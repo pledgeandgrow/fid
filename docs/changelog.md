@@ -1,0 +1,607 @@
+# Pledge Language Changelog
+
+## [Unreleased] — 2026-08-06 (Batch 11: Enhanced Built-in Types)
+
+### Typechecker (`typechecker.rs`) — Comprehensive Method Sets
+- **String methods**: Added `contains`, `starts_with`, `ends_with`, `trim`, `split`, `replace`, `char_at`, `to_uppercase`, `to_lowercase`, `parse_int`, `find`, `rfind`, `repeat`, `bytes`, `clone`
+- **Vec methods**: Added `set`, `insert`, `remove`, `contains`, `reverse`, `first`, `last`, `extend`, `truncate`, `sort`, `clone`
+- **HashMap methods**: Added `get_or`, `clone`
+
+### Lowerer (`lower.rs`) — Extended Builtin Dispatch
+- Extended method dispatch for all new String, Vec, and HashMap methods
+- Correct return type inference including element type for Vec generics
+
+### Interpreter (`interp.rs`) — Full Runtime Implementations
+- **15 new String runtime functions**: `p_string_contains`, `p_string_starts_with`, `p_string_ends_with`, `p_string_trim`, `p_string_split`, `p_string_replace`, `p_string_char_at`, `p_string_to_uppercase`, `p_string_to_lowercase`, `p_string_parse_int`, `p_string_find`, `p_string_rfind`, `p_string_repeat`, `p_string_bytes`, `p_string_clone`
+- **11 new Vec runtime functions**: `p_vec_set`, `p_vec_insert`, `p_vec_remove`, `p_vec_contains`, `p_vec_reverse`, `p_vec_first`, `p_vec_last`, `p_vec_extend`, `p_vec_truncate`, `p_vec_sort`, `p_vec_clone`
+- **2 new HashMap runtime functions**: `p_map_get_or`, `p_map_clone`
+- Added `PartialEq` derive to `Value` enum for `contains` comparisons
+
+### PE Emitter (`pe.rs`) — Native Runtime Stubs
+- Pre-allocated labels for all new runtime functions
+- Functional x86-64 implementations for: `p_vec_is_empty`, `p_vec_clear`, `p_vec_first`, `p_vec_last`, `p_vec_contains`, `p_string_is_empty`, `p_string_len`, `p_string_parse_int`, `p_string_clone`, `p_string_starts_with`
+- Simplified stubs (return default values) for complex operations: `insert`, `remove`, `reverse`, `extend`, `sort`, `split`, `replace`, `trim`, `to_uppercase`, `to_lowercase`, `find`, `rfind`, `repeat`
+
+### Tests (`tests/test_collections.p`)
+- Comprehensive test file covering all 49 operations across String, Vec, and HashMap
+- All tests pass in interpreter backend
+
+### Build Status
+- Compiles successfully with warnings (unused variants — expected)
+- Interpreter: all 49 test outputs verified correct
+- PE emitter: stubs registered and compiling, full native implementations pending for complex methods
+
+---
+
+## [Unreleased] — 2026-08-04 (Batch 10: Direct PE Emitter)
+
+### PE Emitter (`pe.rs`) — Direct Native Code Generation
+- **New backend**: Encodes x86_64 instructions directly to machine code bytes and constructs a valid PE file — no `ml64.exe`, `link.exe`, or C compiler required
+- **`emit` CLI command**: `pledgec emit <file.p> -o <out.exe>` — full pipeline: lex → parse → typecheck → monomorphize → lower → x86 machine code → PE file → `.exe`
+- **Full x86_64 instruction encoder**: REX prefixes (W/R/X/B bits), ModR/M + SIB bytes, 8-bit/32-bit displacement encoding, immediate encoding
+- **Register model**: All 16 x86_64 registers (RAX–R15) with correct encoding for extended registers (R8–R15)
+- **Instruction set**: `mov_rr`, `mov_mem_disp_reg`, `mov_mem_disp_reg32` (32-bit store), `mov_r_imm`, `mov_r8_imm`, `mov_mem_reg8`, `add_rr`, `sub_rr`, `imul_rr`, `xor_rr`, `and_rr`, `or_rr`, `cmp_rr`, `test_rr`, `jcc_label`, `call_label`, `call_reg`, `call_rip`, `ret`, `push`, `pop`, `lea_rbp`, `sub_rsp_i32`, `add_rsp_i32`, `dec_r`, `inc_r`, `xor_self`
+- **PE file format**: DOS header, PE header, section headers (.text + .rdata), import directory, IAT (Import Address Table) for `kernel32.dll`
+- **Import resolution**: `GetStdHandle`, `WriteFile`, `ExitProcess` imported via IAT with RIP-relative `call [rip+offset]` addressing
+- **Runtime stubs** (generated as machine code):
+  - `p_print_int`: Integer to string (div/mod loop, reverse fill in stack buffer), `WriteFile` to stdout, newline
+  - `p_print_str`: String + newline to stdout via `WriteFile`
+  - `p_print_bool`: "true"/"false" to stdout
+  - `p_print_float`: (stub, prints truncated int)
+  - `p_panic`: Prints message + `ExitProcess`
+  - `p_malloc` / `p_free`: Heap allocation (stubs)
+- **Label relocation**: Deferred label resolution — `jcc` and `call` instructions emit placeholders that are patched after all code is generated
+- **Stack frame**: `push rbp` / `mov rbp, rsp` / `sub rsp, N` prologues, alloca slots at fixed `rbp` offsets, `r12`/`r13` saved/restored in runtime stubs
+- **Read-only data**: String literals stored in `.rdata` section, referenced via RIP-relative addressing
+
+### Bug Fixes
+- **`mov_rr` REX prefix bug**: REX.R and REX.B bits were swapped in `mov_rr` (0x89 opcode). In `MOV r/m64, r64`, `reg` = source, `r/m` = destination, so R should extend `src` and B should extend `dst`. The old code had them backwards, causing wrong register selection for any `mov_rr` involving extended registers (R8–R15), leading to `ACCESS_VIOLATION` crashes
+- **64-bit store overwriting adjacent stack data**: `mov_mem_disp_reg` was used to zero the `written` DWORD variable before `WriteFile` calls, but it performed a 64-bit store (REX.W), writing 8 bytes of zeros and overwriting adjacent stack data — the newline byte in `p_print_str` and digit bytes in `p_print_int`. Added `mov_mem_disp_reg32` for 32-bit stores and replaced all 5 `&written` zeroing calls
+- **Integer print length off-by-one**: Buffer length was calculated as `r13 - r8` (buffer_end - current_pos), excluding the newline stored at `r13`. Added `+1` to include it
+
+### Build Status
+- `emit` verified: `hello.p` generates valid PE, produces correct output:
+  ```
+  Hello, Pledge!
+  50
+  y is big
+  ```
+- Output matches interpreter (`run` command) and MASM (`build` command) exactly
+- Exit codes work correctly (`minimal.p` returns 42, `hello.p` returns 0)
+- Compiles successfully with warnings (unused variants — expected)
+
+---
+
+## [Unreleased] — 2026-08-04 (Batch 9: Monomorphization & Module Imports)
+
+### Monomorphization (`mono.rs`)
+- **New module**: Generic function specialization
+- Scans all call sites for concrete type arguments
+- Generates specialized non-generic copies (e.g., `identity__i64`, `identity__bool`)
+- Replaces generic call sites with calls to specialized versions
+- Handles generic methods on structs (mangled as `StructName__method__T1_T2`)
+- Integrates into pipeline: typecheck → monomorphize → lower
+
+### Module Import Resolution (`compiler.rs`)
+- `use foo::bar` imports now resolve files from disk
+- Searches for `<path>.p` or `<path>/mod.p` relative to source file
+- Also searches `pledge_modules/` subdirectory
+- Module merging: stdlib + imported modules + user code (user wins on conflicts)
+- Module-level visibility enforcement in typechecker
+- Import error messages with suggestions (Levenshtein distance for "did you mean")
+- `core` module auto-included (stdlib/core.p prepended to every program)
+
+### Compiler Pipeline Updates
+- All entry points now accept `source_path` for import resolution
+- `build_program_with_path()` handles stdlib + imports + user merge
+- `emit_source_with_path()` added for PE emission pipeline
+
+---
+
+## [Unreleased] — 2026-08-04 (Batch 8: C Codegen Backend)
+
+### C Code Generator (`codegen_c.rs`)
+- **New backend**: Translates SSA IR to portable C code (C99) that compiles with MSVC (`cl.exe`), GCC, or Clang
+- **`ccompile` CLI command**: `pledgec ccompile <file.p> -o <out.exe>` — full pipeline: lex → parse → typecheck → lower → C codegen → compile with `cl.exe` → native `.exe`
+- **MSVC environment setup**: `find_cl()` and `find_vcvarsall()` functions locate the MSVC compiler and set up its environment via `vcvarsall.bat`
+- **Function renaming**: `main` → `main_entry` (avoids conflict with C `main` wrapper), `abs`/`max`/`min` → `p_abs`/`p_max`/`p_min` (avoids MSVC intrinsic/macro conflicts)
+- **`#undef` directives**: `#undef max`/`#undef min`/`#undef abs` in generated C to avoid MSVC macro conflicts
+- **SSA variable declarations**: All SSA values declared once at function start as `int64_t` (or `void*` for pointers), instructions generate assignments — no redefinitions
+- **Void type handling**: `IrType::Void` and `IrType::Never` variables skipped in declarations; void functions get default `return;` statements
+- **Polymorphic `print` dispatch**: `print` calls in IR are intercepted in codegen and dispatched to `p_print_str`, `p_print_int`, `p_print_bool`, or `p_print_float` based on argument type, followed by `p_print_newline()` (matching interpreter behavior where `print` adds a trailing newline)
+- **Runtime implementations**: `p_print`, `p_print_str`, `p_print_int`, `p_print_bool`, `p_print_float`, `p_print_newline`, `p_panic`, `p_malloc`, `p_free`, `p_str_concat`, `p_to_str`, Vec/HashMap/String runtime functions
+- **String constants**: Emitted as `static const char str_N[] = "...";` in generated C
+- **Struct definitions**: Emitted as C `struct` typedefs with field layout
+- **Block labels**: Basic blocks emitted as C labels (`bb0:`, `bb1:`, etc.) with `goto` for control flow
+- **Main wrapper**: C `main()` function calls `main_entry()` and returns its result
+
+### MSVC Integration (`main.rs`)
+- **`find_cl()`**: Searches Visual Studio installation paths for `cl.exe`
+- **`find_vcvarsall()`**: Searches for `vcvarsall.bat` to set up MSVC build environment
+- **`ccompile` command**: Generates C file, invokes `cl.exe` via `vcvarsall.bat` environment, produces native executable
+
+### Build Status
+- Compiles successfully with warnings (unused imports/variants — expected)
+- `ccompile` verified: `hello.p` generates valid C, compiles with MSVC `cl.exe`, and produces correct output:
+  ```
+  Hello, Pledge!
+  50
+  y is big
+  ```
+- Output matches interpreter (`run` command) exactly
+
+---
+
+## [Unreleased] — 2026-08-04 (Batch 7: Lowering Feature Implementation)
+
+### AST → IR Lowering (`lower.rs`)
+- **`alloca_types` tracking**: New `HashMap<ValueId, IrType>` field on `Lowerer` to track the actual type of each `alloca` instruction, enabling correct `Load` types instead of hardcoded `I64`
+- **`Expr::Ident` fix**: Now uses `alloca_types` to determine the correct IR type for mutable variable loads (was hardcoded `I64`)
+- **`Expr::Deref` fix**: Uses `alloca_types` for correct dereference load types
+- **`Expr::ArrayLit` lowering**: Allocates array on stack via `Alloca`, stores each element via `GetElemPtr` + `Store`, returns the array pointer
+- **`Expr::Index` lowering**: Uses `GetElemPtr` with correct element type from array type inference, loads element with correct type
+- **`Stmt::IndexAssign` lowering**: `GetElemPtr` + `Store` for array element assignment, with compound assignment support (`+=`, `-=`, etc.)
+- **Compound assignment fix**: `lower_compound_assign` and `Stmt::Assign` compound path now use `get_value_type()` / `alloca_types` for correct `BinOp` type instead of hardcoded `I64`
+- **`Stmt::Return` defer emission**: `emit_defers` helper added — drains deferred statements from `defer_stack` and emits them before `Ret` instruction
+- **`defer_stack` field**: New `Vec<Vec<Stmt>>` on `Lowerer` for tracking deferred statements per scope
+- **`Expr::MethodCall` lowering**: Method name mangling (`__pledge_StructName_method`), SRET handling for struct returns, receiver passed as first argument
+- **`Expr::Match` as expression**: `lower_match_expr` with result slot alloca, pattern matching branches, merge block for result
+- **`infer_match_type`**: Infers the result type of a match expression from its arms
+- **Match pattern lowering**: Extended to support `Pattern::StrLit` (string comparison), `Pattern::Range` (bounds check with `BinOp::Lt`/`GtEq`), `Pattern::EnumVariant` (variant discriminant check with bindings)
+- **`Expr::TupleLit` lowering**: Allocates tuple struct on stack, stores each element via `GetFieldPtr`
+- **`Expr::EnumLit` lowering**: Allocates enum struct, stores variant discriminant + payload fields
+- **`Expr::Try` lowering**: `TryUnwrap` instruction with ok/err blocks, early return on error
+- **`Expr::Closure` lowering**: Lambda lifting — creates a new `IrFunction` with mangled name, captures are simplified (no environment capture yet)
+- **`for` loop array iterator**: `for x in arr { }` lowered to index-based while loop with `GetElemPtr` + `Load` for element access; handles both direct array values and pointer-to-array (from mutable variable loads)
+- **`loop_stack` updated to 3-tuple**: `(cond_block, exit_block, Option<ValueId>)` to support loop-as-expression with break values
+- **`enums` field**: `HashMap<String, EnumDef>` on `Lowerer` for enum variant lookup during pattern matching
+- **`impl_methods` field**: `HashMap<String, HashMap<String, Func>>` on `Lowerer` for method resolution during `MethodCall` lowering
+
+### Parser Fix (`parser.rs`)
+- **Array literal element type**: Changed from hardcoded `Type::I32` to `Type::I64` to match `IntLit` lowering (which produces `I64` values)
+
+### Test Files (Batch 7)
+- `tests/features6.p` — array literals `[1, 2, 3, 4, 5]`, array indexing (read/write), compound assignment on array elements (`arr[2] += 100`), `for` loop over array with sum accumulation
+
+### Build Status
+- Compiles successfully with warnings (unused variants — expected)
+- `run` command verified: `hello.p`, `struct_return.p`, `features6.p` all produce correct output in interpreter
+- `features6.p` output: `1, 3, 5, 10, 20, 103, 142` (array reads, writes, compound assign, for-loop sum)
+
+---
+
+## [Unreleased] — 2026-08-04 (Batch 6: IR, x86_64 Backend, Interpreter)
+
+### SSA IR Module (`ir.rs`)
+- Typed Static Single Assignment (SSA) intermediate representation
+- `IrType`: `I1`, `I8`, `I16`, `I32`, `I64`, `U8`, `U32`, `U64`, `F32`, `F64`, `Bool`, `Ptr`, `Void`, `Tuple`, `Struct`, `Enum`, `Func`
+- `Inst`: `Const`, `ConstStr`, `BinOp`, `UnaryOp`, `Call`, `Load`, `Store`, `Alloca`, `Br`, `CondBr`, `Ret`, `Panic`, `Cast`, `ICmp`, `FCmp`, `GEP`, `StructField`, `StructConstruct`
+- `ValueId`, `BlockId`, `IrFunction`, `IrModule` types
+- `EffectSet` for tracking side effects
+- `Display` impls for IR types, instructions, functions, modules (for `ir` CLI command)
+
+### AST → IR Lowering (`lower.rs`)
+- Full lowering pipeline: type-checked AST → SSA IR
+- `Lowerer` struct with function-level lowering context
+- Variable bindings via `alloca` + `load`/`store` (mutable variables)
+- Control flow lowering:
+  - `if`/`else` → `CondBr` with then/else/merge blocks
+  - `while` loops → condition block + body block + back-edge
+  - `for` loops over ranges → `alloca` for loop variable + comparison + increment + back-edge
+- Function calls → `Inst::Call` with argument value IDs
+- F-string lowering:
+  - Literal parts → `ConstStr`
+  - Expression parts → `__pledge_to_str` call (skipped if already string type)
+  - All parts concatenated via `__pledge_str_concat`
+  - Type check: if expression IR type is `Ptr`, skip `__pledge_to_str` (prevents treating string pointer as integer)
+- Constants (`pc`) → `Inst::Const` with value inlined
+- Binary ops, unary ops, comparisons → corresponding `Inst` variants
+- Runtime function registration: `__pledge_print_int`, `__pledge_print_str`, `__pledge_print_bool`, `__pledge_to_str`, `__pledge_str_concat`, `__pledge_panic`
+
+### IR Interpreter (`interp.rs`)
+- Direct execution of SSA IR — no external assembler needed
+- `run` CLI command for fast iteration
+- Value types: `Int`, `Float`, `Bool`, `Str`, `Ptr`, `Unit`
+- Runtime function handling:
+  - `print` → dispatches to `__pledge_print_int`, `__pledge_print_str`, `__pledge_print_bool` based on value type
+  - `__pledge_to_str` → converts `Int`, `Bool`, `Float` to `Str`; `Str` passes through
+  - `__pledge_str_concat` → concatenates `Str` and `Ptr` values
+- Verbose mode (`-v`) for debugging IR execution
+- `RunResult::Return(Value)` and `RunResult::Panic(String)` result types
+
+### x86_64 Code Generator (`x86.rs`)
+- Generates MASM-compatible x86_64 assembly from SSA IR
+- **Windows x64 calling convention**: RCX, RDX, R8, R9 for first 4 args; 32-byte shadow space; 16-byte stack alignment
+- Stack frame: `push rbp` / `mov rbp, rsp` / `sub rsp, N` prologues with pre-allocated alloca slots
+- Non-volatile register preservation: `r12`/`r13` saved/restored in runtime stubs
+- Runtime stubs (generated inline, no C runtime dependency):
+  - `__pledge_print_int` — integer to string + `WriteFile` to stdout
+  - `__pledge_print_str` — string + newline to stdout
+  - `__pledge_print_bool` — "true"/"false" to stdout
+  - `__pledge_to_str` — integer to null-terminated string in stack buffer
+  - `__pledge_str_concat` — concatenates two strings into static buffer with temp buffer to avoid aliasing
+  - `__pledge_panic` — prints message + `ExitProcess`
+- Static data: string literals, `str_concat_buf`, `str_concat_tmp` in `.data` section (`BYTE 4096 DUP(?)`)
+- MASM addressing: `mov reg, OFFSET label` for static data (avoids `ADDR32` relocation errors)
+- External imports: `GetStdHandle`, `WriteFile`, `ExitProcess` from `kernel32.lib`
+- Entry point: `main` / `_main` (both exported)
+
+### CLI Commands
+- `build <file.p> -o <out.exe>` — full pipeline to native Windows executable (ml64.exe + link.exe)
+- `ccompile <file.p> -o <out.exe>` — full pipeline via C codegen + MSVC cl.exe (added in Batch 8)
+- `run <file.p> [-v]` — interpret via IR (no external tools needed)
+- `ir <file.p>` — print lowered SSA IR
+- `compile <file.p> -o <out.s>` — legacy ARM64 codegen
+- `tokens`, `ast`, `version` — unchanged
+
+### Bug Fixes
+- **For loop infinite loop**: `lower_for` now uses `alloca` for loop variable so increments persist across iterations
+- **F-string only printing first literal**: `lower_fstring` now concatenates all parts (literals + expression-converted strings) via `__pledge_str_concat`
+- **F-string string variables printing memory address**: Type check added — if expression is already `IrType::Ptr` (string), `__pledge_to_str` is skipped
+- **Recursive function calls crashing in x86**: Non-volatile registers `r12`/`r13` now saved/restored in `__pledge_print_int`, `__pledge_print_str`, `__pledge_print_bool` stubs (Windows x64 ABI compliance)
+- **Linker error `LNK2017: ADDR32`**: Changed `lea reg, [rip + label]` to `mov reg, OFFSET label` for static data buffers in MASM
+- **MASM error `undefined symbol: rip`**: MASM does not use `rip` keyword; removed explicit `rip +` addressing
+- **Buffer aliasing in `__pledge_str_concat`**: Added `str_concat_tmp` buffer — left string copied to temp first, then to output buffer
+
+### Test Files (Batch 6)
+- `tests/control_flow.p` — if/else if/else, for loops with `..` and `..=` ranges
+- `tests/functions.p` — user-defined functions, recursive `factorial(5)`
+- `tests/strings.p` — string literals, string variables, f-string interpolation with string and integer expressions
+- `tests/struct_return.p` — struct return via SRET calling convention, field access on returned structs
+
+### Build Status
+- Compiles successfully
+- `run` command verified: `hello.p`, `control_flow.p`, `functions.p`, `strings.p`, `features.p` all produce correct output in interpreter
+- `build` command verified: `control_flow.p`, `functions.p`, `strings.p` all build and run correctly as native x86_64 executables
+
+---
+
+## [Unreleased] — 2026-08-03 (Batch 5)
+
+### G16: Option/Result Types (Generic Types)
+- Generic type syntax: `Option<T>`, `Result<T, E>` parsed as `Type::Generic { name, args }`
+- Parser: `Name<T, U>` in `parse_type()` with nested generic args
+- Typechecker: `Type::Generic` resolution for `Option` and `Result` in `?` operator
+- Codegen: Generic types pass through as opaque values (simplified)
+
+### G18: Generic Functions
+- Generic function syntax: `pf identity<T>(x: T) -> T { ret x; }`
+- Parser: `<T, U, ...>` type params after function name in `parse_func()`
+- AST: `Func.type_params: Vec<String>` field added
+- Typechecker: Type params registered as named types in function scope (simplified)
+
+### G29: Error Handling (`?` Operator)
+- Try operator: `expr?` unwraps `Result<T, E>` -> `T` or `Option<T>` -> `T`
+- Parser: `?` as postfix operator in `parse_postfix()`
+- AST: `Expr::Try { expr }` node
+- Typechecker: Validates `Option<T>` or `Result<T, E>` and returns inner type `T`
+- Codegen: Simplified passthrough (full impl would check discriminant and early-return)
+
+### G30: Closures
+- Block closure: `pf(x: i32) -> i32 { ret x + 1; }`
+- Expression closure: `pf(x: i32) => x * 2`
+- Parser: `pf(params)` in `parse_primary()` with `-> ret { body }` or `=> expr` forms
+- AST: `Expr::Closure { params, body, ret_ty }` node
+- Typechecker: Closure scope with param bindings, body checked
+- Codegen: Simplified inline body generation (full impl would create trampoline function)
+
+### G15: Tuple Types and Literals
+- Tuple type: `(i32, bool)`, `(T, U, V)` parsed as `Type::Tuple(Vec<Type>)`
+- Tuple literal: `(42, true, "hello")` parsed as `Expr::TupleLit(Vec<Expr>)`
+- Parser: `(T, U, ...)` in `parse_type()`, `(expr, expr, ...)` in `parse_primary()`
+- Typechecker: `Type::Tuple` of element types
+- Codegen: Evaluate each element in sequence (simplified)
+
+### G40: Standard Library (Initial)
+- Test file demonstrates stdlib patterns: string operations, f-string formatting
+- Full stdlib expansion is ongoing
+
+### Bug Fix: Double-advance in `parse_type`
+- Fixed `Ident` case in `parse_type()` that called `self.advance()` inside the match arm and then fell through to `self.advance()` at the end, causing the parser to skip the next token
+- This was the root cause of generic function parsing failures
+
+## [Unreleased] — 2026-08-02 (Batch 4)
+
+### G17: Enum Variant Matching with Data
+- Enum variants with anonymous data: `enum Shape { Circle(f64), Rectangle(f64, f64), Unit }`
+- Enum variant construction: `Shape::Circle(3.14)`
+- Enum variant pattern matching: `Shape::Circle(radius: f64) => { ... }`
+- New `Expr::EnumLit { enum_name, variant, args }` AST node
+- Parser: `EnumName::Variant(args)` in `parse_primary()`, anonymous types in `parse_enum()`
+- `read_type_name()` helper accepts both identifiers and type keywords (i32, f64, etc.)
+- Typechecker: `EnumLit` returns `Type::Named(enum_name)`
+- Codegen: simplified variant index emission
+
+### G28: References & Borrowing
+- Reference types: `&i32`, `&mut T`, `&str`
+- Reference expressions: `&x`, `&mut x`
+- Dereference: `*expr`
+- New `Type::Ref { inner, is_mut }` variant
+- New `Expr::Ref { expr, is_mut }` and `Expr::Deref { expr }` AST nodes
+- Parser: `&`/`&mut` in `parse_type()` and `parse_unary()`, `*` deref in `parse_unary()`
+- Typechecker: `Ref` wraps inner type, `Deref` unwraps `Type::Ref`
+- Codegen: `Ref` computes `add x0, sp, #offset`, `Deref` does `ldr x0, [x0]`
+
+### G21: String Operations
+- String concatenation with `+`: `"Hello" + " " + "World"`
+- String literal patterns in match: `"hello" => { ... }`
+- New `Expr::StrConcat { left, right }` AST node
+- New `Pattern::StrLit(String)` variant
+- Typechecker: `BinOp::Add` with `Str + Str` returns `Type::Str`
+- Codegen: `StrConcat` calls `__pledge_str_concat` runtime function
+
+### G31: Modules & Imports
+- `use std::io;` — module import syntax
+- `use path::item;` — path with `::` separator
+- New `Stmt::Use { path, items }` AST node
+- New `ImportDef` struct, `Program.imports` field
+- Parser: `parse_use()` for top-level, `parse_use_stmt()` for statement-level
+- Typechecker: `Stmt::Use` is a no-op (resolved at compile time)
+- Codegen: `Stmt::Use` is a no-op
+
+### G34: Attributes
+- `#[test]` — simple attribute
+- `#[name(arg1, arg2)]` — attribute with arguments
+- New `Attribute { name, args }` struct, `Program.attributes` field
+- Parser: `parse_attribute()` handles `#[...]` syntax with optional args
+- Attributes parsed at top level alongside functions, structs, enums
+
+### Test Files (Batch 4)
+- `tests/features4.p` — tests for enums, references, string concat, imports, attributes
+
+---
+
+## [Unreleased] — 2026-08-02 (Batch 3)
+
+### G14: Array Types and Literals
+- Array type: `[i32; 5]` in type annotations
+- Array literal: `[1, 2, 3, 4, 5]`
+- Array indexing: `arr[0]`, `arr[i]`
+- Array index assignment: `arr[0] = 42`, `arr[i] += 1`
+- New `Type::Array { elem, size }` variant
+- New `Expr::ArrayLit`, `Expr::Index` AST nodes
+- New `Stmt::IndexAssign` for `arr[idx] op= expr`
+- Parser: `[T; N]` in `parse_type()`, `[...]` in `parse_primary()`, `arr[idx]` in `parse_postfix()`
+- Codegen: stack-allocated arrays (8 bytes per element), base+index*8 addressing
+
+### G27: Pattern Matching (match / =>)
+- `match expr { pattern => { body }, ... }` statement
+- Pattern types: `IntLit`, `BoolLit`, `Ident` (binding), `Wildcard` (`_`), `EnumVariant` (`Enum::Variant(bindings)`)
+- New `Pattern` enum, `MatchArm` struct
+- New `Stmt::Match` and `Expr::Match` AST nodes
+- Parser: `parse_match_stmt()`, `parse_pattern()`
+- Typechecker: pattern variable binding in match arms
+- Codegen: comparison-based arm matching with branch-to-arm-label pattern
+
+### G32: F-String Interpolation
+- `f"Hello, {name}!"` — first-class f-string with embedded expressions
+- New `TokenKind::FString` token
+- New `Expr::FString { parts }` and `FStringPart::Literal(String)` / `FStringPart::Expr(Expr)` AST nodes
+- Lexer: `read_fstring()` handles `{expr}` interpolation with brace depth tracking
+- Parser: `parse_fstring_parts()` re-lexes and parses embedded expressions
+- Codegen: evaluates expression parts (full string formatting pending runtime support)
+
+### G22: Float Codegen
+- Float literals stored in `.rodata` section as `.double` constants
+- New `intern_float()` method with `float_consts` map
+- `gen_expr` for `FloatLit` loads via `adr` + `ldr d0`
+
+### Test Files (Batch 3)
+- `tests/features3.p` — tests for arrays, match, f-strings, floats
+
+---
+
+## [Unreleased] — 2026-08-02 (Batch 2)
+
+### G5: For Loops with Ranges
+- `for x in 0..10 { }` (exclusive range)
+- `for x in 0..=10 { }` (inclusive range)
+- New `Expr::Range` AST node with `start`, `end`, `inclusive` fields
+- Parser: `parse_range()` at expression top level
+- Codegen: proper counter-based loop with compare, increment, and branch
+
+### G12: Type Aliases
+- `ty Name = i32;` syntax (top-level)
+- New `TypeAlias` struct, `type_aliases` field on `Program`
+- Typechecker: `resolve_type()` recursively resolves aliases
+- `types_compatible()` resolves aliases before comparison
+
+### G23: Struct Methods (impl blocks)
+- `impl StructName { pf method(self: StructName) -> i32 { } }` syntax
+- New `ImplDef` struct, `impls` field on `Program`
+- New `Expr::MethodCall` AST node: `receiver.method(args)`
+- Parser: `parse_impl()`, method call parsing in `parse_postfix()`
+- Typechecker: method registration per struct, arg count validation (self excluded)
+- Codegen: mangled method names (`__pledge_StructName_method`), struct type tracking via `var_types`
+
+### Block-as-Expression
+- `{ stmt; stmt; expr }` returns final expression value
+- New `Expr::Block(Vec<Stmt>)` AST node
+- Parser: `LBrace` in `parse_primary()` triggers block expression parsing
+- Typechecker: returns last expression type
+- Codegen: generates block statements in new scope
+
+### If-as-Expression
+- Already partially supported via `Expr::If` in expression position
+- Parser already handles `if` in `parse_primary()`
+
+### Lexer Improvements (Batch 2)
+- Hex literals: `0xFF`, `0xDEADBEEF`
+- Binary literals: `0b1010`
+- Octal literals: `0o777`
+- Underscore separators: `1_000_000`, `0xFF_FF`
+
+### Test Files (Batch 2)
+- `tests/features2.p` — tests for ranges, type aliases, block expressions, struct methods
+
+---
+
+## [Unreleased] — 2026-08-02 (Batch 1)
+
+### Language Syntax
+
+#### Keyword Renames (Rust → Pledge)
+- `fn` → `pf` (Pledge Function) — used for all functions
+- `let` / `let mut` → `pv` / `pv mut` (Pledge Variable)
+- `const` → `pc` (Pledge Constant)
+- `trait` → `cap` (capability/trait)
+- `return` → `ret`
+- `type` → `ty` (type alias)
+- `import` → `use`
+
+#### New Keywords
+- `comptime` — compile-time code blocks
+- `defer` — Go-style cleanup
+- `spawn` — task spawning
+- `region` — explicit region (replaces lifetime annotations)
+
+#### File Extension
+- Changed from `.pl` to `.p` to avoid collision with Perl
+
+### Compiler Features
+
+#### G1: Compound Assignment Operators
+- Added `+=`, `-=`, `*=`, `/=`, `%=`
+- Added `&=`, `|=`, `^=`, `<<=`, `>>=`
+- New `AssignOp` enum with 11 variants in AST
+- Parser handles assignment via `parse_assign_or_expr()`
+- Codegen for `+=`, `-=`, `*=` (others fall back to simple assign)
+
+#### G2: Bitwise Operators
+- Added `&` (bitwise AND), `|` (bitwise OR), `^` (bitwise XOR)
+- Added `~` (bitwise NOT), `<<` (shift left), `>>` (shift right)
+- New `BinOp` variants: `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`
+- New `UnaryOp::BitNot` variant
+- Operator precedence chain: `bit_or > bit_xor > bit_and > shift`
+- Codegen: `and`, `orr`, `eor`, `lsl`, `asr`, `mvn`
+
+#### G3: Boolean Literals
+- `true` / `false` already in tokens; now fully supported in parser, typechecker, and codegen
+- Codegen emits `mov x0, #1` (true) / `mov x0, #0` (false)
+
+#### G4: While Loops
+- `while cond { body }` syntax
+- Parser: `parse_while()`
+- Typechecker: validates condition is bool
+- Codegen: proper label-based loop with `while_start` / `while_end`
+
+#### G6: Loop / Break / Continue
+- `loop { body }` — infinite loop
+- `break;` / `break expr;` — exit loop
+- `continue;` — skip to next iteration
+- Parser: `parse_loop()`, break/continue handling in `parse_stmt()`
+- Codegen: label-based jump instructions
+
+#### G7: Mutable Variables
+- `pv mut name = value;` syntax
+- `is_mut` field added to `Stmt::Let`
+- Assignment (`=`) and compound assignment store back to existing variable slots
+
+#### G8: Constant Declarations
+- `pc NAME: type = value;` syntax (top-level only)
+- New `ConstDef` struct in AST
+- `consts` field added to `Program`
+- Typechecker tracks constants in `consts` map
+- Constants resolved in identifier lookup
+
+#### G9: Unary Not
+- `!expr` for logical negation (bool)
+- `~expr` for bitwise negation (integers)
+- Both fully supported in parser, typechecker, and codegen
+
+#### G10: Comparison Chains
+- Comparison operators (`==`, `!=`, `<`, `>`, `<=`, `>=`) work in nested expressions
+- Proper precedence: `equality > comparison > shift > bitwise_and > bitwise_or`
+
+#### G11: Type Inference for Variables
+- `pv x = 42;` infers `i32` without explicit type annotation
+- Typechecker infers from initializer expression when no type declared
+
+#### G33: Defer
+- `defer { body }` syntax
+- Parser: `parse_stmt()` handles `defer` keyword
+- Codegen: simplified (executes immediately; full scope-exit queueing pending)
+
+### Lexer Improvements
+
+#### Number Literals
+- Hex literals: `0xFF`, `0xDEADBEEF`
+- Binary literals: `0b1010`
+- Octal literals: `0o777`
+- Underscore separators: `1_000_000`, `0xFF_FF`
+
+#### Comments
+- Line comments: `//`
+- Block comments: `/* */` (new)
+
+#### Strings
+- F-string lexing: `f"..."` (tokenized as string, interpolation parsing pending G32)
+
+#### Operators
+- All compound assignment operators: `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`
+- Bitwise operators: `|`, `^`, `~`, `<<`, `>>`
+- Range operators: `..`, `..=` (tokenized, parsing pending G5)
+- Hash: `#` (for attributes, parsing pending G34)
+
+### Token Changes
+- Added: `Pipe`, `Caret`, `Tilde`, `Shl`, `Shr`, `DotDot`, `DotDotEq`
+- Added: `PlusEq`, `MinusEq`, `StarEq`, `SlashEq`, `PercentEq`, `AmpEq`, `PipeEq`, `CaretEq`, `ShlEq`, `ShrEq`
+- Added: `Hash`
+- Removed duplicate delimiter definitions
+
+### AST Changes
+- `BinOp`: added `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`
+- `UnaryOp`: added `BitNot`
+- `Stmt`: added `Assign`, `While`, `For`, `Loop`, `Break`, `Continue`, `Defer`
+- `Stmt::Let`: added `is_mut: bool` field
+- New `AssignOp` enum (11 variants)
+- New `ConstDef` struct
+- `Program`: added `consts: Vec<ConstDef>` field
+
+### Typechecker Changes
+- Added `consts: HashMap<String, Type>` tracking
+- Type checking for: `Assign`, `While`, `For`, `Loop`, `Break`, `Continue`, `Defer`
+- Bitwise binary operator type checking (requires integer types)
+- `BitNot` unary type checking
+- Constant lookup in identifier resolution
+
+### Codegen Changes
+- Codegen for: `Assign` (with `+=`, `-=`, `*=`), `While`, `For`, `Loop`, `Break`, `Continue`, `Defer`
+- Bitwise binary ops: `and`, `orr`, `eor`, `lsl`, `asr`
+- `BitNot` unary: `mvn`
+- Updated `count_lets()` to handle new statement types
+
+### IDE Support
+- `.vscode/settings.json` — associates `.p` files with Pledge language
+- `.vscode/pledge.tmLanguage.json` — TextMate grammar for syntax highlighting
+- Scopes: keywords, types, strings, comments, numbers, functions
+
+### Documentation
+- `README.md` — comprehensive rewrite with features, compiler pipeline, syntax overview, keyword reference, project structure, roadmap
+- `docs/syntax-spec.md` — updated with new keywords and syntax
+
+### Test Files
+- `tests/hello.p` — updated to new syntax (`pf`, `pv`, semicolons)
+- `tests/struct.p` — updated to new syntax
+- `tests/arithmetic.p` — updated to new syntax
+- `tests/features.p` — new test exercising compound assignment, bitwise ops, while loops, mutable vars, constants
+
+### Build Status
+- Compiles successfully with 5 warnings (all dead code — expected for unused AST fields)
+- All 4 test files compile to ARM64 assembly
+
+---
+
+## [Initial] — Pre-2026-08-02
+
+### Initial Compiler
+- Lexer with basic tokens and keywords
+- Recursive descent parser
+- Basic type checker (integers, floats, strings, bools, structs, functions)
+- ARM64 (AArch64) code generator
+- CLI: `compile`, `tokens`, `ast`, `version` commands
+- Basic structs, enums, functions, if/else expressions
+- Binary arithmetic: `+`, `-`, `*`, `/`, `%`
+- Comparison: `==`, `!=`, `<`, `>`, `<=`, `>=`
+- Logical: `&&`, `||`, `!`
+- `print()` builtin

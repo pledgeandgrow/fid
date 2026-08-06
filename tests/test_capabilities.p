@@ -1,0 +1,23 @@
+// Test: capability-gated imports with with { ... } syntax
+// The with keyword grants capabilities to imported modules
+
+module test_caps;
+
+// Import with capability grant — parsed and stored
+use core::{Option, max} with { IO };
+
+// Import without capabilities — also valid
+use core::{min, abs};
+
+// Import with multiple capabilities
+use core::{clamp} with { IO, Read, Write };
+
+pf main() -> i32 {
+    pv x = Option::Some(42);
+    print(x.unwrap());       // 42
+    print(max(10, 20));      // 20
+    print(min(10, 20));      // 10
+    print(abs(-5));          // 5
+    print(clamp(15, 0, 10)); // 10
+    ret 0;
+}

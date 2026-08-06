@@ -1,0 +1,3153 @@
+// AST → Pledge IR lowering pass
+//
+// This module lowers the typed AST into Pledge IR (SSA form).
+// It handles:
+// - Function lowering with basic blocks and control flow
+// - Expression lowering to SSA values
+// - Statement lowering with proper block management
+// - Struct layout computation
+// - Effect propagation
+//
+// The lowering is designed to produce correct SSA even with
+// mutable variables (via alloca + load/store pattern initially,
+// to be optimized later by mem2reg pass).
+
+use crate::ast::*;
+use crate::ir::*;
+use std::collections::HashMap;
+
+pub struct Lowerer {
+    module: IrModule,
+    /// Current function being lowered
+    current_func: Option<IrFunction>,
+    /// Current block we're emitting into
+    current_block: BlockId,
+    /// Loop context — (continue_target, break_target, result_slot) stack
+    /// result_slot is Some(alloca) for loop-as-expression, None for plain loops
+    loop_stack: Vec<(BlockId, BlockId, Option<ValueId>)>,
+    /// Struct definitions from AST (for layout computation)
+    structs: HashMap<String, StructDef>,
+    /// Mutable variables that have been allocated on the stack (alloca pattern)
+    /// Maps variable name → alloca pointer ValueId
+    allocas: HashMap<String, ValueId>,
+    /// Types of alloca slots — maps alloca ValueId → stored IrType
+    /// Used to correctly load mutable variables with their actual type
+    alloca_types: HashMap<ValueId, IrType>,
+    /// Constants (pc) — maps name to expression for inline substitution
+    constants: HashMap<String, Expr>,
+    /// SRET pointer for current function (if it returns a struct)
+    current_sret: Option<ValueId>,
+    /// Enum definitions from AST
+    enums: HashMap<String, EnumDef>,
+    /// Impl method lookup: (struct_name, method_name) → Func
+    impl_methods: HashMap<(String, String), Func>,
+    /// Defer blocks to emit at all exit points of the current function
+    defer_stack: Vec<Vec<Stmt>>,
+    /// Current closure captures: maps captured var name → (env field index, type)
+    /// Set when lowering inside a closure function
+    current_captures: Vec<(String, usize, Type)>,
+    /// Try block context stack — each entry is (error_block, error_result_slot)
+    /// When non-empty, ? operator jumps to error_block instead of returning
+    try_stack: Vec<(BlockId, ValueId)>,
+}
+
+impl Lowerer {
+    pub fn new() -> Self {
+        Lowerer {
+            module: IrModule::new(),
+            current_func: None,
+            current_block: BlockId(0),
+            loop_stack: Vec::new(),
+            structs: HashMap::new(),
+            allocas: HashMap::new(),
+            alloca_types: HashMap::new(),
+            constants: HashMap::new(),
+            current_sret: None,
+            enums: HashMap::new(),
+            impl_methods: HashMap::new(),
+            defer_stack: Vec::new(),
+            current_captures: Vec::new(),
+            try_stack: Vec::new(),
+        }
+    }
+
+    /// Lower a complete program to IR
+    pub fn lower_program(&mut self, program: &Program) -> IrModule {
+        // Register constants (pc) for inline substitution
+        for c in &program.consts {
+            self.constants.insert(c.name.clone(), c.expr.clone());
+        }
+
+        // Register struct definitions for layout computation
+        for s in &program.structs {
+            self.structs.insert(s.name.clone(), s.clone());
+        }
+
+        // Register enum definitions
+        for e in &program.enums {
+            self.enums.insert(e.name.clone(), e.clone());
+        }
+
+        // Register impl methods
+        for imp in &program.impls {
+            for method in &imp.methods {
+                self.impl_methods.insert((imp.struct_name.clone(), method.name.clone()), method.clone());
+            }
+        }
+
+        // Register trait impl methods — they're methods on the type
+        // Keyed as (type_name, method_name) so normal method calls find them
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                self.impl_methods.insert((ti.type_name.clone(), method.name.clone()), method.clone());
+            }
+        }
+
+        // Compute struct layouts
+        for s in &program.structs {
+            self.compute_struct_layout(s);
+        }
+
+        // Compute enum layouts
+        for e in &program.enums {
+            self.compute_enum_layout(e);
+        }
+
+        // Register runtime/external functions
+        self.register_runtime();
+
+        // Lower each function
+        for func in &program.funcs {
+            self.lower_func(func);
+        }
+
+        // Lower impl methods (mangled as {StructName}_{method})
+        for imp in &program.impls {
+            for method in &imp.methods {
+                let mut mangled = method.clone();
+                mangled.name = format!("{}_{}", imp.struct_name, method.name);
+                self.lower_func(&mangled);
+            }
+        }
+
+        // Lower trait impl methods (mangled as {TypeName}_{method})
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                let mut mangled = method.clone();
+                mangled.name = format!("{}_{}", ti.type_name, method.name);
+                self.lower_func(&mangled);
+            }
+        }
+
+        // Take ownership of the module
+        std::mem::take(&mut self.module)
+    }
+
+    /// Compute the memory layout for a struct
+    fn compute_struct_layout(&mut self, def: &StructDef) {
+        let mut fields = Vec::new();
+        let mut offset: u64 = 0;
+        let mut max_align: u64 = 1;
+
+        for field in &def.fields {
+            let ir_ty = lower_type(&field.ty);
+            let align = self.module.type_align(&ir_ty);
+            // Align offset
+            offset = (offset + align - 1) & !(align - 1);
+            fields.push((field.name.clone(), ir_ty.clone(), offset as u32));
+            offset += self.module.type_size(&ir_ty);
+            if align > max_align {
+                max_align = align;
+            }
+        }
+
+        // Pad to alignment
+        let size = (offset + max_align - 1) & !(max_align - 1);
+
+        let layout = StructLayout {
+            name: def.name.clone(),
+            fields,
+            size,
+            align: max_align,
+        };
+
+        self.module.add_struct(layout);
+    }
+
+    /// Compute layout for an enum type.
+    /// Enums are laid out as: tag (i64) at offset 0, then data fields at 8-byte intervals.
+    /// Size = (1 + max_variant_arity) * 8, aligned to 8.
+    fn compute_enum_layout(&mut self, def: &EnumDef) {
+        let mut max_fields = 0usize;
+        for variant in &def.variants {
+            if let Some(data) = &variant.data {
+                max_fields = max_fields.max(data.len());
+            }
+        }
+
+        let mut fields = Vec::new();
+        // Field 0: tag
+        fields.push(("__tag".to_string(), IrType::I64, 0u32));
+        // Fields 1..max: data slots (all 8 bytes, enough for i64/f64/ptr)
+        for i in 0..max_fields {
+            fields.push((format!("__data{}", i), IrType::I64, ((i + 1) * 8) as u32));
+        }
+
+        let size = ((1 + max_fields) * 8) as u64;
+        let layout = StructLayout {
+            name: def.name.clone(),
+            fields,
+            size,
+            align: 8,
+        };
+        self.module.add_struct(layout);
+    }
+
+    /// Register runtime functions that the IR can call
+    fn register_runtime(&mut self) {
+        self.module.add_extern("p_print_int", vec![IrType::I64], IrType::Void);
+        self.module.add_extern("p_print_str", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Void);
+        self.module.add_extern("p_print_bool", vec![IrType::Bool], IrType::Void);
+        self.module.add_extern("p_print_float", vec![IrType::F64], IrType::Void);
+        self.module.add_extern("p_print_newline", vec![], IrType::Void);
+        self.module.add_extern("p_panic", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Void);
+        self.module.add_extern("p_alloc", vec![IrType::I64], IrType::Ptr(Box::new(IrType::U8)));
+        self.module.add_extern("p_malloc", vec![IrType::I64], IrType::Ptr(Box::new(IrType::U8)));
+        self.module.add_extern("p_free", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Void);
+        self.module.add_extern("p_str_concat",
+            vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))],
+            IrType::Ptr(Box::new(IrType::U8)));
+        self.module.add_extern("p_to_str",
+            vec![IrType::I64],
+            IrType::Ptr(Box::new(IrType::U8)));
+    }
+
+    /// Lower a single function
+    fn lower_func(&mut self, func: &Func) {
+        let ret_ty = lower_type(&func.ret_ty);
+        let mut ir_func = IrFunction::new(func.name.clone(), ret_ty.clone());
+
+        // If the function returns a struct, add a hidden SRET parameter
+        // (caller-allocated pointer as first arg, callee writes struct data there)
+        // SRET goes in rcx (first arg), __env goes in rdx (second arg)
+        let is_struct_ret = matches!(ret_ty, IrType::Struct(_));
+        if is_struct_ret {
+            let sret_ty = IrType::Ptr(Box::new(ret_ty.clone()));
+            let meta = ValueMeta {
+                ty: sret_ty.clone(),
+                region: Region::Stack,
+                effects: EffectSet::none(),
+                source_line: None,
+            };
+            let sret_val = ir_func.new_value(meta);
+            ir_func.params.push((sret_val, sret_ty));
+            // Don't bind it to a name — it's hidden
+            self.current_sret = Some(sret_val);
+        } else {
+            self.current_sret = None;
+        }
+
+        // All functions get __env as next param (for uniform CallPtr calling convention)
+        let env_meta = ValueMeta {
+            ty: IrType::Ptr(Box::new(IrType::U8)),
+            region: Region::Stack,
+            effects: EffectSet::none(),
+            source_line: None,
+        };
+        let env_val = ir_func.new_value(env_meta);
+        ir_func.params.push((env_val, IrType::Ptr(Box::new(IrType::U8))));
+        ir_func.bind_local("__env", env_val);
+
+        // Create parameter values
+        for param in &func.params {
+            let raw_ty = lower_type(&param.ty);
+            // Struct params are passed as pointers (by-ref) so FieldAccess works
+            let ir_ty = if matches!(raw_ty, IrType::Struct(_)) {
+                IrType::Ptr(Box::new(raw_ty))
+            } else {
+                raw_ty
+            };
+            let meta = ValueMeta {
+                ty: ir_ty.clone(),
+                region: Region::Stack,
+                effects: EffectSet::none(),
+                source_line: None,
+            };
+            let val = ir_func.new_value(meta);
+            ir_func.params.push((val, ir_ty.clone()));
+            ir_func.bind_local(&param.name, val);
+        }
+
+        // Set as current function
+        let prev = std::mem::replace(&mut self.current_func, Some(ir_func));
+        self.current_block = BlockId(0);
+        self.allocas.clear();
+        self.alloca_types.clear();
+        self.defer_stack.clear();
+
+        // Lower the function body
+        // If the function has a non-void return type and the last statement
+        // is an expression, use it as the implicit return value.
+        let mut last_expr_val: Option<ValueId> = None;
+        for stmt in &func.body {
+            if let Stmt::Expr(expr) = stmt {
+                // Lower the expression and remember its value
+                last_expr_val = Some(self.lower_expr(expr));
+            } else {
+                last_expr_val = None;
+                self.lower_stmt(stmt);
+            }
+        }
+
+        // Ensure the function ends with a return
+        // Check if current block already has a terminator (immutable borrow first)
+        let has_terminator = if let Some(ref f) = self.current_func {
+            let block_idx = self.current_block.0 as usize;
+            if block_idx < f.blocks.len() {
+                f.blocks[block_idx].instructions.iter()
+                    .any(|id| f.instructions.get(id).map(|i| i.is_terminator()).unwrap_or(false))
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !has_terminator {
+            // Emit defer blocks before implicit return
+            self.emit_defers();
+
+            if self.current_sret.is_some() {
+                // Struct-returning function: copy struct data to sret, return void
+                if let Some(val) = last_expr_val {
+                    self.emit_sret_copy(val);
+                }
+                self.emit_terminator(Inst::Return { value: None });
+            } else {
+                // Non-struct return: use the function's return type
+                let ret_val = if let Some(ref f) = self.current_func {
+                    if f.ret_ty == IrType::Void {
+                        None
+                    } else if let Some(val) = last_expr_val {
+                        Some(val)
+                    } else {
+                        // Implicit return of 0 for non-void functions (safety)
+                        // Need to emit a zero constant — handle below
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if ret_val.is_none() && self.current_func.is_some() {
+                    // Need to emit a zero constant for non-void functions
+                    let needs_zero = if let Some(ref f) = self.current_func {
+                        f.ret_ty != IrType::Void && last_expr_val.is_none()
+                    } else {
+                        false
+                    };
+                    if needs_zero {
+                        let zero_val = if let Some(ref f) = self.current_func {
+                            let ret_ty = f.ret_ty.clone();
+                            let meta = ValueMeta {
+                                ty: ret_ty.clone(),
+                                region: Region::Stack,
+                                effects: EffectSet::none(),
+                                source_line: None,
+                            };
+                            let zid = {
+                                let fmut = self.current_func.as_mut().unwrap();
+                                let id = fmut.new_value(meta);
+                                let inst = match &ret_ty {
+                                    IrType::F32 | IrType::F64 => Inst::ConstFloat { bits: 0, ty: ret_ty.clone() },
+                                    IrType::Bool => Inst::ConstBool { value: false },
+                                    _ => Inst::ConstInt { value: 0, ty: ret_ty.clone() },
+                                };
+                                fmut.instructions.insert(id, inst);
+                                let block_idx = self.current_block.0 as usize;
+                                fmut.blocks[block_idx].instructions.push(id);
+                                id
+                            };
+                            Some(zid)
+                        } else {
+                            None
+                        };
+                        self.emit_terminator(Inst::Return { value: zero_val });
+                    } else {
+                        self.emit_terminator(Inst::Return { value: None });
+                    }
+                } else {
+                    self.emit_terminator(Inst::Return { value: ret_val });
+                }
+            }
+        }
+
+        // Store the function in the module
+        if let Some(f) = self.current_func.take() {
+            // Compute function effects from all instructions
+            let mut func_effects = EffectSet::new();
+            for inst in f.instructions.values() {
+                func_effects.add_all(&inst.effects());
+            }
+            let func_name = f.name.clone();
+            self.module.function_effects.insert(func_name.clone(), func_effects.clone());
+            let name = f.name.clone();
+            let mut f = f;
+            f.effects = func_effects;
+            self.module.functions.insert(name, f);
+        }
+
+        self.current_func = prev;
+    }
+
+    /// Lower a sequence of statements
+    fn lower_stmts(&mut self, stmts: &[Stmt]) {
+        for stmt in stmts {
+            self.lower_stmt(stmt);
+        }
+    }
+
+    /// Lower a single statement
+    fn lower_stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Let { name, ty, expr, is_mut: _ } => {
+                let val = self.lower_expr(expr);
+                // Always use alloca + store for variables.
+                // Direct SSA binding is broken for loops (no phi nodes) —
+                // the condition block references the original ValueId and
+                // never sees rebinding from the loop body.
+                let ir_ty = ty.as_ref().map(|t| lower_type(t)).unwrap_or_else(|| {
+                    self.get_value_type(val)
+                });
+                let alloca = self.emit_inst(Inst::Alloca {
+                    ty: ir_ty.clone(),
+                    region: Region::Stack,
+                });
+                self.alloca_types.insert(alloca, ir_ty);
+                self.emit_inst(Inst::Store {
+                    ptr: alloca,
+                    value: val,
+                });
+                self.allocas.insert(name.clone(), alloca);
+                if let Some(ref mut f) = self.current_func {
+                    f.bind_local(name, alloca);
+                }
+            }
+
+            Stmt::Assign { target, op, expr } => {
+                // Check if target is a mutable variable with an alloca
+                let alloca = self.allocas.get(target).copied();
+                
+                if let Some(ptr) = alloca {
+                    // Mutable variable: use load/store through alloca
+                    match op {
+                        AssignOp::Assign => {
+                            let val = self.lower_expr(expr);
+                            self.emit_inst(Inst::Store { ptr, value: val });
+                        }
+                        _ => {
+                            // Compound assignment: load current, apply op, store back
+                            let load_ty = self.alloca_types.get(&ptr).cloned().unwrap_or(IrType::I64);
+                            let current = self.emit_inst(Inst::Load {
+                                ptr,
+                                ty: load_ty,
+                            });
+                            let rhs = self.lower_expr(expr);
+                            let new_val = self.lower_compound_assign(op, current, rhs);
+                            self.emit_inst(Inst::Store { ptr, value: new_val });
+                        }
+                    }
+                } else {
+                    // Non-alloca variable: use direct SSA binding
+                    let val = self.lower_expr(expr);
+                    match op {
+                        AssignOp::Assign => {
+                            if let Some(ref mut f) = self.current_func {
+                                f.bind_local(target, val);
+                            }
+                        }
+                        _ => {
+                            let current = self.current_func.as_ref()
+                                .and_then(|f| f.lookup_local(target));
+                            if let Some(curr) = current {
+                                let new_val = self.lower_compound_assign(op, curr, val);
+                                if let Some(ref mut f) = self.current_func {
+                                    f.bind_local(target, new_val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Stmt::IndexAssign { array, index, op, expr } => {
+                // Look up the array variable — it should be an alloca or local
+                let arr_val = if let Some(alloca) = self.allocas.get(array) {
+                    // Load the array pointer from the alloca
+                    let arr_ty = self.alloca_types.get(alloca).cloned().unwrap_or(IrType::I64);
+                    self.emit_inst(Inst::Load { ptr: *alloca, ty: arr_ty })
+                } else if let Some(val) = self.current_func.as_ref().and_then(|f| f.lookup_local(array)) {
+                    val
+                } else {
+                    self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 })
+                };
+
+                let idx_val = self.lower_expr(index);
+
+                // Determine element type from array value metadata
+                let elem_ty = self.get_value_type(arr_val);
+                let elem_ty = match &elem_ty {
+                    IrType::Array(inner, _) => *inner.clone(),
+                    _ => IrType::I64,
+                };
+
+                let elem_ptr = self.emit_inst(Inst::GetElemPtr {
+                    array_ptr: arr_val,
+                    index: idx_val,
+                    elem_ty: elem_ty.clone(),
+                });
+
+                if *op == AssignOp::Assign {
+                    let val = self.lower_expr(expr);
+                    self.emit_inst(Inst::Store { ptr: elem_ptr, value: val });
+                } else {
+                    // Compound assignment: load, binop, store
+                    let current = self.emit_inst(Inst::Load { ptr: elem_ptr, ty: elem_ty.clone() });
+                    let rhs = self.lower_expr(expr);
+                    let bin_op = match op {
+                        AssignOp::AddAssign => BinOp::Add,
+                        AssignOp::SubAssign => BinOp::Sub,
+                        AssignOp::MulAssign => BinOp::Mul,
+                        AssignOp::DivAssign => BinOp::Div,
+                        AssignOp::ModAssign => BinOp::Mod,
+                        AssignOp::BitAndAssign => BinOp::BitAnd,
+                        AssignOp::BitOrAssign => BinOp::BitOr,
+                        AssignOp::BitXorAssign => BinOp::BitXor,
+                        AssignOp::ShlAssign => BinOp::Shl,
+                        AssignOp::ShrAssign => BinOp::Shr,
+                        AssignOp::Assign => unreachable!(),
+                    };
+                    let new_val = self.emit_inst(Inst::BinOp {
+                        op: bin_op,
+                        left: current,
+                        right: rhs,
+                        ty: elem_ty,
+                    });
+                    self.emit_inst(Inst::Store { ptr: elem_ptr, value: new_val });
+                }
+            }
+
+            Stmt::DerefAssign { ptr_expr, op, expr } => {
+                let ptr_val = self.lower_expr(ptr_expr);
+                let pointee_ty = match self.get_value_type(ptr_val) {
+                    IrType::Ptr(inner) => *inner,
+                    _ => IrType::I64,
+                };
+                if *op == AssignOp::Assign {
+                    let val = self.lower_expr(expr);
+                    self.emit_inst(Inst::Store { ptr: ptr_val, value: val });
+                } else {
+                    let current = self.emit_inst(Inst::Load { ptr: ptr_val, ty: pointee_ty.clone() });
+                    let rhs = self.lower_expr(expr);
+                    let bin_op = match op {
+                        AssignOp::AddAssign => BinOp::Add,
+                        AssignOp::SubAssign => BinOp::Sub,
+                        AssignOp::MulAssign => BinOp::Mul,
+                        AssignOp::DivAssign => BinOp::Div,
+                        AssignOp::ModAssign => BinOp::Mod,
+                        AssignOp::BitAndAssign => BinOp::BitAnd,
+                        AssignOp::BitOrAssign => BinOp::BitOr,
+                        AssignOp::BitXorAssign => BinOp::BitXor,
+                        AssignOp::ShlAssign => BinOp::Shl,
+                        AssignOp::ShrAssign => BinOp::Shr,
+                        AssignOp::Assign => unreachable!(),
+                    };
+                    let new_val = self.emit_inst(Inst::BinOp {
+                        op: bin_op,
+                        left: current,
+                        right: rhs,
+                        ty: pointee_ty,
+                    });
+                    self.emit_inst(Inst::Store { ptr: ptr_val, value: new_val });
+                }
+            }
+
+            Stmt::Expr(expr) => {
+                self.lower_expr(expr);
+            }
+
+            Stmt::Return(expr) => {
+                // Emit defer blocks before returning (in reverse order)
+                self.emit_defers();
+
+                if self.current_sret.is_some() {
+                    // Struct-returning function: copy struct data to sret, return void
+                    if let Some(e) = expr {
+                        let val = self.lower_expr(e);
+                        self.emit_sret_copy(val);
+                    }
+                    self.emit_terminator(Inst::Return { value: None });
+                } else {
+                    let ret_val = match expr {
+                        Some(e) => Some(self.lower_expr(e)),
+                        None => None,
+                    };
+                    self.emit_terminator(Inst::Return { value: ret_val });
+                }
+            }
+
+            Stmt::If { cond, then_block, else_block } => {
+                self.lower_if(cond, then_block, else_block.as_ref());
+            }
+
+            Stmt::While { cond, body } => {
+                self.lower_while(cond, body);
+            }
+
+            Stmt::For { var, iterator, body } => {
+                self.lower_for(var, iterator, body);
+            }
+
+            Stmt::Loop { body } => {
+                self.lower_loop(body);
+            }
+
+            Stmt::Break(expr) => {
+                if let Some((_, break_block, result_slot)) = self.loop_stack.last() {
+                    let break_target = *break_block;
+                    let slot = *result_slot;
+                    if let Some(e) = expr {
+                        let val = self.lower_expr(e);
+                        if let Some(slot) = slot {
+                            self.emit_inst(Inst::Store { ptr: slot, value: val });
+                        }
+                    }
+                    self.emit_terminator(Inst::Jump { target: break_target });
+                }
+            }
+
+            Stmt::Continue => {
+                if let Some((continue_block, _, _)) = self.loop_stack.last() {
+                    let continue_target = *continue_block;
+                    self.emit_terminator(Inst::Jump { target: continue_target });
+                }
+            }
+
+            Stmt::Defer(body) => {
+                // Register defer block — will be emitted at all exit points
+                self.defer_stack.push(body.clone());
+            }
+
+            Stmt::Match { expr, arms } => {
+                self.lower_match(expr, arms);
+            }
+
+            Stmt::Use { .. } => {
+                // Imports are handled at the AST level
+            }
+        }
+    }
+
+    /// Lower an if statement
+    fn lower_if(&mut self, cond: &Expr, then_block: &[Stmt], else_block: Option<&Vec<Stmt>>) {
+        let cond_val = self.lower_expr(cond);
+
+        let then_block_id = self.new_block();
+        let else_block_id = self.new_block();
+        let merge_block_id = self.new_block();
+
+        // Emit branch
+        self.emit_terminator(Inst::Branch {
+            cond: cond_val,
+            then: then_block_id,
+            else_: else_block_id,
+        });
+
+        // Lower then block
+        self.set_current_block(then_block_id);
+        self.lower_stmts(then_block);
+        // If then block doesn't end with terminator, jump to merge
+        if !self.current_block_has_terminator() {
+            self.emit_terminator(Inst::Jump { target: merge_block_id });
+        }
+
+        // Lower else block
+        self.set_current_block(else_block_id);
+        if let Some(else_stmts) = else_block {
+            self.lower_stmts(else_stmts);
+        }
+        if !self.current_block_has_terminator() {
+            self.emit_terminator(Inst::Jump { target: merge_block_id });
+        }
+
+        // Continue in merge block
+        self.set_current_block(merge_block_id);
+    }
+
+    /// Lower a while loop
+    fn lower_while(&mut self, cond: &Expr, body: &[Stmt]) {
+        let cond_block = self.new_block();
+        let body_block = self.new_block();
+        let exit_block = self.new_block();
+
+        // Jump to condition block
+        self.emit_terminator(Inst::Jump { target: cond_block });
+
+        // Condition block
+        self.set_current_block(cond_block);
+        let cond_val = self.lower_expr(cond);
+        self.emit_terminator(Inst::Branch {
+            cond: cond_val,
+            then: body_block,
+            else_: exit_block,
+        });
+
+        // Body block
+        self.set_current_block(body_block);
+        self.loop_stack.push((cond_block, exit_block, None));
+        self.lower_stmts(body);
+        self.loop_stack.pop();
+        if !self.current_block_has_terminator() {
+            self.emit_terminator(Inst::Jump { target: cond_block });
+        }
+
+        // Continue after loop
+        self.set_current_block(exit_block);
+    }
+
+    /// Lower a for loop (for x in iterator { body })
+    fn lower_for(&mut self, var: &str, iterator: &Expr, body: &[Stmt]) {
+        // For ranges: for x in start..end { body }
+        // Lowered to: let x = start; while x < end { body; x += 1; }
+        match iterator {
+            Expr::Range { start, end, inclusive } => {
+                let start_val = self.lower_expr(start);
+                let end_val = self.lower_expr(end);
+
+                // Create alloca for loop variable (must be mutable across iterations)
+                let alloca = self.emit_inst(Inst::Alloca {
+                    ty: IrType::I64,
+                    region: Region::Stack,
+                });
+                self.emit_inst(Inst::Store {
+                    ptr: alloca,
+                    value: start_val,
+                });
+                self.allocas.insert(var.to_string(), alloca);
+                if let Some(ref mut f) = self.current_func {
+                    f.bind_local(var, alloca);
+                }
+
+                let cond_block = self.new_block();
+                let body_block = self.new_block();
+                let exit_block = self.new_block();
+
+                self.emit_terminator(Inst::Jump { target: cond_block });
+
+                // Condition: var < end (or var <= end for inclusive)
+                self.set_current_block(cond_block);
+                let var_val = self.emit_inst(Inst::Load {
+                    ptr: alloca,
+                    ty: IrType::I64,
+                });
+                let cmp_op = if *inclusive { BinOp::LtEq } else { BinOp::Lt };
+                let cond_val = self.emit_inst(Inst::BinOp {
+                    op: cmp_op,
+                    left: var_val,
+                    right: end_val,
+                    ty: IrType::Bool,
+                });
+                self.emit_terminator(Inst::Branch {
+                    cond: cond_val,
+                    then: body_block,
+                    else_: exit_block,
+                });
+
+                // Body
+                self.set_current_block(body_block);
+                self.loop_stack.push((cond_block, exit_block, None));
+                self.lower_stmts(body);
+                self.loop_stack.pop();
+
+                // Increment: var += 1
+                if !self.current_block_has_terminator() {
+                    let current = self.emit_inst(Inst::Load {
+                        ptr: alloca,
+                        ty: IrType::I64,
+                    });
+                    let one = self.emit_inst(Inst::ConstInt { value: 1, ty: IrType::I64 });
+                    let inc = self.emit_inst(Inst::BinOp {
+                        op: BinOp::Add,
+                        left: current,
+                        right: one,
+                        ty: IrType::I64,
+                    });
+                    self.emit_inst(Inst::Store {
+                        ptr: alloca,
+                        value: inc,
+                    });
+                    self.emit_terminator(Inst::Jump { target: cond_block });
+                }
+
+                self.set_current_block(exit_block);
+            }
+            _ => {
+                // Check if iterator is a Vec (Opaque type)
+                let iter_val = self.lower_expr(iterator);
+                let iter_ty = self.get_value_type(iter_val);
+                if iter_ty.is_opaque_named("Vec") {
+                    self.lower_for_vec(var, iter_val, body);
+                    return;
+                }
+                // Array iterator: for x in array { body }
+                // Lowered to: let i = 0; while i < len { let x = arr[i]; body; i += 1; }
+                let arr_val = iter_val;
+                let arr_ty = self.get_value_type(arr_val);
+                // Handle both direct array and pointer-to-array (from mutable var load)
+                let (elem_ty, arr_len) = match &arr_ty {
+                    IrType::Array(inner, len) => (*inner.clone(), *len),
+                    IrType::Ptr(inner) => match inner.as_ref() {
+                        IrType::Array(inner2, len2) => (*inner2.clone(), *len2),
+                        _ => (IrType::I64, 0),
+                    },
+                    _ => (IrType::I64, 0),
+                };
+
+                // Create alloca for loop variable
+                let var_alloca = self.emit_inst(Inst::Alloca {
+                    ty: elem_ty.clone(),
+                    region: Region::Stack,
+                });
+                self.alloca_types.insert(var_alloca, elem_ty.clone());
+                self.allocas.insert(var.to_string(), var_alloca);
+                if let Some(ref mut f) = self.current_func {
+                    f.bind_local(var, var_alloca);
+                }
+
+                // Create index alloca
+                let idx_alloca = self.emit_inst(Inst::Alloca {
+                    ty: IrType::I64,
+                    region: Region::Stack,
+                });
+                self.alloca_types.insert(idx_alloca, IrType::I64);
+                let zero = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                self.emit_inst(Inst::Store {
+                    ptr: idx_alloca,
+                    value: zero,
+                });
+
+                let cond_block = self.new_block();
+                let body_block = self.new_block();
+                let exit_block = self.new_block();
+
+                self.emit_terminator(Inst::Jump { target: cond_block });
+
+                // Condition: i < arr_len
+                self.set_current_block(cond_block);
+                let idx_val = self.emit_inst(Inst::Load { ptr: idx_alloca, ty: IrType::I64 });
+                let len_val = self.emit_inst(Inst::ConstInt { value: arr_len as i64, ty: IrType::I64 });
+                let cond_val = self.emit_inst(Inst::BinOp {
+                    op: BinOp::Lt,
+                    left: idx_val,
+                    right: len_val,
+                    ty: IrType::Bool,
+                });
+                self.emit_terminator(Inst::Branch {
+                    cond: cond_val,
+                    then: body_block,
+                    else_: exit_block,
+                });
+
+                // Body: load arr[i], store to var_alloca, lower body, increment
+                self.set_current_block(body_block);
+                let cur_idx = self.emit_inst(Inst::Load { ptr: idx_alloca, ty: IrType::I64 });
+                let elem_ptr = self.emit_inst(Inst::GetElemPtr {
+                    array_ptr: arr_val,
+                    index: cur_idx,
+                    elem_ty: elem_ty.clone(),
+                });
+                let elem_val = self.emit_inst(Inst::Load { ptr: elem_ptr, ty: elem_ty });
+                self.emit_inst(Inst::Store { ptr: var_alloca, value: elem_val });
+
+                self.loop_stack.push((cond_block, exit_block, None));
+                self.lower_stmts(body);
+                self.loop_stack.pop();
+
+                if !self.current_block_has_terminator() {
+                    let cur = self.emit_inst(Inst::Load { ptr: idx_alloca, ty: IrType::I64 });
+                    let one = self.emit_inst(Inst::ConstInt { value: 1, ty: IrType::I64 });
+                    let inc = self.emit_inst(Inst::BinOp {
+                        op: BinOp::Add,
+                        left: cur,
+                        right: one,
+                        ty: IrType::I64,
+                    });
+                    self.emit_inst(Inst::Store { ptr: idx_alloca, value: inc });
+                    self.emit_terminator(Inst::Jump { target: cond_block });
+                }
+
+                self.set_current_block(exit_block);
+            }
+        }
+    }
+
+    /// Lower `for x in vec { body }` — iterates Vec via p_vec_len/p_vec_get
+    fn lower_for_vec(&mut self, var: &str, vec_val: ValueId, body: &[Stmt]) {
+        // Create alloca for loop variable — use Opaque so Load checks side-table
+        let var_alloca = self.emit_inst(Inst::Alloca {
+            ty: IrType::Opaque("any".to_string()),
+            region: Region::Stack,
+        });
+        self.alloca_types.insert(var_alloca, IrType::Opaque("any".to_string()));
+        self.allocas.insert(var.to_string(), var_alloca);
+        if let Some(ref mut f) = self.current_func {
+            f.bind_local(var, var_alloca);
+        }
+
+        // Create index alloca
+        let idx_alloca = self.emit_inst(Inst::Alloca {
+            ty: IrType::I64,
+            region: Region::Stack,
+        });
+        self.alloca_types.insert(idx_alloca, IrType::I64);
+        let zero = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+        self.emit_inst(Inst::Store {
+            ptr: idx_alloca,
+            value: zero,
+        });
+
+        let cond_block = self.new_block();
+        let body_block = self.new_block();
+        let exit_block = self.new_block();
+
+        self.emit_terminator(Inst::Jump { target: cond_block });
+
+        // Condition: i < vec.len()
+        self.set_current_block(cond_block);
+        let idx_val = self.emit_inst(Inst::Load { ptr: idx_alloca, ty: IrType::I64 });
+        let len_val = self.emit_inst(Inst::Call {
+            func: "p_vec_len".to_string(),
+            args: vec![vec_val],
+            ret_ty: IrType::I64,
+            effects: EffectSet::new(),
+        });
+        let cond_val = self.emit_inst(Inst::BinOp {
+            op: BinOp::Lt,
+            left: idx_val,
+            right: len_val,
+            ty: IrType::Bool,
+        });
+        self.emit_terminator(Inst::Branch {
+            cond: cond_val,
+            then: body_block,
+            else_: exit_block,
+        });
+
+        // Body: vec.get(i), store to var_alloca, lower body, increment
+        self.set_current_block(body_block);
+        let cur_idx = self.emit_inst(Inst::Load { ptr: idx_alloca, ty: IrType::I64 });
+        let elem_val = self.emit_inst(Inst::Call {
+            func: "p_vec_get".to_string(),
+            args: vec![vec_val, cur_idx],
+            ret_ty: IrType::Opaque("any".to_string()),
+            effects: EffectSet::new(),
+        });
+        self.emit_inst(Inst::Store { ptr: var_alloca, value: elem_val });
+
+        self.loop_stack.push((cond_block, exit_block, None));
+        self.lower_stmts(body);
+        self.loop_stack.pop();
+
+        if !self.current_block_has_terminator() {
+            let cur = self.emit_inst(Inst::Load { ptr: idx_alloca, ty: IrType::I64 });
+            let one = self.emit_inst(Inst::ConstInt { value: 1, ty: IrType::I64 });
+            let inc = self.emit_inst(Inst::BinOp {
+                op: BinOp::Add,
+                left: cur,
+                right: one,
+                ty: IrType::I64,
+            });
+            self.emit_inst(Inst::Store { ptr: idx_alloca, value: inc });
+            self.emit_terminator(Inst::Jump { target: cond_block });
+        }
+
+        self.set_current_block(exit_block);
+    }
+
+    /// Lower an infinite loop
+    fn lower_loop(&mut self, body: &[Stmt]) {
+        let loop_block = self.new_block();
+        let exit_block = self.new_block();
+
+        self.emit_terminator(Inst::Jump { target: loop_block });
+
+        self.set_current_block(loop_block);
+        self.loop_stack.push((loop_block, exit_block, None));
+        self.lower_stmts(body);
+        self.loop_stack.pop();
+        if !self.current_block_has_terminator() {
+            self.emit_terminator(Inst::Jump { target: loop_block });
+        }
+
+        self.set_current_block(exit_block);
+    }
+
+    /// Lower a match statement (lowered to if/else chains)
+    fn lower_match(&mut self, expr: &Expr, arms: &[MatchArm]) {
+        let match_val = self.lower_expr(expr);
+
+        let merge_block = self.new_block();
+
+        for arm in arms {
+            let match_block = self.new_block();
+            let next_arm_block = self.new_block();
+
+            // Check pattern against match_val
+            match &arm.pattern {
+                Pattern::Wildcard => {
+                    self.emit_terminator(Inst::Jump { target: match_block });
+                }
+                Pattern::IntLit(n) => {
+                    let const_val = self.emit_inst(Inst::ConstInt { value: *n, ty: IrType::I64 });
+                    let cmp = self.emit_inst(Inst::BinOp {
+                        op: BinOp::Eq,
+                        left: match_val,
+                        right: const_val,
+                        ty: IrType::Bool,
+                    });
+                    self.emit_terminator(Inst::Branch {
+                        cond: cmp,
+                        then: match_block,
+                        else_: next_arm_block,
+                    });
+                }
+                Pattern::BoolLit(b) => {
+                    let const_val = self.emit_inst(Inst::ConstBool { value: *b });
+                    let cmp = self.emit_inst(Inst::BinOp {
+                        op: BinOp::Eq,
+                        left: match_val,
+                        right: const_val,
+                        ty: IrType::Bool,
+                    });
+                    self.emit_terminator(Inst::Branch {
+                        cond: cmp,
+                        then: match_block,
+                        else_: next_arm_block,
+                    });
+                }
+                Pattern::Ident(name) => {
+                    // Bind the match value to this identifier
+                    if let Some(ref mut f) = self.current_func {
+                        f.bind_local(name, match_val);
+                    }
+                    self.emit_terminator(Inst::Jump { target: match_block });
+                }
+                Pattern::StrLit(s) => {
+                    let const_val = self.emit_inst(Inst::ConstStr { value: s.clone() });
+                    let cmp = self.emit_inst(Inst::BinOp {
+                        op: BinOp::Eq,
+                        left: match_val,
+                        right: const_val,
+                        ty: IrType::Bool,
+                    });
+                    self.emit_terminator(Inst::Branch {
+                        cond: cmp,
+                        then: match_block,
+                        else_: next_arm_block,
+                    });
+                }
+                Pattern::Range { start, end } => {
+                    // Range pattern: start..end (non-inclusive)
+                    // Extract integer values from sub-patterns
+                    let (lo, hi) = match (start.as_ref(), end.as_ref()) {
+                        (Pattern::IntLit(s), Pattern::IntLit(e)) => (*s, *e),
+                        _ => { self.emit_terminator(Inst::Jump { target: next_arm_block }); continue; }
+                    };
+                    let start_val = self.emit_inst(Inst::ConstInt { value: lo, ty: IrType::I64 });
+                    let end_val = self.emit_inst(Inst::ConstInt { value: hi, ty: IrType::I64 });
+                    let lo_cmp = self.emit_inst(Inst::BinOp { op: BinOp::LtEq, left: start_val, right: match_val, ty: IrType::Bool });
+                    let hi_cmp = self.emit_inst(Inst::BinOp { op: BinOp::Lt, left: match_val, right: end_val, ty: IrType::Bool });
+                    let in_range = self.emit_inst(Inst::BinOp { op: BinOp::And, left: lo_cmp, right: hi_cmp, ty: IrType::Bool });
+                    self.emit_terminator(Inst::Branch { cond: in_range, then: match_block, else_: next_arm_block });
+                }
+                Pattern::EnumVariant { enum_name, variant, bindings } => {
+                    // Load the tag (field 0) and compare to variant index
+                    let variant_idx = if enum_name.is_empty() {
+                        // Shorthand pattern (e.g. Some(x) without Option:: prefix)
+                        // Search all enums for a matching variant name
+                        let mut found = None;
+                        for (_, enum_def) in &self.enums {
+                            if let Some(idx) = enum_def.variants.iter().position(|v| v.name == *variant) {
+                                found = Some(idx as i64);
+                                break;
+                            }
+                        }
+                        found.unwrap_or(0)
+                    } else if let Some(enum_def) = self.enums.get(enum_name) {
+                        enum_def.variants.iter().position(|v| v.name == *variant).unwrap_or(0) as i64
+                    } else {
+                        0
+                    };
+                    let tag_ptr = self.emit_inst(Inst::GetFieldPtr {
+                        struct_ptr: match_val,
+                        field_index: 0,
+                        field_ty: IrType::I64,
+                    });
+                    let tag = self.emit_inst(Inst::Load { ptr: tag_ptr, ty: IrType::I64 });
+                    let expected = self.emit_inst(Inst::ConstInt { value: variant_idx, ty: IrType::I64 });
+                    let cmp = self.emit_inst(Inst::BinOp {
+                        op: BinOp::Eq,
+                        left: tag,
+                        right: expected,
+                        ty: IrType::Bool,
+                    });
+                    self.emit_terminator(Inst::Branch {
+                        cond: cmp,
+                        then: match_block,
+                        else_: next_arm_block,
+                    });
+                    // Bind data fields in the match block
+                    self.set_current_block(match_block);
+                    for (i, (binding, _ty_name)) in bindings.iter().enumerate() {
+                        let field_ptr = self.emit_inst(Inst::GetFieldPtr {
+                            struct_ptr: match_val,
+                            field_index: (i + 1) as u32,
+                            field_ty: IrType::I64,
+                        });
+                        let field_val = self.emit_inst(Inst::Load { ptr: field_ptr, ty: IrType::I64 });
+                        if let Some(ref mut f) = self.current_func {
+                            f.bind_local(binding, field_val);
+                        }
+                    }
+                    // Skip the normal body lowering since we already set the block
+                    self.lower_stmts(&arm.body);
+                    if !self.current_block_has_terminator() {
+                        self.emit_terminator(Inst::Jump { target: merge_block });
+                    }
+                    self.set_current_block(next_arm_block);
+                    continue;
+                }
+            }
+
+            // Lower match arm body
+            self.set_current_block(match_block);
+            self.lower_stmts(&arm.body);
+            if !self.current_block_has_terminator() {
+                self.emit_terminator(Inst::Jump { target: merge_block });
+            }
+
+            // Continue to next arm
+            self.set_current_block(next_arm_block);
+        }
+
+        // No arm matched — jump to merge
+        self.emit_terminator(Inst::Jump { target: merge_block });
+        self.set_current_block(merge_block);
+    }
+
+    /// Lower a match expression — stores arm result into result_slot
+    fn lower_match_expr(&mut self, expr: &Expr, arms: &[MatchArm], result_slot: ValueId) {
+        let match_val = self.lower_expr(expr);
+        let merge_block = self.new_block();
+
+        for arm in arms {
+            let match_block = self.new_block();
+            let next_arm_block = self.new_block();
+
+            match &arm.pattern {
+                Pattern::Wildcard => {
+                    self.emit_terminator(Inst::Jump { target: match_block });
+                }
+                Pattern::IntLit(n) => {
+                    let const_val = self.emit_inst(Inst::ConstInt { value: *n, ty: IrType::I64 });
+                    let cmp = self.emit_inst(Inst::BinOp { op: BinOp::Eq, left: match_val, right: const_val, ty: IrType::Bool });
+                    self.emit_terminator(Inst::Branch { cond: cmp, then: match_block, else_: next_arm_block });
+                }
+                Pattern::BoolLit(b) => {
+                    let const_val = self.emit_inst(Inst::ConstBool { value: *b });
+                    let cmp = self.emit_inst(Inst::BinOp { op: BinOp::Eq, left: match_val, right: const_val, ty: IrType::Bool });
+                    self.emit_terminator(Inst::Branch { cond: cmp, then: match_block, else_: next_arm_block });
+                }
+                Pattern::Ident(name) => {
+                    if let Some(ref mut f) = self.current_func {
+                        f.bind_local(name, match_val);
+                    }
+                    self.emit_terminator(Inst::Jump { target: match_block });
+                }
+                Pattern::StrLit(s) => {
+                    let const_val = self.emit_inst(Inst::ConstStr { value: s.clone() });
+                    let cmp = self.emit_inst(Inst::BinOp { op: BinOp::Eq, left: match_val, right: const_val, ty: IrType::Bool });
+                    self.emit_terminator(Inst::Branch { cond: cmp, then: match_block, else_: next_arm_block });
+                }
+                Pattern::Range { start, end } => {
+                    let (lo, hi) = match (start.as_ref(), end.as_ref()) {
+                        (Pattern::IntLit(s), Pattern::IntLit(e)) => (*s, *e),
+                        _ => { self.emit_terminator(Inst::Jump { target: next_arm_block }); continue; }
+                    };
+                    let start_val = self.emit_inst(Inst::ConstInt { value: lo, ty: IrType::I64 });
+                    let end_val = self.emit_inst(Inst::ConstInt { value: hi, ty: IrType::I64 });
+                    let lo_cmp = self.emit_inst(Inst::BinOp { op: BinOp::LtEq, left: start_val, right: match_val, ty: IrType::Bool });
+                    let hi_cmp = self.emit_inst(Inst::BinOp { op: BinOp::Lt, left: match_val, right: end_val, ty: IrType::Bool });
+                    let in_range = self.emit_inst(Inst::BinOp { op: BinOp::And, left: lo_cmp, right: hi_cmp, ty: IrType::Bool });
+                    self.emit_terminator(Inst::Branch { cond: in_range, then: match_block, else_: next_arm_block });
+                }
+                Pattern::EnumVariant { enum_name, variant, bindings } => {
+                    let variant_idx = if enum_name.is_empty() {
+                        let mut found = None;
+                        for (_, enum_def) in &self.enums {
+                            if let Some(idx) = enum_def.variants.iter().position(|v| v.name == *variant) {
+                                found = Some(idx as i64);
+                                break;
+                            }
+                        }
+                        found.unwrap_or(0)
+                    } else if let Some(enum_def) = self.enums.get(enum_name) {
+                        enum_def.variants.iter().position(|v| v.name == *variant).unwrap_or(0) as i64
+                    } else { 0 };
+                    let tag_ptr = self.emit_inst(Inst::GetFieldPtr { struct_ptr: match_val, field_index: 0, field_ty: IrType::I64 });
+                    let tag = self.emit_inst(Inst::Load { ptr: tag_ptr, ty: IrType::I64 });
+                    let expected = self.emit_inst(Inst::ConstInt { value: variant_idx, ty: IrType::I64 });
+                    let cmp = self.emit_inst(Inst::BinOp { op: BinOp::Eq, left: tag, right: expected, ty: IrType::Bool });
+                    self.emit_terminator(Inst::Branch { cond: cmp, then: match_block, else_: next_arm_block });
+                    self.set_current_block(match_block);
+                    for (i, (binding, _ty_name)) in bindings.iter().enumerate() {
+                        let field_ptr = self.emit_inst(Inst::GetFieldPtr { struct_ptr: match_val, field_index: (i + 1) as u32, field_ty: IrType::I64 });
+                        let field_val = self.emit_inst(Inst::Load { ptr: field_ptr, ty: IrType::I64 });
+                        if let Some(ref mut f) = self.current_func {
+                            f.bind_local(binding, field_val);
+                        }
+                    }
+                    // Lower body and store result
+                    let mut last_val = None;
+                    for stmt in &arm.body {
+                        if let Stmt::Expr(e) = stmt {
+                            last_val = Some(self.lower_expr(e));
+                        } else {
+                            last_val = None;
+                            self.lower_stmt(stmt);
+                        }
+                    }
+                    if let Some(v) = last_val {
+                        self.emit_inst(Inst::Store { ptr: result_slot, value: v });
+                    }
+                    if !self.current_block_has_terminator() {
+                        self.emit_terminator(Inst::Jump { target: merge_block });
+                    }
+                    self.set_current_block(next_arm_block);
+                    continue;
+                }
+            }
+
+            // Lower match arm body and store result
+            self.set_current_block(match_block);
+            let mut last_val = None;
+            for stmt in &arm.body {
+                if let Stmt::Expr(e) = stmt {
+                    last_val = Some(self.lower_expr(e));
+                } else {
+                    last_val = None;
+                    self.lower_stmt(stmt);
+                }
+            }
+            if let Some(v) = last_val {
+                self.emit_inst(Inst::Store { ptr: result_slot, value: v });
+            }
+            if !self.current_block_has_terminator() {
+                self.emit_terminator(Inst::Jump { target: merge_block });
+            }
+
+            self.set_current_block(next_arm_block);
+        }
+
+        self.emit_terminator(Inst::Jump { target: merge_block });
+        self.set_current_block(merge_block);
+    }
+
+    /// Infer the result type of a match expression from its arms
+    fn infer_match_type(&self, arms: &[MatchArm]) -> IrType {
+        for arm in arms {
+            for stmt in &arm.body {
+                if let Stmt::Expr(e) = stmt {
+                    return self.infer_expr_type(e);
+                }
+            }
+        }
+        IrType::I64
+    }
+
+    /// Lower an expression to an SSA value
+    fn lower_expr(&mut self, expr: &Expr) -> ValueId {
+        match expr {
+            Expr::IntLit(n) => {
+                self.emit_inst(Inst::ConstInt { value: *n, ty: IrType::I64 })
+            }
+
+            Expr::FloatLit(f) => {
+                let bits = f.to_bits();
+                self.emit_inst(Inst::ConstFloat { bits, ty: IrType::F64 })
+            }
+
+            Expr::BoolLit(b) => {
+                self.emit_inst(Inst::ConstBool { value: *b })
+            }
+
+            Expr::StringLit(s) => {
+                // Intern the string and return a pointer to it
+                if let Some(ref mut _f) = self.current_func {
+                    let _label = self.module.intern_string(s);
+                }
+                self.emit_inst(Inst::ConstStr { value: s.clone() })
+            }
+
+            Expr::Ident(name) => {
+                // Check if this is a captured variable in a closure
+                if let Some((_, idx, cap_ty)) = self.current_captures.iter().find(|(n, _, _)| n == name) {
+                    let idx = *idx;
+                    let cap_ir_ty = lower_type(&cap_ty);
+                    // Load from env struct: env_ptr is the first param of the closure function
+                    if let Some(ref func) = self.current_func {
+                        if let Some(env_val) = func.params.first().map(|p| p.0) {
+                            // Get element pointer: env_ptr + idx * 8
+                            let idx_val = self.emit_inst(Inst::ConstInt { value: idx as i64, ty: IrType::I64 });
+                            let elem_ptr = self.emit_inst(Inst::GetElemPtr {
+                                array_ptr: env_val,
+                                index: idx_val,
+                                elem_ty: IrType::I64,
+                            });
+                            return self.emit_inst(Inst::Load { ptr: elem_ptr, ty: cap_ir_ty });
+                        }
+                    }
+                }
+                // Check if this is a mutable variable with an alloca
+                if let Some(alloca) = self.allocas.get(name) {
+                    let load_ty = self.alloca_types.get(alloca).cloned().unwrap_or(IrType::I64);
+                    // If the alloca holds a struct pointer, return the pointer directly
+                    if matches!(&load_ty, IrType::Ptr(inner) if matches!(inner.as_ref(), IrType::Struct(_))) {
+                        return self.emit_inst(Inst::Load { ptr: *alloca, ty: load_ty });
+                    }
+                    return self.emit_inst(Inst::Load {
+                        ptr: *alloca,
+                        ty: load_ty,
+                    });
+                }
+                // Check if it's a local variable
+                if let Some(val) = self.current_func.as_ref().and_then(|f| f.lookup_local(name)) {
+                    return val;
+                }
+                // Check if it's a constant (pc)
+                if let Some(const_expr) = self.constants.get(name).cloned() {
+                    return self.lower_expr(&const_expr);
+                }
+                // Check if it's a known function name — emit as env struct with fn addr
+                if self.module.functions.contains_key(name) || self.module.extern_functions.contains_key(name) {
+                    return self.make_fn_env(name, &[]);
+                }
+                // Unknown identifier — emit zero as fallback
+                self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 })
+            }
+
+            Expr::Binary { op, left, right } => {
+                let left_val = self.lower_expr(left);
+                let right_val = self.lower_expr(right);
+                let result_ty = self.infer_binop_type(op, left, right);
+                self.emit_inst(Inst::BinOp {
+                    op: op.clone(),
+                    left: left_val,
+                    right: right_val,
+                    ty: result_ty,
+                })
+            }
+
+            Expr::Unary { op, expr } => {
+                let operand = self.lower_expr(expr);
+                let result_ty = self.infer_unary_type(op, expr);
+                self.emit_inst(Inst::UnaryOp {
+                    op: op.clone(),
+                    operand,
+                    ty: result_ty,
+                })
+            }
+
+            Expr::Call { callee, args } => {
+                let arg_vals: Vec<ValueId> = args.iter()
+                    .map(|a| self.lower_expr(a))
+                    .collect();
+
+                // Check if callee is a local variable (function-typed param)
+                let is_local = self.current_func.as_ref().and_then(|f| f.lookup_local(callee)).is_some()
+                    || self.allocas.contains_key(callee);
+
+                if is_local {
+                    // Indirect call through function pointer variable
+                    let fn_val = if let Some(alloca) = self.allocas.get(callee) {
+                        let load_ty = self.alloca_types.get(alloca).cloned().unwrap_or(IrType::I64);
+                        self.emit_inst(Inst::Load { ptr: *alloca, ty: load_ty })
+                    } else if let Some(val) = self.current_func.as_ref().and_then(|f| f.lookup_local(callee)) {
+                        val
+                    } else {
+                        self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 })
+                    };
+                    let ret_ty = IrType::I64; // Default return type for indirect calls
+                    let mut effects = EffectSet::new();
+                    effects.add(Effect::IO); // Conservative
+                    // All function references are env structs, and all functions have __env param
+                    return self.emit_inst(Inst::CallPtr {
+                        fn_ptr: fn_val,
+                        args: arg_vals,
+                        ret_ty,
+                        effects,
+                        has_env: true,
+                    });
+                }
+
+                // Determine return type — look up function or default to I64
+                let ret_ty = self.lookup_func_ret_ty(callee);
+
+                // If the function returns a struct, use SRET calling convention:
+                // 1. Alloca space for the struct in the caller's frame
+                // 2. Pass the alloca pointer as a hidden first arg
+                // 3. The call result is the alloca pointer (not rax)
+                if let IrType::Struct(ref name) = ret_ty {
+                    let sret_ptr = self.emit_inst(Inst::Alloca {
+                        ty: IrType::Struct(name.clone()),
+                        region: Region::Stack,
+                    });
+                    let mut all_args = vec![sret_ptr];
+                    // Prepend dummy env_ptr for user functions (not externs or builtins)
+                    if !self.module.extern_functions.contains_key(callee) && callee != "print" {
+                        let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                        all_args.push(dummy_env);
+                    }
+                    all_args.extend(arg_vals);
+
+                    // Determine effects
+                    let mut effects = EffectSet::new();
+                    if callee.starts_with("__pledge") {
+                        effects.add(Effect::IO);
+                    } else if let Some(e) = self.module.function_effects.get(callee) {
+                        effects.add_all(e);
+                    }
+
+                    self.emit_inst(Inst::Call {
+                        func: callee.clone(),
+                        args: all_args,
+                        ret_ty: IrType::Void,
+                        effects,
+                    });
+                    // The result is the sret pointer, not the call's return value
+                    sret_ptr
+                } else {
+                    // Determine effects
+                    let mut effects = EffectSet::new();
+                    if callee.starts_with("p_print") {
+                        effects.add(Effect::IO);
+                    } else if callee.starts_with("__pledge") {
+                        effects.add(Effect::IO);
+                    } else {
+                        // User function — look up effects
+                        if let Some(e) = self.module.function_effects.get(callee) {
+                            effects.add_all(e);
+                        }
+                    }
+
+                    // Prepend dummy env_ptr for user functions (not externs or builtins)
+                    let mut all_args = arg_vals;
+                    if !self.module.extern_functions.contains_key(callee) && callee != "print" {
+                        let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                        all_args.insert(0, dummy_env);
+                    }
+
+                    self.emit_inst(Inst::Call {
+                        func: callee.clone(),
+                        args: all_args,
+                        ret_ty,
+                        effects,
+                    })
+                }
+            }
+
+            Expr::MethodCall { receiver, method, args } => {
+                // Check if this is Box::new(x) — built-in heap allocation
+                if let Expr::Ident(name) = receiver.as_ref() {
+                    if name == "Box" && method == "new" {
+                        // Box::new(x) = malloc(sizeof(x)), store x, return ptr
+                        let val = self.lower_expr(&args[0]);
+                        let val_ty = self.get_value_type(val);
+                        let size = self.module.type_size(&val_ty);
+                        let size_val = self.emit_inst(Inst::ConstInt { value: size as i64, ty: IrType::I64 });
+                        let typed_ptr_ty = IrType::Ptr(Box::new(val_ty.clone()));
+                        let ptr = self.emit_inst(Inst::Call {
+                            func: "p_malloc".to_string(),
+                            args: vec![size_val],
+                            ret_ty: typed_ptr_ty.clone(),
+                            effects: {
+                                let mut e = EffectSet::new();
+                                e.add(Effect::Alloc);
+                                e
+                            },
+                        });
+                        // Store the value at the heap address
+                        self.emit_inst(Inst::Store { ptr, value: val });
+                        return ptr;
+                    }
+                }
+                // Check if this is Vec::new() — built-in
+                if let Expr::Ident(name) = receiver.as_ref() {
+                    if name == "Vec" && method == "new" {
+                        return self.emit_inst(Inst::Call {
+                            func: "p_vec_new".to_string(),
+                            args: vec![],
+                            ret_ty: IrType::Generic("Vec".to_string(), vec![IrType::Opaque("any".to_string())]),
+                            effects: EffectSet::new(),
+                        });
+                    }
+                }
+                // Check if this is HashMap::new() — built-in
+                if let Expr::Ident(name) = receiver.as_ref() {
+                    if name == "HashMap" && method == "new" {
+                        return self.emit_inst(Inst::Call {
+                            func: "p_map_new".to_string(),
+                            args: vec![],
+                            ret_ty: IrType::Generic("HashMap".to_string(), vec![IrType::Ptr(Box::new(IrType::U8)), IrType::I64]),
+                            effects: EffectSet::new(),
+                        });
+                    }
+                }
+                // Check if this is String::from(x) — built-in
+                if let Expr::Ident(name) = receiver.as_ref() {
+                    if name == "String" && method == "from" {
+                        let arg = self.lower_expr(&args[0]);
+                        return self.emit_inst(Inst::Call {
+                            func: "p_string_from".to_string(),
+                            args: vec![arg],
+                            ret_ty: IrType::Opaque("String".to_string()),
+                            effects: EffectSet::new(),
+                        });
+                    }
+                }
+                // Check if this is an associated function call (e.g. Point::new(x, y))
+                // where receiver is Expr::Ident("Point") and "Point" is a struct name
+                if let Expr::Ident(name) = receiver.as_ref() {
+                    if self.structs.contains_key(name) {
+                        // Associated function call: mangle as StructName_method
+                        let mangled_name = format!("{}_{}", name, method);
+                        let mut all_args = Vec::new();
+                        for a in args {
+                            all_args.push(self.lower_expr(a));
+                        }
+                        // Look up return type
+                        let ret_ty = if let Some(meth) = self.impl_methods.get(&(name.clone(), method.clone())) {
+                            lower_type(&meth.ret_ty)
+                        } else {
+                            IrType::I64
+                        };
+                        // Handle struct return with SRET
+                        if let IrType::Struct(ref sname) = ret_ty {
+                            let sret_ptr = self.emit_inst(Inst::Alloca {
+                                ty: IrType::Struct(sname.clone()),
+                                region: Region::Stack,
+                            });
+                            let mut sret_args = vec![sret_ptr];
+                            // Prepend dummy env_ptr for user functions
+                            if !self.module.extern_functions.contains_key(&mangled_name) && mangled_name != "print" {
+                                let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                                sret_args.push(dummy_env);
+                            }
+                            sret_args.extend(all_args);
+                            let mut effects = EffectSet::new();
+                            if let Some(e) = self.module.function_effects.get(&mangled_name) {
+                                effects.add_all(e);
+                            }
+                            self.emit_inst(Inst::Call {
+                                func: mangled_name,
+                                args: sret_args,
+                                ret_ty: IrType::Void,
+                                effects,
+                            });
+                            return sret_ptr;
+                        } else {
+                            let mut effects = EffectSet::new();
+                            if let Some(e) = self.module.function_effects.get(&mangled_name) {
+                                effects.add_all(e);
+                            }
+                            // Prepend dummy env_ptr for user functions
+                            if !self.module.extern_functions.contains_key(&mangled_name) && mangled_name != "print" {
+                                let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                                all_args.insert(0, dummy_env);
+                            }
+                            return self.emit_inst(Inst::Call {
+                                func: mangled_name,
+                                args: all_args,
+                                ret_ty,
+                                effects,
+                            });
+                        }
+                    }
+                }
+                // Regular method call: receiver is a value, pass as first arg
+                let recv_val = self.lower_expr(receiver);
+
+                // Builtin collection method dispatch
+                let recv_ty = self.get_value_type(recv_val);
+                let is_builtin_collection = recv_ty.is_opaque_named("Vec")
+                    || recv_ty.is_opaque_named("HashMap")
+                    || recv_ty.is_opaque_named("String");
+                if is_builtin_collection {
+                    let mut runtime_args = vec![recv_val];
+                    for a in args {
+                        runtime_args.push(self.lower_expr(a));
+                    }
+                    let (func_name, ret_ty) = if recv_ty.is_opaque_named("Vec") {
+                        // Element type from Generic args, default to I64
+                        let elem_ty = recv_ty.generic_elem().cloned().unwrap_or(IrType::I64);
+                        let rt = match method.as_str() {
+                            "push" => IrType::Void,
+                            "pop" => elem_ty.clone(),
+                            "len" => IrType::I64,
+                            "is_empty" => IrType::Bool,
+                            "get" => elem_ty.clone(),
+                            "set" => IrType::Void,
+                            "clear" => IrType::Void,
+                            "capacity" => IrType::I64,
+                            "insert" => IrType::Void,
+                            "remove" => elem_ty.clone(),
+                            "contains" => IrType::Bool,
+                            "reverse" => IrType::Void,
+                            "first" => elem_ty.clone(),
+                            "last" => elem_ty.clone(),
+                            "extend" => IrType::Void,
+                            "truncate" => IrType::Void,
+                            "sort" => IrType::Void,
+                            "clone" => recv_ty.clone(),
+                            _ => IrType::I64,
+                        };
+                        (format!("p_vec_{}", method), rt)
+                    } else if recv_ty.is_opaque_named("HashMap") {
+                        let rt = match method.as_str() {
+                            "insert" => IrType::Void,
+                            "get" => IrType::I64,
+                            "contains" => IrType::Bool,
+                            "remove" => IrType::Void,
+                            "len" => IrType::I64,
+                            "is_empty" => IrType::Bool,
+                            "clear" => IrType::Void,
+                            "keys" => IrType::Generic("Vec".to_string(), vec![IrType::Ptr(Box::new(IrType::U8))]),
+                            "values" => IrType::Generic("Vec".to_string(), vec![IrType::I64]),
+                            "get_or" => IrType::I64,
+                            "clone" => recv_ty.clone(),
+                            _ => IrType::I64,
+                        };
+                        (format!("p_map_{}", method), rt)
+                    } else if recv_ty.is_opaque_named("String") {
+                        let rt = match method.as_str() {
+                            "len" => IrType::I64,
+                            "is_empty" => IrType::Bool,
+                            "push_str" => IrType::Opaque("String".to_string()),
+                            "to_string" => IrType::Opaque("String".to_string()),
+                            "contains" => IrType::Bool,
+                            "starts_with" => IrType::Bool,
+                            "ends_with" => IrType::Bool,
+                            "trim" => IrType::Opaque("String".to_string()),
+                            "split" => IrType::Generic("Vec".to_string(), vec![IrType::Opaque("String".to_string())]),
+                            "replace" => IrType::Opaque("String".to_string()),
+                            "char_at" => IrType::Opaque("String".to_string()),
+                            "to_uppercase" => IrType::Opaque("String".to_string()),
+                            "to_lowercase" => IrType::Opaque("String".to_string()),
+                            "parse_int" => IrType::I64,
+                            "find" => IrType::I64,
+                            "rfind" => IrType::I64,
+                            "repeat" => IrType::Opaque("String".to_string()),
+                            "bytes" => IrType::I64,
+                            "clone" => IrType::Opaque("String".to_string()),
+                            _ => IrType::I64,
+                        };
+                        (format!("p_string_{}", method), rt)
+                    } else {
+                        (method.clone(), IrType::I64)
+                    };
+                    return self.emit_inst(Inst::Call {
+                        func: func_name,
+                        args: runtime_args,
+                        ret_ty,
+                        effects: EffectSet::new(),
+                    });
+                }
+
+                let mut all_args = vec![recv_val];
+                for a in args {
+                    all_args.push(self.lower_expr(a));
+                }
+                // Determine the struct type from receiver to mangle method name
+                let recv_ty = self.get_value_type(recv_val);
+                let struct_name = match &recv_ty {
+                    IrType::Ptr(inner) => match inner.as_ref() {
+                        IrType::Struct(name) => Some(name.clone()),
+                        _ => None,
+                    },
+                    IrType::Struct(name) => Some(name.clone()),
+                    _ => None,
+                };
+                // Mangle as struct_name_method_name
+                let mangled_name = if let Some(ref sn) = struct_name {
+                    format!("{}_{}", sn, method)
+                } else {
+                    method.clone()
+                };
+                // Look up return type from the impl method
+                let ret_ty = if let Some(ref sn) = struct_name {
+                    if let Some(meth) = self.impl_methods.get(&(sn.clone(), method.clone())) {
+                        lower_type(&meth.ret_ty)
+                    } else {
+                        IrType::I64
+                    }
+                } else {
+                    IrType::I64
+                };
+                // Handle struct return with SRET
+                if let IrType::Struct(ref name) = ret_ty {
+                    let sret_ptr = self.emit_inst(Inst::Alloca {
+                        ty: IrType::Struct(name.clone()),
+                        region: Region::Stack,
+                    });
+                    let mut sret_args = vec![sret_ptr];
+                    // Prepend dummy env_ptr for user functions
+                    if !self.module.extern_functions.contains_key(&mangled_name) && mangled_name != "print" {
+                        let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                        sret_args.push(dummy_env);
+                    }
+                    sret_args.extend(all_args);
+                    let mut effects = EffectSet::new();
+                    if let Some(e) = self.module.function_effects.get(&mangled_name) {
+                        effects.add_all(e);
+                    }
+                    self.emit_inst(Inst::Call {
+                        func: mangled_name,
+                        args: sret_args,
+                        ret_ty: IrType::Void,
+                        effects,
+                    });
+                    sret_ptr
+                } else {
+                    let mut effects = EffectSet::new();
+                    if let Some(e) = self.module.function_effects.get(&mangled_name) {
+                        effects.add_all(e);
+                    }
+                    // Prepend dummy env_ptr for user functions
+                    if !self.module.extern_functions.contains_key(&mangled_name) && mangled_name != "print" {
+                        let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                        all_args.insert(0, dummy_env);
+                    }
+                    self.emit_inst(Inst::Call {
+                        func: mangled_name,
+                        args: all_args,
+                        ret_ty,
+                        effects,
+                    })
+                }
+            }
+
+            Expr::FieldAccess { expr, field } => {
+                // The expression should evaluate to a pointer to the struct
+                let struct_ptr = self.lower_expr(expr);
+
+                // Look up the struct layout to find the field index and type
+                // We need to determine the struct type from the value metadata
+                let struct_ty = self.get_value_type(struct_ptr);
+                let struct_name = match &struct_ty {
+                    IrType::Ptr(inner) => match inner.as_ref() {
+                        IrType::Struct(name) => Some(name.clone()),
+                        _ => None,
+                    },
+                    IrType::Struct(name) => Some(name.clone()),
+                    _ => None,
+                };
+
+                if let Some(name) = struct_name {
+                    if let Some(layout) = self.module.get_struct(&name).cloned() {
+                        if let Some((idx, (_, field_ty, _))) = layout.fields.iter()
+                            .enumerate()
+                            .find(|(_, (n, _, _))| n == field)
+                        {
+                            let field_ptr = self.emit_inst(Inst::GetFieldPtr {
+                                struct_ptr,
+                                field_index: idx as u32,
+                                field_ty: field_ty.clone(),
+                            });
+                            // If the field is a struct, return the pointer (not a load)
+                            // — structs can't be loaded as scalar values
+                            if matches!(field_ty, IrType::Struct(_)) {
+                                return field_ptr;
+                            }
+                            return self.emit_inst(Inst::Load {
+                                ptr: field_ptr,
+                                ty: field_ty.clone(),
+                            });
+                        }
+                    }
+                }
+
+                // Fallback: return 0
+                self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 })
+            }
+
+            Expr::StructLit { name, fields } => {
+                // Allocate struct on stack, store fields
+                let struct_ty = IrType::Struct(name.clone());
+                let ptr = self.emit_inst(Inst::Alloca {
+                    ty: struct_ty.clone(),
+                    region: Region::Stack,
+                });
+
+                // Store each field
+                let layout_clone = self.module.get_struct(name).cloned();
+                if let Some(layout) = layout_clone {
+                    for (field_name, field_expr) in fields {
+                        let field_val = self.lower_expr(field_expr);
+                        if let Some((idx, _)) = layout.fields.iter()
+                            .enumerate()
+                            .find(|(_, (n, _, _))| n == field_name)
+                        {
+                            let field_ty = layout.fields[idx].1.clone();
+                            let field_ptr = self.emit_inst(Inst::GetFieldPtr {
+                                struct_ptr: ptr,
+                                field_index: idx as u32,
+                                field_ty: field_ty.clone(),
+                            });
+                            // If the field is a struct, the value is a pointer to struct data.
+                            // Copy field-by-field rather than storing a pointer.
+                            if let IrType::Struct(ref field_struct_name) = field_ty {
+                                self.emit_struct_copy(field_val, field_ptr, field_struct_name);
+                            } else {
+                                self.emit_inst(Inst::Store {
+                                    ptr: field_ptr,
+                                    value: field_val,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Return the pointer to the struct (not a load — structs can be > 8 bytes)
+                // The value type is Ptr(Struct(name)) so FieldAccess can work with it
+                ptr
+            }
+
+            Expr::ArrayLit { elem_type, elements } => {
+                // Allocate array on stack, return pointer
+                let elem_ty = lower_type(elem_type);
+                let array_ty = IrType::Array(Box::new(elem_ty.clone()), elements.len());
+                let ptr = self.emit_inst(Inst::Alloca {
+                    ty: array_ty.clone(),
+                    region: Region::Stack,
+                });
+
+                // Store each element
+                for (i, elem_expr) in elements.iter().enumerate() {
+                    let elem_val = self.lower_expr(elem_expr);
+                    let idx = self.emit_inst(Inst::ConstInt { value: i as i64, ty: IrType::I64 });
+                    let elem_ptr = self.emit_inst(Inst::GetElemPtr {
+                        array_ptr: ptr,
+                        index: idx,
+                        elem_ty: elem_ty.clone(),
+                    });
+                    self.emit_inst(Inst::Store {
+                        ptr: elem_ptr,
+                        value: elem_val,
+                    });
+                }
+
+                // Return the pointer — arrays are accessed via pointers
+                ptr
+            }
+
+            Expr::Index { array, index } => {
+                let arr_val = self.lower_expr(array);
+                let arr_ty = self.get_value_type(arr_val);
+
+                // String slicing: s[start..end] → p_string_slice(s, start, end)
+                if arr_ty.is_opaque_named("String") {
+                    if let Expr::Range { start, end, inclusive } = index.as_ref() {
+                        let start_val = self.lower_expr(start);
+                        let end_val = self.lower_expr(end);
+                        // For inclusive range, add 1 to end
+                        let final_end = if *inclusive {
+                            let one = self.emit_inst(Inst::ConstInt { value: 1, ty: IrType::I64 });
+                            self.emit_inst(Inst::BinOp {
+                                op: BinOp::Add,
+                                left: end_val,
+                                right: one,
+                                ty: IrType::I64,
+                            })
+                        } else {
+                            end_val
+                        };
+                        return self.emit_inst(Inst::Call {
+                            func: "p_string_slice".to_string(),
+                            args: vec![arr_val, start_val, final_end],
+                            ret_ty: IrType::Opaque("String".to_string()),
+                            effects: EffectSet::new(),
+                        });
+                    }
+                }
+
+                let idx_val = self.lower_expr(index);
+
+                // Vec indexing — call runtime p_vec_get with correct element type
+                if arr_ty.is_opaque_named("Vec") {
+                    let elem_ty = arr_ty.generic_elem().cloned().unwrap_or(IrType::I64);
+                    return self.emit_inst(Inst::Call {
+                        func: "p_vec_get".to_string(),
+                        args: vec![arr_val, idx_val],
+                        ret_ty: elem_ty,
+                        effects: EffectSet::new(),
+                    });
+                }
+
+                let elem_ty = match &arr_ty {
+                    IrType::Array(inner, _) => *inner.clone(),
+                    _ => IrType::I64,
+                };
+                let elem_ptr = self.emit_inst(Inst::GetElemPtr {
+                    array_ptr: arr_val,
+                    index: idx_val,
+                    elem_ty: elem_ty.clone(),
+                });
+                self.emit_inst(Inst::Load {
+                    ptr: elem_ptr,
+                    ty: elem_ty,
+                })
+            }
+
+            Expr::If { cond, then_block, else_block } => {
+                // If as expression — use alloca to merge branch results.
+                // 1. Infer the result type from the then-branch's last expression
+                // 2. Allocate a result slot of the correct type
+                // 3. In each branch, store the result value to the slot
+                // 4. In the merge block, load from the slot
+                let result_ty = self.infer_expr_type(&Expr::If {
+                    cond: cond.clone(),
+                    then_block: then_block.clone(),
+                    else_block: else_block.clone(),
+                });
+                let result_slot = self.emit_inst(Inst::Alloca {
+                    ty: result_ty.clone(),
+                    region: Region::Stack,
+                });
+
+                let cond_val = self.lower_expr(cond);
+                let then_bb = self.new_block();
+                let else_bb = self.new_block();
+                let merge_bb = self.new_block();
+
+                self.emit_terminator(Inst::Branch {
+                    cond: cond_val,
+                    then: then_bb,
+                    else_: else_bb,
+                });
+
+                // Lower then block — capture last expression value, store to slot
+                self.set_current_block(then_bb);
+                let mut then_val: Option<ValueId> = None;
+                for stmt in then_block {
+                    if let Stmt::Expr(e) = stmt {
+                        then_val = Some(self.lower_expr(e));
+                    } else {
+                        self.lower_stmt(stmt);
+                        then_val = None;
+                    }
+                }
+                if let Some(tv) = then_val {
+                    self.emit_inst(Inst::Store { ptr: result_slot, value: tv });
+                }
+                if !self.current_block_has_terminator() {
+                    self.emit_terminator(Inst::Jump { target: merge_bb });
+                }
+
+                // Lower else block — capture last expression value, store to slot
+                self.set_current_block(else_bb);
+                let mut else_val: Option<ValueId> = None;
+                if let Some(else_stmts) = else_block {
+                    for stmt in else_stmts {
+                        if let Stmt::Expr(e) = stmt {
+                            else_val = Some(self.lower_expr(e));
+                        } else {
+                            self.lower_stmt(stmt);
+                            else_val = None;
+                        }
+                    }
+                }
+                if let Some(ev) = else_val {
+                    self.emit_inst(Inst::Store { ptr: result_slot, value: ev });
+                }
+                if !self.current_block_has_terminator() {
+                    self.emit_terminator(Inst::Jump { target: merge_bb });
+                }
+
+                // Merge block — load the result from the slot
+                self.set_current_block(merge_bb);
+                self.emit_inst(Inst::Load { ptr: result_slot, ty: result_ty })
+            }
+
+            Expr::Range { .. } => {
+                // Ranges are handled by for loop lowering
+                self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 })
+            }
+
+            Expr::Block(stmts) => {
+                // Lower all statements; if the last one is an expression,
+                // its value becomes the block's value
+                let mut last_val: Option<ValueId> = None;
+                for stmt in stmts {
+                    if let Stmt::Expr(e) = stmt {
+                        last_val = Some(self.lower_expr(e));
+                    } else {
+                        self.lower_stmt(stmt);
+                        last_val = None;
+                    }
+                }
+                last_val.unwrap_or_else(|| self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 }))
+            }
+
+            Expr::FString { parts } => {
+                // Lower f-string by concatenating all parts
+                // Each literal part → ConstStr, each expr part → convert to string → concat
+                let mut result: Option<ValueId> = None;
+
+                for part in parts {
+                    let part_str = match part {
+                        FStringPart::Literal(s) => {
+                            self.emit_inst(Inst::ConstStr { value: s.clone() })
+                        }
+                        FStringPart::Expr(e) => {
+                            // Lower the expression
+                            let val = self.lower_expr(e);
+                            // Check if it's already a string type — if so, skip conversion
+                            let is_string = if let Some(ref f) = self.current_func {
+                                if let Some(meta) = f.values.get(&val) {
+                                    matches!(meta.ty, IrType::Ptr(_))
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+                            if is_string {
+                                val
+                            } else {
+                                // Call p_to_str to convert non-string value to string
+                                self.emit_inst(Inst::Call {
+                                    func: "p_to_str".to_string(),
+                                    args: vec![val],
+                                    ret_ty: IrType::Ptr(Box::new(IrType::U8)),
+                                    effects: EffectSet::new(),
+                                })
+                            }
+                        }
+                    };
+
+                    result = Some(match result {
+                        None => part_str,
+                        Some(prev) => {
+                            self.emit_inst(Inst::Call {
+                                func: "p_str_concat".to_string(),
+                                args: vec![prev, part_str],
+                                ret_ty: IrType::Ptr(Box::new(IrType::U8)),
+                                effects: EffectSet::new(),
+                            })
+                        }
+                    });
+                }
+
+                result.unwrap_or_else(|| self.emit_inst(Inst::ConstStr { value: String::new() }))
+            }
+
+            Expr::Match { expr, arms } => {
+                // Match as expression — use alloca to merge arm results
+                let result_ty = self.infer_match_type(arms);
+                let result_slot = self.emit_inst(Inst::Alloca {
+                    ty: result_ty.clone(),
+                    region: Region::Stack,
+                });
+                self.lower_match_expr(expr, arms, result_slot);
+                self.emit_inst(Inst::Load { ptr: result_slot, ty: result_ty })
+            }
+
+            Expr::EnumLit { enum_name, variant, args } => {
+                // Enum variant: stored as (tag, data...) in a struct-like layout
+                // Tag is the variant index, data fields follow
+                // We represent enums as a struct with first field = tag (i64), rest = data fields
+                let enum_ty = IrType::Struct(enum_name.clone());
+                let ptr = self.emit_inst(Inst::Alloca {
+                    ty: enum_ty.clone(),
+                    region: Region::Stack,
+                });
+
+                // Find variant index
+                let variant_idx = if let Some(enum_def) = self.enums.get(enum_name) {
+                    enum_def.variants.iter().position(|v| v.name == *variant).unwrap_or(0) as i64
+                } else {
+                    0
+                };
+
+                // Store tag at field 0
+                let tag_val = self.emit_inst(Inst::ConstInt { value: variant_idx, ty: IrType::I64 });
+                let tag_ptr = self.emit_inst(Inst::GetFieldPtr {
+                    struct_ptr: ptr,
+                    field_index: 0,
+                    field_ty: IrType::I64,
+                });
+                self.emit_inst(Inst::Store { ptr: tag_ptr, value: tag_val });
+
+                // Store data fields starting at field 1
+                for (i, arg_expr) in args.iter().enumerate() {
+                    let arg_val = self.lower_expr(arg_expr);
+                    let arg_ty = self.get_value_type(arg_val);
+                    let field_ptr = self.emit_inst(Inst::GetFieldPtr {
+                        struct_ptr: ptr,
+                        field_index: (i + 1) as u32,
+                        field_ty: arg_ty.clone(),
+                    });
+                    self.emit_inst(Inst::Store { ptr: field_ptr, value: arg_val });
+                }
+
+                ptr
+            }
+
+            Expr::Ref { expr, is_mut: _ } => {
+                // If taking a reference to a variable that has an alloca,
+                // return the alloca pointer directly (no copy).
+                // This ensures &mut v actually points to v's storage.
+                if let Expr::Ident(name) = expr.as_ref() {
+                    if let Some(alloca) = self.allocas.get(name) {
+                        return *alloca;
+                    }
+                }
+                // Otherwise: alloca, store, return pointer
+                let val = self.lower_expr(expr);
+                let val_ty = self.get_value_type(val);
+                let ptr = self.emit_inst(Inst::Alloca {
+                    ty: val_ty.clone(),
+                    region: Region::Stack,
+                });
+                self.emit_inst(Inst::Store {
+                    ptr,
+                    value: val,
+                });
+                ptr
+            }
+
+            Expr::Deref { expr } => {
+                let ptr = self.lower_expr(expr);
+                // Infer the pointee type from the pointer's type metadata
+                let pointee_ty = self.get_value_type(ptr);
+                let load_ty = match &pointee_ty {
+                    IrType::Ptr(inner) => *inner.clone(),
+                    _ => IrType::I64,
+                };
+                // If loading a struct, return the pointer itself (structs are accessed via pointers)
+                if matches!(load_ty, IrType::Struct(_)) {
+                    return ptr;
+                }
+                self.emit_inst(Inst::Load {
+                    ptr,
+                    ty: load_ty,
+                })
+            }
+
+            Expr::StrConcat { left, right } => {
+                let left_val = self.lower_expr(left);
+                let right_val = self.lower_expr(right);
+                self.emit_inst(Inst::Call {
+                    func: "p_str_concat".to_string(),
+                    args: vec![left_val, right_val],
+                    ret_ty: IrType::Ptr(Box::new(IrType::U8)),
+                    effects: {
+                        let mut e = EffectSet::new();
+                        e.add(Effect::Alloc);
+                        e.add(Effect::IO);
+                        e
+                    },
+                })
+            }
+
+            Expr::Try { expr } => {
+                // ? operator — evaluate expression, check if it's Ok/Err
+                // For now, we model Result as a struct with (tag, value)
+                // tag 0 = Ok, tag 1 = Err
+                // If Err, propagate the error to the caller (or to the nearest try block)
+                let val = self.lower_expr(expr);
+
+                // Load the tag (field 0)
+                let tag_ptr = self.emit_inst(Inst::GetFieldPtr {
+                    struct_ptr: val,
+                    field_index: 0,
+                    field_ty: IrType::I64,
+                });
+                let tag = self.emit_inst(Inst::Load {
+                    ptr: tag_ptr,
+                    ty: IrType::I64,
+                });
+
+                let ok_block = self.new_block();
+                let err_block = self.new_block();
+                let merge_block = self.new_block();
+
+                let zero_val = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                let is_ok = self.emit_inst(Inst::BinOp {
+                    op: BinOp::Eq,
+                    left: tag,
+                    right: zero_val,
+                    ty: IrType::Bool,
+                });
+
+                self.emit_terminator(Inst::Branch {
+                    cond: is_ok,
+                    then: ok_block,
+                    else_: err_block,
+                });
+
+                // Ok: load the value (field 1) and continue
+                self.set_current_block(ok_block);
+                self.emit_terminator(Inst::Jump { target: merge_block });
+
+                // Err: propagate the error
+                self.set_current_block(err_block);
+                if let Some(&(try_err_block, try_err_slot)) = self.try_stack.last() {
+                    // Inside a try block: copy the Result struct field-by-field into err_slot
+                    // (val is a *struct.Result pointer, err_slot is also a *struct.Result —
+                    //  we can't just Store the pointer, we need to copy the struct contents)
+                    let src_tag_ptr = self.emit_inst(Inst::GetFieldPtr {
+                        struct_ptr: val,
+                        field_index: 0,
+                        field_ty: IrType::I64,
+                    });
+                    let src_tag = self.emit_inst(Inst::Load { ptr: src_tag_ptr, ty: IrType::I64 });
+                    let dst_tag_ptr = self.emit_inst(Inst::GetFieldPtr {
+                        struct_ptr: try_err_slot,
+                        field_index: 0,
+                        field_ty: IrType::I64,
+                    });
+                    self.emit_inst(Inst::Store { ptr: dst_tag_ptr, value: src_tag });
+                    let src_val_ptr = self.emit_inst(Inst::GetFieldPtr {
+                        struct_ptr: val,
+                        field_index: 1,
+                        field_ty: IrType::I64,
+                    });
+                    let src_val = self.emit_inst(Inst::Load { ptr: src_val_ptr, ty: IrType::I64 });
+                    let dst_val_ptr = self.emit_inst(Inst::GetFieldPtr {
+                        struct_ptr: try_err_slot,
+                        field_index: 1,
+                        field_ty: IrType::I64,
+                    });
+                    self.emit_inst(Inst::Store { ptr: dst_val_ptr, value: src_val });
+                    self.emit_terminator(Inst::Jump { target: try_err_block });
+                } else {
+                    // Not inside a try block: return the error from the current function
+                    self.emit_defers();
+                    if self.current_sret.is_some() {
+                        self.emit_terminator(Inst::Return { value: None });
+                    } else {
+                        self.emit_terminator(Inst::Return { value: Some(val) });
+                    }
+                }
+
+                // Merge: load the unwrapped value
+                self.set_current_block(merge_block);
+                let val_ptr = self.emit_inst(Inst::GetFieldPtr {
+                    struct_ptr: val,
+                    field_index: 1,
+                    field_ty: IrType::I64,
+                });
+                self.emit_inst(Inst::Load {
+                    ptr: val_ptr,
+                    ty: IrType::I64,
+                })
+            }
+
+            Expr::TryBlock { body } => {
+                // try { body } — catches ? early returns, wraps result in Result
+                // Result is modeled as struct { tag: i64, value: i64 }
+                // tag 0 = Ok, tag 1 = Err
+
+                // Allocate slot for the error Result (captured by ? operator)
+                let err_slot = self.emit_inst(Inst::Alloca {
+                    ty: IrType::Struct("Result".to_string()),
+                    region: Region::Stack,
+                });
+
+                // Allocate output Result struct
+                let result_slot = self.emit_inst(Inst::Alloca {
+                    ty: IrType::Struct("Result".to_string()),
+                    region: Region::Stack,
+                });
+
+                let err_block = self.new_block();
+                let cont_block = self.new_block();
+
+                // Push try context so ? inside body jumps to err_block
+                self.try_stack.push((err_block, err_slot));
+
+                // Lower the body — last expression value becomes the Ok value
+                let mut last_val: Option<ValueId> = None;
+                for stmt in body {
+                    if let Stmt::Expr(e) = stmt {
+                        last_val = Some(self.lower_expr(e));
+                    } else {
+                        self.lower_stmt(stmt);
+                        last_val = None;
+                    }
+                }
+                let ok_val = last_val.unwrap_or_else(|| self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 }));
+
+                // Pop try context
+                self.try_stack.pop();
+
+                // Normal completion: build Result::Ok(ok_val)
+                // tag = 0 (Ok), value = ok_val
+                let ok_tag = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                let tag_ptr = self.emit_inst(Inst::GetFieldPtr {
+                    struct_ptr: result_slot,
+                    field_index: 0,
+                    field_ty: IrType::I64,
+                });
+                self.emit_inst(Inst::Store { ptr: tag_ptr, value: ok_tag });
+                let val_ptr = self.emit_inst(Inst::GetFieldPtr {
+                    struct_ptr: result_slot,
+                    field_index: 1,
+                    field_ty: IrType::I64,
+                });
+                self.emit_inst(Inst::Store { ptr: val_ptr, value: ok_val });
+                self.emit_terminator(Inst::Jump { target: cont_block });
+
+                // Error block: ? jumped here with the error Result in err_slot
+                self.set_current_block(err_block);
+                // Copy err_slot → result_slot
+                let err_tag_ptr = self.emit_inst(Inst::GetFieldPtr {
+                    struct_ptr: err_slot,
+                    field_index: 0,
+                    field_ty: IrType::I64,
+                });
+                let err_tag = self.emit_inst(Inst::Load { ptr: err_tag_ptr, ty: IrType::I64 });
+                let out_tag_ptr = self.emit_inst(Inst::GetFieldPtr {
+                    struct_ptr: result_slot,
+                    field_index: 0,
+                    field_ty: IrType::I64,
+                });
+                self.emit_inst(Inst::Store { ptr: out_tag_ptr, value: err_tag });
+                let err_val_ptr = self.emit_inst(Inst::GetFieldPtr {
+                    struct_ptr: err_slot,
+                    field_index: 1,
+                    field_ty: IrType::I64,
+                });
+                let err_val = self.emit_inst(Inst::Load { ptr: err_val_ptr, ty: IrType::I64 });
+                let out_val_ptr = self.emit_inst(Inst::GetFieldPtr {
+                    struct_ptr: result_slot,
+                    field_index: 1,
+                    field_ty: IrType::I64,
+                });
+                self.emit_inst(Inst::Store { ptr: out_val_ptr, value: err_val });
+                self.emit_terminator(Inst::Jump { target: cont_block });
+
+                // Continuation: result_slot holds the final Result
+                self.set_current_block(cont_block);
+                result_slot
+            }
+
+            Expr::TupleLit(elems) => {
+                // Allocate tuple on stack as a struct, store each element, return pointer
+                let tuple_size = elems.len();
+                let tuple_ty = IrType::Struct(format!("__tuple_{}", tuple_size));
+                let ptr = self.emit_inst(Inst::Alloca {
+                    ty: tuple_ty.clone(),
+                    region: Region::Stack,
+                });
+                for (i, e) in elems.iter().enumerate() {
+                    let val = self.lower_expr(e);
+                    let val_ty = self.get_value_type(val);
+                    let field_ptr = self.emit_inst(Inst::GetFieldPtr {
+                        struct_ptr: ptr,
+                        field_index: i as u32,
+                        field_ty: val_ty.clone(),
+                    });
+                    // If the value is a struct, copy field-by-field
+                    if let IrType::Struct(ref sub_name) = val_ty {
+                        self.emit_struct_copy(val, field_ptr, sub_name);
+                    } else {
+                        self.emit_inst(Inst::Store { ptr: field_ptr, value: val });
+                    }
+                }
+                ptr
+            }
+
+            Expr::Closure { params, body, ret_ty } => {
+                // Lambda lifting with environment struct:
+                // 1. Find free variables (captures) in the closure body
+                // 2. Create lifted function: (env_ptr: *u8, ...own_params) -> ret
+                //    Inside, load captures from env struct fields
+                // 3. At creation site: alloca env struct, store captures, return struct ptr
+                // 4. CallPtr passes env_ptr as first arg
+
+                let closure_id = self.module.functions.len();
+                let closure_name = format!("__closure_{}", closure_id);
+
+                // Find free variables
+                let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+                let captures = self.find_captures(body, &param_names);
+
+                // Build the lifted function — lower_func adds __env as first param automatically
+                let all_params = params.clone();
+
+                // Save current captures and set new ones for this closure
+                let saved_captures = std::mem::take(&mut self.current_captures);
+                for (i, (cap_name, cap_ty)) in captures.iter().enumerate() {
+                    // Capture field index in env struct is i+1 (field 0 is fn_name)
+                    self.current_captures.push((cap_name.clone(), i + 1, cap_ty.clone()));
+                }
+
+                let closure_func = Func {
+                    name: closure_name.clone(),
+                    type_params: vec![],
+                    type_param_bounds: vec![],
+                    params: all_params,
+                    ret_ty: ret_ty.clone().unwrap_or(Type::I64),
+                    body: body.clone(),
+                    is_pub: false,
+                };
+
+                // Save current function context, lower the closure, restore context
+                let saved_func = self.current_func.take();
+                self.lower_func(&closure_func);
+                self.current_func = saved_func;
+                self.current_captures = saved_captures;
+
+                // At the creation site: build env struct with captures
+                if captures.is_empty() {
+                    // No captures — still create env struct for uniform CallPtr handling
+                    self.make_fn_env(&closure_name, &[])
+                } else {
+                    // Lower capture values from enclosing scope
+                    let cap_vals: Vec<(String, ValueId)> = captures.iter()
+                        .map(|(name, _)| {
+                            let val = self.lower_expr(&Expr::Ident(name.clone()));
+                            (name.clone(), val)
+                        })
+                        .collect();
+                    self.make_fn_env(&closure_name, &cap_vals)
+                }
+            }
+            Expr::Cast { expr, target_ty } => {
+                let val = self.lower_expr(expr);
+                let src_ty = self.get_value_type(val);
+                let dst_ir_ty = lower_type(target_ty);
+                self.lower_cast(val, src_ty, dst_ir_ty)
+            }
+        }
+    }
+
+    /// Find free variables in a closure body — identifiers used but not defined as params or locals
+    fn find_captures(&self, body: &[Stmt], param_names: &[String]) -> Vec<(String, Type)> {
+        let mut free_vars: Vec<String> = Vec::new();
+        let mut local_names: Vec<String> = param_names.to_vec();
+        self.collect_free_vars(body, &mut free_vars, &mut local_names);
+
+        // For each free variable, look up its type from the enclosing scope
+        let mut captures = Vec::new();
+        for name in &free_vars {
+            // Try to find the type from alloca types or function locals
+            if let Some(alloca) = self.allocas.get(name) {
+                let ty = self.alloca_types.get(alloca).cloned().unwrap_or(IrType::I64);
+                captures.push((name.clone(), ir_type_to_ast_type(&ty)));
+            } else if let Some(ref func) = self.current_func {
+                // IR params are (ValueId, IrType) — check by looking up the name in the AST func params
+                // For now, just use I64 as the capture type
+                // TODO: properly look up the type
+                captures.push((name.clone(), Type::I64));
+            }
+        }
+        captures
+    }
+
+    fn collect_free_vars(&self, stmts: &[Stmt], free_vars: &mut Vec<String>, local_names: &mut Vec<String>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let { name, expr, .. } => {
+                    self.collect_free_vars_expr(expr, free_vars, local_names);
+                    local_names.push(name.clone());
+                }
+                Stmt::Assign { target, expr, .. } => {
+                    if !local_names.contains(target) && !free_vars.contains(target) {
+                        free_vars.push(target.clone());
+                    }
+                    self.collect_free_vars_expr(expr, free_vars, local_names);
+                }
+                Stmt::IndexAssign { array, index, expr, .. } => {
+                    if !local_names.contains(array) && !free_vars.contains(array) {
+                        free_vars.push(array.clone());
+                    }
+                    self.collect_free_vars_expr(index, free_vars, local_names);
+                    self.collect_free_vars_expr(expr, free_vars, local_names);
+                }
+                Stmt::DerefAssign { ptr_expr, expr, .. } => {
+                    self.collect_free_vars_expr(ptr_expr, free_vars, local_names);
+                    self.collect_free_vars_expr(expr, free_vars, local_names);
+                }
+                Stmt::Expr(e) => self.collect_free_vars_expr(e, free_vars, local_names),
+                Stmt::Return(e) => {
+                    if let Some(e) = e {
+                        self.collect_free_vars_expr(e, free_vars, local_names);
+                    }
+                }
+                Stmt::If { cond, then_block, else_block } => {
+                    self.collect_free_vars_expr(cond, free_vars, local_names);
+                    self.collect_free_vars(then_block, free_vars, local_names);
+                    if let Some(eb) = else_block {
+                        self.collect_free_vars(eb, free_vars, local_names);
+                    }
+                }
+                Stmt::While { cond, body } => {
+                    self.collect_free_vars_expr(cond, free_vars, local_names);
+                    self.collect_free_vars(body, free_vars, local_names);
+                }
+                Stmt::For { var, iterator, body } => {
+                    self.collect_free_vars_expr(iterator, free_vars, local_names);
+                    local_names.push(var.clone());
+                    self.collect_free_vars(body, free_vars, local_names);
+                }
+                Stmt::Loop { body } => {
+                    self.collect_free_vars(body, free_vars, local_names);
+                }
+                Stmt::Break(e) => {
+                    if let Some(e) = e {
+                        self.collect_free_vars_expr(e, free_vars, local_names);
+                    }
+                }
+                Stmt::Continue => {}
+                Stmt::Defer(body) => {
+                    self.collect_free_vars(body, free_vars, local_names);
+                }
+                Stmt::Match { expr, arms } => {
+                    self.collect_free_vars_expr(expr, free_vars, local_names);
+                    for arm in arms {
+                        if let Pattern::EnumVariant { bindings, .. } = &arm.pattern {
+                            for (pat_name, _) in bindings {
+                                local_names.push(pat_name.clone());
+                            }
+                        }
+                        if let Pattern::Ident(name) = &arm.pattern {
+                            local_names.push(name.clone());
+                        }
+                        self.collect_free_vars(&arm.body, free_vars, local_names);
+                    }
+                }
+                Stmt::Use { .. } => {}
+            }
+        }
+    }
+
+    fn collect_free_vars_expr(&self, expr: &Expr, free_vars: &mut Vec<String>, local_names: &[String]) {
+        match expr {
+            Expr::Ident(name) => {
+                if !local_names.contains(name) && !free_vars.contains(name) {
+                    // Check if it's a known variable in the enclosing scope
+                    if self.allocas.contains_key(name)
+                        || self.current_func.as_ref().map(|f| f.params.len() > 0).unwrap_or(false)
+                    {
+                        free_vars.push(name.clone());
+                    }
+                }
+            }
+            Expr::Binary { left, right, .. } => {
+                self.collect_free_vars_expr(left, free_vars, local_names);
+                self.collect_free_vars_expr(right, free_vars, local_names);
+            }
+            Expr::Unary { expr, .. } => {
+                self.collect_free_vars_expr(expr, free_vars, local_names);
+            }
+            Expr::Call { callee, args } => {
+                // Don't treat function names as free variables
+                if !self.module.functions.contains_key(callee) && !self.module.extern_functions.contains_key(callee) {
+                    if !local_names.contains(callee) && !free_vars.contains(callee) {
+                        if self.allocas.contains_key(callee)
+                            || self.current_func.as_ref().map(|f| f.params.len() > 0).unwrap_or(false)
+                        {
+                            free_vars.push(callee.clone());
+                        }
+                    }
+                }
+                for a in args {
+                    self.collect_free_vars_expr(a, free_vars, local_names);
+                }
+            }
+            Expr::FieldAccess { expr, .. } => {
+                self.collect_free_vars_expr(expr, free_vars, local_names);
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                self.collect_free_vars_expr(receiver, free_vars, local_names);
+                for a in args {
+                    self.collect_free_vars_expr(a, free_vars, local_names);
+                }
+            }
+            Expr::Index { array, index } => {
+                self.collect_free_vars_expr(array, free_vars, local_names);
+                self.collect_free_vars_expr(index, free_vars, local_names);
+            }
+            Expr::StructLit { fields, .. } => {
+                for (_, e) in fields {
+                    self.collect_free_vars_expr(e, free_vars, local_names);
+                }
+            }
+            Expr::If { cond, then_block, else_block } => {
+                self.collect_free_vars_expr(cond, free_vars, local_names);
+                for s in then_block {
+                    self.collect_free_vars(&[s.clone()], free_vars, &mut local_names.to_vec());
+                }
+                if let Some(eb) = else_block {
+                    for s in eb {
+                        self.collect_free_vars(&[s.clone()], free_vars, &mut local_names.to_vec());
+                    }
+                }
+            }
+            Expr::Block(stmts) => {
+                for s in stmts {
+                    self.collect_free_vars(&[s.clone()], free_vars, &mut local_names.to_vec());
+                }
+            }
+            Expr::Ref { expr, .. } => self.collect_free_vars_expr(expr, free_vars, local_names),
+            Expr::Deref { expr } => self.collect_free_vars_expr(expr, free_vars, local_names),
+            Expr::ArrayLit { elements, .. } => {
+                for e in elements {
+                    self.collect_free_vars_expr(e, free_vars, local_names);
+                }
+            }
+            Expr::FString { parts } => {
+                for p in parts {
+                    if let crate::ast::FStringPart::Expr(e) = p {
+                        self.collect_free_vars_expr(e, free_vars, local_names);
+                    }
+                }
+            }
+            Expr::Match { expr, arms } => {
+                self.collect_free_vars_expr(expr, free_vars, local_names);
+                for arm in arms {
+                    self.collect_free_vars(&arm.body, free_vars, &mut local_names.to_vec());
+                }
+            }
+            Expr::EnumLit { args, .. } => {
+                for a in args {
+                    self.collect_free_vars_expr(a, free_vars, local_names);
+                }
+            }
+            Expr::StrConcat { left, right } => {
+                self.collect_free_vars_expr(left, free_vars, local_names);
+                self.collect_free_vars_expr(right, free_vars, local_names);
+            }
+            Expr::Try { expr } => self.collect_free_vars_expr(expr, free_vars, local_names),
+            Expr::TryBlock { body } => {
+                for stmt in body {
+                    match stmt {
+                        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr(expr) => {
+                            self.collect_free_vars_expr(expr, free_vars, local_names);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Expr::TupleLit(elems) => {
+                for e in elems {
+                    self.collect_free_vars_expr(e, free_vars, local_names);
+                }
+            }
+            Expr::Range { start, end, .. } => {
+                self.collect_free_vars_expr(start, free_vars, local_names);
+                self.collect_free_vars_expr(end, free_vars, local_names);
+            }
+            Expr::Cast { expr, .. } => self.collect_free_vars_expr(expr, free_vars, local_names),
+            Expr::Closure { params, body, .. } => {
+                let mut inner_locals = local_names.to_vec();
+                for p in params {
+                    inner_locals.push(p.name.clone());
+                }
+                self.collect_free_vars(body, free_vars, &mut inner_locals);
+            }
+            Expr::IntLit(_) | Expr::FloatLit(_) | Expr::BoolLit(_) | Expr::StringLit(_) => {}
+        }
+    }
+
+    /// Lower a type cast (expr as Type)
+    fn lower_cast(&mut self, val: ValueId, src: IrType, dst: IrType) -> ValueId {
+        match (&src, &dst) {
+            // Same type — no-op
+            _ if src == dst => val,
+            // Int to int: extend or truncate
+            (a, b) if a.is_int() && b.is_int() => {
+                let src_size = self.module.type_size(&src);
+                let dst_size = self.module.type_size(&dst);
+                if dst_size > src_size {
+                    self.emit_inst(Inst::IntExtend { value: val, from: src, to: dst })
+                } else if dst_size < src_size {
+                    self.emit_inst(Inst::IntTrunc { value: val, from: src, to: dst })
+                } else {
+                    self.emit_inst(Inst::BitCast { value: val, from: src, to: dst })
+                }
+            }
+            // Int to float
+            (a, b) if a.is_int() && b.is_float() => {
+                self.emit_inst(Inst::IntToFloat { value: val, from: src, to: dst })
+            }
+            // Float to int
+            (a, b) if a.is_float() && b.is_int() => {
+                self.emit_inst(Inst::FloatToInt { value: val, from: src, to: dst })
+            }
+            // Float to float
+            (a, b) if a.is_float() && b.is_float() => {
+                self.emit_inst(Inst::BitCast { value: val, from: src, to: dst })
+            }
+            // Anything else: bitcast
+            _ => self.emit_inst(Inst::BitCast { value: val, from: src, to: dst }),
+        }
+    }
+
+    /// Lower compound assignment (+=, -=, etc.)
+    fn lower_compound_assign(&mut self, op: &AssignOp, current: ValueId, rhs: ValueId) -> ValueId {
+        let binop = match op {
+            AssignOp::AddAssign => BinOp::Add,
+            AssignOp::SubAssign => BinOp::Sub,
+            AssignOp::MulAssign => BinOp::Mul,
+            AssignOp::DivAssign => BinOp::Div,
+            AssignOp::ModAssign => BinOp::Mod,
+            AssignOp::BitAndAssign => BinOp::BitAnd,
+            AssignOp::BitOrAssign => BinOp::BitOr,
+            AssignOp::BitXorAssign => BinOp::BitXor,
+            AssignOp::ShlAssign => BinOp::Shl,
+            AssignOp::ShrAssign => BinOp::Shr,
+            AssignOp::Assign => unreachable!(),
+        };
+        let ty = self.get_value_type(current);
+        self.emit_inst(Inst::BinOp {
+            op: binop,
+            left: current,
+            right: rhs,
+            ty,
+        })
+    }
+
+    // ─── Helpers ────────────────────────────────────────────────────────
+
+    fn emit_inst(&mut self, inst: Inst) -> ValueId {
+        if let Some(ref mut f) = self.current_func {
+            let id = f.emit(inst);
+            // Override: emit() uses next_block-1, but we need current_block
+            // Move the instruction to the correct block
+            let wrong_idx = (f.next_block - 1) as usize;
+            let right_idx = self.current_block.0 as usize;
+            if wrong_idx != right_idx && wrong_idx < f.blocks.len() && right_idx < f.blocks.len() {
+                if let Some(&id) = f.blocks[wrong_idx].instructions.last() {
+                    f.blocks[wrong_idx].instructions.pop();
+                    f.blocks[right_idx].instructions.push(id);
+                }
+            }
+            id
+        } else {
+            ValueId(0)
+        }
+    }
+
+    /// Override the type of a value (used for closure env struct typing)
+    fn set_value_type(&mut self, id: ValueId, ty: IrType) {
+        if let Some(ref mut f) = self.current_func {
+            if let Some(meta) = f.values.get_mut(&id) {
+                meta.ty = ty;
+            }
+        }
+    }
+
+    /// Create an env struct for a function reference: [fn_addr, cap1, cap2, ...]
+    /// Returns a heap-allocated env struct pointer
+    fn make_fn_env(&mut self, fn_name: &str, captures: &[(String, ValueId)]) -> ValueId {
+        let env_size = ((1 + captures.len()) * 8) as i64;
+        let size_val = self.emit_inst(Inst::ConstInt { value: env_size, ty: IrType::I64 });
+        let env_ptr = self.emit_inst(Inst::Call {
+            func: "p_malloc".to_string(),
+            args: vec![size_val],
+            ret_ty: IrType::Ptr(Box::new(IrType::U8)),
+            effects: {
+                let mut es = EffectSet::new();
+                es.add(Effect::Alloc);
+                es
+            },
+        });
+
+        // Store function address at field 0
+        let fn_name_val = self.emit_inst(Inst::ConstStr { value: fn_name.to_string() });
+        let zero_idx = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+        let field0 = self.emit_inst(Inst::GetElemPtr {
+            array_ptr: env_ptr,
+            index: zero_idx,
+            elem_ty: IrType::I64,
+        });
+        self.emit_inst(Inst::Store { ptr: field0, value: fn_name_val });
+
+        // Store captures at fields 1..N
+        for (i, (_, cap_val)) in captures.iter().enumerate() {
+            let idx = self.emit_inst(Inst::ConstInt { value: (i + 1) as i64, ty: IrType::I64 });
+            let field = self.emit_inst(Inst::GetElemPtr {
+                array_ptr: env_ptr,
+                index: idx,
+                elem_ty: IrType::I64,
+            });
+            self.emit_inst(Inst::Store { ptr: field, value: *cap_val });
+        }
+
+        self.set_value_type(env_ptr, IrType::Opaque("closure".to_string()));
+        env_ptr
+    }
+
+    fn emit_terminator(&mut self, inst: Inst) {
+        self.emit_inst(inst);
+    }
+
+    fn new_block(&mut self) -> BlockId {
+        if let Some(ref mut f) = self.current_func {
+            f.new_block()
+        } else {
+            BlockId(0)
+        }
+    }
+
+    fn set_current_block(&mut self, block: BlockId) {
+        self.current_block = block;
+    }
+
+    fn current_block_has_terminator(&self) -> bool {
+        if let Some(ref f) = self.current_func {
+            let block_idx = self.current_block.0 as usize;
+            if block_idx < f.blocks.len() {
+                f.blocks[block_idx].instructions.iter()
+                    .any(|id| f.instructions.get(id).map(|i| i.is_terminator()).unwrap_or(false))
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    fn infer_binop_type(&self, op: &BinOp, left: &Expr, right: &Expr) -> IrType {
+        match op {
+            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq
+            | BinOp::And | BinOp::Or => IrType::Bool,
+            _ => {
+                let lt = self.infer_expr_type(left);
+                let rt = self.infer_expr_type(right);
+                if lt.is_float() || rt.is_float() {
+                    if lt == IrType::F32 || rt == IrType::F32 {
+                        IrType::F32
+                    } else {
+                        IrType::F64
+                    }
+                } else {
+                    IrType::I64
+                }
+            }
+        }
+    }
+
+    fn infer_unary_type(&self, _op: &UnaryOp, expr: &Expr) -> IrType {
+        let t = self.infer_expr_type(expr);
+        if t.is_float() { t } else { IrType::I64 }
+    }
+
+    fn lookup_func_ret_ty(&self, name: &str) -> IrType {
+        if let Some((_, ret)) = self.module.extern_functions.get(name) {
+            return ret.clone();
+        }
+        if let Some(f) = self.module.functions.get(name) {
+            return f.ret_ty.clone();
+        }
+        IrType::I64 // Default for unknown functions
+    }
+
+    fn get_value_type(&self, val: ValueId) -> IrType {
+        if let Some(ref f) = self.current_func {
+            if let Some(meta) = f.values.get(&val) {
+                return meta.ty.clone();
+            }
+        }
+        IrType::I64
+    }
+
+    /// Infer the IrType of an AST expression without lowering it.
+    /// Used for type-aware alloca slots in if-as-expression.
+    fn infer_expr_type(&self, expr: &Expr) -> IrType {
+        match expr {
+            Expr::IntLit(_) => IrType::I64,
+            Expr::FloatLit(_) => IrType::F64,
+            Expr::BoolLit(_) => IrType::Bool,
+            Expr::StringLit(_) => IrType::Ptr(Box::new(IrType::U8)),
+            Expr::Ident(name) => {
+                // Check mutable variable (alloca) — type is stored in alloca_types
+                if let Some(alloca) = self.allocas.get(name) {
+                    if let Some(ty) = self.alloca_types.get(alloca) {
+                        return ty.clone();
+                    }
+                    return IrType::I64;
+                }
+                // Check local binding — type is the value's type
+                if let Some(val) = self.current_func.as_ref().and_then(|f| f.lookup_local(name)) {
+                    if let Some(meta) = self.current_func.as_ref().and_then(|f| f.values.get(&val)) {
+                        return meta.ty.clone();
+                    }
+                }
+                // Check constant
+                if let Some(const_expr) = self.constants.get(name) {
+                    return self.infer_expr_type(const_expr);
+                }
+                IrType::I64
+            }
+            Expr::Binary { op, left, right } => self.infer_binop_type(op, left, right),
+            Expr::Unary { op, expr } => self.infer_unary_type(op, expr),
+            Expr::Call { callee, .. } => self.lookup_func_ret_ty(callee),
+            Expr::StructLit { name, .. } => {
+                IrType::Ptr(Box::new(IrType::Struct(name.clone())))
+            }
+            Expr::FieldAccess { expr, field } => {
+                let struct_ty = self.infer_expr_type(expr);
+                let struct_name = match &struct_ty {
+                    IrType::Ptr(inner) => match inner.as_ref() {
+                        IrType::Struct(name) => Some(name.clone()),
+                        _ => None,
+                    },
+                    IrType::Struct(name) => Some(name.clone()),
+                    _ => None,
+                };
+                if let Some(name) = struct_name {
+                    if let Some(layout) = self.module.get_struct(&name) {
+                        if let Some((_, ty, _)) = layout.fields.iter()
+                            .find(|(n, _, _)| n == field)
+                        {
+                            return ty.clone();
+                        }
+                    }
+                }
+                IrType::I64
+            }
+            Expr::If { then_block, .. } => {
+                // Infer type from the last expression in the then block
+                for stmt in then_block {
+                    if let Stmt::Expr(e) = stmt {
+                        return self.infer_expr_type(e);
+                    }
+                }
+                IrType::I64
+            }
+            Expr::Block(stmts) => {
+                // Infer type from the last expression in the block
+                for stmt in stmts {
+                    if let Stmt::Expr(e) = stmt {
+                        return self.infer_expr_type(e);
+                    }
+                }
+                IrType::Void
+            }
+            Expr::Ref { expr, .. } => {
+                IrType::Ptr(Box::new(self.infer_expr_type(expr)))
+            }
+            Expr::Deref { expr } => {
+                let inner_ty = self.infer_expr_type(expr);
+                match &inner_ty {
+                    IrType::Ptr(inner) => *inner.clone(),
+                    _ => IrType::I64,
+                }
+            }
+            Expr::ArrayLit { elem_type, .. } => {
+                let elem_ir = lower_type(elem_type);
+                IrType::Ptr(Box::new(elem_ir))
+            }
+            Expr::Index { array, index, .. } => {
+                let arr_ty = self.infer_expr_type(array);
+                // String slicing returns String
+                if arr_ty.is_opaque_named("String") {
+                    return IrType::Opaque("String".to_string());
+                }
+                // Vec indexing returns element type
+                if arr_ty.is_opaque_named("Vec") {
+                    return arr_ty.generic_elem().cloned().unwrap_or(IrType::I64);
+                }
+                match &arr_ty {
+                    IrType::Ptr(inner) => match inner.as_ref() {
+                        IrType::Array(elem, _) => *elem.clone(),
+                        _ => IrType::I64,
+                    },
+                    IrType::Array(elem, _) => *elem.clone(),
+                    _ => IrType::I64,
+                }
+            }
+            Expr::MethodCall { receiver, method, .. } => {
+                // Check if this is Box::new(x) — returns a pointer
+                if let Expr::Ident(name) = receiver.as_ref() {
+                    if name == "Box" && method == "new" {
+                        return IrType::Ptr(Box::new(IrType::U8));
+                    }
+                    if name == "Vec" && method == "new" {
+                        return IrType::Generic("Vec".to_string(), vec![IrType::Opaque("any".to_string())]);
+                    }
+                    if name == "HashMap" && method == "new" {
+                        return IrType::Generic("HashMap".to_string(), vec![IrType::Ptr(Box::new(IrType::U8)), IrType::I64]);
+                    }
+                    if name == "String" && method == "from" {
+                        return IrType::Opaque("String".to_string());
+                    }
+                    if self.structs.contains_key(name) {
+                        let mangled = format!("{}_{}", name, method);
+                        return self.lookup_func_ret_ty(&mangled);
+                    }
+                }
+                let recv_ty = self.infer_expr_type(receiver);
+                let struct_name = match &recv_ty {
+                    IrType::Ptr(inner) => match inner.as_ref() {
+                        IrType::Struct(name) => Some(name.clone()),
+                        _ => None,
+                    },
+                    IrType::Struct(name) => Some(name.clone()),
+                    _ => None,
+                };
+                let mangled = if let Some(ref sn) = struct_name {
+                    format!("{}_{}", sn, method)
+                } else {
+                    method.clone()
+                };
+                self.lookup_func_ret_ty(&mangled)
+            }
+            Expr::FString { .. } => IrType::Ptr(Box::new(IrType::U8)),
+            Expr::StrConcat { .. } => IrType::Ptr(Box::new(IrType::U8)),
+            Expr::Range { .. } => IrType::Void,
+            Expr::Try { expr } => {
+                // Try unwraps Result<T,E> -> T or Option<T> -> T
+                // For now, infer from the inner expression
+                self.infer_expr_type(expr)
+            }
+            Expr::TryBlock { .. } => {
+                // try { } returns a Result struct
+                IrType::Struct("Result".to_string())
+            }
+            Expr::TupleLit(elements) => {
+                let field_tys: Vec<IrType> = elements.iter()
+                    .map(|e| self.infer_expr_type(e))
+                    .collect();
+                IrType::Struct(format!("__tuple_{}", field_tys.len()))
+            }
+            Expr::EnumLit { enum_name, .. } => {
+                IrType::Ptr(Box::new(IrType::Struct(enum_name.clone())))
+            }
+            Expr::Closure { ret_ty, .. } => {
+                if let Some(rt) = ret_ty {
+                    lower_type(rt)
+                } else {
+                    IrType::Void
+                }
+            }
+            Expr::Match { arms, .. } => {
+                // Infer from first arm's body
+                for arm in arms {
+                    for stmt in &arm.body {
+                        if let Stmt::Expr(e) = stmt {
+                            return self.infer_expr_type(e);
+                        }
+                    }
+                }
+                IrType::Void
+            }
+            Expr::Cast { target_ty, .. } => lower_type(target_ty),
+        }
+    }
+
+    /// Emit all deferred blocks in reverse order (LIFO — last registered runs first)
+    fn emit_defers(&mut self) {
+        let defers: Vec<Vec<Stmt>> = self.defer_stack.drain(..).rev().collect();
+        for body in defers {
+            self.lower_stmts(&body);
+        }
+    }
+
+    /// Copy struct data from a source pointer to the SRET destination pointer.
+    /// Used at return points in struct-returning functions.
+    fn emit_sret_copy(&mut self, src_ptr: ValueId) {
+        if let Some(sret) = self.current_sret {
+            // Get the struct name from the function's return type
+            if let Some(ref f) = self.current_func {
+                let struct_name = match &f.ret_ty {
+                    IrType::Struct(name) => name.clone(),
+                    _ => return,
+                };
+                self.emit_struct_copy(src_ptr, sret, &struct_name);
+            }
+        }
+    }
+
+    /// Recursively copy struct data from src_ptr to dst_ptr, field by field.
+    /// Handles nested structs by recursing into their fields.
+    fn emit_struct_copy(&mut self, src_ptr: ValueId, dst_ptr: ValueId, struct_name: &str) {
+        let layout = self.module.get_struct(struct_name).cloned();
+        if let Some(layout) = layout {
+            for (idx, (_, field_ty, _)) in layout.fields.iter().enumerate() {
+                let src_field = self.emit_inst(Inst::GetFieldPtr {
+                    struct_ptr: src_ptr,
+                    field_index: idx as u32,
+                    field_ty: field_ty.clone(),
+                });
+                let dst_field = self.emit_inst(Inst::GetFieldPtr {
+                    struct_ptr: dst_ptr,
+                    field_index: idx as u32,
+                    field_ty: field_ty.clone(),
+                });
+                if let IrType::Struct(ref sub_name) = field_ty {
+                    // Nested struct: recurse
+                    self.emit_struct_copy(src_field, dst_field, sub_name);
+                } else {
+                    // Scalar field: load + store
+                    let field_val = self.emit_inst(Inst::Load {
+                        ptr: src_field,
+                        ty: field_ty.clone(),
+                    });
+                    self.emit_inst(Inst::Store {
+                        ptr: dst_field,
+                        value: field_val,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Lower a program to IR — convenience function
+pub fn lower(program: &Program) -> IrModule {
+    let mut lowerer = Lowerer::new();
+    lowerer.lower_program(program)
+}
+
+/// Convert an IrType back to an AST Type (for capture type lookup)
+fn ir_type_to_ast_type(ty: &IrType) -> Type {
+    match ty {
+        IrType::I8 => Type::I8,
+        IrType::I16 => Type::I16,
+        IrType::I32 => Type::I32,
+        IrType::I64 => Type::I64,
+        IrType::U8 => Type::U8,
+        IrType::U16 => Type::U16,
+        IrType::U32 => Type::U32,
+        IrType::U64 => Type::U64,
+        IrType::F32 => Type::F32,
+        IrType::F64 => Type::F64,
+        IrType::Bool => Type::Bool,
+        IrType::Void => Type::Void,
+        IrType::Never => Type::Never,
+        IrType::Ptr(inner) => Type::Ref { inner: Box::new(ir_type_to_ast_type(inner)), is_mut: false },
+        IrType::Struct(name) => Type::Named(name.clone()),
+        IrType::Array(elem, size) => Type::Array { elem: Box::new(ir_type_to_ast_type(elem)), size: *size },
+        IrType::Opaque(name) => Type::Named(name.clone()),
+        IrType::Generic(name, args) => Type::Generic {
+            name: name.clone(),
+            args: args.iter().map(ir_type_to_ast_type).collect(),
+        },
+    }
+}
