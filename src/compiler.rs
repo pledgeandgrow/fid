@@ -248,6 +248,8 @@ fn fill_default_trait_methods(program: &mut Program) {
                 body: default_body,
                 is_pub: tm.is_pub,
                 is_comptime: false,
+                declared_effects: Vec::new(),
+                has_effect_annotation: false,
             });
 
         }

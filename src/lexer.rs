@@ -122,6 +122,8 @@ impl Lexer {
             "loop" => TokenKind::Loop,
             "break" => TokenKind::Break,
             "continue" => TokenKind::Continue,
+            "handle" => TokenKind::Handle,
+            "do" => TokenKind::Do,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             "i8" => TokenKind::I8,

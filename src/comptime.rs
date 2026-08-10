@@ -1,13 +1,877 @@
 // Pledge comptime evaluation engine (Phase 3A)
 //
-// Currently disabled due to AST changes. The substitute function is a no-op
-// stub that passes the program through unchanged.
+// Evaluates `comptime <expr>`, `comptime { block }`, and `comptime reflect_op(T)`
+// at compile time, substituting the result as a literal into the AST.
 //
-// TODO: Re-enable comptime evaluation (Phase 3A).
+// Comptime functions (`comptime pf name(...) { ... }`) are evaluated by
+// directly interpreting their AST bodies when called from a comptime context.
 
-use crate::ast::Program;
+use crate::ast::*;
+use std::collections::HashMap;
 
-/// Comptime evaluation entry point. Currently a no-op.
+/// A comptime evaluation failure.
+#[derive(Debug)]
+pub struct ComptimeError(pub String);
+
+/// Recursively substitute every comptime expression in `program` with an AST
+/// literal carrying its compile-time value.
 pub fn substitute(program: &Program) -> Result<Program, Vec<String>> {
-    Ok(program.clone())
+    let mut errs: Vec<String> = Vec::new();
+    let mut prog = program.clone();
+
+    // Phase 1: Pre-substitute comptime expressions inside comptime function
+    // bodies so that comptime function calls from comptime context see
+    // already-substituted bodies. Iterate a bounded number of times.
+    for _ in 0..8 {
+        let snapshot = prog.clone();
+        for func in prog.funcs.iter_mut() {
+            if func.is_comptime {
+                substitute_func(func, &snapshot, &mut errs);
+            }
+        }
+    }
+
+    // Phase 2: Substitute comptime expressions everywhere else.
+    let snapshot2 = prog.clone();
+    for func in prog.funcs.iter_mut() {
+        substitute_func(func, &snapshot2, &mut errs);
+    }
+    for imp in prog.impls.iter_mut() {
+        for method in imp.methods.iter_mut() {
+            substitute_func(method, &snapshot2, &mut errs);
+        }
+    }
+    for ti in prog.trait_impls.iter_mut() {
+        for method in ti.methods.iter_mut() {
+            substitute_func(method, &snapshot2, &mut errs);
+        }
+    }
+
+    if errs.is_empty() {
+        Ok(prog)
+    } else {
+        Err(errs)
+    }
+}
+
+fn substitute_func(func: &mut Func, original: &Program, errs: &mut Vec<String>) {
+    for stmt in func.body.iter_mut() {
+        substitute_stmt(stmt, original, errs);
+    }
+}
+
+fn substitute_stmts(stmts: &mut [Stmt], original: &Program, errs: &mut Vec<String>) {
+    for stmt in stmts.iter_mut() {
+        substitute_stmt(stmt, original, errs);
+    }
+}
+
+fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<String>) {
+    match stmt {
+        Stmt::Let { expr, .. } => substitute_expr(expr, original, errs),
+        Stmt::Assign { expr, .. } => substitute_expr(expr, original, errs),
+        Stmt::IndexAssign { index, expr, .. } => {
+            substitute_expr(index, original, errs);
+            substitute_expr(expr, original, errs);
+        }
+        Stmt::DerefAssign { ptr_expr, expr, .. } => {
+            substitute_expr(ptr_expr, original, errs);
+            substitute_expr(expr, original, errs);
+        }
+        Stmt::Expr(e, _) => substitute_expr(e, original, errs),
+        Stmt::Return(opt, _) => {
+            if let Some(e) = opt {
+                substitute_expr(e, original, errs);
+            }
+        }
+        Stmt::If { cond, then_block, else_block, .. } => {
+            substitute_expr(cond, original, errs);
+            substitute_stmts(then_block, original, errs);
+            if let Some(eb) = else_block {
+                substitute_stmts(eb, original, errs);
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            substitute_expr(cond, original, errs);
+            substitute_stmts(body, original, errs);
+        }
+        Stmt::For { iterator, body, .. } => {
+            substitute_expr(iterator, original, errs);
+            substitute_stmts(body, original, errs);
+        }
+        Stmt::Match { expr, arms, .. } => {
+            substitute_expr(expr, original, errs);
+            for arm in arms.iter_mut() {
+                substitute_stmts(&mut arm.body, original, errs);
+            }
+        }
+        Stmt::Defer(stmts, _) => substitute_stmts(stmts, original, errs),
+        Stmt::Break(_, _) | Stmt::Continue(_) => {}
+        Stmt::Use { .. } | Stmt::Loop { .. } => {}
+        Stmt::Handle { body, handlers, .. } => {
+            substitute_stmts(body, original, errs);
+            for h in handlers.iter_mut() {
+                substitute_stmts(&mut h.body, original, errs);
+            }
+        }
+        Stmt::Do { args, .. } => {
+            for a in args.iter_mut() {
+                substitute_expr(a, original, errs);
+            }
+        }
+    }
+}
+
+fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<String>) {
+    // First recurse into children
+    match expr {
+        Expr::Binary { left, right, .. } => {
+            substitute_expr(left, original, errs);
+            substitute_expr(right, original, errs);
+        }
+        Expr::Unary { expr: inner, .. } => substitute_expr(inner, original, errs),
+        Expr::Call { args, .. } => {
+            for a in args.iter_mut() {
+                substitute_expr(a, original, errs);
+            }
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            substitute_expr(receiver, original, errs);
+            for a in args.iter_mut() {
+                substitute_expr(a, original, errs);
+            }
+        }
+        Expr::FieldAccess { expr: inner, .. } => substitute_expr(inner, original, errs),
+        Expr::StructLit { fields, .. } => {
+            for (_, e) in fields.iter_mut() {
+                substitute_expr(e, original, errs);
+            }
+        }
+        Expr::If { cond, then_block, else_block, .. } => {
+            substitute_expr(cond, original, errs);
+            substitute_stmts(then_block, original, errs);
+            if let Some(eb) = else_block {
+                substitute_stmts(eb, original, errs);
+            }
+        }
+        Expr::Block(stmts) => substitute_stmts(stmts, original, errs),
+        Expr::Index { array, index } => {
+            substitute_expr(array, original, errs);
+            substitute_expr(index, original, errs);
+        }
+        Expr::ArrayLit { elements, .. } => {
+            for e in elements.iter_mut() {
+                substitute_expr(e, original, errs);
+            }
+        }
+        Expr::FString { .. } => { /* TODO: substitute inside f-string parts */ }
+        Expr::Match { expr: inner, arms } => {
+            substitute_expr(inner, original, errs);
+            for arm in arms.iter_mut() {
+                substitute_stmts(&mut arm.body, original, errs);
+            }
+        }
+        Expr::Range { start, end, .. } => {
+            substitute_expr(start, original, errs);
+            substitute_expr(end, original, errs);
+        }
+        Expr::Ref { expr: inner, .. } => substitute_expr(inner, original, errs),
+        Expr::Deref { expr: inner } => substitute_expr(inner, original, errs),
+        Expr::StrConcat { left, right } => {
+            substitute_expr(left, original, errs);
+            substitute_expr(right, original, errs);
+        }
+        Expr::Try { expr: inner } => substitute_expr(inner, original, errs),
+        Expr::TryBlock { body } => substitute_stmts(body, original, errs),
+        Expr::TupleLit(exprs) => {
+            for e in exprs.iter_mut() {
+                substitute_expr(e, original, errs);
+            }
+        }
+        Expr::Closure { body, .. } => substitute_stmts(body, original, errs),
+        Expr::Cast { expr: inner, .. } => substitute_expr(inner, original, errs),
+        Expr::Asm { .. } => {}
+        Expr::Comptime(inner) => {
+            substitute_expr(inner, original, errs);
+            // Now evaluate the comptime expression
+            match evaluate(inner, original) {
+                Ok(result) => { *expr = result; }
+                Err(e) => errs.push(format!("comptime error: {}", e.0)),
+            }
+        }
+        Expr::ComptimeBlock(stmts) => {
+            substitute_stmts(stmts, original, errs);
+            match evaluate_block(stmts, original) {
+                Ok(result) => { *expr = result; }
+                Err(e) => errs.push(format!("comptime error: {}", e.0)),
+            }
+        }
+        Expr::ComptimeReflect { op, ty } => {
+            match evaluate_reflect(op, ty, original) {
+                Ok(result) => { *expr = result; }
+                Err(e) => errs.push(format!("comptime error: {}", e.0)),
+            }
+        }
+        Expr::IntLit(_) | Expr::FloatLit(_) | Expr::StringLit(_)
+        | Expr::BoolLit(_) | Expr::Ident(_) | Expr::EnumLit { .. } => {}
+    }
+}
+
+// ─── Evaluation ───────────────────────────────────────────────────────────
+
+/// Evaluate a comptime expression to a literal AST value.
+fn evaluate(expr: &Expr, original: &Program) -> Result<Expr, ComptimeError> {
+    match expr {
+        Expr::IntLit(n) => Ok(Expr::IntLit(*n)),
+        Expr::FloatLit(f) => Ok(Expr::FloatLit(*f)),
+        Expr::StringLit(s) => Ok(Expr::StringLit(s.clone())),
+        Expr::BoolLit(b) => Ok(Expr::BoolLit(*b)),
+        Expr::Binary { op, left, right } => {
+            let l = evaluate(left, original)?;
+            let r = evaluate(right, original)?;
+            eval_binop(op, &l, &r)
+        }
+        Expr::Unary { op, expr: inner } => {
+            let v = evaluate(inner, original)?;
+            eval_unaryop(op, &v)
+        }
+        Expr::Call { callee, args } => {
+            // Look up comptime function
+            let func = original.funcs.iter()
+                .find(|f| f.name == *callee && f.is_comptime)
+                .ok_or_else(|| ComptimeError(format!("comptime function '{}' not found", callee)))?;
+
+            let arg_vals: Vec<Expr> = args.iter()
+                .map(|a| evaluate(a, original))
+                .collect::<Result<_, _>>()?;
+
+            call_comptime_func(func, &arg_vals, original)
+        }
+        Expr::If { cond, then_block, else_block } => {
+            let c = evaluate(cond, original)?;
+            match c {
+                Expr::BoolLit(true) => evaluate_block(then_block, original),
+                Expr::BoolLit(false) => {
+                    if let Some(eb) = else_block {
+                        evaluate_block(eb, original)
+                    } else {
+                        Ok(Expr::IntLit(0))
+                    }
+                }
+                _ => Err(ComptimeError("comptime if condition must be boolean".into())),
+            }
+        }
+        Expr::Block(stmts) => evaluate_block(stmts, original),
+        // Fallback: return as-is (already a literal)
+        other => Ok(other.clone()),
+    }
+}
+
+/// Evaluate a block of statements, returning the value of the last expression.
+fn evaluate_block(stmts: &[Stmt], original: &Program) -> Result<Expr, ComptimeError> {
+    let mut env: HashMap<String, Expr> = HashMap::new();
+    let mut result = Expr::IntLit(0);
+
+    for stmt in stmts {
+        match stmt {
+            Stmt::Let { name, expr, .. } => {
+                let v = evaluate_with_env(expr, &env, original)?;
+                env.insert(name.clone(), v);
+            }
+            Stmt::Assign { target, op, expr, .. } => {
+                let v = evaluate_with_env(expr, &env, original)?;
+                let current = env.get(target).cloned().unwrap_or(Expr::IntLit(0));
+                let new_val = match op {
+                    AssignOp::Assign => v,
+                    AssignOp::AddAssign => eval_binop(&BinOp::Add, &current, &v)?,
+                    AssignOp::SubAssign => eval_binop(&BinOp::Sub, &current, &v)?,
+                    AssignOp::MulAssign => eval_binop(&BinOp::Mul, &current, &v)?,
+                    _ => v,
+                };
+                env.insert(target.clone(), new_val);
+            }
+            Stmt::Expr(e, _) => {
+                result = evaluate_with_env(e, &env, original)?;
+            }
+            Stmt::Return(opt, _) => {
+                if let Some(e) = opt {
+                    return evaluate_with_env(e, &env, original);
+                }
+                return Ok(Expr::IntLit(0));
+            }
+            Stmt::If { cond, then_block, else_block, .. } => {
+                let c = evaluate_with_env(cond, &env, original)?;
+                match c {
+                    Expr::BoolLit(true) => {
+                        let mut sub_env = env.clone();
+                        for s in then_block {
+                            match s {
+                                Stmt::Let { name, expr, .. } => {
+                                    let v = evaluate_with_env(expr, &sub_env, original)?;
+                                    sub_env.insert(name.clone(), v);
+                                }
+                                Stmt::Expr(e, _) => {
+                                    result = evaluate_with_env(e, &sub_env, original)?;
+                                }
+                                Stmt::Return(opt, _) => {
+                                    if let Some(e) = opt {
+                                        return evaluate_with_env(e, &sub_env, original);
+                                    }
+                                    return Ok(Expr::IntLit(0));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Expr::BoolLit(false) => {
+                        if let Some(eb) = else_block {
+                            let mut sub_env = env.clone();
+                            for s in eb {
+                                match s {
+                                    Stmt::Let { name, expr, .. } => {
+                                        let v = evaluate_with_env(expr, &sub_env, original)?;
+                                        sub_env.insert(name.clone(), v);
+                                    }
+                                    Stmt::Expr(e, _) => {
+                                        result = evaluate_with_env(e, &sub_env, original)?;
+                                    }
+                                    Stmt::Return(opt, _) => {
+                                        if let Some(e) = opt {
+                                            return evaluate_with_env(e, &sub_env, original);
+                                        }
+                                        return Ok(Expr::IntLit(0));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    _ => return Err(ComptimeError("comptime if condition must be boolean".into())),
+                }
+            }
+            Stmt::Break(_, _) | Stmt::Continue(_) => {}
+            Stmt::For { var, iterator, body, .. } => {
+                // Evaluate the iterator (must be a Range)
+                let iter_val = evaluate_with_env(iterator, &env, original)?;
+                let (start, end) = match iter_val {
+                    Expr::Range { start, end, .. } => {
+                        let s = evaluate_with_env(&start, &env, original)?;
+                        let e = evaluate_with_env(&end, &env, original)?;
+                        match (s, e) {
+                            (Expr::IntLit(a), Expr::IntLit(b)) => (a, b),
+                            _ => return Err(ComptimeError("comptime for range must be ints".into())),
+                        }
+                    }
+                    _ => return Err(ComptimeError("comptime for requires a range".into())),
+                };
+                for i in start..end {
+                    env.insert(var.clone(), Expr::IntLit(i));
+                    for s in body {
+                        match s {
+                            Stmt::Let { name, expr, .. } => {
+                                let v = evaluate_with_env(expr, &env, original)?;
+                                env.insert(name.clone(), v);
+                            }
+                            Stmt::Assign { target, op, expr, .. } => {
+                                let v = evaluate_with_env(expr, &env, original)?;
+                                let current = env.get(target).cloned().unwrap_or(Expr::IntLit(0));
+                                let new_val = match op {
+                                    AssignOp::Assign => v,
+                                    AssignOp::AddAssign => eval_binop(&BinOp::Add, &current, &v)?,
+                                    AssignOp::SubAssign => eval_binop(&BinOp::Sub, &current, &v)?,
+                                    AssignOp::MulAssign => eval_binop(&BinOp::Mul, &current, &v)?,
+                                    _ => v,
+                                };
+                                env.insert(target.clone(), new_val);
+                            }
+                            Stmt::Expr(e, _) => {
+                                result = evaluate_with_env(e, &env, original)?;
+                            }
+                            Stmt::Return(opt, _) => {
+                                if let Some(e) = opt {
+                                    return evaluate_with_env(e, &env, original);
+                                }
+                                return Ok(Expr::IntLit(0));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(result)
+}
+
+/// Evaluate an expression with variable bindings from the environment.
+fn evaluate_with_env(expr: &Expr, env: &HashMap<String, Expr>, original: &Program) -> Result<Expr, ComptimeError> {
+    match expr {
+        Expr::Ident(name) => {
+            env.get(name).cloned()
+                .ok_or_else(|| ComptimeError(format!("undefined variable '{}' in comptime", name)))
+        }
+        Expr::IntLit(n) => Ok(Expr::IntLit(*n)),
+        Expr::FloatLit(f) => Ok(Expr::FloatLit(*f)),
+        Expr::StringLit(s) => Ok(Expr::StringLit(s.clone())),
+        Expr::BoolLit(b) => Ok(Expr::BoolLit(*b)),
+        Expr::Binary { op, left, right } => {
+            let l = evaluate_with_env(left, env, original)?;
+            let r = evaluate_with_env(right, env, original)?;
+            eval_binop(op, &l, &r)
+        }
+        Expr::Unary { op, expr: inner } => {
+            let v = evaluate_with_env(inner, env, original)?;
+            eval_unaryop(op, &v)
+        }
+        Expr::Call { callee, args } => {
+            // Look up comptime function
+            let func = original.funcs.iter()
+                .find(|f| f.name == *callee && f.is_comptime)
+                .ok_or_else(|| ComptimeError(format!("comptime function '{}' not found", callee)))?;
+
+            let arg_vals: Vec<Expr> = args.iter()
+                .map(|a| evaluate_with_env(a, env, original))
+                .collect::<Result<_, _>>()?;
+
+            call_comptime_func(func, &arg_vals, original)
+        }
+        Expr::If { cond, then_block, else_block } => {
+            let c = evaluate_with_env(cond, env, original)?;
+            match c {
+                Expr::BoolLit(true) => {
+                    let mut sub_env = env.clone();
+                    let mut result = Expr::IntLit(0);
+                    for s in then_block {
+                        match s {
+                            Stmt::Let { name, expr, .. } => {
+                                let v = evaluate_with_env(expr, &sub_env, original)?;
+                                sub_env.insert(name.clone(), v);
+                            }
+                            Stmt::Expr(e, _) => {
+                                result = evaluate_with_env(e, &sub_env, original)?;
+                            }
+                            Stmt::Return(opt, _) => {
+                                if let Some(e) = opt {
+                                    return evaluate_with_env(e, &sub_env, original);
+                                }
+                                return Ok(Expr::IntLit(0));
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(result)
+                }
+                Expr::BoolLit(false) => {
+                    if let Some(eb) = else_block {
+                        let mut sub_env = env.clone();
+                        let mut result = Expr::IntLit(0);
+                        for s in eb {
+                            match s {
+                                Stmt::Let { name, expr, .. } => {
+                                    let v = evaluate_with_env(expr, &sub_env, original)?;
+                                    sub_env.insert(name.clone(), v);
+                                }
+                                Stmt::Expr(e, _) => {
+                                    result = evaluate_with_env(e, &sub_env, original)?;
+                                }
+                                Stmt::Return(opt, _) => {
+                                    if let Some(e) = opt {
+                                        return evaluate_with_env(e, &sub_env, original);
+                                    }
+                                    return Ok(Expr::IntLit(0));
+                                }
+                                _ => {}
+                            }
+                        }
+                        Ok(result)
+                    } else {
+                        Ok(Expr::IntLit(0))
+                    }
+                }
+                _ => Err(ComptimeError("comptime if condition must be boolean".into())),
+            }
+        }
+        Expr::Block(stmts) => {
+            let mut sub_env = env.clone();
+            let mut result = Expr::IntLit(0);
+            for s in stmts {
+                match s {
+                    Stmt::Let { name, expr, .. } => {
+                        let v = evaluate_with_env(expr, &sub_env, original)?;
+                        sub_env.insert(name.clone(), v);
+                    }
+                    Stmt::Expr(e, _) => {
+                        result = evaluate_with_env(e, &sub_env, original)?;
+                    }
+                    Stmt::Return(opt, _) => {
+                        if let Some(e) = opt {
+                            return evaluate_with_env(e, &sub_env, original);
+                        }
+                        return Ok(Expr::IntLit(0));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(result)
+        }
+        Expr::FString { parts } => {
+            // Evaluate f-string at comptime
+            let mut result = String::new();
+            for part in parts {
+                match part {
+                    FStringPart::Literal(s) => result.push_str(s),
+                    FStringPart::Expr(e) => {
+                        let v = evaluate_with_env(e, env, original)?;
+                        match v {
+                            Expr::IntLit(n) => result.push_str(&n.to_string()),
+                            Expr::FloatLit(f) => result.push_str(&f.to_string()),
+                            Expr::StringLit(s) => result.push_str(&s),
+                            Expr::BoolLit(b) => result.push_str(&b.to_string()),
+                            _ => result.push_str("?"),
+                        }
+                    }
+                }
+            }
+            Ok(Expr::StringLit(result))
+        }
+        Expr::Index { array, index } => {
+            // Array indexing at comptime (for field_names[i] etc.)
+            let arr = evaluate_with_env(array, env, original)?;
+            let idx = evaluate_with_env(index, env, original)?;
+            match (&arr, &idx) {
+                (Expr::ArrayLit { elements, .. }, Expr::IntLit(i)) => {
+                    if *i >= 0 && (*i as usize) < elements.len() {
+                        Ok(elements[*i as usize].clone())
+                    } else {
+                        Err(ComptimeError(format!("comptime index {} out of bounds", i)))
+                    }
+                }
+                _ => Err(ComptimeError("comptime indexing requires array and int".into())),
+            }
+        }
+        Expr::ArrayLit { elements, .. } => {
+            // Evaluate each element
+            let evals: Vec<Expr> = elements.iter()
+                .map(|e| evaluate_with_env(e, env, original))
+                .collect::<Result<_, _>>()?;
+            Ok(Expr::ArrayLit {
+                elem_type: Box::new(Type::Named("str".to_string())),
+                elements: evals,
+            })
+        }
+        Expr::StrConcat { left, right } => {
+            let l = evaluate_with_env(left, env, original)?;
+            let r = evaluate_with_env(right, env, original)?;
+            match (&l, &r) {
+                (Expr::StringLit(a), Expr::StringLit(b)) => Ok(Expr::StringLit(format!("{}{}", a, b))),
+                _ => Err(ComptimeError("comptime str_concat requires strings".into())),
+            }
+        }
+        // Fallback: try plain evaluate
+        other => evaluate(other, original),
+    }
+}
+
+/// Call a comptime function with evaluated arguments.
+fn call_comptime_func(func: &Func, args: &[Expr], original: &Program) -> Result<Expr, ComptimeError> {
+    if args.len() != func.params.len() {
+        return Err(ComptimeError(format!(
+            "comptime function '{}' expects {} args, got {}",
+            func.name, func.params.len(), args.len()
+        )));
+    }
+
+    let mut env: HashMap<String, Expr> = HashMap::new();
+    for (param, arg) in func.params.iter().zip(args.iter()) {
+        env.insert(param.name.clone(), arg.clone());
+    }
+
+    // Execute the function body
+    let mut result = Expr::IntLit(0);
+    for stmt in &func.body {
+        match stmt {
+            Stmt::Let { name, expr, .. } => {
+                let v = evaluate_with_env(expr, &env, original)?;
+                env.insert(name.clone(), v);
+            }
+            Stmt::Assign { target, op, expr, .. } => {
+                let v = evaluate_with_env(expr, &env, original)?;
+                let current = env.get(target).cloned().unwrap_or(Expr::IntLit(0));
+                let new_val = match op {
+                    AssignOp::Assign => v,
+                    AssignOp::AddAssign => eval_binop(&BinOp::Add, &current, &v)?,
+                    AssignOp::SubAssign => eval_binop(&BinOp::Sub, &current, &v)?,
+                    AssignOp::MulAssign => eval_binop(&BinOp::Mul, &current, &v)?,
+                    _ => v,
+                };
+                env.insert(target.clone(), new_val);
+            }
+            Stmt::Expr(e, _) => {
+                result = evaluate_with_env(e, &env, original)?;
+            }
+            Stmt::Return(opt, _) => {
+                if let Some(e) = opt {
+                    return evaluate_with_env(e, &env, original);
+                }
+                return Ok(Expr::IntLit(0));
+            }
+            Stmt::If { cond, then_block, else_block, .. } => {
+                let c = evaluate_with_env(cond, &env, original)?;
+                match c {
+                    Expr::BoolLit(true) => {
+                        let mut sub_env = env.clone();
+                        for s in then_block {
+                            match s {
+                                Stmt::Let { name, expr, .. } => {
+                                    let v = evaluate_with_env(expr, &sub_env, original)?;
+                                    sub_env.insert(name.clone(), v);
+                                }
+                                Stmt::Return(opt, _) => {
+                                    if let Some(e) = opt {
+                                        return evaluate_with_env(e, &sub_env, original);
+                                    }
+                                    return Ok(Expr::IntLit(0));
+                                }
+                                Stmt::Expr(e, _) => {
+                                    result = evaluate_with_env(e, &sub_env, original)?;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Expr::BoolLit(false) => {
+                        if let Some(eb) = else_block {
+                            let mut sub_env = env.clone();
+                            for s in eb {
+                                match s {
+                                    Stmt::Let { name, expr, .. } => {
+                                        let v = evaluate_with_env(expr, &sub_env, original)?;
+                                        sub_env.insert(name.clone(), v);
+                                    }
+                                    Stmt::Return(opt, _) => {
+                                        if let Some(e) = opt {
+                                            return evaluate_with_env(e, &sub_env, original);
+                                        }
+                                        return Ok(Expr::IntLit(0));
+                                    }
+                                    Stmt::Expr(e, _) => {
+                                        result = evaluate_with_env(e, &sub_env, original)?;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    _ => return Err(ComptimeError("comptime if condition must be boolean".into())),
+                }
+            }
+            Stmt::Break(_, _) | Stmt::Continue(_) => {}
+            Stmt::For { var, iterator, body, .. } => {
+                // Evaluate the iterator (must be a Range)
+                let iter_val = evaluate_with_env(iterator, &env, original)?;
+                let (start, end) = match iter_val {
+                    Expr::Range { start, end, .. } => {
+                        let s = evaluate_with_env(&start, &env, original)?;
+                        let e = evaluate_with_env(&end, &env, original)?;
+                        match (s, e) {
+                            (Expr::IntLit(a), Expr::IntLit(b)) => (a, b),
+                            _ => return Err(ComptimeError("comptime for range must be ints".into())),
+                        }
+                    }
+                    _ => return Err(ComptimeError("comptime for requires a range".into())),
+                };
+                for i in start..end {
+                    env.insert(var.clone(), Expr::IntLit(i));
+                    for s in body {
+                        match s {
+                            Stmt::Let { name, expr, .. } => {
+                                let v = evaluate_with_env(expr, &env, original)?;
+                                env.insert(name.clone(), v);
+                            }
+                            Stmt::Assign { target, op, expr, .. } => {
+                                let v = evaluate_with_env(expr, &env, original)?;
+                                let current = env.get(target).cloned().unwrap_or(Expr::IntLit(0));
+                                let new_val = match op {
+                                    AssignOp::Assign => v,
+                                    AssignOp::AddAssign => eval_binop(&BinOp::Add, &current, &v)?,
+                                    AssignOp::SubAssign => eval_binop(&BinOp::Sub, &current, &v)?,
+                                    AssignOp::MulAssign => eval_binop(&BinOp::Mul, &current, &v)?,
+                                    _ => v,
+                                };
+                                env.insert(target.clone(), new_val);
+                            }
+                            Stmt::Expr(e, _) => {
+                                result = evaluate_with_env(e, &env, original)?;
+                            }
+                            Stmt::Return(opt, _) => {
+                                if let Some(e) = opt {
+                                    return evaluate_with_env(e, &env, original);
+                                }
+                                return Ok(Expr::IntLit(0));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(result)
+}
+
+/// Evaluate a binary operation on literal expressions.
+fn eval_binop(op: &BinOp, l: &Expr, r: &Expr) -> Result<Expr, ComptimeError> {
+    match (l, r) {
+        (Expr::IntLit(a), Expr::IntLit(b)) => {
+            let v = match op {
+                BinOp::Add => a.wrapping_add(*b),
+                BinOp::Sub => a.wrapping_sub(*b),
+                BinOp::Mul => a.wrapping_mul(*b),
+                BinOp::Div => {
+                    if *b == 0 { return Err(ComptimeError("division by zero in comptime".into())); }
+                    a.wrapping_div(*b)
+                }
+                BinOp::Mod => {
+                    if *b == 0 { return Err(ComptimeError("modulo by zero in comptime".into())); }
+                    a.wrapping_rem(*b)
+                }
+                BinOp::Eq => return Ok(Expr::BoolLit(a == b)),
+                BinOp::Neq => return Ok(Expr::BoolLit(a != b)),
+                BinOp::Lt => return Ok(Expr::BoolLit(a < b)),
+                BinOp::LtEq => return Ok(Expr::BoolLit(a <= b)),
+                BinOp::Gt => return Ok(Expr::BoolLit(a > b)),
+                BinOp::GtEq => return Ok(Expr::BoolLit(a >= b)),
+                BinOp::And => return Ok(Expr::BoolLit(*a != 0 && *b != 0)),
+                BinOp::Or => return Ok(Expr::BoolLit(*a != 0 || *b != 0)),
+                _ => return Err(ComptimeError(format!("unsupported binop {:?} for ints", op))),
+            };
+            Ok(Expr::IntLit(v))
+        }
+        (Expr::FloatLit(a), Expr::FloatLit(b)) => {
+            let v = match op {
+                BinOp::Add => a + b,
+                BinOp::Sub => a - b,
+                BinOp::Mul => a * b,
+                BinOp::Div => a / b,
+                BinOp::Eq => return Ok(Expr::BoolLit(a == b)),
+                BinOp::Neq => return Ok(Expr::BoolLit(a != b)),
+                BinOp::Lt => return Ok(Expr::BoolLit(a < b)),
+                BinOp::LtEq => return Ok(Expr::BoolLit(a <= b)),
+                BinOp::Gt => return Ok(Expr::BoolLit(a > b)),
+                BinOp::GtEq => return Ok(Expr::BoolLit(a >= b)),
+                _ => return Err(ComptimeError(format!("unsupported binop {:?} for floats", op))),
+            };
+            Ok(Expr::FloatLit(v))
+        }
+        (Expr::StringLit(a), Expr::StringLit(b)) => {
+            match op {
+                BinOp::Add => Ok(Expr::StringLit(format!("{}{}", a, b))),
+                BinOp::Eq => Ok(Expr::BoolLit(a == b)),
+                BinOp::Neq => Ok(Expr::BoolLit(a != b)),
+                _ => Err(ComptimeError(format!("unsupported binop {:?} for strings", op))),
+            }
+        }
+        (Expr::BoolLit(a), Expr::BoolLit(b)) => {
+            match op {
+                BinOp::Eq => Ok(Expr::BoolLit(a == b)),
+                BinOp::Neq => Ok(Expr::BoolLit(a != b)),
+                BinOp::And => Ok(Expr::BoolLit(*a && *b)),
+                BinOp::Or => Ok(Expr::BoolLit(*a || *b)),
+                _ => Err(ComptimeError(format!("unsupported binop {:?} for bools", op))),
+            }
+        }
+        _ => Err(ComptimeError(format!("cannot evaluate binop {:?} on {:?} and {:?}", op, l, r))),
+    }
+}
+
+/// Evaluate a unary operation on a literal expression.
+fn eval_unaryop(op: &UnaryOp, v: &Expr) -> Result<Expr, ComptimeError> {
+    match (op, v) {
+        (UnaryOp::Neg, Expr::IntLit(n)) => Ok(Expr::IntLit(-n)),
+        (UnaryOp::Neg, Expr::FloatLit(f)) => Ok(Expr::FloatLit(-f)),
+        (UnaryOp::Not, Expr::BoolLit(b)) => Ok(Expr::BoolLit(!b)),
+        (UnaryOp::Not, Expr::IntLit(n)) => Ok(Expr::IntLit(!n)),
+        (UnaryOp::BitNot, Expr::IntLit(n)) => Ok(Expr::IntLit(!n)),
+        _ => Err(ComptimeError(format!("cannot evaluate unaryop {:?} on {:?}", op, v))),
+    }
+}
+
+// ─── Reflection ───────────────────────────────────────────────────────────
+
+fn evaluate_reflect(op: &ReflectOp, ty: &Type, original: &Program) -> Result<Expr, ComptimeError> {
+    let type_name = match ty {
+        Type::Named(name) => name.clone(),
+        Type::I8 => "i8".into(),
+        Type::I16 => "i16".into(),
+        Type::I32 => "i32".into(),
+        Type::I64 => "i64".into(),
+        Type::I128 => "i128".into(),
+        Type::U8 => "u8".into(),
+        Type::U16 => "u16".into(),
+        Type::U32 => "u32".into(),
+        Type::U64 => "u64".into(),
+        Type::U128 => "u128".into(),
+        Type::F32 => "f32".into(),
+        Type::F64 => "f64".into(),
+        Type::Bool => "bool".into(),
+        Type::Str => "str".into(),
+        Type::Void => "void".into(),
+        _ => return Err(ComptimeError(format!("reflect: unsupported type {:?}", ty))),
+    };
+
+    match op {
+        ReflectOp::TypeName => Ok(Expr::StringLit(type_name)),
+        ReflectOp::IsStruct => {
+            Ok(Expr::BoolLit(original.structs.iter().any(|s| s.name == type_name)))
+        }
+        ReflectOp::IsEnum => {
+            Ok(Expr::BoolLit(original.enums.iter().any(|e| e.name == type_name)))
+        }
+        ReflectOp::FieldCount => {
+            let s = original.structs.iter()
+                .find(|s| s.name == type_name)
+                .ok_or_else(|| ComptimeError(format!("type_name: '{}' is not a struct", type_name)))?;
+            Ok(Expr::IntLit(s.fields.len() as i64))
+        }
+        ReflectOp::FieldNames => {
+            let s = original.structs.iter()
+                .find(|s| s.name == type_name)
+                .ok_or_else(|| ComptimeError(format!("field_names: '{}' is not a struct", type_name)))?;
+            let elements: Vec<Expr> = s.fields.iter()
+                .map(|f| Expr::StringLit(f.name.clone()))
+                .collect();
+            Ok(Expr::ArrayLit {
+                elem_type: Box::new(Type::Named("str".to_string())),
+                elements,
+            })
+        }
+        ReflectOp::FieldTypes => {
+            let s = original.structs.iter()
+                .find(|s| s.name == type_name)
+                .ok_or_else(|| ComptimeError(format!("field_types: '{}' is not a struct", type_name)))?;
+            let elements: Vec<Expr> = s.fields.iter()
+                .map(|f| Expr::StringLit(format!("{}", f.ty)))
+                .collect();
+            Ok(Expr::ArrayLit {
+                elem_type: Box::new(Type::Named("str".to_string())),
+                elements,
+            })
+        }
+        ReflectOp::EnumVariants => {
+            let e = original.enums.iter()
+                .find(|e| e.name == type_name)
+                .ok_or_else(|| ComptimeError(format!("enum_variants: '{}' is not an enum", type_name)))?;
+            let elements: Vec<Expr> = e.variants.iter()
+                .map(|v| Expr::StringLit(v.name.clone()))
+                .collect();
+            Ok(Expr::ArrayLit {
+                elem_type: Box::new(Type::Named("str".to_string())),
+                elements,
+            })
+        }
+    }
 }

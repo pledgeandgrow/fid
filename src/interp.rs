@@ -14,6 +14,8 @@
 
 use crate::ir::*;
 use crate::ast::BinOp;
+use crate::tensor::Tensor;
+use crate::json;
 use std::collections::HashMap;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -21,7 +23,7 @@ use smallvec::SmallVec;
 use compact_str::CompactString;
 
 /// A runtime value in the interpreter
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
     Float(f64),
@@ -35,6 +37,10 @@ pub enum Value {
     Map(Rc<RefCell<hashbrown::HashMap<String, Value>>>),
     /// Trait object — (concrete_type_name, data_pointer)
     Dyn(String, u64),
+    /// Tensor — n-dimensional array (Phase 5C.1)
+    Tensor(Rc<RefCell<Tensor>>),
+    /// JSON value (Phase 5D.2)
+    Json(Rc<RefCell<json::Json>>),
 }
 
 impl std::fmt::Display for Value {
@@ -49,6 +55,36 @@ impl std::fmt::Display for Value {
             Value::Vec(_) => write!(f, "[...]"),
             Value::Map(_) => write!(f, "{{...}}"),
             Value::Dyn(t, _) => write!(f, "dyn({})", t),
+            Value::Tensor(t) => write!(f, "{}", t.borrow().to_string()),
+            Value::Json(j) => write!(f, "{}", json::dump(&j.borrow(), false)),
+        }
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Ptr(a), Value::Ptr(b)) => a == b,
+            (Value::Void, Value::Void) => true,
+            (Value::Vec(a), Value::Vec(b)) => {
+                a.borrow().as_slice() == b.borrow().as_slice()
+            }
+            (Value::Map(a), Value::Map(b)) => {
+                a.borrow().eq(&*b.borrow())
+            }
+            // Opaque types: reference identity
+            (Value::Dyn(a, _), Value::Dyn(b, _)) => a == b,
+            (Value::Tensor(a), Value::Tensor(b)) => {
+                a.as_ptr() == b.as_ptr()
+            }
+            (Value::Json(a), Value::Json(b)) => {
+                a.as_ptr() == b.as_ptr()
+            }
+            _ => false,
         }
     }
 }
@@ -159,6 +195,10 @@ pub struct Interpreter {
     debug_mode: bool,
     /// Array bounds tracking — maps base address to array size
     array_bounds: HashMap<u64, usize>,
+    /// In-memory databases for p_db_* builtins (Phase 5D.4)
+    databases: HashMap<u64, hashbrown::HashMap<String, Value>>,
+    /// Next database handle
+    next_db_handle: u64,
 }
 
 /// Result of running a function
@@ -180,6 +220,8 @@ impl Interpreter {
             verbose: false,
             debug_mode: true,
             array_bounds: HashMap::new(),
+            databases: HashMap::new(),
+            next_db_handle: 1,
         };
         // Pre-allocate string constants
         interp.init_strings();
@@ -455,6 +497,7 @@ impl Interpreter {
                                 self.memory.store(str_addr + s.len() as u64, &[0]);
                                 self.memory.store_i64(addr, str_addr as i64);
                             }
+                            // Tensor, Json, Dyn, Vec, Map are already in side-table via opaque_values.insert above
                             _ => {}
                         }
                     }
@@ -488,7 +531,7 @@ impl Interpreter {
                             self.opaque_values.insert(addr, v.clone());
                         }
                     }
-                    Some(Value::Vec(_)) | Some(Value::Map(_)) => {
+                    Some(Value::Vec(_)) | Some(Value::Map(_)) | Some(Value::Tensor(_)) | Some(Value::Json(_)) | Some(Value::Dyn(_, _)) => {
                         // Opaque values can't be serialized to bytes — store in side-table
                         if let Some(v) = values.get(value) {
                             self.opaque_values.insert(addr, v.clone());
@@ -999,6 +1042,12 @@ impl Interpreter {
             || name.starts_with("p_vec_")
             || name.starts_with("p_map_")
             || name.starts_with("p_string_")
+            || name.starts_with("p_json_")
+            || name.starts_with("p_tensor_")
+            || name.starts_with("p_simd_")
+            || name.starts_with("p_socket_")
+            || name.starts_with("p_http_")
+            || name.starts_with("p_db_")
     }
 
     /// Call a runtime function
@@ -1641,8 +1690,572 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Map(Rc::new(RefCell::new(hashbrown::HashMap::new()))))
             }
 
+            // ─── Phase 5D.2: JSON builtins (string-based) ───
+            "p_json_parse" => {
+                if let Some(s) = args.first() {
+                    let text = match s {
+                        Value::Str(s) => s.to_string(),
+                        Value::Ptr(addr) => {
+                            let mut bytes = Vec::new();
+                            let mut offset = *addr;
+                            loop {
+                                let b = self.memory.load(offset, 1);
+                                if b[0] == 0 { break; }
+                                bytes.push(b[0]);
+                                offset += 1;
+                            }
+                            String::from_utf8_lossy(&bytes).to_string()
+                        }
+                        _ => return ExecOutcome::Panic("json_parse: expected string".to_string()),
+                    };
+                    match json::parse(&text) {
+                        Ok(j) => ExecOutcome::Value(Value::Str(CompactString::from(json::dump(&j, false)))),
+                        Err(e) => ExecOutcome::Panic(format!("json_parse: {}", e)),
+                    }
+                } else {
+                    ExecOutcome::Panic("json_parse: missing argument".to_string())
+                }
+            }
+            "p_json_dump" => {
+                // Same as parse — canonicalize
+                if let Some(s) = args.first() {
+                    let text = match s {
+                        Value::Str(s) => s.to_string(),
+                        _ => return ExecOutcome::Panic("json_dump: expected string".to_string()),
+                    };
+                    match json::parse(&text) {
+                        Ok(j) => ExecOutcome::Value(Value::Str(CompactString::from(json::dump(&j, false)))),
+                        Err(e) => ExecOutcome::Panic(format!("json_dump: {}", e)),
+                    }
+                } else {
+                    ExecOutcome::Panic("json_dump: missing argument".to_string())
+                }
+            }
+            "p_json_get" => {
+                if let (Some(s), Some(key)) = (args.get(0), args.get(1)) {
+                    let text = match s {
+                        Value::Str(s) => s.to_string(),
+                        _ => return ExecOutcome::Panic("json_get: expected string".to_string()),
+                    };
+                    let key_str = match key {
+                        Value::Str(s) => s.to_string(),
+                        _ => return ExecOutcome::Panic("json_get: key must be string".to_string()),
+                    };
+                    match json::parse(&text) {
+                        Ok(json::Json::Object(map)) => {
+                            if let Some(v) = map.get(&key_str) {
+                                ExecOutcome::Value(Value::Str(CompactString::from(json::dump(v, false))))
+                            } else {
+                                ExecOutcome::Value(Value::Str(CompactString::from("null")))
+                            }
+                        }
+                        _ => ExecOutcome::Panic("json_get: not an object".to_string()),
+                    }
+                } else {
+                    ExecOutcome::Panic("json_get: missing args".to_string())
+                }
+            }
+            "p_json_type" => {
+                if let Some(s) = args.first() {
+                    let text = match s {
+                        Value::Str(s) => s.to_string(),
+                        _ => return ExecOutcome::Panic("json_type: expected string".to_string()),
+                    };
+                    match json::parse(&text) {
+                        Ok(j) => {
+                            let ty = match j {
+                                json::Json::Null => "null",
+                                json::Json::Bool(_) => "boolean",
+                                json::Json::Number(_) => "number",
+                                json::Json::String(_) => "string",
+                                json::Json::Array(_) => "array",
+                                json::Json::Object(_) => "object",
+                            };
+                            ExecOutcome::Value(Value::Str(CompactString::from(ty)))
+                        }
+                        Err(e) => ExecOutcome::Panic(format!("json_type: {}", e)),
+                    }
+                } else {
+                    ExecOutcome::Panic("json_type: missing argument".to_string())
+                }
+            }
+            "p_json_len" => {
+                if let Some(s) = args.first() {
+                    let text = match s {
+                        Value::Str(s) => s.to_string(),
+                        _ => return ExecOutcome::Panic("json_len: expected string".to_string()),
+                    };
+                    match json::parse(&text) {
+                        Ok(json::Json::Array(a)) => ExecOutcome::Value(Value::Int(a.len() as i64)),
+                        Ok(json::Json::Object(o)) => ExecOutcome::Value(Value::Int(o.len() as i64)),
+                        _ => ExecOutcome::Panic("json_len: not array or object".to_string()),
+                    }
+                } else {
+                    ExecOutcome::Panic("json_len: missing argument".to_string())
+                }
+            }
+            "p_json_at" => {
+                if let (Some(s), Some(Value::Int(idx))) = (args.get(0), args.get(1)) {
+                    let text = match s {
+                        Value::Str(s) => s.to_string(),
+                        _ => return ExecOutcome::Panic("json_at: expected string".to_string()),
+                    };
+                    match json::parse(&text) {
+                        Ok(json::Json::Array(a)) => {
+                            if let Some(v) = a.get(*idx as usize) {
+                                ExecOutcome::Value(Value::Str(CompactString::from(json::dump(v, false))))
+                            } else {
+                                ExecOutcome::Panic(format!("json_at: index {} out of bounds", idx))
+                            }
+                        }
+                        _ => ExecOutcome::Panic("json_at: not an array".to_string()),
+                    }
+                } else {
+                    ExecOutcome::Panic("json_at: missing args".to_string())
+                }
+            }
+            "p_json_pretty" => {
+                if let Some(s) = args.first() {
+                    let text = match s {
+                        Value::Str(s) => s.to_string(),
+                        _ => return ExecOutcome::Panic("json_pretty: expected string".to_string()),
+                    };
+                    match json::parse(&text) {
+                        Ok(j) => ExecOutcome::Value(Value::Str(CompactString::from(json::dump(&j, true)))),
+                        Err(e) => ExecOutcome::Panic(format!("json_pretty: {}", e)),
+                    }
+                } else {
+                    ExecOutcome::Panic("json_pretty: missing argument".to_string())
+                }
+            }
+            "p_json_string" => {
+                if let Some(s) = args.first() {
+                    let text = match s {
+                        Value::Str(s) => s.to_string(),
+                        _ => return ExecOutcome::Panic("json_string: expected string".to_string()),
+                    };
+                    match json::parse(&text) {
+                        Ok(json::Json::String(s)) => {
+                            ExecOutcome::Value(Value::Str(CompactString::from(s)))
+                        }
+                        _ => ExecOutcome::Panic("json_string: not a string".to_string()),
+                    }
+                } else {
+                    ExecOutcome::Panic("json_string: missing argument".to_string())
+                }
+            }
+
+            // ─── Phase 5C.1: Tensor builtins ───
+            "p_tensor_zeros" => {
+                if let Some(v) = arg_vec_usize(args, 0) {
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(Tensor::zeros(v)))))
+                } else {
+                    ExecOutcome::Panic("tensor_zeros: expected Vec".to_string())
+                }
+            }
+            "p_tensor_ones" => {
+                if let Some(v) = arg_vec_usize(args, 0) {
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(Tensor::ones(v)))))
+                } else {
+                    ExecOutcome::Panic("tensor_ones: expected Vec".to_string())
+                }
+            }
+            "p_tensor_filled" => {
+                if let (Some(v), Some(Value::Float(f))) = (arg_vec_usize(args, 0), args.get(1)) {
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(Tensor::filled(v, *f)))))
+                } else {
+                    ExecOutcome::Panic("tensor_filled: expected Vec, f64".to_string())
+                }
+            }
+            "p_tensor_from_vec" => {
+                if let (Some(shape), Some(data)) = (arg_vec_usize(args, 0), arg_vec_f64(args, 1)) {
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(Tensor::from_vec(shape, data)))))
+                } else {
+                    ExecOutcome::Panic("tensor_from_vec: expected Vec, Vec".to_string())
+                }
+            }
+            "p_tensor_get" => {
+                if let (Some(Value::Tensor(t)), Some(idx)) = (args.get(0), arg_vec_i64(args, 1)) {
+                    ExecOutcome::Value(Value::Float(t.borrow().get(&idx)))
+                } else {
+                    ExecOutcome::Panic("tensor_get: expected Tensor, Vec".to_string())
+                }
+            }
+            "p_tensor_set" => {
+                if let (Some(Value::Tensor(t)), Some(idx), Some(Value::Float(v))) = (args.get(0), arg_vec_i64(args, 1), args.get(2)) {
+                    t.borrow_mut().set(&idx, *v);
+                    ExecOutcome::Continue
+                } else {
+                    ExecOutcome::Panic("tensor_set: expected Tensor, Vec, f64".to_string())
+                }
+            }
+            "p_tensor_shape" => {
+                if let Some(Value::Tensor(t)) = args.first() {
+                    let shape: SmallVec<[Value; 8]> = t.borrow().shape.iter()
+                        .map(|&d| Value::Int(d as i64))
+                        .collect();
+                    ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(shape))))
+                } else {
+                    ExecOutcome::Panic("tensor_shape: expected Tensor".to_string())
+                }
+            }
+            "p_tensor_ndim" => {
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Int(t.borrow().ndim() as i64))
+                } else {
+                    ExecOutcome::Panic("tensor_ndim: expected Tensor".to_string())
+                }
+            }
+            "p_tensor_size" => {
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Int(t.borrow().size() as i64))
+                } else {
+                    ExecOutcome::Panic("tensor_size: expected Tensor".to_string())
+                }
+            }
+            "p_tensor_reshape" => {
+                if let (Some(Value::Tensor(t)), Some(new_shape)) = (args.get(0), arg_vec_usize(args, 1)) {
+                    match t.borrow().reshape(new_shape) {
+                        Ok(nt) => ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(nt)))),
+                        Err(e) => ExecOutcome::Panic(e),
+                    }
+                } else {
+                    ExecOutcome::Panic("tensor_reshape: expected Tensor, Vec".to_string())
+                }
+            }
+            "p_tensor_transpose" => {
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().transpose()))))
+                } else {
+                    ExecOutcome::Panic("tensor_transpose: expected Tensor".to_string())
+                }
+            }
+            "p_tensor_add" => {
+                if let (Some(Value::Tensor(a)), Some(Value::Tensor(b))) = (args.get(0), args.get(1)) {
+                    match a.borrow().add(&b.borrow()) {
+                        Ok(r) => ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(r)))),
+                        Err(e) => ExecOutcome::Panic(e),
+                    }
+                } else {
+                    ExecOutcome::Panic("tensor_add: expected Tensor, Tensor".to_string())
+                }
+            }
+            "p_tensor_sub" => {
+                if let (Some(Value::Tensor(a)), Some(Value::Tensor(b))) = (args.get(0), args.get(1)) {
+                    match a.borrow().sub(&b.borrow()) {
+                        Ok(r) => ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(r)))),
+                        Err(e) => ExecOutcome::Panic(e),
+                    }
+                } else {
+                    ExecOutcome::Panic("tensor_sub: expected Tensor, Tensor".to_string())
+                }
+            }
+            "p_tensor_mul" => {
+                if let (Some(Value::Tensor(a)), Some(Value::Tensor(b))) = (args.get(0), args.get(1)) {
+                    match a.borrow().mul(&b.borrow()) {
+                        Ok(r) => ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(r)))),
+                        Err(e) => ExecOutcome::Panic(e),
+                    }
+                } else {
+                    ExecOutcome::Panic("tensor_mul: expected Tensor, Tensor".to_string())
+                }
+            }
+            "p_tensor_scale" => {
+                if let (Some(Value::Tensor(t)), Some(Value::Float(s))) = (args.get(0), args.get(1)) {
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().scale(*s)))))
+                } else {
+                    ExecOutcome::Panic("tensor_scale: expected Tensor, f64".to_string())
+                }
+            }
+            "p_tensor_matmul" => {
+                if let (Some(Value::Tensor(a)), Some(Value::Tensor(b))) = (args.get(0), args.get(1)) {
+                    match a.borrow().matmul(&b.borrow()) {
+                        Ok(r) => ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(r)))),
+                        Err(e) => ExecOutcome::Panic(e),
+                    }
+                } else {
+                    ExecOutcome::Panic("tensor_matmul: expected Tensor, Tensor".to_string())
+                }
+            }
+            "p_tensor_dot" => {
+                if let (Some(Value::Tensor(a)), Some(Value::Tensor(b))) = (args.get(0), args.get(1)) {
+                    match a.borrow().dot(&b.borrow()) {
+                        Ok(r) => ExecOutcome::Value(Value::Float(r)),
+                        Err(e) => ExecOutcome::Panic(e),
+                    }
+                } else {
+                    ExecOutcome::Panic("tensor_dot: expected Tensor, Tensor".to_string())
+                }
+            }
+            "p_tensor_sum" => {
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Float(t.borrow().sum()))
+                } else {
+                    ExecOutcome::Panic("tensor_sum: expected Tensor".to_string())
+                }
+            }
+            "p_tensor_mean" => {
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Float(t.borrow().mean()))
+                } else {
+                    ExecOutcome::Panic("tensor_mean: expected Tensor".to_string())
+                }
+            }
+            "p_tensor_max" => {
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Float(t.borrow().max()))
+                } else {
+                    ExecOutcome::Panic("tensor_max: expected Tensor".to_string())
+                }
+            }
+            "p_tensor_min" => {
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Float(t.borrow().min()))
+                } else {
+                    ExecOutcome::Panic("tensor_min: expected Tensor".to_string())
+                }
+            }
+            "p_tensor_relu" => {
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().relu()))))
+                } else {
+                    ExecOutcome::Panic("tensor_relu: expected Tensor".to_string())
+                }
+            }
+            "p_tensor_sigmoid" => {
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().sigmoid()))))
+                } else {
+                    ExecOutcome::Panic("tensor_sigmoid: expected Tensor".to_string())
+                }
+            }
+            "p_tensor_softmax" => {
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().softmax()))))
+                } else {
+                    ExecOutcome::Panic("tensor_softmax: expected Tensor".to_string())
+                }
+            }
+            "p_tensor_to_str" => {
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Str(CompactString::from(t.borrow().to_string())))
+                } else {
+                    ExecOutcome::Panic("tensor_to_str: expected Tensor".to_string())
+                }
+            }
+            "p_tensor_to_json" => {
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Str(CompactString::from(t.borrow().to_json())))
+                } else {
+                    ExecOutcome::Panic("tensor_to_json: expected Tensor".to_string())
+                }
+            }
+            "p_tensor_clone" => {
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().clone()))))
+                } else {
+                    ExecOutcome::Panic("tensor_clone: expected Tensor".to_string())
+                }
+            }
+
+            // ─── Phase 5C.2: SIMD builtins ───
+            "p_simd_add" => simd_binary(args, |a, b| a + b),
+            "p_simd_sub" => simd_binary(args, |a, b| a - b),
+            "p_simd_mul" => simd_binary(args, |a, b| a * b),
+            "p_simd_div" => simd_binary(args, |a, b| if b != 0.0 { a / b } else { 0.0 }),
+            "p_simd_dot" => {
+                if let (Some(a), Some(b)) = (arg_vec_f64(args, 0), arg_vec_f64(args, 1)) {
+                    let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+                    ExecOutcome::Value(Value::Float(dot))
+                } else {
+                    ExecOutcome::Panic("simd_dot: expected Vec, Vec".to_string())
+                }
+            }
+            "p_simd_sum" => {
+                if let Some(v) = arg_vec_f64(args, 0) {
+                    ExecOutcome::Value(Value::Float(v.iter().sum()))
+                } else {
+                    ExecOutcome::Panic("simd_sum: expected Vec".to_string())
+                }
+            }
+            "p_simd_scale" => {
+                if let (Some(v), Some(Value::Float(s))) = (arg_vec_f64(args, 0), args.get(1)) {
+                    let result: SmallVec<[Value; 8]> = v.iter().map(|x| Value::Float(x * s)).collect();
+                    ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(result))))
+                } else {
+                    ExecOutcome::Panic("simd_scale: expected Vec, f64".to_string())
+                }
+            }
+            "p_simd_from_vec" => {
+                if let Some(Value::Vec(v)) = args.first() {
+                    let result: SmallVec<[Value; 8]> = v.borrow().iter().map(|x| match x {
+                        Value::Int(i) => Value::Float(*i as f64),
+                        Value::Float(f) => Value::Float(*f),
+                        other => other.clone(),
+                    }).collect();
+                    ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(result))))
+                } else {
+                    ExecOutcome::Panic("simd_from_vec: expected Vec".to_string())
+                }
+            }
+            "p_simd_to_str" => {
+                if let Some(v) = arg_vec_f64(args, 0) {
+                    let s: Vec<String> = v.iter().map(|x| format!("{}", x)).collect();
+                    ExecOutcome::Value(Value::Str(CompactString::from(format!("[{}]", s.join(", ")))))
+                } else {
+                    ExecOutcome::Panic("simd_to_str: expected Vec".to_string())
+                }
+            }
+
+            // ─── Phase 5D.3: Socket/HTTP builtins (simulated) ───
+            "p_socket_listen" => {
+                // Simulated socket — return a handle
+                ExecOutcome::Value(Value::Int(1))
+            }
+            "p_socket_accept" => {
+                // Simulated — return a client handle
+                ExecOutcome::Value(Value::Int(2))
+            }
+            "p_socket_read" => {
+                // Simulated — return empty vec
+                ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(SmallVec::new()))))
+            }
+            "p_socket_write" => {
+                // Simulated — return bytes "written"
+                if let Some(Value::Vec(v)) = args.get(1) {
+                    ExecOutcome::Value(Value::Int(v.borrow().len() as i64))
+                } else {
+                    ExecOutcome::Value(Value::Int(0))
+                }
+            }
+            "p_socket_close" => ExecOutcome::Continue,
+            "p_socket_recv_str" => {
+                // Simulated — return empty string
+                ExecOutcome::Value(Value::Str(CompactString::from("")))
+            }
+            "p_http_parse_request" => {
+                // Simulated — return a map with method, path, body
+                let mut map = hashbrown::HashMap::new();
+                map.insert("method".to_string(), Value::Str(CompactString::from("GET")));
+                map.insert("path".to_string(), Value::Str(CompactString::from("/")));
+                map.insert("body".to_string(), Value::Str(CompactString::from("")));
+                ExecOutcome::Value(Value::Map(Rc::new(RefCell::new(map))))
+            }
+            "p_http_build_response" => {
+                if let (Some(Value::Int(status)), Some(body)) = (args.get(0), args.get(2)) {
+                    let body_str = match body {
+                        Value::Str(s) => s.to_string(),
+                        _ => "".to_string(),
+                    };
+                    let response = format!("HTTP/1.1 {} OK\r\nContent-Length: {}\r\n\r\n{}",
+                        status, body_str.len(), body_str);
+                    ExecOutcome::Value(Value::Str(CompactString::from(response)))
+                } else {
+                    ExecOutcome::Value(Value::Str(CompactString::from("HTTP/1.1 500 Internal Server Error\r\n\r\n")))
+                }
+            }
+
+            // ─── Phase 5D.4: Database builtins (in-memory KV) ───
+            "p_db_mem_open" => {
+                let handle = self.next_db_handle;
+                self.next_db_handle += 1;
+                self.databases.insert(handle, hashbrown::HashMap::new());
+                ExecOutcome::Value(Value::Int(handle as i64))
+            }
+            "p_db_mem_close" => {
+                if let Some(Value::Int(h)) = args.first() {
+                    self.databases.remove(&(*h as u64));
+                }
+                ExecOutcome::Continue
+            }
+            "p_db_mem_query" => {
+                // Query: SELECT key FROM db -> return JSON array of all keys
+                if let Some(Value::Int(h)) = args.first() {
+                    if let Some(db) = self.databases.get(&(*h as u64)) {
+                        let arr: Vec<json::Json> = db.keys()
+                            .map(|k| json::Json::String(k.clone()))
+                            .collect();
+                        let j = json::Json::Array(arr);
+                        return ExecOutcome::Value(Value::Str(CompactString::from(json::dump(&j, false))));
+                    }
+                }
+                ExecOutcome::Value(Value::Str(CompactString::from("[]")))
+            }
+            "p_db_mem_exec" => {
+                // Exec: INSERT/SET key=value
+                if let (Some(Value::Int(h)), Some(query)) = (args.get(0), args.get(1)) {
+                    let query_str = match query {
+                        Value::Str(s) => s.to_string(),
+                        _ => return ExecOutcome::Value(Value::Int(0)),
+                    };
+                    // Simple: "SET key value" or "INSERT key value"
+                    let parts: Vec<&str> = query_str.splitn(3, ' ').collect();
+                    if parts.len() >= 3 && (parts[0].eq_ignore_ascii_case("set") || parts[0].eq_ignore_ascii_case("insert")) {
+                        if let Some(db) = self.databases.get_mut(&(*h as u64)) {
+                            db.insert(parts[1].to_string(), Value::Str(CompactString::from(parts[2])));
+                            return ExecOutcome::Value(Value::Int(1));
+                        }
+                    }
+                }
+                ExecOutcome::Value(Value::Int(0))
+            }
+
             _ => ExecOutcome::Panic(format!("Unknown runtime function: {}", name)),
         }
+    }
+}
+
+// ─── Helper functions for Phase 5C/5D builtins ──────────────────────
+
+/// Extract a Vec<usize> from an argument
+fn arg_vec_usize(args: &[Value], idx: usize) -> Option<Vec<usize>> {
+    match args.get(idx) {
+        Some(Value::Vec(v)) => {
+            Some(v.borrow().iter().map(|x| match x {
+                Value::Int(i) => *i as usize,
+                _ => 0,
+            }).collect())
+        }
+        _ => None,
+    }
+}
+
+/// Extract a Vec<i64> from an argument
+fn arg_vec_i64(args: &[Value], idx: usize) -> Option<Vec<i64>> {
+    match args.get(idx) {
+        Some(Value::Vec(v)) => {
+            Some(v.borrow().iter().map(|x| match x {
+                Value::Int(i) => *i,
+                _ => 0,
+            }).collect())
+        }
+        _ => None,
+    }
+}
+
+/// Extract a Vec<f64> from an argument
+fn arg_vec_f64(args: &[Value], idx: usize) -> Option<Vec<f64>> {
+    match args.get(idx) {
+        Some(Value::Vec(v)) => {
+            Some(v.borrow().iter().map(|x| match x {
+                Value::Int(i) => *i as f64,
+                Value::Float(f) => *f,
+                _ => 0.0,
+            }).collect())
+        }
+        _ => None,
+    }
+}
+
+/// SIMD binary operation helper
+fn simd_binary(args: &[Value], f: impl Fn(f64, f64) -> f64) -> ExecOutcome {
+    if let (Some(a), Some(b)) = (arg_vec_f64(args, 0), arg_vec_f64(args, 1)) {
+        let result: SmallVec<[Value; 8]> = a.iter().zip(b.iter())
+            .map(|(x, y)| Value::Float(f(*x, *y)))
+            .collect();
+        ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(result))))
+    } else {
+        ExecOutcome::Panic("simd: expected Vec, Vec".to_string())
     }
 }
 

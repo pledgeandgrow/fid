@@ -536,6 +536,8 @@ All 41 test files in `tests/` pass across all three backends. Key tests:
 | `test_generics.p` | Generic functions, monomorphization |
 | `test_traits.p` | `cap` traits, `impl Cap for Type` |
 | `test_capabilities.p` | Capability grants, denial, transitive |
+| `tests/capability/test_cap_*.p` | Capability security: grant/deny/propagation (Phase 2C) |
+| `tests/safety/test_*.p` | Bounds safety: OOB, overflow, div-by-zero, unwrap None (Phase 2D) |
 | `test_refs_mut.p` | `&mut` references, dereference |
 | `test_pe_*.p` | PE emitter specific tests (struct, enum, refs, generics, defer, try) |
 | `test_regression_*.p` | Regression tests (closures, fstrings, collections) |
@@ -567,7 +569,7 @@ Run all tests: `cargo run -- test`
 | Phase | Goal | Status |
 |-------|------|--------|
 | **Phase 1** | Bootstrap compiler in Rust — direct PE emission, MASM + C backends, IR interpreter | **Complete** (41/41 tests pass) |
-| **Phase 2** | Region inference, effect system, capability security, bounds safety | Not started |
+| **Phase 2** | Region inference, effect system, capability security, bounds safety | **In progress** (2C capability security ✓, 2D bounds safety ✓; 6/6 harness tests pass) |
 | **Phase 3** | comptime, advanced traits, FFI & interop | Not started |
 | **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | In progress (4A PIR complete, 4B optimizer complete) |
 | **Phase 5** | Bare metal, IoT, AI/ML, self-hosting | Not started |

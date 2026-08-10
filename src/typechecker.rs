@@ -230,6 +230,9 @@ impl TypeChecker {
         // Pre-pass: compute direct effects of each function (e.g., which functions call print)
         self.compute_func_effects(program);
 
+        // Verify declared effects match inferred effects
+        self.verify_declared_effects(program);
+
         for func in &program.funcs {
             self.check_func(func);
         }
@@ -255,6 +258,33 @@ impl TypeChecker {
                 self.check_func(method);
             }
             self.current_type_params = prev_type_params;
+        }
+    }
+
+    /// Verify that declared effect annotations match the inferred effects.
+    /// If a function declares `!IO` but actually has `!Net` too, that's an error
+    /// (under-declared). If it declares `!{}` (pure) but has `!IO`, that's also
+    /// an error. Over-declaring (declaring more than needed) is allowed.
+    fn verify_declared_effects(&mut self, program: &Program) {
+        for func in &program.funcs {
+            if !func.has_effect_annotation {
+                continue; // No annotation — nothing to verify
+            }
+
+            let inferred = match self.func_effects.get(&func.name) {
+                Some(e) => e,
+                None => continue,
+            };
+
+            // Check that all inferred effects are declared (under-declaration is an error)
+            for eff in inferred {
+                if !func.declared_effects.contains(eff) {
+                    self.errors.push(format!(
+                        "Effect error: function '{}' has inferred effect '!{}' but only declared '!{}'",
+                        func.name, eff, func.declared_effects.join(",")
+                    ));
+                }
+            }
         }
     }
 
@@ -361,6 +391,15 @@ impl TypeChecker {
                     self.scan_stmts_for_effects(&arm.body, effects);
                 }
             }
+            Stmt::Handle { body, handlers, .. } => {
+                self.scan_stmts_for_effects(body, effects);
+                for handler in handlers {
+                    self.scan_stmts_for_effects(&handler.body, effects);
+                }
+            }
+            Stmt::Do { effect, .. } => {
+                effects.insert(effect.clone());
+            }
             _ => {}
         }
     }
@@ -368,10 +407,31 @@ impl TypeChecker {
     fn scan_expr_for_effects(&self, expr: &Expr, effects: &mut HashSet<String>) {
         match expr {
             Expr::Call { callee, args } => {
-                if callee == "print" {
-                    effects.insert("IO".to_string());
+                // Direct effect mapping for built-in functions
+                match callee.as_str() {
+                    "print" | "println" | "print_int" | "print_float" | "print_str"
+                    | "p_print_str" | "p_print_int" | "p_println_str" | "p_println_int"
+                    | "p_fs_read" | "p_fs_write" => {
+                        effects.insert("IO".to_string());
+                    }
+                    "p_net_connect" | "p_net_send" | "p_net_recv" | "p_http_get" => {
+                        effects.insert("Net".to_string());
+                    }
+                    "p_spawn_process" | "p_spawn_thread" => {
+                        effects.insert("Spawn".to_string());
+                    }
+                    "p_panic" => {
+                        effects.insert("Diverge".to_string());
+                    }
+                    // Allocation functions
+                    "p_vec_new" | "p_map_new" | "p_vec_push" | "p_vec_insert"
+                    | "p_map_insert" | "p_string_concat" | "p_vec_clone"
+                    | "p_map_clone" | "p_string_clone" => {
+                        effects.insert("Alloc".to_string());
+                    }
+                    _ => {}
                 }
-                // Check if callee is a known function with IO effects
+                // Check if callee is a known function with effects
                 if let Some(func_effs) = self.func_effects.get(callee) {
                     for e in func_effs {
                         effects.insert(e.clone());
@@ -685,6 +745,28 @@ impl TypeChecker {
                 }
             }
             Stmt::Use { .. } => {}
+            Stmt::Handle { body, handlers, line: _ } => {
+                self.push_scope();
+                for s in body {
+                    self.check_stmt(s);
+                }
+                self.pop_scope();
+                for handler in handlers {
+                    self.push_scope();
+                    for param in &handler.params {
+                        self.declare(param, Type::I64);
+                    }
+                    for s in &handler.body {
+                        self.check_stmt(s);
+                    }
+                    self.pop_scope();
+                }
+            }
+            Stmt::Do { effect: _, op: _, args, line: _ } => {
+                for arg in args {
+                    self.check_expr(arg);
+                }
+            }
         }
     }
 
@@ -1398,6 +1480,24 @@ impl TypeChecker {
                     Type::I64
                 } else {
                     Type::Void
+                }
+            }
+            Expr::Comptime(inner) => self.check_expr(inner),
+            Expr::ComptimeBlock(stmts) => {
+                for s in stmts {
+                    self.check_stmt(s);
+                }
+                Type::I64
+            }
+            Expr::ComptimeReflect { op, ty: _ } => {
+                use crate::ast::ReflectOp;
+                match op {
+                    ReflectOp::TypeName => Type::Str,
+                    ReflectOp::IsStruct | ReflectOp::IsEnum => Type::Bool,
+                    ReflectOp::FieldCount => Type::I64,
+                    ReflectOp::FieldNames | ReflectOp::FieldTypes | ReflectOp::EnumVariants => {
+                        Type::Array { elem: Box::new(Type::Str), size: 0 }
+                    }
                 }
             }
         }

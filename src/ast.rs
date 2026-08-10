@@ -189,6 +189,27 @@ pub enum Expr {
         template: String,
         operands: Vec<AsmOperand>,
     },
+    /// comptime <expr> — evaluate at compile time, substitute the result
+    Comptime(Box<Expr>),
+    /// comptime { stmts... } — block evaluated at compile time
+    ComptimeBlock(Vec<Stmt>),
+    /// comptime reflect_op(Type) — type reflection at compile time
+    ComptimeReflect {
+        op: ReflectOp,
+        ty: Type,
+    },
+}
+
+/// Compile-time reflection operations (Phase 3A)
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReflectOp {
+    TypeName,
+    IsStruct,
+    IsEnum,
+    FieldCount,
+    FieldNames,
+    FieldTypes,
+    EnumVariants,
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +337,32 @@ pub enum Stmt {
         line: usize,
     },
     Use { path: String, items: Vec<String>, line: usize },
+    /// Effect handler: `handle { body } with { Effect.op(args) => handler_body, ... }`
+    Handle {
+        body: Vec<Stmt>,
+        handlers: Vec<EffectHandler>,
+        line: usize,
+    },
+    /// Perform an effect operation: `do Effect.op(args)`
+    Do {
+        effect: String,
+        op: String,
+        args: Vec<Expr>,
+        line: usize,
+    },
+}
+
+/// A handler for one effect operation within a `handle` block.
+#[derive(Debug, Clone)]
+pub struct EffectHandler {
+    /// Effect name (e.g. "IO")
+    pub effect: String,
+    /// Operation name (e.g. "print")
+    pub op: String,
+    /// Parameter names for the handler function
+    pub params: Vec<String>,
+    /// Handler body
+    pub body: Vec<Stmt>,
 }
 
 impl Stmt {
@@ -336,7 +383,9 @@ impl Stmt {
             | Stmt::Continue(line)
             | Stmt::Defer(_, line)
             | Stmt::Match { line, .. }
-            | Stmt::Use { line, .. } => *line,
+            | Stmt::Use { line, .. }
+            | Stmt::Handle { line, .. }
+            | Stmt::Do { line, .. } => *line,
         }
     }
 }
@@ -374,6 +423,12 @@ pub struct Func {
     pub is_pub: bool,
     /// Whether this is a comptime function (evaluated at compile time)
     pub is_comptime: bool,
+    /// Explicit effect annotations (e.g. `!IO`, `!Net,Spawn`)
+    /// Empty = no annotation (effects will be inferred)
+    pub declared_effects: Vec<String>,
+    /// Whether the function has an explicit effect annotation (`!IO`, `!{}`, etc.)
+    /// If true and declared_effects is empty, the function is explicitly pure.
+    pub has_effect_annotation: bool,
 }
 
 #[derive(Debug, Clone)]

@@ -15,6 +15,7 @@ mod typechecker;
 mod pe;
 mod pir;
 mod opt;
+mod regalloc;
 mod tensor;
 mod wasm;
 mod x86;
@@ -787,6 +788,52 @@ fn main() {
 
             print!("{}", pir::format_l2(&l2));
             eprintln!(";; optimization stats: {:?}", stats);
+        }
+
+        "codegen" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pledgec codegen <file.p> [--target x86-64|arm64]");
+                eprintln!("       Emits assembly via the custom PIR L3 → target codegen");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let target = args.iter().position(|a| a == "--target")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| s.as_str())
+                .unwrap_or("x86-64");
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+            let module = match compiler::lower_to_ir_module(&source) {
+                Ok(m) => m,
+                Err(errors) => {
+                    for e in errors {
+                        eprintln!("{}", e);
+                    }
+                    process::exit(1);
+                }
+            };
+            match target {
+                "x86-64" | "x64" => {
+                    let l1 = pir::lower_ir_to_l1(&module);
+                    let l2 = pir::lower_l1_to_l2(&l1);
+                    let l3 = pir::lower_l2_to_l3(&l2, &module);
+                    let asm = codegen_x64::generate_asm(&l3);
+                    print!("{}", asm);
+                }
+                "arm64" | "aarch64" => {
+                    eprintln!("ARM64 codegen not yet implemented (Phase 4C target 2)");
+                    process::exit(1);
+                }
+                _ => {
+                    eprintln!("Unknown target: {} (supported: x86-64, arm64)", target);
+                    process::exit(1);
+                }
+            }
         }
 
         _ => {

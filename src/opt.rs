@@ -152,19 +152,43 @@ pub fn optimize_ir_module(ir_module: &crate::ir::IrModule) -> (L2Module, OptStat
 /// Does this instruction have observable side effects (so DCE must keep it
 /// even if its result is unused)?
 fn has_side_effects(inst: &L2Inst) -> bool {
-    matches!(
-        inst,
-        L2Inst::Store { .. }
-            | L2Inst::Call { .. }
-            | L2Inst::CallPtr { .. }
-            | L2Inst::DynCall { .. }
-            | L2Inst::Print { .. }
-            | L2Inst::Panic { .. }
-            | L2Inst::Return { .. }
-            | L2Inst::Jump { .. }
-            | L2Inst::Branch { .. }
-            | L2Inst::Unreachable
-            | L2Inst::TryUnwrap { .. }
+    match inst {
+        L2Inst::Store { .. } => true,
+        L2Inst::Print { .. } => true,
+        L2Inst::Panic { .. } => true,
+        L2Inst::Return { .. } => true,
+        L2Inst::Jump { .. } => true,
+        L2Inst::Branch { .. } => true,
+        L2Inst::Unreachable => true,
+        L2Inst::TryUnwrap { .. } => true,
+        // Calls to pure functions have no side effects
+        L2Inst::Call { func, .. } => !is_known_pure_func(func),
+        // CallPtr and DynCall are conservative — assume side effects
+        L2Inst::CallPtr { .. } | L2Inst::DynCall { .. } => true,
+        _ => false,
+    }
+}
+
+/// Check if a function name is known to be pure (no side effects).
+/// Runtime helper functions that only compute values are pure.
+fn is_known_pure_func(name: &str) -> bool {
+    matches!(name,
+        // Pure arithmetic helpers
+        "p_add" | "p_sub" | "p_mul" | "p_div" | "p_mod"
+        // Pure comparison helpers
+        | "p_eq" | "p_neq" | "p_lt" | "p_gt" | "p_le" | "p_ge"
+        // Pure conversion helpers
+        | "p_int_to_float" | "p_float_to_int" | "p_int_extend" | "p_int_trunc"
+        // Pure string accessors (no mutation)
+        | "p_string_len" | "p_string_contains" | "p_string_starts_with"
+        | "p_string_ends_with" | "p_string_trim" | "p_string_to_uppercase"
+        | "p_string_to_lowercase" | "p_string_replace" | "p_string_split"
+        | "p_string_char_at"
+        // Pure vec accessors (read-only)
+        | "p_vec_len" | "p_vec_get" | "p_vec_contains"
+        // Pure option/result
+        | "p_option_some" | "p_option_none" | "p_option_is_some" | "p_option_is_none"
+        | "p_result_ok" | "p_result_err" | "p_result_is_ok" | "p_result_is_err"
     )
 }
 
@@ -1201,9 +1225,19 @@ pub fn function_effects(f: &L2Function) -> EffectSet {
                 effects.add(Effect::Read);
             }
             L2Inst::Panic { .. } | L2Inst::Unreachable => effects.add(Effect::Diverge),
-            L2Inst::Call { .. } | L2Inst::CallPtr { .. } | L2Inst::DynCall { .. } => {
-                // Conservative: assume all effects. With Phase 2's effect
-                // inference, this would consult the callee's declared effects.
+            L2Inst::Call { func, .. } => {
+                if is_known_pure_func(func) {
+                    // Pure function — no effects
+                } else {
+                    // Conservative: assume all effects for unknown functions
+                    effects.add(Effect::IO);
+                    effects.add(Effect::Read);
+                    effects.add(Effect::Write);
+                    effects.add(Effect::Alloc);
+                }
+            }
+            L2Inst::CallPtr { .. } | L2Inst::DynCall { .. } => {
+                // Conservative: assume all effects for indirect calls
                 effects.add(Effect::IO);
                 effects.add(Effect::Read);
                 effects.add(Effect::Write);

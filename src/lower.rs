@@ -223,6 +223,78 @@ impl Lowerer {
         self.module.add_extern("p_to_str",
             vec![IrType::I64],
             IrType::Ptr(Box::new(IrType::U8)));
+
+        // ─── Phase 5D.2: JSON stdlib ───
+        let json_ty = IrType::Opaque("Json".to_string());
+        self.module.add_extern("p_json_parse", vec![IrType::Ptr(Box::new(IrType::U8))], json_ty.clone());
+        self.module.add_extern("p_json_dump", vec![json_ty.clone()], IrType::Ptr(Box::new(IrType::U8)));
+        self.module.add_extern("p_json_get", vec![json_ty.clone(), IrType::Ptr(Box::new(IrType::U8))], json_ty.clone());
+        self.module.add_extern("p_json_type", vec![json_ty.clone()], IrType::Ptr(Box::new(IrType::U8)));
+        self.module.add_extern("p_json_len", vec![json_ty.clone()], IrType::I64);
+        self.module.add_extern("p_json_at", vec![json_ty.clone(), IrType::I64], json_ty.clone());
+        self.module.add_extern("p_json_pretty", vec![json_ty.clone()], IrType::Ptr(Box::new(IrType::U8)));
+        self.module.add_extern("p_json_string", vec![json_ty.clone()], IrType::Ptr(Box::new(IrType::U8)));
+
+        // ─── Phase 5C.1: Tensor stdlib ───
+        let tensor_ty = IrType::Opaque("Tensor".to_string());
+        let vec_i64_ty = IrType::Opaque("Vec".to_string());
+        self.module.add_extern("p_tensor_zeros", vec![vec_i64_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_tensor_ones", vec![vec_i64_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_tensor_filled", vec![vec_i64_ty.clone(), IrType::F64], tensor_ty.clone());
+        self.module.add_extern("p_tensor_from_vec", vec![vec_i64_ty.clone(), vec_i64_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_tensor_get", vec![tensor_ty.clone(), vec_i64_ty.clone()], IrType::F64);
+        self.module.add_extern("p_tensor_set", vec![tensor_ty.clone(), vec_i64_ty.clone(), IrType::F64], IrType::Void);
+        self.module.add_extern("p_tensor_shape", vec![tensor_ty.clone()], vec_i64_ty.clone());
+        self.module.add_extern("p_tensor_ndim", vec![tensor_ty.clone()], IrType::I64);
+        self.module.add_extern("p_tensor_size", vec![tensor_ty.clone()], IrType::I64);
+        self.module.add_extern("p_tensor_reshape", vec![tensor_ty.clone(), vec_i64_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_tensor_transpose", vec![tensor_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_tensor_add", vec![tensor_ty.clone(), tensor_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_tensor_sub", vec![tensor_ty.clone(), tensor_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_tensor_mul", vec![tensor_ty.clone(), tensor_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_tensor_scale", vec![tensor_ty.clone(), IrType::F64], tensor_ty.clone());
+        self.module.add_extern("p_tensor_matmul", vec![tensor_ty.clone(), tensor_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_tensor_dot", vec![tensor_ty.clone(), tensor_ty.clone()], IrType::F64);
+        self.module.add_extern("p_tensor_sum", vec![tensor_ty.clone()], IrType::F64);
+        self.module.add_extern("p_tensor_mean", vec![tensor_ty.clone()], IrType::F64);
+        self.module.add_extern("p_tensor_max", vec![tensor_ty.clone()], IrType::F64);
+        self.module.add_extern("p_tensor_min", vec![tensor_ty.clone()], IrType::F64);
+        self.module.add_extern("p_tensor_relu", vec![tensor_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_tensor_sigmoid", vec![tensor_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_tensor_softmax", vec![tensor_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_tensor_to_str", vec![tensor_ty.clone()], IrType::Ptr(Box::new(IrType::U8)));
+        self.module.add_extern("p_tensor_to_json", vec![tensor_ty.clone()], IrType::Ptr(Box::new(IrType::U8)));
+        self.module.add_extern("p_tensor_clone", vec![tensor_ty.clone()], tensor_ty.clone());
+
+        // ─── Phase 5C.2: SIMD stdlib ───
+        let simd_ty = IrType::Opaque("Vec".to_string());
+        self.module.add_extern("p_simd_add", vec![simd_ty.clone(), simd_ty.clone()], simd_ty.clone());
+        self.module.add_extern("p_simd_sub", vec![simd_ty.clone(), simd_ty.clone()], simd_ty.clone());
+        self.module.add_extern("p_simd_mul", vec![simd_ty.clone(), simd_ty.clone()], simd_ty.clone());
+        self.module.add_extern("p_simd_div", vec![simd_ty.clone(), simd_ty.clone()], simd_ty.clone());
+        self.module.add_extern("p_simd_dot", vec![simd_ty.clone(), simd_ty.clone()], IrType::F64);
+        self.module.add_extern("p_simd_sum", vec![simd_ty.clone()], IrType::F64);
+        self.module.add_extern("p_simd_scale", vec![simd_ty.clone(), IrType::F64], simd_ty.clone());
+        self.module.add_extern("p_simd_from_vec", vec![vec_i64_ty.clone()], simd_ty.clone());
+        self.module.add_extern("p_simd_to_str", vec![simd_ty.clone()], IrType::Ptr(Box::new(IrType::U8)));
+
+        // ─── Phase 5D.3: HTTP server stdlib ───
+        let socket_ty = IrType::Opaque("Socket".to_string());
+        self.module.add_extern("p_socket_listen", vec![IrType::I64], socket_ty.clone());
+        self.module.add_extern("p_socket_accept", vec![socket_ty.clone()], socket_ty.clone());
+        self.module.add_extern("p_socket_read", vec![socket_ty.clone()], vec_i64_ty.clone());
+        self.module.add_extern("p_socket_write", vec![socket_ty.clone(), vec_i64_ty.clone()], IrType::I64);
+        self.module.add_extern("p_socket_close", vec![socket_ty.clone()], IrType::Void);
+        self.module.add_extern("p_socket_recv_str", vec![socket_ty.clone()], IrType::Ptr(Box::new(IrType::U8)));
+        self.module.add_extern("p_http_parse_request", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Opaque("HttpRequest".to_string()));
+        self.module.add_extern("p_http_build_response", vec![IrType::I64, IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))], IrType::Ptr(Box::new(IrType::U8)));
+
+        // ─── Phase 5D.4: Database driver framework ───
+        let db_ty = IrType::Opaque("Database".to_string());
+        self.module.add_extern("p_db_mem_open", vec![], db_ty.clone());
+        self.module.add_extern("p_db_mem_close", vec![db_ty.clone()], IrType::Void);
+        self.module.add_extern("p_db_mem_query", vec![db_ty.clone(), IrType::Ptr(Box::new(IrType::U8))], IrType::Ptr(Box::new(IrType::U8)));
+        self.module.add_extern("p_db_mem_exec", vec![db_ty.clone(), IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
     }
 
     /// Lower a single function
@@ -699,6 +771,19 @@ impl Lowerer {
 
             Stmt::Use { .. } => {
                 // Imports are handled at the AST level
+            }
+
+            Stmt::Handle { body, handlers, .. } => {
+                // Lower the body (effect handlers are not yet supported in IR)
+                self.lower_stmts(body);
+                let _ = handlers;
+            }
+
+            Stmt::Do { effect: _, op: _, args, .. } => {
+                // Lower the effect operation arguments (do is not yet fully supported in IR)
+                for arg in args {
+                    self.lower_expr(arg);
+                }
             }
         }
     }
@@ -2488,6 +2573,8 @@ impl Lowerer {
                     body: body.clone(),
                     is_pub: false,
                     is_comptime: false,
+                    declared_effects: Vec::new(),
+                    has_effect_annotation: false,
                 };
 
                 // Save current function context, lower the closure, restore context
@@ -2569,6 +2656,15 @@ impl Lowerer {
                     outputs,
                     ret_ty,
                 })
+            }
+            Expr::Comptime(inner) => self.lower_expr(inner),
+            Expr::ComptimeBlock(_) => {
+                // Should not reach here after comptime substitution; emit const 0
+                self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 })
+            }
+            Expr::ComptimeReflect { .. } => {
+                // Should not reach here after comptime substitution; emit const 0
+                self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 })
             }
         }
     }
@@ -2669,6 +2765,17 @@ impl Lowerer {
                     }
                 }
                 Stmt::Use { .. } => {}
+                Stmt::Handle { body, handlers, .. } => {
+                    self.collect_free_vars(body, free_vars, local_names);
+                    for handler in handlers {
+                        self.collect_free_vars(&handler.body, free_vars, local_names);
+                    }
+                }
+                Stmt::Do { args, .. } => {
+                    for arg in args {
+                        self.collect_free_vars_expr(arg, free_vars, local_names);
+                    }
+                }
             }
         }
     }
@@ -2804,6 +2911,13 @@ impl Lowerer {
                 self.collect_free_vars(body, free_vars, &mut inner_locals);
             }
             Expr::IntLit(_) | Expr::FloatLit(_) | Expr::BoolLit(_) | Expr::StringLit(_) => {}
+            Expr::Comptime(inner) => {
+                self.collect_free_vars_expr(inner, free_vars, local_names);
+            }
+            Expr::ComptimeBlock(stmts) => {
+                self.collect_free_vars(stmts, free_vars, &mut local_names.to_vec());
+            }
+            Expr::ComptimeReflect { .. } => {}
         }
     }
 
@@ -3225,6 +3339,19 @@ impl Lowerer {
                     IrType::I64
                 } else {
                     IrType::Void
+                }
+            }
+            Expr::Comptime(inner) => self.infer_expr_type(inner),
+            Expr::ComptimeBlock(_) => IrType::I64,
+            Expr::ComptimeReflect { op, .. } => {
+                use crate::ast::ReflectOp;
+                match op {
+                    ReflectOp::TypeName => IrType::Ptr(Box::new(IrType::U8)),
+                    ReflectOp::IsStruct | ReflectOp::IsEnum => IrType::Bool,
+                    ReflectOp::FieldCount => IrType::I64,
+                    ReflectOp::FieldNames | ReflectOp::FieldTypes | ReflectOp::EnumVariants => {
+                        IrType::Array(Box::new(IrType::Ptr(Box::new(IrType::U8))), 0)
+                    }
                 }
             }
         }

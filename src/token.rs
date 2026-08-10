@@ -38,6 +38,8 @@ pub enum TokenKind {
     Loop,        // loop
     Break,       // break
     Continue,    // continue
+    Handle,      // handle — effect handler
+    Do,          // do — perform effect operation
     True,
     False,
 
@@ -171,6 +173,8 @@ impl fmt::Display for TokenKind {
             TokenKind::Loop => write!(f, "loop"),
             TokenKind::Break => write!(f, "break"),
             TokenKind::Continue => write!(f, "continue"),
+            TokenKind::Handle => write!(f, "handle"),
+            TokenKind::Do => write!(f, "do"),
             TokenKind::True => write!(f, "true"),
             TokenKind::False => write!(f, "false"),
             TokenKind::IntLit(n) => write!(f, "{}", n),

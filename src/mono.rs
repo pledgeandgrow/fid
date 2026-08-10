@@ -272,6 +272,14 @@ fn subst_expr(expr: &Expr, subst: &Subst, renames: &HashMap<String, String>, met
             args: args.iter().map(|a| subst_expr(a, subst, renames, method_renames)).collect(),
         },
         Expr::Asm { .. } => expr.clone(),
+        Expr::Comptime(inner) => Expr::Comptime(Box::new(subst_expr(inner, subst, renames, method_renames))),
+        Expr::ComptimeBlock(stmts) => Expr::ComptimeBlock(
+            stmts.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect()
+        ),
+        Expr::ComptimeReflect { op, ty } => Expr::ComptimeReflect {
+            op: op.clone(),
+            ty: subst_type(ty, subst),
+        },
     }
 }
 
@@ -344,6 +352,22 @@ fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, met
         Stmt::Use { path, items, line } => Stmt::Use {
             path: path.clone(),
             items: items.clone(),
+            line: *line,
+        },
+        Stmt::Handle { body, handlers, line } => Stmt::Handle {
+            body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
+            handlers: handlers.iter().map(|h| EffectHandler {
+                effect: h.effect.clone(),
+                op: h.op.clone(),
+                params: h.params.clone(),
+                body: h.body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
+            }).collect(),
+            line: *line,
+        },
+        Stmt::Do { effect, op, args, line } => Stmt::Do {
+            effect: effect.clone(),
+            op: op.clone(),
+            args: args.iter().map(|a| subst_expr(a, subst, renames, method_renames)).collect(),
             line: *line,
         },
     }
@@ -619,6 +643,8 @@ fn process_func(func: &Func, ctx: &mut MonoCtx) -> Func {
         body: new_body,
         is_pub: func.is_pub,
         is_comptime: false,
+        declared_effects: func.declared_effects.clone(),
+        has_effect_annotation: func.has_effect_annotation,
     }
 }
 
@@ -650,6 +676,8 @@ fn instantiate(gen_func: &Func, subst: &Subst, mangled_name: &str, ctx: &mut Mon
         body: subst_body,
         is_pub: gen_func.is_pub,
         is_comptime: false,
+        declared_effects: gen_func.declared_effects.clone(),
+        has_effect_annotation: gen_func.has_effect_annotation,
     };
 
     // Now process this concrete function — it may contain calls to other generics
@@ -752,6 +780,21 @@ fn collect_generic_calls_stmt_with_hint(
             }
         }
         Stmt::Use { .. } => {}
+        Stmt::Handle { body, handlers, .. } => {
+            for s in body {
+                collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
+            }
+            for handler in handlers {
+                for s in &handler.body {
+                    collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
+                }
+            }
+        }
+        Stmt::Do { args, .. } => {
+            for arg in args {
+                collect_generic_calls_expr_with_hint(arg, generics, generic_methods, calls, method_calls, current_func, None);
+            }
+        }
     }
 }
 

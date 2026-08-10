@@ -99,6 +99,14 @@ impl Parser {
                     let attr = self.parse_attribute()?;
                     program.attributes.push(attr);
                 }
+                TokenKind::Comptime => {
+                    self.advance(); // consume comptime
+                    // comptime pf name(...) { ... }
+                    let mut func = self.parse_func()?;
+                    func.is_pub = is_pub;
+                    func.is_comptime = true;
+                    program.funcs.push(func);
+                }
                 _ => {
                     let mut func = self.parse_func()?;
                     func.is_pub = is_pub;
@@ -511,6 +519,32 @@ impl Parser {
             Type::Void
         };
 
+        // Parse effect annotation: !IO, !{IO, Net}, !{} (pure)
+        let mut has_effect_annotation = false;
+        let declared_effects = if self.match_tok(TokenKind::Bang) {
+            has_effect_annotation = true;
+            if self.match_tok(TokenKind::LBrace) {
+                // !{IO, Net, ...}
+                let mut effects = Vec::new();
+                if !self.check(&TokenKind::RBrace) {
+                    loop {
+                        let eff = self.expect_ident()?;
+                        effects.push(eff);
+                        if !self.match_tok(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(TokenKind::RBrace, "}")?;
+                effects
+            } else {
+                // !IO (single effect)
+                vec![self.expect_ident()?]
+            }
+        } else {
+            Vec::new()
+        };
+
         self.expect(TokenKind::LBrace, "{")?;
         let body = self.parse_block()?;
         self.expect(TokenKind::RBrace, "}")?;
@@ -524,6 +558,8 @@ impl Parser {
             body,
             is_pub: false,
             is_comptime: false,
+            declared_effects,
+            has_effect_annotation,
         })
     }
 
@@ -722,6 +758,8 @@ impl Parser {
             }
             TokenKind::Match => self.parse_match_stmt(),
             TokenKind::Use => self.parse_use_stmt(),
+            TokenKind::Handle => self.parse_handle_stmt(),
+            TokenKind::Do => self.parse_do_stmt(),
             _ => self.parse_assign_or_expr(),
         }
     }
@@ -1224,6 +1262,48 @@ impl Parser {
                     expr: Box::new(expr),
                 })
             }
+            TokenKind::Comptime => {
+                self.advance();
+                // comptime { block } — comptime block expression
+                if self.check(&TokenKind::LBrace) {
+                    self.advance();
+                    let mut stmts = Vec::new();
+                    while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+                        stmts.push(self.parse_stmt()?);
+                    }
+                    self.expect(TokenKind::RBrace, "}")?;
+                    // Optional trailing semicolon
+                    self.match_tok(TokenKind::Semicolon);
+                    return Ok(Expr::ComptimeBlock(stmts));
+                }
+                // comptime reflect_op(Type) — type reflection
+                // Recognize: type_name, is_struct, is_enum, field_count,
+                // field_names, field_types, enum_variants
+                if let TokenKind::Ident(ref name) = self.peek().clone() {
+                    let reflect_op = match name.as_str() {
+                        "type_name" => Some(ReflectOp::TypeName),
+                        "is_struct" => Some(ReflectOp::IsStruct),
+                        "is_enum" => Some(ReflectOp::IsEnum),
+                        "field_count" => Some(ReflectOp::FieldCount),
+                        "field_names" => Some(ReflectOp::FieldNames),
+                        "field_types" => Some(ReflectOp::FieldTypes),
+                        "enum_variants" => Some(ReflectOp::EnumVariants),
+                        _ => None,
+                    };
+                    if let Some(op) = reflect_op {
+                        self.advance(); // consume the function name
+                        self.expect(TokenKind::LParen, "(")?;
+                        let ty = self.parse_type()?;
+                        self.expect(TokenKind::RParen, ")")?;
+                        self.match_tok(TokenKind::Semicolon);
+                        return Ok(Expr::ComptimeReflect { op, ty });
+                    }
+                }
+                // comptime <expr> — comptime expression
+                let inner = self.parse_unary()?;
+                self.match_tok(TokenKind::Semicolon);
+                Ok(Expr::Comptime(Box::new(inner)))
+            }
             _ => self.parse_postfix(),
         }
     }
@@ -1693,6 +1773,76 @@ impl Parser {
         }
         self.match_tok(TokenKind::Semicolon);
         Ok(Stmt::Use { path, items, line })
+    }
+
+    /// Parse `handle { body } with { Effect.op(params) => { handler }, ... }`
+    fn parse_handle_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect(TokenKind::Handle, "handle")?;
+        self.expect(TokenKind::LBrace, "{")?;
+        let body = self.parse_block()?;
+        self.expect(TokenKind::RBrace, "}")?;
+        self.expect(TokenKind::With, "with")?;
+        self.expect(TokenKind::LBrace, "{")?;
+
+        let mut handlers = Vec::new();
+        while !self.check(&TokenKind::RBrace) {
+            // Effect.op(params)
+            let effect = self.expect_ident()?;
+            self.expect(TokenKind::Dot, ".")?;
+            let op = self.expect_ident()?;
+            self.expect(TokenKind::LParen, "(")?;
+            let mut params = Vec::new();
+            if !self.check(&TokenKind::RParen) {
+                loop {
+                    params.push(self.expect_ident()?);
+                    if !self.match_tok(TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(TokenKind::RParen, ")")?;
+            self.expect(TokenKind::FatArrow, "=>")?;
+            self.expect(TokenKind::LBrace, "{")?;
+            let handler_body = self.parse_block()?;
+            self.expect(TokenKind::RBrace, "}")?;
+
+            handlers.push(EffectHandler {
+                effect,
+                op,
+                params,
+                body: handler_body,
+            });
+
+            if !self.match_tok(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RBrace, "}")?;
+
+        Ok(Stmt::Handle { body, handlers, line })
+    }
+
+    /// Parse `do Effect.op(args)` — perform an effect operation
+    fn parse_do_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect(TokenKind::Do, "do")?;
+        let effect = self.expect_ident()?;
+        self.expect(TokenKind::Dot, ".")?;
+        let op = self.expect_ident()?;
+        self.expect(TokenKind::LParen, "(")?;
+        let mut args = Vec::new();
+        if !self.check(&TokenKind::RParen) {
+            loop {
+                args.push(self.parse_expr()?);
+                if !self.match_tok(TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(TokenKind::RParen, ")")?;
+        self.match_tok(TokenKind::Semicolon);
+        Ok(Stmt::Do { effect, op, args, line })
     }
 
     fn parse_attribute(&mut self) -> Result<Attribute, String> {

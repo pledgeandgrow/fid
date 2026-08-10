@@ -598,3 +598,83 @@ fn capability_security_enforced() {
     }
     println!("Capability security: {}/{} tests passed", passed, cap_tests.len());
 }
+
+/// Effect system test: verify effect annotations, inference, and checking.
+/// Test files in tests/effects/ are split into:
+/// - "should pass" (correct annotations, pure functions, propagation)
+/// - "should fail" (under-declaration, pure violation)
+#[test]
+fn effect_system_enforced() {
+    let bin = ensure_binary();
+    let effect_dir = PathBuf::from("tests/effects");
+    if !effect_dir.exists() {
+        println!("tests/effects/ directory not found, skipping effect test.");
+        return;
+    }
+
+    let mut effect_tests: Vec<PathBuf> = fs::read_dir(&effect_dir)
+        .expect("Could not open tests/effects/ directory")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |e| e == "p"))
+        .collect();
+    effect_tests.sort();
+    assert!(!effect_tests.is_empty(), "No .p effect test files found in tests/effects/");
+
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut failures: Vec<String> = Vec::new();
+
+    for test in &effect_tests {
+        let name = test.file_name().unwrap().to_string_lossy().to_string();
+
+        let output = Command::new(&bin)
+            .arg("run")
+            .arg(test)
+            .output()
+            .expect("Failed to run interpreter");
+        let code = output.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        if name.contains("underdeclare") || name.contains("pure_violation") {
+            // These tests should fail with an effect error
+            if code == 0 {
+                failed += 1;
+                failures.push(format!(
+                    "{}: expected effect error (exit=1) but succeeded (exit=0)",
+                    name
+                ));
+            } else if !stderr.contains("Effect error") {
+                failed += 1;
+                failures.push(format!(
+                    "{}: expected 'Effect error' in stderr but got: {}",
+                    name, stderr
+                ));
+            } else {
+                passed += 1;
+            }
+        } else {
+            // These tests should succeed
+            if code != 0 {
+                failed += 1;
+                failures.push(format!(
+                    "{}: expected success (exit=0) but failed (exit={}): {}",
+                    name, code, stderr
+                ));
+            } else {
+                passed += 1;
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "Effect system: {}/{} passed, {} failed:\n{}",
+            passed,
+            effect_tests.len(),
+            failed,
+            failures.join("\n")
+        );
+    }
+    println!("Effect system: {}/{} tests passed", passed, effect_tests.len());
+}

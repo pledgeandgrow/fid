@@ -585,6 +585,12 @@ impl CodeGen {
             Stmt::Use { .. } => {
                 // No-op: imports resolved at compile time
             }
+            Stmt::Handle { .. } => {
+                // Not yet supported in legacy ARM64 codegen
+            }
+            Stmt::Do { .. } => {
+                // Not yet supported in legacy ARM64 codegen
+            }
         }
     }
 

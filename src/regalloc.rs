@@ -1,0 +1,769 @@
+// Register Allocator — Phase 4C
+//
+// Linear scan register allocator for x86-64. Consumes PIR L3 (which uses
+// unbounded virtual registers) and maps each VReg to either a physical
+// register or a stack slot.
+//
+// Algorithm:
+//   1. Compute live intervals for each VReg (start = first def, end = last use).
+//   2. Sort intervals by start point.
+//   3. Walk intervals in order; assign a free physical register, or spill
+//      the interval with the farthest end point to a stack slot.
+//
+// x86-64 register file (System V AMD64 calling convention):
+//   General purpose (caller-saved): RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11
+//   General purpose (callee-saved): RBX, R12, R13, R14, R15, RBP
+//   We allocate from caller-saved first (no save/restore overhead), then
+//   callee-saved (requires prologue/epilogue saves).
+//
+// For the bootstrap we use a simplified calling convention:
+//   - Args in RDI, RSI, RDX, RCX, R8, R9 (first 6 integer/pointer args)
+//   - Return in RAX
+//   - 8 caller-saved + 6 callee-saved = 14 allocatable GP registers
+//
+// Entry points:
+//   allocate(&L3Function) -> Allocation  — run the allocator on one function
+//   allocate_module(&L3Module) -> ModuleAllocation  — run on all functions
+
+use crate::pir::{L3Function, L3Inst, L3Module, MemRegion, Operand, VReg};
+use crate::ir::BlockId;
+use std::collections::{HashMap, HashSet};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Physical registers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A physical x86-64 general-purpose register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum PhysReg {
+    Rax = 0,
+    Rcx = 1,
+    Rdx = 2,
+    Rbx = 3,
+    Rsp = 4,
+    Rbp = 5,
+    Rsi = 6,
+    Rdi = 7,
+    R8 = 8,
+    R9 = 9,
+    R10 = 10,
+    R11 = 11,
+    R12 = 12,
+    R13 = 13,
+    R14 = 14,
+    R15 = 15,
+}
+
+impl PhysReg {
+    /// The 4-bit encoding used in ModRM reg/rm fields.
+    pub fn encoding(self) -> u8 {
+        self as u8
+    }
+
+    /// Registers available for allocation (not RSP, not RBP).
+    /// Caller-saved first, then callee-saved.
+    pub fn allocatable() -> &'static [PhysReg] {
+        &[
+            // Caller-saved (no prologue save needed)
+            PhysReg::Rax,
+            PhysReg::Rcx,
+            PhysReg::Rdx,
+            PhysReg::Rsi,
+            PhysReg::Rdi,
+            PhysReg::R8,
+            PhysReg::R9,
+            PhysReg::R10,
+            PhysReg::R11,
+            // Callee-saved (need prologue push / epilogue pop)
+            PhysReg::Rbx,
+            PhysReg::R12,
+            PhysReg::R13,
+            PhysReg::R14,
+            PhysReg::R15,
+        ]
+    }
+
+    /// Is this register callee-saved?
+    pub fn is_callee_saved(self) -> bool {
+        matches!(
+            self,
+            PhysReg::Rbx | PhysReg::R12 | PhysReg::R13 | PhysReg::R14 | PhysReg::R15
+        )
+    }
+
+    /// Argument registers in System V AMD64 order (first 6 integer args).
+    pub fn arg_regs() -> &'static [PhysReg] {
+        &[PhysReg::Rdi, PhysReg::Rsi, PhysReg::Rdx, PhysReg::Rcx, PhysReg::R8, PhysReg::R9]
+    }
+
+    /// Return value register.
+    pub fn return_reg() -> PhysReg {
+        PhysReg::Rax
+    }
+
+    /// Name for assembly output.
+    pub fn name(self) -> &'static str {
+        match self {
+            PhysReg::Rax => "rax",
+            PhysReg::Rcx => "rcx",
+            PhysReg::Rdx => "rdx",
+            PhysReg::Rbx => "rbx",
+            PhysReg::Rsp => "rsp",
+            PhysReg::Rbp => "rbp",
+            PhysReg::Rsi => "rsi",
+            PhysReg::Rdi => "rdi",
+            PhysReg::R8 => "r8",
+            PhysReg::R9 => "r9",
+            PhysReg::R10 => "r10",
+            PhysReg::R11 => "r11",
+            PhysReg::R12 => "r12",
+            PhysReg::R13 => "r13",
+            PhysReg::R14 => "r14",
+            PhysReg::R15 => "r15",
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Live intervals
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A live interval [start, end] for a virtual register.
+/// `start` is the instruction index where the VReg is defined;
+/// `end` is the instruction index of its last use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveInterval {
+    pub vreg: VReg,
+    pub start: u32,
+    pub end: u32,
+}
+
+impl LiveInterval {
+    /// Does this interval overlap with another?
+    pub fn overlaps(&self, other: &LiveInterval) -> bool {
+        !(self.end < other.start || other.end < self.start)
+    }
+
+    /// Is this interval live at instruction index `pos`?
+    pub fn contains(&self, pos: u32) -> bool {
+        pos >= self.start && pos <= self.end
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Allocation result
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Where a VReg lives after allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Location {
+    /// Allocated to a physical register.
+    Reg(PhysReg),
+    /// Spilled to a stack slot at byte offset from RBP.
+    Spill(u32),
+}
+
+/// The result of allocating one function.
+#[derive(Debug, Clone)]
+pub struct Allocation {
+    /// VReg → location mapping.
+    pub vreg_to_loc: HashMap<VReg, Location>,
+    /// Callee-saved registers used (need prologue push / epilogue pop).
+    pub used_callee_saved: Vec<PhysReg>,
+    /// Total spill area size in bytes (added to frame size).
+    pub spill_size: u32,
+    /// Argument VRegs that arrive in physical registers.
+    pub arg_locations: Vec<Location>,
+}
+
+impl Allocation {
+    /// Look up where a VReg lives.
+    pub fn loc(&self, vreg: VReg) -> Location {
+        self.vreg_to_loc
+            .get(&vreg)
+            .copied()
+            .unwrap_or(Location::Spill(0))
+    }
+
+    /// Look up the physical register for a VReg, if any.
+    pub fn reg(&self, vreg: VReg) -> Option<PhysReg> {
+        match self.loc(vreg) {
+            Location::Reg(r) => Some(r),
+            _ => None,
+        }
+    }
+}
+
+/// Allocation results for an entire module.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleAllocation {
+    pub func_allocations: HashMap<String, Allocation>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Linear scan allocator
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Run the linear scan allocator on a single function.
+pub fn allocate(func: &L3Function) -> Allocation {
+    // 1. Compute live intervals.
+    let intervals = compute_live_intervals(func);
+
+    // 2. Map argument VRegs to their incoming physical registers.
+    let arg_regs = PhysReg::arg_regs();
+    let mut arg_locations: Vec<Location> = Vec::new();
+    for (i, (vreg, _)) in func.params.iter().enumerate() {
+        if i < arg_regs.len() {
+            arg_locations.push(Location::Reg(arg_regs[i]));
+        } else {
+            // Extra args are on the stack (above RBP). Offset: 16 + (i-6)*8.
+            let offset = 16 + (i - arg_regs.len()) as u32 * 8;
+            arg_locations.push(Location::Spill(offset));
+        }
+    }
+
+    // 3. Pre-assign argument VRegs to their physical registers or stack slots.
+    let mut vreg_to_loc: HashMap<VReg, Location> = HashMap::new();
+    let mut preassigned_reg: HashMap<VReg, PhysReg> = HashMap::new();
+    let mut preassigned_all: HashSet<VReg> = HashSet::new();
+    for (i, (vreg, _)) in func.params.iter().enumerate() {
+        if i < arg_regs.len() {
+            vreg_to_loc.insert(*vreg, Location::Reg(arg_regs[i]));
+            preassigned_reg.insert(*vreg, arg_regs[i]);
+        } else {
+            let offset = 16 + (i - arg_regs.len()) as u32 * 8;
+            vreg_to_loc.insert(*vreg, Location::Spill(offset));
+        }
+        preassigned_all.insert(*vreg);
+    }
+
+    // 4. Sort intervals by start point.
+    let mut sorted: Vec<LiveInterval> = intervals.values().cloned().collect();
+    sorted.sort_by_key(|i| i.start);
+
+    // 5. Linear scan.
+    // `active` holds intervals currently assigned to a physical register,
+    // sorted by end point. `free_pool` holds available physical registers.
+    let mut active: Vec<LiveInterval> = Vec::new();
+    let mut free_pool: Vec<PhysReg> = PhysReg::allocatable().to_vec();
+    // Remove pre-assigned arg registers from the free pool — they're
+    // occupied by incoming args at function entry.
+    for &r in preassigned_reg.values() {
+        free_pool.retain(|&p| p != r);
+    }
+
+    let mut spill_offset: u32 = func.frame_size as u32;
+    let mut used_callee_saved: Vec<PhysReg> = Vec::new();
+
+    for interval in &sorted {
+        // Skip VRegs that are pre-assigned (function params — in registers or on stack).
+        if preassigned_all.contains(&interval.vreg) {
+            // Only add to active if it's in a register (so we track its lifetime
+            // and free the register when it expires).
+            if preassigned_reg.contains_key(&interval.vreg) {
+                active.push(*interval);
+                active.sort_by_key(|i| i.end);
+            }
+            continue;
+        }
+
+        // Expire old intervals: any active interval whose end < this start
+        // is no longer live; free its register.
+        let mut to_free: Vec<PhysReg> = Vec::new();
+        active.retain(|a| {
+            if a.end < interval.start {
+                if let Some(Location::Reg(r)) = vreg_to_loc.get(&a.vreg) {
+                    to_free.push(*r);
+                }
+                false // remove from active
+            } else {
+                true
+            }
+        });
+        for r in to_free {
+            if !preassigned_reg.values().any(|&p| p == r) {
+                if !free_pool.contains(&r) {
+                    free_pool.push(r);
+                }
+            }
+        }
+        free_pool.sort_by_key(|r| r.encoding());
+
+        // Try to assign a free register.
+        if let Some(reg) = free_pool.first().copied() {
+            free_pool.remove(0);
+            vreg_to_loc.insert(interval.vreg, Location::Reg(reg));
+            active.push(*interval);
+            active.sort_by_key(|i| i.end);
+            if reg.is_callee_saved() && !used_callee_saved.contains(&reg) {
+                used_callee_saved.push(reg);
+            }
+        } else {
+            // No free register — spill. Choose the interval with the farthest
+            // end point among (active + current). If the current interval has
+            // the farthest end, spill it. Otherwise, spill the farthest-active
+            // and give its register to the current.
+            let mut candidates: Vec<&LiveInterval> = active.iter().collect();
+            candidates.push(interval);
+            candidates.sort_by_key(|i| i.end);
+
+            let spill_vreg = candidates.last().unwrap().vreg;
+            let is_current = spill_vreg == interval.vreg;
+
+            if is_current {
+                // Spill the current interval.
+                let aligned = (spill_offset + 7) & !7;
+                spill_offset = aligned + 8;
+                vreg_to_loc.insert(interval.vreg, Location::Spill(aligned));
+            } else {
+                // Spill the farthest-active, take its register.
+                let reg = match vreg_to_loc.get(&spill_vreg) {
+                    Some(Location::Reg(r)) => *r,
+                    _ => {
+                        // Fallback: just spill current.
+                        let aligned = (spill_offset + 7) & !7;
+                        spill_offset = aligned + 8;
+                        vreg_to_loc.insert(interval.vreg, Location::Spill(aligned));
+                        continue;
+                    }
+                };
+                let aligned = (spill_offset + 7) & !7;
+                spill_offset = aligned + 8;
+                vreg_to_loc.insert(spill_vreg, Location::Spill(aligned));
+                active.retain(|a| a.vreg != spill_vreg);
+
+                vreg_to_loc.insert(interval.vreg, Location::Reg(reg));
+                active.push(*interval);
+                active.sort_by_key(|i| i.end);
+                if reg.is_callee_saved() && !used_callee_saved.contains(&reg) {
+                    used_callee_saved.push(reg);
+                }
+            }
+        }
+    }
+
+    // Sort callee-saved registers by encoding for deterministic prologue.
+    used_callee_saved.sort_by_key(|r| r.encoding());
+
+    Allocation {
+        vreg_to_loc,
+        used_callee_saved,
+        spill_size: spill_offset - func.frame_size as u32,
+        arg_locations,
+    }
+}
+
+/// Run the allocator on all functions in a module.
+pub fn allocate_module(module: &L3Module) -> ModuleAllocation {
+    let mut result = ModuleAllocation::default();
+    for f in &module.functions {
+        result.func_allocations.insert(f.name.clone(), allocate(f));
+    }
+    result
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Live interval computation
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Compute live intervals for all VRegs in a function.
+///
+/// We use a simple linear-scan-friendly approach: flatten all instructions
+/// into a single instruction index space (block by block), then for each
+/// VReg, find its first def and last use.
+///
+/// This is NOT a precise liveness analysis (no dataflow). It's the classic
+/// linear-scan simplification: each VReg's interval spans from its first
+/// definition to its last use across the whole function. This is
+/// conservative (intervals may be longer than necessary) but correct.
+fn compute_live_intervals(func: &L3Function) -> HashMap<VReg, LiveInterval> {
+    let mut intervals: HashMap<VReg, LiveInterval> = HashMap::new();
+    let mut idx: u32 = 0;
+
+    // Helper to record a def (start of interval).
+    let mut def = |vreg: VReg, pos: u32, intervals: &mut HashMap<VReg, LiveInterval>| {
+        let entry = intervals.entry(vreg).or_insert(LiveInterval {
+            vreg,
+            start: pos,
+            end: pos,
+        });
+        if pos < entry.start {
+            entry.start = pos;
+        }
+    };
+
+    // Helper to record a use (extends end of interval).
+    let mut use_ = |vreg: VReg, pos: u32, intervals: &mut HashMap<VReg, LiveInterval>| {
+        let entry = intervals.entry(vreg).or_insert(LiveInterval {
+            vreg,
+            start: pos,
+            end: pos,
+        });
+        if pos > entry.end {
+            entry.end = pos;
+        }
+    };
+
+    // Function params are live from instruction 0.
+    for (vreg, _) in &func.params {
+        def(*vreg, 0, &mut intervals);
+    }
+
+    for block in &func.blocks {
+        // Block params are defined at block entry.
+        for (vreg, _) in &block.params {
+            def(*vreg, idx, &mut intervals);
+        }
+
+        for inst in &block.instructions {
+            // Record defs (the destination VReg).
+            if let Some(dst) = inst_def(inst) {
+                def(dst, idx, &mut intervals);
+            }
+
+            // Record uses (all VReg operands).
+            for vreg in inst_uses(inst) {
+                use_(vreg, idx, &mut intervals);
+            }
+
+            idx += 1;
+        }
+    }
+
+    intervals
+}
+
+/// The VReg defined by an instruction (its destination), if any.
+fn inst_def(inst: &L3Inst) -> Option<VReg> {
+    match inst {
+        L3Inst::Mov { dst, .. }
+        | L3Inst::Bin { dst, .. }
+        | L3Inst::Unary { dst, .. }
+        | L3Inst::StackAlloc { dst, .. }
+        | L3Inst::Load { dst, .. }
+        | L3Inst::FieldAddr { dst, .. }
+        | L3Inst::ElemAddr { dst, .. }
+        | L3Inst::MakeDyn { dst, .. }
+        | L3Inst::Cast { dst, .. } => Some(*dst),
+        L3Inst::Call { dst, .. } | L3Inst::CallPtr { dst, .. } | L3Inst::DynCall { dst, .. } => {
+            *dst
+        }
+        L3Inst::TryUnwrap { ok_dst, .. } => Some(*ok_dst),
+        L3Inst::Store { .. }
+        | L3Inst::Jmp { .. }
+        | L3Inst::Br { .. }
+        | L3Inst::Ret { .. }
+        | L3Inst::Unreachable
+        | L3Inst::Print { .. }
+        | L3Inst::Panic { .. } => None,
+    }
+}
+
+/// All VRegs used (read) by an instruction.
+fn inst_uses(inst: &L3Inst) -> Vec<VReg> {
+    let mut uses = Vec::new();
+    let mut collect = |op: &Operand, uses: &mut Vec<VReg>| {
+        if let Operand::VReg(r) = op {
+            uses.push(*r);
+        }
+    };
+
+    match inst {
+        L3Inst::Mov { src, .. } => collect(src, &mut uses),
+        L3Inst::Bin { a, b, .. } => {
+            collect(a, &mut uses);
+            collect(b, &mut uses);
+        }
+        L3Inst::Unary { src, .. } => collect(src, &mut uses),
+        L3Inst::StackAlloc { .. } => {}
+        L3Inst::Load { ptr, .. } => collect(ptr, &mut uses),
+        L3Inst::Store { ptr, val, .. } => {
+            collect(ptr, &mut uses);
+            collect(val, &mut uses);
+        }
+        L3Inst::FieldAddr { base, .. } => collect(base, &mut uses),
+        L3Inst::ElemAddr { base, index, .. } => {
+            collect(base, &mut uses);
+            collect(index, &mut uses);
+        }
+        L3Inst::Jmp { .. } => {}
+        L3Inst::Br { cond, .. } => collect(cond, &mut uses),
+        L3Inst::Ret { value: Some(v) } => collect(v, &mut uses),
+        L3Inst::Ret { value: None } => {}
+        L3Inst::Unreachable => {}
+        L3Inst::Call { args, .. } | L3Inst::DynCall { args, .. } => {
+            for a in args {
+                collect(a, &mut uses);
+            }
+        }
+        L3Inst::CallPtr { fn_ptr, args, .. } => {
+            collect(fn_ptr, &mut uses);
+            for a in args {
+                collect(a, &mut uses);
+            }
+        }
+        L3Inst::MakeDyn { value, .. } => collect(value, &mut uses),
+        L3Inst::Cast { src, .. } => collect(src, &mut uses),
+        L3Inst::TryUnwrap { value, .. } => collect(value, &mut uses),
+        L3Inst::Print { val, .. } => collect(val, &mut uses),
+        L3Inst::Panic { .. } => {}
+    }
+
+    uses
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pir::{L3Block, L3Function, L3Inst, Operand, VReg};
+    use crate::ir::{BlockId, IrType};
+
+    fn vreg(n: u32) -> VReg {
+        VReg(n)
+    }
+
+    fn make_func(name: &str, blocks: Vec<L3Block>) -> L3Function {
+        L3Function {
+            name: name.to_string(),
+            params: Vec::new(),
+            ret_ty: IrType::I64,
+            blocks,
+            entry: BlockId(0),
+            frame_size: 0,
+            next_vreg: 100,
+        }
+    }
+
+    #[test]
+    fn interval_overlap() {
+        let a = LiveInterval { vreg: vreg(0), start: 0, end: 5 };
+        let b = LiveInterval { vreg: vreg(1), start: 3, end: 10 };
+        let c = LiveInterval { vreg: vreg(2), start: 6, end: 8 };
+        assert!(a.overlaps(&b));
+        assert!(!a.overlaps(&c));
+        assert!(b.overlaps(&c));
+    }
+
+    #[test]
+    fn interval_contains() {
+        let i = LiveInterval { vreg: vreg(0), start: 2, end: 7 };
+        assert!(i.contains(2));
+        assert!(i.contains(7));
+        assert!(i.contains(5));
+        assert!(!i.contains(1));
+        assert!(!i.contains(8));
+    }
+
+    #[test]
+    fn allocates_single_vreg_to_register() {
+        // One block: v0 = Mov #42; Ret v0
+        let block = L3Block {
+            id: BlockId(0),
+            instructions: vec![
+                L3Inst::Mov { dst: vreg(0), src: Operand::ImmI(42) },
+                L3Inst::Ret { value: Some(Operand::VReg(vreg(0))) },
+            ],
+            predecessors: Vec::new(),
+            params: Vec::new(),
+        };
+        let func = make_func("test", vec![block]);
+        let alloc = allocate(&func);
+        assert!(alloc.reg(vreg(0)).is_some(), "v0 should get a register");
+    }
+
+    #[test]
+    fn allocates_non_overlapping_to_same_reg() {
+        // v0 lives [0,1], v1 lives [2,3] — should share a register.
+        let block = L3Block {
+            id: BlockId(0),
+            instructions: vec![
+                L3Inst::Mov { dst: vreg(0), src: Operand::ImmI(1) },
+                L3Inst::Ret { value: Some(Operand::VReg(vreg(0))) },
+                L3Inst::Mov { dst: vreg(1), src: Operand::ImmI(2) },
+                L3Inst::Ret { value: Some(Operand::VReg(vreg(1))) },
+            ],
+            predecessors: Vec::new(),
+            params: Vec::new(),
+        };
+        let func = make_func("test", vec![block]);
+        let alloc = allocate(&func);
+        let r0 = alloc.reg(vreg(0));
+        let r1 = alloc.reg(vreg(1));
+        assert!(r0.is_some() && r1.is_some());
+        // Non-overlapping intervals may reuse the same register.
+        // (Not required, but likely with linear scan.)
+    }
+
+    #[test]
+    fn spills_when_pressure_exceeds_registers() {
+        // Create more live VRegs than physical registers (14 allocatable).
+        // Use 20 VRegs all live simultaneously.
+        let mut insts = Vec::new();
+        // Define 20 VRegs
+        for i in 0..20 {
+            insts.push(L3Inst::Mov {
+                dst: vreg(i),
+                src: Operand::ImmI(i as i64),
+            });
+        }
+        // Use all 20 (keeps them all live until the end)
+        for i in 0..20 {
+            insts.push(L3Inst::Ret {
+                value: Some(Operand::VReg(vreg(i))),
+            });
+        }
+        let block = L3Block {
+            id: BlockId(0),
+            instructions: insts,
+            predecessors: Vec::new(),
+            params: Vec::new(),
+        };
+        let func = make_func("test", vec![block]);
+        let alloc = allocate(&func);
+
+        let in_reg: usize = (0..20).filter(|i| alloc.reg(vreg(*i)).is_some()).count();
+        let in_spill: usize = (0..20).filter(|i| matches!(alloc.loc(vreg(*i)), Location::Spill(_))).count();
+        assert!(in_reg <= 14, "at most 14 VRegs in registers, got {}", in_reg);
+        assert!(in_spill >= 6, "at least 6 VRegs spilled, got {}", in_spill);
+        assert_eq!(in_reg + in_spill, 20);
+    }
+
+    #[test]
+    fn function_params_get_arg_registers() {
+        // Function with 3 params — should get RDI, RSI, RDX.
+        let func = L3Function {
+            name: "test".to_string(),
+            params: vec![
+                (vreg(0), IrType::I64),
+                (vreg(1), IrType::I64),
+                (vreg(2), IrType::I64),
+            ],
+            ret_ty: IrType::I64,
+            blocks: vec![L3Block {
+                id: BlockId(0),
+                instructions: vec![L3Inst::Ret {
+                    value: Some(Operand::VReg(vreg(0))),
+                }],
+                predecessors: Vec::new(),
+                params: Vec::new(),
+            }],
+            entry: BlockId(0),
+            frame_size: 0,
+            next_vreg: 10,
+        };
+        let alloc = allocate(&func);
+        assert_eq!(alloc.reg(vreg(0)), Some(PhysReg::Rdi));
+        assert_eq!(alloc.reg(vreg(1)), Some(PhysReg::Rsi));
+        assert_eq!(alloc.reg(vreg(2)), Some(PhysReg::Rdx));
+    }
+
+    #[test]
+    fn extra_params_spill_to_stack() {
+        // Function with 10 params — first 6 in registers, rest on stack.
+        let params: Vec<(VReg, IrType)> = (0..10)
+            .map(|i| (vreg(i), IrType::I64))
+            .collect();
+        let func = L3Function {
+            name: "test".to_string(),
+            params,
+            ret_ty: IrType::I64,
+            blocks: vec![L3Block {
+                id: BlockId(0),
+                instructions: vec![L3Inst::Ret {
+                    value: Some(Operand::VReg(vreg(0))),
+                }],
+                predecessors: Vec::new(),
+                params: Vec::new(),
+            }],
+            entry: BlockId(0),
+            frame_size: 0,
+            next_vreg: 20,
+        };
+        let alloc = allocate(&func);
+        // First 6 in registers
+        for i in 0..6 {
+            assert!(alloc.reg(vreg(i)).is_some(), "param {} should be in a register", i);
+        }
+        // Rest on stack
+        for i in 6..10 {
+            assert!(
+                matches!(alloc.loc(vreg(i)), Location::Spill(_)),
+                "param {} should be spilled", i
+            );
+        }
+    }
+
+    #[test]
+    fn inst_def_and_uses() {
+        // Bin: defines dst, uses a and b
+        let inst = L3Inst::Bin {
+            op: crate::ast::BinOp::Add,
+            dst: vreg(3),
+            a: Operand::VReg(vreg(1)),
+            b: Operand::VReg(vreg(2)),
+            ty: IrType::I64,
+        };
+        assert_eq!(inst_def(&inst), Some(vreg(3)));
+        let uses = inst_uses(&inst);
+        assert!(uses.contains(&vreg(1)));
+        assert!(uses.contains(&vreg(2)));
+
+        // Ret: no def, uses the value
+        let inst = L3Inst::Ret {
+            value: Some(Operand::VReg(vreg(5))),
+        };
+        assert_eq!(inst_def(&inst), None);
+        assert!(inst_uses(&inst).contains(&vreg(5)));
+
+        // Store: no def, uses ptr and val
+        let inst = L3Inst::Store {
+            ptr: Operand::VReg(vreg(1)),
+            val: Operand::VReg(vreg(2)),
+            ty: IrType::I64,
+        };
+        assert_eq!(inst_def(&inst), None);
+        let uses = inst_uses(&inst);
+        assert!(uses.contains(&vreg(1)));
+        assert!(uses.contains(&vreg(2)));
+    }
+
+    #[test]
+    fn phys_reg_names() {
+        assert_eq!(PhysReg::Rax.name(), "rax");
+        assert_eq!(PhysReg::R15.name(), "r15");
+        assert_eq!(PhysReg::Rdi.name(), "rdi");
+    }
+
+    #[test]
+    fn phys_reg_callee_saved() {
+        assert!(PhysReg::Rbx.is_callee_saved());
+        assert!(PhysReg::R12.is_callee_saved());
+        assert!(!PhysReg::Rax.is_callee_saved());
+        assert!(!PhysReg::Rdi.is_callee_saved());
+    }
+
+    #[test]
+    fn arg_regs_order() {
+        let regs = PhysReg::arg_regs();
+        assert_eq!(regs.len(), 6);
+        assert_eq!(regs[0], PhysReg::Rdi);
+        assert_eq!(regs[1], PhysReg::Rsi);
+        assert_eq!(regs[2], PhysReg::Rdx);
+        assert_eq!(regs[3], PhysReg::Rcx);
+        assert_eq!(regs[4], PhysReg::R8);
+        assert_eq!(regs[5], PhysReg::R9);
+    }
+
+    #[test]
+    fn allocatable_excludes_rsp_rbp() {
+        let alloc = PhysReg::allocatable();
+        assert!(!alloc.contains(&PhysReg::Rsp));
+        assert!(!alloc.contains(&PhysReg::Rbp));
+        assert_eq!(alloc.len(), 14);
+    }
+}

@@ -264,12 +264,26 @@ impl fmt::Display for IrType {
 
 /// Effects that an instruction or function can have.
 /// This is Pledge's key differentiator — effects are tracked at the IR level.
+///
+/// Effect taxonomy:
+/// - **Pure**: no side effects at all (can reorder, memoize, CSE)
+/// - **Read**: reads from memory (loads)
+/// - **Write**: writes to memory (stores)
+/// - **Alloc**: allocates memory (heap or stack)
+/// - **IO**: performs console/file I/O (print, println, file read/write)
+/// - **Net**: performs network I/O (connect, send, recv)
+/// - **Spawn**: spawns threads or processes
+/// - **Diverge**: may not return (infinite loop, panic, abort)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Effect {
     /// Allocates memory (heap or stack)
     Alloc,
-    /// Performs I/O (print, file, network)
+    /// Performs console/file I/O (print, println, file read/write)
     IO,
+    /// Performs network I/O (connect, send, recv)
+    Net,
+    /// Spawns threads or subprocesses
+    Spawn,
     /// May not return (infinite loop, panic, abort)
     Diverge,
     /// Reads from memory
@@ -283,6 +297,8 @@ impl fmt::Display for Effect {
         match self {
             Effect::Alloc => write!(f, "alloc"),
             Effect::IO => write!(f, "io"),
+            Effect::Net => write!(f, "net"),
+            Effect::Spawn => write!(f, "spawn"),
             Effect::Diverge => write!(f, "diverge"),
             Effect::Read => write!(f, "read"),
             Effect::Write => write!(f, "write"),
@@ -323,6 +339,32 @@ impl EffectSet {
 
     pub fn is_pure(&self) -> bool {
         self.effects.is_empty()
+    }
+
+    /// True if the function has no observable side effects
+    /// (may still read memory, but no IO/Net/Spawn/Write/Alloc/Diverge)
+    pub fn is_read_only(&self) -> bool {
+        self.effects.iter().all(|e| matches!(e, Effect::Read))
+    }
+
+    /// True if the function may have observable side effects
+    /// (IO, Net, Spawn, Write, Alloc, or Diverge)
+    pub fn has_side_effects(&self) -> bool {
+        self.effects.iter().any(|e| !matches!(e, Effect::Read))
+    }
+
+    /// Parse an effect from its string name
+    pub fn parse_effect(s: &str) -> Option<Effect> {
+        match s.to_lowercase().as_str() {
+            "alloc" => Some(Effect::Alloc),
+            "io" => Some(Effect::IO),
+            "net" => Some(Effect::Net),
+            "spawn" => Some(Effect::Spawn),
+            "diverge" => Some(Effect::Diverge),
+            "read" => Some(Effect::Read),
+            "write" => Some(Effect::Write),
+            _ => None,
+        }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Effect> {
