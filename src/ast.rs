@@ -234,50 +234,82 @@ pub enum Stmt {
         ty: Option<Type>,
         expr: Expr,
         is_mut: bool,
+        line: usize,
     },
     Assign {
         target: String,
         op: AssignOp,
         expr: Expr,
+        line: usize,
     },
     IndexAssign {
         array: String,
         index: Expr,
         op: AssignOp,
         expr: Expr,
+        line: usize,
     },
     DerefAssign {
         ptr_expr: Expr,
         op: AssignOp,
         expr: Expr,
+        line: usize,
     },
-    Expr(Expr),
-    Return(Option<Expr>),
+    Expr(Expr, usize),
+    Return(Option<Expr>, usize),
     If {
         cond: Expr,
         then_block: Vec<Stmt>,
         else_block: Option<Vec<Stmt>>,
+        line: usize,
     },
     While {
         cond: Expr,
         body: Vec<Stmt>,
+        line: usize,
     },
     For {
         var: String,
         iterator: Expr,
         body: Vec<Stmt>,
+        line: usize,
     },
     Loop {
         body: Vec<Stmt>,
+        line: usize,
     },
-    Break(Option<Expr>),
-    Continue,
-    Defer(Vec<Stmt>),
+    Break(Option<Expr>, usize),
+    Continue(usize),
+    Defer(Vec<Stmt>, usize),
     Match {
         expr: Expr,
         arms: Vec<MatchArm>,
+        line: usize,
     },
-    Use { path: String, items: Vec<String> },
+    Use { path: String, items: Vec<String>, line: usize },
+}
+
+impl Stmt {
+    /// Get the source line for this statement.
+    pub fn line(&self) -> usize {
+        match self {
+            Stmt::Let { line, .. }
+            | Stmt::Assign { line, .. }
+            | Stmt::IndexAssign { line, .. }
+            | Stmt::DerefAssign { line, .. }
+            | Stmt::Expr(_, line)
+            | Stmt::Return(_, line)
+            | Stmt::If { line, .. }
+            | Stmt::While { line, .. }
+            | Stmt::For { line, .. }
+            | Stmt::Loop { line, .. }
+            | Stmt::Break(_, line)
+            | Stmt::Continue(line)
+            | Stmt::Defer(_, line)
+            | Stmt::Match { line, .. }
+            | Stmt::Use { line, .. } => *line,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

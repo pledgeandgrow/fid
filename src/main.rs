@@ -322,7 +322,7 @@ fn main() {
 
         "ccompile" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec ccompile <file.p> [-o output.exe]");
+                eprintln!("Usage: pledgec ccompile <file.p> [-o output.exe] [--target <triple>]");
                 process::exit(1);
             }
             let input = &args[2];
@@ -333,6 +333,10 @@ fn main() {
                     let stem = input.rsplit('.').nth(1).unwrap_or("output");
                     format!("{}.exe", stem)
                 });
+            // Optional --target <triple> for cross-compilation
+            let target = args.iter().position(|a| a == "--target")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| s.clone());
             let source = match fs::read_to_string(input) {
                 Ok(s) => s,
                 Err(e) => {
@@ -351,19 +355,33 @@ fn main() {
                     });
                     println!("Generated C source: {}", c_path);
 
-                    // Find a C compiler: try CC env var, then gcc, clang, cl.exe
-                    let cc = std::env::var("CC").unwrap_or_else(|_| {
-                        for c in &["gcc", "clang", "cc"] {
-                            if process::Command::new(c).arg("--version").output().is_ok() {
-                                return c.to_string();
+                    // Find a C compiler: try --target prefix, then CC env var, then gcc, clang, cl.exe
+                    let cc = if let Some(ref target) = target {
+                        // Cross-compilation: use <target>-gcc or <target>-clang
+                        let cross_gcc = format!("{}-gcc", target);
+                        let cross_clang = format!("{}-clang", target);
+                        if process::Command::new(&cross_gcc).arg("--version").output().is_ok() {
+                            cross_gcc
+                        } else if process::Command::new(&cross_clang).arg("--version").output().is_ok() {
+                            cross_clang
+                        } else {
+                            eprintln!("Warning: cross-compiler for target '{}' not found, falling back to default CC", target);
+                            std::env::var("CC").unwrap_or_else(|_| "gcc".to_string())
+                        }
+                    } else {
+                        std::env::var("CC").unwrap_or_else(|_| {
+                            for c in &["gcc", "clang", "cc"] {
+                                if process::Command::new(c).arg("--version").output().is_ok() {
+                                    return c.to_string();
+                                }
                             }
-                        }
-                        // Try cl.exe from VS install
-                        if let Some(cl) = find_cl() {
-                            return cl;
-                        }
-                        "gcc".to_string() // fallback to gcc for error message
-                    });
+                            // Try cl.exe from VS install
+                            if let Some(cl) = find_cl() {
+                                return cl;
+                            }
+                            "gcc".to_string() // fallback to gcc for error message
+                        })
+                    };
 
                     let is_cl = cc.ends_with("cl.exe") || cc == "cl";
                     let status = if is_cl {
@@ -416,6 +434,241 @@ fn main() {
             }
         }
 
+        "sourcemap" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pledgec sourcemap <file.p>");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+            match compiler::lower_to_ir_module(&source) {
+                Ok(module) => {
+                    let sm = module.source_map();
+                    if sm.entries.is_empty() {
+                        println!("Source map is empty (no source line info available).");
+                        println!("Note: Source line tracking requires parser changes to populate AST line numbers.");
+                    } else {
+                        print!("{}", sm.to_string());
+                    }
+                }
+                Err(errors) => {
+                    for e in errors {
+                        eprintln!("{}", e);
+                    }
+                    process::exit(1);
+                }
+            }
+        }
+
+        "verify" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pledgec verify <file.p>");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+            match compiler::lower_to_ir_module(&source) {
+                Ok(module) => {
+                    let result = module.verify();
+                    result.report();
+                    if result.is_valid() {
+                        println!("IR verification passed ({} warnings)", result.warnings.len());
+                    } else {
+                        eprintln!("IR verification failed with {} errors", result.errors.len());
+                        process::exit(1);
+                    }
+                }
+                Err(errors) => {
+                    for e in errors {
+                        eprintln!("{}", e);
+                    }
+                    process::exit(1);
+                }
+            }
+        }
+
+        "repl" => {
+            use std::io::{self, BufRead, Write};
+            eprintln!("pledgec REPL — type expressions to evaluate, :quit to exit");
+            eprintln!();
+            let stdin = io::stdin();
+            let mut line_num = 1;
+            loop {
+                eprint!("pledge:{}> ", line_num);
+                io::stderr().flush().ok();
+                let mut line = String::new();
+                match stdin.lock().read_line(&mut line) {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed == ":quit" || trimmed == ":q" || trimmed == ":exit" {
+                    break;
+                }
+                if trimmed == ":help" || trimmed == ":h" {
+                    eprintln!("Commands:");
+                    eprintln!("  :quit  — exit REPL");
+                    eprintln!("  :help  — show this help");
+                    eprintln!("  :ir    — show IR for last expression");
+                    eprintln!();
+                    eprintln!("Type a Pledge expression (e.g. 1 + 2, \"hello\", [1,2,3])");
+                    continue;
+                }
+                // Wrap the input in a main function and interpret it
+                let source = format!(
+                    "pf main() -> i64 {{\n    println({});\n    ret 0;\n}}",
+                    trimmed
+                );
+                match compiler::interpret_source(&source, false) {
+                    Ok(RunResult::Return(_)) => {}
+                    Ok(RunResult::Panic(msg)) => {
+                        eprintln!("Panic: {}", msg);
+                    }
+                    Err(errors) => {
+                        for e in errors {
+                            eprintln!("{}", e);
+                        }
+                    }
+                }
+                line_num += 1;
+            }
+            eprintln!("\nBye!");
+        }
+
+        "test" => {
+            // Run all .p tests in the tests/ directory against all backends.
+            let current_exe = std::env::current_exe()
+                .unwrap_or_else(|_| std::path::PathBuf::from("pledgec"));
+            let test_dir = "tests";
+            let mut test_files: Vec<String> = Vec::new();
+            if let Ok(entries) = fs::read_dir(test_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |e| e == "p") {
+                        test_files.push(path.to_string_lossy().to_string());
+                    }
+                }
+            }
+            test_files.sort();
+
+            if test_files.is_empty() {
+                eprintln!("No .p test files found in tests/");
+                process::exit(1);
+            }
+
+            println!("Running {} tests...\n", test_files.len());
+
+            let mut interp_pass = 0;
+            let mut interp_fail = 0;
+            let mut c_pass = 0;
+            let mut c_fail = 0;
+            let mut pe_pass = 0;
+            let mut pe_fail = 0;
+
+            for test_file in &test_files {
+                let name = std::path::Path::new(test_file)
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+
+                // Interpreter — a test "passes" if it doesn't panic.
+                // The exit code may be non-zero (e.g. `ret 42` exits with 42).
+                let interp_out = process::Command::new(&current_exe)
+                    .args(["run", test_file])
+                    .output();
+                let interp_ok = interp_out
+                    .as_ref()
+                    .map(|o| {
+                        // Check stderr for "Panic:" or compilation errors
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        !stderr.contains("Panic:") && !stderr.contains("error:")
+                    })
+                    .unwrap_or(false);
+                let interp_stdout = interp_out
+                    .as_ref()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                    .unwrap_or_default();
+
+                if interp_ok {
+                    interp_pass += 1;
+                } else {
+                    interp_fail += 1;
+                    eprintln!("  [FAIL] interp: {}", name);
+                }
+
+                // C codegen
+                let c_exe = format!("/tmp/{}_test_c.exe", name);
+                let _ = fs::remove_file(&c_exe);
+                let c_compile = process::Command::new(&current_exe)
+                    .args(["ccompile", test_file, "-o", &c_exe])
+                    .output();
+                let c_ok = if c_compile.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+                    if let Ok(c_out) = process::Command::new(&c_exe).output() {
+                        let c_stdout = String::from_utf8_lossy(&c_out.stdout).to_string();
+                        c_stdout == interp_stdout
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                let _ = fs::remove_file(&c_exe);
+                let _ = fs::remove_file(&c_exe.replace(".exe", ".c"));
+
+                if c_ok {
+                    c_pass += 1;
+                } else {
+                    c_fail += 1;
+                    eprintln!("  [FAIL] c codegen: {}", name);
+                }
+
+                // PE emitter
+                let pe_exe = format!("/tmp/{}_test_pe.exe", name);
+                let _ = fs::remove_file(&pe_exe);
+                let pe_out = process::Command::new(&current_exe)
+                    .args(["emit", test_file, "-o", &pe_exe])
+                    .output();
+                let pe_ok = pe_out
+                    .as_ref()
+                    .map(|o| o.status.success() && std::path::Path::new(&pe_exe).exists())
+                    .unwrap_or(false);
+                let _ = fs::remove_file(&pe_exe);
+
+                if pe_ok {
+                    pe_pass += 1;
+                } else {
+                    pe_fail += 1;
+                    eprintln!("  [FAIL] pe emit: {}", name);
+                }
+            }
+
+            println!("\n=== Results ===");
+            println!("Interpreter:  {}/{} passed", interp_pass, test_files.len());
+            println!("C Codegen:    {}/{} matched", c_pass, test_files.len());
+            println!("PE Emitter:   {}/{} valid", pe_pass, test_files.len());
+
+            if interp_fail > 0 || c_fail > 0 || pe_fail > 0 {
+                process::exit(1);
+            }
+        }
+
         _ => {
             print_usage();
             process::exit(1);
@@ -430,12 +683,17 @@ fn print_usage() {
     eprintln!("  pledgec build   <file.p> [-o output.exe]  Build native x86_64 executable");
     eprintln!("  pledgec emit    <file.p> [-o output.exe]  Emit PE directly (no ml64.exe/link.exe)");
     eprintln!("  pledgec ccompile <file.p> [-o output.exe]  Compile via C codegen (gcc/clang)");
+    eprintln!("           [--target <triple>]                Cross-compile (e.g. aarch64-linux-gnu)");
     eprintln!("  pledgec compile <file.p> [-o output.s]    Compile to ARM64 assembly (legacy)");
     eprintln!("  pledgec run     <file.p> [-v]             Interpret Pledge IR (execute)");
     eprintln!("  pledgec ir      <file.p>                  Show Pledge IR");
     eprintln!("  pledgec tokens  <file.p>                  Show tokens");
     eprintln!("  pledgec ast     <file.p>                  Show AST");
     eprintln!("  pledgec version                           Show version");
+    eprintln!("  pledgec test                              Run all tests across all backends");
+    eprintln!("  pledgec repl                              Interactive REPL (evaluate expressions)");
+    eprintln!("  pledgec verify  <file.p>                  Verify IR correctness");
+    eprintln!("  pledgec sourcemap <file.p>                Show source map (IR to source mapping)");
 }
 
 /// Find ml64.exe by searching Visual Studio install paths

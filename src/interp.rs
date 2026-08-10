@@ -276,7 +276,7 @@ impl Interpreter {
     fn execute_inst(
         &mut self,
         inst: &Inst,
-        _inst_id: ValueId,
+        inst_id: ValueId,
         values: &mut HashMap<ValueId, Value>,
         func: &IrFunction,
     ) -> ExecOutcome {
@@ -541,7 +541,11 @@ impl Interpreter {
             }
 
             Inst::Unreachable => {
-                ExecOutcome::Panic("Reached unreachable instruction".to_string())
+                let line = func.values.get(&inst_id).and_then(|m| m.source_line);
+                ExecOutcome::Panic(format!(
+                    "Reached unreachable instruction{}",
+                    line.map(|l| format!(" at line {}", l)).unwrap_or_default()
+                ))
             }
 
             // ─── Function Calls ───
@@ -565,7 +569,14 @@ impl Interpreter {
                 }
 
                 // Unknown function
-                ExecOutcome::Panic(format!("Unknown function: {}", name))
+                ExecOutcome::Panic(format!(
+                    "Unknown function '{}'{}",
+                    name,
+                    func.values.get(&inst_id)
+                        .and_then(|m| m.source_line)
+                        .map(|l| format!(" at line {}", l))
+                        .unwrap_or_default()
+                ))
             }
 
             Inst::CallPtr { fn_ptr, args, .. } => {
@@ -620,7 +631,14 @@ impl Interpreter {
                     };
                 }
 
-                ExecOutcome::Panic(format!("Unknown function in CallPtr: {}", fn_name))
+                ExecOutcome::Panic(format!(
+                    "Unknown function in CallPtr: '{}'{}",
+                    fn_name,
+                    func.values.get(&inst_id)
+                        .and_then(|m| m.source_line)
+                        .map(|l| format!(" at line {}", l))
+                        .unwrap_or_default()
+                ))
             }
 
             // ─── Conversions ───
@@ -965,8 +983,11 @@ impl Interpreter {
                     }
                     Some(Value::Map(m)) => {
                         let borrow = m.borrow();
+                        // Sort keys for deterministic output
+                        let mut entries: Vec<_> = borrow.iter().collect();
+                        entries.sort_by(|a, b| a.0.cmp(b.0));
                         let mut s = String::from("{");
-                        for (i, (k, v)) in borrow.iter().enumerate() {
+                        for (i, (k, v)) in entries.iter().enumerate() {
                             if i > 0 { s.push_str(", "); }
                             s.push_str(k);
                             s.push_str(": ");
@@ -1001,8 +1022,11 @@ impl Interpreter {
                         }
                         Value::Map(m) => {
                             let borrow = m.borrow();
+                            // Sort keys for deterministic output
+                            let mut entries: Vec<_> = borrow.iter().collect();
+                            entries.sort_by(|a, b| a.0.cmp(b.0));
                             print!("{{");
-                            for (i, (k, v)) in borrow.iter().enumerate() {
+                            for (i, (k, v)) in entries.iter().enumerate() {
                                 if i > 0 { print!(", "); }
                                 print!("{}: {}", k, v);
                             }
@@ -1024,7 +1048,7 @@ impl Interpreter {
                         _ => print!("{:?}", v),
                     }
                 }
-                println!();
+                // Note: print does NOT add a newline — println does that.
                 ExecOutcome::Value(Value::Void)
             }
 

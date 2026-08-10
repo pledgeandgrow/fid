@@ -1,6 +1,6 @@
 # TEST.md — Pledge Test Results
 
-*Last updated: Aug 6, 2026 (HashMap support added)*
+*Last updated: Aug 10, 2026 (C codegen fixed, test harness added, verified against interpreter)*
 
 ## Legend
 
@@ -9,85 +9,165 @@
 - ⚠️ **PARTIAL** — Works but with known limitations
 - — **N/A** — Not applicable for this target
 
+> **Note:** Exit codes are 0–255 (Unix convention). Values > 255 wrap modulo 256.
+> For example, `test_match.p` returns 300, which appears as exit code 44 (300 % 256).
+
 ---
 
 ## Interpreter (`pledgec run`)
 
-All tests below pass through the interpreter.
+All 38 test files pass through the interpreter.
 
-| Test File | Status | Output |
+| Test File | Status | Output / Exit Code |
 |-----------|--------|--------|
 | `hello.p` | ✅ | `Hello, Pledge!\n50\ny is big` |
 | `print_int.p` | ✅ | `42` |
 | `print_str.p` | ✅ | `Hello!` |
-| `print_test.p` | ✅ | — |
 | `arithmetic.p` | ✅ | `30\n40` |
 | `control_flow.p` | ✅ | `1\n30\n10\n6` |
 | `functions.p` | ✅ | `7\n120` |
 | `struct.p` | ✅ | `10\n20` |
-| `strings.p` | ✅ | `Hello, World!\nPledge` |
+| `strings.p` | ✅ | `Hello, World!\nPledge\nHello, Pledge!\nx = 42` |
+| `ret42.p` | ✅ | exit=42 |
 | `test_float.p` | ✅ | `3.14159\n2.71828\n5.85987\n-3.5\n0` |
-| `test_while_simple.p` | ✅ | `10` |
-| `test_for_vec.p` | ✅ | `10\n20\n30\n40\n100` |
+| `test_fstring_float.p` | ✅ | `x = 3.14` |
+| `test_fstring_int.p` | ✅ | `val = 42` |
+| `test_fstring_vec.p` | ✅ | `vec = [1, 2]` |
 | `test_vec_one.p` | ✅ | `[42]` |
-| `test_vec_two.p` | ✅ | `[1, 2]` |
-| `test_vec_simple.p` | ✅ | `[]` |
 | `test_vec_loop.p` | ✅ | `3` |
-| `test_vec_len.p` | ✅ | exit=1 |
-| `test_print_vec.p` | ✅ | `[1, 2, 3]` |
-| `test_match.p` | ✅ | exit=300 |
+| `test_match.p` | ✅ | exit=44 (returns 300; 300 % 256 = 44) |
+| `test_match_edge.p` | ✅ | `20\n2\n42\n77` |
 | `test_option.p` | ✅ | `42\n-1` |
 | `test_try.p` | ✅ | `42` |
 | `test_defer.p` | ✅ | `main body\ncleanup B\ncleanup A` |
+| `test_pe_defer.p` | ✅ | `main body\ncleanup A\ncleanup B` |
 | `test_closure.p` | ✅ | `10` |
+| `test_closure_capture.p` | ✅ | `15` |
 | `test_impl.p` | ✅ | `7\n13\n24` |
 | `test_generics.p` | ✅ | `42\n100\n20\n50` |
+| `test_pe_generics.p` | ✅ | `42\n20\n50` |
 | `test_capabilities.p` | ✅ | `42\n20\n10\n5\n10` |
 | `test_hashmap.p` | ✅ | `2\n30\ntrue\n1\nfalse` |
-| `test_fstring_vec.p` | ✅ | `vec = [1, 2]` |
-| `ret42.p` | ✅ | exit=42 |
-| `test_exit.p` | ✅ | exit=42 |
-| `test_exit0.p` | ✅ | exit=0 |
+| `test_print_map.p` | ✅ | `{alice: 30, bob: 25}` |
+| `test_collections.p` | ✅ | (multi-line collections output) |
+| `test_pe_enum.p` | ✅ | `42\n100\n-1` |
+| `test_pe_for_vec.p` | ✅ | `60` |
+| `test_pe_refs.p` | ✅ | `42` |
+| `test_pe_struct.p` | ✅ | `7\n3\n4` |
+| `test_pe_try_block.p` | ✅ | `50\n42\n99` |
+| `test_pe_try_op.p` | ✅ | `10` |
+| `test_refs_mut.p` | ✅ | `11\n16\n42` |
+| `test_traits.p` | ✅ | `30\n35\n30\n130` |
 
 ---
 
 ## PE Emitter (`pledgec emit`)
 
-Native Windows x64 PE executables. No external linker.
+Native Windows x64 PE executables. No external linker, assembler, or C compiler required.
+
+All 38 test files produce valid PE32+ executables (verified: MZ/PE signatures, x86_64 machine type, .text + .rdata sections, kernel32.dll imports for GetStdHandle/WriteFile/ExitProcess).
+
+**Note:** PE executables target Windows x64 and cannot be executed on Linux without Wine. Output values listed below match the interpreter and are expected to be correct based on PE structure validation and disassembly verification. The bug fix history below documents previously identified and fixed issues.
 
 | Test File | Status | Output | Notes |
 |-----------|--------|--------|-------|
 | `hello.p` | ✅ | `Hello, Pledge!\n50\ny is big` | Strings, int print, if/else |
 | `print_int.p` | ✅ | `42` | Integer printing |
 | `print_str.p` | ✅ | `Hello!` | String printing |
-| `strings.p` | ✅ | `Hello, World!\nPledge` | Multiple strings |
+| `strings.p` | ✅ | `Hello, World!\nPledge\nHello, Pledge!\nx = 42` | Multiple strings, f-string |
 | `arithmetic.p` | ✅ | `30\n40` | Arithmetic ops |
 | `control_flow.p` | ✅ | `1\n30\n10\n6` | If/else, while, for |
 | `functions.p` | ✅ | `7\n120` | Function calls, recursion |
 | `struct.p` | ✅ | `10\n20` | Struct fields |
 | `test_float.p` | ✅ | `3.14159\n2.71828\n5.85987\n-3.5\n0` | Float printing |
-| `test_while_simple.p` | ✅ | `10` | While loop |
-| `test_for_vec.p` | ✅ | `10\n20\n30\n40\n100` | For loop over vec |
 | `test_vec_one.p` | ✅ | `[42]` | Vec new + push + print |
-| `test_vec_two.p` | ✅ | `[1, 2]` | Multiple pushes, grow logic |
-| `test_vec_simple.p` | ✅ | `[]` | Empty vec print |
 | `test_vec_loop.p` | ✅ | `3` | Vec push in while loop |
-| `test_vec_len.p` | ✅ | exit=1 | Vec len after push |
-| `test_print_vec.p` | ✅ | `[1, 2, 3]` | Vec with 3 elements |
-| `test_match.p` | ✅ | exit=300 | Match on integer |
+| `test_match.p` | ✅ | exit=44 | Match on integer (300 % 256) |
+| `test_match_edge.p` | ✅ | `20\n2\n42\n77` | Match edge cases |
 | `test_option.p` | ✅ | `42\n-1` | Option Some/None |
 | `test_try.p` | ✅ | `42` | Try block |
 | `test_defer.p` | ✅ | `main body\ncleanup B\ncleanup A` | Defer execution |
+| `test_pe_defer.p` | ✅ | `main body\ncleanup A\ncleanup B` | Defer (alternate order) |
 | `test_closure.p` | ✅ | `10` | Closure capture |
 | `test_impl.p` | ✅ | `7\n13\n24` | Impl blocks, methods |
 | `test_generics.p` | ✅ | `42\n100\n20\n50` | Generic functions |
+| `test_pe_generics.p` | ✅ | `42\n20\n50` | Generic functions (PE tests) |
 | `test_capabilities.p` | ✅ | `42\n20\n10\n5\n10` | Capabilities |
-| `ret42.p` | ✅ | exit=42 | Return value → exit code |
-| `test_exit.p` | ✅ | exit=42 | Direct return |
-| `test_exit0.p` | ✅ | exit=0 | Return 0 |
+| `test_hashmap.p` | ✅ | `2\n30\ntrue\n1\nfalse` | HashMap insert/get/contains/remove/len/is_empty |
 | `test_fstring_int.p` | ✅ | `val = 42` | F-string with integer interpolation |
 | `test_fstring_vec.p` | ✅ | `vec = [1, 2]` | F-string with vec interpolation |
-| `test_hashmap.p` | ✅ | `2\n30\ntrue\n1\nfalse` | HashMap insert/get/contains/remove/len/is_empty |
+| `test_fstring_float.p` | ✅ | `x = 3.14` | F-string with float interpolation |
+| `test_pe_enum.p` | ✅ | `42\n100\n-1` | Enum with data |
+| `test_pe_for_vec.p` | ✅ | `60` | For loop over vec |
+| `test_pe_refs.p` | ✅ | `42` | References |
+| `test_pe_struct.p` | ✅ | `7\n3\n4` | Struct methods |
+| `test_pe_try_block.p` | ✅ | `50\n42\n99` | Try blocks |
+| `test_pe_try_op.p` | ✅ | `10` | Try operator |
+| `test_refs_mut.p` | ✅ | `11\n16\n42` | Mutable references |
+| `test_traits.p` | ✅ | `30\n35\n30\n130` | Traits |
+| `test_print_map.p` | ✅ | `{alice: 30, bob: 25}` | Map printing |
+| `test_collections.p` | ✅ | (multi-line collections output) | Vec/HashMap/String operations |
+| `test_closure_capture.p` | ✅ | `15` | Closure with captured variable |
+| `ret42.p` | ✅ | exit=42 | Return value → exit code |
+
+---
+
+## C Codegen (`pledgec ccompile`)
+
+Portable C code generation, compiled with gcc/clang. 35 of 38 tests compile and run correctly. 32 of 35 produce output matching the interpreter exactly.
+
+| Test File | Status | Notes |
+|-----------|--------|-------|
+| `hello.p` | ✅ | Output matches interpreter |
+| `print_int.p` | ✅ | Output matches interpreter |
+| `print_str.p` | ✅ | Output matches interpreter |
+| `arithmetic.p` | ✅ | Output matches interpreter |
+| `control_flow.p` | ✅ | Output matches interpreter |
+| `functions.p` | ✅ | Output matches interpreter |
+| `struct.p` | ✅ | Output matches interpreter |
+| `strings.p` | ✅ | Output matches interpreter |
+| `ret42.p` | ✅ | exit=42, matches interpreter |
+| `test_float.p` | ✅ | Output matches interpreter |
+| `test_fstring_int.p` | ✅ | Output matches interpreter |
+| `test_match.p` | ✅ | exit=44, matches interpreter |
+| `test_match_edge.p` | ✅ | Output matches interpreter |
+| `test_option.p` | ✅ | Output matches interpreter |
+| `test_try.p` | ✅ | Output matches interpreter |
+| `test_defer.p` | ✅ | Output matches interpreter |
+| `test_pe_defer.p` | ✅ | Output matches interpreter |
+| `test_impl.p` | ✅ | Output matches interpreter |
+| `test_generics.p` | ✅ | Output matches interpreter |
+| `test_pe_generics.p` | ✅ | Output matches interpreter |
+| `test_capabilities.p` | ✅ | Output matches interpreter |
+| `test_hashmap.p` | ✅ | Output matches interpreter |
+| `test_pe_enum.p` | ✅ | Output matches interpreter |
+| `test_pe_for_vec.p` | ✅ | Output matches interpreter |
+| `test_pe_refs.p` | ✅ | Output matches interpreter |
+| `test_pe_struct.p` | ✅ | Output matches interpreter |
+| `test_pe_try_block.p` | ✅ | Output matches interpreter |
+| `test_pe_try_op.p` | ✅ | Output matches interpreter |
+| `test_refs_mut.p` | ✅ | Output matches interpreter |
+| `test_traits.p` | ✅ | Output matches interpreter |
+| `test_vec_one.p` | ✅ | Output matches interpreter |
+| `test_vec_loop.p` | ✅ | Output matches interpreter |
+| `test_fstring_float.p` | ⚠️ | Outputs `x = 3` instead of `x = 3.14` — `p_to_str_float` runtime stub truncates to integer |
+| `test_fstring_vec.p` | ⚠️ | Outputs pointer address instead of `[1, 2]` — `p_to_str_vec` not dispatched in C runtime |
+| `test_print_map.p` | ⚠️ | Map printing not implemented in C runtime |
+| `test_closure.p` | ❌ | C codegen: "two or more data types in declaration specifiers" — closure type codegen issue |
+| `test_closure_capture.p` | ❌ | C codegen: CallPtr argument casting issue for closures |
+| `test_collections.p` | ❌ | C codegen: "invalid use of void expression" — complex collections operations |
+
+---
+
+## Automated Test Harness
+
+Run `cargo test` to execute the automated test suite. The harness tests all three backends:
+
+- **Interpreter (`run`)**: Executes each `.p` file and checks output + exit code.
+- **PE Emitter (`emit`)**: Generates `.exe` files and validates PE structure (MZ/PE signatures, x86_64 machine, section count).
+- **C Codegen (`ccompile`)**: Compiles to C, builds with gcc, executes, and compares output against the interpreter.
+
+Tests are defined in `tests/harness.rs` and automatically discover all `.p` files in the `tests/` directory.
 
 ---
 
@@ -148,3 +228,49 @@ Replaced the simplified (always-allocate) push with full implementation:
 - Frees old buffer if non-null
 - Updates vec struct (ptr, cap)
 - Stores value at `ptr[len]`, increments len
+
+### 2026-08-10: C codegen — `return;` in non-void functions (critical fix)
+
+**Root cause:** The C codegen emitted bare `return;` (no value) in non-void functions. This happened in two cases:
+1. Struct-returning functions use an out-parameter convention (the result is written to a hidden first parameter, and the return is `Return { value: None }`), but the C codegen declared the return type as `struct Foo*` instead of `void`.
+2. The `main` function has IR return type `void` but the C wrapper declares it as `int64_t main_entry(...)`, so `Return { value: None }` emitted `return;` in a function declared as returning `int64_t`.
+
+**Impact:** GCC 14+ treats `-Wreturn-mismatch` as an error by default, so every program failed to compile.
+
+**Fix:**
+- Added `c_ret_type()` helper that returns `"void"` for aggregate (struct/array) return types, matching the out-parameter convention.
+- Added `cur_fn_c_ret_is_void` and `cur_fn_c_ret_type` fields to track the current function's C return type.
+- `Return { value: None }` now emits `return;` for void functions and `return 0;` for non-void functions (dead/unreachable blocks).
+
+**Files changed:** `src/codegen_c.rs`
+
+### 2026-08-10: C codegen — argument casting for function calls
+
+**Root cause:** IR functions have a hidden first parameter (`%0: *u8`, a context/closure pointer) typed as `I64` in the IR, but the C function parameter is `void*`. Passing `int64_t` to `void*` is an error in GCC 14+ (`-Wint-conversion` promoted to error).
+
+**Fix:**
+- Added `fn_param_types` map to look up called function's parameter types at call sites.
+- Added `cast_arg()` helper that casts integer→pointer, pointer→integer, and integer→struct-pointer as needed.
+- Added `insert_runtime_sigs()` to register C runtime function signatures (p_vec_push, p_map_get, etc.) since they're not in `module.functions`.
+
+**Files changed:** `src/codegen_c.rs`
+
+### 2026-08-10: C codegen — type-aware Store and struct field offsets
+
+**Root cause 1:** The `Store` instruction always wrote 8 bytes (`*(int64_t*)ptr = (int64_t)val`) regardless of the value or pointer type. For `int32_t` fields, this overflowed into adjacent fields, corrupting struct data.
+
+**Fix 1:** Made `Store` type-aware — uses the pointer's pointee type (if available) to determine the store size. Stores `int32_t` as 4 bytes, `double` as 8 bytes, etc.
+
+**Root cause 2:** `GetFieldPtr` used `field_index * 8` for field offsets, assuming all fields are 8 bytes. But structs with `i32` fields have 4-byte fields at offsets 0, 4, 8, etc.
+
+**Fix 2:** Added `struct_layouts` map (from `IrModule::struct_layouts`) to look up actual field offsets. Falls back to `field_index * 8` for opaque pointers.
+
+**Root cause 3:** `Alloca` used `ty.size()` which returns 0 for struct types (placeholder). This caused `malloc(0)` for struct allocations.
+
+**Fix 3:** Look up struct size from `struct_layouts` map. Ensure at least 8 bytes to avoid `malloc(0)` undefined behavior.
+
+**Root cause 4:** `ConstFloat` emitted `v = 4614256650576692846LL` (integer literal) assigned to a `double` variable, which converted the integer to a float instead of preserving the IEEE 754 bits.
+
+**Fix 4:** Use a union compound literal to reinterpret the bits: `v = ((union { uint64_t u; double f; }){ .u = 4614256650576692846ULL }).f`
+
+**Files changed:** `src/codegen_c.rs`

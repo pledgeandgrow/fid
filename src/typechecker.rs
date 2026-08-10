@@ -245,7 +245,7 @@ impl TypeChecker {
 
     fn scan_stmt_for_effects(&self, stmt: &Stmt, effects: &mut HashSet<String>) {
         match stmt {
-            Stmt::Expr(e) => self.scan_expr_for_effects(e, effects),
+            Stmt::Expr(e, _) => self.scan_expr_for_effects(e, effects),
             Stmt::Let { expr, .. } => self.scan_expr_for_effects(expr, effects),
             Stmt::Assign { expr, .. } => self.scan_expr_for_effects(expr, effects),
             Stmt::IndexAssign { index, expr, .. } => {
@@ -253,15 +253,15 @@ impl TypeChecker {
                 self.scan_expr_for_effects(expr, effects);
             }
             Stmt::DerefAssign { expr, .. } => self.scan_expr_for_effects(expr, effects),
-            Stmt::Return(e) => {
+            Stmt::Return(e, _) => {
                 if let Some(e) = e { self.scan_expr_for_effects(e, effects); }
             }
-            Stmt::If { cond, then_block, else_block } => {
+            Stmt::If { cond, then_block, else_block, .. } => {
                 self.scan_expr_for_effects(cond, effects);
                 self.scan_stmts_for_effects(then_block, effects);
                 if let Some(eb) = else_block { self.scan_stmts_for_effects(eb, effects); }
             }
-            Stmt::While { cond, body } => {
+            Stmt::While { cond, body, .. } => {
                 self.scan_expr_for_effects(cond, effects);
                 self.scan_stmts_for_effects(body, effects);
             }
@@ -269,12 +269,12 @@ impl TypeChecker {
                 self.scan_expr_for_effects(iterator, effects);
                 self.scan_stmts_for_effects(body, effects);
             }
-            Stmt::Loop { body } => self.scan_stmts_for_effects(body, effects),
-            Stmt::Break(e) => {
+            Stmt::Loop { body, .. } => self.scan_stmts_for_effects(body, effects),
+            Stmt::Break(e, _) => {
                 if let Some(e) = e { self.scan_expr_for_effects(e, effects); }
             }
-            Stmt::Defer(stmts) => self.scan_stmts_for_effects(stmts, effects),
-            Stmt::Match { expr, arms } => {
+            Stmt::Defer(stmts, _) => self.scan_stmts_for_effects(stmts, effects),
+            Stmt::Match { expr, arms, .. } => {
                 self.scan_expr_for_effects(expr, effects);
                 for arm in arms {
                     self.scan_stmts_for_effects(&arm.body, effects);
@@ -456,7 +456,7 @@ impl TypeChecker {
 
     fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let { name, ty, expr, is_mut: _ } => {
+            Stmt::Let { name, ty, expr, is_mut: _, line: _ } => {
                 let expr_ty = self.check_expr(expr);
                 let final_ty = if let Some(declared) = ty {
                     if !self.types_compatible(declared, &expr_ty) {
@@ -471,10 +471,10 @@ impl TypeChecker {
                 };
                 self.declare(name, final_ty);
             }
-            Stmt::Expr(expr) => {
+            Stmt::Expr(expr, _) => {
                 self.check_expr(expr);
             }
-            Stmt::Return(expr) => {
+            Stmt::Return(expr, _) => {
                 if let Some(e) = expr {
                     self.check_expr(e);
                 }
@@ -483,6 +483,7 @@ impl TypeChecker {
                 cond,
                 then_block,
                 else_block,
+                line: _,
             } => {
                 let cond_ty = self.check_expr(cond);
                 if cond_ty != Type::Bool && cond_ty != Type::I32 && cond_ty != Type::I64 {
@@ -504,7 +505,7 @@ impl TypeChecker {
                     self.pop_scope();
                 }
             }
-            Stmt::Assign { target, op: _, expr } => {
+            Stmt::Assign { target, op: _, expr, line: _ } => {
                 let _expr_ty = self.check_expr(expr);
                 if self.lookup(target).is_none() && !self.consts.contains_key(target) {
                     self.errors.push(format!(
@@ -513,7 +514,7 @@ impl TypeChecker {
                     ));
                 }
             }
-            Stmt::IndexAssign { array, index, op: _, expr } => {
+            Stmt::IndexAssign { array, index, op: _, expr, line: _ } => {
                 self.check_expr(index);
                 self.check_expr(expr);
                 if self.lookup(array).is_none() {
@@ -523,11 +524,11 @@ impl TypeChecker {
                     ));
                 }
             }
-            Stmt::DerefAssign { ptr_expr, op: _, expr } => {
+            Stmt::DerefAssign { ptr_expr, op: _, expr, line: _ } => {
                 self.check_expr(ptr_expr);
                 self.check_expr(expr);
             }
-            Stmt::While { cond, body } => {
+            Stmt::While { cond, body, line: _ } => {
                 let cond_ty = self.check_expr(cond);
                 if cond_ty != Type::Bool && cond_ty != Type::I32 && cond_ty != Type::I64 {
                     self.errors.push(format!(
@@ -541,7 +542,7 @@ impl TypeChecker {
                 }
                 self.pop_scope();
             }
-            Stmt::For { var, iterator, body } => {
+            Stmt::For { var, iterator, body, line: _ } => {
                 let iter_ty = self.check_expr(iterator);
                 // Extract element type: Vec<T> → T, [T; N] → T, range → I64
                 let elem_ty = match &iter_ty {
@@ -558,27 +559,27 @@ impl TypeChecker {
                 }
                 self.pop_scope();
             }
-            Stmt::Loop { body } => {
+            Stmt::Loop { body, line: _ } => {
                 self.push_scope();
                 for s in body {
                     self.check_stmt(s);
                 }
                 self.pop_scope();
             }
-            Stmt::Break(expr) => {
+            Stmt::Break(expr, _) => {
                 if let Some(e) = expr {
                     self.check_expr(e);
                 }
             }
-            Stmt::Continue => {}
-            Stmt::Defer(body) => {
+            Stmt::Continue(_) => {}
+            Stmt::Defer(body, _) => {
                 self.push_scope();
                 for s in body {
                     self.check_stmt(s);
                 }
                 self.pop_scope();
             }
-            Stmt::Match { expr, arms } => {
+            Stmt::Match { expr, arms, line: _ } => {
                 let match_ty = self.check_expr(expr);
                 for arm in arms {
                     self.push_scope();
@@ -876,7 +877,7 @@ impl TypeChecker {
                 self.push_scope();
                 let mut last_ty = Type::Void;
                 for s in stmts {
-                    if let Stmt::Expr(e) = s {
+                    if let Stmt::Expr(e, _) = s {
                         last_ty = self.check_expr(e);
                     } else {
                         self.check_stmt(s);
@@ -948,28 +949,29 @@ impl TypeChecker {
                 let recv_ty = self.check_expr(receiver);
                 let arg_types: Vec<Type> = args.iter().map(|a| self.check_expr(a)).collect();
 
-                // Builtin Vec methods
-                if let Type::Generic { name, .. } = &recv_ty {
+                // Builtin Vec methods — use element type from Generic args
+                if let Type::Generic { name, args } = &recv_ty {
                     if name == "Vec" {
+                        let elem_ty = args.first().cloned().unwrap_or(Type::I64);
                         return match method.as_str() {
                             "push" => Type::Void,
-                            "pop" => Type::I64,
+                            "pop" => elem_ty.clone(),
                             "len" => Type::I64,
                             "is_empty" => Type::Bool,
-                            "get" => Type::I64,
+                            "get" => elem_ty.clone(),
                             "set" => Type::Void,
                             "clear" => Type::Void,
                             "capacity" => Type::I64,
                             "insert" => Type::Void,
-                            "remove" => Type::I64,
+                            "remove" => elem_ty.clone(),
                             "contains" => Type::Bool,
                             "reverse" => Type::Void,
-                            "first" => Type::I64,
-                            "last" => Type::I64,
+                            "first" => elem_ty.clone(),
+                            "last" => elem_ty.clone(),
                             "extend" => Type::Void,
                             "truncate" => Type::Void,
                             "sort" => Type::Void,
-                            "clone" => Type::Generic { name: "Vec".to_string(), args: vec![Type::I64] },
+                            "clone" => Type::Generic { name: "Vec".to_string(), args: vec![elem_ty] },
                             _ => {
                                 self.errors.push(format!("Type error: no method '{}' on Vec", method));
                                 Type::Never
@@ -977,18 +979,20 @@ impl TypeChecker {
                         };
                     }
                     if name == "HashMap" {
+                        let key_ty = args.first().cloned().unwrap_or(Type::Str);
+                        let val_ty = args.get(1).cloned().unwrap_or(Type::I64);
                         return match method.as_str() {
                             "insert" => Type::Void,
-                            "get" => Type::I64,
+                            "get" => val_ty.clone(),
                             "contains" => Type::Bool,
                             "remove" => Type::Void,
                             "len" => Type::I64,
                             "is_empty" => Type::Bool,
                             "clear" => Type::Void,
-                            "keys" => Type::Generic { name: "Vec".to_string(), args: vec![Type::Str] },
-                            "values" => Type::Generic { name: "Vec".to_string(), args: vec![Type::I64] },
-                            "get_or" => Type::I64,
-                            "clone" => Type::Generic { name: "HashMap".to_string(), args: vec![Type::Str, Type::I64] },
+                            "keys" => Type::Generic { name: "Vec".to_string(), args: vec![key_ty] },
+                            "values" => Type::Generic { name: "Vec".to_string(), args: vec![val_ty.clone()] },
+                            "get_or" => val_ty,
+                            "clone" => Type::Generic { name: "HashMap".to_string(), args: args.clone() },
                             _ => {
                                 self.errors.push(format!("Type error: no method '{}' on HashMap", method));
                                 Type::Never
@@ -1221,7 +1225,7 @@ impl TypeChecker {
                 // Check body statements, infer Ok value type from last expression
                 let mut last_ty = Type::I64;
                 for stmt in body {
-                    if let Stmt::Expr(e) = stmt {
+                    if let Stmt::Expr(e, _) = stmt {
                         last_ty = self.check_expr(e);
                     } else {
                         self.check_stmt(stmt);

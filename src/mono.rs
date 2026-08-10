@@ -222,62 +222,73 @@ fn subst_expr(expr: &Expr, subst: &Subst, renames: &HashMap<String, String>, met
 /// Apply substitution to a statement
 fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, method_renames: &HashMap<String, String>) -> Stmt {
     match stmt {
-        Stmt::Let { name, ty, is_mut, expr } => Stmt::Let {
+        Stmt::Let { name, ty, is_mut, expr, line } => Stmt::Let {
             name: name.clone(),
             ty: ty.as_ref().map(|t| subst_type(t, subst)),
             is_mut: *is_mut,
             expr: subst_expr(expr, subst, renames, method_renames),
+            line: *line,
         },
-        Stmt::Assign { target, op, expr } => Stmt::Assign {
+        Stmt::Assign { target, op, expr, line } => Stmt::Assign {
             target: target.clone(),
             op: op.clone(),
             expr: subst_expr(expr, subst, renames, method_renames),
+            line: *line,
         },
-        Stmt::IndexAssign { array, index, op, expr } => Stmt::IndexAssign {
+        Stmt::IndexAssign { array, index, op, expr, line } => Stmt::IndexAssign {
             array: array.clone(),
             index: subst_expr(index, subst, renames, method_renames),
             op: op.clone(),
             expr: subst_expr(expr, subst, renames, method_renames),
+            line: *line,
         },
-        Stmt::DerefAssign { ptr_expr, op, expr } => Stmt::DerefAssign {
+        Stmt::DerefAssign { ptr_expr, op, expr, line } => Stmt::DerefAssign {
             ptr_expr: subst_expr(ptr_expr, subst, renames, method_renames),
             op: op.clone(),
             expr: subst_expr(expr, subst, renames, method_renames),
+            line: *line,
         },
-        Stmt::Expr(e) => Stmt::Expr(subst_expr(e, subst, renames, method_renames)),
-        Stmt::Return(e) => Stmt::Return(e.as_ref().map(|e| subst_expr(e, subst, renames, method_renames))),
-        Stmt::If { cond, then_block, else_block } => Stmt::If {
+        Stmt::Expr(e, line) => Stmt::Expr(subst_expr(e, subst, renames, method_renames), *line),
+        Stmt::Return(e, line) => Stmt::Return(e.as_ref().map(|e| subst_expr(e, subst, renames, method_renames)), *line),
+        Stmt::If { cond, then_block, else_block, line } => Stmt::If {
             cond: subst_expr(cond, subst, renames, method_renames),
             then_block: then_block.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
             else_block: else_block.as_ref().map(|eb| eb.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect()),
+            line: *line,
         },
-        Stmt::While { cond, body } => Stmt::While {
+        Stmt::While { cond, body, line } => Stmt::While {
             cond: subst_expr(cond, subst, renames, method_renames),
             body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
+            line: *line,
         },
-        Stmt::For { var, iterator, body } => Stmt::For {
+        Stmt::For { var, iterator, body, line } => Stmt::For {
             var: var.clone(),
             iterator: subst_expr(iterator, subst, renames, method_renames),
             body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
+            line: *line,
         },
-        Stmt::Loop { body } => Stmt::Loop {
+        Stmt::Loop { body, line } => Stmt::Loop {
             body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
+            line: *line,
         },
-        Stmt::Break(e) => Stmt::Break(e.as_ref().map(|e| subst_expr(e, subst, renames, method_renames))),
-        Stmt::Continue => Stmt::Continue,
-        Stmt::Defer(body) => Stmt::Defer(
-            body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect()
+        Stmt::Break(e, line) => Stmt::Break(e.as_ref().map(|e| subst_expr(e, subst, renames, method_renames)), *line),
+        Stmt::Continue(line) => Stmt::Continue(*line),
+        Stmt::Defer(body, line) => Stmt::Defer(
+            body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
+            *line,
         ),
-        Stmt::Match { expr, arms } => Stmt::Match {
+        Stmt::Match { expr, arms, line } => Stmt::Match {
             expr: subst_expr(expr, subst, renames, method_renames),
             arms: arms.iter().map(|a| MatchArm {
                 pattern: a.pattern.clone(),
                 body: a.body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
             }).collect(),
+            line: *line,
         },
-        Stmt::Use { path, items } => Stmt::Use {
+        Stmt::Use { path, items, line } => Stmt::Use {
             path: path.clone(),
             items: items.clone(),
+            line: *line,
         },
     }
 }
@@ -612,15 +623,15 @@ fn collect_generic_calls_stmt_with_hint(
             collect_generic_calls_expr_with_hint(ptr_expr, generics, generic_methods, calls, method_calls, current_func, None);
             collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, None);
         }
-        Stmt::Expr(e) => collect_generic_calls_expr_with_hint(e, generics, generic_methods, calls, method_calls, current_func, expected_ty),
-        Stmt::Return(e) => {
+        Stmt::Expr(e, _) => collect_generic_calls_expr_with_hint(e, generics, generic_methods, calls, method_calls, current_func, expected_ty),
+        Stmt::Return(e, _) => {
             if let Some(e) = e {
                 // Use the function's return type as hint
                 let ret_hint = Some(&current_func.ret_ty);
                 collect_generic_calls_expr_with_hint(e, generics, generic_methods, calls, method_calls, current_func, ret_hint);
             }
         }
-        Stmt::If { cond, then_block, else_block } => {
+        Stmt::If { cond, then_block, else_block, .. } => {
             collect_generic_calls_expr_with_hint(cond, generics, generic_methods, calls, method_calls, current_func, None);
             for s in then_block {
                 collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
@@ -631,7 +642,7 @@ fn collect_generic_calls_stmt_with_hint(
                 }
             }
         }
-        Stmt::While { cond, body } => {
+        Stmt::While { cond, body, .. } => {
             collect_generic_calls_expr_with_hint(cond, generics, generic_methods, calls, method_calls, current_func, None);
             for s in body {
                 collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
@@ -643,23 +654,23 @@ fn collect_generic_calls_stmt_with_hint(
                 collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
             }
         }
-        Stmt::Loop { body } => {
+        Stmt::Loop { body, .. } => {
             for s in body {
                 collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
             }
         }
-        Stmt::Break(e) => {
+        Stmt::Break(e, _) => {
             if let Some(e) = e {
                 collect_generic_calls_expr_with_hint(e, generics, generic_methods, calls, method_calls, current_func, None);
             }
         }
-        Stmt::Continue => {}
-        Stmt::Defer(body) => {
+        Stmt::Continue(_) => {}
+        Stmt::Defer(body, _) => {
             for s in body {
                 collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
             }
         }
-        Stmt::Match { expr, arms } => {
+        Stmt::Match { expr, arms, .. } => {
             collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, None);
             for arm in arms {
                 for s in &arm.body {

@@ -272,6 +272,12 @@ pub fn lower_to_ir(source: &str) -> Result<String, Vec<String>> {
     Ok(module.to_string())
 }
 
+/// Lower source to an IR module (for verification and analysis).
+pub fn lower_to_ir_module(source: &str) -> Result<crate::ir::IrModule, Vec<String>> {
+    let program = build_program(source)?;
+    Ok(lower::lower(&program))
+}
+
 pub fn lex(source: &str) -> Vec<String> {
     let mut lexer = Lexer::new(source);
     lexer

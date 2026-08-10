@@ -49,6 +49,8 @@ pub struct Lowerer {
     /// Try block context stack — each entry is (error_block, error_result_slot)
     /// When non-empty, ? operator jumps to error_block instead of returning
     try_stack: Vec<(BlockId, ValueId)>,
+    /// Current source line (for debug info)
+    current_line: Option<usize>,
 }
 
 impl Lowerer {
@@ -68,6 +70,7 @@ impl Lowerer {
             defer_stack: Vec::new(),
             current_captures: Vec::new(),
             try_stack: Vec::new(),
+            current_line: None,
         }
     }
 
@@ -290,7 +293,7 @@ impl Lowerer {
         // is an expression, use it as the implicit return value.
         let mut last_expr_val: Option<ValueId> = None;
         for stmt in &func.body {
-            if let Stmt::Expr(expr) = stmt {
+            if let Stmt::Expr(expr, _) = stmt {
                 // Lower the expression and remember its value
                 last_expr_val = Some(self.lower_expr(expr));
             } else {
@@ -409,8 +412,10 @@ impl Lowerer {
 
     /// Lower a single statement
     fn lower_stmt(&mut self, stmt: &Stmt) {
+        // Set current line for debug info
+        self.current_line = Some(stmt.line());
         match stmt {
-            Stmt::Let { name, ty, expr, is_mut: _ } => {
+            Stmt::Let { name, ty, expr, is_mut: _, line: _ } => {
                 let val = self.lower_expr(expr);
                 // Always use alloca + store for variables.
                 // Direct SSA binding is broken for loops (no phi nodes) —
@@ -434,7 +439,7 @@ impl Lowerer {
                 }
             }
 
-            Stmt::Assign { target, op, expr } => {
+            Stmt::Assign { target, op, expr, line: _ } => {
                 // Check if target is a mutable variable with an alloca
                 let alloca = self.allocas.get(target).copied();
                 
@@ -480,7 +485,7 @@ impl Lowerer {
                 }
             }
 
-            Stmt::IndexAssign { array, index, op, expr } => {
+            Stmt::IndexAssign { array, index, op, expr, line: _ } => {
                 // Look up the array variable — it should be an alloca or local
                 let arr_val = if let Some(alloca) = self.allocas.get(array) {
                     // Load the array pointer from the alloca
@@ -537,7 +542,7 @@ impl Lowerer {
                 }
             }
 
-            Stmt::DerefAssign { ptr_expr, op, expr } => {
+            Stmt::DerefAssign { ptr_expr, op, expr, line: _ } => {
                 let ptr_val = self.lower_expr(ptr_expr);
                 let pointee_ty = match self.get_value_type(ptr_val) {
                     IrType::Ptr(inner) => *inner,
@@ -572,11 +577,11 @@ impl Lowerer {
                 }
             }
 
-            Stmt::Expr(expr) => {
+            Stmt::Expr(expr, _) => {
                 self.lower_expr(expr);
             }
 
-            Stmt::Return(expr) => {
+            Stmt::Return(expr, _) => {
                 // Emit defer blocks before returning (in reverse order)
                 self.emit_defers();
 
@@ -596,23 +601,23 @@ impl Lowerer {
                 }
             }
 
-            Stmt::If { cond, then_block, else_block } => {
+            Stmt::If { cond, then_block, else_block, line: _ } => {
                 self.lower_if(cond, then_block, else_block.as_ref());
             }
 
-            Stmt::While { cond, body } => {
+            Stmt::While { cond, body, line: _ } => {
                 self.lower_while(cond, body);
             }
 
-            Stmt::For { var, iterator, body } => {
+            Stmt::For { var, iterator, body, line: _ } => {
                 self.lower_for(var, iterator, body);
             }
 
-            Stmt::Loop { body } => {
+            Stmt::Loop { body, line: _ } => {
                 self.lower_loop(body);
             }
 
-            Stmt::Break(expr) => {
+            Stmt::Break(expr, _) => {
                 if let Some((_, break_block, result_slot)) = self.loop_stack.last() {
                     let break_target = *break_block;
                     let slot = *result_slot;
@@ -626,19 +631,19 @@ impl Lowerer {
                 }
             }
 
-            Stmt::Continue => {
+            Stmt::Continue(_) => {
                 if let Some((continue_block, _, _)) = self.loop_stack.last() {
                     let continue_target = *continue_block;
                     self.emit_terminator(Inst::Jump { target: continue_target });
                 }
             }
 
-            Stmt::Defer(body) => {
+            Stmt::Defer(body, _) => {
                 // Register defer block — will be emitted at all exit points
                 self.defer_stack.push(body.clone());
             }
 
-            Stmt::Match { expr, arms } => {
+            Stmt::Match { expr, arms, line: _ } => {
                 self.lower_match(expr, arms);
             }
 
@@ -1220,7 +1225,7 @@ impl Lowerer {
                     // Lower body and store result
                     let mut last_val = None;
                     for stmt in &arm.body {
-                        if let Stmt::Expr(e) = stmt {
+                        if let Stmt::Expr(e, _) = stmt {
                             last_val = Some(self.lower_expr(e));
                         } else {
                             last_val = None;
@@ -1242,7 +1247,7 @@ impl Lowerer {
             self.set_current_block(match_block);
             let mut last_val = None;
             for stmt in &arm.body {
-                if let Stmt::Expr(e) = stmt {
+                if let Stmt::Expr(e, _) = stmt {
                     last_val = Some(self.lower_expr(e));
                 } else {
                     last_val = None;
@@ -1267,7 +1272,7 @@ impl Lowerer {
     fn infer_match_type(&self, arms: &[MatchArm]) -> IrType {
         for arm in arms {
             for stmt in &arm.body {
-                if let Stmt::Expr(e) = stmt {
+                if let Stmt::Expr(e, _) = stmt {
                     return self.infer_expr_type(e);
                 }
             }
@@ -1494,10 +1499,12 @@ impl Lowerer {
                 // Check if this is Vec::new() — built-in
                 if let Expr::Ident(name) = receiver.as_ref() {
                     if name == "Vec" && method == "new" {
+                        // Infer element type from the typechecker's result
+                        let elem_ty = self.infer_vec_elem_type();
                         return self.emit_inst(Inst::Call {
                             func: "p_vec_new".to_string(),
                             args: vec![],
-                            ret_ty: IrType::Generic("Vec".to_string(), vec![IrType::Opaque("any".to_string())]),
+                            ret_ty: IrType::Generic("Vec".to_string(), vec![elem_ty]),
                             effects: EffectSet::new(),
                         });
                     }
@@ -1505,10 +1512,11 @@ impl Lowerer {
                 // Check if this is HashMap::new() — built-in
                 if let Expr::Ident(name) = receiver.as_ref() {
                     if name == "HashMap" && method == "new" {
+                        let (key_ty, val_ty) = self.infer_map_types();
                         return self.emit_inst(Inst::Call {
                             func: "p_map_new".to_string(),
                             args: vec![],
-                            ret_ty: IrType::Generic("HashMap".to_string(), vec![IrType::Ptr(Box::new(IrType::U8)), IrType::I64]),
+                            ret_ty: IrType::Generic("HashMap".to_string(), vec![key_ty, val_ty]),
                             effects: EffectSet::new(),
                         });
                     }
@@ -1949,7 +1957,7 @@ impl Lowerer {
                 self.set_current_block(then_bb);
                 let mut then_val: Option<ValueId> = None;
                 for stmt in then_block {
-                    if let Stmt::Expr(e) = stmt {
+                    if let Stmt::Expr(e, _) = stmt {
                         then_val = Some(self.lower_expr(e));
                     } else {
                         self.lower_stmt(stmt);
@@ -1968,7 +1976,7 @@ impl Lowerer {
                 let mut else_val: Option<ValueId> = None;
                 if let Some(else_stmts) = else_block {
                     for stmt in else_stmts {
-                        if let Stmt::Expr(e) = stmt {
+                        if let Stmt::Expr(e, _) = stmt {
                             else_val = Some(self.lower_expr(e));
                         } else {
                             self.lower_stmt(stmt);
@@ -1998,7 +2006,7 @@ impl Lowerer {
                 // its value becomes the block's value
                 let mut last_val: Option<ValueId> = None;
                 for stmt in stmts {
-                    if let Stmt::Expr(e) = stmt {
+                    if let Stmt::Expr(e, _) = stmt {
                         last_val = Some(self.lower_expr(e));
                     } else {
                         self.lower_stmt(stmt);
@@ -2290,7 +2298,7 @@ impl Lowerer {
                 // Lower the body — last expression value becomes the Ok value
                 let mut last_val: Option<ValueId> = None;
                 for stmt in body {
-                    if let Stmt::Expr(e) = stmt {
+                    if let Stmt::Expr(e, _) = stmt {
                         last_val = Some(self.lower_expr(e));
                     } else {
                         self.lower_stmt(stmt);
@@ -2491,41 +2499,41 @@ impl Lowerer {
                     self.collect_free_vars_expr(ptr_expr, free_vars, local_names);
                     self.collect_free_vars_expr(expr, free_vars, local_names);
                 }
-                Stmt::Expr(e) => self.collect_free_vars_expr(e, free_vars, local_names),
-                Stmt::Return(e) => {
+                Stmt::Expr(e, _) => self.collect_free_vars_expr(e, free_vars, local_names),
+                Stmt::Return(e, _) => {
                     if let Some(e) = e {
                         self.collect_free_vars_expr(e, free_vars, local_names);
                     }
                 }
-                Stmt::If { cond, then_block, else_block } => {
+                Stmt::If { cond, then_block, else_block, .. } => {
                     self.collect_free_vars_expr(cond, free_vars, local_names);
                     self.collect_free_vars(then_block, free_vars, local_names);
                     if let Some(eb) = else_block {
                         self.collect_free_vars(eb, free_vars, local_names);
                     }
                 }
-                Stmt::While { cond, body } => {
+                Stmt::While { cond, body, .. } => {
                     self.collect_free_vars_expr(cond, free_vars, local_names);
                     self.collect_free_vars(body, free_vars, local_names);
                 }
-                Stmt::For { var, iterator, body } => {
+                Stmt::For { var, iterator, body, .. } => {
                     self.collect_free_vars_expr(iterator, free_vars, local_names);
                     local_names.push(var.clone());
                     self.collect_free_vars(body, free_vars, local_names);
                 }
-                Stmt::Loop { body } => {
+                Stmt::Loop { body, .. } => {
                     self.collect_free_vars(body, free_vars, local_names);
                 }
-                Stmt::Break(e) => {
+                Stmt::Break(e, _) => {
                     if let Some(e) = e {
                         self.collect_free_vars_expr(e, free_vars, local_names);
                     }
                 }
-                Stmt::Continue => {}
-                Stmt::Defer(body) => {
+                Stmt::Continue(_) => {}
+                Stmt::Defer(body, _) => {
                     self.collect_free_vars(body, free_vars, local_names);
                 }
-                Stmt::Match { expr, arms } => {
+                Stmt::Match { expr, arms, .. } => {
                     self.collect_free_vars_expr(expr, free_vars, local_names);
                     for arm in arms {
                         if let Pattern::EnumVariant { bindings, .. } = &arm.pattern {
@@ -2645,7 +2653,7 @@ impl Lowerer {
             Expr::TryBlock { body } => {
                 for stmt in body {
                     match stmt {
-                        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr(expr) => {
+                        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr(expr, _) => {
                             self.collect_free_vars_expr(expr, free_vars, local_names);
                         }
                         _ => {}
@@ -2736,6 +2744,12 @@ impl Lowerer {
     fn emit_inst(&mut self, inst: Inst) -> ValueId {
         if let Some(ref mut f) = self.current_func {
             let id = f.emit(inst);
+            // Set source line for debug info
+            if let Some(line) = self.current_line {
+                if let Some(meta) = f.values.get_mut(&id) {
+                    meta.source_line = Some(line);
+                }
+            }
             // Override: emit() uses next_block-1, but we need current_block
             // Move the instruction to the correct block
             let wrong_idx = (f.next_block - 1) as usize;
@@ -2759,6 +2773,24 @@ impl Lowerer {
                 meta.ty = ty;
             }
         }
+    }
+
+    /// Infer the element type for Vec::new() based on the current context.
+    /// Since the typechecker already resolved the type, we default to I64
+    /// (the most common element type) but could be extended to use type
+    /// annotations from the AST.
+    fn infer_vec_elem_type(&self) -> IrType {
+        // Default to I64 — the typechecker hardcodes Vec<i64> for Vec::new()
+        // Future: infer from type annotations or first push() call
+        IrType::I64
+    }
+
+    /// Infer key and value types for HashMap::new() based on the current context.
+    /// Returns (key_type, value_type).
+    fn infer_map_types(&self) -> (IrType, IrType) {
+        // Default to (String, I64) — the typechecker hardcodes HashMap<String, i64>
+        // Future: infer from type annotations or first insert() call
+        (IrType::Opaque("String".to_string()), IrType::I64)
     }
 
     /// Create an env struct for a function reference: [fn_addr, cap1, cap2, ...]
@@ -2934,7 +2966,7 @@ impl Lowerer {
             Expr::If { then_block, .. } => {
                 // Infer type from the last expression in the then block
                 for stmt in then_block {
-                    if let Stmt::Expr(e) = stmt {
+                    if let Stmt::Expr(e, _) = stmt {
                         return self.infer_expr_type(e);
                     }
                 }
@@ -2943,7 +2975,7 @@ impl Lowerer {
             Expr::Block(stmts) => {
                 // Infer type from the last expression in the block
                 for stmt in stmts {
-                    if let Stmt::Expr(e) = stmt {
+                    if let Stmt::Expr(e, _) = stmt {
                         return self.infer_expr_type(e);
                     }
                 }
@@ -2989,10 +3021,12 @@ impl Lowerer {
                         return IrType::Ptr(Box::new(IrType::U8));
                     }
                     if name == "Vec" && method == "new" {
-                        return IrType::Generic("Vec".to_string(), vec![IrType::Opaque("any".to_string())]);
+                        let elem_ty = self.infer_vec_elem_type();
+                        return IrType::Generic("Vec".to_string(), vec![elem_ty]);
                     }
                     if name == "HashMap" && method == "new" {
-                        return IrType::Generic("HashMap".to_string(), vec![IrType::Ptr(Box::new(IrType::U8)), IrType::I64]);
+                        let (key_ty, val_ty) = self.infer_map_types();
+                        return IrType::Generic("HashMap".to_string(), vec![key_ty, val_ty]);
                     }
                     if name == "String" && method == "from" {
                         return IrType::Opaque("String".to_string());
@@ -3050,7 +3084,7 @@ impl Lowerer {
                 // Infer from first arm's body
                 for arm in arms {
                     for stmt in &arm.body {
-                        if let Stmt::Expr(e) = stmt {
+                        if let Stmt::Expr(e, _) = stmt {
                             return self.infer_expr_type(e);
                         }
                     }

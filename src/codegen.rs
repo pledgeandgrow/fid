@@ -264,7 +264,7 @@ impl CodeGen {
                 };
                 writeln!(self.output, "    str x0, [sp, #{}]", offset).unwrap();
             }
-            Stmt::Assign { target, op, expr } => {
+            Stmt::Assign { target, op, expr, .. } => {
                 if let Some(offset) = self.lookup_var(target) {
                     match op {
                         AssignOp::Assign => {
@@ -315,7 +315,7 @@ impl CodeGen {
                     }
                 }
             }
-            Stmt::IndexAssign { array, index, op, expr } => {
+            Stmt::IndexAssign { array, index, op, expr, .. } => {
                 // Evaluate index
                 self.gen_expr(index);
                 let idx_temp = self.next_offset;
@@ -367,13 +367,13 @@ impl CodeGen {
                 }
                 self.next_offset -= 16;
             }
-            Stmt::Expr(expr) => {
+            Stmt::Expr(expr, _) => {
                 self.gen_expr(expr);
             }
             Stmt::DerefAssign { .. } => {
                 // Handled by new backend, not this legacy ARM64 codegen
             }
-            Stmt::Return(expr) => {
+            Stmt::Return(expr, _) => {
                 if let Some(e) = expr {
                     self.gen_expr(e);
                 }
@@ -383,6 +383,7 @@ impl CodeGen {
                 cond,
                 then_block,
                 else_block,
+                ..
             } => {
                 let else_label = self.fresh_label("else");
                 let end_label = self.fresh_label("endif");
@@ -410,7 +411,7 @@ impl CodeGen {
 
                 writeln!(self.output, "{}:", end_label).unwrap();
             }
-            Stmt::While { cond, body } => {
+            Stmt::While { cond, body, .. } => {
                 let start_label = self.fresh_label("while_start");
                 let end_label = self.fresh_label("while_end");
 
@@ -428,7 +429,7 @@ impl CodeGen {
                 writeln!(self.output, "    b {}", start_label).unwrap();
                 writeln!(self.output, "{}:", end_label).unwrap();
             }
-            Stmt::For { var, iterator, body } => {
+            Stmt::For { var, iterator, body, .. } => {
                 let start_label = self.fresh_label("for_start");
                 let end_label = self.fresh_label("for_end");
 
@@ -487,7 +488,7 @@ impl CodeGen {
                     }
                 }
             }
-            Stmt::Loop { body } => {
+            Stmt::Loop { body, .. } => {
                 let start_label = self.fresh_label("loop_start");
                 let end_label = self.fresh_label("loop_end");
 
@@ -500,15 +501,15 @@ impl CodeGen {
                 writeln!(self.output, "    b {}", start_label).unwrap();
                 writeln!(self.output, "{}:", end_label).unwrap();
             }
-            Stmt::Break(_) => {
+            Stmt::Break(_, _) => {
                 // Simplified: jump to end of current block
                 // Full impl: track break/continue labels
                 writeln!(self.output, "    b .loop_end_{}", self.label_counter).unwrap();
             }
-            Stmt::Continue => {
+            Stmt::Continue(_) => {
                 writeln!(self.output, "    b .loop_start_{}", self.label_counter).unwrap();
             }
-            Stmt::Defer(body) => {
+            Stmt::Defer(body, _) => {
                 // Simplified: execute defer body immediately (proper impl: queue for scope exit)
                 self.push_scope();
                 for s in body {
@@ -516,7 +517,7 @@ impl CodeGen {
                 }
                 self.pop_scope();
             }
-            Stmt::Match { expr, arms } => {
+            Stmt::Match { expr, arms, .. } => {
                 // Evaluate match expression
                 self.gen_expr(expr);
                 let match_temp = self.next_offset;
@@ -1036,8 +1037,8 @@ fn count_lets(stmts: &[Stmt]) -> usize {
             }
             Stmt::While { body, .. } => count += count_lets(body),
             Stmt::For { body, .. } => count += count_lets(body),
-            Stmt::Loop { body } => count += count_lets(body),
-            Stmt::Defer(body) => count += count_lets(body),
+            Stmt::Loop { body, .. } => count += count_lets(body),
+            Stmt::Defer(body, _) => count += count_lets(body),
             Stmt::Match { arms, .. } => {
                 for arm in arms {
                     count += count_lets(&arm.body);

@@ -649,38 +649,43 @@ impl Parser {
             TokenKind::Pv => self.parse_let(),
             TokenKind::Ret => self.parse_return(),
             TokenKind::If => {
+                let line = self.peek_token().line;
                 let expr = self.parse_if_expr()?;
                 Ok(Stmt::If {
                     cond: *expr.cond,
                     then_block: expr.then_block,
                     else_block: expr.else_block,
+                    line,
                 })
             }
             TokenKind::While => self.parse_while(),
             TokenKind::For => self.parse_for(),
             TokenKind::Loop => self.parse_loop(),
             TokenKind::Break => {
+                let line = self.peek_token().line;
                 self.advance();
                 if self.check(&TokenKind::Semicolon) || self.check(&TokenKind::RBrace) {
                     self.match_tok(TokenKind::Semicolon);
-                    Ok(Stmt::Break(None))
+                    Ok(Stmt::Break(None, line))
                 } else {
                     let expr = self.parse_expr()?;
                     self.match_tok(TokenKind::Semicolon);
-                    Ok(Stmt::Break(Some(expr)))
+                    Ok(Stmt::Break(Some(expr), line))
                 }
             }
             TokenKind::Continue => {
+                let line = self.peek_token().line;
                 self.advance();
                 self.match_tok(TokenKind::Semicolon);
-                Ok(Stmt::Continue)
+                Ok(Stmt::Continue(line))
             }
             TokenKind::Defer => {
+                let line = self.peek_token().line;
                 self.advance();
                 self.expect(TokenKind::LBrace, "{")?;
                 let body = self.parse_block()?;
                 self.expect(TokenKind::RBrace, "}")?;
-                Ok(Stmt::Defer(body))
+                Ok(Stmt::Defer(body, line))
             }
             TokenKind::Match => self.parse_match_stmt(),
             TokenKind::Use => self.parse_use_stmt(),
@@ -689,6 +694,7 @@ impl Parser {
     }
 
     fn parse_assign_or_expr(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
         // Try to parse as expression first
         let expr = self.parse_expr()?;
 
@@ -713,38 +719,40 @@ impl Parser {
             if let Expr::Ident(name) = expr {
                 let rhs = self.parse_expr()?;
                 self.match_tok(TokenKind::Semicolon);
-                Ok(Stmt::Assign { target: name, op, expr: rhs })
+                Ok(Stmt::Assign { target: name, op, expr: rhs, line })
             } else if let Expr::Index { array, index } = expr {
                 if let Expr::Ident(name) = *array {
                     let rhs = self.parse_expr()?;
                     self.match_tok(TokenKind::Semicolon);
-                    Ok(Stmt::IndexAssign { array: name, index: *index, op, expr: rhs })
+                    Ok(Stmt::IndexAssign { array: name, index: *index, op, expr: rhs, line })
                 } else {
                     Err("Parse error: index assignment target must be an array variable".to_string())
                 }
             } else if let Expr::Deref { expr: ptr_expr } = expr {
                 let rhs = self.parse_expr()?;
                 self.match_tok(TokenKind::Semicolon);
-                Ok(Stmt::DerefAssign { ptr_expr: *ptr_expr, op, expr: rhs })
+                Ok(Stmt::DerefAssign { ptr_expr: *ptr_expr, op, expr: rhs, line })
             } else {
                 Err("Parse error: assignment target must be an identifier or array index".to_string())
             }
         } else {
             self.match_tok(TokenKind::Semicolon);
-            Ok(Stmt::Expr(expr))
+            Ok(Stmt::Expr(expr, line))
         }
     }
 
     fn parse_while(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
         self.expect(TokenKind::While, "while")?;
         let cond = self.parse_expr()?;
         self.expect(TokenKind::LBrace, "{")?;
         let body = self.parse_block()?;
         self.expect(TokenKind::RBrace, "}")?;
-        Ok(Stmt::While { cond, body })
+        Ok(Stmt::While { cond, body, line })
     }
 
     fn parse_for(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
         self.expect(TokenKind::For, "for")?;
         let var = self.expect_ident()?;
         self.expect(TokenKind::In, "in")?;
@@ -752,18 +760,20 @@ impl Parser {
         self.expect(TokenKind::LBrace, "{")?;
         let body = self.parse_block()?;
         self.expect(TokenKind::RBrace, "}")?;
-        Ok(Stmt::For { var, iterator, body })
+        Ok(Stmt::For { var, iterator, body, line })
     }
 
     fn parse_loop(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
         self.expect(TokenKind::Loop, "loop")?;
         self.expect(TokenKind::LBrace, "{")?;
         let body = self.parse_block()?;
         self.expect(TokenKind::RBrace, "}")?;
-        Ok(Stmt::Loop { body })
+        Ok(Stmt::Loop { body, line })
     }
 
     fn parse_match_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
         self.expect(TokenKind::Match, "match")?;
         let expr = self.parse_expr()?;
         self.expect(TokenKind::LBrace, "{")?;
@@ -780,7 +790,7 @@ impl Parser {
         }
         self.expect(TokenKind::RBrace, "}")?;
 
-        Ok(Stmt::Match { expr, arms })
+        Ok(Stmt::Match { expr, arms, line })
     }
 
     fn parse_match_expr(&mut self) -> Result<Expr, String> {
@@ -799,8 +809,9 @@ impl Parser {
                 self.expect(TokenKind::RBrace, "}")?;
                 block
             } else {
+                let line = self.peek_token().line;
                 let e = self.parse_expr()?;
-                vec![Stmt::Expr(e)]
+                vec![Stmt::Expr(e, line)]
             };
             self.match_tok(TokenKind::Comma);
             arms.push(MatchArm { pattern, body });
@@ -887,6 +898,7 @@ impl Parser {
     }
 
     fn parse_let(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
         self.expect(TokenKind::Pv, "pv")?;
         let is_mut = self.match_tok(TokenKind::Mut);
         let name = self.expect_ident()?;
@@ -901,18 +913,19 @@ impl Parser {
         let expr = self.parse_expr()?;
         self.match_tok(TokenKind::Semicolon);
 
-        Ok(Stmt::Let { name, ty, expr, is_mut })
+        Ok(Stmt::Let { name, ty, expr, is_mut, line })
     }
 
     fn parse_return(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
         self.expect(TokenKind::Ret, "ret")?;
         if self.check(&TokenKind::RBrace) || self.check(&TokenKind::Semicolon) {
             self.match_tok(TokenKind::Semicolon);
-            Ok(Stmt::Return(None))
+            Ok(Stmt::Return(None, line))
         } else {
             let expr = self.parse_expr()?;
             self.match_tok(TokenKind::Semicolon);
-            Ok(Stmt::Return(Some(expr)))
+            Ok(Stmt::Return(Some(expr), line))
         }
     }
 
@@ -926,11 +939,13 @@ impl Parser {
 
         let else_block: Option<Vec<Stmt>> = if self.match_tok(TokenKind::Else) {
             if self.check(&TokenKind::If) {
+                let line = self.peek_token().line;
                 let nested = self.parse_if_expr()?;
                 Some(vec![Stmt::If {
                     cond: *nested.cond,
                     then_block: nested.then_block,
                     else_block: nested.else_block,
+                    line,
                 }])
             } else {
                 self.expect(TokenKind::LBrace, "{")?;
@@ -1307,10 +1322,11 @@ impl Parser {
 
                 if self.match_tok(TokenKind::FatArrow) {
                     // Expression closure: pf(x) => expr
+                    let line = self.peek_token().line;
                     let expr = self.parse_expr()?;
                     Ok(Expr::Closure {
                         params,
-                        body: vec![Stmt::Expr(expr)],
+                        body: vec![Stmt::Expr(expr, line)],
                         ret_ty,
                     })
                 } else {
@@ -1542,6 +1558,7 @@ impl Parser {
     }
 
     fn parse_use_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
         self.expect(TokenKind::Use, "use")?;
         let mut path = String::new();
         loop {
@@ -1573,7 +1590,7 @@ impl Parser {
             path = path[..path.len() - 2].to_string();
         }
         self.match_tok(TokenKind::Semicolon);
-        Ok(Stmt::Use { path, items })
+        Ok(Stmt::Use { path, items, line })
     }
 
     fn parse_attribute(&mut self) -> Result<Attribute, String> {

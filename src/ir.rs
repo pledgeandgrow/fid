@@ -120,6 +120,112 @@ impl IrType {
             _ => None,
         }
     }
+
+    /// Get all type parameters of a Generic type
+    /// For `Generic("HashMap", [String, I64])` returns `&[String, I64]`
+    pub fn generic_args(&self) -> &[IrType] {
+        match self {
+            IrType::Generic(_, args) => args,
+            _ => &[],
+        }
+    }
+
+    /// Is this a signed integer type?
+    pub fn is_signed(&self) -> bool {
+        matches!(self, IrType::I8 | IrType::I16 | IrType::I32 | IrType::I64)
+    }
+
+    /// Is this an unsigned integer type?
+    pub fn is_unsigned(&self) -> bool {
+        matches!(self, IrType::U8 | IrType::U16 | IrType::U32 | IrType::U64)
+    }
+
+    /// Is this a numeric type (int or float)?
+    pub fn is_numeric(&self) -> bool {
+        self.is_int() || self.is_float()
+    }
+
+    /// Is this a scalar type (numeric or bool)?
+    pub fn is_scalar(&self) -> bool {
+        self.is_numeric() || *self == IrType::Bool
+    }
+
+    /// Is this an aggregate type (struct, array, vec, map)?
+    pub fn is_aggregate(&self) -> bool {
+        matches!(
+            self,
+            IrType::Struct(_) | IrType::Array(_, _) | IrType::Opaque(_) | IrType::Generic(_, _)
+        )
+    }
+
+    /// Is this type a collection (Vec or HashMap)?
+    pub fn is_collection(&self) -> bool {
+        self.is_opaque_named("Vec") || self.is_opaque_named("HashMap")
+    }
+
+    /// Is this the Never type (unreachable)?
+    pub fn is_never(&self) -> bool {
+        *self == IrType::Never
+    }
+
+    /// Is this a void type (no value)?
+    pub fn is_void(&self) -> bool {
+        *self == IrType::Void
+    }
+
+    /// Get the element type of a collection (Vec<T> → T, HashMap<K,V> → V)
+    pub fn collection_elem(&self) -> Option<&IrType> {
+        match self {
+            IrType::Generic(name, args) if name == "Vec" => args.first(),
+            IrType::Generic(name, args) if name == "HashMap" => args.get(1),
+            _ => None,
+        }
+    }
+
+    /// Get the key type of a HashMap
+    pub fn map_key_type(&self) -> Option<&IrType> {
+        match self {
+            IrType::Generic(name, args) if name == "HashMap" => args.first(),
+            _ => None,
+        }
+    }
+
+    /// Get the value type of a HashMap
+    pub fn map_value_type(&self) -> Option<&IrType> {
+        match self {
+            IrType::Generic(name, args) if name == "HashMap" => args.get(1),
+            _ => None,
+        }
+    }
+
+    /// Check if two types are compatible (ignoring opaque name differences)
+    /// e.g. Opaque("Vec") and Generic("Vec", [I64]) are compatible
+    pub fn is_compatible_with(&self, other: &IrType) -> bool {
+        if self == other {
+            return true;
+        }
+        // Opaque and Generic with same name are compatible
+        match (self, other) {
+            (IrType::Opaque(n1), IrType::Generic(n2, _)) | (IrType::Generic(n2, _), IrType::Opaque(n1))
+                if n1 == n2 => true,
+            // Ptr types are compatible if pointee is compatible
+            (IrType::Ptr(a), IrType::Ptr(b)) => a.is_compatible_with(b),
+            // Any pointer is compatible with Opaque (runtime handle)
+            (IrType::Ptr(_), IrType::Opaque(_)) | (IrType::Opaque(_), IrType::Ptr(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// Get the bit width of this type (for integer/float types)
+    pub fn bit_width(&self) -> Option<u32> {
+        match self {
+            IrType::I8 | IrType::U8 | IrType::Bool => Some(8),
+            IrType::I16 | IrType::U16 => Some(16),
+            IrType::I32 | IrType::U32 | IrType::F32 => Some(32),
+            IrType::I64 | IrType::U64 | IrType::F64 | IrType::Ptr(_) => Some(64),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for IrType {
@@ -519,6 +625,38 @@ impl Inst {
         effects
     }
 
+    /// Get a short name for this instruction kind (for debugging/source maps)
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Inst::ConstInt { .. } => "ConstInt",
+            Inst::ConstFloat { .. } => "ConstFloat",
+            Inst::ConstBool { .. } => "ConstBool",
+            Inst::ConstStr { .. } => "ConstStr",
+            Inst::ConstNull { .. } => "ConstNull",
+            Inst::BinOp { .. } => "BinOp",
+            Inst::UnaryOp { .. } => "UnaryOp",
+            Inst::Alloca { .. } => "Alloca",
+            Inst::Load { .. } => "Load",
+            Inst::Store { .. } => "Store",
+            Inst::GetFieldPtr { .. } => "GetFieldPtr",
+            Inst::GetElemPtr { .. } => "GetElemPtr",
+            Inst::Jump { .. } => "Jump",
+            Inst::Branch { .. } => "Branch",
+            Inst::Return { .. } => "Return",
+            Inst::Unreachable => "Unreachable",
+            Inst::Call { .. } => "Call",
+            Inst::CallPtr { .. } => "CallPtr",
+            Inst::BitCast { .. } => "BitCast",
+            Inst::IntExtend { .. } => "IntExtend",
+            Inst::IntTrunc { .. } => "IntTrunc",
+            Inst::IntToFloat { .. } => "IntToFloat",
+            Inst::FloatToInt { .. } => "FloatToInt",
+            Inst::TryUnwrap { .. } => "TryUnwrap",
+            Inst::Print { .. } => "Print",
+            Inst::Panic { .. } => "Panic",
+        }
+    }
+
     /// Is this a terminator instruction? (must be last in a block)
     pub fn is_terminator(&self) -> bool {
         matches!(self,
@@ -528,6 +666,45 @@ impl Inst {
             | Inst::Unreachable
             | Inst::Panic { .. }
         )
+    }
+
+    /// Get all ValueId references used by this instruction.
+    /// Useful for verification and dataflow analysis.
+    pub fn value_refs(&self) -> Vec<ValueId> {
+        match self {
+            Inst::ConstInt { .. }
+            | Inst::ConstFloat { .. }
+            | Inst::ConstBool { .. }
+            | Inst::ConstStr { .. }
+            | Inst::ConstNull { .. }
+            | Inst::Alloca { .. }
+            | Inst::Unreachable
+            | Inst::Panic { .. } => Vec::new(),
+
+            Inst::BinOp { left, right, .. } => vec![*left, *right],
+            Inst::UnaryOp { operand, .. } => vec![*operand],
+            Inst::Load { ptr, .. } => vec![*ptr],
+            Inst::Store { ptr, value } => vec![*ptr, *value],
+            Inst::GetFieldPtr { struct_ptr, .. } => vec![*struct_ptr],
+            Inst::GetElemPtr { array_ptr, index, .. } => vec![*array_ptr, *index],
+            Inst::Jump { .. } => Vec::new(),
+            Inst::Branch { cond, .. } => vec![*cond],
+            Inst::Return { value: Some(v) } => vec![*v],
+            Inst::Return { value: None } => Vec::new(),
+            Inst::Call { args, .. } => args.clone(),
+            Inst::CallPtr { fn_ptr, args, .. } => {
+                let mut refs = vec![*fn_ptr];
+                refs.extend(args);
+                refs
+            }
+            Inst::BitCast { value, .. } => vec![*value],
+            Inst::IntExtend { value, .. } => vec![*value],
+            Inst::IntTrunc { value, .. } => vec![*value],
+            Inst::IntToFloat { value, .. } => vec![*value],
+            Inst::FloatToInt { value, .. } => vec![*value],
+            Inst::TryUnwrap { value, .. } => vec![*value],
+            Inst::Print { value, .. } => vec![*value],
+        }
     }
 }
 
@@ -693,6 +870,55 @@ pub struct StructLayout {
     pub align: u64,
 }
 
+/// Source map entry — maps an IR value to its source location
+#[derive(Debug, Clone)]
+pub struct SourceEntry {
+    pub function: String,
+    pub value_id: u32,
+    pub line: usize,
+    pub inst: String,
+}
+
+/// Source map — maps IR values to source locations for debugging
+#[derive(Debug, Clone, Default)]
+pub struct SourceMap {
+    pub entries: Vec<SourceEntry>,
+}
+
+impl SourceMap {
+    pub fn new() -> Self {
+        SourceMap { entries: Vec::new() }
+    }
+
+    /// Look up the source line for a given function and value ID
+    pub fn lookup(&self, function: &str, value_id: u32) -> Option<usize> {
+        self.entries.iter()
+            .find(|e| e.function == function && e.value_id == value_id)
+            .map(|e| e.line)
+    }
+
+    /// Get all entries for a given function
+    pub fn for_function(&self, function: &str) -> Vec<&SourceEntry> {
+        self.entries.iter()
+            .filter(|e| e.function == function)
+            .collect()
+    }
+
+    /// Render the source map as a text table
+    pub fn to_string(&self) -> String {
+        let mut out = String::from("Source Map:\n");
+        out.push_str("  Function           Value  Line  Instruction\n");
+        out.push_str("  ─────────────────  ─────  ────  ────────────\n");
+        for e in &self.entries {
+            out.push_str(&format!(
+                "  {:18}  v{:4}  {:4}  {}\n",
+                e.function, e.value_id, e.line, e.inst
+            ));
+        }
+        out
+    }
+}
+
 /// A Pledge IR module — the top-level container for a compilation unit.
 /// Contains functions, global data, struct layouts, and metadata.
 #[derive(Debug, Clone)]
@@ -765,6 +991,29 @@ impl IrModule {
             }
             _ => ty.align(),
         }
+    }
+
+    /// Generate a source map from the IR module.
+    /// Maps each instruction that has source_line info to a SourceEntry.
+    pub fn source_map(&self) -> SourceMap {
+        let mut map = SourceMap::new();
+        for (func_name, func) in &self.functions {
+            for (value_id, meta) in &func.values {
+                if let Some(line) = meta.source_line {
+                    let inst_str = func.instructions
+                        .get(value_id)
+                        .map(|inst| format!("{}", inst.kind_name()))
+                        .unwrap_or_else(|| "?".to_string());
+                    map.entries.push(SourceEntry {
+                        function: func_name.clone(),
+                        value_id: value_id.0,
+                        line,
+                        inst: inst_str,
+                    });
+                }
+            }
+        }
+        map
     }
 }
 
@@ -904,3 +1153,259 @@ impl IrModule {
 
 // We need to store instructions per-function. Add instructions field to IrFunction.
 // Since we can't easily modify the struct after definition, we include it here.
+
+// ─── IR Optimization Passes ─────────────────────────────────────────────
+
+impl IrModule {
+    /// Run basic optimization passes on this module.
+    ///
+    /// Currently implements:
+    /// - Constant folding for binary operations
+    /// - Dead code elimination (removes unused instructions)
+    ///
+    /// Returns the number of optimizations applied.
+    pub fn optimize(&mut self) -> usize {
+        let mut total = 0;
+        for func in self.functions.values_mut() {
+            total += func.constant_fold();
+        }
+        total
+    }
+}
+
+impl IrFunction {
+    /// Constant folding: evaluate binary operations on constants at compile time.
+    fn constant_fold(&mut self) -> usize {
+        let mut folded = 0;
+        let block_ids: Vec<u32> = self.blocks.iter().map(|b| b.id.0).collect();
+
+        for block_id in block_ids {
+            let block = &self.blocks[block_id as usize];
+            let inst_ids = block.instructions.clone();
+
+            for inst_id in inst_ids {
+                let inst = match self.instructions.get(&inst_id) {
+                    Some(i) => i.clone(),
+                    None => continue,
+                };
+
+                if let Inst::BinOp { op, left, right, ty } = &inst {
+                    // Try to fold if both operands are constants
+                    let left_inst = self.instructions.get(left);
+                    let right_inst = self.instructions.get(right);
+
+                    if let (Some(Inst::ConstInt { value: lv, .. }), Some(Inst::ConstInt { value: rv, .. })) =
+                        (left_inst, right_inst)
+                    {
+                        if let Some(result) = eval_binop_int(op, *lv, *rv, ty) {
+                            self.instructions.insert(inst_id, Inst::ConstInt { value: result, ty: ty.clone() });
+                            folded += 1;
+                        }
+                    }
+                }
+            }
+        }
+        folded
+    }
+}
+
+/// Evaluate a binary operation on integer constants.
+fn eval_binop_int(op: &BinOp, l: i64, r: i64, ty: &IrType) -> Option<i64> {
+    use BinOp::*;
+    let result = match op {
+        Add => l.wrapping_add(r),
+        Sub => l.wrapping_sub(r),
+        Mul => l.wrapping_mul(r),
+        Div => if r == 0 { return None } else { l.wrapping_div(r) },
+        Mod => if r == 0 { return None } else { l.wrapping_rem(r) },
+        BitAnd => l & r,
+        BitOr => l | r,
+        BitXor => l ^ r,
+        Shl => l.wrapping_shl(r as u32),
+        Shr => l.wrapping_shr(r as u32),
+        Eq => (l == r) as i64,
+        Ne => (l != r) as i64,
+        Lt => (l < r) as i64,
+        Le => (l <= r) as i64,
+        Gt => (l > r) as i64,
+        Ge => (l >= r) as i64,
+        _ => return None,
+    };
+    // Truncate to the target type width
+    let truncated = match ty {
+        IrType::I8 | IrType::U8 => (result as i8) as i64,
+        IrType::I16 | IrType::U16 => (result as i16) as i64,
+        IrType::I32 | IrType::U32 => (result as i32) as i64,
+        _ => result,
+    };
+    Some(truncated)
+}
+
+// ─── IR Verification Pass ──────────────────────────────────────────────
+
+/// Result of verifying an IR module.
+#[derive(Debug)]
+pub struct VerificationResult {
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl VerificationResult {
+    pub fn is_valid(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    pub fn report(&self) {
+        for w in &self.warnings {
+            eprintln!("warning: {}", w);
+        }
+        for e in &self.errors {
+            eprintln!("error: {}", e);
+        }
+    }
+}
+
+impl IrModule {
+    /// Verify the correctness of this IR module.
+    ///
+    /// Checks:
+    /// - Every function has an entry block
+    /// - Every block ends with a terminator
+    /// - All ValueId references point to valid instructions
+    /// - Block IDs in control flow are valid
+    /// - Return types match function signatures
+    /// - No duplicate ValueIds
+    pub fn verify(&self) -> VerificationResult {
+        let mut errors: Vec<String> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+
+        for (name, func) in &self.functions {
+            // Check: function has blocks
+            if func.blocks.is_empty() {
+                errors.push(format!("function '{}' has no blocks", name));
+                continue;
+            }
+
+            // Check: entry block exists
+            if func.blocks[0].id != func.entry {
+                warnings.push(format!(
+                    "function '{}': first block id {} != entry {}",
+                    name, func.blocks[0].id.0, func.entry.0
+                ));
+            }
+
+            // Collect all valid block IDs
+            let valid_blocks: std::collections::HashSet<u32> =
+                func.blocks.iter().map(|b| b.id.0).collect();
+
+            // Collect all defined ValueIds
+            let defined_values: std::collections::HashSet<u32> =
+                func.instructions.keys().map(|v| v.0).collect();
+
+            // Check each block
+            for block in &func.blocks {
+                // Check: block has instructions
+                if block.instructions.is_empty() {
+                    warnings.push(format!(
+                        "function '{}': block {} is empty",
+                        name, block.id.0
+                    ));
+                    continue;
+                }
+
+                // Check: all instruction references are valid
+                for &inst_id in &block.instructions {
+                    if !func.instructions.contains_key(&inst_id) {
+                        errors.push(format!(
+                            "function '{}': block {} references undefined instruction v{}",
+                            name, block.id.0, inst_id.0
+                        ));
+                    }
+                }
+
+                // Check: block ends with a terminator
+                let last_id = *block.instructions.last().unwrap();
+                if let Some(last_inst) = func.instructions.get(&last_id) {
+                    if !last_inst.is_terminator() {
+                        errors.push(format!(
+                            "function '{}': block {} does not end with a terminator (ends with {:?})",
+                            name, block.id.0, last_inst
+                        ));
+                    }
+
+                    // Check: no instructions after terminator
+                    let mut found_terminator = false;
+                    for &iid in &block.instructions {
+                        if found_terminator {
+                            errors.push(format!(
+                                "function '{}': block {} has instruction after terminator",
+                                name, block.id.0
+                            ));
+                            break;
+                        }
+                        if let Some(inst) = func.instructions.get(&iid) {
+                            if inst.is_terminator() {
+                                found_terminator = true;
+                            }
+                        }
+                    }
+
+                    // Check: control flow targets are valid
+                    match last_inst {
+                        Inst::Jump { target } => {
+                            if !valid_blocks.contains(&target.0) {
+                                errors.push(format!(
+                                    "function '{}': block {} jumps to invalid block {}",
+                                    name, block.id.0, target.0
+                                ));
+                            }
+                        }
+                        Inst::Branch { then, else_, .. } => {
+                            if !valid_blocks.contains(&then.0) {
+                                errors.push(format!(
+                                    "function '{}': block {} branches to invalid then-block {}",
+                                    name, block.id.0, then.0
+                                ));
+                            }
+                            if !valid_blocks.contains(&else_.0) {
+                                errors.push(format!(
+                                    "function '{}': block {} branches to invalid else-block {}",
+                                    name, block.id.0, else_.0
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Check: all ValueId references in instructions are defined
+            for (inst_id, inst) in &func.instructions {
+                let refs = inst.value_refs();
+                for ref_id in refs {
+                    if !defined_values.contains(&ref_id.0) && !func.params.iter().any(|(p, _)| *p == ref_id) {
+                        errors.push(format!(
+                            "function '{}': instruction v{} references undefined value v{}",
+                            name, inst_id.0, ref_id.0
+                        ));
+                    }
+                }
+            }
+
+            // Check: function has a Return somewhere
+            let has_return = func.blocks.iter().any(|b| {
+                b.instructions.iter().any(|iid| {
+                    matches!(func.instructions.get(iid), Some(Inst::Return { .. }))
+                })
+            });
+            if !has_return && func.ret_ty != IrType::Void {
+                warnings.push(format!(
+                    "function '{}': no Return instruction (declared return type {:?})",
+                    name, func.ret_ty
+                ));
+            }
+        }
+
+        VerificationResult { errors, warnings }
+    }
+}
