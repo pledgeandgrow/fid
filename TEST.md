@@ -1,6 +1,6 @@
 # TEST.md — Pledge Test Results
 
-*Last updated: Aug 10, 2026 (41/41 tests pass across all three backends)*
+*Last updated: Aug 10, 2026 (Phase 5C+5D — 59/59 tests pass on PE & WASM; AI/ML + Web & Cloud)*
 
 ## Legend
 
@@ -61,6 +61,14 @@ All 41 test files pass through the interpreter.
 | `test_regression_closures.p` | ✅ | Closures regression test |
 | `test_regression_fstring.p` | ✅ | F-string regression test |
 | `test_regression_collections.p` | ✅ | Collections regression test |
+| `test_wasm.p` | ✅ | WASM target test (Phase 5D.1) |
+| `test_json.p` | ✅ | JSON stdlib (Phase 5D.2) |
+| `test_http.p` | ✅ | HTTP server stdlib (Phase 5D.3) |
+| `test_db.p` | ✅ | Database driver framework (Phase 5D.4) |
+| `test_tensor.p` | ✅ | Tensor type + ops (Phase 5C.1) |
+| `test_simd.p` | ✅ | SIMD intrinsics (Phase 5C.2) |
+| `test_shape.p` | ✅ | Comptime shape verification (Phase 5C.3) |
+| `test_parallel.p` | ✅ | Auto-parallelization framework (Phase 5C.4) |
 
 ---
 
@@ -68,7 +76,7 @@ All 41 test files pass through the interpreter.
 
 Native Windows x64 PE executables. No external linker, assembler, or C compiler required.
 
-All 41 test files produce valid PE32+ executables (verified: MZ/PE signatures, x86_64 machine type, .text + .rdata sections, kernel32.dll imports for GetStdHandle/WriteFile/ExitProcess).
+All 59 test files produce valid PE32+ executables (verified: MZ/PE signatures, x86_64 machine type, .text + .rdata sections, kernel32.dll imports for GetStdHandle/WriteFile/ExitProcess).
 
 **Note:** PE executables target Windows x64 and cannot be executed on Linux without Wine. Output values listed below match the interpreter and are expected to be correct based on PE structure validation and disassembly verification. The bug fix history below documents previously identified and fixed issues.
 

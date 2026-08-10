@@ -1,0 +1,63 @@
+// Test: Comptime tensor shape verification — Phase 5C.3
+// Tests runtime shape assertions that will become comptime checks.
+
+use tensor;
+use shape;
+
+pf main() {
+    // ─── Create tensors with known shapes ────────────────────────────
+    pv data = Vec::new();
+    data.push(1);
+    data.push(2);
+    data.push(3);
+    data.push(4);
+    data.push(5);
+    data.push(6);
+
+    pv a = from_vec(data, shape_2x3);
+    print(to_str(a));
+    print("\n");
+
+    // ─── Assert ndim ─────────────────────────────────────────────────
+    assert_ndim(a, 2);
+    print("ndim assertion passed\n");
+
+    // ─── Assert size ─────────────────────────────────────────────────
+    assert_size(a, 6);
+    print("size assertion passed\n");
+
+    // ─── Assert same shape ───────────────────────────────────────────
+    pv b = ones(shape_2x3);
+    assert_same_shape(a, b, "add");
+    print("same shape assertion passed\n");
+
+    // ─── Assert matmul compatible ────────────────────────────────────
+    pv w_data = Vec::new();
+    w_data.push(1);
+    w_data.push(0);
+    w_data.push(0);
+    w_data.push(1);
+    w_data.push(0);
+    w_data.push(0);
+    pv w = from_vec(w_data, shape_3x2);
+    assert_matmul_compatible(a, w);
+    print("matmul compatible assertion passed\n");
+
+    // ─── Do the matmul (should succeed after assertion) ──────────────
+    pv c = matmul(a, w);
+    print(to_str(c));
+    print("\n");
+
+    // ─── Assert reshape ──────────────────────────────────────────────
+    assert_reshape(a, 6);
+    print("reshape assertion passed\n");
+
+    pv shape1x6 = Vec::new();
+    shape1x6.push(1);
+    shape1x6.push(6);
+    pv r = reshape(a, shape1x6);
+    print(to_str(r));
+    print("\n");
+
+    ret 0;
+}

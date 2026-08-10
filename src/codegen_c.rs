@@ -1118,6 +1118,42 @@ impl CCodeGen {
                 dispatch.push_str("    }\n");
                 self.out.push_str(&dispatch);
             }
+            Inst::MakeDyn { type_name, trait_name, .. } => {
+                wln!(self, "    /* make dyn {} as {} */", type_name, trait_name);
+                wln!(self, "    {} = 0; /* MakeDyn not yet supported in C codegen */", dst);
+            }
+            Inst::DynCall { trait_name, method, args, ret_ty, .. } => {
+                let arg_strs: Vec<String> = args.iter().map(|a| self.val_name(*a)).collect();
+                let void_ret = Self::c_ret_type(ret_ty) == "void";
+                let mut dispatch = format!("    /* dyncall {}::{} */\n", trait_name, method);
+                if !arg_strs.is_empty() {
+                    let type_arg = &arg_strs[0];
+                    let candidates: Vec<String> = self.user_functions.iter()
+                        .filter(|name| name.ends_with(&format!("_{}", method)))
+                        .cloned()
+                        .collect();
+                    dispatch.push_str(&format!("    {{ const char* _t = (const char*){};\n", type_arg));
+                    dispatch.push_str("    if (false) {}\n");
+                    for cname in &candidates {
+                        let type_name = cname.rsplitn(2, '_').nth(1).unwrap_or("");
+                        let call_args = arg_strs[1..].join(", ");
+                        if void_ret {
+                            dispatch.push_str(&format!(
+                                "    else if (strcmp(_t, \"{}\") == 0) {}({});\n",
+                                type_name, cname, call_args
+                            ));
+                        } else {
+                            dispatch.push_str(&format!(
+                                "    else if (strcmp(_t, \"{}\") == 0) {} = {}({});\n",
+                                type_name, dst, cname, call_args
+                            ));
+                        }
+                    }
+                    if !void_ret { dispatch.push_str("    else { abort(); }\n"); }
+                    dispatch.push_str("    }\n");
+                }
+                self.out.push_str(&dispatch);
+            }
             Inst::BitCast { value, from: _, to: _ } => {
                 let v = self.val_name(*value);
                 wln!(self, "    {} = (void*){};", dst, v);
@@ -1147,6 +1183,11 @@ impl CCodeGen {
             }
             Inst::Panic { message, .. } => {
                 wln!(self, "    fprintf(stderr, \"Panic: {}\\n\"); abort();", message);
+            }
+            Inst::Asm { template, .. } => {
+                // C backend: emit inline assembly using GCC __asm__ syntax
+                let escaped = template.replace("\\", "\\\\").replace("\"", "\\\"");
+                wln!(self, "    __asm__ volatile(\"{}\");", escaped);
             }
         }
     }

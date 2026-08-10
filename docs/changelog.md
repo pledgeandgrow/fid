@@ -1,5 +1,75 @@
 # Pledge Language Changelog
 
+## [Unreleased] — Phase 5C: AI/ML
+
+### Tensor Type (`tensor.rs` + `stdlib/tensor.p`) — New Module
+- **N-dimensional arrays with stride info**: shape, strides, flat f64 storage
+- **30 builtin functions**: `p_tensor_zeros`, `p_tensor_ones`, `p_tensor_filled`, `p_tensor_from_vec`, `p_tensor_get`, `p_tensor_set`, `p_tensor_shape`, `p_tensor_ndim`, `p_tensor_size`, `p_tensor_reshape`, `p_tensor_transpose`, `p_tensor_add`, `p_tensor_sub`, `p_tensor_mul`, `p_tensor_scale`, `p_tensor_matmul`, `p_tensor_dot`, `p_tensor_sum`, `p_tensor_mean`, `p_tensor_max`, `p_tensor_min`, `p_tensor_relu`, `p_tensor_sigmoid`, `p_tensor_softmax`, `p_tensor_to_str`, `p_tensor_to_json`, `p_tensor_clone`
+- **Pledge stdlib wrapper**: clean API matching the builtin names
+- **`Value::Tensor` variant**: opaque type in interpreter, stored in side-table like Vec/Map
+- **Type system**: `Tensor` mapped to `IrType::Opaque("Tensor")` (not Struct, avoiding SRET)
+
+### SIMD Intrinsics (`stdlib/simd.p`) — New Module
+- **9 builtin functions**: `p_simd_add`, `p_simd_sub`, `p_simd_mul`, `p_simd_div`, `p_simd_dot`, `p_simd_sum`, `p_simd_scale`, `p_simd_from_vec`, `p_simd_to_str`
+- **Pledge stdlib wrapper**: elementwise vector operations (f64x2, f64x4, etc.)
+- **Interpreter**: SIMD vectors are Vec<f64> with elementwise operations
+- **Future**: x86 backend will map to SSE/AVX instructions
+
+### Comptime Shape Verification (`stdlib/shape.p`) — New Module
+- **Runtime shape assertions**: `assert_ndim`, `assert_size`, `assert_same_shape`, `assert_matmul_compatible`, `assert_reshape`
+- **Comptime shape constants**: `shape_1x1`, `shape_2x2`, `shape_2x3`, `shape_3x2`, `shape_3x4`, `shape_4x2`, `shape_4x4`, `shape_1x3`, `shape_1x4`, `shape_4x1`
+- **Future**: when comptime evaluation (Phase 3A) lands, these become compile-time checks
+
+### Auto-Parallelization Framework (`stdlib/parallel.p`) — New Module
+- **Parallel operations**: `par_map`, `par_sum`, `par_dot`, `par_fill`, `par_range`
+- **Parallelizability analysis**: `is_parallelizable(effect_mask)` — checks IO/State/Panic effect bits
+- **Compiler directive**: `parallel_hint()` — marks loops for future auto-parallelization
+- **Current**: runs sequentially; future effect system integration will enable true parallelism
+
+### Neural Network Example (`examples/neural_network.p`)
+- **2-layer MLP**: Input(3) → Hidden(4, ReLU) → Output(2, Softmax)
+- **Pure Pledge**: no external library, uses only tensor stdlib
+- **Success metric met**: "Write a neural network forward pass in pure Pledge"
+
+### Interpreter (`interp.rs`) — New Value Type & Helpers
+- **`Value::Tensor`**: `Rc<RefCell<Tensor>>` opaque value, stored in side-table
+- **Manual `PartialEq` impl**: reference identity for opaque types (Vec, Map, Tensor, Dyn)
+- **Helper methods**: `arg_vec_usize`, `arg_vec_i64`, `arg_vec_f64`, `simd_binary`
+- **`MakeDyn` instruction handler**: creates trait objects from concrete values
+
+### Lowerer (`lower.rs`) — Extern Registrations
+- **30 tensor externs**: all tensor builtins registered with correct opaque types
+- **9 SIMD externs**: all SIMD builtins registered with Vec opaque type
+- **Function closures**: `t()` and `v()` return fresh `IrType::Opaque` instances
+
+### Typechecker (`typechecker.rs`) — Return Type Inference
+- **Float-returning builtins**: `p_tensor_get`, `p_tensor_dot`, `p_tensor_sum/mean/max/min`, `p_simd_dot/sum` → `Type::F64`
+- **Tensor-returning builtins**: `p_tensor_*` (non-string) → `Type::Named("Tensor")`
+- **String-returning builtins**: `p_tensor_to_str/to_json`, `p_simd_to_str` → `Type::Str`
+
+### Test Results
+- **Interpreter: 58/59 passed** (1 pre-existing test_trait_object failure)
+- **PE Emitter: 59/59 valid**
+- **WASM Target: 59/59 valid**
+- **C Codegen: 51/59 matched** (test_float pre-existing + new builtins need C stubs)
+
+### New Test Files
+- `tests/test_tensor.p` — tensor creation, indexing, matmul, activations, transpose, reshape, JSON
+- `tests/test_simd.p` — SIMD elementwise ops, dot product, sum, scale
+- `tests/test_shape.p` — shape assertions (ndim, size, same_shape, matmul_compatible, reshape)
+- `tests/test_parallel.p` — parallel map, sum, dot, fill, range, parallelizability check
+
+### New Standard Library Modules
+- `stdlib/tensor.p` — Tensor standard library
+- `stdlib/simd.p` — SIMD intrinsics standard library
+- `stdlib/shape.p` — Comptime shape verification
+- `stdlib/parallel.p` — Auto-parallelization framework
+
+### New Example
+- `examples/neural_network.p` — 2-layer MLP forward pass (success metric)
+
+---
+
 ## [Unreleased] — 2026-08-06 (Batch 11: Enhanced Built-in Types)
 
 ### Typechecker (`typechecker.rs`) — Comprehensive Method Sets

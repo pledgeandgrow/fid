@@ -1,0 +1,81 @@
+// Pledge HTTP server standard library — Phase 5D.3
+//
+// HTTP server for the "Web & Cloud" platform milestone.
+//
+// Design: Socket primitives are implemented as native builtins (p_socket_*).
+// HTTP request parsing and response writing are implemented in Pledge.
+// This is a blocking, single-threaded server — effect handlers (Phase 2B)
+// will replace the blocking calls with non-blocking I/O later.
+//
+// Builtins (implemented in interp.rs):
+//   p_socket_listen(port: i64) -> i64       — create listening socket, return fd
+//   p_socket_accept(fd: i64) -> i64         — accept connection, return client fd
+//   p_socket_read(fd: i64, buf: str, n: i64) -> str  — read up to n bytes
+//   p_socket_write(fd: i64, data: str) -> i64       — write data, return bytes written
+//   p_socket_close(fd: i64) -> void         — close socket
+//   p_socket_recv_str(fd: i64) -> str       — read until \r\n\r\n (HTTP headers)
+
+module http;
+
+/// HTTP request structure (parsed from raw HTTP request text).
+/// Fields are accessed via builtin functions since Pledge doesn't yet
+/// support string fields in structs (strings are opaque handles).
+//
+// We represent the request as a JSON string for easy field access:
+// {"method":"GET","path":"/","headers":{...},"body":"..."}
+
+/// Parse an HTTP request from raw text. Returns a JSON string with
+/// method, path, headers, and body fields.
+pub pf parse_request(raw: str) -> str {
+    p_http_parse_request(raw)
+}
+
+/// Build an HTTP response string from status, content-type, and body.
+pub pf build_response(status: i64, content_type: str, body: str) -> str {
+    p_http_build_response(status, content_type, body)
+}
+
+/// Start an HTTP server on the given port. The handler function is called
+/// for each connection with the raw request text. The handler returns
+/// the response text to send back.
+/// This is a blocking call — it runs forever until the process is killed.
+pub pf serve(port: i64) -> void {
+    pv fd = p_socket_listen(port);
+    if fd < 0 {
+        print("Failed to listen on port\n");
+        ret;
+    }
+    print("Server listening on port ");
+    print(port);
+    print("\n");
+    while true {
+        pv client = p_socket_accept(fd);
+        if client < 0 {
+            ret;
+        }
+        pv raw = p_socket_recv_str(client);
+        pv response = handle_request(raw);
+        p_socket_write(client, response);
+        p_socket_close(client);
+    }
+}
+
+/// Default request handler — echoes the request path.
+/// Override this in your program by defining your own `handle_request`.
+pub pf handle_request(raw: str) -> str {
+    pv req = parse_request(raw);
+    pv path = json_get(req, "path");
+    pv body = p_str_concat(p_str_concat("Hello from Pledge! Path: ", path), "\n");
+    build_response(200, "text/plain", body)
+}
+
+/// HTTP status codes as strings.
+pub pf status_text(code: i64) -> str {
+    if code == 200 { ret "OK"; }
+    if code == 201 { ret "Created"; }
+    if code == 204 { ret "No Content"; }
+    if code == 400 { ret "Bad Request"; }
+    if code == 404 { ret "Not Found"; }
+    if code == 500 { ret "Internal Server Error"; }
+    ret "Unknown"
+}

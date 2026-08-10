@@ -60,6 +60,8 @@ fn mangle_type(ty: &Type) -> String {
             let p: Vec<String> = params.iter().map(mangle_type).collect();
             format!("fn_{}_{}", p.join("_"), mangle_type(ret))
         }
+        Type::Assoc(_, trait_name, name) => format!("assoc_{}_{}", trait_name, name),
+        Type::Dyn(name) => format!("dyn_{}", name),
     }
 }
 
@@ -91,6 +93,46 @@ fn subst_type(ty: &Type, subst: &Subst) -> Type {
         Type::Func { params, ret } => Type::Func {
             params: params.iter().map(|t| subst_type(t, subst)).collect(),
             ret: Box::new(subst_type(ret, subst)),
+        },
+        _ => ty.clone(),
+    }
+}
+
+/// Resolve `Type::Assoc` in a type using the substitution and trait impl bindings.
+fn resolve_assoc_types(ty: &Type, subst: &Subst, bindings: &HashMap<(String, String), HashMap<String, Type>>) -> Type {
+    match ty {
+        Type::Assoc(type_param, trait_name, assoc_name) => {
+            if let Some(concrete) = subst.get(type_param) {
+                let concrete_name = match concrete {
+                    Type::Named(n) => n.clone(),
+                    _ => return Type::I64,
+                };
+                if let Some(assoc_map) = bindings.get(&(trait_name.clone(), concrete_name)) {
+                    if let Some(resolved) = assoc_map.get(assoc_name) {
+                        return resolved.clone();
+                    }
+                }
+            }
+            Type::I64
+        }
+        Type::Array { elem, size } => Type::Array {
+            elem: Box::new(resolve_assoc_types(elem, subst, bindings)),
+            size: *size,
+        },
+        Type::Ref { inner, is_mut } => Type::Ref {
+            inner: Box::new(resolve_assoc_types(inner, subst, bindings)),
+            is_mut: *is_mut,
+        },
+        Type::Generic { name, args } => Type::Generic {
+            name: name.clone(),
+            args: args.iter().map(|a| resolve_assoc_types(a, subst, bindings)).collect(),
+        },
+        Type::Tuple(types) => Type::Tuple(
+            types.iter().map(|t| resolve_assoc_types(t, subst, bindings)).collect()
+        ),
+        Type::Func { params, ret } => Type::Func {
+            params: params.iter().map(|t| resolve_assoc_types(t, subst, bindings)).collect(),
+            ret: Box::new(resolve_assoc_types(ret, subst, bindings)),
         },
         _ => ty.clone(),
     }
@@ -197,6 +239,19 @@ fn subst_expr(expr: &Expr, subst: &Subst, renames: &HashMap<String, String>, met
             expr: Box::new(subst_expr(expr, subst, renames, method_renames)),
             target_ty: subst_type(target_ty, subst),
         },
+        Expr::Asm { template, operands } => {
+            let new_operands: Vec<crate::ast::AsmOperand> = operands.iter()
+                .map(|op| crate::ast::AsmOperand {
+                    direction: op.direction.clone(),
+                    reg: op.reg.clone(),
+                    expr: subst_expr(&op.expr, subst, renames, method_renames),
+                })
+                .collect();
+            Expr::Asm {
+                template: template.clone(),
+                operands: new_operands,
+            }
+        },
         Expr::Ref { expr, is_mut } => Expr::Ref {
             expr: Box::new(subst_expr(expr, subst, renames, method_renames)),
             is_mut: *is_mut,
@@ -216,6 +271,7 @@ fn subst_expr(expr: &Expr, subst: &Subst, renames: &HashMap<String, String>, met
             variant: variant.clone(),
             args: args.iter().map(|a| subst_expr(a, subst, renames, method_renames)).collect(),
         },
+        Expr::Asm { .. } => expr.clone(),
     }
 }
 
@@ -353,6 +409,8 @@ struct MonoCtx {
     instantiated: Vec<Func>,
     /// Track which instantiations we've already done
     seen: HashSet<String>,
+    /// Trait impl associated type bindings: (trait_name, type_name) -> {assoc_name -> concrete_type}
+    trait_assoc_bindings: HashMap<(String, String), HashMap<String, Type>>,
 }
 
 /// Main monomorphization entry point
@@ -374,7 +432,17 @@ pub fn monomorphize(program: &Program) -> Program {
         generic_methods: HashMap::new(),
         instantiated: Vec::new(),
         seen: HashSet::new(),
+        trait_assoc_bindings: HashMap::new(),
     };
+
+    // Register trait impl associated type bindings
+    for ti in &program.trait_impls {
+        if !ti.associated_types.is_empty() {
+            let key = (ti.trait_name.clone(), ti.type_name.clone());
+            let bindings: HashMap<String, Type> = ti.associated_types.iter().cloned().collect();
+            ctx.trait_assoc_bindings.insert(key, bindings);
+        }
+    }
 
     // Register generic impl methods BEFORE processing any functions
     for imp in &program.impls {
@@ -442,6 +510,7 @@ pub fn monomorphize(program: &Program) -> Program {
             type_name: ti.type_name.clone(),
             type_params: Vec::new(),
             methods: new_methods,
+            associated_types: ti.associated_types.clone(),
         });
     }
 
@@ -549,19 +618,22 @@ fn process_func(func: &Func, ctx: &mut MonoCtx) -> Func {
         ret_ty: func.ret_ty.clone(),
         body: new_body,
         is_pub: func.is_pub,
+        is_comptime: false,
     }
 }
 
 /// Instantiate a generic function with a concrete substitution.
 /// Recursively processes the instantiated body to handle nested generic calls.
 fn instantiate(gen_func: &Func, subst: &Subst, mangled_name: &str, ctx: &mut MonoCtx) -> Func {
-    // Apply substitution to params
-    let new_params: Vec<Param> = gen_func.params.iter().map(|p| Param {
-        name: p.name.clone(),
-        ty: subst_type(&p.ty, subst),
+    // Apply substitution to params, then resolve associated types
+    let new_params: Vec<Param> = gen_func.params.iter().map(|p| {
+        let substituted = subst_type(&p.ty, subst);
+        let resolved = resolve_assoc_types(&substituted, subst, &ctx.trait_assoc_bindings);
+        Param { name: p.name.clone(), ty: resolved }
     }).collect();
 
-    let new_ret_ty = subst_type(&gen_func.ret_ty, subst);
+    let substituted_ret = subst_type(&gen_func.ret_ty, subst);
+    let new_ret_ty = resolve_assoc_types(&substituted_ret, subst, &ctx.trait_assoc_bindings);
 
     // First, apply the type substitution to the body
     let subst_body: Vec<Stmt> = gen_func.body.iter()
@@ -577,6 +649,7 @@ fn instantiate(gen_func: &Func, subst: &Subst, mangled_name: &str, ctx: &mut Mon
         ret_ty: new_ret_ty.clone(),
         body: subst_body,
         is_pub: gen_func.is_pub,
+        is_comptime: false,
     };
 
     // Now process this concrete function — it may contain calls to other generics
@@ -798,6 +871,11 @@ fn collect_generic_calls_expr_with_hint(
         Expr::Cast { expr, .. } => {
             collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, None);
         }
+        Expr::Asm { operands, .. } => {
+            for op in operands {
+                collect_generic_calls_expr_with_hint(&op.expr, generics, generic_methods, calls, method_calls, current_func, None);
+            }
+        }
         Expr::Ref { expr, .. } | Expr::Deref { expr } => {
             collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, None);
         }
@@ -885,6 +963,10 @@ fn infer_expr_type(expr: &Expr, func: &Func) -> Type {
             Type::Named(name.clone())
         }
         Expr::Cast { target_ty, .. } => target_ty.clone(),
+        Expr::Asm { operands, .. } => {
+            let has_out = operands.iter().any(|op| op.direction == crate::ast::AsmDir::Out);
+            if has_out { Type::I64 } else { Type::Void }
+        }
         Expr::Binary { op, left, right } => {
             match op {
                 BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => Type::Bool,

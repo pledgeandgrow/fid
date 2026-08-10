@@ -515,6 +515,20 @@ pub enum Inst {
         effects: EffectSet,
         has_env: bool,
     },
+    /// Dynamic dispatch: call a method on a trait object.
+    DynCall {
+        trait_name: String,
+        method: String,
+        args: Vec<ValueId>,
+        ret_ty: IrType,
+        effects: EffectSet,
+    },
+    /// Create a trait object from a concrete value.
+    MakeDyn {
+        value: ValueId,
+        type_name: String,
+        trait_name: String,
+    },
 
     // ─── Conversions ───
     /// Cast between types of the same size (bitcast)
@@ -569,6 +583,18 @@ pub enum Inst {
     Panic {
         message: String,
     },
+
+    /// Inline assembly — Phase 5A.1
+    /// template is the assembly template string
+    /// inputs are (register, value) pairs for input operands
+    /// outputs are (register, value_id) pairs for output operands (stored after execution)
+    /// ret_ty is the type of the result (Void if no outputs, I64 for single output)
+    Asm {
+        template: String,
+        inputs: Vec<(String, ValueId)>,
+        outputs: Vec<(String, ValueId)>,
+        ret_ty: IrType,
+    },
 }
 
 impl Inst {
@@ -593,6 +619,8 @@ impl Inst {
             Inst::Unreachable => IrType::Void,
             Inst::Call { ret_ty, .. } => ret_ty.clone(),
             Inst::CallPtr { ret_ty, .. } => ret_ty.clone(),
+            Inst::DynCall { ret_ty, .. } => ret_ty.clone(),
+            Inst::MakeDyn { .. } => IrType::Opaque("dyn".to_string()),
             Inst::BitCast { to, .. } => to.clone(),
             Inst::IntExtend { to, .. } => to.clone(),
             Inst::IntTrunc { to, .. } => to.clone(),
@@ -601,6 +629,7 @@ impl Inst {
             Inst::TryUnwrap { .. } => IrType::Void,
             Inst::Print { .. } => IrType::Void,
             Inst::Panic { .. } => IrType::Never,
+            Inst::Asm { ret_ty, .. } => ret_ty.clone(),
         }
     }
 
@@ -613,11 +642,17 @@ impl Inst {
             Inst::Store { .. } => effects.add(Effect::Write),
             Inst::Call { effects: e, .. } => effects.add_all(e),
             Inst::CallPtr { effects: e, .. } => effects.add_all(e),
+            Inst::DynCall { effects: e, .. } => effects.add_all(e),
+            Inst::MakeDyn { .. } => {}
             Inst::Print { .. } => {
                 effects.add(Effect::IO);
                 effects.add(Effect::Read);
             },
             Inst::Panic { .. } => effects.add(Effect::Diverge),
+            Inst::Asm { .. } => {
+                effects.add(Effect::Read);
+                effects.add(Effect::Write);
+            },
             Inst::TryUnwrap { .. } => effects.add(Effect::Read),
             Inst::Unreachable => effects.add(Effect::Diverge),
             _ => {}
@@ -646,6 +681,8 @@ impl Inst {
             Inst::Unreachable => "Unreachable",
             Inst::Call { .. } => "Call",
             Inst::CallPtr { .. } => "CallPtr",
+            Inst::DynCall { .. } => "DynCall",
+            Inst::MakeDyn { .. } => "MakeDyn",
             Inst::BitCast { .. } => "BitCast",
             Inst::IntExtend { .. } => "IntExtend",
             Inst::IntTrunc { .. } => "IntTrunc",
@@ -654,6 +691,7 @@ impl Inst {
             Inst::TryUnwrap { .. } => "TryUnwrap",
             Inst::Print { .. } => "Print",
             Inst::Panic { .. } => "Panic",
+            Inst::Asm { .. } => "Asm",
         }
     }
 
@@ -697,6 +735,8 @@ impl Inst {
                 refs.extend(args);
                 refs
             }
+            Inst::DynCall { args, .. } => args.clone(),
+            Inst::MakeDyn { value, .. } => vec![*value],
             Inst::BitCast { value, .. } => vec![*value],
             Inst::IntExtend { value, .. } => vec![*value],
             Inst::IntTrunc { value, .. } => vec![*value],
@@ -704,6 +744,11 @@ impl Inst {
             Inst::FloatToInt { value, .. } => vec![*value],
             Inst::TryUnwrap { value, .. } => vec![*value],
             Inst::Print { value, .. } => vec![*value],
+            Inst::Asm { inputs, outputs, .. } => {
+                let mut refs: Vec<ValueId> = inputs.iter().map(|(_, v)| *v).collect();
+                refs.extend(outputs.iter().map(|(_, v)| *v));
+                refs
+            }
         }
     }
 }
@@ -1044,7 +1089,14 @@ pub fn lower_type(ast_ty: &AstType) -> IrType {
         AstType::Str => IrType::Ptr(Box::new(IrType::U8)), // str -> *u8 (simplified)
         AstType::Void => IrType::Void,
         AstType::Never => IrType::Void,
-        AstType::Named(name) => IrType::Struct(name.clone()),
+        AstType::Named(name) => {
+            // Vec, HashMap, and Tensor are opaque types (not structs)
+            if name == "Vec" || name == "HashMap" || name == "Tensor" {
+                IrType::Opaque(name.clone())
+            } else {
+                IrType::Struct(name.clone())
+            }
+        }
         AstType::Array { elem, size } => {
             IrType::Array(Box::new(lower_type(elem)), *size)
         }
@@ -1060,6 +1112,12 @@ pub fn lower_type(ast_ty: &AstType) -> IrType {
         }
         AstType::Func { .. } => {
             IrType::Opaque("func".to_string())
+        }
+        AstType::Assoc(_, _, _) => {
+            IrType::I64
+        }
+        AstType::Dyn(name) => {
+            IrType::Opaque(format!("dyn:{}", name))
         }
     }
 }

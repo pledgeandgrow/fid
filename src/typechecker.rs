@@ -15,6 +15,10 @@ pub struct TypeChecker {
     current_type_param_bounds: HashMap<String, String>,
     /// Trait definitions: trait_name -> {method_name -> (params, ret_ty, has_self)}
     traits: HashMap<String, HashMap<String, (Vec<Type>, Type, bool)>>,
+    /// Trait associated type declarations: trait_name -> {assoc_type_name}
+    trait_assoc_types: HashMap<String, HashSet<String>>,
+    /// Trait impl associated type bindings: (trait_name, type_name) -> {assoc_name -> concrete_type}
+    trait_impl_assoc_bindings: HashMap<(String, String), HashMap<String, Type>>,
     /// Track which module each item belongs to ("func_name" → "core")
     item_modules: HashMap<String, String>,
     /// Track visibility of each item ("func_name" → true if pub)
@@ -44,6 +48,8 @@ impl TypeChecker {
             current_type_params: HashSet::new(),
             current_type_param_bounds: HashMap::new(),
             traits: HashMap::new(),
+            trait_assoc_types: HashMap::new(),
+            trait_impl_assoc_bindings: HashMap::new(),
             item_modules: HashMap::new(),
             item_visibility: HashMap::new(),
             current_module: String::new(),
@@ -141,6 +147,81 @@ impl TypeChecker {
                 method_map.insert(method.name.clone(), (param_types, self.resolve_type(&method.ret_ty), method.has_self));
             }
             self.traits.insert(trait_def.name.clone(), method_map);
+            // Register associated type declarations
+            let assoc_set: HashSet<String> = trait_def.associated_types.iter().cloned().collect();
+            self.trait_assoc_types.insert(trait_def.name.clone(), assoc_set);
+        }
+    }
+
+    /// Register trait impl methods from a program (e.g. the merged program
+    /// that includes default trait methods filled in by the compiler).
+    /// This is called after all modules are registered to ensure default
+    /// trait methods are visible to the typechecker.
+    pub fn register_trait_impls(&mut self, program: &Program) {
+        for ti in &program.trait_impls {
+            let type_name = ti.type_name.clone();
+            let mut new_methods: Vec<(String, Vec<Type>, Type, bool, bool)> = Vec::new();
+            for method in &ti.methods {
+                let param_types: Vec<Type> = method.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
+                let has_self = method.params.first().map_or(false, |p| p.name == "self");
+                new_methods.push((method.name.clone(), param_types, self.resolve_type(&method.ret_ty), has_self, method.is_pub));
+            }
+            let method_map = self.methods.entry(type_name).or_insert_with(HashMap::new);
+            for (name, param_types, ret_ty, has_self, is_pub) in new_methods {
+                method_map.insert(name, (param_types, ret_ty, has_self, is_pub));
+            }
+            // Register associated type bindings from the trait impl
+            let key = (ti.trait_name.clone(), ti.type_name.clone());
+            let bindings: HashMap<String, Type> = ti.associated_types.iter().cloned().collect();
+            if !bindings.is_empty() {
+                self.trait_impl_assoc_bindings.insert(key, bindings);
+            }
+        }
+    }
+
+    /// Phase 3B.4: Verify that trait impls match their trait definitions.
+    pub fn verify_trait_impls(&mut self, program: &Program) {
+        let trait_defs: HashMap<String, &TraitDef> = program.traits.iter()
+            .map(|t| (t.name.clone(), t))
+            .collect();
+
+        for ti in &program.trait_impls {
+            let trait_def = match trait_defs.get(&ti.trait_name) {
+                Some(t) => *t,
+                None => {
+                    self.errors.push(format!(
+                        "Type error: trait '{}' is not defined (in impl for {})",
+                        ti.trait_name, ti.type_name
+                    ));
+                    continue;
+                }
+            };
+
+            let implemented: HashSet<String> = ti.methods.iter()
+                .map(|m| m.name.clone())
+                .collect();
+
+            for tm in &trait_def.methods {
+                if !implemented.contains(&tm.name) && tm.default_body.is_none() {
+                    self.errors.push(format!(
+                        "Type error: impl {} for {} is missing method '{}'",
+                        ti.trait_name, ti.type_name, tm.name
+                    ));
+                }
+            }
+
+            // Check that all declared associated types are provided
+            let provided_assoc: HashSet<String> = ti.associated_types.iter()
+                .map(|(name, _)| name.clone())
+                .collect();
+            for assoc_name in &trait_def.associated_types {
+                if !provided_assoc.contains(assoc_name) {
+                    self.errors.push(format!(
+                        "Type error: impl {} for {} is missing associated type '{}'",
+                        ti.trait_name, ti.type_name, assoc_name
+                    ));
+                }
+            }
         }
     }
 
@@ -731,9 +812,23 @@ impl TypeChecker {
                 }
             }
             Expr::Call { callee, args } => {
+                // Check capabilities for built-in functions that produce effects
+                match callee.as_str() {
+                    "print" | "println" | "print_int" | "print_float" | "print_str" => {
+                        self.check_capability("IO", &format!("{}()", callee));
+                    }
+                    "read_file" | "write_file" | "file_open" | "file_read" | "file_write" => {
+                        self.check_capability("FS", &format!("{}()", callee));
+                    }
+                    "http_get" | "http_post" | "socket_connect" | "socket_send" | "socket_recv" => {
+                        self.check_capability("Net", &format!("{}()", callee));
+                    }
+                    "spawn" | "exec" | "system" => {
+                        self.check_capability("Spawn", &format!("{}()", callee));
+                    }
+                    _ => {}
+                }
                 if callee == "print" {
-                    // print requires IO capability
-                    self.check_capability("IO", "print()");
                     for arg in args {
                         self.check_expr(arg);
                     }
@@ -782,6 +877,12 @@ impl TypeChecker {
                         }
                         return (**ret).clone();
                     }
+                }
+
+                // Check for runtime builtin functions (p_*)
+                if callee.starts_with("p_") {
+                    // Builtins are variadic — return I64 as a safe default
+                    return Type::I64;
                 }
 
                 self.errors
@@ -1032,6 +1133,27 @@ impl TypeChecker {
                     }
                 }
 
+                // Check if receiver is a trait object (dyn Trait)
+                if let Type::Dyn(trait_name) = &recv_ty {
+                    if let Some(trait_methods) = self.traits.get(trait_name) {
+                        if let Some((params, ret, has_self)) = trait_methods.get(method) {
+                            let expected_args = if *has_self { if params.is_empty() { 0 } else { params.len() - 1 } } else { params.len() };
+                            if expected_args != arg_types.len() {
+                                self.errors.push(format!(
+                                    "Type error: method '{}.{}' expects {} args, got {}",
+                                    trait_name, method, expected_args, arg_types.len()
+                                ));
+                            }
+                            return ret.clone();
+                        }
+                    }
+                    self.errors.push(format!(
+                        "Type error: no method '{}' on trait '{}'",
+                        method, trait_name
+                    ));
+                    return Type::Never;
+                }
+
                 if let Type::Named(struct_name) = &recv_ty {
                     if let Some(method_map) = self.methods.get(struct_name) {
                         if let Some((params, ret, has_self, is_pub)) = method_map.get(method) {
@@ -1256,6 +1378,28 @@ impl TypeChecker {
                 self.check_expr(expr);
                 self.resolve_type(target_ty)
             }
+            Expr::Asm { template: _, operands } => {
+                // Type-check each operand expression
+                let mut has_out = false;
+                for op in operands {
+                    match op.direction {
+                        crate::ast::AsmDir::In => {
+                            self.check_expr(&op.expr);
+                        }
+                        crate::ast::AsmDir::Out => {
+                            // out operands are lvalues — check the expression
+                            self.check_expr(&op.expr);
+                            has_out = true;
+                        }
+                    }
+                }
+                // asm! returns void if no outputs, i64 if there's an output
+                if has_out {
+                    Type::I64
+                } else {
+                    Type::Void
+                }
+            }
         }
     }
 
@@ -1269,6 +1413,24 @@ impl TypeChecker {
                 }
             }
             other => other.clone(),
+        }
+    }
+
+    /// Substitute associated type names in a type with `Type::Assoc`.
+    fn resolve_assoc_in_type(&self, ty: &Type, type_param: &str, trait_name: &str) -> Type {
+        match ty {
+            Type::Named(name) => {
+                if let Some(assoc_types) = self.trait_assoc_types.get(trait_name) {
+                    if assoc_types.contains(name) {
+                        return Type::Assoc(type_param.to_string(), trait_name.to_string(), name.clone());
+                    }
+                }
+                ty.clone()
+            }
+            Type::Assoc(_, _, name) => {
+                Type::Assoc(type_param.to_string(), trait_name.to_string(), name.clone())
+            }
+            _ => ty.clone(),
         }
     }
 
@@ -1375,6 +1537,16 @@ impl TypeChecker {
         if actual == Type::Never {
             return true;
         }
+        // Associated types are compatible with anything (resolved during mono)
+        if matches!(declared, Type::Assoc(_, _, _)) || matches!(actual, Type::Assoc(_, _, _)) {
+            return true;
+        }
+        // Trait objects (dyn Trait) are compatible with any concrete type
+        // that implements the trait (checked at the cast site)
+        if matches!(declared, Type::Dyn(_)) || matches!(actual, Type::Dyn(_)) {
+            return true;
+        }
+        // Trait objects (dyn Trait) are compatible with their concrete types
         // Type parameters are compatible with anything
         if let Type::Named(name) = &declared {
             if self.current_type_params.contains(name) {

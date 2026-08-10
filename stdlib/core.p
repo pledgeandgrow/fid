@@ -53,8 +53,7 @@ impl Option {
         match self {
             Option::Some(v: i64) => { ret v; }
             Option::None => {
-                print("panic: called unwrap on None\n");
-                ret 0;
+                p_panic("called unwrap on None");
             }
         }
     }
@@ -101,8 +100,7 @@ impl Result {
         match self {
             Result::Ok(v: i64) => { ret v; }
             Result::Err(e: i64) => {
-                print("panic: called unwrap on Err\n");
-                ret 0;
+                p_panic("called unwrap on Err");
             }
         }
     }

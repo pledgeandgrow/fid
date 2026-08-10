@@ -30,6 +30,7 @@ pub enum TokenKind {
     Try,         // try
     In,          // in
     As,          // as
+    Dyn,         // dyn — trait object
     Where,       // where
     Region,      // region
     For,         // for
@@ -162,6 +163,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Try => write!(f, "try"),
             TokenKind::In => write!(f, "in"),
             TokenKind::As => write!(f, "as"),
+            TokenKind::Dyn => write!(f, "dyn"),
             TokenKind::Where => write!(f, "where"),
             TokenKind::Region => write!(f, "region"),
             TokenKind::For => write!(f, "for"),

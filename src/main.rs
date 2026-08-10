@@ -2,8 +2,10 @@ mod ast;
 mod codegen;
 mod codegen_c;
 mod compiler;
+mod comptime;
 mod interp;
 mod ir;
+mod json;
 mod lower;
 mod mono;
 mod lexer;
@@ -11,6 +13,10 @@ mod parser;
 mod token;
 mod typechecker;
 mod pe;
+mod pir;
+mod opt;
+mod tensor;
+mod wasm;
 mod x86;
 
 use std::env;
@@ -282,6 +288,7 @@ fn main() {
             }
             let input = &args[2];
             let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
+            let release = args.iter().any(|a| a == "--release");
             let source = match fs::read_to_string(input) {
                 Ok(s) => s,
                 Err(e) => {
@@ -290,7 +297,7 @@ fn main() {
                 }
             };
 
-            match compiler::interpret_source_with_path(&source, input, verbose) {
+            match compiler::interpret_source_with_path_release(&source, input, verbose, release) {
                 Ok(result) => {
                     match result {
                         RunResult::Return(val) => {
@@ -669,6 +676,119 @@ fn main() {
             }
         }
 
+        "pir" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pledgec pir <file.p> [1|2|3|all] [--opt]");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+            let level_arg = args.get(3).map(|s| s.as_str()).unwrap_or("2");
+            let do_opt = args.iter().any(|a| a == "--opt");
+
+            let module = match compiler::lower_to_ir_module(&source) {
+                Ok(m) => m,
+                Err(errors) => {
+                    for e in errors {
+                        eprintln!("{}", e);
+                    }
+                    process::exit(1);
+                }
+            };
+
+            let level = pir::PirLevel::parse(level_arg).unwrap_or(pir::PirLevel::L2);
+            match level {
+                pir::PirLevel::L1 => {
+                    let l1 = pir::lower_ir_to_l1(&module);
+                    print!("{}", pir::format_l1(&l1));
+                }
+                pir::PirLevel::L2 => {
+                    let l1 = pir::lower_ir_to_l1(&module);
+                    let mut l2 = pir::lower_l1_to_l2(&l1);
+                    if do_opt {
+                        let stats = opt::optimize_l2(&mut l2);
+                        eprintln!(";; optimization stats: {:?}", stats);
+                    }
+                    print!("{}", pir::format_l2(&l2));
+                }
+                pir::PirLevel::L3 => {
+                    let l1 = pir::lower_ir_to_l1(&module);
+                    let l2 = pir::lower_l1_to_l2(&l1);
+                    let l3 = pir::lower_l2_to_l3(&l2, &module);
+                    print!("{}", pir::format_l3(&l3));
+                }
+                pir::PirLevel::All => {
+                    if do_opt {
+                        eprintln!(";; note: --opt applies to L2 only; showing all levels with L2 optimized");
+                        let l1 = pir::lower_ir_to_l1(&module);
+                        let mut l2 = pir::lower_l1_to_l2(&l1);
+                        let stats = opt::optimize_l2(&mut l2);
+                        eprintln!(";; optimization stats: {:?}", stats);
+                        let l3 = pir::lower_l2_to_l3(&l2, &module);
+                        print!("{}", pir::format_l1(&l1));
+                        print!("\n");
+                        print!("{}", pir::format_l2(&l2));
+                        print!("\n");
+                        print!("{}", pir::format_l3(&l3));
+                    } else {
+                        print!("{}", pir::generate_pir(&module, pir::PirLevel::All));
+                    }
+                }
+            }
+        }
+
+        "opt" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pledgec opt <file.p> [pass1,pass2,...]");
+                eprintln!("       passes: const-fold, cse, dce, inline, unroll, tco");
+                eprintln!("       default: all passes to fixed point");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+            let module = match compiler::lower_to_ir_module(&source) {
+                Ok(m) => m,
+                Err(errors) => {
+                    for e in errors {
+                        eprintln!("{}", e);
+                    }
+                    process::exit(1);
+                }
+            };
+
+            let l1 = pir::lower_ir_to_l1(&module);
+            let mut l2 = pir::lower_l1_to_l2(&l1);
+
+            let stats = if let Some(pass_arg) = args.get(3) {
+                let passes: Vec<opt::Pass> = pass_arg
+                    .split(',')
+                    .filter_map(|s| opt::Pass::parse(s.trim()))
+                    .collect();
+                if passes.is_empty() {
+                    opt::optimize_l2(&mut l2)
+                } else {
+                    opt::optimize_l2_with(&mut l2, &passes, 8)
+                }
+            } else {
+                opt::optimize_l2(&mut l2)
+            };
+
+            print!("{}", pir::format_l2(&l2));
+            eprintln!(";; optimization stats: {:?}", stats);
+        }
+
         _ => {
             print_usage();
             process::exit(1);
@@ -687,6 +807,8 @@ fn print_usage() {
     eprintln!("  pledgec compile <file.p> [-o output.s]    Compile to ARM64 assembly (legacy)");
     eprintln!("  pledgec run     <file.p> [-v]             Interpret Pledge IR (execute)");
     eprintln!("  pledgec ir      <file.p>                  Show Pledge IR");
+    eprintln!("  pledgec pir     <file.p> [1|2|3] [--opt]  Show PIR (Level 1/2/3, optional optimize)");
+    eprintln!("  pledgec opt     <file.p> [passes]         Optimize PIR L2 and show result");
     eprintln!("  pledgec tokens  <file.p>                  Show tokens");
     eprintln!("  pledgec ast     <file.p>                  Show AST");
     eprintln!("  pledgec version                           Show version");

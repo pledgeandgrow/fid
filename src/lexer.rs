@@ -114,6 +114,7 @@ impl Lexer {
             "try" => TokenKind::Try,
             "in" => TokenKind::In,
             "as" => TokenKind::As,
+            "dyn" => TokenKind::Dyn,
             "where" => TokenKind::Where,
             "region" => TokenKind::Region,
             "for" => TokenKind::For,

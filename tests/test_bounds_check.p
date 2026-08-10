@@ -1,0 +1,33 @@
+// Bounds checking — valid access works correctly (Phase 2D)
+
+pf main() {
+    // Vec bounds — valid access
+    pv v = Vec::new();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    println(v[0]);  // 10
+    println(v[1]);  // 20
+    println(v[2]);  // 30
+
+    // Vec set — valid index
+    v[1] = 99;
+    println(v[1]);  // 99
+
+    // Vec first/last
+    println(v.first());  // 10
+    println(v.last());   // 30
+
+    // Vec len boundary
+    pv n = v.len();
+    println(n);  // 3
+
+    // Array bounds — valid access
+    pv arr = [1, 2, 3, 4, 5];
+    println(arr[0]);  // 1
+    println(arr[4]);  // 5
+
+    // Array set — valid index
+    arr[2] = 42;
+    println(arr[2]);  // 42
+}

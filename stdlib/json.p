@@ -1,0 +1,77 @@
+// Pledge JSON standard library — Phase 5D.2
+//
+// JSON support for the "Web & Cloud" platform milestone.
+//
+// Design: JSON values are represented as strings (the serialized form) and
+// manipulated via builtin functions implemented natively in the compiler.
+// This avoids needing a recursive enum type in Pledge's current type system
+// (which doesn't yet support self-referential generics). When comptime
+// reflection (Phase 3A) lands, this will be replaced with a proper `Json`
+// ADT and comptime-derived serialization.
+//
+// Builtins (implemented in interp.rs / codegen_c.rs / pe.rs):
+//   p_json_parse(s: str) -> str      — parse JSON, return canonical form
+//   p_json_dump(s: str) -> str       — alias for parse (canonicalize)
+//   p_json_get(s: str, key: str) -> str   — extract object field as string
+//   p_json_at(s: str, idx: i64) -> str    — extract array element as string
+//   p_json_type(s: str) -> str       — "object"|"array"|"string"|"number"|
+//                                       "boolean"|"null"
+//   p_json_len(s: str) -> i64        — object key count or array length
+//   p_json_pretty(s: str) -> str     — pretty-print with 2-space indent
+
+module json;
+
+/// Parse a JSON string and return its canonical (minified) form.
+/// Returns the empty string on parse error.
+pub pf json_parse(s: str) -> str {
+    p_json_parse(s)
+}
+
+/// Serialize a Pledge string as a JSON string literal (with quotes and
+/// escaping). Useful for building JSON by hand.
+pub pf json_string(s: str) -> str {
+    p_json_string(s)
+}
+
+/// Extract a field from a JSON object. Returns the raw JSON value as a
+/// string (which may itself be an object, array, string, number, etc.).
+/// Returns the empty string if the key is not found or the input is not a
+/// JSON object.
+pub pf json_get(s: str, key: str) -> str {
+    p_json_get(s, key)
+}
+
+/// Extract an element from a JSON array by index. Returns the raw JSON
+/// value as a string. Returns the empty string if out of bounds or the
+/// input is not a JSON array.
+pub pf json_at(s: str, idx: i64) -> str {
+    p_json_at(s, idx)
+}
+
+/// Get the type name of a JSON value: "object", "array", "string",
+/// "number", "boolean", or "null". Returns "error" on parse failure.
+pub pf json_type(s: str) -> str {
+    p_json_type(s)
+}
+
+/// Get the length of a JSON object (key count) or array. Returns -1 on
+/// error or for non-collection types.
+pub pf json_len(s: str) -> i64 {
+    p_json_len(s)
+}
+
+/// Pretty-print a JSON string with 2-space indentation.
+pub pf json_pretty(s: str) -> str {
+    p_json_pretty(s)
+}
+
+/// Build a JSON object from a key and value. Returns {"key":value}.
+pub pf json_pair(key: str, val: str) -> str {
+    p_str_concat(
+        p_str_concat(
+            p_str_concat("{\"", key),
+            p_str_concat("\":", val)
+        ),
+        "}"
+    )
+}

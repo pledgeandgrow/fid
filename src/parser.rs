@@ -322,7 +322,18 @@ impl Parser {
             self.expect(TokenKind::LBrace, "{")?;
 
             let mut methods = Vec::new();
+            let mut associated_types = Vec::new();
             while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+                // Associated type binding: `ty Item = ConcreteType;`
+                if self.check(&TokenKind::Ty) {
+                    self.advance();
+                    let assoc_name = self.expect_ident()?;
+                    self.expect(TokenKind::Eq, "=")?;
+                    let assoc_ty = self.parse_type()?;
+                    self.match_tok(TokenKind::Semicolon);
+                    associated_types.push((assoc_name, assoc_ty));
+                    continue;
+                }
                 let is_pub = if self.check(&TokenKind::Pub) {
                     self.advance();
                     true
@@ -340,6 +351,7 @@ impl Parser {
                 type_name,
                 type_params,
                 methods,
+                associated_types,
             }));
         }
 
@@ -370,7 +382,16 @@ impl Parser {
         self.expect(TokenKind::LBrace, "{")?;
 
         let mut methods = Vec::new();
+        let mut associated_types = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            // Associated type declaration: `ty Item;`
+            if self.check(&TokenKind::Ty) {
+                self.advance();
+                let assoc_name = self.expect_ident()?;
+                self.match_tok(TokenKind::Semicolon);
+                associated_types.push(assoc_name);
+                continue;
+            }
             let is_pub = if self.check(&TokenKind::Pub) {
                 self.advance();
                 true
@@ -447,7 +468,7 @@ impl Parser {
         }
         self.expect(TokenKind::RBrace, "}")?;
 
-        Ok(TraitDef { name, methods, is_pub: false })
+        Ok(TraitDef { name, methods, associated_types, is_pub: false })
     }
 
     fn parse_func(&mut self) -> Result<Func, String> {
@@ -502,6 +523,7 @@ impl Parser {
             ret_ty,
             body,
             is_pub: false,
+            is_comptime: false,
         })
     }
 
@@ -564,8 +586,19 @@ impl Parser {
             TokenKind::Bool => Type::Bool,
             TokenKind::Str => Type::Str,
             TokenKind::Void => Type::Void,
+            TokenKind::Dyn => {
+                self.advance();
+                let trait_name = self.expect_ident()?;
+                return Ok(Type::Dyn(trait_name));
+            }
             TokenKind::Ident(s) => {
                 self.advance();
+                // Check for associated type: T::Item
+                if self.check(&TokenKind::DoubleColon) {
+                    self.advance();
+                    let assoc_name = self.expect_ident()?;
+                    return Ok(Type::Assoc(s, String::new(), assoc_name));
+                }
                 // Check for generic type args: Name<T, U>
                 if self.check(&TokenKind::Lt) {
                     self.advance(); // consume <
@@ -1346,6 +1379,10 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.advance();
+                // Check for asm! macro
+                if name == "asm" && self.match_tok(TokenKind::Bang) {
+                    return self.parse_asm();
+                }
                 if self.match_tok(TokenKind::LParen) {
                     let mut args = Vec::new();
                     if !self.check(&TokenKind::RParen) {
@@ -1462,6 +1499,71 @@ impl Parser {
                 ))
             }
         }
+    }
+
+    /// Parse inline assembly: asm!("template", in("reg") expr, out("reg") ident, ...)
+    fn parse_asm(&mut self) -> Result<Expr, String> {
+        self.expect(TokenKind::LParen, "(")?;
+        // First argument: template string
+        let template = {
+            let tok = self.peek_token().clone();
+            match &tok.kind {
+                TokenKind::StringLit(s) => {
+                    self.advance();
+                    s.clone()
+                }
+                _ => return Err(format!(
+                    "Parse error: asm! first argument must be a string template, got '{}'",
+                    tok.kind
+                )),
+            }
+        };
+        // Parse operands
+        let mut operands = Vec::new();
+        while self.match_tok(TokenKind::Comma) {
+            // Direction: in() or out()
+            // 'in' is a keyword token, 'out' is an identifier
+            let direction = match &self.peek_token().kind {
+                TokenKind::In => {
+                    self.advance();
+                    crate::ast::AsmDir::In
+                }
+                TokenKind::Ident(s) if s == "out" => {
+                    self.advance();
+                    crate::ast::AsmDir::Out
+                }
+                _ => return Err(format!(
+                    "Parse error: asm! operand must start with 'in' or 'out', got '{}'",
+                    self.peek_token().kind
+                )),
+            };
+            self.expect(TokenKind::LParen, "(")?;
+            let reg = {
+                let tok = self.peek_token().clone();
+                match &tok.kind {
+                    TokenKind::StringLit(s) => {
+                        self.advance();
+                        s.clone()
+                    }
+                    _ => return Err(format!(
+                        "Parse error: asm! register must be a string, got '{}'",
+                        tok.kind
+                    )),
+                }
+            };
+            self.expect(TokenKind::RParen, ")")?;
+            let expr = self.parse_expr()?;
+            operands.push(crate::ast::AsmOperand {
+                direction,
+                reg,
+                expr,
+            });
+        }
+        self.expect(TokenKind::RParen, ")")?;
+        Ok(Expr::Asm {
+            template,
+            operands,
+        })
     }
 
     fn parse_use(&mut self) -> Result<ImportDef, String> {

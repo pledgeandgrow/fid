@@ -2158,6 +2158,14 @@ impl PeCodeGen {
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
             }
 
+            Inst::MakeDyn { .. } => {
+                self.enc.xor_self(Reg::Rax);
+                self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
+            }
+            Inst::DynCall { .. } => {
+                self.enc.xor_self(Reg::Rax);
+                self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
+            }
             Inst::BitCast { value, .. } => {
                 let voff = frame.offset(*value) as i32;
                 self.enc.mov_reg_mem_rbp(Reg::Rax, voff);
@@ -2188,6 +2196,11 @@ impl PeCodeGen {
             Inst::TryUnwrap { .. } => {
                 // Not fully implemented
                 self.enc.nop();
+            }
+            Inst::Asm { .. } => {
+                // Inline assembly not yet supported in PE backend
+                self.enc.xor_self(Reg::Rax);
+                self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
             }
         }
     }

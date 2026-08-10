@@ -1,0 +1,43 @@
+// Phase 3A — comptime type reflection.
+// `comptime reflect_op(T)` inspects types at compile time.
+
+struct Point {
+    x: i64,
+    y: i64,
+    label: str,
+}
+
+enum Shape {
+    Circle(i64),
+    Square(i64, i64),
+    Triangle,
+}
+
+pf main() -> i64 {
+    // type_name — name of the type as a string.
+    pv name = comptime type_name(Point);
+    print(name);
+
+    // is_struct / is_enum — boolean type tests.
+    pv s = comptime is_struct(Point);
+    print(s);
+
+    pv e = comptime is_enum(Shape);
+    print(e);
+
+    pv not_struct = comptime is_struct(i64);
+    print(not_struct);
+
+    // field_count — number of fields in a struct.
+    pv fc = comptime field_count(Point);
+    print(fc);
+
+    // enum_variants — names of an enum's variants.
+    pv variants = comptime enum_variants(Shape);
+    for v in variants {
+        print(v);
+        print(" ");
+    }
+
+    ret 0;
+}

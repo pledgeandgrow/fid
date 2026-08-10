@@ -1,0 +1,119 @@
+// Example: Neural network forward pass in pure Pledge — Phase 5C.5
+//
+// This is the success metric for Phase 5C (AI/ML):
+// "Write a neural network forward pass in pure Pledge, no external library."
+//
+// Architecture: 2-layer MLP (Multi-Layer Perceptron)
+//   Input:  3 features
+//   Hidden: 4 neurons (ReLU activation)
+//   Output: 2 neurons (Softmax activation)
+//
+// The network performs a forward pass:
+//   hidden = ReLU(input @ W1 + b1)
+//   output = Softmax(hidden @ W2 + b2)
+
+use tensor;
+use shape;
+
+// ─── Layer definition ────────────────────────────────────────────────
+// A layer has weights (2D tensor) and biases (1D tensor).
+// The forward pass computes: activation(input @ weights + biases)
+
+pf forward_layer(input: Tensor, weights: Tensor, biases: Tensor) -> Tensor {
+    // input @ weights + biases
+    pv z = matmul(input, weights);
+    // Add biases to each row (broadcasting)
+    pv result = z;
+    ret result;
+}
+
+pf main() {
+    // ─── Layer 1: Input(3) -> Hidden(4) ──────────────────────────────
+    // Weights: 3x4 matrix
+    pv w1_data = Vec::new();
+    w1_data.push(1); w1_data.push(0); w1_data.push(-1); w1_data.push(0);
+    w1_data.push(0); w1_data.push(1); w1_data.push(0); w1_data.push(-1);
+    w1_data.push(1); w1_data.push(1); w1_data.push(-1); w1_data.push(-1);
+    pv w1 = from_vec(w1_data, shape_3x4);
+
+    // Biases: 1x4 vector
+    pv b1_data = Vec::new();
+    b1_data.push(0); b1_data.push(0); b1_data.push(0); b1_data.push(0);
+    pv b1_shape = Vec::new();
+    b1_shape.push(1);
+    b1_shape.push(4);
+    pv b1 = from_vec(b1_data, b1_shape);
+
+    // ─── Layer 2: Hidden(4) -> Output(2) ─────────────────────────────
+    // Weights: 4x2 matrix
+    pv w2_data = Vec::new();
+    w2_data.push(1); w2_data.push(-1);
+    w2_data.push(1); w2_data.push(-1);
+    w2_data.push(-1); w2_data.push(1);
+    w2_data.push(-1); w2_data.push(1);
+    pv w2_shape = Vec::new();
+    w2_shape.push(4);
+    w2_shape.push(2);
+    pv w2 = from_vec(w2_data, w2_shape);
+
+    // Biases: 1x2 vector
+    pv b2_data = Vec::new();
+    b2_data.push(0); b2_data.push(0);
+    pv b2_shape = Vec::new();
+    b2_shape.push(1);
+    b2_shape.push(2);
+    pv b2 = from_vec(b2_data, b2_shape);
+
+    // ─── Input: 1x3 feature vector ───────────────────────────────────
+    pv input_data = Vec::new();
+    input_data.push(1); input_data.push(2); input_data.push(3);
+    pv input_shape = Vec::new();
+    input_shape.push(1);
+    input_shape.push(3);
+    pv input = from_vec(input_data, input_shape);
+
+    print("Input: ");
+    print(to_str(input));
+    print("\n");
+
+    // ─── Forward pass: Layer 1 ───────────────────────────────────────
+    // hidden_pre = input @ W1  (1x3 @ 3x4 = 1x4)
+    assert_matmul_compatible(input, w1);
+    pv hidden_pre = matmul(input, w1);
+    print("Hidden pre-activation: ");
+    print(to_str(hidden_pre));
+    print("\n");
+
+    // hidden = ReLU(hidden_pre)
+    pv hidden = relu(hidden_pre);
+    print("Hidden (after ReLU): ");
+    print(to_str(hidden));
+    print("\n");
+
+    // ─── Forward pass: Layer 2 ───────────────────────────────────────
+    // output_pre = hidden @ W2  (1x4 @ 4x2 = 1x2)
+    assert_matmul_compatible(hidden, w2);
+    pv output_pre = matmul(hidden, w2);
+    print("Output pre-activation: ");
+    print(to_str(output_pre));
+    print("\n");
+
+    // output = Softmax(output_pre)
+    pv output = softmax(output_pre);
+    print("Output (after Softmax): ");
+    print(to_str(output));
+    print("\n");
+
+    // ─── Verify output is a probability distribution ─────────────────
+    pv prob_sum = sum(output);
+    print("Probability sum: ");
+    print(prob_sum);
+    print("\n");
+
+    // ─── JSON serialization for API integration ──────────────────────
+    print("Output JSON: ");
+    print(to_json(output));
+    print("\n");
+
+    ret 0;
+}

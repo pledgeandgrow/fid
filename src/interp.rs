@@ -33,6 +33,8 @@ pub enum Value {
     Vec(Rc<RefCell<SmallVec<[Value; 8]>>>),
     /// Hash map — backed by hashbrown's SwissTable implementation
     Map(Rc<RefCell<hashbrown::HashMap<String, Value>>>),
+    /// Trait object — (concrete_type_name, data_pointer)
+    Dyn(String, u64),
 }
 
 impl std::fmt::Display for Value {
@@ -46,6 +48,7 @@ impl std::fmt::Display for Value {
             Value::Void => write!(f, "void"),
             Value::Vec(_) => write!(f, "[...]"),
             Value::Map(_) => write!(f, "{{...}}"),
+            Value::Dyn(t, _) => write!(f, "dyn({})", t),
         }
     }
 }
@@ -152,6 +155,10 @@ pub struct Interpreter {
     opaque_values: HashMap<u64, Value>,
     /// Verbose mode — print each instruction as it executes
     verbose: bool,
+    /// Debug mode — enables runtime safety checks (overflow, bounds)
+    debug_mode: bool,
+    /// Array bounds tracking — maps base address to array size
+    array_bounds: HashMap<u64, usize>,
 }
 
 /// Result of running a function
@@ -171,6 +178,8 @@ impl Interpreter {
             string_addrs: HashMap::new(),
             opaque_values: HashMap::new(),
             verbose: false,
+            debug_mode: true,
+            array_bounds: HashMap::new(),
         };
         // Pre-allocate string constants
         interp.init_strings();
@@ -331,6 +340,24 @@ impl Interpreter {
                 let l = values.get(left).cloned().unwrap_or(Value::Void);
                 let r = values.get(right).cloned().unwrap_or(Value::Void);
                 let result = self.eval_binop(op, &l, &r);
+                // Check for overflow/div-by-zero panic (eval_binop returns Void)
+                if self.debug_mode && result == Value::Void {
+                    let msg = match op {
+                        BinOp::Add => format!("Integer overflow on addition: {} + {}", 
+                            if let Value::Int(a) = l { a.to_string() } else { "?".to_string() },
+                            if let Value::Int(b) = r { b.to_string() } else { "?".to_string() }),
+                        BinOp::Sub => format!("Integer overflow on subtraction: {} - {}",
+                            if let Value::Int(a) = l { a.to_string() } else { "?".to_string() },
+                            if let Value::Int(b) = r { b.to_string() } else { "?".to_string() }),
+                        BinOp::Mul => format!("Integer overflow on multiplication: {} * {}",
+                            if let Value::Int(a) = l { a.to_string() } else { "?".to_string() },
+                            if let Value::Int(b) = r { b.to_string() } else { "?".to_string() }),
+                        BinOp::Div => "Division by zero".to_string(),
+                        BinOp::Mod => "Modulo by zero".to_string(),
+                        _ => "Arithmetic error".to_string(),
+                    };
+                    return ExecOutcome::Panic(msg);
+                }
                 ExecOutcome::Value(result)
             }
 
@@ -344,6 +371,10 @@ impl Interpreter {
             Inst::Alloca { ty, .. } => {
                 let size = self.module.type_size(ty);
                 let addr = self.memory.alloc(size.max(1));
+                // Track array bounds for bounds checking
+                if let IrType::Array(_, arr_size) = ty {
+                    self.array_bounds.insert(addr, *arr_size);
+                }
                 ExecOutcome::Value(Value::Ptr(addr))
             }
 
@@ -506,12 +537,29 @@ impl Interpreter {
                     Some(Value::Ptr(a)) => *a,
                     _ => 0,
                 };
-                let idx = match values.get(index) {
-                    Some(Value::Int(i)) => *i as u64,
+                let idx_val = match values.get(index) {
+                    Some(Value::Int(i)) => *i,
                     _ => 0,
                 };
+                // Bounds check for arrays
+                if self.debug_mode {
+                    if idx_val < 0 {
+                        return ExecOutcome::Panic(format!(
+                            "Array index out of bounds: negative index {}",
+                            idx_val
+                        ));
+                    }
+                    if let Some(arr_size) = self.array_bounds.get(&base) {
+                        if (idx_val as usize) >= *arr_size {
+                            return ExecOutcome::Panic(format!(
+                                "Array index out of bounds: index {} but array has {} elements",
+                                idx_val, arr_size
+                            ));
+                        }
+                    }
+                }
                 let elem_size = self.module.type_size(elem_ty).max(1);
-                ExecOutcome::Value(Value::Ptr(base + idx * elem_size))
+                ExecOutcome::Value(Value::Ptr(base + idx_val as u64 * elem_size))
             }
 
             // ─── Control Flow ───
@@ -641,6 +689,51 @@ impl Interpreter {
                 ))
             }
 
+            Inst::MakeDyn { value, type_name, .. } => {
+                let data_ptr = match values.get(value) {
+                    Some(Value::Ptr(p)) => *p,
+                    Some(Value::Int(i)) => *i as u64,
+                    _ => 0,
+                };
+                ExecOutcome::Value(Value::Dyn(type_name.clone(), data_ptr))
+            }
+
+            Inst::DynCall { trait_name, method, args, .. } => {
+                let arg_vals: Vec<Value> = args.iter()
+                    .map(|a| values.get(a).cloned().unwrap_or(Value::Void))
+                    .collect();
+
+                let (type_name, mut all_args) = match arg_vals.first() {
+                    Some(Value::Dyn(t, p)) => {
+                        let mut aa = arg_vals.clone();
+                        aa[0] = Value::Ptr(*p);
+                        (t.clone(), aa)
+                    }
+                    Some(Value::Str(s)) => (s.to_string(), arg_vals.clone()),
+                    _ => return ExecOutcome::Panic(format!(
+                        "DynCall: receiver is not a trait object ({}::{})",
+                        trait_name, method
+                    )),
+                };
+
+                let mangled = format!("{}_{}", type_name, method);
+
+                if let Some(callee) = self.module.functions.get(&mangled).cloned() {
+                    if callee.params.len() > all_args.len() {
+                        all_args.insert(0, Value::Int(0));
+                    }
+                    return match self.run_function(&callee, &all_args) {
+                        RunResult::Return(v) => ExecOutcome::Value(v),
+                        RunResult::Panic(msg) => ExecOutcome::Panic(msg),
+                    };
+                }
+
+                ExecOutcome::Panic(format!(
+                    "DynCall: no method '{}' on type '{}' (looked for '{}')",
+                    method, type_name, mangled
+                ))
+            }
+
             // ─── Conversions ───
             Inst::BitCast { value, to, .. } => {
                 let v = values.get(value).cloned().unwrap_or(Value::Void);
@@ -703,6 +796,19 @@ impl Interpreter {
             Inst::Panic { message } => {
                 ExecOutcome::Panic(message.clone())
             }
+            Inst::Asm { template, inputs, outputs, ret_ty } => {
+                // Interpreter: no actual assembly execution
+                // For input operands, values are already evaluated
+                // For output operands, we store 0 (no-op in interpreter)
+                if self.debug_mode {
+                    eprintln!("[asm] {} (inputs: {}, outputs: {})",
+                        template, inputs.len(), outputs.len());
+                }
+                match ret_ty {
+                    crate::ir::IrType::Void => ExecOutcome::Continue,
+                    _ => ExecOutcome::Value(Value::Int(0)),
+                }
+            }
         }
     }
 
@@ -711,16 +817,58 @@ impl Interpreter {
         match (l, r) {
             (Value::Int(a), Value::Int(b)) => {
                 match op {
-                    BinOp::Add => Value::Int(a.wrapping_add(*b)),
-                    BinOp::Sub => Value::Int(a.wrapping_sub(*b)),
-                    BinOp::Mul => Value::Int(a.wrapping_mul(*b)),
+                    BinOp::Add => {
+                        if self.debug_mode {
+                            if let Some(r) = a.checked_add(*b) {
+                                Value::Int(r)
+                            } else {
+                                return Value::Void; // panic handled by caller
+                            }
+                        } else {
+                            Value::Int(a.wrapping_add(*b))
+                        }
+                    }
+                    BinOp::Sub => {
+                        if self.debug_mode {
+                            if let Some(r) = a.checked_sub(*b) {
+                                Value::Int(r)
+                            } else {
+                                return Value::Void;
+                            }
+                        } else {
+                            Value::Int(a.wrapping_sub(*b))
+                        }
+                    }
+                    BinOp::Mul => {
+                        if self.debug_mode {
+                            if let Some(r) = a.checked_mul(*b) {
+                                Value::Int(r)
+                            } else {
+                                return Value::Void;
+                            }
+                        } else {
+                            Value::Int(a.wrapping_mul(*b))
+                        }
+                    }
                     BinOp::Div => {
-                        if *b == 0 { Value::Int(0) }
-                        else { Value::Int(a.wrapping_div(*b)) }
+                        if *b == 0 {
+                            if self.debug_mode {
+                                return Value::Void; // panic: division by zero
+                            }
+                            Value::Int(0)
+                        } else {
+                            Value::Int(a.wrapping_div(*b))
+                        }
                     }
                     BinOp::Mod => {
-                        if *b == 0 { Value::Int(0) }
-                        else { Value::Int(a.wrapping_rem(*b)) }
+                        if *b == 0 {
+                            if self.debug_mode {
+                                return Value::Void;
+                            }
+                            Value::Int(0)
+                        } else {
+                            Value::Int(a.wrapping_rem(*b))
+                        }
                     }
                     BinOp::Eq => Value::Bool(a == b),
                     BinOp::Neq => Value::Bool(a != b),
@@ -1085,18 +1233,26 @@ impl Interpreter {
             "p_vec_get" => {
                 if let (Some(Value::Vec(arr)), Some(Value::Int(idx))) = (args.first(), args.get(1)) {
                     let borrow = arr.borrow();
-                    if let Some(v) = borrow.get(*idx as usize) {
-                        return ExecOutcome::Value(v.clone());
+                    if *idx < 0 || (*idx as usize) >= borrow.len() {
+                        return ExecOutcome::Panic(format!(
+                            "Vec index out of bounds: index {} but vec has {} elements",
+                            idx, borrow.len()
+                        ));
                     }
+                    return ExecOutcome::Value(borrow[*idx as usize].clone());
                 }
                 ExecOutcome::Value(Value::Void)
             }
             "p_vec_set" => {
                 if let (Some(Value::Vec(arr)), Some(Value::Int(idx)), Some(val)) = (args.first(), args.get(1), args.get(2)) {
                     let mut borrow = arr.borrow_mut();
-                    if let Some(slot) = borrow.get_mut(*idx as usize) {
-                        *slot = val.clone();
+                    if *idx < 0 || (*idx as usize) >= borrow.len() {
+                        return ExecOutcome::Panic(format!(
+                            "Vec index out of bounds: index {} but vec has {} elements",
+                            idx, borrow.len()
+                        ));
                     }
+                    borrow[*idx as usize] = val.clone();
                 }
                 ExecOutcome::Value(Value::Void)
             }
@@ -1254,11 +1410,14 @@ impl Interpreter {
             }
             "p_string_slice" => {
                 if let (Some(Value::Str(s)), Some(Value::Int(start)), Some(Value::Int(end))) = (args.first(), args.get(1), args.get(2)) {
-                    let start = (*start as usize).min(s.len());
-                    let end = (*end as usize).min(s.len());
-                    if start <= end {
-                        return ExecOutcome::Value(Value::Str(CompactString::from(&s[start..end])));
+                    let len = s.len() as i64;
+                    if *start < 0 || *end > len || *start > *end {
+                        return ExecOutcome::Panic(format!(
+                            "String slice out of bounds: start={} end={} but string has {} chars",
+                            start, end, len
+                        ));
                     }
+                    return ExecOutcome::Value(Value::Str(CompactString::from(&s[*start as usize..*end as usize])));
                 }
                 ExecOutcome::Value(Value::Str(CompactString::from("")))
             }
@@ -1303,9 +1462,15 @@ impl Interpreter {
             }
             "p_string_char_at" => {
                 if let (Some(Value::Str(s)), Some(Value::Int(idx))) = (args.first(), args.get(1)) {
-                    if let Some(c) = s.chars().nth(*idx as usize) {
-                        return ExecOutcome::Value(Value::Str(CompactString::from(c.to_string())));
+                    let char_count = s.chars().count() as i64;
+                    if *idx < 0 || *idx >= char_count {
+                        return ExecOutcome::Panic(format!(
+                            "String char_at out of bounds: index {} but string has {} chars",
+                            idx, char_count
+                        ));
                     }
+                    let c = s.chars().nth(*idx as usize).unwrap();
+                    return ExecOutcome::Value(Value::Str(CompactString::from(c.to_string())));
                 }
                 ExecOutcome::Value(Value::Str(CompactString::from("")))
             }
@@ -1365,15 +1530,27 @@ impl Interpreter {
             // ─── New Vec runtime functions ───
             "p_vec_insert" => {
                 if let (Some(Value::Vec(arr)), Some(Value::Int(idx)), Some(val)) = (args.first(), args.get(1), args.get(2)) {
+                    let len = arr.borrow().len() as i64;
+                    if *idx < 0 || *idx > len {
+                        return ExecOutcome::Panic(format!(
+                            "Vec insert out of bounds: index {} but vec has {} elements",
+                            idx, len
+                        ));
+                    }
                     arr.borrow_mut().insert(*idx as usize, val.clone());
                 }
                 ExecOutcome::Value(Value::Void)
             }
             "p_vec_remove" => {
                 if let (Some(Value::Vec(arr)), Some(Value::Int(idx))) = (args.first(), args.get(1)) {
-                    if (*idx as usize) < arr.borrow().len() {
-                        return ExecOutcome::Value(arr.borrow_mut().remove(*idx as usize));
+                    let len = arr.borrow().len() as i64;
+                    if *idx < 0 || *idx >= len {
+                        return ExecOutcome::Panic(format!(
+                            "Vec remove out of bounds: index {} but vec has {} elements",
+                            idx, len
+                        ));
                     }
+                    return ExecOutcome::Value(arr.borrow_mut().remove(*idx as usize));
                 }
                 ExecOutcome::Value(Value::Void)
             }
@@ -1394,6 +1571,7 @@ impl Interpreter {
                     if let Some(v) = arr.borrow().first() {
                         return ExecOutcome::Value(v.clone());
                     }
+                    return ExecOutcome::Panic("Vec first() on empty vec".to_string());
                 }
                 ExecOutcome::Value(Value::Void)
             }
@@ -1402,6 +1580,7 @@ impl Interpreter {
                     if let Some(v) = arr.borrow().last() {
                         return ExecOutcome::Value(v.clone());
                     }
+                    return ExecOutcome::Panic("Vec last() on empty vec".to_string());
                 }
                 ExecOutcome::Value(Value::Void)
             }
@@ -1482,13 +1661,13 @@ enum ExecOutcome {
 }
 
 /// Convenience function — lower and interpret a program
-pub fn interpret(module: IrModule, verbose: bool) -> RunResult {
-    let interp = if verbose {
-        Interpreter::new(module).verbose()
-    } else {
-        Interpreter::new(module)
-    };
-    // We need mutable interp to run, but verbose() consumes self
-    let mut interp = interp;
+pub fn interpret(module: IrModule, verbose: bool, release: bool) -> RunResult {
+    let mut interp = Interpreter::new(module);
+    if verbose {
+        interp.verbose = true;
+    }
+    if release {
+        interp.debug_mode = false;
+    }
     interp.run()
 }

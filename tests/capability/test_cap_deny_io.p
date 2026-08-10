@@ -1,0 +1,9 @@
+// Capability test: IO capability NOT granted, print should fail (Phase 2C)
+// The `with { FS }` clause enables strict mode but only grants FS, not IO.
+// Calling print() should produce a capability error.
+use core with { FS }
+
+pf main() -> i64 {
+    print("hello");  // should fail — no IO capability
+    ret 0;
+}

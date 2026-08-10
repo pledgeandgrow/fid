@@ -85,7 +85,7 @@ A bootstrap compiler for the Pledge programming language, written in Rust. Gener
 
 - **PE emitter targets Windows x64 only** — no Linux ELF or macOS Mach-O output yet
 - **No register allocator** — stack-based alloca model (every value gets a stack slot)
-- **No optimizer** — constant folding pass exists but is not wired into the pipeline
+- **No optimizer in default pipeline** — PIR optimizer exists (`pledgec opt`, `pledgec pir --opt`) with constant folding, DCE, CSE, inlining, TCO detection, and loop unrolling detection, but is not yet wired into the default build/run pipeline
 - **No bounds checking** — array/Vec indexing has no runtime bounds check yet
 - **No integer overflow checking** — uses wrapping arithmetic
 - **`#[test]` attribute** — parsed but not executed by `pledgec test` (tests are file-based)
@@ -569,7 +569,7 @@ Run all tests: `cargo run -- test`
 | **Phase 1** | Bootstrap compiler in Rust — direct PE emission, MASM + C backends, IR interpreter | **Complete** (41/41 tests pass) |
 | **Phase 2** | Region inference, effect system, capability security, bounds safety | Not started |
 | **Phase 3** | comptime, advanced traits, FFI & interop | Not started |
-| **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | Not started |
+| **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | In progress (4A PIR complete, 4B optimizer complete) |
 | **Phase 5** | Bare metal, IoT, AI/ML, self-hosting | Not started |
 
 See `docs/roadmap.md` for the full 8-phase roadmap.

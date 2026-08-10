@@ -1,6 +1,7 @@
 use crate::ast::Program;
 use crate::codegen::CodeGen;
 use crate::codegen_c;
+use crate::comptime;
 use crate::interp;
 use crate::lexer::Lexer;
 use crate::lower;
@@ -9,6 +10,8 @@ use crate::parser::Parser;
 use crate::typechecker::TypeChecker;
 use crate::x86;
 use crate::pe;
+use crate::pir;
+use crate::wasm;
 
 pub use crate::interp::RunResult;
 pub use crate::interp::Value;
@@ -78,6 +81,9 @@ fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Pr
                 base_dir.join(format!("{}/mod.p", path_str)),
                 base_dir.join("pledge_modules").join(format!("{}.p", path_str)),
                 base_dir.join("pledge_modules").join(format!("{}/mod.p", path_str)),
+                // Fallback: stdlib/ directory (for json, http, db, etc.)
+                std::path::Path::new("stdlib").join(format!("{}.p", path_str)),
+                std::path::Path::new("stdlib").join(format!("{}/mod.p", path_str)),
             ];
 
             let mut found = None;
@@ -156,6 +162,9 @@ fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Pr
     // Merge user code (highest priority)
     program = merge_programs(program, user.clone());
 
+    // Phase 3B.1: Fill in default trait methods.
+    fill_default_trait_methods(&mut program);
+
     // Type check — register each module with its own name for visibility enforcement
     let mut tc = TypeChecker::new();
     let stdlib_module = stdlib.module.clone().unwrap_or_else(|| "core".to_string());
@@ -168,6 +177,14 @@ fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Pr
     let user_module = user.module.clone().unwrap_or_else(|| "main".to_string());
     tc.register_program(&user, &user_module);
 
+    // Re-register trait impl methods from the merged program so that
+    // default trait methods (filled in by fill_default_trait_methods) are
+    // visible to the typechecker.
+    tc.register_trait_impls(&program);
+
+    // Phase 3B.4: Verify trait impls match trait definitions
+    tc.verify_trait_impls(&program);
+
     // Collect capabilities from user's use statements (with { IO, ... })
     tc.collect_capabilities(&user);
 
@@ -178,8 +195,63 @@ fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Pr
         return Err(tc.errors);
     }
 
+    // Phase 3A: comptime substitution
+    let program = match comptime::substitute(&program) {
+        Ok(p) => p,
+        Err(errs) => return Err(errs),
+    };
+
     // Monomorphize generics
     Ok(mono::monomorphize(&program))
+}
+
+/// Phase 3B.1: Fill in default trait methods.
+fn fill_default_trait_methods(program: &mut Program) {
+    use crate::ast::{Func, Param, Type};
+
+    let trait_map: HashMap<String, &crate::ast::TraitDef> = program.traits.iter()
+        .map(|t| (t.name.clone(), t))
+        .collect();
+
+    for ti in program.trait_impls.iter_mut() {
+        let trait_def = match trait_map.get(&ti.trait_name) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        let provided: HashSet<String> = ti.methods.iter().map(|m| m.name.clone()).collect();
+
+        for tm in &trait_def.methods {
+            if provided.contains(&tm.name) {
+                continue;
+            }
+            let default_body = match &tm.default_body {
+                Some(b) => b.clone(),
+                None => continue,
+            };
+
+            let self_type = Type::Named(ti.type_name.clone());
+            let params: Vec<Param> = tm.params.iter().map(|p| {
+                if p.name == "self" {
+                    Param { name: p.name.clone(), ty: self_type.clone() }
+                } else {
+                    p.clone()
+                }
+            }).collect();
+
+            ti.methods.push(Func {
+                name: tm.name.clone(),
+                type_params: Vec::new(),
+                type_param_bounds: Vec::new(),
+                params,
+                ret_ty: tm.ret_ty.clone(),
+                body: default_body,
+                is_pub: tm.is_pub,
+                is_comptime: false,
+            });
+
+        }
+    }
 }
 
 fn merge_programs(stdlib: Program, user: Program) -> Program {
@@ -306,17 +378,21 @@ pub fn interpret_source(source: &str, verbose: bool) -> Result<RunResult, Vec<St
     let module = lower::lower(&program);
 
     // Interpret
-    Ok(interp::interpret(module, verbose))
+    Ok(interp::interpret(module, verbose, false))
 }
 
 pub fn interpret_source_with_path(source: &str, source_path: &str, verbose: bool) -> Result<RunResult, Vec<String>> {
+    interpret_source_with_path_release(source, source_path, verbose, false)
+}
+
+pub fn interpret_source_with_path_release(source: &str, source_path: &str, verbose: bool, release: bool) -> Result<RunResult, Vec<String>> {
     let program = build_program_with_path(source, Some(source_path))?;
 
     // Lower to IR
     let module = lower::lower(&program);
 
     // Interpret
-    Ok(interp::interpret(module, verbose))
+    Ok(interp::interpret(module, verbose, release))
 }
 
 /// Build source to x86_64 assembly (Stage 2 — no C runtime)

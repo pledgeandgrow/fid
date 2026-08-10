@@ -25,6 +25,12 @@ pub enum Type {
         params: Vec<Type>,
         ret: Box<Type>,
     },
+    /// An associated type: `T::Item` where `T` is a type parameter with a
+    /// trait bound. Resolved to a concrete type during monomorphization.
+    /// (type_param, trait_name, assoc_name)
+    Assoc(String, String, String),
+    /// A trait object type: `dyn TraitName` — enables dynamic dispatch.
+    Dyn(String),
 }
 
 impl std::fmt::Display for Type {
@@ -78,6 +84,10 @@ impl std::fmt::Display for Type {
                 }
                 write!(f, ") -> {}", ret)
             }
+            Type::Assoc(tp, trait_name, name) => {
+                write!(f, "{}::{}({})", tp, name, trait_name)
+            }
+            Type::Dyn(name) => write!(f, "dyn {}", name),
         }
     }
 }
@@ -173,6 +183,25 @@ pub enum Expr {
         expr: Box<Expr>,
         target_ty: Type,
     },
+    /// Inline assembly — Phase 5A.1
+    /// asm!("template", in("reg") expr, out("reg") ident, ...)
+    Asm {
+        template: String,
+        operands: Vec<AsmOperand>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct AsmOperand {
+    pub direction: AsmDir,
+    pub reg: String,
+    pub expr: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AsmDir {
+    In,
+    Out,
 }
 
 #[derive(Debug, Clone)]
@@ -343,6 +372,8 @@ pub struct Func {
     pub ret_ty: Type,
     pub body: Vec<Stmt>,
     pub is_pub: bool,
+    /// Whether this is a comptime function (evaluated at compile time)
+    pub is_comptime: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -392,6 +423,8 @@ pub struct ImplDef {
 pub struct TraitDef {
     pub name: String,
     pub methods: Vec<TraitMethod>,
+    /// Associated type declarations: `type Item;`
+    pub associated_types: Vec<String>,
     pub is_pub: bool,
 }
 
@@ -414,6 +447,8 @@ pub struct TraitImpl {
     pub type_name: String,
     pub type_params: Vec<String>,
     pub methods: Vec<Func>,
+    /// Associated type bindings: `type Item = i64;` → ("Item", I64)
+    pub associated_types: Vec<(String, Type)>,
 }
 
 #[derive(Debug, Clone)]

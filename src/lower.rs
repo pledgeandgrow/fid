@@ -500,8 +500,58 @@ impl Lowerer {
                 let idx_val = self.lower_expr(index);
 
                 // Determine element type from array value metadata
-                let elem_ty = self.get_value_type(arr_val);
-                let elem_ty = match &elem_ty {
+                let arr_ty = self.get_value_type(arr_val);
+
+                // Vec indexing — call runtime p_vec_set / p_vec_get
+                if arr_ty.is_opaque_named("Vec") {
+                    let elem_ty = arr_ty.generic_elem().cloned().unwrap_or(IrType::I64);
+                    if *op == AssignOp::Assign {
+                        let val = self.lower_expr(expr);
+                        self.emit_inst(Inst::Call {
+                            func: "p_vec_set".to_string(),
+                            args: vec![arr_val, idx_val, val],
+                            ret_ty: IrType::Void,
+                            effects: EffectSet::new(),
+                        });
+                    } else {
+                        // Compound assignment: p_vec_get, binop, p_vec_set
+                        let current = self.emit_inst(Inst::Call {
+                            func: "p_vec_get".to_string(),
+                            args: vec![arr_val, idx_val],
+                            ret_ty: elem_ty.clone(),
+                            effects: EffectSet::new(),
+                        });
+                        let rhs = self.lower_expr(expr);
+                        let bin_op = match op {
+                            AssignOp::AddAssign => BinOp::Add,
+                            AssignOp::SubAssign => BinOp::Sub,
+                            AssignOp::MulAssign => BinOp::Mul,
+                            AssignOp::DivAssign => BinOp::Div,
+                            AssignOp::ModAssign => BinOp::Mod,
+                            AssignOp::BitAndAssign => BinOp::BitAnd,
+                            AssignOp::BitOrAssign => BinOp::BitOr,
+                            AssignOp::BitXorAssign => BinOp::BitXor,
+                            AssignOp::ShlAssign => BinOp::Shl,
+                            AssignOp::ShrAssign => BinOp::Shr,
+                            AssignOp::Assign => unreachable!(),
+                        };
+                        let new_val = self.emit_inst(Inst::BinOp {
+                            op: bin_op,
+                            left: current,
+                            right: rhs,
+                            ty: elem_ty.clone(),
+                        });
+                        self.emit_inst(Inst::Call {
+                            func: "p_vec_set".to_string(),
+                            args: vec![arr_val, idx_val, new_val],
+                            ret_ty: IrType::Void,
+                            effects: EffectSet::new(),
+                        });
+                    }
+                    return;
+                }
+
+                let elem_ty = match &arr_ty {
                     IrType::Array(inner, _) => *inner.clone(),
                     _ => IrType::I64,
                 };
@@ -1687,6 +1737,23 @@ impl Lowerer {
                 }
                 // Determine the struct type from receiver to mangle method name
                 let recv_ty = self.get_value_type(recv_val);
+
+                // Check if receiver is a trait object (dyn Trait) — use dynamic dispatch
+                if let IrType::Opaque(ref name) = recv_ty {
+                    if name.starts_with("dyn:") {
+                        let trait_name = name[4..].to_string();
+                        let ret_ty = IrType::I64;
+                        let effects = EffectSet::new();
+                        return self.emit_inst(Inst::DynCall {
+                            trait_name,
+                            method: method.clone(),
+                            args: all_args,
+                            ret_ty,
+                            effects,
+                        });
+                    }
+                }
+
                 let struct_name = match &recv_ty {
                     IrType::Ptr(inner) => match inner.as_ref() {
                         IrType::Struct(name) => Some(name.clone()),
@@ -2420,6 +2487,7 @@ impl Lowerer {
                     ret_ty: ret_ty.clone().unwrap_or(Type::I64),
                     body: body.clone(),
                     is_pub: false,
+                    is_comptime: false,
                 };
 
                 // Save current function context, lower the closure, restore context
@@ -2444,10 +2512,63 @@ impl Lowerer {
                 }
             }
             Expr::Cast { expr, target_ty } => {
+                // Casting to a trait object (dyn Trait) creates a Dyn value
+                if let crate::ast::Type::Dyn(trait_name) = target_ty {
+                    let val = self.lower_expr(expr);
+                    let src_ir_ty = self.get_value_type(val);
+                    let type_name = match &src_ir_ty {
+                        crate::ir::IrType::Struct(n) => n.clone(),
+                        crate::ir::IrType::Ptr(inner) => {
+                            match inner.as_ref() {
+                                crate::ir::IrType::Struct(n) => n.clone(),
+                                _ => "Unknown".to_string(),
+                            }
+                        }
+                        _ => "Unknown".to_string(),
+                    };
+                    return self.emit_inst(Inst::MakeDyn {
+                        value: val,
+                        type_name,
+                        trait_name: trait_name.clone(),
+                    });
+                }
                 let val = self.lower_expr(expr);
                 let src_ty = self.get_value_type(val);
                 let dst_ir_ty = lower_type(target_ty);
                 self.lower_cast(val, src_ty, dst_ir_ty)
+            }
+            Expr::Asm { template, operands } => {
+                let mut inputs: Vec<(String, ValueId)> = Vec::new();
+                let mut outputs: Vec<(String, ValueId)> = Vec::new();
+
+                for op in operands {
+                    match op.direction {
+                        crate::ast::AsmDir::In => {
+                            let val = self.lower_expr(&op.expr);
+                            inputs.push((op.reg.clone(), val));
+                        }
+                        crate::ast::AsmDir::Out => {
+                            // For out operands, we lower the expression to get a pointer
+                            // (it should be an lvalue). For now, lower the expr and store
+                            // the result after asm execution.
+                            let val = self.lower_expr(&op.expr);
+                            outputs.push((op.reg.clone(), val));
+                        }
+                    }
+                }
+
+                let ret_ty = if outputs.is_empty() {
+                    crate::ir::IrType::Void
+                } else {
+                    crate::ir::IrType::I64
+                };
+
+                self.emit_inst(Inst::Asm {
+                    template: template.clone(),
+                    inputs,
+                    outputs,
+                    ret_ty,
+                })
             }
         }
     }
@@ -2670,6 +2791,11 @@ impl Lowerer {
                 self.collect_free_vars_expr(end, free_vars, local_names);
             }
             Expr::Cast { expr, .. } => self.collect_free_vars_expr(expr, free_vars, local_names),
+            Expr::Asm { operands, .. } => {
+                for op in operands {
+                    self.collect_free_vars_expr(&op.expr, free_vars, local_names);
+                }
+            }
             Expr::Closure { params, body, .. } => {
                 let mut inner_locals = local_names.to_vec();
                 for p in params {
@@ -3092,6 +3218,15 @@ impl Lowerer {
                 IrType::Void
             }
             Expr::Cast { target_ty, .. } => lower_type(target_ty),
+            Expr::Asm { operands, .. } => {
+                // asm! returns I64 if there are output operands, Void otherwise
+                let has_out = operands.iter().any(|op| op.direction == crate::ast::AsmDir::Out);
+                if has_out {
+                    IrType::I64
+                } else {
+                    IrType::Void
+                }
+            }
         }
     }
 

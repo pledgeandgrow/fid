@@ -593,6 +593,14 @@ impl X86CodeGen {
                 wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
             }
 
+            Inst::MakeDyn { .. } => {
+                wln!(self, "    xor rax, rax  ; MakeDyn not yet supported");
+                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+            }
+            Inst::DynCall { .. } => {
+                wln!(self, "    xor rax, rax  ; DynCall not yet supported");
+                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+            }
             Inst::BitCast { value, .. } => {
                 let voff = frame.offset(*value);
                 wln!(self, "    mov rax, [rbp{}]", fmt_offset(voff));
@@ -625,6 +633,11 @@ impl X86CodeGen {
             Inst::TryUnwrap { .. } => {
                 // Simplified — not fully implemented in backend yet
                 wln!(self, "    ; TODO: TryUnwrap");
+            }
+            Inst::Asm { .. } => {
+                wln!(self, "    ; asm not yet supported");
+                wln!(self, "    xor rax, rax");
+                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
             }
         }
     }
