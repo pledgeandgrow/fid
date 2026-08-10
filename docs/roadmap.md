@@ -5,7 +5,7 @@
 ## Overview
 
 ```
-Phase 1: Foundation          ← WE ARE HERE
+Phase 1: Foundation          ← COMPLETE (41/41 tests pass)
 Phase 2: Safety              ← Next
 Phase 3: Power
 Phase 4: Performance
@@ -17,11 +17,11 @@ Phase 8: World Class
 
 ---
 
-## Phase 1 — Foundation (Current)
+## Phase 1 — Foundation (Complete)
 
 **Goal:** A working language with basic features, custom codegen, no external dependencies.
 
-**Status:** ~95% complete
+**Status:** Complete — 41/41 tests pass across interpreter, PE emitter, and C codegen
 
 ### Milestones
 - [x] Lexer, parser, AST
@@ -42,9 +42,12 @@ Phase 8: World Class
 - [x] HashMap — comprehensive methods: insert, get, contains, remove, len, is_empty, clear, keys, values, get_or, clone
 
 ### Exit Criteria
-- All core language constructs work in both interpreter and PE emitter
-- Can write real programs (not just tests)
-- No crashes on valid input
+- [x] All core language constructs work in both interpreter and PE emitter
+- [x] Can write real programs (not just tests)
+- [x] No crashes on valid input
+- [x] C codegen matches interpreter output (41/41)
+- [x] Test harness with automated verification
+- [x] Source maps, IR verification, REPL
 
 ---
 

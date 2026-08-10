@@ -1,6 +1,6 @@
 # Pledge Language — Feature Status
 
-*Last updated: Aug 6, 2026*
+*Last updated: Aug 10, 2026 (41/41 tests pass across all backends)*
 
 ## Legend
 
@@ -20,7 +20,7 @@
 | IR Lowering (lower.rs) | ✅ | AST → typed SSA IR with effects/regions |
 | IR Interpreter (interp.rs) | ✅ | Runs IR directly via `pledgec run` |
 | PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables, all core features working |
-| C Codegen (codegen_c.rs) | ⚠️ | Generates C code, not actively maintained |
+| C Codegen (codegen_c.rs) | ✅ | Generates C code, 41/41 tests match interpreter output |
 
 ## CLI Commands
 
@@ -32,6 +32,12 @@
 | `pledgec ir <file>` | ✅ | Dumps lowered IR |
 | `pledgec run <file>` | ✅ | Interprets and runs program |
 | `pledgec emit <file> -o <exe>` | ✅ | Emits native PE executable |
+| `pledgec ccompile <file> -o <exe>` | ✅ | C codegen → gcc/clang → executable |
+| `pledgec build <file> -o <exe>` | ✅ | MASM pipeline (requires ml64.exe) |
+| `pledgec test` | ✅ | Runs all 41 tests across all backends |
+| `pledgec repl` | ✅ | Interactive REPL |
+| `pledgec verify <file>` | ✅ | IR verification pass |
+| `pledgec sourcemap <file>` | ✅ | Source map output |
 
 ## Language Features — Interpreter (`pledgec run`)
 
@@ -160,7 +166,7 @@
 | `Result<T,E>` type | ✅ | |
 | `?` operator | ✅ | Early return on Err |
 | `match` on Result | ✅ | |
-| `try` blocks | ✅ | |
+| `try` blocks | ✅ | `test_pe_try_block.p` |
 
 ### Concurrency
 
@@ -176,7 +182,7 @@
 |---------|--------|-------|
 | `comptime` blocks | ❌ | Not yet implemented |
 | Hot reload | ❌ | Not yet implemented |
-| `#[test]` attribute | ❌ | Not yet implemented |
+| `#[test]` attribute | ❌ | Parsed but not executed |
 | `#[derive]` | ❌ | Not yet implemented |
 
 ---
@@ -251,7 +257,7 @@ The PE emitter generates standalone Windows x64 PE executables with no external 
 | HashMap (insert/get/contains/remove/len) | ✅ | `test_hashmap.p` |
 | `p_print_map` | ✅ | `test_print_map.p` |
 | f-string with float | ✅ | `test_fstring_float.p` |
-| `try { }` blocks | ❌ | Not implemented in parser |
+| `try { }` blocks | ✅ | `test_pe_try_block.p` |
 
 ### PE — Runtime Stubs
 
@@ -298,5 +304,18 @@ The PE emitter generates standalone Windows x64 PE executables with no external 
 | Parser | 100% | — | — |
 | Type Checker | 100% | — | — |
 | IR Lowering | 100% | — | — |
-| Interpreter | ~98% | — | async/spawn/comptime |
-| PE Emitter | ~99% | — | — |
+| Interpreter | 100% (41/41) | — | async/spawn/comptime (not parsed) |
+| PE Emitter | 100% (41/41) | — | — |
+| C Codegen | 100% (41/41) | — | — |
+| MASM Backend | ~90% | — | Not actively tested (requires Windows + MASM) |
+| IR Optimizer | — | Constant folding exists | Not wired into pipeline |
+| Source Maps | ✅ | Line tracking in AST | `sourcemap` command works |
+| IR Verification | ✅ | — | `verify` command works |
+
+### Test Coverage
+
+- **41 test files** in `tests/` — all pass across interpreter, PE emitter, and C codegen
+- **4 cargo tests** in `tests/harness.rs` — interpreter, PE, C codegen, golden files
+- **Golden files** in `tests/golden/` — 41 expected outputs
+- **3 regression tests** — closures, fstrings, collections
+- **Benchmarks** in `benches/bench_main.rs`

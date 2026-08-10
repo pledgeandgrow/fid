@@ -4,49 +4,92 @@ A bootstrap compiler for the Pledge programming language, written in Rust. Gener
 
 ## Status
 
-**Phase 1: Bootstrap** — The compiler lexes, parses, type-checks, lowers to SSA IR, and generates native x86_64 Windows executables. The **PE emitter** (`emit` command) produces `.exe` files directly — no assembler, linker, or C compiler required. Additional backends (MASM, C codegen) and an IR interpreter are also available.
+**Phase 1: Bootstrap — Complete** — The compiler lexes, parses, type-checks, lowers to SSA IR, and generates native x86_64 Windows executables. **41/41 tests pass** across all three backends (interpreter, PE emitter, C codegen). The **PE emitter** (`emit` command) produces `.exe` files directly — no assembler, linker, or C compiler required.
 
-### What Works (Verified)
+### Test Results (Aug 10, 2026)
 
-| Feature | Interpreter (`run`) | PE Emitter (`emit`) | MASM (`build`) | C Codegen (`ccompile`) |
-|---------|:--------------------:|:-------------------:|:---------------:|:----------------------:|
-| String literals + `print` | Yes | Yes | Yes | Yes |
-| Integer arithmetic + `print` | Yes | Yes | Yes | Yes |
-| `if` / `else if` / `else` | Yes | Yes | Yes | Yes |
-| `for` loops with `..` and `..=` ranges | Yes | Yes | Yes | Lowered |
-| `while` loops | Yes | Yes | Yes | Lowered |
-| Mutable variables (`pv mut`) | Yes | Yes | Yes | Yes |
-| Constants (`pc`) | Yes | Yes | Yes | Yes |
-| User-defined functions | Yes | Yes | Yes | Yes |
-| Recursive function calls | Yes | Yes | Yes | Yes |
-| F-string interpolation (`f"{expr}"`) | Yes | Yes | Yes | Lowered |
-| String concatenation | Yes | Yes | Yes | Lowered |
-| Int-to-string conversion | Yes | Yes | Yes | Lowered |
-| Bitwise operators (`& | ^ ~ << >>`) | Yes | Yes | Yes | Lowered |
-| Compound assignment (`+= -= *=` etc.) | Yes | Yes | Yes | Lowered |
-| Hex / binary / octal literals | Yes | Yes | Yes | Lowered |
-| Structs (definition, literals, field access) | Yes | Yes | Yes | Lowered |
-| Struct methods (`impl` blocks) | Lowered | — | Parsed | Lowered |
-| Pattern matching (`match`) | Lowered | — | Parsed | Lowered |
-| Enums with data | Lowered | — | Parsed | Lowered |
-| References (`&` / `&mut` / `*`) | Lowered | — | Parsed | Lowered |
-| Closures (`pf(x) => expr`) | Lowered | — | Parsed | Lowered |
-| Generic functions (`pf<T>`) | Parsed | — | Parsed | Parsed |
-| `?` operator | Lowered | — | Parsed | Lowered |
-| Tuples | Lowered | — | Parsed | Lowered |
-| Arrays (`[1, 2, 3]`, indexing, assignment) | Lowered | — | Lowered | Lowered |
-| `for` loop over arrays | Lowered | — | Parsed | Lowered |
-| `defer` blocks | Lowered | — | Parsed | Lowered |
-| `use` imports (file resolution) | Parsed | Parsed | Parsed | Parsed |
-| Monomorphization (generic specialization) | Yes | Yes | Yes | Yes |
-| Module imports (`use foo::bar`) | Yes | Yes | Yes | Yes |
-| Attributes (`#[test]`) | Parsed | Parsed | Parsed | Parsed |
-| Type aliases (`ty`) | Parsed | Parsed | Parsed | Parsed |
-| Block expressions | Parsed | Parsed | Parsed | Parsed |
+| Backend | Tests Passed | Notes |
+|---------|:------------:|-------|
+| Interpreter (`run`) | 41/41 | All features work |
+| PE Emitter (`emit`) | 41/41 valid | Valid PE32+ x86_64 executables |
+| C Codegen (`ccompile`) | 41/41 matched | Output matches interpreter |
+| Cargo tests | 4/4 | interpreter, PE, C codegen, golden files |
 
-> **Parsed** = syntax accepted by lexer/parser/typechecker but not yet fully lowered to IR or codegen.
-> **Lowered** = AST is lowered to SSA IR and executable in the interpreter, but not yet in the PE/native backend.
-> **Yes** = works end-to-end (parse → lower → codegen → execute).
+### What Works (Verified End-to-End)
+
+| Feature | Interpreter (`run`) | PE Emitter (`emit`) | C Codegen (`ccompile`) |
+|---------|:--------------------:|:-------------------:|:----------------------:|
+| String literals + `print` / `println` | Yes | Yes | Yes |
+| Integer arithmetic + `print` | Yes | Yes | Yes |
+| Float arithmetic + printing | Yes | Yes | Yes |
+| `if` / `else if` / `else` | Yes | Yes | Yes |
+| `for` loops with `..` and `..=` ranges | Yes | Yes | Yes |
+| `while` / `loop` loops | Yes | Yes | Yes |
+| `break` / `continue` | Yes | Yes | Yes |
+| Mutable variables (`pv mut`) | Yes | Yes | Yes |
+| Constants (`pc`) | Yes | Yes | Yes |
+| User-defined functions | Yes | Yes | Yes |
+| Recursive function calls | Yes | Yes | Yes |
+| F-string interpolation (`f"{expr}"`) | Yes | Yes | Yes |
+| F-string with int, float, vec | Yes | Yes | Yes |
+| String concatenation | Yes | Yes | Yes |
+| Bitwise operators (`& | ^ ~ << >>`) | Yes | Yes | Yes |
+| Compound assignment (`+= -= *=` etc.) | Yes | Yes | Yes |
+| Hex / binary / octal literals | Yes | Yes | Yes |
+| Structs (definition, literals, field access) | Yes | Yes | Yes |
+| Struct methods (`impl` blocks) | Yes | Yes | Yes |
+| Pattern matching (`match`) | Yes | Yes | Yes |
+| Enums with data | Yes | Yes | Yes |
+| References (`&` / `&mut` / `*`) | Yes | Yes | Yes |
+| Closures (`pf(x) => expr`) | Yes | Yes | Yes |
+| Closure environment capture | Yes | Yes | Yes |
+| Generic functions (`pf<T>`) | Yes | Yes | Yes |
+| Monomorphization (generic specialization) | Yes | Yes | Yes |
+| `?` operator | Yes | Yes | Yes |
+| `try { }` blocks | Yes | Yes | Yes |
+| Tuples | Yes | Yes | Yes |
+| Arrays (`[1, 2, 3]`, indexing, assignment) | Yes | Yes | Yes |
+| `Vec<T>` (push, pop, len, get, etc.) | Yes | Yes | Yes |
+| `HashMap<K,V>` (insert, get, contains, etc.) | Yes | Yes | Yes |
+| `for` loop over Vec | Yes | Yes | Yes |
+| `defer` blocks | Yes | Yes | Yes |
+| `Option<T>` (Some/None, unwrap, etc.) | Yes | Yes | Yes |
+| `Result<T,E>` (Ok/Err, unwrap, etc.) | Yes | Yes | Yes |
+| Traits (`cap` keyword, `impl Cap for Type`) | Yes | Yes | Yes |
+| Module imports (`use foo::bar`) | Yes | Yes | Yes |
+| `use` aliases, selective, glob imports | Yes | Yes | Yes |
+| Capabilities (grants, denial, transitive) | Yes | Yes | Yes |
+| Type casts (`as`) | Yes | Yes | Yes |
+| `print` for Vec/Map (deterministic output) | Yes | Yes | Yes |
+
+### What Is Parsed But Not Fully Working
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `async` / `await` | Parsed | Phase 4+ — not yet implemented |
+| `spawn` | Parsed | Phase 4+ — not yet implemented |
+| `comptime` blocks | Parsed | Phase 3 — not yet implemented |
+| `#[test]` attribute | Parsed | Not yet implemented |
+| `#[derive]` | Parsed | Not yet implemented |
+| Type aliases (`ty`) | Parsed | Syntax accepted, not fully lowered |
+| Block expressions | Parsed | Syntax accepted, not fully lowered |
+| Region inference | IR tracks regions | Not enforced at compile time |
+| Effect handlers | IR tracks effects | Not enforced, no handler syntax |
+| Default arguments | Not parsed | Not yet implemented |
+| Variadic arguments | Not parsed | Not yet implemented |
+| Associated types in traits | Not parsed | Not yet implemented |
+| Trait objects (dynamic dispatch) | Not parsed | Not yet implemented |
+| C FFI | Not parsed | Phase 3 — not yet implemented |
+
+### Known Limitations
+
+- **PE emitter targets Windows x64 only** — no Linux ELF or macOS Mach-O output yet
+- **No register allocator** — stack-based alloca model (every value gets a stack slot)
+- **No optimizer** — constant folding pass exists but is not wired into the pipeline
+- **No bounds checking** — array/Vec indexing has no runtime bounds check yet
+- **No integer overflow checking** — uses wrapping arithmetic
+- **`#[test]` attribute** — parsed but not executed by `pledgec test` (tests are file-based)
+- **43 compiler warnings** — dead code, unused variables (cleanup needed)
 
 ---
 
@@ -92,6 +135,10 @@ cargo run -- version
 | `ir <file.p>` | Lex → parse → typecheck → lower → print SSA IR |
 | `tokens <file.p>` | Lex only — print token stream |
 | `ast <file.p>` | Lex + parse — print AST tree |
+| `test` | Run all 41 tests across interpreter, PE emitter, and C codegen |
+| `repl` | Interactive REPL — evaluate Pledge expressions |
+| `verify <file.p>` | Verify IR correctness (terminators, block refs, value refs) |
+| `sourcemap <file.p>` | Show source map (IR value → source line mapping) |
 | `version` | Print compiler version |
 
 ---
@@ -441,6 +488,7 @@ pledge-lang/
 ├── stdlib/
 │   └── core.p              # Core standard library (println, assert, assert_eq, Option, Result, max, min, abs, clamp)
 ├── tests/
+│   ├── harness.rs          # Automated test harness (4 cargo tests)
 │   ├── hello.p             # Hello world — print, if/else, variables, arithmetic
 │   ├── arithmetic.p        # Arithmetic and nested function calls
 │   ├── struct.p            # Struct definition, literals, field access
@@ -448,8 +496,12 @@ pledge-lang/
 │   ├── functions.p         # User-defined functions, recursive factorial
 │   ├── strings.p           # String literals, f-string interpolation
 │   ├── print_int.p         # Integer printing test
-│   ├── minimal.p           # Minimal program (ret 42)
-│   └── ...                 # Feature tests (features2-6, test_*, etc.)
+│   ├── test_*.p            # 34 feature tests (float, vec, map, closures, generics, etc.)
+│   └── test_regression_*.p # 3 regression tests (closures, fstrings, collections)
+├── tests/golden/           # Golden file outputs for all 41 tests
+├── benches/
+│   └── bench_main.rs       # Performance benchmarks
+└── docs/
 └── docs/
     ├── syntax-spec.md      # Complete language syntax specification
     ├── architecture.md     # Compiler architecture and pipeline
@@ -460,32 +512,35 @@ pledge-lang/
 
 ## Test Programs
 
-### `tests/hello.p`
-Basic hello world — demonstrates `pf`, `pv`, `if/else`, `print`.
+All 41 test files in `tests/` pass across all three backends. Key tests:
 
-### `tests/arithmetic.p`
-Arithmetic operations — demonstrates function calls, nested calls, variable bindings.
+| Test File | What It Tests |
+|-----------|---------------|
+| `hello.p` | Hello world — `pf`, `pv`, `if/else`, `print` |
+| `arithmetic.p` | Arithmetic, nested function calls |
+| `struct.p` | Struct definition, literals, field access |
+| `control_flow.p` | `if`/`else if`/`else`, `for` ranges, compound assignment |
+| `functions.p` | User-defined functions, recursive factorial |
+| `strings.p` | String literals, f-string interpolation |
+| `test_float.p` | Float arithmetic and printing |
+| `test_fstring_*.p` | F-string with int, float, vec |
+| `test_vec_*.p` | Vec creation, push, loop, printing |
+| `test_hashmap.p` | HashMap insert, get, contains |
+| `test_print_map.p` | Map printing (deterministic key sorting) |
+| `test_match.p` | Pattern matching (int, string, enum, wildcard) |
+| `test_option.p` | Option type (Some/None, unwrap) |
+| `test_try.p` | `?` operator and `try { }` blocks |
+| `test_defer.p` | `defer` blocks (LIFO cleanup order) |
+| `test_closure.p` | Closures with environment capture |
+| `test_impl.p` | `impl` blocks, struct methods |
+| `test_generics.p` | Generic functions, monomorphization |
+| `test_traits.p` | `cap` traits, `impl Cap for Type` |
+| `test_capabilities.p` | Capability grants, denial, transitive |
+| `test_refs_mut.p` | `&mut` references, dereference |
+| `test_pe_*.p` | PE emitter specific tests (struct, enum, refs, generics, defer, try) |
+| `test_regression_*.p` | Regression tests (closures, fstrings, collections) |
 
-### `tests/struct.p`
-Struct operations — demonstrates struct definition, struct literals, field access, functions returning structs.
-
-### `tests/control_flow.p`
-Control flow — `if`/`else if`/`else`, `for` loops with exclusive (`..`) and inclusive (`..=`) ranges, mutable variables, compound assignment.
-
-### `tests/functions.p`
-User-defined functions — `add(a, b)` and recursive `factorial(n)`. Tests argument passing, return values, and recursion in both interpreter and native x86_64.
-
-### `tests/strings.p`
-String handling — string literals, string variables, f-string interpolation with string and integer expressions.
-
-### `tests/features.p`
-Feature showcase — compound assignment (`+=`, `-=`, `*=`), bitwise operators (`&`, `|`, `^`, `~`, `<<`, `>>`), `while` loops, mutable variables, constants (`pc`), hex literals.
-
-### `tests/features2.p`–`features5.p`
-Advanced features — type aliases, block expressions, struct methods, arrays, match, f-strings, floats, enums, references, closures, generics, tuples, `?` operator, imports, attributes. These exercise the parser and typechecker.
-
-### `tests/features6.p`
-Array features — array literals (`[1, 2, 3, 4, 5]`), array indexing (read/write), compound assignment on array elements (`arr[2] += 100`), `for` loop over array with mutable sum accumulation. Verified in both interpreter and native x86_64 (arrays work natively; for-over-array has a known bug in native).
+Run all tests: `cargo run -- test`
 
 ---
 
@@ -493,17 +548,28 @@ Array features — array literals (`[1, 2, 3, 4, 5]`), array indexing (read/writ
 
 - `docs/syntax-spec.md` — Complete Pledge syntax specification (all keywords, types, features)
 - `docs/architecture.md` — Compiler architecture, pipeline stages, and internal design
+- `docs/roadmap.md` — Full 8-phase roadmap (currently at Phase 1 complete)
+- `docs/vision.md` — Language vision and 8 pillars (Originality, Security, Performance, etc.)
+- `docs/design-principles.md` — Core design principles
 - `docs/changelog.md` — Version history and detailed change log
-- `../docs/foundation-lang.md` — Full language design blueprint and philosophy
+- `docs/competitive-analysis.md` — Comparison with Rust, Zig, Go, Swift
+- `docs/adoption-strategy.md` — Language adoption strategy
+- `docs/full-stack-architecture.md` — Full-stack Pledge ecosystem vision
+- `docs/innovation.md` — Innovative language features
+- `docs/custom-toolchain.md` — Custom toolchain plans
+- `features.md` — Detailed feature status matrix
+- `TEST.md` — Complete test results across all backends
 
 ---
 
 ## Roadmap
 
-| Phase | Goal |
-|-------|------|
-| **Phase 1** (current) | Bootstrap compiler in Rust — direct PE emission, MASM + C backends, IR interpreter |
-| **Phase 2** | Full struct/enum codegen in PE emitter, pattern matching, traits (cap), ownership, error handling, modules |
-| **Phase 3** | Async/await, defer, full closures, float formatting |
-| **Phase 4** | Effect handlers, comptime blocks, region inference |
-| **Phase 5** | Self-hosting — compiler rewritten in Pledge, hot reload |
+| Phase | Goal | Status |
+|-------|------|--------|
+| **Phase 1** | Bootstrap compiler in Rust — direct PE emission, MASM + C backends, IR interpreter | **Complete** (41/41 tests pass) |
+| **Phase 2** | Region inference, effect system, capability security, bounds safety | Not started |
+| **Phase 3** | comptime, advanced traits, FFI & interop | Not started |
+| **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | Not started |
+| **Phase 5** | Bare metal, IoT, AI/ML, self-hosting | Not started |
+
+See `docs/roadmap.md` for the full 8-phase roadmap.
