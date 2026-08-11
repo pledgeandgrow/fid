@@ -5,7 +5,7 @@
 // native binaries via gcc/clang.
 
 use crate::ir::*;
-use crate::ast::{BinOp, UnaryOp};
+use crate::ast::{self, BinOp, UnaryOp};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -53,6 +53,9 @@ pub struct CCodeGen {
     /// Function return types, keyed by IR function name.  Used for CallPtr
     /// dispatch to filter candidates by return type.
     fn_ret_types: HashMap<String, IrType>,
+    /// Set of user-defined extern function names (FFI). These should NOT be
+    /// sanitized (they keep their original C names).
+    extern_func_names: std::collections::HashSet<String>,
 }
 
 impl CCodeGen {
@@ -69,6 +72,7 @@ impl CCodeGen {
             struct_layouts: HashMap::new(),
             user_functions: std::collections::HashSet::new(),
             fn_ret_types: HashMap::new(),
+            extern_func_names: std::collections::HashSet::new(),
         }
     }
 
@@ -143,8 +147,12 @@ impl CCodeGen {
 
     /// Sanitize a Pledge function name for use as a C identifier.
     /// Renames functions that collide with C keywords or C runtime names.
-    fn sanitize_c_name(name: &str) -> &str {
-        match name {
+    fn sanitize_c_name(&self, name: &str) -> String {
+        // Don't sanitize user-defined extern function names (FFI)
+        if self.extern_func_names.contains(name) {
+            return name.to_string();
+        }
+        let sanitized = match name {
             "main" => "main_entry",
             "abs" => "p_abs",
             "max" => "p_max",
@@ -185,8 +193,9 @@ impl CCodeGen {
             "goto" => "p_goto",
             "inline" => "p_inline",
             "restrict" => "p_restrict",
-            other => other,
-        }
+            other => return other.to_string(),
+        };
+        sanitized.to_string()
     }
 
     /// Escape a string for use as a C string literal.
@@ -247,9 +256,14 @@ impl CCodeGen {
         // Collect user-defined function names (for CallPtr dispatch)
         self.user_functions.clear();
         self.fn_ret_types.clear();
+        self.extern_func_names.clear();
         for (name, func) in &module.functions {
             self.user_functions.insert(name.clone());
             self.fn_ret_types.insert(name.clone(), func.ret_ty.clone());
+        }
+        // Collect extern function names (these should NOT be sanitized)
+        for ext in &module.extern_decls {
+            self.extern_func_names.insert(ext.pledge_name.clone());
         }
         // Runtime functions (not in module.functions) — needed so that
         // call-site argument casting knows their parameter types.
@@ -257,6 +271,12 @@ impl CCodeGen {
 
         // Emit runtime header
         self.emit_runtime_header();
+
+        // Emit user-defined extern includes and declarations
+        self.emit_extern_decls(module);
+
+        // Emit runtime types and declarations
+        self.emit_runtime_types();
 
         // Emit string constants
         self.emit_string_consts(module);
@@ -366,6 +386,7 @@ impl CCodeGen {
             "p_map_insert", "p_map_remove", "p_map_clear",
             "p_print", "p_print_str", "p_print_int", "p_print_bool",
             "p_print_float", "p_print_newline", "p_free", "p_panic",
+            "p_socket_close",
         ];
         for name in void_ret {
             self.fn_ret_types.insert(name.to_string(), IrType::Void);
@@ -380,6 +401,18 @@ impl CCodeGen {
         wln!(self, "#include <stdint.h>");
         wln!(self, "#include <stdbool.h>");
         wln!(self, "#include <ctype.h>");
+        // Socket support for native HTTP server (Phase 5D)
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "#include <winsock2.h>");
+        wln!(self, "#include <ws2tcpip.h>");
+        wln!(self, "#pragma comment(lib, \"ws2_32.lib\")");
+        wln!(self, "#else");
+        wln!(self, "#include <sys/socket.h>");
+        wln!(self, "#include <netinet/in.h>");
+        wln!(self, "#include <arpa/inet.h>");
+        wln!(self, "#include <unistd.h>");
+        wln!(self, "#include <fcntl.h>");
+        wln!(self, "#endif");
         wln!(self, "");
         // Undefine MSVC macros that conflict with function names
         wln!(self, "#ifdef max");
@@ -392,6 +425,86 @@ impl CCodeGen {
         wln!(self, "#undef abs");
         wln!(self, "#endif");
         wln!(self, "");
+    }
+
+    /// Emit user-defined extern declarations (FFI)
+    fn emit_extern_decls(&mut self, module: &IrModule) {
+        if module.extern_decls.is_empty() {
+            return;
+        }
+
+        // Emit #include directives
+        let mut emitted_includes: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for ext in &module.extern_decls {
+            if let Some(inc) = &ext.include {
+                if emitted_includes.insert(inc.clone()) {
+                    wln!(self, "#include {}", inc);
+                }
+            }
+        }
+        if !emitted_includes.is_empty() {
+            wln!(self, "");
+        }
+
+        // Emit link library directives (parsed by the ccompile command)
+        let mut emitted_libs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for ext in &module.extern_decls {
+            if let Some(lib) = &ext.link_lib {
+                if emitted_libs.insert(lib.clone()) {
+                    wln!(self, "// PLINK: {}", lib);
+                }
+            }
+        }
+
+        // Emit extern function declarations
+        wln!(self, "// ─── User-defined extern declarations (FFI) ───");
+        for ext in &module.extern_decls {
+            let ret_c = self.c_type_from_ast(&ext.ret_ty);
+            let params_c: Vec<String> = ext.params.iter()
+                .map(|p| format!("{} {}", self.c_type_from_ast(&p.ty), p.name))
+                .collect();
+            let params_str = if params_c.is_empty() {
+                "void".to_string()
+            } else {
+                params_c.join(", ")
+            };
+            // Emit the C declaration with the C function name
+            wln!(self, "{} {}({});", ret_c, ext.c_name, params_str);
+            // If pledge_name differs from c_name, emit a macro alias
+            if ext.pledge_name != ext.c_name {
+                wln!(self, "#define {} {}", ext.pledge_name, ext.c_name);
+            }
+        }
+        wln!(self, "");
+    }
+
+    /// Convert an AST type to a C type string
+    fn c_type_from_ast(&self, ty: &ast::Type) -> String {
+        match ty {
+            ast::Type::I8 => "int8_t".to_string(),
+            ast::Type::I16 => "int16_t".to_string(),
+            ast::Type::I32 => "int32_t".to_string(),
+            ast::Type::I64 => "int64_t".to_string(),
+            ast::Type::I128 => "__int128".to_string(),
+            ast::Type::U8 => "uint8_t".to_string(),
+            ast::Type::U16 => "uint16_t".to_string(),
+            ast::Type::U32 => "uint32_t".to_string(),
+            ast::Type::U64 => "uint64_t".to_string(),
+            ast::Type::U128 => "unsigned __int128".to_string(),
+            ast::Type::F32 => "float".to_string(),
+            ast::Type::F64 => "double".to_string(),
+            ast::Type::Bool => "bool".to_string(),
+            ast::Type::Void => "void".to_string(),
+            ast::Type::Str => "const char*".to_string(),
+            ast::Type::Named(n) if n == "str" => "const char*".to_string(),
+            ast::Type::Named(n) => n.clone(),
+            ast::Type::Ref { inner, .. } => format!("{}*", self.c_type_from_ast(inner)),
+            _ => "void*".to_string(),
+        }
+    }
+
+    /// Emit runtime types and function declarations (continuation of emit_runtime_header)
+    fn emit_runtime_types(&mut self) {
         wln!(self, "// ─── Runtime types ───");
         wln!(self, "typedef struct { void** data; int64_t len; int64_t cap; } PVec;");
         wln!(self, "typedef struct { char** keys; int64_t* vals; int64_t len; int64_t cap; } PMap;");
@@ -448,6 +561,18 @@ impl CCodeGen {
         wln!(self, "void p_panic(const char* msg);");
         wln!(self, "void* p_malloc(int64_t size);");
         wln!(self, "void p_free(void* ptr);");
+        // Allocator builtins (Phase 2A.8)
+        wln!(self, "void* p_allocator_create(void* arg);");
+        wln!(self, "int64_t p_allocator_alloc(void* alloc, int64_t size);");
+        wln!(self, "void p_allocator_free(void* alloc, int64_t ptr);");
+        wln!(self, "int64_t p_allocator_stats(void* alloc);");
+        // Socket builtins (native HTTP server, Phase 5D)
+        wln!(self, "int64_t p_socket_listen(int64_t port);");
+        wln!(self, "int64_t p_socket_accept(int64_t fd);");
+        wln!(self, "int64_t p_socket_read(int64_t fd, char* buf, int64_t max_len);");
+        wln!(self, "int64_t p_socket_write(int64_t fd, const char* buf, int64_t len);");
+        wln!(self, "void p_socket_close(int64_t fd);");
+        wln!(self, "char* p_socket_recv_str(int64_t fd);");
         wln!(self, "int64_t print(int64_t val);");
         wln!(self, "int64_t print_str(const char* s);");
         wln!(self, "void p_vec_clear(PVec* v);");
@@ -502,7 +627,7 @@ impl CCodeGen {
     fn emit_prototypes(&mut self, module: &IrModule) {
         wln!(self, "// ─── Function prototypes ───");
         for (name, func) in &module.functions {
-            let proto_name = Self::sanitize_c_name(name);
+            let proto_name = self.sanitize_c_name(name);
             let ret_ty = if name == "main" { "int64_t".to_string() } else { Self::c_ret_type(&func.ret_ty) };
             let params: Vec<String> = func
                 .params
@@ -531,7 +656,7 @@ impl CCodeGen {
         self.label_counter = 0;
 
         // Rename functions that conflict with C keywords or C runtime names
-        let c_name = Self::sanitize_c_name(name);
+        let c_name = self.sanitize_c_name(name);
 
         // Register params
         for (id, _) in &func.params {
@@ -929,7 +1054,7 @@ impl CCodeGen {
                     }
                     return;
                 }
-                let c_fname = Self::sanitize_c_name(fname);
+                let c_fname = self.sanitize_c_name(fname);
                 // Look up the called function's parameter types so we can
                 // cast arguments to the correct C type (e.g. the hidden
                 // context pointer is passed as I64 0 but the parameter is
@@ -1024,7 +1149,7 @@ impl CCodeGen {
                 dispatch.push_str("        if (!_fn_name) abort();\n");
                 let mut first = true;
                 for &fname in &candidates {
-                    let c_fname = Self::sanitize_c_name(fname);
+                    let c_fname = self.sanitize_c_name(fname);
                     let param_types = self.fn_param_types.get(fname);
                     // Build call args, casting each to the candidate function's
                     // parameter type.  The first param is always the ctx/env
@@ -1189,6 +1314,9 @@ impl CCodeGen {
                 let escaped = template.replace("\\", "\\\\").replace("\"", "\\\"");
                 wln!(self, "    __asm__ volatile(\"{}\");", escaped);
             }
+            Inst::RegionBegin { .. } | Inst::RegionEnd { .. } => {
+                // Region begin/end — no-op in C backend (C manages its own memory)
+            }
         }
     }
 
@@ -1349,6 +1477,11 @@ impl CCodeGen {
         wln!(self, "void p_panic(const char* msg) { fprintf(stderr, \"%s\\n\", msg); abort(); }");
         wln!(self, "void* p_malloc(int64_t size) { return malloc((size_t)size); }");
         wln!(self, "void p_free(void* ptr) { free(ptr); }");
+        // Allocator builtins (Phase 2A.8) — simplified stubs
+        wln!(self, "void* p_allocator_create(void* arg) { (void)arg; return (void*)1; }");
+        wln!(self, "int64_t p_allocator_alloc(void* alloc, int64_t size) { (void)alloc; return (int64_t)(intptr_t)malloc((size_t)size); }");
+        wln!(self, "void p_allocator_free(void* alloc, int64_t ptr) { (void)alloc; free((void*)(intptr_t)ptr); }");
+        wln!(self, "int64_t p_allocator_stats(void* alloc) { (void)alloc; return 0; }");
         wln!(self, "int64_t print(int64_t val) { printf(\"%lld\\n\", (long long)val); return 0; }");
         wln!(self, "int64_t print_str(const char* s) { printf(\"%s\\n\", s); return 0; }");
         wln!(self, "");
@@ -1532,6 +1665,98 @@ impl CCodeGen {
         wln!(self, "    snprintf(buf, 32, \"%g\", val);");
         wln!(self, "    return buf;");
         wln!(self, "}}");
+
+        // ─── Socket builtins (native HTTP server, Phase 5D) ───
+        wln!(self, "");
+        wln!(self, "// Socket operations — native POSIX/Winsock implementation");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "static int ws_initialized = 0;");
+        wln!(self, "static void init_winsock(void) {");
+        wln!(self, "    if (!ws_initialized) { WSADATA d; WSAStartup(MAKEWORD(2,2), &d); ws_initialized = 1; }");
+        wln!(self, "}");
+        wln!(self, "#endif");
+        wln!(self, "");
+        wln!(self, "int64_t p_socket_listen(int64_t port) {");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    init_winsock();");
+        wln!(self, "    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);");
+        wln!(self, "    if (s == INVALID_SOCKET) return -1;");
+        wln!(self, "#else");
+        wln!(self, "    int s = socket(AF_INET, SOCK_STREAM, 0);");
+        wln!(self, "    if (s < 0) return -1;");
+        wln!(self, "#endif");
+        wln!(self, "    int opt = 1;");
+        wln!(self, "    setsockopt((int)s, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));");
+        wln!(self, "    struct sockaddr_in addr;");
+        wln!(self, "    memset(&addr, 0, sizeof(addr));");
+        wln!(self, "    addr.sin_family = AF_INET;");
+        wln!(self, "    addr.sin_addr.s_addr = INADDR_ANY;");
+        wln!(self, "    addr.sin_port = htons((int)port);");
+        wln!(self, "    if (bind((int)s, (struct sockaddr*)&addr, sizeof(addr)) < 0) {");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "        closesocket(s);");
+        wln!(self, "#else");
+        wln!(self, "        close(s);");
+        wln!(self, "#endif");
+        wln!(self, "        return -1;");
+        wln!(self, "    }");
+        wln!(self, "    if (listen((int)s, 10) < 0) {");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "        closesocket(s);");
+        wln!(self, "#else");
+        wln!(self, "        close(s);");
+        wln!(self, "#endif");
+        wln!(self, "        return -1;");
+        wln!(self, "    }");
+        wln!(self, "    return (int64_t)s;");
+        wln!(self, "}");
+        wln!(self, "");
+        wln!(self, "int64_t p_socket_accept(int64_t fd) {");
+        wln!(self, "    struct sockaddr_in client;");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    int clen = sizeof(client);");
+        wln!(self, "    SOCKET c = accept((SOCKET)fd, (struct sockaddr*)&client, &clen);");
+        wln!(self, "    return (c == INVALID_SOCKET) ? -1 : (int64_t)c;");
+        wln!(self, "#else");
+        wln!(self, "    socklen_t clen = sizeof(client);");
+        wln!(self, "    int c = accept((int)fd, (struct sockaddr*)&client, &clen);");
+        wln!(self, "    return (int64_t)c;");
+        wln!(self, "#endif");
+        wln!(self, "}");
+        wln!(self, "");
+        wln!(self, "int64_t p_socket_read(int64_t fd, char* buf, int64_t max_len) {");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    int n = recv((SOCKET)fd, buf, (int)max_len, 0);");
+        wln!(self, "#else");
+        wln!(self, "    ssize_t n = read((int)fd, buf, (size_t)max_len);");
+        wln!(self, "#endif");
+        wln!(self, "    return (n < 0) ? -1 : (int64_t)n;");
+        wln!(self, "}");
+        wln!(self, "");
+        wln!(self, "int64_t p_socket_write(int64_t fd, const char* buf, int64_t len) {");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    int n = send((SOCKET)fd, buf, (int)len, 0);");
+        wln!(self, "#else");
+        wln!(self, "    ssize_t n = write((int)fd, buf, (size_t)len);");
+        wln!(self, "#endif");
+        wln!(self, "    return (n < 0) ? -1 : (int64_t)n;");
+        wln!(self, "}");
+        wln!(self, "");
+        wln!(self, "void p_socket_close(int64_t fd) {");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "    closesocket((SOCKET)fd);");
+        wln!(self, "#else");
+        wln!(self, "    close((int)fd);");
+        wln!(self, "#endif");
+        wln!(self, "}");
+        wln!(self, "");
+        wln!(self, "char* p_socket_recv_str(int64_t fd) {");
+        wln!(self, "    char buf[4096];");
+        wln!(self, "    int64_t n = p_socket_read(fd, buf, sizeof(buf)-1);");
+        wln!(self, "    if (n <= 0) return strdup(\"\");");
+        wln!(self, "    buf[n] = 0;");
+        wln!(self, "    return strdup(buf);");
+        wln!(self, "}");
     }
 }
 

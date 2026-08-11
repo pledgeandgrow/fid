@@ -956,6 +956,13 @@ impl WasmCodeGen {
                     self.emit_const_i64(out, 0);
                 }
             }
+            Inst::RegionBegin { .. } => {
+                // Region begin — push a fake region handle (0)
+                self.emit_const_i64(out, 0);
+            }
+            Inst::RegionEnd { .. } => {
+                // Region end — no-op in WASM
+            }
         }
     }
 
@@ -1201,4 +1208,31 @@ pub fn dump_wat(module: &IrModule) -> String {
 
 fn gen_func_names(module: &IrModule) -> Vec<String> {
     module.functions.keys().cloned().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compiler;
+
+    #[test]
+    fn test_wasm_magic_and_header() {
+        let source = "pf main() { ret 0; }";
+        let bytes = compiler::compile_to_wasm(source, "test.p", false).unwrap();
+        // WASM magic: \0asm
+        assert_eq!(&bytes[0..4], b"\0asm");
+        // Version 1
+        assert_eq!(&bytes[4..8], &[1, 0, 0, 0]);
+        // Must have at least type + code sections
+        assert!(bytes.len() > 8);
+    }
+
+    #[test]
+    fn test_wat_dump() {
+        let source = "pf main() { ret 0; }";
+        let wat = compiler::compile_to_wasm(source, "test.p", true).unwrap();
+        let s = String::from_utf8(wat).unwrap();
+        assert!(s.contains("SPIR-V") || s.contains("WASM") || s.contains("magic"));
+        assert!(s.contains("section"));
+    }
 }

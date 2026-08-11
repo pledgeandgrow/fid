@@ -90,13 +90,15 @@ impl Tensor {
     /// Get an element by multi-index.
     pub fn get(&self, indices: &[i64]) -> f64 {
         let fi = self.flat_index(indices);
-        self.data[fi]
+        if fi < self.data.len() { self.data[fi] } else { 0.0 }
     }
 
     /// Set an element by multi-index.
     pub fn set(&mut self, indices: &[i64], value: f64) {
         let fi = self.flat_index(indices);
-        self.data[fi] = value;
+        if fi < self.data.len() {
+            self.data[fi] = value;
+        };
     }
 
     /// Reshape the tensor (total size must be preserved).
@@ -362,12 +364,14 @@ impl Tensor {
     pub fn to_string(&self) -> String {
         fn format_recursive(data: &[f64], shape: &[usize], strides: &[usize], offset: usize) -> String {
             if shape.is_empty() {
-                return format!("{}", data[offset]);
+                let v = if offset < data.len() { data[offset] } else { 0.0 };
+                return format!("{}", v);
             }
             if shape.len() == 1 {
                 let items: Vec<String> = (0..shape[0])
                     .map(|i| {
-                        let v = data[offset + i * strides[0]];
+                        let idx = offset + i * strides[0];
+                        let v = if idx < data.len() { data[idx] } else { 0.0 };
                         if v == v.trunc() && v.is_finite() && v.abs() < 1e15 {
                             format!("{}", v as i64)
                         } else {

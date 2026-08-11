@@ -40,6 +40,8 @@ pub enum TokenKind {
     Continue,    // continue
     Handle,      // handle — effect handler
     Do,          // do — perform effect operation
+    Interrupt,   // interrupt — interrupt handler (bare-metal)
+    Extern,      // extern — FFI declarations
     True,
     False,
 
@@ -175,6 +177,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Continue => write!(f, "continue"),
             TokenKind::Handle => write!(f, "handle"),
             TokenKind::Do => write!(f, "do"),
+            TokenKind::Interrupt => write!(f, "interrupt"),
             TokenKind::True => write!(f, "true"),
             TokenKind::False => write!(f, "false"),
             TokenKind::IntLit(n) => write!(f, "{}", n),

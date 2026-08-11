@@ -149,3 +149,28 @@ pub pf clamp(n: i64, lo: i64, hi: i64) -> i64 {
     if n > hi { ret hi; }
     ret n;
 }
+
+// ─── Allocator (Phase 2A.8) ───
+// Explicit allocator-as-parameter, like Zig, but verified at compile time.
+// Functions that declare !Alloc must take an Allocator parameter.
+
+// Builtin: p_allocator_create — create a named allocator
+// Builtin: p_allocator_alloc — allocate memory from an allocator
+// Builtin: p_allocator_free — free memory back to an allocator
+// Builtin: p_allocator_stats — get allocation stats (bytes allocated)
+
+pub pf create_allocator(name: str) -> Allocator {
+    ret p_allocator_create(name);
+}
+
+pub pf allocator_alloc(alloc: &Allocator, size: i64) -> i64 {
+    ret p_allocator_alloc(alloc, size);
+}
+
+pub pf allocator_free(alloc: &Allocator, ptr: i64) -> void {
+    p_allocator_free(alloc, ptr);
+}
+
+pub pf allocator_bytes_used(alloc: &Allocator) -> i64 {
+    ret p_allocator_stats(alloc);
+}

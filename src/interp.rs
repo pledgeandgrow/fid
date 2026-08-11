@@ -41,6 +41,9 @@ pub enum Value {
     Tensor(Rc<RefCell<Tensor>>),
     /// JSON value (Phase 5D.2)
     Json(Rc<RefCell<json::Json>>),
+    /// Allocator — explicit memory allocator (Phase 2A)
+    /// Stores the region name it was created in. Used for allocator-as-parameter verification.
+    Allocator(CompactString),
 }
 
 impl std::fmt::Display for Value {
@@ -57,6 +60,7 @@ impl std::fmt::Display for Value {
             Value::Dyn(t, _) => write!(f, "dyn({})", t),
             Value::Tensor(t) => write!(f, "{}", t.borrow().to_string()),
             Value::Json(j) => write!(f, "{}", json::dump(&j.borrow(), false)),
+            Value::Allocator(a) => write!(f, "alloc({})", a),
         }
     }
 }
@@ -851,6 +855,23 @@ impl Interpreter {
                     crate::ir::IrType::Void => ExecOutcome::Continue,
                     _ => ExecOutcome::Value(Value::Int(0)),
                 }
+            }
+            Inst::RegionBegin { name } => {
+                // Begin a named region — in the interpreter, this is a no-op
+                // (memory is managed by the interpreter's allocation tracking).
+                // Return a fake region handle.
+                if self.debug_mode {
+                    eprintln!("[region] begin {}", name);
+                }
+                ExecOutcome::Value(Value::Int(0))
+            }
+            Inst::RegionEnd { name } => {
+                // End a named region — in the interpreter, this is a no-op.
+                // In a native backend, this would free all memory in the region.
+                if self.debug_mode {
+                    eprintln!("[region] end {}", name);
+                }
+                ExecOutcome::Continue
             }
         }
     }
@@ -1693,20 +1714,9 @@ impl Interpreter {
             // ─── Phase 5D.2: JSON builtins (string-based) ───
             "p_json_parse" => {
                 if let Some(s) = args.first() {
-                    let text = match s {
-                        Value::Str(s) => s.to_string(),
-                        Value::Ptr(addr) => {
-                            let mut bytes = Vec::new();
-                            let mut offset = *addr;
-                            loop {
-                                let b = self.memory.load(offset, 1);
-                                if b[0] == 0 { break; }
-                                bytes.push(b[0]);
-                                offset += 1;
-                            }
-                            String::from_utf8_lossy(&bytes).to_string()
-                        }
-                        _ => return ExecOutcome::Panic("json_parse: expected string".to_string()),
+                    let text = match self.arg_string(s) {
+                        Some(t) => t,
+                        None => return ExecOutcome::Panic("json_parse: expected string".to_string()),
                     };
                     match json::parse(&text) {
                         Ok(j) => ExecOutcome::Value(Value::Str(CompactString::from(json::dump(&j, false)))),
@@ -1717,11 +1727,10 @@ impl Interpreter {
                 }
             }
             "p_json_dump" => {
-                // Same as parse — canonicalize
                 if let Some(s) = args.first() {
-                    let text = match s {
-                        Value::Str(s) => s.to_string(),
-                        _ => return ExecOutcome::Panic("json_dump: expected string".to_string()),
+                    let text = match self.arg_string(s) {
+                        Some(t) => t,
+                        None => return ExecOutcome::Panic("json_dump: expected string".to_string()),
                     };
                     match json::parse(&text) {
                         Ok(j) => ExecOutcome::Value(Value::Str(CompactString::from(json::dump(&j, false)))),
@@ -1733,13 +1742,13 @@ impl Interpreter {
             }
             "p_json_get" => {
                 if let (Some(s), Some(key)) = (args.get(0), args.get(1)) {
-                    let text = match s {
-                        Value::Str(s) => s.to_string(),
-                        _ => return ExecOutcome::Panic("json_get: expected string".to_string()),
+                    let text = match self.arg_string(s) {
+                        Some(t) => t,
+                        None => return ExecOutcome::Panic("json_get: expected string".to_string()),
                     };
-                    let key_str = match key {
-                        Value::Str(s) => s.to_string(),
-                        _ => return ExecOutcome::Panic("json_get: key must be string".to_string()),
+                    let key_str = match self.arg_string(key) {
+                        Some(k) => k,
+                        None => return ExecOutcome::Panic("json_get: key must be string".to_string()),
                     };
                     match json::parse(&text) {
                         Ok(json::Json::Object(map)) => {
@@ -1757,9 +1766,9 @@ impl Interpreter {
             }
             "p_json_type" => {
                 if let Some(s) = args.first() {
-                    let text = match s {
-                        Value::Str(s) => s.to_string(),
-                        _ => return ExecOutcome::Panic("json_type: expected string".to_string()),
+                    let text = match self.arg_string(s) {
+                        Some(t) => t,
+                        None => return ExecOutcome::Panic("json_type: expected string".to_string()),
                     };
                     match json::parse(&text) {
                         Ok(j) => {
@@ -1781,9 +1790,9 @@ impl Interpreter {
             }
             "p_json_len" => {
                 if let Some(s) = args.first() {
-                    let text = match s {
-                        Value::Str(s) => s.to_string(),
-                        _ => return ExecOutcome::Panic("json_len: expected string".to_string()),
+                    let text = match self.arg_string(s) {
+                        Some(t) => t,
+                        None => return ExecOutcome::Panic("json_len: expected string".to_string()),
                     };
                     match json::parse(&text) {
                         Ok(json::Json::Array(a)) => ExecOutcome::Value(Value::Int(a.len() as i64)),
@@ -1796,9 +1805,9 @@ impl Interpreter {
             }
             "p_json_at" => {
                 if let (Some(s), Some(Value::Int(idx))) = (args.get(0), args.get(1)) {
-                    let text = match s {
-                        Value::Str(s) => s.to_string(),
-                        _ => return ExecOutcome::Panic("json_at: expected string".to_string()),
+                    let text = match self.arg_string(s) {
+                        Some(t) => t,
+                        None => return ExecOutcome::Panic("json_at: expected string".to_string()),
                     };
                     match json::parse(&text) {
                         Ok(json::Json::Array(a)) => {
@@ -1816,9 +1825,9 @@ impl Interpreter {
             }
             "p_json_pretty" => {
                 if let Some(s) = args.first() {
-                    let text = match s {
-                        Value::Str(s) => s.to_string(),
-                        _ => return ExecOutcome::Panic("json_pretty: expected string".to_string()),
+                    let text = match self.arg_string(s) {
+                        Some(t) => t,
+                        None => return ExecOutcome::Panic("json_pretty: expected string".to_string()),
                     };
                     match json::parse(&text) {
                         Ok(j) => ExecOutcome::Value(Value::Str(CompactString::from(json::dump(&j, true)))),
@@ -1829,17 +1838,28 @@ impl Interpreter {
                 }
             }
             "p_json_string" => {
+                // Serialize a plain string as a JSON string literal (with quotes + escaping)
                 if let Some(s) = args.first() {
-                    let text = match s {
-                        Value::Str(s) => s.to_string(),
-                        _ => return ExecOutcome::Panic("json_string: expected string".to_string()),
+                    let text = match self.arg_string(s) {
+                        Some(t) => t,
+                        None => return ExecOutcome::Panic("json_string: expected string".to_string()),
                     };
-                    match json::parse(&text) {
-                        Ok(json::Json::String(s)) => {
-                            ExecOutcome::Value(Value::Str(CompactString::from(s)))
+                    // Escape and wrap in quotes
+                    let mut out = String::with_capacity(text.len() + 2);
+                    out.push('"');
+                    for c in text.chars() {
+                        match c {
+                            '"' => out.push_str("\\\""),
+                            '\\' => out.push_str("\\\\"),
+                            '\n' => out.push_str("\\n"),
+                            '\r' => out.push_str("\\r"),
+                            '\t' => out.push_str("\\t"),
+                            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                            c => out.push(c),
                         }
-                        _ => ExecOutcome::Panic("json_string: not a string".to_string()),
                     }
+                    out.push('"');
+                    ExecOutcome::Value(Value::Str(CompactString::from(out)))
                 } else {
                     ExecOutcome::Panic("json_string: missing argument".to_string())
                 }
@@ -1868,7 +1888,8 @@ impl Interpreter {
                 }
             }
             "p_tensor_from_vec" => {
-                if let (Some(shape), Some(data)) = (arg_vec_usize(args, 0), arg_vec_f64(args, 1)) {
+                // stdlib calls from_vec(data, shape) — args are (data, shape)
+                if let (Some(data), Some(shape)) = (arg_vec_f64(args, 0), arg_vec_usize(args, 1)) {
                     ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(Tensor::from_vec(shape, data)))))
                 } else {
                     ExecOutcome::Panic("tensor_from_vec: expected Vec, Vec".to_string())
@@ -2134,18 +2155,78 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Str(CompactString::from("")))
             }
             "p_http_parse_request" => {
-                // Simulated — return a map with method, path, body
-                let mut map = hashbrown::HashMap::new();
-                map.insert("method".to_string(), Value::Str(CompactString::from("GET")));
-                map.insert("path".to_string(), Value::Str(CompactString::from("/")));
-                map.insert("body".to_string(), Value::Str(CompactString::from("")));
-                ExecOutcome::Value(Value::Map(Rc::new(RefCell::new(map))))
+                // Parse raw HTTP request into a JSON string: {"method","path","version","headers":{...},"body"}
+                let raw = match args.first().and_then(|v| self.arg_string(v)) {
+                    Some(s) => s,
+                    None => return ExecOutcome::Panic("http_parse_request: expected string".to_string()),
+                };
+                // Parse request line: METHOD PATH HTTP/VERSION
+                let mut lines = raw.split("\r\n");
+                let req_line = lines.next().unwrap_or("");
+                let parts: Vec<&str> = req_line.splitn(3, ' ').collect();
+                let method = parts.first().copied().unwrap_or("GET");
+                let path = parts.get(1).copied().unwrap_or("/");
+                let version = parts.get(2).copied().unwrap_or("HTTP/1.1").strip_prefix("HTTP/").unwrap_or("1.1");
+
+                // Parse headers until empty line
+                let mut headers = String::from("{");
+                let mut first_hdr = true;
+                let mut body_start = 0;
+                let mut idx = 0;
+                for line in lines {
+                    idx += 1;
+                    if line.is_empty() {
+                        body_start = idx; // body starts after this
+                        break;
+                    }
+                    if let Some(colon) = line.find(':') {
+                        let key = line[..colon].trim();
+                        let val = line[colon+1..].trim();
+                        if !first_hdr { headers.push(','); }
+                        first_hdr = false;
+                        headers.push('"');
+                        headers.push_str(key);
+                        headers.push_str("\":\"");
+                        headers.push_str(val);
+                        headers.push('"');
+                    }
+                }
+                headers.push('}');
+
+                // Body is everything after the empty line
+                let body = if body_start > 0 {
+                    // Re-split to get body
+                    raw.split("\r\n\r\n").nth(1).unwrap_or("")
+                } else { "" };
+
+                // Build JSON: {"method":"...","path":"...","version":"...","headers":{...},"body":"..."}
+                // Escape string values for JSON
+                let esc = |s: &str| -> String {
+                    let mut out = String::with_capacity(s.len());
+                    for c in s.chars() {
+                        match c {
+                            '"' => out.push_str("\\\""),
+                            '\\' => out.push_str("\\\\"),
+                            '\n' => out.push_str("\\n"),
+                            '\r' => out.push_str("\\r"),
+                            '\t' => out.push_str("\\t"),
+                            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                            c => out.push(c),
+                        }
+                    }
+                    out
+                };
+                let json = format!(
+                    "{{\"method\":\"{}\",\"path\":\"{}\",\"version\":\"{}\",\"headers\":{},\"body\":\"{}\"}}",
+                    esc(method), esc(path), esc(version), headers, esc(body)
+                );
+                ExecOutcome::Value(Value::Str(CompactString::from(json)))
             }
             "p_http_build_response" => {
                 if let (Some(Value::Int(status)), Some(body)) = (args.get(0), args.get(2)) {
-                    let body_str = match body {
-                        Value::Str(s) => s.to_string(),
-                        _ => "".to_string(),
+                    let body_str = match self.arg_string(body) {
+                        Some(s) => s,
+                        None => "".to_string(),
                     };
                     let response = format!("HTTP/1.1 {} OK\r\nContent-Length: {}\r\n\r\n{}",
                         status, body_str.len(), body_str);
@@ -2200,12 +2281,226 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Int(0))
             }
 
+            // ─── Phase 5A.3: Interrupt handler builtins (bare-metal) ───
+            "p_cli" => {
+                // Clear interrupt flag — simulated
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_sti" => {
+                // Set interrupt flag — simulated
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_lidt" => {
+                // Load IDT register — simulated (arg is pointer to IDT descriptor)
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_idt_set_entry" => {
+                // Set IDT entry: (vector, handler_addr) — simulated
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_hlt" => {
+                // Halt CPU — simulated
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_inb" => {
+                // Read byte from I/O port — simulated, returns 0
+                ExecOutcome::Value(Value::Int(0))
+            }
+            "p_outb" => {
+                // Write byte to I/O port — simulated
+                ExecOutcome::Value(Value::Void)
+            }
+
+            // ─── Phase 5A.4: MMU/page table management (bare-metal) ───
+            "p_cr3_read" => {
+                // Read CR3 — simulated, return a fake page table base
+                ExecOutcome::Value(Value::Int(0x10000))
+            }
+            "p_cr3_write" => {
+                // Write CR3 — simulated
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_cr0_read" => {
+                // Read CR0 — simulated
+                ExecOutcome::Value(Value::Int(0x80000011))
+            }
+            "p_cr0_write" => {
+                // Write CR0 — simulated
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_cr4_read" => {
+                // Read CR4 — simulated
+                ExecOutcome::Value(Value::Int(0x20))
+            }
+            "p_cr4_write" => {
+                // Write CR4 — simulated
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_invlpg" => {
+                // Invalidate TLB entry — simulated
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_page_map" => {
+                // Map virtual page to physical — simulated
+                // args: page_table, virt_addr, phys_addr, flags
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_page_unmap" => {
+                // Unmap virtual page — simulated
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_phys_read64" => {
+                // Read 8 bytes from physical address — simulated, returns 0
+                ExecOutcome::Value(Value::Int(0))
+            }
+            "p_phys_write64" => {
+                // Write 8 bytes to physical address — simulated
+                ExecOutcome::Value(Value::Void)
+            }
+
+            // ─── Phase 2A.8: Allocator builtins ───
+            "p_allocator_create" => {
+                if let Some(Value::Str(name)) = args.first() {
+                    ExecOutcome::Value(Value::Allocator(name.clone()))
+                } else {
+                    ExecOutcome::Value(Value::Allocator(CompactString::from("default")))
+                }
+            }
+            "p_allocator_alloc" => {
+                // In interpreter mode, allocation just returns a synthetic pointer
+                if let Some(Value::Int(size)) = args.get(1) {
+                    // Simulate allocation — return a non-zero pointer
+                    static mut ALLOC_PTR: u64 = 0x10000;
+                    unsafe { ALLOC_PTR += *size as u64; }
+                    ExecOutcome::Value(Value::Ptr(unsafe { ALLOC_PTR }))
+                } else {
+                    ExecOutcome::Value(Value::Ptr(0))
+                }
+            }
+            "p_allocator_free" => {
+                // No-op in interpreter mode
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_allocator_stats" => {
+                // Return bytes allocated (simulated)
+                ExecOutcome::Value(Value::Int(0))
+            }
+
+            // ─── C library function stubs (for extern FFI in interpreter mode) ───
+            "abs" => {
+                if let Some(Value::Int(n)) = args.first() {
+                    ExecOutcome::Value(Value::Int(n.abs()))
+                } else {
+                    ExecOutcome::Value(Value::Int(0))
+                }
+            }
+            "labs" => {
+                if let Some(Value::Int(n)) = args.first() {
+                    ExecOutcome::Value(Value::Int(n.abs()))
+                } else {
+                    ExecOutcome::Value(Value::Int(0))
+                }
+            }
+            "sqrt" | "c_sqrt" | "pledge_sqrt" => {
+                if let Some(Value::Float(f)) = args.first() {
+                    ExecOutcome::Value(Value::Float(f.sqrt()))
+                } else if let Some(Value::Int(i)) = args.first() {
+                    ExecOutcome::Value(Value::Float((*i as f64).sqrt()))
+                } else {
+                    ExecOutcome::Value(Value::Float(0.0))
+                }
+            }
+            "pow" | "c_pow" | "pledge_pow" => {
+                if let (Some(Value::Float(a)), Some(Value::Float(b))) = (args.get(0), args.get(1)) {
+                    ExecOutcome::Value(Value::Float(a.powf(*b)))
+                } else {
+                    ExecOutcome::Value(Value::Float(0.0))
+                }
+            }
+            "floor" | "c_floor" | "pledge_floor" => {
+                if let Some(Value::Float(f)) = args.first() {
+                    ExecOutcome::Value(Value::Float(f.floor()))
+                } else {
+                    ExecOutcome::Value(Value::Float(0.0))
+                }
+            }
+            "ceil" | "c_ceil" | "pledge_ceil" => {
+                if let Some(Value::Float(f)) = args.first() {
+                    ExecOutcome::Value(Value::Float(f.ceil()))
+                } else {
+                    ExecOutcome::Value(Value::Float(0.0))
+                }
+            }
+            "sin" | "c_sin" => {
+                if let Some(Value::Float(f)) = args.first() {
+                    ExecOutcome::Value(Value::Float(f.sin()))
+                } else {
+                    ExecOutcome::Value(Value::Float(0.0))
+                }
+            }
+            "cos" | "c_cos" => {
+                if let Some(Value::Float(f)) = args.first() {
+                    ExecOutcome::Value(Value::Float(f.cos()))
+                } else {
+                    ExecOutcome::Value(Value::Float(0.0))
+                }
+            }
+            "fabs" | "c_fabs" => {
+                if let Some(Value::Float(f)) = args.first() {
+                    ExecOutcome::Value(Value::Float(f.abs()))
+                } else {
+                    ExecOutcome::Value(Value::Float(0.0))
+                }
+            }
+            "strcmp" | "c_strcmp" => {
+                if let (Some(Value::Str(a)), Some(Value::Str(b))) = (args.get(0), args.get(1)) {
+                    ExecOutcome::Value(Value::Int(a.cmp(b) as i64))
+                } else {
+                    ExecOutcome::Value(Value::Int(0))
+                }
+            }
+            "strlen" | "c_strlen" | "pledge_strlen" => {
+                if let Some(Value::Str(s)) = args.first() {
+                    ExecOutcome::Value(Value::Int(s.len() as i64))
+                } else {
+                    ExecOutcome::Value(Value::Int(0))
+                }
+            }
+            "printf" => {
+                // Simplified printf — just print the first arg if it's a string
+                if let Some(Value::Str(s)) = args.first() {
+                    print!("{}", s);
+                }
+                ExecOutcome::Value(Value::Int(0))
+            }
+
             _ => ExecOutcome::Panic(format!("Unknown runtime function: {}", name)),
         }
     }
 }
 
 // ─── Helper functions for Phase 5C/5D builtins ──────────────────────
+
+/// Extract a string from a Value (Str or Ptr to null-terminated string in memory)
+impl Interpreter {
+    fn arg_string(&self, v: &Value) -> Option<String> {
+        match v {
+            Value::Str(s) => Some(s.to_string()),
+            Value::Ptr(addr) => {
+                let mut bytes = Vec::new();
+                let mut offset = *addr;
+                loop {
+                    let b = self.memory.load(offset, 1);
+                    if b[0] == 0 { break; }
+                    bytes.push(b[0]);
+                    offset += 1;
+                }
+                Some(String::from_utf8_lossy(&bytes).to_string())
+            }
+            _ => None,
+        }
+    }
+}
 
 /// Extract a Vec<usize> from an argument
 fn arg_vec_usize(args: &[Value], idx: usize) -> Option<Vec<usize>> {

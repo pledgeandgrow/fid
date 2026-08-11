@@ -637,6 +637,18 @@ pub enum Inst {
         outputs: Vec<(String, ValueId)>,
         ret_ty: IrType,
     },
+
+    // ─── Region Management (Phase 2A) ───
+    /// Begin a named region — allocations inside the region block use this region.
+    /// Returns a region handle (as I64) that can be passed to Alloca.
+    RegionBegin {
+        name: String,
+    },
+    /// End a named region — all memory allocated in this region is freed.
+    /// The region handle is consumed and must not be used after this.
+    RegionEnd {
+        name: String,
+    },
 }
 
 impl Inst {
@@ -672,6 +684,8 @@ impl Inst {
             Inst::Print { .. } => IrType::Void,
             Inst::Panic { .. } => IrType::Never,
             Inst::Asm { ret_ty, .. } => ret_ty.clone(),
+            Inst::RegionBegin { .. } => IrType::I64,
+            Inst::RegionEnd { .. } => IrType::Void,
         }
     }
 
@@ -697,6 +711,11 @@ impl Inst {
             },
             Inst::TryUnwrap { .. } => effects.add(Effect::Read),
             Inst::Unreachable => effects.add(Effect::Diverge),
+            Inst::RegionBegin { .. } => effects.add(Effect::Alloc),
+            Inst::RegionEnd { .. } => {
+                effects.add(Effect::Alloc);
+                effects.add(Effect::Write);
+            },
             _ => {}
         }
         effects
@@ -734,6 +753,8 @@ impl Inst {
             Inst::Print { .. } => "Print",
             Inst::Panic { .. } => "Panic",
             Inst::Asm { .. } => "Asm",
+            Inst::RegionBegin { .. } => "RegionBegin",
+            Inst::RegionEnd { .. } => "RegionEnd",
         }
     }
 
@@ -791,6 +812,7 @@ impl Inst {
                 refs.extend(outputs.iter().map(|(_, v)| *v));
                 refs
             }
+            Inst::RegionBegin { .. } | Inst::RegionEnd { .. } => vec![],
         }
     }
 }
@@ -843,6 +865,9 @@ pub struct IrFunction {
     pub entry: BlockId,
     /// Local variables — maps source variable names to SSA values
     pub locals: HashMap<String, ValueId>,
+    /// Whether this is an interrupt handler (bare-metal mode).
+    /// Interrupt handlers save/restore all registers and use `iret` instead of `ret`.
+    pub is_interrupt: bool,
 }
 
 impl IrFunction {
@@ -859,6 +884,7 @@ impl IrFunction {
             next_block: 0,
             entry: BlockId(0),
             locals: HashMap::new(),
+            is_interrupt: false,
         };
         // Create entry block
         func.new_block();
@@ -1018,6 +1044,8 @@ pub struct IrModule {
     pub extern_functions: HashMap<String, (Vec<IrType>, IrType)>,
     /// Effects of each function (computed from function body)
     pub function_effects: HashMap<String, EffectSet>,
+    /// User-defined extern declarations for FFI (C codegen uses these)
+    pub extern_decls: Vec<crate::ast::ExternDecl>,
 }
 
 impl IrModule {
@@ -1028,6 +1056,7 @@ impl IrModule {
             string_constants: HashMap::new(),
             extern_functions: HashMap::new(),
             function_effects: HashMap::new(),
+            extern_decls: Vec::new(),
         }
     }
 
@@ -1132,8 +1161,8 @@ pub fn lower_type(ast_ty: &AstType) -> IrType {
         AstType::Void => IrType::Void,
         AstType::Never => IrType::Void,
         AstType::Named(name) => {
-            // Vec, HashMap, and Tensor are opaque types (not structs)
-            if name == "Vec" || name == "HashMap" || name == "Tensor" {
+            // Vec, HashMap, Tensor, and Allocator are opaque types (not structs)
+            if name == "Vec" || name == "HashMap" || name == "Tensor" || name == "Allocator" {
                 IrType::Opaque(name.clone())
             } else {
                 IrType::Struct(name.clone())
@@ -1141,6 +1170,11 @@ pub fn lower_type(ast_ty: &AstType) -> IrType {
         }
         AstType::Array { elem, size } => {
             IrType::Array(Box::new(lower_type(elem)), *size)
+        }
+        AstType::ArrayConst { elem, .. } => {
+            // Const generic array — size is resolved during monomorphization.
+            // Use a placeholder size of 0; the monomorphizer will replace this.
+            IrType::Array(Box::new(lower_type(elem)), 0)
         }
         AstType::Ref { inner, .. } => {
             IrType::Ptr(Box::new(lower_type(inner)))
@@ -1155,7 +1189,7 @@ pub fn lower_type(ast_ty: &AstType) -> IrType {
         AstType::Func { .. } => {
             IrType::Opaque("func".to_string())
         }
-        AstType::Assoc(_, _, _) => {
+        AstType::Assoc(_, _, _, _) => {
             IrType::I64
         }
         AstType::Dyn(name) => {

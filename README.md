@@ -1,19 +1,21 @@
 <h1 align="center">Pledge Language — Bootstrap Compiler</h1>
 
-A bootstrap compiler for the Pledge programming language, written in Rust. Generates **native x86_64 Windows executables** via three backends: direct PE emission (no external tools), MASM assembly, or portable C codegen. Also includes an IR interpreter for rapid testing.
+A bootstrap compiler for the Pledge programming language, written in Rust. Generates **native x86_64 Windows executables** via three backends: direct PE emission (no external tools), MASM assembly, or portable C codegen. Also includes an IR interpreter for rapid testing, a WebAssembly backend, an ELF64 object file emitter, and a bare-metal flat binary mode.
 
 ## Status
 
-**Phase 1: Bootstrap — Complete** — The compiler lexes, parses, type-checks, lowers to SSA IR, and generates native x86_64 Windows executables. **41/41 tests pass** across all three backends (interpreter, PE emitter, C codegen). The **PE emitter** (`emit` command) produces `.exe` files directly — no assembler, linker, or C compiler required.
+**Phase 1: Bootstrap — Complete.** **Phase 2: Safety — Complete.** The compiler lexes, parses, type-checks, lowers to SSA IR, and generates native x86_64 Windows executables. The **PE emitter** (`emit` command) produces `.exe` files directly — no assembler, linker, or C compiler required. Phase 2 adds region inference, effect system, capability security (with compile-time elision), and bounds safety.
 
-### Test Results (Aug 10, 2026)
+### Test Results (Aug 11, 2026)
 
-| Backend | Tests Passed | Notes |
-|---------|:------------:|-------|
-| Interpreter (`run`) | 41/41 | All features work |
-| PE Emitter (`emit`) | 41/41 valid | Valid PE32+ x86_64 executables |
-| C Codegen (`ccompile`) | 41/41 matched | Output matches interpreter |
-| Cargo tests | 4/4 | interpreter, PE, C codegen, golden files |
+| Test Group | Tests Passed | Notes |
+|------------|:------------:|-------|
+| Harness tests (`cargo test --test harness`) | 8/8 | Interpreter, PE, C codegen, golden files, safety, capability, effect, region |
+| Unit tests (`cargo test --bin pledgec`) | 85/85 | elf64, pir, peephole, codegen_x64, opt, regalloc, tensor |
+| Interpreter (`run`) | 52/52 active | 12 tests skipped (unimplemented features) |
+| PE Emitter (`emit`) | 52/52 valid | Valid PE32+ x86_64 executables |
+| C Codegen (`ccompile`) | 38+ matched | Output matches interpreter |
+| Total `.p` test files | 87 | 64 root + 9 safety + 4 capability + 7 effects + 3 regions |
 
 ### What Works (Verified End-to-End)
 
@@ -61,6 +63,26 @@ A bootstrap compiler for the Pledge programming language, written in Rust. Gener
 | Capabilities (grants, denial, transitive) | Yes | Yes | Yes |
 | Type casts (`as`) | Yes | Yes | Yes |
 | `print` for Vec/Map (deterministic output) | Yes | Yes | Yes |
+| Type aliases (`ty X = T`) | Yes | Yes | Yes |
+| Match guards (`pattern if cond =>`) | Yes | Yes | Yes |
+| Match range patterns (`1..=5 =>`) | Yes | Yes | Yes |
+| Trait associated types (`ty Item;`) | Yes | Yes | Yes |
+| Trait default methods | Yes | Yes | Yes |
+| Trait objects (`dyn Trait`) | Yes | Yes | Yes |
+| Trait impl verification | Yes | Yes | Yes |
+| Inline assembly (`asm!("...")`) | Yes | Yes | Yes |
+| Effect annotations (`!IO`, `!{}`, `!{IO,Net}`) | Yes | Yes | Yes |
+| Effect inference (fixpoint over call graph) | Yes | Yes | Yes |
+| Effect checking (under-declaration errors) | Yes | Yes | Yes |
+| Effect handlers (`handle { do } with`) | Parsed | Parsed | Parsed |
+| Region blocks (`region r { ... }`) | Yes | Yes | Yes |
+| Region use-after-free detection | Compile-time | Compile-time | Compile-time |
+| Region escape detection | Compile-time | Compile-time | Compile-time |
+| Capability elision (zero runtime overhead) | Compile-time | Compile-time | Compile-time |
+| Bounds checking (Vec/array/string) | Runtime (debug) | Runtime (debug) | Runtime (debug) |
+| Integer overflow checking | Runtime (debug) | Runtime (debug) | Runtime (debug) |
+| `Option::unwrap` panics on None | Yes | Yes | Yes |
+| Bare-metal mode (`emit --bare`) | N/A | Yes (flat binary) | N/A |
 
 ### What Is Parsed But Not Fully Working
 
@@ -68,28 +90,26 @@ A bootstrap compiler for the Pledge programming language, written in Rust. Gener
 |---------|--------|-------|
 | `async` / `await` | Parsed | Phase 4+ — not yet implemented |
 | `spawn` | Parsed | Phase 4+ — not yet implemented |
-| `comptime` blocks | Parsed | Phase 3 — not yet implemented |
-| `#[test]` attribute | Parsed | Not yet implemented |
+| `comptime` blocks | Working | `comptime <expr>`, `comptime { block }`, reflection — Phase 3A |
+| `#[test]` attribute | Parsed | Not yet executed by `pledgec test` |
 | `#[derive]` | Parsed | Not yet implemented |
-| Type aliases (`ty`) | Parsed | Syntax accepted, not fully lowered |
-| Block expressions | Parsed | Syntax accepted, not fully lowered |
-| Region inference | IR tracks regions | Not enforced at compile time |
-| Effect handlers | IR tracks effects | Not enforced, no handler syntax |
+| Effect handler continuations | Syntax works | `handle { do } with` parses and runs; full continuation semantics pending |
+| Const generics (`[T; N]`) | Parsed | `ArrayConst` type variant exists; monomorphization resolution pending |
 | Default arguments | Not parsed | Not yet implemented |
 | Variadic arguments | Not parsed | Not yet implemented |
-| Associated types in traits | Not parsed | Not yet implemented |
-| Trait objects (dynamic dispatch) | Not parsed | Not yet implemented |
-| C FFI | Not parsed | Phase 3 — not yet implemented |
+| C FFI | Not parsed | Phase 3D — not yet implemented |
+| GATs (Generic Associated Types) | Not parsed | Phase 3C — not yet implemented |
+| ELF64 object emission | Partial | `elf64.rs` produces headers, symbol tables, relocations; instruction encoding expanding |
 
 ### Known Limitations
 
-- **PE emitter targets Windows x64 only** — no Linux ELF or macOS Mach-O output yet
-- **No register allocator** — stack-based alloca model (every value gets a stack slot)
-- **No optimizer in default pipeline** — PIR optimizer exists (`pledgec opt`, `pledgec pir --opt`) with constant folding, DCE, CSE, inlining, TCO detection, and loop unrolling detection, but is not yet wired into the default build/run pipeline
-- **No bounds checking** — array/Vec indexing has no runtime bounds check yet
-- **No integer overflow checking** — uses wrapping arithmetic
+- **PE emitter targets Windows x64 only** — ELF64 object emission (`elf64.rs`) is WIP; no macOS Mach-O output yet
+- **Custom x86-64 codegen emits textual assembly + ELF objects** — `pledgec codegen <file> --target x86-64` produces Intel-syntax asm; `--elf <out.o>` emits valid ELF64 relocatable objects (readelf compatible); `--peephole` runs 6 local optimization passes
+- **Register allocator implemented but not in default pipeline** — linear scan allocator in `regalloc.rs` maps VRegs to physical registers; the PE emitter still uses stack-based alloca
+- **Optimizer not in default pipeline** — PIR optimizer exists (`pledgec opt`, `pledgec pir --opt`) with constant folding, DCE, CSE, inlining, TCO, loop unrolling, and effect-based pure function elision, but is not yet wired into the default build/run pipeline
 - **`#[test]` attribute** — parsed but not executed by `pledgec test` (tests are file-based)
-- **43 compiler warnings** — dead code, unused variables (cleanup needed)
+- **ELF64 emitter WIP** — `elf64.rs` produces valid ELF headers, symbol tables, and relocations; full instruction encoding still being expanded
+- **120 compiler warnings** — dead code, unused variables (cleanup needed)
 
 ---
 
@@ -129,13 +149,17 @@ cargo run -- version
 | Command | Description |
 |---------|-------------|
 | `emit <file.p> -o <out.exe>` | **Direct PE emission**: lex → parse → typecheck → lower → x86 machine code → PE file → `.exe` (no external tools) |
+| `emit <file.p> -o <out.bin> --bare` | **Bare-metal mode**: no stdlib, flat binary output (Phase 5A) |
 | `build <file.p> -o <out.exe>` | MASM pipeline: lex → parse → typecheck → lower → x86 assembly → `ml64.exe` → `link.exe` → `.exe` |
 | `ccompile <file.p> -o <out.exe>` | C codegen pipeline: lex → parse → typecheck → lower → C source → `cl.exe`/`gcc`/`clang` → `.exe` |
 | `run <file.p> [-v]` | Lex → parse → typecheck → lower → interpret IR (no external tools needed) |
 | `ir <file.p>` | Lex → parse → typecheck → lower → print SSA IR |
+| `pir <file.p> [--opt]` | Lower to PIR (L1/L2/L3) and print; `--opt` runs optimization passes |
+| `opt <file.p>` | Run PIR optimizer and print statistics (const fold, CSE, DCE, inline, unroll, TCO) |
+| `codegen <file.p> --target <arch>` | Generate assembly for x86-64 or ARM64 |
 | `tokens <file.p>` | Lex only — print token stream |
 | `ast <file.p>` | Lex + parse — print AST tree |
-| `test` | Run all 41 tests across interpreter, PE emitter, and C codegen |
+| `test` | Run all tests across interpreter, PE emitter, and C codegen |
 | `repl` | Interactive REPL — evaluate Pledge expressions |
 | `verify <file.p>` | Verify IR correctness (terminators, block refs, value refs) |
 | `sourcemap <file.p>` | Show source map (IR value → source line mapping) |
@@ -469,50 +493,71 @@ See `docs/syntax-spec.md` for the complete syntax specification.
 ```
 pledge-lang/
 ├── Cargo.toml              # Rust project config
-├── src/
-│   ├── main.rs             # CLI entry point (emit, build, ccompile, run, ir, tokens, ast, version)
-│   ├── token.rs            # Token kind definitions (all Pledge keywords)
+├── src/                    # 25 source files, ~35,000 lines of Rust
+│   ├── main.rs             # CLI entry point (emit, build, ccompile, run, ir, pir, opt, codegen, etc.)
+│   ├── token.rs            # Token kind definitions (45+ keywords)
 │   ├── lexer.rs            # Tokenizer (source → tokens)
-│   ├── ast.rs              # AST node types (Expr, Stmt, Func, StructDef, EnumDef, etc.)
+│   ├── ast.rs              # AST node types (Expr, Stmt, Func, StructDef, EnumDef, TraitDef, etc.)
 │   ├── parser.rs           # Recursive descent parser (tokens → AST)
-│   ├── typechecker.rs      # Type validation (AST → checked AST)
+│   ├── typechecker.rs      # Type checking + capability + effect + region enforcement
 │   ├── mono.rs             # Generic monomorphization (specialize generic functions per call site)
-│   ├── ir.rs               # SSA IR definitions (types, instructions, functions, modules)
+│   ├── ir.rs               # SSA IR definitions (types, instructions, functions, modules, effects, regions)
 │   ├── lower.rs            # AST → SSA IR lowering
 │   ├── interp.rs           # IR interpreter (for `run` command)
-│   ├── pe.rs               # Direct PE emitter — x86_64 machine code → .exe (no external tools)
+│   ├── pe.rs               # Direct PE emitter — x86_64 machine code → .exe + flat binary (no external tools)
+│   ├── elf64.rs            # ELF64 relocatable object file emitter for Linux (WIP)
 │   ├── x86.rs              # x86_64 MASM assembly generation (IR → .asm, for `build` command)
+│   ├── codegen.rs          # ARM64 assembly generation (AST → .s)
+│   ├── codegen_x64.rs      # x86_64 assembly codegen (MASM syntax)
 │   ├── codegen_c.rs        # C codegen backend (IR → .c, for `ccompile` command)
-│   ├── codegen.rs          # Legacy ARM64 assembly generation (AST → .s, unused)
+│   ├── pir.rs              # PIR (Pledge Intermediate Representation) — L1/L2/L3 levels
+│   ├── opt.rs              # PIR optimizer (const fold, CSE, DCE, inline, unroll, TCO, effect-based elision)
+│   ├── peephole.rs         # Peephole optimizer (redundant moves, zero idioms, branch threading)
+│   ├── regalloc.rs         # Linear scan register allocator
+│   ├── comptime.rs         # Comptime evaluation engine (Phase 3A)
+│   ├── tensor.rs           # Tensor type for AI/ML (Phase 5C)
+│   ├── json.rs             # JSON parsing/serialization (Phase 5D)
+│   ├── wasm.rs             # WebAssembly backend (Phase 5D)
 │   └── compiler.rs         # Pipeline orchestration, module resolution, stdlib auto-include
-├── stdlib/
-│   └── core.p              # Core standard library (println, assert, assert_eq, Option, Result, max, min, abs, clamp)
-├── tests/
-│   ├── harness.rs          # Automated test harness (4 cargo tests)
-│   ├── hello.p             # Hello world — print, if/else, variables, arithmetic
-│   ├── arithmetic.p        # Arithmetic and nested function calls
-│   ├── struct.p            # Struct definition, literals, field access
-│   ├── control_flow.p      # if/else if/else, for loops with ranges
-│   ├── functions.p         # User-defined functions, recursive factorial
-│   ├── strings.p           # String literals, f-string interpolation
-│   ├── print_int.p         # Integer printing test
-│   ├── test_*.p            # 34 feature tests (float, vec, map, closures, generics, etc.)
-│   └── test_regression_*.p # 3 regression tests (closures, fstrings, collections)
-├── tests/golden/           # Golden file outputs for all 41 tests
+├── stdlib/                 # 8 standard library modules
+│   ├── core.p              # Option, Result, println, assert, max, min, abs, clamp
+│   ├── json.p              # JSON parsing and serialization
+│   ├── tensor.p            # Tensor type for AI/ML (zeros, ones, matmul, relu, softmax, etc.)
+│   ├── parallel.p          # Parallel operations (par_map, par_sum, par_dot)
+│   ├── db.p                # Database driver framework
+│   ├── http.p              # HTTP server stdlib
+│   ├── simd.p              # SIMD intrinsics
+│   └── shape.p             # Shape operations
+├── tests/                  # 87 .p test files + harness
+│   ├── harness.rs          # Automated test harness (8 cargo tests)
+│   ├── *.p                 # 64 feature tests (arithmetic, structs, closures, generics, traits, etc.)
+│   ├── safety/             # 9 bounds safety tests (OOB, overflow, div-by-zero, unwrap)
+│   ├── capability/         # 4 capability security tests (grant, deny, propagation)
+│   ├── effects/            # 7 effect system tests (annotations, inference, handlers, pure)
+│   ├── regions/            # 3 region inference tests (blocks, nesting, escape detection)
+│   └── golden/             # 43 golden file outputs for regression testing
 ├── benches/
 │   └── bench_main.rs       # Performance benchmarks
-└── docs/
-└── docs/
+└── docs/                   # 13 documentation files
+    ├── roadmap.md          # Full 8-phase roadmap
     ├── syntax-spec.md      # Complete language syntax specification
     ├── architecture.md     # Compiler architecture and pipeline
-    └── changelog.md        # Version history and changes
+    ├── changelog.md        # Version history and changes
+    ├── vision.md           # Language vision and 8 pillars
+    ├── design-principles.md # Core design principles
+    ├── competitive-analysis.md # Comparison with Rust, Zig, Go, Swift
+    ├── adoption-strategy.md # Language adoption strategy
+    ├── full-stack-architecture.md # Full-stack Pledge ecosystem vision
+    ├── innovation.md       # Innovative language features
+    ├── custom-toolchain.md # Custom toolchain plans
+    └── ...
 ```
 
 ---
 
 ## Test Programs
 
-All 41 test files in `tests/` pass across all three backends. Key tests:
+87 test files across `tests/` and subdirectories. Key tests:
 
 | Test File | What It Tests |
 |-----------|---------------|
@@ -526,8 +571,9 @@ All 41 test files in `tests/` pass across all three backends. Key tests:
 | `test_fstring_*.p` | F-string with int, float, vec |
 | `test_vec_*.p` | Vec creation, push, loop, printing |
 | `test_hashmap.p` | HashMap insert, get, contains |
-| `test_print_map.p` | Map printing (deterministic key sorting) |
 | `test_match.p` | Pattern matching (int, string, enum, wildcard) |
+| `test_match_guard.p` | Match guards (`pattern if cond =>`) |
+| `test_match_range.p` | Match range patterns (`1..=5 =>`) |
 | `test_option.p` | Option type (Some/None, unwrap) |
 | `test_try.p` | `?` operator and `try { }` blocks |
 | `test_defer.p` | `defer` blocks (LIFO cleanup order) |
@@ -535,14 +581,22 @@ All 41 test files in `tests/` pass across all three backends. Key tests:
 | `test_impl.p` | `impl` blocks, struct methods |
 | `test_generics.p` | Generic functions, monomorphization |
 | `test_traits.p` | `cap` traits, `impl Cap for Type` |
+| `test_trait_assoc.p` | Trait associated types |
+| `test_trait_default.p` | Trait default methods |
+| `test_trait_object.p` | Trait objects (`dyn Trait`) |
+| `test_type_alias.p` | Type aliases (`ty X = T`) |
+| `test_asm.p` | Inline assembly (`asm!`) |
+| `test_bare.p` | Bare-metal mode (no stdlib, `asm!("hlt")`) |
 | `test_capabilities.p` | Capability grants, denial, transitive |
 | `tests/capability/test_cap_*.p` | Capability security: grant/deny/propagation (Phase 2C) |
 | `tests/safety/test_*.p` | Bounds safety: OOB, overflow, div-by-zero, unwrap None (Phase 2D) |
+| `tests/effects/test_effect_*.p` | Effect system: annotations, inference, checking, handlers (Phase 2B) |
+| `tests/regions/test_region_*.p` | Region inference: region blocks, escape detection, safety (Phase 2A) |
 | `test_refs_mut.p` | `&mut` references, dereference |
 | `test_pe_*.p` | PE emitter specific tests (struct, enum, refs, generics, defer, try) |
 | `test_regression_*.p` | Regression tests (closures, fstrings, collections) |
 
-Run all tests: `cargo run -- test`
+Run all tests: `cargo test --test harness`
 
 ---
 
@@ -568,10 +622,13 @@ Run all tests: `cargo run -- test`
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| **Phase 1** | Bootstrap compiler in Rust — direct PE emission, MASM + C backends, IR interpreter | **Complete** (41/41 tests pass) |
-| **Phase 2** | Region inference, effect system, capability security, bounds safety | **In progress** (2C capability security ✓, 2D bounds safety ✓; 6/6 harness tests pass) |
-| **Phase 3** | comptime, advanced traits, FFI & interop | Not started |
-| **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | In progress (4A PIR complete, 4B optimizer complete) |
-| **Phase 5** | Bare metal, IoT, AI/ML, self-hosting | Not started |
+| **Phase 1** | Bootstrap compiler in Rust — direct PE emission, MASM + C backends, IR interpreter | **Complete** (52+ tests pass) |
+| **Phase 2** | Region inference, effect system, capability security, bounds safety | **Complete** (2A ✓, 2B ✓, 2C ✓ with elision, 2D ✓; 8/8 harness tests pass) |
+| **Phase 3** | comptime, advanced traits, FFI & interop | **In progress** (3A comptime ✓, 3B traits ✓; 3C advanced types and 3D FFI pending) |
+| **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | **In progress** (4A PIR ✓, 4B optimizer ✓, 4C x86-64 codegen + regalloc + peephole + ELF emission ✓; 4D linker and 4E hot reload pending) |
+| **Phase 5** | Bare metal, IoT, AI/ML, web & cloud | **In progress** (5A bare-metal mode ✓, 5C AI/ML tensor ✓, 5D WASM + HTTP + JSON ✓; 5B IoT pending) |
+| **Phase 6** | Self-hosting | Not started |
+| **Phase 7** | Ecosystem (package manager, LSP, docs) | Not started |
+| **Phase 8** | World class | Not started |
 
 See `docs/roadmap.md` for the full 8-phase roadmap.

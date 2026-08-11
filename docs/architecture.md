@@ -1,7 +1,7 @@
 # Pledge Compiler Architecture
 
-**Version:** 0.4.0
-**Targets:** x86_64 (Windows) native executables — direct PE emission (primary), MASM, C codegen + IR interpreter
+**Version:** 0.5.0
+**Targets:** x86_64 (Windows PE + Linux ELF64), WebAssembly, bare-metal flat binary, C codegen, IR interpreter
 
 ---
 
@@ -15,54 +15,94 @@ Source (.p)
 │  Lexer   │────▶│  Parser  │────▶│  TypeChecker │────▶│  Monomorph   │────▶│  Lowerer │────▶│   SSA IR      │
 │lexer.rs  │     │parser.rs │     │typechecker.rs│     │  mono.rs     │     │lower.rs  │     │   ir.rs       │
 └──────────┘     └──────────┘     └──────────────┘     └──────────────┘     └──────────┘     └───────────────┘
+                                         │              (types, caps,        (generic          (typed SSA,
+                                         │               effects, regions,   specialization)   effects, regions)
+                                         │               traits)
+                                         ▼
+                                    ┌──────────────┐
+                                    │  Comptime    │
+                                    │  comptime.rs │
+                                    └──────────────┘
                                                                     │
-                                                    ┌───────────────┼───────────────┐
-                                                    │               │               │
-                                                    ▼               ▼               ▼
-                                            ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-                                            │  PE Emitter  │ │  x86_64 Code │ │  C Codegen   │
-                                            │  pe.rs       │ │  x86.rs      │ │  codegen_c.rs│
-                                            └──────────────┘ └──────────────┘ └──────────────┘
-                                                    │               │               │
-                                                    ▼               ▼               ▼
-                                            Native .exe       MASM (.asm)    C source (.c)
-                                                             │               │
-                                                             ▼               ▼
-                                                        ┌──────────┐    ┌──────────┐
-                                                        │ ml64.exe │    │ cl.exe   │
-                                                        └──────────┘    │ gcc      │
-                                                             │          │ clang    │
-                                                             ▼          └──────────┘
-                                                        ┌──────────┐         │
-                                                        │ link.exe │         ▼
-                                                        └──────────┘    Native .exe
-                                                             │
-                                                             ▼
-                                                        Native .exe
+                                        ┌───────────────────────────┼───────────────────────────┐
+                                        │                           │                           │
+                                        ▼                           ▼                           ▼
+                                ┌──────────────┐           ┌──────────────┐           ┌──────────────┐
+                                │  PIR Optimizer│          │  Backends    │           │  Interpreter │
+                                │  pir.rs      │           │              │           │  interp.rs   │
+                                │  opt.rs      │           │              │           └──────────────┘
+                                │  peephole.rs │           │              │
+                                │  regalloc.rs │           │              │
+                                └──────────────┘           │              │
+                                        │                  │              │
+                                        ▼                  ▼              │
+                                ┌──────────────┐    ┌──────────────┐      │
+                                │  PIR L1/L2/L3│    │  PE Emitter  │      │
+                                │  (optimized) │    │  pe.rs       │      │
+                                └──────────────┘    └──────────────┘      │
+                                                    │              │      │
+                                                    ▼              ▼      │
+                                            ┌──────────────┐ ┌──────────────┐
+                                            │  ELF64       │ │  x86_64 Code │
+                                            │  elf64.rs    │ │  x86.rs      │
+                                            └──────────────┘ └──────────────┘
+                                                    │              │
+                                                    ▼              ▼
+                                            ELF64 .o       MASM (.asm)
+                                                    │              │
+                                                    ▼              ▼
+                                            ┌──────────┐    ┌──────────┐
+                                            │ linker   │    │ ml64.exe │
+                                            └──────────┘    └──────────┘
+                                                    │              │
+                                                    ▼              ▼
+                                            Native binary   Native .exe
+
+                         ┌──────────────┐           ┌──────────────┐
+                         │  WASM        │           │  C Codegen   │
+                         │  wasm.rs     │           │  codegen_c.rs│
+                         └──────────────┘           └──────────────┘
+                                │                          │
+                                ▼                          ▼
+                           .wasm binary              C source (.c)
+                                                           │
+                                                           ▼
+                                                     ┌──────────┐
+                                                     │ gcc/clang│
+                                                     └──────────┘
+                                                           │
+                                                           ▼
+                                                     Native .exe
 ```
 
-The **PE emitter** is the primary backend — it produces `.exe` files directly with zero external tool dependencies.
+The **PE emitter** is the primary backend — it produces `.exe` files directly with zero external tool dependencies. The **ELF64 emitter** produces relocatable `.o` files for Linux. The **WASM backend** targets the web. The **interpreter** provides rapid testing without any external tools.
 
 ### Entry Points (`compiler.rs`)
 
 | Function | Pipeline | CLI Command |
 |----------|----------|-------------|
 | `emit_source_with_path(source, path)` | lex → parse → typecheck → monomorphize → lower → PE emission | `emit` |
+| `emit_bare(source, path)` | lex → parse → typecheck → lower → flat binary (no stdlib) | `emit --bare` |
 | `build_source_with_path(source, path)` | lex → parse → typecheck → monomorphize → lower → x86 codegen | `build` |
 | `ccompile_source_with_path(source, path)` | lex → parse → typecheck → monomorphize → lower → C codegen | `ccompile` |
 | `interpret_source_with_path(source, path, verbose)` | lex → parse → typecheck → monomorphize → lower → interpret | `run` |
 | `lower_to_ir(source)` | lex → parse → typecheck → monomorphize → lower → format IR | `ir` |
 | `lex(source)` | lex only | `tokens` |
 | `parse_to_ast(source)` | lex → parse | `ast` |
+| PIR lowering (`pir.rs`) | IR → PIR L1 → L2 → L3 | `pir` |
+| PIR optimization (`opt.rs`) | PIR + const fold + CSE + DCE + inline + unroll + TCO | `opt`, `pir --opt` |
+| Codegen (`codegen_x64.rs`, `codegen.rs`) | PIR L3 → x86-64 / ARM64 assembly | `codegen` |
 
 ### Module Resolution (`compiler.rs`)
 
 Before type-checking, the compiler:
-1. Parses `stdlib/core.p` (auto-included)
+1. Parses `stdlib/core.p` (auto-included) — Option, Result, println, assert, max, min, abs, clamp
 2. Parses user source with stdlib names pre-populated
 3. Resolves `use` imports by searching for `<path>.p` or `<path>/mod.p` relative to source
 4. Merges stdlib + imported modules + user code (user wins on conflicts)
 5. Type-checks the merged program with module-level visibility enforcement
+
+**Standard library modules** (in `stdlib/`): `core.p` (auto-included), `json.p`, `tensor.p`, `parallel.p`, `db.p`, `http.p`, `simd.p`, `shape.p` — imported explicitly via `use`.
 
 ### Monomorphization (`mono.rs`)
 

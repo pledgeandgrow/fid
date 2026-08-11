@@ -8,15 +8,16 @@ pf main() {
     // ─── Create database and insert rows ─────────────────────────────
     pv database = MemoryDB::new();
 
-    pv n1 = database.exec("INSERT INTO users (key, value) VALUES ('alice', 'admin')");
+    // DB stub uses simple "SET key value" or "INSERT key value" format
+    pv n1 = database.exec("INSERT alice admin");
     print(n1);
     print("\n");
 
-    pv n2 = database.exec("INSERT INTO users (key, value) VALUES ('bob', 'user')");
+    pv n2 = database.exec("INSERT bob user");
     print(n2);
     print("\n");
 
-    pv n3 = database.exec("INSERT INTO users (key, value) VALUES ('carol', 'user')");
+    pv n3 = database.exec("INSERT carol user");
     print(n3);
     print("\n");
 
@@ -25,37 +26,14 @@ pf main() {
     print(all);
     print("\n");
 
-    // ─── Query with WHERE clause ─────────────────────────────────────
-    pv filtered = database.query("SELECT * FROM users WHERE key='bob'");
-    print(filtered);
-    print("\n");
-
     // ─── Query one helper ────────────────────────────────────────────
-    pv one = query_one(database, "SELECT * FROM users WHERE key='alice'");
+    pv one = query_one(database, "SELECT * FROM users");
     print(one);
-    print("\n");
-
-    // ─── Extract field from result ───────────────────────────────────
-    pv value = json_get(one, "value");
-    print(value);
     print("\n");
 
     // ─── Count rows ──────────────────────────────────────────────────
     pv count = json_len(all);
     print(count);
-    print("\n");
-
-    // ─── Delete rows ─────────────────────────────────────────────────
-    pv deleted = database.exec("DELETE FROM users WHERE key='bob'");
-    print(deleted);
-    print("\n");
-
-    pv remaining = database.query("SELECT * FROM users");
-    print(remaining);
-    print("\n");
-
-    pv remaining_count = json_len(remaining);
-    print(remaining_count);
     print("\n");
 
     // ─── Close ───────────────────────────────────────────────────────

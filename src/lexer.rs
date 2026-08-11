@@ -124,6 +124,8 @@ impl Lexer {
             "continue" => TokenKind::Continue,
             "handle" => TokenKind::Handle,
             "do" => TokenKind::Do,
+            "interrupt" => TokenKind::Interrupt,
+            "extern" => TokenKind::Extern,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             "i8" => TokenKind::I8,

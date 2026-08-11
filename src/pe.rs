@@ -28,6 +28,27 @@ pub enum Reg {
     R12 = 12, R13 = 13, R14 = 14, R15 = 15,
 }
 
+/// XMM (SSE/AVX) registers — 128-bit for SSE, 256-bit for AVX.
+/// Encoded with the same low-3-bit scheme as GP regs, plus optional VEX prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XmmReg {
+    Xmm0 = 0, Xmm1 = 1, Xmm2 = 2, Xmm3 = 3,
+    Xmm4 = 4, Xmm5 = 5, Xmm6 = 6, Xmm7 = 7,
+    Xmm8 = 8, Xmm9 = 9, Xmm10 = 10, Xmm11 = 11,
+    Xmm12 = 12, Xmm13 = 13, Xmm14 = 14, Xmm15 = 15,
+}
+
+impl XmmReg {
+    fn code(&self) -> u8 {
+        *self as u8
+    }
+
+    /// Is this a high register (8-15) requiring REX prefix?
+    fn is_high(&self) -> bool {
+        *self as u8 >= 8
+    }
+}
+
 impl Reg {
     /// Low 3 bits (ModR/M encoding)
     fn code(&self) -> u8 {
@@ -200,6 +221,182 @@ impl X86Encoder {
     fn ud2(&mut self) {
         self.emit_u8(0x0F);
         self.emit_u8(0x0B);
+    }
+
+    // ─── SSE2 packed double-precision (f64x2) instructions ───
+    // These operate on XMM registers. Encoding: 66 0F <opcode> ModR/M
+    // For register-to-register: ModR/M = 11 (mod) | reg (dst) | rm (src)
+
+    /// Emit REX prefix for XMM register pair (dst, src)
+    fn rex_sse(&mut self, dst: XmmReg, src: XmmReg) {
+        let w = false; // no 64-bit operand size needed for SSE
+        let r = dst.is_high(); // REX.R extends reg field (dst)
+        let b = src.is_high(); // REX.B extends r/m field (src)
+        if w || r || b {
+            let mut rex: u8 = 0x40;
+            if w { rex |= 0x08; }
+            if r { rex |= 0x04; }
+            if b { rex |= 0x01; }
+            self.emit_u8(rex);
+        }
+    }
+
+    /// ModR/M byte for XMM reg-to-reg: 11 | dst_code | src_code
+    fn modrm_xmm(&mut self, dst: XmmReg, src: XmmReg) {
+        let modrm: u8 = 0xC0 | (dst.code() & 7) << 3 | (src.code() & 7);
+        self.emit_u8(modrm);
+    }
+
+    /// addpd xmm_dst, xmm_src — SSE2 packed double add
+    /// Encoding: 66 0F 58 ModR/M
+    fn addpd_rr(&mut self, dst: XmmReg, src: XmmReg) {
+        self.emit_u8(0x66);
+        self.rex_sse(dst, src);
+        self.emit_u8(0x0F);
+        self.emit_u8(0x58);
+        self.modrm_xmm(dst, src);
+    }
+
+    /// subpd xmm_dst, xmm_src — SSE2 packed double subtract
+    /// Encoding: 66 0F 5C ModR/M
+    fn subpd_rr(&mut self, dst: XmmReg, src: XmmReg) {
+        self.emit_u8(0x66);
+        self.rex_sse(dst, src);
+        self.emit_u8(0x0F);
+        self.emit_u8(0x5C);
+        self.modrm_xmm(dst, src);
+    }
+
+    /// mulpd xmm_dst, xmm_src — SSE2 packed double multiply
+    /// Encoding: 66 0F 59 ModR/M
+    fn mulpd_rr(&mut self, dst: XmmReg, src: XmmReg) {
+        self.emit_u8(0x66);
+        self.rex_sse(dst, src);
+        self.emit_u8(0x0F);
+        self.emit_u8(0x59);
+        self.modrm_xmm(dst, src);
+    }
+
+    /// divpd xmm_dst, xmm_src — SSE2 packed double divide
+    /// Encoding: 66 0F 5E ModR/M
+    fn divpd_rr(&mut self, dst: XmmReg, src: XmmReg) {
+        self.emit_u8(0x66);
+        self.rex_sse(dst, src);
+        self.emit_u8(0x0F);
+        self.emit_u8(0x5E);
+        self.modrm_xmm(dst, src);
+    }
+
+    /// movapd xmm_dst, xmm_src — SSE2 move aligned packed double
+    /// Encoding: 66 0F 28 ModR/M
+    fn movapd_rr(&mut self, dst: XmmReg, src: XmmReg) {
+        self.emit_u8(0x66);
+        self.rex_sse(dst, src);
+        self.emit_u8(0x0F);
+        self.emit_u8(0x28);
+        self.modrm_xmm(dst, src);
+    }
+
+    /// movsd xmm_dst, xmm_src — SSE2 move scalar double
+    /// Encoding: F2 0F 10 ModR/M
+    fn movsd_rr(&mut self, dst: XmmReg, src: XmmReg) {
+        self.emit_u8(0xF2);
+        self.rex_sse(dst, src);
+        self.emit_u8(0x0F);
+        self.emit_u8(0x10);
+        self.modrm_xmm(dst, src);
+    }
+
+    /// addpd xmm_dst, [rbp+disp] — SSE2 add from memory
+    fn addpd_mem_rbp(&mut self, dst: XmmReg, disp: i32) {
+        self.emit_u8(0x66);
+        if dst.is_high() {
+            let rex: u8 = 0x40 | (if dst.is_high() { 0x04 } else { 0 });
+            self.emit_u8(rex);
+        }
+        self.emit_u8(0x0F);
+        self.emit_u8(0x58);
+        // ModR/M: mod=01 (disp8) or 10 (disp32) | reg=dst | rm=rbp(5)
+        if disp >= -128 && disp <= 127 {
+            self.emit_u8(0x40 | (dst.code() & 7) << 3 | 5);
+            self.emit_u8(disp as u8);
+        } else {
+            self.emit_u8(0x80 | (dst.code() & 7) << 3 | 5);
+            self.emit_i32(disp);
+        }
+    }
+
+    /// movapd [rbp+disp], xmm_src — SSE2 store to memory
+    fn movapd_mem_rbp(&mut self, disp: i32, src: XmmReg) {
+        self.emit_u8(0x66);
+        if src.is_high() {
+            let rex: u8 = 0x40 | (if src.is_high() { 0x01 } else { 0 });
+            self.emit_u8(rex);
+        }
+        self.emit_u8(0x0F);
+        self.emit_u8(0x29); // movapd m128, xmm
+        if disp >= -128 && disp <= 127 {
+            self.emit_u8(0x40 | (src.code() & 7) << 3 | 5);
+            self.emit_u8(disp as u8);
+        } else {
+            self.emit_u8(0x80 | (src.code() & 7) << 3 | 5);
+            self.emit_i32(disp);
+        }
+    }
+
+    /// movapd xmm_dst, [rbp+disp] — SSE2 load from memory
+    fn movapd_rbp_reg(&mut self, dst: XmmReg, disp: i32) {
+        self.emit_u8(0x66);
+        if dst.is_high() {
+            let rex: u8 = 0x40 | (if dst.is_high() { 0x04 } else { 0 });
+            self.emit_u8(rex);
+        }
+        self.emit_u8(0x0F);
+        self.emit_u8(0x28);
+        if disp >= -128 && disp <= 127 {
+            self.emit_u8(0x40 | (dst.code() & 7) << 3 | 5);
+            self.emit_u8(disp as u8);
+        } else {
+            self.emit_u8(0x80 | (dst.code() & 7) << 3 | 5);
+            self.emit_i32(disp);
+        }
+    }
+
+    // ─── AVX packed double-precision (f64x4) instructions ───
+    // VEX prefix encoding: C5 or C4 prefix + opcode + ModR/M
+    // For simplicity, we use 2-byte VEX (C5) when possible.
+
+    /// Emit 2-byte VEX prefix for AVX instruction
+    /// v_dst = destination XMM, v_src = source XMM (second operand)
+    fn vex2(&mut self, dst: XmmReg, src: XmmReg, opcode_len: u8) {
+        // C5 [R.vvvv:1=L'.0 | R:1=~R | V:4=~vvvv] 
+        // For 2-byte VEX: implied 0F leading opcode byte
+        let r_bit = if dst.is_high() { 0 } else { 1 }; // inverted
+        let vvvv = !(src.code() & 0x0F) & 0x0F; // inverted
+        let vex_byte: u8 = 0xC0 | (r_bit << 7) | (vvvv << 3);
+        self.emit_u8(0xC5);
+        self.emit_u8(vex_byte);
+        let _ = opcode_len;
+    }
+
+    /// vaddpd xmm_dst, xmm_src1, xmm_src2 — AVX packed double add
+    /// Encoding: C5 [vex] 58 ModR/M
+    fn vaddpd_rr(&mut self, dst: XmmReg, src1: XmmReg, src2: XmmReg) {
+        self.vex2(dst, src1, 1);
+        self.emit_u8(0x58);
+        // ModR/M: 11 | dst | src2
+        let modrm: u8 = 0xC0 | (dst.code() & 7) << 3 | (src2.code() & 7);
+        self.emit_u8(modrm);
+        // If src2 is high, we need REX.B via VEX.X bit — but 2-byte VEX doesn't have X
+        // For simplicity, only support src2 in 0-7 when using 2-byte VEX
+    }
+
+    /// vmulpd xmm_dst, xmm_src1, xmm_src2 — AVX packed double multiply
+    fn vmulpd_rr(&mut self, dst: XmmReg, src1: XmmReg, src2: XmmReg) {
+        self.vex2(dst, src1, 1);
+        self.emit_u8(0x59);
+        let modrm: u8 = 0xC0 | (dst.code() & 7) << 3 | (src2.code() & 7);
+        self.emit_u8(modrm);
     }
 
     /// mov r64, imm64 (10 bytes)
@@ -1591,6 +1788,8 @@ struct PeCodeGen {
     block_labels: HashMap<(String, u32), u32>,
     /// Entry point (_main) offset within .text
     entry_offset: usize,
+    /// Bare-metal mode: no IAT, no OS calls, flat binary
+    bare_mode: bool,
 }
 
 impl PeCodeGen {
@@ -1602,6 +1801,7 @@ impl PeCodeGen {
             iat_rdata_offsets: Vec::new(),
             block_labels: HashMap::new(),
             entry_offset: 0,
+            bare_mode: false,
         }
     }
 
@@ -1666,7 +1866,15 @@ impl PeCodeGen {
                        "p_string_trim", "p_string_split", "p_string_replace",
                        "p_string_char_at", "p_string_to_uppercase", "p_string_to_lowercase",
                        "p_string_parse_int", "p_string_find", "p_string_rfind",
-                       "p_string_repeat", "p_string_bytes", "p_string_clone"] {
+                       "p_string_repeat", "p_string_bytes", "p_string_clone",
+                       // Phase 5A.3: Interrupt handler stubs
+                       "p_cli", "p_sti", "p_lidt", "p_idt_set_entry",
+                       "p_hlt", "p_inb", "p_outb",
+                       // Phase 5A.4: MMU/page table stubs
+                       "p_cr3_read", "p_cr3_write", "p_cr0_read", "p_cr0_write",
+                       "p_cr4_read", "p_cr4_write", "p_invlpg",
+                       "p_page_map", "p_page_unmap",
+                       "p_phys_read64", "p_phys_write64"] {
             let label = self.enc.alloc_label();
             self.func_labels.insert(stub.to_string(), label);
         }
@@ -1704,6 +1912,251 @@ impl PeCodeGen {
         build_pe_file(&self.enc.code, &rdata.data, entry_rva, import_dir_rva, iat_rva, iat_size, rdata_rva)
     }
 
+    /// Generate a flat binary (no PE headers, no imports).
+    /// Layout: [code][padding][rdata]
+    /// Entry point is at offset 0 (the _main label).
+    /// Load address: BARE_LOAD_RVA (0x10000).
+    fn generate_flat(&mut self, module: &IrModule) -> Vec<u8> {
+        const BARE_LOAD_RVA: u32 = 0x10000;
+        self.bare_mode = true;
+
+        // 1. Collect string constants
+        let mut all_strings: Vec<String> = Vec::new();
+        for func in module.functions.values() {
+            for inst in func.instructions.values() {
+                if let Inst::ConstStr { value } = inst {
+                    if !all_strings.contains(value) {
+                        all_strings.push(value.clone());
+                    }
+                }
+                if let Inst::Panic { message } = inst {
+                    if !all_strings.contains(message) {
+                        all_strings.push(message.clone());
+                    }
+                }
+            }
+        }
+        all_strings.push("true".to_string());
+        all_strings.push("false".to_string());
+
+        // 2. Build .rdata section (strings only, no IAT)
+        let mut rdata = RdataBuilder::new();
+        let string_map: HashMap<String, String> = all_strings.iter()
+            .map(|s| (s.clone(), s.clone()))
+            .collect();
+        rdata.build(&string_map);
+        for s in &all_strings {
+            if let Some(&off) = rdata.string_offsets.get(s) {
+                self.string_rdata_offsets.insert(s.clone(), off);
+            }
+        }
+        // No IAT in bare mode — clear IAT offsets
+        self.iat_rdata_offsets.clear();
+
+        // 3. Pre-allocate labels for all functions
+        for name in module.functions.keys() {
+            let label = self.enc.alloc_label();
+            self.func_labels.insert(name.clone(), label);
+        }
+        // Pre-allocate labels for runtime stubs (only the ones we can generate without imports)
+        for stub in &["p_print_int", "p_print_str", "p_print_bool", "p_print_float",
+                       "p_panic", "p_malloc", "p_free",
+                       "p_str_concat", "p_to_str",
+                       "p_to_str_vec", "p_to_str_float", "p_to_str_str", "p_to_str_bool",
+                       "p_vec_new", "p_vec_push", "p_vec_len", "p_vec_get", "p_vec_pop", "p_print_vec",
+                       "p_vec_set", "p_vec_is_empty", "p_vec_clear", "p_vec_capacity",
+                       "p_vec_insert", "p_vec_remove", "p_vec_contains", "p_vec_reverse",
+                       "p_vec_first", "p_vec_last", "p_vec_extend", "p_vec_truncate",
+                       "p_vec_sort", "p_vec_clone",
+                       "p_map_new", "p_map_insert", "p_map_get", "p_map_contains", "p_map_remove", "p_map_len", "p_map_is_empty", "p_print_map",
+                       "p_map_clear", "p_map_keys", "p_map_values", "p_map_get_or", "p_map_clone",
+                       "p_string_from", "p_string_len", "p_string_is_empty", "p_string_push_str",
+                       "p_string_to_string", "p_string_slice",
+                       "p_string_contains", "p_string_starts_with", "p_string_ends_with",
+                       "p_string_trim", "p_string_split", "p_string_replace",
+                       "p_string_char_at", "p_string_to_uppercase", "p_string_to_lowercase",
+                       "p_string_parse_int", "p_string_find", "p_string_rfind",
+                       "p_string_repeat", "p_string_bytes", "p_string_clone",
+                       // Phase 5A.3: Interrupt handler stubs
+                       "p_cli", "p_sti", "p_lidt", "p_idt_set_entry",
+                       "p_hlt", "p_inb", "p_outb",
+                       // Phase 5A.4: MMU/page table stubs
+                       "p_cr3_read", "p_cr3_write", "p_cr0_read", "p_cr0_write",
+                       "p_cr4_read", "p_cr4_write", "p_invlpg",
+                       "p_page_map", "p_page_unmap",
+                       "p_phys_read64", "p_phys_write64"] {
+            let label = self.enc.alloc_label();
+            self.func_labels.insert(stub.to_string(), label);
+        }
+
+        // 4. Generate code for each function
+        for (name, func) in &module.functions {
+            self.gen_function(name, func, module);
+        }
+
+        // 5. Generate runtime stubs (will use IAT offsets if present, but in bare mode
+        //    external calls will be no-ops or traps)
+        self.gen_runtime_stubs();
+
+        // 6. Generate entry point
+        self.gen_entry_point();
+
+        // 7. Resolve labels
+        self.enc.resolve_labels();
+
+        // 8. Compute rdata RVA
+        let rdata_rva = BARE_LOAD_RVA + align_up(self.enc.code.len() as u32, SECTION_ALIGN);
+
+        // 9. Patch RIP-relative references (strings only, no IAT)
+        self.enc.resolve_rip_refs(BARE_LOAD_RVA, rdata_rva);
+
+        // 10. Build flat binary: [code][padding to alignment][rdata]
+        let code_len = self.enc.code.len();
+        let padded_code_len = align_up(code_len as u32, SECTION_ALIGN) as usize;
+        let mut binary = Vec::with_capacity(padded_code_len + rdata.data.len());
+        binary.extend_from_slice(&self.enc.code);
+        binary.resize(padded_code_len, 0xCC); // pad with INT3 (breakpoint)
+        binary.extend_from_slice(&rdata.data);
+
+        binary
+    }
+
+    /// Generate a Multiboot2-compatible boot binary (Phase 5A.5).
+    /// Layout: [multiboot2 header][boot code + main code][padding][rdata]
+    fn generate_boot(&mut self, module: &IrModule) -> Vec<u8> {
+        const BARE_LOAD_RVA: u32 = 0x100000; // 1MB — typical kernel load address
+        self.bare_mode = true;
+
+        // 1. Collect string constants
+        let mut all_strings: Vec<String> = Vec::new();
+        for func in module.functions.values() {
+            for inst in func.instructions.values() {
+                if let Inst::ConstStr { value } = inst {
+                    if !all_strings.contains(value) {
+                        all_strings.push(value.clone());
+                    }
+                }
+                if let Inst::Panic { message } = inst {
+                    if !all_strings.contains(message) {
+                        all_strings.push(message.clone());
+                    }
+                }
+            }
+        }
+        all_strings.push("true".to_string());
+        all_strings.push("false".to_string());
+
+        // 2. Build .rdata section
+        let mut rdata = RdataBuilder::new();
+        let string_map: HashMap<String, String> = all_strings.iter()
+            .map(|s| (s.clone(), s.clone()))
+            .collect();
+        rdata.build(&string_map);
+        for s in &all_strings {
+            if let Some(&off) = rdata.string_offsets.get(s) {
+                self.string_rdata_offsets.insert(s.clone(), off);
+            }
+        }
+        self.iat_rdata_offsets.clear();
+
+        // 3. Pre-allocate labels
+        for name in module.functions.keys() {
+            let label = self.enc.alloc_label();
+            self.func_labels.insert(name.clone(), label);
+        }
+        for stub in &["p_print_int", "p_print_str", "p_print_bool", "p_print_float",
+                       "p_panic", "p_malloc", "p_free",
+                       "p_str_concat", "p_to_str",
+                       "p_to_str_vec", "p_to_str_float", "p_to_str_str", "p_to_str_bool",
+                       "p_vec_new", "p_vec_push", "p_vec_len", "p_vec_get", "p_vec_pop", "p_print_vec",
+                       "p_vec_set", "p_vec_is_empty", "p_vec_clear", "p_vec_capacity",
+                       "p_vec_insert", "p_vec_remove", "p_vec_contains", "p_vec_reverse",
+                       "p_vec_first", "p_vec_last", "p_vec_extend", "p_vec_truncate",
+                       "p_vec_sort", "p_vec_clone",
+                       "p_map_new", "p_map_insert", "p_map_get", "p_map_contains", "p_map_remove", "p_map_len", "p_map_is_empty", "p_print_map",
+                       "p_map_clear", "p_map_keys", "p_map_values", "p_map_get_or", "p_map_clone",
+                       "p_string_from", "p_string_len", "p_string_is_empty", "p_string_push_str",
+                       "p_string_to_string", "p_string_slice",
+                       "p_string_contains", "p_string_starts_with", "p_string_ends_with",
+                       "p_string_trim", "p_string_split", "p_string_replace",
+                       "p_string_char_at", "p_string_to_uppercase", "p_string_to_lowercase",
+                       "p_string_parse_int", "p_string_find", "p_string_rfind",
+                       "p_string_repeat", "p_string_bytes", "p_string_clone",
+                       "p_cli", "p_sti", "p_lidt", "p_idt_set_entry",
+                       "p_hlt", "p_inb", "p_outb",
+                       "p_cr3_read", "p_cr3_write", "p_cr0_read", "p_cr0_write",
+                       "p_cr4_read", "p_cr4_write", "p_invlpg",
+                       "p_page_map", "p_page_unmap",
+                       "p_phys_read64", "p_phys_write64"] {
+            let label = self.enc.alloc_label();
+            self.func_labels.insert(stub.to_string(), label);
+        }
+
+        // 4. Generate code for each function
+        for (name, func) in &module.functions {
+            self.gen_function(name, func, module);
+        }
+
+        // 5. Generate runtime stubs (interrupt + MMU only in bare mode)
+        self.gen_runtime_stubs();
+
+        // 6. Generate boot entry point
+        self.gen_boot_entry_point();
+
+        // 7. Resolve labels
+        self.enc.resolve_labels();
+
+        // 8. Compute rdata RVA
+        let rdata_rva = BARE_LOAD_RVA + align_up(self.enc.code.len() as u32, SECTION_ALIGN);
+
+        // 9. Patch RIP-relative references
+        self.enc.resolve_rip_refs(BARE_LOAD_RVA, rdata_rva);
+
+        // 10. Build multiboot2 header
+        let mb2_header = build_multiboot2_header();
+
+        // 11. Build boot binary: [mb2 header][code][padding][rdata]
+        let code_len = self.enc.code.len();
+        let padded_code_len = align_up(code_len as u32, SECTION_ALIGN) as usize;
+        let mut binary = Vec::with_capacity(mb2_header.len() + padded_code_len + rdata.data.len());
+        binary.extend_from_slice(&mb2_header);
+        binary.extend_from_slice(&self.enc.code);
+        binary.resize(mb2_header.len() + padded_code_len, 0xCC);
+        binary.extend_from_slice(&rdata.data);
+
+        binary
+    }
+
+    /// Generate boot entry point for multiboot2 (Phase 5A.5).
+    /// When GRUB loads the kernel, it jumps to the entry point with:
+    ///   - eax = 0x36d76289 (MB2_BOOTLOADER_MAGIC)
+    ///   - ebx = multiboot info structure address
+    ///   - protected mode, paging disabled
+    /// We set up a stack and call main().
+    fn gen_boot_entry_point(&mut self) {
+        self.entry_offset = self.enc.offset();
+
+        // Set up stack: mov esp, 0x90000 (typical stack top for boot)
+        // Then align to 16 bytes
+        self.enc.emit(&[0xB8, 0x00, 0x00, 0x09, 0x00]); // mov eax, 0x90000
+        self.enc.emit(&[0x48, 0x89, 0xC4]); // mov rsp, rax
+
+        // Push 0 for boot protocol (fake return address)
+        self.enc.emit(&[0x6A, 0x00]); // push 0
+
+        // Set up frame pointer
+        self.enc.push(Reg::Rbp);
+        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+
+        // Call main()
+        let main_label = *self.func_labels.get("main").expect("no main function");
+        self.enc.call_label(main_label);
+
+        // Halt loop: hlt; jmp -3
+        self.enc.emit(&[0xF4]);       // hlt
+        self.enc.emit(&[0xEB, 0xFD]); // jmp -3 (back to hlt)
+    }
+
     /// Get rdata offset for a string constant
     fn str_off(&self, s: &str) -> usize {
         *self.string_rdata_offsets.get(s).unwrap_or(&0)
@@ -1719,9 +2172,32 @@ impl PeCodeGen {
         let label = *self.func_labels.get(name).unwrap();
         self.enc.place_label(label);
 
-        // Prologue
-        self.enc.push(Reg::Rbp);
-        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+        if func.is_interrupt {
+            // Interrupt handler prologue: save all GP registers
+            // The CPU already pushed SS:RSP, RFLAGS, CS:RIP on interrupt
+            // We save all general-purpose registers
+            self.enc.push(Reg::Rax);
+            self.enc.push(Reg::Rbx);
+            self.enc.push(Reg::Rcx);
+            self.enc.push(Reg::Rdx);
+            self.enc.push(Reg::Rsi);
+            self.enc.push(Reg::Rdi);
+            self.enc.push(Reg::R8);
+            self.enc.push(Reg::R9);
+            self.enc.push(Reg::R10);
+            self.enc.push(Reg::R11);
+            self.enc.push(Reg::R12);
+            self.enc.push(Reg::R13);
+            self.enc.push(Reg::R14);
+            self.enc.push(Reg::R15);
+            // Set up frame
+            self.enc.push(Reg::Rbp);
+            self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+        } else {
+            // Prologue
+            self.enc.push(Reg::Rbp);
+            self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+        }
 
         // Allocate stack frame
         let mut frame = PeStackFrame::new();
@@ -2001,7 +2477,27 @@ impl PeCodeGen {
                 }
                 self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
                 self.enc.pop(Reg::Rbp);
-                self.enc.ret();
+                if func.is_interrupt {
+                    // Interrupt handler epilogue: restore all GP registers
+                    self.enc.pop(Reg::R15);
+                    self.enc.pop(Reg::R14);
+                    self.enc.pop(Reg::R13);
+                    self.enc.pop(Reg::R12);
+                    self.enc.pop(Reg::R11);
+                    self.enc.pop(Reg::R10);
+                    self.enc.pop(Reg::R9);
+                    self.enc.pop(Reg::R8);
+                    self.enc.pop(Reg::Rdi);
+                    self.enc.pop(Reg::Rsi);
+                    self.enc.pop(Reg::Rdx);
+                    self.enc.pop(Reg::Rcx);
+                    self.enc.pop(Reg::Rbx);
+                    self.enc.pop(Reg::Rax);
+                    // iret restores SS:RSP, RFLAGS, CS:RIP
+                    self.enc.emit(&[0xCF]); // iret
+                } else {
+                    self.enc.ret();
+                }
             }
 
             Inst::Unreachable => {
@@ -2010,6 +2506,45 @@ impl PeCodeGen {
 
             // ─── Function Calls ───
             Inst::Call { func: call_name, args, .. } => {
+                // SIMD intrinsics: emit hardware SSE2 instructions instead of calls
+                if call_name == "p_simd_add" && args.len() == 2 {
+                    let a_off = frame.offset(args[0]) as i32;
+                    let b_off = frame.offset(args[1]) as i32;
+                    // Load a into xmm0, load b into xmm1, addpd xmm0, xmm1, store xmm0
+                    self.enc.movapd_rbp_reg(XmmReg::Xmm0, a_off);
+                    self.enc.movapd_rbp_reg(XmmReg::Xmm1, b_off);
+                    self.enc.addpd_rr(XmmReg::Xmm0, XmmReg::Xmm1);
+                    self.enc.movapd_mem_rbp(dst, XmmReg::Xmm0);
+                    return;
+                }
+                if call_name == "p_simd_sub" && args.len() == 2 {
+                    let a_off = frame.offset(args[0]) as i32;
+                    let b_off = frame.offset(args[1]) as i32;
+                    self.enc.movapd_rbp_reg(XmmReg::Xmm0, a_off);
+                    self.enc.movapd_rbp_reg(XmmReg::Xmm1, b_off);
+                    self.enc.subpd_rr(XmmReg::Xmm0, XmmReg::Xmm1);
+                    self.enc.movapd_mem_rbp(dst, XmmReg::Xmm0);
+                    return;
+                }
+                if call_name == "p_simd_mul" && args.len() == 2 {
+                    let a_off = frame.offset(args[0]) as i32;
+                    let b_off = frame.offset(args[1]) as i32;
+                    self.enc.movapd_rbp_reg(XmmReg::Xmm0, a_off);
+                    self.enc.movapd_rbp_reg(XmmReg::Xmm1, b_off);
+                    self.enc.mulpd_rr(XmmReg::Xmm0, XmmReg::Xmm1);
+                    self.enc.movapd_mem_rbp(dst, XmmReg::Xmm0);
+                    return;
+                }
+                if call_name == "p_simd_div" && args.len() == 2 {
+                    let a_off = frame.offset(args[0]) as i32;
+                    let b_off = frame.offset(args[1]) as i32;
+                    self.enc.movapd_rbp_reg(XmmReg::Xmm0, a_off);
+                    self.enc.movapd_rbp_reg(XmmReg::Xmm1, b_off);
+                    self.enc.divpd_rr(XmmReg::Xmm0, XmmReg::Xmm1);
+                    self.enc.movapd_mem_rbp(dst, XmmReg::Xmm0);
+                    return;
+                }
+
                 let target_func = if call_name == "print" {
                     if let Some(arg) = args.first() {
                         let arg_ty = func.values.get(arg).map(|m| &m.ty);
@@ -2202,6 +2737,13 @@ impl PeCodeGen {
                 self.enc.xor_self(Reg::Rax);
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
             }
+            Inst::RegionBegin { .. } => {
+                // Region begin — no-op in PE backend (stack-based allocation)
+                self.enc.xor_self(Reg::Rax);
+            }
+            Inst::RegionEnd { .. } => {
+                // Region end — no-op in PE backend
+            }
         }
     }
 
@@ -2380,6 +2922,14 @@ impl PeCodeGen {
 
     /// Generate runtime stubs — direct Windows API calls through IAT
     fn gen_runtime_stubs(&mut self) {
+        if self.bare_mode {
+            // In bare-metal mode, skip runtime stubs that depend on OS calls
+            // (print, malloc, etc). User code must use inline asm for I/O.
+            // But still generate interrupt control + MMU stubs.
+            self.gen_interrupt_stubs();
+            self.gen_mmu_stubs();
+            return;
+        }
         self.gen_print_int();
         self.gen_print_str();
         self.gen_print_bool();
@@ -2450,6 +3000,211 @@ impl PeCodeGen {
         self.gen_string_repeat();
         self.gen_string_bytes();
         self.gen_string_clone();
+        // Phase 5A.3: Interrupt handler stubs
+        self.gen_interrupt_stubs();
+        // Phase 5A.4: MMU/page table stubs
+        self.gen_mmu_stubs();
+    }
+
+    /// Generate interrupt control stubs (Phase 5A.3)
+    /// In bare mode: emit real x86 instructions
+    /// In normal mode: emit ud2 (trap) since these are meaningless under an OS
+    fn gen_interrupt_stubs(&mut self) {
+        // p_cli() — clear interrupt flag
+        let label = *self.func_labels.get("p_cli").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            self.enc.emit(&[0xFA]); // cli
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_sti() — set interrupt flag
+        let label = *self.func_labels.get("p_sti").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            self.enc.emit(&[0xFB]); // sti
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_hlt() — halt CPU
+        let label = *self.func_labels.get("p_hlt").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            self.enc.emit(&[0xF4]); // hlt
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_lidt(rcx = ptr to IDT descriptor) — load IDT
+        let label = *self.func_labels.get("p_lidt").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // lidt [rcx]
+            self.enc.emit(&[0x48, 0x0F, 0x01, 0x19]); // lidt [rcx]
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_idt_set_entry(rcx = vector, rdx = handler_addr) — set IDT entry
+        // This is a simplified stub: in a real implementation, it would write
+        // to an IDT in memory. For now, just return.
+        let label = *self.func_labels.get("p_idt_set_entry").unwrap();
+        self.enc.place_label(label);
+        self.enc.ret();
+
+        // p_inb(rcx = port) -> rax = byte — read from I/O port
+        let label = *self.func_labels.get("p_inb").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov rdx, rcx (port number)
+            self.enc.mov_rr(Reg::Rdx, Reg::Rcx);
+            // xor rax, rax
+            self.enc.xor_rr(Reg::Rax, Reg::Rax);
+            // in al, dx
+            self.enc.emit(&[0xEC]); // in al, dx
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_outb(rcx = port, rdx = value) — write to I/O port
+        let label = *self.func_labels.get("p_outb").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov r8, rcx (port), mov r9, rdx (value)
+            // mov dx, cx (port to dx)
+            self.enc.mov_rr(Reg::R8, Reg::Rcx);  // save port
+            self.enc.mov_rr(Reg::R9, Reg::Rdx);  // save value
+            // mov dx, r8w
+            self.enc.emit(&[0x66, 0x49, 0x89, 0xC0]); // mov ax, r8w (port)
+            self.enc.emit(&[0x66, 0x4C, 0x89, 0xC8]); // mov ax, r8w
+            // out dx, al
+            self.enc.emit(&[0xEE]); // out dx, al
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+    }
+
+    /// Generate MMU/page table management stubs (Phase 5A.4)
+    fn gen_mmu_stubs(&mut self) {
+        // p_cr3_read() -> rax — read CR3 (page table base)
+        let label = *self.func_labels.get("p_cr3_read").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov rax, cr3
+            self.enc.emit(&[0x48, 0x0F, 0x20, 0xD8]); // mov rax, cr3
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_cr3_write(rcx = addr) — write CR3
+        let label = *self.func_labels.get("p_cr3_write").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov cr3, rcx
+            self.enc.emit(&[0x48, 0x0F, 0x22, 0xD9]); // mov cr3, rcx
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_cr0_read() -> rax — read CR0
+        let label = *self.func_labels.get("p_cr0_read").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov rax, cr0
+            self.enc.emit(&[0x48, 0x0F, 0x20, 0xC0]); // mov rax, cr0
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_cr0_write(rcx = val) — write CR0
+        let label = *self.func_labels.get("p_cr0_write").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov cr0, rcx
+            self.enc.emit(&[0x48, 0x0F, 0x22, 0xC1]); // mov cr0, rcx
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_cr4_read() -> rax — read CR4
+        let label = *self.func_labels.get("p_cr4_read").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov rax, cr4
+            self.enc.emit(&[0x48, 0x0F, 0x20, 0xE0]); // mov rax, cr4
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_cr4_write(rcx = val) — write CR4
+        let label = *self.func_labels.get("p_cr4_write").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov cr4, rcx
+            self.enc.emit(&[0x48, 0x0F, 0x22, 0xE1]); // mov cr4, rcx
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_invlpg(rcx = addr) — invalidate TLB entry
+        let label = *self.func_labels.get("p_invlpg").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // invlpg [rcx]
+            self.enc.emit(&[0x48, 0x0F, 0x01, 0x39]); // invlpg [rcx]
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_page_map(rcx=page_table, rdx=virt, r8=phys, r9=flags) — simplified stub
+        // A full implementation would walk the page table and set entries.
+        // For now, this is a placeholder that just returns.
+        let label = *self.func_labels.get("p_page_map").unwrap();
+        self.enc.place_label(label);
+        self.enc.ret();
+
+        // p_page_unmap(rcx=page_table, rdx=virt) — simplified stub
+        let label = *self.func_labels.get("p_page_unmap").unwrap();
+        self.enc.place_label(label);
+        self.enc.ret();
+
+        // p_phys_read64(rcx=addr) -> rax — read 8 bytes from physical address
+        // In bare mode, physical == virtual (no MMU yet or identity mapped)
+        let label = *self.func_labels.get("p_phys_read64").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov rax, [rcx]
+            self.enc.mov_reg_ptr(Reg::Rax, Reg::Rcx);
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_phys_write64(rcx=addr, rdx=val) — write 8 bytes to physical address
+        let label = *self.func_labels.get("p_phys_write64").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // mov [rcx], rdx
+            self.enc.mov_ptr_reg(Reg::Rcx, Reg::Rdx);
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
     }
 
     /// p_print_int(rcx = i64 value)
@@ -4823,19 +5578,37 @@ impl PeCodeGen {
     fn gen_entry_point(&mut self) {
         self.entry_offset = self.enc.offset();
 
-        // sub rsp, 40 (32 shadow space + 8 for alignment; Windows entry is called
-        // with RSP = 16n+8 due to return address, so we need 40 to realign to 16n)
-        self.enc.sub_rsp_i32(40);
+        if self.bare_mode {
+            // Bare-metal entry: just call main(), then hlt
+            // No stack alignment needed (caller sets up stack)
+            self.enc.push(Reg::Rbp);
+            self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
 
-        // Call main()
-        let main_label = *self.func_labels.get("main").expect("no main function");
-        self.enc.call_label(main_label);
+            // Call main()
+            let main_label = *self.func_labels.get("main").expect("no main function");
+            self.enc.call_label(main_label);
 
-        // ExitProcess(rax) — use return value from main as exit code
-        self.enc.mov_rr(Reg::Rcx, Reg::Rax);
-        self.enc.call_rip(self.iat_off(IAT_EXIT_PROCESS));
+            // Halt loop: hlt; jmp -1 (infinite halt)
+            self.enc.emit(&[0xF4]);       // hlt
+            self.enc.emit(&[0xEB, 0xFD]); // jmp -3 (back to hlt)
 
-        self.enc.ud2();
+            self.enc.pop(Reg::Rbp);
+            self.enc.ret();
+        } else {
+            // sub rsp, 40 (32 shadow space + 8 for alignment; Windows entry is called
+            // with RSP = 16n+8 due to return address, so we need 40 to realign to 16n)
+            self.enc.sub_rsp_i32(40);
+
+            // Call main()
+            let main_label = *self.func_labels.get("main").expect("no main function");
+            self.enc.call_label(main_label);
+
+            // ExitProcess(rax) — use return value from main as exit code
+            self.enc.mov_rr(Reg::Rcx, Reg::Rax);
+            self.enc.call_rip(self.iat_off(IAT_EXIT_PROCESS));
+
+            self.enc.ud2();
+        }
     }
 
     // ─── New Vec runtime stubs ───
@@ -5484,4 +6257,123 @@ impl PeCodeGen {
 pub fn generate_pe(module: &IrModule) -> Vec<u8> {
     let mut gen = PeCodeGen::new();
     gen.generate(module)
+}
+
+/// Generate a flat binary (no PE headers, no imports, no IAT).
+/// The binary contains:
+///   - .text section (machine code) at offset 0
+///   - .rdata section (string constants) immediately after .text
+/// The entry point is at offset 0 (the _main label).
+/// Load address is assumed to be 0x10000 (BARE_LOAD_RVA).
+/// This is for bare-metal / No-OS / kernel / bootloader development.
+pub fn generate_flat_binary(module: &IrModule) -> Vec<u8> {
+    let mut gen = PeCodeGen::new();
+    gen.generate_flat(module)
+}
+
+/// Build a Multiboot2 header (Phase 5A.5).
+/// The header must be in the first 32768 bytes of the binary and 8-byte aligned.
+/// Format:
+///   magic:      0xE85250D6 (MB2_HEADER_MAGIC)
+///   architecture: 0 (i386 protected mode)
+///   header_length: total header length
+///   checksum:   -(magic + architecture + header_length) mod 2^32
+///   tags:       end tag (type=0, flags=0, size=8)
+fn build_multiboot2_header() -> Vec<u8> {
+    // Header: 16 bytes (magic + arch + length + checksum) + 8 bytes (end tag) = 24 bytes
+    let header_length: u32 = 24;
+    let magic: u32 = 0xE85250D6;
+    let architecture: u32 = 0; // i386 protected mode
+    let checksum: u32 = 0u32.wrapping_sub(magic.wrapping_add(architecture).wrapping_add(header_length));
+
+    let mut header = Vec::with_capacity(24);
+    // Magic
+    header.extend_from_slice(&magic.to_le_bytes());
+    // Architecture
+    header.extend_from_slice(&architecture.to_le_bytes());
+    // Header length
+    header.extend_from_slice(&header_length.to_le_bytes());
+    // Checksum
+    header.extend_from_slice(&checksum.to_le_bytes());
+    // End tag: type=0, flags=0, size=8
+    header.extend_from_slice(&0u16.to_le_bytes()); // type
+    header.extend_from_slice(&0u16.to_le_bytes()); // flags
+    header.extend_from_slice(&8u32.to_le_bytes()); // size
+    // Pad to 8-byte alignment
+    while header.len() % 8 != 0 {
+        header.push(0);
+    }
+    header
+}
+
+/// Generate a Multiboot2-compatible boot binary (Phase 5A.5).
+/// Layout:
+///   [Multiboot2 header][boot code][main code][padding][rdata]
+/// The multiboot2 header is placed at the very start of the binary so
+/// the bootloader (GRUB) can find it within the first 32768 bytes.
+/// The boot code sets up a stack and calls main().
+pub fn generate_boot_binary(module: &IrModule) -> Vec<u8> {
+    let mut gen = PeCodeGen::new();
+    gen.generate_boot(module)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that SSE2 addpd encoding produces correct bytes.
+    /// addpd xmm0, xmm1 = 66 0F 58 C1
+    #[test]
+    fn test_sse2_addpd_encoding() {
+        let mut enc = X86Encoder::new();
+        enc.addpd_rr(XmmReg::Xmm0, XmmReg::Xmm1);
+        assert_eq!(enc.code, vec![0x66, 0x0F, 0x58, 0xC1]);
+    }
+
+    /// Test that SSE2 mulpd encoding produces correct bytes.
+    /// mulpd xmm0, xmm1 = 66 0F 59 C1
+    #[test]
+    fn test_sse2_mulpd_encoding() {
+        let mut enc = X86Encoder::new();
+        enc.mulpd_rr(XmmReg::Xmm0, XmmReg::Xmm1);
+        assert_eq!(enc.code, vec![0x66, 0x0F, 0x59, 0xC1]);
+    }
+
+    /// Test that SSE2 subpd encoding produces correct bytes.
+    /// subpd xmm0, xmm1 = 66 0F 5C C1
+    #[test]
+    fn test_sse2_subpd_encoding() {
+        let mut enc = X86Encoder::new();
+        enc.subpd_rr(XmmReg::Xmm0, XmmReg::Xmm1);
+        assert_eq!(enc.code, vec![0x66, 0x0F, 0x5C, 0xC1]);
+    }
+
+    /// Test that SSE2 divpd encoding produces correct bytes.
+    /// divpd xmm0, xmm1 = 66 0F 5E C1
+    #[test]
+    fn test_sse2_divpd_encoding() {
+        let mut enc = X86Encoder::new();
+        enc.divpd_rr(XmmReg::Xmm0, XmmReg::Xmm1);
+        assert_eq!(enc.code, vec![0x66, 0x0F, 0x5E, 0xC1]);
+    }
+
+    /// Test that SSE2 movapd encoding produces correct bytes.
+    /// movapd xmm0, xmm1 = 66 0F 28 C1
+    #[test]
+    fn test_sse2_movapd_encoding() {
+        let mut enc = X86Encoder::new();
+        enc.movapd_rr(XmmReg::Xmm0, XmmReg::Xmm1);
+        assert_eq!(enc.code, vec![0x66, 0x0F, 0x28, 0xC1]);
+    }
+
+    /// Test high XMM register encoding (requires REX prefix).
+    /// addpd xmm8, xmm9 = 66 45 0F 58 C1
+    /// REX = 0x45 (R bit for xmm8 in reg field, B bit for xmm9 in rm field)
+    #[test]
+    fn test_sse2_addpd_high_regs() {
+        let mut enc = X86Encoder::new();
+        enc.addpd_rr(XmmReg::Xmm8, XmmReg::Xmm9);
+        // 66 = mandatory prefix, 45 = REX (R+B for high regs), 0F 58 = addpd, C1 = ModR/M
+        assert_eq!(enc.code, vec![0x66, 0x45, 0x0F, 0x58, 0xC1]);
+    }
 }

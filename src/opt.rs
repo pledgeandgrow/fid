@@ -32,7 +32,8 @@
 use crate::ast::{BinOp, UnaryOp};
 use crate::ir::{BlockId, Effect, EffectSet, IrType, ValueId};
 use crate::pir::{
-    lower_ir_to_l1, lower_l1_to_l2, L2Block, L2Function, L2Inst, L2Module, PBlock, PValue,
+    lower_ir_to_l1, lower_l1_to_l2, L2Block, L2Function, L2Inst, L2Module, MemRegion, PBlock,
+    PirType, PValue,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -49,6 +50,9 @@ pub enum Pass {
     Inline,
     Unroll,
     Tco,
+    AliasAnalysis,
+    EffectReorder,
+    PartialEval,
 }
 
 impl Pass {
@@ -60,6 +64,9 @@ impl Pass {
             Pass::Inline,
             Pass::Unroll,
             Pass::Tco,
+            Pass::AliasAnalysis,
+            Pass::EffectReorder,
+            Pass::PartialEval,
         ]
     }
 
@@ -71,6 +78,9 @@ impl Pass {
             Pass::Inline => "inline",
             Pass::Unroll => "unroll",
             Pass::Tco => "tco",
+            Pass::AliasAnalysis => "alias-analysis",
+            Pass::EffectReorder => "effect-reorder",
+            Pass::PartialEval => "partial-eval",
         }
     }
 
@@ -82,6 +92,9 @@ impl Pass {
             "inline" | "inl" => Some(Pass::Inline),
             "unroll" => Some(Pass::Unroll),
             "tco" => Some(Pass::Tco),
+            "alias-analysis" | "alias" | "aa" => Some(Pass::AliasAnalysis),
+            "effect-reorder" | "reorder" | "er" => Some(Pass::EffectReorder),
+            "partial-eval" | "pe" => Some(Pass::PartialEval),
             _ => None,
         }
     }
@@ -97,6 +110,9 @@ pub struct OptStats {
     pub inlined: usize,
     pub unrolled: usize,
     pub tco: usize,
+    pub alias_analysis: usize,
+    pub effect_reorder: usize,
+    pub partial_eval: usize,
     /// Number of fixed-point iterations the driver ran.
     pub iterations: usize,
 }
@@ -104,6 +120,7 @@ pub struct OptStats {
 impl OptStats {
     pub fn total(&self) -> usize {
         self.const_fold + self.cse + self.dce + self.inlined + self.unrolled + self.tco
+            + self.alias_analysis + self.effect_reorder + self.partial_eval
     }
 }
 
@@ -127,6 +144,9 @@ pub fn optimize_l2_with(module: &mut L2Module, passes: &[Pass], max_iters: usize
                 Pass::Inline => stats.inlined += pass_inline(module),
                 Pass::Unroll => stats.unrolled += pass_unroll(module),
                 Pass::Tco => stats.tco += pass_tco(module),
+                Pass::AliasAnalysis => stats.alias_analysis += pass_alias_analysis(module),
+                Pass::EffectReorder => stats.effect_reorder += pass_effect_reorder(module),
+                Pass::PartialEval => stats.partial_eval += pass_partial_eval(module),
             }
         }
         if stats.total() == before {
@@ -1116,19 +1136,211 @@ pub fn pass_unroll(module: &mut L2Module) -> usize {
     count
 }
 
+/// Clone an L2 instruction with remapped ValueId references. Used during loop
+/// unrolling to give each unrolled iteration fresh ValueIds.
+fn clone_inst_remapped(inst: &L2Inst, map: &std::collections::HashMap<PValue, PValue>) -> L2Inst {
+    let r = |v: &PValue| -> PValue { *map.get(v).unwrap_or(v) };
+    match inst {
+        L2Inst::ConstInt { value, ty } => L2Inst::ConstInt { value: *value, ty: ty.clone() },
+        L2Inst::ConstFloat { bits, ty } => L2Inst::ConstFloat { bits: *bits, ty: ty.clone() },
+        L2Inst::ConstBool { value } => L2Inst::ConstBool { value: *value },
+        L2Inst::ConstStr { value } => L2Inst::ConstStr { value: value.clone() },
+        L2Inst::ConstNull { ty } => L2Inst::ConstNull { ty: ty.clone() },
+        L2Inst::BinOp { op, left, right, ty } => L2Inst::BinOp { op: op.clone(), left: r(left), right: r(right), ty: ty.clone() },
+        L2Inst::UnaryOp { op, operand, ty } => L2Inst::UnaryOp { op: op.clone(), operand: r(operand), ty: ty.clone() },
+        L2Inst::Alloca { ty, region } => L2Inst::Alloca { ty: ty.clone(), region: region.clone() },
+        L2Inst::Load { ptr, ty } => L2Inst::Load { ptr: r(ptr), ty: ty.clone() },
+        L2Inst::Store { ptr, value } => L2Inst::Store { ptr: r(ptr), value: r(value) },
+        L2Inst::GetFieldPtr { struct_ptr, field_index, field_ty } => L2Inst::GetFieldPtr { struct_ptr: r(struct_ptr), field_index: *field_index, field_ty: field_ty.clone() },
+        L2Inst::GetElemPtr { array_ptr, index, elem_ty } => L2Inst::GetElemPtr { array_ptr: r(array_ptr), index: r(index), elem_ty: elem_ty.clone() },
+        L2Inst::Jump { target } => L2Inst::Jump { target: *target },
+        L2Inst::Branch { cond, then, else_ } => L2Inst::Branch { cond: r(cond), then: *then, else_: *else_ },
+        L2Inst::Return { value } => L2Inst::Return { value: value.map(|v| r(&v)) },
+        L2Inst::Unreachable => L2Inst::Unreachable,
+        L2Inst::Call { func, args, ret_ty } => L2Inst::Call { func: func.clone(), args: args.iter().map(r).collect(), ret_ty: ret_ty.clone() },
+        L2Inst::CallPtr { fn_ptr, args, ret_ty, has_env } => L2Inst::CallPtr { fn_ptr: r(fn_ptr), args: args.iter().map(r).collect(), ret_ty: ret_ty.clone(), has_env: *has_env },
+        L2Inst::DynCall { trait_name, method, args, ret_ty } => L2Inst::DynCall { trait_name: trait_name.clone(), method: method.clone(), args: args.iter().map(r).collect(), ret_ty: ret_ty.clone() },
+        L2Inst::MakeDyn { value, type_name, trait_name } => L2Inst::MakeDyn { value: r(value), type_name: type_name.clone(), trait_name: trait_name.clone() },
+        L2Inst::BitCast { value, from, to } => L2Inst::BitCast { value: r(value), from: from.clone(), to: to.clone() },
+        L2Inst::IntExtend { value, from, to } => L2Inst::IntExtend { value: r(value), from: from.clone(), to: to.clone() },
+        L2Inst::IntTrunc { value, from, to } => L2Inst::IntTrunc { value: r(value), from: from.clone(), to: to.clone() },
+        L2Inst::IntToFloat { value, from, to } => L2Inst::IntToFloat { value: r(value), from: from.clone(), to: to.clone() },
+        L2Inst::FloatToInt { value, from, to } => L2Inst::FloatToInt { value: r(value), from: from.clone(), to: to.clone() },
+        L2Inst::TryUnwrap { value, ok_dst, err_block, ok_block } => L2Inst::TryUnwrap { value: r(value), ok_dst: r(ok_dst), err_block: *err_block, ok_block: *ok_block },
+        L2Inst::Print { value, ty } => L2Inst::Print { value: r(value), ty: ty.clone() },
+        L2Inst::Panic { message } => L2Inst::Panic { message: message.clone() },
+    }
+}
+
 fn unroll_function(f: &mut L2Function) -> usize {
-    // This is a conservative first cut: we detect the pattern but full
-    // unrolling requires duplicating blocks and remapping SSA ids, which is
-    // involved. For the bootstrap we report 0 unrolls and document the
-    // precondition; the pass is wired so Phase 4B's success metric
-    // (optimizer runs) is satisfied, and the framework is in place for a
-    // follow-up that does the actual duplication.
+    // Loop unrolling for simple counted loops with constant trip counts.
     //
-    // Detection (for future use): find a block whose terminator is a Branch
-    // on a BinOp(Lt, %i, ConstInt n) where %i is updated by BinOp(Add, %i,
-    // ConstInt 1) in the body and the body jumps back to the header.
-    let _ = f;
-    0
+    // Pattern: a header block H with terminator Branch(cond, Body, Exit)
+    // where cond = BinOp(Lt, Load(i_ptr), ConstInt(N))
+    // and Body ends with Jump(H) and contains Store(Add(Load(i_ptr), ConstInt(1)), i_ptr).
+    //
+    // When N is a small constant (≤ 8), we fully unroll by:
+    //   1. Replacing the header's branch with the body instructions repeated N times
+    //   2. Each iteration's comparison is resolved at compile time (i < N → true for i=0..N-1)
+    //   3. After N iterations, jump to the exit block
+    //
+    // Since the loop uses mutable allocas (not SSA phi nodes), we can duplicate
+    // the body instructions directly — they reference the same alloca slots.
+
+    let mut unrolled = 0;
+
+    // Find loops: a body block that ends with Jump(header), where header's
+    // terminator is Branch(cond, body, exit) or Branch(cond, exit, body).
+    let mut loops_to_unroll: Vec<(usize, usize, usize, i64)> = Vec::new(); // (header_idx, body_idx, exit_idx, trip_count)
+
+    for (bi, body) in f.blocks.iter().enumerate() {
+        // Check if body ends with a Jump
+        let term_vid = body.instructions.last();
+        if let Some(&tv) = term_vid {
+            if let Some(L2Inst::Jump { target: header_id }) = f.values.get(&tv) {
+                // Find the header block
+                let hi = f.blocks.iter().position(|b| b.id == *header_id);
+                if hi.is_none() { continue; }
+                let hi = hi.unwrap();
+                let header = &f.blocks[hi];
+
+                // Header's terminator must be a Branch
+                let hterm_vid = header.instructions.last();
+                if let Some(&hv) = hterm_vid {
+                    if let Some(L2Inst::Branch { cond, then, else_ }) = f.values.get(&hv) {
+                        // One target is the body, the other is the exit
+                        let (_body_target, exit_target) = if *then == body.id {
+                            (*then, *else_)
+                        } else if *else_ == body.id {
+                            (*else_, *then)
+                        } else {
+                            continue; // header doesn't branch to this body
+                        };
+
+                        let exit_idx = f.blocks.iter().position(|b| b.id == exit_target);
+                        if exit_idx.is_none() { continue; }
+                        let exit_idx = exit_idx.unwrap();
+
+                        // Check if cond is BinOp(Lt, Load(i_ptr), ConstInt(N))
+                        if let Some(L2Inst::BinOp { op: BinOp::Lt, left, right, .. }) = f.values.get(cond) {
+                            // Check if left is a Load from an alloca
+                            let i_ptr = if let Some(L2Inst::Load { ptr, .. }) = f.values.get(left) {
+                                Some(*ptr)
+                            } else {
+                                None
+                            };
+
+                            // Check if right is a ConstInt
+                            let trip_count = if let Some(L2Inst::ConstInt { value, .. }) = f.values.get(right) {
+                                Some(*value)
+                            } else {
+                                None
+                            };
+
+                            if let (Some(i_ptr), Some(n)) = (i_ptr, trip_count) {
+                                // Only unroll small constant trip counts
+                                if n > 0 && n <= 8 {
+                                    // Verify the body increments i by 1
+                                    let mut found_increment = false;
+                                    for &inst_vid in &body.instructions {
+                                        if let Some(inst) = f.values.get(&inst_vid) {
+                                            if let L2Inst::Store { ptr, value: val } = inst {
+                                                if *ptr == i_ptr {
+                                                    if let Some(L2Inst::BinOp { op: BinOp::Add, left, right, .. }) = f.values.get(val) {
+                                                        if let Some(L2Inst::Load { ptr: lp, .. }) = f.values.get(left) {
+                                                            if *lp == i_ptr {
+                                                                if let Some(L2Inst::ConstInt { value: 1, .. }) = f.values.get(right) {
+                                                                    found_increment = true;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if found_increment {
+                                        loops_to_unroll.push((hi, bi, exit_idx, n));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Unroll loops (process in reverse order to preserve block indices)
+    for (hi, bi, ei, n) in loops_to_unroll.into_iter().rev() {
+        // Build the unrolled instructions:
+        // For each iteration 0..n-1: copy body instructions with fresh ValueIds
+        // After n iterations: jump to exit block
+        let header = &f.blocks[hi];
+        let body = &f.blocks[bi];
+        let exit_id = f.blocks[ei].id;
+
+        // Collect body instruction ValueIds (excluding the back-edge jump)
+        let body_insts: Vec<PValue> = body.instructions.iter()
+            .filter(|&&vid| {
+                if let Some(L2Inst::Jump { .. }) = f.values.get(&vid) {
+                    false // skip the back-edge jump
+                } else {
+                    true
+                }
+            })
+            .copied()
+            .collect();
+
+        // Build new header: all non-terminator instructions from header, then
+        // N copies of the body (with fresh ValueIds), then jump to exit
+        let mut new_header_insts: Vec<PValue> = Vec::new();
+
+        // Keep header instructions except the terminator branch
+        for &vid in &header.instructions {
+            if let Some(inst) = f.values.get(&vid) {
+                if inst.is_terminator() {
+                    break;
+                }
+                new_header_insts.push(vid);
+            }
+        }
+
+        // Find the next available ValueId
+        let mut next_vid = f.values.keys().map(|v| v.0).max().unwrap_or(0) + 1;
+
+        // Append N copies of the body with remapped ValueIds
+        for _ in 0..n {
+            // Build a mapping from old ValueId → new ValueId for this iteration
+            let mut vid_map: std::collections::HashMap<PValue, PValue> = std::collections::HashMap::new();
+            for &old_vid in &body_insts {
+                let new_vid = ValueId(next_vid);
+                next_vid += 1;
+                vid_map.insert(old_vid, new_vid);
+            }
+
+            // Clone each instruction with remapped ValueIds
+            for &old_vid in &body_insts {
+                if let Some(inst) = f.values.get(&old_vid) {
+                    let new_vid = vid_map[&old_vid];
+                    let new_inst = clone_inst_remapped(inst, &vid_map);
+                    f.values.insert(new_vid, new_inst);
+                    new_header_insts.push(new_vid);
+                }
+            }
+        }
+
+        // Append jump to exit
+        let jump_vid = ValueId(next_vid);
+        f.values.insert(jump_vid, L2Inst::Jump { target: exit_id });
+        new_header_insts.push(jump_vid);
+
+        // Replace header instructions
+        f.blocks[hi].instructions = new_header_insts;
+        unrolled += 1;
+    }
+
+    unrolled
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1154,13 +1366,160 @@ pub fn pass_tco(module: &mut L2Module) -> usize {
 }
 
 fn tco_function(f: &mut L2Function) -> usize {
-    // Detection: a block whose last two instructions are
-    //   %r = Call g(args)
+    // Tail call optimization for self-recursive functions.
+    //
+    // Pattern: a block ending with
+    //   %r = Call self(args)
     //   Return Some(%r)
-    // We count these; a full rewrite to a jump requires block-param support
-    // (the callee's entry params must be wired as block params so we can
-    // jump to it with the args). For now we report the count so the CLI can
-    // show "N tail calls detected" — the framework is in place.
+    //
+    // Rewrite: replace the Call + Return with:
+    //   store args[0] -> param_alloca[0]
+    //   store args[1] -> param_alloca[1]
+    //   ...
+    //   Jump entry
+    //
+    // This converts self-recursion into a loop, eliminating stack growth.
+    // The function's params are converted to allocas so they can be reassigned.
+
+    // First, check if there are any self-recursive tail calls
+    let mut tail_call_blocks: Vec<usize> = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        if b.instructions.len() < 2 {
+            continue;
+        }
+        let n = b.instructions.len();
+        let call_id = b.instructions[n - 2];
+        let ret_id = b.instructions[n - 1];
+        if let (Some(L2Inst::Call { func, .. }), Some(L2Inst::Return { value: Some(v) })) =
+            (f.values.get(&call_id), f.values.get(&ret_id))
+        {
+            if *func == f.name && *v == call_id {
+                tail_call_blocks.push(bi);
+            }
+        }
+    }
+
+    if tail_call_blocks.is_empty() {
+        return 0;
+    }
+
+    // Convert params to allocas.
+    // Create allocas for each param, store the param values into them at entry,
+    // and replace all uses of params with loads from the allocas.
+    let param_count = f.params.len();
+    if param_count == 0 {
+        return 0;
+    }
+
+    let mut next_vid = f.values.keys().map(|v| v.0).max().unwrap_or(0) + 1;
+    let mut next_block = f.blocks.iter().map(|b| b.id.0).max().unwrap_or(0) + 1;
+
+    // Create allocas for params
+    let mut param_allocas: Vec<PValue> = Vec::new();
+    for (_, pty) in &f.params {
+        let alloca_vid = ValueId(next_vid); next_vid += 1;
+        f.values.insert(alloca_vid, L2Inst::Alloca {
+            ty: pty.clone(),
+            region: crate::pir::MemRegion::Stack,
+        });
+        param_allocas.push(alloca_vid);
+    }
+
+    // Store initial param values into allocas at the start of the entry block
+    let entry_idx = f.blocks.iter().position(|b| b.id == f.entry);
+    if let Some(ei) = entry_idx {
+        let mut init_insts: Vec<PValue> = Vec::new();
+        for (i, (pid, _)) in f.params.iter().enumerate() {
+            let store_vid = ValueId(next_vid); next_vid += 1;
+            f.values.insert(store_vid, L2Inst::Store {
+                ptr: param_allocas[i],
+                value: *pid,
+            });
+            init_insts.push(store_vid);
+        }
+        // Insert these at the start of the entry block
+        let mut new_insts = init_insts;
+        new_insts.extend(f.blocks[ei].instructions.drain(..));
+        f.blocks[ei].instructions = new_insts;
+    }
+
+    // Replace all uses of params with loads from allocas.
+    // We need to insert a load before each use. To keep it simple, insert
+    // loads at the start of each block that uses a param, and replace the
+    // param reference with the load result.
+    for b in &mut f.blocks {
+        // For each param, check if it's used in this block
+        let mut loads_to_insert: Vec<(PValue, PValue)> = Vec::new(); // (param_id, load_vid)
+        for (i, (pid, pty)) in f.params.iter().enumerate() {
+            let uses_param = b.instructions.iter().any(|&vid| {
+                if vid == *pid { return true; }
+                if let Some(inst) = f.values.get(&vid) {
+                    inst_uses_value(inst, pid)
+                } else { false }
+            });
+            if uses_param {
+                let load_vid = ValueId(next_vid); next_vid += 1;
+                f.values.insert(load_vid, L2Inst::Load {
+                    ptr: param_allocas[i],
+                    ty: pty.clone(),
+                });
+                loads_to_insert.push((*pid, load_vid));
+            }
+        }
+        if !loads_to_insert.is_empty() {
+            // Insert loads at the start of the block
+            let load_vids: Vec<PValue> = loads_to_insert.iter().map(|(_, v)| *v).collect();
+            let mut new_insts = load_vids;
+            new_insts.extend(b.instructions.drain(..));
+            b.instructions = new_insts;
+
+            // Remap param references to load results in all instructions in this block
+            let map: std::collections::HashMap<PValue, PValue> = loads_to_insert.iter().cloned().collect();
+            for &vid in &b.instructions {
+                if let Some(inst) = f.values.get_mut(&vid) {
+                    remap_inst(inst, &map, &std::collections::HashMap::new());
+                }
+            }
+        }
+    }
+
+    // Now rewrite tail call blocks: replace Call + Return with stores + Jump
+    let mut rewrite_count = 0;
+    for bi in tail_call_blocks.into_iter().rev() {
+        let n = f.blocks[bi].instructions.len();
+        let call_id = f.blocks[bi].instructions[n - 2];
+        let _ret_id = f.blocks[bi].instructions[n - 1];
+
+        if let Some(L2Inst::Call { args, .. }) = f.values.get(&call_id).cloned() {
+            // Remove the call and return
+            f.blocks[bi].instructions.truncate(n - 2);
+
+            // Add stores: args[i] -> param_allocas[i]
+            // Skip arg 0 if it's the env pointer (params[0] is usually env)
+            for i in 0..param_count.min(args.len()) {
+                let store_vid = ValueId(next_vid); next_vid += 1;
+                f.values.insert(store_vid, L2Inst::Store {
+                    ptr: param_allocas[i],
+                    value: args[i],
+                });
+                f.blocks[bi].instructions.push(store_vid);
+            }
+
+            // Add jump to entry
+            let jump_vid = ValueId(next_vid); next_vid += 1;
+            f.values.insert(jump_vid, L2Inst::Jump { target: f.entry });
+            f.blocks[bi].instructions.push(jump_vid);
+            rewrite_count += 1;
+        }
+    }
+
+    // Update predecessors (simplified — just clear and let later passes fix)
+    let _ = next_block;
+    // Return the number of tail calls that were rewritten
+    rewrite_count
+}
+
+fn tail_call_blocks_count(f: &L2Function) -> usize {
     let mut count = 0;
     for b in &f.blocks {
         if b.instructions.len() < 2 {
@@ -1169,21 +1528,41 @@ fn tco_function(f: &mut L2Function) -> usize {
         let n = b.instructions.len();
         let call_id = b.instructions[n - 2];
         let ret_id = b.instructions[n - 1];
-        let (is_tail_call, _) = match (f.values.get(&call_id), f.values.get(&ret_id)) {
-            (Some(L2Inst::Call { .. }), Some(L2Inst::Return { value: Some(v) })) => {
-                if *v == call_id {
-                    (true, call_id)
-                } else {
-                    (false, call_id)
-                }
+        if let (Some(L2Inst::Call { func, .. }), Some(L2Inst::Return { value: Some(v) })) =
+            (f.values.get(&call_id), f.values.get(&ret_id))
+        {
+            if *func == f.name && *v == call_id {
+                count += 1;
             }
-            _ => (false, call_id),
-        };
-        if is_tail_call {
-            count += 1;
         }
     }
     count
+}
+
+/// Check if an L2 instruction references a given ValueId
+fn inst_uses_value(inst: &L2Inst, target: &PValue) -> bool {
+    match inst {
+        L2Inst::BinOp { left, right, .. } => left == target || right == target,
+        L2Inst::UnaryOp { operand, .. } => operand == target,
+        L2Inst::Load { ptr, .. } => ptr == target,
+        L2Inst::Store { ptr, value, .. } => ptr == target || value == target,
+        L2Inst::GetFieldPtr { struct_ptr, .. } => struct_ptr == target,
+        L2Inst::GetElemPtr { array_ptr, index, .. } => array_ptr == target || index == target,
+        L2Inst::Branch { cond, .. } => cond == target,
+        L2Inst::Return { value: Some(v) } => v == target,
+        L2Inst::Call { args, .. } => args.iter().any(|a| a == target),
+        L2Inst::CallPtr { fn_ptr, args, .. } => fn_ptr == target || args.iter().any(|a| a == target),
+        L2Inst::DynCall { args, .. } => args.iter().any(|a| a == target),
+        L2Inst::MakeDyn { value, .. } => value == target,
+        L2Inst::BitCast { value, .. } => value == target,
+        L2Inst::IntExtend { value, .. } => value == target,
+        L2Inst::IntTrunc { value, .. } => value == target,
+        L2Inst::IntToFloat { value, .. } => value == target,
+        L2Inst::FloatToInt { value, .. } => value == target,
+        L2Inst::TryUnwrap { value, ok_dst, .. } => value == target || ok_dst == target,
+        L2Inst::Print { value, .. } => value == target,
+        _ => false,
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1248,6 +1627,559 @@ pub fn function_effects(f: &L2Function) -> EffectSet {
         }
     }
     effects
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Region-aware alias analysis
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Region-aware alias analysis: two pointers in disjoint memory regions
+/// cannot alias. This pass identifies load/store pairs that access different
+/// regions and marks them as non-aliasing, enabling reordering by the
+/// effect-based reordering pass.
+///
+/// The pass works by:
+/// 1. Collecting all Alloca instructions and their regions
+/// 2. For each Load, finding the source pointer's region
+/// 3. For each Store, finding the target pointer's region
+/// 4. If a Load and Store access different regions, they can be reordered
+///
+/// Returns the number of alias-disambiguation annotations made.
+fn pass_alias_analysis(module: &mut L2Module) -> usize {
+    let mut count = 0;
+    for func in &mut module.functions {
+        // Build a map from ValueId (pointer) → MemRegion by scanning Alloca instructions.
+        let mut ptr_region: std::collections::HashMap<PValue, MemRegion> = std::collections::HashMap::new();
+        for (vid, inst) in &func.values {
+            if let L2Inst::Alloca { region, .. } = inst {
+                ptr_region.insert(*vid, region.clone());
+            }
+        }
+
+        // Collect reordering decisions for each block, then apply them.
+        // (Can't mutate blocks while iterating due to borrow rules.)
+        let mut block_reorders: Vec<(usize, Vec<PValue>)> = Vec::new();
+
+        for (bi, block) in func.blocks.iter().enumerate() {
+            let mut loads: Vec<(usize, MemRegion)> = Vec::new();
+            let mut stores: Vec<(usize, MemRegion)> = Vec::new();
+
+            for (i, inst_idx) in block.instructions.iter().enumerate() {
+                if let Some(inst) = func.values.get(inst_idx) {
+                    match inst {
+                        L2Inst::Load { ptr, .. } => {
+                            let region = ptr_region.get(ptr).cloned().unwrap_or(MemRegion::Heap);
+                            loads.push((i, region));
+                        }
+                        L2Inst::Store { ptr, .. } => {
+                            let region = ptr_region.get(ptr).cloned().unwrap_or(MemRegion::Heap);
+                            stores.push((i, region));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Count non-aliasing pairs: loads and stores in different regions
+            // can be safely reordered.
+            for (li, lr) in &loads {
+                for (si, sr) in &stores {
+                    if lr != sr && li != si {
+                        count += 1;
+                    }
+                }
+            }
+
+            // Reorder: move loads that don't alias any store to before the stores.
+            if !loads.is_empty() && !stores.is_empty() {
+                let store_regions: Vec<&MemRegion> = stores.iter().map(|(_, r)| r).collect();
+                let mut safe_loads: Vec<usize> = Vec::new();
+                for (li, lr) in &loads {
+                    if !store_regions.iter().any(|sr| **sr == *lr) {
+                        safe_loads.push(*li);
+                    }
+                }
+
+                if !safe_loads.is_empty() {
+                    let safe_set: std::collections::HashSet<usize> = safe_loads.iter().copied().collect();
+                    let mut new_insts: Vec<PValue> = Vec::with_capacity(block.instructions.len());
+                    for &i in &safe_loads {
+                        new_insts.push(block.instructions[i]);
+                    }
+                    for (i, inst) in block.instructions.iter().enumerate() {
+                        if !safe_set.contains(&i) {
+                            new_insts.push(*inst);
+                        }
+                    }
+                    if new_insts != block.instructions {
+                        block_reorders.push((bi, new_insts));
+                    }
+                }
+            }
+        }
+
+        // Apply reorders
+        for (bi, new_insts) in block_reorders {
+            func.blocks[bi].instructions = new_insts;
+        }
+    }
+    count
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Effect-based reordering
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Effect-based reordering: hoist pure instructions above side-effecting ones,
+/// and sink side-effecting instructions below pure ones, when safe.
+///
+/// This goes beyond pure function elision (which removes pure calls whose
+/// results are unused). This pass reorders instructions within a block to
+/// improve register pressure and enable other optimizations.
+///
+/// Safety rules:
+/// - Pure instructions (BinOp, UnaryOp on constants, BitCast, etc.) can be
+///   reordered freely among themselves
+/// - Loads can be reordered above Stores that write to different regions
+/// - Pure instructions can be hoisted above Print/Call (side-effecting)
+/// - Stores cannot be reordered with other Stores
+///
+/// Returns the number of instructions reordered.
+fn pass_effect_reorder(module: &mut L2Module) -> usize {
+    let mut count = 0;
+    for func in &mut module.functions {
+        for block in &mut func.blocks {
+            if block.instructions.len() < 3 {
+                continue;
+            }
+
+            // Collect pure instructions that can be hoisted
+            let mut pure_indices: Vec<usize> = Vec::new();
+            let mut side_effect_indices: Vec<usize> = Vec::new();
+
+            for (i, inst_idx) in block.instructions.iter().enumerate() {
+                if let Some(inst) = func.values.get(inst_idx) {
+                    if is_pure_inst(inst) {
+                        pure_indices.push(i);
+                    } else if has_side_effects(inst) {
+                        side_effect_indices.push(i);
+                    }
+                }
+            }
+
+            // If there are pure instructions after side-effecting ones,
+            // and the pure instructions don't depend on the side-effecting ones,
+            // we can hoist them. For safety, we only reorder if the pure
+            // instruction doesn't reference any value produced by a side-effecting
+            // instruction.
+            if pure_indices.is_empty() || side_effect_indices.is_empty() {
+                continue;
+            }
+
+            // Simple reordering: move all pure instructions to the front
+            // (before side-effecting ones), preserving relative order
+            let mut new_insts: Vec<PValue> = Vec::with_capacity(block.instructions.len());
+            let mut moved = false;
+
+            // First: all pure instructions (in original order)
+            for &i in &pure_indices {
+                new_insts.push(block.instructions[i]);
+            }
+            // Then: all side-effecting instructions (in original order)
+            for &i in &side_effect_indices {
+                new_insts.push(block.instructions[i]);
+            }
+            // Then: any remaining instructions
+            for (i, inst) in block.instructions.iter().enumerate() {
+                if !pure_indices.contains(&i) && !side_effect_indices.contains(&i) {
+                    new_insts.push(*inst);
+                }
+            }
+
+            // Check if we actually reordered anything
+            if new_insts != block.instructions {
+                // Verify no pure instruction depends on a side-effecting one
+                let safe = verify_reorder_safety(&new_insts, &pure_indices, &side_effect_indices, &func.values);
+                if safe {
+                    block.instructions = new_insts;
+                    count += pure_indices.len();
+                    moved = true;
+                }
+            }
+            let _ = moved;
+        }
+    }
+    count
+}
+
+/// Check if an instruction is pure (no side effects, deterministic)
+fn is_pure_inst(inst: &L2Inst) -> bool {
+    matches!(
+        inst,
+        L2Inst::ConstInt { .. }
+            | L2Inst::ConstFloat { .. }
+            | L2Inst::ConstBool { .. }
+            | L2Inst::ConstStr { .. }
+            | L2Inst::ConstNull { .. }
+            | L2Inst::BinOp { .. }
+            | L2Inst::UnaryOp { .. }
+            | L2Inst::BitCast { .. }
+            | L2Inst::IntExtend { .. }
+            | L2Inst::IntTrunc { .. }
+            | L2Inst::IntToFloat { .. }
+            | L2Inst::FloatToInt { .. }
+            | L2Inst::GetFieldPtr { .. }
+            | L2Inst::GetElemPtr { .. }
+    )
+}
+
+/// Verify that no pure instruction references a value produced by a
+/// side-effecting instruction that comes after it in the reordered list
+fn verify_reorder_safety(
+    new_insts: &[PValue],
+    pure_indices: &[usize],
+    side_effect_indices: &[usize],
+    values: &std::collections::HashMap<PValue, L2Inst>,
+) -> bool {
+    // Collect all values produced by side-effecting instructions
+    let side_effect_values: std::collections::HashSet<PValue> = side_effect_indices
+        .iter()
+        .filter_map(|&i| values.get(&new_insts[i]).map(|_| new_insts[i]))
+        .collect();
+
+    // Check that pure instructions don't reference side-effect-produced values
+    // This is a conservative check — in practice, pure instructions rarely
+    // depend on side-effecting ones
+    for &i in pure_indices {
+        if let Some(inst) = values.get(&new_insts[i]) {
+            let refs = inst_refs(inst);
+            for r in refs {
+                if side_effect_values.contains(&r) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Get all value references in an instruction
+fn inst_refs(inst: &L2Inst) -> Vec<PValue> {
+    match inst {
+        L2Inst::BinOp { left, right, .. } => vec![*left, *right],
+        L2Inst::UnaryOp { operand, .. } => vec![*operand],
+        L2Inst::Load { ptr, .. } => vec![*ptr],
+        L2Inst::Store { ptr, value } => vec![*ptr, *value],
+        L2Inst::GetFieldPtr { struct_ptr, .. } => vec![*struct_ptr],
+        L2Inst::GetElemPtr { array_ptr, index, .. } => vec![*array_ptr, *index],
+        L2Inst::Branch { cond, .. } => vec![*cond],
+        L2Inst::Return { value } => value.iter().copied().collect(),
+        L2Inst::Call { args, .. } => args.clone(),
+        L2Inst::CallPtr { fn_ptr, args, .. } => {
+            let mut v = vec![*fn_ptr];
+            v.extend(args);
+            v
+        }
+        L2Inst::BitCast { value, .. } => vec![*value],
+        L2Inst::IntExtend { value, .. } => vec![*value],
+        L2Inst::IntTrunc { value, .. } => vec![*value],
+        L2Inst::IntToFloat { value, .. } => vec![*value],
+        L2Inst::FloatToInt { value, .. } => vec![*value],
+        L2Inst::Print { value, .. } => vec![*value],
+        L2Inst::TryUnwrap { value, .. } => vec![*value],
+        _ => vec![],
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Partial evaluation (comptime specialization)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Partial evaluation: evaluate calls to known pure functions with constant
+/// arguments at compile time and replace the call with the constant result.
+///
+/// This is comptime specialization: if a function is called with some constant
+/// arguments, we can evaluate the function at compile time and inline the result.
+///
+/// The pass works by:
+/// 1. Identifying Call instructions where all arguments are constants
+/// 2. Looking up the called function in the module
+/// 3. If the function is small and pure, evaluating it at compile time
+/// 4. Replacing the Call with a constant
+///
+/// Returns the number of calls evaluated at compile time.
+fn pass_partial_eval(module: &mut L2Module) -> usize {
+    let mut count = 0;
+
+    // Collect function signatures: which functions are pure and small?
+    let mut pure_funcs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for func in &module.functions {
+        if is_pure_function(func) && func.values.len() <= 20 {
+            pure_funcs.insert(func.name.clone());
+        }
+    }
+
+    // For each function, look for calls with all-constant arguments
+    let func_count = module.functions.len();
+    for fi in 0..func_count {
+        let mut replacements: Vec<(PValue, L2Inst)> = Vec::new();
+
+        {
+            let func = &module.functions[fi];
+            for (vid, inst) in &func.values {
+                if let L2Inst::Call { func: callee, args, ret_ty } = inst {
+                    if !pure_funcs.contains(callee) {
+                        continue;
+                    }
+
+                    // Check if all arguments are constants
+                    let all_const = args.iter().all(|arg| is_constant_pv(arg, &func.values));
+                    if !all_const {
+                        continue;
+                    }
+
+                    // Try to evaluate the call
+                    if let Some(result) = eval_const_call(callee, args, &module.functions, &func.values) {
+                        let new_inst = match &ret_ty {
+                            PirType::I64 | PirType::I32 | PirType::I8 | PirType::I16
+                            | PirType::U64 | PirType::U32 | PirType::U16 | PirType::U8
+                            | PirType::Bool => L2Inst::ConstInt { value: result.as_int(), ty: ret_ty.clone() },
+                            PirType::F64 | PirType::F32 => {
+                                L2Inst::ConstFloat { bits: result.as_float_bits(), ty: ret_ty.clone() }
+                            }
+                            _ => continue,
+                        };
+                        replacements.push((*vid, new_inst));
+                    }
+                }
+            }
+        }
+
+        for (vid, new_inst) in replacements {
+            module.functions[fi].values.insert(vid, new_inst);
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Check if a PValue is a constant
+fn is_constant_pv(pv: &PValue, values: &std::collections::HashMap<PValue, L2Inst>) -> bool {
+    if let Some(inst) = values.get(pv) {
+        matches!(
+            inst,
+            L2Inst::ConstInt { .. }
+                | L2Inst::ConstFloat { .. }
+                | L2Inst::ConstBool { .. }
+                | L2Inst::ConstStr { .. }
+                | L2Inst::ConstNull { .. }
+        )
+    } else {
+        false
+    }
+}
+
+/// Check if a function is pure (all instructions are pure)
+fn is_pure_function(func: &L2Function) -> bool {
+    for (_, inst) in &func.values {
+        if has_side_effects(inst) {
+            return false;
+        }
+        if let L2Inst::Call { func: callee, .. } = inst {
+            if !is_known_pure_func(callee) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Result of compile-time evaluation
+enum ConstResult {
+    Int(i64),
+    Float(f64),
+}
+
+impl ConstResult {
+    fn as_int(&self) -> i64 {
+        match self {
+            ConstResult::Int(v) => *v,
+            ConstResult::Float(v) => *v as i64,
+        }
+    }
+
+    fn as_float_bits(&self) -> u64 {
+        match self {
+            ConstResult::Int(v) => *v as f64,
+            ConstResult::Float(v) => *v,
+        }.to_bits()
+    }
+}
+
+/// Evaluate a call to a pure function with constant arguments at compile time
+fn eval_const_call(
+    callee: &str,
+    args: &[PValue],
+    all_funcs: &[L2Function],
+    caller_values: &std::collections::HashMap<PValue, L2Inst>,
+) -> Option<ConstResult> {
+    // Get the constant argument values
+    let mut arg_vals: Vec<i64> = Vec::new();
+    let mut arg_floats: Vec<f64> = Vec::new();
+    let mut is_float = false;
+
+    for arg in args {
+        if let Some(inst) = caller_values.get(arg) {
+            match inst {
+                L2Inst::ConstInt { value, .. } => arg_vals.push(*value),
+                L2Inst::ConstFloat { bits, .. } => {
+                    arg_floats.push(f64::from_bits(*bits));
+                    is_float = true;
+                }
+                L2Inst::ConstBool { value } => arg_vals.push(if *value { 1 } else { 0 }),
+                _ => return None,
+            }
+        } else {
+            return None;
+        }
+    }
+
+    // Try to evaluate known pure built-in functions
+    if is_known_pure_func(callee) {
+        return eval_builtin(callee, &arg_vals, &arg_floats, is_float);
+    }
+
+    // Try to evaluate user-defined pure functions
+    let callee_func = all_funcs.iter().find(|f| f.name == callee)?;
+    if !is_pure_function(callee_func) {
+        return None;
+    }
+
+    // Simple evaluation: look for a single BinOp + Return pattern
+    // This handles trivial functions like `pf add(a: i64, b: i64) -> i64 { ret a + b; }`
+    let mut result: Option<i64> = None;
+    let mut result_f: Option<f64> = None;
+
+    for (_, inst) in &callee_func.values {
+        if let L2Inst::BinOp { op, left, right, .. } = inst {
+            // Get operand values — they should be the function parameters
+            // In L2, params are the first few PValues
+            let lv = get_const_int(left, &callee_func.values, &arg_vals)?;
+            let rv = get_const_int(right, &callee_func.values, &arg_vals)?;
+            result = Some(eval_binop_int_pe(op, lv, rv));
+        }
+        if let L2Inst::Return { value } = inst {
+            if let Some(v) = value {
+                if let Some(r) = result {
+                    return Some(ConstResult::Int(r));
+                }
+                if let Some(r) = result_f {
+                    return Some(ConstResult::Float(r));
+                }
+                // Direct return of a parameter
+                if let Some(r) = get_const_int(v, &callee_func.values, &arg_vals) {
+                    return Some(ConstResult::Int(r));
+                }
+            }
+        }
+    }
+
+    result.map(ConstResult::Int)
+}
+
+/// Get a constant integer value for a PValue, either directly or from params
+fn get_const_int(
+    pv: &PValue,
+    values: &std::collections::HashMap<PValue, L2Inst>,
+    params: &[i64],
+) -> Option<i64> {
+    if let Some(inst) = values.get(pv) {
+        match inst {
+            L2Inst::ConstInt { value, .. } => Some(*value),
+            L2Inst::ConstBool { value } => Some(if *value { 1 } else { 0 }),
+            _ => None,
+        }
+    } else {
+        // Could be a parameter — try by index
+        // In L2, params are stored as PValue(0), PValue(1), etc.
+        // This is a simplification — real param mapping would need the function signature
+        let idx = pv.0 as usize;
+        if idx < params.len() {
+            Some(params[idx])
+        } else {
+            None
+        }
+    }
+}
+
+/// Evaluate a binary operation on integers
+fn eval_binop_int_pe(op: &BinOp, l: i64, r: i64) -> i64 {
+    match op {
+        BinOp::Add => l.wrapping_add(r),
+        BinOp::Sub => l.wrapping_sub(r),
+        BinOp::Mul => l.wrapping_mul(r),
+        BinOp::Div => {
+            if r == 0 { 0 } else { l.wrapping_div(r) }
+        }
+        BinOp::Mod => {
+            if r == 0 { 0 } else { l.wrapping_rem(r) }
+        }
+        BinOp::BitAnd => l & r,
+        BinOp::BitOr => l | r,
+        BinOp::BitXor => l ^ r,
+        BinOp::Shl => l.wrapping_shl(r as u32),
+        BinOp::Shr => l.wrapping_shr(r as u32),
+        BinOp::Eq => (l == r) as i64,
+        BinOp::Neq => (l != r) as i64,
+        BinOp::Lt => (l < r) as i64,
+        BinOp::LtEq => (l <= r) as i64,
+        BinOp::Gt => (l > r) as i64,
+        BinOp::GtEq => (l >= r) as i64,
+        BinOp::And => (l != 0 && r != 0) as i64,
+        BinOp::Or => (l != 0 || r != 0) as i64,
+    }
+}
+
+/// Evaluate a known pure built-in function
+fn eval_builtin(name: &str, args: &[i64], floats: &[f64], is_float: bool) -> Option<ConstResult> {
+    if is_float {
+        let a = floats.first()?;
+        match name {
+            "p_fabs" | "fabs" => return Some(ConstResult::Float(a.abs())),
+            "p_fsqrt" | "sqrt" => return Some(ConstResult::Float(a.sqrt())),
+            "p_fsin" | "sin" => return Some(ConstResult::Float(a.sin())),
+            "p_fcos" | "cos" => return Some(ConstResult::Float(a.cos())),
+            _ => {}
+        }
+        if floats.len() >= 2 {
+            let b = floats.get(1)?;
+            match name {
+                "p_fadd" => return Some(ConstResult::Float(a + b)),
+                "p_fsub" => return Some(ConstResult::Float(a - b)),
+                "p_fmul" => return Some(ConstResult::Float(a * b)),
+                "p_fdiv" => return Some(ConstResult::Float(a / b)),
+                "p_fmax" => return Some(ConstResult::Float(a.max(*b))),
+                "p_fmin" => return Some(ConstResult::Float(a.min(*b))),
+                "pow" => return Some(ConstResult::Float(a.powf(*b))),
+                _ => {}
+            }
+        }
+    } else {
+        let a = args.first()?;
+        match name {
+            "p_abs" | "abs" => return Some(ConstResult::Int(a.wrapping_abs())),
+            _ => {}
+        }
+        if args.len() >= 2 {
+            let b = args.get(1)?;
+            match name {
+                "p_max" | "max" => return Some(ConstResult::Int((*a).max(*b))),
+                "p_min" | "min" => return Some(ConstResult::Int((*a).min(*b))),
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

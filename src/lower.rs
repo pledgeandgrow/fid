@@ -51,9 +51,27 @@ pub struct Lowerer {
     try_stack: Vec<(BlockId, ValueId)>,
     /// Current source line (for debug info)
     current_line: Option<usize>,
+    /// Type aliases (ty X = T;) — maps alias name to resolved type
+    type_aliases: HashMap<String, Type>,
+    /// Current Self type (set when lowering impl methods, for bare `self` params)
+    current_self_type: Option<String>,
+    /// Stack of effect handlers (for handle/do statements)
+    effect_handler_stack: Vec<Vec<crate::ast::EffectHandler>>,
+    /// Stack of active named regions — allocations inside a region block
+    /// use Region::Named(name) instead of Region::Stack
+    region_stack: Vec<String>,
 }
 
 impl Lowerer {
+    /// Get the current region for allocations.
+    /// If inside a `region r { ... }` block, returns Region::Named(r).
+    /// Otherwise returns Region::Stack.
+    fn current_region(&self) -> Region {
+        self.region_stack.last()
+            .map(|name| Region::Named(name.clone()))
+            .unwrap_or(Region::Stack)
+    }
+
     pub fn new() -> Self {
         Lowerer {
             module: IrModule::new(),
@@ -71,6 +89,10 @@ impl Lowerer {
             current_captures: Vec::new(),
             try_stack: Vec::new(),
             current_line: None,
+            type_aliases: HashMap::new(),
+            current_self_type: None,
+            effect_handler_stack: Vec::new(),
+            region_stack: Vec::new(),
         }
     }
 
@@ -81,6 +103,11 @@ impl Lowerer {
             self.constants.insert(c.name.clone(), c.expr.clone());
         }
 
+        // Register type aliases
+        for ta in &program.type_aliases {
+            self.type_aliases.insert(ta.name.clone(), ta.alias_for.clone());
+        }
+
         // Register struct definitions for layout computation
         for s in &program.structs {
             self.structs.insert(s.name.clone(), s.clone());
@@ -89,6 +116,15 @@ impl Lowerer {
         // Register enum definitions
         for e in &program.enums {
             self.enums.insert(e.name.clone(), e.clone());
+        }
+
+        // Register user-defined extern functions
+        for ext in &program.extern_decls {
+            let param_types: Vec<IrType> = ext.params.iter().map(|p| self.lower_type(&p.ty)).collect();
+            let ret_type = self.lower_type(&ext.ret_ty);
+            // Register under the pledge_name so calls resolve
+            self.module.add_extern(&ext.pledge_name, param_types, ret_type);
+            self.module.extern_decls.push(ext.clone());
         }
 
         // Register impl methods
@@ -119,6 +155,14 @@ impl Lowerer {
         // Register runtime/external functions
         self.register_runtime();
 
+        // Pre-register all function signatures so calls can look up return types
+        // before the function body is lowered
+        for func in &program.funcs {
+            let ret_ty = self.lower_type(&func.ret_ty);
+            let ir_func = IrFunction::new(func.name.clone(), ret_ty);
+            self.module.functions.insert(func.name.clone(), ir_func);
+        }
+
         // Lower each function
         for func in &program.funcs {
             self.lower_func(func);
@@ -126,20 +170,36 @@ impl Lowerer {
 
         // Lower impl methods (mangled as {StructName}_{method})
         for imp in &program.impls {
+            let saved_self = self.current_self_type.clone();
+            self.current_self_type = Some(imp.struct_name.clone());
             for method in &imp.methods {
                 let mut mangled = method.clone();
                 mangled.name = format!("{}_{}", imp.struct_name, method.name);
+                // Resolve Self in param types and return type
+                mangled.params = mangled.params.iter().map(|p| {
+                    Param { name: p.name.clone(), ty: self.resolve_self_in_type(&p.ty) }
+                }).collect();
+                mangled.ret_ty = self.resolve_self_in_type(&mangled.ret_ty);
                 self.lower_func(&mangled);
             }
+            self.current_self_type = saved_self;
         }
 
         // Lower trait impl methods (mangled as {TypeName}_{method})
         for ti in &program.trait_impls {
+            let saved_self = self.current_self_type.clone();
+            self.current_self_type = Some(ti.type_name.clone());
             for method in &ti.methods {
                 let mut mangled = method.clone();
                 mangled.name = format!("{}_{}", ti.type_name, method.name);
+                // Resolve Self in param types and return type
+                mangled.params = mangled.params.iter().map(|p| {
+                    Param { name: p.name.clone(), ty: self.resolve_self_in_type(&p.ty) }
+                }).collect();
+                mangled.ret_ty = self.resolve_self_in_type(&mangled.ret_ty);
                 self.lower_func(&mangled);
             }
+            self.current_self_type = saved_self;
         }
 
         // Take ownership of the module
@@ -153,7 +213,7 @@ impl Lowerer {
         let mut max_align: u64 = 1;
 
         for field in &def.fields {
-            let ir_ty = lower_type(&field.ty);
+            let ir_ty = self.lower_type(&field.ty);
             let align = self.module.type_align(&ir_ty);
             // Align offset
             offset = (offset + align - 1) & !(align - 1);
@@ -279,10 +339,11 @@ impl Lowerer {
         self.module.add_extern("p_simd_to_str", vec![simd_ty.clone()], IrType::Ptr(Box::new(IrType::U8)));
 
         // ─── Phase 5D.3: HTTP server stdlib ───
-        let socket_ty = IrType::Opaque("Socket".to_string());
+        // Socket file descriptors are i64 (POSIX int fd or Winsock SOCKET)
+        let socket_ty = IrType::I64;
         self.module.add_extern("p_socket_listen", vec![IrType::I64], socket_ty.clone());
         self.module.add_extern("p_socket_accept", vec![socket_ty.clone()], socket_ty.clone());
-        self.module.add_extern("p_socket_read", vec![socket_ty.clone()], vec_i64_ty.clone());
+        self.module.add_extern("p_socket_read", vec![socket_ty.clone(), vec_i64_ty.clone()], IrType::I64);
         self.module.add_extern("p_socket_write", vec![socket_ty.clone(), vec_i64_ty.clone()], IrType::I64);
         self.module.add_extern("p_socket_close", vec![socket_ty.clone()], IrType::Void);
         self.module.add_extern("p_socket_recv_str", vec![socket_ty.clone()], IrType::Ptr(Box::new(IrType::U8)));
@@ -295,12 +356,42 @@ impl Lowerer {
         self.module.add_extern("p_db_mem_close", vec![db_ty.clone()], IrType::Void);
         self.module.add_extern("p_db_mem_query", vec![db_ty.clone(), IrType::Ptr(Box::new(IrType::U8))], IrType::Ptr(Box::new(IrType::U8)));
         self.module.add_extern("p_db_mem_exec", vec![db_ty.clone(), IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
+
+        // ─── Phase 2A.8: Allocator builtins ───
+        let alloc_ty = IrType::Opaque("Allocator".to_string());
+        self.module.add_extern("p_allocator_create", vec![IrType::Ptr(Box::new(IrType::U8))], alloc_ty.clone());
+        self.module.add_extern("p_allocator_alloc", vec![alloc_ty.clone(), IrType::I64], IrType::I64);
+        self.module.add_extern("p_allocator_free", vec![alloc_ty.clone(), IrType::I64], IrType::Void);
+        self.module.add_extern("p_allocator_stats", vec![alloc_ty], IrType::I64);
+
+        // ─── Phase 5A.3: Interrupt handler builtins (bare-metal) ───
+        self.module.add_extern("p_cli", vec![], IrType::Void);           // disable interrupts
+        self.module.add_extern("p_sti", vec![], IrType::Void);           // enable interrupts
+        self.module.add_extern("p_lidt", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Void); // load IDT
+        self.module.add_extern("p_idt_set_entry", vec![IrType::I64, IrType::I64], IrType::Void); // set IDT entry
+        self.module.add_extern("p_hlt", vec![], IrType::Void);           // halt CPU
+        self.module.add_extern("p_inb", vec![IrType::I64], IrType::I64);  // port I/O: read byte
+        self.module.add_extern("p_outb", vec![IrType::I64, IrType::I64], IrType::Void); // port I/O: write byte
+
+        // ─── Phase 5A.4: MMU/page table management (bare-metal) ───
+        self.module.add_extern("p_cr3_read", vec![], IrType::I64);         // read CR3 (page table base)
+        self.module.add_extern("p_cr3_write", vec![IrType::I64], IrType::Void); // write CR3
+        self.module.add_extern("p_cr0_read", vec![], IrType::I64);         // read CR0
+        self.module.add_extern("p_cr0_write", vec![IrType::I64], IrType::Void); // write CR0
+        self.module.add_extern("p_cr4_read", vec![], IrType::I64);         // read CR4
+        self.module.add_extern("p_cr4_write", vec![IrType::I64], IrType::Void); // write CR4
+        self.module.add_extern("p_invlpg", vec![IrType::I64], IrType::Void); // invalidate TLB entry
+        self.module.add_extern("p_page_map", vec![IrType::I64, IrType::I64, IrType::I64, IrType::I64], IrType::Void); // map vaddr->paddr
+        self.module.add_extern("p_page_unmap", vec![IrType::I64, IrType::I64], IrType::Void); // unmap vaddr
+        self.module.add_extern("p_phys_read64", vec![IrType::I64], IrType::I64); // read 8 bytes from physical addr
+        self.module.add_extern("p_phys_write64", vec![IrType::I64, IrType::I64], IrType::Void); // write 8 bytes to physical addr
     }
 
     /// Lower a single function
     fn lower_func(&mut self, func: &Func) {
-        let ret_ty = lower_type(&func.ret_ty);
+        let ret_ty = self.lower_type(&func.ret_ty);
         let mut ir_func = IrFunction::new(func.name.clone(), ret_ty.clone());
+        ir_func.is_interrupt = func.is_interrupt;
 
         // If the function returns a struct, add a hidden SRET parameter
         // (caller-allocated pointer as first arg, callee writes struct data there)
@@ -310,7 +401,7 @@ impl Lowerer {
             let sret_ty = IrType::Ptr(Box::new(ret_ty.clone()));
             let meta = ValueMeta {
                 ty: sret_ty.clone(),
-                region: Region::Stack,
+                region: self.current_region(),
                 effects: EffectSet::none(),
                 source_line: None,
             };
@@ -325,7 +416,7 @@ impl Lowerer {
         // All functions get __env as next param (for uniform CallPtr calling convention)
         let env_meta = ValueMeta {
             ty: IrType::Ptr(Box::new(IrType::U8)),
-            region: Region::Stack,
+            region: self.current_region(),
             effects: EffectSet::none(),
             source_line: None,
         };
@@ -335,7 +426,7 @@ impl Lowerer {
 
         // Create parameter values
         for param in &func.params {
-            let raw_ty = lower_type(&param.ty);
+            let raw_ty = self.lower_type(&param.ty);
             // Struct params are passed as pointers (by-ref) so FieldAccess works
             let ir_ty = if matches!(raw_ty, IrType::Struct(_)) {
                 IrType::Ptr(Box::new(raw_ty))
@@ -344,7 +435,7 @@ impl Lowerer {
             };
             let meta = ValueMeta {
                 ty: ir_ty.clone(),
-                region: Region::Stack,
+                region: self.current_region(),
                 effects: EffectSet::none(),
                 source_line: None,
             };
@@ -426,7 +517,7 @@ impl Lowerer {
                             let ret_ty = f.ret_ty.clone();
                             let meta = ValueMeta {
                                 ty: ret_ty.clone(),
-                                region: Region::Stack,
+                                region: self.current_region(),
                                 effects: EffectSet::none(),
                                 source_line: None,
                             };
@@ -475,6 +566,79 @@ impl Lowerer {
         self.current_func = prev;
     }
 
+    /// Resolve type aliases to their underlying type
+    fn resolve_type(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Named(name) => {
+                if let Some(alias) = self.type_aliases.get(name) {
+                    self.resolve_type(alias)
+                } else {
+                    ty.clone()
+                }
+            }
+            Type::Ref { inner, is_mut } => {
+                Type::Ref { inner: Box::new(self.resolve_type(inner)), is_mut: *is_mut }
+            }
+            Type::Array { elem, size } => {
+                Type::Array { elem: Box::new(self.resolve_type(elem)), size: *size }
+            }
+            Type::ArrayConst { elem, size_param } => {
+                Type::ArrayConst { elem: Box::new(self.resolve_type(elem)), size_param: size_param.clone() }
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Lower a Pledge AST type to an IR type, resolving aliases first
+    fn lower_type(&self, ty: &Type) -> IrType {
+        let resolved = self.resolve_type(ty);
+        crate::ir::lower_type(&resolved)
+    }
+
+    /// Resolve a type name (possibly an alias) to its underlying struct name
+    fn resolve_struct_name(&self, name: &str) -> String {
+        if let Some(alias) = self.type_aliases.get(name) {
+            match alias {
+                Type::Named(inner) => return self.resolve_struct_name(inner),
+                _ => {}
+            }
+        }
+        name.to_string()
+    }
+
+    /// Resolve `Self` to the current impl's type name
+    fn resolve_self_in_type(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Named(name) if name == "Self" => {
+                if let Some(self_name) = &self.current_self_type {
+                    Type::Named(self_name.clone())
+                } else {
+                    ty.clone()
+                }
+            }
+            Type::Ref { inner, is_mut } => Type::Ref {
+                inner: Box::new(self.resolve_self_in_type(inner)),
+                is_mut: *is_mut,
+            },
+            Type::Array { elem, size } => Type::Array {
+                elem: Box::new(self.resolve_self_in_type(elem)),
+                size: *size,
+            },
+            Type::ArrayConst { elem, size_param } => Type::ArrayConst {
+                elem: Box::new(self.resolve_self_in_type(elem)),
+                size_param: size_param.clone(),
+            },
+            Type::Generic { name, args } => Type::Generic {
+                name: name.clone(),
+                args: args.iter().map(|a| self.resolve_self_in_type(a)).collect(),
+            },
+            Type::Tuple(types) => Type::Tuple(
+                types.iter().map(|t| self.resolve_self_in_type(t)).collect()
+            ),
+            other => other.clone(),
+        }
+    }
+
     /// Lower a sequence of statements
     fn lower_stmts(&mut self, stmts: &[Stmt]) {
         for stmt in stmts {
@@ -493,12 +657,12 @@ impl Lowerer {
                 // Direct SSA binding is broken for loops (no phi nodes) —
                 // the condition block references the original ValueId and
                 // never sees rebinding from the loop body.
-                let ir_ty = ty.as_ref().map(|t| lower_type(t)).unwrap_or_else(|| {
+                let ir_ty = ty.as_ref().map(|t| self.lower_type(t)).unwrap_or_else(|| {
                     self.get_value_type(val)
                 });
                 let alloca = self.emit_inst(Inst::Alloca {
                     ty: ir_ty.clone(),
-                    region: Region::Stack,
+                    region: self.current_region(),
                 });
                 self.alloca_types.insert(alloca, ir_ty);
                 self.emit_inst(Inst::Store {
@@ -774,17 +938,60 @@ impl Lowerer {
             }
 
             Stmt::Handle { body, handlers, .. } => {
-                // Lower the body (effect handlers are not yet supported in IR)
+                // Effect handler: lower the body. When a `do Effect.op(args)` is
+                // encountered inside, the matching handler is called.
+                // We store the handlers in a stack so that Do statements can find them.
+                self.effect_handler_stack.push(handlers.clone());
                 self.lower_stmts(body);
-                let _ = handlers;
+                self.effect_handler_stack.pop();
             }
 
-            Stmt::Do { effect: _, op: _, args, .. } => {
-                // Lower the effect operation arguments (do is not yet fully supported in IR)
-                for arg in args {
-                    self.lower_expr(arg);
+            Stmt::Do { effect, op, args, .. } => {
+                // Look up the handler for this effect.op
+                let handler_info = self.effect_handler_stack.iter().rev().find_map(|handlers| {
+                    handlers.iter().find(|h| h.effect == *effect && h.op == *op)
+                        .map(|h| (h.params.clone(), h.body.clone()))
+                });
+
+                if let Some((params, body)) = handler_info {
+                    // Lower the handler body with the args bound to params
+                    for (i, arg) in args.iter().enumerate() {
+                        if i < params.len() {
+                            let arg_val = self.lower_expr(arg);
+                            let slot = self.emit_inst(Inst::Alloca {
+                                ty: IrType::I64,
+                                region: self.current_region(),
+                            });
+                            self.emit_inst(Inst::Store { ptr: slot, value: arg_val });
+                            self.allocas.insert(params[i].clone(), slot);
+                            self.alloca_types.insert(slot, IrType::I64);
+                        }
+                    }
+                    self.lower_stmts(&body);
+                } else {
+                    // No handler found — just lower the args (no-op)
+                    for arg in args {
+                        self.lower_expr(arg);
+                    }
                 }
             }
+            Stmt::RegionBlock { name, body, .. } => {
+                // Emit RegionBegin — marks the start of a named region.
+                // Allocations inside the block will use Region::Named(name).
+                self.emit_inst(Inst::RegionBegin {
+                    name: name.clone(),
+                });
+                self.region_stack.push(name.clone());
+                for s in body {
+                    self.lower_stmt(s);
+                }
+                self.region_stack.pop();
+                // Emit RegionEnd — frees all memory allocated in this region.
+                self.emit_inst(Inst::RegionEnd {
+                    name: name.clone(),
+                });
+            }
+            Stmt::ComptimeGen { .. } => {}
         }
     }
 
@@ -867,7 +1074,7 @@ impl Lowerer {
                 // Create alloca for loop variable (must be mutable across iterations)
                 let alloca = self.emit_inst(Inst::Alloca {
                     ty: IrType::I64,
-                    region: Region::Stack,
+                    region: self.current_region(),
                 });
                 self.emit_inst(Inst::Store {
                     ptr: alloca,
@@ -956,7 +1163,7 @@ impl Lowerer {
                 // Create alloca for loop variable
                 let var_alloca = self.emit_inst(Inst::Alloca {
                     ty: elem_ty.clone(),
-                    region: Region::Stack,
+                    region: self.current_region(),
                 });
                 self.alloca_types.insert(var_alloca, elem_ty.clone());
                 self.allocas.insert(var.to_string(), var_alloca);
@@ -967,7 +1174,7 @@ impl Lowerer {
                 // Create index alloca
                 let idx_alloca = self.emit_inst(Inst::Alloca {
                     ty: IrType::I64,
-                    region: Region::Stack,
+                    region: self.current_region(),
                 });
                 self.alloca_types.insert(idx_alloca, IrType::I64);
                 let zero = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
@@ -1036,7 +1243,7 @@ impl Lowerer {
         // Create alloca for loop variable — use Opaque so Load checks side-table
         let var_alloca = self.emit_inst(Inst::Alloca {
             ty: IrType::Opaque("any".to_string()),
-            region: Region::Stack,
+            region: self.current_region(),
         });
         self.alloca_types.insert(var_alloca, IrType::Opaque("any".to_string()));
         self.allocas.insert(var.to_string(), var_alloca);
@@ -1047,7 +1254,7 @@ impl Lowerer {
         // Create index alloca
         let idx_alloca = self.emit_inst(Inst::Alloca {
             ty: IrType::I64,
-            region: Region::Stack,
+            region: self.current_region(),
         });
         self.alloca_types.insert(idx_alloca, IrType::I64);
         let zero = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
@@ -1259,6 +1466,17 @@ impl Lowerer {
                             f.bind_local(binding, field_val);
                         }
                     }
+                    // If there's a guard, evaluate it and branch
+                    if let Some(guard_expr) = &arm.guard {
+                        let guard_val = self.lower_expr(guard_expr);
+                        let guard_body_block = self.new_block();
+                        self.emit_terminator(Inst::Branch {
+                            cond: guard_val,
+                            then: guard_body_block,
+                            else_: next_arm_block,
+                        });
+                        self.set_current_block(guard_body_block);
+                    }
                     // Skip the normal body lowering since we already set the block
                     self.lower_stmts(&arm.body);
                     if !self.current_block_has_terminator() {
@@ -1271,6 +1489,19 @@ impl Lowerer {
 
             // Lower match arm body
             self.set_current_block(match_block);
+
+            // If there's a guard, evaluate it and branch
+            if let Some(guard_expr) = &arm.guard {
+                let guard_val = self.lower_expr(guard_expr);
+                let guard_body_block = self.new_block();
+                self.emit_terminator(Inst::Branch {
+                    cond: guard_val,
+                    then: guard_body_block,
+                    else_: next_arm_block,
+                });
+                self.set_current_block(guard_body_block);
+            }
+
             self.lower_stmts(&arm.body);
             if !self.current_block_has_terminator() {
                 self.emit_terminator(Inst::Jump { target: merge_block });
@@ -1357,6 +1588,17 @@ impl Lowerer {
                             f.bind_local(binding, field_val);
                         }
                     }
+                    // If there's a guard, evaluate it and branch
+                    if let Some(guard_expr) = &arm.guard {
+                        let guard_val = self.lower_expr(guard_expr);
+                        let guard_body_block = self.new_block();
+                        self.emit_terminator(Inst::Branch {
+                            cond: guard_val,
+                            then: guard_body_block,
+                            else_: next_arm_block,
+                        });
+                        self.set_current_block(guard_body_block);
+                    }
                     // Lower body and store result
                     let mut last_val = None;
                     for stmt in &arm.body {
@@ -1380,6 +1622,19 @@ impl Lowerer {
 
             // Lower match arm body and store result
             self.set_current_block(match_block);
+
+            // If there's a guard, evaluate it and branch
+            if let Some(guard_expr) = &arm.guard {
+                let guard_val = self.lower_expr(guard_expr);
+                let guard_body_block = self.new_block();
+                self.emit_terminator(Inst::Branch {
+                    cond: guard_val,
+                    then: guard_body_block,
+                    else_: next_arm_block,
+                });
+                self.set_current_block(guard_body_block);
+            }
+
             let mut last_val = None;
             for stmt in &arm.body {
                 if let Stmt::Expr(e, _) = stmt {
@@ -1443,7 +1698,7 @@ impl Lowerer {
                 // Check if this is a captured variable in a closure
                 if let Some((_, idx, cap_ty)) = self.current_captures.iter().find(|(n, _, _)| n == name) {
                     let idx = *idx;
-                    let cap_ir_ty = lower_type(&cap_ty);
+                    let cap_ir_ty = self.lower_type(&cap_ty);
                     // Load from env struct: env_ptr is the first param of the closure function
                     if let Some(ref func) = self.current_func {
                         if let Some(env_val) = func.params.first().map(|p| p.0) {
@@ -1550,7 +1805,7 @@ impl Lowerer {
                 if let IrType::Struct(ref name) = ret_ty {
                     let sret_ptr = self.emit_inst(Inst::Alloca {
                         ty: IrType::Struct(name.clone()),
-                        region: Region::Stack,
+                        region: self.current_region(),
                     });
                     let mut all_args = vec![sret_ptr];
                     // Prepend dummy env_ptr for user functions (not externs or builtins)
@@ -1680,7 +1935,7 @@ impl Lowerer {
                         }
                         // Look up return type
                         let ret_ty = if let Some(meth) = self.impl_methods.get(&(name.clone(), method.clone())) {
-                            lower_type(&meth.ret_ty)
+                            self.lower_type(&meth.ret_ty)
                         } else {
                             IrType::I64
                         };
@@ -1688,7 +1943,7 @@ impl Lowerer {
                         if let IrType::Struct(ref sname) = ret_ty {
                             let sret_ptr = self.emit_inst(Inst::Alloca {
                                 ty: IrType::Struct(sname.clone()),
-                                region: Region::Stack,
+                                region: self.current_region(),
                             });
                             let mut sret_args = vec![sret_ptr];
                             // Prepend dummy env_ptr for user functions
@@ -1856,7 +2111,7 @@ impl Lowerer {
                 // Look up return type from the impl method
                 let ret_ty = if let Some(ref sn) = struct_name {
                     if let Some(meth) = self.impl_methods.get(&(sn.clone(), method.clone())) {
-                        lower_type(&meth.ret_ty)
+                        self.lower_type(&meth.ret_ty)
                     } else {
                         IrType::I64
                     }
@@ -1867,7 +2122,7 @@ impl Lowerer {
                 if let IrType::Struct(ref name) = ret_ty {
                     let sret_ptr = self.emit_inst(Inst::Alloca {
                         ty: IrType::Struct(name.clone()),
-                        region: Region::Stack,
+                        region: self.current_region(),
                     });
                     let mut sret_args = vec![sret_ptr];
                     // Prepend dummy env_ptr for user functions
@@ -1951,15 +2206,17 @@ impl Lowerer {
             }
 
             Expr::StructLit { name, fields } => {
+                // Resolve type alias to actual struct name
+                let real_name = self.resolve_struct_name(name);
                 // Allocate struct on stack, store fields
-                let struct_ty = IrType::Struct(name.clone());
+                let struct_ty = IrType::Struct(real_name.clone());
                 let ptr = self.emit_inst(Inst::Alloca {
                     ty: struct_ty.clone(),
-                    region: Region::Stack,
+                    region: self.current_region(),
                 });
 
                 // Store each field
-                let layout_clone = self.module.get_struct(name).cloned();
+                let layout_clone = self.module.get_struct(&real_name).cloned();
                 if let Some(layout) = layout_clone {
                     for (field_name, field_expr) in fields {
                         let field_val = self.lower_expr(field_expr);
@@ -1994,11 +2251,11 @@ impl Lowerer {
 
             Expr::ArrayLit { elem_type, elements } => {
                 // Allocate array on stack, return pointer
-                let elem_ty = lower_type(elem_type);
+                let elem_ty = self.lower_type(elem_type);
                 let array_ty = IrType::Array(Box::new(elem_ty.clone()), elements.len());
                 let ptr = self.emit_inst(Inst::Alloca {
                     ty: array_ty.clone(),
-                    region: Region::Stack,
+                    region: self.current_region(),
                 });
 
                 // Store each element
@@ -2091,7 +2348,7 @@ impl Lowerer {
                 });
                 let result_slot = self.emit_inst(Inst::Alloca {
                     ty: result_ty.clone(),
-                    region: Region::Stack,
+                    region: self.current_region(),
                 });
 
                 let cond_val = self.lower_expr(cond);
@@ -2226,7 +2483,7 @@ impl Lowerer {
                 let result_ty = self.infer_match_type(arms);
                 let result_slot = self.emit_inst(Inst::Alloca {
                     ty: result_ty.clone(),
-                    region: Region::Stack,
+                    region: self.current_region(),
                 });
                 self.lower_match_expr(expr, arms, result_slot);
                 self.emit_inst(Inst::Load { ptr: result_slot, ty: result_ty })
@@ -2239,7 +2496,7 @@ impl Lowerer {
                 let enum_ty = IrType::Struct(enum_name.clone());
                 let ptr = self.emit_inst(Inst::Alloca {
                     ty: enum_ty.clone(),
-                    region: Region::Stack,
+                    region: self.current_region(),
                 });
 
                 // Find variant index
@@ -2287,7 +2544,7 @@ impl Lowerer {
                 let val_ty = self.get_value_type(val);
                 let ptr = self.emit_inst(Inst::Alloca {
                     ty: val_ty.clone(),
-                    region: Region::Stack,
+                    region: self.current_region(),
                 });
                 self.emit_inst(Inst::Store {
                     ptr,
@@ -2432,13 +2689,13 @@ impl Lowerer {
                 // Allocate slot for the error Result (captured by ? operator)
                 let err_slot = self.emit_inst(Inst::Alloca {
                     ty: IrType::Struct("Result".to_string()),
-                    region: Region::Stack,
+                    region: self.current_region(),
                 });
 
                 // Allocate output Result struct
                 let result_slot = self.emit_inst(Inst::Alloca {
                     ty: IrType::Struct("Result".to_string()),
-                    region: Region::Stack,
+                    region: self.current_region(),
                 });
 
                 let err_block = self.new_block();
@@ -2519,7 +2776,7 @@ impl Lowerer {
                 let tuple_ty = IrType::Struct(format!("__tuple_{}", tuple_size));
                 let ptr = self.emit_inst(Inst::Alloca {
                     ty: tuple_ty.clone(),
-                    region: Region::Stack,
+                    region: self.current_region(),
                 });
                 for (i, e) in elems.iter().enumerate() {
                     let val = self.lower_expr(e);
@@ -2568,6 +2825,7 @@ impl Lowerer {
                     name: closure_name.clone(),
                     type_params: vec![],
                     type_param_bounds: vec![],
+                    const_params: vec![],
                     params: all_params,
                     ret_ty: ret_ty.clone().unwrap_or(Type::I64),
                     body: body.clone(),
@@ -2575,6 +2833,7 @@ impl Lowerer {
                     is_comptime: false,
                     declared_effects: Vec::new(),
                     has_effect_annotation: false,
+                    is_interrupt: false,
                 };
 
                 // Save current function context, lower the closure, restore context
@@ -2621,7 +2880,7 @@ impl Lowerer {
                 }
                 let val = self.lower_expr(expr);
                 let src_ty = self.get_value_type(val);
-                let dst_ir_ty = lower_type(target_ty);
+                let dst_ir_ty = self.lower_type(target_ty);
                 self.lower_cast(val, src_ty, dst_ir_ty)
             }
             Expr::Asm { template, operands } => {
@@ -2776,6 +3035,10 @@ impl Lowerer {
                         self.collect_free_vars_expr(arg, free_vars, local_names);
                     }
                 }
+                Stmt::RegionBlock { body, .. } => {
+                    self.collect_free_vars(body, free_vars, local_names);
+                }
+                Stmt::ComptimeGen { .. } => {}
             }
         }
     }
@@ -3232,7 +3495,7 @@ impl Lowerer {
                 }
             }
             Expr::ArrayLit { elem_type, .. } => {
-                let elem_ir = lower_type(elem_type);
+                let elem_ir = self.lower_type(elem_type);
                 IrType::Ptr(Box::new(elem_ir))
             }
             Expr::Index { array, index, .. } => {
@@ -3315,7 +3578,7 @@ impl Lowerer {
             }
             Expr::Closure { ret_ty, .. } => {
                 if let Some(rt) = ret_ty {
-                    lower_type(rt)
+                    self.lower_type(rt)
                 } else {
                     IrType::Void
                 }
@@ -3331,7 +3594,7 @@ impl Lowerer {
                 }
                 IrType::Void
             }
-            Expr::Cast { target_ty, .. } => lower_type(target_ty),
+            Expr::Cast { target_ty, .. } => self.lower_type(target_ty),
             Expr::Asm { operands, .. } => {
                 // asm! returns I64 if there are output operands, Void otherwise
                 let has_out = operands.iter().any(|op| op.direction == crate::ast::AsmDir::Out);

@@ -1,0 +1,47 @@
+// Test match with guards — `pattern if cond => body`
+pf main() -> i64 {
+    // Test 1: guard on int pattern
+    pv n = 5;
+    pv r1 = match n {
+        x if x > 10 => 100,
+        x if x > 3 => 200,
+        _ => 999,
+    };
+    print(r1);
+
+    // Test 2: guard on wildcard
+    pv r2 = match n {
+        _ if n > 3 => 300,
+        _ => 400,
+    };
+    print(r2);
+
+    // Test 3: guard fails, falls through to next arm
+    pv m = 2;
+    pv r3 = match m {
+        x if x > 5 => 500,
+        x if x > 1 => 600,
+        _ => 700,
+    };
+    print(r3);
+
+    // Test 4: guard with enum pattern
+    pv opt = Option::Some(42);
+    pv r4 = match opt {
+        Some(x: i64) if x > 10 => 800,
+        Some(x: i64) => 900,
+        None => 0,
+    };
+    print(r4);
+
+    // Test 5: guard with string pattern
+    pv s = "hello";
+    pv r5 = match s {
+        "hi" if n > 0 => 1,
+        "hello" if n > 0 => 2,
+        _ => 99,
+    };
+    print(r5);
+
+    ret 0;
+}

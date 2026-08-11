@@ -18,6 +18,8 @@ pub enum Type {
     Never,
     Named(String),
     Array { elem: Box<Type>, size: usize },
+    /// Array with const generic size: [T; N] where N is a type param
+    ArrayConst { elem: Box<Type>, size_param: String },
     Ref { inner: Box<Type>, is_mut: bool },
     Generic { name: String, args: Vec<Type> },
     Tuple(Vec<Type>),
@@ -27,8 +29,8 @@ pub enum Type {
     },
     /// An associated type: `T::Item` where `T` is a type parameter with a
     /// trait bound. Resolved to a concrete type during monomorphization.
-    /// (type_param, trait_name, assoc_name)
-    Assoc(String, String, String),
+    /// (type_param, trait_name, assoc_name, type_args) — type_args for GATs
+    Assoc(String, String, String, Vec<Type>),
     /// A trait object type: `dyn TraitName` — enables dynamic dispatch.
     Dyn(String),
 }
@@ -54,6 +56,7 @@ impl std::fmt::Display for Type {
             Type::Never => write!(f, "never"),
             Type::Named(s) => write!(f, "{}", s),
             Type::Array { elem, size } => write!(f, "[{}; {}]", elem, size),
+            Type::ArrayConst { elem, size_param } => write!(f, "[{}; {}]", elem, size_param),
             Type::Ref { inner, is_mut } => {
                 if *is_mut { write!(f, "&mut ")? } else { write!(f, "&")? }
                 write!(f, "{}", inner)
@@ -84,8 +87,13 @@ impl std::fmt::Display for Type {
                 }
                 write!(f, ") -> {}", ret)
             }
-            Type::Assoc(tp, trait_name, name) => {
-                write!(f, "{}::{}({})", tp, name, trait_name)
+            Type::Assoc(tp, trait_name, name, args) => {
+                if args.is_empty() {
+                    write!(f, "{}::{}({})", tp, name, trait_name)
+                } else {
+                    let args_str: Vec<String> = args.iter().map(|t| t.to_string()).collect();
+                    write!(f, "{}::{}<{}>({})", tp, name, args_str.join(", "), trait_name)
+                }
             }
             Type::Dyn(name) => write!(f, "dyn {}", name),
         }
@@ -234,6 +242,8 @@ pub enum FStringPart {
 #[derive(Debug, Clone)]
 pub struct MatchArm {
     pub pattern: Pattern,
+    /// Optional guard: `pattern if guard => body`
+    pub guard: Option<Expr>,
     pub body: Vec<Stmt>,
 }
 
@@ -350,6 +360,21 @@ pub enum Stmt {
         args: Vec<Expr>,
         line: usize,
     },
+    /// Region block: `region r { body }` — creates a named region,
+    /// allocates within it, and frees it at the end of the block.
+    /// References to region-allocated data cannot escape the block.
+    RegionBlock {
+        name: String,
+        body: Vec<Stmt>,
+        line: usize,
+    },
+    /// comptime gen { block } — evaluate block at compile time, parse the
+    /// resulting string as Pledge source code, and inject the declarations
+    /// into the program. This enables comptime code generation.
+    ComptimeGen {
+        block: Vec<Stmt>,
+        line: usize,
+    },
 }
 
 /// A handler for one effect operation within a `handle` block.
@@ -385,7 +410,9 @@ impl Stmt {
             | Stmt::Match { line, .. }
             | Stmt::Use { line, .. }
             | Stmt::Handle { line, .. }
-            | Stmt::Do { line, .. } => *line,
+            | Stmt::Do { line, .. }
+            | Stmt::RegionBlock { line, .. }
+            | Stmt::ComptimeGen { line, .. } => *line,
         }
     }
 }
@@ -417,6 +444,8 @@ pub struct Func {
     pub type_params: Vec<String>,
     /// Trait bounds for type params: ("T" -> "Printable")
     pub type_param_bounds: Vec<(String, String)>,
+    /// Const generic params: ("N" -> "i64") — comptime values used in array sizes
+    pub const_params: Vec<(String, String)>,
     pub params: Vec<Param>,
     pub ret_ty: Type,
     pub body: Vec<Stmt>,
@@ -429,6 +458,9 @@ pub struct Func {
     /// Whether the function has an explicit effect annotation (`!IO`, `!{}`, etc.)
     /// If true and declared_effects is empty, the function is explicitly pure.
     pub has_effect_annotation: bool,
+    /// Whether this is an interrupt handler (bare-metal mode).
+    /// Interrupt handlers save/restore all registers and use `iret` instead of `ret`.
+    pub is_interrupt: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -478,8 +510,9 @@ pub struct ImplDef {
 pub struct TraitDef {
     pub name: String,
     pub methods: Vec<TraitMethod>,
-    /// Associated type declarations: `type Item;`
-    pub associated_types: Vec<String>,
+    /// Associated type declarations: `ty Item;` or GAT `ty Item<T, U>;`
+    /// (name, type_params) — type_params is empty for non-GAT associated types
+    pub associated_types: Vec<(String, Vec<String>)>,
     pub is_pub: bool,
 }
 
@@ -539,4 +572,24 @@ pub struct Program {
     pub attributes: Vec<Attribute>,
     pub traits: Vec<TraitDef>,
     pub trait_impls: Vec<TraitImpl>,
+    pub extern_decls: Vec<ExternDecl>,
+}
+
+/// An extern declaration for FFI: `extern "C" pf name(params) -> ret_ty;`
+#[derive(Debug, Clone)]
+pub struct ExternDecl {
+    /// ABI convention (e.g. "C", "stdcall")
+    pub abi: String,
+    /// C function name (as seen by the linker)
+    pub c_name: String,
+    /// Pledge function name (what Pledge code calls)
+    pub pledge_name: String,
+    /// Parameter types
+    pub params: Vec<Param>,
+    /// Return type
+    pub ret_ty: Type,
+    /// Optional C header to include (e.g. "<stdio.h>")
+    pub include: Option<String>,
+    /// Optional library to link (e.g. "m" for libm)
+    pub link_lib: Option<String>,
 }

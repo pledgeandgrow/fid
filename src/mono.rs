@@ -4,6 +4,9 @@ use std::collections::{HashMap, HashSet};
 /// A substitution mapping type parameters to concrete types
 type Subst = HashMap<String, Type>;
 
+/// A substitution mapping const generic parameters to their integer values
+type ConstSubst = HashMap<String, i64>;
+
 /// Mangled name for a monomorphized function: `name__T1_T2`
 fn mangle(name: &str, subst: &Subst, type_params: &[String]) -> String {
     let type_strs: Vec<String> = type_params.iter()
@@ -52,6 +55,7 @@ fn mangle_type(ty: &Type) -> String {
         }
         Type::Ref { inner, .. } => format!("ref_{}", mangle_type(inner)),
         Type::Array { elem, .. } => format!("arr_{}", mangle_type(elem)),
+        Type::ArrayConst { elem, size_param } => format!("arrc_{}_{}", mangle_type(elem), size_param),
         Type::Tuple(types) => {
             let parts: Vec<String> = types.iter().map(mangle_type).collect();
             format!("tup_{}", parts.join("_"))
@@ -60,7 +64,7 @@ fn mangle_type(ty: &Type) -> String {
             let p: Vec<String> = params.iter().map(mangle_type).collect();
             format!("fn_{}_{}", p.join("_"), mangle_type(ret))
         }
-        Type::Assoc(_, trait_name, name) => format!("assoc_{}_{}", trait_name, name),
+        Type::Assoc(_, trait_name, name, _) => format!("assoc_{}_{}", trait_name, name),
         Type::Dyn(name) => format!("dyn_{}", name),
     }
 }
@@ -79,6 +83,25 @@ fn subst_type(ty: &Type, subst: &Subst) -> Type {
             elem: Box::new(subst_type(elem, subst)),
             size: *size,
         },
+        Type::ArrayConst { elem, size_param } => {
+            // If the const param is in the substitution, resolve it to a concrete size
+            if let Some(replacement) = subst.get(size_param) {
+                if let Type::Named(ref name) = replacement {
+                    if let Some(size_str) = name.strip_prefix("__const_") {
+                        if let Ok(size) = size_str.parse::<usize>() {
+                            return Type::Array {
+                                elem: Box::new(subst_type(elem, subst)),
+                                size,
+                            };
+                        }
+                    }
+                }
+            }
+            Type::ArrayConst {
+                elem: Box::new(subst_type(elem, subst)),
+                size_param: size_param.clone(),
+            }
+        }
         Type::Ref { inner, is_mut } => Type::Ref {
             inner: Box::new(subst_type(inner, subst)),
             is_mut: *is_mut,
@@ -98,18 +121,98 @@ fn subst_type(ty: &Type, subst: &Subst) -> Type {
     }
 }
 
+/// Substitute GAT type arguments into a resolved associated type.
+/// E.g., if the impl binds `ty Item<T> = Vec<T>`, and the usage is `T::Item<i64>`,
+/// this replaces T with i64 in Vec<T> → Vec<i64>.
+fn subst_gat_type_args(ty: &Type, args: &[Type], subst: &Subst) -> Type {
+    match ty {
+        Type::Named(name) => {
+            // Check if this name is a GAT type parameter (by position in args)
+            // GAT type params are typically T, U, etc. — we match by name against
+            // the impl's type params. For simplicity, if the name is a single uppercase
+            // letter and matches a type param in subst, use the arg.
+            // Actually, we need the GAT param names from the trait def.
+            // For now, use positional substitution: first Named that's a type param → args[0], etc.
+            ty.clone()
+        }
+        Type::Generic { name, args: inner_args } => {
+            // e.g. Vec<T> → Vec<i64> if args[0] is T
+            let new_args: Vec<Type> = inner_args.iter().map(|a| {
+                if let Type::Named(n) = a {
+                    // Try to find this name in the GAT type params
+                    // For now, check if it's a single-char type param
+                    if n.len() == 1 && n.chars().next().unwrap().is_uppercase() {
+                        // Positional: find index
+                        // This is a simplification — proper impl would track param names
+                        return args.first().cloned().unwrap_or(a.clone());
+                    }
+                }
+                subst_gat_type_args(a, args, subst)
+            }).collect();
+            Type::Generic { name: name.clone(), args: new_args }
+        }
+        Type::Array { elem, size } => Type::Array {
+            elem: Box::new(subst_gat_type_args(elem, args, subst)),
+            size: *size,
+        },
+        Type::ArrayConst { elem, size_param } => {
+            // Check if size_param matches a GAT type arg
+            if let Some(arg) = args.first() {
+                if let Type::Named(n) = arg {
+                    if n == size_param {
+                        // Can't resolve to a concrete size here
+                        return Type::ArrayConst {
+                            elem: Box::new(subst_gat_type_args(elem, args, subst)),
+                            size_param: size_param.clone(),
+                        };
+                    }
+                }
+            }
+            Type::ArrayConst {
+                elem: Box::new(subst_gat_type_args(elem, args, subst)),
+                size_param: size_param.clone(),
+            }
+        }
+        Type::Ref { inner, is_mut } => Type::Ref {
+            inner: Box::new(subst_gat_type_args(inner, args, subst)),
+            is_mut: *is_mut,
+        },
+        Type::Tuple(types) => Type::Tuple(
+            types.iter().map(|t| subst_gat_type_args(t, args, subst)).collect()
+        ),
+        other => other.clone(),
+    }
+}
+
 /// Resolve `Type::Assoc` in a type using the substitution and trait impl bindings.
 fn resolve_assoc_types(ty: &Type, subst: &Subst, bindings: &HashMap<(String, String), HashMap<String, Type>>) -> Type {
     match ty {
-        Type::Assoc(type_param, trait_name, assoc_name) => {
+        Type::Assoc(type_param, trait_name, assoc_name, type_args) => {
             if let Some(concrete) = subst.get(type_param) {
                 let concrete_name = match concrete {
                     Type::Named(n) => n.clone(),
                     _ => return Type::I64,
                 };
-                if let Some(assoc_map) = bindings.get(&(trait_name.clone(), concrete_name)) {
-                    if let Some(resolved) = assoc_map.get(assoc_name) {
-                        return resolved.clone();
+                // If trait_name is empty, search all bindings for this type+assoc_name
+                if trait_name.is_empty() {
+                    for ((tn, cn), assoc_map) in bindings {
+                        if cn == &concrete_name {
+                            if let Some(resolved) = assoc_map.get(assoc_name) {
+                                if !type_args.is_empty() {
+                                    return subst_gat_type_args(resolved, type_args, subst);
+                                }
+                                return resolved.clone();
+                            }
+                        }
+                    }
+                } else {
+                    if let Some(assoc_map) = bindings.get(&(trait_name.clone(), concrete_name)) {
+                        if let Some(resolved) = assoc_map.get(assoc_name) {
+                            if !type_args.is_empty() {
+                                return subst_gat_type_args(resolved, type_args, subst);
+                            }
+                            return resolved.clone();
+                        }
                     }
                 }
             }
@@ -148,7 +251,19 @@ fn subst_expr(expr: &Expr, subst: &Subst, renames: &HashMap<String, String>, met
             let new_callee = renames.get(callee).cloned().unwrap_or_else(|| callee.clone());
             Expr::Call { callee: new_callee, args: new_args }
         }
-        Expr::Ident(s) => Expr::Ident(s.clone()),
+        Expr::Ident(s) => {
+            // Check if this is a const generic param being substituted
+            if let Some(replacement) = subst.get(s) {
+                if let Type::Named(ref name) = replacement {
+                    if let Some(val_str) = name.strip_prefix("__const_") {
+                        if let Ok(val) = val_str.parse::<i64>() {
+                            return Expr::IntLit(val);
+                        }
+                    }
+                }
+            }
+            Expr::Ident(s.clone())
+        }
         Expr::IntLit(n) => Expr::IntLit(*n),
         Expr::FloatLit(f) => Expr::FloatLit(*f),
         Expr::BoolLit(b) => Expr::BoolLit(*b),
@@ -212,6 +327,7 @@ fn subst_expr(expr: &Expr, subst: &Subst, renames: &HashMap<String, String>, met
             expr: Box::new(subst_expr(expr, subst, renames, method_renames)),
             arms: arms.iter().map(|a| MatchArm {
                 pattern: a.pattern.clone(),
+                guard: a.guard.as_ref().map(|g| subst_expr(g, subst, renames, method_renames)),
                 body: a.body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
             }).collect(),
         },
@@ -345,6 +461,7 @@ fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, met
             expr: subst_expr(expr, subst, renames, method_renames),
             arms: arms.iter().map(|a| MatchArm {
                 pattern: a.pattern.clone(),
+                guard: a.guard.as_ref().map(|g| subst_expr(g, subst, renames, method_renames)),
                 body: a.body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
             }).collect(),
             line: *line,
@@ -370,6 +487,12 @@ fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, met
             args: args.iter().map(|a| subst_expr(a, subst, renames, method_renames)).collect(),
             line: *line,
         },
+        Stmt::RegionBlock { name, body, line } => Stmt::RegionBlock {
+            name: name.clone(),
+            body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
+            line: *line,
+        },
+        Stmt::ComptimeGen { .. } => stmt.clone(),
     }
 }
 
@@ -393,6 +516,14 @@ fn infer_from_pair(param: &Type, arg: &Type, tp_set: &HashSet<&String>, subst: &
     match param {
         Type::Named(name) if tp_set.contains(name) => {
             subst.insert(name.clone(), arg.clone());
+        }
+        Type::ArrayConst { elem, size_param } if tp_set.contains(size_param) => {
+            // Const generic: bind N to the argument's array type (which carries the size)
+            if let Type::Array { elem: arg_elem, size } = arg {
+                // Store the size as a Named type with the size encoded: __const_3
+                subst.insert(size_param.clone(), Type::Named(format!("__const_{}", size)));
+                infer_from_pair(elem, arg_elem, tp_set, subst);
+            }
         }
         Type::Array { elem, .. } => {
             if let Type::Array { elem: arg_elem, .. } = arg {
@@ -553,6 +684,105 @@ pub fn monomorphize(program: &Program) -> Program {
         attributes: program.attributes.clone(),
         traits: program.traits.clone(),
         trait_impls: new_trait_impls,
+        extern_decls: program.extern_decls.clone(),
+    }
+}
+
+/// Fix up call sites for generic functions that may have multiple instantiations.
+/// For each call to a generic, re-infer the substitution from argument types
+/// and use the correct mangled name.
+fn fixup_generic_calls(stmts: &[Stmt], generics: &HashMap<String, (Func, Vec<String>)>, current_func: &Func) -> Vec<Stmt> {
+    stmts.iter().map(|s| fixup_generic_calls_stmt(s, generics, current_func)).collect()
+}
+
+fn fixup_generic_calls_stmt(stmt: &Stmt, generics: &HashMap<String, (Func, Vec<String>)>, current_func: &Func) -> Stmt {
+    match stmt {
+        Stmt::Expr(e, line) => Stmt::Expr(fixup_generic_calls_expr(e, generics, current_func), *line),
+        Stmt::Let { name, ty, expr, is_mut, line } => Stmt::Let {
+            name: name.clone(), ty: ty.clone(),
+            expr: fixup_generic_calls_expr(expr, generics, current_func),
+            is_mut: *is_mut, line: *line,
+        },
+        Stmt::Return(opt, line) => Stmt::Return(
+            opt.as_ref().map(|e| fixup_generic_calls_expr(e, generics, current_func)),
+            *line,
+        ),
+        Stmt::If { cond, then_block, else_block, line } => Stmt::If {
+            cond: fixup_generic_calls_expr(cond, generics, current_func),
+            then_block: fixup_generic_calls(then_block, generics, current_func),
+            else_block: else_block.as_ref().map(|eb| fixup_generic_calls(eb, generics, current_func)),
+            line: *line,
+        },
+        Stmt::While { cond, body, line } => Stmt::While {
+            cond: fixup_generic_calls_expr(cond, generics, current_func),
+            body: fixup_generic_calls(body, generics, current_func),
+            line: *line,
+        },
+        Stmt::For { var, iterator, body, line } => Stmt::For {
+            var: var.clone(),
+            iterator: fixup_generic_calls_expr(iterator, generics, current_func),
+            body: fixup_generic_calls(body, generics, current_func),
+            line: *line,
+        },
+        Stmt::Assign { target, op, expr, line } => Stmt::Assign {
+            target: target.clone(), op: op.clone(),
+            expr: fixup_generic_calls_expr(expr, generics, current_func),
+            line: *line,
+        },
+        other => other.clone(),
+    }
+}
+
+fn fixup_generic_calls_expr(expr: &Expr, generics: &HashMap<String, (Func, Vec<String>)>, current_func: &Func) -> Expr {
+    match expr {
+        Expr::Call { callee, args } => {
+            // First, recursively fix up args
+            let new_args: Vec<Expr> = args.iter()
+                .map(|a| fixup_generic_calls_expr(a, generics, current_func))
+                .collect();
+
+            // Check if this is a call to a generic function
+            if let Some((gen_func, type_params)) = generics.get(callee) {
+                let arg_types: Vec<Type> = new_args.iter()
+                    .map(|a| infer_expr_type(a, current_func))
+                    .collect();
+                let param_types: Vec<Type> = gen_func.params.iter().map(|p| p.ty.clone()).collect();
+                let subst = infer_subst(&param_types, &arg_types, type_params);
+                let mangled = mangle(callee, &subst, type_params);
+                return Expr::Call { callee: mangled, args: new_args };
+            }
+
+            Expr::Call { callee: callee.clone(), args: new_args }
+        }
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: op.clone(),
+            left: Box::new(fixup_generic_calls_expr(left, generics, current_func)),
+            right: Box::new(fixup_generic_calls_expr(right, generics, current_func)),
+        },
+        Expr::Unary { op, expr: inner } => Expr::Unary {
+            op: op.clone(),
+            expr: Box::new(fixup_generic_calls_expr(inner, generics, current_func)),
+        },
+        Expr::MethodCall { receiver, method, args } => Expr::MethodCall {
+            receiver: Box::new(fixup_generic_calls_expr(receiver, generics, current_func)),
+            method: method.clone(),
+            args: args.iter().map(|a| fixup_generic_calls_expr(a, generics, current_func)).collect(),
+        },
+        Expr::FieldAccess { expr: inner, field } => Expr::FieldAccess {
+            expr: Box::new(fixup_generic_calls_expr(inner, generics, current_func)),
+            field: field.clone(),
+        },
+        Expr::Index { array, index } => Expr::Index {
+            array: Box::new(fixup_generic_calls_expr(array, generics, current_func)),
+            index: Box::new(fixup_generic_calls_expr(index, generics, current_func)),
+        },
+        Expr::If { cond, then_block, else_block } => Expr::If {
+            cond: Box::new(fixup_generic_calls_expr(cond, generics, current_func)),
+            then_block: fixup_generic_calls(then_block, generics, current_func),
+            else_block: else_block.as_ref().map(|eb| fixup_generic_calls(eb, generics, current_func)),
+        },
+        Expr::Block(stmts) => Expr::Block(fixup_generic_calls(stmts, generics, current_func)),
+        other => other.clone(),
     }
 }
 
@@ -629,15 +859,20 @@ fn process_func(func: &Func, ctx: &mut MonoCtx) -> Func {
         }
     }
 
-    // Rewrite the function body with renames
-    let new_body: Vec<Stmt> = func.body.iter()
-        .map(|s| subst_stmt(s, &HashMap::new(), &local_renames, &method_renames))
+    // Fix up call sites for generics with multiple instantiations.
+    // We need to run fixup on the ORIGINAL body (before subst_stmt renamed
+    // callees), then apply substitution for types/exprs without the renames.
+    let fixed_body = fixup_generic_calls(&func.body, &ctx.generics, func);
+    // Now apply type substitution (but no call renames since fixup already did them)
+    let new_body: Vec<Stmt> = fixed_body.iter()
+        .map(|s| subst_stmt(s, &HashMap::new(), &HashMap::new(), &method_renames))
         .collect();
 
     Func {
         name: func.name.clone(),
         type_params: Vec::new(),
         type_param_bounds: Vec::new(),
+        const_params: Vec::new(),
         params: func.params.clone(),
         ret_ty: func.ret_ty.clone(),
         body: new_body,
@@ -645,6 +880,7 @@ fn process_func(func: &Func, ctx: &mut MonoCtx) -> Func {
         is_comptime: false,
         declared_effects: func.declared_effects.clone(),
         has_effect_annotation: func.has_effect_annotation,
+        is_interrupt: func.is_interrupt,
     }
 }
 
@@ -671,6 +907,7 @@ fn instantiate(gen_func: &Func, subst: &Subst, mangled_name: &str, ctx: &mut Mon
         name: mangled_name.to_string(),
         type_params: Vec::new(),
         type_param_bounds: Vec::new(),
+        const_params: Vec::new(),
         params: new_params,
         ret_ty: new_ret_ty.clone(),
         body: subst_body,
@@ -678,6 +915,7 @@ fn instantiate(gen_func: &Func, subst: &Subst, mangled_name: &str, ctx: &mut Mon
         is_comptime: false,
         declared_effects: gen_func.declared_effects.clone(),
         has_effect_annotation: gen_func.has_effect_annotation,
+        is_interrupt: gen_func.is_interrupt,
     };
 
     // Now process this concrete function — it may contain calls to other generics
@@ -795,6 +1033,12 @@ fn collect_generic_calls_stmt_with_hint(
                 collect_generic_calls_expr_with_hint(arg, generics, generic_methods, calls, method_calls, current_func, None);
             }
         }
+        Stmt::RegionBlock { body, .. } => {
+            for s in body {
+                collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
+            }
+        }
+        Stmt::ComptimeGen { .. } => {}
     }
 }
 
@@ -1027,6 +1271,12 @@ fn infer_expr_type(expr: &Expr, func: &Func) -> Type {
             }
         }
         Expr::StructLit { name, .. } => Type::Named(name.clone()),
+        Expr::ArrayLit { elem_type, elements } => {
+            Type::Array {
+                elem: Box::new((**elem_type).clone()),
+                size: elements.len(),
+            }
+        }
         Expr::MethodCall { receiver, .. } => {
             // For associated function calls like Point::new(x, y),
             // the receiver is Expr::Ident("Point") — infer as that type

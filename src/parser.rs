@@ -17,16 +17,18 @@ pub struct Parser {
     pos: usize,
     struct_names: Vec<String>,
     enum_names: Vec<String>,
+    /// Type alias names that resolve to struct types (for struct literal parsing)
+    alias_to_struct: Vec<String>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0, struct_names: Vec::new(), enum_names: Vec::new() }
+        Parser { tokens, pos: 0, struct_names: Vec::new(), enum_names: Vec::new(), alias_to_struct: Vec::new() }
     }
 
     /// Create a parser with pre-populated struct/enum names (for stdlib auto-include)
     pub fn with_names(tokens: Vec<Token>, struct_names: Vec<String>, enum_names: Vec<String>) -> Self {
-        Parser { tokens, pos: 0, struct_names, enum_names }
+        Parser { tokens, pos: 0, struct_names, enum_names, alias_to_struct: Vec::new() }
     }
 
     pub fn parse(&mut self) -> Result<Program, String> {
@@ -107,6 +109,66 @@ impl Parser {
                     func.is_comptime = true;
                     program.funcs.push(func);
                 }
+                TokenKind::Interrupt => {
+                    self.advance(); // consume interrupt
+                    // interrupt pf name(...) { ... } — bare-metal interrupt handler
+                    let mut func = self.parse_func()?;
+                    func.is_pub = is_pub;
+                    func.is_interrupt = true;
+                    program.funcs.push(func);
+                }
+                TokenKind::Extern => {
+                    self.advance(); // consume extern
+                    // extern "C" pf name(...);  or  extern "C" { pf name(...); ... }
+                    // Also: extern "C" include "<stdio.h>" link "m"
+                    let abi = if let TokenKind::StringLit(ref s) = self.peek().clone() {
+                        self.advance();
+                        s.clone()
+                    } else {
+                        String::from("C")
+                    };
+
+                    // Optional: include "<header>" and link "lib"
+                    let mut include: Option<String> = None;
+                    let mut link_lib: Option<String> = None;
+                    loop {
+                        if let TokenKind::Ident(ref kw) = self.peek().clone() {
+                            if kw == "include" {
+                                self.advance();
+                                if let TokenKind::StringLit(ref s) = self.peek().clone() {
+                                    include = Some(s.clone());
+                                    self.advance();
+                                }
+                                continue;
+                            }
+                            if kw == "link" {
+                                self.advance();
+                                if let TokenKind::StringLit(ref s) = self.peek().clone() {
+                                    link_lib = Some(s.clone());
+                                    self.advance();
+                                }
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+
+                    if self.check(&TokenKind::LBrace) {
+                        // Block of extern declarations
+                        self.advance();
+                        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+                            self.expect(TokenKind::Pf, "pf")?;
+                            let decl = self.parse_extern_func_decl(&abi, &include, &link_lib)?;
+                            program.extern_decls.push(decl);
+                        }
+                        self.expect(TokenKind::RBrace, "}")?;
+                    } else {
+                        // Single extern function
+                        self.expect(TokenKind::Pf, "pf")?;
+                        let decl = self.parse_extern_func_decl(&abi, &include, &link_lib)?;
+                        program.extern_decls.push(decl);
+                    }
+                }
                 _ => {
                     let mut func = self.parse_func()?;
                     func.is_pub = is_pub;
@@ -181,6 +243,7 @@ impl Parser {
 
     fn is_struct_name(&self, name: &str) -> bool {
         self.struct_names.iter().any(|s| s == name)
+            || self.alias_to_struct.iter().any(|s| s == name)
     }
 
     fn is_enum_name(&self, name: &str) -> bool {
@@ -299,6 +362,12 @@ impl Parser {
         self.expect(TokenKind::Eq, "=")?;
         let alias_for = self.parse_type()?;
         self.match_tok(TokenKind::Semicolon);
+        // If the alias points to a named type that's a struct, track it
+        if let Type::Named(ref target) = alias_for {
+            if self.struct_names.iter().any(|s| s == target) {
+                self.alias_to_struct.push(name.clone());
+            }
+        }
         Ok(TypeAlias { name, alias_for, is_pub: false })
     }
 
@@ -332,10 +401,26 @@ impl Parser {
             let mut methods = Vec::new();
             let mut associated_types = Vec::new();
             while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
-                // Associated type binding: `ty Item = ConcreteType;`
+                // Associated type binding: `ty Item = ConcreteType;` or GAT `ty Item<T> = ConcreteType;`
                 if self.check(&TokenKind::Ty) {
                     self.advance();
                     let assoc_name = self.expect_ident()?;
+                    // Parse optional GAT type params: <T, U>
+                    if self.check(&TokenKind::Lt) {
+                        self.advance();
+                        if !self.check(&TokenKind::Gt) {
+                            loop {
+                                self.expect_ident()?;
+                                if !self.match_tok(TokenKind::Comma) {
+                                    break;
+                                }
+                                if self.check(&TokenKind::Gt) {
+                                    break;
+                                }
+                            }
+                        }
+                        self.expect(TokenKind::Gt, ">")?;
+                    }
                     self.expect(TokenKind::Eq, "=")?;
                     let assoc_ty = self.parse_type()?;
                     self.match_tok(TokenKind::Semicolon);
@@ -392,12 +477,31 @@ impl Parser {
         let mut methods = Vec::new();
         let mut associated_types = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
-            // Associated type declaration: `ty Item;`
+            // Associated type declaration: `ty Item;` or GAT `ty Item<T, U>;`
             if self.check(&TokenKind::Ty) {
                 self.advance();
                 let assoc_name = self.expect_ident()?;
+                // Parse optional GAT type params: <T, U>
+                let mut type_params = Vec::new();
+                if self.check(&TokenKind::Lt) {
+                    self.advance();
+                    if !self.check(&TokenKind::Gt) {
+                        loop {
+                            let tp = self.expect_ident()?;
+                            type_params.push(tp);
+                            if !self.match_tok(TokenKind::Comma) {
+                                break;
+                            }
+                            // Allow trailing comma
+                            if self.check(&TokenKind::Gt) {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(TokenKind::Gt, ">")?;
+                }
                 self.match_tok(TokenKind::Semicolon);
-                associated_types.push(assoc_name);
+                associated_types.push((assoc_name, type_params));
                 continue;
             }
             let is_pub = if self.check(&TokenKind::Pub) {
@@ -479,28 +583,86 @@ impl Parser {
         Ok(TraitDef { name, methods, associated_types, is_pub: false })
     }
 
+    /// Parse an extern function declaration (pf keyword already consumed)
+    fn parse_extern_func_decl(&mut self, abi: &str, include: &Option<String>, link_lib: &Option<String>) -> Result<ExternDecl, String> {
+        let c_name = self.expect_ident()?;
+        // Optional `as pledge_name` to map C name to Pledge name
+        let pledge_name = if self.check(&TokenKind::As) {
+            self.advance();
+            self.expect_ident()?
+        } else {
+            c_name.clone()
+        };
+        self.expect(TokenKind::LParen, "(")?;
+        let params = self.parse_params()?;
+        self.expect(TokenKind::RParen, ")")?;
+        let ret_ty = if self.match_tok(TokenKind::Arrow) {
+            self.parse_type()?
+        } else {
+            Type::Void
+        };
+        self.match_tok(TokenKind::Semicolon);
+        Ok(ExternDecl {
+            abi: abi.to_string(),
+            c_name,
+            pledge_name,
+            params,
+            ret_ty,
+            include: include.clone(),
+            link_lib: link_lib.clone(),
+        })
+    }
+
     fn parse_func(&mut self) -> Result<Func, String> {
         self.expect(TokenKind::Pf, "fn")?;
         let name = self.expect_ident()?;
 
         // Generic type params: <T, U, ...> with optional trait bounds: <T: Display, U>
+        // Also supports const generic params: <N: i64> where N is a comptime value
         let mut type_params = Vec::new();
         let mut type_param_bounds: Vec<(String, String)> = Vec::new();
+        // Const generic params: (name, type_name) — e.g. ("N", "i64")
+        let mut const_params: Vec<(String, String)> = Vec::new();
         if self.check(&TokenKind::Lt) {
             self.advance(); // consume <
             if !self.check(&TokenKind::Gt) {
                 loop {
                     let tp = self.expect_ident()?;
-                    type_params.push(tp.clone());
-                    // Parse trait bound: T: SomeCap
+                    // Parse bound: T: SomeCap or N: i64 (const generic)
                     if self.match_tok(TokenKind::Colon) {
-                        let bound = self.expect_ident()?;
-                        type_param_bounds.push((tp, bound));
-                        // Skip additional bounds: T: Cap1 + Cap2
-                        while self.match_tok(TokenKind::Plus) {
-                            let _ = self.expect_ident()?;
+                        let bound_tok = self.peek_token().clone();
+                        // Check if it's a type (const generic) or a trait bound
+                        let is_type = matches!(bound_tok.kind,
+                            TokenKind::I8 | TokenKind::I16 | TokenKind::I32 | TokenKind::I64
+                            | TokenKind::I128 | TokenKind::U8 | TokenKind::U16
+                            | TokenKind::U32 | TokenKind::U64 | TokenKind::U128
+                        );
+                        if is_type {
+                            let ty_name = match bound_tok.kind {
+                                TokenKind::I8 => "i8",
+                                TokenKind::I16 => "i16",
+                                TokenKind::I32 => "i32",
+                                TokenKind::I64 => "i64",
+                                TokenKind::I128 => "i128",
+                                TokenKind::U8 => "u8",
+                                TokenKind::U16 => "u16",
+                                TokenKind::U32 => "u32",
+                                TokenKind::U64 => "u64",
+                                TokenKind::U128 => "u128",
+                                _ => unreachable!(),
+                            };
+                            self.advance();
+                            const_params.push((tp.clone(), ty_name.to_string()));
+                        } else {
+                            let bound = self.expect_ident()?;
+                            type_param_bounds.push((tp.clone(), bound));
+                            // Skip additional bounds: T: Cap1 + Cap2
+                            while self.match_tok(TokenKind::Plus) {
+                                let _ = self.expect_ident()?;
+                            }
                         }
                     }
+                    type_params.push(tp);
                     if !self.match_tok(TokenKind::Comma) {
                         break;
                     }
@@ -553,6 +715,7 @@ impl Parser {
             name,
             type_params,
             type_param_bounds,
+            const_params,
             params,
             ret_ty,
             body,
@@ -560,6 +723,7 @@ impl Parser {
             is_comptime: false,
             declared_effects,
             has_effect_annotation,
+            is_interrupt: false,
         })
     }
 
@@ -571,11 +735,20 @@ impl Parser {
 
         loop {
             let name = self.expect_ident()?;
-            self.expect(TokenKind::Colon, ":")?;
-            let ty = self.parse_type()?;
-            params.push(Param { name, ty });
+            // Handle bare 'self' (without type annotation) in impl methods
+            if name == "self" && !self.check(&TokenKind::Colon) {
+                params.push(Param { name: "self".to_string(), ty: Type::Named("Self".to_string()) });
+            } else {
+                self.expect(TokenKind::Colon, ":")?;
+                let ty = self.parse_type()?;
+                params.push(Param { name, ty });
+            }
 
             if !self.match_tok(TokenKind::Comma) {
+                break;
+            }
+            // Allow trailing comma
+            if self.check(&TokenKind::RParen) {
                 break;
             }
         }
@@ -629,11 +802,29 @@ impl Parser {
             }
             TokenKind::Ident(s) => {
                 self.advance();
-                // Check for associated type: T::Item
+                // Check for associated type: T::Item or GAT T::Item<X>
                 if self.check(&TokenKind::DoubleColon) {
                     self.advance();
                     let assoc_name = self.expect_ident()?;
-                    return Ok(Type::Assoc(s, String::new(), assoc_name));
+                    // Parse optional GAT type args: <X, Y>
+                    let mut type_args = Vec::new();
+                    if self.check(&TokenKind::Lt) {
+                        self.advance();
+                        if !self.check(&TokenKind::Gt) {
+                            loop {
+                                let ta = self.parse_type()?;
+                                type_args.push(ta);
+                                if !self.match_tok(TokenKind::Comma) {
+                                    break;
+                                }
+                                if self.check(&TokenKind::Gt) {
+                                    break;
+                                }
+                            }
+                        }
+                        self.expect(TokenKind::Gt, ">")?;
+                    }
+                    return Ok(Type::Assoc(s, String::new(), assoc_name, type_args));
                 }
                 // Check for generic type args: Name<T, U>
                 if self.check(&TokenKind::Lt) {
@@ -681,16 +872,23 @@ impl Parser {
                 let elem = self.parse_type()?;
                 self.expect(TokenKind::Semicolon, ";")?;
                 let size_tok = self.peek_token().clone();
-                let size = match &size_tok.kind {
-                    TokenKind::IntLit(n) => *n as usize,
+                let ty = match &size_tok.kind {
+                    TokenKind::IntLit(n) => {
+                        self.advance();
+                        Type::Array { elem: Box::new(elem), size: *n as usize }
+                    }
+                    TokenKind::Ident(name) => {
+                        // Const generic size: [T; N] where N is a type param
+                        self.advance();
+                        Type::ArrayConst { elem: Box::new(elem), size_param: name.clone() }
+                    }
                     _ => return Err(format!(
                         "Parse error at {}:{}: expected array size but got '{}'",
                         size_tok.line, size_tok.col, size_tok.kind
                     )),
                 };
-                self.advance();
                 self.expect(TokenKind::RBracket, "]")?;
-                return Ok(Type::Array { elem: Box::new(elem), size });
+                return Ok(ty);
             }
             _ => {
                 return Err(format!(
@@ -760,6 +958,27 @@ impl Parser {
             TokenKind::Use => self.parse_use_stmt(),
             TokenKind::Handle => self.parse_handle_stmt(),
             TokenKind::Do => self.parse_do_stmt(),
+            TokenKind::Region => self.parse_region_block(),
+            TokenKind::Comptime => {
+                let line = self.peek_token().line;
+                self.advance(); // consume comptime
+                // comptime gen { block } — comptime code generation
+                if let TokenKind::Ident(ref name) = self.peek().clone() {
+                    if name == "gen" {
+                        self.advance(); // consume gen
+                        self.expect(TokenKind::LBrace, "{")?;
+                        let mut block = Vec::new();
+                        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+                            block.push(self.parse_stmt()?);
+                        }
+                        self.expect(TokenKind::RBrace, "}")?;
+                        return Ok(Stmt::ComptimeGen { block, line });
+                    }
+                }
+                // Fall through to expression-level comptime parsing
+                let expr = self.parse_comptime_expr(line)?;
+                Ok(Stmt::Expr(expr, line))
+            }
             _ => self.parse_assign_or_expr(),
         }
     }
@@ -852,12 +1071,19 @@ impl Parser {
         let mut arms = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
             let pattern = self.parse_pattern()?;
+            // Optional guard: `pattern if cond =>`
+            let guard = if self.check(&TokenKind::If) {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             self.expect(TokenKind::FatArrow, "=>")?;
             self.expect(TokenKind::LBrace, "{")?;
             let body = self.parse_block()?;
             self.expect(TokenKind::RBrace, "}")?;
             self.match_tok(TokenKind::Comma);
-            arms.push(MatchArm { pattern, body });
+            arms.push(MatchArm { pattern, guard, body });
         }
         self.expect(TokenKind::RBrace, "}")?;
 
@@ -872,6 +1098,13 @@ impl Parser {
         let mut arms = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
             let pattern = self.parse_pattern()?;
+            // Optional guard: `pattern if cond =>`
+            let guard = if self.check(&TokenKind::If) {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             self.expect(TokenKind::FatArrow, "=>")?;
             // Arm body: either { block } or single expression
             let body = if self.check(&TokenKind::LBrace) {
@@ -885,7 +1118,7 @@ impl Parser {
                 vec![Stmt::Expr(e, line)]
             };
             self.match_tok(TokenKind::Comma);
-            arms.push(MatchArm { pattern, body });
+            arms.push(MatchArm { pattern, guard, body });
         }
         self.expect(TokenKind::RBrace, "}")?;
 
@@ -897,6 +1130,35 @@ impl Parser {
         match &tok.kind {
             TokenKind::IntLit(n) => {
                 self.advance();
+                // Check for range pattern: 1..=3 or 1..5
+                if self.check(&TokenKind::DotDotEq) {
+                    self.advance();
+                    let end_tok = self.peek_token().clone();
+                    if let TokenKind::IntLit(m) = end_tok.kind {
+                        self.advance();
+                        // Inclusive range: 1..=3 means [1,3]. Lowering uses [lo,hi)
+                        // so we store end+1 to make it exclusive.
+                        return Ok(Pattern::Range {
+                            start: Box::new(Pattern::IntLit(*n)),
+                            end: Box::new(Pattern::IntLit(m + 1)),
+                        });
+                    }
+                    return Err(format!("Parse error at {}:{}: expected int after ..=", end_tok.line, end_tok.col));
+                }
+                if self.check(&TokenKind::DotDot) {
+                    self.advance();
+                    let end_tok = self.peek_token().clone();
+                    if let TokenKind::IntLit(m) = end_tok.kind {
+                        self.advance();
+                        // Exclusive range: 1..5 means [1,5). Lowering uses [lo,hi)
+                        // so we keep end as-is.
+                        return Ok(Pattern::Range {
+                            start: Box::new(Pattern::IntLit(*n)),
+                            end: Box::new(Pattern::IntLit(m)),
+                        });
+                    }
+                    return Err(format!("Parse error at {}:{}: expected int after ..", end_tok.line, end_tok.col));
+                }
                 Ok(Pattern::IntLit(*n))
             }
             TokenKind::StringLit(s) => {
@@ -923,9 +1185,12 @@ impl Parser {
                     if self.match_tok(TokenKind::LParen) {
                         loop {
                             let bname = self.expect_ident()?;
-                            self.expect(TokenKind::Colon, ":")?;
-                            // Accept any type name (ident or type keyword)
-                            let bty = self.read_type_name()?;
+                            // Type annotation is optional: `x: Type` or just `x`
+                            let bty = if self.match_tok(TokenKind::Colon) {
+                                self.read_type_name()?
+                            } else {
+                                String::new() // empty = infer type
+                            };
                             bindings.push((bname, bty));
                             if !self.match_tok(TokenKind::Comma) {
                                 break;
@@ -939,13 +1204,17 @@ impl Parser {
                         bindings,
                     })
                 } else if self.check(&TokenKind::LParen) {
-                    // Shorthand: Some(x: i64) without EnumName:: prefix
+                    // Shorthand: Some(x) or Some(x: i64) without EnumName:: prefix
                     self.advance(); // consume (
                     let mut bindings = Vec::new();
                     loop {
                         let bname = self.expect_ident()?;
-                        self.expect(TokenKind::Colon, ":")?;
-                        let bty = self.read_type_name()?;
+                        // Type annotation is optional: `x: Type` or just `x`
+                        let bty = if self.match_tok(TokenKind::Colon) {
+                            self.read_type_name()?
+                        } else {
+                            String::new() // empty = infer type
+                        };
                         bindings.push((bname, bty));
                         if !self.match_tok(TokenKind::Comma) {
                             break;
@@ -1264,48 +1533,50 @@ impl Parser {
             }
             TokenKind::Comptime => {
                 self.advance();
-                // comptime { block } — comptime block expression
-                if self.check(&TokenKind::LBrace) {
-                    self.advance();
-                    let mut stmts = Vec::new();
-                    while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
-                        stmts.push(self.parse_stmt()?);
-                    }
-                    self.expect(TokenKind::RBrace, "}")?;
-                    // Optional trailing semicolon
-                    self.match_tok(TokenKind::Semicolon);
-                    return Ok(Expr::ComptimeBlock(stmts));
-                }
-                // comptime reflect_op(Type) — type reflection
-                // Recognize: type_name, is_struct, is_enum, field_count,
-                // field_names, field_types, enum_variants
-                if let TokenKind::Ident(ref name) = self.peek().clone() {
-                    let reflect_op = match name.as_str() {
-                        "type_name" => Some(ReflectOp::TypeName),
-                        "is_struct" => Some(ReflectOp::IsStruct),
-                        "is_enum" => Some(ReflectOp::IsEnum),
-                        "field_count" => Some(ReflectOp::FieldCount),
-                        "field_names" => Some(ReflectOp::FieldNames),
-                        "field_types" => Some(ReflectOp::FieldTypes),
-                        "enum_variants" => Some(ReflectOp::EnumVariants),
-                        _ => None,
-                    };
-                    if let Some(op) = reflect_op {
-                        self.advance(); // consume the function name
-                        self.expect(TokenKind::LParen, "(")?;
-                        let ty = self.parse_type()?;
-                        self.expect(TokenKind::RParen, ")")?;
-                        self.match_tok(TokenKind::Semicolon);
-                        return Ok(Expr::ComptimeReflect { op, ty });
-                    }
-                }
-                // comptime <expr> — comptime expression
-                let inner = self.parse_unary()?;
-                self.match_tok(TokenKind::Semicolon);
-                Ok(Expr::Comptime(Box::new(inner)))
+                return self.parse_comptime_expr(0);
             }
             _ => self.parse_postfix(),
         }
+    }
+
+    /// Parse comptime expression (comptime keyword already consumed)
+    fn parse_comptime_expr(&mut self, _line: usize) -> Result<Expr, String> {
+        // comptime { block } — comptime block expression
+        if self.check(&TokenKind::LBrace) {
+            self.advance();
+            let mut stmts = Vec::new();
+            while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+                stmts.push(self.parse_stmt()?);
+            }
+            self.expect(TokenKind::RBrace, "}")?;
+            self.match_tok(TokenKind::Semicolon);
+            return Ok(Expr::ComptimeBlock(stmts));
+        }
+        // comptime reflect_op(Type) — type reflection
+        if let TokenKind::Ident(ref name) = self.peek().clone() {
+            let reflect_op = match name.as_str() {
+                "type_name" => Some(ReflectOp::TypeName),
+                "is_struct" => Some(ReflectOp::IsStruct),
+                "is_enum" => Some(ReflectOp::IsEnum),
+                "field_count" => Some(ReflectOp::FieldCount),
+                "field_names" => Some(ReflectOp::FieldNames),
+                "field_types" => Some(ReflectOp::FieldTypes),
+                "enum_variants" => Some(ReflectOp::EnumVariants),
+                _ => None,
+            };
+            if let Some(op) = reflect_op {
+                self.advance();
+                self.expect(TokenKind::LParen, "(")?;
+                let ty = self.parse_type()?;
+                self.expect(TokenKind::RParen, ")")?;
+                self.match_tok(TokenKind::Semicolon);
+                return Ok(Expr::ComptimeReflect { op, ty });
+            }
+        }
+        // comptime <expr> — comptime expression
+        let inner = self.parse_unary()?;
+        self.match_tok(TokenKind::Semicolon);
+        Ok(Expr::Comptime(Box::new(inner)))
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, String> {
@@ -1489,6 +1760,10 @@ impl Parser {
                             let fval = self.parse_expr()?;
                             fields.push((fname, fval));
                             if !self.match_tok(TokenKind::Comma) {
+                                break;
+                            }
+                            // Allow trailing comma
+                            if self.check(&TokenKind::RBrace) {
                                 break;
                             }
                         }
@@ -1843,6 +2118,17 @@ impl Parser {
         self.expect(TokenKind::RParen, ")")?;
         self.match_tok(TokenKind::Semicolon);
         Ok(Stmt::Do { effect, op, args, line })
+    }
+
+    /// Parse `region r { body }` — create a named region block
+    fn parse_region_block(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect(TokenKind::Region, "region")?;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::LBrace, "{")?;
+        let body = self.parse_block()?;
+        self.expect(TokenKind::RBrace, "}")?;
+        Ok(Stmt::RegionBlock { name, body, line })
     }
 
     fn parse_attribute(&mut self) -> Result<Attribute, String> {

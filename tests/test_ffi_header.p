@@ -1,0 +1,23 @@
+// Test C header parsing — auto-generate FFI bindings
+// Phase 3D.2
+
+// This test verifies that the C header parser can extract function
+// declarations from a C header file and generate Pledge extern declarations.
+// The actual parsing is done by `pledgec parse-header <file.h>`.
+
+// We test by using the generated bindings to call C functions.
+// The header file test_math.h declares:
+//   int c_add(int a, int b);
+//   double c_sqrt(double x);
+
+extern "C" include "<math.h>" link "m" {
+    pf sqrt as pledge_sqrt(x: f64) -> f64;
+}
+
+pf main() -> i64 {
+    // Use the extern function
+    pv s = pledge_sqrt(25.0);
+    print(s);  // 5
+
+    ret 0;
+}

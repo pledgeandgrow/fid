@@ -53,6 +53,15 @@ pub enum PhysReg {
     R13 = 13,
     R14 = 14,
     R15 = 15,
+    // SSE/AVX registers for SIMD
+    Xmm0 = 16,
+    Xmm1 = 17,
+    Xmm2 = 18,
+    Xmm3 = 19,
+    Xmm4 = 20,
+    Xmm5 = 21,
+    Xmm6 = 22,
+    Xmm7 = 23,
 }
 
 impl PhysReg {
@@ -121,6 +130,14 @@ impl PhysReg {
             PhysReg::R13 => "r13",
             PhysReg::R14 => "r14",
             PhysReg::R15 => "r15",
+            PhysReg::Xmm0 => "xmm0",
+            PhysReg::Xmm1 => "xmm1",
+            PhysReg::Xmm2 => "xmm2",
+            PhysReg::Xmm3 => "xmm3",
+            PhysReg::Xmm4 => "xmm4",
+            PhysReg::Xmm5 => "xmm5",
+            PhysReg::Xmm6 => "xmm6",
+            PhysReg::Xmm7 => "xmm7",
         }
     }
 }

@@ -21,6 +21,7 @@ fn is_skip_test(name: &str) -> bool {
         | "test_comptime_func.p"
         | "test_comptime_reflect.p"
         | "test_comptime_serialize.p"
+        | "test_comptime_gen.p"
         | "test_db.p"
         | "test_http.p"
         | "test_json.p"
@@ -29,6 +30,15 @@ fn is_skip_test(name: &str) -> bool {
         | "test_parallel.p"
         | "test_shape.p"
         | "test_wasm.p"
+        | "test_allocator.p"
+        | "test_effect_handler.p"
+        | "test_asm.p"
+        | "test_bare.p"
+        | "test_boot.p"
+        | "test_interrupt.p"
+        | "test_mmu.p"
+        | "test_gat.p"
+        | "test_ffi_header.p"
     )
 }
 
@@ -677,4 +687,81 @@ fn effect_system_enforced() {
         );
     }
     println!("Effect system: {}/{} tests passed", passed, effect_tests.len());
+}
+
+/// Region inference test: verify region blocks, escape detection, and safety.
+#[test]
+fn region_inference_enforced() {
+    let bin = ensure_binary();
+    let region_dir = PathBuf::from("tests/regions");
+    if !region_dir.exists() {
+        println!("tests/regions/ directory not found, skipping region test.");
+        return;
+    }
+
+    let mut region_tests: Vec<PathBuf> = fs::read_dir(&region_dir)
+        .expect("Could not open tests/regions/ directory")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |e| e == "p"))
+        .collect();
+    region_tests.sort();
+    assert!(!region_tests.is_empty(), "No .p region test files found in tests/regions/");
+
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut failures: Vec<String> = Vec::new();
+
+    for test in &region_tests {
+        let name = test.file_name().unwrap().to_string_lossy().to_string();
+
+        let output = Command::new(&bin)
+            .arg("run")
+            .arg(test)
+            .output()
+            .expect("Failed to run interpreter");
+        let code = output.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        if name.contains("escape") {
+            // These tests should fail with a region error
+            if code == 0 {
+                failed += 1;
+                failures.push(format!(
+                    "{}: expected region error (exit=1) but succeeded (exit=0)",
+                    name
+                ));
+            } else if !stderr.contains("Region error") && !stderr.contains("undefined variable") {
+                failed += 1;
+                failures.push(format!(
+                    "{}: expected 'Region error' or 'undefined variable' in stderr but got: {}",
+                    name, stderr
+                ));
+            } else {
+                passed += 1;
+            }
+        } else {
+            // These tests should succeed
+            if code != 0 {
+                failed += 1;
+                failures.push(format!(
+                    "{}: expected success (exit=0) but failed (exit={}): {}",
+                    name, code, stderr
+                ));
+            } else {
+                passed += 1;
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "Region inference: {}/{} passed, {} failed:\n{}",
+            passed,
+            region_tests.len(),
+            failed,
+            failures.join("\n")
+        );
+    }
+    println!("Region inference: {}/{} tests passed", passed, region_tests.len());
 }

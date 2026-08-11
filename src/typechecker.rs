@@ -33,6 +33,23 @@ pub struct TypeChecker {
     strict_caps: bool,
     /// Track which functions produce which effects (func_name → set of effect names)
     func_effects: HashMap<String, HashSet<String>>,
+    /// Stack of active region scopes (region name → depth)
+    /// When a `region r { ... }` block is entered, `r` is pushed.
+    /// When exited, `r` is popped and any references to it become invalid.
+    region_stack: Vec<String>,
+    /// Map from variable name to the region it was allocated in.
+    /// Used to detect use-after-free and dangling pointers.
+    var_regions: HashMap<String, String>,
+    /// Set of region names that have been freed (popped from region_stack).
+    /// Variables still referencing these regions are use-after-free.
+    freed_regions: HashSet<String>,
+    /// Functions that have been capability-verified at compile time.
+    /// Calls to these functions can skip runtime capability checks (elision).
+    cap_verified: HashSet<String>,
+    /// Name of the function currently being checked (for cap_verified tracking)
+    current_func_name: Option<String>,
+    /// Current Self type (set when checking impl methods, for bare `self` params)
+    current_self_type: Option<String>,
 }
 
 impl TypeChecker {
@@ -57,6 +74,12 @@ impl TypeChecker {
             granted_caps: HashSet::new(),
             strict_caps: false,
             func_effects: HashMap::new(),
+            region_stack: Vec::new(),
+            var_regions: HashMap::new(),
+            freed_regions: HashSet::new(),
+            cap_verified: HashSet::new(),
+            current_func_name: None,
+            current_self_type: None,
         }
     }
 
@@ -111,6 +134,14 @@ impl TypeChecker {
             self.item_visibility.insert(func.name.clone(), func.is_pub);
         }
 
+        // Register extern function declarations
+        for ext in &program.extern_decls {
+            let param_types: Vec<Type> = ext.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
+            self.funcs.insert(ext.pledge_name.clone(), (param_types, self.resolve_type(&ext.ret_ty)));
+            self.item_modules.insert(ext.pledge_name.clone(), module.to_string());
+            self.item_visibility.insert(ext.pledge_name.clone(), true);
+        }
+
         for imp in &program.impls {
             let struct_name = imp.struct_name.clone();
             let mut method_map = HashMap::new();
@@ -148,7 +179,7 @@ impl TypeChecker {
             }
             self.traits.insert(trait_def.name.clone(), method_map);
             // Register associated type declarations
-            let assoc_set: HashSet<String> = trait_def.associated_types.iter().cloned().collect();
+            let assoc_set: HashSet<String> = trait_def.associated_types.iter().map(|(name, _)| name.clone()).collect();
             self.trait_assoc_types.insert(trait_def.name.clone(), assoc_set);
         }
     }
@@ -175,6 +206,28 @@ impl TypeChecker {
             let bindings: HashMap<String, Type> = ti.associated_types.iter().cloned().collect();
             if !bindings.is_empty() {
                 self.trait_impl_assoc_bindings.insert(key, bindings);
+            }
+        }
+    }
+
+    /// Register comptime-generated functions and structs that were injected
+    /// into the merged program but aren't in the original user/stdlib programs.
+    pub fn register_generated_decls(&mut self, program: &Program) {
+        // Register any structs not already known
+        for s in &program.structs {
+            if !self.structs.contains_key(&s.name) {
+                let fields: Vec<(String, Type)> = s.fields.iter()
+                    .map(|f| (f.name.clone(), self.resolve_type(&f.ty)))
+                    .collect();
+                self.structs.insert(s.name.clone(), fields);
+            }
+        }
+        // Register any functions not already known
+        for func in &program.funcs {
+            if !self.funcs.contains_key(&func.name) {
+                let param_types: Vec<Type> = func.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
+                let ret_ty = self.resolve_type(&func.ret_ty);
+                self.funcs.insert(func.name.clone(), (param_types, ret_ty));
             }
         }
     }
@@ -214,7 +267,7 @@ impl TypeChecker {
             let provided_assoc: HashSet<String> = ti.associated_types.iter()
                 .map(|(name, _)| name.clone())
                 .collect();
-            for assoc_name in &trait_def.associated_types {
+            for (assoc_name, _type_params) in &trait_def.associated_types {
                 if !provided_assoc.contains(assoc_name) {
                     self.errors.push(format!(
                         "Type error: impl {} for {} is missing associated type '{}'",
@@ -233,31 +286,52 @@ impl TypeChecker {
         // Verify declared effects match inferred effects
         self.verify_declared_effects(program);
 
+        // Verify allocator-as-parameter: functions with !Alloc must take an Allocator param
+        self.verify_allocator_params(program);
+
+        // Mark all functions as capability-verified before checking.
+        // If any function fails capability checking, it will be removed
+        // from the verified set (and an error will be reported).
+        for func in &program.funcs {
+            self.cap_verified.insert(func.name.clone());
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                self.cap_verified.insert(method.name.clone());
+            }
+        }
+
         for func in &program.funcs {
             self.check_func(func);
         }
 
         for imp in &program.impls {
             let prev_type_params = self.current_type_params.clone();
+            let prev_self = self.current_self_type.clone();
             if !imp.type_params.is_empty() {
                 self.current_type_params = imp.type_params.iter().cloned().collect();
             }
+            self.current_self_type = Some(imp.struct_name.clone());
             for method in &imp.methods {
                 self.check_func(method);
             }
             self.current_type_params = prev_type_params;
+            self.current_self_type = prev_self;
         }
 
         // Check trait impl method bodies
         for ti in &program.trait_impls {
             let prev_type_params = self.current_type_params.clone();
+            let prev_self = self.current_self_type.clone();
             if !ti.type_params.is_empty() {
                 self.current_type_params = ti.type_params.iter().cloned().collect();
             }
+            self.current_self_type = Some(ti.type_name.clone());
             for method in &ti.methods {
                 self.check_func(method);
             }
             self.current_type_params = prev_type_params;
+            self.current_self_type = prev_self;
         }
     }
 
@@ -283,6 +357,61 @@ impl TypeChecker {
                         "Effect error: function '{}' has inferred effect '!{}' but only declared '!{}'",
                         func.name, eff, func.declared_effects.join(",")
                     ));
+                }
+            }
+        }
+    }
+
+    /// Verify that functions declaring `!Alloc` have an explicit `Allocator` (or `&Allocator`)
+    /// parameter. This is the "allocator-as-parameter" rule (like Zig, but verified).
+    /// Functions that allocate must receive their allocator explicitly — no ambient allocation.
+    fn verify_allocator_params(&mut self, program: &Program) {
+        let check_one = |func: &Func| -> Option<String> {
+            if !func.has_effect_annotation {
+                return None;
+            }
+            // If the function declares !Alloc (or !{Alloc, ...}), it must have an Allocator param
+            if !func.declared_effects.iter().any(|e| e == "Alloc") {
+                return None;
+            }
+            // Look for a parameter of type Allocator or &Allocator
+            let has_alloc_param = func.params.iter().any(|p| {
+                match &p.ty {
+                    Type::Named(name) => name == "Allocator",
+                    Type::Ref { inner, .. } => {
+                        matches!(inner.as_ref(), Type::Named(name) if name == "Allocator")
+                    }
+                    _ => false,
+                }
+            });
+            if has_alloc_param {
+                None
+            } else {
+                Some(format!(
+                    "Allocator error: function '{}' declares '!Alloc' but has no Allocator parameter. \
+                     Functions that allocate must receive an allocator explicitly (like Zig). \
+                     Add a parameter of type 'Allocator' or '&Allocator'.",
+                    func.name
+                ))
+            }
+        };
+
+        for func in &program.funcs {
+            if let Some(err) = check_one(func) {
+                self.errors.push(err);
+            }
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                if let Some(err) = check_one(method) {
+                    self.errors.push(err);
+                }
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                if let Some(err) = check_one(method) {
+                    self.errors.push(err);
                 }
             }
         }
@@ -400,6 +529,9 @@ impl TypeChecker {
             Stmt::Do { effect, .. } => {
                 effects.insert(effect.clone());
             }
+            Stmt::RegionBlock { body, .. } => {
+                self.scan_stmts_for_effects(body, effects);
+            }
             _ => {}
         }
     }
@@ -426,7 +558,8 @@ impl TypeChecker {
                     // Allocation functions
                     "p_vec_new" | "p_map_new" | "p_vec_push" | "p_vec_insert"
                     | "p_map_insert" | "p_string_concat" | "p_vec_clone"
-                    | "p_map_clone" | "p_string_clone" => {
+                    | "p_map_clone" | "p_string_clone" | "p_vec_new_with"
+                    | "p_alloc_new" => {
                         effects.insert("Alloc".to_string());
                     }
                     _ => {}
@@ -499,7 +632,17 @@ impl TypeChecker {
                 "Capability error: '{}' requires '{}' capability (not granted to module '{}')",
                 context, cap, self.current_module
             ));
+            // Mark the current function as not capability-verified
+            if let Some(fname) = &self.current_func_name {
+                self.cap_verified.remove(fname);
+            }
         }
+    }
+
+    /// Returns the set of functions that passed capability verification.
+    /// Calls to these functions can skip runtime capability checks.
+    pub fn cap_verified_functions(&self) -> &HashSet<String> {
+        &self.cap_verified
     }
 
     /// Find the closest matching name from a set of candidates.
@@ -572,6 +715,7 @@ impl TypeChecker {
     }
 
     fn check_func(&mut self, func: &Func) {
+        self.current_func_name = Some(func.name.clone());
         self.push_scope();
 
         // Track type parameters for this function
@@ -582,8 +726,19 @@ impl TypeChecker {
         let saved_bounds = self.current_type_param_bounds.clone();
         self.current_type_param_bounds = func.type_param_bounds.iter().cloned().collect();
 
+        // Declare const generic params as variables (e.g. N: i64 → N is an i64 value)
+        for (name, ty_name) in &func.const_params {
+            let ty = match ty_name.as_str() {
+                "i8" => Type::I8, "i16" => Type::I16, "i32" => Type::I32, "i64" => Type::I64,
+                "i128" => Type::I128, "u8" => Type::U8, "u16" => Type::U16, "u32" => Type::U32,
+                "u64" => Type::U64, "u128" => Type::U128, _ => Type::I64,
+            };
+            self.declare(name, ty);
+        }
+
         for param in &func.params {
-            self.declare(&param.name, param.ty.clone());
+            let resolved_ty = self.resolve_self_type(&param.ty);
+            self.declare(&param.name, resolved_ty);
         }
 
         for stmt in &func.body {
@@ -593,6 +748,7 @@ impl TypeChecker {
         self.current_type_params = saved_tp;
         self.current_type_param_bounds = saved_bounds;
         self.pop_scope();
+        self.current_func_name = None;
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) {
@@ -610,6 +766,10 @@ impl TypeChecker {
                 } else {
                     expr_ty
                 };
+                // Track region: if inside a region block, record the allocation region
+                if let Some(region) = self.region_stack.last() {
+                    self.var_regions.insert(name.clone(), region.clone());
+                }
                 self.declare(name, final_ty);
             }
             Stmt::Expr(expr, _) => {
@@ -649,10 +809,26 @@ impl TypeChecker {
             Stmt::Assign { target, op: _, expr, line: _ } => {
                 let _expr_ty = self.check_expr(expr);
                 if self.lookup(target).is_none() && !self.consts.contains_key(target) {
-                    self.errors.push(format!(
-                        "Type error: cannot assign to undefined variable '{}'",
-                        target
-                    ));
+                    // Check if it was in a freed region (use-after-free)
+                    if let Some(region) = self.var_regions.get(target) {
+                        if self.freed_regions.contains(region) {
+                            self.errors.push(format!(
+                                "Region error: use-after-free — variable '{}' was in region '{}' \
+                                 which has been freed",
+                                target, region
+                            ));
+                        } else {
+                            self.errors.push(format!(
+                                "Type error: cannot assign to undefined variable '{}'",
+                                target
+                            ));
+                        }
+                    } else {
+                        self.errors.push(format!(
+                            "Type error: cannot assign to undefined variable '{}'",
+                            target
+                        ));
+                    }
                 }
             }
             Stmt::IndexAssign { array, index, op: _, expr, line: _ } => {
@@ -663,6 +839,30 @@ impl TypeChecker {
                         "Type error: cannot index undefined variable '{}'",
                         array
                     ));
+                }
+                // Compile-time bounds checking for constant indices
+                let const_idx = match &index {
+                    Expr::IntLit(v) => Some(*v),
+                    Expr::Unary { op: UnaryOp::Neg, expr, .. } => {
+                        if let Expr::IntLit(v) = expr.as_ref() { Some(-*v) } else { None }
+                    }
+                    _ => None,
+                };
+                if let Some(idx_val) = const_idx {
+                    if let Some(var_ty) = self.lookup(array) {
+                        match &var_ty {
+                            Type::Array { size, .. } => {
+                                let len = *size as i64;
+                                if idx_val < 0 || idx_val >= len {
+                                    self.errors.push(format!(
+                                        "Compile error: array index {} out of bounds for array of length {}",
+                                        idx_val, len
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             Stmt::DerefAssign { ptr_expr, op: _, expr, line: _ } => {
@@ -738,6 +938,10 @@ impl TypeChecker {
                         Pattern::Range { .. } => {}
                         _ => {}
                     }
+                    // Check guard expression if present
+                    if let Some(guard) = &arm.guard {
+                        self.check_expr(guard);
+                    }
                     for s in &arm.body {
                         self.check_stmt(s);
                     }
@@ -767,6 +971,62 @@ impl TypeChecker {
                     self.check_expr(arg);
                 }
             }
+            Stmt::RegionBlock { name, body, .. } => {
+                // Push region scope
+                self.region_stack.push(name.clone());
+                self.push_scope();
+
+                // Snapshot variables before the region block
+                let vars_before: HashSet<String> = self
+                    .var_regions
+                    .keys()
+                    .cloned()
+                    .collect();
+
+                for s in body {
+                    self.check_stmt(s);
+                }
+
+                // Detect variables that were allocated in this region
+                let region_name = name.clone();
+                let escaped: Vec<String> = self
+                    .var_regions
+                    .iter()
+                    .filter(|(k, v)| {
+                        v.as_str() == region_name.as_str() && !vars_before.contains(k.as_str())
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+
+                // Pop scope and region
+                self.pop_scope();
+                self.region_stack.pop();
+
+                // Mark region as freed — any future access to its variables is use-after-free
+                self.freed_regions.insert(region_name.clone());
+
+                // Remove region-allocated variables from tracking
+                for var in &escaped {
+                    self.var_regions.remove(var);
+                }
+
+                // Check if any escaped variables are still referenced in
+                // an outer scope (use-after-free / dangling pointer)
+                // This is a conservative check: if the variable is still in
+                // a scope, it's a potential escape.
+                if let Some(outer_scope) = self.scopes.last() {
+                    for var in &escaped {
+                        if outer_scope.contains_key(var) {
+                            self.errors.push(format!(
+                                "Region error: variable '{}' allocated in region '{}' \
+                                 may escape the region block",
+                                var, region_name
+                            ));
+                        }
+                    }
+                }
+            }
+            Stmt::ComptimeGen { .. } => {}
         }
     }
 
@@ -799,6 +1059,8 @@ impl TypeChecker {
             Expr::Binary { op, left, right } => {
                 let lt = self.check_expr(left);
                 let rt = self.check_expr(right);
+                let lt = self.resolve_type(&lt);
+                let rt = self.resolve_type(&rt);
                 match op {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                         // String concatenation with +
@@ -998,7 +1260,9 @@ impl TypeChecker {
                 Type::Never
             }
             Expr::StructLit { name, fields } => {
-                if let Some(struct_fields) = self.structs.get(name) {
+                // Resolve type alias to actual struct name
+                let real_name = self.resolve_struct_name(name);
+                if let Some(struct_fields) = self.structs.get(&real_name) {
                     let struct_fields = struct_fields.clone();
                     for (fname, fexpr) in fields {
                         let fty = self.check_expr(fexpr);
@@ -1016,7 +1280,7 @@ impl TypeChecker {
                             ));
                         }
                     }
-                    Type::Named(name.clone())
+                    Type::Named(real_name.clone())
                 } else {
                     self.errors.push(format!(
                         "Type error: unknown struct '{}'",
@@ -1316,8 +1580,35 @@ impl TypeChecker {
                         idx_ty
                     ));
                 }
+
+                // Compile-time bounds checking: if the index is a constant
+                // integer and the array has a known size, verify the index
+                // is in bounds. This catches buffer overflows at compile time.
+                let const_idx = match index.as_ref() {
+                    Expr::IntLit(v) => Some(*v),
+                    Expr::Unary { op: UnaryOp::Neg, expr, .. } => {
+                        if let Expr::IntLit(v) = expr.as_ref() { Some(-*v) } else { None }
+                    }
+                    _ => None,
+                };
+                if let Some(idx_val) = const_idx {
+                    match &arr_ty {
+                        Type::Array { size, .. } => {
+                            let len = *size as i64;
+                            if idx_val < 0 || idx_val >= len {
+                                self.errors.push(format!(
+                                    "Compile error: array index {} out of bounds for array of length {}",
+                                    idx_val, len
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 match arr_ty {
-                    Type::Array { elem, .. } => *elem,
+                    Type::Array { elem, .. } => *elem.clone(),
+                    Type::ArrayConst { elem, .. } => *elem.clone(),
                     Type::Generic { name, args } if name == "Vec" => {
                         args.first().cloned().unwrap_or(Type::I64)
                     }
@@ -1354,6 +1645,9 @@ impl TypeChecker {
                         Pattern::StrLit(_) => {}
                         Pattern::Range { .. } => {}
                         _ => {}
+                    }
+                    if let Some(guard) = &arm.guard {
+                        self.check_expr(guard);
                     }
                     for s in &arm.body {
                         self.check_stmt(s);
@@ -1512,6 +1806,50 @@ impl TypeChecker {
                     ty.clone()
                 }
             }
+            Type::ArrayConst { .. } => ty.clone(),
+            other => other.clone(),
+        }
+    }
+
+    /// Resolve a type name (possibly an alias) to its underlying struct name
+    fn resolve_struct_name(&self, name: &str) -> String {
+        if let Some(alias) = self.type_aliases.get(name) {
+            if let Type::Named(inner) = alias {
+                return self.resolve_struct_name(inner);
+            }
+        }
+        name.to_string()
+    }
+
+    /// Resolve `Self` to the current impl's type name
+    fn resolve_self_type(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Named(name) if name == "Self" => {
+                if let Some(self_name) = &self.current_self_type {
+                    Type::Named(self_name.clone())
+                } else {
+                    ty.clone()
+                }
+            }
+            Type::Ref { inner, is_mut } => Type::Ref {
+                inner: Box::new(self.resolve_self_type(inner)),
+                is_mut: *is_mut,
+            },
+            Type::Array { elem, size } => Type::Array {
+                elem: Box::new(self.resolve_self_type(elem)),
+                size: *size,
+            },
+            Type::ArrayConst { elem, size_param } => Type::ArrayConst {
+                elem: Box::new(self.resolve_self_type(elem)),
+                size_param: size_param.clone(),
+            },
+            Type::Generic { name, args } => Type::Generic {
+                name: name.clone(),
+                args: args.iter().map(|a| self.resolve_self_type(a)).collect(),
+            },
+            Type::Tuple(types) => Type::Tuple(
+                types.iter().map(|t| self.resolve_self_type(t)).collect()
+            ),
             other => other.clone(),
         }
     }
@@ -1522,13 +1860,13 @@ impl TypeChecker {
             Type::Named(name) => {
                 if let Some(assoc_types) = self.trait_assoc_types.get(trait_name) {
                     if assoc_types.contains(name) {
-                        return Type::Assoc(type_param.to_string(), trait_name.to_string(), name.clone());
+                        return Type::Assoc(type_param.to_string(), trait_name.to_string(), name.clone(), Vec::new());
                     }
                 }
                 ty.clone()
             }
-            Type::Assoc(_, _, name) => {
-                Type::Assoc(type_param.to_string(), trait_name.to_string(), name.clone())
+            Type::Assoc(_, _, name, args) => {
+                Type::Assoc(type_param.to_string(), trait_name.to_string(), name.clone(), args.clone())
             }
             _ => ty.clone(),
         }
@@ -1638,7 +1976,7 @@ impl TypeChecker {
             return true;
         }
         // Associated types are compatible with anything (resolved during mono)
-        if matches!(declared, Type::Assoc(_, _, _)) || matches!(actual, Type::Assoc(_, _, _)) {
+        if matches!(declared, Type::Assoc(_, _, _, _)) || matches!(actual, Type::Assoc(_, _, _, _)) {
             return true;
         }
         // Trait objects (dyn Trait) are compatible with any concrete type
@@ -1657,6 +1995,10 @@ impl TypeChecker {
             if self.current_type_params.contains(name) {
                 return true;
             }
+        }
+        // Const generic arrays are compatible with concrete arrays of any size
+        if matches!(declared, Type::ArrayConst { .. }) || matches!(actual, Type::ArrayConst { .. }) {
+            return true;
         }
         // Allow implicit widening (e.g., i8 literal assigned to i32 variable)
         if Self::can_implicitly_widen(&actual, &declared) {

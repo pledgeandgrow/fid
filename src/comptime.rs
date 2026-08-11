@@ -13,6 +13,45 @@ use std::collections::HashMap;
 #[derive(Debug)]
 pub struct ComptimeError(pub String);
 
+/// Process `comptime gen` blocks in the program, generating new code.
+/// This should be called BEFORE typechecking so generated declarations are visible.
+/// Returns a new program with generated functions/structs injected.
+pub fn process_gen(program: Program) -> Program {
+    let mut errs: Vec<String> = Vec::new();
+    let mut prog = program;
+
+    // First, substitute comptime expressions inside comptime gen blocks
+    // so that comptime function calls and reflection are resolved before
+    // evaluating the gen blocks.
+    let snapshot = prog.clone();
+    for func in prog.funcs.iter_mut() {
+        substitute_comptime_gen_blocks(func, &snapshot, &mut errs);
+    }
+
+    // Now process the gen blocks (comptime expressions inside should be resolved)
+    let mut generated_funcs: Vec<Func> = Vec::new();
+    let mut generated_structs: Vec<StructDef> = Vec::new();
+    let func_count = prog.funcs.len();
+    for idx in 0..func_count {
+        let snapshot = prog.clone();
+        let func = &mut prog.funcs[idx];
+        process_comptime_gen_in_func(func, &snapshot, &mut generated_funcs, &mut generated_structs, &mut errs);
+    }
+    prog.funcs.extend(generated_funcs);
+    prog.structs.extend(generated_structs);
+
+    prog
+}
+
+/// Substitute comptime expressions inside comptime gen blocks.
+fn substitute_comptime_gen_blocks(func: &mut Func, original: &Program, errs: &mut Vec<String>) {
+    for stmt in func.body.iter_mut() {
+        if let Stmt::ComptimeGen { block, .. } = stmt {
+            substitute_stmts(block, original, errs);
+        }
+    }
+}
+
 /// Recursively substitute every comptime expression in `program` with an AST
 /// literal carrying its compile-time value.
 pub fn substitute(program: &Program) -> Result<Program, Vec<String>> {
@@ -52,6 +91,58 @@ pub fn substitute(program: &Program) -> Result<Program, Vec<String>> {
     } else {
         Err(errs)
     }
+}
+
+/// Process `comptime gen` statements in a function, extracting generated code.
+fn process_comptime_gen_in_func(
+    func: &mut Func,
+    original: &Program,
+    generated_funcs: &mut Vec<Func>,
+    generated_structs: &mut Vec<StructDef>,
+    errs: &mut Vec<String>,
+) {
+    let mut new_body = Vec::new();
+    for stmt in func.body.drain(..) {
+        if let Stmt::ComptimeGen { block, line } = stmt {
+            // Evaluate the comptime block to get a string
+            match evaluate_block(&block, original) {
+                Ok(result) => {
+                    if let Expr::StringLit(source) = result {
+                        // Parse the generated source code
+                        match parse_generated_code(&source) {
+                            Ok((funcs, structs)) => {
+                                generated_funcs.extend(funcs);
+                                generated_structs.extend(structs);
+                            }
+                            Err(e) => {
+                                errs.push(format!("comptime gen at line {}: failed to parse generated code: {}", line, e));
+                            }
+                        }
+                    } else {
+                        errs.push(format!("comptime gen at line {}: block must evaluate to a string", line));
+                    }
+                }
+                Err(e) => {
+                    errs.push(format!("comptime gen at line {}: {}", line, e.0));
+                }
+            }
+        } else {
+            new_body.push(stmt);
+        }
+    }
+    func.body = new_body;
+}
+
+/// Parse generated Pledge source code into functions and structs.
+fn parse_generated_code(source: &str) -> Result<(Vec<Func>, Vec<StructDef>), String> {
+    let mut lexer = crate::lexer::Lexer::new(source);
+    let tokens = lexer.tokenize();
+    let mut parser = crate::parser::Parser::new(tokens);
+    let program = parser.parse()?;
+
+    let funcs = program.funcs;
+    let structs = program.structs;
+    Ok((funcs, structs))
 }
 
 fn substitute_func(func: &mut Func, original: &Program, errs: &mut Vec<String>) {
@@ -118,6 +209,12 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<String>) 
             for a in args.iter_mut() {
                 substitute_expr(a, original, errs);
             }
+        }
+        Stmt::RegionBlock { body, .. } => {
+            substitute_stmts(body, original, errs);
+        }
+        Stmt::ComptimeGen { block, .. } => {
+            substitute_stmts(block, original, errs);
         }
     }
 }

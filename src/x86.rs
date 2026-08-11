@@ -639,6 +639,13 @@ impl X86CodeGen {
                 wln!(self, "    xor rax, rax");
                 wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
             }
+            Inst::RegionBegin { .. } => {
+                wln!(self, "    ; region begin (no-op — stack allocation)");
+                wln!(self, "    xor rax, rax");
+            }
+            Inst::RegionEnd { .. } => {
+                wln!(self, "    ; region end (no-op)");
+            }
         }
     }
 

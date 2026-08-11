@@ -162,6 +162,10 @@ fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Pr
     // Merge user code (highest priority)
     program = merge_programs(program, user.clone());
 
+    // Phase 3A: Process comptime gen blocks (before typechecking so generated
+    // code is visible to the typechecker)
+    program = comptime::process_gen(program);
+
     // Phase 3B.1: Fill in default trait methods.
     fill_default_trait_methods(&mut program);
 
@@ -181,6 +185,10 @@ fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Pr
     // default trait methods (filled in by fill_default_trait_methods) are
     // visible to the typechecker.
     tc.register_trait_impls(&program);
+
+    // Register comptime-generated functions and structs from the merged program
+    // (these are not in the original user or stdlib programs)
+    tc.register_generated_decls(&program);
 
     // Phase 3B.4: Verify trait impls match trait definitions
     tc.verify_trait_impls(&program);
@@ -243,6 +251,7 @@ fn fill_default_trait_methods(program: &mut Program) {
                 name: tm.name.clone(),
                 type_params: Vec::new(),
                 type_param_bounds: Vec::new(),
+                const_params: Vec::new(),
                 params,
                 ret_ty: tm.ret_ty.clone(),
                 body: default_body,
@@ -250,6 +259,7 @@ fn fill_default_trait_methods(program: &mut Program) {
                 is_comptime: false,
                 declared_effects: Vec::new(),
                 has_effect_annotation: false,
+                is_interrupt: false,
             });
 
         }
@@ -438,6 +448,113 @@ pub fn emit_source_with_path(source: &str, source_path: &str) -> Result<Vec<u8>,
 
     // Generate PE file directly
     Ok(pe::generate_pe(&module))
+}
+
+/// Compile to WASM binary (Phase 5D.1).
+/// Parses, typechecks, lowers to IR, then generates WASM bytecode.
+pub fn compile_to_wasm(source: &str, source_path: &str, wat_mode: bool) -> Result<Vec<u8>, Vec<String>> {
+    let program = build_program_with_path(source, Some(source_path))?;
+    let module = lower::lower(&program);
+    if wat_mode {
+        Ok(wasm::dump_wat(&module).into_bytes())
+    } else {
+        Ok(wasm::generate_wasm(&module))
+    }
+}
+
+/// Build a native executable in one step: parse → typecheck → lower → PIR →
+/// optimize → codegen → link. Zero external tools required.
+/// Supports x86-64 (full ELF linking), arm64 and riscv (assembly text output).
+pub fn build_executable(source: &str, source_path: &str, target: &str, do_opt: bool) -> Result<Vec<u8>, Vec<String>> {
+    let program = build_program_with_path(source, Some(source_path))?;
+    let module = lower::lower(&program);
+
+    let l1 = pir::lower_ir_to_l1(&module);
+    let mut l2 = pir::lower_l1_to_l2(&l1);
+
+    if do_opt {
+        let _ = crate::opt::optimize_l2(&mut l2);
+    }
+
+    let l3 = pir::lower_l2_to_l3(&l2, &module);
+
+    match target {
+        "x86-64" | "x64" => {
+            let asm = crate::codegen_x64::generate_asm(&l3);
+            let obj = crate::elf64::emit_object_file(&l3, &asm)
+                .map_err(|e| vec![e])?;
+            crate::linker::link(&[obj], "main")
+                .map_err(|e| vec![e])
+        }
+        "arm64" | "aarch64" => {
+            let asm = crate::codegen_arm64::generate_asm(&l3);
+            // Emit a valid ELF64 relocatable object for AArch64
+            let obj = crate::elf64::emit_object_file_for_target(&l3, &asm, "arm64")
+                .map_err(|e| vec![e])?;
+            Ok(obj)
+        }
+        "riscv" | "riscv64" => {
+            let asm = crate::codegen_riscv::generate_asm(&l3);
+            // Emit a valid ELF64 relocatable object for RISC-V
+            let obj = crate::elf64::emit_object_file_for_target(&l3, &asm, "riscv")
+                .map_err(|e| vec![e])?;
+            Ok(obj)
+        }
+        _ => Err(vec![format!("Unknown target: {}", target)])
+    }
+}
+
+/// Bare-metal mode: skip stdlib, produce a flat binary (no PE headers, no C runtime).
+/// The entry point is the `main` function. The binary is loaded at address 0x10000.
+/// This is for No-OS / kernel / bootloader development (Phase 5A.2).
+pub fn emit_bare(source: &str, source_path: &str) -> Result<Vec<u8>, Vec<String>> {
+    // Parse user code WITHOUT stdlib
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize();
+    let mut parser = Parser::new(tokens);
+    let user = parser.parse().map_err(|e| vec![e])?;
+
+    // Typecheck user code (no stdlib registration)
+    let mut tc = TypeChecker::new();
+    let user_module = user.module.clone().unwrap_or_else(|| "bare".to_string());
+    tc.register_program(&user, &user_module);
+    tc.collect_capabilities(&user);
+    tc.check_bodies(&user);
+    if !tc.errors.is_empty() {
+        return Err(tc.errors);
+    }
+
+    // Lower to IR
+    let module = lower::lower(&user);
+
+    // Generate flat binary (raw machine code, no PE headers)
+    Ok(pe::generate_flat_binary(&module))
+}
+
+/// Boot mode: generate a Multiboot2-compatible kernel binary (Phase 5A.5).
+/// Same as bare mode but with a multiboot2 header and boot entry point.
+pub fn emit_boot(source: &str, source_path: &str) -> Result<Vec<u8>, Vec<String>> {
+    // Parse user code WITHOUT stdlib
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize();
+    let mut parser = Parser::new(tokens);
+    let user = parser.parse().map_err(|e| vec![e])?;
+
+    // Typecheck user code (no stdlib registration)
+    let mut tc = TypeChecker::new();
+    let user_module = user.module.clone().unwrap_or_else(|| "boot".to_string());
+    tc.register_program(&user, &user_module);
+    tc.collect_capabilities(&user);
+    tc.check_bodies(&user);
+    if !tc.errors.is_empty() {
+        return Err(tc.errors);
+    }
+
+    // Lower to IR
+    let module = lower::lower(&user);
+
+    // Generate multiboot2-compatible boot binary
+    Ok(pe::generate_boot_binary(&module))
 }
 
 /// Simple Levenshtein edit distance for module name suggestions.

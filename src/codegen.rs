@@ -591,6 +591,15 @@ impl CodeGen {
             Stmt::Do { .. } => {
                 // Not yet supported in legacy ARM64 codegen
             }
+            Stmt::RegionBlock { body, .. } => {
+                // Region creation/freeing not yet implemented in codegen
+                for s in body {
+                    self.gen_stmt(s);
+                }
+            }
+            Stmt::ComptimeGen { .. } => {
+                // ComptimeGen is processed during comptime substitution; no-op here
+            }
         }
     }
 

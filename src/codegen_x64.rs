@@ -732,6 +732,48 @@ impl X64CodeGen {
     }
 
     fn gen_call(&mut self, dst: Option<&VReg>, target: &str, args: &[Operand]) {
+        // SIMD intrinsics: emit hardware SSE2/AVX instructions
+        if target == "p_simd_add" && args.len() == 2 {
+            self.wl(&format!("    # SIMD: addpd {}, {}", self.op_str(&args[0]), self.op_str(&args[1])));
+            self.gen_operand_to_xmm(&args[0], PhysReg::Xmm0);
+            self.gen_operand_to_xmm(&args[1], PhysReg::Xmm1);
+            self.wl("    addpd %xmm1, %xmm0");
+            if let Some(d) = dst {
+                self.wl(&format!("    movapd %xmm0, {}", self.vreg_str(d)));
+            }
+            return;
+        }
+        if target == "p_simd_sub" && args.len() == 2 {
+            self.wl(&format!("    # SIMD: subpd {}, {}", self.op_str(&args[0]), self.op_str(&args[1])));
+            self.gen_operand_to_xmm(&args[0], PhysReg::Xmm0);
+            self.gen_operand_to_xmm(&args[1], PhysReg::Xmm1);
+            self.wl("    subpd %xmm1, %xmm0");
+            if let Some(d) = dst {
+                self.wl(&format!("    movapd %xmm0, {}", self.vreg_str(d)));
+            }
+            return;
+        }
+        if target == "p_simd_mul" && args.len() == 2 {
+            self.wl(&format!("    # SIMD: mulpd {}, {}", self.op_str(&args[0]), self.op_str(&args[1])));
+            self.gen_operand_to_xmm(&args[0], PhysReg::Xmm0);
+            self.gen_operand_to_xmm(&args[1], PhysReg::Xmm1);
+            self.wl("    mulpd %xmm1, %xmm0");
+            if let Some(d) = dst {
+                self.wl(&format!("    movapd %xmm0, {}", self.vreg_str(d)));
+            }
+            return;
+        }
+        if target == "p_simd_div" && args.len() == 2 {
+            self.wl(&format!("    # SIMD: divpd {}, {}", self.op_str(&args[0]), self.op_str(&args[1])));
+            self.gen_operand_to_xmm(&args[0], PhysReg::Xmm0);
+            self.gen_operand_to_xmm(&args[1], PhysReg::Xmm1);
+            self.wl("    divpd %xmm1, %xmm0");
+            if let Some(d) = dst {
+                self.wl(&format!("    movapd %xmm0, {}", self.vreg_str(d)));
+            }
+            return;
+        }
+
         // Move args into argument registers.
         let arg_regs = PhysReg::arg_regs();
         for (i, arg) in args.iter().enumerate() {
@@ -863,6 +905,15 @@ impl X64CodeGen {
         self.current_alloc.as_ref().map(|a| a.loc(vreg))
     }
 
+    /// String representation of a VReg's current location
+    fn vreg_str(&self, vreg: &VReg) -> String {
+        match self.dst_loc(*vreg) {
+            Some(Location::Reg(r)) => format!("%{}", r.name()),
+            Some(Location::Spill(off)) => format!("-{}(%rbp)", off),
+            None => format!("%v{}", vreg.0),
+        }
+    }
+
     /// Get the location of an operand (if it's a VReg).
     fn operand_loc(&self, vreg: VReg) -> Option<Location> {
         self.dst_loc(vreg)
@@ -923,6 +974,53 @@ impl X64CodeGen {
                     reg.name()
                 ));
             }
+        }
+    }
+
+    /// Load an operand into an XMM register (for SIMD operations).
+    /// Uses movapd for VReg/stack operands, movsd for scalar floats.
+    fn gen_operand_to_xmm(&mut self, op: &Operand, reg: PhysReg) {
+        let xmm_name = reg.name();
+        match op {
+            Operand::ImmF(bits) => {
+                let label = self.alloc_float_const(*bits);
+                self.wl(&format!("    movsd {}(%rip), %{}", label, xmm_name));
+            }
+            Operand::VReg(vr) => {
+                let loc = self.dst_loc(*vr);
+                match loc {
+                    Some(Location::Reg(r)) => {
+                        // GP reg → XMM via movq
+                        self.wl(&format!("    movq %{}, %{}", r.name(), xmm_name));
+                    }
+                    Some(Location::Spill(off)) => {
+                        self.wl(&format!("    movapd -{}(%rbp), %{}", off, xmm_name));
+                    }
+                    None => {
+                        self.wl(&format!("    # operand {} unallocated for XMM", vr));
+                    }
+                }
+            }
+            Operand::Slot(slot) => {
+                self.wl(&format!("    movapd -{}(%rbp), %{}", slot.0, xmm_name));
+            }
+            _ => {
+                // Fallback: load via GP reg then move to XMM
+                self.gen_operand_to_reg(op, PhysReg::Rax);
+                self.wl(&format!("    movq %rax, %{}", xmm_name));
+            }
+        }
+    }
+
+    /// String representation of an operand for inline comments
+    fn op_str(&self, op: &Operand) -> String {
+        match op {
+            Operand::ImmI(v) => format!("${}", v),
+            Operand::ImmF(bits) => format!("f64:0x{:016x}", bits),
+            Operand::ImmStr(s) => format!("\"{}\"", s),
+            Operand::ImmNull => "null".to_string(),
+            Operand::VReg(vr) => format!("%v{}", vr.0),
+            Operand::Slot(slot) => format!("slot({})", slot.0),
         }
     }
 

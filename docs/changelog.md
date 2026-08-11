@@ -1,6 +1,110 @@
 # Pledge Language Changelog
 
-## [Unreleased] — Phase 5C: AI/ML
+## [Unreleased] — Phase 2: Safety (Complete) + Documentation Update
+
+### Phase 2A — Region Inference
+- **AST**: `Stmt::RegionBlock { name, body }` for `region r { ... }` blocks
+- **Lexer/Parser**: `region` keyword, region block parsing
+- **Typechecker**: region stack tracking, variable-to-region mapping, use-after-free detection, double-free detection, dangling pointer detection, region escape detection
+- **IR**: `Region` enum (Stack, Heap, Static, Named), `RegionRef` in PIR (`NewRegion`, `FreeRegion`, `AllocaIn`)
+- **Tests**: `tests/regions/test_region_basic.p`, `test_region_nested.p`, `test_region_escape.p` (3/3 pass)
+
+### Phase 2B — Effect System
+- **IR**: `Effect` enum expanded with `Net`, `Spawn`, `Pure` (in addition to `Alloc`, `IO`, `Diverge`, `Read`, `Write`)
+- **Parser**: `!IO`, `!{IO, Net}`, `!{}` (pure) syntax in function signatures
+- **Typechecker**: effect inference (fixpoint over call graph), effect checking (under-declaration errors), `has_effect_annotation` field on `Func`
+- **Optimizer**: `is_pure` and `has_side_effects` in `opt.rs` leverage effect info for DCE/CSE
+- **Effect handlers**: `handle { body } with { Effect.op(args) => handler }` and `do Effect.op(args)` syntax (AST, lexer, parser, typechecker)
+- **Tests**: 7 tests — annotations, multi-effects, pure, under-declaration, pure violation, handlers, propagation (7/7 pass)
+
+### Phase 2C — Capability Security (with Elision)
+- **Capability elision**: all capability checks are compile-time only; `caps_for_call` in `pir.rs` returns empty `CapSet` for all calls, eliminating runtime capability overhead
+- **Typechecker**: `cap_verified` and `current_func_name` fields track verified functions
+- **Tests**: 4 tests — grant IO, deny IO, propagation, deny propagation (4/4 pass)
+
+### Phase 2D — Bounds Safety
+- **Runtime bounds checking**: Vec/array/string indexing checked in debug mode
+- **Integer overflow checking**: debug mode panics on overflow, `--release` wraps
+- **Division by zero detection**: runtime panic in debug mode
+- **Option::unwrap panics on None**: calls `p_panic`
+- **Tests**: 9 tests — OOB vec get/set, overflow add/mul/sub, div-by-zero, empty vec first/last, unwrap none (9/9 pass)
+
+### Documentation Update
+- **README.md**: Updated status to Phase 1+2 complete, test counts (87 .p files, 8/8 harness, 85/85 unit), new feature table entries (type aliases, match guards/ranges, trait assoc/default/objects, inline asm, effect annotations, region blocks, capability elision, bounds checking, bare-metal mode), updated CLI commands (pir, opt, codegen, emit --bare), updated project structure (25 source files, 8 stdlib modules), updated roadmap
+- **docs/roadmap.md**: Updated Phase 3C (ADTs, match guards/ranges, type aliases, SIMD marked done), Phase 4A (PIR L1/L2/L3 done), Phase 4B (effect-based elision, capability elision, peephole done), Phase 4C (ELF64, peephole, flat binary done), Phase 4D (ELF output done)
+- **docs/architecture.md**: Updated to v0.5.0, added PIR optimizer, ELF64, WASM, comptime, and bare-metal to pipeline diagram
+- **features.md**: Updated all sections with Phase 2 features, added Safety section, updated Concurrency and Advanced sections
+- **TEST.md**: Updated test summary table (8/8 harness, 85/85 unit, 87 .p files)
+
+### Test Results
+- **Harness tests**: 8/8 pass (interpreter, PE, C codegen, golden files, safety, capability, effect, region)
+- **Unit tests**: 85/85 pass (elf64: 19, pir: 9, peephole: 20, codegen_x64: 10, opt: 9, regalloc: 13, tensor: 7)
+- **Total .p test files**: 87 (64 root + 9 safety + 4 capability + 7 effects + 3 regions)
+
+## [Previous] — Phase 5A: Bare Metal
+
+### Inline Assembly (`asm!()`) — 5A.1
+- **AST**: `Expr::Asm` variant with template string, inputs, outputs, and clobbers
+- **IR**: `Inst::Asm` instruction with operand handling
+- **Parser**: `asm!("template" : outputs : inputs : clobbers)` syntax (Rust-style)
+- **Typechecker**: infers result type from output operands (defaults to `void`)
+- **Lowerer**: lowers to `Inst::Asm` with free variable collection for operands
+- **Interpreter**: prints asm template and input/output counts (simulation mode)
+- **PE codegen**: emits raw x86-64 bytes from asm template (nop, hlt, cli, sti, mfence, sfence, lfence, pause, etc.)
+- **C codegen**: emits `__asm__()` blocks
+- **WASM codegen**: panics (inline asm not supported in WASM)
+- **Test**: `tests/test_asm.p` — 7 test cases covering nop, multi-instruction, inputs, outputs, in+out, fences, pause
+
+### No-OS / Bare-Metal Mode (`--bare` flag) — 5A.2
+- **`pledgec emit <file.p> --bare -o output.bin`**: produces a flat binary (no PE headers, no IAT, no OS calls)
+- **Skips stdlib**: user code is compiled without `stdlib/core.p` — only built-in language features
+- **`pe::generate_flat_binary`**: generates `[code][padding][rdata]` layout, load address 0x10000
+- **Bare entry point**: calls `main()`, then `hlt; jmp -3` (infinite halt loop) — no `ExitProcess`
+- **Runtime stubs skipped**: no print/malloc/vec stubs (user must use inline asm for I/O)
+- **Test**: `tests/test_bare.p` — minimal bare-metal program using `asm!("hlt")`
+
+### Interrupt Handler Support — 5A.3
+- **`interrupt pf` keyword**: marks a function as an interrupt handler
+- **AST**: `Func::is_interrupt` field, `TokenKind::Interrupt` token
+- **Parser**: `interrupt pf name() { ... }` syntax
+- **IR**: `IrFunction::is_interrupt` field propagated from AST
+- **PE codegen**: interrupt handlers save all 14 GP registers on entry, restore on exit, use `iret` instead of `ret`
+- **Builtins**: `p_cli()`, `p_sti()`, `p_hlt()`, `p_lidt(ptr)`, `p_idt_set_entry(vec, handler)`, `p_inb(port)`, `p_outb(port, val)`
+- **Bare mode**: emits real x86 instructions (cli, sti, hlt, lidt, in/out)
+- **Normal mode**: emits `ud2` (trap) since OS calls are meaningless
+- **Test**: `tests/test_interrupt.p` — interrupt handler + cli/sti/hlt builtins
+
+### MMU/Page Table Management — 5A.4
+- **Control register access**: `p_cr0_read()`, `p_cr0_write(val)`, `p_cr3_read()`, `p_cr3_write(val)`, `p_cr4_read()`, `p_cr4_write(val)`
+- **TLB management**: `p_invlpg(addr)` — invalidate TLB entry
+- **Page mapping**: `p_page_map(page_table, virt, phys, flags)`, `p_page_unmap(page_table, virt)`
+- **Physical memory**: `p_phys_read64(addr)`, `p_phys_write64(addr, val)`
+- **Bare mode**: emits real x86 instructions (mov cr0/cr3/cr4, invlpg)
+- **Test**: `tests/test_mmu.p` — CR0/CR3/CR4 read, TLB invalidation, page map/unmap
+
+### Boot Code Generation — 5A.5
+- **`pledgec emit <file.p> --boot -o output.bin`**: produces a Multiboot2-compatible kernel binary
+- **Multiboot2 header**: magic 0xE85250D6, architecture 0 (i386), checksum, end tag — at offset 0
+- **`pe::generate_boot_binary`**: generates `[mb2 header][boot code + main code][padding][rdata]` layout
+- **Boot entry point**: sets up stack at 0x90000, calls `main()`, then halt loop
+- **Load address**: 0x100000 (1MB — typical kernel load address for GRUB)
+- **Test**: `tests/test_boot.p` — minimal kernel with cli, CR0 read, hlt
+
+### Interpreter Fixes (Phase 5C/5D restoration)
+- **Pre-register function signatures**: lowerer now pre-registers all function return types before lowering bodies, fixing type inference for calls to functions defined later in the file
+- **`arg_string` helper**: interpreter can extract strings from both `Value::Str` and `Value::Ptr` (null-terminated string in memory)
+- **JSON builtins**: all `p_json_*` builtins now use `arg_string` for robust string argument handling
+- **`p_json_string`**: fixed to serialize a plain string as a JSON string literal (with quotes + escaping), not parse it
+- **`p_http_parse_request`**: rewrote to actually parse HTTP request lines, headers, and body into a JSON string with proper escaping
+- **`p_http_build_response`**: uses `arg_string` for body argument
+- **Opaque store/load**: `Value::Tensor`, `Value::Json`, `Value::Dyn` now stored in interpreter side-table
+
+### ELF64 Object File Emitter (`elf64.rs`) — New Module
+- **ELF64 relocatable object file**: emits `.o` files with .text, .rodata, .symtab, .strtab, .rela sections
+- **`--elf <output>` flag**: on `codegen` command, writes ELF64 object file
+- **Linkable**: output can be linked with `ld`, `lld`, or `gold`
+
+## [Previous] — Phase 5C: AI/ML
 
 ### Tensor Type (`tensor.rs` + `stdlib/tensor.p`) — New Module
 - **N-dimensional arrays with stride info**: shape, strides, flat f64 storage

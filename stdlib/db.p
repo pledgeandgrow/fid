@@ -30,28 +30,28 @@ cap Database {
 /// In-memory database stub for testing.
 /// Stores rows in a simple format. Supports basic SELECT/INSERT.
 struct MemoryDB {
-    handle: i64,  // opaque handle to native storage
+    dbh: i64,  // opaque handle to native storage
 }
 
 impl MemoryDB {
     pub pf new() -> MemoryDB {
         // Create a native in-memory store
-        pv handle = p_db_mem_open();
-        ret MemoryDB { handle: handle };
+        pv dbh = p_db_mem_open();
+        ret MemoryDB { dbh: dbh };
     }
 }
 
 impl Database for MemoryDB {
     pub pf query(self: MemoryDB, sql: str) -> str {
-        ret p_db_mem_query(self.handle, sql);
+        ret p_db_mem_query(self.dbh, sql);
     }
 
     pub pf exec(self: MemoryDB, sql: str) -> i64 {
-        ret p_db_mem_exec(self.handle, sql);
+        ret p_db_mem_exec(self.dbh, sql);
     }
 
     pub pf close(self: MemoryDB) {
-        p_db_mem_close(self.handle);
+        p_db_mem_close(self.dbh);
     }
 }
 

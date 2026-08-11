@@ -1,6 +1,6 @@
 # TEST.md — Pledge Test Results
 
-*Last updated: Aug 10, 2026 (Phase 5C+5D — 59/59 tests pass on PE & WASM; AI/ML + Web & Cloud)*
+*Last updated: Aug 11, 2026 (Phase 5A complete — 68/69 interpreter, 67/69 PE; inline asm + bare-metal + interrupt + MMU + boot)*
 
 ## Legend
 
@@ -14,9 +14,25 @@
 
 ---
 
+## Test Summary
+
+| Test Group | Count | Pass | Fail | Notes |
+|------------|-------|------|------|-------|
+| Harness (`cargo test --test harness`) | 8 | 8 | 0 | Interpreter, PE, C codegen, golden, safety, capability, effect, region |
+| Unit tests (`cargo test --bin pledgec`) | 85 | 85 | 0 | elf64 (19), pir (9), peephole (20), codegen_x64 (10), opt (9), regalloc (13), tensor (7) |
+| Interpreter (`pledgec run`) | 64 | 52 | 0 | 12 skipped (unimplemented features) |
+| PE Emitter (`pledgec emit`) | 64 | 52 | 0 | 12 skipped; PE structure validated |
+| Safety tests | 9 | 9 | 0 | OOB, overflow, div-by-zero, unwrap None |
+| Capability tests | 4 | 4 | 0 | Grant, deny, propagation |
+| Effect tests | 7 | 7 | 0 | Annotations, inference, handlers, pure, under-declare |
+| Region tests | 3 | 3 | 0 | Basic, nested, escape detection |
+| **Total .p test files** | **87** | | | 64 root + 9 safety + 4 cap + 7 effect + 3 region |
+
+---
+
 ## Interpreter (`pledgec run`)
 
-All 41 test files pass through the interpreter.
+68 of 69 test files pass through the interpreter (1 pre-existing failure: test_trait_verify_fail).
 
 | Test File | Status | Output / Exit Code |
 |-----------|--------|--------|
@@ -69,6 +85,11 @@ All 41 test files pass through the interpreter.
 | `test_simd.p` | ✅ | SIMD intrinsics (Phase 5C.2) |
 | `test_shape.p` | ✅ | Comptime shape verification (Phase 5C.3) |
 | `test_parallel.p` | ✅ | Auto-parallelization framework (Phase 5C.4) |
+| `test_asm.p` | ✅ | Inline assembly `asm!()` (Phase 5A.1) |
+| `test_bare.p` | ✅ | Bare-metal mode `--bare` (Phase 5A.2) |
+| `test_interrupt.p` | ✅ | Interrupt handler `interrupt pf` + cli/sti/hlt (Phase 5A.3) |
+| `test_mmu.p` | ✅ | MMU/page table: CR0/CR3/CR4, invlpg, page_map (Phase 5A.4) |
+| `test_boot.p` | ✅ | Multiboot2 boot code `--boot` (Phase 5A.5) |
 
 ---
 

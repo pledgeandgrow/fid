@@ -1,0 +1,16 @@
+// Test: Boot code generation — Phase 5A.5
+// Tests --boot flag: multiboot2-compatible kernel binary.
+// This program is a minimal kernel that can be loaded by GRUB.
+
+pf main() {
+    // Set up a simple IDT (in a real kernel, this would be more complex)
+    p_cli();
+
+    // Read CR0 to check if paging is enabled
+    pv cr0 = p_cr0_read();
+
+    // Halt the CPU
+    p_hlt();
+
+    ret 0;
+}

@@ -1,6 +1,6 @@
 # Pledge Language — Feature Status
 
-*Last updated: Aug 10, 2026 (41/41 tests pass across all backends)*
+*Last updated: Aug 11, 2026 (Phase 1+2 complete, 8/8 harness tests, 76/85 unit tests, 87 .p test files)*
 
 ## Legend
 
@@ -16,11 +16,18 @@
 |---------|--------|-------|
 | Lexer (token.rs) | ✅ | All Pledge keywords (pf, pv, pc, ret, etc.) |
 | Parser (parser.rs) | ✅ | Produces AST from tokens |
-| Type Checker (typechecker.rs) | ✅ | Validates types, capabilities |
+| Type Checker (typechecker.rs) | ✅ | Validates types, capabilities, effects, regions, traits |
 | IR Lowering (lower.rs) | ✅ | AST → typed SSA IR with effects/regions |
 | IR Interpreter (interp.rs) | ✅ | Runs IR directly via `pledgec run` |
-| PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables, all core features working |
-| C Codegen (codegen_c.rs) | ✅ | Generates C code, 41/41 tests match interpreter output |
+| PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables + flat binary (bare-metal mode) |
+| C Codegen (codegen_c.rs) | ✅ | Generates C code, 38+ tests match interpreter output |
+| PIR (pir.rs) | ✅ | PIR L1/L2/L3, `pledgec pir` command |
+| Optimizer (opt.rs) | ✅ | Const fold, CSE, DCE, inline, unroll, TCO, effect-based elision |
+| Peephole (peephole.rs) | ✅ | Redundant moves, zero idioms, branch threading, dead store |
+| Register Allocator (regalloc.rs) | ✅ | Linear scan allocator |
+| ELF64 Emitter (elf64.rs) | ⚠️ | Headers + symbol table work, instruction encoding WIP |
+| WASM Backend (wasm.rs) | ✅ | PIR → WASM binary, `pledgec codegen --target wasm` |
+| Comptime (comptime.rs) | ✅ | Compile-time evaluation, reflection, f-string interpolation |
 
 ## CLI Commands
 
@@ -34,10 +41,14 @@
 | `pledgec emit <file> -o <exe>` | ✅ | Emits native PE executable |
 | `pledgec ccompile <file> -o <exe>` | ✅ | C codegen → gcc/clang → executable |
 | `pledgec build <file> -o <exe>` | ✅ | MASM pipeline (requires ml64.exe) |
-| `pledgec test` | ✅ | Runs all 41 tests across all backends |
+| `pledgec test` | ✅ | Runs all tests across all backends |
 | `pledgec repl` | ✅ | Interactive REPL |
 | `pledgec verify <file>` | ✅ | IR verification pass |
 | `pledgec sourcemap <file>` | ✅ | Source map output |
+| `pledgec pir <file> [--opt]` | ✅ | PIR output (L1/L2/L3) with optional optimization |
+| `pledgec opt <file>` | ✅ | Run PIR optimizer, print statistics |
+| `pledgec codegen <file> --target <arch>` | ✅ | x86-64 or ARM64 assembly output |
+| `pledgec emit <file> --bare -o <bin>` | ✅ | Bare-metal flat binary (no stdlib, no PE headers) |
 
 ## Language Features — Interpreter (`pledgec run`)
 
@@ -135,7 +146,9 @@
 | `&` references | ✅ | Immutable borrows |
 | `&mut` references | ✅ | Mutable borrows |
 | `defer` | ✅ | Go-style deferred cleanup |
-| Region inference | ⚠️ | IR tracks regions, not fully enforced |
+| Region blocks `region r { }` | ✅ | Compile-time region tracking, use-after-free detection |
+| Region escape detection | ✅ | Compile-time dangling pointer detection |
+| Region inference | ✅ | Auto-detect regions via region_stack tracking in typechecker |
 
 ### Modules & Imports
 
@@ -155,9 +168,10 @@
 | Feature | Status | Notes |
 |---------|--------|-------|
 | `cap` (capability/trait) declarations | ✅ | |
-| Capability grants | ✅ | |
-| Capability denial | ✅ | |
-| Transitive capabilities | ✅ | |
+| Capability grants | ✅ | `use ... with { IO, FS, Net, Spawn }` |
+| Capability denial | ✅ | Compile-time error if not granted |
+| Transitive capabilities | ✅ | Propagation through call graph |
+| Capability elision | ✅ | Zero runtime overhead — all checks compile-time |
 
 ### Error Handling
 
@@ -172,18 +186,54 @@
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `async` / `await` | ❌ | Not yet implemented (Phase 4+) |
-| `spawn` | ❌ | Not yet implemented |
-| Effect handlers | ❌ | Not yet implemented (Phase 4+) |
+| `async` / `await` | ❌ | Parsed, not yet implemented (Phase 4+) |
+| `spawn` | ❌ | Parsed, not yet implemented |
+| Effect handlers `handle { do } with` | ⚠️ | Syntax parses and runs; full continuation semantics pending |
+| Effect annotations `!IO`, `!{}` | ✅ | Compile-time effect inference and checking |
+| Effect propagation | ✅ | Fixpoint iteration over call graph |
+
+### Safety (Phase 2)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Bounds checking (Vec/array/string) | ✅ | Runtime in debug mode, compile-time for constant indices |
+| Integer overflow checking | ✅ | Debug mode panics, release mode wraps (`--release`) |
+| Division by zero detection | ✅ | Runtime panic in debug mode |
+| `Option::unwrap` panics on None | ✅ | Calls `p_panic` |
+| Effect system (annotations + inference) | ✅ | `!IO`, `!Net`, `!Spawn`, `!Alloc`, `!{}` for pure |
+| Effect checking (under-declaration) | ✅ | Compile-time error if inferred > declared |
+| Region use-after-free detection | ✅ | Compile-time via `freed_regions` tracking |
+| Region escape detection | ✅ | Compile-time via `region_stack` tracking |
+| Capability elision | ✅ | Zero runtime overhead, all checks compile-time |
 
 ### Advanced
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `comptime` blocks | ❌ | Not yet implemented |
+| `comptime` blocks | ✅ | `comptime <expr>`, `comptime { block }`, reflection |
+| `comptime` reflection | ✅ | type_name, is_struct, is_enum, field_names, field_types, enum_variants |
+| `comptime` functions | ✅ | `comptime pf func()` — evaluated at compile time |
+| Match guards | ✅ | `pattern if cond => body` |
+| Match range patterns | ✅ | `1..=5 => body` |
+| Trait associated types | ✅ | `ty Item;` in trait, `ty Item = T;` in impl |
+| Trait default methods | ✅ | Default body in trait, inherited by impls |
+| Trait objects (`dyn Trait`) | ✅ | Dynamic dispatch via vtable |
+| Trait impl verification | ✅ | Check all required methods implemented |
+| Type aliases (`ty`) | ✅ | `ty X = T` — parsed, typechecked, lowered |
+| Inline assembly (`asm!`) | ✅ | Hardware-specific instructions |
+| Bare-metal mode (`--bare`) | ✅ | No stdlib, flat binary output |
+| SIMD types | ✅ | `stdlib/simd.p` — elementwise ops, dot, sum, scale |
+| Tensor type | ✅ | `stdlib/tensor.p` — n-d arrays, matmul, relu, softmax |
+| JSON parsing | ✅ | `stdlib/json.p` — parse, stringify, get, at |
+| HTTP server | ✅ | `stdlib/http.p` — socket + HTTP parsing |
+| Database framework | ✅ | `stdlib/db.p` — cap Database trait, in-memory KV |
+| Parallel operations | ✅ | `stdlib/parallel.p` — par_map, par_sum, par_dot |
+| Const generics | ⚠️ | `ArrayConst` type variant exists, monomorphization pending |
+| GATs | ❌ | Not yet parsed |
 | Hot reload | ❌ | Not yet implemented |
 | `#[test]` attribute | ❌ | Parsed but not executed |
 | `#[derive]` | ❌ | Not yet implemented |
+| C FFI | ❌ | Not yet implemented (Phase 3D) |
 
 ---
 

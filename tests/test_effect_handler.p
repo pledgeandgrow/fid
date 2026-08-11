@@ -1,0 +1,28 @@
+// Test effect handlers — Phase 2B.6
+// Effect handlers replace async/await. do Effect.op(args) inside handle { } with { } blocks.
+
+pf main() -> i64 {
+    pv result = 0;
+    
+    handle {
+        // Do an effect operation — the handler will be called
+        do IO.print(42);
+    } with {
+        IO.print(x) => {
+            print(x);
+            print("\n");
+        }
+    }
+    
+    // Test with a custom effect
+    handle {
+        do Math.compute(10, 20);
+    } with {
+        Math.compute(a, b) => {
+            print(a + b);
+            print("\n");
+        }
+    }
+    
+    ret 0;
+}
