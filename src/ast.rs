@@ -294,6 +294,7 @@ pub enum Stmt {
         ty: Option<Type>,
         expr: Expr,
         is_mut: bool,
+        is_persist: bool,
         line: usize,
     },
     Assign {
@@ -363,8 +364,18 @@ pub enum Stmt {
     /// Region block: `region r { body }` — creates a named region,
     /// allocates within it, and frees it at the end of the block.
     /// References to region-allocated data cannot escape the block.
+    /// Optional `budget` specifies a compile-time memory budget in bytes.
+    /// `region r with budget(4096) { body }` — compile error if exceeded.
     RegionBlock {
         name: String,
+        budget: Option<u64>,
+        body: Vec<Stmt>,
+        line: usize,
+    },
+    /// Sandbox block: `sandbox { body }` — strips all capabilities for the
+    /// scope. Any IO/FS/Net/Spawn call inside is a compile error.
+    /// The body is otherwise a normal block — safety is compile-time only.
+    Sandbox {
         body: Vec<Stmt>,
         line: usize,
     },
@@ -412,6 +423,7 @@ impl Stmt {
             | Stmt::Handle { line, .. }
             | Stmt::Do { line, .. }
             | Stmt::RegionBlock { line, .. }
+            | Stmt::Sandbox { line, .. }
             | Stmt::ComptimeGen { line, .. } => *line,
         }
     }

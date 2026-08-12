@@ -417,6 +417,9 @@ impl CCodeGen {
             ("p_to_str_bool", &[Bool]),
             ("p_to_str_float", &[F64]),
             ("p_to_str_map", &[p()]),
+            ("p_float_to_str", &[F64]),
+            ("p_bool_to_str", &[Bool]),
+            ("p_vec_to_str", &[p()]),
             ("p_str_concat", &[p(), p()]),
             ("p_print", &[I64]),
             ("p_print_str", &[p()]),
@@ -800,6 +803,9 @@ impl CCodeGen {
         wln!(self, "char* p_to_str_bool(bool val);");
         wln!(self, "char* p_to_str_float(double val);");
         wln!(self, "char* p_to_str_map(PMap* m);");
+        wln!(self, "char* p_float_to_str(double val);");
+        wln!(self, "char* p_bool_to_str(bool val);");
+        wln!(self, "char* p_vec_to_str(PVec* v);");
         wln!(self, "char* p_str_concat(const char* a, const char* b);");
         wln!(self, "void p_print(int64_t val);");
         wln!(self, "void p_print_str(const char* s);");
@@ -1607,6 +1613,14 @@ impl CCodeGen {
                     }
                 }
             }
+            Inst::PersistLoad { default, .. } => {
+                // Persistent load — just use the default value (no persistence in C backend)
+                let d = self.val_name(*default);
+                wln!(self, "    {} = {};", dst, d);
+            }
+            Inst::PersistSave { .. } => {
+                // Persistent save — no-op in C backend
+            }
             Inst::Panic { message, .. } => {
                 wln!(self, "    fprintf(stderr, \"Panic: {}\\n\"); abort();", message);
             }
@@ -1971,6 +1985,10 @@ impl CCodeGen {
         wln!(self, "    snprintf(buf, 32, \"%g\", val);");
         wln!(self, "    return buf;");
         wln!(self, "}}");
+        // Aliases for the new naming convention used by fstring lowering
+        wln!(self, "char* p_float_to_str(double val) {{ return p_to_str_float(val); }}");
+        wln!(self, "char* p_bool_to_str(bool val) {{ return p_to_str_bool(val); }}");
+        wln!(self, "char* p_vec_to_str(PVec* v) {{ return p_to_str_vec(v); }}");
 
         // ─── Socket builtins (native HTTP server, Phase 5D) ───
         wln!(self, "");

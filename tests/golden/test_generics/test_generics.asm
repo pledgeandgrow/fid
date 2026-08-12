@@ -1,0 +1,1165 @@
+    .text
+
+    .globl Option_is_none
+    .type Option_is_none, @function
+Option_is_none:
+    pushq %rbp
+    movq %rsp, %rbp
+.LOption_is_none_bb0:
+    movq %rsi, %rax
+    movq (%rax), %rcx
+    movq $0, %rax
+    movq %rcx, %rdx
+    cmpq %rax, %rdx
+    sete %al
+    movzbq %al, %rdx
+    movq %rdx, %rax
+    testq %rax, %rax
+    jne .LOption_is_none_bb2
+    jmp .LOption_is_none_bb3
+.LOption_is_none_bb1:
+    movq $0, %rax
+    jmp .LOption_is_none_epilogue
+.LOption_is_none_bb2:
+    movq %rsi, %rax
+    addq $8, %rax
+    movq (%rax), %rcx
+    movq $0, %rax
+    jmp .LOption_is_none_epilogue
+.LOption_is_none_bb3:
+    movq %rsi, %rax
+    movq (%rax), %rcx
+    movq $1, %rax
+    movq %rcx, %rdx
+    cmpq %rax, %rdx
+    sete %al
+    movzbq %al, %rdx
+    movq %rdx, %rax
+    testq %rax, %rax
+    jne .LOption_is_none_bb4
+    jmp .LOption_is_none_bb5
+.LOption_is_none_bb4:
+    movq $1, %rax
+    jmp .LOption_is_none_epilogue
+.LOption_is_none_bb5:
+    jmp .LOption_is_none_bb1
+.LOption_is_none_epilogue:
+    leave
+    ret
+    .size Option_is_none, .-Option_is_none
+
+    .globl Option_is_some
+    .type Option_is_some, @function
+Option_is_some:
+    pushq %rbp
+    movq %rsp, %rbp
+.LOption_is_some_bb0:
+    movq %rsi, %rax
+    movq (%rax), %rcx
+    movq $0, %rax
+    movq %rcx, %rdx
+    cmpq %rax, %rdx
+    sete %al
+    movzbq %al, %rdx
+    movq %rdx, %rax
+    testq %rax, %rax
+    jne .LOption_is_some_bb2
+    jmp .LOption_is_some_bb3
+.LOption_is_some_bb1:
+    movq $0, %rax
+    jmp .LOption_is_some_epilogue
+.LOption_is_some_bb2:
+    movq %rsi, %rax
+    addq $8, %rax
+    movq (%rax), %rcx
+    movq $1, %rax
+    jmp .LOption_is_some_epilogue
+.LOption_is_some_bb3:
+    movq %rsi, %rax
+    movq (%rax), %rcx
+    movq $1, %rax
+    movq %rcx, %rdx
+    cmpq %rax, %rdx
+    sete %al
+    movzbq %al, %rdx
+    movq %rdx, %rax
+    testq %rax, %rax
+    jne .LOption_is_some_bb4
+    jmp .LOption_is_some_bb5
+.LOption_is_some_bb4:
+    movq $0, %rax
+    jmp .LOption_is_some_epilogue
+.LOption_is_some_bb5:
+    jmp .LOption_is_some_bb1
+.LOption_is_some_epilogue:
+    leave
+    ret
+    .size Option_is_some, .-Option_is_some
+
+    .globl Option_map
+    .type Option_map, @function
+Option_map:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $48, %rsp
+    pushq %rbx
+    movq %rcx, -40(%rbp)
+.LOption_map_bb0:
+    movq %rdx, %rax
+    movq (%rax), %rcx
+    movq $0, %rax
+    movq %rcx, %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rbx
+    movq %rbx, %rax
+    testq %rax, %rax
+    jne .LOption_map_bb2
+    jmp .LOption_map_bb3
+.LOption_map_bb1:
+    jmp .LOption_map_epilogue
+.LOption_map_bb2:
+    movq %rdx, %rax
+    addq $8, %rax
+    movq (%rax), %rbx
+    leaq -16(%rbp), %rax
+    movq $0, %r8
+    leaq -16(%rbp), %r9
+    movq %r8, %rax
+    movq %rax, (%r9)
+    movq %rbx, %r8
+    addq -40(%rbp), %r8
+    leaq -16(%rbp), %rbx
+    addq $8, %rbx
+    movq %r8, %rax
+    movq %rax, (%rbx)
+    leaq -16(%rbp), %rax
+    movq %rdi, %rbx
+    movq (%rax), %r8
+    movq %r8, %rax
+    movq %rax, (%rbx)
+    leaq -16(%rbp), %rax
+    addq $8, %rax
+    movq %rdi, %rbx
+    addq $8, %rbx
+    movq (%rax), %r8
+    movq %r8, %rax
+    movq %rax, (%rbx)
+    jmp .LOption_map_epilogue
+.LOption_map_bb3:
+    movq %rdx, %rax
+    movq (%rax), %rbx
+    movq $1, %rax
+    movq %rbx, %r8
+    cmpq %rax, %r8
+    sete %al
+    movzbq %al, %r8
+    movq %r8, %rax
+    testq %rax, %rax
+    jne .LOption_map_bb4
+    jmp .LOption_map_bb5
+.LOption_map_bb4:
+    leaq -32(%rbp), %rax
+    movq $1, %rbx
+    leaq -32(%rbp), %r8
+    movq %rbx, %rax
+    movq %rax, (%r8)
+    leaq -32(%rbp), %rax
+    movq %rdi, %rbx
+    movq (%rax), %r8
+    movq %r8, %rax
+    movq %rax, (%rbx)
+    leaq -32(%rbp), %rax
+    addq $8, %rax
+    movq %rdi, %rbx
+    addq $8, %rbx
+    movq (%rax), %r8
+    movq %r8, %rax
+    movq %rax, (%rbx)
+    jmp .LOption_map_epilogue
+.LOption_map_bb5:
+    jmp .LOption_map_bb1
+.LOption_map_epilogue:
+    popq %rbx
+    leave
+    ret
+    .size Option_map, .-Option_map
+
+    .globl Option_unwrap
+    .type Option_unwrap, @function
+Option_unwrap:
+    pushq %rbp
+    movq %rsp, %rbp
+    pushq %rbx
+.LOption_unwrap_bb0:
+    movq %rsi, %rax
+    movq (%rax), %rcx
+    movq $0, %rax
+    movq %rcx, %rdx
+    cmpq %rax, %rdx
+    sete %al
+    movzbq %al, %rdx
+    movq %rdx, %rax
+    testq %rax, %rax
+    jne .LOption_unwrap_bb2
+    jmp .LOption_unwrap_bb3
+.LOption_unwrap_bb1:
+    movq $0, %rax
+    jmp .LOption_unwrap_epilogue
+.LOption_unwrap_bb2:
+    movq %rsi, %rax
+    addq $8, %rax
+    movq (%rax), %rcx
+    movq %rcx, %rax
+    jmp .LOption_unwrap_epilogue
+.LOption_unwrap_bb3:
+    movq %rsi, %rax
+    movq (%rax), %rcx
+    movq $1, %rax
+    movq %rcx, %rdx
+    cmpq %rax, %rdx
+    sete %al
+    movzbq %al, %rdx
+    movq %rdx, %rax
+    testq %rax, %rax
+    jne .LOption_unwrap_bb4
+    jmp .LOption_unwrap_bb5
+.LOption_unwrap_bb4:
+    leaq .str_0(%rip), %rbx
+    movq %rbx, %rdi
+    call p_panic
+    jmp .LOption_unwrap_bb1
+.LOption_unwrap_bb5:
+    jmp .LOption_unwrap_bb1
+.LOption_unwrap_epilogue:
+    popq %rbx
+    leave
+    ret
+    .size Option_unwrap, .-Option_unwrap
+
+    .globl Option_unwrap_or
+    .type Option_unwrap_or, @function
+Option_unwrap_or:
+    pushq %rbp
+    movq %rsp, %rbp
+    pushq %rbx
+.LOption_unwrap_or_bb0:
+    movq %rsi, %rax
+    movq (%rax), %rcx
+    movq $0, %rax
+    movq %rcx, %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rbx
+    movq %rbx, %rax
+    testq %rax, %rax
+    jne .LOption_unwrap_or_bb2
+    jmp .LOption_unwrap_or_bb3
+.LOption_unwrap_or_bb1:
+    movq $0, %rax
+    jmp .LOption_unwrap_or_epilogue
+.LOption_unwrap_or_bb2:
+    movq %rsi, %rax
+    addq $8, %rax
+    movq (%rax), %rcx
+    movq %rcx, %rax
+    jmp .LOption_unwrap_or_epilogue
+.LOption_unwrap_or_bb3:
+    movq %rsi, %rax
+    movq (%rax), %rcx
+    movq $1, %rax
+    movq %rcx, %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rbx
+    movq %rbx, %rax
+    testq %rax, %rax
+    jne .LOption_unwrap_or_bb4
+    jmp .LOption_unwrap_or_bb5
+.LOption_unwrap_or_bb4:
+    movq %rdx, %rax
+    jmp .LOption_unwrap_or_epilogue
+.LOption_unwrap_or_bb5:
+    jmp .LOption_unwrap_or_bb1
+.LOption_unwrap_or_epilogue:
+    popq %rbx
+    leave
+    ret
+    .size Option_unwrap_or, .-Option_unwrap_or
+
+    .globl Result_err
+    .type Result_err, @function
+Result_err:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $32, %rsp
+    pushq %rbx
+.LResult_err_bb0:
+    movq %rdx, %rax
+    movq (%rax), %rcx
+    movq $0, %rax
+    movq %rcx, %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rbx
+    movq %rbx, %rax
+    testq %rax, %rax
+    jne .LResult_err_bb2
+    jmp .LResult_err_bb3
+.LResult_err_bb1:
+    jmp .LResult_err_epilogue
+.LResult_err_bb2:
+    movq %rdx, %rax
+    addq $8, %rax
+    movq (%rax), %rcx
+    leaq -16(%rbp), %rax
+    movq $1, %rbx
+    leaq -16(%rbp), %r8
+    movq %rbx, %rax
+    movq %rax, (%r8)
+    leaq -16(%rbp), %rax
+    movq %rdi, %rbx
+    movq (%rax), %r8
+    movq %r8, %rax
+    movq %rax, (%rbx)
+    leaq -16(%rbp), %rax
+    addq $8, %rax
+    movq %rdi, %rbx
+    addq $8, %rbx
+    movq (%rax), %r8
+    movq %r8, %rax
+    movq %rax, (%rbx)
+    jmp .LResult_err_epilogue
+.LResult_err_bb3:
+    movq %rdx, %rax
+    movq (%rax), %rcx
+    movq $1, %rax
+    movq %rcx, %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rbx
+    movq %rbx, %rax
+    testq %rax, %rax
+    jne .LResult_err_bb4
+    jmp .LResult_err_bb5
+.LResult_err_bb4:
+    movq %rdx, %rax
+    addq $8, %rax
+    movq (%rax), %rbx
+    leaq -32(%rbp), %rax
+    movq $0, %r8
+    leaq -32(%rbp), %r9
+    movq %r8, %rax
+    movq %rax, (%r9)
+    leaq -32(%rbp), %r8
+    addq $8, %r8
+    movq %rbx, %rax
+    movq %rax, (%r8)
+    leaq -32(%rbp), %rax
+    movq %rdi, %rbx
+    movq (%rax), %r8
+    movq %r8, %rax
+    movq %rax, (%rbx)
+    leaq -32(%rbp), %rax
+    addq $8, %rax
+    movq %rdi, %rbx
+    addq $8, %rbx
+    movq (%rax), %r8
+    movq %r8, %rax
+    movq %rax, (%rbx)
+    jmp .LResult_err_epilogue
+.LResult_err_bb5:
+    jmp .LResult_err_bb1
+.LResult_err_epilogue:
+    popq %rbx
+    leave
+    ret
+    .size Result_err, .-Result_err
+
+    .globl Result_is_err
+    .type Result_is_err, @function
+Result_is_err:
+    pushq %rbp
+    movq %rsp, %rbp
+.LResult_is_err_bb0:
+    movq %rsi, %rax
+    movq (%rax), %rcx
+    movq $0, %rax
+    movq %rcx, %rdx
+    cmpq %rax, %rdx
+    sete %al
+    movzbq %al, %rdx
+    movq %rdx, %rax
+    testq %rax, %rax
+    jne .LResult_is_err_bb2
+    jmp .LResult_is_err_bb3
+.LResult_is_err_bb1:
+    movq $0, %rax
+    jmp .LResult_is_err_epilogue
+.LResult_is_err_bb2:
+    movq %rsi, %rax
+    addq $8, %rax
+    movq (%rax), %rcx
+    movq $0, %rax
+    jmp .LResult_is_err_epilogue
+.LResult_is_err_bb3:
+    movq %rsi, %rax
+    movq (%rax), %rcx
+    movq $1, %rax
+    movq %rcx, %rdx
+    cmpq %rax, %rdx
+    sete %al
+    movzbq %al, %rdx
+    movq %rdx, %rax
+    testq %rax, %rax
+    jne .LResult_is_err_bb4
+    jmp .LResult_is_err_bb5
+.LResult_is_err_bb4:
+    movq %rsi, %rax
+    addq $8, %rax
+    movq (%rax), %rcx
+    movq $1, %rax
+    jmp .LResult_is_err_epilogue
+.LResult_is_err_bb5:
+    jmp .LResult_is_err_bb1
+.LResult_is_err_epilogue:
+    leave
+    ret
+    .size Result_is_err, .-Result_is_err
+
+    .globl Result_is_ok
+    .type Result_is_ok, @function
+Result_is_ok:
+    pushq %rbp
+    movq %rsp, %rbp
+.LResult_is_ok_bb0:
+    movq %rsi, %rax
+    movq (%rax), %rcx
+    movq $0, %rax
+    movq %rcx, %rdx
+    cmpq %rax, %rdx
+    sete %al
+    movzbq %al, %rdx
+    movq %rdx, %rax
+    testq %rax, %rax
+    jne .LResult_is_ok_bb2
+    jmp .LResult_is_ok_bb3
+.LResult_is_ok_bb1:
+    movq $0, %rax
+    jmp .LResult_is_ok_epilogue
+.LResult_is_ok_bb2:
+    movq %rsi, %rax
+    addq $8, %rax
+    movq (%rax), %rcx
+    movq $1, %rax
+    jmp .LResult_is_ok_epilogue
+.LResult_is_ok_bb3:
+    movq %rsi, %rax
+    movq (%rax), %rcx
+    movq $1, %rax
+    movq %rcx, %rdx
+    cmpq %rax, %rdx
+    sete %al
+    movzbq %al, %rdx
+    movq %rdx, %rax
+    testq %rax, %rax
+    jne .LResult_is_ok_bb4
+    jmp .LResult_is_ok_bb5
+.LResult_is_ok_bb4:
+    movq %rsi, %rax
+    addq $8, %rax
+    movq (%rax), %rcx
+    movq $0, %rax
+    jmp .LResult_is_ok_epilogue
+.LResult_is_ok_bb5:
+    jmp .LResult_is_ok_bb1
+.LResult_is_ok_epilogue:
+    leave
+    ret
+    .size Result_is_ok, .-Result_is_ok
+
+    .globl Result_ok
+    .type Result_ok, @function
+Result_ok:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $32, %rsp
+    pushq %rbx
+.LResult_ok_bb0:
+    movq %rdx, %rax
+    movq (%rax), %rcx
+    movq $0, %rax
+    movq %rcx, %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rbx
+    movq %rbx, %rax
+    testq %rax, %rax
+    jne .LResult_ok_bb2
+    jmp .LResult_ok_bb3
+.LResult_ok_bb1:
+    jmp .LResult_ok_epilogue
+.LResult_ok_bb2:
+    movq %rdx, %rax
+    addq $8, %rax
+    movq (%rax), %rbx
+    leaq -16(%rbp), %rax
+    movq $0, %r8
+    leaq -16(%rbp), %r9
+    movq %r8, %rax
+    movq %rax, (%r9)
+    leaq -16(%rbp), %r8
+    addq $8, %r8
+    movq %rbx, %rax
+    movq %rax, (%r8)
+    leaq -16(%rbp), %rax
+    movq %rdi, %rbx
+    movq (%rax), %r8
+    movq %r8, %rax
+    movq %rax, (%rbx)
+    leaq -16(%rbp), %rax
+    addq $8, %rax
+    movq %rdi, %rbx
+    addq $8, %rbx
+    movq (%rax), %r8
+    movq %r8, %rax
+    movq %rax, (%rbx)
+    jmp .LResult_ok_epilogue
+.LResult_ok_bb3:
+    movq %rdx, %rax
+    movq (%rax), %rcx
+    movq $1, %rax
+    movq %rcx, %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rbx
+    movq %rbx, %rax
+    testq %rax, %rax
+    jne .LResult_ok_bb4
+    jmp .LResult_ok_bb5
+.LResult_ok_bb4:
+    movq %rdx, %rax
+    addq $8, %rax
+    movq (%rax), %rcx
+    leaq -32(%rbp), %rax
+    movq $1, %rbx
+    leaq -32(%rbp), %r8
+    movq %rbx, %rax
+    movq %rax, (%r8)
+    leaq -32(%rbp), %rax
+    movq %rdi, %rbx
+    movq (%rax), %r8
+    movq %r8, %rax
+    movq %rax, (%rbx)
+    leaq -32(%rbp), %rax
+    addq $8, %rax
+    movq %rdi, %rbx
+    addq $8, %rbx
+    movq (%rax), %r8
+    movq %r8, %rax
+    movq %rax, (%rbx)
+    jmp .LResult_ok_epilogue
+.LResult_ok_bb5:
+    jmp .LResult_ok_bb1
+.LResult_ok_epilogue:
+    popq %rbx
+    leave
+    ret
+    .size Result_ok, .-Result_ok
+
+    .globl Result_unwrap
+    .type Result_unwrap, @function
+Result_unwrap:
+    pushq %rbp
+    movq %rsp, %rbp
+    pushq %rbx
+.LResult_unwrap_bb0:
+    movq %rsi, %rax
+    movq (%rax), %rcx
+    movq $0, %rax
+    movq %rcx, %rdx
+    cmpq %rax, %rdx
+    sete %al
+    movzbq %al, %rdx
+    movq %rdx, %rax
+    testq %rax, %rax
+    jne .LResult_unwrap_bb2
+    jmp .LResult_unwrap_bb3
+.LResult_unwrap_bb1:
+    movq $0, %rax
+    jmp .LResult_unwrap_epilogue
+.LResult_unwrap_bb2:
+    movq %rsi, %rax
+    addq $8, %rax
+    movq (%rax), %rcx
+    movq %rcx, %rax
+    jmp .LResult_unwrap_epilogue
+.LResult_unwrap_bb3:
+    movq %rsi, %rax
+    movq (%rax), %rcx
+    movq $1, %rax
+    movq %rcx, %rdx
+    cmpq %rax, %rdx
+    sete %al
+    movzbq %al, %rdx
+    movq %rdx, %rax
+    testq %rax, %rax
+    jne .LResult_unwrap_bb4
+    jmp .LResult_unwrap_bb5
+.LResult_unwrap_bb4:
+    movq %rsi, %rax
+    addq $8, %rax
+    movq (%rax), %rcx
+    leaq .str_1(%rip), %rbx
+    movq %rbx, %rdi
+    call p_panic
+    jmp .LResult_unwrap_bb1
+.LResult_unwrap_bb5:
+    jmp .LResult_unwrap_bb1
+.LResult_unwrap_epilogue:
+    popq %rbx
+    leave
+    ret
+    .size Result_unwrap, .-Result_unwrap
+
+    .globl Result_unwrap_or
+    .type Result_unwrap_or, @function
+Result_unwrap_or:
+    pushq %rbp
+    movq %rsp, %rbp
+    pushq %rbx
+.LResult_unwrap_or_bb0:
+    movq %rsi, %rax
+    movq (%rax), %rcx
+    movq $0, %rax
+    movq %rcx, %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rbx
+    movq %rbx, %rax
+    testq %rax, %rax
+    jne .LResult_unwrap_or_bb2
+    jmp .LResult_unwrap_or_bb3
+.LResult_unwrap_or_bb1:
+    movq $0, %rax
+    jmp .LResult_unwrap_or_epilogue
+.LResult_unwrap_or_bb2:
+    movq %rsi, %rax
+    addq $8, %rax
+    movq (%rax), %rcx
+    movq %rcx, %rax
+    jmp .LResult_unwrap_or_epilogue
+.LResult_unwrap_or_bb3:
+    movq %rsi, %rax
+    movq (%rax), %rcx
+    movq $1, %rax
+    movq %rcx, %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rbx
+    movq %rbx, %rax
+    testq %rax, %rax
+    jne .LResult_unwrap_or_bb4
+    jmp .LResult_unwrap_or_bb5
+.LResult_unwrap_or_bb4:
+    movq %rsi, %rax
+    addq $8, %rax
+    movq (%rax), %rcx
+    movq %rdx, %rax
+    jmp .LResult_unwrap_or_epilogue
+.LResult_unwrap_or_bb5:
+    jmp .LResult_unwrap_or_bb1
+.LResult_unwrap_or_epilogue:
+    popq %rbx
+    leave
+    ret
+    .size Result_unwrap_or, .-Result_unwrap_or
+
+    .globl abs
+    .type abs, @function
+abs:
+    pushq %rbp
+    movq %rsp, %rbp
+.Labs_bb0:
+    movq $0, %rax
+    movq %rsi, %rcx
+    cmpq %rax, %rcx
+    setl %al
+    movzbq %al, %rcx
+    movq %rcx, %rax
+    testq %rax, %rax
+    jne .Labs_bb1
+    jmp .Labs_bb2
+.Labs_bb1:
+    movq %rsi, %rax
+    negq %rax
+    jmp .Labs_epilogue
+.Labs_bb2:
+    jmp .Labs_bb3
+.Labs_bb3:
+    movq %rsi, %rax
+    jmp .Labs_epilogue
+.Labs_epilogue:
+    leave
+    ret
+    .size abs, .-abs
+
+    .globl allocator_alloc
+    .type allocator_alloc, @function
+allocator_alloc:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $32, %rsp
+    pushq %rbx
+    movq %rdi, -8(%rbp)
+    movq %rsi, -24(%rbp)
+    movq %rdx, -16(%rbp)
+.Lallocator_alloc_bb0:
+    movq -24(%rbp), %rdi
+    movq -16(%rbp), %rsi
+    call p_allocator_alloc
+    movq %rax, %rbx
+    movq %rbx, %rax
+    jmp .Lallocator_alloc_epilogue
+.Lallocator_alloc_epilogue:
+    popq %rbx
+    leave
+    ret
+    .size allocator_alloc, .-allocator_alloc
+
+    .globl allocator_bytes_used
+    .type allocator_bytes_used, @function
+allocator_bytes_used:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $16, %rsp
+    pushq %rbx
+    movq %rdi, -8(%rbp)
+    movq %rsi, -16(%rbp)
+.Lallocator_bytes_used_bb0:
+    movq -16(%rbp), %rdi
+    call p_allocator_stats
+    movq %rax, %rbx
+    movq %rbx, %rax
+    jmp .Lallocator_bytes_used_epilogue
+.Lallocator_bytes_used_epilogue:
+    popq %rbx
+    leave
+    ret
+    .size allocator_bytes_used, .-allocator_bytes_used
+
+    .globl allocator_free
+    .type allocator_free, @function
+allocator_free:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $32, %rsp
+    movq %rdi, -8(%rbp)
+    movq %rsi, -24(%rbp)
+    movq %rdx, -16(%rbp)
+.Lallocator_free_bb0:
+    movq -24(%rbp), %rdi
+    movq -16(%rbp), %rsi
+    call p_allocator_free
+    jmp .Lallocator_free_epilogue
+.Lallocator_free_epilogue:
+    leave
+    ret
+    .size allocator_free, .-allocator_free
+
+    .globl assert
+    .type assert, @function
+assert:
+    pushq %rbp
+    movq %rsp, %rbp
+    pushq %rbx
+.Lassert_bb0:
+    movq %rsi, %rcx
+    testq %rcx, %rcx
+    sete %al
+    movzbq %al, %rax
+    movq %rax, %rcx
+    movq %rcx, %rax
+    testq %rax, %rax
+    jne .Lassert_bb1
+    jmp .Lassert_bb2
+.Lassert_bb1:
+    leaq .str_2(%rip), %rbx
+    # Print: v4 (*u8)
+    movq %rbx, %rdi
+    call p_print_str
+    jmp .Lassert_bb3
+.Lassert_bb2:
+    jmp .Lassert_bb3
+.Lassert_bb3:
+    jmp .Lassert_epilogue
+.Lassert_epilogue:
+    popq %rbx
+    leave
+    ret
+    .size assert, .-assert
+
+    .globl clamp
+    .type clamp, @function
+clamp:
+    pushq %rbp
+    movq %rsp, %rbp
+    pushq %rbx
+.Lclamp_bb0:
+    movq %rsi, %rbx
+    cmpq %rdx, %rbx
+    setl %al
+    movzbq %al, %rbx
+    movq %rbx, %rax
+    testq %rax, %rax
+    jne .Lclamp_bb1
+    jmp .Lclamp_bb2
+.Lclamp_bb1:
+    movq %rdx, %rax
+    jmp .Lclamp_epilogue
+.Lclamp_bb2:
+    jmp .Lclamp_bb3
+.Lclamp_bb3:
+    movq %rsi, %rbx
+    cmpq %rcx, %rbx
+    setg %al
+    movzbq %al, %rbx
+    movq %rbx, %rax
+    testq %rax, %rax
+    jne .Lclamp_bb4
+    jmp .Lclamp_bb5
+.Lclamp_bb4:
+    movq %rcx, %rax
+    jmp .Lclamp_epilogue
+.Lclamp_bb5:
+    jmp .Lclamp_bb6
+.Lclamp_bb6:
+    movq %rsi, %rax
+    jmp .Lclamp_epilogue
+.Lclamp_epilogue:
+    popq %rbx
+    leave
+    ret
+    .size clamp, .-clamp
+
+    .globl create_allocator
+    .type create_allocator, @function
+create_allocator:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $16, %rsp
+    pushq %rbx
+    movq %rdi, -16(%rbp)
+    movq %rsi, -8(%rbp)
+.Lcreate_allocator_bb0:
+    movq -8(%rbp), %rdi
+    call p_allocator_create
+    movq %rax, %rbx
+    movq %rbx, %rax
+    jmp .Lcreate_allocator_epilogue
+.Lcreate_allocator_epilogue:
+    popq %rbx
+    leave
+    ret
+    .size create_allocator, .-create_allocator
+
+    .globl identity__i32
+    .type identity__i32, @function
+identity__i32:
+    pushq %rbp
+    movq %rsp, %rbp
+.Lidentity__i32_bb0:
+    movq %rsi, %rax
+    jmp .Lidentity__i32_epilogue
+.Lidentity__i32_epilogue:
+    leave
+    ret
+    .size identity__i32, .-identity__i32
+
+    .globl main
+    .type main, @function
+main:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $32, %rsp
+    pushq %rbx
+    pushq %r12
+    pushq %r13
+    pushq %r14
+.Lmain_bb0:
+    movq $42, %rbx
+    movq $0, %r12
+    movq %r12, %rdi
+    movq %rbx, %rsi
+    call identity__i32
+    movq %rax, %r13
+    leaq -8(%rbp), %rax
+    movq %r13, %rax
+    movq %rax, -8(%rbp)
+    movslq -8(%rbp), %rbx
+    # Print: v6 (i32)
+    movq %rbx, %rdi
+    call p_print_int
+    movq $100, %rbx
+    movq $0, %r12
+    movq %r12, %rdi
+    movq %rbx, %rsi
+    call identity__i32
+    movq %rax, %r13
+    leaq -16(%rbp), %rax
+    movq %r13, %rax
+    movq %rax, -16(%rbp)
+    movq -16(%rbp), %rbx
+    # Print: v13 (i64)
+    movq %rbx, %rdi
+    call p_print_int
+    movq $10, %rbx
+    movq $20, %r12
+    movq $0, %r13
+    movq %r13, %rdi
+    movq %rbx, %rsi
+    movq %r12, %rdx
+    call max_value__i32
+    movq %rax, %r14
+    leaq -24(%rbp), %rax
+    movq %r14, %rax
+    movq %rax, -24(%rbp)
+    movslq -24(%rbp), %rbx
+    # Print: v21 (i32)
+    movq %rbx, %rdi
+    call p_print_int
+    movq $50, %rbx
+    movq $30, %r12
+    movq $0, %r13
+    movq %r13, %rdi
+    movq %rbx, %rsi
+    movq %r12, %rdx
+    call max_value__i32
+    movq %rax, %r14
+    leaq -32(%rbp), %rax
+    movq %r14, %rax
+    movq %rax, -32(%rbp)
+    movq -32(%rbp), %rbx
+    # Print: v29 (i64)
+    movq %rbx, %rdi
+    call p_print_int
+    movq $0, %rax
+    jmp .Lmain_epilogue
+.Lmain_epilogue:
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %rbx
+    leave
+    ret
+    .size main, .-main
+
+    .globl max
+    .type max, @function
+max:
+    pushq %rbp
+    movq %rsp, %rbp
+.Lmax_bb0:
+    movq %rsi, %rcx
+    cmpq %rdx, %rcx
+    setg %al
+    movzbq %al, %rcx
+    movq %rcx, %rax
+    testq %rax, %rax
+    jne .Lmax_bb1
+    jmp .Lmax_bb2
+.Lmax_bb1:
+    movq %rsi, %rax
+    jmp .Lmax_epilogue
+.Lmax_bb2:
+    jmp .Lmax_bb3
+.Lmax_bb3:
+    movq %rdx, %rax
+    jmp .Lmax_epilogue
+.Lmax_epilogue:
+    leave
+    ret
+    .size max, .-max
+
+    .globl max_value__i32
+    .type max_value__i32, @function
+max_value__i32:
+    pushq %rbp
+    movq %rsp, %rbp
+.Lmax_value__i32_bb0:
+    movq %rsi, %rcx
+    cmpq %rdx, %rcx
+    setg %al
+    movzbq %al, %rcx
+    movq %rcx, %rax
+    testq %rax, %rax
+    jne .Lmax_value__i32_bb1
+    jmp .Lmax_value__i32_bb2
+.Lmax_value__i32_bb1:
+    movq %rsi, %rax
+    jmp .Lmax_value__i32_epilogue
+.Lmax_value__i32_bb2:
+    movq %rdx, %rax
+    jmp .Lmax_value__i32_epilogue
+.Lmax_value__i32_bb3:
+    movq $0, %rax
+    jmp .Lmax_value__i32_epilogue
+.Lmax_value__i32_epilogue:
+    leave
+    ret
+    .size max_value__i32, .-max_value__i32
+
+    .globl min
+    .type min, @function
+min:
+    pushq %rbp
+    movq %rsp, %rbp
+.Lmin_bb0:
+    movq %rsi, %rcx
+    cmpq %rdx, %rcx
+    setl %al
+    movzbq %al, %rcx
+    movq %rcx, %rax
+    testq %rax, %rax
+    jne .Lmin_bb1
+    jmp .Lmin_bb2
+.Lmin_bb1:
+    movq %rsi, %rax
+    jmp .Lmin_epilogue
+.Lmin_bb2:
+    jmp .Lmin_bb3
+.Lmin_bb3:
+    movq %rdx, %rax
+    jmp .Lmin_epilogue
+.Lmin_epilogue:
+    leave
+    ret
+    .size min, .-min
+
+    .globl println
+    .type println, @function
+println:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $16, %rsp
+    pushq %rbx
+    movq %rdi, -8(%rbp)
+    movq %rsi, -16(%rbp)
+.Lprintln_bb0:
+    # Print: v1 (*u8)
+    movq -16(%rbp), %rdi
+    call p_print_str
+    leaq .str_3(%rip), %rbx
+    # Print: v3 (*u8)
+    movq %rbx, %rdi
+    call p_print_str
+    jmp .Lprintln_epilogue
+.Lprintln_epilogue:
+    popq %rbx
+    leave
+    ret
+    .size println, .-println
+
+    .section .rodata
+    .align 8
+.str_0: .asciz "called unwrap on None"
+Assertion failed
+: .asciz ".str_1"
+
+: .asciz ".str_0"
+.str_1: .asciz "called unwrap on Err"
+.str_3: .asciz "\n"
+.str_2: .asciz "Assertion failed\n"
+called unwrap on Err: .asciz ".str_3"
+called unwrap on None: .asciz ".str_2"
+
+    # External runtime functions (linked from C runtime)
+    .globl p_allocator_alloc
+    .globl p_tensor_from_vec
+    .globl p_db_mem_exec
+    .globl p_cr4_read
+    .globl p_to_str
+    .globl p_tensor_matmul
+    .globl p_page_unmap
+    .globl p_malloc
+    .globl p_tensor_relu
+    .globl p_tensor_zeros
+    .globl p_tensor_sigmoid
+    .globl p_tensor_clone
+    .globl p_lidt
+    .globl p_tensor_set
+    .globl p_simd_from_vec
+    .globl p_tensor_transpose
+    .globl p_socket_read
+    .globl p_socket_close
+    .globl p_phys_read64
+    .globl p_allocator_stats
+    .globl p_sti
+    .globl p_phys_write64
+    .globl p_socket_listen
+    .globl p_print_int
+    .globl p_cr3_read
+    .globl p_json_parse
+    .globl p_free
+    .globl p_tensor_shape
+    .globl p_outb
+    .globl p_tensor_sub
+    .globl p_db_mem_open
+    .globl p_cr0_read
+    .globl p_invlpg
+    .globl p_json_len
+    .globl p_tensor_scale
+    .globl p_tensor_min
+    .globl p_tensor_to_str
+    .globl p_json_get
+    .globl p_tensor_mean
+    .globl p_tensor_reshape
+    .globl p_tensor_sum
+    .globl p_print_str
+    .globl p_tensor_add
+    .globl p_cr3_write
+    .globl p_print_float
+    .globl p_str_concat
+    .globl p_tensor_mul
+    .globl p_db_mem_close
+    .globl p_idt_set_entry
+    .globl p_tensor_max
+    .globl p_simd_sum
+    .globl p_cli
+    .globl p_page_map
+    .globl p_cr0_write
+    .globl p_http_build_response
+    .globl p_inb
+    .globl p_cr4_write
+    .globl p_tensor_dot
+    .globl p_print_newline
+    .globl p_alloc
+    .globl p_simd_dot
+    .globl p_tensor_size
+    .globl p_tensor_ndim
+    .globl p_simd_div
+    .globl p_simd_mul
+    .globl p_panic
+    .globl p_allocator_free
+    .globl p_print_bool
+    .globl p_tensor_filled
+    .globl p_simd_to_str
+    .globl p_db_mem_query
+    .globl p_json_dump
+    .globl p_simd_scale
+    .globl p_simd_sub
+    .globl p_json_at
+    .globl p_socket_recv_str
+    .globl p_hlt
+    .globl p_tensor_to_json
+    .globl p_tensor_softmax
+    .globl p_allocator_create
+    .globl p_socket_write
+    .globl p_tensor_ones
+    .globl p_simd_add
+    .globl p_tensor_get
+    .globl p_json_pretty
+    .globl p_json_type
+    .globl p_json_string
+    .globl p_socket_accept
+    .globl p_http_parse_request

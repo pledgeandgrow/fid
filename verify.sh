@@ -1,3 +1,4 @@
+
 #!/bin/bash
 # verify.sh — P compiler verification script
 #
@@ -80,14 +81,23 @@ if [[ ! -x "$PLEDGEC" ]]; then
 fi
 
 # --- Run tests ---
-echo -e "${YELLOW}Running tests...${NC}"
+echo -e "${YELLOW}Running normal tests...${NC}"
 TEST_OUTPUT=$($PLEDGEC test 2>&1 || true)
 echo "$TEST_OUTPUT"
+
+echo -e "${YELLOW}Running expected-fail tests...${NC}"
+FAIL_OUTPUT=$($PLEDGEC test --fail 2>&1 || true)
+echo "$FAIL_OUTPUT"
+
+# Combine for baseline storage
+COMBINED_OUTPUT="${TEST_OUTPUT}
+
+${FAIL_OUTPUT}"
 
 # --- Save mode: just save and exit ---
 if [[ "$1" == "--save" ]]; then
     mkdir -p "$BASELINE_DIR"
-    echo "$TEST_OUTPUT" > "$BASELINE_FILE"
+    echo "$COMBINED_OUTPUT" > "$BASELINE_FILE"
     echo -e "${GREEN}Baseline saved to $BASELINE_FILE${NC}"
     exit 0
 fi
@@ -100,12 +110,12 @@ if [[ ! -f "$BASELINE_FILE" ]]; then
     exit 0
 fi
 
-# Extract just the results line and failures for comparison
-CURRENT_FAILS=$(echo "$TEST_OUTPUT" | grep "^\s*\[FAIL\]" || true)
-BASELINE_FAILS=$(grep "^\s*\[FAIL\]" "$BASELINE_FILE" || true)
+# Extract failures for comparison (includes [FAIL] and [UNEXPECTED PASS])
+CURRENT_FAILS=$(echo "$COMBINED_OUTPUT" | grep -E "^\s*\[FAIL\]|^\s*\[UNEXPECTED" || true)
+BASELINE_FAILS=$(grep -E "^\s*\[FAIL\]|^\s*\[UNEXPECTED" "$BASELINE_FILE" || true)
 
 # Extract summary lines
-CURRENT_SUMMARY=$(echo "$TEST_OUTPUT" | grep -E "^(Interpreter|C Codegen|PE Emitter):")
+CURRENT_SUMMARY=$(echo "$COMBINED_OUTPUT" | grep -E "^(Interpreter|C Codegen|PE Emitter):")
 BASELINE_SUMMARY=$(grep -E "^(Interpreter|C Codegen|PE Emitter):" "$BASELINE_FILE")
 
 echo ""

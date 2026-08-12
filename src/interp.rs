@@ -222,6 +222,10 @@ pub struct Interpreter {
     databases: HashMap<u64, hashbrown::HashMap<String, Value>>,
     /// Next database handle
     next_db_handle: u64,
+    /// Persistent state for `persist` variables (F2)
+    /// Maps variable name → saved value. Survives across interpreter runs
+    /// when using `pledgec watch` (hot reload).
+    persist_state: HashMap<String, String>,
 }
 
 /// Result of running a function
@@ -245,6 +249,7 @@ impl Interpreter {
             array_bounds: HashMap::new(),
             databases: HashMap::new(),
             next_db_handle: 1,
+            persist_state: HashMap::new(),
         };
         // Pre-allocate string constants
         interp.init_strings();
@@ -909,7 +914,53 @@ impl Interpreter {
                 }
                 ExecOutcome::Continue
             }
+            Inst::PersistLoad { name, default, .. } => {
+                // Check if we have a saved value for this variable
+                if let Some(saved) = self.persist_state.get(name) {
+                    // Parse the saved string back into a Value
+                    let default_val = values.get(default).cloned().unwrap_or(Value::Int(0));
+                    let val = self.parse_persisted_value(saved, &default_val);
+                    ExecOutcome::Value(val)
+                } else {
+                    // No saved value — use the default
+                    let val = values.get(default).cloned().unwrap_or(Value::Int(0));
+                    ExecOutcome::Value(val)
+                }
+            }
+            Inst::PersistSave { name, value } => {
+                let val = values.get(value).cloned().unwrap_or(Value::Void);
+                let s = self.stringify_value(&val);
+                self.persist_state.insert(name.clone(), s);
+                ExecOutcome::Continue
+            }
         }
+    }
+
+    /// Convert a Value to a string for persistence storage
+    fn stringify_value(&self, val: &Value) -> String {
+        match val {
+            Value::Int(n) => format!("i:{}", n),
+            Value::Bool(b) => format!("b:{}", b),
+            Value::Float(f) => format!("f:{}", f),
+            Value::Str(s) => format!("s:{}", s),
+            _ => format!("v:{}", val),
+        }
+    }
+
+    /// Parse a persisted string back into a Value, using the default's type as a hint
+    fn parse_persisted_value(&self, saved: &str, default: &Value) -> Value {
+        if let Some(colon) = saved.find(':') {
+            let (prefix, rest) = saved.split_at(colon + 1);
+            match prefix {
+                "i:" => return Value::Int(rest.parse().unwrap_or(0)),
+                "b:" => return Value::Bool(rest == "true"),
+                "f:" => return Value::Float(rest.parse().unwrap_or(0.0)),
+                "s:" => return Value::Str(CompactString::from(rest)),
+                _ => {}
+            }
+        }
+        // Fallback: use the default value
+        default.clone()
     }
 
     /// Evaluate a binary operation
@@ -1248,6 +1299,39 @@ impl Interpreter {
                             s.push_str(&format!("{}", v));
                         }
                         s.push('}');
+                        s
+                    }
+                    _ => String::new(),
+                };
+                ExecOutcome::Value(Value::Str(CompactString::from(s)))
+            }
+            "p_float_to_str" => {
+                let s = match args.first() {
+                    Some(Value::Float(f)) => f.to_string(),
+                    _ => String::new(),
+                };
+                ExecOutcome::Value(Value::Str(CompactString::from(s)))
+            }
+            "p_bool_to_str" => {
+                let s = match args.first() {
+                    Some(Value::Bool(b)) => b.to_string(),
+                    _ => String::new(),
+                };
+                ExecOutcome::Value(Value::Str(CompactString::from(s)))
+            }
+            "p_vec_to_str" => {
+                let s = match args.first() {
+                    Some(Value::Vec(arr)) => {
+                        let borrow = arr.borrow();
+                        let mut s = String::from("[");
+                        for (i, v) in borrow.iter().enumerate() {
+                            if i > 0 { s.push_str(", "); }
+                            match v {
+                                Value::Str(inner) => { s.push('"'); s.push_str(inner); s.push('"'); }
+                                _ => s.push_str(&format!("{}", v)),
+                            }
+                        }
+                        s.push(']');
                         s
                     }
                     _ => String::new(),

@@ -115,8 +115,8 @@ impl X64CodeGen {
         for (label, val) in &strings {
             if val.starts_with("__float_bits:") {
                 // Float constant — emit as .quad with the raw bits.
-                let bits: u64 = val[14..].parse().unwrap_or(0);
-                self.wl(&format!("{}    .quad {}", label, bits));
+                let bits: u64 = val["__float_bits:".len()..].parse().unwrap_or(0);
+                self.wl(&format!("{}: .quad {}", label, bits));
             } else {
                 self.wl(&format!("{}: .asciz \"{}\"", label, escape_str(val)));
             }
@@ -319,8 +319,8 @@ impl X64CodeGen {
                 self.gen_call(dst.as_ref(), target, args);
             }
 
-            L3Inst::CallPtr { dst, fn_ptr, args, .. } => {
-                self.gen_call_ptr(dst.as_ref(), fn_ptr, args);
+            L3Inst::CallPtr { dst, fn_ptr, args, has_env, .. } => {
+                self.gen_call_ptr(dst.as_ref(), fn_ptr, args, *has_env);
             }
 
             L3Inst::DynCall { dst, trait_name, method, args, .. } => {
@@ -386,6 +386,8 @@ impl X64CodeGen {
                     | IrType::U64 | IrType::U32 | IrType::U16 | IrType::U8 => "p_print_int",
                     IrType::F64 | IrType::F32 => "p_print_float",
                     IrType::Bool => "p_print_bool",
+                    IrType::Opaque(ref name) | IrType::Generic(ref name, _) if name.contains("Vec") => "p_print_vec",
+                    IrType::Opaque(ref name) | IrType::Generic(ref name, _) if name.contains("Map") => "p_print_map",
                     _ => "p_print_str",
                 };
                 self.gen_operand_to_reg(val, PhysReg::Rdi);
@@ -409,10 +411,25 @@ impl X64CodeGen {
         let dst_loc = self.dst_loc(dst);
         match dst_loc {
             Some(Location::Reg(dr)) => {
-                self.gen_operand_to_reg(src, dr);
+                // Special case: Mov from Slot should load the VALUE at the
+                // stack slot, not the address. gen_operand_to_reg treats
+                // Slot as address-of (leaq), which is correct for pointer
+                // operands but wrong for value moves.
+                if let Operand::Slot(slot) = src {
+                    self.wl(&format!("    movq -{}(%rbp), %{}", slot.0, dr.name()));
+                } else {
+                    self.gen_operand_to_reg(src, dr);
+                }
             }
             Some(Location::Spill(off)) => {
-                self.gen_operand_to_mem(src, off);
+                // For spill destinations, gen_operand_to_mem handles most cases.
+                // But Slot source needs to load the value, not the address.
+                if let Operand::Slot(slot) = src {
+                    self.wl(&format!("    movq -{}(%rbp), %rax", slot.0));
+                    self.wl(&format!("    movq %rax, -{}(%rbp)", off));
+                } else {
+                    self.gen_operand_to_mem(src, off);
+                }
             }
             None => {
                 self.wl(&format!("    # Mov: dst {} unallocated", dst));
@@ -420,7 +437,7 @@ impl X64CodeGen {
         }
     }
 
-    fn gen_bin(&mut self, op: BinOp, dst: VReg, a: &Operand, b: &Operand, _ty: &IrType) {
+    fn gen_bin(&mut self, op: BinOp, dst: VReg, a: &Operand, b: &Operand, ty: &IrType) {
         // Strategy: load `a` into dst's register, then apply `b`.
         // If dst is spilled, use RAX as a temporary.
         let dst_loc = self.dst_loc(dst);
@@ -434,6 +451,42 @@ impl X64CodeGen {
             self.gen_operand_to_reg(a, dst_reg);
         } else {
             self.gen_operand_to_reg(a, dst_reg);
+        }
+
+        // Float operations: use SSE2 instructions.
+        if ty.is_float() {
+            match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                    // Move a to xmm0, b to xmm1, then apply SSE op.
+                    self.wl(&format!("    movq %{}, %xmm0", dst_reg.name()));
+                    let tmp = self.scratch_reg(dst_reg);
+                    self.gen_operand_to_reg(b, tmp);
+                    self.wl(&format!("    movq %{}, %xmm1", tmp.name()));
+                    let sse_op = match op {
+                        BinOp::Add => "addsd",
+                        BinOp::Sub => "subsd",
+                        BinOp::Mul => "mulsd",
+                        BinOp::Div => "divsd",
+                        _ => unreachable!(),
+                    };
+                    self.wl(&format!("    {} %xmm1, %xmm0", sse_op));
+                    self.wl(&format!("    movq %xmm0, %{}", dst_reg.name()));
+                }
+                BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq
+                | BinOp::And | BinOp::Or => {
+                    self.gen_comparison(op, b, dst_reg);
+                }
+                _ => {
+                    // Fallback for other ops on floats (shouldn't happen).
+                    self.gen_operand_apply_binop("addq", b, dst_reg);
+                }
+            }
+            if need_spill_reload {
+                if let Some(Location::Spill(off)) = self.dst_loc(dst) {
+                    self.wl(&format!("    movq %{}, -{}(%rbp)", dst_reg.name(), off));
+                }
+            }
+            return;
         }
 
         // Apply the operation with b.
@@ -453,31 +506,52 @@ impl X64CodeGen {
             BinOp::Div => {
                 // idivq: dividend in RDX:RAX, divisor in operand.
                 // Move dividend to RAX, sign-extend to RDX, then divide.
+                // IMPORTANT: cqto clobbers RDX, so the divisor must NOT be in RDX.
+                // If it is, move it to RCX first.
                 if dst_reg != PhysReg::Rax {
                     self.wl(&format!("    movq %{}, %rax", dst_reg.name()));
                 }
-                self.wl("    cqto");
+                // Save divisor to RCX if it's in RDX or not in a register.
                 match b {
                     Operand::ImmI(v) => {
+                        self.wl("    cqto");
                         self.wl(&format!("    movq ${}, %rcx", v));
                         self.wl("    idivq %rcx");
                     }
                     Operand::VReg(vr) => {
                         let b_loc = self.operand_loc(*vr);
                         match b_loc {
+                            Some(Location::Reg(PhysReg::Rdx)) => {
+                                // Divisor is in RDX — move to RCX before cqto.
+                                self.wl("    movq %rdx, %rcx");
+                                self.wl("    cqto");
+                                self.wl("    idivq %rcx");
+                            }
                             Some(Location::Reg(r)) => {
+                                self.wl("    cqto");
                                 self.wl(&format!("    idivq %{}", r.name()));
                             }
                             Some(Location::Spill(off)) => {
+                                self.wl("    cqto");
                                 self.wl(&format!("    idivq -{}(%rbp)", off));
                             }
                             None => {
+                                self.wl("    cqto");
                                 self.wl("    idivq %rcx");
                             }
                         }
                     }
                     _ => {
-                        self.wl("    idivq %rcx");
+                        let tmp = self.scratch_reg(dst_reg);
+                        self.gen_operand_to_reg(b, tmp);
+                        if tmp == PhysReg::Rdx {
+                            self.wl("    movq %rdx, %rcx");
+                            self.wl("    cqto");
+                            self.wl("    idivq %rcx");
+                        } else {
+                            self.wl("    cqto");
+                            self.wl(&format!("    idivq %{}", tmp.name()));
+                        }
                     }
                 }
                 // Result is in RAX; move to dst if needed.
@@ -490,28 +564,45 @@ impl X64CodeGen {
                 if dst_reg != PhysReg::Rax {
                     self.wl(&format!("    movq %{}, %rax", dst_reg.name()));
                 }
-                self.wl("    cqto");
                 match b {
                     Operand::ImmI(v) => {
+                        self.wl("    cqto");
                         self.wl(&format!("    movq ${}, %rcx", v));
                         self.wl("    idivq %rcx");
                     }
                     Operand::VReg(vr) => {
                         let b_loc = self.operand_loc(*vr);
                         match b_loc {
+                            Some(Location::Reg(PhysReg::Rdx)) => {
+                                self.wl("    movq %rdx, %rcx");
+                                self.wl("    cqto");
+                                self.wl("    idivq %rcx");
+                            }
                             Some(Location::Reg(r)) => {
+                                self.wl("    cqto");
                                 self.wl(&format!("    idivq %{}", r.name()));
                             }
                             Some(Location::Spill(off)) => {
+                                self.wl("    cqto");
                                 self.wl(&format!("    idivq -{}(%rbp)", off));
                             }
                             None => {
+                                self.wl("    cqto");
                                 self.wl("    idivq %rcx");
                             }
                         }
                     }
                     _ => {
-                        self.wl("    idivq %rcx");
+                        let tmp = self.scratch_reg(dst_reg);
+                        self.gen_operand_to_reg(b, tmp);
+                        if tmp == PhysReg::Rdx {
+                            self.wl("    movq %rdx, %rcx");
+                            self.wl("    cqto");
+                            self.wl("    idivq %rcx");
+                        } else {
+                            self.wl("    cqto");
+                            self.wl(&format!("    idivq %{}", tmp.name()));
+                        }
                     }
                 }
                 // Result is in RDX; move to dst.
@@ -547,7 +638,7 @@ impl X64CodeGen {
         }
     }
 
-    fn gen_unary(&mut self, op: crate::ast::UnaryOp, dst: VReg, src: &Operand, _ty: &IrType) {
+    fn gen_unary(&mut self, op: crate::ast::UnaryOp, dst: VReg, src: &Operand, ty: &IrType) {
         let dst_loc = self.dst_loc(dst);
         let dst_reg = match dst_loc {
             Some(Location::Reg(r)) => r,
@@ -558,7 +649,18 @@ impl X64CodeGen {
 
         match op {
             crate::ast::UnaryOp::Neg => {
-                self.wl(&format!("    negq %{}", dst_reg.name()));
+                if ty.is_float() {
+                    // Float negation: flip sign bit (bit 63) via XOR with sign mask
+                    // Load sign mask from rodata, then xorq
+                    self.wl(&format!("    movq %{}, %rax", dst_reg.name()));
+                    self.wl("    movq $0x8000000000000000, %rcx");
+                    self.wl("    xorq %rcx, %rax");
+                    if dst_reg != PhysReg::Rax {
+                        self.wl(&format!("    movq %rax, %{}", dst_reg.name()));
+                    }
+                } else {
+                    self.wl(&format!("    negq %{}", dst_reg.name()));
+                }
             }
             crate::ast::UnaryOp::Not => {
                 // Logical not: test if zero, set to 0 or 1.
@@ -858,20 +960,33 @@ impl X64CodeGen {
         }
     }
 
-    fn gen_call_ptr(&mut self, dst: Option<&VReg>, fn_ptr: &Operand, args: &[Operand]) {
-        // Load function pointer into RAX.
-        self.gen_operand_to_reg(fn_ptr, PhysReg::Rax);
+    fn gen_call_ptr(&mut self, dst: Option<&VReg>, fn_ptr: &Operand, args: &[Operand], has_env: bool) {
+        // Load function pointer into R11 (a caller-saved scratch reg).
+        // If has_env is true, fn_ptr is actually an env pointer and the
+        // real function pointer is stored at env[0].
+        self.gen_operand_to_reg(fn_ptr, PhysReg::R11);
+        if has_env {
+            // Load the real function pointer from env[0].
+            self.wl("    movq (%r11), %r11");
+        }
 
-        // Move args into argument registers (skip env ptr if present —
-        // the first arg is the env, which we pass in RDI).
+        // Move args into argument registers.
+        // When has_env is true, the env pointer is passed as the first
+        // argument (in %rdi), and the actual args start at index 1 (%rsi).
         let arg_regs = PhysReg::arg_regs();
+        let arg_start = if has_env { 1 } else { 0 };
+        if has_env {
+            // Pass env pointer in %rdi.
+            self.gen_operand_to_reg(fn_ptr, PhysReg::Rdi);
+        }
         for (i, arg) in args.iter().enumerate() {
-            if i < arg_regs.len() {
-                self.gen_operand_to_reg(arg, arg_regs[i]);
+            let reg_idx = i + arg_start;
+            if reg_idx < arg_regs.len() {
+                self.gen_operand_to_reg(arg, arg_regs[reg_idx]);
             }
         }
 
-        self.wl("    call *%rax");
+        self.wl("    call *%r11");
 
         if let Some(dst) = dst {
             if let Some(loc) = self.dst_loc(*dst) {
@@ -982,6 +1097,10 @@ impl X64CodeGen {
                 let label = self.alloc_string(s);
                 self.wl(&format!("    leaq {}(%rip), %{}", label, reg.name()));
             }
+            Operand::ImmFunc(name) => {
+                // Load function address via RIP-relative LEA.
+                self.wl(&format!("    leaq {}(%rip), %{}", name, reg.name()));
+            }
             Operand::ImmNull => {
                 self.wl(&format!("    xorq %{}, %{}", reg.name(), reg.name()));
             }
@@ -1051,6 +1170,7 @@ impl X64CodeGen {
             Operand::ImmI(v) => format!("${}", v),
             Operand::ImmF(bits) => format!("f64:0x{:016x}", bits),
             Operand::ImmStr(s) => format!("\"{}\"", s),
+            Operand::ImmFunc(s) => format!("&{}", s),
             Operand::ImmNull => "null".to_string(),
             Operand::VReg(vr) => format!("%v{}", vr.0),
             Operand::Slot(slot) => format!("slot({})", slot.0),
@@ -1083,6 +1203,10 @@ impl X64CodeGen {
             Operand::ImmStr(s) => {
                 let label = self.alloc_string(s);
                 self.wl(&format!("    leaq {}(%rip), %rax", label));
+                self.wl(&format!("    movq %rax, -{}(%rbp)", offset));
+            }
+            Operand::ImmFunc(name) => {
+                self.wl(&format!("    leaq {}(%rip), %rax", name));
                 self.wl(&format!("    movq %rax, -{}(%rbp)", offset));
             }
             Operand::ImmF(_) => {
@@ -1139,6 +1263,39 @@ impl X64CodeGen {
 
     /// Generate a comparison: set dst to 0 or 1 based on the comparison.
     fn gen_comparison(&mut self, op: BinOp, b: &Operand, dst_reg: PhysReg) {
+        // Handle logical And/Or separately — they don't use cmpq.
+        match op {
+            BinOp::And => {
+                // Logical and: dst = (dst != 0) && (b != 0)
+                // Load b into scratch FIRST (before setne clobbers %al which may alias b's register).
+                let tmp = self.scratch_reg(dst_reg);
+                self.gen_operand_to_reg(b, tmp);
+                // Now test dst_reg.
+                self.wl(&format!("    testq %{}, %{}", dst_reg.name(), dst_reg.name()));
+                self.wl("    setne %al");
+                // Test b (in scratch).
+                self.wl(&format!("    testq %{}, %{}", tmp.name(), tmp.name()));
+                self.wl("    setne %cl");
+                // AND the two results.
+                self.wl("    andb %cl, %al");
+                self.wl(&format!("    movzbq %al, %{}", dst_reg.name()));
+                return;
+            }
+            BinOp::Or => {
+                // Logical or: dst = (dst != 0) || (b != 0)
+                let tmp = self.scratch_reg(dst_reg);
+                self.gen_operand_to_reg(b, tmp);
+                self.wl(&format!("    testq %{}, %{}", dst_reg.name(), dst_reg.name()));
+                self.wl("    setne %al");
+                self.wl(&format!("    testq %{}, %{}", tmp.name(), tmp.name()));
+                self.wl("    setne %cl");
+                self.wl("    orb %cl, %al");
+                self.wl(&format!("    movzbq %al, %{}", dst_reg.name()));
+                return;
+            }
+            _ => {}
+        }
+
         // Compare dst_reg with b.
         match b {
             Operand::ImmI(v) => {
@@ -1170,18 +1327,6 @@ impl X64CodeGen {
             BinOp::Gt => "setg",
             BinOp::LtEq => "setle",
             BinOp::GtEq => "setge",
-            BinOp::And => {
-                // Logical and: dst = dst != 0 && b != 0
-                // We've already loaded a into dst_reg. Test b.
-                self.wl(&format!("    setne %al"));
-                self.wl(&format!("    movzbq %al, %{}", dst_reg.name()));
-                return;
-            }
-            BinOp::Or => {
-                self.wl(&format!("    setne %al"));
-                self.wl(&format!("    movzbq %al, %{}", dst_reg.name()));
-                return;
-            }
             _ => "sete",
         };
 

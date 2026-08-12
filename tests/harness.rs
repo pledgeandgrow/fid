@@ -44,7 +44,10 @@ fn is_skip_test(name: &str) -> bool {
 
 /// Tests that are expected to fail (they test error detection).
 fn is_expect_fail_test(name: &str) -> bool {
-    matches!(name, "test_trait_verify_fail.p")
+    matches!(
+        name,
+        "test_trait_verify_fail.p" | "test_budget_fail.p" | "test_sandbox_fail.p"
+    )
 }
 
 /// Discover all `.p` test files in the `tests/` directory.

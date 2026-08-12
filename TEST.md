@@ -1,6 +1,6 @@
 # TEST.md — P Test Results
 
-*Last updated: verified against actual test runs (136/136 unit tests, 7/8 harness tests, 78/79 interpreter, 78/79 PE, 53/79 C codegen, 102 .p test files)*
+*Last updated: Aug 2026 — verified against actual test runs (136/136 unit tests, 8/8 harness tests, 78/78 interpreter + 1/1 expected-fail, 78/78 PE + 1/1 expected-fail, 76/78 C codegen + 1/1 expected-fail, 102 .p test files)*
 
 ## Legend
 
@@ -18,11 +18,11 @@
 
 | Test Group | Count | Pass | Fail | Notes |
 |------------|-------|------|------|-------|
-| Harness (`cargo test --test harness`) | 8 | 7 | 1 | 1 failure: `golden_files_match` — interpreter prints Rust debug format for Vec/Map/Ptr |
-| Unit tests (`cargo test --bin pledgec`) | 136 | 136 | 0 | elf64, pir, peephole (26), codegen_x64, opt, regalloc, tensor, hotreload (8) |
-| Interpreter (`pledgec run`) | 79 | 78 | 1 | 1 expected failure: `test_trait_verify_fail` (compile-time failure test) |
-| PE Emitter (`pledgec emit`) | 79 | 78 | 1 | 1 expected failure: `test_trait_verify_fail` |
-| C Codegen (`pledgec ccompile`) | 79 | 53 | 26 | 26 mismatches: asm, comptime, const_generic, gat, json, tensor, etc. |
+| Harness (`cargo test --test harness`) | 8 | 8 | 0 | All pass including golden_files_match |
+| Unit tests (`cargo test --bin pledgec`) | 136 | 136 | 0 | elf64, pir, peephole (26), codegen_x64, opt, regalloc, tensor, hotreload (8), embedded, gpu, wasm, coff, macho, linker |
+| Interpreter (`pledgec run`) | 78 normal + 1 expected-fail | 78 + 1 | 0 | 1 expected failure: `test_trait_verify_fail` (compile-time failure test — correctly fails) |
+| PE Emitter (`pledgec emit`) | 78 normal + 1 expected-fail | 78 + 1 | 0 | 1 expected failure: `test_trait_verify_fail` |
+| C Codegen (`pledgec ccompile`) | 78 normal + 1 expected-fail | 76 + 1 | 2 | 2 real mismatches: `test_asm` (inline asm — by design), `test_comptime_reflect` (comptime reflection — interpreter-only). `test_db` is flaky (HashMap ordering non-deterministic). |
 | Safety tests | 9 | 9 | 0 | OOB, overflow, div-by-zero, unwrap None |
 | Capability tests | 4 | 4 | 0 | Grant, deny, propagation |
 | Effect tests | 7 | 7 | 0 | Annotations, inference, handlers, pure, under-declare |
@@ -33,7 +33,7 @@
 
 ## Interpreter (`pledgec run`)
 
-78 of 79 test files pass through the interpreter (1 expected failure: test_trait_verify_fail — a compile-time failure test that correctly fails).
+78 of 78 normal test files pass through the interpreter, plus 1 expected-fail test (`test_trait_verify_fail` — a compile-time failure test that correctly fails).
 
 | Test File | Status | Output / Exit Code |
 |-----------|--------|--------|
@@ -98,7 +98,7 @@
 
 Native Windows x64 PE executables. No external linker, assembler, or C compiler required.
 
-78 of 79 test files produce valid PE32+ executables (1 expected failure: test_trait_verify_fail). Verified: MZ/PE signatures, x86_64 machine type, .text + .rdata sections, kernel32.dll imports for GetStdHandle/WriteFile/ExitProcess.
+78 of 78 normal test files produce valid PE32+ executables, plus 1 expected-fail test (`test_trait_verify_fail`). Verified: MZ/PE signatures, x86_64 machine type, .text + .rdata sections, kernel32.dll imports for GetStdHandle/WriteFile/ExitProcess.
 
 **Note:** PE executables target Windows x64 and cannot be executed on Linux without Wine. Output values listed below match the interpreter and are expected to be correct based on PE structure validation and disassembly verification. The bug fix history below documents previously identified and fixed issues.
 
@@ -147,12 +147,14 @@ Native Windows x64 PE executables. No external linker, assembler, or C compiler 
 
 ## C Codegen (`pledgec ccompile`)
 
-Portable C code generation, compiled with gcc/clang. **53 of 79 tests produce output matching the interpreter.** 26 tests fail due to missing C codegen support for: inline asm, bare-metal, bounds checks, comptime reflection/serialization, const generics, GATs, databases, f-strings with int/vec, HTTP, interrupts, JSON, matrix multiply, MMU, parallel ops, map printing, collections regression, shapes, SIMD, tensors, trait objects, type aliases, vec printing, strings.
+Portable C code generation, compiled with gcc/clang. **76 of 78 normal tests produce output matching the interpreter**, plus 1 expected-fail test (`test_trait_verify_fail` — correctly fails). 2 real mismatches: `test_asm` (inline assembly — cannot be translated to C by design), `test_comptime_reflect` (comptime reflection — interpreter-only feature). `test_db` is flaky (HashMap iteration order is non-deterministic in both interpreter and C codegen — sometimes matches, sometimes doesn't).
 
 | Test File | Status | Notes |
 |-----------|--------|-------|
-| 53 test files | ✅ | Output matches interpreter |
-| 26 test files | ❌ | C codegen lacks support for the feature (see list above) |
+| 76 test files | ✅ | Output matches interpreter |
+| 2 test files | ❌ | test_asm (inline asm — by design), test_comptime_reflect (interpreter-only) |
+| 1 test file | ⚠️ | test_db (flaky — HashMap ordering non-deterministic) |
+| 1 test file | ✅ (expected fail) | test_trait_verify_fail (correctly rejected at compile time) |
 
 ---
 

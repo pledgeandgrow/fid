@@ -146,7 +146,7 @@ pub struct JitResult {
 pub fn compile_and_run(source: &str, source_path: &str, do_opt: bool) -> Result<JitResult, String> {
     let compile_start = Instant::now();
 
-    let binary = crate::compiler::build_executable(source, source_path, "x86-64", do_opt)
+    let binary = crate::compiler::build_executable(source, source_path, "x86-64", do_opt, None)
         .map_err(|errors| errors.join("\n"))?;
 
     let compile_time_ms = compile_start.elapsed().as_millis() as u64;

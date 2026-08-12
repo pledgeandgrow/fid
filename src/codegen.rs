@@ -600,6 +600,12 @@ impl CodeGen {
             Stmt::ComptimeGen { .. } => {
                 // ComptimeGen is processed during comptime substitution; no-op here
             }
+            Stmt::Sandbox { body, .. } => {
+                // Sandbox is transparent at codegen — safety is compile-time only
+                for s in body {
+                    self.gen_stmt(s);
+                }
+            }
         }
     }
 

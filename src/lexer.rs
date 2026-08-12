@@ -117,6 +117,8 @@ impl Lexer {
             "dyn" => TokenKind::Dyn,
             "where" => TokenKind::Where,
             "region" => TokenKind::Region,
+            "sandbox" => TokenKind::Sandbox,
+            "persist" => TokenKind::Persist,
             "for" => TokenKind::For,
             "while" => TokenKind::While,
             "loop" => TokenKind::Loop,

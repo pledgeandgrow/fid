@@ -649,6 +649,21 @@ pub enum Inst {
     RegionEnd {
         name: String,
     },
+
+    // ─── Persist Variables (F2) ───
+    /// Load a persisted variable's value by name. If a saved value exists
+    /// in the persistent state, return it. Otherwise return the default value.
+    PersistLoad {
+        name: String,
+        default: ValueId,
+        ty: IrType,
+    },
+    /// Save a variable's value to persistent state by name.
+    /// Called before function return to persist the variable's current value.
+    PersistSave {
+        name: String,
+        value: ValueId,
+    },
 }
 
 impl Inst {
@@ -686,6 +701,8 @@ impl Inst {
             Inst::Asm { ret_ty, .. } => ret_ty.clone(),
             Inst::RegionBegin { .. } => IrType::I64,
             Inst::RegionEnd { .. } => IrType::Void,
+            Inst::PersistLoad { ty, .. } => ty.clone(),
+            Inst::PersistSave { .. } => IrType::Void,
         }
     }
 
@@ -716,6 +733,8 @@ impl Inst {
                 effects.add(Effect::Alloc);
                 effects.add(Effect::Write);
             },
+            Inst::PersistLoad { .. } => effects.add(Effect::Read),
+            Inst::PersistSave { .. } => effects.add(Effect::Write),
             _ => {}
         }
         effects
@@ -755,6 +774,8 @@ impl Inst {
             Inst::Asm { .. } => "Asm",
             Inst::RegionBegin { .. } => "RegionBegin",
             Inst::RegionEnd { .. } => "RegionEnd",
+            Inst::PersistLoad { .. } => "PersistLoad",
+            Inst::PersistSave { .. } => "PersistSave",
         }
     }
 
@@ -813,6 +834,8 @@ impl Inst {
                 refs
             }
             Inst::RegionBegin { .. } | Inst::RegionEnd { .. } => vec![],
+            Inst::PersistLoad { default, .. } => vec![*default],
+            Inst::PersistSave { value, .. } => vec![*value],
         }
     }
 }
@@ -868,6 +891,9 @@ pub struct IrFunction {
     /// Whether this is an interrupt handler (bare-metal mode).
     /// Interrupt handlers save/restore all registers and use `iret` instead of `ret`.
     pub is_interrupt: bool,
+    /// Persist variables in this function — (name, alloca_ptr)
+    /// Used to emit PersistSave before returns
+    pub persist_vars: Vec<(String, ValueId)>,
 }
 
 impl IrFunction {
@@ -885,6 +911,7 @@ impl IrFunction {
             entry: BlockId(0),
             locals: HashMap::new(),
             is_interrupt: false,
+            persist_vars: Vec::new(),
         };
         // Create entry block
         func.new_block();

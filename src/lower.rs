@@ -206,32 +206,28 @@ impl Lowerer {
         std::mem::take(&mut self.module)
     }
 
-    /// Compute the memory layout for a struct
+    /// Compute the memory layout for a struct.
+    /// All fields are stored as 8-byte slots to match the native codegen
+    /// (which uses `field_index * 8` as the byte offset for each field).
     fn compute_struct_layout(&mut self, def: &StructDef) {
         let mut fields = Vec::new();
         let mut offset: u64 = 0;
-        let mut max_align: u64 = 1;
 
         for field in &def.fields {
             let ir_ty = self.lower_type(&field.ty);
-            let align = self.module.type_align(&ir_ty);
-            // Align offset
-            offset = (offset + align - 1) & !(align - 1);
+            // Every field gets an 8-byte slot (uniform representation).
             fields.push((field.name.clone(), ir_ty.clone(), offset as u32));
-            offset += self.module.type_size(&ir_ty);
-            if align > max_align {
-                max_align = align;
-            }
+            offset += 8;
         }
 
-        // Pad to alignment
-        let size = (offset + max_align - 1) & !(max_align - 1);
+        // Align to 8 bytes (all structs are 8-byte aligned in the native codegen).
+        let size = (offset + 7) & !7;
 
         let layout = StructLayout {
             name: def.name.clone(),
             fields,
             size,
-            align: max_align,
+            align: 8,
         };
 
         self.module.add_struct(layout);
@@ -282,6 +278,16 @@ impl Lowerer {
             IrType::Ptr(Box::new(IrType::U8)));
         self.module.add_extern("p_to_str",
             vec![IrType::I64],
+            IrType::Ptr(Box::new(IrType::U8)));
+        self.module.add_extern("p_float_to_str",
+            vec![IrType::F64],
+            IrType::Ptr(Box::new(IrType::U8)));
+        self.module.add_extern("p_bool_to_str",
+            vec![IrType::Bool],
+            IrType::Ptr(Box::new(IrType::U8)));
+        let vec_ty = IrType::Opaque("Vec".to_string());
+        self.module.add_extern("p_vec_to_str",
+            vec![vec_ty.clone()],
             IrType::Ptr(Box::new(IrType::U8)));
 
         // ─── Phase 5D.2: JSON stdlib ───
@@ -651,12 +657,8 @@ impl Lowerer {
         // Set current line for debug info
         self.current_line = Some(stmt.line());
         match stmt {
-            Stmt::Let { name, ty, expr, is_mut: _, line: _ } => {
+            Stmt::Let { name, ty, expr, is_mut: _, is_persist, line: _ } => {
                 let val = self.lower_expr(expr);
-                // Always use alloca + store for variables.
-                // Direct SSA binding is broken for loops (no phi nodes) —
-                // the condition block references the original ValueId and
-                // never sees rebinding from the loop body.
                 let ir_ty = ty.as_ref().map(|t| self.lower_type(t)).unwrap_or_else(|| {
                     self.get_value_type(val)
                 });
@@ -664,11 +666,27 @@ impl Lowerer {
                     ty: ir_ty.clone(),
                     region: self.current_region(),
                 });
-                self.alloca_types.insert(alloca, ir_ty);
-                self.emit_inst(Inst::Store {
-                    ptr: alloca,
-                    value: val,
-                });
+                self.alloca_types.insert(alloca, ir_ty.clone());
+                if *is_persist {
+                    // Emit PersistLoad — returns saved value or the default
+                    let loaded = self.emit_inst(Inst::PersistLoad {
+                        name: name.clone(),
+                        default: val,
+                        ty: ir_ty,
+                    });
+                    self.emit_inst(Inst::Store {
+                        ptr: alloca,
+                        value: loaded,
+                    });
+                    if let Some(ref mut f) = self.current_func {
+                        f.persist_vars.push((name.clone(), alloca));
+                    }
+                } else {
+                    self.emit_inst(Inst::Store {
+                        ptr: alloca,
+                        value: val,
+                    });
+                }
                 self.allocas.insert(name.clone(), alloca);
                 if let Some(ref mut f) = self.current_func {
                     f.bind_local(name, alloca);
@@ -871,6 +889,9 @@ impl Lowerer {
                 // Emit defer blocks before returning (in reverse order)
                 self.emit_defers();
 
+                // Save persist variables before returning
+                self.emit_persist_saves();
+
                 if self.current_sret.is_some() {
                     // Struct-returning function: copy struct data to sret, return void
                     if let Some(e) = expr {
@@ -975,7 +996,7 @@ impl Lowerer {
                     }
                 }
             }
-            Stmt::RegionBlock { name, body, .. } => {
+            Stmt::RegionBlock { name, budget: _, body, .. } => {
                 // Emit RegionBegin — marks the start of a named region.
                 // Allocations inside the block will use Region::Named(name).
                 self.emit_inst(Inst::RegionBegin {
@@ -992,6 +1013,14 @@ impl Lowerer {
                 });
             }
             Stmt::ComptimeGen { .. } => {}
+            Stmt::Sandbox { body, .. } => {
+                // Sandbox is transparent at the IR level — safety is
+                // enforced entirely at compile time by the typechecker.
+                // Just lower the body as normal statements.
+                for s in body {
+                    self.lower_stmt(s);
+                }
+            }
         }
     }
 
@@ -1805,6 +1834,23 @@ impl Lowerer {
                     });
                 }
 
+                // Special case: println() builtin — emit as Print + Print("\n")
+                // This avoids calling the stdlib println (which always uses p_print_str)
+                // and instead routes to the correct p_print_* based on the argument type.
+                if callee == "println" && !arg_vals.is_empty() {
+                    let arg_ty = self.get_value_type(arg_vals[0]);
+                    self.emit_inst(Inst::Print {
+                        value: arg_vals[0],
+                        ty: arg_ty,
+                    });
+                    let newline = self.emit_inst(Inst::ConstStr { value: "\n".to_string() });
+                    self.emit_inst(Inst::Print {
+                        value: newline,
+                        ty: IrType::Ptr(Box::new(IrType::U8)),
+                    });
+                    return ValueId(0); // void
+                }
+
                 // Determine return type — look up function or default to I64
                 let ret_ty = self.lookup_func_ret_ty(callee);
 
@@ -2448,26 +2494,48 @@ impl Lowerer {
                         FStringPart::Expr(e) => {
                             // Lower the expression
                             let val = self.lower_expr(e);
-                            // Check if it's already a string type — if so, skip conversion
-                            let is_string = if let Some(ref f) = self.current_func {
-                                if let Some(meta) = f.values.get(&val) {
-                                    matches!(meta.ty, IrType::Ptr(_))
-                                } else {
-                                    false
-                                }
+                            // Determine type and dispatch to appropriate to_str function
+                            let ty = if let Some(ref f) = self.current_func {
+                                f.values.get(&val).map(|m| m.ty.clone()).unwrap_or(IrType::I64)
                             } else {
-                                false
+                                IrType::I64
                             };
-                            if is_string {
-                                val
-                            } else {
-                                // Call p_to_str to convert non-string value to string
-                                self.emit_inst(Inst::Call {
-                                    func: "p_to_str".to_string(),
-                                    args: vec![val],
-                                    ret_ty: IrType::Ptr(Box::new(IrType::U8)),
-                                    effects: EffectSet::new(),
-                                })
+                            match ty {
+                                IrType::Ptr(_) => val, // already a string
+                                IrType::F64 | IrType::F32 => {
+                                    self.emit_inst(Inst::Call {
+                                        func: "p_float_to_str".to_string(),
+                                        args: vec![val],
+                                        ret_ty: IrType::Ptr(Box::new(IrType::U8)),
+                                        effects: EffectSet::new(),
+                                    })
+                                }
+                                IrType::Bool => {
+                                    self.emit_inst(Inst::Call {
+                                        func: "p_bool_to_str".to_string(),
+                                        args: vec![val],
+                                        ret_ty: IrType::Ptr(Box::new(IrType::U8)),
+                                        effects: EffectSet::new(),
+                                    })
+                                }
+                                IrType::Opaque(ref name) | IrType::Generic(ref name, _)
+                                    if name.contains("Vec") => {
+                                    self.emit_inst(Inst::Call {
+                                        func: "p_vec_to_str".to_string(),
+                                        args: vec![val],
+                                        ret_ty: IrType::Ptr(Box::new(IrType::U8)),
+                                        effects: EffectSet::new(),
+                                    })
+                                }
+                                _ => {
+                                    // Call p_to_str for int and other types
+                                    self.emit_inst(Inst::Call {
+                                        func: "p_to_str".to_string(),
+                                        args: vec![val],
+                                        ret_ty: IrType::Ptr(Box::new(IrType::U8)),
+                                        effects: EffectSet::new(),
+                                    })
+                                }
                             }
                         }
                     };
@@ -3046,6 +3114,9 @@ impl Lowerer {
                     }
                 }
                 Stmt::RegionBlock { body, .. } => {
+                    self.collect_free_vars(body, free_vars, local_names);
+                }
+                Stmt::Sandbox { body, .. } => {
                     self.collect_free_vars(body, free_vars, local_names);
                 }
                 Stmt::ComptimeGen { .. } => {}
@@ -3635,6 +3706,23 @@ impl Lowerer {
         let defers: Vec<Vec<Stmt>> = self.defer_stack.drain(..).rev().collect();
         for body in defers {
             self.lower_stmts(&body);
+        }
+    }
+
+    /// Emit PersistSave instructions for all persist variables in the current function.
+    /// Called before every Return to save persist variable values.
+    fn emit_persist_saves(&mut self) {
+        let persist_vars: Vec<(String, ValueId)> = if let Some(ref f) = self.current_func {
+            f.persist_vars.clone()
+        } else {
+            return;
+        };
+        for (name, alloca) in persist_vars {
+            let loaded = self.emit_inst(Inst::Load { ptr: alloca, ty: IrType::I64 });
+            self.emit_inst(Inst::PersistSave {
+                name,
+                value: loaded,
+            });
         }
     }
 

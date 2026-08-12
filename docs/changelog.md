@@ -1,6 +1,61 @@
-# Pledge Language Changelog
+# P Language Changelog
 
-## [Unreleased] — Optimization Improvements + Documentation Audit
+## [Unreleased] — Documentation Audit + Roadmap Accuracy Pass
+
+### Documentation Updates
+- **`docs/roadmap.md`**: Full rewrite for accuracy — fixed inconsistencies between overview status labels and section headers (Phase 3/4/5 said "MOSTLY COMPLETE" in overview but "Complete" in section headers). Added "What's Left" section to each phase. Added "Summary: Are Phases 1–5 Fully Done?" table. Added "Recommended Next Steps" priority list. Updated all test counts to verified Aug 2026 baseline.
+- **`README.md`**: Updated test results table — 136/136 unit tests (was 133), 8/8 harness tests (was 7/8 — `golden_files_match` now passes), 78/78 interpreter + 1/1 expected-fail (was 78/79), 76/78 C codegen + 1/1 expected-fail (was 75/79). Updated phase status to reflect Phases 1–5 actual state.
+- **`features.md`**: Updated test counts in header and C codegen row.
+- **`TEST.md`**: Updated test summary table and per-backend sections with accurate counts. Documented `test_db` flakiness (HashMap ordering non-deterministic).
+
+### Verified Test Baseline (Aug 2026)
+- **Unit tests**: 136/136 pass
+- **Harness tests**: 8/8 pass (golden_files_match now passes — was previously failing)
+- **Interpreter**: 78/78 normal + 1/1 expected-fail
+- **PE Emitter**: 78/78 normal + 1/1 expected-fail
+- **C Codegen**: 76/78 normal + 1/1 expected-fail (2 real mismatches: test_asm by design, test_comptime_reflect interpreter-only; test_db flaky due to HashMap ordering)
+- **Total .p test files**: 102 (79 root + 23 subdirs)
+- **Source**: 35 .rs files, 47,397 LOC
+
+### Phase Status Summary
+- **Phase 1 — Foundation**: COMPLETE, nothing left
+- **Phase 2 — Safety**: COMPLETE (interpreter), C codegen coverage gap for runtime allocator/effect-handler dispatch
+- **Phase 3 — Power**: COMPLETE (interpreter), C codegen gap for comptime reflection
+- **Phase 4 — Performance**: MOSTLY COMPLETE — regalloc bug blocks --opt by default, GetFieldPtr offset workaround
+- **Phase 5 — Platform**: MOSTLY COMPLETE — all features work in interpreter, C codegen coverage partial, test_db flaky
+
+## [Previous] — Optimization Improvements + Documentation Audit + Safety Net
+
+### Verification Infrastructure
+- **`verify.sh`**: Build + test + compare to baseline. Prevents "fix one thing, break everything" by diffing test results against a known-good baseline.
+- **`scripts/gen_golden.sh`**: Generate golden files for 15 key tests at each compiler stage (IR, PIR L1/L2/L3, assembly, peephole, output).
+- **`scripts/bisect.sh`**: Bisect which compiler layer introduced a regression by diffing each stage against golden files. Normalizes non-deterministic output (HashMap ordering, stack slot offsets, string constant numbering).
+- **`AGENTS.md`**: Working guide for AI assistants and humans — build commands, high-risk files, known bugs, coding conventions, debugging workflow.
+- **`docs/best-practices.md`**: 15 sections of hard-won insights from building the custom toolchain — register allocator traps, peephole correctness rules, ABI awareness, testing discipline, non-deterministic output issues.
+
+### Register Allocator Improvements (regalloc.rs)
+- **Pre-assigned arg register spilling**: When a function parameter is in a caller-saved register and a call clobbers it during the parameter's live range, spill the parameter to the stack. Updates `arg_locations` so the codegen prologue saves the arg register to the spill slot.
+- **Spill offset alignment fix**: `spill_offset` now starts at `func.frame_size + 8` to match the codegen prologue's stack layout expectation.
+
+### Peephole Optimizer Fixes (peephole.rs)
+- **LEA coalescing across calls**: `pass_lea_coalesce` now clears tracking state on `call`/`callq` instructions. Calls clobber caller-saved registers, invalidating LEA→register forwarding.
+- **Dead store elimination safety**: `pass_store_load_forward` now checks if the next instruction reads from the destination as a memory address before eliminating a store. Prevents incorrect elimination of stores needed for address-dependent loads.
+
+### Codegen Improvements (codegen_x64.rs)
+- **Closure environment passing**: `gen_call_ptr` now properly handles `has_env` flag — loads function pointer from `env[0]`, passes env pointer as first argument (RDI), shifts user args to start at RSI.
+- **`Operand::ImmFunc` support**: Function addresses loaded via RIP-relative LEA for both register and stack slot destinations.
+
+### Runtime (runtime_linux.rs)
+- **`p_print_vec` implementation**: Hand-encoded x86-64 machine code for printing vectors in `[1, 2, 3]` format. Uses callee-saved registers (RBX, R12, R13) to preserve state across `write` syscalls and `p_print_int` calls.
+
+### Documentation Updates
+- **"Pledge" → "P" rename**: All documentation updated to use "P" as the language name (14 files). `pledgec` kept as compiler binary name. `PledgeOS` preserved as separate product name. `changelog.md` kept as "Pledge" for historical accuracy.
+- **`docs/custom-toolchain.md`**: Full rewrite from aspirational Phase 1 to actual Phase 4D state — all 10 sections updated with real status.
+- **`docs/full-stack-architecture.md`**: Full rewrite — architecture diagram, PIR levels, codegen backends, linker, runtime, stdlib, embedded/IoT, hot reload, C FFI, bootstrapping strategy.
+- **`docs/syntax-spec.md`**: Targeted updates — version 0.5.0, keyword list from token.rs, stdlib types (removed non-existent Box/Rc/Arc), effect handlers status (partial), comptime reflection, attributes status (#[test]/#[derive] honest), concurrency status (parsed-only), capability security (actual syntax), hot reload (actual implementation).
+- **C codegen test parity**: Improved from 53/79 to 75/79.
+
+## [Previous] — Optimization Improvements + Documentation Audit
 
 ### Peephole Optimizer — 3 New Passes (peephole.rs)
 - **Store-to-load forwarding**: `movq %src, -N(%rbp)` followed by `movq -N(%rbp), %dst` → replace load with `movq %src, %dst`. Eliminates redundant memory traffic.

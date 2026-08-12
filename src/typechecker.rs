@@ -50,6 +50,12 @@ pub struct TypeChecker {
     current_func_name: Option<String>,
     /// Current Self type (set when checking impl methods, for bare `self` params)
     current_self_type: Option<String>,
+    /// Sandbox depth — when > 0, all capabilities are revoked.
+    /// Any IO/FS/Net/Spawn call inside a sandbox block is a compile error.
+    sandbox_depth: usize,
+    /// Stack of (region_name, budget_bytes, current_usage_bytes) for active
+    /// region blocks with budgets. Used to track and enforce memory budgets.
+    region_budgets: Vec<(String, Option<u64>, u64)>,
 }
 
 impl TypeChecker {
@@ -80,6 +86,8 @@ impl TypeChecker {
             cap_verified: HashSet::new(),
             current_func_name: None,
             current_self_type: None,
+            sandbox_depth: 0,
+            region_budgets: Vec::new(),
         }
     }
 
@@ -532,6 +540,9 @@ impl TypeChecker {
             Stmt::RegionBlock { body, .. } => {
                 self.scan_stmts_for_effects(body, effects);
             }
+            Stmt::Sandbox { body, .. } => {
+                self.scan_stmts_for_effects(body, effects);
+            }
             _ => {}
         }
     }
@@ -624,9 +635,54 @@ impl TypeChecker {
         }
     }
 
+    /// Estimate the size in bytes of a type for budget checking.
+    /// This is a conservative estimate — uses platform defaults.
+    fn type_size(&self, ty: &Type) -> u64 {
+        match ty {
+            Type::I8 | Type::U8 | Type::Bool => 1,
+            Type::I16 | Type::U16 => 2,
+            Type::I32 | Type::U32 | Type::F32 => 4,
+            Type::I64 | Type::U64 | Type::F64 => 8,
+            Type::I128 | Type::U128 => 16,
+            Type::Str => 16, // ptr + len
+            Type::Named(name) => {
+                // Check if it's a known struct
+                if let Some(fields) = self.structs.get(name) {
+                    fields.len() as u64 * 8 // conservative: 8 per field
+                } else if name == "String" {
+                    16
+                } else {
+                    8
+                }
+            }
+            Type::Generic { name, args } => {
+                match name.as_str() {
+                    "Vec" => 24,        // ptr + len + cap
+                    "HashMap" => 48,    // conservative
+                    "Option" => 16,     // tag + payload
+                    "Result" => 16,     // tag + payload
+                    _ => 8,
+                }
+            }
+            Type::Ref { .. } => 8, // pointer
+            _ => 8, // conservative default
+        }
+    }
+
     /// Check if a capability is granted to the current module.
     /// In non-strict mode (no `with` clauses), all capabilities are granted.
+    /// Inside a `sandbox { }` block, ALL capabilities are revoked.
     fn check_capability(&mut self, cap: &str, context: &str) {
+        if self.sandbox_depth > 0 {
+            self.errors.push(format!(
+                "Sandbox error: '{}' requires '{}' capability — all capabilities are revoked inside sandbox {{ }}",
+                context, cap
+            ));
+            if let Some(fname) = &self.current_func_name {
+                self.cap_verified.remove(fname);
+            }
+            return;
+        }
         if self.strict_caps && !self.granted_caps.contains(cap) {
             self.errors.push(format!(
                 "Capability error: '{}' requires '{}' capability (not granted to module '{}')",
@@ -753,7 +809,7 @@ impl TypeChecker {
 
     fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let { name, ty, expr, is_mut: _, line: _ } => {
+            Stmt::Let { name, ty, expr, is_mut: _, is_persist: _, line: _ } => {
                 let expr_ty = self.check_expr(expr);
                 let final_ty = if let Some(declared) = ty {
                     if !self.types_compatible(declared, &expr_ty) {
@@ -769,6 +825,11 @@ impl TypeChecker {
                 // Track region: if inside a region block, record the allocation region
                 if let Some(region) = self.region_stack.last() {
                     self.var_regions.insert(name.clone(), region.clone());
+                    // Track allocation size for budget checking
+                    let size = self.type_size(&final_ty);
+                    if let Some(entry) = self.region_budgets.last_mut() {
+                        entry.2 += size;
+                    }
                 }
                 self.declare(name, final_ty);
             }
@@ -971,10 +1032,12 @@ impl TypeChecker {
                     self.check_expr(arg);
                 }
             }
-            Stmt::RegionBlock { name, body, .. } => {
+            Stmt::RegionBlock { name, budget, body, .. } => {
                 // Push region scope
                 self.region_stack.push(name.clone());
                 self.push_scope();
+                // Push budget tracker
+                self.region_budgets.push((name.clone(), *budget, 0));
 
                 // Snapshot variables before the region block
                 let vars_before: HashSet<String> = self
@@ -1025,6 +1088,28 @@ impl TypeChecker {
                         }
                     }
                 }
+
+                // Check memory budget
+                if let Some((_, budget_opt, usage)) = self.region_budgets.pop() {
+                    if let Some(budget) = budget_opt {
+                        if usage > budget {
+                            self.errors.push(format!(
+                                "Budget error: region '{}' used {} bytes but budget is {} bytes ({} bytes over)",
+                                region_name, usage, budget, usage - budget
+                            ));
+                        }
+                    }
+                }
+            }
+            Stmt::Sandbox { body, .. } => {
+                // Push scope and enter sandbox mode (all capabilities revoked)
+                self.push_scope();
+                self.sandbox_depth += 1;
+                for s in body {
+                    self.check_stmt(s);
+                }
+                self.sandbox_depth -= 1;
+                self.pop_scope();
             }
             Stmt::ComptimeGen { .. } => {}
         }

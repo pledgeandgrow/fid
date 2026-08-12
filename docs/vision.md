@@ -58,11 +58,11 @@ P is a systems programming language built from first principles — every layer 
 - **Custom typechecker**: region inference + effect system + capability checking
 - **Custom IR (PIR)**: P Intermediate Representation — typed, semantic, multi-level
 - **Custom optimizer**: semantic-aware, leverages region/effect/capability info
-- **Custom codegen**: direct to machine code (x86-64, ARM64, RISC-V)
+- **Custom codegen**: direct to machine code (x86-64, ARM64, RISC-V) — **DONE**
 - **Custom linker**: integrated, not a separate process
 - **Custom stdlib**: no libc dependency for core operations
 - **Custom allocator**: region-aware, built into the language runtime
-- Minimal external dependency: only the Rust compiler to build P (bootstrapping later)
+- Minimal external dependencies: the Rust compiler plus 4 crates (hashbrown, compact_str, smallvec, bumpalo) to build P (bootstrapping later)
 
 ### 8. Innovation — Optimized for AI, Robotics, Hardware, IoT
 - **AI/ML**: comptime specialization for tensor operations, SIMD intrinsics as first-class

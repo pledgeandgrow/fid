@@ -451,6 +451,14 @@ impl Linker {
         // Resolve relocations and patch the text
         let text_size = self.text_bytes.len() as u64;
         for (offset, sym_name, r_type) in &self.relocations {
+            if sym_name.contains("p_string_split") || sym_name.contains("p_string_trim") {
+                eprintln!("  LINK RELOC: off=0x{:x} name={} rtype={}", offset, sym_name, r_type);
+                if let Some((sym_offset, is_defined)) = self.symbols.get(sym_name) {
+                    eprintln!("    → sym at 0x{:x} defined={}", sym_offset, is_defined);
+                } else {
+                    eprintln!("    → sym NOT FOUND");
+                }
+            }
             // Look up symbol in text symbols first, then rodata symbols
             let sym_offset_opt = if let Some((sym_offset, is_defined)) = self.symbols.get(sym_name) {
                 if !is_defined {
@@ -475,21 +483,11 @@ impl Linker {
             if let Some(sym_offset) = sym_offset_opt {
                 let patch_offset = *offset as usize;
                 if patch_offset + 4 <= self.text_bytes.len() {
+                    if sym_name == "p_print_int" && *offset >= 0xd40 && *offset <= 0xd50 {
+                        let next_rip = patch_offset as i64 + 4;
+                        let delta = sym_offset as i64 - next_rip;
+                    }
                     match r_type {
-                        2 => {
-                            // R_X86_64_PC32: PC-relative 32-bit
-                            let next_rip = patch_offset as i64 + 4;
-                            let delta = sym_offset as i64 - next_rip;
-                            self.text_bytes[patch_offset..patch_offset + 4]
-                                .copy_from_slice(&(delta as i32).to_le_bytes());
-                        }
-                        4 => {
-                            // R_X86_64_PLT32: same as PC32 for our purposes
-                            let next_rip = patch_offset as i64 + 4;
-                            let delta = sym_offset as i64 - next_rip;
-                            self.text_bytes[patch_offset..patch_offset + 4]
-                                .copy_from_slice(&(delta as i32).to_le_bytes());
-                        }
                         2 => {
                             // R_X86_64_PC32: PC-relative 32-bit
                             let next_rip = patch_offset as i64 + 4;

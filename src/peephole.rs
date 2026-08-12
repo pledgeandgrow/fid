@@ -376,9 +376,31 @@ fn pass_dead_store(lines: Vec<String>) -> Vec<String> {
                                 let next_operands: Vec<&str> =
                                     nops.split(',').map(|o| o.trim()).collect();
                                 if next_operands.len() == 2 && next_operands[1] == dst {
-                                    // Dead store — skip this instruction.
-                                    i += 1;
-                                    continue;
+                                    // Check if the next instruction reads from dst
+                                    // (e.g., `movq (%rax), %rax` reads %rax as
+                                    // a memory address). If so, this is NOT a
+                                    // dead store.
+                                    let next_src = next_operands[0];
+                                    let reads_dst = next_src.contains(dst)
+                                        || next_src.contains("(%rax)")
+                                        || next_src.contains("(%rcx)")
+                                        || next_src.contains("(%rdx)")
+                                        || next_src.contains("(%rbx)")
+                                        || next_src.contains("(%rsi)")
+                                        || next_src.contains("(%rdi)")
+                                        || next_src.contains("(%r8)")
+                                        || next_src.contains("(%r9)")
+                                        || next_src.contains("(%r10)")
+                                        || next_src.contains("(%r11)")
+                                        || next_src.contains("(%r12)")
+                                        || next_src.contains("(%r13)")
+                                        || next_src.contains("(%r14)")
+                                        || next_src.contains("(%r15)");
+                                    if !reads_dst {
+                                        // Dead store — skip this instruction.
+                                        i += 1;
+                                        continue;
+                                    }
                                 }
                             }
                         }

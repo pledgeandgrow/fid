@@ -158,6 +158,8 @@ pub enum L1Inst {
 
     // ─── Conversions (pure) ───
     BitCast { value: PValue, from: PirType, to: PirType },
+    /// Copy a value (used for PersistLoad which just returns the default).
+    Copy { value: PValue, ty: PirType },
     IntExtend { value: PValue, from: PirType, to: PirType },
     IntTrunc { value: PValue, from: PirType, to: PirType },
     IntToFloat { value: PValue, from: PirType, to: PirType },
@@ -229,6 +231,7 @@ impl L1Inst {
             L1Inst::DynCall { .. } => "DynCall",
             L1Inst::MakeDyn { .. } => "MakeDyn",
             L1Inst::BitCast { .. } => "BitCast",
+            L1Inst::Copy { .. } => "Copy",
             L1Inst::IntExtend { .. } => "IntExtend",
             L1Inst::IntTrunc { .. } => "IntTrunc",
             L1Inst::IntToFloat { .. } => "IntToFloat",
@@ -325,6 +328,7 @@ pub enum L2Inst {
     MakeDyn { value: PValue, type_name: String, trait_name: String },
 
     BitCast { value: PValue, from: PirType, to: PirType },
+    Copy { value: PValue, ty: PirType },
     IntExtend { value: PValue, from: PirType, to: PirType },
     IntTrunc { value: PValue, from: PirType, to: PirType },
     IntToFloat { value: PValue, from: PirType, to: PirType },
@@ -370,6 +374,7 @@ impl L2Inst {
             L2Inst::DynCall { .. } => "DynCall",
             L2Inst::MakeDyn { .. } => "MakeDyn",
             L2Inst::BitCast { .. } => "BitCast",
+            L2Inst::Copy { .. } => "Copy",
             L2Inst::IntExtend { .. } => "IntExtend",
             L2Inst::IntTrunc { .. } => "IntTrunc",
             L2Inst::IntToFloat { .. } => "IntToFloat",
@@ -440,6 +445,7 @@ pub enum Operand {
     ImmI(i64),
     ImmF(u64), // f64 bits
     ImmStr(String),
+    ImmFunc(String), // function address (for closure envs)
     ImmNull,
 }
 
@@ -451,6 +457,7 @@ impl fmt::Display for Operand {
             Operand::ImmI(v) => write!(f, "#{}", v),
             Operand::ImmF(b) => write!(f, "#f:{}", b),
             Operand::ImmStr(s) => write!(f, "\"{}\"", s),
+            Operand::ImmFunc(s) => write!(f, "&{}", s),
             Operand::ImmNull => write!(f, "#null"),
         }
     }
@@ -760,6 +767,14 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
                 ok_block: *ok_block,
             },
             Inst::Print { value, ty } => L1Inst::Print { value: *value, ty: ty.clone() },
+            Inst::PersistLoad { default, ty, .. } => L1Inst::Copy {
+                value: *default,
+                ty: ty.clone(),
+            },
+            Inst::PersistSave { .. } => L1Inst::Copy {
+                value: ValueId(0),
+                ty: PirType::I64,
+            },
             Inst::Panic { message } => L1Inst::Panic { message: message.clone() },
             Inst::Asm { template, .. } => L1Inst::Panic { message: format!("inline asm not supported in PIR: {}", template) },
             Inst::RegionBegin { name } => L1Inst::NewRegion { name: name.clone() },
@@ -827,9 +842,11 @@ fn mem_region_of(r: &RegionRef) -> MemRegion {
 
 fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
     let mut values: HashMap<PValue, L2Inst> = HashMap::new();
-    // Track NewRegion handles so we can drop them and remap AllocaIn that
-    // referenced them to Heap.
+    // Track NewRegion and FreeRegion handles so we can drop them from the
+    // block instruction lists and remap AllocaIn that referenced NewRegion
+    // to Heap.
     let mut region_handles: HashMap<PValue, ()> = HashMap::new();
+    let mut dropped_insts: HashMap<PValue, ()> = HashMap::new();
 
     for (vid, (inst, region, _effects, _line)) in &f.values {
         match inst {
@@ -837,11 +854,13 @@ fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
                 // Drop the instruction; record the handle so FreeRegion and
                 // any AllocaIn referencing it can be remapped.
                 region_handles.insert(*vid, ());
+                dropped_insts.insert(*vid, ());
                 continue;
             }
             L1Inst::FreeRegion { region: r } => {
                 let _ = r;
                 // Drop free-region; L2 doesn't model region lifetimes.
+                dropped_insts.insert(*vid, ());
                 continue;
             }
             _ => {}
@@ -925,6 +944,10 @@ fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
                 from: from.clone(),
                 to: to.clone(),
             },
+            L1Inst::Copy { value, ty } => L2Inst::Copy {
+                value: *value,
+                ty: ty.clone(),
+            },
             L1Inst::IntExtend { value, from, to } => L2Inst::IntExtend {
                 value: *value,
                 from: from.clone(),
@@ -962,14 +985,14 @@ fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
         values.insert(*vid, l2_inst);
     }
 
-    // Rebuild block instruction lists, dropping dropped value IDs.
-    let dropped: HashMap<PValue, ()> = region_handles;
+    // Rebuild block instruction lists, dropping dropped value IDs
+    // (NewRegion and FreeRegion are not in L2).
     let blocks = f
         .blocks
         .iter()
         .map(|b| L2Block {
             id: b.id,
-            instructions: b.instructions.iter().filter(|v| !dropped.contains_key(v)).copied().collect(),
+            instructions: b.instructions.iter().filter(|v| !dropped_insts.contains_key(v)).copied().collect(),
             predecessors: b.predecessors.clone(),
             params: b.params.clone(),
         })
@@ -1072,6 +1095,7 @@ fn lower_func_l2_to_l3(f: &L2Function, module: &IrModule) -> L3Function {
                 &mut vreg_of,
                 &mut operand,
                 &slot_of,
+                module,
             );
             l3_insts.push(l3_inst);
         }
@@ -1119,6 +1143,7 @@ fn lower_l2_inst_to_l3(
     vreg_of: &mut HashMap<PValue, VReg>,
     operand: &mut impl FnMut(PValue, &mut u32, &mut HashMap<PValue, VReg>) -> Operand,
     slot_of: &HashMap<PValue, Slot>,
+    module: &IrModule,
 ) -> L3Inst {
     let mut new_vreg = |next: &mut u32| -> VReg {
         let r = VReg(*next);
@@ -1152,7 +1177,15 @@ fn lower_l2_inst_to_l3(
         },
         L2Inst::ConstFloat { bits, .. } => L3Inst::Mov { dst, src: Operand::ImmF(*bits) },
         L2Inst::ConstBool { value } => L3Inst::Mov { dst, src: Operand::ImmI(if *value { 1 } else { 0 }) },
-        L2Inst::ConstStr { value } => L3Inst::Mov { dst, src: Operand::ImmStr(value.clone()) },
+        L2Inst::ConstStr { value } => {
+            // If this string is a known function name, emit ImmFunc (function address)
+            // instead of ImmStr (string pointer). This is used by closure envs.
+            if module.functions.contains_key(value) {
+                L3Inst::Mov { dst, src: Operand::ImmFunc(value.clone()) }
+            } else {
+                L3Inst::Mov { dst, src: Operand::ImmStr(value.clone()) }
+            }
+        }
         L2Inst::ConstNull { .. } => L3Inst::Mov { dst, src: Operand::ImmNull },
 
         L2Inst::BinOp { op, left, right, ty } => L3Inst::Bin {
@@ -1266,6 +1299,10 @@ fn lower_l2_inst_to_l3(
             from: from.clone(),
             to: to.clone(),
             kind: CastKind::BitCast,
+        },
+        L2Inst::Copy { value, .. } => L3Inst::Mov {
+            dst,
+            src: materialize(*value, next, vreg_of, operand),
         },
         L2Inst::IntExtend { value, from, to } => L3Inst::Cast {
             dst,
@@ -1506,6 +1543,7 @@ fn fmt_l1_inst(i: &L1Inst) -> String {
             format!("makedyn {} as {} for {}", value, type_name, trait_name)
         }
         BitCast { value, from, to } => format!("bitcast {} {} -> {}", value, from, to),
+        Copy { value, ty } => format!("copy {} -> {}", value, ty),
         IntExtend { value, from, to } => format!("int_extend {} {} -> {}", value, from, to),
         IntTrunc { value, from, to } => format!("int_trunc {} {} -> {}", value, from, to),
         IntToFloat { value, from, to } => format!("int_to_float {} {} -> {}", value, from, to),
@@ -1600,6 +1638,7 @@ fn fmt_l2_inst(i: &L2Inst) -> String {
             format!("makedyn {} as {} for {}", value, type_name, trait_name)
         }
         BitCast { value, from, to } => format!("bitcast {} {} -> {}", value, from, to),
+        Copy { value, ty } => format!("copy {} -> {}", value, ty),
         IntExtend { value, from, to } => format!("int_extend {} {} -> {}", value, from, to),
         IntTrunc { value, from, to } => format!("int_trunc {} {} -> {}", value, from, to),
         IntToFloat { value, from, to } => format!("int_to_float {} {} -> {}", value, from, to),

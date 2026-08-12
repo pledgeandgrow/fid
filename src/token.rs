@@ -33,6 +33,8 @@ pub enum TokenKind {
     Dyn,         // dyn — trait object
     Where,       // where
     Region,      // region
+    Sandbox,     // sandbox — capability revocation block
+    Persist,     // persist — variable persists across hot reloads
     For,         // for
     While,       // while
     Loop,        // loop
@@ -170,6 +172,8 @@ impl fmt::Display for TokenKind {
             TokenKind::Dyn => write!(f, "dyn"),
             TokenKind::Where => write!(f, "where"),
             TokenKind::Region => write!(f, "region"),
+            TokenKind::Sandbox => write!(f, "sandbox"),
+            TokenKind::Persist => write!(f, "persist"),
             TokenKind::For => write!(f, "for"),
             TokenKind::While => write!(f, "while"),
             TokenKind::Loop => write!(f, "loop"),

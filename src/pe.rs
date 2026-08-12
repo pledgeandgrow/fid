@@ -2718,6 +2718,16 @@ impl PeCodeGen {
                 self.enc.add_rsp_i32(32);
             }
 
+            Inst::PersistLoad { default, .. } => {
+                // Persistent load — just copy default value to destination
+                let doff = frame.offset(*default) as i32;
+                let dst_off = frame.offset(id) as i32;
+                self.enc.mov_reg_mem_rbp(Reg::Rax, doff);
+                self.enc.mov_mem_rbp_reg(dst_off, Reg::Rax);
+            }
+            Inst::PersistSave { .. } => {
+                // No-op in PE emitter
+            }
             Inst::Panic { message } => {
                 let off = self.str_off(message);
                 self.enc.lea_rip(Reg::Rcx, off);

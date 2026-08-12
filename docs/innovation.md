@@ -30,7 +30,7 @@ No language can:
 
 ## AI/ML — First-Class Support
 
-### SIMD Types
+### SIMD Types (WORKING — see `stdlib/simd.p`)
 ```
 // SIMD is a first-class type, not an intrinsic
 pv a: simd[i64; 4] = [1, 2, 3, 4];
@@ -38,7 +38,7 @@ pv b: simd[i64; 4] = [5, 6, 7, 8];
 pv c: simd[i64; 4] = a + b;  // vectorized addition, one instruction
 ```
 
-### Tensor Type
+### Tensor Type (WORKING — see `stdlib/tensor.p`)
 ```
 // Tensors are n-dimensional arrays with stride info
 pv weights: Tensor[f32; 784, 128] = load_weights("model.bin");
@@ -59,7 +59,7 @@ pf comptime matmul[M: comptime, N: comptime, K: comptime](
 }
 ```
 
-### GPU Targeting (Future)
+### GPU Targeting (Implemented — SPIR-V codegen in `src/gpu.rs`)
 ```
 // Same P code, different target
 #[target(gpu)]

@@ -272,6 +272,7 @@ fn value_refs(inst: &L2Inst) -> Vec<PValue> {
         }
         L2Inst::MakeDyn { value, .. } => vec![*value],
         L2Inst::BitCast { value, .. }
+        | L2Inst::Copy { value, .. }
         | L2Inst::IntExtend { value, .. }
         | L2Inst::IntTrunc { value, .. }
         | L2Inst::IntToFloat { value, .. }
@@ -1561,6 +1562,7 @@ fn clone_inst_remapped(inst: &L2Inst, map: &std::collections::HashMap<PValue, PV
         L2Inst::DynCall { trait_name, method, args, ret_ty } => L2Inst::DynCall { trait_name: trait_name.clone(), method: method.clone(), args: args.iter().map(r).collect(), ret_ty: ret_ty.clone() },
         L2Inst::MakeDyn { value, type_name, trait_name } => L2Inst::MakeDyn { value: r(value), type_name: type_name.clone(), trait_name: trait_name.clone() },
         L2Inst::BitCast { value, from, to } => L2Inst::BitCast { value: r(value), from: from.clone(), to: to.clone() },
+        L2Inst::Copy { value, ty } => L2Inst::Copy { value: r(value), ty: ty.clone() },
         L2Inst::IntExtend { value, from, to } => L2Inst::IntExtend { value: r(value), from: from.clone(), to: to.clone() },
         L2Inst::IntTrunc { value, from, to } => L2Inst::IntTrunc { value: r(value), from: from.clone(), to: to.clone() },
         L2Inst::IntToFloat { value, from, to } => L2Inst::IntToFloat { value: r(value), from: from.clone(), to: to.clone() },

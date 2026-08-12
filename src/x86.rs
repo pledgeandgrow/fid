@@ -618,6 +618,15 @@ impl X86CodeGen {
                 wln!(self, "    add rsp, 32");
             }
 
+            Inst::PersistLoad { default, .. } => {
+                // Just copy default value to destination
+                let doff = frame.offset(*default);
+                wln!(self, "    mov rax, [rbp{}]", fmt_offset(doff));
+                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+            }
+            Inst::PersistSave { .. } => {
+                // No-op
+            }
             Inst::Panic { message } => {
                 let label = self.intern_string(message);
                 // Emit the string in data section if not already there

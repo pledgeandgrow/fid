@@ -4,18 +4,19 @@ A bootstrap compiler for the P programming language, written in Rust. Generates 
 
 ## Status
 
-**Phase 1: Bootstrap — Complete.** **Phase 2: Safety — Complete.** The compiler lexes, parses, type-checks, lowers to SSA IR, and generates native executables. The **ELF64 emitter** (`build --target x86-64` on Linux) produces working executables directly — no assembler, linker, or C compiler required. The **PE emitter** (`emit` command) produces Windows `.exe` files directly. Phase 2 adds region inference, effect system, capability security (with compile-time elision), and bounds safety.
+**Phase 1: Foundation — Complete.** **Phase 2: Safety — Complete.** **Phase 3: Power — Complete (interpreter).** **Phase 4: Performance — Mostly complete.** **Phase 5: Platform — Mostly complete.** The compiler lexes, parses, type-checks, lowers to SSA IR, and generates native executables. The **ELF64 emitter** (`build --target x86-64` on Linux) produces working executables directly — no assembler, linker, or C compiler required. The **PE emitter** (`emit` command) produces Windows `.exe` files directly. Phase 2 adds region inference, effect system, capability security (with compile-time elision), and bounds safety. Phase 4 has a known register allocator bug that prevents `--opt` from being enabled by default. See `docs/roadmap.md` for full phase status and what's left.
 
-### Test Results (Verified)
+### Test Results (Verified Aug 2026)
 
 | Test Group | Result | Notes |
 |------------|:------:|-------|
-| Unit tests (`cargo test --bin pledgec`) | **133/133** | elf64, pir, peephole (26 tests), opt, regalloc, tensor, codegen_x64 |
-| Harness tests (`cargo test --test harness`) | **7/8** | 1 failure: `golden_files_match` — interpreter prints Rust debug format for Vec/Map/Ptr instead of user-friendly output |
-| Interpreter (`pledgec test`) | **78/79** | 1 failure: `test_trait_verify_fail` — expected compile-time failure test |
-| PE Emitter (`pledgec test`) | **78/79** | 1 failure: `test_trait_verify_fail` (same — expected to fail) |
-| C Codegen (`pledgec test`) | **53/79** | 26 mismatches — C codegen lacks support for: asm, boot, bounds_check, comptime_reflect/serialize, const_generic, db, fstring_int/vec, gat, http, interrupt, json, matrix_mul, mmu, parallel, print_map, regression_collections, shape, simd, tensor, trait_object, trait_verify_fail, type_alias, vec_one, strings |
+| Unit tests (`cargo test --bin pledgec`) | **136/136** | elf64, pir, peephole (26 tests), opt, regalloc, tensor, codegen_x64, hotreload (8), embedded, gpu, wasm, coff, macho, linker |
+| Harness tests (`cargo test --test harness`) | **8/8** | All pass including golden_files_match |
+| Interpreter (`pledgec test`) | **78/78** normal + **1/1** expected-fail | `test_trait_verify_fail` is expected to fail (tests error detection) |
+| PE Emitter (`pledgec test`) | **78/78** normal + **1/1** expected-fail | All PE structures valid |
+| C Codegen (`pledgec test`) | **76/78** normal + **1/1** expected-fail | 2 real mismatches: `test_asm` (inline asm — by design), `test_comptime_reflect` (comptime reflection — interpreter-only). `test_db` is flaky (HashMap ordering). |
 | Total `.p` test files | **102** | 79 root + 9 safety + 4 capability + 7 effects + 3 regions |
+| Source files | **35** `.rs` | 47,397 LOC |
 | Golden files | **43** | Expected outputs in `tests/golden/` |
 
 ### What Works (Verified End-to-End)
@@ -84,6 +85,23 @@ A bootstrap compiler for the P programming language, written in Rust. Generates 
 | Integer overflow checking | Runtime (debug) | Runtime (debug) | Runtime (debug) |
 | `Option::unwrap` panics on None | Yes | Yes | Yes |
 | Bare-metal mode (`emit --bare`) | N/A | Yes (flat binary) | N/A |
+| `comptime` blocks + reflection | Yes | Yes | Partial |
+| C FFI (`extern "C"`) | Yes (stubs) | Yes | Yes |
+| Const generics (`[T; N]`) | Yes | Yes | Yes |
+| GATs (Generic Associated Types) | Yes | Yes | Yes |
+| SIMD types (`stdlib/simd.p`) | Yes | Yes | Partial |
+| Tensor type (`stdlib/tensor.p`) | Yes | Yes | Partial |
+| JSON parsing (`stdlib/json.p`) | Yes | Yes | Partial |
+| HTTP server (`stdlib/http.p`) | Yes | Yes | N/A |
+| Database framework (`stdlib/db.p`) | Yes | Yes | N/A |
+| Parallel operations (`stdlib/parallel.p`) | Yes | Yes | N/A |
+| WebAssembly backend (`pledgec wasm`) | N/A | N/A | N/A |
+| SPIR-V GPU backend (`pledgec gpu`) | N/A | N/A | N/A |
+| Hot reload (`pledgec watch`) | N/A | N/A | N/A |
+| Multi-arch codegen (x86-64/ARM64/RISC-V) | N/A | N/A | N/A |
+| ELF64/Mach-O/COFF object files | N/A | N/A | N/A |
+| Integrated linker (`pledgec link`) | N/A | N/A | N/A |
+| Embedded/IoT support (`embedded.rs`) | N/A | N/A | N/A |
 
 ### What Is Parsed But Not Fully Working
 
@@ -91,28 +109,22 @@ A bootstrap compiler for the P programming language, written in Rust. Generates 
 |---------|--------|-------|
 | `async` / `await` | Parsed | Phase 4+ — not yet implemented |
 | `spawn` | Parsed | Phase 4+ — not yet implemented |
-| `comptime` blocks | Working | `comptime <expr>`, `comptime { block }`, reflection — Phase 3A |
 | `#[test]` attribute | Parsed | Not yet executed by `pledgec test` |
 | `#[derive]` | Parsed | Not yet implemented |
 | Effect handler continuations | Syntax works | `handle { do } with` parses and runs; full continuation semantics pending |
-| Const generics (`[T; N]`) | Working | `ArrayConst` type variant, monomorphization handles it — `test_const_generic.p` passes in interpreter |
-| GATs (Generic Associated Types) | Working | `test_gat.p` passes in interpreter, outputs correct results |
-| C FFI (`extern "C"`) | Working | Parsed, lowered, C codegen, interpreter stubs — `test_ffi.p`, `test_ffi_full.p`, `test_ffi_header.p` pass |
+| `--opt` (L2 optimizer) | Partial | Inliner fixed, but exposes pre-existing register allocator bug for complex programs. Simple programs work correctly. Not enabled by default. |
 | Default arguments | Not parsed | Not yet implemented |
 | Variadic arguments | Not parsed | Not yet implemented |
-| `--opt` (L2 optimizer) | Partial | Inliner fixed, but exposes pre-existing register allocator bug for complex programs. Simple programs work correctly. Not enabled by default. |
-| Hot reload | Code exists | `hotreload.rs` — mmap-based code loading, not wired into default pipeline |
 
 ### Known Limitations
 
 - **ELF64 executable emission works on Linux** — `pledgec build <file> --target x86-64` produces working ELF64 executables directly (zero external tools). `pledgec codegen --elf <out.o>` emits valid relocatable objects (readelf compatible). `pledgec codegen --macho` and `--coff` also produce valid object files.
-- **PE emitter targets Windows x64 only** — `pledgec emit` produces PE32+ executables; tested via `pledgec test` (78/79 valid)
+- **PE emitter targets Windows x64 only** — `pledgec emit` produces PE32+ executables; tested via `pledgec test` (78/78 valid + 1/1 expected-fail)
 - **Register allocator has a pre-existing bug** — linear scan allocator in `regalloc.rs` maps VRegs to physical registers, but constants not loaded into registers before use can be clobbered by intervening instructions. Exposed by the L2 optimizer's instruction reordering. Blocks enabling `--opt` by default.
 - **Peephole optimizer always on** — 9 passes run automatically in the `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
 - **L2 optimizer (`--opt`) not enabled by default** — PIR optimizer exists (`pledgec opt`, `pledgec pir --opt`, `pledgec build --opt`) with constant folding, DCE, CSE, inlining, TCO, loop unrolling, and effect-based pure function elision. Works for simple programs but exposes the register allocator bug on complex ones.
 - **`#[test]` attribute** — parsed but not executed by `pledgec test` (tests are file-based)
-- **Interpreter output formatting** — Vec, Map, and raw string pointers print as Rust debug format (`Vec(RefCell { ... })`, `Ptr(0x...)`) instead of user-friendly output. This causes the `golden_files_match` harness test to fail.
-- **C codegen coverage** — 53/79 tests match interpreter output. 26 tests fail due to missing C codegen support for: inline asm, bare-metal, bounds checks, comptime reflection/serialization, const generics, GATs, databases, f-strings with int/vec, HTTP, interrupts, JSON, matrix multiply, MMU, parallel ops, map printing, collections regression, shapes, SIMD, tensors, trait objects, type aliases, vec printing.
+- **C codegen coverage** — 76/78 tests match interpreter output (+ 1/1 expected-fail). 2 real mismatches: `test_asm` (inline asm — by design), `test_comptime_reflect` (comptime reflection — interpreter-only). `test_db` is flaky (HashMap iteration order non-deterministic).
 - **190 compiler warnings** — dead code, unused variables (cleanup needed)
 
 ---
@@ -183,7 +195,45 @@ cargo run -- version
 | `verify <file.p>` | Verify IR correctness (terminators, block refs, value refs) |
 | `sourcemap <file.p>` | Show source map (IR value → source line mapping) |
 | `parse-header <file.h> -o <out.p>` | Parse C header file → generate P FFI bindings |
+| `watch <file.p>` | Hot reload: native JIT (ELF64) + function-level change detection |
+| `link <files...>` | Link multiple object files (integrated linker) |
 | `version` | Print compiler version |
+
+---
+
+## Verification
+
+The project includes automated verification scripts for ensuring correctness across all backends:
+
+```bash
+# Full verification: build + test + compare to baseline
+./verify.sh
+
+# Save current test results as new baseline (only after intentional changes)
+./verify.sh --save
+
+# Quick build check (no tests)
+./verify.sh --quick
+
+# Bisect which compiler layer broke a test
+./scripts/bisect.sh <test_name>
+# Example: ./scripts/bisect.sh strings
+
+# Generate golden files for intermediate compiler stages
+./scripts/gen_golden.sh
+```
+
+**Before making any change:** run `./verify.sh` to confirm you're starting from a known-good state. After changes, run `./verify.sh` again to check for regressions. If a test regresses, use `./scripts/bisect.sh <test_name>` to identify which compiler layer (lowering, PIR, codegen, or peephole) is responsible.
+
+Current baseline:
+```
+Unit tests:   136/136 passed
+Harness:      8/8 passed
+Interpreter:  78/78 passed   (+ 1/1 expected fail: test_trait_verify_fail)
+C Codegen:    76/78 matched   (2 real mismatches: test_asm [by design], test_comptime_reflect [interpreter-only];
+                               test_db flaky — HashMap ordering non-deterministic)
+PE Emitter:   78/78 valid     (+ 1/1 expected fail: test_trait_verify_fail)
+```
 
 ---
 
@@ -395,7 +445,7 @@ Orchestrates the stages. Entry points:
 | Field access | `point.x` | `print(p.x);` |
 | Struct return (SRET) | `pf make_point() -> Point { ... }` | `pv p = make_point(); print(p.x);` |
 
-### Lowered (AST → SSA IR → Interpreter — not yet in x86 native backend)
+### Lowered (AST → SSA IR → Interpreter + PE Emitter)
 
 | Feature | Syntax |
 |---------|--------|
@@ -429,7 +479,6 @@ Orchestrates the stages. Entry points:
 |---------|--------|-------|
 | Default arguments | `pf f(x: i32 = 0)` | Future |
 | Variadic arguments | `pf f(...args)` | Future |
-| Hot reload | `pledgec watch <file.p>` | Phase 4E (works — native JIT + function diff) |
 | Self-hosting | (rewrite compiler in P) | Phase 6 |
 
 ---
@@ -438,7 +487,7 @@ Orchestrates the stages. Entry points:
 
 P is a systems language with unique keywords designed for clarity and AI-friendliness:
 
-```pledge
+```p
 // Function declaration
 pf main() {
     pv x = 42;
@@ -498,7 +547,7 @@ See `docs/syntax-spec.md` for the complete syntax specification.
 ## Project Structure
 
 ```
-pledge-lang/
+p-lang/
 ├── Cargo.toml              # Rust project config
 ├── src/                    # 35 source files, ~45,000 lines of Rust
 │   ├── main.rs             # CLI entry point (21 commands: build, emit, run, codegen, ccompile, etc.)
@@ -644,11 +693,11 @@ Run all tests: `cargo test --test harness`
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (133 unit tests, 78/79 integration tests) |
-| **Phase 2** | Region inference, effect system, capability security, bounds safety | **Complete** (2A ✓, 2B ✓, 2C ✓ with elision, 2D ✓; 7/8 harness tests pass) |
-| **Phase 3** | comptime, advanced traits, FFI & interop | **Mostly complete** (3A comptime ✓, 3B traits ✓, 3C const generics + GATs ✓ in interpreter; 3D C FFI ✓ via `extern "C"` + `parse-header`) |
-| **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | **Mostly complete** (4A PIR ✓, 4B optimizer ✓, 4C x86-64/arm64/riscv codegen + regalloc + 9 peephole passes + ELF64 executables ✓; 4D linker ✓, 4E hot reload ✓ via `pledgec watch`) |
-| **Phase 5** | Bare metal, IoT, AI/ML, web & cloud | **In progress** (5A bare-metal mode ✓, 5C AI/ML tensor ✓, 5D WASM + GPU/SPIR-V + HTTP + JSON ✓; 5B IoT/embedded code exists) |
+| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (136 unit tests, 78/78 + 1/1 expected-fail integration tests) |
+| **Phase 2** | Region inference, effect system, capability security, bounds safety | **Complete** (2A ✓, 2B ✓, 2C ✓ with elision, 2D ✓; 8/8 harness tests pass) |
+| **Phase 3** | comptime, advanced traits, FFI & interop | **Complete** (3A comptime ✓, 3B traits ✓, 3C const generics + GATs ✓; 3D C FFI ✓ via `extern "C"` + `parse-header`) |
+| **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | **Mostly complete** (4A PIR ✓, 4B optimizer ✓ but disabled by default due to regalloc bug, 4C x86-64/arm64/riscv codegen + regalloc + 9 peephole passes + ELF64 executables ✓; 4D linker ✓, 4E hot reload ✓ via `pledgec watch`) |
+| **Phase 5** | Bare metal, IoT, AI/ML, web & cloud | **Mostly complete** (5A bare-metal mode ✓, 5B IoT/embedded framework ✓ `embedded.rs`, 5C AI/ML tensor ✓, 5D WASM + GPU/SPIR-V + HTTP + JSON ✓) |
 | **Phase 6** | Self-hosting | Not started |
 | **Phase 7** | Ecosystem (package manager, LSP, docs) | Not started |
 | **Phase 8** | World class | Not started |

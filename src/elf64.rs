@@ -376,11 +376,31 @@ impl ElfEmitter {
             (line.to_string(), String::new())
         };
 
-        let operands: Vec<&str> = if operands_str.is_empty() {
+        // Split operands by comma, respecting parentheses (commas inside parens
+        // are part of the operand, e.g. "(%rbx,%rcx,8)" is one operand).
+        let operand_strings: Vec<String> = if operands_str.is_empty() {
             Vec::new()
         } else {
-            operands_str.split(',').map(|o| o.trim()).collect()
+            let mut result = Vec::new();
+            let mut current = String::new();
+            let mut paren_depth = 0;
+            for ch in operands_str.chars() {
+                match ch {
+                    '(' => { paren_depth += 1; current.push(ch); }
+                    ')' => { paren_depth -= 1; current.push(ch); }
+                    ',' if paren_depth == 0 => {
+                        result.push(current.trim().to_string());
+                        current.clear();
+                    }
+                    _ => current.push(ch),
+                }
+            }
+            if !current.trim().is_empty() {
+                result.push(current.trim().to_string());
+            }
+            result
         };
+        let operands: Vec<&str> = operand_strings.iter().map(|s| s.as_str()).collect();
 
         match mnemonic.as_str() {
             // ─── No-operand instructions ───
@@ -701,33 +721,107 @@ impl ElfEmitter {
             return Ok(());
         }
 
-        // movq %reg, -offset(%rbp)  (store to stack)
-        if let (Some(s), Some((off, base))) = (try_parse_reg(src), try_parse_mem(dst)) {
-            let rex = rex_w(size) | ((s >> 3) << 2) | ((base >> 3) << 0);
-            self.text.push(rex);
-            self.text.push(0x89);
-            self.encode_modrm_mem(s, off, base);
-            return Ok(());
-        }
-
-        // movq -offset(%rbp), %reg  (load from stack)
-        if let (Some((off, base)), Some(d)) = (try_parse_mem(src), try_parse_reg(dst)) {
-            let rex = rex_w(size) | ((d >> 3) << 2) | ((base >> 3) << 0);
-            self.text.push(rex);
-            self.text.push(0x8b);
-            self.encode_modrm_mem(d, off, base);
-            return Ok(());
-        }
-
-        // movq $imm, -offset(%rbp) (immediate to memory)
-        if src.starts_with('$') {
-            if let Some((off, base)) = try_parse_mem(dst) {
-                let imm: i32 = src[1..].parse().unwrap_or(0);
-                let rex = rex_w(size) | ((base >> 3) << 0);
+        // movq %reg, mem  (store to memory)
+        // Handles 8-bit register names (al, cl, etc.) for movb
+        // Handles SIB addressing: movq %reg, (%base,%index,scale)
+        let src_reg = try_parse_reg(src).or_else(|| try_parse_reg8(src));
+        // Try SIB first: movq %reg, (%base,%index,scale)
+        if let (Some(s), Some((off, base, index, sc))) = (src_reg, try_parse_mem_indexed(dst)) {
+            if size == 1 {
+                let rex = 0x40 | ((s >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
                 self.text.push(rex);
-                self.text.push(0xc7);
-                self.encode_modrm_mem(0, off, base);
-                self.text.extend_from_slice(&imm.to_le_bytes());
+                self.text.push(0x88);
+                self.encode_modrm_sib(s, off, base, index, sc);
+            } else {
+                let rex = rex_w(size) | ((s >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                self.text.push(rex);
+                self.text.push(0x89);
+                self.encode_modrm_sib(s, off, base, index, sc);
+            }
+            return Ok(());
+        }
+        if let (Some(s), Some((off, base))) = (src_reg, try_parse_mem(dst)) {
+            if size == 1 {
+                let rex = 0x40 | ((s >> 3) << 2) | ((base >> 3) << 0);
+                self.text.push(rex);
+                self.text.push(0x88);
+                self.encode_modrm_mem(s, off, base);
+            } else {
+                let rex = rex_w(size) | ((s >> 3) << 2) | ((base >> 3) << 0);
+                self.text.push(rex);
+                self.text.push(0x89);
+                self.encode_modrm_mem(s, off, base);
+            }
+            return Ok(());
+        }
+
+        // movq mem, %reg  (load from memory)
+        // Handles 8-bit register names for movb
+        // Handles SIB addressing: movq (%base,%index,scale), %reg
+        let dst_reg = try_parse_reg(dst).or_else(|| try_parse_reg8(dst));
+        if let (Some((off, base, index, sc)), Some(d)) = (try_parse_mem_indexed(src), dst_reg) {
+            if size == 1 {
+                let rex = 0x40 | ((d >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                self.text.push(rex);
+                self.text.push(0x8a);
+                self.encode_modrm_sib(d, off, base, index, sc);
+            } else {
+                let rex = rex_w(size) | ((d >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                self.text.push(rex);
+                self.text.push(0x8b);
+                self.encode_modrm_sib(d, off, base, index, sc);
+            }
+            return Ok(());
+        }
+        if let (Some((off, base)), Some(d)) = (try_parse_mem(src), dst_reg) {
+            if size == 1 {
+                let rex = 0x40 | ((d >> 3) << 2) | ((base >> 3) << 0);
+                self.text.push(rex);
+                self.text.push(0x8a);
+                self.encode_modrm_mem(d, off, base);
+            } else {
+                let rex = rex_w(size) | ((d >> 3) << 2) | ((base >> 3) << 0);
+                self.text.push(rex);
+                self.text.push(0x8b);
+                self.encode_modrm_mem(d, off, base);
+            }
+            return Ok(());
+        }
+
+        // movq $imm, mem (immediate to memory)
+        if src.starts_with('$') {
+            if let Some((off, base, index, sc)) = try_parse_mem_indexed(dst) {
+                let imm: i64 = src[1..].parse().unwrap_or(0);
+                if size == 1 {
+                    let rex = 0x40 | ((index >> 3) << 1) | ((base >> 3) << 0);
+                    self.text.push(rex);
+                    self.text.push(0xc6);
+                    self.encode_modrm_sib(0, off, base, index, sc);
+                    self.text.push(imm as u8);
+                } else {
+                    let rex = rex_w(size) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                    self.text.push(rex);
+                    self.text.push(0xc7);
+                    self.encode_modrm_sib(0, off, base, index, sc);
+                    self.text.extend_from_slice(&(imm as i32).to_le_bytes());
+                }
+                return Ok(());
+            }
+            if let Some((off, base)) = try_parse_mem(dst) {
+                let imm: i64 = src[1..].parse().unwrap_or(0);
+                if size == 1 {
+                    let rex = 0x40 | ((base >> 3) << 0);
+                    self.text.push(rex);
+                    self.text.push(0xc6);
+                    self.encode_modrm_mem(0, off, base);
+                    self.text.push(imm as u8);
+                } else {
+                    let rex = rex_w(size) | ((base >> 3) << 0);
+                    self.text.push(rex);
+                    self.text.push(0xc7);
+                    self.encode_modrm_mem(0, off, base);
+                    self.text.extend_from_slice(&(imm as i32).to_le_bytes());
+                }
                 return Ok(());
             }
         }
@@ -881,6 +975,14 @@ impl ElfEmitter {
         }
 
         // cmpq mem, %reg
+        // Try SIB first: cmpq (%base,%index,scale), %reg
+        if let (Some((off, base, index, sc)), Some(d)) = (try_parse_mem_indexed(src), try_parse_reg(dst)) {
+            let rex = rex_w(size) | ((d >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+            self.text.push(rex);
+            self.text.push(0x3b);
+            self.encode_modrm_sib(d, off, base, index, sc);
+            return Ok(());
+        }
         if let (Some((off, base)), Some(d)) = (try_parse_mem(src), try_parse_reg(dst)) {
             let rex = rex_w(size) | ((d >> 3) << 2) | ((base >> 3) << 0);
             self.text.push(rex);
@@ -918,13 +1020,31 @@ impl ElfEmitter {
         if operands.len() != 2 {
             return Ok(());
         }
-        // movzbq %al, %rdx → REX.W 0F B6 /r
-        // Source can be an 8-bit register (%al, %cl, ...) or a 64-bit register.
-        // Destination is always a 64-bit register.
-        let s_opt = try_parse_reg8(operands[0]).or_else(|| try_parse_reg(operands[0]));
         let d_opt = try_parse_reg(operands[1]);
+
+        // Try SIB memory source: movzbq (%base,%index,scale), %dst
+        if let (Some((off, base, index, sc)), Some(d)) = (try_parse_mem_indexed(operands[0]), d_opt) {
+            let rex = 0x48 | (((d >> 3) & 1) << 2) | (((index >> 3) & 1) << 1) | (((base >> 3) & 1) << 0);
+            self.text.push(rex);
+            self.text.push(0x0f);
+            self.text.push(opcode);
+            self.encode_modrm_sib(d, off, base, index, sc);
+            return Ok(());
+        }
+
+        // Try memory source: movzbq offset(%base), %dst
+        if let (Some((off, base)), Some(d)) = (try_parse_mem(operands[0]), d_opt) {
+            let rex = 0x48 | (((d >> 3) & 1) << 2) | (((base >> 3) & 1) << 0);
+            self.text.push(rex);
+            self.text.push(0x0f);
+            self.text.push(opcode);
+            self.encode_modrm_mem(d, off, base);
+            return Ok(());
+        }
+
+        // Register source: movzbq %al, %rdx → REX.W 0F B6 /r
+        let s_opt = try_parse_reg8(operands[0]).or_else(|| try_parse_reg(operands[0]));
         if let (Some(s), Some(d)) = (s_opt, d_opt) {
-            // REX.W=1, REX.R extends destination (reg field), REX.B extends source (rm field).
             let rex = 0x48 | (((d >> 3) & 1) << 2) | (((s >> 3) & 1) << 0);
             self.text.push(rex);
             self.text.push(0x0f);
@@ -983,6 +1103,9 @@ impl ElfEmitter {
         // call rel32 → 0xE8 rel32
         // For external functions, use R_X86_64_PLT32 relocation.
         // For local functions, use R_X86_64_PC32.
+        if target.contains("p_string_split") || target.contains("p_string_trim") {
+            eprintln!("  ENCODE_CALL: target={} text_off=0x{:x}", target, self.text.len());
+        }
         if target.starts_with(".L") {
             let sym_idx = self.get_or_add_local_label(target);
             let reloc_offset = self.text.len() as u64 + 1;
@@ -1019,7 +1142,7 @@ impl ElfEmitter {
                 } else {
                     self.get_or_add_undef_symbol(&label)
                 };
-                let rex = 0x48 | ((d >> 3) << 0);
+                let rex = 0x48 | ((d >> 3) << 2);
                 self.text.push(rex);
                 self.text.push(0x8d);
                 // RIP-relative: mod=00, r/m=101
@@ -1033,6 +1156,15 @@ impl ElfEmitter {
                     addend: -4,
                 });
                 self.text.extend_from_slice(&[0, 0, 0, 0]);
+                return Ok(());
+            }
+
+            // leaq (%base,%index,scale), %reg — SIB addressing
+            if let Some((off, base, index, sc)) = try_parse_mem_indexed(src) {
+                let rex = 0x48 | ((d >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                self.text.push(rex);
+                self.text.push(0x8d);
+                self.encode_modrm_sib(d, off, base, index, sc);
                 return Ok(());
             }
 
@@ -1099,6 +1231,36 @@ impl ElfEmitter {
             if base_field == 4 {
                 self.text.push(0x24);
             }
+            self.text.extend_from_slice(&offset.to_le_bytes());
+        }
+    }
+
+    /// Encode ModRM + SIB + displacement for [offset + base + index*scale]
+    /// scale_bits: 0=1x, 1=2x, 2=4x, 3=8x
+    fn encode_modrm_sib(&mut self, reg: u8, offset: i32, base: u8, index: u8, scale_bits: u8) {
+        let reg_field = reg & 7;
+        let base_field = base & 7;
+        let index_field = index & 7;
+
+        if offset == 0 && base_field != 5 {
+            // [base + index*scale] — mod=00, r/m=100 (SIB)
+            let modrm = 0x04 | (reg_field << 3);
+            self.text.push(modrm);
+            let sib = (scale_bits << 6) | (index_field << 3) | base_field;
+            self.text.push(sib);
+        } else if offset >= -128 && offset <= 127 {
+            // [disp8 + base + index*scale] — mod=01, r/m=100 (SIB)
+            let modrm = 0x44 | (reg_field << 3);
+            self.text.push(modrm);
+            let sib = (scale_bits << 6) | (index_field << 3) | base_field;
+            self.text.push(sib);
+            self.text.push(offset as u8);
+        } else {
+            // [disp32 + base + index*scale] — mod=10, r/m=100 (SIB)
+            let modrm = 0x84 | (reg_field << 3);
+            self.text.push(modrm);
+            let sib = (scale_bits << 6) | (index_field << 3) | base_field;
+            self.text.push(sib);
             self.text.extend_from_slice(&offset.to_le_bytes());
         }
     }
@@ -1640,7 +1802,7 @@ fn parse_xmm_reg(s: &str) -> Result<u8, String> {
 /// Returns (offset, base_reg_number).
 fn try_parse_mem(s: &str) -> Option<(i32, u8)> {
     let s = s.trim();
-    // Pattern: offset(%reg) or (%reg)
+    // Pattern: offset(%reg) or (%reg) — but NOT (%reg,%reg) which is SIB
     if !s.contains("(%") {
         return None;
     }
@@ -1655,8 +1817,55 @@ fn try_parse_mem(s: &str) -> Option<(i32, u8)> {
     let rest = &s[paren_idx + 1..];
     let end_idx = rest.find(')')?;
     let reg_str = &rest[..end_idx];
+    // Reject SIB patterns (containing comma)
+    if reg_str.contains(',') {
+        return None;
+    }
     let base = try_parse_reg(reg_str)?;
     Some((offset, base))
+}
+
+/// Parse indexed memory operand: offset(%base,%index) or (%base,%index) or (%base,%index,scale)
+/// Returns (offset, base, index, scale_bits) where scale_bits: 0=1x, 1=2x, 2=4x, 3=8x
+fn try_parse_mem_indexed(s: &str) -> Option<(i32, u8, u8, u8)> {
+    let s = s.trim();
+    if !s.contains("(%") {
+        return None;
+    }
+    let paren_idx = s.find('(')?;
+    let offset_str = &s[..paren_idx];
+    let offset: i32 = if offset_str.is_empty() {
+        0
+    } else {
+        offset_str.parse().ok()?
+    };
+
+    let rest = &s[paren_idx + 1..];
+    let end_idx = rest.find(')')?;
+    let inner = &rest[..end_idx];
+    // Must contain comma for SIB
+    let comma_idx = inner.find(',')?;
+    let base_str = inner[..comma_idx].trim();
+    let remaining = inner[comma_idx + 1..].trim();
+    // Check for scale: "index,scale" or just "index"
+    let (index_str, scale) = if let Some(c2) = remaining.find(',') {
+        let idx = remaining[..c2].trim();
+        let sc: u8 = remaining[c2 + 1..].trim().parse().ok()?;
+        (idx, sc)
+    } else {
+        (remaining, 1u8)
+    };
+    let base = try_parse_reg(base_str)?;
+    let index = try_parse_reg(index_str)?;
+    // Scale must be 1, 2, 4, or 8
+    let scale_bits = match scale {
+        1 => 0u8,
+        2 => 1,
+        4 => 2,
+        8 => 3,
+        _ => return None,
+    };
+    Some((offset, base, index, scale_bits))
 }
 
 /// Build a REX prefix with optional W bit.
@@ -1900,4 +2109,35 @@ mod tests {
         let e_machine = u16::from_le_bytes([elf[18], elf[19]]);
         assert_eq!(e_machine, 243, "EM_RISCV");
     }
+}
+
+/// Encode a block of assembly text to raw bytes + symbols + relocations.
+/// Used by runtime_linux.rs to encode runtime functions without hand-encoding bytes.
+/// Returns (text_bytes, symbols, relocations) where:
+///   symbols: (name, offset_in_text)
+///   relocations: (offset_in_text, target_name, rtype_u8)  rtype: 1=64, 2=PC32, 4=PLT32
+pub fn encode_asm_block(asm: &str) -> Result<(Vec<u8>, Vec<(String, u64)>, Vec<(u64, String, u8)>), String> {
+    let mut enc = ElfEmitter::new();
+    enc.assemble(asm)?;
+
+    let symbols: Vec<(String, u64)> = enc.symbols.iter()
+        .filter(|s| s.is_defined && s.section == 1)
+        .map(|s| (s.name.clone(), s.value))
+        .collect();
+
+    let relocations: Vec<(u64, String, u8)> = enc.relocations.iter()
+        .filter_map(|r| {
+            enc.symbols.get(r.symbol).map(|s| {
+                let rtype = match r.rtype {
+                    R_X86_64_64 => 1,
+                    R_X86_64_PC32 => 2,
+                    R_X86_64_PLT32 => 4,
+                    _ => 2,
+                };
+                (r.offset, s.name.clone(), rtype)
+            })
+        })
+        .collect();
+
+    Ok((enc.text, symbols, relocations))
 }

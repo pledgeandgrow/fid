@@ -941,6 +941,13 @@ impl WasmCodeGen {
                     out.push(0x1A); // drop
                 }
             }
+            Inst::PersistLoad { default, .. } => {
+                // Just use default value
+                self.emit_value(out, *default, func);
+            }
+            Inst::PersistSave { .. } => {
+                // No-op in WASM
+            }
             Inst::Panic { message } => {
                 let addr = self.string_addrs.get(message).copied().unwrap_or(0);
                 self.emit_const_i64(out, addr as i64);

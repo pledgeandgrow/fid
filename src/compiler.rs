@@ -11,6 +11,7 @@ use crate::typechecker::TypeChecker;
 use crate::x86;
 use crate::pe;
 use crate::pir;
+use crate::ir::{Effect, EffectSet, IrModule, Inst};
 use crate::wasm;
 
 pub use crate::interp::RunResult;
@@ -475,30 +476,35 @@ pub fn compile_to_wasm(source: &str, source_path: &str, wat_mode: bool) -> Resul
 /// Build a native executable in one step: parse → typecheck → lower → PIR →
 /// optimize → codegen → link. Zero external tools required.
 /// Supports x86-64 (full ELF linking), arm64 and riscv (assembly text output).
-pub fn build_executable(source: &str, source_path: &str, target: &str, do_opt: bool) -> Result<Vec<u8>, Vec<String>> {
+pub fn build_executable(source: &str, source_path: &str, target: &str, do_opt: bool, granted_caps: Option<&[String]>) -> Result<Vec<u8>, Vec<String>> {
     let program = build_program_with_path(source, Some(source_path))?;
-    let module = lower::lower(&program);
+    let mut module = lower::lower(&program);
+
+    // F5: Capability-aware linking — strip functions requiring ungranted capabilities
+    if let Some(caps) = granted_caps {
+        strip_ungranted_caps(&mut module, caps);
+    }
 
     let l1 = pir::lower_ir_to_l1(&module);
     let mut l2 = pir::lower_l1_to_l2(&l1);
 
     if do_opt {
         let _ = crate::opt::optimize_l2(&mut l2);
-        for f in &l2.functions {
-            if f.name == "main" {
-                if let Some(b) = f.blocks.first() {
-                    eprintln!("[opt] main bb0 order: {:?}", b.instructions);
-                    for vid in &b.instructions {
-                        if let Some(inst) = f.values.get(vid) {
-                            eprintln!("  {} = {:?}", vid, inst);
-                        }
-                    }
+    }
+
+    let l3 = pir::lower_l2_to_l3(&l2, &module);
+
+    // Debug: dump apply L3 IR
+    for f in &l3.functions {
+        if f.name == "apply" {
+            eprintln!("DBG L3 apply: frame_size={}", f.frame_size);
+            for b in &f.blocks {
+                for inst in &b.instructions {
+                    eprintln!("  {:?}", inst);
                 }
             }
         }
     }
-
-    let l3 = pir::lower_l2_to_l3(&l2, &module);
 
     match target {
         "x86-64" | "x64" => {
@@ -507,12 +513,6 @@ pub fn build_executable(source: &str, source_path: &str, target: &str, do_opt: b
             // this catches redundant moves, zero idioms, dead stores, etc.
             // These are safe local transformations that don't affect semantics.
             let asm = crate::peephole::optimize(&asm);
-            // Debug: dump asm for some_func
-            for line in asm.lines() {
-                if line.contains("some_func") || line.contains("xorl") {
-                    eprintln!("DBG ASM: {}", line);
-                }
-            }
             let obj = crate::elf64::emit_object_file(&l3, &asm)
                 .map_err(|e| vec![e])?;
             // Link with the pre-compiled Linux runtime (raw machine code)
@@ -614,4 +614,92 @@ fn edit_distance(a: &str, b: &str) -> usize {
         }
     }
     dp[a.len()][b.len()]
+}
+
+/// F5: Strip functions that require capabilities not in the granted set.
+/// Maps capability names to effects: IO->IO, FS->IO, Net->Net, Spawn->Spawn.
+/// After removing ungranted-cap functions, does a reachability check from
+/// "main" to remove any functions that are now unreachable.
+fn strip_ungranted_caps(module: &mut IrModule, granted_caps: &[String]) {
+    use std::collections::{HashMap, HashSet};
+
+    let granted: HashSet<String> = granted_caps.iter().map(|s| s.to_string()).collect();
+    let _ = granted;
+
+    // Map capability names to the effects they grant
+    let granted_effects: HashSet<Effect> = granted_caps.iter().filter_map(|cap| {
+        match cap.as_str() {
+            "IO" | "FS" => Some(Effect::IO),
+            "Net" => Some(Effect::Net),
+            "Spawn" => Some(Effect::Spawn),
+            _ => None,
+        }
+    }).collect();
+
+    // Find functions that require effects not in the granted set
+    let mut to_remove: HashSet<String> = HashSet::new();
+    for (name, effects) in &module.function_effects {
+        if name == "main" || name == "_start" {
+            continue;
+        }
+        for eff in effects.iter() {
+            match eff {
+                Effect::IO | Effect::Net | Effect::Spawn => {
+                    if !granted_effects.contains(&eff) {
+                        to_remove.insert(name.clone());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if to_remove.is_empty() {
+        return;
+    }
+
+    eprintln!("[caps] Granted capabilities: {:?}", granted_caps);
+    eprintln!("[caps] Removing {} functions requiring ungranted capabilities:", to_remove.len());
+
+    // Build call graph
+    let mut call_graph: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, func) in &module.functions {
+        let mut callees = Vec::new();
+        for (_, inst) in &func.instructions {
+            if let Inst::Call { func: callee, .. } = inst {
+                callees.push(callee.clone());
+            }
+        }
+        call_graph.insert(name.clone(), callees);
+    }
+
+    // BFS from main to find reachable functions (skipping ungranted-cap ones)
+    let mut reachable: HashSet<String> = HashSet::new();
+    let mut queue: Vec<String> = vec!["main".to_string()];
+    while let Some(name) = queue.pop() {
+        if reachable.contains(&name) || to_remove.contains(&name) {
+            continue;
+        }
+        reachable.insert(name.clone());
+        if let Some(callees) = call_graph.get(&name) {
+            for callee in callees {
+                if !reachable.contains(callee) {
+                    queue.push(callee.clone());
+                }
+            }
+        }
+    }
+
+    // Remove unreachable functions
+    let removed: Vec<String> = module.functions.keys()
+        .filter(|k| !reachable.contains(*k))
+        .cloned()
+        .collect();
+    for name in &removed {
+        module.functions.remove(name);
+        module.function_effects.remove(name);
+    }
+    eprintln!("[caps]   Removed: {:?}", removed);
+    eprintln!("[caps]   {} functions remaining", module.functions.len());
 }

@@ -25,7 +25,7 @@
 //   allocate(&L3Function) -> Allocation  — run the allocator on one function
 //   allocate_module(&L3Module) -> ModuleAllocation  — run on all functions
 
-use crate::pir::{L3Function, L3Inst, L3Module, MemRegion, Operand, VReg};
+use crate::pir::{L3Function, L3Inst, L3Module, MemRegion, Operand, PBlock, VReg};
 use crate::ir::BlockId;
 use std::collections::{HashMap, HashSet};
 
@@ -286,6 +286,15 @@ pub fn allocate(func: &L3Function) -> Allocation {
                     let aligned = (spill_offset + 7) & !7;
                     spill_offset = aligned + 8;
                     vreg_to_loc.insert(interval.vreg, Location::Spill(aligned));
+                    // Update arg_locations so the codegen prologue saves
+                    // the arg register to the spill slot.
+                    for (i, (vreg_param, _)) in func.params.iter().enumerate() {
+                        if vreg_param == &interval.vreg {
+                            if i < arg_locations.len() {
+                                arg_locations[i] = Location::Spill(aligned);
+                            }
+                        }
+                    }
                     // Return the pre-assigned register to the free pool.
                     if !free_pool.contains(&reg) {
                         free_pool.push(reg);
@@ -453,7 +462,11 @@ fn compute_live_intervals(func: &L3Function) -> HashMap<VReg, LiveInterval> {
         def(*vreg, 0, &mut intervals);
     }
 
+    // Track block start/end indices for loop handling.
+    let mut block_ranges: Vec<(PBlock, u32, u32)> = Vec::new();
+
     for block in &func.blocks {
+        let block_start = idx;
         // Block params are defined at block entry.
         for (vreg, _) in &block.params {
             def(*vreg, idx, &mut intervals);
@@ -472,6 +485,58 @@ fn compute_live_intervals(func: &L3Function) -> HashMap<VReg, LiveInterval> {
 
             idx += 1;
         }
+        block_ranges.push((block.id, block_start, idx));
+    }
+
+    // ── Loop handling ──
+    // A back-edge is a jump from a later block to an earlier block.
+    // If a VReg is used in a loop header (the target of a back-edge),
+    // its interval must extend to cover the entire loop body, because
+    // the value must survive each iteration.
+    let block_end = |bid: PBlock| -> u32 {
+        block_ranges.iter()
+            .find(|(id, _, _)| *id == bid)
+            .map(|(_, _, end)| *end)
+            .unwrap_or(0)
+    };
+    let block_start = |bid: PBlock| -> u32 {
+        block_ranges.iter()
+            .find(|(id, _, _)| *id == bid)
+            .map(|(_, start, _)| *start)
+            .unwrap_or(0)
+    };
+
+    // Find back-edges: terminators that jump to a block with a lower index.
+    for block in &func.blocks {
+        let my_end = block_end(block.id);
+        let targets: Vec<PBlock> = match block.instructions.last() {
+            Some(L3Inst::Jmp { target }) => vec![*target],
+            Some(L3Inst::Br { then, else_, .. }) => vec![*then, *else_],
+            _ => vec![],
+        };
+        for target in targets {
+            let target_start = block_start(target);
+            if target_start < my_end {
+                // This is a back-edge: block → target (target is earlier).
+                // Extend all VRegs used in the target block to cover the
+                // entire loop body (from target_start to my_end).
+                let loop_end = my_end;
+                // Find all VRegs used in the target block and extend their intervals.
+                for tblock in &func.blocks {
+                    if tblock.id == target {
+                        for inst in &tblock.instructions {
+                            for vreg in inst_uses(inst) {
+                                if let Some(entry) = intervals.get_mut(&vreg) {
+                                    if loop_end > entry.end {
+                                        entry.end = loop_end;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     intervals
@@ -483,6 +548,11 @@ fn inst_clobbers(inst: &L3Inst) -> Vec<PhysReg> {
     match inst {
         // Store: gen_store loads value into RAX, pointer into RCX
         L3Inst::Store { .. } => vec![PhysReg::Rax, PhysReg::Rcx],
+        // ElemAddr: gen_elem_addr uses scratch_reg (RCX or RDX) for index
+        L3Inst::ElemAddr { .. } => vec![PhysReg::Rcx, PhysReg::Rdx],
+        // Load: gen_load may use RAX as scratch when ptr is not in a register
+        // or when dst is spilled
+        L3Inst::Load { .. } => vec![PhysReg::Rax],
         // Branch: gen_branch loads condition into RAX
         L3Inst::Br { .. } => vec![PhysReg::Rax],
         // Print: call to p_print_int/p_print_str clobbers caller-saved

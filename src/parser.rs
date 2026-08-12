@@ -913,6 +913,7 @@ impl Parser {
 
     fn parse_stmt(&mut self) -> Result<Stmt, String> {
         match self.peek() {
+            TokenKind::Persist => self.parse_persist_let(),
             TokenKind::Pv => self.parse_let(),
             TokenKind::Ret => self.parse_return(),
             TokenKind::If => {
@@ -959,6 +960,7 @@ impl Parser {
             TokenKind::Handle => self.parse_handle_stmt(),
             TokenKind::Do => self.parse_do_stmt(),
             TokenKind::Region => self.parse_region_block(),
+            TokenKind::Sandbox => self.parse_sandbox_block(),
             TokenKind::Comptime => {
                 let line = self.peek_token().line;
                 self.advance(); // consume comptime
@@ -1253,7 +1255,32 @@ impl Parser {
         let expr = self.parse_expr()?;
         self.match_tok(TokenKind::Semicolon);
 
-        Ok(Stmt::Let { name, ty, expr, is_mut, line })
+        // Check for `persist` modifier after the statement
+        // Syntax: `pv name = expr; persist` or `persist pv name = expr;`
+        // We use the prefix form: `persist pv name = expr;`
+        // This is handled in parse_stmt by checking for Persist token before Pv
+        Ok(Stmt::Let { name, ty, expr, is_mut, is_persist: false, line })
+    }
+
+    /// Parse `persist pv name = expr;` — variable that survives hot reloads.
+    fn parse_persist_let(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect(TokenKind::Persist, "persist")?;
+        self.expect(TokenKind::Pv, "pv")?;
+        let is_mut = self.match_tok(TokenKind::Mut);
+        let name = self.expect_ident()?;
+
+        let ty = if self.match_tok(TokenKind::Colon) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        self.expect(TokenKind::Eq, "=")?;
+        let expr = self.parse_expr()?;
+        self.match_tok(TokenKind::Semicolon);
+
+        Ok(Stmt::Let { name, ty, expr, is_mut, is_persist: true, line })
     }
 
     fn parse_return(&mut self) -> Result<Stmt, String> {
@@ -2120,15 +2147,49 @@ impl Parser {
         Ok(Stmt::Do { effect, op, args, line })
     }
 
-    /// Parse `region r { body }` — create a named region block
+    /// Parse `region r { body }` or `region r with budget(N) { body }`
     fn parse_region_block(&mut self) -> Result<Stmt, String> {
         let line = self.peek_token().line;
         self.expect(TokenKind::Region, "region")?;
         let name = self.expect_ident()?;
+
+        // Optional: `with budget(N)`
+        let budget = if self.match_tok(TokenKind::With) {
+            let budget_name = self.expect_ident()?;
+            if budget_name != "budget" {
+                return Err(format!("Expected 'budget' after 'with' in region block, got '{}'", budget_name));
+            }
+            self.expect(TokenKind::LParen, "(")?;
+            // Parse the budget value (must be a literal integer)
+            let n = match self.peek().clone() {
+                TokenKind::IntLit(n) => {
+                    self.advance();
+                    n as u64
+                }
+                _ => return Err("Expected integer literal in budget(N)".to_string()),
+            };
+            self.expect(TokenKind::RParen, ")")?;
+            Some(n)
+        } else {
+            None
+        };
+
         self.expect(TokenKind::LBrace, "{")?;
         let body = self.parse_block()?;
         self.expect(TokenKind::RBrace, "}")?;
-        Ok(Stmt::RegionBlock { name, body, line })
+        Ok(Stmt::RegionBlock { name, budget, body, line })
+    }
+
+    /// Parse `sandbox { body }` — capability revocation block.
+    /// All capabilities are stripped for the scope. Any IO/FS/Net/Spawn
+    /// call inside is a compile error.
+    fn parse_sandbox_block(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect(TokenKind::Sandbox, "sandbox")?;
+        self.expect(TokenKind::LBrace, "{")?;
+        let body = self.parse_block()?;
+        self.expect(TokenKind::RBrace, "}")?;
+        Ok(Stmt::Sandbox { body, line })
     }
 
     fn parse_attribute(&mut self) -> Result<Attribute, String> {

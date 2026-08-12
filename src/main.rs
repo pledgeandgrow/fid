@@ -84,10 +84,11 @@ fn main() {
         }
         "build" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec build <file.p> [-o output] [--target x86-64|arm64|riscv] [--opt]");
+                eprintln!("Usage: pledgec build <file.p> [-o output] [--target x86-64|arm64|riscv] [--opt] [--caps \"IO,FS\"]");
                 eprintln!("       Compiles and links a Pledge program into a native executable in one step");
                 eprintln!("       --target  Target architecture (default: x86-64)");
                 eprintln!("       --opt     Run PIR optimizer before codegen");
+                eprintln!("       --caps    Grant only these capabilities (e.g. \"IO,FS\"). Strips code requiring ungranted caps.");
                 process::exit(1);
             }
             let input = &args[2];
@@ -96,6 +97,9 @@ fn main() {
                 .map(|s| s.as_str())
                 .unwrap_or("x86-64");
             let do_opt = args.iter().any(|a| a == "--opt");
+            let granted_caps: Option<Vec<String>> = args.iter().position(|a| a == "--caps")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| s.split(',').map(|c| c.trim().to_string()).collect());
             let output = args.iter().position(|a| a == "-o")
                 .and_then(|i| args.get(i + 1))
                 .map(|s| s.clone())
@@ -110,7 +114,7 @@ fn main() {
                     process::exit(1);
                 }
             };
-            match compiler::build_executable(&source, input, target, do_opt) {
+            match compiler::build_executable(&source, input, target, do_opt, granted_caps.as_deref()) {
                 Ok(exe_bytes) => {
                     fs::write(&output, &exe_bytes).unwrap_or_else(|e| {
                         eprintln!("Error writing '{}': {}", output, e);
@@ -615,27 +619,59 @@ fn main() {
         }
 
         "test" => {
-            // Run all .p tests in the tests/ directory against all backends.
+            // Run .p tests in the tests/ directory against all backends.
+            //
+            // By default, runs NORMAL tests (expected to pass).
+            // Use `pledgec test --fail` to run only expected-fail tests
+            // (where failing = correct, passing = regression).
+            let fail_only = args.iter().any(|a| a == "--fail");
+
             let current_exe = std::env::current_exe()
                 .unwrap_or_else(|_| std::path::PathBuf::from("pledgec"));
             let test_dir = "tests";
+
+            // Expected-fail tests: these test compiler error detection.
+            // They SHOULD fail to compile/run — failing is the correct behavior.
+            let expected_fail: &[&str] = &[
+                "test_trait_verify_fail",
+                "test_budget_fail",
+                "test_sandbox_fail",
+            ];
+
             let mut test_files: Vec<String> = Vec::new();
             if let Ok(entries) = fs::read_dir(test_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.extension().map_or(false, |e| e == "p") {
-                        test_files.push(path.to_string_lossy().to_string());
+                        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+                        let is_fail = expected_fail.contains(&stem.as_str());
+                        if fail_only {
+                            // Only include expected-fail tests
+                            if is_fail {
+                                test_files.push(path.to_string_lossy().to_string());
+                            }
+                        } else {
+                            // Only include normal tests (exclude expected-fail)
+                            if !is_fail {
+                                test_files.push(path.to_string_lossy().to_string());
+                            }
+                        }
                     }
                 }
             }
             test_files.sort();
 
             if test_files.is_empty() {
-                eprintln!("No .p test files found in tests/");
+                if fail_only {
+                    eprintln!("No expected-fail tests found in tests/");
+                } else {
+                    eprintln!("No .p test files found in tests/");
+                }
                 process::exit(1);
             }
 
-            println!("Running {} tests...\n", test_files.len());
+            let batch_label = if fail_only { "expected-fail" } else { "normal" };
+            println!("Running {} {} tests...\n", test_files.len(), batch_label);
 
             let mut interp_pass = 0;
             let mut interp_fail = 0;
@@ -669,11 +705,21 @@ fn main() {
                     .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
                     .unwrap_or_default();
 
-                if interp_ok {
-                    interp_pass += 1;
+                if fail_only {
+                    // For expected-fail tests, failing = correct, passing = regression
+                    if interp_ok {
+                        interp_fail += 1;  // unexpected pass!
+                        eprintln!("  [UNEXPECTED PASS] interp: {} (should have failed)", name);
+                    } else {
+                        interp_pass += 1;  // correct failure
+                    }
                 } else {
-                    interp_fail += 1;
-                    eprintln!("  [FAIL] interp: {}", name);
+                    if interp_ok {
+                        interp_pass += 1;
+                    } else {
+                        interp_fail += 1;
+                        eprintln!("  [FAIL] interp: {}", name);
+                    }
                 }
 
                 // C codegen
@@ -695,11 +741,20 @@ fn main() {
                 let _ = fs::remove_file(&c_exe);
                 let _ = fs::remove_file(&c_exe.replace(".exe", ".c"));
 
-                if c_ok {
-                    c_pass += 1;
+                if fail_only {
+                    if c_ok {
+                        c_fail += 1;  // unexpected pass!
+                        eprintln!("  [UNEXPECTED PASS] c codegen: {} (should have failed)", name);
+                    } else {
+                        c_pass += 1;  // correct failure
+                    }
                 } else {
-                    c_fail += 1;
-                    eprintln!("  [FAIL] c codegen: {}", name);
+                    if c_ok {
+                        c_pass += 1;
+                    } else {
+                        c_fail += 1;
+                        eprintln!("  [FAIL] c codegen: {}", name);
+                    }
                 }
 
                 // PE emitter
@@ -714,18 +769,34 @@ fn main() {
                     .unwrap_or(false);
                 let _ = fs::remove_file(&pe_exe);
 
-                if pe_ok {
-                    pe_pass += 1;
+                if fail_only {
+                    if pe_ok {
+                        pe_fail += 1;  // unexpected pass!
+                        eprintln!("  [UNEXPECTED PASS] pe emit: {} (should have failed)", name);
+                    } else {
+                        pe_pass += 1;  // correct failure
+                    }
                 } else {
-                    pe_fail += 1;
-                    eprintln!("  [FAIL] pe emit: {}", name);
+                    if pe_ok {
+                        pe_pass += 1;
+                    } else {
+                        pe_fail += 1;
+                        eprintln!("  [FAIL] pe emit: {}", name);
+                    }
                 }
             }
 
-            println!("\n=== Results ===");
-            println!("Interpreter:  {}/{} passed", interp_pass, test_files.len());
-            println!("C Codegen:    {}/{} matched", c_pass, test_files.len());
-            println!("PE Emitter:   {}/{} valid", pe_pass, test_files.len());
+            println!("\n=== Results ({}) ===", batch_label);
+            if fail_only {
+                // For fail tests: "correct" = failed as expected
+                println!("Interpreter:  {}/{} correctly failed", interp_pass, test_files.len());
+                println!("C Codegen:    {}/{} correctly failed", c_pass, test_files.len());
+                println!("PE Emitter:   {}/{} correctly failed", pe_pass, test_files.len());
+            } else {
+                println!("Interpreter:  {}/{} passed", interp_pass, test_files.len());
+                println!("C Codegen:    {}/{} matched", c_pass, test_files.len());
+                println!("PE Emitter:   {}/{} valid", pe_pass, test_files.len());
+            }
 
             if interp_fail > 0 || c_fail > 0 || pe_fail > 0 {
                 process::exit(1);
@@ -1182,12 +1253,13 @@ fn main() {
 
         "watch" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec watch <file.p> [--interval <ms>] [--opt] [--no-run]");
+                eprintln!("Usage: pledgec watch <file.p> [--interval <ms>] [--opt] [--no-run] [--diff]");
                 eprintln!("       Auto-recompiles and runs on file change (hot reload mode)");
                 eprintln!("       Uses native JIT: compiles to ELF64 and executes (zero external tools)");
                 eprintln!("       --interval <ms>  Polling interval (default: 500ms)");
                 eprintln!("       --opt            Enable L2 optimizer");
                 eprintln!("       --no-run         Compile only, don't execute after each reload");
+                eprintln!("       --diff           Show PIR/assembly diff on each reload");
                 process::exit(1);
             }
             let input = &args[2];
@@ -1197,22 +1269,27 @@ fn main() {
                 .unwrap_or(500);
             let do_opt = args.iter().any(|a| a == "--opt");
             let do_run = !args.iter().any(|a| a == "--no-run");
+            let do_diff = args.iter().any(|a| a == "--diff");
 
             let input_path = std::path::PathBuf::from(input);
             let input_clone = input.clone();
             let do_opt_move = do_opt;
             let do_run_move = do_run;
+            let do_diff_move = do_diff;
 
             // Previous function snapshot for change detection (shared via Mutex for Send)
             let prev_snapshot = std::sync::Mutex::new(None::<hotreload::FunctionSnapshot>);
+            // Previous PIR L2 output for diffing (shared via Mutex for Send)
+            let prev_pir = std::sync::Mutex::new(None::<String>);
             // Track run count
             let run_count = std::sync::Mutex::new(0u32);
 
             // Helper: compile, detect changes, and optionally run
             let do_reload = move |source: &str, path: &str, is_initial: bool,
                              prev_snapshot: &std::sync::Mutex<Option<hotreload::FunctionSnapshot>>,
+                             prev_pir: &std::sync::Mutex<Option<String>>,
                              run_count: &std::sync::Mutex<u32>,
-                             do_opt: bool, do_run: bool| {
+                             do_opt: bool, do_run: bool, do_diff: bool| {
                 let label = if is_initial { "Initial" } else { "Reload" };
                 eprintln!("[watch] {} compilation of {}...", label, path);
 
@@ -1260,7 +1337,50 @@ fn main() {
 
                         *prev_snapshot.lock().unwrap() = Some(new_snapshot);
 
+                        // PIR diff: show what changed at the IR level
+                        if do_diff && !is_initial && !diff.modified.is_empty() {
+                            let new_pir = pir::format_l2(&l2);
+                            let prev_pir_str = {
+                                let prev = prev_pir.lock().unwrap();
+                                prev.clone()
+                            };
+                            if let Some(ref prev_pir_text) = prev_pir_str {
+                                eprintln!("[watch] PIR L2 diff:");
+                                let prev_lines: Vec<&str> = prev_pir_text.lines().collect();
+                                let new_lines: Vec<&str> = new_pir.lines().collect();
+                                let max_len = prev_lines.len().max(new_lines.len());
+                                let mut added = 0usize;
+                                let mut removed = 0usize;
+                                for i in 0..max_len {
+                                    let prev_line = prev_lines.get(i).copied().unwrap_or("");
+                                    let new_line = new_lines.get(i).copied().unwrap_or("");
+                                    if prev_line != new_line {
+                                        if !prev_line.is_empty() && new_line.is_empty() {
+                                            eprintln!("  - {}", prev_line);
+                                            removed += 1;
+                                        } else if prev_line.is_empty() && !new_line.is_empty() {
+                                            eprintln!("  + {}", new_line);
+                                            added += 1;
+                                        } else {
+                                            eprintln!("  - {}", prev_line);
+                                            eprintln!("  + {}", new_line);
+                                            removed += 1;
+                                            added += 1;
+                                        }
+                                    }
+                                }
+                                if added == 0 && removed == 0 {
+                                    eprintln!("  (no PIR changes detected)");
+                                }
+                            }
+                            *prev_pir.lock().unwrap() = Some(new_pir);
+                        } else if is_initial {
+                            // Store initial PIR for future diffs
+                            *prev_pir.lock().unwrap() = Some(pir::format_l2(&l2));
+                        }
+
                         // Compile and run using native JIT
+                        let mut prev_binary_size: u64 = 0;
                         if do_run {
                             eprintln!("[watch] Compiling to native ELF64 (opt={})...", do_opt);
                             match hotreload::compile_and_run(source, path, do_opt) {
@@ -1272,6 +1392,15 @@ fn main() {
                                     eprintln!("[watch] Run #{}: exit={}, compile={}ms, exec={}ms, size={} bytes",
                                         rc_val, result.exit_code, result.compile_time_ms,
                                         result.exec_time_ms, result.binary_size);
+                                    if do_diff && !is_initial && prev_binary_size > 0 {
+                                        let delta = result.binary_size as i64 - prev_binary_size as i64;
+                                        if delta != 0 {
+                                            let sign = if delta > 0 { "+" } else { "" };
+                                            eprintln!("[watch] Binary size: {} → {} bytes ({}{})",
+                                                prev_binary_size, result.binary_size, sign, delta);
+                                        }
+                                    }
+                                    prev_binary_size = result.binary_size as u64;
                                     if !result.stdout.is_empty() {
                                         let out = result.stdout.trim_end();
                                         if !out.is_empty() {
@@ -1309,7 +1438,7 @@ fn main() {
                     process::exit(1);
                 }
             };
-            do_reload(&source, input, true, &prev_snapshot, &run_count, do_opt_move, do_run_move);
+            do_reload(&source, input, true, &prev_snapshot, &prev_pir, &run_count, do_opt_move, do_run_move, do_diff_move);
 
             // Watch loop
             let mut watcher = hotreload::Watcher::new(move |path| {
@@ -1322,11 +1451,11 @@ fn main() {
                         return;
                     }
                 };
-                do_reload(&source, &input_clone, false, &prev_snapshot, &run_count, do_opt_move, do_run_move);
+                do_reload(&source, &input_clone, false, &prev_snapshot, &prev_pir, &run_count, do_opt_move, do_run_move, do_diff_move);
             });
             watcher.watch(&input_path);
-            eprintln!("\n[watch] Watching {} (polling every {}ms, native JIT, opt={})",
-                input, interval, do_opt);
+            eprintln!("\n[watch] Watching {} (polling every {}ms, native JIT, opt={}, diff={})",
+                input, interval, do_opt, do_diff);
             eprintln!("[watch] Press Ctrl+C to stop");
             watcher.run(interval);
         }
@@ -1412,6 +1541,7 @@ fn print_usage() {
     eprintln!("  pledgec version                           Show version");
     eprintln!("  pledgec watch   <file.p> [--interval <ms>] [--run]  Hot reload: recompile on change");
     eprintln!("  pledgec test                              Run all tests across all backends");
+    eprintln!("  pledgec test --fail                       Run only expected-fail tests (failing = correct)");
     eprintln!("  pledgec repl                              Interactive REPL (evaluate expressions)");
     eprintln!("  pledgec verify  <file.p>                  Verify IR correctness");
     eprintln!("  pledgec sourcemap <file.p>                Show source map (IR to source mapping)");

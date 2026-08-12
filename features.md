@@ -1,6 +1,6 @@
 # P Language — Feature Status
 
-*Last updated: verified against actual source code and test runs (133/133 unit tests, 7/8 harness tests, 78/79 interpreter tests, 102 .p test files)*
+*Last updated: verified against actual source code and test runs (136/136 unit tests, 8/8 harness tests, 78/78 interpreter tests + 1/1 expected-fail, 76/78 C codegen, 102 .p test files)*
 
 ## Legend
 
@@ -21,7 +21,7 @@
 | IR Interpreter (interp.rs) | ✅ | Runs IR directly via `pledgec run` |
 | PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables + flat binary (bare-metal mode) |
 | ELF64 Emitter (elf64.rs) | ✅ | Generates native ELF64 executables on Linux (zero external tools) + relocatable objects |
-| C Codegen (codegen_c.rs) | ✅ | Generates C code, 53/79 tests match interpreter output |
+| C Codegen (codegen_c.rs) | ✅ | Generates C code, 76/78 tests match interpreter output (2 mismatches: test_asm by design, test_comptime_reflect interpreter-only) |
 | PIR (pir.rs) | ✅ | PIR L1/L2/L3, `pledgec pir` command |
 | Optimizer (opt.rs) | ⚠️ | Const fold, CSE, DCE, inline, unroll, TCO, effect-based elision. Works for simple programs but exposes register allocator bug on complex ones. Not enabled by default. |
 | Peephole (peephole.rs) | ✅ | 9 passes, always on in `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection |
@@ -46,7 +46,7 @@
 | `pledgec emit <file> --bare -o <bin>` | ✅ | Bare-metal flat binary (no stdlib, no PE headers) |
 | `pledgec build <file> -o <out> [--target] [--opt]` | ✅ | Native build: PIR → codegen → peephole → ELF64 executable (zero external tools on Linux) |
 | `pledgec ccompile <file> -o <exe>` | ✅ | C codegen → gcc/clang → executable |
-| `pledgec test` | ✅ | Runs all 102 tests across interpreter, PE emitter, and C codegen |
+| `pledgec test` | ✅ | Runs all 78 normal + 1 expected-fail tests across interpreter, PE emitter, and C codegen |
 | `pledgec repl` | ✅ | Interactive REPL |
 | `pledgec verify <file>` | ✅ | IR verification pass |
 | `pledgec sourcemap <file>` | ✅ | Source map output |
@@ -364,10 +364,10 @@ The PE emitter generates standalone Windows x64 PE executables with no external 
 | Parser | 100% | — | — |
 | Type Checker | 100% | — | — |
 | IR Lowering | 100% | — | — |
-| Interpreter | 78/79 | — | `test_trait_verify_fail` (expected failure) |
-| PE Emitter | 78/79 | — | `test_trait_verify_fail` (expected failure) |
+| Interpreter | 78/78 + 1/1 expected-fail | — | `test_trait_verify_fail` (expected failure) |
+| PE Emitter | 78/78 + 1/1 expected-fail | — | `test_trait_verify_fail` (expected failure) |
 | ELF64 Emitter | ✅ | — | Working executables on Linux (zero external tools) |
-| C Codegen | 53/79 | — | 26 mismatches (asm, comptime, const_generic, gat, json, tensor, etc.) |
+| C Codegen | 76/78 + 1/1 expected-fail | — | 2 real mismatches (asm by design, comptime_reflect interpreter-only). test_db flaky (HashMap ordering). |
 | Multi-arch Codegen | ✅ | — | x86-64, ARM64, RISC-V assembly all work |
 | Peephole Optimizer | ✅ (9 passes) | — | Always on in `build` |
 | L2 Optimizer | — | ⚠️ | Works for simple programs, regalloc bug on complex ones |

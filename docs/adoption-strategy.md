@@ -36,6 +36,16 @@ Every new language faces the chicken-and-egg problem:
 - **Target users:** IoT device manufacturers, medical device companies
 - **Killer feature:** Memory-safe firmware with < 4KB binary size
 
+> **Status update — what's WORKING now:**
+> - ✅ **Bare-metal mode** — no-libc, no-OS targets are functional
+> - ✅ **RISC-V target** — `codegen_riscv.rs` emits RISC-V assembly
+> - ✅ **FixedBufferAllocator** — deterministic, no-allocation embedded memory management is operational (`src/embedded.rs`)
+> - ✅ **Hot reload** — native JIT + function-level change detection works
+> - ✅ **C interop** — C header parser → P FFI bindings (`src/cparser.rs`) is functional
+> - 📈 **C codegen backend** — 76/78 test parity (2 real mismatches: test_asm by design, test_comptime_reflect interpreter-only)
+>
+> These niches are no longer aspirational — the foundational capabilities are built and running.
+
 ---
 
 ## Phase 2: Expansion (Year 2-3)
@@ -81,48 +91,33 @@ Every new language faces the chicken-and-egg problem:
 
 ## Migration Tools — Making Switching Easy
 
-### C-to-P Transpiler
-```
-// Input: C code
-int add(int a, int b) { return a + b; }
+> **Note:** C-to-P and Rust-to-P transpilers are nice-to-have community
+> goals, not on the critical path. See `docs/extra.md` for honest
+> feasibility assessment. The FFI generator below is the only migration
+> tool that exists today.
 
-// Output: P code
-pf add(a: i32, b: i32) -> i32 {
-    ret a + b;
-}
-```
-- Auto-translate C syntax to P syntax
-- Add memory safety annotations (regions, capabilities)
-- Flag unsafe patterns for manual review
-- Gradual migration: translate one file at a time
-
-### Rust-to-P Transpiler
-```
-// Input: Rust code
-fn add(a: i64, b: i64) -> i64 { a + b }
-
-// Output: P code
-pf add(a: i64, b: i64) -> i64 {
-    ret a + b;
-}
-```
-- Convert Rust syntax to P syntax
-- Replace lifetimes with regions (auto-inferred)
-- Replace async/await with effect handlers
-- Replace macros with comptime
-
-### FFI Generator
+### FFI Generator (Working now)
 ```
 // Input: C header (openssl.h)
 SSL_CTX* SSL_CTX_new(const SSL_METHOD* method);
 
 // Output: P FFI binding
-#[extern]
-pf SSL_CTX_new(method: *const SSL_METHOD) -> *mut SSL_CTX;
+extern "C" pf SSL_CTX_new(method: *const SSL_METHOD) -> *mut SSL_CTX;
 ```
 - Parse C headers automatically
 - Generate P FFI bindings
 - No hand-written bindings needed
+- ✅ **Working now** — `pledgec parse-header <file.h>` parses C headers and emits P FFI bindings (`src/cparser.rs`)
+
+### C-to-P Transpiler (Nice-to-have — see `docs/extra.md`)
+- Auto-translate C code to P code
+- Feasible but moderate effort (real C has macros, goto, union punning)
+- FFI already covers the interop case; transpiler would help porting logic
+
+### Rust-to-P Transpiler (Aspirational — see `docs/extra.md`)
+- Convert Rust code to P code
+- Very high effort — lifetimes, macros, async, trait system don't map cleanly
+- Practical alternative: use FFI via C ABI, port files manually
 
 ---
 

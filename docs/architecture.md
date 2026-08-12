@@ -1,7 +1,7 @@
 # P Compiler Architecture
 
 **Version:** 0.5.0
-**Targets:** x86_64 (Windows PE + Linux ELF64), WebAssembly, bare-metal flat binary, C codegen, IR interpreter
+**Targets:** x86_64 (Windows PE + Linux ELF64), ARM64, RISC-V, Mach-O (macOS), COFF (Windows), WebAssembly, SPIR-V (GPU), bare-metal flat binary, C codegen, IR interpreter
 
 ---
 
@@ -75,13 +75,13 @@ Source (.p)
                                                      Native .exe
 ```
 
-The **ELF64 emitter** (`build` command on Linux) is the primary native backend — it produces working ELF64 executables directly with zero external tool dependencies, using the full PIR pipeline (L1→L2→L3 → codegen → peephole → ELF64). The **PE emitter** (`emit` command) produces Windows `.exe` files directly, bypassing PIR (operates directly on IR). The **WASM backend** targets the web. The **interpreter** provides rapid testing without any external tools.
+The **`build` command** uses the full PIR pipeline (L1→L2→L3 → codegen → peephole → ELF64) and is the primary native backend on Linux — it produces working ELF64 executables directly with zero external tool dependencies. The **`emit` command** bypasses PIR entirely: it operates directly on IR to produce Windows `.exe` files via the PE emitter (or bare-metal flat binaries with `--bare`). The **WASM backend** (`wasm.rs`) and **SPIR-V GPU backend** (`gpu.rs`) both consume PIR L3. The **C codegen** (`codegen_c.rs`) consumes IR directly. The **interpreter** provides rapid testing without any external tools. Object file formats (ELF64, Mach-O, COFF) are available via `codegen --elf|--macho|--coff`, and multiple object files can be linked with the integrated `linker.rs`.
 
 ### Entry Points (`compiler.rs`)
 
 | Function | Pipeline | CLI Command |
 |----------|----------|-------------|
-| `emit_source_with_path(source, path)` | lex → parse → typecheck → monomorphize → lower → PE emission (direct IR→machine code) | `emit` |
+| `emit_source_with_path(source, path)` | lex → parse → typecheck → monomorphize → lower → PE emission (direct IR→machine code, bypasses PIR) | `emit` |
 | `emit_bare(source, path)` | lex → parse → typecheck → lower → flat binary (no stdlib) | `emit --bare` |
 | `build_executable(source, path)` | lex → parse → typecheck → monomorphize → lower → PIR (L1→L2→L3) → codegen → peephole → ELF64 executable | `build` |
 | `ccompile_source_with_path(source, path)` | lex → parse → typecheck → monomorphize → lower → C codegen | `ccompile` |
@@ -91,7 +91,12 @@ The **ELF64 emitter** (`build` command on Linux) is the primary native backend �
 | `parse_to_ast(source)` | lex → parse | `ast` |
 | PIR lowering (`pir.rs`) | IR → PIR L1 → L2 → L3 | `pir` |
 | PIR optimization (`opt.rs`) | PIR + const fold + CSE + DCE + inline + unroll + TCO | `opt`, `pir --opt` |
-| Codegen (`codegen_x64.rs`, `codegen.rs`) | PIR L3 → x86-64 / ARM64 assembly | `codegen` |
+| Codegen (`codegen_x64.rs`, `codegen_arm64.rs`, `codegen_riscv.rs`) | PIR L3 → x86-64 / ARM64 / RISC-V assembly | `codegen` |
+| WASM backend (`wasm.rs`) | PIR L3 → WebAssembly binary | `wasm` |
+| GPU backend (`gpu.rs`) | PIR L3 → SPIR-V binary | `gpu` |
+| C header parser (`cparser.rs`) | C header → P FFI bindings | `parse-header` |
+| Hot reload (`hotreload.rs`) | Native JIT (ELF64) + function-level change detection | `watch` |
+| Linker (`linker.rs`) | Multiple object files → linked binary | `link` |
 
 ### Module Resolution (`compiler.rs`)
 
@@ -401,13 +406,19 @@ Translates SSA IR to portable C99 code that compiles with MSVC (`cl.exe`), GCC, 
 
 ### 2.9 Build Pipeline (`main.rs`)
 
-The `emit` command is the primary native backend — it requires zero external tools:
+The `build` command is the primary native backend on Linux — it uses the full PIR pipeline with zero external tools:
+
+1. `compiler::build_executable(source, path)` → PIR (L1→L2→L3) → codegen → peephole → ELF64 bytes
+2. Write bytes directly to executable file
+3. Print "Built native executable: <exe> (<size> bytes)"
+
+The `emit` command produces Windows PE executables directly (bypasses PIR):
 
 1. `compiler::emit_source_with_path(source, path)` → PE bytes (`Vec<u8>`)
 2. Write bytes directly to `.exe` file
 3. Print "Emitted native executable: <exe> (<size> bytes, no ml64.exe/link.exe)"
 
-The `build` command orchestrates external tools (MASM pipeline):
+The legacy `build` MASM pipeline (Windows, external tools) is also available:
 
 1. `compiler::build_source(source)` → assembly string
 2. Write `.asm` file
@@ -422,9 +433,47 @@ The `build` command orchestrates external tools (MASM pipeline):
 - `find_link()`: Same search paths
 - `find_kernel32_lib()`: Searches for `kernel32.lib` in Windows SDK directories
 
+### 2.10 Backends Overview
+
+The P compiler supports multiple output backends, each consuming either IR or PIR L3:
+
+| Backend | Source File | Input | Output | CLI Command |
+|---------|-----------|-------|--------|-------------|
+| **PE** (Windows) | `pe.rs` | IR (bypasses PIR) | x86_64 machine code → `.exe` | `emit` |
+| **ELF64** (Linux) | `elf64.rs` | PIR L3 → codegen → peephole | ELF64 executable / relocatable `.o` | `build`, `codegen --elf` |
+| **Mach-O** (macOS) | `macho.rs` | PIR L3 → codegen | Mach-O object file | `codegen --macho` |
+| **COFF** (Windows) | `coff.rs` | PIR L3 → codegen | COFF object file | `codegen --coff` |
+| **WASM** | `wasm.rs` | PIR L3 | WebAssembly binary (`.wasm`) | `wasm` |
+| **SPIR-V** (GPU) | `gpu.rs` | PIR L3 | SPIR-V binary | `gpu` |
+| **C codegen** | `codegen_c.rs` | IR (bypasses PIR) | C99 source (`.c`) → gcc/clang → executable | `ccompile` |
+| **Bare-metal** | `pe.rs` (`--bare` mode) | IR | Flat binary (no stdlib, no PE headers) | `emit --bare` |
+| **MASM** (legacy) | `x86.rs` | IR | MASM assembly (`.asm`) → `ml64.exe` → `link.exe` | legacy `build` (Windows) |
+| **Interpreter** | `interp.rs` | IR | Direct execution (in-memory) | `run` |
+
+**Multi-architecture codegen:** `codegen_x64.rs` (x86-64), `codegen_arm64.rs` (ARM64), and `codegen_riscv.rs` (RISC-V) all consume PIR L3 and produce assembly. Selected via `codegen --target <arch>`.
+
+**Integrated linker:** `linker.rs` resolves relocations across multiple object files (ELF64, Mach-O, COFF) — invoked via the `link` command.
+
+**Linux runtime:** `runtime_linux.rs` provides hand-encoded x86_64 machine code for raw Linux syscalls (write, exit, mmap) — no libc dependency. Used by the ELF64 backend.
+
 ---
 
-## 3. Source File Map
+## 3. Verification Infrastructure
+
+The compiler includes a suite of scripts and conventions for maintaining correctness across all backends:
+
+| Tool | Purpose |
+|------|---------|
+| `verify.sh` | Full verification: build (release) + run all tests + compare to baseline. Use `--save` to update baseline, `--quick` for build-only check. |
+| `scripts/bisect.sh <test>` | Bisect which compiler layer (lowering, PIR, codegen, peephole) broke a specific test. |
+| `scripts/gen_golden.sh` | Generate golden files for intermediate compiler stages (IR, PIR L1/L2/L3, codegen, peephole) for future bisect accuracy. |
+| `AGENTS.md` | Working guide for AI assistants and humans: build commands, high-risk file list, known bugs, coding conventions, debugging workflow. **Read before making changes.** |
+
+**Workflow:** Run `./verify.sh` before and after every change. If tests regress, use `./scripts/bisect.sh <test_name>` to isolate the layer. If codegen/regalloc/peephole/elf64/pe changed, also run `./scripts/gen_golden.sh` to keep golden files current.
+
+---
+
+## 4. Source File Map
 
 | File | Responsibility |
 |------|---------------|
@@ -438,9 +487,27 @@ The `build` command orchestrates external tools (MASM pipeline):
 | `src/lower.rs` | AST → SSA IR lowering: `Program` → `IrModule` |
 | `src/interp.rs` | IR interpreter: `IrModule` → execution result |
 | `src/pe.rs` | **Direct PE emitter**: `IrModule` → x86_64 machine code → PE `.exe` (no external tools) |
-| `src/x86.rs` | x86_64 MASM codegen: `IrModule` → assembly string (for `build` command) |
+| `src/elf64.rs` | **ELF64 emitter**: PIR L3 → codegen → peephole → ELF64 executable (Linux, zero external tools) + relocatable objects |
+| `src/macho.rs` | **Mach-O emitter**: object files for macOS |
+| `src/coff.rs` | **COFF emitter**: object files for Windows |
+| `src/linker.rs` | **Integrated linker**: resolves relocations across multiple object files |
+| `src/runtime_linux.rs` | Hand-encoded x86_64 Linux runtime (raw syscall bytes, no libc) |
+| `src/x86.rs` | x86_64 MASM codegen: `IrModule` → assembly string (legacy `build` path) |
+| `src/codegen_x64.rs` | PIR L3 → x86_64 assembly (used by `build` and `codegen --target x86-64`) |
+| `src/codegen_arm64.rs` | PIR L3 → ARM64 assembly (`codegen --target arm64`) |
+| `src/codegen_riscv.rs` | PIR L3 → RISC-V assembly (`codegen --target riscv`) |
 | `src/codegen_c.rs` | C codegen backend: `IrModule` → C99 source code (for `ccompile` command) |
-| `src/codegen.rs` | Legacy ARM64 codegen: `Program` → assembly string (unused) |
+| `src/codegen.rs` | Legacy codegen dispatch (unused) |
+| `src/wasm.rs` | **WASM backend**: PIR L3 → WebAssembly binary (`wasm` command) |
+| `src/gpu.rs` | **SPIR-V GPU backend**: PIR L3 → SPIR-V binary (`gpu` command) |
+| `src/embedded.rs` | Embedded systems support: `FixedBufferAllocator`, `RealTime` effect, HAL abstractions |
+| `src/hotreload.rs` | **Hot reload**: native JIT (ELF64) + function-level change detection (`watch` command) |
+| `src/cparser.rs` | **C header parser**: parses C `.h` files → generates P FFI bindings (`parse-header` command) |
+| `src/pir.rs` | **PIR**: multi-level IR (L1/L2/L3) — `IrModule` → PIR |
+| `src/comptime.rs` | **Compile-time eval**: constant folding, reflection, f-string interpolation |
+| `src/opt.rs` | **PIR optimizer**: const fold, CSE, DCE, inline, unroll, TCO, effect-based elision (opt-in, has regalloc bug) |
+| `src/peephole.rs` | **9-pass peephole optimizer**: always on in `build` (redundant moves, zero idiom, branch threading, store-to-load, LEA coalescing, instruction selection) |
+| `src/regalloc.rs` | **Linear scan register allocator** (⚠️ known bug: constants clobbered by intervening instructions) |
 | `src/mono.rs` | Generic monomorphization: specializes generic functions per call site |
 | `src/compiler.rs` | Pipeline orchestration, module resolution, stdlib auto-include |
 | `stdlib/core.p` | Core standard library (println, assert, assert_eq) |
@@ -448,11 +515,11 @@ The `build` command orchestrates external tools (MASM pipeline):
 
 ---
 
-## 4. Data Flow Example
+## 5. Data Flow Example
 
 For `tests/strings.p`:
 
-```pledge
+```p
 pf main() {
     print("Hello, World!");
     pv name = "P";

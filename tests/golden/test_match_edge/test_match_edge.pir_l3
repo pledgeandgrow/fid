@@ -1,0 +1,781 @@
+; ─── PIR Level 3 — Low (virtual registers, stack frame) ───
+; ─── struct layouts ───
+struct Option { size=16, align=8
+  +0 __tag: i64
+  +8 __data0: i64
+}
+struct Result { size=16, align=8
+  +0 __tag: i64
+  +8 __data0: i64
+}
+; ─── string constants ───
+.str_0 = "hello"
+.str_1 = "\n"
+.str_2 = "Assertion failed\n"
+.str_3 = "called unwrap on None"
+.str_4 = "called unwrap on Err"
+; ─── extern functions ───
+extern p_alloc(i64) -> *u8
+extern p_allocator_alloc(opaque.Allocator, i64) -> i64
+extern p_allocator_create(*u8) -> opaque.Allocator
+extern p_allocator_free(opaque.Allocator, i64) -> void
+extern p_allocator_stats(opaque.Allocator) -> i64
+extern p_cli() -> void
+extern p_cr0_read() -> i64
+extern p_cr0_write(i64) -> void
+extern p_cr3_read() -> i64
+extern p_cr3_write(i64) -> void
+extern p_cr4_read() -> i64
+extern p_cr4_write(i64) -> void
+extern p_db_mem_close(opaque.Database) -> void
+extern p_db_mem_exec(opaque.Database, *u8) -> i64
+extern p_db_mem_open() -> opaque.Database
+extern p_db_mem_query(opaque.Database, *u8) -> *u8
+extern p_free(*u8) -> void
+extern p_hlt() -> void
+extern p_http_build_response(i64, *u8, *u8) -> *u8
+extern p_http_parse_request(*u8) -> opaque.HttpRequest
+extern p_idt_set_entry(i64, i64) -> void
+extern p_inb(i64) -> i64
+extern p_invlpg(i64) -> void
+extern p_json_at(opaque.Json, i64) -> opaque.Json
+extern p_json_dump(opaque.Json) -> *u8
+extern p_json_get(opaque.Json, *u8) -> opaque.Json
+extern p_json_len(opaque.Json) -> i64
+extern p_json_parse(*u8) -> opaque.Json
+extern p_json_pretty(opaque.Json) -> *u8
+extern p_json_string(opaque.Json) -> *u8
+extern p_json_type(opaque.Json) -> *u8
+extern p_lidt(*u8) -> void
+extern p_malloc(i64) -> *u8
+extern p_outb(i64, i64) -> void
+extern p_page_map(i64, i64, i64, i64) -> void
+extern p_page_unmap(i64, i64) -> void
+extern p_panic(*u8) -> void
+extern p_phys_read64(i64) -> i64
+extern p_phys_write64(i64, i64) -> void
+extern p_print_bool(bool) -> void
+extern p_print_float(f64) -> void
+extern p_print_int(i64) -> void
+extern p_print_newline() -> void
+extern p_print_str(*u8) -> void
+extern p_simd_add(opaque.Vec, opaque.Vec) -> opaque.Vec
+extern p_simd_div(opaque.Vec, opaque.Vec) -> opaque.Vec
+extern p_simd_dot(opaque.Vec, opaque.Vec) -> f64
+extern p_simd_from_vec(opaque.Vec) -> opaque.Vec
+extern p_simd_mul(opaque.Vec, opaque.Vec) -> opaque.Vec
+extern p_simd_scale(opaque.Vec, f64) -> opaque.Vec
+extern p_simd_sub(opaque.Vec, opaque.Vec) -> opaque.Vec
+extern p_simd_sum(opaque.Vec) -> f64
+extern p_simd_to_str(opaque.Vec) -> *u8
+extern p_socket_accept(i64) -> i64
+extern p_socket_close(i64) -> void
+extern p_socket_listen(i64) -> i64
+extern p_socket_read(i64, opaque.Vec) -> i64
+extern p_socket_recv_str(i64) -> *u8
+extern p_socket_write(i64, opaque.Vec) -> i64
+extern p_sti() -> void
+extern p_str_concat(*u8, *u8) -> *u8
+extern p_tensor_add(opaque.Tensor, opaque.Tensor) -> opaque.Tensor
+extern p_tensor_clone(opaque.Tensor) -> opaque.Tensor
+extern p_tensor_dot(opaque.Tensor, opaque.Tensor) -> f64
+extern p_tensor_filled(opaque.Vec, f64) -> opaque.Tensor
+extern p_tensor_from_vec(opaque.Vec, opaque.Vec) -> opaque.Tensor
+extern p_tensor_get(opaque.Tensor, opaque.Vec) -> f64
+extern p_tensor_matmul(opaque.Tensor, opaque.Tensor) -> opaque.Tensor
+extern p_tensor_max(opaque.Tensor) -> f64
+extern p_tensor_mean(opaque.Tensor) -> f64
+extern p_tensor_min(opaque.Tensor) -> f64
+extern p_tensor_mul(opaque.Tensor, opaque.Tensor) -> opaque.Tensor
+extern p_tensor_ndim(opaque.Tensor) -> i64
+extern p_tensor_ones(opaque.Vec) -> opaque.Tensor
+extern p_tensor_relu(opaque.Tensor) -> opaque.Tensor
+extern p_tensor_reshape(opaque.Tensor, opaque.Vec) -> opaque.Tensor
+extern p_tensor_scale(opaque.Tensor, f64) -> opaque.Tensor
+extern p_tensor_set(opaque.Tensor, opaque.Vec, f64) -> void
+extern p_tensor_shape(opaque.Tensor) -> opaque.Vec
+extern p_tensor_sigmoid(opaque.Tensor) -> opaque.Tensor
+extern p_tensor_size(opaque.Tensor) -> i64
+extern p_tensor_softmax(opaque.Tensor) -> opaque.Tensor
+extern p_tensor_sub(opaque.Tensor, opaque.Tensor) -> opaque.Tensor
+extern p_tensor_sum(opaque.Tensor) -> f64
+extern p_tensor_to_json(opaque.Tensor) -> *u8
+extern p_tensor_to_str(opaque.Tensor) -> *u8
+extern p_tensor_transpose(opaque.Tensor) -> opaque.Tensor
+extern p_tensor_zeros(opaque.Vec) -> opaque.Tensor
+extern p_to_str(i64) -> *u8
+
+; ─── function Option_is_none (frame=0 bytes) ───
+pf Option_is_none(v0: *u8, v1: *struct.Option) -> bool
+{
+  bb0:
+    v2 = addr v1 +0  ; *i64
+    v3 = load i64 v2
+    v4 = #0
+    v5 = Eq v3, v4  ; bool
+    br v5 ? bb2 : bb3
+  bb1:
+    v7 = #0
+    ret v7
+  bb2:
+    v9 = addr v1 +8  ; *i64
+    v10 = load i64 v9
+    v11 = #0
+    ret v11
+  bb3:
+    v13 = addr v1 +0  ; *i64
+    v14 = load i64 v13
+    v15 = #1
+    v16 = Eq v14, v15  ; bool
+    br v16 ? bb4 : bb5
+  bb4:
+    v18 = #1
+    ret v18
+  bb5:
+    jmp bb1
+}
+
+; ─── function Option_is_some (frame=0 bytes) ───
+pf Option_is_some(v0: *u8, v1: *struct.Option) -> bool
+{
+  bb0:
+    v2 = addr v1 +0  ; *i64
+    v3 = load i64 v2
+    v4 = #0
+    v5 = Eq v3, v4  ; bool
+    br v5 ? bb2 : bb3
+  bb1:
+    v7 = #0
+    ret v7
+  bb2:
+    v9 = addr v1 +8  ; *i64
+    v10 = load i64 v9
+    v11 = #1
+    ret v11
+  bb3:
+    v13 = addr v1 +0  ; *i64
+    v14 = load i64 v13
+    v15 = #1
+    v16 = Eq v14, v15  ; bool
+    br v16 ? bb4 : bb5
+  bb4:
+    v18 = #0
+    ret v18
+  bb5:
+    jmp bb1
+}
+
+; ─── function Option_map (frame=32 bytes) ───
+pf Option_map(v0: *struct.Option, v1: *u8, v2: *struct.Option, v3: i64) -> struct.Option
+{
+  bb0:
+    v4 = addr v2 +0  ; *i64
+    v5 = load i64 v4
+    v6 = #0
+    v7 = Eq v5, v6  ; bool
+    br v7 ? bb2 : bb3
+  bb1:
+    ret
+  bb2:
+    v10 = addr v2 +8  ; *i64
+    v11 = load i64 v10
+    v12 = [fp-16]
+    v13 = #0
+    v14 = addr [fp-16] +0  ; *i64
+    store i64 v13 -> v14
+    v16 = Add v11, v3  ; i64
+    v17 = addr [fp-16] +8  ; *i64
+    store i64 v16 -> v17
+    v19 = addr [fp-16] +0  ; *i64
+    v20 = addr v0 +0  ; *i64
+    v21 = load i64 v19
+    store i64 v21 -> v20
+    v23 = addr [fp-16] +8  ; *i64
+    v24 = addr v0 +8  ; *i64
+    v25 = load i64 v23
+    store i64 v25 -> v24
+    ret
+  bb3:
+    v28 = addr v2 +0  ; *i64
+    v29 = load i64 v28
+    v30 = #1
+    v31 = Eq v29, v30  ; bool
+    br v31 ? bb4 : bb5
+  bb4:
+    v33 = [fp-32]
+    v34 = #1
+    v35 = addr [fp-32] +0  ; *i64
+    store i64 v34 -> v35
+    v37 = addr [fp-32] +0  ; *i64
+    v38 = addr v0 +0  ; *i64
+    v39 = load i64 v37
+    store i64 v39 -> v38
+    v41 = addr [fp-32] +8  ; *i64
+    v42 = addr v0 +8  ; *i64
+    v43 = load i64 v41
+    store i64 v43 -> v42
+    ret
+  bb5:
+    jmp bb1
+}
+
+; ─── function Option_unwrap (frame=0 bytes) ───
+pf Option_unwrap(v0: *u8, v1: *struct.Option) -> i64
+{
+  bb0:
+    v2 = addr v1 +0  ; *i64
+    v3 = load i64 v2
+    v4 = #0
+    v5 = Eq v3, v4  ; bool
+    br v5 ? bb2 : bb3
+  bb1:
+    v7 = #0
+    ret v7
+  bb2:
+    v9 = addr v1 +8  ; *i64
+    v10 = load i64 v9
+    ret v10
+  bb3:
+    v12 = addr v1 +0  ; *i64
+    v13 = load i64 v12
+    v14 = #1
+    v15 = Eq v13, v14  ; bool
+    br v15 ? bb4 : bb5
+  bb4:
+    v17 = "called unwrap on None"
+    call p_panic(v17)
+    jmp bb1
+  bb5:
+    jmp bb1
+}
+
+; ─── function Option_unwrap_or (frame=0 bytes) ───
+pf Option_unwrap_or(v0: *u8, v1: *struct.Option, v2: i64) -> i64
+{
+  bb0:
+    v3 = addr v1 +0  ; *i64
+    v4 = load i64 v3
+    v5 = #0
+    v6 = Eq v4, v5  ; bool
+    br v6 ? bb2 : bb3
+  bb1:
+    v8 = #0
+    ret v8
+  bb2:
+    v10 = addr v1 +8  ; *i64
+    v11 = load i64 v10
+    ret v11
+  bb3:
+    v13 = addr v1 +0  ; *i64
+    v14 = load i64 v13
+    v15 = #1
+    v16 = Eq v14, v15  ; bool
+    br v16 ? bb4 : bb5
+  bb4:
+    ret v2
+  bb5:
+    jmp bb1
+}
+
+; ─── function Result_err (frame=32 bytes) ───
+pf Result_err(v0: *struct.Option, v1: *u8, v2: *struct.Result) -> struct.Option
+{
+  bb0:
+    v3 = addr v2 +0  ; *i64
+    v4 = load i64 v3
+    v5 = #0
+    v6 = Eq v4, v5  ; bool
+    br v6 ? bb2 : bb3
+  bb1:
+    ret
+  bb2:
+    v9 = addr v2 +8  ; *i64
+    v10 = load i64 v9
+    v11 = [fp-16]
+    v12 = #1
+    v13 = addr [fp-16] +0  ; *i64
+    store i64 v12 -> v13
+    v15 = addr [fp-16] +0  ; *i64
+    v16 = addr v0 +0  ; *i64
+    v17 = load i64 v15
+    store i64 v17 -> v16
+    v19 = addr [fp-16] +8  ; *i64
+    v20 = addr v0 +8  ; *i64
+    v21 = load i64 v19
+    store i64 v21 -> v20
+    ret
+  bb3:
+    v24 = addr v2 +0  ; *i64
+    v25 = load i64 v24
+    v26 = #1
+    v27 = Eq v25, v26  ; bool
+    br v27 ? bb4 : bb5
+  bb4:
+    v29 = addr v2 +8  ; *i64
+    v30 = load i64 v29
+    v31 = [fp-32]
+    v32 = #0
+    v33 = addr [fp-32] +0  ; *i64
+    store i64 v32 -> v33
+    v35 = addr [fp-32] +8  ; *i64
+    store i64 v30 -> v35
+    v37 = addr [fp-32] +0  ; *i64
+    v38 = addr v0 +0  ; *i64
+    v39 = load i64 v37
+    store i64 v39 -> v38
+    v41 = addr [fp-32] +8  ; *i64
+    v42 = addr v0 +8  ; *i64
+    v43 = load i64 v41
+    store i64 v43 -> v42
+    ret
+  bb5:
+    jmp bb1
+}
+
+; ─── function Result_is_err (frame=0 bytes) ───
+pf Result_is_err(v0: *u8, v1: *struct.Result) -> bool
+{
+  bb0:
+    v2 = addr v1 +0  ; *i64
+    v3 = load i64 v2
+    v4 = #0
+    v5 = Eq v3, v4  ; bool
+    br v5 ? bb2 : bb3
+  bb1:
+    v7 = #0
+    ret v7
+  bb2:
+    v9 = addr v1 +8  ; *i64
+    v10 = load i64 v9
+    v11 = #0
+    ret v11
+  bb3:
+    v13 = addr v1 +0  ; *i64
+    v14 = load i64 v13
+    v15 = #1
+    v16 = Eq v14, v15  ; bool
+    br v16 ? bb4 : bb5
+  bb4:
+    v18 = addr v1 +8  ; *i64
+    v19 = load i64 v18
+    v20 = #1
+    ret v20
+  bb5:
+    jmp bb1
+}
+
+; ─── function Result_is_ok (frame=0 bytes) ───
+pf Result_is_ok(v0: *u8, v1: *struct.Result) -> bool
+{
+  bb0:
+    v2 = addr v1 +0  ; *i64
+    v3 = load i64 v2
+    v4 = #0
+    v5 = Eq v3, v4  ; bool
+    br v5 ? bb2 : bb3
+  bb1:
+    v7 = #0
+    ret v7
+  bb2:
+    v9 = addr v1 +8  ; *i64
+    v10 = load i64 v9
+    v11 = #1
+    ret v11
+  bb3:
+    v13 = addr v1 +0  ; *i64
+    v14 = load i64 v13
+    v15 = #1
+    v16 = Eq v14, v15  ; bool
+    br v16 ? bb4 : bb5
+  bb4:
+    v18 = addr v1 +8  ; *i64
+    v19 = load i64 v18
+    v20 = #0
+    ret v20
+  bb5:
+    jmp bb1
+}
+
+; ─── function Result_ok (frame=32 bytes) ───
+pf Result_ok(v0: *struct.Option, v1: *u8, v2: *struct.Result) -> struct.Option
+{
+  bb0:
+    v3 = addr v2 +0  ; *i64
+    v4 = load i64 v3
+    v5 = #0
+    v6 = Eq v4, v5  ; bool
+    br v6 ? bb2 : bb3
+  bb1:
+    ret
+  bb2:
+    v9 = addr v2 +8  ; *i64
+    v10 = load i64 v9
+    v11 = [fp-16]
+    v12 = #0
+    v13 = addr [fp-16] +0  ; *i64
+    store i64 v12 -> v13
+    v15 = addr [fp-16] +8  ; *i64
+    store i64 v10 -> v15
+    v17 = addr [fp-16] +0  ; *i64
+    v18 = addr v0 +0  ; *i64
+    v19 = load i64 v17
+    store i64 v19 -> v18
+    v21 = addr [fp-16] +8  ; *i64
+    v22 = addr v0 +8  ; *i64
+    v23 = load i64 v21
+    store i64 v23 -> v22
+    ret
+  bb3:
+    v26 = addr v2 +0  ; *i64
+    v27 = load i64 v26
+    v28 = #1
+    v29 = Eq v27, v28  ; bool
+    br v29 ? bb4 : bb5
+  bb4:
+    v31 = addr v2 +8  ; *i64
+    v32 = load i64 v31
+    v33 = [fp-32]
+    v34 = #1
+    v35 = addr [fp-32] +0  ; *i64
+    store i64 v34 -> v35
+    v37 = addr [fp-32] +0  ; *i64
+    v38 = addr v0 +0  ; *i64
+    v39 = load i64 v37
+    store i64 v39 -> v38
+    v41 = addr [fp-32] +8  ; *i64
+    v42 = addr v0 +8  ; *i64
+    v43 = load i64 v41
+    store i64 v43 -> v42
+    ret
+  bb5:
+    jmp bb1
+}
+
+; ─── function Result_unwrap (frame=0 bytes) ───
+pf Result_unwrap(v0: *u8, v1: *struct.Result) -> i64
+{
+  bb0:
+    v2 = addr v1 +0  ; *i64
+    v3 = load i64 v2
+    v4 = #0
+    v5 = Eq v3, v4  ; bool
+    br v5 ? bb2 : bb3
+  bb1:
+    v7 = #0
+    ret v7
+  bb2:
+    v9 = addr v1 +8  ; *i64
+    v10 = load i64 v9
+    ret v10
+  bb3:
+    v12 = addr v1 +0  ; *i64
+    v13 = load i64 v12
+    v14 = #1
+    v15 = Eq v13, v14  ; bool
+    br v15 ? bb4 : bb5
+  bb4:
+    v17 = addr v1 +8  ; *i64
+    v18 = load i64 v17
+    v19 = "called unwrap on Err"
+    call p_panic(v19)
+    jmp bb1
+  bb5:
+    jmp bb1
+}
+
+; ─── function Result_unwrap_or (frame=0 bytes) ───
+pf Result_unwrap_or(v0: *u8, v1: *struct.Result, v2: i64) -> i64
+{
+  bb0:
+    v3 = addr v1 +0  ; *i64
+    v4 = load i64 v3
+    v5 = #0
+    v6 = Eq v4, v5  ; bool
+    br v6 ? bb2 : bb3
+  bb1:
+    v8 = #0
+    ret v8
+  bb2:
+    v10 = addr v1 +8  ; *i64
+    v11 = load i64 v10
+    ret v11
+  bb3:
+    v13 = addr v1 +0  ; *i64
+    v14 = load i64 v13
+    v15 = #1
+    v16 = Eq v14, v15  ; bool
+    br v16 ? bb4 : bb5
+  bb4:
+    v18 = addr v1 +8  ; *i64
+    v19 = load i64 v18
+    ret v2
+  bb5:
+    jmp bb1
+}
+
+; ─── function abs (frame=0 bytes) ───
+pf abs(v0: *u8, v1: i64) -> i64
+{
+  bb0:
+    v2 = #0
+    v3 = Lt v1, v2  ; bool
+    br v3 ? bb1 : bb2
+  bb1:
+    v5 = Neg v1  ; i64
+    ret v5
+  bb2:
+    jmp bb3
+  bb3:
+    ret v1
+}
+
+; ─── function allocator_alloc (frame=0 bytes) ───
+pf allocator_alloc(v0: *u8, v1: *opaque.Allocator, v2: i64) -> i64
+{
+  bb0:
+    v3 = call p_allocator_alloc(v1, v2) -> i64
+    ret v3
+}
+
+; ─── function allocator_bytes_used (frame=0 bytes) ───
+pf allocator_bytes_used(v0: *u8, v1: *opaque.Allocator) -> i64
+{
+  bb0:
+    v2 = call p_allocator_stats(v1) -> i64
+    ret v2
+}
+
+; ─── function allocator_free (frame=0 bytes) ───
+pf allocator_free(v0: *u8, v1: *opaque.Allocator, v2: i64) -> void
+{
+  bb0:
+    call p_allocator_free(v1, v2)
+    ret
+}
+
+; ─── function assert (frame=0 bytes) ───
+pf assert(v0: *u8, v1: bool) -> void
+{
+  bb0:
+    v2 = Not v1  ; i64
+    br v2 ? bb1 : bb2
+  bb1:
+    v4 = "Assertion failed
+"
+    print *u8 v4
+    jmp bb3
+  bb2:
+    jmp bb3
+  bb3:
+    ret
+}
+
+; ─── function clamp (frame=0 bytes) ───
+pf clamp(v0: *u8, v1: i64, v2: i64, v3: i64) -> i64
+{
+  bb0:
+    v4 = Lt v1, v2  ; bool
+    br v4 ? bb1 : bb2
+  bb1:
+    ret v2
+  bb2:
+    jmp bb3
+  bb3:
+    v8 = Gt v1, v3  ; bool
+    br v8 ? bb4 : bb5
+  bb4:
+    ret v3
+  bb5:
+    jmp bb6
+  bb6:
+    ret v1
+}
+
+; ─── function create_allocator (frame=0 bytes) ───
+pf create_allocator(v0: *u8, v1: *u8) -> opaque.Allocator
+{
+  bb0:
+    v2 = call p_allocator_create(v1) -> opaque.Allocator
+    ret v2
+}
+
+; ─── function main (frame=104 bytes) ───
+pf main(v0: *u8) -> i64
+{
+  bb0:
+    v1 = #2
+    v2 = [fp-8]
+    store i64 v1 -> [fp-8]
+    v4 = [fp-16]
+    v5 = load i64 [fp-8]
+    v6 = #1
+    v7 = Eq v5, v6  ; bool
+    br v7 ? bb2 : bb3
+  bb1:
+    v9 = load i64 [fp-16]
+    v10 = [fp-24]
+    store i64 v9 -> [fp-24]
+    v12 = load i64 [fp-24]
+    print i64 v12
+    v14 = "hello"
+    v15 = [fp-32]
+    store i64 v14 -> [fp-32]
+    v17 = [fp-40]
+    v18 = load *u8 [fp-32]
+    v19 = "hi"
+    v20 = Eq v18, v19  ; bool
+    br v20 ? bb11 : bb12
+  bb2:
+    v22 = #10
+    store i64 v22 -> [fp-16]
+    jmp bb1
+  bb3:
+    v25 = #2
+    v26 = Eq v5, v25  ; bool
+    br v26 ? bb4 : bb5
+  bb4:
+    v28 = #20
+    store i64 v28 -> [fp-16]
+    jmp bb1
+  bb5:
+    v31 = #3
+    v32 = Eq v5, v31  ; bool
+    br v32 ? bb6 : bb7
+  bb6:
+    v34 = #30
+    store i64 v34 -> [fp-16]
+    jmp bb1
+  bb7:
+    jmp bb8
+  bb8:
+    v38 = #99
+    store i64 v38 -> [fp-16]
+    jmp bb1
+  bb9:
+    jmp bb1
+  bb10:
+    v42 = load i64 [fp-40]
+    v43 = [fp-48]
+    store i64 v42 -> [fp-48]
+    v45 = load i64 [fp-48]
+    print i64 v45
+    v47 = [fp-64]
+    v48 = #0
+    v49 = addr [fp-64] +0  ; *i64
+    store i64 v48 -> v49
+    v51 = #42
+    v52 = addr [fp-64] +8  ; *i64
+    store i64 v51 -> v52
+    v54 = [fp-72]
+    store i64 [fp-64] -> [fp-72]
+    v56 = [fp-80]
+    v57 = load *struct.Option [fp-72]
+    v58 = addr v57 +0  ; *i64
+    v59 = load i64 v58
+    v60 = #0
+    v61 = Eq v59, v60  ; bool
+    br v61 ? bb20 : bb21
+  bb11:
+    v63 = #1
+    store i64 v63 -> [fp-40]
+    jmp bb10
+  bb12:
+    v66 = "hello"
+    v67 = Eq v18, v66  ; bool
+    br v67 ? bb13 : bb14
+  bb13:
+    v69 = #2
+    store i64 v69 -> [fp-40]
+    jmp bb10
+  bb14:
+    v72 = "bye"
+    v73 = Eq v18, v72  ; bool
+    br v73 ? bb15 : bb16
+  bb15:
+    v75 = #3
+    store i64 v75 -> [fp-40]
+    jmp bb10
+  bb16:
+    jmp bb17
+  bb17:
+    v79 = #99
+    store i64 v79 -> [fp-40]
+    jmp bb10
+  bb18:
+    jmp bb10
+  bb19:
+    v83 = load i64 [fp-80]
+    v84 = [fp-88]
+    store i64 v83 -> [fp-88]
+    v86 = load i64 [fp-88]
+    print i64 v86
+    v88 = [fp-96]
+    v89 = load i64 [fp-8]
+    jmp bb25
+  bb20:
+    v91 = addr v57 +8  ; *i64
+    v92 = load i64 v91
+    store i64 v92 -> [fp-80]
+    jmp bb19
+  bb21:
+    jmp bb22
+  bb22:
+    v96 = #0
+    store i64 v96 -> [fp-80]
+    jmp bb19
+  bb23:
+    jmp bb19
+  bb24:
+    v100 = load i64 [fp-96]
+    v101 = [fp-104]
+    store i64 v100 -> [fp-104]
+    v103 = load i64 [fp-104]
+    print i64 v103
+    v105 = #0
+    ret v105
+  bb25:
+    v107 = #77
+    store i64 v107 -> [fp-96]
+    jmp bb24
+  bb26:
+    jmp bb24
+}
+
+; ─── function max (frame=0 bytes) ───
+pf max(v0: *u8, v1: i64, v2: i64) -> i64
+{
+  bb0:
+    v3 = Gt v1, v2  ; bool
+    br v3 ? bb1 : bb2
+  bb1:
+    ret v1
+  bb2:
+    jmp bb3
+  bb3:
+    ret v2
+}
+
+; ─── function min (frame=0 bytes) ───
+pf min(v0: *u8, v1: i64, v2: i64) -> i64
+{
+  bb0:
+    v3 = Lt v1, v2  ; bool
+    br v3 ? bb1 : bb2
+  bb1:
+    ret v1
+  bb2:
+    jmp bb3
+  bb3:
+    ret v2
+}
+
+; ─── function println (frame=0 bytes) ───
+pf println(v0: *u8, v1: *u8) -> void
+{
+  bb0:
+    print *u8 v1
+    v3 = "
+"
+    print *u8 v3
+    ret
+}

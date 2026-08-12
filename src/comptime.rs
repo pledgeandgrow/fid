@@ -216,6 +216,9 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<String>) 
         Stmt::ComptimeGen { block, .. } => {
             substitute_stmts(block, original, errs);
         }
+        Stmt::Sandbox { body, .. } => {
+            substitute_stmts(body, original, errs);
+        }
     }
 }
 
