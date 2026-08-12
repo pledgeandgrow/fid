@@ -1046,7 +1046,11 @@ fn lower_func_l2_to_l3(f: &L2Function, module: &IrModule) -> L3Function {
     // layout; Phase 4C will do proper alignment-aware layout.
     let mut frame_size: u64 = 0;
     let mut slot_of: HashMap<PValue, Slot> = HashMap::new();
-    for (vid, inst) in &f.values {
+    // Sort values by PValue to ensure deterministic slot assignment.
+    // (HashMap iteration order is non-deterministic due to random seeding.)
+    let mut sorted_values: Vec<(&PValue, &L2Inst)> = f.values.iter().collect();
+    sorted_values.sort_by_key(|(pv, _)| pv.0);
+    for (vid, inst) in sorted_values {
         if let L2Inst::Alloca { ty, .. } = inst {
             let size = module.type_size(ty).max(1);
             // Align to 8 bytes (simplified).
@@ -1192,7 +1196,7 @@ fn lower_l2_inst_to_l3(
         L2Inst::GetFieldPtr { struct_ptr, field_index, field_ty } => L3Inst::FieldAddr {
             dst,
             base: materialize(*struct_ptr, next, vreg_of, operand),
-            offset: *field_index,
+            offset: *field_index * 8,  // field index → byte offset (each field is 8 bytes)
             field_ty: field_ty.clone(),
         },
         L2Inst::GetElemPtr { array_ptr, index, elem_ty } => L3Inst::ElemAddr {
@@ -1871,7 +1875,9 @@ mod tests {
         // returns an empty CapSet for all calls — no runtime capability
         // annotations are needed. This test verifies that calls have empty
         // (elided) capability sets.
-        let src = "pf main() -> i64 { print(\"hi\"); ret 0; }\n";
+        // Note: print() is special-cased to emit Inst::Print (not Inst::Call),
+        // so we use a user-defined function call to test capability elision.
+        let src = "pf helper() -> i64 { ret 42; }\npf main() -> i64 { pv x = helper(); ret x; }\n";
         let module = compile_to_ir(src);
         let l1 = lower_ir_to_l1(&module);
         let main = l1.functions.iter().find(|f| f.name == "main").expect("main");

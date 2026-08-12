@@ -55,8 +55,27 @@ impl std::fmt::Display for Value {
             Value::Str(s) => write!(f, "{}", s),
             Value::Ptr(p) => write!(f, "ptr(0x{:x})", p),
             Value::Void => write!(f, "void"),
-            Value::Vec(_) => write!(f, "[...]"),
-            Value::Map(_) => write!(f, "{{...}}"),
+            Value::Vec(v) => {
+                let v = v.borrow();
+                write!(f, "[")?;
+                for (i, elem) in v.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", elem)?;
+                }
+                write!(f, "]")
+            }
+            Value::Map(m) => {
+                let m = m.borrow();
+                // Sort keys for deterministic output
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort();
+                write!(f, "{{")?;
+                for (i, key) in keys.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}: {}", key, m.get(*key).unwrap())?;
+                }
+                write!(f, "}}")
+            }
             Value::Dyn(t, _) => write!(f, "dyn({})", t),
             Value::Tensor(t) => write!(f, "{}", t.borrow().to_string()),
             Value::Json(j) => write!(f, "{}", json::dump(&j.borrow(), false)),
@@ -834,7 +853,24 @@ impl Interpreter {
                     Value::Float(f) => print!("{}", f),
                     Value::Bool(b) => print!("{}", b),
                     Value::Str(s) => print!("{}", s),
-                    _ => print!("{:?}", v),
+                    Value::Ptr(addr) => {
+                        // Try to load string from memory (null-terminated)
+                        let mut bytes = Vec::new();
+                        let mut offset = *addr;
+                        loop {
+                            let b = self.memory.load(offset, 1);
+                            if b[0] == 0 { break; }
+                            bytes.push(b[0]);
+                            offset += 1;
+                        }
+                        if bytes.is_empty() {
+                            // Not a string — print as pointer
+                            print!("ptr(0x{:x})", addr);
+                        } else {
+                            print!("{}", String::from_utf8_lossy(&bytes));
+                        }
+                    }
+                    _ => print!("{}", v),
                 }
                 let _ = ty;
                 ExecOutcome::Continue

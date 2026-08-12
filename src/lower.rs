@@ -1795,6 +1795,16 @@ impl Lowerer {
                     });
                 }
 
+                // Special case: print() builtin — emit as Inst::Print (not Inst::Call)
+                // so the codegen can route to p_print_int/p_print_str/etc.
+                if callee == "print" && !arg_vals.is_empty() {
+                    let arg_ty = self.get_value_type(arg_vals[0]);
+                    return self.emit_inst(Inst::Print {
+                        value: arg_vals[0],
+                        ty: arg_ty,
+                    });
+                }
+
                 // Determine return type — look up function or default to I64
                 let ret_ty = self.lookup_func_ret_ty(callee);
 

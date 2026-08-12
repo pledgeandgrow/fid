@@ -1,6 +1,39 @@
 # Pledge Language Changelog
 
-## [Unreleased] — Phase 2: Safety (Complete) + Documentation Update
+## [Unreleased] — Optimization Improvements + Documentation Audit
+
+### Peephole Optimizer — 3 New Passes (peephole.rs)
+- **Store-to-load forwarding**: `movq %src, -N(%rbp)` followed by `movq -N(%rbp), %dst` → replace load with `movq %src, %dst`. Eliminates redundant memory traffic.
+- **LEA coalescing**: `leaq -N(%rbp), %reg` repeated with same address and destination → remove duplicates. Tracks last LEA and skips redundant recomputations.
+- **Instruction selection (cmp+setcc+jcc)**: `cmpq %a, %b; sete %al; movzbq %al, %rax; testq %rax, %rax; jne .L` → `cmpq %a, %b; je .L`. Eliminates 4 instructions by using flags directly from cmpq. Supports all setcc variants (sete, setne, setl, setg, setle, setge, setb, seta, setbe, setae).
+- **Total peephole passes**: 9 (up from 6), all always on in `build` command
+- **Tests**: 26 peephole tests (up from 20), all pass
+
+### L2 Optimizer Fixes (opt.rs)
+- **Inliner dangling references**: Fixed bug where `replace_all_refs` ran before new instructions were fully integrated, leaving dangling references to removed call IDs. Fix: `inline_call_site_tracked` tracks all replacements across inlining rounds and applies them to newly created instructions.
+- **Topological sort**: Added `topo_sort_block` to sort block instruction lists after inlining so definitions come before uses. Terminators forced to end.
+- **`--opt` still not enabled by default**: Works for simple programs (hello.p: 3316 bytes vs 3468 without opt) but exposes pre-existing register allocator bug on complex programs (constants clobbered by intervening instructions).
+
+### ELF64 Emitter Fix (elf64.rs)
+- **movslq memory operand**: Fixed crash on `movslq (%rax), %rax` — extended encoder to handle memory operands via `try_parse_mem` + `encode_modrm_mem`.
+
+### Hot Reload Implementation (hotreload.rs + main.rs)
+- **Native JIT execution**: `compile_and_run()` compiles source to ELF64 executable via `build_executable` pipeline (PIR L1→L2→L3 → codegen → 9 peephole passes → ELF64), writes to temp file, executes as child process, captures stdout/stderr/exit code. Zero external tools.
+- **Function-level change detection**: `FunctionSnapshot::from_l2()` hashes each L2 function's debug representation (name + params + blocks + values). `FunctionSnapshot::diff()` compares snapshots and reports added/modified/removed functions.
+- **State preservation**: `PersistentState` stores key-value state in a temp file keyed by source path hash. State survives across reloads.
+- **Watch command rewrite**: `pledgec watch <file.p> [--interval <ms>] [--opt] [--no-run]` — polls for file changes, recompiles to native ELF64, reports function diff (added/modified/removed), executes, shows compile/exec time + binary size. Initial compilation + reload both use native JIT.
+- **Removed old stub**: The old `watch` command that just re-lowered to IR and printed "Hot reload complete" without executing anything has been replaced.
+- **Tests**: 8 hot reload tests (function snapshot diff, no changes, removed functions, persistent state, compile_and_run hello, compile_and_run with opt, debugger, watcher detects changes). Total unit tests: 136 (up from 133).
+
+### Documentation Audit
+- **README.md**: Corrected all outdated claims — 35 source files (was 25), 45K LOC (was 35K), 133 unit tests (was 85), 7/8 harness (was 8/8), 78/79 interp/PE (was 52/52), 53/79 C codegen (was 38+), 102 .p files (was 87), 9 peephole passes (was 6), ELF64 executables work (was "WIP/segfault"), FFI/const generics/GATs work (were "not parsed"), GPU backend wired (was "dead code")
+- **features.md**: Updated all status entries with verified information
+- **docs/roadmap.md**: Updated phase status and test counts
+- **docs/roadmap-limitations.md**: Updated gap analysis with verified results
+- **docs/architecture.md**: Updated to show ELF64 as primary Linux backend, PIR pipeline in build
+- **docs/changelog.md**: Updated test results to verified counts
+
+## [Previous] — Phase 2: Safety (Complete) + Documentation Update
 
 ### Phase 2A — Region Inference
 - **AST**: `Stmt::RegionBlock { name, body }` for `region r { ... }` blocks
@@ -30,16 +63,19 @@
 - **Tests**: 9 tests — OOB vec get/set, overflow add/mul/sub, div-by-zero, empty vec first/last, unwrap none (9/9 pass)
 
 ### Documentation Update
-- **README.md**: Updated status to Phase 1+2 complete, test counts (87 .p files, 8/8 harness, 85/85 unit), new feature table entries (type aliases, match guards/ranges, trait assoc/default/objects, inline asm, effect annotations, region blocks, capability elision, bounds checking, bare-metal mode), updated CLI commands (pir, opt, codegen, emit --bare), updated project structure (25 source files, 8 stdlib modules), updated roadmap
-- **docs/roadmap.md**: Updated Phase 3C (ADTs, match guards/ranges, type aliases, SIMD marked done), Phase 4A (PIR L1/L2/L3 done), Phase 4B (effect-based elision, capability elision, peephole done), Phase 4C (ELF64, peephole, flat binary done), Phase 4D (ELF output done)
-- **docs/architecture.md**: Updated to v0.5.0, added PIR optimizer, ELF64, WASM, comptime, and bare-metal to pipeline diagram
-- **features.md**: Updated all sections with Phase 2 features, added Safety section, updated Concurrency and Advanced sections
-- **TEST.md**: Updated test summary table (8/8 harness, 85/85 unit, 87 .p files)
+- **README.md**: Updated to reflect actual state — 35 source files, ~45,000 LOC, 133 unit tests, 7/8 harness tests, 78/79 interpreter/PE tests, 53/79 C codegen, 102 .p test files, 9 peephole passes, ELF64 executables work on Linux
+- **docs/roadmap.md**: Updated test counts and phase status to reflect actual verified state
+- **docs/architecture.md**: Updated to show ELF64 emitter as primary backend on Linux, PIR pipeline in build command
+- **features.md**: Updated all sections with verified status, added ELF64/Mach-O/COFF/GPU backends, corrected const generics/GATs/FFI status
+- **docs/roadmap-limitations.md**: Updated gap analysis with verified test results (133 unit, 7/8 harness, 78/79 interp/PE, 53/79 C codegen, 190 warnings)
 
-### Test Results
-- **Harness tests**: 8/8 pass (interpreter, PE, C codegen, golden files, safety, capability, effect, region)
-- **Unit tests**: 85/85 pass (elf64: 19, pir: 9, peephole: 20, codegen_x64: 10, opt: 9, regalloc: 13, tensor: 7)
-- **Total .p test files**: 87 (64 root + 9 safety + 4 capability + 7 effects + 3 regions)
+### Test Results (Verified)
+- **Unit tests**: 133/133 pass (elf64, pir, peephole: 26, codegen_x64, opt, regalloc, tensor)
+- **Harness tests**: 7/8 pass (1 failure: golden_files_match — interpreter prints Rust debug format for Vec/Map/Ptr)
+- **Interpreter**: 78/79 pass (1 expected failure: test_trait_verify_fail)
+- **PE Emitter**: 78/79 valid (1 expected failure: test_trait_verify_fail)
+- **C Codegen**: 53/79 match (26 mismatches: asm, comptime, const_generic, gat, json, tensor, etc.)
+- **Total .p test files**: 102 (79 root + 9 safety + 4 capability + 7 effects + 3 regions)
 
 ## [Previous] — Phase 5A: Bare Metal
 

@@ -1,105 +1,97 @@
-# Pledge Architecture — The Full Stack
+# P Architecture — The Full Stack
 
 > Every layer built by us. No LLVM. No borrowed infrastructure.
 
-## Current Architecture (Phase 1 — What We Have Now)
+*Last updated: Aug 2026 — verified against source tree (`src/*.rs`, `stdlib/*.p`, `features.md`).*
+
+## Current Architecture (Phase 4D — What We Have Now)
 
 ```
 Source (.p files)
     ↓
-Lexer (src/lexer.rs)          — hand-written tokenizer
+Lexer (src/lexer.rs)              — hand-written tokenizer
     ↓
-Parser (src/parser.rs)        — recursive descent, produces AST
+Parser (src/parser.rs)            — recursive descent, produces AST
     ↓
-Typechecker (src/typechecker.rs) — basic type inference
+Typechecker (src/typechecker.rs)  — types + regions + effects + capabilities + traits
     ↓
-Lowering (src/lower.rs)        — AST → IR (our own SSA-based IR)
+Monomorphization (src/mono.rs)    — generic specialization
     ↓
-Monomorphization (src/mono.rs) — generic specialization
+Lowering (src/lower.rs)           — AST → SSA IR (src/ir.rs)
     ↓
-┌─────────────────────────────────────────────┐
-│                                             │
-│  Interpreter (src/interp.rs)                │ — runs IR directly
-│  PE Emitter (src/pe.rs)                     │ — IR → x86-64 machine code
-│                                             │
-└─────────────────────────────────────────────┘
+Comptime (src/comptime.rs)        — compile-time eval + reflection
+    ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│                                                                      │
+│  Interpreter (src/interp.rs)        — runs IR directly (pledgec run) │
+│  PIR Pipeline (src/pir.rs)          — IR → PIR L1 → L2 → L3          │
+│  Peephole (src/peephole.rs)         — 9 passes, always on in build   │
+│  Optimizer (src/opt.rs)             — opt-in (has regalloc bug)      │
+│  Register Allocator (src/regalloc.rs) — linear scan                  │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+    ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│                                                                      │
+│  Native Backends                                                     │
+│  • PE Emitter (src/pe.rs)            — IR → x86-64 .exe (Windows)    │
+│  • ELF64 Emitter (src/elf64.rs)      — PIR → ELF64 executable (Linux)│
+│  • Mach-O Emitter (src/macho.rs)     — object files (macOS)          │
+│  • COFF Emitter (src/coff.rs)        — object files (Windows)        │
+│  • Bare-metal flat binary            — emit --bare                   │
+│                                                                      │
+│  Multi-Arch Codegen (assembly output)                                │
+│  • x86-64 (src/codegen_x64.rs)       • ARM64 (src/codegen_arm64.rs)  │
+│  • RISC-V (src/codegen_riscv.rs)     • MASM (src/x86.rs)             │
+│                                                                      │
+│  Portable / Web / GPU Backends                                       │
+│  • C source (src/codegen_c.rs)       — IR → C99 (gcc/clang/cl.exe)   │
+│  • WASM (src/wasm.rs)                — PIR → WebAssembly binary      │
+│  • SPIR-V (src/gpu.rs)               — PIR → SPIR-V GPU binary       │
+│                                                                      │
+│  Integrated Linker (src/linker.rs)   — ELF64 objects → executable    │
+│  Hot Reload (src/hotreload.rs)       — native JIT + function swap    │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+    ↓
+Native Binary / WASM / SPIR-V / C Source / Running Code
 ```
 
 **What works today:**
-- Lexer, parser, AST, typechecker, lowering, monomorphization
-- IR interpreter (for `pledgec run`)
-- PE emitter (for `pledgec emit` — produces native x86-64 executables)
-- Generics, enums, structs, closures, match, try blocks, defer, references
-- No external dependencies (no LLVM, no libc, no assembler, no linker)
+- Lexer, parser, AST, typechecker (types + regions + effects + capabilities + traits)
+- Lowering, monomorphization, comptime (eval + reflection + f-string interpolation)
+- IR interpreter (`pledgec run`)
+- PIR pipeline: L1 → L2 → L3 (`pledgec pir`)
+- Peephole optimizer: 9 passes, always on in `build`
+- PIR optimizer: const fold, CSE, DCE, inline, unroll, TCO, effect elision (opt-in — has regalloc bug)
+- PE emitter: native x86-64 Windows executables, no external tools
+- ELF64 emitter: native Linux executables + relocatable objects, no external tools
+- Mach-O / COFF object file emission
+- Bare-metal flat binary mode (`--bare`)
+- Multi-arch assembly codegen: x86-64, ARM64, RISC-V
+- WASM backend, SPIR-V/GPU backend
+- C source backend (portability fallback via gcc/clang/cl.exe)
+- Integrated linker (ELF64 objects → executable, in-process)
+- Hot reload (`pledgec watch`) — native JIT + function-level change detection
+- Custom runtime: hand-encoded x86-64 machine code via raw syscalls (Linux, no libc) / kernel32.dll (Windows)
+- 8 stdlib modules: core, json, tensor, parallel, db, http, simd, shape
+- C header FFI parsing (`pledgec parse-header`)
+- Embedded/IoT: FixedBufferAllocator, `!RealTime` effect, RISC-V target, HAL framework
+- No external dependencies for primary paths: no LLVM, no libc (in P binaries), no external assembler, no external linker
 
-**What's missing:**
-- No optimizer (IR is directly translated to machine code)
-- No region inference
-- No effect system
-- No capability checking
-- No comptime
-- No hot reload
-- Only x86-64 target
-
----
-
-## Target Architecture (End State)
-
-```
-Source (.p files)
-    ↓
-Lexer (src/lexer.rs)               — hand-written, incremental
-    ↓
-Parser (src/parser.rs)             — recursive descent, error recovery
-    ↓
-Typechecker (src/typechecker.rs)   — regions + effects + capabilities + traits
-    ↓
-PIR Generator (src/pir.rs)         — AST → PIR (Pledge Intermediate Representation)
-    ↓
-┌──────────────────────────────────────────────────────────┐
-│                                                          │
-│  PIR Level 1 — High-level (semantic)                     │
-│  • Preserves regions, effects, capabilities              │
-│  • Inlining, specialization, comptime evaluation         │
-│  • Effect-based reordering                               │
-│  • Region-based alias analysis                           │
-│  • Capability elision                                    │
-│                                                          │
-│  PIR Level 2 — Mid-level (control flow)                  │
-│  • Loop transforms, tail call optimization               │
-│  • Closure conversion, lambda lifting                    │
-│  • Partial evaluation, constant folding                  │
-│  • Dead code elimination                                 │
-│                                                          │
-│  PIR Level 3 — Low-level (machine-near)                  │
-│  • SSA form, register allocation                         │
-│  • Instruction selection per architecture                │
-│  • Peephole optimization                                 │
-│  • Stack frame layout                                    │
-│                                                          │
-└──────────────────────────────────────────────────────────┘
-    ↓
-┌─────────────────────────────────────────────┐
-│                                             │
-│  Dev Mode: JIT Compiler                     │ — hot reload, fast compilation
-│  • Compile function bodies on demand        │
-│  • Patch running code in memory             │
-│  • Sub-millisecond iteration               │
-│                                             │
-│  Prod Mode: AOT Compiler                    │ — full optimization, small binaries
-│  • All PIR optimization passes              │
-│  • Custom codegen (x86-64, ARM64, RISC-V)  │
-│  • Integrated linker (no external linker)   │
-│  • Binary output (ELF, PE, Mach-O)          │
-│                                             │
-└─────────────────────────────────────────────┘
-    ↓
-Native Binary / Running Code
-```
+**What's partial / pending:**
+- ⚠️ PIR optimizer: works for simple programs, exposes pre-existing register allocator bug on complex ones (not enabled by default)
+- ⚠️ Effect handlers: `handle { do } with` syntax parses and runs; full continuation semantics pending
+- ❌ `async` / `await` / `spawn`: parsed, not yet implemented
+- ❌ `#[test]` attribute: parsed but not executed by `pledgec test`
+- ❌ `#[derive]`: not yet implemented
+- ❌ Default arguments, variadic arguments: not implemented
+- ❌ Region allocator (arena-based, tied to region system): not started
+- ❌ Self-hosting (Phase 6): compiler is still written in Rust
 
 ---
 
-## PIR — Pledge Intermediate Representation
+## PIR — P Intermediate Representation
 
 ### Design Principles
 
@@ -108,11 +100,11 @@ Native Binary / Running Code
 3. **Semantic-aware**: regions, effects, capabilities are first-class in PIR
 4. **SSA-based**: static single assignment for optimization passes
 5. **Target-independent at high level**: same PIR for all architectures
-6. **Human-readable**: debuggable, inspectable (like LLVM IR but cleaner)
+6. **Human-readable**: debuggable, inspectable (`pledgec pir <file> [1|2|3|all]`)
 
 ### PIR Level 1 — High-Level (Semantic)
 
-Preserves all Pledge language semantics:
+Preserves all P language semantics:
 
 ```
 function main() -> i64 !IO {
@@ -127,7 +119,7 @@ function main() -> i64 !IO {
 }
 ```
 
-**Optimizations at this level:**
+**Optimizations at this level** (in `src/opt.rs`, opt-in):
 - Region-aware alias analysis (free, no pointer analysis needed)
 - Effect-based reordering (pure calls can move past each other)
 - Capability elision (if capability is provably unused, remove checks)
@@ -175,9 +167,9 @@ bb0:
 ```
 
 **Optimizations at this level:**
-- Register allocation (graph coloring or linear scan)
-- Instruction selection (choose optimal instructions per architecture)
-- Peephole optimization (local instruction improvements)
+- Register allocation (linear scan in `src/regalloc.rs`)
+- Instruction selection (per architecture in `codegen_x64.rs` / `codegen_arm64.rs` / `codegen_riscv.rs`)
+- Peephole optimization (9 passes in `src/peephole.rs`, always on in `build`)
 - Stack frame layout
 - Calling convention lowering
 
@@ -192,22 +184,25 @@ bb0:
 - Its compile times are slow (100+ passes)
 - Its linker (lld) is separate and expensive
 - We can't control its behavior precisely
+- Using it would make P "just another LLVM frontend" — no architectural advantage over Rust or Zig
 
-### What We Build Instead
-- **x86-64 backend**: direct PIR → machine code (already have this in pe.rs!)
-- **ARM64 backend**: for Apple Silicon, embedded, servers
-- **RISC-V backend**: for IoT, custom hardware, research
-- **WASM backend**: for web deployment (future)
+### What We Built Instead
+- **x86-64 backend**: PE emitter (`src/pe.rs`, direct IR→machine code), PIR codegen (`src/codegen_x64.rs`), MASM (`src/x86.rs`)
+- **ARM64 backend**: `src/codegen_arm64.rs` — for Apple Silicon, embedded, servers
+- **RISC-V backend**: `src/codegen_riscv.rs` — for IoT, custom hardware, research
+- **WASM backend**: `src/wasm.rs` — PIR → WebAssembly binary (`pledgec wasm`)
+- **SPIR-V / GPU backend**: `src/gpu.rs` — PIR → SPIR-V binary (`pledgec gpu`)
+- **C source backend**: `src/codegen_c.rs` — IR → C99, portability fallback compiled by gcc/clang/cl.exe
 
 ### Codegen Strategy
 ```
 PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Binary Output
 ```
 
-- **Register allocator**: linear scan for dev (fast), graph coloring for prod (optimal)
-- **Instruction selector**: pattern matching on PIR → machine instructions
-- **Peephole**: local optimizations (e.g., `mov rax, 0` → `xor rax, rax`)
-- **Binary output**: direct to ELF/PE/Mach-O (no external assembler/linker)
+- **Register allocator**: linear scan (`src/regalloc.rs`) — ⚠️ has known bug (constants not loaded into registers before use can be clobbered by intervening instructions)
+- **Instruction selector**: pattern matching on PIR → machine instructions per architecture
+- **Peephole**: 9 local optimization passes (always on in `build`): redundant moves, zero idioms, nop arithmetic, branch threading, dead stores, redundant tests, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
+- **Binary output**: direct to ELF/PE/Mach-O/COFF/WASM/SPIR-V (no external assembler/linker for native targets)
 
 ---
 
@@ -218,45 +213,103 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 - External linker doesn't understand PIR semantics
 - Separate linker = separate process = IPC overhead
 
-### What We Build Instead
-- **Integrated linker**: part of the compiler, not a separate process
-- **Incremental linking**: only re-link changed modules
-- **Semantic linking**: leverage PIR for cross-module optimization
-- **Dead code elimination**: at link time, remove unused functions (smaller binaries)
+### What We Built
+- **Integrated linker** (`src/linker.rs`): part of the compiler, not a separate process
+- **ELF64 object linking**: resolves `R_X86_64_PC32`, `R_X86_64_PLT32`, `R_X86_64_64` relocations in-process
+- **Incremental linking**: cache object files, only re-link changed modules
+- **Link-time dead code elimination**: remove unused functions (smaller binaries)
+- **Multi-file linking**: `pledgec link <files...>`
+- **Runtime symbol resolution**: links against hand-encoded P runtime (`src/runtime_linux.rs`)
 
 ---
 
-## Custom Runtime — Minimal, Region-Aware
+## Custom Runtime — Minimal, No libc
 
-### What We Need
-- **Region allocator**: arena/pool/stack allocation backed by regions
-- **Panic handler**: for unrecoverable errors (no exceptions)
-- **Effect runtime**: for effect handlers (when not compiled away)
-- **Print/IO stubs**: minimal stdlib (already have p_print_*)
+### What We Have
+- **Linux runtime** (`src/runtime_linux.rs`): hand-encoded x86-64 machine code (raw bytes, not assembly text) implementing all `p_print_*`, `p_panic`, `p_alloc`, `p_malloc`, `p_free`, `p_str_concat`, `p_to_str` via direct syscalls. System V AMD64 ABI. **No libc dependency.**
+- **Windows runtime** (in `src/pe.rs`): links only `kernel32.dll` (HeapAlloc/HeapFree/WriteFile/GetStdHandle/ExitProcess) — not the MSVC C runtime.
+- **Bare metal**: no runtime — `--bare` mode emits flat binary with no stdlib
+- **Panic handler** (`p_panic`): for unrecoverable errors (no exceptions)
 
 ### What We DON'T Need
 - No garbage collector
 - No runtime type information (RTTI)
 - No virtual machine
-- No JIT in production mode
+- No JIT in production mode (hot reload JIT is dev-only)
 - No reflection (comptime replaces it)
+- No libc (raw syscalls on Linux, kernel32.dll only on Windows)
+
+### What's Planned
+- Region allocator: arena-based, tied to the region system (not yet started)
+- Effect runtime: for effect handlers that can't be compiled away (full continuation semantics pending)
+
+---
+
+## Custom Stdlib — 8 Modules
+
+| Module | File | Contents |
+|--------|------|----------|
+| core | `stdlib/core.p` | Auto-included: `Option`, `Result`, `println`, `assert`, `assert_eq`, `max`, `min`, `abs`, `clamp` |
+| json | `stdlib/json.p` | parse, stringify, get, at |
+| tensor | `stdlib/tensor.p` | n-d arrays, matmul, relu, softmax |
+| parallel | `stdlib/parallel.p` | par_map, par_sum, par_dot |
+| db | `stdlib/db.p` | `cap Database` trait, in-memory KV store |
+| http | `stdlib/http.p` | socket + HTTP parsing |
+| simd | `stdlib/simd.p` | elementwise ops, dot, sum, scale (f64x2, f64x4, etc.) |
+| shape | `stdlib/shape.p` | shape system for tensor ops |
+
+---
+
+## Embedded & IoT Support (Phase 5B)
+
+- **RISC-V target**: `src/codegen_riscv.rs` — assembly output for IoT/custom hardware
+- **Deterministic memory**: `FixedBufferAllocator` in `src/embedded.rs` — pre-allocated buffer, no heap fragmentation
+- **Binary size optimization**: < 4KB for simple programs
+- **Real-time guarantees**: `!RealTime` effect — bounded execution time
+- **HAL framework**: hardware abstraction layer in `src/embedded.rs`
+- **Bare-metal mode**: `pledgec emit <file> --bare -o <bin>` — no headers, no stdlib, raw machine code
+- **Examples**: `examples/rpi_led_blink.p`, `examples/riscv_blink.p`, `tests/test_boot.p`, `tests/test_bare.p`
+
+---
+
+## Hot Reload (Phase 4D)
+
+- `src/hotreload.rs` + `pledgec watch <file>`
+- Native JIT: compiles to ELF64 in memory, runs immediately
+- Function-level change detection via L2 IR hashing
+- Recompiles and swaps only changed functions
+- Sub-second iteration for development
+
+---
+
+## C FFI
+
+- `src/cparser.rs` + `pledgec parse-header <file.h>` — parses C headers, generates P FFI bindings
+- `extern "C"` declarations: parsed, lowered, C codegen, interpreter stubs
+- Tests: `test_ffi.p`, `test_ffi_full.p`, `test_ffi_header.p`
 
 ---
 
 ## Bootstrapping Strategy
 
-### Phase 1: Pledge in Rust (Now)
-- Compiler written in Rust
-- Compiles Pledge source to native code
-- Self-hosting IR and codegen
+### Phase 1–4D: P in Rust (Current)
+- Compiler written in Rust (`pledgec` binary)
+- Compiles P source to native code via custom pipeline
+- Self-hosting IR, PIR, codegen, linker, runtime — all custom-built
+- 4 Rust crates used to build `pledgec`: `hashbrown`, `compact_str`, `smallvec`, `bumpalo`
 
-### Phase 2: Pledge in Pledge (Self-Hosting)
-- Rewrite compiler in Pledge
-- Pledge compiler compiles itself
+### Phase 5: Custom Everything for P Binaries
+- Custom file I/O via raw syscalls on Windows too (drop kernel32.dll for P binaries)
+- Region allocator tied to region system
+- Full effect handler continuation semantics
+- `async` / `await` / `spawn` implementation
+
+### Phase 6: P in P (Self-Hosting)
+- Rewrite compiler in P
+- P compiler compiles itself
 - No Rust dependency for end users
-- Compiler binary is a Pledge binary
-
-### Phase 3: Pledge Optimizes Itself
-- PIR optimizer runs on Pledge compiler code
+- Compiler binary is a P binary
+- PIR optimizer runs on P compiler code
 - comptime specializes the compiler for the target
 - Compiler becomes faster by optimizing itself
+- **ZERO external dependencies**

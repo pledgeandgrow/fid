@@ -26,6 +26,7 @@ mod coff;
 mod macho;
 mod hotreload;
 mod linker;
+mod runtime_linux;
 mod embedded;
 mod gpu;
 mod tensor;
@@ -456,7 +457,7 @@ fn main() {
                     } else {
                         // gcc/clang: -O2 -o output c_path
                         // Extract link libraries from the C source (extern "C" link "m")
-                        let mut link_libs: Vec<String> = Vec::new();
+                        let mut link_libs: Vec<String> = vec!["-lm".to_string()];
                         for line in c_code.lines() {
                             if line.starts_with("// PLINK:") {
                                 let lib = line.trim_start_matches("// PLINK:").trim();
@@ -1059,10 +1060,134 @@ fn main() {
             }
         }
 
+        "gpu" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pledgec gpu <file.p> --target spirv|ptx [-o output] [--text]");
+                eprintln!("       Generates GPU code from a Pledge program");
+                eprintln!("       --target spirv  Generate SPIR-V bytecode (Vulkan compute shaders)");
+                eprintln!("       --target ptx     Generate PTX assembly (NVIDIA GPUs)");
+                eprintln!("       -o <file>        Write output to file (default: stdout)");
+                eprintln!("       --text           For spirv: emit text disassembly instead of raw bytecode");
+                process::exit(1);
+            }
+            // Find the input file (first non-flag argument after "gpu")
+            let skip_next: std::collections::HashSet<&str> = ["--target", "-o"].iter().cloned().collect();
+            let mut input_file = String::new();
+            let mut i = 2;
+            while i < args.len() {
+                let a = &args[i];
+                if skip_next.contains(a.as_str()) {
+                    i += 2;
+                    continue;
+                }
+                if !a.starts_with("-") && !a.starts_with("--") {
+                    input_file = a.clone();
+                    break;
+                }
+                i += 1;
+            }
+            if input_file.is_empty() {
+                eprintln!("Error: no input file specified");
+                process::exit(1);
+            }
+            let input = &input_file;
+            let target = args.iter().position(|a| a == "--target")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| s.as_str())
+                .unwrap_or("spirv");
+            let output_file: Option<&str> = args.iter().position(|a| a == "-o")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| s.as_str());
+            let text_mode = args.iter().any(|a| a == "--text");
+
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+
+            // Parse → typecheck → lower → PIR L3
+            let module = match compiler::lower_to_ir_module(&source) {
+                Ok(m) => m,
+                Err(errors) => {
+                    for e in errors {
+                        eprintln!("{}", e);
+                    }
+                    process::exit(1);
+                }
+            };
+            let l1 = pir::lower_ir_to_l1(&module);
+            let l2 = pir::lower_l1_to_l2(&l1);
+            let l3 = pir::lower_l2_to_l3(&l2, &module);
+
+            match target {
+                "spirv" => {
+                    if text_mode {
+                        let text = gpu::generate_spirv_text(&l3);
+                        match output_file {
+                            Some(path) => {
+                                if let Err(e) = fs::write(path, &text) {
+                                    eprintln!("Error writing '{}': {}", path, e);
+                                    process::exit(1);
+                                }
+                                println!("Generated SPIR-V text: {} ({} chars)", path, text.len());
+                            }
+                            None => {
+                                print!("{}", text);
+                            }
+                        }
+                    } else {
+                        let words = gpu::generate_spirv(&l3);
+                        let bytes: Vec<u8> = words.iter()
+                            .flat_map(|w| w.to_le_bytes())
+                            .collect();
+                        match output_file {
+                            Some(path) => {
+                                if let Err(e) = fs::write(path, &bytes) {
+                                    eprintln!("Error writing '{}': {}", path, e);
+                                    process::exit(1);
+                                }
+                                println!("Generated SPIR-V bytecode: {} ({} words, {} bytes)", path, words.len(), bytes.len());
+                            }
+                            None => {
+                                use std::io::Write;
+                                std::io::stdout().write_all(&bytes).ok();
+                            }
+                        }
+                    }
+                }
+                "ptx" => {
+                    let ptx = gpu::generate_ptx(&l3);
+                    match output_file {
+                        Some(path) => {
+                            if let Err(e) = fs::write(path, &ptx) {
+                                eprintln!("Error writing '{}': {}", path, e);
+                                process::exit(1);
+                            }
+                            println!("Generated PTX assembly: {} ({} chars)", path, ptx.len());
+                        }
+                        None => {
+                            print!("{}", ptx);
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("Unknown GPU target '{}'. Use --target spirv or --target ptx", target);
+                    process::exit(1);
+                }
+            }
+        }
+
         "watch" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec watch <file.p> [--interval <ms>]");
+                eprintln!("Usage: pledgec watch <file.p> [--interval <ms>] [--opt] [--no-run]");
                 eprintln!("       Auto-recompiles and runs on file change (hot reload mode)");
+                eprintln!("       Uses native JIT: compiles to ELF64 and executes (zero external tools)");
+                eprintln!("       --interval <ms>  Polling interval (default: 500ms)");
+                eprintln!("       --opt            Enable L2 optimizer");
+                eprintln!("       --no-run         Compile only, don't execute after each reload");
                 process::exit(1);
             }
             let input = &args[2];
@@ -1070,25 +1195,103 @@ fn main() {
                 .and_then(|i| args.get(i + 1))
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(500);
+            let do_opt = args.iter().any(|a| a == "--opt");
+            let do_run = !args.iter().any(|a| a == "--no-run");
 
             let input_path = std::path::PathBuf::from(input);
             let input_clone = input.clone();
+            let do_opt_move = do_opt;
+            let do_run_move = do_run;
 
-            let mut watcher = hotreload::Watcher::new(move |path| {
-                eprintln!("\n[watch] File changed: {} — recompiling...", path);
-                let source = match fs::read_to_string(&input_clone) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("[watch] Error reading: {}", e);
-                        return;
-                    }
-                };
-                match compiler::lower_to_ir_module(&source) {
-                    Ok(module) => {
-                        eprintln!("[watch] Compiled {} functions", module.functions.len());
-                        // In a full implementation, this would JIT-compile and hot-swap
-                        // For now, just report success
-                        eprintln!("[watch] Hot reload complete");
+            // Previous function snapshot for change detection (shared via Mutex for Send)
+            let prev_snapshot = std::sync::Mutex::new(None::<hotreload::FunctionSnapshot>);
+            // Track run count
+            let run_count = std::sync::Mutex::new(0u32);
+
+            // Helper: compile, detect changes, and optionally run
+            let do_reload = move |source: &str, path: &str, is_initial: bool,
+                             prev_snapshot: &std::sync::Mutex<Option<hotreload::FunctionSnapshot>>,
+                             run_count: &std::sync::Mutex<u32>,
+                             do_opt: bool, do_run: bool| {
+                let label = if is_initial { "Initial" } else { "Reload" };
+                eprintln!("[watch] {} compilation of {}...", label, path);
+
+                // Build L2 for function-level change detection
+                match compiler::lower_to_l2(source, path) {
+                    Ok(l2) => {
+                        let new_snapshot = hotreload::FunctionSnapshot::from_l2(&l2);
+                        let func_count = new_snapshot.function_names().len();
+
+                        // Compute diff against previous snapshot
+                        let diff = {
+                            let prev = prev_snapshot.lock().unwrap();
+                            match &*prev {
+                                Some(prev_snap) => new_snapshot.diff(prev_snap),
+                                None => {
+                                    // First compilation — everything is "added"
+                                    hotreload::FunctionDiff {
+                                        added: new_snapshot.function_names().iter().map(|s| s.to_string()).collect(),
+                                        modified: Vec::new(),
+                                        removed: Vec::new(),
+                                    }
+                                }
+                            }
+                        };
+
+                        if is_initial {
+                            eprintln!("[watch] Compiled {} functions: {:?}",
+                                func_count,
+                                new_snapshot.function_names().iter().take(5).collect::<Vec<_>>());
+                        } else if diff.is_empty() {
+                            eprintln!("[watch] No functions changed (whitespace/comment only?)");
+                        } else {
+                            eprintln!("[watch] Function changes: {} added, {} modified, {} removed",
+                                diff.added.len(), diff.modified.len(), diff.removed.len());
+                            if !diff.added.is_empty() {
+                                eprintln!("[watch]   Added: {:?}", diff.added);
+                            }
+                            if !diff.modified.is_empty() {
+                                eprintln!("[watch]   Modified: {:?}", diff.modified);
+                            }
+                            if !diff.removed.is_empty() {
+                                eprintln!("[watch]   Removed: {:?}", diff.removed);
+                            }
+                        }
+
+                        *prev_snapshot.lock().unwrap() = Some(new_snapshot);
+
+                        // Compile and run using native JIT
+                        if do_run {
+                            eprintln!("[watch] Compiling to native ELF64 (opt={})...", do_opt);
+                            match hotreload::compile_and_run(source, path, do_opt) {
+                                Ok(result) => {
+                                    let mut rc = run_count.lock().unwrap();
+                                    *rc += 1;
+                                    let rc_val = *rc;
+                                    drop(rc);
+                                    eprintln!("[watch] Run #{}: exit={}, compile={}ms, exec={}ms, size={} bytes",
+                                        rc_val, result.exit_code, result.compile_time_ms,
+                                        result.exec_time_ms, result.binary_size);
+                                    if !result.stdout.is_empty() {
+                                        let out = result.stdout.trim_end();
+                                        if !out.is_empty() {
+                                            eprintln!("[watch] stdout:");
+                                            for line in out.lines() {
+                                                eprintln!("  {}", line);
+                                            }
+                                        }
+                                    }
+                                    if !result.stderr.is_empty() {
+                                        eprintln!("[watch] stderr: {}", result.stderr.trim());
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[watch] Compilation error: {}", e);
+                                }
+                            }
+                        }
+
+                        eprintln!("[watch] {} complete", label);
                     }
                     Err(errors) => {
                         for e in errors {
@@ -1096,9 +1299,34 @@ fn main() {
                         }
                     }
                 }
+            };
+
+            // Initial compilation
+            let source = match fs::read_to_string(&input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[watch] Error reading: {}", e);
+                    process::exit(1);
+                }
+            };
+            do_reload(&source, input, true, &prev_snapshot, &run_count, do_opt_move, do_run_move);
+
+            // Watch loop
+            let mut watcher = hotreload::Watcher::new(move |path| {
+                eprintln!("\n[watch] File changed: {} — reloading...", path);
+                let path_owned = path.to_string();
+                let source = match fs::read_to_string(&input_clone) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[watch] Error reading: {}", e);
+                        return;
+                    }
+                };
+                do_reload(&source, &input_clone, false, &prev_snapshot, &run_count, do_opt_move, do_run_move);
             });
             watcher.watch(&input_path);
-            eprintln!("[watch] Watching {} (polling every {}ms)...", input, interval);
+            eprintln!("\n[watch] Watching {} (polling every {}ms, native JIT, opt={})",
+                input, interval, do_opt);
             eprintln!("[watch] Press Ctrl+C to stop");
             watcher.run(interval);
         }
@@ -1177,9 +1405,12 @@ fn print_usage() {
     eprintln!("  pledgec opt     <file.p> [passes]         Optimize PIR L2 and show result");
     eprintln!("  pledgec codegen <file.p> [--target x86-64] Custom codegen (PIR L3 → x86-64 asm)");
     eprintln!("           [--peephole] [--elf <out.o>]     Peephole optimize / emit ELF object");
+    eprintln!("  pledgec gpu     <file.p> --target spirv|ptx  Generate GPU code (SPIR-V or PTX)");
+    eprintln!("           [-o output] [--text]             Write to file / SPIR-V text disassembly");
     eprintln!("  pledgec tokens  <file.p>                  Show tokens");
     eprintln!("  pledgec ast     <file.p>                  Show AST");
     eprintln!("  pledgec version                           Show version");
+    eprintln!("  pledgec watch   <file.p> [--interval <ms>] [--run]  Hot reload: recompile on change");
     eprintln!("  pledgec test                              Run all tests across all backends");
     eprintln!("  pledgec repl                              Interactive REPL (evaluate expressions)");
     eprintln!("  pledgec verify  <file.p>                  Verify IR correctness");

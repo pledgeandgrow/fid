@@ -1,13 +1,13 @@
-# Pledge Language Syntax Specification
+# P Language Syntax Specification
 
-**Version:** 0.4.0
-**Status:** Phase 1 Bootstrap — Direct PE emitter (x86_64) + MASM backend + C codegen backend + IR interpreter
+**Version:** 0.5.0
+**Status:** Phase 4D — Direct PE/ELF64 emitters (x86_64) + MASM backend + C codegen backend + WASM/SPIR-V backends + multi-arch assembly (x86-64/ARM64/RISC-V) + IR interpreter + PIR pipeline (L1/L2/L3)
 
-> **Implementation Status:** This document is the full language specification. Not all features are implemented yet. See `README.md` for a breakdown of what is working end-to-end (interpreter + native x86_64 + C codegen) vs. parsed-only vs. planned.
+> **Implementation Status:** This document is the full language specification. Not all features are implemented yet — sections marked with implementation status (✅ working / ⚠️ partial / ❌ parsed-only or planned). See `features.md` for the authoritative feature matrix and `docs/architecture.md` for the compiler pipeline.
 
 ## 1. Design Philosophy
 
-Pledge is a systems programming language designed for safety, clarity, and modern AI-assisted development. It borrows proven concepts from Rust while introducing several innovations that address Rust's pain points.
+P is a systems programming language designed for safety, clarity, and modern AI-assisted development. It borrows proven concepts from Rust while introducing several innovations that address Rust's pain points.
 
 ### 1.1 Core Principles
 
@@ -19,7 +19,7 @@ Pledge is a systems programming language designed for safety, clarity, and moder
 6. **AI-friendly syntax** — Syntax choices prioritize AI model comprehension. Familiar patterns from Rust, Python, Swift.
 7. **One keyword per concept** — `pf` for all functions (named, anonymous, async, comptime). `pv` for all variables. `pc` for constants. `cap` for traits/capabilities.
 
-### 1.2 What Pledge Takes From Rust
+### 1.2 What P Takes From Rust
 
 - Ownership and borrowing (`&` / `&mut`)
 - Algebraic enums and pattern matching (`match` / `=>`)
@@ -33,9 +33,9 @@ Pledge is a systems programming language designed for safety, clarity, and moder
 - `&str` / `String` string model
 - `[T; N]` / `Vec<T>` / `&[T]` collection model
 
-### 1.3 What Pledge Does Differently
+### 1.3 What P Does Differently
 
-| Feature | Rust | Pledge |
+| Feature | Rust | P |
 |---------|------|--------|
 | Function keyword | `fn` | `pf` |
 | Variable keyword | `let` / `let mut` | `pv` / `pv mut` |
@@ -51,7 +51,7 @@ Pledge is a systems programming language designed for safety, clarity, and moder
 | Error handling | `Result<T, E>` only | `Result<T, E>` + effect handlers (`!Effect`) |
 | Async | `async fn` / `.await` | `async pf` / `.await` (sugar over effects) |
 | Compile-time code | Procedural macros | `comptime { }` blocks |
-| Hot reload | Not supported | Built-in (for PledgeOS) |
+| Hot reload | Not supported | Built-in (`pledgec watch`) |
 | Capability security | Not built-in | Core language feature |
 
 ---
@@ -66,11 +66,36 @@ enum        cap         impl        use         match       ty
 if          else        for         while       loop
 ret         break       continue    async       await
 comptime    in          as          where       region
-spawn       defer       move        static
+spawn       defer       move        static      try
+handle      do          interrupt   extern      dyn         module
+with
 true        false       none        some        ok          err
 ```
 
 **Note:** `none`, `some`, `ok`, `err` are not keywords — they are enum variant names from the standard library (`Option` and `Result`). They are listed here for reference.
+
+**Keyword reference** (from `src/token.rs`):
+
+| Keyword | Purpose |
+|---------|---------|
+| `pf` | Function declaration (named, anonymous, async, comptime) |
+| `pv` | Variable declaration (`pv mut` for mutable) |
+| `pc` | Compile-time constant |
+| `cap` | Capability / trait declaration |
+| `ty` | Type alias |
+| `ret` | Return statement |
+| `region` | Region block for memory lifetime tracking |
+| `handle` / `do` / `with` | Effect handlers |
+| `extern` | FFI declarations (`extern "C"`) |
+| `dyn` | Trait object (dynamic dispatch) |
+| `module` | Module declaration |
+| `with` | Capability grant in imports (`use ... with { IO, FS, Net, Spawn }`) |
+| `interrupt` | Interrupt handler (bare-metal) |
+| `comptime` | Compile-time code execution |
+| `defer` | Deferred cleanup (Go-style) |
+| `spawn` | Spawn concurrent task (parsed, not yet implemented) |
+| `async` / `await` | Async functions (parsed, not yet implemented) |
+| `try` | Try blocks for error handling |
 
 ### 2.2 Operators
 
@@ -219,11 +244,24 @@ Result<T, E>     // enum Result<T, E> { Ok(T), Err(E) }
 Vec<T>           // growable array
 String           // owned string
 HashMap<K, V>    // hash map
-HashSet<T>       // hash set
-Box<T>           // heap allocation
-Rc<T>            // reference counted
-Arc<T>           // atomically reference counted
 ```
+
+### 3.4a Standard Library Modules
+
+P's stdlib lives in `stdlib/` and is imported explicitly via `use` (except `core.p`, which is auto-included):
+
+| Module | File | Contents |
+|--------|------|----------|
+| `core` | `stdlib/core.p` | Auto-included: `Option`, `Result`, `println`, `print`, `assert`, `assert_eq`, `max`, `min`, `abs`, `clamp` |
+| `json` | `stdlib/json.p` | `parse`, `stringify`, `get`, `at` |
+| `tensor` | `stdlib/tensor.p` | n-d arrays, `matmul`, `relu`, `softmax` |
+| `parallel` | `stdlib/parallel.p` | `par_map`, `par_sum`, `par_dot` |
+| `db` | `stdlib/db.p` | `cap Database` trait, in-memory KV store |
+| `http` | `stdlib/http.p` | socket + HTTP parsing |
+| `simd` | `stdlib/simd.p` | elementwise ops, `dot`, `sum`, `scale` (f64x2, f64x4, etc.) |
+| `shape` | `stdlib/shape.p` | shape system for tensor ops |
+
+> **Note:** `Box<T>`, `Rc<T>`, `Arc<T>`, `HashSet<T>`, `Mutex<T>`, and channels are **not** in the current stdlib. Heap allocation uses `p_malloc`/`p_free` directly or via `Vec`/`String`/`HashMap`.
 
 ### 3.5 Built-in Type Methods
 
@@ -311,7 +349,7 @@ pf add(x: i32, y: i32) -> i32 {
 
 // Public function
 pub pf main() {
-    println("Hello, Pledge!");
+    println("Hello, P!");
 }
 
 // Function with no ret value (unit)
@@ -397,7 +435,7 @@ pv result = add(5, 3);
 ```pledge
 // Immutable (default)
 pv x = 5;
-pv name = "Pledge";
+pv name = "P";
 pv point = Point { x: 3.0, y: 4.0 };
 
 // Mutable
@@ -424,7 +462,7 @@ pv x = "now a string";  // shadows previous x
 // Compile-time constant
 pc MAX_PLAYERS: i32 = 64;
 pc PI: f64 = 3.14159265358979;
-pc GREETING: &str = "Hello, Pledge!";
+pc GREETING: &str = "Hello, P!";
 
 // Static (single memory location)
 static COUNTER: AtomicI32 = AtomicI32::new(0);
@@ -480,12 +518,12 @@ pv r = &mut y;      // &mut i32
 
 ### 6.2 Region Inference
 
-Pledge deduces regions (lifetimes) automatically. You rarely need to annotate them.
+P deduces regions (lifetimes) automatically. You rarely need to annotate them.
 
 ```pledge
 // Rust requires explicit lifetime:
 //   fn longest<'a>(x: &'a str, y: &'a str) -> &'a str
-// Pledge: compiler infers the region
+// P: compiler infers the region
 pf longest(x: &str, y: &str) -> &str {
     if x.len() > y.len() { x } else { y }
 }
@@ -641,7 +679,7 @@ pf foo(x: i32) -> i32 {
 
 ### 7.5 Defer
 
-Pledge introduces `defer` for cleanup (inspired by Go, but with RAII):
+P introduces `defer` for cleanup (inspired by Go, but with RAII):
 
 ```pledge
 pf process_file(path: &str) -> Result<(), FileError> {
@@ -941,7 +979,9 @@ pf load() -> Result<Data, AppError> {
 }
 ```
 
-### 11.2 Effect Handlers (Advanced — Phase 4+)
+### 11.2 Effect Handlers (⚠️ Partial — Phase 4D)
+
+> **Implementation status:** Effect annotations (`!IO`, `!Net`, `!Spawn`, `!Alloc`, `!{}`) and effect inference via fixpoint iteration over the call graph are ✅ working. The `handle { do } with` syntax parses and runs, but **full continuation semantics are pending** — effect handlers currently execute their handler bodies but do not support resumable continuations.
 
 ```pledge
 // Effect ty in signature
@@ -1100,16 +1140,16 @@ impl Iterator for Range {
 
 ---
 
-## 14. Compile-Time Code (comptime)
+## 14. Compile-Time Code (comptime) — ✅ Working
 
-Pledge replaces macros with `comptime` blocks — real code that runs at compile time.
+P replaces macros with `comptime` blocks — real code that runs at compile time. Implemented in `src/comptime.rs`.
 
 ### 14.1 Comptime Blocks
 
 ```pledge
 // Compile-time evaluation
 pc MAX_SIZE: i32 = comptime {
-    pv config = parse_env("PLEDGE_MAX_SIZE");
+    pv config = parse_env("P_MAX_SIZE");
     config.unwrap_or(1024)
 };
 
@@ -1121,42 +1161,53 @@ comptime {
     }
 }
 
-// Comptime function
-pf comptime fibonacci(n: i32) -> i32 {
+// Comptime function — note: `comptime` goes before `pf`
+comptime pf fibonacci(n: i32) -> i32 {
     if n <= 1 { n } else { fibonacci(n - 1) + fibonacci(n - 2) }
 }
 
 pc FIB_10: i32 = comptime fibonacci(10);  // 55
 ```
 
-### 14.2 Comptime vs Macros
+### 14.2 Comptime Reflection — ✅ Working
 
-| Feature | Rust Macros | Pledge comptime |
+```pledge
+comptime {
+    pv name = type_name<T>;           // type name as string
+    pv is_struct = is_struct<T>;      // true if T is a struct
+    pv is_enum = is_enum<T>;          // true if T is an enum
+    pv fields = field_names<T>;       // Vec of field name strings
+    pv field_types = field_types<T>;  // Vec of type descriptors
+    pv variants = enum_variants<T>;   // Vec of variant name strings
+}
+```
+
+### 14.3 Comptime vs Macros
+
+| Feature | Rust Macros | P comptime |
 |---------|------------|-----------------|
 | Syntax | `macro_rules!` or proc macros | `comptime { }` blocks |
-| Language | Macro DSL or Rust | Pledge itself |
+| Language | Macro DSL or Rust | P itself |
 | Debugging | Difficult | Standard debugger |
 | Error messages | Often cryptic | Compiler-generated, clear |
-| AI generation | Hard (macro DSL) | Easy (it's just Pledge) |
+| AI generation | Hard (macro DSL) | Easy (it's just P) |
 
 ---
 
 ## 15. Attributes
 
+> **Implementation status:** Attributes are parsed by the compiler. `#[test]` is parsed but **not executed** by `pledgec test` (❌). `#[derive]` is **not yet implemented** (❌). Other attributes shown below are the planned syntax.
+
 ```pledge
 // Standard attributes
 #[test]
-pf test_addition() { assert(1 + 1 == 2); }
+pf test_addition() { assert(1 + 1 == 2); }        // ❌ parsed, not executed
 
 #[test]
 #[should_panic]
-pf test_oob() { pv _ = [1, 2, 3][10]; }
+pf test_oob() { pv _ = [1, 2, 3][10]; }            // ❌ parsed, not executed
 
-#[test]
-#[ignore]
-pf slow_test() { /* ... */ }
-
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]                  // ❌ not implemented
 struct Point { x: f64, y: f64 }
 
 #[inline]
@@ -1172,9 +1223,11 @@ struct Config { /* ... */ }
 
 ---
 
-## 16. Concurrency
+## 16. Concurrency (❌ Parsed Only — Phase 4+)
 
-### 16.1 Async / Await
+> **Implementation status:** `async`, `await`, and `spawn` are **parsed by the compiler but not yet implemented**. The syntax below is the planned design. Effect annotations (`!Spawn`, `!Async`) and effect inference are ✅ working, but the runtime execution of async tasks and spawned threads is not yet functional.
+
+### 16.1 Async / Await (❌ Planned)
 
 ```pledge
 // Async function
@@ -1211,10 +1264,12 @@ process_local();
 pv result = task.await;
 ```
 
-### 16.3 Synchronization
+### 16.3 Synchronization (❌ Planned)
+
+> **Note:** `Mutex<T>`, `Rc<T>`, `Arc<T>`, and channels are **not** in the current stdlib. The syntax below is the planned design for when concurrency is implemented.
 
 ```pledge
-// Mutex
+// Mutex (planned)
 use std::sync::Mutex;
 
 pv data = Mutex::new(0);
@@ -1223,7 +1278,7 @@ pv data = Mutex::new(0);
     *guard += 1;
 }  // lock released here
 
-// Channels (for message passing)
+// Channels (for message passing, planned)
 use std::sync::channel;
 
 pv (tx, rx) = channel();
@@ -1235,90 +1290,124 @@ pv received = rx.recv();
 
 ---
 
-## 17. Capability-Based Security
+## 17. Capability-Based Security — ✅ Working
 
-Pledge has no ambient authority. File, network, and hardware access require explicit capabilities.
+P has no ambient authority. File, network, and hardware access require explicit capabilities, enforced at compile time with zero runtime overhead (capability elision).
+
+> **Implementation status:** ✅ `cap` declarations, `use ... with { IO, FS, Net, Spawn }` capability grants, transitive propagation through the call graph, compile-time denial, and zero-runtime-overhead capability elision all work.
+
+### 17.1 Capability Grants in Imports
 
 ```pledge
-// No ambient authority — this won't compile
-pf bad() {
-    // ERROR: no File capability in scope
-    pv file = open("secret.txt");
+// Grant capabilities to an imported module
+use network_lib with { Net, IO };       // network_lib can use Net + IO
+use file_lib with { FS };               // file_lib can use FS only
+use pure_lib;                           // pure_lib gets no capabilities
+```
+
+### 17.2 Capability Declarations
+
+```pledge
+// Declare a capability/trait
+cap Database {
+    pf query(&self, sql: &str) -> Result<Vec<Row>, DbError>;
+    pf execute(&self, sql: &str) -> Result<(), DbError>;
 }
 
-// Explicit capability required
-pf good(cap: &FileCap) {
-    pv file = cap.open("data.txt");
-    pv content = file.read();
-    println(content);
-}
-
-// Capabilities are passed, not global
-pf main() {
-    pv cap = FileCap::new("/allowed/path/");  // restricted to this path
-    good(&cap);
+// Implement it
+impl Database for InMemoryDB {
+    pf query(&self, sql: &str) -> Result<Vec<Row>, DbError> {
+        // ...
+    }
+    pf execute(&self, sql: &str) -> Result<(), DbError> {
+        // ...
+    }
 }
 ```
 
----
-
-## 18. Hot Reload
-
-Pledge supports hot-swapping functions at runtime (critical for PledgeOS):
+### 17.3 Compile-Time Enforcement
 
 ```pledge
-#[hot_reloadable]
+// Without capability grant — this won't compile
+pf bad() {
+    // ERROR: no Net capability in scope
+    pv response = http_get("https://example.com");
+}
+
+// With capability — compiles fine
+pf good() !Net {
+    pv response = http_get("https://example.com");
+    // ...
+}
+```
+
+### 17.4 Transitive Capabilities
+
+Capabilities propagate through the call graph. If function A calls function B which requires `Net`, then A must also have `Net` (or declare it). The compiler verifies this at compile time — no runtime checks needed.
+
+---
+
+## 18. Hot Reload — ✅ Working
+
+P supports hot-swapping functions at runtime via `pledgec watch`. Implemented in `src/hotreload.rs` — native JIT (ELF64) with function-level change detection via L2 IR hashing.
+
+```pledge
+// Any function can be hot-reloaded when using `pledgec watch`
 pub pf handle_request(req: &Request) -> Response {
     // This function can be replaced at runtime
     // without restarting the process
     process(req)
 }
-
-// Reload trigger (PledgeOS-specific)
-pf reload_module(name: &str) -> Result<(), ReloadError> {
-    pv new_code = compile_file(name)?;
-    swap_function(name, new_code)?;
-    Ok(())
-}
 ```
+
+```bash
+# Start watching — compiles to native ELF64, runs, and watches for changes
+pledgec watch main.p
+
+# When you edit and save a function, only that function is recompiled
+# and swapped in the running process — sub-second iteration
+```
+
+> **Note:** Hot reload for PledgeOS (the OS project) uses the same mechanism with OS-specific integration. The `pledgec watch` command works on any Linux system.
 
 ---
 
 ## 19. Standard Library Prelude
 
-Items available without explicit import:
+Items available without explicit import (from `stdlib/core.p`, auto-included):
 
 ```pledge
 // Types
 Option<T>     Some(T)     None
 Result<T, E>  Ok(T)       Err(E)
 Vec<T>        String      &str
-Box<T>        Rc<T>       Arc<T>
 
 // Functions
 println       print       eprintln
 vec!          format      dbg
-spawn         handle
+spawn         handle      // spawn: parsed only, handle: effect handlers
 
 // Note: `print` is polymorphic (accepts int, float, bool, str, vec, map)
 // and always appends a trailing newline (like Rust's `println!`).
 // `println` is an alias for `print` with explicit newline semantics.
 
-// Traits
+// Traits (caps)
 Clone         Copy        Debug
 Default       Display     Eq + Ord
 Hash          Iterator    IntoIterator
 From          Into        TryFrom + TryInto
 
-// Macros (none — Pledge has no macros)
+// Macros (none — P has no macros)
 // All of the above are functions or types
 ```
+
+> **Note:** `Box<T>`, `Rc<T>`, `Arc<T>`, `Mutex<T>`, and channels are **not** in the current stdlib. See section 3.4a for the full list of stdlib modules.
 
 ---
 
 ## 20. File Extension
 
-Pledge source files use the `.p` extension:
+P source files use the `.p` extension:
 
 ```
 main.p

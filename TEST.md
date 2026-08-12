@@ -1,6 +1,6 @@
-# TEST.md — Pledge Test Results
+# TEST.md — P Test Results
 
-*Last updated: Aug 11, 2026 (Phase 5A complete — 68/69 interpreter, 67/69 PE; inline asm + bare-metal + interrupt + MMU + boot)*
+*Last updated: verified against actual test runs (136/136 unit tests, 7/8 harness tests, 78/79 interpreter, 78/79 PE, 53/79 C codegen, 102 .p test files)*
 
 ## Legend
 
@@ -18,32 +18,33 @@
 
 | Test Group | Count | Pass | Fail | Notes |
 |------------|-------|------|------|-------|
-| Harness (`cargo test --test harness`) | 8 | 8 | 0 | Interpreter, PE, C codegen, golden, safety, capability, effect, region |
-| Unit tests (`cargo test --bin pledgec`) | 85 | 85 | 0 | elf64 (19), pir (9), peephole (20), codegen_x64 (10), opt (9), regalloc (13), tensor (7) |
-| Interpreter (`pledgec run`) | 64 | 52 | 0 | 12 skipped (unimplemented features) |
-| PE Emitter (`pledgec emit`) | 64 | 52 | 0 | 12 skipped; PE structure validated |
+| Harness (`cargo test --test harness`) | 8 | 7 | 1 | 1 failure: `golden_files_match` — interpreter prints Rust debug format for Vec/Map/Ptr |
+| Unit tests (`cargo test --bin pledgec`) | 136 | 136 | 0 | elf64, pir, peephole (26), codegen_x64, opt, regalloc, tensor, hotreload (8) |
+| Interpreter (`pledgec run`) | 79 | 78 | 1 | 1 expected failure: `test_trait_verify_fail` (compile-time failure test) |
+| PE Emitter (`pledgec emit`) | 79 | 78 | 1 | 1 expected failure: `test_trait_verify_fail` |
+| C Codegen (`pledgec ccompile`) | 79 | 53 | 26 | 26 mismatches: asm, comptime, const_generic, gat, json, tensor, etc. |
 | Safety tests | 9 | 9 | 0 | OOB, overflow, div-by-zero, unwrap None |
 | Capability tests | 4 | 4 | 0 | Grant, deny, propagation |
 | Effect tests | 7 | 7 | 0 | Annotations, inference, handlers, pure, under-declare |
 | Region tests | 3 | 3 | 0 | Basic, nested, escape detection |
-| **Total .p test files** | **87** | | | 64 root + 9 safety + 4 cap + 7 effect + 3 region |
+| **Total .p test files** | **102** | | | 79 root + 9 safety + 4 cap + 7 effect + 3 region |
 
 ---
 
 ## Interpreter (`pledgec run`)
 
-68 of 69 test files pass through the interpreter (1 pre-existing failure: test_trait_verify_fail).
+78 of 79 test files pass through the interpreter (1 expected failure: test_trait_verify_fail — a compile-time failure test that correctly fails).
 
 | Test File | Status | Output / Exit Code |
 |-----------|--------|--------|
-| `hello.p` | ✅ | `Hello, Pledge!\n50\ny is big` |
+| `hello.p` | ✅ | `Hello, P!\n50\ny is big` |
 | `print_int.p` | ✅ | `42` |
 | `print_str.p` | ✅ | `Hello!` |
 | `arithmetic.p` | ✅ | `30\n40` |
 | `control_flow.p` | ✅ | `1\n30\n10\n6` |
 | `functions.p` | ✅ | `7\n120` |
 | `struct.p` | ✅ | `10\n20` |
-| `strings.p` | ✅ | `Hello, World!\nPledge\nHello, Pledge!\nx = 42` |
+| `strings.p` | ✅ | `Hello, World!\nPledge\nHello, P!\nx = 42` |
 | `ret42.p` | ✅ | exit=42 |
 | `test_float.p` | ✅ | `3.14159\n2.71828\n5.85987\n-3.5\n0` |
 | `test_fstring_float.p` | ✅ | `x = 3.14` |
@@ -97,16 +98,16 @@
 
 Native Windows x64 PE executables. No external linker, assembler, or C compiler required.
 
-All 59 test files produce valid PE32+ executables (verified: MZ/PE signatures, x86_64 machine type, .text + .rdata sections, kernel32.dll imports for GetStdHandle/WriteFile/ExitProcess).
+78 of 79 test files produce valid PE32+ executables (1 expected failure: test_trait_verify_fail). Verified: MZ/PE signatures, x86_64 machine type, .text + .rdata sections, kernel32.dll imports for GetStdHandle/WriteFile/ExitProcess.
 
 **Note:** PE executables target Windows x64 and cannot be executed on Linux without Wine. Output values listed below match the interpreter and are expected to be correct based on PE structure validation and disassembly verification. The bug fix history below documents previously identified and fixed issues.
 
 | Test File | Status | Output | Notes |
 |-----------|--------|--------|-------|
-| `hello.p` | ✅ | `Hello, Pledge!\n50\ny is big` | Strings, int print, if/else |
+| `hello.p` | ✅ | `Hello, P!\n50\ny is big` | Strings, int print, if/else |
 | `print_int.p` | ✅ | `42` | Integer printing |
 | `print_str.p` | ✅ | `Hello!` | String printing |
-| `strings.p` | ✅ | `Hello, World!\nPledge\nHello, Pledge!\nx = 42` | Multiple strings, f-string |
+| `strings.p` | ✅ | `Hello, World!\nPledge\nHello, P!\nx = 42` | Multiple strings, f-string |
 | `arithmetic.p` | ✅ | `30\n40` | Arithmetic ops |
 | `control_flow.p` | ✅ | `1\n30\n10\n6` | If/else, while, for |
 | `functions.p` | ✅ | `7\n120` | Function calls, recursion |
@@ -146,11 +147,29 @@ All 59 test files produce valid PE32+ executables (verified: MZ/PE signatures, x
 
 ## C Codegen (`pledgec ccompile`)
 
-Portable C code generation, compiled with gcc/clang. **All 41 tests pass and produce output matching the interpreter exactly.**
+Portable C code generation, compiled with gcc/clang. **53 of 79 tests produce output matching the interpreter.** 26 tests fail due to missing C codegen support for: inline asm, bare-metal, bounds checks, comptime reflection/serialization, const generics, GATs, databases, f-strings with int/vec, HTTP, interrupts, JSON, matrix multiply, MMU, parallel ops, map printing, collections regression, shapes, SIMD, tensors, trait objects, type aliases, vec printing, strings.
 
 | Test File | Status | Notes |
 |-----------|--------|-------|
-| All 41 test files | ✅ | Output matches interpreter |
+| 53 test files | ✅ | Output matches interpreter |
+| 26 test files | ❌ | C codegen lacks support for the feature (see list above) |
+
+---
+
+## Native ELF64 Build (`pledgec build --target x86-64`)
+
+Native Linux x86-64 ELF64 executables. No external linker, assembler, or C compiler required. Uses the full PIR pipeline (L1→L2→L3 → codegen → 9 peephole passes → ELF64).
+
+| Test File | Status | Output / Exit Code | Notes |
+|-----------|--------|--------|-------|
+| `hello.p` | ✅ | `Hello, P!50y is big` (exit 8) | 3468 bytes, zero external tools |
+| `hello.p --opt` | ✅ | `Hello, P!50y is big` (exit 8) | 3316 bytes with L2 optimizer |
+
+**Note:** Exit code 8 is correct — `main()` has no explicit `ret`, so it returns the value of the last expression (the `if` block), which is `print("y is big")` returning 8 (bytes written). The interpreter does not propagate return values as exit codes.
+
+**Known issue:** The L2 optimizer (`--opt`) works for simple programs but exposes a pre-existing register allocator bug on complex programs (constants clobbered by intervening instructions). Not enabled by default.
+
+---
 
 ### C Codegen fixes applied (Aug 10, 2026):
 

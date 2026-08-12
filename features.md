@@ -1,6 +1,6 @@
-# Pledge Language — Feature Status
+# P Language — Feature Status
 
-*Last updated: Aug 11, 2026 (Phase 1+2 complete, 8/8 harness tests, 76/85 unit tests, 87 .p test files)*
+*Last updated: verified against actual source code and test runs (133/133 unit tests, 7/8 harness tests, 78/79 interpreter tests, 102 .p test files)*
 
 ## Legend
 
@@ -14,20 +14,24 @@
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Lexer (token.rs) | ✅ | All Pledge keywords (pf, pv, pc, ret, etc.) |
+| Lexer (token.rs) | ✅ | All P keywords (pf, pv, pc, ret, etc.) |
 | Parser (parser.rs) | ✅ | Produces AST from tokens |
 | Type Checker (typechecker.rs) | ✅ | Validates types, capabilities, effects, regions, traits |
 | IR Lowering (lower.rs) | ✅ | AST → typed SSA IR with effects/regions |
 | IR Interpreter (interp.rs) | ✅ | Runs IR directly via `pledgec run` |
 | PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables + flat binary (bare-metal mode) |
-| C Codegen (codegen_c.rs) | ✅ | Generates C code, 38+ tests match interpreter output |
+| ELF64 Emitter (elf64.rs) | ✅ | Generates native ELF64 executables on Linux (zero external tools) + relocatable objects |
+| C Codegen (codegen_c.rs) | ✅ | Generates C code, 53/79 tests match interpreter output |
 | PIR (pir.rs) | ✅ | PIR L1/L2/L3, `pledgec pir` command |
-| Optimizer (opt.rs) | ✅ | Const fold, CSE, DCE, inline, unroll, TCO, effect-based elision |
-| Peephole (peephole.rs) | ✅ | Redundant moves, zero idioms, branch threading, dead store |
-| Register Allocator (regalloc.rs) | ✅ | Linear scan allocator |
-| ELF64 Emitter (elf64.rs) | ⚠️ | Headers + symbol table work, instruction encoding WIP |
-| WASM Backend (wasm.rs) | ✅ | PIR → WASM binary, `pledgec codegen --target wasm` |
+| Optimizer (opt.rs) | ⚠️ | Const fold, CSE, DCE, inline, unroll, TCO, effect-based elision. Works for simple programs but exposes register allocator bug on complex ones. Not enabled by default. |
+| Peephole (peephole.rs) | ✅ | 9 passes, always on in `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection |
+| Register Allocator (regalloc.rs) | ⚠️ | Linear scan allocator. Has pre-existing bug: constants not loaded into registers before use can be clobbered by intervening instructions. Exposed by L2 optimizer's instruction reordering. |
+| Mach-O Emitter (macho.rs) | ✅ | Generates Mach-O object files for macOS |
+| COFF Emitter (coff.rs) | ✅ | Generates COFF object files for Windows |
+| WASM Backend (wasm.rs) | ✅ | PIR → WASM binary, `pledgec wasm` command |
+| GPU/SPIR-V Backend (gpu.rs) | ✅ | PIR → SPIR-V binary, `pledgec gpu` command |
 | Comptime (comptime.rs) | ✅ | Compile-time evaluation, reflection, f-string interpolation |
+| Multi-arch Codegen | ✅ | x86-64, ARM64, RISC-V assembly via `pledgec codegen --target` |
 
 ## CLI Commands
 
@@ -38,17 +42,23 @@
 | `pledgec ast <file>` | ✅ | Dumps parsed AST |
 | `pledgec ir <file>` | ✅ | Dumps lowered IR |
 | `pledgec run <file>` | ✅ | Interprets and runs program |
-| `pledgec emit <file> -o <exe>` | ✅ | Emits native PE executable |
+| `pledgec emit <file> -o <exe>` | ✅ | Emits native PE executable (Windows) |
+| `pledgec emit <file> --bare -o <bin>` | ✅ | Bare-metal flat binary (no stdlib, no PE headers) |
+| `pledgec build <file> -o <out> [--target] [--opt]` | ✅ | Native build: PIR → codegen → peephole → ELF64 executable (zero external tools on Linux) |
 | `pledgec ccompile <file> -o <exe>` | ✅ | C codegen → gcc/clang → executable |
-| `pledgec build <file> -o <exe>` | ✅ | MASM pipeline (requires ml64.exe) |
-| `pledgec test` | ✅ | Runs all tests across all backends |
+| `pledgec test` | ✅ | Runs all 102 tests across interpreter, PE emitter, and C codegen |
 | `pledgec repl` | ✅ | Interactive REPL |
 | `pledgec verify <file>` | ✅ | IR verification pass |
 | `pledgec sourcemap <file>` | ✅ | Source map output |
-| `pledgec pir <file> [--opt]` | ✅ | PIR output (L1/L2/L3) with optional optimization |
-| `pledgec opt <file>` | ✅ | Run PIR optimizer, print statistics |
-| `pledgec codegen <file> --target <arch>` | ✅ | x86-64 or ARM64 assembly output |
-| `pledgec emit <file> --bare -o <bin>` | ✅ | Bare-metal flat binary (no stdlib, no PE headers) |
+| `pledgec pir <file> [1\|2\|3\|all] [--opt]` | ✅ | PIR output (L1/L2/L3) with optional optimization |
+| `pledgec opt <file> [passes]` | ✅ | Run PIR optimizer, print statistics |
+| `pledgec codegen <file> --target <arch>` | ✅ | x86-64, ARM64, or RISC-V assembly output |
+| `pledgec codegen <file> --elf\|--macho\|--coff <o>` | ✅ | Emit ELF64, Mach-O, or COFF object files |
+| `pledgec wasm <file> -o <out.wasm>` | ✅ | WebAssembly backend |
+| `pledgec gpu <file>` | ✅ | SPIR-V GPU backend |
+| `pledgec parse-header <file.h>` | ✅ | Parse C header → generate P FFI bindings |
+| `pledgec watch <file>` | ✅ | Hot reload: native JIT (ELF64) + function-level change detection |
+| `pledgec link <files...>` | ✅ | Link multiple object files |
 
 ## Language Features — Interpreter (`pledgec run`)
 
@@ -228,12 +238,12 @@
 | HTTP server | ✅ | `stdlib/http.p` — socket + HTTP parsing |
 | Database framework | ✅ | `stdlib/db.p` — cap Database trait, in-memory KV |
 | Parallel operations | ✅ | `stdlib/parallel.p` — par_map, par_sum, par_dot |
-| Const generics | ⚠️ | `ArrayConst` type variant exists, monomorphization pending |
-| GATs | ❌ | Not yet parsed |
-| Hot reload | ❌ | Not yet implemented |
-| `#[test]` attribute | ❌ | Parsed but not executed |
+| Const generics | ✅ | `ArrayConst` type variant, monomorphization handles it — `test_const_generic.p` passes in interpreter |
+| GATs | ✅ | `test_gat.p` passes in interpreter, outputs correct results |
+| C FFI (`extern "C"`) | ✅ | Parsed, lowered, C codegen, interpreter stubs — `test_ffi.p`, `test_ffi_full.p`, `test_ffi_header.p` pass |
+| Hot reload | ✅ | `pledgec watch` compiles to native ELF64, runs, detects function-level changes via L2 IR hashing |
+| `#[test]` attribute | ❌ | Parsed but not executed by `pledgec test` |
 | `#[derive]` | ❌ | Not yet implemented |
-| C FFI | ❌ | Not yet implemented (Phase 3D) |
 
 ---
 
@@ -354,18 +364,23 @@ The PE emitter generates standalone Windows x64 PE executables with no external 
 | Parser | 100% | — | — |
 | Type Checker | 100% | — | — |
 | IR Lowering | 100% | — | — |
-| Interpreter | 100% (41/41) | — | async/spawn/comptime (not parsed) |
-| PE Emitter | 100% (41/41) | — | — |
-| C Codegen | 100% (41/41) | — | — |
-| MASM Backend | ~90% | — | Not actively tested (requires Windows + MASM) |
-| IR Optimizer | — | Constant folding exists | Not wired into pipeline |
-| Source Maps | ✅ | Line tracking in AST | `sourcemap` command works |
+| Interpreter | 78/79 | — | `test_trait_verify_fail` (expected failure) |
+| PE Emitter | 78/79 | — | `test_trait_verify_fail` (expected failure) |
+| ELF64 Emitter | ✅ | — | Working executables on Linux (zero external tools) |
+| C Codegen | 53/79 | — | 26 mismatches (asm, comptime, const_generic, gat, json, tensor, etc.) |
+| Multi-arch Codegen | ✅ | — | x86-64, ARM64, RISC-V assembly all work |
+| Peephole Optimizer | ✅ (9 passes) | — | Always on in `build` |
+| L2 Optimizer | — | ⚠️ | Works for simple programs, regalloc bug on complex ones |
+| Register Allocator | — | ⚠️ | Pre-existing bug with constant loading |
+| Source Maps | ✅ | — | `sourcemap` command works |
 | IR Verification | ✅ | — | `verify` command works |
+| WASM Backend | ✅ | — | `wasm` command works |
+| GPU/SPIR-V Backend | ✅ | — | `gpu` command works |
 
 ### Test Coverage
 
-- **41 test files** in `tests/` — all pass across interpreter, PE emitter, and C codegen
-- **4 cargo tests** in `tests/harness.rs` — interpreter, PE, C codegen, golden files
-- **Golden files** in `tests/golden/` — 41 expected outputs
-- **3 regression tests** — closures, fstrings, collections
+- **102 test files** in `tests/` (79 root + 9 safety + 4 capability + 7 effects + 3 regions)
+- **133 unit tests** in `cargo test --bin pledgec` — all pass
+- **8 cargo tests** in `tests/harness.rs` — 7 pass, 1 fails (golden_files_match: interpreter debug format)
+- **43 golden files** in `tests/golden/` — expected outputs for regression testing
 - **Benchmarks** in `benches/bench_main.rs`

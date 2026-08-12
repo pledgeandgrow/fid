@@ -38,6 +38,9 @@ pub fn optimize(asm: &str) -> String {
         lines = pass_branch_threading(lines);
         lines = pass_dead_store(lines);
         lines = pass_redundant_test(lines);
+        lines = pass_store_load_forward(lines);
+        lines = pass_lea_coalesce(lines);
+        lines = pass_cmp_setcc_jcc(lines);
         if lines.len() == before {
             // Length didn't change — check if content changed.
             // For simplicity, just break; most optimizations reduce length.
@@ -58,6 +61,9 @@ pub fn optimize_pass(asm: &str, pass: &str) -> String {
         "branch_threading" => pass_branch_threading(lines),
         "dead_store" => pass_dead_store(lines),
         "redundant_test" => pass_redundant_test(lines),
+        "store_load_forward" => pass_store_load_forward(lines),
+        "lea_coalesce" => pass_lea_coalesce(lines),
+        "cmp_setcc_jcc" => pass_cmp_setcc_jcc(lines),
         _ => return asm.to_string(),
     };
     result.join("\n") + "\n"
@@ -456,7 +462,237 @@ fn pass_redundant_test(lines: Vec<String>) -> Vec<String> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Register name helpers
+// Pass 7: Store-to-load forwarding
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Forward stores to loads: if `movq %src, off(%rbp)` is immediately followed
+/// by `movq off(%rbp), %dst` (same offset), replace the load with
+/// `movq %src, %dst`. This eliminates redundant memory traffic.
+///
+/// Pattern:
+///   movq %src, -N(%rbp)
+///   movq -N(%rbp), %dst
+/// →
+///   movq %src, -N(%rbp)
+///   movq %src, %dst
+///
+/// The store must stay (the memory value may be read later), but the load
+/// can be replaced with a register-to-register move.
+fn pass_store_load_forward(lines: Vec<String>) -> Vec<String> {
+    let parsed = parse_lines(&lines);
+    let mut result: Vec<AsmLine> = Vec::new();
+
+    let mut i = 0;
+    while i < parsed.len() {
+        // Look for a two-instruction window: store then load from same address.
+        if i + 1 < parsed.len() {
+            if let (Some(mn1), Some(ops1)) = (&parsed[i].mnemonic, &parsed[i].operands) {
+                if let (Some(mn2), Some(ops2)) = (&parsed[i + 1].mnemonic, &parsed[i + 1].operands) {
+                    // Store: movq %src, -N(%rbp)  or  movq %src, (%reg)
+                    // Load:  movq -N(%rbp), %dst  or  movq (%reg), %dst
+                    if (mn1 == "movq" || mn1 == "movl") && (mn2 == "movq" || mn2 == "movl") {
+                        let ops1_list: Vec<&str> = ops1.split(',').map(|o| o.trim()).collect();
+                        let ops2_list: Vec<&str> = ops2.split(',').map(|o| o.trim()).collect();
+                        if ops1_list.len() == 2 && ops2_list.len() == 2 {
+                            let src = ops1_list[0];
+                            let mem_dst = ops1_list[1];
+                            let mem_src = ops2_list[0];
+                            let dst = ops2_list[1];
+                            // The store's destination and load's source must both be
+                            // memory operands (contain '(') — not plain registers.
+                            // The store's source must be a register (start with '%').
+                            // This prevents matching reg-to-reg moves as store-load.
+                            let is_mem = |s: &str| s.contains('(');
+                            let is_reg = |s: &str| s.starts_with('%');
+                            if is_mem(mem_dst) && is_mem(mem_src)
+                                && is_reg(src) && is_reg(dst)
+                                && mem_dst == mem_src && src != dst {
+                                // Replace the load with a register-to-register move.
+                                result.push(parsed[i].clone());
+                                result.push(AsmLine {
+                                    raw: format!("    {} {}, {}", mn2, src, dst),
+                                    mnemonic: Some(mn2.clone()),
+                                    operands: Some(format!("{}, {}", src, dst)),
+                                    is_label: false,
+                                    is_directive: false,
+                                    is_other: false,
+                                });
+                                i += 2;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        result.push(parsed[i].clone());
+        i += 1;
+    }
+
+    emit_lines(&result)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 8: LEA coalescing
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Coalesce redundant LEA instructions: if `leaq -N(%rbp), %reg` is followed
+/// by another `leaq -N(%rbp), %reg` (same offset), the second is redundant
+/// (the register already holds the address).
+///
+/// Pattern:
+///   leaq -N(%rbp), %rax
+///   leaq -N(%rbp), %rax
+/// →
+///   leaq -N(%rbp), %rax
+///
+/// Also handles the case where the same address is computed into different
+/// registers — we can't remove those, but we can track them.
+fn pass_lea_coalesce(lines: Vec<String>) -> Vec<String> {
+    let parsed = parse_lines(&lines);
+    let mut result: Vec<AsmLine> = Vec::new();
+
+    // Track the last LEA: (address, destination_register)
+    let mut last_lea: Option<(String, String)> = None;
+
+    for line in &parsed {
+        if let (Some(mn), Some(ops)) = (&line.mnemonic, &line.operands) {
+            if mn == "leaq" {
+                let operands: Vec<&str> = ops.split(',').map(|o| o.trim()).collect();
+                if operands.len() == 2 {
+                    let addr = operands[0].to_string();
+                    let dst = operands[1].to_string();
+                    if let Some((prev_addr, prev_dst)) = &last_lea {
+                        // Same address, same destination → redundant.
+                        if &addr == prev_addr && &dst == prev_dst {
+                            continue;
+                        }
+                    }
+                    last_lea = Some((addr, dst));
+                } else {
+                    last_lea = None;
+                }
+            } else if line.mnemonic.is_some() {
+                // Call instructions clobber all caller-saved registers.
+                if mn == "call" || mn == "callq" {
+                    last_lea = None;
+                } else if let Some(ops) = &line.operands {
+                    // Any other instruction might clobber a register, so clear
+                    // the tracking if the destination matches the LEA's dst.
+                    let operands: Vec<&str> = ops.split(',').map(|o| o.trim()).collect();
+                    if let Some(last_operand) = operands.last() {
+                        if let Some((_, lea_dst)) = &last_lea {
+                            if last_operand == lea_dst {
+                                last_lea = None;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if !line.is_other {
+            // Labels/directives break the chain.
+            last_lea = None;
+        }
+        result.push(line.clone());
+    }
+
+    emit_lines(&result)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 9: Instruction selection — cmp+sete+movzbq+test+jne → test+je
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Pattern-match the canonical comparison lowering and replace it with
+/// a simpler instruction sequence:
+///
+///   cmpq %a, %b
+///   sete %al        (or setne, setl, setg, setle, setge)
+///   movzbq %al, %rax
+///   testq %rax, %rax
+///   jne .Ltrue
+/// →
+///   cmpq %a, %b
+///   je .Ltrue        (or jne, jl, jg, jle, jge)
+///
+/// This eliminates the setcc+movzbq+test sequence and uses the flags
+/// directly from cmpq.
+fn pass_cmp_setcc_jcc(lines: Vec<String>) -> Vec<String> {
+    let parsed = parse_lines(&lines);
+    let mut result: Vec<AsmLine> = Vec::new();
+
+    let mut i = 0;
+    while i < parsed.len() {
+        // Look for the 5-instruction pattern: cmp + setcc + movzbq + test + jcc
+        if i + 4 < parsed.len() {
+            let p0 = &parsed[i];
+            let p1 = &parsed[i + 1];
+            let p2 = &parsed[i + 2];
+            let p3 = &parsed[i + 3];
+            let p4 = &parsed[i + 4];
+
+            // Check: cmpq %a, %b
+            if let (Some(mn0), Some(ops0)) = (&p0.mnemonic, &p0.operands) {
+                if mn0 == "cmpq" || mn0 == "cmpl" {
+                    // Check: setcc %al
+                    if let (Some(mn1), Some(ops1)) = (&p1.mnemonic, &p1.operands) {
+                        let setcc_map = |mn: &str| -> Option<&str> {
+                            match mn {
+                                "sete" => Some("je"),
+                                "setne" => Some("jne"),
+                                "setl" => Some("jl"),
+                                "setg" => Some("jg"),
+                                "setle" => Some("jle"),
+                                "setge" => Some("jge"),
+                                "setb" => Some("jb"),
+                                "seta" => Some("ja"),
+                                "setbe" => Some("jbe"),
+                                "setae" => Some("jae"),
+                                _ => None,
+                            }
+                        };
+                        if let Some(jcc) = setcc_map(mn1) {
+                            if ops1 == "%al" {
+                                // Check: movzbq %al, %rax
+                                if let (Some(mn2), Some(ops2)) = (&p2.mnemonic, &p2.operands) {
+                                    if mn2 == "movzbq" && ops2 == "%al, %rax" {
+                                        // Check: testq %rax, %rax
+                                        if let (Some(mn3), Some(ops3)) = (&p3.mnemonic, &p3.operands) {
+                                            if mn3 == "testq" && ops3 == "%rax, %rax" {
+                                                // Check: jne .Ltarget
+                                                if let (Some(mn4), Some(ops4)) = (&p4.mnemonic, &p4.operands) {
+                                                    if mn4 == "jne" {
+                                                        // All five instructions match!
+                                                        // Replace with: cmpq (kept) + jcc .Ltarget
+                                                        result.push(p0.clone());
+                                                        result.push(AsmLine {
+                                                            raw: format!("    {} {}", jcc, ops4),
+                                                            mnemonic: Some(jcc.to_string()),
+                                                            operands: Some(ops4.clone()),
+                                                            is_label: false,
+                                                            is_directive: false,
+                                                            is_other: false,
+                                                        });
+                                                        i += 5;
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        result.push(parsed[i].clone());
+        i += 1;
+    }
+
+    emit_lines(&result)
+}
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Convert a 64-bit register name to its 32-bit form.
@@ -677,5 +913,60 @@ main:
         assert!(opt_lines < orig_lines, "optimized should have fewer lines: {} vs {}", opt_lines, orig_lines);
         // Branch threading: jmp .L1 should become jmp .L3.
         assert!(opt.contains("jne .L3") || opt.contains("jne .L1"), "branch threading should resolve");
+    }
+
+    #[test]
+    fn store_load_forward_basic() {
+        let asm = "    movq %rax, -8(%rbp)\n    movq -8(%rbp), %rcx\n    ret\n";
+        let opt = optimize_pass(asm, "store_load_forward");
+        // The load should be replaced with a register-to-register move.
+        assert!(opt.contains("movq %rax, %rcx"), "load should be forwarded to movq %rax, %rcx");
+        // The store should still be present.
+        assert!(opt.contains("movq %rax, -8(%rbp)"), "store should be preserved");
+    }
+
+    #[test]
+    fn store_load_forward_different_addr() {
+        let asm = "    movq %rax, -8(%rbp)\n    movq -16(%rbp), %rcx\n    ret\n";
+        let opt = optimize_pass(asm, "store_load_forward");
+        // Different addresses — should not forward.
+        assert!(opt.contains("movq -16(%rbp), %rcx"), "load from different addr should not be forwarded");
+    }
+
+    #[test]
+    fn lea_coalesce_redundant() {
+        let asm = "    leaq -8(%rbp), %rax\n    leaq -8(%rbp), %rax\n    ret\n";
+        let opt = optimize_pass(asm, "lea_coalesce");
+        let count = opt.matches("leaq").count();
+        assert_eq!(count, 1, "redundant leaq should be coalesced");
+    }
+
+    #[test]
+    fn lea_coalesce_different_reg() {
+        let asm = "    leaq -8(%rbp), %rax\n    leaq -8(%rbp), %rcx\n    ret\n";
+        let opt = optimize_pass(asm, "lea_coalesce");
+        let count = opt.matches("leaq").count();
+        assert_eq!(count, 2, "different destination registers should not be coalesced");
+    }
+
+    #[test]
+    fn cmp_setcc_jcc_pattern() {
+        let asm = "    cmpq %rsi, %rax\n    sete %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .Ltrue\n    ret\n";
+        let opt = optimize_pass(asm, "cmp_setcc_jcc");
+        // The setcc+movzbq+test sequence should be eliminated.
+        assert!(!opt.contains("sete"), "sete should be eliminated");
+        assert!(!opt.contains("movzbq"), "movzbq should be eliminated");
+        assert!(!opt.contains("testq %rax, %rax"), "testq should be eliminated");
+        // The cmpq should be kept and jne should become je.
+        assert!(opt.contains("cmpq %rsi, %rax"), "cmpq should be kept");
+        assert!(opt.contains("je .Ltrue"), "jne should become je (sete → je)");
+    }
+
+    #[test]
+    fn cmp_setne_jcc_pattern() {
+        let asm = "    cmpq %rsi, %rax\n    setne %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .Lfalse\n    ret\n";
+        let opt = optimize_pass(asm, "cmp_setcc_jcc");
+        assert!(opt.contains("jne .Lfalse"), "setne+jne should become jne");
+        assert!(!opt.contains("setne"), "setne should be eliminated");
     }
 }

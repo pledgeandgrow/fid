@@ -214,6 +214,17 @@ impl ElfEmitter {
     }
 
     fn add_symbol(&mut self, name: &str, value: u64, size: u64, binding: u8, sym_type: u8, section: u16, is_defined: bool) {
+        // If this symbol already exists (e.g., added as undefined by get_or_add_local_label),
+        // update it in place rather than creating a duplicate.
+        if let Some(&idx) = self.symbol_index.get(name) {
+            self.symbols[idx].value = value;
+            self.symbols[idx].size = size;
+            self.symbols[idx].binding = binding;
+            self.symbols[idx].sym_type = sym_type;
+            self.symbols[idx].section = section;
+            self.symbols[idx].is_defined = is_defined;
+            return;
+        }
         let idx = self.symbols.len();
         self.symbols.push(Symbol {
             name: name.to_string(),
@@ -260,13 +271,7 @@ impl ElfEmitter {
                 continue;
             }
 
-            // Handle directives.
-            if trimmed.starts_with('.') {
-                self.handle_directive(trimmed)?;
-                continue;
-            }
-
-            // Handle labels.
+            // Handle labels first (labels can start with '.' like .Lmain_bb1:)
             if trimmed.ends_with(':') {
                 let label = trimmed.trim_end_matches(':').to_string();
 
@@ -291,9 +296,17 @@ impl ElfEmitter {
                 continue;
             }
 
+            // Handle directives (lines starting with '.' that are not labels).
+            if trimmed.starts_with('.') {
+                self.handle_directive(trimmed)?;
+                continue;
+            }
+
             // Encode the instruction.
             let text_len_before = self.text.len();
-            self.encode_instruction(trimmed)?;
+            if let Err(e) = self.encode_instruction(trimmed) {
+                return Err(format!("{} — in instruction: '{}'", e, trimmed));
+            }
 
             // If we're in a function, we could track size, but we handle that
             // at the next label or EOF.
@@ -377,6 +390,7 @@ impl ElfEmitter {
             "cqto" => { self.text.extend_from_slice(&[0x48, 0x99]); }
             "cdq" => { self.text.push(0x99); }
             "ud2" => { self.text.extend_from_slice(&[0x0f, 0x0b]); }
+            "syscall" => { self.text.extend_from_slice(&[0x0f, 0x05]); }
 
             // ─── pushq / popq ───
             "pushq" => {
@@ -399,6 +413,11 @@ impl ElfEmitter {
             "movl" => {
                 if operands.len() == 2 {
                     self.encode_mov(operands[0], operands[1], 4)?;
+                }
+            }
+            "movb" => {
+                if operands.len() == 2 {
+                    self.encode_mov(operands[0], operands[1], 1)?;
                 }
             }
 
@@ -431,6 +450,34 @@ impl ElfEmitter {
                     let rex = 0x48 | ((r >> 3) << 0);
                     let modrm = 0xd8 | (r & 7);
                     self.text.extend_from_slice(&[rex, 0xf7, modrm]);
+                }
+            }
+            "incq" => {
+                if operands.len() == 1 {
+                    if let Some(r) = try_parse_reg(operands[0]) {
+                        let rex = 0x48 | ((r >> 3) << 0);
+                        let modrm = 0xc0 | (r & 7);
+                        self.text.extend_from_slice(&[rex, 0xff, modrm]);
+                    } else if let Some((off, base)) = try_parse_mem(operands[0]) {
+                        let rex = 0x48 | ((base >> 3) << 0);
+                        self.text.push(rex);
+                        self.text.push(0xff);
+                        self.encode_modrm_mem(0, off, base);
+                    }
+                }
+            }
+            "decq" => {
+                if operands.len() == 1 {
+                    if let Some(r) = try_parse_reg(operands[0]) {
+                        let rex = 0x48 | ((r >> 3) << 0);
+                        let modrm = 0xc8 | (r & 7);
+                        self.text.extend_from_slice(&[rex, 0xff, modrm]);
+                    } else if let Some((off, base)) = try_parse_mem(operands[0]) {
+                        let rex = 0x48 | ((base >> 3) << 0);
+                        self.text.push(rex);
+                        self.text.push(0xff);
+                        self.encode_modrm_mem(1, off, base);
+                    }
                 }
             }
             "notq" => {
@@ -494,11 +541,22 @@ impl ElfEmitter {
             "movzwq" => self.encode_movzx(0xb7, operands, 8)?,
             "movslq" => {
                 if operands.len() == 2 {
-                    let src = parse_reg(operands[0])?;
-                    let dst = parse_reg(operands[1])?;
-                    let rex = 0x48 | ((src >> 3) << 2) | ((dst >> 3) << 0);
-                    let modrm = 0xc0 | ((src & 7) << 3) | (dst & 7);
-                    self.text.extend_from_slice(&[rex, 0x63, modrm]);
+                    // movslq %reg, %reg → REX.W 0x63 /r
+                    if let (Some(s), Some(d)) = (try_parse_reg(operands[0]), try_parse_reg(operands[1])) {
+                        let rex = 0x48 | ((s >> 3) << 2) | ((d >> 3) << 0);
+                        let modrm = 0xc0 | ((s & 7) << 3) | (d & 7);
+                        self.text.extend_from_slice(&[rex, 0x63, modrm]);
+                    } else if let (Some((off, base)), Some(d)) = (try_parse_mem(operands[0]), try_parse_reg(operands[1])) {
+                        // movslq off(%base), %reg → REX.W 0x63 /r with memory operand
+                        let rex = 0x48 | ((d >> 3) << 2) | ((base >> 3) << 0);
+                        self.text.push(rex);
+                        self.text.push(0x63);
+                        self.encode_modrm_mem(d, off, base);
+                    } else if let (Some(s), Some(d)) = (try_parse_reg(operands[0]), try_parse_reg(operands[1])) {
+                        let rex = 0x48 | ((s >> 3) << 2) | ((d >> 3) << 0);
+                        let modrm = 0xc0 | ((s & 7) << 3) | (d & 7);
+                        self.text.extend_from_slice(&[rex, 0x63, modrm]);
+                    }
                 }
             }
 
@@ -695,11 +753,15 @@ impl ElfEmitter {
         if let (Some(s), Some(d)) = (try_parse_reg(src), try_parse_reg(dst)) {
             // Only emit REX prefix if needed (W bit for 64-bit, or B/R for extended regs).
             let need_rex = effective_size == 8 || s >= 8 || d >= 8;
+            let text_len_before = self.text.len();
             if need_rex {
                 let rex = rex_w(effective_size) | ((s >> 3) << 2) | ((d >> 3) << 0);
                 self.text.push(rex);
             }
             self.text.push(opcode_base | 0x01);
+            if src == "%edx" && dst == "%edx" {
+                eprintln!("DBG ALU: s={} d={} need_rex={} bytes={:02x?}", s, d, need_rex, &self.text[text_len_before..]);
+            }
             let modrm = 0xc0 | ((s & 7) << 3) | (d & 7);
             self.text.push(modrm);
             return Ok(());
@@ -856,9 +918,14 @@ impl ElfEmitter {
         if operands.len() != 2 {
             return Ok(());
         }
-        // movzbq (%reg), %dst → REX.W 0F opcode /r
-        if let (Some(s), Some(d)) = (try_parse_reg(operands[0]), try_parse_reg(operands[1])) {
-            let rex = 0x48 | ((s >> 3) << 2) | ((d >> 3) << 0);
+        // movzbq %al, %rdx → REX.W 0F B6 /r
+        // Source can be an 8-bit register (%al, %cl, ...) or a 64-bit register.
+        // Destination is always a 64-bit register.
+        let s_opt = try_parse_reg8(operands[0]).or_else(|| try_parse_reg(operands[0]));
+        let d_opt = try_parse_reg(operands[1]);
+        if let (Some(s), Some(d)) = (s_opt, d_opt) {
+            // REX.W=1, REX.R extends destination (reg field), REX.B extends source (rm field).
+            let rex = 0x48 | (((d >> 3) & 1) << 2) | (((s >> 3) & 1) << 0);
             self.text.push(rex);
             self.text.push(0x0f);
             self.text.push(opcode);
@@ -1140,25 +1207,34 @@ impl ElfEmitter {
             sym_idx += 1;
         }
 
+        // Build a lookup map for rodata symbols (name → offset in rodata)
+        let rodata_map: HashMap<String, u64> = self.rodata_symbols
+            .iter()
+            .map(|(name, off)| (name.clone(), *off as u64))
+            .collect();
+
         // Emit local symbols.
         for sym in &local_symbols {
             let name_off = self.add_strtab_static(&sym.name);
-            let section = if sym.is_defined {
-                // Determine which section this symbol belongs to.
+            // Check if this is a rodata symbol (string constant label)
+            let (section, value, is_def) = if let Some(&rod_off) = rodata_map.get(&sym.name) {
+                (rodata_idx, rod_off, true)
+            } else if sym.is_defined {
                 if sym.name.starts_with(".str") || sym.name.starts_with(".flt") {
-                    rodata_idx
+                    (rodata_idx, sym.value, true)
                 } else {
-                    text_idx
+                    (text_idx, sym.value, true)
                 }
             } else {
-                SHN_UNDEF
+                (SHN_UNDEF, sym.value, false)
             };
+            let _ = is_def;
             symtab.extend_from_slice(&Elf64_Sym {
                 st_name: name_off,
                 st_info: (sym.binding << 4) | sym.sym_type,
                 st_other: 0,
                 st_shndx: section,
-                st_value: sym.value,
+                st_value: value,
                 st_size: sym.size,
             }.to_bytes());
         }
@@ -1166,13 +1242,20 @@ impl ElfEmitter {
         // Emit global symbols.
         for sym in &global_symbols {
             let name_off = self.add_strtab_static(&sym.name);
-            let section = if sym.is_defined { text_idx } else { SHN_UNDEF };
+            // Check if this is a rodata symbol
+            let (section, value) = if let Some(&rod_off) = rodata_map.get(&sym.name) {
+                (rodata_idx, rod_off)
+            } else if sym.is_defined {
+                (text_idx, sym.value)
+            } else {
+                (SHN_UNDEF, sym.value)
+            };
             symtab.extend_from_slice(&Elf64_Sym {
                 st_name: name_off,
                 st_info: (sym.binding << 4) | sym.sym_type,
                 st_other: 0,
                 st_shndx: section,
-                st_value: sym.value,
+                st_value: value,
                 st_size: sym.size,
             }.to_bytes());
         }

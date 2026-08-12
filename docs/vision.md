@@ -1,17 +1,17 @@
-# Pledge Language — Vision
+# P Language — Vision
 
 > Build the last programming language the world needs.
 
 ## Mission
 
-Pledge is a systems programming language built from first principles — every layer custom-made, from parser to machine code. No LLVM dependency. No borrowed infrastructure. A language designed to outperform C, Rust, and Zig in security, performance, developer velocity, and expressiveness.
+P is a systems programming language built from first principles — every layer custom-made, from parser to machine code. No LLVM dependency. No borrowed infrastructure. A language designed to outperform C, Rust, and Zig in security, performance, developer velocity, and expressiveness.
 
 ## The Eight Pillars
 
 ### 1. Originality — Own Our Uniqueness
 - No existing language combines region-based memory safety, effect handlers, capability security, and comptime metaprogramming
 - Every layer of the compiler stack is built by us: lexer, parser, typechecker, IR, optimizer, codegen, linker
-- Pledge is not "Rust with different syntax" or "Zig with safety" — it is a new architecture
+- P is not "Rust with different syntax" or "Zig with safety" — it is a new architecture
 
 ### 2. Security — Prevent CVEs by Construction
 - **Capability-based security**: no ambient authority, no implicit filesystem/network access
@@ -31,7 +31,7 @@ Pledge is a systems programming language built from first principles — every l
 ### 4. Memory Safety — Like Rust, Without the Pain
 - **Region inference**: compiler tracks memory regions, no lifetime annotations needed
 - **No borrow checker fights**: regions are more flexible than ownership+borrowing
-- **No "mutation xor sharing" rule**: aliasing patterns that Rust rejects are valid in Pledge
+- **No "mutation xor sharing" rule**: aliasing patterns that Rust rejects are valid in P
 - **Explicit allocators**: caller chooses allocation strategy (like Zig), but with compile-time safety (like Rust)
 - **Zero runtime cost**: all safety checks are compile-time
 
@@ -45,7 +45,7 @@ Pledge is a systems programming language built from first principles — every l
 
 ### 6. Adoption — Make Switching Easy
 - **C interop**: call C libraries directly, gradual migration path
-- **Familiar syntax**: Rust-like syntax with Pledge keywords (pv/pf/pc)
+- **Familiar syntax**: Rust-like syntax with P keywords (pv/pf/pc)
 - **Hot reload**: instant feedback loop attracts game/GUI/web developers
 - **Fast compilation**: sub-second builds for small projects
 - **AI tooling**: LLM-friendly syntax, semantic IR enables AI-assisted refactoring
@@ -56,13 +56,13 @@ Pledge is a systems programming language built from first principles — every l
 - **Custom lexer**: hand-written, not generated
 - **Custom parser**: recursive descent, not parser generators
 - **Custom typechecker**: region inference + effect system + capability checking
-- **Custom IR (PIR)**: Pledge Intermediate Representation — typed, semantic, multi-level
+- **Custom IR (PIR)**: P Intermediate Representation — typed, semantic, multi-level
 - **Custom optimizer**: semantic-aware, leverages region/effect/capability info
 - **Custom codegen**: direct to machine code (x86-64, ARM64, RISC-V)
 - **Custom linker**: integrated, not a separate process
 - **Custom stdlib**: no libc dependency for core operations
 - **Custom allocator**: region-aware, built into the language runtime
-- Minimal external dependency: only the Rust compiler to build Pledge (bootstrapping later)
+- Minimal external dependency: only the Rust compiler to build P (bootstrapping later)
 
 ### 8. Innovation — Optimized for AI, Robotics, Hardware, IoT
 - **AI/ML**: comptime specialization for tensor operations, SIMD intrinsics as first-class
@@ -74,7 +74,7 @@ Pledge is a systems programming language built from first principles — every l
 - **Cross-compilation**: target any architecture from any host
 - **No runtime**: bare metal, no OS needed
 
-## What Pledge Is NOT
+## What P Is NOT
 
 - **Not a research language**: designed for production, not papers
 - **Not a Rust replacement**: different architecture, different tradeoffs

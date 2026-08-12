@@ -1,6 +1,6 @@
-# Pledge Innovation — AI, Robotics, Hardware, IoT
+# P Innovation — AI, Robotics, Hardware, IoT
 
-> Pledge is designed for the next 50 years of computing, not the last 50.
+> P is designed for the next 50 years of computing, not the last 50.
 
 ## Why Existing Languages Fail at the Future
 
@@ -24,7 +24,7 @@ No language can:
 4. Write a device driver with memory safety
 5. Hot-reload code on a running robot
 
-**Pledge targets all of these.**
+**P targets all of these.**
 
 ---
 
@@ -61,7 +61,7 @@ pf comptime matmul[M: comptime, N: comptime, K: comptime](
 
 ### GPU Targeting (Future)
 ```
-// Same Pledge code, different target
+// Same P code, different target
 #[target(gpu)]
 pf train_step(batch: Tensor[f32; 32, 784]) -> Tensor[f32; 32, 10] {
     // PIR lowers to SPIR-V or PTX for GPU
@@ -161,7 +161,7 @@ pf firmware_main() {
 
 ### Tiny Binaries
 ```
-// Pledge produces smaller binaries than C because:
+// P produces smaller binaries than C because:
 // 1. Dead code elimination at IR level (not link time)
 // 2. No libc dependency
 // 3. No runtime
@@ -218,7 +218,7 @@ pf map_page(virt: usize, phys: usize, flags: PageFlags) {
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                  Pledge Language                     │
+│                  P Language                     │
 │                                                     │
 │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌──────────┐  │
 │  │ AI/ML   │ │ Robotics│ │  IoT    │ │ Servers  │  │
@@ -229,7 +229,7 @@ pf map_page(virt: usize, phys: usize, flags: PageFlags) {
 │  └─────────┘ └─────────┘ └─────────┘ └─────────┘  │
 │                                                     │
 │  ┌─────────────────────────────────────────────┐    │
-│  │              PIR (Pledge IR)                 │    │
+│  │              PIR (P IR)                 │    │
 │  │  Regions + Effects + Capabilities + comptime │    │
 │  └─────────────────────────────────────────────┘    │
 │                                                     │

@@ -583,6 +583,31 @@ impl X64CodeGen {
         let dst_loc = self.dst_loc(dst);
         let size = type_size(ty);
 
+        let load_op = match size {
+            1 => "movzbq",
+            2 => "movzwq",
+            4 => "movslq",
+            _ => "movq",
+        };
+
+        // If the pointer is a stack slot, we can load directly from the
+        // memory operand without needing a scratch register. This avoids
+        // clobbering live values in %rax.
+        if let Operand::Slot(slot) = ptr {
+            let mem = format!("-{}(%rbp)", slot.0);
+            match dst_loc {
+                Some(Location::Reg(dr)) => {
+                    self.wl(&format!("    {} {}, %{}", load_op, mem, dr.name()));
+                }
+                Some(Location::Spill(off)) => {
+                    self.wl(&format!("    {} {}, %rax", load_op, mem));
+                    self.wl(&format!("    movq %rax, -{}(%rbp)", off));
+                }
+                None => {}
+            }
+            return;
+        }
+
         // Load the pointer into a scratch register.
         let ptr_reg = match self.operand_reg(ptr) {
             Some(r) => r,
@@ -591,13 +616,6 @@ impl X64CodeGen {
                 self.gen_operand_to_reg(ptr, tmp);
                 tmp
             }
-        };
-
-        let load_op = match size {
-            1 => "movzbq",
-            2 => "movzwq",
-            4 => "movslq",
-            _ => "movq",
         };
 
         match dst_loc {
@@ -626,6 +644,21 @@ impl X64CodeGen {
             4 => "movl",
             _ => "movq",
         };
+
+        // If the pointer is a stack slot, we can store directly to the
+        // memory operand without needing a scratch register for the address.
+        if let Operand::Slot(slot) = ptr {
+            let mem = format!("-{}(%rbp)", slot.0);
+            // Load value into RAX.
+            self.gen_operand_to_reg(val, PhysReg::Rax);
+            if size < 8 {
+                let sub_reg = sub_reg_name(PhysReg::Rax, size);
+                self.wl(&format!("    {} %{}, {}", store_op, sub_reg, mem));
+            } else {
+                self.wl(&format!("    {} %rax, {}", store_op, mem));
+            }
+            return;
+        }
 
         // Load value into RAX.
         self.gen_operand_to_reg(val, PhysReg::Rax);

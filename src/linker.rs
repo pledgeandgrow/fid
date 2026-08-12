@@ -30,6 +30,41 @@ pub fn link(objects: &[Vec<u8>], entry: &str) -> Result<Vec<u8>, String> {
     linker.link(entry)
 }
 
+/// Link ELF64 object files with a pre-compiled runtime (raw bytes + symbols).
+/// The runtime is appended after the user objects and its symbols are
+/// registered with defined=true.
+pub fn link_with_runtime(
+    objects: &[Vec<u8>],
+    entry: &str,
+    runtime_text: &[u8],
+    runtime_symbols: &[(&str, u64, usize)],
+    runtime_rodata: &[u8],
+    runtime_rodata_syms: &[(&str, u64)],
+    runtime_relocs: &[(u64, String, u8)],
+) -> Result<Vec<u8>, String> {
+    let mut linker = Linker::new();
+    for obj in objects {
+        linker.add_object(obj)?;
+    }
+    // Add the runtime as raw text + symbols
+    let rt_base = linker.text_bytes.len() as u64;
+    linker.text_bytes.extend_from_slice(runtime_text);
+    for (name, offset, _size) in runtime_symbols {
+        linker.symbols.insert(name.to_string(), (rt_base + offset, true));
+    }
+    // Add rodata
+    let rod_base = linker.rodata.len() as u64;
+    linker.rodata.extend_from_slice(runtime_rodata);
+    for (name, offset) in runtime_rodata_syms {
+        linker.rodata_symbols.insert(name.to_string(), rod_base + offset);
+    }
+    // Add relocations (adjusted by rt_base)
+    for (offset, sym_name, r_type) in runtime_relocs {
+        linker.relocations.push((rt_base + offset, sym_name.clone(), *r_type));
+    }
+    linker.link(entry)
+}
+
 /// Incremental link cache: tracks which object files have changed
 /// and only re-links when necessary.
 pub struct IncrementalLinker {
@@ -103,14 +138,48 @@ pub fn dead_code_elimination(
         .collect();
 
     for (offset, target) in relocations {
-        // Find which symbol contains this relocation offset
+        // Find which symbol contains this relocation offset.
+        // If size is 0 (unknown), treat it as containing any relocation >= start.
         for (name, (start, size)) in &symbol_ranges {
+            if *size == 0 {
+                // Unknown size: attribute to the nearest symbol at or before this offset
+                // We'll handle this after the loop with a sorted approach
+                continue;
+            }
             if *offset >= *start && *offset < *start + *size as u64 {
                 call_graph
                     .entry(name.clone())
                     .or_default()
                     .push(target.clone());
                 break;
+            }
+        }
+    }
+
+    // Handle size-0 symbols: sort by offset and attribute relocations to the
+    // nearest preceding symbol.
+    let mut sorted_syms: Vec<(String, u64)> = symbol_ranges
+        .iter()
+        .filter(|(_, (_, size))| *size == 0)
+        .map(|(name, (start, _))| (name.clone(), *start))
+        .collect();
+    sorted_syms.sort_by_key(|(_, off)| *off);
+
+    for (offset, target) in relocations {
+        // Find the nearest preceding symbol with size 0
+        let mut found: Option<&str> = None;
+        for (name, start) in &sorted_syms {
+            if *start <= *offset {
+                found = Some(name);
+            } else {
+                break;
+            }
+        }
+        if let Some(name) = found {
+            // Only add if not already added by the size>0 path
+            let already = call_graph.get(name).map(|v| v.contains(target)).unwrap_or(false);
+            if !already {
+                call_graph.entry(name.to_string()).or_default().push(target.clone());
             }
         }
     }
@@ -225,13 +294,16 @@ impl Linker {
             }
         }
 
-        // Find .text, .symtab, .strtab, .rela.text sections
+        // Find .text, .rodata, .symtab, .strtab, .rela.text sections
         let mut text_offset = 0;
         let mut text_size = 0;
         let mut text_data: Vec<u8> = Vec::new();
+        let mut rodata_data: Vec<u8> = Vec::new();
+        let mut rodata_syms: Vec<(String, u64)> = Vec::new();
         let mut symtab_idx = None;
         let mut strtab_idx = None;
         let mut rela_text_idx = None;
+        let mut rela_rodata_idx = None;
 
         for (i, sec) in sections.iter().enumerate() {
             match sec.name.as_str() {
@@ -242,9 +314,15 @@ impl Linker {
                         text_data = obj[sec.offset..sec.offset + sec.size].to_vec();
                     }
                 }
+                ".rodata" => {
+                    if sec.offset + sec.size <= obj.len() {
+                        rodata_data = obj[sec.offset..sec.offset + sec.size].to_vec();
+                    }
+                }
                 ".symtab" => symtab_idx = Some(i),
                 ".strtab" => strtab_idx = Some(sec.link),
                 ".rela.text" => rela_text_idx = Some(i),
+                ".rela.rodata" => rela_rodata_idx = Some(i),
                 _ => {}
             }
         }
@@ -257,6 +335,15 @@ impl Linker {
         // Append text section to our combined text
         let text_base = self.text_bytes.len() as u64;
         self.text_bytes.extend(&text_data);
+
+        // Append rodata section to our combined rodata
+        let rodata_base = self.rodata.len() as u64;
+        self.rodata.extend(&rodata_data);
+
+        // Find the section index for .rodata
+        let rodata_sec_idx: Option<u16> = sections.iter().enumerate()
+            .find(|(_, s)| s.name == ".rodata")
+            .map(|(i, _)| i as u16);
 
         // Parse symbols
         if let (Some(si), Some(sti)) = (symtab_idx, strtab_idx) {
@@ -281,13 +368,19 @@ impl Linker {
 
                 // If the symbol is defined (st_shndx points to a section, not UNDEF)
                 let is_defined = st_shndx != 0;
-                let offset = if is_defined {
-                    text_base + st_value
-                } else {
-                    0
-                };
 
-                self.symbols.insert(name, (offset, is_defined));
+                // Check if this symbol is in the rodata section
+                if is_defined && rodata_sec_idx == Some(st_shndx) {
+                    // Rodata symbol
+                    self.rodata_symbols.insert(name, rodata_base + st_value);
+                } else {
+                    let offset = if is_defined {
+                        text_base + st_value
+                    } else {
+                        0
+                    };
+                    self.symbols.insert(name, (offset, is_defined));
+                }
             }
         }
 
@@ -339,6 +432,7 @@ impl Linker {
             .symbols
             .iter()
             .filter(|(_, (_, is_def))| *is_def)
+            .filter(|(name, _)| !name.starts_with(".L"))  // Exclude local labels from DCE
             .map(|(name, (offset, _))| (name.clone(), *offset, 0))
             .collect();
 
@@ -355,37 +449,63 @@ impl Linker {
             .collect();
 
         // Resolve relocations and patch the text
+        let text_size = self.text_bytes.len() as u64;
         for (offset, sym_name, r_type) in &self.relocations {
-            if let Some((sym_offset, is_defined)) = self.symbols.get(sym_name) {
+            // Look up symbol in text symbols first, then rodata symbols
+            let sym_offset_opt = if let Some((sym_offset, is_defined)) = self.symbols.get(sym_name) {
                 if !is_defined {
-                    // External symbol — leave as 0 (will be resolved by dynamic linker or runtime)
+                    // External symbol — leave as 0
                     continue;
                 }
                 // Skip if this symbol is not reachable (DCE)
-                if !reachable_set.contains(sym_name) && sym_name != entry {
+                // But always keep local labels (.L prefix) — they're internal to functions
+                // and are reachable if their containing function is reachable.
+                if !reachable_set.contains(sym_name) && sym_name != entry && !sym_name.starts_with(".L") {
                     continue;
                 }
-                // Patch the relocation
+                Some(*sym_offset)
+            } else if let Some(rod_off) = self.rodata_symbols.get(sym_name) {
+                // Rodata symbol: offset is text_size + rodata_offset
+                Some(text_size + rod_off)
+            } else {
+                // Unknown symbol — skip
+                continue;
+            };
+
+            if let Some(sym_offset) = sym_offset_opt {
                 let patch_offset = *offset as usize;
                 if patch_offset + 4 <= self.text_bytes.len() {
                     match r_type {
                         2 => {
                             // R_X86_64_PC32: PC-relative 32-bit
                             let next_rip = patch_offset as i64 + 4;
-                            let delta = *sym_offset as i64 - next_rip;
+                            let delta = sym_offset as i64 - next_rip;
                             self.text_bytes[patch_offset..patch_offset + 4]
                                 .copy_from_slice(&(delta as i32).to_le_bytes());
                         }
                         4 => {
                             // R_X86_64_PLT32: same as PC32 for our purposes
                             let next_rip = patch_offset as i64 + 4;
-                            let delta = *sym_offset as i64 - next_rip;
+                            let delta = sym_offset as i64 - next_rip;
+                            self.text_bytes[patch_offset..patch_offset + 4]
+                                .copy_from_slice(&(delta as i32).to_le_bytes());
+                        }
+                        2 => {
+                            // R_X86_64_PC32: PC-relative 32-bit
+                            let next_rip = patch_offset as i64 + 4;
+                            let delta = sym_offset as i64 - next_rip;
+                            self.text_bytes[patch_offset..patch_offset + 4]
+                                .copy_from_slice(&(delta as i32).to_le_bytes());
+                        }
+                        4 => {
+                            // R_X86_64_PLT32: same as PC32 for our purposes
+                            let next_rip = patch_offset as i64 + 4;
+                            let delta = sym_offset as i64 - next_rip;
                             self.text_bytes[patch_offset..patch_offset + 4]
                                 .copy_from_slice(&(delta as i32).to_le_bytes());
                         }
                         1 => {
                             // R_X86_64_64: absolute 64-bit
-                            // Base virtual address = 0x400000 + 0x78 (ELF header + program header)
                             if patch_offset + 8 <= self.text_bytes.len() {
                                 let abs_addr = sym_offset + 0x400078u64;
                                 self.text_bytes[patch_offset..patch_offset + 8]

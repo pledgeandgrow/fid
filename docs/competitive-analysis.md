@@ -1,4 +1,4 @@
-# Pledge vs The World — Competitive Analysis
+# P vs The World — Competitive Analysis
 
 > Honest assessment. No ego. No vanity. Just facts.
 
@@ -62,7 +62,7 @@
 
 ---
 
-## Pledge — Target State
+## P — Target State
 
 | Dimension | Target | How |
 |---|---|---|
@@ -77,7 +77,7 @@
 
 ---
 
-## Where Pledge Wins Uniquely
+## Where P Wins Uniquely
 
 ### No other language has ALL of these:
 1. **Region-based memory safety** (Rust has borrow checking, Zig has nothing, C has nothing)
@@ -90,20 +90,20 @@
 8. **AI/robotics/IoT ready** (SIMD, bare metal, real-time effects, tensor types)
 
 ### The "Killer App" Argument
-What can you do in Pledge that you can't do in any other language?
+What can you do in P that you can't do in any other language?
 
 - **Write a safe OS kernel with hot reload** — Rust can do safe kernels but no hot reload. Zig can do hot reload but no safety. C can do kernels but no safety.
 - **Write a robot control system with real-time guarantees and memory safety** — Rust's async doesn't support real-time well. Zig has no safety. C has no safety.
 - **Deploy a web server with zero external dependencies** — Rust needs a linker. Zig needs a linker. C needs everything.
-- **Gradually migrate a C codebase to a memory-safe language** — Rust requires full rewrites. Zig is closer but still different. Pledge with C interop + migration tools makes this feasible.
+- **Gradually migrate a C codebase to a memory-safe language** — Rust requires full rewrites. Zig is closer but still different. P with C interop + migration tools makes this feasible.
 
 ---
 
-## Where Pledge Could Lose
+## Where P Could Lose
 
 ### Honest Risks
 
-1. **Ecosystem cold start** — Rust has crates.io, C has everything. Pledge starts at zero. This is the biggest practical barrier.
+1. **Ecosystem cold start** — Rust has crates.io, C has everything. P starts at zero. This is the biggest practical barrier.
 
 2. **Custom codegen quality** — LLVM has 20+ years of optimization. Our codegen will be worse for years. We mitigate by focusing on compilation speed first, optimization quality later.
 
@@ -111,7 +111,7 @@ What can you do in Pledge that you can't do in any other language?
 
 4. **Effect handler runtime overhead** — Delimited continuations have overhead. We mitigate by compiling effect handlers away when the handler is statically known.
 
-5. **Adoption chicken-and-egg** — People use languages with ecosystems. Ecosystems form around languages with users. We break this by targeting niches where Pledge uniquely wins (embedded AI, robotics, safe kernels).
+5. **Adoption chicken-and-egg** — People use languages with ecosystems. Ecosystems form around languages with users. We break this by targeting niches where P uniquely wins (embedded AI, robotics, safe kernels).
 
 6. **Team size** — Building a custom toolchain is massive work. LLVM has hundreds of contributors. We need to be strategic about what we build vs what we defer.
 

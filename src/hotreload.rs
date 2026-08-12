@@ -1,199 +1,279 @@
 // Hot Reload System — Phase 4E
 //
 // Provides fast development iteration by:
-//   1. JIT compiler: compiles PIR L3 → machine code in memory (no object files)
-//   2. Function-level hot swap: replaces function bodies without restarting
-//   3. State preservation: global state survives reloads
-//   4. Watch mode: auto-recompiles on file change
-//   5. Debugger integration: breakpoints and stepping in hot-reloaded code
+//   1. Native JIT: compiles PIR L3 → ELF64 → execute (no external tools)
+//   2. Function-level change detection: hash L2 IR to detect which functions changed
+//   3. State preservation: global state survives reloads via temp file
+//   4. Watch mode: auto-recompiles and runs on file change
+//   5. Debugger integration: breakpoints and stepping tracking (structural)
 //
-// The JIT uses a simple approach: for each function, allocate executable memory
-// (mmap with PROT_EXEC), copy the machine code bytes, and maintain a function
-// table that maps function names to executable addresses. When a function is
-// hot-swapped, we update the function table to point to the new code.
+// The JIT uses the existing build_executable pipeline (PIR → codegen → peephole
+// → ELF64) to produce a native executable, then runs it as a child process.
+// This reuses the working codegen + linker rather than trying to JIT individual
+// functions (which would require resolving relocations between user code and
+// the runtime — a much harder problem).
+//
+// Function-level hot-swap detection works by hashing each L2 function's debug
+// representation. When a file changes, we recompile to L2 and compare hashes
+// to report which functions were added, modified, or removed.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Public API
+// Function Change Detection
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// JIT compiler: manages executable memory and function dispatch.
-pub struct JitCompiler {
-    /// Map from function name to executable memory address
-    functions: HashMap<String, *mut u8>,
-    /// Allocated executable memory regions (to prevent deallocation)
-    _code_regions: Vec<CodeRegion>,
-    /// Global state that persists across reloads
-    global_state: HashMap<String, i64>,
-    /// Breakpoints: set of function names + instruction offsets
-    breakpoints: HashMap<String, Vec<usize>>,
+/// A snapshot of function hashes from a compilation.
+/// Used to detect which functions changed between reloads.
+pub struct FunctionSnapshot {
+    /// Map from function name to content hash
+    hashes: HashMap<String, u64>,
 }
 
-/// A region of executable memory
-struct CodeRegion {
-    ptr: *mut u8,
-    size: usize,
-}
-
-unsafe impl Send for CodeRegion {}
-unsafe impl Sync for CodeRegion {}
-
-impl JitCompiler {
-    pub fn new() -> Self {
-        JitCompiler {
-            functions: HashMap::new(),
-            _code_regions: Vec::new(),
-            global_state: HashMap::new(),
-            breakpoints: HashMap::new(),
+impl FunctionSnapshot {
+    /// Build a snapshot from an L2 module by hashing each function's debug repr.
+    pub fn from_l2(module: &crate::pir::L2Module) -> Self {
+        let mut hashes = HashMap::new();
+        for func in &module.functions {
+            // Hash the function name + blocks + values
+            let mut content = format!("{}|{:?}|{:?}|{:?}", func.name, func.params, func.ret_ty, func.entry);
+            for block in &func.blocks {
+                content.push_str(&format!("|{}|{:?}|{:?}", block.id, block.instructions, block.params));
+            }
+            // Sort value entries for deterministic hashing
+            let mut entries: Vec<_> = func.values.iter().collect();
+            entries.sort_by_key(|(k, _)| format!("{:?}", k));
+            for (k, v) in entries {
+                content.push_str(&format!("|{:?}:{:?}", k, v));
+            }
+            hashes.insert(func.name.clone(), hash_str(&content));
         }
+        FunctionSnapshot { hashes }
     }
 
-    /// JIT-compile a function: given the function name and machine code bytes,
-    /// allocate executable memory and register the function.
-    pub fn compile_function(&mut self, name: &str, code: &[u8]) -> Result<*mut u8, String> {
-        let mem = alloc_executable(code.len())?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(code.as_ptr(), mem, code.len());
-        }
-        self.functions.insert(name.to_string(), mem);
-        self._code_regions.push(CodeRegion {
-            ptr: mem,
-            size: code.len(),
-        });
-        Ok(mem)
-    }
+    /// Compare this snapshot with a previous one and return the diff.
+    pub fn diff(&self, prev: &FunctionSnapshot) -> FunctionDiff {
+        let mut added = Vec::new();
+        let mut modified = Vec::new();
+        let mut removed = Vec::new();
 
-    /// Hot-swap a function: replace the function body with new code.
-    /// The old code is kept in memory (to avoid dangling pointers), but the
-    /// function table is updated to point to the new code.
-    pub fn hot_swap(&mut self, name: &str, new_code: &[u8]) -> Result<(), String> {
-        // Check if function exists
-        if !self.functions.contains_key(name) {
-            return Err(format!("Cannot hot-swap: function '{}' not found", name));
+        for (name, hash) in &self.hashes {
+            match prev.hashes.get(name) {
+                None => added.push(name.clone()),
+                Some(prev_hash) if prev_hash != hash => modified.push(name.clone()),
+                _ => {}
+            }
         }
 
-        // Compile new version
-        let mem = alloc_executable(new_code.len())?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(new_code.as_ptr(), mem, new_code.len());
+        for name in prev.hashes.keys() {
+            if !self.hashes.contains_key(name) {
+                removed.push(name.clone());
+            }
         }
 
-        // Update function table
-        self.functions.insert(name.to_string(), mem);
-        self._code_regions.push(CodeRegion {
-            ptr: mem,
-            size: new_code.len(),
-        });
+        added.sort();
+        modified.sort();
+        removed.sort();
 
-        Ok(())
+        FunctionDiff { added, modified, removed }
     }
 
-    /// Get the address of a compiled function
-    pub fn get_function_addr(&self, name: &str) -> Option<*mut u8> {
-        self.functions.get(name).copied()
-    }
-
-    /// Save a global state value (persists across reloads)
-    pub fn save_state(&mut self, key: &str, value: i64) {
-        self.global_state.insert(key.to_string(), value);
-    }
-
-    /// Restore a global state value
-    pub fn restore_state(&self, key: &str) -> Option<i64> {
-        self.global_state.get(key).copied()
-    }
-
-    /// Set a breakpoint at a function + instruction offset
-    pub fn set_breakpoint(&mut self, func: &str, offset: usize) {
-        self.breakpoints
-            .entry(func.to_string())
-            .or_default()
-            .push(offset);
-    }
-
-    /// Clear all breakpoints for a function
-    pub fn clear_breakpoints(&mut self, func: &str) {
-        self.breakpoints.remove(func);
-    }
-
-    /// Check if there's a breakpoint at the given function + offset
-    pub fn has_breakpoint(&self, func: &str, offset: usize) -> bool {
-        self.breakpoints
-            .get(func)
-            .map(|offsets| offsets.contains(&offset))
-            .unwrap_or(false)
-    }
-
-    /// List all compiled functions
-    pub fn functions(&self) -> Vec<&str> {
-        self.functions.keys().map(|s| s.as_str()).collect()
+    /// Get all function names in this snapshot.
+    pub fn function_names(&self) -> Vec<&str> {
+        self.hashes.keys().map(|s| s.as_str()).collect()
     }
 }
 
-impl Drop for JitCompiler {
-    fn drop(&mut self) {
-        // Note: we intentionally leak the mmap'd regions on Drop because
-        // munmap'ing code that might still be executing is unsafe.
-        // In a real implementation, we'd track whether functions are still
-        // callable before unmapping.
+/// The result of comparing two function snapshots.
+#[derive(Debug, Clone)]
+pub struct FunctionDiff {
+    /// Functions that exist in the new snapshot but not the old.
+    pub added: Vec<String>,
+    /// Functions that exist in both but have different content.
+    pub modified: Vec<String>,
+    /// Functions that existed in the old snapshot but not the new.
+    pub removed: Vec<String>,
+}
+
+impl FunctionDiff {
+    /// Returns true if nothing changed.
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.modified.is_empty() && self.removed.is_empty()
+    }
+
+    /// Total number of changed functions.
+    pub fn total_changes(&self) -> usize {
+        self.added.len() + self.modified.len() + self.removed.len()
     }
 }
 
-/// Allocate executable memory using mmap (Unix) or VirtualAlloc (Windows)
-fn alloc_executable(size: usize) -> Result<*mut u8, String> {
+/// Simple FNV-1a hash for strings.
+fn hash_str(s: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in s.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Native JIT Execution
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Result of a JIT execution.
+#[derive(Debug)]
+pub struct JitResult {
+    /// Exit code of the program
+    pub exit_code: i32,
+    /// Stdout output
+    pub stdout: String,
+    /// Stderr output
+    pub stderr: String,
+    /// Time taken to compile (in milliseconds)
+    pub compile_time_ms: u64,
+    /// Time taken to execute (in milliseconds)
+    pub exec_time_ms: u64,
+    /// Size of the compiled binary (in bytes)
+    pub binary_size: usize,
+}
+
+/// Compile source code to a native ELF64 executable and run it.
+/// Uses the full PIR pipeline (L1→L2→L3 → codegen → peephole → ELF64).
+/// Zero external tools required.
+pub fn compile_and_run(source: &str, source_path: &str, do_opt: bool) -> Result<JitResult, String> {
+    let compile_start = Instant::now();
+
+    let binary = crate::compiler::build_executable(source, source_path, "x86-64", do_opt)
+        .map_err(|errors| errors.join("\n"))?;
+
+    let compile_time_ms = compile_start.elapsed().as_millis() as u64;
+    let binary_size = binary.len();
+
+    // Write to temp file, make executable, run it
+    let tmp_path = std::env::temp_dir().join(format!(
+        "pledge_jit_{}.bin",
+        std::process::id()
+    ));
+
+    std::fs::write(&tmp_path, &binary)
+        .map_err(|e| format!("Failed to write JIT binary: {}", e))?;
+
+    // Set executable permissions (Unix only)
     #[cfg(unix)]
     {
-        // Use extern "C" to call mmap directly (no libc crate dependency)
-        extern "C" {
-            fn mmap(
-                addr: *mut std::ffi::c_void,
-                length: usize,
-                prot: i32,
-                flags: i32,
-                fd: i32,
-                offset: i64,
-            ) -> *mut std::ffi::c_void;
-            fn munmap(addr: *mut std::ffi::c_void, length: usize) -> i32;
-        }
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&tmp_path)
+            .map_err(|e| format!("Failed to stat JIT binary: {}", e))?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tmp_path, perms)
+            .map_err(|e| format!("Failed to chmod JIT binary: {}", e))?;
+    }
 
-        const PROT_READ: i32 = 1;
-        const PROT_WRITE: i32 = 2;
-        const PROT_EXEC: i32 = 4;
-        const MAP_PRIVATE: i32 = 0x02;
-        const MAP_ANONYMOUS: i32 = 0x20;
-        const MAP_FAILED: *mut std::ffi::c_void = !0usize as *mut std::ffi::c_void;
+    let exec_start = Instant::now();
 
-        let page_size = 4096;
-        let aligned_size = ((size + page_size - 1) / page_size) * page_size;
+    let output = std::process::Command::new(&tmp_path)
+        .output()
+        .map_err(|e| {
+            // Clean up temp file on error
+            let _ = std::fs::remove_file(&tmp_path);
+            format!("Failed to execute JIT binary: {}", e)
+        })?;
 
-        unsafe {
-            let ptr = mmap(
-                std::ptr::null_mut(),
-                aligned_size,
-                PROT_READ | PROT_WRITE | PROT_EXEC,
-                MAP_PRIVATE | MAP_ANONYMOUS,
-                -1,
-                0,
-            );
+    let exec_time_ms = exec_start.elapsed().as_millis() as u64;
 
-            if ptr == MAP_FAILED {
-                return Err("mmap failed to allocate executable memory".to_string());
+    // Clean up temp file
+    let _ = std::fs::remove_file(&tmp_path);
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    Ok(JitResult {
+        exit_code,
+        stdout,
+        stderr,
+        compile_time_ms,
+        exec_time_ms,
+        binary_size,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// State Preservation
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// State that persists across hot reloads.
+/// Stored in a temp file so it survives between child process executions.
+pub struct PersistentState {
+    /// Path to the state file
+    state_file: PathBuf,
+    /// Key-value state
+    data: HashMap<String, String>,
+}
+
+impl PersistentState {
+    /// Create a new persistent state for the given source file.
+    pub fn for_source(source_path: &str) -> Self {
+        let state_file = std::env::temp_dir().join(format!(
+            "pledge_state_{}.json",
+            hash_str(source_path)
+        ));
+
+        let mut state = PersistentState {
+            state_file,
+            data: HashMap::new(),
+        };
+        state.load();
+        state
+    }
+
+    /// Load state from the temp file.
+    fn load(&mut self) {
+        if let Ok(content) = std::fs::read_to_string(&self.state_file) {
+            // Simple line-based format: key=value
+            for line in content.lines() {
+                if let Some(eq_pos) = line.find('=') {
+                    let key = &line[..eq_pos];
+                    let value = &line[eq_pos + 1..];
+                    self.data.insert(key.to_string(), value.to_string());
+                }
             }
-
-            Ok(ptr as *mut u8)
         }
     }
 
-    #[cfg(not(unix))]
-    {
-        // Fallback: just allocate on the heap (won't be executable, but won't crash)
-        let mut buf = vec![0u8; size];
-        let ptr = buf.as_mut_ptr();
-        std::mem::forget(buf);
-        Ok(ptr)
+    /// Save state to the temp file.
+    pub fn save(&self) {
+        let content: String = self.data.iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = std::fs::write(&self.state_file, content);
+    }
+
+    /// Set a state value.
+    pub fn set(&mut self, key: &str, value: &str) {
+        self.data.insert(key.to_string(), value.to_string());
+    }
+
+    /// Get a state value.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.data.get(key).map(|s| s.as_str())
+    }
+
+    /// Clear all state.
+    pub fn clear(&mut self) {
+        self.data.clear();
+        let _ = std::fs::remove_file(&self.state_file);
+    }
+}
+
+impl Drop for PersistentState {
+    fn drop(&mut self) {
+        self.save();
     }
 }
 
@@ -248,7 +328,7 @@ impl Watcher {
     pub fn run(&mut self, interval_ms: u64) {
         loop {
             self.poll();
-            std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+            std::thread::sleep(Duration::from_millis(interval_ms));
         }
     }
 }
@@ -257,7 +337,8 @@ impl Watcher {
 // Debugger Integration
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Debug state for the hot-reload debugger
+/// Debug state for the hot-reload debugger.
+/// Tracks call stack and current position for debugging hot-reloaded code.
 pub struct Debugger {
     /// Current function being debugged
     current_function: Option<String>,
@@ -323,52 +404,103 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_jit_compile_and_lookup() {
-        let mut jit = JitCompiler::new();
-        // x86-64: mov rax, 42; ret
-        let code = [0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00, 0xC3];
-        jit.compile_function("test_func", &code).unwrap();
-        assert!(jit.get_function_addr("test_func").is_some());
-        assert!(jit.get_function_addr("nonexistent").is_none());
+    fn test_function_snapshot_diff() {
+        // Build a snapshot with two functions
+        let mut hashes1 = HashMap::new();
+        hashes1.insert("main".to_string(), 1u64);
+        hashes1.insert("helper".to_string(), 2u64);
+        let snap1 = FunctionSnapshot { hashes: hashes1 };
+
+        // Build a snapshot with one modified, one added, one removed
+        let mut hashes2 = HashMap::new();
+        hashes2.insert("main".to_string(), 1u64);      // unchanged
+        hashes2.insert("helper".to_string(), 99u64);   // modified
+        hashes2.insert("new_func".to_string(), 3u64);  // added
+        let snap2 = FunctionSnapshot { hashes: hashes2 };
+
+        let diff = snap2.diff(&snap1);
+        assert_eq!(diff.added, vec!["new_func".to_string()]);
+        assert_eq!(diff.modified, vec!["helper".to_string()]);
+        assert!(diff.removed.is_empty());
+        assert!(!diff.is_empty());
+        assert_eq!(diff.total_changes(), 2);
     }
 
     #[test]
-    fn test_hot_swap() {
-        let mut jit = JitCompiler::new();
-        let code1 = [0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, 0xC3];
-        jit.compile_function("func", &code1).unwrap();
-        let addr1 = jit.get_function_addr("func").unwrap();
-
-        let code2 = [0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00, 0xC3];
-        jit.hot_swap("func", &code2).unwrap();
-        let addr2 = jit.get_function_addr("func").unwrap();
-
-        // Address should change after hot swap
-        assert_ne!(addr1, addr2);
+    fn test_function_snapshot_no_changes() {
+        let mut hashes = HashMap::new();
+        hashes.insert("main".to_string(), 1u64);
+        let snap1 = FunctionSnapshot { hashes: hashes.clone() };
+        let snap2 = FunctionSnapshot { hashes };
+        let diff = snap2.diff(&snap1);
+        assert!(diff.is_empty());
     }
 
     #[test]
-    fn test_state_preservation() {
-        let mut jit = JitCompiler::new();
-        jit.save_state("counter", 42);
+    fn test_function_snapshot_removed() {
+        let mut hashes1 = HashMap::new();
+        hashes1.insert("main".to_string(), 1u64);
+        hashes1.insert("old_func".to_string(), 2u64);
+        let snap1 = FunctionSnapshot { hashes: hashes1 };
 
-        // Simulate a reload by checking state is still there
-        assert_eq!(jit.restore_state("counter"), Some(42));
-        assert_eq!(jit.restore_state("nonexistent"), None);
+        let mut hashes2 = HashMap::new();
+        hashes2.insert("main".to_string(), 1u64);
+        let snap2 = FunctionSnapshot { hashes: hashes2 };
+
+        let diff = snap2.diff(&snap1);
+        assert_eq!(diff.removed, vec!["old_func".to_string()]);
+        assert!(diff.added.is_empty());
+        assert!(diff.modified.is_empty());
     }
 
     #[test]
-    fn test_breakpoints() {
-        let mut jit = JitCompiler::new();
-        jit.set_breakpoint("main", 10);
-        jit.set_breakpoint("main", 20);
-        assert!(jit.has_breakpoint("main", 10));
-        assert!(jit.has_breakpoint("main", 20));
-        assert!(!jit.has_breakpoint("main", 30));
-        assert!(!jit.has_breakpoint("other", 10));
+    fn test_persistent_state() {
+        let state_path = "/tmp/pledge_test_state_unique_12345.json";
+        let _ = std::fs::remove_file(state_path);
 
-        jit.clear_breakpoints("main");
-        assert!(!jit.has_breakpoint("main", 10));
+        {
+            let mut state = PersistentState {
+                state_file: PathBuf::from(state_path),
+                data: HashMap::new(),
+            };
+            state.set("counter", "42");
+            state.set("name", "pledge");
+            state.save();
+        }
+
+        // Load in a new instance
+        let state = PersistentState {
+            state_file: PathBuf::from(state_path),
+            data: HashMap::new(),
+        };
+        let mut state = state;
+        state.load();
+        assert_eq!(state.get("counter"), Some("42"));
+        assert_eq!(state.get("name"), Some("pledge"));
+        assert_eq!(state.get("nonexistent"), None);
+
+        state.clear();
+        assert_eq!(state.get("counter"), None);
+    }
+
+    #[test]
+    fn test_compile_and_run_hello() {
+        let source = "pf main() {\n    print(\"hot reload works!\");\n}\n";
+        let result = compile_and_run(source, "test.p", false);
+        assert!(result.is_ok(), "compile_and_run should succeed");
+        let result = result.unwrap();
+        assert_eq!(result.exit_code, 17); // print returns bytes written ("hot reload works!" = 17 chars)
+        assert!(result.stdout.contains("hot reload works!"));
+        assert!(result.binary_size > 0);
+    }
+
+    #[test]
+    fn test_compile_and_run_with_opt() {
+        let source = "pf main() {\n    print(\"optimized!\");\n}\n";
+        let result = compile_and_run(source, "test.p", true);
+        assert!(result.is_ok(), "compile_and_run with opt should succeed");
+        let result = result.unwrap();
+        assert!(result.stdout.contains("optimized!"));
     }
 
     #[test]
@@ -400,5 +532,28 @@ mod tests {
         // Just verify it doesn't crash
         watcher.watch("/tmp/nonexistent_file_for_test");
         assert!(!watcher.poll()); // file doesn't exist, no change
+    }
+
+    #[test]
+    fn test_watcher_detects_changes() {
+        // Create a temp file, watch it, modify it, verify poll detects the change
+        let tmp = std::env::temp_dir().join("pledge_watcher_test.txt");
+        std::fs::write(&tmp, "initial").unwrap();
+
+        let mut watcher = Watcher::new(|_| {});
+        watcher.watch(&tmp);
+
+        // No change yet
+        assert!(!watcher.poll());
+
+        // Wait a moment so the modification time differs
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&tmp, "modified").unwrap();
+
+        // Should detect the change
+        assert!(watcher.poll());
+
+        // Cleanup
+        let _ = std::fs::remove_file(&tmp);
     }
 }

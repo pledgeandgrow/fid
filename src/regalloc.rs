@@ -270,17 +270,32 @@ pub fn allocate(func: &L3Function) -> Allocation {
         free_pool.retain(|&p| p != r);
     }
 
-    let mut spill_offset: u32 = func.frame_size as u32;
+    let mut spill_offset: u32 = func.frame_size as u32 + 8;
     let mut used_callee_saved: Vec<PhysReg> = Vec::new();
 
     for interval in &sorted {
-        // Skip VRegs that are pre-assigned (function params — in registers or on stack).
+        // Handle pre-assigned VRegs (function params).
         if preassigned_all.contains(&interval.vreg) {
-            // Only add to active if it's in a register (so we track its lifetime
-            // and free the register when it expires).
-            if preassigned_reg.contains_key(&interval.vreg) {
-                active.push(*interval);
-                active.sort_by_key(|i| i.end);
+            if let Some(&reg) = preassigned_reg.get(&interval.vreg) {
+                // Check if the pre-assigned register is clobbered during
+                // this VReg's live range (e.g., a call clobbers caller-saved
+                // registers). If so, spill the VReg to the stack — the
+                // codegen prologue will save the arg register to the spill
+                // slot, and uses will load from the stack.
+                if is_reg_clobbered_in_range(func, interval.start, interval.end, reg) {
+                    let aligned = (spill_offset + 7) & !7;
+                    spill_offset = aligned + 8;
+                    vreg_to_loc.insert(interval.vreg, Location::Spill(aligned));
+                    // Return the pre-assigned register to the free pool.
+                    if !free_pool.contains(&reg) {
+                        free_pool.push(reg);
+                    }
+                    free_pool.sort_by_key(|r| r.encoding());
+                } else {
+                    // Register is safe for the entire live range — keep it.
+                    active.push(*interval);
+                    active.sort_by_key(|i| i.end);
+                }
             }
             continue;
         }
@@ -307,9 +322,12 @@ pub fn allocate(func: &L3Function) -> Allocation {
         }
         free_pool.sort_by_key(|r| r.encoding());
 
-        // Try to assign a free register.
-        if let Some(reg) = free_pool.first().copied() {
-            free_pool.remove(0);
+        // Try to assign a free register that is not clobbered during this interval.
+        let assigned_reg = free_pool.iter().find(|&&r| {
+            !is_reg_clobbered_in_range(func, interval.start, interval.end, r)
+        }).copied();
+        if let Some(reg) = assigned_reg {
+            free_pool.retain(|&r| r != reg);
             vreg_to_loc.insert(interval.vreg, Location::Reg(reg));
             active.push(*interval);
             active.sort_by_key(|i| i.end);
@@ -345,6 +363,14 @@ pub fn allocate(func: &L3Function) -> Allocation {
                         continue;
                     }
                 };
+                // Check if the register is clobbered in the current interval's range.
+                if is_reg_clobbered_in_range(func, interval.start, interval.end, reg) {
+                    // Can't use this register — spill current instead.
+                    let aligned = (spill_offset + 7) & !7;
+                    spill_offset = aligned + 8;
+                    vreg_to_loc.insert(interval.vreg, Location::Spill(aligned));
+                    continue;
+                }
                 let aligned = (spill_offset + 7) & !7;
                 spill_offset = aligned + 8;
                 vreg_to_loc.insert(spill_vreg, Location::Spill(aligned));
@@ -366,7 +392,7 @@ pub fn allocate(func: &L3Function) -> Allocation {
     Allocation {
         vreg_to_loc,
         used_callee_saved,
-        spill_size: spill_offset - func.frame_size as u32,
+        spill_size: spill_offset - (func.frame_size as u32 + 8),
         arg_locations,
     }
 }
@@ -449,6 +475,50 @@ fn compute_live_intervals(func: &L3Function) -> HashMap<VReg, LiveInterval> {
     }
 
     intervals
+}
+
+/// Physical registers implicitly clobbered by the codegen for each instruction.
+/// The regalloc must not keep live vregs in these registers across the instruction.
+fn inst_clobbers(inst: &L3Inst) -> Vec<PhysReg> {
+    match inst {
+        // Store: gen_store loads value into RAX, pointer into RCX
+        L3Inst::Store { .. } => vec![PhysReg::Rax, PhysReg::Rcx],
+        // Branch: gen_branch loads condition into RAX
+        L3Inst::Br { .. } => vec![PhysReg::Rax],
+        // Print: call to p_print_int/p_print_str clobbers caller-saved
+        L3Inst::Print { .. } => vec![PhysReg::Rax, PhysReg::Rcx, PhysReg::Rdx,
+            PhysReg::Rsi, PhysReg::Rdi, PhysReg::R8, PhysReg::R9, PhysReg::R10, PhysReg::R11],
+        // Calls clobber all caller-saved registers
+        L3Inst::Call { .. } | L3Inst::CallPtr { .. } | L3Inst::DynCall { .. } => {
+            vec![PhysReg::Rax, PhysReg::Rcx, PhysReg::Rdx,
+                PhysReg::Rsi, PhysReg::Rdi, PhysReg::R8, PhysReg::R9, PhysReg::R10, PhysReg::R11]
+        }
+        // Panic: calls p_panic
+        L3Inst::Panic { .. } => vec![PhysReg::Rax, PhysReg::Rcx, PhysReg::Rdx,
+            PhysReg::Rsi, PhysReg::Rdi, PhysReg::R8, PhysReg::R9, PhysReg::R10, PhysReg::R11],
+        _ => vec![],
+    }
+}
+
+/// Check if a register is clobbered by any instruction in the given range.
+fn is_reg_clobbered_in_range(
+    func: &L3Function,
+    start: u32,
+    end: u32,
+    reg: PhysReg,
+) -> bool {
+    let mut idx: u32 = 0;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if idx >= start && idx <= end {
+                if inst_clobbers(inst).contains(&reg) {
+                    return true;
+                }
+            }
+            idx += 1;
+        }
+    }
+    false
 }
 
 /// The VReg defined by an instruction (its destination), if any.

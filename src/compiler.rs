@@ -362,6 +362,16 @@ pub fn lower_to_ir_module(source: &str) -> Result<crate::ir::IrModule, Vec<Strin
     Ok(lower::lower(&program))
 }
 
+/// Lower source to PIR L2 (for hot-reload change detection).
+/// Returns the L2 module which can be compared across reloads.
+pub fn lower_to_l2(source: &str, source_path: &str) -> Result<crate::pir::L2Module, Vec<String>> {
+    let program = build_program_with_path(source, Some(source_path))?;
+    let module = lower::lower(&program);
+    let l1 = pir::lower_ir_to_l1(&module);
+    let l2 = pir::lower_l1_to_l2(&l1);
+    Ok(l2)
+}
+
 pub fn lex(source: &str) -> Vec<String> {
     let mut lexer = Lexer::new(source);
     lexer
@@ -474,6 +484,18 @@ pub fn build_executable(source: &str, source_path: &str, target: &str, do_opt: b
 
     if do_opt {
         let _ = crate::opt::optimize_l2(&mut l2);
+        for f in &l2.functions {
+            if f.name == "main" {
+                if let Some(b) = f.blocks.first() {
+                    eprintln!("[opt] main bb0 order: {:?}", b.instructions);
+                    for vid in &b.instructions {
+                        if let Some(inst) = f.values.get(vid) {
+                            eprintln!("  {} = {:?}", vid, inst);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     let l3 = pir::lower_l2_to_l3(&l2, &module);
@@ -481,9 +503,27 @@ pub fn build_executable(source: &str, source_path: &str, target: &str, do_opt: b
     match target {
         "x86-64" | "x64" => {
             let asm = crate::codegen_x64::generate_asm(&l3);
+            // Always run peephole optimization on the generated assembly —
+            // this catches redundant moves, zero idioms, dead stores, etc.
+            // These are safe local transformations that don't affect semantics.
+            let asm = crate::peephole::optimize(&asm);
+            // Debug: dump asm for some_func
+            for line in asm.lines() {
+                if line.contains("some_func") || line.contains("xorl") {
+                    eprintln!("DBG ASM: {}", line);
+                }
+            }
             let obj = crate::elf64::emit_object_file(&l3, &asm)
                 .map_err(|e| vec![e])?;
-            crate::linker::link(&[obj], "main")
+            // Link with the pre-compiled Linux runtime (raw machine code)
+            let (rt_text, rt_syms, rt_rodata, rt_rodata_syms) = crate::runtime_linux::runtime_parts();
+            let rt_relocs = crate::runtime_linux::runtime_relocations();
+            crate::linker::link_with_runtime(
+                &[obj], "_start",
+                &rt_text, &rt_syms,
+                &rt_rodata, &rt_rodata_syms,
+                &rt_relocs,
+            )
                 .map_err(|e| vec![e])
         }
         "arm64" | "aarch64" => {

@@ -1,4 +1,4 @@
-# Pledge Design Principles
+# P Design Principles
 
 > The non-negotiable rules that guide every design decision.
 
@@ -107,7 +107,7 @@
 - Custom stdlib
 - Custom allocator
 
-**Exception:** The Rust compiler (for now) — used to build Pledge, but the end goal is self-hosting.
+**Exception:** The Rust compiler (for now) — used to build P, but the end goal is self-hosting.
 
 **Anti-pattern:** Using LLVM because "it's easier."
 **Anti-pattern:** Using libc because "everyone has it."
@@ -131,7 +131,7 @@
 
 **Rule:** The language should be learnable by any programmer in <1 week.
 
-- Syntax is familiar (Rust-like with Pledge keywords)
+- Syntax is familiar (Rust-like with P keywords)
 - Error messages are clear and actionable
 - No lifetime annotations (regions are inferred)
 - No macro complexity (comptime is just regular code)

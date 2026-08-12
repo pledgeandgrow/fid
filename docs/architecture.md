@@ -1,4 +1,4 @@
-# Pledge Compiler Architecture
+# P Compiler Architecture
 
 **Version:** 0.5.0
 **Targets:** x86_64 (Windows PE + Linux ELF64), WebAssembly, bare-metal flat binary, C codegen, IR interpreter
@@ -75,15 +75,15 @@ Source (.p)
                                                      Native .exe
 ```
 
-The **PE emitter** is the primary backend — it produces `.exe` files directly with zero external tool dependencies. The **ELF64 emitter** produces relocatable `.o` files for Linux. The **WASM backend** targets the web. The **interpreter** provides rapid testing without any external tools.
+The **ELF64 emitter** (`build` command on Linux) is the primary native backend — it produces working ELF64 executables directly with zero external tool dependencies, using the full PIR pipeline (L1→L2→L3 → codegen → peephole → ELF64). The **PE emitter** (`emit` command) produces Windows `.exe` files directly, bypassing PIR (operates directly on IR). The **WASM backend** targets the web. The **interpreter** provides rapid testing without any external tools.
 
 ### Entry Points (`compiler.rs`)
 
 | Function | Pipeline | CLI Command |
 |----------|----------|-------------|
-| `emit_source_with_path(source, path)` | lex → parse → typecheck → monomorphize → lower → PE emission | `emit` |
+| `emit_source_with_path(source, path)` | lex → parse → typecheck → monomorphize → lower → PE emission (direct IR→machine code) | `emit` |
 | `emit_bare(source, path)` | lex → parse → typecheck → lower → flat binary (no stdlib) | `emit --bare` |
-| `build_source_with_path(source, path)` | lex → parse → typecheck → monomorphize → lower → x86 codegen | `build` |
+| `build_executable(source, path)` | lex → parse → typecheck → monomorphize → lower → PIR (L1→L2→L3) → codegen → peephole → ELF64 executable | `build` |
 | `ccompile_source_with_path(source, path)` | lex → parse → typecheck → monomorphize → lower → C codegen | `ccompile` |
 | `interpret_source_with_path(source, path, verbose)` | lex → parse → typecheck → monomorphize → lower → interpret | `run` |
 | `lower_to_ir(source)` | lex → parse → typecheck → monomorphize → lower → format IR | `ir` |
@@ -121,7 +121,7 @@ After type-checking, generic functions are monomorphized:
 Reads source text character-by-character and produces a `Vec<Token>`.
 
 **Key responsibilities:**
-- Tokenize all Pledge keywords (`pf`, `pv`, `pc`, `ret`, `if`, `else`, `for`, `while`, `match`, etc.)
+- Tokenize all P keywords (`pf`, `pv`, `pc`, `ret`, `if`, `else`, `for`, `while`, `match`, etc.)
 - Parse integer literals (decimal, hex `0xFF`, binary `0b1010`, octal `0o777`, underscores `1_000`)
 - Parse float literals (`3.14`, `3.14f32`)
 - Parse string literals (`"hello"`)
@@ -429,7 +429,7 @@ The `build` command orchestrates external tools (MASM pipeline):
 | File | Responsibility |
 |------|---------------|
 | `src/main.rs` | CLI entry point, command dispatch, external tool invocation |
-| `src/token.rs` | `TokenKind` enum (all Pledge keywords and operators) |
+| `src/token.rs` | `TokenKind` enum (all P keywords and operators) |
 | `src/lexer.rs` | Tokenizer: source text → `Vec<Token>` |
 | `src/ast.rs` | AST node definitions: `Program`, `Func`, `Stmt`, `Expr`, `StructDef`, `EnumDef`, etc. |
 | `src/parser.rs` | Recursive descent parser: `Vec<Token>` → `Program` |
@@ -455,7 +455,7 @@ For `tests/strings.p`:
 ```pledge
 pf main() {
     print("Hello, World!");
-    pv name = "Pledge";
+    pv name = "P";
     print(name);
     pv greeting = f"Hello, {name}!";
     print(greeting);
@@ -464,20 +464,20 @@ pf main() {
 }
 ```
 
-1. **Lexer** produces tokens: `Keyword(Pf)`, `Ident("main")`, `LParen`, `RParen`, `LBrace`, `Ident("print")`, `LParen`, `StrLit("Hello, World!")`, `RParen`, `Semicolon`, `Keyword(Pv)`, `Ident("name")`, `Assign`, `StrLit("Pledge")`, `Semicolon`, ...
+1. **Lexer** produces tokens: `Keyword(Pf)`, `Ident("main")`, `LParen`, `RParen`, `LBrace`, `Ident("print")`, `LParen`, `StrLit("Hello, World!")`, `RParen`, `Semicolon`, `Keyword(Pv)`, `Ident("name")`, `Assign`, `StrLit("P")`, `Semicolon`, ...
 
-2. **Parser** builds AST with `Func { name: "main", body: [Expr(Call(print, "Hello, World!")), Let(name, "Pledge"), Expr(Call(print, Ident(name))), Let(greeting, FString([Literal("Hello, "), Expr(Ident(name)), Literal("!")])), ...] }`
+2. **Parser** builds AST with `Func { name: "main", body: [Expr(Call(print, "Hello, World!")), Let(name, "P"), Expr(Call(print, Ident(name))), Let(greeting, FString([Literal("Hello, "), Expr(Ident(name)), Literal("!")])), ...] }`
 
 3. **TypeChecker** validates: `print` takes `str`, `name` is `str`, f-string parts are valid, etc.
 
 4. **Lowerer** produces IR:
    - `ConstStr("Hello, World!")` → `Call(__pledge_print_str, [str])`
-   - `ConstStr("Pledge")` → `Store(alloca_name, str)`
+   - `ConstStr("P")` → `Store(alloca_name, str)`
    - `Load(alloca_name)` → `Call(__pledge_print_str, [str])`
    - `ConstStr("Hello, ")` + `Load(alloca_name)` (already Ptr, skip `__pledge_to_str`) + `Call(__pledge_str_concat, [prev, name])` + `ConstStr("!")` + `Call(__pledge_str_concat, [prev, "!"])` → `Call(__pledge_print_str, [result])`
    - `Const(42)` → `Call(__pledge_to_str, [42])` → concat with `ConstStr("x = ")` → `Call(__pledge_print_str, [result])`
 
-5. **Interpreter** executes: prints "Hello, World!", "Pledge", "Hello, Pledge!", "x = 42"
+5. **Interpreter** executes: prints "Hello, World!", "P", "Hello, P!", "x = 42"
 
 6. **x86 Codegen** generates MASM assembly with:
    - String literals in `.data`

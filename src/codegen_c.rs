@@ -7,7 +7,6 @@
 use crate::ir::*;
 use crate::ast::{self, BinOp, UnaryOp};
 use std::collections::HashMap;
-use std::fmt::Write;
 
 /// Macro for formatted writeln to self.out
 macro_rules! wln {
@@ -50,6 +49,9 @@ pub struct CCodeGen {
     /// Set of user-defined function names (from the module).  Used to
     /// distinguish user functions from runtime functions in CallPtr dispatch.
     user_functions: std::collections::HashSet<String>,
+    /// User function parameter types (from the module).  Used for argument
+    /// casting when calling user functions with array/struct params.
+    user_fn_param_types: HashMap<String, Vec<IrType>>,
     /// Function return types, keyed by IR function name.  Used for CallPtr
     /// dispatch to filter candidates by return type.
     fn_ret_types: HashMap<String, IrType>,
@@ -71,6 +73,7 @@ impl CCodeGen {
             fn_param_types: HashMap::new(),
             struct_layouts: HashMap::new(),
             user_functions: std::collections::HashSet::new(),
+            user_fn_param_types: HashMap::new(),
             fn_ret_types: HashMap::new(),
             extern_func_names: std::collections::HashSet::new(),
         }
@@ -107,6 +110,15 @@ impl CCodeGen {
         }
     }
 
+    /// Format a C parameter declaration with the variable name in the right position.
+    /// For array types, C requires `type name[size]` not `type[size] name`.
+    fn c_param_decl(ty: &IrType, name: &str) -> String {
+        match ty {
+            IrType::Array(elem, size) => format!("{} {}[{}]", Self::c_type(elem), name, size),
+            _ => format!("{} {}", Self::c_type(ty), name),
+        }
+    }
+
     /// Returns true if the type uses the out-parameter calling convention
     /// (struct/array returns are lowered to a hidden first parameter pointer
     /// and a void return). The C declaration must use `void` as the return
@@ -131,10 +143,23 @@ impl CCodeGen {
     /// `*u8`/`void*`).
     fn cast_arg(val: &str, from: &IrType, to: &IrType) -> String {
         let from_is_ptr = matches!(from, IrType::Ptr(_) | IrType::Opaque(_) | IrType::Generic(_, _));
+        let from_is_float = matches!(from, IrType::F32 | IrType::F64);
         let to_is_ptr = matches!(to, IrType::Ptr(_) | IrType::Opaque(_) | IrType::Generic(_, _));
+        let to_is_array = matches!(to, IrType::Array(_, _));
         let to_is_struct = Self::is_aggregate_ret(to);
 
+        // Array params decay to pointers in C — cast to element pointer type
+        if to_is_array {
+            if let IrType::Array(elem, _) = to {
+                return format!("({}*){}", Self::c_type(elem), val);
+            }
+        }
+
         match (from_is_ptr, to_is_ptr, to_is_struct) {
+            // float → pointer: use type punning via union (double and void* are both 8 bytes)
+            (false, true, _) if from_is_float => {
+                format!("((union {{ double d; void* p; }}){{ .d = {} }}).p", val)
+            }
             // int → pointer: cast to void*
             (false, true, _) => format!("(void*){}", val),
             // pointer → int: cast to int64_t
@@ -157,6 +182,31 @@ impl CCodeGen {
             "abs" => "p_abs",
             "max" => "p_max",
             "min" => "p_min",
+            "div" => "p_div",
+            "exit" => "p_exit",
+            "printf" => "p_printf",
+            "malloc" => "p_malloc_user",
+            "free" => "p_free_user",
+            "realloc" => "p_realloc",
+            "calloc" => "p_calloc",
+            "abort" => "p_abort",
+            "atoi" => "p_atoi",
+            "atof" => "p_atof",
+            "strlen" => "p_strlen_user",
+            "strcmp" => "p_strcmp_user",
+            "strcpy" => "p_strcpy_user",
+            "memcpy" => "p_memcpy_user",
+            "memset" => "p_memset_user",
+            "pow" => "p_pow",
+            "sqrt" => "p_sqrt",
+            "sin" => "p_sin",
+            "cos" => "p_cos",
+            "tan" => "p_tan",
+            "log" => "p_log",
+            "exp" => "p_exp_user",
+            "floor" => "p_floor",
+            "ceil" => "p_ceil",
+            "round" => "p_round",
             // C keywords that can't be function names
             "double" => "p_double",
             "float" => "p_float",
@@ -255,10 +305,15 @@ impl CCodeGen {
         }
         // Collect user-defined function names (for CallPtr dispatch)
         self.user_functions.clear();
+        self.user_fn_param_types.clear();
         self.fn_ret_types.clear();
         self.extern_func_names.clear();
         for (name, func) in &module.functions {
             self.user_functions.insert(name.clone());
+            self.user_fn_param_types.insert(
+                name.clone(),
+                func.params.iter().map(|(_, ty)| ty.clone()).collect(),
+            );
             self.fn_ret_types.insert(name.clone(), func.ret_ty.clone());
         }
         // Collect extern function names (these should NOT be sanitized)
@@ -361,6 +416,7 @@ impl CCodeGen {
             ("p_to_str_str", &[p()]),
             ("p_to_str_bool", &[Bool]),
             ("p_to_str_float", &[F64]),
+            ("p_to_str_map", &[p()]),
             ("p_str_concat", &[p(), p()]),
             ("p_print", &[I64]),
             ("p_print_str", &[p()]),
@@ -373,6 +429,96 @@ impl CCodeGen {
             ("p_free", &[p()]),
             ("p_panic", &[p()]),
             ("println", &[p(), p()]),
+            ("p_vec_set", &[p(), I64, p()]),
+            ("p_cli", &[]),
+            ("p_sti", &[]),
+            ("p_cr0_read", &[]),
+            ("p_cr3_read", &[]),
+            ("p_cr4_read", &[]),
+            ("p_cr3_write", &[I64]),
+            ("p_invlpg", &[I64]),
+            ("p_page_map", &[I64, I64, I64, I64]),
+            ("p_page_unmap", &[I64, I64]),
+            ("p_phys_read64", &[I64]),
+            ("p_phys_write64", &[I64, I64]),
+            ("p_simd_add", &[p(), p()]),
+            ("p_simd_sub", &[p(), p()]),
+            ("p_simd_mul", &[p(), p()]),
+            ("p_simd_div", &[p(), p()]),
+            ("p_simd_dot", &[p(), p()]),
+            ("p_simd_sum", &[p()]),
+            ("p_simd_scale", &[p(), F64]),
+            ("p_simd_from_vec", &[p()]),
+            ("p_simd_to_str", &[p()]),
+            ("p_tensor_new", &[I64, p()]),
+            ("p_tensor_from", &[p(), I64, p()]),
+            ("p_tensor_zeros", &[p()]),
+            ("p_tensor_ones", &[p()]),
+            ("p_tensor_filled", &[p(), F64]),
+            ("p_tensor_from_vec", &[p(), p()]),
+            ("p_tensor_clone", &[p()]),
+            ("p_tensor_at", &[p(), I64]),
+            ("p_tensor_get", &[p(), p()]),
+            ("p_tensor_set", &[p(), p(), F64]),
+            ("p_tensor_add", &[p(), p()]),
+            ("p_tensor_sub", &[p(), p()]),
+            ("p_tensor_mul", &[p(), p()]),
+            ("p_tensor_matmul", &[p(), p()]),
+            ("p_tensor_transpose", &[p()]),
+            ("p_tensor_relu", &[p()]),
+            ("p_tensor_sigmoid", &[p()]),
+            ("p_tensor_softmax", &[p()]),
+            ("p_tensor_scale", &[p(), F64]),
+            ("p_tensor_sum", &[p()]),
+            ("p_tensor_mean", &[p()]),
+            ("p_tensor_min", &[p()]),
+            ("p_tensor_max", &[p()]),
+            ("p_tensor_dot", &[p(), p()]),
+            ("p_tensor_reshape", &[p(), p()]),
+            ("p_tensor_len", &[p()]),
+            ("p_tensor_ndim", &[p()]),
+            ("p_tensor_shape", &[p()]),
+            ("p_tensor_size", &[p()]),
+            ("p_tensor_to_str", &[p()]),
+            ("p_tensor_to_json", &[p()]),
+            ("p_json_parse", &[p()]),
+            ("p_json_new_object", &[]),
+            ("p_json_new_array", &[]),
+            ("p_json_set", &[p(), p(), p()]),
+            ("p_json_set_int", &[p(), p(), I64]),
+            ("p_json_set_float", &[p(), p(), F64]),
+            ("p_json_set_bool", &[p(), p(), I64]),
+            ("p_json_append", &[p(), p()]),
+            ("p_json_append_int", &[p(), I64]),
+            ("p_json_append_float", &[p(), F64]),
+            ("p_json_dump", &[p()]),
+            ("p_json_dump_pretty", &[p()]),
+            ("p_json_pretty", &[p()]),
+            ("p_json_string", &[p()]),
+            ("p_json_type", &[p()]),
+            ("p_json_get", &[p(), p()]),
+            ("p_json_get_int", &[p(), p()]),
+            ("p_json_get_float", &[p(), p()]),
+            ("p_json_get_bool", &[p(), p()]),
+            ("p_json_at", &[p(), I64]),
+            ("p_json_len", &[p()]),
+            ("p_json_object_get", &[p(), p()]),
+            ("p_http_listen", &[I64]),
+            ("p_http_recv_request", &[I64]),
+            ("p_http_send_response", &[I64, I64, p()]),
+            ("p_http_build_response", &[I64, p(), p()]),
+            ("p_http_parse_request", &[p()]),
+            ("p_db_connect", &[p()]),
+            ("p_db_exec", &[p(), p()]),
+            ("p_db_query", &[p(), p()]),
+            ("p_db_get", &[p(), p()]),
+            ("p_db_set", &[p(), p(), p()]),
+            ("p_db_mem_open", &[I64]),
+            ("p_db_mem_exec", &[p(), p()]),
+            ("p_db_mem_query", &[p(), p()]),
+            ("p_db_mem_close", &[p()]),
+            ("p_hlt", &[]),
+            ("p_socket_write_str", &[I64, p()]),
         ];
         for (name, params) in sigs {
             self.fn_param_types
@@ -381,12 +527,19 @@ impl CCodeGen {
         // Runtime function return types — most return int64_t or void*,
         // but some return void (mutating operations).
         let void_ret: &[&str] = &[
-            "p_vec_push", "p_vec_clear", "p_vec_insert",
+            "p_vec_push", "p_vec_clear", "p_vec_insert", "p_vec_set",
             "p_vec_reverse", "p_vec_sort", "p_vec_truncate", "p_vec_extend",
             "p_map_insert", "p_map_remove", "p_map_clear",
             "p_print", "p_print_str", "p_print_int", "p_print_bool",
             "p_print_float", "p_print_newline", "p_free", "p_panic",
             "p_socket_close",
+            "p_cli", "p_sti", "p_cr3_write", "p_invlpg", "p_page_map", "p_page_unmap",
+            "p_phys_write64",
+            "p_tensor_set",
+            "p_json_set", "p_json_set_int", "p_json_set_float", "p_json_set_bool",
+            "p_json_append", "p_json_append_int", "p_json_append_float",
+            "p_http_send_response",
+            "p_db_exec", "p_db_set", "p_db_mem_close",
         ];
         for name in void_ret {
             self.fn_ret_types.insert(name.to_string(), IrType::Void);
@@ -401,6 +554,7 @@ impl CCodeGen {
         wln!(self, "#include <stdint.h>");
         wln!(self, "#include <stdbool.h>");
         wln!(self, "#include <ctype.h>");
+        wln!(self, "#include <math.h>");
         // Socket support for native HTTP server (Phase 5D)
         wln!(self, "#ifdef _WIN32");
         wln!(self, "#include <winsock2.h>");
@@ -513,6 +667,7 @@ impl CCodeGen {
         wln!(self, "PVec* p_vec_new(void);");
         wln!(self, "void p_vec_push(PVec* v, void* val);");
         wln!(self, "void* p_vec_get(PVec* v, int64_t idx);");
+        wln!(self, "void p_vec_set(PVec* v, int64_t idx, void* val);");
         wln!(self, "int64_t p_vec_len(PVec* v);");
         wln!(self, "int64_t p_vec_pop(PVec* v);");
         wln!(self, "bool p_vec_is_empty(PVec* v);");
@@ -527,6 +682,100 @@ impl CCodeGen {
         wln!(self, "void p_map_clear(PMap* m);");
         wln!(self, "PVec* p_map_keys(PMap* m);");
         wln!(self, "PVec* p_map_values(PMap* m);");
+        // Bare metal builtins (Phase 5A) — stubs for C codegen
+        wln!(self, "void p_cli(void);");
+        wln!(self, "void p_sti(void);");
+        wln!(self, "void p_hlt(void);");
+        wln!(self, "int64_t p_cr0_read(void);");
+        wln!(self, "int64_t p_cr3_read(void);");
+        wln!(self, "int64_t p_cr4_read(void);");
+        wln!(self, "void p_cr3_write(int64_t val);");
+        wln!(self, "void p_invlpg(int64_t addr);");
+        wln!(self, "void p_page_map(int64_t cr3, int64_t virt, int64_t phys, int64_t flags);");
+        wln!(self, "void p_page_unmap(int64_t cr3, int64_t virt);");
+        wln!(self, "int64_t p_phys_read64(int64_t addr);");
+        wln!(self, "void p_phys_write64(int64_t addr, int64_t val);");
+        // SIMD builtins (Phase 5C) — elementwise double4 operations
+        wln!(self, "void* p_simd_add(void* a, void* b);");
+        wln!(self, "void* p_simd_sub(void* a, void* b);");
+        wln!(self, "void* p_simd_mul(void* a, void* b);");
+        wln!(self, "void* p_simd_div(void* a, void* b);");
+        wln!(self, "double p_simd_dot(void* a, void* b);");
+        wln!(self, "double p_simd_sum(void* a);");
+        wln!(self, "void* p_simd_scale(void* a, double s);");
+        wln!(self, "void* p_simd_from_vec(void* v);");
+        wln!(self, "char* p_simd_to_str(void* a);");
+        // Tensor builtins (Phase 5C)
+        wln!(self, "void* p_tensor_new(int64_t ndim, int64_t* shape);");
+        wln!(self, "void* p_tensor_from(void* data, int64_t ndim, int64_t* shape);");
+        wln!(self, "void* p_tensor_zeros(void* shape_vec);");
+        wln!(self, "void* p_tensor_ones(void* shape_vec);");
+        wln!(self, "void* p_tensor_filled(void* shape_vec, double val);");
+        wln!(self, "void* p_tensor_from_vec(void* v, void* shape_vec);");
+        wln!(self, "void* p_tensor_clone(void* t);");
+        wln!(self, "double p_tensor_at(void* t, int64_t idx);");
+        wln!(self, "double p_tensor_get(void* t, void* idx_vec);");
+        wln!(self, "void p_tensor_set(void* t, void* idx_vec, double val);");
+        wln!(self, "void* p_tensor_add(void* a, void* b);");
+        wln!(self, "void* p_tensor_sub(void* a, void* b);");
+        wln!(self, "void* p_tensor_mul(void* a, void* b);");
+        wln!(self, "void* p_tensor_matmul(void* a, void* b);");
+        wln!(self, "void* p_tensor_transpose(void* t);");
+        wln!(self, "void* p_tensor_relu(void* t);");
+        wln!(self, "void* p_tensor_sigmoid(void* t);");
+        wln!(self, "void* p_tensor_softmax(void* t);");
+        wln!(self, "void* p_tensor_scale(void* t, double s);");
+        wln!(self, "double p_tensor_sum(void* t);");
+        wln!(self, "double p_tensor_mean(void* t);");
+        wln!(self, "double p_tensor_min(void* t);");
+        wln!(self, "double p_tensor_max(void* t);");
+        wln!(self, "double p_tensor_dot(void* a, void* b);");
+        wln!(self, "void* p_tensor_reshape(void* t, void* shape_vec);");
+        wln!(self, "int64_t p_tensor_len(void* t);");
+        wln!(self, "int64_t p_tensor_ndim(void* t);");
+        wln!(self, "void* p_tensor_shape(void* t);");
+        wln!(self, "int64_t p_tensor_size(void* t);");
+        wln!(self, "char* p_tensor_to_str(void* t);");
+        wln!(self, "char* p_tensor_to_json(void* t);");
+        // JSON builtins (Phase 5D)
+        wln!(self, "char* p_json_parse(const char* s);");
+        wln!(self, "void* p_json_new_object(void);");
+        wln!(self, "void* p_json_new_array(void);");
+        wln!(self, "void p_json_set(void* j, const char* key, const char* val);");
+        wln!(self, "void p_json_set_int(void* j, const char* key, int64_t val);");
+        wln!(self, "void p_json_set_float(void* j, const char* key, double val);");
+        wln!(self, "void p_json_set_bool(void* j, const char* key, int64_t val);");
+        wln!(self, "void p_json_append(void* j, const char* val);");
+        wln!(self, "void p_json_append_int(void* j, int64_t val);");
+        wln!(self, "void p_json_append_float(void* j, double val);");
+        wln!(self, "char* p_json_dump(void* j);");
+        wln!(self, "char* p_json_dump_pretty(void* j);");
+        wln!(self, "char* p_json_pretty(void* j);");
+        wln!(self, "char* p_json_string(void* j);");
+        wln!(self, "const char* p_json_type(void* j);");
+        wln!(self, "char* p_json_get(void* j, const char* key);");
+        wln!(self, "int64_t p_json_get_int(void* j, const char* key);");
+        wln!(self, "double p_json_get_float(void* j, const char* key);");
+        wln!(self, "int64_t p_json_get_bool(void* j, const char* key);");
+        wln!(self, "void* p_json_at(void* j, int64_t idx);");
+        wln!(self, "int64_t p_json_len(void* j);");
+        wln!(self, "void* p_json_object_get(void* j, const char* key);");
+        // HTTP builtins (Phase 5D) — already have socket builtins
+        wln!(self, "int64_t p_http_listen(int64_t port);");
+        wln!(self, "char* p_http_recv_request(int64_t fd);");
+        wln!(self, "void p_http_send_response(int64_t fd, int64_t status, const char* body);");
+        wln!(self, "char* p_http_build_response(int64_t status, const char* content_type, const char* body);");
+        wln!(self, "char* p_http_parse_request(const char* request);");
+        // DB builtins (Phase 5D)
+        wln!(self, "void* p_db_connect(const char* conn_str);");
+        wln!(self, "void p_db_exec(void* db, const char* query);");
+        wln!(self, "void* p_db_query(void* db, const char* query);");
+        wln!(self, "char* p_db_get(void* db, const char* key);");
+        wln!(self, "void p_db_set(void* db, const char* key, const char* val);");
+        wln!(self, "void* p_db_mem_open(void);");
+        wln!(self, "int64_t p_db_mem_exec(void* db, const char* query);");
+        wln!(self, "char* p_db_mem_query(void* db, const char* query);");
+        wln!(self, "void p_db_mem_close(void* db);");
         wln!(self, "int64_t p_string_len(const char* s);");
         wln!(self, "bool p_string_is_empty(const char* s);");
         wln!(self, "char* p_string_push_str(const char* s, const char* other);");
@@ -571,6 +820,7 @@ impl CCodeGen {
         wln!(self, "int64_t p_socket_accept(int64_t fd);");
         wln!(self, "int64_t p_socket_read(int64_t fd, char* buf, int64_t max_len);");
         wln!(self, "int64_t p_socket_write(int64_t fd, const char* buf, int64_t len);");
+        wln!(self, "int64_t p_socket_write_str(int64_t fd, const char* buf);");
         wln!(self, "void p_socket_close(int64_t fd);");
         wln!(self, "char* p_socket_recv_str(int64_t fd);");
         wln!(self, "int64_t print(int64_t val);");
@@ -632,7 +882,7 @@ impl CCodeGen {
             let params: Vec<String> = func
                 .params
                 .iter()
-                .map(|(id, ty)| format!("{} v{}", Self::c_type(ty), id.0))
+                .map(|(id, ty)| Self::c_param_decl(ty, &format!("v{}", id.0)))
                 .collect();
             wln!(self, "{} {}({});", ret_ty, proto_name, params.join(", "));
         }
@@ -681,7 +931,7 @@ impl CCodeGen {
         let params: Vec<String> = func
             .params
             .iter()
-            .map(|(id, ty)| format!("{} v{}", Self::c_type(ty), id.0))
+            .map(|(id, ty)| Self::c_param_decl(ty, &format!("v{}", id.0)))
             .collect();
 
         wln!(self, "{} {}({}) {{", ret_ty, func_name, params.join(", "));
@@ -917,21 +1167,26 @@ impl CCodeGen {
             Inst::Return { value } => {
                 match value {
                     Some(v) => {
-                        let vn = self.val_name(*v);
-                        let val_ty = func.values.get(v).map(|m| m.ty.clone());
-                        let ret = &self.cur_fn_c_ret_type;
-                        // Cast the return value if its IR type doesn't match
-                        // the C return type (e.g. returning a pointer from an
-                        // int64_t function, or an integer from a pointer
-                        // function).
-                        let val_is_ptr = matches!(val_ty, Some(IrType::Ptr(_)) | Some(IrType::Opaque(_)) | Some(IrType::Generic(_, _)));
-                        let ret_is_ptr = ret == "void*" || ret.starts_with("struct ");
-                        let expr = match (val_is_ptr, ret_is_ptr) {
-                            (true, false) => format!("({}){}", ret, vn),
-                            (false, true) => format!("(void*){}", vn),
-                            _ => vn,
-                        };
-                        wln!(self, "    return {};", expr);
+                        // If the C function returns void, discard the value
+                        if self.cur_fn_c_ret_is_void {
+                            wln!(self, "    return;");
+                        } else {
+                            let vn = self.val_name(*v);
+                            let val_ty = func.values.get(v).map(|m| m.ty.clone());
+                            let ret = &self.cur_fn_c_ret_type;
+                            // Cast the return value if its IR type doesn't match
+                            // the C return type (e.g. returning a pointer from an
+                            // int64_t function, or an integer from a pointer
+                            // function).
+                            let val_is_ptr = matches!(val_ty, Some(IrType::Ptr(_)) | Some(IrType::Opaque(_)) | Some(IrType::Generic(_, _)));
+                            let ret_is_ptr = ret == "void*" || ret.starts_with("struct ");
+                            let expr = match (val_is_ptr, ret_is_ptr) {
+                                (true, false) => format!("({}){}", ret, vn),
+                                (false, true) => format!("(void*){}", vn),
+                                _ => vn,
+                            };
+                            wln!(self, "    return {};", expr);
+                        }
                     }
                     None => {
                         if self.cur_fn_c_ret_is_void {
@@ -1054,12 +1309,22 @@ impl CCodeGen {
                     }
                     return;
                 }
+                // Special-case: p_socket_write is called with 2 args (fd, str) by stdlib
+                // but the C implementation needs 3 args (fd, buf, len)
+                if fname == "p_socket_write" && args.len() == 2 {
+                    let arg0 = self.val_name(args[0]);
+                    let arg1 = self.val_name(args[1]);
+                    wln!(self, "    {} = p_socket_write_str({}, {});", dst, arg0, arg1);
+                    return;
+                }
                 let c_fname = self.sanitize_c_name(fname);
                 // Look up the called function's parameter types so we can
                 // cast arguments to the correct C type (e.g. the hidden
                 // context pointer is passed as I64 0 but the parameter is
                 // void*).
-                let param_types = self.fn_param_types.get(fname);
+                // Check runtime function signatures first, then user functions.
+                let param_types = self.fn_param_types.get(fname)
+                    .or_else(|| self.user_fn_param_types.get(fname));
                 let arg_strs: Vec<String> = args
                     .iter()
                     .enumerate()
@@ -1243,9 +1508,16 @@ impl CCodeGen {
                 dispatch.push_str("    }\n");
                 self.out.push_str(&dispatch);
             }
-            Inst::MakeDyn { type_name, trait_name, .. } => {
-                wln!(self, "    /* make dyn {} as {} */", type_name, trait_name);
-                wln!(self, "    {} = 0; /* MakeDyn not yet supported in C codegen */", dst);
+            Inst::MakeDyn { value, type_name, trait_name, .. } => {
+                let val_str = self.val_name(*value);
+                // Represent dyn as a malloc'd struct: { char* type_name; void* ptr; }
+                // Use raw push_str to avoid {{ escaping in inline struct definition
+                self.out.push_str(&format!("    {{ /* make dyn {} as {} */\n", type_name, trait_name));
+                self.out.push_str("        struct { const char* type_name; void* ptr; }* _dyn = malloc(sizeof(*_dyn));\n");
+                self.out.push_str(&format!("        _dyn->type_name = \"{}\";\n", type_name));
+                self.out.push_str(&format!("        _dyn->ptr = (void*){};\n", val_str));
+                self.out.push_str(&format!("        {} = (void*)_dyn;\n", dst));
+                self.out.push_str("    }\n");
             }
             Inst::DynCall { trait_name, method, args, ret_ty, .. } => {
                 let arg_strs: Vec<String> = args.iter().map(|a| self.val_name(*a)).collect();
@@ -1257,20 +1529,26 @@ impl CCodeGen {
                         .filter(|name| name.ends_with(&format!("_{}", method)))
                         .cloned()
                         .collect();
-                    dispatch.push_str(&format!("    {{ const char* _t = (const char*){};\n", type_arg));
+                    // The first arg is a dyn object: { const char* type_name; void* ptr; }
+                    dispatch.push_str(&format!("    {{ struct {{ const char* type_name; void* ptr; }}* _dyn = (void*){};\n", type_arg));
+                    dispatch.push_str("    const char* _t = _dyn ? _dyn->type_name : \"\";\n");
+                    dispatch.push_str("    void* _recv = _dyn ? _dyn->ptr : NULL;\n");
                     dispatch.push_str("    if (false) {}\n");
                     for cname in &candidates {
                         let type_name = cname.rsplitn(2, '_').nth(1).unwrap_or("");
-                        let call_args = arg_strs[1..].join(", ");
+                        // Pass NULL (ctx) + receiver + remaining args
+                        let mut call_args = vec!["NULL".to_string(), "_recv".to_string()];
+                        call_args.extend(arg_strs[1..].iter().cloned());
+                        let call_args_str = call_args.join(", ");
                         if void_ret {
                             dispatch.push_str(&format!(
                                 "    else if (strcmp(_t, \"{}\") == 0) {}({});\n",
-                                type_name, cname, call_args
+                                type_name, cname, call_args_str
                             ));
                         } else {
                             dispatch.push_str(&format!(
                                 "    else if (strcmp(_t, \"{}\") == 0) {} = {}({});\n",
-                                type_name, dst, cname, call_args
+                                type_name, dst, cname, call_args_str
                             ));
                         }
                     }
@@ -1302,9 +1580,32 @@ impl CCodeGen {
             Inst::TryUnwrap { .. } => {
                 wln!(self, "    // TryUnwrap not implemented in C backend");
             }
-            Inst::Print { value, .. } => {
+            Inst::Print { value, ty, .. } => {
                 let v = self.val_name(*value);
-                wln!(self, "    printf(\"%lld\\n\", (long long){});", v);
+                // Dispatch based on type — print does NOT add a newline
+                match ty {
+                    IrType::F64 => {
+                        wln!(self, "    p_print_float({});", v);
+                    }
+                    IrType::Bool => {
+                        wln!(self, "    p_print_bool({});", v);
+                    }
+                    IrType::Ptr(_) => {
+                        wln!(self, "    p_print_str({});", v);
+                    }
+                    IrType::Generic(name, _) if name == "Vec" => {
+                        wln!(self, "    {{ char* _s = p_to_str_vec((PVec*){}); p_print_str(_s); free(_s); }}", v);
+                    }
+                    IrType::Generic(name, _) if name == "HashMap" => {
+                        wln!(self, "    {{ char* _s = p_to_str_map((PMap*){}); p_print_str(_s); free(_s); }}", v);
+                    }
+                    IrType::Opaque(name) if name == "String" => {
+                        wln!(self, "    p_print_str({});", v);
+                    }
+                    _ => {
+                        wln!(self, "    p_print_int((int64_t){});", v);
+                    }
+                }
             }
             Inst::Panic { message, .. } => {
                 wln!(self, "    fprintf(stderr, \"Panic: {}\\n\"); abort();", message);
@@ -1343,6 +1644,11 @@ impl CCodeGen {
         wln!(self, "void* p_vec_get(PVec* v, int64_t idx) {{");
         wln!(self, "    if (!v || idx < 0 || idx >= v->len) return NULL;");
         wln!(self, "    return v->data[idx];");
+        wln!(self, "}}");
+        wln!(self, "");
+        wln!(self, "void p_vec_set(PVec* v, int64_t idx, void* val) {{");
+        wln!(self, "    if (!v || idx < 0 || idx >= v->len) return;");
+        wln!(self, "    v->data[idx] = val;");
         wln!(self, "}}");
         wln!(self, "");
         wln!(self, "int64_t p_vec_len(PVec* v) {{ return v ? v->len : 0; }}");
@@ -1468,7 +1774,7 @@ impl CCodeGen {
         wln!(self, "    return result;");
         wln!(self, "}}");
         wln!(self, "");
-        wln!(self, "void p_print(int64_t val) { printf(\"%lld\\n\", (long long)val); }");
+        wln!(self, "void p_print(int64_t val) { printf(\"%lld\", (long long)val); }");
         wln!(self, "void p_print_str(const char* s) { printf(\"%s\", s); }");
         wln!(self, "void p_print_int(int64_t val) { printf(\"%lld\", (long long)val); }");
         wln!(self, "void p_print_bool(bool val) { printf(\"%s\", val ? \"true\" : \"false\"); }");
@@ -1482,8 +1788,8 @@ impl CCodeGen {
         wln!(self, "int64_t p_allocator_alloc(void* alloc, int64_t size) { (void)alloc; return (int64_t)(intptr_t)malloc((size_t)size); }");
         wln!(self, "void p_allocator_free(void* alloc, int64_t ptr) { (void)alloc; free((void*)(intptr_t)ptr); }");
         wln!(self, "int64_t p_allocator_stats(void* alloc) { (void)alloc; return 0; }");
-        wln!(self, "int64_t print(int64_t val) { printf(\"%lld\\n\", (long long)val); return 0; }");
-        wln!(self, "int64_t print_str(const char* s) { printf(\"%s\\n\", s); return 0; }");
+        wln!(self, "int64_t print(int64_t val) { printf(\"%lld\", (long long)val); return 0; }");
+        wln!(self, "int64_t print_str(const char* s) { printf(\"%s\", s); return 0; }");
         wln!(self, "");
         // String functions
         wln!(self, "bool p_string_contains(const char* s, const char* sub) {{ return s && sub && strstr(s, sub) != NULL; }}");
@@ -1639,7 +1945,7 @@ impl CCodeGen {
         wln!(self, "    return result;");
         wln!(self, "}}");
         wln!(self, "char* p_to_str_map(PMap* m) {{");
-        wln!(self, "    if (!m) return strdup(\"{{}}\");");
+        wln!(self, "    if (!m) return strdup(\"{}\");");
         wln!(self, "    // Sort keys for deterministic output");
         wln!(self, "    int64_t* order = (int64_t*)malloc(m->len * sizeof(int64_t));");
         wln!(self, "    for (int64_t i = 0; i < m->len; i++) order[i] = i;");
@@ -1742,6 +2048,10 @@ impl CCodeGen {
         wln!(self, "    return (n < 0) ? -1 : (int64_t)n;");
         wln!(self, "}");
         wln!(self, "");
+        wln!(self, "int64_t p_socket_write_str(int64_t fd, const char* buf) {");
+        wln!(self, "    return p_socket_write(fd, buf, strlen(buf));");
+        wln!(self, "}");
+        wln!(self, "");
         wln!(self, "void p_socket_close(int64_t fd) {");
         wln!(self, "#ifdef _WIN32");
         wln!(self, "    closesocket((SOCKET)fd);");
@@ -1757,6 +2067,788 @@ impl CCodeGen {
         wln!(self, "    buf[n] = 0;");
         wln!(self, "    return strdup(buf);");
         wln!(self, "}");
+
+        // ─── Bare metal builtins (Phase 5A) — stubs for C codegen ───
+        wln!(self, "");
+        wln!(self, "// Bare metal stubs — no-ops in C codegen (use --bare for real hardware)");
+        wln!(self, "void p_cli(void) {{}}");
+        wln!(self, "void p_sti(void) {{}}");
+        wln!(self, "void p_hlt(void) {{}}");
+        wln!(self, "int64_t p_cr0_read(void) {{ return 0; }}");
+        wln!(self, "int64_t p_cr3_read(void) {{ return 0; }}");
+        wln!(self, "int64_t p_cr4_read(void) {{ return 0; }}");
+        wln!(self, "void p_cr3_write(int64_t val) {{ (void)val; }}");
+        wln!(self, "void p_invlpg(int64_t addr) {{ (void)addr; }}");
+        wln!(self, "void p_page_map(int64_t cr3, int64_t virt, int64_t phys, int64_t flags) {{ (void)cr3; (void)virt; (void)phys; (void)flags; }}");
+        wln!(self, "void p_page_unmap(int64_t cr3, int64_t virt) {{ (void)cr3; (void)virt; }}");
+        wln!(self, "static int64_t _phys_mem[65536];");
+        wln!(self, "int64_t p_phys_read64(int64_t addr) {{ return _phys_mem[(addr/8) & 65535]; }}");
+        wln!(self, "void p_phys_write64(int64_t addr, int64_t val) {{ _phys_mem[(addr/8) & 65535] = val; }}");
+
+        // ─── SIMD builtins (Phase 5C) — operate on Vec<f64> ───
+        wln!(self, "");
+        wln!(self, "// SIMD builtins — operate on PVec (Vec<f64>)");
+        wln!(self, "// Helper: read double from PVec element (stored as void* via type punning)");
+        self.out.push_str("static double _pvec_get_f64(PVec* v, int i) {\n");
+        self.out.push_str("    if (!v || i < 0 || i >= v->len) return 0;\n");
+        self.out.push_str("    union { void* p; double d; } u; u.p = v->data[i]; return u.d;\n");
+        self.out.push_str("}\n");
+        self.out.push_str("static void _pvec_push_f64(PVec* v, double d) {\n");
+        self.out.push_str("    union { void* p; double d; } u; u.d = d; p_vec_push(v, u.p);\n");
+        self.out.push_str("}\n");
+        wln!(self, "void* p_simd_add(void* a, void* b) {{");
+        wln!(self, "    PVec* va = (PVec*)a; PVec* vb = (PVec*)b; PVec* r = p_vec_new();");
+        wln!(self, "    int n = va ? va->len : 0;");
+        wln!(self, "    for (int i = 0; i < n; i++) _pvec_push_f64(r, _pvec_get_f64(va,i) + _pvec_get_f64(vb,i));");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "void* p_simd_sub(void* a, void* b) {{");
+        wln!(self, "    PVec* va = (PVec*)a; PVec* vb = (PVec*)b; PVec* r = p_vec_new();");
+        wln!(self, "    int n = va ? va->len : 0;");
+        wln!(self, "    for (int i = 0; i < n; i++) _pvec_push_f64(r, _pvec_get_f64(va,i) - _pvec_get_f64(vb,i));");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "void* p_simd_mul(void* a, void* b) {{");
+        wln!(self, "    PVec* va = (PVec*)a; PVec* vb = (PVec*)b; PVec* r = p_vec_new();");
+        wln!(self, "    int n = va ? va->len : 0;");
+        wln!(self, "    for (int i = 0; i < n; i++) _pvec_push_f64(r, _pvec_get_f64(va,i) * _pvec_get_f64(vb,i));");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "void* p_simd_div(void* a, void* b) {{");
+        wln!(self, "    PVec* va = (PVec*)a; PVec* vb = (PVec*)b; PVec* r = p_vec_new();");
+        wln!(self, "    int n = va ? va->len : 0;");
+        wln!(self, "    for (int i = 0; i < n; i++) {{ double db = _pvec_get_f64(vb,i); _pvec_push_f64(r, db != 0 ? _pvec_get_f64(va,i) / db : 0); }}");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "double p_simd_dot(void* a, void* b) {{");
+        wln!(self, "    PVec* va = (PVec*)a; PVec* vb = (PVec*)b;");
+        wln!(self, "    int n = va ? va->len : 0; double s = 0;");
+        wln!(self, "    for (int i = 0; i < n; i++) s += _pvec_get_f64(va,i) * _pvec_get_f64(vb,i);");
+        wln!(self, "    return s;");
+        wln!(self, "}}");
+        wln!(self, "double p_simd_sum(void* a) {{");
+        wln!(self, "    PVec* va = (PVec*)a;");
+        wln!(self, "    int n = va ? va->len : 0; double s = 0;");
+        wln!(self, "    for (int i = 0; i < n; i++) s += _pvec_get_f64(va,i);");
+        wln!(self, "    return s;");
+        wln!(self, "}}");
+        wln!(self, "void* p_simd_scale(void* a, double s) {{");
+        wln!(self, "    PVec* va = (PVec*)a; PVec* r = p_vec_new();");
+        wln!(self, "    int n = va ? va->len : 0;");
+        wln!(self, "    for (int i = 0; i < n; i++) _pvec_push_f64(r, _pvec_get_f64(va,i) * s);");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "void* p_simd_from_vec(void* v) {{ (void)v; return p_vec_new(); }}");
+        wln!(self, "char* p_simd_to_str(void* a) {{");
+        wln!(self, "    PVec* va = (PVec*)a;");
+        wln!(self, "    if (!va) return strdup(\"[]\");");
+        wln!(self, "    size_t cap = 64; char* result = (char*)malloc(cap); size_t pos = 0;");
+        wln!(self, "    result[pos++] = '[';");
+        wln!(self, "    for (int64_t i = 0; i < va->len; i++) {{");
+        wln!(self, "        if (i > 0) {{ if (pos+2>=cap){{cap*=2;result=(char*)realloc(result,cap);}} result[pos++]=','; result[pos++]=' '; }}");
+        wln!(self, "        double d = _pvec_get_f64(va, i);");
+        wln!(self, "        char buf[32];");
+        wln!(self, "        if (d == (int64_t)d) snprintf(buf,sizeof(buf),\"%lld\",(long long)d);");
+        wln!(self, "        else snprintf(buf,sizeof(buf),\"%g\",d);");
+        wln!(self, "        size_t bl=strlen(buf);");
+        wln!(self, "        if (pos+bl+1>=cap){{cap=(cap+bl)*2;result=(char*)realloc(result,cap);}}");
+        wln!(self, "        memcpy(result+pos,buf,bl); pos+=bl;");
+        wln!(self, "    }}");
+        wln!(self, "    if (pos+2>=cap){{cap+=2;result=(char*)realloc(result,cap);}}");
+        wln!(self, "    result[pos++]=']'; result[pos]=0;");
+        wln!(self, "    return result;");
+        wln!(self, "}}");
+
+        // ─── Tensor builtins (Phase 5C) ───
+        wln!(self, "");
+        wln!(self, "// Tensor builtins — simple flat array with shape metadata");
+        wln!(self, "typedef struct { double* data; int64_t len; int64_t ndim; int64_t shape[8]; } PTensor;");
+        wln!(self, "void* p_tensor_new(int64_t ndim, int64_t* shape) {{");
+        wln!(self, "    PTensor* t = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    t->ndim = ndim;");
+        wln!(self, "    t->len = 1;");
+        wln!(self, "    for (int64_t i = 0; i < ndim && i < 8; i++) {{ t->shape[i] = shape[i]; t->len *= shape[i]; }}");
+        wln!(self, "    t->data = (double*)calloc(t->len, sizeof(double));");
+        wln!(self, "    return t;");
+        wln!(self, "}}");
+        wln!(self, "void* p_tensor_from(void* data, int64_t ndim, int64_t* shape) {{");
+        wln!(self, "    (void)data;");
+        wln!(self, "    return p_tensor_new(ndim, shape);");
+        wln!(self, "}}");
+        wln!(self, "double p_tensor_at(void* t, int64_t idx) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t;");
+        wln!(self, "    if (!pt || idx < 0 || idx >= pt->len) return 0;");
+        wln!(self, "    return pt->data[idx];");
+        wln!(self, "}}");
+        wln!(self, "void* p_tensor_add(void* a, void* b) {{");
+        wln!(self, "    PTensor* ta = (PTensor*)a; PTensor* tb = (PTensor*)b;");
+        wln!(self, "    if (!ta || !tb) return NULL;");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = ta->ndim; r->len = ta->len;");
+        wln!(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = ta->shape[i];");
+        wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = ta->data[i] + tb->data[i];");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "void* p_tensor_mul(void* a, void* b) {{");
+        wln!(self, "    PTensor* ta = (PTensor*)a; PTensor* tb = (PTensor*)b;");
+        wln!(self, "    if (!ta || !tb) return NULL;");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = ta->ndim; r->len = ta->len;");
+        wln!(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = ta->shape[i];");
+        wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = ta->data[i] * tb->data[i];");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "void* p_tensor_matmul(void* a, void* b) {{");
+        wln!(self, "    PTensor* ta = (PTensor*)a; PTensor* tb = (PTensor*)b;");
+        wln!(self, "    if (!ta || !tb || ta->ndim < 2 || tb->ndim < 2) return NULL;");
+        wln!(self, "    int64_t M = ta->shape[0], K = ta->shape[1], N = tb->shape[1];");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = 2; r->len = M * N; r->shape[0] = M; r->shape[1] = N;");
+        wln!(self, "    r->data = (double*)calloc(r->len, sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < M; i++)");
+        wln!(self, "        for (int64_t j = 0; j < N; j++)");
+        wln!(self, "            for (int64_t k = 0; k < K; k++)");
+        wln!(self, "                r->data[i*N+j] += ta->data[i*K+k] * tb->data[k*N+j];");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "void* p_tensor_transpose(void* t) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t;");
+        wln!(self, "    if (!pt || pt->ndim < 2) return t;");
+        wln!(self, "    int64_t M = pt->shape[0], N = pt->shape[1];");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = 2; r->len = M * N; r->shape[0] = N; r->shape[1] = M;");
+        wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < M; i++)");
+        wln!(self, "        for (int64_t j = 0; j < N; j++)");
+        wln!(self, "            r->data[j*M+i] = pt->data[i*N+j];");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "void* p_tensor_relu(void* t) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t;");
+        wln!(self, "    if (!pt) return NULL;");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = pt->ndim; r->len = pt->len;");
+        wln!(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = pt->shape[i];");
+        wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = pt->data[i] > 0 ? pt->data[i] : 0;");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "void* p_tensor_softmax(void* t) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t;");
+        wln!(self, "    if (!pt) return NULL;");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = pt->ndim; r->len = pt->len;");
+        wln!(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = pt->shape[i];");
+        wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
+        wln!(self, "    double max = pt->data[0];");
+        wln!(self, "    for (int64_t i = 1; i < pt->len; i++) if (pt->data[i] > max) max = pt->data[i];");
+        wln!(self, "    double sum = 0;");
+        wln!(self, "    for (int64_t i = 0; i < pt->len; i++) {{ r->data[i] = exp(pt->data[i] - max); sum += r->data[i]; }}");
+        wln!(self, "    for (int64_t i = 0; i < pt->len; i++) r->data[i] /= sum;");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_tensor_len(void* t) {{ PTensor* pt = (PTensor*)t; return pt ? pt->len : 0; }}");
+        wln!(self, "int64_t p_tensor_ndim(void* t) {{ PTensor* pt = (PTensor*)t; return pt ? pt->ndim : 0; }}");
+        wln!(self, "void* p_tensor_shape(void* t) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t;");
+        wln!(self, "    PVec* v = (PVec*)p_vec_new();");
+        wln!(self, "    if (pt) for (int64_t i = 0; i < pt->ndim; i++) {{ int64_t d = pt->shape[i]; p_vec_push(v, (void*)d); }}");
+        wln!(self, "    return v;");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_tensor_size(void* t) {{ return p_tensor_len(t); }}");
+        wln!(self, "void* p_tensor_zeros(void* shape_vec) {{");
+        wln!(self, "    PVec* sv = (PVec*)shape_vec;");
+        wln!(self, "    if (!sv) return p_tensor_new(0, NULL);");
+        wln!(self, "    int64_t shape[8]; int64_t ndim = sv->len < 8 ? sv->len : 8;");
+        wln!(self, "    for (int64_t i = 0; i < ndim; i++) shape[i] = (int64_t)sv->data[i];");
+        wln!(self, "    return p_tensor_new(ndim, shape);");
+        wln!(self, "}}");
+        wln!(self, "void* p_tensor_ones(void* shape_vec) {{");
+        wln!(self, "    PVec* sv = (PVec*)shape_vec;");
+        wln!(self, "    if (!sv) return p_tensor_new(0, NULL);");
+        wln!(self, "    int64_t shape[8]; int64_t ndim = sv->len < 8 ? sv->len : 8;");
+        wln!(self, "    for (int64_t i = 0; i < ndim; i++) shape[i] = (int64_t)sv->data[i];");
+        wln!(self, "    PTensor* t = (PTensor*)p_tensor_new(ndim, shape);");
+        wln!(self, "    if (t) for (int64_t i = 0; i < t->len; i++) t->data[i] = 1.0;");
+        wln!(self, "    return t;");
+        wln!(self, "}}");
+        wln!(self, "void* p_tensor_filled(void* shape_vec, double val) {{");
+        wln!(self, "    PVec* sv = (PVec*)shape_vec;");
+        wln!(self, "    if (!sv) return p_tensor_new(0, NULL);");
+        wln!(self, "    int64_t shape[8]; int64_t ndim = sv->len < 8 ? sv->len : 8;");
+        wln!(self, "    for (int64_t i = 0; i < ndim; i++) shape[i] = (int64_t)sv->data[i];");
+        wln!(self, "    PTensor* t = (PTensor*)p_tensor_new(ndim, shape);");
+        wln!(self, "    if (t) for (int64_t i = 0; i < t->len; i++) t->data[i] = val;");
+        wln!(self, "    return t;");
+        wln!(self, "}}");
+        wln!(self, "void* p_tensor_from_vec(void* v, void* shape_vec) {{");
+        wln!(self, "    PVec* sv = (PVec*)shape_vec;");
+        wln!(self, "    if (!sv) return p_tensor_new(0, NULL);");
+        wln!(self, "    int64_t shape[8]; int64_t ndim = sv->len < 8 ? sv->len : 8;");
+        wln!(self, "    for (int64_t i = 0; i < ndim; i++) shape[i] = (int64_t)sv->data[i];");
+        wln!(self, "    PTensor* t = (PTensor*)p_tensor_new(ndim, shape);");
+        wln!(self, "    PVec* pv = (PVec*)v;");
+        wln!(self, "    if (t && pv) for (int64_t i = 0; i < t->len && i < pv->len; i++) t->data[i] = (double)(int64_t)pv->data[i];");
+        wln!(self, "    return t;");
+        wln!(self, "}}");
+        wln!(self, "void* p_tensor_clone(void* t) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t;");
+        wln!(self, "    if (!pt) return NULL;");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = pt->ndim; r->len = pt->len;");
+        wln!(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = pt->shape[i];");
+        wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = pt->data[i];");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "double p_tensor_get(void* t, void* idx_vec) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t;");
+        wln!(self, "    PVec* iv = (PVec*)idx_vec;");
+        wln!(self, "    if (!pt || !iv || iv->len == 0) return 0;");
+        wln!(self, "    int64_t idx = 0;");
+        wln!(self, "    for (int64_t i = 0; i < pt->ndim && i < (int64_t)iv->len; i++) {{");
+        wln!(self, "        int64_t dim = (int64_t)iv->data[i];");
+        wln!(self, "        int64_t stride = 1;");
+        wln!(self, "        for (int64_t j = i+1; j < pt->ndim; j++) stride *= pt->shape[j];");
+        wln!(self, "        idx += dim * stride;");
+        wln!(self, "    }}");
+        wln!(self, "    if (idx < 0 || idx >= pt->len) return 0;");
+        wln!(self, "    return pt->data[idx];");
+        wln!(self, "}}");
+        wln!(self, "void p_tensor_set(void* t, void* idx_vec, double val) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t;");
+        wln!(self, "    PVec* iv = (PVec*)idx_vec;");
+        wln!(self, "    if (!pt || !iv || iv->len == 0) return;");
+        wln!(self, "    int64_t idx = 0;");
+        wln!(self, "    for (int64_t i = 0; i < pt->ndim && i < (int64_t)iv->len; i++) {{");
+        wln!(self, "        int64_t dim = (int64_t)iv->data[i];");
+        wln!(self, "        int64_t stride = 1;");
+        wln!(self, "        for (int64_t j = i+1; j < pt->ndim; j++) stride *= pt->shape[j];");
+        wln!(self, "        idx += dim * stride;");
+        wln!(self, "    }}");
+        wln!(self, "    if (idx < 0 || idx >= pt->len) return;");
+        wln!(self, "    pt->data[idx] = val;");
+        wln!(self, "}}");
+        wln!(self, "void* p_tensor_sub(void* a, void* b) {{");
+        wln!(self, "    PTensor* ta = (PTensor*)a; PTensor* tb = (PTensor*)b;");
+        wln!(self, "    if (!ta || !tb) return NULL;");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = ta->ndim; r->len = ta->len;");
+        wln!(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = ta->shape[i];");
+        wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = ta->data[i] - tb->data[i];");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "void* p_tensor_sigmoid(void* t) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t;");
+        wln!(self, "    if (!pt) return NULL;");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = pt->ndim; r->len = pt->len;");
+        wln!(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = pt->shape[i];");
+        wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = 1.0 / (1.0 + exp(-pt->data[i]));");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "void* p_tensor_scale(void* t, double s) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t;");
+        wln!(self, "    if (!pt) return NULL;");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = pt->ndim; r->len = pt->len;");
+        wln!(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = pt->shape[i];");
+        wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = pt->data[i] * s;");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "double p_tensor_sum(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt) return 0; double s=0; for (int64_t i=0;i<pt->len;i++) s+=pt->data[i]; return s; }}");
+        wln!(self, "double p_tensor_mean(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; return p_tensor_sum(t)/pt->len; }}");
+        wln!(self, "double p_tensor_min(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; double m=pt->data[0]; for (int64_t i=1;i<pt->len;i++) if (pt->data[i]<m) m=pt->data[i]; return m; }}");
+        wln!(self, "double p_tensor_max(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; double m=pt->data[0]; for (int64_t i=1;i<pt->len;i++) if (pt->data[i]>m) m=pt->data[i]; return m; }}");
+        wln!(self, "double p_tensor_dot(void* a, void* b) {{ PTensor* ta=(PTensor*)a; PTensor* tb=(PTensor*)b; if (!ta||!tb) return 0; double s=0; for (int64_t i=0;i<ta->len&&i<tb->len;i++) s+=ta->data[i]*tb->data[i]; return s; }}");
+        wln!(self, "void* p_tensor_reshape(void* t, void* shape_vec) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t; if (!pt) return NULL;");
+        wln!(self, "    PVec* sv = (PVec*)shape_vec;");
+        wln!(self, "    PTensor* r = (PTensor*)p_tensor_clone(t);");
+        wln!(self, "    if (sv) {{");
+        wln!(self, "        r->ndim = sv->len < 8 ? sv->len : 8; r->len = 1;");
+        wln!(self, "        for (int64_t i = 0; i < r->ndim; i++) {{ r->shape[i] = (int64_t)sv->data[i]; r->len *= r->shape[i]; }}");
+        wln!(self, "    }}");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "char* p_tensor_to_json(void* t) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t;");
+        wln!(self, "    if (!pt) return strdup(\"{}\");");
+        wln!(self, "    size_t cap = 128; char* result = (char*)malloc(cap); size_t pos = 0;");
+        wln!(self, "    pos += snprintf(result+pos, cap-pos, \"{\\\"shape\\\":[\");");
+        wln!(self, "    for (int64_t i = 0; i < pt->ndim; i++) {{");
+        wln!(self, "        if (i > 0) pos += snprintf(result+pos, cap-pos, \",\");");
+        wln!(self, "        pos += snprintf(result+pos, cap-pos, \"%lld\", (long long)pt->shape[i]);");
+        wln!(self, "    }}");
+        wln!(self, "    pos += snprintf(result+pos, cap-pos, \"],\\\"data\\\":[\");");
+        wln!(self, "    for (int64_t i = 0; i < pt->len; i++) {{");
+        wln!(self, "        if (i > 0) pos += snprintf(result+pos, cap-pos, \",\");");
+        wln!(self, "        double d = pt->data[i];");
+        wln!(self, "        if (d == (int64_t)d && d < 1e15 && d > -1e15) pos += snprintf(result+pos, cap-pos, \"%lld\", (long long)d);");
+        wln!(self, "        else pos += snprintf(result+pos, cap-pos, \"%g\", d);");
+        wln!(self, "    }}");
+        wln!(self, "    pos += snprintf(result+pos, cap-pos, \"]}\");");
+        wln!(self, "    return result;");
+        wln!(self, "}}");
+        wln!(self, "char* p_tensor_to_str(void* t) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t;");
+        wln!(self, "    if (!pt) return strdup(\"[]\");");
+        wln!(self, "    size_t cap = 128; char* result = (char*)malloc(cap); size_t pos = 0;");
+        wln!(self, "    if (pt->ndim <= 1) {{");
+        wln!(self, "        result[pos++] = '[';");
+        wln!(self, "        for (int64_t i = 0; i < pt->len; i++) {{");
+        wln!(self, "            if (i > 0) {{ if (pos+2>=cap){{cap*=2;result=(char*)realloc(result,cap);}} result[pos++]=','; result[pos++]=' '; }}");
+        wln!(self, "            char buf[32]; snprintf(buf,sizeof(buf),\"%g\",pt->data[i]); size_t bl=strlen(buf);");
+        wln!(self, "            if (pos+bl+1>=cap){{cap=(cap+bl)*2;result=(char*)realloc(result,cap);}}");
+        wln!(self, "            memcpy(result+pos,buf,bl); pos+=bl;");
+        wln!(self, "        }}");
+        wln!(self, "        if (pos+2>=cap){{cap+=2;result=(char*)realloc(result,cap);}}");
+        wln!(self, "        result[pos++]=']'; result[pos]=0;");
+        wln!(self, "        return result;");
+        wln!(self, "    }}");
+        wln!(self, "    // 2D tensor: print as nested brackets");
+        wln!(self, "    int64_t rows = pt->shape[0], cols = pt->ndim >= 2 ? pt->shape[1] : 1;");
+        wln!(self, "    result[pos++] = '[';");
+        wln!(self, "    for (int64_t r = 0; r < rows; r++) {{");
+        wln!(self, "        if (r > 0) {{ if (pos+2>=cap){{cap*=2;result=(char*)realloc(result,cap);}} result[pos++]=','; result[pos++]=' '; }}");
+        wln!(self, "        if (pos+1>=cap){{cap+=2;result=(char*)realloc(result,cap);}} result[pos++]='[';");
+        wln!(self, "        for (int64_t c = 0; c < cols; c++) {{");
+        wln!(self, "            if (c > 0) {{ if (pos+2>=cap){{cap*=2;result=(char*)realloc(result,cap);}} result[pos++]=','; result[pos++]=' '; }}");
+        wln!(self, "            char buf[32]; snprintf(buf,sizeof(buf),\"%g\",pt->data[r*cols+c]); size_t bl=strlen(buf);");
+        wln!(self, "            if (pos+bl+1>=cap){{cap=(cap+bl)*2;result=(char*)realloc(result,cap);}}");
+        wln!(self, "            memcpy(result+pos,buf,bl); pos+=bl;");
+        wln!(self, "        }}");
+        wln!(self, "        if (pos+1>=cap){{cap+=2;result=(char*)realloc(result,cap);}} result[pos++]=']';");
+        wln!(self, "    }}");
+        wln!(self, "    if (pos+2>=cap){{cap+=2;result=(char*)realloc(result,cap);}}");
+        wln!(self, "    result[pos++]=']'; result[pos]=0;");
+        wln!(self, "    return result;");
+        wln!(self, "}}");
+
+        // ─── JSON builtins (Phase 5D) — simple JSON implementation ───
+        wln!(self, "");
+        wln!(self, "// JSON builtins — simple key-value store");
+        wln!(self, "typedef struct { char** keys; char** vals; int64_t len; int64_t cap; int64_t is_array; } PJson;");
+        wln!(self, "static char* _json_dump_obj(PJson* pj); // forward decl");
+        wln!(self, "void _json_append(PJson* j, const char* key, const char* val) {{");
+        wln!(self, "    if (j->len >= j->cap) {{ j->cap = j->cap == 0 ? 8 : j->cap * 2; j->keys = (char**)realloc(j->keys, j->cap * sizeof(char*)); j->vals = (char**)realloc(j->vals, j->cap * sizeof(char*)); }}");
+        wln!(self, "    j->keys[j->len] = key ? strdup(key) : strdup(\"\"); j->vals[j->len] = val ? strdup(val) : strdup(\"\"); j->len++;");
+        wln!(self, "}}");
+        wln!(self, "char* p_json_parse(const char* s) {{");
+        wln!(self, "    if (!s) return strdup(\"\");");
+        wln!(self, "    // Simple JSON parser: extracts string and number values");
+        wln!(self, "    PJson* j = (PJson*)p_json_new_object();");
+        wln!(self, "    const char* p = s;");
+        wln!(self, "    while (*p) {{");
+        wln!(self, "        // Skip whitespace and structural chars");
+        wln!(self, "        while (*p && *p != '\"' && *p != '-' && (*p < '0' || *p > '9') && *p != 't' && *p != 'f' && *p != 'n') p++;");
+        wln!(self, "        if (!*p) break;");
+        wln!(self, "        // Try to parse a key (string followed by colon)");
+        wln!(self, "        if (*p == '\"' && p > s && p[-1] != ':') {{");
+        wln!(self, "            p++; const char* kstart = p;");
+        wln!(self, "            while (*p && *p != '\"') p++;");
+        wln!(self, "            size_t klen = p - kstart;");
+        wln!(self, "            if (*p) p++;");
+        wln!(self, "            // Skip whitespace and colon");
+        wln!(self, "            while (*p && *p != ':') p++;");
+        wln!(self, "            if (*p) p++;");
+        wln!(self, "            while (*p == ' ' || *p == '\\t') p++;");
+        wln!(self, "            // Parse value");
+        wln!(self, "            char* key = (char*)malloc(klen+1); memcpy(key, kstart, klen); key[klen] = 0;");
+        wln!(self, "            if (*p == '\"') {{");
+        wln!(self, "                p++; const char* vstart = p;");
+        wln!(self, "                while (*p && *p != '\"') p++;");
+        wln!(self, "                size_t vlen = p - vstart;");
+        wln!(self, "                if (*p) p++;");
+        wln!(self, "                char* val = (char*)malloc(vlen+1); memcpy(val, vstart, vlen); val[vlen] = 0;");
+        wln!(self, "                _json_append(j, key, val); free(key); free(val);");
+        wln!(self, "            }} else if (*p == 't') {{");
+        wln!(self, "                _json_append(j, key, \"true\"); free(key); p += 4;");
+        wln!(self, "            }} else if (*p == 'f') {{");
+        wln!(self, "                _json_append(j, key, \"false\"); free(key); p += 5;");
+        wln!(self, "            }} else if (*p == 'n') {{");
+        wln!(self, "                _json_append(j, key, \"null\"); free(key); p += 4;");
+        wln!(self, "            }} else {{");
+        wln!(self, "                const char* vstart = p;");
+        wln!(self, "                while (*p && *p != ',' && *p != '}' && *p != ']' && *p != ' ') p++;");
+        wln!(self, "                size_t vlen = p - vstart;");
+        wln!(self, "                char* val = (char*)malloc(vlen+1); memcpy(val, vstart, vlen); val[vlen] = 0;");
+        wln!(self, "                _json_append(j, key, val); free(key); free(val);");
+        wln!(self, "            }}");
+        wln!(self, "        }} else {{");
+        wln!(self, "            p++;");
+        wln!(self, "        }}");
+        wln!(self, "    }}");
+        wln!(self, "    char* result = _json_dump_obj(j);");
+        wln!(self, "    return result;");
+        wln!(self, "}}");
+        wln!(self, "void* p_json_new_object(void) {{");
+        wln!(self, "    PJson* j = (PJson*)malloc(sizeof(PJson));");
+        wln!(self, "    j->keys = NULL; j->vals = NULL; j->len = 0; j->cap = 0; j->is_array = 0;");
+        wln!(self, "    return j;");
+        wln!(self, "}}");
+        wln!(self, "void* p_json_new_array(void) {{");
+        wln!(self, "    PJson* j = (PJson*)p_json_new_object(); j->is_array = 1; return j;");
+        wln!(self, "}}");
+        wln!(self, "void p_json_set(void* j, const char* key, const char* val) {{ _json_append((PJson*)j, key, val); }}");
+        wln!(self, "void p_json_set_int(void* j, const char* key, int64_t val) {{ char buf[32]; snprintf(buf,sizeof(buf),\"%lld\",(long long)val); _json_append((PJson*)j, key, buf); }}");
+        wln!(self, "void p_json_set_float(void* j, const char* key, double val) {{ char buf[32]; snprintf(buf,sizeof(buf),\"%g\",val); _json_append((PJson*)j, key, buf); }}");
+        wln!(self, "void p_json_set_bool(void* j, const char* key, int64_t val) {{ _json_append((PJson*)j, key, val ? \"true\" : \"false\"); }}");
+        wln!(self, "void p_json_append(void* j, const char* val) {{ _json_append((PJson*)j, NULL, val); }}");
+        wln!(self, "void p_json_append_int(void* j, int64_t val) {{ char buf[32]; snprintf(buf,sizeof(buf),\"%lld\",(long long)val); _json_append((PJson*)j, NULL, buf); }}");
+        wln!(self, "void p_json_append_float(void* j, double val) {{ char buf[32]; snprintf(buf,sizeof(buf),\"%g\",val); _json_append((PJson*)j, NULL, buf); }}");
+        wln!(self, "// Internal: dump PJson object to string (sorted keys, no quotes on numbers/bools)");
+        wln!(self, "static char* _json_dump_obj(PJson* pj) {{");
+        wln!(self, "    if (!pj) return strdup(\"{}\");");
+        wln!(self, "    // Sort keys (simple insertion sort) for objects");
+        wln!(self, "    if (!pj->is_array) {{");
+        wln!(self, "        for (int64_t i = 1; i < pj->len; i++) {{");
+        wln!(self, "            char* k = pj->keys[i]; char* v = pj->vals[i];");
+        wln!(self, "            int64_t j = i - 1;");
+        wln!(self, "            while (j >= 0 && strcmp(pj->keys[j], k) > 0) {{ pj->keys[j+1] = pj->keys[j]; pj->vals[j+1] = pj->vals[j]; j--; }}");
+        wln!(self, "            pj->keys[j+1] = k; pj->vals[j+1] = v;");
+        wln!(self, "        }}");
+        wln!(self, "    }}");
+        wln!(self, "    size_t cap = 64; char* result = (char*)malloc(cap); size_t pos = 0;");
+        wln!(self, "    result[pos++] = pj->is_array ? '[' : '{';");
+        wln!(self, "    for (int64_t i = 0; i < pj->len; i++) {{");
+        wln!(self, "        if (i > 0) {{ if (pos+1>=cap){{cap*=2;result=(char*)realloc(result,cap);}} result[pos++]=','; }}");
+        wln!(self, "        if (!pj->is_array) {{ size_t kl=strlen(pj->keys[i]); if (pos+kl+4>=cap){{cap=(cap+kl)*2;result=(char*)realloc(result,cap);}} result[pos++]='\"'; memcpy(result+pos,pj->keys[i],kl); pos+=kl; result[pos++]='\"'; result[pos++]=':'; }}");
+        wln!(self, "        // Don't quote numbers, booleans, null");
+        wln!(self, "        const char* v = pj->vals[i];");
+        wln!(self, "        bool is_numeric = (*v >= '0' && *v <= '9') || *v == '-';");
+        wln!(self, "        bool is_bool = strcmp(v, \"true\") == 0 || strcmp(v, \"false\") == 0;");
+        wln!(self, "        bool is_null = strcmp(v, \"null\") == 0;");
+        wln!(self, "        bool need_quotes = !is_numeric && !is_bool && !is_null;");
+        wln!(self, "        size_t vl=strlen(v); if (pos+vl+3>=cap){{cap=(cap+vl)*2;result=(char*)realloc(result,cap);}}");
+        wln!(self, "        if (need_quotes) {{ result[pos++]='\"'; memcpy(result+pos,v,vl); pos+=vl; result[pos++]='\"'; }}");
+        wln!(self, "        else {{ memcpy(result+pos,v,vl); pos+=vl; }}");
+        wln!(self, "    }}");
+        wln!(self, "    if (pos+2>=cap){{cap+=2;result=(char*)realloc(result,cap);}}");
+        wln!(self, "    result[pos++] = pj->is_array ? ']' : '}'; result[pos] = 0;");
+        wln!(self, "    return result;");
+        wln!(self, "}}");
+        wln!(self, "// User-facing: parse JSON string and re-dump in canonical form");
+        wln!(self, "char* p_json_dump(void* j) {{");
+        wln!(self, "    return p_json_parse((const char*)j);");
+        wln!(self, "}}");
+        wln!(self, "char* p_json_dump_pretty(void* j) {{ return p_json_dump(j); }}");
+        wln!(self, "char* p_json_pretty(void* j) {{");
+        wln!(self, "    // Pretty-print with 2-space indentation (canonicalize first)");
+        wln!(self, "    char* canonical = p_json_parse((const char*)j);");
+        wln!(self, "    const char* s = canonical;");
+        wln!(self, "    if (!s) return strdup(\"\");");
+        wln!(self, "    size_t cap = strlen(s) * 4 + 64; char* result = (char*)malloc(cap); size_t pos = 0;");
+        wln!(self, "    int indent = 0; bool in_str = false;");
+        wln!(self, "    while (*s) {{");
+        wln!(self, "        if (*s == '\"' && (s == (const char*)j || s[-1] != '\\\\')) in_str = !in_str;");
+        wln!(self, "        if (!in_str) {{");
+        wln!(self, "            if (*s == '{' || *s == '[') {{");
+        wln!(self, "                result[pos++] = *s++; result[pos++] = '\\n';");
+        wln!(self, "                indent++;");
+        wln!(self, "                for (int i = 0; i < indent*2; i++) result[pos++] = ' ';");
+        wln!(self, "                continue;");
+        wln!(self, "            }}");
+        wln!(self, "            if (*s == '}' || *s == ']') {{");
+        wln!(self, "                result[pos++] = '\\n'; indent--;");
+        wln!(self, "                for (int i = 0; i < indent*2; i++) result[pos++] = ' ';");
+        wln!(self, "                result[pos++] = *s++;");
+        wln!(self, "                continue;");
+        wln!(self, "            }}");
+        wln!(self, "            if (*s == ',') {{");
+        wln!(self, "                result[pos++] = *s++; result[pos++] = '\\n';");
+        wln!(self, "                for (int i = 0; i < indent*2; i++) result[pos++] = ' ';");
+        wln!(self, "                continue;");
+        wln!(self, "            }}");
+        wln!(self, "            if (*s == ':') {{ result[pos++] = *s++; result[pos++] = ' '; continue; }}");
+        wln!(self, "        }}");
+        wln!(self, "        if (pos >= cap-1) {{ cap *= 2; result = (char*)realloc(result, cap); }}");
+        wln!(self, "        result[pos++] = *s++;");
+        wln!(self, "    }}");
+        wln!(self, "    result[pos] = 0;");
+        wln!(self, "    return result;");
+        wln!(self, "}}");
+        wln!(self, "char* p_json_string(void* j) {{");
+        wln!(self, "    // Serialize a plain string as a JSON string literal (with quotes + escaping)");
+        wln!(self, "    const char* s = (const char*)j;");
+        wln!(self, "    if (!s) return strdup(\"\\\"\\\"\");");
+        wln!(self, "    size_t cap = strlen(s) * 2 + 4; char* result = (char*)malloc(cap); size_t pos = 0;");
+        wln!(self, "    result[pos++] = '\"';");
+        wln!(self, "    while (*s) {{");
+        wln!(self, "        if (*s == '\"' || *s == '\\\\') {{ if (pos >= cap-2) {{ cap *= 2; result = (char*)realloc(result, cap); }} result[pos++] = '\\\\'; }}");
+        wln!(self, "        if (*s == '\\n') {{ if (pos >= cap-2) {{ cap *= 2; result = (char*)realloc(result, cap); }} result[pos++] = '\\\\'; result[pos++] = 'n'; s++; continue; }}");
+        wln!(self, "        if (pos >= cap-1) {{ cap *= 2; result = (char*)realloc(result, cap); }}");
+        wln!(self, "        result[pos++] = *s++;");
+        wln!(self, "    }}");
+        wln!(self, "    result[pos++] = '\"'; result[pos] = 0;");
+        wln!(self, "    return result;");
+        wln!(self, "}}");
+        wln!(self, "const char* p_json_type(void* j) {{");
+        wln!(self, "    const char* s = (const char*)j;");
+        wln!(self, "    if (!s) return \"null\";");
+        wln!(self, "    while (*s == ' ') s++;");
+        wln!(self, "    if (*s == '{') return \"object\";");
+        wln!(self, "    if (*s == '[') return \"array\";");
+        wln!(self, "    if (*s == '\"') return \"string\";");
+        wln!(self, "    if (*s == 't' || *s == 'f') return \"boolean\";");
+        wln!(self, "    if (*s == 'n') return \"null\";");
+        wln!(self, "    return \"number\";");
+        wln!(self, "}}");
+        wln!(self, "char* p_json_get(void* j, const char* key) {{");
+        wln!(self, "    const char* s = (const char*)j;");
+        wln!(self, "    if (!s || !key) return strdup(\"null\");");
+        wln!(self, "    char pattern[256]; snprintf(pattern, sizeof(pattern), \"\\\"%s\\\":\", key);");
+        wln!(self, "    const char* found = strstr(s, pattern);");
+        wln!(self, "    if (!found) return strdup(\"null\");");
+        wln!(self, "    found += strlen(pattern);");
+        wln!(self, "    while (*found == ' ') found++;");
+        wln!(self, "    // Return the raw JSON value (with quotes for strings, as json::dump would)");
+        wln!(self, "    if (*found == '\"') {{");
+        wln!(self, "        // String value — return with quotes (handle escaped quotes)");
+        wln!(self, "        const char* end = found + 1;");
+        wln!(self, "        while (*end) {{ if (*end == '\\\\' && end[1]) end += 2; else if (*end == '\"') break; else end++; }}");
+        wln!(self, "        size_t len = end - found + 1; // include closing quote");
+        wln!(self, "        char* result = (char*)malloc(len+1); memcpy(result, found, len); result[len] = 0;");
+        wln!(self, "        return result;");
+        wln!(self, "    }}");
+        wln!(self, "    if (*found == '{' || *found == '[') {{");
+        wln!(self, "        // Nested object/array — find matching close brace");
+        wln!(self, "        char open = *found; char close = open == '{' ? '}' : ']';");
+        wln!(self, "        int depth = 1; const char* end = found + 1;");
+        wln!(self, "        while (*end && depth > 0) {{");
+        wln!(self, "            if (*end == open) depth++;");
+        wln!(self, "            if (*end == close) depth--;");
+        wln!(self, "            if (depth > 0) end++;");
+        wln!(self, "        }}");
+        wln!(self, "        size_t len = end - found + 1;");
+        wln!(self, "        char* result = (char*)malloc(len+1); memcpy(result, found, len); result[len] = 0;");
+        wln!(self, "        // Canonicalize by parsing and re-dumping");
+        wln!(self, "        char* canonical = p_json_parse(result); free(result);");
+        wln!(self, "        return canonical;");
+        wln!(self, "    }}");
+        wln!(self, "    // Number, boolean, or null");
+        wln!(self, "    const char* end = found;");
+        wln!(self, "    while (*end && *end != ',' && *end != '}' && *end != ']' && *end != ' ') end++;");
+        wln!(self, "    size_t len = end - found;");
+        wln!(self, "    char* result = (char*)malloc(len+1); memcpy(result, found, len); result[len] = 0;");
+        wln!(self, "    return result;");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_json_get_int(void* j, const char* key) {{ char* v = p_json_get(j, key); int64_t r = atoll(v); free(v); return r; }}");
+        wln!(self, "double p_json_get_float(void* j, const char* key) {{ char* v = p_json_get(j, key); double r = atof(v); free(v); return r; }}");
+        wln!(self, "int64_t p_json_get_bool(void* j, const char* key) {{ char* v = p_json_get(j, key); int64_t r = strcmp(v, \"true\") == 0; free(v); return r; }}");
+        wln!(self, "void* p_json_at(void* j, int64_t idx) {{");
+        wln!(self, "    const char* s = (const char*)j;");
+        wln!(self, "    if (!s || idx < 0) return strdup(\"null\");");
+        wln!(self, "    // Find array start");
+        wln!(self, "    while (*s && *s != '[') s++;");
+        wln!(self, "    if (*s != '[') return strdup(\"null\");");
+        wln!(self, "    s++; // skip '['");
+        wln!(self, "    int64_t cur = 0;");
+        wln!(self, "    while (*s) {{");
+        wln!(self, "        while (*s == ' ' || *s == '\\t') s++;");
+        wln!(self, "        if (*s == ']' || !*s) return strdup(\"null\");");
+        wln!(self, "        if (cur == idx) {{");
+        wln!(self, "            // Found the element — extract it");
+        wln!(self, "            if (*s == '\"') {{");
+        wln!(self, "                const char* end = s + 1;");
+        wln!(self, "                while (*end && *end != '\"') end++;");
+        wln!(self, "                size_t len = end - s + 1; // include closing quote");
+        wln!(self, "                char* result = (char*)malloc(len+1); memcpy(result, s, len); result[len] = 0;");
+        wln!(self, "                return result;");
+        wln!(self, "            }}");
+        wln!(self, "            const char* end = s;");
+        wln!(self, "            while (*end && *end != ',' && *end != ']') end++;");
+        wln!(self, "            size_t len = end - s;");
+        wln!(self, "            char* result = (char*)malloc(len+1); memcpy(result, s, len); result[len] = 0;");
+        wln!(self, "            return result;");
+        wln!(self, "        }}");
+        wln!(self, "        // Skip this element");
+        wln!(self, "        if (*s == '\"') {{");
+        wln!(self, "            s++; while (*s && *s != '\"') s++; if (*s) s++;");
+        wln!(self, "        }} else {{");
+        wln!(self, "            while (*s && *s != ',' && *s != ']') s++;");
+        wln!(self, "        }}");
+        wln!(self, "        if (*s == ',') s++;");
+        wln!(self, "        cur++;");
+        wln!(self, "    }}");
+        wln!(self, "    return strdup(\"null\");");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_json_len(void* j) {{");
+        wln!(self, "    const char* s = (const char*)j;");
+        wln!(self, "    if (!s) return 0;");
+        wln!(self, "    int64_t count = 0; int depth = 0; bool in_str = false;");
+        wln!(self, "    while (*s) {{");
+        wln!(self, "        if (*s == '\"' && (s == (const char*)j || s[-1] != '\\\\')) in_str = !in_str;");
+        wln!(self, "        if (!in_str) {{");
+        wln!(self, "            if (*s == '{' || *s == '[') depth++;");
+        wln!(self, "            if (*s == '}' || *s == ']') depth--;");
+        wln!(self, "            if (*s == ',' && depth == 1) count++;");
+        wln!(self, "        }}");
+        wln!(self, "        s++;");
+        wln!(self, "    }}");
+        wln!(self, "    return count + 1;");
+        wln!(self, "}}");
+        wln!(self, "void* p_json_object_get(void* j, const char* key) {{ return p_json_get(j, key); }}");
+
+        // ─── HTTP builtins (Phase 5D) ───
+        wln!(self, "");
+        wln!(self, "int64_t p_http_listen(int64_t port) {{ return p_socket_listen(port); }}");
+        wln!(self, "char* p_http_recv_request(int64_t fd) {{ return p_socket_recv_str(fd); }}");
+        wln!(self, "void p_http_send_response(int64_t fd, int64_t status, const char* body) {{");
+        wln!(self, "    char header[256];");
+        wln!(self, "    snprintf(header, sizeof(header), \"HTTP/1.1 %lld OK\\r\\nContent-Type: text/plain\\r\\nContent-Length: %zu\\r\\n\\r\\n\", (long long)status, strlen(body));");
+        wln!(self, "    p_socket_write(fd, header, strlen(header));");
+        wln!(self, "    p_socket_write(fd, body, strlen(body));");
+        wln!(self, "}}");
+        wln!(self, "char* p_http_build_response(int64_t status, const char* content_type, const char* body) {{");
+        wln!(self, "    (void)content_type;");
+        wln!(self, "    size_t blen = strlen(body);");
+        wln!(self, "    char* resp = (char*)malloc(blen + 256);");
+        wln!(self, "    snprintf(resp, blen+256, \"HTTP/1.1 %lld OK\\r\\nContent-Length: %zu\\r\\n\\r\\n%s\", (long long)status, blen, body);");
+        wln!(self, "    return resp;");
+        wln!(self, "}}");
+        wln!(self, "char* p_http_parse_request(const char* request) {{");
+        wln!(self, "    if (!request) return strdup(\"{}\");");
+        wln!(self, "    // Parse request line: METHOD PATH HTTP/VERSION");
+        wln!(self, "    const char* p = request;");
+        wln!(self, "    const char* line_end = strstr(p, \"\\r\\n\");");
+        wln!(self, "    if (!line_end) line_end = p + strlen(p);");
+        wln!(self, "    // Extract method");
+        wln!(self, "    const char* sp1 = strchr(p, ' ');");
+        wln!(self, "    char method[16] = {{0}};");
+        wln!(self, "    if (sp1 && sp1 < line_end) {{ size_t ml = sp1 - p; if (ml > 15) ml = 15; memcpy(method, p, ml); }}");
+        wln!(self, "    // Extract path");
+        wln!(self, "    const char* path_start = sp1 ? sp1 + 1 : p;");
+        wln!(self, "    const char* sp2 = strchr(path_start, ' ');");
+        wln!(self, "    char path[1024] = {{0}};");
+        wln!(self, "    if (sp2 && sp2 < line_end) {{ size_t pl = sp2 - path_start; if (pl > 1023) pl = 1023; memcpy(path, path_start, pl); }}");
+        wln!(self, "    // Extract version");
+        wln!(self, "    const char* ver_start = sp2 ? sp2 + 1 : p;");
+        wln!(self, "    char version[16] = {{0}};");
+        wln!(self, "    if (ver_start < line_end) {{ size_t vl = line_end - ver_start; if (vl > 15) vl = 15; memcpy(version, ver_start, vl); }}");
+        wln!(self, "    // Strip HTTP/ prefix");
+        wln!(self, "    const char* v = version;");
+        wln!(self, "    if (strncmp(v, \"HTTP/\", 5) == 0) v += 5;");
+        wln!(self, "    // Parse headers until empty line");
+        wln!(self, "    p = line_end + 2; // skip \\r\\n");
+        wln!(self, "    size_t cap = 1024; char* result = (char*)malloc(cap); size_t pos = 0;");
+        wln!(self, "    pos += snprintf(result+pos, cap-pos, \"{\\\"method\\\":\\\"%s\\\",\\\"path\\\":\\\"%s\\\",\\\"version\\\":\\\"%s\\\",\\\"headers\\\":{\", method, path, v);");
+        wln!(self, "    int first_hdr = 1;");
+        wln!(self, "    while (*p) {{");
+        wln!(self, "        const char* next_line = strstr(p, \"\\r\\n\");");
+        wln!(self, "        if (!next_line) break;");
+        wln!(self, "        if (next_line == p) {{ p += 2; break; }} // empty line = end of headers");
+        wln!(self, "        // Find colon");
+        wln!(self, "        const char* colon = strchr(p, ':');");
+        wln!(self, "        if (colon && colon < next_line) {{");
+        wln!(self, "            size_t kl = colon - p;");
+        wln!(self, "            const char* val_start = colon + 1;");
+        wln!(self, "            while (*val_start == ' ') val_start++;");
+        wln!(self, "            size_t vl = next_line - val_start;");
+        wln!(self, "            if (!first_hdr) pos += snprintf(result+pos, cap-pos, \",\");");
+        wln!(self, "            first_hdr = 0;");
+        wln!(self, "            if (pos + kl + vl + 10 >= cap) {{ cap = (cap + kl + vl) * 2; result = (char*)realloc(result, cap); }}");
+        wln!(self, "            result[pos++] = '\"'; memcpy(result+pos, p, kl); pos += kl; result[pos++] = '\"'; result[pos++] = ':'; result[pos++] = '\"'; memcpy(result+pos, val_start, vl); pos += vl; result[pos++] = '\"';");
+        wln!(self, "        }}");
+        wln!(self, "        p = next_line + 2;");
+        wln!(self, "    }}");
+        wln!(self, "    pos += snprintf(result+pos, cap-pos, \"},\\\"body\\\":\\\"\");");
+        wln!(self, "    // Extract body (everything after the empty line) and escape for JSON");
+        wln!(self, "    if (*p) {{");
+        wln!(self, "        while (*p) {{");
+        wln!(self, "            if (pos >= cap-2) {{ cap *= 2; result = (char*)realloc(result, cap); }}");
+        wln!(self, "            if (*p == '\"') {{ result[pos++] = '\\\\'; result[pos++] = '\"'; }}");
+        wln!(self, "            else if (*p == '\\\\') {{ result[pos++] = '\\\\'; result[pos++] = '\\\\'; }}");
+        wln!(self, "            else if (*p == '\\n') {{ result[pos++] = '\\\\'; result[pos++] = 'n'; }}");
+        wln!(self, "            else if (*p == '\\r') {{ result[pos++] = '\\\\'; result[pos++] = 'r'; }}");
+        wln!(self, "            else if (*p == '\\t') {{ result[pos++] = '\\\\'; result[pos++] = 't'; }}");
+        wln!(self, "            else result[pos++] = *p;");
+        wln!(self, "            p++;");
+        wln!(self, "        }}");
+        wln!(self, "    }}");
+        wln!(self, "    pos += snprintf(result+pos, cap-pos, \"\\\"}\");");
+        wln!(self, "    return result;");
+        wln!(self, "}}");
+
+        // ─── DB builtins (Phase 5D) ───
+        wln!(self, "");
+        wln!(self, "// DB builtins — in-memory key-value store");
+        wln!(self, "typedef struct { char** keys; char** vals; int64_t len; int64_t cap; } PDB;");
+        wln!(self, "void* p_db_connect(const char* conn_str) {{");
+        wln!(self, "    (void)conn_str;");
+        wln!(self, "    PDB* db = (PDB*)malloc(sizeof(PDB));");
+        wln!(self, "    db->keys = NULL; db->vals = NULL; db->len = 0; db->cap = 0;");
+        wln!(self, "    return db;");
+        wln!(self, "}}");
+        wln!(self, "void p_db_exec(void* db, const char* query) {{ (void)db; (void)query; }}");
+        wln!(self, "void* p_db_query(void* db, const char* query) {{ (void)query; return db; }}");
+        wln!(self, "char* p_db_get(void* db, const char* key) {{");
+        wln!(self, "    PDB* pdb = (PDB*)db;");
+        wln!(self, "    if (!pdb) return strdup(\"\");");
+        wln!(self, "    for (int64_t i = 0; i < pdb->len; i++) if (strcmp(pdb->keys[i], key) == 0) return strdup(pdb->vals[i]);");
+        wln!(self, "    return strdup(\"\");");
+        wln!(self, "}}");
+        wln!(self, "void p_db_set(void* db, const char* key, const char* val) {{");
+        wln!(self, "    PDB* pdb = (PDB*)db;");
+        wln!(self, "    if (!pdb) return;");
+        wln!(self, "    for (int64_t i = 0; i < pdb->len; i++) if (strcmp(pdb->keys[i], key) == 0) {{ free(pdb->vals[i]); pdb->vals[i] = strdup(val); return; }}");
+        wln!(self, "    if (pdb->len >= pdb->cap) {{ pdb->cap = pdb->cap == 0 ? 8 : pdb->cap * 2; pdb->keys = (char**)realloc(pdb->keys, pdb->cap * sizeof(char*)); pdb->vals = (char**)realloc(pdb->vals, pdb->cap * sizeof(char*)); }}");
+        wln!(self, "    pdb->keys[pdb->len] = strdup(key); pdb->vals[pdb->len] = strdup(val); pdb->len++;");
+        wln!(self, "}}");
+        // ─── Memory DB implementation ───
+        self.out.push_str("typedef struct { char** keys; char** vals; int64_t len; int64_t cap; } PMemDB;\n");
+        wln!(self, "void* p_db_mem_open(void) {{");
+        wln!(self, "    PMemDB* db = (PMemDB*)calloc(1, sizeof(PMemDB));");
+        wln!(self, "    return db;");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_db_mem_exec(void* db, const char* query) {{");
+        wln!(self, "    PMemDB* mdb = (PMemDB*)db;");
+        wln!(self, "    if (!mdb || !query) return 0;");
+        wln!(self, "    const char* p = query;");
+        wln!(self, "    while (*p == ' ') p++;");
+        wln!(self, "    char cmd[16] = {{0}}; int ci = 0;");
+        wln!(self, "    while (*p && *p != ' ' && ci < 15) cmd[ci++] = tolower(*p++);");
+        wln!(self, "    while (*p == ' ') p++;");
+        wln!(self, "    const char* kstart = p;");
+        wln!(self, "    while (*p && *p != ' ') p++;");
+        wln!(self, "    size_t klen = p - kstart;");
+        wln!(self, "    while (*p == ' ') p++;");
+        wln!(self, "    const char* vstart = p;");
+        wln!(self, "    while (*p) p++;");
+        wln!(self, "    size_t vlen = p - vstart;");
+        wln!(self, "    if ((strcmp(cmd, \"insert\") == 0 || strcmp(cmd, \"set\") == 0) && klen > 0) {{");
+        wln!(self, "        if (mdb->len >= mdb->cap) {{ mdb->cap = mdb->cap ? mdb->cap*2 : 8; mdb->keys = (char**)realloc(mdb->keys, mdb->cap*sizeof(char*)); mdb->vals = (char**)realloc(mdb->vals, mdb->cap*sizeof(char*)); }}");
+        wln!(self, "        mdb->keys[mdb->len] = (char*)malloc(klen+1); memcpy(mdb->keys[mdb->len], kstart, klen); mdb->keys[mdb->len][klen] = 0;");
+        wln!(self, "        mdb->vals[mdb->len] = (char*)malloc(vlen+1); memcpy(mdb->vals[mdb->len], vstart, vlen); mdb->vals[mdb->len][vlen] = 0;");
+        wln!(self, "        mdb->len++;");
+        wln!(self, "        return 1;");
+        wln!(self, "    }}");
+        wln!(self, "    return 0;");
+        wln!(self, "}}");
+        wln!(self, "char* p_db_mem_query(void* db, const char* query) {{");
+        wln!(self, "    (void)query;");
+        wln!(self, "    PMemDB* mdb = (PMemDB*)db;");
+        wln!(self, "    if (!mdb) return strdup(\"[]\");");
+        wln!(self, "    size_t cap = 64; char* result = (char*)malloc(cap); size_t pos = 0;");
+        wln!(self, "    result[pos++] = '[';");
+        wln!(self, "    for (int64_t i = 0; i < mdb->len; i++) {{");
+        wln!(self, "        if (i > 0) result[pos++] = ',';");
+        wln!(self, "        size_t kl = strlen(mdb->keys[i]);");
+        wln!(self, "        if (pos+kl+4 >= cap) {{ cap = (cap+kl)*2; result = (char*)realloc(result, cap); }}");
+        wln!(self, "        result[pos++] = '\"'; memcpy(result+pos, mdb->keys[i], kl); pos += kl; result[pos++] = '\"';");
+        wln!(self, "    }}");
+        wln!(self, "    result[pos++] = ']'; result[pos] = 0;");
+        wln!(self, "    return result;");
+        wln!(self, "}}");
+        wln!(self, "void p_db_mem_close(void* db) {{");
+        wln!(self, "    PMemDB* mdb = (PMemDB*)db;");
+        wln!(self, "    if (mdb) {{ for (int64_t i = 0; i < mdb->len; i++) {{ free(mdb->keys[i]); free(mdb->vals[i]); }} free(mdb->keys); free(mdb->vals); free(mdb); }}");
+        wln!(self, "}}");
     }
 }
 

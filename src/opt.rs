@@ -153,6 +153,14 @@ pub fn optimize_l2_with(module: &mut L2Module, passes: &[Pass], max_iters: usize
             break;
         }
     }
+    // Final cleanup: topologically sort all block instruction lists so that
+    // definitions come before uses. Optimization passes (especially inlining
+    // and CSE) can scramble the order.
+    for f in &mut module.functions {
+        for b in &mut f.blocks {
+            topo_sort_block(b, &f.values);
+        }
+    }
     stats
 }
 
@@ -822,8 +830,95 @@ pub fn pass_inline(module: &mut L2Module) -> usize {
             break;
         }
         count += pass;
+        // After each inlining round, topologically sort block instruction
+        // lists so that all definitions come before uses.
+        for f in &mut module.functions {
+            for b in &mut f.blocks {
+                topo_sort_block(b, &f.values);
+            }
+        }
     }
     count
+}
+
+/// Topologically sort a block's instruction list so that every value is
+/// defined before it is used. This is needed after inlining, which can
+/// insert instructions at positions that violate SSA ordering.
+fn topo_sort_block(b: &mut L2Block, values: &HashMap<PValue, L2Inst>) {
+    use std::collections::HashSet;
+
+    let insts: Vec<PValue> = b.instructions.clone();
+    if insts.is_empty() {
+        return;
+    }
+
+    // Build dependency graph: for each instruction, which other instructions
+    // in this block must come before it?
+    let inst_set: HashSet<PValue> = insts.iter().copied().collect();
+    let mut deps: HashMap<PValue, HashSet<PValue>> = HashMap::new();
+    for &id in &insts {
+        if let Some(inst) = values.get(&id) {
+            let refs: HashSet<PValue> = value_refs(inst)
+                .into_iter()
+                .filter(|r| inst_set.contains(r))
+                .collect();
+            // Terminators (Return, Jump, Branch, Unreachable) must come last.
+            // We model this by making them depend on ALL other instructions.
+            let is_terminator = matches!(inst,
+                L2Inst::Return { .. } | L2Inst::Jump { .. }
+                | L2Inst::Branch { .. } | L2Inst::Unreachable
+            );
+            let final_deps = if is_terminator {
+                inst_set.iter().filter(|&&x| x != id).copied().collect()
+            } else {
+                refs
+            };
+            deps.insert(id, final_deps);
+        } else {
+            deps.insert(id, HashSet::new());
+        }
+    }
+
+    // Original position for stable ordering.
+    let pos: HashMap<PValue, usize> = insts.iter().enumerate()
+        .map(|(i, &id)| (id, i)).collect();
+
+    // Kahn's algorithm: repeatedly pick the instruction with all deps
+    // satisfied and the lowest original position.
+    let mut visited: HashSet<PValue> = HashSet::new();
+    let mut result: Vec<PValue> = Vec::new();
+
+    while result.len() < insts.len() {
+        // Find all instructions whose deps are all visited.
+        let mut ready: Vec<PValue> = insts.iter()
+            .filter(|&&id| !visited.contains(&id))
+            .filter(|&&id| deps.get(&id).map(|d| d.iter().all(|dep| visited.contains(dep))).unwrap_or(true))
+            .copied()
+            .collect();
+
+        if ready.is_empty() {
+            // Cycle detected — append remaining in original order.
+            for &id in &insts {
+                if !visited.contains(&id) {
+                    result.push(id);
+                    visited.insert(id);
+                }
+            }
+            break;
+        }
+
+        // Sort by original position for stability.
+        ready.sort_by_key(|id| pos.get(id).copied().unwrap_or(usize::MAX));
+
+        // Pick the first ready instruction.
+        let id = ready[0];
+        visited.insert(id);
+        result.push(id);
+    }
+
+    if result.len() == insts.len() {
+        b.instructions = result;
+    }
 }
 
 const MAX_INLINE_BLOCKS: usize = 3;
@@ -881,7 +976,7 @@ fn recurses_directly(f: &L2Function) -> bool {
 fn inline_into(caller: &mut L2Function, eligible: &HashMap<String, L2Function>) -> usize {
     let mut count = 0;
     // Find call sites to inline. We collect them first to avoid mutating
-    // while iterating.
+    // while iterating. Sort by ID to process in a deterministic order.
     let mut sites: Vec<(PValue, String, Vec<PValue>, IrType)> = Vec::new();
     for (id, inst) in &caller.values {
         if let L2Inst::Call { func, args, ret_ty } = inst {
@@ -890,17 +985,187 @@ fn inline_into(caller: &mut L2Function, eligible: &HashMap<String, L2Function>) 
             }
         }
     }
+    // Sort by call ID (ascending) so inner calls (which typically have lower
+    // IDs since they appear earlier in the block) are inlined first.
+    sites.sort_by_key(|(id, _, _, _)| id.0);
+
+    // Track all replacements (old_id → new_id) so we can fix up references
+    // in instructions created by later inlining.
+    let mut all_replacements: HashMap<PValue, PValue> = HashMap::new();
 
     for (call_id, callee_name, args, ret_ty) in sites {
+        // Skip if this call was already removed (e.g., it was inlined as part
+        // of another call's argument resolution).
+        if !caller.values.contains_key(&call_id) {
+            continue;
+        }
+        // Fix up args: if an arg was already replaced by a previous inlining,
+        // use the replacement.
+        let fixed_args: Vec<PValue> = args.iter()
+            .map(|a| *all_replacements.get(a).unwrap_or(a))
+            .collect();
         let callee = match eligible.get(&callee_name) {
             Some(c) => c.clone(),
             None => continue,
         };
-        if inline_call_site(caller, call_id, &callee, &args, ret_ty) {
+        if let Some(ret) = inline_call_site_tracked(caller, call_id, &callee, &fixed_args, ret_ty, &all_replacements) {
+            all_replacements.insert(call_id, ret);
             count += 1;
         }
     }
     count
+}
+
+/// Like inline_call_site but also applies prior replacements to the inlined
+/// instructions, and returns the return value ID.
+fn inline_call_site_tracked(
+    caller: &mut L2Function,
+    call_id: PValue,
+    callee: &L2Function,
+    args: &[PValue],
+    ret_ty: IrType,
+    prior_replacements: &HashMap<PValue, PValue>,
+) -> Option<PValue> {
+    // ─── Simple case: single-block callee with straight-line code ───
+    if callee.blocks.len() == 1 {
+        return inline_single_block_tracked(caller, call_id, callee, args, ret_ty, prior_replacements);
+    }
+    // Multi-block: use the existing implementation (less common, no tracking needed
+    // for the common case).
+    if inline_multi_block(caller, call_id, callee, args, ret_ty) {
+        // We don't track the return value for multi-block; return None to
+        // indicate we couldn't track it. This is conservative.
+        None
+    } else {
+        None
+    }
+}
+
+/// Single-block inlining with prior replacement tracking.
+fn inline_single_block_tracked(
+    caller: &mut L2Function,
+    call_id: PValue,
+    callee: &L2Function,
+    args: &[PValue],
+    _ret_ty: IrType,
+    prior_replacements: &HashMap<PValue, PValue>,
+) -> Option<PValue> {
+    let max_id = caller.values.keys().map(|v| v.0).max().unwrap_or(0);
+    let mut next_id = max_id + 1;
+    let mut value_map: HashMap<PValue, PValue> = HashMap::new();
+
+    // Bind parameters: callee param → caller argument value.
+    for (i, (param_pv, _)) in callee.params.iter().enumerate() {
+        if let Some(arg) = args.get(i) {
+            value_map.insert(*param_pv, *arg);
+        }
+    }
+
+    // Find which caller block contains the call.
+    let call_block_id = caller.blocks.iter()
+        .find(|b| b.instructions.contains(&call_id))
+        .map(|b| b.id);
+    let call_block_id = match call_block_id {
+        Some(b) => b,
+        None => return None,
+    };
+
+    // Clone callee instructions, remap operands, collect them.
+    let mut new_insts: Vec<(PValue, L2Inst)> = Vec::new();
+    let mut return_value: Option<PValue> = None;
+
+    for &callee_inst_id in &callee.blocks[0].instructions {
+        let callee_inst = match callee.values.get(&callee_inst_id) {
+            Some(i) => i.clone(),
+            None => continue,
+        };
+        let new_id = ValueId(next_id);
+        next_id += 1;
+        value_map.insert(callee_inst_id, new_id);
+        let mut remapped = callee_inst.clone();
+        remap_inst(&mut remapped, &value_map, &HashMap::new());
+        // Also apply prior replacements (from earlier inlining in this pass).
+        for (_, inst) in &mut new_insts {
+            apply_replacements(inst, prior_replacements);
+        }
+        if let L2Inst::Return { value: Some(rv) } = &remapped {
+            // Apply prior replacements to the return value too.
+            return_value = Some(*prior_replacements.get(rv).unwrap_or(rv));
+            continue;
+        }
+        if let L2Inst::Return { value: None } = &remapped {
+            return_value = None;
+            continue;
+        }
+        // Apply prior replacements to this instruction's operands.
+        apply_replacements(&mut remapped, prior_replacements);
+        new_insts.push((new_id, remapped));
+    }
+
+    let return_value = match return_value {
+        Some(v) => v,
+        None => {
+            caller.values.insert(call_id, L2Inst::ConstInt { value: 0, ty: _ret_ty.clone() });
+            return None;
+        }
+    };
+
+    // Insert the inlined instructions into the caller's value map.
+    for (id, inst) in &new_insts {
+        caller.values.insert(*id, inst.clone());
+    }
+
+    // Replace all references to call_id with return_value.
+    replace_all_refs(caller, call_id, return_value);
+
+    // Splice into the block: replace call_id in the instruction list with
+    // the new instruction ids.
+    let block = caller.blocks.iter_mut().find(|b| b.id == call_block_id).unwrap();
+    let call_idx = block.instructions.iter().position(|&v| v == call_id);
+    if let Some(idx) = call_idx {
+        block.instructions.remove(idx);
+        for (i, (id, _)) in new_insts.iter().enumerate() {
+            block.instructions.insert(idx + i, *id);
+        }
+    }
+
+    caller.values.remove(&call_id);
+    Some(return_value)
+}
+
+/// Apply a replacement map to an instruction's operands.
+fn apply_replacements(inst: &mut L2Inst, replacements: &HashMap<PValue, PValue>) {
+    fn r(v: &mut PValue, reps: &HashMap<PValue, PValue>) {
+        if let Some(new) = reps.get(v) {
+            *v = *new;
+        }
+    }
+    match inst {
+        L2Inst::BinOp { left, right, .. } => { r(left, replacements); r(right, replacements); }
+        L2Inst::UnaryOp { operand, .. } => r(operand, replacements),
+        L2Inst::Load { ptr, .. } => r(ptr, replacements),
+        L2Inst::Store { ptr, value } => { r(ptr, replacements); r(value, replacements); }
+        L2Inst::GetFieldPtr { struct_ptr, .. } => r(struct_ptr, replacements),
+        L2Inst::GetElemPtr { array_ptr, index, .. } => { r(array_ptr, replacements); r(index, replacements); }
+        L2Inst::Branch { cond, .. } => r(cond, replacements),
+        L2Inst::Return { value: Some(v) } => r(v, replacements),
+        L2Inst::Call { args, .. } | L2Inst::DynCall { args, .. } => {
+            for a in args { r(a, replacements); }
+        }
+        L2Inst::CallPtr { fn_ptr, args, .. } => {
+            r(fn_ptr, replacements);
+            for a in args { r(a, replacements); }
+        }
+        L2Inst::MakeDyn { value, .. } => r(value, replacements),
+        L2Inst::BitCast { value, .. }
+        | L2Inst::IntExtend { value, .. }
+        | L2Inst::IntTrunc { value, .. }
+        | L2Inst::IntToFloat { value, .. }
+        | L2Inst::FloatToInt { value, .. } => r(value, replacements),
+        L2Inst::TryUnwrap { value, ok_dst, .. } => { r(value, replacements); r(ok_dst, replacements); }
+        L2Inst::Print { value, .. } => r(value, replacements),
+        _ => {}
+    }
 }
 
 /// Inline `callee` at the call site that produces `call_id`. The call's
@@ -913,8 +1178,121 @@ fn inline_call_site(
     args: &[PValue],
     ret_ty: IrType,
 ) -> bool {
-    // Map callee PValues -> fresh PValues in the caller. We pick fresh ids
-    // above the caller's current max.
+    // ─── Simple case: single-block callee with straight-line code ───
+    // This is the common case for small helpers like `add(a,b) { a + b }`.
+    // We inline the instructions directly into the call site's block,
+    // replacing the call with the return value. No new blocks needed.
+    if callee.blocks.len() == 1 {
+        return inline_single_block(caller, call_id, callee, args, ret_ty);
+    }
+
+    // ─── Multi-block case: proper block splitting ───
+    inline_multi_block(caller, call_id, callee, args, ret_ty)
+}
+
+/// Inline a single-block callee. The callee's instructions (minus the return)
+/// are inserted into the caller's value map, and the call is replaced with
+/// the return value. All instructions go into the caller's block that contained
+/// the call site.
+fn inline_single_block(
+    caller: &mut L2Function,
+    call_id: PValue,
+    callee: &L2Function,
+    args: &[PValue],
+    _ret_ty: IrType,
+) -> bool {
+    let max_id = caller.values.keys().map(|v| v.0).max().unwrap_or(0);
+    let mut next_id = max_id + 1;
+    let mut value_map: HashMap<PValue, PValue> = HashMap::new();
+
+    // Bind parameters: callee param → caller argument value.
+    for (i, (param_pv, _)) in callee.params.iter().enumerate() {
+        if let Some(arg) = args.get(i) {
+            value_map.insert(*param_pv, *arg);
+        }
+    }
+
+    // Find which caller block contains the call.
+    let call_block_id = caller.blocks.iter()
+        .find(|b| b.instructions.contains(&call_id))
+        .map(|b| b.id);
+    let call_block_id = match call_block_id {
+        Some(b) => b,
+        None => return false,
+    };
+
+    // Clone callee instructions, remap operands, collect them.
+    let mut new_insts: Vec<(PValue, L2Inst)> = Vec::new();
+    let mut return_value: Option<PValue> = None;
+
+    for &callee_inst_id in &callee.blocks[0].instructions {
+        let callee_inst = match callee.values.get(&callee_inst_id) {
+            Some(i) => i.clone(),
+            None => continue,
+        };
+        let new_id = ValueId(next_id);
+        next_id += 1;
+        value_map.insert(callee_inst_id, new_id);
+        let mut remapped = callee_inst.clone();
+        remap_inst(&mut remapped, &value_map, &HashMap::new());
+        if let L2Inst::Return { value: Some(rv) } = &remapped {
+            return_value = Some(*rv);
+            continue;
+        }
+        if let L2Inst::Return { value: None } = &remapped {
+            return_value = None;
+            continue;
+        }
+        new_insts.push((new_id, remapped));
+    }
+
+    let return_value = match return_value {
+        Some(v) => v,
+        None => {
+            // Void return: replace call with const 0.
+            caller.values.insert(call_id, L2Inst::ConstInt { value: 0, ty: _ret_ty.clone() });
+            return false; // Don't inline void functions with side effects for now
+        }
+    };
+
+    // Insert the inlined instructions into the caller's value map.
+    for (id, inst) in &new_insts {
+        caller.values.insert(*id, inst.clone());
+    }
+
+    // Replace the call instruction in the block's instruction list with
+    // the inlined instructions, followed by a reference to the return value.
+    // We use replace_all_refs to point call_id → return_value, then
+    // splice the new instructions into the block where the call was.
+    replace_all_refs(caller, call_id, return_value);
+
+    // Splice into the block: replace call_id in the instruction list with
+    // the new instruction ids.
+    let block = caller.blocks.iter_mut().find(|b| b.id == call_block_id).unwrap();
+    let call_idx = block.instructions.iter().position(|&v| v == call_id);
+    if let Some(idx) = call_idx {
+        // Remove the call from the instruction list.
+        block.instructions.remove(idx);
+        // Insert the new instructions at the same position.
+        for (i, (id, _)) in new_insts.iter().enumerate() {
+            block.instructions.insert(idx + i, *id);
+        }
+    }
+
+    // Remove the call from the value map.
+    caller.values.remove(&call_id);
+
+    true
+}
+
+/// Inline a multi-block callee with proper block splitting.
+fn inline_multi_block(
+    caller: &mut L2Function,
+    call_id: PValue,
+    callee: &L2Function,
+    args: &[PValue],
+    ret_ty: IrType,
+) -> bool {
     let max_id = caller.values.keys().map(|v| v.0).max().unwrap_or(0);
     let max_block = caller.blocks.iter().map(|b| b.id.0).max().unwrap_or(0);
     let mut value_map: HashMap<PValue, PValue> = HashMap::new();
@@ -925,7 +1303,6 @@ fn inline_call_site(
     // Bind parameters.
     for (i, (param_pv, _)) in callee.params.iter().enumerate() {
         if let Some(arg) = args.get(i) {
-            // The argument value flows directly; no copy needed.
             value_map.insert(*param_pv, *arg);
         }
     }
@@ -936,10 +1313,19 @@ fn inline_call_site(
         next_block += 1;
     }
 
+    // Find which caller block contains the call.
+    let call_block_id = caller.blocks.iter()
+        .find(|b| b.instructions.contains(&call_id))
+        .map(|b| b.id);
+    let call_block_id = match call_block_id {
+        Some(b) => b,
+        None => return false,
+    };
+
     // Clone callee instructions into the caller with remapped ids/operands.
-    // We collect (caller_block, caller_id, remapped_inst) tuples.
     let mut new_insts: Vec<(PBlock, PValue, L2Inst)> = Vec::new();
     let mut return_value: Option<PValue> = None;
+    let first_inlined_block = block_map[&callee.blocks[0].id];
 
     for b in &callee.blocks {
         let caller_block = block_map[&b.id];
@@ -948,7 +1334,6 @@ fn inline_call_site(
                 Some(i) => i.clone(),
                 None => continue,
             };
-            // The call's result id is reused for the callee's return value.
             let new_id = ValueId(next_id);
             next_id += 1;
             value_map.insert(callee_inst_id, new_id);
@@ -956,8 +1341,6 @@ fn inline_call_site(
             remap_inst(&mut remapped, &value_map, &block_map);
             if let L2Inst::Return { value: Some(rv) } = &remapped {
                 return_value = Some(*rv);
-                // Don't emit the return as an instruction; the call site
-                // continues in the caller.
                 continue;
             }
             if let L2Inst::Return { value: None } = &remapped {
@@ -971,35 +1354,98 @@ fn inline_call_site(
     let return_value = match return_value {
         Some(v) => v,
         None => {
-            // Callee returns void; the call's result is unused. Replace the
-            // call with a no-op constant of the right type so downstream
-            // references still resolve.
-            caller.values.insert(
-                call_id,
-                L2Inst::ConstInt {
-                    value: 0,
-                    ty: ret_ty.clone(),
-                },
-            );
-            // Still splice in the callee body for side effects.
-            splice_blocks(caller, &new_insts, call_id);
-            return true;
+            caller.values.insert(call_id, L2Inst::ConstInt { value: 0, ty: ret_ty.clone() });
+            return false;
         }
     };
 
-    // Replace the call instruction itself with a copy of the return value.
-    // The cleanest SSA rewrite: make `call_id` an alias of `return_value` by
-    // replacing all references to `call_id` with `return_value`, then drop
-    // the call instruction.
+    // Insert the inlined instructions into the caller's value map.
+    for (_, id, inst) in &new_insts {
+        caller.values.insert(*id, inst.clone());
+    }
+
+    // Replace all references to call_id with return_value.
     replace_all_refs(caller, call_id, return_value);
+
+    // Split the call site block: instructions before the call stay in the
+    // original block, then jump to the first inlined block. Instructions
+    // after the call go to a continuation block.
+    let block = caller.blocks.iter_mut().find(|b| b.id == call_block_id).unwrap();
+    let call_idx = block.instructions.iter().position(|&v| v == call_id).unwrap();
+    let after_call: Vec<PValue> = block.instructions.split_off(call_idx);
+    // Remove the call itself from after_call.
+    let after_call = if !after_call.is_empty() && after_call[0] == call_id {
+        after_call[1..].to_vec()
+    } else {
+        after_call
+    };
+
+    // Add a jump to the first inlined block at the end of the call site block.
+    let jump_id = ValueId(next_id);
+    next_id += 1;
+    caller.values.insert(jump_id, L2Inst::Jump { target: first_inlined_block });
+    block.instructions.push(jump_id);
+
+    // Create a continuation block for instructions after the call.
+    let cont_block_id = BlockId(next_block);
+    let mut cont_block = L2Block {
+        id: cont_block_id,
+        instructions: after_call,
+        predecessors: Vec::new(),
+        params: Vec::new(),
+    };
+    caller.blocks.push(cont_block);
+
+    // Now fix up the inlined blocks: any block that had a Return should now
+    // jump to the continuation block instead.
+    for (_, id, inst) in &new_insts {
+        // Returns were already extracted as return_value; the blocks that
+        // contained returns now need a jump to the continuation block.
+        // We check if the block's instruction list ends without a terminator.
+    }
+
+    // Append the inlined blocks to the caller.
+    let mut blocks: HashMap<PBlock, Vec<PValue>> = HashMap::new();
+    let mut block_order: Vec<PBlock> = Vec::new();
+    for (bid, id, _) in &new_insts {
+        if !blocks.contains_key(bid) {
+            block_order.push(*bid);
+        }
+        blocks.entry(*bid).or_default().push(*id);
+    }
+
+    for bid in block_order {
+        let insts = &blocks[&bid];
+        if let Some(existing) = caller.blocks.iter_mut().find(|b| b.id == bid) {
+            for id in insts {
+                existing.instructions.push(*id);
+            }
+        } else {
+            let mut block = L2Block {
+                id: bid,
+                instructions: insts.clone(),
+                predecessors: Vec::new(),
+                params: Vec::new(),
+            };
+            // If this block's last instruction is not a terminator, add a
+            // jump to the continuation block.
+            let needs_terminator = match insts.last().and_then(|id| caller.values.get(id)) {
+                Some(L2Inst::Jump { .. }) | Some(L2Inst::Branch { .. }) | Some(L2Inst::Return { .. }) | Some(L2Inst::Unreachable) => false,
+                _ => true,
+            };
+            if needs_terminator {
+                let jid = ValueId(next_id);
+                next_id += 1;
+                caller.values.insert(jid, L2Inst::Jump { target: cont_block_id });
+                block.instructions.push(jid);
+            }
+            caller.blocks.push(block);
+        }
+    }
+
+    // Remove the call from the value map.
     caller.values.remove(&call_id);
 
-    // Splice the inlined blocks into the caller. The block that contained
-    // the call gets its instruction list split: instructions before the call
-    // stay, then a jump to the first inlined block; inlined blocks are
-    // appended; the inlined blocks' terminator jumps back to a continuation
-    // block holding the instructions after the call.
-    splice_blocks(caller, &new_insts, return_value);
     true
 }
 
@@ -1058,53 +1504,6 @@ fn remap_inst(inst: &mut L2Inst, value_map: &HashMap<PValue, PValue>, block_map:
         }
         L2Inst::Print { value, .. } => *value = rv(*value, value_map),
         _ => {}
-    }
-}
-
-/// Splice inlined blocks into the caller. This is a simplified splice: we
-/// append the inlined blocks to the caller's block list. A full splice would
-/// split the original call-site block; for the bootstrap we keep the call's
-/// block intact (minus the call) and let the inlined blocks follow, with the
-/// first inlined block becoming the new continuation. This is conservative
-/// but correct: control flow reaches the inlined blocks via the remapped
-/// jump targets, and the original block's terminator (now possibly a Jump to
-/// the first inlined block) wires them in.
-fn splice_blocks(caller: &mut L2Function, new_insts: &[(PBlock, PValue, L2Inst)], _ret: PValue) {
-    // Group instructions by block.
-    let mut blocks: HashMap<PBlock, Vec<(PValue, L2Inst)>> = HashMap::new();
-    let mut block_order: Vec<PBlock> = Vec::new();
-    for (bid, id, inst) in new_insts {
-        if !blocks.contains_key(bid) {
-            block_order.push(*bid);
-        }
-        blocks.entry(*bid).or_default().push((*id, inst.clone()));
-    }
-
-    // Insert instructions into the caller's value map.
-    for (bid, id, inst) in new_insts {
-        caller.values.insert(*id, inst.clone());
-        let _ = bid;
-    }
-
-    // Append new blocks (or merge into existing if the id already exists).
-    for bid in block_order {
-        let insts = &blocks[&bid];
-        if let Some(existing) = caller.blocks.iter_mut().find(|b| b.id == bid) {
-            for (id, _) in insts {
-                existing.instructions.push(*id);
-            }
-        } else {
-            let mut block = L2Block {
-                id: bid,
-                instructions: Vec::new(),
-                predecessors: Vec::new(),
-                params: Vec::new(),
-            };
-            for (id, _) in insts {
-                block.instructions.push(*id);
-            }
-            caller.blocks.push(block);
-        }
     }
 }
 
@@ -2267,15 +2666,18 @@ mod tests {
         pass_dce(&mut l2);
         let after = l2.functions.iter().find(|f| f.name == "main").unwrap().values.len();
         assert_eq!(before, after, "DCE must not remove side-effecting call");
-        let has_print_call = l2
+        let has_print = l2
             .functions
             .iter()
             .find(|f| f.name == "main")
             .unwrap()
             .values
             .values()
-            .any(|i| matches!(i, L2Inst::Call { func, .. } if func == "print" || func.starts_with("p_print")));
-        assert!(has_print_call, "print call must survive DCE");
+            .any(|i| {
+                matches!(i, L2Inst::Print { .. })
+                    || matches!(i, L2Inst::Call { func, .. } if func == "print" || func.starts_with("p_print"))
+            });
+        assert!(has_print, "print must survive DCE");
     }
 
     #[test]
