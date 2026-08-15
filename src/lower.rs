@@ -1021,6 +1021,15 @@ impl Lowerer {
                     self.lower_stmt(s);
                 }
             }
+            Stmt::GradBlock { body, .. } => {
+                // The autograd transform happens later; lower the body as normal statements.
+                for s in body {
+                    self.lower_stmt(s);
+                }
+            }
+            Stmt::Backward { .. } => {
+                // Marker for the autograd pass — emit nothing here.
+            }
         }
     }
 
@@ -1824,6 +1833,14 @@ impl Lowerer {
                     });
                 }
 
+                // GPU kernel builtins: thread_id(dim), workgroup_size(dim), etc.
+                // On CPU, these return 0 (single-threaded fallback).
+                // On GPU, they map to SPIR-V/PTX builtins.
+                if callee == "thread_id" || callee == "workgroup_size" || callee == "workgroup_id" || callee == "num_workgroups" {
+                    // Return 0 as a placeholder for CPU execution
+                    return self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                }
+
                 // Special case: print() builtin — emit as Inst::Print (not Inst::Call)
                 // so the codegen can route to p_print_int/p_print_str/etc.
                 if callee == "print" && !arg_vals.is_empty() {
@@ -2261,7 +2278,129 @@ impl Lowerer {
                 self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 })
             }
 
-            Expr::StructLit { name, fields } => {
+            Expr::OptionalFieldAccess { expr, field } => {
+                // `expr?.field` — if expr is None, return 0; else unwrap and access field.
+                // The expression is an Option (struct { tag: i64, value: i64 }).
+                // If Some (tag 0), the value (field 1) is a pointer to the struct.
+                // If None (tag 1), return 0.
+                let option_ptr = self.lower_expr(expr);
+
+                // Allocate result slot
+                let result_slot = self.emit_inst(Inst::Alloca {
+                    ty: IrType::I64,
+                    region: self.current_region(),
+                });
+
+                // Load the tag (field 0)
+                let tag_ptr = self.emit_inst(Inst::GetFieldPtr {
+                    struct_ptr: option_ptr,
+                    field_index: 0,
+                    field_ty: IrType::I64,
+                });
+                let tag = self.emit_inst(Inst::Load {
+                    ptr: tag_ptr,
+                    ty: IrType::I64,
+                });
+
+                let some_block = self.new_block();
+                let none_block = self.new_block();
+                let merge_block = self.new_block();
+
+                let zero_val = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                let is_some = self.emit_inst(Inst::BinOp {
+                    op: BinOp::Eq,
+                    left: tag,
+                    right: zero_val,
+                    ty: IrType::Bool,
+                });
+
+                self.emit_terminator(Inst::Branch {
+                    cond: is_some,
+                    then: some_block,
+                    else_: none_block,
+                });
+
+                // Some: load the value (field 1 = struct pointer), then access field
+                self.set_current_block(some_block);
+                let val_ptr = self.emit_inst(Inst::GetFieldPtr {
+                    struct_ptr: option_ptr,
+                    field_index: 1,
+                    field_ty: IrType::I64,
+                });
+                let struct_ptr = self.emit_inst(Inst::Load {
+                    ptr: val_ptr,
+                    ty: IrType::I64,
+                });
+
+                // Now access the field on the struct pointer
+                // Try to find the struct layout — we need to infer the struct type
+                // For now, use the struct name from the field access context
+                let field_val = if let Some(ref mut f) = self.current_func {
+                    // Try to find the struct type from the option's metadata
+                    // This is a simplification — in a full implementation, we'd track types
+                    // through the option. For now, search for a struct that has this field.
+                    let mut found = None;
+                    for (name, layout) in &self.module.struct_layouts {
+                        if layout.fields.iter().any(|(n, _, _)| n == field) {
+                            found = Some(name.clone());
+                            break;
+                        }
+                    }
+                    if let Some(struct_name) = found {
+                        if let Some(layout) = self.module.get_struct(&struct_name).cloned() {
+                            if let Some((idx, (_, field_ty, _))) = layout.fields.iter()
+                                .enumerate()
+                                .find(|(_, (n, _, _))| n == field)
+                            {
+                                let field_ptr = self.emit_inst(Inst::GetFieldPtr {
+                                    struct_ptr,
+                                    field_index: idx as u32,
+                                    field_ty: field_ty.clone(),
+                                });
+                                if matches!(field_ty, IrType::Struct(_)) {
+                                    field_ptr
+                                } else {
+                                    self.emit_inst(Inst::Load {
+                                        ptr: field_ptr,
+                                        ty: field_ty.clone(),
+                                    })
+                                }
+                            } else {
+                                self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 })
+                            }
+                        } else {
+                            self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 })
+                        }
+                    } else {
+                        self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 })
+                    }
+                } else {
+                    self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 })
+                };
+
+                self.emit_inst(Inst::Store {
+                    ptr: result_slot,
+                    value: field_val,
+                });
+                self.emit_terminator(Inst::Jump { target: merge_block });
+
+                // None: store 0 to result
+                self.set_current_block(none_block);
+                self.emit_inst(Inst::Store {
+                    ptr: result_slot,
+                    value: zero_val,
+                });
+                self.emit_terminator(Inst::Jump { target: merge_block });
+
+                // Merge: load result
+                self.set_current_block(merge_block);
+                self.emit_inst(Inst::Load {
+                    ptr: result_slot,
+                    ty: IrType::I64,
+                })
+            }
+
+            Expr::StructLit { name, fields, spread } => {
                 // Resolve type alias to actual struct name
                 let real_name = self.resolve_struct_name(name);
                 // Allocate struct on stack, store fields
@@ -2271,7 +2410,39 @@ impl Lowerer {
                     region: self.current_region(),
                 });
 
-                // Store each field
+                // If there's a spread source, copy all fields from it first
+                if let Some(spread_expr) = spread {
+                    let src_ptr = self.lower_expr(spread_expr);
+                    let layout_clone = self.module.get_struct(&real_name).cloned();
+                    if let Some(layout) = layout_clone {
+                        for (idx, (_, field_ty, _)) in layout.fields.iter().enumerate() {
+                            let field_ptr = self.emit_inst(Inst::GetFieldPtr {
+                                struct_ptr: ptr,
+                                field_index: idx as u32,
+                                field_ty: field_ty.clone(),
+                            });
+                            let src_field_ptr = self.emit_inst(Inst::GetFieldPtr {
+                                struct_ptr: src_ptr,
+                                field_index: idx as u32,
+                                field_ty: field_ty.clone(),
+                            });
+                            if let IrType::Struct(ref field_struct_name) = field_ty {
+                                self.emit_struct_copy(src_field_ptr, field_ptr, field_struct_name);
+                            } else {
+                                let val = self.emit_inst(Inst::Load {
+                                    ptr: src_field_ptr,
+                                    ty: field_ty.clone(),
+                                });
+                                self.emit_inst(Inst::Store {
+                                    ptr: field_ptr,
+                                    value: val,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Store each explicit field (overrides spread values)
                 let layout_clone = self.module.get_struct(&real_name).cloned();
                 if let Some(layout) = layout_clone {
                     for (field_name, field_expr) in fields {
@@ -2759,6 +2930,82 @@ impl Lowerer {
                 })
             }
 
+            Expr::Coalesce { expr, default } => {
+                // ?? operator: expr ?? default
+                // Option is modeled as struct { tag: i64, value: i64 }
+                // tag 0 = Some, tag 1 = None
+                // If Some, load value; if None, evaluate default
+                let val = self.lower_expr(expr);
+
+                // Allocate a temp slot for the result
+                let result_slot = self.emit_inst(Inst::Alloca {
+                    ty: IrType::I64,
+                    region: self.current_region(),
+                });
+
+                // Load the tag (field 0)
+                let tag_ptr = self.emit_inst(Inst::GetFieldPtr {
+                    struct_ptr: val,
+                    field_index: 0,
+                    field_ty: IrType::I64,
+                });
+                let tag = self.emit_inst(Inst::Load {
+                    ptr: tag_ptr,
+                    ty: IrType::I64,
+                });
+
+                let some_block = self.new_block();
+                let none_block = self.new_block();
+                let merge_block = self.new_block();
+
+                let zero_val = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                let is_some = self.emit_inst(Inst::BinOp {
+                    op: BinOp::Eq,
+                    left: tag,
+                    right: zero_val,
+                    ty: IrType::Bool,
+                });
+
+                self.emit_terminator(Inst::Branch {
+                    cond: is_some,
+                    then: some_block,
+                    else_: none_block,
+                });
+
+                // Some: load the value (field 1) and store to result slot
+                self.set_current_block(some_block);
+                let val_ptr = self.emit_inst(Inst::GetFieldPtr {
+                    struct_ptr: val,
+                    field_index: 1,
+                    field_ty: IrType::I64,
+                });
+                let some_val = self.emit_inst(Inst::Load {
+                    ptr: val_ptr,
+                    ty: IrType::I64,
+                });
+                self.emit_inst(Inst::Store {
+                    ptr: result_slot,
+                    value: some_val,
+                });
+                self.emit_terminator(Inst::Jump { target: merge_block });
+
+                // None: evaluate the default and store to result slot
+                self.set_current_block(none_block);
+                let default_val = self.lower_expr(default);
+                self.emit_inst(Inst::Store {
+                    ptr: result_slot,
+                    value: default_val,
+                });
+                self.emit_terminator(Inst::Jump { target: merge_block });
+
+                // Merge: load the result
+                self.set_current_block(merge_block);
+                self.emit_inst(Inst::Load {
+                    ptr: result_slot,
+                    ty: IrType::I64,
+                })
+            }
+
             Expr::TryBlock { body } => {
                 // try { body } — catches ? early returns, wraps result in Result
                 // Result is modeled as struct { tag: i64, value: i64 }
@@ -2848,6 +3095,74 @@ impl Lowerer {
                 result_slot
             }
 
+            Expr::IsCheck { expr, type_name } => {
+                // `expr is Type` or `expr is Variant`
+                let val = self.lower_expr(expr);
+
+                // Check if type_name is a primitive type (compile-time check)
+                let is_primitive = matches!(type_name.as_str(),
+                    "i8" | "i16" | "i32" | "i64" | "i128" |
+                    "u8" | "u16" | "u32" | "u64" | "u128" |
+                    "f32" | "f64" | "bool" | "str" | "void"
+                );
+
+                if is_primitive {
+                    // Compile-time type check — always true or false based on inferred type
+                    let expr_ty = self.infer_expr_type(expr);
+                    let matches = match (&expr_ty, type_name.as_str()) {
+                        (IrType::I64, "i64") => true,
+                        (IrType::I32, "i32") => true,
+                        (IrType::I8, "i8") => true,
+                        (IrType::I16, "i16") => true,
+                        (IrType::U64, "u64") => true,
+                        (IrType::U32, "u32") => true,
+                        (IrType::U8, "u8") => true,
+                        (IrType::U16, "u16") => true,
+                        (IrType::F64, "f64") => true,
+                        (IrType::F32, "f32") => true,
+                        (IrType::Bool, "bool") => true,
+                        (IrType::Void, "void") => true,
+                        (IrType::Ptr(inner), "str") if matches!(**inner, IrType::U8) => true,
+                        _ => false,
+                    };
+                    self.emit_inst(Inst::ConstBool { value: matches })
+                } else {
+                    // Enum variant check: load tag (field 0) and compare to variant index
+                    // Search all enums for a matching variant name
+                    let variant_idx = {
+                        let mut found = None;
+                        for (_, enum_def) in &self.enums {
+                            if let Some(idx) = enum_def.variants.iter().position(|v| v.name == *type_name) {
+                                found = Some(idx as i64);
+                                break;
+                            }
+                        }
+                        // Also check if type_name is an enum name (always true if type matches)
+                        if found.is_none() && self.enums.contains_key(type_name) {
+                            // `expr is EnumName` — always true if type matches
+                            found = Some(0); // tag 0 means it's at least the first variant
+                        }
+                        found.unwrap_or(0)
+                    };
+                    let tag_ptr = self.emit_inst(Inst::GetFieldPtr {
+                        struct_ptr: val,
+                        field_index: 0,
+                        field_ty: IrType::I64,
+                    });
+                    let tag = self.emit_inst(Inst::Load {
+                        ptr: tag_ptr,
+                        ty: IrType::I64,
+                    });
+                    let expected = self.emit_inst(Inst::ConstInt { value: variant_idx, ty: IrType::I64 });
+                    self.emit_inst(Inst::BinOp {
+                        op: BinOp::Eq,
+                        left: tag,
+                        right: expected,
+                        ty: IrType::Bool,
+                    })
+                }
+            }
+
             Expr::TupleLit(elems) => {
                 // Allocate tuple on stack as a struct, store each element, return pointer
                 let tuple_size = elems.len();
@@ -2912,6 +3227,7 @@ impl Lowerer {
                     declared_effects: Vec::new(),
                     has_effect_annotation: false,
                     is_interrupt: false,
+            annotations: Vec::new(),
                 };
 
                 // Save current function context, lower the closure, restore context
@@ -3002,6 +3318,61 @@ impl Lowerer {
             Expr::ComptimeReflect { .. } => {
                 // Should not reach here after comptime substitution; emit const 0
                 self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 })
+            }
+            Expr::PipeForward { left, right } => {
+                // Desugar left |> right into a function/method call
+                match right.as_ref() {
+                    Expr::Call { callee, args } => {
+                        let mut all_args = vec![left.as_ref().clone()];
+                        all_args.extend(args.iter().cloned());
+                        let new_call = Expr::Call { callee: callee.clone(), args: all_args };
+                        self.lower_expr(&new_call)
+                    }
+                    Expr::MethodCall { receiver, method, args } => {
+                        let new_call = Expr::MethodCall {
+                            receiver: left.clone(),
+                            method: method.clone(),
+                            args: args.clone(),
+                        };
+                        let _ = receiver; // suppress unused warning
+                        self.lower_expr(&new_call)
+                    }
+                    Expr::Ident(name) => {
+                        // x |> f  →  f(x)
+                        let new_call = Expr::Call {
+                            callee: name.clone(),
+                            args: vec![left.as_ref().clone()],
+                        };
+                        self.lower_expr(&new_call)
+                    }
+                    Expr::FieldAccess { expr: receiver, field } => {
+                        // x |> obj.method  →  obj.method(x)
+                        let new_call = Expr::MethodCall {
+                            receiver: receiver.clone(),
+                            method: field.clone(),
+                            args: vec![],
+                        };
+                        // But we need to pass `left` as the first arg.
+                        // Actually: x |> obj.method means obj.method(x)
+                        // So we need to construct: MethodCall { receiver: receiver, method: field, args: [left] }
+                        let new_call = Expr::MethodCall {
+                            receiver: receiver.clone(),
+                            method: field.clone(),
+                            args: vec![left.as_ref().clone()],
+                        };
+                        self.lower_expr(&new_call)
+                    }
+                    _ => {
+                        self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 })
+                    }
+                }
+            }
+            Expr::QuantCast { expr, target_ty } => {
+                // Lower as a cast to the target type
+                let val = self.lower_expr(expr);
+                let src_ty = self.get_value_type(val);
+                let dst_ir_ty = self.lower_type(target_ty);
+                self.lower_cast(val, src_ty, dst_ir_ty)
             }
         }
     }
@@ -3120,6 +3491,12 @@ impl Lowerer {
                     self.collect_free_vars(body, free_vars, local_names);
                 }
                 Stmt::ComptimeGen { .. } => {}
+                Stmt::GradBlock { body, .. } => {
+                    self.collect_free_vars(body, free_vars, local_names);
+                }
+                Stmt::Backward { loss, .. } => {
+                    self.collect_free_vars_expr(loss, free_vars, local_names);
+                }
             }
         }
     }
@@ -3161,6 +3538,9 @@ impl Lowerer {
             Expr::FieldAccess { expr, .. } => {
                 self.collect_free_vars_expr(expr, free_vars, local_names);
             }
+            Expr::OptionalFieldAccess { expr, .. } => {
+                self.collect_free_vars_expr(expr, free_vars, local_names);
+            }
             Expr::MethodCall { receiver, args, .. } => {
                 self.collect_free_vars_expr(receiver, free_vars, local_names);
                 for a in args {
@@ -3171,9 +3551,12 @@ impl Lowerer {
                 self.collect_free_vars_expr(array, free_vars, local_names);
                 self.collect_free_vars_expr(index, free_vars, local_names);
             }
-            Expr::StructLit { fields, .. } => {
+            Expr::StructLit { fields, spread, .. } => {
                 for (_, e) in fields {
                     self.collect_free_vars_expr(e, free_vars, local_names);
+                }
+                if let Some(spread_expr) = spread {
+                    self.collect_free_vars_expr(spread_expr, free_vars, local_names);
                 }
             }
             Expr::If { cond, then_block, else_block } => {
@@ -3222,6 +3605,11 @@ impl Lowerer {
                 self.collect_free_vars_expr(right, free_vars, local_names);
             }
             Expr::Try { expr } => self.collect_free_vars_expr(expr, free_vars, local_names),
+            Expr::Coalesce { expr, default } => {
+                self.collect_free_vars_expr(expr, free_vars, local_names);
+                self.collect_free_vars_expr(default, free_vars, local_names);
+            }
+            Expr::IsCheck { expr, .. } => self.collect_free_vars_expr(expr, free_vars, local_names),
             Expr::TryBlock { body } => {
                 for stmt in body {
                     match stmt {
@@ -3262,6 +3650,13 @@ impl Lowerer {
                 self.collect_free_vars(stmts, free_vars, &mut local_names.to_vec());
             }
             Expr::ComptimeReflect { .. } => {}
+            Expr::PipeForward { left, right } => {
+                self.collect_free_vars_expr(left, free_vars, local_names);
+                self.collect_free_vars_expr(right, free_vars, local_names);
+            }
+            Expr::QuantCast { expr, .. } => {
+                self.collect_free_vars_expr(expr, free_vars, local_names);
+            }
         }
     }
 
@@ -3547,6 +3942,7 @@ impl Lowerer {
                 }
                 IrType::I64
             }
+            Expr::OptionalFieldAccess { .. } => IrType::I64,
             Expr::If { then_block, .. } => {
                 // Infer type from the last expression in the then block
                 for stmt in then_block {
@@ -3644,6 +4040,11 @@ impl Lowerer {
                 // For now, infer from the inner expression
                 self.infer_expr_type(expr)
             }
+            Expr::Coalesce { default, .. } => {
+                // ?? returns the type of the default (same as unwrapped option type)
+                self.infer_expr_type(default)
+            }
+            Expr::IsCheck { .. } => IrType::Bool,
             Expr::TryBlock { .. } => {
                 // try { } returns a Result struct
                 IrType::Struct("Result".to_string())
@@ -3697,6 +4098,13 @@ impl Lowerer {
                         IrType::Array(Box::new(IrType::Ptr(Box::new(IrType::U8))), 0)
                     }
                 }
+            }
+            Expr::PipeForward { right, .. } => {
+                // Pipe forward type is the type of the right side (the call)
+                self.infer_expr_type(right)
+            }
+            Expr::QuantCast { target_ty, .. } => {
+                self.lower_type(target_ty)
             }
         }
     }

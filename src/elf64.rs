@@ -853,9 +853,6 @@ impl ElfEmitter {
                 self.text.push(rex);
             }
             self.text.push(opcode_base | 0x01);
-            if src == "%edx" && dst == "%edx" {
-                eprintln!("DBG ALU: s={} d={} need_rex={} bytes={:02x?}", s, d, need_rex, &self.text[text_len_before..]);
-            }
             let modrm = 0xc0 | ((s & 7) << 3) | (d & 7);
             self.text.push(modrm);
             return Ok(());
@@ -1103,9 +1100,6 @@ impl ElfEmitter {
         // call rel32 → 0xE8 rel32
         // For external functions, use R_X86_64_PLT32 relocation.
         // For local functions, use R_X86_64_PC32.
-        if target.contains("p_string_split") || target.contains("p_string_trim") {
-            eprintln!("  ENCODE_CALL: target={} text_off=0x{:x}", target, self.text.len());
-        }
         if target.starts_with(".L") {
             let sym_idx = self.get_or_add_local_label(target);
             let reloc_offset = self.text.len() as u64 + 1;

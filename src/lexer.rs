@@ -128,8 +128,17 @@ impl Lexer {
             "do" => TokenKind::Do,
             "interrupt" => TokenKind::Interrupt,
             "extern" => TokenKind::Extern,
+            "guard" => TokenKind::Guard,
+            "is" => TokenKind::Is,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
+            "layer" => TokenKind::Layer,
+            "model" => TokenKind::Model,
+            "grad" => TokenKind::Grad,
+            "backward" => TokenKind::Backward,
+            "kernel" => TokenKind::Kernel,
+            "q8" => TokenKind::I8,    // q8 is an alias for i8 (quantized 8-bit)
+            "q4" => TokenKind::I8,    // q4 is stored in i8 (quantized 4-bit)
             "i8" => TokenKind::I8,
             "i16" => TokenKind::I16,
             "i32" => TokenKind::I32,
@@ -436,6 +445,9 @@ impl Lexer {
                 if self.peek() == '|' {
                     self.advance();
                     TokenKind::Or
+                } else if self.peek() == '>' {
+                    self.advance();
+                    TokenKind::PipeArrow
                 } else if self.peek() == '=' {
                     self.advance();
                     TokenKind::PipeEq
@@ -451,7 +463,14 @@ impl Lexer {
                     TokenKind::Caret
                 }
             }
-            '~' => TokenKind::Tilde,
+            '~' => {
+                if self.peek() == '>' {
+                    self.advance();
+                    TokenKind::TildeArrow
+                } else {
+                    TokenKind::Tilde
+                }
+            }
             '.' => {
                 if self.peek() == '.' {
                     self.advance();
@@ -466,6 +485,7 @@ impl Lexer {
                 }
             }
             '#' => TokenKind::Hash,
+            '@' => TokenKind::At,
             ',' => TokenKind::Comma,
             ':' => {
                 if self.peek() == ':' {
@@ -476,7 +496,17 @@ impl Lexer {
                 }
             }
             ';' => TokenKind::Semicolon,
-            '?' => TokenKind::Question,
+            '?' => {
+                if self.peek() == '?' {
+                    self.advance();
+                    TokenKind::QuestionQuestion
+                } else if self.peek() == '.' {
+                    self.advance();
+                    TokenKind::QuestionDot
+                } else {
+                    TokenKind::Question
+                }
+            }
             '(' => TokenKind::LParen,
             ')' => TokenKind::RParen,
             '{' => TokenKind::LBrace,

@@ -1222,6 +1222,9 @@ pub fn lower_type(ast_ty: &AstType) -> IrType {
         AstType::Dyn(name) => {
             IrType::Opaque(format!("dyn:{}", name))
         }
+        AstType::ShapedTensor { .. } => {
+            IrType::Opaque("Tensor".to_string())
+        }
     }
 }
 

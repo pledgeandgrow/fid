@@ -27,6 +27,7 @@ mod macho;
 mod hotreload;
 mod linker;
 mod runtime_linux;
+mod autograd;
 mod embedded;
 mod gpu;
 mod tensor;

@@ -44,8 +44,17 @@ pub enum TokenKind {
     Do,          // do — perform effect operation
     Interrupt,   // interrupt — interrupt handler (bare-metal)
     Extern,      // extern — FFI declarations
+    Guard,       // guard — early exit: guard cond => action
+    Is,          // is — type/variant check
     True,
     False,
+
+    // ML keywords
+    Layer,       // layer — neural network layer declaration
+    Model,       // model — neural network model declaration
+    Grad,        // grad — autograd block
+    Backward,    // backward — trigger reverse-mode AD
+    Kernel,      // kernel — GPU kernel keyword (used with @)
 
     // Types
     I8,
@@ -89,12 +98,14 @@ pub enum TokenKind {
     Ampersand,   // & for references
     Or,
     Pipe,        // | for bitwise OR
+    PipeArrow,   // |> pipeline operator
     Caret,       // ^ for bitwise XOR
     Tilde,       // ~ for bitwise NOT
     Shl,         // <<
     Shr,         // >>
     DotDot,      // ..
     DotDotEq,    // ..=
+    TildeArrow,  // ~> quantization cast
     // Compound assignment
     PlusEq,
     MinusEq,
@@ -114,7 +125,10 @@ pub enum TokenKind {
     Semicolon,
     DoubleColon, // ::
     Question,    // ?
+    QuestionQuestion, // ?? coalescing operator
+    QuestionDot, // ?. optional chaining operator
     Hash,        // #
+    At,          // @ for annotations (@kernel, @on, @serve, etc.)
     LBracket,
     RBracket,
     LParen,
@@ -182,6 +196,8 @@ impl fmt::Display for TokenKind {
             TokenKind::Handle => write!(f, "handle"),
             TokenKind::Do => write!(f, "do"),
             TokenKind::Interrupt => write!(f, "interrupt"),
+            TokenKind::Guard => write!(f, "guard"),
+            TokenKind::Is => write!(f, "is"),
             TokenKind::True => write!(f, "true"),
             TokenKind::False => write!(f, "false"),
             TokenKind::IntLit(n) => write!(f, "{}", n),

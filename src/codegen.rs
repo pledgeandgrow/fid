@@ -606,6 +606,14 @@ impl CodeGen {
                     self.gen_stmt(s);
                 }
             }
+            Stmt::GradBlock { body, .. } => {
+                for s in body {
+                    self.gen_stmt(s);
+                }
+            }
+            Stmt::Backward { .. } => {
+                // Marker for autograd pass — no-op in codegen
+            }
         }
     }
 
@@ -765,7 +773,11 @@ impl CodeGen {
                     writeln!(self.output, "    ldr x0, [x0, #0]").unwrap();
                 }
             }
-            Expr::StructLit { name, fields } => {
+            Expr::OptionalFieldAccess { expr, .. } => {
+                // Simplified: just evaluate expr (lowerer handles the logic)
+                self.gen_expr(expr);
+            }
+            Expr::StructLit { name, fields, .. } => {
                 // Allocate space for struct on stack
                 let struct_size = fields.len() * 8;
                 let struct_offset = self.next_offset;
@@ -1018,6 +1030,16 @@ impl CodeGen {
                 // ? operator: evaluate expr, check if it's an error/none
                 // Simplified: just evaluate and return the value
                 // Full impl would check a discriminant and early-return on error
+                self.gen_expr(expr);
+            }
+            Expr::Coalesce { expr, default } => {
+                // ?? operator: evaluate expr, if None evaluate default
+                // Simplified: just evaluate expr (the interpreter/lowerer handles the logic)
+                self.gen_expr(expr);
+                self.gen_expr(default);
+            }
+            Expr::IsCheck { expr, .. } => {
+                // is check — simplified, just evaluate expr
                 self.gen_expr(expr);
             }
             Expr::TupleLit(elems) => {

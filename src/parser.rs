@@ -101,6 +101,28 @@ impl Parser {
                     let attr = self.parse_attribute()?;
                     program.attributes.push(attr);
                 }
+                TokenKind::At => {
+                    // @annotation(s) followed by a function
+                    let mut annotations = Vec::new();
+                    while self.check(&TokenKind::At) {
+                        annotations.push(self.parse_at_annotation()?);
+                    }
+                    // The annotated item must be a function (for now)
+                    let mut func = self.parse_func()?;
+                    func.is_pub = is_pub;
+                    func.annotations = annotations;
+                    program.funcs.push(func);
+                }
+                TokenKind::Layer => {
+                    let mut l = self.parse_layer()?;
+                    l.is_pub = is_pub;
+                    program.layers.push(l);
+                }
+                TokenKind::Model => {
+                    let mut m = self.parse_model()?;
+                    m.is_pub = is_pub;
+                    program.models.push(m);
+                }
                 TokenKind::Comptime => {
                     self.advance(); // consume comptime
                     // comptime pf name(...) { ... }
@@ -295,6 +317,120 @@ impl Parser {
 
         self.struct_names.push(name.clone());
         Ok(StructDef { name, fields, is_pub: false })
+    }
+
+    /// Parse a layer declaration:
+    /// `layer Dense { w: Tensor, b: Tensor, forward(self, x: Tensor) -> Tensor { ... } }`
+    /// Also supports constructor args: `layer Dense(784, 128) { ... }`
+    fn parse_layer(&mut self) -> Result<LayerDef, String> {
+        self.expect(TokenKind::Layer, "layer")?;
+        let name = self.expect_ident()?;
+
+        // Optional constructor args: Dense(784, 128)
+        let mut constructor_args = Vec::new();
+        if self.match_tok(TokenKind::LParen) {
+            if !self.check(&TokenKind::RParen) {
+                loop {
+                    let arg = self.parse_annotation_arg()?;
+                    constructor_args.push(arg);
+                    if !self.match_tok(TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(TokenKind::RParen, ")")?;
+        }
+
+        self.expect(TokenKind::LBrace, "{")?;
+
+        let mut fields = Vec::new();
+        let mut forward: Option<Func> = None;
+
+        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            if self.check(&TokenKind::Pf) {
+                // Parse the forward method
+                let mut func = self.parse_func()?;
+                if func.name == "forward" {
+                    forward = Some(func);
+                }
+            } else {
+                // Parse a field: name: Type,
+                let fname = self.expect_ident()?;
+                self.expect(TokenKind::Colon, ":")?;
+                let fty = self.parse_type()?;
+                fields.push(Param { name: fname, ty: fty });
+                self.match_tok(TokenKind::Comma);
+            }
+        }
+        self.expect(TokenKind::RBrace, "}")?;
+
+        let forward = forward.ok_or_else(|| {
+            format!("Layer '{}' must have a 'forward' method", name)
+        })?;
+
+        self.struct_names.push(name.clone());
+        Ok(LayerDef {
+            name,
+            fields,
+            constructor_args,
+            forward,
+            is_pub: false,
+        })
+    }
+
+    /// Parse a model declaration:
+    /// `model MLP { l1: Dense(784, 128), l2: Dense(128, 10), forward(self, x) -> T { ... } }`
+    fn parse_model(&mut self) -> Result<ModelDef, String> {
+        self.expect(TokenKind::Model, "model")?;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::LBrace, "{")?;
+
+        let mut layers = Vec::new();
+        let mut forward: Option<Func> = None;
+
+        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            if self.check(&TokenKind::Pf) {
+                let mut func = self.parse_func()?;
+                if func.name == "forward" {
+                    forward = Some(func);
+                }
+            } else {
+                // Layer instantiation: l1: Dense(784, 128)
+                let field_name = self.expect_ident()?;
+                self.expect(TokenKind::Colon, ":")?;
+                let layer_type = self.expect_ident()?;
+
+                // Optional constructor args
+                let mut ctor_args = Vec::new();
+                if self.match_tok(TokenKind::LParen) {
+                    if !self.check(&TokenKind::RParen) {
+                        loop {
+                            let arg = self.parse_annotation_arg()?;
+                            ctor_args.push(arg);
+                            if !self.match_tok(TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(TokenKind::RParen, ")")?;
+                }
+                self.match_tok(TokenKind::Comma);
+                layers.push((field_name, layer_type, ctor_args));
+            }
+        }
+        self.expect(TokenKind::RBrace, "}")?;
+
+        let forward = forward.ok_or_else(|| {
+            format!("Model '{}' must have a 'forward' method", name)
+        })?;
+
+        self.struct_names.push(name.clone());
+        Ok(ModelDef {
+            name,
+            layers,
+            forward,
+            is_pub: false,
+        })
     }
 
     fn parse_enum(&mut self) -> Result<EnumDef, String> {
@@ -724,6 +860,7 @@ impl Parser {
             declared_effects,
             has_effect_annotation,
             is_interrupt: false,
+            annotations: Vec::new(),
         })
     }
 
@@ -829,6 +966,49 @@ impl Parser {
                 // Check for generic type args: Name<T, U>
                 if self.check(&TokenKind::Lt) {
                     self.advance(); // consume <
+
+                    // Special case: Tensor<elem, [dims]> → ShapedTensor
+                    if s == "Tensor" {
+                        let elem = self.parse_type()?;
+                        if self.match_tok(TokenKind::Comma) {
+                            // Expect [dim, dim, ...]
+                            if self.match_tok(TokenKind::LBracket) {
+                                let mut shape = Vec::new();
+                                if !self.check(&TokenKind::RBracket) {
+                                    loop {
+                                        if let TokenKind::IntLit(n) = self.peek().clone() {
+                                            self.advance();
+                                            shape.push(ShapeDim::Known(n));
+                                        } else if let TokenKind::Ident(name) = self.peek().clone() {
+                                            self.advance();
+                                            shape.push(ShapeDim::Symbolic(name));
+                                        } else {
+                                            return Err(format!(
+                                                "Expected dimension (int or identifier) in Tensor shape, got {:?}",
+                                                self.peek()
+                                            ));
+                                        }
+                                        if !self.match_tok(TokenKind::Comma) {
+                                            break;
+                                        }
+                                    }
+                                }
+                                self.expect(TokenKind::RBracket, "]")?;
+                                self.expect(TokenKind::Gt, ">")?;
+                                return Ok(Type::ShapedTensor {
+                                    elem: Box::new(elem),
+                                    shape,
+                                });
+                            }
+                        }
+                        // Fallback: just Tensor<elem> without shape → Generic
+                        self.expect(TokenKind::Gt, ">")?;
+                        return Ok(Type::Generic {
+                            name: s,
+                            args: vec![elem],
+                        });
+                    }
+
                     let mut args = Vec::new();
                     if !self.check(&TokenKind::Gt) {
                         loop {
@@ -961,6 +1141,16 @@ impl Parser {
             TokenKind::Do => self.parse_do_stmt(),
             TokenKind::Region => self.parse_region_block(),
             TokenKind::Sandbox => self.parse_sandbox_block(),
+            TokenKind::Grad => self.parse_grad_block(),
+            TokenKind::Backward => {
+                let line = self.peek_token().line;
+                self.advance(); // consume backward
+                self.expect(TokenKind::LParen, "(")?;
+                let loss = self.parse_expr()?;
+                self.expect(TokenKind::RParen, ")")?;
+                self.match_tok(TokenKind::Semicolon);
+                Ok(Stmt::Backward { loss, line })
+            }
             TokenKind::Comptime => {
                 let line = self.peek_token().line;
                 self.advance(); // consume comptime
@@ -981,6 +1171,7 @@ impl Parser {
                 let expr = self.parse_comptime_expr(line)?;
                 Ok(Stmt::Expr(expr, line))
             }
+            TokenKind::Guard => self.parse_guard_stmt(),
             _ => self.parse_assign_or_expr(),
         }
     }
@@ -1041,6 +1232,37 @@ impl Parser {
         let body = self.parse_block()?;
         self.expect(TokenKind::RBrace, "}")?;
         Ok(Stmt::While { cond, body, line })
+    }
+
+    /// Parse `guard cond => action` — early exit if condition is false.
+    /// Desugars to `if !cond { action }`.
+    /// The action can be a block `{ ... }` or a single statement.
+    fn parse_guard_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect(TokenKind::Guard, "guard")?;
+        let cond = self.parse_expr()?;
+        self.expect(TokenKind::FatArrow, "=>")?;
+
+        // The action can be a block or a single statement
+        let then_block = if self.check(&TokenKind::LBrace) {
+            self.advance(); // consume {
+            let block = self.parse_block()?;
+            self.expect(TokenKind::RBrace, "}")?;
+            block
+        } else {
+            vec![self.parse_stmt()?]
+        };
+
+        // Desugar: guard cond => action  →  if !cond { action }
+        Ok(Stmt::If {
+            cond: Expr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(cond),
+            },
+            then_block,
+            else_block: None,
+            line,
+        })
     }
 
     fn parse_for(&mut self) -> Result<Stmt, String> {
@@ -1332,7 +1554,35 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, String> {
-        self.parse_range()
+        self.parse_pipe_forward()
+    }
+
+    /// Parse pipe-forward operator `|>` — lowest precedence binary operator.
+    /// `x |> f` desugars to `f(x)`, `x |> obj.method()` desugars to `obj.method(x)`.
+    fn parse_pipe_forward(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_coalesce()?;
+        while self.match_tok(TokenKind::PipeArrow) {
+            let right = self.parse_coalesce()?;
+            left = Expr::PipeForward {
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// Parse coalescing operator `??` — `expr ?? default`.
+    /// If expr is None, return default; else unwrap and return the value.
+    fn parse_coalesce(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_range()?;
+        while self.match_tok(TokenKind::QuestionQuestion) {
+            let right = self.parse_range()?;
+            left = Expr::Coalesce {
+                expr: Box::new(left),
+                default: Box::new(right),
+            };
+        }
+        Ok(left)
     }
 
     fn parse_range(&mut self) -> Result<Expr, String> {
@@ -1457,6 +1707,37 @@ impl Parser {
 
     fn parse_comparison(&mut self) -> Result<Expr, String> {
         let mut left = self.parse_addition()?;
+        // Check for `is` type/variant check
+        if self.match_tok(TokenKind::Is) {
+            // Accept both identifiers and type keyword tokens
+            let peek_clone = self.peek().clone();
+            let type_name = match &peek_clone {
+                TokenKind::Ident(name) => {
+                    self.advance();
+                    name.clone()
+                }
+                TokenKind::I8 => { self.advance(); "i8".to_string() }
+                TokenKind::I16 => { self.advance(); "i16".to_string() }
+                TokenKind::I32 => { self.advance(); "i32".to_string() }
+                TokenKind::I64 => { self.advance(); "i64".to_string() }
+                TokenKind::I128 => { self.advance(); "i128".to_string() }
+                TokenKind::U8 => { self.advance(); "u8".to_string() }
+                TokenKind::U16 => { self.advance(); "u16".to_string() }
+                TokenKind::U32 => { self.advance(); "u32".to_string() }
+                TokenKind::U64 => { self.advance(); "u64".to_string() }
+                TokenKind::U128 => { self.advance(); "u128".to_string() }
+                TokenKind::F32 => { self.advance(); "f32".to_string() }
+                TokenKind::F64 => { self.advance(); "f64".to_string() }
+                TokenKind::Bool => { self.advance(); "bool".to_string() }
+                TokenKind::Str => { self.advance(); "str".to_string() }
+                TokenKind::Void => { self.advance(); "void".to_string() }
+                _ => return Err(format!("expected type name after 'is' but got {:?}", peek_clone)),
+            };
+            return Ok(Expr::IsCheck {
+                expr: Box::new(left),
+                type_name,
+            });
+        }
         loop {
             let op = match self.peek() {
                 TokenKind::Lt => BinOp::Lt,
@@ -1634,6 +1915,13 @@ impl Parser {
                         field,
                     };
                 }
+            } else if self.match_tok(TokenKind::QuestionDot) {
+                // Optional field access: expr?.field
+                let field = self.expect_ident()?;
+                expr = Expr::OptionalFieldAccess {
+                    expr: Box::new(expr),
+                    field,
+                };
             } else if self.match_tok(TokenKind::LBracket) {
                 // Array index: arr[idx]
                 let index = self.parse_expr()?;
@@ -1651,6 +1939,13 @@ impl Parser {
                 // Cast: expr as Type
                 let target_ty = self.parse_type()?;
                 expr = Expr::Cast {
+                    expr: Box::new(expr),
+                    target_ty,
+                };
+            } else if self.match_tok(TokenKind::TildeArrow) {
+                // Quantization cast: expr ~> q8
+                let target_ty = self.parse_type()?;
+                expr = Expr::QuantCast {
                     expr: Box::new(expr),
                     target_ty,
                 };
@@ -1780,8 +2075,23 @@ impl Parser {
                     // Struct literal: StructName { field: value, ... }
                     self.advance(); // consume {
                     let mut fields = Vec::new();
+                    let mut spread: Option<Box<Expr>> = None;
                     if !self.check(&TokenKind::RBrace) {
                         loop {
+                            // Check for spread: `..expr`
+                            if self.check(&TokenKind::DotDot) {
+                                self.advance(); // consume ..
+                                let spread_expr = self.parse_expr()?;
+                                spread = Some(Box::new(spread_expr));
+                                if !self.match_tok(TokenKind::Comma) {
+                                    break;
+                                }
+                                // Allow trailing comma after spread
+                                if self.check(&TokenKind::RBrace) {
+                                    break;
+                                }
+                                continue;
+                            }
                             let fname = self.expect_ident()?;
                             self.expect(TokenKind::Colon, ":")?;
                             let fval = self.parse_expr()?;
@@ -1799,6 +2109,7 @@ impl Parser {
                     Ok(Expr::StructLit {
                         name: name.clone(),
                         fields,
+                        spread,
                     })
                 } else if self.check(&TokenKind::DoubleColon) {
                     // Could be: EnumName::Variant(args) or StructName::method(args)
@@ -2190,6 +2501,91 @@ impl Parser {
         let body = self.parse_block()?;
         self.expect(TokenKind::RBrace, "}")?;
         Ok(Stmt::Sandbox { body, line })
+    }
+
+    /// Parse a grad block: `grad(var) { body; backward(loss); }`
+    /// The compiler traces operations on `var` and generates gradient code.
+    fn parse_grad_block(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect(TokenKind::Grad, "grad")?;
+        self.expect(TokenKind::LParen, "(")?;
+        let var = self.expect_ident()?;
+        self.expect(TokenKind::RParen, ")")?;
+        self.expect(TokenKind::LBrace, "{")?;
+        let body = self.parse_block()?;
+        self.expect(TokenKind::RBrace, "}")?;
+        Ok(Stmt::GradBlock { var, body, line })
+    }
+
+    /// Parse an @-annotation: `@name` or `@name(args)`
+    /// Returns (name, args) where args is a list of raw string tokens.
+    fn parse_at_annotation(&mut self) -> Result<Annotation, String> {
+        self.expect(TokenKind::At, "@")?;
+        // Annotation name can be a keyword (like 'kernel') or an identifier
+        let name = match self.peek().clone() {
+            TokenKind::Ident(s) => { self.advance(); s }
+            TokenKind::Kernel => { self.advance(); "kernel".to_string() }
+            TokenKind::Layer => { self.advance(); "layer".to_string() }
+            TokenKind::Model => { self.advance(); "model".to_string() }
+            _ => return Err(format!(
+                "Parse error at {}:{}: expected annotation name after '@' but got '{:?}'",
+                self.peek_token().line, self.peek_token().col, self.peek()
+            )),
+        };
+        let mut args = Vec::new();
+        if self.match_tok(TokenKind::LParen) {
+            if !self.check(&TokenKind::RParen) {
+                loop {
+                    // Parse annotation arg — can be ident, int, string, or key=value
+                    let arg = self.parse_annotation_arg()?;
+                    args.push(arg);
+                    if !self.match_tok(TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(TokenKind::RParen, ")")?;
+        }
+        Ok(Annotation { name, args })
+    }
+
+    fn parse_annotation_arg(&mut self) -> Result<String, String> {
+        // key=value or just value
+        let mut arg = String::new();
+        match self.peek().clone() {
+            TokenKind::Ident(s) => {
+                self.advance();
+                arg = s;
+                if self.match_tok(TokenKind::Eq) {
+                    arg.push_str("=");
+                    arg.push_str(&self.parse_annotation_arg()?);
+                }
+            }
+            TokenKind::IntLit(n) => {
+                self.advance();
+                arg = n.to_string();
+            }
+            TokenKind::StringLit(s) => {
+                self.advance();
+                arg = format!("\"{}\"", s);
+            }
+            TokenKind::LBracket => {
+                // [1, 2, 3] — workgroup size
+                self.advance();
+                arg.push_str("[");
+                loop {
+                    arg.push_str(&self.parse_annotation_arg()?);
+                    if !self.match_tok(TokenKind::Comma) {
+                        break;
+                    }
+                    arg.push_str(",");
+                }
+                self.expect(TokenKind::RBracket, "]")?;
+                arg.push_str("]");
+            }
+            _ => return Err(format!("Expected annotation argument, got {:?}", self.peek())),
+        }
+        Ok(arg)
     }
 
     fn parse_attribute(&mut self) -> Result<Attribute, String> {

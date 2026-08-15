@@ -1,4 +1,5 @@
 use crate::ast::Program;
+use crate::autograd;
 use crate::codegen::CodeGen;
 use crate::codegen_c;
 use crate::comptime;
@@ -163,6 +164,9 @@ fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Pr
     // Merge user code (highest priority)
     program = merge_programs(program, user.clone());
 
+    // Desugar layer/model declarations into structs + impls + functions
+    desugar_layers_models(&mut program);
+
     // Phase 3A: Process comptime gen blocks (before typechecking so generated
     // code is visible to the typechecker)
     program = comptime::process_gen(program);
@@ -214,6 +218,137 @@ fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Pr
     Ok(mono::monomorphize(&program))
 }
 
+/// Desugar layer/model declarations into structs + impls + constructor functions.
+///
+/// `layer Dense { w: Tensor, b: Tensor, forward(self, x: Tensor) -> Tensor { ... } }`
+/// desugars to:
+///   struct Dense { w: Tensor, b: Tensor }
+///   impl Dense { pf forward(self: Dense, x: Tensor) -> Tensor { ... } }
+///   pf Dense_new(w: Tensor, b: Tensor) -> Dense { Dense { w, b } }  // constructor
+///
+/// `model MLP { l1: Dense(784, 128), l2: Dense(128, 10), forward(self, x) -> T { ... } }`
+/// desugars to:
+///   struct MLP { l1: Dense, l2: Dense }
+///   impl MLP { pf forward(self: MLP, x: Tensor) -> Tensor { ... } }
+///   pf MLP_new() -> MLP { MLP { l1: Dense_new(784, 128), l2: Dense_new(128, 10) } }
+fn desugar_layers_models(program: &mut Program) {
+    use crate::ast::{Func, ImplDef, Param, StructDef, Type, Expr, Stmt, Annotation};
+
+    // Desugar layers
+    for layer in program.layers.drain(..) {
+        // Create struct
+        program.structs.push(StructDef {
+            name: layer.name.clone(),
+            fields: layer.fields.clone(),
+            is_pub: layer.is_pub,
+        });
+
+        // Create impl block with forward method
+        let mut forward = layer.forward.clone();
+        forward.is_pub = true;
+        program.impls.push(ImplDef {
+            struct_name: layer.name.clone(),
+            type_params: Vec::new(),
+            methods: vec![forward],
+        });
+
+        // Create constructor function: LayerName_new(fields...) -> LayerName
+        let ctor_name = format!("{}_new", layer.name);
+        let ctor_params = layer.fields.clone();
+        let ctor_body = vec![Stmt::Return(
+            Some(Expr::StructLit {
+                name: layer.name.clone(),
+                fields: layer.fields.iter().map(|f| {
+                    (f.name.clone(), Expr::Ident(f.name.clone()))
+                }).collect(),
+                spread: None,
+            }),
+            0,
+        )];
+        program.funcs.push(Func {
+            name: ctor_name,
+            type_params: Vec::new(),
+            type_param_bounds: Vec::new(),
+            const_params: Vec::new(),
+            params: ctor_params,
+            ret_ty: Type::Named(layer.name.clone()),
+            body: ctor_body,
+            is_pub: layer.is_pub,
+            is_comptime: false,
+            declared_effects: Vec::new(),
+            has_effect_annotation: false,
+            is_interrupt: false,
+            annotations: Vec::new(),
+        });
+    }
+
+    // Desugar models
+    for model in program.models.drain(..) {
+        // Create struct with layer fields
+        let fields: Vec<Param> = model.layers.iter().map(|(name, layer_type, _)| {
+            Param {
+                name: name.clone(),
+                ty: Type::Named(layer_type.clone()),
+            }
+        }).collect();
+
+        program.structs.push(StructDef {
+            name: model.name.clone(),
+            fields,
+            is_pub: model.is_pub,
+        });
+
+        // Create impl block with forward method
+        let mut forward = model.forward.clone();
+        forward.is_pub = true;
+        program.impls.push(ImplDef {
+            struct_name: model.name.clone(),
+            type_params: Vec::new(),
+            methods: vec![forward],
+        });
+
+        // Create constructor: ModelName_new() -> ModelName
+        // Body: ModelName { l1: LayerName_new(args...), l2: LayerName_new(args...), ... }
+        let ctor_name = format!("{}_new", model.name);
+        let struct_lit = Expr::StructLit {
+            name: model.name.clone(),
+            fields: model.layers.iter().map(|(field_name, layer_type, ctor_args)| {
+                let mut args = Vec::new();
+                for arg in ctor_args {
+                    // Try to parse as int
+                    if let Ok(n) = arg.parse::<i64>() {
+                        args.push(Expr::IntLit(n));
+                    } else {
+                        args.push(Expr::Ident(arg.clone()));
+                    }
+                }
+                let layer_ctor = format!("{}_new", layer_type);
+                (field_name.clone(), Expr::Call {
+                    callee: layer_ctor,
+                    args,
+                })
+            }).collect(),
+            spread: None,
+        };
+        let ctor_body = vec![Stmt::Return(Some(struct_lit), 0)];
+        program.funcs.push(Func {
+            name: ctor_name,
+            type_params: Vec::new(),
+            type_param_bounds: Vec::new(),
+            const_params: Vec::new(),
+            params: Vec::new(),
+            ret_ty: Type::Named(model.name.clone()),
+            body: ctor_body,
+            is_pub: model.is_pub,
+            is_comptime: false,
+            declared_effects: Vec::new(),
+            has_effect_annotation: false,
+            is_interrupt: false,
+            annotations: Vec::new(),
+        });
+    }
+}
+
 /// Phase 3B.1: Fill in default trait methods.
 fn fill_default_trait_methods(program: &mut Program) {
     use crate::ast::{Func, Param, Type};
@@ -261,6 +396,7 @@ fn fill_default_trait_methods(program: &mut Program) {
                 declared_effects: Vec::new(),
                 has_effect_annotation: false,
                 is_interrupt: false,
+            annotations: Vec::new(),
             });
 
         }
@@ -480,6 +616,9 @@ pub fn build_executable(source: &str, source_path: &str, target: &str, do_opt: b
     let program = build_program_with_path(source, Some(source_path))?;
     let mut module = lower::lower(&program);
 
+    // Autograd pass: process grad blocks, generate backward code
+    autograd::process_module(&mut module);
+
     // F5: Capability-aware linking — strip functions requiring ungranted capabilities
     if let Some(caps) = granted_caps {
         strip_ungranted_caps(&mut module, caps);
@@ -493,18 +632,6 @@ pub fn build_executable(source: &str, source_path: &str, target: &str, do_opt: b
     }
 
     let l3 = pir::lower_l2_to_l3(&l2, &module);
-
-    // Debug: dump apply L3 IR
-    for f in &l3.functions {
-        if f.name == "apply" {
-            eprintln!("DBG L3 apply: frame_size={}", f.frame_size);
-            for b in &f.blocks {
-                for inst in &b.instructions {
-                    eprintln!("  {:?}", inst);
-                }
-            }
-        }
-    }
 
     match target {
         "x86-64" | "x64" => {
@@ -659,9 +786,6 @@ fn strip_ungranted_caps(module: &mut IrModule, granted_caps: &[String]) {
         return;
     }
 
-    eprintln!("[caps] Granted capabilities: {:?}", granted_caps);
-    eprintln!("[caps] Removing {} functions requiring ungranted capabilities:", to_remove.len());
-
     // Build call graph
     let mut call_graph: HashMap<String, Vec<String>> = HashMap::new();
     for (name, func) in &module.functions {
@@ -700,6 +824,4 @@ fn strip_ungranted_caps(module: &mut IrModule, granted_caps: &[String]) {
         module.functions.remove(name);
         module.function_effects.remove(name);
     }
-    eprintln!("[caps]   Removed: {:?}", removed);
-    eprintln!("[caps]   {} functions remaining", module.functions.len());
 }

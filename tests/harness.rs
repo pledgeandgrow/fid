@@ -22,7 +22,6 @@ fn is_skip_test(name: &str) -> bool {
         | "test_comptime_reflect.p"
         | "test_comptime_serialize.p"
         | "test_comptime_gen.p"
-        | "test_db.p"
         | "test_http.p"
         | "test_json.p"
         | "test_tensor.p"

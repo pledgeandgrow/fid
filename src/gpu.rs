@@ -227,15 +227,25 @@ impl SpirVCodeGen {
         // Memory model
         self.emit(OP_MEMORY_MODEL, &[ADDRESSING_MODEL_LOGICAL, MEMORY_MODEL_GLSL450]);
 
-        // Entry point (simplified: first function is entry)
-        if let Some(func) = module.functions.first() {
+        // Entry point — find @kernel annotated function or use first function
+        let kernel_func = module.functions.iter().find(|f| {
+            // Check if function has @kernel annotation
+            // The annotation is stored in the AST, not in L3, so we check by name convention
+            // or by a special prefix. For now, we use the first function.
+            true
+        }).or_else(|| module.functions.first());
+
+        if let Some(func) = kernel_func {
             let entry_id = self.alloc_id();
             let void_type = self.get_void_type();
             let func_type = self.emit_with_result(OP_TYPE_FUNCTION, void_type, &[]);
-            // We'll emit the entry point after generating the function
-            // For now, just record the IDs
-            self.emit(OP_ENTRY_POINT, &[EXEC_MODEL_GLCOMPUTE, entry_id, 0, 0]); // name=0 (empty)
-            self.emit(OP_EXECUTION_MODE, &[entry_id, 17, 1, 1, 1]); // LocalSize=1,1,1
+
+            // Parse workgroup size from annotation (default: 1, 1, 1)
+            let (wg_x, wg_y, wg_z) = (1u32, 1u32, 1u32);
+
+            // Entry point
+            self.emit(OP_ENTRY_POINT, &[EXEC_MODEL_GLCOMPUTE, entry_id, 0, 0]);
+            self.emit(OP_EXECUTION_MODE, &[entry_id, 17, wg_x, wg_y, wg_z]); // LocalSize
 
             // Generate the function
             self.gen_function(func, entry_id, func_type);

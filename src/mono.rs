@@ -66,6 +66,13 @@ fn mangle_type(ty: &Type) -> String {
         }
         Type::Assoc(_, trait_name, name, _) => format!("assoc_{}_{}", trait_name, name),
         Type::Dyn(name) => format!("dyn_{}", name),
+        Type::ShapedTensor { elem, shape } => {
+            let shape_str: Vec<String> = shape.iter().map(|d| match d {
+                crate::ast::ShapeDim::Known(n) => n.to_string(),
+                crate::ast::ShapeDim::Symbolic(s) => s.clone(),
+            }).collect();
+            format!("tensor_{}_{}", mangle_type(elem), shape_str.join("_"))
+        }
     }
 }
 
@@ -289,6 +296,10 @@ fn subst_expr(expr: &Expr, subst: &Subst, renames: &HashMap<String, String>, met
             expr: Box::new(subst_expr(expr, subst, renames, method_renames)),
             field: field.clone(),
         },
+        Expr::OptionalFieldAccess { expr, field } => Expr::OptionalFieldAccess {
+            expr: Box::new(subst_expr(expr, subst, renames, method_renames)),
+            field: field.clone(),
+        },
         Expr::MethodCall { receiver, method, args } => {
             // Check if this method call should be rewritten to a monomorphized function call
             if let Some(mangled) = method_renames.get(method) {
@@ -317,11 +328,12 @@ fn subst_expr(expr: &Expr, subst: &Subst, renames: &HashMap<String, String>, met
             end: Box::new(subst_expr(end, subst, renames, method_renames)),
             inclusive: *inclusive,
         },
-        Expr::StructLit { name, fields } => Expr::StructLit {
+        Expr::StructLit { name, fields, spread } => Expr::StructLit {
             name: name.clone(),
             fields: fields.iter().map(|(n, e)| {
                 (n.clone(), subst_expr(e, subst, renames, method_renames))
             }).collect(),
+            spread: spread.as_ref().map(|e| Box::new(subst_expr(e, subst, renames, method_renames))),
         },
         Expr::Match { expr, arms } => Expr::Match {
             expr: Box::new(subst_expr(expr, subst, renames, method_renames)),
@@ -333,6 +345,14 @@ fn subst_expr(expr: &Expr, subst: &Subst, renames: &HashMap<String, String>, met
         },
         Expr::Try { expr } => Expr::Try {
             expr: Box::new(subst_expr(expr, subst, renames, method_renames)),
+        },
+        Expr::Coalesce { expr, default } => Expr::Coalesce {
+            expr: Box::new(subst_expr(expr, subst, renames, method_renames)),
+            default: Box::new(subst_expr(default, subst, renames, method_renames)),
+        },
+        Expr::IsCheck { expr, type_name } => Expr::IsCheck {
+            expr: Box::new(subst_expr(expr, subst, renames, method_renames)),
+            type_name: type_name.clone(),
         },
         Expr::TryBlock { body } => Expr::TryBlock {
             body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
@@ -395,6 +415,14 @@ fn subst_expr(expr: &Expr, subst: &Subst, renames: &HashMap<String, String>, met
         Expr::ComptimeReflect { op, ty } => Expr::ComptimeReflect {
             op: op.clone(),
             ty: subst_type(ty, subst),
+        },
+        Expr::PipeForward { left, right } => Expr::PipeForward {
+            left: Box::new(subst_expr(left, subst, renames, method_renames)),
+            right: Box::new(subst_expr(right, subst, renames, method_renames)),
+        },
+        Expr::QuantCast { expr, target_ty } => Expr::QuantCast {
+            expr: Box::new(subst_expr(expr, subst, renames, method_renames)),
+            target_ty: subst_type(target_ty, subst),
         },
     }
 }
@@ -497,6 +525,15 @@ fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, met
         Stmt::ComptimeGen { .. } => stmt.clone(),
         Stmt::Sandbox { body, line } => Stmt::Sandbox {
             body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
+            line: *line,
+        },
+        Stmt::GradBlock { var, body, line } => Stmt::GradBlock {
+            var: var.clone(),
+            body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
+            line: *line,
+        },
+        Stmt::Backward { loss, line } => Stmt::Backward {
+            loss: subst_expr(loss, subst, renames, method_renames),
             line: *line,
         },
     }
@@ -691,6 +728,8 @@ pub fn monomorphize(program: &Program) -> Program {
         traits: program.traits.clone(),
         trait_impls: new_trait_impls,
         extern_decls: program.extern_decls.clone(),
+        layers: program.layers.clone(),
+        models: program.models.clone(),
     }
 }
 
@@ -887,6 +926,7 @@ fn process_func(func: &Func, ctx: &mut MonoCtx) -> Func {
         declared_effects: func.declared_effects.clone(),
         has_effect_annotation: func.has_effect_annotation,
         is_interrupt: func.is_interrupt,
+            annotations: func.annotations.clone(),
     }
 }
 
@@ -922,6 +962,7 @@ fn instantiate(gen_func: &Func, subst: &Subst, mangled_name: &str, ctx: &mut Mon
         declared_effects: gen_func.declared_effects.clone(),
         has_effect_annotation: gen_func.has_effect_annotation,
         is_interrupt: gen_func.is_interrupt,
+            annotations: gen_func.annotations.clone(),
     };
 
     // Now process this concrete function — it may contain calls to other generics
@@ -1050,6 +1091,14 @@ fn collect_generic_calls_stmt_with_hint(
                 collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
             }
         }
+        Stmt::GradBlock { body, .. } => {
+            for s in body {
+                collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
+            }
+        }
+        Stmt::Backward { loss, .. } => {
+            collect_generic_calls_expr_with_hint(loss, generics, generic_methods, calls, method_calls, current_func, None);
+        }
     }
 }
 fn collect_generic_calls_expr_with_hint(
@@ -1099,6 +1148,9 @@ fn collect_generic_calls_expr_with_hint(
         Expr::FieldAccess { expr, .. } => {
             collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, None);
         }
+        Expr::OptionalFieldAccess { expr, .. } => {
+            collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, None);
+        }
         Expr::MethodCall { receiver, method, args } => {
             // Check if this is a call to a generic method
             // We need to determine the struct type from the receiver
@@ -1131,9 +1183,12 @@ fn collect_generic_calls_expr_with_hint(
             collect_generic_calls_expr_with_hint(start, generics, generic_methods, calls, method_calls, current_func, None);
             collect_generic_calls_expr_with_hint(end, generics, generic_methods, calls, method_calls, current_func, None);
         }
-        Expr::StructLit { fields, .. } => {
+        Expr::StructLit { fields, spread, .. } => {
             for (_, e) in fields {
                 collect_generic_calls_expr_with_hint(e, generics, generic_methods, calls, method_calls, current_func, None);
+            }
+            if let Some(se) = spread {
+                collect_generic_calls_expr_with_hint(se, generics, generic_methods, calls, method_calls, current_func, None);
             }
         }
         Expr::Match { expr, arms } => {
@@ -1145,6 +1200,13 @@ fn collect_generic_calls_expr_with_hint(
             }
         }
         Expr::Try { expr } => {
+            collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, None);
+        }
+        Expr::Coalesce { expr, default } => {
+            collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, None);
+            collect_generic_calls_expr_with_hint(default, generics, generic_methods, calls, method_calls, current_func, None);
+        }
+        Expr::IsCheck { expr, .. } => {
             collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, None);
         }
         Expr::TryBlock { body } => {

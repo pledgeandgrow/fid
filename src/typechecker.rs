@@ -238,6 +238,44 @@ impl TypeChecker {
                 self.funcs.insert(func.name.clone(), (param_types, ret_ty));
             }
         }
+        // Register any impl methods not already known (from desugared layer/model)
+        // Compute all method info first to avoid borrow conflicts
+        let mut new_methods: Vec<(String, HashMap<String, (Vec<Type>, Type, bool, bool)>)> = Vec::new();
+        let mut merged_methods: Vec<(String, HashMap<String, (Vec<Type>, Type, bool, bool)>)> = Vec::new();
+        for imp in &program.impls {
+            if !self.methods.contains_key(&imp.struct_name) {
+                let mut method_map = HashMap::new();
+                for method in &imp.methods {
+                    let param_types: Vec<Type> = method.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
+                    let has_self = method.params.first().map_or(false, |p| p.name == "self");
+                    method_map.insert(method.name.clone(), (param_types, self.resolve_type(&method.ret_ty), has_self, method.is_pub));
+                }
+                new_methods.push((imp.struct_name.clone(), method_map));
+            } else {
+                let existing = self.methods.get(&imp.struct_name).unwrap();
+                let mut to_add = HashMap::new();
+                for method in &imp.methods {
+                    if !existing.contains_key(&method.name) {
+                        let param_types: Vec<Type> = method.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
+                        let has_self = method.params.first().map_or(false, |p| p.name == "self");
+                        to_add.insert(method.name.clone(), (param_types, self.resolve_type(&method.ret_ty), has_self, method.is_pub));
+                    }
+                }
+                if !to_add.is_empty() {
+                    merged_methods.push((imp.struct_name.clone(), to_add));
+                }
+            }
+        }
+        for (name, methods) in new_methods {
+            self.methods.insert(name, methods);
+        }
+        for (name, methods) in merged_methods {
+            if let Some(existing) = self.methods.get_mut(&name) {
+                for (m_name, m_info) in methods {
+                    existing.insert(m_name, m_info);
+                }
+            }
+        }
     }
 
     /// Phase 3B.4: Verify that trait impls match their trait definitions.
@@ -597,6 +635,7 @@ impl TypeChecker {
             }
             Expr::Unary { expr, .. } => self.scan_expr_for_effects(expr, effects),
             Expr::FieldAccess { expr, .. } => self.scan_expr_for_effects(expr, effects),
+            Expr::OptionalFieldAccess { expr, .. } => self.scan_expr_for_effects(expr, effects),
             Expr::Index { array, index } => {
                 self.scan_expr_for_effects(array, effects);
                 self.scan_expr_for_effects(index, effects);
@@ -1112,6 +1151,35 @@ impl TypeChecker {
                 self.pop_scope();
             }
             Stmt::ComptimeGen { .. } => {}
+            Stmt::GradBlock { var, body, .. } => {
+                // Typecheck the body, mark the variable as requiring gradient tracking
+                self.push_scope();
+                for s in body {
+                    self.check_stmt(s);
+                }
+                self.pop_scope();
+                // Mark the variable as requiring gradient tracking
+                if let Some(ty) = self.lookup(var) {
+                    let _ = ty; // variable exists — gradient tracking is handled later
+                }
+            }
+            Stmt::Backward { loss, .. } => {
+                // Typecheck the loss expression — must be F64 or Tensor
+                let loss_ty = self.check_expr(loss);
+                let is_f64 = loss_ty == Type::F64;
+                let is_tensor = match &loss_ty {
+                    Type::Named(name) => name == "Tensor",
+                    Type::Generic { name, .. } => name == "Tensor",
+                    Type::ShapedTensor { .. } => true,
+                    _ => false,
+                };
+                if !is_f64 && !is_tensor {
+                    self.errors.push(format!(
+                        "Type error: backward() loss must be F64 or Tensor, got {}",
+                        loss_ty
+                    ));
+                }
+            }
         }
     }
 
@@ -1249,6 +1317,22 @@ impl TypeChecker {
                     "read_file" | "write_file" | "file_open" | "file_read" | "file_write" => {
                         self.check_capability("FS", &format!("{}()", callee));
                     }
+                    "thread_id" | "workgroup_size" | "workgroup_id" | "num_workgroups" => {
+                        // GPU kernel builtins — return i64
+                        // These are only valid inside @kernel functions
+                        return Type::I64;
+                    }
+                    "quantize_q8" | "dequantize_q8" | "qmatmul" | "find_quant_params" => {
+                        // Quantization builtins — return Tensor or str
+                        if callee == "find_quant_params" {
+                            return Type::Str;
+                        }
+                        // quantize/dequantize/qmatmul return Tensor
+                        if let Some((_, ret)) = self.funcs.get(callee).cloned() {
+                            return ret;
+                        }
+                        return Type::Generic { name: "Tensor".to_string(), args: vec![Type::F64] };
+                    }
                     "http_get" | "http_post" | "socket_connect" | "socket_send" | "socket_recv" => {
                         self.check_capability("Net", &format!("{}()", callee));
                     }
@@ -1265,6 +1349,92 @@ impl TypeChecker {
                 }
 
                 let arg_types: Vec<Type> = args.iter().map(|a| self.check_expr(a)).collect();
+
+                // Shape-level type checking for tensor operations
+                // Verifies shape compatibility at compile time
+                match callee.as_str() {
+                    "matmul" => {
+                        if arg_types.len() == 2 {
+                            let a_shape = self.get_tensor_shape(&arg_types[0]);
+                            let b_shape = self.get_tensor_shape(&arg_types[1]);
+                            if let (Some(a), Some(b)) = (&a_shape, &b_shape) {
+                                if a.len() >= 2 && b.len() >= 2 {
+                                    let a_last = a.last().unwrap();
+                                    let b_first = b.first().unwrap();
+                                    if !self.shapes_compatible(a_last, b_first) {
+                                        self.errors.push(format!(
+                                            "Shape error: matmul incompatible — a last dim {:?} != b first dim {:?}",
+                                            a_last, b_first
+                                        ));
+                                    }
+                                    // Result shape: a[..-1] ++ b[1..]
+                                    let mut result_shape = a[..a.len()-1].to_vec();
+                                    result_shape.extend(b[1..].iter().cloned());
+                                    return Type::ShapedTensor {
+                                        elem: Box::new(Type::F64),
+                                        shape: result_shape,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    "add" | "sub" | "mul" => {
+                        if arg_types.len() == 2 {
+                            let a_shape = self.get_tensor_shape(&arg_types[0]);
+                            let b_shape = self.get_tensor_shape(&arg_types[1]);
+                            if let (Some(a), Some(b)) = (&a_shape, &b_shape) {
+                                if a.len() == b.len() {
+                                    for (i, (da, db)) in a.iter().zip(b.iter()).enumerate() {
+                                        if !self.shapes_compatible(da, db) {
+                                            self.errors.push(format!(
+                                                "Shape error: {} incompatible — dim {}: {:?} != {:?}",
+                                                callee, i, da, db
+                                            ));
+                                        }
+                                    }
+                                    return arg_types[0].clone();
+                                }
+                            }
+                        }
+                    }
+                    "transpose" => {
+                        if arg_types.len() == 1 {
+                            let shape = self.get_tensor_shape(&arg_types[0]);
+                            if let Some(s) = &shape {
+                                if s.len() == 2 {
+                                    let mut rev = s.clone();
+                                    rev.reverse();
+                                    return Type::ShapedTensor {
+                                        elem: Box::new(Type::F64),
+                                        shape: rev,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    "reshape" => {
+                        // reshape(t, new_shape) — result shape is new_shape
+                        // Size must match, but we can't verify that at compile time
+                        // without knowing the symbolic dims. Just return the new shape.
+                        if arg_types.len() == 2 {
+                            // The new shape is passed as a Vec<i64> — we can't extract it
+                            // at type-check time. Return a generic Tensor.
+                        }
+                    }
+                    "relu" | "sigmoid" | "softmax" | "scale" | "clone" => {
+                        // Elementwise — result shape = input shape
+                        if arg_types.len() >= 1 {
+                            return arg_types[0].clone();
+                        }
+                    }
+                    "sum" | "mean" | "max" | "min" | "dot" => {
+                        // Reductions — result is scalar F64
+                        if arg_types.len() >= 1 {
+                            return Type::F64;
+                        }
+                    }
+                    _ => {}
+                }
 
                 // Check if callee is a known function
                 if let Some((params, ret)) = self.funcs.get(callee).cloned() {
@@ -1344,11 +1514,36 @@ impl TypeChecker {
                 }
                 Type::Never
             }
-            Expr::StructLit { name, fields } => {
+            Expr::OptionalFieldAccess { expr, field } => {
+                // `expr?.field` — if expr is an Option wrapping a struct, unwrap and access field.
+                // If None, returns 0 (i64).
+                let obj_ty = self.check_expr(expr);
+                // For now, treat it like field access — the lowerer handles the None check
+                if let Type::Named(name) = &obj_ty {
+                    if let Some(fields) = self.structs.get(name) {
+                        if let Some((_, fty)) = fields.iter().find(|(n, _)| n == field) {
+                            return fty.clone();
+                        }
+                    }
+                }
+                // Default: returns i64 (0 if None)
+                Type::I64
+            }
+            Expr::StructLit { name, fields, spread } => {
                 // Resolve type alias to actual struct name
                 let real_name = self.resolve_struct_name(name);
                 if let Some(struct_fields) = self.structs.get(&real_name) {
                     let struct_fields = struct_fields.clone();
+                    // Check spread source type matches struct type
+                    if let Some(spread_expr) = spread {
+                        let spread_ty = self.check_expr(spread_expr);
+                        if !self.types_compatible(&Type::Named(real_name.clone()), &spread_ty) {
+                            self.errors.push(format!(
+                                "Type error: spread source expected {}, got {}",
+                                real_name, spread_ty
+                            ));
+                        }
+                    }
                     for (fname, fexpr) in fields {
                         let fty = self.check_expr(fexpr);
                         if let Some((_, expected_ty)) = struct_fields.iter().find(|(n, _)| n == fname) {
@@ -1803,6 +1998,39 @@ impl TypeChecker {
                     }
                 }
             }
+            Expr::Coalesce { expr, default } => {
+                // ?? operator: expr ?? default
+                // If expr is Option<T>, return T (unwrapped) or default (which must be T)
+                let ty = self.check_expr(expr);
+                let default_ty = self.check_expr(default);
+                match &ty {
+                    Type::Generic { name, args } if name == "Option" && args.len() == 1 => {
+                        if !self.types_compatible(&args[0], &default_ty) {
+                            self.errors.push(format!(
+                                "Type error: ?? default must be {}, got {}",
+                                args[0], default_ty
+                            ));
+                        }
+                        args[0].clone()
+                    }
+                    Type::Named(name) if name == "Option" => {
+                        if !self.types_compatible(&Type::I64, &default_ty) {
+                            self.errors.push(format!(
+                                "Type error: ?? default must be i64, got {}",
+                                default_ty
+                            ));
+                        }
+                        Type::I64
+                    }
+                    _ => {
+                        self.errors.push(format!(
+                            "Type error: ?? operator requires Option<T>, got {}",
+                            ty
+                        ));
+                        Type::Never
+                    }
+                }
+            }
             Expr::TryBlock { body } => {
                 // try { } returns Result<T, E>
                 // Check body statements, infer Ok value type from last expression
@@ -1818,6 +2046,30 @@ impl TypeChecker {
                 Type::Generic {
                     name: "Result".to_string(),
                     args: vec![last_ty, Type::I64],
+                }
+            }
+            Expr::IsCheck { expr, type_name } => {
+                // `expr is Type` or `expr is Variant`
+                // Returns bool. For enum variants, it's a runtime tag check.
+                // For types, it's a compile-time type comparison.
+                let expr_ty = self.check_expr(expr);
+
+                // Check if type_name is a known type
+                let is_type = matches!(type_name.as_str(),
+                    "i8" | "i16" | "i32" | "i64" | "i128" |
+                    "u8" | "u16" | "u32" | "u64" | "u128" |
+                    "f32" | "f64" | "bool" | "str" | "void"
+                ) || self.structs.contains_key(type_name) || self.enums.contains(type_name);
+
+                if is_type {
+                    // Compile-time type check — always evaluates to a constant bool
+                    Type::Bool
+                } else {
+                    // Could be an enum variant name (e.g., "Some", "None")
+                    // The typechecker only stores enum names, not variants.
+                    // The lowerer will validate the variant at lowering time.
+                    // For now, just accept any identifier as a potential variant.
+                    Type::Bool
                 }
             }
             Expr::TupleLit(elems) => {
@@ -1879,6 +2131,55 @@ impl TypeChecker {
                     }
                 }
             }
+            Expr::PipeForward { left, right } => {
+                // Typecheck left, then typecheck right as a function applied to left's type
+                let left_ty = self.check_expr(left);
+                // Desugar: if right is a Call, typecheck as call with left prepended to args
+                match right.as_ref() {
+                    Expr::Call { callee, args } => {
+                        let mut all_args = vec![left.as_ref().clone()];
+                        all_args.extend(args.iter().cloned());
+                        let new_call = Expr::Call { callee: callee.clone(), args: all_args };
+                        self.check_expr(&new_call)
+                    }
+                    Expr::MethodCall { receiver, method, args } => {
+                        let new_call = Expr::MethodCall {
+                            receiver: left.clone(),
+                            method: method.clone(),
+                            args: args.clone(),
+                        };
+                        let _ = receiver; // suppress unused warning
+                        self.check_expr(&new_call)
+                    }
+                    Expr::Ident(name) => {
+                        // x |> f  →  f(x)
+                        let new_call = Expr::Call {
+                            callee: name.clone(),
+                            args: vec![left.as_ref().clone()],
+                        };
+                        self.check_expr(&new_call)
+                    }
+                    Expr::FieldAccess { expr: receiver, field } => {
+                        // x |> obj.method  →  obj.method(x)
+                        let new_call = Expr::MethodCall {
+                            receiver: receiver.clone(),
+                            method: field.clone(),
+                            args: vec![left.as_ref().clone()],
+                        };
+                        self.check_expr(&new_call)
+                    }
+                    _ => {
+                        // Fallback: typecheck right and return its type
+                        let _ = left_ty;
+                        self.check_expr(right)
+                    }
+                }
+            }
+            Expr::QuantCast { expr, target_ty } => {
+                // Typecheck the inner expr, return the target type
+                self.check_expr(expr);
+                self.resolve_type(target_ty)
+            }
         }
     }
 
@@ -1893,6 +2194,29 @@ impl TypeChecker {
             }
             Type::ArrayConst { .. } => ty.clone(),
             other => other.clone(),
+        }
+    }
+
+    /// Extract the shape from a tensor type. Returns None for untyped tensors.
+    fn get_tensor_shape(&self, ty: &Type) -> Option<Vec<ShapeDim>> {
+        match ty {
+            Type::ShapedTensor { shape, .. } => Some(shape.clone()),
+            Type::Generic { name, .. } if name == "Tensor" => None,
+            Type::Named(name) if name == "Tensor" => None,
+            _ => None,
+        }
+    }
+
+    /// Check if two shape dimensions are compatible.
+    /// Two Known dims are compatible if they're equal.
+    /// A Known dim is compatible with a Symbolic dim (the symbolic dim is a wildcard).
+    /// Two Symbolic dims are compatible if they have the same name.
+    fn shapes_compatible(&self, a: &ShapeDim, b: &ShapeDim) -> bool {
+        match (a, b) {
+            (ShapeDim::Known(a), ShapeDim::Known(b)) => a == b,
+            (ShapeDim::Known(_), ShapeDim::Symbolic(_)) => true,
+            (ShapeDim::Symbolic(_), ShapeDim::Known(_)) => true,
+            (ShapeDim::Symbolic(a), ShapeDim::Symbolic(b)) => a == b || a == "_" || b == "_",
         }
     }
 

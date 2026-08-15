@@ -356,6 +356,139 @@ The PE emitter generates standalone Windows x64 PE executables with no external 
 
 ---
 
+## AI/ML Features
+
+Six AI/ML-oriented features have been added to the P language, enabling neural network programming with compile-time safety, automatic differentiation, GPU kernel support, and quantization.
+
+### Pipeline Operator (`|>`)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `|>` operator | ✅ | Chains function calls: `x \|> f \|> g` desugars to `g(f(x))` |
+| Bare identifier chaining | ✅ | `x \|> f` calls `f(x)` |
+| Method call chaining | ✅ | `x \|> obj.method()` calls `obj.method(x)` |
+| Field access chaining | ✅ | `x \|> obj.field` accesses `obj.field` |
+
+**Syntax example:**
+```p
+pv result = x |> square |> add_one |> print;
+// equivalent to: print(add_one(square(x)));
+```
+
+### Layer/Model Syntax
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `layer` keyword | ✅ | Neural network layer declarations |
+| `model` keyword | ✅ | Model declarations containing layers |
+| Layer desugaring | ✅ | Layers desugar to structs + impls + constructor functions |
+| Model desugaring | ✅ | Models desugar to structs containing layers + forward method |
+| `forward` method | ✅ | Required method on layers and models |
+
+**Syntax example:**
+```p
+layer Dense {
+    w: Tensor,
+    b: Tensor,
+    forward(self, x: Tensor) -> Tensor {
+        ret matmul(x, self.w) + self.b;
+    }
+}
+
+model MLP {
+    l1: Dense(784, 128),
+    l2: Dense(128, 10),
+    forward(self, x: Tensor) -> Tensor {
+        ret x |> self.l1.forward |> relu |> self.l2.forward;
+    }
+}
+```
+
+### Shape-Level Type Safety
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `Tensor<f32, [784, 128]>` type syntax | ✅ | Compile-time shape checking |
+| Concrete shape dimensions | ✅ | e.g. `784`, `128` |
+| Symbolic shape dimensions | ✅ | e.g. `batch` |
+| Shape verification for `matmul` | ✅ | Compile-time check: inner dimensions must match |
+| Shape verification for `add`/`sub`/`mul` | ✅ | Compile-time check: shapes must be compatible |
+| Shape verification for `transpose` | ✅ | Compile-time check: dimensions swap correctly |
+| Shape mismatch as compile error | ✅ | Shape mismatches are compile errors, not runtime crashes |
+
+**Syntax example:**
+```p
+pv w: Tensor<f32, [784, 128]> = ...;
+pv x: Tensor<f32, [batch, 784]> = ...;
+pv y: Tensor<f32, [batch, 128]> = matmul(x, w);  // shape-checked at compile time
+```
+
+### Autograd Block
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `grad(var) { ... }` syntax | ✅ | Compile-time reverse-mode automatic differentiation |
+| `backward(loss)` statement | ✅ | Triggers reverse-mode AD within a grad block |
+| Tape-based gradient computation | ✅ | `src/autograd.rs` — traces operations and builds backward computation graph |
+| Compilation pipeline integration | ✅ | Autograd pass hooked into compilation pipeline |
+
+**Syntax example:**
+```p
+grad(w) {
+    pv loss = compute_loss(w);
+    backward(loss);
+}
+// After the grad block, w has been updated with computed gradients
+```
+
+### GPU Kernel Annotation
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `@kernel` annotation | ✅ | Marks functions as GPU kernels |
+| `thread_id(dim)` builtin | ✅ | On GPU: maps to SPIR-V `GlobalInvocationId` / PTX `threadIdx`; on CPU: returns 0 |
+| `workgroup_size(dim)` builtin | ✅ | Workgroup size query |
+| `workgroup_id(dim)` builtin | ✅ | Workgroup index query |
+| `num_workgroups()` builtin | ✅ | Total workgroup count |
+| Configurable workgroup sizes | ✅ | Enhanced SPIR-V codegen |
+| CPU fallback | ✅ | Single-threaded fallback (`thread_id()` returns 0) |
+
+**Syntax example:**
+```p
+@kernel
+pf vector_add(a: &Tensor, b: &Tensor, c: &mut Tensor, n: i64) {
+    pv i = thread_id(0);
+    if i < n {
+        c[i] = a[i] + b[i];
+    }
+}
+```
+
+### Quantized Types
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `q8` type alias | ✅ | Maps to `i8` storage |
+| `q4` type alias | ✅ | Maps to `i8` storage |
+| `~>` quantization cast operator | ✅ | `expr ~> q8` quantizes an expression |
+| `quantize_q8` stdlib function | ✅ | `stdlib/quant.p` |
+| `dequantize_q8` stdlib function | ✅ | `stdlib/quant.p` |
+| `qmatmul` stdlib function | ✅ | Quantized matrix multiplication |
+| `find_quant_params` stdlib function | ✅ | Find quantization scale and zero-point |
+
+**Syntax example:**
+```p
+use quant;
+
+pv w: Tensor = ...;
+pv q_w = w ~> q8;                    // quantize weights to 8-bit
+pv q_x = x ~> q8;                    // quantize activations
+pv q_out = quant::qmatmul(q_x, q_w); // quantized matmul
+pv out = quant::dequantize_q8(q_out); // dequantize result
+```
+
+---
+
 ## Summary
 
 | Component | Working | Partial | Broken |

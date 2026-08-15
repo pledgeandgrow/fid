@@ -1,5 +1,131 @@
 # P Language Changelog
 
+## Banking & Cross-Industry Safety Features Planned (August 2026)
+
+### Banking & Finance (F38–F43, S19–S21)
+- **F38: `money` type** — first-class financial type with dimensional rules (money × money = compile error, no FP, no overflow, no truncation)
+- **F39: `@conserve`** — compile-time money conservation proof (double-entry bookkeeping enforced by compiler — P's killer feature for banking, no other language has this)
+- **F40: `txn { }` blocks** — language-level atomic transactions with auto-rollback, compiler verifies all operations are reversible
+- **F41: Linear money** — money can be moved, not copied (prevents duplication at type level, like Rust ownership but for money)
+- **F42: `Account<State>` types** — state-encoded account types (Active/Frozen/Closed can't be mixed, no runtime check needed)
+- **F43: `LogicalTime` type** — timezone-free, clock-free time for deterministic date math
+- **S19–S21: Banking stdlib** — core banking, SWIFT messaging, payment rails (ACH, SEPA, FedNow, UPI, Pix)
+
+### Automotive (F44, F52–F55, S22–S23)
+- **F44: `@safety-critical`** — compiler enforces DO-178C/ISO 26262 coding rules at compile time (no heap, no recursion, bounded loops)
+- **F52: `@autosar`** — compiler enforces AUTOSAR coding guidelines (no dynamic alloc post-startup, complexity ≤ 15)
+- **F53: `@can-bus`** — compiler generates CAN frame encoding with compile-time ID collision verification
+- **F54: `@diagnostic`** — compiler auto-generates UDS/OBD diagnostic service handlers
+- **F55: `@calibratable`** — compiler marks tunable parameters, generates calibration data format
+- **S22–S23: Automotive stdlib** — CAN bus (J1939, OBD-II, UDS), ECU abstractions
+
+### Aerospace & Defense (F45–F47, F56–F58, S24–S25)
+- **F45: `@redundant`** — compiler generates dual-channel redundant execution + voter comparison (flight control)
+- **F46: `@bounded`** — compiler proves all loops terminate (WCET requirement)
+- **F47: `@partitioned`** — compiler enforces spatial + temporal partitioning (ARINC 653)
+- **F56: `@dal-a`** — compiler enforces DO-178C DAL-A (highest safety level, strictest rules)
+- **F57: `@arinc`** — compiler generates ARINC 653 partition scheduling + port communication
+- **F58: `@bit-exact`** — compiler guarantees bit-identical FP results across hardware
+- **S24–S25: Aerospace stdlib** — ARINC 653, Ada-style safety patterns
+
+### Energy & Grid (F59–F60, S26–S27)
+- **F59: `@grid-safe`** — compiler enforces IEC 61850 rules (≤ 4ms response, no blocking, deterministic dispatch)
+- **F60: `@scada`** — compiler generates SCADA protocol stubs with compile-time point verification
+- **S26–S27: Energy stdlib** — IEC 61850 (GOOSE/SV/MMS), SCADA (Modbus, DNP3, IEC 60870)
+
+### Medical (F48, F50, F51, S28–S29)
+- **F48: `@medical`** — compiler enforces IEC 62304 rules (no dynamic alloc, no recursion, no FP, full logging)
+- **F50: `@signed`** — compiler requires cryptographic signatures on all state transitions
+- **F51: `@reproducible`** — compiler verifies bit-identical output across runs/builds
+- **S28–S29: Medical stdlib** — HL7/FHIR, DICOM, ICD coding, clinical calculations
+
+### Key Insight: Cross-Industry Synergy
+All industries share the same 3 core safety systems (capabilities, effects, regions). Each industry's annotations are different configurations of those systems. Building `@deterministic` for medical makes `@gas` for blockchain cheaper. Building `@bounded` for aerospace makes `@crashfree` for gaming stronger. This is P's moat — one language, every industry, compile-time proofs.
+
+### Feature Count Update
+- Total features analyzed: **105** (was 69)
+- Syntax features: **52** (was 31) — added 21 banking/automotive/aerospace/energy/medical features
+- Stdlib modules: **29** (was 18) — added 11 industry-specific stdlib modules
+
+## C Codegen Full Parity (August 2026)
+
+### Closed All C Codegen Gaps
+- **test_asm**: Inline assembly now emits as C comments (`/* asm: nop */`) with return value 0, matching the interpreter's no-op behavior. Previously emitted `__asm__ volatile()` blocks that crashed on privileged instructions (hlt, cli, sti).
+- **test_comptime_reflect**: Fixed comptime reflection array element type from `Type::Named("str")` (→ `struct.str`) to `Type::Str` (→ `*u8`), matching how `StringLit` lowers to `ConstStr` (`*u8`). Previously, storing `*u8` pointers into `struct.str` array slots caused garbage output in C codegen.
+- **Result**: C codegen now at **86/86** matched — FULL PARITY with interpreter.
+
+## Phase 7 Ergonomics Features (August 2026)
+
+### F11: `is` Type/Variant Check
+- Added `is` keyword and `Expr::IsCheck` AST node
+- `expr is Type` — compile-time type check (evaluates to constant true/false)
+- `expr is Variant` — runtime enum variant check (loads tag, compares to variant index)
+- Works with all primitive types (i64, i32, f64, bool, str, etc.) and enum variants
+
+### F8: `?.` Optional Chaining
+- Added `?.` token (`QuestionDot`) and `Expr::OptionalFieldAccess` AST node
+- `expr?.field` — if expr is None, short-circuits to 0; else unwraps and accesses field
+- Works with Option type; full field access on wrapped structs requires generic Option<T> (Phase 10)
+
+### F9: `??` Coalescing
+- `option ?? default` — if None, return default; else unwrap
+
+### F7: `..` Spread Operator
+- `StructLit { x: 1, ..p }` — copies all fields from p, then overrides x
+
+### F6: `guard` Statement
+- `guard cond => action` — early exit without nesting (desugars to `if !cond { action }`)
+
+## AI/ML Features (August 2026)
+
+### Pipeline Operator (`|>`)
+- Added `|>` operator for chaining function calls: `x |> f |> g` desugars to `g(f(x))`
+- Works with bare identifiers, method calls, and field access
+- New token: `PipeArrow` (`|>`)
+- New AST node: `Expr::PipeForward`
+
+### Layer/Model Syntax
+- Added `layer` keyword for neural network layer declarations
+- Added `model` keyword for model declarations
+- Layers desugar to structs + impls + constructor functions
+- Models desugar to structs containing layers + forward method
+- Example: `layer Dense { w: Tensor, b: Tensor, forward(self, x) -> Tensor { ... } }`
+- Example: `model MLP { l1: Dense(784, 128), l2: Dense(128, 10), forward(self, x) -> Tensor { ... } }`
+- New AST nodes: `LayerDef`, `ModelDef`
+- Desugaring pass in `compiler.rs::desugar_layers_models()`
+
+### Shape-Level Type Safety
+- Added `Tensor<f32, [784, 128]>` type syntax with compile-time shape checking
+- Shape dimensions can be concrete (`784`) or symbolic (`batch`)
+- Compile-time shape verification for `matmul`, `add`, `sub`, `mul`, `transpose`
+- Shape mismatches are compile errors, not runtime crashes
+- New AST nodes: `Type::ShapedTensor`, `ShapeDim::Known`, `ShapeDim::Symbolic`
+- Shape checking in `typechecker.rs`
+
+### Autograd Block
+- Added `grad(var) { ... backward(loss); }` syntax for compile-time reverse-mode AD
+- The compiler traces operations and builds a backward computation graph
+- `backward(loss)` triggers reverse-mode AD within a grad block
+- New module: `src/autograd.rs` with tape-based gradient computation framework
+- New AST nodes: `Stmt::GradBlock`, `Stmt::Backward`
+- Autograd pass hooked into compilation pipeline
+
+### GPU Kernel Annotation
+- Added `@kernel` annotation for GPU kernel functions
+- Added `thread_id(dim)`, `workgroup_size(dim)`, `workgroup_id(dim)`, `num_workgroups()` builtins
+- On CPU: `thread_id()` returns 0 (single-threaded fallback)
+- On GPU: maps to SPIR-V `GlobalInvocationId` / PTX `threadIdx`
+- New token: `At` (`@`)
+- New AST node: `Annotation` struct on `Func`
+- Enhanced SPIR-V codegen with configurable workgroup sizes
+
+### Quantized Types
+- Added `q8` and `q4` type aliases (map to `i8` storage)
+- Added `~>` quantization cast operator: `expr ~> q8`
+- Added `quant.p` stdlib with `quantize_q8`, `dequantize_q8`, `qmatmul`, `find_quant_params`
+- New token: `TildeArrow` (`~>`)
+- New AST node: `Expr::QuantCast`
+
 ## [Unreleased] — Documentation Audit + Roadmap Accuracy Pass
 
 ### Documentation Updates

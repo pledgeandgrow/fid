@@ -33,6 +33,24 @@ pub enum Type {
     Assoc(String, String, String, Vec<Type>),
     /// A trait object type: `dyn TraitName` — enables dynamic dispatch.
     Dyn(String),
+    /// A shaped tensor type: Tensor<f32, [784, 128]> or Tensor<f32, [batch, 784]>
+    /// The shape dimensions are either integer literals or symbolic names.
+    /// The type checker solves a constraint system at compile time to verify
+    /// shape compatibility for matmul, add, etc.
+    ShapedTensor {
+        elem: Box<Type>,
+        shape: Vec<ShapeDim>,
+    },
+}
+
+/// A dimension in a tensor shape: either a concrete integer or a symbolic name.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShapeDim {
+    /// Concrete dimension: 784, 128, etc.
+    Known(i64),
+    /// Symbolic dimension: batch, seq_len, etc.
+    /// Two uses of the same symbolic name must match.
+    Symbolic(String),
 }
 
 impl std::fmt::Display for Type {
@@ -96,6 +114,21 @@ impl std::fmt::Display for Type {
                 }
             }
             Type::Dyn(name) => write!(f, "dyn {}", name),
+            Type::ShapedTensor { elem, shape } => {
+                write!(f, "Tensor<{}", elem)?;
+                if !shape.is_empty() {
+                    write!(f, ", [")?;
+                    for (i, d) in shape.iter().enumerate() {
+                        if i > 0 { write!(f, ", ")?; }
+                        match d {
+                            ShapeDim::Known(n) => write!(f, "{}", n)?,
+                            ShapeDim::Symbolic(s) => write!(f, "{}", s)?,
+                        }
+                    }
+                    write!(f, "]")?;
+                }
+                write!(f, ">")
+            }
         }
     }
 }
@@ -124,9 +157,17 @@ pub enum Expr {
         expr: Box<Expr>,
         field: String,
     },
+    /// Optional field access: `expr?.field` — if expr is None, return 0; else access field.
+    OptionalFieldAccess {
+        expr: Box<Expr>,
+        field: String,
+    },
     StructLit {
         name: String,
         fields: Vec<(String, Expr)>,
+        /// Spread source: `Point { x: 1, ..p }` copies all fields from p, then overrides x.
+        /// The expression must be of the same struct type.
+        spread: Option<Box<Expr>>,
     },
     If {
         cond: Box<Expr>,
@@ -178,6 +219,19 @@ pub enum Expr {
     Try {
         expr: Box<Expr>,
     },
+    /// Coalescing: `expr ?? default` — if expr is None, return default; else unwrap and return.
+    Coalesce {
+        expr: Box<Expr>,
+        default: Box<Expr>,
+    },
+    /// Type/variant check: `expr is Type` or `expr is Variant`.
+    /// For enum variants, this is a runtime tag check.
+    /// For types, this is a compile-time type check.
+    IsCheck {
+        expr: Box<Expr>,
+        /// Type name or enum variant name (e.g., "i64", "str", "Some", "None")
+        type_name: String,
+    },
     TryBlock {
         body: Vec<Stmt>,
     },
@@ -205,6 +259,19 @@ pub enum Expr {
     ComptimeReflect {
         op: ReflectOp,
         ty: Type,
+    },
+    /// Pipeline operator: left |> right
+    /// Desugars to: right(left) if right is a function call,
+    /// or right.forward(left) if right is a method call.
+    PipeForward {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// Quantization cast: expr ~> target_ty
+    /// Converts a tensor to a quantized representation (q8, q4, etc.)
+    QuantCast {
+        expr: Box<Expr>,
+        target_ty: Type,
     },
 }
 
@@ -386,6 +453,21 @@ pub enum Stmt {
         block: Vec<Stmt>,
         line: usize,
     },
+    /// grad(var) { body; backward(loss); }
+    /// Compile-time reverse-mode automatic differentiation.
+    /// The compiler traces operations on `var` within the block,
+    /// builds a backward computation graph, and emits gradient code.
+    GradBlock {
+        var: String,
+        body: Vec<Stmt>,
+        line: usize,
+    },
+    /// backward(loss) — triggers reverse-mode AD within a grad block.
+    /// Populates .grad on all tracked variables.
+    Backward {
+        loss: Expr,
+        line: usize,
+    },
 }
 
 /// A handler for one effect operation within a `handle` block.
@@ -424,7 +506,9 @@ impl Stmt {
             | Stmt::Do { line, .. }
             | Stmt::RegionBlock { line, .. }
             | Stmt::Sandbox { line, .. }
-            | Stmt::ComptimeGen { line, .. } => *line,
+            | Stmt::ComptimeGen { line, .. }
+            | Stmt::GradBlock { line, .. }
+            | Stmt::Backward { line, .. } => *line,
         }
     }
 }
@@ -473,6 +557,15 @@ pub struct Func {
     /// Whether this is an interrupt handler (bare-metal mode).
     /// Interrupt handlers save/restore all registers and use `iret` instead of `ret`.
     pub is_interrupt: bool,
+    /// Annotations attached to this function (e.g. @kernel, @serve, @on(gpu))
+    pub annotations: Vec<Annotation>,
+}
+
+/// An annotation: @name or @name(args)
+#[derive(Debug, Clone, PartialEq)]
+pub struct Annotation {
+    pub name: String,
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -585,6 +678,39 @@ pub struct Program {
     pub traits: Vec<TraitDef>,
     pub trait_impls: Vec<TraitImpl>,
     pub extern_decls: Vec<ExternDecl>,
+    /// Layer definitions: `layer Dense { fields... forward(self, x) -> T { ... } }`
+    pub layers: Vec<LayerDef>,
+    /// Model definitions: `model MLP { layers... forward(self, x) -> T { ... } }`
+    pub models: Vec<ModelDef>,
+}
+
+/// A neural network layer definition.
+/// Syntactic sugar for a struct with a `forward` method.
+/// `layer Dense { w: Tensor, b: Tensor, forward(self, x: Tensor) -> Tensor { ... } }`
+/// desugars to:
+///   struct Dense { w: Tensor, b: Tensor }
+///   impl Dense { pf forward(self: Dense, x: Tensor) -> Tensor { ... }
+///   pf Dense_new(...) -> Dense { ... }  // constructor
+#[derive(Debug, Clone)]
+pub struct LayerDef {
+    pub name: String,
+    pub fields: Vec<Param>,
+    /// Constructor args (e.g. Dense(784, 128) → args = ["784", "128"])
+    pub constructor_args: Vec<String>,
+    pub forward: Func,
+    pub is_pub: bool,
+}
+
+/// A neural network model definition.
+/// Syntactic sugar for a struct containing layers with a `forward` method.
+/// `model MLP { l1: Dense(784, 128), l2: Dense(128, 10), forward(self, x) -> T { ... } }`
+#[derive(Debug, Clone)]
+pub struct ModelDef {
+    pub name: String,
+    /// Layer instantiations: (field_name, layer_type, constructor_args)
+    pub layers: Vec<(String, String, Vec<String>)>,
+    pub forward: Func,
+    pub is_pub: bool,
 }
 
 /// An extern declaration for FFI: `extern "C" pf name(params) -> ret_ty;`

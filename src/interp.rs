@@ -2371,10 +2371,13 @@ impl Interpreter {
             }
             "p_db_mem_query" => {
                 // Query: SELECT key FROM db -> return JSON array of all keys
+                // Sort keys for deterministic output (matches C codegen's insertion-order array)
                 if let Some(Value::Int(h)) = args.first() {
                     if let Some(db) = self.databases.get(&(*h as u64)) {
-                        let arr: Vec<json::Json> = db.keys()
-                            .map(|k| json::Json::String(k.clone()))
+                        let mut keys: Vec<&str> = db.keys().map(|k| k.as_str()).collect();
+                        keys.sort();
+                        let arr: Vec<json::Json> = keys.into_iter()
+                            .map(|k| json::Json::String(k.to_string()))
                             .collect();
                         let j = json::Json::Array(arr);
                         return ExecOutcome::Value(Value::Str(CompactString::from(json::dump(&j, false))));

@@ -219,6 +219,12 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<String>) 
         Stmt::Sandbox { body, .. } => {
             substitute_stmts(body, original, errs);
         }
+        Stmt::GradBlock { body, .. } => {
+            substitute_stmts(body, original, errs);
+        }
+        Stmt::Backward { loss, .. } => {
+            substitute_expr(loss, original, errs);
+        }
     }
 }
 
@@ -242,6 +248,7 @@ fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<String>) 
             }
         }
         Expr::FieldAccess { expr: inner, .. } => substitute_expr(inner, original, errs),
+        Expr::OptionalFieldAccess { expr: inner, .. } => substitute_expr(inner, original, errs),
         Expr::StructLit { fields, .. } => {
             for (_, e) in fields.iter_mut() {
                 substitute_expr(e, original, errs);
@@ -282,6 +289,11 @@ fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<String>) 
             substitute_expr(right, original, errs);
         }
         Expr::Try { expr: inner } => substitute_expr(inner, original, errs),
+        Expr::Coalesce { expr, default } => {
+            substitute_expr(expr, original, errs);
+            substitute_expr(default, original, errs);
+        }
+        Expr::IsCheck { expr, .. } => substitute_expr(expr, original, errs),
         Expr::TryBlock { body } => substitute_stmts(body, original, errs),
         Expr::TupleLit(exprs) => {
             for e in exprs.iter_mut() {
@@ -314,6 +326,13 @@ fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<String>) 
         }
         Expr::IntLit(_) | Expr::FloatLit(_) | Expr::StringLit(_)
         | Expr::BoolLit(_) | Expr::Ident(_) | Expr::EnumLit { .. } => {}
+        Expr::PipeForward { left, right } => {
+            substitute_expr(left, original, errs);
+            substitute_expr(right, original, errs);
+        }
+        Expr::QuantCast { expr: inner, .. } => {
+            substitute_expr(inner, original, errs);
+        }
     }
 }
 
@@ -944,8 +963,9 @@ fn evaluate_reflect(op: &ReflectOp, ty: &Type, original: &Program) -> Result<Exp
             let elements: Vec<Expr> = s.fields.iter()
                 .map(|f| Expr::StringLit(f.name.clone()))
                 .collect();
+            // Element type is Str (lowers to *u8, matching StringLit → ConstStr)
             Ok(Expr::ArrayLit {
-                elem_type: Box::new(Type::Named("str".to_string())),
+                elem_type: Box::new(Type::Str),
                 elements,
             })
         }
@@ -957,7 +977,7 @@ fn evaluate_reflect(op: &ReflectOp, ty: &Type, original: &Program) -> Result<Exp
                 .map(|f| Expr::StringLit(format!("{}", f.ty)))
                 .collect();
             Ok(Expr::ArrayLit {
-                elem_type: Box::new(Type::Named("str".to_string())),
+                elem_type: Box::new(Type::Str),
                 elements,
             })
         }
@@ -969,7 +989,7 @@ fn evaluate_reflect(op: &ReflectOp, ty: &Type, original: &Program) -> Result<Exp
                 .map(|v| Expr::StringLit(v.name.clone()))
                 .collect();
             Ok(Expr::ArrayLit {
-                elem_type: Box::new(Type::Named("str".to_string())),
+                elem_type: Box::new(Type::Str),
                 elements,
             })
         }

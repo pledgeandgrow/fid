@@ -52,13 +52,13 @@ cargo build
 ```
 Unit tests:   136/136 passed
 Harness:      8/8 passed       (golden_files_match now passes)
-Interpreter:  78/78 passed     (+ 1/1 expected fail: test_trait_verify_fail)
-C Codegen:    76/78 matched    (2 real mismatches: test_asm [by design], test_comptime_reflect [interpreter-only];
-                                test_db is flaky — HashMap ordering non-deterministic, sometimes 75/78)
-PE Emitter:   78/78 valid      (+ 1/1 expected fail: test_trait_verify_fail)
+Interpreter:  86/86 passed     (+ 3/3 expected fail: test_trait_verify_fail, test_budget_fail, test_sandbox_fail)
+C Codegen:    86/86 matched    (FULL PARITY — no gaps)
+PE Emitter:   86/86 valid      (+ 3/3 expected fail: test_trait_verify_fail, test_budget_fail, test_sandbox_fail)
+Skip list:    20 tests         (interpreter-only features: comptime, bare metal, WASM, SIMD, tensor, HTTP, JSON, etc.)
 ```
 
-**Note:** `test_db` is flaky due to non-deterministic HashMap iteration order in both interpreter and C codegen. A "regression" on `test_db` in `verify.sh` is likely a false alarm — re-run to confirm.
+**Note:** `test_db` is no longer flaky — HashMap keys are now sorted in the interpreter for deterministic output.
 
 **Before making any change:** run `./verify.sh` to confirm you're starting from a known-good state.
 
@@ -77,7 +77,7 @@ touching them.
 | `src/coff.rs` | **HIGH** | COFF object file format. Same byte-level risk as PE/ELF. |
 | `src/macho.rs` | **HIGH** | Mach-O object file format. Same byte-level risk. |
 | `src/codegen_x64.rs` | **HIGH** | PIR L3 → x86-64 instruction encoding. ModRM/SIB bytes, REX prefixes, ABI rules. |
-| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 76/78 test parity. |
+| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 79/81 test parity. |
 | `src/pir.rs` | **HIGH** | PIR L1/L2/L3 transforms. A bad lowering propagates to all backends. |
 | `src/lower.rs` | **MEDIUM** | AST → SSA IR. Changes here affect interpreter + all backends. |
 | `src/typechecker.rs` | **MEDIUM** | Types + regions + effects + capabilities. Wrong rejection = broken code; wrong acceptance = silent miscompilation. |

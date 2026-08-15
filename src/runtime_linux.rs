@@ -2751,9 +2751,6 @@ p_print_map:
     let asm_base = text.len();
     text.extend_from_slice(&asm_bytes);
     for (name, offset) in &asm_syms {
-        if name.starts_with("p_string") {
-            eprintln!("  ASM SYM: {} at asm_off=0x{:x} → text_off=0x{:x}", name, offset, asm_base + *offset as usize);
-        }
         let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
         symbols.push((leaked, asm_base as u64 + offset, 0));
     }

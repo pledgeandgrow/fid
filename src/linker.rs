@@ -451,14 +451,6 @@ impl Linker {
         // Resolve relocations and patch the text
         let text_size = self.text_bytes.len() as u64;
         for (offset, sym_name, r_type) in &self.relocations {
-            if sym_name.contains("p_string_split") || sym_name.contains("p_string_trim") {
-                eprintln!("  LINK RELOC: off=0x{:x} name={} rtype={}", offset, sym_name, r_type);
-                if let Some((sym_offset, is_defined)) = self.symbols.get(sym_name) {
-                    eprintln!("    → sym at 0x{:x} defined={}", sym_offset, is_defined);
-                } else {
-                    eprintln!("    → sym NOT FOUND");
-                }
-            }
             // Look up symbol in text symbols first, then rodata symbols
             let sym_offset_opt = if let Some((sym_offset, is_defined)) = self.symbols.get(sym_name) {
                 if !is_defined {

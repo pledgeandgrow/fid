@@ -107,7 +107,7 @@ Before type-checking, the compiler:
 4. Merges stdlib + imported modules + user code (user wins on conflicts)
 5. Type-checks the merged program with module-level visibility enforcement
 
-**Standard library modules** (in `stdlib/`): `core.p` (auto-included), `json.p`, `tensor.p`, `parallel.p`, `db.p`, `http.p`, `simd.p`, `shape.p` — imported explicitly via `use`.
+**Standard library modules** (in `stdlib/`): `core.p` (auto-included), `json.p`, `tensor.p`, `parallel.p`, `db.p`, `http.p`, `simd.p`, `shape.p`, `quant.p` — imported explicitly via `use`.
 
 ### Monomorphization (`mono.rs`)
 
@@ -456,6 +456,57 @@ The P compiler supports multiple output backends, each consuming either IR or PI
 
 **Linux runtime:** `runtime_linux.rs` provides hand-encoded x86_64 machine code for raw Linux syscalls (write, exit, mmap) — no libc dependency. Used by the ELF64 backend.
 
+### 2.11 AI/ML Extensions
+
+The P compiler includes six AI/ML-oriented features that extend the language for neural network programming, automatic differentiation, GPU acceleration, and quantization. These features are integrated into the existing pipeline through new AST nodes, compiler passes, and a dedicated autograd module.
+
+**Pipeline Operator (`|>`):**
+- New token `PipeArrow` (`|>`) in `token.rs`, lexed by `lexer.rs`
+- New AST node `Expr::PipeForward` in `ast.rs`, parsed by `parser.rs`
+- Desugars `x |> f |> g` to `g(f(x))` during parsing — works with bare identifiers, method calls, and field access
+- No new IR instructions — pipeline expressions are lowered to standard `Call` / `MethodCall` / `FieldAccess` IR nodes
+
+**Layer/Model Syntax:**
+- New keywords `layer` and `model` in `token.rs`, parsed into `LayerDef` and `ModelDef` AST nodes
+- **Desugaring pass** in `compiler.rs::desugar_layers_models()` runs after parsing and before type-checking:
+  - `layer Dense { w: Tensor, b: Tensor, forward(self, x) -> Tensor { ... } }` desugars to a `struct Dense` + `impl Dense { forward() }` + a constructor function `Dense(args)`
+  - `model MLP { l1: Dense(784, 128), l2: Dense(128, 10), forward(self, x) -> Tensor { ... } }` desugars to a `struct MLP` containing layer fields + `impl MLP { forward() }`
+- After desugaring, layers and models are standard structs and impls — no special handling needed in typechecker, lowerer, or backends
+
+**Shape-Level Type Safety:**
+- New AST nodes `Type::ShapedTensor`, `ShapeDim::Known`, `ShapeDim::Symbolic` in `ast.rs`
+- Shape checking implemented in `typechecker.rs` — verifies shape compatibility for `matmul`, `add`, `sub`, `mul`, `transpose` at compile time
+- Shape dimensions can be concrete (`784`) or symbolic (`batch`) — symbolic dimensions are tracked but not resolved
+- Shape mismatches produce compile errors, not runtime crashes
+- Shapes are erased during IR lowering — the IR `Tensor` type is unshaped (runtime tensors carry shape metadata)
+
+**Autograd (`autograd.rs`):**
+- New module `src/autograd.rs` implements a tape-based gradient computation framework
+- New AST nodes `Stmt::GradBlock` and `Stmt::Backward` in `ast.rs`
+- `grad(var) { ... backward(loss); }` syntax: the compiler traces operations within the grad block and builds a backward computation graph
+- The autograd pass is hooked into the compilation pipeline after type-checking and before IR lowering:
+  1. Identifies `GradBlock` statements and the variable to differentiate
+  2. Traces all operations on the target variable within the block
+  3. Builds a backward computation graph using reverse-mode AD
+  4. Emits gradient computation code as additional IR instructions
+- Supports standard tensor operations: `matmul`, `add`, `sub`, `mul`, `relu`, `softmax`, etc.
+
+**GPU Kernel Annotation:**
+- New token `At` (`@`) in `token.rs`, lexed by `lexer.rs`
+- New `Annotation` struct on `Func` in `ast.rs` — parsed by `parser.rs`
+- `@kernel` annotation marks functions as GPU kernels
+- Builtins: `thread_id(dim)`, `workgroup_size(dim)`, `workgroup_id(dim)`, `num_workgroups()` — available within `@kernel` functions
+- On CPU: `thread_id()` returns 0 (single-threaded fallback) — enables testing GPU kernels in the interpreter
+- On GPU: maps to SPIR-V `GlobalInvocationId` / PTX `threadIdx`
+- Enhanced SPIR-V codegen in `gpu.rs` with configurable workgroup sizes
+
+**Quantized Types:**
+- New token `TildeArrow` (`~>`) in `token.rs`, lexed by `lexer.rs`
+- New AST node `Expr::QuantCast` in `ast.rs` — parsed by `parser.rs`
+- `q8` and `q4` type aliases map to `i8` storage — registered in the typechecker
+- `expr ~> q8` quantization cast operator — lowered to calls to `quantize_q8` / `quantize_q4` from `stdlib/quant.p`
+- New stdlib module `stdlib/quant.p` with `quantize_q8`, `dequantize_q8`, `qmatmul`, `find_quant_params`
+
 ---
 
 ## 3. Verification Infrastructure
@@ -509,7 +560,8 @@ The compiler includes a suite of scripts and conventions for maintaining correct
 | `src/peephole.rs` | **9-pass peephole optimizer**: always on in `build` (redundant moves, zero idiom, branch threading, store-to-load, LEA coalescing, instruction selection) |
 | `src/regalloc.rs` | **Linear scan register allocator** (⚠️ known bug: constants clobbered by intervening instructions) |
 | `src/mono.rs` | Generic monomorphization: specializes generic functions per call site |
-| `src/compiler.rs` | Pipeline orchestration, module resolution, stdlib auto-include |
+| `src/compiler.rs` | Pipeline orchestration, module resolution, stdlib auto-include, layer/model desugaring |
+| `src/autograd.rs` | **Autograd**: tape-based gradient computation framework — reverse-mode AD for `grad` blocks |
 | `stdlib/core.p` | Core standard library (println, assert, assert_eq) |
 | `tests/*.p` | Test programs (hello, struct, struct_return, features2-6, control_flow, functions, strings) |
 
