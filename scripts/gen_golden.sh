@@ -12,18 +12,18 @@
 #
 # When a test fails, diff these against the current output to find which
 # layer introduced the regression:
-#   diff tests/golden/strings.ir <(pledgec ir tests/strings.p)
-#   diff tests/golden/strings.pir_l3 <(pledgec pir tests/strings.p 3)
-#   diff tests/golden/strings.asm <(pledgec codegen tests/strings.p --target x86-64)
+#   diff tests/golden/strings.ir <(fidesc ir tests/strings.fd)
+#   diff tests/golden/strings.pir_l3 <(fidesc pir tests/strings.fd 3)
+#   diff tests/golden/strings.asm <(fidesc codegen tests/strings.fd --target x86-64)
 
 set -e
 cd "$(dirname "$0")/.."
 
-PLEDGEC="./target/release/pledgec"
+PLEDGEC="./target/release/fidesc"
 GOLDEN_DIR="tests/golden"
 
 if [[ ! -x "$PLEDGEC" ]]; then
-    echo "Building pledgec..."
+    echo "Building fidesc..."
     cargo build --release 2>&1 | grep -E "^(error|Finished)" || true
 fi
 
@@ -50,7 +50,7 @@ KEY_TESTS=(
 echo "Generating golden files for ${#KEY_TESTS[@]} tests..."
 
 for name in "${KEY_TESTS[@]}"; do
-    src="tests/${name}.p"
+    src="tests/${name}.fd"
     if [[ ! -f "$src" ]]; then
         echo "  SKIP $name (file not found: $src)"
         continue
@@ -83,5 +83,5 @@ echo ""
 echo "Golden files saved to $GOLDEN_DIR/"
 echo ""
 echo "To check for regressions at a specific layer:"
-echo "  diff tests/golden/strings/strings.pir_l3 <(./target/release/pledgec pir tests/strings.p 3)"
-echo "  diff tests/golden/strings/strings.asm <(./target/release/pledgec codegen tests/strings.p --target x86-64)"
+echo "  diff tests/golden/strings/strings.pir_l3 <(./target/release/fidesc pir tests/strings.fd 3)"
+echo "  diff tests/golden/strings/strings.asm <(./target/release/fidesc codegen tests/strings.fd --target x86-64)"

@@ -1,10 +1,10 @@
-// WebAssembly code generation from Pledge IR
+// WebAssembly code generation from Fides IR
 //
 // Phase 5D.1 — WASM target.
 //
 // Strategy: translate IR functions to WASM functions operating on a 64-bit
-// linear memory model. All Pledge pointers become i64 offsets into linear
-// memory. Integers use i64 (Pledge's default int) or i32 for the narrower
+// linear memory model. All Fides pointers become i64 offsets into linear
+// memory. Integers use i64 (Fides's default int) or i32 for the narrower
 // kinds. Structs/enums/collections are pointer-sized opaque handles.
 //
 // Control flow: IR uses an arbitrary CFG of basic blocks. WASM is structured.
@@ -246,7 +246,7 @@ impl WasmCodeGen {
         i
     }
 
-    /// Map a Pledge function name to a sanitized WASM-safe name.
+    /// Map a Fides function name to a sanitized WASM-safe name.
     fn sanitize(name: &str) -> String {
         // WASM names allow almost any UTF-8, but keep it simple and C-like.
         name.replace("::", "_").replace('.', "_")
@@ -896,7 +896,7 @@ impl WasmCodeGen {
                 if dst_has_value { self.emit_set_value(out, id, func); }
             }
 
-            // ─── Pledge-specific ───
+            // ─── Fides-specific ───
             Inst::TryUnwrap { value, ok_dst, err_block, ok_block } => {
                 // Load the tag (field 0) and branch.
                 self.emit_value(out, *value, func);
@@ -1225,7 +1225,7 @@ mod tests {
     #[test]
     fn test_wasm_magic_and_header() {
         let source = "pf main() { ret 0; }";
-        let bytes = compiler::compile_to_wasm(source, "test.p", false).unwrap();
+        let bytes = compiler::compile_to_wasm(source, "test.fd", false).unwrap();
         // WASM magic: \0asm
         assert_eq!(&bytes[0..4], b"\0asm");
         // Version 1
@@ -1237,7 +1237,7 @@ mod tests {
     #[test]
     fn test_wat_dump() {
         let source = "pf main() { ret 0; }";
-        let wat = compiler::compile_to_wasm(source, "test.p", true).unwrap();
+        let wat = compiler::compile_to_wasm(source, "test.fd", true).unwrap();
         let s = String::from_utf8(wat).unwrap();
         assert!(s.contains("SPIR-V") || s.contains("WASM") || s.contains("magic"));
         assert!(s.contains("section"));

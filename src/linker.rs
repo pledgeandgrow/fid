@@ -1,4 +1,4 @@
-// Pledge Integrated Linker — Phase 4D
+// Fides Integrated Linker — Phase 4D
 //
 // Links ELF64 object files into executable binaries without external tools.
 // Supports:
@@ -11,7 +11,7 @@
 //   - Program headers (PT_LOAD segments)
 //   - Resolved relocations (R_X86_64_PC32, R_X86_64_PLT32, R_X86_64_64)
 //   - Entry point set to `main` (or `_start`)
-//   - Runtime symbols resolved from the Pledge runtime
+//   - Runtime symbols resolved from the Fides runtime
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

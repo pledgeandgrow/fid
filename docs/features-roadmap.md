@@ -1,7 +1,7 @@
-# P Features Roadmap — New Language Features
+# Fides Features Roadmap — New Language Features
 
-> This roadmap tracks **new features** added to P — things that don't
-> exist in any other language and leverage P's unique combination of
+> This roadmap tracks **new features** added to Fides — things that don't
+> exist in any other language and leverage Fides's unique combination of
 > capabilities + effects + regions + comptime + custom toolchain.
 >
 > Separate from `docs/roadmap.md` which tracks the core compiler phases
@@ -11,17 +11,17 @@
 
 ## Design Philosophy: Syntax vs Stdlib
 
-P follows the Rust/Zig philosophy: **small language, rich stdlib, infinite extensibility.**
+Fides follows the Rust/Zig philosophy: **small language, rich stdlib, infinite extensibility.**
 
 Not every useful feature should be a language keyword. The test is simple:
 
-> **Can a user build this in P itself? If yes, it belongs in the stdlib. If no, it belongs in the compiler.**
+> **Can a user build this in Fides itself? If yes, it belongs in the stdlib. If no, it belongs in the compiler.**
 
 ### Why This Matters
 
-| Syntax (compiler) | Stdlib (P code) |
+| Syntax (compiler) | Stdlib (Fides code) |
 |-------------------|-----------------|
-| Parser + typechecker + lowering + codegen needed | Just a `.p` file — no compiler changes |
+| Parser + typechecker + lowering + codegen needed | Just a `.fd` file — no compiler changes |
 | Users **cannot** modify how it works | Users **can** read, modify, extend, replace |
 | Works with zero imports | Requires `use` import |
 | Compiler can optimize across it | Opaque to compiler (just function calls) |
@@ -33,7 +33,7 @@ Not every useful feature should be a language keyword. The test is simple:
 
 ```
 SYNTAX  = things the COMPILER must understand (can't be a library)
-STDLIB  = things USERS can build themselves (just .p files)
+STDLIB  = things USERS can build themselves (just .fd files)
 CUT     = things EXISTING features already cover (redundant)
 ```
 
@@ -165,36 +165,36 @@ F87: @race-free               🔲 PLANNED — compiler verifies all shared acce
 F89: @csprng                  🔲 PLANNED — only cryptographically secure random in crypto contexts (crypto weakness)
 F93: @capability-scope        🔲 PLANNED — capabilities can't be escalated at runtime (privilege escalation)
 
-─── Stdlib Modules — Built in P, Shipped with Compiler ──────────
-S1: stdlib/tilemap.p          🔲 PLANNED — tile maps, collision, auto-tiling (gaming)
-S2: stdlib/sprite.p           🔲 PLANNED — animation, atlases, palette swap (gaming)
-S3: stdlib/flowfield.p        🔲 PLANNED — RTS pathfinding, vector fields (gaming)
-S4: stdlib/streaming.p        🔲 PLANNED — chunk load/unload for open worlds (gaming)
-S5: stdlib/scene.p            🔲 PLANNED — declarative entity spawning (was F22)
-S6: stdlib/physics.p          🔲 PLANNED — collision detection, rigid bodies (gaming+robotics)
-S7: stdlib/audio.p            🔲 PLANNED — audio playback via FFI (gaming)
-S8: stdlib/input.p            🔲 PLANNED — input handling on top of `on` events (gaming)
-S9: stdlib/crypto.p           🔲 PLANNED — hashing, signatures, encryption (blockchain+medical)
-S10: stdlib/consensus.p       🔲 PLANNED — PoW, PoS, PBFT, Raft (blockchain)
-S11: stdlib/storage.p         🔲 PLANNED — Merkle trees, KV storage, state roots (blockchain)
-S12: stdlib/hal.p             🔲 PLANNED — GPIO, I2C, SPI, UART, PWM (robotics+IoT)
-S13: stdlib/sensor.p          🔲 PLANNED — IMU, temperature, distance, camera (robotics+IoT)
-S14: stdlib/motor.p           🔲 PLANNED — PWM, encoder feedback, PID (robotics)
-S15: stdlib/protocol.p        🔲 PLANNED — MQTT, CoAP, BLE, LoRaWAN (IoT)
-S16: stdlib/ota.p             🔲 PLANNED — OTA protocol: download, verify, apply, rollback (IoT)
-S17: stdlib/http_server.p     🔲 PLANNED — HTTP server, routing, middleware, TLS (serverless+web)
-S18: stdlib/wasm_api.p        🔲 PLANNED — WASM browser bindings: DOM, fetch, localStorage (serverless+web)
-S19: stdlib/banking.p         🔲 PLANNED — core banking: accounts, ledger, transfers, interest, clearing (finance)
-S20: stdlib/swift.p           🔲 PLANNED — SWIFT message format (MT/MX), BIC lookup, transaction routing (finance)
-S21: stdlib/payments.p        🔲 PLANNED — payment rails: ACH, SEPA, FedNow, UPI, Pix adapters (finance)
-S22: stdlib/can.p             🔲 PLANNED — CAN bus frame encoding, J1939, OBD-II, UDS diagnostics (automotive)
-S23: stdlib/ecu.p             🔲 PLANNED — ECU abstractions: sensors, actuators, control loops, calibration (automotive)
-S24: stdlib/arinc.p           🔲 PLANNED — ARINC 653 partitions, ports, health monitoring (aerospace)
-S25: stdlib/ada.p             🔲 PLANNED — Ada-style safety patterns: ranged types, invariant checking (aerospace+defense)
-S26: stdlib/grid.p            🔲 PLANNED — IEC 61850 data models, GOOSE/SV/MMS protocols (energy)
-S27: stdlib/scada.p           🔲 PLANNED — SCADA: Modbus, DNP3, IEC 60870-5-104, point database (energy)
-S28: stdlib/medical.p         🔲 PLANNED — HL7/FHIR parsing, DICOM imaging, ICD coding, FDA audit trails (medical)
-S29: stdlib/clinical.p        🔲 PLANNED — clinical calculations: drug dosage, BMI, GFR, risk scores (medical)
+─── Stdlib Modules — Built in Fides, Shipped with Compiler ──────────
+S1: stdlib/tilemap.fd          🔲 PLANNED — tile maps, collision, auto-tiling (gaming)
+S2: stdlib/sprite.fd           🔲 PLANNED — animation, atlases, palette swap (gaming)
+S3: stdlib/flowfield.fd        🔲 PLANNED — RTS pathfinding, vector fields (gaming)
+S4: stdlib/streaming.fd        🔲 PLANNED — chunk load/unload for open worlds (gaming)
+S5: stdlib/scene.fd            🔲 PLANNED — declarative entity spawning (was F22)
+S6: stdlib/physics.fd          🔲 PLANNED — collision detection, rigid bodies (gaming+robotics)
+S7: stdlib/audio.fd            🔲 PLANNED — audio playback via FFI (gaming)
+S8: stdlib/input.fd            🔲 PLANNED — input handling on top of `on` events (gaming)
+S9: stdlib/crypto.fd           🔲 PLANNED — hashing, signatures, encryption (blockchain+medical)
+S10: stdlib/consensus.fd       🔲 PLANNED — PoW, PoS, PBFT, Raft (blockchain)
+S11: stdlib/storage.fd         🔲 PLANNED — Merkle trees, KV storage, state roots (blockchain)
+S12: stdlib/hal.fd             🔲 PLANNED — GPIO, I2C, SPI, UART, PWM (robotics+IoT)
+S13: stdlib/sensor.fd          🔲 PLANNED — IMU, temperature, distance, camera (robotics+IoT)
+S14: stdlib/motor.fd           🔲 PLANNED — PWM, encoder feedback, PID (robotics)
+S15: stdlib/protocol.fd        🔲 PLANNED — MQTT, CoAP, BLE, LoRaWAN (IoT)
+S16: stdlib/ota.fd             🔲 PLANNED — OTA protocol: download, verify, apply, rollback (IoT)
+S17: stdlib/http_server.fd     🔲 PLANNED — HTTP server, routing, middleware, TLS (serverless+web)
+S18: stdlib/wasm_api.fd        🔲 PLANNED — WASM browser bindings: DOM, fetch, localStorage (serverless+web)
+S19: stdlib/banking.fd         🔲 PLANNED — core banking: accounts, ledger, transfers, interest, clearing (finance)
+S20: stdlib/swift.fd           🔲 PLANNED — SWIFT message format (MT/MX), BIC lookup, transaction routing (finance)
+S21: stdlib/payments.fd        🔲 PLANNED — payment rails: ACH, SEPA, FedNow, UPI, Pix adapters (finance)
+S22: stdlib/can.fd             🔲 PLANNED — CAN bus frame encoding, J1939, OBD-II, UDS diagnostics (automotive)
+S23: stdlib/ecu.fd             🔲 PLANNED — ECU abstractions: sensors, actuators, control loops, calibration (automotive)
+S24: stdlib/arinc.fd           🔲 PLANNED — ARINC 653 partitions, ports, health monitoring (aerospace)
+S25: stdlib/ada.fd             🔲 PLANNED — Ada-style safety patterns: ranged types, invariant checking (aerospace+defense)
+S26: stdlib/grid.fd            🔲 PLANNED — IEC 61850 data models, GOOSE/SV/MMS protocols (energy)
+S27: stdlib/scada.fd           🔲 PLANNED — SCADA: Modbus, DNP3, IEC 60870-5-104, point database (energy)
+S28: stdlib/medical.fd         🔲 PLANNED — HL7/FHIR parsing, DICOM imaging, ICD coding, FDA audit trails (medical)
+S29: stdlib/clinical.fd        🔲 PLANNED — clinical calculations: drug dosage, BMI, GFR, risk scores (medical)
 
 ─── Cut — Redundant, Build with Existing Features ───────────────
 C1: fogofwar                  ❌ CUT — build with tilemap (S1) + query (F18)
@@ -202,7 +202,7 @@ C2: selection                 ❌ CUT — build with query (F18) + formation mat
 C3: traffic                   ❌ CUT — build with ECS (F18) + flowfield (S3) + state (F19)
 C4: lod                       ❌ CUT — build with distance check + model swap
 C5: snapshot                  ❌ CUT — merge into persist (F2): persist every 30s { }
-C6: scene { } keyword         ❌ CUT — moved to stdlib/scene.p (S5)
+C6: scene { } keyword         ❌ CUT — moved to stdlib/scene.fd (S5)
 C7: @hipaa                    ❌ CUT — just a capability tag (HealthData), use existing cap system
 C8: @contract                 ❌ CUT — compose sandbox(F1) + @deterministic(F26) + @gas(F28) + persist(F2)
 C9: @view                     ❌ CUT — just !{} pure effect, already exists
@@ -210,7 +210,7 @@ C10: @constructor             ❌ CUT — just a function called from init, no k
 C11: @coldstart               ❌ CUT — merge into @realtime(phase=init, deadline=10ms)
 C12: @payable                 ❌ CUT — just a function with a value parameter
 C13: @warm                    ❌ CUT — runtime concern (keep-alive ping), not compile-time
-C14: mesh networking          ❌ CUT — just a protocol, build with stdlib/protocol.p (S15)
+C14: mesh networking          ❌ CUT — just a protocol, build with stdlib/protocol.fd (S15)
 C15: @validated               ❌ CUT — already covered by given/ensure contracts (F10)
 ```
 
@@ -221,7 +221,7 @@ C15: @validated               ❌ CUT — already covered by given/ensure contra
 | **Implemented** | 9 | F1–F11 (F6,7,8,9,11 done) | Done and tested in all backends |
 | **Syntax Tier A** | 39 | F10, F13, F14, F16–F18, F21, F23–F60 | Compiler must understand — can't be a library |
 | **Syntax Tier B** | 13 | F6, F7, F9, F11, F12, F15, F19, F20, F33–F37 | Ergonomic — could be library but worth the keyword |
-| **Stdlib** | 29 | S1–S29 | Built in P, users can read/modify/replace |
+| **Stdlib** | 29 | S1–S29 | Built in Fides, users can read/modify/replace |
 | **Cut** | 15 | C1–C15 | Redundant — existing features already cover |
 
 **Total: 9 implemented + 52 syntax + 29 stdlib + 15 cut = 105 features analyzed.**
@@ -238,10 +238,10 @@ C15: @validated               ❌ CUT — already covered by given/ensure contra
 | **Robotics/IoT** | F27, F29–F31, F35, F37 (@realtime, @interrupt, @firmware, @lowpower, @watchdog, @ota) | S12–S16 (HAL, sensor, motor, protocol, OTA) | WCET proof + no-malloc proof + bare metal |
 | **Blockchain** | F28, F34, F50 (@gas, @emit, @signed) | S9–S11 (crypto, consensus, storage) | Compile-time gas verification + determinism |
 | **Gaming** | F16–F18, F21, F23–F25 (vec/mat, swizzle, ECS, @shader, @simd, @crashfree, @pool) | S1–S8 (tilemap, sprite, etc.) | Crash-free game loop proof |
-| **AI/ML** | F14, F15 (@differentiable, @no_grad) | — (tensor.p exists) | Compile-time shape checking + autograd |
+| **AI/ML** | F14, F15 (@differentiable, @no_grad) | — (tensor.fd exists) | Compile-time shape checking + autograd |
 | **Serverless/Edge** | F32, F36 (@serverless, @handler) | S17–S18 (HTTP server, WASM API) | Tiny binaries + capability-stripped |
 
-**The key insight:** all these industries share the same 3 core safety systems (capabilities, effects, regions). Each industry's annotations are different *configurations* of those systems. Building @deterministic for medical makes @gas for blockchain cheaper. Building @bounded for aerospace makes @crashfree for gaming stronger. This is P's moat — one language, every industry, compile-time proofs.
+**The key insight:** all these industries share the same 3 core safety systems (capabilities, effects, regions). Each industry's annotations are different *configurations* of those systems. Building @deterministic for medical makes @gas for blockchain cheaper. Building @bounded for aerospace makes @crashfree for gaming stronger. This is Fides's moat — one language, every industry, compile-time proofs.
 
 ---
 
@@ -249,7 +249,7 @@ C15: @validated               ❌ CUT — already covered by given/ensure contra
 
 **Status:** ✅ Implemented
 **Files:** token.rs, lexer.rs, ast.rs, parser.rs, typechecker.rs, lower.rs, mono.rs, comptime.rs, codegen.rs
-**Test:** `tests/test_sandbox.p` (passes), `tests/test_sandbox_fail.p` (expected fail)
+**Test:** `tests/test_sandbox.fd` (passes), `tests/test_sandbox_fail.fd` (expected fail)
 **Impact:** High — security
 **Novelty:** Genuinely impossible in Rust/C/Go (no compile-time capability system)
 
@@ -303,9 +303,9 @@ pf main() {
 
 ### Tests
 
-- `test_sandbox.p` — IO call inside sandbox → compile error
-- `test_sandbox_nested.p` — sandbox inside sandbox, capabilities restored after
-- `test_sandbox_safe.p` — pure function inside sandbox → OK
+- `test_sandbox.fd` — IO call inside sandbox → compile error
+- `test_sandbox_nested.fd` — sandbox inside sandbox, capabilities restored after
+- `test_sandbox_safe.fd` — pure function inside sandbox → OK
 
 ---
 
@@ -313,7 +313,7 @@ pf main() {
 
 **Status:** ✅ Implemented
 **Files:** token.rs, lexer.rs, ast.rs, parser.rs, ir.rs, lower.rs, interp.rs, pir.rs, codegen_c.rs, pe.rs, wasm.rs
-**Test:** `tests/test_persist.p` (passes)
+**Test:** `tests/test_persist.fd` (passes)
 **Impact:** High — developer experience
 **Novelty:** No language has scope-level state persistence across hot reloads
 
@@ -364,9 +364,9 @@ pf main() {
 
 ### Tests
 
-- `test_persist.p` — persist counter, increment, verify value survives reload
-- `test_persist_struct.p` — persist a struct, verify fields survive
-- `test_persist_vec.p` — persist a Vec, verify contents survive
+- `test_persist.fd` — persist counter, increment, verify value survives reload
+- `test_persist_struct.fd` — persist a struct, verify fields survive
+- `test_persist_vec.fd` — persist a Vec, verify contents survive
 
 ---
 
@@ -374,7 +374,7 @@ pf main() {
 
 **Status:** ✅ Implemented
 **Files:** ast.rs, parser.rs, typechecker.rs, lower.rs, mono.rs
-**Test:** `tests/test_budget.p` (passes), `tests/test_budget_fail.p` (expected fail)
+**Test:** `tests/test_budget.fd` (passes), `tests/test_budget_fail.fd` (expected fail)
 **Impact:** High — embedded/safety-critical
 **Novelty:** Genuinely impossible in Rust/Zig (runtime panic only, no compile-time guarantee)
 
@@ -425,29 +425,29 @@ pf sensor_loop() !RealTime {
 
 ### Tests
 
-- `test_budget.p` — region with budget, allocations under budget → OK
-- `test_budget_exceed.p` — allocations exceed budget → compile error
-- `test_budget_loop.p` — constant trip count loop, budget calculated → OK
-- `test_budget_dynamic.p` — dynamic loop without max_iterations → compile error
+- `test_budget.fd` — region with budget, allocations under budget → OK
+- `test_budget_exceed.fd` — allocations exceed budget → compile error
+- `test_budget_loop.fd` — constant trip count loop, budget calculated → OK
+- `test_budget_dynamic.fd` — dynamic loop without max_iterations → compile error
 
 ---
 
-## F4 — `pledgec watch --diff` — Optimization Diff
+## F4 — `fidesc watch --diff` — Optimization Diff
 
 **Status:** ✅ Implemented
 **Files:** main.rs
-**Usage:** `pledgec watch <file.p> --diff [--opt]`
+**Usage:** `fidesc watch <file.fd> --diff [--opt]`
 **Impact:** High — developer experience, performance tuning
 **Novelty:** Custom toolchain exclusive — impossible with LLVM-based compilers
 
 ### Concept
 
-When `pledgec watch` detects a file change, it shows what the optimizer
+When `fidesc watch` detects a file change, it shows what the optimizer
 *did* — PIR changes, assembly changes, binary size delta. Like `git diff`
 but for compiler optimizations.
 
 ```bash
-$ pledgec watch app.p --diff
+$ fidesc watch app.fd --diff
 [change detected] function `render` modified
 
   PIR L2 changes:
@@ -465,8 +465,8 @@ $ pledgec watch app.p --diff
 ### Implementation
 
 1. Before recompilation: capture current PIR L2 output and assembly output
-   for each function (P already prints these via `pledgec pir` and
-   `pledgec codegen`)
+   for each function (Fides already prints these via `fidesc pir` and
+   `fidesc codegen`)
 2. After recompilation: capture new output
 3. Diff the two (line-based diff, similar to `git diff` output)
 4. Print per-function summary: what was inlined, what was eliminated,
@@ -482,7 +482,7 @@ $ pledgec watch app.p --diff
 - **Zig:** Doesn't show what the optimizer did.
 - **Go:** Same — compiler is opaque.
 
-P can do this because it has its *own* optimizer (`opt.rs`) and *own* PIR
+Fides can do this because it has its *own* optimizer (`opt.rs`) and *own* PIR
 representation. The optimizer output is structured and accessible.
 
 ### Use Cases
@@ -496,7 +496,7 @@ representation. The optimizer output is structured and accessible.
 
 - Unit test: diff two PIR outputs, verify correct additions/removals reported
 - Unit test: diff two assembly outputs, verify correct line changes
-- Integration: `pledgec watch --diff` on a test file, verify output format
+- Integration: `fidesc watch --diff` on a test file, verify output format
 
 ---
 
@@ -504,7 +504,7 @@ representation. The optimizer output is structured and accessible.
 
 **Status:** ✅ Implemented
 **Files:** main.rs, compiler.rs
-**Usage:** `pledgec build <file.p> --caps "IO,FS"`
+**Usage:** `fidesc build <file.fd> --caps "IO,FS"`
 **Impact:** High — security + binary size
 **Novelty:** No linker in any language removes code based on capabilities
 
@@ -516,8 +516,8 @@ linker strips all Net-dependent functions from the binary. Smaller binary,
 smaller attack surface, and it's *proven* — the code is not in the binary.
 
 ```bash
-$ pledgec build app.p --caps "IO"
-  [linker] module `network.p` requires Net — not granted, excluding
+$ fidesc build app.fd --caps "IO"
+  [linker] module `network.fd` requires Net — not granted, excluding
   [linker] removed 12 functions (Net-dependent)
   [linker] removed 3 import entries (socket syscalls)
   Built: 8KB (was 47KB with all modules)
@@ -529,7 +529,7 @@ $ pledgec build app.p --caps "IO"
    (stored in function metadata)
 2. The linker already does dead code elimination via BFS from entry point
    (`linker.rs::dead_code_elimination`)
-3. Add `--caps` flag to `pledgec build` — parse the granted capability list
+3. Add `--caps` flag to `fidesc build` — parse the granted capability list
 4. In the DCE pass: treat "requires ungranted capability" as "unreachable"
    — don't traverse into functions that need capabilities you didn't grant
 5. Report what was removed (function names, import entries, byte savings)
@@ -551,8 +551,8 @@ $ pledgec build app.p --caps "IO"
 
 ### Tests
 
-- `test_link_caps.p` — build with `--caps "IO"`, verify Net code excluded
-- `test_link_caps_full.p` — build with `--caps "IO,FS,Net"`, verify all included
+- `test_link_caps.fd` — build with `--caps "IO"`, verify Net code excluded
+- `test_link_caps_full.fd` — build with `--caps "IO,FS,Net"`, verify all included
 - Unit test: DCE with capability filter, verify correct functions removed
 
 ---
@@ -562,7 +562,7 @@ $ pledgec build app.p --caps "IO"
 **Classification:** SYNTAX — Tier B (ergonomic; could be `guard(cond, || return)` but used too often for function syntax)
 **Status:** 🔲 Planned
 **Impact:** High — developer experience, readability
-**Novelty:** Swift has `guard`; P adds the `=>` arrow for explicit action, making the exit path unmissable
+**Novelty:** Swift has `guard`; Fides adds the `=>` arrow for explicit action, making the exit path unmissable
 
 ### Concept
 
@@ -604,7 +604,7 @@ pf process_bad(data: Vec<i64>) -> i64 {
 ### Why It's Better Than Swift's guard
 
 - Swift's `guard` requires `else { return }` — two keywords for the error path
-- P's `guard cond => return` uses the arrow to visually separate condition from action
+- Fides's `guard cond => return` uses the arrow to visually separate condition from action
 - The arrow is consistent with match arms (`=>`) and closures (`=>`)
 
 ### Use Cases
@@ -621,7 +621,7 @@ pf process_bad(data: Vec<i64>) -> i64 {
 **Classification:** SYNTAX — Tier B (ergonomic; could be `struct::copy(p, hp=70)` but used too often for function syntax)
 **Status:** 🔲 Planned
 **Impact:** High — developer experience, immutability ergonomics
-**Novelty:** Rust has struct update syntax (`..base`) but no array spread; JS has both but no type safety. P has both with compile-time verification.
+**Novelty:** Rust has struct update syntax (`..base`) but no array spread; JS has both but no type safety. Fides has both with compile-time verification.
 
 ### Concept
 
@@ -678,7 +678,7 @@ pv result = sum(..args);  // equivalent to sum(1, 2, 3)
 **Classification:** SYNTAX — Tier A (typechecker must narrow types through the chain — a library can't do this)
 **Status:** 🔲 Planned
 **Impact:** High — developer experience, safety
-**Novelty:** P already has `Option<T>`; this adds the chaining syntax that makes it painless. Combined with P's comptime, chains can be fully evaluated at compile time when possible.
+**Novelty:** Fides already has `Option<T>`; this adds the chaining syntax that makes it painless. Combined with Fides's comptime, chains can be fully evaluated at compile time when possible.
 
 ### Concept
 
@@ -721,8 +721,8 @@ user?.address?.city = "Portland";  // no-op if user or address is None
 
 - **C#/TypeScript:** Have `?.` but no compile-time type safety on the chain
 - **Rust:** Has `Option` but no `?.` — you write `and_then()` chains or nested `match`
-- **Swift:** Has `?.` but optional is implicit, not explicit like P's `Option<T>`
-- **P's advantage:** Explicit `Option<T>` + `?.` chaining + comptime evaluation = zero-cost when the value is known at compile time
+- **Swift:** Has `?.` but optional is implicit, not explicit like Fides's `Option<T>`
+- **Fides's advantage:** Explicit `Option<T>` + `?.` chaining + comptime evaluation = zero-cost when the value is known at compile time
 
 ### Use Cases
 
@@ -738,7 +738,7 @@ user?.address?.city = "Portland";  // no-op if user or address is None
 **Classification:** SYNTAX — Tier B (ergonomic; could be `coalesce(x, default)` but used too often for function syntax)
 **Status:** 🔲 Planned
 **Impact:** Medium — developer experience
-**Novelty:** Pairs with `?.` — provides the "else" branch for optional chains. P's version also works for zero-value defaults on primitives.
+**Novelty:** Pairs with `?.` — provides the "else" branch for optional chains. Fides's version also works for zero-value defaults on primitives.
 
 ### Concept
 
@@ -782,7 +782,7 @@ pv server = primary ?? backup ?? local ?? "localhost:8080";
 **Classification:** SYNTAX — Tier A (typechecker must verify contracts at all call sites — a library can't see call sites)
 **Status:** 🔲 Planned
 **Impact:** High — safety, correctness
-**Novelty:** Eiffel had contracts but they were runtime-checked. P's version leverages comptime to verify simple contracts at compile time. No other systems language has native contract syntax.
+**Novelty:** Eiffel had contracts but they were runtime-checked. Fides's version leverages comptime to verify simple contracts at compile time. No other systems language has native contract syntax.
 
 ### Concept
 
@@ -844,7 +844,7 @@ pf max<T: Ord>(a: T, b: T) -> T
 - **D:** Has contracts but they're always runtime-checked, never compile-time.
 - **Ada/SPARK:** Can prove contracts but requires external proof tools and manual effort.
 - **C++:** `[[expects:]]` / `[[ensures:]]` attributes exist but are ignored by most compilers.
-- **P's advantage:** Comptime evaluation + capability system + effect system = contracts that are actually verified, not just documented.
+- **Fides's advantage:** Comptime evaluation + capability system + effect system = contracts that are actually verified, not just documented.
 
 ### Use Cases
 
@@ -861,7 +861,7 @@ pf max<T: Ord>(a: T, b: T) -> T
 **Classification:** SYNTAX — Tier B (type narrowing in branches needs typechecker, but could work as a library with explicit casts)
 **Status:** 🔲 Planned
 **Impact:** Medium — developer experience
-**Novelty:** C# has `is` but it doesn't narrow types. TypeScript has `typeof` but it's string-based. P's `is` narrows the type in the branch, eliminating redundant casts.
+**Novelty:** C# has `is` but it doesn't narrow types. TypeScript has `typeof` but it's string-based. Fides's `is` narrows the type in the branch, eliminating redundant casts.
 
 ### Concept
 
@@ -922,7 +922,7 @@ if value is not null {
 **Classification:** SYNTAX — Tier B (could be `memoize(|n| { ... })` wrapper, but annotation is cleaner; purity verified by effect system)
 **Status:** 🔲 Planned
 **Impact:** High — performance, developer experience
-**Novelty:** No systems language has annotation-based memoization. Python has `@lru_cache` but it's dynamic. P's version uses comptime to generate the cache lookup code, with zero runtime overhead for cache misses on pure functions.
+**Novelty:** No systems language has annotation-based memoization. Python has `@lru_cache` but it's dynamic. Fides's version uses comptime to generate the cache lookup code, with zero runtime overhead for cache misses on pure functions.
 
 ### Concept
 
@@ -970,7 +970,7 @@ pf impure_func(x: i64) -> i64 {
 - **Python:** `@lru_cache` works but Python is dynamic — no compile-time purity check, no type-safe cache keys.
 - **Rust:** No built-in memoization. You write `HashMap` boilerplate by hand or use a crate.
 - **C++:** No memoization. Manual `std::unordered_map` caching.
-- **P's advantage:** Effect system proves purity at compile time. Comptime generates the cache code. Zero boilerplate, zero runtime overhead for the purity check.
+- **Fides's advantage:** Effect system proves purity at compile time. Comptime generates the cache code. Zero boilerplate, zero runtime overhead for the purity check.
 
 ### Use Cases
 
@@ -986,7 +986,7 @@ pf impure_func(x: i64) -> i64 {
 **Classification:** SYNTAX — Tier A (compiler must emit thread spawn/join — a library can't manage threads this way)
 **Status:** 🔲 Planned
 **Impact:** High — performance, developer experience
-**Novelty:** Rayon (Rust) uses `join()` function calls. OpenMP uses `#pragma`. P uses native syntax with `|` as the task separator — the most readable form of structured parallelism.
+**Novelty:** Rayon (Rust) uses `join()` function calls. OpenMP uses `#pragma`. Fides uses native syntax with `|` as the task separator — the most readable form of structured parallelism.
 
 ### Concept
 
@@ -1039,7 +1039,7 @@ pv result = parallel {
 - **Rust/Rayon:** `rayon::join(|| a(), || b())` — function-based, not syntax. No tuple destructuring.
 - **OpenMP:** `#pragma omp parallel sections` — preprocessor, not language. No type safety.
 - **Go:** `go func() { ... }()` + `sync.WaitGroup` — manual goroutine management, no auto-join.
-- **P's advantage:** Native syntax, auto-join, tuple destructuring, effect system prevents data races, capability system prevents privilege escalation.
+- **Fides's advantage:** Native syntax, auto-join, tuple destructuring, effect system prevents data races, capability system prevents privilege escalation.
 
 ### Use Cases
 
@@ -1055,7 +1055,7 @@ pv result = parallel {
 **Classification:** SYNTAX — Tier A (compiler must trace IR operations for autograd — a library can't inspect IR)
 **Status:** 🔲 Planned
 **Impact:** High — AI/ML
-**Novelty:** JAX uses `jax.grad()` transformations. PyTorch uses runtime autograd graphs. P uses a compile-time annotation that tells the autograd pass to trace the function and generate backward code.
+**Novelty:** JAX uses `jax.grad()` transformations. PyTorch uses runtime autograd graphs. Fides uses a compile-time annotation that tells the autograd pass to trace the function and generate backward code.
 
 ### Concept
 
@@ -1108,7 +1108,7 @@ pf train(model: Model, data: Tensor, labels: Tensor) {
 **Classification:** SYNTAX — Tier B (could be `no_grad(|| { ... })` flag, but annotation is cleaner; compiler skips tracing)
 **Status:** 🔲 Planned
 **Impact:** Medium — AI/ML performance
-**Novelty:** PyTorch has `with torch.no_grad():` context manager. P uses a scoped annotation that the compiler enforces — no gradient tape is built inside, saving memory and compute.
+**Novelty:** PyTorch has `with torch.no_grad():` context manager. Fides uses a scoped annotation that the compiler enforces — no gradient tape is built inside, saving memory and compute.
 
 ### Concept
 
@@ -1151,11 +1151,11 @@ are not needed.
 **Classification:** SYNTAX — Tier A (compiler must emit SIMD instructions for vector operators — a library has function call overhead)
 **Status:** 🔲 Planned
 **Impact:** High — game development, graphics, ML
-**Novelty:** GLSL/HLSL have these but are shader-only languages. P brings them to a general-purpose systems language with full operator overloading, swizzle syntax, and compile-time shape checking.
+**Novelty:** GLSL/HLSL have these but are shader-only languages. Fides brings them to a general-purpose systems language with full operator overloading, swizzle syntax, and compile-time shape checking.
 
 ### Concept
 
-Vector and matrix types are first-class citizens in P. They support all
+Vector and matrix types are first-class citizens in Fides. They support all
 arithmetic operators, are type-checked at compile time, and generate
 efficient SIMD code on supported hardware.
 
@@ -1208,7 +1208,7 @@ pv smooth = slerp(q1, q2, 0.5);  // smooth interpolation
 - **C++:** Needs GLM or DirectXMath library. No native syntax.
 - **Rust:** Needs `nalgebra` or `cgmath` crate. No swizzle.
 - **C#:** Unity's `Vector3` is a class with method calls, not operators.
-- **P's advantage:** Native types + operators + swizzle + SIMD codegen + shape checking. Game devs and ML engineers get shader-quality math in a systems language.
+- **Fides's advantage:** Native types + operators + swizzle + SIMD codegen + shape checking. Game devs and ML engineers get shader-quality math in a systems language.
 
 ### Use Cases
 
@@ -1225,7 +1225,7 @@ pv smooth = slerp(q1, q2, 0.5);  // smooth interpolation
 **Classification:** SYNTAX — Tier A (parser must recognize `.xyz` patterns; typechecker must verify component validity; zero-cost desugaring)
 **Status:** 🔲 Planned
 **Impact:** High — game development, graphics
-**Novelty:** GLSL/HLSL have swizzle but are shader-only. P brings it to a general-purpose language. The `.xyz` syntax desugars to `vec3(self.x, self.y, self.z)` at compile time — zero runtime cost.
+**Novelty:** GLSL/HLSL have swizzle but are shader-only. Fides brings it to a general-purpose language. The `.xyz` syntax desugars to `vec3(self.x, self.y, self.z)` at compile time — zero runtime cost.
 
 ### Concept
 
@@ -1273,7 +1273,7 @@ pv right = cross(forward, up);  // perpendicular vector
 - **GLSL/HLSL:** Have swizzle but only in shader code. Can't use for game logic.
 - **C++ (GLM):** Has swizzle via macros but it's opt-in and verbose.
 - **Rust (cgmath):** No swizzle. You write `vec3(v.x, v.y, v.z)`.
-- **P's advantage:** Swizzle in a general-purpose language. Same syntax for shaders and game logic. Zero cost via compile-time desugaring.
+- **Fides's advantage:** Swizzle in a general-purpose language. Same syntax for shaders and game logic. Zero cost via compile-time desugaring.
 
 ### Use Cases
 
@@ -1289,11 +1289,11 @@ pv right = cross(forward, up);  // perpendicular vector
 **Classification:** SYNTAX — Tier A (compiler must control SoA memory layout + optimize query iteration — a library can't rearrange memory)
 **Status:** 🔲 Planned
 **Impact:** Very High — game development
-**Novelty:** Unity bolted ECS onto C# with attributes. Unreal uses C++ macros. Bevy uses Rust traits. P makes ECS native language syntax with `component`, `system`, and `query` keywords — the first language to do so.
+**Novelty:** Unity bolted ECS onto C# with attributes. Unreal uses C++ macros. Bevy uses Rust traits. Fides makes ECS native language syntax with `component`, `system`, and `query` keywords — the first language to do so.
 
 ### Concept
 
-ECS is the dominant architecture for game engines. P makes it native syntax:
+ECS is the dominant architecture for game engines. Fides makes it native syntax:
 - `component` declares a data container (pure data, no logic)
 - `system` declares a function that runs over all entities matching a query
 - `query` iterates all entities that have the specified components
@@ -1368,7 +1368,7 @@ schedule {
 
 ### Why Other Languages Fall Short
 
-| Feature | Unity (C#) | Unreal (C++) | Bevy (Rust) | **P** |
+| Feature | Unity (C#) | Unreal (C++) | Bevy (Rust) | **Fides** |
 |---------|-----------|-------------|-------------|-------|
 | ECS syntax | Attributes | Macros | Traits | **Native keywords** |
 | Query syntax | LINQ-like | Manual | Trait bounds | **`query()` keyword** |
@@ -1390,7 +1390,7 @@ schedule {
 **Classification:** SYNTAX — Tier B (could be a library with enums + match, but compile-time transition verification needs typechecker)
 **Status:** 🔲 Planned
 **Impact:** High — game development, UI, protocol handling
-**Novelty:** No language has native state machine syntax. Libraries exist (XState for JS, smach for Rust) but they're external. P makes state machines first-class language constructs with compile-time transition verification.
+**Novelty:** No language has native state machine syntax. Libraries exist (XState for JS, smach for Rust) but they're external. Fides makes state machines first-class language constructs with compile-time transition verification.
 
 ### Concept
 
@@ -1481,7 +1481,7 @@ player_state.handle(tick(dt));     // runs tick handler
 - **XState (JS):** JSON config, no compile-time checks. Invalid transitions are runtime errors.
 - **smach (Rust):** Builder pattern, verbose. No syntax-level support.
 - **Unity Animator:** Visual editor, not code. Hard to version control.
-- **P's advantage:** Native syntax, compile-time verified transitions, readable as code, version-controllable, integrates with `on` event handlers (F20).
+- **Fides's advantage:** Native syntax, compile-time verified transitions, readable as code, version-controllable, integrates with `on` event handlers (F20).
 
 ### Use Cases
 
@@ -1498,7 +1498,7 @@ player_state.handle(tick(dt));     // runs tick handler
 **Classification:** SYNTAX — Tier B (could be a callback registry library, but unified dispatch + compile-time parameter verification is cleaner as syntax)
 **Status:** 🔲 Planned
 **Impact:** High — game development, UI, async
-**Novelty:** Unity uses magic method names (`OnCollisionEnter`, `Update`). Node.js uses `addEventListener`. P uses a single `on` keyword for all event types — input, collision, physics, lifecycle — with type-safe parameters.
+**Novelty:** Unity uses magic method names (`OnCollisionEnter`, `Update`). Node.js uses `addEventListener`. Fides uses a single `on` keyword for all event types — input, collision, physics, lifecycle — with type-safe parameters.
 
 ### Concept
 
@@ -1576,7 +1576,7 @@ on destroy() {
 - **Unity:** Magic method names (`OnCollisionEnter`, `Update`, `Start`). No type safety on parameters. Can't add custom events without writing a system.
 - **Node.js:** `addEventListener('click', handler)` — string-based, no type checking.
 - **Rust:** No built-in event system. You use channels or observer crates.
-- **P's advantage:** One keyword, type-safe parameters, compile-time verification, works with ECS (F18) and state machines (F19).
+- **Fides's advantage:** One keyword, type-safe parameters, compile-time verification, works with ECS (F18) and state machines (F19).
 
 ### Use Cases
 
@@ -1594,14 +1594,14 @@ on destroy() {
 **Classification:** SYNTAX — Tier A (compiler must emit SPIR-V/PTX for GPU — a library can't generate GPU bytecode)
 **Status:** 🔲 Planned
 **Impact:** Very High — game development, graphics, compute
-**Novelty:** No general-purpose language lets you write shaders in the same language as game logic. You write GLSL/HLSL strings embedded in C++/Rust/C#. P compiles the same code to both x86 and SPIR-V, with full type checking and error messages.
+**Novelty:** No general-purpose language lets you write shaders in the same language as game logic. You write GLSL/HLSL strings embedded in C++/Rust/C#. Fides compiles the same code to both x86 and SPIR-V, with full type checking and error messages.
 
 ### Concept
 
 `@vertex`, `@fragment`, and `@kernel` annotations tell the compiler to
 generate GPU code (SPIR-V for Vulkan, GLSL for OpenGL, PTX for CUDA)
 instead of CPU code. The shader code has full type checking, autocompletion,
-and error messages — because it's just P code.
+and error messages — because it's just Fides code.
 
 ```p
 // ─── Vertex shader ────────────────────────────────────────────
@@ -1654,7 +1654,7 @@ pf particle_update(particles: Buffer<Particle>, dt: f32) {
 - **C++ (OpenGL/Vulkan):** Shaders are GLSL strings. No type checking. No autocompletion. Errors at runtime.
 - **Rust (wgpu):** Same — WGSL strings. Type errors are runtime.
 - **Unity (Shader Graph):** Visual editor, not code. Limited expressiveness.
-- **P's advantage:** One language, one type system, one set of error messages. Refactoring a struct used in both CPU and GPU code just works. No more "shader compile error at runtime" — it's a compile-time error.
+- **Fides's advantage:** One language, one type system, one set of error messages. Refactoring a struct used in both CPU and GPU code just works. No more "shader compile error at runtime" — it's a compile-time error.
 
 ### Use Cases
 
@@ -1668,9 +1668,9 @@ pf particle_update(particles: Buffer<Particle>, dt: f32) {
 
 ## F22 — `scene { }` — Declarative Scene Hierarchy
 
-**Classification:** ~~SYNTAX~~ → **STDLIB (S5)** — moved to `stdlib/scene.p`. It's just entity spawning code (`Entity::new()` + `.add()` calls). No compiler support needed. Users can read, modify, and extend it. Keeping it as a keyword would bloat the language for no compiler benefit.
+**Classification:** ~~SYNTAX~~ → **STDLIB (S5)** — moved to `stdlib/scene.fd`. It's just entity spawning code (`Entity::new()` + `.add()` calls). No compiler support needed. Users can read, modify, and extend it. Keeping it as a keyword would bloat the language for no compiler benefit.
 **Impact:** Medium — game development, UI
-**Novelty:** Unity uses YAML (.unity files). Godot uses XML (.tscn files). Unreal uses binary (.umap). P uses code — the scene is a code block with embedded logic, type checking, and hot reload support.
+**Novelty:** Unity uses YAML (.unity files). Godot uses XML (.tscn files). Unreal uses binary (.umap). Fides uses code — the scene is a code block with embedded logic, type checking, and hot reload support.
 
 ### Concept
 
@@ -1733,7 +1733,7 @@ scene GameWorld {
 3. Parse `scene Name { NodeName { props, components, children, on handlers } }` in `parser.rs`
 4. Typechecker: verify component assignments match component definitions. Verify child entities have valid types.
 5. Lowering: desugar to a function that spawns entities, assigns components, and registers event handlers. Children inherit parent transforms.
-6. Hot reload: when the scene block changes, re-spawn only the modified entities (leveraging P's existing hot reload infrastructure).
+6. Hot reload: when the scene block changes, re-spawn only the modified entities (leveraging Fides's existing hot reload infrastructure).
 
 ### Why Code Is Better Than Data Files
 
@@ -1757,7 +1757,7 @@ scene GameWorld {
 **Classification:** SYNTAX — Tier A (compiler must emit SSE/AVX/NEON vector instructions — a library can't generate machine code)
 **Status:** 🔲 Planned
 **Impact:** High — performance
-**Novelty:** No annotation-based SIMD in any systems language. Rust has `std::simd` but it's a library with explicit types. P's `@simd` lets the compiler auto-vectorize existing loops.
+**Novelty:** No annotation-based SIMD in any systems language. Rust has `std::simd` but it's a library with explicit types. Fides's `@simd` lets the compiler auto-vectorize existing loops.
 
 ### Concept
 
@@ -1824,8 +1824,8 @@ A library can't emit machine code. `@simd` requires the compiler to:
 
 **Classification:** SYNTAX — Tier A (compiler must analyze entire call graph for panic safety — a library can't inspect itself)
 **Status:** 🔲 Planned
-**Impact:** Very High — P's killer feature for gaming
-**Novelty:** No language can prove a function is crash-free at compile time. This is P's unique advantage for game development.
+**Impact:** Very High — Fides's killer feature for gaming
+**Novelty:** No language can prove a function is crash-free at compile time. This is Fides's unique advantage for game development.
 
 ### Concept
 
@@ -1886,7 +1886,7 @@ A library can't inspect the call graph. `@crashfree` requires the compiler to:
 
 ### The "No Crash" Promise
 
-| Crash Cause | How P Prevents It |
+| Crash Cause | How Fides Prevents It |
 |-------------|-------------------|
 | Null pointer dereference | No nulls — `Option<T>` + `?.` chaining (F8) |
 | Array out of bounds | Compile-time bounds checking + runtime check |
@@ -1898,7 +1898,7 @@ A library can't inspect the call graph. `@crashfree` requires the compiler to:
 | Out of memory | `region with budget(N)` — compile-time guarantee (F3) |
 | Subsystem crash | `supervise` — recover instead of dying (see below) |
 
-**No other game engine language provides this.** Unity crashes from null refs. Unreal crashes from C++ memory errors. Godot crashes from GDScript type errors. P makes crashes a compile-time problem.
+**No other game engine language provides this.** Unity crashes from null refs. Unreal crashes from C++ memory errors. Godot crashes from GDScript type errors. Fides makes crashes a compile-time problem.
 
 ### Use Cases
 
@@ -1915,7 +1915,7 @@ A library can't inspect the call graph. `@crashfree` requires the compiler to:
 **Classification:** SYNTAX — Tier A (compiler must manage pool memory layout for zero overhead — a library has allocation overhead)
 **Status:** 🔲 Planned
 **Impact:** High — performance
-**Novelty:** No language has compiler-managed object pools. Rust's `bumpalo` is a library. P's `@pool` lets the compiler manage the pool, eliminating allocation in hot loops.
+**Novelty:** No language has compiler-managed object pools. Rust's `bumpalo` is a library. Fides's `@pool` lets the compiler manage the pool, eliminating allocation in hot loops.
 
 ### Concept
 
@@ -1979,13 +1979,13 @@ A library can do pooling (`bumpalo`, `typed-arena`), but:
 
 ---
 
-## Stdlib Modules — Built in P, Shipped with Compiler
+## Stdlib Modules — Built in Fides, Shipped with Compiler
 
-These modules are **not language keywords** — they're `.p` files that ship with the compiler. Users can read the source, modify them, extend them, or replace them entirely. The compiler treats them like any other P code.
+These modules are **not language keywords** — they're `.fd` files that ship with the compiler. Users can read the source, modify them, extend them, or replace them entirely. The compiler treats them like any other Fides code.
 
 > **Philosophy:** A low-level language should give you sharp tools, not pre-built furniture. `vec3` + `@simd` + ECS + `@crashfree` are sharp tools. `tilemap` as a keyword is pre-built furniture. Provide the tools. Ship good furniture in the stdlib. Let users build their own if they want.
 
-### S1 — `stdlib/tilemap.p` — Tile Maps for 2D Games
+### S1 — `stdlib/tilemap.fd` — Tile Maps for 2D Games
 
 **Classification:** STDLIB — built on `Vec<i32>` + `vec2` (F16) + ECS query (F18)
 **Status:** 🔲 Planned
@@ -2008,7 +2008,7 @@ for tile in visible { draw_tile(tile); }
 
 **Why stdlib not syntax:** It's arrays of tile IDs + collision checks. A `struct Tilemap { tiles: Vec<i32> }` with methods. Users can add custom tile types, auto-tiling rules, or replace it with their own implementation. No compiler support needed.
 
-### S2 — `stdlib/sprite.p` — Animation and Atlases
+### S2 — `stdlib/sprite.fd` — Animation and Atlases
 
 **Classification:** STDLIB — built on `struct` + `Vec<i32>` + timers
 **Status:** 🔲 Planned
@@ -2027,7 +2027,7 @@ draw_sprite(sprite);
 
 **Why stdlib not syntax:** It's frame index math + a timer. A `struct Sprite { frames: Vec<i32>, fps: f32, current_frame: i32 }` with methods. Users can add palette swapping, skeletal animation, or custom blending. No compiler support needed.
 
-### S3 — `stdlib/flowfield.p` — RTS Pathfinding
+### S3 — `stdlib/flowfield.fd` — RTS Pathfinding
 
 **Classification:** STDLIB — built on `vec2` (F16) + grid math
 **Status:** 🔲 Planned
@@ -2054,7 +2054,7 @@ system MoveUnits(dt: f32) {
 
 **Why stdlib not syntax:** It's grid math + vector field computation. A `struct FlowField { grid: Vec<vec2> }` with a compute method. Users can optimize for their specific game (different grid sizes, terrain weights, dynamic obstacles). No compiler support needed.
 
-### S4 — `stdlib/streaming.p` — Open World Chunk Loading
+### S4 — `stdlib/streaming.fd` — Open World Chunk Loading
 
 **Classification:** STDLIB — built on ECS (F18) + `HashMap` + `query`
 **Status:** 🔲 Planned
@@ -2086,7 +2086,7 @@ system UpdateStreaming {
 
 **Why stdlib not syntax:** It's chunk load/unload logic with a `HashMap<vec2, Chunk>`. Users can tune chunk sizes, add priority loading, implement async loading, or add custom chunk formats. No compiler support needed.
 
-### S5 — `stdlib/scene.p` — Declarative Scene Hierarchy
+### S5 — `stdlib/scene.fd` — Declarative Scene Hierarchy
 
 **Classification:** STDLIB — built on ECS (F18) + `on` events (F20). Was F22 (syntax), moved to stdlib.
 **Status:** 🔲 Planned
@@ -2108,7 +2108,7 @@ pv player = scene::entity("Player")
 
 **Why moved from syntax to stdlib:** `scene { }` as a keyword was just syntactic sugar for `Entity::new()` + `.add()` calls. No compiler transformation needed. As a stdlib module, users can customize scene loading, add their own scene formats, or integrate with streaming (S4). The keyword would have locked everyone into one scene model.
 
-### S6 — `stdlib/physics.p` — Collision Detection
+### S6 — `stdlib/physics.fd` — Collision Detection
 
 **Classification:** STDLIB — built on `vec3` (F16) + `struct` + ECS (F18)
 **Status:** 🔲 Planned
@@ -2127,7 +2127,7 @@ for contact in contacts {
 }
 ```
 
-### S7 — `stdlib/audio.p` — Audio Playback
+### S7 — `stdlib/audio.fd` — Audio Playback
 
 **Classification:** STDLIB — built on FFI (`extern "C"`) to OS audio APIs
 **Status:** 🔲 Planned
@@ -2144,7 +2144,7 @@ pv sfx = audio::load("sfx/sword.wav");
 sfx.play();  // one-shot
 ```
 
-### S8 — `stdlib/input.p` — Input Handling
+### S8 — `stdlib/input.fd` — Input Handling
 
 **Classification:** STDLIB — built on `on` events (F20) + FFI to OS input APIs
 **Status:** 🔲 Planned
@@ -2231,7 +2231,7 @@ system UpdateLOD {
 
 ### C6 — `scene { }` keyword — CUT
 
-**Why cut:** Moved to stdlib/scene.p (S5). It's just entity spawning code — `Entity::new()` + `.add()` calls. No compiler transformation needed. As a stdlib module, users can customize it. As a keyword, it would lock everyone into one scene model.
+**Why cut:** Moved to stdlib/scene.fd (S5). It's just entity spawning code — `Entity::new()` + `.add()` calls. No compiler transformation needed. As a stdlib module, users can customize it. As a keyword, it would lock everyone into one scene model.
 
 ---
 
@@ -2276,18 +2276,18 @@ system UpdateLOD {
 | F19: `state` machines | 🔲 Planned | High | Compile-time transition verification |
 | F20: `on` events | 🔲 Planned | High | Unified dispatch + parameter verification |
 
-### Stdlib Modules (Built in P, Shipped with Compiler)
+### Stdlib Modules (Built in Fides, Shipped with Compiler)
 
 | Module | Status | What It Provides |
 |--------|--------|-----------------|
-| S1: `tilemap.p` | 🔲 Planned | Tile maps, collision, auto-tiling |
-| S2: `sprite.p` | 🔲 Planned | Animation, atlases, palette swap |
-| S3: `flowfield.p` | 🔲 Planned | RTS pathfinding, vector fields |
-| S4: `streaming.p` | 🔲 Planned | Chunk load/unload for open worlds |
-| S5: `scene.p` | 🔲 Planned | Declarative entity spawning (was F22) |
-| S6: `physics.p` | 🔲 Planned | Collision detection, rigid bodies |
-| S7: `audio.p` | 🔲 Planned | Audio playback via FFI |
-| S8: `input.p` | 🔲 Planned | Input handling on top of `on` events |
+| S1: `tilemap.fd` | 🔲 Planned | Tile maps, collision, auto-tiling |
+| S2: `sprite.fd` | 🔲 Planned | Animation, atlases, palette swap |
+| S3: `flowfield.fd` | 🔲 Planned | RTS pathfinding, vector fields |
+| S4: `streaming.fd` | 🔲 Planned | Chunk load/unload for open worlds |
+| S5: `scene.fd` | 🔲 Planned | Declarative entity spawning (was F22) |
+| S6: `physics.fd` | 🔲 Planned | Collision detection, rigid bodies |
+| S7: `audio.fd` | 🔲 Planned | Audio playback via FFI |
+| S8: `input.fd` | 🔲 Planned | Input handling on top of `on` events |
 
 ### Cut Features (Redundant)
 
@@ -2298,32 +2298,32 @@ system UpdateLOD {
 | C3: traffic | ❌ Cut | Build with ECS (F18) + flowfield (S3) + state (F19) |
 | C4: lod | ❌ Cut | Build with distance check + model swap |
 | C5: snapshot | ❌ Cut | Merge into persist (F2): `persist every 30s { }` |
-| C6: scene keyword | ❌ Cut | Moved to stdlib/scene.p (S5) |
+| C6: scene keyword | ❌ Cut | Moved to stdlib/scene.fd (S5) |
 
 ### The Story
 
-> P is the only language where you can sandbox untrusted code at compile
+> Fides is the only language where you can sandbox untrusted code at compile
 > time, guarantee memory budgets for embedded, persist state across hot
 > reloads, see what the optimizer changed, and strip untrusted code from
 > your binary — all verified by the compiler, not hoped for at runtime.
 >
-> With Tier A syntax (F8, F10, F13–F18, F21, F23–F25), P gives the compiler
+> With Tier A syntax (F8, F10, F13–F18, F21, F23–F25), Fides gives the compiler
 > the power to emit SIMD instructions, manage ECS memory layout, trace
 > autograd graphs, generate GPU shaders, vectorize loops, prove crash-free
 > code, and manage object pools — things no library can do.
 >
-> With Tier B syntax (F6, F7, F9, F11, F12, F15, F19, F20), P makes common
+> With Tier B syntax (F6, F7, F9, F11, F12, F15, F19, F20), Fides makes common
 > patterns beautiful: guard clauses, spread operators, optional chaining,
 > contracts, memoization, state machines, and event handlers — all native
 > syntax, not library boilerplate.
 >
-> With the stdlib (S1–S8), P ships game systems as readable P code:
+> With the stdlib (S1–S8), Fides ships game systems as readable Fides code:
 > tilemaps, sprites, flowfields, streaming, scenes, physics, audio, input.
 > Users can read every line, modify anything, or replace it entirely.
 >
-> P follows the Rust/Zig philosophy: small language, rich stdlib, infinite
+> Fides follows the Rust/Zig philosophy: small language, rich stdlib, infinite
 > extensibility. Only make it syntax when the compiler must do something
-> a library can't. Everything else is P code that users control.
+> a library can't. Everything else is Fides code that users control.
 
 ### Implementation Details
 
@@ -2336,7 +2336,7 @@ All 5 original features (F1–F5) were implemented in a single session. Test res
 **Planned for implementation:**
 - 39 Tier A syntax features (F10, F13, F14, F16–F18, F21, F23–F60) — need compiler support
 - 8 Tier B syntax features (F12, F15, F19, F20) — ergonomic keywords
-- 29 stdlib modules (S1–S29) — P code, no compiler changes
+- 29 stdlib modules (S1–S29) — Fides code, no compiler changes
 - 15 features cut (C1–C15) — redundant, build with existing features
 
 ---
@@ -2382,7 +2382,7 @@ pv result: money(18, 2) = balance + $99999999999999.99
 
 ### Why It Matters
 
-| Bug class | COBOL | P with `money` type |
+| Bug class | COBOL | Fides with `money` type |
 |-----------|-------|---------------------|
 | Silent truncation | `PIC 9(8)` overflows → wraps to 0 | Compile error or runtime abort |
 | Float rounding | `COMP` float → 0.1 + 0.2 = 0.30000000000000004 | `money` uses integer cents, no FP |
@@ -2450,7 +2450,7 @@ This is **double-entry bookkeeping enforced at compile time.** Every debit
 must have a matching credit. The salami attack (stealing rounding errors)
 becomes impossible because the compiler notices the missing half-cent.
 
-| Guarantee | COBOL | P with `@conserve` |
+| Guarantee | COBOL | Fides with `@conserve` |
 |-----------|-------|---------------------|
 | Debits = credits | Manual (programmer must remember) | Compiler-enforced (can't forget) |
 | Rounding theft | Possible (salami attack) | Impossible (compiler detects missing amount) |
@@ -2470,7 +2470,7 @@ becomes impossible because the compiler notices the missing half-cent.
 
 **Status:** 🔲 Planned
 **Impact:** Critical — prevents partial transactions (the #1 cause of financial inconsistency)
-**Novelty:** Most languages rely on database transactions; P makes it a language construct
+**Novelty:** Most languages rely on database transactions; Fides makes it a language construct
 **Industries:** Banking, finance, payments, blockchain, any transactional system
 
 ### Concept
@@ -2503,7 +2503,7 @@ fn bad_transfer(from: &mut Account, to: &mut Account, amount: money) {
 
 ### Why It Matters
 
-| Bug class | COBOL + CICS | P with `txn { }` |
+| Bug class | COBOL + CICS | Fides with `txn { }` |
 |-----------|-------------|-------------------|
 | Partial transaction (crash between debit and credit) | CICS rolls back (runtime) | Compiler prevents irreversible ops + auto-rollback |
 | Irreversible side effect in transaction | No check (programmer must know) | Compile error |
@@ -2523,7 +2523,7 @@ fn bad_transfer(from: &mut Account, to: &mut Account, amount: money) {
 
 **Status:** 🔲 Planned
 **Impact:** High — prevents accidental money duplication at the type level
-**Novelty:** Rust has ownership for memory; P has linear types for money
+**Novelty:** Rust has ownership for memory; Fides has linear types for money
 **Industries:** Banking, finance, blockchain
 
 ### Concept
@@ -2604,7 +2604,7 @@ even call `transfer` on a `Closed` account.
 
 ### Implementation
 
-1. Requires const generics (already partially implemented in P)
+1. Requires const generics (already partially implemented in Fides)
 2. Typechecker: `Account<Active>` and `Account<Closed>` are different types
 3. State transition functions consume old state, produce new state
 4. No runtime check needed — type system prevents misuse
@@ -2615,7 +2615,7 @@ even call `transfer` on a `Closed` account.
 
 **Status:** 🔲 Planned
 **Impact:** High — prevents timezone, clock-skew, and leap-year bugs
-**Novelty:** Most languages use system clock; P provides logical time as explicit parameter
+**Novelty:** Most languages use system clock; Fides provides logical time as explicit parameter
 **Industries:** Banking, finance, medical, aerospace, blockchain
 
 ### Concept
@@ -2639,7 +2639,7 @@ let now = system_clock();  // COMPILE ERROR: system clock not allowed
 
 ### Why It Matters
 
-| Bug class | COBOL | P with `LogicalTime` |
+| Bug class | COBOL | Fides with `LogicalTime` |
 |-----------|-------|----------------------|
 | Timezone error | System clock is local time → off by one day | `LogicalDate` has no timezone |
 | Clock skew | Different servers have different clocks | Time is a parameter, not read from OS |
@@ -2699,10 +2699,10 @@ pf flight_control_loop(
 
 Today, DO-178C and ISO 26262 compliance is verified by **external tools**
 (LDRA, Polyspace, Coverity) that run AFTER coding. They find violations
-late in the process. P enforces the rules **at compile time** — violations
+late in the process. Fides enforces the rules **at compile time** — violations
 are compile errors, not late-stage audit findings.
 
-| Standard | Domain | P enforcement |
+| Standard | Domain | Fides enforcement |
 |----------|--------|---------------|
 | DO-178C | Aerospace | @safety-critical + @dal-a |
 | ISO 26262 | Automotive | @safety-critical + @autosar |
@@ -2752,7 +2752,7 @@ pf compute_pitch_command(
 
 Flight control computers use dual/triple redundant channels. Today this is
 done with **two separate codebases** written by **two separate teams** (DO-178C
-requires this for DAL-A). P can generate both channels from one codebase,
+requires this for DAL-A). Fides can generate both channels from one codebase,
 with the compiler ensuring they're identical but independently scheduled.
 
 ### Implementation
@@ -2768,7 +2768,7 @@ with the compiler ensuring they're identical but independently scheduled.
 
 **Status:** 🔲 Planned
 **Impact:** Critical for safety-critical systems
-**Novelty:** Most languages can't prove loop termination; P can
+**Novelty:** Most languages can't prove loop termination; Fides can
 **Industries:** Aerospace, automotive, medical, nuclear, rail, robotics
 
 ### Concept
@@ -2801,7 +2801,7 @@ pf process_packets(buffer: &Buffer) -> Result<(), Error> {
 Unbounded loops are the #1 cause of missed deadlines in safety-critical
 systems. WCET (Worst-Case Execution Time) analysis requires that all loops
 have a known maximum iteration count. Today this is verified by external
-tools (aiT, Bound-T). P enforces it at compile time.
+tools (aiT, Bound-T). Fides enforces it at compile time.
 
 ### Implementation
 
@@ -2849,7 +2849,7 @@ pf avionics_system() {
 ARINC 653 requires that avionics components are spatially partitioned (can't
 access each other's memory) and temporally partitioned (can't run during
 each other's time slices). Today this is enforced by the RTOS (VxWorks,
-INTEGRITY). P can enforce it at compile time — the compiler prevents any
+INTEGRITY). Fides can enforce it at compile time — the compiler prevents any
 shared mutable state between partitions.
 
 ### Implementation
@@ -2902,16 +2902,16 @@ pf drug_dosage_calculator(
 
 Medical device software must comply with IEC 62304 (US) or MDR (EU).
 Today, compliance is verified by external auditors who manually review
-code. P enforces the rules at compile time — violations are compile errors,
+code. Fides enforces the rules at compile time — violations are compile errors,
 not audit findings months later.
 
-| IEC 62304 Requirement | P Enforcement |
+| IEC 62304 Requirement | Fides Enforcement |
 |----------------------|---------------|
 | No dynamic allocation in safety-critical | `@medical` rejects heap allocation |
 | All errors handled | Typechecker rejects ignored `Result` |
 | No uninitialized data | Typechecker requires initialization |
 | Traceability (every requirement → code) | `@audit` auto-generates traceability log |
-| No undefined behavior | P has no UB (safe language by design) |
+| No undefined behavior | Fides has no UB (safe language by design) |
 | Risk analysis | `@deterministic` proves no unexpected side effects |
 
 ### Implementation
@@ -2941,13 +2941,13 @@ pf engine_control(
     // AUTOSAR rules enforced:
     // 1. No dynamic allocation after startup (static allocation only)
     // 2. No recursion (bounded call depth)
-    // 3. No multiple inheritance (not applicable in P — no classes)
-    // 4. No exceptions (P uses Result — already compliant)
-    // 5. No goto (P has no goto — already compliant)
+    // 3. No multiple inheritance (not applicable in Fides — no classes)
+    // 4. No exceptions (Fides uses Result — already compliant)
+    // 5. No goto (Fides has no goto — already compliant)
     // 6. All parameters named and typed
     // 7. No magic numbers (use pc constants)
     // 8. Cyclomatic complexity ≤ 15
-    // 9. No pointer arithmetic (P has no raw pointers in safe mode)
+    // 9. No pointer arithmetic (Fides has no raw pointers in safe mode)
     // 10. Fixed-point math preferred over FP
     
     let rpm = sensors.rpm;
@@ -2962,7 +2962,7 @@ pf engine_control(
 
 AUTOSAR is the standard for automotive ECU software. Today, compliance is
 checked by static analysis tools (Axivion, Helix QAC) that run AFTER coding.
-P enforces AUTOSAR rules at compile time.
+Fides enforces AUTOSAR rules at compile time.
 
 ### Implementation
 
@@ -3005,14 +3005,14 @@ pf send_brake_status(ecu: &mut ECU, pressure: i32) -> Result<(), Error> {
 
 CAN bus IDs must be unique across the vehicle. Today, ID collisions are
 found during integration testing (when two ECUs talk over the same ID).
-P verifies uniqueness at compile time.
+Fides verifies uniqueness at compile time.
 
 ### Implementation
 
 1. `@can-bus` registers CAN IDs in a compile-time table
 2. Typechecker verifies no ID collisions across all `@can-bus` functions
 3. Codegen generates CAN frame encoding (pack struct into 8-byte frame)
-4. Stdlib `can.p` provides CAN HAL (socketCAN on Linux, direct register on bare metal)
+4. Stdlib `can.fd` provides CAN HAL (socketCAN on Linux, direct register on bare metal)
 
 ---
 
@@ -3061,7 +3061,7 @@ pf flight_control_primary(
 
 DAL-A is the highest safety level in DO-178C — required for flight control
 systems where failure causes catastrophic loss. Today, DAL-A compliance
-requires millions of dollars in verification effort. P enforces the coding
+requires millions of dollars in verification effort. Fides enforces the coding
 rules at compile time, reducing verification cost.
 
 ### Implementation
@@ -3112,7 +3112,7 @@ pf protection_relay(
 
 Power grid protection relays must respond within 4 milliseconds. Missing
 the deadline means equipment damage or power outage. Today, timing
-verification is done with external WCET tools. P enforces it at compile time.
+verification is done with external WCET tools. Fides enforces it at compile time.
 
 ### Implementation
 

@@ -72,7 +72,7 @@ Philosophy: no hidden allocations, no hidden control flow, no preprocessor, no t
 
 **Verdict:** 🟢 Absolutely justified. Zig explores a genuinely different answer from Rust — simplicity and explicit control rather than maximizing compile-time enforcement.
 
-**Lesson for P:** Comptime is a powerful idea. P already has it. Zig proves that comptime can replace macros, generics complexity, and much of what other languages solve with complex type systems.
+**Lesson for Fides:** Comptime is a powerful idea. Fides already has it. Zig proves that comptime can replace macros, generics complexity, and much of what other languages solve with complex type systems.
 
 ---
 

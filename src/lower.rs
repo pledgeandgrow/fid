@@ -1,6 +1,6 @@
-// AST → Pledge IR lowering pass
+// AST → Fides IR lowering pass
 //
-// This module lowers the typed AST into Pledge IR (SSA form).
+// This module lowers the typed AST into Fides IR (SSA form).
 // It handles:
 // - Function lowering with basic blocks and control flow
 // - Expression lowering to SSA values
@@ -595,7 +595,7 @@ impl Lowerer {
         }
     }
 
-    /// Lower a Pledge AST type to an IR type, resolving aliases first
+    /// Lower a Fides AST type to an IR type, resolving aliases first
     fn lower_type(&self, ty: &Type) -> IrType {
         let resolved = self.resolve_type(ty);
         crate::ir::lower_type(&resolved)

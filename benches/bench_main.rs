@@ -1,4 +1,4 @@
-//! Performance benchmarks for the Pledge compiler.
+//! Performance benchmarks for the Fides compiler.
 //!
 //! Run with: `cargo bench`
 //!
@@ -60,16 +60,16 @@ pub fn bench<F: FnMut()>(name: &str, n: usize, mut f: F) -> BenchResult {
     }
 }
 
-/// Get the pledgec binary path.
-fn pledgec_bin() -> String {
-    let bin = std::env::var("CARGO_BIN_EXE_pledgec")
-        .unwrap_or_else(|_| "target/debug/pledgec".to_string());
+/// Get the fidesc binary path.
+fn fidesc_bin() -> String {
+    let bin = std::env::var("CARGO_BIN_EXE_fidesc")
+        .unwrap_or_else(|_| "target/debug/fidesc".to_string());
     bin
 }
 
 #[test]
 fn bench_lexing() {
-    let bin = pledgec_bin();
+    let bin = fidesc_bin();
     let source = include_str!("../tests/hello.p");
     let n = 50;
     let result = bench("lexing (hello.p)", n, || {
@@ -82,7 +82,7 @@ fn bench_lexing() {
 
 #[test]
 fn bench_parsing() {
-    let bin = pledgec_bin();
+    let bin = fidesc_bin();
     let n = 50;
     let result = bench("parsing (hello.p)", n, || {
         let _ = Command::new(&bin)
@@ -94,7 +94,7 @@ fn bench_parsing() {
 
 #[test]
 fn bench_ir_lowering() {
-    let bin = pledgec_bin();
+    let bin = fidesc_bin();
     let n = 50;
     let result = bench("IR lowering (hello.p)", n, || {
         let _ = Command::new(&bin)
@@ -106,7 +106,7 @@ fn bench_ir_lowering() {
 
 #[test]
 fn bench_interpretation() {
-    let bin = pledgec_bin();
+    let bin = fidesc_bin();
     let n = 50;
     let result = bench("interpretation (hello.p)", n, || {
         let _ = Command::new(&bin)
@@ -118,7 +118,7 @@ fn bench_interpretation() {
 
 #[test]
 fn bench_c_codegen() {
-    let bin = pledgec_bin();
+    let bin = fidesc_bin();
     let n = 10;
     let result = bench("C codegen (hello.p)", n, || {
         let _ = Command::new(&bin)
@@ -132,7 +132,7 @@ fn bench_c_codegen() {
 
 #[test]
 fn bench_pe_emission() {
-    let bin = pledgec_bin();
+    let bin = fidesc_bin();
     let n = 10;
     let result = bench("PE emission (hello.p)", n, || {
         let _ = Command::new(&bin)
@@ -145,7 +145,7 @@ fn bench_pe_emission() {
 
 #[test]
 fn bench_interpretation_collections() {
-    let bin = pledgec_bin();
+    let bin = fidesc_bin();
     let n = 20;
     let result = bench("interpretation (collections)", n, || {
         let _ = Command::new(&bin)
@@ -157,7 +157,7 @@ fn bench_interpretation_collections() {
 
 #[test]
 fn bench_interpretation_closures() {
-    let bin = pledgec_bin();
+    let bin = fidesc_bin();
     let n = 20;
     let result = bench("interpretation (closures)", n, || {
         let _ = Command::new(&bin)
@@ -169,7 +169,7 @@ fn bench_interpretation_closures() {
 
 #[test]
 fn bench_all_tests_interpreter() {
-    let bin = pledgec_bin();
+    let bin = fidesc_bin();
     let n = 3;
     let result = bench("all tests (interpreter)", n, || {
         let _ = Command::new(&bin).arg("test").output();

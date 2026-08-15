@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
 # Benchmark Suite vs LLVM -O2 — Phase 4B
-# Compares Pledge compiler output against equivalent C code compiled with gcc -O2.
+# Compares Fides compiler output against equivalent C code compiled with gcc -O2.
 # Success metric: PIR optimizer produces code within 10% of LLVM -O2.
 #
 # Usage: bash benchmarks/bench_vs_llvm.sh
 
 set -e
 
-PLEDGEC=${PLEDGEC:-./target/debug/pledgec}
+FIDESC=${FIDESC:-./target/debug/fidesc}
 TMPDIR=$(mktemp -d)
 
-echo "=== Benchmark Suite: Pledge vs LLVM -O2 ==="
+echo "=== Benchmark Suite: Fides vs LLVM -O2 ==="
 echo ""
 
 # Build the compiler if needed
-if [ ! -f "$PLEDGEC" ]; then
-    echo "Building pledgec..."
+if [ ! -f "$FIDESC" ]; then
+    echo "Building fidesc..."
     cargo build 2>/dev/null
 fi
 
 # ─── Benchmark 1: Fibonacci (recursive) ───
 echo "--- Benchmark 1: fib(35) recursive ---"
 
-cat > "$TMPDIR/fib.p" << 'EOF'
+cat > "$TMPDIR/fib.fd" << 'EOF'
 pf fib(n: i64) -> i64 {
     if n <= 1 { ret n; }
     ret fib(n - 1) + fib(n - 2);
@@ -47,11 +47,11 @@ int main() {
 }
 EOF
 
-# Run Pledge (interpreter)
+# Run Fides (interpreter)
 START=$(date +%s%N)
-PLEDGE_RESULT=$($PLEDGEC run "$TMPDIR/fib.p" 2>/dev/null)
+FIDES_RESULT=$($FIDESC run "$TMPDIR/fib.fd" 2>/dev/null)
 END=$(date +%s%N)
-PLEDGE_MS=$(( (END - START) / 100000 ))
+FIDES_MS=$(( (END - START) / 100000 ))
 
 # Run C with gcc -O2
 gcc -O2 -o "$TMPDIR/fib_c" "$TMPDIR/fib.c" 2>/dev/null
@@ -60,10 +60,10 @@ C_RESULT=$("$TMPDIR/fib_c" 2>/dev/null)
 END=$(date +%s%N)
 C_MS=$(( (END - START) / 100000 ))
 
-echo "  Pledge (interp): ${PLEDGE_MS}ms (result: $PLEDGE_RESULT)"
+echo "  Fides (interp): ${FIDES_MS}ms (result: $FIDES_RESULT)"
 echo "  C (gcc -O2):   ${C_MS}ms (result: $C_RESULT)"
 if [ "$C_MS" -gt 0 ]; then
-    RATIO=$(( PLEDGE_MS * 100 / C_MS ))
+    RATIO=$(( FIDES_MS * 100 / C_MS ))
     echo "  Ratio: ${RATIO}% of LLVM speed"
 fi
 
@@ -71,7 +71,7 @@ fi
 echo ""
 echo "--- Benchmark 2: sum 1..100000 ---"
 
-cat > "$TMPDIR/sum.p" << 'EOF'
+cat > "$TMPDIR/sum.fd" << 'EOF'
 pf main() -> i64 !IO {
     pv total = 0;
     pv i = 0;
@@ -98,9 +98,9 @@ int main() {
 EOF
 
 START=$(date +%s%N)
-PLEDGE_RESULT=$($PLEDGEC run "$TMPDIR/sum.p" 2>/dev/null)
+FIDES_RESULT=$($FIDESC run "$TMPDIR/sum.fd" 2>/dev/null)
 END=$(date +%s%N)
-PLEDGE_MS=$(( (END - START) / 100000 ))
+FIDES_MS=$(( (END - START) / 100000 ))
 
 gcc -O2 -o "$TMPDIR/sum_c" "$TMPDIR/sum.c" 2>/dev/null
 START=$(date +%s%N)
@@ -108,18 +108,18 @@ C_RESULT=$("$TMPDIR/sum_c" 2>/dev/null)
 END=$(date +%s%N)
 C_MS=$(( (END - START) / 100000 ))
 
-echo "  Pledge (interp): ${PLEDGE_MS}ms (result: $PLEDGE_RESULT)"
+echo "  Fides (interp): ${FIDES_MS}ms (result: $FIDES_RESULT)"
 echo "  C (gcc -O2):   ${C_MS}ms (result: $C_RESULT)"
 if [ "$C_MS" -gt 0 ]; then
-    RATIO=$(( PLEDGE_MS * 100 / C_MS ))
+    RATIO=$(( FIDES_MS * 100 / C_MS ))
     echo "  Ratio: ${RATIO}% of LLVM speed"
 fi
 
-# ─── Benchmark 3: C-compiled Pledge vs C ───
+# ─── Benchmark 3: C-compiled Fides vs C ───
 echo ""
-echo "--- Benchmark 3: C-compiled Pledge vs gcc -O2 ---"
+echo "--- Benchmark 3: C-compiled Fides vs gcc -O2 ---"
 
-cat > "$TMPDIR/sum2.p" << 'EOF'
+cat > "$TMPDIR/sum2.fd" << 'EOF'
 pf main() -> i64 !IO {
     pv total = 0;
     pv i = 0;
@@ -132,17 +132,17 @@ pf main() -> i64 !IO {
 }
 EOF
 
-# Compile Pledge to C, then compile with gcc -O2
-$PLEDGEC ccompile "$TMPDIR/sum2.p" -o "$TMPDIR/sum_pledge" 2>/dev/null
+# Compile Fides to C, then compile with gcc -O2
+$FIDESC ccompile "$TMPDIR/sum2.fd" -o "$TMPDIR/sum_fides" 2>/dev/null
 START=$(date +%s%N)
-PLEDGE_C_RESULT=$("$TMPDIR/sum_pledge" 2>/dev/null)
+FIDES_C_RESULT=$("$TMPDIR/sum_fides" 2>/dev/null)
 END=$(date +%s%N)
-PLEDGE_C_MS=$(( (END - START) / 100000 ))
+FIDES_C_MS=$(( (END - START) / 100000 ))
 
-echo "  Pledge (ccompile -O0): ${PLEDGE_C_MS}ms (result: $PLEDGE_C_RESULT)"
+echo "  Fides (ccompile -O0): ${FIDES_C_MS}ms (result: $FIDES_C_RESULT)"
 echo "  C (gcc -O2):         ${C_MS}ms (result: $C_RESULT)"
-if [ "$C_MS" -gt 0 ] && [ "$PLEDGE_C_MS" -gt 0 ]; then
-    RATIO=$(( PLEDGE_C_MS * 100 / C_MS ))
+if [ "$C_MS" -gt 0 ] && [ "$FIDES_C_MS" -gt 0 ]; then
+    RATIO=$(( FIDES_C_MS * 100 / C_MS ))
     echo "  Ratio: ${RATIO}% of LLVM speed"
 fi
 
@@ -150,7 +150,7 @@ fi
 echo ""
 echo "--- Benchmark 4: Compilation speed ---"
 
-cat > "$TMPDIR/big.p" << 'EOF'
+cat > "$TMPDIR/big.fd" << 'EOF'
 pf compute(n: i64) -> i64 {
     pv a = n * 2;
     pv b = a + 1;
@@ -192,11 +192,11 @@ int main() {
 }
 EOF
 
-# Pledge compilation time
+# Fides compilation time
 START=$(date +%s%N)
-$PLEDGEC ccompile "$TMPDIR/big.p" -o "$TMPDIR/big_pledge" 2>/dev/null
+$FIDESC ccompile "$TMPDIR/big.fd" -o "$TMPDIR/big_fides" 2>/dev/null
 END=$(date +%s%N)
-PLEDGE_COMPILE_MS=$(( (END - START) / 100000 ))
+FIDES_COMPILE_MS=$(( (END - START) / 100000 ))
 
 # clang compilation time
 START=$(date +%s%N)
@@ -206,24 +206,24 @@ CLANG_COMPILE_MS=$(( (END - START) / 100000 ))
 
 # Run times
 START=$(date +%s%N)
-"$TMPDIR/big_pledge" > /dev/null 2>&1
+"$TMPDIR/big_fides" > /dev/null 2>&1
 END=$(date +%s%N)
-PLEDGE_RUN_MS=$(( (END - START) / 100000 ))
+FIDES_RUN_MS=$(( (END - START) / 100000 ))
 
 START=$(date +%s%N)
 "$TMPDIR/big_c" > /dev/null 2>&1
 END=$(date +%s%N)
 C_RUN_MS=$(( (END - START) / 100000 ))
 
-echo "  Pledge compile: ${PLEDGE_COMPILE_MS}ms, run: ${PLEDGE_RUN_MS}ms"
+echo "  Fides compile: ${FIDES_COMPILE_MS}ms, run: ${FIDES_RUN_MS}ms"
 echo "  gcc -O2 compile: ${CLANG_COMPILE_MS}ms, run: ${C_RUN_MS}ms"
 
 echo ""
 echo "=== Summary ==="
-echo "Note: Pledge interpreter is ~100-1000x slower than native code for compute-heavy"
+echo "Note: Fides interpreter is ~100-1000x slower than native code for compute-heavy"
 echo "workloads (expected — it's a tree-walking interpreter). The ccompile backend"
 echo "produces C code that gcc/clang compiles to native speed, closing the gap."
-echo "For hot reload, Pledge compiles in <20ms vs gcc -O2 in ~100-500ms."
+echo "For hot reload, Fides compiles in <20ms vs gcc -O2 in ~100-500ms."
 
 # Cleanup
 rm -rf "$TMPDIR"

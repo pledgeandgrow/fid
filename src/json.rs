@@ -1,4 +1,4 @@
-// Minimal JSON module for the Pledge runtime.
+// Minimal JSON module for the Fides runtime.
 // Provides parse, dump, and escape_string functions used by p_json_* builtins.
 
 use std::collections::BTreeMap;

@@ -3,10 +3,10 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // Keywords
-    Pf,          // pf — Pledge Function
-    Pv,          // pv — Pledge Variable
+    Pf,          // pf — Fides Function
+    Pv,          // pv — Fides Variable
     Mut,         // mut
-    Pc,          // pc — Pledge Constant
+    Pc,          // pc — Fides Constant
     Cap,         // cap — capability/trait
     Ty,          // ty — type alias
     Ret,         // ret — return

@@ -1,17 +1,17 @@
-# P Language — Vision
+# Fides Language — Vision
 
 > Build the last programming language the world needs.
 
 ## Mission
 
-P is a systems programming language built from first principles — every layer custom-made, from parser to machine code. No LLVM dependency. No borrowed infrastructure. A language designed to outperform C, Rust, and Zig in security, performance, developer velocity, and expressiveness.
+Fides is a systems programming language built from first principles — every layer custom-made, from parser to machine code. No LLVM dependency. No borrowed infrastructure. A language designed to outperform C, Rust, and Zig in security, performance, developer velocity, and expressiveness.
 
 ## The Eight Pillars
 
 ### 1. Originality — Own Our Uniqueness
 - No existing language combines region-based memory safety, effect handlers, capability security, and comptime metaprogramming
 - Every layer of the compiler stack is built by us: lexer, parser, typechecker, IR, optimizer, codegen, linker
-- P is not "Rust with different syntax" or "Zig with safety" — it is a new architecture
+- Fides is not "Rust with different syntax" or "Zig with safety" — it is a new architecture
 
 ### 2. Security — Prevent CVEs by Construction
 - **Capability-based security**: no ambient authority, no implicit filesystem/network access
@@ -31,7 +31,7 @@ P is a systems programming language built from first principles — every layer 
 ### 4. Memory Safety — Like Rust, Without the Pain
 - **Region inference**: compiler tracks memory regions, no lifetime annotations needed
 - **No borrow checker fights**: regions are more flexible than ownership+borrowing
-- **No "mutation xor sharing" rule**: aliasing patterns that Rust rejects are valid in P
+- **No "mutation xor sharing" rule**: aliasing patterns that Rust rejects are valid in Fides
 - **Explicit allocators**: caller chooses allocation strategy (like Zig), but with compile-time safety (like Rust)
 - **Zero runtime cost**: all safety checks are compile-time
 
@@ -45,7 +45,7 @@ P is a systems programming language built from first principles — every layer 
 
 ### 6. Adoption — Make Switching Easy
 - **C interop**: call C libraries directly, gradual migration path
-- **Familiar syntax**: Rust-like syntax with P keywords (pv/pf/pc)
+- **Familiar syntax**: Rust-like syntax with Fides keywords (pv/pf/pc)
 - **Hot reload**: instant feedback loop attracts game/GUI/web developers
 - **Fast compilation**: sub-second builds for small projects
 - **AI tooling**: LLM-friendly syntax, semantic IR enables AI-assisted refactoring
@@ -56,13 +56,13 @@ P is a systems programming language built from first principles — every layer 
 - **Custom lexer**: hand-written, not generated
 - **Custom parser**: recursive descent, not parser generators
 - **Custom typechecker**: region inference + effect system + capability checking
-- **Custom IR (PIR)**: P Intermediate Representation — typed, semantic, multi-level
+- **Custom IR (PIR)**: Fides Intermediate Representation — typed, semantic, multi-level
 - **Custom optimizer**: semantic-aware, leverages region/effect/capability info
 - **Custom codegen**: direct to machine code (x86-64, ARM64, RISC-V) — **DONE**
 - **Custom linker**: integrated, not a separate process
 - **Custom stdlib**: no libc dependency for core operations
 - **Custom allocator**: region-aware, built into the language runtime
-- Minimal external dependencies: the Rust compiler plus 4 crates (hashbrown, compact_str, smallvec, bumpalo) to build P (bootstrapping later)
+- Minimal external dependencies: the Rust compiler plus 4 crates (hashbrown, compact_str, smallvec, bumpalo) to build Fides (bootstrapping later)
 
 ### 8. Innovation — Optimized for AI, Robotics, Hardware, IoT
 - **AI/ML**: comptime specialization for tensor operations, SIMD intrinsics as first-class
@@ -74,7 +74,7 @@ P is a systems programming language built from first principles — every layer 
 - **Cross-compilation**: target any architecture from any host
 - **No runtime**: bare metal, no OS needed
 
-## What P Is NOT
+## What Fides Is NOT
 
 - **Not a research language**: designed for production, not papers
 - **Not a Rust replacement**: different architecture, different tradeoffs

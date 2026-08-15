@@ -1,4 +1,4 @@
-// Pledge comptime evaluation engine (Phase 3A)
+// Fides comptime evaluation engine (Phase 3A)
 //
 // Evaluates `comptime <expr>`, `comptime { block }`, and `comptime reflect_op(T)`
 // at compile time, substituting the result as a literal into the AST.
@@ -133,7 +133,7 @@ fn process_comptime_gen_in_func(
     func.body = new_body;
 }
 
-/// Parse generated Pledge source code into functions and structs.
+/// Parse generated Fides source code into functions and structs.
 fn parse_generated_code(source: &str) -> Result<(Vec<Func>, Vec<StructDef>), String> {
     let mut lexer = crate::lexer::Lexer::new(source);
     let tokens = lexer.tokenize();

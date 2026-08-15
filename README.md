@@ -1,6 +1,6 @@
-<h1 align="center">P Language — Bootstrap Compiler</h1>
+<h1 align="center">Fides Language — Bootstrap Compiler</h1>
 
-A bootstrap compiler for the P programming language, written in Rust. Generates **native ELF64 executables on Linux** and **PE executables on Windows** via zero-external-tool emission, plus portable C codegen. Also includes an IR interpreter for rapid testing, WebAssembly and SPIR-V GPU backends, multi-arch assembly codegen (x86-64, ARM64, RISC-V), ELF64/Mach-O/COFF object file emission, and a bare-metal flat binary mode.
+A bootstrap compiler for the Fides programming language, written in Rust. Generates **native ELF64 executables on Linux** and **PE executables on Windows** via zero-external-tool emission, plus portable C codegen. Also includes an IR interpreter for rapid testing, WebAssembly and SPIR-V GPU backends, multi-arch assembly codegen (x86-64, ARM64, RISC-V), ELF64/Mach-O/COFF object file emission, and a bare-metal flat binary mode.
 
 ## Status
 
@@ -10,12 +10,12 @@ A bootstrap compiler for the P programming language, written in Rust. Generates 
 
 | Test Group | Result | Notes |
 |------------|:------:|-------|
-| Unit tests (`cargo test --bin pledgec`) | **136/136** | elf64, pir, peephole (26 tests), opt, regalloc, tensor, codegen_x64, hotreload (8), embedded, gpu, wasm, coff, macho, linker |
+| Unit tests (`cargo test --bin fidesc`) | **136/136** | elf64, pir, peephole (26 tests), opt, regalloc, tensor, codegen_x64, hotreload (8), embedded, gpu, wasm, coff, macho, linker |
 | Harness tests (`cargo test --test harness`) | **8/8** | All pass including golden_files_match |
-| Interpreter (`pledgec test`) | **78/78** normal + **1/1** expected-fail | `test_trait_verify_fail` is expected to fail (tests error detection) |
-| PE Emitter (`pledgec test`) | **78/78** normal + **1/1** expected-fail | All PE structures valid |
-| C Codegen (`pledgec test`) | **76/78** normal + **1/1** expected-fail | 2 real mismatches: `test_asm` (inline asm — by design), `test_comptime_reflect` (comptime reflection — interpreter-only). `test_db` is flaky (HashMap ordering). |
-| Total `.p` test files | **102** | 79 root + 9 safety + 4 capability + 7 effects + 3 regions |
+| Interpreter (`fidesc test`) | **78/78** normal + **1/1** expected-fail | `test_trait_verify_fail` is expected to fail (tests error detection) |
+| PE Emitter (`fidesc test`) | **78/78** normal + **1/1** expected-fail | All PE structures valid |
+| C Codegen (`fidesc test`) | **76/78** normal + **1/1** expected-fail | 2 real mismatches: `test_asm` (inline asm — by design), `test_comptime_reflect` (comptime reflection — interpreter-only). `test_db` is flaky (HashMap ordering). |
+| Total `.fd` test files | **102** | 79 root + 9 safety + 4 capability + 7 effects + 3 regions |
 | Source files | **35** `.rs` | 47,397 LOC |
 | Golden files | **43** | Expected outputs in `tests/golden/` |
 
@@ -89,18 +89,18 @@ A bootstrap compiler for the P programming language, written in Rust. Generates 
 | C FFI (`extern "C"`) | Yes (stubs) | Yes | Yes |
 | Const generics (`[T; N]`) | Yes | Yes | Yes |
 | GATs (Generic Associated Types) | Yes | Yes | Yes |
-| SIMD types (`stdlib/simd.p`) | Yes | Yes | Partial |
-| Tensor type (`stdlib/tensor.p`) | Yes | Yes | Partial |
-| JSON parsing (`stdlib/json.p`) | Yes | Yes | Partial |
-| HTTP server (`stdlib/http.p`) | Yes | Yes | N/A |
-| Database framework (`stdlib/db.p`) | Yes | Yes | N/A |
-| Parallel operations (`stdlib/parallel.p`) | Yes | Yes | N/A |
-| WebAssembly backend (`pledgec wasm`) | N/A | N/A | N/A |
-| SPIR-V GPU backend (`pledgec gpu`) | N/A | N/A | N/A |
-| Hot reload (`pledgec watch`) | N/A | N/A | N/A |
+| SIMD types (`stdlib/simd.fd`) | Yes | Yes | Partial |
+| Tensor type (`stdlib/tensor.fd`) | Yes | Yes | Partial |
+| JSON parsing (`stdlib/json.fd`) | Yes | Yes | Partial |
+| HTTP server (`stdlib/http.fd`) | Yes | Yes | N/A |
+| Database framework (`stdlib/db.fd`) | Yes | Yes | N/A |
+| Parallel operations (`stdlib/parallel.fd`) | Yes | Yes | N/A |
+| WebAssembly backend (`fidesc wasm`) | N/A | N/A | N/A |
+| SPIR-V GPU backend (`fidesc gpu`) | N/A | N/A | N/A |
+| Hot reload (`fidesc watch`) | N/A | N/A | N/A |
 | Multi-arch codegen (x86-64/ARM64/RISC-V) | N/A | N/A | N/A |
 | ELF64/Mach-O/COFF object files | N/A | N/A | N/A |
-| Integrated linker (`pledgec link`) | N/A | N/A | N/A |
+| Integrated linker (`fidesc link`) | N/A | N/A | N/A |
 | Embedded/IoT support (`embedded.rs`) | N/A | N/A | N/A |
 
 ### What Is Parsed But Not Fully Working
@@ -109,7 +109,7 @@ A bootstrap compiler for the P programming language, written in Rust. Generates 
 |---------|--------|-------|
 | `async` / `await` | Parsed | Phase 4+ — not yet implemented |
 | `spawn` | Parsed | Phase 4+ — not yet implemented |
-| `#[test]` attribute | Parsed | Not yet executed by `pledgec test` |
+| `#[test]` attribute | Parsed | Not yet executed by `fidesc test` |
 | `#[derive]` | Parsed | Not yet implemented |
 | Effect handler continuations | Syntax works | `handle { do } with` parses and runs; full continuation semantics pending |
 | `--opt` (L2 optimizer) | Partial | Inliner fixed, but exposes pre-existing register allocator bug for complex programs. Simple programs work correctly. Not enabled by default. |
@@ -118,12 +118,12 @@ A bootstrap compiler for the P programming language, written in Rust. Generates 
 
 ### Known Limitations
 
-- **ELF64 executable emission works on Linux** — `pledgec build <file> --target x86-64` produces working ELF64 executables directly (zero external tools). `pledgec codegen --elf <out.o>` emits valid relocatable objects (readelf compatible). `pledgec codegen --macho` and `--coff` also produce valid object files.
-- **PE emitter targets Windows x64 only** — `pledgec emit` produces PE32+ executables; tested via `pledgec test` (78/78 valid + 1/1 expected-fail)
+- **ELF64 executable emission works on Linux** — `fidesc build <file> --target x86-64` produces working ELF64 executables directly (zero external tools). `fidesc codegen --elf <out.o>` emits valid relocatable objects (readelf compatible). `fidesc codegen --macho` and `--coff` also produce valid object files.
+- **PE emitter targets Windows x64 only** — `fidesc emit` produces PE32+ executables; tested via `fidesc test` (78/78 valid + 1/1 expected-fail)
 - **Register allocator has a pre-existing bug** — linear scan allocator in `regalloc.rs` maps VRegs to physical registers, but constants not loaded into registers before use can be clobbered by intervening instructions. Exposed by the L2 optimizer's instruction reordering. Blocks enabling `--opt` by default.
 - **Peephole optimizer always on** — 9 passes run automatically in the `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
-- **L2 optimizer (`--opt`) not enabled by default** — PIR optimizer exists (`pledgec opt`, `pledgec pir --opt`, `pledgec build --opt`) with constant folding, DCE, CSE, inlining, TCO, loop unrolling, and effect-based pure function elision. Works for simple programs but exposes the register allocator bug on complex ones.
-- **`#[test]` attribute** — parsed but not executed by `pledgec test` (tests are file-based)
+- **L2 optimizer (`--opt`) not enabled by default** — PIR optimizer exists (`fidesc opt`, `fidesc pir --opt`, `fidesc build --opt`) with constant folding, DCE, CSE, inlining, TCO, loop unrolling, and effect-based pure function elision. Works for simple programs but exposes the register allocator bug on complex ones.
+- **`#[test]` attribute** — parsed but not executed by `fidesc test` (tests are file-based)
 - **C codegen coverage** — 76/78 tests match interpreter output (+ 1/1 expected-fail). 2 real mismatches: `test_asm` (inline asm — by design), `test_comptime_reflect` (comptime reflection — interpreter-only). `test_db` is flaky (HashMap iteration order non-deterministic).
 - **190 compiler warnings** — dead code, unused variables (cleanup needed)
 
@@ -136,35 +136,35 @@ A bootstrap compiler for the P programming language, written in Rust. Generates 
 cargo build
 
 # Build a native ELF64 executable on Linux (zero external tools needed)
-cargo run -- build tests/hello.p -o hello
-./hello  # Output: Hello, P!50y is big (exit code 8)
+cargo run -- build tests/hello.fd -o hello
+./hello  # Output: Hello, Fides!50y is big (exit code 8)
 
-# Run a P file in the IR interpreter (fast, no external tools)
-cargo run -- run tests/hello.p
+# Run a Fides file in the IR interpreter (fast, no external tools)
+cargo run -- run tests/hello.fd
 
 # Build with optimization (smaller binary, but may be incorrect on complex programs)
-cargo run -- build tests/hello.p -o hello_opt --opt
+cargo run -- build tests/hello.fd -o hello_opt --opt
 
 # Build via C codegen (requires gcc or clang)
-cargo run -- ccompile tests/hello.p -o hello_c
+cargo run -- ccompile tests/hello.fd -o hello_c
 
 # Emit a Windows PE executable (cross-compilation, no external tools)
-cargo run -- emit tests/hello.p -o hello.exe
+cargo run -- emit tests/hello.fd -o hello.exe
 
 # Generate assembly for multiple architectures
-cargo run -- codegen tests/hello.p --target x86-64
-cargo run -- codegen tests/hello.p --target arm64
-cargo run -- codegen tests/hello.p --target riscv
+cargo run -- codegen tests/hello.fd --target x86-64
+cargo run -- codegen tests/hello.fd --target arm64
+cargo run -- codegen tests/hello.fd --target riscv
 
 # Emit object files in multiple formats
-cargo run -- codegen tests/hello.p --elf hello.o
-cargo run -- codegen tests/hello.p --macho hello.macho
-cargo run -- codegen tests/hello.p --coff hello.coff
+cargo run -- codegen tests/hello.fd --elf hello.o
+cargo run -- codegen tests/hello.fd --macho hello.macho
+cargo run -- codegen tests/hello.fd --coff hello.coff
 
 # View tokens, AST, or IR
-cargo run -- tokens tests/hello.p
-cargo run -- ast tests/hello.p
-cargo run -- ir tests/hello.p
+cargo run -- tokens tests/hello.fd
+cargo run -- ast tests/hello.fd
+cargo run -- ir tests/hello.fd
 
 # Run the test suite
 cargo run -- test
@@ -177,25 +177,25 @@ cargo run -- version
 
 | Command | Description |
 |---------|-------------|
-| `build <file.p> -o <out> [--target x86-64\|arm64\|riscv] [--opt]` | **Native build**: lex → parse → typecheck → lower → PIR → codegen → peephole → ELF64 executable (zero external tools on Linux). `--opt` runs L2 optimizer. |
-| `emit <file.p> -o <out.exe>` | **Direct PE emission**: lex → parse → typecheck → lower → x86 machine code → PE file → `.exe` (no external tools, Windows) |
-| `emit <file.p> -o <out.bin> --bare` | **Bare-metal mode**: no stdlib, flat binary output (Phase 5A) |
-| `ccompile <file.p> -o <out>` | C codegen pipeline: lex → parse → typecheck → lower → C source → `gcc`/`clang` → executable |
-| `run <file.p> [-v]` | Lex → parse → typecheck → lower → interpret IR (no external tools needed) |
-| `ir <file.p>` | Lex → parse → typecheck → lower → print SSA IR |
-| `pir <file.p> [1\|2\|3\|all] [--opt]` | Lower to PIR (L1/L2/L3) and print; `--opt` runs optimization passes |
-| `opt <file.p> [pass1,pass2,...]` | Run PIR optimizer and print statistics (const-fold, cse, dce, inline, unroll, tco) |
-| `codegen <file.p> --target <arch> [--peephole] [--elf\|--macho\|--coff <o>]` | Generate assembly for x86-64, ARM64, or RISC-V; optionally emit object files |
-| `wasm <file.p> -o <out.wasm> [--wat]` | WebAssembly backend: PIR → WASM binary |
-| `gpu <file.p>` | SPIR-V GPU backend: PIR → SPIR-V binary |
-| `tokens <file.p>` | Lex only — print token stream |
-| `ast <file.p>` | Lex + parse — print AST tree |
+| `build <file.fd> -o <out> [--target x86-64\|arm64\|riscv] [--opt]` | **Native build**: lex → parse → typecheck → lower → PIR → codegen → peephole → ELF64 executable (zero external tools on Linux). `--opt` runs L2 optimizer. |
+| `emit <file.fd> -o <out.exe>` | **Direct PE emission**: lex → parse → typecheck → lower → x86 machine code → PE file → `.exe` (no external tools, Windows) |
+| `emit <file.fd> -o <out.bin> --bare` | **Bare-metal mode**: no stdlib, flat binary output (Phase 5A) |
+| `ccompile <file.fd> -o <out>` | C codegen pipeline: lex → parse → typecheck → lower → C source → `gcc`/`clang` → executable |
+| `run <file.fd> [-v]` | Lex → parse → typecheck → lower → interpret IR (no external tools needed) |
+| `ir <file.fd>` | Lex → parse → typecheck → lower → print SSA IR |
+| `pir <file.fd> [1\|2\|3\|all] [--opt]` | Lower to PIR (L1/L2/L3) and print; `--opt` runs optimization passes |
+| `opt <file.fd> [pass1,pass2,...]` | Run PIR optimizer and print statistics (const-fold, cse, dce, inline, unroll, tco) |
+| `codegen <file.fd> --target <arch> [--peephole] [--elf\|--macho\|--coff <o>]` | Generate assembly for x86-64, ARM64, or RISC-V; optionally emit object files |
+| `wasm <file.fd> -o <out.wasm> [--wat]` | WebAssembly backend: PIR → WASM binary |
+| `gpu <file.fd>` | SPIR-V GPU backend: PIR → SPIR-V binary |
+| `tokens <file.fd>` | Lex only — print token stream |
+| `ast <file.fd>` | Lex + parse — print AST tree |
 | `test` | Run all 102 tests across interpreter, PE emitter, and C codegen |
-| `repl` | Interactive REPL — evaluate P expressions |
-| `verify <file.p>` | Verify IR correctness (terminators, block refs, value refs) |
-| `sourcemap <file.p>` | Show source map (IR value → source line mapping) |
-| `parse-header <file.h> -o <out.p>` | Parse C header file → generate P FFI bindings |
-| `watch <file.p>` | Hot reload: native JIT (ELF64) + function-level change detection |
+| `repl` | Interactive REPL — evaluate Fides expressions |
+| `verify <file.fd>` | Verify IR correctness (terminators, block refs, value refs) |
+| `sourcemap <file.fd>` | Show source map (IR value → source line mapping) |
+| `parse-header <file.h> -o <out.fd>` | Parse C header file → generate Fides FFI bindings |
+| `watch <file.fd>` | Hot reload: native JIT (ELF64) + function-level change detection |
 | `link <files...>` | Link multiple object files (integrated linker) |
 | `version` | Print compiler version |
 
@@ -242,7 +242,7 @@ PE Emitter:   78/78 valid     (+ 1/1 expected fail: test_trait_verify_fail)
 The compiler is a multi-stage pipeline:
 
 ```
-Source (.p) → Lexer → Parser → TypeChecker → Monomorphizer → Lowerer → SSA IR
+Source (.fd) → Lexer → Parser → TypeChecker → Monomorphizer → Lowerer → SSA IR
                                                                          │
                                                     ┌────────────────────┼────────────────────┐
                                                     │                    │                    │
@@ -267,14 +267,14 @@ The **ELF64 emitter** (`build` command on Linux) is the primary native backend �
 ### 0. Module Resolution & Monomorphization (`compiler.rs`, `mono.rs`)
 
 Before lowering, the compiler:
-- Auto-includes `stdlib/core.p` (user definitions override stdlib)
-- Resolves `use` imports by searching for `<path>.p` or `<path>/mod.p` files relative to the source
+- Auto-includes `stdlib/core.fd` (user definitions override stdlib)
+- Resolves `use` imports by searching for `<path>.fd` or `<path>/mod.fd` files relative to the source
 - Merges stdlib + imported modules + user code (user wins on conflicts)
 - **Monomorphizes** generic functions: analyzes all call sites with concrete type arguments, generates specialized non-generic copies (e.g., `identity__i64`), and replaces calls
 
 ### 1. Lexer (`lexer.rs`)
 
-Reads P source text and produces a stream of tokens. Handles:
+Reads Fides source text and produces a stream of tokens. Handles:
 
 - **Keywords**: `pf`, `pv`, `pc`, `mut`, `cap`, `ty`, `ret`, `if`, `else`, `match`, `struct`, `enum`, `impl`, `pub`, `use`, `async`, `await`, `comptime`, `defer`, `spawn`, `for`, `while`, `loop`, `break`, `continue`, `in`, `as`, `where`, `region`, `move`, `static`, `true`, `false`
 - **Primitive types**: `i8`–`i128`, `u8`–`u128`, `f32`, `f64`, `bool`, `str`, `void`
@@ -314,13 +314,13 @@ Lowers the type-checked AST to a typed **SSA (Static Single Assignment) IR** def
 - **Basic blocks**: control flow lowered to blocks with terminators (jump, branch, return)
 - **Alloca + load/store**: mutable variables lowered via stack allocations
 - **Function calls**: lowered to `Inst::Call` with argument passing
-- **Runtime functions**: `print`, `__pledge_to_str`, `__pledge_str_concat`, `__pledge_print_int`, `__pledge_print_str`, `__pledge_print_bool`, `__pledge_panic`
-- **F-string lowering**: literal parts become `ConstStr`, expression parts are converted via `__pledge_to_str` (if not already a string), then all parts are concatenated via `__pledge_str_concat`
+- **Runtime functions**: `print`, `__fides_to_str`, `__fides_str_concat`, `__fides_print_int`, `__fides_print_str`, `__fides_print_bool`, `__fides_panic`
+- **F-string lowering**: literal parts become `ConstStr`, expression parts are converted via `__fides_to_str` (if not already a string), then all parts are concatenated via `__fides_str_concat`
 - **Loop lowering**: `for` loops over ranges become `while`-style blocks with a loop variable alloca; `for` loops over arrays become index-based while loops with `GetElemPtr` + `Load`; `while` loops become condition + body + back-edge blocks
 - **Alloca type tracking**: `HashMap<ValueId, IrType>` maps each alloca to its IR type, enabling correct `Load` types (not hardcoded `I64`)
 - **Defer emission**: `defer_stack` tracks deferred statements; `emit_defers` drains and emits them before `Ret`
 - **Match expression lowering**: `lower_match_expr` with result slot alloca, pattern matching branches (IntLit, StrLit, Range, EnumVariant, Wildcard, Ident), merge block
-- **Method call lowering**: Name mangling (`__pledge_StructName_method`), SRET for struct returns, receiver as first arg
+- **Method call lowering**: Name mangling (`__fides_StructName_method`), SRET for struct returns, receiver as first arg
 - **Compound assignment**: Uses `get_value_type()` / `alloca_types` for correct `BinOp` type instead of hardcoded `I64`
 
 ### 5. IR Interpreter (`interp.rs`)
@@ -328,7 +328,7 @@ Lowers the type-checked AST to a typed **SSA (Static Single Assignment) IR** def
 Executes the SSA IR directly — no external assembler or linker needed. Used by the `run` command. Supports:
 
 - All IR instructions (arithmetic, comparisons, control flow, calls)
-- Runtime function calls (`print`, `__pledge_to_str`, `__pledge_str_concat`, etc.)
+- Runtime function calls (`print`, `__fides_to_str`, `__fides_str_concat`, etc.)
 - Value types: `Int`, `Float`, `Bool`, `Str`, `Ptr`, `Unit`
 - Verbose mode (`-v`) for debugging
 
@@ -373,13 +373,13 @@ Generates MASM-compatible x86_64 assembly from the SSA IR. Features:
 - **Stack frame management**: `push rbp` / `mov rbp, rsp` / `sub rsp, N` prologues; pre-allocated alloca slots
 - **Non-volatile register preservation**: `r12`/`r13` saved/restored in runtime stubs
 - **Runtime stubs** (generated inline, no C runtime):
-  - `__pledge_print_int` — integer to string + `WriteFile` to stdout
-  - `__pledge_print_str` — string + newline to stdout
-  - `__pledge_print_bool` — "true"/"false" to stdout
-  - `__pledge_print_float` — (stub, prints truncated int)
-  - `__pledge_to_str` — integer to null-terminated string in stack buffer
-  - `__pledge_str_concat` — concatenates two strings into static buffer (with temp buffer to avoid aliasing)
-  - `__pledge_panic` — prints message + `ExitProcess`
+  - `__fides_print_int` — integer to string + `WriteFile` to stdout
+  - `__fides_print_str` — string + newline to stdout
+  - `__fides_print_bool` — "true"/"false" to stdout
+  - `__fides_print_float` — (stub, prints truncated int)
+  - `__fides_to_str` — integer to null-terminated string in stack buffer
+  - `__fides_str_concat` — concatenates two strings into static buffer (with temp buffer to avoid aliasing)
+  - `__fides_panic` — prints message + `ExitProcess`
 - **Static data**: string literals, concatenation buffers (`str_concat_buf`, `str_concat_tmp`) in `.data` section
 - **External imports**: `GetStdHandle`, `WriteFile`, `ExitProcess` from `kernel32.lib`
 - **Entry point**: `main` / `_main` (both exported)
@@ -390,7 +390,7 @@ Translates SSA IR to portable C99 code. Used by the `ccompile` command. Features
 
 - **Portable C output**: Generates `.c` files compilable with MSVC (`cl.exe`), GCC, or Clang
 - **Function renaming**: `main` → `main_entry`, `abs`/`max`/`min` → `p_abs`/`p_max`/`p_min` (avoids C/MSVC conflicts)
-- **`#undef` directives**: Removes MSVC `max`/`min`/`abs` macros that conflict with P functions
+- **`#undef` directives**: Removes MSVC `max`/`min`/`abs` macros that conflict with Fides functions
 - **SSA variable declarations**: All values declared once at function start; instructions are assignments
 - **Polymorphic `print`**: Dispatches to `p_print_str`/`p_print_int`/`p_print_bool`/`p_print_float` + `p_print_newline()` based on argument type
 - **Runtime functions**: `p_print*`, `p_panic`, `p_malloc`, `p_free`, `p_str_concat`, `p_to_str`, Vec/HashMap/String operations
@@ -432,7 +432,7 @@ Orchestrates the stages. Entry points:
 | Compound assign | `+= -= *= /= %=` | `x += 10;` |
 | Function calls | `name(args)` | `add(10, 20)` |
 | Recursive calls | self-referential `pf` | `pf fact(n: i32) -> i32 { ... fact(n-1) ... }` |
-| Print | `print(...)` | `print("Hello, P!");` |
+| Print | `print(...)` | `print("Hello, Fides!");` |
 | String literals | `"..."` | `print("Hello");` |
 | F-strings | `f"{expr}"` | `f"Hello, {name}!"` |
 | F-string with int | `f"x = {x}"` | `print(f"x = {x}");` |
@@ -470,7 +470,7 @@ Orchestrates the stages. Entry points:
 |---------|--------|-------|
 | `async` / `await` | `async pf` / `.await` | Parsed, not yet implemented (Phase 4+) |
 | `spawn` | `spawn` | Parsed, not yet implemented |
-| `#[test]` attribute | `#[test]` | Parsed but not executed by `pledgec test` |
+| `#[test]` attribute | `#[test]` | Parsed but not executed by `fidesc test` |
 | `#[derive]` | `#[derive]` | Parsed, not yet implemented |
 
 ### Planned (Not Yet Implemented)
@@ -479,13 +479,13 @@ Orchestrates the stages. Entry points:
 |---------|--------|-------|
 | Default arguments | `pf f(x: i32 = 0)` | Future |
 | Variadic arguments | `pf f(...args)` | Future |
-| Self-hosting | (rewrite compiler in P) | Phase 6 |
+| Self-hosting | (rewrite compiler in Fides) | Phase 6 |
 
 ---
 
-## P Syntax Overview
+## Fides Syntax Overview
 
-P is a systems language with unique keywords designed for clarity and AI-friendliness:
+Fides is a systems language with unique keywords designed for clarity and AI-friendliness:
 
 ```p
 // Function declaration
@@ -525,11 +525,11 @@ enum Shape {
 pc MAX_PLAYERS: i32 = 64;
 ```
 
-### P Keyword Reference
+### Fides Keyword Reference
 
 | Keyword | Meaning | Replaces (Rust) |
 |---------|---------|-----------------|
-| `pf` | P Function (all functions) | `fn` |
+| `pf` | Fides Function (all functions) | `fn` |
 | `pv` / `pv mut` | Variable (immutable / mutable) | `let` / `let mut` |
 | `pc` | Constant | `const` |
 | `cap` | Capability / Trait | `trait` |
@@ -570,7 +570,7 @@ p-lang/
 │   ├── codegen_riscv.rs    # RISC-V assembly codegen (PIR L3 → .s)
 │   ├── codegen_c.rs        # C codegen backend (IR → .c, for `ccompile` command)
 │   ├── x86.rs              # Legacy x86_64 MASM assembly generation (IR → .asm)
-│   ├── pir.rs              # PIR (P Intermediate Representation) — L1/L2/L3 levels
+│   ├── pir.rs              # PIR (Fides Intermediate Representation) — L1/L2/L3 levels
 │   ├── opt.rs              # PIR optimizer (const fold, CSE, DCE, inline, unroll, TCO, effect-based elision)
 │   ├── peephole.rs         # Peephole optimizer (9 passes, always on in `build`)
 │   ├── regalloc.rs         # Linear scan register allocator
@@ -586,27 +586,27 @@ p-lang/
 │   ├── runtime_linux.rs    # Linux runtime (syscalls for bare-metal/standalone)
 │   └── compiler.rs         # Pipeline orchestration, module resolution, stdlib auto-include
 ├── stdlib/                 # 8 standard library modules
-│   ├── core.p              # Option, Result, println, assert, max, min, abs, clamp
-│   ├── json.p              # JSON parsing and serialization
-│   ├── tensor.p            # Tensor type for AI/ML (zeros, ones, matmul, relu, softmax, etc.)
-│   ├── parallel.p          # Parallel operations (par_map, par_sum, par_dot)
-│   ├── db.p                # Database driver framework
-│   ├── http.p              # HTTP server stdlib
-│   ├── simd.p              # SIMD intrinsics
-│   └── shape.p             # Shape operations
-├── tests/                  # 102 .p test files + harness
+│   ├── core.fd              # Option, Result, println, assert, max, min, abs, clamp
+│   ├── json.fd              # JSON parsing and serialization
+│   ├── tensor.fd            # Tensor type for AI/ML (zeros, ones, matmul, relu, softmax, etc.)
+│   ├── parallel.fd          # Parallel operations (par_map, par_sum, par_dot)
+│   ├── db.fd                # Database driver framework
+│   ├── http.fd              # HTTP server stdlib
+│   ├── simd.fd              # SIMD intrinsics
+│   └── shape.fd             # Shape operations
+├── tests/                  # 102 .fd test files + harness
 │   ├── harness.rs          # Automated test harness (8 cargo tests)
-│   ├── *.p                 # 79 feature tests (arithmetic, structs, closures, generics, traits, etc.)
+│   ├── *.fd                 # 79 feature tests (arithmetic, structs, closures, generics, traits, etc.)
 │   ├── safety/             # 9 bounds safety tests (OOB, overflow, div-by-zero, unwrap)
 │   ├── capability/         # 4 capability security tests (grant, deny, propagation)
 │   ├── effects/            # 7 effect system tests (annotations, inference, handlers, pure)
 │   ├── regions/            # 3 region inference tests (blocks, nesting, escape detection)
 │   └── golden/             # 43 golden file outputs for regression testing
 ├── examples/               # 4 example programs
-│   ├── http_server.p       # HTTP server example
-│   ├── neural_network.p    # Neural network example
-│   ├── riscv_blink.p       # RISC-V LED blink (embedded)
-│   └── rpi_led_blink.p     # Raspberry Pi LED blink (embedded)
+│   ├── http_server.fd       # HTTP server example
+│   ├── neural_network.fd    # Neural network example
+│   ├── riscv_blink.fd       # RISC-V LED blink (embedded)
+│   └── rpi_led_blink.fd     # Raspberry Pi LED blink (embedded)
 ├── benches/
 │   └── bench_main.rs       # Performance benchmarks
 └── docs/                   # 12 documentation files
@@ -619,7 +619,7 @@ p-lang/
     ├── design-principles.md # Core design principles
     ├── competitive-analysis.md # Comparison with Rust, Zig, Go, Swift
     ├── adoption-strategy.md # Language adoption strategy
-    ├── full-stack-architecture.md # Full-stack P ecosystem vision
+    ├── full-stack-architecture.md # Full-stack Fides ecosystem vision
     ├── innovation.md       # Innovative language features
     └── custom-toolchain.md # Custom toolchain plans
 ```
@@ -632,40 +632,40 @@ p-lang/
 
 | Test File | What It Tests |
 |-----------|---------------|
-| `hello.p` | Hello world — `pf`, `pv`, `if/else`, `print` |
-| `arithmetic.p` | Arithmetic, nested function calls |
-| `struct.p` | Struct definition, literals, field access |
-| `control_flow.p` | `if`/`else if`/`else`, `for` ranges, compound assignment |
-| `functions.p` | User-defined functions, recursive factorial |
-| `strings.p` | String literals, f-string interpolation |
-| `test_float.p` | Float arithmetic and printing |
-| `test_fstring_*.p` | F-string with int, float, vec |
-| `test_vec_*.p` | Vec creation, push, loop, printing |
-| `test_hashmap.p` | HashMap insert, get, contains |
-| `test_match.p` | Pattern matching (int, string, enum, wildcard) |
-| `test_match_guard.p` | Match guards (`pattern if cond =>`) |
-| `test_match_range.p` | Match range patterns (`1..=5 =>`) |
-| `test_option.p` | Option type (Some/None, unwrap) |
-| `test_try.p` | `?` operator and `try { }` blocks |
-| `test_defer.p` | `defer` blocks (LIFO cleanup order) |
-| `test_closure.p` | Closures with environment capture |
-| `test_impl.p` | `impl` blocks, struct methods |
-| `test_generics.p` | Generic functions, monomorphization |
-| `test_traits.p` | `cap` traits, `impl Cap for Type` |
-| `test_trait_assoc.p` | Trait associated types |
-| `test_trait_default.p` | Trait default methods |
-| `test_trait_object.p` | Trait objects (`dyn Trait`) |
-| `test_type_alias.p` | Type aliases (`ty X = T`) |
-| `test_asm.p` | Inline assembly (`asm!`) |
-| `test_bare.p` | Bare-metal mode (no stdlib, `asm!("hlt")`) |
-| `test_capabilities.p` | Capability grants, denial, transitive |
-| `tests/capability/test_cap_*.p` | Capability security: grant/deny/propagation (Phase 2C) |
-| `tests/safety/test_*.p` | Bounds safety: OOB, overflow, div-by-zero, unwrap None (Phase 2D) |
-| `tests/effects/test_effect_*.p` | Effect system: annotations, inference, checking, handlers (Phase 2B) |
-| `tests/regions/test_region_*.p` | Region inference: region blocks, escape detection, safety (Phase 2A) |
-| `test_refs_mut.p` | `&mut` references, dereference |
-| `test_pe_*.p` | PE emitter specific tests (struct, enum, refs, generics, defer, try) |
-| `test_regression_*.p` | Regression tests (closures, fstrings, collections) |
+| `hello.fd` | Hello world — `pf`, `pv`, `if/else`, `print` |
+| `arithmetic.fd` | Arithmetic, nested function calls |
+| `struct.fd` | Struct definition, literals, field access |
+| `control_flow.fd` | `if`/`else if`/`else`, `for` ranges, compound assignment |
+| `functions.fd` | User-defined functions, recursive factorial |
+| `strings.fd` | String literals, f-string interpolation |
+| `test_float.fd` | Float arithmetic and printing |
+| `test_fstring_*.fd` | F-string with int, float, vec |
+| `test_vec_*.fd` | Vec creation, push, loop, printing |
+| `test_hashmap.fd` | HashMap insert, get, contains |
+| `test_match.fd` | Pattern matching (int, string, enum, wildcard) |
+| `test_match_guard.fd` | Match guards (`pattern if cond =>`) |
+| `test_match_range.fd` | Match range patterns (`1..=5 =>`) |
+| `test_option.fd` | Option type (Some/None, unwrap) |
+| `test_try.fd` | `?` operator and `try { }` blocks |
+| `test_defer.fd` | `defer` blocks (LIFO cleanup order) |
+| `test_closure.fd` | Closures with environment capture |
+| `test_impl.fd` | `impl` blocks, struct methods |
+| `test_generics.fd` | Generic functions, monomorphization |
+| `test_traits.fd` | `cap` traits, `impl Cap for Type` |
+| `test_trait_assoc.fd` | Trait associated types |
+| `test_trait_default.fd` | Trait default methods |
+| `test_trait_object.fd` | Trait objects (`dyn Trait`) |
+| `test_type_alias.fd` | Type aliases (`ty X = T`) |
+| `test_asm.fd` | Inline assembly (`asm!`) |
+| `test_bare.fd` | Bare-metal mode (no stdlib, `asm!("hlt")`) |
+| `test_capabilities.fd` | Capability grants, denial, transitive |
+| `tests/capability/test_cap_*.fd` | Capability security: grant/deny/propagation (Phase 2C) |
+| `tests/safety/test_*.fd` | Bounds safety: OOB, overflow, div-by-zero, unwrap None (Phase 2D) |
+| `tests/effects/test_effect_*.fd` | Effect system: annotations, inference, checking, handlers (Phase 2B) |
+| `tests/regions/test_region_*.fd` | Region inference: region blocks, escape detection, safety (Phase 2A) |
+| `test_refs_mut.fd` | `&mut` references, dereference |
+| `test_pe_*.fd` | PE emitter specific tests (struct, enum, refs, generics, defer, try) |
+| `test_regression_*.fd` | Regression tests (closures, fstrings, collections) |
 
 Run all tests: `cargo test --test harness`
 
@@ -673,7 +673,7 @@ Run all tests: `cargo test --test harness`
 
 ## Design Documents
 
-- `docs/syntax-spec.md` — Complete P syntax specification (all keywords, types, features)
+- `docs/syntax-spec.md` — Complete Fides syntax specification (all keywords, types, features)
 - `docs/architecture.md` — Compiler architecture, pipeline stages, and internal design
 - `docs/roadmap.md` — Full 8-phase roadmap (currently at Phase 1 complete)
 - `docs/vision.md` — Language vision and 8 pillars (Originality, Security, Performance, etc.)
@@ -681,7 +681,7 @@ Run all tests: `cargo test --test harness`
 - `docs/changelog.md` — Version history and detailed change log
 - `docs/competitive-analysis.md` — Comparison with Rust, Zig, Go, Swift
 - `docs/adoption-strategy.md` — Language adoption strategy
-- `docs/full-stack-architecture.md` — Full-stack P ecosystem vision
+- `docs/full-stack-architecture.md` — Full-stack Fides ecosystem vision
 - `docs/innovation.md` — Innovative language features
 - `docs/custom-toolchain.md` — Custom toolchain plans
 - `features.md` — Detailed feature status matrix
@@ -696,7 +696,7 @@ Run all tests: `cargo test --test harness`
 | **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (136 unit tests, 78/78 + 1/1 expected-fail integration tests) |
 | **Phase 2** | Region inference, effect system, capability security, bounds safety | **Complete** (2A ✓, 2B ✓, 2C ✓ with elision, 2D ✓; 8/8 harness tests pass) |
 | **Phase 3** | comptime, advanced traits, FFI & interop | **Complete** (3A comptime ✓, 3B traits ✓, 3C const generics + GATs ✓; 3D C FFI ✓ via `extern "C"` + `parse-header`) |
-| **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | **Mostly complete** (4A PIR ✓, 4B optimizer ✓ but disabled by default due to regalloc bug, 4C x86-64/arm64/riscv codegen + regalloc + 9 peephole passes + ELF64 executables ✓; 4D linker ✓, 4E hot reload ✓ via `pledgec watch`) |
+| **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | **Mostly complete** (4A PIR ✓, 4B optimizer ✓ but disabled by default due to regalloc bug, 4C x86-64/arm64/riscv codegen + regalloc + 9 peephole passes + ELF64 executables ✓; 4D linker ✓, 4E hot reload ✓ via `fidesc watch`) |
 | **Phase 5** | Bare metal, IoT, AI/ML, web & cloud | **Mostly complete** (5A bare-metal mode ✓, 5B IoT/embedded framework ✓ `embedded.rs`, 5C AI/ML tensor ✓, 5D WASM + GPU/SPIR-V + HTTP + JSON ✓) |
 | **Phase 6** | Self-hosting | Not started |
 | **Phase 7** | Ecosystem (package manager, LSP, docs) | Not started |

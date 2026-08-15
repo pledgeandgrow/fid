@@ -1,4 +1,4 @@
-# P Language — Direction Analysis
+# Fides Language — Direction Analysis
 
 > Are we going in the right direction?
 > An honest assessment based on `docs/history.md` lessons, `docs/roadmap.md`,
@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-**P is doing many things right. It also has serious strategic risks that could
+**Fides is doing many things right. It also has serious strategic risks that could
 make it another D, Crystal, or V — technically good, commercially irrelevant.**
 
 The project has built an impressive amount of working compiler infrastructure
@@ -18,8 +18,8 @@ modules, 6 backends). But it's spreading into too many domains (games,
 blockchain, robotics, medical, serverless) before it has proven it can do the
 basics better than existing languages.
 
-**The single most important question P has not answered:**
-> *Why would someone choose P over Rust or Zig for a real project today?*
+**The single most important question Fides has not answered:**
+> *Why would someone choose Fides over Rust or Zig for a real project today?*
 
 ---
 
@@ -27,25 +27,25 @@ basics better than existing languages.
 
 ### 1. Genuine Novel Combinations ✅
 
-P combines things no other language has together:
+Fides combines things no other language has together:
 
 | Feature | Exists in... | But combined with... |
 |---------|-------------|---------------------|
 | Region-based memory safety | Rust (ownership), Cyclone (regions) | Effects + capabilities + comptime |
-| Compile-time capability revocation | None (P-unique) | Sandbox blocks |
+| Compile-time capability revocation | None (Fides-unique) | Sandbox blocks |
 | Effect system | Koka, Eff, Helium | Regions + native codegen |
 | Comptime reflection | Zig | Effects + capabilities |
-| Memory budgets | None (P-unique) | Region system |
+| Memory budgets | None (Fides-unique) | Region system |
 | Native codegen (zero tools) | Go (partially), Zig | PE + ELF64 + Mach-O + COFF + WASM + SPIR-V |
 
 This is genuinely new territory. History lesson #1 says: **"Solve a specific,
-painful problem"** — P's combination of safety + native + no-GC + comptime +
+painful problem"** — Fides's combination of safety + native + no-GC + comptime +
 capabilities is a real design-space point no one else occupies.
 
 ### 2. Multi-Backend Architecture ✅
 
 ```
-P source
+Fides source
    ↓
   IR (SSA)
    ↓
@@ -61,7 +61,7 @@ P source
 
 86/86 test parity across interpreter, PE, and C codegen is real. This is more
 backends than most languages ever achieve. History lesson: **"A great runtime
-can sustain multiple languages"** — P's IR is its "runtime" and it supports
+can sustain multiple languages"** — Fides's IR is its "runtime" and it supports
 many targets.
 
 ### 3. Syntax-vs-Stdlib Discipline ✅
@@ -70,7 +70,7 @@ The `features-roadmap.md` classification is excellent:
 
 ```
 SYNTAX  = things the COMPILER must understand (can't be a library)
-STDLIB  = things USERS can build themselves (just .p files)
+STDLIB  = things USERS can build themselves (just .fd files)
 CUT     = things EXISTING features already cover (redundant)
 ```
 
@@ -94,7 +94,7 @@ infrastructure works and catches real issues.
 
 ### 5. Self-Hosting Plan ✅
 
-Phase 10 plans to rewrite the compiler in P itself. This is the right path —
+Phase 10 plans to rewrite the compiler in Fides itself. This is the right path —
 it's how C, Go, Rust, Zig, and many others proved their language was real.
 History lesson: **"A language is proven by what it can express, including
 itself."**
@@ -102,7 +102,7 @@ itself."**
 ### 6. Comptime as Central Design ✅
 
 Zig proved comptime can replace macros, complex generics, and much of what
-other languages solve with type system gymnastics. P has comptime and uses it
+other languages solve with type system gymnastics. Fides has comptime and uses it
 for reflection, code generation, and f-string interpolation. This is the right
 bet — it's one of Zig's strongest ideas.
 
@@ -112,11 +112,11 @@ bet — it's one of Zig's strongest ideas.
 
 ### 1. Scope Expansion — Real Synergy, Execution Risk �
 
-> **Note:** This section was revised after recognizing that P's multi-domain
+> **Note:** This section was revised after recognizing that Fides's multi-domain
 > scope is not "trying to do everything" — it's **one safety system with many
 > lenses**. The cross-domain synergy is architecturally real.
 
-P's domain annotations (Phases 8–9) are not separate features. They're
+Fides's domain annotations (Phases 8–9) are not separate features. They're
 different applications of the same three core systems:
 
 ```
@@ -149,7 +149,7 @@ This is architecturally different from a language that just "adds features."
 Each new annotation is cheaper because it reuses existing infrastructure.
 This is more like **Erlang's BEAM VM** — built for telecom, but its core
 abstractions (actors, supervision, fault tolerance) turned out to be broadly
-applicable to messaging, databases, and real-time web. P's core abstractions
+applicable to messaging, databases, and real-time web. Fides's core abstractions
 (capabilities, effects, regions) may be similarly broadly applicable.
 
 **The real risk is not the scope — it's the execution:**
@@ -180,7 +180,7 @@ a platform, you need a killer framework."**
 Current state:
 - 0 users (not released)
 - 0 packages (no package manager)
-- 0 real projects written in P
+- 0 real projects written in Fides
 - No LSP, no formatter, no debugger
 - No documentation for users (only internal docs)
 - No community (no Discord, no forum, no GitHub stars)
@@ -189,11 +189,11 @@ The roadmap puts ecosystem at Phase 11 — after games, blockchain, robotics,
 and self-hosting. **This is backwards.** Go got users because it had a working
 toolchain and could deploy to Google's infrastructure on day one. Rust got
 users because it solved a problem (memory safety) that people were desperate
-to solve. P has neither a deploy target nor a desperate problem that users
+to solve. Fides has neither a deploy target nor a desperate problem that users
 can articulate.
 
-**The killer app question:** What can you build in P today that you can't
-build in Rust or Zig? The answer is "nothing, yet" — because P hasn't proven
+**The killer app question:** What can you build in Fides today that you can't
+build in Rust or Zig? The answer is "nothing, yet" — because Fides hasn't proven
 any concrete advantage in a real project.
 
 ### 3. The Register Allocator Bug — Technical Debt Blocking Progress 🔴
@@ -205,7 +205,7 @@ being enabled by default. This means:
 - Binary size and performance can't compete with Rust/Zig/Clang
 
 History lesson: Rust's success was partly because it produced *fast* binaries.
-If P can't optimize, it can't compete on performance — which is the #1 reason
+If Fides can't optimize, it can't compete on performance — which is the #1 reason
 to choose a systems language.
 
 **This should be the #1 priority, not Phase 7 ergonomics.**
@@ -234,9 +234,9 @@ a potential bug or a sign of abandoned code paths. The roadmap mentions
 ### 6. No Generic Option<T> Yet 🟡
 
 The `?.` optional chaining implementation note says: "Full field access on
-wrapped structs requires generic Option<T> (Phase 10)." This means P's Option
+wrapped structs requires generic Option<T> (Phase 10)." This means Fides's Option
 type currently only wraps i64 — a significant limitation. Rust's Option<T> is
-one of its most important features. P can't do real ergonomic null-safety
+one of its most important features. Fides can't do real ergonomic null-safety
 without it.
 
 This is a foundational gap, not an ergonomic feature. It should be higher
@@ -256,9 +256,9 @@ Each of these requires:
 - Tests
 - Documentation
 
-That's 18 × 5 = 90 units of work for features that serve domains P hasn't
+That's 18 × 5 = 90 units of work for features that serve domains Fides hasn't
 proven it can serve yet. History lesson: **Carbon is "wait and see" because
-it has to prove its C++ migration strategy.** P's @gas, @realtime, @firmware
+it has to prove its C++ migration strategy.** Fides's @gas, @realtime, @firmware
 annotations are the same — they sound impressive but need to prove they
 actually work better than existing solutions.
 
@@ -266,7 +266,7 @@ actually work better than existing solutions.
 
 The roadmap title is "Milestones to World Domination." Phase 12 plans to write
 an OS kernel, web browser engine, database, AI framework, and robot control
-system in P, plus get 3 companies using it and 1000+ developers.
+system in Fides, plus get 3 companies using it and 1000+ developers.
 
 This is aspirational, but history lesson #6: **"Technical merit ≠ adoption."**
 D was technically excellent. Crystal is well-designed. Vale has novel ideas.
@@ -290,11 +290,11 @@ were clearly the best before expanding:
 | Erlang | Telecom | Messaging, distributed systems |
 | Julia | Scientific computing | (Still expanding) |
 
-**Recommendation:** P should pick **systems programming with safety + comptime**
-as its initial domain. This is where P's unique combination (regions +
+**Recommendation:** Fides should pick **systems programming with safety + comptime**
+as its initial domain. This is where Fides's unique combination (regions +
 effects + capabilities + comptime + native codegen) is strongest. Prove it
 there. Write a real project (a web server, a database client, a CLI tool
-framework) in P. Then expand.
+framework) in Fides. Then expand.
 
 ### 2. Fix the Register Allocator Before Adding Features
 
@@ -305,7 +305,7 @@ The regalloc bug is the single highest-impact technical issue. It blocks:
 - Confidence in the codegen pipeline
 
 Every hour spent on F8 `?.` or F11 `is` while the regalloc bug persists is an
-hour not spent on the thing that would make P competitive with Rust/Zig.
+hour not spent on the thing that would make Fides competitive with Rust/Zig.
 
 **Recommendation:** Make the regalloc fix the #1 priority. Everything else
 is secondary.
@@ -314,10 +314,10 @@ is secondary.
 
 History lesson #9: **"Without a platform, you need a killer framework."**
 
-P has no platform (no browser, no JVM, no cloud provider). So it needs a
+Fides has no platform (no browser, no JVM, no cloud provider). So it needs a
 killer framework or killer use case. The best candidate is:
 
-> **P is the only language where you can write safe systems code with
+> **Fides is the only language where you can write safe systems code with
 > compile-time capability revocation, effect tracking, and comptime
 > reflection — all with native codegen and no GC.**
 
@@ -325,18 +325,18 @@ That's a real pitch. But it needs to be proven with a real project, not just
 test files.
 
 **Recommendation:** Before starting Phase 8 (games), write one real project
-in P that demonstrates the unique value proposition. A web server with
+in Fides that demonstrates the unique value proposition. A web server with
 sandbox blocks for plugin isolation. A CLI tool with capability-restricted
 subcommands. Something that makes people say "I can't do this in Rust."
 
 ### 4. Generic Option<T> and Vec<T> Are Foundational, Not Features
 
-P currently has Option wrapping only i64, and Vec/HashMap/String are
+Fides currently has Option wrapping only i64, and Vec/HashMap/String are
 hardcoded in the compiler (522 lines of special cases across backends).
 
 This is not a "Phase 10" issue. This is a "Phase 1" issue that was deferred.
-Without generic Option<T>, P can't do real null-safety. Without Vec<T> in P
-code, P can't be self-hosting. These are foundational.
+Without generic Option<T>, Fides can't do real null-safety. Without Vec<T> in Fides
+code, Fides can't be self-hosting. These are foundational.
 
 **Recommendation:** Move generic Option<T> and the Vec/HashMap/String
 migration to immediately after the regalloc fix. They're prerequisites for
@@ -348,7 +348,7 @@ Phase 9 plans 12 domain annotations. Each is a significant compiler feature.
 But none has been proven to work better than existing approaches.
 
 History lesson: Mojo's @differentiable and GPU support are valuable because
-they solve a real, painful problem (Python + C++ + CUDA fragmentation). P's
+they solve a real, painful problem (Python + C++ + CUDA fragmentation). Fides's
 @gas, @realtime, @firmware need to prove they solve real problems better
 than Solidity's runtime gas, C's manual WCET analysis, and existing bare-metal
 toolchains.
@@ -363,7 +363,7 @@ Every doc should be updated when test counts change. The current state where
 `features.md` says 76/78 but reality is 86/86 is unacceptable for a project
 that wants to be taken seriously.
 
-**Recommendation:** Add a pre-commit check: run `pledgec test`, compare
+**Recommendation:** Add a pre-commit check: run `fidesc test`, compare
 output to docs, fail if mismatch. Or at minimum, update all docs in the same
 commit that changes test results.
 
@@ -373,20 +373,20 @@ From history.md, V is classified as 🟠 because: "much smaller ecosystem and
 adoption, and many of its desirable properties exist in better-established
 competitors."
 
-P faces the same risk. Its features are impressive, but:
+Fides faces the same risk. Its features are impressive, but:
 - Region-based safety → Rust has ownership
 - Comptime → Zig has comptime
 - Native codegen → Go, Rust, Zig all have this
 - Effects → Koka has effects
 - Capabilities → object-capability languages exist
 
-P's defense is the *combination*. But combinations are hard to sell. "We have
+Fides's defense is the *combination*. But combinations are hard to sell. "We have
 everything" is less compelling than "we're the best at X."
 
-**Recommendation:** Define P's one-sentence pitch. Not a feature list. One
-sentence that answers: "Why P instead of Rust or Zig?"
+**Recommendation:** Define Fides's one-sentence pitch. Not a feature list. One
+sentence that answers: "Why Fides instead of Rust or Zig?"
 
-Suggested pitch: **"P is the only language with compile-time capability
+Suggested pitch: **"Fides is the only language with compile-time capability
 revocation, effect tracking, and region-based memory safety — all with
 native codegen and no GC."**
 
@@ -403,7 +403,7 @@ But self-hosting requires:
 - Generic Option<T> ✅ (needed)
 - Generic Vec<T> ✅ (needed)
 - Raw pointers + unsafe ✅ (needed)
-- String type in P ✅ (needed)
+- String type in Fides ✅ (needed)
 
 These are prerequisites. They should be prioritized over ergonomic features
 and domain annotations.
@@ -419,7 +419,7 @@ Crystal is well-designed but has a tiny community because:
 - "Ruby but compiled" isn't enough differentiation
 - Ruby users have Ruby; compiled users have many alternatives
 
-P risks the same fate if it:
+Fides risks the same fate if it:
 - Tries to compete in too many domains
 - Doesn't achieve a critical mass of users in one domain
 - Can't articulate why it's better than Rust/Zig for a specific use case
@@ -430,11 +430,11 @@ Erlang succeeded because it solved ONE problem (telecom reliability)
 extremely well. Julia succeeded because it solved ONE problem (the
 two-language problem in science) extremely well.
 
-P should identify its ONE problem and solve it extremely well. The best
+Fides should identify its ONE problem and solve it extremely well. The best
 candidate:
 
 > **The safety-vs-control problem:** You want memory safety without GC, but
-> Rust's borrow checker is too complex and Zig doesn't guarantee safety. P
+> Rust's borrow checker is too complex and Zig doesn't guarantee safety. Fides
 > provides region-based safety with effect tracking and capability
 > revocation — a different point in the design space.
 
@@ -470,16 +470,16 @@ Based on the history.md lessons and current state:
    → Foundational for null-safety, ergonomics, self-hosting
    → Currently Option only wraps i64 — a serious limitation
 
-3. 🔴 Migrate Vec/HashMap/String to P stdlib
+3. 🔴 Migrate Vec/HashMap/String to Fides stdlib
    → Eliminates 522 lines of compiler special cases
    → Prerequisite for self-hosting
-   → Proves P can express its own data structures
+   → Proves Fides can express its own data structures
 
 4. 🟡 Update all documentation to match reality
    → features.md, roadmap-limitations.md need sync
    → Trust erodes when docs lie
 
-5. 🟡 Write ONE real project in P
+5. 🟡 Write ONE real project in Fides
    → A web server with sandbox blocks for plugin isolation
    → Or a CLI tool framework with capability-restricted subcommands
    → Proves the unique value proposition
@@ -490,7 +490,7 @@ Based on the history.md lessons and current state:
 
 7. 🟢 Begin self-hosting (Phase 10)
    → Start with lexer (simplest component)
-   → Proves P is real
+   → Proves Fides is real
 
 8. 🟢 Start ecosystem (Phase 11 basics)
    → LSP server, formatter, package manager
@@ -502,7 +502,7 @@ Based on the history.md lessons and current state:
 
 10. ⏸ DEFER Phase 9 (Industry Domains)
     → Pick 1-2 annotations (@deterministic, @crashfree) not all 12
-    → Only after proving P in its core domain
+    → Only after proving Fides in its core domain
 
 11. ⏸ DEFER Phase 12 (World Class)
     → Formal verification, OS kernel, browser — aspirational
@@ -518,15 +518,15 @@ From history.md, the most important lesson is:
 > **"A new language is worth creating if it solves a problem no existing
 > language solves."**
 
-P's answer:
+Fides's answer:
 
-> **P is the only language that combines compile-time capability revocation,
+> **Fides is the only language that combines compile-time capability revocation,
 > effect tracking, region-based memory safety, and comptime reflection — all
 > with native codegen and no GC.**
 
 That's real. That's unique. That's worth building.
 
-But only if P **proves it** with a real project, **fixes the performance
+But only if Fides **proves it** with a real project, **fixes the performance
 gap** (regalloc), and **gets real users** before trying to conquer games,
 blockchain, robotics, and the world.
 

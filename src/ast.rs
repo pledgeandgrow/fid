@@ -447,7 +447,7 @@ pub enum Stmt {
         line: usize,
     },
     /// comptime gen { block } — evaluate block at compile time, parse the
-    /// resulting string as Pledge source code, and inject the declarations
+    /// resulting string as Fides source code, and inject the declarations
     /// into the program. This enables comptime code generation.
     ComptimeGen {
         block: Vec<Stmt>,
@@ -720,7 +720,7 @@ pub struct ExternDecl {
     pub abi: String,
     /// C function name (as seen by the linker)
     pub c_name: String,
-    /// Pledge function name (what Pledge code calls)
+    /// Fides function name (what Fides code calls)
     pub pledge_name: String,
     /// Parameter types
     pub params: Vec<Param>,

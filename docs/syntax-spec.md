@@ -1,4 +1,4 @@
-# P Language Syntax Specification
+# Fides Language Syntax Specification
 
 **Version:** 0.5.0
 **Status:** Phase 4D — Direct PE/ELF64 emitters (x86_64) + MASM backend + C codegen backend + WASM/SPIR-V backends + multi-arch assembly (x86-64/ARM64/RISC-V) + IR interpreter + PIR pipeline (L1/L2/L3)
@@ -7,7 +7,7 @@
 
 ## 1. Design Philosophy
 
-P is a systems programming language designed for safety, clarity, and modern AI-assisted development. It borrows proven concepts from Rust while introducing several innovations that address Rust's pain points.
+Fides is a systems programming language designed for safety, clarity, and modern AI-assisted development. It borrows proven concepts from Rust while introducing several innovations that address Rust's pain points.
 
 ### 1.1 Core Principles
 
@@ -19,7 +19,7 @@ P is a systems programming language designed for safety, clarity, and modern AI-
 6. **AI-friendly syntax** — Syntax choices prioritize AI model comprehension. Familiar patterns from Rust, Python, Swift.
 7. **One keyword per concept** — `pf` for all functions (named, anonymous, async, comptime). `pv` for all variables. `pc` for constants. `cap` for traits/capabilities.
 
-### 1.2 What P Takes From Rust
+### 1.2 What Fides Takes From Rust
 
 - Ownership and borrowing (`&` / `&mut`)
 - Algebraic enums and pattern matching (`match` / `=>`)
@@ -33,9 +33,9 @@ P is a systems programming language designed for safety, clarity, and modern AI-
 - `&str` / `String` string model
 - `[T; N]` / `Vec<T>` / `&[T]` collection model
 
-### 1.3 What P Does Differently
+### 1.3 What Fides Does Differently
 
-| Feature | Rust | P |
+| Feature | Rust | Fides |
 |---------|------|--------|
 | Function keyword | `fn` | `pf` |
 | Variable keyword | `let` / `let mut` | `pv` / `pv mut` |
@@ -51,7 +51,7 @@ P is a systems programming language designed for safety, clarity, and modern AI-
 | Error handling | `Result<T, E>` only | `Result<T, E>` + effect handlers (`!Effect`) |
 | Async | `async fn` / `.await` | `async pf` / `.await` (sugar over effects) |
 | Compile-time code | Procedural macros | `comptime { }` blocks |
-| Hot reload | Not supported | Built-in (`pledgec watch`) |
+| Hot reload | Not supported | Built-in (`fidesc watch`) |
 | Capability security | Not built-in | Core language feature |
 
 ---
@@ -115,7 +115,7 @@ Namespace:   ::
 
 ### 2.3 Comments
 
-```pledge
+```fides
 // Line comment
 
 /* Block comment */
@@ -132,7 +132,7 @@ Namespace:   ::
 
 ### 2.5 Literals
 
-```pledge
+```fides
 42          // i32 (inferred)
 42i64       // explicit i64
 3.14        // f64
@@ -150,7 +150,7 @@ b"bytes"    // &[u8]
 
 F-strings are a first-class language feature (not a macro). Any expression can be embedded in `{}`:
 
-```pledge
+```fides
 pv name = "World";
 pv x = 5;
 pv y = 10;
@@ -184,7 +184,7 @@ Never:      ! (diverges / never returns)
 
 ### 3.2 Compound Types
 
-```pledge
+```fides
 // Array — fixed size, stack allocated
 [T; N]          // type
 [1, 2, 3]       // literal
@@ -206,7 +206,7 @@ pf(x: i32) -> i32   // type signature
 
 ### 3.3 Custom Types
 
-```pledge
+```fides
 // Struct — product type
 struct Point {
     x: f64,
@@ -238,7 +238,7 @@ ty Score = i32;
 
 ### 3.4 Standard Library Types
 
-```pledge
+```fides
 Option<T>        // enum Option<T> { Some(T), None }
 Result<T, E>     // enum Result<T, E> { Ok(T), Err(E) }
 Vec<T>           // growable array
@@ -248,18 +248,18 @@ HashMap<K, V>    // hash map
 
 ### 3.4a Standard Library Modules
 
-P's stdlib lives in `stdlib/` and is imported explicitly via `use` (except `core.p`, which is auto-included):
+Fides's stdlib lives in `stdlib/` and is imported explicitly via `use` (except `core.fd`, which is auto-included):
 
 | Module | File | Contents |
 |--------|------|----------|
-| `core` | `stdlib/core.p` | Auto-included: `Option`, `Result`, `println`, `print`, `assert`, `assert_eq`, `max`, `min`, `abs`, `clamp` |
-| `json` | `stdlib/json.p` | `parse`, `stringify`, `get`, `at` |
-| `tensor` | `stdlib/tensor.p` | n-d arrays, `matmul`, `relu`, `softmax` |
-| `parallel` | `stdlib/parallel.p` | `par_map`, `par_sum`, `par_dot` |
-| `db` | `stdlib/db.p` | `cap Database` trait, in-memory KV store |
-| `http` | `stdlib/http.p` | socket + HTTP parsing |
-| `simd` | `stdlib/simd.p` | elementwise ops, `dot`, `sum`, `scale` (f64x2, f64x4, etc.) |
-| `shape` | `stdlib/shape.p` | shape system for tensor ops |
+| `core` | `stdlib/core.fd` | Auto-included: `Option`, `Result`, `println`, `print`, `assert`, `assert_eq`, `max`, `min`, `abs`, `clamp` |
+| `json` | `stdlib/json.fd` | `parse`, `stringify`, `get`, `at` |
+| `tensor` | `stdlib/tensor.fd` | n-d arrays, `matmul`, `relu`, `softmax` |
+| `parallel` | `stdlib/parallel.fd` | `par_map`, `par_sum`, `par_dot` |
+| `db` | `stdlib/db.fd` | `cap Database` trait, in-memory KV store |
+| `http` | `stdlib/http.fd` | socket + HTTP parsing |
+| `simd` | `stdlib/simd.fd` | elementwise ops, `dot`, `sum`, `scale` (f64x2, f64x4, etc.) |
+| `shape` | `stdlib/shape.fd` | shape system for tensor ops |
 
 > **Note:** `Box<T>`, `Rc<T>`, `Arc<T>`, `HashSet<T>`, `Mutex<T>`, and channels are **not** in the current stdlib. Heap allocation uses `p_malloc`/`p_free` directly or via `Vec`/`String`/`HashMap`.
 
@@ -267,7 +267,7 @@ P's stdlib lives in `stdlib/` and is imported explicitly via `use` (except `core
 
 #### String Methods
 
-```pledge
+```fides
 pv s: String = "Hello";
 
 s.len() -> i64              // length in bytes
@@ -294,7 +294,7 @@ s.clone() -> String         // deep copy
 
 #### Vec Methods
 
-```pledge
+```fides
 pv v: Vec<i64> = vec![1, 2, 3];
 
 v.push(val: i64)            // append element
@@ -319,7 +319,7 @@ v.clone() -> Vec<i64>       // deep copy
 
 #### HashMap Methods
 
-```pledge
+```fides
 pv m: HashMap<String, i64> = hashmap![];
 
 m.insert(key: String, val: i64)  // insert/update
@@ -341,7 +341,7 @@ m.clone() -> HashMap<String, i64>  // deep copy
 
 ### 4.1 Named Functions
 
-```pledge
+```fides
 // Basic function
 pf add(x: i32, y: i32) -> i32 {
     x + y
@@ -349,7 +349,7 @@ pf add(x: i32, y: i32) -> i32 {
 
 // Public function
 pub pf main() {
-    println("Hello, P!");
+    println("Hello, Fides!");
 }
 
 // Function with no ret value (unit)
@@ -390,7 +390,7 @@ pf read_config(path: &str) -> Config !FileIO + LogIO {
 
 ### 4.2 Closures
 
-```pledge
+```fides
 // Full closure
 pv double = pf(x: i32) -> i32 {
     x * 2
@@ -418,7 +418,7 @@ pv task = async pf() {
 
 ### 4.3 Function Pointers
 
-```pledge
+```fides
 // Function type
 ty BinOp = pf(i32, i32) -> i32;
 
@@ -432,10 +432,10 @@ pv result = add(5, 3);
 
 ### 5.1 Variable Declaration
 
-```pledge
+```fides
 // Immutable (default)
 pv x = 5;
-pv name = "P";
+pv name = "Fides";
 pv point = Point { x: 3.0, y: 4.0 };
 
 // Mutable
@@ -458,11 +458,11 @@ pv x = "now a string";  // shadows previous x
 
 ### 5.2 Constants
 
-```pledge
+```fides
 // Compile-time constant
 pc MAX_PLAYERS: i32 = 64;
 pc PI: f64 = 3.14159265358979;
-pc GREETING: &str = "Hello, P!";
+pc GREETING: &str = "Hello, Fides!";
 
 // Static (single memory location)
 static COUNTER: AtomicI32 = AtomicI32::new(0);
@@ -470,7 +470,7 @@ static COUNTER: AtomicI32 = AtomicI32::new(0);
 
 ### 5.3 Move Semantics
 
-```pledge
+```fides
 // Copy types (i32, bool, f64, etc.) — copied by default
 pv a = 5;
 pv b = a;      // a is still valid (i32 is Copy)
@@ -494,7 +494,7 @@ println(s4);      // works
 
 ### 6.1 References
 
-```pledge
+```fides
 // Shared reference (immutable borrow)
 pf len(s: &str) -> usize {
     s.len()
@@ -518,12 +518,12 @@ pv r = &mut y;      // &mut i32
 
 ### 6.2 Region Inference
 
-P deduces regions (lifetimes) automatically. You rarely need to annotate them.
+Fides deduces regions (lifetimes) automatically. You rarely need to annotate them.
 
-```pledge
+```fides
 // Rust requires explicit lifetime:
 //   fn longest<'a>(x: &'a str, y: &'a str) -> &'a str
-// P: compiler infers the region
+// Fides: compiler infers the region
 pf longest(x: &str, y: &str) -> &str {
     if x.len() > y.len() { x } else { y }
 }
@@ -551,7 +551,7 @@ pf store(data: &str) -> &str {
 
 ### 7.1 If / Else
 
-```pledge
+```fides
 // Statement form
 if x > 0 {
     println("positive");
@@ -574,7 +574,7 @@ pv result = if condition {
 
 ### 7.2 Match
 
-```pledge
+```fides
 // Basic match
 match color {
     Color::Red => 0xFF0000,
@@ -617,7 +617,7 @@ match x {
 
 ### 7.3 Loops
 
-```pledge
+```fides
 // For-in loop (iterator based)
 for x in nums {
     println(x);
@@ -668,7 +668,7 @@ pv result = loop {
 
 ### 7.4 Return
 
-```pledge
+```fides
 pf foo(x: i32) -> i32 {
     if x < 0 {
         ret 0;     // early return
@@ -679,9 +679,9 @@ pf foo(x: i32) -> i32 {
 
 ### 7.5 Defer
 
-P introduces `defer` for cleanup (inspired by Go, but with RAII):
+Fides introduces `defer` for cleanup (inspired by Go, but with RAII):
 
-```pledge
+```fides
 pf process_file(path: &str) -> Result<(), FileError> {
     pv file = open(path)?;
     defer close(file);          // runs when function exits (even on error)
@@ -699,7 +699,7 @@ pf process_file(path: &str) -> Result<(), FileError> {
 
 ### 8.1 Struct Definitions
 
-```pledge
+```fides
 // Named fields
 struct Point {
     x: f64,
@@ -723,7 +723,7 @@ pub struct Config {
 
 ### 8.2 Struct Literals
 
-```pledge
+```fides
 // Full literal
 pv p = Point { x: 3.0, y: 4.0 };
 
@@ -733,12 +733,12 @@ pv y = 4.0;
 pv p = Point { x, y };     // shorthand for Point { x: x, y: y }
 
 // Update syntax (copy remaining fields from another)
-pv p2 = Point { x: 5.0, ..p };   // x=5.0, y=4.0 (from p)
+pv p2 = Point { x: 5.0, ..fd };   // x=5.0, y=4.0 (from p)
 ```
 
 ### 8.3 Impl Blocks
 
-```pledge
+```fides
 impl Point {
     // Associated function (constructor)
     pf new(x: f64, y: f64) -> Point {
@@ -765,7 +765,7 @@ impl Point {
 
 ### 8.4 Tuple Structs
 
-```pledge
+```fides
 struct Color(u8, u8, u8);
 
 pv red = Color(255, 0, 0);
@@ -780,7 +780,7 @@ pv b = red.2;    // 0
 
 ### 9.1 Enum Definitions
 
-```pledge
+```fides
 // Simple enum (unit variants)
 enum Color {
     Red,
@@ -822,7 +822,7 @@ impl Message {
 
 ### 9.2 Pattern Matching
 
-```pledge
+```fides
 // Exhaustive match (compiler enforces all cases)
 match msg {
     Message::Quit => 0,
@@ -867,7 +867,7 @@ match age {
 
 ### 10.1 Trait (cap) Definitions
 
-```pledge
+```fides
 // Basic cap
 cap Drawable {
     pf draw(&self);
@@ -898,7 +898,7 @@ cap Ord: Eq + PartialOrd {
 
 ### 10.2 Trait (cap) Implementations
 
-```pledge
+```fides
 impl Drawable for Point {
     pf draw(&self) {
         render_pixel(self.x, self.y);
@@ -925,7 +925,7 @@ impl Iterator for Counter {
 
 ### 10.3 Trait (cap) Bounds
 
-```pledge
+```fides
 // In function signatures
 pf sort<T: Ord>(arr: &mut [T]) {
     // ...
@@ -951,7 +951,7 @@ pf make_iter() -> impl Iterator<Item = i32> {
 
 ### 11.1 Result Type
 
-```pledge
+```fides
 // Returning Result
 pf parse_int(s: &str) -> Result<i32, ParseError> {
     // ...
@@ -983,7 +983,7 @@ pf load() -> Result<Data, AppError> {
 
 > **Implementation status:** Effect annotations (`!IO`, `!Net`, `!Spawn`, `!Alloc`, `!{}`) and effect inference via fixpoint iteration over the call graph are ✅ working. The `handle { do } with` syntax parses and runs, but **full continuation semantics are pending** — effect handlers currently execute their handler bodies but do not support resumable continuations.
 
-```pledge
+```fides
 // Effect ty in signature
 pf read_file(path: &str) -> str !FileIO {
     handle FileIO::Read(path)
@@ -1017,7 +1017,7 @@ pf main() {
 
 ### 11.3 Async as Effect Sugar
 
-```pledge
+```fides
 // This:
 async pf fetch(url: &str) -> Result<str, NetError> {
     pv resp = http_get(url).await?;
@@ -1037,8 +1037,8 @@ pf fetch(url: &str) -> Result<str, NetError> !Async {
 
 ### 12.1 Module Declaration
 
-```pledge
-// File: src/net/http.p
+```fides
+// File: src/net/http.fd
 pub module net::http;
 
 pub struct Request { ... }
@@ -1050,7 +1050,7 @@ pub module net::http::client;
 
 ### 12.2 Imports
 
-```pledge
+```fides
 // Import specific items
 use std::io::println;
 use std::fs::{read, write};
@@ -1067,7 +1067,7 @@ use std::prelude::*;
 
 ### 12.3 Visibility
 
-```pledge
+```fides
 // Private by default
 pf helper() { ... }           // private to module
 
@@ -1085,7 +1085,7 @@ pub(super) pf child_api() { ... }   // parent module only
 
 ### 13.1 Generic Functions
 
-```pledge
+```fides
 pf identity<T>(x: T) -> T {
     x
 }
@@ -1104,7 +1104,7 @@ pf merge<T, U>(left: Vec<T>, right: Vec<U>) -> Vec<(T, U)>
 
 ### 13.2 Generic Types
 
-```pledge
+```fides
 struct Pair<A, B> {
     first: A,
     second: B,
@@ -1122,7 +1122,7 @@ struct HashMap<K: Hash + Eq, V> {
 
 ### 13.3 Associated Types
 
-```pledge
+```fides
 cap Iterator {
     ty Item;
 
@@ -1142,11 +1142,11 @@ impl Iterator for Range {
 
 ## 14. Compile-Time Code (comptime) — ✅ Working
 
-P replaces macros with `comptime` blocks — real code that runs at compile time. Implemented in `src/comptime.rs`.
+Fides replaces macros with `comptime` blocks — real code that runs at compile time. Implemented in `src/comptime.rs`.
 
 ### 14.1 Comptime Blocks
 
-```pledge
+```fides
 // Compile-time evaluation
 pc MAX_SIZE: i32 = comptime {
     pv config = parse_env("P_MAX_SIZE");
@@ -1171,7 +1171,7 @@ pc FIB_10: i32 = comptime fibonacci(10);  // 55
 
 ### 14.2 Comptime Reflection — ✅ Working
 
-```pledge
+```fides
 comptime {
     pv name = type_name<T>;           // type name as string
     pv is_struct = is_struct<T>;      // true if T is a struct
@@ -1184,21 +1184,21 @@ comptime {
 
 ### 14.3 Comptime vs Macros
 
-| Feature | Rust Macros | P comptime |
+| Feature | Rust Macros | Fides comptime |
 |---------|------------|-----------------|
 | Syntax | `macro_rules!` or proc macros | `comptime { }` blocks |
-| Language | Macro DSL or Rust | P itself |
+| Language | Macro DSL or Rust | Fides itself |
 | Debugging | Difficult | Standard debugger |
 | Error messages | Often cryptic | Compiler-generated, clear |
-| AI generation | Hard (macro DSL) | Easy (it's just P) |
+| AI generation | Hard (macro DSL) | Easy (it's just Fides) |
 
 ---
 
 ## 15. Attributes
 
-> **Implementation status:** Attributes are parsed by the compiler. `#[test]` is parsed but **not executed** by `pledgec test` (❌). `#[derive]` is **not yet implemented** (❌). Other attributes shown below are the planned syntax.
+> **Implementation status:** Attributes are parsed by the compiler. `#[test]` is parsed but **not executed** by `fidesc test` (❌). `#[derive]` is **not yet implemented** (❌). Other attributes shown below are the planned syntax.
 
-```pledge
+```fides
 // Standard attributes
 #[test]
 pf test_addition() { assert(1 + 1 == 2); }        // ❌ parsed, not executed
@@ -1229,7 +1229,7 @@ struct Config { /* ... */ }
 
 ### 16.1 Async / Await (❌ Planned)
 
-```pledge
+```fides
 // Async function
 async pf fetch_data(url: &str) -> Result<str, NetError> {
     pv resp = http_get(url).await?;
@@ -1251,7 +1251,7 @@ async pf fetch_all(urls: Vec<&str>) -> Vec<Result<str, NetError>> {
 
 ### 16.2 Spawning Tasks
 
-```pledge
+```fides
 // Spawn a task (runs concurrently)
 pv task = spawn async {
     fetch_data("https://example.com").await
@@ -1268,7 +1268,7 @@ pv result = task.await;
 
 > **Note:** `Mutex<T>`, `Rc<T>`, `Arc<T>`, and channels are **not** in the current stdlib. The syntax below is the planned design for when concurrency is implemented.
 
-```pledge
+```fides
 // Mutex (planned)
 use std::sync::Mutex;
 
@@ -1292,13 +1292,13 @@ pv received = rx.recv();
 
 ## 17. Capability-Based Security — ✅ Working
 
-P has no ambient authority. File, network, and hardware access require explicit capabilities, enforced at compile time with zero runtime overhead (capability elision).
+Fides has no ambient authority. File, network, and hardware access require explicit capabilities, enforced at compile time with zero runtime overhead (capability elision).
 
 > **Implementation status:** ✅ `cap` declarations, `use ... with { IO, FS, Net, Spawn }` capability grants, transitive propagation through the call graph, compile-time denial, and zero-runtime-overhead capability elision all work.
 
 ### 17.1 Capability Grants in Imports
 
-```pledge
+```fides
 // Grant capabilities to an imported module
 use network_lib with { Net, IO };       // network_lib can use Net + IO
 use file_lib with { FS };               // file_lib can use FS only
@@ -1307,7 +1307,7 @@ use pure_lib;                           // pure_lib gets no capabilities
 
 ### 17.2 Capability Declarations
 
-```pledge
+```fides
 // Declare a capability/trait
 cap Database {
     pf query(&self, sql: &str) -> Result<Vec<Row>, DbError>;
@@ -1327,7 +1327,7 @@ impl Database for InMemoryDB {
 
 ### 17.3 Compile-Time Enforcement
 
-```pledge
+```fides
 // Without capability grant — this won't compile
 pf bad() {
     // ERROR: no Net capability in scope
@@ -1349,10 +1349,10 @@ Capabilities propagate through the call graph. If function A calls function B wh
 
 ## 18. Hot Reload — ✅ Working
 
-P supports hot-swapping functions at runtime via `pledgec watch`. Implemented in `src/hotreload.rs` — native JIT (ELF64) with function-level change detection via L2 IR hashing.
+Fides supports hot-swapping functions at runtime via `fidesc watch`. Implemented in `src/hotreload.rs` — native JIT (ELF64) with function-level change detection via L2 IR hashing.
 
-```pledge
-// Any function can be hot-reloaded when using `pledgec watch`
+```fides
+// Any function can be hot-reloaded when using `fidesc watch`
 pub pf handle_request(req: &Request) -> Response {
     // This function can be replaced at runtime
     // without restarting the process
@@ -1362,21 +1362,21 @@ pub pf handle_request(req: &Request) -> Response {
 
 ```bash
 # Start watching — compiles to native ELF64, runs, and watches for changes
-pledgec watch main.p
+fidesc watch main.fd
 
 # When you edit and save a function, only that function is recompiled
 # and swapped in the running process — sub-second iteration
 ```
 
-> **Note:** Hot reload for PledgeOS (the OS project) uses the same mechanism with OS-specific integration. The `pledgec watch` command works on any Linux system.
+> **Note:** Hot reload for FidesOS (the OS project) uses the same mechanism with OS-specific integration. The `fidesc watch` command works on any Linux system.
 
 ---
 
 ## 19. Standard Library Prelude
 
-Items available without explicit import (from `stdlib/core.p`, auto-included):
+Items available without explicit import (from `stdlib/core.fd`, auto-included):
 
-```pledge
+```fides
 // Types
 Option<T>     Some(T)     None
 Result<T, E>  Ok(T)       Err(E)
@@ -1397,7 +1397,7 @@ Default       Display     Eq + Ord
 Hash          Iterator    IntoIterator
 From          Into        TryFrom + TryInto
 
-// Macros (none — P has no macros)
+// Macros (none — Fides has no macros)
 // All of the above are functions or types
 ```
 
@@ -1407,19 +1407,19 @@ From          Into        TryFrom + TryInto
 
 ## 20. File Extension
 
-P source files use the `.p` extension:
+Fides source files use the `.fd` extension:
 
 ```
-main.p
-parser.p
-net/http.p
+main.fd
+parser.fd
+net/http.fd
 ```
 
 ---
 
 ## 21. Complete Example
 
-```pledge
+```fides
 use std::io::println;
 use std::fs::read_to_string;
 use std::collections::HashMap;
@@ -1485,7 +1485,7 @@ pf test_config_debug() {
 }
 
 pub pf main() -> Result<(), LoadError> {
-    pv config = load_config("pledge.toml")?;
+    pv config = load_config("fides.toml")?;
 
     println(f"Loaded: {config.name} v{config.version}");
     println(f"Settings: {config.settings.len()} entries");

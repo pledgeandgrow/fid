@@ -1,6 +1,6 @@
-# P Innovation — AI, Robotics, Hardware, IoT
+# Fides Innovation — AI, Robotics, Hardware, IoT
 
-> P is designed for the next 50 years of computing, not the last 50.
+> Fides is designed for the next 50 years of computing, not the last 50.
 
 ## Why Existing Languages Fail at the Future
 
@@ -24,13 +24,13 @@ No language can:
 4. Write a device driver with memory safety
 5. Hot-reload code on a running robot
 
-**P targets all of these.**
+**Fides targets all of these.**
 
 ---
 
 ## AI/ML — First-Class Support
 
-### SIMD Types (WORKING — see `stdlib/simd.p`)
+### SIMD Types (WORKING — see `stdlib/simd.fd`)
 ```
 // SIMD is a first-class type, not an intrinsic
 pv a: simd[i64; 4] = [1, 2, 3, 4];
@@ -38,7 +38,7 @@ pv b: simd[i64; 4] = [5, 6, 7, 8];
 pv c: simd[i64; 4] = a + b;  // vectorized addition, one instruction
 ```
 
-### Tensor Type (WORKING — see `stdlib/tensor.p`)
+### Tensor Type (WORKING — see `stdlib/tensor.fd`)
 ```
 // Tensors are n-dimensional arrays with stride info
 pv weights: Tensor[f32; 784, 128] = load_weights("model.bin");
@@ -61,7 +61,7 @@ pf comptime matmul[M: comptime, N: comptime, K: comptime](
 
 ### GPU Targeting (Implemented — SPIR-V codegen in `src/gpu.rs`)
 ```
-// Same P code, different target
+// Same Fides code, different target
 #[target(gpu)]
 pf train_step(batch: Tensor[f32; 32, 784]) -> Tensor[f32; 32, 10] {
     // PIR lowers to SPIR-V or PTX for GPU
@@ -161,7 +161,7 @@ pf firmware_main() {
 
 ### Tiny Binaries
 ```
-// P produces smaller binaries than C because:
+// Fides produces smaller binaries than C because:
 // 1. Dead code elimination at IR level (not link time)
 // 2. No libc dependency
 // 3. No runtime
@@ -172,10 +172,10 @@ pf firmware_main() {
 ### Cross-Compilation
 ```
 // Build for any target from any host
-pledgec build --target riscv32-embedded    // RISC-V microcontroller
-pledgec build --target arm64-bare-metal    // Raspberry Pi
-pledgec build --target x86_64-linux        // Server
-pledgec build --target wasm                // Web
+fidesc build --target riscv32-embedded    // RISC-V microcontroller
+fidesc build --target arm64-bare-metal    // Raspberry Pi
+fidesc build --target x86_64-linux        // Server
+fidesc build --target wasm                // Web
 ```
 
 ---
@@ -218,7 +218,7 @@ pf map_page(virt: usize, phys: usize, flags: PageFlags) {
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                  P Language                     │
+│                  Fides Language                     │
 │                                                     │
 │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌──────────┐  │
 │  │ AI/ML   │ │ Robotics│ │  IoT    │ │ Servers  │  │
@@ -229,7 +229,7 @@ pf map_page(virt: usize, phys: usize, flags: PageFlags) {
 │  └─────────┘ └─────────┘ └─────────┘ └─────────┘  │
 │                                                     │
 │  ┌─────────────────────────────────────────────┐    │
-│  │              PIR (P IR)                 │    │
+│  │              PIR (Fides IR)                 │    │
 │  │  Regions + Effects + Capabilities + comptime │    │
 │  └─────────────────────────────────────────────┘    │
 │                                                     │

@@ -93,8 +93,17 @@ impl X64CodeGen {
 
     fn gen_module(&mut self, module: &L3Module) {
         // Collect string constants.
-        for (label, val) in &module.string_constants {
-            self.strings.insert(label.clone(), val.clone());
+        // Note: module.string_constants maps (content → label).
+        for (content, label) in &module.string_constants {
+            self.strings.insert(label.clone(), content.clone());
+            // Update string_counter to avoid label collisions with module labels.
+            if let Some(n) = label.strip_prefix(".str_") {
+                if let Ok(n) = n.parse::<u32>() {
+                    if n >= self.string_counter {
+                        self.string_counter = n + 1;
+                    }
+                }
+            }
         }
 
         // .data section — string constants (initial set from the module).

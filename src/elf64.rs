@@ -326,32 +326,29 @@ impl ElfEmitter {
 
     fn handle_directive(&mut self, line: &str) -> Result<(), String> {
         // We mostly ignore directives — the actual code is what matters.
-        // String constants (.asciz) go into .rodata.
-        if line.contains(".asciz") || line.contains(".ascii") {
-            // Format: "label: .asciz \"value\"" or "label: .quad value"
-            // Parse the label and value.
-            if let Some(colon_idx) = line.find(':') {
-                let label = line[..colon_idx].trim().to_string();
-                let rest = &line[colon_idx + 1..].trim();
+        // String constants (.asciz) and float constants (.quad) go into .rodata.
+        // Format: "label: .asciz \"value\"" or "label: .quad bits"
+        if let Some(colon_idx) = line.find(':') {
+            let label = line[..colon_idx].trim().to_string();
+            let rest = &line[colon_idx + 1..].trim();
 
-                if rest.starts_with(".asciz") || rest.starts_with(".ascii") {
-                    // Extract the quoted string.
-                    let val = extract_string_literal(rest);
-                    let offset = self.rodata.len() as u32;
-                    self.rodata.extend_from_slice(val.as_bytes());
-                    if rest.starts_with(".asciz") {
-                        self.rodata.push(0); // null terminator
-                    }
-                    self.rodata_symbols.push((label, offset));
-                } else if rest.starts_with(".quad") {
-                    // A .quad value (e.g., float constant bits).
-                    let parts: Vec<&str> = rest.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        if let Ok(bits) = parts[1].parse::<u64>() {
-                            let offset = self.rodata.len() as u32;
-                            self.rodata.extend_from_slice(&bits.to_le_bytes());
-                            self.rodata_symbols.push((label, offset));
-                        }
+            if rest.starts_with(".asciz") || rest.starts_with(".ascii") {
+                // Extract the quoted string.
+                let val = extract_string_literal(rest);
+                let offset = self.rodata.len() as u32;
+                self.rodata.extend_from_slice(val.as_bytes());
+                if rest.starts_with(".asciz") {
+                    self.rodata.push(0); // null terminator
+                }
+                self.rodata_symbols.push((label, offset));
+            } else if rest.starts_with(".quad") {
+                // A .quad value (e.g., float constant bits).
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(bits) = parts[1].parse::<u64>() {
+                        let offset = self.rodata.len() as u32;
+                        self.rodata.extend_from_slice(&bits.to_le_bytes());
+                        self.rodata_symbols.push((label, offset));
                     }
                 }
             }
@@ -455,11 +452,13 @@ impl ElfEmitter {
 
             "imulq" => {
                 // imulq %src, %dst → REX.W 0F AF /r
+                // AT&T syntax: dst = dst * src
+                // IMUL encoding: reg field = dst, rm field = src
                 if operands.len() == 2 {
                     let src = parse_reg(operands[0])?;
                     let dst = parse_reg(operands[1])?;
-                    let rex = 0x48 | ((src >> 3) << 2) | ((dst >> 3) << 0);
-                    let modrm = 0xc0 | ((src & 7) << 3) | (dst & 7);
+                    let rex = 0x48 | ((dst >> 3) << 2) | ((src >> 3) << 0);
+                    let modrm = 0xc0 | ((dst & 7) << 3) | (src & 7);
                     self.text.extend_from_slice(&[rex, 0x0f, 0xaf, modrm]);
                 }
             }
@@ -621,23 +620,48 @@ impl ElfEmitter {
                     let dst_xmm = parse_xmm_reg(operands[1])?;
                     let rex = 0x48 | ((src >> 3) << 0);
                     let modrm = 0xc0 | ((dst_xmm & 7) << 3) | (src & 7);
-                    self.text.extend_from_slice(&[rex, 0xf2, 0x0f, 0x2a, modrm]);
+                    self.text.extend_from_slice(&[0xf2, rex, 0x0f, 0x2a, modrm]);
                 }
             }
             "cvttsd2siq" => {
-                // REX.W 0xF2 0F 2C /r
+                // F2 REX.W 0F 2C /r
                 if operands.len() == 2 {
                     let src_xmm = parse_xmm_reg(operands[0])?;
                     let dst = parse_reg(operands[1])?;
                     let rex = 0x48 | ((src_xmm >> 3) << 2) | ((dst >> 3) << 0);
                     let modrm = 0xc0 | ((src_xmm & 7) << 3) | (dst & 7);
-                    self.text.extend_from_slice(&[rex, 0xf2, 0x0f, 0x2c, modrm]);
+                    self.text.extend_from_slice(&[0xf2, rex, 0x0f, 0x2c, modrm]);
                 }
             }
             "movsd" => {
-                // Simplified: only handle xmm0 cases
-                // F2 0F 10/11 /r
-                self.text.extend_from_slice(&[0xf2, 0x0f, 0x10, 0x00]);
+                if operands.len() == 2 {
+                    self.encode_movsd(operands[0], operands[1])?;
+                }
+            }
+            "addsd" => {
+                if operands.len() == 2 {
+                    self.encode_sse2_arith(0x58, operands[0], operands[1])?;
+                }
+            }
+            "subsd" => {
+                if operands.len() == 2 {
+                    self.encode_sse2_arith(0x5c, operands[0], operands[1])?;
+                }
+            }
+            "mulsd" => {
+                if operands.len() == 2 {
+                    self.encode_sse2_arith(0x59, operands[0], operands[1])?;
+                }
+            }
+            "divsd" => {
+                if operands.len() == 2 {
+                    self.encode_sse2_arith(0x5e, operands[0], operands[1])?;
+                }
+            }
+            "ucomisd" => {
+                if operands.len() == 2 {
+                    self.encode_sse2_arith_66(0x2e, operands[0], operands[1])?;
+                }
             }
 
             // ─── Unknown instruction — emit a nop placeholder ───
@@ -694,7 +718,23 @@ impl ElfEmitter {
         // movq $imm, %reg
         if src.starts_with('$') {
             if let Some(r) = try_parse_reg(dst) {
-                let imm: i64 = src[1..].parse().unwrap_or(0);
+                let imm_str = &src[1..];
+                // Try parsing as i64 first, then u64 (for values like 0x8000000000000000)
+                let imm: i64 = if let Ok(v) = imm_str.parse::<i64>() {
+                    v
+                } else if let Ok(v) = imm_str.parse::<u64>() {
+                    v as i64
+                } else if imm_str.starts_with("0x") || imm_str.starts_with("0X") {
+                    if let Ok(v) = i64::from_str_radix(&imm_str[2..], 16) {
+                        v
+                    } else if let Ok(v) = u64::from_str_radix(&imm_str[2..], 16) {
+                        v as i64
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
                 if size == 8 {
                     // REX.W 0xB8+r imm64
                     let rex = 0x48 | ((r >> 3) << 0);
@@ -709,6 +749,34 @@ impl ElfEmitter {
                 }
                 return Ok(());
             }
+        }
+
+        // movq %xmmN, %gpr  →  66 [REX.W] 0F 7E /r  (MOVQ r64, xmm)
+        // Note: mandatory prefix (66) comes BEFORE REX prefix.
+        // 0F 7E with 66 prefix moves from XMM to r/m64.
+        if let (Ok(s_xmm), Some(d)) = (parse_xmm_reg(src), try_parse_reg(dst)) {
+            let rex = 0x48 | ((s_xmm >> 3) << 2) | ((d >> 3) << 0);
+            self.text.push(0x66);
+            self.text.push(rex);
+            self.text.push(0x0f);
+            self.text.push(0x7e);
+            let modrm = 0xc0 | ((s_xmm & 7) << 3) | (d & 7);
+            self.text.push(modrm);
+            return Ok(());
+        }
+
+        // movq %gpr, %xmmN  →  66 [REX.W] 0F 6E /r  (MOVQ xmm, r64)
+        // Note: mandatory prefix (66) comes BEFORE REX prefix.
+        // 0F 6E with 66 prefix moves from r/m64 to XMM.
+        if let (Some(s), Ok(d_xmm)) = (try_parse_reg(src), parse_xmm_reg(dst)) {
+            let rex = 0x48 | ((d_xmm >> 3) << 2) | ((s >> 3) << 0);
+            self.text.push(0x66);
+            self.text.push(rex);
+            self.text.push(0x0f);
+            self.text.push(0x6e);
+            let modrm = 0xc0 | ((d_xmm & 7) << 3) | (s & 7);
+            self.text.push(modrm);
+            return Ok(());
         }
 
         // movq %reg, %reg
@@ -1097,6 +1165,23 @@ impl ElfEmitter {
     }
 
     fn encode_call(&mut self, target: &str) -> Result<(), String> {
+        // call *%reg → indirect call through register
+        // Encoding: [REX.B] FF /2  (ModRM mod=11, reg=2, rm=reg)
+        //   r0-r7:  FF D0|reg
+        //   r8-r15: 41 FF D0|(reg-8)
+        if target.starts_with("*%") {
+            let reg_str = &target[1..]; // keep the % prefix for try_parse_reg
+            if let Some(r) = try_parse_reg(reg_str) {
+                if r >= 8 {
+                    self.text.push(0x41); // REX.B
+                }
+                self.text.push(0xff);
+                let modrm = 0xd0 | (r & 7); // mod=11, reg=2 (CALL), rm=reg
+                self.text.push(modrm);
+                return Ok(());
+            }
+        }
+
         // call rel32 → 0xE8 rel32
         // For external functions, use R_X86_64_PLT32 relocation.
         // For local functions, use R_X86_64_PC32.
@@ -1172,6 +1257,146 @@ impl ElfEmitter {
             }
         }
         self.text.push(0x90);
+        Ok(())
+    }
+
+    /// Encode movsd: move scalar double-precision FP value.
+    /// AT&T syntax: movsd src, dst
+    /// Cases:
+    ///   movsd .label(%rip), %xmmN  → load from memory (RIP-relative)
+    ///   movsd %xmmN, %xmmM         → reg-to-reg move
+    ///   movsd %xmmN, mem           → store to memory
+    ///   movsd mem, %xmmN           → load from memory
+    fn encode_movsd(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        // movsd label(%rip), %xmmN
+        if src.contains("(%rip)") {
+            let dst_xmm = parse_xmm_reg(dst)?;
+            let label = src.trim_end_matches("(%rip)").to_string();
+            let sym_idx = if label.starts_with(".L") {
+                self.get_or_add_local_label(&label)
+            } else {
+                self.get_or_add_undef_symbol(&label)
+            };
+            // F2 0F 10 /r with RIP-relative
+            // Note: mandatory prefix (F2) comes BEFORE REX prefix.
+            let rex = if dst_xmm >= 8 { 0x44 } else { 0x40 }; // REX.R for xmm8-15
+            self.text.push(0xf2);
+            self.text.push(rex);
+            self.text.push(0x0f);
+            self.text.push(0x10);
+            let modrm = 0x05 | ((dst_xmm & 7) << 3); // mod=00, reg=xmm, rm=101 (RIP)
+            self.text.push(modrm);
+            let reloc_offset = self.text.len() as u64;
+            self.relocations.push(Relocation {
+                offset: reloc_offset,
+                symbol: sym_idx,
+                rtype: R_X86_64_PC32,
+                addend: -4,
+            });
+            self.text.extend_from_slice(&[0, 0, 0, 0]);
+            return Ok(());
+        }
+
+        // movsd %xmmN, %xmmM (reg-to-reg)
+        if let (Ok(s_xmm), Ok(d_xmm)) = (parse_xmm_reg(src), parse_xmm_reg(dst)) {
+            let rex = if (s_xmm >= 8) || (d_xmm >= 8) {
+                0x40 | ((s_xmm >> 3) << 2) | ((d_xmm >> 3) << 0)
+            } else { 0x00 };
+            self.text.push(0xf2);
+            if rex != 0 { self.text.push(rex); }
+            self.text.push(0x0f);
+            self.text.push(0x10); // MOVSD xmm1, xmm2
+            let modrm = 0xc0 | ((d_xmm & 7) << 3) | (s_xmm & 7);
+            self.text.push(modrm);
+            return Ok(());
+        }
+
+        // movsd %xmmN, mem (store)
+        if let Ok(s_xmm) = parse_xmm_reg(src) {
+            if let Some((off, base, index, sc)) = try_parse_mem_indexed(dst) {
+                let rex = 0x40 | ((s_xmm >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                self.text.push(0xf2);
+                self.text.push(0xf2);
+                self.text.push(rex);
+                self.text.push(0x0f);
+                self.text.push(0x11); // MOVSD mem, xmm
+                self.encode_modrm_sib(s_xmm, off, base, index, sc);
+                return Ok(());
+            }
+            if let Some((off, base)) = try_parse_mem(dst) {
+                let rex = 0x40 | ((s_xmm >> 3) << 2) | ((base >> 3) << 0);
+                self.text.push(0xf2);
+                self.text.push(rex);
+                self.text.push(0x0f);
+                self.text.push(0x11);
+                self.encode_modrm_mem(s_xmm, off, base);
+                return Ok(());
+            }
+        }
+
+        // movsd mem, %xmmN (load from [reg+off])
+        if let Ok(d_xmm) = parse_xmm_reg(dst) {
+            if let Some((off, base, index, sc)) = try_parse_mem_indexed(src) {
+                let rex = 0x40 | ((d_xmm >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                self.text.push(0xf2);
+                self.text.push(rex);
+                self.text.push(0x0f);
+                self.text.push(0x10);
+                self.encode_modrm_sib(d_xmm, off, base, index, sc);
+                return Ok(());
+            }
+            if let Some((off, base)) = try_parse_mem(src) {
+                let rex = 0x40 | ((d_xmm >> 3) << 2) | ((base >> 3) << 0);
+                self.text.push(0xf2);
+                self.text.push(rex);
+                self.text.push(0x0f);
+                self.text.push(0x10);
+                self.encode_modrm_mem(d_xmm, off, base);
+                return Ok(());
+            }
+        }
+
+        self.text.push(0x90);
+        Ok(())
+    }
+
+    /// Encode SSE2 arithmetic instructions (addsd, subsd, mulsd, divsd, ucomisd).
+    /// AT&T syntax: op src, dst  →  dst = dst op src
+    /// Encoding: F2 [REX] 0F opcode /r
+    ///   reg field = dst_xmm, rm field = src_xmm
+    ///   (In AT&T syntax, the first operand is src, second is dst.
+    ///    In the ModRM byte, reg=dst, rm=src for SSE2 arithmetic.)
+    fn encode_sse2_arith(&mut self, opcode: u8, src: &str, dst: &str) -> Result<(), String> {
+        let s_xmm = parse_xmm_reg(src)?;
+        let d_xmm = parse_xmm_reg(dst)?;
+        let rex = if (s_xmm >= 8) || (d_xmm >= 8) {
+            0x40 | ((d_xmm >> 3) << 2) | ((s_xmm >> 3) << 0)
+        } else { 0x00 };
+        self.text.push(0xf2);
+        if rex != 0 { self.text.push(rex); }
+        self.text.push(0x0f);
+        self.text.push(opcode);
+        let modrm = 0xc0 | ((d_xmm & 7) << 3) | (s_xmm & 7);
+        self.text.push(modrm);
+        Ok(())
+    }
+
+    /// Encode SSE2 arithmetic instructions with 66 prefix (ucomisd).
+    /// AT&T syntax: op src, dst  →  ucomisd src, dst
+    /// Encoding: 66 [REX] 0F opcode /r
+    ///   reg field = dst_xmm, rm field = src_xmm
+    fn encode_sse2_arith_66(&mut self, opcode: u8, src: &str, dst: &str) -> Result<(), String> {
+        let s_xmm = parse_xmm_reg(src)?;
+        let d_xmm = parse_xmm_reg(dst)?;
+        let rex = if (s_xmm >= 8) || (d_xmm >= 8) {
+            0x40 | ((d_xmm >> 3) << 2) | ((s_xmm >> 3) << 0)
+        } else { 0x00 };
+        self.text.push(0x66);
+        if rex != 0 { self.text.push(rex); }
+        self.text.push(0x0f);
+        self.text.push(opcode);
+        let modrm = 0xc0 | ((d_xmm & 7) << 3) | (s_xmm & 7);
+        self.text.push(modrm);
         Ok(())
     }
 
@@ -1286,7 +1511,7 @@ impl ElfEmitter {
 
         // Pre-populate the strtab with all symbol names so we know its size
         // before computing the layout.
-        self.add_strtab_static("pledge.c"); // FILE symbol
+        self.add_strtab_static("fides.c"); // FILE symbol
         let sym_names: Vec<String> = self.symbols.iter().map(|s| s.name.clone()).collect();
         for name in &sym_names {
             self.add_strtab_static(name);
@@ -1299,7 +1524,7 @@ impl ElfEmitter {
         symtab.extend_from_slice(&[0u8; 24]); // 24 bytes per Elf64_Sym
 
         // Add FILE symbol as first local symbol.
-        let file_strtab_off = self.add_strtab_static("pledge.c");
+        let file_strtab_off = self.add_strtab_static("fides.c");
         symtab.extend_from_slice(&Elf64_Sym {
             st_name: file_strtab_off,
             st_info: (STB_LOCAL << 4) | STT_FILE,

@@ -1,4 +1,4 @@
-# P Compiler — Best Practices & Lessons Learned
+# Fides Compiler — Best Practices & Lessons Learned
 
 > Hard-won insights from building a custom toolchain. Read this before making
 > changes. Every rule here exists because something broke.
@@ -247,7 +247,7 @@ need a map for output, use `BTreeMap` or `IndexMap`.
 
 ```
                     ┌─────────────┐
-                    │  End-to-end │  pledgec test (79 .p files)
+                    │  End-to-end │  fidesc test (79 .fd files)
                     │   tests     │  ← tells you SOMETHING broke
                     └──────┬──────┘
                   ┌────────┴────────┐
@@ -262,7 +262,7 @@ need a map for output, use `BTreeMap` or `IndexMap`.
 
 ### The Workflow
 
-1. **Write a failing test first** — if you're fixing a bug, write a `.p` test
+1. **Write a failing test first** — if you're fixing a bug, write a `.fd` test
    that exposes it before fixing the code
 2. **Fix the bug** — the test should now pass
 3. **Run `./verify.sh`** — make sure nothing else broke
@@ -343,7 +343,7 @@ will change the "correct" output for all backends.
 ### What To Commit
 
 - Source code changes
-- Test files (new `.p` tests)
+- Test files (new `.fd` tests)
 - Updated baseline (`tests/baseline/test_results.txt`)
 - Updated golden files (`tests/golden/`)
 
@@ -385,14 +385,14 @@ Format: `type(scope): description` where type is one of:
 2. **Run `./scripts/bisect.sh <test_name>`** — find which layer broke
 3. **Add targeted `eprintln!`** — dump the IR/PIR/asm at the failing point
 4. **Compare to interpreter output** — is the interpreter also wrong?
-5. **Read the assembly** — `pledgec codegen <file> --target x86-64` and read it
-6. **Minimize the test case** — reduce the failing `.p` file to the smallest
+5. **Read the assembly** — `fidesc codegen <file> --target x86-64` and read it
+6. **Minimize the test case** — reduce the failing `.fd` file to the smallest
    reproducer
 7. **Check the ABI** — is a register being clobbered? Stack misaligned?
 
 ### Minimizing Test Cases
 
-```pledge
+```fides
 // If this 100-line file fails, reduce to:
 pf main() {
     pv x = 42;
@@ -490,8 +490,8 @@ non-deterministic (HashSet).
 `R_X86_64_64`. The `PLT32` type is treated the same as `PC32` (relative call)
 in most cases, but this is a simplification.
 
-**If you add new relocation types, test with `pledgec build` and
-`pledgec codegen --elf`.**
+**If you add new relocation types, test with `fidesc build` and
+`fidesc codegen --elf`.**
 
 ---
 

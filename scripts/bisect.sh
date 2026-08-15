@@ -12,20 +12,20 @@
 #
 #   Layer         Command                    Golden file
 #   ─────────    ─────────                 ─────────────
-#   IR            pledgec ir                .ir
-#   PIR L1        pledgec pir 1             .pir_l1
-#   PIR L2        pledgec pir 2             .pir_l2
-#   PIR L3        pledgec pir 3             .pir_l3
-#   Codegen       pledgec codegen           .asm
-#   Peephole      pledgec codegen --peephole .peephole
-#   Output        pledgec run               .out
+#   IR            fidesc ir                .ir
+#   PIR L1        fidesc pir 1             .pir_l1
+#   PIR L2        fidesc pir 2             .pir_l2
+#   PIR L3        fidesc pir 3             .pir_l3
+#   Codegen       fidesc codegen           .asm
+#   Peephole      fidesc codegen --peephole .peephole
+#   Output        fidesc run               .out
 #
 # The first layer that differs from golden is where the regression lives.
 
 set -e
 cd "$(dirname "$0")/.."
 
-PLEDGEC="./target/release/pledgec"
+PLEDGEC="./target/release/fidesc"
 
 if [[ -z "$1" ]]; then
     echo "Usage: $0 <test_name>"
@@ -38,7 +38,7 @@ fi
 
 name="$1"
 golden_dir="tests/golden/${name}"
-src="tests/${name}.p"
+src="tests/${name}.fd"
 
 if [[ ! -d "$golden_dir" ]]; then
     echo "ERROR: No golden files for '$name' in $golden_dir"
@@ -51,9 +51,9 @@ if [[ ! -f "$src" ]]; then
     exit 1
 fi
 
-# Make sure pledgec is built
+# Make sure fidesc is built
 if [[ ! -x "$PLEDGEC" ]]; then
-    echo "Building pledgec..."
+    echo "Building fidesc..."
     cargo build --release 2>&1 | grep -E "^(error|Finished)" || true
 fi
 

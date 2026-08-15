@@ -1,10 +1,10 @@
-// C header parser — auto-generate Pledge FFI bindings from C headers
+// C header parser — auto-generate Fides FFI bindings from C headers
 //
-// Parses C function declarations from .h files and generates Pledge
+// Parses C function declarations from .h files and generates Fides
 // `extern "C"` declarations. Supports basic C types, pointers, and
 // function prototypes.
 //
-// Usage: pledgec parse-header <file.h> [-o output.p]
+// Usage: fidesc parse-header <file.h> [-o output.p]
 
 use crate::ast::{ExternDecl, Param, Type};
 use std::collections::HashSet;
@@ -135,7 +135,7 @@ fn parse_c_function(decl: &str, include: &str) -> Option<ExternDecl> {
     })
 }
 
-/// Parse a C type string into a Pledge Type
+/// Parse a C type string into a Fides Type
 fn parse_c_type(c_type: &str) -> Option<Type> {
     let c_type = c_type.trim();
     // Remove qualifiers
@@ -159,7 +159,7 @@ fn parse_c_type(c_type: &str) -> Option<Type> {
         });
     }
 
-    // Map C types to Pledge types
+    // Map C types to Fides types
     match c_type.as_str() {
         "int" | "signed int" | "signed" => Some(Type::I32),
         "long" | "signed long" | "long int" => Some(Type::I64),
@@ -268,10 +268,10 @@ fn parse_c_param(param: &str) -> Option<Param> {
     })
 }
 
-/// Generate Pledge source code from extern declarations
+/// Generate Fides source code from extern declarations
 pub fn generate_pledge_bindings(decls: &[ExternDecl], include: &str) -> String {
     let mut out = String::new();
-    out.push_str(&format!("// Auto-generated Pledge FFI bindings from C header\n"));
+    out.push_str(&format!("// Auto-generated Fides FFI bindings from C header\n"));
     out.push_str(&format!("extern \"C\" include \"{}\" {{\n", include));
     for decl in decls {
         let ret = type_to_pledge(&decl.ret_ty);

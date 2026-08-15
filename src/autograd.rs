@@ -1,7 +1,7 @@
 // Autograd — Compile-time reverse-mode automatic differentiation
 //
 // This module implements reverse-mode AD as a compiler transform over the
-// Pledge IR. When a `grad(var) { ... backward(loss); }` block is encountered,
+// Fides IR. When a `grad(var) { ... backward(loss); }` block is encountered,
 // the compiler:
 //
 // 1. Traces all operations on the gradient-tracked variable within the block

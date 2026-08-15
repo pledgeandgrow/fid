@@ -1,4 +1,4 @@
-// Pledge Linux x86-64 Runtime — Phase 4D
+// Fides Linux x86-64 Runtime — Phase 4D
 //
 // Native runtime stubs for Linux x86-64 executables. Provides implementations
 // of all p_print_*, p_panic, p_alloc, p_malloc, p_free, p_str_concat, p_to_str,
@@ -2473,23 +2473,24 @@ p_map_contains:
     pushq %rbx
     pushq %r12
     pushq %r13
+    pushq %r14
     movq %rdi, %rbx
     movq %rsi, %r12
     movq 8(%rbx), %r13
     movq (%rbx), %rdx
-    xorl %rcx, %rcx
+    xorl %r14, %r14
 .Lpmc_loop:
-    cmpq %r13, %rcx
+    cmpq %r13, %r14
     jae .Lpmc_false
-    leaq (%rdx,%rcx,8), %r8
-    leaq (%r8,%rcx,8), %r8
+    leaq (%rdx,%r14,8), %r8
+    leaq (%r8,%r14,8), %r8
     movq (%r8), %r9
     movq %r9, %rdi
     movq %r12, %rsi
     call p_strcmp
     testq %rax, %rax
     je .Lpmc_true
-    incq %rcx
+    incq %r14
     jmp .Lpmc_loop
 .Lpmc_true:
     movl $1, %eax
@@ -2497,6 +2498,7 @@ p_map_contains:
 .Lpmc_false:
     xorl %eax, %eax
 .Lpmc_ret:
+    popq %r14
     popq %r13
     popq %r12
     popq %rbx
@@ -2508,29 +2510,30 @@ p_map_insert:
     pushq %r12
     pushq %r13
     pushq %r14
+    pushq %r15
     movq %rdi, %rbx
     movq %rsi, %r12
     movq %rdx, %r13
     # check if key exists
     movq 8(%rbx), %r14
     movq (%rbx), %rdx
-    xorl %rcx, %rcx
+    xorl %r15, %r15
 .Lpmi_loop:
-    cmpq %r14, %rcx
+    cmpq %r14, %r15
     jae .Lpmi_new
-    leaq (%rdx,%rcx,8), %r8
-    leaq (%r8,%rcx,8), %r8
+    leaq (%rdx,%r15,8), %r8
+    leaq (%r8,%r15,8), %r8
     movq (%r8), %r9
     movq %r9, %rdi
     movq %r12, %rsi
     call p_strcmp
     testq %rax, %rax
     je .Lpmi_update
-    incq %rcx
+    incq %r15
     jmp .Lpmi_loop
 .Lpmi_update:
-    leaq (%rdx,%rcx,8), %r8
-    leaq (%r8,%rcx,8), %r8
+    leaq (%rdx,%r15,8), %r8
+    leaq (%r8,%r15,8), %r8
     movq %r13, 8(%r8)
     jmp .Lpmi_done
 .Lpmi_new:
@@ -2553,13 +2556,16 @@ p_map_insert:
     movq 8(%rbx), %r8
     cmpq %r8, %rcx
     jae .Lpmi_copy_done
-    movq (%rsi,%rcx,8), %r9
-    movq %r9, (%rdi,%rcx,8)
-    leaq 1(%rcx), %r10
-    shlq $4, %r10
-    subq $8, %r10
-    movq 8(%rsi,%rcx,8), %r9
-    movq %r9, 8(%rdi,%rcx,8)
+    # Entry at index rcx is at offset rcx*16 (each entry = 16 bytes: key, value)
+    # Key: offset = rcx*16 = rcx*8*2 → use leaq (%rsi,%rcx,8),%r9; leaq (%r9,%rcx,8),%r9
+    leaq (%rsi,%rcx,8), %r9       # r9 = rsi + rcx*8
+    leaq (%r9,%rcx,8), %r9       # r9 = rsi + rcx*16
+    movq (%r9), %r10             # key
+    leaq (%rdi,%rcx,8), %r11
+    leaq (%r11,%rcx,8), %r11
+    movq %r10, (%r11)            # store key
+    movq 8(%r9), %r10           # value
+    movq %r10, 8(%r11)          # store value
     incq %rcx
     jmp .Lpmi_copy
 .Lpmi_copy_done:
@@ -2697,9 +2703,13 @@ p_print_map:
     movq %rdi, %rbx
     movq 8(%rbx), %r13
     movq (%rbx), %r14
-    # print '{'
-    movl $123, %edi
-    call p_print_int
+    # print '{' — write single char directly
+    movb $123, 16(%rsp)
+    movl $1, %eax
+    movl $1, %edi
+    leaq 16(%rsp), %rsi
+    movl $1, %edx
+    syscall
     xorl %r12, %r12
 .Lppm_loop:
     cmpq %r13, %r12
@@ -2707,10 +2717,13 @@ p_print_map:
     # if not first, print ", "
     testq %r12, %r12
     je .Lppm_skip_sep
-    movl $44, %edi
-    call p_print_int
-    movl $32, %edi
-    call p_print_int
+    movb $44, 16(%rsp)
+    movb $32, 17(%rsp)
+    movl $1, %eax
+    movl $1, %edi
+    leaq 16(%rsp), %rsi
+    movl $2, %edx
+    syscall
 .Lppm_skip_sep:
     # print key
     leaq (%r14,%r12,8), %r8
@@ -2718,10 +2731,13 @@ p_print_map:
     movq (%r8), %rdi
     call p_print_str
     # print ": "
-    movl $58, %edi
-    call p_print_int
-    movl $32, %edi
-    call p_print_int
+    movb $58, 16(%rsp)
+    movb $32, 17(%rsp)
+    movl $1, %eax
+    movl $1, %edi
+    leaq 16(%rsp), %rsi
+    movl $2, %edx
+    syscall
     # print value via p_to_str + p_print_str
     movq 8(%r8), %rdi
     call p_to_str
@@ -2730,8 +2746,13 @@ p_print_map:
     incq %r12
     jmp .Lppm_loop
 .Lppm_done:
-    movl $125, %edi
-    call p_print_int
+    # print '}'
+    movb $125, 16(%rsp)
+    movl $1, %eax
+    movl $1, %edi
+    leaq 16(%rsp), %rsi
+    movl $1, %edx
+    syscall
     addq $8, %rsp
     popq %r15
     popq %r14

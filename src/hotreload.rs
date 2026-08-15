@@ -464,7 +464,7 @@ mod tests {
                 data: HashMap::new(),
             };
             state.set("counter", "42");
-            state.set("name", "pledge");
+            state.set("name", "fides");
             state.save();
         }
 
@@ -476,7 +476,7 @@ mod tests {
         let mut state = state;
         state.load();
         assert_eq!(state.get("counter"), Some("42"));
-        assert_eq!(state.get("name"), Some("pledge"));
+        assert_eq!(state.get("name"), Some("fides"));
         assert_eq!(state.get("nonexistent"), None);
 
         state.clear();
@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn test_compile_and_run_hello() {
         let source = "pf main() {\n    print(\"hot reload works!\");\n}\n";
-        let result = compile_and_run(source, "test.p", false);
+        let result = compile_and_run(source, "test.fd", false);
         assert!(result.is_ok(), "compile_and_run should succeed");
         let result = result.unwrap();
         assert_eq!(result.exit_code, 17); // print returns bytes written ("hot reload works!" = 17 chars)
@@ -497,7 +497,7 @@ mod tests {
     #[test]
     fn test_compile_and_run_with_opt() {
         let source = "pf main() {\n    print(\"optimized!\");\n}\n";
-        let result = compile_and_run(source, "test.p", true);
+        let result = compile_and_run(source, "test.fd", true);
         assert!(result.is_ok(), "compile_and_run with opt should succeed");
         let result = result.unwrap();
         assert!(result.stdout.contains("optimized!"));

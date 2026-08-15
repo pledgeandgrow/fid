@@ -1,6 +1,6 @@
-# P for AI/ML — Feature Opportunities
+# Fides for AI/ML — Feature Opportunities
 
-> Mapping P's unique capabilities to real problems in AI/ML systems
+> Mapping Fides's unique capabilities to real problems in AI/ML systems
 > programming, based on 2024-2026 research and industry trends.
 
 ## The Problem Space (2024-2026)
@@ -18,7 +18,7 @@ zero memory safety.
 > access' errors on the GPU, potentially crashing the entire inference
 > service." — Model2Kernel, 2026
 
-**P's advantage:** P already has compile-time region-based memory safety
+**Fides's advantage:** Fides already has compile-time region-based memory safety
 on CPU. Extending regions to GPU memory would eliminate this entire class
 of bugs — at compile time, with zero runtime cost.
 
@@ -28,11 +28,11 @@ vLLM's PagedAttention (SOSP 2023, 2-4x throughput improvement) is
 essentially **manual region-based memory management for GPU memory**.
 Developers manually page KV cache blocks in and out, track which
 blocks belong to which request, and free them when conversations end.
-This is exactly what P's regions do — but P does it with compile-time
+This is exactly what Fides's regions do — but Fides does it with compile-time
 safety, while vLLM does it with manual C++ code that can leak or
 double-free.
 
-**P's advantage:** Region-scoped KV cache. Allocate KV cache in a region,
+**Fides's advantage:** Region-scoped KV cache. Allocate KV cache in a region,
 free it automatically when the conversation ends. Compile-time guarantee
 that no references escape. No manual paging code, no leaks.
 
@@ -49,8 +49,8 @@ But Mojo is **AI-niche**. It's not a general systems language. It depends
 on MLIR (LLVM infrastructure). It has no capability system, no effect
 system, no hot reload, no custom toolchain.
 
-**P's advantage:** P is a general systems language that can also do AI/ML.
-P doesn't need MLIR. P has capabilities + effects + regions + comptime +
+**Fides's advantage:** Fides is a general systems language that can also do AI/ML.
+Fides doesn't need MLIR. Fides has capabilities + effects + regions + comptime +
 hot reload — none of which Mojo has.
 
 ### 4. Model Serving Needs Hot Reload
@@ -60,7 +60,7 @@ to update model code. This means downtime, lost KV cache, dropped
 connections. The industry workaround is blue-green deployments — running
 two servers and switching, wasting GPU memory.
 
-**P's advantage:** P already has hot reload with `persist`. You can
+**Fides's advantage:** Fides already has hot reload with `persist`. You can
 reload model code while keeping KV cache and connection state alive.
 This is impossible in Python/C++/Rust without massive infrastructure.
 
@@ -70,7 +70,7 @@ Running models on embedded devices (microcontrollers, IoT) requires
 proving the model fits in SRAM. Currently this is done by running the
 model and hoping it doesn't OOM, or by manual calculation.
 
-**P's advantage:** `region r with budget(N)` already proves memory
+**Fides's advantage:** `region r with budget(N)` already proves memory
 budgets at compile time. Extending this to GPU shared memory and edge
 device SRAM gives a compile-time guarantee that a kernel or model fits.
 
@@ -99,12 +99,12 @@ region gpu r {
 
 **Why it's novel:** No GPU programming language has region-based memory
 management. CUDA, OpenCL, HIP, Triton, Mojo — all use manual allocation
-or garbage collection. P's regions would give compile-time safety with
+or garbage collection. Fides's regions would give compile-time safety with
 zero runtime cost.
 
 **Why it matters:** The Model2Kernel study found 353 memory bugs in
-production CUDA kernels. P's regions would eliminate these at compile
-time. vLLM's PagedAttention is manual region management — P makes it
+production CUDA kernels. Fides's regions would eliminate these at compile
+time. vLLM's PagedAttention is manual region management — Fides makes it
 automatic and safe.
 
 ### ML2 — comptime Tensor Shape Verification
@@ -128,12 +128,12 @@ pf linear(input: Tensor<f32, [batch, in_dim]>, weight: Tensor<f32, [in_dim, out_
 ```
 
 **Why it's novel:** Mojo has dependent types for shapes, but they're
-rigid. P's comptime can run arbitrary shape verification logic at compile
+rigid. Fides's comptime can run arbitrary shape verification logic at compile
 time — any function, any condition. More flexible than Mojo's type system.
 
 **Why it matters:** Shape mismatches are the most common runtime error in
 PyTorch/TensorFlow. They waste GPU time (the error happens after kernel
-launch) and are hard to debug. P catches them at compile time.
+launch) and are hard to debug. Fides catches them at compile time.
 
 ### ML3 — Effect-Traced Autodiff
 
@@ -174,12 +174,12 @@ pf bad_forward(model: Model, input: Tensor) -> Tensor !{Diff} {
 ```
 
 **Why it's novel:** No language uses effects for differentiability
-tracking. PyTorch/JAX trace at runtime. Mojo doesn't have effects. P's
+tracking. PyTorch/JAX trace at runtime. Mojo doesn't have effects. Fides's
 effect system can prove differentiability at compile time.
 
 **Why it matters:** In production ML, you need to know if a model is
 differentiable (for training) or not (for inference). Currently this is
-discovered at runtime. P makes it a compile-time property.
+discovered at runtime. Fides makes it a compile-time property.
 
 ### ML4 — Hot-Swappable Model Weights via persist
 
@@ -207,11 +207,11 @@ pf serve_model() {
 ```
 
 **Why it's novel:** No ML framework has language-level state persistence
-across hot reloads. vLLM/TGI/SGLang all require full restart. P's
+across hot reloads. vLLM/TGI/SGLang all require full restart. Fides's
 `persist` + hot reload makes this a language feature.
 
 **Why it matters:** Model serving downtime is expensive. A 7B model
-takes 30+ seconds to load weights. With P, you can update the inference
+takes 30+ seconds to load weights. With Fides, you can update the inference
 code while keeping weights in memory — zero downtime.
 
 ### ML5 — sandbox { } for Untrusted Model Plugins
@@ -234,11 +234,11 @@ pf run_custom_activation(plugin: extern fn(Tensor) -> Tensor, input: Tensor) -> 
 
 **Why it's novel:** No ML framework can sandbox custom model code at
 compile time. PyTorch lets custom ops do anything. ONNX Runtime has
-runtime sandboxing (slow). P does it at compile time — zero runtime cost.
+runtime sandboxing (slow). Fides does it at compile time — zero runtime cost.
 
 **Why it matters:** Model marketplaces (HuggingFace, etc.) distribute
 custom model code that runs with full privileges. A malicious model
-could exfiltrate data, make network calls, or spawn processes. P's
+could exfiltrate data, make network calls, or spawn processes. Fides's
 `sandbox { }` proves at compile time that a plugin can only compute.
 
 ### ML6 — Compile-Time SRAM Budget for Edge AI
@@ -260,12 +260,12 @@ region shared with budget(48 * 1024) {  // 48KB SRAM on this GPU
 
 **Why it's novel:** No language can prove GPU shared memory budgets at
 compile time. CUDA developers manually calculate SRAM usage and hope
-they got it right. P's `region with budget(N)` makes it a compile-time
+they got it right. Fides's `region with budget(N)` makes it a compile-time
 guarantee.
 
 **Why it matters:** Edge AI (running models on microcontrollers, IoT
 devices) has strict memory limits. Exceeding SRAM causes a runtime crash
-on the device. P catches this at compile time, before deployment.
+on the device. Fides catches this at compile time, before deployment.
 
 ### ML7 — Capability-Aware Inference Stripping
 
@@ -275,7 +275,7 @@ on the device. P catches this at compile time, before deployment.
 
 ```
 // Build an inference-only binary — no training code
-pledgec build model.p --caps "IO" -o inference_server
+fidesc build model.fd --caps "IO" -o inference_server
 
 // The compiler strips:
 // - All gradient computation functions (require Alloc + Diff, not granted)
@@ -286,11 +286,11 @@ pledgec build model.p --caps "IO" -o inference_server
 
 **Why it's novel:** No ML framework strips training code from inference
 binaries. PyTorch ships the entire autodiff engine in every deployment.
-P's `--caps` flag removes it at link time.
+Fides's `--caps` flag removes it at link time.
 
 **Why it matters:** Production inference servers ship with full training
 capability — a security risk. An attacker who compromises the server can
-modify gradients or extract training data. P's capability-aware linking
+modify gradients or extract training data. Fides's capability-aware linking
 strips this code at compile time.
 
 ### ML8 — comptime Kernel Specialization
@@ -319,14 +319,14 @@ comptime gen gemm_kernel(128, 128, 64);
 // Now gemm_128_128_64 exists — fully specialized, zero overhead
 ```
 
-**Why it's novel:** Mojo has comptime specialization, but P's `comptime
-gen` can parse and inject arbitrary P source code. More flexible than
-Mojo's metaprogramming. torch.compile does this at runtime; P does it at
+**Why it's novel:** Mojo has comptime specialization, but Fides's `comptime
+gen` can parse and inject arbitrary Fides source code. More flexible than
+Mojo's metaprogramming. torch.compile does this at runtime; Fides does it at
 compile time.
 
 **Why it matters:** GPU kernel performance depends heavily on exact
 shapes. Generic kernels are 2-5x slower than specialized ones.
-torch.compile specializes at runtime (first-call overhead). P specializes
+torch.compile specializes at runtime (first-call overhead). Fides specializes
 at compile time — zero runtime overhead.
 
 ---
@@ -347,7 +347,7 @@ ML3: Effect-traced autodiff      ← MEDIUM — nice to have, not critical
 
 ## The Story
 
-> P is the only language where you can:
+> Fides is the only language where you can:
 > - Allocate GPU memory in a region and prove it's freed at compile time
 > - Verify tensor shapes at compile time, not runtime
 > - Prove a model is differentiable via effect tracking
@@ -358,5 +358,5 @@ ML3: Effect-traced autodiff      ← MEDIUM — nice to have, not critical
 > - Specialize GPU kernels for exact shapes at compile time
 >
 > No other language — not Python, not C++, not Rust, not Zig, not Mojo —
-> can do ALL of these. P's unique combination of regions + capabilities +
+> can do ALL of these. Fides's unique combination of regions + capabilities +
 > effects + comptime + hot reload + custom toolchain makes this possible.

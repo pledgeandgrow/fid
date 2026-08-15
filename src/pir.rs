@@ -1,6 +1,6 @@
-// PIR — Pledge Intermediate Representation
+// PIR — Fides Intermediate Representation
 //
-// Phase 4A: a multi-level IR that evolves Pledge from a single-level SSA IR
+// Phase 4A: a multi-level IR that evolves Fides from a single-level SSA IR
 // (ir.rs) into a layered pipeline suitable for optimization and multi-arch
 // codegen.
 //
@@ -25,7 +25,7 @@
 //                     allocation, instruction selection, peephole.
 //
 // Entry point: `generate_pir(&ir_module, level)` returns a human-readable
-// dump of one or all levels. Wired into the CLI as `pledgec pir <file>`.
+// dump of one or all levels. Wired into the CLI as `fidesc pir <file>`.
 
 use crate::ast::{BinOp, UnaryOp};
 use crate::ir::{
@@ -165,7 +165,7 @@ pub enum L1Inst {
     IntToFloat { value: PValue, from: PirType, to: PirType },
     FloatToInt { value: PValue, from: PirType, to: PirType },
 
-    // ─── Pledge-specific ───
+    // ─── Fides-specific ───
     TryUnwrap { value: PValue, ok_dst: PValue, err_block: PBlock, ok_block: PBlock },
     Print { value: PValue, ty: PirType },
     Panic { message: String },
@@ -1376,7 +1376,7 @@ impl PirLevel {
 }
 
 /// Generate a human-readable PIR dump for `module` at the requested level.
-/// This is the entry point wired into the CLI as `pledgec pir <file>`.
+/// This is the entry point wired into the CLI as `fidesc pir <file>`.
 pub fn generate_pir(module: &IrModule, level: PirLevel) -> String {
     let l1 = lower_ir_to_l1(module);
     let l2 = lower_l1_to_l2(&l1);
@@ -1384,7 +1384,7 @@ pub fn generate_pir(module: &IrModule, level: PirLevel) -> String {
 
     let mut out = String::new();
     out.push_str("; ════════════════════════════════════════════════════════════════\n");
-    out.push_str("; PIR — Pledge Intermediate Representation\n");
+    out.push_str("; PIR — Fides Intermediate Representation\n");
     out.push_str("; ════════════════════════════════════════════════════════════════\n\n");
 
     if level == PirLevel::L1 || level == PirLevel::All {

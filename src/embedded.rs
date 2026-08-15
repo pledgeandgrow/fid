@@ -331,7 +331,7 @@ pub enum RegisterAccess {
 }
 
 /// HAL framework: manages hardware device descriptors and generates
-/// Pledge FFI bindings for accessing hardware registers.
+/// Fides FFI bindings for accessing hardware registers.
 pub struct HalFramework {
     devices: Vec<HalDevice>,
 }
@@ -353,8 +353,8 @@ impl HalFramework {
         self.devices.iter().find(|d| d.name == name)
     }
 
-    /// Generate Pledge FFI bindings for all registered devices.
-    /// Returns Pledge source code that wraps hardware register access.
+    /// Generate Fides FFI bindings for all registered devices.
+    /// Returns Fides source code that wraps hardware register access.
     pub fn generate_bindings(&self) -> String {
         let mut code = String::new();
         code.push_str("// Generated HAL bindings — Phase 5B.5\n");

@@ -722,7 +722,7 @@ impl Parser {
     /// Parse an extern function declaration (pf keyword already consumed)
     fn parse_extern_func_decl(&mut self, abi: &str, include: &Option<String>, link_lib: &Option<String>) -> Result<ExternDecl, String> {
         let c_name = self.expect_ident()?;
-        // Optional `as pledge_name` to map C name to Pledge name
+        // Optional `as pledge_name` to map C name to Fides name
         let pledge_name = if self.check(&TokenKind::As) {
             self.advance();
             self.expect_ident()?

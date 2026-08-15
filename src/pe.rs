@@ -2707,7 +2707,7 @@ impl PeCodeGen {
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
             }
 
-            // ─── Pledge-Specific ───
+            // ─── Fides-Specific ───
             Inst::Print { value, .. } => {
                 let voff = frame.offset(*value) as i32;
                 self.enc.mov_reg_mem_rbp(Reg::Rcx, voff);

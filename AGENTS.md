@@ -1,7 +1,7 @@
-# AGENTS.md — P Compiler Working Guide
+# AGENTS.md — Fides Compiler Working Guide
 
 > This file gives AI assistants (and humans) the context needed to work on the
-> P compiler safely. Read this before making changes.
+> Fides compiler safely. Read this before making changes.
 
 ## Build & Test Commands
 
@@ -13,7 +13,7 @@ cargo build --release
 cargo build
 
 # Run all tests across all backends
-./target/release/pledgec test
+./target/release/fidesc test
 
 # Full verification (build + test + compare to baseline)
 ./verify.sh
@@ -32,19 +32,19 @@ cargo build
 # Example: ./scripts/bisect.sh strings
 
 # Run a single test through the interpreter
-./target/release/pledgec run tests/<name>.p
+./target/release/fidesc run tests/<name>.fd
 
 # Show IR for a test
-./target/release/pledgec ir tests/<name>.p
+./target/release/fidesc ir tests/<name>.fd
 
 # Show PIR (L1/L2/L3) for a test
-./target/release/pledgec pir tests/<name>.p 3
+./target/release/fidesc pir tests/<name>.fd 3
 
 # Show assembly (x86-64)
-./target/release/pledgec codegen tests/<name>.p --target x86-64
+./target/release/fidesc codegen tests/<name>.fd --target x86-64
 
 # Show assembly with peephole (what `build` actually uses)
-./target/release/pledgec codegen tests/<name>.p --target x86-64 --peephole
+./target/release/fidesc codegen tests/<name>.fd --target x86-64 --peephole
 ```
 
 ## Current Baseline (as of Aug 2026)
@@ -81,7 +81,7 @@ touching them.
 | `src/pir.rs` | **HIGH** | PIR L1/L2/L3 transforms. A bad lowering propagates to all backends. |
 | `src/lower.rs` | **MEDIUM** | AST → SSA IR. Changes here affect interpreter + all backends. |
 | `src/typechecker.rs` | **MEDIUM** | Types + regions + effects + capabilities. Wrong rejection = broken code; wrong acceptance = silent miscompilation. |
-| `src/opt.rs` | **MEDIUM** | PIR optimizer. Not enabled by default (regalloc bug). Changes can expose the bug. |
+| `src/opt.rs` | **MEDIUM** | PIR optimizer. Optimizer bugs fixed (effect_reorder, inline, TCO, imul). `--opt` now produces matching output on 62/65 tests (3 closure tests fail due to pre-existing codegen bugs, not optimizer). |
 | `src/runtime_linux.rs` | **HIGH** | Hand-encoded x86-64 machine code (raw bytes). No assembler — every byte is manual. |
 | `src/linker.rs` | **MEDIUM** | Relocation resolution. Wrong offset = crash or silent corruption. |
 | `src/interp.rs` | **LOW** | The reference oracle. If this is wrong, all backends "match" but produce wrong results. |
@@ -98,14 +98,16 @@ touching them.
 | `src/comptime.rs` | LOW | Compile-time eval — errors are loud. |
 | `src/main.rs` | LOW | CLI dispatch — adding commands is safe. |
 | `src/compiler.rs` | LOW | Pipeline orchestration — changes are visible. |
-| `stdlib/*.p` | LOW | P source — errors surface as test failures. |
+| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. |
 
 ## Known Bugs (Do Not Re-Introduce)
 
 1. **Register allocator clobbering** (`regalloc.rs`): Constants not loaded into
-   registers before use can be clobbered by intervening instructions. Exposed
-   by L2 optimizer's instruction reordering. The optimizer is disabled by
-   default because of this. If you fix it, test with `--opt` enabled.
+   registers before use can be clobbered by intervening instructions. The L2
+   optimizer's `effect_reorder` pass was fixed to respect memory dependencies
+   and keep terminators last, so `--opt` no longer exposes this bug on the
+   current test suite. However, the underlying regalloc weakness may still
+   surface with new code. Test with `--opt` enabled when changing regalloc.
 
 2. **Debug `eprintln!` statements** in `compiler.rs` and `elf64.rs`: There are
    temporary debug prints (DBG ASM, DBG ALU) added during debugging sessions.
@@ -116,6 +118,12 @@ touching them.
    assumes all fields are 8 bytes. This is a workaround — the proper fix is to
    use real struct layouts from `StructLayout` (like `codegen_c.rs` does).
 
+4. **Pre-existing native codegen bugs** (not optimizer-related): 19 tests fail
+   with both `--opt` and without (closures, float, ffi, collections, etc.).
+   These are native codegen issues, not optimizer regressions. The `--opt`
+   flag produces identical output to non-opt for all tests except 3 closure
+   tests that are broken in both paths.
+
 ## Coding Conventions
 
 1. **Codegen output**: use the `wln!` macro for formatted output in
@@ -124,11 +132,11 @@ touching them.
 2. **Error handling**: return `Result<_, Vec<String>>` for compiler errors
    (multiple errors collected). Don't use `panic!` for user-facing errors.
 
-3. **Test naming**: `test_<feature>.p` for feature tests, `test_pe_<feature>.p`
+3. **Test naming**: `test_<feature>.fd` for feature tests, `test_pe_<feature>.fd`
    for PE-emitter-specific tests. Keep the skip list in `tests/harness.rs`
    updated when adding tests for unimplemented features.
 
-4. **Adding a new test**: create `tests/test_<name>.p`, run `./verify.sh --save`
+4. **Adding a new test**: create `tests/test_<name>.fd`, run `./verify.sh --save`
    to update the baseline. If the test exercises a not-yet-implemented feature,
    add it to `is_skip_test()` in `tests/harness.rs`.
 
@@ -219,6 +227,6 @@ touching them.
 | `src/gpu.rs` | PIR → SPIR-V |
 | `src/embedded.rs` | FixedBufferAllocator, RealTime effect, HAL |
 | `src/hotreload.rs` | Native JIT + function-level change detection |
-| `src/cparser.rs` | C header parser → P FFI bindings |
+| `src/cparser.rs` | C header parser → Fides FFI bindings |
 | `src/compiler.rs` | Pipeline orchestration |
 | `src/main.rs` | CLI entry point |

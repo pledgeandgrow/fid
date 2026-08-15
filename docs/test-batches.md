@@ -1,23 +1,23 @@
 # Test Batches
 
-This document specifies all test batches for the P compiler so that
+This document specifies all test batches for the Fides compiler so that
 results from different backends are never confounded.
 
 ## Test Corpus
 
-All batches use the same corpus: every `.p` file in `tests/` (79 files as of
+All batches use the same corpus: every `.fd` file in `tests/` (79 files as of
 this writing).  Tests are sorted alphabetically by filename.
 
 ## Batches
 
-### Batch 1 — Interpreter (`pledgec run`)
+### Batch 1 — Interpreter (`fidesc run`)
 
 | Field | Value |
 |-------|-------|
-| Command | `pledgec run <file.p>` |
+| Command | `fidesc run <file.fd>` |
 | Pass criterion | No panic on stderr; exit code may be non-zero |
 | What it exercises | AST → IR → tree-walking interpreter |
-| Run by | `pledgec test` (built-in) |
+| Run by | `fidesc test` (built-in) |
 | Current score | 78/78 + 1/1 expected-fail |
 
 The interpreter is the reference implementation.  A test "passes" if the
@@ -25,28 +25,28 @@ interpreter does not panic or emit a compilation error.  Non-zero exit codes
 (e.g. `ret 42`) are **not** failures.  `test_trait_verify_fail` is an expected-fail
 test (correctly rejected at compile time).
 
-### Batch 2 — C Codegen (`pledgec ccompile`)
+### Batch 2 — C Codegen (`fidesc ccompile`)
 
 | Field | Value |
 |-------|-------|
-| Command | `pledgec ccompile <file.p> -o <exe>` then run `<exe>` |
+| Command | `fidesc ccompile <file.fd> -o <exe>` then run `<exe>` |
 | Pass criterion | stdout matches interpreter stdout exactly |
 | What it exercises | AST → IR → C source transpilation → external gcc |
-| Run by | `pledgec test` (built-in) |
+| Run by | `fidesc test` (built-in) |
 | Current score | 76/78 + 1/1 expected-fail |
 
-C codegen transpiles the P IR to C source code and compiles it with the
+C codegen transpiles the Fides IR to C source code and compiles it with the
 system C compiler (gcc/clang).  A test "passes" only if the executable's
 stdout exactly matches the interpreter's stdout.
 
-### Batch 3 — PE Emitter (`pledgec emit`)
+### Batch 3 — PE Emitter (`fidesc emit`)
 
 | Field | Value |
 |-------|-------|
-| Command | `pledgec emit <file.p> -o <exe>` |
+| Command | `fidesc emit <file.fd> -o <exe>` |
 | Pass criterion | Emission succeeds and output file exists |
 | What it exercises | AST → IR → PE bytecode emitter |
-| Run by | `pledgec test` (built-in) |
+| Run by | `fidesc test` (built-in) |
 | Current score | 78/78 + 1/1 expected-fail |
 
 The PE (Portable Executable) emitter produces a standalone native x86-64
@@ -54,14 +54,14 @@ executable. A test "passes" if emission succeeds and the output file is
 created.  It does **not** run the executable or compare output (PE binaries
 cannot run on Linux without Wine).
 
-### Batch 4 — Native x86-64 (`pledgec build`)
+### Batch 4 — Native x86-64 (`fidesc build`)
 
 | Field | Value |
 |-------|-------|
-| Command | `pledgec build <file.p> -o <exe>` then run `<exe>` |
+| Command | `fidesc build <file.fd> -o <exe>` then run `<exe>` |
 | Pass criterion | stdout matches interpreter stdout exactly |
 | What it exercises | PIR → L2 → L3 → x86-64 asm → ELF object → linker → native exe |
-| Run by | Custom script (`/tmp/test_native.sh`) — **not** `pledgec test` |
+| Run by | Custom script (`/tmp/test_native.sh`) — **not** `fidesc test` |
 | Current score | 41/79 |
 
 The native x86-64 backend is a self-contained toolchain: it generates x86-64
@@ -97,7 +97,7 @@ interpreter's stdout.
 
 ```bash
 cargo build --release
-./target/release/pledgec test
+./target/release/fidesc test
 ```
 
 ### Batch 4 (native x86-64)
@@ -106,8 +106,8 @@ cargo build --release
 #!/bin/bash
 cd /path/to/p-lang
 pass=0; fail=0
-for f in tests/*.p; do
-    name=$(basename "$f" .p)
+for f in tests/*.fd; do
+    name=$(basename "$f" .fd)
     interp_out=$(cargo run --quiet -- run "$f" 2>/dev/null)
     cargo run --quiet -- build "$f" -o "/tmp/test_$name" 2>/dev/null
     [ -f "/tmp/test_$name" ] || { fail=$((fail+1)); echo "FAIL: $name (build)"; continue; }
@@ -135,7 +135,7 @@ echo "=== Results: $pass pass, $fail fail ==="
 
 - **Never compare scores across batches.**  Each batch has different pass
   criteria (e.g. PE emitter only checks emission, not output correctness).
-- **Batch 4 is not run by `pledgec test`.**  It must be run separately.
+- **Batch 4 is not run by `fidesc test`.**  It must be run separately.
 - The interpreter (Batch 1) is the **reference** for Batches 2 and 4.
 - `test_trait_verify_fail` is expected to fail in all batches — it tests
   that the compiler correctly rejects invalid trait implementations.

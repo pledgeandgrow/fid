@@ -1,10 +1,10 @@
-//! Automated test harness for the Pledge compiler.
+//! Automated test harness for the Fides compiler.
 //!
-//! Tests three backends against every `.p` file in the `tests/` directory:
-//!   1. **Interpreter** (`pledgec run`) — baseline; all tests must pass.
-//!   2. **PE Emitter** (`pledgec emit`) — validates PE structure (cannot
+//! Tests three backends against every `.fd` file in the `tests/` directory:
+//!   1. **Interpreter** (`fidesc run`) — baseline; all tests must pass.
+//!   2. **PE Emitter** (`fidesc emit`) — validates PE structure (cannot
 //!      execute on Linux without Wine).
-//!   3. **C Codegen** (`pledgec ccompile`) — compiles to C, builds with gcc,
+//!   3. **C Codegen** (`fidesc ccompile`) — compiles to C, builds with gcc,
 //!      executes, and compares output against the interpreter.
 //!
 //! Run with: `cargo test`
@@ -17,27 +17,27 @@ use std::process::Command;
 /// false regressions in the harness.
 fn is_skip_test(name: &str) -> bool {
     matches!(name,
-        "test_comptime_basic.p"
-        | "test_comptime_func.p"
-        | "test_comptime_reflect.p"
-        | "test_comptime_serialize.p"
-        | "test_comptime_gen.p"
-        | "test_http.p"
-        | "test_json.p"
-        | "test_tensor.p"
-        | "test_simd.p"
-        | "test_parallel.p"
-        | "test_shape.p"
-        | "test_wasm.p"
-        | "test_allocator.p"
-        | "test_effect_handler.p"
-        | "test_asm.p"
-        | "test_bare.p"
-        | "test_boot.p"
-        | "test_interrupt.p"
-        | "test_mmu.p"
-        | "test_gat.p"
-        | "test_ffi_header.p"
+        "test_comptime_basic.fd"
+        | "test_comptime_func.fd"
+        | "test_comptime_reflect.fd"
+        | "test_comptime_serialize.fd"
+        | "test_comptime_gen.fd"
+        | "test_http.fd"
+        | "test_json.fd"
+        | "test_tensor.fd"
+        | "test_simd.fd"
+        | "test_parallel.fd"
+        | "test_shape.fd"
+        | "test_wasm.fd"
+        | "test_allocator.fd"
+        | "test_effect_handler.fd"
+        | "test_asm.fd"
+        | "test_bare.fd"
+        | "test_boot.fd"
+        | "test_interrupt.fd"
+        | "test_mmu.fd"
+        | "test_gat.fd"
+        | "test_ffi_header.fd"
     )
 }
 
@@ -45,11 +45,11 @@ fn is_skip_test(name: &str) -> bool {
 fn is_expect_fail_test(name: &str) -> bool {
     matches!(
         name,
-        "test_trait_verify_fail.p" | "test_budget_fail.p" | "test_sandbox_fail.p"
+        "test_trait_verify_fail.fd" | "test_budget_fail.fd" | "test_sandbox_fail.fd"
     )
 }
 
-/// Discover all `.p` test files in the `tests/` directory.
+/// Discover all `.fd` test files in the `tests/` directory.
 fn discover_tests() -> Vec<PathBuf> {
     // cargo test runs from the package root, so "tests/" should work.
     // Fall back to a path relative to the test file for robustness.
@@ -66,15 +66,15 @@ fn discover_tests() -> Vec<PathBuf> {
         .expect("Could not open tests/ directory")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |e| e == "p"))
+        .filter(|p| p.extension().map_or(false, |e| e == "fd"))
         .collect();
     tests.sort();
     tests
 }
 
-/// Build the pledgec binary if not already built.
+/// Build the fidesc binary if not already built.
 fn ensure_binary() -> PathBuf {
-    let bin = PathBuf::from("target/debug/pledgec");
+    let bin = PathBuf::from("target/debug/fidesc");
     if !bin.exists() {
         let status = Command::new("cargo")
             .args(["build"])
@@ -111,11 +111,11 @@ fn run_pe_emitter(bin: &Path, test: &Path, tmp: &Path) -> Result<(), String> {
         .arg("-o")
         .arg(&exe_path)
         .output()
-        .map_err(|e| format!("Failed to run pledgec emit: {}", e))?;
+        .map_err(|e| format!("Failed to run fidesc emit: {}", e))?;
 
     if !output.status.success() {
         return Err(format!(
-            "pledgec emit failed: {}",
+            "fidesc emit failed: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }
@@ -200,7 +200,7 @@ fn run_c_codegen(bin: &Path, test: &Path, tmp: &Path) -> Option<(i32, String)> {
 fn interpreter_all_tests() {
     let bin = ensure_binary();
     let tests = discover_tests();
-    assert!(!tests.is_empty(), "No .p test files found in tests/");
+    assert!(!tests.is_empty(), "No .fd test files found in tests/");
 
     let mut passed = 0;
     let mut failed = 0;
@@ -264,7 +264,7 @@ fn interpreter_all_tests() {
 fn pe_emitter_all_tests() {
     let bin = ensure_binary();
     let tests = discover_tests();
-    assert!(!tests.is_empty(), "No .p test files found in tests/");
+    assert!(!tests.is_empty(), "No .fd test files found in tests/");
 
     let tmp = PathBuf::from("/tmp/pledge_pe_tests");
     let _ = fs::create_dir(&tmp);
@@ -309,7 +309,7 @@ fn pe_emitter_all_tests() {
 fn c_codegen_matches_interpreter() {
     let bin = ensure_binary();
     let tests = discover_tests();
-    assert!(!tests.is_empty(), "No .p test files found in tests/");
+    assert!(!tests.is_empty(), "No .fd test files found in tests/");
 
     let tmp = PathBuf::from("/tmp/pledge_c_tests");
     let _ = fs::create_dir(&tmp);
@@ -384,12 +384,12 @@ fn c_codegen_matches_interpreter() {
 }
 
 /// Golden file test: compare interpreter output against stored golden files.
-/// To regenerate golden files: `pledgec run tests/<test>.p > tests/golden/<test>.txt`
+/// To regenerate golden files: `fidesc run tests/<test>.fd > tests/golden/<test>.txt`
 #[test]
 fn golden_files_match() {
     let bin = ensure_binary();
     let tests = discover_tests();
-    assert!(!tests.is_empty(), "No .p test files found in tests/");
+    assert!(!tests.is_empty(), "No .fd test files found in tests/");
 
     let golden_dir = PathBuf::from("tests/golden");
     if !golden_dir.exists() {
@@ -468,10 +468,10 @@ fn safety_checks_panic_in_debug_mode() {
         .expect("Could not open tests/safety/ directory")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |e| e == "p"))
+        .filter(|p| p.extension().map_or(false, |e| e == "fd"))
         .collect();
     safety_tests.sort();
-    assert!(!safety_tests.is_empty(), "No .p safety test files found in tests/safety/");
+    assert!(!safety_tests.is_empty(), "No .fd safety test files found in tests/safety/");
 
     let mut passed = 0;
     let mut failed = 0;
@@ -548,10 +548,10 @@ fn capability_security_enforced() {
         .expect("Could not open tests/capability/ directory")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |e| e == "p"))
+        .filter(|p| p.extension().map_or(false, |e| e == "fd"))
         .collect();
     cap_tests.sort();
-    assert!(!cap_tests.is_empty(), "No .p capability test files found in tests/capability/");
+    assert!(!cap_tests.is_empty(), "No .fd capability test files found in tests/capability/");
 
     let mut passed = 0;
     let mut failed = 0;
@@ -628,10 +628,10 @@ fn effect_system_enforced() {
         .expect("Could not open tests/effects/ directory")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |e| e == "p"))
+        .filter(|p| p.extension().map_or(false, |e| e == "fd"))
         .collect();
     effect_tests.sort();
-    assert!(!effect_tests.is_empty(), "No .p effect test files found in tests/effects/");
+    assert!(!effect_tests.is_empty(), "No .fd effect test files found in tests/effects/");
 
     let mut passed = 0;
     let mut failed = 0;
@@ -705,10 +705,10 @@ fn region_inference_enforced() {
         .expect("Could not open tests/regions/ directory")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |e| e == "p"))
+        .filter(|p| p.extension().map_or(false, |e| e == "fd"))
         .collect();
     region_tests.sort();
-    assert!(!region_tests.is_empty(), "No .p region test files found in tests/regions/");
+    assert!(!region_tests.is_empty(), "No .fd region test files found in tests/regions/");
 
     let mut passed = 0;
     let mut failed = 0;

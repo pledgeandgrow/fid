@@ -1,4 +1,4 @@
-# P Roadmap — Limitations & Pain Points
+# Fides Roadmap — Limitations & Pain Points
 
 > Addressing every major complaint from every major language.
 > Built on top of Phases 1-5 (claimed complete) and complementing Phases 6-8 (existing roadmap).
@@ -8,7 +8,7 @@
 
 The existing `docs/roadmap.md` defines Phases 1-8:
 - **Phases 1-5**: Claimed COMPLETE (Foundation, Safety, Power, Performance, Platform)
-- **Phase 6**: Self-Hosting (planned — rewrite compiler in P)
+- **Phase 6**: Self-Hosting (planned — rewrite compiler in Fides)
 - **Phase 7**: Ecosystem (planned — tooling, stdlib, migration, docs)
 - **Phase 8**: World Class (planned — formal verification, optimization parity, adoption)
 
@@ -27,7 +27,7 @@ This section has been **verified by reading source code, running tests, and exec
 
 | Test Group | README Claims | Actual (Verified) | Discrepancy |
 |------------|--------------|-------------------|-------------|
-| Unit tests (`cargo test --bin pledgec`) | 85/85 | **136/136** | README undercounts by 48 |
+| Unit tests (`cargo test --bin fidesc`) | 85/85 | **136/136** | README undercounts by 48 |
 | Harness tests (`cargo test --test harness`) | 8/8 | **8/8** (golden_files_match now passes) | README overcounts by 1 |
 | Interpreter (`run`) | 52/52 active | **78/78 + 1/1 expected-fail** (1 expected failure: test_trait_verify_fail) | README undercounts by 26 |
 | PE Emitter (`emit`) | 52/52 valid | **78/78 + 1/1 expected-fail** valid (1 expected failure: test_trait_verify_fail) | README undercounts by 26 |
@@ -38,30 +38,30 @@ This section has been **verified by reading source code, running tests, and exec
 
 | Feature | Roadmap Claims | README Claims | ACTUAL VERIFIED State | Verdict |
 |---------|---------------|--------------|----------------------|---------|
-| **FFI (`extern "C"`)** | Phase 3D COMPLETE | "Not parsed" | **WORKS** — parser parses it (parser.rs:120), AST has `ExternDecl` (ast.rs:580), lowerer registers externs (lower.rs:121), C codegen emits extern decls (codegen_c.rs:430), interpreter has C stubs (interp.rs:2389). `test_ffi.p` and `test_ffi_full.p` pass. | **README is WRONG** — FFI works |
-| **Const generics** | Phase 3C COMPLETE | "Parsed, pending" | **WORKS** — parser parses `ArrayConst` (parser.rs:883), mono handles it (mono.rs:58+), `test_const_generic.p` passes in interpreter | **README is WRONG** — const generics work |
-| **GATs** | Phase 3C COMPLETE | "Not parsed" | **WORKS** — `test_gat.p` passes in interpreter, outputs correct results | **README is WRONG** — GATs work |
-| **Effect handlers** | Phase 2B COMPLETE | "Syntax works, pending" | **WORKS** (basic) — `test_effect_handler.p` passes in interpreter. Full continuation semantics NOT verified. | **Partial** — basic dispatch works, continuations unclear |
+| **FFI (`extern "C"`)** | Phase 3D COMPLETE | "Not parsed" | **WORKS** — parser parses it (parser.rs:120), AST has `ExternDecl` (ast.rs:580), lowerer registers externs (lower.rs:121), C codegen emits extern decls (codegen_c.rs:430), interpreter has C stubs (interp.rs:2389). `test_ffi.fd` and `test_ffi_full.fd` pass. | **README is WRONG** — FFI works |
+| **Const generics** | Phase 3C COMPLETE | "Parsed, pending" | **WORKS** — parser parses `ArrayConst` (parser.rs:883), mono handles it (mono.rs:58+), `test_const_generic.fd` passes in interpreter | **README is WRONG** — const generics work |
+| **GATs** | Phase 3C COMPLETE | "Not parsed" | **WORKS** — `test_gat.fd` passes in interpreter, outputs correct results | **README is WRONG** — GATs work |
+| **Effect handlers** | Phase 2B COMPLETE | "Syntax works, pending" | **WORKS** (basic) — `test_effect_handler.fd` passes in interpreter. Full continuation semantics NOT verified. | **Partial** — basic dispatch works, continuations unclear |
 | **PIR optimizer** | Phase 4B COMPLETE | "Not in default pipeline" | **PARTIALLY WIRED** — wired into `build --opt` (compiler.rs:476) and `opt` command (main.rs:812). NOT wired into `emit` command (pe.rs bypasses PIR entirely). **⚠️ KNOWN BUG — register allocator clobbering:** `--opt` exposes a pre-existing register allocator issue where vregs for constants are not loaded into registers before use and can be clobbered by intervening instructions, producing wrong output. The inliner and topo-sort are fixed, but this regalloc bug is the sole reason `--opt` cannot be enabled by default. Until `regalloc.rs` is fixed, the optimizer remains opt-in only. | **README partially wrong** — it IS wired into `build`, but regalloc bug prevents default use |
 | **Register allocator** | Phase 4C COMPLETE | "Not in default pipeline" | **PARTIALLY WIRED** — wired into `codegen_x64::generate_asm` (codegen_x64.rs:39), used by `build` and `codegen` commands. NOT used by `emit` command (pe.rs uses its own stack-based codegen). | **README partially wrong** — it IS wired into `build`/`codegen`, but NOT `emit` |
 | **Peephole optimizer** | Phase 4B COMPLETE | Not mentioned | **WIRED** — always on in `build` command (compiler.rs:487). 9 passes: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection. | **Works** and enabled by default |
-| **ELF64 executable** | Phase 4D COMPLETE | "Partial, WIP" | **WORKS** — `build --target x86-64` produces working ELF64 executables on Linux (zero external tools). `hello.p` builds to 3468 bytes and runs correctly. `--opt` produces 3316 bytes. | **Roadmap was wrong** — executable now works |
-| **ELF64 object files** | Phase 4C COMPLETE | "Partial" | **WORKS** — `codegen --elf` produces valid relocatable objects (readelf confirms, 13279 bytes for hello.p) | **Works** |
+| **ELF64 executable** | Phase 4D COMPLETE | "Partial, WIP" | **WORKS** — `build --target x86-64` produces working ELF64 executables on Linux (zero external tools). `hello.fd` builds to 3468 bytes and runs correctly. `--opt` produces 3316 bytes. | **Roadmap was wrong** — executable now works |
+| **ELF64 object files** | Phase 4C COMPLETE | "Partial" | **WORKS** — `codegen --elf` produces valid relocatable objects (readelf confirms, 13279 bytes for hello.fd) | **Works** |
 | **Mach-O emission** | Phase 4D COMPLETE | Not mentioned | **WORKS** (objects) — `codegen --macho` produces 9248-byte Mach-O object file. Executable emission NOT tested (no macOS). | **Partial** — objects work, executables unverified |
 | **COFF emission** | Phase 4C COMPLETE | Not mentioned | **WORKS** — `codegen --coff` produces 9677-byte COFF object file. | **Works** for objects |
 | **ARM64 codegen** | Phase 4C COMPLETE | Not mentioned | **WORKS** (assembly) — `codegen --target arm64` produces valid ARM64 assembly. `build --target arm64` produces ELF object (not executable). | **Partial** — assembly works, no executable |
 | **RISC-V codegen** | Phase 4C COMPLETE | Not mentioned | **WORKS** (assembly) — `codegen --target riscv` produces valid RISC-V assembly. `build --target riscv` produces ELF object (not executable). | **Partial** — assembly works, no executable |
 | **WASM backend** | Phase 5D COMPLETE | "PIR -> WASM binary" | **WORKS** — `wasm` command produces valid WASM binary (magic header confirmed). 2 unit tests pass. | **Works** but minimal verification |
 | **Hot reload / JIT** | Phase 4E COMPLETE | Not mentioned | **WORKS** — `watch` command compiles to native ELF64 via `build_executable` pipeline, runs as child process, detects function-level changes via L2 IR hashing. Reports added/modified/removed functions on each reload. `--opt` flag enables L2 optimizer. `--no-run` compiles only. | **Works** — native JIT + function diff |
-| **GPU backend** | Phase 5C COMPLETE | Not mentioned | **WORKS** — `gpu` command produces 340-byte SPIR-V binary. `gpu.rs` has `generate_spirv` and `generate_ptx` functions, wired via `pledgec gpu` CLI command (main.rs:1063). | **Works** — produces SPIR-V binary |
+| **GPU backend** | Phase 5C COMPLETE | Not mentioned | **WORKS** — `gpu` command produces 340-byte SPIR-V binary. `gpu.rs` has `generate_spirv` and `generate_ptx` functions, wired via `fidesc gpu` CLI command (main.rs:1063). | **Works** — produces SPIR-V binary |
 | **Bare metal** | Phase 5A COMPLETE | "Works for flat binary" | **WORKS** — `emit --bare` produces flat binary | **Verified** |
 | **Boot mode** | Phase 5A COMPLETE | Not mentioned | **WORKS** — `emit --boot` produces multiboot2 binary | **Verified** |
 | **async/await/spawn** | Phase 2B "replaced by effects" | "Parsed, not implemented" | **TOKENIZED ONLY** — tokens exist in lexer (lexer.rs:107-111) but parser does NOT handle them (no match in parser.rs). Not parsed into AST nodes. | **README is MISLEADING** — not even parsed, just tokenized |
-| **`#[test]` attribute** | Not claimed | "Parsed but not executed" | **VERIFIED** — parser parses attributes (parser.rs:2134) but `pledgec test` runs file-based tests, not `#[test]` functions. `test` command (main.rs:616) iterates `.p` files. | **Correct** — parsed but not executed |
+| **`#[test]` attribute** | Not claimed | "Parsed but not executed" | **VERIFIED** — parser parses attributes (parser.rs:2134) but `fidesc test` runs file-based tests, not `#[test]` functions. `test` command (main.rs:616) iterates `.fd` files. | **Correct** — parsed but not executed |
 | **`#[derive]`** | Not claimed | "Parsed, not implemented" | **VERIFIED** — attributes are parsed generically but no derive logic exists | **Correct** — parsed but not implemented |
-| **HTTP server stdlib** | Phase 5D COMPLETE | "Works in interpreter" | **INTERPRETER ONLY** — `stdlib/http.p` works in interpreter. C codegen test FAILS (`test_http` in C codegen failures). PE backend unverified. | **Partial** — interpreter only |
-| **JSON stdlib** | Phase 5D COMPLETE | "Works in interpreter" | **INTERPRETER ONLY** — `stdlib/json.p` works in interpreter. C codegen test FAILS (`test_json` in C codegen failures). | **Partial** — interpreter only |
-| **DB stdlib** | Phase 5D COMPLETE | "Works in interpreter" | **INTERPRETER ONLY** — `stdlib/db.p` works in interpreter. C codegen test FAILS (`test_db` in C codegen failures). | **Partial** — interpreter only |
+| **HTTP server stdlib** | Phase 5D COMPLETE | "Works in interpreter" | **INTERPRETER ONLY** — `stdlib/http.fd` works in interpreter. C codegen test FAILS (`test_http` in C codegen failures). PE backend unverified. | **Partial** — interpreter only |
+| **JSON stdlib** | Phase 5D COMPLETE | "Works in interpreter" | **INTERPRETER ONLY** — `stdlib/json.fd` works in interpreter. C codegen test FAILS (`test_json` in C codegen failures). | **Partial** — interpreter only |
+| **DB stdlib** | Phase 5D COMPLETE | "Works in interpreter" | **INTERPRETER ONLY** — `stdlib/db.fd` works in interpreter. C codegen test FAILS (`test_db` in C codegen failures). | **Partial** — interpreter only |
 | **SIMD** | Phase 5C COMPLETE | Not mentioned | **INTERPRETER ONLY** — `test_simd` FAILS in C codegen. PE backend has SSE2 encoding (claimed). | **Partial** — interpreter + PE claimed, C codegen fails |
 | **Tensor** | Phase 5C COMPLETE | Not mentioned | **INTERPRETER ONLY** — `test_tensor` FAILS in C codegen. | **Partial** — interpreter only |
 | **Inline assembly** | Phase 5A COMPLETE | "Yes" all backends | **ALL BACKENDS** — `test_asm` passes in C codegen (asm emitted as comments, matching interpreter no-op). | **Complete** |
@@ -105,7 +105,7 @@ These tests pass in the interpreter but FAIL in C codegen (expected failures):
 - REPL, sourcemap, verify — commands exist ✅
 
 **BUILT BUT NOT WIRED IN / BROKEN:**
-- **`#[test]` execution** — parsed but `pledgec test` runs file-based tests, not `#[test]` functions ❌
+- **`#[test]` execution** — parsed but `fidesc test` runs file-based tests, not `#[test]` functions ❌
 - **`#[derive]`** — parsed but no derive logic ❌
 - **async/await/spawn** — tokenized but not parsed into AST ❌
 - **L2 optimizer (`--opt`)** — works for simple programs but exposes pre-existing register allocator bug on complex programs (constants clobbered by intervening instructions) — this is the sole reason `--opt` is not enabled by default ⚠️
@@ -126,7 +126,7 @@ These tests pass in the interpreter but FAIL in C codegen (expected failures):
 **ROADMAP CLAIMS THAT ARE WRONG (should be corrected):**
 1. Phase 5D "HTTP/JSON/DB work" → **PARTIAL, interpreter only — C codegen fails**
 
-**Conclusion:** The core compiler (lexer → parser → typechecker → IR → interpreter/PE/C codegen/ELF64) is solid and well-tested. The PIR optimizer and register allocator are wired into the `build`/`codegen` commands but NOT the `emit` command. ELF64 executables work on Linux (zero external tools). The GPU/SPIR-V backend is wired via `pledgec gpu`. The peephole optimizer (9 passes) is always on in `build`. Hot reload (`pledgec watch`) is fully implemented — native JIT via ELF64 + function-level change detection. The L2 optimizer works for simple programs but has a known register allocator bug (constants not loaded into registers before use can be clobbered by intervening instructions) that prevents `--opt` from being enabled by default. The README and features.md were significantly outdated — they have been corrected.
+**Conclusion:** The core compiler (lexer → parser → typechecker → IR → interpreter/PE/C codegen/ELF64) is solid and well-tested. The PIR optimizer and register allocator are wired into the `build`/`codegen` commands but NOT the `emit` command. ELF64 executables work on Linux (zero external tools). The GPU/SPIR-V backend is wired via `fidesc gpu`. The peephole optimizer (9 passes) is always on in `build`. Hot reload (`fidesc watch`) is fully implemented — native JIT via ELF64 + function-level change detection. The L2 optimizer works for simple programs but has a known register allocator bug (constants not loaded into registers before use can be clobbered by intervening instructions) that prevents `--opt` from being enabled by default. The README and features.md were significantly outdated — they have been corrected.
 
 ---
 
@@ -158,14 +158,14 @@ This catalog drives the 10 phases below. Each pain point is tagged with which la
 - **C++**: No standard error type — exceptions, return codes, `expected`, `variant`, `StatusOr` all coexist
 - **Python**: Exceptions everywhere, no compile-time checking
 - **JS**: Thrown errors are untyped, `catch(e)` gives `any`
-- **→ Already solved** — P has `Result<T,E>` + `?` operator + `try` blocks (Phase 1). **Phase L8** adds typed catches.
+- **→ Already solved** — Fides has `Result<T,E>` + `?` operator + `try` blocks (Phase 1). **Phase L8** adds typed catches.
 
 ### 4. Memory Management
 - **C/C++**: Undefined behavior (use-after-free, buffer overflows, data races), manual management, move semantics confusion
 - **Rust**: Borrow checker learning curve, lifetime annotations, `Pin`/`Unpin` complexity, "fighting the compiler"
 - **Go/Java/Python/JS**: GC pauses, no control over allocation
 - **Zig**: Explicit allocators everywhere — verbose
-- **→ Already solved** — P has region-based safety (Phase 2). **Phase L1** verifies it works in all backends.
+- **→ Already solved** — Fides has region-based safety (Phase 2). **Phase L1** verifies it works in all backends.
 
 ### 5. Type System Limitations
 - **Go**: Limited generics (no generic methods), no sum types, no pattern matching (until recently), no immutability, no operator overloading
@@ -202,7 +202,7 @@ This catalog drives the 10 phases below. Each pain point is tagged with which la
 - **Scala**: Implicits, given/using, type classes, category theory
 - **Swift**: Protocol-oriented programming learning curve, ABI complexity
 - **Haskell**: Monads, type theory, string fragmentation (String/Text/ByteString/ShortText), Cabal hell
-- **→ P design principles already address this** (one way to do things, comptime replaces macros). **Phase L10** keeps it simple.
+- **→ Fides design principles already address this** (one way to do things, comptime replaces macros). **Phase L10** keeps it simple.
 
 ### 9. FFI & Interop
 - **Rust**: FFI exists but unsafe and verbose, no automatic bindings
@@ -211,7 +211,7 @@ This catalog drives the 10 phases below. Each pain point is tagged with which la
 - **Python**: C extensions painful (Cython, pybind11, cffi compete)
 - **Java**: JNI notoriously awful
 - **JS**: N-API complex
-- **P**: Roadmap claims Phase 3D complete but README says "Not parsed" — **major gap**
+- **Fides**: Roadmap claims Phase 3D complete but README says "Not parsed" — **major gap**
 - **→ Phase L6** (Seamless FFI & C Interop)
 
 ### 10. Cross-Platform & Targets
@@ -219,7 +219,7 @@ This catalog drives the 10 phases below. Each pain point is tagged with which la
 - **Go**: Excellent cross-compilation
 - **Zig**: Cross-compilation is a strength — "bring your own OS"
 - **C++**: Platform fragmentation — different compilers, ABIs, stdlib implementations
-- **P**: Linux x86-64 ELF64 executables work (zero external tools). Windows x64 PE executables work. ARM64/RISC-V produce valid assembly + ELF objects. Mach-O/COFF objects work. No macOS executable verification.
+- **Fides**: Linux x86-64 ELF64 executables work (zero external tools). Windows x64 PE executables work. ARM64/RISC-V produce valid assembly + ELF objects. Mach-O/COFF objects work. No macOS executable verification.
 - **→ Phase L2** (Cross-Platform Native Execution)
 
 ### 11. Debugging & Tooling
@@ -235,7 +235,7 @@ This catalog drives the 10 phases below. Each pain point is tagged with which la
 - **Rust**: Intentionally small stdlib, everything is a crate, fragmented (time vs chrono, log vs tracing)
 - **C++**: Huge but inconsistent, no networking/JSON/HTTP/crypto
 - **Zig**: Growing but small, I/O just reworked
-- **P**: Minimal — Vec, HashMap, Option, Result, String. Has http.p/json.p/db.p but only work in interpreter.
+- **Fides**: Minimal — Vec, HashMap, Option, Result, String. Has http.fd/json.fd/db.fd but only work in interpreter.
 - **→ Phase L4** (Comprehensive Standard Library)
 
 ### 13. Language-Specific Complaints
@@ -260,7 +260,7 @@ Phase L1: Pipeline Integration          ← Close claimed-vs-actual gap
 Phase L2: Cross-Platform Native         ← Linux, macOS, cross-compilation
 Phase L3: Concurrency Without Coloring  ← Effect handlers, green threads, data race safety
 Phase L4: Comprehensive Stdlib          ← net, fs, io, time, json, regex, crypto, http
-Phase L5: Package Manager & Build       ← pledge.toml, registry, lockfiles
+Phase L5: Package Manager & Build       ← fides.toml, registry, lockfiles
 Phase L6: Seamless FFI & C Interop      ← extern "C", auto-bindings, transpiler
 Phase L7: Developer Tooling             ← LSP, debugger, profiler, formatter, linter
 Phase L8: Type System Completeness      ← Named args, reflection, specialization, verification
@@ -303,30 +303,30 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 #### L1C — Fix ELF64 Executable (DONE)
 - [x] **FIXED:** `build --target x86-64` now produces working ELF64 executables on Linux (zero external tools)
 - [x] **VERIFIED WORKING:** ELF64 object files work (`codegen --elf` produces valid relocatable objects)
-- [x] `hello.p` builds to 3468 bytes, runs correctly. `--opt` produces 3316 bytes.
-- [x] `pledgec build file.p -o app` on Linux produces a working ELF64 executable
+- [x] `hello.fd` builds to 3468 bytes, runs correctly. `--opt` produces 3316 bytes.
+- [x] `fidesc build file.fd -o app` on Linux produces a working ELF64 executable
 - [ ] Verify with `readelf` and actual execution on Linux
 - [ ] **Already built:** ELF64 headers, symbol tables, relocations, `linker.rs` (link function exists)
 - [ ] **Not redoing:** ELF64 format handling — fixing the link/relocation bug
 
 #### L1D — FFI Already Works (Update Docs)
-- [x] **VERIFIED WORKING:** FFI (`extern "C"`) IS parsed (parser.rs:120), lowered (lower.rs:121), C codegen emits externs (codegen_c.rs:430), interpreter has C stubs (interp.rs:2389). `test_ffi.p` and `test_ffi_full.p` pass.
-- [x] **VERIFIED WORKING:** `pledgec parse-header` generates bindings (cparser.rs)
+- [x] **VERIFIED WORKING:** FFI (`extern "C"`) IS parsed (parser.rs:120), lowered (lower.rs:121), C codegen emits externs (codegen_c.rs:430), interpreter has C stubs (interp.rs:2389). `test_ffi.fd` and `test_ffi_full.fd` pass.
+- [x] **VERIFIED WORKING:** `fidesc parse-header` generates bindings (cparser.rs)
 - [x] **ACTION:** Update README and features.md to remove "C FFI: Not parsed" — this is incorrect (DONE Aug 2026)
 - [ ] Verify FFI works in PE backend (currently only verified in interpreter and C codegen)
 - [ ] **Already built and working:** `extern "C"` syntax, `parse-header`, test files
 - [ ] **Not redoing:** FFI implementation — just fixing docs and verifying PE backend
 
 #### L1E — Verify ARM64 and RISC-V Codegen Produce Working Binaries
-- [ ] Test `pledgec build --target arm64` produces an executable that runs on ARM64 hardware (or QEMU)
-- [ ] Test `pledgec build --target riscv` produces an executable that runs on RISC-V hardware (or QEMU)
+- [ ] Test `fidesc build --target arm64` produces an executable that runs on ARM64 hardware (or QEMU)
+- [ ] Test `fidesc build --target riscv` produces an executable that runs on RISC-V hardware (or QEMU)
 - [ ] Fix any codegen bugs found
 - [ ] **Already built:** `codegen_arm64.rs`, `codegen_riscv.rs`, ELF objects with correct machine types
 - [ ] **Not redoing:** The codegen backends — just verifying and fixing
 
 #### L1F — Verify Mach-O Emission
 - [ ] Test `macho.rs` produces valid Mach-O 64-bit object files
-- [ ] Test `pledgec build --target x86-64-macos` produces a working macOS executable
+- [ ] Test `fidesc build --target x86-64-macos` produces a working macOS executable
 - [ ] Verify with `otool` and actual execution on macOS
 - [ ] **Already built (claimed):** `macho.rs` — needs verification
 - [ ] **Not redoing:** Mach-O format handling (if it works)
@@ -340,8 +340,8 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 - [x] 8 unit tests pass (function diff, persistent state, compile_and_run, watcher, debugger)
 
 #### L1H — Const Generics and GATs Already Work (Update Docs)
-- [x] **VERIFIED WORKING:** Const generics (`[T; N]`) work in interpreter — `test_const_generic.p` passes
-- [x] **VERIFIED WORKING:** GATs work in interpreter — `test_gat.p` passes
+- [x] **VERIFIED WORKING:** Const generics (`[T; N]`) work in interpreter — `test_const_generic.fd` passes
+- [x] **VERIFIED WORKING:** GATs work in interpreter — `test_gat.fd` passes
 - [x] **ACTION:** Update README to remove "Const generics: Parsed, pending" and "GATs: Not parsed" — both are incorrect (DONE Aug 2026)
 - [ ] Verify const generics and GATs work in PE and C codegen backends (currently only verified in interpreter)
 - [ ] **Already built and working:** Parser, mono, typechecker support for const generics and GATs
@@ -359,7 +359,7 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 #### L1J — Wire GPU Backend (Currently Dead Code)
 - [x] **VERIFIED:** `gpu.rs` has `generate_spirv` (gpu.rs:26) and `generate_ptx` (gpu.rs:40) but NO CLI command calls them
 - [x] **VERIFIED:** `mod gpu;` is imported in main.rs but completely unused
-- [ ] Add CLI command: `pledgec gpu <file.p> --target spirv|ptx -o <output>`
+- [ ] Add CLI command: `fidesc gpu <file.fd> --target spirv|ptx -o <output>`
 - [ ] Wire `generate_spirv` and `generate_ptx` into the command
 - [ ] **Already built:** SPIR-V codegen, PTX codegen, disassembler
 - [ ] **Not redoing:** The GPU codegen — adding a CLI command to expose it
@@ -371,11 +371,11 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 - [ ] **Not redoing:** Any functionality — just cleanup
 
 ### Exit Criteria
-- [ ] `pledgec emit` uses PIR optimizer + register allocator (currently bypasses both)
-- [ ] `pledgec build` uses optimizer by default (currently requires `--opt` flag)
-- [x] `pledgec build file.p -o app` on Linux produces a working ELF64 executable (verified — zero external tools)
-- [x] `pledgec watch` compiles to native ELF64 and runs on file change (with function-level diff)
-- [ ] `pledgec gpu` command exposes SPIR-V/PTX codegen (currently dead code)
+- [ ] `fidesc emit` uses PIR optimizer + register allocator (currently bypasses both)
+- [ ] `fidesc build` uses optimizer by default (currently requires `--opt` flag)
+- [x] `fidesc build file.fd -o app` on Linux produces a working ELF64 executable (verified — zero external tools)
+- [x] `fidesc watch` compiles to native ELF64 and runs on file change (with function-level diff)
+- [ ] `fidesc gpu` command exposes SPIR-V/PTX codegen (currently dead code)
 - [ ] FFI verified working in PE backend (already works in interpreter + C codegen)
 - [ ] Const generics and GATs verified in PE/C backends (already work in interpreter)
 - [ ] HTTP/JSON/DB/SIMD/Tensor work in C codegen (currently fail)
@@ -389,11 +389,11 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 
 ## Phase L2 — Cross-Platform Native Execution
 
-**Goal:** P runs natively on Linux, macOS, and Windows. Cross-compilation from any host to any target.
+**Goal:** Fides runs natively on Linux, macOS, and Windows. Cross-compilation from any host to any target.
 
 **Status:** Not started
 
-**Why:** Windows-only PE is a death sentence for adoption. Rust, Go, and Zig all have excellent cross-platform support. P needs the same.
+**Why:** Windows-only PE is a death sentence for adoption. Rust, Go, and Zig all have excellent cross-platform support. Fides needs the same.
 
 **Depends on:** Phase L1 (ELF64 and Mach-O must work first)
 
@@ -401,7 +401,7 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 
 #### L2A — Linux ELF64 Executable Pipeline
 - [ ] Full ELF64 executable emission (program headers, relocation resolution, entry point)
-- [ ] `pledgec build file.p -o app` produces a working Linux executable
+- [ ] `fidesc build file.fd -o app` produces a working Linux executable
 - [ ] Test on Ubuntu, Debian, Arch, Alpine (different libc versions)
 - [ ] Static linking option (`--static`) — no libc dependency
 - [ ] **Already built:** `elf64.rs` (headers, symbols, relocations), `linker.rs` (incremental, DCE)
@@ -409,18 +409,18 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 
 #### L2B — macOS Mach-O Executable Pipeline
 - [ ] Full Mach-O executable emission (LC_SEGMENT, LINKEDIT, symbol table)
-- [ ] `pledgec build file.p -o app` produces a working macOS executable
+- [ ] `fidesc build file.fd -o app` produces a working macOS executable
 - [ ] Test on Intel and Apple Silicon (x86-64 and ARM64)
 - [ ] Universal binary support (`--target universal` produces fat binary)
 - [ ] **Already built (claimed):** `macho.rs` (object files)
 - [ ] **Not redoing:** Mach-O format — extending to executable emission
 
 #### L2C — Cross-Compilation
-- [ ] `pledgec build --target x86-64-linux` from macOS/Windows host
-- [ ] `pledgec build --target arm64-linux` from any host
-- [ ] `pledgec build --target x86-64-macos` from Linux/Windows host
-- [ ] `pledgec build --target x86-64-windows` from Linux/macOS host
-- [ ] `pledgec build --target riscv64-embedded` from any host
+- [ ] `fidesc build --target x86-64-linux` from macOS/Windows host
+- [ ] `fidesc build --target arm64-linux` from any host
+- [ ] `fidesc build --target x86-64-macos` from Linux/Windows host
+- [ ] `fidesc build --target x86-64-windows` from Linux/macOS host
+- [ ] `fidesc build --target riscv64-embedded` from any host
 - [ ] Target triple syntax: `<arch>-<os>-<abi>` (e.g., `arm64-linux-gnu`, `x86-64-windows-msvc`)
 - [ ] **Already built:** Multi-arch codegen (x86-64, ARM64, RISC-V), multi-format emission (PE, ELF, Mach-O)
 - [ ] **Not redoing:** Codegen backends — just wiring cross-compilation
@@ -433,20 +433,20 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 - [ ] **Not redoing:** Calling convention implementation — documenting and freezing
 
 #### L2E — WASM Target Verification
-- [ ] Verify `pledgec wasm file.p -o out.wasm` produces valid WASM that runs in browsers
+- [ ] Verify `fidesc wasm file.fd -o out.wasm` produces valid WASM that runs in browsers
 - [ ] Test with Node.js, Deno, Bun, browser WASM runtime
 - [ ] WASI support for system access
 - [ ] **Already built:** `wasm.rs` (PIR -> WASM binary, 2 unit tests)
 - [ ] **Not redoing:** WASM backend — verifying and extending
 
 ### Exit Criteria
-- [ ] `pledgec build file.p` works on Linux, macOS, and Windows natively
+- [ ] `fidesc build file.fd` works on Linux, macOS, and Windows natively
 - [ ] Cross-compilation from any host to any supported target
 - [ ] Static and dynamic linking options
 - [ ] WASM target runs in browsers and WASI runtimes
 - [ ] ABI documented and stable
 
-**Success metric:** Write P on Linux, compile for macOS, Windows, ARM64, RISC-V, and WASM — all from one command.
+**Success metric:** Write Fides on Linux, compile for macOS, Windows, ARM64, RISC-V, and WASM — all from one command.
 
 ---
 
@@ -463,7 +463,7 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 - JS/Python: function coloring, GIL
 - Swift/Kotlin: bridging complexity
 
-P's effect system is the foundation — effect handlers can replace async/await entirely (per design principles: "One concurrency model: effect handlers, not async/await + threads + channels").
+Fides's effect system is the foundation — effect handlers can replace async/await entirely (per design principles: "One concurrency model: effect handlers, not async/await + threads + channels").
 
 ### Milestones
 
@@ -526,7 +526,7 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] Any function callable from any context (no coloring)
 - [ ] Built-in async I/O on Linux, macOS, Windows
 
-**Success metric:** Write a concurrent web server in P that is shorter, safer, and faster than equivalent Rust+tokio, Go, and Node.js code. No `async`, no `await`, no `Send`/`Sync` bounds, no runtime selection.
+**Success metric:** Write a concurrent web server in Fides that is shorter, safer, and faster than equivalent Rust+tokio, Go, and Node.js code. No `async`, no `await`, no `Send`/`Sync` bounds, no runtime selection.
 
 ---
 
@@ -534,9 +534,9 @@ P's effect system is the foundation — effect handlers can replace async/await 
 
 **Goal:** "Batteries included" like Go. One canonical implementation per domain. No Rust-style fragmentation.
 
-**Status:** Not started (minimal stdlib exists: Vec, HashMap, Option, Result, String + http.p, json.p, db.p, simd.p, tensor.p)
+**Status:** Not started (minimal stdlib exists: Vec, HashMap, Option, Result, String + http.fd, json.fd, db.fd, simd.fd, tensor.fd)
 
-**Why:** People pick Go because "batteries included." Rust's intentionally small stdlib causes fragmentation (time vs chrono, log vs tracing). C++ has no networking/JSON/HTTP/crypto. P needs a comprehensive stdlib to compete.
+**Why:** People pick Go because "batteries included." Rust's intentionally small stdlib causes fragmentation (time vs chrono, log vs tracing). C++ has no networking/JSON/HTTP/crypto. Fides needs a comprehensive stdlib to compete.
 
 **Depends on:** Phase L1 (stdlib must work in native backends, not just interpreter)
 
@@ -573,12 +573,12 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] **Not built:** This is new
 
 #### L4D — JSON and Serialization
-- [ ] Verify `stdlib/json.p` works in all backends (Phase 5D claims complete)
+- [ ] Verify `stdlib/json.fd` works in all backends (Phase 5D claims complete)
 - [ ] `json::parse(str) -> Value` — parse JSON string
 - [ ] `json::serialize(Value) -> String` — serialize to JSON
 - [ ] Comptime-derived serialization: `#[derive(Serialize, Deserialize)]` via comptime reflection
 - [ ] Binary serialization format (compact, typed)
-- [ ] **Already built (claimed):** `stdlib/json.p`, `p_json_*` builtins
+- [ ] **Already built (claimed):** `stdlib/json.fd`, `p_json_*` builtins
 - [ ] **Not redoing:** JSON parser — verifying and extending with comptime derivation
 
 #### L4E — Regex
@@ -597,12 +597,12 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] **Design principle:** Capabilities — crypto requires explicit `Crypto` capability grant
 
 #### L4G — HTTP (Verify and Extend)
-- [ ] Verify `stdlib/http.p` works in PE and ELF backends (not just interpreter)
+- [ ] Verify `stdlib/http.fd` works in PE and ELF backends (not just interpreter)
 - [ ] `http::Server` — route, handle, listen (via effect handlers for async)
 - [ ] `http::Client` — get, post, put, delete, with headers and body
 - [ ] Request/response types, middleware, routing
 - [ ] HTTPS/TLS support (via crypto module)
-- [ ] **Already built (partial):** `stdlib/http.p`, `p_http_*` builtins (Phase 5D)
+- [ ] **Already built (partial):** `stdlib/http.fd`, `p_http_*` builtins (Phase 5D)
 - [ ] **Not redoing:** HTTP parsing — extending to full server/client
 
 #### L4H — Process and Environment
@@ -616,15 +616,15 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] **Design principle:** Capabilities — process spawning requires `Spawn` capability
 
 #### L4I — Math (Verify and Extend)
-- [ ] Verify `stdlib/simd.p` and `stdlib/tensor.p` work in all backends
+- [ ] Verify `stdlib/simd.fd` and `stdlib/tensor.fd` work in all backends
 - [ ] `math` module: sin, cos, tan, sqrt, pow, log, exp, floor, ceil, round, abs, min, max
 - [ ] `complex` module: Complex number type and operations
 - [ ] `Random` type — non-crypto PRNG (xorshift, PCG)
-- [ ] **Already built:** `stdlib/simd.p` (SSE2), `stdlib/tensor.p` (Phase 5C)
+- [ ] **Already built:** `stdlib/simd.fd` (SSE2), `stdlib/tensor.fd` (Phase 5C)
 - [ ] **Not redoing:** SIMD/tensor — adding standard math functions
 
 #### L4J — Testing Framework
-- [ ] `#[test]` attribute — execute tests with `pledgec test` (currently parsed but not executed)
+- [ ] `#[test]` attribute — execute tests with `fidesc test` (currently parsed but not executed)
 - [ ] `assert!`, `assert_eq!`, `assert_ne!` macros (or comptime equivalents)
 - [ ] Test runner: discover, execute, report results
 - [ ] `#[should_panic]` — assert that a test panics
@@ -636,10 +636,10 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] All stdlib modules work in interpreter, PE, ELF, and C codegen backends
 - [ ] Write a REST API server using only stdlib (http + json + crypto + fs)
 - [ ] Write a CLI tool using only stdlib (env + process + fs + io)
-- [ ] `pledgec test` runs `#[test]` functions
+- [ ] `fidesc test` runs `#[test]` functions
 - [ ] One canonical implementation per domain (no fragmentation)
 
-**Success metric:** A developer can build a real web application using only P stdlib — no external dependencies needed. Like Go, but with memory safety, capability security, and effect-based concurrency.
+**Success metric:** A developer can build a real web application using only Fides stdlib — no external dependencies needed. Like Go, but with memory safety, capability security, and effect-based concurrency.
 
 ---
 
@@ -649,14 +649,14 @@ P's effect system is the foundation — effect handlers can replace async/await 
 
 **Status:** Not started
 
-**Why:** Cargo is why Rust won. CMake is why C++ lost developers. Python's packaging zoo is a running joke. P needs this from day one.
+**Why:** Cargo is why Rust won. CMake is why C++ lost developers. Python's packaging zoo is a running joke. Fides needs this from day one.
 
 **Overlaps with:** Existing roadmap Phase 7A (Tooling) — this phase is more detailed
 
 ### Milestones
 
-#### L5A — Project File (`pledge.toml`)
-- [ ] `pledge.toml` — project manifest (name, version, edition, dependencies, targets)
+#### L5A — Project File (`fides.toml`)
+- [ ] `fides.toml` — project manifest (name, version, edition, dependencies, targets)
 - [ ] `[package]` section: name, version, authors, edition, description, license
 - [ ] `[dependencies]` section: package = "version" or package = { version = "...", features = [...] }
 - [ ] `[dev-dependencies]` section: test-only dependencies
@@ -664,36 +664,36 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] `[[bin]]` and `[[lib]]` sections: multiple targets per project
 - [ ] **Not built:** This is new
 
-#### L5B — Build System (`pledge build`)
-- [ ] `pledge build` — compile project (reads `pledge.toml`, compiles all targets)
-- [ ] `pledge build --release` — optimized build (enables PIR optimizer, LTO)
-- [ ] `pledge build --target <triple>` — cross-compile
-- [ ] `pledge run` — build and run main binary
-- [ ] `pledge test` — build and run all tests
-- [ ] `pledge check` — type-check without codegen (fast feedback)
-- [ ] `pledge clean` — remove build artifacts
+#### L5B — Build System (`fides build`)
+- [ ] `fides build` — compile project (reads `fides.toml`, compiles all targets)
+- [ ] `fides build --release` — optimized build (enables PIR optimizer, LTO)
+- [ ] `fides build --target <triple>` — cross-compile
+- [ ] `fides run` — build and run main binary
+- [ ] `fides test` — build and run all tests
+- [ ] `fides check` — type-check without codegen (fast feedback)
+- [ ] `fides clean` — remove build artifacts
 - [ ] Incremental builds (only recompile changed files — use `linker.rs::IncrementalLinker`)
-- [ ] **Already built:** `linker.rs::IncrementalLinker` (caches by content hash), `pledgec build` command
+- [ ] **Already built:** `linker.rs::IncrementalLinker` (caches by content hash), `fidesc build` command
 - [ ] **Not redoing:** Incremental linker — wrapping in project-aware build system
 
-#### L5C — Package Manager (`pledge add/remove/publish`)
-- [ ] `pledge add <package>` — add dependency to `pledge.toml`, download
-- [ ] `pledge remove <package>` — remove dependency
-- [ ] `pledge update` — update dependencies within version constraints
-- [ ] `pledge publish` — publish package to registry
-- [ ] `pledge search <query>` — search registry
+#### L5C — Package Manager (`fides add/remove/publish`)
+- [ ] `fides add <package>` — add dependency to `fides.toml`, download
+- [ ] `fides remove <package>` — remove dependency
+- [ ] `fides update` — update dependencies within version constraints
+- [ ] `fides publish` — publish package to registry
+- [ ] `fides search <query>` — search registry
 - [ ] Semantic versioning support (caret, tilde, wildcard, exact)
 - [ ] **Not built:** This is new
 
 #### L5D — Lockfiles
-- [ ] `pledge.lock` — deterministic dependency versions
+- [ ] `fides.lock` — deterministic dependency versions
 - [ ] Reproducible builds (same lockfile = same output)
 - [ ] Consistent metadata (fix Python's problem where metadata can differ per machine)
 - [ ] Lockfile includes content hashes (supply chain integrity)
 - [ ] **Not built:** This is new
 
 #### L5E — Registry
-- [ ] P package registry (like crates.io but curated)
+- [ ] Fides package registry (like crates.io but curated)
 - [ ] Package verification (signed packages, verified publishers)
 - [ ] Binary package distribution (not just source — fix C++'s "no binary libraries" problem)
 - [ ] Mirror support (corporate/offline environments)
@@ -701,21 +701,21 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] **Design principle:** Capabilities — downloaded packages can't access IO/FS/Net unless explicitly granted
 
 #### L5F — Workspaces
-- [ ] `[workspace]` in `pledge.toml` — multi-package projects
+- [ ] `[workspace]` in `fides.toml` — multi-package projects
 - [ ] Shared dependencies across workspace members
-- [ ] `pledge build` from workspace root builds all members
+- [ ] `fides build` from workspace root builds all members
 - [ ] Path dependencies for local development
 - [ ] **Not built:** This is new
 
 ### Exit Criteria
-- [ ] `pledge new myproject` creates a new project with `pledge.toml`
-- [ ] `pledge add http` downloads and integrates the `http` package
-- [ ] `pledge build` compiles the project with incremental builds
-- [ ] `pledge publish` publishes to the P registry
+- [ ] `fides new myproject` creates a new project with `fides.toml`
+- [ ] `fides add http` downloads and integrates the `http` package
+- [ ] `fides build` compiles the project with incremental builds
+- [ ] `fides publish` publishes to the Fides registry
 - [ ] Lockfiles ensure reproducible builds
 - [ ] No external build tools needed (no Make, no CMake, no Ninja)
 
-**Success metric:** A new user can `pledge new app && pledge add http && pledge run` and have a working HTTP server in under 30 seconds. Like `cargo new && cargo run`, but faster.
+**Success metric:** A new user can `fides new app && fides add http && fides run` and have a working HTTP server in under 30 seconds. Like `cargo new && cargo run`, but faster.
 
 ---
 
@@ -725,7 +725,7 @@ P's effect system is the foundation — effect handlers can replace async/await 
 
 **Status:** FFI works (verified in interpreter + C codegen) — needs PE backend verification and docs correction
 
-**Why:** Zig's seamless C interop is its killer feature. Rust's FFI is unsafe and verbose. C++ has no automatic bindings. P needs this for adoption — no one rewrites everything at once.
+**Why:** Zig's seamless C interop is its killer feature. Rust's FFI is unsafe and verbose. C++ has no automatic bindings. Fides needs this for adoption — no one rewrites everything at once.
 
 **Depends on:** Phase L1D (verify FFI actually works)
 
@@ -733,19 +733,19 @@ P's effect system is the foundation — effect handlers can replace async/await 
 
 #### L6A — Verify and Fix `extern "C"`
 - [ ] Verify `extern "C" pf name(params) -> ret;` works on all backends
-- [ ] Verify P primitives map directly to C types (i64 = int64_t, f64 = double, etc.)
+- [ ] Verify Fides primitives map directly to C types (i64 = int64_t, f64 = double, etc.)
 - [ ] Verify pointer types (`*mut T`, `*const T`) work across FFI boundary
 - [ ] Verify struct layout matches C (repr(C) equivalent)
-- [ ] **Already built (claimed):** `extern "C"` syntax, `test_ffi.p`, `test_ffi_full.p`
+- [ ] **Already built (claimed):** `extern "C"` syntax, `test_ffi.fd`, `test_ffi_full.fd`
 - [ ] **Not redoing:** FFI syntax — making it actually work everywhere
 
-#### L6B — Auto-Binding Generation (`pledge parse-header`)
-- [ ] Verify `pledgec parse-header <file.h>` generates working P bindings
+#### L6B — Auto-Binding Generation (`fides parse-header`)
+- [ ] Verify `fidesc parse-header <file.h>` generates working Fides bindings
 - [ ] Handle: function prototypes, struct definitions, enum definitions, typedefs, macros
 - [ ] Handle: pointer types, arrays, function pointers
 - [ ] Handle: `#include` resolution (find headers in standard paths)
-- [ ] Output: `.p` file with `extern "C"` declarations
-- [ ] **Already built (claimed):** `parse-header` command, `test_ffi_header.p`
+- [ ] Output: `.fd` file with `extern "C"` declarations
+- [ ] **Already built (claimed):** `parse-header` command, `test_ffi_header.fd`
 - [ ] **Not redoing:** Header parser — verifying and extending
 
 #### L6C — Shared Library Loading
@@ -755,29 +755,29 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] Gated by `FS` capability (loading a library is filesystem access)
 - [ ] **Not built:** This is new
 
-#### L6D — C-to-P Transpiler
-- [ ] Auto-translate C code to P (best-effort, manual review needed)
+#### L6D — C-to-Fides Transpiler
+- [ ] Auto-translate C code to Fides (best-effort, manual review needed)
 - [ ] Handle: functions, structs, enums, typedefs, basic control flow
-- [ ] Map C patterns to P idioms (malloc/free -> regions, pointers -> references)
-- [ ] Output readable P code (not machine-generated mess)
+- [ ] Map C patterns to Fides idioms (malloc/free -> regions, pointers -> references)
+- [ ] Output readable Fides code (not machine-generated mess)
 - [ ] **Overlaps with:** Existing roadmap Phase 7C (Migration Tools)
 - [ ] **Not built:** This is new
 
 #### L6E — Multi-Language Interop via C ABI
-- [ ] Python interop: P compiles to shared library, Python calls via ctypes/cffi
-- [ ] JavaScript interop: P compiles to WASM (via existing WASM backend), JS calls via WASM imports
-- [ ] Rust interop: P calls Rust via C ABI (Rust `extern "C"`)
-- [ ] Go interop: P calls Go via cgo-compatible C ABI
+- [ ] Python interop: Fides compiles to shared library, Python calls via ctypes/cffi
+- [ ] JavaScript interop: Fides compiles to WASM (via existing WASM backend), JS calls via WASM imports
+- [ ] Rust interop: Fides calls Rust via C ABI (Rust `extern "C"`)
+- [ ] Go interop: Fides calls Go via cgo-compatible C ABI
 - [ ] **Already built:** WASM backend (Phase 5D)
 - [ ] **Not redoing:** WASM backend — using it for JS interop
 
 ### Exit Criteria
-- [ ] Call OpenSSL, libcurl, SQLite, and libpng from P without hand-writing bindings
-- [ ] `pledge parse-header openssl/ssl.h` generates working bindings
-- [ ] P shared library callable from Python, JS, Rust, and Go
-- [ ] C-to-P transpiler handles real-world C code (at least simple programs)
+- [ ] Call OpenSSL, libcurl, SQLite, and libpng from Fides without hand-writing bindings
+- [ ] `fides parse-header openssl/ssl.h` generates working bindings
+- [ ] Fides shared library callable from Python, JS, Rust, and Go
+- [ ] C-to-Fides transpiler handles real-world C code (at least simple programs)
 
-**Success metric:** A C project can gradually migrate to P — one file at a time, calling remaining C code via FFI, with auto-generated bindings. Like Zig's `@cImport`, but better.
+**Success metric:** A C project can gradually migrate to Fides — one file at a time, calling remaining C code via FFI, with auto-generated bindings. Like Zig's `@cImport`, but better.
 
 ---
 
@@ -794,7 +794,7 @@ P's effect system is the foundation — effect handlers can replace async/await 
 ### Milestones
 
 #### L7A — LSP Server
-- [ ] `pledge lsp` — Language Server Protocol implementation
+- [ ] `fides lsp` — Language Server Protocol implementation
 - [ ] Features: completion, hover, goto definition, goto references, rename, format on save
 - [ ] Diagnostics: type errors, capability errors, effect errors, region errors — all in editor
 - [ ] Semantic highlighting (using PIR type info)
@@ -804,7 +804,7 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] **Already built:** Typechecker, sourcemap (for goto definition)
 
 #### L7B — Debugger
-- [ ] `pledge debug <binary>` — source-level debugger
+- [ ] `fides debug <binary>` — source-level debugger
 - [ ] Breakpoints (line, function, conditional)
 - [ ] Stepping (step in, step over, step out, continue)
 - [ ] Variable inspection (print values, expand structs/enums)
@@ -814,7 +814,7 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] **Not redoing:** Debugger infrastructure — extending to standalone debugging
 
 #### L7C — Profiler
-- [ ] `pledge profile <binary>` — runtime profiler
+- [ ] `fides profile <binary>` — runtime profiler
 - [ ] CPU profiling (function-level timing, call graph)
 - [ ] Memory profiling (allocation tracking, region usage)
 - [ ] Allocation profiler (which functions allocate, how much)
@@ -822,23 +822,23 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] **Not built:** This is new
 
 #### L7D — Formatter
-- [ ] `pledge fmt` — code formatter (like `rustfmt`, `gofmt`)
-- [ ] Consistent style across all P code
+- [ ] `fides fmt` — code formatter (like `rustfmt`, `gofmt`)
+- [ ] Consistent style across all Fides code
 - [ ] No configuration needed (one canonical style)
-- [ ] `pledge fmt --check` for CI (verify code is formatted)
+- [ ] `fides fmt --check` for CI (verify code is formatted)
 - [ ] **Not built:** This is new
 - [ ] **Design principle:** "One way to do things" — one canonical format
 
 #### L7E — Linter
-- [ ] `pledge lint` — code linter
+- [ ] `fides lint` — code linter
 - [ ] Lints: unused variables, dead code, unnecessary allocations, effect violations
 - [ ] Style lints: naming conventions, import ordering
 - [ ] Security lints: capability usage audit, unsafe code audit
-- [ ] `pledge lint --fix` — auto-fix where possible
+- [ ] `fides lint --fix` — auto-fix where possible
 - [ ] **Not built:** This is new
 
 #### L7F — Documentation Generator
-- [ ] `pledge doc` — generate HTML documentation from source
+- [ ] `fides doc` — generate HTML documentation from source
 - [ ] Doc comments (`///` or `/** */`)
 - [ ] Cross-references (type links, function links)
 - [ ] Searchable
@@ -846,7 +846,7 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] **Not built:** This is new
 
 #### L7G — REPL Improvements
-- [ ] Verify `pledge repl` works (claimed in features.md)
+- [ ] Verify `fides repl` works (claimed in features.md)
 - [ ] Multi-line input
 - [ ] Type inspection (`:type expr`)
 - [ ] Effect inspection (`:effects func`)
@@ -856,22 +856,22 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] **Not redoing:** REPL — extending with inspection commands
 
 #### L7H — Source Map Verification
-- [ ] Verify `pledge sourcemap` produces correct source maps
+- [ ] Verify `fides sourcemap` produces correct source maps
 - [ ] Source maps work with debugger (L7B)
 - [ ] Source maps work with profiler (L7C)
 - [ ] Source maps work with error messages (file:line:col)
-- [ ] **Already built:** `pledge sourcemap` command
+- [ ] **Already built:** `fides sourcemap` command
 - [ ] **Not redoing:** Source map generation — verifying integration
 
 ### Exit Criteria
 - [ ] VS Code extension with full LSP support (completion, diagnostics, refactor)
 - [ ] Source-level debugger with breakpoints and variable inspection
 - [ ] CPU and memory profiler with flame graphs
-- [ ] `pledge fmt` produces canonical formatting
-- [ ] `pledge doc` generates searchable HTML docs
+- [ ] `fides fmt` produces canonical formatting
+- [ ] `fides doc` generates searchable HTML docs
 - [ ] REPL with type/effect/capability inspection
 
-**Success metric:** A developer's first experience with P includes: syntax highlighting, autocomplete, inline errors, goto definition, formatter on save, and a debugger — all within 5 minutes of installation. Like Rust-analyzer, but faster.
+**Success metric:** A developer's first experience with Fides includes: syntax highlighting, autocomplete, inline errors, goto definition, formatter on save, and a debugger — all within 5 minutes of installation. Like Rust-analyzer, but faster.
 
 ---
 
@@ -881,7 +881,7 @@ P's effect system is the foundation — effect handlers can replace async/await 
 
 **Status:** Partial (generics, enums, traits, pattern matching work; const generics and GATs work in interpreter — need PE/C backend verification)
 
-**Why:** Go's limited generics, Java's type erasure, TypeScript's erased types, Rust's missing specialization — all are major complaints. P needs to close every gap.
+**Why:** Go's limited generics, Java's type erasure, TypeScript's erased types, Rust's missing specialization — all are major complaints. Fides needs to close every gap.
 
 **Depends on:** Phase L1H (verify const generics and GATs)
 
@@ -892,15 +892,15 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] Test: `pf sum<N: i64>(arr: [i64; N]) -> i64` monomorphizes correctly
 - [ ] Test: const generic in struct (`struct Matrix<T, const N: usize>`)
 - [ ] Test: const generic constraints (`where N > 0`)
-- [ ] **Already built (claimed):** `test_const_generic.p`, `test_matrix_mul.p`
+- [ ] **Already built (claimed):** `test_const_generic.fd`, `test_matrix_mul.fd`
 - [ ] **Not redoing:** Const generic implementation — verifying
 
 #### L8B — Verify GATs
 - [ ] Confirm `ty Item<T>;` in traits works
 - [ ] Confirm `ty Item<T> = T;` in impls works
 - [ ] Confirm `T::Item<X>` in type positions works
-- [ ] Test: `test_gat.p` passes
-- [ ] **Already built (claimed):** `test_gat.p`
+- [ ] Test: `test_gat.fd` passes
+- [ ] **Already built (claimed):** `test_gat.fd`
 - [ ] **Not redoing:** GAT implementation — verifying
 
 #### L8C — Named Arguments
@@ -983,7 +983,7 @@ P's effect system is the foundation — effect handlers can replace async/await 
 
 **Status:** Partial (optimizer built but not wired in — Phase L1A fixes this)
 
-**Why:** Rust's slow compilation is the #1 complaint. C++ template explosions. If P is slow to compile or produces slow code, none of its other advantages matter.
+**Why:** Rust's slow compilation is the #1 complaint. C++ template explosions. If Fides is slow to compile or produces slow code, none of its other advantages matter.
 
 **Depends on:** Phase L1A (optimizer wired into pipeline), Phase L1B (register allocator wired in)
 
@@ -992,7 +992,7 @@ P's effect system is the foundation — effect handlers can replace async/await 
 ### Milestones
 
 #### L9A — Benchmark Against LLVM -O2
-- [ ] Benchmark suite: P vs gcc -O2 vs clang -O2 vs rustc -O2
+- [ ] Benchmark suite: Fides vs gcc -O2 vs clang -O2 vs rustc -O2
 - [ ] Benchmarks: loop-heavy, recursion-heavy, allocation-heavy, IO-heavy, mixed
 - [ ] Track: runtime speed, binary size, compile time
 - [ ] Target: within 5% of LLVM -O2 for runtime, within 10% for binary size
@@ -1000,8 +1000,8 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] **Not redoing:** Benchmark framework — extending and verifying
 
 #### L9B — Profile-Guided Optimization (PGO)
-- [ ] `pledge build --profile-generate` — instrument binary for profiling
-- [ ] `pledge build --profile-use <profile>` — use profile data for optimization
+- [ ] `fides build --profile-generate` — instrument binary for profiling
+- [ ] `fides build --profile-use <profile>` — use profile data for optimization
 - [ ] Branch prediction hints from profile data
 - [ ] Inlining decisions from profile data
 - [ ] **Not built:** This is new
@@ -1028,7 +1028,7 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] **Not redoing:** SIMD types — adding auto-vectorization pass
 
 #### L9F — Compile-Time Benchmarks
-- [ ] Benchmark: P vs Rust vs Go vs Zig for compile time
+- [ ] Benchmark: Fides vs Rust vs Go vs Zig for compile time
 - [ ] Track: clean build, incremental build, no-op rebuild
 - [ ] Target: 10x faster than Rust, comparable to Go
 - [ ] **Already built:** `benchmarks/hot_reload_bench.sh` (claims 13ms warm)
@@ -1037,26 +1037,26 @@ P's effect system is the foundation — effect handlers can replace async/await 
 #### L9G — Binary Size Optimization
 - [ ] Dead code elimination at IR level (already in linker)
 - [ ] String pooling (deduplicate string literals)
-- [ ] Symbol stripping (`pledge build --strip`)
-- [ ] LTO for size (`pledge build --opt-level z`)
+- [ ] Symbol stripping (`fides build --strip`)
+- [ ] LTO for size (`fides build --opt-level z`)
 - [ ] Target: smaller than C for equivalent functionality
 - [ ] **Already built:** `linker.rs::dead_code_elimination`, `embedded.rs::BinarySizeOptimizer`
 - [ ] **Not redoing:** DCE — adding size-specific optimizations
 
 ### Exit Criteria
-- [ ] P code runs within 5% of LLVM -O2 on standard benchmarks
-- [ ] P compiles 10x faster than Rust for equivalent projects
+- [ ] Fides code runs within 5% of LLVM -O2 on standard benchmarks
+- [ ] Fides compiles 10x faster than Rust for equivalent projects
 - [ ] Binary size smaller than C for equivalent functionality
 - [ ] PGO, LTO, and whole-program optimization available
 - [ ] Auto-vectorization uses effect + region info for safety
 
-**Success metric:** `pledge build --release` produces code as fast as `rustc -O` and `gcc -O2`, compiles in 1/10th the time, and produces smaller binaries. No LLVM dependency.
+**Success metric:** `fides build --release` produces code as fast as `rustc -O` and `gcc -O2`, compiles in 1/10th the time, and produces smaller binaries. No LLVM dependency.
 
 ---
 
 ## Phase L10 — Ecosystem, Community & Adoption
 
-**Goal:** Real developers using P for real projects. Documentation, community, migration paths.
+**Goal:** Real developers using Fides for real projects. Documentation, community, migration paths.
 
 **Status:** Not started
 
@@ -1076,8 +1076,8 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] **Overlaps with:** Existing roadmap Phase 8A (Formal Verification) — spec comes first
 - [ ] **Not built:** This is new
 
-#### L10B — P Book
-- [ ] "The P Programming Language" — like "The Rust Programming Language"
+#### L10B — Fides Book
+- [ ] "The Fides Programming Language" — like "The Rust Programming Language"
 - [ ] Chapters: Getting Started, Syntax, Types, Traits, Regions, Effects, Capabilities, Comptime, FFI, Concurrency, Stdlib, Deployment
 - [ ] Interactive examples (run in browser via WASM backend)
 - [ ] Free online, paid print/ebook
@@ -1086,13 +1086,13 @@ P's effect system is the foundation — effect handlers can replace async/await 
 
 #### L10C — Examples Library
 - [ ] Real-world code samples: CLI tools, web servers, embedded firmware, data processing
-- [ ] Each example demonstrates a P differentiator (regions, effects, capabilities, comptime)
-- [ ] "P by Example" — like "Go by Example"
+- [ ] Each example demonstrates a Fides differentiator (regions, effects, capabilities, comptime)
+- [ ] "Fides by Example" — like "Go by Example"
 - [ ] **Overlaps with:** Existing roadmap Phase 7D
 - [ ] **Not built:** This is new
 
 #### L10D — Playground
-- [ ] Web-based P IDE (run in browser)
+- [ ] Web-based Fides IDE (run in browser)
 - [ ] Edit, compile (to WASM), run, share
 - [ ] Embeddable (like Rust Playground)
 - [ ] Links from documentation and book
@@ -1100,10 +1100,10 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] **Not redoing:** WASM backend — building playground on top
 
 #### L10E — Migration Guides
-- [ ] "C to P" guide — map C patterns to P idioms
-- [ ] "Rust to P" guide — map Rust patterns (borrow checker, lifetimes, async) to P (regions, effects)
-- [ ] "Go to P" guide — map Go patterns (goroutines, channels, interfaces) to P (spawn, channels, traits)
-- [ ] "Python to P" guide — for performance-critical Python code
+- [ ] "C to Fides" guide — map C patterns to Fides idioms
+- [ ] "Rust to Fides" guide — map Rust patterns (borrow checker, lifetimes, async) to Fides (regions, effects)
+- [ ] "Go to Fides" guide — map Go patterns (goroutines, channels, interfaces) to Fides (spawn, channels, traits)
+- [ ] "Python to Fides" guide — for performance-critical Python code
 - [ ] **Overlaps with:** Existing roadmap Phase 7C (Migration Tools)
 - [ ] **Not built:** This is new
 
@@ -1121,20 +1121,20 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] Audit region safety (can it be bypassed?)
 - [ ] Audit capability security (can unprivileged code access IO/FS/Net?)
 - [ ] Audit effect system (can effects be hidden?)
-- [ ] Audit FFI (can unsafe C code bypass P safety?)
+- [ ] Audit FFI (can unsafe C code bypass Fides safety?)
 - [ ] Publish audit report
 - [ ] **Overlaps with:** Existing roadmap Phase 8A (Formal Verification)
 - [ ] **Not built:** This is new
 
 #### L10H — Production Case Studies
-- [ ] Find 3 companies willing to pilot P in production
+- [ ] Find 3 companies willing to pilot Fides in production
 - [ ] Document use case, results, lessons learned
 - [ ] Publish case studies
 - [ ] **Overlaps with:** Existing roadmap Phase 8D (Industry Adoption)
 - [ ] **Not built:** This is new
 
 #### L10I — University Course
-- [ ] Develop university-level course materials for P
+- [ ] Develop university-level course materials for Fides
 - [ ] Topics: systems programming, memory safety, capability security, effect systems
 - [ ] Lab exercises (using playground)
 - [ ] Partner with at least 1 university to teach it
@@ -1142,7 +1142,7 @@ P's effect system is the foundation — effect handlers can replace async/await 
 - [ ] **Not built:** This is new
 
 #### L10J — Killer App
-- [ ] Build at least 1 application that only P can do well:
+- [ ] Build at least 1 application that only Fides can do well:
   - Hot-reloadable web server with compile-time capability security (no other language does both)
   - Memory-safe OS kernel with effect-based real-time guarantees
   - AI inference engine that runs on CPU, GPU, and microcontroller from same code
@@ -1151,16 +1151,16 @@ P's effect system is the foundation — effect handlers can replace async/await 
 
 ### Exit Criteria
 - [ ] Formal language specification published
-- [ ] "The P Programming Language" book available online
+- [ ] "The Fides Programming Language" book available online
 - [ ] Web playground live and linked from docs
 - [ ] Migration guides for C, Rust, Go, Python
 - [ ] Active community (forum + chat)
 - [ ] External security audit completed and published
 - [ ] At least 3 production case studies
-- [ ] At least 1 university teaching P
-- [ ] At least 1 killer app that demonstrates P's unique capabilities
+- [ ] At least 1 university teaching Fides
+- [ ] At least 1 killer app that demonstrates Fides's unique capabilities
 
-**Success metric:** A developer can go from "never heard of P" to "running their first P program" in under 5 minutes, find comprehensive documentation, join an active community, and see real companies using it in production.
+**Success metric:** A developer can go from "never heard of Fides" to "running their first Fides program" in under 5 minutes, find comprehensive documentation, join an active community, and see real companies using it in production.
 
 ---
 
@@ -1264,7 +1264,7 @@ When choosing what to work on next, ask:
 
 1. **Is it blocking other phases?** If yes, do it first (L1 blocks almost everything).
 2. **Does it address a top complaint from multiple languages?** If yes, prioritize (L3 concurrency, L6 FFI).
-3. **Does it differentiate P from all other languages?** If yes, prioritize (L3 effect-based concurrency, L4 capability-gated stdlib).
+3. **Does it differentiate Fides from all other languages?** If yes, prioritize (L3 effect-based concurrency, L4 capability-gated stdlib).
 4. **Does it enable adoption?** If yes, prioritize after foundation (L5 package manager, L7 tooling).
 5. **Is it already built but not wired in?** If yes, just wire it in — don't rebuild (L1).
 

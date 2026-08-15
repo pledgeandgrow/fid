@@ -1,6 +1,6 @@
-// Pledge IR Interpreter
+// Fides IR Interpreter
 //
-// Executes Pledge IR directly without generating machine code.
+// Executes Fides IR directly without generating machine code.
 // This is used for:
 // - comptime: running code at compile time
 // - Debugging: stepping through IR to verify correctness
@@ -224,7 +224,7 @@ pub struct Interpreter {
     next_db_handle: u64,
     /// Persistent state for `persist` variables (F2)
     /// Maps variable name → saved value. Survives across interpreter runs
-    /// when using `pledgec watch` (hot reload).
+    /// when using `fidesc watch` (hot reload).
     persist_state: HashMap<String, String>,
 }
 
@@ -844,7 +844,7 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Int(f as i64))
             }
 
-            // ─── Pledge-Specific ───
+            // ─── Fides-Specific ───
             Inst::TryUnwrap { value, ok_block, err_block: _, .. } => {
                 // Simplified — just continue to ok_block
                 let _ = values.get(value);

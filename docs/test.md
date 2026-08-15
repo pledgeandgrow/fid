@@ -1,6 +1,6 @@
-# TEST.md — P Test Results
+# TEST.md — Fides Test Results
 
-*Last updated: Aug 2026 — verified against actual test runs (136/136 unit tests, 8/8 harness tests, 78/78 interpreter + 1/1 expected-fail, 78/78 PE + 1/1 expected-fail, 76/78 C codegen + 1/1 expected-fail, 102 .p test files)*
+*Last updated: Aug 2026 — verified against actual test runs (136/136 unit tests, 8/8 harness tests, 78/78 interpreter + 1/1 expected-fail, 78/78 PE + 1/1 expected-fail, 76/78 C codegen + 1/1 expected-fail, 102 .fd test files)*
 
 ## Legend
 
@@ -10,7 +10,7 @@
 - — **N/A** — Not applicable for this target
 
 > **Note:** Exit codes are 0–255 (Unix convention). Values > 255 wrap modulo 256.
-> For example, `test_match.p` returns 300, which appears as exit code 44 (300 % 256).
+> For example, `test_match.fd` returns 300, which appears as exit code 44 (300 % 256).
 
 ---
 
@@ -19,82 +19,82 @@
 | Test Group | Count | Pass | Fail | Notes |
 |------------|-------|------|------|-------|
 | Harness (`cargo test --test harness`) | 8 | 8 | 0 | All pass including golden_files_match |
-| Unit tests (`cargo test --bin pledgec`) | 136 | 136 | 0 | elf64, pir, peephole (26), codegen_x64, opt, regalloc, tensor, hotreload (8), embedded, gpu, wasm, coff, macho, linker |
-| Interpreter (`pledgec run`) | 78 normal + 1 expected-fail | 78 + 1 | 0 | 1 expected failure: `test_trait_verify_fail` (compile-time failure test — correctly fails) |
-| PE Emitter (`pledgec emit`) | 78 normal + 1 expected-fail | 78 + 1 | 0 | 1 expected failure: `test_trait_verify_fail` |
-| C Codegen (`pledgec ccompile`) | 78 normal + 1 expected-fail | 76 + 1 | 2 | 2 real mismatches: `test_asm` (inline asm — by design), `test_comptime_reflect` (comptime reflection — interpreter-only). `test_db` is flaky (HashMap ordering non-deterministic). |
+| Unit tests (`cargo test --bin fidesc`) | 136 | 136 | 0 | elf64, pir, peephole (26), codegen_x64, opt, regalloc, tensor, hotreload (8), embedded, gpu, wasm, coff, macho, linker |
+| Interpreter (`fidesc run`) | 78 normal + 1 expected-fail | 78 + 1 | 0 | 1 expected failure: `test_trait_verify_fail` (compile-time failure test — correctly fails) |
+| PE Emitter (`fidesc emit`) | 78 normal + 1 expected-fail | 78 + 1 | 0 | 1 expected failure: `test_trait_verify_fail` |
+| C Codegen (`fidesc ccompile`) | 78 normal + 1 expected-fail | 76 + 1 | 2 | 2 real mismatches: `test_asm` (inline asm — by design), `test_comptime_reflect` (comptime reflection — interpreter-only). `test_db` is flaky (HashMap ordering non-deterministic). |
 | Safety tests | 9 | 9 | 0 | OOB, overflow, div-by-zero, unwrap None |
 | Capability tests | 4 | 4 | 0 | Grant, deny, propagation |
 | Effect tests | 7 | 7 | 0 | Annotations, inference, handlers, pure, under-declare |
 | Region tests | 3 | 3 | 0 | Basic, nested, escape detection |
-| **Total .p test files** | **102** | | | 79 root + 9 safety + 4 cap + 7 effect + 3 region |
+| **Total .fd test files** | **102** | | | 79 root + 9 safety + 4 cap + 7 effect + 3 region |
 
 ---
 
-## Interpreter (`pledgec run`)
+## Interpreter (`fidesc run`)
 
 78 of 78 normal test files pass through the interpreter, plus 1 expected-fail test (`test_trait_verify_fail` — a compile-time failure test that correctly fails).
 
 | Test File | Status | Output / Exit Code |
 |-----------|--------|--------|
-| `hello.p` | ✅ | `Hello, P!\n50\ny is big` |
-| `print_int.p` | ✅ | `42` |
-| `print_str.p` | ✅ | `Hello!` |
-| `arithmetic.p` | ✅ | `30\n40` |
-| `control_flow.p` | ✅ | `1\n30\n10\n6` |
-| `functions.p` | ✅ | `7\n120` |
-| `struct.p` | ✅ | `10\n20` |
-| `strings.p` | ✅ | `Hello, World!\nPledge\nHello, P!\nx = 42` |
-| `ret42.p` | ✅ | exit=42 |
-| `test_float.p` | ✅ | `3.14159\n2.71828\n5.85987\n-3.5\n0` |
-| `test_fstring_float.p` | ✅ | `x = 3.14` |
-| `test_fstring_int.p` | ✅ | `val = 42` |
-| `test_fstring_vec.p` | ✅ | `vec = [1, 2]` |
-| `test_vec_one.p` | ✅ | `[42]` |
-| `test_vec_loop.p` | ✅ | `3` |
-| `test_match.p` | ✅ | exit=44 (returns 300; 300 % 256 = 44) |
-| `test_match_edge.p` | ✅ | `20\n2\n42\n77` |
-| `test_option.p` | ✅ | `42\n-1` |
-| `test_try.p` | ✅ | `42` |
-| `test_defer.p` | ✅ | `main body\ncleanup B\ncleanup A` |
-| `test_pe_defer.p` | ✅ | `main body\ncleanup A\ncleanup B` |
-| `test_closure.p` | ✅ | `10` |
-| `test_closure_capture.p` | ✅ | `15` |
-| `test_impl.p` | ✅ | `7\n13\n24` |
-| `test_generics.p` | ✅ | `42\n100\n20\n50` |
-| `test_pe_generics.p` | ✅ | `42\n20\n50` |
-| `test_capabilities.p` | ✅ | `42\n20\n10\n5\n10` |
-| `test_hashmap.p` | ✅ | `2\n30\ntrue\n1\nfalse` |
-| `test_print_map.p` | ✅ | `{alice: 30, bob: 25}` |
-| `test_collections.p` | ✅ | (multi-line collections output) |
-| `test_pe_enum.p` | ✅ | `42\n100\n-1` |
-| `test_pe_for_vec.p` | ✅ | `60` |
-| `test_pe_refs.p` | ✅ | `42` |
-| `test_pe_struct.p` | ✅ | `7\n3\n4` |
-| `test_pe_try_block.p` | ✅ | `50\n42\n99` |
-| `test_pe_try_op.p` | ✅ | `10` |
-| `test_refs_mut.p` | ✅ | `11\n16\n42` |
-| `test_traits.p` | ✅ | `30\n35\n30\n130` |
-| `test_regression_closures.p` | ✅ | Closures regression test |
-| `test_regression_fstring.p` | ✅ | F-string regression test |
-| `test_regression_collections.p` | ✅ | Collections regression test |
-| `test_wasm.p` | ✅ | WASM target test (Phase 5D.1) |
-| `test_json.p` | ✅ | JSON stdlib (Phase 5D.2) |
-| `test_http.p` | ✅ | HTTP server stdlib (Phase 5D.3) |
-| `test_db.p` | ✅ | Database driver framework (Phase 5D.4) |
-| `test_tensor.p` | ✅ | Tensor type + ops (Phase 5C.1) |
-| `test_simd.p` | ✅ | SIMD intrinsics (Phase 5C.2) |
-| `test_shape.p` | ✅ | Comptime shape verification (Phase 5C.3) |
-| `test_parallel.p` | ✅ | Auto-parallelization framework (Phase 5C.4) |
-| `test_asm.p` | ✅ | Inline assembly `asm!()` (Phase 5A.1) |
-| `test_bare.p` | ✅ | Bare-metal mode `--bare` (Phase 5A.2) |
-| `test_interrupt.p` | ✅ | Interrupt handler `interrupt pf` + cli/sti/hlt (Phase 5A.3) |
-| `test_mmu.p` | ✅ | MMU/page table: CR0/CR3/CR4, invlpg, page_map (Phase 5A.4) |
-| `test_boot.p` | ✅ | Multiboot2 boot code `--boot` (Phase 5A.5) |
+| `hello.fd` | ✅ | `Hello, Fides!\n50\ny is big` |
+| `print_int.fd` | ✅ | `42` |
+| `print_str.fd` | ✅ | `Hello!` |
+| `arithmetic.fd` | ✅ | `30\n40` |
+| `control_flow.fd` | ✅ | `1\n30\n10\n6` |
+| `functions.fd` | ✅ | `7\n120` |
+| `struct.fd` | ✅ | `10\n20` |
+| `strings.fd` | ✅ | `Hello, World!\nFides\nHello, Fides!\nx = 42` |
+| `ret42.fd` | ✅ | exit=42 |
+| `test_float.fd` | ✅ | `3.14159\n2.71828\n5.85987\n-3.5\n0` |
+| `test_fstring_float.fd` | ✅ | `x = 3.14` |
+| `test_fstring_int.fd` | ✅ | `val = 42` |
+| `test_fstring_vec.fd` | ✅ | `vec = [1, 2]` |
+| `test_vec_one.fd` | ✅ | `[42]` |
+| `test_vec_loop.fd` | ✅ | `3` |
+| `test_match.fd` | ✅ | exit=44 (returns 300; 300 % 256 = 44) |
+| `test_match_edge.fd` | ✅ | `20\n2\n42\n77` |
+| `test_option.fd` | ✅ | `42\n-1` |
+| `test_try.fd` | ✅ | `42` |
+| `test_defer.fd` | ✅ | `main body\ncleanup B\ncleanup A` |
+| `test_pe_defer.fd` | ✅ | `main body\ncleanup A\ncleanup B` |
+| `test_closure.fd` | ✅ | `10` |
+| `test_closure_capture.fd` | ✅ | `15` |
+| `test_impl.fd` | ✅ | `7\n13\n24` |
+| `test_generics.fd` | ✅ | `42\n100\n20\n50` |
+| `test_pe_generics.fd` | ✅ | `42\n20\n50` |
+| `test_capabilities.fd` | ✅ | `42\n20\n10\n5\n10` |
+| `test_hashmap.fd` | ✅ | `2\n30\ntrue\n1\nfalse` |
+| `test_print_map.fd` | ✅ | `{alice: 30, bob: 25}` |
+| `test_collections.fd` | ✅ | (multi-line collections output) |
+| `test_pe_enum.fd` | ✅ | `42\n100\n-1` |
+| `test_pe_for_vec.fd` | ✅ | `60` |
+| `test_pe_refs.fd` | ✅ | `42` |
+| `test_pe_struct.fd` | ✅ | `7\n3\n4` |
+| `test_pe_try_block.fd` | ✅ | `50\n42\n99` |
+| `test_pe_try_op.fd` | ✅ | `10` |
+| `test_refs_mut.fd` | ✅ | `11\n16\n42` |
+| `test_traits.fd` | ✅ | `30\n35\n30\n130` |
+| `test_regression_closures.fd` | ✅ | Closures regression test |
+| `test_regression_fstring.fd` | ✅ | F-string regression test |
+| `test_regression_collections.fd` | ✅ | Collections regression test |
+| `test_wasm.fd` | ✅ | WASM target test (Phase 5D.1) |
+| `test_json.fd` | ✅ | JSON stdlib (Phase 5D.2) |
+| `test_http.fd` | ✅ | HTTP server stdlib (Phase 5D.3) |
+| `test_db.fd` | ✅ | Database driver framework (Phase 5D.4) |
+| `test_tensor.fd` | ✅ | Tensor type + ops (Phase 5C.1) |
+| `test_simd.fd` | ✅ | SIMD intrinsics (Phase 5C.2) |
+| `test_shape.fd` | ✅ | Comptime shape verification (Phase 5C.3) |
+| `test_parallel.fd` | ✅ | Auto-parallelization framework (Phase 5C.4) |
+| `test_asm.fd` | ✅ | Inline assembly `asm!()` (Phase 5A.1) |
+| `test_bare.fd` | ✅ | Bare-metal mode `--bare` (Phase 5A.2) |
+| `test_interrupt.fd` | ✅ | Interrupt handler `interrupt pf` + cli/sti/hlt (Phase 5A.3) |
+| `test_mmu.fd` | ✅ | MMU/page table: CR0/CR3/CR4, invlpg, page_map (Phase 5A.4) |
+| `test_boot.fd` | ✅ | Multiboot2 boot code `--boot` (Phase 5A.5) |
 
 ---
 
-## PE Emitter (`pledgec emit`)
+## PE Emitter (`fidesc emit`)
 
 Native Windows x64 PE executables. No external linker, assembler, or C compiler required.
 
@@ -104,48 +104,48 @@ Native Windows x64 PE executables. No external linker, assembler, or C compiler 
 
 | Test File | Status | Output | Notes |
 |-----------|--------|--------|-------|
-| `hello.p` | ✅ | `Hello, P!\n50\ny is big` | Strings, int print, if/else |
-| `print_int.p` | ✅ | `42` | Integer printing |
-| `print_str.p` | ✅ | `Hello!` | String printing |
-| `strings.p` | ✅ | `Hello, World!\nPledge\nHello, P!\nx = 42` | Multiple strings, f-string |
-| `arithmetic.p` | ✅ | `30\n40` | Arithmetic ops |
-| `control_flow.p` | ✅ | `1\n30\n10\n6` | If/else, while, for |
-| `functions.p` | ✅ | `7\n120` | Function calls, recursion |
-| `struct.p` | ✅ | `10\n20` | Struct fields |
-| `test_float.p` | ✅ | `3.14159\n2.71828\n5.85987\n-3.5\n0` | Float printing |
-| `test_vec_one.p` | ✅ | `[42]` | Vec new + push + print |
-| `test_vec_loop.p` | ✅ | `3` | Vec push in while loop |
-| `test_match.p` | ✅ | exit=44 | Match on integer (300 % 256) |
-| `test_match_edge.p` | ✅ | `20\n2\n42\n77` | Match edge cases |
-| `test_option.p` | ✅ | `42\n-1` | Option Some/None |
-| `test_try.p` | ✅ | `42` | Try block |
-| `test_defer.p` | ✅ | `main body\ncleanup B\ncleanup A` | Defer execution |
-| `test_pe_defer.p` | ✅ | `main body\ncleanup A\ncleanup B` | Defer (alternate order) |
-| `test_closure.p` | ✅ | `10` | Closure capture |
-| `test_impl.p` | ✅ | `7\n13\n24` | Impl blocks, methods |
-| `test_generics.p` | ✅ | `42\n100\n20\n50` | Generic functions |
-| `test_pe_generics.p` | ✅ | `42\n20\n50` | Generic functions (PE tests) |
-| `test_capabilities.p` | ✅ | `42\n20\n10\n5\n10` | Capabilities |
-| `test_hashmap.p` | ✅ | `2\n30\ntrue\n1\nfalse` | HashMap insert/get/contains/remove/len/is_empty |
-| `test_fstring_int.p` | ✅ | `val = 42` | F-string with integer interpolation |
-| `test_fstring_vec.p` | ✅ | `vec = [1, 2]` | F-string with vec interpolation |
-| `test_fstring_float.p` | ✅ | `x = 3.14` | F-string with float interpolation |
-| `test_pe_enum.p` | ✅ | `42\n100\n-1` | Enum with data |
-| `test_pe_for_vec.p` | ✅ | `60` | For loop over vec |
-| `test_pe_refs.p` | ✅ | `42` | References |
-| `test_pe_struct.p` | ✅ | `7\n3\n4` | Struct methods |
-| `test_pe_try_block.p` | ✅ | `50\n42\n99` | Try blocks |
-| `test_pe_try_op.p` | ✅ | `10` | Try operator |
-| `test_refs_mut.p` | ✅ | `11\n16\n42` | Mutable references |
-| `test_traits.p` | ✅ | `30\n35\n30\n130` | Traits |
-| `test_print_map.p` | ✅ | `{alice: 30, bob: 25}` | Map printing |
-| `test_collections.p` | ✅ | (multi-line collections output) | Vec/HashMap/String operations |
-| `test_closure_capture.p` | ✅ | `15` | Closure with captured variable |
-| `ret42.p` | ✅ | exit=42 | Return value → exit code |
+| `hello.fd` | ✅ | `Hello, Fides!\n50\ny is big` | Strings, int print, if/else |
+| `print_int.fd` | ✅ | `42` | Integer printing |
+| `print_str.fd` | ✅ | `Hello!` | String printing |
+| `strings.fd` | ✅ | `Hello, World!\nFides\nHello, Fides!\nx = 42` | Multiple strings, f-string |
+| `arithmetic.fd` | ✅ | `30\n40` | Arithmetic ops |
+| `control_flow.fd` | ✅ | `1\n30\n10\n6` | If/else, while, for |
+| `functions.fd` | ✅ | `7\n120` | Function calls, recursion |
+| `struct.fd` | ✅ | `10\n20` | Struct fields |
+| `test_float.fd` | ✅ | `3.14159\n2.71828\n5.85987\n-3.5\n0` | Float printing |
+| `test_vec_one.fd` | ✅ | `[42]` | Vec new + push + print |
+| `test_vec_loop.fd` | ✅ | `3` | Vec push in while loop |
+| `test_match.fd` | ✅ | exit=44 | Match on integer (300 % 256) |
+| `test_match_edge.fd` | ✅ | `20\n2\n42\n77` | Match edge cases |
+| `test_option.fd` | ✅ | `42\n-1` | Option Some/None |
+| `test_try.fd` | ✅ | `42` | Try block |
+| `test_defer.fd` | ✅ | `main body\ncleanup B\ncleanup A` | Defer execution |
+| `test_pe_defer.fd` | ✅ | `main body\ncleanup A\ncleanup B` | Defer (alternate order) |
+| `test_closure.fd` | ✅ | `10` | Closure capture |
+| `test_impl.fd` | ✅ | `7\n13\n24` | Impl blocks, methods |
+| `test_generics.fd` | ✅ | `42\n100\n20\n50` | Generic functions |
+| `test_pe_generics.fd` | ✅ | `42\n20\n50` | Generic functions (PE tests) |
+| `test_capabilities.fd` | ✅ | `42\n20\n10\n5\n10` | Capabilities |
+| `test_hashmap.fd` | ✅ | `2\n30\ntrue\n1\nfalse` | HashMap insert/get/contains/remove/len/is_empty |
+| `test_fstring_int.fd` | ✅ | `val = 42` | F-string with integer interpolation |
+| `test_fstring_vec.fd` | ✅ | `vec = [1, 2]` | F-string with vec interpolation |
+| `test_fstring_float.fd` | ✅ | `x = 3.14` | F-string with float interpolation |
+| `test_pe_enum.fd` | ✅ | `42\n100\n-1` | Enum with data |
+| `test_pe_for_vec.fd` | ✅ | `60` | For loop over vec |
+| `test_pe_refs.fd` | ✅ | `42` | References |
+| `test_pe_struct.fd` | ✅ | `7\n3\n4` | Struct methods |
+| `test_pe_try_block.fd` | ✅ | `50\n42\n99` | Try blocks |
+| `test_pe_try_op.fd` | ✅ | `10` | Try operator |
+| `test_refs_mut.fd` | ✅ | `11\n16\n42` | Mutable references |
+| `test_traits.fd` | ✅ | `30\n35\n30\n130` | Traits |
+| `test_print_map.fd` | ✅ | `{alice: 30, bob: 25}` | Map printing |
+| `test_collections.fd` | ✅ | (multi-line collections output) | Vec/HashMap/String operations |
+| `test_closure_capture.fd` | ✅ | `15` | Closure with captured variable |
+| `ret42.fd` | ✅ | exit=42 | Return value → exit code |
 
 ---
 
-## C Codegen (`pledgec ccompile`)
+## C Codegen (`fidesc ccompile`)
 
 Portable C code generation, compiled with gcc/clang. **76 of 78 normal tests produce output matching the interpreter**, plus 1 expected-fail test (`test_trait_verify_fail` — correctly fails). 2 real mismatches: `test_asm` (inline assembly — cannot be translated to C by design), `test_comptime_reflect` (comptime reflection — interpreter-only feature). `test_db` is flaky (HashMap iteration order is non-deterministic in both interpreter and C codegen — sometimes matches, sometimes doesn't).
 
@@ -158,14 +158,14 @@ Portable C code generation, compiled with gcc/clang. **76 of 78 normal tests pro
 
 ---
 
-## Native ELF64 Build (`pledgec build --target x86-64`)
+## Native ELF64 Build (`fidesc build --target x86-64`)
 
 Native Linux x86-64 ELF64 executables. No external linker, assembler, or C compiler required. Uses the full PIR pipeline (L1→L2→L3 → codegen → 9 peephole passes → ELF64).
 
 | Test File | Status | Output / Exit Code | Notes |
 |-----------|--------|--------|-------|
-| `hello.p` | ✅ | `Hello, P!50y is big` (exit 8) | 3468 bytes, zero external tools |
-| `hello.p --opt` | ✅ | `Hello, P!50y is big` (exit 8) | 3316 bytes with L2 optimizer |
+| `hello.fd` | ✅ | `Hello, Fides!50y is big` (exit 8) | 3468 bytes, zero external tools |
+| `hello.fd --opt` | ✅ | `Hello, Fides!50y is big` (exit 8) | 3316 bytes with L2 optimizer |
 
 **Note:** Exit code 8 is correct — `main()` has no explicit `ret`, so it returns the value of the last expression (the `if` block), which is `print("y is big")` returning 8 (bytes written). The interpreter does not propagate return values as exit codes.
 
@@ -192,11 +192,11 @@ Native Linux x86-64 ELF64 executables. No external linker, assembler, or C compi
 
 Run `cargo test` to execute the automated test suite. The harness tests all three backends:
 
-- **Interpreter (`run`)**: Executes each `.p` file and checks output + exit code.
+- **Interpreter (`run`)**: Executes each `.fd` file and checks output + exit code.
 - **PE Emitter (`emit`)**: Generates `.exe` files and validates PE structure (MZ/PE signatures, x86_64 machine, section count).
 - **C Codegen (`ccompile`)**: Compiles to C, builds with gcc, executes, and compares output against the interpreter.
 
-Tests are defined in `tests/harness.rs` and automatically discover all `.p` files in the `tests/` directory.
+Tests are defined in `tests/harness.rs` and automatically discover all `.fd` files in the `tests/` directory.
 
 ---
 

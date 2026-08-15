@@ -1,4 +1,4 @@
-// C code generation from Pledge IR
+// C code generation from Fides IR
 //
 // Strategy: translate IR functions to C functions, with a runtime library
 // implementing p_vec_*, p_map_*, p_string_* in C. This produces portable
@@ -170,7 +170,7 @@ impl CCodeGen {
         }
     }
 
-    /// Sanitize a Pledge function name for use as a C identifier.
+    /// Sanitize a Fides function name for use as a C identifier.
     /// Renames functions that collide with C keywords or C runtime names.
     fn sanitize_c_name(&self, name: &str) -> String {
         // Don't sanitize user-defined extern function names (FFI)
@@ -550,7 +550,7 @@ impl CCodeGen {
     }
 
     fn emit_runtime_header(&mut self) {
-        wln!(self, "// Auto-generated C code from Pledge IR");
+        wln!(self, "// Auto-generated C code from Fides IR");
         wln!(self, "#include <stdio.h>");
         wln!(self, "#include <stdlib.h>");
         wln!(self, "#include <string.h>");
@@ -1381,7 +1381,7 @@ impl CCodeGen {
             }
             Inst::CallPtr { fn_ptr, args, ret_ty, has_env, .. } => {
                 let fp = self.val_name(*fn_ptr);
-                // Closures in Pledge use string-based dispatch: the closure
+                // Closures in Fides use string-based dispatch: the closure
                 // struct's field 0 is a char* pointing to the function name.
                 // We generate an inline if/else chain that compares the name
                 // and calls the appropriate C function.

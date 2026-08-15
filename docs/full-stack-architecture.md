@@ -1,13 +1,13 @@
-# P Architecture — The Full Stack
+# Fides Architecture — The Full Stack
 
 > Every layer built by us. No LLVM. No borrowed infrastructure.
 
-*Last updated: Aug 2026 — verified against source tree (`src/*.rs`, `stdlib/*.p`, `features.md`).*
+*Last updated: Aug 2026 — verified against source tree (`src/*.rs`, `stdlib/*.fd`, `features.md`).*
 
 ## Current Architecture (Phase 4D — What We Have Now)
 
 ```
-Source (.p files)
+Source (.fd files)
     ↓
 Lexer (src/lexer.rs)              — hand-written tokenizer
     ↓
@@ -23,7 +23,7 @@ Comptime (src/comptime.rs)        — compile-time eval + reflection
     ↓
 ┌──────────────────────────────────────────────────────────────────────┐
 │                                                                      │
-│  Interpreter (src/interp.rs)        — runs IR directly (pledgec run) │
+│  Interpreter (src/interp.rs)        — runs IR directly (fidesc run) │
 │  PIR Pipeline (src/pir.rs)          — IR → PIR L1 → L2 → L3          │
 │  Peephole (src/peephole.rs)         — 9 passes, always on in build   │
 │  Optimizer (src/opt.rs)             — opt-in (has regalloc bug)      │
@@ -60,8 +60,8 @@ Native Binary / WASM / SPIR-V / C Source / Running Code
 **What works today:**
 - Lexer, parser, AST, typechecker (types + regions + effects + capabilities + traits)
 - Lowering, monomorphization, comptime (eval + reflection + f-string interpolation)
-- IR interpreter (`pledgec run`)
-- PIR pipeline: L1 → L2 → L3 (`pledgec pir`)
+- IR interpreter (`fidesc run`)
+- PIR pipeline: L1 → L2 → L3 (`fidesc pir`)
 - Peephole optimizer: 9 passes, always on in `build`
 - PIR optimizer: const fold, CSE, DCE, inline, unroll, TCO, effect elision (opt-in — has regalloc bug)
 - PE emitter: native x86-64 Windows executables, no external tools
@@ -72,18 +72,18 @@ Native Binary / WASM / SPIR-V / C Source / Running Code
 - WASM backend, SPIR-V/GPU backend
 - C source backend (portability fallback via gcc/clang/cl.exe)
 - Integrated linker (ELF64 objects → executable, in-process)
-- Hot reload (`pledgec watch`) — native JIT + function-level change detection
+- Hot reload (`fidesc watch`) — native JIT + function-level change detection
 - Custom runtime: hand-encoded x86-64 machine code via raw syscalls (Linux, no libc) / kernel32.dll (Windows)
 - 8 stdlib modules: core, json, tensor, parallel, db, http, simd, shape
-- C header FFI parsing (`pledgec parse-header`)
+- C header FFI parsing (`fidesc parse-header`)
 - Embedded/IoT: FixedBufferAllocator, `!RealTime` effect, RISC-V target, HAL framework
-- No external dependencies for primary paths: no LLVM, no libc (in P binaries), no external assembler, no external linker
+- No external dependencies for primary paths: no LLVM, no libc (in Fides binaries), no external assembler, no external linker
 
 **What's partial / pending:**
 - ⚠️ PIR optimizer: works for simple programs, exposes pre-existing register allocator bug on complex ones (not enabled by default)
 - ⚠️ Effect handlers: `handle { do } with` syntax parses and runs; full continuation semantics pending
 - ❌ `async` / `await` / `spawn`: parsed, not yet implemented
-- ❌ `#[test]` attribute: parsed but not executed by `pledgec test`
+- ❌ `#[test]` attribute: parsed but not executed by `fidesc test`
 - ❌ `#[derive]`: not yet implemented
 - ❌ Default arguments, variadic arguments: not implemented
 - ❌ Region allocator (arena-based, tied to region system): not started
@@ -91,7 +91,7 @@ Native Binary / WASM / SPIR-V / C Source / Running Code
 
 ---
 
-## PIR — P Intermediate Representation
+## PIR — Fides Intermediate Representation
 
 ### Design Principles
 
@@ -100,11 +100,11 @@ Native Binary / WASM / SPIR-V / C Source / Running Code
 3. **Semantic-aware**: regions, effects, capabilities are first-class in PIR
 4. **SSA-based**: static single assignment for optimization passes
 5. **Target-independent at high level**: same PIR for all architectures
-6. **Human-readable**: debuggable, inspectable (`pledgec pir <file> [1|2|3|all]`)
+6. **Human-readable**: debuggable, inspectable (`fidesc pir <file> [1|2|3|all]`)
 
 ### PIR Level 1 — High-Level (Semantic)
 
-Preserves all P language semantics:
+Preserves all Fides language semantics:
 
 ```
 function main() -> i64 !IO {
@@ -184,14 +184,14 @@ bb0:
 - Its compile times are slow (100+ passes)
 - Its linker (lld) is separate and expensive
 - We can't control its behavior precisely
-- Using it would make P "just another LLVM frontend" — no architectural advantage over Rust or Zig
+- Using it would make Fides "just another LLVM frontend" — no architectural advantage over Rust or Zig
 
 ### What We Built Instead
 - **x86-64 backend**: PE emitter (`src/pe.rs`, direct IR→machine code), PIR codegen (`src/codegen_x64.rs`), MASM (`src/x86.rs`)
 - **ARM64 backend**: `src/codegen_arm64.rs` — for Apple Silicon, embedded, servers
 - **RISC-V backend**: `src/codegen_riscv.rs` — for IoT, custom hardware, research
-- **WASM backend**: `src/wasm.rs` — PIR → WebAssembly binary (`pledgec wasm`)
-- **SPIR-V / GPU backend**: `src/gpu.rs` — PIR → SPIR-V binary (`pledgec gpu`)
+- **WASM backend**: `src/wasm.rs` — PIR → WebAssembly binary (`fidesc wasm`)
+- **SPIR-V / GPU backend**: `src/gpu.rs` — PIR → SPIR-V binary (`fidesc gpu`)
 - **C source backend**: `src/codegen_c.rs` — IR → C99, portability fallback compiled by gcc/clang/cl.exe
 
 ### Codegen Strategy
@@ -218,8 +218,8 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 - **ELF64 object linking**: resolves `R_X86_64_PC32`, `R_X86_64_PLT32`, `R_X86_64_64` relocations in-process
 - **Incremental linking**: cache object files, only re-link changed modules
 - **Link-time dead code elimination**: remove unused functions (smaller binaries)
-- **Multi-file linking**: `pledgec link <files...>`
-- **Runtime symbol resolution**: links against hand-encoded P runtime (`src/runtime_linux.rs`)
+- **Multi-file linking**: `fidesc link <files...>`
+- **Runtime symbol resolution**: links against hand-encoded Fides runtime (`src/runtime_linux.rs`)
 
 ---
 
@@ -249,14 +249,14 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 
 | Module | File | Contents |
 |--------|------|----------|
-| core | `stdlib/core.p` | Auto-included: `Option`, `Result`, `println`, `assert`, `assert_eq`, `max`, `min`, `abs`, `clamp` |
-| json | `stdlib/json.p` | parse, stringify, get, at |
-| tensor | `stdlib/tensor.p` | n-d arrays, matmul, relu, softmax |
-| parallel | `stdlib/parallel.p` | par_map, par_sum, par_dot |
-| db | `stdlib/db.p` | `cap Database` trait, in-memory KV store |
-| http | `stdlib/http.p` | socket + HTTP parsing |
-| simd | `stdlib/simd.p` | elementwise ops, dot, sum, scale (f64x2, f64x4, etc.) |
-| shape | `stdlib/shape.p` | shape system for tensor ops |
+| core | `stdlib/core.fd` | Auto-included: `Option`, `Result`, `println`, `assert`, `assert_eq`, `max`, `min`, `abs`, `clamp` |
+| json | `stdlib/json.fd` | parse, stringify, get, at |
+| tensor | `stdlib/tensor.fd` | n-d arrays, matmul, relu, softmax |
+| parallel | `stdlib/parallel.fd` | par_map, par_sum, par_dot |
+| db | `stdlib/db.fd` | `cap Database` trait, in-memory KV store |
+| http | `stdlib/http.fd` | socket + HTTP parsing |
+| simd | `stdlib/simd.fd` | elementwise ops, dot, sum, scale (f64x2, f64x4, etc.) |
+| shape | `stdlib/shape.fd` | shape system for tensor ops |
 
 ---
 
@@ -267,14 +267,14 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 - **Binary size optimization**: < 4KB for simple programs
 - **Real-time guarantees**: `!RealTime` effect — bounded execution time
 - **HAL framework**: hardware abstraction layer in `src/embedded.rs`
-- **Bare-metal mode**: `pledgec emit <file> --bare -o <bin>` — no headers, no stdlib, raw machine code
-- **Examples**: `examples/rpi_led_blink.p`, `examples/riscv_blink.p`, `tests/test_boot.p`, `tests/test_bare.p`
+- **Bare-metal mode**: `fidesc emit <file> --bare -o <bin>` — no headers, no stdlib, raw machine code
+- **Examples**: `examples/rpi_led_blink.fd`, `examples/riscv_blink.fd`, `tests/test_boot.fd`, `tests/test_bare.fd`
 
 ---
 
 ## Hot Reload (Phase 4D)
 
-- `src/hotreload.rs` + `pledgec watch <file>`
+- `src/hotreload.rs` + `fidesc watch <file>`
 - Native JIT: compiles to ELF64 in memory, runs immediately
 - Function-level change detection via L2 IR hashing
 - Recompiles and swaps only changed functions
@@ -284,32 +284,32 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 
 ## C FFI
 
-- `src/cparser.rs` + `pledgec parse-header <file.h>` — parses C headers, generates P FFI bindings
+- `src/cparser.rs` + `fidesc parse-header <file.h>` — parses C headers, generates Fides FFI bindings
 - `extern "C"` declarations: parsed, lowered, C codegen, interpreter stubs
-- Tests: `test_ffi.p`, `test_ffi_full.p`, `test_ffi_header.p`
+- Tests: `test_ffi.fd`, `test_ffi_full.fd`, `test_ffi_header.fd`
 
 ---
 
 ## Bootstrapping Strategy
 
-### Phase 1–4D: P in Rust (Current)
-- Compiler written in Rust (`pledgec` binary)
-- Compiles P source to native code via custom pipeline
+### Phase 1–4D: Fides in Rust (Current)
+- Compiler written in Rust (`fidesc` binary)
+- Compiles Fides source to native code via custom pipeline
 - Self-hosting IR, PIR, codegen, linker, runtime — all custom-built
-- 4 Rust crates used to build `pledgec`: `hashbrown`, `compact_str`, `smallvec`, `bumpalo`
+- 4 Rust crates used to build `fidesc`: `hashbrown`, `compact_str`, `smallvec`, `bumpalo`
 
-### Phase 5: Custom Everything for P Binaries
-- Custom file I/O via raw syscalls on Windows too (drop kernel32.dll for P binaries)
+### Phase 5: Custom Everything for Fides Binaries
+- Custom file I/O via raw syscalls on Windows too (drop kernel32.dll for Fides binaries)
 - Region allocator tied to region system
 - Full effect handler continuation semantics
 - `async` / `await` / `spawn` implementation
 
-### Phase 6: P in P (Self-Hosting)
-- Rewrite compiler in P
-- P compiler compiles itself
+### Phase 6: Fides in Fides (Self-Hosting)
+- Rewrite compiler in Fides
+- Fides compiler compiles itself
 - No Rust dependency for end users
-- Compiler binary is a P binary
-- PIR optimizer runs on P compiler code
+- Compiler binary is a Fides binary
+- PIR optimizer runs on Fides compiler code
 - comptime specializes the compiler for the target
 - Compiler becomes faster by optimizing itself
 - **ZERO external dependencies**

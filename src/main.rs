@@ -53,7 +53,7 @@ fn main() {
     match command.as_str() {
         "parse-header" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec parse-header <file.h> [-o output.p]");
+                eprintln!("Usage: fidesc parse-header <file.h> [-o output.fd]");
                 process::exit(1);
             }
             let input = &args[2];
@@ -85,8 +85,8 @@ fn main() {
         }
         "build" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec build <file.p> [-o output] [--target x86-64|arm64|riscv] [--opt] [--caps \"IO,FS\"]");
-                eprintln!("       Compiles and links a Pledge program into a native executable in one step");
+                eprintln!("Usage: fidesc build <file.fd> [-o output] [--target x86-64|arm64|riscv] [--opt] [--caps \"IO,FS\"]");
+                eprintln!("       Compiles and links a Fides program into a native executable in one step");
                 eprintln!("       --target  Target architecture (default: x86-64)");
                 eprintln!("       --opt     Run PIR optimizer before codegen");
                 eprintln!("       --caps    Grant only these capabilities (e.g. \"IO,FS\"). Strips code requiring ungranted caps.");
@@ -139,7 +139,7 @@ fn main() {
 
         "emit" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec emit <file.p> [-o output.exe] [--bare] [--boot]");
+                eprintln!("Usage: fidesc emit <file.fd> [-o output.exe] [--bare] [--boot]");
                 process::exit(1);
             }
             let bare_mode = args.iter().any(|a| a == "--bare");
@@ -225,7 +225,7 @@ fn main() {
 
         "compile" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec compile <file.p> [-o output.s]");
+                eprintln!("Usage: fidesc compile <file.fd> [-o output.s]");
                 process::exit(1);
             }
             let input = &args[2];
@@ -262,7 +262,7 @@ fn main() {
 
         "tokens" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec tokens <file.p>");
+                eprintln!("Usage: fidesc tokens <file.fd>");
                 process::exit(1);
             }
             let input = &args[2];
@@ -281,7 +281,7 @@ fn main() {
 
         "ast" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec ast <file.p>");
+                eprintln!("Usage: fidesc ast <file.fd>");
                 process::exit(1);
             }
             let input = &args[2];
@@ -304,7 +304,7 @@ fn main() {
 
         "ir" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec ir <file.p>");
+                eprintln!("Usage: fidesc ir <file.fd>");
                 process::exit(1);
             }
             let input = &args[2];
@@ -329,7 +329,7 @@ fn main() {
 
         "run" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec run <file.p> [-v]");
+                eprintln!("Usage: fidesc run <file.fd> [-v]");
                 process::exit(1);
             }
             let input = &args[2];
@@ -369,13 +369,13 @@ fn main() {
         }
 
         "version" => {
-            println!("pledgec 0.1.0 (bootstrap compiler)");
-            println!("Written in Rust — will be replaced by self-hosted Pledge compiler");
+            println!("fidesc 0.1.0 (bootstrap compiler)");
+            println!("Written in Rust — will be replaced by self-hosted Fides compiler");
         }
 
         "ccompile" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec ccompile <file.p> [-o output.exe] [--target <triple>]");
+                eprintln!("Usage: fidesc ccompile <file.fd> [-o output.exe] [--target <triple>]");
                 process::exit(1);
             }
             let input = &args[2];
@@ -504,7 +504,7 @@ fn main() {
 
         "sourcemap" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec sourcemap <file.p>");
+                eprintln!("Usage: fidesc sourcemap <file.fd>");
                 process::exit(1);
             }
             let input = &args[2];
@@ -536,7 +536,7 @@ fn main() {
 
         "verify" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec verify <file.p>");
+                eprintln!("Usage: fidesc verify <file.fd>");
                 process::exit(1);
             }
             let input = &args[2];
@@ -569,12 +569,12 @@ fn main() {
 
         "repl" => {
             use std::io::{self, BufRead, Write};
-            eprintln!("pledgec REPL — type expressions to evaluate, :quit to exit");
+            eprintln!("fidesc REPL — type expressions to evaluate, :quit to exit");
             eprintln!();
             let stdin = io::stdin();
             let mut line_num = 1;
             loop {
-                eprint!("pledge:{}> ", line_num);
+                eprint!("fides:{}> ", line_num);
                 io::stderr().flush().ok();
                 let mut line = String::new();
                 match stdin.lock().read_line(&mut line) {
@@ -595,7 +595,7 @@ fn main() {
                     eprintln!("  :help  — show this help");
                     eprintln!("  :ir    — show IR for last expression");
                     eprintln!();
-                    eprintln!("Type a Pledge expression (e.g. 1 + 2, \"hello\", [1,2,3])");
+                    eprintln!("Type a Fides expression (e.g. 1 + 2, \"hello\", [1,2,3])");
                     continue;
                 }
                 // Wrap the input in a main function and interpret it
@@ -620,15 +620,15 @@ fn main() {
         }
 
         "test" => {
-            // Run .p tests in the tests/ directory against all backends.
+            // Run .fd tests in the tests/ directory against all backends.
             //
             // By default, runs NORMAL tests (expected to pass).
-            // Use `pledgec test --fail` to run only expected-fail tests
+            // Use `fidesc test --fail` to run only expected-fail tests
             // (where failing = correct, passing = regression).
             let fail_only = args.iter().any(|a| a == "--fail");
 
             let current_exe = std::env::current_exe()
-                .unwrap_or_else(|_| std::path::PathBuf::from("pledgec"));
+                .unwrap_or_else(|_| std::path::PathBuf::from("fidesc"));
             let test_dir = "tests";
 
             // Expected-fail tests: these test compiler error detection.
@@ -643,7 +643,7 @@ fn main() {
             if let Ok(entries) = fs::read_dir(test_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "p") {
+                    if path.extension().map_or(false, |e| e == "fd") {
                         let stem = path.file_stem().unwrap().to_string_lossy().to_string();
                         let is_fail = expected_fail.contains(&stem.as_str());
                         if fail_only {
@@ -666,7 +666,7 @@ fn main() {
                 if fail_only {
                     eprintln!("No expected-fail tests found in tests/");
                 } else {
-                    eprintln!("No .p test files found in tests/");
+                    eprintln!("No .fd test files found in tests/");
                 }
                 process::exit(1);
             }
@@ -806,7 +806,7 @@ fn main() {
 
         "wasm" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec wasm <file.p> [-o output.wasm] [--wat]");
+                eprintln!("Usage: fidesc wasm <file.fd> [-o output.wasm] [--wat]");
                 process::exit(1);
             }
             let input = &args[2];
@@ -848,7 +848,7 @@ fn main() {
 
         "pir" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec pir <file.p> [1|2|3|all] [--opt]");
+                eprintln!("Usage: fidesc pir <file.fd> [1|2|3|all] [--opt]");
                 process::exit(1);
             }
             let input = &args[2];
@@ -915,7 +915,7 @@ fn main() {
 
         "opt" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec opt <file.p> [pass1,pass2,...]");
+                eprintln!("Usage: fidesc opt <file.fd> [pass1,pass2,...]");
                 eprintln!("       passes: const-fold, cse, dce, inline, unroll, tco");
                 eprintln!("       default: all passes to fixed point");
                 process::exit(1);
@@ -961,7 +961,7 @@ fn main() {
 
         "codegen" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec codegen <file.p> [--target x86-64|arm64|riscv] [--peephole] [--elf <o>] [--coff <o>] [--macho <o>]");
+                eprintln!("Usage: fidesc codegen <file.fd> [--target x86-64|arm64|riscv] [--peephole] [--elf <o>] [--coff <o>] [--macho <o>]");
                 eprintln!("       Emits assembly via the custom PIR L3 → target codegen");
                 eprintln!("       --peephole  Run peephole optimizer on the output assembly");
                 eprintln!("       --elf <o>   Emit an ELF64 relocatable object file (Linux)");
@@ -1134,8 +1134,8 @@ fn main() {
 
         "gpu" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec gpu <file.p> --target spirv|ptx [-o output] [--text]");
-                eprintln!("       Generates GPU code from a Pledge program");
+                eprintln!("Usage: fidesc gpu <file.fd> --target spirv|ptx [-o output] [--text]");
+                eprintln!("       Generates GPU code from a Fides program");
                 eprintln!("       --target spirv  Generate SPIR-V bytecode (Vulkan compute shaders)");
                 eprintln!("       --target ptx     Generate PTX assembly (NVIDIA GPUs)");
                 eprintln!("       -o <file>        Write output to file (default: stdout)");
@@ -1254,7 +1254,7 @@ fn main() {
 
         "watch" => {
             if args.len() < 3 {
-                eprintln!("Usage: pledgec watch <file.p> [--interval <ms>] [--opt] [--no-run] [--diff]");
+                eprintln!("Usage: fidesc watch <file.fd> [--interval <ms>] [--opt] [--no-run] [--diff]");
                 eprintln!("       Auto-recompiles and runs on file change (hot reload mode)");
                 eprintln!("       Uses native JIT: compiles to ELF64 and executes (zero external tools)");
                 eprintln!("       --interval <ms>  Polling interval (default: 500ms)");
@@ -1462,7 +1462,7 @@ fn main() {
         }
 
         "link" => {            if args.len() < 4 {
-                eprintln!("Usage: pledgec link <output> <object1.o> [object2.o ...] [--entry <name>]");
+                eprintln!("Usage: fidesc link <output> <object1.o> [object2.o ...] [--entry <name>]");
                 eprintln!("       Links ELF64 object files into an executable (no external ld needed)");
                 process::exit(1);
             }
@@ -1517,35 +1517,35 @@ fn main() {
 }
 
 fn print_usage() {
-    eprintln!("pledgec — Pledge language bootstrap compiler");
+    eprintln!("fidesc — Fides language bootstrap compiler");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  pledgec build   <file.p> [-o output] [--target] [--opt]  Compile + link in one step (zero external tools)");
-    eprintln!("  pledgec emit    <file.p> [-o output.exe]  Emit PE directly (no ml64.exe/link.exe)");
+    eprintln!("  fidesc build   <file.fd> [-o output] [--target] [--opt]  Compile + link in one step (zero external tools)");
+    eprintln!("  fidesc emit    <file.fd> [-o output.exe]  Emit PE directly (no ml64.exe/link.exe)");
     eprintln!("           [--bare]                          Bare-metal: skip stdlib, flat binary");
     eprintln!("           [--boot]                          Multiboot2: kernel binary for GRUB");
-    eprintln!("  pledgec ccompile <file.p> [-o output.exe]  Compile via C codegen (gcc/clang)");
+    eprintln!("  fidesc ccompile <file.fd> [-o output.exe]  Compile via C codegen (gcc/clang)");
     eprintln!("           [--target <triple>]                Cross-compile (e.g. aarch64-linux-gnu)");
-    eprintln!("  pledgec compile <file.p> [-o output.s]    Compile to ARM64 assembly (legacy)");
-    eprintln!("  pledgec run     <file.p> [-v]             Interpret Pledge IR (execute)");
-    eprintln!("  pledgec parse-header <file.h> [-o out.p]  Parse C header, generate FFI bindings");
-    eprintln!("  pledgec ir      <file.p>                  Show Pledge IR");
-    eprintln!("  pledgec pir     <file.p> [1|2|3] [--opt]  Show PIR (Level 1/2/3, optional optimize)");
-    eprintln!("  pledgec wasm    <file.p> [-o out.wasm] [--wat]  Compile to WASM binary (or WAT text)");
-    eprintln!("  pledgec opt     <file.p> [passes]         Optimize PIR L2 and show result");
-    eprintln!("  pledgec codegen <file.p> [--target x86-64] Custom codegen (PIR L3 → x86-64 asm)");
+    eprintln!("  fidesc compile <file.fd> [-o output.s]    Compile to ARM64 assembly (legacy)");
+    eprintln!("  fidesc run     <file.fd> [-v]             Interpret Fides IR (execute)");
+    eprintln!("  fidesc parse-header <file.h> [-o out.fd]  Parse C header, generate FFI bindings");
+    eprintln!("  fidesc ir      <file.fd>                  Show Fides IR");
+    eprintln!("  fidesc pir     <file.fd> [1|2|3] [--opt]  Show PIR (Level 1/2/3, optional optimize)");
+    eprintln!("  fidesc wasm    <file.fd> [-o out.wasm] [--wat]  Compile to WASM binary (or WAT text)");
+    eprintln!("  fidesc opt     <file.fd> [passes]         Optimize PIR L2 and show result");
+    eprintln!("  fidesc codegen <file.fd> [--target x86-64] Custom codegen (PIR L3 → x86-64 asm)");
     eprintln!("           [--peephole] [--elf <out.o>]     Peephole optimize / emit ELF object");
-    eprintln!("  pledgec gpu     <file.p> --target spirv|ptx  Generate GPU code (SPIR-V or PTX)");
+    eprintln!("  fidesc gpu     <file.fd> --target spirv|ptx  Generate GPU code (SPIR-V or PTX)");
     eprintln!("           [-o output] [--text]             Write to file / SPIR-V text disassembly");
-    eprintln!("  pledgec tokens  <file.p>                  Show tokens");
-    eprintln!("  pledgec ast     <file.p>                  Show AST");
-    eprintln!("  pledgec version                           Show version");
-    eprintln!("  pledgec watch   <file.p> [--interval <ms>] [--run]  Hot reload: recompile on change");
-    eprintln!("  pledgec test                              Run all tests across all backends");
-    eprintln!("  pledgec test --fail                       Run only expected-fail tests (failing = correct)");
-    eprintln!("  pledgec repl                              Interactive REPL (evaluate expressions)");
-    eprintln!("  pledgec verify  <file.p>                  Verify IR correctness");
-    eprintln!("  pledgec sourcemap <file.p>                Show source map (IR to source mapping)");
+    eprintln!("  fidesc tokens  <file.fd>                  Show tokens");
+    eprintln!("  fidesc ast     <file.fd>                  Show AST");
+    eprintln!("  fidesc version                           Show version");
+    eprintln!("  fidesc watch   <file.fd> [--interval <ms>] [--run]  Hot reload: recompile on change");
+    eprintln!("  fidesc test                              Run all tests across all backends");
+    eprintln!("  fidesc test --fail                       Run only expected-fail tests (failing = correct)");
+    eprintln!("  fidesc repl                              Interactive REPL (evaluate expressions)");
+    eprintln!("  fidesc verify  <file.fd>                  Verify IR correctness");
+    eprintln!("  fidesc sourcemap <file.fd>                Show source map (IR to source mapping)");
 }
 
 /// Find ml64.exe by searching Visual Studio install paths

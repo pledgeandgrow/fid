@@ -27,7 +27,7 @@
 // Entry points:
 //   optimize_l2(&mut L2Module) -> OptStats   — run all passes to a fixed point
 //   optimize_l2_with(&mut L2Module, &[Pass]) — run a specific pass list
-//   CLI: `pledgec opt <file>` and `pledgec pir <file> --opt`
+//   CLI: `fidesc opt <file>` and `fidesc pir <file> --opt`
 
 use crate::ast::{BinOp, UnaryOp};
 use crate::ir::{BlockId, Effect, EffectSet, IrType, ValueId};
@@ -239,7 +239,9 @@ fn is_pure(inst: &L2Inst) -> bool {
                 | L2Inst::IntTrunc { .. }
                 | L2Inst::IntToFloat { .. }
                 | L2Inst::FloatToInt { .. }
-                | L2Inst::Alloca { .. }
+                // NOTE: Alloca is NOT pure — each alloca returns a unique memory
+                // location. CSE must never merge two allocas with the same type,
+                // or they'll share the same stack slot and clobber each other.
         )
 }
 
@@ -934,6 +936,7 @@ fn inline_once(module: &mut L2Module) -> usize {
             && f.values.len() <= MAX_INLINE_INSTS
             && !has_external_calls(f)
             && !recurses_directly(f)
+            && !has_multiple_returns(f)
         {
             eligible.insert(f.name.clone(), f.clone());
         }
@@ -972,6 +975,16 @@ fn recurses_directly(f: &L2Function) -> bool {
         }
     }
     false
+}
+
+/// Check if a function has multiple return instructions. The multi-block
+/// inliner doesn't properly handle multiple returns (it only keeps the last
+/// return value), so we skip such functions.
+fn has_multiple_returns(f: &L2Function) -> bool {
+    let count = f.values.values()
+        .filter(|i| matches!(i, L2Inst::Return { .. }))
+        .count();
+    count > 1
 }
 
 fn inline_into(caller: &mut L2Function, eligible: &HashMap<String, L2Function>) -> usize {
@@ -1103,21 +1116,12 @@ fn inline_single_block_tracked(
         new_insts.push((new_id, remapped));
     }
 
-    let return_value = match return_value {
-        Some(v) => v,
-        None => {
-            caller.values.insert(call_id, L2Inst::ConstInt { value: 0, ty: _ret_ty.clone() });
-            return None;
-        }
-    };
-
     // Insert the inlined instructions into the caller's value map.
+    // This must happen BEFORE the void-return early exit, otherwise the
+    // inlined body (which may contain stores through output pointers) is lost.
     for (id, inst) in &new_insts {
         caller.values.insert(*id, inst.clone());
     }
-
-    // Replace all references to call_id with return_value.
-    replace_all_refs(caller, call_id, return_value);
 
     // Splice into the block: replace call_id in the instruction list with
     // the new instruction ids.
@@ -1129,6 +1133,19 @@ fn inline_single_block_tracked(
             block.instructions.insert(idx + i, *id);
         }
     }
+
+    let return_value = match return_value {
+        Some(v) => v,
+        None => {
+            // Void function: just remove the call. The inlined instructions
+            // (including stores through output pointers) are already inserted.
+            caller.values.remove(&call_id);
+            return None;
+        }
+    };
+
+    // Replace all references to call_id with return_value.
+    replace_all_refs(caller, call_id, return_value);
 
     caller.values.remove(&call_id);
     Some(return_value)
@@ -1826,28 +1843,10 @@ fn tco_function(f: &mut L2Function) -> usize {
         param_allocas.push(alloca_vid);
     }
 
-    // Store initial param values into allocas at the start of the entry block
-    let entry_idx = f.blocks.iter().position(|b| b.id == f.entry);
-    if let Some(ei) = entry_idx {
-        let mut init_insts: Vec<PValue> = Vec::new();
-        for (i, (pid, _)) in f.params.iter().enumerate() {
-            let store_vid = ValueId(next_vid); next_vid += 1;
-            f.values.insert(store_vid, L2Inst::Store {
-                ptr: param_allocas[i],
-                value: *pid,
-            });
-            init_insts.push(store_vid);
-        }
-        // Insert these at the start of the entry block
-        let mut new_insts = init_insts;
-        new_insts.extend(f.blocks[ei].instructions.drain(..));
-        f.blocks[ei].instructions = new_insts;
-    }
-
-    // Replace all uses of params with loads from allocas.
-    // We need to insert a load before each use. To keep it simple, insert
-    // loads at the start of each block that uses a param, and replace the
-    // param reference with the load result.
+    // Step 1: Replace all uses of params with loads from allocas.
+    // Do this BEFORE inserting the initial stores, so the stores can use
+    // the original param values (not the loaded values).
+    let entry_block_id = f.entry;
     for b in &mut f.blocks {
         // For each param, check if it's used in this block
         let mut loads_to_insert: Vec<(PValue, PValue)> = Vec::new(); // (param_id, load_vid)
@@ -1884,9 +1883,50 @@ fn tco_function(f: &mut L2Function) -> usize {
         }
     }
 
+    // Step 2: Create a prologue block with allocas + initial stores, and
+    // make it the new entry. The original entry block remains unchanged
+    // (it already has loads at the start from step 1). The TCO loop will
+    // jump to the original entry, NOT the prologue, so the initial stores
+    // only run once.
+    let original_entry = f.entry;
+    let prologue_id = BlockId(next_block);
+    next_block += 1;
+    {
+        let mut prologue_insts: Vec<PValue> = Vec::new();
+        // Add the alloca instructions
+        for &av in &param_allocas {
+            prologue_insts.push(av);
+        }
+        // Add stores: param values -> allocas
+        for (i, (pid, _)) in f.params.iter().enumerate() {
+            let store_vid = ValueId(next_vid); next_vid += 1;
+            f.values.insert(store_vid, L2Inst::Store {
+                ptr: param_allocas[i],
+                value: *pid,
+            });
+            prologue_insts.push(store_vid);
+        }
+        // Add jump to original entry
+        let jump_vid = ValueId(next_vid); next_vid += 1;
+        f.values.insert(jump_vid, L2Inst::Jump { target: original_entry });
+        prologue_insts.push(jump_vid);
+
+        let prologue = L2Block {
+            id: prologue_id,
+            instructions: prologue_insts,
+            predecessors: Vec::new(),
+            params: Vec::new(),
+        };
+        // Insert prologue at the beginning of the blocks vector
+        f.blocks.insert(0, prologue);
+        f.entry = prologue_id;
+    }
+
     // Now rewrite tail call blocks: replace Call + Return with stores + Jump
+    // Adjust indices by +1 because the prologue block was inserted at index 0.
     let mut rewrite_count = 0;
     for bi in tail_call_blocks.into_iter().rev() {
+        let bi = bi + 1; // shifted by prologue insertion
         let n = f.blocks[bi].instructions.len();
         let call_id = f.blocks[bi].instructions[n - 2];
         let _ret_id = f.blocks[bi].instructions[n - 1];
@@ -1906,9 +1946,10 @@ fn tco_function(f: &mut L2Function) -> usize {
                 f.blocks[bi].instructions.push(store_vid);
             }
 
-            // Add jump to entry
+            // Add jump to original entry (not the prologue, which would
+            // overwrite the new param values with the original ones)
             let jump_vid = ValueId(next_vid); next_vid += 1;
-            f.values.insert(jump_vid, L2Inst::Jump { target: f.entry });
+            f.values.insert(jump_vid, L2Inst::Jump { target: original_entry });
             f.blocks[bi].instructions.push(jump_vid);
             rewrite_count += 1;
         }
@@ -2162,7 +2203,12 @@ fn pass_effect_reorder(module: &mut L2Module) -> usize {
                 if let Some(inst) = func.values.get(inst_idx) {
                     if is_pure_inst(inst) {
                         pure_indices.push(i);
-                    } else if has_side_effects(inst) {
+                    } else if has_side_effects(inst) || is_memory_op(inst) {
+                        // Treat memory operations (Load, Alloca) as side-effecting
+                        // for reordering purposes. This prevents Loads from being
+                        // moved before Stores that write to the same address.
+                        // verify_reorder_safety will also prevent pure instructions
+                        // that depend on Loads from being hoisted before them.
                         side_effect_indices.push(i);
                     }
                 }
@@ -2186,15 +2232,21 @@ fn pass_effect_reorder(module: &mut L2Module) -> usize {
             for &i in &pure_indices {
                 new_insts.push(block.instructions[i]);
             }
-            // Then: all side-effecting instructions (in original order)
-            for &i in &side_effect_indices {
-                new_insts.push(block.instructions[i]);
-            }
-            // Then: any remaining instructions
+            // Then: any remaining instructions (neither pure nor side-effecting,
+            // e.g. Load). These must come BEFORE side-effecting instructions
+            // so that terminators (Jump/Branch/Return) stay last —
+            // remove_unreachable_blocks relies on the last instruction being
+            // the terminator.
             for (i, inst) in block.instructions.iter().enumerate() {
                 if !pure_indices.contains(&i) && !side_effect_indices.contains(&i) {
                     new_insts.push(*inst);
                 }
+            }
+            // Then: all side-effecting instructions (in original order).
+            // This includes terminators (Jump/Branch/Return/Unreachable),
+            // ensuring they remain at the end of the block.
+            for &i in &side_effect_indices {
+                new_insts.push(block.instructions[i]);
             }
 
             // Check if we actually reordered anything
@@ -2231,6 +2283,16 @@ fn is_pure_inst(inst: &L2Inst) -> bool {
             | L2Inst::FloatToInt { .. }
             | L2Inst::GetFieldPtr { .. }
             | L2Inst::GetElemPtr { .. }
+    )
+}
+
+/// Memory operations that must not be reordered relative to each other or to
+/// side-effecting instructions. Used by the effect_reorder pass to keep Loads
+/// and Allocas in their original position relative to Stores.
+fn is_memory_op(inst: &L2Inst) -> bool {
+    matches!(
+        inst,
+        L2Inst::Load { .. } | L2Inst::Alloca { .. }
     )
 }
 
@@ -2719,7 +2781,7 @@ mod tests {
     fn tco_detects_tail_call() {
         // A function that ends with `ret f(args)` should be detected as a
         // tail call. We use a self-call (recursion) which is the common case.
-        // Note: `loop` is a keyword in Pledge, so we use `count_down`.
+        // Note: `loop` is a keyword in Fides, so we use `count_down`.
         let src = "pf count_down(n: i64) -> i64 { if n == 0 { ret 0; } ret count_down(n - 1); }\n";
         let l2 = compile_to_l2(src);
         let n = pass_tco(&mut l2.clone());

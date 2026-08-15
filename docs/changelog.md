@@ -1,10 +1,40 @@
-# P Language Changelog
+# Fides Language Changelog
+
+## Docs: Fides Rename Completion + Feature Governance Policy (August 2026)
+
+- **Completed Fides rename in remaining docs**: `__pledge_*` runtime symbol
+  references → `__fides_*` in README.md, docs/architecture.md, docs/changelog.md.
+  "P Compiler" → "Fides Compiler" in architecture.md, best-practices.md headers.
+  "P Programming Language" → "Fides Programming Language" in roadmap-limitations.md.
+  All standalone `\bP\b` language-name references → "Fides" across all 24 doc
+  files + README.md + AGENTS.md.
+- **Added design principles 11–16** (`docs/design-principles.md`):
+  - **11. Zero-Cost Domain Features** — industry attrs add no cost when unused
+  - **12. Import-Scoped Attributes** — `use automotive` enables `@autosar`,
+    without it the attr is a parse error
+  - **13. Tiered Feature Support** — Core / Platform / Domain tiers with
+    explicit backend coverage requirements
+  - **14. Compile-Time Budget** — 10k LOC < 2s, 1k LOC < 200ms; measure before
+    Phase 9
+  - **15. Stdlib Discipline** — `stdlib/core.fd` stays small; domain modules
+    are never auto-included
+  - **16. Honest Positioning** — "multi-domain systems language with opt-in
+    domain-specific features", not "does everything"
+- **Added Feature Governance Policy** (`docs/roadmap.md`): feature tier table,
+  import-scoped attribute table, compile-time budget targets, stdlib discipline
+  rules. Formalizes the policy that keeps Fides multipurpose without
+  complexity overhead.
+- **Note**: Source code still contains `pledge` references (runtime symbols
+  `pledge_sqrt`/`pledge_strlen`/etc. in `src/runtime_linux.rs`, `pledge_name`
+  FFI field in `src/ast.rs`, `__pledge` mangling prefix in `src/x86.rs` and
+  `src/lower.rs`). These are internal symbol names — renaming them is a
+  code-change task that requires running `./verify.sh` after, not a docs task.
 
 ## Banking & Cross-Industry Safety Features Planned (August 2026)
 
 ### Banking & Finance (F38–F43, S19–S21)
 - **F38: `money` type** — first-class financial type with dimensional rules (money × money = compile error, no FP, no overflow, no truncation)
-- **F39: `@conserve`** — compile-time money conservation proof (double-entry bookkeeping enforced by compiler — P's killer feature for banking, no other language has this)
+- **F39: `@conserve`** — compile-time money conservation proof (double-entry bookkeeping enforced by compiler — Fides's killer feature for banking, no other language has this)
 - **F40: `txn { }` blocks** — language-level atomic transactions with auto-rollback, compiler verifies all operations are reversible
 - **F41: Linear money** — money can be moved, not copied (prevents duplication at type level, like Rust ownership but for money)
 - **F42: `Account<State>` types** — state-encoded account types (Active/Frozen/Closed can't be mixed, no runtime check needed)
@@ -40,7 +70,7 @@
 - **S28–S29: Medical stdlib** — HL7/FHIR, DICOM, ICD coding, clinical calculations
 
 ### Key Insight: Cross-Industry Synergy
-All industries share the same 3 core safety systems (capabilities, effects, regions). Each industry's annotations are different configurations of those systems. Building `@deterministic` for medical makes `@gas` for blockchain cheaper. Building `@bounded` for aerospace makes `@crashfree` for gaming stronger. This is P's moat — one language, every industry, compile-time proofs.
+All industries share the same 3 core safety systems (capabilities, effects, regions). Each industry's annotations are different configurations of those systems. Building `@deterministic` for medical makes `@gas` for blockchain cheaper. Building `@bounded` for aerospace makes `@crashfree` for gaming stronger. This is Fides's moat — one language, every industry, compile-time proofs.
 
 ### Feature Count Update
 - Total features analyzed: **105** (was 69)
@@ -122,7 +152,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 ### Quantized Types
 - Added `q8` and `q4` type aliases (map to `i8` storage)
 - Added `~>` quantization cast operator: `expr ~> q8`
-- Added `quant.p` stdlib with `quantize_q8`, `dequantize_q8`, `qmatmul`, `find_quant_params`
+- Added `quant.fd` stdlib with `quantize_q8`, `dequantize_q8`, `qmatmul`, `find_quant_params`
 - New token: `TildeArrow` (`~>`)
 - New AST node: `Expr::QuantCast`
 
@@ -140,7 +170,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **Interpreter**: 78/78 normal + 1/1 expected-fail
 - **PE Emitter**: 78/78 normal + 1/1 expected-fail
 - **C Codegen**: 76/78 normal + 1/1 expected-fail (2 real mismatches: test_asm by design, test_comptime_reflect interpreter-only; test_db flaky due to HashMap ordering)
-- **Total .p test files**: 102 (79 root + 23 subdirs)
+- **Total .fd test files**: 102 (79 root + 23 subdirs)
 - **Source**: 35 .rs files, 47,397 LOC
 
 ### Phase Status Summary
@@ -175,7 +205,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **`p_print_vec` implementation**: Hand-encoded x86-64 machine code for printing vectors in `[1, 2, 3]` format. Uses callee-saved registers (RBX, R12, R13) to preserve state across `write` syscalls and `p_print_int` calls.
 
 ### Documentation Updates
-- **"Pledge" → "P" rename**: All documentation updated to use "P" as the language name (14 files). `pledgec` kept as compiler binary name. `PledgeOS` preserved as separate product name. `changelog.md` kept as "Pledge" for historical accuracy.
+- **"Pledge" → "Fides" rename**: All documentation updated to use "Fides" as the language name (14 files). `fidesc` is the compiler binary name. `.p` extension changed to `.fd` (125 files renamed).
 - **`docs/custom-toolchain.md`**: Full rewrite from aspirational Phase 1 to actual Phase 4D state — all 10 sections updated with real status.
 - **`docs/full-stack-architecture.md`**: Full rewrite — architecture diagram, PIR levels, codegen backends, linker, runtime, stdlib, embedded/IoT, hot reload, C FFI, bootstrapping strategy.
 - **`docs/syntax-spec.md`**: Targeted updates — version 0.5.0, keyword list from token.rs, stdlib types (removed non-existent Box/Rc/Arc), effect handlers status (partial), comptime reflection, attributes status (#[test]/#[derive] honest), concurrency status (parsed-only), capability security (actual syntax), hot reload (actual implementation).
@@ -193,7 +223,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 ### L2 Optimizer Fixes (opt.rs)
 - **Inliner dangling references**: Fixed bug where `replace_all_refs` ran before new instructions were fully integrated, leaving dangling references to removed call IDs. Fix: `inline_call_site_tracked` tracks all replacements across inlining rounds and applies them to newly created instructions.
 - **Topological sort**: Added `topo_sort_block` to sort block instruction lists after inlining so definitions come before uses. Terminators forced to end.
-- **`--opt` still not enabled by default**: Works for simple programs (hello.p: 3316 bytes vs 3468 without opt) but exposes pre-existing register allocator bug on complex programs (constants clobbered by intervening instructions).
+- **`--opt` still not enabled by default**: Works for simple programs (hello.fd: 3316 bytes vs 3468 without opt) but exposes pre-existing register allocator bug on complex programs (constants clobbered by intervening instructions).
 
 ### ELF64 Emitter Fix (elf64.rs)
 - **movslq memory operand**: Fixed crash on `movslq (%rax), %rax` — extended encoder to handle memory operands via `try_parse_mem` + `encode_modrm_mem`.
@@ -202,12 +232,12 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **Native JIT execution**: `compile_and_run()` compiles source to ELF64 executable via `build_executable` pipeline (PIR L1→L2→L3 → codegen → 9 peephole passes → ELF64), writes to temp file, executes as child process, captures stdout/stderr/exit code. Zero external tools.
 - **Function-level change detection**: `FunctionSnapshot::from_l2()` hashes each L2 function's debug representation (name + params + blocks + values). `FunctionSnapshot::diff()` compares snapshots and reports added/modified/removed functions.
 - **State preservation**: `PersistentState` stores key-value state in a temp file keyed by source path hash. State survives across reloads.
-- **Watch command rewrite**: `pledgec watch <file.p> [--interval <ms>] [--opt] [--no-run]` — polls for file changes, recompiles to native ELF64, reports function diff (added/modified/removed), executes, shows compile/exec time + binary size. Initial compilation + reload both use native JIT.
+- **Watch command rewrite**: `fidesc watch <file.fd> [--interval <ms>] [--opt] [--no-run]` — polls for file changes, recompiles to native ELF64, reports function diff (added/modified/removed), executes, shows compile/exec time + binary size. Initial compilation + reload both use native JIT.
 - **Removed old stub**: The old `watch` command that just re-lowered to IR and printed "Hot reload complete" without executing anything has been replaced.
 - **Tests**: 8 hot reload tests (function snapshot diff, no changes, removed functions, persistent state, compile_and_run hello, compile_and_run with opt, debugger, watcher detects changes). Total unit tests: 136 (up from 133).
 
 ### Documentation Audit
-- **README.md**: Corrected all outdated claims — 35 source files (was 25), 45K LOC (was 35K), 133 unit tests (was 85), 7/8 harness (was 8/8), 78/79 interp/PE (was 52/52), 53/79 C codegen (was 38+), 102 .p files (was 87), 9 peephole passes (was 6), ELF64 executables work (was "WIP/segfault"), FFI/const generics/GATs work (were "not parsed"), GPU backend wired (was "dead code")
+- **README.md**: Corrected all outdated claims — 35 source files (was 25), 45K LOC (was 35K), 133 unit tests (was 85), 7/8 harness (was 8/8), 78/79 interp/PE (was 52/52), 53/79 C codegen (was 38+), 102 .fd files (was 87), 9 peephole passes (was 6), ELF64 executables work (was "WIP/segfault"), FFI/const generics/GATs work (were "not parsed"), GPU backend wired (was "dead code")
 - **features.md**: Updated all status entries with verified information
 - **docs/roadmap.md**: Updated phase status and test counts
 - **docs/roadmap-limitations.md**: Updated gap analysis with verified results
@@ -221,7 +251,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **Lexer/Parser**: `region` keyword, region block parsing
 - **Typechecker**: region stack tracking, variable-to-region mapping, use-after-free detection, double-free detection, dangling pointer detection, region escape detection
 - **IR**: `Region` enum (Stack, Heap, Static, Named), `RegionRef` in PIR (`NewRegion`, `FreeRegion`, `AllocaIn`)
-- **Tests**: `tests/regions/test_region_basic.p`, `test_region_nested.p`, `test_region_escape.p` (3/3 pass)
+- **Tests**: `tests/regions/test_region_basic.fd`, `test_region_nested.fd`, `test_region_escape.fd` (3/3 pass)
 
 ### Phase 2B — Effect System
 - **IR**: `Effect` enum expanded with `Net`, `Spawn`, `Pure` (in addition to `Alloc`, `IO`, `Diverge`, `Read`, `Write`)
@@ -244,7 +274,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **Tests**: 9 tests — OOB vec get/set, overflow add/mul/sub, div-by-zero, empty vec first/last, unwrap none (9/9 pass)
 
 ### Documentation Update
-- **README.md**: Updated to reflect actual state — 35 source files, ~45,000 LOC, 133 unit tests, 7/8 harness tests, 78/79 interpreter/PE tests, 53/79 C codegen, 102 .p test files, 9 peephole passes, ELF64 executables work on Linux
+- **README.md**: Updated to reflect actual state — 35 source files, ~45,000 LOC, 133 unit tests, 7/8 harness tests, 78/79 interpreter/PE tests, 53/79 C codegen, 102 .fd test files, 9 peephole passes, ELF64 executables work on Linux
 - **docs/roadmap.md**: Updated test counts and phase status to reflect actual verified state
 - **docs/architecture.md**: Updated to show ELF64 emitter as primary backend on Linux, PIR pipeline in build command
 - **features.md**: Updated all sections with verified status, added ELF64/Mach-O/COFF/GPU backends, corrected const generics/GATs/FFI status
@@ -256,7 +286,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **Interpreter**: 78/79 pass (1 expected failure: test_trait_verify_fail)
 - **PE Emitter**: 78/79 valid (1 expected failure: test_trait_verify_fail)
 - **C Codegen**: 53/79 match (26 mismatches: asm, comptime, const_generic, gat, json, tensor, etc.)
-- **Total .p test files**: 102 (79 root + 9 safety + 4 capability + 7 effects + 3 regions)
+- **Total .fd test files**: 102 (79 root + 9 safety + 4 capability + 7 effects + 3 regions)
 
 ## [Previous] — Phase 5A: Bare Metal
 
@@ -270,15 +300,15 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **PE codegen**: emits raw x86-64 bytes from asm template (nop, hlt, cli, sti, mfence, sfence, lfence, pause, etc.)
 - **C codegen**: emits `__asm__()` blocks
 - **WASM codegen**: panics (inline asm not supported in WASM)
-- **Test**: `tests/test_asm.p` — 7 test cases covering nop, multi-instruction, inputs, outputs, in+out, fences, pause
+- **Test**: `tests/test_asm.fd` — 7 test cases covering nop, multi-instruction, inputs, outputs, in+out, fences, pause
 
 ### No-OS / Bare-Metal Mode (`--bare` flag) — 5A.2
-- **`pledgec emit <file.p> --bare -o output.bin`**: produces a flat binary (no PE headers, no IAT, no OS calls)
-- **Skips stdlib**: user code is compiled without `stdlib/core.p` — only built-in language features
+- **`fidesc emit <file.fd> --bare -o output.bin`**: produces a flat binary (no PE headers, no IAT, no OS calls)
+- **Skips stdlib**: user code is compiled without `stdlib/core.fd` — only built-in language features
 - **`pe::generate_flat_binary`**: generates `[code][padding][rdata]` layout, load address 0x10000
 - **Bare entry point**: calls `main()`, then `hlt; jmp -3` (infinite halt loop) — no `ExitProcess`
 - **Runtime stubs skipped**: no print/malloc/vec stubs (user must use inline asm for I/O)
-- **Test**: `tests/test_bare.p` — minimal bare-metal program using `asm!("hlt")`
+- **Test**: `tests/test_bare.fd` — minimal bare-metal program using `asm!("hlt")`
 
 ### Interrupt Handler Support — 5A.3
 - **`interrupt pf` keyword**: marks a function as an interrupt handler
@@ -289,7 +319,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **Builtins**: `p_cli()`, `p_sti()`, `p_hlt()`, `p_lidt(ptr)`, `p_idt_set_entry(vec, handler)`, `p_inb(port)`, `p_outb(port, val)`
 - **Bare mode**: emits real x86 instructions (cli, sti, hlt, lidt, in/out)
 - **Normal mode**: emits `ud2` (trap) since OS calls are meaningless
-- **Test**: `tests/test_interrupt.p` — interrupt handler + cli/sti/hlt builtins
+- **Test**: `tests/test_interrupt.fd` — interrupt handler + cli/sti/hlt builtins
 
 ### MMU/Page Table Management — 5A.4
 - **Control register access**: `p_cr0_read()`, `p_cr0_write(val)`, `p_cr3_read()`, `p_cr3_write(val)`, `p_cr4_read()`, `p_cr4_write(val)`
@@ -297,15 +327,15 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **Page mapping**: `p_page_map(page_table, virt, phys, flags)`, `p_page_unmap(page_table, virt)`
 - **Physical memory**: `p_phys_read64(addr)`, `p_phys_write64(addr, val)`
 - **Bare mode**: emits real x86 instructions (mov cr0/cr3/cr4, invlpg)
-- **Test**: `tests/test_mmu.p` — CR0/CR3/CR4 read, TLB invalidation, page map/unmap
+- **Test**: `tests/test_mmu.fd` — CR0/CR3/CR4 read, TLB invalidation, page map/unmap
 
 ### Boot Code Generation — 5A.5
-- **`pledgec emit <file.p> --boot -o output.bin`**: produces a Multiboot2-compatible kernel binary
+- **`fidesc emit <file.fd> --boot -o output.bin`**: produces a Multiboot2-compatible kernel binary
 - **Multiboot2 header**: magic 0xE85250D6, architecture 0 (i386), checksum, end tag — at offset 0
 - **`pe::generate_boot_binary`**: generates `[mb2 header][boot code + main code][padding][rdata]` layout
 - **Boot entry point**: sets up stack at 0x90000, calls `main()`, then halt loop
 - **Load address**: 0x100000 (1MB — typical kernel load address for GRUB)
-- **Test**: `tests/test_boot.p` — minimal kernel with cli, CR0 read, hlt
+- **Test**: `tests/test_boot.fd` — minimal kernel with cli, CR0 read, hlt
 
 ### Interpreter Fixes (Phase 5C/5D restoration)
 - **Pre-register function signatures**: lowerer now pre-registers all function return types before lowering bodies, fixing type inference for calls to functions defined later in the file
@@ -323,34 +353,34 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 
 ## [Previous] — Phase 5C: AI/ML
 
-### Tensor Type (`tensor.rs` + `stdlib/tensor.p`) — New Module
+### Tensor Type (`tensor.rs` + `stdlib/tensor.fd`) — New Module
 - **N-dimensional arrays with stride info**: shape, strides, flat f64 storage
 - **30 builtin functions**: `p_tensor_zeros`, `p_tensor_ones`, `p_tensor_filled`, `p_tensor_from_vec`, `p_tensor_get`, `p_tensor_set`, `p_tensor_shape`, `p_tensor_ndim`, `p_tensor_size`, `p_tensor_reshape`, `p_tensor_transpose`, `p_tensor_add`, `p_tensor_sub`, `p_tensor_mul`, `p_tensor_scale`, `p_tensor_matmul`, `p_tensor_dot`, `p_tensor_sum`, `p_tensor_mean`, `p_tensor_max`, `p_tensor_min`, `p_tensor_relu`, `p_tensor_sigmoid`, `p_tensor_softmax`, `p_tensor_to_str`, `p_tensor_to_json`, `p_tensor_clone`
-- **Pledge stdlib wrapper**: clean API matching the builtin names
+- **Fides stdlib wrapper**: clean API matching the builtin names
 - **`Value::Tensor` variant**: opaque type in interpreter, stored in side-table like Vec/Map
 - **Type system**: `Tensor` mapped to `IrType::Opaque("Tensor")` (not Struct, avoiding SRET)
 
-### SIMD Intrinsics (`stdlib/simd.p`) — New Module
+### SIMD Intrinsics (`stdlib/simd.fd`) — New Module
 - **9 builtin functions**: `p_simd_add`, `p_simd_sub`, `p_simd_mul`, `p_simd_div`, `p_simd_dot`, `p_simd_sum`, `p_simd_scale`, `p_simd_from_vec`, `p_simd_to_str`
-- **Pledge stdlib wrapper**: elementwise vector operations (f64x2, f64x4, etc.)
+- **Fides stdlib wrapper**: elementwise vector operations (f64x2, f64x4, etc.)
 - **Interpreter**: SIMD vectors are Vec<f64> with elementwise operations
 - **Future**: x86 backend will map to SSE/AVX instructions
 
-### Comptime Shape Verification (`stdlib/shape.p`) — New Module
+### Comptime Shape Verification (`stdlib/shape.fd`) — New Module
 - **Runtime shape assertions**: `assert_ndim`, `assert_size`, `assert_same_shape`, `assert_matmul_compatible`, `assert_reshape`
 - **Comptime shape constants**: `shape_1x1`, `shape_2x2`, `shape_2x3`, `shape_3x2`, `shape_3x4`, `shape_4x2`, `shape_4x4`, `shape_1x3`, `shape_1x4`, `shape_4x1`
 - **Future**: when comptime evaluation (Phase 3A) lands, these become compile-time checks
 
-### Auto-Parallelization Framework (`stdlib/parallel.p`) — New Module
+### Auto-Parallelization Framework (`stdlib/parallel.fd`) — New Module
 - **Parallel operations**: `par_map`, `par_sum`, `par_dot`, `par_fill`, `par_range`
 - **Parallelizability analysis**: `is_parallelizable(effect_mask)` — checks IO/State/Panic effect bits
 - **Compiler directive**: `parallel_hint()` — marks loops for future auto-parallelization
 - **Current**: runs sequentially; future effect system integration will enable true parallelism
 
-### Neural Network Example (`examples/neural_network.p`)
+### Neural Network Example (`examples/neural_network.fd`)
 - **2-layer MLP**: Input(3) → Hidden(4, ReLU) → Output(2, Softmax)
-- **Pure Pledge**: no external library, uses only tensor stdlib
-- **Success metric met**: "Write a neural network forward pass in pure Pledge"
+- **Pure Fides**: no external library, uses only tensor stdlib
+- **Success metric met**: "Write a neural network forward pass in pure Fides"
 
 ### Interpreter (`interp.rs`) — New Value Type & Helpers
 - **`Value::Tensor`**: `Rc<RefCell<Tensor>>` opaque value, stored in side-table
@@ -375,19 +405,19 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **C Codegen: 51/59 matched** (test_float pre-existing + new builtins need C stubs)
 
 ### New Test Files
-- `tests/test_tensor.p` — tensor creation, indexing, matmul, activations, transpose, reshape, JSON
-- `tests/test_simd.p` — SIMD elementwise ops, dot product, sum, scale
-- `tests/test_shape.p` — shape assertions (ndim, size, same_shape, matmul_compatible, reshape)
-- `tests/test_parallel.p` — parallel map, sum, dot, fill, range, parallelizability check
+- `tests/test_tensor.fd` — tensor creation, indexing, matmul, activations, transpose, reshape, JSON
+- `tests/test_simd.fd` — SIMD elementwise ops, dot product, sum, scale
+- `tests/test_shape.fd` — shape assertions (ndim, size, same_shape, matmul_compatible, reshape)
+- `tests/test_parallel.fd` — parallel map, sum, dot, fill, range, parallelizability check
 
 ### New Standard Library Modules
-- `stdlib/tensor.p` — Tensor standard library
-- `stdlib/simd.p` — SIMD intrinsics standard library
-- `stdlib/shape.p` — Comptime shape verification
-- `stdlib/parallel.p` — Auto-parallelization framework
+- `stdlib/tensor.fd` — Tensor standard library
+- `stdlib/simd.fd` — SIMD intrinsics standard library
+- `stdlib/shape.fd` — Comptime shape verification
+- `stdlib/parallel.fd` — Auto-parallelization framework
 
 ### New Example
-- `examples/neural_network.p` — 2-layer MLP forward pass (success metric)
+- `examples/neural_network.fd` — 2-layer MLP forward pass (success metric)
 
 ---
 
@@ -413,7 +443,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - Functional x86-64 implementations for: `p_vec_is_empty`, `p_vec_clear`, `p_vec_first`, `p_vec_last`, `p_vec_contains`, `p_string_is_empty`, `p_string_len`, `p_string_parse_int`, `p_string_clone`, `p_string_starts_with`
 - Simplified stubs (return default values) for complex operations: `insert`, `remove`, `reverse`, `extend`, `sort`, `split`, `replace`, `trim`, `to_uppercase`, `to_lowercase`, `find`, `rfind`, `repeat`
 
-### Tests (`tests/test_collections.p`)
+### Tests (`tests/test_collections.fd`)
 - Comprehensive test file covering all 49 operations across String, Vec, and HashMap
 - All tests pass in interpreter backend
 
@@ -428,7 +458,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 
 ### PE Emitter (`pe.rs`) — Direct Native Code Generation
 - **New backend**: Encodes x86_64 instructions directly to machine code bytes and constructs a valid PE file — no `ml64.exe`, `link.exe`, or C compiler required
-- **`emit` CLI command**: `pledgec emit <file.p> -o <out.exe>` — full pipeline: lex → parse → typecheck → monomorphize → lower → x86 machine code → PE file → `.exe`
+- **`emit` CLI command**: `fidesc emit <file.fd> -o <out.exe>` — full pipeline: lex → parse → typecheck → monomorphize → lower → x86 machine code → PE file → `.exe`
 - **Full x86_64 instruction encoder**: REX prefixes (W/R/X/B bits), ModR/M + SIB bytes, 8-bit/32-bit displacement encoding, immediate encoding
 - **Register model**: All 16 x86_64 registers (RAX–R15) with correct encoding for extended registers (R8–R15)
 - **Instruction set**: `mov_rr`, `mov_mem_disp_reg`, `mov_mem_disp_reg32` (32-bit store), `mov_r_imm`, `mov_r8_imm`, `mov_mem_reg8`, `add_rr`, `sub_rr`, `imul_rr`, `xor_rr`, `and_rr`, `or_rr`, `cmp_rr`, `test_rr`, `jcc_label`, `call_label`, `call_reg`, `call_rip`, `ret`, `push`, `pop`, `lea_rbp`, `sub_rsp_i32`, `add_rsp_i32`, `dec_r`, `inc_r`, `xor_self`
@@ -451,14 +481,14 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **Integer print length off-by-one**: Buffer length was calculated as `r13 - r8` (buffer_end - current_pos), excluding the newline stored at `r13`. Added `+1` to include it
 
 ### Build Status
-- `emit` verified: `hello.p` generates valid PE, produces correct output:
+- `emit` verified: `hello.fd` generates valid PE, produces correct output:
   ```
-  Hello, Pledge!
+  Hello, Fides!
   50
   y is big
   ```
 - Output matches interpreter (`run` command) and MASM (`build` command) exactly
-- Exit codes work correctly (`minimal.p` returns 42, `hello.p` returns 0)
+- Exit codes work correctly (`minimal.fd` returns 42, `hello.fd` returns 0)
 - Compiles successfully with warnings (unused variants — expected)
 
 ---
@@ -475,12 +505,12 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 
 ### Module Import Resolution (`compiler.rs`)
 - `use foo::bar` imports now resolve files from disk
-- Searches for `<path>.p` or `<path>/mod.p` relative to source file
-- Also searches `pledge_modules/` subdirectory
+- Searches for `<path>.fd` or `<path>/mod.fd` relative to source file
+- Also searches `fides_modules/` subdirectory
 - Module merging: stdlib + imported modules + user code (user wins on conflicts)
 - Module-level visibility enforcement in typechecker
 - Import error messages with suggestions (Levenshtein distance for "did you mean")
-- `core` module auto-included (stdlib/core.p prepended to every program)
+- `core` module auto-included (stdlib/core.fd prepended to every program)
 
 ### Compiler Pipeline Updates
 - All entry points now accept `source_path` for import resolution
@@ -493,7 +523,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 
 ### C Code Generator (`codegen_c.rs`)
 - **New backend**: Translates SSA IR to portable C code (C99) that compiles with MSVC (`cl.exe`), GCC, or Clang
-- **`ccompile` CLI command**: `pledgec ccompile <file.p> -o <out.exe>` — full pipeline: lex → parse → typecheck → lower → C codegen → compile with `cl.exe` → native `.exe`
+- **`ccompile` CLI command**: `fidesc ccompile <file.fd> -o <out.exe>` — full pipeline: lex → parse → typecheck → lower → C codegen → compile with `cl.exe` → native `.exe`
 - **MSVC environment setup**: `find_cl()` and `find_vcvarsall()` functions locate the MSVC compiler and set up its environment via `vcvarsall.bat`
 - **Function renaming**: `main` → `main_entry` (avoids conflict with C `main` wrapper), `abs`/`max`/`min` → `p_abs`/`p_max`/`p_min` (avoids MSVC intrinsic/macro conflicts)
 - **`#undef` directives**: `#undef max`/`#undef min`/`#undef abs` in generated C to avoid MSVC macro conflicts
@@ -513,9 +543,9 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 
 ### Build Status
 - Compiles successfully with warnings (unused imports/variants — expected)
-- `ccompile` verified: `hello.p` generates valid C, compiles with MSVC `cl.exe`, and produces correct output:
+- `ccompile` verified: `hello.fd` generates valid C, compiles with MSVC `cl.exe`, and produces correct output:
   ```
-  Hello, Pledge!
+  Hello, Fides!
   50
   y is big
   ```
@@ -535,7 +565,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **Compound assignment fix**: `lower_compound_assign` and `Stmt::Assign` compound path now use `get_value_type()` / `alloca_types` for correct `BinOp` type instead of hardcoded `I64`
 - **`Stmt::Return` defer emission**: `emit_defers` helper added — drains deferred statements from `defer_stack` and emits them before `Ret` instruction
 - **`defer_stack` field**: New `Vec<Vec<Stmt>>` on `Lowerer` for tracking deferred statements per scope
-- **`Expr::MethodCall` lowering**: Method name mangling (`__pledge_StructName_method`), SRET handling for struct returns, receiver passed as first argument
+- **`Expr::MethodCall` lowering**: Method name mangling (`__fides_StructName_method`), SRET handling for struct returns, receiver passed as first argument
 - **`Expr::Match` as expression**: `lower_match_expr` with result slot alloca, pattern matching branches, merge block for result
 - **`infer_match_type`**: Infers the result type of a match expression from its arms
 - **Match pattern lowering**: Extended to support `Pattern::StrLit` (string comparison), `Pattern::Range` (bounds check with `BinOp::Lt`/`GtEq`), `Pattern::EnumVariant` (variant discriminant check with bindings)
@@ -552,12 +582,12 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **Array literal element type**: Changed from hardcoded `Type::I32` to `Type::I64` to match `IntLit` lowering (which produces `I64` values)
 
 ### Test Files (Batch 7)
-- `tests/features6.p` — array literals `[1, 2, 3, 4, 5]`, array indexing (read/write), compound assignment on array elements (`arr[2] += 100`), `for` loop over array with sum accumulation
+- `tests/features6.fd` — array literals `[1, 2, 3, 4, 5]`, array indexing (read/write), compound assignment on array elements (`arr[2] += 100`), `for` loop over array with sum accumulation
 
 ### Build Status
 - Compiles successfully with warnings (unused variants — expected)
-- `run` command verified: `hello.p`, `struct_return.p`, `features6.p` all produce correct output in interpreter
-- `features6.p` output: `1, 3, 5, 10, 20, 103, 142` (array reads, writes, compound assign, for-loop sum)
+- `run` command verified: `hello.fd`, `struct_return.fd`, `features6.fd` all produce correct output in interpreter
+- `features6.fd` output: `1, 3, 5, 10, 20, 103, 142` (array reads, writes, compound assign, for-loop sum)
 
 ---
 
@@ -582,21 +612,21 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - Function calls → `Inst::Call` with argument value IDs
 - F-string lowering:
   - Literal parts → `ConstStr`
-  - Expression parts → `__pledge_to_str` call (skipped if already string type)
-  - All parts concatenated via `__pledge_str_concat`
-  - Type check: if expression IR type is `Ptr`, skip `__pledge_to_str` (prevents treating string pointer as integer)
+  - Expression parts → `__fides_to_str` call (skipped if already string type)
+  - All parts concatenated via `__fides_str_concat`
+  - Type check: if expression IR type is `Ptr`, skip `__fides_to_str` (prevents treating string pointer as integer)
 - Constants (`pc`) → `Inst::Const` with value inlined
 - Binary ops, unary ops, comparisons → corresponding `Inst` variants
-- Runtime function registration: `__pledge_print_int`, `__pledge_print_str`, `__pledge_print_bool`, `__pledge_to_str`, `__pledge_str_concat`, `__pledge_panic`
+- Runtime function registration: `__fides_print_int`, `__fides_print_str`, `__fides_print_bool`, `__fides_to_str`, `__fides_str_concat`, `__fides_panic`
 
 ### IR Interpreter (`interp.rs`)
 - Direct execution of SSA IR — no external assembler needed
 - `run` CLI command for fast iteration
 - Value types: `Int`, `Float`, `Bool`, `Str`, `Ptr`, `Unit`
 - Runtime function handling:
-  - `print` → dispatches to `__pledge_print_int`, `__pledge_print_str`, `__pledge_print_bool` based on value type
-  - `__pledge_to_str` → converts `Int`, `Bool`, `Float` to `Str`; `Str` passes through
-  - `__pledge_str_concat` → concatenates `Str` and `Ptr` values
+  - `print` → dispatches to `__fides_print_int`, `__fides_print_str`, `__fides_print_bool` based on value type
+  - `__fides_to_str` → converts `Int`, `Bool`, `Float` to `Str`; `Str` passes through
+  - `__fides_str_concat` → concatenates `Str` and `Ptr` values
 - Verbose mode (`-v`) for debugging IR execution
 - `RunResult::Return(Value)` and `RunResult::Panic(String)` result types
 
@@ -606,44 +636,44 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - Stack frame: `push rbp` / `mov rbp, rsp` / `sub rsp, N` prologues with pre-allocated alloca slots
 - Non-volatile register preservation: `r12`/`r13` saved/restored in runtime stubs
 - Runtime stubs (generated inline, no C runtime dependency):
-  - `__pledge_print_int` — integer to string + `WriteFile` to stdout
-  - `__pledge_print_str` — string + newline to stdout
-  - `__pledge_print_bool` — "true"/"false" to stdout
-  - `__pledge_to_str` — integer to null-terminated string in stack buffer
-  - `__pledge_str_concat` — concatenates two strings into static buffer with temp buffer to avoid aliasing
-  - `__pledge_panic` — prints message + `ExitProcess`
+  - `__fides_print_int` — integer to string + `WriteFile` to stdout
+  - `__fides_print_str` — string + newline to stdout
+  - `__fides_print_bool` — "true"/"false" to stdout
+  - `__fides_to_str` — integer to null-terminated string in stack buffer
+  - `__fides_str_concat` — concatenates two strings into static buffer with temp buffer to avoid aliasing
+  - `__fides_panic` — prints message + `ExitProcess`
 - Static data: string literals, `str_concat_buf`, `str_concat_tmp` in `.data` section (`BYTE 4096 DUP(?)`)
 - MASM addressing: `mov reg, OFFSET label` for static data (avoids `ADDR32` relocation errors)
 - External imports: `GetStdHandle`, `WriteFile`, `ExitProcess` from `kernel32.lib`
 - Entry point: `main` / `_main` (both exported)
 
 ### CLI Commands
-- `build <file.p> -o <out.exe>` — full pipeline to native Windows executable (ml64.exe + link.exe)
-- `ccompile <file.p> -o <out.exe>` — full pipeline via C codegen + MSVC cl.exe (added in Batch 8)
-- `run <file.p> [-v]` — interpret via IR (no external tools needed)
-- `ir <file.p>` — print lowered SSA IR
-- `compile <file.p> -o <out.s>` — legacy ARM64 codegen
+- `build <file.fd> -o <out.exe>` — full pipeline to native Windows executable (ml64.exe + link.exe)
+- `ccompile <file.fd> -o <out.exe>` — full pipeline via C codegen + MSVC cl.exe (added in Batch 8)
+- `run <file.fd> [-v]` — interpret via IR (no external tools needed)
+- `ir <file.fd>` — print lowered SSA IR
+- `compile <file.fd> -o <out.s>` — legacy ARM64 codegen
 - `tokens`, `ast`, `version` — unchanged
 
 ### Bug Fixes
 - **For loop infinite loop**: `lower_for` now uses `alloca` for loop variable so increments persist across iterations
-- **F-string only printing first literal**: `lower_fstring` now concatenates all parts (literals + expression-converted strings) via `__pledge_str_concat`
-- **F-string string variables printing memory address**: Type check added — if expression is already `IrType::Ptr` (string), `__pledge_to_str` is skipped
-- **Recursive function calls crashing in x86**: Non-volatile registers `r12`/`r13` now saved/restored in `__pledge_print_int`, `__pledge_print_str`, `__pledge_print_bool` stubs (Windows x64 ABI compliance)
+- **F-string only printing first literal**: `lower_fstring` now concatenates all parts (literals + expression-converted strings) via `__fides_str_concat`
+- **F-string string variables printing memory address**: Type check added — if expression is already `IrType::Ptr` (string), `__fides_to_str` is skipped
+- **Recursive function calls crashing in x86**: Non-volatile registers `r12`/`r13` now saved/restored in `__fides_print_int`, `__fides_print_str`, `__fides_print_bool` stubs (Windows x64 ABI compliance)
 - **Linker error `LNK2017: ADDR32`**: Changed `lea reg, [rip + label]` to `mov reg, OFFSET label` for static data buffers in MASM
 - **MASM error `undefined symbol: rip`**: MASM does not use `rip` keyword; removed explicit `rip +` addressing
-- **Buffer aliasing in `__pledge_str_concat`**: Added `str_concat_tmp` buffer — left string copied to temp first, then to output buffer
+- **Buffer aliasing in `__fides_str_concat`**: Added `str_concat_tmp` buffer — left string copied to temp first, then to output buffer
 
 ### Test Files (Batch 6)
-- `tests/control_flow.p` — if/else if/else, for loops with `..` and `..=` ranges
-- `tests/functions.p` — user-defined functions, recursive `factorial(5)`
-- `tests/strings.p` — string literals, string variables, f-string interpolation with string and integer expressions
-- `tests/struct_return.p` — struct return via SRET calling convention, field access on returned structs
+- `tests/control_flow.fd` — if/else if/else, for loops with `..` and `..=` ranges
+- `tests/functions.fd` — user-defined functions, recursive `factorial(5)`
+- `tests/strings.fd` — string literals, string variables, f-string interpolation with string and integer expressions
+- `tests/struct_return.fd` — struct return via SRET calling convention, field access on returned structs
 
 ### Build Status
 - Compiles successfully
-- `run` command verified: `hello.p`, `control_flow.p`, `functions.p`, `strings.p`, `features.p` all produce correct output in interpreter
-- `build` command verified: `control_flow.p`, `functions.p`, `strings.p` all build and run correctly as native x86_64 executables
+- `run` command verified: `hello.fd`, `control_flow.fd`, `functions.fd`, `strings.fd`, `features.fd` all produce correct output in interpreter
+- `build` command verified: `control_flow.fd`, `functions.fd`, `strings.fd` all build and run correctly as native x86_64 executables
 
 ---
 
@@ -719,7 +749,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - New `Expr::StrConcat { left, right }` AST node
 - New `Pattern::StrLit(String)` variant
 - Typechecker: `BinOp::Add` with `Str + Str` returns `Type::Str`
-- Codegen: `StrConcat` calls `__pledge_str_concat` runtime function
+- Codegen: `StrConcat` calls `__fides_str_concat` runtime function
 
 ### G31: Modules & Imports
 - `use std::io;` — module import syntax
@@ -738,7 +768,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - Attributes parsed at top level alongside functions, structs, enums
 
 ### Test Files (Batch 4)
-- `tests/features4.p` — tests for enums, references, string concat, imports, attributes
+- `tests/features4.fd` — tests for enums, references, string concat, imports, attributes
 
 ---
 
@@ -778,7 +808,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - `gen_expr` for `FloatLit` loads via `adr` + `ldr d0`
 
 ### Test Files (Batch 3)
-- `tests/features3.p` — tests for arrays, match, f-strings, floats
+- `tests/features3.fd` — tests for arrays, match, f-strings, floats
 
 ---
 
@@ -803,7 +833,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - New `Expr::MethodCall` AST node: `receiver.method(args)`
 - Parser: `parse_impl()`, method call parsing in `parse_postfix()`
 - Typechecker: method registration per struct, arg count validation (self excluded)
-- Codegen: mangled method names (`__pledge_StructName_method`), struct type tracking via `var_types`
+- Codegen: mangled method names (`__fides_StructName_method`), struct type tracking via `var_types`
 
 ### Block-as-Expression
 - `{ stmt; stmt; expr }` returns final expression value
@@ -823,7 +853,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - Underscore separators: `1_000_000`, `0xFF_FF`
 
 ### Test Files (Batch 2)
-- `tests/features2.p` — tests for ranges, type aliases, block expressions, struct methods
+- `tests/features2.fd` — tests for ranges, type aliases, block expressions, struct methods
 
 ---
 
@@ -831,10 +861,10 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 
 ### Language Syntax
 
-#### Keyword Renames (Rust → Pledge)
-- `fn` → `pf` (Pledge Function) — used for all functions
-- `let` / `let mut` → `pv` / `pv mut` (Pledge Variable)
-- `const` → `pc` (Pledge Constant)
+#### Keyword Renames (Rust → Fides)
+- `fn` → `pf` (Fides Function) — used for all functions
+- `let` / `let mut` → `pv` / `pv mut` (Fides Variable)
+- `const` → `pc` (Fides Constant)
 - `trait` → `cap` (capability/trait)
 - `return` → `ret`
 - `type` → `ty` (type alias)
@@ -847,7 +877,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - `region` — explicit region (replaces lifetime annotations)
 
 #### File Extension
-- Changed from `.pl` to `.p` to avoid collision with Perl
+- Changed from `.pl` to `.fd` to avoid collision with Perl
 
 ### Compiler Features
 
@@ -963,8 +993,8 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - Updated `count_lets()` to handle new statement types
 
 ### IDE Support
-- `.vscode/settings.json` — associates `.p` files with Pledge language
-- `.vscode/pledge.tmLanguage.json` — TextMate grammar for syntax highlighting
+- `.vscode/settings.json` — associates `.fd` files with Fides language
+- `.vscode/fides.tmLanguage.json` — TextMate grammar for syntax highlighting
 - Scopes: keywords, types, strings, comments, numbers, functions
 
 ### Documentation
@@ -972,10 +1002,10 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - `docs/syntax-spec.md` — updated with new keywords and syntax
 
 ### Test Files
-- `tests/hello.p` — updated to new syntax (`pf`, `pv`, semicolons)
-- `tests/struct.p` — updated to new syntax
-- `tests/arithmetic.p` — updated to new syntax
-- `tests/features.p` — new test exercising compound assignment, bitwise ops, while loops, mutable vars, constants
+- `tests/hello.fd` — updated to new syntax (`pf`, `pv`, semicolons)
+- `tests/struct.fd` — updated to new syntax
+- `tests/arithmetic.fd` — updated to new syntax
+- `tests/features.fd` — new test exercising compound assignment, bitwise ops, while loops, mutable vars, constants
 
 ### Build Status
 - Compiles successfully with 5 warnings (all dead code — expected for unused AST fields)

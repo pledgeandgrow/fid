@@ -1,4 +1,4 @@
-# P Compiler Architecture
+# Fides Compiler Architecture
 
 **Version:** 0.5.0
 **Targets:** x86_64 (Windows PE + Linux ELF64), ARM64, RISC-V, Mach-O (macOS), COFF (Windows), WebAssembly, SPIR-V (GPU), bare-metal flat binary, C codegen, IR interpreter
@@ -8,7 +8,7 @@
 ## 1. Pipeline Overview
 
 ```
-Source (.p)
+Source (.fd)
     │
     ▼
 ┌──────────┐     ┌──────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────┐     ┌───────────────┐
@@ -94,20 +94,20 @@ The **`build` command** uses the full PIR pipeline (L1→L2→L3 → codegen →
 | Codegen (`codegen_x64.rs`, `codegen_arm64.rs`, `codegen_riscv.rs`) | PIR L3 → x86-64 / ARM64 / RISC-V assembly | `codegen` |
 | WASM backend (`wasm.rs`) | PIR L3 → WebAssembly binary | `wasm` |
 | GPU backend (`gpu.rs`) | PIR L3 → SPIR-V binary | `gpu` |
-| C header parser (`cparser.rs`) | C header → P FFI bindings | `parse-header` |
+| C header parser (`cparser.rs`) | C header → Fides FFI bindings | `parse-header` |
 | Hot reload (`hotreload.rs`) | Native JIT (ELF64) + function-level change detection | `watch` |
 | Linker (`linker.rs`) | Multiple object files → linked binary | `link` |
 
 ### Module Resolution (`compiler.rs`)
 
 Before type-checking, the compiler:
-1. Parses `stdlib/core.p` (auto-included) — Option, Result, println, assert, max, min, abs, clamp
+1. Parses `stdlib/core.fd` (auto-included) — Option, Result, println, assert, max, min, abs, clamp
 2. Parses user source with stdlib names pre-populated
-3. Resolves `use` imports by searching for `<path>.p` or `<path>/mod.p` relative to source
+3. Resolves `use` imports by searching for `<path>.fd` or `<path>/mod.fd` relative to source
 4. Merges stdlib + imported modules + user code (user wins on conflicts)
 5. Type-checks the merged program with module-level visibility enforcement
 
-**Standard library modules** (in `stdlib/`): `core.p` (auto-included), `json.p`, `tensor.p`, `parallel.p`, `db.p`, `http.p`, `simd.p`, `shape.p`, `quant.p` — imported explicitly via `use`.
+**Standard library modules** (in `stdlib/`): `core.fd` (auto-included), `json.fd`, `tensor.fd`, `parallel.fd`, `db.fd`, `http.fd`, `simd.fd`, `shape.fd`, `quant.fd` — imported explicitly via `use`.
 
 ### Monomorphization (`mono.rs`)
 
@@ -126,7 +126,7 @@ After type-checking, generic functions are monomorphized:
 Reads source text character-by-character and produces a `Vec<Token>`.
 
 **Key responsibilities:**
-- Tokenize all P keywords (`pf`, `pv`, `pc`, `ret`, `if`, `else`, `for`, `while`, `match`, etc.)
+- Tokenize all Fides keywords (`pf`, `pv`, `pc`, `ret`, `if`, `else`, `for`, `while`, `match`, etc.)
 - Parse integer literals (decimal, hex `0xFF`, binary `0b1010`, octal `0o777`, underscores `1_000`)
 - Parse float literals (`3.14`, `3.14f32`)
 - Parse string literals (`"hello"`)
@@ -259,12 +259,12 @@ Terminator
 - **While loops** → condition block, body block, back-edge
 - **If/else** → `CondBr` to then/else blocks, merge block
 - **Defer blocks** → `defer_stack: Vec<Vec<Stmt>>` tracks deferred statements; `emit_defers` drains and emits them before `Ret` instructions
-- **F-strings** → `ConstStr` for literals, `__pledge_to_str` for non-string expressions, `__pledge_str_concat` to join all parts
+- **F-strings** → `ConstStr` for literals, `__fides_to_str` for non-string expressions, `__fides_str_concat` to join all parts
 - **Constants** → `Inst::Const` with value inlined
 - **Array literals** → `Alloca` for array, `GetElemPtr` + `Store` per element, returns array pointer
 - **Array indexing** → `GetElemPtr` with element type from array type, `Load` with correct element type
 - **Array index assignment** → `GetElemPtr` + `Store` (with compound assignment via `Load` + `BinOp` + `Store`)
-- **Method calls** → Name mangling (`__pledge_StructName_method`), receiver as first arg, SRET for struct returns
+- **Method calls** → Name mangling (`__fides_StructName_method`), receiver as first arg, SRET for struct returns
 - **Match expressions** → `lower_match_expr` with result slot `alloca`, pattern matching branches, merge block
 - **Match patterns** → `IntLit` (equality), `StrLit` (string comparison), `Range` (bounds check), `EnumVariant` (discriminant + bindings), `Wildcard`, `Ident` (binding)
 - **Tuple literals** → `Alloca` for tuple struct, `GetFieldPtr` + `Store` per element
@@ -273,7 +273,7 @@ Terminator
 - **Closures** → Lambda lifting: creates new `IrFunction` with mangled name (no environment capture yet)
 - **Compound assignment** → Uses `get_value_type()` / `alloca_types` for correct `BinOp` type instead of hardcoded `I64`
 - **Loop stack** → 3-tuple `(cond_block, exit_block, Option<ValueId>)` for loop-as-expression break values
-- **Runtime functions** registered as externs: `__pledge_print_int`, `__pledge_print_str`, `__pledge_print_bool`, `__pledge_to_str`, `__pledge_str_concat`, `__pledge_panic`
+- **Runtime functions** registered as externs: `__fides_print_int`, `__fides_print_str`, `__fides_print_bool`, `__fides_to_str`, `__fides_str_concat`, `__fides_panic`
 
 ### 2.5 IR Interpreter (`interp.rs`)
 
@@ -295,9 +295,9 @@ Value
 - Evaluates instructions and maintains a `HashMap<ValueId, Value>` per function
 - Handles `Alloca` by allocating stack slots in a `HashMap<usize, Value>`
 - Runtime functions are intercepted in `call_runtime()`:
-  - `print` → dispatches based on value type to `__pledge_print_int/str/bool`
-  - `__pledge_to_str` → converts `Int`/`Bool`/`Float` to `Str`; `Str` passes through
-  - `__pledge_str_concat` → concatenates two string values
+  - `print` → dispatches based on value type to `__fides_print_int/str/bool`
+  - `__fides_to_str` → converts `Int`/`Bool`/`Float` to `Str`; `Str` passes through
+  - `__fides_str_concat` → concatenates two string values
 - Returns `RunResult::Return(Value)` or `RunResult::Panic(String)`
 
 ### 2.6 PE Emitter (`pe.rs`) — Direct Native Code Generation
@@ -360,12 +360,12 @@ Generates MASM-compatible x86_64 assembly from SSA IR.
    - Return value in RAX
 
 4. **Runtime stubs** (generated inline):
-   - `__pledge_print_int`: Converts integer to string in stack buffer, calls `WriteFile`
-   - `__pledge_print_str`: Calls `WriteFile` with string pointer
-   - `__pledge_print_bool`: Prints "true" or "false"
-   - `__pledge_to_str`: Converts integer to null-terminated string in stack buffer (reverse fill)
-   - `__pledge_str_concat`: Copies left string to temp buffer, then both to output buffer (avoids aliasing)
-   - `__pledge_panic`: Prints message, calls `ExitProcess`
+   - `__fides_print_int`: Converts integer to string in stack buffer, calls `WriteFile`
+   - `__fides_print_str`: Calls `WriteFile` with string pointer
+   - `__fides_print_bool`: Prints "true" or "false"
+   - `__fides_to_str`: Converts integer to null-terminated string in stack buffer (reverse fill)
+   - `__fides_str_concat`: Copies left string to temp buffer, then both to output buffer (avoids aliasing)
+   - `__fides_panic`: Prints message, calls `ExitProcess`
 
 5. **Non-volatile registers**: `r12`, `r13` saved/restored in runtime stubs (Windows x64 ABI)
 
@@ -435,7 +435,7 @@ The legacy `build` MASM pipeline (Windows, external tools) is also available:
 
 ### 2.10 Backends Overview
 
-The P compiler supports multiple output backends, each consuming either IR or PIR L3:
+The Fides compiler supports multiple output backends, each consuming either IR or PIR L3:
 
 | Backend | Source File | Input | Output | CLI Command |
 |---------|-----------|-------|--------|-------------|
@@ -458,7 +458,7 @@ The P compiler supports multiple output backends, each consuming either IR or PI
 
 ### 2.11 AI/ML Extensions
 
-The P compiler includes six AI/ML-oriented features that extend the language for neural network programming, automatic differentiation, GPU acceleration, and quantization. These features are integrated into the existing pipeline through new AST nodes, compiler passes, and a dedicated autograd module.
+The Fides compiler includes six AI/ML-oriented features that extend the language for neural network programming, automatic differentiation, GPU acceleration, and quantization. These features are integrated into the existing pipeline through new AST nodes, compiler passes, and a dedicated autograd module.
 
 **Pipeline Operator (`|>`):**
 - New token `PipeArrow` (`|>`) in `token.rs`, lexed by `lexer.rs`
@@ -504,8 +504,8 @@ The P compiler includes six AI/ML-oriented features that extend the language for
 - New token `TildeArrow` (`~>`) in `token.rs`, lexed by `lexer.rs`
 - New AST node `Expr::QuantCast` in `ast.rs` — parsed by `parser.rs`
 - `q8` and `q4` type aliases map to `i8` storage — registered in the typechecker
-- `expr ~> q8` quantization cast operator — lowered to calls to `quantize_q8` / `quantize_q4` from `stdlib/quant.p`
-- New stdlib module `stdlib/quant.p` with `quantize_q8`, `dequantize_q8`, `qmatmul`, `find_quant_params`
+- `expr ~> q8` quantization cast operator — lowered to calls to `quantize_q8` / `quantize_q4` from `stdlib/quant.fd`
+- New stdlib module `stdlib/quant.fd` with `quantize_q8`, `dequantize_q8`, `qmatmul`, `find_quant_params`
 
 ---
 
@@ -529,7 +529,7 @@ The compiler includes a suite of scripts and conventions for maintaining correct
 | File | Responsibility |
 |------|---------------|
 | `src/main.rs` | CLI entry point, command dispatch, external tool invocation |
-| `src/token.rs` | `TokenKind` enum (all P keywords and operators) |
+| `src/token.rs` | `TokenKind` enum (all Fides keywords and operators) |
 | `src/lexer.rs` | Tokenizer: source text → `Vec<Token>` |
 | `src/ast.rs` | AST node definitions: `Program`, `Func`, `Stmt`, `Expr`, `StructDef`, `EnumDef`, etc. |
 | `src/parser.rs` | Recursive descent parser: `Vec<Token>` → `Program` |
@@ -553,7 +553,7 @@ The compiler includes a suite of scripts and conventions for maintaining correct
 | `src/gpu.rs` | **SPIR-V GPU backend**: PIR L3 → SPIR-V binary (`gpu` command) |
 | `src/embedded.rs` | Embedded systems support: `FixedBufferAllocator`, `RealTime` effect, HAL abstractions |
 | `src/hotreload.rs` | **Hot reload**: native JIT (ELF64) + function-level change detection (`watch` command) |
-| `src/cparser.rs` | **C header parser**: parses C `.h` files → generates P FFI bindings (`parse-header` command) |
+| `src/cparser.rs` | **C header parser**: parses C `.h` files → generates Fides FFI bindings (`parse-header` command) |
 | `src/pir.rs` | **PIR**: multi-level IR (L1/L2/L3) — `IrModule` → PIR |
 | `src/comptime.rs` | **Compile-time eval**: constant folding, reflection, f-string interpolation |
 | `src/opt.rs` | **PIR optimizer**: const fold, CSE, DCE, inline, unroll, TCO, effect-based elision (opt-in, has regalloc bug) |
@@ -562,19 +562,19 @@ The compiler includes a suite of scripts and conventions for maintaining correct
 | `src/mono.rs` | Generic monomorphization: specializes generic functions per call site |
 | `src/compiler.rs` | Pipeline orchestration, module resolution, stdlib auto-include, layer/model desugaring |
 | `src/autograd.rs` | **Autograd**: tape-based gradient computation framework — reverse-mode AD for `grad` blocks |
-| `stdlib/core.p` | Core standard library (println, assert, assert_eq) |
-| `tests/*.p` | Test programs (hello, struct, struct_return, features2-6, control_flow, functions, strings) |
+| `stdlib/core.fd` | Core standard library (println, assert, assert_eq) |
+| `tests/*.fd` | Test programs (hello, struct, struct_return, features2-6, control_flow, functions, strings) |
 
 ---
 
 ## 5. Data Flow Example
 
-For `tests/strings.p`:
+For `tests/strings.fd`:
 
 ```p
 pf main() {
     print("Hello, World!");
-    pv name = "P";
+    pv name = "Fides";
     print(name);
     pv greeting = f"Hello, {name}!";
     print(greeting);
@@ -583,25 +583,25 @@ pf main() {
 }
 ```
 
-1. **Lexer** produces tokens: `Keyword(Pf)`, `Ident("main")`, `LParen`, `RParen`, `LBrace`, `Ident("print")`, `LParen`, `StrLit("Hello, World!")`, `RParen`, `Semicolon`, `Keyword(Pv)`, `Ident("name")`, `Assign`, `StrLit("P")`, `Semicolon`, ...
+1. **Lexer** produces tokens: `Keyword(Pf)`, `Ident("main")`, `LParen`, `RParen`, `LBrace`, `Ident("print")`, `LParen`, `StrLit("Hello, World!")`, `RParen`, `Semicolon`, `Keyword(Pv)`, `Ident("name")`, `Assign`, `StrLit("Fides")`, `Semicolon`, ...
 
-2. **Parser** builds AST with `Func { name: "main", body: [Expr(Call(print, "Hello, World!")), Let(name, "P"), Expr(Call(print, Ident(name))), Let(greeting, FString([Literal("Hello, "), Expr(Ident(name)), Literal("!")])), ...] }`
+2. **Parser** builds AST with `Func { name: "main", body: [Expr(Call(print, "Hello, World!")), Let(name, "Fides"), Expr(Call(print, Ident(name))), Let(greeting, FString([Literal("Hello, "), Expr(Ident(name)), Literal("!")])), ...] }`
 
 3. **TypeChecker** validates: `print` takes `str`, `name` is `str`, f-string parts are valid, etc.
 
 4. **Lowerer** produces IR:
-   - `ConstStr("Hello, World!")` → `Call(__pledge_print_str, [str])`
-   - `ConstStr("P")` → `Store(alloca_name, str)`
-   - `Load(alloca_name)` → `Call(__pledge_print_str, [str])`
-   - `ConstStr("Hello, ")` + `Load(alloca_name)` (already Ptr, skip `__pledge_to_str`) + `Call(__pledge_str_concat, [prev, name])` + `ConstStr("!")` + `Call(__pledge_str_concat, [prev, "!"])` → `Call(__pledge_print_str, [result])`
-   - `Const(42)` → `Call(__pledge_to_str, [42])` → concat with `ConstStr("x = ")` → `Call(__pledge_print_str, [result])`
+   - `ConstStr("Hello, World!")` → `Call(__fides_print_str, [str])`
+   - `ConstStr("Fides")` → `Store(alloca_name, str)`
+   - `Load(alloca_name)` → `Call(__fides_print_str, [str])`
+   - `ConstStr("Hello, ")` + `Load(alloca_name)` (already Ptr, skip `__fides_to_str`) + `Call(__fides_str_concat, [prev, name])` + `ConstStr("!")` + `Call(__fides_str_concat, [prev, "!"])` → `Call(__fides_print_str, [result])`
+   - `Const(42)` → `Call(__fides_to_str, [42])` → concat with `ConstStr("x = ")` → `Call(__fides_print_str, [result])`
 
-5. **Interpreter** executes: prints "Hello, World!", "P", "Hello, P!", "x = 42"
+5. **Interpreter** executes: prints "Hello, World!", "Fides", "Hello, Fides!", "x = 42"
 
 6. **x86 Codegen** generates MASM assembly with:
    - String literals in `.data`
    - `main` function with prologue, calls to runtime stubs, epilogue
-   - Runtime stubs for `__pledge_print_str`, `__pledge_to_str`, `__pledge_str_concat`
+   - Runtime stubs for `__fides_print_str`, `__fides_to_str`, `__fides_str_concat`
    - `EXTERN GetStdHandle`, `WriteFile`, `ExitProcess`
 
 7. **ml64.exe** assembles `.asm` → `.obj`

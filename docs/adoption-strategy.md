@@ -1,4 +1,4 @@
-# P Adoption Strategy
+# Fides Adoption Strategy
 
 > Build it and they will come — only if switching is easy.
 
@@ -9,28 +9,28 @@ Every new language faces the chicken-and-egg problem:
 - Ecosystems form around users
 - Nobody switches languages for marginal improvements
 
-**P's strategy: target niches where P uniquely wins, then expand.**
+**Fides's strategy: target niches where Fides uniquely wins, then expand.**
 
 ---
 
 ## Phase 1: Niche Domination (Year 1-2)
 
 ### Niche 1: Embedded AI
-- **Why P wins:** SIMD types + comptime shape verification + bare metal + memory safety
+- **Why Fides wins:** SIMD types + comptime shape verification + bare metal + memory safety
 - **Why not Rust:** No SIMD first-class, compile times too slow for iteration
 - **Why not Python:** Too slow, no bare metal, GC pauses
 - **Target users:** AI researchers deploying models to edge devices
 - **Killer feature:** Write AI inference code that runs on a microcontroller with memory safety
 
 ### Niche 2: Robotics
-- **Why P wins:** Real-time effects + capability security + hot reload on running robots
+- **Why Fides wins:** Real-time effects + capability security + hot reload on running robots
 - **Why not Rust:** Async doesn't support real-time well, no hot reload
 - **Why not C:** No memory safety, no real-time guarantees
 - **Target users:** Robotics startups, autonomous vehicle teams
 - **Killer feature:** Hot-reload control code on a running robot without safety violations
 
 ### Niche 3: Safe Embedded Systems
-- **Why P wins:** Memory safety + tiny binaries + deterministic memory + RISC-V support
+- **Why Fides wins:** Memory safety + tiny binaries + deterministic memory + RISC-V support
 - **Why not Rust:** Compile times too slow, borrow checker too rigid for embedded patterns
 - **Why not C:** 70% of CVEs are memory safety issues
 - **Target users:** IoT device manufacturers, medical device companies
@@ -41,7 +41,7 @@ Every new language faces the chicken-and-egg problem:
 > - ✅ **RISC-V target** — `codegen_riscv.rs` emits RISC-V assembly
 > - ✅ **FixedBufferAllocator** — deterministic, no-allocation embedded memory management is operational (`src/embedded.rs`)
 > - ✅ **Hot reload** — native JIT + function-level change detection works
-> - ✅ **C interop** — C header parser → P FFI bindings (`src/cparser.rs`) is functional
+> - ✅ **C interop** — C header parser → Fides FFI bindings (`src/cparser.rs`) is functional
 > - 📈 **C codegen backend** — 76/78 test parity (2 real mismatches: test_asm by design, test_comptime_reflect interpreter-only)
 >
 > These niches are no longer aspirational — the foundational capabilities are built and running.
@@ -51,19 +51,19 @@ Every new language faces the chicken-and-egg problem:
 ## Phase 2: Expansion (Year 2-3)
 
 ### Bridge: Systems Programming
-- **Why P wins:** Memory safety without borrow checker pain + fast compilation + hot reload
-- **Migration path:** C interop + C-to-P transpiler
+- **Why Fides wins:** Memory safety without borrow checker pain + fast compilation + hot reload
+- **Migration path:** C interop + C-to-Fides transpiler
 - **Target users:** C developers tired of CVEs, Rust developers tired of compile times
 - **Killer feature:** Gradually migrate C codebase to memory safety, one file at a time
 
 ### Bridge: Web Backends
-- **Why P wins:** Effect handlers for async I/O + hot reload + fast compilation
+- **Why Fides wins:** Effect handlers for async I/O + hot reload + fast compilation
 - **Migration path:** HTTP server stdlib + JSON serialization (comptime)
 - **Target users:** Startups wanting fast iteration + safety
 - **Killer feature:** Hot-reload a running web server, see changes instantly
 
 ### Bridge: CLI Tools
-- **Why P wins:** Fast compilation + single binary output + no runtime
+- **Why Fides wins:** Fast compilation + single binary output + no runtime
 - **Migration path:** Simple syntax, familiar to Rust/Go developers
 - **Target users:** Go/Rust CLI tool developers
 - **Killer feature:** Sub-second compile + hot reload during development
@@ -73,17 +73,17 @@ Every new language faces the chicken-and-egg problem:
 ## Phase 3: Mainstream (Year 3-5)
 
 ### Bridge: Game Development
-- **Why P wins:** Hot reload + SIMD + memory safety + fast compilation
+- **Why Fides wins:** Hot reload + SIMD + memory safety + fast compilation
 - **Target users:** Game studios, indie developers
 - **Killer feature:** Change game logic while the game is running
 
 ### Bridge: OS Development
-- **Why P wins:** Bare metal + memory safety + inline assembly + capability security
+- **Why Fides wins:** Bare metal + memory safety + inline assembly + capability security
 - **Target users:** OS researchers, security-focused OS projects
 - **Killer feature:** Write a memory-safe OS kernel with hot-reloadable drivers
 
 ### Bridge: Security-Critical Software
-- **Why P wins:** Capability security + memory safety + effect system (auditable)
+- **Why Fides wins:** Capability security + memory safety + effect system (auditable)
 - **Target users:** Cryptography libraries, security tools, government software
 - **Killer feature:** Prove no code can access the filesystem without explicit capability
 
@@ -91,7 +91,7 @@ Every new language faces the chicken-and-egg problem:
 
 ## Migration Tools — Making Switching Easy
 
-> **Note:** C-to-P and Rust-to-P transpilers are nice-to-have community
+> **Note:** C-to-Fides and Rust-to-Fides transpilers are nice-to-have community
 > goals, not on the critical path. See `docs/extra.md` for honest
 > feasibility assessment. The FFI generator below is the only migration
 > tool that exists today.
@@ -101,21 +101,21 @@ Every new language faces the chicken-and-egg problem:
 // Input: C header (openssl.h)
 SSL_CTX* SSL_CTX_new(const SSL_METHOD* method);
 
-// Output: P FFI binding
+// Output: Fides FFI binding
 extern "C" pf SSL_CTX_new(method: *const SSL_METHOD) -> *mut SSL_CTX;
 ```
 - Parse C headers automatically
-- Generate P FFI bindings
+- Generate Fides FFI bindings
 - No hand-written bindings needed
-- ✅ **Working now** — `pledgec parse-header <file.h>` parses C headers and emits P FFI bindings (`src/cparser.rs`)
+- ✅ **Working now** — `fidesc parse-header <file.h>` parses C headers and emits Fides FFI bindings (`src/cparser.rs`)
 
-### C-to-P Transpiler (Nice-to-have — see `docs/extra.md`)
-- Auto-translate C code to P code
+### C-to-Fides Transpiler (Nice-to-have — see `docs/extra.md`)
+- Auto-translate C code to Fides code
 - Feasible but moderate effort (real C has macros, goto, union punning)
 - FFI already covers the interop case; transpiler would help porting logic
 
-### Rust-to-P Transpiler (Aspirational — see `docs/extra.md`)
-- Convert Rust code to P code
+### Rust-to-Fides Transpiler (Aspirational — see `docs/extra.md`)
+- Convert Rust code to Fides code
 - Very high effort — lifetimes, macros, async, trait system don't map cleanly
 - Practical alternative: use FFI via C ABI, port files manually
 
@@ -125,22 +125,22 @@ extern "C" pf SSL_CTX_new(method: *const SSL_METHOD) -> *mut SSL_CTX;
 
 ### Sub-Second Compilation
 ```
-$ pledgec build
+$ fidesc build
 Built in 0.3s   ← not 30 minutes
 ```
 
 ### Hot Reload
 ```
-$ pledgec watch
+$ fidesc watch
 Running... (PID 12345)
-File changed: src/main.p
+File changed: src/main.fd
 Reloaded in 45ms   ← not a full rebuild
 ```
 
 ### Clear Error Messages
 ```
 Error: use-after-free detected at compile time
-  → src/main.p:12:5
+  → src/main.fd:12:5
    |
 12 |   print(buf[0]);
    |         ^^^
@@ -153,7 +153,7 @@ Error: use-after-free detected at compile time
 
 ### AI-Assisted Development
 ```
-$ pledgec ai "refactor this function to use effect handlers"
+$ fidesc ai "refactor this function to use effect handlers"
 Analyzing...
 Proposed change:
   - Replace async/await with effect handler
@@ -173,10 +173,10 @@ Apply? [y/n]
 - **Architecture docs** — help contributors understand the codebase
 
 ### Documentation Strategy
-- **P Book** — free online book (like "The Rust Programming Language")
+- **Fides Book** — free online book (like "The Rust Programming Language")
 - **Interactive Tutorial** — learn by doing, in the browser
 - **Examples Library** — real-world code for every use case
-- **Playground** — try P without installing anything
+- **Playground** — try Fides without installing anything
 
 ### Conference Strategy
 - **Talks at systems conferences** — OSDI, SOSP, PLDI
@@ -202,15 +202,15 @@ Apply? [y/n]
 ## The Adoption Funnel
 
 ```
-Awareness (people hear about P)
+Awareness (people hear about Fides)
     ↓ 10% convert
 Interest (people try the playground)
     ↓ 20% convert
-Trial (people install pledgec)
+Trial (people install fidesc)
     ↓ 30% convert
-Adoption (people use P for a project)
+Adoption (people use Fides for a project)
     ↓ 50% convert
-Advocacy (people recommend P to others)
+Advocacy (people recommend Fides to others)
 ```
 
 **Key conversion points:**

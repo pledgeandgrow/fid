@@ -1,6 +1,6 @@
-# P Language — Feature Status
+# Fides Language — Feature Status
 
-*Last updated: verified against actual source code and test runs (136/136 unit tests, 8/8 harness tests, 78/78 interpreter tests + 1/1 expected-fail, 76/78 C codegen, 102 .p test files)*
+*Last updated: verified against actual source code and test runs (136/136 unit tests, 8/8 harness tests, 78/78 interpreter tests + 1/1 expected-fail, 76/78 C codegen, 102 .fd test files)*
 
 ## Legend
 
@@ -14,53 +14,53 @@
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Lexer (token.rs) | ✅ | All P keywords (pf, pv, pc, ret, etc.) |
+| Lexer (token.rs) | ✅ | All Fides keywords (pf, pv, pc, ret, etc.) |
 | Parser (parser.rs) | ✅ | Produces AST from tokens |
 | Type Checker (typechecker.rs) | ✅ | Validates types, capabilities, effects, regions, traits |
 | IR Lowering (lower.rs) | ✅ | AST → typed SSA IR with effects/regions |
-| IR Interpreter (interp.rs) | ✅ | Runs IR directly via `pledgec run` |
+| IR Interpreter (interp.rs) | ✅ | Runs IR directly via `fidesc run` |
 | PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables + flat binary (bare-metal mode) |
 | ELF64 Emitter (elf64.rs) | ✅ | Generates native ELF64 executables on Linux (zero external tools) + relocatable objects |
 | C Codegen (codegen_c.rs) | ✅ | Generates C code, 76/78 tests match interpreter output (2 mismatches: test_asm by design, test_comptime_reflect interpreter-only) |
-| PIR (pir.rs) | ✅ | PIR L1/L2/L3, `pledgec pir` command |
+| PIR (pir.rs) | ✅ | PIR L1/L2/L3, `fidesc pir` command |
 | Optimizer (opt.rs) | ⚠️ | Const fold, CSE, DCE, inline, unroll, TCO, effect-based elision. Works for simple programs but exposes register allocator bug on complex ones. Not enabled by default. |
 | Peephole (peephole.rs) | ✅ | 9 passes, always on in `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection |
 | Register Allocator (regalloc.rs) | ⚠️ | Linear scan allocator. Has pre-existing bug: constants not loaded into registers before use can be clobbered by intervening instructions. Exposed by L2 optimizer's instruction reordering. |
 | Mach-O Emitter (macho.rs) | ✅ | Generates Mach-O object files for macOS |
 | COFF Emitter (coff.rs) | ✅ | Generates COFF object files for Windows |
-| WASM Backend (wasm.rs) | ✅ | PIR → WASM binary, `pledgec wasm` command |
-| GPU/SPIR-V Backend (gpu.rs) | ✅ | PIR → SPIR-V binary, `pledgec gpu` command |
+| WASM Backend (wasm.rs) | ✅ | PIR → WASM binary, `fidesc wasm` command |
+| GPU/SPIR-V Backend (gpu.rs) | ✅ | PIR → SPIR-V binary, `fidesc gpu` command |
 | Comptime (comptime.rs) | ✅ | Compile-time evaluation, reflection, f-string interpolation |
-| Multi-arch Codegen | ✅ | x86-64, ARM64, RISC-V assembly via `pledgec codegen --target` |
+| Multi-arch Codegen | ✅ | x86-64, ARM64, RISC-V assembly via `fidesc codegen --target` |
 
 ## CLI Commands
 
 | Command | Status | Notes |
 |---------|--------|-------|
-| `pledgec version` | ✅ | Shows version info |
-| `pledgec tokens <file>` | ✅ | Dumps lexer tokens |
-| `pledgec ast <file>` | ✅ | Dumps parsed AST |
-| `pledgec ir <file>` | ✅ | Dumps lowered IR |
-| `pledgec run <file>` | ✅ | Interprets and runs program |
-| `pledgec emit <file> -o <exe>` | ✅ | Emits native PE executable (Windows) |
-| `pledgec emit <file> --bare -o <bin>` | ✅ | Bare-metal flat binary (no stdlib, no PE headers) |
-| `pledgec build <file> -o <out> [--target] [--opt]` | ✅ | Native build: PIR → codegen → peephole → ELF64 executable (zero external tools on Linux) |
-| `pledgec ccompile <file> -o <exe>` | ✅ | C codegen → gcc/clang → executable |
-| `pledgec test` | ✅ | Runs all 78 normal + 1 expected-fail tests across interpreter, PE emitter, and C codegen |
-| `pledgec repl` | ✅ | Interactive REPL |
-| `pledgec verify <file>` | ✅ | IR verification pass |
-| `pledgec sourcemap <file>` | ✅ | Source map output |
-| `pledgec pir <file> [1\|2\|3\|all] [--opt]` | ✅ | PIR output (L1/L2/L3) with optional optimization |
-| `pledgec opt <file> [passes]` | ✅ | Run PIR optimizer, print statistics |
-| `pledgec codegen <file> --target <arch>` | ✅ | x86-64, ARM64, or RISC-V assembly output |
-| `pledgec codegen <file> --elf\|--macho\|--coff <o>` | ✅ | Emit ELF64, Mach-O, or COFF object files |
-| `pledgec wasm <file> -o <out.wasm>` | ✅ | WebAssembly backend |
-| `pledgec gpu <file>` | ✅ | SPIR-V GPU backend |
-| `pledgec parse-header <file.h>` | ✅ | Parse C header → generate P FFI bindings |
-| `pledgec watch <file>` | ✅ | Hot reload: native JIT (ELF64) + function-level change detection |
-| `pledgec link <files...>` | ✅ | Link multiple object files |
+| `fidesc version` | ✅ | Shows version info |
+| `fidesc tokens <file>` | ✅ | Dumps lexer tokens |
+| `fidesc ast <file>` | ✅ | Dumps parsed AST |
+| `fidesc ir <file>` | ✅ | Dumps lowered IR |
+| `fidesc run <file>` | ✅ | Interprets and runs program |
+| `fidesc emit <file> -o <exe>` | ✅ | Emits native PE executable (Windows) |
+| `fidesc emit <file> --bare -o <bin>` | ✅ | Bare-metal flat binary (no stdlib, no PE headers) |
+| `fidesc build <file> -o <out> [--target] [--opt]` | ✅ | Native build: PIR → codegen → peephole → ELF64 executable (zero external tools on Linux) |
+| `fidesc ccompile <file> -o <exe>` | ✅ | C codegen → gcc/clang → executable |
+| `fidesc test` | ✅ | Runs all 78 normal + 1 expected-fail tests across interpreter, PE emitter, and C codegen |
+| `fidesc repl` | ✅ | Interactive REPL |
+| `fidesc verify <file>` | ✅ | IR verification pass |
+| `fidesc sourcemap <file>` | ✅ | Source map output |
+| `fidesc pir <file> [1\|2\|3\|all] [--opt]` | ✅ | PIR output (L1/L2/L3) with optional optimization |
+| `fidesc opt <file> [passes]` | ✅ | Run PIR optimizer, print statistics |
+| `fidesc codegen <file> --target <arch>` | ✅ | x86-64, ARM64, or RISC-V assembly output |
+| `fidesc codegen <file> --elf\|--macho\|--coff <o>` | ✅ | Emit ELF64, Mach-O, or COFF object files |
+| `fidesc wasm <file> -o <out.wasm>` | ✅ | WebAssembly backend |
+| `fidesc gpu <file>` | ✅ | SPIR-V GPU backend |
+| `fidesc parse-header <file.h>` | ✅ | Parse C header → generate Fides FFI bindings |
+| `fidesc watch <file>` | ✅ | Hot reload: native JIT (ELF64) + function-level change detection |
+| `fidesc link <files...>` | ✅ | Link multiple object files |
 
-## Language Features — Interpreter (`pledgec run`)
+## Language Features — Interpreter (`fidesc run`)
 
 ### Core Syntax
 
@@ -190,7 +190,7 @@
 | `Result<T,E>` type | ✅ | |
 | `?` operator | ✅ | Early return on Err |
 | `match` on Result | ✅ | |
-| `try` blocks | ✅ | `test_pe_try_block.p` |
+| `try` blocks | ✅ | `test_pe_try_block.fd` |
 
 ### Concurrency
 
@@ -232,22 +232,22 @@
 | Type aliases (`ty`) | ✅ | `ty X = T` — parsed, typechecked, lowered |
 | Inline assembly (`asm!`) | ✅ | Hardware-specific instructions |
 | Bare-metal mode (`--bare`) | ✅ | No stdlib, flat binary output |
-| SIMD types | ✅ | `stdlib/simd.p` — elementwise ops, dot, sum, scale |
-| Tensor type | ✅ | `stdlib/tensor.p` — n-d arrays, matmul, relu, softmax |
-| JSON parsing | ✅ | `stdlib/json.p` — parse, stringify, get, at |
-| HTTP server | ✅ | `stdlib/http.p` — socket + HTTP parsing |
-| Database framework | ✅ | `stdlib/db.p` — cap Database trait, in-memory KV |
-| Parallel operations | ✅ | `stdlib/parallel.p` — par_map, par_sum, par_dot |
-| Const generics | ✅ | `ArrayConst` type variant, monomorphization handles it — `test_const_generic.p` passes in interpreter |
-| GATs | ✅ | `test_gat.p` passes in interpreter, outputs correct results |
-| C FFI (`extern "C"`) | ✅ | Parsed, lowered, C codegen, interpreter stubs — `test_ffi.p`, `test_ffi_full.p`, `test_ffi_header.p` pass |
-| Hot reload | ✅ | `pledgec watch` compiles to native ELF64, runs, detects function-level changes via L2 IR hashing |
-| `#[test]` attribute | ❌ | Parsed but not executed by `pledgec test` |
+| SIMD types | ✅ | `stdlib/simd.fd` — elementwise ops, dot, sum, scale |
+| Tensor type | ✅ | `stdlib/tensor.fd` — n-d arrays, matmul, relu, softmax |
+| JSON parsing | ✅ | `stdlib/json.fd` — parse, stringify, get, at |
+| HTTP server | ✅ | `stdlib/http.fd` — socket + HTTP parsing |
+| Database framework | ✅ | `stdlib/db.fd` — cap Database trait, in-memory KV |
+| Parallel operations | ✅ | `stdlib/parallel.fd` — par_map, par_sum, par_dot |
+| Const generics | ✅ | `ArrayConst` type variant, monomorphization handles it — `test_const_generic.fd` passes in interpreter |
+| GATs | ✅ | `test_gat.fd` passes in interpreter, outputs correct results |
+| C FFI (`extern "C"`) | ✅ | Parsed, lowered, C codegen, interpreter stubs — `test_ffi.fd`, `test_ffi_full.fd`, `test_ffi_header.fd` pass |
+| Hot reload | ✅ | `fidesc watch` compiles to native ELF64, runs, detects function-level changes via L2 IR hashing |
+| `#[test]` attribute | ❌ | Parsed but not executed by `fidesc test` |
 | `#[derive]` | ❌ | Not yet implemented |
 
 ---
 
-## PE Emitter (`pledgec emit`) — Native Code Generation
+## PE Emitter (`fidesc emit`) — Native Code Generation
 
 The PE emitter generates standalone Windows x64 PE executables with no external linker.
 
@@ -305,19 +305,19 @@ The PE emitter generates standalone Windows x64 PE executables with no external 
 
 | Feature | Status | Test |
 |---------|--------|------|
-| `defer` | ✅ | `test_pe_defer.p` |
-| `?` operator | ✅ | `test_pe_try_op.p` |
-| References `&` / `&mut` | ✅ | `test_pe_refs.p` |
-| `enum` / `Option` / `Result` | ✅ | `test_pe_enum.p` |
-| `for` over Vec | ✅ | `test_pe_for_vec.p` |
-| `struct` + `impl` methods | ✅ | `test_pe_struct.p` |
-| Generics `<T>` | ✅ | `test_pe_generics.p` |
-| Closures with captures | ✅ | `test_closure_capture.p` |
-| `match` (int/string/enum/wildcard) | ✅ | `test_match_edge.p` |
-| HashMap (insert/get/contains/remove/len) | ✅ | `test_hashmap.p` |
-| `p_print_map` | ✅ | `test_print_map.p` |
-| f-string with float | ✅ | `test_fstring_float.p` |
-| `try { }` blocks | ✅ | `test_pe_try_block.p` |
+| `defer` | ✅ | `test_pe_defer.fd` |
+| `?` operator | ✅ | `test_pe_try_op.fd` |
+| References `&` / `&mut` | ✅ | `test_pe_refs.fd` |
+| `enum` / `Option` / `Result` | ✅ | `test_pe_enum.fd` |
+| `for` over Vec | ✅ | `test_pe_for_vec.fd` |
+| `struct` + `impl` methods | ✅ | `test_pe_struct.fd` |
+| Generics `<T>` | ✅ | `test_pe_generics.fd` |
+| Closures with captures | ✅ | `test_closure_capture.fd` |
+| `match` (int/string/enum/wildcard) | ✅ | `test_match_edge.fd` |
+| HashMap (insert/get/contains/remove/len) | ✅ | `test_hashmap.fd` |
+| `p_print_map` | ✅ | `test_print_map.fd` |
+| f-string with float | ✅ | `test_fstring_float.fd` |
+| `try { }` blocks | ✅ | `test_pe_try_block.fd` |
 
 ### PE — Runtime Stubs
 
@@ -358,7 +358,7 @@ The PE emitter generates standalone Windows x64 PE executables with no external 
 
 ## AI/ML Features
 
-Six AI/ML-oriented features have been added to the P language, enabling neural network programming with compile-time safety, automatic differentiation, GPU kernel support, and quantization.
+Six AI/ML-oriented features have been added to the Fides language, enabling neural network programming with compile-time safety, automatic differentiation, GPU kernel support, and quantization.
 
 ### Pipeline Operator (`|>`)
 
@@ -471,8 +471,8 @@ pf vector_add(a: &Tensor, b: &Tensor, c: &mut Tensor, n: i64) {
 | `q8` type alias | ✅ | Maps to `i8` storage |
 | `q4` type alias | ✅ | Maps to `i8` storage |
 | `~>` quantization cast operator | ✅ | `expr ~> q8` quantizes an expression |
-| `quantize_q8` stdlib function | ✅ | `stdlib/quant.p` |
-| `dequantize_q8` stdlib function | ✅ | `stdlib/quant.p` |
+| `quantize_q8` stdlib function | ✅ | `stdlib/quant.fd` |
+| `dequantize_q8` stdlib function | ✅ | `stdlib/quant.fd` |
 | `qmatmul` stdlib function | ✅ | Quantized matrix multiplication |
 | `find_quant_params` stdlib function | ✅ | Find quantization scale and zero-point |
 
@@ -513,7 +513,7 @@ pv out = quant::dequantize_q8(q_out); // dequantize result
 ### Test Coverage
 
 - **102 test files** in `tests/` (79 root + 9 safety + 4 capability + 7 effects + 3 regions)
-- **133 unit tests** in `cargo test --bin pledgec` — all pass
+- **133 unit tests** in `cargo test --bin fidesc` — all pass
 - **8 cargo tests** in `tests/harness.rs` — 7 pass, 1 fails (golden_files_match: interpreter debug format)
 - **43 golden files** in `tests/golden/` — expected outputs for regression testing
 - **Benchmarks** in `benches/bench_main.rs`

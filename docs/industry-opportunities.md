@@ -1,6 +1,6 @@
-# P Industry Opportunities — Where P Could Be Groundbreaking
+# Fides Industry Opportunities — Where Fides Could Be Groundbreaking
 
-> Mapping P's unique capabilities to industries with real, painful problems
+> Mapping Fides's unique capabilities to industries with real, painful problems
 > that no current language solves well. Based on 2024-2026 research.
 
 ## The Timing Question: Self-Host First or Add Features on Rust?
@@ -9,36 +9,36 @@
 
 ### Why not self-host now
 
-1. **P is not mature enough.** Missing: full concurrency (spawn), package
+1. **Fides is not mature enough.** Missing: full concurrency (spawn), package
    manager, LSP, effect handler continuations, GPU region support. Self-hosting
    into a language missing these features means writing them in a language that
    doesn't have them yet — circular dependency.
 
 2. **Self-hosting is 3-6 months of zero user-facing features.** The compiler is
-   ~35k lines of Rust. Rewriting in P produces no new capabilities, attracts
+   ~35k lines of Rust. Rewriting in Fides produces no new capabilities, attracts
    no new users, solves no industry problems. It's internal validation.
 
 3. **Features attract users; users attract contributors; contributors build the
    ecosystem.** Self-hosting attracts compiler nerds (important, but small
    audience). Industry features attract robotics engineers, AI researchers,
-   automotive teams — the people who will actually use P.
+   automotive teams — the people who will actually use Fides.
 
 4. **Rust's tooling is better right now.** cargo, rust-analyzer, clippy,
-   debugger — all mature. P's tooling is early. Writing complex features
+   debugger — all mature. Fides's tooling is early. Writing complex features
    (GPU regions, autodiff) in Rust is faster and less error-prone than
-   writing them in P today.
+   writing them in Fides today.
 
-5. **You can partially self-host now.** Write the stdlib in P. Write tools
-   (formatter, linter, package manager) in P. This gives dogfooding without
-   the full commitment. The compiler stays in Rust until P is feature-complete
+5. **You can partially self-host now.** Write the stdlib in Fides. Write tools
+   (formatter, linter, package manager) in Fides. This gives dogfooding without
+   the full commitment. The compiler stays in Rust until Fides is feature-complete
    enough to make self-hosting pleasant.
 
 ### When to self-host
 
 Self-host when:
-- P has the features that make it attractive to target industries
-- P has a package manager and LSP
-- P's stdlib is comprehensive enough to write a compiler in
+- Fides has the features that make it attractive to target industries
+- Fides has a package manager and LSP
+- Fides's stdlib is comprehensive enough to write a compiler in
 - You have 3-6 months with no new feature work needed
 
 **Target:** Self-host after Phase 7 (package manager + LSP). Until then,
@@ -49,16 +49,16 @@ add features on Rust.
 | Component | Language | Why |
 |-----------|----------|-----|
 | Compiler (lexer, parser, typechecker, codegen) | Rust | Complex, needs mature tooling |
-| Stdlib | **P** | Dogfooding — tests the language on real code |
-| Package manager | **P** | Simpler than compiler, good dogfooding target |
-| LSP server | Rust | Needs performance + async (P's async isn't ready) |
-| Formatter/linter | **P** | Simple tools, good dogfooding |
-| Build system | **P** | Replaces make/cmake — natural fit |
-| Test harness | Rust | Needs to bootstrap P compiler testing |
+| Stdlib | **Fides** | Dogfooding — tests the language on real code |
+| Package manager | **Fides** | Simpler than compiler, good dogfooding target |
+| LSP server | Rust | Needs performance + async (Fides's async isn't ready) |
+| Formatter/linter | **Fides** | Simple tools, good dogfooding |
+| Build system | **Fides** | Replaces make/cmake — natural fit |
+| Test harness | Rust | Needs to bootstrap Fides compiler testing |
 
 ---
 
-## Industries Where P Wins
+## Industries Where Fides Wins
 
 ### 1. Robotics — The Killer Domain
 
@@ -73,7 +73,7 @@ add features on Rust.
 hot reload of control code. Rust frameworks have safety but no hot reload.
 ROS2 has neither. Juliet has hot reload but is proprietary.
 
-**P's unique advantage:**
+**Fides's unique advantage:**
 
 ```
 // Robot control loop with hot reload
@@ -97,7 +97,7 @@ pf control_loop() !{IO, Alloc} {  // no Spawn, no Net
 }
 ```
 
-| Feature | ROS2 (C++) | dora (Rust) | Copper (Rust) | P |
+| Feature | ROS2 (C++) | dora (Rust) | Copper (Rust) | Fides |
 |---------|-----------|------------|---------------|---|
 | Memory safety | ❌ | ✅ | ✅ | ✅ |
 | Hot reload | ❌ | ⚠️ Python only | ❌ | ✅ native |
@@ -108,7 +108,7 @@ pf control_loop() !{IO, Alloc} {  // no Spawn, no Net
 | Bare metal | ✅ | ❌ | ✅ | ✅ |
 | Zero external deps | ❌ | ❌ | ❌ | ✅ |
 
-**Verdict:** P could be the definitive robotics language. The combination
+**Verdict:** Fides could be the definitive robotics language. The combination
 of memory safety + hot reload + persist + capability proofs is exactly
 what robotics needs and nobody has.
 
@@ -133,14 +133,14 @@ working group literally argues "C is suitable for safety-critical software
 that developers constantly violate. The industry needs a language that is
 safe *by construction*, not safe *by linting*.
 
-**P's unique advantage:**
+**Fides's unique advantage:**
 
 ```
 // Brake controller — prove it can't do IO except sensor/actuator
 pf brake_controller() !{IO, Alloc} {
     // Compiler PROVES: no network, no file system, no thread spawning
     // This is what ISO 26262 ASIL-D requires — currently verified by
-    // expensive static analysis tools. P does it in the compiler.
+    // expensive static analysis tools. Fides does it in the compiler.
 
     let pedal = read_pedal_sensor();  // !IO — allowed
     let pressure = compute_brake_pressure(pedal);  // pure
@@ -156,7 +156,7 @@ region ecu with budget(128 * 1024) {  // 128KB SRAM
 }
 ```
 
-| Feature | MISRA C | AUTOSAR C++ | Rust | P |
+| Feature | MISRA C | AUTOSAR C++ | Rust | Fides |
 |---------|---------|-------------|------|---|
 | Memory safety | ⚠️ Lint rules | ⚠️ Lint rules | ✅ Borrow checker | ✅ Regions |
 | Capability proof | ❌ | ❌ | ❌ | ✅ `!{IO}` |
@@ -166,14 +166,14 @@ region ecu with budget(128 * 1024) {  // 128KB SRAM
 | Rules to learn | 300+ | 300+ | Borrow checker | Regions (simple) |
 | Certification path | ✅ Established | ✅ Established | ⚠️ Emerging | ❌ New |
 
-**Verdict:** P could replace MISRA C for new automotive projects. The
+**Verdict:** Fides could replace MISRA C for new automotive projects. The
 compile-time safety guarantees eliminate the need for 300+ linting rules.
 The memory budget feature directly addresses AUTOSAR's dynamic allocation
 concerns. The capability system provides the safety proofs that ISO 26262
 ASIL-D requires.
 
 **Barrier:** Certification. ISO 26262 requires tool qualification (TCL).
-P's compiler would need to be qualified — expensive and time-consuming.
+Fides's compiler would need to be qualified — expensive and time-consuming.
 This is a 2-3 year play, not immediate.
 
 **Effort to target:** High. Need certification, MISRA migration tooling,
@@ -195,7 +195,7 @@ per line of code is $100-1000. Memory bugs discovered late in certification
 cost millions. A language that eliminates memory bugs at compile time
 would dramatically reduce certification cost.
 
-**P's unique advantage:**
+**Fides's unique advantage:**
 - `sandbox { }` proves no IO in flight control code — currently manual review
 - `region with budget(N)` proves memory fits in avionics SRAM — currently
   manual calculation + testing
@@ -206,7 +206,7 @@ would dramatically reduce certification cost.
 MC/DC coverage, formal methods, and tool qualification. This is a 3-5
 year play.
 
-**Effort to target:** Very high. But the payoff is enormous — P could
+**Effort to target:** Very high. But the payoff is enormous — Fides could
 become the safe Ada replacement the industry has been waiting for.
 
 ---
@@ -225,7 +225,7 @@ compile-time capability revocation or effect tracking. A reentrancy attack
 is impossible to express in a language where external calls require an
 `!IO` effect and the contract is annotated `!{}` (pure).
 
-**P's unique advantage:**
+**Fides's unique advantage:**
 
 ```
 // Token contract — prove no reentrancy
@@ -245,7 +245,7 @@ pf pure_computation(x: u64) -> u64 !{} {
 }
 ```
 
-| Feature | Solidity | Move | Cadence | P |
+| Feature | Solidity | Move | Cadence | Fides |
 |---------|----------|------|---------|---|
 | Memory safety | ❌ | ✅ Linear types | ✅ Resources | ✅ Regions |
 | Reentrancy prevention | ⚠️ Runtime check | ✅ By design | ✅ By design | ✅ `sandbox` |
@@ -254,13 +254,13 @@ pf pure_computation(x: u64) -> u64 !{} {
 | Pure function proof | ❌ | ❌ | ❌ | ✅ `!{}` |
 | Compile-time verification | ⚠️ External tools | ✅ Verifier | ✅ Type system | ✅ Compiler |
 
-**Verdict:** P's capability system maps naturally to smart contract security.
+**Verdict:** Fides's capability system maps naturally to smart contract security.
 `sandbox { }` prevents reentrancy. `!{}` proves purity. `!{IO}` tracks
 external calls. This is a better security model than any current smart
 contract language.
 
 **Barrier:** Need a blockchain VM backend (compile to EVM, Move VM, or
-P's own VM). Need gas metering. Need formal verification story. This is
+Fides's own VM). Need gas metering. Need formal verification story. This is
 a 1-2 year play with high payoff.
 
 **Effort to target:** Medium. The language features exist. Need VM backend
@@ -282,7 +282,7 @@ C++ gives performance but no safety or hot reload. Rust gives safety but
 no hot reload. Bevy (Rust) is gaining traction but the lack of hot reload
 is a constant complaint.
 
-**P's unique advantage:**
+**Fides's unique advantage:**
 
 ```
 // Game loop with hot reload
@@ -310,7 +310,7 @@ pf render(state: &GameState) !{IO} {
 }
 ```
 
-| Feature | C++ (Unreal) | Rust (Bevy) | P |
+| Feature | C++ (Unreal) | Rust (Bevy) | Fides |
 |---------|-------------|-------------|---|
 | Hot reload | ⚠️ Live Coding (limited) | ❌ | ✅ native |
 | Persist state across reload | ❌ | ❌ | ✅ |
@@ -319,15 +319,15 @@ pf render(state: &GameState) !{IO} {
 | GPU shaders | ✅ HLSL | ✅ WGSL | ✅ SPIR-V (native) |
 | Performance | ✅ 10/10 | ✅ 9/10 | ⚠️ 7/10 |
 
-**Verdict:** P could be the game engine language that finally gives hot
+**Verdict:** Fides could be the game engine language that finally gives hot
 reload + memory safety together. The `persist` feature is perfect for
 keeping game state alive across code changes. The effect system can prove
 render code doesn't mutate game state.
 
-**Barrier:** Performance. Game engines need 10/10 codegen quality. P is
+**Barrier:** Performance. Game engines need 10/10 codegen quality. Fides is
 at 7/10 today. This improves over time but won't match GCC/LLVM for years.
 
-**Effort to target:** Medium. Game engine is a big project but P's
+**Effort to target:** Medium. Game engine is a big project but Fides's
 features map well. GPU backend already exists (SPIR-V).
 
 ---
@@ -343,10 +343,10 @@ features map well. GPU backend already exists (SPIR-V).
 
 **The gap:** IoT developers need to prove their code fits in 4KB SRAM.
 Currently they do this by running the code and hoping it doesn't OOM, or
-by manual calculation. P's `region with budget(N)` does this at compile
+by manual calculation. Fides's `region with budget(N)` does this at compile
 time.
 
-**P's unique advantage:**
+**Fides's unique advantage:**
 
 ```
 // IoT sensor node — prove it fits in 4KB SRAM
@@ -372,7 +372,7 @@ pf sensor_loop() {
 }
 ```
 
-| Feature | C | Rust (embassy) | P |
+| Feature | C | Rust (embassy) | Fides |
 |---------|---|----------------|---|
 | Memory budget proof | ❌ | ❌ | ✅ |
 | Hot reload | ❌ | ❌ | ✅ |
@@ -381,7 +381,7 @@ pf sensor_loop() {
 | No external deps | ⚠️ Needs libc | ⚠️ Needs toolchain | ✅ |
 | Bare metal | ✅ | ✅ | ✅ |
 
-**Verdict:** P is the natural IoT language. Memory budgets, hot reload,
+**Verdict:** Fides is the natural IoT language. Memory budgets, hot reload,
 tiny binaries, no dependencies — all already implemented. This is the
 lowest-effort, highest-impact target.
 
@@ -399,21 +399,21 @@ embedded HAL support and more ARM/RISC-V codegen testing.
 - Security sandboxing is at the WASM level, not language level
 
 **The gap:** Serverless needs small binaries and fast cold starts. Rust
-binaries are 1-10MB. P with `--caps` can strip to <100KB. P's capability
+binaries are 1-10MB. Fides with `--caps` can strip to <100KB. Fides's capability
 system provides language-level sandboxing on top of WASM's sandbox.
 
-**P's unique advantage:**
+**Fides's unique advantage:**
 
 ```
 // Serverless function — strip everything except HTTP handling
-pledgec build handler.p --caps "IO" --target wasm -o handler.wasm
+fidesc build handler.fd --caps "IO" --target wasm -o handler.wasm
 
 // Binary: 47KB (vs 2.3MB for equivalent Rust)
 // Capabilities: IO only (no Net, no Spawn, no FS)
 // Cold start: <1ms (tiny binary, no runtime init)
 ```
 
-| Feature | Rust → WASM | P → WASM |
+| Feature | Rust → WASM | Fides → WASM |
 |---------|-------------|----------|
 | Binary size | 1-10MB | <100KB (--caps) |
 | Cold start | 5-50ms | <1ms |
@@ -421,7 +421,7 @@ pledgec build handler.p --caps "IO" --target wasm -o handler.wasm
 | Capability proof | ❌ | ✅ |
 | Hot reload | ❌ | ✅ |
 
-**Verdict:** P could dominate serverless WASM. Smallest binaries, fastest
+**Verdict:** Fides could dominate serverless WASM. Smallest binaries, fastest
 cold starts, compile-time capability proofs. The WASM backend already
 exists.
 
@@ -439,10 +439,10 @@ with WASM codegen and WASI support.
 - FDA requires evidence of safety — currently via testing and static analysis
 
 **The gap:** Same as automotive but with human life directly at stake.
-A pacemaker that crashes due to a memory bug is fatal. P's compile-time
+A pacemaker that crashes due to a memory bug is fatal. Fides's compile-time
 memory safety eliminates this class of bugs entirely.
 
-**P's unique advantage:**
+**Fides's unique advantage:**
 - `region with budget(N)` proves the device's code fits in its memory
 - `sandbox { }` proves the communication module can't affect the therapy module
 - `!{IO}` proves the therapy calculation is pure
@@ -476,7 +476,7 @@ example projects, create documentation, attract early adopters.
 
 **Phase 2 (6-12 months):** Target Robotics and Game engines. Need `spawn`
 and effect handler continuations. These are the "killer app" domains
-where P's unique combination (safety + hot reload + persist) is exactly
+where Fides's unique combination (safety + hot reload + persist) is exactly
 what developers want and nobody else provides.
 
 **Phase 3 (1-2 years):** Target Blockchain. Need VM backend and gas
@@ -484,17 +484,17 @@ metering. The capability system maps perfectly to smart contract security.
 
 **Phase 4 (2-5 years):** Target Automotive, Aerospace, Medical. Need
 certification. This is the long game — high barrier but enormous payoff.
-P could become the safe systems language for safety-critical industries.
+Fides could become the safe systems language for safety-critical industries.
 
-**Self-hosting target:** After Phase 2, once P has the features that make
+**Self-hosting target:** After Phase 2, once Fides has the features that make
 it attractive (spawn, effect handlers, package manager, LSP). At that
 point, self-hosting is a natural milestone, not a detour.
 
 ## The Story
 
-> P is not trying to be the best language for everything. P is trying to
+> Fides is not trying to be the best language for everything. Fides is trying to
 > be the best language for systems where **compile-time safety proofs,
 > hot reload, and zero external dependencies** matter simultaneously.
 >
 > That's robotics, automotive, aerospace, medical devices, IoT, blockchain,
-> and AI inference. No other language serves all of these. P can.
+> and AI inference. No other language serves all of these. Fides can.

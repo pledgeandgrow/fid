@@ -26,10 +26,10 @@ pub struct CompileResult {
 }
 
 // ─── Stdlib auto-include ─────────────────────────────────────────────────
-// Phase 1: stdlib/core.p is automatically prepended to every program.
+// Phase 1: stdlib/core.fd is automatically prepended to every program.
 // User definitions take priority over stdlib duplicates (user can override).
 
-const STDLIB_CORE: &str = include_str!("../stdlib/core.p");
+const STDLIB_CORE: &str = include_str!("../stdlib/core.fd");
 
 fn parse_source(source: &str) -> Result<Program, Vec<String>> {
     let mut lexer = Lexer::new(source);
@@ -43,8 +43,8 @@ fn build_program(source: &str) -> Result<Program, Vec<String>> {
 }
 
 /// Build a program with optional file path for resolving `use` imports.
-/// When source_path is provided, `use foo::bar;` will look for `foo.p` or
-/// `foo/mod.p` relative to the source file's directory.
+/// When source_path is provided, `use foo::bar;` will look for `foo.fd` or
+/// `foo/mod.fd` relative to the source file's directory.
 fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Program, Vec<String>> {
     // Parse stdlib first
     let stdlib = parse_source(STDLIB_CORE)?;
@@ -76,16 +76,16 @@ fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Pr
                 continue;
             }
 
-            // Try: <base_dir>/<path>.p  and  <base_dir>/<path>/mod.p
+            // Try: <base_dir>/<path>.fd  and  <base_dir>/<path>/mod.fd
             let path_str = import.path.replace("::", "/");
             let candidates = [
-                base_dir.join(format!("{}.p", path_str)),
-                base_dir.join(format!("{}/mod.p", path_str)),
-                base_dir.join("pledge_modules").join(format!("{}.p", path_str)),
-                base_dir.join("pledge_modules").join(format!("{}/mod.p", path_str)),
+                base_dir.join(format!("{}.fd", path_str)),
+                base_dir.join(format!("{}/mod.fd", path_str)),
+                base_dir.join("fides_modules").join(format!("{}.fd", path_str)),
+                base_dir.join("fides_modules").join(format!("{}/mod.fd", path_str)),
                 // Fallback: stdlib/ directory (for json, http, db, etc.)
-                std::path::Path::new("stdlib").join(format!("{}.p", path_str)),
-                std::path::Path::new("stdlib").join(format!("{}/mod.p", path_str)),
+                std::path::Path::new("stdlib").join(format!("{}.fd", path_str)),
+                std::path::Path::new("stdlib").join(format!("{}/mod.fd", path_str)),
             ];
 
             let mut found = None;
@@ -120,8 +120,8 @@ fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Pr
                 if let Ok(entries) = std::fs::read_dir(base_dir) {
                     for entry in entries.flatten() {
                         if let Some(name) = entry.file_name().to_str() {
-                            if name.ends_with(".p") {
-                                suggestions.push(name.trim_end_matches(".p").to_string());
+                            if name.ends_with(".fd") {
+                                suggestions.push(name.trim_end_matches(".fd").to_string());
                             }
                         }
                     }

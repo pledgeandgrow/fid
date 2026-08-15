@@ -1,6 +1,6 @@
 
 #!/bin/bash
-# verify.sh — P compiler verification script
+# verify.sh — Fides compiler verification script
 #
 # Usage:
 #   ./verify.sh              Build + run all tests, compare to baseline
@@ -26,18 +26,18 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-PLEDGEC="./target/release/pledgec"
+FIDESC="./target/release/fidesc"
 BASELINE_DIR="tests/baseline"
 BASELINE_FILE="$BASELINE_DIR/test_results.txt"
 
 # --- Help ---
 if [[ "$1" == "--help" || "$1" == "-h" ]]; then
     cat <<'EOF'
-verify.sh — P compiler verification
+verify.sh — Fides compiler verification
 
 Commands:
-  (default)  Build release + run pledgec test + diff against baseline
-  --save     Build release + run pledgec test + save results as new baseline
+  (default)  Build release + run fidesc test + diff against baseline
+  --save     Build release + run fidesc test + save results as new baseline
   --quick    Build release only (no tests) — fast check
   --golden   Regenerate golden files (IR/PIR/asm) for key tests
   --help     This help message
@@ -75,18 +75,18 @@ fi
 echo -e "${YELLOW}Building (release)...${NC}"
 cargo build --release 2>&1 | grep -E "^(error|Finished)" || true
 
-if [[ ! -x "$PLEDGEC" ]]; then
-    echo -e "${RED}ERROR: pledgec binary not found at $PLEDGEC${NC}"
+if [[ ! -x "$FIDESC" ]]; then
+    echo -e "${RED}ERROR: fidesc binary not found at $FIDESC${NC}"
     exit 1
 fi
 
 # --- Run tests ---
 echo -e "${YELLOW}Running normal tests...${NC}"
-TEST_OUTPUT=$($PLEDGEC test 2>&1 || true)
+TEST_OUTPUT=$($FIDESC test 2>&1 || true)
 echo "$TEST_OUTPUT"
 
 echo -e "${YELLOW}Running expected-fail tests...${NC}"
-FAIL_OUTPUT=$($PLEDGEC test --fail 2>&1 || true)
+FAIL_OUTPUT=$($FIDESC test --fail 2>&1 || true)
 echo "$FAIL_OUTPUT"
 
 # Combine for baseline storage

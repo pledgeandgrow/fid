@@ -1,4 +1,4 @@
-// Pledge IR — Typed SSA with effect and region annotations
+// Fides IR — Typed SSA with effect and region annotations
 //
 // Design principles:
 // - Every value has a type and a unique ID (SSA form)
@@ -7,7 +7,7 @@
 // - IR is serializable for incremental compilation and hot reload
 // - IR is interpretable for comptime and debugging
 //
-// This IR is the heart of Pledge — it's what makes the language unique:
+// This IR is the heart of Fides — it's what makes the language unique:
 // no other language has effect-aware, region-annotated SSA IR that's
 // also interpretable and serializable.
 
@@ -263,7 +263,7 @@ impl fmt::Display for IrType {
 // ─── Effects ────────────────────────────────────────────────────────────
 
 /// Effects that an instruction or function can have.
-/// This is Pledge's key differentiator — effects are tracked at the IR level.
+/// This is Fides's key differentiator — effects are tracked at the IR level.
 ///
 /// Effect taxonomy:
 /// - **Pure**: no side effects at all (can reorder, memoize, CSE)
@@ -384,7 +384,7 @@ impl fmt::Display for EffectSet {
 
 // ─── Regions ────────────────────────────────────────────────────────────
 
-/// Memory regions — Pledge's approach to memory safety without lifetimes.
+/// Memory regions — Fides's approach to memory safety without lifetimes.
 /// Each allocation belongs to a region, and the IR tracks which region.
 /// The type checker proves that references don't outlive their region.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -448,7 +448,7 @@ pub struct ValueMeta {
 
 // ─── Instructions ───────────────────────────────────────────────────────
 
-/// IR instructions — the core of Pledge IR.
+/// IR instructions — the core of Fides IR.
 /// Every instruction produces a value (even if it's void).
 /// Instructions are organized into basic blocks.
 #[derive(Debug, Clone)]
@@ -604,7 +604,7 @@ pub enum Inst {
         to: IrType,
     },
 
-    // ─── Pledge-Specific ───
+    // ─── Fides-Specific ───
     /// Try operator — check if value is Ok/Some, branch accordingly
     /// If Ok: store unwrapped value to `ok_dst`, jump to `ok_block`
     /// If Err/None: store error to `err_dst` (if present), jump to `err_block`
@@ -1059,7 +1059,7 @@ impl SourceMap {
     }
 }
 
-/// A Pledge IR module — the top-level container for a compilation unit.
+/// A Fides IR module — the top-level container for a compilation unit.
 /// Contains functions, global data, struct layouts, and metadata.
 #[derive(Debug, Clone)]
 pub struct IrModule {

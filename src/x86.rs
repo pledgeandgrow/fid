@@ -1,4 +1,4 @@
-// x86_64 backend — stack machine code generation from Pledge IR
+// x86_64 backend — stack machine code generation from Fides IR
 //
 // Strategy: each SSA value lives on the stack. We use RAX as the accumulator.
 // This is simple, correct, and a starting point for register allocation later.
@@ -607,7 +607,7 @@ impl X86CodeGen {
                 wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
             }
 
-            // ─── Pledge-Specific ───
+            // ─── Fides-Specific ───
             Inst::Print { value, ty } => {
                 let voff = frame.offset(*value);
                 let _ = ty;

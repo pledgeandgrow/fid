@@ -402,7 +402,7 @@ fn disassemble(words: &[u32]) -> String {
     let mut output = String::new();
     output.push_str(&format!("; SPIR-V\n"));
     output.push_str(&format!("; Version: 1.0\n"));
-    output.push_str(&format!("; Generator: Pledge Compiler\n"));
+    output.push_str(&format!("; Generator: Fides Compiler\n"));
     output.push_str(&format!("; Bound: {}\n", words.get(3).copied().unwrap_or(0)));
     output.push_str(&format!("; Schema: 0\n"));
 

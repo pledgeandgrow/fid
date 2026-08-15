@@ -7,9 +7,9 @@
 
 set -e
 
-PLEDGEC=${PLEDGEC:-./target/debug/pledgec}
+PLEDGEC=${PLEDGEC:-./target/debug/fidesc}
 TMPDIR=$(mktemp -d)
-TEST_FILE="$TMPDIR/test_hot.p"
+TEST_FILE="$TMPDIR/test_hot.fd"
 RESULTS_FILE="$TMPDIR/results.txt"
 
 echo "=== Hot Reload Latency Benchmark ==="
@@ -25,7 +25,7 @@ EOF
 
 # Build the compiler if needed
 if [ ! -f "$PLEDGEC" ]; then
-    echo "Building pledgec..."
+    echo "Building fidesc..."
     cargo build 2>/dev/null
 fi
 
