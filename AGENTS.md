@@ -52,11 +52,24 @@ cargo build
 ```
 Unit tests:   136/136 passed
 Harness:      8/8 passed       (golden_files_match now passes)
-Interpreter:  87/87 passed     (+ 4/4 expected fail: test_trait_verify_fail, test_budget_fail, test_sandbox_fail, test_deterministic_fail)
-C Codegen:    87/87 matched    (FULL PARITY — no gaps)
-PE Emitter:   87/87 valid      (+ 4/4 expected fail: test_trait_verify_fail, test_budget_fail, test_sandbox_fail, test_deterministic_fail)
+Interpreter:  99/99 normal     (+ 12/12 expected fail)
+C Codegen:    99/99 matched    (FULL PARITY — no gaps) (+ 12/12 expected fail)
+PE Emitter:   99/99 valid      (+ 12/12 expected fail: same as interpreter)
+Total .fd:    111 test files   (99 normal + 12 expected-fail)
 Skip list:    21 tests         (interpreter-only features: comptime, bare metal, WASM, SIMD, tensor, HTTP, JSON, etc.)
 ```
+
+Expected-fail tests (12):
+test_trait_verify_fail, test_budget_fail, test_sandbox_fail,
+test_deterministic_fail, test_field_privacy_fail, test_money_linear_fail,
+test_money_conserve_fail, test_banking_double_credit_fail,
+test_banking_lost_money_fail, test_loop_linear_fail, test_gas_fail,
+test_crashfree_fail
+
+Features now present in the baseline: tuple destructuring, file I/O
+(`stdlib/file.fd`), `txn {}` blocks, loop-aware linear types, `@gas`
+annotation, `@crashfree` annotation, `@audit` annotation, banking stdlib,
+money stdlib, LogicalTime stdlib (`stdlib/time.fd`).
 
 **Note:** `test_db` is no longer flaky — HashMap keys are now sorted in the interpreter for deterministic output.
 
@@ -77,7 +90,7 @@ touching them.
 | `src/coff.rs` | **HIGH** | COFF object file format. Same byte-level risk as PE/ELF. |
 | `src/macho.rs` | **HIGH** | Mach-O object file format. Same byte-level risk. |
 | `src/codegen_x64.rs` | **HIGH** | PIR L3 → x86-64 instruction encoding. ModRM/SIB bytes, REX prefixes, ABI rules. |
-| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 86/86 test parity (FULL PARITY). |
+| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 96/96 test parity (FULL PARITY). |
 | `src/pir.rs` | **HIGH** | PIR L1/L2/L3 transforms. A bad lowering propagates to all backends. |
 | `src/lower.rs` | **MEDIUM** | AST → SSA IR. Changes here affect interpreter + all backends. |
 | `src/typechecker.rs` | **MEDIUM** | Types + regions + effects + capabilities. Wrong rejection = broken code; wrong acceptance = silent miscompilation. |
@@ -98,7 +111,7 @@ touching them.
 | `src/comptime.rs` | LOW | Compile-time eval — errors are loud. |
 | `src/main.rs` | LOW | CLI dispatch — adding commands is safe. |
 | `src/compiler.rs` | LOW | Pipeline orchestration — changes are visible. |
-| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. |
+| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. Stdlib modules: core, db, http, json, parallel, shape, simd, tensor, quant, money, banking, alloc, file, time. |
 
 ## Known Bugs (Do Not Re-Introduce)
 

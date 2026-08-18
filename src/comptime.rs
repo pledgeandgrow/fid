@@ -160,6 +160,8 @@ fn substitute_stmts(stmts: &mut [Stmt], original: &Program, errs: &mut Vec<Strin
 fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<String>) {
     match stmt {
         Stmt::Let { expr, .. } => substitute_expr(expr, original, errs),
+        Stmt::LetTuple { expr, .. } => substitute_expr(expr, original, errs),
+        Stmt::Txn { body, .. } => substitute_stmts(body, original, errs),
         Stmt::Assign { expr, .. } => substitute_expr(expr, original, errs),
         Stmt::IndexAssign { index, expr, .. } => {
             substitute_expr(index, original, errs);

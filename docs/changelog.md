@@ -1,5 +1,276 @@
 # Fides Language Changelog
 
+## Phase 7.5B: @crashfree Annotation — Compile-Time Panic Prevention (August 2026)
+
+Added `@crashfree` annotation for compile-time proof that a function cannot
+panic at runtime. The SPARK Ada "absence of run-time errors" model, implemented
+as a pattern-based static check.
+
+### `@crashfree` Annotation
+
+- **Syntax**: `@crashfree pf foo(...) -> i64 { ... }`
+- **Semantics**: function is proven to never panic at runtime
+- **Rejected patterns**:
+  - `unwrap()` on Option/Result — calls `p_panic` on None/Err
+  - `p_panic()` — explicit panic
+  - Division `/` or modulo `%` with non-constant divisor — division by zero risk
+  - `while` loops — unbounded iteration (can hang or overflow stack)
+  - Calling non-`@crashfree` functions — transitive crash risk
+- **Allowed patterns**:
+  - `for` loops over finite ranges/arrays
+  - `match` on Option/Result (exhaustive error handling)
+  - `unwrap_or()` (provides default, no panic)
+  - Division by non-zero constants (e.g., `n / 4`)
+  - Calling other `@crashfree` functions
+
+### SPARK Ada vs Fides
+
+| | SPARK Ada | Fides |
+|---|---|---|
+| Method | Formal proof (GNATprove) | Pattern-based static check |
+| Coverage | All runtime errors (overflow, OOB, etc.) | Panic sources (unwrap, div0, hang) |
+| Effort | High (preconditions, postconditions) | Low (just add annotation) |
+| Precision | High (proves absence) | Conservative (rejects safe code too) |
+
+### Files Changed
+
+- `src/typechecker.rs`: `verify_crashfree()`, `scan_for_division()`, `scan_for_while_loops()`
+- `tests/test_crashfree.fd`: valid — 4 crashfree functions (arithmetic, for loop, transitive call, const div)
+- `tests/test_crashfree_fail.fd`: expected fail — `@crashfree` function calls `unwrap()`
+
+### Test Results
+
+- 99/99 normal tests pass (including test_crashfree)
+- 12/12 expected-fail tests correctly rejected (including test_crashfree_fail)
+- No regressions
+
+## Phase 7.5A (cont): LogicalTime Stdlib (August 2026)
+
+Added `stdlib/time.fd` — a timezone-free, clock-free time type for deterministic date math.
+
+### LogicalTime Type (F43)
+
+- `LogicalTime` struct: stores Unix timestamp as `i64` seconds
+- All operations are `@deterministic` (pure integer math, no IO, no randomness)
+- NOT `@linear` — it's a value type that can be freely copied
+
+### Construction
+- `time_from_timestamp(ts)` — from Unix seconds
+- `time_new(year, month, day, hour, min, sec)` — from date components (UTC)
+- `time_from_date(year, month, day)` — date at midnight UTC
+
+### Extraction
+- `time_get_year/month/day/hour/minute/second(t)` — component extraction
+- `time_get_weekday(t)` — day of week (0=Sunday, 1=Monday, ..., 6=Saturday)
+- `time_get_day_of_year(t)` — day of year (1-366)
+
+### Arithmetic
+- `time_add_seconds/minutes/hours/days(t, n)` — add time
+- `time_sub_seconds(t, n)` — subtract time
+- `time_diff_seconds/days(a, b)` — difference between two times
+
+### Comparison
+- `time_before/after/eq/before_eq(a, b)` — comparison functions
+
+### Formatting
+- `time_to_iso(t)` — ISO 8601 format: "YYYY-MM-DDTHH:MM:SSZ"
+- `time_to_date_string(t)` — date only: "YYYY-MM-DD"
+
+### Calendar
+- `is_leap_year(year)` — leap year check
+- `days_in_month(year, month)` — days in a given month
+
+### Algorithm
+Uses Howard Hinnant's `civil_from_days` algorithm for exact date math. Handles:
+- Leap years (including century rules: 2000 is leap, 1900/2100 are not)
+- Pre-epoch dates (negative timestamps)
+- Year boundaries
+- All edge cases verified with tests
+
+### Why It Matters
+Prevents two classes of bugs that plague financial systems:
+1. **Timezone bugs** — settlement dates in New York vs Tokyo
+2. **Clock skew bugs** — different servers disagree on "now"
+
+All time values are explicitly constructed — no system clock access means
+deterministic, reproducible date math.
+
+### Test Results
+- 99/99 normal tests pass (including test_time, test_time_edge)
+- 12/12 expected-fail tests correctly rejected
+- No regressions
+
+## Phase 7.5D: @gas Annotation — Compile-Time Gas Budgets (August 2026)
+
+Added `@gas(N)` annotation for compile-time gas limit enforcement, the Solidity
+gas model but checked before deployment instead of at runtime.
+
+### `@gas(N)` Annotation
+
+- **Syntax**: `@gas(50) pf foo(...) -> i64 { ... }`
+- **Semantics**: function has a compile-time gas budget of N units
+- **Cost model**: gas cost = AST node count (statements + expressions)
+- **Propagation**: total gas = own cost + sum of all callees' total gas (transitive)
+- **Cycle detection**: visited set prevents infinite recursion on recursive calls
+- **Memoization**: total gas cached per function for efficiency
+- **Error**: if `total_gas > N`, compile error with breakdown (own vs callees)
+- **Coverage**: works on free functions, impl methods, and trait impl methods
+
+### Solidity vs Fides Gas
+
+| | Solidity | Fides |
+|---|---|---|
+| When | Runtime | Compile time |
+| Failure | Transaction reverts mid-execution | Compile error before deployment |
+| Cost | Opcode gas (EVM) | AST node count |
+| Propagation | Call stack | Call graph (transitive) |
+
+### Files Changed
+
+- `src/typechecker.rs`: `verify_gas()`, `count_gas_cost_stmts/expr()`, `compute_total_gas()`
+- `src/ast.rs`: `Annotation` already supported (no changes needed)
+- `tests/test_gas.fd`: valid — 3 functions with gas budgets (50, 100, 200)
+- `tests/test_gas_fail.fd`: expected fail — `@gas(3)` on 16-cost function
+
+### Test Results
+
+- 96/96 normal tests pass (including test_gas)
+- 11/11 expected-fail tests correctly rejected (including test_gas_fail)
+- No regressions
+
+## Phase 7.5C: Production Primitives — Tuple Destructuring, File I/O, txn{}, Loop-Safe Linear Types (August 2026)
+
+Added the core primitives needed for real-world financial applications.
+
+### Tuple Destructuring
+
+`pv (a, b) = expr` — unpack multi-return values in one statement.
+
+- Parser: detects `(` after `pv` and parses a tuple pattern
+- Typechecker: verifies expression is a tuple type, binds each name
+- Lowerer: extracts each field with correct type (struct fields use Ptr load)
+- Banking: `Account_withdraw` and `Account_transfer` now return tuples
+
+### File I/O (`stdlib/file.fd`)
+
+- `file_read(path) -> str` — read entire file
+- `file_write(path, content) -> i64` — write file (0=success, -1=error)
+- `file_append(path, content) -> i64` — append to file
+- `file_exists(path) -> bool` — check existence
+- Interpreter: uses host OS filesystem
+- Native: will use Linux syscalls (open/read/write/close)
+
+### `txn {}` Blocks
+
+Atomic transaction blocks with rollback semantics.
+
+- Parser: `txn { body }` parsed as new statement type
+- Typechecker: body checked in new scope
+- Lowerer: transparent (body lowered as normal statements)
+- Future: interpreter-level memory snapshot for rollback
+
+### Loop-Aware Linear Types
+
+Linear variables cannot be consumed inside loop bodies.
+
+- `loop_depth` counter tracks loop nesting
+- `consume_var` rejects consumption when `loop_depth > 0`
+- Error: "variable 'm' cannot be consumed inside a loop"
+- Prevents double-consumption across iterations (the COBOL batch bug)
+
+### Database Helpers (`stdlib/db.fd`)
+
+Added `insert`, `delete`, `update` helper functions for common SQL operations.
+
+### Test Results
+
+- 96/96 normal tests pass
+- 11/11 expected-fail tests correctly rejected
+- No regressions
+
+## Phase 10A + F33: unsafe blocks, Heap Alloc, @audit, Field Privacy, Debug Cleanup (August 2026)
+
+Implemented four features and a cleanup pass that advance both Phase 10A
+(self-hosting foundation) and Phase 7.5C (safety annotations).
+
+### `unsafe { }` blocks (Phase 10A)
+
+- **Syntax**: `unsafe { body }` — escape hatch for raw memory operations
+- **Token/lexer/parser/AST/typechecker/lowering**: full pipeline, copying the
+  `sandbox { }` pattern (which revokes capabilities). `unsafe` is the inverse —
+  it permits operations that would otherwise be rejected.
+- **Currently transparent**: since raw pointer types don't exist yet, `unsafe`
+  blocks just run the body normally. When raw pointers are added (10A remaining),
+  `unsafe` will gate pointer dereference and FFI calls.
+- **Zero runtime cost**: `unsafe` is a compile-time permission, not a runtime check.
+- **Files**: `src/token.rs`, `src/lexer.rs`, `src/ast.rs`, `src/parser.rs`,
+  `src/typechecker.rs`, `src/lower.rs`, `src/codegen.rs`, `src/mono.rs`,
+  `src/comptime.rs`
+- **Test**: `tests/test_unsafe.fd`
+
+### Heap allocation builtins (Phase 10A)
+
+- **Stdlib module** `stdlib/alloc.fd` with `__alloc`, `__free`, `__alloc_bytes`,
+  `__alloc_array` — wrapping the existing `p_malloc`/`p_free` runtime builtins
+  with nicer names.
+- **All backends already supported**: interpreter (`interp.rs`), C codegen
+  (`codegen_c.rs` maps to `malloc`/`free`), and native PE/ELF (`runtime_linux.rs`
+  uses `mmap`/`munmap`).
+- **Test**: `tests/test_alloc.fd` — allocates, checks non-null, frees, no crash.
+
+### `@audit` annotation (F33 — Phase 7.5C)
+
+- **Behavior**: functions marked `@audit` emit `[AUDIT] enter <name>` at function
+  entry and `[AUDIT] exit <name>` at every return point (via defer).
+- **Implementation**: injected at IR lowering in `src/lower.rs` — works across
+  all backends (interpreter, C codegen, PE emitter) since it's at the IR level.
+- **Works on impl methods too**: annotations are preserved through mangling.
+- **Test**: `tests/test_audit.fd` — audited and non-audited functions, verifies
+  entry/exit logs appear only for `@audit` functions.
+- **Future**: full audit trail (timestamps, params, return values, chain-linked
+  hash, crypto signing) is still pending — this is the foundation.
+
+### Field-level privacy (Phase 10A.5)
+
+- **`is_pub: bool` on `Param`**: struct fields can be `pub` (public) or private
+  (default). Private fields are inaccessible from outside their defining module.
+- **Typechecker enforcement**: `field_visibility` map tracks which fields are
+  public. Cross-module access to private fields is a compile error.
+- **Test**: `tests/test_field_privacy.fd`, `tests/test_field_privacy_fail.fd`
+- **Files**: `src/ast.rs`, `src/parser.rs`, `src/typechecker.rs`,
+  `src/compiler.rs`, `src/lower.rs`, `src/mono.rs`, `src/cparser.rs`,
+  `stdlib/privacy.fd`
+
+### Debug cleanup
+
+- Removed 4 `DBG DCE` eprintln! statements from `src/linker.rs`
+- Removed 3 `DBG ELF` eprintln! statements from `src/elf64.rs`
+
+### Linear type field access fix
+
+- Fixed `Money_print` and banking functions that accessed multiple fields on
+  linear structs. Field access on a linear type is a **borrow** (does not
+  consume the struct), allowing reading multiple scalar fields. Accessing a
+  linear field (e.g. `acc.balance` where `balance: Money`) still consumes that
+  field's value.
+
+**Verification:** 93/93 normal + 9/9 expected-fail. No regressions.
+
+**Files changed:**
+- `src/token.rs` — `TokenKind::Unsafe`
+- `src/lexer.rs` — `"unsafe" => TokenKind::Unsafe`
+- `src/ast.rs` — `Stmt::Unsafe { body, line }`
+- `src/parser.rs` — `parse_unsafe_block()`, dispatch
+- `src/typechecker.rs` — `Stmt::Unsafe` handling (transparent), field privacy, linear field access fix
+- `src/lower.rs` — `@audit` injection, `Stmt::Unsafe` transparent lowering
+- `src/codegen.rs` — `Stmt::Unsafe` transparent codegen
+- `src/mono.rs` — `Stmt::Unsafe` substitution + generic call collection
+- `src/comptime.rs` — `Stmt::Unsafe` substitution
+- `src/linker.rs` — removed debug eprintln!s
+- `src/elf64.rs` — removed debug eprintln!s
+- `stdlib/alloc.fd` — new stdlib module
+- `tests/test_unsafe.fd`, `tests/test_alloc.fd`, `tests/test_audit.fd` — new tests
+
 ## Phase 7.5B: Banking Demo — Compile-Time Financial Conservation (August 2026)
 
 Built a mini banking system on top of linear Money + @conserve that

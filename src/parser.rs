@@ -1162,6 +1162,7 @@ impl Parser {
             TokenKind::Region => self.parse_region_block(),
             TokenKind::Sandbox => self.parse_sandbox_block(),
             TokenKind::Unsafe => self.parse_unsafe_block(),
+            TokenKind::Txn => self.parse_txn_block(),
             TokenKind::Grad => self.parse_grad_block(),
             TokenKind::Backward => {
                 let line = self.peek_token().line;
@@ -2559,6 +2560,17 @@ impl Parser {
         let body = self.parse_block()?;
         self.expect(TokenKind::RBrace, "}")?;
         Ok(Stmt::Unsafe { body, line })
+    }
+
+    /// Parse a transaction block: `txn { body }`
+    /// Atomic transaction with rollback on failure.
+    fn parse_txn_block(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect(TokenKind::Txn, "txn")?;
+        self.expect(TokenKind::LBrace, "{")?;
+        let body = self.parse_block()?;
+        self.expect(TokenKind::RBrace, "}")?;
+        Ok(Stmt::Txn { body, line })
     }
 
     /// Parse a grad block: `grad(var) { body; backward(loss); }`

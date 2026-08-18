@@ -53,23 +53,29 @@ pub pf Account_deposit(acc: Account, amount: Money) -> Account {
 }
 
 /// Withdraw money from an account. Consumes the account,
-/// returns a new account with reduced balance.
+/// returns a new account with reduced balance AND the withdrawn cash.
 /// Conservation: old_balance = new_balance + withdrawn.
-/// The withdrawn cash is produced separately by Account_withdraw_cash.
 @conserve
-pub pf Account_withdraw(acc: Account, withdraw_cents: i64) -> Account {
+pub pf Account_withdraw(acc: Account, withdraw_cents: i64) -> (Account, Money) {
     pv id = acc.id;
     pv c = acc.balance.cents;
     pv new_balance = Money_from_cents(c - withdraw_cents);
-    ret Account { id: id, balance: new_balance };
+    pv cash = Money_from_cents(withdraw_cents);
+    ret (Account { id: id, balance: new_balance }, cash);
 }
 
-/// Produce the cash that was withdrawn. @conserve because it creates
-/// Money from an integer — conservation is proved by the caller consuming
-/// both the new account (with reduced balance) and this cash.
+/// Transfer money from one account to another. Consumes both accounts,
+/// returns both with updated balances.
+/// Conservation: A loses X, B gains X. Total unchanged.
 @conserve
-pub pf Account_withdraw_cash(withdraw_cents: i64) -> Money {
-    ret Money_from_cents(withdraw_cents);
+pub pf Account_transfer(from: Account, to: Account, amount_cents: i64) -> (Account, Account) {
+    pv from_id = from.id;
+    pv from_bal = from.balance.cents;
+    pv to_id = to.id;
+    pv to_bal = to.balance.cents;
+    pv new_from = Account { id: from_id, balance: Money_from_cents(from_bal - amount_cents) };
+    pv new_to = Account { id: to_id, balance: Money_from_cents(to_bal + amount_cents) };
+    ret (new_from, new_to);
 }
 
 /// Calculate simple interest on an account. Consumes the account,

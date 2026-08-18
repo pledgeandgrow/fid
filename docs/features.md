@@ -1,6 +1,6 @@
 # Fides Language — Feature Status
 
-*Last updated: verified against actual source code and test runs (137/137 unit tests, 8/8 harness tests, 86/86 interpreter tests + 3/3 expected-fail, 86/86 C codegen — FULL PARITY, 89 .fd test files)*
+*Last updated: verified against actual source code and test runs (137/137 unit tests, 8/8 harness tests, 99/99 interpreter tests + 12/12 expected-fail, 99/99 C codegen — FULL PARITY, 111 .fd test files)*
 
 ## Legend
 
@@ -21,7 +21,7 @@
 | IR Interpreter (interp.rs) | ✅ | Runs IR directly via `fidesc run` |
 | PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables + flat binary (bare-metal mode) |
 | ELF64 Emitter (elf64.rs) | ✅ | Generates native ELF64 executables on Linux (zero external tools) + relocatable objects |
-| C Codegen (codegen_c.rs) | ✅ | Generates C code, 86/86 tests match interpreter output (FULL PARITY — no gaps) |
+| C Codegen (codegen_c.rs) | ✅ | Generates C code, 99/99 tests match interpreter output (FULL PARITY — no gaps) |
 | PIR (pir.rs) | ✅ | PIR L1/L2/L3, `fidesc pir` command |
 | Optimizer (opt.rs) | ⚠️ | Const fold, CSE, DCE, inline, unroll, TCO, effect-based elision. Works for simple programs but exposes register allocator bug on complex ones. Not enabled by default. |
 | Peephole (peephole.rs) | ✅ | 9 passes, always on in `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection |
@@ -46,7 +46,7 @@
 | `fidesc emit <file> --bare -o <bin>` | ✅ | Bare-metal flat binary (no stdlib, no PE headers) |
 | `fidesc build <file> -o <out> [--target] [--opt]` | ✅ | Native build: PIR → codegen → peephole → ELF64 executable (zero external tools on Linux) |
 | `fidesc ccompile <file> -o <exe>` | ✅ | C codegen → gcc/clang → executable |
-| `fidesc test` | ✅ | Runs all 86 normal + 3 expected-fail tests across interpreter, PE emitter, and C codegen |
+| `fidesc test` | ✅ | Runs all 99 normal + 12 expected-fail tests across interpreter, PE emitter, and C codegen |
 | `fidesc repl` | ✅ | Interactive REPL |
 | `fidesc verify <file>` | ✅ | IR verification pass |
 | `fidesc sourcemap <file>` | ✅ | Source map output |
@@ -489,6 +489,41 @@ pv out = quant::dequantize_q8(q_out); // dequantize result
 
 ---
 
+## Safety Features (Phase 7.5 — Tier 1 Safety)
+
+### Compile-Time Safety Annotations
+
+| Annotation | Status | What It Does |
+|-----------|--------|-------------|
+| `@deterministic` | ✅ DONE | Rejects FP, IO, Net, Spawn, Diverge effects — same inputs always produce same outputs |
+| `@conserve` | ✅ DONE | Proves money-in = money-out at compile time (no mint, no IO, no float, only call @conserve funcs) |
+| `@linear` | ✅ DONE | Move semantics on structs — no duplication, must consume, loop-aware |
+| `@gas(N)` | ✅ DONE | Compile-time gas budget — counts AST nodes, propagates through call graph, rejects if > N |
+| `@crashfree` | ✅ DONE | Compile-time panic prevention — rejects unwrap, p_panic, non-const div/mod, while loops, non-crashfree calls |
+| `@audit` | ✅ Partial | Entry/exit logging via IR injection. Full trail (timestamps, params, crypto) pending |
+| `txn {}` | ✅ Partial | Parsing + typechecking done. Interpreter rollback (memory snapshot) pending |
+
+### Financial Safety Stdlib
+
+| Module | Status | Description |
+|--------|--------|-------------|
+| `stdlib/money.fd` | ✅ DONE | Fixed-point i64 cents, @linear struct, arithmetic, formatting |
+| `stdlib/banking.fd` | ✅ DONE | Account, deposit, withdraw, transfer, interest, double-credit/lost-money detection |
+| `stdlib/file.fd` | ✅ DONE | File I/O: read, write, append, exists |
+| `stdlib/time.fd` | ✅ DONE | LogicalTime: timezone-free, clock-free, @deterministic date math |
+| `stdlib/alloc.fd` | ✅ DONE | Heap allocator builtins (malloc, realloc, free) |
+| `stdlib/privacy.fd` | ✅ DONE | Field-level privacy test module |
+
+### Language Features Added in Phase 7.5
+
+| Feature | Syntax | Status |
+|---------|--------|--------|
+| Tuple destructuring | `pv (a, b) = expr` | ✅ DONE |
+| Loop-aware linear types | Linear vars can't be consumed in loops | ✅ DONE |
+| `txn {}` blocks | `txn { ... }` | ✅ Partial (parsing+typechecking) |
+
+---
+
 ## Summary
 
 | Component | Working | Partial | Broken |
@@ -497,10 +532,10 @@ pv out = quant::dequantize_q8(q_out); // dequantize result
 | Parser | 100% | — | — |
 | Type Checker | 100% | — | — |
 | IR Lowering | 100% | — | — |
-| Interpreter | 86/86 + 3/3 expected-fail | — | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` (expected failures) |
-| PE Emitter | 86/86 + 3/3 expected-fail | — | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` (expected failures) |
+| Interpreter | 99/99 + 12/12 expected-fail | — | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` (expected failures) |
+| PE Emitter | 99/99 + 12/12 expected-fail | — | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` (expected failures) |
 | ELF64 Emitter | ✅ | — | Working executables on Linux (zero external tools) |
-| C Codegen | 86/86 + 3/3 expected-fail | — | FULL PARITY — no gaps. test_db no longer flaky (HashMap keys sorted). |
+| C Codegen | 99/99 + 12/12 expected-fail | — | FULL PARITY — no gaps. test_db no longer flaky (HashMap keys sorted). |
 | Multi-arch Codegen | ✅ | — | x86-64, ARM64, RISC-V assembly all work |
 | Peephole Optimizer | ✅ (9 passes) | — | Always on in `build` |
 | L2 Optimizer | — | ⚠️ | Works for simple programs, regalloc bug on complex ones |
@@ -512,7 +547,7 @@ pv out = quant::dequantize_q8(q_out); // dequantize result
 
 ### Test Coverage
 
-- **89 test files** in `tests/` (86 normal + 3 expected-fail)
+- **111 test files** in `tests/` (99 normal + 12 expected-fail)
 - **137 unit tests** in `cargo test --bin fidesc` — all pass
 - **8 cargo tests** in `tests/harness.rs` — all pass (including golden_files_match)
 - **43 golden files** in `tests/golden/` — expected outputs for regression testing

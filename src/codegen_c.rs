@@ -522,6 +522,10 @@ impl CCodeGen {
             ("p_db_mem_close", &[p()]),
             ("p_hlt", &[]),
             ("p_socket_write_str", &[I64, p()]),
+            ("p_file_read", &[p()]),
+            ("p_file_write", &[p(), p()]),
+            ("p_file_exists", &[p()]),
+            ("p_file_append", &[p(), p()]),
         ];
         for (name, params) in sigs {
             self.fn_param_types
@@ -816,6 +820,11 @@ impl CCodeGen {
         wln!(self, "void p_panic(const char* msg);");
         wln!(self, "void* p_malloc(int64_t size);");
         wln!(self, "void p_free(void* ptr);");
+        // File I/O builtins
+        wln!(self, "char* p_file_read(const char* path);");
+        wln!(self, "int64_t p_file_write(const char* path, const char* content);");
+        wln!(self, "bool p_file_exists(const char* path);");
+        wln!(self, "int64_t p_file_append(const char* path, const char* content);");
         // Allocator builtins (Phase 2A.8)
         wln!(self, "void* p_allocator_create(void* arg);");
         wln!(self, "int64_t p_allocator_alloc(void* alloc, int64_t size);");
@@ -1805,6 +1814,27 @@ impl CCodeGen {
         wln!(self, "void p_panic(const char* msg) { fprintf(stderr, \"%s\\n\", msg); abort(); }");
         wln!(self, "void* p_malloc(int64_t size) { return malloc((size_t)size); }");
         wln!(self, "void p_free(void* ptr) { free(ptr); }");
+        // File I/O builtins
+        wln!(self, "char* p_file_read(const char* path) {{");
+        wln!(self, "    FILE* f = fopen(path, \"rb\");");
+        wln!(self, "    if (!f) return NULL;");
+        wln!(self, "    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);");
+        wln!(self, "    char* buf = (char*)malloc((size_t)sz + 1);");
+        wln!(self, "    if (!buf) {{ fclose(f); return NULL; }}");
+        wln!(self, "    size_t rd = fread(buf, 1, (size_t)sz, f); buf[rd] = 0; fclose(f);");
+        wln!(self, "    return buf;");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_file_write(const char* path, const char* content) {{");
+        wln!(self, "    FILE* f = fopen(path, \"wb\");");
+        wln!(self, "    if (!f) return -1;");
+        wln!(self, "    fputs(content, f); fclose(f); return 0;");
+        wln!(self, "}}");
+        wln!(self, "bool p_file_exists(const char* path) {{ FILE* f = fopen(path, \"rb\"); if (f) {{ fclose(f); return true; }} return false; }}");
+        wln!(self, "int64_t p_file_append(const char* path, const char* content) {{");
+        wln!(self, "    FILE* f = fopen(path, \"ab\");");
+        wln!(self, "    if (!f) return -1;");
+        wln!(self, "    fputs(content, f); fclose(f); return 0;");
+        wln!(self, "}}");
         // Allocator builtins (Phase 2A.8) — simplified stubs
         wln!(self, "void* p_allocator_create(void* arg) { (void)arg; return (void*)1; }");
         wln!(self, "int64_t p_allocator_alloc(void* alloc, int64_t size) { (void)alloc; return (int64_t)(intptr_t)malloc((size_t)size); }");

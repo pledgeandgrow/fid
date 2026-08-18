@@ -75,6 +75,9 @@ pub struct TypeChecker {
     /// Track linear variables declared in each scope, so we can check they're consumed.
     /// Maps scope depth → set of (var_name, line) pairs that are linear.
     scope_linear_vars: Vec<Vec<(String, usize)>>,
+    /// Current loop nesting depth — when > 0, linear variables cannot be consumed.
+    /// This prevents double-consumption across loop iterations.
+    loop_depth: usize,
 }
 
 impl TypeChecker {
@@ -114,6 +117,7 @@ impl TypeChecker {
             linear_structs: HashSet::new(),
             consumed_vars: HashSet::new(),
             scope_linear_vars: vec![Vec::new()],
+            loop_depth: 0,
         }
     }
 
@@ -376,6 +380,12 @@ impl TypeChecker {
 
         // Verify @conserve annotation constraints
         self.verify_conserve(program);
+
+        // Verify @gas annotation constraints
+        self.verify_gas(program);
+
+        // Verify @crashfree annotation constraints
+        self.verify_crashfree(program);
 
         // Verify allocator-as-parameter: functions with !Alloc must take an Allocator param
         self.verify_allocator_params(program);
@@ -763,6 +773,282 @@ impl TypeChecker {
         }
     }
 
+    /// Verify @gas annotation constraints.
+    ///
+    /// A @gas(N) function has a compile-time gas budget of N. The gas cost
+    /// is the number of AST operations (statements + expressions) in the
+    /// function body, plus the gas cost of all called functions (transitive).
+    ///
+    /// This is the Solidity gas model, but at compile time:
+    ///   - Solidity: gas checked at runtime, transaction fails mid-execution
+    ///   - Fides:    gas checked at compile time, rejected before deployment
+    ///
+    /// The gas cost is propagated through the call graph:
+    ///   total_gas(func) = own_cost(func) + sum(total_gas(callee) for callee in calls(func))
+    ///
+    /// If total_gas > N, it's a compile error.
+    fn verify_gas(&mut self, program: &Program) {
+        // Collect all function gas limits: name -> limit
+        let mut gas_limits: HashMap<String, u64> = HashMap::new();
+        for func in &program.funcs {
+            for ann in &func.annotations {
+                if ann.name == "gas" {
+                    if let Some(arg) = ann.args.first() {
+                        if let Ok(limit) = arg.parse::<u64>() {
+                            gas_limits.insert(func.name.clone(), limit);
+                        }
+                    }
+                }
+            }
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                for ann in &method.annotations {
+                    if ann.name == "gas" {
+                        if let Some(arg) = ann.args.first() {
+                            if let Ok(limit) = arg.parse::<u64>() {
+                                gas_limits.insert(format!("{}_{}", imp.struct_name, method.name), limit);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                for ann in &method.annotations {
+                    if ann.name == "gas" {
+                        if let Some(arg) = ann.args.first() {
+                            if let Ok(limit) = arg.parse::<u64>() {
+                                gas_limits.insert(format!("{}_{}", ti.type_name, method.name), limit);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build call graph: func name -> set of called function names
+        let mut call_graph: HashMap<String, HashSet<String>> = HashMap::new();
+        for func in &program.funcs {
+            let mut calls = HashSet::new();
+            scan_stmts_for_calls(&func.body, &mut calls);
+            call_graph.insert(func.name.clone(), calls);
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                let mangled = format!("{}_{}", imp.struct_name, method.name);
+                let mut calls = HashSet::new();
+                scan_stmts_for_calls(&method.body, &mut calls);
+                call_graph.insert(mangled, calls);
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                let mangled = format!("{}_{}", ti.type_name, method.name);
+                let mut calls = HashSet::new();
+                scan_stmts_for_calls(&method.body, &mut calls);
+                call_graph.insert(mangled, calls);
+            }
+        }
+
+        // Compute own cost (AST node count) for each function
+        let mut own_costs: HashMap<String, u64> = HashMap::new();
+        for func in &program.funcs {
+            own_costs.insert(func.name.clone(), count_gas_cost_stmts(&func.body));
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                let mangled = format!("{}_{}", imp.struct_name, method.name);
+                own_costs.insert(mangled, count_gas_cost_stmts(&method.body));
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                let mangled = format!("{}_{}", ti.type_name, method.name);
+                own_costs.insert(mangled, count_gas_cost_stmts(&method.body));
+            }
+        }
+
+        // Compute total gas (own + callees) with memoization and cycle detection
+        let mut total_gas_cache: HashMap<String, u64> = HashMap::new();
+        for (name, &limit) in &gas_limits {
+            let mut visited: HashSet<String> = HashSet::new();
+            let total = compute_total_gas(name, &own_costs, &call_graph, &mut visited, &mut total_gas_cache);
+            if total > limit {
+                self.errors.push(format!(
+                    "Gas error: function '{}' has @gas({}) but total gas cost is {} (own: {} + callees: {}).\n\
+                     \x20\x20\x20\x20The function exceeds its compile-time gas budget.\n\
+                     \x20\x20\x20\x20Unlike Solidity (runtime gas — transaction fails mid-execution),\n\
+                     \x20\x20\x20\x20Fides rejects gas overruns at compile time — before deployment.\n\
+                     \x20\x20\x20\x20Fix: increase the gas limit, simplify the function, or reduce calls.",
+                    name, limit, total,
+                    own_costs.get(name).copied().unwrap_or(0),
+                    total - own_costs.get(name).copied().unwrap_or(0)
+                ));
+            }
+        }
+    }
+
+    /// Verify @crashfree annotation constraints.
+    ///
+    /// A @crashfree function is proven to never panic at runtime. The compiler
+    /// rejects patterns that can crash:
+    ///   1. `unwrap()` on Option/Result — calls p_panic on None/Err
+    ///   2. `p_panic()` — explicit panic
+    ///   3. Division `/` or modulo `%` — division by zero aborts
+    ///      (unless divisor is a non-zero constant)
+    ///   4. `while` loops without a bound — can hang or overflow stack
+    ///      (for loops over finite ranges/arrays are safe)
+    ///   5. Calling non-@crashfree functions — transitive crash risk
+    ///
+    /// This is the SPARK Ada "proof of absence of run-time errors" model,
+    /// but as a simple pattern-based check rather than full formal proof.
+    ///
+    /// Primary use case: aerospace (DO-178C), medical (IEC 62304), automotive
+    /// (ISO 26262) — any domain where a crash = catastrophic failure.
+    fn verify_crashfree(&mut self, program: &Program) {
+        // Collect all @crashfree function names (free functions + methods)
+        let mut crashfree_funcs: HashSet<String> = HashSet::new();
+        for func in &program.funcs {
+            if func.annotations.iter().any(|a| a.name == "crashfree") {
+                crashfree_funcs.insert(func.name.clone());
+            }
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                if method.annotations.iter().any(|a| a.name == "crashfree") {
+                    crashfree_funcs.insert(format!("{}_{}", imp.struct_name, method.name));
+                }
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                if method.annotations.iter().any(|a| a.name == "crashfree") {
+                    crashfree_funcs.insert(format!("{}_{}", ti.type_name, method.name));
+                }
+            }
+        }
+
+        // Functions that are known to panic (stdlib)
+        let panic_funcs: &[&str] = &["p_panic", "Option_unwrap", "Result_unwrap"];
+        // Method names that panic (called as Type::unwrap)
+        let panic_methods: &[&str] = &["unwrap"];
+
+        // Check each @crashfree function
+        let check_body = |stmts: &[Stmt], func_name: &str, crashfree_funcs: &HashSet<String>| -> Vec<String> {
+            let mut errs = Vec::new();
+            let mut calls = HashSet::new();
+            scan_stmts_for_calls(stmts, &mut calls);
+
+            // 1. Check called functions for panic risk
+            for called in &calls {
+                // Direct panic functions
+                if panic_funcs.contains(&called.as_str()) {
+                    errs.push(format!(
+                        "Crashfree error: function '{}' is @crashfree but calls '{}'.\n\
+                         \x20\x20\x20\x20'{}' can panic at runtime — @crashfree functions must never panic.\n\
+                         \x20\x20\x20\x20Fix: use match/unwrap_or instead of unwrap, or remove @crashfree.",
+                        func_name, called, called
+                    ));
+                    continue;
+                }
+                // Method calls that panic (unwrap on Option/Result)
+                if panic_methods.iter().any(|m| called == m || called.ends_with(&format!("_{}", m))) {
+                    if called == "unwrap" {
+                        errs.push(format!(
+                            "Crashfree error: function '{}' is @crashfree but calls 'unwrap'.\n\
+                             \x20\x20\x20\x20unwrap() panics on None/Err — @crashfree functions must never panic.\n\
+                             \x20\x20\x20\x20Fix: use match, unwrap_or, or the ? operator instead.",
+                            func_name
+                        ));
+                    }
+                    continue;
+                }
+                // Skip built-in runtime functions (p_print_*, p_malloc, etc. — these don't panic)
+                if called.starts_with("p_") && !panic_funcs.contains(&called.as_str()) {
+                    continue;
+                }
+                // Skip print/println
+                if matches!(called.as_str(), "print" | "println" | "print_str" | "print_nl" | "print_int") {
+                    continue;
+                }
+                // Skip unknown functions (might be builtins we don't track)
+                if !self.funcs.contains_key(called) {
+                    continue;
+                }
+                // Check transitive: can only call other @crashfree functions
+                if !crashfree_funcs.contains(called) {
+                    errs.push(format!(
+                        "Crashfree error: function '{}' is @crashfree but calls '{}',\n\
+                         \x20\x20\x20\x20which is not @crashfree.\n\
+                         \x20\x20\x20\x20A @crashfree function can only call other @crashfree functions —\n\
+                         \x20\x20\x20\x20otherwise the callee could panic.\n\
+                         \x20\x20\x20\x20Fix: add @crashfree to '{}', or remove the call from '{}'.",
+                        func_name, called, called, func_name
+                    ));
+                }
+            }
+
+            // 2. Check for division/modulo (division by zero risk)
+            let mut div_sites = Vec::new();
+            scan_for_division(stmts, &mut div_sites);
+            for (line, op) in div_sites {
+                errs.push(format!(
+                    "Crashfree error (line {}): function '{}' is @crashfree but uses '{}'.\n\
+                     \x20\x20\x20\x20Division/modulo by zero aborts at runtime.\n\
+                     \x20\x20\x20\x20@crashfree functions cannot use '{}' unless the divisor is proven non-zero.\n\
+                     \x20\x20\x20\x20Fix: use a checked-divide helper, or remove @crashfree.",
+                    line, func_name, op, op
+                ));
+            }
+
+            // 3. Check for unbounded while loops
+            let mut while_sites = Vec::new();
+            scan_for_while_loops(stmts, &mut while_sites);
+            for line in while_sites {
+                errs.push(format!(
+                    "Crashfree error (line {}): function '{}' is @crashfree but uses a 'while' loop.\n\
+                     \x20\x20\x20\x20While loops can be unbounded — potential infinite loop or stack overflow.\n\
+                     \x20\x20\x20\x20@crashfree functions must use 'for' loops over finite ranges/arrays instead.\n\
+                     \x20\x20\x20\x20Fix: replace 'while cond {{ ... }}' with 'for i in 0..N {{ ... }}',\n\
+                     \x20\x20\x20\x20or remove @crashfree.",
+                    line, func_name
+                ));
+            }
+
+            errs
+        };
+
+        // Check free functions
+        for func in &program.funcs {
+            if !func.annotations.iter().any(|a| a.name == "crashfree") { continue; }
+            for err in check_body(&func.body, &func.name, &crashfree_funcs) {
+                self.errors.push(err);
+            }
+        }
+        // Check impl methods
+        for imp in &program.impls {
+            for method in &imp.methods {
+                if !method.annotations.iter().any(|a| a.name == "crashfree") { continue; }
+                let qualified = format!("{}_{}", imp.struct_name, method.name);
+                for err in check_body(&method.body, &qualified, &crashfree_funcs) {
+                    self.errors.push(err);
+                }
+            }
+        }
+        // Check trait impl methods
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                if !method.annotations.iter().any(|a| a.name == "crashfree") { continue; }
+                let qualified = format!("{}_{}", ti.type_name, method.name);
+                for err in check_body(&method.body, &qualified, &crashfree_funcs) {
+                    self.errors.push(err);
+                }
+            }
+        }
+    }
+
     /// Verify that functions declaring `!Alloc` have an explicit `Allocator` (or `&Allocator`)
     /// parameter. This is the "allocator-as-parameter" rule (like Zig, but verified).
     /// Functions that allocate must receive their allocator explicitly — no ambient allocation.
@@ -888,6 +1174,7 @@ impl TypeChecker {
         match stmt {
             Stmt::Expr(e, _) => self.scan_expr_for_effects(e, effects),
             Stmt::Let { expr, .. } => self.scan_expr_for_effects(expr, effects),
+            Stmt::LetTuple { expr, .. } => self.scan_expr_for_effects(expr, effects),
             Stmt::Assign { expr, .. } => self.scan_expr_for_effects(expr, effects),
             Stmt::IndexAssign { index, expr, .. } => {
                 self.scan_expr_for_effects(index, effects);
@@ -936,7 +1223,7 @@ impl TypeChecker {
             Stmt::Sandbox { body, .. } => {
                 self.scan_stmts_for_effects(body, effects);
             }
-            Stmt::Unsafe { body, .. } => {
+            Stmt::Unsafe { body, .. } | Stmt::Txn { body, .. } => {
                 self.scan_stmts_for_effects(body, effects);
             }
             _ => {}
@@ -1202,6 +1489,15 @@ impl TypeChecker {
 
     /// Mark a variable as consumed (moved). If it's already consumed, error.
     fn consume_var(&mut self, name: &str, line: usize) {
+        if self.loop_depth > 0 {
+            self.errors.push(format!(
+                "Linear type error (line {}): variable '{}' cannot be consumed inside a loop.\n\
+                 \x20\x20\x20\x20Linear values can only be used once — consuming them inside a loop\n\
+                 \x20\x20\x20\x20would fail on the second iteration. Move the consumption outside\n\
+                 \x20\x20\x20\x20the loop, or use a non-linear type.",
+                line, name
+            ));
+        }
         if self.consumed_vars.contains(name) {
             self.errors.push(format!(
                 "Linear type error (line {}): variable '{}' was already consumed (moved).\n\
@@ -1403,6 +1699,34 @@ impl TypeChecker {
                 }
                 self.declare(name, final_ty);
             }
+            Stmt::LetTuple { names, expr, line } => {
+                let expr_ty = self.check_expr(expr);
+                self.consume_linear_in_expr(expr, *line);
+                match &expr_ty {
+                    Type::Tuple(elem_types) => {
+                        if names.len() != elem_types.len() {
+                            self.errors.push(format!(
+                                "Type error (line {}): tuple destructuring expects {} names but expression has {} elements.",
+                                line, names.len(), elem_types.len()
+                            ));
+                        }
+                        for (name, elem_ty) in names.iter().zip(elem_types.iter()) {
+                            if self.is_linear_type(elem_ty) {
+                                if let Some(scope) = self.scope_linear_vars.last_mut() {
+                                    scope.push((name.clone(), *line));
+                                }
+                            }
+                            self.declare(name, elem_ty.clone());
+                        }
+                    }
+                    _ => {
+                        self.errors.push(format!(
+                            "Type error (line {}): cannot destructure {} as a tuple — expected a tuple type.",
+                            line, expr_ty
+                        ));
+                    }
+                }
+            }
             Stmt::Expr(expr, line) => {
                 self.check_expr(expr);
                 self.consume_linear_in_expr(expr, *line);
@@ -1546,9 +1870,11 @@ impl TypeChecker {
                     ));
                 }
                 self.push_scope();
+                self.loop_depth += 1;
                 for s in body {
                     self.check_stmt(s);
                 }
+                self.loop_depth -= 1;
                 self.pop_scope();
             }
             Stmt::For { var, iterator, body, line: _ } => {
@@ -1563,16 +1889,20 @@ impl TypeChecker {
                 };
                 self.push_scope();
                 self.declare(var, elem_ty);
+                self.loop_depth += 1;
                 for s in body {
                     self.check_stmt(s);
                 }
+                self.loop_depth -= 1;
                 self.pop_scope();
             }
             Stmt::Loop { body, line: _ } => {
                 self.push_scope();
+                self.loop_depth += 1;
                 for s in body {
                     self.check_stmt(s);
                 }
+                self.loop_depth -= 1;
                 self.pop_scope();
             }
             Stmt::Break(expr, _) => {
@@ -1740,6 +2070,16 @@ impl TypeChecker {
                 // For now, unsafe is transparent — it just passes through.
                 // When raw pointers are added, unsafe_depth > 0 will permit
                 // pointer dereference and other unsafe operations.
+                self.push_scope();
+                for s in body {
+                    self.check_stmt(s);
+                }
+                self.pop_scope();
+            }
+            Stmt::Txn { body, .. } => {
+                // Transaction block — typecheck body normally.
+                // The rollback semantics are handled at runtime (interpreter)
+                // or at the application level (native code).
                 self.push_scope();
                 for s in body {
                     self.check_stmt(s);
@@ -3096,6 +3436,124 @@ fn type_contains_float(ty: &Type) -> bool {
     }
 }
 
+/// Count the gas cost of a list of statements (AST node count).
+/// Each statement and sub-expression costs 1 gas unit.
+fn count_gas_cost_stmts(stmts: &[Stmt]) -> u64 {
+    stmts.iter().map(|s| count_gas_cost_stmt(s)).sum()
+}
+
+fn count_gas_cost_stmt(stmt: &Stmt) -> u64 {
+    let mut cost = 1; // this statement
+    match stmt {
+        Stmt::Let { expr, .. } | Stmt::LetTuple { expr, .. } => cost += count_gas_cost_expr(expr),
+        Stmt::Expr(e, _) => cost += count_gas_cost_expr(e),
+        Stmt::Assign { expr, .. } => cost += count_gas_cost_expr(expr),
+        Stmt::IndexAssign { index, expr, .. } => cost += count_gas_cost_expr(index) + count_gas_cost_expr(expr),
+        Stmt::DerefAssign { ptr_expr, expr, .. } => cost += count_gas_cost_expr(ptr_expr) + count_gas_cost_expr(expr),
+        Stmt::Return(e, _) => { if let Some(e) = e { cost += count_gas_cost_expr(e); } }
+        Stmt::If { cond, then_block, else_block, .. } => {
+            cost += count_gas_cost_expr(cond);
+            cost += count_gas_cost_stmts(then_block);
+            if let Some(eb) = else_block { cost += count_gas_cost_stmts(eb); }
+        }
+        Stmt::While { cond, body, .. } => {
+            cost += count_gas_cost_expr(cond);
+            cost += count_gas_cost_stmts(body);
+        }
+        Stmt::Loop { body, .. } => cost += count_gas_cost_stmts(body),
+        Stmt::For { iterator, body, .. } => {
+            cost += count_gas_cost_expr(iterator);
+            cost += count_gas_cost_stmts(body);
+        }
+        Stmt::Defer(b, _) => cost += count_gas_cost_stmts(b),
+        Stmt::Match { expr, arms, .. } => {
+            cost += count_gas_cost_expr(expr);
+            for arm in arms {
+                cost += count_gas_cost_stmts(&arm.body);
+            }
+        }
+        Stmt::RegionBlock { body, .. } | Stmt::Sandbox { body, .. } | Stmt::Unsafe { body, .. } | Stmt::Txn { body, .. } => {
+            cost += count_gas_cost_stmts(body);
+        }
+        Stmt::GradBlock { body, .. } => cost += count_gas_cost_stmts(body),
+        Stmt::ComptimeGen { block, .. } => cost += count_gas_cost_stmts(block),
+        _ => {}
+    }
+    cost
+}
+
+fn count_gas_cost_expr(expr: &Expr) -> u64 {
+    let mut cost = 1; // this expression
+    match expr {
+        Expr::Binary { left, right, .. } => cost += count_gas_cost_expr(left) + count_gas_cost_expr(right),
+        Expr::Unary { expr, .. } => cost += count_gas_cost_expr(expr),
+        Expr::Call { args, .. } => { for a in args { cost += count_gas_cost_expr(a); } }
+        Expr::MethodCall { receiver, args, .. } => {
+            cost += count_gas_cost_expr(receiver);
+            for a in args { cost += count_gas_cost_expr(a); }
+        }
+        Expr::FieldAccess { expr, .. } => cost += count_gas_cost_expr(expr),
+        Expr::Index { index, .. } => cost += count_gas_cost_expr(index),
+        Expr::StructLit { fields, spread, .. } => {
+            for (_, e) in fields { cost += count_gas_cost_expr(e); }
+            if let Some(s) = spread { cost += count_gas_cost_expr(s); }
+        }
+        Expr::ArrayLit { elements, .. } => { for e in elements { cost += count_gas_cost_expr(e); } }
+        Expr::TupleLit(elems) => { for e in elems { cost += count_gas_cost_expr(e); } }
+        Expr::Ref { expr, .. } => cost += count_gas_cost_expr(expr),
+        Expr::Deref { expr } => cost += count_gas_cost_expr(expr),
+        Expr::Cast { expr, .. } => cost += count_gas_cost_expr(expr),
+        Expr::If { cond, then_block, else_block } => {
+            cost += count_gas_cost_expr(cond);
+            cost += count_gas_cost_stmts(then_block);
+            if let Some(eb) = else_block { cost += count_gas_cost_stmts(eb); }
+        }
+        Expr::Block(stmts) => cost += count_gas_cost_stmts(stmts),
+        Expr::Match { expr, arms } => {
+            cost += count_gas_cost_expr(expr);
+            for arm in arms { cost += count_gas_cost_stmts(&arm.body); }
+        }
+        Expr::Coalesce { expr, default } => cost += count_gas_cost_expr(expr) + count_gas_cost_expr(default),
+        Expr::Try { expr } => cost += count_gas_cost_expr(expr),
+        Expr::StrConcat { left, right } => cost += count_gas_cost_expr(left) + count_gas_cost_expr(right),
+        Expr::Range { start, end, .. } => cost += count_gas_cost_expr(start) + count_gas_cost_expr(end),
+        _ => {}
+    }
+    cost
+}
+
+/// Compute total gas cost (own + transitive callees) with cycle detection.
+fn compute_total_gas(
+    name: &str,
+    own_costs: &HashMap<String, u64>,
+    call_graph: &HashMap<String, HashSet<String>>,
+    visited: &mut HashSet<String>,
+    cache: &mut HashMap<String, u64>,
+) -> u64 {
+    if let Some(&cached) = cache.get(name) {
+        return cached;
+    }
+    // Cycle detection — if we've already visited this node in the current
+    // traversal, return its own cost (don't recurse into the cycle).
+    if visited.contains(name) {
+        return own_costs.get(name).copied().unwrap_or(0);
+    }
+    visited.insert(name.to_string());
+
+    let own = own_costs.get(name).copied().unwrap_or(0);
+    let callee_total: u64 = call_graph.get(name)
+        .map(|calls| {
+            calls.iter()
+                .map(|c| compute_total_gas(c, own_costs, call_graph, visited, cache))
+                .sum()
+        })
+        .unwrap_or(0);
+
+    let total = own + callee_total;
+    cache.insert(name.to_string(), total);
+    total
+}
+
 /// Scan function body statements for all function calls.
 /// Collects both direct calls (callee name) and method calls (Type::method).
 fn scan_stmts_for_calls(stmts: &[Stmt], calls: &mut HashSet<String>) {
@@ -3107,6 +3565,7 @@ fn scan_stmts_for_calls(stmts: &[Stmt], calls: &mut HashSet<String>) {
 fn scan_stmt_for_calls(stmt: &Stmt, calls: &mut HashSet<String>) {
     match stmt {
         Stmt::Let { expr, .. } => scan_expr_for_calls(expr, calls),
+        Stmt::LetTuple { expr, .. } => scan_expr_for_calls(expr, calls),
         Stmt::Expr(e, _) => scan_expr_for_calls(e, calls),
         Stmt::Assign { expr, .. } => scan_expr_for_calls(expr, calls),
         Stmt::IndexAssign { index, expr, .. } => {
@@ -3162,7 +3621,7 @@ fn scan_stmt_for_calls(stmt: &Stmt, calls: &mut HashSet<String>) {
         Stmt::Sandbox { body, .. } => {
             for s in body { scan_stmt_for_calls(s, calls); }
         }
-        Stmt::Unsafe { body, .. } => {
+        Stmt::Unsafe { body, .. } | Stmt::Txn { body, .. } => {
             for s in body { scan_stmt_for_calls(s, calls); }
         }
         Stmt::GradBlock { body, .. } => {
@@ -3278,6 +3737,7 @@ fn scan_stmt_for_floats(stmt: &Stmt, found: &mut Vec<String>) {
             }
             scan_expr_for_floats(expr, found);
         }
+        Stmt::LetTuple { expr, .. } => scan_expr_for_floats(expr, found),
         Stmt::Expr(e, _) => scan_expr_for_floats(e, found),
         Stmt::Assign { expr, .. } => scan_expr_for_floats(expr, found),
         Stmt::IndexAssign { index, expr, .. } => {
@@ -3330,7 +3790,7 @@ fn scan_stmt_for_floats(stmt: &Stmt, found: &mut Vec<String>) {
         Stmt::Sandbox { body, .. } => {
             for s in body { scan_stmt_for_floats(s, found); }
         }
-        Stmt::Unsafe { body, .. } => {
+        Stmt::Unsafe { body, .. } | Stmt::Txn { body, .. } => {
             for s in body { scan_stmt_for_floats(s, found); }
         }
         Stmt::GradBlock { body, .. } => {
@@ -3437,6 +3897,272 @@ fn scan_expr_for_floats(expr: &Expr, found: &mut Vec<String>) {
         Expr::Asm { .. } => {}
         Expr::ComptimeReflect { .. } => {}
         Expr::FString { .. } => {}
+        _ => {}
+    }
+}
+
+// ─── @crashfree helpers ───
+
+/// Scan statements for division/modulo operations.
+/// Returns (line, operator_string) for each div/mod site.
+fn scan_for_division(stmts: &[Stmt], sites: &mut Vec<(usize, &'static str)>) {
+    for stmt in stmts {
+        scan_stmt_for_division(stmt, sites);
+    }
+}
+
+fn scan_stmt_for_division(stmt: &Stmt, sites: &mut Vec<(usize, &'static str)>) {
+    match stmt {
+        Stmt::Let { expr, .. } | Stmt::LetTuple { expr, .. } => scan_expr_for_division(expr, sites),
+        Stmt::Expr(e, _) => scan_expr_for_division(e, sites),
+        Stmt::Assign { expr, .. } => scan_expr_for_division(expr, sites),
+        Stmt::IndexAssign { index, expr, .. } => {
+            scan_expr_for_division(index, sites);
+            scan_expr_for_division(expr, sites);
+        }
+        Stmt::DerefAssign { ptr_expr, expr, .. } => {
+            scan_expr_for_division(ptr_expr, sites);
+            scan_expr_for_division(expr, sites);
+        }
+        Stmt::Return(e, _) => {
+            if let Some(e) = e { scan_expr_for_division(e, sites); }
+        }
+        Stmt::If { cond, then_block, else_block, .. } => {
+            scan_expr_for_division(cond, sites);
+            for s in then_block { scan_stmt_for_division(s, sites); }
+            if let Some(eb) = else_block {
+                for s in eb { scan_stmt_for_division(s, sites); }
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            scan_expr_for_division(cond, sites);
+            for s in body { scan_stmt_for_division(s, sites); }
+        }
+        Stmt::For { iterator, body, .. } => {
+            scan_expr_for_division(iterator, sites);
+            for s in body { scan_stmt_for_division(s, sites); }
+        }
+        Stmt::Loop { body, .. } => {
+            for s in body { scan_stmt_for_division(s, sites); }
+        }
+        Stmt::Defer(stmts, _) => {
+            for s in stmts { scan_stmt_for_division(s, sites); }
+        }
+        Stmt::Match { expr, arms, .. } => {
+            scan_expr_for_division(expr, sites);
+            for arm in arms {
+                for s in &arm.body { scan_stmt_for_division(s, sites); }
+            }
+        }
+        Stmt::Handle { body, handlers, .. } => {
+            for s in body { scan_stmt_for_division(s, sites); }
+            for h in handlers {
+                for s in &h.body { scan_stmt_for_division(s, sites); }
+            }
+        }
+        Stmt::RegionBlock { body, .. } | Stmt::Sandbox { body, .. } | Stmt::Unsafe { body, .. } | Stmt::Txn { body, .. } => {
+            for s in body { scan_stmt_for_division(s, sites); }
+        }
+        Stmt::GradBlock { body, .. } => {
+            for s in body { scan_stmt_for_division(s, sites); }
+        }
+        Stmt::Backward { loss, .. } => scan_expr_for_division(loss, sites),
+        Stmt::ComptimeGen { block, .. } => {
+            for s in block { scan_stmt_for_division(s, sites); }
+        }
+        _ => {}
+    }
+}
+
+fn scan_expr_for_division(expr: &Expr, sites: &mut Vec<(usize, &'static str)>) {
+    match expr {
+        Expr::Binary { op, left, right } => {
+            if matches!(op, BinOp::Div | BinOp::Mod) {
+                // Check if divisor is a non-zero constant — if so, it's safe
+                let is_safe = matches!(right.as_ref(), Expr::IntLit(n) if *n != 0);
+                if !is_safe {
+                    let op_str = if matches!(op, BinOp::Div) { "/" } else { "%" };
+                    sites.push((0, op_str));
+                }
+            }
+            scan_expr_for_division(left, sites);
+            scan_expr_for_division(right, sites);
+        }
+        Expr::Unary { expr, .. } => scan_expr_for_division(expr, sites),
+        Expr::Call { args, .. } => {
+            for a in args { scan_expr_for_division(a, sites); }
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            scan_expr_for_division(receiver, sites);
+            for a in args { scan_expr_for_division(a, sites); }
+        }
+        Expr::FieldAccess { expr, .. } => scan_expr_for_division(expr, sites),
+        Expr::Index { array, index } => {
+            scan_expr_for_division(array, sites);
+            scan_expr_for_division(index, sites);
+        }
+        Expr::StructLit { fields, spread, .. } => {
+            for (_, e) in fields { scan_expr_for_division(e, sites); }
+            if let Some(s) = spread { scan_expr_for_division(s, sites); }
+        }
+        Expr::ArrayLit { elements, .. } => {
+            for e in elements { scan_expr_for_division(e, sites); }
+        }
+        Expr::TupleLit(elems) => {
+            for e in elems { scan_expr_for_division(e, sites); }
+        }
+        Expr::Ref { expr, .. } => scan_expr_for_division(expr, sites),
+        Expr::Deref { expr } => scan_expr_for_division(expr, sites),
+        Expr::Cast { expr, .. } => scan_expr_for_division(expr, sites),
+        Expr::If { cond, then_block, else_block } => {
+            scan_expr_for_division(cond, sites);
+            for s in then_block { scan_stmt_for_division(s, sites); }
+            if let Some(eb) = else_block {
+                for s in eb { scan_stmt_for_division(s, sites); }
+            }
+        }
+        Expr::Block(stmts) => {
+            for s in stmts { scan_stmt_for_division(s, sites); }
+        }
+        Expr::Match { expr, arms } => {
+            scan_expr_for_division(expr, sites);
+            for arm in arms {
+                for s in &arm.body { scan_stmt_for_division(s, sites); }
+            }
+        }
+        Expr::StrConcat { left, right } => {
+            scan_expr_for_division(left, sites);
+            scan_expr_for_division(right, sites);
+        }
+        Expr::Try { expr } => scan_expr_for_division(expr, sites),
+        Expr::Coalesce { expr, default } => {
+            scan_expr_for_division(expr, sites);
+            scan_expr_for_division(default, sites);
+        }
+        Expr::IsCheck { expr, .. } => scan_expr_for_division(expr, sites),
+        Expr::TryBlock { body } => {
+            for s in body { scan_stmt_for_division(s, sites); }
+        }
+        Expr::Closure { body, .. } => {
+            for s in body { scan_stmt_for_division(s, sites); }
+        }
+        Expr::Comptime(e) => scan_expr_for_division(e, sites),
+        Expr::ComptimeBlock(stmts) => {
+            for s in stmts { scan_stmt_for_division(s, sites); }
+        }
+        Expr::PipeForward { left, right } => {
+            scan_expr_for_division(left, sites);
+            scan_expr_for_division(right, sites);
+        }
+        Expr::QuantCast { expr, .. } => scan_expr_for_division(expr, sites),
+        _ => {}
+    }
+}
+
+/// Scan statements for `while` loops (unbounded iteration risk).
+/// Returns line numbers of each while loop.
+fn scan_for_while_loops(stmts: &[Stmt], sites: &mut Vec<usize>) {
+    for stmt in stmts {
+        scan_stmt_for_while(stmt, sites);
+    }
+}
+
+fn scan_stmt_for_while(stmt: &Stmt, sites: &mut Vec<usize>) {
+    match stmt {
+        Stmt::While { cond, body, line } => {
+            sites.push(*line);
+            scan_expr_for_while(cond, sites);
+            for s in body { scan_stmt_for_while(s, sites); }
+        }
+        Stmt::If { cond, then_block, else_block, .. } => {
+            scan_expr_for_while(cond, sites);
+            for s in then_block { scan_stmt_for_while(s, sites); }
+            if let Some(eb) = else_block {
+                for s in eb { scan_stmt_for_while(s, sites); }
+            }
+        }
+        Stmt::For { iterator, body, .. } => {
+            scan_expr_for_while(iterator, sites);
+            for s in body { scan_stmt_for_while(s, sites); }
+        }
+        Stmt::Loop { body, .. } => {
+            for s in body { scan_stmt_for_while(s, sites); }
+        }
+        Stmt::Defer(stmts, _) => {
+            for s in stmts { scan_stmt_for_while(s, sites); }
+        }
+        Stmt::Match { expr, arms, .. } => {
+            scan_expr_for_while(expr, sites);
+            for arm in arms {
+                for s in &arm.body { scan_stmt_for_while(s, sites); }
+            }
+        }
+        Stmt::Handle { body, handlers, .. } => {
+            for s in body { scan_stmt_for_while(s, sites); }
+            for h in handlers {
+                for s in &h.body { scan_stmt_for_while(s, sites); }
+            }
+        }
+        Stmt::RegionBlock { body, .. } | Stmt::Sandbox { body, .. } | Stmt::Unsafe { body, .. } | Stmt::Txn { body, .. } => {
+            for s in body { scan_stmt_for_while(s, sites); }
+        }
+        Stmt::GradBlock { body, .. } => {
+            for s in body { scan_stmt_for_while(s, sites); }
+        }
+        Stmt::ComptimeGen { block, .. } => {
+            for s in block { scan_stmt_for_while(s, sites); }
+        }
+        Stmt::Let { expr, .. } | Stmt::LetTuple { expr, .. } => scan_expr_for_while(expr, sites),
+        Stmt::Expr(e, _) => scan_expr_for_while(e, sites),
+        Stmt::Assign { expr, .. } => scan_expr_for_while(expr, sites),
+        Stmt::Return(e, _) => {
+            if let Some(e) = e { scan_expr_for_while(e, sites); }
+        }
+        _ => {}
+    }
+}
+
+fn scan_expr_for_while(expr: &Expr, sites: &mut Vec<usize>) {
+    match expr {
+        Expr::Binary { left, right, .. } => {
+            scan_expr_for_while(left, sites);
+            scan_expr_for_while(right, sites);
+        }
+        Expr::Unary { expr, .. } => scan_expr_for_while(expr, sites),
+        Expr::Call { args, .. } => {
+            for a in args { scan_expr_for_while(a, sites); }
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            scan_expr_for_while(receiver, sites);
+            for a in args { scan_expr_for_while(a, sites); }
+        }
+        Expr::FieldAccess { expr, .. } => scan_expr_for_while(expr, sites),
+        Expr::Index { array, index } => {
+            scan_expr_for_while(array, sites);
+            scan_expr_for_while(index, sites);
+        }
+        Expr::If { cond, then_block, else_block } => {
+            scan_expr_for_while(cond, sites);
+            for s in then_block { scan_stmt_for_while(s, sites); }
+            if let Some(eb) = else_block {
+                for s in eb { scan_stmt_for_while(s, sites); }
+            }
+        }
+        Expr::Block(stmts) => {
+            for s in stmts { scan_stmt_for_while(s, sites); }
+        }
+        Expr::Match { expr, arms } => {
+            scan_expr_for_while(expr, sites);
+            for arm in arms {
+                for s in &arm.body { scan_stmt_for_while(s, sites); }
+            }
+        }
+        Expr::TryBlock { body } => {
+            for s in body { scan_stmt_for_while(s, sites); }
+        }
+        Expr::Closure { body, .. } => {
+            for s in body { scan_stmt_for_while(s, sites); }
+        }
         _ => {}
     }
 }

@@ -613,3 +613,84 @@ pf main() {
 > **PE emitter path:** Steps 6-8 are replaced by `pe.rs` which encodes x86_64 instructions directly to machine code bytes and constructs a PE file — no `ml64.exe` or `link.exe` needed.
 >
 > **Alternative path (C codegen):** Step 6 can be replaced by `codegen_c.rs` which generates a `.c` file, then `cl.exe`/`gcc`/`clang` compiles it directly to a `.exe`. The output is identical.
+
+---
+
+## Phase 7.5: Financial Safety & Production Primitives
+
+This phase introduces compile-time guarantees for financial correctness and production-grade language primitives for I/O, transactions, resource accounting, and auditability.
+
+### Linear Types
+
+- `@linear` annotation on structs prevents copying (move semantics)
+- Typechecker tracks consumed variables, rejects double-use
+- Loop-aware: linear variables can't be consumed inside loop bodies
+- Files: `src/typechecker.rs` (`linear_structs`, `consumed_vars`, `loop_depth`)
+
+### @conserve Annotation
+
+- Functions marked `@conserve` can't: mint money, do IO/Net, use floats, call non-`@conserve` functions
+- Compile-time proof of financial conservation
+- Files: `src/typechecker.rs` (`verify_conserve`)
+
+### Money & Banking Stdlib
+
+- `stdlib/money.fd`: `@linear` struct `Money`, `@conserve` operations (add, sub, split, merge)
+- `stdlib/banking.fd`: `@linear` struct `Account`, deposit/withdraw/transfer/interest
+- All operations `@conserve` except mint (`Money_new`, `Account_open`) and IO (`print`)
+
+### Tuple Destructuring
+
+- `pv (a, b) = expr` — unpack multi-return values
+- AST: `Stmt::LetTuple` variant
+- Lowerer: extracts fields with correct types (`Ptr` for structs, `I64` for scalars)
+
+### File I/O
+
+- `stdlib/file.fd`: `file_read`, `file_write`, `file_append`, `file_exists`
+- Interpreter: uses host OS filesystem
+- C codegen: uses `fopen`/`fread`/`fwrite`
+- Native: will use Linux syscalls
+
+### txn {} Blocks
+
+- Atomic transaction blocks with rollback semantics
+- AST: `Stmt::Txn` variant
+- Currently transparent (body lowered as normal statements)
+- Future: interpreter-level memory snapshot for rollback
+
+### @gas Annotation
+
+- Compile-time gas budget enforcement
+- Cost model: AST node count
+- Transitive: total gas = own cost + sum of callee costs
+- Files: `src/typechecker.rs` (`verify_gas`, `compute_total_gas`)
+
+### @audit Annotation
+
+- Auto-instruments function entry/exit with logging
+- IR injection in `lower.rs`
+- Full audit trail (timestamps, params, crypto signing) pending
+
+### @crashfree Annotation
+
+- Compile-time proof that a function cannot panic at runtime
+- Rejects: `unwrap()`, `p_panic()`, non-const division/modulo, `while` loops, non-`@crashfree` calls
+- Allows: `for` loops over finite ranges, `match` on Option/Result, `unwrap_or()`, const division
+- SPARK Ada "absence of runtime errors" model, pattern-based static check
+- Files: `src/typechecker.rs` (`verify_crashfree`, `scan_for_division`, `scan_for_while_loops`)
+
+### LogicalTime Stdlib (stdlib/time.fd)
+
+- Timezone-free, clock-free time type for deterministic date math
+- `LogicalTime` struct: stores Unix timestamp as `i64` seconds
+- All operations `@deterministic` (pure integer math, no IO, no randomness)
+- Construction: `time_new(year, month, day, hour, min, sec)`, `time_from_timestamp(ts)`
+- Extraction: `time_get_year/month/day/hour/minute/second/weekday/day_of_year`
+- Arithmetic: `time_add_seconds/minutes/hours/days`, `time_diff_seconds/days`
+- Comparison: `time_before/after/eq/before_eq`
+- Formatting: `time_to_iso(t)` → "YYYY-MM-DDTHH:MM:SSZ", `time_to_date_string(t)`
+- Calendar: `is_leap_year(year)`, `days_in_month(year, month)`
+- Uses Howard Hinnant's `civil_from_days` algorithm for exact date math
+- Prevents timezone bugs and clock skew bugs in financial systems
+- NOT `@linear` — value type, freely copyable

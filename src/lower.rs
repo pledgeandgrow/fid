@@ -60,6 +60,9 @@ pub struct Lowerer {
     /// Stack of active named regions — allocations inside a region block
     /// use Region::Named(name) instead of Region::Stack
     region_stack: Vec<String>,
+    /// AST function return types — maps function name to AST return type
+    /// Used by LetTuple to determine tuple element types
+    func_ret_types: HashMap<String, Type>,
 }
 
 impl Lowerer {
@@ -93,6 +96,7 @@ impl Lowerer {
             current_self_type: None,
             effect_handler_stack: Vec::new(),
             region_stack: Vec::new(),
+            func_ret_types: HashMap::new(),
         }
     }
 
@@ -131,6 +135,7 @@ impl Lowerer {
         for imp in &program.impls {
             for method in &imp.methods {
                 self.impl_methods.insert((imp.struct_name.clone(), method.name.clone()), method.clone());
+                self.func_ret_types.insert(method.name.clone(), method.ret_ty.clone());
             }
         }
 
@@ -139,6 +144,7 @@ impl Lowerer {
         for ti in &program.trait_impls {
             for method in &ti.methods {
                 self.impl_methods.insert((ti.type_name.clone(), method.name.clone()), method.clone());
+                self.func_ret_types.insert(method.name.clone(), method.ret_ty.clone());
             }
         }
 
@@ -167,6 +173,8 @@ impl Lowerer {
             let ret_ty = self.lower_type(&func.ret_ty);
             let ir_func = IrFunction::new(func.name.clone(), ret_ty);
             self.module.functions.insert(func.name.clone(), ir_func);
+            // Store AST return type for tuple element type lookup
+            self.func_ret_types.insert(func.name.clone(), func.ret_ty.clone());
         }
 
         // Lower each function
@@ -361,6 +369,16 @@ impl Lowerer {
         self.module.add_extern("p_socket_recv_str", vec![socket_ty.clone()], IrType::Ptr(Box::new(IrType::U8)));
         self.module.add_extern("p_http_parse_request", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Opaque("HttpRequest".to_string()));
         self.module.add_extern("p_http_build_response", vec![IrType::I64, IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))], IrType::Ptr(Box::new(IrType::U8)));
+
+        // ─── File I/O builtins ───
+        // p_file_read(path: *u8) -> *u8  — read entire file, return content as string
+        // p_file_write(path: *u8, content: *u8) -> i64  — write content to file, return 0 on success, -1 on error
+        // p_file_exists(path: *u8) -> bool  — check if file exists
+        // p_file_append(path: *u8, content: *u8) -> i64  — append content to file
+        self.module.add_extern("p_file_read", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Ptr(Box::new(IrType::U8)));
+        self.module.add_extern("p_file_write", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
+        self.module.add_extern("p_file_exists", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Bool);
+        self.module.add_extern("p_file_append", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
 
         // ─── Phase 5D.4: Database driver framework ───
         let db_ty = IrType::Opaque("Database".to_string());
@@ -723,6 +741,66 @@ impl Lowerer {
                     f.bind_local(name, alloca);
                 }
             }
+            Stmt::LetTuple { names, expr, line: _ } => {
+                // Lower the tuple expression — returns a pointer to a __tuple_N struct
+                let tuple_ptr = self.lower_expr(expr);
+                let n = names.len();
+
+                // Determine element types by looking up the function's AST return type
+                let elem_tys: Vec<IrType> = if let Expr::Call { callee, .. } = expr {
+                    self.func_ret_types.get(callee)
+                        .and_then(|ret_ty| match ret_ty {
+                            Type::Tuple(elems) => Some(elems.iter().map(|t| self.lower_type(t)).collect()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| vec![IrType::I64; n])
+                } else {
+                    // For non-call expressions, try to get types from the value
+                    vec![IrType::I64; n]
+                };
+
+                // For each name, extract the corresponding field
+                for (i, name) in names.iter().enumerate() {
+                    let field_ty = elem_tys.get(i).cloned().unwrap_or(IrType::I64);
+                    let field_ptr = self.emit_inst(Inst::GetFieldPtr {
+                        struct_ptr: tuple_ptr,
+                        field_index: i as u32,
+                        field_ty: field_ty.clone(),
+                    });
+                    // Load from the tuple field. For struct fields, use Ptr type so
+                    // the interpreter returns Value::Ptr. For scalars, use the field type.
+                    let load_ty = if matches!(field_ty, IrType::Struct(_)) {
+                        IrType::Ptr(Box::new(IrType::I64))
+                    } else {
+                        field_ty.clone()
+                    };
+                    let val = self.emit_inst(Inst::Load {
+                        ptr: field_ptr,
+                        ty: load_ty.clone(),
+                    });
+                    // For struct fields, the alloca holds a pointer to the struct.
+                    // Use Ptr(Struct(...)) as the alloca type so that variable loads
+                    // return the pointer correctly.
+                    let alloca_ty = if matches!(field_ty, IrType::Struct(_)) {
+                        IrType::Ptr(Box::new(field_ty.clone()))
+                    } else {
+                        field_ty.clone()
+                    };
+                    let alloca = self.emit_inst(Inst::Alloca {
+                        ty: alloca_ty.clone(),
+                        region: self.current_region(),
+                    });
+                    self.alloca_types.insert(alloca, alloca_ty.clone());
+                    self.emit_inst(Inst::Store {
+                        ptr: alloca,
+                        value: val,
+                    });
+                    self.allocas.insert(name.clone(), alloca);
+                    if let Some(ref mut f) = self.current_func {
+                        f.bind_local(name, alloca);
+                    }
+                }
+            }
 
             Stmt::Assign { target, op, expr, line: _ } => {
                 // Check if target is a mutable variable with an alloca
@@ -1056,6 +1134,16 @@ impl Lowerer {
                 // Unsafe is transparent at the IR level — safety is
                 // enforced entirely at compile time by the typechecker.
                 // Just lower the body as normal statements.
+                for s in body {
+                    self.lower_stmt(s);
+                }
+            }
+            Stmt::Txn { body, .. } => {
+                // Transaction block — lower body as normal statements.
+                // In the interpreter, txn blocks get snapshot/rollback semantics
+                // via a special marker. In native code, transactions are handled
+                // at the application level (database transactions, etc.).
+                // For now, txn is transparent — just lower the body.
                 for s in body {
                     self.lower_stmt(s);
                 }
@@ -3205,25 +3293,44 @@ impl Lowerer {
             Expr::TupleLit(elems) => {
                 // Allocate tuple on stack as a struct, store each element, return pointer
                 let tuple_size = elems.len();
-                let tuple_ty = IrType::Struct(format!("__tuple_{}", tuple_size));
+                let tuple_name = format!("__tuple_{}", tuple_size);
+                let tuple_ty = IrType::Struct(tuple_name.clone());
+                // Lower all elements first to get their types
+                let mut elem_vals = Vec::new();
+                let mut elem_tys = Vec::new();
+                for e in elems {
+                    let val = self.lower_expr(e);
+                    let ty = self.get_value_type(val);
+                    elem_vals.push(val);
+                    elem_tys.push(ty);
+                }
+                // Register or update the tuple struct layout with actual element types
+                // Always update — different tuples with same arity may have different element types
+                let fields: Vec<(String, IrType, u32)> = elem_tys.iter().enumerate()
+                    .map(|(i, ty)| (format!("_{}", i), ty.clone(), (i * 8) as u32))
+                    .collect();
+                let size = (tuple_size * 8) as u64;
+                self.module.add_struct(StructLayout {
+                    name: tuple_name.clone(),
+                    fields,
+                    size,
+                    align: 8,
+                });
                 let ptr = self.emit_inst(Inst::Alloca {
                     ty: tuple_ty.clone(),
                     region: self.current_region(),
                 });
-                for (i, e) in elems.iter().enumerate() {
-                    let val = self.lower_expr(e);
-                    let val_ty = self.get_value_type(val);
+                for (i, val) in elem_vals.iter().enumerate() {
+                    let val_ty = &elem_tys[i];
                     let field_ptr = self.emit_inst(Inst::GetFieldPtr {
                         struct_ptr: ptr,
                         field_index: i as u32,
                         field_ty: val_ty.clone(),
                     });
-                    // If the value is a struct, copy field-by-field
-                    if let IrType::Struct(ref sub_name) = val_ty {
-                        self.emit_struct_copy(val, field_ptr, sub_name);
-                    } else {
-                        self.emit_inst(Inst::Store { ptr: field_ptr, value: val });
-                    }
+                    // Store the value — for structs, this is already a pointer
+                    // (structs are passed by pointer in Fides). Don't do struct copy
+                    // into tuple fields — just store the pointer.
+                    self.emit_inst(Inst::Store { ptr: field_ptr, value: *val });
                 }
                 ptr
             }
@@ -3446,6 +3553,12 @@ impl Lowerer {
                     self.collect_free_vars_expr(expr, free_vars, local_names);
                     local_names.push(name.clone());
                 }
+                Stmt::LetTuple { names, expr, .. } => {
+                    self.collect_free_vars_expr(expr, free_vars, local_names);
+                    for name in names {
+                        local_names.push(name.clone());
+                    }
+                }
                 Stmt::Assign { target, expr, .. } => {
                     if !local_names.contains(target) && !free_vars.contains(target) {
                         free_vars.push(target.clone());
@@ -3529,7 +3642,7 @@ impl Lowerer {
                 Stmt::Sandbox { body, .. } => {
                     self.collect_free_vars(body, free_vars, local_names);
                 }
-                Stmt::Unsafe { body, .. } => {
+                Stmt::Unsafe { body, .. } | Stmt::Txn { body, .. } => {
                     self.collect_free_vars(body, free_vars, local_names);
                 }
                 Stmt::ComptimeGen { .. } => {}
@@ -3655,7 +3768,7 @@ impl Lowerer {
             Expr::TryBlock { body } => {
                 for stmt in body {
                     match stmt {
-                        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr(expr, _) => {
+                        Stmt::Let { expr, .. } | Stmt::LetTuple { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr(expr, _) => {
                             self.collect_free_vars_expr(expr, free_vars, local_names);
                         }
                         _ => {}

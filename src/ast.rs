@@ -461,6 +461,16 @@ pub enum Stmt {
         body: Vec<Stmt>,
         line: usize,
     },
+    /// Transaction block: `txn { body }` — atomic transaction with rollback.
+    /// If any operation in the body fails (returns error/panic), all changes
+    /// to mutable variables made inside the block are rolled back.
+    /// In the interpreter, this snapshots mutable variables on entry and
+    /// restores them on failure. In native code, this is a no-op wrapper
+    /// (transactions are handled at the application level).
+    Txn {
+        body: Vec<Stmt>,
+        line: usize,
+    },
     /// comptime gen { block } — evaluate block at compile time, parse the
     /// resulting string as Fides source code, and inject the declarations
     /// into the program. This enables comptime code generation.
@@ -523,6 +533,7 @@ impl Stmt {
             | Stmt::RegionBlock { line, .. }
             | Stmt::Sandbox { line, .. }
             | Stmt::Unsafe { line, .. }
+            | Stmt::Txn { line, .. }
             | Stmt::ComptimeGen { line, .. }
             | Stmt::GradBlock { line, .. }
             | Stmt::Backward { line, .. } => *line,

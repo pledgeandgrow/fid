@@ -12,12 +12,29 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 |------------|:------:|-------|
 | Unit tests (`cargo test --bin fidesc`) | **137/137** | elf64, pir, peephole (26 tests), opt, regalloc, tensor, codegen_x64, hotreload (8), embedded, gpu, wasm, coff, macho, linker |
 | Harness tests (`cargo test --test harness`) | **8/8** | All pass including golden_files_match |
-| Interpreter (`fidesc test`) | **86/86** normal + **3/3** expected-fail | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` are expected to fail (test error detection) |
-| PE Emitter (`fidesc test`) | **86/86** normal + **3/3** expected-fail | All PE structures valid |
-| C Codegen (`fidesc test`) | **86/86** normal + **3/3** expected-fail | FULL PARITY with interpreter — no gaps |
-| Total `.fd` test files | **89** | 86 normal + 3 expected-fail |
+| Interpreter (`fidesc test`) | **99/99** normal + **12/12** expected-fail | Expected-fail: trait verify, budget, sandbox, deterministic, field privacy, money linear, money conserve, banking double-credit, banking lost-money, loop linear, gas |
+| PE Emitter (`fidesc test`) | **99/99** normal + **12/12** expected-fail | All PE structures valid |
+| C Codegen (`fidesc test`) | **99/99** normal + **12/12** expected-fail | FULL PARITY with interpreter — no gaps |
+| Total `.fd` test files | **111** | 99 normal + 12 expected-fail |
 | Source files | **36** `.rs` | 52,845 LOC |
 | Golden files | **43** | Expected outputs in `tests/golden/` |
+
+### Financial Safety Features (New)
+
+| Feature | Syntax | Description |
+|---------|--------|-------------|
+| Linear types | `@linear` | Move semantics — no duplication of linear values |
+| Conservation proof | `@conserve` | Compile-time financial conservation proof (money in = money out) |
+| Money stdlib | `stdlib/money.fd` | Fixed-point money type, arithmetic, formatting |
+| Banking stdlib | `stdlib/banking.fd` | Accounts, transfers, double-credit/lost-money detection |
+| Tuple destructuring | `pv (a, b) = expr` | Decompose tuple values into bindings |
+| File I/O | `stdlib/file.fd` | File descriptors, read/write via `stdlib/file.fd` |
+| Atomic transactions | `txn { ... }` | Atomic transaction blocks with rollback on failure |
+| Gas budgets | `@gas(N)` | Compile-time gas budget annotation |
+| Crash-free proof | `@crashfree` | Compile-time proof that a function cannot panic |
+| Audit logging | `@audit` | Automatic function audit logging |
+| Loop-aware linear types | — | Linear variables cannot be consumed inside loops (compile error) |
+| LogicalTime | `stdlib/time.fd` | Timezone-free, clock-free deterministic date math |
 
 ### What Works (Verified End-to-End)
 
@@ -95,6 +112,18 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 | HTTP server (`stdlib/http.fd`) | Yes | Yes | N/A |
 | Database framework (`stdlib/db.fd`) | Yes | Yes | N/A |
 | Parallel operations (`stdlib/parallel.fd`) | Yes | Yes | N/A |
+| Money stdlib (`stdlib/money.fd`) | Yes | Yes | Yes |
+| Banking stdlib (`stdlib/banking.fd`) | Yes | Yes | N/A |
+| File I/O (`stdlib/file.fd`) | Yes | Yes | Yes |
+| Linear types (`@linear`) | Yes | Yes | Yes |
+| `@conserve` conservation proof | Compile-time | Compile-time | Compile-time |
+| Tuple destructuring (`pv (a, b) = expr`) | Yes | Yes | Yes |
+| `txn {}` atomic transactions | Yes | Yes | N/A |
+| `@gas` gas budgets | Compile-time | Compile-time | Compile-time |
+| `@crashfree` panic prevention | Compile-time | Compile-time | Compile-time |
+| `@audit` audit logging | Yes | Yes | Yes |
+| Loop-aware linear types | Compile-time | Compile-time | Compile-time |
+| LogicalTime (`stdlib/time.fd`) | Yes | Yes | Yes |
 | WebAssembly backend (`fidesc wasm`) | N/A | N/A | N/A |
 | SPIR-V GPU backend (`fidesc gpu`) | N/A | N/A | N/A |
 | Hot reload (`fidesc watch`) | N/A | N/A | N/A |
@@ -119,12 +148,12 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 ### Known Limitations
 
 - **ELF64 executable emission works on Linux** — `fidesc build <file> --target x86-64` produces working ELF64 executables directly (zero external tools). `fidesc codegen --elf <out.o>` emits valid relocatable objects (readelf compatible). `fidesc codegen --macho` and `--coff` also produce valid object files.
-- **PE emitter targets Windows x64 only** — `fidesc emit` produces PE32+ executables; tested via `fidesc test` (86/86 valid + 3/3 expected-fail)
+- **PE emitter targets Windows x64 only** — `fidesc emit` produces PE32+ executables; tested via `fidesc test` (99/99 valid + 12/12 expected-fail)
 - **Register allocator has a pre-existing bug** — linear scan allocator in `regalloc.rs` maps VRegs to physical registers, but constants not loaded into registers before use can be clobbered by intervening instructions. Exposed by the L2 optimizer's instruction reordering. Blocks enabling `--opt` by default.
 - **Peephole optimizer always on** — 9 passes run automatically in the `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
 - **L2 optimizer (`--opt`) not enabled by default** — PIR optimizer exists (`fidesc opt`, `fidesc pir --opt`, `fidesc build --opt`) with constant folding, DCE, CSE, inlining, TCO, loop unrolling, and effect-based pure function elision. Works for simple programs but exposes the register allocator bug on complex ones.
 - **`#[test]` attribute** — parsed but not executed by `fidesc test` (tests are file-based)
-- **C codegen coverage** — 86/86 tests match interpreter output (+ 3/3 expected-fail). FULL PARITY — no gaps. `test_db` is no longer flaky (HashMap keys sorted for deterministic output).
+- **C codegen coverage** — 99/99 tests match interpreter output (+ 12/12 expected-fail). FULL PARITY — no gaps. `test_db` is no longer flaky (HashMap keys sorted for deterministic output).
 - **215 compiler warnings** — dead code, unused variables (cleanup needed)
 
 ---
@@ -190,7 +219,7 @@ cargo run -- version
 | `gpu <file.fd>` | SPIR-V GPU backend: PIR → SPIR-V binary |
 | `tokens <file.fd>` | Lex only — print token stream |
 | `ast <file.fd>` | Lex + parse — print AST tree |
-| `test` | Run all 89 tests across interpreter, PE emitter, and C codegen |
+| `test` | Run all 111 tests across interpreter, PE emitter, and C codegen |
 | `repl` | Interactive REPL — evaluate Fides expressions |
 | `verify <file.fd>` | Verify IR correctness (terminators, block refs, value refs) |
 | `sourcemap <file.fd>` | Show source map (IR value → source line mapping) |
@@ -229,9 +258,9 @@ Current baseline:
 ```
 Unit tests:   137/137 passed
 Harness:      8/8 passed
-Interpreter:  86/86 passed   (+ 3/3 expected fail: test_trait_verify_fail, test_budget_fail, test_sandbox_fail)
-C Codegen:    86/86 matched   (FULL PARITY — no gaps)
-PE Emitter:   86/86 valid     (+ 3/3 expected fail: test_trait_verify_fail, test_budget_fail, test_sandbox_fail)
+Interpreter:  99/99 passed   (+ 12/12 expected fail: trait verify, budget, sandbox, deterministic, field privacy, money linear, money conserve, banking double-credit, banking lost-money, loop linear, gas)
+C Codegen:    99/99 matched   (FULL PARITY — no gaps)
+PE Emitter:   99/99 valid     (+ 12/12 expected fail: same as interpreter)
 ```
 
 ---
@@ -462,6 +491,14 @@ Orchestrates the stages. Entry points:
 | `for` loop over arrays | `for x in arr { sum += x; }` |
 | `defer` blocks | `defer close(file);` |
 | Block expressions | `{ pv a = 10; pv b = 20; a + b }` |
+| Linear types (`@linear`) | `@linear pf transfer(...) { ... }` — move semantics, no duplication |
+| `@conserve` | `@conserve pf settle(...) { ... }` — compile-time financial conservation proof |
+| Tuple destructuring | `pv (a, b) = expr` |
+| `txn {}` blocks | `txn { transfer(a, b, 100); }` — atomic transactions with rollback |
+| `@gas` | `@gas(1000) pf foo() { ... }` — compile-time gas budgets |
+| `@crashfree` | `@crashfree pf foo() { ... }` — compile-time proof of no panics |
+| `@audit` | `@audit pf foo() { ... }` — automatic function audit logging |
+| Loop-aware linear types | Linear vars consumed in loops → compile error |
 
 ### Parsed (Lexer + Parser + Typechecker — not yet lowered to IR)
 
@@ -485,6 +522,8 @@ Orchestrates the stages. Entry points:
 ## Fides Syntax Overview
 
 Fides is a systems language with unique keywords designed for clarity and AI-friendliness:
+
+- **Compile-time financial conservation** — Bugs that cost the real world billions (Knight Capital: $440M in 45 minutes from double-processing) are compile errors in Fides. The `@conserve` annotation proves money-in equals money-out at compile time, and linear types (`@linear`) prevent double-processing of financial values.
 
 ```p
 // Function declaration
@@ -584,7 +623,7 @@ p-lang/
 │   ├── linker.rs           # Incremental linker (ELF64)
 │   ├── runtime_linux.rs    # Linux runtime (syscalls for bare-metal/standalone)
 │   └── compiler.rs         # Pipeline orchestration, module resolution, stdlib auto-include
-├── stdlib/                 # 8 standard library modules
+├── stdlib/                 # 15 standard library modules
 │   ├── core.fd              # Option, Result, println, assert, max, min, abs, clamp
 │   ├── json.fd              # JSON parsing and serialization
 │   ├── tensor.fd            # Tensor type for AI/ML (zeros, ones, matmul, relu, softmax, etc.)
@@ -592,10 +631,14 @@ p-lang/
 │   ├── db.fd                # Database driver framework
 │   ├── http.fd              # HTTP server stdlib
 │   ├── simd.fd              # SIMD intrinsics
-│   └── shape.fd             # Shape operations
-├── tests/                  # 89 .fd test files + harness
+│   ├── shape.fd             # Shape operations
+│   ├── money.fd             # Fixed-point money type, arithmetic, formatting
+│   ├── banking.fd           # Accounts, transfers, double-credit/lost-money detection
+│   ├── file.fd              # File I/O (file descriptors, read/write)
+│   └── time.fd              # LogicalTime: timezone-free, clock-free deterministic date math
+├── tests/                  # 111 .fd test files + harness
 │   ├── harness.rs          # Automated test harness (8 cargo tests)
-│   ├── *.fd                 # 86 feature tests (arithmetic, structs, closures, generics, traits, etc.)
+│   ├── *.fd                 # 99 feature tests (arithmetic, structs, closures, generics, traits, money, banking, etc.)
 │   ├── safety/             # 9 bounds safety tests (OOB, overflow, div-by-zero, unwrap)
 │   ├── capability/         # 4 capability security tests (grant, deny, propagation)
 │   ├── effects/            # 7 effect system tests (annotations, inference, handlers, pure)
@@ -627,7 +670,7 @@ p-lang/
 
 ## Test Programs
 
-89 test files across `tests/` and subdirectories. Key tests:
+111 test files across `tests/` and subdirectories. Key tests:
 
 | Test File | What It Tests |
 |-----------|---------------|
@@ -665,6 +708,16 @@ p-lang/
 | `test_refs_mut.fd` | `&mut` references, dereference |
 | `test_pe_*.fd` | PE emitter specific tests (struct, enum, refs, generics, defer, try) |
 | `test_regression_*.fd` | Regression tests (closures, fstrings, collections) |
+| `test_money_*.fd` | Money stdlib: fixed-point arithmetic, linear type enforcement (`test_money_linear_fail`) |
+| `test_money_conserve*.fd` | `@conserve` conservation proof (`test_money_conserve_fail`) |
+| `test_banking_*.fd` | Banking stdlib: accounts, transfers, double-credit/lost-money detection |
+| `test_loop_linear*.fd` | Loop-aware linear types (`test_loop_linear_fail`) |
+| `test_gas*.fd` | `@gas` compile-time gas budgets (`test_gas_fail`) |
+| `test_crashfree*.fd` | `@crashfree` compile-time panic prevention (`test_crashfree_fail`) |
+| `test_tuple_destructure.fd` | Tuple destructuring (`pv (a, b) = expr`) |
+| `test_file.fd` | File I/O (`stdlib/file.fd`) |
+| `test_txn.fd` | `txn {}` atomic transaction blocks |
+| `test_time*.fd` | LogicalTime stdlib: construction, extraction, arithmetic, formatting, leap years |
 
 Run all tests: `cargo test --test harness`
 
@@ -692,7 +745,7 @@ Run all tests: `cargo test --test harness`
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (137 unit tests, 86/86 + 3/3 expected-fail integration tests) |
+| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (137 unit tests, 99/99 + 12/12 expected-fail integration tests) |
 | **Phase 2** | Region inference, effect system, capability security, bounds safety | **Complete** (2A ✓, 2B ✓, 2C ✓ with elision, 2D ✓; 8/8 harness tests pass) |
 | **Phase 3** | comptime, advanced traits, FFI & interop | **Complete** (3A comptime ✓, 3B traits ✓, 3C const generics + GATs ✓; 3D C FFI ✓ via `extern "C"` + `parse-header`) |
 | **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | **Mostly complete** (4A PIR ✓, 4B optimizer ✓ but disabled by default due to regalloc bug, 4C x86-64/arm64/riscv codegen + regalloc + 9 peephole passes + ELF64 executables ✓; 4D linker ✓, 4E hot reload ✓ via `fidesc watch`) |

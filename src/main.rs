@@ -643,6 +643,9 @@ fn main() {
                 "test_money_conserve_fail",
                 "test_banking_double_credit_fail",
                 "test_banking_lost_money_fail",
+                "test_loop_linear_fail",
+                "test_gas_fail",
+                "test_crashfree_fail",
             ];
 
             let mut test_files: Vec<String> = Vec::new();

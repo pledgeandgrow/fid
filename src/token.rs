@@ -35,6 +35,7 @@ pub enum TokenKind {
     Region,      // region
     Sandbox,     // sandbox — capability revocation block
     Unsafe,      // unsafe — unsafe block (gates raw pointer ops)
+    Txn,         // txn — transaction block with rollback
     Persist,     // persist — variable persists across hot reloads
     For,         // for
     While,       // while
@@ -189,6 +190,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Region => write!(f, "region"),
             TokenKind::Sandbox => write!(f, "sandbox"),
             TokenKind::Unsafe => write!(f, "unsafe"),
+            TokenKind::Txn => write!(f, "txn"),
             TokenKind::Persist => write!(f, "persist"),
             TokenKind::For => write!(f, "for"),
             TokenKind::While => write!(f, "while"),

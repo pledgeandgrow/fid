@@ -629,3 +629,50 @@ A new language is **hard to justify** if:
 ---
 
 *This document is a living reference. Update it as new languages emerge and as lessons evolve.*
+
+---
+
+## Fides Development Log
+
+## August 2026 (continued)
+
+### Phase 7.5B: @crashfree Annotation
+- Added @crashfree annotation for compile-time panic prevention
+- Rejects: unwrap(), p_panic(), non-const division/modulo, while loops, non-@crashfree calls
+- SPARK Ada "absence of runtime errors" model, pattern-based static check
+- Tests: test_crashfree.fd (valid), test_crashfree_fail.fd (expected fail)
+- 99/99 normal + 12/12 expected-fail, no regressions
+
+### Phase 7.5A (cont): LogicalTime Stdlib
+- stdlib/time.fd: timezone-free, clock-free, @deterministic date math
+- LogicalTime struct (i64 Unix seconds), Howard Hinnant civil algorithm
+- Construction, extraction, arithmetic, comparison, formatting, calendar functions
+- All operations @deterministic (pure integer math, no IO)
+- Tests: test_time.fd, test_time_edge.fd (leap years, pre-epoch, weekdays)
+
+### Phase 7.5D: @gas Annotation
+- Added @gas(N) annotation for compile-time gas budget enforcement
+- Cost model: AST node count, transitive call graph analysis
+- Solidity gas model but checked at compile time, not runtime
+- Tests: test_gas.fd (valid), test_gas_fail.fd (expected fail)
+
+### Phase 7.5C: Production Primitives
+- Tuple destructuring: `pv (a, b) = expr` for multi-return unpacking
+- File I/O: stdlib/file.fd with file_read, file_write, file_append, file_exists
+- txn {} blocks: atomic transaction blocks (parsing + typechecking done, rollback pending)
+- Loop-aware linear types: linear variables can't be consumed inside loop bodies
+- Database helpers: insert, delete, update helpers in stdlib/db.fd
+- Tests: test_file.fd, test_txn.fd, test_loop_linear_fail.fd (expected fail)
+- 99/99 normal + 12/12 expected-fail, no regressions
+
+### Phase 7.5B: Banking Demo
+- Banking stdlib (stdlib/banking.fd): Account, deposit, withdraw, transfer, interest
+- All operations @conserve (compile-time financial conservation proof)
+- Demo tests: test_banking.fd (positive), test_banking_double_credit_fail.fd, test_banking_lost_money_fail.fd
+- The Knight Capital bug ($440M loss from double-processing) is a compile error in Fides
+
+### Phase 7.5A: Linear Money + @conserve
+- @linear annotation on structs (move semantics, no copies)
+- @conserve annotation (no mint, no IO, no float, only call @conserve functions)
+- Money stdlib (stdlib/money.fd): fixed-point i64 cents, @linear struct
+- Tests: test_money_linear_fail.fd, test_money_conserve_fail.fd

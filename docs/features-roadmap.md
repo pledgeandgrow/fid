@@ -69,11 +69,11 @@ F13: parallel { | } fork-join 🔲 PLANNED — compiler emits thread spawn/join
 F14: @differentiable          🔲 PLANNED — compiler traces IR for autograd
 F21: @shader (vert/frag)      🔲 PLANNED — compiler emits SPIR-V for GPU
 F23: @simd                    🔲 PLANNED — compiler vectorizes loops to SSE/AVX/NEON
-F24: @crashfree               🔲 PLANNED — compiler analyzes call graph, proves no panic
+F24: @crashfree               ✅ IMPLEMENTED — compile-time panic prevention: rejects unwrap, p_panic, non-const div/mod, while loops, non-crashfree calls
 F25: @pool                    🔲 PLANNED — compiler manages pool memory layout, zero alloc
-F26: @deterministic           🔲 PLANNED — compiler rejects FP/random/IO/time (medical+blockchain)
+F26: @deterministic           ✅ IMPLEMENTED — compiler rejects FP/random/IO/time (medical+blockchain)
 F27: @realtime                🔲 PLANNED — compiler analyzes WCET, rejects malloc (robotics)
-F28: @gas                     🔲 PLANNED — compiler counts IR ops, verifies gas < limit (blockchain)
+F28: @gas                     ✅ IMPLEMENTED — compile-time gas budgets, AST node cost model, transitive call graph analysis (blockchain)
 F29: @interrupt               🔲 PLANNED — compiler generates ISR code, vector table (robotics+IoT)
 F30: @firmware                🔲 PLANNED — compiler strips OS deps, bare metal startup (IoT)
 F31: @lowpower                🔲 PLANNED — compiler inserts sleep, gates clocks (IoT)
@@ -88,19 +88,24 @@ F12: @memo annotation         🔲 PLANNED — purity verified by effect system,
 F20: on event handlers        🔲 PLANNED — unified dispatch needs compiler event routing
 F19: state machines           🔲 PLANNED — compile-time transition verification
 F15: @no_grad scope           ❌ CUT — unnecessary in compile-time opt-in autograd (grad blocks are opt-in, nothing to disable)
-F33: @audit                   🔲 PLANNED — auto-instrument every function entry/exit (medical)
+F33: @audit                   🔨 PARTIAL — entry/exit logging DONE (IR injection); full trail (timestamps, params, crypto signing) pending
 F34: @emit                    🔲 PLANNED — blockchain event emission with signature verification
 F35: @watchdog                🔲 PLANNED — compiler auto-inserts watchdog kicks (robotics+IoT)
 F36: @handler                 🔲 PLANNED — auto-generates routing + OpenAPI docs (serverless)
 F37: @ota                     🔲 PLANNED — compiler generates binary diff for OTA updates (IoT)
 
 ─── Banking & Finance — Tier A: Compile-Time Financial Safety ──
-F38: money type               🔲 PLANNED — first-class money type, no FP, no overflow, no truncation
-F39: @conserve                🔲 PLANNED — compiler proves money in = money out (double-entry at compile time)
-F40: txn { } blocks           🔲 PLANNED — language-level atomic transactions, auto-rollback on failure
-F41: linear money             🔲 PLANNED — money can be moved, not copied (prevents duplication at type level)
+F38: money type               ✅ IMPLEMENTED — fixed-point i64 cents, @linear struct, no FP, no overflow
+F39: @conserve                ✅ IMPLEMENTED — compiler proves money in = money out, no mint/IO/float inside @conserve functions
+F40: txn { } blocks           🔨 PARTIAL — parsing + typechecking DONE; interpreter rollback (memory snapshot) pending
+F41: linear money             ✅ IMPLEMENTED — @linear annotation on structs, move semantics, no copies, loop-aware (can't consume in loops)
 F42: Account<State> types     🔲 PLANNED — state-encoded account types (Active/Frozen/Closed can't be mixed)
-F43: LogicalTime type         🔲 PLANNED — stdlib struct (not compiler feature), implemented with @deterministic in 7.5A
+F43: LogicalTime type         ✅ IMPLEMENTED — stdlib/time.fd: timezone-free, clock-free, @deterministic date math (Howard Hinnant civil algorithm)
+
+─── Production Primitives — Tier B: Ergonomic ───────────────────
+F61: tuple destructuring       ✅ IMPLEMENTED — `pv (a, b) = expr` multi-return unpacking
+F62: file I/O                  ✅ IMPLEMENTED — stdlib/file.fd: read/write/append/exists
+F63: loop-aware linear types   ✅ IMPLEMENTED — linear vars can't be consumed inside loops
 
 ─── Cross-Industry Safety — Tier A: Compiler-Verified Domain Guarantees ──
 F44: @safety-critical         🔲 PLANNED — compiler enforces DO-178C/ISO 26262 coding rules (aerospace+automotive)
@@ -224,7 +229,7 @@ C15: @validated               ❌ CUT — already covered by given/ensure contra
 | **Stdlib** | 29 | S1–S29 | Built in Fides, users can read/modify/replace |
 | **Cut** | 16 | C1–C15, F15 | Redundant — existing features already cover |
 
-**Total: 9 implemented + 52 syntax + 29 stdlib + 15 cut = 105 features analyzed.**
+**Total: 9 implemented + 52 syntax + 215 stdlib + 15 cut = 105 features analyzed.**
 
 ### Industry Coverage
 
@@ -2236,7 +2241,7 @@ system UpdateLOD {
 | F18: ECS syntax | 🔲 Planned | Very High | Compiler controls SoA memory layout |
 | F21: `@shader` | 🔲 Planned | Very High | Compiler emits SPIR-V for GPU |
 | F23: `@simd` | 🔲 Planned | High | Compiler vectorizes loops to SSE/AVX |
-| F24: `@crashfree` | 🔲 Planned | Very High | Compiler analyzes call graph, proves no panic |
+| F24: `@crashfree` | ✅ Implemented | Very High | Compile-time panic prevention: rejects unwrap, p_panic, non-const div/mod, while loops, non-crashfree calls |
 | F25: `@pool` | 🔲 Planned | High | Compiler manages pool memory, zero alloc |
 
 ### Language Syntax — Tier B (Ergonomic, Worth the Keyword)
@@ -2304,15 +2309,15 @@ system UpdateLOD {
 ### Implementation Details
 
 All 5 original features (F1–F5) were implemented in a single session. Test results (current state):
-- Interpreter: 86/86 passed (+ 3/3 expected-fail)
-- PE Emitter: 86/86 valid (+ 3/3 expected-fail)
-- C Codegen: 86/86 matched — FULL PARITY (+ 3/3 expected-fail)
-- Total: 89 .fd test files (86 normal + 3 expected-fail)
+- Interpreter: 99/99 passed (+ 12/12 expected-fail)
+- PE Emitter: 99/99 valid (+ 12/12 expected-fail)
+- C Codegen: 99/99 matched — FULL PARITY (+ 12/12 expected-fail)
+- Total: 111 .fd test files (99 normal + 12 expected-fail)
 
 **Planned for implementation:**
 - 39 Tier A syntax features (F10, F13, F14, F16–F18, F21, F23–F60) — need compiler support
 - 7 Tier B syntax features (F12, F19, F20) — ergonomic keywords
-- 29 stdlib modules (S1–S29) — Fides code, no compiler changes
+- 215 stdlib modules (S1–S29) — Fides code, no compiler changes
 - 15 features cut (C1–C15) — redundant, build with existing features
 
 ---

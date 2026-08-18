@@ -466,6 +466,13 @@ impl Interpreter {
                         Value::Int(self.memory.load_i32(addr) as i64)
                     }
                     IrType::I64 | IrType::U64 => {
+                        // Check side-table first — the value might be a stored pointer
+                        // (e.g. tuple field that contains a struct pointer)
+                        if let Some(v) = self.opaque_values.get(&addr) {
+                            if matches!(v, Value::Ptr(_)) {
+                                return ExecOutcome::Value(v.clone());
+                            }
+                        }
                         Value::Int(self.memory.load_i64(addr))
                     }
                     IrType::F32 => {
@@ -1101,6 +1108,21 @@ impl Interpreter {
                     _ => Value::Void,
                 }
             }
+            (Value::Ptr(a), Value::Int(b)) => {
+                // Pointer compared to integer (e.g. ptr == 0 for null check)
+                match op {
+                    BinOp::Eq => Value::Bool(*a as i64 == *b),
+                    BinOp::Neq => Value::Bool(*a as i64 != *b),
+                    _ => Value::Void,
+                }
+            }
+            (Value::Int(a), Value::Ptr(b)) => {
+                match op {
+                    BinOp::Eq => Value::Bool(*a == *b as i64),
+                    BinOp::Neq => Value::Bool(*a != *b as i64),
+                    _ => Value::Void,
+                }
+            }
             _ => Value::Void,
         }
     }
@@ -1156,6 +1178,7 @@ impl Interpreter {
             || name.starts_with("p_socket_")
             || name.starts_with("p_http_")
             || name.starts_with("p_db_")
+            || name.starts_with("p_file_")
     }
 
     /// Call a runtime function
@@ -2402,6 +2425,76 @@ impl Interpreter {
                     }
                 }
                 ExecOutcome::Value(Value::Int(0))
+            }
+
+            // ─── File I/O builtins ───
+            "p_file_read" => {
+                if let Some(Value::Str(path)) = args.get(0) {
+                    let path_str = path.to_string();
+                    match std::fs::read_to_string(&path_str) {
+                        Ok(content) => {
+                            let addr = self.memory.alloc(content.len() as u64 + 1);
+                            self.memory.store(addr, content.as_bytes());
+                            self.memory.store(addr + content.len() as u64, &[0]);
+                            let val = Value::Str(CompactString::from(content));
+                            self.opaque_values.insert(addr, val.clone());
+                            return ExecOutcome::Value(Value::Ptr(addr));
+                        }
+                        Err(_) => return ExecOutcome::Value(Value::Ptr(0)),
+                    }
+                }
+                ExecOutcome::Value(Value::Ptr(0))
+            }
+            "p_file_write" => {
+                if let (Some(Value::Str(path)), Some(content)) = (args.get(0), args.get(1)) {
+                    let path_str = path.to_string();
+                    let content_str = match content {
+                        Value::Str(s) => s.to_string(),
+                        Value::Ptr(addr) => {
+                            let bytes = self.memory.load(*addr, 4096);
+                            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                            String::from_utf8_lossy(&bytes[..end]).to_string()
+                        }
+                        _ => return ExecOutcome::Value(Value::Int(-1)),
+                    };
+                    match std::fs::write(&path_str, &content_str) {
+                        Ok(_) => return ExecOutcome::Value(Value::Int(0)),
+                        Err(_) => return ExecOutcome::Value(Value::Int(-1)),
+                    }
+                }
+                ExecOutcome::Value(Value::Int(-1))
+            }
+            "p_file_exists" => {
+                if let Some(Value::Str(path)) = args.get(0) {
+                    let path_str = path.to_string();
+                    return ExecOutcome::Value(Value::Bool(std::path::Path::new(&path_str).exists()));
+                }
+                ExecOutcome::Value(Value::Bool(false))
+            }
+            "p_file_append" => {
+                if let (Some(Value::Str(path)), Some(content)) = (args.get(0), args.get(1)) {
+                    let path_str = path.to_string();
+                    let content_str = match content {
+                        Value::Str(s) => s.to_string(),
+                        Value::Ptr(addr) => {
+                            let bytes = self.memory.load(*addr, 4096);
+                            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                            String::from_utf8_lossy(&bytes[..end]).to_string()
+                        }
+                        _ => return ExecOutcome::Value(Value::Int(-1)),
+                    };
+                    use std::io::Write;
+                    match std::fs::OpenOptions::new().append(true).create(true).open(&path_str) {
+                        Ok(mut f) => {
+                            match f.write_all(content_str.as_bytes()) {
+                                Ok(_) => return ExecOutcome::Value(Value::Int(0)),
+                                Err(_) => return ExecOutcome::Value(Value::Int(-1)),
+                            }
+                        }
+                        Err(_) => return ExecOutcome::Value(Value::Int(-1)),
+                    }
+                }
+                ExecOutcome::Value(Value::Int(-1))
             }
 
             // ─── Phase 5A.3: Interrupt handler builtins (bare-metal) ───

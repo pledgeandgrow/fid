@@ -439,6 +439,11 @@ fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, met
             expr: subst_expr(expr, subst, renames, method_renames),
             line: *line,
         },
+        Stmt::LetTuple { names, expr, line } => Stmt::LetTuple {
+            names: names.clone(),
+            expr: subst_expr(expr, subst, renames, method_renames),
+            line: *line,
+        },
         Stmt::Assign { target, op, expr, line } => Stmt::Assign {
             target: target.clone(),
             op: op.clone(),
@@ -529,6 +534,10 @@ fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, met
             line: *line,
         },
         Stmt::Unsafe { body, line } => Stmt::Unsafe {
+            body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
+            line: *line,
+        },
+        Stmt::Txn { body, line } => Stmt::Txn {
             body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
             line: *line,
         },
@@ -752,6 +761,11 @@ fn fixup_generic_calls_stmt(stmt: &Stmt, generics: &HashMap<String, (Func, Vec<S
             name: name.clone(), ty: ty.clone(),
             expr: fixup_generic_calls_expr(expr, generics, current_func),
             is_mut: *is_mut, is_persist: *is_persist, line: *line,
+        },
+        Stmt::LetTuple { names, expr, line } => Stmt::LetTuple {
+            names: names.clone(),
+            expr: fixup_generic_calls_expr(expr, generics, current_func),
+            line: *line,
         },
         Stmt::Return(opt, line) => Stmt::Return(
             opt.as_ref().map(|e| fixup_generic_calls_expr(e, generics, current_func)),
@@ -1005,6 +1019,9 @@ fn collect_generic_calls_stmt_with_hint(
             // Register this let binding's type for later lookups
             let _ = name;
         }
+        Stmt::LetTuple { expr, .. } => {
+            collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, None);
+        }
         Stmt::Assign { expr, .. } => collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, None),
         Stmt::IndexAssign { index, expr, .. } => {
             collect_generic_calls_expr_with_hint(index, generics, generic_methods, calls, method_calls, current_func, None);
@@ -1096,7 +1113,7 @@ fn collect_generic_calls_stmt_with_hint(
                 collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
             }
         }
-        Stmt::Unsafe { body, .. } => {
+        Stmt::Unsafe { body, .. } | Stmt::Txn { body, .. } => {
             for s in body {
                 collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
             }
