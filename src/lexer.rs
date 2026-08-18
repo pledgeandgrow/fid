@@ -118,6 +118,7 @@ impl Lexer {
             "where" => TokenKind::Where,
             "region" => TokenKind::Region,
             "sandbox" => TokenKind::Sandbox,
+            "unsafe" => TokenKind::Unsafe,
             "persist" => TokenKind::Persist,
             "for" => TokenKind::For,
             "while" => TokenKind::While,

@@ -86,7 +86,7 @@
 > - ✅ **`watch --diff` works** — PIR L2 line diff + binary size delta on each reload
 > - ✅ **Capability-aware linking works** — `--caps` flag strips ungranted functions from binary
 > - ⚠️ **Optimizer not enabled by default** — regalloc bug blocks `--opt`. Fix in progress.
-> - 📈 **C codegen at 78/81 test parity** (3 mismatches: test_asm [by design], test_comptime_reflect [interpreter-only], test_db [flaky HashMap ordering])
+> - ✅ **C codegen at 86/86 test parity** — FULL PARITY with interpreter, no gaps. test_db no longer flaky (HashMap keys sorted).
 
 ---
 

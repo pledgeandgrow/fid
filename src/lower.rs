@@ -142,6 +142,12 @@ impl Lowerer {
             }
         }
 
+        // Register trait method names (in order) for vtable dispatch
+        for td in &program.traits {
+            let methods: Vec<String> = td.methods.iter().map(|m| m.name.clone()).collect();
+            self.module.trait_methods.insert(td.name.clone(), methods);
+        }
+
         // Compute struct layouts
         for s in &program.structs {
             self.compute_struct_layout(s);
@@ -177,7 +183,7 @@ impl Lowerer {
                 mangled.name = format!("{}_{}", imp.struct_name, method.name);
                 // Resolve Self in param types and return type
                 mangled.params = mangled.params.iter().map(|p| {
-                    Param { name: p.name.clone(), ty: self.resolve_self_in_type(&p.ty) }
+                    Param { name: p.name.clone(), ty: self.resolve_self_in_type(&p.ty), is_pub: p.is_pub }
                 }).collect();
                 mangled.ret_ty = self.resolve_self_in_type(&mangled.ret_ty);
                 self.lower_func(&mangled);
@@ -194,7 +200,7 @@ impl Lowerer {
                 mangled.name = format!("{}_{}", ti.type_name, method.name);
                 // Resolve Self in param types and return type
                 mangled.params = mangled.params.iter().map(|p| {
-                    Param { name: p.name.clone(), ty: self.resolve_self_in_type(&p.ty) }
+                    Param { name: p.name.clone(), ty: self.resolve_self_in_type(&p.ty), is_pub: p.is_pub }
                 }).collect();
                 mangled.ret_ty = self.resolve_self_in_type(&mangled.ret_ty);
                 self.lower_func(&mangled);
@@ -456,6 +462,31 @@ impl Lowerer {
         self.allocas.clear();
         self.alloca_types.clear();
         self.defer_stack.clear();
+
+        // @audit annotation: emit log calls at function entry/exit.
+        // Entry: print "[AUDIT] enter <name>\n"
+        // Exit:  print "[AUDIT] exit <name>\n" (via defer, runs before every return)
+        let is_audited = func.annotations.iter().any(|a| a.name == "audit");
+        if is_audited {
+            // Entry log
+            let entry_msg = self.emit_inst(Inst::ConstStr {
+                value: format!("[AUDIT] enter {}\n", func.name),
+            });
+            self.emit_inst(Inst::Print {
+                value: entry_msg,
+                ty: IrType::Ptr(Box::new(IrType::U8)),
+            });
+            // Exit log via defer — a synthetic print statement that runs
+            // before every return point (including implicit returns).
+            let exit_stmt = Stmt::Expr(
+                Expr::Call {
+                    callee: "print".to_string(),
+                    args: vec![Expr::StringLit(format!("[AUDIT] exit {}\n", func.name))],
+                },
+                0,
+            );
+            self.defer_stack.push(vec![exit_stmt]);
+        }
 
         // Lower the function body
         // If the function has a non-void return type and the last statement
@@ -1015,6 +1046,14 @@ impl Lowerer {
             Stmt::ComptimeGen { .. } => {}
             Stmt::Sandbox { body, .. } => {
                 // Sandbox is transparent at the IR level — safety is
+                // enforced entirely at compile time by the typechecker.
+                // Just lower the body as normal statements.
+                for s in body {
+                    self.lower_stmt(s);
+                }
+            }
+            Stmt::Unsafe { body, .. } => {
+                // Unsafe is transparent at the IR level — safety is
                 // enforced entirely at compile time by the typechecker.
                 // Just lower the body as normal statements.
                 for s in body {
@@ -3488,6 +3527,9 @@ impl Lowerer {
                     self.collect_free_vars(body, free_vars, local_names);
                 }
                 Stmt::Sandbox { body, .. } => {
+                    self.collect_free_vars(body, free_vars, local_names);
+                }
+                Stmt::Unsafe { body, .. } => {
                     self.collect_free_vars(body, free_vars, local_names);
                 }
                 Stmt::ComptimeGen { .. } => {}

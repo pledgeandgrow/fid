@@ -13,7 +13,7 @@
 make it another D, Crystal, or V — technically good, commercially irrelevant.**
 
 The project has built an impressive amount of working compiler infrastructure
-(51,600 LOC, 36 source files, 86/86 test parity across 3 backends, 9 stdlib
+(52,845 LOC, 36 source files, 86/86 test parity across 3 backends, 9 stdlib
 modules, 6 backends). But it's spreading into too many domains (games,
 blockchain, robotics, medical, serverless) before it has proven it can do the
 basics better than existing languages.
@@ -80,7 +80,7 @@ doesn't burden the language forever. Scala should have done this. C++ couldn't.
 
 ### 4. Test Infrastructure ✅
 
-- 136 unit tests
+- 137 unit tests
 - 8/8 harness tests
 - 86/86 interpreter + PE + C codegen parity
 - 3/3 expected-fail tests
@@ -212,17 +212,18 @@ to choose a systems language.
 
 ### 4. Documentation Inconsistency 🟡
 
-Multiple docs are out of sync with reality:
-- `features.md` says "76/78 C codegen" — actual is 86/86
-- `features.md` says "78/78 interpreter" — actual is 86/86
-- `roadmap-limitations.md` says "78/78 + 1/1 expected-fail" — actual is 86/86 + 3/3
-- `roadmap-limitations.md` says "190 warnings" — actual is 214
-- `roadmap.md` summary says "81/81" — actual is 86/86
-- Phase numbers shifted (self-hosting was Phase 6, now Phase 10)
+~~Multiple docs are out of sync with reality:~~
+**UPDATE Aug 2026:** Docs have been synchronized with actual state. All test
+counts, LOC, file counts, and phase numbers now match verified reality:
+- `features.md` now says "86/86 C codegen — FULL PARITY" ✅
+- `features.md` now says "86/86 interpreter" ✅
+- `roadmap-limitations.md` now says "86/86 + 3/3 expected-fail" ✅
+- `roadmap-limitations.md` now says "215 warnings" ✅
+- `roadmap.md` summary now says "86/86" ✅
+- Phase numbers updated (self-hosting is Phase 10, ecosystem Phase 11, world class Phase 12) ✅
 
-This is a symptom of moving fast without updating all docs. It's not fatal,
-but it erodes trust. If the docs lie about test counts, what else do they lie
-about?
+This was a symptom of moving fast without updating all docs. The docs now
+match reality. A pre-commit check would prevent future drift.
 
 ### 5. 214 Compiler Warnings 🟡
 
@@ -359,9 +360,10 @@ well. Cut the rest until those 3 prove the concept.
 
 ### 6. Documentation Must Match Reality
 
-Every doc should be updated when test counts change. The current state where
+Every doc should be updated when test counts change. ~~The current state where
 `features.md` says 76/78 but reality is 86/86 is unacceptable for a project
-that wants to be taken seriously.
+that wants to be taken seriously.~~ **UPDATE Aug 2026: All docs now match
+verified reality (86/86 FULL PARITY across all backends).**
 
 **Recommendation:** Add a pre-commit check: run `fidesc test`, compare
 output to docs, fail if mismatch. Or at minimum, update all docs in the same

@@ -1,6 +1,6 @@
 # Fides Language — Feature Status
 
-*Last updated: verified against actual source code and test runs (136/136 unit tests, 8/8 harness tests, 78/78 interpreter tests + 1/1 expected-fail, 76/78 C codegen, 102 .fd test files)*
+*Last updated: verified against actual source code and test runs (137/137 unit tests, 8/8 harness tests, 86/86 interpreter tests + 3/3 expected-fail, 86/86 C codegen — FULL PARITY, 89 .fd test files)*
 
 ## Legend
 
@@ -21,7 +21,7 @@
 | IR Interpreter (interp.rs) | ✅ | Runs IR directly via `fidesc run` |
 | PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables + flat binary (bare-metal mode) |
 | ELF64 Emitter (elf64.rs) | ✅ | Generates native ELF64 executables on Linux (zero external tools) + relocatable objects |
-| C Codegen (codegen_c.rs) | ✅ | Generates C code, 76/78 tests match interpreter output (2 mismatches: test_asm by design, test_comptime_reflect interpreter-only) |
+| C Codegen (codegen_c.rs) | ✅ | Generates C code, 86/86 tests match interpreter output (FULL PARITY — no gaps) |
 | PIR (pir.rs) | ✅ | PIR L1/L2/L3, `fidesc pir` command |
 | Optimizer (opt.rs) | ⚠️ | Const fold, CSE, DCE, inline, unroll, TCO, effect-based elision. Works for simple programs but exposes register allocator bug on complex ones. Not enabled by default. |
 | Peephole (peephole.rs) | ✅ | 9 passes, always on in `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection |
@@ -46,7 +46,7 @@
 | `fidesc emit <file> --bare -o <bin>` | ✅ | Bare-metal flat binary (no stdlib, no PE headers) |
 | `fidesc build <file> -o <out> [--target] [--opt]` | ✅ | Native build: PIR → codegen → peephole → ELF64 executable (zero external tools on Linux) |
 | `fidesc ccompile <file> -o <exe>` | ✅ | C codegen → gcc/clang → executable |
-| `fidesc test` | ✅ | Runs all 78 normal + 1 expected-fail tests across interpreter, PE emitter, and C codegen |
+| `fidesc test` | ✅ | Runs all 86 normal + 3 expected-fail tests across interpreter, PE emitter, and C codegen |
 | `fidesc repl` | ✅ | Interactive REPL |
 | `fidesc verify <file>` | ✅ | IR verification pass |
 | `fidesc sourcemap <file>` | ✅ | Source map output |
@@ -497,10 +497,10 @@ pv out = quant::dequantize_q8(q_out); // dequantize result
 | Parser | 100% | — | — |
 | Type Checker | 100% | — | — |
 | IR Lowering | 100% | — | — |
-| Interpreter | 78/78 + 1/1 expected-fail | — | `test_trait_verify_fail` (expected failure) |
-| PE Emitter | 78/78 + 1/1 expected-fail | — | `test_trait_verify_fail` (expected failure) |
+| Interpreter | 86/86 + 3/3 expected-fail | — | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` (expected failures) |
+| PE Emitter | 86/86 + 3/3 expected-fail | — | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` (expected failures) |
 | ELF64 Emitter | ✅ | — | Working executables on Linux (zero external tools) |
-| C Codegen | 76/78 + 1/1 expected-fail | — | 2 real mismatches (asm by design, comptime_reflect interpreter-only). test_db flaky (HashMap ordering). |
+| C Codegen | 86/86 + 3/3 expected-fail | — | FULL PARITY — no gaps. test_db no longer flaky (HashMap keys sorted). |
 | Multi-arch Codegen | ✅ | — | x86-64, ARM64, RISC-V assembly all work |
 | Peephole Optimizer | ✅ (9 passes) | — | Always on in `build` |
 | L2 Optimizer | — | ⚠️ | Works for simple programs, regalloc bug on complex ones |
@@ -512,8 +512,8 @@ pv out = quant::dequantize_q8(q_out); // dequantize result
 
 ### Test Coverage
 
-- **102 test files** in `tests/` (79 root + 9 safety + 4 capability + 7 effects + 3 regions)
-- **133 unit tests** in `cargo test --bin fidesc` — all pass
-- **8 cargo tests** in `tests/harness.rs` — 7 pass, 1 fails (golden_files_match: interpreter debug format)
+- **89 test files** in `tests/` (86 normal + 3 expected-fail)
+- **137 unit tests** in `cargo test --bin fidesc` — all pass
+- **8 cargo tests** in `tests/harness.rs` — all pass (including golden_files_match)
 - **43 golden files** in `tests/golden/` — expected outputs for regression testing
 - **Benchmarks** in `benches/bench_main.rs`

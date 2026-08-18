@@ -1073,6 +1073,9 @@ pub struct IrModule {
     pub function_effects: HashMap<String, EffectSet>,
     /// User-defined extern declarations for FFI (C codegen uses these)
     pub extern_decls: Vec<crate::ast::ExternDecl>,
+    /// Trait method names in order, for vtable dispatch.
+    /// Maps trait name → list of method names.
+    pub trait_methods: HashMap<String, Vec<String>>,
 }
 
 impl IrModule {
@@ -1084,6 +1087,7 @@ impl IrModule {
             extern_functions: HashMap::new(),
             function_effects: HashMap::new(),
             extern_decls: Vec::new(),
+            trait_methods: HashMap::new(),
         }
     }
 

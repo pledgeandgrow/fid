@@ -1,6 +1,6 @@
 # TEST.md — Fides Test Results
 
-*Last updated: Aug 2026 — verified against actual test runs (136/136 unit tests, 8/8 harness tests, 78/78 interpreter + 1/1 expected-fail, 78/78 PE + 1/1 expected-fail, 76/78 C codegen + 1/1 expected-fail, 102 .fd test files)*
+*Last updated: Aug 2026 — verified against actual test runs (137/137 unit tests, 8/8 harness tests, 86/86 interpreter + 3/3 expected-fail, 86/86 PE + 3/3 expected-fail, 86/86 C codegen + 3/3 expected-fail — FULL PARITY, 89 .fd test files)*
 
 ## Legend
 

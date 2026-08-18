@@ -34,6 +34,7 @@ pub enum TokenKind {
     Where,       // where
     Region,      // region
     Sandbox,     // sandbox — capability revocation block
+    Unsafe,      // unsafe — unsafe block (gates raw pointer ops)
     Persist,     // persist — variable persists across hot reloads
     For,         // for
     While,       // while
@@ -187,6 +188,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Where => write!(f, "where"),
             TokenKind::Region => write!(f, "region"),
             TokenKind::Sandbox => write!(f, "sandbox"),
+            TokenKind::Unsafe => write!(f, "unsafe"),
             TokenKind::Persist => write!(f, "persist"),
             TokenKind::For => write!(f, "for"),
             TokenKind::While => write!(f, "while"),

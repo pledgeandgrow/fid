@@ -241,6 +241,7 @@ fn desugar_layers_models(program: &mut Program) {
             name: layer.name.clone(),
             fields: layer.fields.clone(),
             is_pub: layer.is_pub,
+            annotations: Vec::new(),
         });
 
         // Create impl block with forward method
@@ -289,6 +290,7 @@ fn desugar_layers_models(program: &mut Program) {
             Param {
                 name: name.clone(),
                 ty: Type::Named(layer_type.clone()),
+                is_pub: false,
             }
         }).collect();
 
@@ -296,6 +298,7 @@ fn desugar_layers_models(program: &mut Program) {
             name: model.name.clone(),
             fields,
             is_pub: model.is_pub,
+            annotations: Vec::new(),
         });
 
         // Create impl block with forward method
@@ -377,7 +380,7 @@ fn fill_default_trait_methods(program: &mut Program) {
             let self_type = Type::Named(ti.type_name.clone());
             let params: Vec<Param> = tm.params.iter().map(|p| {
                 if p.name == "self" {
-                    Param { name: p.name.clone(), ty: self_type.clone() }
+                    Param { name: p.name.clone(), ty: self_type.clone(), is_pub: false }
                 } else {
                     p.clone()
                 }

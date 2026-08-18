@@ -2013,10 +2013,22 @@ p_string_replace:
     # if flen == 0: return strdup(s)
     testq %r15, %r15
     je .Lpsr2_copy_all
-    # malloc slen+1 (overestimate, good enough)
-    leaq 1(%r14), %rdi
+    # get tlen (for buffer size calculation)
+    movq %r13, %rax
+    xorl %ecx, %ecx
+.Lpsr2_tlen:
+    movzbq (%rax), %edx
+    testq %rdx, %rdx
+    je .Lpsr2_tlen_done
+    incq %rax
+    incq %rcx
+    jmp .Lpsr2_tlen
+.Lpsr2_tlen_done:
+    # rcx = tlen; malloc slen + tlen + 1 (enough for one replacement;
+    # p_malloc rounds up to 4096 so this is safe for small strings)
+    leaq 1(%r14,%rcx), %rdi
     call p_malloc
-    movq %rax, -8(%rbp)
+    movq %rax, (%rsp)
     xorl %ecx, %ecx
     xorl %edx, %edx
 .Lpsr2_loop:
@@ -2031,40 +2043,39 @@ p_string_replace:
 .Lpsr2_match:
     cmpq %r15, %r8
     jae .Lpsr2_replace
-    movzbq (%rbx,%rcx,%r8), %rax
-    movzbq (%r12,%r8), %rdx
-    cmpq %rdx, %rax
+    leaq (%rbx,%rcx), %r9
+    movzbq (%r9,%r8), %rax
+    movzbq (%r12,%r8), %r9
+    cmpq %r9, %rax
     jne .Lpsr2_copy_char
     incq %r8
     jmp .Lpsr2_match
 .Lpsr2_replace:
-    # copy 'to' to result[rdx]
+    # copy 'to' to result[rdx] — save rcx only (rdx must keep advancing)
     pushq %rcx
-    pushq %rdx
     xorl %rcx, %ecx
 .Lpsr2_copy_to:
     movzbq (%r13,%rcx), %rax
     testq %rax, %rax
     je .Lpsr2_copy_to_done
-    movq -16(%rbp), %r8
+    movq 8(%rsp), %r8
     movb %al, (%r8,%rdx)
     incq %rdx
     incq %rcx
     jmp .Lpsr2_copy_to
 .Lpsr2_copy_to_done:
-    popq %rdx
     popq %rcx
     addq %r15, %rcx
     jmp .Lpsr2_loop
 .Lpsr2_copy_char:
     movzbq (%rbx,%rcx), %rax
-    movq -16(%rbp), %r8
+    movq (%rsp), %r8
     movb %al, (%r8,%rdx)
     incq %rcx
     incq %rdx
     jmp .Lpsr2_loop
 .Lpsr2_done:
-    movq -16(%rbp), %r8
+    movq (%rsp), %r8
     movb $0, (%r8,%rdx)
     movq %r8, %rax
     addq $8, %rsp
@@ -2092,6 +2103,7 @@ p_string_split:
     pushq %r13
     pushq %r14
     pushq %r15
+    subq $8, %rsp
     movq %rdi, %rbx
     movq %rsi, %r12
     call p_vec_new
@@ -2148,10 +2160,12 @@ p_string_split:
     jmp .Lpss2_copy
 .Lpss2_copy_done:
     movb $0, (%rdx,%rcx)
-    # push to vec
+    # push to vec (save rcx across call — p_vec_push clobbers it)
+    movq %rcx, (%rsp)
     movq %r13, %rdi
     movq %rdx, %rsi
     call p_vec_push
+    movq (%rsp), %rcx
     # advance r15 past delim
     leaq (%r15,%rcx), %r15
     addq %r14, %r15
@@ -2167,6 +2181,7 @@ p_string_split:
     movq %r13, %rax
     jmp .Lpss2_ret
 .Lpss2_ret:
+    addq $8, %rsp
     popq %r15
     popq %r14
     popq %r13
@@ -2181,25 +2196,27 @@ p_vec_clone:
     pushq %rbx
     pushq %r12
     pushq %r13
+    pushq %r14
     movq %rdi, %rbx
     call p_vec_new
     movq %rax, %r12
     # get len
     movq 8(%rbx), %r13
-    xorl %rcx, %rcx
+    xorl %r14d, %r14d
 .Lpvc_loop:
-    cmpq %r13, %rcx
+    cmpq %r13, %r14
     jae .Lpvc_done
     movq %rbx, %rdi
-    movq %rcx, %rsi
+    movq %r14, %rsi
     call p_vec_get
     movq %r12, %rdi
     movq %rax, %rsi
     call p_vec_push
-    incq %rcx
+    incq %r14
     jmp .Lpvc_loop
 .Lpvc_done:
     movq %r12, %rax
+    popq %r14
     popq %r13
     popq %r12
     popq %rbx
@@ -2229,22 +2246,24 @@ p_vec_extend:
     pushq %rbx
     pushq %r12
     pushq %r13
+    pushq %r14
     movq %rdi, %rbx
     movq %rsi, %r12
     movq 8(%r12), %r13
-    xorl %rcx, %rcx
+    xorl %r14d, %r14d
 .Lpve_loop:
-    cmpq %r13, %rcx
+    cmpq %r13, %r14
     jae .Lpve_done
     movq %r12, %rdi
-    movq %rcx, %rsi
+    movq %r14, %rsi
     call p_vec_get
     movq %rbx, %rdi
     movq %rax, %rsi
     call p_vec_push
-    incq %rcx
+    incq %r14
     jmp .Lpve_loop
 .Lpve_done:
+    popq %r14
     popq %r13
     popq %r12
     popq %rbx
@@ -2271,12 +2290,13 @@ p_vec_insert:
     call p_vec_push
     # reload len
     movq 8(%rbx), %r14
-    # shift elements from idx to len-2 right by 1
+    # shift elements from len-2 down to idx right by 1
     movq %r14, %rcx
+    decq %rcx
     decq %rcx
 .Lpvi_shift:
     cmpq %r12, %rcx
-    jle .Lpvi_done
+    jl .Lpvi_done
     movq (%rbx), %rdx
     movq (%rdx,%rcx,8), %rax
     movq %rax, 8(%rdx,%rcx,8)
@@ -2434,17 +2454,18 @@ p_map_get:
     pushq %rbx
     pushq %r12
     pushq %r13
+    pushq %r14
     movq %rdi, %rbx
     movq %rsi, %r12
     movq 8(%rbx), %r13
     movq (%rbx), %rdx
-    xorl %rcx, %rcx
+    xorl %r14, %r14
 .Lpmg_loop:
-    cmpq %r13, %rcx
+    cmpq %r13, %r14
     jae .Lpmg_notfound
-    # entry = rdx + rcx*16
-    leaq (%rdx,%rcx,8), %r8
-    leaq (%r8,%rcx,8), %r8
+    # entry = rdx + r14*16
+    leaq (%rdx,%r14,8), %r8
+    leaq (%r8,%r14,8), %r8
     # key = *(r8)
     movq (%r8), %r9
     # compare key with r12 (strcmp)
@@ -2453,16 +2474,58 @@ p_map_get:
     call p_strcmp
     testq %rax, %rax
     je .Lpmg_found
-    incq %rcx
+    incq %r14
     jmp .Lpmg_loop
 .Lpmg_found:
-    leaq (%rdx,%rcx,8), %r8
-    leaq (%r8,%rcx,8), %r8
+    leaq (%rdx,%r14,8), %r8
+    leaq (%r8,%r14,8), %r8
     movq 8(%r8), %rax
     jmp .Lpmg_ret
 .Lpmg_notfound:
     xorl %eax, %eax
 .Lpmg_ret:
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %rbx
+    ret
+
+# p_map_get_or(rdi=map, rsi=key, rdx=default) → rax = value or default
+p_map_get_or:
+    pushq %rbx
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    movq %rdi, %rbx
+    movq %rsi, %r12
+    movq %rdx, %r13
+    movq 8(%rbx), %r14
+    movq (%rbx), %rdx
+    xorl %r15, %r15
+.Lpmgo_loop:
+    cmpq %r14, %r15
+    jae .Lpmgo_notfound
+    leaq (%rdx,%r15,8), %r8
+    leaq (%r8,%r15,8), %r8
+    movq (%r8), %r9
+    movq %r9, %rdi
+    movq %r12, %rsi
+    call p_strcmp
+    testq %rax, %rax
+    je .Lpmgo_found
+    incq %r15
+    jmp .Lpmgo_loop
+.Lpmgo_found:
+    leaq (%rdx,%r15,8), %r8
+    leaq (%r8,%r15,8), %r8
+    movq 8(%r8), %rax
+    jmp .Lpmgo_ret
+.Lpmgo_notfound:
+    movq %r13, %rax
+.Lpmgo_ret:
+    popq %r15
+    popq %r14
     popq %r13
     popq %r12
     popq %rbx
@@ -2580,6 +2643,7 @@ p_map_insert:
     incq %rcx
     movq %rcx, 8(%rbx)
 .Lpmi_done:
+    popq %r15
     popq %r14
     popq %r13
     popq %r12
@@ -2591,27 +2655,28 @@ p_map_remove:
     pushq %rbx
     pushq %r12
     pushq %r13
+    pushq %r14
     movq %rdi, %rbx
     movq %rsi, %r12
     movq 8(%rbx), %r13
     movq (%rbx), %rdx
-    xorl %rcx, %rcx
+    xorl %r14, %r14
 .Lpmr_loop:
-    cmpq %r13, %rcx
+    cmpq %r13, %r14
     jae .Lpmr_done
-    leaq (%rdx,%rcx,8), %r8
-    leaq (%r8,%rcx,8), %r8
+    leaq (%rdx,%r14,8), %r8
+    leaq (%r8,%r14,8), %r8
     movq (%r8), %r9
     movq %r9, %rdi
     movq %r12, %rsi
     call p_strcmp
     testq %rax, %rax
     je .Lpmr_found
-    incq %rcx
+    incq %r14
     jmp .Lpmr_loop
 .Lpmr_found:
-    # shift entries left from rcx+1 to r13-1
-    movq %rcx, %rdx
+    # shift entries left from r14+1 to r13-1
+    movq %r14, %rdx
 .Lpmr_shift:
     leaq 1(%rdx), %r8
     cmpq %r13, %r8
@@ -2636,6 +2701,7 @@ p_map_remove:
     decq %r13
     movq %r13, 8(%rbx)
 .Lpmr_done:
+    popq %r14
     popq %r13
     popq %r12
     popq %rbx
@@ -2646,27 +2712,29 @@ p_map_clone:
     pushq %rbx
     pushq %r12
     pushq %r13
+    pushq %r14
     movq %rdi, %rbx
     call p_map_new
     movq %rax, %r12
     movq 8(%rbx), %r13
     movq (%rbx), %rdx
-    xorl %rcx, %rcx
+    xorl %r14, %r14
 .Lpmc2_loop:
-    cmpq %r13, %rcx
+    cmpq %r13, %r14
     jae .Lpmc2_done
-    leaq (%rdx,%rcx,8), %r8
-    leaq (%r8,%rcx,8), %r8
+    leaq (%rdx,%r14,8), %r8
+    leaq (%r8,%r14,8), %r8
     movq (%r8), %rsi
     movq 8(%r8), %rdx
     movq %r12, %rdi
     call p_map_insert
     movq 8(%rbx), %r13
     movq (%rbx), %rdx
-    incq %rcx
+    incq %r14
     jmp .Lpmc2_loop
 .Lpmc2_done:
     movq %r12, %rax
+    popq %r14
     popq %r13
     popq %r12
     popq %rbx
@@ -3011,8 +3079,7 @@ p_print_map:
     stub_zero!("p_json_dump");
     stub_zero!("p_json_get");
     stub_zero!("p_json_type");
-    stub_zero!("p_json_len");
-    stub_zero!("p_json_at");
+    // p_json_len and p_json_at are implemented below (needed by test_db)
     stub_zero!("p_json_pretty");
     stub_zero!("p_json_string");
 
@@ -3068,9 +3135,8 @@ p_print_map:
     text.extend_from_slice(&[0x4d, 0x8b, 0x24, 0x24]);
     // xorq %r14, %r14 (index = 0)
     text.extend_from_slice(&[0x4d, 0x31, 0xf6]);
-    // Store 0.0 at 16(%rsp) (accumulator)
+    // Store 0.0 at 16(%rsp) (accumulator — 8 bytes zeroed)
     text.extend_from_slice(&[0x48, 0xc7, 0x44, 0x24, 0x10, 0x00, 0x00, 0x00, 0x00]);
-    text.extend_from_slice(&[0x48, 0xc7, 0x44, 0x24, 0x14, 0x00, 0x00, 0x00, 0x00]);
     // .loop:
     let psdot_loop = text.len();
     // cmpq %r14, %r13
@@ -3079,13 +3145,15 @@ p_print_map:
     let psdot_je = text.len();
     text.extend_from_slice(&[0x0f, 0x84, 0x00, 0x00, 0x00, 0x00]); // je rel32
     // movq (%rbx,%r14,8), %rax (a[i] as f64 bits)
-    text.extend_from_slice(&[0x48, 0x8b, 0x04, 0xf3]);
+    // REX.WX=0x4a to extend SIB index to r14
+    text.extend_from_slice(&[0x4a, 0x8b, 0x04, 0xf3]);
     // movq %rax, (%rsp)
     text.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]);
     // movsd (%rsp), %xmm0
     text.extend_from_slice(&[0xf2, 0x0f, 0x10, 0x04, 0x24]);
     // movq (%r12,%r14,8), %rax (b[i] as f64 bits)
-    text.extend_from_slice(&[0x49, 0x8b, 0x04, 0xf4]);
+    // REX.WXB=0x4b to extend SIB index to r14 and base to r12
+    text.extend_from_slice(&[0x4b, 0x8b, 0x04, 0xf4]);
     // movq %rax, (%rsp)
     text.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]);
     // movsd (%rsp), %xmm1
@@ -3134,11 +3202,8 @@ p_print_map:
     stub_zero!("p_http_parse_request");
     stub_zero!("p_http_build_response");
 
-    // Database stubs
-    stub_zero!("p_db_mem_open");
-    stub_void!("p_db_mem_close");
-    stub_zero!("p_db_mem_query");
-    stub_zero!("p_db_mem_exec");
+    // Database functions — implemented below
+    // p_db_mem_open, p_db_mem_close, p_db_mem_exec, p_db_mem_query
 
     // Interrupt/MMU stubs (bare-metal only, no-op on Linux)
     stub_void!("p_cli");
@@ -3159,6 +3224,552 @@ p_print_map:
     stub_void!("p_page_unmap");
     stub_zero!("p_phys_read64");
     stub_void!("p_phys_write64");
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Database functions — in-memory key-value store for test_db
+    // Layout: db pointer → [count(8), key_ptr_0(8), key_ptr_1(8), ...]
+    // Each key_ptr points to a null-terminated string (allocated with p_malloc)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // p_db_mem_open() → rax = db pointer
+    // Allocates 4096 bytes, sets count=0
+    sym!("p_db_mem_open");
+    text.extend_from_slice(&[0x48, 0xc7, 0xc7, 0x00, 0x10, 0x00, 0x00]); // movq $4096, %rdi
+    text.extend_from_slice(&[0xe8, 0, 0, 0, 0]); // call p_malloc
+    let dbopen_call_off = text.len() - 4;
+    text.extend_from_slice(&[0x48, 0xc7, 0x00, 0x00, 0x00, 0x00, 0x00]); // movq $0, (%rax)
+    text.push(0xc3); // ret
+
+    // p_db_mem_close(rdi = db) → void
+    // Just calls p_free
+    sym!("p_db_mem_close");
+    text.extend_from_slice(&[0xe8, 0, 0, 0, 0]); // call p_free
+    let dbclose_call_off = text.len() - 4;
+    text.push(0xc3); // ret
+
+    // p_db_mem_exec(rdi = db, rsi = query) → rax = 1 on success, 0 on failure
+    // Parses "INSERT key value" or "SET key value", stores key pointer
+    // p_db_mem_exec(rdi = db, rsi = query) → rax = 1 on success, 0 on failure
+    // Parses "INSERT key value", stores key pointer + length in the db.
+    // No p_malloc needed — key pointer points into the query string (rodata).
+    // DB layout: [count(8), key_ptr_0(8), key_len_0(8), key_ptr_1(8), key_len_1(8), ...]
+    sym!("p_db_mem_exec");
+    // pushq %rbx, %r12, %r13
+    text.push(0x53); // pushq %rbx
+    text.extend_from_slice(&[0x41, 0x54]); // pushq %r12
+    text.extend_from_slice(&[0x41, 0x55]); // pushq %r13
+    // (3 pushes = 24 bytes, rsp = 8+24 = 32 ≡ 0 mod 16 — aligned, no subq needed)
+    // rbx = db, r12 = query cursor
+    text.extend_from_slice(&[0x48, 0x89, 0xfb]); // movq %rdi, %rbx
+    text.extend_from_slice(&[0x49, 0x89, 0xf4]); // movq %rsi, %r12
+    // Find first space: advance r12 until ' '
+    // .find_space:
+    let dbexec_fs = text.len();
+    text.extend_from_slice(&[0x41, 0x0f, 0xb6, 0x04, 0x24]); // movzbl (%r12), %eax
+    text.extend_from_slice(&[0x84, 0xc0]); // testb %al, %al
+    let dbexec_fail1_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je .fail
+    text.extend_from_slice(&[0x3c, 0x20]); // cmpb $' ', %al
+    let dbexec_found_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je .found_space
+    text.extend_from_slice(&[0x49, 0xff, 0xc4]); // incq %r12
+    let dbexec_fs_jmp = text.len();
+    let dbexec_fs_back = dbexec_fs as i64 - dbexec_fs_jmp as i64 - 2;
+    text.extend_from_slice(&[0xeb, dbexec_fs_back as u8]); // jmp .find_space
+    // .found_space:
+    let dbexec_found = text.len();
+    let dbexec_found_rel = (dbexec_found as i64 - dbexec_found_je as i64 - 6) as i32;
+    text[dbexec_found_je+2..dbexec_found_je+6].copy_from_slice(&dbexec_found_rel.to_le_bytes());
+    // Skip spaces
+    // .skip_spaces:
+    let dbexec_skip = text.len();
+    text.extend_from_slice(&[0x41, 0x0f, 0xb6, 0x04, 0x24]); // movzbl (%r12), %eax
+    text.extend_from_slice(&[0x3c, 0x20]); // cmpb $' ', %al
+    let dbexec_keystart_jne = text.len();
+    text.extend_from_slice(&[0x0f, 0x85, 0, 0, 0, 0]); // jne .key_start
+    text.extend_from_slice(&[0x49, 0xff, 0xc4]); // incq %r12
+    let dbexec_skip_jmp = text.len();
+    let dbexec_skip_back = dbexec_skip as i64 - dbexec_skip_jmp as i64 - 2;
+    text.extend_from_slice(&[0xeb, dbexec_skip_back as u8]); // jmp .skip_spaces
+    // .key_start:
+    let dbexec_keystart = text.len();
+    let dbexec_keystart_rel = (dbexec_keystart as i64 - dbexec_keystart_jne as i64 - 6) as i32;
+    text[dbexec_keystart_jne+2..dbexec_keystart_jne+6].copy_from_slice(&dbexec_keystart_rel.to_le_bytes());
+    // r13 = r12 (key start pointer)
+    text.extend_from_slice(&[0x4d, 0x89, 0xe5]); // movq %r12, %r13
+    // Find end of key: advance r12 until ' ' or '\0'
+    // .find_key_end:
+    let dbexec_keyend = text.len();
+    text.extend_from_slice(&[0x41, 0x0f, 0xb6, 0x04, 0x24]); // movzbl (%r12), %eax
+    text.extend_from_slice(&[0x84, 0xc0]); // testb %al, %al
+    let dbexec_havekey_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je .have_key
+    text.extend_from_slice(&[0x3c, 0x20]); // cmpb $' ', %al
+    let dbexec_havekey_je2 = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je .have_key
+    text.extend_from_slice(&[0x49, 0xff, 0xc4]); // incq %r12
+    let dbexec_keyend_jmp = text.len();
+    let dbexec_keyend_back = dbexec_keyend as i64 - dbexec_keyend_jmp as i64 - 2;
+    text.extend_from_slice(&[0xeb, dbexec_keyend_back as u8]); // jmp .find_key_end
+    // .have_key:
+    let dbexec_havekey = text.len();
+    let dbexec_havekey_rel = (dbexec_havekey as i64 - dbexec_havekey_je as i64 - 6) as i32;
+    text[dbexec_havekey_je+2..dbexec_havekey_je+6].copy_from_slice(&dbexec_havekey_rel.to_le_bytes());
+    let dbexec_havekey_rel2 = (dbexec_havekey as i64 - dbexec_havekey_je2 as i64 - 6) as i32;
+    text[dbexec_havekey_je2+2..dbexec_havekey_je2+6].copy_from_slice(&dbexec_havekey_rel2.to_le_bytes());
+    // r12 = r12 - r13 (key length)
+    text.extend_from_slice(&[0x4d, 0x29, 0xec]); // subq %r13, %r12
+    // Store key_ptr and key_len in database at entry[count]
+    // rax = count = *(%rbx)
+    text.extend_from_slice(&[0x48, 0x8b, 0x03]); // movq (%rbx), %rax
+    // rcx = rbx + 8 + count*16 = rbx + 8 + (count << 4)
+    text.extend_from_slice(&[0x48, 0xc1, 0xe0, 0x04]); // shlq $4, %rax
+    text.extend_from_slice(&[0x48, 0x8d, 0x4c, 0x03, 0x08]); // leaq 8(%rbx,%rax,1), %rcx
+    // movq %r13, (%rcx) — store key_ptr
+    text.extend_from_slice(&[0x4c, 0x89, 0x29]); // movq %r13, (%rcx)
+    // movq %r12, 8(%rcx) — store key_len
+    text.extend_from_slice(&[0x4c, 0x89, 0x61, 0x08]); // movq %r12, 8(%rcx)
+    // incq (%rbx) — count++
+    text.extend_from_slice(&[0x48, 0xff, 0x03]); // incq (%rbx)
+    // Return 1
+    text.extend_from_slice(&[0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00]); // movq $1, %rax
+    // jmp .done
+    let dbexec_done_jmp = text.len();
+    text.extend_from_slice(&[0xeb, 0x00]); // jmp rel8 (placeholder)
+    // .fail:
+    let dbexec_fail = text.len();
+    let dbexec_fail1_rel = (dbexec_fail as i64 - dbexec_fail1_je as i64 - 6) as i32;
+    text[dbexec_fail1_je+2..dbexec_fail1_je+6].copy_from_slice(&dbexec_fail1_rel.to_le_bytes());
+    text.extend_from_slice(&[0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x00]); // movq $0, %rax
+    // .done:
+    let dbexec_done = text.len();
+    let dbexec_done_rel = (dbexec_done as i64 - dbexec_done_jmp as i64 - 2) as i8;
+    text[dbexec_done_jmp+1] = dbexec_done_rel as u8;
+    // popq %r13, %r12, %rbx
+    text.extend_from_slice(&[0x41, 0x5d]); // popq %r13
+    text.extend_from_slice(&[0x41, 0x5c]); // popq %r12
+    text.push(0x5b); // popq %rbx
+    text.push(0xc3); // ret
+    // p_db_mem_query(rdi = db, rsi = query) → rax = JSON string pointer
+    // Builds ["key1","key2",...] from stored keys
+    // DB layout: [count(8), key_ptr_0(8), key_len_0(8), ...] (16-byte entries)
+    sym!("p_db_mem_query");
+    // pushq %rbx, %r12, %r13, %r14, %r15
+    text.push(0x53); // pushq %rbx
+    text.extend_from_slice(&[0x41, 0x54]); // pushq %r12
+    text.extend_from_slice(&[0x41, 0x55]); // pushq %r13
+    text.extend_from_slice(&[0x41, 0x56]); // pushq %r14
+    text.extend_from_slice(&[0x41, 0x57]); // pushq %r15
+    text.extend_from_slice(&[0x48, 0x83, 0xec, 0x10]); // subq $16, %rsp (align to 16)
+    // rbx = db
+    text.extend_from_slice(&[0x48, 0x89, 0xfb]); // movq %rdi, %rbx
+    // Allocate output buffer: 4096 bytes
+    text.extend_from_slice(&[0x48, 0xc7, 0xc7, 0x00, 0x10, 0x00, 0x00]); // movq $4096, %rdi
+    text.extend_from_slice(&[0xe8, 0, 0, 0, 0]); // call p_malloc
+    let dbquery_malloc_call = text.len() - 4;
+    // r13 = rax (output buffer)
+    text.extend_from_slice(&[0x49, 0x89, 0xc5]); // movq %rax, %r13
+    // r14 = 0 (write index)
+    text.extend_from_slice(&[0x4d, 0x31, 0xf6]); // xorq %r14, %r14
+    // Write '[' at output[0]
+    text.extend_from_slice(&[0x41, 0xc6, 0x45, 0x00, 0x5b]); // movb $0x5b, 0(%r13)
+    text.extend_from_slice(&[0x49, 0xff, 0xc6]); // incq %r14
+    // r15 = 0 (key index)
+    text.extend_from_slice(&[0x4d, 0x31, 0xff]); // xorq %r15, %r15
+    // r12 = count = *(%rbx)
+    text.extend_from_slice(&[0x4c, 0x8b, 0x23]); // movq (%rbx), %r12
+    // .query_loop:
+    let dbquery_loop = text.len();
+    text.extend_from_slice(&[0x4d, 0x39, 0xfc]); // cmpq %r15, %r12
+    let dbquery_done_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je .query_done
+    // If not first key, write ','
+    text.extend_from_slice(&[0x49, 0x83, 0xff, 0x00]); // cmpq $0, %r15
+    let dbquery_nocomma_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je .no_comma
+    // Write ',' at output[r14]: leaq (%r13,%r14,1), %rax ; movb $',', (%rax)
+    // REX.WXB=0x4b, SIB index=6(r14), base=5(r13) → 0x35
+    text.extend_from_slice(&[0x4b, 0x8d, 0x44, 0x35, 0x00]); // leaq 0(%r13,%r14,1), %rax
+    text.extend_from_slice(&[0xc6, 0x00, 0x2c]); // movb $0x2c, (%rax)
+    text.extend_from_slice(&[0x49, 0xff, 0xc6]); // incq %r14
+    // .no_comma:
+    let dbquery_nocomma = text.len();
+    let dbquery_nocomma_rel = (dbquery_nocomma as i64 - dbquery_nocomma_je as i64 - 6) as i32;
+    text[dbquery_nocomma_je+2..dbquery_nocomma_je+6].copy_from_slice(&dbquery_nocomma_rel.to_le_bytes());
+    // Write '"'
+    text.extend_from_slice(&[0x4b, 0x8d, 0x44, 0x35, 0x00]); // leaq 0(%r13,%r14,1), %rax
+    text.extend_from_slice(&[0xc6, 0x00, 0x22]); // movb $'"', (%rax)
+    text.extend_from_slice(&[0x49, 0xff, 0xc6]); // incq %r14
+    // Get entry address: r15 * 16 + 8 + rbx
+    // rax = r15 ; shlq $4, rax ; leaq 8(%rbx,%rax,1), %rax
+    text.extend_from_slice(&[0x4c, 0x89, 0xf8]); // movq %r15, %rax
+    text.extend_from_slice(&[0x48, 0xc1, 0xe0, 0x04]); // shlq $4, %rax
+    text.extend_from_slice(&[0x48, 0x8d, 0x44, 0x03, 0x08]); // leaq 8(%rbx,%rax,1), %rax
+    // rax = &entry.key_ptr. Load key_ptr and key_len.
+    // Save entry addr on stack: movq %rax, (%rsp)
+    text.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]); // movq %rax, (%rsp)
+    // rcx = key_ptr = *(%rax)
+    text.extend_from_slice(&[0x48, 0x8b, 0x08]); // movq (%rax), %rcx
+    // rdx = key_len = 8(%rax)
+    text.extend_from_slice(&[0x48, 0x8b, 0x50, 0x08]); // movq 8(%rax), %rdx
+    // Save key_len on stack: movq %rdx, 8(%rsp)
+    text.extend_from_slice(&[0x48, 0x89, 0x54, 0x24, 0x08]); // movq %rdx, 8(%rsp)
+    // .key_copy_loop:
+    let dbquery_kcl = text.len();
+    // cmpq $0, 8(%rsp) — compare remaining len with 0
+    text.extend_from_slice(&[0x48, 0x83, 0x7c, 0x24, 0x08, 0x00]); // cmpq $0, 8(%rsp)
+    let dbquery_kcdone_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je .key_copy_done
+    // movzbl (%rcx), %eax
+    text.extend_from_slice(&[0x0f, 0xb6, 0x01]); // movzbl (%rcx), %eax
+    // Store byte: leaq (%r13,%r14,1), %rdx ; movb %al, (%rdx)
+    text.extend_from_slice(&[0x4b, 0x8d, 0x54, 0x35, 0x00]); // leaq 0(%r13,%r14,1), %rdx
+    text.extend_from_slice(&[0x88, 0x02]); // movb %al, (%rdx)
+    // incq %r14
+    text.extend_from_slice(&[0x49, 0xff, 0xc6]); // incq %r14
+    // incq %rcx (key cursor)
+    text.extend_from_slice(&[0x48, 0xff, 0xc1]); // incq %rcx
+    // decq 8(%rsp) (remaining len--)
+    text.extend_from_slice(&[0x48, 0xff, 0x4c, 0x24, 0x08]); // decq 8(%rsp)
+    // jmp .key_copy_loop
+    let dbquery_kcl_jmp = text.len();
+    let dbquery_kcl_back = dbquery_kcl as i64 - dbquery_kcl_jmp as i64 - 2;
+    text.extend_from_slice(&[0xeb, dbquery_kcl_back as u8]); // jmp rel8
+    // .key_copy_done:
+    let dbquery_kcdone = text.len();
+    let dbquery_kcdone_rel = (dbquery_kcdone as i64 - dbquery_kcdone_je as i64 - 6) as i32;
+    text[dbquery_kcdone_je+2..dbquery_kcdone_je+6].copy_from_slice(&dbquery_kcdone_rel.to_le_bytes());
+    // Write closing '"'
+    text.extend_from_slice(&[0x4b, 0x8d, 0x44, 0x35, 0x00]); // leaq 0(%r13,%r14,1), %rax
+    text.extend_from_slice(&[0xc6, 0x00, 0x22]); // movb $'"', (%rax)
+    text.extend_from_slice(&[0x49, 0xff, 0xc6]); // incq %r14
+    // incq %r15 (key index)
+    text.extend_from_slice(&[0x49, 0xff, 0xc7]); // incq %r15
+    // jmp .query_loop
+    let dbquery_loop_jmp = text.len();
+    let dbquery_loop_back = dbquery_loop as i64 - dbquery_loop_jmp as i64 - 2;
+    text.extend_from_slice(&[0xeb, dbquery_loop_back as u8]); // jmp rel8
+    // .query_done:
+    let dbquery_done = text.len();
+    let dbquery_done_rel = (dbquery_done as i64 - dbquery_done_je as i64 - 6) as i32;
+    text[dbquery_done_je+2..dbquery_done_je+6].copy_from_slice(&dbquery_done_rel.to_le_bytes());
+    // Write ']'
+    text.extend_from_slice(&[0x4b, 0x8d, 0x44, 0x35, 0x00]); // leaq 0(%r13,%r14,1), %rax
+    text.extend_from_slice(&[0xc6, 0x00, 0x5d]); // movb $']', (%rax)
+    text.extend_from_slice(&[0x49, 0xff, 0xc6]); // incq %r14
+    // Null-terminate
+    text.extend_from_slice(&[0x4b, 0x8d, 0x44, 0x35, 0x00]); // leaq 0(%r13,%r14,1), %rax
+    text.extend_from_slice(&[0xc6, 0x00, 0x00]); // movb $0, (%rax)
+    // rax = r13 (return output buffer)
+    text.extend_from_slice(&[0x4c, 0x89, 0xe8]); // movq %r13, %rax
+    // addq $16, %rsp
+    text.extend_from_slice(&[0x48, 0x83, 0xc4, 0x10]); // addq $16, %rsp
+    // popq %r15, %r14, %r13, %r12, %rbx
+    text.extend_from_slice(&[0x41, 0x5f]); // popq %r15
+    text.extend_from_slice(&[0x41, 0x5e]); // popq %r14
+    text.extend_from_slice(&[0x41, 0x5d]); // popq %r13
+    text.extend_from_slice(&[0x41, 0x5c]); // popq %r12
+    text.push(0x5b); // popq %rbx
+    text.push(0xc3); // ret
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // JSON functions — simplified implementations for test_db
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // p_json_len(rdi = json_str) → rax = element count
+    // For JSON arrays: count commas between [ and ], add 1 if non-empty
+    sym!("p_json_len");
+    // pushq %rbx, %r12
+    text.push(0x53); // pushq %rbx
+    text.extend_from_slice(&[0x41, 0x54]); // pushq %r12
+    // rbx = json_str, r12 = 0 (count)
+    text.extend_from_slice(&[0x48, 0x89, 0xfb]); // movq %rdi, %rbx
+    text.extend_from_slice(&[0x4d, 0x31, 0xe4]); // xorq %r12, %r12
+    // Skip to '[': find first '['
+    // .find_bracket:
+    let jlen_fb = text.len();
+    // movzbl (%rbx), %eax
+    text.extend_from_slice(&[0x0f, 0xb6, 0x03]); // movzbl (%rbx), %eax
+    // testb %al, %al → end of string, return 0
+    text.extend_from_slice(&[0x84, 0xc0]); // testb %al, %al
+    // jz .done
+    let jlen_done1_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je rel32
+    // cmpb $0x5b, %al → '['?
+    text.extend_from_slice(&[0x3c, 0x5b]); // cmpb $'[', %al
+    // je .in_array
+    let jlen_inarr_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je rel32
+    // incq %rbx
+    text.extend_from_slice(&[0x48, 0xff, 0xc3]); // incq %rbx
+    // jmp .find_bracket
+    let jlen_fb_jmp = text.len();
+    let jlen_fb_back = jlen_fb as i64 - jlen_fb_jmp as i64 - 2;
+    text.extend_from_slice(&[0xeb, jlen_fb_back as u8]); // jmp rel8
+    // .in_array:
+    let jlen_inarr = text.len();
+    let jlen_inarr_rel = (jlen_inarr as i64 - jlen_inarr_je as i64 - 6) as i32;
+    text[jlen_inarr_je+2..jlen_inarr_je+6].copy_from_slice(&jlen_inarr_rel.to_le_bytes());
+    // incq %rbx (skip past '[')
+    text.extend_from_slice(&[0x48, 0xff, 0xc3]); // incq %rbx
+    // Check for empty array: movzbl (%rbx), %eax ; cmpb $']', %al
+    text.extend_from_slice(&[0x0f, 0xb6, 0x03]); // movzbl (%rbx), %eax
+    text.extend_from_slice(&[0x3c, 0x5d]); // cmpb $']', %al
+    // je .done (empty array → count = 0)
+    let jlen_done2_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je rel32
+    // Not empty → count = 1
+    text.extend_from_slice(&[0x49, 0xc7, 0xc4, 0x01, 0x00, 0x00, 0x00]); // movq $1, %r12
+    // .scan:
+    let jlen_scan = text.len();
+    // movzbl (%rbx), %eax
+    text.extend_from_slice(&[0x0f, 0xb6, 0x03]); // movzbl (%rbx), %eax
+    // testb %al, %al → end of string
+    text.extend_from_slice(&[0x84, 0xc0]); // testb %al, %al
+    // jz .done
+    let jlen_done3_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je rel32
+    // cmpb $0x5d, %al → ']'?
+    text.extend_from_slice(&[0x3c, 0x5d]); // cmpb $']', %al
+    // je .done
+    let jlen_done4_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je rel32
+    // cmpb $0x2c, %al → ','?
+    text.extend_from_slice(&[0x3c, 0x2c]); // cmpb $',', %al
+    // jne .next
+    let jlen_next_jne = text.len();
+    text.extend_from_slice(&[0x0f, 0x85, 0, 0, 0, 0]); // jne rel32
+    // incq %r12 (count++)
+    text.extend_from_slice(&[0x49, 0xff, 0xc4]); // incq %r12
+    // .next:
+    let jlen_next = text.len();
+    let jlen_next_rel = (jlen_next as i64 - jlen_next_jne as i64 - 6) as i32;
+    text[jlen_next_jne+2..jlen_next_jne+6].copy_from_slice(&jlen_next_rel.to_le_bytes());
+    // incq %rbx
+    text.extend_from_slice(&[0x48, 0xff, 0xc3]); // incq %rbx
+    // jmp .scan
+    let jlen_scan_jmp = text.len();
+    let jlen_scan_back = jlen_scan as i64 - jlen_scan_jmp as i64 - 2;
+    text.extend_from_slice(&[0xeb, jlen_scan_back as u8]); // jmp rel8
+    // .done:
+    let jlen_done = text.len();
+    // Patch all je's to here
+    for je_off in [jlen_done1_je, jlen_done2_je, jlen_done3_je, jlen_done4_je] {
+        let rel = (jlen_done as i64 - je_off as i64 - 6) as i32;
+        text[je_off+2..je_off+6].copy_from_slice(&rel.to_le_bytes());
+    }
+    // rax = r12 (count)
+    text.extend_from_slice(&[0x4c, 0x89, 0xe0]); // movq %r12, %rax
+    // popq %r12, %rbx
+    text.extend_from_slice(&[0x41, 0x5c]); // popq %r12
+    text.push(0x5b); // popq %rbx
+    text.push(0xc3); // ret
+
+    // p_json_at(rdi = json_str, rsi = index) → rax = element string pointer
+    // For JSON arrays of strings: extract the index-th quoted string
+    // Returns the element as a JSON string (e.g., "alice" with quotes)
+    sym!("p_json_at");
+    // pushq %rbx, %r12, %r13, %r14
+    text.push(0x53); // pushq %rbx
+    text.extend_from_slice(&[0x41, 0x54]); // pushq %r12
+    text.extend_from_slice(&[0x41, 0x55]); // pushq %r13
+    text.extend_from_slice(&[0x41, 0x56]); // pushq %r14
+    text.extend_from_slice(&[0x48, 0x83, 0xec, 0x08]); // subq $8, %rsp (align)
+    // rbx = json_str, r12 = target index
+    text.extend_from_slice(&[0x48, 0x89, 0xfb]); // movq %rdi, %rbx
+    text.extend_from_slice(&[0x49, 0x89, 0xf4]); // movq %rsi, %r12
+    // r13 = 0 (current index)
+    text.extend_from_slice(&[0x4d, 0x31, 0xed]); // xorq %r13, %r13
+    // Skip to '['
+    // .find_bracket:
+    let jat_fb = text.len();
+    text.extend_from_slice(&[0x0f, 0xb6, 0x03]); // movzbl (%rbx), %eax
+    text.extend_from_slice(&[0x84, 0xc0]); // testb %al, %al
+    // jz .ret_empty
+    let jat_empty_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je rel32
+    text.extend_from_slice(&[0x3c, 0x5b]); // cmpb $'[', %al
+    // je .in_array
+    let jat_inarr_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je rel32
+    text.extend_from_slice(&[0x48, 0xff, 0xc3]); // incq %rbx
+    let jat_fb_jmp = text.len();
+    let jat_fb_back = jat_fb as i64 - jat_fb_jmp as i64 - 2;
+    text.extend_from_slice(&[0xeb, jat_fb_back as u8]); // jmp rel8
+    // .in_array:
+    let jat_inarr = text.len();
+    let jat_inarr_rel = (jat_inarr as i64 - jat_inarr_je as i64 - 6) as i32;
+    text[jat_inarr_je+2..jat_inarr_je+6].copy_from_slice(&jat_inarr_rel.to_le_bytes());
+    // incq %rbx (skip '[')
+    text.extend_from_slice(&[0x48, 0xff, 0xc3]); // incq %rbx
+    // .find_quote:
+    let jat_fq = text.len();
+    // movzbl (%rbx), %eax
+    text.extend_from_slice(&[0x0f, 0xb6, 0x03]); // movzbl (%rbx), %eax
+    text.extend_from_slice(&[0x84, 0xc0]); // testb %al, %al
+    // jz .ret_empty
+    let jat_empty2_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je rel32
+    // cmpb $0x22, %al → '"'?
+    text.extend_from_slice(&[0x3c, 0x22]); // cmpb $'"', %al
+    // je .found_quote
+    let jat_fqfound_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je rel32
+    // incq %rbx
+    text.extend_from_slice(&[0x48, 0xff, 0xc3]); // incq %rbx
+    let jat_fq_jmp = text.len();
+    let jat_fq_back = jat_fq as i64 - jat_fq_jmp as i64 - 2;
+    text.extend_from_slice(&[0xeb, jat_fq_back as u8]); // jmp rel8
+    // .found_quote:
+    let jat_fqfound = text.len();
+    let jat_fqfound_rel = (jat_fqfound as i64 - jat_fqfound_je as i64 - 6) as i32;
+    text[jat_fqfound_je+2..jat_fqfound_je+6].copy_from_slice(&jat_fqfound_rel.to_le_bytes());
+    // Check if this is the target index
+    // cmpq %r13, %r12 → compares target with current
+    // je .extract — if target == current, extract this string
+    text.extend_from_slice(&[0x4d, 0x39, 0xec]); // cmpq %r13, %r12
+    let jat_extract_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je rel32
+    // Not target → skip this string, find next quote
+    // incq %rbx (skip past opening quote)
+    text.extend_from_slice(&[0x48, 0xff, 0xc3]); // incq %rbx
+    // .skip_str:
+    let jat_skip = text.len();
+    text.extend_from_slice(&[0x0f, 0xb6, 0x03]); // movzbl (%rbx), %eax
+    text.extend_from_slice(&[0x84, 0xc0]); // testb %al, %al
+    // jz .ret_empty
+    let jat_empty3_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je rel32
+    text.extend_from_slice(&[0x3c, 0x22]); // cmpb $'"', %al
+    // je .str_end
+    let jat_strend_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je rel32
+    text.extend_from_slice(&[0x48, 0xff, 0xc3]); // incq %rbx
+    let jat_skip_jmp = text.len();
+    let jat_skip_back = jat_skip as i64 - jat_skip_jmp as i64 - 2;
+    text.extend_from_slice(&[0xeb, jat_skip_back as u8]); // jmp rel8
+    // .str_end:
+    let jat_strend = text.len();
+    let jat_strend_rel = (jat_strend as i64 - jat_strend_je as i64 - 6) as i32;
+    text[jat_strend_je+2..jat_strend_je+6].copy_from_slice(&jat_strend_rel.to_le_bytes());
+    // incq %rbx (skip past closing quote)
+    text.extend_from_slice(&[0x48, 0xff, 0xc3]); // incq %rbx
+    // incq %r13 (current index++)
+    text.extend_from_slice(&[0x49, 0xff, 0xc5]); // incq %r13
+    // jmp .find_quote (find next opening quote)
+    let jat_fq2_jmp = text.len();
+    let jat_fq2_back = jat_fq as i64 - jat_fq2_jmp as i64 - 2;
+    text.extend_from_slice(&[0xeb, jat_fq2_back as u8]); // jmp rel8
+    // .extract:
+    let jat_extract = text.len();
+    let jat_extract_rel = (jat_extract as i64 - jat_extract_je as i64 - 6) as i32;
+    text[jat_extract_je+2..jat_extract_je+6].copy_from_slice(&jat_extract_rel.to_le_bytes());
+    // rbx points to opening quote of target string
+    // Find closing quote
+    // incq %rbx (skip opening quote)
+    text.extend_from_slice(&[0x48, 0xff, 0xc3]); // incq %rbx
+    // r14 = rbx (start of string content)
+    text.extend_from_slice(&[0x49, 0x89, 0xde]); // movq %rbx, %r14
+    // .find_close:
+    let jat_fclose = text.len();
+    text.extend_from_slice(&[0x0f, 0xb6, 0x03]); // movzbl (%rbx), %eax
+    text.extend_from_slice(&[0x84, 0xc0]); // testb %al, %al
+    // jz .ret_empty
+    let jat_empty4_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je rel32
+    text.extend_from_slice(&[0x3c, 0x22]); // cmpb $'"', %al
+    // je .copy_str
+    let jat_copy_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je rel32
+    text.extend_from_slice(&[0x48, 0xff, 0xc3]); // incq %rbx
+    let jat_fclose_jmp = text.len();
+    let jat_fclose_back = jat_fclose as i64 - jat_fclose_jmp as i64 - 2;
+    text.extend_from_slice(&[0xeb, jat_fclose_back as u8]); // jmp rel8
+    // .copy_str:
+    let jat_copy = text.len();
+    let jat_copy_rel = (jat_copy as i64 - jat_copy_je as i64 - 6) as i32;
+    text[jat_copy_je+2..jat_copy_je+6].copy_from_slice(&jat_copy_rel.to_le_bytes());
+    // rbx = end of string (points to closing quote)
+    // r14 = start of string
+    // length = rbx - r14
+    // We need to return "string" (with quotes) as per json::dump
+    // Allocate (rbx - r14 + 3) bytes: " + string + " + \0
+    // rax = rbx - r14 (string length)
+    text.extend_from_slice(&[0x48, 0x89, 0xd8]); // movq %rbx, %rax
+    // subq %r14, %rax → REX.WR (W=1, R=1 for r14 in reg field), 29, ModRM=F0 (mod=11, reg=110=r14, rm=000=rax)
+    text.extend_from_slice(&[0x4c, 0x29, 0xf0]); // subq %r14, %rax
+    // rax = length + 3 (for two quotes and null)
+    text.extend_from_slice(&[0x48, 0x83, 0xc0, 0x03]); // addq $3, %rax
+    // movq %rax, %rdi
+    text.extend_from_slice(&[0x48, 0x89, 0xc7]); // movq %rax, %rdi
+    // call p_malloc
+    text.extend_from_slice(&[0xe8, 0, 0, 0, 0]); // call p_malloc
+    let jat_malloc_call = text.len() - 4;
+    // r13 = rax (output buffer)
+    text.extend_from_slice(&[0x49, 0x89, 0xc5]); // movq %rax, %r13
+    // Write opening quote: movb $0x22, 0(%r13)
+    text.extend_from_slice(&[0x41, 0xc6, 0x45, 0x00, 0x22]); // movb $0x22, 0(%r13)
+    // r12 = 1 (write index, after opening quote)
+    text.extend_from_slice(&[0x49, 0xc7, 0xc4, 0x01, 0x00, 0x00, 0x00]); // movq $1, %r12
+    // Copy string bytes from r14 to r13+r12
+    // .copy_loop:
+    let jat_cploop = text.len();
+    // cmpq %r14, %rbx → sets flags for rbx - r14, je when rbx == r14 (src reached end)
+    text.extend_from_slice(&[0x49, 0x39, 0xde]); // cmpq %rbx, %r14
+    // je .copy_done (when rbx == r14, i.e., src reached end)
+    let jat_cpdone_je = text.len();
+    text.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // je rel32
+    // movzbl (%r14), %eax
+    text.extend_from_slice(&[0x41, 0x0f, 0xb6, 0x06]); // movzbl (%r14), %eax
+    // movb %al, 0(%r13,%r12,1) — use mod=01 with disp8=0 to avoid r13-as-base bug
+    text.extend_from_slice(&[0x43, 0x88, 0x44, 0x25, 0x00]); // movb %al, 0(%r13,%r12,1)
+    // incq %r12
+    text.extend_from_slice(&[0x49, 0xff, 0xc4]); // incq %r12
+    // incq %r14
+    text.extend_from_slice(&[0x49, 0xff, 0xc6]); // incq %r14
+    // jmp .copy_loop
+    let jat_cploop_jmp = text.len();
+    let jat_cploop_back = jat_cploop as i64 - jat_cploop_jmp as i64 - 2;
+    text.extend_from_slice(&[0xeb, jat_cploop_back as u8]); // jmp rel8
+    // .copy_done:
+    let jat_cpdone = text.len();
+    let jat_cpdone_rel = (jat_cpdone as i64 - jat_cpdone_je as i64 - 6) as i32;
+    text[jat_cpdone_je+2..jat_cpdone_je+6].copy_from_slice(&jat_cpdone_rel.to_le_bytes());
+    // Write closing quote: movb $0x22, 0(%r13,%r12,1)
+    text.extend_from_slice(&[0x43, 0xc6, 0x44, 0x25, 0x00, 0x22]); // movb $0x22, 0(%r13,%r12,1)
+    // incq %r12
+    text.extend_from_slice(&[0x49, 0xff, 0xc4]); // incq %r12
+    // Null-terminate: movb $0, 0(%r13,%r12,1)
+    text.extend_from_slice(&[0x43, 0xc6, 0x44, 0x25, 0x00, 0x00]); // movb $0, 0(%r13,%r12,1)
+    // rax = r13 (return output)
+    text.extend_from_slice(&[0x4c, 0x89, 0xe8]); // movq %r13, %rax
+    // jmp .jat_done
+    let jat_done_jmp = text.len();
+    text.extend_from_slice(&[0xeb, 0x00]); // jmp rel8 (placeholder)
+    // .ret_empty:
+    let jat_empty = text.len();
+    // Patch all empty je's
+    for je_off in [jat_empty_je, jat_empty2_je, jat_empty3_je, jat_empty4_je] {
+        let rel = (jat_empty as i64 - je_off as i64 - 6) as i32;
+        text[je_off+2..je_off+6].copy_from_slice(&rel.to_le_bytes());
+    }
+    // Return empty string: allocate 1 byte, store 0
+    text.extend_from_slice(&[0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00]); // movq $1, %rdi
+    text.extend_from_slice(&[0xe8, 0, 0, 0, 0]); // call p_malloc
+    let jat_empty_malloc = text.len() - 4;
+    text.extend_from_slice(&[0xc6, 0x00, 0x00]); // movb $0, (%rax)
+    // .jat_done:
+    let jat_done = text.len();
+    let jat_done_rel = (jat_done as i64 - jat_done_jmp as i64 - 2) as i8;
+    text[jat_done_jmp+1] = jat_done_rel as u8;
+    // addq $8, %rsp
+    text.extend_from_slice(&[0x48, 0x83, 0xc4, 0x08]); // addq $8, %rsp
+    // popq %r14, %r13, %r12, %rbx
+    text.extend_from_slice(&[0x41, 0x5e]); // popq %r14
+    text.extend_from_slice(&[0x41, 0x5d]); // popq %r13
+    text.extend_from_slice(&[0x41, 0x5c]); // popq %r12
+    text.push(0x5b); // popq %rbx
+    text.push(0xc3); // ret
 
     // ═══════════════════════════════════════════════════════════════════════
     // FFI math functions — implementations of common C math functions
@@ -3545,6 +4156,13 @@ p_print_map:
 
     // p_vec_new calls p_malloc
     relocations.push((pvec_new_call_off as u64, "p_malloc".to_string(), 4));
+
+    // Database function calls
+    relocations.push((dbopen_call_off as u64, "p_malloc".to_string(), 4));
+    relocations.push((dbclose_call_off as u64, "p_free".to_string(), 4));
+    relocations.push((dbquery_malloc_call as u64, "p_malloc".to_string(), 4));
+    relocations.push((jat_malloc_call as u64, "p_malloc".to_string(), 4));
+    relocations.push((jat_empty_malloc as u64, "p_malloc".to_string(), 4));
 
     // p_print_vec LEA relocations and call
     relocations.push((pvec_open_lea as u64, ".Lbracket_open".to_string(), 2));

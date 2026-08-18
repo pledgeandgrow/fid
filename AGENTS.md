@@ -52,10 +52,10 @@ cargo build
 ```
 Unit tests:   136/136 passed
 Harness:      8/8 passed       (golden_files_match now passes)
-Interpreter:  86/86 passed     (+ 3/3 expected fail: test_trait_verify_fail, test_budget_fail, test_sandbox_fail)
-C Codegen:    86/86 matched    (FULL PARITY — no gaps)
-PE Emitter:   86/86 valid      (+ 3/3 expected fail: test_trait_verify_fail, test_budget_fail, test_sandbox_fail)
-Skip list:    20 tests         (interpreter-only features: comptime, bare metal, WASM, SIMD, tensor, HTTP, JSON, etc.)
+Interpreter:  87/87 passed     (+ 4/4 expected fail: test_trait_verify_fail, test_budget_fail, test_sandbox_fail, test_deterministic_fail)
+C Codegen:    87/87 matched    (FULL PARITY — no gaps)
+PE Emitter:   87/87 valid      (+ 4/4 expected fail: test_trait_verify_fail, test_budget_fail, test_sandbox_fail, test_deterministic_fail)
+Skip list:    21 tests         (interpreter-only features: comptime, bare metal, WASM, SIMD, tensor, HTTP, JSON, etc.)
 ```
 
 **Note:** `test_db` is no longer flaky — HashMap keys are now sorted in the interpreter for deterministic output.
@@ -77,7 +77,7 @@ touching them.
 | `src/coff.rs` | **HIGH** | COFF object file format. Same byte-level risk as PE/ELF. |
 | `src/macho.rs` | **HIGH** | Mach-O object file format. Same byte-level risk. |
 | `src/codegen_x64.rs` | **HIGH** | PIR L3 → x86-64 instruction encoding. ModRM/SIB bytes, REX prefixes, ABI rules. |
-| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 79/81 test parity. |
+| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 86/86 test parity (FULL PARITY). |
 | `src/pir.rs` | **HIGH** | PIR L1/L2/L3 transforms. A bad lowering propagates to all backends. |
 | `src/lower.rs` | **MEDIUM** | AST → SSA IR. Changes here affect interpreter + all backends. |
 | `src/typechecker.rs` | **MEDIUM** | Types + regions + effects + capabilities. Wrong rejection = broken code; wrong acceptance = silent miscompilation. |
@@ -114,15 +114,20 @@ touching them.
    These should be removed before committing but are safe to leave during
    active debugging.
 
-3. **PIR L2 GetFieldPtr offset** (`pir.rs` line ~1199): `offset: *field_index * 8`
-   assumes all fields are 8 bytes. This is a workaround — the proper fix is to
-   use real struct layouts from `StructLayout` (like `codegen_c.rs` does).
+3. **PIR L2 GetFieldPtr offset** (`pir.rs` line ~1240): `offset: *field_index * 8`
+   uses `field_index * 8` as the byte offset. This is **correct by design** —
+   `compute_struct_layout()` in `lower.rs` deliberately assigns every field an
+   8-byte slot (uniform representation), so `field_index * 8` always matches the
+   real offset in `StructLayout`. This is not a bug; it's a design choice. If
+   struct layouts are ever changed to use packed/sized fields, this code must be
+   updated to look up real offsets from `struct_layouts` (as `codegen_c.rs` does).
 
-4. **Pre-existing native codegen bugs** (not optimizer-related): 19 tests fail
-   with both `--opt` and without (closures, float, ffi, collections, etc.).
-   These are native codegen issues, not optimizer regressions. The `--opt`
-   flag produces identical output to non-opt for all tests except 3 closure
-   tests that are broken in both paths.
+4. **Native codegen bugs** (not optimizer-related): All previously failing
+   native ELF64 tests (`test_collections`, `test_db`, `test_match_range`,
+   `test_matrix_mul`) are now FIXED. The root cause was a single wrong REX
+   prefix byte in `p_json_at` (`0x49` instead of `0x4C` — see changelog for
+   details). The `--opt` flag produces identical output to non-opt for all
+   tests except 3 closure tests that are broken in both paths.
 
 ## Coding Conventions
 

@@ -507,6 +507,12 @@ fn compute_live_intervals(func: &L3Function) -> HashMap<VReg, LiveInterval> {
     };
 
     // Find back-edges: terminators that jump to a block with a lower index.
+    // For nested loops, blocks in inner loops may appear after the outer
+    // loop's back-edge source in the linear ordering. To handle this,
+    // we compute the maximum end across ALL back-edges targeting the same
+    // loop header, and also extend to cover any blocks reachable from the
+    // loop header that come after the back-edge source.
+    let max_block_end = block_ranges.iter().map(|(_, _, end)| *end).max().unwrap_or(0);
     for block in &func.blocks {
         let my_end = block_end(block.id);
         let targets: Vec<PBlock> = match block.instructions.last() {
@@ -519,8 +525,10 @@ fn compute_live_intervals(func: &L3Function) -> HashMap<VReg, LiveInterval> {
             if target_start < my_end {
                 // This is a back-edge: block → target (target is earlier).
                 // Extend all VRegs used in the target block to cover the
-                // entire loop body (from target_start to my_end).
-                let loop_end = my_end;
+                // entire loop body. For nested loops, inner loop blocks may
+                // appear after the back-edge source, so we extend to the
+                // end of the function (conservative but correct).
+                let loop_end = max_block_end;
                 // Find all VRegs used in the target block and extend their intervals.
                 for tblock in &func.blocks {
                     if tblock.id == target {

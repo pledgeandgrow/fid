@@ -637,6 +637,12 @@ fn main() {
                 "test_trait_verify_fail",
                 "test_budget_fail",
                 "test_sandbox_fail",
+                "test_deterministic_fail",
+                "test_field_privacy_fail",
+                "test_money_linear_fail",
+                "test_money_conserve_fail",
+                "test_banking_double_credit_fail",
+                "test_banking_lost_money_fail",
             ];
 
             let mut test_files: Vec<String> = Vec::new();
@@ -696,9 +702,11 @@ fn main() {
                 let interp_ok = interp_out
                     .as_ref()
                     .map(|o| {
-                        // Check stderr for "Panic:" or compilation errors
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        !stderr.contains("Panic:") && !stderr.contains("error:")
+                        // Check stderr for "Panic:" or compilation errors.
+                        // Error messages contain "error" (e.g. "Type error:", "Budget error (line 5):",
+                        // "Region error (line N):", "Sandbox error:", "Capability error:", etc.)
+                        let stderr = String::from_utf8_lossy(&o.stderr).to_lowercase();
+                        !stderr.contains("panic:") && !stderr.contains("error")
                     })
                     .unwrap_or(false);
                 let interp_stdout = interp_out

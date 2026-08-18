@@ -606,6 +606,12 @@ impl CodeGen {
                     self.gen_stmt(s);
                 }
             }
+            Stmt::Unsafe { body, .. } => {
+                // Unsafe is transparent at codegen — safety is compile-time only
+                for s in body {
+                    self.gen_stmt(s);
+                }
+            }
             Stmt::GradBlock { body, .. } => {
                 for s in body {
                     self.gen_stmt(s);

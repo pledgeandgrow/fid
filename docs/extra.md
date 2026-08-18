@@ -114,6 +114,91 @@ common need (calling C from Fides) without requiring a full transpiler.
 
 ---
 
+## Medical Device Compliance Tooling
+
+These items address gaps identified during analysis of the medical device industry's
+language limitations. They are ecosystem/tooling features, not language features —
+the language-level safety (regions, bounds, @crashfree, @medical, @audit) is already
+in the roadmap (Phases 7.5 and 9B). These tools support the *process* side of medical
+device compliance (IEC 62304, FDA cybersecurity guidance).
+
+### SBOM Generator (`fidesc sbom`) — Depends on package manager
+
+- Scan Fides import graph, generate Software Bill of Materials
+- List all dependencies: stdlib modules, FFI libraries, transitive imports
+- Include versions and content hashes
+- Required for FDA 2025 cybersecurity compliance and IEC 62304 SOUP management
+- Output format: SPDX or CycloneDX (industry-standard SBOM formats)
+
+**Why this is extra, not roadmap:** An SBOM is only meaningful with versioned,
+registered packages. Fides has no package manager yet (Phase 11A). Adding SBOM
+generation before there's a package ecosystem produces trivial output ("imports:
+core.fd — version: unknown"). When Phase 11A lands a package manager, SBOM
+generation is a natural companion feature.
+
+### CVE Checker (`fidesc audit`) — Depends on SBOM + package registry
+
+- Check dependencies against known vulnerability databases (NVD, OSV)
+- Flag CVEs in SOUP (Software of Unknown Provenance) components
+- Requires SBOM generator + package registry to be useful
+- Ongoing maintenance: CVE databases update constantly
+
+**Why this is extra, not roadmap:** Same dependency as SBOM — needs a package
+registry. Also requires ongoing infrastructure (CVE database updates). Consider
+integrating with existing services (NVD API, OSV.dev) rather than hosting a
+database. This is a CI/CD tool, not a compiler feature.
+
+### IEC 62304 Process Integration — Tooling, not compiler
+
+IEC 62304 is a *process* standard, not a coding standard. It requires:
+- **Requirements traceability:** each requirement → design → code → test
+- **Risk management:** each hazard → risk control → verification
+- **Problem resolution:** each bug → root cause → fix → regression test
+
+Fides's language-level features (@crashfree, @medical, @audit, @bounded) serve
+as *risk control measures* in the IEC 62304 risk management process. But the
+*process tooling* — linking hazards to code, tracing requirements through
+implementation, tracking problem resolution — is a separate concern.
+
+**What this tooling would do:**
+- Link Fides functions and tests to requirement IDs (via annotations or external mapping)
+- Export traceability matrices for auditor review
+- Map @crashfree/@medical/@bounded annotations to hazard IDs as risk controls
+- Integrate with issue trackers for problem resolution tracking
+
+**Why this is extra, not roadmap:** Full IEC 62304 process tooling is a product
+category on its own (companies like Polarion, Jama, Visure sell this). Building
+it into Fides is scope creep. The right approach: Fides provides the language-level
+safety guarantees, and third-party tooling or integrations handle the process-level
+requirements. Consider an export format that integrates with existing ALM tools
+rather than building a full requirements management system.
+
+### CWE Mapping Documentation (`docs/fides-cwe-mapping.md`) — Low effort, high value
+
+Map Fides safety features to CWE (Common Weakness Enumeration) categories for
+medical device auditor review:
+
+| CWE ID | CWE Name | Fides Prevention |
+|--------|----------|-----------------|
+| CWE-787 | Out-of-bounds Write | Bounds checking + region escape detection |
+| CWE-416 | Use-After-Free | Region system (compile-time lifetime tracking) |
+| CWE-476 | NULL Pointer Dereference | Option<T> (no null in the language) |
+| CWE-190 | Integer Overflow | Checked arithmetic in debug mode |
+| CWE-119 | Improper Bounds Restriction | Bounds checking (compile-time + runtime) |
+| CWE-20 | Improper Input Validation | @crashfree (reject unhandled errors) |
+| CWE-125 | Out-of-bounds Read | Bounds checking + region escape detection |
+| CWE-788 | Access of Memory Location of Wrong Size | Type system (fixed-width types) |
+| CWE-479 | Use of a Pointer Derived from an Untrusted Source | Capability system (untrusted code can't access pointers) |
+
+**Why this is extra, not roadmap:** This is documentation, not code. It doesn't
+change the compiler. It can be written now — the safety features it maps (regions,
+bounds, Option) already exist. The only risk is accuracy: if the mapping claims a
+CWE is prevented and there's an edge case, that's a false claim in a safety-critical
+context. The mapping must be verified, not just written. Low effort, high value
+for medical device adoption — auditors expect CWE coverage documentation.
+
+---
+
 ## Why These Are Separate From the Roadmap
 
 The main roadmap (`docs/roadmap.md`) tracks what's needed to make Fides a

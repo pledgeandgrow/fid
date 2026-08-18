@@ -219,6 +219,9 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<String>) 
         Stmt::Sandbox { body, .. } => {
             substitute_stmts(body, original, errs);
         }
+        Stmt::Unsafe { body, .. } => {
+            substitute_stmts(body, original, errs);
+        }
         Stmt::GradBlock { body, .. } => {
             substitute_stmts(body, original, errs);
         }

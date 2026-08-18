@@ -225,7 +225,7 @@ Phase 6:
 - `src/codegen_c.rs` — IR → C99 source
 - `fidesc ccompile <file> -o <exe>` generates `.c`, invokes `gcc`/`clang`/`cl.exe`
 - Used when targeting platforms the native backends don't yet cover
-- Note: 76/78 test parity with interpreter — secondary backend, not primary (2 real mismatches: test_asm by design, test_comptime_reflect interpreter-only)
+- Note: 86/86 test parity with interpreter — FULL PARITY, no gaps. C codegen is at full parity with the interpreter.
 
 ---
 

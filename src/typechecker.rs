@@ -23,6 +23,11 @@ pub struct TypeChecker {
     item_modules: HashMap<String, String>,
     /// Track visibility of each item ("func_name" → true if pub)
     item_visibility: HashMap<String, bool>,
+    /// Field-level visibility: (struct_name, field_name) → is_pub
+    /// Private fields are only accessible from within their defining module.
+    field_visibility: HashMap<(String, String), bool>,
+    /// The module where each struct was defined (struct_name → module_name)
+    struct_modules: HashMap<String, String>,
     /// The module being compiled (user's module)
     pub current_module: String,
     /// Type checking errors
@@ -56,6 +61,20 @@ pub struct TypeChecker {
     /// Stack of (region_name, budget_bytes, current_usage_bytes) for active
     /// region blocks with budgets. Used to track and enforce memory budgets.
     region_budgets: Vec<(String, Option<u64>, u64)>,
+    /// Map from region name to the source line where it was declared.
+    /// Used to produce better error messages (show where the region block is).
+    region_lines: HashMap<String, usize>,
+    /// Map from variable name to the source line where it was allocated.
+    /// Used to produce better error messages (show where the variable was created).
+    var_alloc_lines: HashMap<String, usize>,
+    /// Set of struct names that are @linear (values can be moved but not copied).
+    linear_structs: HashSet<String>,
+    /// Set of variable names that have been consumed (moved) in the current scope.
+    /// A linear variable can only be used once — after it's moved, it's in this set.
+    consumed_vars: HashSet<String>,
+    /// Track linear variables declared in each scope, so we can check they're consumed.
+    /// Maps scope depth → set of (var_name, line) pairs that are linear.
+    scope_linear_vars: Vec<Vec<(String, usize)>>,
 }
 
 impl TypeChecker {
@@ -75,6 +94,8 @@ impl TypeChecker {
             trait_impl_assoc_bindings: HashMap::new(),
             item_modules: HashMap::new(),
             item_visibility: HashMap::new(),
+            field_visibility: HashMap::new(),
+            struct_modules: HashMap::new(),
             current_module: String::new(),
             errors: Vec::new(),
             granted_caps: HashSet::new(),
@@ -88,6 +109,11 @@ impl TypeChecker {
             current_self_type: None,
             sandbox_depth: 0,
             region_budgets: Vec::new(),
+            region_lines: HashMap::new(),
+            var_alloc_lines: HashMap::new(),
+            linear_structs: HashSet::new(),
+            consumed_vars: HashSet::new(),
+            scope_linear_vars: vec![Vec::new()],
         }
     }
 
@@ -115,6 +141,15 @@ impl TypeChecker {
             self.structs.insert(s.name.clone(), fields);
             self.item_modules.insert(s.name.clone(), module.to_string());
             self.item_visibility.insert(s.name.clone(), s.is_pub);
+            self.struct_modules.insert(s.name.clone(), module.to_string());
+            // Register field-level visibility
+            for f in &s.fields {
+                self.field_visibility.insert((s.name.clone(), f.name.clone()), f.is_pub);
+            }
+            // Check for @linear annotation
+            if s.annotations.iter().any(|a| a.name == "linear") {
+                self.linear_structs.insert(s.name.clone());
+            }
         }
 
         for e in &program.enums {
@@ -157,6 +192,8 @@ impl TypeChecker {
                 let param_types: Vec<Type> = method.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
                 let has_self = method.params.first().map_or(false, |p| p.name == "self");
                 method_map.insert(method.name.clone(), (param_types, self.resolve_type(&method.ret_ty), has_self, method.is_pub));
+                // Track which module this method was defined in (for field privacy)
+                self.item_modules.insert(method.name.clone(), module.to_string());
             }
             // Merge methods — don't overwrite if struct already has methods from another module
             self.methods.entry(struct_name).or_insert(method_map);
@@ -171,6 +208,8 @@ impl TypeChecker {
                 let param_types: Vec<Type> = method.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
                 let has_self = method.params.first().map_or(false, |p| p.name == "self");
                 new_methods.push((method.name.clone(), param_types, self.resolve_type(&method.ret_ty), has_self, method.is_pub));
+                // Track which module this method was defined in (for field privacy)
+                self.item_modules.insert(method.name.clone(), module.to_string());
             }
             let method_map = self.methods.entry(type_name).or_insert_with(HashMap::new);
             for (name, param_types, ret_ty, has_self, is_pub) in new_methods {
@@ -332,6 +371,12 @@ impl TypeChecker {
         // Verify declared effects match inferred effects
         self.verify_declared_effects(program);
 
+        // Verify @deterministic annotation constraints
+        self.verify_deterministic(program);
+
+        // Verify @conserve annotation constraints
+        self.verify_conserve(program);
+
         // Verify allocator-as-parameter: functions with !Alloc must take an Allocator param
         self.verify_allocator_params(program);
 
@@ -399,10 +444,320 @@ impl TypeChecker {
             // Check that all inferred effects are declared (under-declaration is an error)
             for eff in inferred {
                 if !func.declared_effects.contains(eff) {
+                    // Build the correct effect annotation for the fix suggestion
+                    let mut correct_effects: Vec<String> = func.declared_effects.clone();
+                    if !correct_effects.contains(eff) {
+                        correct_effects.push(eff.clone());
+                    }
+                    let correct_annotation = if correct_effects.is_empty() {
+                        "!{}".to_string()
+                    } else if correct_effects.len() == 1 {
+                        format!("!{}", correct_effects[0])
+                    } else {
+                        format!("!{{{}}}", correct_effects.join(", "))
+                    };
                     self.errors.push(format!(
-                        "Effect error: function '{}' has inferred effect '!{}' but only declared '!{}'",
-                        func.name, eff, func.declared_effects.join(",")
+                        "Effect error: function '{}' has inferred effect '!{}' but only declared '!{}'.\n\
+                         \x20\x20\x20\x20The function performs an operation that produces the '{}' effect,\n\
+                         \x20\x20\x20\x20but the effect annotation doesn't include it.\n\
+                         \x20\x20\x20\x20Fix: change the annotation to `pf {}() {}` (add '{}' to the effect set).",
+                        func.name, eff, func.declared_effects.join(","),
+                        eff,
+                        func.name, correct_annotation, eff
                     ));
+                }
+            }
+        }
+    }
+
+    /// Verify @deterministic annotation constraints.
+    ///
+    /// A @deterministic function must:
+    ///   - Have no IO, Net, Spawn, or Diverge effects (use the effect system)
+    ///   - Contain no floating-point operations (F32/F64 literals, variables, or arithmetic)
+    ///   - Not call any function that is not itself @deterministic (transitive)
+    ///
+    /// Alloc and Read effects are allowed (allocation and pure memory reads are deterministic).
+    /// Write effect is allowed (writing to a local mutable variable is deterministic).
+    ///
+    /// The goal: same inputs → same outputs, always. No wall clock, no network, no randomness,
+    /// no floating-point nondeterminism (e.g., different FP results on different CPUs).
+    fn verify_deterministic(&mut self, program: &Program) {
+        let check_one = |func: &Func| -> Vec<String> {
+            let is_det = func.annotations.iter().any(|a| a.name == "deterministic");
+            if !is_det { return Vec::new(); }
+
+            let mut errs = Vec::new();
+
+            // Check effects — reject IO, Net, Spawn, Diverge
+            if let Some(effects) = self.func_effects.get(&func.name) {
+                for eff in effects {
+                    match eff.as_str() {
+                        "IO" | "Net" | "Spawn" | "Diverge" => {
+                            errs.push(format!(
+                                "Determinism error: function '{}' is @deterministic but has effect '!{}'.\n\
+                                 \x20\x20\x20\x20@deterministic functions must be reproducible — same inputs → same outputs.\n\
+                                 \x20\x20\x20\x20Effect '!{}' introduces nondeterminism (IO/Net depend on external state,\n\
+                                 \x20\x20\x20\x20Spawn introduces concurrency, Diverge introduces control flow uncertainty).\n\
+                                 \x20\x20\x20\x20Fix: remove the @deterministic annotation, or remove the operation that\n\
+                                 \x20\x20\x20\x20produces the '!{}' effect.",
+                                func.name, eff, eff, eff
+                            ));
+                        }
+                        _ => {} // Alloc, Read, Write are allowed
+                    }
+                }
+            }
+
+            // Check for floating-point operations — reject F32/F64
+            let mut fp_found = scan_for_floats(&func.body);
+            // Also check function parameters for float types
+            for param in &func.params {
+                if type_contains_float(&param.ty) {
+                    fp_found.push(format!("parameter '{}: {}'", param.name, param.ty));
+                }
+            }
+            // Check return type
+            if type_contains_float(&func.ret_ty) {
+                fp_found.push(format!("return type '{}'", func.ret_ty));
+            }
+            if !fp_found.is_empty() {
+                errs.push(format!(
+                    "Determinism error: function '{}' is @deterministic but uses floating-point.\n\
+                     \x20\x20\x20\x20Floating-point results vary across CPUs (different rounding, FMA contraction, etc.).\n\
+                     \x20\x20\x20\x20Found float in: {}.\n\
+                     \x20\x20\x20\x20Fix: use integer arithmetic (e.g., fixed-point with i64) instead of f32/f64,\n\
+                     \x20\x20\x20\x20or remove the @deterministic annotation.",
+                    func.name, fp_found.join(", ")
+                ));
+            }
+
+            errs
+        };
+
+        for func in &program.funcs {
+            for err in check_one(func) {
+                self.errors.push(err);
+            }
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                for err in check_one(method) {
+                    self.errors.push(err);
+                }
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                for err in check_one(method) {
+                    self.errors.push(err);
+                }
+            }
+        }
+    }
+
+    /// Verify @conserve annotation constraints.
+    ///
+    /// A @conserve function guarantees that no Money is created, destroyed, or
+    /// duplicated. This is enforced by:
+    ///   1. No IO/Net/Spawn/Diverge effects (same as @deterministic for these)
+    ///   2. No floating-point (same as @deterministic)
+    ///   3. Cannot call functions that are NOT @conserve (transitive — prevents
+    ///      calling a helper that might mint money)
+    ///   4. Cannot call Money::new or Money::from_cents (the mint functions)
+    ///   5. All linear (Money) parameters must be consumed (enforced by linear type system)
+    ///
+    /// The conservation proof is a consequence of rules 3-5 + linear types:
+    /// - Linear types prevent duplication (can't copy Money)
+    /// - No mint (rule 4) prevents creation
+    /// - Must consume (rule 5, linear) prevents destruction
+    /// - Only call @conserve funcs (rule 3) ensures transitive conservation
+    fn verify_conserve(&mut self, program: &Program) {
+        // Collect all @conserve function names
+        let mut conserve_funcs: HashSet<String> = HashSet::new();
+        for func in &program.funcs {
+            if func.annotations.iter().any(|a| a.name == "conserve") {
+                conserve_funcs.insert(func.name.clone());
+            }
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                if method.annotations.iter().any(|a| a.name == "conserve") {
+                    // Method names are qualified: TypeName::method_name
+                    conserve_funcs.insert(format!("{}::{}", imp.struct_name, method.name));
+                }
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                if method.annotations.iter().any(|a| a.name == "conserve") {
+                    conserve_funcs.insert(format!("{}::{}", ti.trait_name, method.name));
+                }
+            }
+        }
+
+        // Names of functions that create Money (the "mint" functions)
+        let mint_funcs: &[&str] = &["Money::new", "Money::from_cents", "Money::from_cents"];
+
+        let check_one = |func: &Func, conserve_funcs: &HashSet<String>| -> Vec<String> {
+            let is_conserve = func.annotations.iter().any(|a| a.name == "conserve");
+            if !is_conserve { return Vec::new(); }
+
+            let mut errs = Vec::new();
+
+            // 1. Check effects — reject IO, Net, Spawn, Diverge
+            if let Some(effects) = self.func_effects.get(&func.name) {
+                for eff in effects {
+                    match eff.as_str() {
+                        "IO" | "Net" | "Spawn" | "Diverge" => {
+                            errs.push(format!(
+                                "Conservation error: function '{}' is @conserve but has effect '!{}'.\n\
+                                 \x20\x20\x20\x20@conserve functions must not interact with external state —\n\
+                                 \x20\x20\x20\x20IO/Net can bring in external money, Spawn introduces concurrency,\n\
+                                 \x20\x20\x20\x20Diverge introduces control flow uncertainty.\n\
+                                 \x20\x20\x20\x20Fix: remove the @conserve annotation, or remove the '!{}' effect.",
+                                func.name, eff, eff
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // 2. No floating-point
+            let mut fp_found = scan_for_floats(&func.body);
+            for param in &func.params {
+                if type_contains_float(&param.ty) {
+                    fp_found.push(format!("parameter '{}: {}'", param.name, param.ty));
+                }
+            }
+            if type_contains_float(&func.ret_ty) {
+                fp_found.push(format!("return type '{}'", func.ret_ty));
+            }
+            if !fp_found.is_empty() {
+                errs.push(format!(
+                    "Conservation error: function '{}' is @conserve but uses floating-point.\n\
+                     \x20\x20\x20\x20Floating-point arithmetic is not exact — money could be lost\n\
+                     \x20\x20\x20\x20to rounding errors, violating conservation.\n\
+                     \x20\x20\x20\x20Found float in: {}.\n\
+                     \x20\x20\x20\x20Fix: use integer arithmetic (fixed-point with i64) instead.",
+                    func.name, fp_found.join(", ")
+                ));
+            }
+
+            // 3. Check that all called functions are also @conserve
+            let mut called_funcs = HashSet::new();
+            scan_stmts_for_calls(&func.body, &mut called_funcs);
+            for called in &called_funcs {
+                // Skip built-in runtime functions (p_print_*, p_malloc, etc.)
+                if called.starts_with("p_") { continue; }
+                // Skip print/println etc.
+                if matches!(called.as_str(), "print" | "println" | "print_str" | "print_nl" | "print_int" | "print_map" | "print_vec") {
+                    continue;
+                }
+                if !conserve_funcs.contains(called) {
+                    // Check if it's a known function at all
+                    if self.funcs.contains_key(called) {
+                        errs.push(format!(
+                            "Conservation error: function '{}' is @conserve but calls '{}',\n\
+                             \x20\x20\x20\x20which is not @conserve.\n\
+                             \x20\x20\x20\x20A @conserve function can only call other @conserve functions —\n\
+                             \x20\x20\x20\x20otherwise the callee could create or destroy money.\n\
+                             \x20\x20\x20\x20Fix: add @conserve to '{}', or remove the call from '{}'.",
+                            func.name, called, called, func.name
+                        ));
+                    }
+                }
+            }
+
+            // 4. Check that no mint functions are called
+            for called in &called_funcs {
+                for mint in mint_funcs {
+                    if called == mint || called.ends_with(&format!("::{}", mint)) {
+                        errs.push(format!(
+                            "Conservation error: function '{}' is @conserve but calls '{}',\n\
+                             \x20\x20\x20\x20which creates new Money. @conserve functions cannot mint money —\n\
+                             \x20\x20\x20\x20they can only move, split, and merge existing Money.\n\
+                             \x20\x20\x20\x20Fix: remove the @conserve annotation, or remove the mint call.",
+                            func.name, called
+                        ));
+                    }
+                }
+                // Also check for bare "new" or "from_cents" calls on Money
+                if called == "Money::new" || called == "Money::from_cents" {
+                    errs.push(format!(
+                        "Conservation error: function '{}' is @conserve but calls '{}',\n\
+                         \x20\x20\x20\x20which creates new Money. @conserve functions cannot mint money.\n\
+                         \x20\x20\x20\x20Fix: remove the @conserve annotation, or remove the mint call.",
+                        func.name, called
+                    ));
+                }
+            }
+
+            errs
+        };
+
+        for func in &program.funcs {
+            for err in check_one(func, &conserve_funcs) {
+                self.errors.push(err);
+            }
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                // Temporarily set the function name for the check
+                let qualified = format!("{}::{}", imp.struct_name, method.name);
+                let is_conserve = method.annotations.iter().any(|a| a.name == "conserve");
+                if !is_conserve { continue; }
+
+                // Check effects
+                if let Some(effects) = self.func_effects.get(&qualified) {
+                    for eff in effects {
+                        if matches!(eff.as_str(), "IO" | "Net" | "Spawn" | "Diverge") {
+                            self.errors.push(format!(
+                                "Conservation error: method '{}' is @conserve but has effect '!{}'.",
+                                qualified, eff
+                            ));
+                        }
+                    }
+                }
+
+                // Check for float
+                let mut fp_found = scan_for_floats(&method.body);
+                for param in &method.params {
+                    if type_contains_float(&param.ty) {
+                        fp_found.push(format!("parameter '{}: {}'", param.name, param.ty));
+                    }
+                }
+                if type_contains_float(&method.ret_ty) {
+                    fp_found.push(format!("return type '{}'", method.ret_ty));
+                }
+                if !fp_found.is_empty() {
+                    self.errors.push(format!(
+                        "Conservation error: method '{}' is @conserve but uses floating-point. Found: {}.",
+                        qualified, fp_found.join(", ")
+                    ));
+                }
+
+                // Check calls
+                let mut called_funcs = HashSet::new();
+                scan_stmts_for_calls(&method.body, &mut called_funcs);
+                for called in &called_funcs {
+                    if called.starts_with("p_") { continue; }
+                    if matches!(called.as_str(), "print" | "println" | "print_str" | "print_nl" | "print_int" | "print_map" | "print_vec") {
+                        continue;
+                    }
+                    if called == "Money::new" || called == "Money::from_cents" {
+                        self.errors.push(format!(
+                            "Conservation error: method '{}' is @conserve but calls mint function '{}'.",
+                            qualified, called
+                        ));
+                    }
+                    if self.funcs.contains_key(called) && !conserve_funcs.contains(called) {
+                        self.errors.push(format!(
+                            "Conservation error: method '{}' is @conserve but calls '{}', which is not @conserve.",
+                            qualified, called
+                        ));
+                    }
                 }
             }
         }
@@ -581,6 +936,9 @@ impl TypeChecker {
             Stmt::Sandbox { body, .. } => {
                 self.scan_stmts_for_effects(body, effects);
             }
+            Stmt::Unsafe { body, .. } => {
+                self.scan_stmts_for_effects(body, effects);
+            }
             _ => {}
         }
     }
@@ -714,8 +1072,11 @@ impl TypeChecker {
     fn check_capability(&mut self, cap: &str, context: &str) {
         if self.sandbox_depth > 0 {
             self.errors.push(format!(
-                "Sandbox error: '{}' requires '{}' capability — all capabilities are revoked inside sandbox {{ }}",
-                context, cap
+                "Sandbox error: '{}' requires '{}' capability — all capabilities are revoked \
+                 inside `sandbox {{ }}`.\n\
+                 \x20\x20\x20\x20Hint: move the '{}' call outside the sandbox block, or remove the \
+                 sandbox if the operation is safe.",
+                context, cap, context
             ));
             if let Some(fname) = &self.current_func_name {
                 self.cap_verified.remove(fname);
@@ -724,8 +1085,11 @@ impl TypeChecker {
         }
         if self.strict_caps && !self.granted_caps.contains(cap) {
             self.errors.push(format!(
-                "Capability error: '{}' requires '{}' capability (not granted to module '{}')",
-                context, cap, self.current_module
+                "Capability error: '{}' requires '{}' capability (not granted to module '{}').\n\
+                 \x20\x20\x20\x20Fix: add `use {} with {{ {} }}` at the top of the file to grant \
+                 the '{}' capability to this module.",
+                context, cap, self.current_module,
+                self.current_module, cap, cap
             ));
             // Mark the current function as not capability-verified
             if let Some(fname) = &self.current_func_name {
@@ -795,9 +1159,24 @@ impl TypeChecker {
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        self.scope_linear_vars.push(Vec::new());
     }
 
     fn pop_scope(&mut self) {
+        // Check that all linear variables in this scope were consumed
+        if let Some(linear_vars) = self.scope_linear_vars.pop() {
+            for (name, line) in &linear_vars {
+                if !self.consumed_vars.contains(name) {
+                    self.errors.push(format!(
+                        "Linear type error (line {}): variable '{}' is linear but was never consumed.\n\
+                         \x20\x20\x20\x20Linear values must be used exactly once — pass them to a function,\n\
+                         \x20\x20\x20\x20return them, or move them to another variable.\n\
+                         \x20\x20\x20\x20Fix: use '{}' somewhere, or remove the binding.",
+                        line, name, name
+                    ));
+                }
+            }
+        }
         self.scopes.pop();
     }
 
@@ -809,8 +1188,141 @@ impl TypeChecker {
         self.scopes.iter().rev().find_map(|s| s.get(name))
     }
 
+    /// Check if a type is linear (i.e., it's a @linear struct or contains one).
+    fn is_linear_type(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Named(name) => self.linear_structs.contains(name),
+            Type::Generic { name, .. } => self.linear_structs.contains(name),
+            Type::Tuple(types) => types.iter().any(|t| self.is_linear_type(t)),
+            Type::Array { elem, .. } | Type::ArrayConst { elem, .. } => self.is_linear_type(elem),
+            Type::Ref { inner, .. } => self.is_linear_type(inner),
+            _ => false,
+        }
+    }
+
+    /// Mark a variable as consumed (moved). If it's already consumed, error.
+    fn consume_var(&mut self, name: &str, line: usize) {
+        if self.consumed_vars.contains(name) {
+            self.errors.push(format!(
+                "Linear type error (line {}): variable '{}' was already consumed (moved).\n\
+                 \x20\x20\x20\x20Linear values can only be used once. After being passed to a function,\n\
+                 \x20\x20\x20\x20returned, or moved, they cannot be used again.\n\
+                 \x20\x20\x20\x20Fix: use a different variable, or restructure the code so '{}' is only used once.",
+                line, name, name
+            ));
+        } else {
+            self.consumed_vars.insert(name.to_string());
+        }
+    }
+
+    /// Check if consuming an expression would consume any linear variables.
+    /// For `Expr::Ident(name)`, this marks the variable as consumed.
+    /// For compound expressions, recurse into sub-expressions.
+    fn consume_linear_in_expr(&mut self, expr: &Expr, line: usize) {
+        match expr {
+            Expr::Ident(name) => {
+                if let Some(ty) = self.lookup(name) {
+                    if self.is_linear_type(ty) {
+                        self.consume_var(name, line);
+                    }
+                }
+            }
+            Expr::Binary { left, right, .. } => {
+                self.consume_linear_in_expr(left, line);
+                self.consume_linear_in_expr(right, line);
+            }
+            Expr::Call { args, .. } => {
+                for arg in args {
+                    self.consume_linear_in_expr(arg, line);
+                }
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                self.consume_linear_in_expr(receiver, line);
+                for arg in args {
+                    self.consume_linear_in_expr(arg, line);
+                }
+            }
+            Expr::FieldAccess { expr, .. } => {
+                // Field access on a linear type does NOT consume the struct.
+                // Reading a scalar field (e.g. m.cents, acc.id) is a borrow —
+                // it reads the value without moving the whole struct.
+                // Only passing the whole struct to a function, returning it, or
+                // assigning it consumes it.
+                // This allows reading multiple fields from a linear struct:
+                //   pv id = acc.id;       // borrow
+                //   pv bal = acc.balance; // borrow (but bal is Money — linear!)
+                // Note: if the field itself is linear (e.g. balance: Money),
+                // accessing it DOES consume that field's value. But the struct
+                // itself is not consumed — other non-linear fields can still be read.
+            }
+            Expr::StructLit { fields, spread, .. } => {
+                for (_, e) in fields {
+                    self.consume_linear_in_expr(e, line);
+                }
+                if let Some(s) = spread {
+                    self.consume_linear_in_expr(s, line);
+                }
+            }
+            Expr::ArrayLit { elements, .. } => {
+                for e in elements {
+                    self.consume_linear_in_expr(e, line);
+                }
+            }
+            Expr::TupleLit(elements) => {
+                for e in elements {
+                    self.consume_linear_in_expr(e, line);
+                }
+            }
+            Expr::Ref { expr, .. } => {
+                // Taking a reference does NOT consume — the original is still usable.
+                // (Borrowing is allowed; only moving consumes.)
+            }
+            Expr::Deref { expr } => {
+                self.consume_linear_in_expr(expr, line);
+            }
+            Expr::Cast { expr, .. } => {
+                self.consume_linear_in_expr(expr, line);
+            }
+            Expr::If { cond, then_block, else_block } => {
+                self.consume_linear_in_expr(cond, line);
+                // Don't consume in blocks — they're checked separately by check_stmt
+            }
+            Expr::Block(_) => {
+                // Block is checked by check_stmt
+            }
+            Expr::Match { expr, .. } => {
+                self.consume_linear_in_expr(expr, line);
+            }
+            Expr::Coalesce { expr, default } => {
+                self.consume_linear_in_expr(expr, line);
+                self.consume_linear_in_expr(default, line);
+            }
+            Expr::Try { expr } => {
+                self.consume_linear_in_expr(expr, line);
+            }
+            Expr::StrConcat { left, right } => {
+                self.consume_linear_in_expr(left, line);
+                self.consume_linear_in_expr(right, line);
+            }
+            Expr::Range { start, end, .. } => {
+                self.consume_linear_in_expr(start, line);
+                self.consume_linear_in_expr(end, line);
+            }
+            _ => {}
+        }
+    }
+
     fn check_func(&mut self, func: &Func) {
         self.current_func_name = Some(func.name.clone());
+        // Set current_module to the module where this function was defined,
+        // so field privacy checks work correctly (private fields are accessible
+        // from within their defining module).
+        let saved_module = self.current_module.clone();
+        if let Some(mod_name) = self.item_modules.get(&func.name) {
+            self.current_module = mod_name.clone();
+        }
+        // Reset linear tracking for this function
+        let saved_consumed = std::mem::take(&mut self.consumed_vars);
         self.push_scope();
 
         // Track type parameters for this function
@@ -833,7 +1345,11 @@ impl TypeChecker {
 
         for param in &func.params {
             let resolved_ty = self.resolve_self_type(&param.ty);
-            self.declare(&param.name, resolved_ty);
+            self.declare(&param.name, resolved_ty.clone());
+            // Linear parameters are consumed at the call site (by the caller).
+            // Inside the function, the parameter is a new binding that can be
+            // used freely (field access, passed to other functions, returned).
+            // So we do NOT track linear params in scope_linear_vars.
         }
 
         for stmt in &func.body {
@@ -843,18 +1359,26 @@ impl TypeChecker {
         self.current_type_params = saved_tp;
         self.current_type_param_bounds = saved_bounds;
         self.pop_scope();
+        self.consumed_vars = saved_consumed;
+        self.current_module = saved_module;
         self.current_func_name = None;
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let { name, ty, expr, is_mut: _, is_persist: _, line: _ } => {
+            Stmt::Let { name, ty, expr, is_mut: _, is_persist: _, line } => {
                 let expr_ty = self.check_expr(expr);
+                // Consume linear values in the initializer expression
+                self.consume_linear_in_expr(expr, *line);
                 let final_ty = if let Some(declared) = ty {
                     if !self.types_compatible(declared, &expr_ty) {
                         self.errors.push(format!(
-                            "Type error: cannot assign {} to variable of type {}",
-                            expr_ty, declared
+                            "Type error (line {}): cannot assign {} to variable '{}' of type {}.\n\
+                             \x20\x20\x20\x20Expected: {}\n\
+                             \x20\x20\x20\x20Found:    {}\n\
+                             \x20\x20\x20\x20Fix: change the type annotation or the expression.",
+                            line, expr_ty, name, declared,
+                            declared, expr_ty
                         ));
                     }
                     declared.clone()
@@ -864,40 +1388,57 @@ impl TypeChecker {
                 // Track region: if inside a region block, record the allocation region
                 if let Some(region) = self.region_stack.last() {
                     self.var_regions.insert(name.clone(), region.clone());
+                    self.var_alloc_lines.insert(name.clone(), *line);
                     // Track allocation size for budget checking
                     let size = self.type_size(&final_ty);
                     if let Some(entry) = self.region_budgets.last_mut() {
                         entry.2 += size;
                     }
                 }
+                // Track linear variables — they must be consumed before scope exit
+                if self.is_linear_type(&final_ty) {
+                    if let Some(scope) = self.scope_linear_vars.last_mut() {
+                        scope.push((name.clone(), *line));
+                    }
+                }
                 self.declare(name, final_ty);
             }
-            Stmt::Expr(expr, _) => {
+            Stmt::Expr(expr, line) => {
                 self.check_expr(expr);
+                self.consume_linear_in_expr(expr, *line);
             }
-            Stmt::Return(expr, _) => {
+            Stmt::Return(expr, line) => {
                 if let Some(e) = expr {
                     self.check_expr(e);
+                    self.consume_linear_in_expr(e, *line);
                 }
             }
             Stmt::If {
                 cond,
                 then_block,
                 else_block,
-                line: _,
+                line,
             } => {
                 let cond_ty = self.check_expr(cond);
+                self.consume_linear_in_expr(cond, *line);
                 if cond_ty != Type::Bool && cond_ty != Type::I32 && cond_ty != Type::I64 {
                     self.errors.push(format!(
                         "Type error: if condition must be bool, got {}",
                         cond_ty
                     ));
                 }
+                // For linear types: variables consumed in then-branch must also be
+                // consumed in else-branch (and vice versa). We snapshot consumed_vars
+                // before each branch and merge after.
+                let consumed_before = self.consumed_vars.clone();
                 self.push_scope();
                 for s in then_block {
                     self.check_stmt(s);
                 }
                 self.pop_scope();
+                let consumed_after_then = self.consumed_vars.clone();
+                // Restore to before-then state for else branch
+                self.consumed_vars = consumed_before.clone();
                 if let Some(else_b) = else_block {
                     self.push_scope();
                     for s in else_b {
@@ -905,9 +1446,18 @@ impl TypeChecker {
                     }
                     self.pop_scope();
                 }
+                // Merge: a variable is consumed after the if if it was consumed in BOTH branches.
+                // (If only consumed in one branch, that's a conditional move — the variable might
+                // still be live in the other path. For linear types, we require consumption in
+                // all paths, so we take the intersection.)
+                let consumed_after_else = self.consumed_vars.clone();
+                self.consumed_vars = consumed_after_then.intersection(&consumed_after_else).cloned().collect();
             }
-            Stmt::Assign { target, op: _, expr, line: _ } => {
+            Stmt::Assign { target, op: _, expr, line } => {
                 let _expr_ty = self.check_expr(expr);
+                // Consume linear values in the RHS
+                self.consume_linear_in_expr(expr, *line);
+                // Check target exists
                 if self.lookup(target).is_none() && !self.consts.contains_key(target) {
                     // Check if it was in a freed region (use-after-free)
                     if let Some(region) = self.var_regions.get(target) {
@@ -928,6 +1478,24 @@ impl TypeChecker {
                             "Type error: cannot assign to undefined variable '{}'",
                             target
                         ));
+                    }
+                } else if let Some(ty) = self.lookup(target).cloned() {
+                    // Re-assigning a linear variable: the old value must have been consumed
+                    // (otherwise we'd be silently destroying a linear value).
+                    // The new value takes ownership.
+                    if self.is_linear_type(&ty) && !self.consumed_vars.contains(target) {
+                        self.errors.push(format!(
+                            "Linear type error (line {}): cannot reassign '{}' — the old value \
+                             would be silently destroyed.\n\
+                             \x20\x20\x20\x20Linear values must be explicitly consumed (passed to a function,\n\
+                             \x20\x20\x20\x20returned, or moved) before reassignment.\n\
+                             \x20\x20\x20\x20Fix: consume '{}' first, or use a different variable name.",
+                            line, target, target
+                        ));
+                    }
+                    if self.is_linear_type(&ty) {
+                        // Mark as unconsumed again (new value takes ownership)
+                        self.consumed_vars.remove(target);
                     }
                 }
             }
@@ -1071,12 +1639,14 @@ impl TypeChecker {
                     self.check_expr(arg);
                 }
             }
-            Stmt::RegionBlock { name, budget, body, .. } => {
+            Stmt::RegionBlock { name, budget, body, line } => {
                 // Push region scope
                 self.region_stack.push(name.clone());
                 self.push_scope();
                 // Push budget tracker
                 self.region_budgets.push((name.clone(), *budget, 0));
+                // Record the source line for better error messages
+                self.region_lines.insert(name.clone(), *line);
 
                 // Snapshot variables before the region block
                 let vars_before: HashSet<String> = self
@@ -1119,10 +1689,20 @@ impl TypeChecker {
                 if let Some(outer_scope) = self.scopes.last() {
                     for var in &escaped {
                         if outer_scope.contains_key(var) {
+                            let alloc_line = self.var_alloc_lines.get(var).copied().unwrap_or(0);
+                            let region_line = self.region_lines.get(&region_name).copied().unwrap_or(0);
                             self.errors.push(format!(
-                                "Region error: variable '{}' allocated in region '{}' \
-                                 may escape the region block",
-                                var, region_name
+                                "Region error (line {}): variable '{}' escapes region '{}'.\n\
+                                 \x20\x20\x20\x20'{}' was allocated at line {} inside `region {} {{ ... }}` (line {}),\n\
+                                 \x20\x20\x20\x20but it is still accessible after the region block ended.\n\
+                                 \x20\x20\x20\x20The region frees all its data when the block exits — accessing '{}' \
+                                 after that is a use-after-free.\n\
+                                 \x20\x20\x20\x20Fix: move the use of '{}' inside the region block, or allocate '{}' \
+                                 outside the region if it needs to live longer.",
+                                region_line, var, region_name,
+                                var, alloc_line, region_name, region_line,
+                                var,
+                                var, var
                             ));
                         }
                     }
@@ -1132,9 +1712,14 @@ impl TypeChecker {
                 if let Some((_, budget_opt, usage)) = self.region_budgets.pop() {
                     if let Some(budget) = budget_opt {
                         if usage > budget {
+                            let region_line = self.region_lines.get(&region_name).copied().unwrap_or(0);
                             self.errors.push(format!(
-                                "Budget error: region '{}' used {} bytes but budget is {} bytes ({} bytes over)",
-                                region_name, usage, budget, usage - budget
+                                "Budget error (line {}): region '{}' used {} bytes but budget is {} bytes \
+                                 ({} bytes over).\n\
+                                 \x20\x20\x20\x20Hint: reduce allocations inside the region block, or increase the budget \
+                                 in `region {} with budget({}) {{ ... }}`.",
+                                region_line, region_name, usage, budget, usage - budget,
+                                region_name, budget
                             ));
                         }
                     }
@@ -1148,6 +1733,17 @@ impl TypeChecker {
                     self.check_stmt(s);
                 }
                 self.sandbox_depth -= 1;
+                self.pop_scope();
+            }
+            Stmt::Unsafe { body, .. } => {
+                // Push scope and enter unsafe mode (permits raw pointer ops etc.)
+                // For now, unsafe is transparent — it just passes through.
+                // When raw pointers are added, unsafe_depth > 0 will permit
+                // pointer dereference and other unsafe operations.
+                self.push_scope();
+                for s in body {
+                    self.check_stmt(s);
+                }
                 self.pop_scope();
             }
             Stmt::ComptimeGen { .. } => {}
@@ -1240,7 +1836,10 @@ impl TypeChecker {
                             }
                         } else {
                             self.errors.push(format!(
-                                "Type error: arithmetic requires numeric types, got {} and {}",
+                                "Type error: arithmetic requires numeric types.\n\
+                                 \x20\x20\x20\x20Left operand:  {}\n\
+                                 \x20\x20\x20\x20Right operand: {}\n\
+                                 \x20\x20\x20\x20Fix: convert one or both operands to a numeric type (i8, i16, i32, i64, u8, u16, u32, u64, f32, f64).",
                                 lt, rt
                             ));
                             Type::Never
@@ -1493,6 +2092,24 @@ impl TypeChecker {
                 if let Type::Named(name) = &obj_ty {
                     if let Some(fields) = self.structs.get(name) {
                         if let Some((_, fty)) = fields.iter().find(|(n, _)| n == field) {
+                            // Check field privacy: private fields are only accessible
+                            // from within their defining module
+                            let is_pub = self.field_visibility
+                                .get(&(name.clone(), field.clone()))
+                                .copied()
+                                .unwrap_or(true); // default to pub if not tracked
+                            if !is_pub {
+                                let struct_module = self.struct_modules.get(name).cloned().unwrap_or_default();
+                                if struct_module != self.current_module {
+                                    self.errors.push(format!(
+                                        "Privacy error: field '{}' of struct '{}' is private.\n\
+                                         \x20\x20\x20\x20It was defined in module '{}', which is not the current module '{}'.\n\
+                                         \x20\x20\x20\x20Fix: mark the field as 'pub' in its definition, or access it only\n\
+                                         \x20\x20\x20\x20from within module '{}'.",
+                                        field, name, struct_module, self.current_module, struct_module
+                                    ));
+                                }
+                            }
                             return fty.clone();
                         } else {
                             self.errors.push(format!(
@@ -1964,13 +2581,17 @@ impl TypeChecker {
                 let rt = self.check_expr(right);
                 if lt != Type::Str && lt != Type::Named("String".to_string()) {
                     self.errors.push(format!(
-                        "Type error: string concat requires str, got {}",
+                        "Type error: string concat requires str or String.\n\
+                         \x20\x20\x20\x20Left operand: {}\n\
+                         \x20\x20\x20\x20Fix: convert the left operand to str (e.g. call .to_str() or use a string literal).",
                         lt
                     ));
                 }
                 if rt != Type::Str && rt != Type::Named("String".to_string()) {
                     self.errors.push(format!(
-                        "Type error: string concat requires str, got {}",
+                        "Type error: string concat requires str or String.\n\
+                         \x20\x20\x20\x20Right operand: {}\n\
+                         \x20\x20\x20\x20Fix: convert the right operand to str (e.g. call .to_str() or use a string literal).",
                         rt
                     ));
                 }
@@ -1991,7 +2612,11 @@ impl TypeChecker {
                     }
                     _ => {
                         self.errors.push(format!(
-                            "Type error: ? operator requires Option<T> or Result<T, E>, got {}",
+                            "Type error: ? operator requires Option<T> or Result<T, E>.\n\
+                             \x20\x20\x20\x20Found: {}\n\
+                             \x20\x20\x20\x20The ? operator unwraps Option or Result — it propagates the error/None \
+                             to the caller.\n\
+                             \x20\x20\x20\x20Fix: wrap the value in Option or Result, or remove the ? operator.",
                             ty
                         ));
                         Type::Never
@@ -2007,8 +2632,11 @@ impl TypeChecker {
                     Type::Generic { name, args } if name == "Option" && args.len() == 1 => {
                         if !self.types_compatible(&args[0], &default_ty) {
                             self.errors.push(format!(
-                                "Type error: ?? default must be {}, got {}",
-                                args[0], default_ty
+                                "Type error: ?? default value type mismatch.\n\
+                                 \x20\x20\x20\x20Option inner type: {}\n\
+                                 \x20\x20\x20\x20Default value type: {}\n\
+                                 \x20\x20\x20\x20Fix: make the default value type {} to match the Option's inner type.",
+                                args[0], default_ty, args[0]
                             ));
                         }
                         args[0].clone()
@@ -2016,7 +2644,10 @@ impl TypeChecker {
                     Type::Named(name) if name == "Option" => {
                         if !self.types_compatible(&Type::I64, &default_ty) {
                             self.errors.push(format!(
-                                "Type error: ?? default must be i64, got {}",
+                                "Type error: ?? default value type mismatch.\n\
+                                 \x20\x20\x20\x20Option inner type: i64\n\
+                                 \x20\x20\x20\x20Default value type: {}\n\
+                                 \x20\x20\x20\x20Fix: make the default value type i64 to match the Option's inner type.",
                                 default_ty
                             ));
                         }
@@ -2024,7 +2655,11 @@ impl TypeChecker {
                     }
                     _ => {
                         self.errors.push(format!(
-                            "Type error: ?? operator requires Option<T>, got {}",
+                            "Type error: ?? operator requires Option<T>.\n\
+                             \x20\x20\x20\x20Found: {}\n\
+                             \x20\x20\x20\x20The ?? operator unwraps an Option, returning the inner value \
+                             or the default if None.\n\
+                             \x20\x20\x20\x20Fix: wrap the value in Option, or remove the ?? operator.",
                             ty
                         ));
                         Type::Never
@@ -2443,5 +3078,365 @@ impl TypeChecker {
 
     fn is_known_enum(&self, name: &str) -> bool {
         self.enums.contains(name)
+    }
+}
+
+// ─── @deterministic helpers ───────────────────────────────────────────────
+
+/// Check if a type contains F32 or F64 (directly or nested in generics/tuples).
+fn type_contains_float(ty: &Type) -> bool {
+    match ty {
+        Type::F32 | Type::F64 => true,
+        Type::Generic { args, .. } => args.iter().any(type_contains_float),
+        Type::Tuple(types) => types.iter().any(type_contains_float),
+        Type::Func { params, ret } => {
+            params.iter().any(type_contains_float) || type_contains_float(ret)
+        }
+        _ => false,
+    }
+}
+
+/// Scan function body statements for all function calls.
+/// Collects both direct calls (callee name) and method calls (Type::method).
+fn scan_stmts_for_calls(stmts: &[Stmt], calls: &mut HashSet<String>) {
+    for stmt in stmts {
+        scan_stmt_for_calls(stmt, calls);
+    }
+}
+
+fn scan_stmt_for_calls(stmt: &Stmt, calls: &mut HashSet<String>) {
+    match stmt {
+        Stmt::Let { expr, .. } => scan_expr_for_calls(expr, calls),
+        Stmt::Expr(e, _) => scan_expr_for_calls(e, calls),
+        Stmt::Assign { expr, .. } => scan_expr_for_calls(expr, calls),
+        Stmt::IndexAssign { index, expr, .. } => {
+            scan_expr_for_calls(index, calls);
+            scan_expr_for_calls(expr, calls);
+        }
+        Stmt::DerefAssign { ptr_expr, expr, .. } => {
+            scan_expr_for_calls(ptr_expr, calls);
+            scan_expr_for_calls(expr, calls);
+        }
+        Stmt::Return(e, _) => {
+            if let Some(e) = e { scan_expr_for_calls(e, calls); }
+        }
+        Stmt::If { cond, then_block, else_block, .. } => {
+            scan_expr_for_calls(cond, calls);
+            for s in then_block { scan_stmt_for_calls(s, calls); }
+            if let Some(eb) = else_block {
+                for s in eb { scan_stmt_for_calls(s, calls); }
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            scan_expr_for_calls(cond, calls);
+            for s in body { scan_stmt_for_calls(s, calls); }
+        }
+        Stmt::For { iterator, body, .. } => {
+            scan_expr_for_calls(iterator, calls);
+            for s in body { scan_stmt_for_calls(s, calls); }
+        }
+        Stmt::Loop { body, .. } => {
+            for s in body { scan_stmt_for_calls(s, calls); }
+        }
+        Stmt::Break(e, _) => {
+            if let Some(e) = e { scan_expr_for_calls(e, calls); }
+        }
+        Stmt::Defer(stmts, _) => {
+            for s in stmts { scan_stmt_for_calls(s, calls); }
+        }
+        Stmt::Match { expr, arms, .. } => {
+            scan_expr_for_calls(expr, calls);
+            for arm in arms {
+                for s in &arm.body { scan_stmt_for_calls(s, calls); }
+            }
+        }
+        Stmt::Handle { body, handlers, .. } => {
+            for s in body { scan_stmt_for_calls(s, calls); }
+            for h in handlers {
+                for s in &h.body { scan_stmt_for_calls(s, calls); }
+            }
+        }
+        Stmt::RegionBlock { body, .. } => {
+            for s in body { scan_stmt_for_calls(s, calls); }
+        }
+        Stmt::Sandbox { body, .. } => {
+            for s in body { scan_stmt_for_calls(s, calls); }
+        }
+        Stmt::Unsafe { body, .. } => {
+            for s in body { scan_stmt_for_calls(s, calls); }
+        }
+        Stmt::GradBlock { body, .. } => {
+            for s in body { scan_stmt_for_calls(s, calls); }
+        }
+        Stmt::Backward { loss, .. } => {
+            scan_expr_for_calls(loss, calls);
+        }
+        _ => {}
+    }
+}
+
+fn scan_expr_for_calls(expr: &Expr, calls: &mut HashSet<String>) {
+    match expr {
+        Expr::Call { callee, args } => {
+            calls.insert(callee.clone());
+            for a in args { scan_expr_for_calls(a, calls); }
+        }
+        Expr::MethodCall { receiver, method, args } => {
+            // For method calls, we need the type name to qualify.
+            // Since we don't have it here, we insert both the bare name
+            // and let the caller check. The caller will need to resolve.
+            // For now, insert the method name as "Type::method" if we can
+            // infer the type, or just the bare method name.
+            calls.insert(method.clone());
+            scan_expr_for_calls(receiver, calls);
+            for a in args { scan_expr_for_calls(a, calls); }
+        }
+        Expr::Binary { left, right, .. } => {
+            scan_expr_for_calls(left, calls);
+            scan_expr_for_calls(right, calls);
+        }
+        Expr::Unary { expr, .. } => scan_expr_for_calls(expr, calls),
+        Expr::FieldAccess { expr, .. } => scan_expr_for_calls(expr, calls),
+        Expr::OptionalFieldAccess { expr, .. } => scan_expr_for_calls(expr, calls),
+        Expr::StructLit { fields, spread, .. } => {
+            for (_, e) in fields { scan_expr_for_calls(e, calls); }
+            if let Some(s) = spread { scan_expr_for_calls(s, calls); }
+        }
+        Expr::If { cond, then_block, else_block, .. } => {
+            scan_expr_for_calls(cond, calls);
+            for s in then_block { scan_stmt_for_calls(s, calls); }
+            if let Some(eb) = else_block {
+                for s in eb { scan_stmt_for_calls(s, calls); }
+            }
+        }
+        Expr::ArrayLit { elements, .. } => {
+            for e in elements { scan_expr_for_calls(e, calls); }
+        }
+        Expr::Index { array, index } => {
+            scan_expr_for_calls(array, calls);
+            scan_expr_for_calls(index, calls);
+        }
+        Expr::TupleLit(elements) => {
+            for e in elements { scan_expr_for_calls(e, calls); }
+        }
+        Expr::Ref { expr, .. } => scan_expr_for_calls(expr, calls),
+        Expr::Deref { expr } => scan_expr_for_calls(expr, calls),
+        Expr::Cast { expr, .. } => scan_expr_for_calls(expr, calls),
+        Expr::Coalesce { expr, default } => {
+            scan_expr_for_calls(expr, calls);
+            scan_expr_for_calls(default, calls);
+        }
+        Expr::Try { expr } => scan_expr_for_calls(expr, calls),
+        Expr::StrConcat { left, right } => {
+            scan_expr_for_calls(left, calls);
+            scan_expr_for_calls(right, calls);
+        }
+        Expr::Range { start, end, .. } => {
+            scan_expr_for_calls(start, calls);
+            scan_expr_for_calls(end, calls);
+        }
+        Expr::Match { expr, arms, .. } => {
+            scan_expr_for_calls(expr, calls);
+            for arm in arms {
+                for s in &arm.body { scan_stmt_for_calls(s, calls); }
+            }
+        }
+        Expr::TryBlock { body } => {
+            for s in body { scan_stmt_for_calls(s, calls); }
+        }
+        Expr::Block(stmts) => {
+            for s in stmts { scan_stmt_for_calls(s, calls); }
+        }
+        Expr::Closure { body, .. } => {
+            for s in body { scan_stmt_for_calls(s, calls); }
+        }
+        Expr::Comptime(e) => scan_expr_for_calls(e, calls),
+        Expr::ComptimeBlock(stmts) => {
+            for s in stmts { scan_stmt_for_calls(s, calls); }
+        }
+        _ => {}
+    }
+}
+
+/// Scan function body statements for floating-point usage.
+/// Returns a list of descriptions of where floats were found.
+fn scan_for_floats(stmts: &[Stmt]) -> Vec<String> {
+    let mut found = Vec::new();
+    for stmt in stmts {
+        scan_stmt_for_floats(stmt, &mut found);
+    }
+    found
+}
+
+fn scan_stmt_for_floats(stmt: &Stmt, found: &mut Vec<String>) {
+    match stmt {
+        Stmt::Let { name, ty, expr, line, .. } => {
+            if let Some(t) = ty {
+                if type_contains_float(t) {
+                    found.push(format!("variable '{}: {}' (line {})", name, t, line));
+                }
+            }
+            scan_expr_for_floats(expr, found);
+        }
+        Stmt::Expr(e, _) => scan_expr_for_floats(e, found),
+        Stmt::Assign { expr, .. } => scan_expr_for_floats(expr, found),
+        Stmt::IndexAssign { index, expr, .. } => {
+            scan_expr_for_floats(index, found);
+            scan_expr_for_floats(expr, found);
+        }
+        Stmt::DerefAssign { expr, .. } => scan_expr_for_floats(expr, found),
+        Stmt::Return(e, _) => {
+            if let Some(e) = e { scan_expr_for_floats(e, found); }
+        }
+        Stmt::If { cond, then_block, else_block, .. } => {
+            scan_expr_for_floats(cond, found);
+            for s in then_block { scan_stmt_for_floats(s, found); }
+            if let Some(eb) = else_block {
+                for s in eb { scan_stmt_for_floats(s, found); }
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            scan_expr_for_floats(cond, found);
+            for s in body { scan_stmt_for_floats(s, found); }
+        }
+        Stmt::For { iterator, body, .. } => {
+            scan_expr_for_floats(iterator, found);
+            for s in body { scan_stmt_for_floats(s, found); }
+        }
+        Stmt::Loop { body, .. } => {
+            for s in body { scan_stmt_for_floats(s, found); }
+        }
+        Stmt::Break(e, _) => {
+            if let Some(e) = e { scan_expr_for_floats(e, found); }
+        }
+        Stmt::Defer(stmts, _) => {
+            for s in stmts { scan_stmt_for_floats(s, found); }
+        }
+        Stmt::Match { expr, arms, .. } => {
+            scan_expr_for_floats(expr, found);
+            for arm in arms {
+                for s in &arm.body { scan_stmt_for_floats(s, found); }
+            }
+        }
+        Stmt::Handle { body, handlers, .. } => {
+            for s in body { scan_stmt_for_floats(s, found); }
+            for h in handlers {
+                for s in &h.body { scan_stmt_for_floats(s, found); }
+            }
+        }
+        Stmt::RegionBlock { body, .. } => {
+            for s in body { scan_stmt_for_floats(s, found); }
+        }
+        Stmt::Sandbox { body, .. } => {
+            for s in body { scan_stmt_for_floats(s, found); }
+        }
+        Stmt::Unsafe { body, .. } => {
+            for s in body { scan_stmt_for_floats(s, found); }
+        }
+        Stmt::GradBlock { body, .. } => {
+            for s in body { scan_stmt_for_floats(s, found); }
+        }
+        Stmt::Backward { loss, .. } => {
+            scan_expr_for_floats(loss, found);
+        }
+        Stmt::Do { args, .. } => {
+            for a in args { scan_expr_for_floats(a, found); }
+        }
+        Stmt::ComptimeGen { block, .. } => {
+            for s in block { scan_stmt_for_floats(s, found); }
+        }
+        Stmt::Use { .. } | Stmt::Continue(_) => {}
+        _ => {}
+    }
+}
+
+fn scan_expr_for_floats(expr: &Expr, found: &mut Vec<String>) {
+    match expr {
+        Expr::FloatLit(_) => {
+            found.push("float literal".to_string());
+        }
+        Expr::Binary { left, right, .. } => {
+            scan_expr_for_floats(left, found);
+            scan_expr_for_floats(right, found);
+        }
+        Expr::Unary { expr, .. } => scan_expr_for_floats(expr, found),
+        Expr::Call { args, .. } => {
+            for a in args { scan_expr_for_floats(a, found); }
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            scan_expr_for_floats(receiver, found);
+            for a in args { scan_expr_for_floats(a, found); }
+        }
+        Expr::FieldAccess { expr, .. } => scan_expr_for_floats(expr, found),
+        Expr::OptionalFieldAccess { expr, .. } => scan_expr_for_floats(expr, found),
+        Expr::Index { array, index } => {
+            scan_expr_for_floats(array, found);
+            scan_expr_for_floats(index, found);
+        }
+        Expr::TupleLit(exprs) => {
+            for e in exprs { scan_expr_for_floats(e, found); }
+        }
+        Expr::Cast { expr, .. } => scan_expr_for_floats(expr, found),
+        Expr::StructLit { fields, spread, .. } => {
+            for (_, e) in fields { scan_expr_for_floats(e, found); }
+            if let Some(s) = spread { scan_expr_for_floats(s, found); }
+        }
+        Expr::If { cond, then_block, else_block } => {
+            scan_expr_for_floats(cond, found);
+            for s in then_block { scan_stmt_for_floats(s, found); }
+            if let Some(eb) = else_block {
+                for s in eb { scan_stmt_for_floats(s, found); }
+            }
+        }
+        Expr::Range { start, end, .. } => {
+            scan_expr_for_floats(start, found);
+            scan_expr_for_floats(end, found);
+        }
+        Expr::Block(stmts) => {
+            for s in stmts { scan_stmt_for_floats(s, found); }
+        }
+        Expr::ArrayLit { elements, .. } => {
+            for e in elements { scan_expr_for_floats(e, found); }
+        }
+        Expr::Match { expr, arms } => {
+            scan_expr_for_floats(expr, found);
+            for arm in arms {
+                for s in &arm.body { scan_stmt_for_floats(s, found); }
+            }
+        }
+        Expr::EnumLit { args, .. } => {
+            for a in args { scan_expr_for_floats(a, found); }
+        }
+        Expr::Ref { expr, .. } => scan_expr_for_floats(expr, found),
+        Expr::Deref { expr } => scan_expr_for_floats(expr, found),
+        Expr::StrConcat { left, right } => {
+            scan_expr_for_floats(left, found);
+            scan_expr_for_floats(right, found);
+        }
+        Expr::Try { expr } => scan_expr_for_floats(expr, found),
+        Expr::Coalesce { expr, default } => {
+            scan_expr_for_floats(expr, found);
+            scan_expr_for_floats(default, found);
+        }
+        Expr::IsCheck { expr, .. } => scan_expr_for_floats(expr, found),
+        Expr::TryBlock { body } => {
+            for s in body { scan_stmt_for_floats(s, found); }
+        }
+        Expr::Closure { body, .. } => {
+            for s in body { scan_stmt_for_floats(s, found); }
+        }
+        Expr::Comptime(e) => scan_expr_for_floats(e, found),
+        Expr::ComptimeBlock(stmts) => {
+            for s in stmts { scan_stmt_for_floats(s, found); }
+        }
+        Expr::PipeForward { left, right } => {
+            scan_expr_for_floats(left, found);
+            scan_expr_for_floats(right, found);
+        }
+        Expr::QuantCast { expr, .. } => scan_expr_for_floats(expr, found),
+        Expr::Asm { .. } => {}
+        Expr::ComptimeReflect { .. } => {}
+        Expr::FString { .. } => {}
+        _ => {}
     }
 }

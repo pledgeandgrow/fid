@@ -67,6 +67,10 @@ struct X64CodeGen {
     block_labels: HashMap<(String, PBlock), String>,
     /// Current function name (for label generation).
     current_func: String,
+    /// Trait method names for vtable dispatch.
+    trait_methods: HashMap<String, Vec<String>>,
+    /// Vtables to emit in .rodata: label → list of function names.
+    vtables: Vec<(String, Vec<String>)>,
 }
 
 impl X64CodeGen {
@@ -79,6 +83,8 @@ impl X64CodeGen {
             string_counter: 0,
             block_labels: HashMap::new(),
             current_func: String::new(),
+            trait_methods: HashMap::new(),
+            vtables: Vec::new(),
         }
     }
 
@@ -92,6 +98,9 @@ impl X64CodeGen {
     }
 
     fn gen_module(&mut self, module: &L3Module) {
+        // Copy trait method info for vtable dispatch.
+        self.trait_methods = module.trait_methods.clone();
+
         // Collect string constants.
         // Note: module.string_constants maps (content → label).
         for (content, label) in &module.string_constants {
@@ -128,6 +137,15 @@ impl X64CodeGen {
                 self.wl(&format!("{}: .quad {}", label, bits));
             } else {
                 self.wl(&format!("{}: .asciz \"{}\"", label, escape_str(val)));
+            }
+        }
+
+        // Emit vtables after string constants.
+        let vtables: Vec<(String, Vec<String>)> = self.vtables.clone();
+        for (vtable_label, methods) in &vtables {
+            self.wl(&format!("{}:", vtable_label));
+            for m in methods {
+                self.wl(&format!("    .quad {}", m));
             }
         }
 
@@ -339,12 +357,31 @@ impl X64CodeGen {
                     method,
                     args.len()
                 ));
-                // Dynamic dispatch via vtable — for the bootstrap, emit a
-                // call through the first argument (the trait object pointer).
+                // Dynamic dispatch via vtable.
+                // The trait object is a pointer to (data, vtable_ptr).
+                // vtable_ptr points to an array of function pointers.
+                // Method index is determined by the trait's method order.
+                let method_idx = self.trait_methods.get(trait_name)
+                    .and_then(|methods| methods.iter().position(|m| m == method))
+                    .unwrap_or(0);
+
+                // Load the trait object pointer into rax
+                if !args.is_empty() {
+                    self.gen_operand_to_reg(&args[0], PhysReg::Rax);
+                }
+                // rax = trait object pointer
+                // data = *(rax+0), vtable = *(rax+8)
+                self.wl("    movq (%rax), %rdi    # data → rdi (first arg)");
+                self.wl("    movq 8(%rax), %r11   # vtable → r11");
+                self.wl(&format!("    call *{}(%r11)    # call vtable[{}]",
+                    method_idx * 8, method_idx));
+                // Result is in rax — move to dst
                 if let Some(dst) = dst {
                     if let Some(loc) = self.dst_loc(*dst) {
                         if let Location::Reg(r) = loc {
-                            self.wl(&format!("    xorq %{}, %{}", r.name(), r.name()));
+                            if r != PhysReg::Rax {
+                                self.wl(&format!("    movq %rax, %{}", r.name()));
+                            }
                         }
                     }
                 }
@@ -355,10 +392,34 @@ impl X64CodeGen {
                     "    # MakeDyn: {} as dyn {} -> {}",
                     type_name, trait_name, dst
                 ));
-                // Store the concrete value's address into dst.
+                // Create a vtable for this (type, trait) pair if not already created.
+                let vtable_label = format!(".vtable_{}_{}", type_name, trait_name);
+                let vtable_exists = self.vtables.iter().any(|(l, _)| l == &vtable_label);
+                if !vtable_exists {
+                    let methods = self.trait_methods.get(trait_name).cloned().unwrap_or_default();
+                    let func_names: Vec<String> = methods.iter()
+                        .map(|m| format!("{}_{}", type_name, m))
+                        .collect();
+                    self.vtables.push((vtable_label.clone(), func_names));
+                }
+
+                // Allocate a 16-byte block: (data, vtable_ptr)
+                // Use p_malloc to allocate.
+                self.wl("    movq $16, %rdi");
+                self.wl("    call p_malloc");
+                // rax = pointer to the new block
+                // Store the data value at offset 0
+                self.gen_operand_to_reg(value, PhysReg::Rcx);
+                self.wl("    movq %rcx, (%rax)");
+                // Store the vtable pointer at offset 8
+                self.wl(&format!("    leaq {}(%rip), %rcx", vtable_label));
+                self.wl("    movq %rcx, 8(%rax)");
+                // rax = trait object pointer → move to dst
                 if let Some(loc) = self.dst_loc(*dst) {
                     if let Location::Reg(r) = loc {
-                        self.gen_operand_to_reg(value, r);
+                        if r != PhysReg::Rax {
+                            self.wl(&format!("    movq %rax, %{}", r.name()));
+                        }
                     }
                 }
             }

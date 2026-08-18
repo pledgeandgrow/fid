@@ -6,16 +6,21 @@
 
 ## How This Document Relates to the Existing Roadmap
 
-The existing `docs/roadmap.md` defines Phases 1-8:
+The existing `docs/roadmap.md` defines Phases 1-12:
 - **Phases 1-5**: Claimed COMPLETE (Foundation, Safety, Power, Performance, Platform)
-- **Phase 6**: Self-Hosting (planned — rewrite compiler in Fides)
-- **Phase 7**: Ecosystem (planned — tooling, stdlib, migration, docs)
-- **Phase 8**: World Class (planned — formal verification, optimization parity, adoption)
+- **Phase 6**: AI/ML (COMPLETE)
+- **Phase 7**: Ergonomics (IN PROGRESS)
+- **Phase 7.5**: Tier 1 Safety (NOT STARTED)
+- **Phase 8**: Game Development (NOT STARTED)
+- **Phase 9**: Industry Domains (NOT STARTED)
+- **Phase 10**: Self-Hosting (planned — rewrite compiler in Fides)
+- **Phase 11**: Ecosystem (planned — tooling, stdlib, migration, docs)
+- **Phase 12**: World Class (planned — formal verification, optimization parity, adoption)
 
 **This document defines Phases L1-L10** (Limitation phases) that:
 1. Close the gap between what the roadmap **claims** and what **actually works** (per `features.md` and `README.md`)
 2. Address every major pain point identified across Rust, Go, C++, Python, JS/TS, Java, Zig, Swift, Kotlin, and other languages
-3. Complement (not replace) Phases 6-8 — cross-references are noted where overlap exists
+3. Complement (not replace) Phases 10-12 — cross-references are noted where overlap exists
 
 ---
 
@@ -27,12 +32,12 @@ This section has been **verified by reading source code, running tests, and exec
 
 | Test Group | README Claims | Actual (Verified) | Discrepancy |
 |------------|--------------|-------------------|-------------|
-| Unit tests (`cargo test --bin fidesc`) | 85/85 | **136/136** | README undercounts by 48 |
-| Harness tests (`cargo test --test harness`) | 8/8 | **8/8** (golden_files_match now passes) | README overcounts by 1 |
-| Interpreter (`run`) | 52/52 active | **78/78 + 1/1 expected-fail** (1 expected failure: test_trait_verify_fail) | README undercounts by 26 |
-| PE Emitter (`emit`) | 52/52 valid | **78/78 + 1/1 expected-fail** valid (1 expected failure: test_trait_verify_fail) | README undercounts by 26 |
-| C Codegen (`ccompile`) | 38+ matched | **86/86** matched (FULL PARITY — no gaps. test_asm emits asm as comments, test_comptime_reflect uses Type::Str for array elements.) | C codegen now at full parity with interpreter |
-| Compiler warnings | ~120 | **190** | README undercounts by 70 |
+| Unit tests (`cargo test --bin fidesc`) | 137/137 | **137/137** | README now accurate |
+| Harness tests (`cargo test --test harness`) | 8/8 | **8/8** (golden_files_match passes) | README now accurate |
+| Interpreter (`run`) | 86/86 + 3/3 expected-fail | **86/86 + 3/3 expected-fail** (test_trait_verify_fail, test_budget_fail, test_sandbox_fail) | README now accurate |
+| PE Emitter (`emit`) | 86/86 + 3/3 expected-fail | **86/86 + 3/3 expected-fail** valid | README now accurate |
+| C Codegen (`ccompile`) | 86/86 + 3/3 expected-fail | **86/86** matched (FULL PARITY — no gaps. test_asm emits asm as comments, test_comptime_reflect uses Type::Str for array elements.) | README now accurate |
+| Compiler warnings | 215 | **215** | README now accurate |
 
 ### Feature Verification Matrix (Code-Verified)
 
@@ -78,8 +83,8 @@ These tests pass in the interpreter but FAIL in C codegen (expected failures):
 
 **ACTUALLY WORKS (code-verified):**
 - Lexer, parser, typechecker, IR lowering ✅
-- Interpreter (`run`) — 78/78 + 1/1 expected-fail tests ✅
-- PE emitter (`emit`) — 78/78 + 1/1 expected-fail valid PE files ✅ (Windows-only, can't run on Linux)
+- Interpreter (`run`) — 86/86 + 3/3 expected-fail tests ✅
+- PE emitter (`emit`) — 86/86 + 3/3 expected-fail valid PE files ✅ (Windows-only, can't run on Linux)
 - ELF64 executables (`build --target x86-64`) — working Linux executables, zero external tools ✅
 - C codegen (`ccompile`) — 86/86 match ✅ (FULL PARITY — no gaps. All tests pass in both interpreter and C codegen.)
 - PIR (L1/L2/L3) — `pir` command ✅
@@ -110,18 +115,18 @@ These tests pass in the interpreter but FAIL in C codegen (expected failures):
 - **async/await/spawn** — tokenized but not parsed into AST ❌
 - **L2 optimizer (`--opt`)** — works for simple programs but exposes pre-existing register allocator bug on complex programs (constants clobbered by intervening instructions) — this is the sole reason `--opt` is not enabled by default ⚠️
 
-**README/FEATURES IS WRONG ABOUT (should be corrected):**
-1. "C FFI: Not parsed" → **WRONG, FFI works**
-2. "Const generics: Parsed, pending" → **WRONG, const generics work**
-3. "GATs: Not parsed" → **WRONG, GATs work**
-4. "52/52 interpreter tests" → **WRONG, it's 78/78 + 1/1 expected-fail**
-5. "52/52 PE emitter" → **WRONG, it's 78/78 + 1/1 expected-fail**
-6. "38+ C codegen matched" → **WRONG, it's 76/78**
-7. "async/spawn: Parsed" → **MISLEADING, tokenized but not parsed**
-8. "Optimizer not in default pipeline" → **PARTIALLY WRONG, wired into `build --opt`**
-9. "Register allocator not in default pipeline" → **PARTIALLY WRONG, wired into `build`/`codegen`**
-10. "~120 compiler warnings" → **WRONG, it's 190**
-11. "ELF64 WIP" → **WRONG, ELF64 executables work on Linux**
+**README/FEATURES — HISTORICAL INACCURACIES (now corrected in README.md as of Aug 2026):**
+1. "C FFI: Not parsed" → **WAS WRONG, FFI works** — README now says "Yes (stubs)"
+2. "Const generics: Parsed, pending" → **WAS WRONG, const generics work** — README now says "Yes"
+3. "GATs: Not parsed" → **WAS WRONG, GATs work** — README now says "Yes"
+4. "52/52 interpreter tests" → **WAS WRONG, it's 86/86 + 3/3 expected-fail** — README now correct
+5. "52/52 PE emitter" → **WAS WRONG, it's 86/86 + 3/3 expected-fail** — README now correct
+6. "38+ C codegen matched" → **WAS WRONG, it's 86/86 (FULL PARITY)** — README now correct
+7. "async/spawn: Parsed" → **MISLEADING, tokenized but not parsed** — README now says "Parsed"
+8. "Optimizer not in default pipeline" → **WAS PARTIALLY WRONG, wired into `build --opt`** — README now documents this
+9. "Register allocator not in default pipeline" → **WAS PARTIALLY WRONG, wired into `build`/`codegen`** — README now documents this
+10. "~120 compiler warnings" → **WAS WRONG, it's 215** — README now says 215
+11. "ELF64 WIP" → **WAS WRONG, ELF64 executables work on Linux** — README now says "works"
 
 **ROADMAP CLAIMS THAT ARE WRONG (should be corrected):**
 1. Phase 5D "HTTP/JSON/DB work" → **PARTIAL, interpreter only — C codegen fails**
@@ -1219,7 +1224,7 @@ Every phase explicitly notes what is already built and what is new work. This ta
 |-----------------------------------|------------------------|
 | Lexer, parser, typechecker | Wire optimizer into `emit` command (L1A) |
 | IR, PIR (L1/L2/L3) | Wire register allocator into `emit` command (L1B) |
-| PE emitter (78/78 + 1/1 expected-fail valid) | Wire peephole into `emit` command |
+| PE emitter (86/86 + 3/3 expected-fail valid) | Wire peephole into `emit` command |
 | C codegen (86/86 match — FULL PARITY) | ✅ DONE — all C codegen gaps closed |
 | PIR optimizer (9 passes) — wired into `build --opt` | Wire optimizer into `emit` and `build` default (L1A) |
 | Peephole optimizer (9 passes) — always on in `build` command | Wire peephole into `emit` command |
@@ -1248,7 +1253,7 @@ Every phase explicitly notes what is already built and what is new work. This ta
 | `parse-header` (verified working) | Extend header parsing (L6B) |
 | Sourcemap command | LSP integration (L7) |
 | REPL command | REPL improvements (L7G) |
-| Test harness (file-based, 78/78 + 1/1 expected-fail pass) | `#[test]` attribute execution (L4J) |
+| Test harness (file-based, 86/86 + 3/3 expected-fail pass) | `#[test]` attribute execution (L4J) |
 | Hot reload (`watch` — native JIT + function diff) | Wire optimizer into `emit` command |
 | **NOT working — GPU codegen exists but no CLI command** | Wire GPU backend (L1J) |
 | **NOT working — `#[derive]` parsed but no logic** | Implement derive via comptime (L8J) |
@@ -1276,8 +1281,8 @@ When choosing what to work on next, ask:
 
 | Existing Phase | Status | Relationship to L-Phases |
 |---------------|--------|-------------------------|
-| Phase 6 — Self-Hosting | Planned | Independent. Can start after L1 (need all features working first). L-phases don't block it. |
-| Phase 7 — Ecosystem | Planned | **L4, L5, L7, L10 are detailed implementations of Phase 7.** Consolidate: replace Phase 7 with L4+L5+L7+L10. |
-| Phase 8 — World Class | Planned | **L9 and L10 overlap with Phase 8.** L9 implements Phase 8B (Optimization Parity). L10 implements Phase 8D (Industry Adoption). Phase 8A (Formal Verification) and 8C (Real-World Validation) remain separate. |
+| Phase 10 — Self-Hosting | Planned | Independent. Can start after L1 (need all features working first). L-phases don't block it. |
+| Phase 11 — Ecosystem | Planned | **L4, L5, L7, L10 are detailed implementations of Phase 11.** Consolidate: replace Phase 11 with L4+L5+L7+L10. |
+| Phase 12 — World Class | Planned | **L9 and L10 overlap with Phase 12.** L9 implements Phase 12B (Optimization Parity). L10 implements Phase 12D (Industry Adoption). Phase 12A (Formal Verification) and 12C (Real-World Validation) remain separate. |
 
-**Recommendation:** Merge Phase 7 into L4+L5+L7+L10. Merge Phase 8B into L9, Phase 8D into L10. Keep Phase 6 (Self-Hosting) and Phase 8A/8C (Formal Verification, Real-World Validation) as separate post-L-phase work.
+**Recommendation:** Merge Phase 11 into L4+L5+L7+L10. Merge Phase 12B into L9, Phase 12D into L10. Keep Phase 10 (Self-Hosting) and Phase 12A/12C (Formal Verification, Real-World Validation) as separate post-L-phase work.

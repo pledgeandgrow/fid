@@ -46,6 +46,9 @@ fn is_expect_fail_test(name: &str) -> bool {
     matches!(
         name,
         "test_trait_verify_fail.fd" | "test_budget_fail.fd" | "test_sandbox_fail.fd"
+        | "test_deterministic_fail.fd" | "test_field_privacy_fail.fd"
+        | "test_money_linear_fail.fd" | "test_money_conserve_fail.fd"
+        | "test_banking_double_credit_fail.fd" | "test_banking_lost_money_fail.fd"
     )
 }
 

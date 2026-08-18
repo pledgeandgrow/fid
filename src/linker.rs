@@ -226,6 +226,8 @@ struct Linker {
     // String constants (rodata)
     rodata: Vec<u8>,
     rodata_symbols: HashMap<String, u64>,
+    // Relocations for rodata (e.g., vtable function pointers)
+    rodata_relocations: Vec<(u64, String, u8)>,
 }
 
 impl Linker {
@@ -236,6 +238,7 @@ impl Linker {
             relocations: Vec::new(),
             rodata: Vec::new(),
             rodata_symbols: HashMap::new(),
+            rodata_relocations: Vec::new(),
         }
     }
 
@@ -423,6 +426,39 @@ impl Linker {
             }
         }
 
+        // Process rodata relocations (e.g., vtable function pointers)
+        if let Some(ri) = rela_rodata_idx {
+            let rela = &sections[ri];
+            let num_relas = rela.size / 24;
+            for j in 0..num_relas {
+                let off = rela.offset + j * 24;
+                if off + 24 > obj.len() {
+                    break;
+                }
+                let r_offset = u64::from_le_bytes(obj[off..off + 8].try_into().unwrap());
+                let r_info = u64::from_le_bytes(obj[off + 8..off + 16].try_into().unwrap());
+                let r_addend = i64::from_le_bytes(obj[off + 16..off + 24].try_into().unwrap());
+                let r_sym = (r_info >> 32) as u32;
+                let r_type = (r_info & 0xffffffff) as u8;
+                let sym_name = if let (Some(si), Some(sti)) = (symtab_idx, strtab_idx) {
+                    let symtab = &sections[si];
+                    let strtab = &sections[sti];
+                    let sym_off = symtab.offset + r_sym as usize * 24;
+                    if sym_off + 4 <= obj.len() {
+                        let st_name = u32::from_le_bytes(obj[sym_off..sym_off + 4].try_into().unwrap()) as usize;
+                        get_string(obj, strtab.offset, st_name)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                let adjusted_offset = rodata_base + r_offset;
+                let _ = r_addend;
+                self.rodata_relocations.push((adjusted_offset, sym_name, r_type));
+            }
+        }
+
         Ok(())
     }
 
@@ -514,6 +550,39 @@ impl Linker {
             .get(entry)
             .map(|(off, _)| *off)
             .unwrap_or(0);
+
+        // Apply rodata relocations (vtable function pointers, etc.)
+        let text_size = self.text_bytes.len() as u64;
+        let base_addr: u64 = 0x400000;
+        let text_file_offset = 64 + 56; // ELF header + 1 phdr
+        let text_vaddr = base_addr + text_file_offset as u64;
+        let rodata_vaddr = text_vaddr + text_size;
+
+        for (offset, sym_name, r_type) in &self.rodata_relocations {
+            let sym_offset_opt = if let Some((sym_offset, is_defined)) = self.symbols.get(sym_name) {
+                if !is_defined { continue; }
+                Some(*sym_offset)
+            } else if let Some(rod_off) = self.rodata_symbols.get(sym_name) {
+                Some(text_size + rod_off)
+            } else {
+                continue;
+            };
+
+            if let Some(sym_offset) = sym_offset_opt {
+                let patch_offset = *offset as usize;
+                match r_type {
+                    1 => {
+                        // R_X86_64_64: absolute 64-bit
+                        if patch_offset + 8 <= self.rodata.len() {
+                            let abs_addr = text_vaddr + sym_offset;
+                            self.rodata[patch_offset..patch_offset + 8]
+                                .copy_from_slice(&abs_addr.to_le_bytes());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         // Build ELF64 executable
         self.build_executable(entry_offset)

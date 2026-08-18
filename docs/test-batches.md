@@ -18,12 +18,13 @@ this writing).  Tests are sorted alphabetically by filename.
 | Pass criterion | No panic on stderr; exit code may be non-zero |
 | What it exercises | AST → IR → tree-walking interpreter |
 | Run by | `fidesc test` (built-in) |
-| Current score | 78/78 + 1/1 expected-fail |
+| Current score | 86/86 + 3/3 expected-fail |
 
 The interpreter is the reference implementation.  A test "passes" if the
 interpreter does not panic or emit a compilation error.  Non-zero exit codes
-(e.g. `ret 42`) are **not** failures.  `test_trait_verify_fail` is an expected-fail
-test (correctly rejected at compile time).
+(e.g. `ret 42`) are **not** failures.  `test_trait_verify_fail`,
+`test_budget_fail`, and `test_sandbox_fail` are expected-fail
+tests (correctly rejected at compile time).
 
 ### Batch 2 — C Codegen (`fidesc ccompile`)
 
@@ -33,11 +34,12 @@ test (correctly rejected at compile time).
 | Pass criterion | stdout matches interpreter stdout exactly |
 | What it exercises | AST → IR → C source transpilation → external gcc |
 | Run by | `fidesc test` (built-in) |
-| Current score | 76/78 + 1/1 expected-fail |
+| Current score | 86/86 + 3/3 expected-fail (FULL PARITY) |
 
 C codegen transpiles the Fides IR to C source code and compiles it with the
 system C compiler (gcc/clang).  A test "passes" only if the executable's
-stdout exactly matches the interpreter's stdout.
+stdout exactly matches the interpreter's stdout. C codegen is now at FULL
+PARITY with the interpreter — no gaps.
 
 ### Batch 3 — PE Emitter (`fidesc emit`)
 
@@ -47,7 +49,7 @@ stdout exactly matches the interpreter's stdout.
 | Pass criterion | Emission succeeds and output file exists |
 | What it exercises | AST → IR → PE bytecode emitter |
 | Run by | `fidesc test` (built-in) |
-| Current score | 78/78 + 1/1 expected-fail |
+| Current score | 86/86 + 3/3 expected-fail |
 
 The PE (Portable Executable) emitter produces a standalone native x86-64
 executable. A test "passes" if emission succeeds and the output file is
@@ -62,7 +64,7 @@ cannot run on Linux without Wine).
 | Pass criterion | stdout matches interpreter stdout exactly |
 | What it exercises | PIR → L2 → L3 → x86-64 asm → ELF object → linker → native exe |
 | Run by | Custom script (`/tmp/test_native.sh`) — **not** `fidesc test` |
-| Current score | 41/79 |
+| Current score | 63/66 (3 mismatches: test_collections, test_db, test_matrix_mul — pre-existing native codegen bugs) |
 
 The native x86-64 backend is a self-contained toolchain: it generates x86-64
 assembly, encodes it into an ELF relocatable object, and links it with a
@@ -126,10 +128,10 @@ echo "=== Results: $pass pass, $fail fail ==="
 
 | Batch | Backend | Score | Notes |
 |-------|---------|-------|-------|
-| 1 | Interpreter | 81/81 + 3/3 expected-fail | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` correctly fail (expected) |
-| 2 | C Codegen | 78/81 + 3/3 expected-fail | 3 real mismatches: asm (by design), comptime_reflect (interpreter-only). test_db flaky (HashMap ordering). |
-| 3 | PE Emitter | 81/81 + 3/3 expected-fail | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` correctly fail (expected) |
-| 4 | Native x86-64 | 58/74 | In progress — see issue categories above |
+| 1 | Interpreter | 86/86 + 3/3 expected-fail | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` correctly fail (expected) |
+| 2 | C Codegen | 86/86 + 3/3 expected-fail | FULL PARITY — no gaps. test_db no longer flaky (HashMap keys sorted). |
+| 3 | PE Emitter | 86/86 + 3/3 expected-fail | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` correctly fail (expected) |
+| 4 | Native x86-64 | 63/66 | 3 mismatches: test_collections, test_db, test_matrix_mul — pre-existing native codegen bugs |
 
 ## Important Notes
 

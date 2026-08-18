@@ -1,0 +1,62 @@
+// Test: Banking operations with linear Money + @conserve
+//
+// This test demonstrates a mini banking system where:
+//   - Accounts hold linear Money (can't be duplicated)
+//   - All operations are @conserve (compiler proves no money created/destroyed)
+//   - Interest is @deterministic (no float, same inputs → same outputs)
+//
+// In COBOL, these operations have NO compile-time conservation check.
+// A bug in COBOL's ADD/MOVE can silently create or destroy money.
+// In Fides, the compiler rejects it before the program runs.
+
+use banking;
+use money;
+
+pf main() -> i64 {
+    // Open account #1 with $1000.00 (100000 cents)
+    pv acc1 = Account_open(1, 100000);
+
+    // Deposit $500.00 into account #1
+    // Account and deposit Money are both consumed, new account produced.
+    pv deposit = Money_new(50000);
+    pv acc1_after_deposit = Account_deposit(acc1, deposit);
+
+    // Withdraw $200.00 from account #1
+    // acc1_after_deposit is consumed, new account produced.
+    pv acc1_after_withdraw = Account_withdraw(acc1_after_deposit, 20000);
+    pv withdrawn_cash = Account_withdraw_cash(20000);
+
+    // Check withdrawn cash: should be $200.00 (20000 cents)
+    pv cash_cents = Money_to_cents(withdrawn_cash);
+    print("Withdrawn cash: ");
+    print(cash_cents);
+    print("\n");
+
+    // Accrue 5% interest (500 basis points) on remaining balance
+    // interest = 130000 * 500 / 10000 = 6500 cents ($65.00)
+    // new balance = 130000 + 6500 = 136500
+    pv acc1_with_interest = Account_accrue_interest(acc1_after_withdraw, 500);
+
+    // Now check final balance (consumes the account)
+    pv final_balance = Account_balance_cents(acc1_with_interest);
+    print("Final balance (after deposit, withdraw, 5% interest): ");
+    print(final_balance);
+    print("\n");
+
+    // Open account #2 with $0.00 and deposit $200.00
+    pv acc2 = Account_open(2, 0);
+    pv acc2_after_deposit = Account_deposit(acc2, Money_new(20000));
+    pv balance2 = Account_balance_cents(acc2_after_deposit);
+    print("Account #2 balance: ");
+    print(balance2);
+    print("\n");
+
+    // Summary:
+    // Account #1: started $1000, deposited $500, withdrew $200, +5% interest
+    //   = (1000 + 500 - 200) * 1.05 = 1300 * 1.05 = $1365.00 (136500 cents)
+    // Account #2: started $0, deposited $200 = $200.00 (20000 cents)
+    // Cash out: $200.00 (20000 cents)
+    print("OK\n");
+
+    ret 0;
+}

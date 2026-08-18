@@ -102,16 +102,30 @@ impl Parser {
                     program.attributes.push(attr);
                 }
                 TokenKind::At => {
-                    // @annotation(s) followed by a function
+                    // @annotation(s) followed by a function or struct
                     let mut annotations = Vec::new();
                     while self.check(&TokenKind::At) {
                         annotations.push(self.parse_at_annotation()?);
                     }
-                    // The annotated item must be a function (for now)
-                    let mut func = self.parse_func()?;
-                    func.is_pub = is_pub;
-                    func.annotations = annotations;
-                    program.funcs.push(func);
+                    // The annotated item may have its own 'pub' prefix
+                    let item_is_pub = if self.check(&TokenKind::Pub) {
+                        self.advance();
+                        true
+                    } else {
+                        is_pub
+                    };
+                    // Check if the annotated item is a struct or function
+                    if self.check(&TokenKind::Struct) {
+                        let mut sd = self.parse_struct()?;
+                        sd.is_pub = item_is_pub;
+                        sd.annotations = annotations;
+                        program.structs.push(sd);
+                    } else {
+                        let mut func = self.parse_func()?;
+                        func.is_pub = item_is_pub;
+                        func.annotations = annotations;
+                        program.funcs.push(func);
+                    }
                 }
                 TokenKind::Layer => {
                     let mut l = self.parse_layer()?;
@@ -307,16 +321,22 @@ impl Parser {
 
         let mut fields = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            let is_pub = if self.check(&TokenKind::Pub) {
+                self.advance();
+                true
+            } else {
+                false
+            };
             let fname = self.expect_ident()?;
             self.expect(TokenKind::Colon, ":")?;
             let fty = self.parse_type()?;
-            fields.push(Param { name: fname, ty: fty });
+            fields.push(Param { name: fname, ty: fty, is_pub });
             self.match_tok(TokenKind::Comma);
         }
         self.expect(TokenKind::RBrace, "}")?;
 
         self.struct_names.push(name.clone());
-        Ok(StructDef { name, fields, is_pub: false })
+        Ok(StructDef { name, fields, is_pub: false, annotations: Vec::new() })
     }
 
     /// Parse a layer declaration:
@@ -358,7 +378,7 @@ impl Parser {
                 let fname = self.expect_ident()?;
                 self.expect(TokenKind::Colon, ":")?;
                 let fty = self.parse_type()?;
-                fields.push(Param { name: fname, ty: fty });
+                fields.push(Param { name: fname, ty: fty, is_pub: false });
                 self.match_tok(TokenKind::Comma);
             }
         }
@@ -455,12 +475,12 @@ impl Parser {
                             let pname = self.expect_ident()?;
                             self.expect(TokenKind::Colon, ":")?;
                             let pty = self.parse_type()?;
-                            params.push(Param { name: pname, ty: pty });
+                            params.push(Param { name: pname, ty: pty, is_pub: false });
                         } else {
                             // Anonymous: just a type
                             let pty = self.parse_type()?;
                             let pname = format!("_{}", params.len());
-                            params.push(Param { name: pname, ty: pty });
+                            params.push(Param { name: pname, ty: pty, is_pub: false });
                         }
                         if !self.match_tok(TokenKind::Comma) {
                             break;
@@ -673,11 +693,11 @@ impl Parser {
                     let pname = self.expect_ident()?;
                     if pname == "self" && !self.check(&TokenKind::Colon) {
                         // Bare 'self' — type will be filled in by the impl
-                        params.push(Param { name: "self".to_string(), ty: Type::Named("Self".to_string()) });
+                        params.push(Param { name: "self".to_string(), ty: Type::Named("Self".to_string()), is_pub: false });
                     } else {
                         self.expect(TokenKind::Colon, ":")?;
                         let ty = self.parse_type()?;
-                        params.push(Param { name: pname, ty });
+                        params.push(Param { name: pname, ty, is_pub: false });
                     }
                     if !self.match_tok(TokenKind::Comma) {
                         break;
@@ -874,11 +894,11 @@ impl Parser {
             let name = self.expect_ident()?;
             // Handle bare 'self' (without type annotation) in impl methods
             if name == "self" && !self.check(&TokenKind::Colon) {
-                params.push(Param { name: "self".to_string(), ty: Type::Named("Self".to_string()) });
+                params.push(Param { name: "self".to_string(), ty: Type::Named("Self".to_string()), is_pub: false });
             } else {
                 self.expect(TokenKind::Colon, ":")?;
                 let ty = self.parse_type()?;
-                params.push(Param { name, ty });
+                params.push(Param { name, ty, is_pub: false });
             }
 
             if !self.match_tok(TokenKind::Comma) {
@@ -1141,6 +1161,7 @@ impl Parser {
             TokenKind::Do => self.parse_do_stmt(),
             TokenKind::Region => self.parse_region_block(),
             TokenKind::Sandbox => self.parse_sandbox_block(),
+            TokenKind::Unsafe => self.parse_unsafe_block(),
             TokenKind::Grad => self.parse_grad_block(),
             TokenKind::Backward => {
                 let line = self.peek_token().line;
@@ -1465,6 +1486,30 @@ impl Parser {
         let line = self.peek_token().line;
         self.expect(TokenKind::Pv, "pv")?;
         let is_mut = self.match_tok(TokenKind::Mut);
+
+        // Check for tuple destructuring: `pv (a, b) = expr`
+        if self.check(&TokenKind::LParen) && !is_mut {
+            // Peek ahead to see if this is a tuple pattern (ident, ident, ...)
+            // vs a tuple type annotation (which would be `pv name: (i64, i64) = ...`)
+            // Since we already consumed `pv` and there's no name yet, `(` means destructuring.
+            self.advance(); // consume (
+            let mut names = Vec::new();
+            if !self.check(&TokenKind::RParen) {
+                loop {
+                    let name = self.expect_ident()?;
+                    names.push(name);
+                    if !self.match_tok(TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(TokenKind::RParen, ")")?;
+            self.expect(TokenKind::Eq, "=")?;
+            let expr = self.parse_expr()?;
+            self.match_tok(TokenKind::Semicolon);
+            return Ok(Stmt::LetTuple { names, expr, line });
+        }
+
         let name = self.expect_ident()?;
 
         let ty = if self.match_tok(TokenKind::Colon) {
@@ -2501,6 +2546,19 @@ impl Parser {
         let body = self.parse_block()?;
         self.expect(TokenKind::RBrace, "}")?;
         Ok(Stmt::Sandbox { body, line })
+    }
+
+    /// Parse `unsafe { body }` — unsafe block.
+    /// Permits operations that would otherwise be rejected by the safety
+    /// type system (e.g. raw pointer dereference). The body is otherwise
+    /// a normal block — unsafe is compile-time only.
+    fn parse_unsafe_block(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect(TokenKind::Unsafe, "unsafe")?;
+        self.expect(TokenKind::LBrace, "{")?;
+        let body = self.parse_block()?;
+        self.expect(TokenKind::RBrace, "}")?;
+        Ok(Stmt::Unsafe { body, line })
     }
 
     /// Parse a grad block: `grad(var) { body; backward(loss); }`

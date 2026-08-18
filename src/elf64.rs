@@ -37,6 +37,60 @@ pub fn emit_object_file(_module: &L3Module, asm: &str) -> Result<Vec<u8>, String
     emitter.build_elf()
 }
 
+/// Dump symbol table from an ELF object file (for debugging).
+pub fn dump_symbols(elf: &[u8]) {
+    if elf.len() < 64 {
+        return;
+    }
+    let e_shoff = u64::from_le_bytes(elf[40..48].try_into().unwrap()) as usize;
+    let e_shentsize = u16::from_le_bytes(elf[58..60].try_into().unwrap()) as usize;
+    let e_shnum = u16::from_le_bytes(elf[60..62].try_into().unwrap()) as usize;
+    let e_shstrndx = u16::from_le_bytes(elf[62..64].try_into().unwrap()) as usize;
+
+    if e_shoff == 0 || e_shnum == 0 {
+        return;
+    }
+
+    // Get section header string table
+    let shstr_off = e_shoff + e_shstrndx * e_shentsize;
+    let shstr_offset = u64::from_le_bytes(elf[shstr_off + 24..shstr_off + 32].try_into().unwrap()) as usize;
+
+    for i in 0..e_shnum {
+        let sh_off = e_shoff + i * e_shentsize;
+        let sh_name = u32::from_le_bytes(elf[sh_off..sh_off+4].try_into().unwrap()) as usize;
+        let sh_type = u32::from_le_bytes(elf[sh_off+4..sh_off+8].try_into().unwrap());
+        let sh_offset = u64::from_le_bytes(elf[sh_off+24..sh_off+32].try_into().unwrap()) as usize;
+        let sh_size = u64::from_le_bytes(elf[sh_off+32..sh_off+40].try_into().unwrap()) as usize;
+        let sh_link = u32::from_le_bytes(elf[sh_off+40..sh_off+44].try_into().unwrap()) as usize;
+
+        let name_start = shstr_offset + sh_name;
+        let name_end = elf[name_start..].iter().position(|&b| b == 0).unwrap_or(0);
+        let name = String::from_utf8_lossy(&elf[name_start..name_start + name_end]);
+
+        if name == ".symtab" {
+            let strtab_off = e_shoff + sh_link * e_shentsize;
+            let strtab_offset = u64::from_le_bytes(elf[strtab_off+24..strtab_off+32].try_into().unwrap()) as usize;
+
+            let num_syms = sh_size / 24;
+            for j in 0..num_syms {
+                let sym_off = sh_offset + j * 24;
+                if sym_off + 24 > elf.len() { break; }
+                let st_name = u32::from_le_bytes(elf[sym_off..sym_off+4].try_into().unwrap()) as usize;
+                let st_value = u64::from_le_bytes(elf[sym_off+8..sym_off+16].try_into().unwrap());
+                let st_info = elf[sym_off + 4];
+
+                let name_start = strtab_offset + st_name;
+                let name_end = elf[name_start..].iter().position(|&b| b == 0).unwrap_or(0);
+                let sym_name = String::from_utf8_lossy(&elf[name_start..name_start + name_end]);
+
+                if !sym_name.is_empty() && (st_info & 0xf) == 2 {
+                    let _ = (sym_name, st_value, st_info); // debugging only
+                }
+            }
+        }
+    }
+}
+
 /// Emit an ELF64 object file for a specific target architecture.
 /// Supports x86-64 (full assembler), arm64 and riscv (raw binary with correct ELF header).
 pub fn emit_object_file_for_target(_module: &L3Module, asm: &str, target: &str) -> Result<Vec<u8>, String> {
@@ -143,6 +197,8 @@ struct ElfEmitter {
     rodata: Vec<u8>,
     /// Symbols for rodata (string labels).
     rodata_symbols: Vec<(String, u32)>,
+    /// Relocations for rodata (e.g., vtable function pointers).
+    rodata_relocations: Vec<Relocation>,
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +235,7 @@ impl ElfEmitter {
             shstrtab_offsets: HashMap::new(),
             rodata: Vec::new(),
             rodata_symbols: Vec::new(),
+            rodata_relocations: Vec::new(),
         };
         // Pre-populate section name string table.
         e.add_shstrtab("");
@@ -188,6 +245,7 @@ impl ElfEmitter {
         e.add_shstrtab(".strtab");
         e.add_shstrtab(".shstrtab");
         e.add_shstrtab(".rela.text");
+        e.add_shstrtab(".rela.rodata");
         e
     }
 
@@ -275,6 +333,22 @@ impl ElfEmitter {
             if trimmed.ends_with(':') {
                 let label = trimmed.trim_end_matches(':').to_string();
 
+                // Labels in .rodata (vtables, etc.)
+                if label.starts_with(".vtable_") || label.starts_with(".str_") || label.starts_with(".flt_") {
+                    // Close previous function if any.
+                    if let (Some(start), Some(name)) = (current_func_start, &current_func_name) {
+                        let size = self.text.len() as u64 - start;
+                        if let Some(&idx) = self.symbol_index.get(name) {
+                            self.symbols[idx].size = size;
+                        }
+                    }
+                    current_func_start = None;
+                    current_func_name = None;
+                    // Record as a rodata symbol.
+                    self.rodata_symbols.push((label, self.rodata.len() as u32));
+                    continue;
+                }
+
                 // Check if this is a function label (not starting with .L).
                 if !label.starts_with(".L") {
                     // Close previous function if any.
@@ -342,14 +416,56 @@ impl ElfEmitter {
                 }
                 self.rodata_symbols.push((label, offset));
             } else if rest.starts_with(".quad") {
-                // A .quad value (e.g., float constant bits).
+                // A .quad value: either a numeric constant (float bits) or
+                // a symbol reference (vtable function pointer).
                 let parts: Vec<&str> = rest.split_whitespace().collect();
                 if parts.len() >= 2 {
+                    let offset = self.rodata.len() as u32;
                     if let Ok(bits) = parts[1].parse::<u64>() {
-                        let offset = self.rodata.len() as u32;
+                        // Numeric constant (e.g., float bits)
                         self.rodata.extend_from_slice(&bits.to_le_bytes());
                         self.rodata_symbols.push((label, offset));
+                    } else {
+                        // Symbol reference (e.g., vtable entry)
+                        // Emit 8 placeholder bytes and add a relocation.
+                        let sym_idx = if parts[1].starts_with(".L") {
+                            self.get_or_add_local_label(parts[1])
+                        } else {
+                            self.get_or_add_undef_symbol(parts[1])
+                        };
+                        self.rodata.extend_from_slice(&[0; 8]);
+                        self.rodata_symbols.push((label, offset));
+                        self.rodata_relocations.push(Relocation {
+                            offset: offset as u64,
+                            symbol: sym_idx,
+                            rtype: R_X86_64_64,
+                            addend: 0,
+                        });
                     }
+                }
+            }
+        }
+        // Handle .quad without a label (e.g., vtable entries after a label line).
+        if line.starts_with(".quad") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Ok(bits) = parts[1].parse::<u64>() {
+                    self.rodata.extend_from_slice(&bits.to_le_bytes());
+                } else {
+                    // Symbol reference
+                    let sym_idx = if parts[1].starts_with(".L") {
+                        self.get_or_add_local_label(parts[1])
+                    } else {
+                        self.get_or_add_undef_symbol(parts[1])
+                    };
+                    let offset = self.rodata.len() as u64;
+                    self.rodata.extend_from_slice(&[0; 8]);
+                    self.rodata_relocations.push(Relocation {
+                        offset,
+                        symbol: sym_idx,
+                        rtype: R_X86_64_64,
+                        addend: 0,
+                    });
                 }
             }
         }
@@ -449,6 +565,7 @@ impl ElfEmitter {
             "andl" => self.encode_alu(0x20, operands, 4)?,
             "orl"  => self.encode_alu(0x08, operands, 4)?,
             "xorl" => self.encode_alu(0x30, operands, 4)?,
+            "andb" => self.encode_alu_8bit(0x20, operands)?,
 
             "imulq" => {
                 // imulq %src, %dst → REX.W 0F AF /r
@@ -533,6 +650,21 @@ impl ElfEmitter {
                     let rex = 0x48 | ((a >> 3) << 2) | ((b >> 3) << 0);
                     let modrm = 0xc0 | ((a & 7) << 3) | (b & 7);
                     self.text.extend_from_slice(&[rex, 0x85, modrm]);
+                }
+            }
+
+            // ─── testl ───
+            "testl" => {
+                if operands.len() == 2 {
+                    let a = parse_reg(operands[0])?;
+                    let b = parse_reg(operands[1])?;
+                    // No REX.W for 32-bit. REX only if extended registers.
+                    if a >= 8 || b >= 8 {
+                        let rex = ((a >> 3) << 2) | ((b >> 3) << 0);
+                        self.text.push(rex);
+                    }
+                    let modrm = 0xc0 | ((a & 7) << 3) | (b & 7);
+                    self.text.extend_from_slice(&[0x85, modrm]);
                 }
             }
 
@@ -899,6 +1031,39 @@ impl ElfEmitter {
         Ok(())
     }
 
+    /// Encode 8-bit ALU ops (andb, orb, xorb) using byte registers (al, cl, etc.)
+    /// Encoding: [REX] opcode_base+1 ModRM  (reg, r/m)
+    fn encode_alu_8bit(&mut self, opcode_base: u8, operands: Vec<&str>) -> Result<(), String> {
+        if operands.len() != 2 {
+            return Ok(());
+        }
+        let src = operands[0];
+        let dst = operands[1];
+
+        // Parse 8-bit register names to register indices
+        let byte_regs = ["al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil",
+                         "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"];
+        let parse_byte_reg = |s: &str| -> Option<usize> {
+            byte_regs.iter().position(|r| *r == s.trim_start_matches('%'))
+        };
+
+        // reg, reg
+        if let (Some(s), Some(d)) = (parse_byte_reg(src), parse_byte_reg(dst)) {
+            // REX needed if either reg is >= 4 (spl/bpl/sil/dil) or >= 8
+            let need_rex = s >= 4 || d >= 4;
+            if need_rex {
+                let rex = (((s >> 3) << 2) | ((d >> 3) << 0)) as u8;
+                // For spl/bpl/sil/dil (indices 4-7), REX is required even without R/R extensions
+                // A plain REX (0x40) is sufficient
+                self.text.push(rex);
+            }
+            self.text.push(opcode_base | 0x01);
+            let modrm = (0xc0 | ((s & 7) << 3) | (d & 7)) as u8;
+            self.text.push(modrm);
+        }
+        Ok(())
+    }
+
     fn encode_alu(&mut self, opcode_base: u8, operands: Vec<&str>, size: usize) -> Result<(), String> {
         if operands.len() != 2 {
             return Ok(());
@@ -1056,6 +1221,24 @@ impl ElfEmitter {
             return Ok(());
         }
 
+        // cmpq %reg, mem  (register source, memory destination)
+        // Uses opcode 0x39 (CMP r/m, r): computes mem - reg
+        // Try SIB first: cmpq %reg, (%base,%index,scale)
+        if let (Some(s), Some((off, base, index, sc))) = (try_parse_reg(src), try_parse_mem_indexed(dst)) {
+            let rex = rex_w(size) | ((s >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+            self.text.push(rex);
+            self.text.push(0x39);
+            self.encode_modrm_sib(s, off, base, index, sc);
+            return Ok(());
+        }
+        if let (Some(s), Some((off, base))) = (try_parse_reg(src), try_parse_mem(dst)) {
+            let rex = rex_w(size) | ((s >> 3) << 2) | ((base >> 3) << 0);
+            self.text.push(rex);
+            self.text.push(0x39);
+            self.encode_modrm_mem(s, off, base);
+            return Ok(());
+        }
+
         self.text.push(0x90);
         Ok(())
     }
@@ -1178,6 +1361,22 @@ impl ElfEmitter {
                 self.text.push(0xff);
                 let modrm = 0xd0 | (r & 7); // mod=11, reg=2 (CALL), rm=reg
                 self.text.push(modrm);
+                return Ok(());
+            }
+        }
+
+        // call *offset(%reg) → indirect call through memory
+        // Encoding: [REX] FF /2  (ModRM mod=01, reg=2, rm=reg) disp8
+        if target.starts_with("*") {
+            let mem_str = &target[1..]; // e.g. "0(%r11)" or "8(%r11)"
+            if let Some((off, base)) = try_parse_mem(mem_str) {
+                let rex = if base >= 8 { 0x41 } else { 0x00 };
+                if rex != 0 { self.text.push(rex); }
+                self.text.push(0xff);
+                // mod=01 (disp8), reg=2 (CALL), rm=base&7
+                let modrm = 0x50 | (2 << 3) | (base & 7); // 0x50 = mod=01
+                self.text.push(modrm);
+                self.text.push(off as u8); // disp8
                 return Ok(());
             }
         }
@@ -1498,6 +1697,7 @@ impl ElfEmitter {
 
         let has_rodata = !self.rodata.is_empty();
         let has_relocations = !self.relocations.is_empty();
+        let has_rodata_relocations = !self.rodata_relocations.is_empty();
 
         // Compute section indices.
         let text_idx: u16 = 1;
@@ -1507,6 +1707,10 @@ impl ElfEmitter {
         let shstrtab_idx: u16 = if has_rodata { 5 } else { 4 };
         let rela_text_idx: u16 = if has_relocations {
             if has_rodata { 6 } else { 5 }
+        } else { 0 };
+        let rela_rodata_idx: u16 = if has_rodata_relocations {
+            let base = if has_rodata { 6 } else { 5 };
+            if has_relocations { base + 1 } else { base }
         } else { 0 };
 
         // Pre-populate the strtab with all symbol names so we know its size
@@ -1652,6 +1856,17 @@ impl ElfEmitter {
             }.to_bytes());
         }
 
+        // Build relocation section (.rela.rodata).
+        let mut rela_rodata: Vec<u8> = Vec::new();
+        for reloc in &self.rodata_relocations {
+            let new_sym = new_index.get(&reloc.symbol).copied().unwrap_or(0);
+            rela_rodata.extend_from_slice(&Elf64_Rela {
+                r_offset: reloc.offset,
+                r_info: ((new_sym as u64) << 32) | (reloc.rtype as u64),
+                r_addend: reloc.addend,
+            }.to_bytes());
+        }
+
         // ─── Layout ────────────────────────────────────────────────────────
         // ELF header: 64 bytes
         // Then sections in order:
@@ -1701,10 +1916,23 @@ impl ElfEmitter {
             (0, 0)
         };
 
+        // .rela.rodata
+        let (rela_rodata_offset, rela_rodata_size) = if has_rodata_relocations {
+            let off = offset;
+            let sz = rela_rodata.len() as u64;
+            offset += sz;
+            (off, sz)
+        } else {
+            (0, 0)
+        };
+
         // Section header table
         let shdr_offset = offset;
-        let num_sections = if has_relocations { 7 } else { 6 };
-        let shdr_size = (num_sections as u64) * 64;
+        let num_sections = 6u64
+            + if has_rodata { 1 } else { 0 }
+            + if has_relocations { 1 } else { 0 }
+            + if has_rodata_relocations { 1 } else { 0 };
+        let shdr_size = num_sections * 64;
         offset += shdr_size;
 
         // ─── Build the output ──────────────────────────────────────────────
@@ -1741,6 +1969,9 @@ impl ElfEmitter {
         out.extend_from_slice(&self.shstrtab);
         if has_relocations {
             out.extend_from_slice(&rela_text);
+        }
+        if has_rodata_relocations {
+            out.extend_from_slice(&rela_rodata);
         }
 
         // Section header table
@@ -1832,6 +2063,22 @@ impl ElfEmitter {
                 sh_info: text_idx as u32,   // link to .text
                 sh_addralign: 8,
                 sh_entsize: 24, // sizeof(Elf64_Rela)
+            }.to_bytes());
+        }
+
+        // Section: .rela.rodata (if present)
+        if has_rodata_relocations {
+            out.extend_from_slice(&Elf64_Shdr {
+                sh_name: self.shstrtab_offsets[".rela.rodata"],
+                sh_type: SHT_RELA,
+                sh_flags: SHF_INFO_LINK,
+                sh_addr: 0,
+                sh_offset: rela_rodata_offset,
+                sh_size: rela_rodata_size,
+                sh_link: symtab_idx as u32, // link to .symtab
+                sh_info: rodata_idx as u32, // link to .rodata
+                sh_addralign: 8,
+                sh_entsize: 24,
             }.to_bytes());
         }
 

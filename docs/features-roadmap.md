@@ -87,7 +87,7 @@ F11: is type check            ✅ IMPLEMENTED — runtime enum variant check + c
 F12: @memo annotation         🔲 PLANNED — purity verified by effect system, cleaner than wrapper
 F20: on event handlers        🔲 PLANNED — unified dispatch needs compiler event routing
 F19: state machines           🔲 PLANNED — compile-time transition verification
-F15: @no_grad scope           🔲 PLANNED — compiler skips tracing, cleaner than flag
+F15: @no_grad scope           ❌ CUT — unnecessary in compile-time opt-in autograd (grad blocks are opt-in, nothing to disable)
 F33: @audit                   🔲 PLANNED — auto-instrument every function entry/exit (medical)
 F34: @emit                    🔲 PLANNED — blockchain event emission with signature verification
 F35: @watchdog                🔲 PLANNED — compiler auto-inserts watchdog kicks (robotics+IoT)
@@ -100,7 +100,7 @@ F39: @conserve                🔲 PLANNED — compiler proves money in = money 
 F40: txn { } blocks           🔲 PLANNED — language-level atomic transactions, auto-rollback on failure
 F41: linear money             🔲 PLANNED — money can be moved, not copied (prevents duplication at type level)
 F42: Account<State> types     🔲 PLANNED — state-encoded account types (Active/Frozen/Closed can't be mixed)
-F43: LogicalTime type         🔲 PLANNED — timezone-free, clock-free time for deterministic date math
+F43: LogicalTime type         🔲 PLANNED — stdlib struct (not compiler feature), implemented with @deterministic in 7.5A
 
 ─── Cross-Industry Safety — Tier A: Compiler-Verified Domain Guarantees ──
 F44: @safety-critical         🔲 PLANNED — compiler enforces DO-178C/ISO 26262 coding rules (aerospace+automotive)
@@ -220,9 +220,9 @@ C15: @validated               ❌ CUT — already covered by given/ensure contra
 |------|-------|------|-----|
 | **Implemented** | 9 | F1–F11 (F6,7,8,9,11 done) | Done and tested in all backends |
 | **Syntax Tier A** | 39 | F10, F13, F14, F16–F18, F21, F23–F60 | Compiler must understand — can't be a library |
-| **Syntax Tier B** | 13 | F6, F7, F9, F11, F12, F15, F19, F20, F33–F37 | Ergonomic — could be library but worth the keyword |
+| **Syntax Tier B** | 12 | F6, F7, F9, F11, F12, F19, F20, F33–F37 | Ergonomic — could be library but worth the keyword |
 | **Stdlib** | 29 | S1–S29 | Built in Fides, users can read/modify/replace |
-| **Cut** | 15 | C1–C15 | Redundant — existing features already cover |
+| **Cut** | 16 | C1–C15, F15 | Redundant — existing features already cover |
 
 **Total: 9 implemented + 52 syntax + 29 stdlib + 15 cut = 105 features analyzed.**
 
@@ -238,7 +238,7 @@ C15: @validated               ❌ CUT — already covered by given/ensure contra
 | **Robotics/IoT** | F27, F29–F31, F35, F37 (@realtime, @interrupt, @firmware, @lowpower, @watchdog, @ota) | S12–S16 (HAL, sensor, motor, protocol, OTA) | WCET proof + no-malloc proof + bare metal |
 | **Blockchain** | F28, F34, F50 (@gas, @emit, @signed) | S9–S11 (crypto, consensus, storage) | Compile-time gas verification + determinism |
 | **Gaming** | F16–F18, F21, F23–F25 (vec/mat, swizzle, ECS, @shader, @simd, @crashfree, @pool) | S1–S8 (tilemap, sprite, etc.) | Crash-free game loop proof |
-| **AI/ML** | F14, F15 (@differentiable, @no_grad) | — (tensor.fd exists) | Compile-time shape checking + autograd |
+| **AI/ML** | F14 (@differentiable) | — (tensor.fd exists) | Compile-time shape checking + autograd |
 | **Serverless/Edge** | F32, F36 (@serverless, @handler) | S17–S18 (HTTP server, WASM API) | Tiny binaries + capability-stripped |
 
 **The key insight:** all these industries share the same 3 core safety systems (capabilities, effects, regions). Each industry's annotations are different *configurations* of those systems. Building @deterministic for medical makes @gas for blockchain cheaper. Building @bounded for aerospace makes @crashfree for gaming stronger. This is Fides's moat — one language, every industry, compile-time proofs.
@@ -1103,46 +1103,22 @@ pf train(model: Model, data: Tensor, labels: Tensor) {
 
 ---
 
-## F15 — `@no_grad` — Disable Gradient Tracking for Inference
+## F15 — `@no_grad` — CUT
 
-**Classification:** SYNTAX — Tier B (could be `no_grad(|| { ... })` flag, but annotation is cleaner; compiler skips tracing)
-**Status:** 🔲 Planned
-**Impact:** Medium — AI/ML performance
-**Novelty:** PyTorch has `with torch.no_grad():` context manager. Fides uses a scoped annotation that the compiler enforces — no gradient tape is built inside, saving memory and compute.
+**Status:** ❌ Cut — unnecessary in Fides's autograd model
 
-### Concept
+### Why cut
 
-`@no_grad` scopes disable autograd tracing. Inside a `@no_grad` block, no
-computation graph is built — operations execute directly without recording
-gradients. This is critical for inference and evaluation where gradients
-are not needed.
+PyTorch needs `torch.no_grad()` because gradient tracking is **on by default** —
+you need a way to disable it for inference. Fides's autograd is **opt-in** —
+gradient tracking only happens inside `grad(var) { }` blocks. Outside those
+blocks, there's nothing to disable. The default IS no-grad.
 
-```p
-@no_grad {
-    // No gradient tape built — faster, less memory
-    pv predictions = model.forward(test_data);
-    pv accuracy = compute_accuracy(predictions, test_labels);
-    println(f"Accuracy: {accuracy}");
-}
-
-// Equivalent to PyTorch's:
-// with torch.no_grad():
-//     predictions = model.forward(test_data)
-```
-
-### Implementation
-
-1. Recognize `@no_grad` as a scoped annotation in `parser.rs`
-2. In `typechecker.rs`: mark the scope as `no_grad`
-3. In `autograd.rs`: skip tracing for operations inside `@no_grad` scopes
-4. In `lower.rs`: emit direct computation without tape recording instructions
-
-### Use Cases
-
-- Model inference (no gradients needed)
-- Model evaluation / validation loops
-- Deployment to production (inference-only)
-- Memory-constrained environments (gradient tape uses significant memory)
+The only theoretical use case (skip tracing for a helper function inside a
+`grad` block) is handled by the **@differentiable opt-in model**: only
+`@differentiable` functions get traced. If you don't mark a function as
+`@differentiable`, it won't be traced. `@no_grad` is the inverse of an opt-in
+that already exists.
 
 ---
 
@@ -2272,7 +2248,7 @@ system UpdateLOD {
 | F9: `??` coalescing | ✅ Implemented | Medium | Used constantly, ugly as function |
 | F11: `is` type check | ✅ Implemented | Medium | Type narrowing in branches |
 | F12: `@memo` | 🔲 Planned | High | Purity verified by effect system |
-| F15: `@no_grad` | 🔲 Planned | Medium | Compiler skips tracing |
+| F15: `@no_grad` | ❌ Cut | — | Unnecessary — autograd is opt-in |
 | F19: `state` machines | 🔲 Planned | High | Compile-time transition verification |
 | F20: `on` events | 🔲 Planned | High | Unified dispatch + parameter verification |
 
@@ -2312,7 +2288,7 @@ system UpdateLOD {
 > autograd graphs, generate GPU shaders, vectorize loops, prove crash-free
 > code, and manage object pools — things no library can do.
 >
-> With Tier B syntax (F6, F7, F9, F11, F12, F15, F19, F20), Fides makes common
+> With Tier B syntax (F6, F7, F9, F11, F12, F19, F20), Fides makes common
 > patterns beautiful: guard clauses, spread operators, optional chaining,
 > contracts, memoization, state machines, and event handlers — all native
 > syntax, not library boilerplate.
@@ -2327,15 +2303,15 @@ system UpdateLOD {
 
 ### Implementation Details
 
-All 5 original features (F1–F5) were implemented in a single session. Test results:
-- Interpreter: 81/81 passed (was 78/78, +3 new feature tests)
-- PE Emitter: 81/81 valid (was 78/78, +3 new feature tests)
-- C Codegen: 78/81 matched (was 76/78, improved)
-- Expected-fail: 3/3 (was 1/1, +2 new expected-fail tests)
+All 5 original features (F1–F5) were implemented in a single session. Test results (current state):
+- Interpreter: 86/86 passed (+ 3/3 expected-fail)
+- PE Emitter: 86/86 valid (+ 3/3 expected-fail)
+- C Codegen: 86/86 matched — FULL PARITY (+ 3/3 expected-fail)
+- Total: 89 .fd test files (86 normal + 3 expected-fail)
 
 **Planned for implementation:**
 - 39 Tier A syntax features (F10, F13, F14, F16–F18, F21, F23–F60) — need compiler support
-- 8 Tier B syntax features (F12, F15, F19, F20) — ergonomic keywords
+- 7 Tier B syntax features (F12, F19, F20) — ergonomic keywords
 - 29 stdlib modules (S1–S29) — Fides code, no compiler changes
 - 15 features cut (C1–C15) — redundant, build with existing features
 
@@ -2613,10 +2589,11 @@ even call `transfer` on a `Closed` account.
 
 ## F43 — `LogicalTime` — Clock-Free Time Type
 
-**Status:** 🔲 Planned
+**Status:** 🔲 Planned (stdlib deliverable, not a compiler feature)
 **Impact:** High — prevents timezone, clock-skew, and leap-year bugs
 **Novelty:** Most languages use system clock; Fides provides logical time as explicit parameter
 **Industries:** Banking, finance, medical, aerospace, blockchain
+**Implementation note:** This is a **stdlib struct** (`struct LogicalTime { nanos: i64 }` with methods), not a compiler feature. It will be implemented in Phase 7.5A alongside `@deterministic`, since its only purpose is to give `@deterministic` functions a way to do time math without wall clock access. A type alias (`ty LogicalTime = i64`) would provide zero safety — the compiler must treat it as a distinct type.
 
 ### Concept
 

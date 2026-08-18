@@ -361,6 +361,7 @@ fn subst_expr(expr: &Expr, subst: &Subst, renames: &HashMap<String, String>, met
             params: params.iter().map(|p| Param {
                 name: p.name.clone(),
                 ty: subst_type(&p.ty, subst),
+                is_pub: p.is_pub,
             }).collect(),
             body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
             ret_ty: ret_ty.as_ref().map(|t| subst_type(t, subst)),
@@ -524,6 +525,10 @@ fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, met
         },
         Stmt::ComptimeGen { .. } => stmt.clone(),
         Stmt::Sandbox { body, line } => Stmt::Sandbox {
+            body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
+            line: *line,
+        },
+        Stmt::Unsafe { body, line } => Stmt::Unsafe {
             body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
             line: *line,
         },
@@ -937,7 +942,7 @@ fn instantiate(gen_func: &Func, subst: &Subst, mangled_name: &str, ctx: &mut Mon
     let new_params: Vec<Param> = gen_func.params.iter().map(|p| {
         let substituted = subst_type(&p.ty, subst);
         let resolved = resolve_assoc_types(&substituted, subst, &ctx.trait_assoc_bindings);
-        Param { name: p.name.clone(), ty: resolved }
+        Param { name: p.name.clone(), ty: resolved, is_pub: p.is_pub }
     }).collect();
 
     let substituted_ret = subst_type(&gen_func.ret_ty, subst);
@@ -1087,6 +1092,11 @@ fn collect_generic_calls_stmt_with_hint(
         }
         Stmt::ComptimeGen { .. } => {}
         Stmt::Sandbox { body, .. } => {
+            for s in body {
+                collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
+            }
+        }
+        Stmt::Unsafe { body, .. } => {
             for s in body {
                 collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
             }

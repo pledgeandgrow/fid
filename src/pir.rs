@@ -270,6 +270,7 @@ pub struct L1Module {
     pub struct_layouts: HashMap<String, crate::ir::StructLayout>,
     pub string_constants: HashMap<String, String>,
     pub extern_functions: HashMap<String, (Vec<PirType>, PirType)>,
+    pub trait_methods: HashMap<String, Vec<String>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -410,6 +411,7 @@ pub struct L2Module {
     pub struct_layouts: HashMap<String, crate::ir::StructLayout>,
     pub string_constants: HashMap<String, String>,
     pub extern_functions: HashMap<String, (Vec<PirType>, PirType)>,
+    pub trait_methods: HashMap<String, Vec<String>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -568,6 +570,9 @@ pub struct L3Module {
     pub struct_layouts: HashMap<String, crate::ir::StructLayout>,
     pub string_constants: HashMap<String, String>,
     pub extern_functions: HashMap<String, (Vec<PirType>, PirType)>,
+    /// Trait method names in order, for vtable dispatch.
+    /// Maps trait name → list of method names.
+    pub trait_methods: HashMap<String, Vec<String>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -586,6 +591,7 @@ pub fn lower_ir_to_l1(module: &IrModule) -> L1Module {
     l1.struct_layouts = module.struct_layouts.clone();
     l1.string_constants = module.string_constants.clone();
     l1.extern_functions = module.extern_functions.clone();
+    l1.trait_methods = module.trait_methods.clone();
 
     // Process functions in a deterministic order (sorted by name) for stable
     // printer output.
@@ -825,6 +831,7 @@ pub fn lower_l1_to_l2(l1: &L1Module) -> L2Module {
     l2.struct_layouts = l1.struct_layouts.clone();
     l2.string_constants = l1.string_constants.clone();
     l2.extern_functions = l1.extern_functions.clone();
+    l2.trait_methods = l1.trait_methods.clone();
     l2.functions = l1.functions.iter().map(lower_func_l1_to_l2).collect();
     l2
 }
@@ -1020,6 +1027,7 @@ pub fn lower_l2_to_l3(l2: &L2Module, module: &IrModule) -> L3Module {
     l3.struct_layouts = l2.struct_layouts.clone();
     l3.string_constants = l2.string_constants.clone();
     l3.extern_functions = l2.extern_functions.clone();
+    l3.trait_methods = l2.trait_methods.clone();
     l3.functions = l2.functions.iter().map(|f| lower_func_l2_to_l3(f, module)).collect();
     l3
 }

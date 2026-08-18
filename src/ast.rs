@@ -364,6 +364,13 @@ pub enum Stmt {
         is_persist: bool,
         line: usize,
     },
+    /// Tuple destructuring: `pv (a, b, ...) = expr`
+    /// Binds each name to the corresponding element of the tuple returned by expr.
+    LetTuple {
+        names: Vec<String>,
+        expr: Expr,
+        line: usize,
+    },
     Assign {
         target: String,
         op: AssignOp,
@@ -446,6 +453,14 @@ pub enum Stmt {
         body: Vec<Stmt>,
         line: usize,
     },
+    /// Unsafe block: `unsafe { body }` — permits operations that would
+    /// otherwise be rejected by the safety type system (e.g. raw pointer
+    /// dereference, FFI calls without capability checks).
+    /// The body is otherwise a normal block — unsafe is compile-time only.
+    Unsafe {
+        body: Vec<Stmt>,
+        line: usize,
+    },
     /// comptime gen { block } — evaluate block at compile time, parse the
     /// resulting string as Fides source code, and inject the declarations
     /// into the program. This enables comptime code generation.
@@ -488,6 +503,7 @@ impl Stmt {
     pub fn line(&self) -> usize {
         match self {
             Stmt::Let { line, .. }
+            | Stmt::LetTuple { line, .. }
             | Stmt::Assign { line, .. }
             | Stmt::IndexAssign { line, .. }
             | Stmt::DerefAssign { line, .. }
@@ -506,6 +522,7 @@ impl Stmt {
             | Stmt::Do { line, .. }
             | Stmt::RegionBlock { line, .. }
             | Stmt::Sandbox { line, .. }
+            | Stmt::Unsafe { line, .. }
             | Stmt::ComptimeGen { line, .. }
             | Stmt::GradBlock { line, .. }
             | Stmt::Backward { line, .. } => *line,
@@ -532,6 +549,9 @@ pub enum AssignOp {
 pub struct Param {
     pub name: String,
     pub ty: Type,
+    /// Whether this parameter/field is public (visible outside the defining module).
+    /// Only meaningful for struct fields. Function params are always visible.
+    pub is_pub: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -573,6 +593,8 @@ pub struct StructDef {
     pub name: String,
     pub fields: Vec<Param>,
     pub is_pub: bool,
+    /// Annotations attached to this struct (e.g. @linear)
+    pub annotations: Vec<Annotation>,
 }
 
 #[derive(Debug, Clone)]

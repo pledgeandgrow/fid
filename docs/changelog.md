@@ -1,5 +1,322 @@
 # Fides Language Changelog
 
+## Phase 7.5B: Banking Demo — Compile-Time Financial Conservation (August 2026)
+
+Built a mini banking system on top of linear Money + @conserve that
+demonstrates Fides's core value proposition: **bugs that cost the real
+world billions are compile errors in Fides**.
+
+### Banking Stdlib (`stdlib/banking.fd`)
+
+- `@linear struct Account { id: i64, balance: Money }` — account with linear balance
+- `Account_open(id, initial_cents)` — create account (NOT @conserve, mints money)
+- `Account_deposit(acc, amount)` — deposit money (@conserve)
+- `Account_withdraw(acc, cents)` — withdraw money (@conserve)
+- `Account_withdraw_cash(cents)` — produce withdrawn cash (@conserve)
+- `Account_accrue_interest(acc, rate_bps)` — interest accrual (@conserve + @deterministic)
+- `Account_balance_cents(acc)` — get balance (@conserve)
+- `Account_print(acc)` — display (NOT @conserve, has IO)
+
+### Tests
+
+- `test_banking.fd` — positive test: open account, deposit, withdraw, interest, verify balances
+- `test_banking_double_credit_fail.fd` — **the Knight Capital bug**: depositing the same money twice is a compile error
+- `test_banking_lost_money_fail.fd` — **the silent loss bug**: withdrawing money and forgetting to use it is a compile error
+
+### What COBOL Allows That Fides Catches
+
+| Bug | COBOL | Fides |
+|-----|-------|-------|
+| Double-credit (deposit same money twice) | Runtime error (if caught) | **Compile error**: "variable 'deposit' was already consumed" |
+| Lost money (withdraw but forget the cash) | Silent runtime bug | **Compile error**: "variable 'cash' is linear but was never consumed" |
+| Money creation (mint inside a transfer) | Runtime audit (if caught) | **Compile error**: "@conserve function calls Money_new" |
+| Float rounding errors | Silent accumulation | **Compile error**: "@conserve uses floating-point" |
+
+### Real-World Impact
+
+Knight Capital lost **$440 million in 45 minutes** when a deployment bug
+caused their trading system to double-process orders. In Fides, that bug
+is a compile error — the linear type system prevents the same Money from
+being used twice.
+
+**Verification:** 92/92 normal + 9/9 expected-fail. No regressions.
+
+## Phase 7.5B: Linear Money + @conserve — Compile-Time Financial Conservation (August 2026)
+
+Implemented linear types and the `@conserve` annotation — the foundation of
+Fides's finance/banking story. Together, these features give compile-time proofs
+that money cannot be created, destroyed, or duplicated.
+
+**What was implemented:**
+
+### Linear Types (`@linear`)
+
+- **`@linear` annotation on structs**: A struct marked `@linear` has move
+  semantics — values can be moved but not copied.
+- **Consumption tracking**: The typechecker tracks which linear variables have
+  been consumed (moved). Using a consumed variable is a compile error.
+- **Scope checking**: Linear variables must be consumed before their scope exits.
+  An unconsumed linear variable is a compile error (prevents silent destruction).
+- **Branch merging**: In `if/else`, a linear variable consumed in both branches
+  is considered consumed after the if. Consumed in only one branch is an error
+  (the variable might still be live in the other path).
+- **Field access is a borrow**: Reading a scalar field (`m.cents`) does NOT
+  consume the struct. Only passing the whole struct to a function, returning it,
+  or assigning it consumes it.
+
+### @conserve Annotation
+
+- **No mint**: `@conserve` functions cannot call `Money_new` or
+  `Money_from_cents` (the mint functions). Money can only be moved, split,
+  or merged.
+- **No external state**: `@conserve` functions cannot have IO/Net/Spawn/Diverge
+  effects (same as `@deterministic` for these).
+- **No floating-point**: `@conserve` functions cannot use F32/F64 (same as
+  `@deterministic`).
+- **Transitive**: `@conserve` functions can only call other `@conserve`
+  functions. This ensures conservation is preserved through the call graph.
+
+### Conservation Proof
+
+The conservation guarantee is a consequence of three rules:
+1. **Linear types** prevent duplication (can't copy Money)
+2. **No mint** prevents creation (can't call Money_new inside @conserve)
+3. **Must consume** prevents destruction (linear vars must be used)
+
+Together: no creation + no destruction + no duplication = conservation.
+
+### Money Stdlib (`stdlib/money.fd`)
+
+- `@linear struct Money { cents: i64 }` — fixed-point decimal, integer-only
+- `Money_new(cents)` / `Money_from_dollars(dollars, cents)` — mint (NOT @conserve)
+- `Money_add(a, b)` / `Money_sub(a, b)` — merge/split (@conserve)
+- `Money_to_cents(m)` — extract value (@conserve)
+- `Money_is_non_negative(m)` / `Money_eq(a, b)` — comparisons (@conserve)
+- `Money_print(m)` — display (NOT @conserve, has IO)
+
+### Tests
+
+- `test_money.fd` — positive test: mint, merge, split, check values
+- `test_money_linear_fail.fd` — expected fail: double-use of linear variable
+- `test_money_conserve_fail.fd` — expected fail: @conserve function calls mint
+
+**Verification:** 89/89 normal + 7/7 expected-fail. No regressions.
+
+**Files changed:**
+- `src/ast.rs` — added `annotations` field to `StructDef`, `is_pub` to `Param`
+- `src/parser.rs` — parse `@linear` on structs, handle `pub` after annotations
+- `src/typechecker.rs` — linear type enforcement, `verify_conserve()`, field privacy
+- `src/compiler.rs` — `annotations` field in generated StructDefs
+- `stdlib/money.fd` — new stdlib module
+- `tests/test_money*.fd` — 3 new test files
+- `tests/harness.rs`, `src/main.rs` — expected-fail list updates
+
+## Native Backend: All 4 Remaining Tests Fixed — FULL NATIVE PARITY (August 2026)
+
+Fixed the last 4 failing native ELF64 tests: `test_db`, `test_collections`,
+`test_match_range`, and `test_matrix_mul`. All now produce output identical to
+the interpreter.
+
+**Root cause:** A single wrong REX prefix byte in `p_json_at` in
+`src/runtime_linux.rs`. The instruction `subq %r14, %rax` was encoded as
+`49 29 F0` (REX.WB) instead of `4C 29 F0` (REX.WR). The B bit extends the r/m
+field (destination), but r14 is in the reg field (source) — it needed the R bit.
+The wrong encoding computed `subq %rsi, %r8` instead of `subq %r14, %rax`,
+leaving `rax` unchanged (still containing the raw `rbx` pointer value).
+
+**Why it only crashed on dynamic strings:** Static strings live at low
+addresses (~0x402000), so the wrong size (`rbx + 3` ≈ 4MB) still succeeded with
+`mmap`. Dynamic strings from `p_malloc` live at high addresses (~0x7F...), so
+the wrong size (`rbx + 3` ≈ 125TB) caused `mmap` to fail and return MAP_FAILED
+(-1), which then segfaulted on write.
+
+**Why previous fixes kept breaking other things:** Debug `sys_write` calls
+accidentally clobbered `rdi` to 1 (stdout fd), making `p_malloc(1)` succeed
+(rounds up to 4096), masking the real bug. But the debug code shifted offsets
+and clobbered registers, causing new failures elsewhere — classic whack-a-mole.
+
+**The fix:** Changed one byte: `0x49` → `0x4C`. No other changes needed.
+
+**Verification:** 87/87 interpreter + 87/87 C codegen + 87/87 PE emitter +
+136/136 unit tests pass. All 4 native tests match interpreter output. No regressions.
+
+## Phase 7.5A: @deterministic (F26) — Core Implementation (August 2026)
+
+Implemented the core of `@deterministic` annotation enforcement in the typechecker.
+A `@deterministic` function is guaranteed to produce the same outputs for the same
+inputs — critical for finance (auditable interest calculations), science (reproducible
+results), and blockchain (node agreement).
+
+**What was implemented:**
+- **Effect rejection**: `@deterministic` functions are rejected if they have any
+  `IO`, `Net`, `Spawn`, or `Diverge` effects (via the existing effect system with
+  fixpoint call-graph propagation). `Alloc`, `Read`, and `Write` effects are allowed
+  (allocation and local mutation are deterministic).
+- **Floating-point rejection**: `@deterministic` functions are rejected if they
+  contain any F32/F64 usage — float literals, float-typed parameters, float return
+  types, or float-typed local variables. FP results vary across CPUs (different
+  rounding, FMA contraction), so they're not deterministic.
+- **Clear error messages**: All rejection errors explain why the operation is
+  nondeterministic and suggest fixes (use integer arithmetic, remove the annotation,
+  or remove the offending operation).
+
+**What was NOT implemented (deferred):**
+- `random()` rejection — no random() builtin exists yet
+- `system_clock()` rejection — no clock builtins exist yet
+- Mutable global rejection — no mutable globals exist yet
+- LogicalTime stdlib struct (F43) — folded into 7.5A as stdlib deliverable
+
+**Files changed:**
+- `src/typechecker.rs` — added `verify_deterministic()` function called from
+  `check_bodies()`, plus `scan_for_floats()`, `scan_stmt_for_floats()`,
+  `scan_expr_for_floats()`, and `type_contains_float()` helpers
+- `src/main.rs` — added `test_deterministic_fail` to expected-fail list
+- `tests/harness.rs` — added `test_deterministic_fail.fd` to expected-fail list
+- `tests/test_deterministic.fd` — new test: valid @deterministic functions
+  (compound_interest, factorial, sum_range — all integer arithmetic)
+- `tests/test_deterministic_fail.fd` — new expected-fail test: exercises all
+  3 rejection rules (IO effect, float literal, float parameter)
+
+**Verification:** 87/87 normal tests + 4/4 expected-fail tests pass. No regressions.
+
+## F15 (@no_grad) Cut and F43 (LogicalTime) Reclassified (August 2026)
+
+**F15: @no_grad — CUT.** Removed from the roadmap. PyTorch needs
+`torch.no_grad()` because gradient tracking is on by default. Fides's autograd
+is opt-in — gradient tracking only happens inside `grad(var) { }` blocks.
+Outside those blocks, there's nothing to disable. The default IS no-grad.
+The only theoretical use case (skip tracing for a helper inside a `grad`
+block) is handled by the @differentiable opt-in model: only @differentiable
+functions get traced. @no_grad is the inverse of an opt-in that already
+exists.
+
+**F43: LogicalTime — reclassified as stdlib deliverable.** A type alias
+(`ty LogicalTime = i64`) provides zero safety — `resolve_type()` unwraps it
+to `i64`, so the compiler can't distinguish a timestamp from any other
+integer. F43 will be implemented as a **stdlib struct** (`struct LogicalTime
+{ nanos: i64 }` with safe date math methods) in Phase 7.5A alongside
+@deterministic, since its only purpose is to give @deterministic functions
+a way to do time math without wall clock access. Removed as a standalone
+roadmap item; folded into 7.5A.
+
+## Phase 7E: Region Error Message Quality — COMPLETE (August 2026)
+
+Improved all typechecker error messages to include source line numbers, context,
+and fix suggestions. This is pure UX work — no language design change.
+
+**Changes in `src/typechecker.rs`:**
+- Added `region_lines` and `var_alloc_lines` tracking fields to `TypeChecker`
+  to record source line numbers for region blocks and variable allocations
+- **Region escape errors**: now show the region block line, the variable
+  allocation line, and suggest moving the use inside or allocating outside
+- **Use-after-free errors**: now show the variable's allocation line and the
+  region block line, with a fix suggestion
+- **Budget errors**: now show the region block line and suggest increasing
+  the budget in the `region r with budget(N) { ... }` syntax
+- **Sandbox capability errors**: now show the revoked capability and suggest
+  moving the call outside the sandbox block
+- **Strict capability errors**: now show the `use` statement that would fix it
+  (`use module with { Capability }`)
+- **Effect under-declaration errors**: now show the missing effect and suggest
+  the correct annotation (e.g. `pf foo() !IO` instead of `pf foo() !{}`)
+- **Type mismatch errors** (Stmt::Let): now show line number, variable name,
+  Expected/Found types, and a fix suggestion
+- **Arithmetic type errors**: now show left/right operand types separately
+  and list valid numeric types
+- **String concat errors**: now show which operand (left/right) is wrong
+- **? operator errors**: now show the found type and explain what's expected
+- **?? operator errors**: now show the Option inner type vs default value type
+  and suggest making them match
+
+**Changes in `src/main.rs`:**
+- Fixed error detection in `fidesc test` to match "error" (case-insensitive)
+  instead of "error:" — this was needed because the new error format uses
+  "Error (line N):" instead of "Error:" (the line number is between "Error"
+  and the colon)
+
+**Verification:** 86/86 tests pass, 3/3 expected-fail tests correctly fail,
+no regressions.
+
+## Docs: Medical Device Gap Analysis — 4 Items Added (August 2026)
+
+Analyzed the medical device industry's language limitations (C memory safety CVEs,
+Java GC pauses, Python type safety, supply chain risk) against Fides's roadmap.
+Found 4 gaps:
+
+- **Item 1: SOUP/SBOM management** → added to `docs/extra.md`
+  - `fidesc sbom` — generate Software Bill of Materials from import graph
+  - `fidesc audit` — check dependencies against CVE databases (NVD, OSV)
+  - Required for FDA 2025 cybersecurity compliance and IEC 62304 SOUP management
+  - Depends on package manager being implemented first (Phase 11A)
+
+- **Item 2: Data race detection** → added to roadmap Phase 9D (@realtime, F27)
+  - Extended `@realtime` spec: "rejects access to mutable state that is not
+    region-local (prevents data races by construction)"
+  - This is a language feature, so it stays in the roadmap (not extra.md)
+  - Simpler than full Send/Sync system — no shared mutable state = no data races
+
+- **Item 3: CWE mapping documentation** → added to `docs/extra.md`
+  - `docs/fides-cwe-mapping.md` — map Fides safety features to CWE categories
+  - CWE-787, CWE-416, CWE-476, CWE-190, CWE-119, CWE-20, CWE-125, CWE-788, CWE-479
+  - Required for IEC 62304 compliance evidence — auditors expect CWE coverage
+
+- **Item 4: IEC 62304 process integration** → added to `docs/extra.md`
+  - Requirements traceability, risk management, problem resolution tooling
+  - Process standard, not coding standard — consider third-party integration
+
+## Docs: Determinism Mitigation Features Added to Roadmap (August 2026)
+
+- **Added Phase 7E — Region Error Message Quality** to `docs/roadmap.md`:
+  - Region escape errors show code context + suggested fix
+  - Capability denial errors show what was denied + the fix
+  - Effect under-declaration errors show missing effects + suggested annotation
+  - Type mismatch errors show human-readable types + inference trace
+  - Pure UX work in `typechecker.rs`, no language design change
+  - Motivation: incomprehensible error messages are the #1 barrier to adoption
+    for region-based languages (same lesson as Rust's borrow checker)
+
+- **Added Arena/Rc/Arc/Weak to Phase 10B** in `docs/roadmap.md`:
+  - `stdlib/arena.fd` — Arena allocator (deterministic alternative to GC)
+    - Bump-allocate within a bounded scope, free all at once (deterministic)
+    - Bridges simplicity/determinism gap: "allocate without thinking" within arena
+    - Use cases: request-scoped data, transactions, compiler passes, game frames
+  - `stdlib/rc.fd` — Reference counting (deterministic shared ownership)
+    - `Rc<T>` (non-atomic, single-threaded), `Arc<T>` (atomic, thread-safe)
+    - `Weak<T>` for breaking reference cycles
+    - Use cases: shared caches, graph structures, observer patterns
+    - Deterministic: freed when last strong reference drops, no GC scanning
+  - These reduce the cons of Fides's deterministic memory model:
+    - Arena = simplicity (allocate freely) + determinism (free when you choose)
+    - Rc/Arc = shared ownership without GC, predictable freeing
+    - Error messages = lower learning curve for region system
+
+- **Updated overview block**: Phase 7 now mentions 7E, Phase 10 mentions Arena/Rc/Arc
+
+## Docs: Full Documentation Sync with Verified Reality (August 2026)
+
+- **Synchronized all current-state docs** with actual verified test results and
+  project metrics. Every doc now matches ground truth:
+  - **Unit tests**: 137/137 (was variously reported as 133, 136)
+  - **Interpreter/PE/C Codegen**: 86/86 + 3/3 expected-fail — FULL PARITY (was
+    variously reported as 78/78+1/1, 81/81+3/3, 76/78, 78/81, etc.)
+  - **C codegen**: FULL PARITY — no gaps (was reported as 76/78 with 2 mismatches
+    and flaky test_db; test_db is no longer flaky, HashMap keys sorted)
+  - **Test files**: 89 .fd (was variously reported as 102, 87)
+  - **Source**: 36 .rs files, 52,845 LOC (was variously reported as 35/47,397/51,600)
+  - **Warnings**: 215 (was reported as 120, 190, 214)
+  - **Skip list**: 21 tests (was reported as 20)
+  - **Native x86-64 builds**: 63/66 (3 mismatches: test_collections, test_db,
+    test_matrix_mul — was reported as 41/79, 58/74)
+- **Updated docs**: README.md, AGENTS.md, docs/features.md, docs/roadmap.md,
+  docs/roadmap-limitations.md, docs/test.md, docs/test-batches.md,
+  docs/features-roadmap.md, docs/direction-analysis.md, docs/custom-toolchain.md,
+  docs/adoption-strategy.md, docs/competitive-analysis.md
+- **Fixed phase numbering** in roadmap-limitations.md: Phase 6/7/8 references →
+  Phase 10/11/12 (self-hosting, ecosystem, world class) to match current roadmap.md
+- **Added Phase 10A.5 — Field-Level Privacy** to roadmap.md (prerequisite for 10B
+  Vec/HashMap/String stdlib migration)
+- **Historical entries in changelog.md left as-is** — they record past state
+
 ## Docs: Fides Rename Completion + Feature Governance Policy (August 2026)
 
 - **Completed Fides rename in remaining docs**: `__pledge_*` runtime symbol

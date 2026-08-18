@@ -251,6 +251,7 @@ fn parse_c_param(param: &str) -> Option<Param> {
             return Some(Param {
                 name: if name.is_empty() { format!("arg{}", 0) } else { name.to_string() },
                 ty,
+                is_pub: false,
             });
         }
     }
@@ -265,6 +266,7 @@ fn parse_c_param(param: &str) -> Option<Param> {
     Some(Param {
         name: if name.is_empty() { "arg".to_string() } else { name.to_string() },
         ty,
+        is_pub: false,
     })
 }
 

@@ -10,13 +10,13 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 
 | Test Group | Result | Notes |
 |------------|:------:|-------|
-| Unit tests (`cargo test --bin fidesc`) | **136/136** | elf64, pir, peephole (26 tests), opt, regalloc, tensor, codegen_x64, hotreload (8), embedded, gpu, wasm, coff, macho, linker |
+| Unit tests (`cargo test --bin fidesc`) | **137/137** | elf64, pir, peephole (26 tests), opt, regalloc, tensor, codegen_x64, hotreload (8), embedded, gpu, wasm, coff, macho, linker |
 | Harness tests (`cargo test --test harness`) | **8/8** | All pass including golden_files_match |
-| Interpreter (`fidesc test`) | **78/78** normal + **1/1** expected-fail | `test_trait_verify_fail` is expected to fail (tests error detection) |
-| PE Emitter (`fidesc test`) | **78/78** normal + **1/1** expected-fail | All PE structures valid |
-| C Codegen (`fidesc test`) | **76/78** normal + **1/1** expected-fail | 2 real mismatches: `test_asm` (inline asm — by design), `test_comptime_reflect` (comptime reflection — interpreter-only). `test_db` is flaky (HashMap ordering). |
-| Total `.fd` test files | **102** | 79 root + 9 safety + 4 capability + 7 effects + 3 regions |
-| Source files | **35** `.rs` | 47,397 LOC |
+| Interpreter (`fidesc test`) | **86/86** normal + **3/3** expected-fail | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` are expected to fail (test error detection) |
+| PE Emitter (`fidesc test`) | **86/86** normal + **3/3** expected-fail | All PE structures valid |
+| C Codegen (`fidesc test`) | **86/86** normal + **3/3** expected-fail | FULL PARITY with interpreter — no gaps |
+| Total `.fd` test files | **89** | 86 normal + 3 expected-fail |
+| Source files | **36** `.rs` | 52,845 LOC |
 | Golden files | **43** | Expected outputs in `tests/golden/` |
 
 ### What Works (Verified End-to-End)
@@ -119,13 +119,13 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 ### Known Limitations
 
 - **ELF64 executable emission works on Linux** — `fidesc build <file> --target x86-64` produces working ELF64 executables directly (zero external tools). `fidesc codegen --elf <out.o>` emits valid relocatable objects (readelf compatible). `fidesc codegen --macho` and `--coff` also produce valid object files.
-- **PE emitter targets Windows x64 only** — `fidesc emit` produces PE32+ executables; tested via `fidesc test` (78/78 valid + 1/1 expected-fail)
+- **PE emitter targets Windows x64 only** — `fidesc emit` produces PE32+ executables; tested via `fidesc test` (86/86 valid + 3/3 expected-fail)
 - **Register allocator has a pre-existing bug** — linear scan allocator in `regalloc.rs` maps VRegs to physical registers, but constants not loaded into registers before use can be clobbered by intervening instructions. Exposed by the L2 optimizer's instruction reordering. Blocks enabling `--opt` by default.
 - **Peephole optimizer always on** — 9 passes run automatically in the `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
 - **L2 optimizer (`--opt`) not enabled by default** — PIR optimizer exists (`fidesc opt`, `fidesc pir --opt`, `fidesc build --opt`) with constant folding, DCE, CSE, inlining, TCO, loop unrolling, and effect-based pure function elision. Works for simple programs but exposes the register allocator bug on complex ones.
 - **`#[test]` attribute** — parsed but not executed by `fidesc test` (tests are file-based)
-- **C codegen coverage** — 76/78 tests match interpreter output (+ 1/1 expected-fail). 2 real mismatches: `test_asm` (inline asm — by design), `test_comptime_reflect` (comptime reflection — interpreter-only). `test_db` is flaky (HashMap iteration order non-deterministic).
-- **190 compiler warnings** — dead code, unused variables (cleanup needed)
+- **C codegen coverage** — 86/86 tests match interpreter output (+ 3/3 expected-fail). FULL PARITY — no gaps. `test_db` is no longer flaky (HashMap keys sorted for deterministic output).
+- **215 compiler warnings** — dead code, unused variables (cleanup needed)
 
 ---
 
@@ -190,7 +190,7 @@ cargo run -- version
 | `gpu <file.fd>` | SPIR-V GPU backend: PIR → SPIR-V binary |
 | `tokens <file.fd>` | Lex only — print token stream |
 | `ast <file.fd>` | Lex + parse — print AST tree |
-| `test` | Run all 102 tests across interpreter, PE emitter, and C codegen |
+| `test` | Run all 89 tests across interpreter, PE emitter, and C codegen |
 | `repl` | Interactive REPL — evaluate Fides expressions |
 | `verify <file.fd>` | Verify IR correctness (terminators, block refs, value refs) |
 | `sourcemap <file.fd>` | Show source map (IR value → source line mapping) |
@@ -227,12 +227,11 @@ The project includes automated verification scripts for ensuring correctness acr
 
 Current baseline:
 ```
-Unit tests:   136/136 passed
+Unit tests:   137/137 passed
 Harness:      8/8 passed
-Interpreter:  78/78 passed   (+ 1/1 expected fail: test_trait_verify_fail)
-C Codegen:    76/78 matched   (2 real mismatches: test_asm [by design], test_comptime_reflect [interpreter-only];
-                               test_db flaky — HashMap ordering non-deterministic)
-PE Emitter:   78/78 valid     (+ 1/1 expected fail: test_trait_verify_fail)
+Interpreter:  86/86 passed   (+ 3/3 expected fail: test_trait_verify_fail, test_budget_fail, test_sandbox_fail)
+C Codegen:    86/86 matched   (FULL PARITY — no gaps)
+PE Emitter:   86/86 valid     (+ 3/3 expected fail: test_trait_verify_fail, test_budget_fail, test_sandbox_fail)
 ```
 
 ---
@@ -594,9 +593,9 @@ p-lang/
 │   ├── http.fd              # HTTP server stdlib
 │   ├── simd.fd              # SIMD intrinsics
 │   └── shape.fd             # Shape operations
-├── tests/                  # 102 .fd test files + harness
+├── tests/                  # 89 .fd test files + harness
 │   ├── harness.rs          # Automated test harness (8 cargo tests)
-│   ├── *.fd                 # 79 feature tests (arithmetic, structs, closures, generics, traits, etc.)
+│   ├── *.fd                 # 86 feature tests (arithmetic, structs, closures, generics, traits, etc.)
 │   ├── safety/             # 9 bounds safety tests (OOB, overflow, div-by-zero, unwrap)
 │   ├── capability/         # 4 capability security tests (grant, deny, propagation)
 │   ├── effects/            # 7 effect system tests (annotations, inference, handlers, pure)
@@ -628,7 +627,7 @@ p-lang/
 
 ## Test Programs
 
-102 test files across `tests/` and subdirectories. Key tests:
+89 test files across `tests/` and subdirectories. Key tests:
 
 | Test File | What It Tests |
 |-----------|---------------|
@@ -693,7 +692,7 @@ Run all tests: `cargo test --test harness`
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (136 unit tests, 78/78 + 1/1 expected-fail integration tests) |
+| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (137 unit tests, 86/86 + 3/3 expected-fail integration tests) |
 | **Phase 2** | Region inference, effect system, capability security, bounds safety | **Complete** (2A ✓, 2B ✓, 2C ✓ with elision, 2D ✓; 8/8 harness tests pass) |
 | **Phase 3** | comptime, advanced traits, FFI & interop | **Complete** (3A comptime ✓, 3B traits ✓, 3C const generics + GATs ✓; 3D C FFI ✓ via `extern "C"` + `parse-header`) |
 | **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | **Mostly complete** (4A PIR ✓, 4B optimizer ✓ but disabled by default due to regalloc bug, 4C x86-64/arm64/riscv codegen + regalloc + 9 peephole passes + ELF64 executables ✓; 4D linker ✓, 4E hot reload ✓ via `fidesc watch`) |
