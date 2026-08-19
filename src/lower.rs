@@ -63,6 +63,12 @@ pub struct Lowerer {
     /// AST function return types — maps function name to AST return type
     /// Used by LetTuple to determine tuple element types
     func_ret_types: HashMap<String, Type>,
+    /// Async function names — functions declared with `async pf`
+    /// Calls to these functions are wrapped in p_future_ready
+    async_funcs: std::collections::HashSet<String>,
+    /// Allocas that hold Vec values (from for-loop iteration over Vec<Vec<...>>)
+    /// Used to enable nested Vec iteration
+    vec_allocas: std::collections::HashSet<ValueId>,
 }
 
 impl Lowerer {
@@ -97,6 +103,8 @@ impl Lowerer {
             effect_handler_stack: Vec::new(),
             region_stack: Vec::new(),
             func_ret_types: HashMap::new(),
+            async_funcs: std::collections::HashSet::new(),
+            vec_allocas: std::collections::HashSet::new(),
         }
     }
 
@@ -175,6 +183,10 @@ impl Lowerer {
             self.module.functions.insert(func.name.clone(), ir_func);
             // Store AST return type for tuple element type lookup
             self.func_ret_types.insert(func.name.clone(), func.ret_ty.clone());
+            // Track async functions — calls to these are wrapped in p_future_ready
+            if func.is_async {
+                self.async_funcs.insert(func.name.clone());
+            }
         }
 
         // Lower each function
@@ -299,6 +311,26 @@ impl Lowerer {
         self.module.add_extern("p_bool_to_str",
             vec![IrType::Bool],
             IrType::Ptr(Box::new(IrType::U8)));
+        // String operations as free functions (for typed_strings stdlib, regex stdlib, etc.)
+        let str_ty = IrType::Ptr(Box::new(IrType::U8));
+        self.module.add_extern("p_string_contains",
+            vec![str_ty.clone(), str_ty.clone()],
+            IrType::Bool);
+        self.module.add_extern("p_string_replace",
+            vec![str_ty.clone(), str_ty.clone(), str_ty.clone()],
+            IrType::Ptr(Box::new(IrType::U8)));
+        self.module.add_extern("p_string_starts_with",
+            vec![str_ty.clone(), str_ty.clone()],
+            IrType::Bool);
+        self.module.add_extern("p_string_ends_with",
+            vec![str_ty.clone(), str_ty.clone()],
+            IrType::Bool);
+        self.module.add_extern("p_string_find",
+            vec![str_ty.clone(), str_ty.clone()],
+            IrType::I64);
+        self.module.add_extern("p_string_len",
+            vec![str_ty.clone()],
+            IrType::I64);
         let vec_ty = IrType::Opaque("Vec".to_string());
         self.module.add_extern("p_vec_to_str",
             vec![vec_ty.clone()],
@@ -415,6 +447,71 @@ impl Lowerer {
         self.module.add_extern("p_page_unmap", vec![IrType::I64, IrType::I64], IrType::Void); // unmap vaddr
         self.module.add_extern("p_phys_read64", vec![IrType::I64], IrType::I64); // read 8 bytes from physical addr
         self.module.add_extern("p_phys_write64", vec![IrType::I64, IrType::I64], IrType::Void); // write 8 bytes to physical addr
+
+        // ─── Environment variable builtins ───
+        // p_getenv(name: *u8) -> *u8  — get environment variable value (null if not set)
+        self.module.add_extern("p_getenv", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Ptr(Box::new(IrType::U8)));
+
+        // ─── Command-line argument builtins ───
+        // p_argc() -> i64  — number of command-line arguments
+        self.module.add_extern("p_argc", vec![], IrType::I64);
+        // p_argv(index: i64) -> *u8  — get command-line argument by index (null if out of bounds)
+        self.module.add_extern("p_argv", vec![IrType::I64], IrType::Ptr(Box::new(IrType::U8)));
+
+        // ─── Process control builtins ───
+        // p_system(cmd: *u8) -> i64  — run a shell command, return exit status
+        self.module.add_extern("p_system", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
+        // p_exit(code: i64) -> void  — exit the process with a code
+        self.module.add_extern("p_exit", vec![IrType::I64], IrType::Void);
+
+        // ─── Regex builtin ───
+        // p_regex_match(s: *u8, pattern: *u8) -> bool  — simple wildcard match (? and *)
+        self.module.add_extern("p_regex_match",
+            vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))],
+            IrType::Bool);
+
+        // ─── Phase 7.6: Async/await runtime ───
+        // p_future_ready(value: i64) -> i64  — wrap a value in a ready Future
+        // The Future is an opaque handle (pointer to a runtime struct).
+        // At the IR level, Future<T> is represented as i64 (pointer-sized handle).
+        self.module.add_extern("p_future_ready", vec![IrType::I64], IrType::I64);
+        // p_future_poll(future: i64) -> i64  — poll a Future, return its value
+        // If the Future is Ready, returns the cached value.
+        // If the Future is Pending, blocks until the thread completes.
+        self.module.add_extern("p_future_poll", vec![IrType::I64], IrType::I64);
+
+        // ─── Phase 8A: Real OS threads + atomics + mutex ───
+        // p_thread_spawn(func_name: *u8, num_args: i64, args...) -> i64
+        //   Spawns an OS thread that runs the named function with the given args.
+        //   Returns a Future handle (i64). Use p_future_poll to join.
+        self.module.add_extern("p_thread_spawn",
+            vec![IrType::Ptr(Box::new(IrType::U8)), IrType::I64],
+            IrType::I64);
+        // p_shared_alloc(size: i64) -> i64  — allocate shared memory, return address
+        self.module.add_extern("p_shared_alloc", vec![IrType::I64], IrType::I64);
+        // p_atomic_load(addr: i64) -> i64  — atomic load from shared memory
+        self.module.add_extern("p_atomic_load", vec![IrType::I64], IrType::I64);
+        // p_atomic_store(addr: i64, val: i64) -> void  — atomic store to shared memory
+        self.module.add_extern("p_atomic_store", vec![IrType::I64, IrType::I64], IrType::Void);
+        // p_atomic_cas(addr: i64, expected: i64, new: i64) -> bool  — compare-and-swap
+        self.module.add_extern("p_atomic_cas", vec![IrType::I64, IrType::I64, IrType::I64], IrType::Bool);
+        // p_atomic_add(addr: i64, val: i64) -> i64  — atomic fetch-and-add, returns old value
+        self.module.add_extern("p_atomic_add", vec![IrType::I64, IrType::I64], IrType::I64);
+        // p_mutex_init() -> i64  — create a mutex, return handle
+        self.module.add_extern("p_mutex_init", vec![], IrType::I64);
+        // p_mutex_lock(m: i64) -> void  — lock a mutex (blocks if contended)
+        self.module.add_extern("p_mutex_lock", vec![IrType::I64], IrType::Void);
+        // p_mutex_unlock(m: i64) -> void  — unlock a mutex
+        self.module.add_extern("p_mutex_unlock", vec![IrType::I64], IrType::Void);
+        // Dynamic loading builtins (Phase 7.7)
+        self.module.add_extern("p_dl_open",
+            vec![IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
+        self.module.add_extern("p_dl_sym",
+            vec![IrType::I64, IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
+        self.module.add_extern("p_dl_close",
+            vec![IrType::I64], IrType::Void);
+        self.module.add_extern("p_dl_call",
+            vec![IrType::I64, IrType::I64], IrType::I64);
     }
 
     /// Lower a single function
@@ -422,6 +519,8 @@ impl Lowerer {
         let ret_ty = self.lower_type(&func.ret_ty);
         let mut ir_func = IrFunction::new(func.name.clone(), ret_ty.clone());
         ir_func.is_interrupt = func.is_interrupt;
+        // F65: @wrapping annotation — use wrap-around arithmetic instead of checked
+        ir_func.is_wrapping = func.annotations.iter().any(|a| a.name == "wrapping");
 
         // If the function returns a struct, add a hidden SRET parameter
         // (caller-allocated pointer as first arg, callee writes struct data there)
@@ -486,16 +585,50 @@ impl Lowerer {
         // Exit:  print "[AUDIT] exit <name>\n" (via defer, runs before every return)
         let is_audited = func.annotations.iter().any(|a| a.name == "audit");
         if is_audited {
-            // Entry log
-            let entry_msg = self.emit_inst(Inst::ConstStr {
-                value: format!("[AUDIT] enter {}\n", func.name),
-            });
-            self.emit_inst(Inst::Print {
-                value: entry_msg,
-                ty: IrType::Ptr(Box::new(IrType::U8)),
-            });
-            // Exit log via defer — a synthetic print statement that runs
-            // before every return point (including implicit returns).
+            // Entry log with parameter values
+            // Format: [AUDIT] enter func_name(param1=val1, param2=val2)\n
+            let param_info: Vec<(String, ValueId, IrType)> = func.params.iter()
+                .filter_map(|p| {
+                    let val = self.current_func.as_ref().and_then(|f| f.locals.get(&p.name).copied());
+                    val.map(|v| {
+                        let ir_ty = lower_type(&p.ty);
+                        (p.name.clone(), v, ir_ty)
+                    })
+                })
+                .collect();
+
+            if param_info.is_empty() {
+                let entry_msg = self.emit_inst(Inst::ConstStr {
+                    value: format!("[AUDIT] enter {}\n", func.name),
+                });
+                self.emit_inst(Inst::Print {
+                    value: entry_msg,
+                    ty: IrType::Ptr(Box::new(IrType::U8)),
+                });
+            } else {
+                let mut header = format!("[AUDIT] enter {}(", func.name);
+                for (i, (pname, pval, pty)) in param_info.iter().enumerate() {
+                    if i > 0 { header.push_str(", "); }
+                    header.push_str(&format!("{}=", pname));
+                    let hdr = self.emit_inst(Inst::ConstStr { value: header.clone() });
+                    self.emit_inst(Inst::Print {
+                        value: hdr,
+                        ty: IrType::Ptr(Box::new(IrType::U8)),
+                    });
+                    // Print the param value using its actual type
+                    self.emit_inst(Inst::Print {
+                        value: *pval,
+                        ty: pty.clone(),
+                    });
+                    header.clear();
+                }
+                let close = self.emit_inst(Inst::ConstStr { value: ")\n".to_string() });
+                self.emit_inst(Inst::Print {
+                    value: close,
+                    ty: IrType::Ptr(Box::new(IrType::U8)),
+                });
+            }
+            // Exit log via defer — runs before every return point
             let exit_stmt = Stmt::Expr(
                 Expr::Call {
                     callee: "print".to_string(),
@@ -634,6 +767,9 @@ impl Lowerer {
             Type::Ref { inner, is_mut } => {
                 Type::Ref { inner: Box::new(self.resolve_type(inner)), is_mut: *is_mut }
             }
+            Type::RawPtr { inner, is_mut } => {
+                Type::RawPtr { inner: Box::new(self.resolve_type(inner)), is_mut: *is_mut }
+            }
             Type::Array { elem, size } => {
                 Type::Array { elem: Box::new(self.resolve_type(elem)), size: *size }
             }
@@ -672,6 +808,10 @@ impl Lowerer {
                 }
             }
             Type::Ref { inner, is_mut } => Type::Ref {
+                inner: Box::new(self.resolve_self_in_type(inner)),
+                is_mut: *is_mut,
+            },
+            Type::RawPtr { inner, is_mut } => Type::RawPtr {
                 inner: Box::new(self.resolve_self_in_type(inner)),
                 is_mut: *is_mut,
             },
@@ -736,6 +876,20 @@ impl Lowerer {
                         value: val,
                     });
                 }
+                self.allocas.insert(name.clone(), alloca);
+                if let Some(ref mut f) = self.current_func {
+                    f.bind_local(name, alloca);
+                }
+            }
+            Stmt::LetUninit { name, ty, line: _ } => {
+                // Uninitialized variable — allocate storage but don't store a value.
+                // The typechecker enforces that it must be assigned before read.
+                let ir_ty = self.lower_type(ty);
+                let alloca = self.emit_inst(Inst::Alloca {
+                    ty: ir_ty.clone(),
+                    region: self.current_region(),
+                });
+                self.alloca_types.insert(alloca, ir_ty);
                 self.allocas.insert(name.clone(), alloca);
                 if let Some(ref mut f) = self.current_func {
                     f.bind_local(name, alloca);
@@ -1131,22 +1285,27 @@ impl Lowerer {
                 }
             }
             Stmt::Unsafe { body, .. } => {
-                // Unsafe is transparent at the IR level — safety is
-                // enforced entirely at compile time by the typechecker.
-                // Just lower the body as normal statements.
+                // F62: emit UnsafeBegin/UnsafeEnd so the interpreter can
+                // skip bounds checks inside unsafe blocks. The typechecker
+                // already enforces that raw pointer ops only happen here.
+                self.emit_inst(Inst::UnsafeBegin);
                 for s in body {
                     self.lower_stmt(s);
                 }
+                self.emit_inst(Inst::UnsafeEnd);
             }
             Stmt::Txn { body, .. } => {
-                // Transaction block — lower body as normal statements.
-                // In the interpreter, txn blocks get snapshot/rollback semantics
-                // via a special marker. In native code, transactions are handled
-                // at the application level (database transactions, etc.).
-                // For now, txn is transparent — just lower the body.
+                // Transaction block — emit TxnBegin, lower body, emit TxnEnd.
+                // The interpreter snapshots memory on TxnBegin and restores
+                // it on panic (before TxnEnd is reached). If TxnEnd is reached,
+                // the transaction commits (snapshot is discarded).
+                // In native code, TxnBegin/TxnEnd are no-ops (transactions are
+                // handled at the application level).
+                self.emit_inst(Inst::TxnBegin);
                 for s in body {
                     self.lower_stmt(s);
                 }
+                self.emit_inst(Inst::TxnEnd);
             }
             Stmt::GradBlock { body, .. } => {
                 // The autograd transform happens later; lower the body as normal statements.
@@ -1311,6 +1470,42 @@ impl Lowerer {
                     self.lower_for_vec(var, iter_val, body);
                     return;
                 }
+                // Check if iterator is a HashMap — iterate over keys
+                if iter_ty.is_opaque_named("HashMap") {
+                    // for k in map → get keys as Vec, then iterate
+                    let keys_vec = self.emit_inst(Inst::Call {
+                        func: "p_map_keys".to_string(),
+                        args: vec![iter_val],
+                        ret_ty: IrType::Opaque("Vec".to_string()),
+                        effects: EffectSet::new(),
+                    });
+                    self.lower_for_vec(var, keys_vec, body);
+                    return;
+                }
+                // Check if iterator is an opaque "any" or I64 value from a Vec element
+                // (nested Vec iteration: for row in vec_of_vecs)
+                // Vec elements are stored as i64 handles, so we check if the value
+                // comes from a Vec-element alloca or directly from p_vec_get.
+                eprintln!("DEBUG: for {} — iter_ty={:?} iter_val={:?}", var, iter_ty, iter_val);
+                if iter_ty.is_opaque_named("any") || iter_ty == IrType::I64 {
+                    if let Some(ref f) = self.current_func {
+                        // Check if the value is loaded from a Vec-element alloca
+                        if let Some(Inst::Load { ptr, .. }) = f.instructions.get(&iter_val) {
+                            eprintln!("DEBUG:   Load ptr={:?} vec_allocas={:?}", ptr, self.vec_allocas);
+                            if self.vec_allocas.contains(ptr) {
+                                self.lower_for_vec(var, iter_val, body);
+                                return;
+                            }
+                        }
+                        // Check if the value came directly from p_vec_get
+                        if let Some(Inst::Call { func, .. }) = f.instructions.get(&iter_val) {
+                            if func == "p_vec_get" {
+                                self.lower_for_vec(var, iter_val, body);
+                                return;
+                            }
+                        }
+                    }
+                }
                 // Array iterator: for x in array { body }
                 // Lowered to: let i = 0; while i < len { let x = arr[i]; body; i += 1; }
                 let arr_val = iter_val;
@@ -1405,13 +1600,28 @@ impl Lowerer {
 
     /// Lower `for x in vec { body }` — iterates Vec via p_vec_len/p_vec_get
     fn lower_for_vec(&mut self, var: &str, vec_val: ValueId, body: &[Stmt]) {
+        // Determine element type: if the Vec's type is Generic("Vec", [elem]),
+        // use elem as the alloca type. Otherwise default to Opaque("any").
+        let vec_ty = self.get_value_type(vec_val);
+        let elem_ty = match &vec_ty {
+            IrType::Generic(_, args) => {
+                if let Some(elem) = args.first() {
+                    elem.clone()
+                } else {
+                    IrType::Opaque("any".to_string())
+                }
+            }
+            _ => IrType::Opaque("any".to_string()),
+        };
         // Create alloca for loop variable — use Opaque so Load checks side-table
         let var_alloca = self.emit_inst(Inst::Alloca {
-            ty: IrType::Opaque("any".to_string()),
+            ty: elem_ty.clone(),
             region: self.current_region(),
         });
-        self.alloca_types.insert(var_alloca, IrType::Opaque("any".to_string()));
+        self.alloca_types.insert(var_alloca, elem_ty.clone());
         self.allocas.insert(var.to_string(), var_alloca);
+        // Track this alloca as holding a Vec element (for nested iteration)
+        self.vec_allocas.insert(var_alloca);
         if let Some(ref mut f) = self.current_func {
             f.bind_local(var, var_alloca);
         }
@@ -2052,12 +2262,27 @@ impl Lowerer {
                         all_args.insert(0, dummy_env);
                     }
 
-                    self.emit_inst(Inst::Call {
+                    let call_result = self.emit_inst(Inst::Call {
                         func: callee.clone(),
                         args: all_args,
                         ret_ty,
                         effects,
-                    })
+                    });
+
+                    // Phase 7.6: If calling an async function, wrap the result
+                    // in a Future via p_future_ready. The async function body
+                    // runs synchronously (eager evaluation), but the result is
+                    // wrapped in a Future handle so `await` can unwrap it.
+                    if self.async_funcs.contains(callee) {
+                        self.emit_inst(Inst::Call {
+                            func: "p_future_ready".to_string(),
+                            args: vec![call_result],
+                            ret_ty: IrType::I64,
+                            effects: EffectSet::new(),
+                        })
+                    } else {
+                        call_result
+                    }
                 }
             }
 
@@ -2300,6 +2525,7 @@ impl Lowerer {
                         _ => None,
                     },
                     IrType::Struct(name) => Some(name.clone()),
+                    IrType::Generic(name, _) => Some(name.clone()),
                     _ => None,
                 };
                 // Mangle as struct_name_method_name
@@ -3374,6 +3600,9 @@ impl Lowerer {
                     has_effect_annotation: false,
                     is_interrupt: false,
             annotations: Vec::new(),
+                    preconditions: Vec::new(),
+                    postconditions: Vec::new(),
+            is_async: false,
                 };
 
                 // Save current function context, lower the closure, restore context
@@ -3520,6 +3749,48 @@ impl Lowerer {
                 let dst_ir_ty = self.lower_type(target_ty);
                 self.lower_cast(val, src_ty, dst_ir_ty)
             }
+            Expr::Await { expr: inner } => {
+                // await <expr> — poll a Future to get its value.
+                // The inner expression evaluates to a Future<T> (an opaque handle).
+                // p_future_poll extracts the value from the Future.
+                let future_val = self.lower_expr(inner);
+                self.emit_inst(Inst::Call {
+                    func: "p_future_poll".to_string(),
+                    args: vec![future_val],
+                    ret_ty: IrType::I64,
+                    effects: EffectSet::new(),
+                })
+            }
+            Expr::Spawn { expr: inner } => {
+                // spawn <expr> — create a concurrent task that runs in a real OS thread.
+                // If the inner expression is a function call, we extract the function
+                // name and args, and call p_thread_spawn which creates an OS thread.
+                // If it's not a call, fall back to eager evaluation.
+                match &**inner {
+                    Expr::Call { callee, args, .. } => {
+                        // spawn func(args) → p_thread_spawn(func_name, num_args, args...)
+                        let func_name_val = self.emit_inst(Inst::ConstStr { value: callee.clone() });
+                        let num_args_val = self.emit_inst(Inst::ConstInt {
+                            value: args.len() as i64,
+                            ty: IrType::I64,
+                        });
+                        let mut all_args = vec![func_name_val, num_args_val];
+                        for arg in args {
+                            all_args.push(self.lower_expr(arg));
+                        }
+                        self.emit_inst(Inst::Call {
+                            func: "p_thread_spawn".to_string(),
+                            args: all_args,
+                            ret_ty: IrType::I64,
+                            effects: EffectSet::new(),
+                        })
+                    }
+                    _ => {
+                        // Non-call spawn — fall back to eager evaluation
+                        self.lower_expr(inner)
+                    }
+                }
+            }
         }
     }
 
@@ -3551,6 +3822,9 @@ impl Lowerer {
             match stmt {
                 Stmt::Let { name, expr, .. } => {
                     self.collect_free_vars_expr(expr, free_vars, local_names);
+                    local_names.push(name.clone());
+                }
+                Stmt::LetUninit { name, .. } => {
                     local_names.push(name.clone());
                 }
                 Stmt::LetTuple { names, expr, .. } => {
@@ -3811,6 +4085,9 @@ impl Lowerer {
             }
             Expr::QuantCast { expr, .. } => {
                 self.collect_free_vars_expr(expr, free_vars, local_names);
+            }
+            Expr::Await { expr: inner } | Expr::Spawn { expr: inner } => {
+                self.collect_free_vars_expr(inner, free_vars, local_names);
             }
         }
     }
@@ -4178,6 +4455,7 @@ impl Lowerer {
                         _ => None,
                     },
                     IrType::Struct(name) => Some(name.clone()),
+                    IrType::Generic(name, _) => Some(name.clone()),
                     _ => None,
                 };
                 let mangled = if let Some(ref sn) = struct_name {
@@ -4260,6 +4538,22 @@ impl Lowerer {
             }
             Expr::QuantCast { target_ty, .. } => {
                 self.lower_type(target_ty)
+            }
+            Expr::Await { expr: inner } => {
+                // await Future<T> returns T — unwrap the Future type
+                let inner_ty = self.infer_expr_type(inner);
+                match &inner_ty {
+                    crate::ir::IrType::Struct(name) if name == "Future" => {
+                        // Future is a struct — await extracts the value field
+                        crate::ir::IrType::I64
+                    }
+                    _ => inner_ty,
+                }
+            }
+            Expr::Spawn { expr: inner } => {
+                // spawn <expr> returns Future<T> — same type as inner for now
+                // (the IR-level type is the same; Future wrapping is type-level only)
+                self.infer_expr_type(inner)
             }
         }
     }

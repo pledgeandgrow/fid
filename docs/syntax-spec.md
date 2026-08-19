@@ -239,12 +239,17 @@ ty Score = i32;
 ### 3.4 Standard Library Types
 
 ```fides
-Option<T>        // enum Option<T> { Some(T), None }
-Result<T, E>     // enum Result<T, E> { Ok(T), Err(E) }
+Option<T>        // enum Option<T> { Some(i64), None }  — uniform i64 representation
+Result<T, E>     // enum Result<T, E> { Ok(i64), Err(i64) }  — uniform i64 representation
 Vec<T>           // growable array
 String           // owned string
 HashMap<K, V>    // hash map
 ```
+
+**Note:** `Option<T>` and `Result<T, E>` are declared with type parameters in
+`stdlib/core.fd`. The type parameters are syntactic — the internal representation
+uses uniform `i64` for all variant data. This means `Option` and `Option<T>` are
+compatible types, and methods like `.unwrap()` work on both.
 
 ### 3.4a Standard Library Modules
 
@@ -252,7 +257,12 @@ Fides's stdlib lives in `stdlib/` and is imported explicitly via `use` (except `
 
 | Module | File | Contents |
 |--------|------|----------|
-| `core` | `stdlib/core.fd` | Auto-included: `Option`, `Result`, `println`, `print`, `assert`, `assert_eq`, `max`, `min`, `abs`, `clamp` |
+| `core` | `stdlib/core.fd` | Auto-included: `Option<T>`, `Result<T, E>`, `println`, `print`, `assert`, `assert_eq`, `max`, `min`, `abs`, `clamp` |
+| `math` | `stdlib/math.fd` | `math_sqrt`, `math_pow`, `math_floor`, `math_ceil`, `math_sin`, `math_cos`, `math_fabs`, `math_pi`, `math_e` |
+| `env` | `stdlib/env.fd` | `env_get`, `env_exists` |
+| `args` | `stdlib/args.fd` | `args_len`, `args_get`, `args_program_name` |
+| `process` | `stdlib/process.fd` | `process_exit`, `process_system` |
+| `regex` | `stdlib/regex.fd` | `regex_matches` (?/* wildcards), `regex_find`, `regex_contains`, `regex_starts_with`, `regex_ends_with` |
 | `json` | `stdlib/json.fd` | `parse`, `stringify`, `get`, `at` |
 | `tensor` | `stdlib/tensor.fd` | n-d arrays, `matmul`, `relu`, `softmax` |
 | `parallel` | `stdlib/parallel.fd` | `par_map`, `par_sum`, `par_dot` |
@@ -260,6 +270,15 @@ Fides's stdlib lives in `stdlib/` and is imported explicitly via `use` (except `
 | `http` | `stdlib/http.fd` | socket + HTTP parsing |
 | `simd` | `stdlib/simd.fd` | elementwise ops, `dot`, `sum`, `scale` (f64x2, f64x4, etc.) |
 | `shape` | `stdlib/shape.fd` | shape system for tensor ops |
+| `quant` | `stdlib/quant.fd` | quantization: `q8`, `q4`, `quantize_q8`, `dequantize_q8`, `qmatmul` |
+| `money` | `stdlib/money.fd` | fixed-point i64 cents, `@linear` struct, arithmetic, formatting |
+| `banking` | `stdlib/banking.fd` | account, deposit, withdraw, transfer, interest |
+| `alloc` | `stdlib/alloc.fd` | heap allocator builtins (`malloc`, `realloc`, `free`) |
+| `file` | `stdlib/file.fd` | file I/O: read, write, append, exists |
+| `time` | `stdlib/time.fd` | `LogicalTime`: timezone-free, `@deterministic` date math |
+| `typed_strings` | `stdlib/typed_strings.fd` | `SQLString`, `ShellString`, `HTMLString`, `JSONString`, `PathString` |
+| `memo` | `stdlib/memo.fd` | `Memo::new`, `get_or_compute` |
+| `privacy` | `stdlib/privacy.fd` | field-level privacy test module |
 
 > **Note:** `Box<T>`, `Rc<T>`, `Arc<T>`, `HashSet<T>`, `Mutex<T>`, and channels are **not** in the current stdlib. Heap allocation uses `p_malloc`/`p_free` directly or via `Vec`/`String`/`HashMap`.
 
@@ -1554,3 +1573,57 @@ defer expr;
 spawn async { }
 expr.await
 ```
+
+---
+
+## 22. LSP Server (Editor Integration)
+
+Fides includes a built-in Language Server Protocol server — no external tools
+required.
+
+### Starting the LSP Server
+
+```bash
+fidesc lsp
+```
+
+This starts a JSON-RPC 2.0 server over stdio. Configure your editor to use
+`fidesc lsp` as the language server command.
+
+### Supported LSP Methods
+
+| Method | Description |
+|--------|-------------|
+| `initialize` | Returns server capabilities (textDocumentSync, diagnosticProvider) |
+| `initialized` | Notification — no response needed |
+| `shutdown` | Prepares for shutdown |
+| `exit` | Terminates the server |
+| `textDocument/didOpen` | Publishes diagnostics when a file is opened |
+| `textDocument/didChange` | Full sync — re-publishes diagnostics on every change |
+| `textDocument/didClose` | Clears document state |
+| `textDocument/publishDiagnostics` | Sends error diagnostics with line/column positions |
+
+### Editor Configuration
+
+**VS Code** (`.vscode/settings.json`):
+```json
+{
+    "fides.languageServerPath": "/path/to/fidesc",
+    "fides.languageServerArgs": ["lsp"]
+}
+```
+
+**Neovim** (`init.lua`):
+```lua
+require'lspconfig'.fides.setup{
+    cmd = {'/path/to/fidesc', 'lsp'},
+    filetypes = {'fides'},
+}
+```
+
+### Notes
+
+- The LSP server uses a built-in JSON parser/serializer — no external Rust
+  dependencies (no serde, no serde_json).
+- Diagnostics are sourced from the compiler's type checker and parser.
+- Text document sync mode is `1` (full document sync).

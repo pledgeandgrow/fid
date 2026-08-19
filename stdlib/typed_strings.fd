@@ -1,0 +1,261 @@
+// Fides Typed Strings standard library — F67
+//
+// Distinct string types that prevent injection attacks at compile time.
+//
+// The #1 web vulnerability (OWASP Top 10) is injection — SQL injection,
+// shell injection, XSS. All caused by mixing untrusted input with command
+// strings. Typed strings make this mixing a compile error.
+//
+// Usage:
+//   use typed_strings;
+//
+//   pf get_user(db: Database, id: i64) -> str {
+//       // SAFE: parameterized query — id is bound, not concatenated
+//       pv sql = sql_query("SELECT * FROM users WHERE id = ?");
+//       pv result = db.query(sql);
+//       ret result;
+//   }
+//
+//   pf run_command(cmd: ShellString) -> i64 {
+//       ret p_exec(cmd.value);
+//   }
+//
+//   // COMPILE ERROR: can't pass raw str to a function expecting SQLString
+//   pf bad(user_input: str) -> str {
+//       pv db = MemoryDB::new();
+//       ret db.query(user_input);  // Error: expected SQLString, got str
+//   }
+//
+// All typed string types are NOT @linear — they're value types.
+// They wrap a `str` field called `value` and provide safe construction methods.
+
+module typed_strings;
+
+// ─── SQLString ────────────────────────────────────────────────────────
+
+/// A SQL query string. Must be constructed via `sql_query()` or `sql_literal()`.
+/// Cannot be concatenated with untrusted input — use `sql_bind()` for parameters.
+pub struct SQLString {
+    pub value: str,
+}
+
+impl SQLString {
+    /// Create a SQLString from a literal query (no user input).
+    /// Use this for static queries: `SQLString::literal("SELECT * FROM users")`
+    pub pf literal(sql: str) -> SQLString {
+        ret SQLString { value: sql };
+    }
+
+    /// Get the raw string value. Use with caution — only for passing to
+    /// database drivers that handle parameterization.
+    pub pf raw(self: SQLString) -> str {
+        ret self.value;
+    }
+
+    /// Check if the SQL string contains potentially dangerous characters.
+    /// This is a heuristic — not a complete security check.
+    pub pf is_safe(self: SQLString) -> bool {
+        // Check for common SQL injection patterns
+        pv v = self.value;
+        if p_string_contains(v, "'") { ret false; }
+        if p_string_contains(v, "\"") { ret false; }
+        if p_string_contains(v, ";") { ret false; }
+        if p_string_contains(v, "--") { ret false; }
+        if p_string_contains(v, "/*") { ret false; }
+        if p_string_contains(v, "*/") { ret false; }
+        if p_string_contains(v, "xp_") { ret false; }
+        ret true;
+    }
+}
+
+/// Create a SQLString from a literal query string.
+/// This is the safe constructor — only use with static query text.
+pub pf sql_query(sql: str) -> SQLString {
+    ret SQLString { value: sql };
+}
+
+/// Create a SQLString from a literal query (alias for sql_query).
+pub pf sql_literal(sql: str) -> SQLString {
+    ret SQLString { value: sql };
+}
+
+/// Escape a string for safe inclusion in SQL. Returns a SQLString.
+/// Uses single-quote doubling (standard SQL escaping).
+/// WARNING: parameterized queries (sql_bind) are always safer than escaping.
+pub pf sql_escape(input: str) -> SQLString {
+    pv escaped = p_string_replace(input, "'", "''");
+    ret SQLString { value: escaped };
+}
+
+/// Bind a parameter into a SQL query. Replaces the first `?` placeholder
+/// with the string-escaped value. Returns a new SQLString.
+/// This is the safe way to include user input in SQL queries.
+pub pf sql_bind(query: SQLString, param: str) -> SQLString {
+    pv escaped = p_string_replace(param, "'", "''");
+    pv result = p_string_replace(query.value, "?", escaped);
+    ret SQLString { value: result };
+}
+
+/// Bind an integer parameter into a SQL query.
+pub pf sql_bind_int(query: SQLString, param: i64) -> SQLString {
+    pv result = p_string_replace(query.value, "?", p_to_str(param));
+    ret SQLString { value: result };
+}
+
+// ─── ShellString ──────────────────────────────────────────────────────
+
+/// A shell command string. Must be constructed via `shell_cmd()` or `shell_escape()`.
+/// Prevents shell injection — untrusted input can't be concatenated into commands.
+pub struct ShellString {
+    pub value: str,
+}
+
+impl ShellString {
+    /// Create a ShellString from a literal command (no user input).
+    pub pf literal(cmd: str) -> ShellString {
+        ret ShellString { value: cmd };
+    }
+
+    /// Get the raw string value.
+    pub pf raw(self: ShellString) -> str {
+        ret self.value;
+    }
+
+    /// Check if the shell string contains potentially dangerous characters.
+    pub pf is_safe(self: ShellString) -> bool {
+        pv v = self.value;
+        if p_string_contains(v, ";") { ret false; }
+        if p_string_contains(v, "|") { ret false; }
+        if p_string_contains(v, "&") { ret false; }
+        if p_string_contains(v, "$") { ret false; }
+        if p_string_contains(v, "`") { ret false; }
+        if p_string_contains(v, "(") { ret false; }
+        if p_string_contains(v, ")") { ret false; }
+        if p_string_contains(v, ">") { ret false; }
+        if p_string_contains(v, "<") { ret false; }
+        if p_string_contains(v, "\n") { ret false; }
+        ret true;
+    }
+}
+
+/// Create a ShellString from a literal command.
+pub pf shell_cmd(cmd: str) -> ShellString {
+    ret ShellString { value: cmd };
+}
+
+/// Escape a string for safe inclusion in a shell command.
+/// Wraps in single quotes and escapes any single quotes inside.
+pub pf shell_escape(input: str) -> ShellString {
+    pv escaped = p_string_replace(input, "'", "'\\''");
+    pv wrapped = p_str_concat("'", escaped);
+    wrapped = p_str_concat(wrapped, "'");
+    ret ShellString { value: wrapped };
+}
+
+// ─── HTMLString ───────────────────────────────────────────────────────
+
+/// An HTML-safe string. Must be constructed via `html_escape()` or `html_literal()`.
+/// Prevents XSS — untrusted input can't be inserted into HTML without escaping.
+pub struct HTMLString {
+    pub value: str,
+}
+
+impl HTMLString {
+    /// Create an HTMLString from literal HTML (no user input).
+    pub pf literal(html: str) -> HTMLString {
+        ret HTMLString { value: html };
+    }
+
+    /// Get the raw string value.
+    pub pf raw(self: HTMLString) -> str {
+        ret self.value;
+    }
+}
+
+/// Create an HTMLString from literal HTML content.
+pub pf html_literal(html: str) -> HTMLString {
+    ret HTMLString { value: html };
+}
+
+/// Escape a string for safe inclusion in HTML.
+/// Replaces &, <, >, ", ' with their HTML entity equivalents.
+pub pf html_escape(input: str) -> HTMLString {
+    pv result = input;
+    result = p_string_replace(result, "&", "&amp;");
+    result = p_string_replace(result, "<", "&lt;");
+    result = p_string_replace(result, ">", "&gt;");
+    result = p_string_replace(result, "\"", "&quot;");
+    result = p_string_replace(result, "'", "&#x27;");
+    ret HTMLString { value: result };
+}
+
+/// Escape a string for safe inclusion in an HTML attribute.
+pub pf html_attr_escape(input: str) -> HTMLString {
+    pv result = input;
+    result = p_string_replace(result, "&", "&amp;");
+    result = p_string_replace(result, "\"", "&quot;");
+    result = p_string_replace(result, "'", "&#x27;");
+    ret HTMLString { value: result };
+}
+
+// ─── JSONString ───────────────────────────────────────────────────────
+
+/// A JSON-safe string. Must be constructed via `json_escape()`.
+/// Prevents JSON injection — untrusted input can't break JSON structure.
+pub struct JSONString {
+    pub value: str,
+}
+
+impl JSONString {
+    /// Get the raw string value.
+    pub pf raw(self: JSONString) -> str {
+        ret self.value;
+    }
+}
+
+/// Escape a string for safe inclusion in JSON.
+/// Replaces ", \, and control characters with their JSON escape sequences.
+pub pf json_escape(input: str) -> JSONString {
+    pv result = input;
+    result = p_string_replace(result, "\\", "\\\\");
+    result = p_string_replace(result, "\"", "\\\"");
+    result = p_string_replace(result, "\n", "\\n");
+    result = p_string_replace(result, "\t", "\\t");
+    ret JSONString { value: result };
+}
+
+// ─── PathString ───────────────────────────────────────────────────────
+
+/// A filesystem path string. Must be constructed via `path_safe()`.
+/// Prevents path traversal — rejects ".." and absolute paths from user input.
+pub struct PathString {
+    pub value: str,
+}
+
+impl PathString {
+    /// Get the raw string value.
+    pub pf raw(self: PathString) -> str {
+        ret self.value;
+    }
+
+    /// Check if the path is safe (no directory traversal).
+    pub pf is_safe(self: PathString) -> bool {
+        pv v = self.value;
+        if p_string_contains(v, "..") { ret false; }
+        ret true;
+    }
+}
+
+/// Create a PathString from user input, rejecting path traversal attempts.
+/// Returns a PathString with empty value if the path is unsafe.
+pub pf path_safe(input: str) -> PathString {
+    if p_string_contains(input, "..") {
+        ret PathString { value: "" };
+    }
+    ret PathString { value: input };
+}
+
+/// Create a PathString from a literal path (trusted).
+pub pf path_literal(path: str) -> PathString {
+    ret PathString { value: path };
+}

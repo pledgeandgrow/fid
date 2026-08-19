@@ -5,7 +5,11 @@ pub enum TokenKind {
     // Keywords
     Pf,          // pf — Fides Function
     Pv,          // pv — Fides Variable
+    Pm,          // pm — Fides Mutable (uninitialized)
     Mut,         // mut
+    Const,       // const — for *const T raw pointer types
+    Given,       // given — precondition contract (F10)
+    Ensure,      // ensure — postcondition contract (F10)
     Pc,          // pc — Fides Constant
     Cap,         // cap — capability/trait
     Ty,          // ty — type alias
@@ -160,7 +164,11 @@ impl fmt::Display for TokenKind {
         match self {
             TokenKind::Pf => write!(f, "pf"),
             TokenKind::Pv => write!(f, "pv"),
+            TokenKind::Pm => write!(f, "pm"),
             TokenKind::Mut => write!(f, "mut"),
+            TokenKind::Const => write!(f, "const"),
+            TokenKind::Given => write!(f, "given"),
+            TokenKind::Ensure => write!(f, "ensure"),
             TokenKind::Pc => write!(f, "pc"),
             TokenKind::Cap => write!(f, "cap"),
             TokenKind::Ty => write!(f, "ty"),

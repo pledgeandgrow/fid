@@ -21,6 +21,9 @@ pub enum Type {
     /// Array with const generic size: [T; N] where N is a type param
     ArrayConst { elem: Box<Type>, size_param: String },
     Ref { inner: Box<Type>, is_mut: bool },
+    /// Raw pointer type: *mut T or *const T
+    /// Only allowed inside unsafe {} blocks. Like Rust's raw pointers.
+    RawPtr { inner: Box<Type>, is_mut: bool },
     Generic { name: String, args: Vec<Type> },
     Tuple(Vec<Type>),
     Func {
@@ -77,6 +80,10 @@ impl std::fmt::Display for Type {
             Type::ArrayConst { elem, size_param } => write!(f, "[{}; {}]", elem, size_param),
             Type::Ref { inner, is_mut } => {
                 if *is_mut { write!(f, "&mut ")? } else { write!(f, "&")? }
+                write!(f, "{}", inner)
+            }
+            Type::RawPtr { inner, is_mut } => {
+                if *is_mut { write!(f, "*mut ")? } else { write!(f, "*const ")? }
                 write!(f, "{}", inner)
             }
             Type::Generic { name, args } => {
@@ -273,6 +280,16 @@ pub enum Expr {
         expr: Box<Expr>,
         target_ty: Type,
     },
+    /// await <expr> — suspend current function until the Future is ready (F: async/await)
+    /// The expression must evaluate to a Future<T>. Returns T.
+    Await {
+        expr: Box<Expr>,
+    },
+    /// spawn <expr> — create a concurrent task, returns Future<T> (F: async/await)
+    /// The expression is evaluated lazily in a new concurrent context.
+    Spawn {
+        expr: Box<Expr>,
+    },
 }
 
 /// Compile-time reflection operations (Phase 3A)
@@ -369,6 +386,14 @@ pub enum Stmt {
     LetTuple {
         names: Vec<String>,
         expr: Expr,
+        line: usize,
+    },
+    /// Uninitialized mutable declaration: `pm x: i64;`
+    /// The variable is declared without an initializer.
+    /// The typechecker enforces that it must be assigned before read (F63: init guarantee).
+    LetUninit {
+        name: String,
+        ty: Type,
         line: usize,
     },
     Assign {
@@ -514,6 +539,7 @@ impl Stmt {
         match self {
             Stmt::Let { line, .. }
             | Stmt::LetTuple { line, .. }
+            | Stmt::LetUninit { line, .. }
             | Stmt::Assign { line, .. }
             | Stmt::IndexAssign { line, .. }
             | Stmt::DerefAssign { line, .. }
@@ -590,6 +616,15 @@ pub struct Func {
     pub is_interrupt: bool,
     /// Annotations attached to this function (e.g. @kernel, @serve, @on(gpu))
     pub annotations: Vec<Annotation>,
+    /// Precondition contracts (F10: `given <expr>`). Must be true on entry.
+    /// The typechecker verifies these at call sites with known argument values.
+    pub preconditions: Vec<Expr>,
+    /// Postcondition contracts (F10: `ensure <expr>`). Must be true on exit.
+    /// `result` is a special identifier bound to the return value.
+    pub postconditions: Vec<Expr>,
+    /// Whether this is an async function (Phase 7.6: async/await).
+    /// Async functions return Future<T> and can use `await` inside.
+    pub is_async: bool,
 }
 
 /// An annotation: @name or @name(args)
@@ -606,6 +641,8 @@ pub struct StructDef {
     pub is_pub: bool,
     /// Annotations attached to this struct (e.g. @linear)
     pub annotations: Vec<Annotation>,
+    /// Type parameters for generic structs (e.g. ["T"] for Box<T>)
+    pub type_params: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -619,6 +656,8 @@ pub struct EnumDef {
     pub name: String,
     pub variants: Vec<EnumVariant>,
     pub is_pub: bool,
+    /// Type parameters for generic enums (e.g. ["T"] for Option<T>, ["T", "E"] for Result<T, E>)
+    pub type_params: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -1,0 +1,87 @@
+// Test: OS threads + atomics + mutex (Phase 8A)
+//
+// spawn <call> creates a real OS thread that runs concurrently.
+// await <future> joins the thread and returns its result.
+// Atomics provide lock-free shared memory.
+// Mutex provides mutual exclusion.
+
+/// Worker function — increments a shared counter 100 times using a mutex.
+pf worker(counter: i64, m: i64) -> i64 {
+    pv i = 0;
+    while i < 100 {
+        p_mutex_lock(m);
+        pv old = p_atomic_add(counter, 1);
+        p_mutex_unlock(m);
+        i = i + 1;
+    }
+    ret 0;
+}
+
+/// Simple worker that just returns a value (no shared state).
+pf simple_worker(x: i64) -> i64 {
+    ret x * 3;
+}
+
+pf main() {
+    // Test 1: Simple thread spawn + join
+    pv fut = spawn simple_worker(7);
+    pv result = await fut;
+    print("simple = ");
+    print(result);
+    print("\n");
+
+    // Test 2: Atomic operations
+    pv counter = p_shared_alloc(8);
+    p_atomic_store(counter, 42);
+    pv loaded = p_atomic_load(counter);
+    print("atomic_load = ");
+    print(loaded);
+    print("\n");
+
+    pv old = p_atomic_add(counter, 8);
+    print("atomic_add old = ");
+    print(old);
+    print("\n");
+    pv new_val = p_atomic_load(counter);
+    print("atomic_add new = ");
+    print(new_val);
+    print("\n");
+
+    // Test 3: CAS
+    pv cas_ok = p_atomic_cas(counter, 50, 100);
+    print("cas_ok = ");
+    print(cas_ok);
+    print("\n");
+    pv after_cas = p_atomic_load(counter);
+    print("after_cas = ");
+    print(after_cas);
+    print("\n");
+
+    // Test 4: Mutex
+    pv m = p_mutex_init();
+    p_mutex_lock(m);
+    p_mutex_unlock(m);
+    print("mutex_ok\n");
+
+    // Test 5: Multiple threads with shared counter + mutex
+    pv counter2 = p_shared_alloc(8);
+    p_atomic_store(counter2, 0);
+    pv m2 = p_mutex_init();
+
+    // Spawn 3 threads, each increments 100 times
+    pv t1 = spawn worker(counter2, m2);
+    pv t2 = spawn worker(counter2, m2);
+    pv t3 = spawn worker(counter2, m2);
+
+    // Join all threads
+    pv r1 = await t1;
+    pv r2 = await t2;
+    pv r3 = await t3;
+
+    pv final = p_atomic_load(counter2);
+    print("final_counter = ");
+    print(final);
+    print("\n");
+
+    print("OK\n");
+}

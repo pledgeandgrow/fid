@@ -160,6 +160,7 @@ fn substitute_stmts(stmts: &mut [Stmt], original: &Program, errs: &mut Vec<Strin
 fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<String>) {
     match stmt {
         Stmt::Let { expr, .. } => substitute_expr(expr, original, errs),
+        Stmt::LetUninit { .. } => {} // No expression to substitute
         Stmt::LetTuple { expr, .. } => substitute_expr(expr, original, errs),
         Stmt::Txn { body, .. } => substitute_stmts(body, original, errs),
         Stmt::Assign { expr, .. } => substitute_expr(expr, original, errs),
@@ -336,6 +337,9 @@ fn substitute_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<String>) 
             substitute_expr(right, original, errs);
         }
         Expr::QuantCast { expr: inner, .. } => {
+            substitute_expr(inner, original, errs);
+        }
+        Expr::Await { expr: inner } | Expr::Spawn { expr: inner } => {
             substitute_expr(inner, original, errs);
         }
     }

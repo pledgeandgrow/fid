@@ -4067,6 +4067,65 @@ p_print_map:
     text.push(0xc3); // ret
 
     // ═══════════════════════════════════════════════════════════════════════
+    // Environment, args, and process control builtins
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // p_exit(rdi = exit code) -> void
+    // sys_exit(60) with code in rdi
+    sym!("p_exit");
+    // movq %rdi, %rax  → 48 89 f8  (wait, sys_exit takes code in rdi, not rax)
+    // Actually: sys_exit(code) → rax=60, rdi=code, syscall
+    // rdi already has the code, just set rax=60 and syscall
+    // movq $60, %rax  → 48 c7 c0 3c 00 00 00
+    text.extend_from_slice(&[0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00]);
+    // syscall  → 0f 05
+    text.extend_from_slice(&[0x0f, 0x05]);
+    // ud2 (should not return)
+    text.extend_from_slice(&[0x0f, 0x0b]);
+
+    // p_getenv(rdi = name ptr) -> *u8
+    // Stub: returns NULL (0) — full implementation requires environ access
+    // TODO: Save environ from _start and search it
+    sym!("p_getenv");
+    // xorq %rax, %rax  → 48 31 c0
+    text.extend_from_slice(&[0x48, 0x31, 0xc0]);
+    text.push(0xc3); // ret
+
+    // p_argc() -> i64
+    // Stub: returns 1 (just program name)
+    // TODO: Save argc from _start
+    sym!("p_argc");
+    // movq $1, %rax  → 48 c7 c0 01 00 00 00
+    text.extend_from_slice(&[0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00]);
+    text.push(0xc3); // ret
+
+    // p_argv(rdi = index) -> *u8
+    // Stub: returns NULL — full implementation requires argv access
+    // TODO: Save argv from _start
+    sym!("p_argv");
+    // xorq %rax, %rax  → 48 31 c0
+    text.extend_from_slice(&[0x48, 0x31, 0xc0]);
+    text.push(0xc3); // ret
+
+    // p_system(rdi = cmd ptr) -> i64
+    // Uses sys_execve via /bin/sh -c <cmd>
+    // This is a simplified version: forks and execs /bin/sh -c <cmd>
+    // For now, stub returns -1 (not supported in native runtime)
+    // TODO: Implement fork+execve with syscall 57+59
+    sym!("p_system");
+    // movq $-1, %rax  → 48 c7 c0 ff ff ff ff
+    text.extend_from_slice(&[0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff]);
+    text.push(0xc3); // ret
+
+    // p_regex_match(rdi = s ptr, rsi = pattern ptr) -> bool
+    // Stub: returns false — full implementation would need string matching in assembly
+    // TODO: Implement wildcard match in assembly
+    sym!("p_regex_match");
+    // xorq %rax, %rax  → 48 31 c0
+    text.extend_from_slice(&[0x48, 0x31, 0xc0]);
+    text.push(0xc3); // ret
+
+    // ═══════════════════════════════════════════════════════════════════════
     // FFI function aliases — c_* names used by test_ffi_full
     // These point to the same code as the pledge_* versions above.
     // We record the current text offsets as symbol addresses.

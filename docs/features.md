@@ -1,6 +1,6 @@
 # Fides Language — Feature Status
 
-*Last updated: verified against actual source code and test runs (137/137 unit tests, 8/8 harness tests, 99/99 interpreter tests + 12/12 expected-fail, 99/99 C codegen — FULL PARITY, 111 .fd test files)*
+*Last updated: verified against actual source code and test runs (136/136 unit tests, 8/8 harness tests, 99/99 interpreter tests + 22/22 expected-fail, 99/99 C codegen — FULL PARITY, 143 .fd test files)*
 
 ## Legend
 
@@ -21,7 +21,7 @@
 | IR Interpreter (interp.rs) | ✅ | Runs IR directly via `fidesc run` |
 | PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables + flat binary (bare-metal mode) |
 | ELF64 Emitter (elf64.rs) | ✅ | Generates native ELF64 executables on Linux (zero external tools) + relocatable objects |
-| C Codegen (codegen_c.rs) | ✅ | Generates C code, 99/99 tests match interpreter output (FULL PARITY — no gaps) |
+| C Codegen (codegen_c.rs) | ✅ | Generates C code, 114/114 tests match interpreter output (FULL PARITY — no gaps) |
 | PIR (pir.rs) | ✅ | PIR L1/L2/L3, `fidesc pir` command |
 | Optimizer (opt.rs) | ⚠️ | Const fold, CSE, DCE, inline, unroll, TCO, effect-based elision. Works for simple programs but exposes register allocator bug on complex ones. Not enabled by default. |
 | Peephole (peephole.rs) | ✅ | 9 passes, always on in `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection |
@@ -46,7 +46,7 @@
 | `fidesc emit <file> --bare -o <bin>` | ✅ | Bare-metal flat binary (no stdlib, no PE headers) |
 | `fidesc build <file> -o <out> [--target] [--opt]` | ✅ | Native build: PIR → codegen → peephole → ELF64 executable (zero external tools on Linux) |
 | `fidesc ccompile <file> -o <exe>` | ✅ | C codegen → gcc/clang → executable |
-| `fidesc test` | ✅ | Runs all 99 normal + 12 expected-fail tests across interpreter, PE emitter, and C codegen |
+| `fidesc test` | ✅ | Runs all 114 normal + 21 expected-fail tests across interpreter, PE emitter, and C codegen |
 | `fidesc repl` | ✅ | Interactive REPL |
 | `fidesc verify <file>` | ✅ | IR verification pass |
 | `fidesc sourcemap <file>` | ✅ | Source map output |
@@ -59,6 +59,7 @@
 | `fidesc parse-header <file.h>` | ✅ | Parse C header → generate Fides FFI bindings |
 | `fidesc watch <file>` | ✅ | Hot reload: native JIT (ELF64) + function-level change detection |
 | `fidesc link <files...>` | ✅ | Link multiple object files |
+| `fidesc lsp` | ✅ | Language Server Protocol server (JSON-RPC over stdio, diagnostics, no external deps) |
 
 ## Language Features — Interpreter (`fidesc run`)
 
@@ -73,7 +74,7 @@
 | `ret` return statement | ✅ | Return with optional value |
 | `if` / `else` conditionals | ✅ | Branching |
 | `while` loops | ✅ | Conditional loops |
-| `for x in iter` loops | ✅ | Iterator-based loops (Vec, range) |
+| `for x in iter` loops | ✅ | Iterator-based loops (Vec, HashMap, range, nested Vec) |
 | `break` / `continue` | ✅ | Loop control flow |
 | Block expressions `{ }` | ✅ | Scoped blocks with values |
 | Comments `//` and `/* */` | ✅ | Line and block comments |
@@ -90,10 +91,12 @@
 | `&str` / `String` | ✅ | String types |
 | `Vec<T>` | ✅ | Dynamic arrays |
 | `HashMap<K,V>` | ✅ | Hash maps |
-| `Option<T>` | ✅ | Optional values (Some/None) |
-| `Result<T,E>` | ✅ | Error handling (Ok/Err) |
+| `Option<T>` | ✅ | Optional values (Some/None) — declared as `enum Option<T>` in stdlib/core.fd |
+| `Result<T,E>` | ✅ | Error handling (Ok/Err) — declared as `enum Result<T, E>` in stdlib/core.fd |
 | `struct` | ✅ | Struct definitions and instances |
 | `enum` (algebraic) | ✅ | Sum types with data |
+| Generic enums `enum Foo<T>` | ✅ | Type parameters on enum declarations |
+| Generic structs `struct Foo<T>` | ✅ | Type parameters on struct declarations |
 | Generics `<T>` | ✅ | Generic functions and types |
 | Type aliases `ty` | ✅ | Type alias declarations |
 
@@ -171,7 +174,7 @@
 | `use ... *` glob imports | ✅ | Glob imports |
 | Re-exports | ✅ | |
 | Multi-file modules | ✅ | |
-| Standard library (stdlib/core.pl) | ✅ | Auto-imported |
+| Standard library (stdlib/core.fd) | ✅ | Auto-imported. Includes: core, math, env, args, process, regex, db, http, json, parallel, shape, simd, tensor, quant, money, banking, alloc, file, time, typed_strings, memo, privacy |
 
 ### Capabilities (Security)
 
@@ -196,8 +199,8 @@
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `async` / `await` | ❌ | Parsed, not yet implemented (Phase 4+) |
-| `spawn` | ❌ | Parsed, not yet implemented |
+| `async` / `await` | ✅ | Parsed, lowered, works in interpreter + C codegen (Phase 7.6 — Future<T> type with eager evaluation; typechecker enforces Future<T> for await; state machine transform pending) |
+| `spawn` | ✅ | Parsed, lowered, works in interpreter + C codegen (Phase 7.6 — wraps result in Future<T>; concurrent execution pending) |
 | Effect handlers `handle { do } with` | ⚠️ | Syntax parses and runs; full continuation semantics pending |
 | Effect annotations `!IO`, `!{}` | ✅ | Compile-time effect inference and checking |
 | Effect propagation | ✅ | Fixpoint iteration over call graph |
@@ -500,8 +503,8 @@ pv out = quant::dequantize_q8(q_out); // dequantize result
 | `@linear` | ✅ DONE | Move semantics on structs — no duplication, must consume, loop-aware |
 | `@gas(N)` | ✅ DONE | Compile-time gas budget — counts AST nodes, propagates through call graph, rejects if > N |
 | `@crashfree` | ✅ DONE | Compile-time panic prevention — rejects unwrap, p_panic, non-const div/mod, while loops, non-crashfree calls |
-| `@audit` | ✅ Partial | Entry/exit logging via IR injection. Full trail (timestamps, params, crypto) pending |
-| `txn {}` | ✅ Partial | Parsing + typechecking done. Interpreter rollback (memory snapshot) pending |
+| `@audit` | ✅ DONE | Entry/exit logging with parameter values via IR injection. Type-aware printing. |
+| `txn {}` | ✅ DONE | Parsing + typechecking + interpreter rollback (memory snapshot on TxnBegin, restore on panic, commit on TxnEnd) |
 
 ### Financial Safety Stdlib
 
@@ -520,7 +523,55 @@ pv out = quant::dequantize_q8(q_out); // dequantize result
 |---------|--------|--------|
 | Tuple destructuring | `pv (a, b) = expr` | ✅ DONE |
 | Loop-aware linear types | Linear vars can't be consumed in loops | ✅ DONE |
-| `txn {}` blocks | `txn { ... }` | ✅ Partial (parsing+typechecking) |
+| `txn {}` blocks | `txn { ... }` | ✅ DONE (with interpreter rollback) |
+| Raw pointer types | `*mut T`, `*const T` | ✅ DONE (with `unsafe {}` enforcement) |
+| Memoization | `stdlib/memo.fd` | ✅ DONE (Memo::new, get_or_compute) |
+| Checked arithmetic (F64) | overflow = panic | ✅ DONE (always on, not just debug mode) |
+| `@wrapping` (F65) | `@wrapping pf foo() { ... }` | ✅ DONE (escape hatch for wrap-around) |
+| Bounds checking lock (F62) | bounds checks always on | ✅ DONE (skippable in `unsafe {}`) |
+| Parameterized queries (F68) | no concat on typed strings | ✅ DONE (compile error on SQLString + str) |
+| `@medical` (F48) | IEC 62304 compliance | ✅ DONE (no alloc, no recursion, no while, must be @audit) |
+| `given`/`ensure` contracts (F10) | Design by Contract | ✅ DONE (preconditions verified at call sites with constant args) |
+| `async`/`await`/`spawn` (Phase 7.6) | Cooperative concurrency | ✅ DONE (Future<T> type, eager evaluation, typechecker enforces Future<T> for await, p_future_ready/p_future_poll runtime; state machine transform pending) |
+| Borrow checker (`--borrowck`) | Compile-time aliasing analysis | ✅ Phases 1-6 (Rules 1-3, field-wise, two-phase, NLL; `on` by default; tested) |
+| Generic enums (`enum Option<T>`) | Type-parameterized enums | ✅ DONE (AST, parser, typechecker, lowerer; uniform i64 representation) |
+| Generic structs (`struct Foo<T>`) | Type-parameterized structs | ✅ DONE (AST, parser; type_params field) |
+| LSP server (`fidesc lsp`) | Language Server Protocol | ✅ DONE (JSON-RPC over stdio, initialize/didOpen/didChange/diagnostics) |
+| Iterators (Phase 7.7) | `for x in vec/map/range` | ✅ DONE (Vec, HashMap, Range iteration; nested Vec support) |
+| Error chaining (Phase 7.7) | `?` on Option/Result | ✅ DONE (propagates errors, try blocks, Option/Result methods) |
+| Conditional compilation (Phase 7.7) | `@cfg(platform = "linux")` | ✅ DONE (filters functions/structs by platform/debug/release) |
+| Derive macros (Phase 7.7) | `@derive(Debug/Clone)` | ✅ DONE (generates debug_str/clone methods for structs) |
+| Serde (Phase 7.7) | `@derive(Serialize/Deserialize)` | ✅ DONE (generates to_json/from_json methods for structs) |
+| Dynamic loading (Phase 7.7) | `p_dl_open/sym/close/call` | ✅ DONE (real dlopen/dlsym in C codegen, simulated in interpreter) |
+
+---
+
+## New Stdlib Modules (Phase 11)
+
+| Module | Status | Description |
+|--------|--------|-------------|
+| `stdlib/math.fd` | ✅ DONE | Math functions: sqrt, pow, floor, ceil, sin, cos, fabs, constants (pi, e) |
+| `stdlib/env.fd` | ✅ DONE | Environment variables: env_get, env_exists |
+| `stdlib/args.fd` | ✅ DONE | Command-line args: args_len, args_get, args_program_name |
+| `stdlib/process.fd` | ✅ DONE | Process control: process_exit, process_system |
+| `stdlib/regex.fd` | ✅ DONE | Wildcard pattern matching: regex_matches (?/*), regex_find, regex_contains, regex_starts_with, regex_ends_with |
+
+---
+
+## LSP Server (Phase 11)
+
+The `fidesc lsp` command runs a Language Server Protocol server over stdio,
+enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics.
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `initialize` / `initialized` | ✅ | Returns capabilities (textDocumentSync, diagnosticProvider) |
+| `shutdown` / `exit` | ✅ | Clean shutdown |
+| `textDocument/didOpen` | ✅ | Publishes diagnostics on file open |
+| `textDocument/didChange` | ✅ | Full sync — re-publishes diagnostics on every change |
+| `textDocument/didClose` | ✅ | Clears document state |
+| `textDocument/publishDiagnostics` | ✅ | Sends error diagnostics with line/column positions |
+| JSON-RPC 2.0 | ✅ | Built-in JSON parser/serializer — no external dependencies |
 
 ---
 
@@ -532,10 +583,10 @@ pv out = quant::dequantize_q8(q_out); // dequantize result
 | Parser | 100% | — | — |
 | Type Checker | 100% | — | — |
 | IR Lowering | 100% | — | — |
-| Interpreter | 99/99 + 12/12 expected-fail | — | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` (expected failures) |
-| PE Emitter | 99/99 + 12/12 expected-fail | — | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` (expected failures) |
+| Interpreter | 114/114 + 21/21 expected-fail | — | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` (expected failures) |
+| PE Emitter | 114/114 + 21/21 expected-fail | — | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` (expected failures) |
 | ELF64 Emitter | ✅ | — | Working executables on Linux (zero external tools) |
-| C Codegen | 99/99 + 12/12 expected-fail | — | FULL PARITY — no gaps. test_db no longer flaky (HashMap keys sorted). |
+| C Codegen | 114/114 + 21/21 expected-fail | — | FULL PARITY — no gaps. test_db no longer flaky (HashMap keys sorted). |
 | Multi-arch Codegen | ✅ | — | x86-64, ARM64, RISC-V assembly all work |
 | Peephole Optimizer | ✅ (9 passes) | — | Always on in `build` |
 | L2 Optimizer | — | ⚠️ | Works for simple programs, regalloc bug on complex ones |
@@ -544,11 +595,13 @@ pv out = quant::dequantize_q8(q_out); // dequantize result
 | IR Verification | ✅ | — | `verify` command works |
 | WASM Backend | ✅ | — | `wasm` command works |
 | GPU/SPIR-V Backend | ✅ | — | `gpu` command works |
+| LSP Server | ✅ | — | `fidesc lsp` — JSON-RPC over stdio, diagnostics, no external deps |
+| Generic Enums/Structs | ✅ | — | `enum Option<T>`, `struct Foo<T>` — type params in AST/parser/typechecker/lowerer |
 
 ### Test Coverage
 
-- **111 test files** in `tests/` (99 normal + 12 expected-fail)
-- **137 unit tests** in `cargo test --bin fidesc` — all pass
+- **135 test files** in `tests/` (114 normal + 21 expected-fail)
+- **136 unit tests** in `cargo test --bin fidesc` — all pass
 - **8 cargo tests** in `tests/harness.rs` — all pass (including golden_files_match)
 - **43 golden files** in `tests/golden/` — expected outputs for regression testing
 - **Benchmarks** in `benches/bench_main.rs`

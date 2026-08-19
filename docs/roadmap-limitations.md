@@ -32,11 +32,11 @@ This section has been **verified by reading source code, running tests, and exec
 
 | Test Group | README Claims | Actual (Verified) | Discrepancy |
 |------------|--------------|-------------------|-------------|
-| Unit tests (`cargo test --bin fidesc`) | 137/137 | **137/137** | README now accurate |
+| Unit tests (`cargo test --bin fidesc`) | 136/136 | **136/136** | README now accurate |
 | Harness tests (`cargo test --test harness`) | 8/8 | **8/8** (golden_files_match passes) | README now accurate |
-| Interpreter (`run`) | 99/99 + 12/12 expected-fail | **99/99 + 12/12 expected-fail** (test_trait_verify_fail, test_budget_fail, test_sandbox_fail) | README now accurate |
-| PE Emitter (`emit`) | 99/99 + 12/12 expected-fail | **99/99 + 12/12 expected-fail** valid | README now accurate |
-| C Codegen (`ccompile`) | 99/99 + 12/12 expected-fail | **99/99** matched (FULL PARITY — no gaps. test_asm emits asm as comments, test_comptime_reflect uses Type::Str for array elements.) | README now accurate |
+| Interpreter (`run`) | 114/114 + 21/21 expected-fail | **114/114 + 21/21 expected-fail** (test_trait_verify_fail, test_budget_fail, test_sandbox_fail) | README now accurate |
+| PE Emitter (`emit`) | 114/114 + 21/21 expected-fail | **114/114 + 21/21 expected-fail** valid | README now accurate |
+| C Codegen (`ccompile`) | 114/114 + 21/21 expected-fail | **114/114** matched (FULL PARITY — no gaps. test_asm emits asm as comments, test_comptime_reflect uses Type::Str for array elements.) | README now accurate |
 | Compiler warnings | 215 | **215** | README now accurate |
 
 ### Feature Verification Matrix (Code-Verified)
@@ -83,10 +83,10 @@ These tests pass in the interpreter but FAIL in C codegen (expected failures):
 
 **ACTUALLY WORKS (code-verified):**
 - Lexer, parser, typechecker, IR lowering ✅
-- Interpreter (`run`) — 99/99 + 12/12 expected-fail tests ✅
-- PE emitter (`emit`) — 99/99 + 12/12 expected-fail valid PE files ✅ (Windows-only, can't run on Linux)
+- Interpreter (`run`) — 114/114 + 21/21 expected-fail tests ✅
+- PE emitter (`emit`) — 114/114 + 21/21 expected-fail valid PE files ✅ (Windows-only, can't run on Linux)
 - ELF64 executables (`build --target x86-64`) — working Linux executables, zero external tools ✅
-- C codegen (`ccompile`) — 99/99 match ✅ (FULL PARITY — no gaps. All tests pass in both interpreter and C codegen.)
+- C codegen (`ccompile`) — 114/114 match ✅ (FULL PARITY — no gaps. All tests pass in both interpreter and C codegen.)
 - PIR (L1/L2/L3) — `pir` command ✅
 - Optimizer — `opt` command and `build --opt` ✅ (simple programs only — ⚠️ regalloc bug: constants not loaded into registers before use can be clobbered by intervening instructions, prevents `--opt` from being default)
 - Register allocator — wired into `codegen_x64` (used by `build`/`codegen`) ⚠️ (pre-existing bug)
@@ -119,9 +119,9 @@ These tests pass in the interpreter but FAIL in C codegen (expected failures):
 1. "C FFI: Not parsed" → **WAS WRONG, FFI works** — README now says "Yes (stubs)"
 2. "Const generics: Parsed, pending" → **WAS WRONG, const generics work** — README now says "Yes"
 3. "GATs: Not parsed" → **WAS WRONG, GATs work** — README now says "Yes"
-4. "52/52 interpreter tests" → **WAS WRONG, it's 99/99 + 12/12 expected-fail** — README now correct
-5. "52/52 PE emitter" → **WAS WRONG, it's 99/99 + 12/12 expected-fail** — README now correct
-6. "38+ C codegen matched" → **WAS WRONG, it's 99/99 (FULL PARITY)** — README now correct
+4. "52/52 interpreter tests" → **WAS WRONG, it's 114/114 + 21/21 expected-fail** — README now correct
+5. "52/52 PE emitter" → **WAS WRONG, it's 114/114 + 21/21 expected-fail** — README now correct
+6. "38+ C codegen matched" → **WAS WRONG, it's 114/114 (FULL PARITY)** — README now correct
 7. "async/spawn: Parsed" → **MISLEADING, tokenized but not parsed** — README now says "Parsed"
 8. "Optimizer not in default pipeline" → **WAS PARTIALLY WRONG, wired into `build --opt`** — README now documents this
 9. "Register allocator not in default pipeline" → **WAS PARTIALLY WRONG, wired into `build`/`codegen`** — README now documents this
@@ -353,7 +353,7 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 - [ ] **Not redoing:** The type system features — just fixing docs and verifying backends
 
 #### L1I — Fix HTTP/JSON/DB/SIMD/Tensor in C Codegen
-- [x] **VERIFIED:** C codegen is at FULL PARITY with interpreter — 99/99 tests match. No gaps remain. `test_asm` emits asm as comments (matching interpreter no-op). `test_comptime_reflect` uses `Type::Str` for array elements (matching `StringLit` → `ConstStr` lowering). `test_trait_verify_fail` is expected-fail (correctly rejected).
+- [x] **VERIFIED:** C codegen is at FULL PARITY with interpreter — 114/114 tests match. No gaps remain. `test_asm` emits asm as comments (matching interpreter no-op). `test_comptime_reflect` uses `Type::Str` for array elements (matching `StringLit` → `ConstStr` lowering). `test_trait_verify_fail` is expected-fail (correctly rejected).
 - [x] **VERIFIED:** These now PASS in C codegen (previously failed): `test_http`, `test_json`, `test_simd`, `test_tensor`, `test_interrupt`, `test_mmu`, `test_matrix_mul`, `test_shape`, `test_const_generic`, `test_bounds_check`, `test_trait_object`, `test_gat`, `test_comptime_serialize`, `test_boot`, `test_parallel`, `test_print_map`, `test_regression_collections`, `test_type_alias`, `test_vec_one`, `strings`, `test_fstring_int`, `test_fstring_vec`
 - [x] **VERIFIED:** These all PASS in interpreter
 - [ ] Fix C codegen to support: inline assembly, comptime reflection, DB builtins (remaining 3 real failures; test_trait_verify_fail is expected)
@@ -1224,8 +1224,8 @@ Every phase explicitly notes what is already built and what is new work. This ta
 |-----------------------------------|------------------------|
 | Lexer, parser, typechecker | Wire optimizer into `emit` command (L1A) |
 | IR, PIR (L1/L2/L3) | Wire register allocator into `emit` command (L1B) |
-| PE emitter (99/99 + 12/12 expected-fail valid) | Wire peephole into `emit` command |
-| C codegen (99/99 match — FULL PARITY) | ✅ DONE — all C codegen gaps closed |
+| PE emitter (114/114 + 21/21 expected-fail valid) | Wire peephole into `emit` command |
+| C codegen (114/114 match — FULL PARITY) | ✅ DONE — all C codegen gaps closed |
 | PIR optimizer (9 passes) — wired into `build --opt` | Wire optimizer into `emit` and `build` default (L1A) |
 | Peephole optimizer (9 passes) — always on in `build` command | Wire peephole into `emit` command |
 | Register allocator — wired into `codegen_x64` (`build`/`codegen`) | Wire register allocator into `emit` (L1B) |
@@ -1253,7 +1253,7 @@ Every phase explicitly notes what is already built and what is new work. This ta
 | `parse-header` (verified working) | Extend header parsing (L6B) |
 | Sourcemap command | LSP integration (L7) |
 | REPL command | REPL improvements (L7G) |
-| Test harness (file-based, 99/99 + 12/12 expected-fail pass) | `#[test]` attribute execution (L4J) |
+| Test harness (file-based, 114/114 + 21/21 expected-fail pass) | `#[test]` attribute execution (L4J) |
 | Hot reload (`watch` — native JIT + function diff) | Wire optimizer into `emit` command |
 | **NOT working — GPU codegen exists but no CLI command** | Wire GPU backend (L1J) |
 | **NOT working — `#[derive]` parsed but no logic** | Implement derive via comptime (L8J) |

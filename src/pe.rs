@@ -2728,6 +2728,9 @@ impl PeCodeGen {
             Inst::PersistSave { .. } => {
                 // No-op in PE emitter
             }
+            Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd => {
+                // No-op in PE emitter (rollback/unsafe not supported)
+            }
             Inst::Panic { message } => {
                 let off = self.str_off(message);
                 self.enc.lea_rip(Reg::Rcx, off);

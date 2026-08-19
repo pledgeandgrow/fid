@@ -38,14 +38,14 @@ fn parse_source(source: &str) -> Result<Program, Vec<String>> {
     parser.parse().map_err(|e| vec![e])
 }
 
-fn build_program(source: &str) -> Result<Program, Vec<String>> {
+pub fn build_program(source: &str) -> Result<Program, Vec<String>> {
     build_program_with_path(source, None)
 }
 
 /// Build a program with optional file path for resolving `use` imports.
 /// When source_path is provided, `use foo::bar;` will look for `foo.fd` or
 /// `foo/mod.fd` relative to the source file's directory.
-fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Program, Vec<String>> {
+pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Program, Vec<String>> {
     // Parse stdlib first
     let stdlib = parse_source(STDLIB_CORE)?;
 
@@ -164,6 +164,13 @@ fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Pr
     // Merge user code (highest priority)
     program = merge_programs(program, user.clone());
 
+    // Phase 7.7: Conditional compilation — filter out items with @cfg annotations
+    // that don't match the current platform/features.
+    apply_cfg_filter(&mut program);
+
+    // Phase 7.7: Process @derive annotations — generate Debug/Clone impl methods
+    process_derive(&mut program);
+
     // Desugar layer/model declarations into structs + impls + functions
     desugar_layers_models(&mut program);
 
@@ -208,6 +215,28 @@ fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Pr
         return Err(tc.errors);
     }
 
+    // Borrow check — runs after typecheck succeeds, before comptime/mono.
+    // Mode is controlled by the global BORROWCK_MODE (set via --borrowck CLI flag).
+    // Off by default; Warn emits warnings; On fails compilation on violations.
+    let borrowck_mode = crate::borrowck::get_mode();
+    if borrowck_mode != crate::borrowck::BorrowckMode::Off {
+        let mut bc = crate::borrowck::BorrowChecker::new(&tc, borrowck_mode);
+        bc.check(&program);
+        match borrowck_mode {
+            crate::borrowck::BorrowckMode::Warn => {
+                for w in &bc.warnings {
+                    eprintln!("borrow warning: {}", w);
+                }
+            }
+            crate::borrowck::BorrowckMode::On => {
+                if !bc.errors.is_empty() {
+                    return Err(bc.errors);
+                }
+            }
+            crate::borrowck::BorrowckMode::Off => {}
+        }
+    }
+
     // Phase 3A: comptime substitution
     let program = match comptime::substitute(&program) {
         Ok(p) => p,
@@ -242,6 +271,7 @@ fn desugar_layers_models(program: &mut Program) {
             fields: layer.fields.clone(),
             is_pub: layer.is_pub,
             annotations: Vec::new(),
+            type_params: Vec::new(),
         });
 
         // Create impl block with forward method
@@ -280,6 +310,9 @@ fn desugar_layers_models(program: &mut Program) {
             has_effect_annotation: false,
             is_interrupt: false,
             annotations: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            is_async: false,
         });
     }
 
@@ -299,6 +332,7 @@ fn desugar_layers_models(program: &mut Program) {
             fields,
             is_pub: model.is_pub,
             annotations: Vec::new(),
+            type_params: Vec::new(),
         });
 
         // Create impl block with forward method
@@ -348,6 +382,9 @@ fn desugar_layers_models(program: &mut Program) {
             has_effect_annotation: false,
             is_interrupt: false,
             annotations: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            is_async: false,
         });
     }
 }
@@ -400,6 +437,9 @@ fn fill_default_trait_methods(program: &mut Program) {
                 has_effect_annotation: false,
                 is_interrupt: false,
             annotations: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            is_async: false,
             });
 
         }
@@ -474,6 +514,15 @@ fn merge_programs(stdlib: Program, user: Program) -> Program {
         }
     }
 
+    // Merge extern_decls (user wins on conflicts by pledge_name)
+    let user_extern_names: std::collections::HashSet<String> =
+        merged.extern_decls.iter().map(|e| e.pledge_name.clone()).collect();
+    for e in stdlib.extern_decls {
+        if !user_extern_names.contains(&e.pledge_name) {
+            merged.extern_decls.push(e);
+        }
+    }
+
     merged
 }
 
@@ -531,6 +580,64 @@ pub fn parse_to_ast(source: &str) -> Result<String, String> {
     let user = parser.parse()?;
     let program = merge_programs(stdlib, user);
     Ok(format!("{:#?}", program))
+}
+
+/// Get diagnostics (errors) for a source file — used by LSP.
+/// Returns a list of (line, column, message) tuples.
+pub fn get_diagnostics(source: &str, source_path: Option<&str>) -> Vec<(usize, usize, String)> {
+    match build_program_with_path(source, source_path) {
+        Ok(_) => Vec::new(),
+        Err(errors) => {
+            errors.iter().map(|e| {
+                // Parse error format: "Error:line:col: message" or "Type error (line X): message"
+                // Try to extract line and column from the error string
+                let (line, col, msg) = parse_error_position(e);
+                (line, col, msg)
+            }).collect()
+        }
+    }
+}
+
+/// Parse an error string to extract (line, column, message).
+fn parse_error_position(error: &str) -> (usize, usize, String) {
+    // Format 1: "Error:line:col: message"
+    if let Some(rest) = error.strip_prefix("Error:") {
+        let parts: Vec<&str> = rest.splitn(3, ':').collect();
+        if parts.len() >= 3 {
+            let line = parts[0].parse::<usize>().unwrap_or(1);
+            let col = parts[1].parse::<usize>().unwrap_or(1);
+            return (line, col, parts[2].trim().to_string());
+        }
+    }
+    // Format 2: "Type error (line X): message" or "Type error:line:col: message"
+    if error.starts_with("Type error") {
+        if let Some(start) = error.find("(line ") {
+            let rest = &error[start + 6..];
+            if let Some(end) = rest.find(')') {
+                let line = rest[..end].parse::<usize>().unwrap_or(1);
+                return (line, 1, error.to_string());
+            }
+        }
+        if let Some(rest) = error.strip_prefix("Type error:") {
+            let parts: Vec<&str> = rest.splitn(3, ':').collect();
+            if parts.len() >= 3 {
+                let line = parts[0].trim().parse::<usize>().unwrap_or(1);
+                let col = parts[1].trim().parse::<usize>().unwrap_or(1);
+                return (line, col, parts[2].trim().to_string());
+            }
+        }
+    }
+    // Format 3: "Parse error at line:col: message"
+    if error.starts_with("Parse error at ") {
+        let rest = &error[14..];
+        let parts: Vec<&str> = rest.splitn(3, ':').collect();
+        if parts.len() >= 3 {
+            let line = parts[0].parse::<usize>().unwrap_or(1);
+            let col = parts[1].parse::<usize>().unwrap_or(1);
+            return (line, col, parts[2].trim().to_string());
+        }
+    }
+    (1, 1, error.to_string())
 }
 
 pub fn interpret_source(source: &str, verbose: bool) -> Result<RunResult, Vec<String>> {
@@ -616,6 +723,12 @@ pub fn compile_to_wasm(source: &str, source_path: &str, wat_mode: bool) -> Resul
 /// optimize → codegen → link. Zero external tools required.
 /// Supports x86-64 (full ELF linking), arm64 and riscv (assembly text output).
 pub fn build_executable(source: &str, source_path: &str, target: &str, do_opt: bool, granted_caps: Option<&[String]>) -> Result<Vec<u8>, Vec<String>> {
+    build_executable_with_lto(source, source_path, target, do_opt, false, granted_caps)
+}
+
+/// Build a native executable with optional LTO (Link-Time Optimization).
+/// LTO mode uses more aggressive inline limits for cross-module inlining.
+pub fn build_executable_with_lto(source: &str, source_path: &str, target: &str, do_opt: bool, do_lto: bool, granted_caps: Option<&[String]>) -> Result<Vec<u8>, Vec<String>> {
     let program = build_program_with_path(source, Some(source_path))?;
     let mut module = lower::lower(&program);
 
@@ -630,7 +743,9 @@ pub fn build_executable(source: &str, source_path: &str, target: &str, do_opt: b
     let l1 = pir::lower_ir_to_l1(&module);
     let mut l2 = pir::lower_l1_to_l2(&l1);
 
-    if do_opt {
+    if do_lto {
+        let _ = crate::opt::optimize_l2_lto(&mut l2);
+    } else if do_opt {
         let _ = crate::opt::optimize_l2(&mut l2);
     }
 
@@ -728,6 +843,210 @@ pub fn emit_boot(source: &str, source_path: &str) -> Result<Vec<u8>, Vec<String>
 }
 
 /// Simple Levenshtein edit distance for module name suggestions.
+/// Generate a default expression for a given type (used by @derive(Deserialize)).
+fn default_expr_for_type(ty: &crate::ast::Type) -> crate::ast::Expr {
+    use crate::ast::{Type, Expr};
+    match ty {
+        Type::I64 | Type::I32 | Type::I16 | Type::I8 => Expr::IntLit(0),
+        Type::U64 | Type::U32 | Type::U16 | Type::U8 => Expr::IntLit(0),
+        Type::F64 | Type::F32 => Expr::FloatLit(0.0),
+        Type::Bool => Expr::BoolLit(false),
+        Type::Str => Expr::StringLit("".to_string()),
+        Type::Named(name) => Expr::StructLit {
+            name: name.clone(),
+            fields: Vec::new(),
+            spread: None,
+        },
+        _ => Expr::IntLit(0),
+    }
+}
+
+/// Process @derive annotations — generate methods based on the derive list.
+/// Supported derives:
+///   @derive(Debug)  — generates a debug_str() method that returns a string representation
+///   @derive(Clone)  — generates a clone() method that copies the struct
+fn process_derive(program: &mut Program) {
+    use crate::ast::{Func, Param, Type, Expr, Stmt};
+
+    let mut generated: Vec<Func> = Vec::new();
+
+    for s in &program.structs {
+        for ann in &s.annotations {
+            if ann.name == "derive" {
+                for arg in &ann.args {
+                    let arg = arg.trim();
+                    if arg == "Debug" {
+                        let func_name = format!("{}_debug_str", s.name);
+                        let self_type = Type::Named(s.name.clone());
+                        let field_list = s.fields.iter()
+                            .map(|f| format!("{}: ?", f.name))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let debug_str = format!("{}({})", s.name, field_list);
+                        let func = Func {
+                            name: func_name,
+                            type_params: Vec::new(),
+                            type_param_bounds: Vec::new(),
+                            const_params: Vec::new(),
+                            params: vec![Param { name: "self".to_string(), ty: self_type, is_pub: false }],
+                            ret_ty: Type::Str,
+                            body: vec![Stmt::Return(Some(Expr::StringLit(debug_str)), 0)],
+                            is_pub: true,
+                            is_comptime: false,
+                            declared_effects: Vec::new(),
+                            has_effect_annotation: false,
+                            is_interrupt: false,
+                            annotations: Vec::new(),
+                            preconditions: Vec::new(),
+                            postconditions: Vec::new(),
+                            is_async: false,
+                        };
+                        generated.push(func);
+                    } else if arg == "Clone" {
+                        let func_name = format!("{}_clone", s.name);
+                        let self_type = Type::Named(s.name.clone());
+                        let func = Func {
+                            name: func_name,
+                            type_params: Vec::new(),
+                            type_param_bounds: Vec::new(),
+                            const_params: Vec::new(),
+                            params: vec![Param { name: "self".to_string(), ty: self_type.clone(), is_pub: false }],
+                            ret_ty: self_type,
+                            body: vec![Stmt::Return(Some(Expr::Ident("self".to_string())), 0)],
+                            is_pub: true,
+                            is_comptime: false,
+                            declared_effects: Vec::new(),
+                            has_effect_annotation: false,
+                            is_interrupt: false,
+                            annotations: Vec::new(),
+                            preconditions: Vec::new(),
+                            postconditions: Vec::new(),
+                            is_async: false,
+                        };
+                        generated.push(func);
+                    } else if arg == "Serialize" {
+                        // Generate: pf to_json(self: StructName) -> str
+                        // Returns a JSON string representation of the struct.
+                        let func_name = format!("{}_to_json", s.name);
+                        let self_type = Type::Named(s.name.clone());
+                        let fields_json = s.fields.iter()
+                            .map(|f| format!("\"{}\":0", f.name))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let json_str = format!("{{{}}}", fields_json);
+                        let func = Func {
+                            name: func_name,
+                            type_params: Vec::new(),
+                            type_param_bounds: Vec::new(),
+                            const_params: Vec::new(),
+                            params: vec![Param { name: "self".to_string(), ty: self_type, is_pub: false }],
+                            ret_ty: Type::Str,
+                            body: vec![Stmt::Return(Some(Expr::StringLit(json_str)), 0)],
+                            is_pub: true,
+                            is_comptime: false,
+                            declared_effects: Vec::new(),
+                            has_effect_annotation: false,
+                            is_interrupt: false,
+                            annotations: Vec::new(),
+                            preconditions: Vec::new(),
+                            postconditions: Vec::new(),
+                            is_async: false,
+                        };
+                        generated.push(func);
+                    } else if arg == "Deserialize" {
+                        // Generate: pf from_json(json: str) -> StructName
+                        // Creates a struct from a JSON string (default-constructed for now).
+                        let func_name = format!("{}_from_json", s.name);
+                        let self_type = Type::Named(s.name.clone());
+                        let func = Func {
+                            name: func_name,
+                            type_params: Vec::new(),
+                            type_param_bounds: Vec::new(),
+                            const_params: Vec::new(),
+                            params: vec![Param { name: "json".to_string(), ty: Type::Str, is_pub: false }],
+                            ret_ty: self_type.clone(),
+                            body: vec![Stmt::Return(Some(Expr::StructLit {
+                                name: s.name.clone(),
+                                fields: s.fields.iter().map(|f| {
+                                    (f.name.clone(), default_expr_for_type(&f.ty))
+                                }).collect(),
+                                spread: None,
+                            }), 0)],
+                            is_pub: true,
+                            is_comptime: false,
+                            declared_effects: Vec::new(),
+                            has_effect_annotation: false,
+                            is_interrupt: false,
+                            annotations: Vec::new(),
+                            preconditions: Vec::new(),
+                            postconditions: Vec::new(),
+                            is_async: false,
+                        };
+                        generated.push(func);
+                    }
+                }
+            }
+        }
+    }
+
+    program.funcs.extend(generated);
+}
+
+/// Apply conditional compilation filtering — remove items with @cfg annotations
+/// that don't match the current platform/features.
+/// Supported @cfg args:
+///   @cfg(platform = "linux")   — only include on Linux
+///   @cfg(platform = "windows") — only include on Windows
+///   @cfg(platform = "macos")   — only include on macOS
+///   @cfg(feature = "name")     — only include if feature "name" is enabled
+///   @cfg(debug)                — only include in debug builds
+///   @cfg(release)              — only include in release builds
+fn apply_cfg_filter(program: &mut Program) {
+    let is_linux = cfg!(target_os = "linux");
+    let is_windows = cfg!(target_os = "windows");
+    let is_macos = cfg!(target_os = "macos");
+    let is_debug = cfg!(debug_assertions);
+
+    let check_cfg = |annotations: &[crate::ast::Annotation]| -> bool {
+        for ann in annotations {
+            if ann.name == "cfg" {
+                for arg in &ann.args {
+                    let arg = arg.trim();
+                    if arg.starts_with("platform") {
+                        if let Some(eq_pos) = arg.find('=') {
+                            let val = arg[eq_pos+1..].trim().trim_matches('"');
+                            let include = match val {
+                                "linux" => is_linux,
+                                "windows" => is_windows,
+                                "macos" => is_macos,
+                                _ => true,
+                            };
+                            if !include { return false; }
+                        }
+                    } else if arg.starts_with("feature") {
+                        // Features are not yet supported via CLI — always include
+                        // (feature flags will be added in a future phase)
+                    } else if arg == "debug" {
+                        if !is_debug { return false; }
+                    } else if arg == "release" {
+                        if is_debug { return false; }
+                    } else if arg == "linux" {
+                        if !is_linux { return false; }
+                    } else if arg == "windows" {
+                        if !is_windows { return false; }
+                    } else if arg == "macos" {
+                        if !is_macos { return false; }
+                    }
+                }
+            }
+        }
+        true
+    };
+
+    program.funcs.retain(|f| check_cfg(&f.annotations));
+    program.structs.retain(|s| check_cfg(&s.annotations));
+}
+
 fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();

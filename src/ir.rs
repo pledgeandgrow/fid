@@ -664,6 +664,24 @@ pub enum Inst {
         name: String,
         value: ValueId,
     },
+
+    // ─── Transaction Blocks (Phase 7.5G) ───
+    /// Begin a transaction — snapshot mutable state for potential rollback.
+    /// The interpreter saves a copy of all memory and opaque values.
+    /// If a panic occurs before TxnEnd, the snapshot is restored.
+    TxnBegin,
+    /// End a transaction — commit changes (discard the snapshot).
+    /// If this is reached, the transaction succeeded.
+    TxnEnd,
+
+    // ─── Unsafe Blocks (F62: bounds checking lock) ───
+    /// Begin an unsafe block — the interpreter skips bounds checks.
+    /// The typechecker already enforces that raw pointer ops only happen
+    /// inside unsafe blocks; these markers let the interpreter skip
+    /// runtime bounds checks for array access.
+    UnsafeBegin,
+    /// End an unsafe block — resume bounds checking.
+    UnsafeEnd,
 }
 
 impl Inst {
@@ -703,6 +721,10 @@ impl Inst {
             Inst::RegionEnd { .. } => IrType::Void,
             Inst::PersistLoad { ty, .. } => ty.clone(),
             Inst::PersistSave { .. } => IrType::Void,
+            Inst::TxnBegin => IrType::Void,
+            Inst::TxnEnd => IrType::Void,
+            Inst::UnsafeBegin => IrType::Void,
+            Inst::UnsafeEnd => IrType::Void,
         }
     }
 
@@ -735,6 +757,8 @@ impl Inst {
             },
             Inst::PersistLoad { .. } => effects.add(Effect::Read),
             Inst::PersistSave { .. } => effects.add(Effect::Write),
+            Inst::TxnBegin | Inst::TxnEnd => effects.add(Effect::Write),
+            Inst::UnsafeBegin | Inst::UnsafeEnd => {}
             _ => {}
         }
         effects
@@ -776,6 +800,10 @@ impl Inst {
             Inst::RegionEnd { .. } => "RegionEnd",
             Inst::PersistLoad { .. } => "PersistLoad",
             Inst::PersistSave { .. } => "PersistSave",
+            Inst::TxnBegin => "TxnBegin",
+            Inst::TxnEnd => "TxnEnd",
+            Inst::UnsafeBegin => "UnsafeBegin",
+            Inst::UnsafeEnd => "UnsafeEnd",
         }
     }
 
@@ -836,6 +864,7 @@ impl Inst {
             Inst::RegionBegin { .. } | Inst::RegionEnd { .. } => vec![],
             Inst::PersistLoad { default, .. } => vec![*default],
             Inst::PersistSave { value, .. } => vec![*value],
+            Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd => vec![],
         }
     }
 }
@@ -894,6 +923,9 @@ pub struct IrFunction {
     /// Persist variables in this function — (name, alloca_ptr)
     /// Used to emit PersistSave before returns
     pub persist_vars: Vec<(String, ValueId)>,
+    /// Whether this function is annotated @wrapping (F65).
+    /// @wrapping functions use wrap-around arithmetic instead of checked arithmetic.
+    pub is_wrapping: bool,
 }
 
 impl IrFunction {
@@ -912,6 +944,7 @@ impl IrFunction {
             locals: HashMap::new(),
             is_interrupt: false,
             persist_vars: Vec::new(),
+            is_wrapping: false,
         };
         // Create entry block
         func.new_block();
@@ -1210,7 +1243,16 @@ pub fn lower_type(ast_ty: &AstType) -> IrType {
         AstType::Ref { inner, .. } => {
             IrType::Ptr(Box::new(lower_type(inner)))
         }
+        AstType::RawPtr { inner, .. } => {
+            // Raw pointers lower to the same IR as references — both are Ptr
+            IrType::Ptr(Box::new(lower_type(inner)))
+        }
         AstType::Generic { name, args } => {
+            // Future<T> is represented as i64 at the IR level (opaque handle).
+            // The Future wrapping/unwrapping is done via p_future_ready/p_future_poll.
+            if name == "Future" {
+                return IrType::I64;
+            }
             let ir_args = args.iter().map(lower_type).collect();
             IrType::Generic(name.clone(), ir_args)
         }

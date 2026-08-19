@@ -45,6 +45,9 @@ cargo build
 
 # Show assembly with peephole (what `build` actually uses)
 ./target/release/fidesc codegen tests/<name>.fd --target x86-64 --peephole
+
+# Run the LSP server (for editor integration)
+./target/release/fidesc lsp
 ```
 
 ## Current Baseline (as of Aug 2026)
@@ -52,24 +55,80 @@ cargo build
 ```
 Unit tests:   136/136 passed
 Harness:      8/8 passed       (golden_files_match now passes)
-Interpreter:  99/99 normal     (+ 12/12 expected fail)
-C Codegen:    99/99 matched    (FULL PARITY — no gaps) (+ 12/12 expected fail)
-PE Emitter:   99/99 valid      (+ 12/12 expected fail: same as interpreter)
-Total .fd:    111 test files   (99 normal + 12 expected-fail)
-Skip list:    21 tests         (interpreter-only features: comptime, bare metal, WASM, SIMD, tensor, HTTP, JSON, etc.)
+Interpreter:  99/99 normal     (+ 22/22 expected fail)
+C Codegen:    99/99 matched    (FULL PARITY — no gaps) (+ 22/22 expected fail)
+PE Emitter:   99/99 valid      (+ 22/22 expected fail: same as interpreter)
+Total .fd:    143 test files   (121 normal + 22 expected-fail)
+Skip list:    22 tests         (interpreter-only features: comptime, bare metal, WASM, SIMD, tensor, HTTP, JSON, dlopen, etc.)
 ```
 
-Expected-fail tests (12):
+### New Features (Phase 7.7)
+
+- **Iterators**: `for x in vec`, `for k in map`, `for i in 0..N` — Vec, HashMap,
+  and Range iteration with nested Vec support. HashMap iterates over keys.
+- **Error chaining**: `?` operator on `Option<T>` and `Result<T, E>` propagates
+  errors. `try { ... }` blocks catch errors. Option/Result methods: unwrap,
+  unwrap_or, is_some, is_none, is_ok, is_err.
+- **Conditional compilation**: `@cfg(platform = "linux")`, `@cfg(platform =
+  "windows")`, `@cfg(platform = "macos")`, `@cfg(debug)`, `@cfg(release)`.
+  Filters out functions and structs at compile time.
+- **Derive macros**: `@derive(Debug)` generates `debug_str()` method.
+  `@derive(Clone)` generates `clone()` method. Applied to structs.
+- **Serde**: `@derive(Serialize)` generates `to_json()` method.
+  `@derive(Deserialize)` generates `from_json()` method.
+- **Dynamic loading**: `p_dl_open(path)`, `p_dl_sym(handle, symbol)`,
+  `p_dl_close(handle)`, `p_dl_call(func_ptr, arg)`. Real dlopen/dlsym in C
+  codegen, simulated in interpreter.
+
+## New Features (Phase 11)
+
+- **Generic Enums**: `Option<T>` and `Result<T, E>` are now declared with type
+  parameters in `stdlib/core.fd`. The parser accepts `enum Foo<T, U> { ... }`
+  and `struct Foo<T> { ... }`. The typechecker treats `Option` and `Option<T>`
+  as compatible (uniform i64 representation).
+- **LSP Server**: `fidesc lsp` runs a Language Server Protocol server over
+  stdio. Supports `initialize`, `textDocument/didOpen`, `didChange`, `didClose`,
+  and `publishDiagnostics`. No external dependencies — uses a built-in JSON
+  parser/serializer.
+- **New Stdlib Modules**:
+  - `stdlib/math.fd`: Math functions (sqrt, sin, cos, floor, ceil, pow, fabs, constants)
+  - `stdlib/env.fd`: Environment variable access (env_get, env_exists)
+  - `stdlib/args.fd`: Command-line arguments (args_len, args_get, args_program_name)
+  - `stdlib/process.fd`: Process control (process_exit, process_system)
+  - `stdlib/regex.fd`: Simple wildcard pattern matching (regex_matches, regex_find, etc.)
+
+Expected-fail tests (21):
 test_trait_verify_fail, test_budget_fail, test_sandbox_fail,
 test_deterministic_fail, test_field_privacy_fail, test_money_linear_fail,
 test_money_conserve_fail, test_banking_double_credit_fail,
 test_banking_lost_money_fail, test_loop_linear_fail, test_gas_fail,
-test_crashfree_fail
+test_crashfree_fail, test_txn_rollback_fail, test_typed_strings_fail,
+test_init_guarantee_fail, test_init_guarantee_cond_fail,
+test_param_queries_fail, test_medical_fail, test_contracts_fail,
+test_safety_annotations_fail, test_safety_no_audit_fail,
+test_borrowck_fail
 
 Features now present in the baseline: tuple destructuring, file I/O
-(`stdlib/file.fd`), `txn {}` blocks, loop-aware linear types, `@gas`
-annotation, `@crashfree` annotation, `@audit` annotation, banking stdlib,
-money stdlib, LogicalTime stdlib (`stdlib/time.fd`).
+(`stdlib/file.fd`), `txn {}` blocks (with interpreter rollback), loop-aware linear types, `@gas`
+annotation, `@crashfree` annotation, `@audit` annotation (with full param trail), banking stdlib,
+money stdlib, LogicalTime stdlib (`stdlib/time.fd`), typed strings
+(`stdlib/typed_strings.fd` — F67: SQLString/ShellString/HTMLString/JSONString/PathString),
+init guarantee (F63: `pm` keyword + definite assignment analysis),
+raw pointer types (`*mut T` / `*const T` with `unsafe {}` blocks),
+memoization stdlib (`stdlib/memo.fd`),
+checked arithmetic lock (F64: overflow = panic, always on),
+`@wrapping` annotation (F65: escape hatch for wrap-around arithmetic),
+bounds checking lock (F62: always on, skippable in `unsafe {}`),
+parameterized queries (F68: no string concat on typed strings),
+`@medical` annotation (F48: IEC 62304 — no alloc, no recursion, no while, must be @audit),
+given/ensure contracts (F10: Design by Contract — preconditions verified at call sites),
+composable safety primitives (F44/F52/F56: @no-alloc, @no-recursion, @no-unbounded, @no-panic,
+@no-indirect, @requires-audit — @safety-critical, @autosar, @dal-a are aliases that expand to these),
+async/await (Phase 7.6: `async pf`, `await <expr>`, `spawn <expr>` — Future<T> type with eager evaluation, typechecker enforces Future<T> for await, `p_future_ready`/`p_future_poll` runtime functions in interpreter + C codegen; state machine transform pending for true cooperative scheduling),
+borrow checker (Phases 1-6 complete: `--borrowck=off|warn|on` — Rules 1-3 active, field-wise borrows, two-phase borrows, NLL, `on` by default),
+generic enums/structs (`enum Option<T> { ... }`, `struct Foo<T> { ... }` — type_params in AST, parser, typechecker, lowerer),
+LSP server (`fidesc lsp` — JSON-RPC over stdio, initialize/didOpen/didChange/diagnostics, no external deps),
+new stdlib modules (`stdlib/math.fd`, `stdlib/env.fd`, `stdlib/args.fd`, `stdlib/process.fd`, `stdlib/regex.fd`).
 
 **Note:** `test_db` is no longer flaky — HashMap keys are now sorted in the interpreter for deterministic output.
 
@@ -94,7 +153,8 @@ touching them.
 | `src/pir.rs` | **HIGH** | PIR L1/L2/L3 transforms. A bad lowering propagates to all backends. |
 | `src/lower.rs` | **MEDIUM** | AST → SSA IR. Changes here affect interpreter + all backends. |
 | `src/typechecker.rs` | **MEDIUM** | Types + regions + effects + capabilities. Wrong rejection = broken code; wrong acceptance = silent miscompilation. |
-| `src/opt.rs` | **MEDIUM** | PIR optimizer. Optimizer bugs fixed (effect_reorder, inline, TCO, imul). `--opt` now produces matching output on 62/65 tests (3 closure tests fail due to pre-existing codegen bugs, not optimizer). |
+| `src/borrowck.rs` | **LOW** | Borrow checker (Phases 1-6 complete). Separate pass after typecheck. `--borrowck=on` by default; `off`/`warn` modes available. Field-wise borrows, two-phase borrows, NLL (non-lexical lifetimes via last-use analysis). |
+| `src/opt.rs` | **MEDIUM** | PIR optimizer. Optimizer bugs fixed (effect_reorder, inline, TCO, imul). `--opt` is now enabled by default in `build` (use `--no-opt` to disable). Produces matching output on all tests. |
 | `src/runtime_linux.rs` | **HIGH** | Hand-encoded x86-64 machine code (raw bytes). No assembler — every byte is manual. |
 | `src/linker.rs` | **MEDIUM** | Relocation resolution. Wrong offset = crash or silent corruption. |
 | `src/interp.rs` | **LOW** | The reference oracle. If this is wrong, all backends "match" but produce wrong results. |
@@ -111,16 +171,18 @@ touching them.
 | `src/comptime.rs` | LOW | Compile-time eval — errors are loud. |
 | `src/main.rs` | LOW | CLI dispatch — adding commands is safe. |
 | `src/compiler.rs` | LOW | Pipeline orchestration — changes are visible. |
-| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. Stdlib modules: core, db, http, json, parallel, shape, simd, tensor, quant, money, banking, alloc, file, time. |
+| `src/lsp.rs` | LOW | LSP server — JSON-RPC over stdio, no external deps. |
+| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. Stdlib modules: core, db, http, json, parallel, shape, simd, tensor, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, math, env, args, process, regex. |
 
 ## Known Bugs (Do Not Re-Introduce)
 
 1. **Register allocator clobbering** (`regalloc.rs`): Constants not loaded into
    registers before use can be clobbered by intervening instructions. The L2
    optimizer's `effect_reorder` pass was fixed to respect memory dependencies
-   and keep terminators last, so `--opt` no longer exposes this bug on the
-   current test suite. However, the underlying regalloc weakness may still
-   surface with new code. Test with `--opt` enabled when changing regalloc.
+   and keep terminators last, so `--opt` (now enabled by default) no longer
+   exposes this bug on the current test suite. However, the underlying regalloc
+   weakness may still surface with new code. Test with `--no-opt` when changing
+   regalloc to isolate issues.
 
 2. **Debug `eprintln!` statements** in `compiler.rs` and `elf64.rs`: There are
    temporary debug prints (DBG ASM, DBG ALU) added during debugging sessions.
@@ -223,6 +285,7 @@ touching them.
 | `src/lexer.rs` | Tokenizer |
 | `src/parser.rs` | Recursive descent parser |
 | `src/typechecker.rs` | Types + regions + effects + capabilities |
+| `src/borrowck.rs` | Borrow checker (alias analysis, `--borrowck=off\|warn\|on`) |
 | `src/ir.rs` | Single-level SSA IR |
 | `src/lower.rs` | AST → SSA IR |
 | `src/pir.rs` | Multi-level PIR (L1/L2/L3) |
@@ -247,4 +310,5 @@ touching them.
 | `src/hotreload.rs` | Native JIT + function-level change detection |
 | `src/cparser.rs` | C header parser → Fides FFI bindings |
 | `src/compiler.rs` | Pipeline orchestration |
+| `src/lsp.rs` | LSP server (JSON-RPC over stdio) |
 | `src/main.rs` | CLI entry point |

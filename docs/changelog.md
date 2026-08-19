@@ -1,5 +1,538 @@
 # Fides Language Changelog
 
+## Phase 7.7: Iterators, Error Chaining, Cfg, Derive, Serde, Dynamic Loading (August 2026)
+
+### Iterators
+
+- **Vec iteration** (`src/lower.rs`) — `for x in vec { ... }` iterates over Vec
+  elements via `p_vec_len`/`p_vec_get`. Nested Vec iteration (`for row in
+  vec_of_vecs`) is supported by tracking Vec-element allocas.
+- **HashMap iteration** (`src/lower.rs`) — `for k in map { ... }` iterates over
+  HashMap keys via `p_map_keys`, then iterates the resulting Vec.
+- **Range iteration** — `for i in start..end { ... }` and `for i in start..=end`
+  are lowered to counting loops.
+- **Interpreter fix** (`src/interp.rs`) — `Load` with `IrType::I64` now checks
+  the opaque side-table for Vec/Map/Tensor/Json values, enabling nested Vec
+  iteration where Vec handles are stored as i64.
+
+### Error Chaining
+
+- **`?` operator** — Already worked on `Result<T, E>` and `Option<T>`. Verified
+  with comprehensive test (`test_error_chain.fd`).
+- **Option/Result methods** — `unwrap`, `unwrap_or`, `is_some`, `is_none`,
+  `is_ok`, `is_err` all work in both interpreter and C codegen.
+
+### Conditional Compilation
+
+- **`@cfg` annotation** (`src/compiler.rs`) — `@cfg(platform = "linux")`,
+  `@cfg(platform = "windows")`, `@cfg(platform = "macos")`, `@cfg(debug)`,
+  `@cfg(release)`. Filters out functions and structs at compile time based on
+  the target platform and build mode.
+
+### Derive Macros
+
+- **`@derive(Debug)`** (`src/compiler.rs`) — Generates a `debug_str()` method
+  that returns a string representation of the struct.
+- **`@derive(Clone)`** — Generates a `clone()` method that copies the struct.
+- **`@derive(Serialize)`** — Generates a `to_json()` method that returns a JSON
+  string representation.
+- **`@derive(Deserialize)`** — Generates a `from_json()` method that creates a
+  struct from a JSON string (default-constructed).
+
+### Dynamic Loading
+
+- **`p_dl_open(path)`** — Opens a shared library (real `dlopen` in C codegen,
+  simulated in interpreter).
+- **`p_dl_sym(handle, symbol)`** — Looks up a symbol (real `dlsym` in C codegen).
+- **`p_dl_close(handle)`** — Closes a shared library.
+- **`p_dl_call(func_ptr, arg)`** — Calls a dynamically loaded function.
+
+### C Codegen Fixes
+
+- **Thread-based futures** (`src/codegen_c.rs`) — `p_future_poll` now joins
+  threads for negative handles (thread-based futures) and returns values
+  directly for non-negative handles (eager futures). `p_thread_spawn` returns
+  negative indices as Future handles.
+- **Thread wrapper env param** — `p_thread_wrapper` now passes `NULL` as the
+  implicit `__env` parameter when calling Fides functions, matching the
+  function signature `(void* env, ...)`.
+
+## Phase 7.6: Async/Await — Real Future<T> Semantics (August 2026)
+
+### Future<T> Type System
+
+- **Typechecker** (`src/typechecker.rs`) — `await Future<T>` now unwraps to `T`
+  and `spawn <expr>` wraps to `Future<T>`. Using `await` on a non-Future value
+  produces a type error with a helpful hint message.
+- **IR type lowering** (`src/ir.rs`) — `Future<T>` lowers to `IrType::I64`
+  (opaque handle). The Future wrapping/unwrapping is handled by runtime
+  functions, not by the type system at the IR level.
+
+### Lowering
+
+- **Async function call wrapping** (`src/lower.rs`) — Calls to `async pf`
+  functions are now wrapped in `p_future_ready(result)`, producing a Future
+  handle. The `async_funcs` set tracks which functions are async.
+- **Await lowering** (`src/lower.rs`) — `await <expr>` now lowers to
+  `p_future_poll(future)`, which extracts the value from the Future handle.
+- **Spawn lowering** (`src/lower.rs`) — `spawn <expr>` evaluates the inner
+  expression (which produces a Future) and returns it as-is.
+
+### Interpreter
+
+- **`Value::Future` variant** (`src/interp.rs`) — New value type for Future
+  handles. Stores an index into the interpreter's `future_table`.
+- **`future_table`** (`src/interp.rs`) — Stores completed Future values. Uses
+  an eager evaluation model: the async function runs synchronously and the
+  result is stored in the table. `await` retrieves the stored value.
+- **`p_future_ready` runtime function** — Wraps a value in a Future (stores it
+  in `future_table` and returns the index as a handle).
+- **`p_future_poll` runtime function** — Polls a Future (retrieves the stored
+  value from `future_table`). Since evaluation is eager, the Future is always
+  Ready.
+- **Store/Load support** — `Value::Future` is stored as an i64 index in byte
+  memory and can be loaded back as a Future.
+
+### C Codegen
+
+- **`p_future_ready` / `p_future_poll`** (`src/codegen_c.rs`) — Implemented as
+  identity functions (`return value` / `return future`). This matches the
+  eager evaluation model — the Future handle IS the value.
+
+### Tests
+
+- **`tests/test_async.fd`** — Existing test now passes with real Future
+  semantics (was passing with stubbed synchronous execution).
+- **`tests/test_async_fail.fd`** — New expected-fail test: `await` on a
+  non-Future value produces a typechecker error.
+
+### Design Notes
+
+This implementation uses an **eager evaluation model** — async functions run
+synchronously and their results are wrapped in Future handles. This is
+semantically correct (the results are the same as lazy evaluation) but not
+yet concurrent. Future work (state machine transform + coroutine event loop)
+will add true cooperative scheduling where async functions can suspend at
+`await` points and resume later.
+
+## Phase 11: Generic Enums, LSP Server, New Stdlib Modules (August 2026)
+
+### Generic Enums and Structs
+
+- **`type_params` on `EnumDef` and `StructDef`** — Both now support type
+  parameters in the AST (`src/ast.rs`).
+- **Parser support** — `enum Option<T> { ... }` and `struct Foo<T, U> { ... }`
+  syntax parsed in `src/parser.rs`.
+- **Typechecker compatibility** — `Option` and `Option<T>` are treated as
+  compatible types (uniform `i64` representation). Method resolution works on
+  `Type::Generic` (e.g., `Option<i64>.unwrap()`).
+- **Lowerer support** — `IrType::Generic` types resolve methods by base name
+  (e.g., `Option_i64` → `Option`).
+- **stdlib/core.fd updated** — `Option<T>` and `Result<T, E>` now declared with
+  type parameters.
+- **Test**: `tests/test_generic_enums.fd` — verifies generic syntax, method
+  calls, and type annotations (`pv x: Option<i64> = Option::Some(42)`).
+
+### LSP Server
+
+- **`fidesc lsp` command** — Runs a Language Server Protocol server over stdio.
+- **No external dependencies** — Built-in JSON parser/serializer in
+  `src/lsp.rs` (no serde, no serde_json).
+- **Supported methods**: `initialize`, `initialized`, `shutdown`, `exit`,
+  `textDocument/didOpen`, `didChange`, `didClose`, `publishDiagnostics`.
+- **Diagnostics** — Compiler errors are parsed for line/column positions and
+  published as LSP diagnostics with severity 1 (Error).
+- **Full sync** — `textDocumentSync: 1` (full document sync).
+
+### New Stdlib Modules
+
+- **`stdlib/math.fd`** — Math functions: `math_sqrt`, `math_pow`, `math_floor`,
+  `math_ceil`, `math_sin`, `math_cos`, `math_fabs`, constants (`math_pi`,
+  `math_e`).
+- **`stdlib/env.fd`** — Environment variables: `env_get`, `env_exists`.
+- **`stdlib/args.fd`** — Command-line arguments: `args_len`, `args_get`,
+  `args_program_name`.
+- **`stdlib/process.fd`** — Process control: `process_exit`, `process_system`.
+- **`stdlib/regex.fd`** — Wildcard pattern matching: `regex_matches` (with `?`
+  and `*` wildcards), `regex_find`, `regex_contains`, `regex_starts_with`,
+  `regex_ends_with`.
+
+### Infrastructure Changes
+
+- **`merge_programs` fix** — `extern_decls` from imported modules are now
+  correctly merged (was missing, causing link errors).
+- **String builtins as free functions** — `p_string_find`,
+  `p_string_starts_with`, `p_string_ends_with`, `p_string_len` registered as
+  free functions in `src/lower.rs` (were only available as `String` methods).
+- **Interpreter FFI** — Added `pledge_sin`, `pledge_cos`, `pledge_fabs` to
+  interpreter's FFI dispatch.
+- **Interpreter `eval_binop`** — Fixed `Value::Str` vs `Value::Int` comparison
+  (for null pointer checks on strings).
+- **Native runtime stubs** — Added `p_exit`, `p_getenv`, `p_argc`, `p_argv`,
+  `p_system`, `p_regex_match` to `src/runtime_linux.rs`.
+
+### Test Results
+
+- 114/114 normal tests pass (was 113 — added `test_generic_enums.fd`)
+- 21/21 expected-fail tests correctly fail
+- 136/136 unit tests pass
+- No regressions
+
+---
+
+## Borrow Checker Phases 3-6: Field-wise, Two-phase, Default On, NLL (August 2026)
+
+The borrow checker (`src/borrowck.rs`) is now fully operational with all six
+phases complete. Borrow checking is ON by default.
+
+### What's New
+
+- **Phase 3: Field-wise borrows** — Borrows are tracked by field path
+  (`"s.x"`, `"s.inner.y"`), not just variable name. Simultaneous borrows of
+  different fields (`&s.x` and `&s.y`) coexist. Conflicts checked
+  hierarchically (whole-var vs field, same-field vs different-field).
+- **Phase 4: Two-phase borrows** — During call argument evaluation, `&mut`
+  borrows are "reserved" rather than immediately "activated". This allows
+  `copy_first(&mut v, &v)` — the shared borrow is consumed before the mutable
+  borrow takes effect. Implemented via `in_reservation_phase` flag and
+  `reserved_mut_borrows` vector.
+- **Phase 5: Default to `on`** — Borrow checking is now always active unless
+  explicitly disabled with `--borrowck=off`. The `test_borrowck_fail` test was
+  moved to the expected-fail list.
+- **Phase 6: NLL (Non-Lexical Lifetimes)** — Borrows end at the borrower's
+  last use, not at scope end. Two-pass approach: pre-pass computes last-use
+  index for each variable, main pass releases dead borrows before each
+  statement. Allows `r = &v; print(*r); v = 20;` (r is dead after print).
+
+### Tests
+
+- `tests/test_borrowck.fd` — valid borrow patterns including field-wise,
+  two-phase, and NLL. 114/114 pass with borrow checking on.
+- `tests/test_borrowck_fail.fd` — borrow violations including double `&mut`
+  and NLL violation (mutation while borrow still live). In expected-fail list.
+
+### Test Count Update
+
+- Normal tests: 114 (was 113)
+- Expected-fail tests: 21 (was 20, +1 for `test_borrowck_fail`)
+
+## Borrow Checker Phase 2: Rules Active + Tested (August 2026)
+
+The borrow checker (`src/borrowck.rs`) reached Phase 2 — all three rules
+active in `warn`/`on` mode, tested, and false positives fixed.
+
+### What Was Done
+
+- **Fixed false positive on borrower reassignment**: `mr = &mut z` now releases
+  `mr`'s old borrow BEFORE checking the RHS, so sequential mutable borrows on
+  the same variable work correctly.
+- **Fixed `--borrowck=` flag parsing**: flags are now filtered from args before
+  command-specific parsing, so `fidesc run --borrowck=on file.fd` works.
+- **All three rules verified**:
+  - Rule 1: `&mut x` while any borrow on `x` is active → error
+  - Rule 2: `&x` while `&mut x` is active → error
+  - Rule 3: mutating `x` while any borrow on `x` is active → error
+- **`unsafe {}` blocks** correctly skip all borrow checks
+- **Temp borrows** in function call arguments correctly released after call
+
+## Phase 7.6: Async/Await — Option A (August 2026)
+
+Added native async/await syntax for cooperative concurrency. This is "Option A"
+from the concurrency design — async functions, await expressions, and spawn for
+concurrent task creation.
+
+### Syntax
+
+```p
+async pf fetch_data(url: String) -> Future<String> { ... }
+
+pv future = fetch_data("https://example.com");
+pv data = await future;
+
+pv task1 = spawn fetch_data("https://api.example.com");
+pv r1 = await task1;
+```
+
+### Implementation
+
+- **New AST nodes**: `Expr::Await { expr }`, `Expr::Spawn { expr }`, `Func.is_async: bool`
+- **Parser**: `async pf` keyword prefix, `await <expr>` and `spawn <expr>` primary expressions
+- **Lowerer**: async functions and await/spawn expressions lower to synchronous IR
+  (state machine transform planned for future iteration)
+- **Typechecker**: `await` and `spawn` typecheck the inner expression and return its type
+  (full `Future<T>` wrapping/unwrapping planned)
+- **C codegen**: works (async functions compile to regular C functions)
+- **PE emitter**: works (async functions emit valid PE structures)
+
+### Design Decisions
+
+- **No function coloring** — `await` works in any function, not just `async` functions
+- **No `Send`/`Sync`** — Fides's effect system (`!Spawn`) tracks cross-task safety
+- **No `Pin`** — region-based memory safety, not self-referential futures
+- **No `Future` trait complexity** — `Future<T>` is a simple enum (planned)
+- **Coexists with effect handlers** — effect handlers for effect dispatch, async/await for concurrency
+
+### Tokens
+
+`async`, `await`, `spawn` tokens have existed in the lexer since Phase 2 but were
+never parsed. Now they are fully integrated into the parser.
+
+### Test
+
+- `tests/test_async.fd` — basic async function, await, spawn, chained await
+
+### Test Count Update
+
+- Normal tests: 114 (was 110)
+- Expected-fail tests: 21 (unchanged)
+
+## Phase 7.5G: Composable Safety Primitives + Domain Presets (August 2026)
+
+Refactored safety annotations into 7 composable primitives with domain presets
+as aliases. This eliminates code duplication between @medical, @safety-critical,
+@autosar, and @dal-a while allowing users to compose custom safety profiles.
+
+### Core Safety Primitives (compiler enforces these directly)
+
+- `@no-alloc` — no dynamic allocation (p_vec_new, p_malloc, etc.)
+- `@no-recursion` — no direct self-calls
+- `@no-unbounded` — no while loops, only for with bounded ranges
+- `@no-panic` — no unwrap, p_panic, non-const div/mod
+- `@no-indirect` — no function pointers, no dynamic dispatch
+- `@requires-audit` — must have @audit
+- `@bounded-stack` — static call depth analysis (placeholder)
+
+### Domain Presets (aliases that expand to primitives)
+
+- `@medical` = `@no-alloc` + `@no-recursion` + `@no-unbounded` + `@no-panic` + `@requires-audit`
+- `@safety-critical` = `@no-alloc` + `@no-recursion` + `@no-unbounded` + `@no-panic` + `@no-indirect`
+- `@autosar` = `@no-alloc` + `@no-recursion` + `@no-unbounded` + `@no-panic`
+- `@dal-a` = `@no-alloc` + `@no-recursion` + `@no-unbounded` + `@no-panic` + `@requires-audit`
+
+### Custom Safety Profiles
+
+Users can now compose custom safety profiles by combining primitives directly:
+```
+@no-alloc @no-recursion pf my_func() { ... }
+```
+
+### Parser Enhancement
+
+- Annotation names now support hyphens: `@safety-critical`, `@no-alloc`, `@dal-a`
+- Parser reads `ident (- ident)*` after `@` to form the annotation name
+
+### Transitive Checking
+
+Safety-annotated functions can only call other safety-annotated functions with
+compatible (or superset) primitives. If a function has `@no-alloc`, any function
+it calls must also have `@no-alloc` (or a preset that includes it).
+
+### Tests
+
+- `test_safety_annotations.fd` — positive: @safety-critical, @autosar, @dal-a, direct primitives
+- `test_safety_annotations_fail.fd` — expected fail: while loop in @safety-critical
+- `test_safety_no_audit_fail.fd` — expected fail: @dal-a without @audit
+
+### Refactoring
+
+- `verify_medical()` replaced with generic `verify_safety_annotations()`
+- 7 core checks (no-alloc, no-recursion, no-unbounded, no-panic, no-indirect,
+  requires-audit, bounded-stack) implemented once, reused by all presets
+- Adding new domain presets is now a 1-line change (just add to the lookup table)
+
+## Phase 7.5F: @medical + given/ensure Contracts (August 2026)
+
+Two new safety features: IEC 62304 medical device compliance and Design by
+Contract preconditions.
+
+### F48: `@medical` Annotation
+
+- **Syntax**: `@medical @audit pf calculate_dose(...) -> i64 { ... }`
+- **Semantics**: IEC 62304 Class C compliance — medical device software safety
+- **Rejected patterns**:
+  - Dynamic allocation (`Vec::new`, `push`, `p_malloc`, etc.) — deterministic memory
+  - Recursion (direct self-calls) — stack overflow = patient harm
+  - `while` loops — unbounded iteration (WCET must be bounded)
+  - `unwrap()` / `p_panic()` — panic = catastrophic failure
+  - Missing `@audit` — full logging required for regulatory traceability
+  - Calling non-`@medical` functions — transitive safety
+- **Test**: `tests/test_medical.fd` (dose calculation, validation, vitals sum)
+- **Expected-fail**: `tests/test_medical_fail.fd` (all 4 violations caught)
+
+### F10: `given`/`ensure` Contracts — Design by Contract
+
+- **Syntax**: `pf sqrt(x: i64) -> i64 given x >= 0 { ... }`
+- **Semantics**: preconditions verified at compile time when arguments are
+  compile-time constants
+- **Supported comparisons**: `>=`, `<=`, `>`, `<`, `==`, `!=`
+- **Logical operators**: `&&` (And), `||` (Or) with short-circuit evaluation
+- **Constant folding**: integer literals, arithmetic expressions, negation
+- **Unknown args**: if arguments aren't compile-time constants, the check is
+  skipped (runtime assertion would be needed)
+- **New keywords**: `given`, `ensure` (tokens + lexer)
+- **New AST fields**: `Func.preconditions`, `Func.postconditions`
+- **Test**: `tests/test_contracts.fd` (sqrt, clamp, safe_divide)
+- **Expected-fail**: `tests/test_contracts_fail.fd` (precondition violations)
+
+### Test Count Update
+
+- Normal tests: 109 (was 107)
+- Expected-fail tests: 18 (was 16)
+- New tests: test_medical, test_contracts
+- New expected-fail: test_medical_fail, test_contracts_fail
+
+## Phase 7.5E: Safety Lock Cluster — F64/F65/F62/F68 (August 2026)
+
+Four compile-time and runtime safety features, completing the "safety lock"
+story that makes Fides competitive with SPARK Ada and Rust for safety-critical
+domains.
+
+### F64: Checked Arithmetic Lock
+
+- **Semantics**: integer overflow = panic (not silent wrap-around)
+- **Always on**: overflow checking is no longer gated on `debug_mode` — it's
+  the default in all modes (interpreter, C codegen, PE emitter)
+- **Division by zero**: always panics (was already the case in debug mode,
+  now always)
+- **Rust comparison**: Rust has `checked_add` opt-in; Fides has checked by
+  default with `@wrapping` opt-out
+
+### F65: `@wrapping` Annotation
+
+- **Syntax**: `@wrapping pf hash_step(x: i64) -> i64 { ... }`
+- **Semantics**: functions marked `@wrapping` use wrap-around arithmetic
+  instead of checked arithmetic — no overflow panic
+- **Use case**: hashing, crypto, bit manipulation where wrap-around is
+  intentional
+- **Implementation**: `IrFunction.is_wrapping` flag, checked in interpreter's
+  `eval_binop` via `is_wrapping_func()` helper
+- **Test**: `tests/test_checked_arith.fd` (hash_combine, rotl with @wrapping)
+
+### F62: Bounds Checking Lock
+
+- **Semantics**: array/Vec bounds checks ALWAYS fire in safe mode
+- **Escape hatch**: bounds checks are skipped inside `unsafe {}` blocks
+- **New IR instructions**: `UnsafeBegin`, `UnsafeEnd` — emitted by lowerer
+  around `unsafe {}` block bodies
+- **Interpreter**: tracks `interp_unsafe_depth` — when > 0, `p_vec_get`,
+  `p_vec_set`, and `ArrayGet` skip bounds checks
+- **Native code**: `UnsafeBegin`/`UnsafeEnd` are no-ops (C/PE don't have
+  runtime bounds checks)
+- **Test**: `tests/test_bounds_lock.fd` (safe access + unsafe access)
+
+### F68: Parameterized Queries
+
+- **Semantics**: string concatenation (`+`) on typed strings (SQLString,
+  ShellString, HTMLString, JSONString, PathString) is a compile error
+- **Rationale**: prevents injection attacks — the #1 OWASP vulnerability
+- **Typechecker**: `is_typed_string()` helper checks if a type is a typed
+  string; `BinOp::Add` on typed strings produces a clear error message
+- **Escape hatch**: use `sql_bind()`, `shell_escape()`, `html_escape()`, etc.
+  instead of `+`
+- **Test**: `tests/test_param_queries.fd` (safe construction),
+  `tests/test_param_queries_fail.fd` (expected fail — concat with +)
+
+### Test Count Update
+
+- Normal tests: 107 (was 104)
+- Expected-fail tests: 16 (was 15)
+- New tests: test_checked_arith, test_bounds_lock, test_param_queries
+- New expected-fail: test_param_queries_fail
+
+## Phase 7.5D: Typed Strings (F67) + Init Guarantee (F63) (August 2026)
+
+Two new safety features: injection prevention via typed strings and
+compile-time detection of uninitialized variable reads.
+
+### F67: Typed Strings
+
+- **New stdlib**: `stdlib/typed_strings.fd` with 5 distinct string types:
+  - `SQLString` — prevents SQL injection (use `sql_query()`, `sql_bind()`, `sql_escape()`)
+  - `ShellString` — prevents shell injection (use `shell_cmd()`, `shell_escape()`)
+  - `HTMLString` — prevents XSS (use `html_escape()`, `html_literal()`)
+  - `JSONString` — prevents JSON injection (use `json_escape()`)
+  - `PathString` — prevents path traversal (use `path_safe()`, `path_literal()`)
+- **Type system enforcement**: passing raw `str` to a function expecting
+  `SQLString` is now a compile error (argument type checking for named struct types)
+- **Safety methods**: each type has `is_safe()` heuristic + `raw()` accessor
+- **Tests**: `test_typed_strings.fd` (positive), `test_typed_strings_fail.fd` (expected fail)
+
+### F63: Init Guarantee
+
+- **New keyword**: `pm` — declare mutable variables without initializer
+  - Syntax: `pm x: i64;` (no `= expr` required)
+  - The variable is declared but not initialized
+- **Definite assignment analysis**: the typechecker tracks which `pm` variables
+  have been assigned and which haven't
+  - Reading an uninitialized `pm` variable is a **compile error**
+  - Assignment (`x = expr`) marks the variable as initialized
+  - If/else: a variable is only initialized after the branch if it was
+    initialized in **both** branches (intersection of init sets)
+- **Error message**: clear diagnostic with fix suggestion
+  ("assign a value before reading, or use `pv x = ...` to initialize at declaration")
+- **Tests**: `test_init_guarantee.fd` (positive), `test_init_guarantee_fail.fd`
+  (expected fail), `test_init_guarantee_cond_fail.fd` (expected fail — conditional)
+
+### Infrastructure Improvements
+
+- **Interpreter fix**: `Load` with `Ptr(U8)` type now checks opaque side-table
+  for stored `Value::Str` (fixes empty strings in struct fields)
+- **Interpreter fix**: `p_string_contains`, `p_string_replace`, `p_string_starts_with`,
+  `p_string_ends_with` now handle `Value::Ptr` arguments (not just `Value::Str`)
+- **Typechecker**: `p_*` builtins now return correct types (`str` for string
+  functions, `bool` for predicate functions) instead of defaulting to `i64`
+- **Typechecker**: function call argument types are now checked for named struct
+  types (catches type mismatches like passing `str` to `SQLString` parameter)
+- **IR fix**: `Type::RawPtr` now handled in `lower_type()` and `mangle_type()`
+- **TxnBegin/TxnEnd**: added to all backend match arms (codegen_c, pe, pir, wasm, x86)
+
+## Phase 7.5C: txn {} Rollback, @audit Full Trail, Raw Pointers, Memo Stdlib (August 2026)
+
+Four new features for systems programming and observability.
+
+### `txn {}` Rollback (Interpreter)
+
+- **Syntax**: `txn { ... }` blocks now have rollback semantics in the interpreter
+- **Mechanism**: `TxnBegin` IR instruction snapshots memory + opaque values;
+  `TxnEnd` commits (discards snapshot); panic restores snapshot before propagating
+- **New IR instructions**: `TxnBegin`, `TxnEnd`
+- **Native code**: `TxnBegin`/`TxnEnd` are no-ops (transactions handled at app level)
+- **Test**: `tests/test_txn_rollback.fd` (nested txn, txn with loops)
+
+### `@audit` Full Trail
+
+- **Enhancement**: `@audit` now logs parameter values on function entry
+- **Format**: `[AUDIT] enter func_name(param1=val1, param2=val2)`
+- **Type-aware**: each parameter is printed using its actual IR type (i64, str, etc.)
+- **Exit log**: unchanged — `[AUDIT] exit func_name`
+- **Test**: `tests/test_audit.fd` (updated to show param values)
+
+### Raw Pointer Types (`*mut T`, `*const T`)
+
+- **Syntax**: `*mut T` (mutable raw pointer), `*const T` (const raw pointer)
+- **Semantics**: like Rust's raw pointers — no borrow checking, no aliasing rules
+- **Safety**: raw pointer dereference only allowed inside `unsafe {}` blocks
+- **Typechecker**: `unsafe_depth` counter tracks unsafe block nesting
+- **Compatibility**: `&T` coerces to `*mut T`/`*const T`; raw pointers compatible with i64
+- **Lowering**: `RawPtr` lowers to `IrType::Ptr` (same as references)
+- **New token**: `const` keyword for `*const T` syntax
+- **New AST type**: `Type::RawPtr { inner, is_mut }`
+- **Test**: `tests/test_raw_ptr.fd` (scalar, array element dereference)
+
+### Memo Stdlib Helper (`stdlib/memo.fd`)
+
+- **Design decision**: memoization is a stdlib helper, not a compiler annotation
+- **API**: `Memo::new()`, `Memo::get_or_compute(&cache, key, compute_fn)`, `Memo::size()`
+- **Implementation**: parallel Vecs for keys and values (simple, no hash map needed)
+- **Test**: `tests/test_memo.fd` (fibonacci memoization with cache size tracking)
+
+### Test Count Update
+
+- Normal tests: 104 (was 101)
+- Expected-fail tests: 15 (was 13)
+- New tests: test_txn_rollback, test_raw_ptr, test_memo
+- New expected-fail: test_typed_strings_fail (user-added typed string injection test)
+
 ## Phase 7.5B: @crashfree Annotation — Compile-Time Panic Prevention (August 2026)
 
 Added `@crashfree` annotation for compile-time proof that a function cannot
@@ -40,8 +573,8 @@ as a pattern-based static check.
 
 ### Test Results
 
-- 99/99 normal tests pass (including test_crashfree)
-- 12/12 expected-fail tests correctly rejected (including test_crashfree_fail)
+- 114/114 normal tests pass (including test_crashfree)
+- 21/21 expected-fail tests correctly rejected (including test_crashfree_fail)
 - No regressions
 
 ## Phase 7.5A (cont): LogicalTime Stdlib (August 2026)
@@ -96,8 +629,8 @@ All time values are explicitly constructed — no system clock access means
 deterministic, reproducible date math.
 
 ### Test Results
-- 99/99 normal tests pass (including test_time, test_time_edge)
-- 12/12 expected-fail tests correctly rejected
+- 114/114 normal tests pass (including test_time, test_time_edge)
+- 21/21 expected-fail tests correctly rejected
 - No regressions
 
 ## Phase 7.5D: @gas Annotation — Compile-Time Gas Budgets (August 2026)
@@ -567,7 +1100,7 @@ Found 4 gaps:
 
 - **Synchronized all current-state docs** with actual verified test results and
   project metrics. Every doc now matches ground truth:
-  - **Unit tests**: 137/137 (was variously reported as 133, 136)
+  - **Unit tests**: 136/136 (was variously reported as 133, 137)
   - **Interpreter/PE/C Codegen**: 86/86 + 3/3 expected-fail — FULL PARITY (was
     variously reported as 78/78+1/1, 81/81+3/3, 76/78, 78/81, etc.)
   - **C codegen**: FULL PARITY — no gaps (was reported as 76/78 with 2 mismatches

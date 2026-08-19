@@ -18,7 +18,7 @@ this writing).  Tests are sorted alphabetically by filename.
 | Pass criterion | No panic on stderr; exit code may be non-zero |
 | What it exercises | AST → IR → tree-walking interpreter |
 | Run by | `fidesc test` (built-in) |
-| Current score | 99/99 + 12/12 expected-fail |
+| Current score | 114/114 + 21/21 expected-fail |
 
 The interpreter is the reference implementation.  A test "passes" if the
 interpreter does not panic or emit a compilation error.  Non-zero exit codes
@@ -34,7 +34,7 @@ tests (correctly rejected at compile time).
 | Pass criterion | stdout matches interpreter stdout exactly |
 | What it exercises | AST → IR → C source transpilation → external gcc |
 | Run by | `fidesc test` (built-in) |
-| Current score | 99/99 + 12/12 expected-fail (FULL PARITY) |
+| Current score | 114/114 + 21/21 expected-fail (FULL PARITY) |
 
 C codegen transpiles the Fides IR to C source code and compiles it with the
 system C compiler (gcc/clang).  A test "passes" only if the executable's
@@ -49,7 +49,7 @@ PARITY with the interpreter — no gaps.
 | Pass criterion | Emission succeeds and output file exists |
 | What it exercises | AST → IR → PE bytecode emitter |
 | Run by | `fidesc test` (built-in) |
-| Current score | 99/99 + 12/12 expected-fail |
+| Current score | 114/114 + 21/21 expected-fail |
 
 The PE (Portable Executable) emitter produces a standalone native x86-64
 executable. A test "passes" if emission succeeds and the output file is
@@ -128,9 +128,9 @@ echo "=== Results: $pass pass, $fail fail ==="
 
 | Batch | Backend | Score | Notes |
 |-------|---------|-------|-------|
-| 1 | Interpreter | 99/99 + 12/12 expected-fail | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` correctly fail (expected) |
-| 2 | C Codegen | 99/99 + 12/12 expected-fail | FULL PARITY — no gaps. test_db no longer flaky (HashMap keys sorted). |
-| 3 | PE Emitter | 99/99 + 12/12 expected-fail | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` correctly fail (expected) |
+| 1 | Interpreter | 114/114 + 21/21 expected-fail | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` correctly fail (expected) |
+| 2 | C Codegen | 114/114 + 21/21 expected-fail | FULL PARITY — no gaps. test_db no longer flaky (HashMap keys sorted). |
+| 3 | PE Emitter | 114/114 + 21/21 expected-fail | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` correctly fail (expected) |
 | 4 | Native x86-64 | 63/66 | 3 mismatches: test_collections, test_db, test_matrix_mul — pre-existing native codegen bugs |
 
 ## Important Notes

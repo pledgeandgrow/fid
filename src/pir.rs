@@ -781,10 +781,18 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
                 value: ValueId(0),
                 ty: PirType::I64,
             },
+            Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd => L1Inst::Copy {
+                value: ValueId(0),
+                ty: PirType::I64,
+            },
             Inst::Panic { message } => L1Inst::Panic { message: message.clone() },
             Inst::Asm { template, .. } => L1Inst::Panic { message: format!("inline asm not supported in PIR: {}", template) },
             Inst::RegionBegin { name } => L1Inst::NewRegion { name: name.clone() },
             Inst::RegionEnd { .. } => L1Inst::FreeRegion { region: ValueId(0) },
+            Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd => L1Inst::Copy {
+                value: ValueId(0),
+                ty: PirType::I64,
+            },
         };
         values.insert(*vid, (l1_inst, region, effects, src_line));
     }

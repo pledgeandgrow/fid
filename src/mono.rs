@@ -54,6 +54,7 @@ fn mangle_type(ty: &Type) -> String {
             format!("{}__{}", name, args_str.join("_"))
         }
         Type::Ref { inner, .. } => format!("ref_{}", mangle_type(inner)),
+        Type::RawPtr { inner, is_mut } => format!("rawptr_{}_{}", if *is_mut { "mut" } else { "const" }, mangle_type(inner)),
         Type::Array { elem, .. } => format!("arr_{}", mangle_type(elem)),
         Type::ArrayConst { elem, size_param } => format!("arrc_{}_{}", mangle_type(elem), size_param),
         Type::Tuple(types) => {
@@ -73,6 +74,7 @@ fn mangle_type(ty: &Type) -> String {
             }).collect();
             format!("tensor_{}_{}", mangle_type(elem), shape_str.join("_"))
         }
+        Type::RawPtr { inner, is_mut } => format!("rawptr_{}_{}", mangle_type(inner), if *is_mut { "mut" } else { "const" }),
     }
 }
 
@@ -110,6 +112,10 @@ fn subst_type(ty: &Type, subst: &Subst) -> Type {
             }
         }
         Type::Ref { inner, is_mut } => Type::Ref {
+            inner: Box::new(subst_type(inner, subst)),
+            is_mut: *is_mut,
+        },
+        Type::RawPtr { inner, is_mut } => Type::RawPtr {
             inner: Box::new(subst_type(inner, subst)),
             is_mut: *is_mut,
         },
@@ -184,6 +190,10 @@ fn subst_gat_type_args(ty: &Type, args: &[Type], subst: &Subst) -> Type {
             inner: Box::new(subst_gat_type_args(inner, args, subst)),
             is_mut: *is_mut,
         },
+        Type::RawPtr { inner, is_mut } => Type::RawPtr {
+            inner: Box::new(subst_gat_type_args(inner, args, subst)),
+            is_mut: *is_mut,
+        },
         Type::Tuple(types) => Type::Tuple(
             types.iter().map(|t| subst_gat_type_args(t, args, subst)).collect()
         ),
@@ -230,6 +240,10 @@ fn resolve_assoc_types(ty: &Type, subst: &Subst, bindings: &HashMap<(String, Str
             size: *size,
         },
         Type::Ref { inner, is_mut } => Type::Ref {
+            inner: Box::new(resolve_assoc_types(inner, subst, bindings)),
+            is_mut: *is_mut,
+        },
+        Type::RawPtr { inner, is_mut } => Type::RawPtr {
             inner: Box::new(resolve_assoc_types(inner, subst, bindings)),
             is_mut: *is_mut,
         },
@@ -425,6 +439,12 @@ fn subst_expr(expr: &Expr, subst: &Subst, renames: &HashMap<String, String>, met
             expr: Box::new(subst_expr(expr, subst, renames, method_renames)),
             target_ty: subst_type(target_ty, subst),
         },
+        Expr::Await { expr: inner } => Expr::Await {
+            expr: Box::new(subst_expr(inner, subst, renames, method_renames)),
+        },
+        Expr::Spawn { expr: inner } => Expr::Spawn {
+            expr: Box::new(subst_expr(inner, subst, renames, method_renames)),
+        },
     }
 }
 
@@ -437,6 +457,11 @@ fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, met
             is_mut: *is_mut,
             is_persist: *is_persist,
             expr: subst_expr(expr, subst, renames, method_renames),
+            line: *line,
+        },
+        Stmt::LetUninit { name, ty, line } => Stmt::LetUninit {
+            name: name.clone(),
+            ty: subst_type(ty, subst),
             line: *line,
         },
         Stmt::LetTuple { names, expr, line } => Stmt::LetTuple {
@@ -946,6 +971,9 @@ fn process_func(func: &Func, ctx: &mut MonoCtx) -> Func {
         has_effect_annotation: func.has_effect_annotation,
         is_interrupt: func.is_interrupt,
             annotations: func.annotations.clone(),
+        preconditions: func.preconditions.clone(),
+        postconditions: func.postconditions.clone(),
+        is_async: func.is_async,
     }
 }
 
@@ -982,6 +1010,9 @@ fn instantiate(gen_func: &Func, subst: &Subst, mangled_name: &str, ctx: &mut Mon
         has_effect_annotation: gen_func.has_effect_annotation,
         is_interrupt: gen_func.is_interrupt,
             annotations: gen_func.annotations.clone(),
+        preconditions: gen_func.preconditions.clone(),
+        postconditions: gen_func.postconditions.clone(),
+        is_async: gen_func.is_async,
     };
 
     // Now process this concrete function — it may contain calls to other generics
@@ -1019,6 +1050,7 @@ fn collect_generic_calls_stmt_with_hint(
             // Register this let binding's type for later lookups
             let _ = name;
         }
+        Stmt::LetUninit { .. } => {} // No expression to analyze
         Stmt::LetTuple { expr, .. } => {
             collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, None);
         }

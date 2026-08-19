@@ -1,0 +1,90 @@
+// Test borrow checker — valid borrow patterns that should compile and run
+// correctly under --borrowck=on (now the default).
+//
+// These patterns exercise:
+// - Shared borrows (&x) that coexist
+// - Mutable borrows (&mut x) that are exclusive
+// - Temporary borrows passed to function calls (released after call)
+// - Borrows that end when the borrower goes out of scope
+// - unsafe {} blocks that skip borrow checking
+// - Field-wise borrows (&s.x and &s.y coexist) — Phase 3
+// - Two-phase borrows (&mut and & in same call) — Phase 4
+// - NLL: borrows end at last use, not scope end — Phase 6
+
+struct Point { x: i64, y: i64 }
+
+pf increment(x: &mut i64) {
+    *x = *x + 1;
+}
+
+pf read_val(x: &i64) -> i64 {
+    *x
+}
+
+pf add_to(x: &mut i64, n: i64) {
+    *x += n;
+}
+
+pf copy_first(dst: &mut i64, src: &i64) {
+    *dst = *src;
+}
+
+pf main() -> i64 {
+    // Temporary mutable borrow passed to a call — released after call returns.
+    pv mut v = 10;
+    increment(&mut v);
+    print(v);  // 11
+
+    // Another temporary mutable borrow on the same var — previous one is gone.
+    add_to(&mut v, 5);
+    print(v);  // 16
+
+    // Named mutable borrow, used, then borrower goes out of scope.
+    {
+        pv mut w = 100;
+        {
+            pv r = &mut w;
+            *r = 42;
+        }
+        // r is out of scope here, so w is no longer borrowed.
+        print(w);  // 42
+    }
+
+    // Temporary shared borrow passed to a call.
+    pv x = 99;
+    pv y = read_val(&x);
+    print(y);  // 99
+
+    // unsafe block skips borrow checking — raw aliasing is allowed.
+    pv mut z = 7;
+    unsafe {
+        pv r1 = &mut z;
+        pv r2 = &mut z;
+        *r1 = 1;
+        *r2 = 2;
+    }
+    print(z);  // 2
+
+    // Field-wise borrows: &p.x and &p.y can coexist (different fields).
+    pv p = Point { x: 10, y: 20 };
+    pv rx = &p.x;
+    pv ry = &p.y;
+    print(*rx);  // 10
+    print(*ry);  // 20
+
+    // Phase 4: Two-phase borrows — &mut v and &v in the same call.
+    // The &v is read before &mut v takes effect.
+    pv mut t = 42;
+    copy_first(&mut t, &t);
+    print(t);  // 42
+
+    // Phase 6: NLL — borrow ends at last use, not scope end.
+    pv mut n = 10;
+    pv nr = &n;       // borrow n
+    print(*nr);       // last use of nr — borrow ends here
+    n = 20;           // mutation OK — nr is dead (NLL)
+    print(n);         // 20
+
+    ret 0;
+}
+

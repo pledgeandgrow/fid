@@ -948,6 +948,9 @@ impl WasmCodeGen {
             Inst::PersistSave { .. } => {
                 // No-op in WASM
             }
+            Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd => {
+                // No-op in WASM (rollback/unsafe not supported)
+            }
             Inst::Panic { message } => {
                 let addr = self.string_addrs.get(message).copied().unwrap_or(0);
                 self.emit_const_i64(out, addr as i64);

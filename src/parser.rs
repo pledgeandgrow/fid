@@ -153,6 +153,14 @@ impl Parser {
                     func.is_interrupt = true;
                     program.funcs.push(func);
                 }
+                TokenKind::Async => {
+                    self.advance(); // consume async
+                    // async pf name(...) -> Future<T> { ... }
+                    let mut func = self.parse_func()?;
+                    func.is_pub = is_pub;
+                    func.is_async = true;
+                    program.funcs.push(func);
+                }
                 TokenKind::Extern => {
                     self.advance(); // consume extern
                     // extern "C" pf name(...);  or  extern "C" { pf name(...); ... }
@@ -317,6 +325,23 @@ impl Parser {
     fn parse_struct(&mut self) -> Result<StructDef, String> {
         self.expect(TokenKind::Struct, "struct")?;
         let name = self.expect_ident()?;
+
+        // Generic type params: struct Foo<T, U> { ... }
+        let mut type_params = Vec::new();
+        if self.check(&TokenKind::Lt) {
+            self.advance();
+            if !self.check(&TokenKind::Gt) {
+                loop {
+                    let tp = self.expect_ident()?;
+                    type_params.push(tp);
+                    if !self.match_tok(TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(TokenKind::Gt, ">")?;
+        }
+
         self.expect(TokenKind::LBrace, "{")?;
 
         let mut fields = Vec::new();
@@ -336,7 +361,7 @@ impl Parser {
         self.expect(TokenKind::RBrace, "}")?;
 
         self.struct_names.push(name.clone());
-        Ok(StructDef { name, fields, is_pub: false, annotations: Vec::new() })
+        Ok(StructDef { name, fields, is_pub: false, annotations: Vec::new(), type_params })
     }
 
     /// Parse a layer declaration:
@@ -456,6 +481,23 @@ impl Parser {
     fn parse_enum(&mut self) -> Result<EnumDef, String> {
         self.expect(TokenKind::Enum, "enum")?;
         let name = self.expect_ident()?;
+
+        // Generic type params: enum Option<T> { ... }
+        let mut type_params = Vec::new();
+        if self.check(&TokenKind::Lt) {
+            self.advance();
+            if !self.check(&TokenKind::Gt) {
+                loop {
+                    let tp = self.expect_ident()?;
+                    type_params.push(tp);
+                    if !self.match_tok(TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(TokenKind::Gt, ">")?;
+        }
+
         self.expect(TokenKind::LBrace, "{")?;
 
         let mut variants = Vec::new();
@@ -498,7 +540,7 @@ impl Parser {
         self.expect(TokenKind::RBrace, "}")?;
 
         self.enum_names.push(name.clone());
-        Ok(EnumDef { name, variants, is_pub: false })
+        Ok(EnumDef { name, variants, is_pub: false, type_params })
     }
 
     fn parse_const(&mut self) -> Result<ConstDef, String> {
@@ -863,6 +905,29 @@ impl Parser {
             Vec::new()
         };
 
+        // F10: Parse given/ensure contracts (Design by Contract)
+        // Syntax: given <expr> ensure <expr> { ... }
+        // Multiple conditions can be separated by commas or 'and'/'or'.
+        // For simplicity, we parse one expression per given/ensure keyword.
+        let mut preconditions: Vec<Expr> = Vec::new();
+        let mut postconditions: Vec<Expr> = Vec::new();
+        loop {
+            if self.check(&TokenKind::Given) {
+                self.advance();
+                let expr = self.parse_expr()?;
+                preconditions.push(expr);
+                // Allow multiple given clauses
+                continue;
+            }
+            if self.check(&TokenKind::Ensure) {
+                self.advance();
+                let expr = self.parse_expr()?;
+                postconditions.push(expr);
+                continue;
+            }
+            break;
+        }
+
         self.expect(TokenKind::LBrace, "{")?;
         let body = self.parse_block()?;
         self.expect(TokenKind::RBrace, "}")?;
@@ -881,6 +946,9 @@ impl Parser {
             has_effect_annotation,
             is_interrupt: false,
             annotations: Vec::new(),
+            preconditions,
+            postconditions,
+            is_async: false, // set by caller when parsing `async pf`
         })
     }
 
@@ -1067,6 +1135,22 @@ impl Parser {
                 let inner = self.parse_type()?;
                 return Ok(Type::Ref { inner: Box::new(inner), is_mut });
             }
+            TokenKind::Star => {
+                // Raw pointer type: *mut T or *const T
+                self.advance();
+                let is_mut = if self.check(&TokenKind::Mut) {
+                    self.advance();
+                    true
+                } else if self.check(&TokenKind::Const) {
+                    self.advance();
+                    false
+                } else {
+                    // *T defaults to *const T
+                    false
+                };
+                let inner = self.parse_type()?;
+                return Ok(Type::RawPtr { inner: Box::new(inner), is_mut });
+            }
             TokenKind::LBracket => {
                 self.advance();
                 let elem = self.parse_type()?;
@@ -1115,6 +1199,7 @@ impl Parser {
         match self.peek() {
             TokenKind::Persist => self.parse_persist_let(),
             TokenKind::Pv => self.parse_let(),
+            TokenKind::Pm => self.parse_let_uninit(),
             TokenKind::Ret => self.parse_return(),
             TokenKind::If => {
                 let line = self.peek_token().line;
@@ -1528,6 +1613,18 @@ impl Parser {
         // We use the prefix form: `persist pv name = expr;`
         // This is handled in parse_stmt by checking for Persist token before Pv
         Ok(Stmt::Let { name, ty, expr, is_mut, is_persist: false, line })
+    }
+
+    /// Parse `pm name: Type;` — uninitialized mutable variable (F63: init guarantee).
+    /// The variable must be assigned before it's read; the typechecker enforces this.
+    fn parse_let_uninit(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect(TokenKind::Pm, "pm")?;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::Colon, ":")?;
+        let ty = self.parse_type()?;
+        self.match_tok(TokenKind::Semicolon);
+        Ok(Stmt::LetUninit { name, ty, line })
     }
 
     /// Parse `persist pv name = expr;` — variable that survives hot reloads.
@@ -2229,6 +2326,18 @@ impl Parser {
                 self.expect(TokenKind::RBrace, "}")?;
                 Ok(Expr::TryBlock { body })
             }
+            TokenKind::Await => {
+                // await <expr> — suspend until Future is ready
+                self.advance(); // consume await
+                let expr = self.parse_unary()?;
+                Ok(Expr::Await { expr: Box::new(expr) })
+            }
+            TokenKind::Spawn => {
+                // spawn <expr> — create a concurrent task, returns Future<T>
+                self.advance(); // consume spawn
+                let expr = self.parse_unary()?;
+                Ok(Expr::Spawn { expr: Box::new(expr) })
+            }
             _ => {
                 // Try postfix (field access) on primary expressions
                 // If it's not a primary token, error
@@ -2591,9 +2700,26 @@ impl Parser {
     /// Returns (name, args) where args is a list of raw string tokens.
     fn parse_at_annotation(&mut self) -> Result<Annotation, String> {
         self.expect(TokenKind::At, "@")?;
-        // Annotation name can be a keyword (like 'kernel') or an identifier
+        // Annotation name can be a keyword (like 'kernel') or an identifier.
+        // Allow hyphens in annotation names (e.g., @safety-critical, @no-alloc, @dal-a)
         let name = match self.peek().clone() {
-            TokenKind::Ident(s) => { self.advance(); s }
+            TokenKind::Ident(s) => {
+                self.advance();
+                // Check for hyphenated name: ident - ident - ident ...
+                let mut full_name = s;
+                while self.check(&TokenKind::Minus) {
+                    self.advance();
+                    match self.peek().clone() {
+                        TokenKind::Ident(part) => {
+                            self.advance();
+                            full_name.push('-');
+                            full_name.push_str(&part);
+                        }
+                        _ => break,
+                    }
+                }
+                full_name
+            }
             TokenKind::Kernel => { self.advance(); "kernel".to_string() }
             TokenKind::Layer => { self.advance(); "layer".to_string() }
             TokenKind::Model => { self.advance(); "model".to_string() }

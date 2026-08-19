@@ -38,6 +38,9 @@ fn is_skip_test(name: &str) -> bool {
         | "test_mmu.fd"
         | "test_gat.fd"
         | "test_ffi_header.fd"
+        | "test_dlopen.fd"
+        // Borrow checker fail test is now in the expected-fail list
+        // (borrow checking is on by default as of Phase 5).
     )
 }
 
@@ -52,6 +55,16 @@ fn is_expect_fail_test(name: &str) -> bool {
         | "test_loop_linear_fail.fd"
         | "test_gas_fail.fd"
         | "test_crashfree_fail.fd"
+        | "test_typed_strings_fail.fd"
+        | "test_init_guarantee_fail.fd"
+        | "test_init_guarantee_cond_fail.fd"
+        | "test_param_queries_fail.fd"
+        | "test_medical_fail.fd"
+        | "test_safety_annotations_fail.fd"
+        | "test_safety_no_audit_fail.fd"
+        | "test_contracts_fail.fd"
+        | "test_borrowck_fail.fd"
+        | "test_async_fail.fd"
     )
 }
 

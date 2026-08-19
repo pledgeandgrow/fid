@@ -1,0 +1,69 @@
+// Fides Concurrency standard library
+//
+// Provides OS threads, atomics, and mutex for shared-memory parallelism.
+// In the interpreter, threads use Rust's std::thread.
+// In C codegen, threads use pthread + C11 stdatomic.
+// In native builds, threads use clone() syscall (pending).
+//
+// Usage:
+//   use sync;
+//   pv counter = sync_atomic_alloc(0);
+//   pv m = sync_mutex_create();
+//   sync_mutex_lock(m);
+//   sync_atomic_add(counter, 1);
+//   sync_mutex_unlock(m);
+//
+//   pv fut = spawn increment(counter, m);
+//   pv result = await fut;
+
+module sync;
+
+/// Allocate a shared atomic i64 slot, initialized to 0.
+/// Returns an address that can be used with atomic operations.
+pub pf sync_atomic_alloc(initial: i64) -> i64 {
+    pv addr = p_shared_alloc(8);
+    p_atomic_store(addr, initial);
+    ret addr;
+}
+
+/// Atomically load the value at an address.
+pub pf sync_atomic_load(addr: i64) -> i64 {
+    ret p_atomic_load(addr);
+}
+
+/// Atomically store a value at an address.
+pub pf sync_atomic_store(addr: i64, val: i64) -> void {
+    p_atomic_store(addr, val);
+}
+
+/// Atomically compare-and-swap. Returns true if the swap succeeded.
+pub pf sync_atomic_cas(addr: i64, expected: i64, new_val: i64) -> bool {
+    ret p_atomic_cas(addr, expected, new_val);
+}
+
+/// Atomically add a value. Returns the old value before the add.
+pub pf sync_atomic_add(addr: i64, val: i64) -> i64 {
+    ret p_atomic_add(addr, val);
+}
+
+/// Create a mutex. Returns a mutex handle.
+pub pf sync_mutex_create() -> i64 {
+    ret p_mutex_init();
+}
+
+/// Lock a mutex (blocks if contended by another thread).
+pub pf sync_mutex_lock(m: i64) -> void {
+    p_mutex_lock(m);
+}
+
+/// Unlock a mutex.
+pub pf sync_mutex_unlock(m: i64) -> void {
+    p_mutex_unlock(m);
+}
+
+/// Spawn a function as a new OS thread.
+/// Returns a Future handle. Use `await` to join the thread and get the result.
+/// The function must take i64 parameters and return i64.
+pub pf sync_spawn(func_name: str, num_args: i64) -> i64 {
+    ret p_thread_spawn(func_name, num_args);
+}

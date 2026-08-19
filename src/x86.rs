@@ -627,6 +627,9 @@ impl X86CodeGen {
             Inst::PersistSave { .. } => {
                 // No-op
             }
+            Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd => {
+                // No-op (rollback/unsafe not supported)
+            }
             Inst::Panic { message } => {
                 let label = self.intern_string(message);
                 // Emit the string in data section if not already there

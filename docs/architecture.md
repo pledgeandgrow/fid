@@ -97,17 +97,18 @@ The **`build` command** uses the full PIR pipeline (L1→L2→L3 → codegen →
 | C header parser (`cparser.rs`) | C header → Fides FFI bindings | `parse-header` |
 | Hot reload (`hotreload.rs`) | Native JIT (ELF64) + function-level change detection | `watch` |
 | Linker (`linker.rs`) | Multiple object files → linked binary | `link` |
+| LSP server (`lsp.rs`) | JSON-RPC 2.0 over stdio, diagnostics from compiler | `lsp` |
 
 ### Module Resolution (`compiler.rs`)
 
 Before type-checking, the compiler:
-1. Parses `stdlib/core.fd` (auto-included) — Option, Result, println, assert, max, min, abs, clamp
+1. Parses `stdlib/core.fd` (auto-included) — Option<T>, Result<T, E>, println, assert, max, min, abs, clamp
 2. Parses user source with stdlib names pre-populated
 3. Resolves `use` imports by searching for `<path>.fd` or `<path>/mod.fd` relative to source
-4. Merges stdlib + imported modules + user code (user wins on conflicts)
+4. Merges stdlib + imported modules + user code (user wins on conflicts, `extern_decls` merged)
 5. Type-checks the merged program with module-level visibility enforcement
 
-**Standard library modules** (in `stdlib/`): `core.fd` (auto-included), `json.fd`, `tensor.fd`, `parallel.fd`, `db.fd`, `http.fd`, `simd.fd`, `shape.fd`, `quant.fd` — imported explicitly via `use`.
+**Standard library modules** (in `stdlib/`): `core.fd` (auto-included), `math.fd`, `env.fd`, `args.fd`, `process.fd`, `regex.fd`, `json.fd`, `tensor.fd`, `parallel.fd`, `db.fd`, `http.fd`, `simd.fd`, `shape.fd`, `quant.fd`, `money.fd`, `banking.fd`, `alloc.fd`, `file.fd`, `time.fd`, `typed_strings.fd`, `memo.fd`, `privacy.fd` — imported explicitly via `use`.
 
 ### Monomorphization (`mono.rs`)
 
@@ -561,8 +562,9 @@ The compiler includes a suite of scripts and conventions for maintaining correct
 | `src/regalloc.rs` | **Linear scan register allocator** (⚠️ known bug: constants clobbered by intervening instructions) |
 | `src/mono.rs` | Generic monomorphization: specializes generic functions per call site |
 | `src/compiler.rs` | Pipeline orchestration, module resolution, stdlib auto-include, layer/model desugaring |
+| `src/lsp.rs` | **LSP server**: JSON-RPC 2.0 over stdio, diagnostics, no external deps |
 | `src/autograd.rs` | **Autograd**: tape-based gradient computation framework — reverse-mode AD for `grad` blocks |
-| `stdlib/core.fd` | Core standard library (println, assert, assert_eq) |
+| `stdlib/core.fd` | Core standard library (Option<T>, Result<T, E>, println, assert, assert_eq) |
 | `tests/*.fd` | Test programs (hello, struct, struct_return, features2-6, control_flow, functions, strings) |
 
 ---

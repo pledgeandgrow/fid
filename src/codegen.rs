@@ -264,6 +264,10 @@ impl CodeGen {
                 };
                 writeln!(self.output, "    str x0, [sp, #{}]", offset).unwrap();
             }
+            Stmt::LetUninit { name, .. } => {
+                // Just declare the variable — no initialization
+                self.declare_var(name);
+            }
             Stmt::LetTuple { names, expr, .. } => {
                 // Generate the tuple expression, then extract each field
                 self.gen_expr(expr);

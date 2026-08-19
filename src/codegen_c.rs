@@ -825,6 +825,37 @@ impl CCodeGen {
         wln!(self, "int64_t p_file_write(const char* path, const char* content);");
         wln!(self, "bool p_file_exists(const char* path);");
         wln!(self, "int64_t p_file_append(const char* path, const char* content);");
+        // Environment variable builtins
+        wln!(self, "char* p_getenv(const char* name);");
+        // Command-line argument builtins — globals saved by main wrapper
+        wln!(self, "static int __p_argc = 0;");
+        wln!(self, "static char** __p_argv = NULL;");
+        wln!(self, "int64_t p_argc(void);");
+        wln!(self, "char* p_argv(int64_t index);");
+        // Process control builtins
+        wln!(self, "int64_t p_system(const char* cmd);");
+        wln!(self, "void p_exit(int64_t code);");
+        // Regex builtin
+        wln!(self, "bool p_regex_match(const char* s, const char* pattern);");
+        // Async/await runtime (Phase 7.6)
+        wln!(self, "int64_t p_future_ready(int64_t value);");
+        wln!(self, "int64_t p_future_poll(int64_t future);");
+        // Threads + atomics + mutex (Phase 8A)
+        wln!(self, "int64_t p_thread_spawn(const char* func_name, int64_t num_args, ...);");
+        wln!(self, "int64_t p_shared_alloc(int64_t size);");
+        wln!(self, "int64_t p_atomic_load(int64_t addr);");
+        wln!(self, "void p_atomic_store(int64_t addr, int64_t val);");
+        wln!(self, "bool p_atomic_cas(int64_t addr, int64_t expected, int64_t new_val);");
+        wln!(self, "int64_t p_atomic_add(int64_t addr, int64_t val);");
+        wln!(self, "int64_t p_mutex_init(void);");
+        wln!(self, "void p_mutex_lock(int64_t m);");
+        wln!(self, "void p_mutex_unlock(int64_t m);");
+        wln!(self, "void p_thread_register(const char* name, int64_t (*fn)());");
+        // Dynamic loading builtins (Phase 7.7)
+        wln!(self, "int64_t p_dl_open(const char* path);");
+        wln!(self, "int64_t p_dl_sym(int64_t handle, const char* symbol);");
+        wln!(self, "void p_dl_close(int64_t handle);");
+        wln!(self, "int64_t p_dl_call(int64_t func_ptr, int64_t arg);");
         // Allocator builtins (Phase 2A.8)
         wln!(self, "void* p_allocator_create(void* arg);");
         wln!(self, "int64_t p_allocator_alloc(void* alloc, int64_t size);");
@@ -891,6 +922,8 @@ impl CCodeGen {
 
     fn emit_prototypes(&mut self, module: &IrModule) {
         wln!(self, "// ─── Function prototypes ───");
+        // Forward declaration for p_thread_register (used in main wrapper)
+        wln!(self, "void p_thread_register(const char* name, int64_t (*fn)());");
         for (name, func) in &module.functions {
             let proto_name = self.sanitize_c_name(name);
             let ret_ty = if name == "main" { "int64_t".to_string() } else { Self::c_ret_type(&func.ret_ty) };
@@ -908,6 +941,15 @@ impl CCodeGen {
         if module.functions.contains_key("main") {
             wln!(self, "// ─── C entry point ───");
             wln!(self, "int main(int argc, char** argv) {");
+            wln!(self, "    __p_argc = argc; __p_argv = argv;");
+            // Register all Fides functions for thread spawning (Phase 8A)
+            wln!(self, "    // Register functions for p_thread_spawn lookup");
+            for (name, _) in &module.functions {
+                if name != "main" {
+                    let c_name = self.sanitize_c_name(name);
+                    wln!(self, "    p_thread_register(\"{}\", (int64_t(*)()){});", name, c_name);
+                }
+            }
             wln!(self, "    int64_t result = main_entry(NULL);");
             wln!(self, "    return (int)result;");
             wln!(self, "}");
@@ -1630,6 +1672,12 @@ impl CCodeGen {
             Inst::PersistSave { .. } => {
                 // Persistent save — no-op in C backend
             }
+            Inst::TxnBegin | Inst::TxnEnd => {
+                // Transaction begin/end — no-op in C backend (rollback not supported)
+            }
+            Inst::UnsafeBegin | Inst::UnsafeEnd => {
+                // Unsafe block markers — no-op in C backend
+            }
             Inst::Panic { message, .. } => {
                 wln!(self, "    fprintf(stderr, \"Panic: {}\\n\"); abort();", message);
             }
@@ -1835,6 +1883,137 @@ impl CCodeGen {
         wln!(self, "    if (!f) return -1;");
         wln!(self, "    fputs(content, f); fclose(f); return 0;");
         wln!(self, "}}");
+        // Environment variable builtins
+        wln!(self, "char* p_getenv(const char* name) {{ return getenv(name); }}");
+        // Command-line argument builtins — globals declared in emit_runtime_types
+        wln!(self, "int64_t p_argc(void) {{ return (int64_t)__p_argc; }}");
+        wln!(self, "char* p_argv(int64_t index) {{ if (index < 0 || index >= __p_argc) return NULL; return __p_argv[index]; }}");
+        // Process control builtins
+        wln!(self, "int64_t p_system(const char* cmd) {{ return (int64_t)system(cmd); }}");
+        wln!(self, "void p_exit(int64_t code) {{ exit((int)code); }}");
+        // Regex builtin — simple wildcard match (? and *)
+        wln!(self, "bool p_regex_match(const char* s, const char* pattern) {{");
+        wln!(self, "    if (!s || !pattern) return false;");
+        wln!(self, "    int64_t si = 0, pi = 0, s_len = (int64_t)strlen(s), p_len = (int64_t)strlen(pattern);");
+        wln!(self, "    int64_t star_s = -1, star_p = -1;");
+        wln!(self, "    while (si < s_len) {{");
+        wln!(self, "        if (pi < p_len && (pattern[pi] == '?' || pattern[pi] == s[si])) {{ si++; pi++; }}");
+        wln!(self, "        else if (pi < p_len && pattern[pi] == '*') {{ star_p = pi; star_s = si; pi++; }}");
+        wln!(self, "        else if (star_p >= 0) {{ pi = star_p + 1; si = star_s + 1; star_s = si; }}");
+        wln!(self, "        else return false;");
+        wln!(self, "    }}");
+        wln!(self, "    while (pi < p_len && pattern[pi] == '*') pi++;");
+        wln!(self, "    return pi == p_len;");
+        wln!(self, "}}");
+        // Async/await runtime (Phase 7.6 + 8A)
+        // Future model: p_future_ready wraps a value directly (eager).
+        // p_thread_spawn returns a negative handle (-1, -2, ...) for thread-based futures.
+        // p_future_poll: if future >= 0, return it (eager). If negative, join the thread.
+        wln!(self, "#include <pthread.h>");
+        wln!(self, "int64_t p_future_ready(int64_t value) { return value; }");
+        // Thread join table — maps negative handle to pthread_t
+        wln!(self, "static pthread_t p_thread_handles[256];");
+        wln!(self, "static int p_thread_handle_count = 0;");
+        wln!(self, "int64_t p_future_poll(int64_t future) {");
+        wln!(self, "    if (future >= 0) return future; // eager future");
+        wln!(self, "    // Thread-based future: join and get result");
+        wln!(self, "    int idx = -(future + 1);");
+        wln!(self, "    if (idx < 0 || idx >= p_thread_handle_count) return 0;");
+        wln!(self, "    void* ret = NULL;");
+        wln!(self, "    pthread_join(p_thread_handles[idx], &ret);");
+        wln!(self, "    return (int64_t)(intptr_t)ret;");
+        wln!(self, "}");
+        // ─── Phase 8A: Threads + atomics + mutex (using pthread) ───
+        wln!(self, "#include <stdatomic.h>");
+        wln!(self, "#include <stdarg.h>");
+        // Thread entry point — calls a Fides function by name with i64 args.
+        // The function lookup uses a simple dispatch table generated below.
+        wln!(self, "typedef struct { const char* name; int64_t (*fn)(); } p_thread_entry_t;");
+        wln!(self, "static p_thread_entry_t p_thread_entries[256];");
+        wln!(self, "static int p_thread_entry_count = 0;");
+        wln!(self, "void p_thread_register(const char* name, int64_t (*fn)()) {");
+        wln!(self, "    if (p_thread_entry_count < 256) {");
+        wln!(self, "        p_thread_entries[p_thread_entry_count].name = name;");
+        wln!(self, "        p_thread_entries[p_thread_entry_count].fn = fn;");
+        wln!(self, "        p_thread_entry_count++;");
+        wln!(self, "    }");
+        wln!(self, "}");
+        wln!(self, "typedef struct { int64_t (*fn)(); int64_t nargs; int64_t args[8]; } p_thread_arg_t;");
+        wln!(self, "static void* p_thread_wrapper(void* arg) {");
+        wln!(self, "    p_thread_arg_t* ta = (p_thread_arg_t*)arg;");
+        wln!(self, "    int64_t result = 0;");
+        wln!(self, "    // Fides functions have an implicit __env param (void*) as first arg.");
+        wln!(self, "    // Pass NULL for __env, then the user-provided args.");
+        wln!(self, "    switch (ta->nargs) {");
+        wln!(self, "        case 0: { typedef int64_t (*f0)(void*); f0 f = (f0)ta->fn; result = f(NULL); break; }");
+        wln!(self, "        case 1: { typedef int64_t (*f1)(void*,int64_t); f1 f = (f1)ta->fn; result = f(NULL, ta->args[0]); break; }");
+        wln!(self, "        case 2: { typedef int64_t (*f2)(void*,int64_t,int64_t); f2 f = (f2)ta->fn; result = f(NULL, ta->args[0], ta->args[1]); break; }");
+        wln!(self, "        case 3: { typedef int64_t (*f3)(void*,int64_t,int64_t,int64_t); f3 f = (f3)ta->fn; result = f(NULL, ta->args[0], ta->args[1], ta->args[2]); break; }");
+        wln!(self, "        default: { typedef int64_t (*f4)(void*,int64_t,int64_t,int64_t,int64_t); f4 f = (f4)ta->fn; result = f(NULL, ta->args[0], ta->args[1], ta->args[2], ta->args[3]); break; }");
+        wln!(self, "    }");
+        wln!(self, "    return (void*)(intptr_t)result;");
+        wln!(self, "}");
+        wln!(self, "int64_t p_thread_spawn(const char* func_name, int64_t num_args, ...) {");
+        wln!(self, "    // Look up function by name");
+        wln!(self, "    int64_t (*fn)() = NULL;");
+        wln!(self, "    for (int i = 0; i < p_thread_entry_count; i++) {");
+        wln!(self, "        if (strcmp(p_thread_entries[i].name, func_name) == 0) {");
+        wln!(self, "            fn = p_thread_entries[i].fn;");
+        wln!(self, "            break;");
+        wln!(self, "        }");
+        wln!(self, "    }");
+        wln!(self, "    if (!fn) return -1;");
+        wln!(self, "    p_thread_arg_t* ta = (p_thread_arg_t*)malloc(sizeof(p_thread_arg_t));");
+        wln!(self, "    ta->fn = fn;");
+        wln!(self, "    ta->nargs = num_args;");
+        wln!(self, "    va_list ap; va_start(ap, num_args);");
+        wln!(self, "    for (int64_t i = 0; i < num_args && i < 8; i++) ta->args[i] = va_arg(ap, int64_t);");
+        wln!(self, "    va_end(ap);");
+        wln!(self, "    pthread_t tid;");
+        wln!(self, "    pthread_create(&tid, NULL, p_thread_wrapper, ta);");
+        wln!(self, "    // Store thread handle and return negative index as Future");
+        wln!(self, "    int idx = p_thread_handle_count++;");
+        wln!(self, "    p_thread_handles[idx] = tid;");
+        wln!(self, "    return -(int64_t)(idx + 1);");
+        wln!(self, "}");
+        // Shared memory — simple malloc-based, atomics use C11 stdatomic
+        wln!(self, "int64_t p_shared_alloc(int64_t size) { return (int64_t)(intptr_t)malloc((size_t)size); }");
+        wln!(self, "int64_t p_atomic_load(int64_t addr) { return atomic_load((atomic_int_least64_t*)(intptr_t)addr); }");
+        wln!(self, "void p_atomic_store(int64_t addr, int64_t val) { atomic_store((atomic_int_least64_t*)(intptr_t)addr, val); }");
+        wln!(self, "bool p_atomic_cas(int64_t addr, int64_t expected, int64_t new_val) {");
+        wln!(self, "    return atomic_compare_exchange_strong((atomic_int_least64_t*)(intptr_t)addr, &expected, new_val);");
+        wln!(self, "}");
+        wln!(self, "int64_t p_atomic_add(int64_t addr, int64_t val) { return atomic_fetch_add((atomic_int_least64_t*)(intptr_t)addr, val); }");
+        // Mutex — use pthread_mutex_t allocated on heap
+        wln!(self, "int64_t p_mutex_init(void) {");
+        wln!(self, "    pthread_mutex_t* m = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));");
+        wln!(self, "    pthread_mutex_init(m, NULL);");
+        wln!(self, "    return (int64_t)(intptr_t)m;");
+        wln!(self, "}");
+        wln!(self, "void p_mutex_lock(int64_t m) { pthread_mutex_lock((pthread_mutex_t*)(intptr_t)m); }");
+        wln!(self, "void p_mutex_unlock(int64_t m) { pthread_mutex_unlock((pthread_mutex_t*)(intptr_t)m); }");
+        // Dynamic loading builtins (Phase 7.7) — using dlopen/dlsym
+        wln!(self, "#include <dlfcn.h>");
+        wln!(self, "int64_t p_dl_open(const char* path) {");
+        wln!(self, "    void* h = dlopen(path, RTLD_LAZY);");
+        wln!(self, "    return (int64_t)(intptr_t)h;");
+        wln!(self, "}");
+        wln!(self, "int64_t p_dl_sym(int64_t handle, const char* symbol) {");
+        wln!(self, "    void* h = (void*)(intptr_t)handle;");
+        wln!(self, "    if (!h) return 0;");
+        wln!(self, "    void* sym = dlsym(h, symbol);");
+        wln!(self, "    return (int64_t)(intptr_t)sym;");
+        wln!(self, "}");
+        wln!(self, "void p_dl_close(int64_t handle) {");
+        wln!(self, "    void* h = (void*)(intptr_t)handle;");
+        wln!(self, "    if (h) dlclose(h);");
+        wln!(self, "}");
+        wln!(self, "int64_t p_dl_call(int64_t func_ptr, int64_t arg) {");
+        wln!(self, "    typedef int64_t (*dl_fn_t)(int64_t);");
+        wln!(self, "    dl_fn_t fn = (dl_fn_t)(intptr_t)func_ptr;");
+        wln!(self, "    if (!fn) return 0;");
+        wln!(self, "    return fn(arg);");
+        wln!(self, "}");
         // Allocator builtins (Phase 2A.8) — simplified stubs
         wln!(self, "void* p_allocator_create(void* arg) { (void)arg; return (void*)1; }");
         wln!(self, "int64_t p_allocator_alloc(void* alloc, int64_t size) { (void)alloc; return (int64_t)(intptr_t)malloc((size_t)size); }");

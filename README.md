@@ -10,12 +10,12 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 
 | Test Group | Result | Notes |
 |------------|:------:|-------|
-| Unit tests (`cargo test --bin fidesc`) | **137/137** | elf64, pir, peephole (26 tests), opt, regalloc, tensor, codegen_x64, hotreload (8), embedded, gpu, wasm, coff, macho, linker |
+| Unit tests (`cargo test --bin fidesc`) | **136/136** | elf64, pir, peephole (26 tests), opt, regalloc, tensor, codegen_x64, hotreload (8), embedded, gpu, wasm, coff, macho, linker |
 | Harness tests (`cargo test --test harness`) | **8/8** | All pass including golden_files_match |
-| Interpreter (`fidesc test`) | **99/99** normal + **12/12** expected-fail | Expected-fail: trait verify, budget, sandbox, deterministic, field privacy, money linear, money conserve, banking double-credit, banking lost-money, loop linear, gas |
-| PE Emitter (`fidesc test`) | **99/99** normal + **12/12** expected-fail | All PE structures valid |
-| C Codegen (`fidesc test`) | **99/99** normal + **12/12** expected-fail | FULL PARITY with interpreter — no gaps |
-| Total `.fd` test files | **111** | 99 normal + 12 expected-fail |
+| Interpreter (`fidesc test`) | **113/113** normal + **20/20** expected-fail | Expected-fail: trait verify, budget, sandbox, deterministic, field privacy, money linear, money conserve, banking double-credit, banking lost-money, loop linear, gas, crashfree, txn rollback, typed strings, init guarantee, param queries |
+| PE Emitter (`fidesc test`) | **113/113** normal + **20/20** expected-fail | All PE structures valid |
+| C Codegen (`fidesc test`) | **113/113** normal + **20/20** expected-fail | FULL PARITY with interpreter — no gaps |
+| Total `.fd` test files | **123** | 113 normal + 20 expected-fail |
 | Source files | **36** `.rs` | 52,845 LOC |
 | Golden files | **43** | Expected outputs in `tests/golden/` |
 
@@ -32,9 +32,21 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 | Atomic transactions | `txn { ... }` | Atomic transaction blocks with rollback on failure |
 | Gas budgets | `@gas(N)` | Compile-time gas budget annotation |
 | Crash-free proof | `@crashfree` | Compile-time proof that a function cannot panic |
-| Audit logging | `@audit` | Automatic function audit logging |
+| Audit logging | `@audit` | Automatic function audit logging with parameter values |
 | Loop-aware linear types | — | Linear variables cannot be consumed inside loops (compile error) |
 | LogicalTime | `stdlib/time.fd` | Timezone-free, clock-free deterministic date math |
+| Typed strings | `stdlib/typed_strings.fd` | SQLString, ShellString, HTMLString, JSONString, PathString — injection prevention via type system |
+| Init guarantee | `pm` keyword | Uninitialized mutable variables + definite assignment analysis (compile error on read before assignment) |
+| Raw pointer types | `*mut T`, `*const T` | Raw pointers with `unsafe {}` enforcement (no borrow checking) |
+| Memoization | `stdlib/memo.fd` | Simple cache helper: `Memo::new()`, `get_or_compute()` |
+| Checked arithmetic | F64 | Integer overflow = panic (always on, not just debug mode) |
+| `@wrapping` | `@wrapping pf foo() { ... }` | Escape hatch for wrap-around arithmetic (hashing, crypto) |
+| Bounds checking lock | F62 | Bounds checks always on, skippable in `unsafe {}` blocks |
+| Parameterized queries | F68 | No string concat on typed strings (SQLString + str = compile error) |
+| `@medical` | `@medical @audit pf foo() { ... }` | IEC 62304: no dynamic alloc, no recursion, no while, no unwrap, must be @audit |
+| `given`/`ensure` contracts | `pf foo(x: i64) -> i64 given x >= 0 { ... }` | Design by Contract — preconditions verified at call sites |
+| `async`/`await`/`spawn` | `async pf foo() -> Future<T> { ... }` | Cooperative concurrency — async functions, await, spawn (Phase 7.6) |
+| Borrow checker | `--borrowck=on` / `--borrowck=warn` | Compile-time aliasing analysis — `&mut` exclusivity, no mutation while borrowed |
 
 ### What Works (Verified End-to-End)
 
@@ -124,6 +136,8 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 | `@audit` audit logging | Yes | Yes | Yes |
 | Loop-aware linear types | Compile-time | Compile-time | Compile-time |
 | LogicalTime (`stdlib/time.fd`) | Yes | Yes | Yes |
+| Typed strings (`stdlib/typed_strings.fd`) | Yes | Yes | Yes |
+| Init guarantee (`pm` keyword) | Yes | Yes | Yes |
 | WebAssembly backend (`fidesc wasm`) | N/A | N/A | N/A |
 | SPIR-V GPU backend (`fidesc gpu`) | N/A | N/A | N/A |
 | Hot reload (`fidesc watch`) | N/A | N/A | N/A |
@@ -148,12 +162,12 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 ### Known Limitations
 
 - **ELF64 executable emission works on Linux** — `fidesc build <file> --target x86-64` produces working ELF64 executables directly (zero external tools). `fidesc codegen --elf <out.o>` emits valid relocatable objects (readelf compatible). `fidesc codegen --macho` and `--coff` also produce valid object files.
-- **PE emitter targets Windows x64 only** — `fidesc emit` produces PE32+ executables; tested via `fidesc test` (99/99 valid + 12/12 expected-fail)
+- **PE emitter targets Windows x64 only** — `fidesc emit` produces PE32+ executables; tested via `fidesc test` (113/113 valid + 20/20 expected-fail)
 - **Register allocator has a pre-existing bug** — linear scan allocator in `regalloc.rs` maps VRegs to physical registers, but constants not loaded into registers before use can be clobbered by intervening instructions. Exposed by the L2 optimizer's instruction reordering. Blocks enabling `--opt` by default.
 - **Peephole optimizer always on** — 9 passes run automatically in the `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
 - **L2 optimizer (`--opt`) not enabled by default** — PIR optimizer exists (`fidesc opt`, `fidesc pir --opt`, `fidesc build --opt`) with constant folding, DCE, CSE, inlining, TCO, loop unrolling, and effect-based pure function elision. Works for simple programs but exposes the register allocator bug on complex ones.
 - **`#[test]` attribute** — parsed but not executed by `fidesc test` (tests are file-based)
-- **C codegen coverage** — 99/99 tests match interpreter output (+ 12/12 expected-fail). FULL PARITY — no gaps. `test_db` is no longer flaky (HashMap keys sorted for deterministic output).
+- **C codegen coverage** — 113/113 tests match interpreter output (+ 20/20 expected-fail). FULL PARITY — no gaps. `test_db` is no longer flaky (HashMap keys sorted for deterministic output).
 - **215 compiler warnings** — dead code, unused variables (cleanup needed)
 
 ---
@@ -219,7 +233,7 @@ cargo run -- version
 | `gpu <file.fd>` | SPIR-V GPU backend: PIR → SPIR-V binary |
 | `tokens <file.fd>` | Lex only — print token stream |
 | `ast <file.fd>` | Lex + parse — print AST tree |
-| `test` | Run all 111 tests across interpreter, PE emitter, and C codegen |
+| `test` | Run all 130 tests across interpreter, PE emitter, and C codegen |
 | `repl` | Interactive REPL — evaluate Fides expressions |
 | `verify <file.fd>` | Verify IR correctness (terminators, block refs, value refs) |
 | `sourcemap <file.fd>` | Show source map (IR value → source line mapping) |
@@ -256,11 +270,11 @@ The project includes automated verification scripts for ensuring correctness acr
 
 Current baseline:
 ```
-Unit tests:   137/137 passed
+Unit tests:   136/136 passed
 Harness:      8/8 passed
-Interpreter:  99/99 passed   (+ 12/12 expected fail: trait verify, budget, sandbox, deterministic, field privacy, money linear, money conserve, banking double-credit, banking lost-money, loop linear, gas)
-C Codegen:    99/99 matched   (FULL PARITY — no gaps)
-PE Emitter:   99/99 valid     (+ 12/12 expected fail: same as interpreter)
+Interpreter:  113/113 passed   (+ 20/20 expected fail: trait verify, budget, sandbox, deterministic, field privacy, money linear, money conserve, banking double-credit, banking lost-money, loop linear, gas, crashfree, txn rollback, typed strings, init guarantee, param queries)
+C Codegen:    113/113 matched   (FULL PARITY — no gaps)
+PE Emitter:   113/113 valid     (+ 20/20 expected fail: same as interpreter)
 ```
 
 ---
@@ -623,7 +637,7 @@ p-lang/
 │   ├── linker.rs           # Incremental linker (ELF64)
 │   ├── runtime_linux.rs    # Linux runtime (syscalls for bare-metal/standalone)
 │   └── compiler.rs         # Pipeline orchestration, module resolution, stdlib auto-include
-├── stdlib/                 # 15 standard library modules
+├── stdlib/                 # 17 standard library modules
 │   ├── core.fd              # Option, Result, println, assert, max, min, abs, clamp
 │   ├── json.fd              # JSON parsing and serialization
 │   ├── tensor.fd            # Tensor type for AI/ML (zeros, ones, matmul, relu, softmax, etc.)
@@ -632,13 +646,18 @@ p-lang/
 │   ├── http.fd              # HTTP server stdlib
 │   ├── simd.fd              # SIMD intrinsics
 │   ├── shape.fd             # Shape operations
+│   ├── quant.fd             # Quantization (q8, find_quant_params, qmatmul)
 │   ├── money.fd             # Fixed-point money type, arithmetic, formatting
 │   ├── banking.fd           # Accounts, transfers, double-credit/lost-money detection
 │   ├── file.fd              # File I/O (file descriptors, read/write)
-│   └── time.fd              # LogicalTime: timezone-free, clock-free deterministic date math
-├── tests/                  # 111 .fd test files + harness
+│   ├── time.fd              # LogicalTime: timezone-free, clock-free deterministic date math
+│   ├── typed_strings.fd     # F67: SQLString, ShellString, HTMLString, JSONString, PathString
+│   ├── memo.fd              # F12: Memoization helper (Memo::new, get_or_compute)
+│   ├── alloc.fd             # Heap allocation builtins (p_alloc_new, p_alloc_free)
+│   └── privacy.fd           # Field privacy test module
+├── tests/                  # 127 .fd test files + harness
 │   ├── harness.rs          # Automated test harness (8 cargo tests)
-│   ├── *.fd                 # 99 feature tests (arithmetic, structs, closures, generics, traits, money, banking, etc.)
+│   ├── *.fd                 # 107 feature tests + 16 expected-fail tests
 │   ├── safety/             # 9 bounds safety tests (OOB, overflow, div-by-zero, unwrap)
 │   ├── capability/         # 4 capability security tests (grant, deny, propagation)
 │   ├── effects/            # 7 effect system tests (annotations, inference, handlers, pure)
@@ -670,7 +689,7 @@ p-lang/
 
 ## Test Programs
 
-111 test files across `tests/` and subdirectories. Key tests:
+127 test files across `tests/` and subdirectories. Key tests:
 
 | Test File | What It Tests |
 |-----------|---------------|
@@ -718,6 +737,8 @@ p-lang/
 | `test_file.fd` | File I/O (`stdlib/file.fd`) |
 | `test_txn.fd` | `txn {}` atomic transaction blocks |
 | `test_time*.fd` | LogicalTime stdlib: construction, extraction, arithmetic, formatting, leap years |
+| `test_typed_strings*.fd` | F67: SQLString, ShellString, HTMLString, JSONString, PathString — escape, bind, is_safe |
+| `test_init_guarantee*.fd` | F63: `pm` keyword, definite assignment analysis, init guarantee |
 
 Run all tests: `cargo test --test harness`
 
@@ -745,7 +766,7 @@ Run all tests: `cargo test --test harness`
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (137 unit tests, 99/99 + 12/12 expected-fail integration tests) |
+| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (136 unit tests, 113/113 + 20/20 expected-fail integration tests) |
 | **Phase 2** | Region inference, effect system, capability security, bounds safety | **Complete** (2A ✓, 2B ✓, 2C ✓ with elision, 2D ✓; 8/8 harness tests pass) |
 | **Phase 3** | comptime, advanced traits, FFI & interop | **Complete** (3A comptime ✓, 3B traits ✓, 3C const generics + GATs ✓; 3D C FFI ✓ via `extern "C"` + `parse-header`) |
 | **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | **Mostly complete** (4A PIR ✓, 4B optimizer ✓ but disabled by default due to regalloc bug, 4C x86-64/arm64/riscv codegen + regalloc + 9 peephole passes + ELF64 executables ✓; 4D linker ✓, 4E hot reload ✓ via `fidesc watch`) |

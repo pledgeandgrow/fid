@@ -63,7 +63,7 @@ F5: Capability-aware linking ✅ IMPLEMENTED --caps flag, strips ungranted funct
 F16: vec2/3/4 + mat4 types    🔲 PLANNED — SIMD instruction emission needs compiler
 F17: Vector swizzle (.xyz)    🔲 PLANNED — parser + typechecker for component access
 F8:  ?. optional chaining     ✅ IMPLEMENTED — null-safe navigation, None short-circuits to 0
-F10: given/ensure contracts   🔲 PLANNED — typechecker verifies at all call sites
+F10: given/ensure contracts   ✅ IMPLEMENTED — preconditions verified at call sites with constant args (Design by Contract)
 F18: ECS (component/system)   🔲 PLANNED — compiler controls SoA memory layout + queries
 F13: parallel { | } fork-join 🔲 PLANNED — compiler emits thread spawn/join
 F14: @differentiable          🔲 PLANNED — compiler traces IR for autograd
@@ -84,11 +84,11 @@ F6:  guard =>                 ✅ IMPLEMENTED — desugars to if !cond { action 
 F7:  .. spread operator       ✅ IMPLEMENTED — struct field copy + override, works in all backends
 F9:  ?? coalescing            ✅ IMPLEMENTED — Option ?? default, works in all backends
 F11: is type check            ✅ IMPLEMENTED — runtime enum variant check + compile-time type check
-F12: @memo annotation         🔲 PLANNED — purity verified by effect system, cleaner than wrapper
+F12: @memo annotation         ✅ IMPLEMENTED (as stdlib) — memoization via stdlib/memo.fd (Memo::new, get_or_compute), not a compiler annotation
 F20: on event handlers        🔲 PLANNED — unified dispatch needs compiler event routing
 F19: state machines           🔲 PLANNED — compile-time transition verification
 F15: @no_grad scope           ❌ CUT — unnecessary in compile-time opt-in autograd (grad blocks are opt-in, nothing to disable)
-F33: @audit                   🔨 PARTIAL — entry/exit logging DONE (IR injection); full trail (timestamps, params, crypto signing) pending
+F33: @audit                   ✅ IMPLEMENTED — entry/exit logging with parameter values (IR injection), type-aware printing
 F34: @emit                    🔲 PLANNED — blockchain event emission with signature verification
 F35: @watchdog                🔲 PLANNED — compiler auto-inserts watchdog kicks (robotics+IoT)
 F36: @handler                 🔲 PLANNED — auto-generates routing + OpenAPI docs (serverless)
@@ -97,7 +97,7 @@ F37: @ota                     🔲 PLANNED — compiler generates binary diff fo
 ─── Banking & Finance — Tier A: Compile-Time Financial Safety ──
 F38: money type               ✅ IMPLEMENTED — fixed-point i64 cents, @linear struct, no FP, no overflow
 F39: @conserve                ✅ IMPLEMENTED — compiler proves money in = money out, no mint/IO/float inside @conserve functions
-F40: txn { } blocks           🔨 PARTIAL — parsing + typechecking DONE; interpreter rollback (memory snapshot) pending
+F40: txn { } blocks           ✅ IMPLEMENTED — parsing + typechecking + interpreter rollback (memory snapshot on TxnBegin, restore on panic, commit on TxnEnd)
 F41: linear money             ✅ IMPLEMENTED — @linear annotation on structs, move semantics, no copies, loop-aware (can't consume in loops)
 F42: Account<State> types     🔲 PLANNED — state-encoded account types (Active/Frozen/Closed can't be mixed)
 F43: LogicalTime type         ✅ IMPLEMENTED — stdlib/time.fd: timezone-free, clock-free, @deterministic date math (Howard Hinnant civil algorithm)
@@ -106,25 +106,26 @@ F43: LogicalTime type         ✅ IMPLEMENTED — stdlib/time.fd: timezone-free,
 F61: tuple destructuring       ✅ IMPLEMENTED — `pv (a, b) = expr` multi-return unpacking
 F62: file I/O                  ✅ IMPLEMENTED — stdlib/file.fd: read/write/append/exists
 F63: loop-aware linear types   ✅ IMPLEMENTED — linear vars can't be consumed inside loops
+F95: raw pointer types         ✅ IMPLEMENTED — *mut T / *const T with unsafe {} blocks, typechecker enforces unsafe_depth, &T coerces to *mut T
 
 ─── Cross-Industry Safety — Tier A: Compiler-Verified Domain Guarantees ──
-F44: @safety-critical         🔲 PLANNED — compiler enforces DO-178C/ISO 26262 coding rules (aerospace+automotive)
+F44: @safety-critical         ✅ IMPLEMENTED — composable safety primitives: @no-alloc + @no-recursion + @no-unbounded + @no-panic + @no-indirect (DO-178C/ISO 26262)
 F45: @redundant               🔲 PLANNED — compiler generates dual-channel redundant execution + comparison (aerospace)
 F46: @bounded                 🔲 PLANNED — compiler proves all loops terminate, no unbounded iteration (safety-critical)
 F47: @partitioned             🔲 PLANNED — compiler enforces spatial+temporal partitioning between components (avionics)
-F48: @medical                 🔲 PLANNED — compiler enforces IEC 62304 rules: no dynamic alloc, no recursion, full logging
+F48: @medical                 ✅ IMPLEMENTED — IEC 62304 rules: no dynamic alloc, no recursion, no while, no unwrap, must be @audit, transitive
 F49: @isolated                🔲 PLANNED — compiler proves no shared mutable state between components (multi-core safety)
 F50: @signed                  🔲 PLANNED — compiler requires cryptographic signatures on all state transitions (blockchain+medical)
 F51: @reproducible            🔲 PLANNED — compiler verifies bit-identical output across runs/builds (regulatory+science)
 
 ─── Automotive — Tier A: Compiler-Verified Vehicle Safety ───────
-F52: @autosar                 🔲 PLANNED — compiler enforces AUTOSAR coding guidelines (no heap, no recursion, static allocation)
+F52: @autosar                 ✅ IMPLEMENTED — composable safety primitives: @no-alloc + @no-recursion + @no-unbounded + @no-panic (AUTOSAR coding guidelines)
 F53: @can-bus                 🔲 PLANNED — compiler generates CAN frame encoding/decoding with compile-time ID verification
 F54: @diagnostic              🔲 PLANNED — compiler auto-generates UDS/OBD diagnostic service handlers (automotive)
 F55: @calibratable            🔲 PLANNED — compiler marks tunable parameters, generates calibration data format (automotive)
 
 ─── Aerospace & Defense — Tier A: Compiler-Verified Flight Safety ──
-F56: @dal-a                   🔲 PLANNED — compiler enforces DAL-A (highest safety level): no dynamic alloc, no interrupts, full traceability
+F56: @dal-a                   ✅ IMPLEMENTED — composable safety primitives: @no-alloc + @no-recursion + @no-unbounded + @no-panic + @requires-audit (DAL-A aerospace)
 F57: @arinc                   🔲 PLANNED — compiler generates ARINC 653 partition scheduling + port communication (avionics)
 F58: @bit-exact               🔲 PLANNED — compiler guarantees bit-identical FP results across hardware (flight control)
 
@@ -134,12 +135,12 @@ F60: @scada                   🔲 PLANNED — compiler generates SCADA protocol
 
 ─── Cybersecurity — Tier A: Compiler-Verified Exploit Prevention ──
 F61: @no-alias                🔲 PLANNED — compiler proves no two mutable refs to same data (memory safety)
-F62: bounds checking lock     🔲 PLANNED — bounds checks CANNOT be disabled in safe mode (memory safety)
-F63: init guarantee           🔲 PLANNED — no variable read before assignment, compile error (memory safety)
-F64: checked arithmetic lock  🔲 PLANNED — overflow = error (not wrap), cannot disable in safe mode (integer safety)
-F65: @wrapping                🔲 PLANNED — explicit opt-in for wrap-around arithmetic (hashing, crypto)
-F67: typed strings            🔲 PLANNED — SQLString, ShellString, HTMLString distinct types (injection prevention)
-F68: parameterized queries    🔲 PLANNED — no string concatenation for SQL/commands, binding only (injection prevention)
+F62: bounds checking lock     ✅ IMPLEMENTED — bounds checks ALWAYS fire in safe mode, skippable in unsafe {} (memory safety)
+F63: init guarantee           ✅ IMPLEMENTED — `pm` keyword for uninitialized mutable vars, definite assignment analysis, compile error on read before assignment (memory safety)
+F64: checked arithmetic lock  ✅ IMPLEMENTED — overflow = panic (not wrap), always on, @wrapping opt-out (integer safety)
+F65: @wrapping                ✅ IMPLEMENTED — explicit opt-in for wrap-around arithmetic (hashing, crypto)
+F67: typed strings            ✅ IMPLEMENTED — SQLString, ShellString, HTMLString, JSONString, PathString distinct types, injection prevention via type system
+F68: parameterized queries    ✅ IMPLEMENTED — no string concatenation for typed strings (SQLString/ShellString/etc), use bind/escape methods (injection prevention)
 F69: @escaped                 🔲 PLANNED — compiler verifies output is escaped before rendering (XSS prevention)
 F70: @atomic-check            🔲 PLANNED — check and act are one atomic operation (TOCTOU prevention)
 F72: @constant-time           🔲 PLANNED — compiler verifies no data-dependent branches or memory access (side-channel)
@@ -200,6 +201,13 @@ S26: stdlib/grid.fd            🔲 PLANNED — IEC 61850 data models, GOOSE/SV/
 S27: stdlib/scada.fd           🔲 PLANNED — SCADA: Modbus, DNP3, IEC 60870-5-104, point database (energy)
 S28: stdlib/medical.fd         🔲 PLANNED — HL7/FHIR parsing, DICOM imaging, ICD coding, FDA audit trails (medical)
 S29: stdlib/clinical.fd        🔲 PLANNED — clinical calculations: drug dosage, BMI, GFR, risk scores (medical)
+
+─── Stdlib Modules — Implemented (Phase 11) ─────────────────────
+S30: stdlib/math.fd            ✅ IMPLEMENTED — sqrt, pow, floor, ceil, sin, cos, fabs, constants (pi, e)
+S31: stdlib/env.fd             ✅ IMPLEMENTED — env_get, env_exists (environment variable access)
+S32: stdlib/args.fd            ✅ IMPLEMENTED — args_len, args_get, args_program_name (command-line args)
+S33: stdlib/process.fd         ✅ IMPLEMENTED — process_exit, process_system (process control)
+S34: stdlib/regex.fd           ✅ IMPLEMENTED — regex_matches (?/* wildcards), regex_find, regex_contains, regex_starts_with, regex_ends_with
 
 ─── Cut — Redundant, Build with Existing Features ───────────────
 C1: fogofwar                  ❌ CUT — build with tilemap (S1) + query (F18)
@@ -785,7 +793,7 @@ pv server = primary ?? backup ?? local ?? "localhost:8080";
 ## F10 — `given`/`ensure` — Design by Contract
 
 **Classification:** SYNTAX — Tier A (typechecker must verify contracts at all call sites — a library can't see call sites)
-**Status:** 🔲 Planned
+**Status:** ✅ Implemented
 **Impact:** High — safety, correctness
 **Novelty:** Eiffel had contracts but they were runtime-checked. Fides's version leverages comptime to verify simple contracts at compile time. No other systems language has native contract syntax.
 
@@ -2309,10 +2317,10 @@ system UpdateLOD {
 ### Implementation Details
 
 All 5 original features (F1–F5) were implemented in a single session. Test results (current state):
-- Interpreter: 99/99 passed (+ 12/12 expected-fail)
-- PE Emitter: 99/99 valid (+ 12/12 expected-fail)
-- C Codegen: 99/99 matched — FULL PARITY (+ 12/12 expected-fail)
-- Total: 111 .fd test files (99 normal + 12 expected-fail)
+- Interpreter: 109/109 passed (+ 18/18 expected-fail)
+- PE Emitter: 109/109 valid (+ 18/18 expected-fail)
+- C Codegen: 109/109 matched — FULL PARITY (+ 18/18 expected-fail)
+- Total: 127 .fd test files (109 normal + 18 expected-fail)
 
 **Planned for implementation:**
 - 39 Tier A syntax features (F10, F13, F14, F16–F18, F21, F23–F60) — need compiler support

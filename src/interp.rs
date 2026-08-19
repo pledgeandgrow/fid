@@ -16,9 +16,10 @@ use crate::ir::*;
 use crate::ast::BinOp;
 use crate::tensor::Tensor;
 use crate::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use smallvec::SmallVec;
 use compact_str::CompactString;
 
@@ -44,6 +45,12 @@ pub enum Value {
     /// Allocator — explicit memory allocator (Phase 2A)
     /// Stores the region name it was created in. Used for allocator-as-parameter verification.
     Allocator(CompactString),
+    /// Future — async/await (Phase 7.6)
+    /// A Future wraps a completed value (eager evaluation model).
+    /// The Future handle is an index into the interpreter's future table.
+    Future(usize),
+    /// Thread handle — for spawn/dynamic loading (Phase 7.7)
+    ThreadHandle(usize),
 }
 
 impl std::fmt::Display for Value {
@@ -80,6 +87,8 @@ impl std::fmt::Display for Value {
             Value::Tensor(t) => write!(f, "{}", t.borrow().to_string()),
             Value::Json(j) => write!(f, "{}", json::dump(&j.borrow(), false)),
             Value::Allocator(a) => write!(f, "alloc({})", a),
+            Value::Future(idx) => write!(f, "Future#{}", idx),
+            Value::ThreadHandle(idx) => write!(f, "Thread#{}", idx),
         }
     }
 }
@@ -107,12 +116,15 @@ impl PartialEq for Value {
             (Value::Json(a), Value::Json(b)) => {
                 a.as_ptr() == b.as_ptr()
             }
+            (Value::Future(a), Value::Future(b)) => a == b,
+            (Value::ThreadHandle(a), Value::ThreadHandle(b)) => a == b,
             _ => false,
         }
     }
 }
 
 /// Interpreter memory — simple byte-addressed array
+#[derive(Clone)]
 pub struct Memory {
     data: Vec<u8>,
     /// Next allocation address
@@ -226,6 +238,37 @@ pub struct Interpreter {
     /// Maps variable name → saved value. Survives across interpreter runs
     /// when using `fidesc watch` (hot reload).
     persist_state: HashMap<String, String>,
+    /// Transaction snapshot stack — for `txn {}` rollback.
+    /// Each entry is a snapshot of (memory, opaque_values) taken at TxnBegin.
+    /// On TxnEnd, the top snapshot is discarded (commit).
+    /// On panic, the top snapshot is restored (rollback).
+    txn_snapshots: Vec<(Memory, HashMap<u64, Value>)>,
+    /// Functions annotated with @wrapping — use wrap-around arithmetic instead
+    /// of checked arithmetic (F65). Checked arithmetic is the default (F64).
+    wrapping_funcs: HashSet<String>,
+    /// Current function name — tracked to determine if we're in a @wrapping function
+    current_func_name: String,
+    /// Unsafe block depth in the currently executing code.
+    /// When > 0, bounds checks are skipped (F62: bounds checking lock —
+    /// can only be bypassed inside unsafe {}).
+    interp_unsafe_depth: usize,
+    /// Future table — maps Future handle (index) to FutureState (Phase 7.6 + Phase 8A).
+    /// Ready futures have their value available immediately.
+    /// Pending futures have a JoinHandle that will produce a value when joined.
+    futures: Vec<FutureState>,
+    /// Shared memory for atomics — maps address to value.
+    /// Shared across threads via Arc<Mutex>.
+    shared_memory: Arc<Mutex<HashMap<i64, i64>>>,
+    /// Next shared memory address (starts at 0x10000000 to avoid collision with stack)
+    next_shared_addr: i64,
+    /// Mutex pool — maps handle to Arc<Mutex<()>>
+    mutexes: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
+    /// Next mutex handle
+    next_mutex_handle: i64,
+    /// Dynamic loading handles — maps handle to library path
+    dl_handles: HashMap<i64, String>,
+    /// Next dynamic loading handle
+    next_dl_handle: i64,
 }
 
 /// Result of running a function
@@ -235,6 +278,17 @@ pub enum RunResult {
     Return(Value),
     /// Function panicked
     Panic(String),
+}
+
+/// State of a Future — either Ready (completed with a value) or Pending
+/// (a thread is running and will produce a value when joined).
+enum FutureState {
+    /// Future is ready — value is available
+    Ready(Value),
+    /// Future is pending — a thread is running.
+    /// The JoinHandle returns an i64 (threads communicate via i64 since
+    /// Value contains non-Send Rc types).
+    Pending(Option<std::thread::JoinHandle<i64>>),
 }
 
 impl Interpreter {
@@ -250,6 +304,17 @@ impl Interpreter {
             databases: HashMap::new(),
             next_db_handle: 1,
             persist_state: HashMap::new(),
+            txn_snapshots: Vec::new(),
+            wrapping_funcs: HashSet::new(),
+            current_func_name: String::new(),
+            interp_unsafe_depth: 0,
+            futures: Vec::new(),
+            shared_memory: Arc::new(Mutex::new(HashMap::new())),
+            next_shared_addr: 0x10000000,
+            mutexes: Arc::new(Mutex::new(HashMap::new())),
+            next_mutex_handle: 1,
+            dl_handles: HashMap::new(),
+            next_dl_handle: 1,
         };
         // Pre-allocate string constants
         interp.init_strings();
@@ -259,6 +324,27 @@ impl Interpreter {
     pub fn verbose(mut self) -> Self {
         self.verbose = true;
         self
+    }
+
+    /// Convert a Value to a String, handling both Value::Str and Value::Ptr
+    /// (Ptr reads a null-terminated C string from memory)
+    fn value_to_string(&self, v: &Value) -> String {
+        match v {
+            Value::Str(s) => s.to_string(),
+            Value::Ptr(addr) => {
+                let mut bytes = Vec::new();
+                let mut offset = *addr;
+                loop {
+                    let b = self.memory.load(offset, 1);
+                    if b[0] == 0 { break; }
+                    bytes.push(b[0]);
+                    offset += 1;
+                }
+                String::from_utf8_lossy(&bytes).to_string()
+            }
+            Value::Int(i) => i.to_string(),
+            _ => String::new(),
+        }
     }
 
     /// Initialize string constants in memory
@@ -289,6 +375,9 @@ impl Interpreter {
 
     /// Run a specific function with arguments
     fn run_function(&mut self, func: &IrFunction, args: &[Value]) -> RunResult {
+        // Track current function name for @wrapping check (F64/F65)
+        let saved_func_name = self.current_func_name.clone();
+        self.current_func_name = func.name.clone();
         // Build value table for this function
         let mut values: HashMap<ValueId, Value> = HashMap::new();
 
@@ -331,9 +420,17 @@ impl Interpreter {
                         break;
                     }
                     ExecOutcome::Return(val) => {
+                        self.current_func_name = saved_func_name;
                         return RunResult::Return(val);
                     }
                     ExecOutcome::Panic(msg) => {
+                        // Transaction rollback: if we're inside a txn block,
+                        // restore the most recent snapshot before propagating.
+                        if let Some((mem_snap, opaque_snap)) = self.txn_snapshots.pop() {
+                            self.memory = mem_snap;
+                            self.opaque_values = opaque_snap;
+                        }
+                        self.current_func_name = saved_func_name;
                         return RunResult::Panic(msg);
                     }
                 }
@@ -345,6 +442,7 @@ impl Interpreter {
                 }
                 None => {
                     // No terminator found — return void
+                    self.current_func_name = saved_func_name;
                     return RunResult::Return(Value::Void);
                 }
             }
@@ -410,8 +508,10 @@ impl Interpreter {
                 let l = values.get(left).cloned().unwrap_or(Value::Void);
                 let r = values.get(right).cloned().unwrap_or(Value::Void);
                 let result = self.eval_binop(op, &l, &r);
-                // Check for overflow/div-by-zero panic (eval_binop returns Void)
-                if self.debug_mode && result == Value::Void {
+                // F64: checked arithmetic lock — overflow/div-by-zero ALWAYS panics
+                // (not just in debug mode). @wrapping functions never hit this
+                // because they use wrapping arithmetic in eval_binop.
+                if result == Value::Void {
                     let msg = match op {
                         BinOp::Add => format!("Integer overflow on addition: {} + {}", 
                             if let Value::Int(a) = l { a.to_string() } else { "?".to_string() },
@@ -467,9 +567,10 @@ impl Interpreter {
                     }
                     IrType::I64 | IrType::U64 => {
                         // Check side-table first — the value might be a stored pointer
-                        // (e.g. tuple field that contains a struct pointer)
+                        // or an opaque value (Vec, Map, etc.) that was stored from a
+                        // for-loop iteration variable.
                         if let Some(v) = self.opaque_values.get(&addr) {
-                            if matches!(v, Value::Ptr(_)) {
+                            if matches!(v, Value::Ptr(_) | Value::Vec(_) | Value::Map(_) | Value::Tensor(_) | Value::Json(_) | Value::Dyn(_, _)) {
                                 return ExecOutcome::Value(v.clone());
                             }
                         }
@@ -485,6 +586,13 @@ impl Interpreter {
                         Value::Bool(self.memory.load_bool(addr))
                     }
                     IrType::Ptr(_) => {
+                        // Check opaque side-table first — the value might be a
+                        // stored Str (str fields have IR type Ptr(U8))
+                        if let Some(v) = self.opaque_values.get(&addr) {
+                            if matches!(v, Value::Str(_) | Value::Ptr(_)) {
+                                return ExecOutcome::Value(v.clone());
+                            }
+                        }
                         Value::Ptr(self.memory.load_i64(addr) as u64)
                     }
                     IrType::Opaque(_) | IrType::Generic(_, _) => {
@@ -555,6 +663,13 @@ impl Interpreter {
                     }
                     Some(Value::Bool(v)) => self.memory.store_bool(addr, *v),
                     Some(Value::Ptr(v)) => self.memory.store_i64(addr, *v as i64),
+                    Some(Value::Future(idx)) => {
+                        // Store Future handle as i64 index in byte memory
+                        self.memory.store_i64(addr, *idx as i64);
+                    }
+                    Some(Value::ThreadHandle(idx)) => {
+                        self.memory.store_i64(addr, *idx as i64);
+                    }
                     Some(Value::Str(s)) => {
                         // Store in byte memory as pointer (for closure env compat)
                         let str_addr = self.memory.alloc(s.len() as u64 + 1);
@@ -619,8 +734,9 @@ impl Interpreter {
                     Some(Value::Int(i)) => *i,
                     _ => 0,
                 };
-                // Bounds check for arrays
-                if self.debug_mode {
+                // F62: bounds checking lock — bounds checks ALWAYS fire in safe mode.
+                // Only skippable inside unsafe {} blocks (interp_unsafe_depth > 0).
+                if self.interp_unsafe_depth == 0 {
                     if idx_val < 0 {
                         return ExecOutcome::Panic(format!(
                             "Array index out of bounds: negative index {}",
@@ -940,6 +1056,30 @@ impl Interpreter {
                 self.persist_state.insert(name.clone(), s);
                 ExecOutcome::Continue
             }
+            Inst::TxnBegin => {
+                // Snapshot memory and opaque values for potential rollback
+                let mem_snapshot = self.memory.clone();
+                let opaque_snapshot = self.opaque_values.clone();
+                self.txn_snapshots.push((mem_snapshot, opaque_snapshot));
+                ExecOutcome::Continue
+            }
+            Inst::TxnEnd => {
+                // Commit — discard the snapshot
+                self.txn_snapshots.pop();
+                ExecOutcome::Continue
+            }
+            Inst::UnsafeBegin => {
+                // F62: enter unsafe block — skip bounds checks
+                self.interp_unsafe_depth += 1;
+                ExecOutcome::Continue
+            }
+            Inst::UnsafeEnd => {
+                // F62: exit unsafe block — resume bounds checks
+                if self.interp_unsafe_depth > 0 {
+                    self.interp_unsafe_depth -= 1;
+                }
+                ExecOutcome::Continue
+            }
         }
     }
 
@@ -972,58 +1112,49 @@ impl Interpreter {
 
     /// Evaluate a binary operation
     fn eval_binop(&self, op: &BinOp, l: &Value, r: &Value) -> Value {
+        // F64/F65: checked arithmetic is the default. @wrapping functions
+        // use wrap-around arithmetic. Division by zero always panics.
+        let use_wrapping = self.is_wrapping_func();
         match (l, r) {
             (Value::Int(a), Value::Int(b)) => {
                 match op {
                     BinOp::Add => {
-                        if self.debug_mode {
-                            if let Some(r) = a.checked_add(*b) {
-                                Value::Int(r)
-                            } else {
-                                return Value::Void; // panic handled by caller
-                            }
-                        } else {
+                        if use_wrapping {
                             Value::Int(a.wrapping_add(*b))
+                        } else if let Some(r) = a.checked_add(*b) {
+                            Value::Int(r)
+                        } else {
+                            return Value::Void; // panic handled by caller
                         }
                     }
                     BinOp::Sub => {
-                        if self.debug_mode {
-                            if let Some(r) = a.checked_sub(*b) {
-                                Value::Int(r)
-                            } else {
-                                return Value::Void;
-                            }
-                        } else {
+                        if use_wrapping {
                             Value::Int(a.wrapping_sub(*b))
+                        } else if let Some(r) = a.checked_sub(*b) {
+                            Value::Int(r)
+                        } else {
+                            return Value::Void;
                         }
                     }
                     BinOp::Mul => {
-                        if self.debug_mode {
-                            if let Some(r) = a.checked_mul(*b) {
-                                Value::Int(r)
-                            } else {
-                                return Value::Void;
-                            }
-                        } else {
+                        if use_wrapping {
                             Value::Int(a.wrapping_mul(*b))
+                        } else if let Some(r) = a.checked_mul(*b) {
+                            Value::Int(r)
+                        } else {
+                            return Value::Void;
                         }
                     }
                     BinOp::Div => {
                         if *b == 0 {
-                            if self.debug_mode {
-                                return Value::Void; // panic: division by zero
-                            }
-                            Value::Int(0)
+                            return Value::Void; // panic: division by zero (always)
                         } else {
                             Value::Int(a.wrapping_div(*b))
                         }
                     }
                     BinOp::Mod => {
                         if *b == 0 {
-                            if self.debug_mode {
-                                return Value::Void;
-                            }
-                            Value::Int(0)
+                            return Value::Void; // panic: modulo by zero (always)
                         } else {
                             Value::Int(a.wrapping_rem(*b))
                         }
@@ -1072,6 +1203,21 @@ impl Interpreter {
                 match op {
                     BinOp::Eq => Value::Bool(a == b),
                     BinOp::Neq => Value::Bool(a != b),
+                    _ => Value::Void,
+                }
+            }
+            (Value::Str(a), Value::Int(b)) => {
+                // String compared to integer (e.g. str == 0 for null check)
+                match op {
+                    BinOp::Eq => Value::Bool(a.is_empty() && *b == 0),
+                    BinOp::Neq => Value::Bool(!(a.is_empty() && *b == 0)),
+                    _ => Value::Void,
+                }
+            }
+            (Value::Int(a), Value::Str(b)) => {
+                match op {
+                    BinOp::Eq => Value::Bool(b.is_empty() && *a == 0),
+                    BinOp::Neq => Value::Bool(!(b.is_empty() && *a == 0)),
                     _ => Value::Void,
                 }
             }
@@ -1165,6 +1311,17 @@ impl Interpreter {
         }
     }
 
+    /// Check if the currently executing function is @wrapping (F65).
+    /// @wrapping functions use wrap-around arithmetic instead of checked.
+    fn is_wrapping_func(&self) -> bool {
+        if self.current_func_name.is_empty() {
+            return false;
+        }
+        self.module.functions.get(&self.current_func_name)
+            .map(|f| f.is_wrapping)
+            .unwrap_or(false)
+    }
+
     /// Check if a function name is a runtime function
     fn is_runtime_func(&self, name: &str) -> bool {
         self.module.extern_functions.contains_key(name)
@@ -1179,6 +1336,11 @@ impl Interpreter {
             || name.starts_with("p_http_")
             || name.starts_with("p_db_")
             || name.starts_with("p_file_")
+            || name.starts_with("p_thread_")
+            || name.starts_with("p_atomic_")
+            || name.starts_with("p_mutex_")
+            || name.starts_with("p_shared_")
+            || name.starts_with("p_future_")
     }
 
     /// Call a runtime function
@@ -1446,26 +1608,34 @@ impl Interpreter {
             "p_vec_get" => {
                 if let (Some(Value::Vec(arr)), Some(Value::Int(idx))) = (args.first(), args.get(1)) {
                     let borrow = arr.borrow();
-                    if *idx < 0 || (*idx as usize) >= borrow.len() {
-                        return ExecOutcome::Panic(format!(
-                            "Vec index out of bounds: index {} but vec has {} elements",
-                            idx, borrow.len()
-                        ));
+                    // F62: bounds checking lock — skip in unsafe blocks
+                    if self.interp_unsafe_depth == 0 {
+                        if *idx < 0 || (*idx as usize) >= borrow.len() {
+                            return ExecOutcome::Panic(format!(
+                                "Vec index out of bounds: index {} but vec has {} elements",
+                                idx, borrow.len()
+                            ));
+                        }
                     }
-                    return ExecOutcome::Value(borrow[*idx as usize].clone());
+                    let idx_clamped = if borrow.is_empty() { 0 } else { (*idx as usize).min(borrow.len() - 1) };
+                    return ExecOutcome::Value(borrow[idx_clamped].clone());
                 }
                 ExecOutcome::Value(Value::Void)
             }
             "p_vec_set" => {
                 if let (Some(Value::Vec(arr)), Some(Value::Int(idx)), Some(val)) = (args.first(), args.get(1), args.get(2)) {
                     let mut borrow = arr.borrow_mut();
-                    if *idx < 0 || (*idx as usize) >= borrow.len() {
-                        return ExecOutcome::Panic(format!(
-                            "Vec index out of bounds: index {} but vec has {} elements",
-                            idx, borrow.len()
-                        ));
+                    // F62: bounds checking lock — skip in unsafe blocks
+                    if self.interp_unsafe_depth == 0 {
+                        if *idx < 0 || (*idx as usize) >= borrow.len() {
+                            return ExecOutcome::Panic(format!(
+                                "Vec index out of bounds: index {} but vec has {} elements",
+                                idx, borrow.len()
+                            ));
+                        }
                     }
-                    borrow[*idx as usize] = val.clone();
+                    let idx_clamped = if borrow.is_empty() { 0 } else { (*idx as usize).min(borrow.len() - 1) };
+                    borrow[idx_clamped] = val.clone();
                 }
                 ExecOutcome::Value(Value::Void)
             }
@@ -1635,22 +1805,19 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Str(CompactString::from("")))
             }
             "p_string_contains" => {
-                if let (Some(Value::Str(s)), Some(Value::Str(sub))) = (args.first(), args.get(1)) {
-                    return ExecOutcome::Value(Value::Bool(s.contains(sub.as_str())));
-                }
-                ExecOutcome::Value(Value::Bool(false))
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                let sub = self.value_to_string(args.get(1).unwrap_or(&Value::Int(0)));
+                return ExecOutcome::Value(Value::Bool(s.contains(sub.as_str())));
             }
             "p_string_starts_with" => {
-                if let (Some(Value::Str(s)), Some(Value::Str(prefix))) = (args.first(), args.get(1)) {
-                    return ExecOutcome::Value(Value::Bool(s.starts_with(prefix.as_str())));
-                }
-                ExecOutcome::Value(Value::Bool(false))
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                let prefix = self.value_to_string(args.get(1).unwrap_or(&Value::Int(0)));
+                return ExecOutcome::Value(Value::Bool(s.starts_with(prefix.as_str())));
             }
             "p_string_ends_with" => {
-                if let (Some(Value::Str(s)), Some(Value::Str(suffix))) = (args.first(), args.get(1)) {
-                    return ExecOutcome::Value(Value::Bool(s.ends_with(suffix.as_str())));
-                }
-                ExecOutcome::Value(Value::Bool(false))
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                let suffix = self.value_to_string(args.get(1).unwrap_or(&Value::Int(0)));
+                return ExecOutcome::Value(Value::Bool(s.ends_with(suffix.as_str())));
             }
             "p_string_trim" => {
                 if let Some(Value::Str(s)) = args.first() {
@@ -1668,10 +1835,10 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(SmallVec::new()))))
             }
             "p_string_replace" => {
-                if let (Some(Value::Str(s)), Some(Value::Str(from)), Some(Value::Str(to))) = (args.first(), args.get(1), args.get(2)) {
-                    return ExecOutcome::Value(Value::Str(CompactString::from(s.replace(from.as_str(), to.as_str()))));
-                }
-                ExecOutcome::Value(Value::Str(CompactString::from("")))
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                let from = self.value_to_string(args.get(1).unwrap_or(&Value::Int(0)));
+                let to = self.value_to_string(args.get(2).unwrap_or(&Value::Int(0)));
+                return ExecOutcome::Value(Value::Str(CompactString::from(s.replace(from.as_str(), to.as_str()))));
             }
             "p_string_char_at" => {
                 if let (Some(Value::Str(s)), Some(Value::Int(idx))) = (args.first(), args.get(1)) {
@@ -2602,6 +2769,310 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Int(0))
             }
 
+            // ─── Environment variable builtins ───
+            "p_getenv" => {
+                if let Some(Value::Str(name)) = args.first() {
+                    let name_str = name.to_string();
+                    match std::env::var(&name_str) {
+                        Ok(val) => return ExecOutcome::Value(Value::Str(CompactString::from(val))),
+                        Err(_) => return ExecOutcome::Value(Value::Ptr(0)),
+                    }
+                }
+                ExecOutcome::Value(Value::Ptr(0))
+            }
+
+            // ─── Command-line argument builtins ───
+            "p_argc" => {
+                ExecOutcome::Value(Value::Int(std::env::args().count() as i64))
+            }
+            "p_argv" => {
+                if let Some(Value::Int(idx)) = args.first() {
+                    let args_vec: Vec<String> = std::env::args().collect();
+                    if *idx >= 0 && (*idx as usize) < args_vec.len() {
+                        return ExecOutcome::Value(Value::Str(CompactString::from(&args_vec[*idx as usize])));
+                    }
+                }
+                ExecOutcome::Value(Value::Ptr(0))
+            }
+
+            // ─── Process control builtins ───
+            "p_system" => {
+                if let Some(Value::Str(cmd)) = args.first() {
+                    let cmd_str = cmd.to_string();
+                    let status = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(&cmd_str)
+                        .status();
+                    match status {
+                        Ok(s) => {
+                            use std::os::unix::process::ExitStatusExt;
+                            return ExecOutcome::Value(Value::Int(s.code().unwrap_or(s.signal().unwrap_or(0)) as i64));
+                        }
+                        Err(_) => return ExecOutcome::Value(Value::Int(-1)),
+                    }
+                }
+                ExecOutcome::Value(Value::Int(-1))
+            }
+            "p_exit" => {
+                if let Some(Value::Int(code)) = args.first() {
+                    std::process::exit(*code as i32);
+                }
+                std::process::exit(0);
+            }
+
+            // ─── Regex builtin ───
+            "p_regex_match" => {
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                let pattern = self.value_to_string(args.get(1).unwrap_or(&Value::Int(0)));
+                ExecOutcome::Value(Value::Bool(wildcard_match(&s, &pattern)))
+            }
+
+            // ─── Phase 7.6 + 8A: Async/await + threads runtime ───
+            "p_future_ready" => {
+                // Wrap a value in a ready Future. The value is stored in the
+                // futures table and a Future handle (index) is returned.
+                let value = args.first().cloned().unwrap_or(Value::Int(0));
+                let idx = self.futures.len();
+                self.futures.push(FutureState::Ready(value));
+                ExecOutcome::Value(Value::Future(idx))
+            }
+            "p_future_poll" => {
+                // Poll a Future — extract its value.
+                // If Ready, return the value immediately.
+                // If Pending (thread running), block until the thread completes.
+                let idx = match args.first() {
+                    Some(Value::Future(idx)) => *idx,
+                    Some(Value::Int(n)) => *n as usize,
+                    _ => return ExecOutcome::Panic("Future poll: not a Future value".to_string()),
+                };
+                if idx >= self.futures.len() {
+                    return ExecOutcome::Panic(format!("Future poll: invalid handle {}", idx));
+                }
+                // Check if already Ready (take the value without consuming the slot)
+                match &self.futures[idx] {
+                    FutureState::Ready(v) => return ExecOutcome::Value(v.clone()),
+                    FutureState::Pending(_) => {}
+                }
+                // Pending — join the thread
+                if let FutureState::Pending(Some(handle)) =
+                    std::mem::replace(&mut self.futures[idx], FutureState::Ready(Value::Int(0)))
+                {
+                    match handle.join() {
+                        Ok(n) => {
+                            let v = Value::Int(n);
+                            self.futures[idx] = FutureState::Ready(v.clone());
+                            ExecOutcome::Value(v)
+                        }
+                        Err(_) => {
+                            self.futures[idx] = FutureState::Ready(Value::Int(0));
+                            ExecOutcome::Panic("Thread panicked during join".to_string())
+                        }
+                    }
+                } else {
+                    ExecOutcome::Panic("Future poll: already consumed".to_string())
+                }
+            }
+
+            // ─── Phase 8A: Real OS threads ───
+            "p_thread_spawn" => {
+                // p_thread_spawn(func_name: *u8, num_args: i64, args...) -> i64
+                // Spawns an OS thread that runs the named function with the given args.
+                // Returns a Future handle. Use p_future_poll to join.
+                // Note: Only primitive values (i64, f64, bool, str) can be passed
+                // to threads. Complex types (Vec, Map, etc.) are converted to i64(0).
+                let func_name = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                let num_args = match args.get(1) {
+                    Some(Value::Int(n)) => *n as usize,
+                    _ => 0,
+                };
+                // Convert args to Send-safe primitives (i64 only — threads get raw values)
+                let thread_args: Vec<i64> = if args.len() >= 2 + num_args {
+                    args[2..2 + num_args].iter().map(|v| match v {
+                        Value::Int(n) => *n,
+                        Value::Bool(b) => *b as i64,
+                        Value::Float(f) => f.to_bits() as i64,
+                        Value::Ptr(p) => *p as i64,
+                        _ => 0,
+                    }).collect()
+                } else {
+                    args[2..].iter().map(|v| match v {
+                        Value::Int(n) => *n,
+                        Value::Bool(b) => *b as i64,
+                        Value::Float(f) => f.to_bits() as i64,
+                        Value::Ptr(p) => *p as i64,
+                        _ => 0,
+                    }).collect()
+                };
+
+                // Clone the module (function table) for the thread
+                let module = self.module.clone();
+                // Clone shared state for the thread
+                let shared_memory = self.shared_memory.clone();
+                let mutexes = self.mutexes.clone();
+
+                // Allocate a Future slot (Pending)
+                let future_idx = self.futures.len();
+                self.futures.push(FutureState::Pending(None));
+
+                let handle = std::thread::spawn(move || {
+                    let mut interp = Interpreter::new(module);
+                    // Share the same shared_memory and mutexes
+                    interp.shared_memory = shared_memory;
+                    interp.mutexes = mutexes;
+
+                    // Convert i64 args back to Values
+                    // Prepend a dummy env value (user functions have __env as first param)
+                    let mut thread_values: Vec<Value> = vec![Value::Int(0)];
+                    for n in &thread_args {
+                        thread_values.push(Value::Int(*n));
+                    }
+
+                    // Look up and run the function
+                    let result = if let Some(func) = interp.module.functions.get(&func_name).cloned()
+                    {
+                        match interp.run_function(&func, &thread_values) {
+                            RunResult::Return(v) => v,
+                            RunResult::Panic(msg) => {
+                                eprintln!("Thread panic: {}", msg);
+                                Value::Int(0)
+                            }
+                        }
+                    } else {
+                        eprintln!("Thread: unknown function '{}'", func_name);
+                        Value::Int(0)
+                    };
+                    // Convert result to Send-safe i64 (threads communicate via i64)
+                    match result {
+                        Value::Int(n) => n,
+                        Value::Bool(b) => b as i64,
+                        Value::Float(f) => f.to_bits() as i64,
+                        Value::Ptr(p) => p as i64,
+                        _ => 0,
+                    }
+                });
+
+                // Store the JoinHandle in the Pending slot
+                self.futures[future_idx] = FutureState::Pending(Some(handle));
+                ExecOutcome::Value(Value::Future(future_idx))
+            }
+
+            // ─── Phase 8A: Shared memory + atomics ───
+            "p_shared_alloc" => {
+                // p_shared_alloc(size: i64) -> i64
+                // Allocates a slot in shared memory. For now, allocates a single i64 slot
+                // (size is ignored — each allocation is one i64).
+                let addr = self.next_shared_addr;
+                self.next_shared_addr += 8;
+                // Initialize to 0
+                self.shared_memory.lock().unwrap().insert(addr, 0);
+                ExecOutcome::Value(Value::Int(addr))
+            }
+            "p_atomic_load" => {
+                // p_atomic_load(addr: i64) -> i64
+                let addr = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let val = self
+                    .shared_memory
+                    .lock()
+                    .unwrap()
+                    .get(&addr)
+                    .copied()
+                    .unwrap_or(0);
+                ExecOutcome::Value(Value::Int(val))
+            }
+            "p_atomic_store" => {
+                // p_atomic_store(addr: i64, val: i64) -> void
+                let addr = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let val = match args.get(1) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                self.shared_memory.lock().unwrap().insert(addr, val);
+                ExecOutcome::Continue
+            }
+            "p_atomic_cas" => {
+                // p_atomic_cas(addr: i64, expected: i64, new: i64) -> bool
+                let addr = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let expected = match args.get(1) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let new = match args.get(2) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let mut shared = self.shared_memory.lock().unwrap();
+                let current = shared.get(&addr).copied().unwrap_or(0);
+                if current == expected {
+                    shared.insert(addr, new);
+                    ExecOutcome::Value(Value::Bool(true))
+                } else {
+                    ExecOutcome::Value(Value::Bool(false))
+                }
+            }
+            "p_atomic_add" => {
+                // p_atomic_add(addr: i64, val: i64) -> i64 (returns old value)
+                let addr = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let val = match args.get(1) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let mut shared = self.shared_memory.lock().unwrap();
+                let old = shared.get(&addr).copied().unwrap_or(0);
+                shared.insert(addr, old + val);
+                ExecOutcome::Value(Value::Int(old))
+            }
+
+            // ─── Phase 8A: Mutex ───
+            "p_mutex_init" => {
+                // p_mutex_init() -> i64 — create a mutex, return handle
+                let handle = self.next_mutex_handle;
+                self.next_mutex_handle += 1;
+                // Use shared_memory with the handle as address for the lock flag
+                self.shared_memory.lock().unwrap().insert(handle, 0);
+                ExecOutcome::Value(Value::Int(handle))
+            }
+            "p_mutex_lock" => {
+                // p_mutex_lock(m: i64) -> void — lock a mutex (blocks if contended)
+                // Uses a spinlock on shared_memory: spin until flag is 0, then set to 1.
+                let m = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let shared = self.shared_memory.clone();
+                loop {
+                    let mut shared_lock = shared.lock().unwrap();
+                    let current = shared_lock.get(&m).copied().unwrap_or(0);
+                    if current == 0 {
+                        shared_lock.insert(m, 1);
+                        break;
+                    }
+                    drop(shared_lock);
+                    std::thread::yield_now();
+                }
+                ExecOutcome::Continue
+            }
+            "p_mutex_unlock" => {
+                // p_mutex_unlock(m: i64) -> void — unlock a mutex
+                let m = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                self.shared_memory.lock().unwrap().insert(m, 0);
+                ExecOutcome::Continue
+            }
+
             // ─── C library function stubs (for extern FFI in interpreter mode) ───
             "abs" => {
                 if let Some(Value::Int(n)) = args.first() {
@@ -2647,21 +3118,21 @@ impl Interpreter {
                     ExecOutcome::Value(Value::Float(0.0))
                 }
             }
-            "sin" | "c_sin" => {
+            "sin" | "c_sin" | "pledge_sin" => {
                 if let Some(Value::Float(f)) = args.first() {
                     ExecOutcome::Value(Value::Float(f.sin()))
                 } else {
                     ExecOutcome::Value(Value::Float(0.0))
                 }
             }
-            "cos" | "c_cos" => {
+            "cos" | "c_cos" | "pledge_cos" => {
                 if let Some(Value::Float(f)) = args.first() {
                     ExecOutcome::Value(Value::Float(f.cos()))
                 } else {
                     ExecOutcome::Value(Value::Float(0.0))
                 }
             }
-            "fabs" | "c_fabs" => {
+            "fabs" | "c_fabs" | "pledge_fabs" => {
                 if let Some(Value::Float(f)) = args.first() {
                     ExecOutcome::Value(Value::Float(f.abs()))
                 } else {
@@ -2690,6 +3161,59 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Int(0))
             }
 
+            // ─── Phase 7.7: Dynamic loading (dlopen/dlsym) ───
+            "p_dl_open" => {
+                // p_dl_open(path: str) -> i64 — open a shared library, return handle
+                // Returns 0 on failure (simulated in interpreter)
+                let path = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                // In interpreter mode, we simulate dlopen by returning a non-zero handle
+                // Real dynamic loading happens in C codegen mode
+                if path.is_empty() {
+                    ExecOutcome::Value(Value::Int(0))
+                } else {
+                    // Return a simulated handle (non-zero)
+                    let handle = self.next_dl_handle;
+                    self.next_dl_handle += 1;
+                    self.dl_handles.insert(handle, path);
+                    ExecOutcome::Value(Value::Int(handle))
+                }
+            }
+            "p_dl_sym" => {
+                // p_dl_sym(handle: i64, symbol: str) -> i64 — look up a symbol
+                // Returns 0 on failure (simulated in interpreter)
+                let handle = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let symbol = self.value_to_string(args.get(1).unwrap_or(&Value::Int(0)));
+                if handle == 0 || !self.dl_handles.contains_key(&handle) {
+                    ExecOutcome::Value(Value::Int(0))
+                } else if symbol.is_empty() {
+                    ExecOutcome::Value(Value::Int(0))
+                } else {
+                    // Return a simulated function pointer (non-zero)
+                    ExecOutcome::Value(Value::Int(0x1000 + handle * 0x100))
+                }
+            }
+            "p_dl_close" => {
+                // p_dl_close(handle: i64) -> void — close a shared library
+                let handle = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                self.dl_handles.remove(&handle);
+                ExecOutcome::Continue
+            }
+            "p_dl_call" => {
+                // p_dl_call(func_ptr: i64, arg: i64) -> i64 — call a dynamically loaded function
+                // In interpreter mode, this is simulated (returns the arg)
+                let arg = match args.get(1) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                ExecOutcome::Value(Value::Int(arg))
+            }
+
             _ => ExecOutcome::Panic(format!("Unknown runtime function: {}", name)),
         }
     }
@@ -2716,6 +3240,39 @@ impl Interpreter {
             _ => None,
         }
     }
+}
+
+/// Simple wildcard pattern matching: ? matches any single char, * matches zero or more chars.
+fn wildcard_match(s: &str, pattern: &str) -> bool {
+    let s_bytes = s.as_bytes();
+    let p_bytes = pattern.as_bytes();
+    let s_len = s_bytes.len();
+    let p_len = p_bytes.len();
+    let mut s_idx = 0usize;
+    let mut p_idx = 0usize;
+    let mut star_s = None; // position in s when we last saw a *
+    let mut star_p = None; // position in p of the last *
+
+    while s_idx < s_len {
+        if p_idx < p_len && (p_bytes[p_idx] == b'?' || p_bytes[p_idx] == s_bytes[s_idx]) {
+            s_idx += 1;
+            p_idx += 1;
+        } else if p_idx < p_len && p_bytes[p_idx] == b'*' {
+            star_p = Some(p_idx);
+            star_s = Some(s_idx);
+            p_idx += 1;
+        } else if let Some(sp) = star_p {
+            p_idx = sp + 1;
+            s_idx = star_s.unwrap() + 1;
+            star_s = Some(s_idx);
+        } else {
+            return false;
+        }
+    }
+    while p_idx < p_len && p_bytes[p_idx] == b'*' {
+        p_idx += 1;
+    }
+    p_idx == p_len
 }
 
 /// Extract a Vec<usize> from an argument

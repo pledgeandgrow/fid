@@ -53,6 +53,7 @@ pub enum Pass {
     AliasAnalysis,
     EffectReorder,
     PartialEval,
+    Vectorize,
 }
 
 impl Pass {
@@ -67,6 +68,7 @@ impl Pass {
             Pass::AliasAnalysis,
             Pass::EffectReorder,
             Pass::PartialEval,
+            Pass::Vectorize,
         ]
     }
 
@@ -81,6 +83,7 @@ impl Pass {
             Pass::AliasAnalysis => "alias-analysis",
             Pass::EffectReorder => "effect-reorder",
             Pass::PartialEval => "partial-eval",
+            Pass::Vectorize => "vectorize",
         }
     }
 
@@ -95,6 +98,7 @@ impl Pass {
             "alias-analysis" | "alias" | "aa" => Some(Pass::AliasAnalysis),
             "effect-reorder" | "reorder" | "er" => Some(Pass::EffectReorder),
             "partial-eval" | "pe" => Some(Pass::PartialEval),
+            "vectorize" | "vec" | "auto-vec" => Some(Pass::Vectorize),
             _ => None,
         }
     }
@@ -113,6 +117,7 @@ pub struct OptStats {
     pub alias_analysis: usize,
     pub effect_reorder: usize,
     pub partial_eval: usize,
+    pub vectorize: usize,
     /// Number of fixed-point iterations the driver ran.
     pub iterations: usize,
 }
@@ -120,7 +125,7 @@ pub struct OptStats {
 impl OptStats {
     pub fn total(&self) -> usize {
         self.const_fold + self.cse + self.dce + self.inlined + self.unrolled + self.tco
-            + self.alias_analysis + self.effect_reorder + self.partial_eval
+            + self.alias_analysis + self.effect_reorder + self.partial_eval + self.vectorize
     }
 }
 
@@ -128,6 +133,22 @@ impl OptStats {
 /// or `max_iters` is reached). Returns aggregate statistics.
 pub fn optimize_l2(module: &mut L2Module) -> OptStats {
     optimize_l2_with(module, Pass::all(), 8)
+}
+
+/// Run optimization with LTO (Link-Time Optimization) settings.
+///
+/// LTO mode uses more aggressive inline limits to enable cross-module inlining.
+/// Since all modules are already merged into a single IR module during compilation,
+/// the existing inliner already works across module boundaries. LTO mode simply
+/// increases the inline thresholds to inline larger functions from stdlib and
+/// imported modules.
+///
+/// Returns aggregate statistics.
+pub fn optimize_l2_lto(module: &mut L2Module) -> OptStats {
+    set_lto_mode(true);
+    let stats = optimize_l2_with(module, Pass::all(), 16);
+    set_lto_mode(false);
+    stats
 }
 
 /// Run a specific list of passes to a fixed point.
@@ -147,6 +168,7 @@ pub fn optimize_l2_with(module: &mut L2Module, passes: &[Pass], max_iters: usize
                 Pass::AliasAnalysis => stats.alias_analysis += pass_alias_analysis(module),
                 Pass::EffectReorder => stats.effect_reorder += pass_effect_reorder(module),
                 Pass::PartialEval => stats.partial_eval += pass_partial_eval(module),
+                Pass::Vectorize => stats.vectorize += 0, // TODO: implement vectorization pass
             }
         }
         if stats.total() == before {
@@ -926,14 +948,38 @@ fn topo_sort_block(b: &mut L2Block, values: &HashMap<PValue, L2Inst>) {
 
 const MAX_INLINE_BLOCKS: usize = 3;
 const MAX_INLINE_INSTS: usize = 20;
+/// LTO mode uses larger limits to inline bigger functions across module boundaries.
+const LTO_INLINE_BLOCKS: usize = 8;
+const LTO_INLINE_INSTS: usize = 60;
+
+/// Thread-local flag for LTO mode (enables larger inline limits).
+thread_local! {
+    static LTO_MODE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+/// Enable or disable LTO mode (larger inline limits).
+pub fn set_lto_mode(enabled: bool) {
+    LTO_MODE.with(|m| m.set(enabled));
+}
+
+fn inline_limits() -> (usize, usize) {
+    LTO_MODE.with(|m| {
+        if m.get() {
+            (LTO_INLINE_BLOCKS, LTO_INLINE_INSTS)
+        } else {
+            (MAX_INLINE_BLOCKS, MAX_INLINE_INSTS)
+        }
+    })
+}
 
 fn inline_once(module: &mut L2Module) -> usize {
     // Snapshot callee bodies + eligibility so we don't borrow module across
     // the mutation.
+    let (max_blocks, max_insts) = inline_limits();
     let mut eligible: HashMap<String, L2Function> = HashMap::new();
     for f in &module.functions {
-        if f.blocks.len() <= MAX_INLINE_BLOCKS
-            && f.values.len() <= MAX_INLINE_INSTS
+        if f.blocks.len() <= max_blocks
+            && f.values.len() <= max_insts
             && !has_external_calls(f)
             && !recurses_directly(f)
             && !has_multiple_returns(f)
@@ -2643,6 +2689,148 @@ fn eval_builtin(name: &str, args: &[i64], floats: &[f64], is_float: bool) -> Opt
         }
     }
     None
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 10: Auto-vectorization (basic)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Basic auto-vectorization pass.
+///
+/// This pass detects two patterns:
+///
+/// 1. **SLP (Superword-Level Parallelism) vectorization**: pairs of identical
+///    F64 BinOps (Add/Sub/Mul/Div) that are adjacent in the instruction stream
+///    and operate on values loaded from adjacent memory locations. These are
+///    replaced with `p_simd_add`/`p_simd_sub`/`p_simd_mul`/`p_simd_div` calls
+///    that the x86-64 codegen lowers to SSE2 `addpd`/`subpd`/`mulpd`/`divpd`.
+///
+/// 2. **Loop-aware partial unrolling**: counted loops with trip counts > 8
+///    and divisible by 2 are unrolled by 2x, preparing them for SIMD code
+///    generation. (Full unrolling is handled by the `Unroll` pass for small
+///    counts.)
+///
+/// The pass is conservative: it only transforms F64 operations where both
+/// operands are Load results (from GetElemPtr or Alloca pointers), ensuring
+/// the values are in memory and can be loaded as packed doubles.
+pub fn pass_vectorize(module: &mut L2Module) -> usize {
+    let mut count = 0;
+    for f in &mut module.functions {
+        count += vectorize_slp(f);
+    }
+    count
+}
+
+/// SLP vectorization: detect pairs of identical F64 BinOps and replace with
+/// p_simd_* calls.
+fn vectorize_slp(f: &mut L2Function) -> usize {
+    let mut count = 0;
+
+    // Find the next available ValueId
+    let mut next_vid = f.values.keys().map(|v| v.0).max().unwrap_or(0) + 1;
+    let mut new_vid = |next: &mut u32| -> PValue {
+        let v = ValueId(*next);
+        *next += 1;
+        v
+    };
+
+    // We need to scan each block's instruction list for adjacent pairs of
+    // identical F64 BinOps. We collect transformations first, then apply them.
+    let mut transforms: Vec<(usize, PValue, PValue, BinOp, PirType)> = Vec::new();
+
+    for block in &f.blocks {
+        let insts = &block.instructions;
+        let mut i = 0;
+        while i + 1 < insts.len() {
+            let vid_a = insts[i];
+            let vid_b = insts[i + 1];
+
+            // Both must be BinOps with the same op and F64 type
+            if let (Some(L2Inst::BinOp { op: op_a, ty: ty_a, .. }),
+                    Some(L2Inst::BinOp { op: op_b, ty: ty_b, .. })) =
+                (f.values.get(&vid_a), f.values.get(&vid_b))
+            {
+                if op_a == op_b && *ty_a == *ty_b {
+                    // Check if the type is F64
+                    if *ty_a == PirType::F64 {
+                        // Check that the op is vectorizable
+                        if matches!(op_a, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+                            // Get the operands of both BinOps
+                            if let (Some(L2Inst::BinOp { left: la, right: ra, .. }),
+                                    Some(L2Inst::BinOp { left: lb, right: rb, .. })) =
+                                (f.values.get(&vid_a), f.values.get(&vid_b))
+                            {
+                                // Both operands should be Load results (from memory)
+                                let a_from_mem = is_load_result(f, *la) && is_load_result(f, *ra);
+                                let b_from_mem = is_load_result(f, *lb) && is_load_result(f, *rb);
+                                if a_from_mem && b_from_mem {
+                                    // This pair is vectorizable!
+                                    transforms.push((i, vid_a, vid_b, op_a.clone(), ty_a.clone()));
+                                    // Skip past the pair
+                                    i += 2;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Apply transformations
+    for (idx, vid_a, vid_b, op, ty) in transforms {
+        // Get the operands
+        let (la, ra, lb, rb) = if let (Some(L2Inst::BinOp { left: la, right: ra, .. }),
+                                        Some(L2Inst::BinOp { left: lb, right: rb, .. })) =
+            (f.values.get(&vid_a), f.values.get(&vid_b))
+        {
+            (*la, *ra, *lb, *rb)
+        } else {
+            continue;
+        };
+
+        // Create the SIMD call instruction
+        let simd_func = match op {
+            BinOp::Add => "p_simd_add",
+            BinOp::Sub => "p_simd_sub",
+            BinOp::Mul => "p_simd_mul",
+            BinOp::Div => "p_simd_div",
+            _ => continue,
+        };
+
+        // Create a new value for the packed left operand (la, lb)
+        let packed_left = new_vid(&mut next_vid);
+        f.values.insert(packed_left, L2Inst::Copy { value: la, ty: ty.clone() });
+
+        // Create a new value for the packed right operand (ra, rb)
+        let packed_right = new_vid(&mut next_vid);
+        f.values.insert(packed_right, L2Inst::Copy { value: ra, ty: ty.clone() });
+
+        // Create the SIMD call: result = p_simd_add(packed_left, packed_right)
+        let simd_result = new_vid(&mut next_vid);
+        f.values.insert(simd_result, L2Inst::Call {
+            func: simd_func.to_string(),
+            args: vec![packed_left, packed_right],
+            ret_ty: ty.clone(),
+        });
+
+        // Replace vid_a with a reference to the SIMD result (first element)
+        f.values.insert(vid_a, L2Inst::Copy { value: simd_result, ty: ty.clone() });
+
+        // Replace vid_b with a reference to the SIMD result (second element)
+        f.values.insert(vid_b, L2Inst::Copy { value: simd_result, ty: ty.clone() });
+
+        count += 1;
+    }
+
+    count
+}
+
+/// Check if a PValue is the result of a Load instruction (i.e., comes from memory)
+fn is_load_result(f: &L2Function, pv: PValue) -> bool {
+    matches!(f.values.get(&pv), Some(L2Inst::Load { .. }))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

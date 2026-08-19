@@ -641,7 +641,7 @@ A new language is **hard to justify** if:
 - Rejects: unwrap(), p_panic(), non-const division/modulo, while loops, non-@crashfree calls
 - SPARK Ada "absence of runtime errors" model, pattern-based static check
 - Tests: test_crashfree.fd (valid), test_crashfree_fail.fd (expected fail)
-- 99/99 normal + 12/12 expected-fail, no regressions
+- 114/114 normal + 21/21 expected-fail, no regressions
 
 ### Phase 7.5A (cont): LogicalTime Stdlib
 - stdlib/time.fd: timezone-free, clock-free, @deterministic date math
@@ -663,7 +663,26 @@ A new language is **hard to justify** if:
 - Loop-aware linear types: linear variables can't be consumed inside loop bodies
 - Database helpers: insert, delete, update helpers in stdlib/db.fd
 - Tests: test_file.fd, test_txn.fd, test_loop_linear_fail.fd (expected fail)
-- 99/99 normal + 12/12 expected-fail, no regressions
+- 114/114 normal + 21/21 expected-fail, no regressions
+
+### Phase 7.5D: Typed Strings + Init Guarantee
+- F67: Typed strings stdlib (stdlib/typed_strings.fd)
+  - SQLString, ShellString, HTMLString, JSONString, PathString distinct types
+  - Injection prevention via type system: passing raw str to SQLString param = compile error
+  - Escape functions: sql_escape, shell_escape, html_escape, json_escape, path_safe
+  - Parameterized query helpers: sql_bind, sql_bind_int
+  - Safety heuristics: is_safe() methods detect injection patterns
+- F63: Init guarantee
+  - `pm` keyword for uninitialized mutable variables (no dummy values needed)
+  - Definite assignment analysis: reading before assignment = compile error
+  - If/else branch analysis: variable initialized only if assigned in BOTH branches
+  - Clear error messages with fix suggestions
+- Infrastructure: interpreter Load fix for str in struct fields, p_string_* arg handling,
+  typechecker return types for p_* builtins, argument type checking for named struct types
+- Tests: test_typed_strings.fd, test_typed_strings_fail.fd (expected fail),
+  test_init_guarantee.fd, test_init_guarantee_fail.fd (expected fail),
+  test_init_guarantee_cond_fail.fd (expected fail)
+- 104/104 normal + 15/15 expected-fail, no regressions
 
 ### Phase 7.5B: Banking Demo
 - Banking stdlib (stdlib/banking.fd): Account, deposit, withdraw, transfer, interest
