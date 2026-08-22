@@ -137,6 +137,26 @@ impl Parser {
                     m.is_pub = is_pub;
                     program.models.push(m);
                 }
+                TokenKind::Component => {
+                    let mut c = self.parse_component()?;
+                    c.is_pub = is_pub;
+                    program.components.push(c);
+                }
+                TokenKind::System => {
+                    let mut s = self.parse_system()?;
+                    s.is_pub = is_pub;
+                    program.systems.push(s);
+                }
+                TokenKind::State => {
+                    let mut sm = self.parse_state_machine()?;
+                    sm.is_pub = is_pub;
+                    program.state_machines.push(sm);
+                }
+                TokenKind::On => {
+                    let mut eh = self.parse_event_handler()?;
+                    eh.is_pub = is_pub;
+                    program.event_handlers.push(eh);
+                }
                 TokenKind::Comptime => {
                     self.advance(); // consume comptime
                     // comptime pf name(...) { ... }
@@ -277,6 +297,27 @@ impl Parser {
         if let TokenKind::Ident(s) = &tok.kind {
             self.advance();
             Ok(s.clone())
+        } else {
+            Err(format!(
+                "Parse error at {}:{}: expected identifier but got '{}'",
+                tok.line, tok.col, tok.kind
+            ))
+        }
+    }
+
+    /// Like expect_ident, but also accepts keywords (useful for method names
+    /// like `query`, event names like `move`, etc.)
+    fn expect_ident_or_keyword(&mut self) -> Result<String, String> {
+        let tok = self.peek_token().clone();
+        if let TokenKind::Ident(s) = &tok.kind {
+            self.advance();
+            return Ok(s.clone());
+        }
+        // Accept any keyword as an identifier
+        let s = format!("{}", tok.kind);
+        if s != "<eof>" && s != "<invalid>" {
+            self.advance();
+            Ok(s)
         } else {
             Err(format!(
                 "Parse error at {}:{}: expected identifier but got '{}'",
@@ -474,6 +515,113 @@ impl Parser {
             name,
             layers,
             forward,
+            is_pub: false,
+        })
+    }
+
+    // ─── Phase 8B: Game Architecture Parsers ───────────────────────────
+
+    /// Parse `component Name { field: type, ... }`
+    fn parse_component(&mut self) -> Result<ComponentDef, String> {
+        self.expect(TokenKind::Component, "component")?;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::LBrace, "{")?;
+        let mut fields = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            let field_name = self.expect_ident()?;
+            self.expect(TokenKind::Colon, ":")?;
+            let field_ty = self.parse_type()?;
+            fields.push(Param {
+                name: field_name,
+                ty: field_ty,
+                is_pub: false,
+            });
+            self.match_tok(TokenKind::Comma);
+        }
+        self.expect(TokenKind::RBrace, "}")?;
+        // Register component name as a struct name so struct literals work
+        self.struct_names.push(name.clone());
+        Ok(ComponentDef {
+            name,
+            fields,
+            is_pub: false,
+        })
+    }
+
+    /// Parse `system Name(params) { body }`
+    fn parse_system(&mut self) -> Result<SystemDef, String> {
+        self.expect(TokenKind::System, "system")?;
+        let name = self.expect_ident()?;
+        // Parse parameters
+        self.expect(TokenKind::LParen, "(")?;
+        let params = self.parse_params()?;
+        self.expect(TokenKind::RParen, ")")?;
+        // Parse body
+        self.expect(TokenKind::LBrace, "{")?;
+        let body = self.parse_block()?;
+        self.expect(TokenKind::RBrace, "}")?;
+        Ok(SystemDef {
+            name,
+            params,
+            body,
+            is_pub: false,
+        })
+    }
+
+    /// Parse `state Name { StateA { on event => Target } ... }`
+    fn parse_state_machine(&mut self) -> Result<StateMachineDef, String> {
+        self.expect(TokenKind::State, "state")?;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::LBrace, "{")?;
+        let mut states = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            let state_name = self.expect_ident_or_keyword()?;
+            self.expect(TokenKind::LBrace, "{")?;
+            let mut transitions = Vec::new();
+            while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+                self.expect(TokenKind::On, "on")?;
+                let event = self.expect_ident_or_keyword()?;
+                self.expect(TokenKind::FatArrow, "=>")?;
+                let target = self.expect_ident_or_keyword()?;
+                transitions.push(StateTransition {
+                    event,
+                    target,
+                });
+                self.match_tok(TokenKind::Comma);
+            }
+            self.expect(TokenKind::RBrace, "}")?;
+            states.push(StateDef {
+                name: state_name,
+                transitions,
+            });
+            self.match_tok(TokenKind::Comma);
+        }
+        self.expect(TokenKind::RBrace, "}")?;
+        // Register state machine name as an enum name
+        self.enum_names.push(name.clone());
+        Ok(StateMachineDef {
+            name,
+            states,
+            is_pub: false,
+        })
+    }
+
+    /// Parse `on event_name(params) { body }`
+    fn parse_event_handler(&mut self) -> Result<EventHandlerDef, String> {
+        self.expect(TokenKind::On, "on")?;
+        let event_name = self.expect_ident_or_keyword()?;
+        // Parse parameters
+        self.expect(TokenKind::LParen, "(")?;
+        let params = self.parse_params()?;
+        self.expect(TokenKind::RParen, ")")?;
+        // Parse body
+        self.expect(TokenKind::LBrace, "{")?;
+        let body = self.parse_block()?;
+        self.expect(TokenKind::RBrace, "}")?;
+        Ok(EventHandlerDef {
+            event_name,
+            params,
+            body,
             is_pub: false,
         })
     }
@@ -711,7 +859,7 @@ impl Parser {
             // Parse method signature: pf name(params) -> ret_ty ;
             // or with default body: pf name(params) -> ret_ty { body }
             self.expect(TokenKind::Pf, "pf")?;
-            let method_name = self.expect_ident()?;
+            let method_name = self.expect_ident_or_keyword()?;
 
             // Generic type params
             if self.check(&TokenKind::Lt) {
@@ -813,7 +961,7 @@ impl Parser {
 
     fn parse_func(&mut self) -> Result<Func, String> {
         self.expect(TokenKind::Pf, "fn")?;
-        let name = self.expect_ident()?;
+        let name = self.expect_ident_or_keyword()?;
 
         // Generic type params: <T, U, ...> with optional trait bounds: <T: Display, U>
         // Also supports const generic params: <N: i64> where N is a comptime value
@@ -959,7 +1107,7 @@ impl Parser {
         }
 
         loop {
-            let name = self.expect_ident()?;
+            let name = self.expect_ident_or_keyword()?;
             // Handle bare 'self' (without type annotation) in impl methods
             if name == "self" && !self.check(&TokenKind::Colon) {
                 params.push(Param { name: "self".to_string(), ty: Type::Named("Self".to_string()), is_pub: false });
@@ -1201,6 +1349,7 @@ impl Parser {
             TokenKind::Pv => self.parse_let(),
             TokenKind::Pm => self.parse_let_uninit(),
             TokenKind::Ret => self.parse_return(),
+            TokenKind::Query => self.parse_query_stmt(),
             TokenKind::If => {
                 let line = self.peek_token().line;
                 let expr = self.parse_if_expr()?;
@@ -1391,6 +1540,28 @@ impl Parser {
         let body = self.parse_block()?;
         self.expect(TokenKind::RBrace, "}")?;
         Ok(Stmt::Loop { body, line })
+    }
+
+    /// Parse `query(ComponentA, ComponentB, ...) { body }`
+    fn parse_query_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect(TokenKind::Query, "query")?;
+        self.expect(TokenKind::LParen, "(")?;
+        let mut components = Vec::new();
+        if !self.check(&TokenKind::RParen) {
+            loop {
+                let comp_name = self.expect_ident()?;
+                components.push(comp_name);
+                if !self.match_tok(TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(TokenKind::RParen, ")")?;
+        self.expect(TokenKind::LBrace, "{")?;
+        let body = self.parse_block()?;
+        self.expect(TokenKind::RBrace, "}")?;
+        Ok(Stmt::Query { components, body, line })
     }
 
     fn parse_match_stmt(&mut self) -> Result<Stmt, String> {
@@ -2034,7 +2205,7 @@ impl Parser {
         let mut expr = self.parse_primary()?;
         loop {
             if self.match_tok(TokenKind::Dot) {
-                let field = self.expect_ident()?;
+                let field = self.expect_ident_or_keyword()?;
                 if self.match_tok(TokenKind::LParen) {
                     // Method call: receiver.method(args)
                     let mut args = Vec::new();
@@ -2339,12 +2510,20 @@ impl Parser {
                 Ok(Expr::Spawn { expr: Box::new(expr) })
             }
             _ => {
+                // Allow keywords to be used as identifiers in expression context
+                // (e.g. `query` as a variable name, `move` as a field name)
+                let kw_str = format!("{}", tok.kind);
+                if kw_str != "<eof>" && kw_str != "<invalid>" && !kw_str.starts_with('<') {
+                    self.advance();
+                    Ok(Expr::Ident(kw_str))
+                } else {
                 // Try postfix (field access) on primary expressions
                 // If it's not a primary token, error
                 Err(format!(
                     "Parse error at {}:{}: unexpected token '{}'",
                     tok.line, tok.col, tok.kind
                 ))
+                }
             }
         }
     }

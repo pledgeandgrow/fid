@@ -638,6 +638,9 @@ impl CodeGen {
             Stmt::Backward { .. } => {
                 // Marker for autograd pass — no-op in codegen
             }
+            Stmt::Query { body, .. } => {
+                for s in body { self.gen_stmt(s); }
+            }
         }
     }
 

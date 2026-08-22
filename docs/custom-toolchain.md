@@ -64,13 +64,13 @@ External linkers (ld, lld, link.exe) are separate processes that:
 - `fidesc pir <file> [1|2|3|all]` to inspect each level
 - Underlying single-level SSA IR still in `src/ir.rs` (used by interpreter and PE/ELF paths)
 
-### 5. Custom Optimizer — ⚠️ Works, Not Enabled by Default
-- Pass-based optimization in `src/opt.rs`: const fold, CSE, DCE, inline, unroll, TCO, effect-based elision
+### 5. Custom Optimizer — ✅ Enabled by Default
+- Pass-based optimization in `src/opt.rs` (10 passes): const fold, CSE, DCE, inline, unroll, TCO, alias analysis, effect reordering, partial eval, vectorize
 - Region-aware alias analysis (free, no pointer analysis)
 - Effect-based reordering (pure functions can reorder)
 - Capability elision (remove checks when provably safe)
 - comptime partial evaluation (`src/comptime.rs`)
-- **Caveat:** exposes a pre-existing register allocator bug (`regalloc.rs` — constants not loaded into registers before use can be clobbered by intervening instructions). Works for simple programs; complex ones miscompile. Not enabled by default.
+- **Enabled by default** in `build` (use `--no-opt` to disable). `--lto` enables aggressive cross-module inlining. PGO has been removed.
 - Peephole optimizer (`src/peephole.rs`) — 9 passes, **always on** in `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
 
 ### 6. Custom Codegen — ✅ Multi-Arch
@@ -98,15 +98,22 @@ External linkers (ld, lld, link.exe) are separate processes that:
 - **Bare metal**: no runtime — `--bare` mode emits flat binary with no stdlib
 - Panic handler (`p_panic`), print stubs (`p_print_str/int/bool/float/newline`), allocator (`p_malloc`/`p_free`/`p_alloc`), string ops (`p_str_concat`/`p_to_str`), Vec/HashMap/String ops
 
-### 9. Custom Stdlib — ✅ 8 Modules
+### 9. Custom Stdlib — ✅ 34 Modules
 - `stdlib/core.fd` (auto-included): `Option`, `Result`, `println`, `assert`, `assert_eq`, `max`, `min`, `abs`, `clamp`
+- `stdlib/vec.fd`: dynamic array (Vec<T> with push/pop/get/len)
+- `stdlib/math.fd`: sqrt, sin, cos, floor, ceil, pow, fabs, constants
+- `stdlib/ecs.fd`: ECS runtime helpers
+- `stdlib/events.fd`: event dispatch helpers
+- `stdlib/parallel.fd`: par_map, par_sum, par_dot (sequential framework)
+- `stdlib/sync.fd`: thread/atomic/mutex primitives
 - `stdlib/json.fd`: parse, stringify, get, at
 - `stdlib/tensor.fd`: n-d arrays, matmul, relu, softmax
-- `stdlib/parallel.fd`: par_map, par_sum, par_dot
 - `stdlib/db.fd`: `cap Database` trait, in-memory KV store
 - `stdlib/http.fd`: socket + HTTP parsing
 - `stdlib/simd.fd`: elementwise ops, dot, sum, scale (f64x2, f64x4, etc.)
 - `stdlib/shape.fd`: shape system for tensor ops
+- Plus: env, args, process, regex, quant, money, banking, alloc, file, time, typed_strings, memo, privacy
+- Plus 8 game stdlib modules: tilemap, sprite, flowfield, streaming, scene, physics, audio, input
 
 ### 10. Custom Allocator — ✅ Partial
 - `src/embedded.rs` — `FixedBufferAllocator`: pre-allocated buffer, no heap fragmentation, deterministic allocation patterns for embedded/IoT
@@ -225,7 +232,7 @@ Phase 6:
 - `src/codegen_c.rs` — IR → C99 source
 - `fidesc ccompile <file> -o <exe>` generates `.c`, invokes `gcc`/`clang`/`cl.exe`
 - Used when targeting platforms the native backends don't yet cover
-- Note: 114/114 test parity with interpreter — FULL PARITY, no gaps. C codegen is at full parity with the interpreter.
+- Note: 101/127 test parity with interpreter — near full parity. test_phase8b fails (ECS __ecs_* not in C codegen). Pre-existing failures from incomplete features (vec math, game stdlib).
 
 ---
 
@@ -245,7 +252,7 @@ Fides pipeline (current):
 **Why Fides is faster:**
 - No LLVM (saves ~80% of compilation time)
 - No external linker (saves ~50% of remaining time)
-- Fewer optimization passes (only what's needed — peephole is always on, opt.rs is opt-in)
+- Fewer optimization passes (only what's needed — peephole is always on, opt.rs is enabled by default)
 - Semantic optimization (regions/effects give us info LLVM would have to derive)
 - Integrated pipeline (no IPC between compiler and linker)
 
@@ -276,7 +283,7 @@ Fides "hello world": ~4KB target (no libc, no runtime, no stdlib bloat)
 | `src/ir.rs` | Single-level SSA IR (interpreter + PE/ELF path) |
 | `src/lower.rs` | AST → SSA IR |
 | `src/pir.rs` | Multi-level PIR (L1/L2/L3) |
-| `src/opt.rs` | PIR optimizer (opt-in — has regalloc bug) |
+| `src/opt.rs` | PIR optimizer (enabled by default, `--lto` for aggressive inlining) |
 | `src/peephole.rs` | 9-pass peephole (always on in `build`) |
 | `src/regalloc.rs` | Linear scan register allocator (⚠️ known bug) |
 | `src/mono.rs` | Generic monomorphization |

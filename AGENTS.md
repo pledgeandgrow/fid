@@ -54,13 +54,28 @@ cargo build
 
 ```
 Unit tests:   136/136 passed
-Harness:      8/8 passed       (golden_files_match now passes)
-Interpreter:  99/99 normal     (+ 22/22 expected fail)
-C Codegen:    99/99 matched    (FULL PARITY — no gaps) (+ 22/22 expected fail)
-PE Emitter:   99/99 valid      (+ 22/22 expected fail: same as interpreter)
-Total .fd:    143 test files   (121 normal + 22 expected-fail)
-Skip list:    22 tests         (interpreter-only features: comptime, bare metal, WASM, SIMD, tensor, HTTP, JSON, dlopen, etc.)
+Harness:      7/8 passed       (safety_checks_panic_in_debug_mode fails — pre-existing: overflow checks always on, --release doesn't disable them)
+Interpreter:  102/127 normal   (+ 22/22 expected fail)
+C Codegen:    101/127 matched  (+ 22/22 expected fail)
+PE Emitter:   102/127 valid    (+ 22/22 expected fail)
+Total .fd:    149 test files   (127 normal + 22 expected-fail)
+Skip list:    22 tests         (features in skip list for fidesc test: comptime, bare metal, WASM, SIMD, tensor, HTTP, JSON, dlopen, parallel, etc. Note: many now work in C codegen but remain skipped for historical reasons)
 ```
+
+### New Features (Phase 8B)
+
+- **ECS (Entity-Component-System)**: `component Position { x: f64, y: f64 }` declares
+  a component (desugars to struct). `system MoveSystem(dt: f64) { query(Position, Velocity) { ... } }`
+  declares a system (desugars to function). `query(CompA, CompB) { body }` iterates
+  over entities with all listed components. ECS runtime: `__ecs_create_entity`,
+  `__ecs_entity_count`, `__ecs_has`, `__ecs_get`, `__ecs_add`, `__ecs_remove`.
+- **State Machines**: `state_machine PlayerState { state Idle { transition "move" to Moving } ... }`
+  desugars to an enum + `<SM>_initial()` and `<SM>_handle(state, event)` functions.
+- **Event Handlers**: `on player_died(name: str) { ... }` desugars to `__on_<event_name>` function.
+- **New keywords**: `component`, `system`, `query`, `state_machine`, `state`, `transition`, `on`.
+  Keywords used as identifiers (e.g. `database.query()`) are handled via `expect_ident_or_keyword()`.
+- **New stdlib modules**: `stdlib/ecs.fd`, `stdlib/events.fd`.
+- **New test**: `tests/test_phase8b.fd` — ECS, state machine, and event handler tests.
 
 ### New Features (Phase 7.7)
 
@@ -97,7 +112,7 @@ Skip list:    22 tests         (interpreter-only features: comptime, bare metal,
   - `stdlib/process.fd`: Process control (process_exit, process_system)
   - `stdlib/regex.fd`: Simple wildcard pattern matching (regex_matches, regex_find, etc.)
 
-Expected-fail tests (21):
+Expected-fail tests (22):
 test_trait_verify_fail, test_budget_fail, test_sandbox_fail,
 test_deterministic_fail, test_field_privacy_fail, test_money_linear_fail,
 test_money_conserve_fail, test_banking_double_credit_fail,
@@ -106,7 +121,11 @@ test_crashfree_fail, test_txn_rollback_fail, test_typed_strings_fail,
 test_init_guarantee_fail, test_init_guarantee_cond_fail,
 test_param_queries_fail, test_medical_fail, test_contracts_fail,
 test_safety_annotations_fail, test_safety_no_audit_fail,
-test_borrowck_fail
+test_borrowck_fail, test_async_fail
+
+Normal tests that fail (pre-existing, incomplete features):
+test_game_stdlib (all backends), test_phase8b (C codegen only),
+test_vec_math (all backends), test_vec_shape_fail (all backends)
 
 Features now present in the baseline: tuple destructuring, file I/O
 (`stdlib/file.fd`), `txn {}` blocks (with interpreter rollback), loop-aware linear types, `@gas`
@@ -122,13 +141,14 @@ bounds checking lock (F62: always on, skippable in `unsafe {}`),
 parameterized queries (F68: no string concat on typed strings),
 `@medical` annotation (F48: IEC 62304 — no alloc, no recursion, no while, must be @audit),
 given/ensure contracts (F10: Design by Contract — preconditions verified at call sites),
-composable safety primitives (F44/F52/F56: @no-alloc, @no-recursion, @no-unbounded, @no-panic,
-@no-indirect, @requires-audit — @safety-critical, @autosar, @dal-a are aliases that expand to these),
+composable safety primitives (F44/F52/F56: @no-alloc, @no-recursion, @no-unbounded, @crashfree,
+@no-indirect, @requires-audit — @safety-critical, @autosar, @medical are aliases that expand to these;
+@dal-a was merged into @medical, @no-panic is internal-only — users write @crashfree),
 async/await (Phase 7.6: `async pf`, `await <expr>`, `spawn <expr>` — Future<T> type with eager evaluation, typechecker enforces Future<T> for await, `p_future_ready`/`p_future_poll` runtime functions in interpreter + C codegen; state machine transform pending for true cooperative scheduling),
 borrow checker (Phases 1-6 complete: `--borrowck=off|warn|on` — Rules 1-3 active, field-wise borrows, two-phase borrows, NLL, `on` by default),
 generic enums/structs (`enum Option<T> { ... }`, `struct Foo<T> { ... }` — type_params in AST, parser, typechecker, lowerer),
 LSP server (`fidesc lsp` — JSON-RPC over stdio, initialize/didOpen/didChange/diagnostics, no external deps),
-new stdlib modules (`stdlib/math.fd`, `stdlib/env.fd`, `stdlib/args.fd`, `stdlib/process.fd`, `stdlib/regex.fd`).
+new stdlib modules (`stdlib/math.fd`, `stdlib/env.fd`, `stdlib/args.fd`, `stdlib/process.fd`, `stdlib/regex.fd`, `stdlib/sync.fd`, `stdlib/vec.fd`, `stdlib/ecs.fd`, `stdlib/events.fd`, `stdlib/parallel.fd`, plus game stdlib: `stdlib/tilemap.fd`, `stdlib/sprite.fd`, `stdlib/flowfield.fd`, `stdlib/streaming.fd`, `stdlib/scene.fd`, `stdlib/physics.fd`, `stdlib/audio.fd`, `stdlib/input.fd`).
 
 **Note:** `test_db` is no longer flaky — HashMap keys are now sorted in the interpreter for deterministic output.
 
@@ -142,19 +162,19 @@ touching them.
 
 | File | Risk | Why |
 |------|------|-----|
-| `src/regalloc.rs` | **CRITICAL** | Linear scan allocator. Has known pre-existing bug: constants not loaded into registers before use can be clobbered by intervening instructions. Any change here affects EVERY function. |
+| `src/regalloc.rs` | **CRITICAL** | Linear scan allocator (~1100 LOC). F-1A: constant rematerialization (`Location::Remat`). F-1D: effect-aware register allocation — calls to pure functions (in `L3Module.pure_functions`) only clobber RAX, not all caller-saved registers. I-2D: calls to `@no-alloc` functions (in `L3Module.no_alloc_functions`) also only clobber RAX. `@medical` functions included in no-alloc set. Any change here affects EVERY function. |
 | `src/peephole.rs` | **CRITICAL** | 9 passes, always on in `build`. A wrong transform silently corrupts all output. |
 | `src/elf64.rs` | **HIGH** | ELF64 header bytes, section layout, relocations (R_X86_64_PC32/PLT32/64). Off-by-one = corrupt binary. |
 | `src/pe.rs` | **HIGH** | PE header bytes, import table, section layout. Off-by-one = corrupt .exe. |
 | `src/coff.rs` | **HIGH** | COFF object file format. Same byte-level risk as PE/ELF. |
 | `src/macho.rs` | **HIGH** | Mach-O object file format. Same byte-level risk. |
 | `src/codegen_x64.rs` | **HIGH** | PIR L3 → x86-64 instruction encoding. ModRM/SIB bytes, REX prefixes, ABI rules. |
-| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 96/96 test parity (FULL PARITY). |
+| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 101/127 test parity (near full parity — test_phase8b fails: ECS __ecs_* not in C codegen). |
 | `src/pir.rs` | **HIGH** | PIR L1/L2/L3 transforms. A bad lowering propagates to all backends. |
 | `src/lower.rs` | **MEDIUM** | AST → SSA IR. Changes here affect interpreter + all backends. |
 | `src/typechecker.rs` | **MEDIUM** | Types + regions + effects + capabilities. Wrong rejection = broken code; wrong acceptance = silent miscompilation. |
 | `src/borrowck.rs` | **LOW** | Borrow checker (Phases 1-6 complete). Separate pass after typecheck. `--borrowck=on` by default; `off`/`warn` modes available. Field-wise borrows, two-phase borrows, NLL (non-lexical lifetimes via last-use analysis). |
-| `src/opt.rs` | **MEDIUM** | PIR optimizer. Optimizer bugs fixed (effect_reorder, inline, TCO, imul). `--opt` is now enabled by default in `build` (use `--no-opt` to disable). Produces matching output on all tests. |
+| `src/opt.rs` | **MEDIUM** | PIR optimizer. 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. 22 in default pass list (region-pool via `--region-pool`). `--opt` is enabled by default in `build` (use `--no-opt` to disable). `--lto` enables aggressive cross-module inlining (larger inline limits). PGO has been removed. Inline cost model (F-3F): cost = blocks×5 + insts, with `is_pure` (50% bonus), `is_crashfree` (25%), `is_deterministic` (10%), capped at 75%. Sandbox-aware inlining (I-3C): sandbox call sites use 6 blocks / 40 insts vs normal 3/20. Sandbox-aware devirt (I-3C): devirtualize DynCalls in sandbox blocks to pure impls. Region bulk free (I-1C): `pass_region_pool` emits `p_region_free` before returns. @crashfree code hoisting (I-4B): `pass_effect_optimize` hoists @crashfree + effectively-pure calls out of loops. @gas-guided unrolling (I-4C): `pass_unroll` uses max_unroll=64 when `gas_limit.is_some()` (vs normal 8). Annotations propagated: `is_wrapping`, `is_deterministic`, `is_crashfree`, `is_no_alloc`, `is_medical`, `gas_limit`. |
 | `src/runtime_linux.rs` | **HIGH** | Hand-encoded x86-64 machine code (raw bytes). No assembler — every byte is manual. |
 | `src/linker.rs` | **MEDIUM** | Relocation resolution. Wrong offset = crash or silent corruption. |
 | `src/interp.rs` | **LOW** | The reference oracle. If this is wrong, all backends "match" but produce wrong results. |
@@ -172,17 +192,17 @@ touching them.
 | `src/main.rs` | LOW | CLI dispatch — adding commands is safe. |
 | `src/compiler.rs` | LOW | Pipeline orchestration — changes are visible. |
 | `src/lsp.rs` | LOW | LSP server — JSON-RPC over stdio, no external deps. |
-| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. Stdlib modules: core, db, http, json, parallel, shape, simd, tensor, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, math, env, args, process, regex. |
+| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. 34 stdlib modules: core, vec, math, ecs, events, parallel, sync, db, http, json, shape, simd, tensor, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input. |
 
 ## Known Bugs (Do Not Re-Introduce)
 
-1. **Register allocator clobbering** (`regalloc.rs`): Constants not loaded into
-   registers before use can be clobbered by intervening instructions. The L2
-   optimizer's `effect_reorder` pass was fixed to respect memory dependencies
-   and keep terminators last, so `--opt` (now enabled by default) no longer
-   exposes this bug on the current test suite. However, the underlying regalloc
-   weakness may still surface with new code. Test with `--no-opt` when changing
-   regalloc to isolate issues.
+1. **Register allocator clobbering** (`regalloc.rs`): Previously, constants not
+   loaded into registers before use could be clobbered by intervening
+   instructions. **Fixed by F-1A (Constant Rematerialization):** constants are
+   now rematerialized at each use site via `Location::Remat(i64)` instead of
+   being spilled and reloaded. The L2 optimizer's `effect_reorder` pass was also
+   fixed to respect memory dependencies and keep terminators last. Test with
+   `--no-opt` when changing regalloc to isolate issues.
 
 2. **Debug `eprintln!` statements** in `compiler.rs` and `elf64.rs`: There are
    temporary debug prints (DBG ASM, DBG ALU) added during debugging sessions.
@@ -278,6 +298,29 @@ touching them.
 ./scripts/gen_golden.sh
 ```
 
+## CRITICAL RULES — NEVER DO THESE
+
+1. **NEVER run `git stash`.** This can lose the user's work. Ever. No exceptions.
+   If you need to compare against original code, use `git diff` or `git show`
+   on specific files — never stash the working tree.
+
+2. **NEVER run `git checkout` on files the user has modified.** This overwrites
+   their changes. Use `git diff` to see what changed instead.
+
+3. **NEVER run `git reset --hard` or `git clean`.** These are destructive and
+   will wipe uncommitted work.
+
+4. **NEVER force-push or rewrite git history.** No `git push --force`,
+   no `git rebase` that rewrites shared commits.
+
+5. **NEVER delete files you did not create.** If a file is in the way, ask the
+   user — don't `rm` it.
+
+6. **NEVER use `rm -rf` on project directories.** Ever.
+
+If you need to see the original state of a file, use `git show HEAD:<path>`
+or `git diff <path>` — these are read-only and safe.
+
 ## File Map (Quick Reference)
 
 | File | Role |
@@ -289,7 +332,7 @@ touching them.
 | `src/ir.rs` | Single-level SSA IR |
 | `src/lower.rs` | AST → SSA IR |
 | `src/pir.rs` | Multi-level PIR (L1/L2/L3) |
-| `src/opt.rs` | PIR optimizer (opt-in — has regalloc bug) |
+| `src/opt.rs` | PIR optimizer (enabled by default in `build`, `--lto` for aggressive inlining) |
 | `src/peephole.rs` | 9-pass peephole (always on in `build`) |
 | `src/regalloc.rs` | Linear scan register allocator (⚠️ known bug) |
 | `src/mono.rs` | Generic monomorphization |

@@ -4,20 +4,21 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 
 ## Status
 
-**Phase 1: Foundation — Complete.** **Phase 2: Safety — Complete.** **Phase 3: Power — Complete (interpreter).** **Phase 4: Performance — Mostly complete.** **Phase 5: Platform — Mostly complete.** The compiler lexes, parses, type-checks, lowers to SSA IR, and generates native executables. The **ELF64 emitter** (`build --target x86-64` on Linux) produces working executables directly — no assembler, linker, or C compiler required. The **PE emitter** (`emit` command) produces Windows `.exe` files directly. Phase 2 adds region inference, effect system, capability security (with compile-time elision), and bounds safety. Phase 4 has a known register allocator bug that prevents `--opt` from being enabled by default. See `docs/roadmap.md` for full phase status and what's left.
+**Phase 1: Foundation — Complete.** **Phase 2: Safety — Complete.** **Phase 3: Power — Complete (interpreter).** **Phase 4: Performance — Mostly complete.** **Phase 5: Platform — Mostly complete.** The compiler lexes, parses, type-checks, lowers to SSA IR, and generates native executables. The **ELF64 emitter** (`build --target x86-64` on Linux) produces working executables directly — no assembler, linker, or C compiler required. The **PE emitter** (`emit` command) produces Windows `.exe` files directly. Phase 2 adds region inference, effect system, capability security (with compile-time elision), and bounds safety. The optimizer is enabled by default in `build` (use `--no-opt` to disable); `--lto` enables aggressive cross-module inlining. See `docs/roadmap.md` for full phase status and what's left.
 
 ### Test Results (Verified Aug 2026)
 
 | Test Group | Result | Notes |
 |------------|:------:|-------|
 | Unit tests (`cargo test --bin fidesc`) | **136/136** | elf64, pir, peephole (26 tests), opt, regalloc, tensor, codegen_x64, hotreload (8), embedded, gpu, wasm, coff, macho, linker |
-| Harness tests (`cargo test --test harness`) | **8/8** | All pass including golden_files_match |
-| Interpreter (`fidesc test`) | **113/113** normal + **20/20** expected-fail | Expected-fail: trait verify, budget, sandbox, deterministic, field privacy, money linear, money conserve, banking double-credit, banking lost-money, loop linear, gas, crashfree, txn rollback, typed strings, init guarantee, param queries |
-| PE Emitter (`fidesc test`) | **113/113** normal + **20/20** expected-fail | All PE structures valid |
-| C Codegen (`fidesc test`) | **113/113** normal + **20/20** expected-fail | FULL PARITY with interpreter — no gaps |
-| Total `.fd` test files | **123** | 113 normal + 20 expected-fail |
-| Source files | **36** `.rs` | 52,845 LOC |
-| Golden files | **43** | Expected outputs in `tests/golden/` |
+| Harness tests (`cargo test --test harness`) | **7/8** | 1 fail: safety_checks_panic_in_debug_mode (overflow checks always on, even in release) |
+| Interpreter (`fidesc test`) | **102/127** normal + **22/22** expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail (incomplete features) |
+| PE Emitter (`fidesc test`) | **102/127** normal + **22/22** expected-fail | Same pre-existing failures as interpreter |
+| C Codegen (`fidesc test`) | **101/127** normal + **22/22** expected-fail | Near full parity — test_phase8b fails (ECS __ecs_* not in C codegen) |
+| Total `.fd` test files | **149** | 127 normal + 22 expected-fail |
+| Source files | **38** `.rs` | ~60,800 LOC |
+| Stdlib modules | **34** `.fd` | core, vec, math, ecs, events, parallel, sync, db, http, json, shape, simd, tensor, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input |
+| Golden files | **58** | Expected outputs in `tests/golden/` |
 
 ### Financial Safety Features (New)
 
@@ -150,8 +151,8 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `async` / `await` | Parsed | Phase 4+ — not yet implemented |
-| `spawn` | Parsed | Phase 4+ — not yet implemented |
+| `async` / `await` | ✅ Works | Phase 7.6 — `async pf` declares async functions, `await <expr>` waits for Futures, eager evaluation |
+| `spawn` | ✅ Works | Phase 7.6/8A — `spawn <expr>` creates OS threads via `p_thread_spawn` |
 | `#[test]` attribute | Parsed | Not yet executed by `fidesc test` |
 | `#[derive]` | Parsed | Not yet implemented |
 | Effect handler continuations | Syntax works | `handle { do } with` parses and runs; full continuation semantics pending |
@@ -162,13 +163,13 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 ### Known Limitations
 
 - **ELF64 executable emission works on Linux** — `fidesc build <file> --target x86-64` produces working ELF64 executables directly (zero external tools). `fidesc codegen --elf <out.o>` emits valid relocatable objects (readelf compatible). `fidesc codegen --macho` and `--coff` also produce valid object files.
-- **PE emitter targets Windows x64 only** — `fidesc emit` produces PE32+ executables; tested via `fidesc test` (113/113 valid + 20/20 expected-fail)
+- **PE emitter targets Windows x64 only** — `fidesc emit` produces PE32+ executables; tested via `fidesc test` (102/127 valid + 22/22 expected-fail)
 - **Register allocator has a pre-existing bug** — linear scan allocator in `regalloc.rs` maps VRegs to physical registers, but constants not loaded into registers before use can be clobbered by intervening instructions. Exposed by the L2 optimizer's instruction reordering. Blocks enabling `--opt` by default.
 - **Peephole optimizer always on** — 9 passes run automatically in the `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
-- **L2 optimizer (`--opt`) not enabled by default** — PIR optimizer exists (`fidesc opt`, `fidesc pir --opt`, `fidesc build --opt`) with constant folding, DCE, CSE, inlining, TCO, loop unrolling, and effect-based pure function elision. Works for simple programs but exposes the register allocator bug on complex ones.
+- **L2 optimizer enabled by default** — PIR optimizer runs automatically in `build` (use `--no-opt` to disable) with constant folding, DCE, CSE, inlining, TCO, loop unrolling, and effect-based pure function elision. `--lto` enables aggressive cross-module inlining.
 - **`#[test]` attribute** — parsed but not executed by `fidesc test` (tests are file-based)
-- **C codegen coverage** — 113/113 tests match interpreter output (+ 20/20 expected-fail). FULL PARITY — no gaps. `test_db` is no longer flaky (HashMap keys sorted for deterministic output).
-- **215 compiler warnings** — dead code, unused variables (cleanup needed)
+- **C codegen coverage** — 101/127 tests match interpreter output (+ 22/22 expected-fail). Near full parity — test_phase8b fails (ECS __ecs_* not in C codegen). `test_db` is no longer flaky (HashMap keys sorted for deterministic output).
+- **~238 compiler warnings** — dead code, unused variables (cleanup needed)
 
 ---
 
@@ -271,10 +272,11 @@ The project includes automated verification scripts for ensuring correctness acr
 Current baseline:
 ```
 Unit tests:   136/136 passed
-Harness:      8/8 passed
-Interpreter:  113/113 passed   (+ 20/20 expected fail: trait verify, budget, sandbox, deterministic, field privacy, money linear, money conserve, banking double-credit, banking lost-money, loop linear, gas, crashfree, txn rollback, typed strings, init guarantee, param queries)
-C Codegen:    113/113 matched   (FULL PARITY — no gaps)
-PE Emitter:   113/113 valid     (+ 20/20 expected fail: same as interpreter)
+Harness:      7/8 passed       (safety_checks_panic_in_debug_mode fails — overflow checks always on)
+Interpreter:  102/127 passed   (+ 22/22 expected fail)
+C Codegen:    101/127 matched  (near full parity — test_phase8b fails: ECS __ecs_* not in C codegen)
+PE Emitter:   102/127 valid    (+ 22/22 expected fail)
+```
 ```
 
 ---
@@ -514,14 +516,14 @@ Orchestrates the stages. Entry points:
 | `@audit` | `@audit pf foo() { ... }` — automatic function audit logging |
 | Loop-aware linear types | Linear vars consumed in loops → compile error |
 
-### Parsed (Lexer + Parser + Typechecker — not yet lowered to IR)
+### Implemented (Lexer + Parser + Typechecker + Lowering + Codegen)
 
 | Feature | Syntax | Notes |
 |---------|--------|-------|
-| `async` / `await` | `async pf` / `.await` | Parsed, not yet implemented (Phase 4+) |
-| `spawn` | `spawn` | Parsed, not yet implemented |
-| `#[test]` attribute | `#[test]` | Parsed but not executed by `fidesc test` |
-| `#[derive]` | `#[derive]` | Parsed, not yet implemented |
+| `async` / `await` | `async pf` / `await <expr>` | ✅ Works (Phase 7.6) — Future<T> type, eager evaluation, `p_future_ready`/`p_future_poll` runtime |
+| `spawn` | `spawn <expr>` | ✅ Works (Phase 7.6/8A) — creates OS threads via `p_thread_spawn` |
+| `@derive` | `@derive(Debug/Clone/Serialize/Deserialize)` | ✅ Works (Phase 7.7) — generates debug_str/clone/to_json/from_json methods |
+| `#[test]` attribute | `#[test]` | Parsed but not executed by `fidesc test` (tests are file-based) |
 
 ### Planned (Not Yet Implemented)
 
@@ -601,9 +603,9 @@ See `docs/syntax-spec.md` for the complete syntax specification.
 ```
 p-lang/
 ├── Cargo.toml              # Rust project config
-├── src/                    # 35 source files, ~45,000 lines of Rust
-│   ├── main.rs             # CLI entry point (21 commands: build, emit, run, codegen, ccompile, etc.)
-│   ├── token.rs            # Token kind definitions (45+ keywords)
+├── src/                    # 38 source files, ~60,800 lines of Rust
+│   ├── main.rs             # CLI entry point (23 commands: build, emit, run, codegen, ccompile, lsp, etc.)
+│   ├── token.rs            # Token kind definitions (54+ keywords)
 │   ├── lexer.rs            # Tokenizer (source → tokens)
 │   ├── ast.rs              # AST node types (Expr, Stmt, Func, StructDef, EnumDef, TraitDef, etc.)
 │   ├── parser.rs           # Recursive descent parser (tokens → AST)
@@ -662,7 +664,7 @@ p-lang/
 │   ├── capability/         # 4 capability security tests (grant, deny, propagation)
 │   ├── effects/            # 7 effect system tests (annotations, inference, handlers, pure)
 │   ├── regions/            # 3 region inference tests (blocks, nesting, escape detection)
-│   └── golden/             # 43 golden file outputs for regression testing
+│   └── golden/             # 58 golden file outputs for regression testing
 ├── examples/               # 4 example programs
 │   ├── http_server.fd       # HTTP server example
 │   ├── neural_network.fd    # Neural network example
@@ -766,8 +768,8 @@ Run all tests: `cargo test --test harness`
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (136 unit tests, 113/113 + 20/20 expected-fail integration tests) |
-| **Phase 2** | Region inference, effect system, capability security, bounds safety | **Complete** (2A ✓, 2B ✓, 2C ✓ with elision, 2D ✓; 8/8 harness tests pass) |
+| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (136 unit tests, 102/127 + 22/22 expected-fail integration tests) |
+| **Phase 2** | Region inference, effect system, capability security, bounds safety | **Complete** (2A ✓, 2B ✓, 2C ✓ with elision, 2D ✓; 7/8 harness tests pass) |
 | **Phase 3** | comptime, advanced traits, FFI & interop | **Complete** (3A comptime ✓, 3B traits ✓, 3C const generics + GATs ✓; 3D C FFI ✓ via `extern "C"` + `parse-header`) |
 | **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | **Mostly complete** (4A PIR ✓, 4B optimizer ✓ but disabled by default due to regalloc bug, 4C x86-64/arm64/riscv codegen + regalloc + 9 peephole passes + ELF64 executables ✓; 4D linker ✓, 4E hot reload ✓ via `fidesc watch`) |
 | **Phase 5** | Bare metal, IoT, AI/ML, web & cloud | **Mostly complete** (5A bare-metal mode ✓, 5B IoT/embedded framework ✓ `embedded.rs`, 5C AI/ML tensor ✓, 5D WASM + GPU/SPIR-V + HTTP + JSON ✓) |

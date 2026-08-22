@@ -5,8 +5,8 @@ results from different backends are never confounded.
 
 ## Test Corpus
 
-All batches use the same corpus: every `.fd` file in `tests/` (79 files as of
-this writing).  Tests are sorted alphabetically by filename.
+All batches use the same corpus: every `.fd` file in `tests/` (149 files as of
+this writing: 127 normal + 22 expected-fail).  Tests are sorted alphabetically by filename.
 
 ## Batches
 
@@ -18,7 +18,7 @@ this writing).  Tests are sorted alphabetically by filename.
 | Pass criterion | No panic on stderr; exit code may be non-zero |
 | What it exercises | AST → IR → tree-walking interpreter |
 | Run by | `fidesc test` (built-in) |
-| Current score | 114/114 + 21/21 expected-fail |
+| Current score | 102/127 + 22/22 expected-fail |
 
 The interpreter is the reference implementation.  A test "passes" if the
 interpreter does not panic or emit a compilation error.  Non-zero exit codes
@@ -34,12 +34,12 @@ tests (correctly rejected at compile time).
 | Pass criterion | stdout matches interpreter stdout exactly |
 | What it exercises | AST → IR → C source transpilation → external gcc |
 | Run by | `fidesc test` (built-in) |
-| Current score | 114/114 + 21/21 expected-fail (FULL PARITY) |
+| Current score | 101/127 + 22/22 expected-fail (near full parity — test_phase8b fails: ECS __ecs_* not in C codegen) |
 
 C codegen transpiles the Fides IR to C source code and compiles it with the
 system C compiler (gcc/clang).  A test "passes" only if the executable's
-stdout exactly matches the interpreter's stdout. C codegen is now at FULL
-PARITY with the interpreter — no gaps.
+stdout exactly matches the interpreter's stdout. C codegen is at near full
+parity with the interpreter — test_phase8b fails (ECS __ecs_* not in C codegen).
 
 ### Batch 3 — PE Emitter (`fidesc emit`)
 
@@ -49,7 +49,7 @@ PARITY with the interpreter — no gaps.
 | Pass criterion | Emission succeeds and output file exists |
 | What it exercises | AST → IR → PE bytecode emitter |
 | Run by | `fidesc test` (built-in) |
-| Current score | 114/114 + 21/21 expected-fail |
+| Current score | 102/127 + 22/22 expected-fail |
 
 The PE (Portable Executable) emitter produces a standalone native x86-64
 executable. A test "passes" if emission succeeds and the output file is
@@ -64,7 +64,7 @@ cannot run on Linux without Wine).
 | Pass criterion | stdout matches interpreter stdout exactly |
 | What it exercises | PIR → L2 → L3 → x86-64 asm → ELF object → linker → native exe |
 | Run by | Custom script (`/tmp/test_native.sh`) — **not** `fidesc test` |
-| Current score | 63/66 (3 mismatches: test_collections, test_db, test_matrix_mul — pre-existing native codegen bugs) |
+| Current score | All tested programs match interpreter (test_collections, test_db, test_matrix_mul all FIXED) |
 
 The native x86-64 backend is a self-contained toolchain: it generates x86-64
 assembly, encodes it into an ELF relocatable object, and links it with a
@@ -128,10 +128,10 @@ echo "=== Results: $pass pass, $fail fail ==="
 
 | Batch | Backend | Score | Notes |
 |-------|---------|-------|-------|
-| 1 | Interpreter | 114/114 + 21/21 expected-fail | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` correctly fail (expected) |
-| 2 | C Codegen | 114/114 + 21/21 expected-fail | FULL PARITY — no gaps. test_db no longer flaky (HashMap keys sorted). |
-| 3 | PE Emitter | 114/114 + 21/21 expected-fail | `test_trait_verify_fail`, `test_budget_fail`, `test_sandbox_fail` correctly fail (expected) |
-| 4 | Native x86-64 | 63/66 | 3 mismatches: test_collections, test_db, test_matrix_mul — pre-existing native codegen bugs |
+| 1 | Interpreter | 102/127 + 22/22 expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
+| 2 | C Codegen | 101/127 + 22/22 expected-fail | Near full parity — test_phase8b fails (ECS __ecs_* not in C codegen). test_db no longer flaky. |
+| 3 | PE Emitter | 102/127 + 22/22 expected-fail | Same pre-existing failures as interpreter |
+| 4 | Native x86-64 | All tested programs match | test_collections, test_db, test_matrix_mul all FIXED (was 63/66) |
 
 ## Important Notes
 

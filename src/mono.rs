@@ -575,6 +575,11 @@ fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, met
             loss: subst_expr(loss, subst, renames, method_renames),
             line: *line,
         },
+        Stmt::Query { components, body, line } => Stmt::Query {
+            components: components.clone(),
+            body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
+            line: *line,
+        },
     }
 }
 
@@ -769,6 +774,10 @@ pub fn monomorphize(program: &Program) -> Program {
         extern_decls: program.extern_decls.clone(),
         layers: program.layers.clone(),
         models: program.models.clone(),
+        components: program.components.clone(),
+        systems: program.systems.clone(),
+        state_machines: program.state_machines.clone(),
+        event_handlers: program.event_handlers.clone(),
     }
 }
 
@@ -1157,6 +1166,11 @@ fn collect_generic_calls_stmt_with_hint(
         }
         Stmt::Backward { loss, .. } => {
             collect_generic_calls_expr_with_hint(loss, generics, generic_methods, calls, method_calls, current_func, None);
+        }
+        Stmt::Query { body, .. } => {
+            for s in body {
+                collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
+            }
         }
     }
 }

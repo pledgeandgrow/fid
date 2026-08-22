@@ -62,6 +62,13 @@ pub enum TokenKind {
     Backward,    // backward — trigger reverse-mode AD
     Kernel,      // kernel — GPU kernel keyword (used with @)
 
+    // Phase 8B: Game architecture keywords
+    Component,   // component — ECS component declaration (F18)
+    System,      // system — ECS system declaration (F18)
+    Query,       // query — ECS query expression (F18)
+    State,       // state — state machine declaration (F19)
+    On,          // on — event handler declaration (F20)
+
     // Types
     I8,
     I16,
@@ -212,6 +219,11 @@ impl fmt::Display for TokenKind {
             TokenKind::Is => write!(f, "is"),
             TokenKind::True => write!(f, "true"),
             TokenKind::False => write!(f, "false"),
+            TokenKind::Component => write!(f, "component"),
+            TokenKind::System => write!(f, "system"),
+            TokenKind::Query => write!(f, "query"),
+            TokenKind::State => write!(f, "state"),
+            TokenKind::On => write!(f, "on"),
             TokenKind::IntLit(n) => write!(f, "{}", n),
             TokenKind::StringLit(s) => write!(f, "\"{}\"", s),
             TokenKind::Ident(s) => write!(f, "{}", s),

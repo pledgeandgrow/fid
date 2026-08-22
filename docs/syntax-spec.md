@@ -93,8 +93,8 @@ true        false       none        some        ok          err
 | `interrupt` | Interrupt handler (bare-metal) |
 | `comptime` | Compile-time code execution |
 | `defer` | Deferred cleanup (Go-style) |
-| `spawn` | Spawn concurrent task (parsed, not yet implemented) |
-| `async` / `await` | Async functions (parsed, not yet implemented) |
+| `spawn` | Spawn concurrent task (✅ implemented — OS thread model) |
+| `async` / `await` | Async functions (✅ implemented — eager evaluation, OS thread model; state machine transform pending) |
 | `try` | Try blocks for error handling |
 
 ### 2.2 Operators
@@ -1215,7 +1215,7 @@ comptime {
 
 ## 15. Attributes
 
-> **Implementation status:** Attributes are parsed by the compiler. `#[test]` is parsed but **not executed** by `fidesc test` (❌). `#[derive]` is **not yet implemented** (❌). Other attributes shown below are the planned syntax.
+> **Implementation status:** Attributes are parsed by the compiler. `#[test]` is parsed but **not executed** by `fidesc test` (❌). `@derive(Debug/Clone/Serialize/Deserialize)` is ✅ implemented (Phase 7.7). Other attributes shown below are the planned syntax.
 
 ```fides
 // Standard attributes
@@ -1242,11 +1242,11 @@ struct Config { /* ... */ }
 
 ---
 
-## 16. Concurrency (❌ Parsed Only — Phase 4+)
+## 16. Concurrency (✅ Implemented — Phase 7.6)
 
-> **Implementation status:** `async`, `await`, and `spawn` are **parsed by the compiler but not yet implemented**. The syntax below is the planned design. Effect annotations (`!Spawn`, `!Async`) and effect inference are ✅ working, but the runtime execution of async tasks and spawned threads is not yet functional.
+> **Implementation status:** `async`, `await`, and `spawn` are ✅ implemented (eager evaluation, OS thread model). `async pf` declares an async function, `await <expr>` waits for a Future, `spawn <expr>` creates a new thread. State machine transform for true cooperative scheduling is pending. Effect annotations (`!Spawn`, `!Async`) and effect inference are ✅ working.
 
-### 16.1 Async / Await (❌ Planned)
+### 16.1 Async / Await (✅ Implemented)
 
 ```fides
 // Async function

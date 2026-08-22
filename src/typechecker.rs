@@ -392,12 +392,10 @@ impl TypeChecker {
         // Verify @gas annotation constraints
         self.verify_gas(program);
 
-        // Verify @crashfree annotation constraints
-        self.verify_crashfree(program);
-
         // Verify safety primitives and domain presets (F48/F44/F52/F56)
-        // @medical, @safety-critical, @autosar, @dal-a are all aliases that
+        // @crashfree, @medical, @safety-critical, @autosar are all aliases that
         // expand to composable primitives: @no-alloc, @no-recursion, etc.
+        // @crashfree = no-panic + no-unbounded (replaces the old verify_crashfree)
         self.verify_safety_annotations(program);
 
         // Verify given/ensure contracts (F10: Design by Contract)
@@ -906,195 +904,38 @@ impl TypeChecker {
         }
     }
 
-    /// Verify @crashfree annotation constraints.
-    ///
-    /// A @crashfree function is proven to never panic at runtime. The compiler
-    /// rejects patterns that can crash:
-    ///   1. `unwrap()` on Option/Result — calls p_panic on None/Err
-    ///   2. `p_panic()` — explicit panic
-    ///   3. Division `/` or modulo `%` — division by zero aborts
-    ///      (unless divisor is a non-zero constant)
-    ///   4. `while` loops without a bound — can hang or overflow stack
-    ///      (for loops over finite ranges/arrays are safe)
-    ///   5. Calling non-@crashfree functions — transitive crash risk
-    ///
-    /// This is the SPARK Ada "proof of absence of run-time errors" model,
-    /// but as a simple pattern-based check rather than full formal proof.
-    ///
-    /// Primary use case: aerospace (DO-178C), medical (IEC 62304), automotive
-    /// (ISO 26262) — any domain where a crash = catastrophic failure.
-    fn verify_crashfree(&mut self, program: &Program) {
-        // Collect all @crashfree function names (free functions + methods)
-        let mut crashfree_funcs: HashSet<String> = HashSet::new();
-        for func in &program.funcs {
-            if func.annotations.iter().any(|a| a.name == "crashfree") {
-                crashfree_funcs.insert(func.name.clone());
-            }
-        }
-        for imp in &program.impls {
-            for method in &imp.methods {
-                if method.annotations.iter().any(|a| a.name == "crashfree") {
-                    crashfree_funcs.insert(format!("{}_{}", imp.struct_name, method.name));
-                }
-            }
-        }
-        for ti in &program.trait_impls {
-            for method in &ti.methods {
-                if method.annotations.iter().any(|a| a.name == "crashfree") {
-                    crashfree_funcs.insert(format!("{}_{}", ti.type_name, method.name));
-                }
-            }
-        }
-
-        // Functions that are known to panic (stdlib)
-        let panic_funcs: &[&str] = &["p_panic", "Option_unwrap", "Result_unwrap"];
-        // Method names that panic (called as Type::unwrap)
-        let panic_methods: &[&str] = &["unwrap"];
-
-        // Check each @crashfree function
-        let check_body = |stmts: &[Stmt], func_name: &str, crashfree_funcs: &HashSet<String>| -> Vec<String> {
-            let mut errs = Vec::new();
-            let mut calls = HashSet::new();
-            scan_stmts_for_calls(stmts, &mut calls);
-
-            // 1. Check called functions for panic risk
-            for called in &calls {
-                // Direct panic functions
-                if panic_funcs.contains(&called.as_str()) {
-                    errs.push(format!(
-                        "Crashfree error: function '{}' is @crashfree but calls '{}'.\n\
-                         \x20\x20\x20\x20'{}' can panic at runtime — @crashfree functions must never panic.\n\
-                         \x20\x20\x20\x20Fix: use match/unwrap_or instead of unwrap, or remove @crashfree.",
-                        func_name, called, called
-                    ));
-                    continue;
-                }
-                // Method calls that panic (unwrap on Option/Result)
-                if panic_methods.iter().any(|m| called == m || called.ends_with(&format!("_{}", m))) {
-                    if called == "unwrap" {
-                        errs.push(format!(
-                            "Crashfree error: function '{}' is @crashfree but calls 'unwrap'.\n\
-                             \x20\x20\x20\x20unwrap() panics on None/Err — @crashfree functions must never panic.\n\
-                             \x20\x20\x20\x20Fix: use match, unwrap_or, or the ? operator instead.",
-                            func_name
-                        ));
-                    }
-                    continue;
-                }
-                // Skip built-in runtime functions (p_print_*, p_malloc, etc. — these don't panic)
-                if called.starts_with("p_") && !panic_funcs.contains(&called.as_str()) {
-                    continue;
-                }
-                // Skip print/println
-                if matches!(called.as_str(), "print" | "println" | "print_str" | "print_nl" | "print_int") {
-                    continue;
-                }
-                // Skip unknown functions (might be builtins we don't track)
-                if !self.funcs.contains_key(called) {
-                    continue;
-                }
-                // Check transitive: can only call other @crashfree functions
-                if !crashfree_funcs.contains(called) {
-                    errs.push(format!(
-                        "Crashfree error: function '{}' is @crashfree but calls '{}',\n\
-                         \x20\x20\x20\x20which is not @crashfree.\n\
-                         \x20\x20\x20\x20A @crashfree function can only call other @crashfree functions —\n\
-                         \x20\x20\x20\x20otherwise the callee could panic.\n\
-                         \x20\x20\x20\x20Fix: add @crashfree to '{}', or remove the call from '{}'.",
-                        func_name, called, called, func_name
-                    ));
-                }
-            }
-
-            // 2. Check for division/modulo (division by zero risk)
-            let mut div_sites = Vec::new();
-            scan_for_division(stmts, &mut div_sites);
-            for (line, op) in div_sites {
-                errs.push(format!(
-                    "Crashfree error (line {}): function '{}' is @crashfree but uses '{}'.\n\
-                     \x20\x20\x20\x20Division/modulo by zero aborts at runtime.\n\
-                     \x20\x20\x20\x20@crashfree functions cannot use '{}' unless the divisor is proven non-zero.\n\
-                     \x20\x20\x20\x20Fix: use a checked-divide helper, or remove @crashfree.",
-                    line, func_name, op, op
-                ));
-            }
-
-            // 3. Check for unbounded while loops
-            let mut while_sites = Vec::new();
-            scan_for_while_loops(stmts, &mut while_sites);
-            for line in while_sites {
-                errs.push(format!(
-                    "Crashfree error (line {}): function '{}' is @crashfree but uses a 'while' loop.\n\
-                     \x20\x20\x20\x20While loops can be unbounded — potential infinite loop or stack overflow.\n\
-                     \x20\x20\x20\x20@crashfree functions must use 'for' loops over finite ranges/arrays instead.\n\
-                     \x20\x20\x20\x20Fix: replace 'while cond {{ ... }}' with 'for i in 0..N {{ ... }}',\n\
-                     \x20\x20\x20\x20or remove @crashfree.",
-                    line, func_name
-                ));
-            }
-
-            errs
-        };
-
-        // Check free functions
-        for func in &program.funcs {
-            if !func.annotations.iter().any(|a| a.name == "crashfree") { continue; }
-            for err in check_body(&func.body, &func.name, &crashfree_funcs) {
-                self.errors.push(err);
-            }
-        }
-        // Check impl methods
-        for imp in &program.impls {
-            for method in &imp.methods {
-                if !method.annotations.iter().any(|a| a.name == "crashfree") { continue; }
-                let qualified = format!("{}_{}", imp.struct_name, method.name);
-                for err in check_body(&method.body, &qualified, &crashfree_funcs) {
-                    self.errors.push(err);
-                }
-            }
-        }
-        // Check trait impl methods
-        for ti in &program.trait_impls {
-            for method in &ti.methods {
-                if !method.annotations.iter().any(|a| a.name == "crashfree") { continue; }
-                let qualified = format!("{}_{}", ti.type_name, method.name);
-                for err in check_body(&method.body, &qualified, &crashfree_funcs) {
-                    self.errors.push(err);
-                }
-            }
-        }
-    }
-
     /// Verify safety annotation constraints using composable primitives.
     ///
     /// Instead of having separate verify_* functions for each domain annotation
-    /// (@medical, @safety-critical, @autosar, @dal-a, etc.), we implement 7 core
-    /// safety primitives and domain annotations as aliases that expand to them.
+    /// (@medical, @safety-critical, @autosar, @crashfree, etc.), we implement
+    /// core safety primitives and domain annotations as aliases that expand to them.
     ///
-    /// Core primitives (compiler enforces these directly):
+    /// Core primitives (compiler enforces these directly, but @no-panic is
+    /// internal-only — users write @crashfree instead):
     ///   @no-alloc       — no dynamic allocation (p_vec_new, p_malloc, etc.)
     ///   @no-recursion   — no direct or indirect self-calls
     ///   @no-unbounded   — no while loops, only for with bounded ranges
-    ///   @no-panic       — no unwrap, p_panic, non-const div/mod (= @crashfree)
     ///   @no-indirect    — no function pointers, no dynamic dispatch
     ///   @requires-audit — must have @audit
     ///   @bounded-stack  — static call depth analysis (TODO: full impl)
     ///
     /// Domain presets (aliases that expand to primitives):
-    ///   @medical         = @no-alloc + @no-recursion + @no-unbounded + @no-panic + @requires-audit
-    ///   @safety-critical = @no-alloc + @no-recursion + @no-unbounded + @no-panic + @no-indirect
-    ///   @autosar         = @no-alloc + @no-recursion + @no-unbounded + @no-panic
-    ///   @dal-a           = @no-alloc + @no-recursion + @no-unbounded + @no-panic + @requires-audit
+    ///   @crashfree       = no-panic + no-unbounded  (no unwrap, no div/mod, no while)
+    ///   @medical         = @no-alloc + @no-recursion + @crashfree + @requires-audit
+    ///   @safety-critical = @no-alloc + @no-recursion + @crashfree + @no-indirect
+    ///   @autosar         = @no-alloc + @no-recursion + @crashfree
     ///
     /// Users can also compose custom safety profiles:
     ///   @no-alloc @no-recursion pf foo() { ... }
     fn verify_safety_annotations(&mut self, program: &Program) {
         // Domain preset → list of primitives (static for lifetime safety)
+        // @dal-a was merged into @medical (identical expansion).
+        // @no-panic is internal-only — users write @crashfree.
         static DOMAIN_PRESETS: &[(&str, &[&str])] = &[
+            ("crashfree", &["no-panic", "no-unbounded"]),
             ("medical", &["no-alloc", "no-recursion", "no-unbounded", "no-panic", "requires-audit"]),
             ("safety-critical", &["no-alloc", "no-recursion", "no-unbounded", "no-panic", "no-indirect"]),
             ("autosar", &["no-alloc", "no-recursion", "no-unbounded", "no-panic"]),
-            ("dal-a", &["no-alloc", "no-recursion", "no-unbounded", "no-panic", "requires-audit"]),
         ];
 
         // Collect all functions and their expanded primitive set
@@ -1105,11 +946,13 @@ impl TypeChecker {
             let mut primitives: HashSet<&'static str> = HashSet::new();
             for ann in annotations {
                 // Direct primitives — use static string literals
+                // Note: @no-panic is NOT user-facing — users write @crashfree
+                // (which expands to no-panic + no-unbounded). The "no-panic"
+                // primitive only appears via preset expansion.
                 match ann.name.as_str() {
                     "no-alloc" => { primitives.insert("no-alloc"); }
                     "no-recursion" => { primitives.insert("no-recursion"); }
                     "no-unbounded" => { primitives.insert("no-unbounded"); }
-                    "no-panic" => { primitives.insert("no-panic"); }
                     "no-indirect" => { primitives.insert("no-indirect"); }
                     "requires-audit" => { primitives.insert("requires-audit"); }
                     "bounded-stack" => { primitives.insert("bounded-stack"); }
@@ -1176,9 +1019,11 @@ impl TypeChecker {
             if prims.contains("requires-audit") && prims.contains("no-indirect") {
                 "safety-critical (ISO 26262 / DO-178C)"
             } else if prims.contains("requires-audit") {
-                "medical (IEC 62304) / dal-a (DAL-A)"
+                "medical (IEC 62304 / DAL-A)"
             } else if prims.contains("no-indirect") {
                 "safety-critical"
+            } else if prims.contains("no-panic") && prims.len() == 2 && prims.contains("no-unbounded") {
+                "crashfree"
             } else {
                 "safety-annotated"
             }
@@ -1217,12 +1062,12 @@ impl TypeChecker {
                     }
                 }
 
-                // @no-panic: check for panic risk
+                // no-panic primitive: check for panic risk (user-facing: @crashfree)
                 if prims.contains("no-panic") {
                     if panic_funcs.contains(&called.as_str()) {
                         errs.push(format!(
-                            "Safety error ({}): function '{}' is @no-panic but calls '{}'.\n\
-                             \x20\x20\x20\x20'{}' can panic — safety-critical functions must never panic.\n\
+                            "Safety error ({}): function '{}' calls '{}', which can panic.\n\
+                             \x20\x20\x20\x20'{}' can panic at runtime — crashfree functions must never panic.\n\
                              \x20\x20\x20\x20Fix: use match/unwrap_or instead of unwrap, or remove the safety annotation.",
                             label, func_name, called, called
                         ));
@@ -1230,8 +1075,8 @@ impl TypeChecker {
                     }
                     if called == "unwrap" {
                         errs.push(format!(
-                            "Safety error ({}): function '{}' is @no-panic but calls 'unwrap'.\n\
-                             \x20\x20\x20\x20unwrap() panics on None/Err — safety-critical functions must never panic.\n\
+                            "Safety error ({}): function '{}' calls 'unwrap'.\n\
+                             \x20\x20\x20\x20unwrap() panics on None/Err — crashfree functions must never panic.\n\
                              \x20\x20\x20\x20Fix: use match, unwrap_or, or the ? operator instead.",
                             label, func_name
                         ));
@@ -1306,6 +1151,23 @@ impl TypeChecker {
                          \x20\x20\x20\x20otherwise the callee could allocate, recurse, or panic.\n\
                          \x20\x20\x20\x20Fix: add safety annotations to '{}', or remove the call from '{}'.",
                         label, func_name, called, called, func_name
+                    ));
+                }
+            }
+
+            // no-panic primitive: check for division/modulo (division by zero risk)
+            // Moved here from verify_crashfree — @crashfree expands to no-panic,
+            // so this check now runs for all no-panic functions.
+            if prims.contains("no-panic") {
+                let mut div_sites = Vec::new();
+                scan_for_division(stmts, &mut div_sites);
+                for (line, op) in div_sites {
+                    errs.push(format!(
+                        "Safety error ({}) (line {}): function '{}' uses '{}'.\n\
+                         \x20\x20\x20\x20Division/modulo by zero aborts at runtime.\n\
+                         \x20\x20\x20\x20Crashfree functions cannot use '{}' unless the divisor is proven non-zero.\n\
+                         \x20\x20\x20\x20Fix: use a checked-divide helper, or remove the safety annotation.",
+                        label, line, func_name, op, op
                     ));
                 }
             }
@@ -2338,6 +2200,7 @@ impl TypeChecker {
                     Type::Generic { name, args } if name == "Vec" => {
                         args.first().cloned().unwrap_or(Type::I64)
                     }
+                    Type::Named(name) if name == "Vec" => Type::I64,
                     Type::Generic { name, args } if name == "HashMap" => {
                         // for k in map → iterate over keys (type K)
                         args.first().cloned().unwrap_or(Type::Str)
@@ -2572,6 +2435,13 @@ impl TypeChecker {
                         loss_ty
                     ));
                 }
+            }
+            Stmt::Query { body, .. } => {
+                self.push_scope();
+                for s in body {
+                    self.check_stmt(s);
+                }
+                self.pop_scope();
             }
         }
     }
@@ -2911,6 +2781,20 @@ impl TypeChecker {
                         }
                         return (**ret).clone();
                     }
+                }
+
+                // Check for ECS runtime functions (__ecs_*)
+                if callee.starts_with("__ecs_") {
+                    match callee.as_str() {
+                        "__ecs_create_entity" | "__ecs_entity_count"
+                        | "__ecs_has" | "__ecs_get" => return Type::I64,
+                        "__ecs_add" | "__ecs_remove" => return Type::Void,
+                        _ => return Type::I64,
+                    }
+                }
+                // Check for event handler functions (__on_*)
+                if callee.starts_with("__on_") {
+                    return Type::Void;
                 }
 
                 // Check for runtime builtin functions (p_*)
@@ -3385,6 +3269,7 @@ impl TypeChecker {
                     Type::Generic { name, args } if name == "Vec" => {
                         args.first().cloned().unwrap_or(Type::I64)
                     }
+                    Type::Named(name) if name == "Vec" => Type::I64,
                     _ => {
                         self.errors.push(format!(
                             "Type error: cannot index type {}",
@@ -4527,7 +4412,7 @@ fn scan_expr_for_floats(expr: &Expr, found: &mut Vec<String>) {
     }
 }
 
-// ─── @crashfree helpers ───
+// ─── safety annotation helpers (used by verify_safety_annotations) ───
 
 /// Scan statements for division/modulo operations.
 /// Returns (line, operator_string) for each div/mod site.

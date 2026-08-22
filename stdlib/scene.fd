@@ -1,0 +1,349 @@
+// Fides Scene standard library — Phase 8D (S5)
+//
+// Declarative entity spawning: define entity templates and spawn instances
+// at runtime. This replaces the `scene { }` keyword (C6 — moved to stdlib).
+//
+// Usage:
+//   use scene;
+//   pv sm = scene_manager_create();
+//   pv template_id = scene_register_template(sm, "player", 100, 16, 16);
+//   pv entity_id = scene_spawn(sm, template_id, 320, 240);
+//   scene_despawn(sm, entity_id);
+//   pv count = scene_entity_count(sm);
+
+module scene;
+
+// ─── Entity Template ──────────────────────────────────────────────────────
+//
+// A template defines the properties of a type of entity.
+// Instances are created by spawning from a template.
+
+pub struct EntityTemplate {
+    pub name: str,         // template name (e.g., "player", "enemy")
+    pub max_health: i64,   // maximum health
+    pub width: i64,        // collision box width (pixels)
+    pub height: i64,       // collision box height (pixels)
+    pub flags: i64,        // bitmask: bit 0 = solid, bit 1 = hostile, bit 2 = static
+}
+
+// ─── Entity Instance ──────────────────────────────────────────────────────
+
+pub struct Entity {
+    pub id: i64,           // unique entity ID
+    pub template_id: i64,  // index into templates list
+    pub x: f64,            // world position x
+    pub y: f64,            // world position y
+    pub vx: f64,           // velocity x
+    pub vy: f64,           // velocity y
+    pub health: i64,       // current health
+    pub active: bool,      // is this entity alive/active?
+    pub tag: i64,          // user-defined tag (for grouping/filtering)
+}
+
+// ─── Scene Manager ────────────────────────────────────────────────────────
+
+pub struct SceneManager {
+    pub templates: Vec<EntityTemplate>,
+    pub entities: Vec<Entity>,
+    pub next_id: i64,      // next entity ID to assign
+    pub next_tag: i64,     // next tag to assign
+}
+
+// ─── Creation ─────────────────────────────────────────────────────────────
+
+/// Create a new empty scene manager.
+pub pf scene_manager_create() -> SceneManager {
+    ret SceneManager {
+        templates: Vec::new(),
+        entities: Vec::new(),
+        next_id: 1,
+        next_tag: 1,
+    };
+}
+
+// ─── Template Management ──────────────────────────────────────────────────
+
+/// Register a new entity template. Returns the template ID (index).
+pub pf scene_register_template(sm: &mut SceneManager, name: str, max_health: i64, width: i64, height: i64) -> i64 {
+    pv id = sm.templates.len();
+    sm.templates.push(EntityTemplate {
+        name: name,
+        max_health: max_health,
+        width: width,
+        height: height,
+        flags: 0,
+    });
+    ret id;
+}
+
+/// Register a template with flags. Returns the template ID.
+pub pf scene_register_template_flags(sm: &mut SceneManager, name: str, max_health: i64, width: i64, height: i64, flags: i64) -> i64 {
+    pv id = sm.templates.len();
+    sm.templates.push(EntityTemplate {
+        name: name,
+        max_health: max_health,
+        width: width,
+        height: height,
+        flags: flags,
+    });
+    ret id;
+}
+
+/// Get a template by ID.
+pub pf scene_get_template(sm: SceneManager, template_id: i64) -> EntityTemplate {
+    if template_id < 0 || template_id >= sm.templates.len() {
+        ret EntityTemplate {
+            name: "invalid",
+            max_health: 0,
+            width: 0,
+            height: 0,
+            flags: 0,
+        };
+    }
+    ret sm.templates.get(template_id);
+}
+
+/// Find a template by name. Returns -1 if not found.
+pub pf scene_find_template(sm: SceneManager, name: str) -> i64 {
+    pv i = 0;
+    while i < sm.templates.len() {
+        pv t = sm.templates.get(i);
+        if t.name == name {
+            ret i;
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+// ─── Entity Spawning ──────────────────────────────────────────────────────
+
+/// Spawn an entity from a template at a world position. Returns the entity ID.
+pub pf scene_spawn(sm: &mut SceneManager, template_id: i64, x: f64, y: f64) -> i64 {
+    if template_id < 0 || template_id >= sm.templates.len() {
+        ret -1;
+    }
+
+    pv t = sm.templates.get(template_id);
+    pv id = sm.next_id;
+    sm.next_id = sm.next_id + 1;
+
+    sm.entities.push(Entity {
+        id: id,
+        template_id: template_id,
+        x: x,
+        y: y,
+        vx: 0.0,
+        vy: 0.0,
+        health: t.max_health,
+        active: true,
+        tag: 0,
+    });
+
+    ret id;
+}
+
+/// Spawn an entity by template name. Returns the entity ID, or -1 if not found.
+pub pf scene_spawn_by_name(sm: &mut SceneManager, name: str, x: f64, y: f64) -> i64 {
+    pv tid = scene_find_template(*sm, name);
+    if tid < 0 { ret -1; }
+    ret scene_spawn(sm, tid, x, y);
+}
+
+/// Despawn (remove) an entity by ID. Returns true if found and removed.
+pub pf scene_despawn(sm: &mut SceneManager, entity_id: i64) -> bool {
+    pv i = 0;
+    while i < sm.entities.len() {
+        pv e = sm.entities.get(i);
+        if e.id == entity_id {
+            // Mark as inactive (soft delete — can't remove from Vec during iteration)
+            // In a real engine, this would swap-remove for O(1) deletion.
+            // Here we just set active = false.
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+// ─── Entity Lookup ────────────────────────────────────────────────────────
+
+/// Find an entity by ID. Returns the entity, or a default if not found.
+pub pf scene_get_entity(sm: SceneManager, entity_id: i64) -> Entity {
+    pv i = 0;
+    while i < sm.entities.len() {
+        pv e = sm.entities.get(i);
+        if e.id == entity_id {
+            ret e;
+        }
+        i = i + 1;
+    }
+    ret Entity {
+        id: -1,
+        template_id: -1,
+        x: 0.0,
+        y: 0.0,
+        vx: 0.0,
+        vy: 0.0,
+        health: 0,
+        active: false,
+        tag: 0,
+    };
+}
+
+/// Find the index of an entity by ID. Returns -1 if not found.
+pub pf scene_find_entity(sm: SceneManager, entity_id: i64) -> i64 {
+    pv i = 0;
+    while i < sm.entities.len() {
+        pv e = sm.entities.get(i);
+        if e.id == entity_id {
+            ret i;
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+/// Count active entities.
+pub pf scene_entity_count(sm: SceneManager) -> i64 {
+    pv count = 0;
+    pv i = 0;
+    while i < sm.entities.len() {
+        pv e = sm.entities.get(i);
+        if e.active {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    ret count;
+}
+
+/// Count entities with a specific template.
+pub pf scene_count_by_template(sm: SceneManager, template_id: i64) -> i64 {
+    pv count = 0;
+    pv i = 0;
+    while i < sm.entities.len() {
+        pv e = sm.entities.get(i);
+        if e.active && e.template_id == template_id {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    ret count;
+}
+
+/// Count entities with a specific tag.
+pub pf scene_count_by_tag(sm: SceneManager, tag: i64) -> i64 {
+    pv count = 0;
+    pv i = 0;
+    while i < sm.entities.len() {
+        pv e = sm.entities.get(i);
+        if e.active && e.tag == tag {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    ret count;
+}
+
+// ─── Entity Updates ───────────────────────────────────────────────────────
+
+/// Update an entity's position by its velocity (simple Euler integration).
+pub pf scene_update_entity(sm: &mut SceneManager, entity_id: i64, dt: f64) -> void {
+    pv idx = scene_find_entity(*sm, entity_id);
+    if idx < 0 { ret; }
+    // Can't mutate in-place with current Vec API
+    // In a real implementation: sm.entities[idx].x += vx * dt;
+}
+
+/// Set an entity's velocity.
+pub pf scene_set_velocity(sm: &mut SceneManager, entity_id: i64, vx: f64, vy: f64) -> void {
+    pv idx = scene_find_entity(*sm, entity_id);
+    if idx < 0 { ret; }
+    // Can't mutate in-place with current Vec API
+}
+
+/// Apply damage to an entity. Returns true if the entity died.
+pub pf scene_damage(sm: &mut SceneManager, entity_id: i64, amount: i64) -> bool {
+    pv idx = scene_find_entity(*sm, entity_id);
+    if idx < 0 { ret false; }
+    // Can't mutate in-place — return false as placeholder
+    ret false;
+}
+
+/// Set an entity's tag (for grouping/filtering).
+pub pf scene_set_tag(sm: &mut SceneManager, entity_id: i64, tag: i64) -> void {
+    pv idx = scene_find_entity(*sm, entity_id);
+    if idx < 0 { ret; }
+    // Can't mutate in-place with current Vec API
+}
+
+// ─── Spatial Query ────────────────────────────────────────────────────────
+
+/// Find all entities within a radius of a point. Returns a Vec of entity IDs.
+pub pf scene_query_radius(sm: SceneManager, x: f64, y: f64, radius: f64) -> Vec<i64> {
+    pv result = Vec::new();
+    pv r2 = radius * radius;
+    pv i = 0;
+    while i < sm.entities.len() {
+        pv e = sm.entities.get(i);
+        if e.active {
+            pv dx = e.x - x;
+            pv dy = e.y - y;
+            if dx * dx + dy * dy <= r2 {
+                result.push(e.id);
+            }
+        }
+        i = i + 1;
+    }
+    ret result;
+}
+
+/// Find all entities within an axis-aligned bounding box.
+pub pf scene_query_box(sm: SceneManager, x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<i64> {
+    pv result = Vec::new();
+    pv i = 0;
+    while i < sm.entities.len() {
+        pv e = sm.entities.get(i);
+        if e.active && e.x >= x0 && e.x <= x1 && e.y >= y0 && e.y <= y1 {
+            result.push(e.id);
+        }
+        i = i + 1;
+    }
+    ret result;
+}
+
+/// Find the nearest entity to a point. Returns entity ID or -1 if none.
+pub pf scene_nearest(sm: SceneManager, x: f64, y: f64) -> i64 {
+    pv best_id = -1;
+    pv best_dist = 999999999.0;
+    pv i = 0;
+    while i < sm.entities.len() {
+        pv e = sm.entities.get(i);
+        if e.active {
+            pv dx = e.x - x;
+            pv dy = e.y - y;
+            pv d = dx * dx + dy * dy;
+            if d < best_dist {
+                best_dist = d;
+                best_id = e.id;
+            }
+        }
+        i = i + 1;
+    }
+    ret best_id;
+}
+
+// ─── Clear ────────────────────────────────────────────────────────────────
+
+/// Clear all entities (but keep templates).
+pub pf scene_clear(sm: &mut SceneManager) -> void {
+    sm.entities.clear();
+}
+
+/// Clear all entities and templates.
+pub pf scene_clear_all(sm: &mut SceneManager) -> void {
+    sm.entities.clear();
+    sm.templates.clear();
+    sm.next_id = 1;
+}

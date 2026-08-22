@@ -64,7 +64,7 @@ F16: vec2/3/4 + mat4 types    🔲 PLANNED — SIMD instruction emission needs c
 F17: Vector swizzle (.xyz)    🔲 PLANNED — parser + typechecker for component access
 F8:  ?. optional chaining     ✅ IMPLEMENTED — null-safe navigation, None short-circuits to 0
 F10: given/ensure contracts   ✅ IMPLEMENTED — preconditions verified at call sites with constant args (Design by Contract)
-F18: ECS (component/system)   🔲 PLANNED — compiler controls SoA memory layout + queries
+F18: ECS (component/system)   ✅ IMPLEMENTED — component/system/query desugar to structs/functions/loops, __ecs_* runtime in interpreter
 F13: parallel { | } fork-join 🔲 PLANNED — compiler emits thread spawn/join
 F14: @differentiable          🔲 PLANNED — compiler traces IR for autograd
 F21: @shader (vert/frag)      🔲 PLANNED — compiler emits SPIR-V for GPU
@@ -85,8 +85,8 @@ F7:  .. spread operator       ✅ IMPLEMENTED — struct field copy + override, 
 F9:  ?? coalescing            ✅ IMPLEMENTED — Option ?? default, works in all backends
 F11: is type check            ✅ IMPLEMENTED — runtime enum variant check + compile-time type check
 F12: @memo annotation         ✅ IMPLEMENTED (as stdlib) — memoization via stdlib/memo.fd (Memo::new, get_or_compute), not a compiler annotation
-F20: on event handlers        🔲 PLANNED — unified dispatch needs compiler event routing
-F19: state machines           🔲 PLANNED — compile-time transition verification
+F20: on event handlers        ✅ IMPLEMENTED — `on event_name(params) { body }` desugars to `__on_<event_name>` function
+F19: state machines           ✅ IMPLEMENTED — `state_machine` desugars to enum + initial/handle functions, transition table
 F15: @no_grad scope           ❌ CUT — unnecessary in compile-time opt-in autograd (grad blocks are opt-in, nothing to disable)
 F33: @audit                   ✅ IMPLEMENTED — entry/exit logging with parameter values (IR injection), type-aware printing
 F34: @emit                    🔲 PLANNED — blockchain event emission with signature verification
@@ -172,14 +172,14 @@ F89: @csprng                  🔲 PLANNED — only cryptographically secure ran
 F93: @capability-scope        🔲 PLANNED — capabilities can't be escalated at runtime (privilege escalation)
 
 ─── Stdlib Modules — Built in Fides, Shipped with Compiler ──────────
-S1: stdlib/tilemap.fd          🔲 PLANNED — tile maps, collision, auto-tiling (gaming)
-S2: stdlib/sprite.fd           🔲 PLANNED — animation, atlases, palette swap (gaming)
-S3: stdlib/flowfield.fd        🔲 PLANNED — RTS pathfinding, vector fields (gaming)
-S4: stdlib/streaming.fd        🔲 PLANNED — chunk load/unload for open worlds (gaming)
-S5: stdlib/scene.fd            🔲 PLANNED — declarative entity spawning (was F22)
-S6: stdlib/physics.fd          🔲 PLANNED — collision detection, rigid bodies (gaming+robotics)
-S7: stdlib/audio.fd            🔲 PLANNED — audio playback via FFI (gaming)
-S8: stdlib/input.fd            🔲 PLANNED — input handling on top of `on` events (gaming)
+S1: stdlib/tilemap.fd          ✅ DONE — tile maps, collision, auto-tiling (gaming)
+S2: stdlib/sprite.fd           ✅ DONE — animation, atlases, palette swap (gaming)
+S3: stdlib/flowfield.fd        ✅ DONE — RTS pathfinding, vector fields (gaming)
+S4: stdlib/streaming.fd        ✅ DONE — chunk load/unload for open worlds (gaming)
+S5: stdlib/scene.fd            ✅ DONE — declarative entity spawning (was F22)
+S6: stdlib/physics.fd          ✅ DONE — collision detection, rigid bodies (gaming+robotics)
+S7: stdlib/audio.fd            ✅ DONE — audio playback via FFI (gaming, stub — no actual audio hardware)
+S8: stdlib/input.fd            ✅ DONE — input handling on top of `on` events (gaming, stub — no actual input hardware)
 S9: stdlib/crypto.fd           🔲 PLANNED — hashing, signatures, encryption (blockchain+medical)
 S10: stdlib/consensus.fd       🔲 PLANNED — PoW, PoS, PBFT, Raft (blockchain)
 S11: stdlib/storage.fd         🔲 PLANNED — Merkle trees, KV storage, state roots (blockchain)
@@ -231,13 +231,13 @@ C15: @validated               ❌ CUT — already covered by given/ensure contra
 
 | Tier | Count | What | Why |
 |------|-------|------|-----|
-| **Implemented** | 9 | F1–F11 (F6,7,8,9,11 done) | Done and tested in all backends |
+| **Implemented** | 30+ | F1–F11, F18–F20, F24, F26, F28, F33, F38–F41, F43, F44, F48, F52, F56, F61–F65, F67–F68, F95 | Done and tested (interpreter + C codegen where applicable) |
 | **Syntax Tier A** | 39 | F10, F13, F14, F16–F18, F21, F23–F60 | Compiler must understand — can't be a library |
 | **Syntax Tier B** | 12 | F6, F7, F9, F11, F12, F19, F20, F33–F37 | Ergonomic — could be library but worth the keyword |
 | **Stdlib** | 29 | S1–S29 | Built in Fides, users can read/modify/replace |
 | **Cut** | 16 | C1–C15, F15 | Redundant — existing features already cover |
 
-**Total: 9 implemented + 52 syntax + 215 stdlib + 15 cut = 105 features analyzed.**
+**Total: 30+ implemented + 52 syntax + 29 stdlib + 15 cut = 105 features analyzed.**
 
 ### Industry Coverage
 
@@ -1977,7 +1977,7 @@ These modules are **not language keywords** — they're `.fd` files that ship wi
 ### S1 — `stdlib/tilemap.fd` — Tile Maps for 2D Games
 
 **Classification:** STDLIB — built on `Vec<i32>` + `vec2` (F16) + ECS query (F18)
-**Status:** 🔲 Planned
+**Status:** ✅ Done
 
 ```p
 use tilemap;
@@ -2000,7 +2000,7 @@ for tile in visible { draw_tile(tile); }
 ### S2 — `stdlib/sprite.fd` — Animation and Atlases
 
 **Classification:** STDLIB — built on `struct` + `Vec<i32>` + timers
-**Status:** 🔲 Planned
+**Status:** ✅ Done
 
 ```p
 use sprite;
@@ -2019,7 +2019,7 @@ draw_sprite(sprite);
 ### S3 — `stdlib/flowfield.fd` — RTS Pathfinding
 
 **Classification:** STDLIB — built on `vec2` (F16) + grid math
-**Status:** 🔲 Planned
+**Status:** ✅ Done
 
 ```p
 use flowfield;
@@ -2046,7 +2046,7 @@ system MoveUnits(dt: f32) {
 ### S4 — `stdlib/streaming.fd` — Open World Chunk Loading
 
 **Classification:** STDLIB — built on ECS (F18) + `HashMap` + `query`
-**Status:** 🔲 Planned
+**Status:** ✅ Done
 
 ```p
 use streaming;
@@ -2078,7 +2078,7 @@ system UpdateStreaming {
 ### S5 — `stdlib/scene.fd` — Declarative Scene Hierarchy
 
 **Classification:** STDLIB — built on ECS (F18) + `on` events (F20). Was F22 (syntax), moved to stdlib.
-**Status:** 🔲 Planned
+**Status:** ✅ Done
 
 ```p
 use scene;
@@ -2100,7 +2100,7 @@ pv player = scene::entity("Player")
 ### S6 — `stdlib/physics.fd` — Collision Detection
 
 **Classification:** STDLIB — built on `vec3` (F16) + `struct` + ECS (F18)
-**Status:** 🔲 Planned
+**Status:** ✅ Done
 
 ```p
 use physics;
@@ -2119,7 +2119,7 @@ for contact in contacts {
 ### S7 — `stdlib/audio.fd` — Audio Playback
 
 **Classification:** STDLIB — built on FFI (`extern "C"`) to OS audio APIs
-**Status:** 🔲 Planned
+**Status:** ✅ Done (stub)
 
 ```p
 use audio;
@@ -2136,7 +2136,7 @@ sfx.play();  // one-shot
 ### S8 — `stdlib/input.fd` — Input Handling
 
 **Classification:** STDLIB — built on `on` events (F20) + FFI to OS input APIs
-**Status:** 🔲 Planned
+**Status:** ✅ Done (stub)
 
 ```p
 use input;
@@ -2269,14 +2269,14 @@ system UpdateLOD {
 
 | Module | Status | What It Provides |
 |--------|--------|-----------------|
-| S1: `tilemap.fd` | 🔲 Planned | Tile maps, collision, auto-tiling |
-| S2: `sprite.fd` | 🔲 Planned | Animation, atlases, palette swap |
-| S3: `flowfield.fd` | 🔲 Planned | RTS pathfinding, vector fields |
-| S4: `streaming.fd` | 🔲 Planned | Chunk load/unload for open worlds |
-| S5: `scene.fd` | 🔲 Planned | Declarative entity spawning (was F22) |
-| S6: `physics.fd` | 🔲 Planned | Collision detection, rigid bodies |
-| S7: `audio.fd` | 🔲 Planned | Audio playback via FFI |
-| S8: `input.fd` | 🔲 Planned | Input handling on top of `on` events |
+| S1: `tilemap.fd` | ✅ Done | Tile maps, collision, auto-tiling |
+| S2: `sprite.fd` | ✅ Done | Animation, atlases, palette swap |
+| S3: `flowfield.fd` | ✅ Done | RTS pathfinding, vector fields |
+| S4: `streaming.fd` | ✅ Done | Chunk load/unload for open worlds |
+| S5: `scene.fd` | ✅ Done | Declarative entity spawning (was F22) |
+| S6: `physics.fd` | ✅ Done | Collision detection, rigid bodies |
+| S7: `audio.fd` | ✅ Done (stub) | Audio playback via FFI (no actual hardware) |
+| S8: `input.fd` | ✅ Done (stub) | Input handling on top of `on` events (no actual hardware) |
 
 ### Cut Features (Redundant)
 
@@ -2317,15 +2317,15 @@ system UpdateLOD {
 ### Implementation Details
 
 All 5 original features (F1–F5) were implemented in a single session. Test results (current state):
-- Interpreter: 109/109 passed (+ 18/18 expected-fail)
-- PE Emitter: 109/109 valid (+ 18/18 expected-fail)
-- C Codegen: 109/109 matched — FULL PARITY (+ 18/18 expected-fail)
-- Total: 127 .fd test files (109 normal + 18 expected-fail)
+- Interpreter: 102/127 passed (+ 22/22 expected-fail)
+- PE Emitter: 102/127 valid (+ 22/22 expected-fail)
+- C Codegen: 101/127 matched — near full parity (+ 22/22 expected-fail)
+- Total: 149 .fd test files (127 normal + 22 expected-fail)
 
 **Planned for implementation:**
 - 39 Tier A syntax features (F10, F13, F14, F16–F18, F21, F23–F60) — need compiler support
 - 7 Tier B syntax features (F12, F19, F20) — ergonomic keywords
-- 215 stdlib modules (S1–S29) — Fides code, no compiler changes
+- 29 stdlib module slots (S1–S29) — Fides code, no compiler changes (34 actual .fd files as of Aug 2026)
 - 15 features cut (C1–C15) — redundant, build with existing features
 
 ---

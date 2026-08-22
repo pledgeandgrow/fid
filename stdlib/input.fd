@@ -1,0 +1,522 @@
+// Fides Input standard library — Phase 8D (S8)
+//
+// Input handling for games: keyboard, mouse, and gamepad state tracking.
+// Provides both polling (is key held?) and event-based (was key just pressed?)
+// interfaces.
+//
+// In the interpreter, input functions are stubs (no actual input).
+// In native builds, these would read from /dev/input, X11, Win32, etc.
+//
+// Usage:
+//   use input;
+//   input_init();
+//   input_update();  // call once per frame
+//   if input_key_pressed(KEY_SPACE) { jump(); }
+//   if input_key_held(KEY_LEFT) { move_left(); }
+//   pv mx = input_mouse_x();
+//   pv my = input_mouse_y();
+//   if input_mouse_pressed(MOUSE_LEFT) { shoot(); }
+
+module input;
+
+// ─── Key Codes ────────────────────────────────────────────────────────────
+//
+// Standard key codes (based on USB HID / SDL2 scancodes).
+
+pub pc KEY_UNKNOWN: i64 = 0;
+pub pc KEY_SPACE: i64 = 32;
+pub pc KEY_APOSTROPHE: i64 = 39;
+pub pc KEY_COMMA: i64 = 44;
+pub pc KEY_MINUS: i64 = 45;
+pub pc KEY_PERIOD: i64 = 46;
+pub pc KEY_SLASH: i64 = 47;
+pub pc KEY_0: i64 = 48;
+pub pc KEY_1: i64 = 49;
+pub pc KEY_2: i64 = 50;
+pub pc KEY_3: i64 = 51;
+pub pc KEY_4: i64 = 52;
+pub pc KEY_5: i64 = 53;
+pub pc KEY_6: i64 = 54;
+pub pc KEY_7: i64 = 55;
+pub pc KEY_8: i64 = 56;
+pub pc KEY_9: i64 = 57;
+pub pc KEY_SEMICOLON: i64 = 59;
+pub pc KEY_EQUAL: i64 = 61;
+pub pc KEY_A: i64 = 65;
+pub pc KEY_B: i64 = 66;
+pub pc KEY_C: i64 = 67;
+pub pc KEY_D: i64 = 68;
+pub pc KEY_E: i64 = 69;
+pub pc KEY_F: i64 = 70;
+pub pc KEY_G: i64 = 71;
+pub pc KEY_H: i64 = 72;
+pub pc KEY_I: i64 = 73;
+pub pc KEY_J: i64 = 74;
+pub pc KEY_K: i64 = 75;
+pub pc KEY_L: i64 = 76;
+pub pc KEY_M: i64 = 77;
+pub pc KEY_N: i64 = 78;
+pub pc KEY_O: i64 = 79;
+pub pc KEY_P: i64 = 80;
+pub pc KEY_Q: i64 = 81;
+pub pc KEY_R: i64 = 82;
+pub pc KEY_S: i64 = 83;
+pub pc KEY_T: i64 = 84;
+pub pc KEY_U: i64 = 85;
+pub pc KEY_V: i64 = 86;
+pub pc KEY_W: i64 = 87;
+pub pc KEY_X: i64 = 88;
+pub pc KEY_Y: i64 = 89;
+pub pc KEY_Z: i64 = 90;
+pub pc KEY_LEFT_BRACKET: i64 = 91;
+pub pc KEY_BACKSLASH: i64 = 92;
+pub pc KEY_RIGHT_BRACKET: i64 = 93;
+pub pc KEY_BACKTICK: i64 = 96;
+pub pc KEY_ESCAPE: i64 = 256;
+pub pc KEY_ENTER: i64 = 257;
+pub pc KEY_TAB: i64 = 258;
+pub pc KEY_BACKSPACE: i64 = 259;
+pub pc KEY_INSERT: i64 = 260;
+pub pc KEY_DELETE: i64 = 261;
+pub pc KEY_RIGHT: i64 = 262;
+pub pc KEY_LEFT: i64 = 263;
+pub pc KEY_DOWN: i64 = 264;
+pub pc KEY_UP: i64 = 265;
+pub pc KEY_PAGE_UP: i64 = 266;
+pub pc KEY_PAGE_DOWN: i64 = 267;
+pub pc KEY_HOME: i64 = 268;
+pub pc KEY_END: i64 = 269;
+pub pc KEY_CAPS_LOCK: i64 = 280;
+pub pc KEY_SCROLL_LOCK: i64 = 281;
+pub pc KEY_NUM_LOCK: i64 = 282;
+pub pc KEY_PRINT_SCREEN: i64 = 283;
+pub pc KEY_PAUSE: i64 = 284;
+pub pc KEY_F1: i64 = 290;
+pub pc KEY_F2: i64 = 291;
+pub pc KEY_F3: i64 = 292;
+pub pc KEY_F4: i64 = 293;
+pub pc KEY_F5: i64 = 294;
+pub pc KEY_F6: i64 = 295;
+pub pc KEY_F7: i64 = 296;
+pub pc KEY_F8: i64 = 297;
+pub pc KEY_F9: i64 = 298;
+pub pc KEY_F10: i64 = 299;
+pub pc KEY_F11: i64 = 300;
+pub pc KEY_F12: i64 = 301;
+pub pc KEY_LEFT_SHIFT: i64 = 340;
+pub pc KEY_LEFT_CONTROL: i64 = 341;
+pub pc KEY_LEFT_ALT: i64 = 342;
+pub pc KEY_LEFT_SUPER: i64 = 343;
+pub pc KEY_RIGHT_SHIFT: i64 = 344;
+pub pc KEY_RIGHT_CONTROL: i64 = 345;
+pub pc KEY_RIGHT_ALT: i64 = 346;
+pub pc KEY_RIGHT_SUPER: i64 = 347;
+
+// ─── Mouse Buttons ────────────────────────────────────────────────────────
+
+pub pc MOUSE_LEFT: i64 = 0;
+pub pc MOUSE_RIGHT: i64 = 1;
+pub pc MOUSE_MIDDLE: i64 = 2;
+pub pc MOUSE_X1: i64 = 3;
+pub pc MOUSE_X2: i64 = 4;
+
+// ─── Gamepad Buttons ──────────────────────────────────────────────────────
+
+pub pc GAMEPAD_A: i64 = 0;
+pub pc GAMEPAD_B: i64 = 1;
+pub pc GAMEPAD_X: i64 = 2;
+pub pc GAMEPAD_Y: i64 = 3;
+pub pc GAMEPAD_LEFT_BUMPER: i64 = 4;
+pub pc GAMEPAD_RIGHT_BUMPER: i64 = 5;
+pub pc GAMEPAD_BACK: i64 = 6;
+pub pc GAMEPAD_START: i64 = 7;
+pub pc GAMEPAD_GUIDE: i64 = 8;
+pub pc GAMEPAD_LEFT_THUMB: i64 = 9;
+pub pc GAMEPAD_RIGHT_THUMB: i64 = 10;
+pub pc GAMEPAD_DPAD_UP: i64 = 11;
+pub pc GAMEPAD_DPAD_RIGHT: i64 = 12;
+pub pc GAMEPAD_DPAD_DOWN: i64 = 13;
+pub pc GAMEPAD_DPAD_LEFT: i64 = 14;
+
+// ─── Input State ──────────────────────────────────────────────────────────
+//
+// We track two frames of state to detect "just pressed" and "just released":
+//   current[key] = key is held this frame
+//   previous[key] = key was held last frame
+//   pressed = current && !previous
+//   released = !current && previous
+
+pub struct InputState {
+    pub key_current: Vec<i64>,    // 512 keys
+    pub key_previous: Vec<i64>,
+    pub mouse_x: i64,
+    pub mouse_y: i64,
+    pub mouse_delta_x: i64,
+    pub mouse_delta_y: i64,
+    pub mouse_current: Vec<i64>,  // 5 buttons
+    pub mouse_previous: Vec<i64>,
+    pub mouse_wheel: i64,          // scroll wheel delta
+    pub gamepad_connected: bool,
+    pub gamepad_current: Vec<i64>,  // 15 buttons
+    pub gamepad_previous: Vec<i64>,
+    pub gamepad_left_x: f64,       // -1.0 to 1.0
+    pub gamepad_left_y: f64,
+    pub gamepad_right_x: f64,
+    pub gamepad_right_y: f64,
+    pub gamepad_left_trigger: f64,  // 0.0 to 1.0
+    pub gamepad_right_trigger: f64,
+}
+
+// ─── FFI (platform input) ─────────────────────────────────────────────────
+//
+// These are stubs — the actual implementations read from the platform.
+// On Linux: /dev/input, X11, or evdev.
+// On Windows: GetAsyncKeyState, RawInput, XInput.
+
+extern "C" include "pledge_input.h" link "" {
+    pf pledge_input_init() -> i64;
+    pf pledge_input_poll(key_state: *u8, key_count: i64) -> void;
+    pf pledge_input_mouse(x: *u8, y: *u8, buttons: *u8, wheel: *u8) -> void;
+    pf pledge_input_gamepad(connected: *u8, buttons: *u8, left_x: *u8, left_y: *u8, right_x: *u8, right_y: *u8, lt: *u8, rt: *u8) -> void;
+}
+
+// ─── Initialization ───────────────────────────────────────────────────────
+
+/// Initialize the input system.
+pub pf input_init() -> void {
+    pledge_input_init();
+}
+
+/// Create a new input state tracker.
+pub pf input_create() -> InputState {
+    pv keys = Vec::new();
+    pv prev_keys = Vec::new();
+    pv i = 0;
+    while i < 512 {
+        keys.push(0);
+        prev_keys.push(0);
+        i = i + 1;
+    }
+
+    pv mb = Vec::new();
+    pv prev_mb = Vec::new();
+    pv j = 0;
+    while j < 5 {
+        mb.push(0);
+        prev_mb.push(0);
+        j = j + 1;
+    }
+
+    pv gb = Vec::new();
+    pv prev_gb = Vec::new();
+    pv k = 0;
+    while k < 15 {
+        gb.push(0);
+        prev_gb.push(0);
+        k = k + 1;
+    }
+
+    ret InputState {
+        key_current: keys,
+        key_previous: prev_keys,
+        mouse_x: 0,
+        mouse_y: 0,
+        mouse_delta_x: 0,
+        mouse_delta_y: 0,
+        mouse_current: mb,
+        mouse_previous: prev_mb,
+        mouse_wheel: 0,
+        gamepad_connected: false,
+        gamepad_current: gb,
+        gamepad_previous: prev_gb,
+        gamepad_left_x: 0.0,
+        gamepad_left_y: 0.0,
+        gamepad_right_x: 0.0,
+        gamepad_right_y: 0.0,
+        gamepad_left_trigger: 0.0,
+        gamepad_right_trigger: 0.0,
+    };
+}
+
+// ─── Update (call once per frame) ─────────────────────────────────────────
+
+/// Update the input state. Call this once per frame before querying input.
+/// Copies current state to previous, then polls the platform for new state.
+pub pf input_update(state: &mut InputState) -> void {
+    // Copy current to previous
+    pv i = 0;
+    while i < state.key_current.len() {
+        pv v = state.key_current.get(i);
+        state.key_previous.set(i, v);
+        i = i + 1;
+    }
+
+    pv j = 0;
+    while j < state.mouse_current.len() {
+        pv v = state.mouse_current.get(j);
+        state.mouse_previous.set(j, v);
+        j = j + 1;
+    }
+
+    pv k = 0;
+    while k < state.gamepad_current.len() {
+        pv v = state.gamepad_current.get(k);
+        state.gamepad_previous.set(k, v);
+        k = k + 1;
+    }
+
+    // Reset mouse wheel and deltas
+    state.mouse_wheel = 0;
+    state.mouse_delta_x = 0;
+    state.mouse_delta_y = 0;
+
+    // Poll platform (stub — in native builds this reads real input)
+    // pledge_input_poll(...) would fill key_current, mouse, gamepad
+    // For now, the state stays as-is (no input in interpreter mode)
+}
+
+// ─── Keyboard ─────────────────────────────────────────────────────────────
+
+/// Check if a key is currently held down.
+pub pf input_key_held(state: InputState, key: i64) -> bool {
+    if key < 0 || key >= state.key_current.len() {
+        ret false;
+    }
+    ret state.key_current.get(key) != 0;
+}
+
+/// Check if a key was just pressed this frame (not held from previous frame).
+pub pf input_key_pressed(state: InputState, key: i64) -> bool {
+    if key < 0 || key >= state.key_current.len() {
+        ret false;
+    }
+    ret state.key_current.get(key) != 0 && state.key_previous.get(key) == 0;
+}
+
+/// Check if a key was just released this frame.
+pub pf input_key_released(state: InputState, key: i64) -> bool {
+    if key < 0 || key >= state.key_current.len() {
+        ret false;
+    }
+    ret state.key_current.get(key) == 0 && state.key_previous.get(key) != 0;
+}
+
+/// Set a key state (for testing or platform integration).
+pub pf input_set_key(state: &mut InputState, key: i64, held: bool) -> void {
+    if key < 0 || key >= state.key_current.len() {
+        ret;
+    }
+    pv val = 0;
+    if held { val = 1; }
+    state.key_current.set(key, val);
+}
+
+// ─── Mouse ────────────────────────────────────────────────────────────────
+
+/// Get mouse X position.
+pub pf input_mouse_x(state: InputState) -> i64 {
+    ret state.mouse_x;
+}
+
+/// Get mouse Y position.
+pub pf input_mouse_y(state: InputState) -> i64 {
+    ret state.mouse_y;
+}
+
+/// Get mouse movement delta (change since last frame).
+pub pf input_mouse_delta(state: InputState) -> (i64, i64) {
+    ret (state.mouse_delta_x, state.mouse_delta_y);
+}
+
+/// Get mouse wheel scroll delta.
+pub pf input_mouse_wheel(state: InputState) -> i64 {
+    ret state.mouse_wheel;
+}
+
+/// Check if a mouse button is held.
+pub pf input_mouse_held(state: InputState, button: i64) -> bool {
+    if button < 0 || button >= state.mouse_current.len() {
+        ret false;
+    }
+    ret state.mouse_current.get(button) != 0;
+}
+
+/// Check if a mouse button was just pressed this frame.
+pub pf input_mouse_pressed(state: InputState, button: i64) -> bool {
+    if button < 0 || button >= state.mouse_current.len() {
+        ret false;
+    }
+    ret state.mouse_current.get(button) != 0 && state.mouse_previous.get(button) == 0;
+}
+
+/// Check if a mouse button was just released this frame.
+pub pf input_mouse_released(state: InputState, button: i64) -> bool {
+    if button < 0 || button >= state.mouse_current.len() {
+        ret false;
+    }
+    ret state.mouse_current.get(button) == 0 && state.mouse_previous.get(button) != 0;
+}
+
+/// Set mouse position (for platform integration).
+pub pf input_set_mouse_pos(state: &mut InputState, x: i64, y: i64) -> void {
+    state.mouse_delta_x = x - state.mouse_x;
+    state.mouse_delta_y = y - state.mouse_y;
+    state.mouse_x = x;
+    state.mouse_y = y;
+}
+
+/// Set mouse button state (for platform integration).
+pub pf input_set_mouse_button(state: &mut InputState, button: i64, held: bool) -> void {
+    if button < 0 || button >= state.mouse_current.len() {
+        ret;
+    }
+    pv val = 0;
+    if held { val = 1; }
+    state.mouse_current.set(button, val);
+}
+
+/// Set mouse wheel delta (for platform integration).
+pub pf input_set_mouse_wheel(state: &mut InputState, delta: i64) -> void {
+    state.mouse_wheel = delta;
+}
+
+// ─── Gamepad ──────────────────────────────────────────────────────────────
+
+/// Check if a gamepad is connected.
+pub pf input_gamepad_connected(state: InputState) -> bool {
+    ret state.gamepad_connected;
+}
+
+/// Check if a gamepad button is held.
+pub pf input_gamepad_held(state: InputState, button: i64) -> bool {
+    if button < 0 || button >= state.gamepad_current.len() {
+        ret false;
+    }
+    ret state.gamepad_current.get(button) != 0;
+}
+
+/// Check if a gamepad button was just pressed.
+pub pf input_gamepad_pressed(state: InputState, button: i64) -> bool {
+    if button < 0 || button >= state.gamepad_current.len() {
+        ret false;
+    }
+    ret state.gamepad_current.get(button) != 0 && state.gamepad_previous.get(button) == 0;
+}
+
+/// Get left stick X axis (-1.0 to 1.0).
+pub pf input_gamepad_left_x(state: InputState) -> f64 {
+    ret state.gamepad_left_x;
+}
+
+/// Get left stick Y axis (-1.0 to 1.0).
+pub pf input_gamepad_left_y(state: InputState) -> f64 {
+    ret state.gamepad_left_y;
+}
+
+/// Get right stick X axis (-1.0 to 1.0).
+pub pf input_gamepad_right_x(state: InputState) -> f64 {
+    ret state.gamepad_right_x;
+}
+
+/// Get right stick Y axis (-1.0 to 1.0).
+pub pf input_gamepad_right_y(state: InputState) -> f64 {
+    ret state.gamepad_right_y;
+}
+
+/// Get left trigger (0.0 to 1.0).
+pub pf input_gamepad_left_trigger(state: InputState) -> f64 {
+    ret state.gamepad_left_trigger;
+}
+
+/// Get right trigger (0.0 to 1.0).
+pub pf input_gamepad_right_trigger(state: InputState) -> f64 {
+    ret state.gamepad_right_trigger;
+}
+
+/// Set gamepad button state (for platform integration).
+pub pf input_set_gamepad_button(state: &mut InputState, button: i64, held: bool) -> void {
+    if button < 0 || button >= state.gamepad_current.len() {
+        ret;
+    }
+    pv val = 0;
+    if held { val = 1; }
+    state.gamepad_current.set(button, val);
+}
+
+/// Set gamepad axis values (for platform integration).
+pub pf input_set_gamepad_axes(state: &mut InputState, lx: f64, ly: f64, rx: f64, ry: f64, lt: f64, rt: f64) -> void {
+    state.gamepad_left_x = lx;
+    state.gamepad_left_y = ly;
+    state.gamepad_right_x = rx;
+    state.gamepad_right_y = ry;
+    state.gamepad_left_trigger = lt;
+    state.gamepad_right_trigger = rt;
+}
+
+/// Set gamepad connected status.
+pub pf input_set_gamepad_connected(state: &mut InputState, connected: bool) -> void {
+    state.gamepad_connected = connected;
+}
+
+// ─── Convenience: Modifier Keys ───────────────────────────────────────────
+
+/// Check if either shift key is held.
+pub pf input_shift_held(state: InputState) -> bool {
+    ret input_key_held(state, KEY_LEFT_SHIFT) || input_key_held(state, KEY_RIGHT_SHIFT);
+}
+
+/// Check if either control key is held.
+pub pf input_ctrl_held(state: InputState) -> bool {
+    ret input_key_held(state, KEY_LEFT_CONTROL) || input_key_held(state, KEY_RIGHT_CONTROL);
+}
+
+/// Check if either alt key is held.
+pub pf input_alt_held(state: InputState) -> bool {
+    ret input_key_held(state, KEY_LEFT_ALT) || input_key_held(state, KEY_RIGHT_ALT);
+}
+
+// ─── Convenience: Directional Input ───────────────────────────────────────
+
+/// Get directional input as a normalized vector (dx, dy).
+/// Combines keyboard arrows, WASD, and gamepad left stick.
+pub pf input_direction(state: InputState) -> (f64, f64) {
+    pv dx = 0.0;
+    pv dy = 0.0;
+
+    // Keyboard arrows
+    if input_key_held(state, KEY_LEFT) { dx = dx - 1.0; }
+    if input_key_held(state, KEY_RIGHT) { dx = dx + 1.0; }
+    if input_key_held(state, KEY_UP) { dy = dy - 1.0; }
+    if input_key_held(state, KEY_DOWN) { dy = dy + 1.0; }
+
+    // WASD
+    if input_key_held(state, KEY_A) { dx = dx - 1.0; }
+    if input_key_held(state, KEY_D) { dx = dx + 1.0; }
+    if input_key_held(state, KEY_W) { dy = dy - 1.0; }
+    if input_key_held(state, KEY_S) { dy = dy + 1.0; }
+
+    // Gamepad left stick (overrides keyboard if significant)
+    pv glx = state.gamepad_left_x;
+    pv gly = state.gamepad_left_y;
+    if glx * glx + gly * gly > 0.25 {
+        dx = glx;
+        dy = gly;
+    }
+
+    // Normalize diagonal
+    if dx != 0.0 && dy != 0.0 {
+        pv len2 = dx * dx + dy * dy;
+        pv len = len2;
+        pv i = 0;
+        while i < 10 {
+            len = (len + len2 / len) * 0.5;
+            i = i + 1;
+        }
+        if len > 0.0 {
+            dx = dx / len;
+            dy = dy / len;
+        }
+    }
+
+    ret (dx, dy);
+}

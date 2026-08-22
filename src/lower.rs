@@ -60,6 +60,8 @@ pub struct Lowerer {
     /// Stack of active named regions — allocations inside a region block
     /// use Region::Named(name) instead of Region::Stack
     region_stack: Vec<String>,
+    /// Sandbox depth — when > 0, emitted instructions are marked in_sandbox
+    sandbox_depth: usize,
     /// AST function return types — maps function name to AST return type
     /// Used by LetTuple to determine tuple element types
     func_ret_types: HashMap<String, Type>,
@@ -102,6 +104,7 @@ impl Lowerer {
             current_self_type: None,
             effect_handler_stack: Vec::new(),
             region_stack: Vec::new(),
+            sandbox_depth: 0,
             func_ret_types: HashMap::new(),
             async_funcs: std::collections::HashSet::new(),
             vec_allocas: std::collections::HashSet::new(),
@@ -160,6 +163,14 @@ impl Lowerer {
         for td in &program.traits {
             let methods: Vec<String> = td.methods.iter().map(|m| m.name.clone()).collect();
             self.module.trait_methods.insert(td.name.clone(), methods);
+        }
+
+        // Register trait implementations for devirtualization (F-3D)
+        for ti in &program.trait_impls {
+            self.module.trait_impls
+                .entry(ti.trait_name.clone())
+                .or_default()
+                .push(ti.type_name.clone());
         }
 
         // Compute struct layouts
@@ -331,10 +342,8 @@ impl Lowerer {
         self.module.add_extern("p_string_len",
             vec![str_ty.clone()],
             IrType::I64);
-        let vec_ty = IrType::Opaque("Vec".to_string());
-        self.module.add_extern("p_vec_to_str",
-            vec![vec_ty.clone()],
-            IrType::Ptr(Box::new(IrType::U8)));
+        // Phase 10B: Vec_to_str is now a Fides function, not an extern
+        // (no need to register as extern)
 
         // ─── Phase 5D.2: JSON stdlib ───
         let json_ty = IrType::Opaque("Json".to_string());
@@ -521,6 +530,22 @@ impl Lowerer {
         ir_func.is_interrupt = func.is_interrupt;
         // F65: @wrapping annotation — use wrap-around arithmetic instead of checked
         ir_func.is_wrapping = func.annotations.iter().any(|a| a.name == "wrapping");
+        // I-4A: @deterministic annotation — function is reproducible, can be memoized
+        ir_func.is_deterministic = func.annotations.iter().any(|a| a.name == "deterministic");
+        // F-3F: @crashfree annotation — function can't panic, safe to inline more aggressively
+        ir_func.is_crashfree = func.annotations.iter().any(|a| a.name == "crashfree");
+        // I-4C: @gas(N) annotation — gas limit proves termination, allows larger unrolling
+        ir_func.gas_limit = func.annotations.iter()
+            .find(|a| a.name == "gas")
+            .and_then(|a| a.args.first())
+            .and_then(|s| s.parse::<u64>().ok());
+        // I-2D: @no-alloc annotation — function cannot allocate, skip allocator state preservation.
+        // @medical implies @no-alloc, so set is_no_alloc for both.
+        ir_func.is_no_alloc = func.annotations.iter().any(|a| a.name == "no-alloc" || a.name == "medical");
+        // I-4D: @medical annotation — IEC 62304 safety. Implies @no-alloc + @no-recursion
+        // + @crashfree + @requires-audit. The optimizer can assume
+        // no heap allocation, no recursion, bounded iteration, no panics.
+        ir_func.is_medical = func.annotations.iter().any(|a| a.name == "medical");
 
         // If the function returns a struct, add a hidden SRET parameter
         // (caller-allocated pointer as first arg, callee writes struct data there)
@@ -533,6 +558,7 @@ impl Lowerer {
                 region: self.current_region(),
                 effects: EffectSet::none(),
                 source_line: None,
+                in_sandbox: false,
             };
             let sret_val = ir_func.new_value(meta);
             ir_func.params.push((sret_val, sret_ty));
@@ -548,6 +574,7 @@ impl Lowerer {
             region: self.current_region(),
             effects: EffectSet::none(),
             source_line: None,
+            in_sandbox: false,
         };
         let env_val = ir_func.new_value(env_meta);
         ir_func.params.push((env_val, IrType::Ptr(Box::new(IrType::U8))));
@@ -567,6 +594,7 @@ impl Lowerer {
                 region: self.current_region(),
                 effects: EffectSet::none(),
                 source_line: None,
+                in_sandbox: false,
             };
             let val = ir_func.new_value(meta);
             ir_func.params.push((val, ir_ty.clone()));
@@ -708,6 +736,7 @@ impl Lowerer {
                                 region: self.current_region(),
                                 effects: EffectSet::none(),
                                 source_line: None,
+                                in_sandbox: false,
                             };
                             let zid = {
                                 let fmut = self.current_func.as_mut().unwrap();
@@ -1019,22 +1048,24 @@ impl Lowerer {
                 // Determine element type from array value metadata
                 let arr_ty = self.get_value_type(arr_val);
 
-                // Vec indexing — call runtime p_vec_set / p_vec_get
+                // Vec indexing — call Fides Vec_set / Vec_get (Phase 10B)
                 if arr_ty.is_opaque_named("Vec") {
                     let elem_ty = arr_ty.generic_elem().cloned().unwrap_or(IrType::I64);
+                    let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                     if *op == AssignOp::Assign {
                         let val = self.lower_expr(expr);
                         self.emit_inst(Inst::Call {
-                            func: "p_vec_set".to_string(),
-                            args: vec![arr_val, idx_val, val],
+                            func: "Vec_set".to_string(),
+                            args: vec![dummy_env, arr_val, idx_val, val],
                             ret_ty: IrType::Void,
                             effects: EffectSet::new(),
                         });
                     } else {
-                        // Compound assignment: p_vec_get, binop, p_vec_set
+                        // Compound assignment: Vec_get, binop, Vec_set
+                        let dummy_env2 = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                         let current = self.emit_inst(Inst::Call {
-                            func: "p_vec_get".to_string(),
-                            args: vec![arr_val, idx_val],
+                            func: "Vec_get".to_string(),
+                            args: vec![dummy_env2, arr_val, idx_val],
                             ret_ty: elem_ty.clone(),
                             effects: EffectSet::new(),
                         });
@@ -1058,9 +1089,10 @@ impl Lowerer {
                             right: rhs,
                             ty: elem_ty.clone(),
                         });
+                        let dummy_env3 = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                         self.emit_inst(Inst::Call {
-                            func: "p_vec_set".to_string(),
-                            args: vec![arr_val, idx_val, new_val],
+                            func: "Vec_set".to_string(),
+                            args: vec![dummy_env3, arr_val, idx_val, new_val],
                             ret_ty: IrType::Void,
                             effects: EffectSet::new(),
                         });
@@ -1277,12 +1309,14 @@ impl Lowerer {
             }
             Stmt::ComptimeGen { .. } => {}
             Stmt::Sandbox { body, .. } => {
-                // Sandbox is transparent at the IR level — safety is
-                // enforced entirely at compile time by the typechecker.
-                // Just lower the body as normal statements.
+                // I-3C: Track sandbox context so the optimizer can do
+                // sandbox-aware devirt/inline. Safety is still enforced at
+                // compile time by the typechecker; this just propagates metadata.
+                self.sandbox_depth += 1;
                 for s in body {
                     self.lower_stmt(s);
                 }
+                self.sandbox_depth -= 1;
             }
             Stmt::Unsafe { body, .. } => {
                 // F62: emit UnsafeBegin/UnsafeEnd so the interpreter can
@@ -1315,6 +1349,9 @@ impl Lowerer {
             }
             Stmt::Backward { .. } => {
                 // Marker for the autograd pass — emit nothing here.
+            }
+            Stmt::Query { body, .. } => {
+                for s in body { self.lower_stmt(s); }
             }
         }
     }
@@ -1497,9 +1534,9 @@ impl Lowerer {
                                 return;
                             }
                         }
-                        // Check if the value came directly from p_vec_get
+                        // Check if the value came directly from Vec_get (Phase 10B)
                         if let Some(Inst::Call { func, .. }) = f.instructions.get(&iter_val) {
-                            if func == "p_vec_get" {
+                            if func == "Vec_get" {
                                 self.lower_for_vec(var, iter_val, body);
                                 return;
                             }
@@ -1598,7 +1635,7 @@ impl Lowerer {
         }
     }
 
-    /// Lower `for x in vec { body }` — iterates Vec via p_vec_len/p_vec_get
+    /// Lower `for x in vec { body }` — iterates Vec via Vec_len/Vec_get (Phase 10B)
     fn lower_for_vec(&mut self, var: &str, vec_val: ValueId, body: &[Stmt]) {
         // Determine element type: if the Vec's type is Generic("Vec", [elem]),
         // use elem as the alloca type. Otherwise default to Opaque("any").
@@ -1647,9 +1684,10 @@ impl Lowerer {
         // Condition: i < vec.len()
         self.set_current_block(cond_block);
         let idx_val = self.emit_inst(Inst::Load { ptr: idx_alloca, ty: IrType::I64 });
+        let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
         let len_val = self.emit_inst(Inst::Call {
-            func: "p_vec_len".to_string(),
-            args: vec![vec_val],
+            func: "Vec_len".to_string(),
+            args: vec![dummy_env, vec_val],
             ret_ty: IrType::I64,
             effects: EffectSet::new(),
         });
@@ -1668,9 +1706,10 @@ impl Lowerer {
         // Body: vec.get(i), store to var_alloca, lower body, increment
         self.set_current_block(body_block);
         let cur_idx = self.emit_inst(Inst::Load { ptr: idx_alloca, ty: IrType::I64 });
+        let dummy_env2 = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
         let elem_val = self.emit_inst(Inst::Call {
-            func: "p_vec_get".to_string(),
-            args: vec![vec_val, cur_idx],
+            func: "Vec_get".to_string(),
+            args: vec![dummy_env2, vec_val, cur_idx],
             ret_ty: IrType::Opaque("any".to_string()),
             effects: EffectSet::new(),
         });
@@ -2311,14 +2350,16 @@ impl Lowerer {
                         return ptr;
                     }
                 }
-                // Check if this is Vec::new() — built-in
+                // Check if this is Vec::new() — Phase 10B: now calls Fides implementation
                 if let Expr::Ident(name) = receiver.as_ref() {
                     if name == "Vec" && method == "new" {
                         // Infer element type from the typechecker's result
                         let elem_ty = self.infer_vec_elem_type();
+                        // Vec_new is a user function — prepend dummy env_ptr
+                        let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                         return self.emit_inst(Inst::Call {
-                            func: "p_vec_new".to_string(),
-                            args: vec![],
+                            func: "Vec_new".to_string(),
+                            args: vec![dummy_env],
                             ret_ty: IrType::Generic("Vec".to_string(), vec![elem_ty]),
                             effects: EffectSet::new(),
                         });
@@ -2421,6 +2462,10 @@ impl Lowerer {
                         runtime_args.push(self.lower_expr(a));
                     }
                     let (func_name, ret_ty) = if recv_ty.is_opaque_named("Vec") {
+                        // Phase 10B: Vec methods now call Fides implementation (Vec_*)
+                        // Prepend dummy env_ptr for user functions
+                        let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                        runtime_args.insert(0, dummy_env);
                         // Element type from Generic args, default to I64
                         let elem_ty = recv_ty.generic_elem().cloned().unwrap_or(IrType::I64);
                         let rt = match method.as_str() {
@@ -2444,7 +2489,7 @@ impl Lowerer {
                             "clone" => recv_ty.clone(),
                             _ => IrType::I64,
                         };
-                        (format!("p_vec_{}", method), rt)
+                        (format!("Vec_{}", method), rt)
                     } else if recv_ty.is_opaque_named("HashMap") {
                         let rt = match method.as_str() {
                             "insert" => IrType::Void,
@@ -2889,12 +2934,13 @@ impl Lowerer {
 
                 let idx_val = self.lower_expr(index);
 
-                // Vec indexing — call runtime p_vec_get with correct element type
+                // Vec indexing — call Fides Vec_get with correct element type (Phase 10B)
                 if arr_ty.is_opaque_named("Vec") {
                     let elem_ty = arr_ty.generic_elem().cloned().unwrap_or(IrType::I64);
+                    let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                     return self.emit_inst(Inst::Call {
-                        func: "p_vec_get".to_string(),
-                        args: vec![arr_val, idx_val],
+                        func: "Vec_get".to_string(),
+                        args: vec![dummy_env, arr_val, idx_val],
                         ret_ty: elem_ty,
                         effects: EffectSet::new(),
                     });
@@ -3044,9 +3090,10 @@ impl Lowerer {
                                 }
                                 IrType::Opaque(ref name) | IrType::Generic(ref name, _)
                                     if name.contains("Vec") => {
+                                    let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                                     self.emit_inst(Inst::Call {
-                                        func: "p_vec_to_str".to_string(),
-                                        args: vec![val],
+                                        func: "Vec_to_str".to_string(),
+                                        args: vec![dummy_env, val],
                                         ret_ty: IrType::Ptr(Box::new(IrType::U8)),
                                         effects: EffectSet::new(),
                                     })
@@ -3926,6 +3973,9 @@ impl Lowerer {
                 Stmt::Backward { loss, .. } => {
                     self.collect_free_vars_expr(loss, free_vars, local_names);
                 }
+                Stmt::Query { body, .. } => {
+                    self.collect_free_vars(body, free_vars, local_names);
+                }
             }
         }
     }
@@ -4159,6 +4209,12 @@ impl Lowerer {
             if let Some(line) = self.current_line {
                 if let Some(meta) = f.values.get_mut(&id) {
                     meta.source_line = Some(line);
+                }
+            }
+            // I-3C: Mark instructions emitted inside a sandbox block
+            if self.sandbox_depth > 0 {
+                if let Some(meta) = f.values.get_mut(&id) {
+                    meta.in_sandbox = true;
                 }
             }
             // Override: emit() uses next_block-1, but we need current_block

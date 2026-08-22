@@ -86,6 +86,29 @@ pub fn substitute(program: &Program) -> Result<Program, Vec<String>> {
         }
     }
 
+    // I-5A: Aggressive comptime evaluation — automatically evaluate calls to
+    // `comptime pf` functions when ALL arguments are literals, without requiring
+    // an explicit `comptime` wrapper. This moves more work to compile time.
+    // Iterate to fixed point (bounded) to handle chains of comptime calls.
+    for _ in 0..4 {
+        let snapshot3 = prog.clone();
+        let mut errs3: Vec<String> = Vec::new();
+        for func in prog.funcs.iter_mut() {
+            aggressive_comptime_func(func, &snapshot3, &mut errs3);
+        }
+        for imp in prog.impls.iter_mut() {
+            for method in imp.methods.iter_mut() {
+                aggressive_comptime_func(method, &snapshot3, &mut errs3);
+            }
+        }
+        for ti in prog.trait_impls.iter_mut() {
+            for method in ti.methods.iter_mut() {
+                aggressive_comptime_func(method, &snapshot3, &mut errs3);
+            }
+        }
+        // Don't add aggressive errors — if it fails, just leave the call as-is
+    }
+
     if errs.is_empty() {
         Ok(prog)
     } else {
@@ -149,6 +172,135 @@ fn substitute_func(func: &mut Func, original: &Program, errs: &mut Vec<String>) 
     for stmt in func.body.iter_mut() {
         substitute_stmt(stmt, original, errs);
     }
+}
+
+/// I-5A: Aggressively evaluate calls to `comptime pf` functions when all
+/// arguments are literals. This runs after normal comptime substitution and
+/// automatically converts `comptime_func(1, 2)` → literal result, without
+/// requiring an explicit `comptime` wrapper.
+fn aggressive_comptime_func(func: &mut Func, original: &Program, errs: &mut Vec<String>) {
+    for stmt in func.body.iter_mut() {
+        aggressive_comptime_stmt(stmt, original, errs);
+    }
+}
+
+fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<String>) {
+    match stmt {
+        Stmt::Let { expr, .. } => aggressive_comptime_expr(expr, original, errs),
+        Stmt::LetTuple { expr, .. } => aggressive_comptime_expr(expr, original, errs),
+        Stmt::Assign { expr, .. } => aggressive_comptime_expr(expr, original, errs),
+        Stmt::IndexAssign { index, expr, .. } => {
+            aggressive_comptime_expr(index, original, errs);
+            aggressive_comptime_expr(expr, original, errs);
+        }
+        Stmt::Expr(e, _) => aggressive_comptime_expr(e, original, errs),
+        Stmt::Return(opt, _) => {
+            if let Some(e) = opt {
+                aggressive_comptime_expr(e, original, errs);
+            }
+        }
+        Stmt::If { cond, then_block, else_block, .. } => {
+            aggressive_comptime_expr(cond, original, errs);
+            for s in then_block.iter_mut() {
+                aggressive_comptime_stmt(s, original, errs);
+            }
+            if let Some(eb) = else_block {
+                for s in eb.iter_mut() {
+                    aggressive_comptime_stmt(s, original, errs);
+                }
+            }
+        }
+        Stmt::For { iterator, body, .. } => {
+            aggressive_comptime_expr(iterator, original, errs);
+            for s in body.iter_mut() {
+                aggressive_comptime_stmt(s, original, errs);
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            aggressive_comptime_expr(cond, original, errs);
+            for s in body.iter_mut() {
+                aggressive_comptime_stmt(s, original, errs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn aggressive_comptime_expr(expr: &mut Expr, original: &Program, errs: &mut Vec<String>) {
+    // First recurse into children
+    match expr {
+        Expr::Binary { left, right, .. } => {
+            aggressive_comptime_expr(left, original, errs);
+            aggressive_comptime_expr(right, original, errs);
+        }
+        Expr::Unary { expr: inner, .. } => aggressive_comptime_expr(inner, original, errs),
+        Expr::Call { args, .. } => {
+            for a in args.iter_mut() {
+                aggressive_comptime_expr(a, original, errs);
+            }
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            aggressive_comptime_expr(receiver, original, errs);
+            for a in args.iter_mut() {
+                aggressive_comptime_expr(a, original, errs);
+            }
+        }
+        Expr::If { cond, then_block, else_block, .. } => {
+            aggressive_comptime_expr(cond, original, errs);
+            for s in then_block.iter_mut() {
+                aggressive_comptime_stmt(s, original, errs);
+            }
+            if let Some(eb) = else_block {
+                for s in eb.iter_mut() {
+                    aggressive_comptime_stmt(s, original, errs);
+                }
+            }
+        }
+        Expr::Block(stmts) => {
+            for s in stmts.iter_mut() {
+                aggressive_comptime_stmt(s, original, errs);
+            }
+        }
+        Expr::Index { array, index } => {
+            aggressive_comptime_expr(array, original, errs);
+            aggressive_comptime_expr(index, original, errs);
+        }
+        Expr::StructLit { fields, .. } => {
+            for (_, e) in fields.iter_mut() {
+                aggressive_comptime_expr(e, original, errs);
+            }
+        }
+        Expr::Match { expr: inner, arms } => {
+            aggressive_comptime_expr(inner, original, errs);
+            for arm in arms.iter_mut() {
+                for s in arm.body.iter_mut() {
+                    aggressive_comptime_stmt(s, original, errs);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // I-5A: If this is a call to a comptime pf function with all-literal args,
+    // evaluate it at compile time and replace with the result.
+    if let Expr::Call { callee, args } = expr {
+        // Check if the callee is a comptime function
+        let is_comptime_func = original.funcs.iter()
+            .any(|f| f.name == *callee && f.is_comptime);
+        if is_comptime_func && args.iter().all(is_literal) {
+            match evaluate(expr, original) {
+                Ok(result) => { *expr = result; }
+                Err(_) => {} // Don't report errors — just leave the call as-is
+            }
+        }
+    }
+}
+
+/// Check if an expression is a literal value (int, float, bool, string).
+fn is_literal(expr: &Expr) -> bool {
+    matches!(expr,
+        Expr::IntLit(_) | Expr::FloatLit(_) | Expr::BoolLit(_) | Expr::StringLit(_)
+    )
 }
 
 fn substitute_stmts(stmts: &mut [Stmt], original: &Program, errs: &mut Vec<String>) {
@@ -231,6 +383,7 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<String>) 
         Stmt::Backward { loss, .. } => {
             substitute_expr(loss, original, errs);
         }
+        Stmt::Query { body, .. } => substitute_stmts(body, original, errs),
     }
 }
 

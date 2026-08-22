@@ -66,7 +66,7 @@
 
 | Dimension | Current | Target | How |
 |---|---|---|---|
-| Performance | 6/10 | 9/10 | Custom codegen works but no LTO, no PGO, no vectorization, optimizer not enabled by default (regalloc bug). LLVM is 20+ years ahead. |
+| Performance | 6/10 | 9/10 | Custom codegen works with LTO (`--lto`), optimizer enabled by default, but no PGO (removed), no auto-vectorization. LLVM is 20+ years ahead. |
 | Safety | 9/10 | 10/10 | Regions + capabilities + effects + sandbox all enforced at compile time. No data race prevention yet. |
 | Flexibility | 7/10 | 10/10 | Inline assembly (x86 only), bare metal, comptime, FFI — all working. No cross-compilation, no dynamic loading, no C++ interop. |
 | Compilation | 10/10 | 10/10 | Custom IR, no LLVM, integrated linker, sub-second for small projects |
@@ -87,8 +87,8 @@
 > - ✅ **Memory budgets work** — `region r with budget(N)` enforced at compile time
 > - ✅ **`watch --diff` works** — PIR L2 line diff + binary size delta on each reload
 > - ✅ **Capability-aware linking works** — `--caps` flag strips ungranted functions from binary
-> - ⚠️ **Optimizer not enabled by default** — regalloc bug blocks `--opt`. Fix in progress.
-> - ✅ **C codegen at 114/114 test parity** — FULL PARITY with interpreter, no gaps. test_db no longer flaky (HashMap keys sorted).
+> - ✅ **Optimizer enabled by default** — `--opt` on by default in `build` (use `--no-opt` to disable). `--lto` for aggressive cross-module inlining. PGO has been removed.
+> - ✅ **C codegen at 101/127 test parity** — Near full parity with interpreter. test_db no longer flaky (HashMap keys sorted). Pre-existing failures from incomplete features (ECS, vec math, game stdlib).
 > - ✅ **LSP server works** — `fidesc lsp` provides JSON-RPC over stdio with live diagnostics, no external dependencies
 > - ✅ **Generic enums/structs work** — `enum Option<T>`, `struct Foo<T>` with type parameters
 > - ✅ **5 new stdlib modules** — math, env, args, process, regex
@@ -213,7 +213,7 @@ autocomplete, no goto-definition, no formatter, no linter, no debugger.
 | Loop unrolling | ✅ Automatic | ✅ Automatic | ⚠️ Limited | ✅ Automatic | ⚠️ Manual (opt has it, not enabled) |
 | Vectorization (SIMD auto) | ✅ LLVM auto-vec | ✅ LLVM auto-vec | ❌ None | ✅ GCC auto-vec | ❌ Not yet |
 | Inlining | ✅ Cross-crate | ✅ Cross-crate | ⚠️ Limited | ✅ LTO | ⚠️ Same-module only |
-| Link-time optimization | ✅ LTO | ✅ LTO | ❌ None | ✅ LTO | ❌ Not yet |
+| Link-time optimization | ✅ LTO | ✅ LTO | ❌ None | ✅ LTO | ✅ LTO (`--lto` flag) |
 | Profile-guided opt | ✅ PGO | ✅ PGO | ❌ None | ✅ PGO | ❌ Not yet |
 | Dead code elimination | ✅ LLVM | ✅ LLVM | ✅ Linker | ✅ Linker | ✅ IR-level DCE |
 | Constant propagation | ✅ LLVM | ✅ LLVM | ✅ Compiler | ✅ LLVM | ⚠️ opt has it, not enabled |
@@ -333,7 +333,7 @@ the coldest of cold starts.
 |---|---|---|
 | 100x faster compilation than Rust | **Plausible** | No LLVM, no proc macros, integrated linker. But only for small projects — Fides hasn't been tested on large codebases. |
 | 100x faster iteration | **Plausible** | Hot reload vs full rebuild. But only if you don't need a debugger, formatter, or linter — which Fides doesn't have. |
-| 10x faster runtime than Rust/Zig | **Not plausible** | Same machine code quality. Fides is actually slower due to no auto-vectorization, no LTO, no PGO. |
+| 10x faster runtime than Rust/Zig | **Not plausible** | Same machine code quality. Fides is actually slower due to no auto-vectorization, no PGO. LTO is available (`--lto`). |
 | 2-3x faster runtime in specific cases | **Not plausible today** | Region-aware optimization and effect reordering are planned but not implemented. Today Fides is slower than Rust/Zig. |
 | 10x fewer bugs than C | **Plausible** | Memory safety eliminates 70% of CVEs. But Fides's own compiler may have bugs that produce wrong code. |
 | 10x easier concurrency than Rust | **Not plausible today** | Effect handlers are theoretically simpler, but not implemented. Rust's concurrency works today; Fides's doesn't. |
@@ -391,7 +391,7 @@ Fides's authority is explicit and revocable, verified at compile time.
 |---------|---|---|
 | Machine code quality | ✅ 10/10 (40+ years of optimizer work) | ⚠️ 6/10 (custom codegen, optimizer not default, no auto-vec) |
 | Auto-vectorization | ✅ GCC/LLVM auto-vec | ❌ Not yet |
-| Link-time optimization | ✅ LTO | ❌ Not yet |
+| Link-time optimization | ✅ LTO | ✅ LTO (`--lto` flag) |
 | Profile-guided optimization | ✅ PGO | ❌ Not yet |
 | Register allocation | ✅ Graph coloring (mature) | ⚠️ Linear scan (known bug) |
 | Zero-cost abstractions | ✅ Yes | ✅ Yes (capabilities, effects, regions all zero-cost) |
@@ -581,9 +581,9 @@ Fides can.
 
 | Feature | Rust | Fides |
 |---------|------|---|
-| Machine code quality | ✅ 9/10 (LLVM backend, 20+ years) | ⚠️ 6/10 (custom codegen, no auto-vec, no LTO) |
+| Machine code quality | ✅ 9/10 (LLVM backend, 20+ years) | ⚠️ 6/10 (custom codegen, no auto-vec, LTO available) |
 | Auto-vectorization | ✅ LLVM auto-vec | ❌ Not yet |
-| Link-time optimization | ✅ LTO | ❌ Not yet |
+| Link-time optimization | ✅ LTO | ✅ LTO (`--lto` flag) |
 | Profile-guided optimization | ✅ PGO | ❌ Not yet |
 | Register allocation | ✅ Graph coloring (LLVM) | ⚠️ Linear scan (known bug) |
 | Zero-cost abstractions | ✅ Yes | ✅ Yes |
@@ -828,9 +828,9 @@ answer, not Zig.
 
 | Feature | Zig | Fides |
 |---------|-----|---|
-| Machine code quality | ✅ 9/10 (LLVM backend) | ⚠️ 6/10 (custom codegen, no auto-vec, no LTO) |
+| Machine code quality | ✅ 9/10 (LLVM backend) | ⚠️ 6/10 (custom codegen, no auto-vec, LTO available) |
 | Auto-vectorization | ✅ LLVM auto-vec | ❌ Not yet |
-| Link-time optimization | ✅ LTO | ❌ Not yet |
+| Link-time optimization | ✅ LTO | ✅ LTO (`--lto` flag) |
 | Profile-guided optimization | ✅ PGO | ❌ Not yet |
 | Register allocation | ✅ LLVM (graph coloring) | ⚠️ Linear scan (known bug) |
 | Zero-cost abstractions | ✅ Yes | ✅ Yes |

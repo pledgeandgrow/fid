@@ -269,6 +269,10 @@ pub struct Interpreter {
     dl_handles: HashMap<i64, String>,
     /// Next dynamic loading handle
     next_dl_handle: i64,
+    /// Phase 8B: ECS entity count
+    ecs_entity_count: i64,
+    /// Phase 8B: ECS component storage — maps component name → (entity_id → value)
+    ecs_components: HashMap<String, HashMap<i64, Value>>,
 }
 
 /// Result of running a function
@@ -315,6 +319,8 @@ impl Interpreter {
             next_mutex_handle: 1,
             dl_handles: HashMap::new(),
             next_dl_handle: 1,
+            ecs_entity_count: 0,
+            ecs_components: HashMap::new(),
         };
         // Pre-allocate string constants
         interp.init_strings();
@@ -976,6 +982,35 @@ impl Interpreter {
 
             Inst::Print { value, ty } => {
                 let v = values.get(value).cloned().unwrap_or(Value::Void);
+                // Phase 10B: Vec values are now raw pointers — check IR type
+                // and call Vec_to_str to format them properly.
+                if ty.is_opaque_named("Vec") {
+                    if let Value::Ptr(_) | Value::Int(_) = &v {
+                        if let Some(callee) = self.module.functions.get("Vec_to_str").cloned() {
+                            let to_str_args = vec![Value::Int(0), v.clone()];
+                            match self.run_function(&callee, &to_str_args) {
+                                RunResult::Return(Value::Str(s)) => {
+                                    print!("{}", s);
+                                    return ExecOutcome::Continue;
+                                }
+                                RunResult::Return(Value::Ptr(addr)) => {
+                                    let mut bytes = Vec::new();
+                                    let mut offset = addr;
+                                    loop {
+                                        let b = self.memory.load(offset, 1);
+                                        if b[0] == 0 { break; }
+                                        bytes.push(b[0]);
+                                        offset += 1;
+                                    }
+                                    print!("{}", String::from_utf8_lossy(&bytes));
+                                    return ExecOutcome::Continue;
+                                }
+                                RunResult::Panic(msg) => return ExecOutcome::Panic(msg),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
                 match &v {
                     Value::Int(i) => print!("{}", i),
                     Value::Float(f) => print!("{}", f),
@@ -1255,17 +1290,40 @@ impl Interpreter {
                 }
             }
             (Value::Ptr(a), Value::Int(b)) => {
-                // Pointer compared to integer (e.g. ptr == 0 for null check)
+                // Phase 10B: pointer arithmetic (Ptr + Int, Ptr - Int, comparisons)
                 match op {
+                    BinOp::Add => Value::Ptr(*a + *b as u64),
+                    BinOp::Sub => Value::Ptr(a.wrapping_sub(*b as u64)),
                     BinOp::Eq => Value::Bool(*a as i64 == *b),
                     BinOp::Neq => Value::Bool(*a as i64 != *b),
+                    BinOp::Lt => Value::Bool((*a as i64) < *b),
+                    BinOp::LtEq => Value::Bool((*a as i64) <= *b),
+                    BinOp::Gt => Value::Bool((*a as i64) > *b),
+                    BinOp::GtEq => Value::Bool((*a as i64) >= *b),
                     _ => Value::Void,
                 }
             }
             (Value::Int(a), Value::Ptr(b)) => {
                 match op {
+                    BinOp::Add => Value::Ptr(*a as u64 + *b),
                     BinOp::Eq => Value::Bool(*a == *b as i64),
                     BinOp::Neq => Value::Bool(*a != *b as i64),
+                    BinOp::Lt => Value::Bool(*a < *b as i64),
+                    BinOp::LtEq => Value::Bool(*a <= *b as i64),
+                    BinOp::Gt => Value::Bool(*a > *b as i64),
+                    BinOp::GtEq => Value::Bool(*a >= *b as i64),
+                    _ => Value::Void,
+                }
+            }
+            (Value::Ptr(a), Value::Ptr(b)) => {
+                // Pointer-pointer comparison
+                match op {
+                    BinOp::Eq => Value::Bool(a == b),
+                    BinOp::Neq => Value::Bool(a != b),
+                    BinOp::Lt => Value::Bool(a < b),
+                    BinOp::LtEq => Value::Bool(a <= b),
+                    BinOp::Gt => Value::Bool(a > b),
+                    BinOp::GtEq => Value::Bool(a >= b),
                     _ => Value::Void,
                 }
             }
@@ -1341,6 +1399,7 @@ impl Interpreter {
             || name.starts_with("p_mutex_")
             || name.starts_with("p_shared_")
             || name.starts_with("p_future_")
+            || name.starts_with("__ecs_")
     }
 
     /// Call a runtime function
@@ -1417,6 +1476,10 @@ impl Interpreter {
             }
             "p_free" => {
                 // Interpreter doesn't actually free — memory is arena-based
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_region_free" => {
+                // I-1C: Region bulk free — interpreter doesn't actually free
                 ExecOutcome::Value(Value::Void)
             }
             "p_str_concat" => {
@@ -1730,14 +1793,40 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Void)
             }
             "p_map_keys" => {
+                // Phase 10B: return a Fides Vec (raw pointer) instead of Value::Vec
                 if let Some(Value::Map(m)) = args.first() {
-                    let keys: SmallVec<[Value; 8]> = m.borrow()
-                        .keys()
-                        .map(|k| Value::Str(CompactString::from(k.as_str())))
-                        .collect();
-                    return ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(keys))));
+                    // Create a Fides Vec via Vec_new
+                    let vec_args = vec![Value::Int(0)];
+                    if let Some(callee) = self.module.functions.get("Vec_new").cloned() {
+                        if let RunResult::Return(Value::Ptr(vec_ptr)) = self.run_function(&callee, &vec_args) {
+                            // Push each key into the Vec
+                            let push_callee = self.module.functions.get("Vec_push").cloned();
+                            for k in m.borrow().keys() {
+                                if let Some(ref push_fn) = push_callee {
+                                    let key_val = Value::Str(CompactString::from(k.as_str()));
+                                    // Store the string pointer as i64
+                                    let str_ptr = if let Value::Str(s) = &key_val {
+                                        let str_addr = self.memory.alloc(s.len() as u64 + 1);
+                                        self.memory.store(str_addr, s.as_bytes());
+                                        self.memory.store(str_addr + s.len() as u64, &[0]);
+                                        str_addr as i64
+                                    } else { 0 };
+                                    let push_args = vec![Value::Int(0), Value::Ptr(vec_ptr), Value::Int(str_ptr)];
+                                    let _ = self.run_function(push_fn, &push_args);
+                                }
+                            }
+                            return ExecOutcome::Value(Value::Ptr(vec_ptr));
+                        }
+                    }
                 }
-                ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(SmallVec::new()))))
+                // Fallback: empty Vec
+                let vec_args = vec![Value::Int(0)];
+                if let Some(callee) = self.module.functions.get("Vec_new").cloned() {
+                    if let RunResult::Return(v) = self.run_function(&callee, &vec_args) {
+                        return ExecOutcome::Value(v);
+                    }
+                }
+                ExecOutcome::Value(Value::Int(0))
             }
             "p_map_values" => {
                 if let Some(Value::Map(m)) = args.first() {
@@ -3212,6 +3301,91 @@ impl Interpreter {
                     _ => 0,
                 };
                 ExecOutcome::Value(Value::Int(arg))
+            }
+
+            // ─── Phase 8B: ECS Runtime Functions ───────────────────────
+            "__ecs_create_entity" => {
+                self.ecs_entity_count += 1;
+                ExecOutcome::Value(Value::Int(self.ecs_entity_count - 1))
+            }
+            "__ecs_entity_count" => {
+                ExecOutcome::Value(Value::Int(self.ecs_entity_count))
+            }
+            "__ecs_has" => {
+                // __ecs_has(component_name: str, entity: i64) -> i64
+                // Note: lowerer prepends __env as first arg
+                let (comp_name, entity) = if let (Some(Value::Str(c)), Some(Value::Int(e))) = (args.first(), args.get(1)) {
+                    (c, e)
+                } else if let (Some(Value::Str(c)), Some(Value::Int(e))) = (args.get(1), args.get(2)) {
+                    (c, e)
+                } else {
+                    return ExecOutcome::Value(Value::Int(0));
+                };
+                let key = comp_name.to_string();
+                let has = self.ecs_components
+                    .get(&key)
+                    .and_then(|m| m.get(entity))
+                    .is_some();
+                ExecOutcome::Value(Value::Int(if has { 1 } else { 0 }))
+            }
+            "__ecs_get" => {
+                // __ecs_get(component_name: str, entity: i64) -> ?
+                let (comp_name, entity) = if let (Some(Value::Str(c)), Some(Value::Int(e))) = (args.first(), args.get(1)) {
+                    (c, e)
+                } else if let (Some(Value::Str(c)), Some(Value::Int(e))) = (args.get(1), args.get(2)) {
+                    (c, e)
+                } else {
+                    return ExecOutcome::Value(Value::Int(0));
+                };
+                let key = comp_name.to_string();
+                let val = self.ecs_components
+                    .get(&key)
+                    .and_then(|m| m.get(entity))
+                    .cloned()
+                    .unwrap_or(Value::Int(0));
+                ExecOutcome::Value(val)
+            }
+            "__ecs_add" => {
+                // __ecs_add(component_name: str, entity: i64, value: struct) -> void
+                // Note: lowerer prepends __env and SRET pointer for struct param
+                // So args may be: [sret_ptr, __env, comp_name, entity, value_ptr]
+                // or: [__env, comp_name, entity, value_ptr]
+                // Try to find comp_name (Value::Str) and entity (Value::Int)
+                let mut comp_name: Option<&CompactString> = None;
+                let mut entity: Option<&i64> = None;
+                let mut value: Option<&Value> = None;
+                for (i, arg) in args.iter().enumerate() {
+                    match arg {
+                        Value::Str(s) if comp_name.is_none() => { comp_name = Some(s); }
+                        Value::Int(n) if entity.is_none() && i > 0 => { entity = Some(n); }
+                        Value::Ptr(_) if value.is_none() => { value = Some(arg); }
+                        _ => {}
+                    }
+                }
+                if let (Some(cn), Some(e)) = (comp_name, entity) {
+                    let key = cn.to_string();
+                    let val = value.cloned().unwrap_or(Value::Int(0));
+                    self.ecs_components
+                        .entry(key)
+                        .or_insert_with(HashMap::new)
+                        .insert(*e, val);
+                }
+                ExecOutcome::Continue
+            }
+            "__ecs_remove" => {
+                // __ecs_remove(component_name: str, entity: i64) -> void
+                let (comp_name, entity) = if let (Some(Value::Str(c)), Some(Value::Int(e))) = (args.first(), args.get(1)) {
+                    (c, e)
+                } else if let (Some(Value::Str(c)), Some(Value::Int(e))) = (args.get(1), args.get(2)) {
+                    (c, e)
+                } else {
+                    return ExecOutcome::Continue;
+                };
+                let key = comp_name.to_string();
+                if let Some(m) = self.ecs_components.get_mut(&key) {
+                    m.remove(entity);
+                }
+                ExecOutcome::Continue
             }
 
             _ => ExecOutcome::Panic(format!("Unknown runtime function: {}", name)),

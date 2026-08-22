@@ -1,0 +1,77 @@
+// Test: async/await with OS thread concurrency model (Phase 7.6)
+//
+// This test verifies that:
+// 1. async function calls spawn OS threads (not eager)
+// 2. spawn creates concurrent threads
+// 3. await joins threads and returns results
+// 4. Multiple spawned tasks run concurrently
+// 5. Shared memory + atomics work across threads
+
+use sync;
+
+// Simple async function — spawns a thread when called
+async pf compute(x: i64) -> Future<i64> {
+    ret x * 2;
+}
+
+// Async function that does work using shared memory
+pf increment_counter(counter: i64, n: i64) -> i64 {
+    pv i = 0;
+    while i < n {
+        p_atomic_add(counter, 1);
+        i = i + 1;
+    }
+    ret p_atomic_load(counter);
+}
+
+pf main() {
+    // Test 1: basic async + await
+    pv f = compute(21);
+    pv r = await f;
+    print("compute(21) = ");
+    print(r);
+    print("\n");
+
+    // Test 2: spawn multiple concurrent tasks
+    pv t1 = spawn compute(50);
+    pv t2 = spawn compute(100);
+    pv r1 = await t1;
+    pv r2 = await t2;
+    print("spawn compute(50) = ");
+    print(r1);
+    print("\n");
+    print("spawn compute(100) = ");
+    print(r2);
+    print("\n");
+
+    // Test 3: concurrent workers with shared atomics
+    pv counter = p_shared_alloc(8);
+    p_atomic_store(counter, 0);
+
+    pv w1 = spawn increment_counter(counter, 500);
+    pv w2 = spawn increment_counter(counter, 500);
+
+    pv c1 = await w1;
+    pv c2 = await w2;
+
+    print("counter after workers = ");
+    print(p_atomic_load(counter));
+    print("\n");
+
+    // Test 4: chained async calls
+    pv chained = await compute(await compute(5));
+    print("chained = ");
+    print(chained);
+    print("\n");
+
+    // Verify results
+    if r == 42 && r1 == 100 && r2 == 200 && chained == 20 {
+        if p_atomic_load(counter) == 1000 {
+            print("OK\n");
+        } else {
+            print("FAIL: counter expected 1000\n");
+        }
+    } else {
+        print("FAIL: wrong results\n");
+    }
+}

@@ -33,6 +33,7 @@ use crate::ir::{
 };
 use std::collections::HashMap;
 use std::fmt;
+use std::collections::HashSet;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Shared PIR types
@@ -262,6 +263,20 @@ pub struct L1Function {
     pub effects: EffectSet,
     pub caps: CapSet,
     pub entry: PBlock,
+    /// Whether this function is @wrapping (F65) — wrap-around arithmetic.
+    pub is_wrapping: bool,
+    /// Whether this function is @deterministic — reproducible, can be memoized.
+    pub is_deterministic: bool,
+    /// Whether this function is @crashfree — can't panic, safe to inline aggressively.
+    pub is_crashfree: bool,
+    /// I-3C: Values produced inside `sandbox {}` blocks.
+    pub sandbox_values: std::collections::HashSet<PValue>,
+    /// Gas limit from @gas(N) — None = no limit. Used by unroller (I-4C).
+    pub gas_limit: Option<u64>,
+    /// Whether this function is @no-alloc — cannot allocate heap memory.
+    pub is_no_alloc: bool,
+    /// Whether this function is @medical — IEC 62304 safety.
+    pub is_medical: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -271,6 +286,7 @@ pub struct L1Module {
     pub string_constants: HashMap<String, String>,
     pub extern_functions: HashMap<String, (Vec<PirType>, PirType)>,
     pub trait_methods: HashMap<String, Vec<String>>,
+    pub trait_impls: HashMap<String, Vec<String>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -403,6 +419,27 @@ pub struct L2Function {
     pub blocks: Vec<L2Block>,
     pub values: HashMap<PValue, L2Inst>,
     pub entry: PBlock,
+    /// Whether this function is pure (no side effects).
+    /// Used by the inline cost model (F-3F) to inline pure functions more aggressively.
+    pub is_pure: bool,
+    /// Whether this function is @wrapping (F65) — wrap-around arithmetic.
+    /// Used by the optimizer for reassociation (I-4E).
+    pub is_wrapping: bool,
+    /// Whether this function is @deterministic — reproducible, can be memoized.
+    /// Used for memoization (I-4A) and loop hoisting.
+    pub is_deterministic: bool,
+    /// Whether this function is @crashfree — can't panic, safe to inline aggressively.
+    /// Used by the inline cost model (F-3F).
+    pub is_crashfree: bool,
+    /// I-3C: Values produced inside `sandbox {}` blocks. Used by the optimizer
+    /// for sandbox-aware devirt and more aggressive inlining.
+    pub sandbox_values: std::collections::HashSet<PValue>,
+    /// Gas limit from @gas(N) — None = no limit. Used by unroller (I-4C).
+    pub gas_limit: Option<u64>,
+    /// Whether this function is @no-alloc — cannot allocate heap memory.
+    pub is_no_alloc: bool,
+    /// Whether this function is @medical — IEC 62304 safety.
+    pub is_medical: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -412,6 +449,7 @@ pub struct L2Module {
     pub string_constants: HashMap<String, String>,
     pub extern_functions: HashMap<String, (Vec<PirType>, PirType)>,
     pub trait_methods: HashMap<String, Vec<String>>,
+    pub trait_impls: HashMap<String, Vec<String>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -573,6 +611,14 @@ pub struct L3Module {
     /// Trait method names in order, for vtable dispatch.
     /// Maps trait name → list of method names.
     pub trait_methods: HashMap<String, Vec<String>>,
+    /// Trait implementations: maps trait name → list of type names.
+    pub trait_impls: HashMap<String, Vec<String>>,
+    /// Set of pure function names (F-1D: effect-aware regalloc).
+    /// Calls to these functions don't clobber caller-saved registers.
+    pub pure_functions: HashSet<String>,
+    /// Set of @no-alloc function names (I-2D: effect-aware regalloc).
+    /// Calls to these functions don't clobber allocator state registers.
+    pub no_alloc_functions: HashSet<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -592,6 +638,7 @@ pub fn lower_ir_to_l1(module: &IrModule) -> L1Module {
     l1.string_constants = module.string_constants.clone();
     l1.extern_functions = module.extern_functions.clone();
     l1.trait_methods = module.trait_methods.clone();
+    l1.trait_impls = module.trait_impls.clone();
 
     // Process functions in a deterministic order (sorted by name) for stable
     // printer output.
@@ -797,6 +844,12 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
         values.insert(*vid, (l1_inst, region, effects, src_line));
     }
 
+    // I-3C: Collect values produced inside sandbox blocks
+    let sandbox_values: std::collections::HashSet<PValue> = f.instructions.iter()
+        .filter(|(vid, _)| f.values.get(vid).map(|m| m.in_sandbox).unwrap_or(false))
+        .map(|(vid, _)| ValueId(vid.0))
+        .collect();
+
     let blocks = f
         .blocks
         .iter()
@@ -823,6 +876,13 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
         effects: func_effects,
         caps: CapSet::new(),
         entry: f.entry,
+        is_wrapping: f.is_wrapping,
+        is_deterministic: f.is_deterministic,
+        is_crashfree: f.is_crashfree,
+        sandbox_values,
+        gas_limit: f.gas_limit,
+        is_no_alloc: f.is_no_alloc,
+        is_medical: f.is_medical,
     }
 }
 
@@ -840,6 +900,7 @@ pub fn lower_l1_to_l2(l1: &L1Module) -> L2Module {
     l2.string_constants = l1.string_constants.clone();
     l2.extern_functions = l1.extern_functions.clone();
     l2.trait_methods = l1.trait_methods.clone();
+    l2.trait_impls = l1.trait_impls.clone();
     l2.functions = l1.functions.iter().map(lower_func_l1_to_l2).collect();
     l2
 }
@@ -1020,6 +1081,14 @@ fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
         blocks,
         values,
         entry: f.entry,
+        is_pure: f.effects.is_pure(),
+        is_wrapping: f.is_wrapping,
+        is_deterministic: f.is_deterministic,
+        is_crashfree: f.is_crashfree,
+        sandbox_values: f.sandbox_values.clone(),
+        gas_limit: f.gas_limit,
+        is_no_alloc: f.is_no_alloc,
+        is_medical: f.is_medical,
     }
 }
 
@@ -1036,6 +1105,18 @@ pub fn lower_l2_to_l3(l2: &L2Module, module: &IrModule) -> L3Module {
     l3.string_constants = l2.string_constants.clone();
     l3.extern_functions = l2.extern_functions.clone();
     l3.trait_methods = l2.trait_methods.clone();
+    l3.trait_impls = l2.trait_impls.clone();
+    // Populate pure function set for F-1D (effect-aware regalloc).
+    // A function is pure if its `is_pure` flag is set (no side effects).
+    for f in &l2.functions {
+        if f.is_pure {
+            l3.pure_functions.insert(f.name.clone());
+        }
+        // I-2D: Populate no-alloc function set for effect-aware regalloc.
+        if f.is_no_alloc || f.is_medical {
+            l3.no_alloc_functions.insert(f.name.clone());
+        }
+    }
     l3.functions = l2.functions.iter().map(|f| lower_func_l2_to_l3(f, module)).collect();
     l3
 }

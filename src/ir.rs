@@ -444,6 +444,9 @@ pub struct ValueMeta {
     pub effects: EffectSet,
     /// Source location for debugging (line number in source)
     pub source_line: Option<usize>,
+    /// Whether this value was produced inside a `sandbox {}` block.
+    /// Used by the optimizer for sandbox-aware devirt/inline (I-3C).
+    pub in_sandbox: bool,
 }
 
 // ─── Instructions ───────────────────────────────────────────────────────
@@ -926,6 +929,22 @@ pub struct IrFunction {
     /// Whether this function is annotated @wrapping (F65).
     /// @wrapping functions use wrap-around arithmetic instead of checked arithmetic.
     pub is_wrapping: bool,
+    /// Whether this function is annotated @deterministic.
+    /// @deterministic functions are reproducible — same inputs → same outputs.
+    /// Used for memoization (I-4A) and loop hoisting.
+    pub is_deterministic: bool,
+    /// Whether this function is annotated @crashfree — can't panic at runtime.
+    /// Used by the inline cost model (F-3F) to inline more aggressively.
+    pub is_crashfree: bool,
+    /// Gas limit from @gas(N) annotation. None = no gas limit.
+    /// Used by the unroller (I-4C) to allow larger unrolling when gas proves termination.
+    pub gas_limit: Option<u64>,
+    /// Whether this function is @no-alloc — cannot allocate heap memory.
+    /// Used by regalloc (I-2D) to skip allocator state preservation.
+    pub is_no_alloc: bool,
+    /// Whether this function is @medical — IEC 62304 / DAL-A safety.
+    /// Implies @no-alloc + @no-recursion + @crashfree + @requires-audit.
+    pub is_medical: bool,
 }
 
 impl IrFunction {
@@ -945,6 +964,11 @@ impl IrFunction {
             is_interrupt: false,
             persist_vars: Vec::new(),
             is_wrapping: false,
+            is_deterministic: false,
+            is_crashfree: false,
+            gas_limit: None,
+            is_no_alloc: false,
+            is_medical: false,
         };
         // Create entry block
         func.new_block();
@@ -983,6 +1007,7 @@ impl IrFunction {
             region: Region::Stack,
             effects,
             source_line: None,
+            in_sandbox: false,
         };
 
         let id = self.new_value(meta);
@@ -1009,6 +1034,7 @@ impl IrFunction {
             region: Region::Stack,
             effects: EffectSet::none(),
             source_line: None,
+            in_sandbox: false,
         };
         let id = self.new_value(meta);
         let block_idx = block.0 as usize;
@@ -1109,6 +1135,10 @@ pub struct IrModule {
     /// Trait method names in order, for vtable dispatch.
     /// Maps trait name → list of method names.
     pub trait_methods: HashMap<String, Vec<String>>,
+    /// Trait implementations: maps trait name → list of type names that implement it.
+    /// Used by devirtualization (F-3D) to replace DynCall with direct Call
+    /// when only one impl exists.
+    pub trait_impls: HashMap<String, Vec<String>>,
 }
 
 impl IrModule {
@@ -1121,6 +1151,7 @@ impl IrModule {
             function_effects: HashMap::new(),
             extern_decls: Vec::new(),
             trait_methods: HashMap::new(),
+            trait_impls: HashMap::new(),
         }
     }
 

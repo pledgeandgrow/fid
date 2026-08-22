@@ -195,3 +195,573 @@ pub cap Iterator {
 pub cap Error {
     pf message(self: Self) -> str;
 }
+
+// ─── Vec<T> (Phase 10B) ─────────────────────────────────────────────────
+// Dynamic array with amortized O(1) push/pop.
+// Implemented in pure Fides using raw pointers — no compiler builtins.
+//
+// Internal layout: 24-byte heap block { data: *i64, len: i64, capacity: i64 }
+// The Vec value is an i64 pointer to this block.
+// Element data is a separate heap allocation of capacity * 8 bytes.
+//
+// All functions take the Vec as i64 (the pointer to the block).
+// Mutation is in-place through the pointer — no return-and-reassign needed.
+
+pub pf Vec_new() -> i64 {
+    pv ptr: i64 = p_malloc(24);
+    pv p0: *mut i64 = ptr;
+    pv p8: *mut i64 = ptr + 8;
+    pv p16: *mut i64 = ptr + 16;
+    unsafe {
+        *p0 = 0;
+        *p8 = 0;
+        *p16 = 0;
+    }
+    ret ptr;
+}
+
+pub pf Vec_push(v: i64, val: i64) {
+    pv len_ptr: *mut i64 = v + 8;
+    pv cap_ptr: *mut i64 = v + 16;
+    pv data_ptr_ptr: *mut i64 = v;
+
+    pm len: i64;
+    pm capacity: i64;
+    pm data: i64;
+
+    unsafe {
+        len = *len_ptr;
+        capacity = *cap_ptr;
+        data = *data_ptr_ptr;
+    }
+
+    if len >= capacity {
+        pv new_capacity: i64 = 8;
+        if capacity > 0 {
+            new_capacity = capacity * 2;
+        }
+        pv new_data: i64 = p_malloc(new_capacity * 8);
+
+        pv i: i64 = 0;
+        while i < len {
+            pv src_addr: i64 = data + i * 8;
+            pv src_ptr: *mut i64 = src_addr;
+            pv dst_addr: i64 = new_data + i * 8;
+            pv dst_ptr: *mut i64 = dst_addr;
+            unsafe {
+                pv old_val: i64 = *src_ptr;
+                *dst_ptr = old_val;
+            }
+            i = i + 1;
+        }
+
+        if data != 0 {
+            p_free(data);
+        }
+
+        unsafe {
+            *data_ptr_ptr = new_data;
+            *cap_ptr = new_capacity;
+        }
+    }
+
+    unsafe {
+        data = *data_ptr_ptr;
+    }
+
+    pv addr: i64 = data + len * 8;
+    pv elem_ptr: *mut i64 = addr;
+    unsafe {
+        *elem_ptr = val;
+    }
+
+    pv new_len: i64 = len + 1;
+    unsafe {
+        *len_ptr = new_len;
+    }
+}
+
+pub pf Vec_pop(v: i64) -> i64 {
+    pv len_ptr: *mut i64 = v + 8;
+    pv data_ptr_ptr: *mut i64 = v;
+
+    pm len: i64;
+    unsafe {
+        len = *len_ptr;
+    }
+
+    if len == 0 {
+        ret 0;
+    }
+
+    pm data: i64;
+    unsafe {
+        data = *data_ptr_ptr;
+    }
+
+    pv addr: i64 = data + (len - 1) * 8;
+    pv elem_ptr: *mut i64 = addr;
+    pm result: i64;
+    unsafe {
+        result = *elem_ptr;
+    }
+
+    pv new_len: i64 = len - 1;
+    unsafe {
+        *len_ptr = new_len;
+    }
+
+    ret result;
+}
+
+pub pf Vec_len(v: i64) -> i64 {
+    pv len_ptr: *mut i64 = v + 8;
+    pm result: i64;
+    unsafe {
+        result = *len_ptr;
+    }
+    ret result;
+}
+
+pub pf Vec_is_empty(v: i64) -> bool {
+    pv len_ptr: *mut i64 = v + 8;
+    pm len: i64;
+    unsafe {
+        len = *len_ptr;
+    }
+    ret len == 0;
+}
+
+pub pf Vec_get(v: i64, idx: i64) -> i64 {
+    pv len_ptr: *mut i64 = v + 8;
+    pv data_ptr_ptr: *mut i64 = v;
+
+    pm len: i64;
+    unsafe {
+        len = *len_ptr;
+    }
+
+    if idx >= len {
+        p_panic("Vec index out of bounds");
+    }
+    if idx < 0 {
+        p_panic("Vec index out of bounds");
+    }
+
+    pm data: i64;
+    unsafe {
+        data = *data_ptr_ptr;
+    }
+
+    pv addr: i64 = data + idx * 8;
+    pv ptr: *mut i64 = addr;
+    pv result: i64 = 0;
+    unsafe {
+        result = *ptr;
+    }
+    ret result;
+}
+
+pub pf Vec_set(v: i64, idx: i64, val: i64) {
+    pv len_ptr: *mut i64 = v + 8;
+    pv data_ptr_ptr: *mut i64 = v;
+
+    pm len: i64;
+    unsafe {
+        len = *len_ptr;
+    }
+
+    if idx >= len {
+        p_panic("Vec index out of bounds");
+    }
+    if idx < 0 {
+        p_panic("Vec index out of bounds");
+    }
+
+    pm data: i64;
+    unsafe {
+        data = *data_ptr_ptr;
+    }
+
+    pv addr: i64 = data + idx * 8;
+    pv ptr: *mut i64 = addr;
+    unsafe {
+        *ptr = val;
+    }
+}
+
+pub pf Vec_clear(v: i64) {
+    pv len_ptr: *mut i64 = v + 8;
+    unsafe {
+        *len_ptr = 0;
+    }
+}
+
+pub pf Vec_capacity(v: i64) -> i64 {
+    pv cap_ptr: *mut i64 = v + 16;
+    pm result: i64;
+    unsafe {
+        result = *cap_ptr;
+    }
+    ret result;
+}
+
+pub pf Vec_contains(v: i64, val: i64) -> bool {
+    pv len_ptr: *mut i64 = v + 8;
+    pv data_ptr_ptr: *mut i64 = v;
+
+    pm len: i64;
+    unsafe {
+        len = *len_ptr;
+    }
+
+    pm data: i64;
+    unsafe {
+        data = *data_ptr_ptr;
+    }
+
+    pv i: i64 = 0;
+    while i < len {
+        pv addr: i64 = data + i * 8;
+        pv ptr: *mut i64 = addr;
+        pv elem: i64 = 0;
+        unsafe {
+            elem = *ptr;
+        }
+        if elem == val {
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub pf Vec_first(v: i64) -> i64 {
+    pv len_ptr: *mut i64 = v + 8;
+    pv data_ptr_ptr: *mut i64 = v;
+
+    pm len: i64;
+    unsafe {
+        len = *len_ptr;
+    }
+
+    if len == 0 {
+        p_panic("Vec is empty");
+    }
+
+    pm data: i64;
+    unsafe {
+        data = *data_ptr_ptr;
+    }
+
+    pv ptr: *mut i64 = data;
+    pv result: i64 = 0;
+    unsafe {
+        result = *ptr;
+    }
+    ret result;
+}
+
+pub pf Vec_last(v: i64) -> i64 {
+    pv len_ptr: *mut i64 = v + 8;
+    pv data_ptr_ptr: *mut i64 = v;
+
+    pm len: i64;
+    unsafe {
+        len = *len_ptr;
+    }
+
+    if len == 0 {
+        p_panic("Vec is empty");
+    }
+
+    pm data: i64;
+    unsafe {
+        data = *data_ptr_ptr;
+    }
+
+    pv addr: i64 = data + (len - 1) * 8;
+    pv ptr: *mut i64 = addr;
+    pv result: i64 = 0;
+    unsafe {
+        result = *ptr;
+    }
+    ret result;
+}
+
+pub pf Vec_truncate(v: i64, n: i64) {
+    pv len_ptr: *mut i64 = v + 8;
+    pm len: i64;
+    unsafe {
+        len = *len_ptr;
+    }
+    if n < len {
+        unsafe {
+            *len_ptr = n;
+        }
+    }
+}
+
+pub pf Vec_reverse(v: i64) {
+    pv len_ptr: *mut i64 = v + 8;
+    pv data_ptr_ptr: *mut i64 = v;
+
+    pm len: i64;
+    unsafe {
+        len = *len_ptr;
+    }
+
+    pm data: i64;
+    unsafe {
+        data = *data_ptr_ptr;
+    }
+
+    pv i: i64 = 0;
+    while i < len / 2 {
+        pv lo_addr: i64 = data + i * 8;
+        pv hi_addr: i64 = data + (len - 1 - i) * 8;
+        pv lo_ptr: *mut i64 = lo_addr;
+        pv hi_ptr: *mut i64 = hi_addr;
+        unsafe {
+            pv lo_val: i64 = *lo_ptr;
+            pv hi_val: i64 = *hi_ptr;
+            *lo_ptr = hi_val;
+            *hi_ptr = lo_val;
+        }
+        i = i + 1;
+    }
+}
+
+pub pf Vec_extend(v: i64, other: i64) {
+    pv other_len_ptr: *mut i64 = other + 8;
+    pv other_data_ptr_ptr: *mut i64 = other;
+
+    pm other_len: i64;
+    unsafe {
+        other_len = *other_len_ptr;
+    }
+
+    pm other_data: i64;
+    unsafe {
+        other_data = *other_data_ptr_ptr;
+    }
+
+    pv i: i64 = 0;
+    while i < other_len {
+        pv addr: i64 = other_data + i * 8;
+        pv ptr: *mut i64 = addr;
+        pv elem: i64 = 0;
+        unsafe {
+            elem = *ptr;
+        }
+        Vec_push(v, elem);
+        i = i + 1;
+    }
+}
+
+pub pf Vec_insert(v: i64, idx: i64, val: i64) {
+    pv len_ptr: *mut i64 = v + 8;
+    pv data_ptr_ptr: *mut i64 = v;
+
+    pm len: i64;
+    unsafe {
+        len = *len_ptr;
+    }
+
+    if idx < 0 {
+        p_panic("Vec insert index out of bounds");
+    }
+    if idx > len {
+        p_panic("Vec insert index out of bounds");
+    }
+
+    // Push a dummy to grow if needed, then shift elements right
+    Vec_push(v, 0);
+
+    // Re-read len and data (push may have reallocated)
+    unsafe {
+        len = *len_ptr;
+    }
+    pm data: i64;
+    unsafe {
+        data = *data_ptr_ptr;
+    }
+
+    // Shift elements right from end to idx
+    pv i: i64 = len - 1;
+    while i > idx {
+        pv cur_addr: i64 = data + i * 8;
+        pv prev_addr: i64 = data + (i - 1) * 8;
+        pv cur_ptr: *mut i64 = cur_addr;
+        pv prev_ptr: *mut i64 = prev_addr;
+        unsafe {
+            pv prev_val: i64 = *prev_ptr;
+            *cur_ptr = prev_val;
+        }
+        i = i - 1;
+    }
+
+    // Store the new value at idx
+    pv addr: i64 = data + idx * 8;
+    pv ptr: *mut i64 = addr;
+    unsafe {
+        *ptr = val;
+    }
+}
+
+pub pf Vec_remove(v: i64, idx: i64) -> i64 {
+    pv len_ptr: *mut i64 = v + 8;
+    pv data_ptr_ptr: *mut i64 = v;
+
+    pm len: i64;
+    unsafe {
+        len = *len_ptr;
+    }
+
+    if idx < 0 {
+        p_panic("Vec remove index out of bounds");
+    }
+    if idx >= len {
+        p_panic("Vec remove index out of bounds");
+    }
+
+    pm data: i64;
+    unsafe {
+        data = *data_ptr_ptr;
+    }
+
+    // Get the value at idx
+    pv addr: i64 = data + idx * 8;
+    pv ptr: *mut i64 = addr;
+    pv result: i64 = 0;
+    unsafe {
+        result = *ptr;
+    }
+
+    // Shift elements left
+    pv i: i64 = idx;
+    while i < len - 1 {
+        pv cur_addr: i64 = data + i * 8;
+        pv next_addr: i64 = data + (i + 1) * 8;
+        pv cur_ptr: *mut i64 = cur_addr;
+        pv next_ptr: *mut i64 = next_addr;
+        unsafe {
+            pv next_val: i64 = *next_ptr;
+            *cur_ptr = next_val;
+        }
+        i = i + 1;
+    }
+
+    // Decrement len
+    pv new_len: i64 = len - 1;
+    unsafe {
+        *len_ptr = new_len;
+    }
+
+    ret result;
+}
+
+pub pf Vec_clone(v: i64) -> i64 {
+    pv len_ptr: *mut i64 = v + 8;
+    pv data_ptr_ptr: *mut i64 = v;
+
+    pm len: i64;
+    unsafe {
+        len = *len_ptr;
+    }
+
+    pm data: i64;
+    unsafe {
+        data = *data_ptr_ptr;
+    }
+
+    pv new_v: i64 = Vec_new();
+    pv i: i64 = 0;
+    while i < len {
+        pv addr: i64 = data + i * 8;
+        pv ptr: *mut i64 = addr;
+        pv elem: i64 = 0;
+        unsafe {
+            elem = *ptr;
+        }
+        Vec_push(new_v, elem);
+        i = i + 1;
+    }
+    ret new_v;
+}
+
+pub pf Vec_to_str(v: i64) -> str {
+    pv len_ptr: *mut i64 = v + 8;
+    pv data_ptr_ptr: *mut i64 = v;
+
+    pm len: i64;
+    unsafe {
+        len = *len_ptr;
+    }
+
+    pm data: i64;
+    unsafe {
+        data = *data_ptr_ptr;
+    }
+
+    // Build string: "[1, 2, 3]"
+    pv result: str = "[";
+    pv i: i64 = 0;
+    while i < len {
+        if i > 0 {
+            result = p_str_concat(result, ", ");
+        }
+        pv addr: i64 = data + i * 8;
+        pv ptr: *mut i64 = addr;
+        pv elem: i64 = 0;
+        unsafe {
+            elem = *ptr;
+        }
+        result = p_str_concat(result, p_to_str(elem));
+        i = i + 1;
+    }
+    result = p_str_concat(result, "]");
+    ret result;
+}
+
+pub pf Vec_sort(v: i64) {
+    // Simple bubble sort
+    pv len_ptr: *mut i64 = v + 8;
+    pv data_ptr_ptr: *mut i64 = v;
+
+    pm len: i64;
+    unsafe {
+        len = *len_ptr;
+    }
+
+    pm data: i64;
+    unsafe {
+        data = *data_ptr_ptr;
+    }
+
+    if len <= 1 {
+        ret;
+    }
+
+    pv swapped: bool = true;
+    while swapped {
+        swapped = false;
+        pv i: i64 = 0;
+        while i < len - 1 {
+            pv addr0: i64 = data + i * 8;
+            pv addr1: i64 = data + (i + 1) * 8;
+            pv ptr0: *mut i64 = addr0;
+            pv ptr1: *mut i64 = addr1;
+            unsafe {
+                pv v0: i64 = *ptr0;
+                pv v1: i64 = *ptr1;
+                if v0 > v1 {
+                    *ptr0 = v1;
+                    *ptr1 = v0;
+                    swapped = true;
+                }
+            }
+            i = i + 1;
+        }
+    }
+}

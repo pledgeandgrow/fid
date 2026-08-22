@@ -174,6 +174,9 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
     // Desugar layer/model declarations into structs + impls + functions
     desugar_layers_models(&mut program);
 
+    // Phase 8B: Desugar ECS/StateMachine/EventHandler declarations
+    desugar_phase8b(&mut program);
+
     // Phase 3A: Process comptime gen blocks (before typechecking so generated
     // code is visible to the typechecker)
     program = comptime::process_gen(program);
@@ -386,6 +389,271 @@ fn desugar_layers_models(program: &mut Program) {
             postconditions: Vec::new(),
             is_async: false,
         });
+    }
+}
+
+/// Phase 8B: Desugar ECS components, systems, state machines, and event handlers
+/// into regular Fides constructs (structs, functions, enums, match statements).
+fn desugar_phase8b(program: &mut Program) {
+    use crate::ast::{Func, Param, StructDef, EnumDef, EnumVariant, Type, Expr, Stmt, MatchArm, Pattern};
+
+    let make_func = |name: String, params: Vec<Param>, ret_ty: Type, body: Vec<Stmt>, is_pub: bool| Func {
+        name,
+        type_params: Vec::new(),
+        type_param_bounds: Vec::new(),
+        const_params: Vec::new(),
+        params,
+        ret_ty,
+        body,
+        is_pub,
+        is_comptime: false,
+        declared_effects: Vec::new(),
+        has_effect_annotation: false,
+        is_interrupt: false,
+        annotations: Vec::new(),
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+        is_async: false,
+    };
+
+    // ── F18: Desugar components → structs ──
+    for comp in program.components.drain(..) {
+        program.structs.push(StructDef {
+            name: comp.name.clone(),
+            fields: comp.fields.clone(),
+            is_pub: comp.is_pub,
+            annotations: Vec::new(),
+            type_params: Vec::new(),
+        });
+    }
+
+    // ── F20: Desugar event handlers → functions ──
+    for eh in program.event_handlers.drain(..) {
+        let func_name = format!("__on_{}", eh.event_name);
+        let mut params = Vec::new();
+        params.extend(eh.params.clone());
+        program.funcs.push(make_func(
+            func_name,
+            params,
+            Type::Void,
+            eh.body.clone(),
+            eh.is_pub,
+        ));
+    }
+
+    // ── F19: Desugar state machines → enum + initial/handle functions ──
+    for sm in program.state_machines.drain(..) {
+        let sm_name = sm.name.clone();
+
+        // Create enum with one variant per state (no data)
+        let variants: Vec<EnumVariant> = sm.states.iter().map(|s| EnumVariant {
+            name: s.name.clone(),
+            data: None,
+        }).collect();
+        program.enums.push(EnumDef {
+            name: sm_name.clone(),
+            variants,
+            type_params: Vec::new(),
+            is_pub: sm.is_pub,
+        });
+
+        // Create <SM>_initial() function — returns first state
+        let first_state = sm.states.first().map(|s| s.name.clone()).unwrap_or("Error".to_string());
+        let initial_name = format!("{}_initial", sm_name);
+        program.funcs.push(make_func(
+            initial_name,
+            vec![],
+            Type::Named(sm_name.clone()),
+            vec![Stmt::Return(Some(Expr::EnumLit {
+                enum_name: sm_name.clone(),
+                variant: first_state.clone(),
+                args: Vec::new(),
+            }), 0)],
+            sm.is_pub,
+        ));
+
+        // Create <SM>_handle(state, event) -> state function
+        let handle_name = format!("{}_handle", sm_name);
+        // Build match arms: one per state, each matching event → target
+        let mut arms: Vec<MatchArm> = Vec::new();
+        for state in &sm.states {
+            // Pattern: StateName
+            let pattern = Pattern::EnumVariant {
+                enum_name: sm_name.clone(),
+                variant: state.name.clone(),
+                bindings: Vec::new(),
+            };
+            // Body: match on event string
+            let mut event_arms: Vec<MatchArm> = Vec::new();
+            for trans in &state.transitions {
+                event_arms.push(MatchArm {
+                    pattern: Pattern::StrLit(trans.event.clone()),
+                    guard: None,
+                    body: vec![Stmt::Return(Some(Expr::EnumLit {
+                        enum_name: sm_name.clone(),
+                        variant: trans.target.clone(),
+                        args: Vec::new(),
+                    }), 0)],
+                });
+            }
+            // Default arm: return current state (no transition)
+            event_arms.push(MatchArm {
+                pattern: Pattern::Wildcard,
+                guard: None,
+                body: vec![Stmt::Return(Some(Expr::Ident("__state".to_string())), 0)],
+            });
+            let body = vec![Stmt::Match {
+                expr: Expr::Ident("__event_type".to_string()),
+                arms: event_arms,
+                line: 0,
+            }];
+            arms.push(MatchArm {
+                pattern,
+                guard: None,
+                body,
+            });
+        }
+        // Default arm for unknown state
+        arms.push(MatchArm {
+            pattern: Pattern::Wildcard,
+            guard: None,
+            body: vec![Stmt::Return(Some(Expr::Ident("__state".to_string())), 0)],
+        });
+
+        program.funcs.push(make_func(
+            handle_name,
+            vec![
+                Param {
+                    name: "__state".to_string(),
+                    ty: Type::Named(sm_name.clone()),
+                    is_pub: false,
+                },
+                Param {
+                    name: "__event_type".to_string(),
+                    ty: Type::Str,
+                    is_pub: false,
+                },
+            ],
+            Type::Named(sm_name.clone()),
+            vec![Stmt::Match {
+                expr: Expr::Ident("__state".to_string()),
+                arms,
+                line: 0,
+            }],
+            sm.is_pub,
+        ));
+    }
+
+    // ── F18: Desugar systems → functions (query statements stay as Stmt::Query) ──
+    for sys in program.systems.drain(..) {
+        let mut params = Vec::new();
+        params.extend(sys.params.clone());
+        program.funcs.push(make_func(
+            sys.name.clone(),
+            params,
+            Type::Void,
+            sys.body.clone(),
+            sys.is_pub,
+        ));
+    }
+
+    // ── F18: Desugar query statements → loops over entities ──
+    desugar_query_stmts_in_program(program);
+}
+
+/// Recursively desugar all `Stmt::Query` nodes in a program's function bodies.
+fn desugar_query_stmts_in_program(program: &mut Program) {
+    use crate::ast::{Stmt, Expr};
+    for func in &mut program.funcs {
+        desugar_query_stmts(&mut func.body);
+    }
+    for imp in &mut program.impls {
+        for m in &mut imp.methods {
+            desugar_query_stmts(&mut m.body);
+        }
+    }
+}
+
+fn desugar_query_stmts(stmts: &mut Vec<crate::ast::Stmt>) {
+    use crate::ast::{Stmt, Expr};
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stmt::Query { components, body, .. } => {
+                desugar_query_stmts(body);
+                // Build: for entity in 0..__ecs_entity_count() { if has_all { body } }
+                let entity_var = "entity".to_string();
+                let mut cond: Option<Expr> = None;
+                for comp in components {
+                    let check = Expr::Binary {
+                        op: crate::ast::BinOp::Neq,
+                        left: Box::new(Expr::Call {
+                            callee: "__ecs_has".to_string(),
+                            args: vec![
+                                Expr::StringLit(comp.clone()),
+                                Expr::Ident(entity_var.clone()),
+                            ],
+                        }),
+                        right: Box::new(Expr::IntLit(0)),
+                    };
+                    cond = Some(match cond {
+                        None => check,
+                        Some(prev) => Expr::Binary {
+                            op: crate::ast::BinOp::And,
+                            left: Box::new(prev),
+                            right: Box::new(check),
+                        },
+                    });
+                }
+                let if_stmt = Stmt::If {
+                    cond: cond.unwrap_or(Expr::BoolLit(true)),
+                    then_block: body.clone(),
+                    else_block: None,
+                    line: 0,
+                };
+                let for_stmt = Stmt::For {
+                    var: entity_var,
+                    iterator: Expr::Range {
+                        start: Box::new(Expr::IntLit(0)),
+                        end: Box::new(Expr::Call {
+                            callee: "__ecs_entity_count".to_string(),
+                            args: Vec::new(),
+                        }),
+                        inclusive: false,
+                    },
+                    body: vec![if_stmt],
+                    line: 0,
+                };
+                *stmt = for_stmt;
+            }
+            Stmt::If { then_block, else_block, .. } => {
+                desugar_query_stmts(then_block);
+                if let Some(eb) = else_block {
+                    desugar_query_stmts(eb);
+                }
+            }
+            Stmt::While { body, .. } => desugar_query_stmts(body),
+            Stmt::For { body, .. } => desugar_query_stmts(body),
+            Stmt::Loop { body, .. } => desugar_query_stmts(body),
+            Stmt::Match { arms, .. } => {
+                for arm in arms {
+                    desugar_query_stmts(&mut arm.body);
+                }
+            }
+            Stmt::Defer(body, _) => desugar_query_stmts(body),
+            Stmt::Handle { body, handlers, .. } => {
+                desugar_query_stmts(body);
+                for h in handlers {
+                    desugar_query_stmts(&mut h.body);
+                }
+            }
+            Stmt::RegionBlock { body, .. } => desugar_query_stmts(body),
+            Stmt::Sandbox { body, .. } => desugar_query_stmts(body),
+            Stmt::Unsafe { body, .. } => desugar_query_stmts(body),
+            Stmt::Txn { body, .. } => desugar_query_stmts(body),
+            Stmt::ComptimeGen { block, .. } => desugar_query_stmts(block),
+            Stmt::GradBlock { body, .. } => desugar_query_stmts(body),
+            _ => {}
+        }
     }
 }
 
@@ -761,7 +1029,13 @@ pub fn build_executable_with_lto(source: &str, source_path: &str, target: &str, 
             let obj = crate::elf64::emit_object_file(&l3, &asm)
                 .map_err(|e| vec![e])?;
             // Link with the pre-compiled Linux runtime (raw machine code)
-            let (rt_text, rt_syms, rt_rodata, rt_rodata_syms) = crate::runtime_linux::runtime_parts();
+            // F-1B: Use capability-aware runtime when caps are granted.
+            let (rt_text, rt_syms, rt_rodata, rt_rodata_syms) = if let Some(caps) = granted_caps {
+                let cap_set: std::collections::HashSet<String> = caps.iter().cloned().collect();
+                crate::runtime_linux::runtime_parts_with_caps(&cap_set)
+            } else {
+                crate::runtime_linux::runtime_parts()
+            };
             let rt_relocs = crate::runtime_linux::runtime_relocations();
             crate::linker::link_with_runtime(
                 &[obj], "_start",
@@ -1065,15 +1339,21 @@ fn edit_distance(a: &str, b: &str) -> usize {
     dp[a.len()][b.len()]
 }
 
-/// F5: Strip functions that require capabilities not in the granted set.
-/// Maps capability names to effects: IO->IO, FS->IO, Net->Net, Spawn->Spawn.
-/// After removing ungranted-cap functions, does a reachability check from
-/// "main" to remove any functions that are now unreachable.
+/// I-3A: Transitive Capability DCE — strip functions requiring capabilities not
+/// in the granted set, then transitively eliminate all functions only reachable
+/// through the stripped functions.
+///
+/// Improvements over the original F5 implementation:
+///   1. Starts reachability BFS from ALL entry points ("main" and "_start"),
+///      not just "main" — prevents stripping _start or its unique callees.
+///   2. Tracks function references through `ConstStr` (used by `spawn` which
+///      passes the callee name as a string to `p_thread_spawn`).
+///   3. Conservatively keeps functions whose address is taken (indirect calls
+///      via `CallPtr` or `DynCall` can't be statically resolved).
+///   4. Tracks transitive closure: if `foo()` is stripped, everything only
+///      callable through `foo()` is also stripped (BFS naturally handles this).
 fn strip_ungranted_caps(module: &mut IrModule, granted_caps: &[String]) {
     use std::collections::{HashMap, HashSet};
-
-    let granted: HashSet<String> = granted_caps.iter().map(|s| s.to_string()).collect();
-    let _ = granted;
 
     // Map capability names to the effects they grant
     let granted_effects: HashSet<Effect> = granted_caps.iter().filter_map(|cap| {
@@ -1085,7 +1365,8 @@ fn strip_ungranted_caps(module: &mut IrModule, granted_caps: &[String]) {
         }
     }).collect();
 
-    // Find functions that require effects not in the granted set
+    // Find functions that require effects not in the granted set.
+    // Entry points (main, _start) are never stripped.
     let mut to_remove: HashSet<String> = HashSet::new();
     for (name, effects) in &module.function_effects {
         if name == "main" || name == "_start" {
@@ -1108,21 +1389,56 @@ fn strip_ungranted_caps(module: &mut IrModule, granted_caps: &[String]) {
         return;
     }
 
-    // Build call graph
+    // Collect all known function names for ConstStr reference tracking.
+    let known_functions: HashSet<String> = module.functions.keys().cloned().collect();
+
+    // Build call graph, including indirect references via ConstStr.
+    // Also track which functions have their address taken (for conservative
+    // retention — indirect calls via CallPtr/DynCall can target them).
     let mut call_graph: HashMap<String, Vec<String>> = HashMap::new();
+    let mut address_taken: HashSet<String> = HashSet::new();
+
     for (name, func) in &module.functions {
         let mut callees = Vec::new();
         for (_, inst) in &func.instructions {
-            if let Inst::Call { func: callee, .. } = inst {
-                callees.push(callee.clone());
+            match inst {
+                Inst::Call { func: callee, .. } => {
+                    callees.push(callee.clone());
+                }
+                Inst::ConstStr { value } => {
+                    // ConstStr containing a function name = address taken
+                    // (used by spawn: p_thread_spawn(func_name, ...))
+                    if known_functions.contains(value) {
+                        address_taken.insert(value.clone());
+                        callees.push(value.clone());
+                    }
+                }
+                Inst::CallPtr { .. } | Inst::DynCall { .. } => {
+                    // Indirect call — can't determine target statically.
+                    // We conservatively keep all address-taken functions.
+                    // (No specific edge added here; address_taken set handles retention.)
+                }
+                _ => {}
             }
         }
         call_graph.insert(name.clone(), callees);
     }
 
-    // BFS from main to find reachable functions (skipping ungranted-cap ones)
+    // BFS from all entry points to find reachable functions.
+    // Skip functions in to_remove (ungranted capabilities).
+    // Address-taken functions are kept even if not directly reachable
+    // (they may be called indirectly via CallPtr/DynCall), UNLESS they
+    // require ungranted capabilities (in to_remove).
     let mut reachable: HashSet<String> = HashSet::new();
-    let mut queue: Vec<String> = vec!["main".to_string()];
+    let mut queue: Vec<String> = Vec::new();
+
+    // Start from all entry points.
+    for entry in &["main", "_start"] {
+        if module.functions.contains_key(*entry) && !to_remove.contains(*entry) {
+            queue.push(entry.to_string());
+        }
+    }
+
     while let Some(name) = queue.pop() {
         if reachable.contains(&name) || to_remove.contains(&name) {
             continue;
@@ -1137,7 +1453,15 @@ fn strip_ungranted_caps(module: &mut IrModule, granted_caps: &[String]) {
         }
     }
 
-    // Remove unreachable functions
+    // Conservatively keep address-taken functions (indirect call targets),
+    // unless they require ungranted capabilities.
+    for fname in &address_taken {
+        if !to_remove.contains(fname) {
+            reachable.insert(fname.clone());
+        }
+    }
+
+    // Remove unreachable functions (transitive closure of capability stripping).
     let removed: Vec<String> = module.functions.keys()
         .filter(|k| !reachable.contains(*k))
         .cloned()
@@ -1145,5 +1469,155 @@ fn strip_ungranted_caps(module: &mut IrModule, granted_caps: &[String]) {
     for name in &removed {
         module.functions.remove(name);
         module.function_effects.remove(name);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{IrModule, IrFunction, BlockId, Effect, EffectSet, IrType, ValueMeta, Region};
+
+    /// Build a minimal IrModule with the given functions and effects.
+    fn make_module(
+        funcs: &[(&str, &[&str], Option<&[Effect]>)],
+    ) -> IrModule {
+        let mut module = IrModule::new();
+        for &(name, callees, effects) in funcs {
+            let mut func = IrFunction::new(name.to_string(), IrType::I64);
+            for callee in callees {
+                let vid = func.new_value(ValueMeta {
+                    ty: IrType::I64,
+                    region: Region::Stack,
+                    effects: EffectSet::new(),
+                    source_line: None,
+                    in_sandbox: false,
+                });
+                func.instructions.insert(vid, Inst::Call {
+                    func: callee.to_string(),
+                    args: vec![],
+                    ret_ty: IrType::I64,
+                    effects: EffectSet::new(),
+                });
+            }
+            module.functions.insert(name.to_string(), func);
+            let eff = match effects {
+                Some(e) => {
+                    let mut es = EffectSet::new();
+                    for &effect in e {
+                        es.add(effect);
+                    }
+                    es
+                }
+                None => EffectSet::new(),
+            };
+            module.function_effects.insert(name.to_string(), eff);
+        }
+        module
+    }
+
+    #[test]
+    fn strip_caps_removes_ungranted_net_function() {
+        // main calls net_func (requires Net) and pure_func (no caps).
+        // Granting only IO should strip net_func and keep pure_func.
+        let mut module = make_module(&[
+            ("main", &["net_func", "pure_func"], None),
+            ("net_func", &[], Some(&[Effect::Net])),
+            ("pure_func", &[], None),
+        ]);
+
+        strip_ungranted_caps(&mut module, &["IO".to_string()]);
+
+        assert!(module.functions.contains_key("main"), "main must survive");
+        assert!(!module.functions.contains_key("net_func"), "net_func requires Net — should be stripped");
+        assert!(module.functions.contains_key("pure_func"), "pure_func has no caps — should survive");
+    }
+
+    #[test]
+    fn strip_caps_transitive_closure() {
+        // main calls helper, helper calls net_func.
+        // If net_func is stripped, helper becomes unreachable (only called by main
+        // but main no longer calls it through a stripped path).
+        // Actually: main calls helper directly, helper calls net_func.
+        // helper itself doesn't require Net, but its callee net_func does.
+        // After stripping net_func, helper is still reachable from main,
+        // but net_func is gone. helper's call to net_func becomes a dead edge.
+        let mut module = make_module(&[
+            ("main", &["helper"], None),
+            ("helper", &["net_func"], None),
+            ("net_func", &[], Some(&[Effect::Net])),
+        ]);
+
+        strip_ungranted_caps(&mut module, &["IO".to_string()]);
+
+        assert!(module.functions.contains_key("main"));
+        assert!(module.functions.contains_key("helper"), "helper doesn't require Net — should survive");
+        assert!(!module.functions.contains_key("net_func"), "net_func should be stripped");
+    }
+
+    #[test]
+    fn strip_caps_transitive_closure_eliminates_orphans() {
+        // main calls foo, foo calls bar, bar calls net_func.
+        // If net_func is stripped, bar is still reachable from main→foo→bar.
+        // But if ONLY bar calls net_func, and bar itself doesn't require Net,
+        // bar survives. The transitive closure removes net_func only.
+        // Now test: orphan_func is only called by net_func.
+        // After stripping net_func, orphan_func becomes unreachable.
+        let mut module = make_module(&[
+            ("main", &["net_func"], None),
+            ("net_func", &["orphan_func"], Some(&[Effect::Net])),
+            ("orphan_func", &[], None),
+        ]);
+
+        strip_ungranted_caps(&mut module, &["IO".to_string()]);
+
+        assert!(module.functions.contains_key("main"));
+        assert!(!module.functions.contains_key("net_func"), "net_func should be stripped");
+        assert!(!module.functions.contains_key("orphan_func"), "orphan_func only called by stripped net_func — transitive DCE");
+    }
+
+    #[test]
+    fn strip_caps_keeps_all_when_granted() {
+        // When all capabilities are granted, nothing should be stripped.
+        let mut module = make_module(&[
+            ("main", &["net_func", "io_func"], None),
+            ("net_func", &[], Some(&[Effect::Net])),
+            ("io_func", &[], Some(&[Effect::IO])),
+        ]);
+
+        strip_ungranted_caps(&mut module, &["IO".to_string(), "Net".to_string()]);
+
+        assert!(module.functions.contains_key("main"));
+        assert!(module.functions.contains_key("net_func"));
+        assert!(module.functions.contains_key("io_func"));
+    }
+
+    #[test]
+    fn strip_caps_keeps_entry_points() {
+        // _start should survive even if it's not called by main.
+        let mut module = make_module(&[
+            ("main", &[], None),
+            ("_start", &["helper"], None),
+            ("helper", &[], None),
+        ]);
+
+        strip_ungranted_caps(&mut module, &["IO".to_string()]);
+
+        assert!(module.functions.contains_key("main"), "main must survive");
+        assert!(module.functions.contains_key("_start"), "_start must survive (entry point)");
+        assert!(module.functions.contains_key("helper"), "helper called by _start — should survive");
+    }
+
+    #[test]
+    fn strip_caps_noop_when_nothing_to_strip() {
+        // No functions require ungranted caps — should be a no-op.
+        let mut module = make_module(&[
+            ("main", &["pure_func"], None),
+            ("pure_func", &[], None),
+        ]);
+
+        strip_ungranted_caps(&mut module, &["IO".to_string()]);
+
+        assert!(module.functions.contains_key("main"));
+        assert!(module.functions.contains_key("pure_func"));
     }
 }

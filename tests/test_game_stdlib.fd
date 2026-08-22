@@ -1,0 +1,412 @@
+// Test: Phase 8D Game Stdlib (S1-S8)
+//
+// Tests the 8 game stdlib modules: tilemap, sprite, flowfield, streaming,
+// scene, physics, audio, input.
+//
+// All modules are pure Fides code (no compiler changes).
+// Audio and input use FFI stubs (no actual sound/input in tests).
+
+use tilemap;
+use sprite;
+use flowfield;
+use streaming;
+use scene;
+use physics;
+use audio;
+use input;
+
+pf main() {
+    // ---
+    // S1: Tilemap
+    // ---
+    pv tm = tilemap_create(10, 10, 16);
+    tilemap_set(&tm, 5, 5, TILE_WALL);
+    tilemap_set(&tm, 0, 0, TILE_FLOOR);
+
+    // Test tile access
+    assert_eq(tilemap_get(tm, 5, 5), TILE_WALL);
+    assert_eq(tilemap_get(tm, 0, 0), TILE_FLOOR);
+    assert_eq(tilemap_get(tm, 9, 9), TILE_EMPTY);
+
+    // Test solid check
+    assert(tilemap_is_solid(tm, 5, 5));
+    assert(!tilemap_is_solid(tm, 0, 0));
+    assert(tilemap_is_solid(tm, -1, 0));  // out of bounds = solid
+
+    // Test pixel conversion
+    assert_eq(tilemap_get_at_pixel(tm, 80, 80), tilemap_get(tm, 5, 5));
+
+    // Test collision
+    assert(tilemap_box_collides(tm, 76, 76, 16, 16));  // overlaps wall at (5,5)
+    assert(!tilemap_box_collides(tm, 16, 16, 16, 16)); // on floor at (1,1)
+
+    // Test fill
+    tilemap_fill_rect(&tm, 7, 7, 9, 9, TILE_STONE);
+    assert_eq(tilemap_get(tm, 8, 8), TILE_STONE);
+    assert_eq(tilemap_count_tile(tm, TILE_STONE), 9);
+
+    // Test border
+    tilemap_fill_border(&tm, TILE_WALL);
+    assert(tilemap_is_solid(tm, 0, 5));
+    assert(tilemap_is_solid(tm, 9, 5));
+
+    // Test auto-tiling (wall at 5,5, surrounded by walls on border)
+    pv mask = tilemap_auto_tile_4dir(tm, 5, 5);
+    // N=0 (empty at 4,5), S=0 (empty at 6,5), E=0 (empty at 5,6), W=0
+    // Actually 5,5 is wall, neighbors: (5,4)=empty, (5,6)=empty, (4,5)=empty, (6,5)=empty
+    // So mask = 0 (no matching neighbors)
+    assert_eq(mask, 0);
+
+    // Test line of sight
+    tilemap_fill_all(&tm, TILE_FLOOR);
+    tilemap_set(&tm, 5, 0, TILE_WALL);
+    tilemap_set(&tm, 5, 5, TILE_WALL);
+    assert(!tilemap_line_of_sight(tm, 0, 0, 9, 0));  // wall at (5,0) blocks
+    assert(tilemap_line_of_sight(tm, 0, 5, 9, 5));   // wall at (5,5) is on the line...
+    // Actually (5,5) is on the line from (0,5) to (9,5), so it should be blocked
+    // Wait — line_of_sight checks tiles BETWEEN start and end, not the endpoints
+    // (5,5) is between (0,5) and (9,5), and it's solid → blocked
+    assert(!tilemap_line_of_sight(tm, 0, 5, 9, 5));
+
+    print("S1 tilemap: OK\n");
+
+    // ---
+    // S2: Sprite
+    // ---
+    pv anim = sprite_anim_create(8, 0.1);
+    sprite_anim_play(&anim, 0);
+    assert_eq(sprite_anim_get_frame(anim), 0);
+
+    // Advance time
+    pv frame = sprite_anim_update(&anim, 0.15);  // 150ms → frame 1
+    assert_eq(frame, 1);
+
+    frame = sprite_anim_update(&anim, 0.1);  // 100ms more → frame 2
+    assert_eq(frame, 2);
+
+    // Test looping (advance past end)
+    pv i = 0;
+    while i < 10 {
+        sprite_anim_update(&anim, 0.1);
+        i = i + 1;
+    }
+    // Should have looped back
+    pv cur = sprite_anim_get_frame(anim);
+    assert(cur >= 0 && cur < 8);
+
+    // Test non-looping
+    pv anim2 = sprite_anim_create(4, 0.05);
+    sprite_anim_set_looping(&anim2, false);
+    sprite_anim_play(&anim2, 0);
+    i = 0;
+    while i < 20 {
+        sprite_anim_update(&anim2, 0.05);
+        i = i + 1;
+    }
+    assert(sprite_anim_is_finished(anim2));
+
+    // Test atlas src_rect
+    pv src_rect = sprite_region_new(32, 64, 16, 16);
+    assert_eq(src_rect.x, 32);
+    assert_eq(src_rect.y, 64);
+    assert_eq(src_rect.width, 16);
+    assert_eq(src_rect.height, 16);
+    assert_eq(src_rect.origin_x, 8);
+    assert_eq(src_rect.origin_y, 8);
+
+    // Test sprite
+    pv s = sprite_create(src_rect, 100.0, 200.0);
+    assert_eq(s.pos_x, 100.0);
+    assert_eq(s.pos_y, 200.0);
+    assert(s.visible);
+    assert_eq(s.alpha, 1.0);
+
+    sprite_move(&s, 10.0, -5.0);
+    assert_eq(s.pos_x, 110.0);
+    assert_eq(s.pos_y, 195.0);
+
+    sprite_set_alpha(&s, 0.5);
+    assert_eq(s.alpha, 0.5);
+
+    // Test palette swap
+    pv pal = sprite_palette_create();
+    sprite_palette_add(&pal, 0xFF0000, 0x00FF00);  // red → green
+    assert_eq(sprite_palette_apply(pal, 0xFF0000), 0x00FF00);
+    assert_eq(sprite_palette_apply(pal, 0x0000FF), 0x0000FF);  // unchanged
+
+    print("S2 sprite: OK\n");
+
+    // ---
+    // S3: Flowfield
+    // ---
+    pv ff = flowfield_create(10, 10);
+    flowfield_set_target(&ff, 9, 9);
+    flowfield_set_blocked(&ff, 5, 5);
+    flowfield_compute(&ff);
+
+    // Target should have distance 0
+    assert_eq(flowfield_get_distance(ff, 9, 9), 0);
+
+    // Blocked cell should have distance -1
+    assert_eq(flowfield_get_distance(ff, 5, 5), -1);
+
+    // A cell near target should have a small distance
+    pv d = flowfield_get_distance(ff, 8, 9);
+    assert(d > 0 && d < 5);
+
+    // Should have a path from (0,0) to (9,9) (around the wall)
+    assert(flowfield_has_path(ff, 0, 0));
+
+    // Direction at (0,0) should point toward target
+    pv dir = flowfield_get_dir(ff, 0, 0);
+    // Should move toward higher x or y
+    pv (dx, dy) = dir;
+    assert(dx != 0 || dy != 0);
+
+    print("S3 flowfield: OK\n");
+
+    // ---
+    // S4: Streaming
+    // ---
+    pv mgr = streaming_create(32, 2);  // 32px chunks, 2 chunk radius
+    streaming_set_focus(&mgr, 64, 64);  // center at (64,64) = chunk (2,2)
+
+    pv changes = streaming_update(&mgr);
+    // Should load chunks in a 5x5 area (radius 2), minus corners (circular)
+    // Circular radius 2: 1 + 4 + 8 + 4 + 1 = 13 chunks (approx)
+    pv loaded = streaming_loaded_count(mgr);
+    assert(loaded > 0);
+    assert(loaded <= 25);  // at most 5x5
+
+    // Focus position should be in a loaded chunk
+    assert(streaming_is_position_loaded(mgr, 64, 64));
+
+    // Move focus far away
+    streaming_set_focus(&mgr, 1000, 1000);
+    streaming_update(&mgr);
+    // Old position should no longer be loaded
+    // (but chunks stay in list, just marked for unload)
+    assert(streaming_is_position_loaded(mgr, 1000, 1000));
+
+    // Test coordinate conversion
+    pv chunk_coords = streaming_world_to_chunk(mgr, 64, 64);
+    pv (cc_x, cc_y) = chunk_coords;
+    assert_eq(cc_x, 2);
+    assert_eq(cc_y, 2);
+
+    pv world_coords = streaming_chunk_to_world(mgr, 2, 2);
+    pv (wc_x, wc_y) = world_coords;
+    assert_eq(wc_x, 64);
+    assert_eq(wc_y, 64);
+
+    print("S4 streaming: OK\n");
+
+    // ---
+    // S5: Scene
+    // ---
+    pv sm = scene_manager_create();
+    pv player_tpl = scene_register_template(&sm, "player", 100, 16, 16);
+    pv enemy_tpl = scene_register_template(&sm, "enemy", 50, 16, 16);
+
+    assert_eq(player_tpl, 0);
+    assert_eq(enemy_tpl, 1);
+
+    // Spawn entities
+    pv e1 = scene_spawn(&sm, player_tpl, 100.0, 200.0);
+    pv e2 = scene_spawn(&sm, enemy_tpl, 300.0, 400.0);
+    pv e3 = scene_spawn_by_name(&sm, "enemy", 500.0, 600.0);
+
+    assert(e1 > 0);
+    assert(e2 > 0);
+    assert(e3 > 0);
+    assert(e1 != e2);
+    assert(e2 != e3);
+
+    // Count entities
+    assert_eq(scene_entity_count(sm), 3);
+    assert_eq(scene_count_by_template(sm, player_tpl), 1);
+    assert_eq(scene_count_by_template(sm, enemy_tpl), 2);
+
+    // Find template by name
+    assert_eq(scene_find_template(sm, "player"), 0);
+    assert_eq(scene_find_template(sm, "enemy"), 1);
+    assert_eq(scene_find_template(sm, "nonexistent"), -1);
+
+    // Query by radius
+    pv nearby = scene_query_radius(sm, 100.0, 200.0, 50.0);
+    assert_eq(nearby.len(), 1);  // only player at (100,200)
+
+    // Query by box
+    pv in_box = scene_query_box(sm, 0.0, 0.0, 350.0, 450.0);
+    assert_eq(in_box.len(), 2);  // player and first enemy
+
+    // Nearest entity
+    pv nearest = scene_nearest(sm, 310.0, 410.0);
+    assert_eq(nearest, e2);  // closest to first enemy
+
+    // Get entity
+    pv ent = scene_get_entity(sm, e1);
+    assert_eq(ent.id, e1);
+    assert_eq(ent.template_id, player_tpl);
+    assert_eq(ent.health, 100);
+    assert(ent.active);
+
+    // Despawn
+    assert(scene_despawn(&sm, e1));
+
+    print("S5 scene: OK\n");
+
+    // ---
+    // S6: Physics
+    // ---
+    // Test AABB collision
+    pv a = physics_aabb_new(0.0, 0.0, 10.0, 10.0);
+    pv b = physics_aabb_new(5.0, 5.0, 10.0, 10.0);
+    assert(physics_aabb_collides(a, b));
+
+    pv c = physics_aabb_new(20.0, 20.0, 10.0, 10.0);
+    assert(!physics_aabb_collides(a, c));
+
+    // Test AABB contains point
+    assert(physics_aabb_contains_point(a, 5.0, 5.0));
+    assert(!physics_aabb_contains_point(a, 15.0, 15.0));
+
+    // Test AABB overlap
+    pv overlap = physics_aabb_overlap(a, b);
+    pv (ov_x, ov_y, ov_w, ov_h) = overlap;
+    assert_eq(ov_x, 5.0);  // x
+    assert_eq(ov_y, 5.0);  // y
+    assert_eq(ov_w, 5.0);  // width
+    assert_eq(ov_h, 5.0);  // height
+
+    // Test circle collision
+    pv c1 = physics_circle_new(0.0, 0.0, 5.0);
+    pv c2 = physics_circle_new(8.0, 0.0, 5.0);
+    assert(physics_circle_collides(c1, c2));  // distance 8 < 5+5=10
+
+    pv c3 = physics_circle_new(20.0, 0.0, 5.0);
+    assert(!physics_circle_collides(c1, c3));  // distance 20 > 10
+
+    // Test rigid body
+    pv body = physics_body_create(0.0, 0.0, 16.0, 16.0);
+    physics_body_set_velocity(&body, 100.0, 0.0);
+    physics_body_update(&body, 0.1, 0.0);  // dt=0.1s, no gravity
+    assert_eq(body.x, 10.0);  // 100 * 0.1 = 10
+    assert_eq(body.y, 0.0);
+
+    // Test gravity
+    pv body2 = physics_body_create(0.0, 0.0, 16.0, 16.0);
+    physics_body_update(&body2, 1.0, 100.0);  // dt=1s, gravity=100
+    // After 1s: y = 0.5 * 100 * 1² = 50
+    pv y_after_gravity = body2.y;
+    assert(y_after_gravity > 0.0);
+
+    // Test collision response
+    pv body3 = physics_body_create(0.0, 0.0, 10.0, 10.0);
+    pv floor_tile = physics_aabb_new(0.0, 20.0, 100.0, 10.0);
+    physics_body_set_velocity(&body3, 0.0, 100.0);
+    physics_body_update(&body3, 0.25, 0.0);  // move down 25px → y=25
+    // Now body3 is at (0, 25) with size 10x10, floor at (0, 20) with size 100x10
+    // They overlap: body3 spans y=25..35, floor spans y=20..30
+    physics_resolve_vs_static(&body3, floor_tile);
+    // Body should be pushed up out of the floor
+    assert(body3.y < 25.0);
+    assert(body3.grounded);
+
+    print("S6 physics: OK\n");
+
+    // ---
+    // S7: Audio (stubs — no actual sound)
+    // ---
+    // Audio init/playback are FFI stubs that return 0
+    // We test the Fides-side state tracking
+
+    pv audio_state = audio_state_create();
+    assert_eq(audio_state.master_vol, 1.0);
+    assert(!audio_state.muted);
+
+    audio_state_set_volume(&audio_state, 0.7);
+    assert_eq(audio_state.master_vol, 0.7);
+
+    // Toggle mute
+    assert(audio_state_toggle_mute(&audio_state));
+    assert(audio_state.muted);
+    assert(!audio_state_toggle_mute(&audio_state));  // unmute
+    assert(!audio_state.muted);
+
+    // Music channel tracking
+    assert_eq(audio_state.music_channel, AUDIO_NO_CHANNEL);
+
+    print("S7 audio: OK\n");
+
+    // ---
+    // S8: Input
+    // ---
+    pv input_state = input_create();
+    input_update(&input_state);
+
+    // No keys held initially
+    assert(!input_key_held(input_state, KEY_SPACE));
+    assert(!input_key_pressed(input_state, KEY_SPACE));
+
+    // Simulate key press
+    input_set_key(&input_state, KEY_SPACE, true);
+    input_update(&input_state);
+
+    // Now space should be held and just-pressed
+    assert(input_key_held(input_state, KEY_SPACE));
+    assert(input_key_pressed(input_state, KEY_SPACE));
+
+    // Next frame: still held but not just-pressed
+    input_update(&input_state);
+    assert(input_key_held(input_state, KEY_SPACE));
+    assert(!input_key_pressed(input_state, KEY_SPACE));
+
+    // Release key
+    input_set_key(&input_state, KEY_SPACE, false);
+    input_update(&input_state);
+    assert(!input_key_held(input_state, KEY_SPACE));
+    assert(input_key_released(input_state, KEY_SPACE));
+
+    // Test mouse
+    input_set_mouse_pos(&input_state, 100, 200);
+    assert_eq(input_mouse_x(input_state), 100);
+    assert_eq(input_mouse_y(input_state), 200);
+
+    input_set_mouse_button(&input_state, MOUSE_LEFT, true);
+    input_update(&input_state);
+    assert(input_mouse_held(input_state, MOUSE_LEFT));
+    assert(input_mouse_pressed(input_state, MOUSE_LEFT));
+
+    // Test directional input
+    input_set_key(&input_state, KEY_D, true);
+    input_update(&input_state);
+    pv dir = input_direction(input_state);
+    pv (dir_x, dir_y) = dir;
+    assert_eq(dir_x, 1.0);  // moving right
+    assert_eq(dir_y, 0.0);
+
+    // Test modifier keys
+    input_set_key(&input_state, KEY_LEFT_SHIFT, true);
+    assert(input_shift_held(input_state));
+
+    // Test gamepad
+    input_set_gamepad_connected(&input_state, true);
+    assert(input_gamepad_connected(input_state));
+
+    input_set_gamepad_axes(&input_state, 0.5, -0.3, 0.0, 0.0, 0.0, 0.0);
+    assert_eq(input_gamepad_left_x(input_state), 0.5);
+    assert_eq(input_gamepad_left_y(input_state), -0.3);
+
+    input_set_gamepad_button(&input_state, GAMEPAD_A, true);
+    input_update(&input_state);
+    assert(input_gamepad_held(input_state, GAMEPAD_A));
+    assert(input_gamepad_pressed(input_state, GAMEPAD_A));
+
+    print("S8 input: OK\n");
+
+    // ---
+    // All tests passed
+    // ---
+    print("OK\n");
+}

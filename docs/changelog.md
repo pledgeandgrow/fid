@@ -1,5 +1,60 @@
 # Fides Language Changelog
 
+## Phase 8B: ECS, State Machines, Event Handlers (August 2026)
+
+### ECS (Entity-Component-System) — F18
+
+- **Component declarations** — `component Position { x: f64, y: f64 }` desugars
+  to a regular struct. Components are plain structs tagged for ECS use.
+- **System declarations** — `system MoveSystem(dt: f64) { query(Position, Velocity) { ... } }`
+  desugars to a function. The `query(CompA, CompB) { body }` statement desugars
+  to a for-loop over all entities, checking `__ecs_has` for each component.
+- **ECS runtime functions** (`src/interp.rs`):
+  - `__ecs_create_entity() -> i64` — creates a new entity, returns its ID
+  - `__ecs_entity_count() -> i64` — returns the current entity count
+  - `__ecs_has(comp_name: str, entity: i64) -> i64` — returns 1 if entity has component
+  - `__ecs_get(comp_name: str, entity: i64)` — retrieves component data
+  - `__ecs_add(comp_name: str, entity: i64, value)` — attaches component to entity
+  - `__ecs_remove(comp_name: str, entity: i64)` — removes component from entity
+
+### State Machines — F19
+
+- **State machine declarations** — `state_machine PlayerState { state Idle { transition "move" to Moving } ... }`
+  desugars to an enum (one variant per state) plus two functions:
+  - `<SM>_initial() -> <SM>` — returns the initial state
+  - `<SM>_handle(state: <SM>, event: str) -> <SM>` — transitions based on event string
+
+### Event Handlers — F20
+
+- **Event handler declarations** — `on player_died(name: str) { ... }` desugars
+  to a function named `__on_<event_name>`. Event handlers are dispatched by name.
+
+### Parser/Lexer Changes
+
+- New keywords: `component`, `system`, `query`, `state_machine`, `state`, `transition`, `on`
+- Keywords used as identifiers (e.g. `query` as a variable name, `database.query()`)
+  are handled via `expect_ident_or_keyword()` in parser methods and the keyword-as-identifier
+  fallback in `parse_primary`.
+- `parse_func` and `parse_params` now use `expect_ident_or_keyword()` so keywords
+  can be used as function names and parameter names (e.g. `pf sql_bind(query: SQLString, ...)`).
+- `parse_postfix` field access uses `expect_ident_or_keyword()` so keywords can be
+  used as field/method names after `.` (e.g. `database.query(...)`).
+
+### Compiler Fixes
+
+- **Stmt::Query handling**: Added `Stmt::Query { body, .. }` cases to all 10 match
+  statements across 8 files (ast.rs, borrowck.rs, codegen.rs, comptime.rs, lower.rs,
+  mono.rs, typechecker.rs) that were missing it, causing non-exhaustive pattern errors.
+- **C codegen p_vec_capacity**: Added missing `p_vec_capacity` declaration and C
+  implementation to `src/codegen_c.rs`.
+- **C codegen Opaque print dispatch**: Added `IrType::Opaque("Vec")` and
+  `IrType::Opaque("HashMap")` cases to the print, p_to_str, and print call dispatch
+  in `src/codegen_c.rs` so Vec/HashMap values are formatted correctly when printed
+  directly (not just when converted via p_to_str first).
+- **Typechecker Named("Vec")**: Added `Type::Named("Vec")` handling for indexing
+  and for-loop iteration in `src/typechecker.rs`, so Vec types declared as
+  `Type::Named` (from stdlib) work the same as `Type::Generic { name: "Vec", ... }`.
+
 ## Phase 7.7: Iterators, Error Chaining, Cfg, Derive, Serde, Dynamic Loading (August 2026)
 
 ### Iterators

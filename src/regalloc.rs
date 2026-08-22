@@ -179,6 +179,9 @@ pub enum Location {
     Reg(PhysReg),
     /// Spilled to a stack slot at byte offset from RBP.
     Spill(u32),
+    /// Rematerializable constant — reload the immediate at each use site
+    /// instead of keeping it in a register or stack slot. (F-1A)
+    Remat(i64),
 }
 
 /// The result of allocating one function.
@@ -223,9 +226,17 @@ pub struct ModuleAllocation {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Run the linear scan allocator on a single function.
-pub fn allocate(func: &L3Function) -> Allocation {
+/// `pure_funcs` is the set of pure function names — calls to these don't
+/// clobber caller-saved registers (F-1D: effect-aware regalloc).
+pub fn allocate(func: &L3Function, pure_funcs: &HashSet<String>, no_alloc_funcs: &HashSet<String>) -> Allocation {
     // 1. Compute live intervals.
     let intervals = compute_live_intervals(func);
+
+    // 1b. Build a map of constant VRegs — VRegs whose sole definition is
+    // `Mov { src: Operand::ImmI(c) }`. These are rematerializable: instead
+    // of spilling them to the stack under register pressure, we reload the
+    // immediate at each use site (1 instruction, no stack slot). (F-1A)
+    let constant_vregs = compute_constant_vregs(func);
 
     // 2. Map argument VRegs to their incoming physical registers.
     let arg_regs = PhysReg::arg_regs();
@@ -282,7 +293,7 @@ pub fn allocate(func: &L3Function) -> Allocation {
                 // registers). If so, spill the VReg to the stack — the
                 // codegen prologue will save the arg register to the spill
                 // slot, and uses will load from the stack.
-                if is_reg_clobbered_in_range(func, interval.start, interval.end, reg) {
+                if is_reg_clobbered_in_range(func, interval.start, interval.end, reg, pure_funcs, no_alloc_funcs) {
                     let aligned = (spill_offset + 7) & !7;
                     spill_offset = aligned + 8;
                     vreg_to_loc.insert(interval.vreg, Location::Spill(aligned));
@@ -333,7 +344,7 @@ pub fn allocate(func: &L3Function) -> Allocation {
 
         // Try to assign a free register that is not clobbered during this interval.
         let assigned_reg = free_pool.iter().find(|&&r| {
-            !is_reg_clobbered_in_range(func, interval.start, interval.end, r)
+            !is_reg_clobbered_in_range(func, interval.start, interval.end, r, pure_funcs, no_alloc_funcs)
         }).copied();
         if let Some(reg) = assigned_reg {
             free_pool.retain(|&r| r != reg);
@@ -357,32 +368,55 @@ pub fn allocate(func: &L3Function) -> Allocation {
 
             if is_current {
                 // Spill the current interval.
-                let aligned = (spill_offset + 7) & !7;
-                spill_offset = aligned + 8;
-                vreg_to_loc.insert(interval.vreg, Location::Spill(aligned));
+                // F-1A: If this VReg is a constant, rematerialize it instead
+                // of consuming a stack slot. The constant is reloaded at each
+                // use site by the codegen.
+                if let Some(&c) = constant_vregs.get(&interval.vreg) {
+                    vreg_to_loc.insert(interval.vreg, Location::Remat(c));
+                } else {
+                    let aligned = (spill_offset + 7) & !7;
+                    spill_offset = aligned + 8;
+                    vreg_to_loc.insert(interval.vreg, Location::Spill(aligned));
+                }
             } else {
                 // Spill the farthest-active, take its register.
                 let reg = match vreg_to_loc.get(&spill_vreg) {
                     Some(Location::Reg(r)) => *r,
                     _ => {
                         // Fallback: just spill current.
-                        let aligned = (spill_offset + 7) & !7;
-                        spill_offset = aligned + 8;
-                        vreg_to_loc.insert(interval.vreg, Location::Spill(aligned));
+                        // F-1A: remat constants instead of spilling.
+                        if let Some(&c) = constant_vregs.get(&interval.vreg) {
+                            vreg_to_loc.insert(interval.vreg, Location::Remat(c));
+                        } else {
+                            let aligned = (spill_offset + 7) & !7;
+                            spill_offset = aligned + 8;
+                            vreg_to_loc.insert(interval.vreg, Location::Spill(aligned));
+                        }
                         continue;
                     }
                 };
                 // Check if the register is clobbered in the current interval's range.
-                if is_reg_clobbered_in_range(func, interval.start, interval.end, reg) {
+                if is_reg_clobbered_in_range(func, interval.start, interval.end, reg, pure_funcs, no_alloc_funcs) {
                     // Can't use this register — spill current instead.
-                    let aligned = (spill_offset + 7) & !7;
-                    spill_offset = aligned + 8;
-                    vreg_to_loc.insert(interval.vreg, Location::Spill(aligned));
+                    // F-1A: remat constants instead of spilling.
+                    if let Some(&c) = constant_vregs.get(&interval.vreg) {
+                        vreg_to_loc.insert(interval.vreg, Location::Remat(c));
+                    } else {
+                        let aligned = (spill_offset + 7) & !7;
+                        spill_offset = aligned + 8;
+                        vreg_to_loc.insert(interval.vreg, Location::Spill(aligned));
+                    }
                     continue;
                 }
-                let aligned = (spill_offset + 7) & !7;
-                spill_offset = aligned + 8;
-                vreg_to_loc.insert(spill_vreg, Location::Spill(aligned));
+                // F-1A: If the evicted VReg is a constant, rematerialize it
+                // instead of consuming a stack slot.
+                if let Some(&c) = constant_vregs.get(&spill_vreg) {
+                    vreg_to_loc.insert(spill_vreg, Location::Remat(c));
+                } else {
+                    let aligned = (spill_offset + 7) & !7;
+                    spill_offset = aligned + 8;
+                    vreg_to_loc.insert(spill_vreg, Location::Spill(aligned));
+                }
                 active.retain(|a| a.vreg != spill_vreg);
 
                 vreg_to_loc.insert(interval.vreg, Location::Reg(reg));
@@ -410,7 +444,7 @@ pub fn allocate(func: &L3Function) -> Allocation {
 pub fn allocate_module(module: &L3Module) -> ModuleAllocation {
     let mut result = ModuleAllocation::default();
     for f in &module.functions {
-        result.func_allocations.insert(f.name.clone(), allocate(f));
+        result.func_allocations.insert(f.name.clone(), allocate(f, &module.pure_functions, &module.no_alloc_functions));
     }
     result
 }
@@ -418,6 +452,23 @@ pub fn allocate_module(module: &L3Module) -> ModuleAllocation {
 // ═══════════════════════════════════════════════════════════════════════════
 // Live interval computation
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// Compute the set of VRegs that hold a constant value and are safe to
+/// rematerialize. A VReg is rematerializable if its sole definition is
+/// `Mov { src: Operand::ImmI(c) }` — the constant can be reloaded at each
+/// use site with a single `movq $c, %reg` instruction, avoiding both
+/// register pressure and stack spill slots. (F-1A)
+fn compute_constant_vregs(func: &L3Function) -> HashMap<VReg, i64> {
+    let mut constants: HashMap<VReg, i64> = HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let L3Inst::Mov { dst, src: Operand::ImmI(c) } = inst {
+                constants.insert(*dst, *c);
+            }
+        }
+    }
+    constants
+}
 
 /// Compute live intervals for all VRegs in a function.
 ///
@@ -552,7 +603,13 @@ fn compute_live_intervals(func: &L3Function) -> HashMap<VReg, LiveInterval> {
 
 /// Physical registers implicitly clobbered by the codegen for each instruction.
 /// The regalloc must not keep live vregs in these registers across the instruction.
-fn inst_clobbers(inst: &L3Inst) -> Vec<PhysReg> {
+///
+/// F-1D: Effect-Aware Register Allocation
+/// For calls to pure functions (in `pure_funcs`), we DON'T clobber caller-saved
+/// registers. A pure function can't modify external state, so caller-saved
+/// registers don't need to be preserved. This is a Fides-specific optimization
+/// that LLVM cannot do — LLVM must assume any call clobbers everything.
+fn inst_clobbers(inst: &L3Inst, pure_funcs: &HashSet<String>, no_alloc_funcs: &HashSet<String>) -> Vec<PhysReg> {
     match inst {
         // Store: gen_store loads value into RAX, pointer into RCX
         L3Inst::Store { .. } => vec![PhysReg::Rax, PhysReg::Rcx],
@@ -566,7 +623,21 @@ fn inst_clobbers(inst: &L3Inst) -> Vec<PhysReg> {
         // Print: call to p_print_int/p_print_str clobbers caller-saved
         L3Inst::Print { .. } => vec![PhysReg::Rax, PhysReg::Rcx, PhysReg::Rdx,
             PhysReg::Rsi, PhysReg::Rdi, PhysReg::R8, PhysReg::R9, PhysReg::R10, PhysReg::R11],
-        // Calls clobber all caller-saved registers
+        // F-1D: Calls to pure functions don't clobber caller-saved registers.
+        // The pure function can't modify external state, so our caller-saved
+        // registers are safe. This lets the regalloc keep live values in
+        // caller-saved registers across pure calls — fewer spills/reloads.
+        L3Inst::Call { target, .. } if pure_funcs.contains(target) => {
+            // Pure function: only RAX is clobbered (it holds the return value).
+            vec![PhysReg::Rax]
+        }
+        // I-2D: Calls to @no-alloc functions don't call p_malloc/p_alloc, so
+        // they don't need allocator state preservation. Treat like pure calls
+        // for clobbering — only RAX clobbered (return value).
+        L3Inst::Call { target, .. } if no_alloc_funcs.contains(target) => {
+            vec![PhysReg::Rax]
+        }
+        // Non-pure calls clobber all caller-saved registers
         L3Inst::Call { .. } | L3Inst::CallPtr { .. } | L3Inst::DynCall { .. } => {
             vec![PhysReg::Rax, PhysReg::Rcx, PhysReg::Rdx,
                 PhysReg::Rsi, PhysReg::Rdi, PhysReg::R8, PhysReg::R9, PhysReg::R10, PhysReg::R11]
@@ -584,12 +655,14 @@ fn is_reg_clobbered_in_range(
     start: u32,
     end: u32,
     reg: PhysReg,
+    pure_funcs: &HashSet<String>,
+    no_alloc_funcs: &HashSet<String>,
 ) -> bool {
     let mut idx: u32 = 0;
     for block in &func.blocks {
         for inst in &block.instructions {
             if idx >= start && idx <= end {
-                if inst_clobbers(inst).contains(&reg) {
+                if inst_clobbers(inst, pure_funcs, no_alloc_funcs).contains(&reg) {
                     return true;
                 }
             }
@@ -737,7 +810,7 @@ mod tests {
             params: Vec::new(),
         };
         let func = make_func("test", vec![block]);
-        let alloc = allocate(&func);
+        let alloc = allocate(&func, &HashSet::new(), &HashSet::new());
         assert!(alloc.reg(vreg(0)).is_some(), "v0 should get a register");
     }
 
@@ -756,7 +829,7 @@ mod tests {
             params: Vec::new(),
         };
         let func = make_func("test", vec![block]);
-        let alloc = allocate(&func);
+        let alloc = allocate(&func, &HashSet::new(), &HashSet::new());
         let r0 = alloc.reg(vreg(0));
         let r1 = alloc.reg(vreg(1));
         assert!(r0.is_some() && r1.is_some());
@@ -767,9 +840,47 @@ mod tests {
     #[test]
     fn spills_when_pressure_exceeds_registers() {
         // Create more live VRegs than physical registers (14 allocatable).
-        // Use 20 VRegs all live simultaneously.
+        // Use 20 VRegs all live simultaneously. Define them via non-constant
+        // sources (loads from a stack slot) so they are NOT rematerializable
+        // — the spill path must be exercised, not the remat path (F-1A).
         let mut insts = Vec::new();
-        // Define 20 VRegs
+        // Define 20 VRegs as loads from slot 0 (non-constant → must spill).
+        for i in 0..20 {
+            insts.push(L3Inst::Load {
+                dst: vreg(i),
+                ptr: Operand::Slot(crate::pir::Slot(0)),
+                ty: IrType::I64,
+            });
+        }
+        // Use all 20 (keeps them all live until the end)
+        for i in 0..20 {
+            insts.push(L3Inst::Ret {
+                value: Some(Operand::VReg(vreg(i))),
+            });
+        }
+        let block = L3Block {
+            id: BlockId(0),
+            instructions: insts,
+            predecessors: Vec::new(),
+            params: Vec::new(),
+        };
+        let func = make_func("test", vec![block]);
+        let alloc = allocate(&func, &HashSet::new(), &HashSet::new());
+
+        let in_reg: usize = (0..20).filter(|i| alloc.reg(vreg(*i)).is_some()).count();
+        let in_spill: usize = (0..20).filter(|i| matches!(alloc.loc(vreg(*i)), Location::Spill(_))).count();
+        assert!(in_reg <= 14, "at most 14 VRegs in registers, got {}", in_reg);
+        assert!(in_spill >= 6, "at least 6 VRegs spilled, got {}", in_spill);
+        assert_eq!(in_reg + in_spill, 20);
+    }
+
+    #[test]
+    fn rematerializes_constants_instead_of_spilling() {
+        // F-1A: When register pressure exceeds the number of physical
+        // registers, constant VRegs (defined by Mov ImmI) should be
+        // rematerialized, not spilled to the stack.
+        let mut insts = Vec::new();
+        // Define 20 constant VRegs — all would be spilled without remat.
         for i in 0..20 {
             insts.push(L3Inst::Mov {
                 dst: vreg(i),
@@ -789,13 +900,21 @@ mod tests {
             params: Vec::new(),
         };
         let func = make_func("test", vec![block]);
-        let alloc = allocate(&func);
+        let alloc = allocate(&func, &HashSet::new(), &HashSet::new());
 
         let in_reg: usize = (0..20).filter(|i| alloc.reg(vreg(*i)).is_some()).count();
         let in_spill: usize = (0..20).filter(|i| matches!(alloc.loc(vreg(*i)), Location::Spill(_))).count();
+        let in_remat: usize = (0..20).filter(|i| matches!(alloc.loc(vreg(*i)), Location::Remat(_))).count();
+        // Constants that don't fit in registers are rematerialized, not spilled.
         assert!(in_reg <= 14, "at most 14 VRegs in registers, got {}", in_reg);
-        assert!(in_spill >= 6, "at least 6 VRegs spilled, got {}", in_spill);
-        assert_eq!(in_reg + in_spill, 20);
+        assert_eq!(in_spill, 0, "constants should never be spilled, got {} spilled", in_spill);
+        assert_eq!(in_reg + in_remat, 20, "all VRegs should be in reg or remat, got {}+{}", in_reg, in_remat);
+        // Verify the rematerialized constants have the right values.
+        for i in 0..20 {
+            if let Location::Remat(c) = alloc.loc(vreg(i)) {
+                assert_eq!(c, i as i64, "remat constant for v{} should be {}", i, i);
+            }
+        }
     }
 
     #[test]
@@ -821,7 +940,7 @@ mod tests {
             frame_size: 0,
             next_vreg: 10,
         };
-        let alloc = allocate(&func);
+        let alloc = allocate(&func, &HashSet::new(), &HashSet::new());
         assert_eq!(alloc.reg(vreg(0)), Some(PhysReg::Rdi));
         assert_eq!(alloc.reg(vreg(1)), Some(PhysReg::Rsi));
         assert_eq!(alloc.reg(vreg(2)), Some(PhysReg::Rdx));
@@ -849,7 +968,7 @@ mod tests {
             frame_size: 0,
             next_vreg: 20,
         };
-        let alloc = allocate(&func);
+        let alloc = allocate(&func, &HashSet::new(), &HashSet::new());
         // First 6 in registers
         for i in 0..6 {
             assert!(alloc.reg(vreg(i)).is_some(), "param {} should be in a register", i);
@@ -930,5 +1049,95 @@ mod tests {
         assert!(!alloc.contains(&PhysReg::Rsp));
         assert!(!alloc.contains(&PhysReg::Rbp));
         assert_eq!(alloc.len(), 14);
+    }
+
+    #[test]
+    fn f1d_pure_call_does_not_clobber_caller_saved() {
+        // F-1D: A call to a pure function should only clobber RAX (return value),
+        // not all caller-saved registers. This lets the regalloc keep live values
+        // in caller-saved registers across pure calls.
+        let pure_funcs: HashSet<String> = {
+            let mut s = HashSet::new();
+            s.insert("pure_func".to_string());
+            s
+        };
+        let pure_call = L3Inst::Call {
+            dst: Some(vreg(0)),
+            target: "pure_func".to_string(),
+            args: vec![],
+            ret_ty: IrType::I64,
+        };
+        let no_alloc_funcs: HashSet<String> = HashSet::new();
+        let clobbers = inst_clobbers(&pure_call, &pure_funcs, &no_alloc_funcs);
+        // Pure call only clobbers RAX (return value register).
+        assert_eq!(clobbers, vec![PhysReg::Rax],
+            "pure call should only clobber RAX, got {:?}", clobbers);
+
+        // Non-pure call clobbers all caller-saved registers.
+        let nonpure_call = L3Inst::Call {
+            dst: Some(vreg(0)),
+            target: "impure_func".to_string(),
+            args: vec![],
+            ret_ty: IrType::I64,
+        };
+        let clobbers = inst_clobbers(&nonpure_call, &pure_funcs, &no_alloc_funcs);
+        assert!(clobbers.contains(&PhysReg::Rcx), "non-pure call should clobber RCX");
+        assert!(clobbers.contains(&PhysReg::Rdx), "non-pure call should clobber RDX");
+        assert!(clobbers.contains(&PhysReg::Rsi), "non-pure call should clobber RSI");
+        assert!(clobbers.contains(&PhysReg::Rdi), "non-pure call should clobber RDI");
+    }
+
+    #[test]
+    fn f1d_pure_call_allows_caller_saved_across_call() {
+        // F-1D: A VReg live across a pure call should be able to stay in a
+        // caller-saved register (e.g., RCX), since the pure call doesn't
+        // clobber it. Without F-1D, the VReg would be spilled.
+        let pure_funcs: HashSet<String> = {
+            let mut s = HashSet::new();
+            s.insert("pure_func".to_string());
+            s
+        };
+        // v0 = load from slot 0
+        // v1 = call pure_func()  -- pure, doesn't clobber RCX
+        // v2 = binop add v0, v0  -- uses v0 which should still be in RCX
+        let block = L3Block {
+            id: BlockId(0),
+            instructions: vec![
+                L3Inst::Load {
+                    dst: vreg(0),
+                    ptr: Operand::Slot(crate::pir::Slot(0)),
+                    ty: IrType::I64,
+                },
+                L3Inst::Call {
+                    dst: Some(vreg(1)),
+                    target: "pure_func".to_string(),
+                    args: vec![],
+                    ret_ty: IrType::I64,
+                },
+                L3Inst::Bin {
+                    op: crate::ast::BinOp::Add,
+                    dst: vreg(2),
+                    a: Operand::VReg(vreg(0)),
+                    b: Operand::VReg(vreg(0)),
+                    ty: IrType::I64,
+                },
+                L3Inst::Ret {
+                    value: Some(Operand::VReg(vreg(2))),
+                },
+            ],
+            predecessors: Vec::new(),
+            params: Vec::new(),
+        };
+        let func = make_func("test", vec![block]);
+        let alloc = allocate(&func, &pure_funcs, &HashSet::new());
+
+        // v0 should get a caller-saved register (not spilled), because the
+        // pure call doesn't clobber it.
+        let v0_loc = alloc.loc(vreg(0));
+        assert!(
+            matches!(v0_loc, Location::Reg(_)),
+            "v0 should be in a register (not spilled) across pure call, got {:?}",
+            v0_loc
+        );
     }
 }

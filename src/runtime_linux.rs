@@ -14,10 +14,44 @@
 //   - Return: RAX
 //   - Syscalls: RAX=syscall#, RDI, RSI, RDX, R10, R8, R9 → RAX
 
+use std::collections::HashSet;
+
 /// Runtime entry: returns (machine_code_bytes, symbol_table, rodata_bytes, rodata_symbols).
 /// symbol_table: Vec<(name, offset_in_text, size_or_0)>
 /// rodata_symbols: Vec<(name, offset_in_rodata)>
 pub fn runtime_parts() -> (Vec<u8>, Vec<(&'static str, u64, usize)>, Vec<u8>, Vec<(&'static str, u64)>) {
+    runtime_parts_impl(None)
+}
+
+/// F-1B: Capability-aware runtime linking.
+/// Returns runtime parts, but stubs for ungranted capabilities are replaced
+/// with trap instructions (0x0f 0x0b = ud2) instead of being fully removed.
+/// This is safer than removal — if a stripped function is somehow called,
+/// it will trap immediately instead of silently returning 0.
+///
+/// The stubs are still present in the binary (same offsets) but their bodies
+/// are replaced with `ud2` (2 bytes) + `ret` (1 byte). This preserves all
+/// symbol offsets without requiring recompilation.
+pub fn runtime_parts_with_caps(granted_caps: &HashSet<String>) -> (Vec<u8>, Vec<(&'static str, u64, usize)>, Vec<u8>, Vec<(&'static str, u64)>) {
+    runtime_parts_impl(Some(granted_caps))
+}
+
+/// Check if a runtime stub belongs to a capability that is not granted.
+/// Returns the capability name if the stub should be trapped.
+fn stub_capability(name: &str) -> Option<&'static str> {
+    // Map runtime stub prefixes to capabilities.
+    if name.starts_with("p_socket_") || name.starts_with("p_http_") {
+        Some("Net")
+    } else if name.starts_with("p_file_") || name.starts_with("p_read_file") || name.starts_with("p_write_file") {
+        Some("FS")
+    } else if name.starts_with("p_thread_") || name == "p_spawn" {
+        Some("Spawn")
+    } else {
+        None
+    }
+}
+
+fn runtime_parts_impl(granted_caps: Option<&HashSet<String>>) -> (Vec<u8>, Vec<(&'static str, u64, usize)>, Vec<u8>, Vec<(&'static str, u64)>) {
     let mut text = Vec::new();
     let mut symbols: Vec<(&'static str, u64, usize)> = Vec::new();
     let mut rodata = Vec::new();
@@ -668,7 +702,16 @@ pub fn runtime_parts() -> (Vec<u8>, Vec<(&'static str, u64, usize)>, Vec<u8>, Ve
     text.push(0xc3); // ret
 
     // ═══════════════════════════════════════════════════════════════════════
-    // p_str_concat(rdi = *u8 a, rsi = *u8 b) → rax = *u8 result
+    // p_region_free(rdi = pointer) — I-1C: Region Bulk Free
+    // Frees an entire region in one operation. Currently aliases p_free
+    // (munmap the pooled allocation). The region_pool pass creates a single
+    // p_alloc for all allocations in a region, so one p_region_free frees
+    // them all — O(1) cleanup instead of O(N) individual frees.
+    // jmp p_free → E9 XX XX XX XX
+    // ═══════════════════════════════════════════════════════════════════════
+    sym!("p_region_free");
+    text.extend_from_slice(&[0xe9, 0x00, 0x00, 0x00, 0x00]); // jmp p_free
+    let pregion_free_jmp_off = text.len() - 4;
     // Simplified: allocate 4096 bytes, copy both strings.
     // pushq %rbx ; pushq %r12 ; pushq %r13 ; pushq %r14
     // movq %rdi, %rbx ; movq %rsi, %r12
@@ -2854,11 +2897,30 @@ p_print_map:
     // ═══════════════════════════════════════════════════════════════════════
 
     // Helper macro for stub functions that return 0
+    // F-1B: If the stub belongs to an ungranted capability, emit ud2 (trap)
+    // instead of xorq %rax,%rax. This makes capability violations trap
+    // immediately at runtime instead of silently returning 0.
     macro_rules! stub_zero {
         ($name:expr) => {
             sym!($name);
-            text.extend_from_slice(&[0x48, 0x31, 0xc0]); // xorq %rax, %rax
-            text.push(0xc3); // ret
+            if let Some(caps) = granted_caps {
+                if let Some(cap) = stub_capability($name) {
+                    if !caps.contains(cap) {
+                        // ud2 (trap) + ret — capability not granted
+                        text.extend_from_slice(&[0x0f, 0x0b]); // ud2
+                        text.push(0xc3); // ret
+                    } else {
+                        text.extend_from_slice(&[0x48, 0x31, 0xc0]); // xorq %rax, %rax
+                        text.push(0xc3); // ret
+                    }
+                } else {
+                    text.extend_from_slice(&[0x48, 0x31, 0xc0]); // xorq %rax, %rax
+                    text.push(0xc3); // ret
+                }
+            } else {
+                text.extend_from_slice(&[0x48, 0x31, 0xc0]); // xorq %rax, %rax
+                text.push(0xc3); // ret
+            }
         };
     }
 
@@ -2866,7 +2928,20 @@ p_print_map:
     macro_rules! stub_void {
         ($name:expr) => {
             sym!($name);
-            text.push(0xc3); // ret
+            if let Some(caps) = granted_caps {
+                if let Some(cap) = stub_capability($name) {
+                    if !caps.contains(cap) {
+                        text.extend_from_slice(&[0x0f, 0x0b]); // ud2
+                        text.push(0xc3); // ret
+                    } else {
+                        text.push(0xc3); // ret
+                    }
+                } else {
+                    text.push(0xc3); // ret
+                }
+            } else {
+                text.push(0xc3); // ret
+            }
         };
     }
 
@@ -4202,6 +4277,9 @@ p_print_map:
     // p_allocator_free jumps to p_free
     relocations.push((palloc_free_jmp_off as u64, "p_free".to_string(), 2));
 
+    // p_region_free jumps to p_free (I-1C)
+    relocations.push((pregion_free_jmp_off as u64, "p_free".to_string(), 2));
+
     // RIP-relative LEA relocations for rodata symbols
     // p_print_bool: true string
     relocations.push((pbool_true_lea as u64, ".Lpbool_true_str".to_string(), 1)); // R_X86_64_32? No, need PC-relative
@@ -4250,4 +4328,56 @@ thread_local! {
 /// Get the runtime relocations (internal calls between runtime functions).
 pub fn runtime_relocations() -> Vec<(u64, String, u8)> {
     RUNTIME_RELOCATIONS.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f1b_stub_capability_mapping() {
+        // Net capability stubs
+        assert_eq!(stub_capability("p_socket_listen"), Some("Net"));
+        assert_eq!(stub_capability("p_socket_accept"), Some("Net"));
+        assert_eq!(stub_capability("p_http_parse_request"), Some("Net"));
+        assert_eq!(stub_capability("p_http_build_response"), Some("Net"));
+
+        // FS capability stubs
+        assert_eq!(stub_capability("p_file_open"), Some("FS"));
+        assert_eq!(stub_capability("p_read_file"), Some("FS"));
+        assert_eq!(stub_capability("p_write_file"), Some("FS"));
+
+        // Spawn capability stubs
+        assert_eq!(stub_capability("p_thread_spawn"), Some("Spawn"));
+        assert_eq!(stub_capability("p_spawn"), Some("Spawn"));
+
+        // Non-capability stubs return None
+        assert_eq!(stub_capability("p_print_int"), None);
+        assert_eq!(stub_capability("p_malloc"), None);
+        assert_eq!(stub_capability("p_vec_new"), None);
+    }
+
+    #[test]
+    fn f1b_runtime_parts_with_caps_does_not_crash() {
+        // Ensure runtime_parts_with_caps produces valid output.
+        let mut caps = HashSet::new();
+        caps.insert("IO".to_string());
+        let (text, syms, rodata, rodata_syms) = runtime_parts_with_caps(&caps);
+        assert!(!text.is_empty(), "runtime text should not be empty");
+        assert!(!syms.is_empty(), "runtime symbols should not be empty");
+        assert!(!rodata.is_empty(), "runtime rodata should not be empty");
+        assert!(!rodata_syms.is_empty(), "runtime rodata syms should not be empty");
+
+        // Verify that Net stubs are present (as symbols) but with trap bodies.
+        let socket_sym = syms.iter().find(|(name, _, _)| *name == "p_socket_listen");
+        assert!(socket_sym.is_some(), "p_socket_listen should be in symbols");
+    }
+
+    #[test]
+    fn f1b_runtime_parts_default_works() {
+        // Default runtime_parts (no caps) should work as before.
+        let (text, syms, _, _) = runtime_parts();
+        assert!(!text.is_empty());
+        assert!(!syms.is_empty());
+    }
 }

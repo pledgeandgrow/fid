@@ -1,0 +1,309 @@
+// Fides Flowfield standard library — Phase 8D (S3)
+//
+// Flowfield pathfinding for RTS games: computes a vector field that guides
+// units toward a destination. Each cell stores a direction vector pointing
+// to the next step. Multiple units can follow the same flowfield efficiently.
+//
+// Usage:
+//   use flowfield;
+//   pv ff = flowfield_create(64, 64);
+//   flowfield_set_target(ff, 32, 32);   // destination
+//   flowfield_set_blocked(ff, 10, 10);  // wall
+//   flowfield_compute(ff);              // BFS from target
+//   pv dir = flowfield_get_dir(ff, 5, 5); // direction to move from (5,5)
+
+module flowfield;
+
+// ─── Flowfield Struct ─────────────────────────────────────────────────────
+//
+// The flowfield uses a distance field (BFS from target) and derives
+// direction vectors by gradient descent on the distance field.
+//
+// distance[y * width + x] = steps to reach target (0 = target, -1 = blocked)
+// dir_x/dir_y = normalized direction vector pointing toward target
+
+pub struct Flowfield {
+    pub width: i64,
+    pub height: i64,
+    pub distance: Vec<i64>,    // distance field (-1 = blocked, -2 = unvisited)
+    pub dir_x: Vec<i64>,       // direction x component (scaled by 1000)
+    pub dir_y: Vec<i64>,       // direction y component (scaled by 1000)
+    pub target_x: i64,
+    pub target_y: i64,
+    pub computed: bool,
+}
+
+// ─── Creation ─────────────────────────────────────────────────────────────
+
+/// Create a new empty flowfield (all cells unvisited).
+pub pf flowfield_create(width: i64, height: i64) -> Flowfield {
+    pv dist = Vec::new();
+    pv dx = Vec::new();
+    pv dy = Vec::new();
+    pv i = 0;
+    while i < width * height {
+        dist.push(-2);  // -2 = unvisited
+        dx.push(0);
+        dy.push(0);
+        i = i + 1;
+    }
+    ret Flowfield {
+        width: width,
+        height: height,
+        distance: dist,
+        dir_x: dx,
+        dir_y: dy,
+        target_x: -1,
+        target_y: -1,
+        computed: false,
+    };
+}
+
+// ─── Setup ────────────────────────────────────────────────────────────────
+
+/// Set the destination/target cell.
+pub pf flowfield_set_target(ff: &mut Flowfield, x: i64, y: i64) -> void {
+    if x < 0 || x >= ff.width || y < 0 || y >= ff.height {
+        ret;
+    }
+    ff.target_x = x;
+    ff.target_y = y;
+    ff.computed = false;
+}
+
+/// Mark a cell as blocked (impassable).
+pub pf flowfield_set_blocked(ff: &mut Flowfield, x: i64, y: i64) -> void {
+    if x < 0 || x >= ff.width || y < 0 || y >= ff.height {
+        ret;
+    }
+    ff.distance.set(y * ff.width + x, -1);
+    ff.computed = false;
+}
+
+/// Mark a cell as passable (clear blocked status).
+pub pf flowfield_set_passable(ff: &mut Flowfield, x: i64, y: i64) -> void {
+    if x < 0 || x >= ff.width || y < 0 || y >= ff.height {
+        ret;
+    }
+    ff.distance.set(y * ff.width + x, -2);
+    ff.computed = false;
+}
+
+/// Check if a cell is blocked.
+pub pf flowfield_is_blocked(ff: Flowfield, x: i64, y: i64) -> bool {
+    if x < 0 || x >= ff.width || y < 0 || y >= ff.height {
+        ret true;
+    }
+    ret ff.distance.get(y * ff.width + x) == -1;
+}
+
+// ─── BFS Distance Field Computation ───────────────────────────────────────
+//
+// We use a simple BFS from the target cell, expanding outward.
+// Each cell's distance = steps to reach the target.
+// Blocked cells remain at -1. Unreachable cells remain at -2.
+
+/// Compute the distance field using BFS from the target.
+/// Uses a simple queue (Vec with head index) since Fides has no deque yet.
+pub pf flowfield_compute(ff: &mut Flowfield) -> void {
+    if ff.target_x < 0 || ff.target_y < 0 {
+        ret;
+    }
+
+    // Reset all non-blocked cells to unvisited
+    pv i = 0;
+    while i < ff.distance.len() {
+        if ff.distance.get(i) != -1 {
+            ff.distance.set(i, -2);
+        }
+        i = i + 1;
+    }
+
+    // BFS queue: store cell indices
+    pv queue_x = Vec::new();
+    pv queue_y = Vec::new();
+    pv head = 0;
+
+    // Start from target
+    pv tgt_x = ff.target_x;
+    pv tgt_y = ff.target_y;
+    ff.distance.set(tgt_y * ff.width + tgt_x, 0);
+    queue_x.push(tgt_x);
+    queue_y.push(tgt_y);
+
+    // 4-directional neighbors
+    pv neighbor_dx = Vec::new();
+    neighbor_dx.push(0);
+    neighbor_dx.push(0);
+    neighbor_dx.push(1);
+    neighbor_dx.push(-1);
+
+    pv neighbor_dy = Vec::new();
+    neighbor_dy.push(-1);
+    neighbor_dy.push(1);
+    neighbor_dy.push(0);
+    neighbor_dy.push(0);
+
+    while head < queue_x.len() {
+        pv cx = queue_x.get(head);
+        pv cy = queue_y.get(head);
+        head = head + 1;
+
+        pv cdist = ff.distance.get(cy * ff.width + cx);
+
+        // Check all 4 neighbors
+        pv d = 0;
+        while d < 4 {
+            pv nx = cx + neighbor_dx.get(d);
+            pv ny = cy + neighbor_dy.get(d);
+
+            if nx >= 0 && nx < ff.width && ny >= 0 && ny < ff.height {
+                pv nidx = ny * ff.width + nx;
+                if ff.distance.get(nidx) == -2 {  // unvisited and not blocked
+                    ff.distance.set(nidx, cdist + 1);
+                    queue_x.push(nx);
+                    queue_y.push(ny);
+                }
+            }
+            d = d + 1;
+        }
+    }
+
+    // Compute direction vectors via gradient descent
+    flowfield_compute_dirs(ff);
+    ff.computed = true;
+}
+
+/// Compute direction vectors from the distance field.
+/// Each cell's direction points toward the neighbor with the lowest distance.
+pub pf flowfield_compute_dirs(ff: &mut Flowfield) -> void {
+    pv y = 0;
+    while y < ff.height {
+        pv x = 0;
+        while x < ff.width {
+            pv idx = y * ff.width + x;
+            pv my_dist = ff.distance.get(idx);
+
+            if my_dist == 0 || my_dist == -1 || my_dist == -2 {
+                // Target, blocked, or unreachable: no direction
+                ff.dir_x.set(idx, 0);
+                ff.dir_y.set(idx, 0);
+            } else {
+                // Find the neighbor with the lowest distance
+                pv best_dist = my_dist;
+                pv best_dx = 0;
+                pv best_dy = 0;
+
+                // Check 4 neighbors
+                // North
+                if y > 0 {
+                    pv n_dist = ff.distance.get((y - 1) * ff.width + x);
+                    if n_dist >= 0 && n_dist < best_dist {
+                        best_dist = n_dist;
+                        best_dx = 0;
+                        best_dy = -1;
+                    }
+                }
+                // South
+                if y < ff.height - 1 {
+                    pv n_dist = ff.distance.get((y + 1) * ff.width + x);
+                    if n_dist >= 0 && n_dist < best_dist {
+                        best_dist = n_dist;
+                        best_dx = 0;
+                        best_dy = 1;
+                    }
+                }
+                // East
+                if x < ff.width - 1 {
+                    pv n_dist = ff.distance.get(y * ff.width + x + 1);
+                    if n_dist >= 0 && n_dist < best_dist {
+                        best_dist = n_dist;
+                        best_dx = 1;
+                        best_dy = 0;
+                    }
+                }
+                // West
+                if x > 0 {
+                    pv n_dist = ff.distance.get(y * ff.width + x - 1);
+                    if n_dist >= 0 && n_dist < best_dist {
+                        best_dist = n_dist;
+                        best_dx = -1;
+                        best_dy = 0;
+                    }
+                }
+
+                ff.dir_x.set(idx, best_dx);
+                ff.dir_y.set(idx, best_dy);
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+// ─── Query ────────────────────────────────────────────────────────────────
+
+/// Get the direction vector at a cell. Returns (dx, dy).
+/// The vector is normalized (one of: (0,0), (±1,0), (0,±1)).
+pub pf flowfield_get_dir(ff: Flowfield, x: i64, y: i64) -> (i64, i64) {
+    if x < 0 || x >= ff.width || y < 0 || y >= ff.height {
+        ret (0, 0);
+    }
+    pv idx = y * ff.width + x;
+    ret (ff.dir_x.get(idx), ff.dir_y.get(idx));
+}
+
+/// Get the distance to the target from a cell. -1 = blocked, -2 = unreachable.
+pub pf flowfield_get_distance(ff: Flowfield, x: i64, y: i64) -> i64 {
+    if x < 0 || x >= ff.width || y < 0 || y >= ff.height {
+        ret -1;
+    }
+    ret ff.distance.get(y * ff.width + x);
+}
+
+/// Check if a cell has a valid path to the target.
+pub pf flowfield_has_path(ff: Flowfield, x: i64, y: i64) -> bool {
+    if x < 0 || x >= ff.width || y < 0 || y >= ff.height {
+        ret false;
+    }
+    pv d = ff.distance.get(y * ff.width + x);
+    ret d >= 0;
+}
+
+/// Check if the flowfield has been computed.
+pub pf flowfield_is_computed(ff: Flowfield) -> bool {
+    ret ff.computed;
+}
+
+// ─── Integration Cost (for RTS group pathfinding) ─────────────────────────
+//
+// The integration cost adds a penalty for cells with many units,
+// encouraging spreading out. This is a simple crowd-based cost.
+
+/// Add a cost penalty to a cell (higher = less desirable path).
+pub pf flowfield_add_cost(ff: &mut Flowfield, x: i64, y: i64, cost: i64) -> void {
+    if x < 0 || x >= ff.width || y < 0 || y >= ff.height {
+        ret;
+    }
+    pv idx = y * ff.width + x;
+    pv current = ff.distance.get(idx);
+    if current > 0 {
+        ff.distance.set(idx, current + cost);
+    }
+}
+
+// ─── Reset ────────────────────────────────────────────────────────────────
+
+/// Reset the flowfield (clear distances and directions, keep blocked tiles).
+pub pf flowfield_reset(ff: &mut Flowfield) -> void {
+    pv i = 0;
+    while i < ff.distance.len() {
+        if ff.distance.get(i) != -1 {
+            ff.distance.set(i, -2);
+        }
+        ff.dir_x.set(i, 0.0);
+        ff.dir_y.set(i, 0.0);
+        i = i + 1;
+    }
+    ff.computed = false;
+}

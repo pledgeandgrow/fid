@@ -325,6 +325,9 @@ impl<'tc> BorrowChecker<'tc> {
             Stmt::Backward { loss, .. } => {
                 self.collect_var_uses_expr(loss, idx);
             }
+            Stmt::Query { body, .. } => {
+                for s in body { self.collect_var_uses_stmt(s, idx); }
+            }
         }
     }
 
@@ -943,6 +946,11 @@ impl<'tc> BorrowChecker<'tc> {
             }
             Stmt::Backward { loss, .. } => {
                 self.check_expr(loss);
+            }
+            Stmt::Query { body, .. } => {
+                self.push_scope();
+                for s in body { self.check_stmt(s); }
+                self.pop_scope();
             }
         }
     }

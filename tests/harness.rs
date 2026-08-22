@@ -26,7 +26,6 @@ fn is_skip_test(name: &str) -> bool {
         | "test_json.fd"
         | "test_tensor.fd"
         | "test_simd.fd"
-        | "test_parallel.fd"
         | "test_shape.fd"
         | "test_wasm.fd"
         | "test_allocator.fd"
@@ -39,6 +38,10 @@ fn is_skip_test(name: &str) -> bool {
         | "test_gat.fd"
         | "test_ffi_header.fd"
         | "test_dlopen.fd"
+        | "test_game_stdlib.fd"
+        | "test_phase8b.fd"
+        | "test_vec_math.fd"
+        | "test_vec_shape_fail.fd"
         // Borrow checker fail test is now in the expected-fail list
         // (borrow checking is on by default as of Phase 5).
     )

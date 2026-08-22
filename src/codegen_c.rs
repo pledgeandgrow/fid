@@ -430,6 +430,7 @@ impl CCodeGen {
             ("p_malloc", &[I64]),
             ("p_alloc", &[I64]),
             ("p_free", &[p()]),
+            ("p_region_free", &[p()]),
             ("p_panic", &[p()]),
             ("println", &[p(), p()]),
             ("p_vec_set", &[p(), I64, p()]),
@@ -538,7 +539,7 @@ impl CCodeGen {
             "p_vec_reverse", "p_vec_sort", "p_vec_truncate", "p_vec_extend",
             "p_map_insert", "p_map_remove", "p_map_clear",
             "p_print", "p_print_str", "p_print_int", "p_print_bool",
-            "p_print_float", "p_print_newline", "p_free", "p_panic",
+            "p_print_float", "p_print_newline", "p_free", "p_region_free", "p_panic",
             "p_socket_close",
             "p_cli", "p_sti", "p_cr3_write", "p_invlpg", "p_page_map", "p_page_unmap",
             "p_phys_write64",
@@ -679,6 +680,7 @@ impl CCodeGen {
         wln!(self, "int64_t p_vec_pop(PVec* v);");
         wln!(self, "bool p_vec_is_empty(PVec* v);");
         wln!(self, "void p_vec_clear(PVec* v);");
+        wln!(self, "int64_t p_vec_capacity(PVec* v);");
         wln!(self, "PMap* p_map_new(void);");
         wln!(self, "void p_map_insert(PMap* m, const char* key, int64_t val);");
         wln!(self, "int64_t p_map_get(PMap* m, const char* key);");
@@ -687,8 +689,8 @@ impl CCodeGen {
         wln!(self, "int64_t p_map_len(PMap* m);");
         wln!(self, "bool p_map_is_empty(PMap* m);");
         wln!(self, "void p_map_clear(PMap* m);");
-        wln!(self, "PVec* p_map_keys(PMap* m);");
-        wln!(self, "PVec* p_map_values(PMap* m);");
+        wln!(self, "int64_t p_map_keys(PMap* m);");
+        wln!(self, "int64_t p_map_values(PMap* m);");
         // Bare metal builtins (Phase 5A) — stubs for C codegen
         wln!(self, "void p_cli(void);");
         wln!(self, "void p_sti(void);");
@@ -1272,9 +1274,16 @@ impl CCodeGen {
                             wln!(self, "    p_print_int((int64_t){});", arg_str);
                         }
                         Some(IrType::Generic(name, _)) if name == "Vec" => {
-                            wln!(self, "    {{ char* _s = p_to_str_vec((PVec*){}); p_print_str(_s); free(_s); }}", arg_str);
+                            // Phase 10B: Vec is now a Fides type — call Vec_to_str
+                            wln!(self, "    {{ char* _s = (char*)Vec_to_str(0, (int64_t){}); p_print_str(_s); }}", arg_str);
+                        }
+                        Some(IrType::Opaque(name)) if name == "Vec" => {
+                            wln!(self, "    {{ char* _s = (char*)Vec_to_str(0, (int64_t){}); p_print_str(_s); }}", arg_str);
                         }
                         Some(IrType::Generic(name, _)) if name == "HashMap" => {
+                            wln!(self, "    {{ char* _s = p_to_str_map((PMap*){}); p_print_str(_s); free(_s); }}", arg_str);
+                        }
+                        Some(IrType::Opaque(name)) if name == "HashMap" => {
                             wln!(self, "    {{ char* _s = p_to_str_map((PMap*){}); p_print_str(_s); free(_s); }}", arg_str);
                         }
                         Some(IrType::Generic(_, _)) => {
@@ -1308,9 +1317,16 @@ impl CCodeGen {
                             wln!(self, "    p_print_int((int64_t){});", arg_str);
                         }
                         Some(IrType::Generic(name, _)) if name == "Vec" => {
-                            wln!(self, "    {{ char* _s = p_to_str_vec((PVec*){}); p_print_str(_s); free(_s); }}", arg_str);
+                            // Phase 10B: Vec is now a Fides type — call Vec_to_str
+                            wln!(self, "    {{ char* _s = (char*)Vec_to_str(0, (int64_t){}); p_print_str(_s); }}", arg_str);
+                        }
+                        Some(IrType::Opaque(name)) if name == "Vec" => {
+                            wln!(self, "    {{ char* _s = (char*)Vec_to_str(0, (int64_t){}); p_print_str(_s); }}", arg_str);
                         }
                         Some(IrType::Generic(name, _)) if name == "HashMap" => {
+                            wln!(self, "    {{ char* _s = p_to_str_map((PMap*){}); p_print_str(_s); free(_s); }}", arg_str);
+                        }
+                        Some(IrType::Opaque(name)) if name == "HashMap" => {
                             wln!(self, "    {{ char* _s = p_to_str_map((PMap*){}); p_print_str(_s); free(_s); }}", arg_str);
                         }
                         Some(IrType::Generic(_, _)) => {
@@ -1349,9 +1365,16 @@ impl CCodeGen {
                             wln!(self, "    {} = (void*)p_to_str_float({});", dst, arg_str);
                         }
                         Some(IrType::Generic(name, _)) if name == "Vec" => {
-                            wln!(self, "    {} = (void*)p_to_str_vec((PVec*){});", dst, arg_str);
+                            // Phase 10B: Vec is now a Fides type — call Vec_to_str
+                            wln!(self, "    {} = (void*)Vec_to_str(0, (int64_t){});", dst, arg_str);
+                        }
+                        Some(IrType::Opaque(name)) if name == "Vec" => {
+                            wln!(self, "    {} = (void*)Vec_to_str(0, (int64_t){});", dst, arg_str);
                         }
                         Some(IrType::Generic(name, _)) if name == "HashMap" => {
+                            wln!(self, "    {} = (void*)p_to_str_map((PMap*){});", dst, arg_str);
+                        }
+                        Some(IrType::Opaque(name)) if name == "HashMap" => {
                             wln!(self, "    {} = (void*)p_to_str_map((PMap*){});", dst, arg_str);
                         }
                         Some(IrType::Bool) => {
@@ -1416,9 +1439,19 @@ impl CCodeGen {
                         }
                         _ => {
                             let dst_ty = func.values.get(&id).map(|m| &m.ty);
+                            // Phase 10B: when destination is a pointer type but
+                            // the callee returns int64_t (e.g. Fides Vec functions
+                            // that return i64 but are typed as Opaque("Vec")),
+                            // add a (void*) cast to satisfy C type checking.
+                            let dst_is_ptr = matches!(dst_ty, Some(IrType::Ptr(_)) | Some(IrType::Opaque(_)) | Some(IrType::Generic(_, _)));
+                            let callee_returns_int = callee_c_ret == "int64_t" || callee_c_ret == "int32_t" || callee_c_ret == "int16_t" || callee_c_ret == "int8_t";
                             let cast = match dst_ty {
                                 Some(IrType::Ptr(_)) | Some(IrType::Opaque(_)) | Some(IrType::Generic(_, _)) => {
-                                    "".to_string()
+                                    if dst_is_ptr && callee_returns_int {
+                                        "(void*)".to_string()
+                                    } else {
+                                        "".to_string()
+                                    }
                                 }
                                 Some(IrType::F64) => "(double)".to_string(),
                                 Some(IrType::F32) => "(float)".to_string(),
@@ -1653,6 +1686,9 @@ impl CCodeGen {
                     IrType::Generic(name, _) if name == "Vec" => {
                         wln!(self, "    {{ char* _s = p_to_str_vec((PVec*){}); p_print_str(_s); free(_s); }}", v);
                     }
+                    IrType::Opaque(name) if name == "Vec" => {
+                        wln!(self, "    {{ char* _s = p_to_str_vec((PVec*){}); p_print_str(_s); free(_s); }}", v);
+                    }
                     IrType::Generic(name, _) if name == "HashMap" => {
                         wln!(self, "    {{ char* _s = p_to_str_map((PMap*){}); p_print_str(_s); free(_s); }}", v);
                     }
@@ -1794,19 +1830,18 @@ impl CCodeGen {
         wln!(self, "bool p_map_is_empty(PMap* m) {{ return m ? m->len == 0 : true; }}");
         wln!(self, "void p_map_clear(PMap* m) {{ if (m) m->len = 0; }}");
         wln!(self, "");
-        wln!(self, "PVec* p_map_keys(PMap* m) {{");
-        wln!(self, "    PVec* v = p_vec_new();");
+        wln!(self, "// Phase 10B: p_map_keys returns a Fides Vec (i64 pointer)");
+        wln!(self, "int64_t p_map_keys(PMap* m) {{");
+        wln!(self, "    int64_t v = Vec_new(0);");
         wln!(self, "    for (int64_t i = 0; i < m->len; i++)");
-        wln!(self, "        p_vec_push(v, (void*)m->keys[i]);");
+        wln!(self, "        Vec_push(0, v, (int64_t)m->keys[i]);");
         wln!(self, "    return v;");
         wln!(self, "}}");
         wln!(self, "");
-        wln!(self, "PVec* p_map_values(PMap* m) {{");
-        wln!(self, "    PVec* v = p_vec_new();");
+        wln!(self, "int64_t p_map_values(PMap* m) {{");
+        wln!(self, "    int64_t v = Vec_new(0);");
         wln!(self, "    for (int64_t i = 0; i < m->len; i++) {{");
-        wln!(self, "    int64_t* p = (int64_t*)malloc(sizeof(int64_t));");
-        wln!(self, "    *p = m->vals[i];");
-        wln!(self, "    p_vec_push(v, p);");
+        wln!(self, "        Vec_push(0, v, m->vals[i]);");
         wln!(self, "    }}");
         wln!(self, "    return v;");
         wln!(self, "}}");
@@ -2116,6 +2151,7 @@ impl CCodeGen {
         wln!(self, "}}");
         wln!(self, "");
         // Additional vec functions
+        wln!(self, "int64_t p_vec_capacity(PVec* v) {{ return v ? v->cap : 0; }}");
         wln!(self, "PVec* p_vec_clone(PVec* v) {{");
         wln!(self, "    PVec* c = p_vec_new();");
         wln!(self, "    for (int64_t i = 0; i < v->len; i++) p_vec_push(c, v->data[i]);");

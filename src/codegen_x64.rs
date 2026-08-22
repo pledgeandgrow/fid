@@ -216,6 +216,10 @@ impl X64CodeGen {
                                 offset
                             ));
                         }
+                        Location::Remat(_) => {
+                            // Function params are never Remat (they're
+                            // pre-assigned in the regalloc). Defensive no-op.
+                        }
                     }
                 }
             }
@@ -302,6 +306,9 @@ impl X64CodeGen {
                         }
                         Location::Spill(off) => {
                             self.wl(&format!("    # spilled to -{}(%rbp)", off));
+                        }
+                        Location::Remat(_) => {
+                            // StackAlloc dst is never Remat (not a Mov ImmI).
                         }
                     }
                 }
@@ -501,6 +508,10 @@ impl X64CodeGen {
                     self.gen_operand_to_mem(src, off);
                 }
             }
+            Some(Location::Remat(_)) => {
+                // F-1A: dst is a rematerializable constant. The defining
+                // Mov is a no-op — the constant is reloaded at each use site.
+            }
             None => {
                 self.wl(&format!("    # Mov: dst {} unallocated", dst));
             }
@@ -605,6 +616,11 @@ impl X64CodeGen {
                                 self.wl("    cqto");
                                 self.wl(&format!("    idivq -{}(%rbp)", off));
                             }
+                            Some(Location::Remat(c)) => {
+                                self.wl("    cqto");
+                                self.wl(&format!("    movq ${}, %rcx", c));
+                                self.wl("    idivq %rcx");
+                            }
                             None => {
                                 self.wl("    cqto");
                                 self.wl("    idivq %rcx");
@@ -655,6 +671,11 @@ impl X64CodeGen {
                             Some(Location::Spill(off)) => {
                                 self.wl("    cqto");
                                 self.wl(&format!("    idivq -{}(%rbp)", off));
+                            }
+                            Some(Location::Remat(c)) => {
+                                self.wl("    cqto");
+                                self.wl(&format!("    movq ${}, %rcx", c));
+                                self.wl("    idivq %rcx");
                             }
                             None => {
                                 self.wl("    cqto");
@@ -775,6 +796,9 @@ impl X64CodeGen {
                     self.wl(&format!("    {} {}, %rax", load_op, mem));
                     self.wl(&format!("    movq %rax, -{}(%rbp)", off));
                 }
+                Some(Location::Remat(_)) => {
+                    // Load dst is never Remat (not a Mov ImmI).
+                }
                 None => {}
             }
             return;
@@ -803,6 +827,9 @@ impl X64CodeGen {
                 // Load into RAX, then store to spill slot.
                 self.wl(&format!("    {} ({}), %rax", load_op, self.reg_str(ptr_reg)));
                 self.wl(&format!("    movq %rax, -{}(%rbp)", off));
+            }
+            Some(Location::Remat(_)) => {
+                // Load dst is never Remat (not a Mov ImmI).
             }
             None => {}
         }
@@ -1128,6 +1155,7 @@ impl X64CodeGen {
         match self.dst_loc(*vreg) {
             Some(Location::Reg(r)) => format!("%{}", r.name()),
             Some(Location::Spill(off)) => format!("-{}(%rbp)", off),
+            Some(Location::Remat(c)) => format!("${}", c),
             None => format!("%v{}", vreg.0),
         }
     }
@@ -1184,6 +1212,10 @@ impl X64CodeGen {
                     Some(Location::Spill(off)) => {
                         self.wl(&format!("    movq -{}(%rbp), %{}", off, reg.name()));
                     }
+                    Some(Location::Remat(c)) => {
+                        // F-1A: Reload the constant immediate directly.
+                        self.wl(&format!("    movq ${}, %{}", c, reg.name()));
+                    }
                     None => {
                         self.wl(&format!("    # operand {} unallocated", vr));
                     }
@@ -1217,6 +1249,11 @@ impl X64CodeGen {
                     }
                     Some(Location::Spill(off)) => {
                         self.wl(&format!("    movapd -{}(%rbp), %{}", off, xmm_name));
+                    }
+                    Some(Location::Remat(c)) => {
+                        // F-1A: Load constant via RAX then move to XMM.
+                        self.wl(&format!("    movq ${}, %rax", c));
+                        self.wl(&format!("    movq %rax, %{}", xmm_name));
                     }
                     None => {
                         self.wl(&format!("    # operand {} unallocated for XMM", vr));
@@ -1267,6 +1304,10 @@ impl X64CodeGen {
                         self.wl(&format!("    movq -{}(%rbp), %rax", src_off));
                         self.wl(&format!("    movq %rax, -{}(%rbp)", offset));
                     }
+                    Some(Location::Remat(c)) => {
+                        // F-1A: Store the constant immediate directly.
+                        self.wl(&format!("    movq ${}, -{}(%rbp)", c, offset));
+                    }
                     None => {}
                 }
             }
@@ -1304,6 +1345,10 @@ impl X64CodeGen {
                     }
                     Some(Location::Spill(off)) => {
                         self.wl(&format!("    {} -{}(%rbp), %{}", op, off, dst_reg.name()));
+                    }
+                    Some(Location::Remat(c)) => {
+                        // F-1A: Apply the constant immediate directly.
+                        self.wl(&format!("    {} ${}, %{}", op, c, dst_reg.name()));
                     }
                     None => {}
                 }
@@ -1379,6 +1424,10 @@ impl X64CodeGen {
                     }
                     Some(Location::Spill(off)) => {
                         self.wl(&format!("    cmpq -{}(%rbp), %{}", off, dst_reg.name()));
+                    }
+                    Some(Location::Remat(c)) => {
+                        // F-1A: Compare with the constant immediate directly.
+                        self.wl(&format!("    cmpq ${}, %{}", c, dst_reg.name()));
                     }
                     None => {}
                 }

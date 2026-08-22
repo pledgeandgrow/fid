@@ -13,7 +13,7 @@
 make it another D, Crystal, or V — technically good, commercially irrelevant.**
 
 The project has built an impressive amount of working compiler infrastructure
-(52,845 LOC, 36 source files, 114/114 test parity across 3 backends, 15 stdlib
+(~55,000 LOC, 36+ source files, 102/127 test parity across 3 backends, 34 stdlib
 modules, 6 backends). But it's spreading into too many domains (games,
 blockchain, robotics, medical, serverless) before it has proven it can do the
 basics better than existing languages.
@@ -59,7 +59,7 @@ Fides source
   └── Hot reload (native JIT)
 ```
 
-114/114 test parity across interpreter, PE, and C codegen is real. This is more
+102/127 test parity across interpreter, PE, and C codegen is real (pre-existing failures from incomplete 8A/8B/8D features). This is more
 backends than most languages ever achieve. History lesson: **"A great runtime
 can sustain multiple languages"** — Fides's IR is its "runtime" and it supports
 many targets.
@@ -81,9 +81,9 @@ doesn't burden the language forever. Scala should have done this. C++ couldn't.
 ### 4. Test Infrastructure ✅
 
 - 136 unit tests
-- 8/8 harness tests
-- 114/114 interpreter + PE + C codegen parity
-- 21/21 expected-fail tests
+- 7/8 harness tests
+- 102/127 interpreter + PE, 101/127 C codegen (pre-existing failures from incomplete features)
+- 22/22 expected-fail tests
 - `verify.sh` with baseline tracking
 - Golden file generation
 - Bisect tooling
@@ -215,11 +215,10 @@ to choose a systems language.
 ~~Multiple docs are out of sync with reality:~~
 **UPDATE Aug 2026:** Docs have been synchronized with actual state. All test
 counts, LOC, file counts, and phase numbers now match verified reality:
-- `features.md` now says "114/114 C codegen — FULL PARITY" ✅
-- `features.md` now says "114/114 interpreter" ✅
-- `roadmap-limitations.md` now says "114/114 + 21/21 expected-fail" ✅
-- `roadmap-limitations.md` now says "215 warnings" ✅
-- `roadmap.md` summary now says "114/114" ✅
+- `features.md` now says "101/127 C codegen — near full parity" ✅
+- `features.md` now says "102/127 interpreter" ✅
+- `roadmap-limitations.md` now says "102/127 + 22/22 expected-fail" ✅
+- `roadmap.md` summary now says "102/127" ✅
 - Phase numbers updated (self-hosting is Phase 10, ecosystem Phase 11, world class Phase 12) ✅
 
 This was a symptom of moving fast without updating all docs. The docs now
@@ -230,7 +229,7 @@ match reality. A pre-commit check would prevent future drift.
 214 warnings in the Rust compiler means ~60 unused imports, dead code, and
 type naming issues. This is technical debt that accumulates. Every warning is
 a potential bug or a sign of abandoned code paths. The roadmap mentions
-"remove 221 debug eprintln! statements" but the actual count is different.
+"remove debug eprintln! statements" but the actual count is ~238 compiler warnings (dead code, unused variables).
 
 ### 6. No Generic Option<T> Yet 🟡
 
@@ -363,7 +362,7 @@ well. Cut the rest until those 3 prove the concept.
 Every doc should be updated when test counts change. ~~The current state where
 `features.md` says 76/78 but reality is 114/114 is unacceptable for a project
 that wants to be taken seriously.~~ **UPDATE Aug 2026: All docs now match
-verified reality (114/114 FULL PARITY across all backends).**
+verified reality (102/127 interpreter+PE, 101/127 C codegen, 22/22 expected-fail).**
 
 **Recommendation:** Add a pre-commit check: run `fidesc test`, compare
 output to docs, fail if mismatch. Or at minimum, update all docs in the same
@@ -447,10 +446,10 @@ candidate:
 | Dimension | Score | Notes |
 |-----------|-------|-------|
 | Novel design space | 🟢 9/10 | Unique combination no one else has |
-| Technical execution | 🟢 8/10 | 114/114 parity, 6 backends, solid test infra |
+| Technical execution | 🟢 8/10 | 102/127 parity, 6 backends, solid test infra |
 | Scope discipline | 🔴 3/10 | Trying to do everything at once |
 | Ecosystem building | 🔴 2/10 | No users, no packages, no tooling |
-| Focus / prioritization | 🟡 4/10 | Regalloc bug unfixed, adding features instead |
+| Focus / prioritization | 🟡 5/10 | Optimizer enabled by default, but still adding features instead of fixing regalloc |
 | Documentation accuracy | 🟡 5/10 | Multiple docs out of sync |
 | Self-hosting path | 🟢 7/10 | Plan exists, prerequisites identified |
 | Differentiation clarity | 🟡 5/10 | Combination is unique but not articulated |

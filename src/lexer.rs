@@ -143,6 +143,11 @@ impl Lexer {
             "grad" => TokenKind::Grad,
             "backward" => TokenKind::Backward,
             "kernel" => TokenKind::Kernel,
+            "component" => TokenKind::Component,
+            "system" => TokenKind::System,
+            "query" => TokenKind::Query,
+            "state" => TokenKind::State,
+            "on" => TokenKind::On,
             "q8" => TokenKind::I8,    // q8 is an alias for i8 (quantized 8-bit)
             "q4" => TokenKind::I8,    // q4 is stored in i8 (quantized 4-bit)
             "i8" => TokenKind::I8,

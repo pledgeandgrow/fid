@@ -26,7 +26,7 @@ Comptime (src/comptime.rs)        — compile-time eval + reflection
 │  Interpreter (src/interp.rs)        — runs IR directly (fidesc run) │
 │  PIR Pipeline (src/pir.rs)          — IR → PIR L1 → L2 → L3          │
 │  Peephole (src/peephole.rs)         — 9 passes, always on in build   │
-│  Optimizer (src/opt.rs)             — opt-in (has regalloc bug)      │
+│  Optimizer (src/opt.rs)             — enabled by default in build    │
 │  Register Allocator (src/regalloc.rs) — linear scan                  │
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
@@ -63,7 +63,7 @@ Native Binary / WASM / SPIR-V / C Source / Running Code
 - IR interpreter (`fidesc run`)
 - PIR pipeline: L1 → L2 → L3 (`fidesc pir`)
 - Peephole optimizer: 9 passes, always on in `build`
-- PIR optimizer: const fold, CSE, DCE, inline, unroll, TCO, effect elision (opt-in — has regalloc bug)
+- PIR optimizer: 10 passes (const fold, CSE, DCE, inline, unroll, TCO, alias analysis, effect reorder, partial eval, vectorize) — enabled by default in `build` (use `--no-opt` to disable), `--lto` for aggressive inlining
 - PE emitter: native x86-64 Windows executables, no external tools
 - ELF64 emitter: native Linux executables + relocatable objects, no external tools
 - Mach-O / COFF object file emission
@@ -74,17 +74,17 @@ Native Binary / WASM / SPIR-V / C Source / Running Code
 - Integrated linker (ELF64 objects → executable, in-process)
 - Hot reload (`fidesc watch`) — native JIT + function-level change detection
 - Custom runtime: hand-encoded x86-64 machine code via raw syscalls (Linux, no libc) / kernel32.dll (Windows)
-- 15 stdlib modules: core, json, tensor, parallel, db, http, simd, shape, quant, alloc, money, banking, file, time, privacy
+- 34 stdlib modules: core, vec, math, ecs, events, parallel, sync, db, http, json, shape, simd, tensor, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input
 - C header FFI parsing (`fidesc parse-header`)
 - Embedded/IoT: FixedBufferAllocator, `!RealTime` effect, RISC-V target, HAL framework
 - No external dependencies for primary paths: no LLVM, no libc (in Fides binaries), no external assembler, no external linker
 
 **What's partial / pending:**
-- ⚠️ PIR optimizer: works for simple programs, exposes pre-existing register allocator bug on complex ones (not enabled by default)
+- ✅ PIR optimizer: enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive cross-module inlining. PGO removed.
 - ⚠️ Effect handlers: `handle { do } with` syntax parses and runs; full continuation semantics pending
-- ❌ `async` / `await` / `spawn`: parsed, not yet implemented
+- ✅ `async` / `await` / `spawn`: implemented (eager evaluation, OS thread model). State machine transform for cooperative scheduling pending.
 - ❌ `#[test]` attribute: parsed but not executed by `fidesc test`
-- ❌ `#[derive]`: not yet implemented
+- ✅ `@derive(Debug/Clone/Serialize/Deserialize)`: implemented (Phase 7.7)
 - ❌ Default arguments, variadic arguments: not implemented
 - ❌ Region allocator (arena-based, tied to region system): not started
 - ❌ Self-hosting (Phase 6): compiler is still written in Rust
@@ -119,7 +119,7 @@ function main() -> i64 !IO {
 }
 ```
 
-**Optimizations at this level** (in `src/opt.rs`, opt-in):
+**Optimizations at this level** (in `src/opt.rs`, enabled by default in `build`):
 - Region-aware alias analysis (free, no pointer analysis needed)
 - Effect-based reordering (pure calls can move past each other)
 - Capability elision (if capability is provably unused, remove checks)
@@ -245,18 +245,24 @@ PIR Level 3 → Register Allocator → Instruction Selector → Peephole → Bin
 
 ---
 
-## Custom Stdlib — 8 Modules
+## Custom Stdlib — 34 Modules
 
 | Module | File | Contents |
 |--------|------|----------|
 | core | `stdlib/core.fd` | Auto-included: `Option`, `Result`, `println`, `assert`, `assert_eq`, `max`, `min`, `abs`, `clamp` |
+| vec | `stdlib/vec.fd` | Dynamic array (Vec<T> with push/pop/get/len) |
+| math | `stdlib/math.fd` | sqrt, sin, cos, floor, ceil, pow, fabs, constants |
+| ecs | `stdlib/ecs.fd` | ECS runtime helpers |
+| events | `stdlib/events.fd` | Event dispatch helpers |
+| parallel | `stdlib/parallel.fd` | par_map, par_sum, par_dot (sequential framework) |
+| sync | `stdlib/sync.fd` | Thread/atomic/mutex primitives |
 | json | `stdlib/json.fd` | parse, stringify, get, at |
 | tensor | `stdlib/tensor.fd` | n-d arrays, matmul, relu, softmax |
-| parallel | `stdlib/parallel.fd` | par_map, par_sum, par_dot |
 | db | `stdlib/db.fd` | `cap Database` trait, in-memory KV store |
 | http | `stdlib/http.fd` | socket + HTTP parsing |
 | simd | `stdlib/simd.fd` | elementwise ops, dot, sum, scale (f64x2, f64x4, etc.) |
 | shape | `stdlib/shape.fd` | shape system for tensor ops |
+| Plus 21 more | | env, args, process, regex, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, tilemap, sprite, flowfield, streaming, scene, physics, audio, input |
 
 ---
 

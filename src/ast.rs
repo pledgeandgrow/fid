@@ -518,6 +518,15 @@ pub enum Stmt {
         loss: Expr,
         line: usize,
     },
+    /// Phase 8B (F18): ECS query statement.
+    /// `query(ComponentA, ComponentB) { body }` — iterates over all entities
+    /// that have all the specified components. The variable `entity` (i64)
+    /// is bound to the current entity ID within the body.
+    Query {
+        components: Vec<String>,
+        body: Vec<Stmt>,
+        line: usize,
+    },
 }
 
 /// A handler for one effect operation within a `handle` block.
@@ -562,7 +571,8 @@ impl Stmt {
             | Stmt::Txn { line, .. }
             | Stmt::ComptimeGen { line, .. }
             | Stmt::GradBlock { line, .. }
-            | Stmt::Backward { line, .. } => *line,
+            | Stmt::Backward { line, .. }
+            | Stmt::Query { line, .. } => *line,
         }
     }
 }
@@ -754,6 +764,14 @@ pub struct Program {
     pub layers: Vec<LayerDef>,
     /// Model definitions: `model MLP { layers... forward(self, x) -> T { ... } }`
     pub models: Vec<ModelDef>,
+    /// Phase 8B: ECS component declarations (F18)
+    pub components: Vec<ComponentDef>,
+    /// Phase 8B: ECS system declarations (F18)
+    pub systems: Vec<SystemDef>,
+    /// Phase 8B: State machine declarations (F19)
+    pub state_machines: Vec<StateMachineDef>,
+    /// Phase 8B: Event handler declarations (F20)
+    pub event_handlers: Vec<EventHandlerDef>,
 }
 
 /// A neural network layer definition.
@@ -782,6 +800,65 @@ pub struct ModelDef {
     /// Layer instantiations: (field_name, layer_type, constructor_args)
     pub layers: Vec<(String, String, Vec<String>)>,
     pub forward: Func,
+    pub is_pub: bool,
+}
+
+// ─── Phase 8B: Game Architecture AST Nodes ───────────────────────────
+
+/// ECS component declaration (F18).
+/// `component Position { x: f64, y: f64 }`
+/// Desugars to: `struct Position { x: f64, y: f64 }`
+#[derive(Debug, Clone)]
+pub struct ComponentDef {
+    pub name: String,
+    pub fields: Vec<Param>,
+    pub is_pub: bool,
+}
+
+/// ECS system declaration (F18).
+/// `system Move(dt: f64) { query(Position, Velocity) { ... } }`
+/// Desugars to: `pf Move(dt: f64) { ... }` with query statements
+#[derive(Debug, Clone)]
+pub struct SystemDef {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub body: Vec<Stmt>,
+    pub is_pub: bool,
+}
+
+/// State machine declaration (F19).
+/// `state PlayerState { Idle { on move => Running } Running { on stop => Idle } }`
+/// Desugars to: enum + initial/handle functions
+#[derive(Debug, Clone)]
+pub struct StateMachineDef {
+    pub name: String,
+    pub states: Vec<StateDef>,
+    pub is_pub: bool,
+}
+
+/// A state within a state machine (F19).
+#[derive(Debug, Clone)]
+pub struct StateDef {
+    pub name: String,
+    pub transitions: Vec<StateTransition>,
+}
+
+/// A transition within a state (F19).
+/// `on move => Running` means: when event "move" is received, transition to Running
+#[derive(Debug, Clone)]
+pub struct StateTransition {
+    pub event: String,
+    pub target: String,
+}
+
+/// Event handler declaration (F20).
+/// `on click(x: i64, y: i64) { ... }`
+/// Desugars to: `pf __on_click(x: i64, y: i64) { ... }`
+#[derive(Debug, Clone)]
+pub struct EventHandlerDef {
+    pub event_name: String,
+    pub params: Vec<Param>,
+    pub body: Vec<Stmt>,
     pub is_pub: bool,
 }
 
