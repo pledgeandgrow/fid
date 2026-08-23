@@ -3,6 +3,7 @@ use crate::autograd;
 use crate::codegen::CodeGen;
 use crate::codegen_c;
 use crate::comptime;
+use crate::diag::ErrCode;
 use crate::interp;
 use crate::lexer::Lexer;
 use crate::lower;
@@ -20,6 +21,157 @@ pub use crate::interp::Value;
 
 use std::path::Path;
 use std::collections::{HashMap, HashSet};
+
+/// Enrich a list of error strings with source context display.
+///
+/// Parses the "line N" or "at L:C" from each error string, extracts the
+/// corresponding source line, and renders a full Diag with caret.
+/// Errors that don't have line info are passed through unchanged.
+fn enrich_errors(errors: &[String], source: &str, file: &str) -> Vec<String> {
+    use crate::diag::{ErrCode, error_with_source};
+
+    let source_lines: Vec<&str> = source.lines().collect();
+    let mut result = Vec::new();
+
+    for err in errors {
+        let (line, col) = extract_line_col(err);
+        if line == 0 || line > source_lines.len() {
+            result.push(err.clone());
+            continue;
+        }
+
+        let source_line = source_lines[line - 1];
+        let code = classify_error(err);
+        let span_len = estimate_span(err, source_line, col);
+
+        let mut diag = error_with_source(code, err.clone(), file, line, col, source, span_len);
+
+        if let Some(help) = extract_help(err) {
+            diag = diag.with_help(help);
+        }
+
+        result.push(diag.render());
+    }
+
+    result
+}
+
+/// Extract (line, col) from an error string.
+fn extract_line_col(err: &str) -> (usize, usize) {
+    // "Type error (line N): ..."
+    if let Some(idx) = err.find("(line ") {
+        let rest = &err[idx + 6..];
+        if let Some(end) = rest.find(')') {
+            if let Ok(line) = rest[..end].parse::<usize>() {
+                return (line, 1);
+            }
+        }
+    }
+    // "Parse error at L:C: ..."
+    if let Some(idx) = err.find("at ") {
+        let rest = &err[idx + 3..];
+        if let Some(colon) = rest.find(':') {
+            if let Ok(line) = rest[..colon].parse::<usize>() {
+                let after_colon = &rest[colon + 1..];
+                if let Some(end) = after_colon.find(':') {
+                    if let Ok(col) = after_colon[..end].parse::<usize>() {
+                        return (line, col);
+                    }
+                }
+                return (line, 1);
+            }
+        }
+    }
+    // "Error:L:C: ..." (lexer format)
+    if err.starts_with("Error:") {
+        let rest = &err[6..];
+        if let Some(colon1) = rest.find(':') {
+            if let Ok(line) = rest[..colon1].parse::<usize>() {
+                let after = &rest[colon1 + 1..];
+                if let Some(colon2) = after.find(':') {
+                    if let Ok(col) = after[..colon2].parse::<usize>() {
+                        return (line, col);
+                    }
+                }
+                return (line, 1);
+            }
+        }
+    }
+    (0, 0)
+}
+
+/// Classify an error string into an ErrCode.
+fn classify_error(err: &str) -> ErrCode {
+    use crate::diag::ErrCode;
+    // Normalize: strip "(line N)" from "Type error (line N): ..." → "Type error: ..."
+    let normalized = if err.starts_with("Type error (line ") {
+        if let Some(idx) = err.find("): ") {
+            format!("Type error: {}", &err[idx + 3..])
+        } else {
+            err.to_string()
+        }
+    } else {
+        err.to_string()
+    };
+    let e = normalized.as_str();
+    if e.starts_with("Type error: undefined variable") { ErrCode::UndefinedVariable }
+    else if e.starts_with("Type error: undefined function") { ErrCode::UndefinedFunction }
+    else if e.starts_with("Type error: undefined struct") { ErrCode::UndefinedStruct }
+    else if e.starts_with("Type error: struct") && e.contains("has no field") { ErrCode::UndefinedField }
+    else if e.contains("cannot assign") { ErrCode::TypeMismatch }
+    else if e.starts_with("Type error: if condition must be bool") { ErrCode::IfConditionNotBool }
+    else if e.contains("expects") && e.contains("args") { ErrCode::ArgCountMismatch }
+    else if e.contains("missing return") { ErrCode::MissingReturn }
+    else if e.starts_with("Init error") { ErrCode::InitBeforeAssign }
+    else if e.starts_with("Linear error") || e.contains("linear") { ErrCode::NotLinear }
+    else if e.starts_with("Capability error") { ErrCode::CapabilityDenied }
+    else if e.starts_with("Sandbox error") { ErrCode::SandboxViolation }
+    else if e.starts_with("Conservation error") { ErrCode::ConservationViolation }
+    else if e.starts_with("Gas error") { ErrCode::GasExceeded }
+    else if e.starts_with("Effect error") { ErrCode::EffectMismatch }
+    else if e.starts_with("Parse error") { ErrCode::ExpectedToken }
+    else if e.starts_with("Error:") { ErrCode::UnexpectedChar }
+    else if e.starts_with("borrow error") { ErrCode::BorrowConflict }
+    else if e.starts_with("Panic:") { ErrCode::NoMain }
+    else { ErrCode::Custom }
+}
+
+/// Estimate the span length for the caret.
+fn estimate_span(err: &str, source_line: &str, _col: usize) -> usize {
+    if let Some(idx) = err.find("variable '") {
+        let rest = &err[idx + 10..];
+        if let Some(end) = rest.find('\'') {
+            let name = &rest[..end];
+            if source_line.contains(name) { return name.len(); }
+        }
+    }
+    if let Some(idx) = err.find("function '") {
+        let rest = &err[idx + 10..];
+        if let Some(end) = rest.find('\'') {
+            let name = &rest[..end];
+            if source_line.contains(name) { return name.len(); }
+        }
+    }
+    if let Some(idx) = err.find("field '") {
+        let rest = &err[idx + 7..];
+        if let Some(end) = rest.find('\'') {
+            let name = &rest[..end];
+            if source_line.contains(name) { return name.len(); }
+        }
+    }
+    1
+}
+
+/// Extract help text from an error that already contains "Fix:" or "Hint:".
+fn extract_help(err: &str) -> Option<String> {
+    if let Some(idx) = err.find("Fix: ") {
+        return Some(err[idx + 5..].trim().to_string());
+    }
+    if let Some(idx) = err.find("Hint: ") {
+        return Some(err[idx + 6..].trim().to_string());
+    }
+    None
+}
 
 pub struct CompileResult {
     pub assembly: String,
@@ -46,6 +198,10 @@ pub fn build_program(source: &str) -> Result<Program, Vec<String>> {
 /// When source_path is provided, `use foo::bar;` will look for `foo.fd` or
 /// `foo/mod.fd` relative to the source file's directory.
 pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Result<Program, Vec<String>> {
+    // Auto-detect color from TTY (can be overridden by main.rs before calling)
+    use std::io::IsTerminal;
+    crate::diag::set_color(std::io::stderr().is_terminal());
+
     // Parse stdlib first
     let stdlib = parse_source(STDLIB_CORE)?;
 
@@ -56,8 +212,16 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
     // Parse user code with stdlib names pre-populated
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();
+    // Check for lexer errors before parsing
+    if !lexer.errors.is_empty() {
+        let file = source_path.unwrap_or("<stdin>");
+        return Err(enrich_errors(&lexer.errors, source, file));
+    }
     let mut parser = Parser::with_names(tokens, struct_names.clone(), enum_names.clone());
-    let user = parser.parse().map_err(|e| vec![e])?;
+    let user = parser.parse().map_err(|e| {
+        let file = source_path.unwrap_or("<stdin>");
+        enrich_errors(&[e], source, file)
+    })?;
 
     // Collect all known struct/enum names (stdlib + user + resolved modules)
     struct_names.extend(user.structs.iter().map(|s| s.name.clone()));
@@ -215,7 +379,8 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
     tc.current_module = user_module.clone();
     tc.check_bodies(&program);
     if !tc.errors.is_empty() {
-        return Err(tc.errors);
+        let file = source_path.unwrap_or("<stdin>");
+        return Err(enrich_errors(&tc.errors, source, file));
     }
 
     // Borrow check — runs after typecheck succeeds, before comptime/mono.
@@ -233,7 +398,8 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
             }
             crate::borrowck::BorrowckMode::On => {
                 if !bc.errors.is_empty() {
-                    return Err(bc.errors);
+                    let file = source_path.unwrap_or("<stdin>");
+                    return Err(enrich_errors(&bc.errors, source, file));
                 }
             }
             crate::borrowck::BorrowckMode::Off => {}

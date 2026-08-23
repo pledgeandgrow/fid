@@ -53,14 +53,66 @@ cargo build
 ## Current Baseline (as of Aug 2026)
 
 ```
-Unit tests:   196/199 passed  (3 pre-existing failures: test_compile_and_run_with_opt, dse_keeps_stores_that_are_loaded, strength_reduce_does_not_apply_to_non_power)
-Harness:      7/8 passed       (safety_checks_panic_in_debug_mode fails — pre-existing: overflow checks always on, --release doesn't disable them)
-Interpreter:  101/127 normal  (+ 22/22 expected fail) — Phase 10B: HashMap/String migrated to Fides stdlib
-C Codegen:    96/127 matched  (+ 22/22 expected fail) — Phase 10B: HashMap/String migrated to Fides stdlib
-PE Emitter:   102/127 valid   (+ 22/22 expected fail)
-Total .fd:    149 test files  (127 normal + 22 expected-fail)
-Skip list:    22 tests        (features in skip list for fidesc test: comptime, bare metal, WASM, SIMD, tensor, HTTP, JSON, dlopen, parallel, etc. Note: many now work in C codegen but remain skipped for historical reasons)
+Unit tests:   200/202 passed  (2 pre-existing failures: dse_keeps_stores_that_are_loaded, strength_reduce_does_not_apply_to_non_power)
+Harness:      6/8 passed       (2 failures: safety_checks_panic_in_debug_mode — overflow checks always on; golden_files_match — golden files outdated)
+Interpreter:  105/130 normal  (+ 22/22 expected fail)
+C Codegen:    104/130 matched  (+ 22/22 expected fail)
+PE Emitter:   105/130 valid   (+ 22/22 expected fail)
+Total .fd:    152 test files  (130 normal + 22 expected-fail)
+Skip list:    25 tests        (features in skip list for fidesc test: comptime, bare metal, WASM, SIMD, tensor, HTTP, JSON, dlopen, parallel, etc. Note: many now work in C codegen but remain skipped for historical reasons)
 ```
+
+### New Features (Phase A: Real Async/Concurrency)
+
+- **Executor runtime** (Phase A1): `p_executor_new`, `p_executor_spawn`,
+  `p_executor_block_on`, `p_executor_run_all`, `p_task_poll`, `p_task_is_ready`.
+  Tasks run as real OS threads. The executor tracks tasks and can join them.
+  `p_task_poll` blocks until the task completes (A1). `PENDING_SENTINEL`
+  (i64::MIN + 1) reserved for non-blocking poll results.
+- **Non-blocking poll + round-robin scheduling** (Phase A2):
+  `p_executor_poll_all` (non-blocking, returns count of pending tasks),
+  `p_task_poll_nonblocking` (returns value if ready, PENDING_SENTINEL if not).
+  Enables concurrent task interleaving: spawn N tasks, poll all until done.
+  Thread results stored in `p_task_results[]` array to prevent double-join.
+- **Non-blocking IO** (Phase A3): `p_net_connect`, `p_net_read`, `p_net_write`,
+  `p_net_close`, `p_fs_read_async`. Async IO operations spawn threads that
+  perform the IO and return Future handles. C codegen uses real sockets/files
+  with pthreads. Interpreter simulates IO with sleep + fake results.
+- **New tests**: `test_async_executor`, `test_async_interleave`, `test_async_io`.
+
+### New Features (Phase 12: Diagnostic System)
+
+- **Unified diagnostic system** (`src/diag.rs`): Structured error/warning/note/help
+  output with error codes (E001-E120), source context display (shows the offending
+  line with a caret `^^^`), and color output (red errors, yellow warnings, cyan
+  notes/help — auto-detected from TTY).
+- **Error codes**: Every error category has a code (E001-E004 lexer, E020-E023
+  parser, E040-E051 typechecker, E080-E081 borrow checker, E090-E096 safety/contract,
+  E110 effects, E120 misc). Displayed as `error[E044]: ...`.
+- **Source context**: Errors show `--> file:line:col` and the source line with a
+  caret pointing at the error location. Example:
+  ```
+  error[E044]: Type error (line 2): cannot assign str to variable 'x' of type i64.
+    --> test.fd:2:1
+    |     pv x: i64 = "hello"
+    | ^
+    = help: change the type annotation or the expression.
+  ```
+- **Lexer error collection**: Lexer errors are now collected in `Lexer.errors`
+  instead of printed directly via `eprintln!`. This allows LSP and other tools
+  to access lexer errors programmatically.
+- **Typechecker line tracking**: Added `current_line` field to `TypeChecker`,
+  updated from statement line numbers. Common errors (undefined variable,
+  undefined function, type mismatch, struct field, if condition, arg count)
+  now include line numbers.
+- **Error enrichment pipeline** (`compiler.rs`): `enrich_errors()` post-processes
+  error strings from typechecker/borrow checker/parser, adding source context,
+  error codes, and help text. `classify_error()` maps error strings to `ErrCode`
+  categories. `suggest_did_you_mean()` provides "did you mean 'X'?" suggestions
+  using Levenshtein distance.
+- **Colored output in main.rs**: `print_errors()` function auto-detects TTY and
+  adds colored `error:` prefix. Rendered Diag strings (containing `error[E...]`)
+  are printed as-is; legacy error strings get the colored prefix.
 
 ### New Features (Phase 10B)
 
@@ -133,15 +185,17 @@ test_trait_verify_fail, test_budget_fail, test_sandbox_fail,
 test_deterministic_fail, test_field_privacy_fail, test_money_linear_fail,
 test_money_conserve_fail, test_banking_double_credit_fail,
 test_banking_lost_money_fail, test_loop_linear_fail, test_gas_fail,
-test_crashfree_fail, test_txn_rollback_fail, test_typed_strings_fail,
+test_crashfree_fail, test_typed_strings_fail,
 test_init_guarantee_fail, test_init_guarantee_cond_fail,
 test_param_queries_fail, test_medical_fail, test_contracts_fail,
 test_safety_annotations_fail, test_safety_no_audit_fail,
 test_borrowck_fail, test_async_fail
 
 Normal tests that fail (pre-existing, incomplete features):
-test_game_stdlib (all backends), test_phase8b (C codegen only),
-test_vec_math (all backends), test_vec_shape_fail (all backends)
+test_game_stdlib (all backends — parser error),
+test_phase8b (C codegen — ECS __ecs_* not in C codegen),
+test_vec_math (all backends),
+test_vec_shape_fail (all backends — in skip list but still runs)
 
 Features now present in the baseline: tuple destructuring, file I/O
 (`stdlib/file.fd`), `txn {}` blocks (with interpreter rollback), loop-aware linear types, `@gas`
@@ -160,13 +214,13 @@ given/ensure contracts (F10: Design by Contract — preconditions verified at ca
 composable safety primitives (F44/F52/F56: @no-alloc, @no-recursion, @no-unbounded, @crashfree,
 @no-indirect, @requires-audit — @safety-critical, @autosar, @medical are aliases that expand to these;
 @dal-a was merged into @medical, @no-panic is internal-only — users write @crashfree),
-async/await (Phase 7.6: `async pf`, `await <expr>`, `spawn <expr>` — Future<T> type with eager evaluation, typechecker enforces Future<T> for await, `p_future_ready`/`p_future_poll` runtime functions in interpreter + C codegen; state machine transform pending for true cooperative scheduling),
+async/await (Phase 7.6 + Phase A: `async pf`, `await <expr>`, `spawn <expr>` — Future<T> type, typechecker enforces Future<T> for await. Phase A added real executor runtime: `p_executor_new`/`p_executor_spawn`/`p_executor_block_on`/`p_executor_run_all`/`p_task_poll`/`p_task_is_ready`/`p_executor_poll_all`/`p_task_poll_nonblocking` (A1+A2), non-blocking IO: `p_net_connect`/`p_net_read`/`p_net_write`/`p_net_close`/`p_fs_read_async` (A3). Tasks run as real OS threads with non-blocking poll and round-robin scheduling. State machine transform for stackless coroutines still pending),
 borrow checker (Phases 1-6 complete: `--borrowck=off|warn|on` — Rules 1-3 active, field-wise borrows, two-phase borrows, NLL, `on` by default),
 generic enums/structs (`enum Option<T> { ... }`, `struct Foo<T> { ... }` — type_params in AST, parser, typechecker, lowerer),
 LSP server (`fidesc lsp` — JSON-RPC over stdio, initialize/didOpen/didChange/diagnostics, no external deps),
 new stdlib modules (`stdlib/math.fd`, `stdlib/env.fd`, `stdlib/args.fd`, `stdlib/process.fd`, `stdlib/regex.fd`, `stdlib/sync.fd`, `stdlib/vec.fd`, `stdlib/ecs.fd`, `stdlib/events.fd`, `stdlib/parallel.fd`, plus game stdlib: `stdlib/tilemap.fd`, `stdlib/sprite.fd`, `stdlib/flowfield.fd`, `stdlib/streaming.fd`, `stdlib/scene.fd`, `stdlib/physics.fd`, `stdlib/audio.fd`, `stdlib/input.fd`).
 
-**Note:** `test_db` is no longer flaky — HashMap keys are now sorted in the interpreter for deterministic output.
+**Note:** `test_db` interp now passes (Phase 10B string-pointer materialization fixed). `test_vec_shape_fail` is in the skip list but still runs and fails on all backends.
 
 **Before making any change:** run `./verify.sh` to confirm you're starting from a known-good state.
 
@@ -185,7 +239,7 @@ touching them.
 | `src/coff.rs` | **HIGH** | COFF object file format. Same byte-level risk as PE/ELF. |
 | `src/macho.rs` | **HIGH** | Mach-O object file format. Same byte-level risk. |
 | `src/codegen_x64.rs` | **HIGH** | PIR L3 → x86-64 instruction encoding. ModRM/SIB bytes, REX prefixes, ABI rules. |
-| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 101/127 test parity (near full parity — test_phase8b fails: ECS __ecs_* not in C codegen). |
+| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 104/130 test parity (near full parity — test_phase8b fails: ECS __ecs_* not in C codegen). Phase 10B: Print instruction calls Fides Vec_to_str/HashMap_to_str for formatting. |
 | `src/pir.rs` | **HIGH** | PIR L1/L2/L3 transforms. A bad lowering propagates to all backends. |
 | `src/lower.rs` | **MEDIUM** | AST → SSA IR. Changes here affect interpreter + all backends. |
 | `src/typechecker.rs` | **MEDIUM** | Types + regions + effects + capabilities. Wrong rejection = broken code; wrong acceptance = silent miscompilation. |
@@ -207,7 +261,8 @@ touching them.
 | `src/mono.rs` | LOW | Monomorphization — errors surface as missing functions. |
 | `src/comptime.rs` | LOW | Compile-time eval — errors are loud. |
 | `src/main.rs` | LOW | CLI dispatch — adding commands is safe. |
-| `src/compiler.rs` | LOW | Pipeline orchestration — changes are visible. |
+| `src/compiler.rs` | LOW | Pipeline orchestration — changes are visible. Phase 12: `enrich_errors()` post-processes errors with source context + error codes. |
+| `src/diag.rs` | LOW | Diagnostic system — structured error/warning/note/help with error codes, source context, color. Zero external deps. |
 | `src/lsp.rs` | LOW | LSP server — JSON-RPC over stdio, no external deps. |
 | `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. 34 stdlib modules: core, vec, math, ecs, events, parallel, sync, db, http, json, shape, simd, tensor, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input. |
 

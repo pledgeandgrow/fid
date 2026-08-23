@@ -488,6 +488,13 @@ fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, met
             expr: subst_expr(expr, subst, renames, method_renames),
             line: *line,
         },
+        Stmt::FieldAssign { object, field, op, expr, line } => Stmt::FieldAssign {
+            object: subst_expr(object, subst, renames, method_renames),
+            field: field.clone(),
+            op: op.clone(),
+            expr: subst_expr(expr, subst, renames, method_renames),
+            line: *line,
+        },
         Stmt::Expr(e, line) => Stmt::Expr(subst_expr(e, subst, renames, method_renames), *line),
         Stmt::Return(e, line) => Stmt::Return(e.as_ref().map(|e| subst_expr(e, subst, renames, method_renames)), *line),
         Stmt::If { cond, then_block, else_block, line } => Stmt::If {
@@ -1070,6 +1077,10 @@ fn collect_generic_calls_stmt_with_hint(
         }
         Stmt::DerefAssign { ptr_expr, expr, .. } => {
             collect_generic_calls_expr_with_hint(ptr_expr, generics, generic_methods, calls, method_calls, current_func, None);
+            collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, None);
+        }
+        Stmt::FieldAssign { object, expr, .. } => {
+            collect_generic_calls_expr_with_hint(object, generics, generic_methods, calls, method_calls, current_func, None);
             collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, None);
         }
         Stmt::Expr(e, _) => collect_generic_calls_expr_with_hint(e, generics, generic_methods, calls, method_calls, current_func, expected_ty),

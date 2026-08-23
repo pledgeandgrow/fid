@@ -6554,7 +6554,11 @@ mod tests {
         // x * 3 should NOT be strength-reduced (3 is not a power of 2).
         let src = "pf main(x: i64) -> i64 { ret x * 3; }\n";
         let mut l2 = compile_to_l2(src);
-        let n = pass_strength_reduce(&mut l2);
+        // Only run on the main function (stdlib functions may have reducible muls)
+        let n = l2.functions.iter_mut()
+            .filter(|f| f.name == "main")
+            .map(|f| strength_reduce_function(f))
+            .sum::<usize>();
         assert_eq!(n, 0, "x * 3 should not be strength-reduced");
     }
 
@@ -6701,7 +6705,11 @@ mod tests {
             }
         ";
         let mut l2 = compile_to_l2(src);
-        let n = pass_dse(&mut l2);
+        // Only run on the main function (stdlib functions may have dead stores)
+        let n = l2.functions.iter_mut()
+            .filter(|f| f.name == "main")
+            .map(|f| dse_function(f))
+            .sum::<usize>();
         // The store to x is loaded by `ret x`, so it must survive.
         assert_eq!(n, 0, "DSE must not remove stores that are loaded, got {}", n);
     }

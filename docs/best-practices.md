@@ -247,7 +247,7 @@ need a map for output, use `BTreeMap` or `IndexMap`.
 
 ```
                     ┌─────────────┐
-                    │  End-to-end │  fidesc test (149 .fd files)
+                    │  End-to-end │  fidesc test (152 .fd files)
                     │   tests     │  ← tells you SOMETHING broke
                     └──────┬──────┘
                   ┌────────┴────────┐
@@ -255,7 +255,7 @@ need a map for output, use `BTreeMap` or `IndexMap`.
                   │  (intermediate) │  ← tells you WHICH LAYER broke
                   └────────┬────────┘
                 ┌──────────┴──────────┐
-                │   Unit tests        │  cargo test (133 tests)
+                │   Unit tests        │  cargo test (200/202 tests)
                 │   (per-module)      │  ← tells you WHICH FUNCTION broke
                 └─────────────────────┘
 ```

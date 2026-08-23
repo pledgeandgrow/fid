@@ -391,6 +391,9 @@ impl CodeGen {
             Stmt::DerefAssign { .. } => {
                 // Handled by new backend, not this legacy ARM64 codegen
             }
+            Stmt::FieldAssign { .. } => {
+                // Handled by new backend, not this legacy ARM64 codegen
+            }
             Stmt::Return(expr, _) => {
                 if let Some(e) = expr {
                     self.gen_expr(e);

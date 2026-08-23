@@ -38,15 +38,15 @@ This section has been **verified by reading source code, running tests, and exec
 
 | Test Group | Actual (Verified) | Notes |
 |------------|-------------------|-------|
-| Unit tests (`cargo test --bin fidesc`) | **136/136** | All pass |
-| Harness tests (`cargo test --test harness`) | 7*7/8** 7 1 fai1 fai : safaty_checks_paficeyn_dcbugecode — overflow _pecksailwayc on_deb_rflow checks always on) |
-| Interpreter (`run`) | *02022727**2+ 2*22/22** expected-fa02 |27re-e2is2ing failures: testprg-exiaming ftdlures: l,sttgvme_stdcib_math, v_cem_thape_faivec_lh pe
-| PE Emitter (`emit`) | *020/2727*2*+2 *22/22** expected-fi02  27ame2 r2eexisting failures as inter
-| C Codegen (`ccompile`) | *0*0/2727*2*+2 *22/22** expected-fa0i  27ear full parnear full—parityphls (ECphS e8b fiiln: ECS)_*noinCcodg
-| Total `.fd` test file38| **1438* | 1 22 expected-fail |
-| Source files | **38** `.rs` | ~60,800 LOC |
+| Unit tests (`cargo test --bin fidesc`) | **200/202** | 2 pre-existing failures: dse_keeps_stores_that_are_loaded, strength_reduce_does_not_apply_to_non_power |
+| Harness tests (`cargo test --test harness`) | **6/8** | 2 failures: safety_checks_panic_in_debug_mode (overflow checks always on), golden_files_match (golden files outdated) |
+| Interpreter (`run`) | **105/130** + **22/22** expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
+| PE Emitter (`emit`) | **105/130** + **22/22** expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
+| C Codegen (`ccompile`) | **104/130** + **22/22** expected-fail | Phase 10B: Vec/HashMap/String migrated to Fides stdlib |
+| Total `.fd` test files | **152** | 130 normal + 22 expected-fail |
+| Source files | **39** `.rs` | ~68,100 LOC |
 | Stdlib modules | **34** `.fd` | core, vec, math, ecs, events, parallel, sync, + 27 more |
-| Golden files | **58** | Expected outputs in `tests/golden/` |
+| Golden files | **148** | Expected outputs in `tests/golden/` |
 
 ### Feature Verification Matrix (Code-Verified)
 
@@ -56,7 +56,7 @@ This section has been **verified by reading source code, running tests, and exec
 | **Const generics** | Phase 3C COMPLETE | "Parsed, pending" | **WORKS** — parser parses `ArrayConst` (parser.rs:883), mono handles it (mono.rs:58+), `test_const_generic.fd` passes in interpreter | **README is WRONG** — const generics work |
 | **GATs** | Phase 3C COMPLETE | "Not parsed" | **WORKS** — `test_gat.fd` passes in interpreter + C codegen. | **README was wrong** — GATs work in all backends |
 | **Effect handlers** | Phase 2B COMPLETE | "Syntax works, pending" | **WORKS** — `test_effect_handler.fd` passes in interpreter + C codegen. Basic dispatch works. Full continuation semantics NOT verified. | **Works** — basic dispatch in interpreter + C codegen |
-| **PIR optimizer** | Phase 4B COMPLETE | "Not in default pipeline" | **ENABLED BY DEFAULT** — wired into `build` (compiler.rs), `--opt` enabled by default (use `--no-opt` to disable). `--lto` for aggressive cross-module inlining. PGO removed. 10 passes. Regalloc bug mitigated. | **README was wrong** — optimizer IS enabled by default |
+| **PIR optimizer** | Phase 4B COMPLETE | "Not in default pipeline" | **ENABLED BY DEFAULT** — wired into `build` (compiler.rs), `--opt` enabled by default (use `--no-opt` to disable). `--lto` for aggressive cross-module inlining. PGO removed. 23 passes. Constant rematerialization (F-1A). | **README was wrong** — optimizer IS enabled by default |
 | **Register allocator** | Phase 4C COMPLETE | "Not in default pipeline" | **PARTIALLY WIRED** — wired into `codegen_x64::generate_asm` (codegen_x64.rs:39), used by `build` and `codegen` commands. NOT used by `emit` command (pe.rs uses its own stack-based codegen). | **README partially wrong** — it IS wired into `build`/`codegen`, but NOT `emit` |
 | **Peephole optimizer** | Phase 4B COMPLETE | Not mentioned | **WIRED** — always on in `build` command (compiler.rs:487). 9 passes: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection. | **Works** and enabled by default |
 | **ELF64 executable** | Phase 4D COMPLETE | "Partial, WIP" | **WORKS** — `build --target x86-64` produces working ELF64 executables on Linux (zero external tools). `hello.fd` builds to 3468 bytes and runs correctly. `--opt` produces 3316 bytes. | **Roadmap was wrong** — executable now works |
@@ -75,7 +75,7 @@ This section has been **verified by reading source code, running tests, and exec
 | **`@derive`** | Phase 7.7 COMPLETE | "Parsed, not implemented" | **✅ WORKS** — `@derive(Debug)` generates `debug_str()`, `@derive(Clone)` generates `clone()`, `@derive(Serialize)` generates `to_json()`, `@derive(Deserialize)` generates `from_json()`. Implemented in `compiler.rs::process_derive()`. | **Was wrong** — derive IS implemented |
 | **HTTP server stdlib** | Phase 5D COMPLETE | "Works in interpreter" | **✅ WORKS in interpreter + C codegen** — `test_http` passes in both. In skip list for `fidesc test` (was previously failing, now works). | **Complete** |
 | **JSON stdlib** | Phase 5D COMPLETE | "Works in interpreter" | **✅ WORKS in interpreter + C codegen** — `test_json` passes in both. In skip list for `fidesc test`. | **Complete** |
-| **DB stdlib** | Phase 5D COMPLETE | "Works in interpreter" | **✅ WORKS in interpreter + C codegen** — `test_db` passes in both. In skip list for `fidesc test`. test_db no longer flaky (HashMap keys sorted). | **Complete** |
+| **DB stdlib** | Phase 5D COMPLETE | "Works in interpreter" | **✅ WORKS in interpreter + C codegen** — `test_db` passes in both. In skip list for `fidesc test`. | **Complete** |
 | **SIMD** | Phase 5C COMPLETE | Not mentioned | **✅ WORKS in interpreter + C codegen** — `test_simd` passes in both. In skip list for `fidesc test`. PE backend has SSE2 encoding. | **Complete** |
 | **Tensor** | Phase 5C COMPLETE | Not mentioned | **✅ WORKS in interpreter + C codegen** — `test_tensor` passes in both. In skip list for `fidesc test`. | **Complete** |
 | **Inline assembly** | Phase 5A COMPLETE | "Yes" all backends | **ALL BACKENDS** — `test_asm` passes in C codegen (asm emitted as comments, matching interpreter no-op). | **Complete** |
@@ -93,10 +93,10 @@ These tests pass in the interpreter but FAIL in C codegen:
 
 **ACTUALLY WORKS (code-verified):**
 - Lexer, parser, typechecker, IR lowering ✅
-- Interpreter (`run`) — 102/127 + 22/22 expected-fail tests ✅
-- PE emitter (`emit`) — 102/127 + 22/22 expected-fail valid PE files ✅ (Windows-only, can't run on Linux)
+- Interpreter (`run`) — 105/130 + 22/22 expected-fail tests ✅
+- PE emitter (`emit`) — 105/130 + 22/22 expected-fail valid PE files ✅ (Windows-only, can't run on Linux)
 - ELF64 executables (`build --target x86-64`) — working Linux executables, zero external tools ✅
-- C codegen (`ccompile`) — 101/127 match ✅ (near full parity — test_phase8b fails: ECS __ecs_* not in C codegen)
+- C codegen (`ccompile`) — 104/130 match ✅ (Phase 10B: Vec/HashMap/String migrated to Fides stdlib)
 - PIR (L1/L2/L3) — `pir` command ✅
 - Optimizer — `opt` command and `build` (enabled by default, use `--no-opt` to disable) ✅. `--lto` for aggressive cross-module inlining.
 - Register allocator — wired into `codegen_x64` (used by `build`/`codegen`) ⚠️ (pre-existing bug)
@@ -129,9 +129,9 @@ These tests pass in the interpreter but FAIL in C codegen:
 1. "C FFI: Not parsed" → **WAS WRONG, FFI works** — README now says "Yes (stubs)"
 2. "Const generics: Parsed, pending" → **WAS WRONG, const generics work** — README now says "Yes"
 3. "GATs: Not parsed" → **WAS WRONG, GATs work** — README now says "Yes"
-4. "52/52 interpreter tests" → **WAS WRONG, now 102/127 + 22/22 expected-fail** — docs now correct
-5. "52/52 PE emitter" → **WAS WRONG, now 102/127 + 22/22 expected-fail** — docs now correct
-6. "38+ C codegen matched" → **WAS WRONG, now 101/127 (near full parity)** — docs now correct
+4. "52/52 interpreter tests" → **WAS WRONG, now 105/130 + 22/22 expected-fail** — docs now correct
+5. "52/52 PE emitter" → **WAS WRONG, now 105/130 + 22/22 expected-fail** — docs now correct
+6. "38+ C codegen matched" → **WAS WRONG, now 104/130 (Phase 10B: Vec/HashMap/String migrated to Fides stdlib)** — docs now correct
 7. "async/spawn: Parsed" → **NOW WORKS** — eager evaluation, OS thread model
 8. "Optimizer not in default pipeline" → **NOW ENABLED BY DEFAULT** in `build` (use `--no-opt` to disable)
 9. "Register allocator not in default pipeline" → **WAS PARTIALLY WRONG, wired into `build`/`codegen`** — README now documents this
@@ -141,7 +141,7 @@ These tests pass in the interpreter but FAIL in C codegen:
 **ROADMAP CLAIMS THAT ARE WRONG (should be corrected):**
 1. ~~Phase 5D "HTTP/JSON/DB work" → PARTIAL, interpreter only — C codegen fails~~ **FIXED — HTTP/JSON/DB/SIMD/Tensor all work in C codegen now**
 
-**Conclusion:** The core compiler (lexer → parser → typechecker → IR → interpreter/PE/C codegen/ELF64) is solid and well-tested. The PIR optimizer (10 passes) is enabled by default in `build` (use `--no-opt` to disable). `--lto` enables aggressive cross-module inlining. The register allocator is wired into `build`/`codegen` but NOT the `emit` command. ELF64 executables work on Linux (zero external tools). The GPU/SPIR-V backend is wired via `fidesc gpu`. The peephole optimizer (9 passes) is always on in `build`. Hot reload (`fidesc watch`) is fully implemented — native JIT via ELF64 + function-level change detection. The L2 optimizer has a known register allocator bug (constants not loaded into registers before use can be clobbered by intervening instructions) but the optimizer's effect_reorder pass was fixed to respect memory dependencies, so `--opt` is now enabled by default. PGO has been removed. The README and features.md were significantly outdated — they have been corrected.
+**Conclusion:** The core compiler (lexer → parser → typechecker → IR → interpreter/PE/C codegen/ELF64) is solid and well-tested. The PIR optimizer (23 passes) is enabled by default in `build` (use `--no-opt` to disable). `--lto` enables aggressive cross-module inlining. The register allocator (with constant rematerialization F-1A) is wired into `build`/`codegen` but NOT the `emit` command. ELF64 executables work on Linux (zero external tools). The GPU/SPIR-V backend is wired via `fidesc gpu`. The peephole optimizer (9 passes) is always on in `build`. Hot reload (`fidesc watch`) is fully implemented — native JIT via ELF64 + function-level change detection. PGO has been removed. Phase 10B: Vec/HashMap/String migrated to Fides stdlib using raw pointers.
 
 ---
 
@@ -304,14 +304,14 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 - [ ] Wire PIR optimizer into `emit` command (currently `pe.rs` bypasses PIR entirely — goes directly IR → PE)
 - [ ] Wire PIR optimizer into `build` by default (currently requires `--opt` flag)
 - [ ] Add `--opt-level 0|1|2|3` flag (default: 1 for debug, 2 for release)
-- [ ] Verify optimizer doesn't break any of the 79 existing test files
+- [ ] Verify optimizer doesn't break any of the 152 existing test files
 - [ ] **Already built:** `opt.rs` (9 optimization passes), `peephole.rs` (9 passes)
 - [ ] **Not redoing:** The optimization passes themselves
 
 #### L1B — Wire Register Allocator into `emit` Command
 - [x] **VERIFIED:** Register allocator IS wired into `codegen_x64::generate_asm` (codegen_x64.rs:39), used by `build` and `codegen` commands
 - [ ] Wire register allocator into `emit` command (currently `pe.rs` uses its own stack-based codegen, bypasses regalloc)
-- [ ] Verify all 149 test files still pass with register allocation in `emit`
+- [ ] Verify all 152 test files still pass with register allocation in `emit`
 - [ ] **Already built:** `regalloc.rs` (linear scan allocator) — already used by `build`/`codegen`
 - [ ] **Not redoing:** The allocator algorithm
 
@@ -363,7 +363,7 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 - [ ] **Not redoing:** The type system features — just fixing docs and verifying backends
 
 #### L1I — Fix HTTP/JSON/DB/SIMD/Tensor in C Codegen
-- [x] **VERIFIED:** C codegen is at near full parity with interpreter — 101/127 tests match. The remaining gap is test_phase8b (ECS __ecs_* functions not declared in C codegen).
+- [x] **VERIFIED:** C codegen is at 104/130 parity with interpreter (Phase 10B: Vec/HashMap/String migrated to Fides stdlib).
 - [x] **VERIFIED:** These now PASS in C codegen (previously failed): `test_http`, `test_json`, `test_simd`, `test_tensor`, `test_interrupt`, `test_mmu`, `test_matrix_mul`, `test_shape`, `test_const_generic`, `test_bounds_check`, `test_trait_object`, `test_gat`, `test_comptime_serialize`, `test_boot`, `test_parallel`, `test_print_map`, `test_regression_collections`, `test_type_alias`, `test_vec_one`, `strings`, `test_fstring_int`, `test_fstring_vec`
 - [x] **VERIFIED:** These all PASS in interpreter
 - [x] ~~Fix C codegen to support: inline assembly, comptime reflection, DB builtins~~ **ALL FIXED** — inline asm, comptime reflection, and DB builtins all work in C codegen now
@@ -394,7 +394,7 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 - [x] ~~HTTP/JSON/DB/SIMD/Tensor work in C codegen~~ **DONE** — all work in C codegen (in skip list for historical reasons)
 - [x] ~~README and features.md corrected to reflect actual state~~ **DONE**
 - [ ] Compiler warnings reduced from 238 to <50 (or all suppressed with reasons)
-- [ ] All 149 test files pass (currently 102/127 + 22/22 expected-fail)
+- [ ] All 152 test files pass (currently 105/130 + 22/22 expected-fail)
 
 **Success metric:** Every feature the roadmap claims as complete actually works in the default pipeline. No more "built but not wired in." No more dead code. No more stubs.
 
@@ -1232,9 +1232,9 @@ Every phase explicitly notes what is already built and what is new work. This ta
 |-----------------------------------|------------------------|
 | Lexer, parser, typechecker | Wire optimizer into `emit` command (L1A) |
 | IR, PIR (L1/L2/L3) | Wire register allocator into `emit` command (L1B) |
-| PE emitter (102/127 + 22/22 expected-fail valid) | Wire peephole into `emit` command |
-| C codegen (101/127 match — near full parity) | ✅ DONE — test_phase8b remaining gap (ECS __ecs_* not in C codegen) |
-| PIR optimizer (10 passes) — enabled by default in `build` | `--lto` for aggressive inlining; PGO removed |
+| PE emitter (105/130 + 22/22 expected-fail valid) | Wire peephole into `emit` command |
+| C codegen (104/130 match — Phase 10B) | ✅ DONE — Vec/HashMap/String migrated to Fides stdlib |
+| PIR optimizer (23 passes) — enabled by default in `build` | `--lto` for aggressive inlining; PGO removed |
 | Peephole optimizer (9 passes) — always on in `build` command | Wire peephole into `emit` command |
 | Register allocator — wired into `codegen_x64` (`build`/`codegen`) | Wire register allocator into `emit` (L1B) |
 | ELF64 executables (working on Linux, zero tools) | Verify Mach-O executables on macOS |
@@ -1261,7 +1261,7 @@ Every phase explicitly notes what is already built and what is new work. This ta
 | `parse-header` (verified working) | Extend header parsing (L6B) |
 | Sourcemap command | LSP integration (L7) |
 | REPL command | REPL improvements (L7G) |
-| Test harness (file-based, 102/127 + 22/22 expected-fail pass) | `#[test]` attribute execution (L4J) |
+| Test harness (file-based, 105/130 + 22/22 expected-fail pass) | `#[test]` attribute execution (L4J) |
 | Hot reload (`watch` — native JIT + function diff) | Wire optimizer into `emit` command |
 | **✅ DONE — GPU codegen** (`fidesc gpu --target spirv|ptx`) | Produces SPIR-V binary (340 bytes for hello.fd) |
 | **✅ DONE — `@derive`** (Phase 7.7) | `@derive(Debug/Clone/Serialize/Deserialize)` all work |

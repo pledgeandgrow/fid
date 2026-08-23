@@ -2317,10 +2317,10 @@ system UpdateLOD {
 ### Implementation Details
 
 All 5 original features (F1–F5) were implemented in a single session. Test results (current state):
-- Interpreter: 102/127 passed (+ 22/22 expected-fail)
-- PE Emitter: 102/127 valid (+ 22/22 expected-fail)
-- C Codegen: 101/127 matched — near full parity (+ 22/22 expected-fail)
-- Total: 149 .fd test files (127 normal + 22 expected-fail)
+- Interpreter: 105/130 passed (+ 22/22 expected-fail)
+- PE Emitter: 105/130 valid (+ 22/22 expected-fail)
+- C Codegen: 104/130 matched — near full parity (+ 22/22 expected-fail)
+- Total: 152 .fd test files (130 normal + 22 expected-fail)
 
 **Planned for implementation:**
 - 39 Tier A syntax features (F10, F13, F14, F16–F18, F21, F23–F60) — need compiler support

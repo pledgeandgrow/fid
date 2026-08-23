@@ -84,6 +84,9 @@ pub struct TypeChecker {
     /// Set of variables declared with `pm` that have not yet been assigned.
     /// Reading a variable in this set is a compile error (F63: init guarantee).
     uninit_vars: HashSet<String>,
+    /// Current source line being type-checked (for error messages).
+    /// Updated from statement line numbers as check_stmt is called.
+    current_line: usize,
 }
 
 impl TypeChecker {
@@ -126,6 +129,7 @@ impl TypeChecker {
             loop_depth: 0,
             unsafe_depth: 0,
             uninit_vars: HashSet::new(),
+            current_line: 0,
         }
     }
 
@@ -205,7 +209,10 @@ impl TypeChecker {
                 let has_self = method.params.first().map_or(false, |p| p.name == "self");
                 method_map.insert(method.name.clone(), (param_types, self.resolve_type(&method.ret_ty), has_self, method.is_pub));
                 // Track which module this method was defined in (for field privacy)
+                // Use both the unmangled and mangled name (StructName_method)
                 self.item_modules.insert(method.name.clone(), module.to_string());
+                let mangled = format!("{}_{}", struct_name, method.name);
+                self.item_modules.insert(mangled, module.to_string());
             }
             // Merge methods — don't overwrite if struct already has methods from another module
             self.methods.entry(struct_name).or_insert(method_map);
@@ -1473,6 +1480,10 @@ impl TypeChecker {
                 self.scan_expr_for_effects(expr, effects);
             }
             Stmt::DerefAssign { expr, .. } => self.scan_expr_for_effects(expr, effects),
+            Stmt::FieldAssign { object, expr, .. } => {
+                self.scan_expr_for_effects(object, effects);
+                self.scan_expr_for_effects(expr, effects);
+            }
             Stmt::Return(e, _) => {
                 if let Some(e) = e { self.scan_expr_for_effects(e, effects); }
             }
@@ -1917,7 +1928,16 @@ impl TypeChecker {
         // so field privacy checks work correctly (private fields are accessible
         // from within their defining module).
         let saved_module = self.current_module.clone();
-        if let Some(mod_name) = self.item_modules.get(&func.name) {
+        // Try mangled name first (StructName_method) for impl methods, then fall back to unmangled
+        let mangled = self.current_self_type.as_ref()
+            .map(|s| format!("{}_{}", s, func.name));
+        if let Some(mangled) = &mangled {
+            if let Some(mod_name) = self.item_modules.get(mangled) {
+                self.current_module = mod_name.clone();
+            } else if let Some(mod_name) = self.item_modules.get(&func.name) {
+                self.current_module = mod_name.clone();
+            }
+        } else if let Some(mod_name) = self.item_modules.get(&func.name) {
             self.current_module = mod_name.clone();
         }
         // Reset linear tracking for this function
@@ -1964,6 +1984,8 @@ impl TypeChecker {
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) {
+        // Track current line for error messages in check_expr
+        self.current_line = stmt_line(stmt);
         match stmt {
             Stmt::Let { name, ty, expr, is_mut: _, is_persist: _, line } => {
                 let expr_ty = self.check_expr(expr);
@@ -2063,8 +2085,8 @@ impl TypeChecker {
                 self.consume_linear_in_expr(cond, *line);
                 if cond_ty != Type::Bool && cond_ty != Type::I32 && cond_ty != Type::I64 {
                     self.errors.push(format!(
-                        "Type error: if condition must be bool, got {}",
-                        cond_ty
+                        "Type error (line {}): if condition must be bool, got {}",
+                        self.current_line, cond_ty
                     ));
                 }
                 // For linear types: variables consumed in then-branch must also be
@@ -2186,6 +2208,62 @@ impl TypeChecker {
             Stmt::DerefAssign { ptr_expr, op: _, expr, line: _ } => {
                 self.check_expr(ptr_expr);
                 self.check_expr(expr);
+            }
+            Stmt::FieldAssign { object, field, op, expr, line } => {
+                let obj_ty = self.check_expr(object);
+                self.current_line = *line;
+                if let Type::Named(name) = &obj_ty {
+                    // Clone fields to avoid borrowing self while checking expr
+                    let field_info = self.structs.get(name)
+                        .and_then(|fields| fields.iter().find(|(n, _)| n == field))
+                        .map(|(_, fty)| fty.clone());
+                    if let Some(fty) = field_info {
+                        let expr_ty = self.check_expr(expr);
+                        self.consume_linear_in_expr(expr, *line);
+                        // Allow integer literals to coerce to the field type
+                        let compatible = expr_ty == fty
+                            || expr_ty == Type::Never
+                            || (self.is_integer(&expr_ty) && self.is_integer(&fty));
+                        match op {
+                            AssignOp::Assign => {
+                                if !compatible {
+                                    self.errors.push(format!(
+                                        "Type error (line {}): cannot assign {} to field '{}' of type {}",
+                                        line, expr_ty, field, fty
+                                    ));
+                                }
+                            }
+                            _ => {
+                                if !compatible {
+                                    self.errors.push(format!(
+                                        "Type error (line {}): cannot compound-assign {} to field '{}' of type {}",
+                                        line, expr_ty, field, fty
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        // Field not found — check if the struct exists at all
+                        if self.structs.contains_key(name) {
+                            self.errors.push(format!(
+                                "Type error (line {}): struct '{}' has no field '{}'",
+                                line, name, field
+                            ));
+                        } else {
+                            self.errors.push(format!(
+                                "Type error: '{}' is not a known struct type",
+                                name
+                            ));
+                        }
+                        self.check_expr(expr);
+                    }
+                } else {
+                    self.errors.push(format!(
+                        "Type error (line {}): cannot assign field '{}' on type {}",
+                        line, field, obj_ty
+                    ));
+                    self.check_expr(expr);
+                }
             }
             Stmt::While { cond, body, line: _ } => {
                 let cond_ty = self.check_expr(cond);
@@ -2489,7 +2567,7 @@ impl TypeChecker {
                     };
                 }
                 self.errors
-                    .push(format!("Type error: undefined variable '{}'{}", name, self.suggestion_suffix(name)));
+                    .push(format!("Type error (line {}): undefined variable '{}'{}", self.current_line, name, self.suggestion_suffix(name)));
                 Type::Never
             }
             Expr::Binary { op, left, right } => {
@@ -2520,22 +2598,28 @@ impl TypeChecker {
                             if lt == Type::Str && rt == Type::Str {
                                 return Type::Str;
                             }
+                            // str + int or int + str: treat str as i64 (pointer arithmetic)
+                            if (lt == Type::Str && self.is_integer(&rt)) || (self.is_integer(&lt) && rt == Type::Str) {
+                                return Type::I64;
+                            }
                         }
-                        if self.is_numeric(&lt) && self.is_numeric(&rt) {
-                            if self.is_integer(&lt) && self.is_integer(&rt) {
-                                // Auto-promote for safety: result is one level wider than the wider operand
-                                let wider = Self::wider_type(&lt, &rt);
-                                Self::promote_for_arith(&wider)
-                            } else if self.is_float(&lt) || self.is_float(&rt) {
+                        // Treat str as i64 for arithmetic (str is a pointer internally)
+                        let lt_eff = if lt == Type::Str { Type::I64 } else { lt.clone() };
+                        let rt_eff = if rt == Type::Str { Type::I64 } else { rt.clone() };
+                        if self.is_numeric(&lt_eff) && self.is_numeric(&rt_eff) {
+                            if self.is_integer(&lt_eff) && self.is_integer(&rt_eff) {
+                                // Auto-widen to the wider operand type
+                                Self::wider_type(&lt_eff, &rt_eff)
+                            } else if self.is_float(&lt_eff) || self.is_float(&rt_eff) {
                                 // Float arithmetic: use wider float
-                                if lt == Type::F64 || rt == Type::F64 {
+                                if lt_eff == Type::F64 || rt_eff == Type::F64 {
                                     Type::F64
                                 } else {
                                     Type::F32
                                 }
                             } else {
                                 // Same type
-                                lt
+                                lt_eff
                             }
                         } else {
                             self.errors.push(format!(
@@ -2750,8 +2834,8 @@ impl TypeChecker {
                     }
                     if params.len() != arg_types.len() {
                         self.errors.push(format!(
-                            "Type error: function '{}' expects {} args, got {}",
-                            callee,
+                            "Type error (line {}): function '{}' expects {} args, got {}",
+                            self.current_line, callee,
                             params.len(),
                             arg_types.len()
                         ));
@@ -2815,7 +2899,8 @@ impl TypeChecker {
                         "p_str_concat" | "p_to_str" | "p_float_to_str"
                         | "p_string_replace" | "p_string_trim"
                         | "p_string_to_uppercase" | "p_string_to_lowercase"
-                        | "p_string_char_at" | "p_string_repeat" => {
+                        | "p_string_char_at" | "p_string_repeat"
+                        | "p_char_to_str" => {
                             return Type::Str;
                         }
                         "p_bool_to_str" => {
@@ -2837,14 +2922,14 @@ impl TypeChecker {
                 }
 
                 self.errors
-                    .push(format!("Type error: undefined function '{}'{}", callee, self.suggestion_suffix(callee)));
+                    .push(format!("Type error (line {}): undefined function '{}'{}", self.current_line, callee, self.suggestion_suffix(callee)));
                 Type::Never
             }
             Expr::FieldAccess { expr, field } => {
                 let obj_ty = self.check_expr(expr);
                 if let Type::Named(name) = &obj_ty {
                     if let Some(fields) = self.structs.get(name) {
-                        if let Some((_, fty)) = fields.iter().find(|(n, _)| n == field) {
+                        if let Some((fname, fty)) = fields.iter().find(|(n, _)| n == field) {
                             // Check field privacy: private fields are only accessible
                             // from within their defining module
                             let is_pub = self.field_visibility
@@ -2866,8 +2951,8 @@ impl TypeChecker {
                             return fty.clone();
                         } else {
                             self.errors.push(format!(
-                                "Type error: struct '{}' has no field '{}'",
-                                name, field
+                                "Type error (line {}): struct '{}' has no field '{}'",
+                                self.current_line, name, field
                             ));
                         }
                     } else {
@@ -2925,8 +3010,8 @@ impl TypeChecker {
                             }
                         } else {
                             self.errors.push(format!(
-                                "Type error: struct '{}' has no field '{}'",
-                                name, fname
+                                "Type error (line {}): struct '{}' has no field '{}'",
+                                self.current_line, name, fname
                             ));
                         }
                     }
@@ -3069,6 +3154,14 @@ impl TypeChecker {
                             "truncate" => Type::Void,
                             "sort" => Type::Void,
                             "clone" => Type::Generic { name: "Vec".to_string(), args: vec![elem_ty] },
+                            "map" => Type::Generic { name: "Vec".to_string(), args: vec![elem_ty] },
+                            "filter" => Type::Generic { name: "Vec".to_string(), args: vec![elem_ty] },
+                            "for_each" => Type::Void,
+                            "fold" => Type::I64,
+                            "any" => Type::Bool,
+                            "all" => Type::Bool,
+                            "find" => Type::I64,
+                            "position" => Type::I64,
                             _ => {
                                 self.errors.push(format!("Type error: no method '{}' on Vec", method));
                                 Type::Never
@@ -3092,6 +3185,45 @@ impl TypeChecker {
                             "clone" => Type::Generic { name: "HashMap".to_string(), args: args.clone() },
                             _ => {
                                 self.errors.push(format!("Type error: no method '{}' on HashMap", method));
+                                Type::Never
+                            }
+                        };
+                    }
+                }
+
+                // Handle Type::Named("Vec") — Vec without type args (used as struct field type)
+                if let Type::Named(n) = &recv_ty {
+                    if n == "Vec" {
+                        let elem_ty = Type::I64;
+                        return match method.as_str() {
+                            "push" => Type::Void,
+                            "pop" => elem_ty.clone(),
+                            "len" => Type::I64,
+                            "is_empty" => Type::Bool,
+                            "get" => elem_ty.clone(),
+                            "set" => Type::Void,
+                            "clear" => Type::Void,
+                            "capacity" => Type::I64,
+                            "insert" => Type::Void,
+                            "remove" => elem_ty.clone(),
+                            "contains" => Type::Bool,
+                            "reverse" => Type::Void,
+                            "first" => elem_ty.clone(),
+                            "last" => elem_ty.clone(),
+                            "extend" => Type::Void,
+                            "truncate" => Type::Void,
+                            "sort" => Type::Void,
+                            "clone" => Type::Generic { name: "Vec".to_string(), args: vec![elem_ty] },
+                            "map" => Type::Generic { name: "Vec".to_string(), args: vec![elem_ty] },
+                            "filter" => Type::Generic { name: "Vec".to_string(), args: vec![elem_ty] },
+                            "for_each" => Type::Void,
+                            "fold" => Type::I64,
+                            "any" => Type::Bool,
+                            "all" => Type::Bool,
+                            "find" => Type::I64,
+                            "position" => Type::I64,
+                            _ => {
+                                self.errors.push(format!("Type error: no method '{}' on Vec", method));
                                 Type::Never
                             }
                         };
@@ -3887,6 +4019,12 @@ impl TypeChecker {
         if matches!(declared, Type::ArrayConst { .. }) || matches!(actual, Type::ArrayConst { .. }) {
             return true;
         }
+        // str is represented as a pointer (i64) internally — allow str→i64 and i64→str
+        if (matches!(declared, Type::I64) && matches!(actual, Type::Str))
+            || (matches!(declared, Type::Str) && matches!(actual, Type::I64))
+        {
+            return true;
+        }
         // Allow implicit widening (e.g., i8 literal assigned to i32 variable)
         if Self::can_implicitly_widen(&actual, &declared) {
             return true;
@@ -3972,6 +4110,7 @@ fn count_gas_cost_stmt(stmt: &Stmt) -> u64 {
         Stmt::Assign { expr, .. } => cost += count_gas_cost_expr(expr),
         Stmt::IndexAssign { index, expr, .. } => cost += count_gas_cost_expr(index) + count_gas_cost_expr(expr),
         Stmt::DerefAssign { ptr_expr, expr, .. } => cost += count_gas_cost_expr(ptr_expr) + count_gas_cost_expr(expr),
+        Stmt::FieldAssign { object, expr, .. } => cost += count_gas_cost_expr(object) + count_gas_cost_expr(expr),
         Stmt::Return(e, _) => { if let Some(e) = e { cost += count_gas_cost_expr(e); } }
         Stmt::If { cond, then_block, else_block, .. } => {
             cost += count_gas_cost_expr(cond);
@@ -4096,6 +4235,10 @@ fn scan_stmt_for_calls(stmt: &Stmt, calls: &mut HashSet<String>) {
         }
         Stmt::DerefAssign { ptr_expr, expr, .. } => {
             scan_expr_for_calls(ptr_expr, calls);
+            scan_expr_for_calls(expr, calls);
+        }
+        Stmt::FieldAssign { object, expr, .. } => {
+            scan_expr_for_calls(object, calls);
             scan_expr_for_calls(expr, calls);
         }
         Stmt::Return(e, _) => {
@@ -4267,6 +4410,10 @@ fn scan_stmt_for_floats(stmt: &Stmt, found: &mut Vec<String>) {
             scan_expr_for_floats(expr, found);
         }
         Stmt::DerefAssign { expr, .. } => scan_expr_for_floats(expr, found),
+        Stmt::FieldAssign { object, expr, .. } => {
+            scan_expr_for_floats(object, found);
+            scan_expr_for_floats(expr, found);
+        }
         Stmt::Return(e, _) => {
             if let Some(e) = e { scan_expr_for_floats(e, found); }
         }
@@ -4444,6 +4591,10 @@ fn scan_stmt_for_division(stmt: &Stmt, sites: &mut Vec<(usize, &'static str)>) {
         }
         Stmt::DerefAssign { ptr_expr, expr, .. } => {
             scan_expr_for_division(ptr_expr, sites);
+            scan_expr_for_division(expr, sites);
+        }
+        Stmt::FieldAssign { object, expr, .. } => {
+            scan_expr_for_division(object, sites);
             scan_expr_for_division(expr, sites);
         }
         Stmt::Return(e, _) => {
@@ -4707,6 +4858,10 @@ fn scan_stmt_for_call_sites(stmt: &Stmt, calls: &mut Vec<(String, Vec<Expr>, usi
         Stmt::Assign { expr, line, .. } => scan_expr_for_call_sites(expr, calls, *line),
         Stmt::IndexAssign { expr, line, .. } => scan_expr_for_call_sites(expr, calls, *line),
         Stmt::DerefAssign { expr, line, .. } => scan_expr_for_call_sites(expr, calls, *line),
+        Stmt::FieldAssign { object, expr, line, .. } => {
+            scan_expr_for_call_sites(object, calls, *line);
+            scan_expr_for_call_sites(expr, calls, *line);
+        }
         Stmt::Expr(expr, line) => scan_expr_for_call_sites(expr, calls, *line),
         Stmt::Return(expr, line) => {
             if let Some(e) = expr { scan_expr_for_call_sites(e, calls, *line); }
@@ -4922,5 +5077,39 @@ fn eval_expr_with_bindings(expr: &Expr, bindings: &HashMap<String, i64>) -> Opti
             }
         }
         _ => None,
+    }
+}
+
+/// Extract the line number from a Stmt for error tracking.
+fn stmt_line(stmt: &Stmt) -> usize {
+    match stmt {
+        Stmt::Let { line, .. } => *line,
+        Stmt::LetTuple { line, .. } => *line,
+        Stmt::LetUninit { line, .. } => *line,
+        Stmt::Assign { line, .. } => *line,
+        Stmt::IndexAssign { line, .. } => *line,
+        Stmt::DerefAssign { line, .. } => *line,
+        Stmt::FieldAssign { line, .. } => *line,
+        Stmt::Expr(_, line) => *line,
+        Stmt::Return(_, line) => *line,
+        Stmt::If { line, .. } => *line,
+        Stmt::While { line, .. } => *line,
+        Stmt::For { line, .. } => *line,
+        Stmt::Loop { line, .. } => *line,
+        Stmt::Break(_, line) => *line,
+        Stmt::Continue(line) => *line,
+        Stmt::Defer(_, line) => *line,
+        Stmt::Match { line, .. } => *line,
+        Stmt::Use { line, .. } => *line,
+        Stmt::Handle { line, .. } => *line,
+        Stmt::Do { line, .. } => *line,
+        Stmt::RegionBlock { line, .. } => *line,
+        Stmt::Sandbox { line, .. } => *line,
+        Stmt::Unsafe { line, .. } => *line,
+        Stmt::Txn { line, .. } => *line,
+        Stmt::ComptimeGen { line, .. } => *line,
+        Stmt::GradBlock { line, .. } => *line,
+        Stmt::Backward { line, .. } => *line,
+        Stmt::Query { line, .. } => *line,
     }
 }

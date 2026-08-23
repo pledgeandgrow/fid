@@ -1,6 +1,6 @@
 # Fides Language — Feature Status
 
-*Last updated: verified against actual source code and test runs (136/136 unit tests, 7/8 harness tests, 102/127 interpreter tests + 22/22 expected-fail, 101/127 C codegen — near full parity, 149 .fd test files, 34 stdlib modules)*
+*Last updated: Aug 2026 — verified against actual source code and test runs (200/202 unit tests, 6/8 harness tests, 105/130 interpreter tests + 22/22 expected-fail, 104/130 C codegen, 105/130 PE emitter, 152 .fd test files, 34 stdlib modules)*
 
 ## Legend
 
@@ -21,11 +21,11 @@
 | IR Interpreter (interp.rs) | ✅ | Runs IR directly via `fidesc run` |
 | PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables + flat binary (bare-metal mode) |
 | ELF64 Emitter (elf64.rs) | ✅ | Generates native ELF64 executables on Linux (zero external tools) + relocatable objects |
-| C Codegen (codegen_c.rs) | ✅ | Generates C code, 101/127 tests match interpreter output (near full parity — test_phase8b fails: ECS __ecs_* not in C codegen) |
+| C Codegen (codegen_c.rs) | ✅ | Generates C code, 104/130 tests match interpreter output. Phase 10B: Print calls Fides Vec_to_str/HashMap_to_str for formatting. |
 | PIR (pir.rs) | ✅ | PIR L1/L2/L3, `fidesc pir` command |
-| Optimizer (opt.rs) | ✅ | 10 passes: const-fold, CSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize. Enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive inlining. |
+| Optimizer (opt.rs) | ✅ | 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. 22 in default pass list. Enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive inlining. |
 | Peephole (peephole.rs) | ✅ | 9 passes, always on in `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection |
-| Register Allocator (regalloc.rs) | ⚠️ | Linear scan allocator. Has pre-existing bug: constants not loaded into registers before use can be clobbered by intervening instructions. Exposed by L2 optimizer's instruction reordering. |
+| Register Allocator (regalloc.rs) | ✅ | Linear scan allocator with constant rematerialization (F-1A). Effect-aware allocation (F-1D): pure/@no-alloc calls only clobber RAX. |
 | Mach-O Emitter (macho.rs) | ✅ | Generates Mach-O object files for macOS |
 | COFF Emitter (coff.rs) | ✅ | Generates COFF object files for Windows |
 | WASM Backend (wasm.rs) | ✅ | PIR → WASM binary, `fidesc wasm` command |
@@ -46,7 +46,7 @@
 | `fidesc emit <file> --bare -o <bin>` | ✅ | Bare-metal flat binary (no stdlib, no PE headers) |
 | `fidesc build <file> -o <out> [--target] [--opt]` | ✅ | Native build: PIR → codegen → peephole → ELF64 executable (zero external tools on Linux) |
 | `fidesc ccompile <file> -o <exe>` | ✅ | C codegen → gcc/clang → executable |
-| `fidesc test` | ✅ | Runs all 127 normal + 22 expected-fail tests across interpreter, PE emitter, and C codegen |
+| `fidesc test` | ✅ | Runs all 130 normal + 22 expected-fail tests across interpreter, PE emitter, and C codegen |
 | `fidesc repl` | ✅ | Interactive REPL |
 | `fidesc verify <file>` | ✅ | IR verification pass |
 | `fidesc sourcemap <file>` | ✅ | Source map output |
@@ -174,7 +174,7 @@
 | `use ... *` glob imports | ✅ | Glob imports |
 | Re-exports | ✅ | |
 | Multi-file modules | ✅ | |
-| Standard library (stdlib/core.fd) | ✅ | Auto-imported. Includes: core, math, env, args, process, regex, db, http, json, parallel, shape, simd, tensor, quant, money, banking, alloc, file, time, typed_strings, memo, privacy |
+| Standard library (stdlib/core.fd) | ✅ | Auto-imported. 34 modules: core, vec, math, ecs, events, parallel, sync, db, http, json, shape, simd, tensor, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input |
 
 ### Capabilities (Security)
 
@@ -209,9 +209,9 @@
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Bounds checking (Vec/array/string) | ✅ | Runtime in debug mode, compile-time for constant indices |
-| Integer overflow checking | ✅ | Debug mode panics, release mode wraps (`--release`) |
-| Division by zero detection | ✅ | Runtime panic in debug mode |
+| Bounds checking (Vec/array/string) | ✅ | Always on (F62); skippable in `unsafe {}` blocks |
+| Integer overflow checking | ✅ | Always on (F64: overflow = panic); `@wrapping` annotation for wrap-around (F65) |
+| Division by zero detection | ✅ | Runtime panic |
 | `Option::unwrap` panics on None | ✅ | Calls `p_panic` |
 | Effect system (annotations + inference) | ✅ | `!IO`, `!Net`, `!Spawn`, `!Alloc`, `!{}` for pure |
 | Effect checking (under-declaration) | ✅ | Compile-time error if inferred > declared |
@@ -247,6 +247,31 @@
 | Hot reload | ✅ | `fidesc watch` compiles to native ELF64, runs, detects function-level changes via L2 IR hashing |
 | `#[test]` attribute | ❌ | Parsed but not executed by `fidesc test` (tests are file-based) |
 | `@derive` | ✅ | `@derive(Debug/Clone/Serialize/Deserialize)` generates methods (Phase 7.7) |
+| Borrow checker | ✅ | Phases 1-6 complete: `--borrowck=off\|warn\|on`, field-wise borrows, two-phase borrows, NLL, on by default |
+| Raw pointers `*mut T` / `*const T` | ✅ | With `unsafe {}` blocks for dereference |
+| `pm` (uninitialized mutable) | ✅ | F63: definite assignment analysis |
+| `@wrapping` arithmetic | ✅ | F65: escape hatch from checked arithmetic |
+| `@gas(N)` budget | ✅ | Compile-time gas budget annotation |
+| `@crashfree` | ✅ | No panic, no unbounded loops |
+| `@medical` (IEC 62304) | ✅ | No alloc, no recursion, no while, must be @audit |
+| `@safety-critical` (ISO 26262) | ✅ | No alloc, no recursion, no unbounded, no indirect |
+| `@autosar` | ✅ | No alloc, no recursion, no unbounded, no panic |
+| `@linear` types | ✅ | Move semantics, no copy |
+| `@conserve` | ✅ | Proves no money created/destroyed/duplicated |
+| `@audit` | ✅ | Design by contract with full param trail |
+| `@deterministic` | ✅ | No IO/Net/Spawn, no floating-point |
+| `given`/`ensure` contracts | ✅ | F10: Design by Contract — preconditions verified at call sites |
+| `txn {}` blocks | ✅ | Transaction with rollback (interpreter) |
+| `sandbox {}` blocks | ✅ | Capability revocation |
+| ECS (component/system/query) | ✅ | Phase 8B: F18 — entity-component-system |
+| State machines | ✅ | Phase 8B: F19 — `state_machine` with states/transitions |
+| Event handlers `on` | ✅ | Phase 8B: F20 — desugars to `__on_<event>` function |
+| Typed strings | ✅ | F67: SQLString/ShellString/HTMLString/JSONString/PathString |
+| `@cfg` conditional compilation | ✅ | Phase 7.7: `@cfg(platform = "linux")`, `@cfg(debug)`, etc. |
+| Dynamic loading | ✅ | `p_dl_open`/`p_dl_sym`/`p_dl_close`/`p_dl_call` — real dlopen in C codegen |
+| Vec stdlib (Phase 10B) | ✅ | `Vec` implemented in `stdlib/core.fd` using raw pointers |
+| HashMap stdlib (Phase 10B) | ✅ | `HashMap` implemented in `stdlib/core.fd` using raw pointers |
+| String stdlib (Phase 10B) | ✅ | `String` implemented in `stdlib/core.fd` using raw pointers |
 
 ---
 
@@ -583,14 +608,14 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 | Parser | 100% | — | — |
 | Type Checker | 100% | — | — |
 | IR Lowering | 100% | — | — |
-| Interpreter | 102/127 + 22/22 expected-fail | — | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
-| PE Emitter | 102/127 + 22/22 expected-fail | — | Same pre-existing failures as interpreter |
+| Interpreter | 105/130 + 22/22 expected-fail | — | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
+| PE Emitter | 105/130 + 22/22 expected-fail | — | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
 | ELF64 Emitter | ✅ | — | Working executables on Linux (zero external tools) |
-| C Codegen | 101/127 + 22/22 expected-fail | — | Near FULL PARITY — test_phase8b fails (ECS __ecs_* not in C codegen). test_db no longer flaky (HashMap keys sorted). |
+| C Codegen | 104/130 + 22/22 expected-fail | — | Phase 10B: Vec/HashMap/String migrated to Fides stdlib |
 | Multi-arch Codegen | ✅ | — | x86-64, ARM64, RISC-V assembly all work |
 | Peephole Optimizer | ✅ (9 passes) | — | Always on in `build` |
-| L2 Optimizer | ✅ | — | Enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive inlining. |
-| Register Allocator | — | ⚠️ | Pre-existing bug with constant loading (mitigated by optimizer) |
+| L2 Optimizer | ✅ (23 passes) | — | Enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive inlining. |
+| Register Allocator | ✅ | — | Linear scan with constant rematerialization (F-1A). Effect-aware allocation (F-1D). |
 | Source Maps | ✅ | — | `sourcemap` command works |
 | IR Verification | ✅ | — | `verify` command works |
 | WASM Backend | ✅ | — | `wasm` command works |
@@ -600,10 +625,10 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 
 ### Test Coverage
 
-- **149 test files** in `tests/` (127 normal + 22 expected-fail)
-- **136 unit tests** in `cargo test --bin fidesc` — all pass
-- **7/8 harness tests** pass (1 fail: safety_checks_panic_in_debug_mode — overflow checks always on, even in release)
-- **102/127** normal tests pass on interpreter + PE, **101/127** on C codegen
+- **152 test files** in `tests/` (130 normal + 22 expected-fail)
+- **202 unit tests** in `cargo test --bin fidesc` — 200 pass (2 pre-existing failures)
+- **6/8 harness tests** pass (2 fails: safety_checks_panic_in_debug_mode — overflow checks always on, even in release; golden_files_match — golden files outdated)
+- **105/130** normal tests pass on interpreter, **105/130** on PE, **104/130** on C codegen
 - **22/22** expected-fail tests correctly fail on all backends
-- **58 golden files** in `tests/golden/` — expected outputs for regression testing
+- **148 golden files** in `tests/golden/` — expected outputs for regression testing
 - **34 stdlib modules** in `stdlib/` — core, vec, math, ecs, events, parallel, sync, and more

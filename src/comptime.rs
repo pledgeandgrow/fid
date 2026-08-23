@@ -468,6 +468,10 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<String>) 
             substitute_expr(ptr_expr, original, errs);
             substitute_expr(expr, original, errs);
         }
+        Stmt::FieldAssign { object, expr, .. } => {
+            substitute_expr(object, original, errs);
+            substitute_expr(expr, original, errs);
+        }
         Stmt::Expr(e, _) => substitute_expr(e, original, errs),
         Stmt::Return(opt, _) => {
             if let Some(e) = opt {

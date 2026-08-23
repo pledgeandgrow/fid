@@ -1,0 +1,41 @@
+// Test: Phase A3 — Non-blocking IO
+//
+// p_net_connect(host, port) — connects to a TCP server, returns socket (eager)
+// p_net_read(sock, buf, len) — async read, returns Future
+// p_net_write(sock, buf, len) — async write, returns Future
+// p_net_close(sock) — close socket
+// p_fs_read_async(path, buf, len) — async file read, returns Future
+//
+// In the interpreter, IO is simulated. In C codegen, real sockets/files are used.
+
+pf main() {
+    // Test async file read — read this test file
+    pv buf = p_malloc(4096);
+    pv read_future = p_fs_read_async("tests/test_async_io.fd", buf, 4096);
+
+    // Poll until the read completes
+    pv pending = 1;
+    while pending > 0 {
+        pv result = p_task_poll_nonblocking(read_future);
+        if result == -9223372036854775807 {
+            // Still pending — yield (in real async, we'd switch tasks here)
+            pending = 1;
+        } else {
+            pending = 0;
+        }
+    }
+
+    pv bytes_read = p_task_poll(read_future);
+    print("bytes_read = ");
+    print(bytes_read);
+    print("\n");
+
+    // Test net connect to localhost — may succeed or fail depending on env
+    // Just test that the function doesn't crash
+    pv sock = p_net_connect("127.0.0.1", 9999);
+    if sock >= 0 {
+        p_net_close(sock);
+    }
+
+    print("OK\n");
+}

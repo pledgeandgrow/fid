@@ -1,0 +1,64 @@
+// Test: Phase A2 — Concurrent task interleaving via executor
+//
+// Demonstrates that spawned tasks run concurrently in real OS threads.
+// The executor polls all tasks non-blocking until they complete.
+
+pf compute(x: i64) -> i64 {
+    // Simulate work with a busy loop
+    pv sum = 0;
+    pv i = 0;
+    while i < x {
+        sum = sum + i;
+        i = i + 1;
+    }
+    ret sum;
+}
+
+pf main() {
+    // Spawn multiple concurrent tasks
+    pv exec = p_executor_new();
+    pv t1 = p_executor_spawn(exec, "compute", 1, 1000);
+    pv t2 = p_executor_spawn(exec, "compute", 1, 2000);
+    pv t3 = p_executor_spawn(exec, "compute", 1, 3000);
+    pv t4 = p_executor_spawn(exec, "compute", 1, 4000);
+
+    // Poll all tasks non-blocking until they complete
+    pv pending = p_executor_poll_all(exec);
+    while pending > 0 {
+        pending = p_executor_poll_all(exec);
+    }
+
+    // All tasks should be done — get results
+    pv r1 = p_task_poll(t1);
+    pv r2 = p_task_poll(t2);
+    pv r3 = p_task_poll(t3);
+    pv r4 = p_task_poll(t4);
+
+    print("r1 = ");
+    print(r1);
+    print("\n");
+    print("r2 = ");
+    print(r2);
+    print("\n");
+    print("r3 = ");
+    print(r3);
+    print("\n");
+    print("r4 = ");
+    print(r4);
+    print("\n");
+
+    // Verify results: sum(0..n-1) = n*(n-1)/2
+    // 1000*999/2 = 499500
+    // 2000*1999/2 = 1999000
+    // 3000*2999/2 = 4498500
+    // 4000*3999/2 = 7998000
+    if r1 == 499500 {
+        if r2 == 1999000 {
+            if r3 == 4498500 {
+                if r4 == 7998000 {
+                    print("OK\n");
+                }
+            }
+        }
+    }
+}

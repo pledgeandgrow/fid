@@ -394,7 +394,7 @@ impl Parser {
             } else {
                 false
             };
-            let fname = self.expect_ident()?;
+            let fname = self.expect_ident_or_keyword()?;
             self.expect(TokenKind::Colon, ":")?;
             let fty = self.parse_type()?;
             fields.push(Param { name: fname, ty: fty, is_pub });
@@ -1472,6 +1472,10 @@ impl Parser {
                 let rhs = self.parse_expr()?;
                 self.match_tok(TokenKind::Semicolon);
                 Ok(Stmt::DerefAssign { ptr_expr: *ptr_expr, op, expr: rhs, line })
+            } else if let Expr::FieldAccess { expr: obj_expr, field } = expr {
+                let rhs = self.parse_expr()?;
+                self.match_tok(TokenKind::Semicolon);
+                Ok(Stmt::FieldAssign { object: *obj_expr, field, op, expr: rhs, line })
             } else {
                 Err("Parse error: assignment target must be an identifier or array index".to_string())
             }

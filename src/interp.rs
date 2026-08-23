@@ -20,6 +20,10 @@ use std::collections::{HashMap, HashSet};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+
+/// Sentinel value returned by p_task_poll when a future is still pending.
+/// Chosen to be unlikely to collide with real values.
+const PENDING_SENTINEL: i64 = i64::MIN + 1;
 use smallvec::SmallVec;
 use compact_str::CompactString;
 
@@ -278,6 +282,12 @@ pub struct Interpreter {
     ecs_entity_count: i64,
     /// Phase 8B: ECS component storage — maps component name → (entity_id → value)
     ecs_components: HashMap<String, HashMap<i64, Value>>,
+    /// Phase A1: Executor table — each executor is a list of future indices.
+    /// p_executor_new returns an index into this vec.
+    executors: Vec<Vec<usize>>,
+    /// Phase A1: Task done flags — maps future index to whether the thread has
+    /// completed (for non-blocking p_task_poll). Set by the thread before exit.
+    task_done: Arc<Mutex<HashMap<usize, bool>>>,
 }
 
 /// Result of running a function
@@ -326,6 +336,8 @@ impl Interpreter {
             next_dl_handle: 1,
             ecs_entity_count: 0,
             ecs_components: HashMap::new(),
+            executors: Vec::new(),
+            task_done: Arc::new(Mutex::new(HashMap::new())),
         };
         // Pre-allocate string constants
         interp.init_strings();
@@ -353,7 +365,31 @@ impl Interpreter {
                 }
                 String::from_utf8_lossy(&bytes).to_string()
             }
-            Value::Int(i) => i.to_string(),
+            Value::Int(i) => {
+                // Phase 10B: Value::Int may be a string pointer (materialized
+                // from Value::Str when passed to an I64/U64 parameter).
+                // Check opaque side-table first for the exact string.
+                if *i > 0 {
+                    if let Some(Value::Str(s)) = self.opaque_values.get(&(*i as u64)) {
+                        return s.to_string();
+                    }
+                }
+                // Try loading a null-terminated string from memory
+                if *i > 0 && self.memory.is_valid_addr(*i as u64) {
+                    let mut bytes = Vec::new();
+                    let mut offset = *i as u64;
+                    for _ in 0..256 {
+                        let b = self.memory.load(offset, 1);
+                        if b[0] == 0 { break; }
+                        bytes.push(b[0]);
+                        offset += 1;
+                    }
+                    if !bytes.is_empty() {
+                        return String::from_utf8_lossy(&bytes).to_string();
+                    }
+                }
+                i.to_string()
+            }
             _ => String::new(),
         }
     }
@@ -470,7 +506,15 @@ impl Interpreter {
                     let str_addr = self.memory.alloc(s.len() as u64 + 1);
                     self.memory.store(str_addr, s.as_bytes());
                     self.memory.store(str_addr + s.len() as u64, &[0]);
-                    val = Value::Int(str_addr as i64);
+                    // Store in opaque_values side-table so Load/Print handlers
+                    // can recover the original string (handles non-printable chars)
+                    self.opaque_values.insert(str_addr, Value::Str(s.clone()));
+                    // Use Value::Ptr for Ptr params, Value::Int for I64/U64 params
+                    if matches!(param_ty, IrType::Ptr(_)) {
+                        val = Value::Ptr(str_addr);
+                    } else {
+                        val = Value::Int(str_addr as i64);
+                    }
                 }
             }
             values.insert(*param_id, val);
@@ -1176,6 +1220,31 @@ impl Interpreter {
                         }
                     }
                 }
+                // Ptr(U8)-typed values that are stored as Value::Int (raw address)
+                // should be printed as strings (null-terminated C strings in memory).
+                // This handles @audit param values, typed strings, and other cases
+                // where the lowerer emits Print with ty=Ptr(U8) but the value is
+                // stored as an i64 address.
+                if let IrType::Ptr(inner) = ty {
+                    if let &IrType::U8 = inner.as_ref() {
+                        if let Value::Int(addr) = &v {
+                            if *addr > 0 && self.memory.is_valid_addr(*addr as u64) {
+                                let mut bytes = Vec::new();
+                                let mut offset = *addr as u64;
+                                loop {
+                                    let b = self.memory.load(offset, 1);
+                                    if b[0] == 0 { break; }
+                                    bytes.push(b[0]);
+                                    offset += 1;
+                                }
+                                if !bytes.is_empty() {
+                                    print!("{}", String::from_utf8_lossy(&bytes));
+                                    return ExecOutcome::Continue;
+                                }
+                            }
+                        }
+                    }
+                }
                 match &v {
                     Value::Int(i) => print!("{}", i),
                     Value::Float(f) => print!("{}", f),
@@ -1732,6 +1801,17 @@ impl Interpreter {
                 };
                 ExecOutcome::Value(Value::Str(CompactString::from(s)))
             }
+            "p_char_to_str" => {
+                // Convert a byte value (0-255) to a single-character string
+                let s = match args.first() {
+                    Some(Value::Int(i)) => {
+                        let b = (*i as u8) as char;
+                        b.to_string()
+                    }
+                    _ => String::new(),
+                };
+                ExecOutcome::Value(Value::Str(CompactString::from(s)))
+            }
             "p_float_to_str" => {
                 let s = match args.first() {
                     Some(Value::Float(f)) => f.to_string(),
@@ -2160,10 +2240,8 @@ impl Interpreter {
                 return ExecOutcome::Value(Value::Bool(s.ends_with(suffix.as_str())));
             }
             "p_string_trim" => {
-                if let Some(Value::Str(s)) = args.first() {
-                    return ExecOutcome::Value(Value::Str(CompactString::from(s.trim())));
-                }
-                ExecOutcome::Value(Value::Str(CompactString::from("")))
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                return ExecOutcome::Value(Value::Str(CompactString::from(s.trim())));
             }
             "p_string_split" => {
                 if let (Some(Value::Str(s)), Some(Value::Str(delim))) = (args.first(), args.get(1)) {
@@ -2205,70 +2283,58 @@ impl Interpreter {
                 return ExecOutcome::Value(Value::Str(CompactString::from(s.replace(from.as_str(), to.as_str()))));
             }
             "p_string_char_at" => {
-                if let (Some(Value::Str(s)), Some(Value::Int(idx))) = (args.first(), args.get(1)) {
-                    let char_count = s.chars().count() as i64;
-                    if *idx < 0 || *idx >= char_count {
-                        return ExecOutcome::Panic(format!(
-                            "String char_at out of bounds: index {} but string has {} chars",
-                            idx, char_count
-                        ));
-                    }
-                    let c = s.chars().nth(*idx as usize).unwrap();
-                    return ExecOutcome::Value(Value::Str(CompactString::from(c.to_string())));
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                let idx = match args.get(1) { Some(Value::Int(i)) => *i, _ => -1 };
+                let char_count = s.chars().count() as i64;
+                if idx < 0 || idx >= char_count {
+                    return ExecOutcome::Panic(format!(
+                        "String char_at out of bounds: index {} but string has {} chars",
+                        idx, char_count
+                    ));
                 }
-                ExecOutcome::Value(Value::Str(CompactString::from("")))
+                let c = s.chars().nth(idx as usize).unwrap();
+                return ExecOutcome::Value(Value::Str(CompactString::from(c.to_string())));
             }
             "p_string_to_uppercase" => {
-                if let Some(Value::Str(s)) = args.first() {
-                    return ExecOutcome::Value(Value::Str(CompactString::from(s.to_uppercase())));
-                }
-                ExecOutcome::Value(Value::Str(CompactString::from("")))
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                return ExecOutcome::Value(Value::Str(CompactString::from(s.to_uppercase())));
             }
             "p_string_to_lowercase" => {
-                if let Some(Value::Str(s)) = args.first() {
-                    return ExecOutcome::Value(Value::Str(CompactString::from(s.to_lowercase())));
-                }
-                ExecOutcome::Value(Value::Str(CompactString::from("")))
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                return ExecOutcome::Value(Value::Str(CompactString::from(s.to_lowercase())));
             }
             "p_string_parse_int" => {
-                if let Some(Value::Str(s)) = args.first() {
-                    return ExecOutcome::Value(Value::Int(s.parse::<i64>().unwrap_or(0)));
-                }
-                ExecOutcome::Value(Value::Int(0))
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                return ExecOutcome::Value(Value::Int(s.parse::<i64>().unwrap_or(0)));
             }
             "p_string_find" => {
-                if let (Some(Value::Str(s)), Some(Value::Str(sub))) = (args.first(), args.get(1)) {
-                    if let Some(pos) = s.find(sub.as_str()) {
-                        return ExecOutcome::Value(Value::Int(pos as i64));
-                    }
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                let sub = self.value_to_string(args.get(1).unwrap_or(&Value::Int(0)));
+                if let Some(pos) = s.find(sub.as_str()) {
+                    return ExecOutcome::Value(Value::Int(pos as i64));
                 }
                 ExecOutcome::Value(Value::Int(-1))
             }
             "p_string_rfind" => {
-                if let (Some(Value::Str(s)), Some(Value::Str(sub))) = (args.first(), args.get(1)) {
-                    if let Some(pos) = s.rfind(sub.as_str()) {
-                        return ExecOutcome::Value(Value::Int(pos as i64));
-                    }
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                let sub = self.value_to_string(args.get(1).unwrap_or(&Value::Int(0)));
+                if let Some(pos) = s.rfind(sub.as_str()) {
+                    return ExecOutcome::Value(Value::Int(pos as i64));
                 }
                 ExecOutcome::Value(Value::Int(-1))
             }
             "p_string_repeat" => {
-                if let (Some(Value::Str(s)), Some(Value::Int(n))) = (args.first(), args.get(1)) {
-                    return ExecOutcome::Value(Value::Str(CompactString::from(s.repeat(*n as usize))));
-                }
-                ExecOutcome::Value(Value::Str(CompactString::from("")))
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                let n = match args.get(1) { Some(Value::Int(n)) => *n as usize, _ => 0 };
+                return ExecOutcome::Value(Value::Str(CompactString::from(s.repeat(n))));
             }
             "p_string_bytes" => {
-                if let Some(Value::Str(s)) = args.first() {
-                    return ExecOutcome::Value(Value::Int(s.len() as i64));
-                }
-                ExecOutcome::Value(Value::Int(0))
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                return ExecOutcome::Value(Value::Int(s.len() as i64));
             }
             "p_string_clone" => {
-                if let Some(Value::Str(s)) = args.first() {
-                    return ExecOutcome::Value(Value::Str(s.clone()));
-                }
-                ExecOutcome::Value(Value::Str(CompactString::from("")))
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                return ExecOutcome::Value(Value::Str(CompactString::from(s)));
             }
 
             // ─── New Vec runtime functions ───
@@ -2964,10 +3030,7 @@ impl Interpreter {
             "p_db_mem_exec" => {
                 // Exec: INSERT/SET key=value
                 if let (Some(Value::Int(h)), Some(query)) = (args.get(0), args.get(1)) {
-                    let query_str = match query {
-                        Value::Str(s) => s.to_string(),
-                        _ => return ExecOutcome::Value(Value::Int(0)),
-                    };
+                    let query_str = self.value_to_string(query);
                     // Simple: "SET key value" or "INSERT key value"
                     let parts: Vec<&str> = query_str.splitn(3, ' ').collect();
                     if parts.len() >= 3 && (parts[0].eq_ignore_ascii_case("set") || parts[0].eq_ignore_ascii_case("insert")) {
@@ -2982,69 +3045,61 @@ impl Interpreter {
 
             // ─── File I/O builtins ───
             "p_file_read" => {
-                if let Some(Value::Str(path)) = args.get(0) {
-                    let path_str = path.to_string();
-                    match std::fs::read_to_string(&path_str) {
-                        Ok(content) => {
-                            let addr = self.memory.alloc(content.len() as u64 + 1);
-                            self.memory.store(addr, content.as_bytes());
-                            self.memory.store(addr + content.len() as u64, &[0]);
-                            let val = Value::Str(CompactString::from(content));
-                            self.opaque_values.insert(addr, val.clone());
-                            return ExecOutcome::Value(Value::Ptr(addr));
+                if let Some(path_arg) = args.get(0) {
+                    let path_str = self.value_to_string(path_arg);
+                    if !path_str.is_empty() {
+                        match std::fs::read_to_string(&path_str) {
+                            Ok(content) => {
+                                let addr = self.memory.alloc(content.len() as u64 + 1);
+                                self.memory.store(addr, content.as_bytes());
+                                self.memory.store(addr + content.len() as u64, &[0]);
+                                let val = Value::Str(CompactString::from(content));
+                                self.opaque_values.insert(addr, val.clone());
+                                return ExecOutcome::Value(Value::Ptr(addr));
+                            }
+                            Err(_) => return ExecOutcome::Value(Value::Ptr(0)),
                         }
-                        Err(_) => return ExecOutcome::Value(Value::Ptr(0)),
                     }
                 }
                 ExecOutcome::Value(Value::Ptr(0))
             }
             "p_file_write" => {
-                if let (Some(Value::Str(path)), Some(content)) = (args.get(0), args.get(1)) {
-                    let path_str = path.to_string();
-                    let content_str = match content {
-                        Value::Str(s) => s.to_string(),
-                        Value::Ptr(addr) => {
-                            let bytes = self.memory.load(*addr, 4096);
-                            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                            String::from_utf8_lossy(&bytes[..end]).to_string()
+                if let (Some(path_arg), Some(content_arg)) = (args.get(0), args.get(1)) {
+                    let path_str = self.value_to_string(path_arg);
+                    let content_str = self.value_to_string(content_arg);
+                    if !path_str.is_empty() {
+                        match std::fs::write(&path_str, &content_str) {
+                            Ok(_) => return ExecOutcome::Value(Value::Int(0)),
+                            Err(_) => return ExecOutcome::Value(Value::Int(-1)),
                         }
-                        _ => return ExecOutcome::Value(Value::Int(-1)),
-                    };
-                    match std::fs::write(&path_str, &content_str) {
-                        Ok(_) => return ExecOutcome::Value(Value::Int(0)),
-                        Err(_) => return ExecOutcome::Value(Value::Int(-1)),
                     }
                 }
                 ExecOutcome::Value(Value::Int(-1))
             }
             "p_file_exists" => {
-                if let Some(Value::Str(path)) = args.get(0) {
-                    let path_str = path.to_string();
-                    return ExecOutcome::Value(Value::Bool(std::path::Path::new(&path_str).exists()));
+                if let Some(path_arg) = args.get(0) {
+                    let path_str = self.value_to_string(path_arg);
+                    if !path_str.is_empty() {
+                        return ExecOutcome::Value(Value::Bool(std::path::Path::new(&path_str).exists()));
+                    }
                 }
                 ExecOutcome::Value(Value::Bool(false))
             }
             "p_file_append" => {
-                if let (Some(Value::Str(path)), Some(content)) = (args.get(0), args.get(1)) {
-                    let path_str = path.to_string();
-                    let content_str = match content {
-                        Value::Str(s) => s.to_string(),
-                        Value::Ptr(addr) => {
-                            let bytes = self.memory.load(*addr, 4096);
-                            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                            String::from_utf8_lossy(&bytes[..end]).to_string()
-                        }
-                        _ => return ExecOutcome::Value(Value::Int(-1)),
-                    };
-                    use std::io::Write;
-                    match std::fs::OpenOptions::new().append(true).create(true).open(&path_str) {
-                        Ok(mut f) => {
-                            match f.write_all(content_str.as_bytes()) {
-                                Ok(_) => return ExecOutcome::Value(Value::Int(0)),
-                                Err(_) => return ExecOutcome::Value(Value::Int(-1)),
+                if let (Some(path_arg), Some(content_arg)) = (args.get(0), args.get(1)) {
+                    let path_str = self.value_to_string(path_arg);
+                    let content_str = self.value_to_string(content_arg);
+                    if !path_str.is_empty() {
+                        use std::io::Write;
+                        match std::fs::OpenOptions::new().append(true).create(true).open(&path_str) {
+                            Ok(mut f) => {
+                                match f.write_all(content_str.as_bytes()) {
+                                    Ok(_) => return ExecOutcome::Value(Value::Int(0)),
+                                    Err(_) => return ExecOutcome::Value(Value::Int(-1)),
+                                }
                             }
+                            Err(_) => return ExecOutcome::Value(Value::Int(-1)),
                         }
-                        Err(_) => return ExecOutcome::Value(Value::Int(-1)),
                     }
                 }
                 ExecOutcome::Value(Value::Int(-1))
@@ -3157,11 +3212,13 @@ impl Interpreter {
 
             // ─── Environment variable builtins ───
             "p_getenv" => {
-                if let Some(Value::Str(name)) = args.first() {
-                    let name_str = name.to_string();
-                    match std::env::var(&name_str) {
-                        Ok(val) => return ExecOutcome::Value(Value::Str(CompactString::from(val))),
-                        Err(_) => return ExecOutcome::Value(Value::Ptr(0)),
+                if let Some(name_arg) = args.first() {
+                    let name_str = self.value_to_string(name_arg);
+                    if !name_str.is_empty() {
+                        match std::env::var(&name_str) {
+                            Ok(val) => return ExecOutcome::Value(Value::Str(CompactString::from(val))),
+                            Err(_) => return ExecOutcome::Value(Value::Ptr(0)),
+                        }
                     }
                 }
                 ExecOutcome::Value(Value::Ptr(0))
@@ -3183,18 +3240,20 @@ impl Interpreter {
 
             // ─── Process control builtins ───
             "p_system" => {
-                if let Some(Value::Str(cmd)) = args.first() {
-                    let cmd_str = cmd.to_string();
-                    let status = std::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(&cmd_str)
-                        .status();
-                    match status {
-                        Ok(s) => {
-                            use std::os::unix::process::ExitStatusExt;
-                            return ExecOutcome::Value(Value::Int(s.code().unwrap_or(s.signal().unwrap_or(0)) as i64));
+                if let Some(cmd_arg) = args.first() {
+                    let cmd_str = self.value_to_string(cmd_arg);
+                    if !cmd_str.is_empty() {
+                        let status = std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(&cmd_str)
+                            .status();
+                        match status {
+                            Ok(s) => {
+                                use std::os::unix::process::ExitStatusExt;
+                                return ExecOutcome::Value(Value::Int(s.code().unwrap_or(s.signal().unwrap_or(0)) as i64));
+                            }
+                            Err(_) => return ExecOutcome::Value(Value::Int(-1)),
                         }
-                        Err(_) => return ExecOutcome::Value(Value::Int(-1)),
                     }
                 }
                 ExecOutcome::Value(Value::Int(-1))
@@ -3340,6 +3399,414 @@ impl Interpreter {
                 // Store the JoinHandle in the Pending slot
                 self.futures[future_idx] = FutureState::Pending(Some(handle));
                 ExecOutcome::Value(Value::Future(future_idx))
+            }
+
+            // ─── Phase A1: Executor + non-blocking task poll ───
+            "p_executor_new" => {
+                // p_executor_new() -> i64 — create an executor, return handle.
+                let idx = self.executors.len();
+                self.executors.push(Vec::new());
+                ExecOutcome::Value(Value::Int(idx as i64))
+            }
+            "p_executor_spawn" => {
+                // p_executor_spawn(exec: i64, func_name: *u8, num_args: i64, args...)
+                //   -> i64 (future handle)
+                // Spawns an OS thread (same as p_thread_spawn) but registers the
+                // future with the given executor.
+                let exec_idx = match args.first() {
+                    Some(Value::Int(n)) => *n as usize,
+                    _ => 0,
+                };
+                let func_name = self.value_to_string(args.get(1).unwrap_or(&Value::Int(0)));
+                let num_args = match args.get(2) {
+                    Some(Value::Int(n)) => *n as usize,
+                    _ => 0,
+                };
+                let thread_args: Vec<i64> = if args.len() >= 3 + num_args {
+                    args[3..3 + num_args].iter().map(|v| match v {
+                        Value::Int(n) => *n,
+                        Value::Bool(b) => *b as i64,
+                        Value::Float(f) => f.to_bits() as i64,
+                        Value::Ptr(p) => *p as i64,
+                        _ => 0,
+                    }).collect()
+                } else {
+                    args[3..].iter().map(|v| match v {
+                        Value::Int(n) => *n,
+                        Value::Bool(b) => *b as i64,
+                        Value::Float(f) => f.to_bits() as i64,
+                        Value::Ptr(p) => *p as i64,
+                        _ => 0,
+                    }).collect()
+                };
+                let module = self.module.clone();
+                let shared_memory = self.shared_memory.clone();
+                let mutexes = self.mutexes.clone();
+                let task_done = self.task_done.clone();
+                let future_idx = self.futures.len();
+                self.futures.push(FutureState::Pending(None));
+                self.task_done.lock().unwrap().insert(future_idx, false);
+                let handle = std::thread::spawn(move || {
+                    let mut interp = Interpreter::new(module);
+                    interp.shared_memory = shared_memory;
+                    interp.mutexes = mutexes;
+                    let mut thread_values: Vec<Value> = vec![Value::Int(0)];
+                    for n in &thread_args {
+                        thread_values.push(Value::Int(*n));
+                    }
+                    let result = if let Some(func) = interp.module.functions.get(&func_name).cloned() {
+                        match interp.run_function(&func, &thread_values) {
+                            RunResult::Return(v) => v,
+                            RunResult::Panic(msg) => {
+                                eprintln!("Thread panic: {}", msg);
+                                Value::Int(0)
+                            }
+                        }
+                    } else {
+                        eprintln!("Executor: unknown function '{}'", func_name);
+                        Value::Int(0)
+                    };
+                    // Mark task as done
+                    task_done.lock().unwrap().insert(future_idx, true);
+                    match result {
+                        Value::Int(n) => n,
+                        Value::Bool(b) => b as i64,
+                        Value::Float(f) => f.to_bits() as i64,
+                        Value::Ptr(p) => p as i64,
+                        _ => 0,
+                    }
+                });
+                self.futures[future_idx] = FutureState::Pending(Some(handle));
+                // Register with executor
+                if exec_idx < self.executors.len() {
+                    self.executors[exec_idx].push(future_idx);
+                }
+                ExecOutcome::Value(Value::Future(future_idx))
+            }
+            "p_executor_block_on" => {
+                // p_executor_block_on(exec: i64, future: i64) -> i64
+                // Block until the future is ready. For A1, this is the same as
+                // p_future_poll (blocking join). A2 will add cooperative polling.
+                let idx = match args.get(1) {
+                    Some(Value::Future(idx)) => *idx,
+                    Some(Value::Int(n)) => *n as usize,
+                    _ => return ExecOutcome::Panic("block_on: not a Future value".to_string()),
+                };
+                if idx >= self.futures.len() {
+                    return ExecOutcome::Panic(format!("block_on: invalid handle {}", idx));
+                }
+                match &self.futures[idx] {
+                    FutureState::Ready(v) => return ExecOutcome::Value(v.clone()),
+                    FutureState::Pending(_) => {}
+                }
+                if let FutureState::Pending(Some(handle)) =
+                    std::mem::replace(&mut self.futures[idx], FutureState::Ready(Value::Int(0)))
+                {
+                    match handle.join() {
+                        Ok(n) => {
+                            let v = Value::Int(n);
+                            self.futures[idx] = FutureState::Ready(v.clone());
+                            self.task_done.lock().unwrap().insert(idx, true);
+                            ExecOutcome::Value(v)
+                        }
+                        Err(_) => {
+                            self.futures[idx] = FutureState::Ready(Value::Int(0));
+                            self.task_done.lock().unwrap().insert(idx, true);
+                            ExecOutcome::Panic("Thread panicked during block_on".to_string())
+                        }
+                    }
+                } else {
+                    ExecOutcome::Panic("block_on: already consumed".to_string())
+                }
+            }
+            "p_task_poll" => {
+                // p_task_poll(future: i64) -> i64
+                // For A1: blocks (joins the thread) to get the value.
+                // A2 will make this non-blocking inside async contexts (state machine).
+                let idx = match args.first() {
+                    Some(Value::Future(idx)) => *idx,
+                    Some(Value::Int(n)) => *n as usize,
+                    _ => return ExecOutcome::Panic("task_poll: not a Future value".to_string()),
+                };
+                if idx >= self.futures.len() {
+                    return ExecOutcome::Panic(format!("task_poll: invalid handle {}", idx));
+                }
+                match &self.futures[idx] {
+                    FutureState::Ready(v) => ExecOutcome::Value(v.clone()),
+                    FutureState::Pending(_) => {
+                        // Block until thread completes (join)
+                        if let FutureState::Pending(Some(handle)) =
+                            std::mem::replace(&mut self.futures[idx], FutureState::Ready(Value::Int(0)))
+                        {
+                            match handle.join() {
+                                Ok(n) => {
+                                    let v = Value::Int(n);
+                                    self.futures[idx] = FutureState::Ready(v.clone());
+                                    self.task_done.lock().unwrap().insert(idx, true);
+                                    ExecOutcome::Value(v)
+                                }
+                                Err(_) => {
+                                    self.futures[idx] = FutureState::Ready(Value::Int(0));
+                                    self.task_done.lock().unwrap().insert(idx, true);
+                                    ExecOutcome::Value(Value::Int(0))
+                                }
+                            }
+                        } else {
+                            ExecOutcome::Value(Value::Int(0))
+                        }
+                    }
+                }
+            }
+            "p_task_is_ready" => {
+                // p_task_is_ready(future: i64) -> bool
+                let idx = match args.first() {
+                    Some(Value::Future(idx)) => *idx,
+                    Some(Value::Int(n)) => *n as usize,
+                    _ => return ExecOutcome::Value(Value::Bool(false)),
+                };
+                if idx >= self.futures.len() {
+                    return ExecOutcome::Value(Value::Bool(false));
+                }
+                let ready = match &self.futures[idx] {
+                    FutureState::Ready(_) => true,
+                    FutureState::Pending(_) => {
+                        self.task_done.lock().unwrap().get(&idx).copied().unwrap_or(false)
+                    }
+                };
+                ExecOutcome::Value(Value::Bool(ready))
+            }
+            "p_executor_run_all" => {
+                // p_executor_run_all(exec: i64) -> i64 (count of completed tasks)
+                // Polls all tasks on the executor. Returns when all are done.
+                // For A1, this blocks on each pending task in order (join all).
+                let exec_idx = match args.first() {
+                    Some(Value::Int(n)) => *n as usize,
+                    _ => 0,
+                };
+                if exec_idx >= self.executors.len() {
+                    return ExecOutcome::Value(Value::Int(0));
+                }
+                let task_indices = self.executors[exec_idx].clone();
+                let mut count = 0i64;
+                for &idx in &task_indices {
+                    if idx >= self.futures.len() { continue; }
+                    match &self.futures[idx] {
+                        FutureState::Ready(_) => { count += 1; }
+                        FutureState::Pending(_) => {
+                            if let FutureState::Pending(Some(handle)) =
+                                std::mem::replace(&mut self.futures[idx], FutureState::Ready(Value::Int(0)))
+                            {
+                                match handle.join() {
+                                    Ok(n) => {
+                                        self.futures[idx] = FutureState::Ready(Value::Int(n));
+                                        self.task_done.lock().unwrap().insert(idx, true);
+                                        count += 1;
+                                    }
+                                    Err(_) => {
+                                        self.futures[idx] = FutureState::Ready(Value::Int(0));
+                                        self.task_done.lock().unwrap().insert(idx, true);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ExecOutcome::Value(Value::Int(count))
+            }
+            "p_executor_poll_all" => {
+                // p_executor_poll_all(exec: i64) -> i64
+                // Non-blocking: returns the number of tasks still pending.
+                // Tasks that have completed since the last poll are joined
+                // (their values are collected). A2: enables round-robin scheduling.
+                let exec_idx = match args.first() {
+                    Some(Value::Int(n)) => *n as usize,
+                    _ => 0,
+                };
+                if exec_idx >= self.executors.len() {
+                    return ExecOutcome::Value(Value::Int(0));
+                }
+                let task_indices = self.executors[exec_idx].clone();
+                let mut pending = 0i64;
+                for &idx in &task_indices {
+                    if idx >= self.futures.len() { continue; }
+                    match &self.futures[idx] {
+                        FutureState::Ready(_) => {}
+                        FutureState::Pending(_) => {
+                            let done = self.task_done.lock().unwrap()
+                                .get(&idx).copied().unwrap_or(false);
+                            if done {
+                                // Join to collect the value
+                                if let FutureState::Pending(Some(handle)) =
+                                    std::mem::replace(&mut self.futures[idx], FutureState::Ready(Value::Int(0)))
+                                {
+                                    match handle.join() {
+                                        Ok(n) => {
+                                            self.futures[idx] = FutureState::Ready(Value::Int(n));
+                                            self.task_done.lock().unwrap().insert(idx, true);
+                                        }
+                                        Err(_) => {
+                                            self.futures[idx] = FutureState::Ready(Value::Int(0));
+                                            self.task_done.lock().unwrap().insert(idx, true);
+                                        }
+                                    }
+                                }
+                            } else {
+                                pending += 1;
+                            }
+                        }
+                    }
+                }
+                ExecOutcome::Value(Value::Int(pending))
+            }
+            "p_task_poll_nonblocking" => {
+                // p_task_poll_nonblocking(future: i64) -> i64
+                // Non-blocking poll: returns the value if ready, PENDING_SENTINEL if not.
+                // A2: used by async runtimes to check task readiness without blocking.
+                let idx = match args.first() {
+                    Some(Value::Future(idx)) => *idx,
+                    Some(Value::Int(n)) => *n as usize,
+                    _ => return ExecOutcome::Panic("task_poll_nb: not a Future value".to_string()),
+                };
+                if idx >= self.futures.len() {
+                    return ExecOutcome::Panic(format!("task_poll_nb: invalid handle {}", idx));
+                }
+                match &self.futures[idx] {
+                    FutureState::Ready(v) => ExecOutcome::Value(v.clone()),
+                    FutureState::Pending(_) => {
+                        let done = self.task_done.lock().unwrap()
+                            .get(&idx).copied().unwrap_or(false);
+                        if done {
+                            if let FutureState::Pending(Some(handle)) =
+                                std::mem::replace(&mut self.futures[idx], FutureState::Ready(Value::Int(0)))
+                            {
+                                match handle.join() {
+                                    Ok(n) => {
+                                        let v = Value::Int(n);
+                                        self.futures[idx] = FutureState::Ready(v.clone());
+                                        self.task_done.lock().unwrap().insert(idx, true);
+                                        ExecOutcome::Value(v)
+                                    }
+                                    Err(_) => {
+                                        self.futures[idx] = FutureState::Ready(Value::Int(0));
+                                        self.task_done.lock().unwrap().insert(idx, true);
+                                        ExecOutcome::Value(Value::Int(0))
+                                    }
+                                }
+                            } else {
+                                ExecOutcome::Value(Value::Int(0))
+                            }
+                        } else {
+                            ExecOutcome::Value(Value::Int(PENDING_SENTINEL))
+                        }
+                    }
+                }
+            }
+
+            // ─── Phase A3: Non-blocking IO (simulated in interpreter) ───
+            // In the interpreter, async IO is simulated by spawning a thread
+            // that performs the IO operation and returns the result.
+            // This gives the same semantics as real non-blocking IO: the
+            // caller gets a Future that can be polled.
+            "p_net_connect" => {
+                // p_net_connect(host: *u8, port: i64) -> i64 (Future handle)
+                // Simulated: spawn a thread that "connects" (just returns a fake socket)
+                let host = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                let port = match args.get(1) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let module = self.module.clone();
+                let future_idx = self.futures.len();
+                self.futures.push(FutureState::Pending(None));
+                self.task_done.lock().unwrap().insert(future_idx, false);
+                let task_done = self.task_done.clone();
+                let handle = std::thread::spawn(move || {
+                    // Simulate connection delay
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    // Return a fake socket FD (just a number)
+                    let sock = (port as i64) + 0x10000;
+                    task_done.lock().unwrap().insert(future_idx, true);
+                    sock
+                });
+                self.futures[future_idx] = FutureState::Pending(Some(handle));
+                ExecOutcome::Value(Value::Future(future_idx))
+            }
+            "p_net_read" => {
+                // p_net_read(sock: i64, buf: *u8, len: i64) -> i64 (Future handle)
+                // Simulated: returns a fake read result
+                let sock = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let _buf = args.get(1);
+                let len = match args.get(2) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let module = self.module.clone();
+                let future_idx = self.futures.len();
+                self.futures.push(FutureState::Pending(None));
+                self.task_done.lock().unwrap().insert(future_idx, false);
+                let task_done = self.task_done.clone();
+                let handle = std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    // Return the number of bytes "read" (min of len and 13)
+                    let n = if len > 13 { 13 } else { len };
+                    task_done.lock().unwrap().insert(future_idx, true);
+                    n
+                });
+                self.futures[future_idx] = FutureState::Pending(Some(handle));
+                ExecOutcome::Value(Value::Future(future_idx))
+            }
+            "p_net_write" => {
+                // p_net_write(sock: i64, buf: *u8, len: i64) -> i64 (Future handle)
+                // Simulated: returns the number of bytes "written"
+                let sock = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let len = match args.get(2) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let future_idx = self.futures.len();
+                self.futures.push(FutureState::Pending(None));
+                self.task_done.lock().unwrap().insert(future_idx, false);
+                let task_done = self.task_done.clone();
+                let handle = std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    task_done.lock().unwrap().insert(future_idx, true);
+                    len // "wrote" all bytes
+                });
+                self.futures[future_idx] = FutureState::Pending(Some(handle));
+                ExecOutcome::Value(Value::Future(future_idx))
+            }
+            "p_fs_read_async" => {
+                // p_fs_read_async(path: *u8, buf: *u8, len: i64) -> i64 (Future handle)
+                // Simulated: reads the file in a thread
+                let path = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                let len = match args.get(2) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 1024,
+                };
+                let future_idx = self.futures.len();
+                self.futures.push(FutureState::Pending(None));
+                self.task_done.lock().unwrap().insert(future_idx, false);
+                let task_done = self.task_done.clone();
+                let handle = std::thread::spawn(move || {
+                    // Try to read the file
+                    let bytes = std::fs::read(&path).unwrap_or_default();
+                    let n = if bytes.len() as i64 > len { len } else { bytes.len() as i64 };
+                    task_done.lock().unwrap().insert(future_idx, true);
+                    n
+                });
+                self.futures[future_idx] = FutureState::Pending(Some(handle));
+                ExecOutcome::Value(Value::Future(future_idx))
+            }
+            "p_net_close" => {
+                // p_net_close(sock: i64) -> void
+                // Simulated: no-op
+                ExecOutcome::Continue
             }
 
             // ─── Phase 8A: Shared memory + atomics ───
@@ -3707,6 +4174,31 @@ impl Interpreter {
                     offset += 1;
                 }
                 Some(String::from_utf8_lossy(&bytes).to_string())
+            }
+            Value::Int(i) => {
+                // Phase 10B: Value::Int may be a string pointer (materialized
+                // from Value::Str when passed to an I64/U64 parameter).
+                // Check opaque side-table first for the exact string.
+                if *i > 0 {
+                    if let Some(Value::Str(s)) = self.opaque_values.get(&(*i as u64)) {
+                        return Some(s.to_string());
+                    }
+                }
+                // Try loading a null-terminated string from memory
+                if *i > 0 && self.memory.is_valid_addr(*i as u64) {
+                    let mut bytes = Vec::new();
+                    let mut offset = *i as u64;
+                    for _ in 0..256 {
+                        let b = self.memory.load(offset, 1);
+                        if b[0] == 0 { break; }
+                        bytes.push(b[0]);
+                        offset += 1;
+                    }
+                    if !bytes.is_empty() {
+                        return Some(String::from_utf8_lossy(&bytes).to_string());
+                    }
+                }
+                None
             }
             _ => None,
         }

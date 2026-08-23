@@ -13,7 +13,7 @@
 make it another D, Crystal, or V — technically good, commercially irrelevant.**
 
 The project has built an impressive amount of working compiler infrastructure
-(~55,000 LOC, 36+ source files, 102/127 test parity across 3 backends, 34 stdlib
+(~68,100 LOC, 39 source files, 105/130 test parity across 3 backends, 34 stdlib
 modules, 6 backends). But it's spreading into too many domains (games,
 blockchain, robotics, medical, serverless) before it has proven it can do the
 basics better than existing languages.
@@ -59,7 +59,7 @@ Fides source
   └── Hot reload (native JIT)
 ```
 
-102/127 test parity across interpreter, PE, and C codegen is real (pre-existing failures from incomplete 8A/8B/8D features). This is more
+105/130 test parity across interpreter, PE, and C codegen is real (pre-existing failures from incomplete 8A/8B/8D features). This is more
 backends than most languages ever achieve. History lesson: **"A great runtime
 can sustain multiple languages"** — Fides's IR is its "runtime" and it supports
 many targets.
@@ -80,9 +80,9 @@ doesn't burden the language forever. Scala should have done this. C++ couldn't.
 
 ### 4. Test Infrastructure ✅
 
-- 136 unit tests
-- 7/8 harness tests
-- 102/127 interpreter + PE, 101/127 C codegen (pre-existing failures from incomplete features)
+- 200/202 unit tests
+- 6/8 harness tests
+- 105/130 interpreter + PE, 104/130 C codegen (pre-existing failures from incomplete features)
 - 22/22 expected-fail tests
 - `verify.sh` with baseline tracking
 - Golden file generation
@@ -215,10 +215,10 @@ to choose a systems language.
 ~~Multiple docs are out of sync with reality:~~
 **UPDATE Aug 2026:** Docs have been synchronized with actual state. All test
 counts, LOC, file counts, and phase numbers now match verified reality:
-- `features.md` now says "101/127 C codegen — near full parity" ✅
-- `features.md` now says "102/127 interpreter" ✅
-- `roadmap-limitations.md` now says "102/127 + 22/22 expected-fail" ✅
-- `roadmap.md` summary now says "102/127" ✅
+- `features.md` now says "104/130 C codegen — near full parity" ✅
+- `features.md` now says "105/130 interpreter" ✅
+- `roadmap-limitations.md` now says "105/130 + 22/22 expected-fail" ✅
+- `roadmap.md` summary now says "105/130" ✅
 - Phase numbers updated (self-hosting is Phase 10, ecosystem Phase 11, world class Phase 12) ✅
 
 This was a symptom of moving fast without updating all docs. The docs now
@@ -362,7 +362,7 @@ well. Cut the rest until those 3 prove the concept.
 Every doc should be updated when test counts change. ~~The current state where
 `features.md` says 76/78 but reality is 114/114 is unacceptable for a project
 that wants to be taken seriously.~~ **UPDATE Aug 2026: All docs now match
-verified reality (102/127 interpreter+PE, 101/127 C codegen, 22/22 expected-fail).**
+verified reality (105/130 interpreter+PE, 104/130 C codegen, 22/22 expected-fail).**
 
 **Recommendation:** Add a pre-commit check: run `fidesc test`, compare
 output to docs, fail if mismatch. Or at minimum, update all docs in the same
@@ -446,7 +446,7 @@ candidate:
 | Dimension | Score | Notes |
 |-----------|-------|-------|
 | Novel design space | 🟢 9/10 | Unique combination no one else has |
-| Technical execution | 🟢 8/10 | 102/127 parity, 6 backends, solid test infra |
+| Technical execution | 🟢 8/10 | 105/130 parity, 6 backends, solid test infra |
 | Scope discipline | 🔴 3/10 | Trying to do everything at once |
 | Ecosystem building | 🔴 2/10 | No users, no packages, no tooling |
 | Focus / prioritization | 🟡 5/10 | Optimizer enabled by default, but still adding features instead of fixing regalloc |

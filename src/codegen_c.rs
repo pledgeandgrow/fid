@@ -418,6 +418,7 @@ impl CCodeGen {
             ("p_string_char_at", &[p(), I64]),
             ("p_string_substring", &[p(), I64, I64]),
             ("p_to_str", &[I64]),
+            ("p_char_to_str", &[I64]),
             ("p_to_str_vec", &[p()]),
             ("p_to_str_str", &[p()]),
             ("p_to_str_bool", &[Bool]),
@@ -818,6 +819,7 @@ impl CCodeGen {
         wln!(self, "char* p_string_char_at(const char* s, int64_t idx);");
         wln!(self, "char* p_string_substring(const char* s, int64_t start, int64_t end);");
         wln!(self, "char* p_to_str(int64_t val);");
+        wln!(self, "char* p_char_to_str(int64_t val);");
         wln!(self, "char* p_to_str_vec(PVec* v);");
         wln!(self, "char* p_to_str_str(const char* s);");
         wln!(self, "char* p_to_str_bool(bool val);");
@@ -858,6 +860,21 @@ impl CCodeGen {
         wln!(self, "int64_t p_future_poll(int64_t future);");
         // Threads + atomics + mutex (Phase 8A)
         wln!(self, "int64_t p_thread_spawn(const char* func_name, int64_t num_args, ...);");
+        // Phase A1: Executor + non-blocking task poll
+        wln!(self, "int64_t p_executor_new(void);");
+        wln!(self, "int64_t p_executor_spawn(int64_t exec, const char* func_name, int64_t num_args, ...);");
+        wln!(self, "int64_t p_executor_block_on(int64_t exec, int64_t future);");
+        wln!(self, "int64_t p_task_poll(int64_t future);");
+        wln!(self, "bool p_task_is_ready(int64_t future);");
+        wln!(self, "int64_t p_executor_run_all(int64_t exec);");
+        wln!(self, "int64_t p_executor_poll_all(int64_t exec);");
+        wln!(self, "int64_t p_task_poll_nonblocking(int64_t future);");
+        // Phase A3: Non-blocking IO
+        wln!(self, "int64_t p_net_connect(const char* host, int64_t port);");
+        wln!(self, "int64_t p_net_read(int64_t sock, char* buf, int64_t len);");
+        wln!(self, "int64_t p_net_write(int64_t sock, const char* buf, int64_t len);");
+        wln!(self, "void p_net_close(int64_t sock);");
+        wln!(self, "int64_t p_fs_read_async(const char* path, char* buf, int64_t len);");
         wln!(self, "int64_t p_shared_alloc(int64_t size);");
         wln!(self, "int64_t p_atomic_load(int64_t addr);");
         wln!(self, "void p_atomic_store(int64_t addr, int64_t val);");
@@ -1967,14 +1984,18 @@ impl CCodeGen {
         // Thread join table — maps negative handle to pthread_t
         wln!(self, "static pthread_t p_thread_handles[256];");
         wln!(self, "static int p_thread_handle_count = 0;");
+        wln!(self, "static int64_t p_task_results[256];");
         wln!(self, "int64_t p_future_poll(int64_t future) {");
         wln!(self, "    if (future >= 0) return future; // eager future");
         wln!(self, "    // Thread-based future: join and get result");
         wln!(self, "    int idx = -(future + 1);");
         wln!(self, "    if (idx < 0 || idx >= p_thread_handle_count) return 0;");
+        wln!(self, "    if (p_thread_handles[idx] == 0) return p_task_results[idx]; // already joined");
         wln!(self, "    void* ret = NULL;");
         wln!(self, "    pthread_join(p_thread_handles[idx], &ret);");
-        wln!(self, "    return (int64_t)(intptr_t)ret;");
+        wln!(self, "    p_task_results[idx] = (int64_t)(intptr_t)ret;");
+        wln!(self, "    p_thread_handles[idx] = 0;");
+        wln!(self, "    return p_task_results[idx];");
         wln!(self, "}");
         // ─── Phase 8A: Threads + atomics + mutex (using pthread) ───
         wln!(self, "#include <stdatomic.h>");
@@ -1991,7 +2012,7 @@ impl CCodeGen {
         wln!(self, "        p_thread_entry_count++;");
         wln!(self, "    }");
         wln!(self, "}");
-        wln!(self, "typedef struct { int64_t (*fn)(); int64_t nargs; int64_t args[8]; } p_thread_arg_t;");
+        wln!(self, "typedef struct { int64_t (*fn)(); int64_t nargs; int64_t args[8]; atomic_int* done; } p_thread_arg_t;");
         wln!(self, "static void* p_thread_wrapper(void* arg) {");
         wln!(self, "    p_thread_arg_t* ta = (p_thread_arg_t*)arg;");
         wln!(self, "    int64_t result = 0;");
@@ -2004,7 +2025,168 @@ impl CCodeGen {
         wln!(self, "        case 3: { typedef int64_t (*f3)(void*,int64_t,int64_t,int64_t); f3 f = (f3)ta->fn; result = f(NULL, ta->args[0], ta->args[1], ta->args[2]); break; }");
         wln!(self, "        default: { typedef int64_t (*f4)(void*,int64_t,int64_t,int64_t,int64_t); f4 f = (f4)ta->fn; result = f(NULL, ta->args[0], ta->args[1], ta->args[2], ta->args[3]); break; }");
         wln!(self, "    }");
+        wln!(self, "    if (ta->done) atomic_store(ta->done, 1);");
         wln!(self, "    return (void*)(intptr_t)result;");
+        wln!(self, "}");
+        // Phase A1: Executor + non-blocking task poll
+        // Executor: just an ID — tasks are tracked via the thread handle table.
+        // Task done flags: maps future handle (negative index) to done flag.
+        wln!(self, "static atomic_int p_task_done_flags[256];");
+        wln!(self, "static int p_executor_count = 0;");
+        wln!(self, "int64_t p_executor_new(void) { return (int64_t)(p_executor_count++); }");
+        wln!(self, "int64_t p_executor_spawn(int64_t exec, const char* func_name, int64_t num_args, ...) {");
+        wln!(self, "    (void)exec;");
+        wln!(self, "    int64_t (*fn)() = NULL;");
+        wln!(self, "    for (int i = 0; i < p_thread_entry_count; i++) {");
+        wln!(self, "        if (strcmp(p_thread_entries[i].name, func_name) == 0) { fn = p_thread_entries[i].fn; break; }");
+        wln!(self, "    }");
+        wln!(self, "    if (!fn) return -1;");
+        wln!(self, "    p_thread_arg_t* ta = (p_thread_arg_t*)malloc(sizeof(p_thread_arg_t));");
+        wln!(self, "    ta->fn = fn; ta->nargs = num_args;");
+        wln!(self, "    va_list ap; va_start(ap, num_args);");
+        wln!(self, "    for (int64_t i = 0; i < num_args && i < 8; i++) ta->args[i] = va_arg(ap, int64_t);");
+        wln!(self, "    va_end(ap);");
+        wln!(self, "    int idx = p_thread_handle_count++;");
+        wln!(self, "    atomic_init(&p_task_done_flags[idx], 0);");
+        wln!(self, "    ta->done = &p_task_done_flags[idx];");
+        wln!(self, "    pthread_t tid; pthread_create(&tid, NULL, p_thread_wrapper, ta);");
+        wln!(self, "    p_thread_handles[idx] = tid;");
+        wln!(self, "    return -(int64_t)(idx + 1);");
+        wln!(self, "}");
+        wln!(self, "int64_t p_task_poll(int64_t future) {");
+        wln!(self, "    if (future >= 0) return future; // eager future");
+        wln!(self, "    int idx = -(future + 1);");
+        wln!(self, "    if (idx < 0 || idx >= p_thread_handle_count) return 0;");
+        wln!(self, "    if (p_thread_handles[idx] == 0) return p_task_results[idx]; // already joined");
+        wln!(self, "    // A1: block until done (join). A2 will add non-blocking poll.");
+        wln!(self, "    void* ret = NULL; pthread_join(p_thread_handles[idx], &ret);");
+        wln!(self, "    p_task_results[idx] = (int64_t)(intptr_t)ret;");
+        wln!(self, "    p_thread_handles[idx] = 0;");
+        wln!(self, "    return p_task_results[idx];");
+        wln!(self, "}");
+        wln!(self, "bool p_task_is_ready(int64_t future) {");
+        wln!(self, "    if (future >= 0) return true;");
+        wln!(self, "    int idx = -(future + 1);");
+        wln!(self, "    if (idx < 0 || idx >= p_thread_handle_count) return false;");
+        wln!(self, "    return atomic_load(&p_task_done_flags[idx]) != 0;");
+        wln!(self, "}");
+        wln!(self, "int64_t p_executor_block_on(int64_t exec, int64_t future) {");
+        wln!(self, "    (void)exec;");
+        wln!(self, "    return p_future_poll(future);");
+        wln!(self, "}");
+        wln!(self, "int64_t p_executor_run_all(int64_t exec) {");
+        wln!(self, "    (void)exec;");
+        wln!(self, "    int64_t count = 0;");
+        wln!(self, "    for (int i = 0; i < p_thread_handle_count; i++) {");
+        wln!(self, "        if (p_thread_handles[i] == 0) continue; // already joined");
+        wln!(self, "        void* ret = NULL; pthread_join(p_thread_handles[i], &ret);");
+        wln!(self, "        p_task_results[i] = (int64_t)(intptr_t)ret;");
+        wln!(self, "        p_thread_handles[i] = 0; count++;");
+        wln!(self, "    }");
+        wln!(self, "    return count;");
+        wln!(self, "}");
+        // A2: Non-blocking poll — returns PENDING_SENTINEL if task not done
+        wln!(self, "int64_t p_task_poll_nonblocking(int64_t future) {");
+        wln!(self, "    if (future >= 0) return future; // eager future");
+        wln!(self, "    int idx = -(future + 1);");
+        wln!(self, "    if (idx < 0 || idx >= p_thread_handle_count) return 0;");
+        wln!(self, "    if (atomic_load(&p_task_done_flags[idx]) == 0) {");
+        wln!(self, "        return (int64_t)0x8000000000000001LL; // PENDING_SENTINEL");
+        wln!(self, "    }");
+        wln!(self, "    if (p_thread_handles[idx] == 0) return p_task_results[idx]; // already joined");
+        wln!(self, "    void* ret = NULL; pthread_join(p_thread_handles[idx], &ret);");
+        wln!(self, "    p_task_results[idx] = (int64_t)(intptr_t)ret;");
+        wln!(self, "    p_thread_handles[idx] = 0;");
+        wln!(self, "    return p_task_results[idx];");
+        wln!(self, "}");
+        // A2: Non-blocking poll all — returns count of still-pending tasks
+        wln!(self, "int64_t p_executor_poll_all(int64_t exec) {");
+        wln!(self, "    (void)exec;");
+        wln!(self, "    int64_t pending = 0;");
+        wln!(self, "    for (int i = 0; i < p_thread_handle_count; i++) {");
+        wln!(self, "        if (p_thread_handles[i] == 0) continue; // already joined");
+        wln!(self, "        if (atomic_load(&p_task_done_flags[i]) == 0) { pending++; }");
+        wln!(self, "        else { void* ret = NULL; pthread_join(p_thread_handles[i], &ret); p_task_results[i] = (int64_t)(intptr_t)ret; p_thread_handles[i] = 0; }");
+        wln!(self, "    }");
+        wln!(self, "    return pending;");
+        wln!(self, "}");
+        // ─── Phase A3: Non-blocking IO (using threads for async) ───
+        // Each async IO operation spawns a thread that performs the IO
+        // and stores the result. The returned Future handle can be polled.
+        wln!(self, "#include <sys/socket.h>");
+        wln!(self, "#include <netinet/in.h>");
+        wln!(self, "#include <arpa/inet.h>");
+        wln!(self, "#include <unistd.h>");
+        wln!(self, "#include <fcntl.h>");
+        // Thread arg for async IO
+        wln!(self, "typedef struct { int64_t sock; char* buf; int64_t len; int64_t result; atomic_int* done; int op; } p_io_arg_t;");
+        wln!(self, "// op: 0=connect, 1=read, 2=write, 3=fs_read");
+        wln!(self, "static void* p_io_worker(void* arg) {");
+        wln!(self, "    p_io_arg_t* ia = (p_io_arg_t*)arg;");
+        wln!(self, "    int64_t result = 0;");
+        wln!(self, "    switch (ia->op) {");
+        wln!(self, "        case 1: { // read");
+        wln!(self, "            ssize_t n = recv((int)ia->sock, ia->buf, (size_t)ia->len, 0);");
+        wln!(self, "            result = (n < 0) ? -1 : (int64_t)n;");
+        wln!(self, "            break;");
+        wln!(self, "        }");
+        wln!(self, "        case 2: { // write");
+        wln!(self, "            ssize_t n = send((int)ia->sock, ia->buf, (size_t)ia->len, 0);");
+        wln!(self, "            result = (n < 0) ? -1 : (int64_t)n;");
+        wln!(self, "            break;");
+        wln!(self, "        }");
+        wln!(self, "        case 3: { // fs_read");
+        wln!(self, "            FILE* f = fopen((const char*)ia->sock, \"rb\");");
+        wln!(self, "            if (f) {");
+        wln!(self, "                size_t n = fread(ia->buf, 1, (size_t)ia->len, f);");
+        wln!(self, "                result = (int64_t)n;");
+        wln!(self, "                fclose(f);");
+        wln!(self, "            } else { result = -1; }");
+        wln!(self, "            break;");
+        wln!(self, "        }");
+        wln!(self, "        default: result = 0;");
+        wln!(self, "    }");
+        wln!(self, "    ia->result = result;");
+        wln!(self, "    if (ia->done) atomic_store(ia->done, 1);");
+        wln!(self, "    return (void*)(intptr_t)result;");
+        wln!(self, "}");
+        wln!(self, "// Helper: spawn an IO thread and return a Future handle");
+        wln!(self, "static int64_t p_io_spawn(int op, int64_t sock, char* buf, int64_t len) {");
+        wln!(self, "    int idx = p_thread_handle_count++;");
+        wln!(self, "    atomic_init(&p_task_done_flags[idx], 0);");
+        wln!(self, "    p_io_arg_t* ia = (p_io_arg_t*)malloc(sizeof(p_io_arg_t));");
+        wln!(self, "    ia->sock = sock; ia->buf = buf; ia->len = len; ia->result = 0;");
+        wln!(self, "    ia->done = &p_task_done_flags[idx]; ia->op = op;");
+        wln!(self, "    pthread_t tid; pthread_create(&tid, NULL, p_io_worker, ia);");
+        wln!(self, "    p_thread_handles[idx] = tid;");
+        wln!(self, "    p_task_results[idx] = 0; // will be set by p_task_poll after join");
+        wln!(self, "    return -(int64_t)(idx + 1);");
+        wln!(self, "}");
+        wln!(self, "int64_t p_net_connect(const char* host, int64_t port) {");
+        wln!(self, "    int sock = socket(AF_INET, SOCK_STREAM, 0);");
+        wln!(self, "    if (sock < 0) return -1;");
+        wln!(self, "    struct sockaddr_in addr = {0};");
+        wln!(self, "    addr.sin_family = AF_INET;");
+        wln!(self, "    addr.sin_port = htons((uint16_t)port);");
+        wln!(self, "    inet_pton(AF_INET, host, &addr.sin_addr);");
+        wln!(self, "    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {");
+        wln!(self, "        close(sock); return -1;");
+        wln!(self, "    }");
+        wln!(self, "    // Return the socket FD as an eager future (positive = ready)");
+        wln!(self, "    return (int64_t)sock;");
+        wln!(self, "}");
+        wln!(self, "int64_t p_net_read(int64_t sock, char* buf, int64_t len) {");
+        wln!(self, "    return p_io_spawn(1, sock, buf, len);");
+        wln!(self, "}");
+        wln!(self, "int64_t p_net_write(int64_t sock, const char* buf, int64_t len) {");
+        wln!(self, "    return p_io_spawn(2, sock, (char*)buf, len);");
+        wln!(self, "}");
+        wln!(self, "void p_net_close(int64_t sock) {");
+        wln!(self, "    close((int)sock);");
+        wln!(self, "}");
+        wln!(self, "int64_t p_fs_read_async(const char* path, char* buf, int64_t len) {");
+        wln!(self, "    // Use sock field to pass the path pointer (op=3 reads it as path)");
+        wln!(self, "    return p_io_spawn(3, (int64_t)(intptr_t)path, buf, len);");
         wln!(self, "}");
         wln!(self, "int64_t p_thread_spawn(const char* func_name, int64_t num_args, ...) {");
         wln!(self, "    // Look up function by name");
@@ -2022,10 +2204,12 @@ impl CCodeGen {
         wln!(self, "    va_list ap; va_start(ap, num_args);");
         wln!(self, "    for (int64_t i = 0; i < num_args && i < 8; i++) ta->args[i] = va_arg(ap, int64_t);");
         wln!(self, "    va_end(ap);");
+        wln!(self, "    int idx = p_thread_handle_count++;");
+        wln!(self, "    atomic_init(&p_task_done_flags[idx], 0);");
+        wln!(self, "    ta->done = &p_task_done_flags[idx];");
         wln!(self, "    pthread_t tid;");
         wln!(self, "    pthread_create(&tid, NULL, p_thread_wrapper, ta);");
         wln!(self, "    // Store thread handle and return negative index as Future");
-        wln!(self, "    int idx = p_thread_handle_count++;");
         wln!(self, "    p_thread_handles[idx] = tid;");
         wln!(self, "    return -(int64_t)(idx + 1);");
         wln!(self, "}");
@@ -2250,6 +2434,7 @@ impl CCodeGen {
         wln!(self, "    return result;");
         wln!(self, "}}");
         wln!(self, "char* p_to_str_str(const char* s) {{ return strdup(s); }}");
+        wln!(self, "char* p_char_to_str(int64_t val) {{ char* s = (char*)malloc(2); s[0] = (char)val; s[1] = 0; return s; }}");
         wln!(self, "char* p_to_str_bool(bool val) {{ return strdup(val ? \"true\" : \"false\"); }}");
         wln!(self, "char* p_to_str_float(double val) {{");
         wln!(self, "    char* buf = (char*)malloc(32);");

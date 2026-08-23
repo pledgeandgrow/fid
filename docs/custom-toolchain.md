@@ -232,7 +232,7 @@ Phase 6:
 - `src/codegen_c.rs` — IR → C99 source
 - `fidesc ccompile <file> -o <exe>` generates `.c`, invokes `gcc`/`clang`/`cl.exe`
 - Used when targeting platforms the native backends don't yet cover
-- Note: 101/127 test parity with interpreter — near full parity. test_phase8b fails (ECS __ecs_* not in C codegen). Pre-existing failures from incomplete features (vec math, game stdlib).
+- Note: 104/130 test parity with interpreter — near full parity. test_phase8b fails (ECS __ecs_* not in C codegen). Pre-existing failures from incomplete features (vec math, game stdlib).
 
 ---
 

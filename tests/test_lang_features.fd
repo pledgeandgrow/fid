@@ -1,0 +1,223 @@
+// Test: Priority 3 — Missing Language Features
+// Tests StringBuilder, char iteration, Vec::map/filter, recursive data structures, ByteBuffer
+
+use core;
+use vec;
+
+// ─── Recursive data structures via raw pointers ───
+// Linked list node: { data: i64, next: i64 (pointer to next node) }
+// Since Fides structs are value types, we use i64 fields to store raw pointers.
+
+pf node_create(data: i64) -> i64 {
+    pv ptr: i64 = p_malloc(16);
+    pv data_addr: i64 = ptr;
+    pv data_ptr: *mut i64 = data_addr;
+    unsafe { *data_ptr = data; }
+    pv next_addr: i64 = ptr + 8;
+    pv next_ptr: *mut i64 = next_addr;
+    unsafe { *next_ptr = 0; }
+    ret ptr;
+}
+
+pf node_get_data(node: i64) -> i64 {
+    pv data_ptr: *mut i64 = node;
+    pv data: i64 = 0;
+    unsafe { data = *data_ptr; }
+    ret data;
+}
+
+pf node_get_next(node: i64) -> i64 {
+    pv next_addr: i64 = node + 8;
+    pv next_ptr: *mut i64 = next_addr;
+    pv next: i64 = 0;
+    unsafe { next = *next_ptr; }
+    ret next;
+}
+
+pf node_set_next(node: i64, next: i64) -> void {
+    pv next_addr: i64 = node + 8;
+    pv next_ptr: *mut i64 = next_addr;
+    unsafe { *next_ptr = next; }
+}
+
+pf build_list() -> i64 {
+    pv n1: i64 = node_create(1);
+    pv n2: i64 = node_create(2);
+    pv n3: i64 = node_create(3);
+    node_set_next(n1, n2);
+    node_set_next(n2, n3);
+    ret n1;
+}
+
+pf list_sum(head: i64) -> i64 {
+    pv sum: i64 = 0;
+    pv cur: i64 = head;
+    while cur != 0 {
+        sum = sum + node_get_data(cur);
+        cur = node_get_next(cur);
+    }
+    ret sum;
+}
+
+pf list_count(head: i64) -> i64 {
+    pv count: i64 = 0;
+    pv cur: i64 = head;
+    while cur != 0 {
+        count = count + 1;
+        cur = node_get_next(cur);
+    }
+    ret count;
+}
+
+pf double(x: i64) -> i64 {
+    ret x * 2;
+}
+
+pf is_even(x: i64) -> bool {
+    ret x % 2 == 0;
+}
+
+pf main() -> i64 {
+    // ─── Test 1: StringBuilder ───
+    pv sb = StringBuilder::new();
+    sb.append_str("hello");
+    sb.append_str(" ");
+    sb.append_str("world");
+    pv result = sb.to_str();
+    print("StringBuilder: ");
+    print(result);
+    print("\n");
+    // Expected: "hello world"
+
+    pv rlen = sb.len();
+    print("  len = ");
+    print(rlen);
+    print("\n");
+    // Expected: 11
+
+    // StringBuilder with int append
+    pv sb2 = StringBuilder::new();
+    sb2.append_str("count = ");
+    sb2.append_int(42);
+    pv result2 = sb2.to_str();
+    print("StringBuilder int: ");
+    print(result2);
+    print("\n");
+    // Expected: "count = 42"
+
+    // ─── Test 2: Char iteration ───
+    // for c in str — iterates over byte values
+    pv s = "hello";
+    print("Char iteration: ");
+    for c in s {
+        print(c);
+        print(" ");
+    }
+    print("\n");
+    // Expected: 104 101 108 108 111
+
+    // Char helper functions
+    print("byte 'A' = ");
+    print(char_to_upper(97));
+    print("\n");
+    // Expected: 65
+
+    print("is_digit('5') = ");
+    print(char_is_digit(53));
+    print("\n");
+    // Expected: 1 (true)
+
+    print("is_alpha('A') = ");
+    print(char_is_alpha(65));
+    print("\n");
+    // Expected: 1 (true)
+
+    // ─── Test 3: Vec::map/filter ───
+    pv v = Vec::new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    v.push(4);
+    v.push(5);
+
+    // map: double each element
+    pv doubled = v.map(double);
+    print("map double: ");
+    pv i: i64 = 0;
+    while i < doubled.len() {
+        print(doubled.get(i));
+        print(" ");
+        i = i + 1;
+    }
+    print("\n");
+    // Expected: 2 4 6 8 10
+
+    // filter: keep even numbers
+    pv evens = v.filter(is_even);
+    print("filter even: ");
+    i = 0;
+    while i < evens.len() {
+        print(evens.get(i));
+        print(" ");
+        i = i + 1;
+    }
+    print("\n");
+    // Expected: 2 4
+
+    // fold: sum all elements
+    pv sum = v.fold(0, pf(acc: i64, x: i64) { acc + x });
+    print("fold sum: ");
+    print(sum);
+    print("\n");
+    // Expected: 15
+
+    // any: is there any element > 3?
+    pv any_gt3 = v.any(pf(x: i64) { x > 3 });
+    print("any > 3: ");
+    print(any_gt3);
+    print("\n");
+    // Expected: 1 (true)
+
+    // all: are all elements > 0?
+    pv all_pos = v.all(pf(x: i64) { x > 0 });
+    print("all > 0: ");
+    print(all_pos);
+    print("\n");
+    // Expected: 1 (true)
+
+    // ─── Test 4: Recursive data structures ───
+    pv head = build_list();
+    print("Linked list sum: ");
+    print(list_sum(head));
+    print("\n");
+    // Expected: 6 (1+2+3)
+
+    print("Linked list count: ");
+    print(list_count(head));
+    print("\n");
+    // Expected: 3
+
+    // ─── Test 5: ByteBuffer ───
+    pv buf = ByteBuffer::new(16);
+    buf.write_byte(72);   // 'H'
+    buf.write_byte(73);   // 'I'
+    buf.write_byte(33);   // '!'
+    print("ByteBuffer len: ");
+    print(buf.len());
+    print("\n");
+    // Expected: 3
+
+    print("ByteBuffer[0]: ");
+    print(buf.read_byte(0));
+    print("\n");
+    // Expected: 72
+
+    pv bstr = buf.to_str();
+    print("ByteBuffer to_str: ");
+    print(bstr);
+    print("\n");
+    // Expected: "HI!"
+
+    print("OK\n");
+    ret 0;
+}

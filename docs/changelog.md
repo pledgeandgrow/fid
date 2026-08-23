@@ -1,5 +1,35 @@
 # Fides Language Changelog
 
+## Phase 10B: HashMap/String/Vec Stdlib Migration (August 2026)
+
+### Vec, HashMap, String Migrated to Fides Stdlib
+
+- **Vec** — Previously migrated to `stdlib/core.fd` using raw pointers (`i64`
+  addresses). All Vec operations (`push`, `pop`, `get`, `set`, `insert`,
+  `remove`, `len`, `contains`, etc.) are now pure Fides functions.
+- **HashMap** — Migrated from compiler builtins (`p_map_*`) to `stdlib/core.fd`.
+  Uses open addressing with FNV-1a hashing. All operations (`insert`, `get`,
+  `contains`, `remove`, `len`, `keys`, `values`, `clear`, `clone`) are pure
+  Fides functions. `HashMap_to_str` sorts keys lexicographically for
+  deterministic output. `@wrapping` annotation used on hash functions.
+- **String** — Migrated from compiler builtins (`p_string_*`) to
+  `stdlib/core.fd`. All operations (`from`, `len`, `contains`, `starts_with`,
+  `ends_with`, `find`, `replace`, `split`, `trim`, `to_uppercase`,
+  `to_lowercase`, `parse_int`, `repeat`, etc.) are pure Fides functions.
+- **Interpreter changes** — `Value::Str` arguments materialized into memory
+  when Fides functions expect `i64` pointers. Store handler fixed to use
+  pointee type for store size (prevents 8-byte stores through `*mut u8`).
+- **C codegen changes** — `Print` instruction calls Fides `Vec_to_str`/
+  `HashMap_to_str` for formatting instead of C runtime `p_to_str_vec`/
+  `p_to_str_map`.
+- **Typechecker** — `core` module implicitly has all capabilities (allows
+  stdlib functions to call `p_panic` for bounds checks).
+- **PIR** — Graceful skip for instructions missing from `f.values` (fixes
+  `UnsafeBegin`/`UnsafeEnd` panic in `Vec_insert`/`Vec_remove`).
+- **Tests fixed** — 9 tests fixed: `test_collections`, `test_hashmap`,
+  `test_iter`, `test_print_map`, `test_regression_collections` (interp + C
+  codegen), `test_capabilities` (interp + C codegen + PE).
+
 ## Phase 8B: ECS, State Machines, Event Handlers (August 2026)
 
 ### ECS (Entity-Component-System) — F18

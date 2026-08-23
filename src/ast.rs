@@ -415,6 +415,13 @@ pub enum Stmt {
         expr: Expr,
         line: usize,
     },
+    FieldAssign {
+        object: Expr,
+        field: String,
+        op: AssignOp,
+        expr: Expr,
+        line: usize,
+    },
     Expr(Expr, usize),
     Return(Option<Expr>, usize),
     If {
@@ -552,6 +559,7 @@ impl Stmt {
             | Stmt::Assign { line, .. }
             | Stmt::IndexAssign { line, .. }
             | Stmt::DerefAssign { line, .. }
+            | Stmt::FieldAssign { line, .. }
             | Stmt::Expr(_, line)
             | Stmt::Return(_, line)
             | Stmt::If { line, .. }

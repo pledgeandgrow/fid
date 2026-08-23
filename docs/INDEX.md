@@ -3,8 +3,8 @@
 > Navigation hub for the Fides compiler. Every file in the project, grouped by
 > directory, with a one-line description. Use this to find anything fast.
 >
-> **Stats:** 38 `.rs` source files (~65,700 LOC) · 34 stdlib modules · 149 `.fd`
-> test files · 27 docs · 4 examples · 3 scripts · 2 benchmarks.
+> **Stats:** 39 `.rs` source files (~68,100 LOC) · 34 stdlib modules · 152 `.fd`
+> test files · 28 docs · 4 examples · 3 scripts · 2 benchmarks.
 
 ---
 
@@ -100,17 +100,17 @@ The front-end and middle-end pipeline: source → tokens → AST → types → I
 | File | LOC | Description |
 |------|----:|-------------|
 | [main.rs](../src/main.rs) | 1746 | CLI entry point, command dispatch, external tool invocation. |
-| [token.rs](../src/token.rs) | 234 | `TokenKind` enum — all Fides keywords and operators. |
+| [token.rs](../src/token.rs) | 261 | `TokenKind` enum — all Fides keywords and operators. |
 | [lexer.rs](../src/lexer.rs) | 535 | Tokenizer: source text → `Vec<Token>`. |
 | [ast.rs](../src/ast.rs) | 882 | AST node definitions: `Program`, `Func`, `Stmt`, `Expr`, `StructDef`, `EnumDef`, etc. |
-| [parser.rs](../src/parser.rs) | 3032 | Recursive descent parser: `Vec<Token>` → `Program`. |
-| [typechecker.rs](../src/typechecker.rs) | 5053 | Type validation, regions, effects, capabilities, traits. ⚠️ MEDIUM risk. |
+| [parser.rs](../src/parser.rs) | 3033 | Recursive descent parser: `Vec<Token>` → `Program`. |
+| [typechecker.rs](../src/typechecker.rs) | 4926 | Type validation, regions, effects, capabilities, traits. ⚠️ MEDIUM risk. |
 | [borrowck.rs](../src/borrowck.rs) | 1176 | Borrow checker (Phases 1-6): `--borrowck=off\|warn\|on`, field-wise borrows, NLL. |
-| [ir.rs](../src/ir.rs) | 1640 | SSA IR definitions: `IrModule`, `IrFunction`, `BasicBlock`, `Inst`, `IrType`. |
-| [lower.rs](../src/lower.rs) | 4700 | AST → SSA IR lowering. ⚠️ MEDIUM risk — affects all backends. |
+| [ir.rs](../src/ir.rs) | 1662 | SSA IR definitions: `IrModule`, `IrFunction`, `BasicBlock`, `Inst`, `IrType`. |
+| [lower.rs](../src/lower.rs) | 4789 | AST → SSA IR lowering. ⚠️ MEDIUM risk — affects all backends. |
 | [mono.rs](../src/mono.rs) | 1437 | Generic monomorphization — specializes generic functions per call site. |
-| [comptime.rs](../src/comptime.rs) | 1007 | Compile-time eval: constant folding, reflection, f-string interpolation. |
-| [compiler.rs](../src/compiler.rs) | 1623 | Pipeline orchestration, module resolution, stdlib auto-include. |
+| [comptime.rs](../src/comptime.rs) | 1303 | Compile-time eval: constant folding, reflection, f-string interpolation. |
+| [compiler.rs](../src/compiler.rs) | 1624 | Pipeline orchestration, module resolution, stdlib auto-include. |
 | [lsp.rs](../src/lsp.rs) | 444 | LSP server: JSON-RPC 2.0 over stdio, diagnostics, no external deps. |
 | [json.rs](../src/json.rs) | 289 | Built-in JSON parser/serializer (used by LSP, no external deps). |
 | [cparser.rs](../src/cparser.rs) | 313 | C header parser → generates Fides FFI bindings (`parse-header` command). |
@@ -123,13 +123,13 @@ IR → target output. Multiple backends: interpreter, native ELF64, PE, C, WASM,
 
 | File | LOC | Description |
 |------|----:|-------------|
-| [interp.rs](../src/interp.rs) | 3450 | IR interpreter — the reference oracle. ⚠️ LOW risk but if wrong, all backends "match" wrongly. |
-| [pir.rs](../src/pir.rs) | 2024 | PIR multi-level IR (L1/L2/L3) transforms. ⚠️ HIGH risk. |
-| [opt.rs](../src/opt.rs) | 7177 | PIR optimizer — 23 passes (const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, etc.). ⚠️ MEDIUM risk. |
+| [interp.rs](../src/interp.rs) | 3825 | IR interpreter — the reference oracle. ⚠️ LOW risk but if wrong, all backends "match" wrongly. |
+| [pir.rs](../src/pir.rs) | 2075 | PIR multi-level IR (L1/L2/L3) transforms. ⚠️ HIGH risk. |
+| [opt.rs](../src/opt.rs) | 7477 | PIR optimizer — 23 passes (const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, etc.). ⚠️ MEDIUM risk. |
 | [peephole.rs](../src/peephole.rs) | 994 | 9-pass peephole optimizer, always on in `build`. ⚠️ CRITICAL. |
-| [regalloc.rs](../src/regalloc.rs) | 1135 | Linear scan register allocator with constant rematerialization. ⚠️ CRITICAL. |
+| [regalloc.rs](../src/regalloc.rs) | 1143 | Linear scan register allocator with constant rematerialization. ⚠️ CRITICAL. |
 | [codegen_x64.rs](../src/codegen_x64.rs) | 1690 | PIR L3 → x86-64 assembly (used by `build` and `codegen`). ⚠️ HIGH risk. |
-| [codegen_c.rs](../src/codegen_c.rs) | 3117 | C codegen backend: IR → C99 source (`ccompile` command). ⚠️ HIGH risk. |
+| [codegen_c.rs](../src/codegen_c.rs) | 3151 | C codegen backend: IR → C99 source (`ccompile` command). ⚠️ HIGH risk. |
 | [codegen_arm64.rs](../src/codegen_arm64.rs) | 364 | PIR L3 → ARM64 assembly (`codegen --target arm64`). |
 | [codegen_riscv.rs](../src/codegen_riscv.rs) | 360 | PIR L3 → RISC-V assembly (`codegen --target riscv`). |
 | [codegen.rs](../src/codegen.rs) | 1121 | Legacy codegen dispatch (unused). |
@@ -213,7 +213,7 @@ imported via `use`. See `docs/features.md` for which are feature-complete.
 
 ## Tests (tests/)
 
-149 `.fd` test files (127 normal + 22 expected-fail) plus the Rust test harness.
+152 `.fd` test files (130 normal + 22 expected-fail) plus the Rust test harness.
 Run all with `./target/release/fidesc test`; verify with `./verify.sh`.
 
 ### Test Infrastructure
@@ -232,16 +232,24 @@ Run all with `./target/release/fidesc test`; verify with `./verify.sh`.
 | [golden/](../tests/golden/) | Golden output files for intermediate compiler stages (IR, PIR L1/L2/L3, codegen, peephole) — used by `bisect.sh`. Contains 15 per-test subdirectories + `.txt` golden files. |
 
 ### Top-level `.fd` Tests (selected)
-127 normal + 22 expected-fail tests covering: arithmetic, control flow,
+130 normal + 22 expected-fail tests covering: arithmetic, control flow,
 functions, strings, structs, pattern matching, enums, closures, generics,
-traits, capabilities, collections (Vec/HashMap), Option/Result, FFI, file I/O,
-async/await, borrow checking, linear types, contracts, ECS, state machines,
-serde, iterators, error chaining, conditional compilation, derive macros,
-dlopen, typed strings, raw pointers, and more.
+traits, capabilities, collections (Vec/HashMap/String), Option/Result, FFI,
+file I/O, async/await, borrow checking, linear types, contracts, ECS, state
+machines, serde, iterators, error chaining, conditional compilation, derive
+macros, dlopen, typed strings, raw pointers, and more.
 
 Expected-fail tests (22) verify that the compiler correctly *rejects* unsafe
 code: `test_*_fail` variants for banking, money, borrowck, safety, contracts,
 typed strings, init guarantees, etc.
+
+### Current Test Results (Aug 2026)
+```
+Interpreter:  105/130 normal  (+ 22/22 expected fail)
+C Codegen:    104/130 matched  (+ 22/22 expected fail)
+PE Emitter:   105/130 valid   (+ 22/22 expected fail)
+Unit tests:   200/202 passed
+```
 
 > Full test inventory: see `tests/` directory listing, or run
 > `./target/release/fidesc test` to see all test names and results.

@@ -911,24 +911,24 @@ pf HashMap_find_slot(m: i64, key: i64) -> i64 {
     pv vals_ptr_ptr: *mut i64 = m + 8;
     pv len_ptr: *mut i64 = m + 16;
 
-    pv old_cap: i64 = 0;
+    pv old_capacity: i64 = 0;
     pv old_keys: i64 = 0;
     pv old_vals: i64 = 0;
     unsafe {
-        old_cap = *cap_ptr;
+        old_capacity = *cap_ptr;
         old_keys = *keys_ptr_ptr;
         old_vals = *vals_ptr_ptr;
     }
 
-    pv new_cap: i64 = 8;
-    if old_cap > 0 { new_cap = old_cap * 2; }
+    pv new_capacity: i64 = 8;
+    if old_capacity > 0 { new_capacity = old_capacity * 2; }
 
-    pv new_keys: i64 = p_malloc(new_cap * 8);
-    pv new_vals: i64 = p_malloc(new_cap * 8);
+    pv new_keys: i64 = p_malloc(new_capacity * 8);
+    pv new_vals: i64 = p_malloc(new_capacity * 8);
 
     // Initialize new arrays to 0
     pv i: i64 = 0;
-    while i < new_cap {
+    while i < new_capacity {
         pv kaddr: i64 = new_keys + i * 8;
         pv kptr: *mut i64 = kaddr;
         pv vaddr: i64 = new_vals + i * 8;
@@ -943,7 +943,7 @@ pf HashMap_find_slot(m: i64, key: i64) -> i64 {
     // Rehash all entries
     pv count: i64 = 0;
     pv old_i: i64 = 0;
-    while old_i < old_cap {
+    while old_i < old_capacity {
         pv old_kaddr: i64 = old_keys + old_i * 8;
         pv old_kptr: *mut i64 = old_kaddr;
         pv old_key: i64 = 0;
@@ -959,9 +959,9 @@ pf HashMap_find_slot(m: i64, key: i64) -> i64 {
             }
             // Insert into new arrays
             pv hash_val: i64 = p_str_hash(old_key);
-            pv new_idx: i64 = hash_val % new_cap;
+            pv new_idx: i64 = hash_val % new_capacity;
             pv probe: i64 = 0;
-            while probe < new_cap {
+            while probe < new_capacity {
                 pv nkaddr: i64 = new_keys + new_idx * 8;
                 pv nkptr: *mut i64 = nkaddr;
                 pv nk: i64 = 0;
@@ -980,7 +980,7 @@ pf HashMap_find_slot(m: i64, key: i64) -> i64 {
                     break;
                 }
                 new_idx = new_idx + 1;
-                if new_idx >= new_cap { new_idx = 0; }
+                if new_idx >= new_capacity { new_idx = 0; }
                 probe = probe + 1;
             }
             count = count + 1;
@@ -995,7 +995,7 @@ pf HashMap_find_slot(m: i64, key: i64) -> i64 {
         *keys_ptr_ptr = new_keys;
         *vals_ptr_ptr = new_vals;
         *len_ptr = count;
-        *cap_ptr = new_cap;
+        *cap_ptr = new_capacity;
     }
 }
 
@@ -1981,4 +1981,194 @@ pub pf String_clone(s: i64) -> i64 {
 
 pub pf String_bytes(s: i64) -> i64 {
     ret p_str_length(s);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// StringBuilder — mutable string builder for efficient concatenation
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Usage:
+//   pv sb = StringBuilder::new();
+//   sb.append_str("hello");
+//   sb.append_str(" world");
+//   pv result = sb.to_str();  // "hello world"
+//   print(result);
+
+pub struct StringBuilder {
+    buf: str,
+    len: i64,
+}
+
+impl StringBuilder {
+    pub pf new() -> StringBuilder {
+        ret StringBuilder { buf: "", len: 0 };
+    }
+
+    pub pf append_str(self: StringBuilder, s: str) -> void {
+        self.buf = p_str_concat(self.buf, s);
+        self.len = self.len + String_len(s);
+    }
+
+    pub pf append_char(self: StringBuilder, c: i64) -> void {
+        self.buf = p_str_concat(self.buf, p_char_to_str(c));
+        self.len = self.len + 1;
+    }
+
+    pub pf append_int(self: StringBuilder, n: i64) -> void {
+        self.buf = p_str_concat(self.buf, p_to_str(n));
+        self.len = self.len + 1;
+    }
+
+    pub pf to_str(self: StringBuilder) -> str {
+        ret self.buf;
+    }
+
+    pub pf len(self: StringBuilder) -> i64 {
+        ret self.len;
+    }
+
+    pub pf is_empty(self: StringBuilder) -> bool {
+        ret self.len == 0;
+    }
+
+    pub pf clear(self: StringBuilder) -> void {
+        self.buf = "";
+        self.len = 0;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Char iteration helpers
+// ═══════════════════════════════════════════════════════════════════════
+
+pub pf String_byte_at(s: i64, idx: i64) -> i64 {
+    if s == 0 { ret -1; }
+    pv len: i64 = p_str_length(s);
+    if idx < 0 || idx >= len { ret -1; }
+    pv addr: i64 = s + idx;
+    pv ptr: *mut u8 = addr;
+    pv b: i64 = 0;
+    unsafe { b = *ptr; }
+    ret b;
+}
+
+pub pf String_char_count(s: i64) -> i64 {
+    ret p_str_length(s);
+}
+
+pub pf char_to_str(b: i64) -> str {
+    ret p_char_to_str(b);
+}
+
+pub pf char_is_digit(b: i64) -> bool {
+    ret b >= 48 && b <= 57;
+}
+
+pub pf char_is_alpha(b: i64) -> bool {
+    ret (b >= 65 && b <= 90) || (b >= 97 && b <= 122);
+}
+
+pub pf char_is_whitespace(b: i64) -> bool {
+    ret b == 32 || b == 9 || b == 10 || b == 13;
+}
+
+pub pf char_is_upper(b: i64) -> bool {
+    ret b >= 65 && b <= 90;
+}
+
+pub pf char_is_lower(b: i64) -> bool {
+    ret b >= 97 && b <= 122;
+}
+
+pub pf char_to_upper(b: i64) -> i64 {
+    if b >= 97 && b <= 122 { ret b - 32; }
+    ret b;
+}
+
+pub pf char_to_lower(b: i64) -> i64 {
+    if b >= 65 && b <= 90 { ret b + 32; }
+    ret b;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ByteBuffer — mutable byte array for binary data
+// ═══════════════════════════════════════════════════════════════════════
+//
+// ByteBuffer uses a Vec internally to store byte values.
+
+pub struct ByteBuffer {
+    data: Vec,
+    len: i64,
+}
+
+impl ByteBuffer {
+    pub pf new(init_cap: i64) -> ByteBuffer {
+        ret ByteBuffer { data: Vec::new(), len: 0 };
+    }
+
+    pub pf from_string(s: str) -> ByteBuffer {
+        pv buf = ByteBuffer::new(0);
+        pv slen: i64 = String_len(s);
+        pv i: i64 = 0;
+        while i < slen {
+            pv addr: i64 = s + i;
+            pv ptr: *mut u8 = addr;
+            pv b: i64 = 0;
+            unsafe { b = *ptr; }
+            buf.write_byte(b);
+            i = i + 1;
+        }
+        ret buf;
+    }
+
+    pub pf write_byte(self: ByteBuffer, b: i64) -> void {
+        self.data.push(b);
+        self.len = self.len + 1;
+    }
+
+    pub pf write_bytes(self: ByteBuffer, src: i64, count: i64) -> void {
+        pv i: i64 = 0;
+        while i < count {
+            pv src_addr: i64 = src + i;
+            pv src_ptr: *mut u8 = src_addr;
+            pv b: i64 = 0;
+            unsafe { b = *src_ptr; }
+            self.write_byte(b);
+            i = i + 1;
+        }
+    }
+
+    pub pf read_byte(self: ByteBuffer, idx: i64) -> i64 {
+        if idx < 0 || idx >= self.len { ret -1; }
+        ret self.data.get(idx);
+    }
+
+    pub pf set_byte(self: ByteBuffer, idx: i64, b: i64) -> void {
+        if idx < 0 || idx >= self.len { ret; }
+        self.data.set(idx, b);
+    }
+
+    pub pf len(self: ByteBuffer) -> i64 {
+        ret self.len;
+    }
+
+    pub pf is_empty(self: ByteBuffer) -> bool {
+        ret self.len == 0;
+    }
+
+    pub pf clear(self: ByteBuffer) -> void {
+        self.data.clear();
+        self.len = 0;
+    }
+
+    pub pf to_str(self: ByteBuffer) -> str {
+        pv result: str = "";
+        pv i: i64 = 0;
+        while i < self.len {
+            pv b: i64 = self.data.get(i);
+            result = p_str_concat(result, p_char_to_str(b));
+            i = i + 1;
+        }
+        ret result;
+    }
 }

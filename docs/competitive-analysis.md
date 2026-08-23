@@ -70,7 +70,7 @@
 | Safety | 9/10 | 10/10 | Regions + capabilities + effects + sandbox all enforced at compile time. No data race prevention yet. |
 | Flexibility | 7/10 | 10/10 | Inline assembly (x86 only), bare metal, comptime, FFI — all working. No cross-compilation, no dynamic loading, no C++ interop. |
 | Compilation | 10/10 | 10/10 | Custom IR, no LLVM, integrated linker, sub-second for small projects |
-| Ecosystem | 2/10 | 8/10 | No package manager, no crates registry, no docs generator, ~22 stdlib modules. Rust has 100k+ crates. C has everything. |
+| Ecosystem | 2/10 | 8/10 | No package manager, no crates registry, no docs generator, ~34 stdlib modules. Rust has 100k+ crates. C has everything. |
 | Metaprogramming | 8/10 | 10/10 | comptime is powerful but comptime functions can't run in all contexts. No derive macros. Reflection is comptime-only. |
 | Concurrency | 3/10 | 10/10 | Effect system tracks `!Spawn` but no real threads, no data race prevention, no channels, no async runtime. Rust's Send/Sync is proven; Go has goroutines. |
 | Developer velocity | 8/10 | 10/10 | Hot reload + persist + watch --diff are excellent. But no formatter, no linter, no debugger, no profiler, LSP is diagnostics-only (no completion, hover, goto-def). |
@@ -88,7 +88,7 @@
 > - ✅ **`watch --diff` works** — PIR L2 line diff + binary size delta on each reload
 > - ✅ **Capability-aware linking works** — `--caps` flag strips ungranted functions from binary
 > - ✅ **Optimizer enabled by default** — `--opt` on by default in `build` (use `--no-opt` to disable). `--lto` for aggressive cross-module inlining. PGO has been removed.
-> - ✅ **C codegen at 101/127 test parity** — Near full parity with interpreter. test_db no longer flaky (HashMap keys sorted). Pre-existing failures from incomplete features (ECS, vec math, game stdlib).
+> - ✅ **C codegen at 104/130 test parity** — Phase 10B: Vec/HashMap/String migrated to Fides stdlib. Pre-existing failures from incomplete features (ECS, vec math, game stdlib, file I/O, typed strings).
 > - ✅ **LSP server works** — `fidesc lsp` provides JSON-RPC over stdio with live diagnostics, no external dependencies
 > - ✅ **Generic enums/structs work** — `enum Option<T>`, `struct Foo<T>` with type parameters
 > - ✅ **5 new stdlib modules** — math, env, args, process, regex
@@ -252,7 +252,7 @@ it does.
 | Path manipulation | ✅ std::path | ✅ path/filepath | ✅ os.path | ❌ Not yet |
 | Process management | ✅ std::process | ✅ os/exec | ✅ subprocess | ⚠️ Basic (stdlib/process.fd) |
 
-**Impact:** Fides's stdlib has ~22 modules. Rust's crates.io has 100k+.
+**Impact:** Fides's stdlib has ~34 modules. Rust's crates.io has 100k+.
 Even Go's standard library is vast. For any real project, you'll need
 to build infrastructure that other languages give you for free.
 
@@ -689,7 +689,7 @@ This is Phase 5 work. Today: Rust wins. Future: Fides has a better model.
 
 | Feature | Rust | Fides |
 |---------|------|---|
-| Libraries | ✅ crates.io (100k+ crates) | ⚠️ ~22 stdlib modules, no external packages |
+| Libraries | ✅ crates.io (100k+ crates) | ⚠️ ~34 stdlib modules, no external packages |
 | Package manager | ✅ cargo (gold standard) | ❌ Not yet |
 | Documentation | ✅ docs.rs (auto-generated, hosted) | ⚠️ Markdown docs only |
 | Community | ✅ Large, active, welcoming (90k+ stars) | ❌ Just starting |
@@ -757,7 +757,7 @@ tooling.
 | Tooling | **Rust** | cargo + rustfmt + clippy + rustdoc + cargo-fuzz + criterion. Fides has none of these. |
 | Corporate backing | **Rust** | Mozilla, AWS, Google, Microsoft. Fides is independent. |
 | Community | **Rust** | Large, active, 90k+ GitHub stars. Fides is just starting. |
-| Standard library | **Rust** | Vast (collections, net, io, sync, fs, process, etc.). Fides has ~22 modules. |
+| Standard library | **Rust** | Vast (collections, net, io, sync, fs, process, etc.). Fides has ~34 modules. |
 | Error messages | **Rust** | Gold standard — detailed, helpful, with suggestions. Fides is basic. |
 | Debugging | **Rust** | Full DWARF, gdb/lldb, backtraces. Fides has no debugger. |
 | Cross-compilation | **Rust** | `cargo build --target`. Fides is manual per-target. |
@@ -909,7 +909,7 @@ threads. Fides has the effect system foundation but no runtime to back it.
 
 | Feature | Zig | Fides |
 |---------|-----|---|
-| Libraries | ⚠️ Small but growing | ⚠️ Small (~22 stdlib modules) |
+| Libraries | ⚠️ Small but growing | ⚠️ Small (~34 stdlib modules) |
 | Package manager | ⚠️ Zon (immature but exists) | ❌ Not yet |
 | Documentation | ⚠️ Growing (autodoc) | ⚠️ Markdown docs only |
 | Community | ✅ Active, passionate (30k+ stars) | ❌ Just starting |
@@ -991,7 +991,7 @@ a runtime and GC while Fides is bare-metal with manual region management.
 | Feature | Go | Fides |
 |---------|-----|-------|
 | Concurrency | ✅ Goroutines + channels (excellent, battle-tested) | ❌ No working concurrency |
-| Standard library | ✅ Vast (net, http, json, crypto, sql, encoding, etc.) | ⚠️ ~22 modules, basic |
+| Standard library | ✅ Vast (net, http, json, crypto, sql, encoding, etc.) | ⚠️ ~34 modules, basic |
 | Tooling | ✅ go fmt + go vet + gopls + pprof + delve | ❌ No formatter, linter, debugger, profiler |
 | Cross-compilation | ✅ `GOOS=x GOARCH=y go build` | ❌ Manual per-target |
 | Build speed | ✅ Fast (compiled language) | ✅ Faster (no runtime, no LLVM) |

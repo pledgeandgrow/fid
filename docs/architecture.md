@@ -557,7 +557,7 @@ The compiler includes a suite of scripts and conventions for maintaining correct
 | `src/cparser.rs` | **C header parser**: parses C `.h` files → generates Fides FFI bindings (`parse-header` command) |
 | `src/pir.rs` | **PIR**: multi-level IR (L1/L2/L3) — `IrModule` → PIR |
 | `src/comptime.rs` | **Compile-time eval**: constant folding, reflection, f-string interpolation |
-| `src/opt.rs` | **PIR optimizer**: 10 passes (const fold, CSE, DCE, inline, unroll, TCO, alias analysis, effect reorder, partial eval, vectorize). Enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive inlining. |
+| `src/opt.rs` | **PIR optimizer**: 23 passes (const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize). 22 in default pass list. Enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive cross-module inlining. |
 | `src/peephole.rs` | **9-pass peephole optimizer**: always on in `build` (redundant moves, zero idiom, branch threading, store-to-load, LEA coalescing, instruction selection) |
 | `src/regalloc.rs` | **Linear scan register allocator** (⚠️ known bug: constants clobbered by intervening instructions) |
 | `src/mono.rs` | Generic monomorphization: specializes generic functions per call site |

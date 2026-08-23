@@ -5,6 +5,7 @@ mod codegen_c;
 mod compiler;
 mod comptime;
 mod cparser;
+mod diag;
 mod interp;
 mod ir;
 mod json;
@@ -41,6 +42,28 @@ use std::fs;
 use std::process;
 
 use compiler::RunResult;
+
+/// Print a list of error strings to stderr with colored "error:" prefix.
+///
+/// If an error string is already a rendered Diag (contains "error[E" or "-->"),
+/// it's printed as-is. Otherwise, a colored "error:" prefix is added.
+fn print_errors(errors: &[String]) {
+    use std::io::IsTerminal;
+    let use_color = std::io::stderr().is_terminal();
+    crate::diag::set_color(use_color);
+
+    let red = if use_color { "\x1b[31m" } else { "" };
+    let bold = if use_color { "\x1b[1m" } else { "" };
+    let reset = if use_color { "\x1b[0m" } else { "" };
+
+    for e in errors {
+        if e.contains("error[E") || e.contains("warning[E") || e.contains("-->") {
+            eprintln!("{}", e);
+        } else {
+            eprintln!("{}{}error:{} {}", bold, red, reset, e);
+        }
+    }
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -158,9 +181,7 @@ fn main() {
                     println!("Built native executable: {} ({} bytes, zero external tools)", output, exe_bytes.len());
                 }
                 Err(errors) => {
-                    for e in errors {
-                        eprintln!("{}", e);
-                    }
+                    print_errors(&errors);
                     process::exit(1);
                 }
             }
@@ -210,9 +231,7 @@ fn main() {
                         println!("Emitted multiboot2 kernel: {} ({} bytes, boot-ready)", output, bin_bytes.len());
                     }
                     Err(errors) => {
-                        for e in errors {
-                            eprintln!("{}", e);
-                        }
+                        print_errors(&errors);
                         process::exit(1);
                     }
                 }
@@ -227,9 +246,7 @@ fn main() {
                         println!("Emitted bare-metal binary: {} ({} bytes, no stdlib, no PE headers)", output, bin_bytes.len());
                     }
                     Err(errors) => {
-                        for e in errors {
-                            eprintln!("{}", e);
-                        }
+                        print_errors(&errors);
                         process::exit(1);
                     }
                 }
@@ -243,9 +260,7 @@ fn main() {
                         println!("Emitted native executable: {} ({} bytes, no ml64.exe/link.exe)", output, pe_bytes.len());
                     }
                     Err(errors) => {
-                        for e in errors {
-                            eprintln!("{}", e);
-                        }
+                        print_errors(&errors);
                         process::exit(1);
                     }
                 }
@@ -281,9 +296,7 @@ fn main() {
                     println!("Compiled {} → {}", input, output_file);
                 }
                 Err(errors) => {
-                    for e in errors {
-                        eprintln!("{}", e);
-                    }
+                    print_errors(&errors);
                     process::exit(1);
                 }
             }
@@ -348,9 +361,7 @@ fn main() {
             match compiler::lower_to_ir(&source) {
                 Ok(ir) => println!("{}", ir),
                 Err(errors) => {
-                    for e in errors {
-                        eprintln!("{}", e);
-                    }
+                    print_errors(&errors);
                     process::exit(1);
                 }
             }
@@ -389,9 +400,7 @@ fn main() {
                     }
                 }
                 Err(errors) => {
-                    for e in errors {
-                        eprintln!("{}", e);
-                    }
+                    print_errors(&errors);
                     process::exit(1);
                 }
             }
@@ -523,9 +532,7 @@ fn main() {
                     }
                 }
                 Err(errors) => {
-                    for e in errors {
-                        eprintln!("{}", e);
-                    }
+                    print_errors(&errors);
                     process::exit(1);
                 }
             }
@@ -555,9 +562,7 @@ fn main() {
                     }
                 }
                 Err(errors) => {
-                    for e in errors {
-                        eprintln!("{}", e);
-                    }
+                    print_errors(&errors);
                     process::exit(1);
                 }
             }
@@ -588,9 +593,7 @@ fn main() {
                     }
                 }
                 Err(errors) => {
-                    for e in errors {
-                        eprintln!("{}", e);
-                    }
+                    print_errors(&errors);
                     process::exit(1);
                 }
             }
@@ -638,9 +641,7 @@ fn main() {
                         eprintln!("Panic: {}", msg);
                     }
                     Err(errors) => {
-                        for e in errors {
-                            eprintln!("{}", e);
-                        }
+                        print_errors(&errors);
                     }
                 }
                 line_num += 1;
@@ -925,9 +926,7 @@ fn main() {
                     }
                 }
                 Err(errors) => {
-                    for e in errors {
-                        eprintln!("{}", e);
-                    }
+                    print_errors(&errors);
                     process::exit(1);
                 }
             }
@@ -952,9 +951,7 @@ fn main() {
             let module = match compiler::lower_to_ir_module(&source) {
                 Ok(m) => m,
                 Err(errors) => {
-                    for e in errors {
-                        eprintln!("{}", e);
-                    }
+                    print_errors(&errors);
                     process::exit(1);
                 }
             };
@@ -1018,9 +1015,7 @@ fn main() {
             let module = match compiler::lower_to_ir_module(&source) {
                 Ok(m) => m,
                 Err(errors) => {
-                    for e in errors {
-                        eprintln!("{}", e);
-                    }
+                    print_errors(&errors);
                     process::exit(1);
                 }
             };
@@ -1102,9 +1097,7 @@ fn main() {
             let module = match compiler::lower_to_ir_module(&source) {
                 Ok(m) => m,
                 Err(errors) => {
-                    for e in errors {
-                        eprintln!("{}", e);
-                    }
+                    print_errors(&errors);
                     process::exit(1);
                 }
             };
@@ -1271,9 +1264,7 @@ fn main() {
             let module = match compiler::lower_to_ir_module(&source) {
                 Ok(m) => m,
                 Err(errors) => {
-                    for e in errors {
-                        eprintln!("{}", e);
-                    }
+                    print_errors(&errors);
                     process::exit(1);
                 }
             };
@@ -1511,9 +1502,7 @@ fn main() {
                         eprintln!("[watch] {} complete", label);
                     }
                     Err(errors) => {
-                        for e in errors {
-                            eprintln!("[watch] {}", e);
-                        }
+                        print_errors(&errors);
                     }
                 }
             };

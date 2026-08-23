@@ -5,6 +5,8 @@ pub struct Lexer {
     pos: usize,
     line: usize,
     col: usize,
+    /// Collected error messages (instead of printing directly).
+    pub errors: Vec<String>,
 }
 
 impl Lexer {
@@ -14,6 +16,7 @@ impl Lexer {
             pos: 0,
             line: 1,
             col: 1,
+            errors: Vec::new(),
         }
     }
 
@@ -267,7 +270,7 @@ impl Lexer {
                     '"' => s.push('"'),
                     '0' => s.push('\0'),
                     _ => {
-                        eprintln!("Error:{}:{}: unknown escape sequence \\{}", line, col, esc);
+                        self.errors.push(format!("Error:{}:{}: unknown escape sequence \\{}", line, col, esc));
                         s.push(esc);
                     }
                 }
@@ -298,7 +301,7 @@ impl Lexer {
         if self.pos < self.source.len() {
             self.advance(); // consume closing "
         } else {
-            eprintln!("Error:{}:{}: unterminated f-string", line, col);
+            self.errors.push(format!("Error:{}:{}: unterminated f-string", line, col));
         }
 
         Token::new(TokenKind::FString(s), line, col)
@@ -323,7 +326,7 @@ impl Lexer {
                     '"' => s.push('"'),
                     '0' => s.push('\0'),
                     _ => {
-                        eprintln!("Error:{}:{}: unknown escape sequence \\{}", line, col, esc);
+                        self.errors.push(format!("Error:{}:{}: unknown escape sequence \\{}", line, col, esc));
                         s.push(esc);
                     }
                 }
@@ -335,7 +338,7 @@ impl Lexer {
         if self.pos < self.source.len() {
             self.advance(); // consume closing "
         } else {
-            eprintln!("Error:{}:{}: unterminated string", line, col);
+            self.errors.push(format!("Error:{}:{}: unterminated string", line, col));
         }
 
         Token::new(TokenKind::StringLit(s), line, col)
@@ -525,7 +528,7 @@ impl Lexer {
             '[' => TokenKind::LBracket,
             ']' => TokenKind::RBracket,
             _ => {
-                eprintln!("Error:{}:{}: unexpected character '{}'", line, col, c);
+                self.errors.push(format!("Error:{}:{}: unexpected character '{}'", line, col, c));
                 TokenKind::Eof
             }
         };

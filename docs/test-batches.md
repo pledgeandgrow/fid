@@ -5,8 +5,8 @@ results from different backends are never confounded.
 
 ## Test Corpus
 
-All batches use the same corpus: every `.fd` file in `tests/` (149 files as of
-this writing: 127 normal + 22 expected-fail).  Tests are sorted alphabetically by filename.
+All batches use the same corpus: every `.fd` file in `tests/` (152 files as of
+this writing: 130 normal + 22 expected-fail).  Tests are sorted alphabetically by filename.
 
 ## Batches
 
@@ -18,7 +18,7 @@ this writing: 127 normal + 22 expected-fail).  Tests are sorted alphabetically b
 | Pass criterion | No panic on stderr; exit code may be non-zero |
 | What it exercises | AST → IR → tree-walking interpreter |
 | Run by | `fidesc test` (built-in) |
-| Current score | 102/127 + 22/22 expected-fail |
+| Current score | 105/130 + 22/22 expected-fail |
 
 The interpreter is the reference implementation.  A test "passes" if the
 interpreter does not panic or emit a compilation error.  Non-zero exit codes
@@ -34,7 +34,7 @@ tests (correctly rejected at compile time).
 | Pass criterion | stdout matches interpreter stdout exactly |
 | What it exercises | AST → IR → C source transpilation → external gcc |
 | Run by | `fidesc test` (built-in) |
-| Current score | 101/127 + 22/22 expected-fail (near full parity — test_phase8b fails: ECS __ecs_* not in C codegen) |
+| Current score | 104/130 + 22/22 expected-fail (Phase 10B: Vec/HashMap/String migrated to Fides stdlib) |
 
 C codegen transpiles the Fides IR to C source code and compiles it with the
 system C compiler (gcc/clang).  A test "passes" only if the executable's
@@ -49,7 +49,7 @@ parity with the interpreter — test_phase8b fails (ECS __ecs_* not in C codegen
 | Pass criterion | Emission succeeds and output file exists |
 | What it exercises | AST → IR → PE bytecode emitter |
 | Run by | `fidesc test` (built-in) |
-| Current score | 102/127 + 22/22 expected-fail |
+| Current score | 105/130 + 22/22 expected-fail |
 
 The PE (Portable Executable) emitter produces a standalone native x86-64
 executable. A test "passes" if emission succeeds and the output file is
@@ -128,9 +128,9 @@ echo "=== Results: $pass pass, $fail fail ==="
 
 | Batch | Backend | Score | Notes |
 |-------|---------|-------|-------|
-| 1 | Interpreter | 102/127 + 22/22 expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
-| 2 | C Codegen | 101/127 + 22/22 expected-fail | Near full parity — test_phase8b fails (ECS __ecs_* not in C codegen). test_db no longer flaky. |
-| 3 | PE Emitter | 102/127 + 22/22 expected-fail | Same pre-existing failures as interpreter |
+| 1 | Interpreter | 105/130 + 22/22 expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
+| 2 | C Codegen | 104/130 + 22/22 expected-fail | Phase 10B: Vec/HashMap/String migrated to Fides stdlib. |
+| 3 | PE Emitter | 105/130 + 22/22 expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
 | 4 | Native x86-64 | All tested programs match | test_collections, test_db, test_matrix_mul all FIXED (was 63/66) |
 
 ## Important Notes

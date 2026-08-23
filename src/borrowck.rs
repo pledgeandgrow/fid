@@ -252,6 +252,10 @@ impl<'tc> BorrowChecker<'tc> {
                 self.collect_var_uses_expr(ptr_expr, idx);
                 self.collect_var_uses_expr(expr, idx);
             }
+            Stmt::FieldAssign { object, expr, .. } => {
+                self.collect_var_uses_expr(object, idx);
+                self.collect_var_uses_expr(expr, idx);
+            }
             Stmt::Expr(e, _) => self.collect_var_uses_expr(e, idx),
             Stmt::Return(e, _) => {
                 if let Some(e) = e { self.collect_var_uses_expr(e, idx); }
@@ -830,6 +834,12 @@ impl<'tc> BorrowChecker<'tc> {
                 // the RHS for nested borrows. The deref itself is safe to
                 // allow (the borrow was already validated when created).
                 self.check_expr(ptr_expr);
+                self.check_expr(expr);
+                let _ = line;
+            }
+            Stmt::FieldAssign { object, field: _, op: _, expr, line } => {
+                // Writing to a struct field. Check the object and RHS for borrows.
+                self.check_expr(object);
                 self.check_expr(expr);
                 let _ = line;
             }

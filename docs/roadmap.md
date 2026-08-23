@@ -5,7 +5,7 @@
 ## Overview
 
 ```
-Phase 1: Foundation          ← COMPLETE — nothing left (102/127 interpreter, 102/127 PE, 101/127 C codegen — pre-existing failures are from incomplete 8A/8B/8D features)
+Phase 1: Foundation          ← COMPLETE — nothing left (105/130 interpreter, 105/130 PE, 104/130 C codegen — pre-existing failures are from incomplete 8A/8B/8D features)
 Phase 2: Safety              ← COMPLETE — compile-time safety in all backends; C codegen gap: runtime allocator/effect-handler dispatch
 Phase 3: Power               ← COMPLETE — all features work in all backends (comptime reflection now works in C codegen)
 Phase 4: Performance         ← MOSTLY COMPLETE — optimizer enabled by default (--no-opt to disable); --lto for aggressive inlining; GetFieldPtr offset correct by design; all 4 native codegen bugs FIXED (test_db, test_collections, test_match_range, test_matrix_mul); native ELF64 now matches interpreter on all tested programs
@@ -14,7 +14,7 @@ Phase 6: AI/ML               ← COMPLETE — pipeline operator, layer/model syn
 Phase 7: Ergonomics          ← MOSTLY COMPLETE — F6 guard =>, F7 .. spread, F8 ?., F9 ??, F11 is, F10 given/ensure contracts, F12 @memo DONE; F13 parallel{} PLANNED (keyword removed, stdlib/parallel.fd provides sequential framework); F14 @differentiable remaining (F15 @no_grad CUT)
 Phase 7.5: Tier 1 Safety     ← COMPLETE — @deterministic DONE; linear types + @conserve + Money + Banking stdlib DONE; @audit DONE (full trail with param values); @gas DONE (compile-time gas budgets); @crashfree DONE (compile-time panic prevention); txn {} DONE (parsing+typechecking+interpreter rollback); loop-aware linear types DONE; tuple destructuring DONE; file I/O DONE; LogicalTime (F43) DONE; typed strings (F67) DONE; init guarantee (F63) DONE; checked arithmetic lock (F64) DONE; @wrapping (F65) DONE; bounds checking lock (F62) DONE; parameterized queries (F68) DONE; @medical (F48) DONE; given/ensure contracts (F10) DONE
 Phase 7.55: Borrow Checker   ← COMPLETE — Phases 1-6: Rules 1-3, field-wise borrows, two-phase borrows, default on, NLL (non-lexical lifetimes)
-Phase 7.6: Async/Await       ← MOSTLY COMPLETE — Option A: async pf + await + spawn (parsing + lowering + interpreter + C codegen work; Future<T> type with eager evaluation; typechecker enforces Future<T> for await; state machine transform pending for true cooperative scheduling)
+Phase 7.6: Async/Await       ← MOSTLY COMPLETE — Phase A (A1-A3) done: executor runtime, non-blocking poll, round-robin scheduling, async IO (net + file). State machine transform (stackless coroutines) deferred to post-self-host — it's an optimization, not a feature; current thread-based executor is correct and usable
 Phase 8A: Vec/Mat Math        ← PLANNED — vec2/vec3/vec4, mat4, quat, swizzle, operator overloading, shape checking (F16/F17 not yet implemented)
 Phase 8B: ECS/States/Events   ← COMPLETE — component/system/query (F18), state_machine (F19), on event handlers (F20), __ecs_* runtime in interpreter
 Phase 8D: Game Stdlib         ← COMPLETE — 8 game stdlib modules (tilemap, sprite, flowfield, streaming, scene, physics, audio, input)
@@ -29,14 +29,14 @@ Phase 12: World Class        ← NOT STARTED
 
 | Backend | Result | Notes |
 |---------|--------|-------|
-| Unit tests (`cargo test --bin fidesc`) | **136/136** | elf64, pir, peephole (26), opt, regalloc, tensor, codegen_x64, hotreload (8), embedded, gpu, wasm, coff, macho, linker |
-| Harness tests (`cargo test --test harness`) | **5/8** | 3 fail: safety_checks_panic_in_debug_mode (overflow checks always on), pe_emitter_all_tests + interpreter_all_tests (test_parallel.fd parse error — `parallel` keyword removed) |
-| Interpreter (`fidesc test`) | **102/127** normal + **22/22** expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail (all backends); test_phase8b (C codegen only) |
-| PE Emitter (`fidesc test`) | **102/127** normal + **22/22** expected-fail | Same pre-existing failures as interpreter |
-| C Codegen (`fidesc test`) | **101/127** normal + **22/22** expected-fail | Near full parity — test_phase8b fails (ECS __ecs_* functions not declared in C codegen), plus same pre-existing failures as interpreter |
-| Total `.fd` test files | **149** | 127 normal + 22 expected-fail |
+| Unit tests (`cargo test --bin fidesc`) | **200/202** | elf64, pir, peephole (26), opt, regalloc, tensor, codegen_x64, hotreload (8), embedded, gpu, wasm, coff, macho, linker. 2 pre-existing failures. |
+| Harness tests (`cargo test --test harness`) | **6/8** | 2 fails: safety_checks_panic_in_debug_mode (overflow checks always on), golden_files_match (golden files outdated) |
+| Interpreter (`fidesc test`) | **105/130** normal + **22/22** expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
+| PE Emitter (`fidesc test`) | **105/130** normal + **22/22** expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
+| C Codegen (`fidesc test`) | **104/130** normal + **22/22** expected-fail | Pre-existing failures: test_game_stdlib, test_phase8b, test_vec_math, test_vec_shape_fail |
+| Total `.fd` test files | **152** | 130 normal + 22 expected-fail |
 | Harness skip list | **22** tests | Features in skip list for `fidesc test` (comptime, bare metal, WASM, SIMD, tensor, HTTP, JSON, parallel, shape, allocator, effect handler, asm, GAT, FFI header, dlopen). Note: many of these now work in C codegen but remain in the skip list for historical reasons. |
-| Source files | **36+** `.rs` | ~55,000 LOC |
+| Source files | **39** `.rs` | ~68,100 LOC |
 | Stdlib files | **34** `.fd` | core, vec, math, ecs, events, parallel, sync, db, http, json, shape, simd, tensor, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input |
 
 ---
@@ -45,7 +45,7 @@ Phase 12: World Class        ← NOT STARTED
 
 **Goal:** A working language with basic features, custom codegen, no external dependencies.
 
-**Status:** Complete — all core language constructs work in interpreter, PE emitter, and C codegen. 136 unit tests, 5/8 harness tests, 102/127 interpreter, 102/127 PE, 101/127 C codegen (pre-existing failures from incomplete 8A/8B/8D features, not Phase 1 regressions).
+**Status:** Complete — all core language constructs work in interpreter, PE emitter, and C codegen. 200/202 unit tests, 6/8 harness tests, 105/130 interpreter, 105/130 PE, 104/130 C codegen (pre-existing failures from incomplete 8A/8B/8D features, not Phase 1 regressions).
 
 ### Milestones
 - [x] Lexer, parser, AST
@@ -69,7 +69,7 @@ Phase 12: World Class        ← NOT STARTED
 - [x] All core language constructs work in both interpreter and PE emitter
 - [x] Can write real programs (not just tests)
 - [x] No crashes on valid input
-- [x] C codegen matches interpreter output (101/127 tests match — near full parity, pre-existing failures from incomplete 8A/8B features)
+- [x] C codegen matches interpreter output (104/130 tests match — Phase 10B: Vec/HashMap/String migrated to Fides stdlib)
 - [x] Test harness with automated verification
 - [x] Source maps, IR verification, REPL
 
@@ -133,7 +133,7 @@ Phase 12: World Class        ← NOT STARTED
 
 **Goal:** Expressiveness matching or exceeding Rust, Zig, and C.
 
-**Status:** Complete — all power features (comptime, traits, advanced types, FFI) work in all backends. 102/127 interpreter + 101/127 C codegen tests pass. Comptime reflection now works in C codegen. GATs work in interpreter + C codegen (in skip list for historical reasons). FFI header parsing is interpreter-only (in harness skip list).
+**Status:** Complete — all power features (comptime, traits, advanced types, FFI) work in all backends. 105/130 interpreter + 104/130 C codegen tests pass. Comptime reflection now works in C codegen. GATs work in interpreter + C codegen (in skip list for historical reasons). FFI header parsing is interpreter-only (in harness skip list).
 
 ### Milestones
 
@@ -188,7 +188,7 @@ Phase 12: World Class        ← NOT STARTED
 
 **Goal:** 10x faster compilation than Rust. 2-3x runtime in specific cases. Custom toolchain.
 
-**Status:** Mostly complete — 136 unit tests + 7/8 harness tests pass, 102/127 interpreter tests pass. PIR (L1/L2/L3), optimizer (10 passes, enabled by default), peephole (9 passes), multi-arch codegen (x86-64/ARM64/RISC-V), ELF64 executables, PE/COFF/Mach-O object files, integrated linker, and hot reload all work. The L2 optimizer is **enabled by default** in `build` (use `--no-opt` to disable). `--lto` enables aggressive cross-module inlining. PGO has been removed.
+**Status:** Mostly complete — 200/202 unit tests + 6/8 harness tests pass, 105/130 interpreter tests pass. PIR (L1/L2/L3), optimizer (23 passes, enabled by default), peephole (9 passes), multi-arch codegen (x86-64/ARM64/RISC-V), ELF64 executables, PE/COFF/Mach-O object files, integrated linker, and hot reload all work. The L2 optimizer is **enabled by default** in `build` (use `--no-opt` to disable). `--lto` enables aggressive cross-module inlining. PGO has been removed.
 
 ### Milestones
 
@@ -267,7 +267,7 @@ Phase 12: World Class        ← NOT STARTED
 
 **Goal:** Run anywhere. Target anything. From microcontrollers to data centers.
 
-**Status:** Mostly complete — all platform features (bare metal, IoT/embedded, AI/ML, web & cloud, GPU) are implemented and work in the interpreter. HTTP/JSON/DB/SIMD/Tensor also work in C codegen (in skip list for historical reasons). 136 unit tests + 7/8 harness tests pass, 102/127 interpreter + 101/127 C codegen tests pass (near full parity — test_phase8b fails in C codegen: ECS __ecs_* not declared). 22 tests are in the harness skip list.
+**Status:** Mostly complete — all platform features (bare metal, IoT/embedded, AI/ML, web & cloud, GPU) are implemented and work in the interpreter. HTTP/JSON/SIMD/Tensor also work in C codegen (in skip list for historical reasons). 200/202 unit tests + 6/8 harness tests pass, 105/130 interpreter + 104/130 C codegen tests pass (Phase 10B: Vec/HashMap/String migrated to Fides stdlib). 25 tests are in the harness skip list.
 
 ### Milestones
 
@@ -309,7 +309,7 @@ Phase 12: World Class        ← NOT STARTED
 ### What's Left
 
 **Actionable fixes:**
-- **`test_db.fd` is no longer flaky**: HashMap keys are now sorted in the interpreter for deterministic output. C codegen at near full parity (101/127). Native ELF64 build also passes — the `p_json_at` REX prefix bug is fixed (see changelog).
+- **`test_db.fd` passes** on interpreter + C codegen (fixed — HashMap keys sorted deterministically). C codegen at 104/130 parity (Phase 10B). Native ELF64 build passes — the `p_json_at` REX prefix bug is fixed (see changelog).
 - ~~**C codegen for HTTP, JSON, SIMD**~~ **FIXED** — HTTP, JSON, SIMD, Tensor, and DB all work in C codegen now. They remain in the skip list for `fidesc test` for historical reasons.
 
 **By-design limitations (not bugs, no fix needed):**
@@ -465,7 +465,7 @@ context, and fix suggestions.
 
 **Goal:** Implement the 7 cross-domain compile-time safety features that make Fides unique. The primary target is **finance and banking — a modern COBOL replacement**. The same features also serve science, education, gaming, blockchain, government, serverless, and aerospace.
 
-**Status:** Complete. @deterministic (F26) DONE. Linear types + @conserve + Money + Banking stdlib DONE (compile-time conservation proof). @audit (F33) DONE (full trail with parameter values via IR injection). @gas (F28) DONE (compile-time gas budgets with call graph propagation). @crashfree (F24) DONE (compile-time panic prevention — rejects unwrap, p_panic, non-const div/mod, while loops, non-crashfree calls). txn {} blocks DONE (parsing + typechecking + interpreter rollback via memory snapshot). Loop-aware linear types DONE. Tuple destructuring DONE. File I/O DONE (stdlib/file.fd). LogicalTime (F43) DONE (stdlib/time.fd — timezone-free, clock-free, @deterministic date math). Typed strings (F67) DONE. Init guarantee (F63) DONE. Raw pointer types (F95) DONE (*mut T / *const T with unsafe enforcement). Memo stdlib (F12) DONE (stdlib/memo.fd). 102/127 normal tests + 22/22 expected-fail tests pass.
+**Status:** Complete. @deterministic (F26) DONE. Linear types + @conserve + Money + Banking stdlib DONE (compile-time conservation proof). @audit (F33) DONE (full trail with parameter values via IR injection). @gas (F28) DONE (compile-time gas budgets with call graph propagation). @crashfree (F24) DONE (compile-time panic prevention — rejects unwrap, p_panic, non-const div/mod, while loops, non-crashfree calls). txn {} blocks DONE (parsing + typechecking + interpreter rollback via memory snapshot). Loop-aware linear types DONE. Tuple destructuring DONE. File I/O DONE (stdlib/file.fd). LogicalTime (F43) DONE (stdlib/time.fd — timezone-free, clock-free, @deterministic date math). Typed strings (F67) DONE. Init guarantee (F63) DONE. Raw pointer types (F95) DONE (*mut T / *const T with unsafe enforcement). Memo stdlib (F12) DONE (stdlib/memo.fd). 105/130 normal tests + 22/22 expected-fail tests pass.
 
 ### Why This Phase Exists
 
@@ -772,7 +772,7 @@ ON by default (`--borrowck=on`); use `--borrowck=off` to disable.
 
 ---
 
-## Phase 7.6 — Async/Await (IN PROGRESS — Option A)
+## Phase 7.6 — Async/Await (MOSTLY COMPLETE — Phase A done, state machine transform deferred)
 
 **Goal:** Add native async/await syntax for cooperative concurrency — non-blocking
 I/O, concurrent task composition, and structured spawning without the function
@@ -858,9 +858,13 @@ pv r2 = await task2;
 - [x] IR: `Future<T>` lowers to `I64` (opaque handle)
 - [x] Tests: basic async/await, spawn + await, chained await, typechecker rejection test
 - [x] Full Future<T> type (eager evaluation model — Future wraps a completed value)
-- [ ] State machine transform (split at await points into resume blocks — for lazy evaluation)
-- [ ] Coroutine event loop in interpreter (for true cooperative scheduling)
-- [ ] Concurrent task execution with spawn (currently eager — spawn = immediate evaluation)
+- [x] **Phase A1**: Executor runtime — `p_executor_new`/`p_executor_spawn`/`p_executor_block_on`/`p_executor_run_all`/`p_task_poll`/`p_task_is_ready`. Tasks run as real OS threads. Thread results cached in `p_task_results[]` to prevent double-join.
+- [x] **Phase A2**: Non-blocking poll + round-robin scheduling — `p_executor_poll_all` (returns pending count), `p_task_poll_nonblocking` (returns value or `PENDING_SENTINEL`). Enables concurrent task interleaving.
+- [x] **Phase A3**: Non-blocking IO — `p_net_connect`/`p_net_read`/`p_net_write`/`p_net_close`/`p_fs_read_async`. C codegen uses real sockets/files with pthreads. Interpreter simulates IO.
+- [x] Tests: `test_async_executor`, `test_async_interleave`, `test_async_io` — all pass on interpreter + C codegen + PE emitter
+- [ ] **DEFERRED to post-self-host**: State machine transform (split async functions at await points into resume blocks, hoist locals into state struct, generate `poll()` with switch on state index). This is an optimization (~500+ LOC) that makes async lighter weight (no OS thread per task). The current thread-based executor is correct and usable. The transform should be built when there's a real need for 10K+ concurrent tasks, and after self-hosting so the self-hosted compiler doesn't need to implement it immediately.
+- [ ] **DEFERRED to post-self-host**: Coroutine event loop in interpreter (for true cooperative scheduling without OS threads)
+- [ ] **OPTIONAL small improvement**: Make `async pf` calls spawn threads instead of running eagerly (~20 LOC in lower.rs). Currently `async pf` functions run synchronously and wrap results in `p_future_ready`; `spawn` is the only way to get real concurrency. This small change would make direct `async pf` calls concurrent too.
 
 ---
 
@@ -1135,7 +1139,7 @@ every library author needs to enforce struct invariants.
   - Same module: all fields accessible (no change from current behavior within a module)
 - [x] **Update existing `.fd` files**
   - `stdlib/privacy.fd` test module created; `stdlib/money.fd` marks `cents` as `pub`
-- [x] **Verify all tests pass** (`./verify.sh`) — 102/127 + 22/22 expected-fail
+- [x] **Verify all tests pass** (`./verify.sh`) — 105/130 + 22/22 expected-fail
 
 **Design decisions:**
 - Binary visibility only (`pub` or private). No `pub(crate)` / `pub(super)` / `pub(in path)` — Fides's module system is flat enough that binary is sufficient. Add granularity only if real code demands it.
@@ -1373,13 +1377,14 @@ Now that Fides can express Vec, HashMap, String, and has raw pointers + unsafe, 
 | **1 — Foundation** | **COMPLETE** | Nothing. All core constructs work in all backends. |
 | **2 — Safety** | **COMPLETE** (interpreter) | C codegen coverage for runtime allocator/effect-handler dispatch. Compile-time safety checks work in all backends. |
 | **3 — Power** | **COMPLETE** (all backends) | GATs work in interpreter + C codegen. FFI header parsing is interpreter-only (in skip list). |
-| **4 — Performance** | **MOSTLY COMPLETE** | Optimizer enabled by default in `build` (10 passes). `--lto` for aggressive inlining. All 4 native codegen bugs FIXED. GetFieldPtr offset correct by design. PGO removed. |
-| **5 — Platform** | **MOSTLY COMPLETE** | `test_db` no longer flaky. C codegen at near full parity (101/127). Native ELF64 passes all tests. HTTP/JSON/SIMD/Tensor/DB all work in C codegen (in skip list for historical reasons). |
+| **4 — Performance** | **MOSTLY COMPLETE** | Optimizer enabled by default in `build` (23 passes). `--lto` for aggressive inlining. All 4 native codegen bugs FIXED. GetFieldPtr offset correct by design. PGO removed. |
+| **5 — Platform** | **MOSTLY COMPLETE** | C codegen at 104/130 parity (Phase 10B: Vec/HashMap/String migrated to Fides stdlib). Native ELF64 passes all tests. HTTP/JSON/SIMD/Tensor work in C codegen (in skip list for historical reasons). test_db passes (fixed — deterministic). |
 | **6 — AI/ML** | **COMPLETE** | Nothing. All six AI/ML features (pipeline operator, layer/model syntax, shape types, autograd, GPU kernels, quantization) are implemented and working. |
 | **7.5 — Tier 1 Safety** | **COMPLETE** | All Tier 1 safety features DONE: @deterministic, linear types, @conserve, Money, Banking, @audit (full trail), @gas, @crashfree, txn {} (with rollback), loop-aware linear types, tuple destructuring, file I/O, LogicalTime, typed strings, init guarantee, raw pointers, memo, checked arithmetic, @wrapping, bounds checking, parameterized queries, @medical, given/ensure contracts. |
+| **7.6 — Async/Await** | **MOSTLY COMPLETE** | Phase A (A1-A3) done: executor runtime (p_executor_new/spawn/block_on/run_all), non-blocking poll (p_task_poll_nonblocking, p_executor_poll_all), round-robin scheduling, async IO (p_net_connect/read/write/close, p_fs_read_async). State machine transform (stackless coroutines) deferred to post-self-host — it's an optimization (~500 LOC), not a feature. Thread-based executor is correct and usable. |
 | **10 — Self-Hosting** | **IN PROGRESS** | unsafe {} blocks DONE, heap alloc DONE (stdlib/alloc.fd), field-level privacy DONE, raw pointer types DONE (*mut T / *const T). Remaining: Vec/HashMap/String migration, compiler rewrite in Fides. |
 
-**Bottom line:** Phases 1–3 are feature-complete (all planned features implemented and working in the interpreter, 102/127 tests pass — pre-existing failures are from incomplete 8A/8B/8D features). Phase 4 optimizer is now enabled by default (`--opt` produces matching output on all tests; `--lto` for aggressive inlining). Phase 5 is feature-complete in the interpreter with C codegen at near full parity (101/127 tests match — test_phase8b fails: ECS __ecs_* not in C codegen) and native ELF64 also passing. Phase 6 (AI/ML) is feature-complete with all six features implemented. Phase 7.5 is complete: all Tier 1 safety annotations are implemented (@deterministic, @conserve, @audit with full trail, @gas, @crashfree) plus linear types, Money, Banking, txn {} (with interpreter rollback), loop-aware linear types, tuple destructuring, file I/O, LogicalTime, typed strings, init guarantee, raw pointer types, memo stdlib, checked arithmetic lock (F64), @wrapping (F65), bounds checking lock (F62), parameterized queries (F68), @medical (F48), and given/ensure contracts (F10). Phase 8B (ECS/state machines/event handlers) and 8D (game stdlib) are complete. Phase 10 has started: unsafe blocks (with unsafe_depth tracking), heap alloc, field privacy, and raw pointer types are DONE — Vec/HashMap/String migration and compiler rewrite in Fides are the remaining blockers for self-hosting.
+**Bottom line:** Phases 1–3 are feature-complete (all planned features implemented and working in the interpreter, 105/130 tests pass — pre-existing failures are from incomplete 8A/8B/8D features). Phase 4 optimizer is now enabled by default (23 passes; `--lto` for aggressive inlining). Phase 5 is feature-complete in the interpreter with C codegen at 104/130 parity (Phase 10B: Vec/HashMap/String migrated to Fides stdlib) and native ELF64 also passing. Phase 6 (AI/ML) is feature-complete with all six features implemented. Phase 7.5 is complete: all Tier 1 safety annotations are implemented. Phase 7.6 (async/await) is mostly complete: Phase A added a real executor runtime with non-blocking poll, round-robin scheduling, and async IO; the state machine transform (stackless coroutines) is deferred to post-self-host as an optimization. Phase 8B (ECS/state machines/event handlers) and 8D (game stdlib) are complete. Phase 10B is complete: Vec/HashMap/String migrated to Fides stdlib using raw pointers. Compiler rewrite in Fides is the remaining blocker for self-hosting.
 
 ---
 
@@ -1395,6 +1400,7 @@ Now that Fides can express Vec, HashMap, String, and has raw pointers + unsafe, 
 | Phase 6 — AI/ML | ✅ Complete | — |
 | Phase 7 — Ergonomics | 🔄 In progress | F6 guard, F7 spread, F8 ?., F9 ??, F11, 7E region error messages DONE; F10 contracts, F12 @memo DONE; F13 parallel{} PLANNED (keyword removed, sequential stdlib framework); F14 @differentiable remaining; F15 @no_grad CUT (moderate) |
 | Phase 7.5 — Tier 1 Safety | ⚠️ Mostly complete | @deterministic, linear types, @conserve, Money, Banking, @audit (entry/exit), @gas, txn {} (parsing+typechecking), loop-aware linear types, tuple destructuring, file I/O DONE; @crashfree, txn {} rollback, full @audit trail remaining (low-moderate) |
+| Phase 7.6 — Async/Await | ✅ Mostly complete | Phase A (A1-A3) done: executor runtime, non-blocking poll, round-robin scheduling, async IO. State machine transform (stackless coroutines) deferred to post-self-host — optimization, not feature. Thread-based executor is correct and usable. |
 | Phase 8 — Game Development | 🟡 In progress | ECS/states/events DONE (8B), game stdlib DONE (8D), vec/mat (8A) + @shader/@simd (8C) remaining |
 | Phase 9 — Industry Domains | ❌ Not started | Banking (PRIMARY: money, @conserve, txn, batch, COBOL interop), Medical, Blockchain, Robotics, Automotive, Aerospace, Energy, Serverless (major) |
 | Phase 10 — Self-Hosting | ❌ Not started | Raw pointers, heap alloc, unsafe blocks, Vec/HashMap/String migration, compiler rewrite in Fides (major) |

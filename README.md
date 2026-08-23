@@ -10,15 +10,15 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 
 | Test Group | Result | Notes |
 |------------|:------:|-------|
-| Unit tests (`cargo test --bin fidesc`) | **136/136** | elf64, pir, peephole (26 tests), opt, regalloc, tensor, codegen_x64, hotreload (8), embedded, gpu, wasm, coff, macho, linker |
-| Harness tests (`cargo test --test harness`) | **7/8** | 1 fail: safety_checks_panic_in_debug_mode (overflow checks always on, even in release) |
-| Interpreter (`fidesc test`) | **102/127** normal + **22/22** expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail (incomplete features) |
-| PE Emitter (`fidesc test`) | **102/127** normal + **22/22** expected-fail | Same pre-existing failures as interpreter |
-| C Codegen (`fidesc test`) | **101/127** normal + **22/22** expected-fail | Near full parity — test_phase8b fails (ECS __ecs_* not in C codegen) |
-| Total `.fd` test files | **149** | 127 normal + 22 expected-fail |
-| Source files | **38** `.rs` | ~60,800 LOC |
+| Unit tests (`cargo test --bin fidesc`) | **200/202** | elf64, pir, peephole (26 tests), opt, regalloc, tensor, codegen_x64, hotreload (8), embedded, gpu, wasm, coff, macho, linker. 2 pre-existing failures. |
+| Harness tests (`cargo test --test harness`) | **6/8** | 2 fails: safety_checks_panic_in_debug_mode (overflow checks always on, even in release), golden_files_match (golden files outdated) |
+| Interpreter (`fidesc test`) | **105/130** normal + **22/22** expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
+| PE Emitter (`fidesc test`) | **105/130** normal + **22/22** expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
+| C Codegen (`fidesc test`) | **104/130** normal + **22/22** expected-fail | Phase 10B: HashMap/String/Vec migrated to Fides stdlib. test_phase8b fails (ECS __ecs_* not in C codegen) |
+| Total `.fd` test files | **152** | 130 normal + 22 expected-fail |
+| Source files | **39** `.rs` | ~68,100 LOC |
 | Stdlib modules | **34** `.fd` | core, vec, math, ecs, events, parallel, sync, db, http, json, shape, simd, tensor, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input |
-| Golden files | **58** | Expected outputs in `tests/golden/` |
+| Golden files | **148** | Expected outputs in `tests/golden/` |
 
 ### Financial Safety Features (New)
 
@@ -111,8 +111,8 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 | Region use-after-free detection | Compile-time | Compile-time | Compile-time |
 | Region escape detection | Compile-time | Compile-time | Compile-time |
 | Capability elision (zero runtime overhead) | Compile-time | Compile-time | Compile-time |
-| Bounds checking (Vec/array/string) | Runtime (debug) | Runtime (debug) | Runtime (debug) |
-| Integer overflow checking | Runtime (debug) | Runtime (debug) | Runtime (debug) |
+| Bounds checking (Vec/array/string) | Always on (F62) | Always on (F62) | Always on (F62) |
+| Integer overflow checking | Always on (F64) | Always on (F64) | Always on (F64) |
 | `Option::unwrap` panics on None | Yes | Yes | Yes |
 | Bare-metal mode (`emit --bare`) | N/A | Yes (flat binary) | N/A |
 | `comptime` blocks + reflection | Yes | Yes | Partial |
@@ -151,24 +151,24 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `async` / `await` | ✅ Works | Phase 7.6 — `async pf` declares async functions, `await <expr>` waits for Futures, eager evaluation |
+| `async` / `await` | ✅ Works | Phase 7.6 — `async pf` declares async functions, `await <expr>` waits for Futures, eager evaluation; state machine transform pending |
 | `spawn` | ✅ Works | Phase 7.6/8A — `spawn <expr>` creates OS threads via `p_thread_spawn` |
 | `#[test]` attribute | Parsed | Not yet executed by `fidesc test` |
-| `#[derive]` | Parsed | Not yet implemented |
+| `@derive` | ✅ Works | Phase 7.7 — `@derive(Debug/Clone/Serialize/Deserialize)` generates methods |
 | Effect handler continuations | Syntax works | `handle { do } with` parses and runs; full continuation semantics pending |
-| `--opt` (L2 optimizer) | Partial | Inliner fixed, but exposes pre-existing register allocator bug for complex programs. Simple programs work correctly. Not enabled by default. |
+| `--opt` (L2 optimizer) | ✅ Works | 23 passes, enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive inlining. |
 | Default arguments | Not parsed | Not yet implemented |
 | Variadic arguments | Not parsed | Not yet implemented |
 
 ### Known Limitations
 
 - **ELF64 executable emission works on Linux** — `fidesc build <file> --target x86-64` produces working ELF64 executables directly (zero external tools). `fidesc codegen --elf <out.o>` emits valid relocatable objects (readelf compatible). `fidesc codegen --macho` and `--coff` also produce valid object files.
-- **PE emitter targets Windows x64 only** — `fidesc emit` produces PE32+ executables; tested via `fidesc test` (102/127 valid + 22/22 expected-fail)
-- **Register allocator has a pre-existing bug** — linear scan allocator in `regalloc.rs` maps VRegs to physical registers, but constants not loaded into registers before use can be clobbered by intervening instructions. Exposed by the L2 optimizer's instruction reordering. Blocks enabling `--opt` by default.
+- **PE emitter targets Windows x64 only** — `fidesc emit` produces PE32+ executables; tested via `fidesc test` (105/130 valid + 22/22 expected-fail)
+- **Register allocator** — Linear scan allocator with constant rematerialization (F-1A). Effect-aware allocation (F-1D): pure/@no-alloc calls only clobber RAX. Works correctly for all passing tests.
 - **Peephole optimizer always on** — 9 passes run automatically in the `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
-- **L2 optimizer enabled by default** — PIR optimizer runs automatically in `build` (use `--no-opt` to disable) with constant folding, DCE, CSE, inlining, TCO, loop unrolling, and effect-based pure function elision. `--lto` enables aggressive cross-module inlining.
+- **L2 optimizer enabled by default** — PIR optimizer runs automatically in `build` (use `--no-opt` to disable) with 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. `--lto` enables aggressive cross-module inlining.
 - **`#[test]` attribute** — parsed but not executed by `fidesc test` (tests are file-based)
-- **C codegen coverage** — 101/127 tests match interpreter output (+ 22/22 expected-fail). Near full parity — test_phase8b fails (ECS __ecs_* not in C codegen). `test_db` is no longer flaky (HashMap keys sorted for deterministic output).
+- **C codegen coverage** — 104/130 tests match interpreter output (+ 22/22 expected-fail). Phase 10B: Vec/HashMap/String now implemented in Fides stdlib using raw pointers.
 - **~238 compiler warnings** — dead code, unused variables (cleanup needed)
 
 ---
@@ -186,8 +186,8 @@ cargo run -- build tests/hello.fd -o hello
 # Run a Fides file in the IR interpreter (fast, no external tools)
 cargo run -- run tests/hello.fd
 
-# Build with optimization (smaller binary, but may be incorrect on complex programs)
-cargo run -- build tests/hello.fd -o hello_opt --opt
+# Build with optimization (enabled by default, use --no-opt to disable)
+cargo run -- build tests/hello.fd -o hello_opt
 
 # Build via C codegen (requires gcc or clang)
 cargo run -- ccompile tests/hello.fd -o hello_c
@@ -271,11 +271,11 @@ The project includes automated verification scripts for ensuring correctness acr
 
 Current baseline:
 ```
-Unit tests:   136/136 passed
-Harness:      7/8 passed       (safety_checks_panic_in_debug_mode fails — overflow checks always on)
-Interpreter:  102/127 passed   (+ 22/22 expected fail)
-C Codegen:    101/127 matched  (near full parity — test_phase8b fails: ECS __ecs_* not in C codegen)
-PE Emitter:   102/127 valid    (+ 22/22 expected fail)
+Unit tests:   200/202 passed  (2 pre-existing failures: dse_keeps_stores_that_are_loaded, strength_reduce_does_not_apply_to_non_power)
+Harness:      6/8 passed       (2 failures: safety_checks_panic_in_debug_mode — overflow checks always on; golden_files_match — golden files outdated)
+Interpreter:  105/130 passed   (+ 22/22 expected fail)
+C Codegen:    104/130 matched   (Phase 10B: Vec/HashMap/String migrated to Fides stdlib)
+PE Emitter:   105/130 valid    (+ 22/22 expected fail)
 ```
 ```
 
@@ -603,7 +603,7 @@ See `docs/syntax-spec.md` for the complete syntax specification.
 ```
 p-lang/
 ├── Cargo.toml              # Rust project config
-├── src/                    # 38 source files, ~60,800 lines of Rust
+├── src/                    # 39 source files, ~68,100 lines of Rust
 │   ├── main.rs             # CLI entry point (23 commands: build, emit, run, codegen, ccompile, lsp, etc.)
 │   ├── token.rs            # Token kind definitions (54+ keywords)
 │   ├── lexer.rs            # Tokenizer (source → tokens)
@@ -657,14 +657,14 @@ p-lang/
 │   ├── memo.fd              # F12: Memoization helper (Memo::new, get_or_compute)
 │   ├── alloc.fd             # Heap allocation builtins (p_alloc_new, p_alloc_free)
 │   └── privacy.fd           # Field privacy test module
-├── tests/                  # 127 .fd test files + harness
+├── tests/                  # 152 .fd test files + harness
 │   ├── harness.rs          # Automated test harness (8 cargo tests)
-│   ├── *.fd                 # 107 feature tests + 16 expected-fail tests
+│   ├── *.fd                 # 107 feature tests + 22 expected-fail tests
 │   ├── safety/             # 9 bounds safety tests (OOB, overflow, div-by-zero, unwrap)
 │   ├── capability/         # 4 capability security tests (grant, deny, propagation)
 │   ├── effects/            # 7 effect system tests (annotations, inference, handlers, pure)
 │   ├── regions/            # 3 region inference tests (blocks, nesting, escape detection)
-│   └── golden/             # 58 golden file outputs for regression testing
+│   └── golden/             # 148 golden file outputs for regression testing
 ├── examples/               # 4 example programs
 │   ├── http_server.fd       # HTTP server example
 │   ├── neural_network.fd    # Neural network example
@@ -691,7 +691,7 @@ p-lang/
 
 ## Test Programs
 
-127 test files across `tests/` and subdirectories. Key tests:
+152 test files across `tests/` and subdirectories. Key tests:
 
 | Test File | What It Tests |
 |-----------|---------------|
@@ -768,8 +768,8 @@ Run all tests: `cargo test --test harness`
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (136 unit tests, 102/127 + 22/22 expected-fail integration tests) |
-| **Phase 2** | Region inference, effect system, capability security, bounds safety | **Complete** (2A ✓, 2B ✓, 2C ✓ with elision, 2D ✓; 7/8 harness tests pass) |
+| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (200/202 unit tests, 105/130 + 22/22 expected-fail integration tests) |
+| **Phase 2** | Region inference, effect system, capability security, bounds safety | **Complete** (2A ✓, 2B ✓, 2C ✓ with elision, 2D ✓; 6/8 harness tests pass) |
 | **Phase 3** | comptime, advanced traits, FFI & interop | **Complete** (3A comptime ✓, 3B traits ✓, 3C const generics + GATs ✓; 3D C FFI ✓ via `extern "C"` + `parse-header`) |
 | **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | **Mostly complete** (4A PIR ✓, 4B optimizer ✓ but disabled by default due to regalloc bug, 4C x86-64/arm64/riscv codegen + regalloc + 9 peephole passes + ELF64 executables ✓; 4D linker ✓, 4E hot reload ✓ via `fidesc watch`) |
 | **Phase 5** | Bare metal, IoT, AI/ML, web & cloud | **Mostly complete** (5A bare-metal mode ✓, 5B IoT/embedded framework ✓ `embedded.rs`, 5C AI/ML tensor ✓, 5D WASM + GPU/SPIR-V + HTTP + JSON ✓) |
