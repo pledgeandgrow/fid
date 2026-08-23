@@ -209,11 +209,51 @@ fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<
                     aggressive_comptime_stmt(s, original, errs);
                 }
             }
+            // I-5A: If condition is a literal bool, eliminate the dead branch
+            if let Expr::BoolLit(b) = cond {
+                if *b {
+                    // Replace if with then_block — but we can't replace a stmt
+                    // with a list of stmts in place. Just clear the else block.
+                    *else_block = None;
+                } else {
+                    // Replace if with else block — clear then block
+                    then_block.clear();
+                }
+            }
         }
-        Stmt::For { iterator, body, .. } => {
+        Stmt::For { var, iterator, body, .. } => {
             aggressive_comptime_expr(iterator, original, errs);
             for s in body.iter_mut() {
                 aggressive_comptime_stmt(s, original, errs);
+            }
+            // I-5D: Comptime loop unrolling — if the iterator is a Range with
+            // literal bounds and the body is small (≤ 16 statements), unroll
+            // the loop at the AST level. This makes the unrolled body available
+            // for further comptime optimization (const folding, etc.).
+            if let Expr::Range { start, end, .. } = iterator {
+                if let (Expr::IntLit(s), Expr::IntLit(e)) = (start.as_ref(), end.as_ref()) {
+                    let trip = e - s;
+                    if trip > 0 && trip <= 16 && body.len() <= 16 {
+                        // Build unrolled body: for each iteration, clone the body
+                        // with the loop variable replaced by a literal.
+                        let mut unrolled: Vec<Stmt> = Vec::new();
+                        for i in *s..*e {
+                            for s in body.iter() {
+                                let mut cloned = s.clone();
+                                replace_ident_in_stmt(&mut cloned, var, &Expr::IntLit(i));
+                                unrolled.push(cloned);
+                            }
+                        }
+                        *body = unrolled;
+                        // Replace iterator with an empty range to make the loop
+                        // a no-op (0 iterations). The optimizer will remove it.
+                        *iterator = Expr::Range {
+                            start: Box::new(Expr::IntLit(0)),
+                            end: Box::new(Expr::IntLit(0)),
+                            inclusive: false,
+                        };
+                    }
+                }
             }
         }
         Stmt::While { cond, body, .. } => {
@@ -301,6 +341,110 @@ fn is_literal(expr: &Expr) -> bool {
     matches!(expr,
         Expr::IntLit(_) | Expr::FloatLit(_) | Expr::BoolLit(_) | Expr::StringLit(_)
     )
+}
+
+/// I-5D: Replace all occurrences of an identifier in a statement with a literal.
+/// Used for comptime loop unrolling — the loop variable is replaced with the
+/// iteration value.
+fn replace_ident_in_stmt(stmt: &mut Stmt, name: &str, replacement: &Expr) {
+    match stmt {
+        Stmt::Let { expr, .. } => replace_ident_in_expr(expr, name, replacement),
+        Stmt::LetTuple { expr, .. } => replace_ident_in_expr(expr, name, replacement),
+        Stmt::Assign { expr, .. } => replace_ident_in_expr(expr, name, replacement),
+        Stmt::IndexAssign { index, expr, .. } => {
+            replace_ident_in_expr(index, name, replacement);
+            replace_ident_in_expr(expr, name, replacement);
+        }
+        Stmt::Expr(e, _) => replace_ident_in_expr(e, name, replacement),
+        Stmt::Return(opt, _) => {
+            if let Some(e) = opt {
+                replace_ident_in_expr(e, name, replacement);
+            }
+        }
+        Stmt::If { cond, then_block, else_block, .. } => {
+            replace_ident_in_expr(cond, name, replacement);
+            for s in then_block.iter_mut() {
+                replace_ident_in_stmt(s, name, replacement);
+            }
+            if let Some(eb) = else_block {
+                for s in eb.iter_mut() {
+                    replace_ident_in_stmt(s, name, replacement);
+                }
+            }
+        }
+        Stmt::For { var: v, iterator, body, .. } => {
+            // Don't replace if the loop variable shadows our target
+            if v != name {
+                replace_ident_in_expr(iterator, name, replacement);
+                for s in body.iter_mut() {
+                    replace_ident_in_stmt(s, name, replacement);
+                }
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            replace_ident_in_expr(cond, name, replacement);
+            for s in body.iter_mut() {
+                replace_ident_in_stmt(s, name, replacement);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replace_ident_in_expr(expr: &mut Expr, name: &str, replacement: &Expr) {
+    match expr {
+        Expr::Ident(n) if n == name => *expr = replacement.clone(),
+        Expr::Binary { left, right, .. } => {
+            replace_ident_in_expr(left, name, replacement);
+            replace_ident_in_expr(right, name, replacement);
+        }
+        Expr::Unary { expr: inner, .. } => replace_ident_in_expr(inner, name, replacement),
+        Expr::Call { args, .. } => {
+            for a in args.iter_mut() {
+                replace_ident_in_expr(a, name, replacement);
+            }
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            replace_ident_in_expr(receiver, name, replacement);
+            for a in args.iter_mut() {
+                replace_ident_in_expr(a, name, replacement);
+            }
+        }
+        Expr::FieldAccess { expr: inner, .. } => replace_ident_in_expr(inner, name, replacement),
+        Expr::Index { array, index } => {
+            replace_ident_in_expr(array, name, replacement);
+            replace_ident_in_expr(index, name, replacement);
+        }
+        Expr::StructLit { fields, .. } => {
+            for (_, e) in fields.iter_mut() {
+                replace_ident_in_expr(e, name, replacement);
+            }
+        }
+        Expr::If { cond, then_block, else_block, .. } => {
+            replace_ident_in_expr(cond, name, replacement);
+            for s in then_block.iter_mut() {
+                replace_ident_in_stmt(s, name, replacement);
+            }
+            if let Some(eb) = else_block {
+                for s in eb.iter_mut() {
+                    replace_ident_in_stmt(s, name, replacement);
+                }
+            }
+        }
+        Expr::Block(stmts) => {
+            for s in stmts.iter_mut() {
+                replace_ident_in_stmt(s, name, replacement);
+            }
+        }
+        Expr::Range { start, end, .. } => {
+            replace_ident_in_expr(start, name, replacement);
+            replace_ident_in_expr(end, name, replacement);
+        }
+        Expr::Ref { expr: inner, .. } => replace_ident_in_expr(inner, name, replacement),
+        Expr::Deref { expr: inner } => replace_ident_in_expr(inner, name, replacement),
+        Expr::Cast { expr: inner, .. } => replace_ident_in_expr(inner, name, replacement),
+        _ => {}
+    }
 }
 
 fn substitute_stmts(stmts: &mut [Stmt], original: &Program, errs: &mut Vec<String>) {

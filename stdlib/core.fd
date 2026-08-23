@@ -765,3 +765,1220 @@ pub pf Vec_sort(v: i64) {
         }
     }
 }
+
+// ─── HashMap (Phase 10B) ────────────────────────────────────────────────
+// Open-addressing hash map with linear probing.
+// Keys are string pointers (i64 addresses to null-terminated strings).
+// Values are i64.
+//
+// Internal layout: 32-byte heap block:
+//   offset  0: keys_ptr  (*i64)  — array of key pointers (0 = empty, -1 = tombstone)
+//   offset  8: vals_ptr  (*i64)  — array of values
+//   offset 16: len        (i64)   — number of live entries
+//   offset 24: capacity   (i64)   — size of keys/vals arrays
+
+// FNV-1a hash of a null-terminated string. s is an i64 address.
+@wrapping pf p_str_hash(s: i64) -> i64 {
+    pv hash: i64 = -3750763034362895579;
+    pv addr: i64 = s;
+    pv byte_ptr: *mut u8 = addr;
+    unsafe {
+        pv b: i64 = *byte_ptr;
+        while b != 0 {
+            hash = hash ^ b;
+            hash = hash * 1099511628211;
+            addr = addr + 1;
+            byte_ptr = addr;
+            b = *byte_ptr;
+        }
+    }
+    if hash < 0 { ret -hash; }
+    ret hash;
+}
+
+// String equality: compare two null-terminated strings byte by byte.
+// a and b are i64 addresses.
+pf p_str_equal(a: i64, b: i64) -> bool {
+    if a == b { ret true; }
+    if a == 0 { ret false; }
+    if b == 0 { ret false; }
+    pv ai: i64 = a;
+    pv bi: i64 = b;
+    pv pa: *mut u8 = ai;
+    pv pb: *mut u8 = bi;
+    unsafe {
+        pv ca: i64 = *pa;
+        pv cb: i64 = *pb;
+        while ca != 0 && cb != 0 {
+            if ca != cb { ret false; }
+            ai = ai + 1;
+            bi = bi + 1;
+            pa = ai;
+            pb = bi;
+            ca = *pa;
+            cb = *pb;
+        }
+        ret ca == cb;
+    }
+}
+
+// Compare two null-terminated strings (i64 addresses).
+// Returns <0 if a<b, 0 if equal, >0 if a>b (lexicographic).
+pf p_str_compare(a: i64, b: i64) -> i64 {
+    if a == b { ret 0; }
+    if a == 0 { ret -1; }
+    if b == 0 { ret 1; }
+    pv ai: i64 = a;
+    pv bi: i64 = b;
+    pv pa: *mut u8 = ai;
+    pv pb: *mut u8 = bi;
+    unsafe {
+        pv ca: i64 = *pa;
+        pv cb: i64 = *pb;
+        while ca != 0 && cb != 0 {
+            if ca != cb { ret ca - cb; }
+            ai = ai + 1;
+            bi = bi + 1;
+            pa = ai;
+            pb = bi;
+            ca = *pa;
+            cb = *pb;
+        }
+        ret ca - cb;
+    }
+}
+
+pub pf HashMap_new() -> i64 {
+    pv ptr: i64 = p_malloc(32);
+    pv p0: *mut i64 = ptr;
+    pv p8: *mut i64 = ptr + 8;
+    pv p16: *mut i64 = ptr + 16;
+    pv p24: *mut i64 = ptr + 24;
+    unsafe {
+        *p0 = 0;
+        *p8 = 0;
+        *p16 = 0;
+        *p24 = 0;
+    }
+    ret ptr;
+}
+
+// Find the slot index for a key. Returns the index of the key if found,
+// or the first empty/tombstone slot if not found.
+pf HashMap_find_slot(m: i64, key: i64) -> i64 {
+    pv cap_ptr: *mut i64 = m + 24;
+    pv keys_ptr_ptr: *mut i64 = m;
+    pv capacity: i64 = 0;
+    unsafe {
+        capacity = *cap_ptr;
+    }
+    if capacity == 0 { ret 0; }
+    pv keys: i64 = 0;
+    unsafe {
+        keys = *keys_ptr_ptr;
+    }
+    pv hash_val: i64 = p_str_hash(key);
+    pv idx: i64 = hash_val % capacity;
+    pv first_tombstone: i64 = -1;
+    pv i: i64 = 0;
+    while i < capacity {
+        pv key_addr: i64 = keys + idx * 8;
+        pv key_ptr: *mut i64 = key_addr;
+        pv slot_key: i64 = 0;
+        unsafe {
+            slot_key = *key_ptr;
+        }
+        if slot_key == 0 {
+            if first_tombstone >= 0 { ret first_tombstone; }
+            ret idx;
+        }
+        if slot_key == -1 {
+            if first_tombstone < 0 { first_tombstone = idx; }
+        } else if p_str_equal(slot_key, key) {
+            ret idx;
+        }
+        idx = idx + 1;
+        if idx >= capacity { idx = 0; }
+        i = i + 1;
+    }
+    if first_tombstone >= 0 { ret first_tombstone; }
+    ret 0;
+}
+
+@wrapping pf HashMap_grow(m: i64) {
+    pv cap_ptr: *mut i64 = m + 24;
+    pv keys_ptr_ptr: *mut i64 = m;
+    pv vals_ptr_ptr: *mut i64 = m + 8;
+    pv len_ptr: *mut i64 = m + 16;
+
+    pv old_cap: i64 = 0;
+    pv old_keys: i64 = 0;
+    pv old_vals: i64 = 0;
+    unsafe {
+        old_cap = *cap_ptr;
+        old_keys = *keys_ptr_ptr;
+        old_vals = *vals_ptr_ptr;
+    }
+
+    pv new_cap: i64 = 8;
+    if old_cap > 0 { new_cap = old_cap * 2; }
+
+    pv new_keys: i64 = p_malloc(new_cap * 8);
+    pv new_vals: i64 = p_malloc(new_cap * 8);
+
+    // Initialize new arrays to 0
+    pv i: i64 = 0;
+    while i < new_cap {
+        pv kaddr: i64 = new_keys + i * 8;
+        pv kptr: *mut i64 = kaddr;
+        pv vaddr: i64 = new_vals + i * 8;
+        pv vptr: *mut i64 = vaddr;
+        unsafe {
+            *kptr = 0;
+            *vptr = 0;
+        }
+        i = i + 1;
+    }
+
+    // Rehash all entries
+    pv count: i64 = 0;
+    pv old_i: i64 = 0;
+    while old_i < old_cap {
+        pv old_kaddr: i64 = old_keys + old_i * 8;
+        pv old_kptr: *mut i64 = old_kaddr;
+        pv old_key: i64 = 0;
+        unsafe {
+            old_key = *old_kptr;
+        }
+        if old_key != 0 && old_key != -1 {
+            pv old_vaddr: i64 = old_vals + old_i * 8;
+            pv old_vptr: *mut i64 = old_vaddr;
+            pv old_val: i64 = 0;
+            unsafe {
+                old_val = *old_vptr;
+            }
+            // Insert into new arrays
+            pv hash_val: i64 = p_str_hash(old_key);
+            pv new_idx: i64 = hash_val % new_cap;
+            pv probe: i64 = 0;
+            while probe < new_cap {
+                pv nkaddr: i64 = new_keys + new_idx * 8;
+                pv nkptr: *mut i64 = nkaddr;
+                pv nk: i64 = 0;
+                unsafe {
+                    nk = *nkptr;
+                }
+                if nk == 0 {
+                    unsafe {
+                        *nkptr = old_key;
+                    }
+                    pv nvaddr: i64 = new_vals + new_idx * 8;
+                    pv nvptr: *mut i64 = nvaddr;
+                    unsafe {
+                        *nvptr = old_val;
+                    }
+                    break;
+                }
+                new_idx = new_idx + 1;
+                if new_idx >= new_cap { new_idx = 0; }
+                probe = probe + 1;
+            }
+            count = count + 1;
+        }
+        old_i = old_i + 1;
+    }
+
+    if old_keys != 0 { p_free(old_keys); }
+    if old_vals != 0 { p_free(old_vals); }
+
+    unsafe {
+        *keys_ptr_ptr = new_keys;
+        *vals_ptr_ptr = new_vals;
+        *len_ptr = count;
+        *cap_ptr = new_cap;
+    }
+}
+
+pub pf HashMap_insert(m: i64, key: i64, val: i64) {
+    pv len_ptr: *mut i64 = m + 16;
+    pv cap_ptr: *mut i64 = m + 24;
+
+    pv len: i64 = 0;
+    pv capacity: i64 = 0;
+    unsafe {
+        len = *len_ptr;
+        capacity = *cap_ptr;
+    }
+
+    // Grow if load factor > 0.7
+    if capacity == 0 || len * 10 >= capacity * 7 {
+        HashMap_grow(m);
+        unsafe {
+            capacity = *cap_ptr;
+        }
+    }
+
+    pv idx: i64 = HashMap_find_slot(m, key);
+
+    pv keys_ptr_ptr: *mut i64 = m;
+    pv vals_ptr_ptr: *mut i64 = m + 8;
+    pv keys: i64 = 0;
+    pv vals: i64 = 0;
+    unsafe {
+        keys = *keys_ptr_ptr;
+        vals = *vals_ptr_ptr;
+    }
+
+    pv kaddr: i64 = keys + idx * 8;
+    pv kptr: *mut i64 = kaddr;
+    pv existing_key: i64 = 0;
+    unsafe {
+        existing_key = *kptr;
+    }
+
+    if existing_key == 0 || existing_key == -1 {
+        unsafe {
+            *kptr = key;
+        }
+        pv vaddr: i64 = vals + idx * 8;
+        pv vptr: *mut i64 = vaddr;
+        unsafe {
+            *vptr = val;
+        }
+        pv new_len: i64 = len + 1;
+        unsafe {
+            *len_ptr = new_len;
+        }
+    } else {
+        pv vaddr: i64 = vals + idx * 8;
+        pv vptr: *mut i64 = vaddr;
+        unsafe {
+            *vptr = val;
+        }
+    }
+}
+
+pub pf HashMap_get(m: i64, key: i64) -> i64 {
+    pv cap_ptr: *mut i64 = m + 24;
+    pv capacity: i64 = 0;
+    unsafe {
+        capacity = *cap_ptr;
+    }
+    if capacity == 0 { ret 0; }
+
+    pv idx: i64 = HashMap_find_slot(m, key);
+    pv keys_ptr_ptr: *mut i64 = m;
+    pv keys: i64 = 0;
+    unsafe {
+        keys = *keys_ptr_ptr;
+    }
+    pv kaddr: i64 = keys + idx * 8;
+    pv kptr: *mut i64 = kaddr;
+    pv slot_key: i64 = 0;
+    unsafe {
+        slot_key = *kptr;
+    }
+    if slot_key == 0 || slot_key == -1 { ret 0; }
+
+    pv vals_ptr_ptr: *mut i64 = m + 8;
+    pv vals: i64 = 0;
+    unsafe {
+        vals = *vals_ptr_ptr;
+    }
+    pv vaddr: i64 = vals + idx * 8;
+    pv vptr: *mut i64 = vaddr;
+    pv result: i64 = 0;
+    unsafe {
+        result = *vptr;
+    }
+    ret result;
+}
+
+pub pf HashMap_contains(m: i64, key: i64) -> bool {
+    pv cap_ptr: *mut i64 = m + 24;
+    pv capacity: i64 = 0;
+    unsafe {
+        capacity = *cap_ptr;
+    }
+    if capacity == 0 { ret false; }
+
+    pv idx: i64 = HashMap_find_slot(m, key);
+    pv keys_ptr_ptr: *mut i64 = m;
+    pv keys: i64 = 0;
+    unsafe {
+        keys = *keys_ptr_ptr;
+    }
+    pv kaddr: i64 = keys + idx * 8;
+    pv kptr: *mut i64 = kaddr;
+    pv slot_key: i64 = 0;
+    unsafe {
+        slot_key = *kptr;
+    }
+    ret slot_key != 0 && slot_key != -1;
+}
+
+pub pf HashMap_remove(m: i64, key: i64) {
+    pv cap_ptr: *mut i64 = m + 24;
+    pv len_ptr: *mut i64 = m + 16;
+    pv capacity: i64 = 0;
+    unsafe {
+        capacity = *cap_ptr;
+    }
+    if capacity == 0 { ret; }
+
+    pv idx: i64 = HashMap_find_slot(m, key);
+    pv keys_ptr_ptr: *mut i64 = m;
+    pv keys: i64 = 0;
+    unsafe {
+        keys = *keys_ptr_ptr;
+    }
+    pv kaddr: i64 = keys + idx * 8;
+    pv kptr: *mut i64 = kaddr;
+    pv slot_key: i64 = 0;
+    unsafe {
+        slot_key = *kptr;
+    }
+    if slot_key == 0 || slot_key == -1 { ret; }
+
+    unsafe {
+        *kptr = -1;
+    }
+    pv len: i64 = 0;
+    unsafe {
+        len = *len_ptr;
+    }
+    pv new_len: i64 = len - 1;
+    unsafe {
+        *len_ptr = new_len;
+    }
+}
+
+pub pf HashMap_len(m: i64) -> i64 {
+    pv len_ptr: *mut i64 = m + 16;
+    pv result: i64 = 0;
+    unsafe {
+        result = *len_ptr;
+    }
+    ret result;
+}
+
+pub pf HashMap_is_empty(m: i64) -> bool {
+    pv len_ptr: *mut i64 = m + 16;
+    pv len: i64 = 0;
+    unsafe {
+        len = *len_ptr;
+    }
+    ret len == 0;
+}
+
+pub pf HashMap_clear(m: i64) {
+    pv len_ptr: *mut i64 = m + 16;
+    unsafe {
+        *len_ptr = 0;
+    }
+    pv keys_ptr_ptr: *mut i64 = m;
+    pv cap_ptr: *mut i64 = m + 24;
+    pv keys: i64 = 0;
+    pv capacity: i64 = 0;
+    unsafe {
+        keys = *keys_ptr_ptr;
+        capacity = *cap_ptr;
+    }
+    if keys != 0 && capacity > 0 {
+        pv i: i64 = 0;
+        while i < capacity {
+            pv kaddr: i64 = keys + i * 8;
+            pv kptr: *mut i64 = kaddr;
+            unsafe {
+                *kptr = 0;
+            }
+            i = i + 1;
+        }
+    }
+}
+
+pub pf HashMap_keys(m: i64) -> i64 {
+    pv cap_ptr: *mut i64 = m + 24;
+    pv keys_ptr_ptr: *mut i64 = m;
+    pv capacity: i64 = 0;
+    pv keys: i64 = 0;
+    unsafe {
+        capacity = *cap_ptr;
+        keys = *keys_ptr_ptr;
+    }
+    pv result: i64 = Vec_new();
+    if keys == 0 || capacity == 0 { ret result; }
+    pv i: i64 = 0;
+    while i < capacity {
+        pv kaddr: i64 = keys + i * 8;
+        pv kptr: *mut i64 = kaddr;
+        pv slot_key: i64 = 0;
+        unsafe {
+            slot_key = *kptr;
+        }
+        if slot_key != 0 && slot_key != -1 {
+            Vec_push(result, slot_key);
+        }
+        i = i + 1;
+    }
+    ret result;
+}
+
+pub pf HashMap_values(m: i64) -> i64 {
+    pv cap_ptr: *mut i64 = m + 24;
+    pv keys_ptr_ptr: *mut i64 = m;
+    pv vals_ptr_ptr: *mut i64 = m + 8;
+    pv capacity: i64 = 0;
+    pv keys: i64 = 0;
+    pv vals: i64 = 0;
+    unsafe {
+        capacity = *cap_ptr;
+        keys = *keys_ptr_ptr;
+        vals = *vals_ptr_ptr;
+    }
+    pv result: i64 = Vec_new();
+    if keys == 0 || capacity == 0 { ret result; }
+    pv i: i64 = 0;
+    while i < capacity {
+        pv kaddr: i64 = keys + i * 8;
+        pv kptr: *mut i64 = kaddr;
+        pv slot_key: i64 = 0;
+        unsafe {
+            slot_key = *kptr;
+        }
+        if slot_key != 0 && slot_key != -1 {
+            pv vaddr: i64 = vals + i * 8;
+            pv vptr: *mut i64 = vaddr;
+            pv val: i64 = 0;
+            unsafe {
+                val = *vptr;
+            }
+            Vec_push(result, val);
+        }
+        i = i + 1;
+    }
+    ret result;
+}
+
+pub pf HashMap_clone(m: i64) -> i64 {
+    pv result: i64 = HashMap_new();
+    pv cap_ptr: *mut i64 = m + 24;
+    pv keys_ptr_ptr: *mut i64 = m;
+    pv vals_ptr_ptr: *mut i64 = m + 8;
+    pv capacity: i64 = 0;
+    pv keys: i64 = 0;
+    pv vals: i64 = 0;
+    unsafe {
+        capacity = *cap_ptr;
+        keys = *keys_ptr_ptr;
+        vals = *vals_ptr_ptr;
+    }
+    if keys == 0 || capacity == 0 { ret result; }
+    pv i: i64 = 0;
+    while i < capacity {
+        pv kaddr: i64 = keys + i * 8;
+        pv kptr: *mut i64 = kaddr;
+        pv slot_key: i64 = 0;
+        unsafe {
+            slot_key = *kptr;
+        }
+        if slot_key != 0 && slot_key != -1 {
+            pv vaddr: i64 = vals + i * 8;
+            pv vptr: *mut i64 = vaddr;
+            pv val: i64 = 0;
+            unsafe {
+                val = *vptr;
+            }
+            HashMap_insert(result, slot_key, val);
+        }
+        i = i + 1;
+    }
+    ret result;
+}
+
+pub pf HashMap_get_or(m: i64, key: i64, default: i64) -> i64 {
+    pv cap_ptr: *mut i64 = m + 24;
+    pv capacity: i64 = 0;
+    unsafe {
+        capacity = *cap_ptr;
+    }
+    if capacity == 0 { ret default; }
+
+    pv idx: i64 = HashMap_find_slot(m, key);
+    pv keys_ptr_ptr: *mut i64 = m;
+    pv keys: i64 = 0;
+    unsafe {
+        keys = *keys_ptr_ptr;
+    }
+    pv kaddr: i64 = keys + idx * 8;
+    pv kptr: *mut i64 = kaddr;
+    pv slot_key: i64 = 0;
+    unsafe {
+        slot_key = *kptr;
+    }
+    if slot_key == 0 || slot_key == -1 { ret default; }
+
+    pv vals_ptr_ptr: *mut i64 = m + 8;
+    pv vals: i64 = 0;
+    unsafe {
+        vals = *vals_ptr_ptr;
+    }
+    pv vaddr: i64 = vals + idx * 8;
+    pv vptr: *mut i64 = vaddr;
+    pv result: i64 = 0;
+    unsafe {
+        result = *vptr;
+    }
+    ret result;
+}
+
+// Format a HashMap as "{key: val, key: val}".
+// Keys and values are assumed to be string pointers (i64 addresses).
+// Keys are sorted lexicographically for deterministic output.
+pub pf HashMap_to_str(m: i64) -> str {
+    pv keys: i64 = HashMap_keys(m);
+    pv len: i64 = Vec_len(keys);
+
+    // Sort keys lexicographically (simple bubble sort)
+    pv i: i64 = 0;
+    while i < len {
+        pv j: i64 = 0;
+        while j + 1 < len - i {
+            pv k1: i64 = Vec_get(keys, j);
+            pv k2: i64 = Vec_get(keys, j + 1);
+            if p_str_compare(k1, k2) > 0 {
+                Vec_set(keys, j, k2);
+                Vec_set(keys, j + 1, k1);
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    pv result: str = "{";
+    i = 0;
+    while i < len {
+        if i > 0 {
+            result = p_str_concat(result, ", ");
+        }
+        pv key: i64 = Vec_get(keys, i);
+        pv val: i64 = HashMap_get(m, key);
+        // Read key string from memory
+        pv key_str: *mut u8 = p_str_from_ptr(key);
+        result = p_str_concat(result, key_str);
+        result = p_str_concat(result, ": ");
+        // Value is an i64 — format as number
+        result = p_str_concat(result, p_to_str(val));
+        i = i + 1;
+    }
+    result = p_str_concat(result, "}");
+    ret result;
+}
+
+// ─── String (Phase 10B) ─────────────────────────────────────────────────
+// Strings are null-terminated byte buffers (i64 pointer to first byte).
+// All operations allocate new strings (immutable semantics).
+// String value is an i64 pointer to a null-terminated char array.
+
+// Read a null-terminated string from a raw pointer (i64 address) and
+// return it as a *mut u8 pointer to a new copy.
+pf p_str_from_ptr(s: i64) -> *mut u8 {
+    if s == 0 {
+        pv empty: i64 = p_malloc(1);
+        pv eptr: *mut u8 = empty;
+        unsafe { *eptr = 0; }
+        ret eptr;
+    }
+    pv addr: i64 = s;
+    pv ptr: *mut u8 = addr;
+    pv len: i64 = 0;
+    unsafe {
+        pv b: i64 = *ptr;
+        while b != 0 {
+            len = len + 1;
+            addr = addr + 1;
+            ptr = addr;
+            b = *ptr;
+        }
+    }
+    // Allocate and copy
+    pv result: i64 = p_malloc(len + 1);
+    pv dst: *mut u8 = result;
+    pv src_addr: i64 = s;
+    pv src_ptr: *mut u8 = src_addr;
+    unsafe {
+        pv i: i64 = 0;
+        while i < len {
+            pv ch: i64 = *src_ptr;
+            *dst = ch;
+            i = i + 1;
+            src_addr = src_addr + 1;
+            src_ptr = src_addr;
+            pv dst_addr: i64 = dst;
+            dst_addr = dst_addr + 1;
+            dst = dst_addr;
+        }
+        *dst = 0;
+    }
+    pv result_ptr: *mut u8 = result;
+    ret result_ptr;
+}
+
+// strlen: count bytes until null terminator. s is an i64 address.
+pf p_str_length(s: i64) -> i64 {
+    if s == 0 { ret 0; }
+    pv addr: i64 = s;
+    pv ptr: *mut u8 = addr;
+    pv count: i64 = 0;
+    unsafe {
+        pv b: i64 = *ptr;
+        while b != 0 {
+            count = count + 1;
+            addr = addr + 1;
+            ptr = addr;
+            b = *ptr;
+        }
+    }
+    ret count;
+}
+
+// str_copy_n: copy n bytes from src to dst. Both are i64 addresses.
+pf p_str_copy_n(dst: i64, src: i64, n: i64) {
+    pv di: i64 = dst;
+    pv si: i64 = src;
+    pv i: i64 = 0;
+    while i < n {
+        pv d_ptr: *mut u8 = di;
+        pv s_ptr: *mut u8 = si;
+        unsafe {
+            pv b: i64 = *s_ptr;
+            *d_ptr = b;
+        }
+        di = di + 1;
+        si = si + 1;
+        i = i + 1;
+    }
+}
+
+pub pf String_from(s: i64) -> i64 {
+    if s == 0 {
+        pv result: i64 = p_malloc(1);
+        pv ptr: *mut u8 = result;
+        unsafe { *ptr = 0; }
+        ret result;
+    }
+    pv len: i64 = p_str_length(s);
+    pv result: i64 = p_malloc(len + 1);
+    p_str_copy_n(result, s, len);
+    pv end_addr: i64 = result + len;
+    pv end_ptr: *mut u8 = end_addr;
+    unsafe { *end_ptr = 0; }
+    ret result;
+}
+
+pub pf String_len(s: i64) -> i64 {
+    ret p_str_length(s);
+}
+
+pub pf String_is_empty(s: i64) -> bool {
+    if s == 0 { ret true; }
+    pv ptr: *mut u8 = s;
+    pv b: i64 = 0;
+    unsafe { b = *ptr; }
+    ret b == 0;
+}
+
+pub pf String_push_str(s: i64, other: i64) -> i64 {
+    pv s_len: i64 = p_str_length(s);
+    pv o_len: i64 = p_str_length(other);
+    pv result: i64 = p_malloc(s_len + o_len + 1);
+    p_str_copy_n(result, s, s_len);
+    p_str_copy_n(result + s_len, other, o_len);
+    pv end_addr: i64 = result + s_len + o_len;
+    pv end_ptr: *mut u8 = end_addr;
+    unsafe { *end_ptr = 0; }
+    ret result;
+}
+
+pub pf String_contains(s: i64, sub: i64) -> bool {
+    if s == 0 || sub == 0 { ret false; }
+    pv s_len: i64 = p_str_length(s);
+    pv sub_len: i64 = p_str_length(sub);
+    if sub_len == 0 { ret true; }
+    if sub_len > s_len { ret false; }
+    pv i: i64 = 0;
+    while i <= s_len - sub_len {
+        pv matched: bool = true;
+        pv j: i64 = 0;
+        while j < sub_len {
+            pv s_addr: i64 = s + i + j;
+            pv sub_addr: i64 = sub + j;
+            pv s_ptr: *mut u8 = s_addr;
+            pv sub_ptr: *mut u8 = sub_addr;
+            pv s_byte: i64 = 0;
+            pv sub_byte: i64 = 0;
+            unsafe {
+                s_byte = *s_ptr;
+                sub_byte = *sub_ptr;
+            }
+            if s_byte != sub_byte {
+                matched = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if matched { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub pf String_starts_with(s: i64, prefix: i64) -> bool {
+    if s == 0 || prefix == 0 { ret false; }
+    pv s_len: i64 = p_str_length(s);
+    pv p_len: i64 = p_str_length(prefix);
+    if p_len > s_len { ret false; }
+    pv i: i64 = 0;
+    while i < p_len {
+        pv s_addr: i64 = s + i;
+        pv p_addr: i64 = prefix + i;
+        pv s_ptr: *mut u8 = s_addr;
+        pv p_ptr: *mut u8 = p_addr;
+        pv s_byte: i64 = 0;
+        pv p_byte: i64 = 0;
+        unsafe {
+            s_byte = *s_ptr;
+            p_byte = *p_ptr;
+        }
+        if s_byte != p_byte { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub pf String_ends_with(s: i64, suffix: i64) -> bool {
+    if s == 0 || suffix == 0 { ret false; }
+    pv s_len: i64 = p_str_length(s);
+    pv suf_len: i64 = p_str_length(suffix);
+    if suf_len > s_len { ret false; }
+    if suf_len == 0 { ret true; }
+    pv offset: i64 = s_len - suf_len;
+    pv i: i64 = 0;
+    while i < suf_len {
+        pv s_addr: i64 = s + offset + i;
+        pv suf_addr: i64 = suffix + i;
+        pv s_ptr: *mut u8 = s_addr;
+        pv suf_ptr: *mut u8 = suf_addr;
+        pv s_byte: i64 = 0;
+        pv suf_byte: i64 = 0;
+        unsafe {
+            s_byte = *s_ptr;
+            suf_byte = *suf_ptr;
+        }
+        if s_byte != suf_byte { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub pf String_trim(s: i64) -> i64 {
+    if s == 0 {
+        pv result: i64 = p_malloc(1);
+        pv ptr: *mut u8 = result;
+        unsafe { *ptr = 0; }
+        ret result;
+    }
+    pv len: i64 = p_str_length(s);
+    pv start: i64 = 0;
+    pv end: i64 = len;
+    // Find first non-whitespace
+    pv addr: i64 = s;
+    pv ptr: *mut u8 = addr;
+    unsafe {
+        pv b: i64 = *ptr;
+        while b == 32 || b == 9 || b == 10 || b == 13 {
+            start = start + 1;
+            addr = addr + 1;
+            ptr = addr;
+            b = *ptr;
+        }
+    }
+    if start >= end {
+        pv result: i64 = p_malloc(1);
+        pv rptr: *mut u8 = result;
+        unsafe { *rptr = 0; }
+        ret result;
+    }
+    // Find last non-whitespace
+    pv end_addr: i64 = s + end - 1;
+    pv eptr: *mut u8 = end_addr;
+    unsafe {
+        pv b: i64 = *eptr;
+        while b == 32 || b == 9 || b == 10 || b == 13 {
+            end = end - 1;
+            if end <= start { break; }
+            end_addr = s + end - 1;
+            eptr = end_addr;
+            b = *eptr;
+        }
+    }
+    pv new_len: i64 = end - start;
+    if new_len <= 0 {
+        pv result: i64 = p_malloc(1);
+        pv rptr: *mut u8 = result;
+        unsafe { *rptr = 0; }
+        ret result;
+    }
+    pv result: i64 = p_malloc(new_len + 1);
+    p_str_copy_n(result, s + start, new_len);
+    pv rend_addr: i64 = result + new_len;
+    pv rend_ptr: *mut u8 = rend_addr;
+    unsafe { *rend_ptr = 0; }
+    ret result;
+}
+
+pub pf String_to_uppercase(s: i64) -> i64 {
+    if s == 0 {
+        pv result: i64 = p_malloc(1);
+        pv ptr: *mut u8 = result;
+        unsafe { *ptr = 0; }
+        ret result;
+    }
+    pv len: i64 = p_str_length(s);
+    pv result: i64 = p_malloc(len + 1);
+    pv i: i64 = 0;
+    while i < len {
+        pv src_addr: i64 = s + i;
+        pv dst_addr: i64 = result + i;
+        pv src_ptr: *mut u8 = src_addr;
+        pv dst_ptr: *mut u8 = dst_addr;
+        pv b: i64 = 0;
+        unsafe { b = *src_ptr; }
+        if b >= 97 && b <= 122 { b = b - 32; }
+        unsafe { *dst_ptr = b; }
+        i = i + 1;
+    }
+    pv end_addr: i64 = result + len;
+    pv end_ptr: *mut u8 = end_addr;
+    unsafe { *end_ptr = 0; }
+    ret result;
+}
+
+pub pf String_to_lowercase(s: i64) -> i64 {
+    if s == 0 {
+        pv result: i64 = p_malloc(1);
+        pv ptr: *mut u8 = result;
+        unsafe { *ptr = 0; }
+        ret result;
+    }
+    pv len: i64 = p_str_length(s);
+    pv result: i64 = p_malloc(len + 1);
+    pv i: i64 = 0;
+    while i < len {
+        pv src_addr: i64 = s + i;
+        pv dst_addr: i64 = result + i;
+        pv src_ptr: *mut u8 = src_addr;
+        pv dst_ptr: *mut u8 = dst_addr;
+        pv b: i64 = 0;
+        unsafe { b = *src_ptr; }
+        if b >= 65 && b <= 90 { b = b + 32; }
+        unsafe { *dst_ptr = b; }
+        i = i + 1;
+    }
+    pv end_addr: i64 = result + len;
+    pv end_ptr: *mut u8 = end_addr;
+    unsafe { *end_ptr = 0; }
+    ret result;
+}
+
+pub pf String_slice(s: i64, start: i64, end: i64) -> i64 {
+    if s == 0 {
+        pv result: i64 = p_malloc(1);
+        pv ptr: *mut u8 = result;
+        unsafe { *ptr = 0; }
+        ret result;
+    }
+    pv len: i64 = p_str_length(s);
+    pv st: i64 = start;
+    pv en: i64 = end;
+    if st < 0 { st = 0; }
+    if en > len { en = len; }
+    if st >= en {
+        pv result: i64 = p_malloc(1);
+        pv ptr: *mut u8 = result;
+        unsafe { *ptr = 0; }
+        ret result;
+    }
+    pv new_len: i64 = en - st;
+    pv result: i64 = p_malloc(new_len + 1);
+    p_str_copy_n(result, s + st, new_len);
+    pv end_addr: i64 = result + new_len;
+    pv end_ptr: *mut u8 = end_addr;
+    unsafe { *end_ptr = 0; }
+    ret result;
+}
+
+pub pf String_find(s: i64, sub: i64) -> i64 {
+    if s == 0 || sub == 0 { ret -1; }
+    pv s_len: i64 = p_str_length(s);
+    pv sub_len: i64 = p_str_length(sub);
+    if sub_len == 0 { ret 0; }
+    if sub_len > s_len { ret -1; }
+    pv i: i64 = 0;
+    while i <= s_len - sub_len {
+        pv matched: bool = true;
+        pv j: i64 = 0;
+        while j < sub_len {
+            pv s_addr: i64 = s + i + j;
+            pv sub_addr: i64 = sub + j;
+            pv s_ptr: *mut u8 = s_addr;
+            pv sub_ptr: *mut u8 = sub_addr;
+            pv s_byte: i64 = 0;
+            pv sub_byte: i64 = 0;
+            unsafe {
+                s_byte = *s_ptr;
+                sub_byte = *sub_ptr;
+            }
+            if s_byte != sub_byte {
+                matched = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if matched { ret i; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+pub pf String_rfind(s: i64, sub: i64) -> i64 {
+    if s == 0 || sub == 0 { ret -1; }
+    pv s_len: i64 = p_str_length(s);
+    pv sub_len: i64 = p_str_length(sub);
+    if sub_len == 0 { ret s_len; }
+    if sub_len > s_len { ret -1; }
+    pv i: i64 = s_len - sub_len;
+    while i >= 0 {
+        pv matched: bool = true;
+        pv j: i64 = 0;
+        while j < sub_len {
+            pv s_addr: i64 = s + i + j;
+            pv sub_addr: i64 = sub + j;
+            pv s_ptr: *mut u8 = s_addr;
+            pv sub_ptr: *mut u8 = sub_addr;
+            pv s_byte: i64 = 0;
+            pv sub_byte: i64 = 0;
+            unsafe {
+                s_byte = *s_ptr;
+                sub_byte = *sub_ptr;
+            }
+            if s_byte != sub_byte {
+                matched = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if matched { ret i; }
+        i = i - 1;
+    }
+    ret -1;
+}
+
+pub pf String_replace(s: i64, from: i64, to: i64) -> i64 {
+    if s == 0 {
+        pv result: i64 = p_malloc(1);
+        pv ptr: *mut u8 = result;
+        unsafe { *ptr = 0; }
+        ret result;
+    }
+    if from == 0 || to == 0 {
+        ret String_from(s);
+    }
+    pv from_len: i64 = p_str_length(from);
+    if from_len == 0 { ret String_from(s); }
+
+    // Build result by iterating through s
+    pv result: i64 = p_malloc(1);
+    pv rptr: *mut u8 = result;
+    unsafe { *rptr = 0; }
+    pv pos: i64 = 0;
+    pv s_len: i64 = p_str_length(s);
+
+    while pos < s_len {
+        // Check if 'from' matches at pos
+        pv matched: bool = true;
+        pv j: i64 = 0;
+        while j < from_len {
+            if pos + j >= s_len { matched = false; break; }
+            pv s_addr: i64 = s + pos + j;
+            pv f_addr: i64 = from + j;
+            pv s_ptr: *mut u8 = s_addr;
+            pv f_ptr: *mut u8 = f_addr;
+            pv s_byte: i64 = 0;
+            pv f_byte: i64 = 0;
+            unsafe {
+                s_byte = *s_ptr;
+                f_byte = *f_ptr;
+            }
+            if s_byte != f_byte { matched = false; break; }
+            j = j + 1;
+        }
+        if matched {
+            result = String_push_str(result, to);
+            pos = pos + from_len;
+        } else {
+            // Append one byte from s
+            pv byte_addr: i64 = s + pos;
+            pv byte_ptr: *mut u8 = byte_addr;
+            pv b: i64 = 0;
+            unsafe { b = *byte_ptr; }
+            pv tmp: i64 = p_malloc(2);
+            pv tmp_ptr: *mut u8 = tmp;
+            unsafe { *tmp_ptr = b; }
+            pv tmp_end_addr: i64 = tmp + 1;
+            pv tmp_end_ptr: *mut u8 = tmp_end_addr;
+            unsafe { *tmp_end_ptr = 0; }
+            result = String_push_str(result, tmp);
+            p_free(tmp);
+            pos = pos + 1;
+        }
+    }
+    ret result;
+}
+
+pub pf String_split(s: i64, delim: i64) -> i64 {
+    pv result: i64 = Vec_new();
+    if s == 0 || delim == 0 { ret result; }
+    pv dlen: i64 = p_str_length(delim);
+    if dlen == 0 { ret result; }
+    pv start: i64 = 0;
+    pv s_len: i64 = p_str_length(s);
+    pv pos: i64 = 0;
+    while pos <= s_len - dlen {
+        pv matched: bool = true;
+        pv j: i64 = 0;
+        while j < dlen {
+            pv s_addr: i64 = s + pos + j;
+            pv d_addr: i64 = delim + j;
+            pv s_ptr: *mut u8 = s_addr;
+            pv d_ptr: *mut u8 = d_addr;
+            pv s_byte: i64 = 0;
+            pv d_byte: i64 = 0;
+            unsafe {
+                s_byte = *s_ptr;
+                d_byte = *d_ptr;
+            }
+            if s_byte != d_byte { matched = false; break; }
+            j = j + 1;
+        }
+        if matched {
+            pv part_len: i64 = pos - start;
+            pv part: i64 = p_malloc(part_len + 1);
+            p_str_copy_n(part, s + start, part_len);
+            pv part_end_addr: i64 = part + part_len;
+            pv part_end_ptr: *mut u8 = part_end_addr;
+            unsafe { *part_end_ptr = 0; }
+            Vec_push(result, part);
+            start = pos + dlen;
+            pos = start;
+        } else {
+            pos = pos + 1;
+        }
+    }
+    // Add remaining part
+    pv remaining: i64 = s_len - start;
+    if remaining >= 0 {
+        pv part: i64 = p_malloc(remaining + 1);
+        p_str_copy_n(part, s + start, remaining);
+        pv part_end_addr: i64 = part + remaining;
+        pv part_end_ptr: *mut u8 = part_end_addr;
+        unsafe { *part_end_ptr = 0; }
+        Vec_push(result, part);
+    }
+    ret result;
+}
+
+pub pf String_parse_int(s: i64) -> i64 {
+    if s == 0 { ret 0; }
+    pv result: i64 = 0;
+    pv sign: i64 = 1;
+    pv addr: i64 = s;
+    pv ptr: *mut u8 = addr;
+    unsafe {
+        pv b: i64 = *ptr;
+        // Skip whitespace
+        while b == 32 || b == 9 || b == 10 || b == 13 {
+            addr = addr + 1;
+            ptr = addr;
+            b = *ptr;
+        }
+        // Check sign
+        if b == 45 {
+            sign = -1;
+            addr = addr + 1;
+            ptr = addr;
+            b = *ptr;
+        } else if b == 43 {
+            addr = addr + 1;
+            ptr = addr;
+            b = *ptr;
+        }
+        // Parse digits
+        while b >= 48 && b <= 57 {
+            result = result * 10 + (b - 48);
+            addr = addr + 1;
+            ptr = addr;
+            b = *ptr;
+        }
+    }
+    ret result * sign;
+}
+
+pub pf String_char_at(s: i64, idx: i64) -> i64 {
+    if s == 0 { ret 0; }
+    pv len: i64 = p_str_length(s);
+    if idx < 0 || idx >= len { ret 0; }
+    pv addr: i64 = s + idx;
+    pv ptr: *mut u8 = addr;
+    pv b: i64 = 0;
+    unsafe { b = *ptr; }
+    pv result: i64 = p_malloc(2);
+    pv rptr: *mut u8 = result;
+    unsafe { *rptr = b; }
+    pv rend_addr: i64 = result + 1;
+    pv rend_ptr: *mut u8 = rend_addr;
+    unsafe { *rend_ptr = 0; }
+    ret result;
+}
+
+pub pf String_repeat(s: i64, n: i64) -> i64 {
+    if s == 0 || n <= 0 {
+        pv result: i64 = p_malloc(1);
+        pv ptr: *mut u8 = result;
+        unsafe { *ptr = 0; }
+        ret result;
+    }
+    pv len: i64 = p_str_length(s);
+    pv result: i64 = p_malloc(len * n + 1);
+    pv i: i64 = 0;
+    while i < n {
+        p_str_copy_n(result + i * len, s, len);
+        i = i + 1;
+    }
+    pv end_addr: i64 = result + len * n;
+    pv end_ptr: *mut u8 = end_addr;
+    unsafe { *end_ptr = 0; }
+    ret result;
+}
+
+pub pf String_to_string(s: i64) -> i64 {
+    ret String_from(s);
+}
+
+pub pf String_clone(s: i64) -> i64 {
+    ret String_from(s);
+}
+
+pub pf String_bytes(s: i64) -> i64 {
+    ret p_str_length(s);
+}

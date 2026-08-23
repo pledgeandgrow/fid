@@ -1491,6 +1491,7 @@ mod tests {
                     effects: EffectSet::new(),
                     source_line: None,
                     in_sandbox: false,
+                    is_linear: false,
                 });
                 func.instructions.insert(vid, Inst::Call {
                     func: callee.to_string(),

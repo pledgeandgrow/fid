@@ -53,14 +53,29 @@ cargo build
 ## Current Baseline (as of Aug 2026)
 
 ```
-Unit tests:   136/136 passed
+Unit tests:   196/199 passed  (3 pre-existing failures: test_compile_and_run_with_opt, dse_keeps_stores_that_are_loaded, strength_reduce_does_not_apply_to_non_power)
 Harness:      7/8 passed       (safety_checks_panic_in_debug_mode fails — pre-existing: overflow checks always on, --release doesn't disable them)
-Interpreter:  102/127 normal   (+ 22/22 expected fail)
-C Codegen:    101/127 matched  (+ 22/22 expected fail)
-PE Emitter:   102/127 valid    (+ 22/22 expected fail)
-Total .fd:    149 test files   (127 normal + 22 expected-fail)
-Skip list:    22 tests         (features in skip list for fidesc test: comptime, bare metal, WASM, SIMD, tensor, HTTP, JSON, dlopen, parallel, etc. Note: many now work in C codegen but remain skipped for historical reasons)
+Interpreter:  101/127 normal  (+ 22/22 expected fail) — Phase 10B: HashMap/String migrated to Fides stdlib
+C Codegen:    96/127 matched  (+ 22/22 expected fail) — Phase 10B: HashMap/String migrated to Fides stdlib
+PE Emitter:   102/127 valid   (+ 22/22 expected fail)
+Total .fd:    149 test files  (127 normal + 22 expected-fail)
+Skip list:    22 tests        (features in skip list for fidesc test: comptime, bare metal, WASM, SIMD, tensor, HTTP, JSON, dlopen, parallel, etc. Note: many now work in C codegen but remain skipped for historical reasons)
 ```
+
+### New Features (Phase 10B)
+
+- **HashMap/String stdlib migration**: `HashMap` and `String` are now implemented
+  entirely in `stdlib/core.fd` using raw pointers (`i64` addresses, `*mut u8`).
+  The lowerer dispatches `HashMap::new()`, `String::from()`, and all methods to
+  Fides stdlib functions (`HashMap_new`, `HashMap_insert`, `String_from`,
+  `String_len`, etc.) instead of compiler builtins (`p_map_*`, `p_string_*`).
+  The interpreter materializes `Value::Str` arguments into memory when Fides
+  functions expect `i64` pointers. The C codegen `Print` instruction calls
+  `Vec_to_str`/`HashMap_to_str` Fides functions for formatting. The `core`
+  module implicitly has all capabilities (allowing stdlib functions to call
+  `p_panic` for bounds checks). `HashMap_to_str` sorts keys lexicographically
+  for deterministic output. `@wrapping` annotation used on hash functions to
+  allow wrap-around arithmetic.
 
 ### New Features (Phase 8B)
 
@@ -73,7 +88,8 @@ Skip list:    22 tests         (features in skip list for fidesc test: comptime,
   desugars to an enum + `<SM>_initial()` and `<SM>_handle(state, event)` functions.
 - **Event Handlers**: `on player_died(name: str) { ... }` desugars to `__on_<event_name>` function.
 - **New keywords**: `component`, `system`, `query`, `state_machine`, `state`, `transition`, `on`.
-  Keywords used as identifiers (e.g. `database.query()`) are handled via `expect_ident_or_keyword()`.
+  Keywords used as identifiers (e.g. `database.query()`, `pm match: bool`) are handled via `expect_ident_or_keyword()`.
+  `TokenKind::is_word_keyword()` distinguishes word-like keywords (e.g. `match`, `query`) from punctuation tokens (e.g. `=`, `;`) to prevent punctuation from being accepted as identifiers.
 - **New stdlib modules**: `stdlib/ecs.fd`, `stdlib/events.fd`.
 - **New test**: `tests/test_phase8b.fd` — ECS, state machine, and event handler tests.
 
@@ -174,7 +190,8 @@ touching them.
 | `src/lower.rs` | **MEDIUM** | AST → SSA IR. Changes here affect interpreter + all backends. |
 | `src/typechecker.rs` | **MEDIUM** | Types + regions + effects + capabilities. Wrong rejection = broken code; wrong acceptance = silent miscompilation. |
 | `src/borrowck.rs` | **LOW** | Borrow checker (Phases 1-6 complete). Separate pass after typecheck. `--borrowck=on` by default; `off`/`warn` modes available. Field-wise borrows, two-phase borrows, NLL (non-lexical lifetimes via last-use analysis). |
-| `src/opt.rs` | **MEDIUM** | PIR optimizer. 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. 22 in default pass list (region-pool via `--region-pool`). `--opt` is enabled by default in `build` (use `--no-opt` to disable). `--lto` enables aggressive cross-module inlining (larger inline limits). PGO has been removed. Inline cost model (F-3F): cost = blocks×5 + insts, with `is_pure` (50% bonus), `is_crashfree` (25%), `is_deterministic` (10%), capped at 75%. Sandbox-aware inlining (I-3C): sandbox call sites use 6 blocks / 40 insts vs normal 3/20. Sandbox-aware devirt (I-3C): devirtualize DynCalls in sandbox blocks to pure impls. Region bulk free (I-1C): `pass_region_pool` emits `p_region_free` before returns. @crashfree code hoisting (I-4B): `pass_effect_optimize` hoists @crashfree + effectively-pure calls out of loops. @gas-guided unrolling (I-4C): `pass_unroll` uses max_unroll=64 when `gas_limit.is_some()` (vs normal 8). Annotations propagated: `is_wrapping`, `is_deterministic`, `is_crashfree`, `is_no_alloc`, `is_medical`, `gas_limit`. |
+| `src/opt.rs` | **MEDIUM** | PIR optimizer. 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. 22 in default pass list (region-pool via `--region-pool`). `--opt` is enabled by default in `build` (use `--no-opt` to disable). `--lto` enables aggressive cross-module inlining (larger inline limits). PGO has been removed. S-1A pass skipping: `pass_relevant_for_module()` skips passes that can't help (no loops → skip unroll, no calls → skip inline, etc.). Inline cost model (F-3F): cost = blocks×5 + insts, with `is_pure` (50% bonus), `is_crashfree` (25%), `is_deterministic` (10%), capped at 75%. Sandbox-aware inlining (I-3C): sandbox call sites use 6 blocks / 40 insts vs normal 3/20. Sandbox-aware devirt (I-3C): devirtualize DynCalls in sandbox blocks to pure impls. Region bulk free (I-1C): `pass_region_pool` emits `p_region_free` before returns. @crashfree code hoisting (I-4B): `pass_effect_optimize` hoists @crashfree + effectively-pure calls out of loops. @gas-guided unrolling (I-4C): `pass_unroll` uses max_unroll=64 when `gas_limit.is_some()` (vs normal 8). Annotations propagated: `is_wrapping`, `is_deterministic`, `is_crashfree`, `is_no_alloc`, `is_medical`, `gas_limit`. I-6B linear type alias analysis: `linear_structs` propagated from AST → IrModule → L1Module → L2Module; `alias_analysis_function` tracks `linear_ptrs` and uses them to prove non-aliasing (stores through linear pointers can't invalidate loads from other pointers). |
+| `src/comptime.rs` | **LOW** | Comptime evaluation engine. Evaluates `comptime <expr>`, `comptime { block }`, `comptime reflect_op(T)`, `comptime gen { block }` at compile time. I-5A: Aggressive comptime evaluation — auto-evaluates calls to `comptime pf` functions with all-literal args (no explicit `comptime` wrapper needed). I-5D: Comptime loop unrolling — unrolls `for` loops with literal bounds (≤16 iterations, ≤16 body stmts) at AST level. Also eliminates dead `if` branches with literal conditions. |
 | `src/runtime_linux.rs` | **HIGH** | Hand-encoded x86-64 machine code (raw bytes). No assembler — every byte is manual. |
 | `src/linker.rs` | **MEDIUM** | Relocation resolution. Wrong offset = crash or silent corruption. |
 | `src/interp.rs` | **LOW** | The reference oracle. If this is wrong, all backends "match" but produce wrong results. |

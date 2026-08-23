@@ -71,6 +71,9 @@ pub struct Lowerer {
     /// Allocas that hold Vec values (from for-loop iteration over Vec<Vec<...>>)
     /// Used to enable nested Vec iteration
     vec_allocas: std::collections::HashSet<ValueId>,
+    /// I-6B: Set of @linear struct names (from typechecker).
+    /// Used to mark ValueMeta.is_linear for alias analysis.
+    linear_structs: std::collections::HashSet<String>,
 }
 
 impl Lowerer {
@@ -108,6 +111,21 @@ impl Lowerer {
             func_ret_types: HashMap::new(),
             async_funcs: std::collections::HashSet::new(),
             vec_allocas: std::collections::HashSet::new(),
+            linear_structs: std::collections::HashSet::new(),
+        }
+    }
+
+    /// I-6B: Set the @linear struct names from the typechecker.
+    /// Call this before lower_program() to enable linear type propagation.
+    pub fn set_linear_structs(&mut self, structs: &std::collections::HashSet<String>) {
+        self.linear_structs = structs.clone();
+    }
+
+    /// I-6B: Check if an IrType corresponds to a @linear struct.
+    fn is_linear_ir_type(&self, ty: &IrType) -> bool {
+        match ty {
+            IrType::Struct(name) => self.linear_structs.contains(name),
+            _ => false,
         }
     }
 
@@ -126,6 +144,10 @@ impl Lowerer {
         // Register struct definitions for layout computation
         for s in &program.structs {
             self.structs.insert(s.name.clone(), s.clone());
+            // I-6B: Track @linear structs for alias analysis
+            if s.annotations.iter().any(|a| a.name == "linear") {
+                self.linear_structs.insert(s.name.clone());
+            }
         }
 
         // Register enum definitions
@@ -238,6 +260,9 @@ impl Lowerer {
             }
             self.current_self_type = saved_self;
         }
+
+        // I-6B: Propagate linear_structs to the IR module
+        self.module.linear_structs = self.linear_structs.clone();
 
         // Take ownership of the module
         std::mem::take(&mut self.module)
@@ -559,6 +584,7 @@ impl Lowerer {
                 effects: EffectSet::none(),
                 source_line: None,
                 in_sandbox: false,
+                                is_linear: false,
             };
             let sret_val = ir_func.new_value(meta);
             ir_func.params.push((sret_val, sret_ty));
@@ -575,6 +601,7 @@ impl Lowerer {
             effects: EffectSet::none(),
             source_line: None,
             in_sandbox: false,
+                                is_linear: false,
         };
         let env_val = ir_func.new_value(env_meta);
         ir_func.params.push((env_val, IrType::Ptr(Box::new(IrType::U8))));
@@ -583,6 +610,8 @@ impl Lowerer {
         // Create parameter values
         for param in &func.params {
             let raw_ty = self.lower_type(&param.ty);
+            // I-6B: Check linearity before raw_ty is moved
+            let is_linear = self.is_linear_ir_type(&raw_ty);
             // Struct params are passed as pointers (by-ref) so FieldAccess works
             let ir_ty = if matches!(raw_ty, IrType::Struct(_)) {
                 IrType::Ptr(Box::new(raw_ty))
@@ -595,6 +624,7 @@ impl Lowerer {
                 effects: EffectSet::none(),
                 source_line: None,
                 in_sandbox: false,
+                is_linear,
             };
             let val = ir_func.new_value(meta);
             ir_func.params.push((val, ir_ty.clone()));
@@ -737,6 +767,7 @@ impl Lowerer {
                                 effects: EffectSet::none(),
                                 source_line: None,
                                 in_sandbox: false,
+                                is_linear: false,
                             };
                             let zid = {
                                 let fmut = self.current_func.as_mut().unwrap();
@@ -1510,9 +1541,11 @@ impl Lowerer {
                 // Check if iterator is a HashMap — iterate over keys
                 if iter_ty.is_opaque_named("HashMap") {
                     // for k in map → get keys as Vec, then iterate
+                    // Phase 10B: call Fides HashMap_keys (user function — needs env_ptr)
+                    let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                     let keys_vec = self.emit_inst(Inst::Call {
-                        func: "p_map_keys".to_string(),
-                        args: vec![iter_val],
+                        func: "HashMap_keys".to_string(),
+                        args: vec![dummy_env, iter_val],
                         ret_ty: IrType::Opaque("Vec".to_string()),
                         effects: EffectSet::new(),
                     });
@@ -1522,8 +1555,7 @@ impl Lowerer {
                 // Check if iterator is an opaque "any" or I64 value from a Vec element
                 // (nested Vec iteration: for row in vec_of_vecs)
                 // Vec elements are stored as i64 handles, so we check if the value
-                // comes from a Vec-element alloca or directly from p_vec_get.
-                eprintln!("DEBUG: for {} — iter_ty={:?} iter_val={:?}", var, iter_ty, iter_val);
+                // comes from a Vec-element alloca or directly from Vec_get.
                 if iter_ty.is_opaque_named("any") || iter_ty == IrType::I64 {
                     if let Some(ref f) = self.current_func {
                         // Check if the value is loaded from a Vec-element alloca
@@ -2365,25 +2397,29 @@ impl Lowerer {
                         });
                     }
                 }
-                // Check if this is HashMap::new() — built-in
+                // Check if this is HashMap::new() — Phase 10B: calls Fides implementation
                 if let Expr::Ident(name) = receiver.as_ref() {
                     if name == "HashMap" && method == "new" {
                         let (key_ty, val_ty) = self.infer_map_types();
+                        // HashMap_new is a user function — prepend dummy env_ptr
+                        let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                         return self.emit_inst(Inst::Call {
-                            func: "p_map_new".to_string(),
-                            args: vec![],
+                            func: "HashMap_new".to_string(),
+                            args: vec![dummy_env],
                             ret_ty: IrType::Generic("HashMap".to_string(), vec![key_ty, val_ty]),
                             effects: EffectSet::new(),
                         });
                     }
                 }
-                // Check if this is String::from(x) — built-in
+                // Check if this is String::from(x) — Phase 10B: calls Fides implementation
                 if let Expr::Ident(name) = receiver.as_ref() {
                     if name == "String" && method == "from" {
                         let arg = self.lower_expr(&args[0]);
+                        // String_from is a user function — prepend dummy env_ptr
+                        let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                         return self.emit_inst(Inst::Call {
-                            func: "p_string_from".to_string(),
-                            args: vec![arg],
+                            func: "String_from".to_string(),
+                            args: vec![dummy_env, arg],
                             ret_ty: IrType::Opaque("String".to_string()),
                             effects: EffectSet::new(),
                         });
@@ -2491,6 +2527,9 @@ impl Lowerer {
                         };
                         (format!("Vec_{}", method), rt)
                     } else if recv_ty.is_opaque_named("HashMap") {
+                        // Phase 10B: HashMap methods call Fides implementation (HashMap_*)
+                        let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                        runtime_args.insert(0, dummy_env);
                         let rt = match method.as_str() {
                             "insert" => IrType::Void,
                             "get" => IrType::I64,
@@ -2505,8 +2544,11 @@ impl Lowerer {
                             "clone" => recv_ty.clone(),
                             _ => IrType::I64,
                         };
-                        (format!("p_map_{}", method), rt)
+                        (format!("HashMap_{}", method), rt)
                     } else if recv_ty.is_opaque_named("String") {
+                        // Phase 10B: String methods call Fides implementation (String_*)
+                        let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                        runtime_args.insert(0, dummy_env);
                         let rt = match method.as_str() {
                             "len" => IrType::I64,
                             "is_empty" => IrType::Bool,
@@ -2527,9 +2569,15 @@ impl Lowerer {
                             "repeat" => IrType::Opaque("String".to_string()),
                             "bytes" => IrType::I64,
                             "clone" => IrType::Opaque("String".to_string()),
+                            "substring" => IrType::Opaque("String".to_string()),
                             _ => IrType::I64,
                         };
-                        (format!("p_string_{}", method), rt)
+                        let fname = if method == "substring" {
+                            "String_slice".to_string()
+                        } else {
+                            format!("String_{}", method)
+                        };
+                        (fname, rt)
                     } else {
                         (method.clone(), IrType::I64)
                     };
@@ -4215,6 +4263,24 @@ impl Lowerer {
             if self.sandbox_depth > 0 {
                 if let Some(meta) = f.values.get_mut(&id) {
                     meta.in_sandbox = true;
+                }
+            }
+            // I-6B: Mark values with linear struct types.
+            // Extract the struct name (if any) while holding the mutable borrow,
+            // then check linear_structs after the borrow ends.
+            let struct_name: Option<String> = f.values.get(&id).and_then(|meta| {
+                if let IrType::Struct(name) = &meta.ty {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            });
+            // I-6B: Set is_linear based on @linear struct membership
+            if let Some(name) = &struct_name {
+                if self.linear_structs.contains(name) {
+                    if let Some(meta) = f.values.get_mut(&id) {
+                        meta.is_linear = true;
+                    }
                 }
             }
             // Override: emit() uses next_block-1, but we need current_block

@@ -271,6 +271,8 @@ pub struct L1Function {
     pub is_crashfree: bool,
     /// I-3C: Values produced inside `sandbox {}` blocks.
     pub sandbox_values: std::collections::HashSet<PValue>,
+    /// I-6B: Values with @linear type (single-owner, can't alias).
+    pub linear_values: std::collections::HashSet<PValue>,
     /// Gas limit from @gas(N) — None = no limit. Used by unroller (I-4C).
     pub gas_limit: Option<u64>,
     /// Whether this function is @no-alloc — cannot allocate heap memory.
@@ -287,6 +289,8 @@ pub struct L1Module {
     pub extern_functions: HashMap<String, (Vec<PirType>, PirType)>,
     pub trait_methods: HashMap<String, Vec<String>>,
     pub trait_impls: HashMap<String, Vec<String>>,
+    /// I-6B: Set of @linear struct names (propagated from IR).
+    pub linear_structs: HashSet<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -434,6 +438,8 @@ pub struct L2Function {
     /// I-3C: Values produced inside `sandbox {}` blocks. Used by the optimizer
     /// for sandbox-aware devirt and more aggressive inlining.
     pub sandbox_values: std::collections::HashSet<PValue>,
+    /// I-6B: Values with @linear type (single-owner, can't alias).
+    pub linear_values: std::collections::HashSet<PValue>,
     /// Gas limit from @gas(N) — None = no limit. Used by unroller (I-4C).
     pub gas_limit: Option<u64>,
     /// Whether this function is @no-alloc — cannot allocate heap memory.
@@ -450,6 +456,9 @@ pub struct L2Module {
     pub extern_functions: HashMap<String, (Vec<PirType>, PirType)>,
     pub trait_methods: HashMap<String, Vec<String>>,
     pub trait_impls: HashMap<String, Vec<String>>,
+    /// I-6B: Set of @linear struct names. Used by alias analysis to determine
+    /// that pointers to linear structs can't alias with other pointers.
+    pub linear_structs: HashSet<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -639,6 +648,7 @@ pub fn lower_ir_to_l1(module: &IrModule) -> L1Module {
     l1.extern_functions = module.extern_functions.clone();
     l1.trait_methods = module.trait_methods.clone();
     l1.trait_impls = module.trait_impls.clone();
+    l1.linear_structs = module.linear_structs.clone();
 
     // Process functions in a deterministic order (sorted by name) for stable
     // printer output.
@@ -850,6 +860,12 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
         .map(|(vid, _)| ValueId(vid.0))
         .collect();
 
+    // I-6B: Collect values with @linear type (single-owner, can't alias)
+    let linear_values: std::collections::HashSet<PValue> = f.instructions.iter()
+        .filter(|(vid, _)| f.values.get(vid).map(|m| m.is_linear).unwrap_or(false))
+        .map(|(vid, _)| ValueId(vid.0))
+        .collect();
+
     let blocks = f
         .blocks
         .iter()
@@ -880,6 +896,7 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
         is_deterministic: f.is_deterministic,
         is_crashfree: f.is_crashfree,
         sandbox_values,
+        linear_values,
         gas_limit: f.gas_limit,
         is_no_alloc: f.is_no_alloc,
         is_medical: f.is_medical,
@@ -901,6 +918,7 @@ pub fn lower_l1_to_l2(l1: &L1Module) -> L2Module {
     l2.extern_functions = l1.extern_functions.clone();
     l2.trait_methods = l1.trait_methods.clone();
     l2.trait_impls = l1.trait_impls.clone();
+    l2.linear_structs = l1.linear_structs.clone();
     l2.functions = l1.functions.iter().map(lower_func_l1_to_l2).collect();
     l2
 }
@@ -1086,6 +1104,7 @@ fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
         is_deterministic: f.is_deterministic,
         is_crashfree: f.is_crashfree,
         sandbox_values: f.sandbox_values.clone(),
+        linear_values: f.linear_values.clone(),
         gas_limit: f.gas_limit,
         is_no_alloc: f.is_no_alloc,
         is_medical: f.is_medical,
@@ -1184,7 +1203,14 @@ fn lower_func_l2_to_l3(f: &L2Function, module: &IrModule) -> L3Function {
     for b in &f.blocks {
         let mut l3_insts: Vec<L3Inst> = Vec::new();
         for vid in &b.instructions {
-            let inst = &f.values[vid];
+            let inst = match f.values.get(vid) {
+                Some(i) => i,
+                None => {
+                    // Some instructions (e.g. UnsafeBegin/UnsafeEnd) may not
+                    // have entries in f.values — skip them.
+                    continue;
+                }
+            };
             let l3_inst = lower_l2_inst_to_l3(
                 inst,
                 *vid,

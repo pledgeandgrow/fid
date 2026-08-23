@@ -4312,8 +4312,9 @@ pub fn function_effects(f: &L2Function) -> EffectSet {
 /// (I-1A)
 fn pass_alias_analysis(module: &mut L2Module) -> usize {
     let mut count = 0;
+    let linear_structs = module.linear_structs.clone();
     for func in &mut module.functions {
-        count += alias_analysis_function(func);
+        count += alias_analysis_function(func, &linear_structs);
     }
     count
 }
@@ -4330,7 +4331,7 @@ enum AllocId {
     Unknown,
 }
 
-fn alias_analysis_function(func: &mut L2Function) -> usize {
+fn alias_analysis_function(func: &mut L2Function, linear_structs: &HashSet<String>) -> usize {
     let mut count = 0;
 
     // I-1A: Compute predecessors if they're not already populated.
@@ -4343,16 +4344,26 @@ fn alias_analysis_function(func: &mut L2Function) -> usize {
     // Build a map from ValueId (pointer) → AllocId by tracing through
     // Alloca, GetElemPtr, and GetFieldPtr instructions.
     let mut ptr_alloc: HashMap<PValue, AllocId> = HashMap::new();
+    // I-6B: Track which pointers point to linear data.
+    // A pointer is linear if its alloca's type is a @linear struct,
+    // or if it's derived (GetFieldPtr/GetElemPtr) from a linear pointer.
+    let mut linear_ptrs: HashSet<PValue> = HashSet::new();
 
     // First pass: collect all Alloca instructions.
     for (vid, inst) in &func.values {
         match inst {
-            L2Inst::Alloca { region, .. } => {
+            L2Inst::Alloca { region, ty } => {
                 let alloc_id = match region {
                     MemRegion::Named(name) => AllocId::NamedRegion(name.clone()),
                     _ => AllocId::Alloca(*vid),
                 };
                 ptr_alloc.insert(*vid, alloc_id);
+                // I-6B: Track linear allocas
+                if let crate::ir::IrType::Struct(name) = ty {
+                    if linear_structs.contains(name) {
+                        linear_ptrs.insert(*vid);
+                    }
+                }
             }
             _ => {}
         }
@@ -4376,11 +4387,19 @@ fn alias_analysis_function(func: &mut L2Function) -> usize {
                         ptr_alloc.insert(*vid, root.clone());
                         changed = true;
                     }
+                    // I-6B: Propagate linear pointer status
+                    if linear_ptrs.contains(array_ptr) {
+                        linear_ptrs.insert(*vid);
+                    }
                 }
                 L2Inst::GetFieldPtr { struct_ptr, .. } => {
                     if let Some(root) = ptr_alloc.get(struct_ptr) {
                         ptr_alloc.insert(*vid, root.clone());
                         changed = true;
+                    }
+                    // I-6B: Propagate linear pointer status
+                    if linear_ptrs.contains(struct_ptr) {
+                        linear_ptrs.insert(*vid);
                     }
                 }
                 _ => {}
@@ -4423,7 +4442,15 @@ fn alias_analysis_function(func: &mut L2Function) -> usize {
                             }
                             L2Inst::Store { ptr, .. } => {
                                 let store_alloc = ptr_alloc.get(ptr).unwrap_or(&AllocId::Unknown);
+                                let store_is_linear = linear_ptrs.contains(ptr);
                                 pred_loads.retain(|load_ptr, _| {
+                                    // I-6B: Linear pointers can't alias
+                                    if store_is_linear && load_ptr != ptr {
+                                        return true;
+                                    }
+                                    if linear_ptrs.contains(load_ptr) && load_ptr != ptr {
+                                        return true;
+                                    }
                                     let load_alloc = ptr_alloc.get(load_ptr).unwrap_or(&AllocId::Unknown);
                                     if store_alloc == &AllocId::Unknown {
                                         load_ptr != ptr
@@ -4501,7 +4528,19 @@ fn alias_analysis_function(func: &mut L2Function) -> usize {
                         // (same AllocId). But loads from different AllocIds are
                         // still valid.
                         let store_alloc = ptr_alloc.get(ptr).unwrap_or(&AllocId::Unknown);
+                        let store_is_linear = linear_ptrs.contains(ptr);
                         last_load.retain(|load_ptr, _| {
+                            // I-6B: Linear pointers can't alias with other pointers.
+                            // If the store is to a linear pointer and the load is
+                            // from a different pointer, they can't alias.
+                            if store_is_linear && load_ptr != ptr {
+                                return true; // keep the load
+                            }
+                            // If the load is from a linear pointer and the store
+                            // is to a different pointer, they can't alias.
+                            if linear_ptrs.contains(load_ptr) && load_ptr != ptr {
+                                return true; // keep the load
+                            }
                             let load_alloc = ptr_alloc.get(load_ptr).unwrap_or(&AllocId::Unknown);
                             // Keep the cached load if it's from a different
                             // allocation than the store.
@@ -4564,19 +4603,22 @@ fn alias_analysis_function(func: &mut L2Function) -> usize {
     let mut block_reorders: Vec<(usize, Vec<PValue>)> = Vec::new();
 
     for (bi, block) in func.blocks.iter().enumerate() {
-        let mut loads: Vec<(usize, AllocId)> = Vec::new();
-        let mut stores: Vec<(usize, AllocId)> = Vec::new();
+        // (index, AllocId, is_linear, ptr_value)
+        let mut loads: Vec<(usize, AllocId, bool, PValue)> = Vec::new();
+        let mut stores: Vec<(usize, AllocId, bool, PValue)> = Vec::new();
 
         for (i, inst_idx) in block.instructions.iter().enumerate() {
             if let Some(inst) = func.values.get(inst_idx) {
                 match inst {
                     L2Inst::Load { ptr, .. } => {
                         let alloc = ptr_alloc.get(ptr).cloned().unwrap_or(AllocId::Unknown);
-                        loads.push((i, alloc));
+                        let is_lin = linear_ptrs.contains(ptr);
+                        loads.push((i, alloc, is_lin, *ptr));
                     }
                     L2Inst::Store { ptr, .. } => {
                         let alloc = ptr_alloc.get(ptr).cloned().unwrap_or(AllocId::Unknown);
-                        stores.push((i, alloc));
+                        let is_lin = linear_ptrs.contains(ptr);
+                        stores.push((i, alloc, is_lin, *ptr));
                     }
                     _ => {}
                 }
@@ -4584,9 +4626,15 @@ fn alias_analysis_function(func: &mut L2Function) -> usize {
         }
 
         // Count non-aliasing pairs.
-        for (li, lr) in &loads {
-            for (si, sr) in &stores {
-                if lr != sr && li != si {
+        for (li, lr, l_lin, l_ptr) in &loads {
+            for (si, sr, s_lin, s_ptr) in &stores {
+                // I-6B: Linear pointers can't alias with different pointers
+                let no_alias = if (*l_lin || *s_lin) && l_ptr != s_ptr {
+                    true
+                } else {
+                    lr != sr
+                };
+                if no_alias && li != si {
                     count += 1;
                 }
             }
@@ -4594,13 +4642,22 @@ fn alias_analysis_function(func: &mut L2Function) -> usize {
 
         // Reorder: move loads that don't alias any store to before the stores.
         if !loads.is_empty() && !stores.is_empty() {
-            let store_allocs: Vec<&AllocId> = stores.iter().map(|(_, a)| a).collect();
             let mut safe_loads: Vec<usize> = Vec::new();
-            for (li, lr) in &loads {
-                // A load is safe to move if its AllocId doesn't match any
-                // store's AllocId. Unknown allocs are conservative (don't move).
-                if *lr != AllocId::Unknown &&
-                   !store_allocs.iter().any(|sa| **sa == *lr) {
+            for (li, lr, l_lin, l_ptr) in &loads {
+                // A load is safe to move if it doesn't alias any store.
+                // Unknown allocs are conservative (don't move).
+                let is_safe = if *lr == AllocId::Unknown && !*l_lin {
+                    false
+                } else {
+                    stores.iter().all(|(_, sr, s_lin, s_ptr)| {
+                        // I-6B: Linear pointers can't alias with different pointers
+                        if (*l_lin || *s_lin) && l_ptr != s_ptr {
+                            return true; // no alias
+                        }
+                        lr != sr
+                    })
+                };
+                if is_safe {
                     safe_loads.push(*li);
                 }
             }
@@ -7229,10 +7286,14 @@ mod tests {
     #[test]
     fn i4e_nonwrapping_does_not_reassociate() {
         // I-4E: Without @wrapping, reassociation should NOT happen.
+        // Note: stdlib may contain @wrapping functions that DO get reassociated,
+        // so we check only the `compute` function, not the total count.
         let src = "pf compute(a: i64) -> i64 { pv x = (a + 10) + 20; ret x; }\n";
         let mut l2 = compile_to_l2(src);
-        let n = pass_reassociate(&mut l2);
-        assert_eq!(n, 0, "should not reassociate without @wrapping, got {}", n);
+        let before = count_binops(&l2, "compute");
+        pass_reassociate(&mut l2);
+        let after = count_binops(&l2, "compute");
+        assert_eq!(before, after, "compute should not be reassociated without @wrapping");
     }
 
     #[test]
@@ -7368,11 +7429,13 @@ mod tests {
     #[test]
     fn i4c_gas_allows_larger_unrolling() {
         // I-4C: @gas functions should allow unrolling loops with trip count > 8
-        let src = "@gas(1000) pf compute() -> i64 { pv sum: i64 = 0; for i in 0..12 { sum = sum + i; } ret sum; }\n";
+        // Use trip count 20 (> 16, so comptime loop unrolling won't handle it,
+        // only the IR unroller with @gas will).
+        let src = "@gas(1000) pf compute() -> i64 { pv sum: i64 = 0; for i in 0..20 { sum = sum + i; } ret sum; }\n";
         let mut l2 = compile_to_l2(src);
         let n = pass_unroll(&mut l2);
-        // Normal limit is 8, but @gas allows up to 64. Trip count 12 should unroll.
-        assert!(n > 0, "expected @gas function to unroll trip count 12, got {}", n);
+        // Normal limit is 8, but @gas allows up to 64. Trip count 20 should unroll.
+        assert!(n > 0, "expected @gas function to unroll trip count 20, got {}", n);
     }
 
     #[test]

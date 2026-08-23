@@ -447,6 +447,10 @@ pub struct ValueMeta {
     /// Whether this value was produced inside a `sandbox {}` block.
     /// Used by the optimizer for sandbox-aware devirt/inline (I-3C).
     pub in_sandbox: bool,
+    /// I-6B: Whether this value's type is @linear (single-owner).
+    /// Linear values can't alias with anything else, so stores/loads through
+    /// linear pointers are safe to reorder relative to other memory ops.
+    pub is_linear: bool,
 }
 
 // ─── Instructions ───────────────────────────────────────────────────────
@@ -1008,6 +1012,7 @@ impl IrFunction {
             effects,
             source_line: None,
             in_sandbox: false,
+            is_linear: false,
         };
 
         let id = self.new_value(meta);
@@ -1035,6 +1040,7 @@ impl IrFunction {
             effects: EffectSet::none(),
             source_line: None,
             in_sandbox: false,
+            is_linear: false,
         };
         let id = self.new_value(meta);
         let block_idx = block.0 as usize;
@@ -1139,6 +1145,9 @@ pub struct IrModule {
     /// Used by devirtualization (F-3D) to replace DynCall with direct Call
     /// when only one impl exists.
     pub trait_impls: HashMap<String, Vec<String>>,
+    /// I-6B: Set of @linear struct names. Propagated from the lowerer
+    /// for use by alias analysis and other optimizations.
+    pub linear_structs: std::collections::HashSet<String>,
 }
 
 impl IrModule {
@@ -1152,6 +1161,7 @@ impl IrModule {
             extern_decls: Vec::new(),
             trait_methods: HashMap::new(),
             trait_impls: HashMap::new(),
+            linear_structs: std::collections::HashSet::new(),
         }
     }
 

@@ -167,6 +167,11 @@ impl Memory {
         }
     }
 
+    /// Check if an address is within the allocated memory region
+    pub fn is_valid_addr(&self, addr: u64) -> bool {
+        (addr as usize) < self.data.len()
+    }
+
     pub fn store_i64(&mut self, addr: u64, val: i64) {
         self.store(addr, &val.to_le_bytes());
     }
@@ -379,17 +384,95 @@ impl Interpreter {
         }
     }
 
+    /// Phase 10B: Convert a Fides Vec (i64 pointer) to a Value::Vec
+    /// by reading elements via Vec_get.
+    fn fides_vec_to_value_vec(&mut self, vec_ptr: i64) -> Value {
+        let vec_len_fn = self.module.functions.get("Vec_len").cloned();
+        let vec_get_fn = self.module.functions.get("Vec_get").cloned();
+        if let (Some(len_fn), Some(get_fn)) = (vec_len_fn, vec_get_fn) {
+            let len_result = self.run_function(&len_fn, &[Value::Int(0), Value::Int(vec_ptr)]);
+            let len = match len_result {
+                RunResult::Return(Value::Int(n)) => n,
+                _ => 0,
+            };
+            let mut elems: SmallVec<[Value; 8]> = SmallVec::new();
+            for i in 0..len {
+                let get_result = self.run_function(&get_fn, &[Value::Int(0), Value::Int(vec_ptr), Value::Int(i)]);
+                if let RunResult::Return(v) = get_result {
+                    elems.push(v);
+                }
+            }
+            return Value::Vec(Rc::new(RefCell::new(elems)));
+        }
+        Value::Vec(Rc::new(RefCell::new(SmallVec::new())))
+    }
+
+    /// Phase 10B: Extract a Vec<f64> from an argument, handling both
+    /// Value::Vec (old built-in) and Fides Vec (i64 pointer).
+    /// For Fides Vecs, f64 values are stored as their i64 bit pattern,
+    /// so we need to reinterpret the bits.
+    fn args_to_f64_vec(&mut self, args: &[Value], idx: usize) -> Option<Vec<f64>> {
+        match args.get(idx) {
+            Some(Value::Vec(v)) => {
+                Some(v.borrow().iter().map(|x| match x {
+                    Value::Int(i) => f64::from_bits(*i as u64),
+                    Value::Float(f) => *f,
+                    _ => 0.0,
+                }).collect())
+            }
+            Some(Value::Int(ptr)) => {
+                // Fides Vec — convert via Vec_get
+                let v = self.fides_vec_to_value_vec(*ptr);
+                if let Value::Vec(arr) = v {
+                    Some(arr.borrow().iter().map(|x| match x {
+                        Value::Int(i) => f64::from_bits(*i as u64),
+                        Value::Float(f) => *f,
+                        _ => 0.0,
+                    }).collect())
+                } else {
+                    None
+                }
+            }
+            Some(Value::Ptr(ptr)) => {
+                let v = self.fides_vec_to_value_vec(*ptr as i64);
+                if let Value::Vec(arr) = v {
+                    Some(arr.borrow().iter().map(|x| match x {
+                        Value::Int(i) => f64::from_bits(*i as u64),
+                        Value::Float(f) => *f,
+                        _ => 0.0,
+                    }).collect())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Run a specific function with arguments
     fn run_function(&mut self, func: &IrFunction, args: &[Value]) -> RunResult {
-        // Track current function name for @wrapping check (F64/F65)
         let saved_func_name = self.current_func_name.clone();
         self.current_func_name = func.name.clone();
         // Build value table for this function
         let mut values: HashMap<ValueId, Value> = HashMap::new();
 
         // Bind parameters
-        for (i, (param_id, _)) in func.params.iter().enumerate() {
-            let val = args.get(i).cloned().unwrap_or(Value::Void);
+        for (i, (param_id, param_ty)) in func.params.iter().enumerate() {
+            let mut val = args.get(i).cloned().unwrap_or(Value::Void);
+            // Phase 10B: When a Value::Str is passed to an i64 or pointer parameter,
+            // materialize the string into memory and pass the address.
+            // This allows Fides stdlib functions (HashMap, String) to receive
+            // string pointers as i64 values.
+            if let Value::Str(ref s) = val {
+                let is_i64_or_ptr = matches!(param_ty, IrType::I64 | IrType::U64)
+                    || matches!(param_ty, IrType::Ptr(_));
+                if is_i64_or_ptr {
+                    let str_addr = self.memory.alloc(s.len() as u64 + 1);
+                    self.memory.store(str_addr, s.as_bytes());
+                    self.memory.store(str_addr + s.len() as u64, &[0]);
+                    val = Value::Int(str_addr as i64);
+                }
+            }
             values.insert(*param_id, val);
         }
 
@@ -557,6 +640,14 @@ impl Interpreter {
             Inst::Load { ptr, ty } => {
                 let addr = match values.get(ptr) {
                     Some(Value::Ptr(a)) => *a,
+                    Some(Value::Int(i)) => *i as u64,
+                    Some(Value::Str(s)) => {
+                        // Phase 10B: materialize string to memory on demand
+                        let str_addr = self.memory.alloc(s.len() as u64 + 1);
+                        self.memory.store(str_addr, s.as_bytes());
+                        self.memory.store(str_addr + s.len() as u64, &[0]);
+                        str_addr
+                    }
                     _ => 0,
                 };
                 let v = match ty {
@@ -622,14 +713,39 @@ impl Interpreter {
                     _ => 0,
                 };
                 // Check if this is an opaque-typed alloca — if so, always use side-table
-                let ptr_ty = func.values.get(ptr).map(|m| &m.ty);
-                let is_opaque = match ptr_ty {
+                let ptr_meta_ty = func.values.get(ptr).map(|m| &m.ty);
+                let is_opaque = match ptr_meta_ty {
                     Some(IrType::Opaque(_)) | Some(IrType::Generic(_, _)) => true,
                     Some(IrType::Ptr(inner)) => matches!(inner.as_ref(), IrType::Opaque(_) | IrType::Generic(_, _)),
                     _ => false,
                 };
-                // Get the value's type to store the correct number of bytes
+                // Phase 10B: Determine the store size.
+                // When storing THROUGH a dereferenced pointer (e.g. *ptr = val),
+                // the pointee type determines the store size.
+                // When storing INTO a pointer-typed slot (e.g. pv p: *mut u8 = addr),
+                // the value is an address (8 bytes).
+                // The value's type (val_ty) is the type of the value being stored.
+                // The pointer's inner type (pointee_ty) is what the pointer points to.
+                // For dereferenced stores, prefer pointee_ty; for slot stores, prefer val_ty.
                 let val_ty = func.values.get(value).map(|m| m.ty.clone());
+                // If the pointer is itself a Load result (storing through a deref),
+                // use the pointer's pointee type for the store size.
+                let pointee_ty = func.values.get(ptr).and_then(|m| match &m.ty {
+                    IrType::Ptr(inner) => Some(inner.as_ref().clone()),
+                    _ => None,
+                });
+                // Check if this is a store through a dereferenced pointer:
+                // The pointer value is a Load result (loaded from a Ptr slot),
+                // which means we're storing THROUGH the pointer, not INTO a slot.
+                let is_deref_store = func.values.get(ptr).map(|m| {
+                    // If the pointer was loaded from a Ptr-typed slot, it's a deref store
+                    matches!(&m.ty, IrType::Ptr(inner) if !matches!(inner.as_ref(), IrType::I64 | IrType::U64 | IrType::Ptr(_)))
+                }).unwrap_or(false);
+                let store_ty = if is_deref_store {
+                    pointee_ty.or(val_ty.clone()).unwrap_or(IrType::I64)
+                } else {
+                    val_ty.clone().unwrap_or(IrType::I64)
+                };
                 if is_opaque {
                     // For opaque-typed slots, always store in side-table
                     if let Some(v) = values.get(value) {
@@ -654,16 +770,16 @@ impl Interpreter {
                 }
                 match values.get(value) {
                     Some(Value::Int(v)) => {
-                        match val_ty {
-                            Some(IrType::I8) | Some(IrType::U8) => self.memory.store(addr, &(*v as i8).to_le_bytes()),
-                            Some(IrType::I16) | Some(IrType::U16) => self.memory.store(addr, &(*v as i16).to_le_bytes()),
-                            Some(IrType::I32) | Some(IrType::U32) => self.memory.store_i32(addr, *v as i32),
+                        match store_ty {
+                            IrType::I8 | IrType::U8 => self.memory.store(addr, &(*v as i8).to_le_bytes()),
+                            IrType::I16 | IrType::U16 => self.memory.store(addr, &(*v as i16).to_le_bytes()),
+                            IrType::I32 | IrType::U32 => self.memory.store_i32(addr, *v as i32),
                             _ => self.memory.store_i64(addr, *v),
                         }
                     }
                     Some(Value::Float(v)) => {
-                        match val_ty {
-                            Some(IrType::F32) => self.memory.store_f32(addr, *v as f32),
+                        match store_ty {
+                            IrType::F32 => self.memory.store_f32(addr, *v as f32),
                             _ => self.memory.store_f64(addr, *v),
                         }
                     }
@@ -1007,6 +1123,55 @@ impl Interpreter {
                                 }
                                 RunResult::Panic(msg) => return ExecOutcome::Panic(msg),
                                 _ => {}
+                            }
+                        }
+                    }
+                }
+                // Phase 10B: HashMap values are raw pointers — call
+                // HashMap_to_str to format them properly.
+                if ty.is_opaque_named("HashMap") || matches!(&ty, IrType::Generic(name, _) if name == "HashMap") {
+                    if let Value::Ptr(_) | Value::Int(_) = &v {
+                        if let Some(callee) = self.module.functions.get("HashMap_to_str").cloned() {
+                            let to_str_args = vec![Value::Int(0), v.clone()];
+                            match self.run_function(&callee, &to_str_args) {
+                                RunResult::Return(Value::Str(s)) => {
+                                    print!("{}", s);
+                                    return ExecOutcome::Continue;
+                                }
+                                RunResult::Return(Value::Ptr(addr)) => {
+                                    let mut bytes = Vec::new();
+                                    let mut offset = addr;
+                                    loop {
+                                        let b = self.memory.load(offset, 1);
+                                        if b[0] == 0 { break; }
+                                        bytes.push(b[0]);
+                                        offset += 1;
+                                    }
+                                    print!("{}", String::from_utf8_lossy(&bytes));
+                                    return ExecOutcome::Continue;
+                                }
+                                RunResult::Panic(msg) => return ExecOutcome::Panic(msg),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                // Phase 10B: String values from Vec_get are raw pointers (i64)
+                // — read the null-terminated string from memory.
+                if ty.is_opaque_named("String") {
+                    if let Value::Int(addr) = &v {
+                        if *addr > 0 && self.memory.is_valid_addr(*addr as u64) {
+                            let mut bytes = Vec::new();
+                            let mut offset = *addr as u64;
+                            loop {
+                                let b = self.memory.load(offset, 1);
+                                if b[0] == 0 { break; }
+                                bytes.push(b[0]);
+                                offset += 1;
+                            }
+                            if !bytes.is_empty() {
+                                print!("{}", String::from_utf8_lossy(&bytes));
+                                return ExecOutcome::Continue;
                             }
                         }
                     }
@@ -1366,6 +1531,20 @@ impl Interpreter {
             (Value::Float(f), IrType::I32) => Value::Int(*f as i32 as i64),
             (Value::Bool(b), IrType::I64) => Value::Int(if *b { 1 } else { 0 }),
             _ => v.clone(),
+        }
+    }
+
+    /// Phase 10B: Coerce Value::Str to Value::Int (memory address) for arithmetic.
+    /// Materializes the string into memory if needed.
+    fn coerce_str_to_int(&mut self, v: &Value) -> Value {
+        match v {
+            Value::Str(s) => {
+                let str_addr = self.memory.alloc(s.len() as u64 + 1);
+                self.memory.store(str_addr, s.as_bytes());
+                self.memory.store(str_addr + s.len() as u64, &[0]);
+                Value::Int(str_addr as i64)
+            }
+            other => other.clone(),
         }
     }
 
@@ -1736,9 +1915,49 @@ impl Interpreter {
                 if let (Some(Value::Map(m)), Some(key)) = (args.first(), args.get(1)) {
                     let key_str = match key {
                         Value::Str(s) => s.to_string(),
-                        Value::Int(i) => i.to_string(),
+                        Value::Int(i) => {
+                            // Phase 10B: the key might be a string pointer (from
+                            // HashMap iteration via Fides Vec). Try reading it as
+                            // a null-terminated string from memory first.
+                            let addr = *i as u64;
+                            if addr > 0 && self.memory.is_valid_addr(addr) {
+                                let mut bytes = Vec::new();
+                                let mut offset = addr;
+                                let mut valid = true;
+                                loop {
+                                    if !self.memory.is_valid_addr(offset) {
+                                        valid = false;
+                                        break;
+                                    }
+                                    let b = self.memory.load(offset, 1);
+                                    if b[0] == 0 { break; }
+                                    bytes.push(b[0]);
+                                    offset += 1;
+                                    if bytes.len() > 1024 { valid = false; break; }
+                                }
+                                if valid && !bytes.is_empty() {
+                                    String::from_utf8_lossy(&bytes).to_string()
+                                } else {
+                                    i.to_string()
+                                }
+                            } else {
+                                i.to_string()
+                            }
+                        }
                         Value::Bool(b) => b.to_string(),
                         Value::Float(f) => f.to_string(),
+                        Value::Ptr(addr) => {
+                            // Phase 10B: key is a string pointer — read from memory
+                            let mut bytes = Vec::new();
+                            let mut offset = *addr;
+                            loop {
+                                let b = self.memory.load(offset, 1);
+                                if b[0] == 0 { break; }
+                                bytes.push(b[0]);
+                                offset += 1;
+                            }
+                            String::from_utf8_lossy(&bytes).to_string()
+                        }
                         _ => format!("{:?}", key),
                     };
                     let borrow = m.borrow();
@@ -1797,26 +2016,33 @@ impl Interpreter {
                 if let Some(Value::Map(m)) = args.first() {
                     // Create a Fides Vec via Vec_new
                     let vec_args = vec![Value::Int(0)];
-                    if let Some(callee) = self.module.functions.get("Vec_new").cloned() {
-                        if let RunResult::Return(Value::Ptr(vec_ptr)) = self.run_function(&callee, &vec_args) {
+                    let vec_new_fn = self.module.functions.get("Vec_new").cloned();
+                    let vec_push_fn = self.module.functions.get("Vec_push").cloned();
+                    if let Some(callee) = vec_new_fn {
+                        let result = self.run_function(&callee, &vec_args);
+                        // Vec_new returns i64 (the pointer address), which may be
+                        // Value::Int or Value::Ptr depending on internal representation
+                        let vec_ptr = match &result {
+                            RunResult::Return(Value::Ptr(p)) => *p,
+                            RunResult::Return(Value::Int(i)) => *i as u64,
+                            _ => 0,
+                        };
+                        if vec_ptr != 0 {
                             // Push each key into the Vec
-                            let push_callee = self.module.functions.get("Vec_push").cloned();
                             for k in m.borrow().keys() {
-                                if let Some(ref push_fn) = push_callee {
-                                    let key_val = Value::Str(CompactString::from(k.as_str()));
-                                    // Store the string pointer as i64
-                                    let str_ptr = if let Value::Str(s) = &key_val {
-                                        let str_addr = self.memory.alloc(s.len() as u64 + 1);
-                                        self.memory.store(str_addr, s.as_bytes());
-                                        self.memory.store(str_addr + s.len() as u64, &[0]);
-                                        str_addr as i64
-                                    } else { 0 };
-                                    let push_args = vec![Value::Int(0), Value::Ptr(vec_ptr), Value::Int(str_ptr)];
+                                if let Some(ref push_fn) = vec_push_fn {
+                                    // Store the string as a null-terminated string in memory
+                                    let str_addr = self.memory.alloc(k.len() as u64 + 1);
+                                    self.memory.store(str_addr, k.as_bytes());
+                                    self.memory.store(str_addr + k.len() as u64, &[0]);
+                                    let push_args = vec![Value::Int(0), Value::Int(vec_ptr as i64), Value::Int(str_addr as i64)];
                                     let _ = self.run_function(push_fn, &push_args);
                                 }
                             }
-                            return ExecOutcome::Value(Value::Ptr(vec_ptr));
+                            return ExecOutcome::Value(Value::Int(vec_ptr as i64));
                         }
+                    } else {
+                        // Vec_new not found — return empty Vec
                     }
                 }
                 // Fallback: empty Vec
@@ -1829,14 +2055,39 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Int(0))
             }
             "p_map_values" => {
+                // Phase 10B: return a Fides Vec (raw pointer) instead of Value::Vec
+                let vec_new_fn = self.module.functions.get("Vec_new").cloned();
+                let vec_push_fn = self.module.functions.get("Vec_push").cloned();
                 if let Some(Value::Map(m)) = args.first() {
-                    let vals: SmallVec<[Value; 8]> = m.borrow()
-                        .values()
-                        .cloned()
-                        .collect();
-                    return ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(vals))));
+                    if let Some(ref new_fn) = vec_new_fn {
+                        let result = self.run_function(new_fn, &[Value::Int(0)]);
+                        let vec_ptr = match result {
+                            RunResult::Return(Value::Ptr(p)) => p as i64,
+                            RunResult::Return(Value::Int(i)) => i,
+                            _ => 0,
+                        };
+                        if vec_ptr != 0 {
+                            if let Some(ref push_fn) = vec_push_fn {
+                                for v in m.borrow().values() {
+                                    let val_i = match v {
+                                        Value::Int(i) => *i,
+                                        Value::Ptr(p) => *p as i64,
+                                        _ => 0,
+                                    };
+                                    let _ = self.run_function(push_fn, &[Value::Int(0), Value::Int(vec_ptr), Value::Int(val_i)]);
+                                }
+                            }
+                            return ExecOutcome::Value(Value::Int(vec_ptr));
+                        }
+                    }
                 }
-                ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(SmallVec::new()))))
+                // Fallback: empty Vec
+                if let Some(callee) = self.module.functions.get("Vec_new").cloned() {
+                    if let RunResult::Return(v) = self.run_function(&callee, &[Value::Int(0)]) {
+                        return ExecOutcome::Value(v);
+                    }
+                }
+                ExecOutcome::Value(Value::Int(0))
             }
 
             // ─── String runtime functions ───
@@ -1916,12 +2167,36 @@ impl Interpreter {
             }
             "p_string_split" => {
                 if let (Some(Value::Str(s)), Some(Value::Str(delim))) = (args.first(), args.get(1)) {
-                    let parts: SmallVec<[Value; 8]> = s.split(delim.as_str())
-                        .map(|p| Value::Str(CompactString::from(p)))
-                        .collect();
-                    return ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(parts))));
+                    // Phase 10B: return a Fides Vec (raw pointer) instead of Value::Vec
+                    let vec_new_fn = self.module.functions.get("Vec_new").cloned();
+                    let vec_push_fn = self.module.functions.get("Vec_push").cloned();
+                    if let Some(ref new_fn) = vec_new_fn {
+                        let result = self.run_function(new_fn, &[Value::Int(0)]);
+                        let vec_ptr = match result {
+                            RunResult::Return(Value::Ptr(p)) => p as i64,
+                            RunResult::Return(Value::Int(i)) => i,
+                            _ => 0,
+                        };
+                        if vec_ptr != 0 {
+                            if let Some(ref push_fn) = vec_push_fn {
+                                for part in s.split(delim.as_str()) {
+                                    let str_addr = self.memory.alloc(part.len() as u64 + 1);
+                                    self.memory.store(str_addr, part.as_bytes());
+                                    self.memory.store(str_addr + part.len() as u64, &[0]);
+                                    let _ = self.run_function(push_fn, &[Value::Int(0), Value::Int(vec_ptr), Value::Int(str_addr as i64)]);
+                                }
+                            }
+                            return ExecOutcome::Value(Value::Int(vec_ptr));
+                        }
+                    }
                 }
-                ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(SmallVec::new()))))
+                // Fallback: empty Vec
+                if let Some(callee) = self.module.functions.get("Vec_new").cloned() {
+                    if let RunResult::Return(v) = self.run_function(&callee, &[Value::Int(0)]) {
+                        return ExecOutcome::Value(v);
+                    }
+                }
+                ExecOutcome::Value(Value::Int(0))
             }
             "p_string_replace" => {
                 let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
@@ -2479,27 +2754,53 @@ impl Interpreter {
             }
 
             // ─── Phase 5C.2: SIMD builtins ───
-            "p_simd_add" => simd_binary(args, |a, b| a + b),
-            "p_simd_sub" => simd_binary(args, |a, b| a - b),
-            "p_simd_mul" => simd_binary(args, |a, b| a * b),
-            "p_simd_div" => simd_binary(args, |a, b| if b != 0.0 { a / b } else { 0.0 }),
+            "p_simd_add" => {
+                let a = self.args_to_f64_vec(args, 0);
+                let b = self.args_to_f64_vec(args, 1);
+                if let (Some(a), Some(b)) = (a, b) {
+                    let result: SmallVec<[Value; 8]> = a.iter().zip(b.iter()).map(|(x, y)| Value::Float(x + y)).collect();
+                    ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(result))))
+                } else { ExecOutcome::Panic("simd_add: expected Vec, Vec".to_string()) }
+            }
+            "p_simd_sub" => {
+                let a = self.args_to_f64_vec(args, 0);
+                let b = self.args_to_f64_vec(args, 1);
+                if let (Some(a), Some(b)) = (a, b) {
+                    let result: SmallVec<[Value; 8]> = a.iter().zip(b.iter()).map(|(x, y)| Value::Float(x - y)).collect();
+                    ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(result))))
+                } else { ExecOutcome::Panic("simd_sub: expected Vec, Vec".to_string()) }
+            }
+            "p_simd_mul" => {
+                let a = self.args_to_f64_vec(args, 0);
+                let b = self.args_to_f64_vec(args, 1);
+                if let (Some(a), Some(b)) = (a, b) {
+                    let result: SmallVec<[Value; 8]> = a.iter().zip(b.iter()).map(|(x, y)| Value::Float(x * y)).collect();
+                    ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(result))))
+                } else { ExecOutcome::Panic("simd_mul: expected Vec, Vec".to_string()) }
+            }
+            "p_simd_div" => {
+                let a = self.args_to_f64_vec(args, 0);
+                let b = self.args_to_f64_vec(args, 1);
+                if let (Some(a), Some(b)) = (a, b) {
+                    let result: SmallVec<[Value; 8]> = a.iter().zip(b.iter()).map(|(x, y)| Value::Float(if *y != 0.0 { x / y } else { 0.0 })).collect();
+                    ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(result))))
+                } else { ExecOutcome::Panic("simd_div: expected Vec, Vec".to_string()) }
+            }
             "p_simd_dot" => {
-                if let (Some(a), Some(b)) = (arg_vec_f64(args, 0), arg_vec_f64(args, 1)) {
+                let a = self.args_to_f64_vec(args, 0);
+                let b = self.args_to_f64_vec(args, 1);
+                if let (Some(a), Some(b)) = (a, b) {
                     let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
                     ExecOutcome::Value(Value::Float(dot))
-                } else {
-                    ExecOutcome::Panic("simd_dot: expected Vec, Vec".to_string())
-                }
+                } else { ExecOutcome::Panic("simd_dot: expected Vec, Vec".to_string()) }
             }
             "p_simd_sum" => {
-                if let Some(v) = arg_vec_f64(args, 0) {
+                if let Some(v) = self.args_to_f64_vec(args, 0) {
                     ExecOutcome::Value(Value::Float(v.iter().sum()))
-                } else {
-                    ExecOutcome::Panic("simd_sum: expected Vec".to_string())
-                }
+                } else { ExecOutcome::Panic("simd_sum: expected Vec".to_string()) }
             }
             "p_simd_scale" => {
-                if let (Some(v), Some(Value::Float(s))) = (arg_vec_f64(args, 0), args.get(1)) {
+                if let (Some(v), Some(Value::Float(s))) = (self.args_to_f64_vec(args, 0), args.get(1)) {
                     let result: SmallVec<[Value; 8]> = v.iter().map(|x| Value::Float(x * s)).collect();
                     ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(result))))
                 } else {
@@ -2507,12 +2808,8 @@ impl Interpreter {
                 }
             }
             "p_simd_from_vec" => {
-                if let Some(Value::Vec(v)) = args.first() {
-                    let result: SmallVec<[Value; 8]> = v.borrow().iter().map(|x| match x {
-                        Value::Int(i) => Value::Float(*i as f64),
-                        Value::Float(f) => Value::Float(*f),
-                        other => other.clone(),
-                    }).collect();
+                if let Some(v) = self.args_to_f64_vec(args, 0) {
+                    let result: SmallVec<[Value; 8]> = v.iter().map(|x| Value::Float(*x)).collect();
                     ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(result))))
                 } else {
                     ExecOutcome::Panic("simd_from_vec: expected Vec".to_string())

@@ -153,6 +153,33 @@ pub enum TokenKind {
     Eof,
 }
 
+impl TokenKind {
+    /// Returns true if this token is a word-like keyword that can be used as
+    /// an identifier (e.g. `match`, `query`, `state`). Returns false for
+    /// punctuation and operator tokens (e.g. `=`, `;`, `+`).
+    pub fn is_word_keyword(&self) -> bool {
+        matches!(self,
+            TokenKind::Pf | TokenKind::Pv | TokenKind::Pm | TokenKind::Mut |
+            TokenKind::Const | TokenKind::Given | TokenKind::Ensure | TokenKind::Pc |
+            TokenKind::Cap | TokenKind::Ty | TokenKind::Ret | TokenKind::If |
+            TokenKind::Else | TokenKind::Match | TokenKind::Struct | TokenKind::Enum |
+            TokenKind::Impl | TokenKind::Pub | TokenKind::Use | TokenKind::Module |
+            TokenKind::With | TokenKind::Async | TokenKind::Await | TokenKind::Comptime |
+            TokenKind::Defer | TokenKind::Spawn | TokenKind::Move | TokenKind::Static |
+            TokenKind::Try | TokenKind::In | TokenKind::As | TokenKind::Dyn |
+            TokenKind::Where | TokenKind::Region | TokenKind::Sandbox | TokenKind::Unsafe |
+            TokenKind::Txn | TokenKind::Persist | TokenKind::For | TokenKind::While |
+            TokenKind::Loop | TokenKind::Break | TokenKind::Continue | TokenKind::Handle |
+            TokenKind::Do | TokenKind::Interrupt | TokenKind::Extern | TokenKind::Guard |
+            TokenKind::Is | TokenKind::True | TokenKind::False |
+            TokenKind::Layer | TokenKind::Model | TokenKind::Grad | TokenKind::Backward |
+            TokenKind::Kernel |
+            TokenKind::Component | TokenKind::System | TokenKind::Query |
+            TokenKind::State | TokenKind::On
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Token {
     pub kind: TokenKind,

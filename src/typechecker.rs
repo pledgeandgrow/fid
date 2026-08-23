@@ -1662,6 +1662,11 @@ impl TypeChecker {
             }
             return;
         }
+        // The core standard library implicitly has all capabilities.
+        // This allows stdlib functions to call p_panic (Diverge) etc.
+        if self.current_module == "core" {
+            return;
+        }
         if self.strict_caps && !self.granted_caps.contains(cap) {
             self.errors.push(format!(
                 "Capability error: '{}' requires '{}' capability (not granted to module '{}').\n\
@@ -1767,8 +1772,14 @@ impl TypeChecker {
         self.scopes.iter().rev().find_map(|s| s.get(name))
     }
 
+    /// I-6B: Get the set of @linear struct names. Used by the lowerer to
+    /// propagate `is_linear` to IR ValueMeta for alias analysis.
+    pub fn get_linear_structs(&self) -> &HashSet<String> {
+        &self.linear_structs
+    }
+
     /// Check if a type is linear (i.e., it's a @linear struct or contains one).
-    fn is_linear_type(&self, ty: &Type) -> bool {
+    pub fn is_linear_type(&self, ty: &Type) -> bool {
         match ty {
             Type::Named(name) => self.linear_structs.contains(name),
             Type::Generic { name, .. } => self.linear_structs.contains(name),

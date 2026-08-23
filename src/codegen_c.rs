@@ -148,6 +148,8 @@ impl CCodeGen {
         let to_is_array = matches!(to, IrType::Array(_, _));
         let to_is_struct = Self::is_aggregate_ret(to);
 
+        let to_is_int = matches!(to, IrType::I64 | IrType::I32 | IrType::I16 | IrType::I8 | IrType::Bool);
+
         // Array params decay to pointers in C — cast to element pointer type
         if to_is_array {
             if let IrType::Array(elem, _) = to {
@@ -159,6 +161,10 @@ impl CCodeGen {
             // float → pointer: use type punning via union (double and void* are both 8 bytes)
             (false, true, _) if from_is_float => {
                 format!("((union {{ double d; void* p; }}){{ .d = {} }}).p", val)
+            }
+            // float → int: use type punning via union to preserve bit pattern
+            (false, false, _) if from_is_float && to_is_int => {
+                format!("((union {{ double d; int64_t i; }}){{ .d = {} }}).i", val)
             }
             // int → pointer: cast to void*
             (false, true, _) => format!("(void*){}", val),
@@ -445,15 +451,15 @@ impl CCodeGen {
             ("p_page_unmap", &[I64, I64]),
             ("p_phys_read64", &[I64]),
             ("p_phys_write64", &[I64, I64]),
-            ("p_simd_add", &[p(), p()]),
-            ("p_simd_sub", &[p(), p()]),
-            ("p_simd_mul", &[p(), p()]),
-            ("p_simd_div", &[p(), p()]),
-            ("p_simd_dot", &[p(), p()]),
-            ("p_simd_sum", &[p()]),
-            ("p_simd_scale", &[p(), F64]),
-            ("p_simd_from_vec", &[p()]),
-            ("p_simd_to_str", &[p()]),
+            ("p_simd_add", &[I64, I64]),
+            ("p_simd_sub", &[I64, I64]),
+            ("p_simd_mul", &[I64, I64]),
+            ("p_simd_div", &[I64, I64]),
+            ("p_simd_dot", &[I64, I64]),
+            ("p_simd_sum", &[I64]),
+            ("p_simd_scale", &[I64, F64]),
+            ("p_simd_from_vec", &[I64]),
+            ("p_simd_to_str", &[I64]),
             ("p_tensor_new", &[I64, p()]),
             ("p_tensor_from", &[p(), I64, p()]),
             ("p_tensor_zeros", &[p()]),
@@ -551,6 +557,14 @@ impl CCodeGen {
         ];
         for name in void_ret {
             self.fn_ret_types.insert(name.to_string(), IrType::Void);
+        }
+        // Phase 10B: p_map_keys/p_map_values/p_string_split now return i64 (Fides Vec pointer)
+        self.fn_ret_types.insert("p_map_keys".to_string(), IrType::I64);
+        self.fn_ret_types.insert("p_map_values".to_string(), IrType::I64);
+        self.fn_ret_types.insert("p_string_split".to_string(), IrType::I64);
+        // Phase 10B: SIMD functions now return i64 (Fides Vec pointer)
+        for name in &["p_simd_add", "p_simd_sub", "p_simd_mul", "p_simd_div", "p_simd_scale", "p_simd_from_vec"] {
+            self.fn_ret_types.insert(name.to_string(), IrType::I64);
         }
     }
 
@@ -704,16 +718,16 @@ impl CCodeGen {
         wln!(self, "void p_page_unmap(int64_t cr3, int64_t virt);");
         wln!(self, "int64_t p_phys_read64(int64_t addr);");
         wln!(self, "void p_phys_write64(int64_t addr, int64_t val);");
-        // SIMD builtins (Phase 5C) — elementwise double4 operations
-        wln!(self, "void* p_simd_add(void* a, void* b);");
-        wln!(self, "void* p_simd_sub(void* a, void* b);");
-        wln!(self, "void* p_simd_mul(void* a, void* b);");
-        wln!(self, "void* p_simd_div(void* a, void* b);");
-        wln!(self, "double p_simd_dot(void* a, void* b);");
-        wln!(self, "double p_simd_sum(void* a);");
-        wln!(self, "void* p_simd_scale(void* a, double s);");
-        wln!(self, "void* p_simd_from_vec(void* v);");
-        wln!(self, "char* p_simd_to_str(void* a);");
+        // SIMD builtins (Phase 5C) — elementwise double4 operations on Fides Vec
+        wln!(self, "int64_t p_simd_add(int64_t a, int64_t b);");
+        wln!(self, "int64_t p_simd_sub(int64_t a, int64_t b);");
+        wln!(self, "int64_t p_simd_mul(int64_t a, int64_t b);");
+        wln!(self, "int64_t p_simd_div(int64_t a, int64_t b);");
+        wln!(self, "double p_simd_dot(int64_t a, int64_t b);");
+        wln!(self, "double p_simd_sum(int64_t a);");
+        wln!(self, "int64_t p_simd_scale(int64_t a, double s);");
+        wln!(self, "int64_t p_simd_from_vec(int64_t v);");
+        wln!(self, "char* p_simd_to_str(int64_t a);");
         // Tensor builtins (Phase 5C)
         wln!(self, "void* p_tensor_new(int64_t ndim, int64_t* shape);");
         wln!(self, "void* p_tensor_from(void* data, int64_t ndim, int64_t* shape);");
@@ -799,7 +813,7 @@ impl CCodeGen {
         wln!(self, "char* p_string_to_lowercase(const char* s);");
         wln!(self, "char* p_string_repeat(const char* s, int64_t n);");
         wln!(self, "char* p_string_replace(const char* s, const char* from, const char* to);");
-        wln!(self, "PVec* p_string_split(const char* s, const char* delim);");
+        wln!(self, "int64_t p_string_split(const char* s, const char* delim);");
         wln!(self, "int64_t p_string_parse_int(const char* s);");
         wln!(self, "char* p_string_char_at(const char* s, int64_t idx);");
         wln!(self, "char* p_string_substring(const char* s, int64_t start, int64_t end);");
@@ -1684,16 +1698,20 @@ impl CCodeGen {
                         wln!(self, "    p_print_str({});", v);
                     }
                     IrType::Generic(name, _) if name == "Vec" => {
-                        wln!(self, "    {{ char* _s = p_to_str_vec((PVec*){}); p_print_str(_s); free(_s); }}", v);
+                        // Phase 10B: Vec is now a raw i64 pointer — call Fides Vec_to_str
+                        wln!(self, "    {{ char* _s = (char*)Vec_to_str(0, (int64_t){}); p_print_str(_s); free(_s); }}", v);
                     }
                     IrType::Opaque(name) if name == "Vec" => {
-                        wln!(self, "    {{ char* _s = p_to_str_vec((PVec*){}); p_print_str(_s); free(_s); }}", v);
+                        // Phase 10B: Vec is now a raw i64 pointer — call Fides Vec_to_str
+                        wln!(self, "    {{ char* _s = (char*)Vec_to_str(0, (int64_t){}); p_print_str(_s); free(_s); }}", v);
                     }
                     IrType::Generic(name, _) if name == "HashMap" => {
-                        wln!(self, "    {{ char* _s = p_to_str_map((PMap*){}); p_print_str(_s); free(_s); }}", v);
+                        // Phase 10B: HashMap is now a raw i64 pointer — call Fides HashMap_to_str
+                        wln!(self, "    {{ char* _s = (char*)HashMap_to_str(0, (int64_t){}); p_print_str(_s); free(_s); }}", v);
                     }
                     IrType::Opaque(name) if name == "String" => {
-                        wln!(self, "    p_print_str({});", v);
+                        // Phase 10B: String from Vec_get is an i64 pointer — cast to char*
+                        wln!(self, "    p_print_str((char*){});", v);
                     }
                     _ => {
                         wln!(self, "    p_print_int((int64_t){});", v);
@@ -2123,18 +2141,18 @@ impl CCodeGen {
         wln!(self, "    result[ri] = 0;");
         wln!(self, "    return result;");
         wln!(self, "}}");
-        wln!(self, "PVec* p_string_split(const char* s, const char* delim) {{");
-        wln!(self, "    PVec* v = p_vec_new();");
+        wln!(self, "int64_t p_string_split(const char* s, const char* delim) {{");
+        wln!(self, "    int64_t v = Vec_new(0);");
         wln!(self, "    if (!s || !delim) return v;");
         wln!(self, "    const char* start = s;");
         wln!(self, "    size_t dlen = strlen(delim);");
         wln!(self, "    while (*start) {{");
         wln!(self, "        const char* p = strstr(start, delim);");
-        wln!(self, "        if (!p) {{ p_vec_push(v, strdup(start)); break; }}");
+        wln!(self, "        if (!p) {{ Vec_push(0, v, (int64_t)strdup(start)); break; }}");
         wln!(self, "        size_t len = p - start;");
         wln!(self, "        char* part = (char*)malloc(len + 1);");
         wln!(self, "        memcpy(part, start, len); part[len] = 0;");
-        wln!(self, "        p_vec_push(v, part);");
+        wln!(self, "        Vec_push(0, v, (int64_t)part);");
         wln!(self, "        start = p + dlen;");
         wln!(self, "    }}");
         wln!(self, "    return v;");
@@ -2358,66 +2376,70 @@ impl CCodeGen {
 
         // ─── SIMD builtins (Phase 5C) — operate on Vec<f64> ───
         wln!(self, "");
-        wln!(self, "// SIMD builtins — operate on PVec (Vec<f64>)");
-        wln!(self, "// Helper: read double from PVec element (stored as void* via type punning)");
-        self.out.push_str("static double _pvec_get_f64(PVec* v, int i) {\n");
-        self.out.push_str("    if (!v || i < 0 || i >= v->len) return 0;\n");
-        self.out.push_str("    union { void* p; double d; } u; u.p = v->data[i]; return u.d;\n");
+        wln!(self, "// SIMD builtins — operate on Fides Vec (i64 pointer, f64 stored as i64 bits)");
+        wln!(self, "// Helper: read double from Fides Vec element (stored as i64 bit pattern)");
+        self.out.push_str("static double _fvec_get_f64(int64_t v, int i) {\n");
+        self.out.push_str("    int64_t val = Vec_get(0, v, i);\n");
+        self.out.push_str("    union { int64_t i; double d; } u; u.i = val; return u.d;\n");
         self.out.push_str("}\n");
-        self.out.push_str("static void _pvec_push_f64(PVec* v, double d) {\n");
-        self.out.push_str("    union { void* p; double d; } u; u.d = d; p_vec_push(v, u.p);\n");
+        self.out.push_str("static int64_t _fvec_new() { return Vec_new(0); }\n");
+        self.out.push_str("static void _fvec_push_f64(int64_t v, double d) {\n");
+        self.out.push_str("    union { double d; int64_t i; } u; u.d = d; Vec_push(0, v, u.i);\n");
         self.out.push_str("}\n");
-        wln!(self, "void* p_simd_add(void* a, void* b) {{");
-        wln!(self, "    PVec* va = (PVec*)a; PVec* vb = (PVec*)b; PVec* r = p_vec_new();");
-        wln!(self, "    int n = va ? va->len : 0;");
-        wln!(self, "    for (int i = 0; i < n; i++) _pvec_push_f64(r, _pvec_get_f64(va,i) + _pvec_get_f64(vb,i));");
+        wln!(self, "int64_t p_simd_add(int64_t a, int64_t b) {{");
+        wln!(self, "    int64_t r = _fvec_new();");
+        wln!(self, "    int n = (int)Vec_len(0, a);");
+        wln!(self, "    for (int i = 0; i < n; i++) _fvec_push_f64(r, _fvec_get_f64(a,i) + _fvec_get_f64(b,i));");
         wln!(self, "    return r;");
         wln!(self, "}}");
-        wln!(self, "void* p_simd_sub(void* a, void* b) {{");
-        wln!(self, "    PVec* va = (PVec*)a; PVec* vb = (PVec*)b; PVec* r = p_vec_new();");
-        wln!(self, "    int n = va ? va->len : 0;");
-        wln!(self, "    for (int i = 0; i < n; i++) _pvec_push_f64(r, _pvec_get_f64(va,i) - _pvec_get_f64(vb,i));");
+        wln!(self, "int64_t p_simd_sub(int64_t a, int64_t b) {{");
+        wln!(self, "    int64_t r = _fvec_new();");
+        wln!(self, "    int n = (int)Vec_len(0, a);");
+        wln!(self, "    for (int i = 0; i < n; i++) _fvec_push_f64(r, _fvec_get_f64(a,i) - _fvec_get_f64(b,i));");
         wln!(self, "    return r;");
         wln!(self, "}}");
-        wln!(self, "void* p_simd_mul(void* a, void* b) {{");
-        wln!(self, "    PVec* va = (PVec*)a; PVec* vb = (PVec*)b; PVec* r = p_vec_new();");
-        wln!(self, "    int n = va ? va->len : 0;");
-        wln!(self, "    for (int i = 0; i < n; i++) _pvec_push_f64(r, _pvec_get_f64(va,i) * _pvec_get_f64(vb,i));");
+        wln!(self, "int64_t p_simd_mul(int64_t a, int64_t b) {{");
+        wln!(self, "    int64_t r = _fvec_new();");
+        wln!(self, "    int n = (int)Vec_len(0, a);");
+        wln!(self, "    for (int i = 0; i < n; i++) _fvec_push_f64(r, _fvec_get_f64(a,i) * _fvec_get_f64(b,i));");
         wln!(self, "    return r;");
         wln!(self, "}}");
-        wln!(self, "void* p_simd_div(void* a, void* b) {{");
-        wln!(self, "    PVec* va = (PVec*)a; PVec* vb = (PVec*)b; PVec* r = p_vec_new();");
-        wln!(self, "    int n = va ? va->len : 0;");
-        wln!(self, "    for (int i = 0; i < n; i++) {{ double db = _pvec_get_f64(vb,i); _pvec_push_f64(r, db != 0 ? _pvec_get_f64(va,i) / db : 0); }}");
+        wln!(self, "int64_t p_simd_div(int64_t a, int64_t b) {{");
+        wln!(self, "    int64_t r = _fvec_new();");
+        wln!(self, "    int n = (int)Vec_len(0, a);");
+        wln!(self, "    for (int i = 0; i < n; i++) {{ double db = _fvec_get_f64(b,i); _fvec_push_f64(r, db != 0 ? _fvec_get_f64(a,i) / db : 0); }}");
         wln!(self, "    return r;");
         wln!(self, "}}");
-        wln!(self, "double p_simd_dot(void* a, void* b) {{");
-        wln!(self, "    PVec* va = (PVec*)a; PVec* vb = (PVec*)b;");
-        wln!(self, "    int n = va ? va->len : 0; double s = 0;");
-        wln!(self, "    for (int i = 0; i < n; i++) s += _pvec_get_f64(va,i) * _pvec_get_f64(vb,i);");
+        wln!(self, "double p_simd_dot(int64_t a, int64_t b) {{");
+        wln!(self, "    int n = (int)Vec_len(0, a); double s = 0;");
+        wln!(self, "    for (int i = 0; i < n; i++) s += _fvec_get_f64(a,i) * _fvec_get_f64(b,i);");
         wln!(self, "    return s;");
         wln!(self, "}}");
-        wln!(self, "double p_simd_sum(void* a) {{");
-        wln!(self, "    PVec* va = (PVec*)a;");
-        wln!(self, "    int n = va ? va->len : 0; double s = 0;");
-        wln!(self, "    for (int i = 0; i < n; i++) s += _pvec_get_f64(va,i);");
+        wln!(self, "double p_simd_sum(int64_t a) {{");
+        wln!(self, "    int n = (int)Vec_len(0, a); double s = 0;");
+        wln!(self, "    for (int i = 0; i < n; i++) s += _fvec_get_f64(a,i);");
         wln!(self, "    return s;");
         wln!(self, "}}");
-        wln!(self, "void* p_simd_scale(void* a, double s) {{");
-        wln!(self, "    PVec* va = (PVec*)a; PVec* r = p_vec_new();");
-        wln!(self, "    int n = va ? va->len : 0;");
-        wln!(self, "    for (int i = 0; i < n; i++) _pvec_push_f64(r, _pvec_get_f64(va,i) * s);");
+        wln!(self, "int64_t p_simd_scale(int64_t a, double s) {{");
+        wln!(self, "    int64_t r = _fvec_new();");
+        wln!(self, "    int n = (int)Vec_len(0, a);");
+        wln!(self, "    for (int i = 0; i < n; i++) _fvec_push_f64(r, _fvec_get_f64(a,i) * s);");
         wln!(self, "    return r;");
         wln!(self, "}}");
-        wln!(self, "void* p_simd_from_vec(void* v) {{ (void)v; return p_vec_new(); }}");
-        wln!(self, "char* p_simd_to_str(void* a) {{");
-        wln!(self, "    PVec* va = (PVec*)a;");
-        wln!(self, "    if (!va) return strdup(\"[]\");");
+        wln!(self, "int64_t p_simd_from_vec(int64_t v) {{");
+        wln!(self, "    int64_t r = _fvec_new();");
+        wln!(self, "    int n = (int)Vec_len(0, v);");
+        wln!(self, "    for (int i = 0; i < n; i++) _fvec_push_f64(r, (double)Vec_get(0, v, i));");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "char* p_simd_to_str(int64_t a) {{");
+        wln!(self, "    if (!a) return strdup(\"[]\");");
         wln!(self, "    size_t cap = 64; char* result = (char*)malloc(cap); size_t pos = 0;");
         wln!(self, "    result[pos++] = '[';");
-        wln!(self, "    for (int64_t i = 0; i < va->len; i++) {{");
+        wln!(self, "    int64_t n = Vec_len(0, a);");
+        wln!(self, "    for (int64_t i = 0; i < n; i++) {{");
         wln!(self, "        if (i > 0) {{ if (pos+2>=cap){{cap*=2;result=(char*)realloc(result,cap);}} result[pos++]=','; result[pos++]=' '; }}");
-        wln!(self, "        double d = _pvec_get_f64(va, i);");
+        wln!(self, "        double d = _fvec_get_f64(a, i);");
         wln!(self, "        char buf[32];");
         wln!(self, "        if (d == (int64_t)d) snprintf(buf,sizeof(buf),\"%lld\",(long long)d);");
         wln!(self, "        else snprintf(buf,sizeof(buf),\"%g\",d);");

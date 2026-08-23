@@ -313,9 +313,10 @@ impl Parser {
             self.advance();
             return Ok(s.clone());
         }
-        // Accept any keyword as an identifier
-        let s = format!("{}", tok.kind);
-        if s != "<eof>" && s != "<invalid>" {
+        // Accept word-like keywords as identifiers (e.g. `match`, `query`, `state`).
+        // Reject punctuation/operator tokens (e.g. `=`, `;`, `{`).
+        if tok.kind.is_word_keyword() {
+            let s = format!("{}", tok.kind);
             self.advance();
             Ok(s)
         } else {
@@ -1753,7 +1754,7 @@ impl Parser {
             let mut names = Vec::new();
             if !self.check(&TokenKind::RParen) {
                 loop {
-                    let name = self.expect_ident()?;
+                    let name = self.expect_ident_or_keyword()?;
                     names.push(name);
                     if !self.match_tok(TokenKind::Comma) {
                         break;
@@ -1767,7 +1768,7 @@ impl Parser {
             return Ok(Stmt::LetTuple { names, expr, line });
         }
 
-        let name = self.expect_ident()?;
+        let name = self.expect_ident_or_keyword()?;
 
         let ty = if self.match_tok(TokenKind::Colon) {
             Some(self.parse_type()?)
@@ -1791,7 +1792,7 @@ impl Parser {
     fn parse_let_uninit(&mut self) -> Result<Stmt, String> {
         let line = self.peek_token().line;
         self.expect(TokenKind::Pm, "pm")?;
-        let name = self.expect_ident()?;
+        let name = self.expect_ident_or_keyword()?;
         self.expect(TokenKind::Colon, ":")?;
         let ty = self.parse_type()?;
         self.match_tok(TokenKind::Semicolon);
@@ -1804,7 +1805,7 @@ impl Parser {
         self.expect(TokenKind::Persist, "persist")?;
         self.expect(TokenKind::Pv, "pv")?;
         let is_mut = self.match_tok(TokenKind::Mut);
-        let name = self.expect_ident()?;
+        let name = self.expect_ident_or_keyword()?;
 
         let ty = if self.match_tok(TokenKind::Colon) {
             Some(self.parse_type()?)
