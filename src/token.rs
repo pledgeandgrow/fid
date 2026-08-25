@@ -17,6 +17,7 @@ pub enum TokenKind {
     If,
     Else,
     Match,
+    Select,
     Struct,
     Enum,
     Impl,
@@ -162,7 +163,7 @@ impl TokenKind {
             TokenKind::Pf | TokenKind::Pv | TokenKind::Pm | TokenKind::Mut |
             TokenKind::Const | TokenKind::Given | TokenKind::Ensure | TokenKind::Pc |
             TokenKind::Cap | TokenKind::Ty | TokenKind::Ret | TokenKind::If |
-            TokenKind::Else | TokenKind::Match | TokenKind::Struct | TokenKind::Enum |
+            TokenKind::Else | TokenKind::Match | TokenKind::Select | TokenKind::Struct | TokenKind::Enum |
             TokenKind::Impl | TokenKind::Pub | TokenKind::Use | TokenKind::Module |
             TokenKind::With | TokenKind::Async | TokenKind::Await | TokenKind::Comptime |
             TokenKind::Defer | TokenKind::Spawn | TokenKind::Move | TokenKind::Static |
@@ -210,6 +211,7 @@ impl fmt::Display for TokenKind {
             TokenKind::If => write!(f, "if"),
             TokenKind::Else => write!(f, "else"),
             TokenKind::Match => write!(f, "match"),
+            TokenKind::Select => write!(f, "select"),
             TokenKind::Struct => write!(f, "struct"),
             TokenKind::Enum => write!(f, "enum"),
             TokenKind::Impl => write!(f, "impl"),

@@ -644,6 +644,16 @@ impl CodeGen {
             Stmt::Query { body, .. } => {
                 for s in body { self.gen_stmt(s); }
             }
+            Stmt::Select { cases, default, .. } => {
+                // Select is lowered to IR before codegen, so this shouldn't
+                // normally be reached. Handle gracefully by executing default.
+                for case in cases {
+                    for s in &case.body { self.gen_stmt(s); }
+                }
+                if let Some(ref def) = default {
+                    for s in def { self.gen_stmt(s); }
+                }
+            }
         }
     }
 

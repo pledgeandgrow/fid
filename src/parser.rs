@@ -19,16 +19,18 @@ pub struct Parser {
     enum_names: Vec<String>,
     /// Type alias names that resolve to struct types (for struct literal parsing)
     alias_to_struct: Vec<String>,
+    /// Collected parse errors for error recovery (task 2.4).
+    errors: Vec<String>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0, struct_names: Vec::new(), enum_names: Vec::new(), alias_to_struct: Vec::new() }
+        Parser { tokens, pos: 0, struct_names: Vec::new(), enum_names: Vec::new(), alias_to_struct: Vec::new(), errors: Vec::new() }
     }
 
     /// Create a parser with pre-populated struct/enum names (for stdlib auto-include)
     pub fn with_names(tokens: Vec<Token>, struct_names: Vec<String>, enum_names: Vec<String>) -> Self {
-        Parser { tokens, pos: 0, struct_names, enum_names, alias_to_struct: Vec::new() }
+        Parser { tokens, pos: 0, struct_names, enum_names, alias_to_struct: Vec::new(), errors: Vec::new() }
     }
 
     pub fn parse(&mut self) -> Result<Program, String> {
@@ -43,7 +45,30 @@ impl Parser {
                 false
             };
 
-            match self.peek() {
+            // Parse one top-level item; on error, record it and recover.
+            if let Err(e) = self.parse_top_level_item(&mut program, is_pub) {
+                self.errors.push(e);
+                self.recover_to_sync_token();
+                // If recovery stopped at an orphaned `}`, skip past it so we
+                // don't get stuck retrying the same token (task 2.4).
+                if self.check(&TokenKind::RBrace) {
+                    self.advance();
+                }
+            }
+        }
+
+        if !self.errors.is_empty() {
+            return Err(self.errors.join("\n"));
+        }
+
+        Ok(program)
+    }
+
+    /// Parse a single top-level declaration and push it into `program`.
+    /// Returns `Err(msg)` on parse failure so the caller can record the error
+    /// and perform synchronization recovery (task 2.4).
+    fn parse_top_level_item(&mut self, program: &mut Program, is_pub: bool) -> Result<(), String> {
+        match self.peek() {
                 TokenKind::Module => {
                     self.advance(); // consume module
                     let mut name = String::new();
@@ -239,9 +264,8 @@ impl Parser {
                     program.funcs.push(func);
                 }
             }
-        }
 
-        Ok(program)
+        Ok(())
     }
 
     fn peek(&self) -> &TokenKind {
@@ -274,6 +298,34 @@ impl Parser {
             true
         } else {
             false
+        }
+    }
+
+    /// Skip tokens until a synchronization point is reached (task 2.4).
+    ///
+    /// Top-level sync tokens: `pf`, `pub`, `struct`, `enum`, `impl`, `use`, `}`
+    /// Statement-level sync token: `;`
+    ///
+    /// The `;` is consumed (statement-level recovery).  `}` and top-level
+    /// keywords are left unconsumed so the caller can act on them.
+    fn recover_to_sync_token(&mut self) {
+        while !self.is_at_end() {
+            match self.peek() {
+                TokenKind::Semicolon => {
+                    self.advance(); // consume ; and resume
+                    return;
+                }
+                TokenKind::RBrace => return, // leave for caller
+                TokenKind::Pf
+                | TokenKind::Pub
+                | TokenKind::Struct
+                | TokenKind::Enum
+                | TokenKind::Impl
+                | TokenKind::Use => return,
+                _ => {
+                    self.advance();
+                }
+            }
         }
     }
 
@@ -397,7 +449,7 @@ impl Parser {
             let fname = self.expect_ident_or_keyword()?;
             self.expect(TokenKind::Colon, ":")?;
             let fty = self.parse_type()?;
-            fields.push(Param { name: fname, ty: fty, is_pub });
+            fields.push(Param { name: fname, ty: fty, is_pub, annotations: Vec::new() });
             self.match_tok(TokenKind::Comma);
         }
         self.expect(TokenKind::RBrace, "}")?;
@@ -442,10 +494,10 @@ impl Parser {
                 }
             } else {
                 // Parse a field: name: Type,
-                let fname = self.expect_ident()?;
+                let fname = self.expect_ident_or_keyword()?;
                 self.expect(TokenKind::Colon, ":")?;
                 let fty = self.parse_type()?;
-                fields.push(Param { name: fname, ty: fty, is_pub: false });
+                fields.push(Param { name: fname, ty: fty, is_pub: false, annotations: Vec::new() });
                 self.match_tok(TokenKind::Comma);
             }
         }
@@ -536,6 +588,7 @@ impl Parser {
                 name: field_name,
                 ty: field_ty,
                 is_pub: false,
+                annotations: Vec::new(),
             });
             self.match_tok(TokenKind::Comma);
         }
@@ -666,12 +719,12 @@ impl Parser {
                             let pname = self.expect_ident()?;
                             self.expect(TokenKind::Colon, ":")?;
                             let pty = self.parse_type()?;
-                            params.push(Param { name: pname, ty: pty, is_pub: false });
+                            params.push(Param { name: pname, ty: pty, is_pub: false, annotations: Vec::new() });
                         } else {
                             // Anonymous: just a type
                             let pty = self.parse_type()?;
                             let pname = format!("_{}", params.len());
-                            params.push(Param { name: pname, ty: pty, is_pub: false });
+                            params.push(Param { name: pname, ty: pty, is_pub: false, annotations: Vec::new() });
                         }
                         if !self.match_tok(TokenKind::Comma) {
                             break;
@@ -884,11 +937,11 @@ impl Parser {
                     let pname = self.expect_ident()?;
                     if pname == "self" && !self.check(&TokenKind::Colon) {
                         // Bare 'self' — type will be filled in by the impl
-                        params.push(Param { name: "self".to_string(), ty: Type::Named("Self".to_string()), is_pub: false });
+                        params.push(Param { name: "self".to_string(), ty: Type::Named("Self".to_string()), is_pub: false, annotations: Vec::new() });
                     } else {
                         self.expect(TokenKind::Colon, ":")?;
                         let ty = self.parse_type()?;
-                        params.push(Param { name: pname, ty, is_pub: false });
+                        params.push(Param { name: pname, ty, is_pub: false, annotations: Vec::new() });
                     }
                     if !self.match_tok(TokenKind::Comma) {
                         break;
@@ -1111,11 +1164,11 @@ impl Parser {
             let name = self.expect_ident_or_keyword()?;
             // Handle bare 'self' (without type annotation) in impl methods
             if name == "self" && !self.check(&TokenKind::Colon) {
-                params.push(Param { name: "self".to_string(), ty: Type::Named("Self".to_string()), is_pub: false });
+                params.push(Param { name: "self".to_string(), ty: Type::Named("Self".to_string()), is_pub: false, annotations: Vec::new() });
             } else {
                 self.expect(TokenKind::Colon, ":")?;
                 let ty = self.parse_type()?;
-                params.push(Param { name, ty, is_pub: false });
+                params.push(Param { name, ty, is_pub: false, annotations: Vec::new() });
             }
 
             if !self.match_tok(TokenKind::Comma) {
@@ -1176,6 +1229,10 @@ impl Parser {
             }
             TokenKind::Ident(s) => {
                 self.advance();
+                // Check for inferred type: `_`
+                if s == "_" {
+                    return Ok(Type::Infer);
+                }
                 // Check for associated type: T::Item or GAT T::Item<X>
                 if self.check(&TokenKind::DoubleColon) {
                     self.advance();
@@ -1338,7 +1395,15 @@ impl Parser {
         let mut stmts = Vec::new();
 
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
-            stmts.push(self.parse_stmt()?);
+            match self.parse_stmt() {
+                Ok(stmt) => stmts.push(stmt),
+                Err(e) => {
+                    // Statement-level recovery: record the error, skip to the
+                    // next `;` or `}`, and continue parsing the block (task 2.4).
+                    self.errors.push(e);
+                    self.recover_to_sync_token();
+                }
+            }
         }
 
         Ok(stmts)
@@ -1391,6 +1456,7 @@ impl Parser {
                 Ok(Stmt::Defer(body, line))
             }
             TokenKind::Match => self.parse_match_stmt(),
+            TokenKind::Select => self.parse_select_stmt(),
             TokenKind::Use => self.parse_use_stmt(),
             TokenKind::Handle => self.parse_handle_stmt(),
             TokenKind::Do => self.parse_do_stmt(),
@@ -1416,10 +1482,7 @@ impl Parser {
                     if name == "gen" {
                         self.advance(); // consume gen
                         self.expect(TokenKind::LBrace, "{")?;
-                        let mut block = Vec::new();
-                        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
-                            block.push(self.parse_stmt()?);
-                        }
+                        let block = self.parse_block()?;
                         self.expect(TokenKind::RBrace, "}")?;
                         return Ok(Stmt::ComptimeGen { block, line });
                     }
@@ -1595,6 +1658,45 @@ impl Parser {
         self.expect(TokenKind::RBrace, "}")?;
 
         Ok(Stmt::Match { expr, arms, line })
+    }
+
+    /// Parse a select statement: `select { case ch => x => { body } default => { body } }`
+    fn parse_select_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect(TokenKind::Select, "select")?;
+        self.expect(TokenKind::LBrace, "{")?;
+
+        let mut cases = Vec::new();
+        let mut default = None;
+
+        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            // Expect `case` or `default`
+            let ident = self.expect_ident()?;
+            if ident == "default" {
+                self.expect(TokenKind::FatArrow, "=>")?;
+                self.expect(TokenKind::LBrace, "{")?;
+                let body = self.parse_block()?;
+                self.expect(TokenKind::RBrace, "}")?;
+                default = Some(body);
+                self.match_tok(TokenKind::Comma);
+            } else if ident == "case" {
+                // case ch => var => { body }
+                let channel = self.parse_expr()?;
+                self.expect(TokenKind::FatArrow, "=>")?;
+                let var_name = self.expect_ident()?;
+                self.expect(TokenKind::FatArrow, "=>")?;
+                self.expect(TokenKind::LBrace, "{")?;
+                let body = self.parse_block()?;
+                self.expect(TokenKind::RBrace, "}")?;
+                self.match_tok(TokenKind::Comma);
+                cases.push(SelectCase { channel, var_name, body });
+            } else {
+                return Err(format!("Expected 'case' or 'default' in select, got '{}'", ident));
+            }
+        }
+        self.expect(TokenKind::RBrace, "}")?;
+
+        Ok(Stmt::Select { cases, default, line })
     }
 
     fn parse_match_expr(&mut self) -> Result<Expr, String> {
@@ -2411,7 +2513,7 @@ impl Parser {
                                 }
                                 continue;
                             }
-                            let fname = self.expect_ident()?;
+                            let fname = self.expect_ident_or_keyword()?;
                             self.expect(TokenKind::Colon, ":")?;
                             let fval = self.parse_expr()?;
                             fields.push((fname, fval));
@@ -2515,19 +2617,20 @@ impl Parser {
                 Ok(Expr::Spawn { expr: Box::new(expr) })
             }
             _ => {
-                // Allow keywords to be used as identifiers in expression context
-                // (e.g. `query` as a variable name, `move` as a field name)
-                let kw_str = format!("{}", tok.kind);
-                if kw_str != "<eof>" && kw_str != "<invalid>" && !kw_str.starts_with('<') {
+                // Allow word-like keywords to be used as identifiers in expression
+                // context (e.g. `query` as a variable name, `move` as a field name).
+                // Punctuation tokens (e.g. `;`, `}`, `{`) must NOT be accepted —
+                // they should produce a parse error so error recovery can activate.
+                if tok.kind.is_word_keyword() {
+                    let kw_str = format!("{}", tok.kind);
                     self.advance();
                     Ok(Expr::Ident(kw_str))
                 } else {
-                // Try postfix (field access) on primary expressions
-                // If it's not a primary token, error
-                Err(format!(
-                    "Parse error at {}:{}: unexpected token '{}'",
-                    tok.line, tok.col, tok.kind
-                ))
+                    // Not a valid primary expression token
+                    Err(format!(
+                        "Parse error at {}:{}: unexpected token '{}'",
+                        tok.line, tok.col, tok.kind
+                    ))
                 }
             }
         }

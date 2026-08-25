@@ -451,6 +451,23 @@ pub struct ValueMeta {
     /// Linear values can't alias with anything else, so stores/loads through
     /// linear pointers are safe to reorder relative to other memory ops.
     pub is_linear: bool,
+    /// I-7A: Borrow kind — tracks whether this pointer value is a shared
+    /// borrow (&x), mutable borrow (&mut x), or not a borrow (None).
+    /// Used by alias analysis: a Load through a shared borrow is safe
+    /// across a Store through a different mutable borrow to the same
+    /// allocation (they can't coexist per the borrow checker).
+    pub borrow_kind: BorrowKind,
+}
+
+/// I-7A: Borrow provenance for pointer values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BorrowKind {
+    /// Not a borrow — this value is not a reference (or provenance unknown).
+    None,
+    /// Shared borrow: `&x`. Read-only, multiple shared borrows can coexist.
+    Shared,
+    /// Mutable borrow: `&mut x`. Exclusive, no other borrows can coexist.
+    Mut,
 }
 
 // ─── Instructions ───────────────────────────────────────────────────────
@@ -514,6 +531,9 @@ pub enum Inst {
     Store {
         ptr: ValueId,
         value: ValueId,
+        /// The type being stored (for typed stores through pointers).
+        /// Defaults to I64 for local variable stores.
+        store_ty: Option<IrType>,
     },
     /// Get the address of a struct field
     GetFieldPtr {
@@ -841,7 +861,7 @@ impl Inst {
             Inst::BinOp { left, right, .. } => vec![*left, *right],
             Inst::UnaryOp { operand, .. } => vec![*operand],
             Inst::Load { ptr, .. } => vec![*ptr],
-            Inst::Store { ptr, value } => vec![*ptr, *value],
+            Inst::Store { ptr, value, .. } => vec![*ptr, *value],
             Inst::GetFieldPtr { struct_ptr, .. } => vec![*struct_ptr],
             Inst::GetElemPtr { array_ptr, index, .. } => vec![*array_ptr, *index],
             Inst::Jump { .. } => Vec::new(),
@@ -1013,6 +1033,7 @@ impl IrFunction {
             source_line: None,
             in_sandbox: false,
             is_linear: false,
+            borrow_kind: crate::ir::BorrowKind::None,
         };
 
         let id = self.new_value(meta);
@@ -1041,6 +1062,7 @@ impl IrFunction {
             source_line: None,
             in_sandbox: false,
             is_linear: false,
+            borrow_kind: crate::ir::BorrowKind::None,
         };
         let id = self.new_value(meta);
         let block_idx = block.0 as usize;
@@ -1265,6 +1287,7 @@ pub fn lower_type(ast_ty: &AstType) -> IrType {
         AstType::Str => IrType::Ptr(Box::new(IrType::U8)), // str -> *u8 (simplified)
         AstType::Void => IrType::Void,
         AstType::Never => IrType::Void,
+        AstType::Infer => IrType::I64, // Infer defaults to i64 at the IR level
         AstType::Named(name) => {
             // Vec, HashMap, Tensor, and Allocator are opaque types (not structs)
             if name == "Vec" || name == "HashMap" || name == "Tensor" || name == "Allocator" {

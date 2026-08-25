@@ -252,6 +252,7 @@ fn parse_c_param(param: &str) -> Option<Param> {
                 name: if name.is_empty() { format!("arg{}", 0) } else { name.to_string() },
                 ty,
                 is_pub: false,
+                annotations: Vec::new(),
             });
         }
     }
@@ -267,6 +268,7 @@ fn parse_c_param(param: &str) -> Option<Param> {
         name: if name.is_empty() { "arg".to_string() } else { name.to_string() },
         ty,
         is_pub: false,
+        annotations: Vec::new(),
     })
 }
 

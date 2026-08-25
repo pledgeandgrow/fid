@@ -230,28 +230,32 @@ fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<
             // literal bounds and the body is small (≤ 16 statements), unroll
             // the loop at the AST level. This makes the unrolled body available
             // for further comptime optimization (const folding, etc.).
-            if let Expr::Range { start, end, .. } = iterator {
+            if let Expr::Range { start, end, inclusive } = iterator {
                 if let (Expr::IntLit(s), Expr::IntLit(e)) = (start.as_ref(), end.as_ref()) {
-                    let trip = e - s;
+                    let trip = if *inclusive { e - s + 1 } else { e - s };
                     if trip > 0 && trip <= 16 && body.len() <= 16 {
                         // Build unrolled body: for each iteration, clone the body
                         // with the loop variable replaced by a literal.
                         let mut unrolled: Vec<Stmt> = Vec::new();
-                        for i in *s..*e {
+                        let last = if *inclusive { *e + 1 } else { *e };
+                        for i in *s..last {
                             for s in body.iter() {
                                 let mut cloned = s.clone();
                                 replace_ident_in_stmt(&mut cloned, var, &Expr::IntLit(i));
                                 unrolled.push(cloned);
                             }
                         }
-                        *body = unrolled;
-                        // Replace iterator with an empty range to make the loop
-                        // a no-op (0 iterations). The optimizer will remove it.
-                        *iterator = Expr::Range {
-                            start: Box::new(Expr::IntLit(0)),
-                            end: Box::new(Expr::IntLit(0)),
-                            inclusive: false,
+                        // Replace the entire for loop with an `if true` block
+                        // containing the unrolled statements. This ensures the
+                        // unrolled body actually executes. (We use `if true`
+                        // because Stmt has no Block variant.)
+                        *stmt = Stmt::If {
+                            cond: Expr::BoolLit(true),
+                            then_block: unrolled,
+                            else_block: None,
+                            line: 0,
                         };
+                        return;
                     }
                 }
             }
@@ -532,6 +536,15 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<String>) 
             substitute_expr(loss, original, errs);
         }
         Stmt::Query { body, .. } => substitute_stmts(body, original, errs),
+        Stmt::Select { cases, default, .. } => {
+            for case in cases {
+                substitute_expr(&mut case.channel, original, errs);
+                substitute_stmts(&mut case.body, original, errs);
+            }
+            if let Some(ref mut def) = default {
+                substitute_stmts(def, original, errs);
+            }
+        }
     }
 }
 

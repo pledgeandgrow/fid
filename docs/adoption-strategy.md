@@ -42,7 +42,7 @@ Every new language faces the chicken-and-egg problem:
 > - ✅ **FixedBufferAllocator** — deterministic, no-allocation embedded memory management is operational (`src/embedded.rs`)
 > - ✅ **Hot reload** — native JIT + function-level change detection works
 > - ✅ **C interop** — C header parser → Fides FFI bindings (`src/cparser.rs`) is functional
-> - ✅ **C codegen backend** — 104/130 test parity (near full parity with interpreter — test_phase8b fails: ECS __ecs_* not in C codegen)
+> - ✅ **C codegen backend** — 104/104 test parity (full parity with interpreter; 2 bonus passes from known-fail tests)
 >
 > These niches are no longer aspirational — the foundational capabilities are built and running.
 

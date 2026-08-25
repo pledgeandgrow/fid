@@ -360,7 +360,7 @@ impl X86CodeGen {
                 wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
             }
 
-            Inst::Store { ptr, value } => {
+            Inst::Store { ptr, value, .. } => {
                 let poff = frame.offset(*ptr);
                 let voff = frame.offset(*value);
                 wln!(self, "    mov rax, [rbp{}]", fmt_offset(poff));

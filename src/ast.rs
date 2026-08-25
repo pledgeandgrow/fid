@@ -16,6 +16,9 @@ pub enum Type {
     Str,
     Void,
     Never,
+    /// Inferred type — used for `-> _` return type inference.
+    /// The typechecker replaces this with the inferred type from the function body.
+    Infer,
     Named(String),
     Array { elem: Box<Type>, size: usize },
     /// Array with const generic size: [T; N] where N is a type param
@@ -75,6 +78,7 @@ impl std::fmt::Display for Type {
             Type::Str => write!(f, "str"),
             Type::Void => write!(f, "void"),
             Type::Never => write!(f, "never"),
+            Type::Infer => write!(f, "_"),
             Type::Named(s) => write!(f, "{}", s),
             Type::Array { elem, size } => write!(f, "[{}; {}]", elem, size),
             Type::ArrayConst { elem, size_param } => write!(f, "[{}; {}]", elem, size_param),
@@ -342,7 +346,7 @@ pub enum Pattern {
     Range { start: Box<Pattern>, end: Box<Pattern> },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOp {
     Add,
     Sub,
@@ -534,6 +538,25 @@ pub enum Stmt {
         body: Vec<Stmt>,
         line: usize,
     },
+    /// Select statement for channels: `select { case ch => x => body, ... default => body }`
+    /// Polls all channels and executes the first ready one. If none ready and
+    /// no default, blocks until one is ready.
+    Select {
+        cases: Vec<SelectCase>,
+        default: Option<Vec<Stmt>>,
+        line: usize,
+    },
+}
+
+/// A case in a select statement.
+#[derive(Debug, Clone)]
+pub struct SelectCase {
+    /// Channel expression (evaluates to i64 channel handle)
+    pub channel: Expr,
+    /// Variable name to bind the received value to
+    pub var_name: String,
+    /// Body to execute when this case is selected
+    pub body: Vec<Stmt>,
 }
 
 /// A handler for one effect operation within a `handle` block.
@@ -580,7 +603,8 @@ impl Stmt {
             | Stmt::ComptimeGen { line, .. }
             | Stmt::GradBlock { line, .. }
             | Stmt::Backward { line, .. }
-            | Stmt::Query { line, .. } => *line,
+            | Stmt::Query { line, .. }
+            | Stmt::Select { line, .. } => *line,
         }
     }
 }
@@ -607,6 +631,8 @@ pub struct Param {
     /// Whether this parameter/field is public (visible outside the defining module).
     /// Only meaningful for struct fields. Function params are always visible.
     pub is_pub: bool,
+    /// Annotations on this parameter (e.g., @tainted for untrusted input)
+    pub annotations: Vec<Annotation>,
 }
 
 #[derive(Debug, Clone)]

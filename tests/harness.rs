@@ -68,6 +68,9 @@ fn is_expect_fail_test(name: &str) -> bool {
         | "test_contracts_fail.fd"
         | "test_borrowck_fail.fd"
         | "test_async_fail.fd"
+        | "test_constant_time_fail.fd"
+        | "test_constant_time_fail2.fd"
+        | "test_send_fail.fd"
     )
 }
 
@@ -475,8 +478,9 @@ fn golden_files_match() {
 }
 
 /// Safety test: verify that bounds checking and overflow detection panic
-/// correctly in debug mode, and that --release mode disables overflow checks.
-/// Test files live in tests/safety/ (not picked up by discover_tests).
+/// correctly in debug mode. Fides has checked arithmetic always on (F64) —
+/// overflow panics in both debug and release mode. The escape hatch is
+/// `@wrapping`, not `--release`. Test files live in tests/safety/.
 #[test]
 fn safety_checks_panic_in_debug_mode() {
     let bin = ensure_binary();
@@ -520,24 +524,9 @@ fn safety_checks_panic_in_debug_mode() {
             continue;
         }
 
-        // For overflow tests, verify --release mode does NOT panic
-        if name.starts_with("test_overflow") {
-            let output = Command::new(&bin)
-                .arg("run")
-                .arg(test)
-                .arg("--release")
-                .output()
-                .expect("Failed to run interpreter in release mode");
-            let release_code = output.status.code().unwrap_or(-1);
-            if release_code != 0 {
-                failed += 1;
-                failures.push(format!(
-                    "{}: expected no panic in release mode but got exit={}",
-                    name, release_code
-                ));
-                continue;
-            }
-        }
+        // Fides has checked arithmetic always on (F64). Overflow panics in
+        // both debug and release mode — `@wrapping` is the escape hatch,
+        // not `--release`. So we don't test release-mode overflow behavior.
 
         passed += 1;
     }

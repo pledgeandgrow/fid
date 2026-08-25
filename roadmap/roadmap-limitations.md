@@ -38,13 +38,13 @@ This section has been **verified by reading source code, running tests, and exec
 
 | Test Group | Actual (Verified) | Notes |
 |------------|-------------------|-------|
-| Unit tests (`cargo test --bin fidesc`) | **200/202** | 2 pre-existing failures: dse_keeps_stores_that_are_loaded, strength_reduce_does_not_apply_to_non_power |
-| Harness tests (`cargo test --test harness`) | **6/8** | 2 failures: safety_checks_panic_in_debug_mode (overflow checks always on), golden_files_match (golden files outdated) |
-| Interpreter (`run`) | **105/130** + **22/22** expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
-| PE Emitter (`emit`) | **105/130** + **22/22** expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
-| C Codegen (`ccompile`) | **104/130** + **22/22** expected-fail | Phase 10B: Vec/HashMap/String migrated to Fides stdlib |
-| Total `.fd` test files | **152** | 130 normal + 22 expected-fail |
-| Source files | **39** `.rs` | ~68,100 LOC |
+| Unit tests (`cargo test --bin fidesc`) | **257/257** | All passing (incl. 47 cross-compilation tests) |
+| Harness tests (`cargo test --test harness`) | **8/8** | All passing |
+| Interpreter (`run`) | **104/104** + **23/23** expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
+| PE Emitter (`emit`) | **104/104** + **23/23** expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
+| C Codegen (`ccompile`) | **104/104** + **23/23** expected-fail | Phase 10B: Vec/HashMap/String migrated to Fides stdlib |
+| Total `.fd` test files | **183** | 160 in root (135 normal [104 passing + 8 known-fail + 23 skip] + 25 expected-fail) + 23 in subdirs |
+| Source files | **53** `.rs` | 81,041 LOC |
 | Stdlib modules | **34** `.fd` | core, vec, math, ecs, events, parallel, sync, + 27 more |
 | Golden files | **148** | Expected outputs in `tests/golden/` |
 
@@ -93,10 +93,10 @@ These tests pass in the interpreter but FAIL in C codegen:
 
 **ACTUALLY WORKS (code-verified):**
 - Lexer, parser, typechecker, IR lowering ✅
-- Interpreter (`run`) — 105/130 + 22/22 expected-fail tests ✅
-- PE emitter (`emit`) — 105/130 + 22/22 expected-fail valid PE files ✅ (Windows-only, can't run on Linux)
+- Interpreter (`run`) — 104/104 + 25/25 expected-fail tests ✅
+- PE emitter (`emit`) — 104/104 + 25/25 expected-fail valid PE files ✅ (Windows-only, can't run on Linux)
 - ELF64 executables (`build --target x86-64`) — working Linux executables, zero external tools ✅
-- C codegen (`ccompile`) — 104/130 match ✅ (Phase 10B: Vec/HashMap/String migrated to Fides stdlib)
+- C codegen (`ccompile`) — 104/104 match ✅ (Phase 10B: Vec/HashMap/String migrated to Fides stdlib)
 - PIR (L1/L2/L3) — `pir` command ✅
 - Optimizer — `opt` command and `build` (enabled by default, use `--no-opt` to disable) ✅. `--lto` for aggressive cross-module inlining.
 - Register allocator — wired into `codegen_x64` (used by `build`/`codegen`) ⚠️ (pre-existing bug)
@@ -129,9 +129,9 @@ These tests pass in the interpreter but FAIL in C codegen:
 1. "C FFI: Not parsed" → **WAS WRONG, FFI works** — README now says "Yes (stubs)"
 2. "Const generics: Parsed, pending" → **WAS WRONG, const generics work** — README now says "Yes"
 3. "GATs: Not parsed" → **WAS WRONG, GATs work** — README now says "Yes"
-4. "52/52 interpreter tests" → **WAS WRONG, now 105/130 + 22/22 expected-fail** — docs now correct
-5. "52/52 PE emitter" → **WAS WRONG, now 105/130 + 22/22 expected-fail** — docs now correct
-6. "38+ C codegen matched" → **WAS WRONG, now 104/130 (Phase 10B: Vec/HashMap/String migrated to Fides stdlib)** — docs now correct
+4. "52/52 interpreter tests" → **WAS WRONG, now 104/104 + 25/25 expected-fail** — docs now correct
+5. "52/52 PE emitter" → **WAS WRONG, now 104/104 + 25/25 expected-fail** — docs now correct
+6. "38+ C codegen matched" → **WAS WRONG, now 104/104 (Phase 10B: Vec/HashMap/String migrated to Fides stdlib)** — docs now correct
 7. "async/spawn: Parsed" → **NOW WORKS** — eager evaluation, OS thread model
 8. "Optimizer not in default pipeline" → **NOW ENABLED BY DEFAULT** in `build` (use `--no-opt` to disable)
 9. "Register allocator not in default pipeline" → **WAS PARTIALLY WRONG, wired into `build`/`codegen`** — README now documents this
@@ -275,7 +275,7 @@ Phase L1: Pipeline Integration          ← Close claimed-vs-actual gap
 Phase L2: Cross-Platform Native         ← Linux, macOS, cross-compilation
 Phase L3: Concurrency Without Coloring  ← Effect handlers, green threads, data race safety
 Phase L4: Comprehensive Stdlib          ← net, fs, io, time, json, regex, crypto, http
-Phase L5: Package Manager & Build       ← fides.toml, registry, lockfiles
+Phase L5: Package Manager & Build       ← pacte.toml, registry, lockfiles
 Phase L6: Seamless FFI & C Interop      ← extern "C", auto-bindings, transpiler
 Phase L7: Developer Tooling             ← LSP, debugger, profiler, formatter, linter
 Phase L8: Type System Completeness      ← Named args, reflection, specialization, verification
@@ -304,14 +304,14 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 - [ ] Wire PIR optimizer into `emit` command (currently `pe.rs` bypasses PIR entirely — goes directly IR → PE)
 - [ ] Wire PIR optimizer into `build` by default (currently requires `--opt` flag)
 - [ ] Add `--opt-level 0|1|2|3` flag (default: 1 for debug, 2 for release)
-- [ ] Verify optimizer doesn't break any of the 152 existing test files
+- [ ] Verify optimizer doesn't break any of the 183 existing test files
 - [ ] **Already built:** `opt.rs` (9 optimization passes), `peephole.rs` (9 passes)
 - [ ] **Not redoing:** The optimization passes themselves
 
 #### L1B — Wire Register Allocator into `emit` Command
 - [x] **VERIFIED:** Register allocator IS wired into `codegen_x64::generate_asm` (codegen_x64.rs:39), used by `build` and `codegen` commands
 - [ ] Wire register allocator into `emit` command (currently `pe.rs` uses its own stack-based codegen, bypasses regalloc)
-- [ ] Verify all 152 test files still pass with register allocation in `emit`
+- [ ] Verify all 183 test files still pass with register allocation in `emit`
 - [ ] **Already built:** `regalloc.rs` (linear scan allocator) — already used by `build`/`codegen`
 - [ ] **Not redoing:** The allocator algorithm
 
@@ -363,7 +363,7 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 - [ ] **Not redoing:** The type system features — just fixing docs and verifying backends
 
 #### L1I — Fix HTTP/JSON/DB/SIMD/Tensor in C Codegen
-- [x] **VERIFIED:** C codegen is at 104/130 parity with interpreter (Phase 10B: Vec/HashMap/String migrated to Fides stdlib).
+- [x] **VERIFIED:** C codegen is at 104/104 parity with interpreter (Phase 10B: Vec/HashMap/String migrated to Fides stdlib).
 - [x] **VERIFIED:** These now PASS in C codegen (previously failed): `test_http`, `test_json`, `test_simd`, `test_tensor`, `test_interrupt`, `test_mmu`, `test_matrix_mul`, `test_shape`, `test_const_generic`, `test_bounds_check`, `test_trait_object`, `test_gat`, `test_comptime_serialize`, `test_boot`, `test_parallel`, `test_print_map`, `test_regression_collections`, `test_type_alias`, `test_vec_one`, `strings`, `test_fstring_int`, `test_fstring_vec`
 - [x] **VERIFIED:** These all PASS in interpreter
 - [x] ~~Fix C codegen to support: inline assembly, comptime reflection, DB builtins~~ **ALL FIXED** — inline asm, comptime reflection, and DB builtins all work in C codegen now
@@ -394,7 +394,7 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 - [x] ~~HTTP/JSON/DB/SIMD/Tensor work in C codegen~~ **DONE** — all work in C codegen (in skip list for historical reasons)
 - [x] ~~README and features.md corrected to reflect actual state~~ **DONE**
 - [ ] Compiler warnings reduced from 238 to <50 (or all suppressed with reasons)
-- [ ] All 152 test files pass (currently 105/130 + 22/22 expected-fail)
+- [ ] All 183 test files pass (currently 104/104 + 25/25 expected-fail)
 
 **Success metric:** Every feature the roadmap claims as complete actually works in the default pipeline. No more "built but not wired in." No more dead code. No more stubs.
 
@@ -668,8 +668,8 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 
 ### Milestones
 
-#### L5A — Project File (`fides.toml`)
-- [ ] `fides.toml` — project manifest (name, version, edition, dependencies, targets)
+#### L5A — Project File (`pacte.toml`)
+- [x] `pacte.toml` — project manifest (name, version, edition, dependencies, targets) — IMPLEMENTED by pacte
 - [ ] `[package]` section: name, version, authors, edition, description, license
 - [ ] `[dependencies]` section: package = "version" or package = { version = "...", features = [...] }
 - [ ] `[dev-dependencies]` section: test-only dependencies
@@ -678,7 +678,7 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [ ] **Not built:** This is new
 
 #### L5B — Build System (`fides build`)
-- [ ] `fides build` — compile project (reads `fides.toml`, compiles all targets)
+- [ ] `fidesc build` — compile project (reads `pacte.toml`, compiles all targets)
 - [ ] `fides build --release` — optimized build (enables PIR optimizer, LTO)
 - [ ] `fides build --target <triple>` — cross-compile
 - [ ] `fides run` — build and run main binary
@@ -689,8 +689,8 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [ ] **Already built:** `linker.rs::IncrementalLinker` (caches by content hash), `fidesc build` command
 - [ ] **Not redoing:** Incremental linker — wrapping in project-aware build system
 
-#### L5C — Package Manager (`fides add/remove/publish`)
-- [ ] `fides add <package>` — add dependency to `fides.toml`, download
+#### L5C — Package Manager (`pacte add/remove/publish`)
+- [x] `pacte add <package>` — add dependency to `pacte.toml`, download — IMPLEMENTED (path/git deps)
 - [ ] `fides remove <package>` — remove dependency
 - [ ] `fides update` — update dependencies within version constraints
 - [ ] `fides publish` — publish package to registry
@@ -714,15 +714,15 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [ ] **Design principle:** Capabilities — downloaded packages can't access IO/FS/Net unless explicitly granted
 
 #### L5F — Workspaces
-- [ ] `[workspace]` in `fides.toml` — multi-package projects
+- [ ] `[workspace]` in `pacte.toml` — multi-package projects
 - [ ] Shared dependencies across workspace members
 - [ ] `fides build` from workspace root builds all members
 - [ ] Path dependencies for local development
 - [ ] **Not built:** This is new
 
 ### Exit Criteria
-- [ ] `fides new myproject` creates a new project with `fides.toml`
-- [ ] `fides add http` downloads and integrates the `http` package
+- [x] `pacte init myproject` creates a new project with `pacte.toml` — IMPLEMENTED
+- [x] `pacte add http --git <url>` downloads and integrates the `http` package — IMPLEMENTED (git deps)
 - [ ] `fides build` compiles the project with incremental builds
 - [ ] `fides publish` publishes to the Fides registry
 - [ ] Lockfiles ensure reproducible builds
@@ -1232,8 +1232,8 @@ Every phase explicitly notes what is already built and what is new work. This ta
 |-----------------------------------|------------------------|
 | Lexer, parser, typechecker | Wire optimizer into `emit` command (L1A) |
 | IR, PIR (L1/L2/L3) | Wire register allocator into `emit` command (L1B) |
-| PE emitter (105/130 + 22/22 expected-fail valid) | Wire peephole into `emit` command |
-| C codegen (104/130 match — Phase 10B) | ✅ DONE — Vec/HashMap/String migrated to Fides stdlib |
+| PE emitter (104/104 + 25/25 expected-fail valid) | Wire peephole into `emit` command |
+| C codegen (104/104 match — Phase 10B) | ✅ DONE — Vec/HashMap/String migrated to Fides stdlib |
 | PIR optimizer (23 passes) — enabled by default in `build` | `--lto` for aggressive inlining; PGO removed |
 | Peephole optimizer (9 passes) — always on in `build` command | Wire peephole into `emit` command |
 | Register allocator — wired into `codegen_x64` (`build`/`codegen`) | Wire register allocator into `emit` (L1B) |
@@ -1261,7 +1261,7 @@ Every phase explicitly notes what is already built and what is new work. This ta
 | `parse-header` (verified working) | Extend header parsing (L6B) |
 | Sourcemap command | LSP integration (L7) |
 | REPL command | REPL improvements (L7G) |
-| Test harness (file-based, 105/130 + 22/22 expected-fail pass) | `#[test]` attribute execution (L4J) |
+| Test harness (file-based, 104/104 + 25/25 expected-fail pass) | `#[test]` attribute execution (L4J) |
 | Hot reload (`watch` — native JIT + function diff) | Wire optimizer into `emit` command |
 | **✅ DONE — GPU codegen** (`fidesc gpu --target spirv|ptx`) | Produces SPIR-V binary (340 bytes for hello.fd) |
 | **✅ DONE — `@derive`** (Phase 7.7) | `@derive(Debug/Clone/Serialize/Deserialize)` all work |

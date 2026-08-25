@@ -1,66 +1,120 @@
-// Pledge auto-parallelization framework — Phase 5C.4
+// Pledge parallel operations — Phase 5C.4
 //
-// Uses the effect system to identify pure (side-effect-free) loops that
-// can be safely parallelized. The analysis is conservative: only loops
-// with no IO, no mutation of shared state, and no panics are candidates.
+// Uses p_thread_spawn to run reduction operations (par_sum, par_dot) in
+// parallel across OS threads. A threshold (PAR_THRESHOLD) controls when
+// parallelism kicks in: small inputs run sequentially (threading overhead
+// dominates), large inputs split into chunks processed by worker threads.
 //
-// This module provides:
-//   1. A `parallel_for` construct that marks a loop as parallelizable
-//   2. A `is_parallelizable` analysis function (comptime in future)
-//   3. A `par_map` helper for embarrassingly parallel map operations
-//
-// In the current interpreter, these run sequentially. When the effect
-// system is fully integrated (Phase 2B), the compiler will automatically
-// parallelize loops identified as pure.
+// Limitations:
+//   - In the interpreter, spawned threads get a fresh Interpreter with no
+//     shared Vec side-table. Vec pointers passed to threads become 0.
+//     The threshold ensures the interpreter always takes the sequential path.
+//   - In C codegen, Vec pointers are real heap addresses shared across
+//     pthreads, so the parallel path works correctly.
+//   - par_map/par_fill/par_range remain sequential (parallel write to a
+//     shared result Vec requires finer-grained synchronization than we
+//     have today).
 
 module parallel;
 
+/// Threshold: inputs smaller than this run sequentially.
+// Threading overhead (spawn + join) is ~10-50us. For a sum of N i64s,
+// the sequential cost is ~N ns. Below 10000 elements, threading is
+// slower than sequential.
+pf PAR_THRESHOLD() -> i64 { ret 10000; }
+
+// ─── Internal worker functions ─────────────────────────────────────────
+
+/// Worker: sum elements [start, end) of a Vec.
+/// Takes raw i64 (not Vec<i64>) to avoid C codegen void* type mismatch
+/// when passing through p_thread_spawn varargs.
+pf __par_sum_worker(data: i64, start: i64, end: i64) -> i64 {
+    pv sum = 0;
+    pv i = start;
+    while i < end {
+        sum = sum + Vec_get(data, i);
+        i = i + 1;
+    }
+    ret sum;
+}
+
+/// Worker: dot product of elements [start, end) of two Vecs.
+/// Takes raw i64 (not Vec<i64>) to avoid C codegen void* type mismatch.
+pf __par_dot_worker(a: i64, b: i64, start: i64, end: i64) -> i64 {
+    pv sum = 0;
+    pv i = start;
+    while i < end {
+        sum = sum + Vec_get(a, i) * Vec_get(b, i);
+        i = i + 1;
+    }
+    ret sum;
+}
+
+// ─── Public parallel operations ────────────────────────────────────────
+
 /// Parallel map: apply a function to each element of a Vec.
-/// In the current implementation, this runs sequentially.
-/// The compiler identifies this as parallelizable because:
-///   - Each iteration is independent (no data dependencies)
-///   - The function has no IO effects (verified by effect system)
-///   - No shared mutable state
+/// Currently sequential — parallel write to a shared result Vec requires
+/// finer-grained synchronization. Each element is independent.
 pub pf par_map(n: i64) -> Vec<i64> {
     pv result = Vec::new();
     pv i = 0;
     while i < n {
-        // Each iteration is independent — no shared state
         result.push(i * i);
         i = i + 1;
     }
     ret result;
 }
 
-/// Parallel sum: compute the sum of a Vec in parallel chunks.
-/// This is a reduction — the compiler can split the Vec into chunks,
-/// sum each chunk in parallel, then combine the partial sums.
+/// Parallel sum: compute the sum of a Vec.
+/// For large inputs (>= PAR_THRESHOLD), splits into 2 chunks processed
+/// by separate OS threads. For small inputs, runs sequentially.
 pub pf par_sum(data: Vec<i64>) -> i64 {
-    pv total = 0;
-    pv i = 0;
     pv n = data.len();
-    while i < n {
-        total = total + data.get(i);
-        i = i + 1;
+    if n < PAR_THRESHOLD() {
+        pv total = 0;
+        pv i = 0;
+        while i < n {
+            total = total + data.get(i);
+            i = i + 1;
+        }
+        ret total;
     }
-    ret total;
+    // Parallel: split into 2 chunks
+    pv mid = n / 2;
+    pv t1 = spawn __par_sum_worker(data, 0, mid);
+    pv t2 = spawn __par_sum_worker(data, mid, n);
+    pv s1 = await t1;
+    pv s2 = await t2;
+    ret s1 + s2;
 }
 
 /// Parallel dot product: compute the dot product of two Vecs.
-/// This is a reduction that can be parallelized.
+/// For large inputs (>= PAR_THRESHOLD), splits into 2 chunks processed
+/// by separate OS threads. For small inputs, runs sequentially.
 pub pf par_dot(a: Vec<i64>, b: Vec<i64>) -> i64 {
-    pv total = 0;
-    pv i = 0;
     pv n = a.len();
-    while i < n {
-        total = total + a.get(i) * b.get(i);
-        i = i + 1;
+    if n < PAR_THRESHOLD() {
+        pv total = 0;
+        pv i = 0;
+        while i < n {
+            total = total + a.get(i) * b.get(i);
+            i = i + 1;
+        }
+        ret total;
     }
-    ret total;
+    // Parallel: split into 2 chunks
+    pv mid = n / 2;
+    pv t1 = spawn __par_dot_worker(a, b, 0, mid);
+    pv t2 = spawn __par_dot_worker(a, b, mid, n);
+    pv s1 = await t1;
+    pv s2 = await t2;
+    ret s1 + s2;
 }
 
 /// Parallel fill: fill a Vec with a constant value.
-/// Each element is independent — embarrassingly parallel.
+/// Currently sequential — each element is independent (embarrassingly
+/// parallel) but parallel write to a shared result Vec requires
+/// finer-grained synchronization.
 pub pf par_fill(n: i64, val: i64) -> Vec<i64> {
     pv result = Vec::new();
     pv i = 0;
@@ -72,7 +126,7 @@ pub pf par_fill(n: i64, val: i64) -> Vec<i64> {
 }
 
 /// Parallel range: generate a sequence [start, start+1, ..., end-1].
-/// Each element is independent.
+/// Currently sequential — same limitation as par_fill.
 pub pf par_range(start: i64, end: i64) -> Vec<i64> {
     pv result = Vec::new();
     pv i = start;
@@ -84,17 +138,14 @@ pub pf par_range(start: i64, end: i64) -> Vec<i64> {
 }
 
 /// Check if a loop is parallelizable by analyzing its effects.
-/// Returns true if the loop body has no IO, no panic, and no shared
-/// mutable state. In the current implementation, this is a stub that
-/// returns true for simple loops. When the effect system is fully
-/// integrated, this will be a comptime analysis.
+/// Returns true if the loop body has no IO, no State, no Panic.
+/// A loop is parallelizable if it has no IO, no State, no Panic.
 pub pf is_parallelizable(effect_mask: i64) -> bool {
     // Effect bits:
     //   0 = IO
     //   1 = State (mutation)
     //   2 = Panic
     //   3 = RealTime
-    // A loop is parallelizable if it has no IO, no State, no Panic.
     pv has_io = (effect_mask & 1) != 0;
     pv has_state = (effect_mask & 2) != 0;
     pv has_panic = (effect_mask & 4) != 0;
@@ -105,5 +156,5 @@ pub pf is_parallelizable(effect_mask: i64) -> bool {
 /// This is a hint — the compiler will verify safety before parallelizing.
 /// In the current implementation, it's a no-op.
 pub pf parallel_hint() -> void {
-    // No-op in interpreter — compiler directive for future parallelization
+    // No-op — compiler directive for future auto-parallelization
 }

@@ -1,0 +1,104 @@
+// Test: Channels — bounded MPSC queue for inter-thread communication
+use channel;
+
+// Producer: sends N values on the channel, then returns
+pf producer(ch: i64, n: i64) -> i64 {
+    pv i = 0;
+    while i < n {
+        channel_send(ch, i * 10);
+        i = i + 1;
+    }
+    ret 0;
+}
+
+pf main() -> i64 !IO {
+    // ─── Basic send/receive (single-threaded) ───────────────────────
+    pv ch = channel_create(5);
+
+    channel_send(ch, 100);
+    channel_send(ch, 200);
+    channel_send(ch, 300);
+
+    pv v1 = channel_recv(ch);
+    print(v1);
+    print("\n");
+
+    pv v2 = channel_recv(ch);
+    print(v2);
+    print("\n");
+
+    pv v3 = channel_recv(ch);
+    print(v3);
+    print("\n");
+
+    // ─── Close and drain ────────────────────────────────────────────
+    channel_send(ch, 400);
+    channel_close(ch);
+
+    pv v4 = channel_recv(ch);
+    print(v4);
+    print("\n");
+
+    // After close and drain, recv returns CHAN_CLOSED
+    pv v5 = channel_recv(ch);
+    if v5 == CHAN_CLOSED() {
+        print("channel closed OK\n");
+    } else {
+        print("channel closed FAIL: got ");
+        print(v5);
+        print("\n");
+    }
+
+    // ─── try_recv on empty channel ──────────────────────────────────
+    pv ch2 = channel_create(3);
+    pv tr = channel_try_recv(ch2);
+    // try_recv on empty (not closed) returns PENDING sentinel (same as CHAN_CLOSED)
+    // We can't distinguish pending from closed without checking is_closed
+    if channel_is_closed(ch2) == false {
+        print("try_recv empty OK (channel not closed)\n");
+    } else {
+        print("try_recv empty FAIL (channel wrongly closed)\n");
+    }
+
+    channel_send(ch2, 42);
+    pv tr2 = channel_try_recv(ch2);
+    if tr2 == 42 {
+        print("try_recv value OK\n");
+    } else {
+        print("try_recv value FAIL: got ");
+        print(tr2);
+        print("\n");
+    }
+
+    // ─── Producer/consumer with threads ─────────────────────────────
+    // Note: In the interpreter, spawned threads get a fresh Interpreter.
+    // The channels map is shared via Arc, so channel operations work
+    // across threads. In C codegen, the channel handle is a real pointer
+    // shared across pthreads.
+    pv ch3 = channel_create(10);
+    pv fut = spawn producer(ch3, 5);
+
+    // Receive all 5 values from the producer thread
+    pv sum = 0;
+    pv i = 0;
+    while i < 5 {
+        pv val = channel_recv(ch3);
+        sum = sum + val;
+        i = i + 1;
+    }
+
+    pv _ = await fut;
+    print("producer sum = ");
+    print(sum);
+    print("\n");
+    // sum = 0 + 10 + 20 + 30 + 40 = 100
+    if sum == 100 {
+        print("producer/consumer OK\n");
+    } else {
+        print("producer/consumer FAIL: sum = ");
+        print(sum);
+        print("\n");
+    }
+
+    ret 0;
+}

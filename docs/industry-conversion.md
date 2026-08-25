@@ -311,7 +311,7 @@ uses floating point. That's something C++ and Java cannot do.
 | Loss | Severity | Mitigation |
 |------|----------|------------|
 | AWS Lambda/GCP Cloud Run native support | 🔴 Critical | Fides compiles to WASM — works with any WASM-compatible platform |
-| npm/pip/crates ecosystem | 🔴 Critical | Fides stdlib + package manager (Phase 11). Start with core libraries |
+| npm/pip/crates ecosystem | � Significant | Fides stdlib + pacte package manager (Phase 13.4). Start with core libraries |
 | Node.js event loop | 🟡 For I/O-heavy code | Fides's effect system + native threads. Different model but capable |
 | Existing DevOps tooling | 🟡 Significant | Fides's build system (Phase 11) handles compilation. CI/CD via CLI |
 

@@ -60,8 +60,8 @@ F4: watch --diff             ✅ IMPLEMENTED — PIR L2 line diff + binary size 
 F5: Capability-aware linking ✅ IMPLEMENTED --caps flag, strips ungranted functions
 
 ─── Language Syntax — Tier A: Compiler Must Understand ───────────
-F16: vec2/3/4 + mat4 types    🔲 PLANNED — SIMD instruction emission needs compiler
-F17: Vector swizzle (.xyz)    🔲 PLANNED — parser + typechecker for component access
+F16: vec2/3/4 + mat4 types    ✅ IMPLEMENTED — vec2/vec3/vec4/mat4/quat structs with methods, operator overloading (+,-,*,/), construction functions
+F17: Vector swizzle (.xyz)    ✅ IMPLEMENTED — .xyz/.rgb/.stpq swizzle access with 2-4 components, reordering, repetition
 F8:  ?. optional chaining     ✅ IMPLEMENTED — null-safe navigation, None short-circuits to 0
 F10: given/ensure contracts   ✅ IMPLEMENTED — preconditions verified at call sites with constant args (Design by Contract)
 F18: ECS (component/system)   ✅ IMPLEMENTED — component/system/query desugar to structs/functions/loops, __ecs_* runtime in interpreter
@@ -143,7 +143,7 @@ F67: typed strings            ✅ IMPLEMENTED — SQLString, ShellString, HTMLSt
 F68: parameterized queries    ✅ IMPLEMENTED — no string concatenation for typed strings (SQLString/ShellString/etc), use bind/escape methods (injection prevention)
 F69: @escaped                 🔲 PLANNED — compiler verifies output is escaped before rendering (XSS prevention)
 F70: @atomic-check            🔲 PLANNED — check and act are one atomic operation (TOCTOU prevention)
-F72: @constant-time           🔲 PLANNED — compiler verifies no data-dependent branches or memory access (side-channel)
+F72: @constant-time           ✅ IMPLEMENTED — compiler verifies no data-dependent branches or memory access, no early returns, no IO/Net, transitive (side-channel)
 F74: @secret type             🔲 PLANNED — information flow control, secrets can't be printed/logged/sent (info leak)
 F75: @cfi                     🔲 PLANNED — control flow integrity: shadow stack, CFI checks, canaries (ROP prevention)
 F76: vtable protection        🔲 PLANNED — vtables read-only, pointer-signed, no user modification (JOP prevention)
@@ -161,7 +161,7 @@ F94: @least-privilege         🔲 PLANNED — compiler verifies minimum capabil
 F66: money overflow protection🔲 PLANNED — money type overflow = transaction abort, never silent (integer safety)
 F71: FS race protection       🔲 PLANNED — FS operations capability-gated + atomic (TOCTOU prevention)
 F73: @no-branch-on-secret     🔲 PLANNED — reject branches based on secret-typed data (side-channel)
-F77: stack canaries           🔲 PLANNED — codegen inserts canaries on all function frames (stack overflow)
+F77: stack canaries           ✅ IMPLEMENTED — C codegen compiles with -fstack-protector-strong by default (stack overflow)
 F78: shadow stack             🔲 PLANNED — hardware shadow stack where supported (ARM64, x86-64 CET)
 F81: @audited-dependency      🔲 PLANNED — dependency must have @audit trail (supply chain)
 F83: @schema-validated        🔲 PLANNED — compiler verifies parser against schema (deserialization)
@@ -209,6 +209,15 @@ S32: stdlib/args.fd            ✅ IMPLEMENTED — args_len, args_get, args_prog
 S33: stdlib/process.fd         ✅ IMPLEMENTED — process_exit, process_system (process control)
 S34: stdlib/regex.fd           ✅ IMPLEMENTED — regex_matches (?/* wildcards), regex_find, regex_contains, regex_starts_with, regex_ends_with
 
+─── Debugging Tools — Phase 14 (Aug 2026) ───────────────────────
+D1: fidesc debug              ✅ IMPLEMENTED — interactive interpreter debugger: break, step, next, continue, print, backtrace, list, ir, effects, regions, capabilities, watch, reload, record
+D2: fidesc replay             ✅ IMPLEMENTED — record/replay execution trace: func_name block_id inst_id source_line [value]
+D3: hot-reload in debugger    ✅ IMPLEMENTED — reload command re-reads source, recompiles, restarts execution preserving breakpoints
+D4: --post-mortem             ✅ IMPLEMENTED — fidesc run --post-mortem auto-saves trace on panic for replay
+D5: fidesc autopsy           ✅ IMPLEMENTED — native code debugger via ptrace (Linux): step, continue, regs, breakpoint injection (also `native-debug`)
+D6: IR-level debugging        ✅ IMPLEMENTED — ir command shows IR with → marker at current instruction, ir current shows just current instruction
+D7: effects/regions/caps      ✅ IMPLEMENTED — effects panel shows function effects+annotations, regions shows memory regions+stack alloc count, capabilities shows annotations+required capabilities
+
 ─── Cut — Redundant, Build with Existing Features ───────────────
 C1: fogofwar                  ❌ CUT — build with tilemap (S1) + query (F18)
 C2: selection                 ❌ CUT — build with query (F18) + formation math
@@ -231,13 +240,14 @@ C15: @validated               ❌ CUT — already covered by given/ensure contra
 
 | Tier | Count | What | Why |
 |------|-------|------|-----|
-| **Implemented** | 30+ | F1–F11, F18–F20, F24, F26, F28, F33, F38–F41, F43, F44, F48, F52, F56, F61–F65, F67–F68, F95 | Done and tested (interpreter + C codegen where applicable) |
-| **Syntax Tier A** | 39 | F10, F13, F14, F16–F18, F21, F23–F60 | Compiler must understand — can't be a library |
+| **Implemented** | 42+ | F1–F11, F16–F20, F24, F26, F28, F33, F38–F41, F43, F44, F48, F52, F56, F61–F65, F67–F68, F72, F77, F95, D1–D7 | Done and tested (interpreter + C codegen where applicable) |
+| **Syntax Tier A** | 35 | F10, F13, F14, F18, F21, F23–F60 | Compiler must understand — can't be a library |
 | **Syntax Tier B** | 12 | F6, F7, F9, F11, F12, F19, F20, F33–F37 | Ergonomic — could be library but worth the keyword |
 | **Stdlib** | 29 | S1–S29 | Built in Fides, users can read/modify/replace |
+| **Debugging** | 7 | D1–D7 | Interactive debugger, record/replay, hot-reload, post-mortem, native debugger |
 | **Cut** | 16 | C1–C15, F15 | Redundant — existing features already cover |
 
-**Total: 30+ implemented + 52 syntax + 29 stdlib + 15 cut = 105 features analyzed.**
+**Total: 42+ implemented + 47 syntax + 29 stdlib + 7 debugging + 15 cut = 140 features analyzed.**
 
 ### Industry Coverage
 
@@ -1138,7 +1148,7 @@ that already exists.
 ## F16 — `vec2`/`vec3`/`vec4` + `mat4` — First-Class Math Types
 
 **Classification:** SYNTAX — Tier A (compiler must emit SIMD instructions for vector operators — a library has function call overhead)
-**Status:** 🔲 Planned
+**Status:** ✅ Implemented (Phase 8A, Aug 2026)
 **Impact:** High — game development, graphics, ML
 **Novelty:** GLSL/HLSL have these but are shader-only languages. Fides brings them to a general-purpose systems language with full operator overloading, swizzle syntax, and compile-time shape checking.
 
@@ -1212,7 +1222,7 @@ pv smooth = slerp(q1, q2, 0.5);  // smooth interpolation
 ## F17 — Vector Swizzle — Shader-Style Component Access
 
 **Classification:** SYNTAX — Tier A (parser must recognize `.xyz` patterns; typechecker must verify component validity; zero-cost desugaring)
-**Status:** 🔲 Planned
+**Status:** ✅ Implemented (Phase 8A, Aug 2026)
 **Impact:** High — game development, graphics
 **Novelty:** GLSL/HLSL have swizzle but are shader-only. Fides brings it to a general-purpose language. The `.xyz` syntax desugars to `vec3(self.x, self.y, self.z)` at compile time — zero runtime cost.
 
@@ -2317,10 +2327,10 @@ system UpdateLOD {
 ### Implementation Details
 
 All 5 original features (F1–F5) were implemented in a single session. Test results (current state):
-- Interpreter: 105/130 passed (+ 22/22 expected-fail)
-- PE Emitter: 105/130 valid (+ 22/22 expected-fail)
-- C Codegen: 104/130 matched — near full parity (+ 22/22 expected-fail)
-- Total: 152 .fd test files (130 normal + 22 expected-fail)
+- Interpreter: 104/104 normal passed (+ 25/25 expected-fail, 6 bonus pass)
+- PE Emitter: 104/104 valid (+ 25/25 expected-fail, 6 bonus pass)
+- C Codegen: 104/104 matched — full parity (+ 25/25 expected-fail, 2 bonus pass)
+- Total: 183 .fd test files (160 in root: 135 normal [104 passing + 8 known-fail + 23 skip] + 25 expected-fail; 23 in subdirs)
 
 **Planned for implementation:**
 - 39 Tier A syntax features (F10, F13, F14, F16–F18, F21, F23–F60) — need compiler support

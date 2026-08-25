@@ -1,0 +1,707 @@
+// pacte — Package manager for the Fides programming language
+//
+// Commands:
+//   pacte init              Create a new pacte.toml in the current directory
+//   pacte add <name>        Add a dependency (path or git)
+//   pacte install           Install all dependencies from pacte.toml
+//   pacte remove <name>     Remove a dependency
+//   pacte list              List all dependencies
+//   pacte lock              Generate pacte.lock with resolved versions
+//   pacte search <query>    Search for packages (future: registry)
+//   pacte publish           Publish to registry (future)
+//   pacte update <name>     Update a dependency (future)
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+// ─── Manifest ───────────────────────────────────────────────────────
+
+const MANIFEST_FILE: &str = "pacte.toml";
+const LOCK_FILE: &str = "pacte.lock";
+const MODULES_DIR: &str = "pacte_modules";
+
+#[derive(Debug, Clone)]
+pub struct Manifest {
+    pub package: PackageInfo,
+    pub dependencies: BTreeMap<String, Dependency>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PackageInfo {
+    pub name: String,
+    pub version: String,
+    pub edition: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum Dependency {
+    Path(String),
+    Git(String),
+    GitBranch(String, String),  // url, branch
+    GitTag(String, String),     // url, tag
+    Registry(String),           // version spec (future)
+}
+
+impl Dependency {
+    fn source(&self) -> &str {
+        match self {
+            Dependency::Path(p) => p,
+            Dependency::Git(u) => u,
+            Dependency::GitBranch(u, _) => u,
+            Dependency::GitTag(u, _) => u,
+            Dependency::Registry(v) => v,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Dependency::Path(_) => "path",
+            Dependency::Git(_) => "git",
+            Dependency::GitBranch(_, _) => "git",
+            Dependency::GitTag(_, _) => "git",
+            Dependency::Registry(_) => "registry",
+        }
+    }
+}
+
+// ─── Minimal TOML parser/writer for pacte.toml ──────────────────────
+
+fn parse_toml(content: &str) -> BTreeMap<String, BTreeMap<String, String>> {
+    let mut sections: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut current_section = String::new();
+    sections.insert(current_section.clone(), BTreeMap::new());
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Section header: [name]
+        if line.starts_with('[') && line.ends_with(']') {
+            current_section = line[1..line.len()-1].trim().to_string();
+            sections.entry(current_section.clone()).or_default();
+            continue;
+        }
+        // key = value
+        if let Some(eq_pos) = line.find('=') {
+            let key = line[..eq_pos].trim().to_string();
+            let value = line[eq_pos+1..].trim().to_string();
+            sections.get_mut(&current_section).unwrap().insert(key, value);
+        }
+    }
+    sections
+}
+
+fn strip_quotes(s: &str) -> String {
+    let s = s.trim();
+    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+        s[1..s.len()-1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+// ─── Manifest parsing ───────────────────────────────────────────────
+
+impl Manifest {
+    pub fn parse(content: &str) -> Result<Manifest, String> {
+        let sections = parse_toml(content);
+
+        let pkg_section = sections.get("package")
+            .ok_or_else(|| "Missing [package] section in pacte.toml".to_string())?;
+
+        let name = strip_quotes(pkg_section.get("name")
+            .ok_or_else(|| "Missing 'name' in [package]".to_string())?);
+        let version = strip_quotes(pkg_section.get("version")
+            .ok_or_else(|| "Missing 'version' in [package]".to_string())?);
+        let edition = strip_quotes(pkg_section.get("edition")
+            .unwrap_or(&"\"2026\"".to_string()));
+
+        let mut dependencies = BTreeMap::new();
+
+        // Parse [dependencies] section — simple key = "value" or key = { path = "..." }
+        if let Some(deps) = sections.get("dependencies") {
+            for (key, val) in deps {
+                let dep = parse_dependency(val)?;
+                dependencies.insert(key.clone(), dep);
+            }
+        }
+
+        Ok(Manifest {
+            package: PackageInfo {
+                name,
+                version,
+                edition,
+            },
+            dependencies,
+        })
+    }
+
+    pub fn to_toml(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# pacte.toml — Fides package manifest\n");
+        out.push_str("# Generated by pacte (https://fides.dev)\n\n");
+
+        out.push_str("[package]\n");
+        out.push_str(&format!("name = {}\n", quote(&self.package.name)));
+        out.push_str(&format!("version = {}\n", quote(&self.package.version)));
+        out.push_str(&format!("edition = {}\n", quote(&self.package.edition)));
+        out.push('\n');
+
+        if !self.dependencies.is_empty() {
+            out.push_str("[dependencies]\n");
+            for (name, dep) in &self.dependencies {
+                match dep {
+                    Dependency::Path(p) => {
+                        out.push_str(&format!("{} = {{ path = {} }}\n", name, quote(p)));
+                    }
+                    Dependency::Git(url) => {
+                        out.push_str(&format!("{} = {{ git = {} }}\n", name, quote(url)));
+                    }
+                    Dependency::GitBranch(url, branch) => {
+                        out.push_str(&format!("{} = {{ git = {}, branch = {} }}\n",
+                            name, quote(url), quote(branch)));
+                    }
+                    Dependency::GitTag(url, tag) => {
+                        out.push_str(&format!("{} = {{ git = {}, tag = {} }}\n",
+                            name, quote(url), quote(tag)));
+                    }
+                    Dependency::Registry(version) => {
+                        out.push_str(&format!("{} = {}\n", name, quote(version)));
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    pub fn load(dir: &Path) -> Result<Manifest, String> {
+        let path = dir.join(MANIFEST_FILE);
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("Cannot read {}: {}", MANIFEST_FILE, e))?;
+        Manifest::parse(&content)
+    }
+
+    pub fn save(&self, dir: &Path) -> Result<(), String> {
+        let path = dir.join(MANIFEST_FILE);
+        fs::write(&path, self.to_toml())
+            .map_err(|e| format!("Cannot write {}: {}", MANIFEST_FILE, e))
+    }
+}
+
+fn parse_dependency(val: &str) -> Result<Dependency, String> {
+    let val = val.trim();
+    // Inline table: { path = "..." } or { git = "..." }
+    if val.starts_with('{') && val.ends_with('}') {
+        let inner = &val[1..val.len()-1];
+        let parts = parse_toml_inline_table(inner);
+        if let Some(p) = parts.get("path") {
+            return Ok(Dependency::Path(strip_quotes(p)));
+        }
+        if let Some(g) = parts.get("git") {
+            let url = strip_quotes(g);
+            if let Some(b) = parts.get("branch") {
+                return Ok(Dependency::GitBranch(url, strip_quotes(b)));
+            }
+            if let Some(t) = parts.get("tag") {
+                return Ok(Dependency::GitTag(url, strip_quotes(t)));
+            }
+            return Ok(Dependency::Git(url));
+        }
+        return Err(format!("Unknown dependency spec: {}", val));
+    }
+    // Simple version string: "1.0.0" or "*"
+    Ok(Dependency::Registry(strip_quotes(val)))
+}
+
+fn parse_toml_inline_table(s: &str) -> BTreeMap<String, String> {
+    let mut result = BTreeMap::new();
+    // Simple split on commas, then key = value
+    for part in s.split(',') {
+        let part = part.trim();
+        if let Some(eq) = part.find('=') {
+            let key = part[..eq].trim().to_string();
+            let val = part[eq+1..].trim().to_string();
+            result.insert(key, val);
+        }
+    }
+    result
+}
+
+// ─── Lock file ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct LockFile {
+    pub packages: BTreeMap<String, LockEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LockEntry {
+    pub source: String,
+    pub resolved: String,  // resolved path or commit hash
+    pub kind: String,
+}
+
+impl LockFile {
+    pub fn to_toml(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# pacte.lock — resolved dependencies\n");
+        out.push_str("# DO NOT EDIT — generated by pacte\n\n");
+        for (name, entry) in &self.packages {
+            out.push_str(&format!("[[package]]\n"));
+            out.push_str(&format!("name = {}\n", quote(name)));
+            out.push_str(&format!("source = {}\n", quote(&entry.source)));
+            out.push_str(&format!("resolved = {}\n", quote(&entry.resolved)));
+            out.push_str(&format!("kind = {}\n\n", quote(&entry.kind)));
+        }
+        out
+    }
+
+    pub fn save(&self, dir: &Path) -> Result<(), String> {
+        let path = dir.join(LOCK_FILE);
+        fs::write(&path, self.to_toml())
+            .map_err(|e| format!("Cannot write {}: {}", LOCK_FILE, e))
+    }
+}
+
+// ─── Commands ───────────────────────────────────────────────────────
+
+pub fn cmd_init(args: &[String]) -> Result<(), String> {
+    let name = if args.is_empty() {
+        // Use current directory name
+        let cwd = std::env::current_dir()
+            .map_err(|e| format!("Cannot get current directory: {}", e))?;
+        cwd.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("my-project")
+            .to_string()
+    } else {
+        args[0].clone()
+    };
+
+    let manifest = Manifest {
+        package: PackageInfo {
+            name: name.clone(),
+            version: "0.1.0".to_string(),
+            edition: "2026".to_string(),
+        },
+        dependencies: BTreeMap::new(),
+    };
+
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("Cannot get current directory: {}", e))?;
+
+    // Check if pacte.toml already exists
+    if cwd.join(MANIFEST_FILE).exists() {
+        return Err(format!("{} already exists in this directory", MANIFEST_FILE));
+    }
+
+    manifest.save(&cwd)?;
+    println!("Created {} for package '{}'", MANIFEST_FILE, name);
+    println!("Edit {} to add dependencies.", MANIFEST_FILE);
+    Ok(())
+}
+
+pub fn cmd_add(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("Usage: pacte add <name> [--path <path> | --git <url> | --branch <branch> | --tag <tag>]".to_string());
+    }
+
+    let dep_name = &args[0];
+    let mut path: Option<String> = None;
+    let mut git: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut tag: Option<String> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--path" | "-p" => {
+                i += 1;
+                path = Some(args.get(i).cloned().ok_or("--path requires a value")?);
+            }
+            "--git" | "-g" => {
+                i += 1;
+                git = Some(args.get(i).cloned().ok_or("--git requires a value")?);
+            }
+            "--branch" | "-b" => {
+                i += 1;
+                branch = Some(args.get(i).cloned().ok_or("--branch requires a value")?);
+            }
+            "--tag" | "-t" => {
+                i += 1;
+                tag = Some(args.get(i).cloned().ok_or("--tag requires a value")?);
+            }
+            _ => {
+                return Err(format!("Unknown flag: {}", args[i]));
+            }
+        }
+        i += 1;
+    }
+
+    let dep = if let Some(p) = path {
+        Dependency::Path(p)
+    } else if let Some(g) = git {
+        if let Some(b) = branch {
+            Dependency::GitBranch(g, b)
+        } else if let Some(t) = tag {
+            Dependency::GitTag(g, t)
+        } else {
+            Dependency::Git(g)
+        }
+    } else {
+        // Default: assume path dependency with dep_name as directory
+        Dependency::Path(dep_name.clone())
+    };
+
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("Cannot get current directory: {}", e))?;
+    let mut manifest = Manifest::load(&cwd)?;
+    manifest.dependencies.insert(dep_name.clone(), dep);
+    manifest.save(&cwd)?;
+
+    println!("Added dependency '{}' to {}", dep_name, MANIFEST_FILE);
+    println!("Run 'pacte install' to install dependencies.");
+    Ok(())
+}
+
+pub fn cmd_remove(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("Usage: pacte remove <name>".to_string());
+    }
+
+    let dep_name = &args[0];
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("Cannot get current directory: {}", e))?;
+    let mut manifest = Manifest::load(&cwd)?;
+
+    if manifest.dependencies.remove(dep_name).is_none() {
+        return Err(format!("Dependency '{}' not found in {}", dep_name, MANIFEST_FILE));
+    }
+
+    manifest.save(&cwd)?;
+    println!("Removed dependency '{}' from {}", dep_name, MANIFEST_FILE);
+    Ok(())
+}
+
+pub fn cmd_list(_args: &[String]) -> Result<(), String> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("Cannot get current directory: {}", e))?;
+    let manifest = Manifest::load(&cwd)?;
+
+    if manifest.dependencies.is_empty() {
+        println!("No dependencies in {}.", MANIFEST_FILE);
+        return Ok(());
+    }
+
+    println!("{} v{} ({})", manifest.package.name, manifest.package.version, manifest.package.edition);
+    println!();
+    println!("{:<20} {:<8} {}", "NAME", "TYPE", "SOURCE");
+    println!("{}", "-".repeat(60));
+    for (name, dep) in &manifest.dependencies {
+        println!("{:<20} {:<8} {}", name, dep.kind(), dep.source());
+    }
+    Ok(())
+}
+
+pub fn cmd_install(_args: &[String]) -> Result<(), String> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("Cannot get current directory: {}", e))?;
+    let manifest = Manifest::load(&cwd)?;
+
+    if manifest.dependencies.is_empty() {
+        println!("No dependencies to install.");
+        return Ok(());
+    }
+
+    let modules_dir = cwd.join(MODULES_DIR);
+
+    // Clean and recreate pacte_modules/
+    if modules_dir.exists() {
+        fs::remove_dir_all(&modules_dir)
+            .map_err(|e| format!("Cannot remove {}: {}", MODULES_DIR, e))?;
+    }
+    fs::create_dir_all(&modules_dir)
+        .map_err(|e| format!("Cannot create {}: {}", MODULES_DIR, e))?;
+
+    let mut lock = LockFile { packages: BTreeMap::new() };
+    let mut installed = 0;
+
+    for (name, dep) in &manifest.dependencies {
+        let dest = modules_dir.join(name);
+        print!("Installing {}... ", name);
+        io::stdout().flush().ok();
+
+        match dep {
+            Dependency::Path(p) => {
+                let src = cwd.join(p);
+                if !src.exists() {
+                    println!("FAILED");
+                    return Err(format!("Path dependency '{}' does not exist: {}", name, src.display()));
+                }
+                // Handle both files (e.g. math.fd) and directories
+                if src.is_file() {
+                    // Single file: just copy it
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent)
+                            .map_err(|e| format!("Cannot create {}: {}", MODULES_DIR, e))?;
+                    }
+                    fs::copy(&src, &dest)
+                        .map_err(|e| format!("Failed to copy {}: {}", name, e))?;
+                } else {
+                    // Directory: copy recursively
+                    copy_dir_recursive(&src, &dest)
+                        .map_err(|e| format!("Failed to copy {}: {}", name, e))?;
+                }
+                lock.packages.insert(name.clone(), LockEntry {
+                    source: p.clone(),
+                    resolved: src.canonicalize()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| p.clone()),
+                    kind: "path".to_string(),
+                });
+                println!("OK (path)");
+                installed += 1;
+            }
+            Dependency::Git(url) => {
+                clone_git(url, &dest, None)?;
+                let commit = get_git_commit(&dest).unwrap_or_else(|_| "unknown".to_string());
+                lock.packages.insert(name.clone(), LockEntry {
+                    source: url.clone(),
+                    resolved: commit,
+                    kind: "git".to_string(),
+                });
+                println!("OK (git)");
+                installed += 1;
+            }
+            Dependency::GitBranch(url, branch) => {
+                clone_git(url, &dest, Some(format!("--branch {}", branch)))?;
+                let commit = get_git_commit(&dest).unwrap_or_else(|_| "unknown".to_string());
+                lock.packages.insert(name.clone(), LockEntry {
+                    source: format!("{}#{}", url, branch),
+                    resolved: commit,
+                    kind: "git".to_string(),
+                });
+                println!("OK (git/branch={})", branch);
+                installed += 1;
+            }
+            Dependency::GitTag(url, tag) => {
+                clone_git(url, &dest, Some(format!("--branch {}", tag)))?;
+                let commit = get_git_commit(&dest).unwrap_or_else(|_| "unknown".to_string());
+                lock.packages.insert(name.clone(), LockEntry {
+                    source: format!("{}#{}", url, tag),
+                    resolved: commit,
+                    kind: "git".to_string(),
+                });
+                println!("OK (git/tag={})", tag);
+                installed += 1;
+            }
+            Dependency::Registry(version) => {
+                println!("SKIP (registry not yet implemented — version {})", version);
+                // Future: download from pacte.dev registry
+            }
+        }
+    }
+
+    lock.save(&cwd)?;
+    println!();
+    println!("Installed {} package(s) to {}/", installed, MODULES_DIR);
+    Ok(())
+}
+
+pub fn cmd_lock(_args: &[String]) -> Result<(), String> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("Cannot get current directory: {}", e))?;
+
+    // Check if pacte_modules/ exists with installed deps
+    let modules_dir = cwd.join(MODULES_DIR);
+    if !modules_dir.exists() {
+        return Err(format!("No {} directory found. Run 'pacte install' first.", MODULES_DIR));
+    }
+
+    let manifest = Manifest::load(&cwd)?;
+    let mut lock = LockFile { packages: BTreeMap::new() };
+
+    for (name, dep) in &manifest.dependencies {
+        let dest = modules_dir.join(name);
+        if !dest.exists() {
+            continue;
+        }
+        match dep {
+            Dependency::Path(p) => {
+                lock.packages.insert(name.clone(), LockEntry {
+                    source: p.clone(),
+                    resolved: dest.canonicalize()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| p.clone()),
+                    kind: "path".to_string(),
+                });
+            }
+            Dependency::Git(url) => {
+                let commit = get_git_commit(&dest).unwrap_or_else(|_| "unknown".to_string());
+                lock.packages.insert(name.clone(), LockEntry {
+                    source: url.clone(),
+                    resolved: commit,
+                    kind: "git".to_string(),
+                });
+            }
+            Dependency::GitBranch(url, branch) => {
+                let commit = get_git_commit(&dest).unwrap_or_else(|_| "unknown".to_string());
+                lock.packages.insert(name.clone(), LockEntry {
+                    source: format!("{}#{}", url, branch),
+                    resolved: commit,
+                    kind: "git".to_string(),
+                });
+            }
+            Dependency::GitTag(url, tag) => {
+                let commit = get_git_commit(&dest).unwrap_or_else(|_| "unknown".to_string());
+                lock.packages.insert(name.clone(), LockEntry {
+                    source: format!("{}#{}", url, tag),
+                    resolved: commit,
+                    kind: "git".to_string(),
+                });
+            }
+            Dependency::Registry(v) => {
+                lock.packages.insert(name.clone(), LockEntry {
+                    source: v.clone(),
+                    resolved: v.clone(),
+                    kind: "registry".to_string(),
+                });
+            }
+        }
+    }
+
+    lock.save(&cwd)?;
+    println!("Wrote {} with {} package(s).", LOCK_FILE, lock.packages.len());
+    Ok(())
+}
+
+pub fn cmd_search(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("Usage: pacte search <query>".to_string());
+    }
+    let query = &args[0];
+    println!("Searching for '{}'...", query);
+    println!("Registry search not yet implemented.");
+    println!("Future: search pacte.dev registry for packages matching '{}'", query);
+    Ok(())
+}
+
+pub fn cmd_publish(_args: &[String]) -> Result<(), String> {
+    println!("Publish not yet implemented.");
+    println!("Future: publish current package to pacte.dev registry");
+    Ok(())
+}
+
+pub fn cmd_update(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        println!("Updating all dependencies...");
+        return cmd_install(&[]);
+    }
+    let name = &args[0];
+    println!("Updating '{}'...", name);
+    // Re-install just this one dep
+    // For now, just re-run install
+    cmd_install(&[])
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    if !dst.exists() {
+        fs::create_dir_all(dst)?;
+    }
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let dest = dst.join(entry.file_name());
+        if path.is_dir() {
+            // Skip .git directories
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            copy_dir_recursive(&path, &dest)?;
+        } else {
+            fs::copy(&path, &dest)?;
+        }
+    }
+    Ok(())
+}
+
+fn clone_git(url: &str, dest: &Path, extra_args: Option<String>) -> Result<(), String> {
+    let mut cmd = format!("git clone --depth 1");
+    if let Some(extra) = extra_args {
+        cmd.push(' ');
+        cmd.push_str(&extra);
+    }
+    cmd.push_str(&format!(" {} {}", url, dest.display()));
+
+    let result = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .output()
+        .map_err(|e| format!("Failed to run git: {}", e))?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(format!("git clone failed: {}", stderr));
+    }
+    Ok(())
+}
+
+fn get_git_commit(dir: &Path) -> Result<String, String> {
+    let result = std::process::Command::new("git")
+        .args(&["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("Failed to run git: {}", e))?;
+
+    if result.status.success() {
+        Ok(String::from_utf8_lossy(&result.stdout).trim().to_string())
+    } else {
+        Err("Could not get git commit".to_string())
+    }
+}
+
+// ─── Help ───────────────────────────────────────────────────────────
+
+pub fn print_help() {
+    println!("pacte — Package manager for Fides");
+    println!();
+    println!("USAGE:");
+    println!("    pacte <command> [options]");
+    println!();
+    println!("COMMANDS:");
+    println!("    init [name]              Create a new pacte.toml in the current directory");
+    println!("    add <name> [options]     Add a dependency");
+    println!("        --path <path>        Path dependency");
+    println!("        --git <url>          Git dependency");
+    println!("        --branch <branch>    Git branch");
+    println!("        --tag <tag>          Git tag");
+    println!("    install                  Install all dependencies from pacte.toml");
+    println!("    remove <name>            Remove a dependency");
+    println!("    list                     List all dependencies");
+    println!("    lock                     Generate pacte.lock with resolved versions");
+    println!("    update [name]            Update dependencies");
+    println!("    search <query>           Search for packages (future)");
+    println!("    publish                  Publish to registry (future)");
+    println!();
+    println!("MANIFEST: pacte.toml");
+    println!("LOCKFILE: pacte.lock");
+    println!("MODULES:  pacte_modules/");
+    println!();
+    println!("EXAMPLES:");
+    println!("    pacte init my-app");
+    println!("    pacte add math --path ../stdlib/math");
+    println!("    pacte add mylib --git https://github.com/user/mylib");
+    println!("    pacte add mylib --git https://github.com/user/mylib --branch dev");
+    println!("    pacte install");
+    println!("    pacte list");
+}

@@ -73,15 +73,16 @@ External linkers (ld, lld, link.exe) are separate processes that:
 - **Enabled by default** in `build` (use `--no-opt` to disable). `--lto` enables aggressive cross-module inlining. PGO has been removed.
 - Peephole optimizer (`src/peephole.rs`) — 9 passes, **always on** in `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
 
-### 6. Custom Codegen — ✅ Multi-Arch
+### 6. Custom Codegen — ✅ Multi-Arch + Cross-Compilation
 - **x86-64**: PE emitter (`src/pe.rs`, direct IR→machine code, Windows), x86 MASM (`src/x86.rs`), PIR→x86-64 (`src/codegen_x64.rs`)
-- **ARM64**: `src/codegen_arm64.rs` (assembly output)
-- **RISC-V**: `src/codegen_riscv.rs` (assembly output)
+- **ARM64**: `src/codegen_arm64.rs` (assembly output) + `src/arm64_enc.rs` (assembly→machine code encoder) + `src/runtime_arm64.rs` (ARM64 Linux runtime with SVC syscalls)
+- **RISC-V**: `src/codegen_riscv.rs` (assembly output) + `src/riscv_enc.rs` (assembly→machine code encoder) + `src/runtime_riscv.rs` (RISC-V Linux runtime with ECALL syscalls)
 - **WASM**: `src/wasm.rs` (PIR → WebAssembly binary, `fidesc wasm`)
 - **SPIR-V / GPU**: `src/gpu.rs` (PIR → SPIR-V binary, `fidesc gpu`)
 - **C source**: `src/codegen_c.rs` (IR → C99, portable fallback compiled by gcc/clang/cl.exe)
 - **Register allocator**: `src/regalloc.rs` — linear scan; has known bug (see Optimizer caveat above)
 - `fidesc codegen <file> --target <arch>` for assembly; `--elf|--macho|--coff` for object files
+- **Cross-compilation**: `fidesc build --target arm64-linux|riscv64-linux|x86-64-windows` — zero external tools, built-in encoders + runtimes
 
 ### 7. Custom Linker / Binary Emitters — ✅ Multi-Format
 - **PE**: `src/pe.rs` — Windows `.exe`, direct byte emission, no `link.exe`/`ml64.exe`
@@ -89,7 +90,7 @@ External linkers (ld, lld, link.exe) are separate processes that:
 - **Mach-O**: `src/macho.rs` — macOS object files
 - **COFF**: `src/coff.rs` — Windows object files
 - **Bare-metal flat binary**: `emit --bare` — no headers, no stdlib, raw machine code at fixed address
-- **Integrated linker**: `src/linker.rs` — links ELF64 objects into executables, resolves relocations in-process, incremental linking, link-time DCE
+- **Integrated linker**: `src/linker.rs` — links ELF64 objects into executables, resolves relocations in-process, incremental linking, link-time DCE. Target-aware: handles ARM64 (BL, B, B.cond, ADRP, ADD:lo12) and RISC-V (JAL, branch) relocations. Emits EM_AARCH64 (183) and EM_RISCV (243) machine types.
 - `fidesc link <files...>` to link multiple object files
 
 ### 8. Custom Runtime — ✅ No libc for Fides Binaries
@@ -98,7 +99,7 @@ External linkers (ld, lld, link.exe) are separate processes that:
 - **Bare metal**: no runtime — `--bare` mode emits flat binary with no stdlib
 - Panic handler (`p_panic`), print stubs (`p_print_str/int/bool/float/newline`), allocator (`p_malloc`/`p_free`/`p_alloc`), string ops (`p_str_concat`/`p_to_str`), Vec/HashMap/String ops
 
-### 9. Custom Stdlib — ✅ 34 Modules
+### 9. Custom Stdlib — ✅ 35 Modules
 - `stdlib/core.fd` (auto-included): `Option`, `Result`, `println`, `assert`, `assert_eq`, `max`, `min`, `abs`, `clamp`
 - `stdlib/vec.fd`: dynamic array (Vec<T> with push/pop/get/len)
 - `stdlib/math.fd`: sqrt, sin, cos, floor, ceil, pow, fabs, constants
@@ -232,7 +233,7 @@ Phase 6:
 - `src/codegen_c.rs` — IR → C99 source
 - `fidesc ccompile <file> -o <exe>` generates `.c`, invokes `gcc`/`clang`/`cl.exe`
 - Used when targeting platforms the native backends don't yet cover
-- Note: 104/130 test parity with interpreter — near full parity. test_phase8b fails (ECS __ecs_* not in C codegen). Pre-existing failures from incomplete features (vec math, game stdlib).
+- Note: 104/104 test parity with interpreter — full parity. 2 bonus passes from known-fail tests. Binary hardening enabled.
 
 ---
 
@@ -292,8 +293,12 @@ Fides "hello world": ~4KB target (no libc, no runtime, no stdlib bloat)
 | `src/elf64.rs` | ELF64 emitter (Linux, PIR pipeline) |
 | `src/macho.rs` | Mach-O object emitter (macOS) |
 | `src/coff.rs` | COFF object emitter (Windows) |
-| `src/linker.rs` | Integrated linker (ELF64 objects → executable) |
+| `src/linker.rs` | Integrated linker (ELF64 objects → executable), target-aware (ARM64, RISC-V) |
 | `src/runtime_linux.rs` | Hand-encoded Linux x86-64 runtime (raw syscalls, no libc) |
+| `src/arm64_enc.rs` | ARM64 assembly text → 4-byte machine code encoder |
+| `src/runtime_arm64.rs` | ARM64 Linux runtime (SVC syscalls, no libc) |
+| `src/riscv_enc.rs` | RISC-V (RV64) assembly text → 4-byte machine code encoder |
+| `src/runtime_riscv.rs` | RISC-V Linux runtime (ECALL syscalls, no libc) |
 | `src/codegen_x64.rs` | PIR L3 → x86-64 assembly |
 | `src/codegen_arm64.rs` | PIR L3 → ARM64 assembly |
 | `src/codegen_riscv.rs` | PIR L3 → RISC-V assembly |

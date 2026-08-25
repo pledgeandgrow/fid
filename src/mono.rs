@@ -48,6 +48,7 @@ fn mangle_type(ty: &Type) -> String {
         Type::Str => "str".to_string(),
         Type::Void => "void".to_string(),
         Type::Never => "never".to_string(),
+        Type::Infer => "infer".to_string(),
         Type::Named(s) => s.clone(),
         Type::Generic { name, args } => {
             let args_str: Vec<String> = args.iter().map(mangle_type).collect();
@@ -376,6 +377,7 @@ fn subst_expr(expr: &Expr, subst: &Subst, renames: &HashMap<String, String>, met
                 name: p.name.clone(),
                 ty: subst_type(&p.ty, subst),
                 is_pub: p.is_pub,
+                annotations: p.annotations.clone(),
             }).collect(),
             body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
             ret_ty: ret_ty.as_ref().map(|t| subst_type(t, subst)),
@@ -585,6 +587,15 @@ fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, met
         Stmt::Query { components, body, line } => Stmt::Query {
             components: components.clone(),
             body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
+            line: *line,
+        },
+        Stmt::Select { cases, default, line } => Stmt::Select {
+            cases: cases.iter().map(|c| SelectCase {
+                channel: subst_expr(&c.channel, subst, renames, method_renames),
+                var_name: c.var_name.clone(),
+                body: c.body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
+            }).collect(),
+            default: default.as_ref().map(|d| d.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect()),
             line: *line,
         },
     }
@@ -1000,7 +1011,7 @@ fn instantiate(gen_func: &Func, subst: &Subst, mangled_name: &str, ctx: &mut Mon
     let new_params: Vec<Param> = gen_func.params.iter().map(|p| {
         let substituted = subst_type(&p.ty, subst);
         let resolved = resolve_assoc_types(&substituted, subst, &ctx.trait_assoc_bindings);
-        Param { name: p.name.clone(), ty: resolved, is_pub: p.is_pub }
+        Param { name: p.name.clone(), ty: resolved, is_pub: p.is_pub, annotations: p.annotations.clone() }
     }).collect();
 
     let substituted_ret = subst_type(&gen_func.ret_ty, subst);
@@ -1181,6 +1192,19 @@ fn collect_generic_calls_stmt_with_hint(
         Stmt::Query { body, .. } => {
             for s in body {
                 collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
+            }
+        }
+        Stmt::Select { cases, default, .. } => {
+            for case in cases {
+                collect_generic_calls_expr_with_hint(&case.channel, generics, generic_methods, calls, method_calls, current_func, None);
+                for s in &case.body {
+                    collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
+                }
+            }
+            if let Some(ref def) = default {
+                for s in def {
+                    collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
+                }
             }
         }
     }

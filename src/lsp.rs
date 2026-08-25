@@ -318,6 +318,15 @@ pub fn run() -> i32 {
                     ("capabilities".to_string(), JsonValue::Object(vec![
                         ("textDocumentSync".to_string(), JsonValue::Int(1)), // Full sync
                         ("diagnosticProvider".to_string(), JsonValue::Object(vec![])),
+                        ("completionProvider".to_string(), JsonValue::Object(vec![
+                            ("triggerCharacters".to_string(), JsonValue::Array(vec![
+                                JsonValue::Str(".".to_string()),
+                            ])),
+                            ("resolveProvider".to_string(), JsonValue::Bool(false)),
+                        ])),
+                        ("hoverProvider".to_string(), JsonValue::Bool(true)),
+                        ("definitionProvider".to_string(), JsonValue::Bool(true)),
+                        ("renameProvider".to_string(), JsonValue::Bool(true)),
                     ])),
                     ("serverInfo".to_string(), JsonValue::Object(vec![
                         ("name".to_string(), JsonValue::Str("fides-lsp".to_string())),
@@ -363,6 +372,81 @@ pub fn run() -> i32 {
                     let uri = text_doc.get("uri").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     documents.remove(&uri);
                 }
+            }
+            "textDocument/completion" => {
+                let uri = params.get("textDocument")
+                    .and_then(|v| v.get("uri"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let line = params.get("position")
+                    .and_then(|v| v.get("line"))
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0) as usize;
+                let character = params.get("position")
+                    .and_then(|v| v.get("character"))
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0) as usize;
+                let text = documents.get(&uri).map(|s| s.as_str()).unwrap_or("");
+                let result = handle_completion(text, line, character);
+                send_response(&mut stdout, id.unwrap(), result);
+            }
+            "textDocument/hover" => {
+                let uri = params.get("textDocument")
+                    .and_then(|v| v.get("uri"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let line = params.get("position")
+                    .and_then(|v| v.get("line"))
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0) as usize;
+                let character = params.get("position")
+                    .and_then(|v| v.get("character"))
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0) as usize;
+                let text = documents.get(&uri).map(|s| s.as_str()).unwrap_or("");
+                let result = handle_hover(text, line, character);
+                send_response(&mut stdout, id.unwrap(), result);
+            }
+            "textDocument/definition" => {
+                let uri = params.get("textDocument")
+                    .and_then(|v| v.get("uri"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let line = params.get("position")
+                    .and_then(|v| v.get("line"))
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0) as usize;
+                let character = params.get("position")
+                    .and_then(|v| v.get("character"))
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0) as usize;
+                let text = documents.get(&uri).map(|s| s.as_str()).unwrap_or("");
+                let result = handle_definition(text, &uri, line, character);
+                send_response(&mut stdout, id.unwrap(), result);
+            }
+            "textDocument/rename" => {
+                let uri = params.get("textDocument")
+                    .and_then(|v| v.get("uri"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let line = params.get("position")
+                    .and_then(|v| v.get("line"))
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0) as usize;
+                let character = params.get("position")
+                    .and_then(|v| v.get("character"))
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0) as usize;
+                let new_name = params.get("newName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("new_name");
+                let text = documents.get(&uri).map(|s| s.as_str()).unwrap_or("");
+                let result = handle_rename(text, &uri, line, character, new_name);
+                send_response(&mut stdout, id.unwrap(), result);
             }
             _ => {
                 // Unknown method — if it has an id, return an error
@@ -441,4 +525,472 @@ fn send_notification(stdout: &mut impl Write, msg: JsonValue) {
     let output = format!("Content-Length: {}\r\n\r\n{}", json.len(), json);
     let _ = stdout.write_all(output.as_bytes());
     let _ = stdout.flush();
+}
+
+// ─── Completion / Hover / Goto-Definition ─────────────────────────────────
+
+/// Fides keywords for completion.
+const KEYWORDS: &[&str] = &[
+    "pf", "pv", "pm", "pc", "ty", "pub", "struct", "enum", "impl", "cap",
+    "if", "elif", "else", "while", "for", "in", "loop", "break", "continue",
+    "ret", "match", "use", "region", "sandbox", "unsafe", "txn", "do",
+    "handle", "with", "await", "async", "comptime",
+];
+
+/// Check if a character is a valid identifier character.
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Extract the word at a given (0-based line, 0-based character) position.
+/// The character position may be on the word or just after it.
+fn word_at_position(text: &str, line: usize, character: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if line >= lines.len() {
+        return String::new();
+    }
+    let line_str = lines[line];
+    let chars: Vec<char> = line_str.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+    // Clamp character to valid range
+    let pos = character.min(chars.len());
+    // If the cursor is right after the word (pos is past the last ident char),
+    // step back to find the word.
+    let mut end = pos;
+    let mut start = pos;
+    // If at end of line or current char is not an ident char, step back
+    if pos == chars.len() || !is_ident_char(chars[pos]) {
+        if pos > 0 && is_ident_char(chars[pos - 1]) {
+            end = pos;
+            start = pos;
+            while start > 0 && is_ident_char(chars[start - 1]) {
+                start -= 1;
+            }
+            return chars[start..end].iter().collect();
+        }
+        return String::new();
+    }
+    // Cursor is on an ident char — expand both directions
+    while start > 0 && is_ident_char(chars[start - 1]) {
+        start -= 1;
+    }
+    while end < chars.len() && is_ident_char(chars[end]) {
+        end += 1;
+    }
+    chars[start..end].iter().collect()
+}
+
+/// Check if the cursor is immediately after a `.` (dot-access for methods/fields).
+/// Returns the identifier before the dot if so.
+fn ident_before_dot(text: &str, line: usize, character: usize) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    if line >= lines.len() {
+        return None;
+    }
+    let line_str = lines[line];
+    let chars: Vec<char> = line_str.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    let pos = character.min(chars.len());
+    if pos == 0 {
+        return None;
+    }
+    // The character right before the cursor should be '.'
+    if chars[pos - 1] != '.' {
+        return None;
+    }
+    // Find the identifier before the dot
+    let mut end = pos - 1; // position of '.'
+    if end == 0 {
+        return None;
+    }
+    let mut start = end - 1;
+    // Skip whitespace before the dot
+    while start > 0 && chars[start].is_whitespace() {
+        start -= 1;
+    }
+    if !is_ident_char(chars[start]) {
+        return None;
+    }
+    end = start + 1;
+    while start > 0 && is_ident_char(chars[start - 1]) {
+        start -= 1;
+    }
+    Some(chars[start..end].iter().collect())
+}
+
+/// Build a CompletionItem JSON object.
+fn completion_item(label: &str, kind: i64, detail: &str) -> JsonValue {
+    JsonValue::Object(vec![
+        ("label".to_string(), JsonValue::Str(label.to_string())),
+        ("kind".to_string(), JsonValue::Int(kind)),
+        ("detail".to_string(), JsonValue::Str(detail.to_string())),
+    ])
+}
+
+/// Handle textDocument/completion.
+fn handle_completion(text: &str, line: usize, character: usize) -> JsonValue {
+    let (_program, tc) = compiler::build_program_for_lsp(text);
+
+    let mut items: Vec<JsonValue> = Vec::new();
+
+    // Check if we're after a dot (method/field completion)
+    if let Some(receiver_name) = ident_before_dot(text, line, character) {
+        // Try to find the type of the receiver from scopes
+        // For now, return all methods from all types that have methods
+        // Also try to match the receiver to a known type
+        let receiver_lower = receiver_name.to_lowercase();
+
+        // If the receiver looks like a known type name (e.g. "Vec", "HashMap"),
+        // return its methods directly
+        let methods = tc.get_methods();
+        for (struct_name, method_map) in methods {
+            if struct_name.to_lowercase() == receiver_lower
+                || *struct_name == receiver_name
+                || receiver_name == "vec" && struct_name.contains("Vec")
+                || receiver_name == "map" && struct_name.contains("HashMap")
+                || receiver_name == "str" && (struct_name.contains("String") || struct_name.contains("Str"))
+            {
+                for (method_name, (params, ret, _has_self, _is_pub)) in method_map {
+                    let param_strs: Vec<String> = params.iter().map(|t| t.to_string()).collect();
+                    let detail = format!("fn {}({}) -> {}", method_name, param_strs.join(", "), ret);
+                    items.push(completion_item(method_name, 2, &detail)); // 2 = Method
+                }
+            }
+        }
+
+        // Also return struct fields if the receiver is a known struct
+        let structs = tc.get_structs();
+        if let Some(fields) = structs.get(&receiver_name) {
+            for (field_name, field_ty) in fields {
+                items.push(completion_item(field_name, 5, &format!("{}: {}", field_name, field_ty))); // 5 = Field
+            }
+        }
+
+        // If we found any items, return them; otherwise return all methods
+        // (useful when the receiver type can't be determined)
+        if items.is_empty() {
+            for (struct_name, method_map) in methods {
+                let _ = struct_name; // unused but needed for iteration
+                for (method_name, (params, ret, _has_self, _is_pub)) in method_map {
+                    let param_strs: Vec<String> = params.iter().map(|t| t.to_string()).collect();
+                    let detail = format!("fn {}({}) -> {}", method_name, param_strs.join(", "), ret);
+                    items.push(completion_item(method_name, 2, &detail));
+                }
+            }
+        }
+
+        return JsonValue::Array(items);
+    }
+
+    // Global completions: keywords, functions, structs, enums, consts
+
+    // Keywords
+    for kw in KEYWORDS {
+        items.push(completion_item(kw, 14, "keyword")); // 14 = Keyword
+    }
+
+    // Functions
+    for (name, (params, ret)) in tc.get_funcs() {
+        let param_strs: Vec<String> = params.iter().map(|t| t.to_string()).collect();
+        let detail = format!("fn {}({}) -> {}", name, param_strs.join(", "), ret);
+        items.push(completion_item(name, 3, &detail)); // 3 = Function
+    }
+
+    // Structs
+    for (name, fields) in tc.get_structs() {
+        let field_strs: Vec<String> = fields.iter().map(|(f, t)| format!("{}: {}", f, t)).collect();
+        let detail = format!("struct {} {{ {} }}", name, field_strs.join(", "));
+        items.push(completion_item(name, 22, &detail)); // 22 = Struct
+    }
+
+    // Enums
+    for name in tc.get_enums() {
+        items.push(completion_item(name, 20, "enum")); // 20 = Enum
+    }
+
+    // Constants
+    for (name, ty) in tc.get_consts() {
+        items.push(completion_item(name, 21, &format!("const {}: {}", name, ty))); // 21 = Constant
+    }
+
+    // Type aliases
+    for (name, ty) in tc.get_type_aliases() {
+        items.push(completion_item(name, 9, &format!("type {} = {}", name, ty))); // 9 = Module? use Class
+    }
+
+    // Traits
+    for name in tc.get_traits().keys() {
+        items.push(completion_item(name, 8, "trait")); // 8 = Interface
+    }
+
+    JsonValue::Array(items)
+}
+
+/// Handle textDocument/hover.
+fn handle_hover(text: &str, line: usize, character: usize) -> JsonValue {
+    let word = word_at_position(text, line, character);
+    if word.is_empty() {
+        return JsonValue::Null;
+    }
+
+    let (_program, tc) = compiler::build_program_for_lsp(text);
+
+    let content = if let Some((params, ret)) = tc.get_funcs().get(&word) {
+        let param_strs: Vec<String> = params.iter().map(|t| t.to_string()).collect();
+        format!("**fn {}({}) → {}**", word, param_strs.join(", "), ret)
+    } else if let Some(fields) = tc.get_structs().get(&word) {
+        let field_strs: Vec<String> = fields.iter().map(|(f, t)| format!("{}: {}", f, t)).collect();
+        format!("**struct {}**\n\n{{ {} }}", word, field_strs.join(", "))
+    } else if tc.get_enums().contains(&word) {
+        format!("**enum {}**", word)
+    } else if let Some(ty) = tc.get_consts().get(&word) {
+        format!("**const {}**: {}", word, ty)
+    } else if let Some(ty) = tc.get_type_aliases().get(&word) {
+        format!("**type {}** = {}", word, ty)
+    } else if tc.get_traits().contains_key(&word) {
+        format!("**trait {}**", word)
+    } else {
+        // Check if it's a struct field type or method
+        let mut found = None;
+        for (struct_name, method_map) in tc.get_methods() {
+            if let Some((params, ret, has_self, _is_pub)) = method_map.get(&word) {
+                let param_strs: Vec<String> = params.iter().map(|t| t.to_string()).collect();
+                let self_note = if *has_self { "method" } else { "function" };
+                found = Some(format!("**{} {}::{}({}) → {}**", self_note, struct_name, word, param_strs.join(", "), ret));
+                break;
+            }
+        }
+        if let Some(s) = found {
+            s
+        } else {
+            return JsonValue::Null;
+        }
+    };
+
+    let hover = JsonValue::Object(vec![
+        ("contents".to_string(), JsonValue::Object(vec![
+            ("kind".to_string(), JsonValue::Str("markdown".to_string())),
+            ("value".to_string(), JsonValue::Str(content)),
+        ])),
+    ]);
+    hover
+}
+
+/// Handle textDocument/definition.
+/// Searches the source text for the definition of the word at the cursor.
+fn handle_definition(text: &str, uri: &str, line: usize, character: usize) -> JsonValue {
+    let word = word_at_position(text, line, character);
+    if word.is_empty() {
+        return JsonValue::Null;
+    }
+
+    let (_program, tc) = compiler::build_program_for_lsp(text);
+
+    // Determine what kind of symbol we're looking for
+    let is_func = tc.get_funcs().contains_key(&word);
+    let is_struct = tc.get_structs().contains_key(&word);
+    let is_enum = tc.get_enums().contains(&word);
+    let is_const = tc.get_consts().contains_key(&word);
+    let is_trait = tc.get_traits().contains_key(&word);
+
+    if !is_func && !is_struct && !is_enum && !is_const && !is_trait {
+        // Check if it's a method name
+        for (_struct_name, method_map) in tc.get_methods() {
+            if method_map.contains_key(&word) {
+                if let Some((def_line, def_col)) = find_definition(text, &word, true) {
+                    return location_json(uri, def_line, def_col, &word);
+                }
+                return JsonValue::Null;
+            }
+        }
+        return JsonValue::Null;
+    }
+
+    // Search for the definition in the source text
+    if let Some((def_line, def_col)) = find_definition(text, &word, is_func) {
+        return location_json(uri, def_line, def_col, &word);
+    }
+
+    JsonValue::Null
+}
+
+/// Handle textDocument/rename — find all occurrences of the symbol at the given
+/// position and return a WorkspaceEdit with TextEdits to rename them.
+fn handle_rename(text: &str, uri: &str, line: usize, character: usize, new_name: &str) -> JsonValue {
+    let word = word_at_position(text, line, character);
+    if word.is_empty() {
+        return JsonValue::Null;
+    }
+
+    let (_program, tc) = compiler::build_program_for_lsp(text);
+
+    // Determine what kind of symbol we're looking for
+    let is_func = tc.get_funcs().contains_key(&word);
+    let is_struct = tc.get_structs().contains_key(&word);
+    let is_enum = tc.get_enums().contains(&word);
+    let is_const = tc.get_consts().contains_key(&word);
+    let is_trait = tc.get_traits().contains_key(&word);
+    let is_method = tc.get_methods().values().any(|m| m.contains_key(&word));
+
+    if !is_func && !is_struct && !is_enum && !is_const && !is_trait && !is_method {
+        return JsonValue::Null;
+    }
+
+    // Find all occurrences of the word as whole-word matches in the source
+    let edits = find_all_occurrences(text, &word);
+    if edits.is_empty() {
+        return JsonValue::Null;
+    }
+
+    // Build the LSP WorkspaceEdit response
+    let edit_objects: Vec<JsonValue> = edits.iter().map(|(l, c, len)| {
+        JsonValue::Object(vec![
+            ("range".to_string(), JsonValue::Object(vec![
+                ("start".to_string(), JsonValue::Object(vec![
+                    ("line".to_string(), JsonValue::Int(*l as i64)),
+                    ("character".to_string(), JsonValue::Int(*c as i64)),
+                ])),
+                ("end".to_string(), JsonValue::Object(vec![
+                    ("line".to_string(), JsonValue::Int(*l as i64)),
+                    ("character".to_string(), JsonValue::Int((*c + *len) as i64)),
+                ])),
+            ])),
+            ("newText".to_string(), JsonValue::Str(new_name.to_string())),
+        ])
+    }).collect();
+
+    JsonValue::Object(vec![
+        ("changes".to_string(), JsonValue::Object(vec![
+            (uri.to_string(), JsonValue::Array(edit_objects)),
+        ])),
+    ])
+}
+
+/// Find all whole-word occurrences of `name` in the source text.
+/// Returns (line, column, length) for each occurrence.
+fn find_all_occurrences(text: &str, name: &str) -> Vec<(usize, usize, usize)> {
+    let mut results = Vec::new();
+    let name_len = name.len();
+    if name_len == 0 {
+        return results;
+    }
+    for (line_idx, line_str) in text.lines().enumerate() {
+        let mut col = 0;
+        let bytes = line_str.as_bytes();
+        let mut i = 0;
+        while i + name_len <= bytes.len() {
+            // Check if we have a whole-word match at position i
+            let slice = &line_str[i..i + name_len];
+            if slice == name {
+                // Check word boundary before
+                let ok_before = i == 0 || !is_ident_char(bytes[i - 1] as char);
+                // Check word boundary after
+                let ok_after = i + name_len == bytes.len() || !is_ident_char(bytes[i + name_len] as char);
+                if ok_before && ok_after {
+                    results.push((line_idx, i, name_len));
+                }
+            }
+            i += 1;
+        }
+    }
+    results
+}
+
+/// Search the source text for a definition of the given symbol name.
+/// Returns (0-based line, 0-based column) if found.
+/// For functions, looks for patterns like `pf name`, `pv name`, `pub pf name`.
+/// For structs, looks for `struct Name`.
+/// For enums, looks for `enum Name`.
+fn find_definition(text: &str, name: &str, is_func: bool) -> Option<(usize, usize)> {
+    for (line_idx, line_str) in text.lines().enumerate() {
+        if is_func {
+            // Look for function definition patterns:
+            //   pf name(   |   pv name(   |   pub pf name(   |   pub pv name(
+            // Also: pm name( is not a function, but cap methods use pf/pv
+            for kw in &["pf ", "pv "] {
+                if let Some(pos) = find_word_after(line_str, kw, name) {
+                    return Some((line_idx, pos));
+                }
+            }
+            // Also check "pub pf" / "pub pv"
+            for kw in &["pub pf ", "pub pv "] {
+                if let Some(pos) = find_word_after(line_str, kw, name) {
+                    return Some((line_idx, pos));
+                }
+            }
+        } else {
+            // Look for struct/enum/const/trait/type definitions
+            for kw in &["struct ", "enum ", "pc ", "ty ", "cap ", "pub struct ", "pub enum ", "pub pc ", "pub ty ", "pub cap "] {
+                if let Some(pos) = find_word_after(line_str, kw, name) {
+                    return Some((line_idx, pos));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Check if `line` contains `keyword` followed by `name` (as a whole word).
+/// Returns the 0-based column of `name` if found.
+fn find_word_after(line: &str, keyword: &str, name: &str) -> Option<usize> {
+    let line_lower = line.to_lowercase();
+    let kw_lower = keyword.to_lowercase();
+    let mut search_from = 0;
+    while let Some(kw_pos) = line_lower[search_from..].find(&kw_lower) {
+        let abs_pos = search_from + kw_pos;
+        // Check that the keyword starts at a word boundary
+        if abs_pos > 0 {
+            let prev_char = line.chars().nth(abs_pos - 1);
+            if let Some(c) = prev_char {
+                if is_ident_char(c) {
+                    search_from = abs_pos + 1;
+                    continue;
+                }
+            }
+        }
+        // Find the name after the keyword
+        let after_kw = abs_pos + keyword.len();
+        let chars: Vec<char> = line.chars().collect();
+        let mut idx = after_kw;
+        // Skip whitespace
+        while idx < chars.len() && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        // Check if the next word matches `name`
+        let name_chars: Vec<char> = name.chars().collect();
+        if idx + name_chars.len() <= chars.len() {
+            let candidate: String = chars[idx..idx + name_chars.len()].iter().collect();
+            if candidate == name {
+                // Ensure it's a word boundary after
+                let after = idx + name_chars.len();
+                if after >= chars.len() || !is_ident_char(chars[after]) {
+                    return Some(idx);
+                }
+            }
+        }
+        search_from = abs_pos + 1;
+    }
+    None
+}
+
+/// Build a Location JSON object for goto-definition.
+fn location_json(uri: &str, line: usize, col: usize, word: &str) -> JsonValue {
+    let word_len = word.chars().count();
+    JsonValue::Object(vec![
+        ("uri".to_string(), JsonValue::Str(uri.to_string())),
+        ("range".to_string(), JsonValue::Object(vec![
+            ("start".to_string(), JsonValue::Object(vec![
+                ("line".to_string(), JsonValue::Int(line as i64)),
+                ("character".to_string(), JsonValue::Int(col as i64)),
+            ])),
+            ("end".to_string(), JsonValue::Object(vec![
+                ("line".to_string(), JsonValue::Int(line as i64)),
+                ("character".to_string(), JsonValue::Int((col + word_len) as i64)),
+            ])),
+        ])),
+    ])
 }

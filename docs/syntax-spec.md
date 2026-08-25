@@ -1504,7 +1504,7 @@ pf test_config_debug() {
 }
 
 pub pf main() -> Result<(), LoadError> {
-    pv config = load_config("fides.toml")?;
+    pv config = load_config("pacte.toml")?;
 
     println(f"Loaded: {config.name} v{config.version}");
     println(f"Settings: {config.settings.len()} entries");

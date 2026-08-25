@@ -225,4 +225,186 @@ impl Vec {
         }
         ret -1;
     }
+
+    // ─── Iterator Adapters (Phase 2.3) ──────────────────────────────
+    // Note: These delegate to the free function versions (Vec_take, etc.)
+    // because Vec_new() returns i64, not Vec, and method calls on i64
+    // are not supported by the typechecker.
+
+    pub pf take(self: Vec, n: i64) -> Vec {
+        ret vec_take(self, n);
+    }
+
+    pub pf skip(self: Vec, n: i64) -> Vec {
+        ret vec_skip(self, n);
+    }
+
+    pub pf zip(self: Vec, other: Vec) -> Vec {
+        ret vec_zip(self, other);
+    }
+
+    pub pf enumerate(self: Vec) -> Vec {
+        ret vec_enumerate(self);
+    }
+
+    pub pf flat_map(self: Vec, f: pf(i64) -> i64) -> Vec {
+        ret vec_flat_map(self, f);
+    }
+
+    pub pf chunk(self: Vec, size: i64) -> Vec {
+        ret vec_chunk(self, size);
+    }
+
+    pub pf window(self: Vec, size: i64) -> Vec {
+        ret vec_window(self, size);
+    }
+
+    pub pf dedup(self: Vec) -> void {
+        vec_dedup(self);
+    }
+
+    pub pf sort_by(self: Vec, cmp: pf(i64, i64) -> i64) -> void {
+        vec_sort_by(self, cmp);
+    }
+
+    pub pf contains_val(self: Vec, val: i64) -> bool {
+        ret vec_contains_val(self, val);
+    }
+}
+
+// ─── Free function wrappers for iterator adapters ───────────────────────
+// These allow calling Vec_take(v, 3) instead of v.take(3) when using `use vec;`
+
+pub pf vec_take(self: i64, n: i64) -> i64 {
+    pv result: i64 = Vec_new();
+    pv len: i64 = Vec_len(self);
+    pv count: i64 = n;
+    if count > len { count = len; }
+    pv i: i64 = 0;
+    while i < count {
+        Vec_push(result, Vec_get(self, i));
+        i = i + 1;
+    }
+    ret result;
+}
+
+pub pf vec_skip(self: i64, n: i64) -> i64 {
+    pv result: i64 = Vec_new();
+    pv len: i64 = Vec_len(self);
+    pv start: i64 = n;
+    if start < 0 { start = 0; }
+    pv i: i64 = start;
+    while i < len {
+        Vec_push(result, Vec_get(self, i));
+        i = i + 1;
+    }
+    ret result;
+}
+
+pub pf vec_zip(self: i64, other: i64) -> i64 {
+    pv result: i64 = Vec_new();
+    pv n1: i64 = Vec_len(self);
+    pv n2: i64 = Vec_len(other);
+    pv n: i64 = n1;
+    if n2 < n { n = n2; }
+    pv i: i64 = 0;
+    while i < n {
+        Vec_push(result, Vec_get(self, i));
+        Vec_push(result, Vec_get(other, i));
+        i = i + 1;
+    }
+    ret result;
+}
+
+pub pf vec_enumerate(self: i64) -> i64 {
+    pv result: i64 = Vec_new();
+    pv n: i64 = Vec_len(self);
+    pv i: i64 = 0;
+    while i < n {
+        Vec_push(result, i);
+        Vec_push(result, Vec_get(self, i));
+        i = i + 1;
+    }
+    ret result;
+}
+
+pub pf vec_flat_map(self: i64, f: pf(i64) -> i64) -> i64 {
+    pv result: i64 = Vec_new();
+    pv n: i64 = Vec_len(self);
+    pv i: i64 = 0;
+    while i < n {
+        pv mapped: i64 = f(Vec_get(self, i));
+        pv m: i64 = Vec_len(mapped);
+        pv j: i64 = 0;
+        while j < m {
+            Vec_push(result, Vec_get(mapped, j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret result;
+}
+
+pub pf vec_chunk(self: i64, size: i64) -> i64 {
+    pv result: i64 = Vec_new();
+    pv n: i64 = Vec_len(self);
+    pv i: i64 = 0;
+    while i < n {
+        Vec_push(result, i);
+        i = i + size;
+    }
+    ret result;
+}
+
+pub pf vec_window(self: i64, size: i64) -> i64 {
+    pv result: i64 = Vec_new();
+    pv n: i64 = Vec_len(self);
+    if size <= 0 { ret result; }
+    pv i: i64 = 0;
+    while i + size <= n {
+        Vec_push(result, i);
+        i = i + 1;
+    }
+    ret result;
+}
+
+pub pf vec_dedup(self: i64) -> void {
+    pv n: i64 = Vec_len(self);
+    if n <= 1 { ret; }
+    pv write: i64 = 1;
+    pv i: i64 = 1;
+    while i < n {
+        if Vec_get(self, i) != Vec_get(self, i - 1) {
+            Vec_set(self, write, Vec_get(self, i));
+            write = write + 1;
+        }
+        i = i + 1;
+    }
+    p_vec_truncate(self, write);
+}
+
+pub pf vec_sort_by(self: i64, cmp: pf(i64, i64) -> i64) -> void {
+    pv n: i64 = Vec_len(self);
+    pv i: i64 = 1;
+    while i < n {
+        pv key: i64 = Vec_get(self, i);
+        pv j: i64 = i - 1;
+        while j >= 0 {
+            if cmp(Vec_get(self, j), key) <= 0 { break; }
+            Vec_set(self, j + 1, Vec_get(self, j));
+            j = j - 1;
+        }
+        Vec_set(self, j + 1, key);
+        i = i + 1;
+    }
+}
+
+pub pf vec_contains_val(self: i64, val: i64) -> bool {
+    pv n: i64 = Vec_len(self);
+    pv i: i64 = 0;
+    while i < n {
+        if Vec_get(self, i) == val { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }

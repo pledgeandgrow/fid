@@ -42,7 +42,22 @@ pub fn link_with_runtime(
     runtime_rodata_syms: &[(&str, u64)],
     runtime_relocs: &[(u64, String, u8)],
 ) -> Result<Vec<u8>, String> {
-    let mut linker = Linker::new();
+    link_with_runtime_for_target(objects, entry, runtime_text, runtime_symbols,
+        runtime_rodata, runtime_rodata_syms, runtime_relocs, "x86-64")
+}
+
+/// Link with runtime for a specific target architecture ("x86-64" or "arm64").
+pub fn link_with_runtime_for_target(
+    objects: &[Vec<u8>],
+    entry: &str,
+    runtime_text: &[u8],
+    runtime_symbols: &[(&str, u64, usize)],
+    runtime_rodata: &[u8],
+    runtime_rodata_syms: &[(&str, u64)],
+    runtime_relocs: &[(u64, String, u8)],
+    target: &str,
+) -> Result<Vec<u8>, String> {
+    let mut linker = Linker::new_for_target(target);
     for obj in objects {
         linker.add_object(obj)?;
     }
@@ -59,6 +74,64 @@ pub fn link_with_runtime(
         linker.rodata_symbols.insert(name.to_string(), rod_base + offset);
     }
     // Add relocations (adjusted by rt_base)
+    for (offset, sym_name, r_type) in runtime_relocs {
+        linker.relocations.push((rt_base + offset, sym_name.clone(), *r_type));
+    }
+    linker.link(entry)
+}
+
+/// Link raw user code (pre-assembled) with a runtime, for a specific target.
+/// Both user code and runtime are provided as raw bytes + symbols + relocations.
+/// This bypasses ELF object file parsing — used for ARM64 where we assemble
+/// directly in-process.
+pub fn link_raw_with_runtime_for_target(
+    user_text: &[u8],
+    user_symbols: &[(String, u64)],
+    user_relocs: &[(u64, String, u8)],
+    user_rodata: &[u8],
+    user_rodata_syms: &[(String, u64)],
+    entry: &str,
+    runtime_text: &[u8],
+    runtime_symbols: &[(&str, u64, usize)],
+    runtime_rodata: &[u8],
+    runtime_rodata_syms: &[(&str, u64)],
+    runtime_relocs: &[(u64, String, u8)],
+    target: &str,
+) -> Result<Vec<u8>, String> {
+    let mut linker = Linker::new_for_target(target);
+
+    // Add user text
+    linker.text_bytes.extend_from_slice(user_text);
+    for (name, offset) in user_symbols {
+        linker.symbols.insert(name.clone(), (*offset, true));
+    }
+    // Add user rodata
+    let user_rod_base = 0u64; // user rodata starts at 0 in its own space
+    let _ = user_rod_base;
+    linker.rodata.extend_from_slice(user_rodata);
+    let user_rod_offset = if user_text.is_empty() { 0 } else { 0u64 };
+    let _ = user_rod_offset;
+    for (name, offset) in user_rodata_syms {
+        linker.rodata_symbols.insert(name.clone(), *offset);
+    }
+    // Add user relocations
+    for (offset, sym_name, r_type) in user_relocs {
+        linker.relocations.push((*offset, sym_name.clone(), *r_type));
+    }
+
+    // Add the runtime as raw text + symbols
+    let rt_base = linker.text_bytes.len() as u64;
+    linker.text_bytes.extend_from_slice(runtime_text);
+    for (name, offset, _size) in runtime_symbols {
+        linker.symbols.insert(name.to_string(), (rt_base + offset, true));
+    }
+    // Add runtime rodata
+    let rod_base = linker.rodata.len() as u64;
+    linker.rodata.extend_from_slice(runtime_rodata);
+    for (name, offset) in runtime_rodata_syms {
+        linker.rodata_symbols.insert(name.to_string(), rod_base + offset);
+    }
+    // Add runtime relocations (adjusted by rt_base)
     for (offset, sym_name, r_type) in runtime_relocs {
         linker.relocations.push((rt_base + offset, sym_name.clone(), *r_type));
     }
@@ -228,6 +301,8 @@ struct Linker {
     rodata_symbols: HashMap<String, u64>,
     // Relocations for rodata (e.g., vtable function pointers)
     rodata_relocations: Vec<(u64, String, u8)>,
+    // Target architecture: "x86-64" or "arm64"
+    target: String,
 }
 
 impl Linker {
@@ -239,7 +314,14 @@ impl Linker {
             rodata: Vec::new(),
             rodata_symbols: HashMap::new(),
             rodata_relocations: Vec::new(),
+            target: "x86-64".to_string(),
         }
+    }
+
+    fn new_for_target(target: &str) -> Self {
+        let mut l = Self::new();
+        l.target = target.to_string();
+        l
     }
 
     fn add_object(&mut self, obj: &[u8]) -> Result<(), String> {
@@ -538,6 +620,133 @@ impl Linker {
                                     .copy_from_slice(&abs_addr.to_le_bytes());
                             }
                         }
+                        // ── ARM64 relocations (internal codes) ──
+                        10 => {
+                            // BL: 26-bit PC-relative offset / 4
+                            let next_pc = patch_offset as i64 + 4;
+                            let delta = sym_offset as i64 - next_pc;
+                            let imm26 = ((delta / 4) as u32) & 0x03FFFFFF;
+                            let instr = u32::from_le_bytes([
+                                self.text_bytes[patch_offset], self.text_bytes[patch_offset+1],
+                                self.text_bytes[patch_offset+2], self.text_bytes[patch_offset+3]
+                            ]);
+                            let patched = (instr & 0xFC000000) | imm26;
+                            self.text_bytes[patch_offset..patch_offset+4]
+                                .copy_from_slice(&patched.to_le_bytes());
+                        }
+                        11 => {
+                            // B: 26-bit PC-relative offset / 4
+                            let next_pc = patch_offset as i64 + 4;
+                            let delta = sym_offset as i64 - next_pc;
+                            let imm26 = ((delta / 4) as u32) & 0x03FFFFFF;
+                            let instr = u32::from_le_bytes([
+                                self.text_bytes[patch_offset], self.text_bytes[patch_offset+1],
+                                self.text_bytes[patch_offset+2], self.text_bytes[patch_offset+3]
+                            ]);
+                            let patched = (instr & 0xFC000000) | imm26;
+                            self.text_bytes[patch_offset..patch_offset+4]
+                                .copy_from_slice(&patched.to_le_bytes());
+                        }
+                        12 => {
+                            // B.cond: 19-bit PC-relative offset / 4
+                            let next_pc = patch_offset as i64 + 4;
+                            let delta = sym_offset as i64 - next_pc;
+                            let imm19 = ((delta / 4) as u32) & 0x0007FFFF;
+                            let instr = u32::from_le_bytes([
+                                self.text_bytes[patch_offset], self.text_bytes[patch_offset+1],
+                                self.text_bytes[patch_offset+2], self.text_bytes[patch_offset+3]
+                            ]);
+                            let patched = (instr & 0xFF00001F) | (imm19 << 5);
+                            self.text_bytes[patch_offset..patch_offset+4]
+                                .copy_from_slice(&patched.to_le_bytes());
+                        }
+                        14 => {
+                            // ADRP: compute page-aligned PC-relative address
+                            // ADRP Xd, label → Xd = (PC & ~0xFFF) + (imm * 4096)
+                            // imm = (target_page - source_page) / 4096
+                            // The instruction has immlo:2 at bits 29-30, immhi:19 at bits 5-23
+                            let source_page = (patch_offset as u64) & !0xFFFu64;
+                            // For the runtime, rodata is placed right after text in the ELF.
+                            // The virtual address of text starts at base_addr + header_size.
+                            // But at link time we work with file offsets. The ADRP needs the
+                            // virtual address. We'll compute it using the same base as build_executable.
+                            let base_addr: u64 = 0x400000;
+                            let text_file_offset = 64 + 56; // ELF header + 1 phdr
+                            let text_vaddr = base_addr + text_file_offset as u64;
+                            let source_vaddr = text_vaddr + patch_offset as u64;
+                            let source_page = source_vaddr & !0xFFFu64;
+                            let sym_vaddr = text_vaddr + sym_offset;
+                            let target_page = sym_vaddr & !0xFFFu64;
+                            let page_delta = (target_page as i64 - source_page as i64) / 4096;
+                            let imm = (page_delta as u32) & 0x7FFFF; // 21 bits
+                            let immlo = imm & 0x3;
+                            let immhi = (imm >> 2) & 0x7FFFF;
+                            let instr = u32::from_le_bytes([
+                                self.text_bytes[patch_offset], self.text_bytes[patch_offset+1],
+                                self.text_bytes[patch_offset+2], self.text_bytes[patch_offset+3]
+                            ]);
+                            let patched = (instr & 0x9F00001F) | (immlo << 29) | (immhi << 5);
+                            self.text_bytes[patch_offset..patch_offset+4]
+                                .copy_from_slice(&patched.to_le_bytes());
+                        }
+                        15 => {
+                            // ADD Xd, Xn, :lo12:label — add low 12 bits of symbol address
+                            let base_addr: u64 = 0x400000;
+                            let text_file_offset = 64 + 56;
+                            let text_vaddr = base_addr + text_file_offset as u64;
+                            let sym_vaddr = text_vaddr + sym_offset;
+                            let lo12 = (sym_vaddr & 0xFFF) as u32;
+                            let instr = u32::from_le_bytes([
+                                self.text_bytes[patch_offset], self.text_bytes[patch_offset+1],
+                                self.text_bytes[patch_offset+2], self.text_bytes[patch_offset+3]
+                            ]);
+                            let patched = (instr & 0xFFC00003) | (lo12 << 10);
+                            self.text_bytes[patch_offset..patch_offset+4]
+                                .copy_from_slice(&patched.to_le_bytes());
+                        }
+                        // ── RISC-V relocations (internal codes) ──
+                        20 => {
+                            // JAL: 20-bit PC-relative immediate (J-type)
+                            let next_pc = patch_offset as i64;
+                            let delta = sym_offset as i64 - next_pc;
+                            let imm = delta as u32;
+                            let imm20 = (imm >> 20) & 1;
+                            let imm10_1 = (imm >> 1) & 0x3FF;
+                            let imm11 = (imm >> 11) & 1;
+                            let imm19_12 = (imm >> 12) & 0xFF;
+                            let instr = u32::from_le_bytes([
+                                self.text_bytes[patch_offset], self.text_bytes[patch_offset+1],
+                                self.text_bytes[patch_offset+2], self.text_bytes[patch_offset+3]
+                            ]);
+                            let patched = (instr & 0x00000FFF)
+                                | (imm20 << 31)
+                                | (imm10_1 << 21)
+                                | (imm11 << 20)
+                                | (imm19_12 << 12);
+                            self.text_bytes[patch_offset..patch_offset+4]
+                                .copy_from_slice(&patched.to_le_bytes());
+                        }
+                        21 => {
+                            // Branch: 13-bit PC-relative immediate (B-type)
+                            let next_pc = patch_offset as i64;
+                            let delta = sym_offset as i64 - next_pc;
+                            let imm = delta as u32;
+                            let imm12 = (imm >> 12) & 1;
+                            let imm10_5 = (imm >> 5) & 0x3F;
+                            let imm4_1 = (imm >> 1) & 0xF;
+                            let imm11 = (imm >> 11) & 1;
+                            let instr = u32::from_le_bytes([
+                                self.text_bytes[patch_offset], self.text_bytes[patch_offset+1],
+                                self.text_bytes[patch_offset+2], self.text_bytes[patch_offset+3]
+                            ]);
+                            let patched = (instr & 0x01FFF07F)
+                                | (imm12 << 31)
+                                | (imm10_5 << 25)
+                                | (imm4_1 << 8)
+                                | (imm11 << 7);
+                            self.text_bytes[patch_offset..patch_offset+4]
+                                .copy_from_slice(&patched.to_le_bytes());
+                        }
                         _ => {}
                     }
                 }
@@ -615,7 +824,12 @@ impl Linker {
         buf.push(0); // ELFOSABI_NONE
         buf.extend_from_slice(&[0; 8]); // padding
         buf.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
-        buf.extend_from_slice(&62u16.to_le_bytes()); // e_machine = EM_X86_64
+        let e_machine: u16 = match self.target.as_str() {
+            "arm64" | "aarch64" => 183, // EM_AARCH64
+            "riscv" | "riscv64" => 243, // EM_RISCV
+            _ => 62, // EM_X86_64
+        };
+        buf.extend_from_slice(&e_machine.to_le_bytes()); // e_machine
         buf.extend_from_slice(&1u32.to_le_bytes()); // e_version
         buf.extend_from_slice(&(text_vaddr + entry_offset).to_le_bytes()); // e_entry = virtual address of entry
         buf.extend_from_slice(&phdr_offset.to_le_bytes()); // e_phoff

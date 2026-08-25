@@ -383,6 +383,9 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
         return Err(enrich_errors(&tc.errors, source, file));
     }
 
+    // Run lint checks (warnings only, never errors)
+    tc.run_lints(&program);
+
     // Borrow check — runs after typecheck succeeds, before comptime/mono.
     // Mode is controlled by the global BORROWCK_MODE (set via --borrowck CLI flag).
     // Off by default; Warn emits warnings; On fails compilation on violations.
@@ -493,6 +496,7 @@ fn desugar_layers_models(program: &mut Program) {
                 name: name.clone(),
                 ty: Type::Named(layer_type.clone()),
                 is_pub: false,
+                annotations: Vec::new(),
             }
         }).collect();
 
@@ -693,11 +697,13 @@ fn desugar_phase8b(program: &mut Program) {
                     name: "__state".to_string(),
                     ty: Type::Named(sm_name.clone()),
                     is_pub: false,
+                annotations: Vec::new(),
                 },
                 Param {
                     name: "__event_type".to_string(),
                     ty: Type::Str,
                     is_pub: false,
+                annotations: Vec::new(),
                 },
             ],
             Type::Named(sm_name.clone()),
@@ -851,7 +857,7 @@ fn fill_default_trait_methods(program: &mut Program) {
             let self_type = Type::Named(ti.type_name.clone());
             let params: Vec<Param> = tm.params.iter().map(|p| {
                 if p.name == "self" {
-                    Param { name: p.name.clone(), ty: self_type.clone(), is_pub: false }
+                    Param { name: p.name.clone(), ty: self_type.clone(), is_pub: false, annotations: Vec::new() }
                 } else {
                     p.clone()
                 }
@@ -1032,6 +1038,54 @@ pub fn get_diagnostics(source: &str, source_path: Option<&str>) -> Vec<(usize, u
     }
 }
 
+/// Build a program and typechecker for LSP use (completion, hover, goto-definition).
+/// Unlike `build_program_with_path`, this does NOT fail on type errors — it
+/// registers all symbols that were successfully parsed so the LSP can provide
+/// completions and hover info even for partially-correct code.
+/// Returns (Program, TypeChecker) with symbol tables populated.
+pub fn build_program_for_lsp(source: &str) -> (Program, TypeChecker) {
+    // Parse stdlib first
+    let stdlib = match parse_source(STDLIB_CORE) {
+        Ok(p) => p,
+        Err(_) => Program::default(),
+    };
+    let stdlib_module = stdlib.module.clone().unwrap_or_else(|| "core".to_string());
+
+    // Extract stdlib struct/enum names so the user parser recognizes them
+    let struct_names: Vec<String> = stdlib.structs.iter().map(|s| s.name.clone()).collect();
+    let enum_names: Vec<String> = stdlib.enums.iter().map(|e| e.name.clone()).collect();
+
+    // Parse user code (tolerate errors — we still want partial symbols)
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize();
+    let mut parser = Parser::with_names(tokens, struct_names, enum_names);
+    let user = parser.parse().unwrap_or_default();
+    let user_module = user.module.clone().unwrap_or_else(|| "main".to_string());
+
+    // Merge programs (simple merge — no desugaring/comptime for LSP)
+    let mut program = Program {
+        module: Some(user_module.clone()),
+        ..Default::default()
+    };
+
+    let mut tc = TypeChecker::new();
+    tc.register_program(&stdlib, &stdlib_module);
+    tc.register_program(&user, &user_module);
+
+    // Copy user items into the merged program for the LSP to traverse
+    for f in &user.funcs { program.funcs.push(f.clone()); }
+    for s in &user.structs { program.structs.push(s.clone()); }
+    for e in &user.enums { program.enums.push(e.clone()); }
+    for c in &user.consts { program.consts.push(c.clone()); }
+    for ta in &user.type_aliases { program.type_aliases.push(ta.clone()); }
+    for i in &user.impls { program.impls.push(i.clone()); }
+    for ti in &user.trait_impls { program.trait_impls.push(ti.clone()); }
+    program.imports = user.imports.clone();
+    program.traits = user.traits.clone();
+
+    (program, tc)
+}
+
 /// Parse an error string to extract (line, column, message).
 fn parse_error_position(error: &str) -> (usize, usize, String) {
     // Format 1: "Error:line:col: message"
@@ -1074,7 +1128,7 @@ fn parse_error_position(error: &str) -> (usize, usize, String) {
     (1, 1, error.to_string())
 }
 
-pub fn interpret_source(source: &str, verbose: bool) -> Result<RunResult, Vec<String>> {
+pub fn interpret_source(source: &str, verbose: bool) -> Result<(RunResult, Option<String>), Vec<String>> {
     let program = build_program(source)?;
 
     // Lower to IR
@@ -1084,11 +1138,136 @@ pub fn interpret_source(source: &str, verbose: bool) -> Result<RunResult, Vec<St
     Ok(interp::interpret(module, verbose, false))
 }
 
-pub fn interpret_source_with_path(source: &str, source_path: &str, verbose: bool) -> Result<RunResult, Vec<String>> {
+pub fn interpret_source_with_path(source: &str, source_path: &str, verbose: bool) -> Result<(RunResult, Option<String>), Vec<String>> {
     interpret_source_with_path_release(source, source_path, verbose, false)
 }
 
-pub fn interpret_source_with_path_release(source: &str, source_path: &str, verbose: bool, release: bool) -> Result<RunResult, Vec<String>> {
+/// Run lint checks on source code and return warnings.
+/// Returns Ok(warnings) if compilation succeeds, Err(errors) if it fails.
+pub fn lint_source(source: &str, source_path: &str) -> Result<Vec<String>, Vec<String>> {
+    let program = build_program_with_path(source, Some(source_path))?;
+    // build_program_with_path already runs lints and stores warnings in tc,
+    // but we don't have access to tc here. So we re-run lints on the program.
+    // We need to reconstruct a typechecker and run just the lint portion.
+    // Actually, build_program_with_path runs run_lints internally, but
+    // doesn't expose the warnings. Let's use get_diagnostics instead.
+    
+    // Re-run with a fresh typechecker to get warnings
+    let (program, _tc) = build_program_with_lints(source, Some(source_path))?;
+    Ok(_tc.warnings)
+}
+
+/// Build program and return both the program and the typechecker (with warnings).
+fn build_program_with_lints(source: &str, source_path: Option<&str>) -> Result<(Program, TypeChecker), Vec<String>> {
+    // Parse user code
+    let mut lex = Lexer::new(source);
+    let toks = lex.tokenize();
+    let lexer_errors = lex.errors.clone();
+    if !lexer_errors.is_empty() {
+        return Err(lexer_errors);
+    }
+    let mut p = Parser::new(toks);
+    let user = p.parse().map_err(|e| vec![e])?;
+
+    // Load imports
+    let mut imported_modules: Vec<(String, Program)> = Vec::new();
+    if let Some(src_path) = source_path {
+        let base_dir = std::path::Path::new(src_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+
+        for import in &user.imports {
+            if import.path == "core" { continue; }
+            let path_str = import.path.replace("::", "/");
+            let candidates = [
+                base_dir.join(format!("{}.fd", path_str)),
+                base_dir.join(format!("{}/mod.fd", path_str)),
+                base_dir.join("fides_modules").join(format!("{}.fd", path_str)),
+                base_dir.join("fides_modules").join(format!("{}/mod.fd", path_str)),
+                std::path::Path::new("stdlib").join(format!("{}.fd", path_str)),
+                std::path::Path::new("stdlib").join(format!("{}/mod.fd", path_str)),
+            ];
+
+            let mut found = None;
+            for candidate in &candidates {
+                if candidate.exists() {
+                    found = Some(candidate.clone());
+                    break;
+                }
+            }
+
+            if let Some(file_path) = found {
+                let module_source = std::fs::read_to_string(&file_path)
+                    .map_err(|e| vec![format!("Error reading '{}': {}", file_path.display(), e)])?;
+                let mut lex2 = Lexer::new(&module_source);
+                let toks2 = lex2.tokenize();
+                let mut p2 = Parser::new(toks2);
+                let imported = p2.parse().map_err(|e| vec![e])?;
+                let module_name = imported.module.clone()
+                    .unwrap_or_else(|| import.path.clone());
+                imported_modules.push((module_name, imported));
+            }
+        }
+    }
+
+    // Load core stdlib
+    let core_source = include_str!("../stdlib/core.fd");
+    let mut lex_core = Lexer::new(core_source);
+    let toks_core = lex_core.tokenize();
+    let mut p_core = Parser::new(toks_core);
+    let core_program = p_core.parse().map_err(|e| vec![e])?;
+
+    // Merge programs
+    let user_module = user.module.clone().unwrap_or_else(|| "main".to_string());
+    let mut program = Program {
+        module: Some(user_module.clone()),
+        ..Default::default()
+    };
+
+    // Register core first
+    let mut tc = TypeChecker::new();
+    tc.register_program(&core_program, "core");
+
+    // Register imported modules
+    for (mod_name, mod_prog) in &imported_modules {
+        tc.register_program(mod_prog, mod_name);
+        for f in &mod_prog.funcs { program.funcs.push(f.clone()); }
+        for s in &mod_prog.structs { program.structs.push(s.clone()); }
+        for e in &mod_prog.enums { program.enums.push(e.clone()); }
+        for c in &mod_prog.consts { program.consts.push(c.clone()); }
+        for ta in &mod_prog.type_aliases { program.type_aliases.push(ta.clone()); }
+        for i in &mod_prog.impls { program.impls.push(i.clone()); }
+        for ti in &mod_prog.trait_impls { program.trait_impls.push(ti.clone()); }
+    }
+
+    // Register user program
+    tc.register_program(&user, &user_module);
+    for f in &user.funcs { program.funcs.push(f.clone()); }
+    for s in &user.structs { program.structs.push(s.clone()); }
+    for e in &user.enums { program.enums.push(e.clone()); }
+    for c in &user.consts { program.consts.push(c.clone()); }
+    for ta in &user.type_aliases { program.type_aliases.push(ta.clone()); }
+    for i in &user.impls { program.impls.push(i.clone()); }
+    for ti in &user.trait_impls { program.trait_impls.push(ti.clone()); }
+    program.imports = user.imports.clone();
+    program.extern_decls = user.extern_decls.clone();
+
+    // Type check
+    tc.current_module = user_module.clone();
+    tc.collect_capabilities(&user);
+    tc.check_bodies(&program);
+    if !tc.errors.is_empty() {
+        let file = source_path.unwrap_or("<stdin>");
+        return Err(enrich_errors(&tc.errors, source, file));
+    }
+
+    // Run lints
+    tc.run_lints(&program);
+
+    Ok((program, tc))
+}
+
+pub fn interpret_source_with_path_release(source: &str, source_path: &str, verbose: bool, release: bool) -> Result<(RunResult, Option<String>), Vec<String>> {
     let program = build_program_with_path(source, Some(source_path))?;
 
     // Lower to IR
@@ -1096,6 +1275,23 @@ pub fn interpret_source_with_path_release(source: &str, source_path: &str, verbo
 
     // Interpret
     Ok(interp::interpret(module, verbose, release))
+}
+
+/// Interpret with trace recording enabled (for post-mortem debugging).
+/// Returns the run result, stack trace string, and the execution trace.
+pub fn interpret_source_with_trace(source: &str, source_path: &str, verbose: bool, release: bool) -> Result<(RunResult, Option<String>, Vec<interp::TraceEntry>), Vec<String>> {
+    let program = build_program_with_path(source, Some(source_path))?;
+    let module = lower::lower(&program);
+    let mut interp = interp::Interpreter::new(module);
+    if verbose {
+        // verbose() takes self by value, so we need to call it before other methods
+        interp = interp.verbose();
+    }
+    interp.enable_recording();
+    let result = interp.run();
+    let trace = interp.get_trace().to_vec();
+    let stack_trace = interp.format_panic_trace();
+    Ok((result, stack_trace, trace))
 }
 
 /// Build source to x86_64 assembly (Stage 2 — no C runtime)
@@ -1185,9 +1381,31 @@ pub fn build_executable_with_lto(source: &str, source_path: &str, target: &str, 
 
     let l3 = pir::lower_l2_to_l3(&l2, &module);
 
+    // DEBUG: dump p_str_copy_n L3 PIR
+    for f in &l3.functions {
+        if f.name == "p_str_copy_n" {
+            eprintln!("=== BUILD p_str_copy_n L3 ===\n{}", pir::format_l3(&l3));
+        }
+    }
+
     match target {
         "x86-64" | "x64" => {
             let asm = crate::codegen_x64::generate_asm(&l3);
+            // DEBUG: dump p_str_copy_n assembly
+            if let Some(idx) = asm.find("p_str_copy_n:") {
+                let end = asm[idx..].find("\n\n").map(|e| idx + e).unwrap_or(idx + 800);
+                eprintln!("=== BUILD p_str_copy_n asm ===\n{}", &asm[idx..end]);
+            }
+            // DEBUG: dump String_from assembly
+            if let Some(idx) = asm.find("String_from:") {
+                let end = asm[idx..].find("\n\n").map(|e| idx + e).unwrap_or(idx + 800);
+                eprintln!("=== BUILD String_from asm ===\n{}", &asm[idx..end]);
+            }
+            // DEBUG: dump p_str_length assembly
+            if let Some(idx) = asm.find("p_str_length:") {
+                let end = asm[idx..].find("\n\n").map(|e| idx + e).unwrap_or(idx + 800);
+                eprintln!("=== BUILD p_str_length asm ===\n{}", &asm[idx..end]);
+            }
             // Always run peephole optimization on the generated assembly —
             // this catches redundant moves, zero idioms, dead stores, etc.
             // These are safe local transformations that don't affect semantics.
@@ -1213,17 +1431,63 @@ pub fn build_executable_with_lto(source: &str, source_path: &str, target: &str, 
         }
         "arm64" | "aarch64" => {
             let asm = crate::codegen_arm64::generate_asm(&l3);
-            // Emit a valid ELF64 relocatable object for AArch64
-            let obj = crate::elf64::emit_object_file_for_target(&l3, &asm, "arm64")
-                .map_err(|e| vec![e])?;
-            Ok(obj)
+            // Assemble the ARM64 code using our built-in encoder
+            let (user_text, user_syms, user_relocs) = crate::arm64_enc::assemble(&asm)
+                .map_err(|e| vec![format!("ARM64 assembly error: {}", e)])?;
+            // Get the ARM64 runtime
+            let (rt_text, rt_syms, rt_rodata, rt_rodata_syms) = if let Some(caps) = granted_caps {
+                let cap_set: std::collections::HashSet<String> = caps.iter().cloned().collect();
+                crate::runtime_arm64::runtime_parts_with_caps(&cap_set)
+            } else {
+                crate::runtime_arm64::runtime_parts()
+            };
+            let rt_relocs = crate::runtime_arm64::runtime_relocations();
+            // Link user code + runtime
+            let user_syms_owned: Vec<(String, u64)> = user_syms.iter()
+                .map(|(n, o)| (n.clone(), *o))
+                .collect();
+            crate::linker::link_raw_with_runtime_for_target(
+                &user_text, &user_syms_owned, &user_relocs,
+                &[], &[],  // user rodata (empty for now)
+                "_start",
+                &rt_text, &rt_syms,
+                &rt_rodata, &rt_rodata_syms,
+                &rt_relocs,
+                "arm64",
+            )
+                .map_err(|e| vec![e])
         }
         "riscv" | "riscv64" => {
             let asm = crate::codegen_riscv::generate_asm(&l3);
-            // Emit a valid ELF64 relocatable object for RISC-V
-            let obj = crate::elf64::emit_object_file_for_target(&l3, &asm, "riscv")
-                .map_err(|e| vec![e])?;
-            Ok(obj)
+            // Assemble the RISC-V code using our built-in encoder
+            let (user_text, user_syms, user_relocs) = crate::riscv_enc::assemble(&asm)
+                .map_err(|e| vec![format!("RISC-V assembly error: {}", e)])?;
+            // Get the RISC-V runtime
+            let (rt_text, rt_syms, rt_rodata, rt_rodata_syms) = if let Some(caps) = granted_caps {
+                let cap_set: std::collections::HashSet<String> = caps.iter().cloned().collect();
+                crate::runtime_riscv::runtime_parts_with_caps(&cap_set)
+            } else {
+                crate::runtime_riscv::runtime_parts()
+            };
+            let rt_relocs = crate::runtime_riscv::runtime_relocations();
+            let user_syms_owned: Vec<(String, u64)> = user_syms.iter()
+                .map(|(n, o)| (n.clone(), *o))
+                .collect();
+            crate::linker::link_raw_with_runtime_for_target(
+                &user_text, &user_syms_owned, &user_relocs,
+                &[], &[],
+                "_start",
+                &rt_text, &rt_syms,
+                &rt_rodata, &rt_rodata_syms,
+                &rt_relocs,
+                "riscv",
+            )
+                .map_err(|e| vec![e])
+        }
+        "x86-64-windows" | "x64-windows" | "windows" => {
+            // Windows PE cross-compilation — use the direct PE emitter
+            // which generates x86-64 Windows .exe files with kernel32.dll imports
+            Ok(crate::pe::generate_pe(&module))
         }
         _ => Err(vec![format!("Unknown target: {}", target)])
     }
@@ -1328,7 +1592,7 @@ fn process_derive(program: &mut Program) {
                             type_params: Vec::new(),
                             type_param_bounds: Vec::new(),
                             const_params: Vec::new(),
-                            params: vec![Param { name: "self".to_string(), ty: self_type, is_pub: false }],
+                            params: vec![Param { name: "self".to_string(), ty: self_type, is_pub: false, annotations: Vec::new() }],
                             ret_ty: Type::Str,
                             body: vec![Stmt::Return(Some(Expr::StringLit(debug_str)), 0)],
                             is_pub: true,
@@ -1350,7 +1614,7 @@ fn process_derive(program: &mut Program) {
                             type_params: Vec::new(),
                             type_param_bounds: Vec::new(),
                             const_params: Vec::new(),
-                            params: vec![Param { name: "self".to_string(), ty: self_type.clone(), is_pub: false }],
+                            params: vec![Param { name: "self".to_string(), ty: self_type.clone(), is_pub: false, annotations: Vec::new() }],
                             ret_ty: self_type,
                             body: vec![Stmt::Return(Some(Expr::Ident("self".to_string())), 0)],
                             is_pub: true,
@@ -1379,7 +1643,7 @@ fn process_derive(program: &mut Program) {
                             type_params: Vec::new(),
                             type_param_bounds: Vec::new(),
                             const_params: Vec::new(),
-                            params: vec![Param { name: "self".to_string(), ty: self_type, is_pub: false }],
+                            params: vec![Param { name: "self".to_string(), ty: self_type, is_pub: false, annotations: Vec::new() }],
                             ret_ty: Type::Str,
                             body: vec![Stmt::Return(Some(Expr::StringLit(json_str)), 0)],
                             is_pub: true,
@@ -1403,7 +1667,7 @@ fn process_derive(program: &mut Program) {
                             type_params: Vec::new(),
                             type_param_bounds: Vec::new(),
                             const_params: Vec::new(),
-                            params: vec![Param { name: "json".to_string(), ty: Type::Str, is_pub: false }],
+                            params: vec![Param { name: "json".to_string(), ty: Type::Str, is_pub: false, annotations: Vec::new() }],
                             ret_ty: self_type.clone(),
                             body: vec![Stmt::Return(Some(Expr::StructLit {
                                 name: s.name.clone(),
@@ -1658,6 +1922,7 @@ mod tests {
                     source_line: None,
                     in_sandbox: false,
                     is_linear: false,
+                    borrow_kind: crate::ir::BorrowKind::None,
                 });
                 func.instructions.insert(vid, Inst::Call {
                     func: callee.to_string(),

@@ -691,7 +691,7 @@ impl WasmCodeGen {
                 out.uleb(0);            // offset
                 if dst_has_value { self.emit_set_value(out, id, func); }
             }
-            Inst::Store { ptr, value } => {
+            Inst::Store { ptr, value, .. } => {
                 // For stores we need value first (to preserve stack order),
                 // then address. WASM store wants [addr, value]. Emit addr
                 // then value.

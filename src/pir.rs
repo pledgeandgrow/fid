@@ -116,7 +116,7 @@ pub enum L1Inst {
     /// or a sentinel referring to Stack/Heap/Static (see `RegionRef`).
     AllocaIn { region: RegionRef, ty: PirType },
     Load { ptr: PValue, ty: PirType, effects: EffectSet },
-    Store { ptr: PValue, value: PValue, effects: EffectSet },
+    Store { ptr: PValue, value: PValue, store_ty: Option<PirType>, effects: EffectSet },
     GetFieldPtr { struct_ptr: PValue, field_index: u32, field_ty: PirType },
     GetElemPtr { array_ptr: PValue, index: PValue, elem_ty: PirType },
 
@@ -273,6 +273,8 @@ pub struct L1Function {
     pub sandbox_values: std::collections::HashSet<PValue>,
     /// I-6B: Values with @linear type (single-owner, can't alias).
     pub linear_values: std::collections::HashSet<PValue>,
+    /// I-7A: Borrow kind per value — tracks & vs &mut provenance.
+    pub borrow_kinds: HashMap<PValue, crate::ir::BorrowKind>,
     /// Gas limit from @gas(N) — None = no limit. Used by unroller (I-4C).
     pub gas_limit: Option<u64>,
     /// Whether this function is @no-alloc — cannot allocate heap memory.
@@ -334,7 +336,7 @@ pub enum L2Inst {
 
     Alloca { ty: PirType, region: MemRegion },
     Load { ptr: PValue, ty: PirType },
-    Store { ptr: PValue, value: PValue },
+    Store { ptr: PValue, value: PValue, store_ty: Option<PirType> },
     GetFieldPtr { struct_ptr: PValue, field_index: u32, field_ty: PirType },
     GetElemPtr { array_ptr: PValue, index: PValue, elem_ty: PirType },
 
@@ -440,6 +442,9 @@ pub struct L2Function {
     pub sandbox_values: std::collections::HashSet<PValue>,
     /// I-6B: Values with @linear type (single-owner, can't alias).
     pub linear_values: std::collections::HashSet<PValue>,
+    /// I-7A: Borrow kind per value — tracks & vs &mut provenance.
+    /// Used by alias analysis to prove non-aliasing.
+    pub borrow_kinds: HashMap<PValue, crate::ir::BorrowKind>,
     /// Gas limit from @gas(N) — None = no limit. Used by unroller (I-4C).
     pub gas_limit: Option<u64>,
     /// Whether this function is @no-alloc — cannot allocate heap memory.
@@ -739,9 +744,10 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
                     e
                 },
             },
-            Inst::Store { ptr, value } => L1Inst::Store {
+            Inst::Store { ptr, value, store_ty } => L1Inst::Store {
                 ptr: *ptr,
                 value: *value,
+                store_ty: store_ty.clone(),
                 effects: {
                     let mut e = EffectSet::new();
                     e.add(Effect::Write);
@@ -864,6 +870,14 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
         .map(|(vid, _)| ValueId(vid.0))
         .collect();
 
+    // I-7A: Collect borrow kind per value from ValueMeta.
+    let borrow_kinds: HashMap<PValue, crate::ir::BorrowKind> = f.instructions.iter()
+        .filter_map(|(vid, _)| {
+            f.values.get(vid).map(|m| (ValueId(vid.0), m.borrow_kind))
+        })
+        .filter(|(_, bk)| *bk != crate::ir::BorrowKind::None)
+        .collect();
+
     let blocks = f
         .blocks
         .iter()
@@ -895,6 +909,7 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
         is_crashfree: f.is_crashfree,
         sandbox_values,
         linear_values,
+        borrow_kinds,
         gas_limit: f.gas_limit,
         is_no_alloc: f.is_no_alloc,
         is_medical: f.is_medical,
@@ -987,7 +1002,7 @@ fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
                 L2Inst::Alloca { ty: ty.clone(), region: mr }
             }
             L1Inst::Load { ptr, ty, .. } => L2Inst::Load { ptr: *ptr, ty: ty.clone() },
-            L1Inst::Store { ptr, value, .. } => L2Inst::Store { ptr: *ptr, value: *value },
+            L1Inst::Store { ptr, value, store_ty, .. } => L2Inst::Store { ptr: *ptr, value: *value, store_ty: store_ty.clone() },
             L1Inst::GetFieldPtr { struct_ptr, field_index, field_ty } => L2Inst::GetFieldPtr {
                 struct_ptr: *struct_ptr,
                 field_index: *field_index,
@@ -1103,6 +1118,7 @@ fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
         is_crashfree: f.is_crashfree,
         sandbox_values: f.sandbox_values.clone(),
         linear_values: f.linear_values.clone(),
+        borrow_kinds: f.borrow_kinds.clone(),
         gas_limit: f.gas_limit,
         is_no_alloc: f.is_no_alloc,
         is_medical: f.is_medical,
@@ -1342,10 +1358,10 @@ fn lower_l2_inst_to_l3(
             ptr: materialize(*ptr, next, vreg_of, operand),
             ty: ty.clone(),
         },
-        L2Inst::Store { ptr, value } => L3Inst::Store {
+        L2Inst::Store { ptr, value, store_ty } => L3Inst::Store {
             ptr: materialize(*ptr, next, vreg_of, operand),
             val: materialize(*value, next, vreg_of, operand),
-            ty: PirType::I64, // type unknown at L2 Store; placeholder
+            ty: store_ty.clone().unwrap_or(PirType::I64),
         },
         L2Inst::GetFieldPtr { struct_ptr, field_index, field_ty } => L3Inst::FieldAddr {
             dst,
@@ -1729,7 +1745,7 @@ fn fmt_l2_inst(i: &L2Inst) -> String {
         UnaryOp { op, operand, ty } => format!("unop {:?} {} -> {}", op, operand, ty),
         Alloca { ty, region } => format!("alloca {} {}", region, ty),
         Load { ptr, ty } => format!("load {} {}", ty, ptr),
-        Store { ptr, value } => format!("store {} -> {}", value, ptr),
+        Store { ptr, value, .. } => format!("store {} -> {}", value, ptr),
         GetFieldPtr { struct_ptr, field_index, field_ty } => {
             format!("fieldptr {} +{} -> *{}", struct_ptr, field_index, field_ty)
         }

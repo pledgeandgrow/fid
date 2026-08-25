@@ -1,7 +1,7 @@
 # Fides Compiler Architecture
 
-**Version:** 0.5.0
-**Targets:** x86_64 (Windows PE + Linux ELF64), ARM64, RISC-V, Mach-O (macOS), COFF (Windows), WebAssembly, SPIR-V (GPU), bare-metal flat binary, C codegen, IR interpreter
+**Version:** 0.6.0
+**Targets:** x86_64 (Windows PE + Linux ELF64), ARM64 (Linux ELF64 cross-compilation), RISC-V (Linux ELF64 cross-compilation), Mach-O (macOS), COFF (Windows), WebAssembly, SPIR-V (GPU), bare-metal flat binary, C codegen, IR interpreter
 
 ---
 
@@ -75,7 +75,7 @@ Source (.fd)
                                                      Native .exe
 ```
 
-The **`build` command** uses the full PIR pipeline (L1→L2→L3 → codegen → peephole → ELF64) and is the primary native backend on Linux — it produces working ELF64 executables directly with zero external tool dependencies. The **`emit` command** bypasses PIR entirely: it operates directly on IR to produce Windows `.exe` files via the PE emitter (or bare-metal flat binaries with `--bare`). The **WASM backend** (`wasm.rs`) and **SPIR-V GPU backend** (`gpu.rs`) both consume PIR L3. The **C codegen** (`codegen_c.rs`) consumes IR directly. The **interpreter** provides rapid testing without any external tools. Object file formats (ELF64, Mach-O, COFF) are available via `codegen --elf|--macho|--coff`, and multiple object files can be linked with the integrated `linker.rs`.
+The **`build` command** uses the full PIR pipeline (L1→L2→L3 → codegen → peephole → ELF64) and is the primary native backend on Linux — it produces working ELF64 executables directly with zero external tool dependencies. **Cross-compilation** to ARM64 (`--target arm64-linux`) and RISC-V (`--target riscv64-linux`) uses built-in instruction encoders and runtime libraries with raw Linux syscalls, also producing valid ELF64 executables. Cross-compilation to Windows (`--target x86-64-windows`) uses the PE emitter. The **`emit` command** bypasses PIR entirely: it operates directly on IR to produce Windows `.exe` files via the PE emitter (or bare-metal flat binaries with `--bare`). The **WASM backend** (`wasm.rs`) and **SPIR-V GPU backend** (`gpu.rs`) both consume PIR L3. The **C codegen** (`codegen_c.rs`) consumes IR directly. The **interpreter** provides rapid testing without any external tools. Object file formats (ELF64, Mach-O, COFF) are available via `codegen --elf|--macho|--coff`, and multiple object files can be linked with the integrated `linker.rs`.
 
 ### Entry Points (`compiler.rs`)
 
@@ -83,7 +83,7 @@ The **`build` command** uses the full PIR pipeline (L1→L2→L3 → codegen →
 |----------|----------|-------------|
 | `emit_source_with_path(source, path)` | lex → parse → typecheck → monomorphize → lower → PE emission (direct IR→machine code, bypasses PIR) | `emit` |
 | `emit_bare(source, path)` | lex → parse → typecheck → lower → flat binary (no stdlib) | `emit --bare` |
-| `build_executable(source, path)` | lex → parse → typecheck → monomorphize → lower → PIR (L1→L2→L3) → codegen → peephole → ELF64 executable | `build` |
+| `build_executable(source, path)` | lex → parse → typecheck → monomorphize → lower → PIR (L1→L2→L3) → codegen → peephole → ELF64/PE executable. Supports cross-compilation: `--target arm64`, `--target riscv`, `--target x86-64-windows`. | `build` |
 | `ccompile_source_with_path(source, path)` | lex → parse → typecheck → monomorphize → lower → C codegen | `ccompile` |
 | `interpret_source_with_path(source, path, verbose)` | lex → parse → typecheck → monomorphize → lower → interpret | `run` |
 | `lower_to_ir(source)` | lex → parse → typecheck → monomorphize → lower → format IR | `ir` |
@@ -97,6 +97,10 @@ The **`build` command** uses the full PIR pipeline (L1→L2→L3 → codegen →
 | C header parser (`cparser.rs`) | C header → Fides FFI bindings | `parse-header` |
 | Hot reload (`hotreload.rs`) | Native JIT (ELF64) + function-level change detection | `watch` |
 | Linker (`linker.rs`) | Multiple object files → linked binary | `link` |
+| ARM64 Encoder (`arm64_enc.rs`) | ARM64 assembly text → 4-byte machine code | (internal) |
+| ARM64 Runtime (`runtime_arm64.rs`) | ARM64 Linux runtime (SVC syscalls) | (internal) |
+| RISC-V Encoder (`riscv_enc.rs`) | RV64 assembly text → 4-byte machine code | (internal) |
+| RISC-V Runtime (`runtime_riscv.rs`) | RISC-V Linux runtime (ECALL syscalls) | (internal) |
 | LSP server (`lsp.rs`) | JSON-RPC 2.0 over stdio, diagnostics from compiler | `lsp` |
 
 ### Module Resolution (`compiler.rs`)

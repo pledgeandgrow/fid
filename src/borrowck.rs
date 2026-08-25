@@ -332,6 +332,15 @@ impl<'tc> BorrowChecker<'tc> {
             Stmt::Query { body, .. } => {
                 for s in body { self.collect_var_uses_stmt(s, idx); }
             }
+            Stmt::Select { cases, default, .. } => {
+                for case in cases {
+                    self.collect_var_uses_expr(&case.channel, idx);
+                    for s in &case.body { self.collect_var_uses_stmt(s, idx); }
+                }
+                if let Some(ref def) = default {
+                    for s in def { self.collect_var_uses_stmt(s, idx); }
+                }
+            }
         }
     }
 
@@ -961,6 +970,19 @@ impl<'tc> BorrowChecker<'tc> {
                 self.push_scope();
                 for s in body { self.check_stmt(s); }
                 self.pop_scope();
+            }
+            Stmt::Select { cases, default, .. } => {
+                for case in cases {
+                    self.check_expr(&case.channel);
+                    self.push_scope();
+                    for s in &case.body { self.check_stmt(s); }
+                    self.pop_scope();
+                }
+                if let Some(ref def) = default {
+                    self.push_scope();
+                    for s in def { self.check_stmt(s); }
+                    self.pop_scope();
+                }
             }
         }
     }

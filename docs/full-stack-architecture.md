@@ -74,7 +74,7 @@ Native Binary / WASM / SPIR-V / C Source / Running Code
 - Integrated linker (ELF64 objects → executable, in-process)
 - Hot reload (`fidesc watch`) — native JIT + function-level change detection
 - Custom runtime: hand-encoded x86-64 machine code via raw syscalls (Linux, no libc) / kernel32.dll (Windows)
-- 34 stdlib modules: core, vec, math, ecs, events, parallel, sync, db, http, json, shape, simd, tensor, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input
+- 35 stdlib modules: core, vec, channel, math, ecs, events, parallel, sync, db, http, json, shape, simd, tensor, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input
 - C header FFI parsing (`fidesc parse-header`)
 - Embedded/IoT: FixedBufferAllocator, `!RealTime` effect, RISC-V target, HAL framework
 - No external dependencies for primary paths: no LLVM, no libc (in Fides binaries), no external assembler, no external linker

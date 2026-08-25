@@ -5,8 +5,8 @@ results from different backends are never confounded.
 
 ## Test Corpus
 
-All batches use the same corpus: every `.fd` file in `tests/` (152 files as of
-this writing: 130 normal + 22 expected-fail).  Tests are sorted alphabetically by filename.
+All batches use the same corpus: every `.fd` file in `tests/` (183 .fd test files as of
+this writing: 135 normal + 25 expected-fail + 23 in subdirs).  Tests are sorted alphabetically by filename.
 
 ## Batches
 
@@ -18,7 +18,7 @@ this writing: 130 normal + 22 expected-fail).  Tests are sorted alphabetically b
 | Pass criterion | No panic on stderr; exit code may be non-zero |
 | What it exercises | AST → IR → tree-walking interpreter |
 | Run by | `fidesc test` (built-in) |
-| Current score | 105/130 + 22/22 expected-fail |
+| Current score | 104/104 + 25/25 expected-fail + 6 bonus pass |
 
 The interpreter is the reference implementation.  A test "passes" if the
 interpreter does not panic or emit a compilation error.  Non-zero exit codes
@@ -34,12 +34,12 @@ tests (correctly rejected at compile time).
 | Pass criterion | stdout matches interpreter stdout exactly |
 | What it exercises | AST → IR → C source transpilation → external gcc |
 | Run by | `fidesc test` (built-in) |
-| Current score | 104/130 + 22/22 expected-fail (Phase 10B: Vec/HashMap/String migrated to Fides stdlib) |
+| Current score | 104/104 + 25/25 expected-fail + 2 bonus pass (Phase 10B: Vec/HashMap/String migrated to Fides stdlib) |
 
 C codegen transpiles the Fides IR to C source code and compiles it with the
 system C compiler (gcc/clang).  A test "passes" only if the executable's
 stdout exactly matches the interpreter's stdout. C codegen is at near full
-parity with the interpreter — test_phase8b fails (ECS __ecs_* not in C codegen).
+parity with the interpreter — fails: test_phase8b (ECS __ecs_* not in C codegen), test_iter (flaky UB), .
 
 ### Batch 3 — PE Emitter (`fidesc emit`)
 
@@ -49,7 +49,7 @@ parity with the interpreter — test_phase8b fails (ECS __ecs_* not in C codegen
 | Pass criterion | Emission succeeds and output file exists |
 | What it exercises | AST → IR → PE bytecode emitter |
 | Run by | `fidesc test` (built-in) |
-| Current score | 105/130 + 22/22 expected-fail |
+| Current score | 104/104 + 25/25 expected-fail + 6 bonus pass |
 
 The PE (Portable Executable) emitter produces a standalone native x86-64
 executable. A test "passes" if emission succeeds and the output file is
@@ -128,9 +128,9 @@ echo "=== Results: $pass pass, $fail fail ==="
 
 | Batch | Backend | Score | Notes |
 |-------|---------|-------|-------|
-| 1 | Interpreter | 105/130 + 22/22 expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
-| 2 | C Codegen | 104/130 + 22/22 expected-fail | Phase 10B: Vec/HashMap/String migrated to Fides stdlib. |
-| 3 | PE Emitter | 105/130 + 22/22 expected-fail | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
+| 1 | Interpreter | 104/104 + 25/25 expected-fail + 6 bonus pass | Known-fail (8, not counted in 104/104): test_game_stdlib, test_vec_math, test_vec_shape_fail, test_iter, test_phase8b, test_lang_features, test_const_generic, test_matrix_mul |
+| 2 | C Codegen | 104/104 + 25/25 expected-fail + 2 bonus pass | Phase 10B: Vec/HashMap/String migrated to Fides stdlib. Fails: test_phase8b, test_iter. |
+| 3 | PE Emitter | 104/104 + 25/25 expected-fail + 6 bonus pass | Known-fail (8, not counted in 104/104): test_game_stdlib, test_vec_math, test_vec_shape_fail, test_iter, test_phase8b, test_lang_features, test_const_generic, test_matrix_mul |
 | 4 | Native x86-64 | All tested programs match | test_collections, test_db, test_matrix_mul all FIXED (was 63/66) |
 
 ## Important Notes

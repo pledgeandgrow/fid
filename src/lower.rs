@@ -16,6 +16,51 @@ use crate::ast::*;
 use crate::ir::*;
 use std::collections::HashMap;
 
+/// Check if an IrType is a vec struct type and return its name
+fn get_vec_type_name(ty: &IrType) -> Option<String> {
+    match ty {
+        IrType::Struct(name) if is_vec_type_name(name) => Some(name.clone()),
+        IrType::Ptr(inner) => get_vec_type_name(inner),
+        _ => None,
+    }
+}
+
+/// Check if a type name is a vector type
+fn is_vec_type_name(name: &str) -> bool {
+    matches!(name, "vec2" | "vec3" | "vec4")
+}
+
+/// Check if a field name is a valid swizzle pattern (2-4 chars, consistent group)
+fn is_valid_swizzle(field: &str) -> bool {
+    if field.len() < 2 || field.len() > 4 {
+        return false;
+    }
+    let valid = field.chars().all(|c| matches!(c, 'x' | 'y' | 'z' | 'w' | 'r' | 'g' | 'b' | 'a' | 's' | 't' | 'p' | 'q'));
+    if !valid {
+        return false;
+    }
+    let first = field.chars().next().unwrap();
+    let group = if matches!(first, 'x' | 'y' | 'z' | 'w') { 'x' }
+        else if matches!(first, 'r' | 'g' | 'b' | 'a') { 'r' }
+        else { 's' };
+    field.chars().all(|c| {
+        if group == 'x' { matches!(c, 'x' | 'y' | 'z' | 'w') }
+        else if group == 'r' { matches!(c, 'r' | 'g' | 'b' | 'a') }
+        else { matches!(c, 's' | 't' | 'p' | 'q') }
+    })
+}
+
+/// Map a swizzle component to a field index
+fn swizzle_index(c: char) -> usize {
+    match c {
+        'x' | 'r' | 's' => 0,
+        'y' | 'g' | 't' => 1,
+        'z' | 'b' | 'p' => 2,
+        'w' | 'a' | 'q' => 3,
+        _ => 0,
+    }
+}
+
 pub struct Lowerer {
     module: IrModule,
     /// Current function being lowered
@@ -68,6 +113,9 @@ pub struct Lowerer {
     /// Async function names — functions declared with `async pf`
     /// Calls to these functions are wrapped in p_future_ready
     async_funcs: std::collections::HashSet<String>,
+    /// Current function's AST parameter types — maps param name to AST type
+    /// Used to determine return types of function-typed parameters (closures)
+    current_func_param_types: HashMap<String, Type>,
     /// Allocas that hold Vec values (from for-loop iteration over Vec<Vec<...>>)
     /// Used to enable nested Vec iteration
     vec_allocas: std::collections::HashSet<ValueId>,
@@ -110,6 +158,7 @@ impl Lowerer {
             sandbox_depth: 0,
             func_ret_types: HashMap::new(),
             async_funcs: std::collections::HashSet::new(),
+            current_func_param_types: HashMap::new(),
             vec_allocas: std::collections::HashSet::new(),
             linear_structs: std::collections::HashSet::new(),
         }
@@ -234,12 +283,9 @@ impl Lowerer {
             for method in &imp.methods {
                 let mut mangled = method.clone();
                 mangled.name = format!("{}_{}", imp.struct_name, method.name);
-                if mangled.name.contains("map") || mangled.name.contains("filter") || mangled.name.contains("fold") {
-                    eprintln!("DEBUG LOWER: lowering {} with {} params", mangled.name, mangled.params.len());
-                }
                 // Resolve Self in param types and return type
                 mangled.params = mangled.params.iter().map(|p| {
-                    Param { name: p.name.clone(), ty: self.resolve_self_in_type(&p.ty), is_pub: p.is_pub }
+                    Param { name: p.name.clone(), ty: self.resolve_self_in_type(&p.ty), is_pub: p.is_pub, annotations: p.annotations.clone() }
                 }).collect();
                 mangled.ret_ty = self.resolve_self_in_type(&mangled.ret_ty);
                 self.lower_func(&mangled);
@@ -256,7 +302,7 @@ impl Lowerer {
                 mangled.name = format!("{}_{}", ti.type_name, method.name);
                 // Resolve Self in param types and return type
                 mangled.params = mangled.params.iter().map(|p| {
-                    Param { name: p.name.clone(), ty: self.resolve_self_in_type(&p.ty), is_pub: p.is_pub }
+                    Param { name: p.name.clone(), ty: self.resolve_self_in_type(&p.ty), is_pub: p.is_pub, annotations: p.annotations.clone() }
                 }).collect();
                 mangled.ret_ty = self.resolve_self_in_type(&mangled.ret_ty);
                 self.lower_func(&mangled);
@@ -577,6 +623,19 @@ impl Lowerer {
         self.module.add_extern("p_mutex_lock", vec![IrType::I64], IrType::Void);
         // p_mutex_unlock(m: i64) -> void  — unlock a mutex
         self.module.add_extern("p_mutex_unlock", vec![IrType::I64], IrType::Void);
+        // ─── Channels (bounded MPSC queue) ───
+        // p_chan_create(capacity: i64) -> i64 — create a bounded channel
+        self.module.add_extern("p_chan_create", vec![IrType::I64], IrType::I64);
+        // p_chan_send(ch: i64, val: i64) -> bool — send a value (blocks if full)
+        self.module.add_extern("p_chan_send", vec![IrType::I64, IrType::I64], IrType::Bool);
+        // p_chan_recv(ch: i64) -> i64 — receive a value (blocks if empty)
+        self.module.add_extern("p_chan_recv", vec![IrType::I64], IrType::I64);
+        // p_chan_try_recv(ch: i64) -> i64 — non-blocking receive
+        self.module.add_extern("p_chan_try_recv", vec![IrType::I64], IrType::I64);
+        // p_chan_close(ch: i64) -> void — close the channel
+        self.module.add_extern("p_chan_close", vec![IrType::I64], IrType::Void);
+        // p_chan_is_closed(ch: i64) -> bool — check if channel is closed
+        self.module.add_extern("p_chan_is_closed", vec![IrType::I64], IrType::Bool);
         // Dynamic loading builtins (Phase 7.7)
         self.module.add_extern("p_dl_open",
             vec![IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
@@ -625,6 +684,7 @@ impl Lowerer {
                 source_line: None,
                 in_sandbox: false,
                                 is_linear: false,
+                                borrow_kind: crate::ir::BorrowKind::None,
             };
             let sret_val = ir_func.new_value(meta);
             ir_func.params.push((sret_val, sret_ty));
@@ -642,6 +702,7 @@ impl Lowerer {
             source_line: None,
             in_sandbox: false,
                                 is_linear: false,
+                                borrow_kind: crate::ir::BorrowKind::None,
         };
         let env_val = ir_func.new_value(env_meta);
         ir_func.params.push((env_val, IrType::Ptr(Box::new(IrType::U8))));
@@ -665,6 +726,7 @@ impl Lowerer {
                 source_line: None,
                 in_sandbox: false,
                 is_linear,
+                borrow_kind: crate::ir::BorrowKind::None,
             };
             let val = ir_func.new_value(meta);
             ir_func.params.push((val, ir_ty.clone()));
@@ -677,6 +739,11 @@ impl Lowerer {
         self.allocas.clear();
         self.alloca_types.clear();
         self.defer_stack.clear();
+        // Save AST parameter types for function-typed param return type lookup
+        self.current_func_param_types.clear();
+        for p in &func.params {
+            self.current_func_param_types.insert(p.name.clone(), p.ty.clone());
+        }
 
         // @audit annotation: emit log calls at function entry/exit.
         // Entry: print "[AUDIT] enter <name>\n"
@@ -808,6 +875,7 @@ impl Lowerer {
                                 source_line: None,
                                 in_sandbox: false,
                                 is_linear: false,
+                                borrow_kind: crate::ir::BorrowKind::None,
                             };
                             let zid = {
                                 let fmut = self.current_func.as_mut().unwrap();
@@ -966,6 +1034,7 @@ impl Lowerer {
                     self.emit_inst(Inst::Store {
                         ptr: alloca,
                         value: loaded,
+                        store_ty: None,
                     });
                     if let Some(ref mut f) = self.current_func {
                         f.persist_vars.push((name.clone(), alloca));
@@ -974,6 +1043,7 @@ impl Lowerer {
                     self.emit_inst(Inst::Store {
                         ptr: alloca,
                         value: val,
+                        store_ty: None,
                     });
                 }
                 self.allocas.insert(name.clone(), alloca);
@@ -1048,6 +1118,7 @@ impl Lowerer {
                     self.emit_inst(Inst::Store {
                         ptr: alloca,
                         value: val,
+                        store_ty: None,
                     });
                     self.allocas.insert(name.clone(), alloca);
                     if let Some(ref mut f) = self.current_func {
@@ -1065,7 +1136,7 @@ impl Lowerer {
                     match op {
                         AssignOp::Assign => {
                             let val = self.lower_expr(expr);
-                            self.emit_inst(Inst::Store { ptr, value: val });
+                            self.emit_inst(Inst::Store { ptr, value: val, store_ty: None });
                         }
                         _ => {
                             // Compound assignment: load current, apply op, store back
@@ -1076,7 +1147,7 @@ impl Lowerer {
                             });
                             let rhs = self.lower_expr(expr);
                             let new_val = self.lower_compound_assign(op, current, rhs);
-                            self.emit_inst(Inst::Store { ptr, value: new_val });
+                            self.emit_inst(Inst::Store { ptr, value: new_val, store_ty: None });
                         }
                     }
                 } else {
@@ -1184,7 +1255,7 @@ impl Lowerer {
 
                 if *op == AssignOp::Assign {
                     let val = self.lower_expr(expr);
-                    self.emit_inst(Inst::Store { ptr: elem_ptr, value: val });
+                    self.emit_inst(Inst::Store { ptr: elem_ptr, value: val, store_ty: None });
                 } else {
                     // Compound assignment: load, binop, store
                     let current = self.emit_inst(Inst::Load { ptr: elem_ptr, ty: elem_ty.clone() });
@@ -1208,7 +1279,7 @@ impl Lowerer {
                         right: rhs,
                         ty: elem_ty,
                     });
-                    self.emit_inst(Inst::Store { ptr: elem_ptr, value: new_val });
+                    self.emit_inst(Inst::Store { ptr: elem_ptr, value: new_val, store_ty: None });
                 }
             }
 
@@ -1220,7 +1291,7 @@ impl Lowerer {
                 };
                 if *op == AssignOp::Assign {
                     let val = self.lower_expr(expr);
-                    self.emit_inst(Inst::Store { ptr: ptr_val, value: val });
+                    self.emit_inst(Inst::Store { ptr: ptr_val, value: val, store_ty: Some(pointee_ty) });
                 } else {
                     let current = self.emit_inst(Inst::Load { ptr: ptr_val, ty: pointee_ty.clone() });
                     let rhs = self.lower_expr(expr);
@@ -1241,9 +1312,9 @@ impl Lowerer {
                         op: bin_op,
                         left: current,
                         right: rhs,
-                        ty: pointee_ty,
+                        ty: pointee_ty.clone(),
                     });
-                    self.emit_inst(Inst::Store { ptr: ptr_val, value: new_val });
+                    self.emit_inst(Inst::Store { ptr: ptr_val, value: new_val, store_ty: Some(pointee_ty) });
                 }
             }
 
@@ -1275,7 +1346,7 @@ impl Lowerer {
                             });
                             if *op == AssignOp::Assign {
                                 let val = self.lower_expr(expr);
-                                self.emit_inst(Inst::Store { ptr: field_ptr, value: val });
+                                self.emit_inst(Inst::Store { ptr: field_ptr, value: val, store_ty: None });
                             } else {
                                 // Compound assignment: load current field value, apply op, store back
                                 let current = self.emit_inst(Inst::Load {
@@ -1284,7 +1355,7 @@ impl Lowerer {
                                 });
                                 let rhs = self.lower_expr(expr);
                                 let new_val = self.lower_compound_assign(op, current, rhs);
-                                self.emit_inst(Inst::Store { ptr: field_ptr, value: new_val });
+                                self.emit_inst(Inst::Store { ptr: field_ptr, value: new_val, store_ty: None });
                             }
                         }
                     }
@@ -1341,7 +1412,7 @@ impl Lowerer {
                     if let Some(e) = expr {
                         let val = self.lower_expr(e);
                         if let Some(slot) = slot {
-                            self.emit_inst(Inst::Store { ptr: slot, value: val });
+                            self.emit_inst(Inst::Store { ptr: slot, value: val, store_ty: None });
                         }
                     }
                     self.emit_terminator(Inst::Jump { target: break_target });
@@ -1393,7 +1464,7 @@ impl Lowerer {
                                 ty: IrType::I64,
                                 region: self.current_region(),
                             });
-                            self.emit_inst(Inst::Store { ptr: slot, value: arg_val });
+                            self.emit_inst(Inst::Store { ptr: slot, value: arg_val, store_ty: None });
                             self.allocas.insert(params[i].clone(), slot);
                             self.alloca_types.insert(slot, IrType::I64);
                         }
@@ -1467,6 +1538,110 @@ impl Lowerer {
             }
             Stmt::Query { body, .. } => {
                 for s in body { self.lower_stmt(s); }
+            }
+            Stmt::Select { cases, default, line: _ } => {
+                // Lower select as: try each channel with try_recv, if ready execute body and jump to merge.
+                // If none ready and no default, block on first channel.
+                // Simplified: poll all channels in order, first ready wins.
+                let merge_block = self.new_block();
+
+                if cases.is_empty() {
+                    if let Some(ref def_body) = default {
+                        for s in def_body { self.lower_stmt(s); }
+                    }
+                    self.emit_terminator(Inst::Jump { target: merge_block });
+                    self.set_current_block(merge_block);
+                    return;
+                }
+
+                // Evaluate all channel expressions first
+                let chan_vals: Vec<ValueId> = cases.iter()
+                    .map(|c| self.lower_expr(&c.channel))
+                    .collect();
+
+                // Create a temp alloca to store the received value across blocks
+                let recv_alloca = self.emit_inst(Inst::Alloca {
+                    ty: IrType::I64,
+                    region: self.current_region(),
+                });
+
+                // For each case, try_recv and check if ready
+                let mut case_blocks = Vec::new();
+                let mut next_poll_blocks = Vec::new();
+                for _ in 0..cases.len() {
+                    case_blocks.push(self.new_block());
+                    next_poll_blocks.push(self.new_block());
+                }
+                let default_block = self.new_block();
+
+                // Jump to first poll block
+                self.emit_terminator(Inst::Jump { target: next_poll_blocks[0] });
+
+                // Chain: poll case 0, if ready go to case_block[0], else poll case 1, etc.
+                for (i, _) in cases.iter().enumerate() {
+                    // In next_poll_blocks[i]: try_recv on chan_vals[i]
+                    self.set_current_block(next_poll_blocks[i]);
+                    let try_recv = self.emit_inst(Inst::Call {
+                        func: "p_chan_try_recv".to_string(),
+                        args: vec![chan_vals[i]],
+                        ret_ty: IrType::I64,
+                        effects: EffectSet::new(),
+                    });
+                    // Store the received value in the temp alloca
+                    self.emit_inst(Inst::Store { ptr: recv_alloca, value: try_recv, store_ty: None });
+                    // Check if result is not PENDING_SENTINEL (i64::MIN + 1)
+                    let sentinel = self.emit_inst(Inst::ConstInt {
+                        value: i64::MIN + 1,
+                        ty: IrType::I64,
+                    });
+                    let is_ready = self.emit_inst(Inst::BinOp {
+                        op: BinOp::Neq,
+                        left: try_recv,
+                        right: sentinel,
+                        ty: IrType::Bool,
+                    });
+                    let next = if i + 1 < cases.len() {
+                        next_poll_blocks[i + 1]
+                    } else {
+                        default_block
+                    };
+                    self.emit_terminator(Inst::Branch {
+                        cond: is_ready,
+                        then: case_blocks[i],
+                        else_: next,
+                    });
+                }
+
+                // Case blocks: load value, bind var, execute body, jump to merge
+                for (i, case) in cases.iter().enumerate() {
+                    self.set_current_block(case_blocks[i]);
+                    let recv_val = self.emit_inst(Inst::Load { ptr: recv_alloca, ty: IrType::I64 });
+                    // Bind to var_name
+                    if let Some(alloca) = self.allocas.get(&case.var_name).copied() {
+                        self.emit_inst(Inst::Store { ptr: alloca, value: recv_val, store_ty: None });
+                    } else {
+                        let alloca = self.emit_inst(Inst::Alloca {
+                            ty: IrType::I64,
+                            region: self.current_region(),
+                        });
+                        self.emit_inst(Inst::Store { ptr: alloca, value: recv_val, store_ty: None });
+                        self.allocas.insert(case.var_name.clone(), alloca);
+                    }
+                    for s in &case.body {
+                        self.lower_stmt(s);
+                    }
+                    self.emit_terminator(Inst::Jump { target: merge_block });
+                }
+
+                // Default block
+                self.set_current_block(default_block);
+                if let Some(ref def_body) = default {
+                    for s in def_body {
+                        self.lower_stmt(s);
+                    }
+                }
+                self.emit_terminator(Inst::Jump { target: merge_block });
+                self.set_current_block(merge_block);
             }
         }
     }
@@ -1555,6 +1730,7 @@ impl Lowerer {
                 self.emit_inst(Inst::Store {
                     ptr: alloca,
                     value: start_val,
+                    store_ty: None,
                 });
                 self.allocas.insert(var.to_string(), alloca);
                 if let Some(ref mut f) = self.current_func {
@@ -1608,6 +1784,7 @@ impl Lowerer {
                     self.emit_inst(Inst::Store {
                         ptr: alloca,
                         value: inc,
+                        store_ty: None,
                     });
                     self.emit_terminator(Inst::Jump { target: cond_block });
                 }
@@ -1699,6 +1876,7 @@ impl Lowerer {
                 self.emit_inst(Inst::Store {
                     ptr: idx_alloca,
                     value: zero,
+                    store_ty: None,
                 });
 
                 let cond_block = self.new_block();
@@ -1732,7 +1910,7 @@ impl Lowerer {
                     elem_ty: elem_ty.clone(),
                 });
                 let elem_val = self.emit_inst(Inst::Load { ptr: elem_ptr, ty: elem_ty });
-                self.emit_inst(Inst::Store { ptr: var_alloca, value: elem_val });
+                self.emit_inst(Inst::Store { ptr: var_alloca, value: elem_val, store_ty: None });
 
                 self.loop_stack.push((cond_block, exit_block, None));
                 self.lower_stmts(body);
@@ -1747,7 +1925,7 @@ impl Lowerer {
                         right: one,
                         ty: IrType::I64,
                     });
-                    self.emit_inst(Inst::Store { ptr: idx_alloca, value: inc });
+                    self.emit_inst(Inst::Store { ptr: idx_alloca, value: inc, store_ty: None });
                     self.emit_terminator(Inst::Jump { target: cond_block });
                 }
 
@@ -1794,6 +1972,7 @@ impl Lowerer {
         self.emit_inst(Inst::Store {
             ptr: idx_alloca,
             value: zero,
+            store_ty: None,
         });
 
         let cond_block = self.new_block();
@@ -1831,10 +2010,10 @@ impl Lowerer {
         let elem_val = self.emit_inst(Inst::Call {
             func: "Vec_get".to_string(),
             args: vec![dummy_env2, vec_val, cur_idx],
-            ret_ty: IrType::Opaque("any".to_string()),
+            ret_ty: elem_ty.clone(),
             effects: EffectSet::new(),
         });
-        self.emit_inst(Inst::Store { ptr: var_alloca, value: elem_val });
+        self.emit_inst(Inst::Store { ptr: var_alloca, value: elem_val, store_ty: None });
 
         self.loop_stack.push((cond_block, exit_block, None));
         self.lower_stmts(body);
@@ -1849,7 +2028,7 @@ impl Lowerer {
                 right: one,
                 ty: IrType::I64,
             });
-            self.emit_inst(Inst::Store { ptr: idx_alloca, value: inc });
+            self.emit_inst(Inst::Store { ptr: idx_alloca, value: inc, store_ty: None });
             self.emit_terminator(Inst::Jump { target: cond_block });
         }
 
@@ -1880,13 +2059,15 @@ impl Lowerer {
         self.emit_inst(Inst::Store {
             ptr: idx_alloca,
             value: zero,
+            store_ty: None,
         });
 
         // Get string length once (hoist out of loop)
+        // p_str_length is a user function — prepend dummy env_ptr
         let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
         let len_val = self.emit_inst(Inst::Call {
             func: "p_str_length".to_string(),
-            args: vec![str_val],
+            args: vec![dummy_env, str_val],
             ret_ty: IrType::I64,
             effects: EffectSet::new(),
         });
@@ -1922,7 +2103,7 @@ impl Lowerer {
             ret_ty: IrType::I64,
             effects: EffectSet::new(),
         });
-        self.emit_inst(Inst::Store { ptr: var_alloca, value: byte_val });
+        self.emit_inst(Inst::Store { ptr: var_alloca, value: byte_val, store_ty: None });
 
         self.loop_stack.push((cond_block, exit_block, None));
         self.lower_stmts(body);
@@ -1937,7 +2118,7 @@ impl Lowerer {
                 right: one,
                 ty: IrType::I64,
             });
-            self.emit_inst(Inst::Store { ptr: idx_alloca, value: inc });
+            self.emit_inst(Inst::Store { ptr: idx_alloca, value: inc, store_ty: None });
             self.emit_terminator(Inst::Jump { target: cond_block });
         }
 
@@ -2233,7 +2414,7 @@ impl Lowerer {
                         }
                     }
                     if let Some(v) = last_val {
-                        self.emit_inst(Inst::Store { ptr: result_slot, value: v });
+                        self.emit_inst(Inst::Store { ptr: result_slot, value: v, store_ty: None });
                     }
                     if !self.current_block_has_terminator() {
                         self.emit_terminator(Inst::Jump { target: merge_block });
@@ -2268,7 +2449,7 @@ impl Lowerer {
                 }
             }
             if let Some(v) = last_val {
-                self.emit_inst(Inst::Store { ptr: result_slot, value: v });
+                self.emit_inst(Inst::Store { ptr: result_slot, value: v, store_ty: None });
             }
             if !self.current_block_has_terminator() {
                 self.emit_terminator(Inst::Jump { target: merge_block });
@@ -2365,6 +2546,44 @@ impl Lowerer {
             }
 
             Expr::Binary { op, left, right } => {
+                // Operator overloading for vec types (Phase 8A)
+                // Check if either operand is a vec type
+                let left_ir_ty = self.infer_expr_type(left);
+                let right_ir_ty = self.infer_expr_type(right);
+                let left_vec_name = get_vec_type_name(&left_ir_ty);
+                let right_vec_name = get_vec_type_name(&right_ir_ty);
+
+                if let Some(vn) = &left_vec_name {
+                    if right_vec_name.as_deref() == Some(vn.as_str()) {
+                        // vec + vec, vec - vec → call vecN_add / vecN_sub
+                        let method = match op {
+                            BinOp::Add => "add",
+                            BinOp::Sub => "sub",
+                            _ => "",
+                        };
+                        if !method.is_empty() {
+                            return self.lower_vec_method_call(vn, method, left, right);
+                        }
+                    } else if matches!(op, BinOp::Mul) {
+                        // vec * scalar → call vecN_scale
+                        return self.lower_vec_method_call(vn, "scale", left, right);
+                    } else if matches!(op, BinOp::Div) {
+                        // vec / scalar = vec * (1/scalar)
+                        let left_val = self.lower_expr(left);
+                        let right_val = self.lower_expr(right);
+                        let one = self.emit_inst(Inst::ConstFloat { bits: 1.0_f64.to_bits(), ty: IrType::F64 });
+                        let inv = self.emit_inst(Inst::BinOp { op: BinOp::Div, left: one, right: right_val, ty: IrType::F64 });
+                        let mangled = format!("{}_scale", vn);
+                        let ret_ty = IrType::Struct(vn.clone());
+                        return self.lower_vec_sret_call(&mangled, &ret_ty, left_val, inv);
+                    }
+                } else if let Some(vn) = &right_vec_name {
+                    if matches!(op, BinOp::Mul) {
+                        // scalar * vec → call vecN_scale(vec, scalar)
+                        return self.lower_vec_method_call(vn, "scale", right, left);
+                    }
+                }
+
                 let left_val = self.lower_expr(left);
                 let right_val = self.lower_expr(right);
                 let result_ty = self.infer_binop_type(op, left, right);
@@ -2405,7 +2624,15 @@ impl Lowerer {
                     } else {
                         self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 })
                     };
-                    let ret_ty = IrType::I64; // Default return type for indirect calls
+                    let ret_ty = self.current_func_param_types.get(callee)
+                        .and_then(|ty| {
+                            if let crate::ast::Type::Func { ret, .. } = ty {
+                                Some(self.lower_type(ret))
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(IrType::I64);
                     let mut effects = EffectSet::new();
                     effects.add(Effect::IO); // Conservative
                     // All function references are env structs, and all functions have __env param
@@ -2466,8 +2693,10 @@ impl Lowerer {
                         region: self.current_region(),
                     });
                     let mut all_args = vec![sret_ptr];
-                    // Prepend dummy env_ptr for user functions (not externs or builtins)
-                    if !self.module.extern_functions.contains_key(callee) && callee != "print" {
+                    // Prepend dummy env_ptr for user functions (not externs, builtins, or runtime funcs)
+                    let is_user_func = self.module.functions.contains_key(callee);
+                    let is_runtime = !is_user_func && (callee.starts_with("p_") || callee.starts_with("__ecs_"));
+                    if !self.module.extern_functions.contains_key(callee) && callee != "print" && !is_runtime {
                         let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                         all_args.push(dummy_env);
                     }
@@ -2503,9 +2732,11 @@ impl Lowerer {
                         }
                     }
 
-                    // Prepend dummy env_ptr for user functions (not externs or builtins)
+                    // Prepend dummy env_ptr for user functions (not externs, builtins, or runtime funcs)
                     let mut all_args = arg_vals;
-                    if !self.module.extern_functions.contains_key(callee) && callee != "print" {
+                    let is_user_func = self.module.functions.contains_key(callee);
+                    let is_runtime = !is_user_func && (callee.starts_with("p_") || callee.starts_with("__ecs_"));
+                    if !self.module.extern_functions.contains_key(callee) && callee != "print" && !is_runtime {
                         let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                         all_args.insert(0, dummy_env);
                     }
@@ -2566,7 +2797,7 @@ impl Lowerer {
                             },
                         });
                         // Store the value at the heap address
-                        self.emit_inst(Inst::Store { ptr, value: val });
+                        self.emit_inst(Inst::Store { ptr, value: val, store_ty: None });
                         return ptr;
                     }
                 }
@@ -2711,7 +2942,23 @@ impl Lowerer {
                             "truncate" => IrType::Void,
                             "sort" => IrType::Void,
                             "clone" => recv_ty.clone(),
-                            _ => IrType::I64,
+                            // Higher-order methods from stdlib/vec.fd
+                            "map" => recv_ty.clone(),
+                            "filter" => recv_ty.clone(),
+                            "for_each" => IrType::Void,
+                            "fold" => IrType::I64,
+                            "any" => IrType::Bool,
+                            "all" => IrType::Bool,
+                            "find" => IrType::I64,
+                            "position" => IrType::I64,
+                            _ => {
+                                // For user-defined Vec methods, look up return type
+                                if let Some(meth) = self.impl_methods.get(&("Vec".to_string(), method.clone())) {
+                                    self.lower_type(&meth.ret_ty)
+                                } else {
+                                    IrType::I64
+                                }
+                            }
                         };
                         (format!("Vec_{}", method), rt)
                     } else if recv_ty.is_opaque_named("HashMap") {
@@ -2888,6 +3135,16 @@ impl Lowerer {
                     _ => None,
                 };
 
+                // Swizzle access for vec types (Phase 8A)
+                if let Some(ref sn) = struct_name {
+                    if is_vec_type_name(sn) && field.len() > 1 {
+                        // Check if this is a valid swizzle pattern
+                        if is_valid_swizzle(field) {
+                            return self.lower_swizzle(sn, struct_ptr, field);
+                        }
+                    }
+                }
+
                 if let Some(name) = struct_name {
                     if let Some(layout) = self.module.get_struct(&name).cloned() {
                         if let Some((idx, (_, field_ty, _))) = layout.fields.iter()
@@ -3019,6 +3276,7 @@ impl Lowerer {
                 self.emit_inst(Inst::Store {
                     ptr: result_slot,
                     value: field_val,
+                    store_ty: None,
                 });
                 self.emit_terminator(Inst::Jump { target: merge_block });
 
@@ -3027,6 +3285,7 @@ impl Lowerer {
                 self.emit_inst(Inst::Store {
                     ptr: result_slot,
                     value: zero_val,
+                    store_ty: None,
                 });
                 self.emit_terminator(Inst::Jump { target: merge_block });
 
@@ -3074,6 +3333,7 @@ impl Lowerer {
                                 self.emit_inst(Inst::Store {
                                     ptr: field_ptr,
                                     value: val,
+                                    store_ty: None,
                                 });
                             }
                         }
@@ -3103,6 +3363,7 @@ impl Lowerer {
                                 self.emit_inst(Inst::Store {
                                     ptr: field_ptr,
                                     value: field_val,
+                                    store_ty: None,
                                 });
                             }
                         }
@@ -3135,6 +3396,7 @@ impl Lowerer {
                     self.emit_inst(Inst::Store {
                         ptr: elem_ptr,
                         value: elem_val,
+                        store_ty: None,
                     });
                 }
 
@@ -3240,7 +3502,7 @@ impl Lowerer {
                     }
                 }
                 if let Some(tv) = then_val {
-                    self.emit_inst(Inst::Store { ptr: result_slot, value: tv });
+                    self.emit_inst(Inst::Store { ptr: result_slot, value: tv, store_ty: None });
                 }
                 if !self.current_block_has_terminator() {
                     self.emit_terminator(Inst::Jump { target: merge_bb });
@@ -3260,7 +3522,7 @@ impl Lowerer {
                     }
                 }
                 if let Some(ev) = else_val {
-                    self.emit_inst(Inst::Store { ptr: result_slot, value: ev });
+                    self.emit_inst(Inst::Store { ptr: result_slot, value: ev, store_ty: None });
                 }
                 if !self.current_block_has_terminator() {
                     self.emit_terminator(Inst::Jump { target: merge_bb });
@@ -3402,7 +3664,7 @@ impl Lowerer {
                     field_index: 0,
                     field_ty: IrType::I64,
                 });
-                self.emit_inst(Inst::Store { ptr: tag_ptr, value: tag_val });
+                self.emit_inst(Inst::Store { ptr: tag_ptr, value: tag_val, store_ty: None });
 
                 // Store data fields starting at field 1
                 for (i, arg_expr) in args.iter().enumerate() {
@@ -3413,18 +3675,33 @@ impl Lowerer {
                         field_index: (i + 1) as u32,
                         field_ty: arg_ty.clone(),
                     });
-                    self.emit_inst(Inst::Store { ptr: field_ptr, value: arg_val });
+                    self.emit_inst(Inst::Store { ptr: field_ptr, value: arg_val, store_ty: None });
                 }
 
                 ptr
             }
 
-            Expr::Ref { expr, is_mut: _ } => {
+            Expr::Ref { expr, is_mut } => {
+                // I-7A: Track borrow provenance for alias analysis.
+                // A shared borrow (&x) is read-only; a mutable borrow (&mut x)
+                // is exclusive. The borrow checker ensures they can't coexist.
+                let borrow = if *is_mut {
+                    crate::ir::BorrowKind::Mut
+                } else {
+                    crate::ir::BorrowKind::Shared
+                };
+
                 // If taking a reference to a variable that has an alloca,
                 // return the alloca pointer directly (no copy).
                 // This ensures &mut v actually points to v's storage.
                 if let Expr::Ident(name) = expr.as_ref() {
                     if let Some(alloca) = self.allocas.get(name) {
+                        // I-7A: Tag the alloca value with borrow kind.
+                        if let Some(f) = self.current_func.as_mut() {
+                            if let Some(meta) = f.values.get_mut(alloca) {
+                                meta.borrow_kind = borrow;
+                            }
+                        }
                         return *alloca;
                     }
                 }
@@ -3435,9 +3712,16 @@ impl Lowerer {
                     ty: val_ty.clone(),
                     region: self.current_region(),
                 });
+                // I-7A: Tag the new alloca with borrow kind.
+                if let Some(f) = self.current_func.as_mut() {
+                    if let Some(meta) = f.values.get_mut(&ptr) {
+                        meta.borrow_kind = borrow;
+                    }
+                }
                 self.emit_inst(Inst::Store {
                     ptr,
                     value: val,
+                    store_ty: None,
                 });
                 ptr
             }
@@ -3533,7 +3817,7 @@ impl Lowerer {
                         field_index: 0,
                         field_ty: IrType::I64,
                     });
-                    self.emit_inst(Inst::Store { ptr: dst_tag_ptr, value: src_tag });
+                    self.emit_inst(Inst::Store { ptr: dst_tag_ptr, value: src_tag, store_ty: None });
                     let src_val_ptr = self.emit_inst(Inst::GetFieldPtr {
                         struct_ptr: val,
                         field_index: 1,
@@ -3545,7 +3829,7 @@ impl Lowerer {
                         field_index: 1,
                         field_ty: IrType::I64,
                     });
-                    self.emit_inst(Inst::Store { ptr: dst_val_ptr, value: src_val });
+                    self.emit_inst(Inst::Store { ptr: dst_val_ptr, value: src_val, store_ty: None });
                     self.emit_terminator(Inst::Jump { target: try_err_block });
                 } else {
                     // Not inside a try block: return the error from the current function
@@ -3626,6 +3910,7 @@ impl Lowerer {
                 self.emit_inst(Inst::Store {
                     ptr: result_slot,
                     value: some_val,
+                    store_ty: None,
                 });
                 self.emit_terminator(Inst::Jump { target: merge_block });
 
@@ -3635,6 +3920,7 @@ impl Lowerer {
                 self.emit_inst(Inst::Store {
                     ptr: result_slot,
                     value: default_val,
+                    store_ty: None,
                 });
                 self.emit_terminator(Inst::Jump { target: merge_block });
 
@@ -3692,13 +3978,13 @@ impl Lowerer {
                     field_index: 0,
                     field_ty: IrType::I64,
                 });
-                self.emit_inst(Inst::Store { ptr: tag_ptr, value: ok_tag });
+                self.emit_inst(Inst::Store { ptr: tag_ptr, value: ok_tag, store_ty: None });
                 let val_ptr = self.emit_inst(Inst::GetFieldPtr {
                     struct_ptr: result_slot,
                     field_index: 1,
                     field_ty: IrType::I64,
                 });
-                self.emit_inst(Inst::Store { ptr: val_ptr, value: ok_val });
+                self.emit_inst(Inst::Store { ptr: val_ptr, value: ok_val, store_ty: None });
                 self.emit_terminator(Inst::Jump { target: cont_block });
 
                 // Error block: ? jumped here with the error Result in err_slot
@@ -3715,7 +4001,7 @@ impl Lowerer {
                     field_index: 0,
                     field_ty: IrType::I64,
                 });
-                self.emit_inst(Inst::Store { ptr: out_tag_ptr, value: err_tag });
+                self.emit_inst(Inst::Store { ptr: out_tag_ptr, value: err_tag, store_ty: None });
                 let err_val_ptr = self.emit_inst(Inst::GetFieldPtr {
                     struct_ptr: err_slot,
                     field_index: 1,
@@ -3727,7 +4013,7 @@ impl Lowerer {
                     field_index: 1,
                     field_ty: IrType::I64,
                 });
-                self.emit_inst(Inst::Store { ptr: out_val_ptr, value: err_val });
+                self.emit_inst(Inst::Store { ptr: out_val_ptr, value: err_val, store_ty: None });
                 self.emit_terminator(Inst::Jump { target: cont_block });
 
                 // Continuation: result_slot holds the final Result
@@ -3843,7 +4129,7 @@ impl Lowerer {
                     // Store the value — for structs, this is already a pointer
                     // (structs are passed by pointer in Fides). Don't do struct copy
                     // into tuple fields — just store the pointer.
-                    self.emit_inst(Inst::Store { ptr: field_ptr, value: *val });
+                    self.emit_inst(Inst::Store { ptr: field_ptr, value: *val, store_ty: None });
                 }
                 ptr
             }
@@ -3873,13 +4159,18 @@ impl Lowerer {
                     self.current_captures.push((cap_name.clone(), i + 1, cap_ty.clone()));
                 }
 
+                // Infer return type if not explicitly specified
+                let inferred_ret_ty = ret_ty.clone().unwrap_or_else(|| {
+                    self.infer_closure_ret_ty(body)
+                });
+
                 let closure_func = Func {
                     name: closure_name.clone(),
                     type_params: vec![],
                     type_param_bounds: vec![],
                     const_params: vec![],
                     params: all_params,
-                    ret_ty: ret_ty.clone().unwrap_or(Type::I64),
+                    ret_ty: inferred_ret_ty,
                     body: body.clone(),
                     is_pub: false,
                     is_comptime: false,
@@ -3892,10 +4183,19 @@ impl Lowerer {
             is_async: false,
                 };
 
-                // Save current function context, lower the closure, restore context
+                // Save current function context, lower the closure, restore context.
+                // lower_func clears self.allocas/alloca_types/vec_allocas, so save those too.
                 let saved_func = self.current_func.take();
+                let saved_allocas = std::mem::take(&mut self.allocas);
+                let saved_alloca_types = std::mem::take(&mut self.alloca_types);
+                let saved_vec_allocas = std::mem::take(&mut self.vec_allocas);
+                let saved_block = self.current_block;
                 self.lower_func(&closure_func);
                 self.current_func = saved_func;
+                self.allocas = saved_allocas;
+                self.alloca_types = saved_alloca_types;
+                self.vec_allocas = saved_vec_allocas;
+                self.current_block = saved_block;
                 self.current_captures = saved_captures;
 
                 // At the creation site: build env struct with captures
@@ -4081,6 +4381,44 @@ impl Lowerer {
         }
     }
 
+    /// Infer the return type of a closure from its body by examining ret statements
+    fn infer_closure_ret_ty(&self, body: &[Stmt]) -> Type {
+        for stmt in body {
+            match stmt {
+                Stmt::Return(Some(expr), _) => {
+                    return self.infer_expr_ast_type(expr);
+                }
+                Stmt::Expr(expr, _) => {
+                    // Last expression in block (implicit return)
+                    return self.infer_expr_ast_type(expr);
+                }
+                _ => {}
+            }
+        }
+        Type::I64
+    }
+
+    /// Infer the type of an expression (best-effort, for closure return type inference)
+    fn infer_expr_ast_type(&self, expr: &Expr) -> Type {
+        match expr {
+            Expr::Binary { op, .. } => {
+                match op {
+                    BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq | BinOp::Eq | BinOp::Neq
+                    | BinOp::And | BinOp::Or => Type::Bool,
+                    _ => Type::I64,
+                }
+            }
+            Expr::IntLit(_) | Expr::Unary { op: UnaryOp::Neg, .. } => Type::I64,
+            Expr::BoolLit(_) => Type::Bool,
+            Expr::FloatLit(_) => Type::F64,
+            Expr::StringLit(_) => Type::Str,
+            Expr::Call { callee, .. } => {
+                self.func_ret_types.get(callee).cloned().unwrap_or(Type::I64)
+            }
+            _ => Type::I64,
+        }
+    }
+
     /// Find free variables in a closure body — identifiers used but not defined as params or locals
     fn find_captures(&self, body: &[Stmt], param_names: &[String]) -> Vec<(String, Type)> {
         let mut free_vars: Vec<String> = Vec::new();
@@ -4219,6 +4557,15 @@ impl Lowerer {
                 }
                 Stmt::Query { body, .. } => {
                     self.collect_free_vars(body, free_vars, local_names);
+                }
+                Stmt::Select { cases, default, .. } => {
+                    for case in cases {
+                        self.collect_free_vars_expr(&case.channel, free_vars, local_names);
+                        self.collect_free_vars(&case.body, free_vars, local_names);
+                    }
+                    if let Some(def_body) = default {
+                        self.collect_free_vars(def_body, free_vars, local_names);
+                    }
                 }
             }
         }
@@ -4546,7 +4893,7 @@ impl Lowerer {
             index: zero_idx,
             elem_ty: IrType::I64,
         });
-        self.emit_inst(Inst::Store { ptr: field0, value: fn_name_val });
+        self.emit_inst(Inst::Store { ptr: field0, value: fn_name_val, store_ty: None });
 
         // Store captures at fields 1..N
         for (i, (_, cap_val)) in captures.iter().enumerate() {
@@ -4556,7 +4903,7 @@ impl Lowerer {
                 index: idx,
                 elem_ty: IrType::I64,
             });
-            self.emit_inst(Inst::Store { ptr: field, value: *cap_val });
+            self.emit_inst(Inst::Store { ptr: field, value: *cap_val, store_ty: None });
         }
 
         self.set_value_type(env_ptr, IrType::Opaque("closure".to_string()));
@@ -4591,6 +4938,81 @@ impl Lowerer {
         } else {
             false
         }
+    }
+
+    /// Lower a vec method call for operator overloading (e.g. vec3_add(a, b))
+    fn lower_vec_method_call(&mut self, vec_name: &str, method: &str, receiver: &Expr, arg: &Expr) -> ValueId {
+        let recv_val = self.lower_expr(receiver);
+        let arg_val = self.lower_expr(arg);
+        let mangled = format!("{}_{}", vec_name, method);
+        let ret_ty = IrType::Struct(vec_name.to_string());
+        self.lower_vec_sret_call(&mangled, &ret_ty, recv_val, arg_val)
+    }
+
+    /// Lower a vec SRET call (struct return via sret pointer)
+    fn lower_vec_sret_call(&mut self, func_name: &str, ret_ty: &IrType, recv_val: ValueId, arg_val: ValueId) -> ValueId {
+        let struct_name = if let IrType::Struct(name) = ret_ty { name.clone() } else { String::new() };
+        let sret_ptr = self.emit_inst(Inst::Alloca {
+            ty: IrType::Struct(struct_name.clone()),
+            region: self.current_region(),
+        });
+        let mut sret_args = vec![sret_ptr];
+        // Prepend dummy env_ptr for user functions
+        if !self.module.extern_functions.contains_key(func_name) {
+            let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+            sret_args.push(dummy_env);
+        }
+        sret_args.push(recv_val);
+        sret_args.push(arg_val);
+        let mut effects = EffectSet::new();
+        if let Some(e) = self.module.function_effects.get(func_name) {
+            effects.add_all(e);
+        }
+        self.emit_inst(Inst::Call {
+            func: func_name.to_string(),
+            args: sret_args,
+            ret_ty: IrType::Void,
+            effects,
+        });
+        sret_ptr
+    }
+
+    /// Lower a swizzle access (e.g. vec4.xyz → vec3, vec4.rgb → vec3)
+    fn lower_swizzle(&mut self, vec_name: &str, struct_ptr: ValueId, swizzle: &str) -> ValueId {
+        // Get the field indices from the swizzle pattern
+        let indices: Vec<usize> = swizzle.chars().map(swizzle_index).collect();
+        // Load each component from the source vec
+        let components: Vec<ValueId> = indices.iter().map(|&idx| {
+            let field_ty = IrType::F64;
+            let field_ptr = self.emit_inst(Inst::GetFieldPtr {
+                struct_ptr,
+                field_index: idx as u32,
+                field_ty: field_ty.clone(),
+            });
+            self.emit_inst(Inst::Load { ptr: field_ptr, ty: field_ty })
+        }).collect();
+        // Construct the result vec type
+        let result_name = match swizzle.len() {
+            2 => "vec2",
+            3 => "vec3",
+            4 => "vec4",
+            _ => "vec3",
+        };
+        let result_ty = IrType::Struct(result_name.to_string());
+        let sret_ptr = self.emit_inst(Inst::Alloca {
+            ty: result_ty.clone(),
+            region: self.current_region(),
+        });
+        // Store each component into the result struct
+        for (i, comp) in components.iter().enumerate() {
+            let field_ptr = self.emit_inst(Inst::GetFieldPtr {
+                struct_ptr: sret_ptr,
+                field_index: i as u32,
+                field_ty: IrType::F64,
+            });
+            self.emit_inst(Inst::Store { ptr: field_ptr, value: *comp, store_ty: None });
+        }
+        sret_ptr
     }
 
     fn infer_binop_type(&self, op: &BinOp, left: &Expr, right: &Expr) -> IrType {
@@ -4945,6 +5367,7 @@ impl Lowerer {
                     self.emit_inst(Inst::Store {
                         ptr: dst_field,
                         value: field_val,
+                        store_ty: None,
                     });
                 }
             }

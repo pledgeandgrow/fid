@@ -104,6 +104,7 @@ impl Lexer {
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
             "match" => TokenKind::Match,
+            "select" => TokenKind::Select,
             "struct" => TokenKind::Struct,
             "enum" => TokenKind::Enum,
             "impl" => TokenKind::Impl,

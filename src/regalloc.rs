@@ -26,6 +26,7 @@
 //   allocate_module(&L3Module) -> ModuleAllocation  — run on all functions
 
 use crate::pir::{L3Function, L3Inst, L3Module, MemRegion, Operand, PBlock, VReg};
+use crate::ast::BinOp;
 use crate::ir::BlockId;
 use std::collections::{HashMap, HashSet};
 
@@ -645,6 +646,32 @@ fn inst_clobbers(inst: &L3Inst, pure_funcs: &HashSet<String>, no_alloc_funcs: &H
         // Panic: calls p_panic
         L3Inst::Panic { .. } => vec![PhysReg::Rax, PhysReg::Rcx, PhysReg::Rdx,
             PhysReg::Rsi, PhysReg::Rdi, PhysReg::R8, PhysReg::R9, PhysReg::R10, PhysReg::R11],
+        // Bin: gen_bin uses scratch registers for Mul, Div, Mod, Shift, And, Or.
+        // Mul uses scratch_reg(dst) = RCX or RDX.
+        // Div/Mod clobber RAX, RDX, and RCX.
+        // Shift uses RCX (CL) for non-immediate counts.
+        // And/Or use scratch_reg(dst) = RCX or RDX.
+        // Add/Sub/BitAnd/BitOr/BitXor only use scratch for exotic operand types.
+        // Comparisons use scratch for exotic operand types.
+        // To be safe, clobber RCX and RDX for all binops, plus RAX for Div/Mod.
+        L3Inst::Bin { op, .. } => {
+            match op {
+                BinOp::Div | BinOp::Mod => {
+                    vec![PhysReg::Rax, PhysReg::Rcx, PhysReg::Rdx]
+                }
+                _ => {
+                    vec![PhysReg::Rcx, PhysReg::Rdx]
+                }
+            }
+        }
+        // Unary: Neg (float) clobbers RAX and RCX. Not clobbers RAX.
+        L3Inst::Unary { op, .. } => {
+            match op {
+                crate::ast::UnaryOp::Neg => vec![PhysReg::Rax, PhysReg::Rcx],
+                crate::ast::UnaryOp::Not => vec![PhysReg::Rax],
+                _ => vec![],
+            }
+        }
         _ => vec![],
     }
 }

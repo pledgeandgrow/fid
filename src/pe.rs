@@ -2392,7 +2392,7 @@ impl PeCodeGen {
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
             }
 
-            Inst::Store { ptr, value } => {
+            Inst::Store { ptr, value, .. } => {
                 let poff = frame.offset(*ptr) as i32;
                 let voff = frame.offset(*value) as i32;
                 self.enc.mov_reg_mem_rbp(Reg::Rax, poff);

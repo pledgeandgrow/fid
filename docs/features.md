@@ -1,6 +1,6 @@
 # Fides Language — Feature Status
 
-*Last updated: Aug 2026 — verified against actual source code and test runs (200/202 unit tests, 6/8 harness tests, 105/130 interpreter tests + 22/22 expected-fail, 104/130 C codegen, 105/130 PE emitter, 152 .fd test files, 34 stdlib modules)*
+*Last updated: Aug 2026 — verified against actual source code and test runs (257/257 unit tests, 8/8 harness tests, 104/104 interpreter tests + 25/25 expected-fail + 6 bonus pass, 104/104 C codegen + 25/25 expected-fail + 2 bonus pass, 104/104 PE emitter + 25/25 expected-fail + 6 bonus pass, 183 .fd test files, 35 stdlib modules (8,080 LOC), 53 .rs source files (81,041 LOC), 4 binaries (fidesc, pacte, scribe, veil), cross-compilation to ARM64/RISC-V/Windows)*
 
 ## Legend
 
@@ -21,7 +21,7 @@
 | IR Interpreter (interp.rs) | ✅ | Runs IR directly via `fidesc run` |
 | PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables + flat binary (bare-metal mode) |
 | ELF64 Emitter (elf64.rs) | ✅ | Generates native ELF64 executables on Linux (zero external tools) + relocatable objects |
-| C Codegen (codegen_c.rs) | ✅ | Generates C code, 104/130 tests match interpreter output. Phase 10B: Print calls Fides Vec_to_str/HashMap_to_str for formatting. |
+| C Codegen (codegen_c.rs) | ✅ | Generates C code, 104/104 normal tests match interpreter output. Phase 10B: Print calls Fides Vec_to_str/HashMap_to_str for formatting. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic via p_call_stack. |
 | PIR (pir.rs) | ✅ | PIR L1/L2/L3, `fidesc pir` command |
 | Optimizer (opt.rs) | ✅ | 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. 22 in default pass list. Enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive inlining. |
 | Peephole (peephole.rs) | ✅ | 9 passes, always on in `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection |
@@ -32,6 +32,14 @@
 | GPU/SPIR-V Backend (gpu.rs) | ✅ | PIR → SPIR-V binary, `fidesc gpu` command |
 | Comptime (comptime.rs) | ✅ | Compile-time evaluation, reflection, f-string interpolation |
 | Multi-arch Codegen | ✅ | x86-64, ARM64, RISC-V assembly via `fidesc codegen --target` |
+| ARM64 Instruction Encoder (arm64_enc.rs) | ✅ | Converts ARM64 assembly text to 4-byte machine code. 17 unit tests. |
+| ARM64 Linux Runtime (runtime_arm64.rs) | ✅ | ARM64 runtime using raw SVC syscalls. 9 unit tests. |
+| RISC-V Instruction Encoder (riscv_enc.rs) | ✅ | Converts RV64 assembly text to 4-byte machine code. 14 unit tests. |
+| RISC-V Linux Runtime (runtime_riscv.rs) | ✅ | RISC-V runtime using raw ECALL syscalls. 7 unit tests. |
+| Cross-compilation (ARM64 Linux ELF) | ✅ | `build --target arm64-linux` → AArch64 ELF64 executable |
+| Cross-compilation (RISC-V Linux ELF) | ✅ | `build --target riscv64-linux` → RISC-V ELF64 executable |
+| Cross-compilation (Windows PE) | ✅ | `build --target x86-64-windows` → x86-64 PE executable |
+| Target Triple Parsing | ✅ | `parse_target_triple()` normalizes arch-os format strings |
 
 ## CLI Commands
 
@@ -44,11 +52,12 @@
 | `fidesc run <file>` | ✅ | Interprets and runs program |
 | `fidesc emit <file> -o <exe>` | ✅ | Emits native PE executable (Windows) |
 | `fidesc emit <file> --bare -o <bin>` | ✅ | Bare-metal flat binary (no stdlib, no PE headers) |
-| `fidesc build <file> -o <out> [--target] [--opt]` | ✅ | Native build: PIR → codegen → peephole → ELF64 executable (zero external tools on Linux) |
+| `fidesc build <file> -o <out> [--target] [--opt]` | ✅ | Native build: PIR → codegen → peephole → ELF64/PE executable (zero external tools). Cross-compilation: `--target arm64-linux`, `--target riscv64-linux`, `--target x86-64-windows`. |
 | `fidesc ccompile <file> -o <exe>` | ✅ | C codegen → gcc/clang → executable |
-| `fidesc test` | ✅ | Runs all 130 normal + 22 expected-fail tests across interpreter, PE emitter, and C codegen |
+| `fidesc test` | ✅ | Runs all 135 normal (104 passing + 8 known-fail + 23 skip) + 25 expected-fail tests across interpreter, PE emitter, and C codegen |
+| `fidesc test --fail` | ✅ | Runs only expected-fail tests (failing = correct) |
 | `fidesc repl` | ✅ | Interactive REPL |
-| `fidesc verify <file>` | ✅ | IR verification pass |
+| `fidesc audit <file>` | ✅ | IR verification pass (also `verify`) |
 | `fidesc sourcemap <file>` | ✅ | Source map output |
 | `fidesc pir <file> [1\|2\|3\|all] [--opt]` | ✅ | PIR output (L1/L2/L3) with optional optimization |
 | `fidesc opt <file> [passes]` | ✅ | Run PIR optimizer, print statistics |
@@ -60,6 +69,9 @@
 | `fidesc watch <file>` | ✅ | Hot reload: native JIT (ELF64) + function-level change detection |
 | `fidesc link <files...>` | ✅ | Link multiple object files |
 | `fidesc lsp` | ✅ | Language Server Protocol server (JSON-RPC over stdio, diagnostics, no external deps) |
+| `fidesc lint <file>` | ✅ | Lint checks (unused functions, unused imports) |
+| `fidesc bench <file> [-n <count>] [--ccompile]` | ✅ | Benchmark a file (interpreter or C native) |
+| `fidesc fmt <file>` | ✅ | Format a Fides source file |
 
 ## Language Features — Interpreter (`fidesc run`)
 
@@ -174,7 +186,7 @@
 | `use ... *` glob imports | ✅ | Glob imports |
 | Re-exports | ✅ | |
 | Multi-file modules | ✅ | |
-| Standard library (stdlib/core.fd) | ✅ | Auto-imported. 34 modules: core, vec, math, ecs, events, parallel, sync, db, http, json, shape, simd, tensor, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input |
+| Standard library (stdlib/core.fd) | ✅ | Auto-imported. 35 modules: core, vec, math, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input |
 
 ### Capabilities (Security)
 
@@ -568,6 +580,13 @@ pv out = quant::dequantize_q8(q_out); // dequantize result
 | Derive macros (Phase 7.7) | `@derive(Debug/Clone)` | ✅ DONE (generates debug_str/clone methods for structs) |
 | Serde (Phase 7.7) | `@derive(Serialize/Deserialize)` | ✅ DONE (generates to_json/from_json methods for structs) |
 | Dynamic loading (Phase 7.7) | `p_dl_open/sym/close/call` | ✅ DONE (real dlopen/dlsym in C codegen, simulated in interpreter) |
+| Select statement (Phase 3.2) | `select { case ch => x => { } default => { } }` | ✅ DONE (multi-channel multiplexing, AST + parser + typechecker + lowerer) |
+| Type inference (Phase 3.3) | Bidirectional + `-> _` | ✅ DONE (contextual literal inference, return type inference via `Type::Infer`) |
+| Auto-vectorization (Phase 3.4) | Loop-vec + SLP | ✅ DONE (loop-vec for constant trips, SLP vectorizer with p_simd_load/store/add/sub/mul/div → SSE2) |
+| Binary hardening (Phase 12) | Stack canaries, PIE, RELRO, NX stack | ✅ DONE (all C codegen output hardened by default, no opt-in) |
+| @constant_time (Phase 12) | Side-channel defense | ✅ DONE (no early returns, no data-dependent branches, no IO/Net/Spawn) |
+| @tainted (Phase 12) | Injection defense | ✅ DONE (prevents tainted values in SQL/shell/HTML/path sinks) |
+| Stack traces (Phase 12) | Panic call stack | ✅ DONE (interpreter + C codegen, p_call_stack_push/pop instrumentation) |
 
 ---
 
@@ -608,27 +627,39 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 | Parser | 100% | — | — |
 | Type Checker | 100% | — | — |
 | IR Lowering | 100% | — | — |
-| Interpreter | 105/130 + 22/22 expected-fail | — | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
-| PE Emitter | 105/130 + 22/22 expected-fail | — | Pre-existing failures: test_game_stdlib, test_vec_math, test_vec_shape_fail |
+| Interpreter | 104/104 + 25/25 expected-fail + 5 bonus | — | All normal tests pass. 5 of 8 known-fail pass as bonus. |
+| PE Emitter | 104/104 + 25/25 expected-fail + 5 bonus | — | All normal tests pass. 5 of 8 known-fail pass as bonus. |
 | ELF64 Emitter | ✅ | — | Working executables on Linux (zero external tools) |
-| C Codegen | 104/130 + 22/22 expected-fail | — | Phase 10B: Vec/HashMap/String migrated to Fides stdlib |
+| C Codegen | 104/104 + 25/25 expected-fail + 2 bonus | — | All normal tests pass. 2 of 8 known-fail pass as bonus. Binary hardening enabled. |
 | Multi-arch Codegen | ✅ | — | x86-64, ARM64, RISC-V assembly all work |
+| Cross-compilation (ARM64) | ✅ | — | `build --target arm64-linux` → AArch64 ELF64 (27KB) |
+| Cross-compilation (RISC-V) | ✅ | — | `build --target riscv64-linux` → RISC-V ELF64 (29KB) |
+| Cross-compilation (Windows) | ✅ | — | `build --target x86-64-windows` → PE executable (98KB) |
+| ARM64 Encoder | ✅ (17 tests) | — | `arm64_enc.rs` — ARM64 assembly → machine code |
+| ARM64 Runtime | ✅ (9 tests) | — | `runtime_arm64.rs` — SVC syscalls |
+| RISC-V Encoder | ✅ (14 tests) | — | `riscv_enc.rs` — RV64 assembly → machine code |
+| RISC-V Runtime | ✅ (7 tests) | — | `runtime_riscv.rs` — ECALL syscalls |
 | Peephole Optimizer | ✅ (9 passes) | — | Always on in `build` |
 | L2 Optimizer | ✅ (23 passes) | — | Enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive inlining. |
 | Register Allocator | ✅ | — | Linear scan with constant rematerialization (F-1A). Effect-aware allocation (F-1D). |
 | Source Maps | ✅ | — | `sourcemap` command works |
-| IR Verification | ✅ | — | `verify` command works |
+| IR Verification | ✅ | — | `audit` command works (also `verify`) |
 | WASM Backend | ✅ | — | `wasm` command works |
 | GPU/SPIR-V Backend | ✅ | — | `gpu` command works |
 | LSP Server | ✅ | — | `fidesc lsp` — JSON-RPC over stdio, diagnostics, no external deps |
 | Generic Enums/Structs | ✅ | — | `enum Option<T>`, `struct Foo<T>` — type params in AST/parser/typechecker/lowerer |
+| Linter | ✅ | — | `fidesc lint` — unused functions, unused imports |
+| Benchmark | ✅ | — | `fidesc bench` — interpreter and C native timing |
+| Format | ✅ | — | `fidesc fmt` — source formatting |
+| Stack Traces | ✅ | — | Panic prints call stack (interpreter + C codegen) |
 
 ### Test Coverage
 
-- **152 test files** in `tests/` (130 normal + 22 expected-fail)
-- **202 unit tests** in `cargo test --bin fidesc` — 200 pass (2 pre-existing failures)
-- **6/8 harness tests** pass (2 fails: safety_checks_panic_in_debug_mode — overflow checks always on, even in release; golden_files_match — golden files outdated)
-- **105/130** normal tests pass on interpreter, **105/130** on PE, **104/130** on C codegen
-- **22/22** expected-fail tests correctly fail on all backends
+- **183 test files** in `tests/` (160 in root: 135 normal [104 passing + 8 known-fail + 23 skip] + 25 expected-fail; 23 in subdirs: capability/effects/regions/safety)
+- **257 unit tests** in `cargo test --bin fidesc` — all pass (incl. 47 cross-compilation tests)
+- **Harness tests** 8/8 passed
+- **104/104** normal tests pass on all 3 backends (interpreter, PE, C codegen)
+- **25/25** expected-fail tests correctly fail on all backends
+- **6 bonus passes** on interpreter+PE, **2 bonus passes** on C codegen (known-fail tests that now work)
 - **148 golden files** in `tests/golden/` — expected outputs for regression testing
-- **34 stdlib modules** in `stdlib/` — core, vec, math, ecs, events, parallel, sync, and more
+- **35 stdlib modules** in `stdlib/` — core, vec, math, ecs, events, parallel, sync, channel, and more

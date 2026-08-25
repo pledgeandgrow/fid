@@ -50,7 +50,7 @@ Fides is a systems programming language built from first principles — every la
 - **Fast compilation**: sub-second builds for small projects
 - **AI tooling**: LLM-friendly syntax, semantic IR enables AI-assisted refactoring
 - **Single binary**: no runtime, no VM, no dependencies — just a binary
-- **Cross-compilation**: built-in, not an afterthought
+- **Cross-compilation**: built-in, not an afterthought — **DONE** (ARM64, RISC-V, Windows)
 
 ### 7. Custom — Everything Built By Us
 - **Custom lexer**: hand-written, not generated
@@ -58,8 +58,8 @@ Fides is a systems programming language built from first principles — every la
 - **Custom typechecker**: region inference + effect system + capability checking
 - **Custom IR (PIR)**: Fides Intermediate Representation — typed, semantic, multi-level
 - **Custom optimizer**: semantic-aware, leverages region/effect/capability info
-- **Custom codegen**: direct to machine code (x86-64, ARM64, RISC-V) — **DONE**
-- **Custom linker**: integrated, not a separate process
+- **Custom codegen**: direct to machine code (x86-64, ARM64, RISC-V) — **DONE** (with cross-compilation)
+- **Custom linker**: integrated, not a separate process — **DONE** (target-aware: x86-64, ARM64, RISC-V)
 - **Custom stdlib**: no libc dependency for core operations
 - **Custom allocator**: region-aware, built into the language runtime
 - Minimal external dependencies: the Rust compiler plus 4 crates (hashbrown, compact_str, smallvec, bumpalo) to build Fides (bootstrapping later)
@@ -71,7 +71,7 @@ Fides is a systems programming language built from first principles — every la
 - **IoT**: bare-metal targets, deterministic memory (FixedBufferAllocator), tiny binaries
 - **Effect handlers**: model robot sensors, actuators, and control loops as effects
 - **Region-based memory**: predictable allocation for real-time systems
-- **Cross-compilation**: target any architecture from any host
+- **Cross-compilation**: target any architecture from any host — **DONE** (ARM64, RISC-V, Windows with zero external tools)
 - **No runtime**: bare metal, no OS needed
 
 ## What Fides Is NOT

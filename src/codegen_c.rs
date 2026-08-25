@@ -534,6 +534,20 @@ impl CCodeGen {
             ("p_file_write", &[p(), p()]),
             ("p_file_exists", &[p()]),
             ("p_file_append", &[p(), p()]),
+            // Varargs functions: register the fixed prefix (non-varargs params).
+            // p_thread_spawn(func_name: const char*, num_args: i64, ...args)
+            // p_executor_spawn(exec: i64, func_name: const char*, num_args: i64, ...args)
+            // Varargs args (beyond the fixed prefix) are cast to int64_t by the
+            // call-site fallback logic (needed for void*→int64_t via va_arg).
+            ("p_thread_spawn", &[p(), I64]),
+            ("p_executor_spawn", &[I64, p(), I64]),
+            // Channel functions
+            ("p_chan_create", &[I64]),
+            ("p_chan_send", &[I64, I64]),
+            ("p_chan_recv", &[I64]),
+            ("p_chan_try_recv", &[I64]),
+            ("p_chan_close", &[I64]),
+            ("p_chan_is_closed", &[I64]),
         ];
         for (name, params) in sigs {
             self.fn_param_types
@@ -706,6 +720,13 @@ impl CCodeGen {
         wln!(self, "void p_map_clear(PMap* m);");
         wln!(self, "int64_t p_map_keys(PMap* m);");
         wln!(self, "int64_t p_map_values(PMap* m);");
+        // ECS runtime (Phase 8B)
+        wln!(self, "int64_t __ecs_create_entity(void);");
+        wln!(self, "int64_t __ecs_entity_count(void);");
+        wln!(self, "int64_t __ecs_has(const char* comp_name, int64_t entity);");
+        wln!(self, "void* __ecs_get(const char* comp_name, int64_t entity);");
+        wln!(self, "int64_t __ecs_add(const char* comp_name, int64_t entity, void* value);");
+        wln!(self, "int64_t __ecs_remove(const char* comp_name, int64_t entity);");
         // Bare metal builtins (Phase 5A) — stubs for C codegen
         wln!(self, "void p_cli(void);");
         wln!(self, "void p_sti(void);");
@@ -836,6 +857,11 @@ impl CCodeGen {
         wln!(self, "void p_print_float(double val);");
         wln!(self, "void p_print_newline(void);");
         wln!(self, "void p_panic(const char* msg);");
+        wln!(self, "// Call stack for panic traces");
+        wln!(self, "static const char* p_call_stack[256];");
+        wln!(self, "static int p_call_stack_depth = 0;");
+        wln!(self, "void p_call_stack_push(const char* name) {{ if (p_call_stack_depth < 256) p_call_stack[p_call_stack_depth++] = name; }}");
+        wln!(self, "void p_call_stack_pop(void) {{ if (p_call_stack_depth > 0) p_call_stack_depth--; }}");
         wln!(self, "void* p_malloc(int64_t size);");
         wln!(self, "void p_free(void* ptr);");
         // File I/O builtins
@@ -883,6 +909,13 @@ impl CCodeGen {
         wln!(self, "int64_t p_mutex_init(void);");
         wln!(self, "void p_mutex_lock(int64_t m);");
         wln!(self, "void p_mutex_unlock(int64_t m);");
+        // Channels (bounded MPSC queue)
+        wln!(self, "int64_t p_chan_create(int64_t capacity);");
+        wln!(self, "bool p_chan_send(int64_t ch, int64_t val);");
+        wln!(self, "int64_t p_chan_recv(int64_t ch);");
+        wln!(self, "int64_t p_chan_try_recv(int64_t ch);");
+        wln!(self, "void p_chan_close(int64_t ch);");
+        wln!(self, "bool p_chan_is_closed(int64_t ch);");
         wln!(self, "void p_thread_register(const char* name, int64_t (*fn)());");
         // Dynamic loading builtins (Phase 7.7)
         wln!(self, "int64_t p_dl_open(const char* path);");
@@ -1026,6 +1059,9 @@ impl CCodeGen {
 
         wln!(self, "{} {}({}) {{", ret_ty, func_name, params.join(", "));
 
+        // Push function name onto call stack for panic traces
+        wln!(self, "    p_call_stack_push(\"{}\");", name);
+
         // Declare all SSA values as local variables (skip void/never and params)
         for (id, meta) in &func.values {
             if !func.params.iter().any(|(pid, _)| pid == id) {
@@ -1161,7 +1197,7 @@ impl CCodeGen {
                     }
                 }
             }
-            Inst::Store { ptr, value } => {
+            Inst::Store { ptr, value, .. } => {
                 let p = self.val_name(*ptr);
                 let v = self.val_name(*value);
                 // Type-aware store: use the pointer's pointee type (if
@@ -1255,6 +1291,8 @@ impl CCodeGen {
                 wln!(self, "    else goto bb{};", else_.0);
             }
             Inst::Return { value } => {
+                // Pop call stack before returning (for panic traces)
+                wln!(self, "    p_call_stack_pop();");
                 match value {
                     Some(v) => {
                         // If the C function returns void, discard the value
@@ -1441,11 +1479,27 @@ impl CCodeGen {
                     .enumerate()
                     .map(|(i, a)| {
                         let base = self.val_name(*a);
+                        let arg_ty = func.values.get(a).map(|m| m.ty.clone()).unwrap_or(IrType::I64);
                         match param_types {
                             Some(pts) if i < pts.len() => {
-                                Self::cast_arg(&base, &func.values.get(a).map(|m| m.ty.clone()).unwrap_or(IrType::I64), &pts[i])
+                                Self::cast_arg(&base, &arg_ty, &pts[i])
                             }
-                            _ => base,
+                            _ => {
+                                // No parameter type info for this arg position.
+                                // For varargs functions (p_thread_spawn, p_executor_spawn),
+                                // cast pointer-typed args to int64_t so they pass
+                                // correctly through C varargs (va_arg(ap, int64_t)).
+                                // Without this, void* values (Vec, HashMap, etc.)
+                                // are misread by va_arg on some platforms.
+                                // For other functions (e.g. FFI externs), pass as-is
+                                // to avoid breaking pointer-parameter calls.
+                                let is_varargs = fname == "p_thread_spawn" || fname == "p_executor_spawn";
+                                if is_varargs && matches!(arg_ty, IrType::Ptr(_) | IrType::Opaque(_) | IrType::Generic(_, _)) {
+                                    format!("(int64_t){}", base)
+                                } else {
+                                    base
+                                }
+                            }
                         }
                     })
                     .collect();
@@ -1563,6 +1617,10 @@ impl CCodeGen {
                             call_args.push(format!("(float){}", arg));
                         } else if cast == "bool" {
                             call_args.push(format!("(bool){}", arg));
+                        } else if cast.contains('[') {
+                            // Array types (e.g. int64_t[3]) — can't cast to array
+                            // type in C. Pass as pointer instead.
+                            call_args.push(format!("(void*){}", arg));
                         } else {
                             call_args.push(format!("({}){}", cast, arg));
                         }
@@ -1750,7 +1808,7 @@ impl CCodeGen {
                 // Unsafe block markers — no-op in C backend
             }
             Inst::Panic { message, .. } => {
-                wln!(self, "    fprintf(stderr, \"Panic: {}\\n\"); abort();", message);
+                wln!(self, "    p_panic(\"{}\");", message);
             }
             Inst::Asm { template, ret_ty, .. } => {
                 // C backend: emit asm as a comment — the interpreter treats asm as a no-op
@@ -1867,18 +1925,18 @@ impl CCodeGen {
         wln!(self, "");
         wln!(self, "// Phase 10B: p_map_keys returns a Fides Vec (i64 pointer)");
         wln!(self, "int64_t p_map_keys(PMap* m) {{");
-        wln!(self, "    int64_t v = Vec_new(0);");
+        wln!(self, "    PVec* v = p_vec_new();");
         wln!(self, "    for (int64_t i = 0; i < m->len; i++)");
-        wln!(self, "        Vec_push(0, v, (int64_t)m->keys[i]);");
-        wln!(self, "    return v;");
+        wln!(self, "        p_vec_push(v, (void*)m->keys[i]);");
+        wln!(self, "    return (int64_t)v;");
         wln!(self, "}}");
         wln!(self, "");
         wln!(self, "int64_t p_map_values(PMap* m) {{");
-        wln!(self, "    int64_t v = Vec_new(0);");
+        wln!(self, "    PVec* v = p_vec_new();");
         wln!(self, "    for (int64_t i = 0; i < m->len; i++) {{");
-        wln!(self, "        Vec_push(0, v, m->vals[i]);");
+        wln!(self, "        p_vec_push(v, (void*)m->vals[i]);");
         wln!(self, "    }}");
-        wln!(self, "    return v;");
+        wln!(self, "    return (int64_t)v;");
         wln!(self, "}}");
         wln!(self, "");
         // String runtime
@@ -1929,7 +1987,19 @@ impl CCodeGen {
         wln!(self, "void p_print_bool(bool val) { printf(\"%s\", val ? \"true\" : \"false\"); }");
         wln!(self, "void p_print_float(double val) { printf(\"%g\", val); }");
         wln!(self, "void p_print_newline(void) { printf(\"\\n\"); }");
-        wln!(self, "void p_panic(const char* msg) { fprintf(stderr, \"%s\\n\", msg); abort(); }");
+        wln!(self, "void p_panic(const char* msg) {{");
+        wln!(self, "    fprintf(stderr, \"Panic: %s\\n\", msg);");
+        wln!(self, "    if (p_call_stack_depth > 0) {{");
+        wln!(self, "        fprintf(stderr, \"stack trace:\\n\");");
+        wln!(self, "        for (int i = p_call_stack_depth - 1; i >= 0; i--) {{");
+        wln!(self, "            if (i == p_call_stack_depth - 1)");
+        wln!(self, "                fprintf(stderr, \"    → %s\\n\", p_call_stack[i]);");
+        wln!(self, "            else");
+        wln!(self, "                fprintf(stderr, \"    ↳ called from %s\\n\", p_call_stack[i]);");
+        wln!(self, "        }}");
+        wln!(self, "    }}");
+        wln!(self, "    abort();");
+        wln!(self, "}}");
         wln!(self, "void* p_malloc(int64_t size) { return malloc((size_t)size); }");
         wln!(self, "void p_free(void* ptr) { free(ptr); }");
         // File I/O builtins
@@ -2229,6 +2299,107 @@ impl CCodeGen {
         wln!(self, "}");
         wln!(self, "void p_mutex_lock(int64_t m) { pthread_mutex_lock((pthread_mutex_t*)(intptr_t)m); }");
         wln!(self, "void p_mutex_unlock(int64_t m) { pthread_mutex_unlock((pthread_mutex_t*)(intptr_t)m); }");
+        // ─── Channels (bounded MPSC queue with mutex + condvar) ───
+        // Channel layout: { mutex, cond_not_empty, cond_not_full, head, tail, count, capacity, closed, buffer[capacity] }
+        // head = next read index, tail = next write index, count = current items
+        wln!(self, "#include <pthread.h>");
+        wln!(self, "typedef struct {");
+        wln!(self, "    pthread_mutex_t mutex;");
+        wln!(self, "    pthread_cond_t not_empty;");
+        wln!(self, "    pthread_cond_t not_full;");
+        wln!(self, "    int64_t head;");
+        wln!(self, "    int64_t tail;");
+        wln!(self, "    int64_t count;");
+        wln!(self, "    int64_t capacity;");
+        wln!(self, "    int closed;");
+        wln!(self, "    int64_t buffer[]; // flexible array member");
+        wln!(self, "} p_channel_t;");
+        wln!(self, "// PENDING_SENTINEL — returned by p_chan_try_recv when channel is empty");
+        wln!(self, "#define P_CHAN_PENDING ((int64_t)0x8000000000000001LL)");
+        wln!(self, "int64_t p_chan_create(int64_t capacity) {");
+        wln!(self, "    if (capacity < 1) capacity = 1;");
+        wln!(self, "    p_channel_t* ch = (p_channel_t*)malloc(sizeof(p_channel_t) + capacity * sizeof(int64_t));");
+        wln!(self, "    pthread_mutex_init(&ch->mutex, NULL);");
+        wln!(self, "    pthread_cond_init(&ch->not_empty, NULL);");
+        wln!(self, "    pthread_cond_init(&ch->not_full, NULL);");
+        wln!(self, "    ch->head = 0; ch->tail = 0; ch->count = 0;");
+        wln!(self, "    ch->capacity = capacity;");
+        wln!(self, "    ch->closed = 0;");
+        wln!(self, "    return (int64_t)(intptr_t)ch;");
+        wln!(self, "}");
+        wln!(self, "bool p_chan_send(int64_t handle, int64_t val) {");
+        wln!(self, "    p_channel_t* ch = (p_channel_t*)(intptr_t)handle;");
+        wln!(self, "    if (!ch) return false;");
+        wln!(self, "    pthread_mutex_lock(&ch->mutex);");
+        wln!(self, "    // Block until there's space or the channel is closed");
+        wln!(self, "    while (ch->count == ch->capacity && !ch->closed) {");
+        wln!(self, "        pthread_cond_wait(&ch->not_full, &ch->mutex);");
+        wln!(self, "    }");
+        wln!(self, "    if (ch->closed) {");
+        wln!(self, "        pthread_mutex_unlock(&ch->mutex);");
+        wln!(self, "        return false;");
+        wln!(self, "    }");
+        wln!(self, "    ch->buffer[ch->tail] = val;");
+        wln!(self, "    ch->tail = (ch->tail + 1) % ch->capacity;");
+        wln!(self, "    ch->count++;");
+        wln!(self, "    pthread_cond_signal(&ch->not_empty);");
+        wln!(self, "    pthread_mutex_unlock(&ch->mutex);");
+        wln!(self, "    return true;");
+        wln!(self, "}");
+        wln!(self, "int64_t p_chan_recv(int64_t handle) {");
+        wln!(self, "    p_channel_t* ch = (p_channel_t*)(intptr_t)handle;");
+        wln!(self, "    if (!ch) return 0;");
+        wln!(self, "    pthread_mutex_lock(&ch->mutex);");
+        wln!(self, "    // Block until there's an item or the channel is closed and empty");
+        wln!(self, "    while (ch->count == 0 && !ch->closed) {");
+        wln!(self, "        pthread_cond_wait(&ch->not_empty, &ch->mutex);");
+        wln!(self, "    }");
+        wln!(self, "    if (ch->count == 0) {");
+        wln!(self, "        // Closed and empty");
+        wln!(self, "        pthread_mutex_unlock(&ch->mutex);");
+        wln!(self, "        return P_CHAN_PENDING;");
+        wln!(self, "    }");
+        wln!(self, "    int64_t val = ch->buffer[ch->head];");
+        wln!(self, "    ch->head = (ch->head + 1) % ch->capacity;");
+        wln!(self, "    ch->count--;");
+        wln!(self, "    pthread_cond_signal(&ch->not_full);");
+        wln!(self, "    pthread_mutex_unlock(&ch->mutex);");
+        wln!(self, "    return val;");
+        wln!(self, "}");
+        wln!(self, "int64_t p_chan_try_recv(int64_t handle) {");
+        wln!(self, "    p_channel_t* ch = (p_channel_t*)(intptr_t)handle;");
+        wln!(self, "    if (!ch) return P_CHAN_PENDING;");
+        wln!(self, "    pthread_mutex_lock(&ch->mutex);");
+        wln!(self, "    if (ch->count == 0) {");
+        wln!(self, "        int closed = ch->closed;");
+        wln!(self, "        pthread_mutex_unlock(&ch->mutex);");
+        wln!(self, "        return closed ? 0 : P_CHAN_PENDING;");
+        wln!(self, "    }");
+        wln!(self, "    int64_t val = ch->buffer[ch->head];");
+        wln!(self, "    ch->head = (ch->head + 1) % ch->capacity;");
+        wln!(self, "    ch->count--;");
+        wln!(self, "    pthread_cond_signal(&ch->not_full);");
+        wln!(self, "    pthread_mutex_unlock(&ch->mutex);");
+        wln!(self, "    return val;");
+        wln!(self, "}");
+        wln!(self, "void p_chan_close(int64_t handle) {");
+        wln!(self, "    p_channel_t* ch = (p_channel_t*)(intptr_t)handle;");
+        wln!(self, "    if (!ch) return;");
+        wln!(self, "    pthread_mutex_lock(&ch->mutex);");
+        wln!(self, "    ch->closed = 1;");
+        wln!(self, "    // Wake up all blocked senders and receivers");
+        wln!(self, "    pthread_cond_broadcast(&ch->not_empty);");
+        wln!(self, "    pthread_cond_broadcast(&ch->not_full);");
+        wln!(self, "    pthread_mutex_unlock(&ch->mutex);");
+        wln!(self, "}");
+        wln!(self, "bool p_chan_is_closed(int64_t handle) {");
+        wln!(self, "    p_channel_t* ch = (p_channel_t*)(intptr_t)handle;");
+        wln!(self, "    if (!ch) return true;");
+        wln!(self, "    pthread_mutex_lock(&ch->mutex);");
+        wln!(self, "    int closed = ch->closed;");
+        wln!(self, "    pthread_mutex_unlock(&ch->mutex);");
+        wln!(self, "    return closed;");
+        wln!(self, "}");
         // Dynamic loading builtins (Phase 7.7) — using dlopen/dlsym
         wln!(self, "#include <dlfcn.h>");
         wln!(self, "int64_t p_dl_open(const char* path) {");
@@ -2326,20 +2497,20 @@ impl CCodeGen {
         wln!(self, "    return result;");
         wln!(self, "}}");
         wln!(self, "int64_t p_string_split(const char* s, const char* delim) {{");
-        wln!(self, "    int64_t v = Vec_new(0);");
-        wln!(self, "    if (!s || !delim) return v;");
+        wln!(self, "    PVec* v = p_vec_new();");
+        wln!(self, "    if (!s || !delim) return (int64_t)v;");
         wln!(self, "    const char* start = s;");
         wln!(self, "    size_t dlen = strlen(delim);");
         wln!(self, "    while (*start) {{");
         wln!(self, "        const char* p = strstr(start, delim);");
-        wln!(self, "        if (!p) {{ Vec_push(0, v, (int64_t)strdup(start)); break; }}");
+        wln!(self, "        if (!p) {{ p_vec_push(v, (void*)strdup(start)); break; }}");
         wln!(self, "        size_t len = p - start;");
         wln!(self, "        char* part = (char*)malloc(len + 1);");
         wln!(self, "        memcpy(part, start, len); part[len] = 0;");
-        wln!(self, "        Vec_push(0, v, (int64_t)part);");
+        wln!(self, "        p_vec_push(v, (void*)part);");
         wln!(self, "        start = p + dlen;");
         wln!(self, "    }}");
-        wln!(self, "    return v;");
+        wln!(self, "    return (int64_t)v;");
         wln!(self, "}}");
         wln!(self, "int64_t p_string_parse_int(const char* s) {{ return s ? (int64_t)atoll(s) : 0; }}");
         wln!(self, "char* p_string_char_at(const char* s, int64_t idx) {{");
@@ -2564,64 +2735,64 @@ impl CCodeGen {
         wln!(self, "// SIMD builtins — operate on Fides Vec (i64 pointer, f64 stored as i64 bits)");
         wln!(self, "// Helper: read double from Fides Vec element (stored as i64 bit pattern)");
         self.out.push_str("static double _fvec_get_f64(int64_t v, int i) {\n");
-        self.out.push_str("    int64_t val = Vec_get(0, v, i);\n");
+        self.out.push_str("    int64_t val = (int64_t)p_vec_get((PVec*)v, i);\n");
         self.out.push_str("    union { int64_t i; double d; } u; u.i = val; return u.d;\n");
         self.out.push_str("}\n");
-        self.out.push_str("static int64_t _fvec_new() { return Vec_new(0); }\n");
+        self.out.push_str("static int64_t _fvec_new() { return (int64_t)p_vec_new(); }\n");
         self.out.push_str("static void _fvec_push_f64(int64_t v, double d) {\n");
-        self.out.push_str("    union { double d; int64_t i; } u; u.d = d; Vec_push(0, v, u.i);\n");
+        self.out.push_str("    union { double d; int64_t i; } u; u.d = d; p_vec_push((PVec*)v, (void*)u.i);\n");
         self.out.push_str("}\n");
         wln!(self, "int64_t p_simd_add(int64_t a, int64_t b) {{");
         wln!(self, "    int64_t r = _fvec_new();");
-        wln!(self, "    int n = (int)Vec_len(0, a);");
+        wln!(self, "    int n = (int)p_vec_len((PVec*)a);");
         wln!(self, "    for (int i = 0; i < n; i++) _fvec_push_f64(r, _fvec_get_f64(a,i) + _fvec_get_f64(b,i));");
         wln!(self, "    return r;");
         wln!(self, "}}");
         wln!(self, "int64_t p_simd_sub(int64_t a, int64_t b) {{");
         wln!(self, "    int64_t r = _fvec_new();");
-        wln!(self, "    int n = (int)Vec_len(0, a);");
+        wln!(self, "    int n = (int)p_vec_len((PVec*)a);");
         wln!(self, "    for (int i = 0; i < n; i++) _fvec_push_f64(r, _fvec_get_f64(a,i) - _fvec_get_f64(b,i));");
         wln!(self, "    return r;");
         wln!(self, "}}");
         wln!(self, "int64_t p_simd_mul(int64_t a, int64_t b) {{");
         wln!(self, "    int64_t r = _fvec_new();");
-        wln!(self, "    int n = (int)Vec_len(0, a);");
+        wln!(self, "    int n = (int)p_vec_len((PVec*)a);");
         wln!(self, "    for (int i = 0; i < n; i++) _fvec_push_f64(r, _fvec_get_f64(a,i) * _fvec_get_f64(b,i));");
         wln!(self, "    return r;");
         wln!(self, "}}");
         wln!(self, "int64_t p_simd_div(int64_t a, int64_t b) {{");
         wln!(self, "    int64_t r = _fvec_new();");
-        wln!(self, "    int n = (int)Vec_len(0, a);");
+        wln!(self, "    int n = (int)p_vec_len((PVec*)a);");
         wln!(self, "    for (int i = 0; i < n; i++) {{ double db = _fvec_get_f64(b,i); _fvec_push_f64(r, db != 0 ? _fvec_get_f64(a,i) / db : 0); }}");
         wln!(self, "    return r;");
         wln!(self, "}}");
         wln!(self, "double p_simd_dot(int64_t a, int64_t b) {{");
-        wln!(self, "    int n = (int)Vec_len(0, a); double s = 0;");
+        wln!(self, "    int n = (int)p_vec_len((PVec*)a); double s = 0;");
         wln!(self, "    for (int i = 0; i < n; i++) s += _fvec_get_f64(a,i) * _fvec_get_f64(b,i);");
         wln!(self, "    return s;");
         wln!(self, "}}");
         wln!(self, "double p_simd_sum(int64_t a) {{");
-        wln!(self, "    int n = (int)Vec_len(0, a); double s = 0;");
+        wln!(self, "    int n = (int)p_vec_len((PVec*)a); double s = 0;");
         wln!(self, "    for (int i = 0; i < n; i++) s += _fvec_get_f64(a,i);");
         wln!(self, "    return s;");
         wln!(self, "}}");
         wln!(self, "int64_t p_simd_scale(int64_t a, double s) {{");
         wln!(self, "    int64_t r = _fvec_new();");
-        wln!(self, "    int n = (int)Vec_len(0, a);");
+        wln!(self, "    int n = (int)p_vec_len((PVec*)a);");
         wln!(self, "    for (int i = 0; i < n; i++) _fvec_push_f64(r, _fvec_get_f64(a,i) * s);");
         wln!(self, "    return r;");
         wln!(self, "}}");
         wln!(self, "int64_t p_simd_from_vec(int64_t v) {{");
         wln!(self, "    int64_t r = _fvec_new();");
-        wln!(self, "    int n = (int)Vec_len(0, v);");
-        wln!(self, "    for (int i = 0; i < n; i++) _fvec_push_f64(r, (double)Vec_get(0, v, i));");
+        wln!(self, "    int n = (int)p_vec_len((PVec*)v);");
+        wln!(self, "    for (int i = 0; i < n; i++) _fvec_push_f64(r, (double)(int64_t)p_vec_get((PVec*)v, i));");
         wln!(self, "    return r;");
         wln!(self, "}}");
         wln!(self, "char* p_simd_to_str(int64_t a) {{");
         wln!(self, "    if (!a) return strdup(\"[]\");");
         wln!(self, "    size_t cap = 64; char* result = (char*)malloc(cap); size_t pos = 0;");
         wln!(self, "    result[pos++] = '[';");
-        wln!(self, "    int64_t n = Vec_len(0, a);");
+        wln!(self, "    int64_t n = p_vec_len((PVec*)a);");
         wln!(self, "    for (int64_t i = 0; i < n; i++) {{");
         wln!(self, "        if (i > 0) {{ if (pos+2>=cap){{cap*=2;result=(char*)realloc(result,cap);}} result[pos++]=','; result[pos++]=' '; }}");
         wln!(self, "        double d = _fvec_get_f64(a, i);");
@@ -3327,6 +3498,94 @@ impl CCodeGen {
         wln!(self, "    PMemDB* mdb = (PMemDB*)db;");
         wln!(self, "    if (mdb) {{ for (int64_t i = 0; i < mdb->len; i++) {{ free(mdb->keys[i]); free(mdb->vals[i]); }} free(mdb->keys); free(mdb->vals); free(mdb); }}");
         wln!(self, "}}");
+
+        // ─── ECS runtime ───
+        // Simple component storage: array of component tables, each table is
+        // an array of (entity_id, value_ptr) pairs. Component names are matched
+        // by string comparison. This is O(n) per lookup but sufficient for tests.
+        wln!(self, "");
+        wln!(self, "typedef struct { int64_t entity; void* value; } EcsEntry;");
+        wln!(self, "typedef struct { char name[64]; EcsEntry* entries; int64_t len; int64_t cap; } EcsComponent;");
+        wln!(self, "static EcsComponent* p_ecs_components = NULL;");
+        wln!(self, "static int64_t p_ecs_component_count = 0;");
+        wln!(self, "static int64_t p_ecs_component_cap = 0;");
+        wln!(self, "static int64_t p_ecs_entity_count = 0;");
+        wln!(self, "");
+        wln!(self, "static EcsComponent* p_ecs_find_component(const char* name) {");
+        wln!(self, "    for (int64_t i = 0; i < p_ecs_component_count; i++) {");
+        wln!(self, "        if (strncmp(p_ecs_components[i].name, name, 63) == 0) return &p_ecs_components[i];");
+        wln!(self, "    }");
+        wln!(self, "    return NULL;");
+        wln!(self, "}");
+        wln!(self, "");
+        wln!(self, "static EcsComponent* p_ecs_get_or_create_component(const char* name) {");
+        wln!(self, "    EcsComponent* c = p_ecs_find_component(name);");
+        wln!(self, "    if (c) return c;");
+        wln!(self, "    if (p_ecs_component_count >= p_ecs_component_cap) {");
+        wln!(self, "        p_ecs_component_cap = p_ecs_component_cap == 0 ? 8 : p_ecs_component_cap * 2;");
+        wln!(self, "        p_ecs_components = (EcsComponent*)realloc(p_ecs_components, p_ecs_component_cap * sizeof(EcsComponent));");
+        wln!(self, "    }");
+        wln!(self, "    c = &p_ecs_components[p_ecs_component_count++];");
+        wln!(self, "    strncpy(c->name, name, 63); c->name[63] = 0;");
+        wln!(self, "    c->entries = NULL; c->len = 0; c->cap = 0;");
+        wln!(self, "    return c;");
+        wln!(self, "}");
+        wln!(self, "");
+        wln!(self, "int64_t __ecs_create_entity(void) {");
+        wln!(self, "    return p_ecs_entity_count++;");
+        wln!(self, "}");
+        wln!(self, "");
+        wln!(self, "int64_t __ecs_entity_count(void) {");
+        wln!(self, "    return p_ecs_entity_count;");
+        wln!(self, "}");
+        wln!(self, "");
+        wln!(self, "int64_t __ecs_has(const char* comp_name, int64_t entity) {");
+        wln!(self, "    EcsComponent* c = p_ecs_find_component(comp_name);");
+        wln!(self, "    if (!c) return 0;");
+        wln!(self, "    for (int64_t i = 0; i < c->len; i++) {");
+        wln!(self, "        if (c->entries[i].entity == entity) return 1;");
+        wln!(self, "    }");
+        wln!(self, "    return 0;");
+        wln!(self, "}");
+        wln!(self, "");
+        wln!(self, "void* __ecs_get(const char* comp_name, int64_t entity) {");
+        wln!(self, "    EcsComponent* c = p_ecs_find_component(comp_name);");
+        wln!(self, "    if (!c) return NULL;");
+        wln!(self, "    for (int64_t i = 0; i < c->len; i++) {");
+        wln!(self, "        if (c->entries[i].entity == entity) return c->entries[i].value;");
+        wln!(self, "    }");
+        wln!(self, "    return NULL;");
+        wln!(self, "}");
+        wln!(self, "");
+        wln!(self, "int64_t __ecs_add(const char* comp_name, int64_t entity, void* value) {");
+        wln!(self, "    EcsComponent* c = p_ecs_get_or_create_component(comp_name);");
+        wln!(self, "    // Check if entity already exists — update value");
+        wln!(self, "    for (int64_t i = 0; i < c->len; i++) {");
+        wln!(self, "        if (c->entries[i].entity == entity) { c->entries[i].value = value; return 0; }");
+        wln!(self, "    }");
+        wln!(self, "    // Add new entry");
+        wln!(self, "    if (c->len >= c->cap) {");
+        wln!(self, "        c->cap = c->cap == 0 ? 8 : c->cap * 2;");
+        wln!(self, "        c->entries = (EcsEntry*)realloc(c->entries, c->cap * sizeof(EcsEntry));");
+        wln!(self, "    }");
+        wln!(self, "    c->entries[c->len].entity = entity;");
+        wln!(self, "    c->entries[c->len].value = value;");
+        wln!(self, "    c->len++;");
+        wln!(self, "    return 0;");
+        wln!(self, "}");
+        wln!(self, "");
+        wln!(self, "int64_t __ecs_remove(const char* comp_name, int64_t entity) {");
+        wln!(self, "    EcsComponent* c = p_ecs_find_component(comp_name);");
+        wln!(self, "    if (!c) return 0;");
+        wln!(self, "    for (int64_t i = 0; i < c->len; i++) {");
+        wln!(self, "        if (c->entries[i].entity == entity) {");
+        wln!(self, "            c->entries[i] = c->entries[c->len - 1];");
+        wln!(self, "            c->len--;");
+        wln!(self, "            return 0;");
+        wln!(self, "        }");
+        wln!(self, "    }");
+        wln!(self, "    return 0;");
+        wln!(self, "}");
     }
 }
 

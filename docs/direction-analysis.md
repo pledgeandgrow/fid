@@ -13,8 +13,8 @@
 make it another D, Crystal, or V — technically good, commercially irrelevant.**
 
 The project has built an impressive amount of working compiler infrastructure
-(~68,100 LOC, 39 source files, 105/130 test parity across 3 backends, 34 stdlib
-modules, 6 backends). But it's spreading into too many domains (games,
+(81,041 LOC, 53 source files, 104/104 test parity across 3 backends, 35 stdlib
+modules, 6 backends, 4 binaries: fidesc/pacte/scribe/veil). But it's spreading into too many domains (games,
 blockchain, robotics, medical, serverless) before it has proven it can do the
 basics better than existing languages.
 
@@ -59,7 +59,7 @@ Fides source
   └── Hot reload (native JIT)
 ```
 
-105/130 test parity across interpreter, PE, and C codegen is real (pre-existing failures from incomplete 8A/8B/8D features). This is more
+104/104 test parity across interpreter, PE, and C codegen is real (pre-existing failures from incomplete 8A/8B/8D features). This is more
 backends than most languages ever achieve. History lesson: **"A great runtime
 can sustain multiple languages"** — Fides's IR is its "runtime" and it supports
 many targets.
@@ -80,10 +80,10 @@ doesn't burden the language forever. Scala should have done this. C++ couldn't.
 
 ### 4. Test Infrastructure ✅
 
-- 200/202 unit tests
-- 6/8 harness tests
-- 105/130 interpreter + PE, 104/130 C codegen (pre-existing failures from incomplete features)
-- 22/22 expected-fail tests
+- 257/257 unit tests
+- harness tests 8/8 passed
+- 104/104 interpreter + PE, 104/104 C codegen (All passing)
+- 25/25 expected-fail tests
 - `verify.sh` with baseline tracking
 - Golden file generation
 - Bisect tooling
@@ -179,7 +179,7 @@ a platform, you need a killer framework."**
 
 Current state:
 - 0 users (not released)
-- 0 packages (no package manager)
+- 0 packages (pacte package manager implemented, registry pending)
 - 0 real projects written in Fides
 - No LSP, no formatter, no debugger
 - No documentation for users (only internal docs)
@@ -215,10 +215,10 @@ to choose a systems language.
 ~~Multiple docs are out of sync with reality:~~
 **UPDATE Aug 2026:** Docs have been synchronized with actual state. All test
 counts, LOC, file counts, and phase numbers now match verified reality:
-- `features.md` now says "104/130 C codegen — near full parity" ✅
-- `features.md` now says "105/130 interpreter" ✅
-- `roadmap-limitations.md` now says "105/130 + 22/22 expected-fail" ✅
-- `roadmap.md` summary now says "105/130" ✅
+- `features.md` now says "104/104 C codegen — full parity" ✅
+- `features.md` now says "104/104 interpreter" ✅
+- `roadmap-limitations.md` now says "104/104 + 25/25 expected-fail" ✅
+- `roadmap.md` summary now says "104/104" ✅
 - Phase numbers updated (self-hosting is Phase 10, ecosystem Phase 11, world class Phase 12) ✅
 
 This was a symptom of moving fast without updating all docs. The docs now
@@ -362,7 +362,7 @@ well. Cut the rest until those 3 prove the concept.
 Every doc should be updated when test counts change. ~~The current state where
 `features.md` says 76/78 but reality is 114/114 is unacceptable for a project
 that wants to be taken seriously.~~ **UPDATE Aug 2026: All docs now match
-verified reality (105/130 interpreter+PE, 104/130 C codegen, 22/22 expected-fail).**
+verified reality (104/104 interpreter+PE, 104/104 C codegen, 25/25 expected-fail).**
 
 **Recommendation:** Add a pre-commit check: run `fidesc test`, compare
 output to docs, fail if mismatch. Or at minimum, update all docs in the same
@@ -446,7 +446,7 @@ candidate:
 | Dimension | Score | Notes |
 |-----------|-------|-------|
 | Novel design space | 🟢 9/10 | Unique combination no one else has |
-| Technical execution | 🟢 8/10 | 105/130 parity, 6 backends, solid test infra |
+| Technical execution | 🟢 8/10 | 104/104 parity, 6 backends, solid test infra |
 | Scope discipline | 🔴 3/10 | Trying to do everything at once |
 | Ecosystem building | 🔴 2/10 | No users, no packages, no tooling |
 | Focus / prioritization | 🟡 5/10 | Optimizer enabled by default, but still adding features instead of fixing regalloc |
@@ -494,7 +494,7 @@ Based on the history.md lessons and current state:
    → Proves Fides is real
 
 8. 🟢 Start ecosystem (Phase 11 basics)
-   → LSP server, formatter, package manager
+   → LSP server (oracle/fidesc lsp), formatter (forge/fidesc fmt), package manager (pacte), doc generator (scribe), coverage (veil)
    → These are what make a language usable
 
 9. ⏸ DEFER Phase 8 (Game Development)

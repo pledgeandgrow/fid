@@ -171,6 +171,16 @@ impl Memory {
         }
     }
 
+    /// Get the amount of memory allocated (in bytes)
+    pub fn allocated(&self) -> u64 {
+        self.next_alloc
+    }
+
+    /// Get the total memory capacity (in bytes)
+    pub fn capacity(&self) -> usize {
+        self.data.len()
+    }
+
     /// Check if an address is within the allocated memory region
     pub fn is_valid_addr(&self, addr: u64) -> bool {
         (addr as usize) < self.data.len()
@@ -233,6 +243,10 @@ pub struct Interpreter {
     /// Opaque values (Vec, HashMap) stored by alloca address —
     /// these can't be serialized to the byte-addressed memory
     opaque_values: HashMap<u64, Value>,
+    /// Mapping from Vec struct address (i64) to side-table address where
+    /// the high-level Value::Vec is stored. This separates the raw struct
+    /// fields (data, len, cap at addr+0, +8, +16) from the Value::Vec.
+    vec_side_table: HashMap<u64, u64>,
     /// Verbose mode — print each instruction as it executes
     verbose: bool,
     /// Debug mode — enables runtime safety checks (overflow, bounds)
@@ -257,6 +271,12 @@ pub struct Interpreter {
     wrapping_funcs: HashSet<String>,
     /// Current function name — tracked to determine if we're in a @wrapping function
     current_func_name: String,
+    /// Call stack — list of function names for stack traces on panic.
+    /// Pushed on run_function entry, popped on return/panic.
+    call_stack: Vec<String>,
+    /// Stack trace captured at the point of panic (before unwinding).
+    /// None if no panic has occurred or the trace was already consumed.
+    panic_stack_trace: Option<String>,
     /// Unsafe block depth in the currently executing code.
     /// When > 0, bounds checks are skipped (F62: bounds checking lock —
     /// can only be bypassed inside unsafe {}).
@@ -274,6 +294,11 @@ pub struct Interpreter {
     mutexes: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
     /// Next mutex handle
     next_mutex_handle: i64,
+    /// Channel pool — maps handle to Arc<Mutex<ChannelState>>
+    /// Channels are shared across threads via Arc.
+    channels: Arc<Mutex<HashMap<i64, Arc<Mutex<ChannelState>>>>>,
+    /// Next channel handle
+    next_channel_handle: i64,
     /// Dynamic loading handles — maps handle to library path
     dl_handles: HashMap<i64, String>,
     /// Next dynamic loading handle
@@ -288,6 +313,39 @@ pub struct Interpreter {
     /// Phase A1: Task done flags — maps future index to whether the thread has
     /// completed (for non-blocking p_task_poll). Set by the thread before exit.
     task_done: Arc<Mutex<HashMap<usize, bool>>>,
+    /// Debug hook — called before each instruction execution.
+    /// If it returns Some(outcome), that outcome replaces the instruction's
+    /// normal execution. If None, the instruction executes normally.
+    /// Used by the built-in debugger (fidesc debug).
+    debug_hook: Option<Box<dyn FnMut(&str, &str, usize, u32, &HashMap<ValueId, Value>, &IrFunction) -> DebugAction>>,
+    /// Execution trace — records each instruction for record/replay.
+    /// Each entry: (func_name, block_id, inst_id, source_line)
+    trace: Vec<TraceEntry>,
+    /// Whether to record a trace (for record/replay debugging)
+    recording: bool,
+}
+
+/// Action returned by the debug hook
+pub enum DebugAction {
+    /// Continue execution normally
+    Continue,
+    /// Pause execution and return to the debugger prompt
+    Pause,
+    /// Inject a return value
+    InjectReturn(Value),
+    /// Inject a panic
+    InjectPanic(String),
+}
+
+/// A trace entry for record/replay debugging
+#[derive(Debug, Clone)]
+pub struct TraceEntry {
+    pub func_name: String,
+    pub block_id: u32,
+    pub inst_id: u32,
+    pub source_line: usize,
+    /// Serialized value (if the instruction produced a value)
+    pub value_repr: Option<String>,
 }
 
 /// Result of running a function
@@ -297,6 +355,8 @@ pub enum RunResult {
     Return(Value),
     /// Function panicked
     Panic(String),
+    /// Execution was paused by the debugger
+    Paused,
 }
 
 /// State of a Future — either Ready (completed with a value) or Pending
@@ -310,6 +370,14 @@ enum FutureState {
     Pending(Option<std::thread::JoinHandle<i64>>),
 }
 
+/// Channel state — a bounded queue with close semantics.
+/// Shared across threads via Arc<Mutex<ChannelState>>.
+struct ChannelState {
+    buffer: std::collections::VecDeque<i64>,
+    capacity: usize,
+    closed: bool,
+}
+
 impl Interpreter {
     pub fn new(module: IrModule) -> Self {
         let mut interp = Interpreter {
@@ -317,6 +385,7 @@ impl Interpreter {
             memory: Memory::new(),
             string_addrs: HashMap::new(),
             opaque_values: HashMap::new(),
+            vec_side_table: HashMap::new(),
             verbose: false,
             debug_mode: true,
             array_bounds: HashMap::new(),
@@ -326,18 +395,25 @@ impl Interpreter {
             txn_snapshots: Vec::new(),
             wrapping_funcs: HashSet::new(),
             current_func_name: String::new(),
+            call_stack: Vec::new(),
+            panic_stack_trace: None,
             interp_unsafe_depth: 0,
             futures: Vec::new(),
             shared_memory: Arc::new(Mutex::new(HashMap::new())),
             next_shared_addr: 0x10000000,
             mutexes: Arc::new(Mutex::new(HashMap::new())),
             next_mutex_handle: 1,
+            channels: Arc::new(Mutex::new(HashMap::new())),
+            next_channel_handle: 1,
             dl_handles: HashMap::new(),
             next_dl_handle: 1,
             ecs_entity_count: 0,
             ecs_components: HashMap::new(),
             executors: Vec::new(),
             task_done: Arc::new(Mutex::new(HashMap::new())),
+            debug_hook: None,
+            trace: Vec::new(),
+            recording: false,
         };
         // Pre-allocate string constants
         interp.init_strings();
@@ -347,6 +423,49 @@ impl Interpreter {
     pub fn verbose(mut self) -> Self {
         self.verbose = true;
         self
+    }
+
+    /// Set a debug hook — called before each instruction execution.
+    /// The hook can block (e.g. waiting for user input) and returns
+    /// an action: Continue, InjectReturn, or InjectPanic.
+    pub fn set_debug_hook(&mut self, hook: Box<dyn FnMut(&str, &str, usize, u32, &HashMap<ValueId, Value>, &IrFunction) -> DebugAction>) {
+        self.debug_hook = Some(hook);
+    }
+
+    /// Enable trace recording for record/replay debugging.
+    pub fn enable_recording(&mut self) {
+        self.recording = true;
+        self.trace.clear();
+    }
+
+    /// Get the recorded trace (for record/replay debugging).
+    pub fn get_trace(&self) -> &[TraceEntry] {
+        &self.trace
+    }
+
+    /// Get the call stack (for the debugger's `backtrace` command)
+    pub fn get_call_stack(&self) -> &[String] {
+        &self.call_stack
+    }
+
+    /// Get the current function name
+    pub fn get_current_func_name(&self) -> &str {
+        &self.current_func_name
+    }
+
+    /// Get a reference to the IR module (for the debugger to inspect functions)
+    pub fn get_module(&self) -> &IrModule {
+        &self.module
+    }
+
+    /// Get memory usage info (for the debugger's `regions` command)
+    pub fn get_memory_usage(&self) -> (u64, usize) {
+        (self.memory.allocated(), self.memory.capacity())
+    }
+
+    /// Get the number of active threads (for the debugger's `regions` command)
+    pub fn get_thread_count(&self) -> usize {
+        self.futures.len()
     }
 
     /// Convert a Value to a String, handling both Value::Str and Value::Ptr
@@ -422,6 +541,42 @@ impl Interpreter {
 
     /// Phase 10B: Convert a Fides Vec (i64 pointer) to a Value::Vec
     /// by reading elements via Vec_get.
+    /// Look up a Vec value from either Value::Int (address) or Value::Vec.
+    fn lookup_vec_value(&self, arg: Option<&Value>) -> Option<Value> {
+        match arg {
+            Some(Value::Int(addr)) => {
+                if *addr > 0 {
+                    if let Some(&side_addr) = self.vec_side_table.get(&(*addr as u64)) {
+                        return self.opaque_values.get(&side_addr).cloned();
+                    }
+                    self.opaque_values.get(&(*addr as u64)).cloned()
+                } else { None }
+            }
+            Some(Value::Ptr(addr)) => {
+                if *addr > 0 {
+                    if let Some(&side_addr) = self.vec_side_table.get(addr) {
+                        return self.opaque_values.get(&side_addr).cloned();
+                    }
+                    self.opaque_values.get(addr).cloned()
+                } else { None }
+            }
+            Some(v @ Value::Vec(_)) => Some(v.clone()),
+            _ => None,
+        }
+    }
+
+    /// Find the Vec struct address for a Value::Vec by scanning vec_side_table.
+    fn find_vec_addr(&self, v: &Value) -> u64 {
+        if let Value::Vec(target) = v {
+            for (&vec_addr, &side_addr) in &self.vec_side_table {
+                if let Some(Value::Vec(arr)) = self.opaque_values.get(&side_addr) {
+                    if Rc::ptr_eq(arr, target) { return vec_addr; }
+                }
+            }
+        }
+        0
+    }
+
     fn fides_vec_to_value_vec(&mut self, vec_ptr: i64) -> Value {
         let vec_len_fn = self.module.functions.get("Vec_len").cloned();
         let vec_get_fn = self.module.functions.get("Vec_get").cloned();
@@ -485,12 +640,57 @@ impl Interpreter {
         }
     }
 
+    /// Format the current call stack as a string for panic output.
+    fn format_call_stack(&self) -> String {
+        if self.call_stack.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("stack trace:\n");
+        // Print from most recent (top) to outermost (bottom)
+        for (i, name) in self.call_stack.iter().rev().enumerate() {
+            if i == 0 {
+                out.push_str(&format!("    → {}\n", name));
+            } else {
+                out.push_str(&format!("    ↳ called from {}\n", name));
+            }
+        }
+        out
+    }
+
+    /// Get the panic stack trace (if any) from the last panic.
+    pub fn take_panic_stack_trace(&mut self) -> Option<String> {
+        self.panic_stack_trace.take()
+    }
+
+    /// Format the panic stack trace for display (non-consuming version)
+    pub fn format_panic_trace(&self) -> Option<String> {
+        self.panic_stack_trace.clone()
+    }
+
     /// Run a specific function with arguments
     fn run_function(&mut self, func: &IrFunction, args: &[Value]) -> RunResult {
         let saved_func_name = self.current_func_name.clone();
         self.current_func_name = func.name.clone();
+        self.call_stack.push(func.name.clone());
         // Build value table for this function
         let mut values: HashMap<ValueId, Value> = HashMap::new();
+
+        // Detect missing __env param: if the first param is Ptr(U8) (the __env param)
+        // but the caller didn't pass a dummy env (args.len() == params.len() - 1),
+        // insert a dummy env and shift args.
+        let effective_args: Vec<Value>;
+        let args: &[Value] = if func.params.first()
+            .map(|(_, ty)| matches!(ty, IrType::Ptr(ref inner) if matches!(inner.as_ref(), IrType::U8)))
+            .unwrap_or(false)
+            && args.len() == func.params.len() - 1
+        {
+            effective_args = std::iter::once(Value::Int(0))
+                .chain(args.iter().cloned())
+                .collect();
+            &effective_args
+        } else {
+            args
+        };
 
         // Bind parameters
         for (i, (param_id, param_ty)) in func.params.iter().enumerate() {
@@ -543,6 +743,47 @@ impl Interpreter {
                     eprintln!("    {} = {:?}", inst_id, inst);
                 }
 
+                // Record trace entry for record/replay debugging
+                if self.recording {
+                    let source_line = func.values.get(&inst_id)
+                        .and_then(|m| m.source_line)
+                        .unwrap_or(0);
+                    self.trace.push(TraceEntry {
+                        func_name: func.name.clone(),
+                        block_id: current_block.0,
+                        inst_id: inst_id.0,
+                        source_line,
+                        value_repr: None, // filled in after execution
+                    });
+                }
+
+                // Debug hook — called before each instruction.
+                // The hook can block (e.g. waiting for user input in the debugger)
+                // and returns an action: Continue, InjectReturn, or InjectPanic.
+                if let Some(ref mut hook) = self.debug_hook {
+                    let source_line = func.values.get(&inst_id)
+                        .and_then(|m| m.source_line)
+                        .unwrap_or(0);
+                    let action = hook(&func.name, &format!("{}", current_block), source_line, inst_id.0, &values, func);
+                    match action {
+                        DebugAction::Continue | DebugAction::Pause => {}
+                        DebugAction::InjectReturn(v) => {
+                            self.current_func_name = saved_func_name;
+                            self.call_stack.pop();
+                            return RunResult::Return(v);
+                        }
+                        DebugAction::InjectPanic(msg) => {
+                            if self.panic_stack_trace.is_none() {
+                                let trace = self.format_call_stack();
+                                self.panic_stack_trace = Some(trace);
+                            }
+                            self.current_func_name = saved_func_name;
+                            self.call_stack.pop();
+                            return RunResult::Panic(msg);
+                        }
+                    }
+                }
+
                 match self.execute_inst(&inst, inst_id, &mut values, func) {
                     ExecOutcome::Continue => {}
                     ExecOutcome::Value(v) => {
@@ -554,9 +795,15 @@ impl Interpreter {
                     }
                     ExecOutcome::Return(val) => {
                         self.current_func_name = saved_func_name;
+                        self.call_stack.pop();
                         return RunResult::Return(val);
                     }
                     ExecOutcome::Panic(msg) => {
+                        // Capture stack trace at the point of panic (before unwinding).
+                        if self.panic_stack_trace.is_none() {
+                            let trace = self.format_call_stack();
+                            self.panic_stack_trace = Some(trace);
+                        }
                         // Transaction rollback: if we're inside a txn block,
                         // restore the most recent snapshot before propagating.
                         if let Some((mem_snap, opaque_snap)) = self.txn_snapshots.pop() {
@@ -564,6 +811,7 @@ impl Interpreter {
                             self.opaque_values = opaque_snap;
                         }
                         self.current_func_name = saved_func_name;
+                        self.call_stack.pop();
                         return RunResult::Panic(msg);
                     }
                 }
@@ -576,6 +824,7 @@ impl Interpreter {
                 None => {
                     // No terminator found — return void
                     self.current_func_name = saved_func_name;
+                    self.call_stack.pop();
                     return RunResult::Return(Value::Void);
                 }
             }
@@ -751,7 +1000,7 @@ impl Interpreter {
                 ExecOutcome::Value(v)
             }
 
-            Inst::Store { ptr, value } => {
+            Inst::Store { ptr, value, .. } => {
                 let addr = match values.get(ptr) {
                     Some(Value::Ptr(a)) => *a,
                     _ => 0,
@@ -973,6 +1222,7 @@ impl Interpreter {
                     return match self.run_function(&callee, &arg_vals) {
                         RunResult::Return(v) => ExecOutcome::Value(v),
                         RunResult::Panic(msg) => ExecOutcome::Panic(msg),
+                        RunResult::Paused => ExecOutcome::Continue,
                     };
                 }
 
@@ -1036,6 +1286,7 @@ impl Interpreter {
                     return match self.run_function(&callee, &all_args) {
                         RunResult::Return(v) => ExecOutcome::Value(v),
                         RunResult::Panic(msg) => ExecOutcome::Panic(msg),
+                        RunResult::Paused => ExecOutcome::Continue,
                     };
                 }
 
@@ -1085,6 +1336,7 @@ impl Interpreter {
                     return match self.run_function(&callee, &all_args) {
                         RunResult::Return(v) => ExecOutcome::Value(v),
                         RunResult::Panic(msg) => ExecOutcome::Panic(msg),
+                        RunResult::Paused => ExecOutcome::Continue,
                     };
                 }
 
@@ -1899,38 +2151,88 @@ impl Interpreter {
 
             // ─── Vec<T> runtime functions ───
             "p_vec_new" => {
-                ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(SmallVec::new()))))
+                // Return an i64 address so Fides code can do pointer arithmetic
+                // (Vec_len does v + 8 to access the len field).
+                let addr = self.memory.alloc(24); // PVec: { data, len, cap } = 3 * 8 bytes
+                self.memory.store_i64(addr, 0);
+                self.memory.store_i64(addr + 8, 0);
+                self.memory.store_i64(addr + 16, 0);
+                // Store the Value::Vec in the opaque side-table at a separate address
+                // (so I64 loads from addr, addr+8, addr+16 read the raw struct fields).
+                let side_addr = self.memory.alloc(8);
+                self.opaque_values.insert(side_addr, Value::Vec(Rc::new(RefCell::new(SmallVec::new()))));
+                self.vec_side_table.insert(addr, side_addr);
+                ExecOutcome::Value(Value::Int(addr as i64))
             }
             "p_vec_push" => {
-                if let (Some(Value::Vec(arr)), Some(val)) = (args.first(), args.get(1)) {
+                let vec_val = self.lookup_vec_value(args.first());
+                if let (Some(Value::Vec(arr)), Some(val)) = (vec_val, args.get(1)) {
                     arr.borrow_mut().push(val.clone());
+                    // Update memory len field
+                    let addr = if let Some(Value::Int(a)) = args.first() { *a as u64 } else { self.find_vec_addr(&Value::Vec(arr.clone())) };
+                    if addr > 0 {
+                        self.memory.store_i64(addr + 8, arr.borrow().len() as i64);
+                        // Also store the value in the data array
+                        let len = arr.borrow().len();
+                        let mut data = self.memory.load_i64(addr);
+                        let mut cap = self.memory.load_i64(addr + 16);
+                        if len as i64 > cap {
+                            let new_cap = if cap > 0 { cap * 2 } else { 8 };
+                            let new_data = self.memory.alloc(new_cap as u64 * 8);
+                            for i in 0..cap {
+                                let old_val = self.memory.load_i64((data as u64) + (i as u64) * 8);
+                                self.memory.store_i64(new_data + (i as u64) * 8, old_val);
+                            }
+                            data = new_data as i64;
+                            cap = new_cap;
+                            self.memory.store_i64(addr, data);
+                            self.memory.store_i64(addr + 16, cap);
+                        }
+                        if let Value::Int(v) = val {
+                            self.memory.store_i64((data as u64) + ((len - 1) as u64) * 8, *v);
+                        }
+                    }
                 }
                 ExecOutcome::Value(Value::Void)
             }
             "p_vec_pop" => {
-                if let Some(Value::Vec(arr)) = args.first() {
+                let vec_val = self.lookup_vec_value(args.first());
+                if let Some(Value::Vec(arr)) = vec_val {
                     if let Some(v) = arr.borrow_mut().pop() {
+                        let addr = if let Some(Value::Int(a)) = args.first() { *a as u64 } else { 0 };
+                        if addr > 0 {
+                            let len = arr.borrow().len() as i64;
+                            self.memory.store_i64(addr + 8, len);
+                        }
                         return ExecOutcome::Value(v);
                     }
                 }
                 ExecOutcome::Value(Value::Void)
             }
             "p_vec_len" => {
-                if let Some(Value::Vec(arr)) = args.first() {
+                let vec_val = self.lookup_vec_value(args.first());
+                if let Some(Value::Vec(arr)) = vec_val {
                     return ExecOutcome::Value(Value::Int(arr.borrow().len() as i64));
+                }
+                // Fallback: read from memory (Fides Vec struct)
+                if let Some(Value::Int(addr)) = args.first() {
+                    if *addr > 0 {
+                        return ExecOutcome::Value(Value::Int(self.memory.load_i64((*addr as u64) + 8)));
+                    }
                 }
                 ExecOutcome::Value(Value::Int(0))
             }
             "p_vec_is_empty" => {
-                if let Some(Value::Vec(arr)) = args.first() {
+                let vec_val = self.lookup_vec_value(args.first());
+                if let Some(Value::Vec(arr)) = vec_val {
                     return ExecOutcome::Value(Value::Bool(arr.borrow().is_empty()));
                 }
                 ExecOutcome::Value(Value::Bool(true))
             }
             "p_vec_get" => {
-                if let (Some(Value::Vec(arr)), Some(Value::Int(idx))) = (args.first(), args.get(1)) {
+                let vec_val = self.lookup_vec_value(args.first());
+                if let (Some(Value::Vec(arr)), Some(Value::Int(idx))) = (vec_val, args.get(1)) {
                     let borrow = arr.borrow();
-                    // F62: bounds checking lock — skip in unsafe blocks
                     if self.interp_unsafe_depth == 0 {
                         if *idx < 0 || (*idx as usize) >= borrow.len() {
                             return ExecOutcome::Panic(format!(
@@ -1942,12 +2244,19 @@ impl Interpreter {
                     let idx_clamped = if borrow.is_empty() { 0 } else { (*idx as usize).min(borrow.len() - 1) };
                     return ExecOutcome::Value(borrow[idx_clamped].clone());
                 }
+                // Fallback: read from memory (Fides Vec struct)
+                if let (Some(Value::Int(addr)), Some(Value::Int(idx))) = (args.first(), args.get(1)) {
+                    if *addr > 0 {
+                        let data = self.memory.load_i64(*addr as u64);
+                        return ExecOutcome::Value(Value::Int(self.memory.load_i64((data as u64) + (*idx as u64) * 8)));
+                    }
+                }
                 ExecOutcome::Value(Value::Void)
             }
             "p_vec_set" => {
-                if let (Some(Value::Vec(arr)), Some(Value::Int(idx)), Some(val)) = (args.first(), args.get(1), args.get(2)) {
+                let vec_val = self.lookup_vec_value(args.first());
+                if let (Some(Value::Vec(arr)), Some(Value::Int(idx)), Some(val)) = (vec_val, args.get(1), args.get(2)) {
                     let mut borrow = arr.borrow_mut();
-                    // F62: bounds checking lock — skip in unsafe blocks
                     if self.interp_unsafe_depth == 0 {
                         if *idx < 0 || (*idx as usize) >= borrow.len() {
                             return ExecOutcome::Panic(format!(
@@ -1962,13 +2271,19 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Void)
             }
             "p_vec_clear" => {
-                if let Some(Value::Vec(arr)) = args.first() {
+                let vec_val = self.lookup_vec_value(args.first());
+                if let Some(Value::Vec(arr)) = vec_val {
                     arr.borrow_mut().clear();
+                    let addr = if let Some(Value::Int(a)) = args.first() { *a as u64 } else { 0 };
+                    if addr > 0 {
+                        self.memory.store_i64(addr + 8, 0);
+                    }
                 }
                 ExecOutcome::Value(Value::Void)
             }
             "p_vec_capacity" => {
-                if let Some(Value::Vec(arr)) = args.first() {
+                let vec_val = self.lookup_vec_value(args.first());
+                if let Some(Value::Vec(arr)) = vec_val {
                     return ExecOutcome::Value(Value::Int(arr.borrow().capacity() as i64));
                 }
                 ExecOutcome::Value(Value::Int(0))
@@ -2339,7 +2654,8 @@ impl Interpreter {
 
             // ─── New Vec runtime functions ───
             "p_vec_insert" => {
-                if let (Some(Value::Vec(arr)), Some(Value::Int(idx)), Some(val)) = (args.first(), args.get(1), args.get(2)) {
+                let vec_val = self.lookup_vec_value(args.first());
+                if let (Some(Value::Vec(arr)), Some(Value::Int(idx)), Some(val)) = (vec_val, args.get(1), args.get(2)) {
                     let len = arr.borrow().len() as i64;
                     if *idx < 0 || *idx > len {
                         return ExecOutcome::Panic(format!(
@@ -2352,7 +2668,8 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Void)
             }
             "p_vec_remove" => {
-                if let (Some(Value::Vec(arr)), Some(Value::Int(idx))) = (args.first(), args.get(1)) {
+                let vec_val = self.lookup_vec_value(args.first());
+                if let (Some(Value::Vec(arr)), Some(Value::Int(idx))) = (vec_val, args.get(1)) {
                     let len = arr.borrow().len() as i64;
                     if *idx < 0 || *idx >= len {
                         return ExecOutcome::Panic(format!(
@@ -2365,19 +2682,22 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Void)
             }
             "p_vec_contains" => {
-                if let (Some(Value::Vec(arr)), Some(val)) = (args.first(), args.get(1)) {
+                let vec_val = self.lookup_vec_value(args.first());
+                if let (Some(Value::Vec(arr)), Some(val)) = (vec_val, args.get(1)) {
                     return ExecOutcome::Value(Value::Bool(arr.borrow().iter().any(|v| v == val)));
                 }
                 ExecOutcome::Value(Value::Bool(false))
             }
             "p_vec_reverse" => {
-                if let Some(Value::Vec(arr)) = args.first() {
+                let vec_val = self.lookup_vec_value(args.first());
+                if let Some(Value::Vec(arr)) = vec_val {
                     arr.borrow_mut().reverse();
                 }
                 ExecOutcome::Value(Value::Void)
             }
             "p_vec_first" => {
-                if let Some(Value::Vec(arr)) = args.first() {
+                let vec_val = self.lookup_vec_value(args.first());
+                if let Some(Value::Vec(arr)) = vec_val {
                     if let Some(v) = arr.borrow().first() {
                         return ExecOutcome::Value(v.clone());
                     }
@@ -2386,7 +2706,8 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Void)
             }
             "p_vec_last" => {
-                if let Some(Value::Vec(arr)) = args.first() {
+                let vec_val = self.lookup_vec_value(args.first());
+                if let Some(Value::Vec(arr)) = vec_val {
                     if let Some(v) = arr.borrow().last() {
                         return ExecOutcome::Value(v.clone());
                     }
@@ -2395,19 +2716,23 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Void)
             }
             "p_vec_extend" => {
-                if let (Some(Value::Vec(dst)), Some(Value::Vec(src))) = (args.first(), args.get(1)) {
+                let dst_val = self.lookup_vec_value(args.first());
+                let src_val = self.lookup_vec_value(args.get(1));
+                if let (Some(Value::Vec(dst)), Some(Value::Vec(src))) = (dst_val, src_val) {
                     dst.borrow_mut().extend(src.borrow().iter().cloned());
                 }
                 ExecOutcome::Value(Value::Void)
             }
             "p_vec_truncate" => {
-                if let (Some(Value::Vec(arr)), Some(Value::Int(len))) = (args.first(), args.get(1)) {
+                let vec_val = self.lookup_vec_value(args.first());
+                if let (Some(Value::Vec(arr)), Some(Value::Int(len))) = (vec_val, args.get(1)) {
                     arr.borrow_mut().truncate(*len as usize);
                 }
                 ExecOutcome::Value(Value::Void)
             }
             "p_vec_sort" => {
-                if let Some(Value::Vec(arr)) = args.first() {
+                let vec_val = self.lookup_vec_value(args.first());
+                if let Some(Value::Vec(arr)) = vec_val {
                     arr.borrow_mut().sort_by(|a, b| {
                         match (a, b) {
                             (Value::Int(a), Value::Int(b)) => a.cmp(b),
@@ -3354,6 +3679,7 @@ impl Interpreter {
                 // Clone shared state for the thread
                 let shared_memory = self.shared_memory.clone();
                 let mutexes = self.mutexes.clone();
+                let channels = self.channels.clone();
 
                 // Allocate a Future slot (Pending)
                 let future_idx = self.futures.len();
@@ -3361,9 +3687,10 @@ impl Interpreter {
 
                 let handle = std::thread::spawn(move || {
                     let mut interp = Interpreter::new(module);
-                    // Share the same shared_memory and mutexes
+                    // Share the same shared_memory, mutexes, and channels
                     interp.shared_memory = shared_memory;
                     interp.mutexes = mutexes;
+                    interp.channels = channels;
 
                     // Convert i64 args back to Values
                     // Prepend a dummy env value (user functions have __env as first param)
@@ -3381,6 +3708,7 @@ impl Interpreter {
                                 eprintln!("Thread panic: {}", msg);
                                 Value::Int(0)
                             }
+                            RunResult::Paused => Value::Int(0),
                         }
                     } else {
                         eprintln!("Thread: unknown function '{}'", func_name);
@@ -3442,6 +3770,7 @@ impl Interpreter {
                 let module = self.module.clone();
                 let shared_memory = self.shared_memory.clone();
                 let mutexes = self.mutexes.clone();
+                let channels = self.channels.clone();
                 let task_done = self.task_done.clone();
                 let future_idx = self.futures.len();
                 self.futures.push(FutureState::Pending(None));
@@ -3450,6 +3779,7 @@ impl Interpreter {
                     let mut interp = Interpreter::new(module);
                     interp.shared_memory = shared_memory;
                     interp.mutexes = mutexes;
+                    interp.channels = channels;
                     let mut thread_values: Vec<Value> = vec![Value::Int(0)];
                     for n in &thread_args {
                         thread_values.push(Value::Int(*n));
@@ -3461,6 +3791,7 @@ impl Interpreter {
                                 eprintln!("Thread panic: {}", msg);
                                 Value::Int(0)
                             }
+                            RunResult::Paused => Value::Int(0),
                         }
                     } else {
                         eprintln!("Executor: unknown function '{}'", func_name);
@@ -3926,6 +4257,145 @@ impl Interpreter {
                 ExecOutcome::Continue
             }
 
+            // ─── Channels (bounded MPSC queue) ───
+            "p_chan_create" => {
+                // p_chan_create(capacity: i64) -> i64 — create a bounded channel
+                let capacity = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 1,
+                };
+                let capacity = if capacity < 1 { 1 } else { capacity as usize };
+                let handle = self.next_channel_handle;
+                self.next_channel_handle += 1;
+                let ch = Arc::new(Mutex::new(ChannelState {
+                    buffer: std::collections::VecDeque::with_capacity(capacity),
+                    capacity,
+                    closed: false,
+                }));
+                self.channels.lock().unwrap().insert(handle, ch);
+                ExecOutcome::Value(Value::Int(handle))
+            }
+            "p_chan_send" => {
+                // p_chan_send(ch: i64, val: i64) -> bool — send a value (blocks if full)
+                let ch_handle = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let val = match args.get(1) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let channels = self.channels.clone();
+                loop {
+                    let ch_arc = {
+                        let chans = channels.lock().unwrap();
+                        chans.get(&ch_handle).cloned()
+                    };
+                    match ch_arc {
+                        Some(ch) => {
+                            let mut ch_lock = ch.lock().unwrap();
+                            if ch_lock.closed {
+                                return ExecOutcome::Value(Value::Bool(false));
+                            }
+                            if ch_lock.buffer.len() < ch_lock.capacity {
+                                ch_lock.buffer.push_back(val);
+                                return ExecOutcome::Value(Value::Bool(true));
+                            }
+                            // Buffer full — spin and yield
+                            drop(ch_lock);
+                            std::thread::yield_now();
+                        }
+                        None => return ExecOutcome::Value(Value::Bool(false)),
+                    }
+                }
+            }
+            "p_chan_recv" => {
+                // p_chan_recv(ch: i64) -> i64 — receive a value (blocks if empty)
+                let ch_handle = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let channels = self.channels.clone();
+                loop {
+                    let ch_arc = {
+                        let chans = channels.lock().unwrap();
+                        chans.get(&ch_handle).cloned()
+                    };
+                    match ch_arc {
+                        Some(ch) => {
+                            let mut ch_lock = ch.lock().unwrap();
+                            if let Some(val) = ch_lock.buffer.pop_front() {
+                                return ExecOutcome::Value(Value::Int(val));
+                            }
+                            if ch_lock.closed {
+                                // Closed and empty — return pending sentinel
+                                return ExecOutcome::Value(Value::Int(i64::MIN + 1));
+                            }
+                            // Empty — spin and yield
+                            drop(ch_lock);
+                            std::thread::yield_now();
+                        }
+                        None => return ExecOutcome::Value(Value::Int(i64::MIN + 1)),
+                    }
+                }
+            }
+            "p_chan_try_recv" => {
+                // p_chan_try_recv(ch: i64) -> i64 — non-blocking receive
+                let ch_handle = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let ch_arc = {
+                    let chans = self.channels.lock().unwrap();
+                    chans.get(&ch_handle).cloned()
+                };
+                match ch_arc {
+                    Some(ch) => {
+                        let mut ch_lock = ch.lock().unwrap();
+                        if let Some(val) = ch_lock.buffer.pop_front() {
+                            ExecOutcome::Value(Value::Int(val))
+                        } else if ch_lock.closed {
+                            // Closed and empty — return 0
+                            ExecOutcome::Value(Value::Int(0))
+                        } else {
+                            // Empty — return pending sentinel
+                            ExecOutcome::Value(Value::Int(i64::MIN + 1))
+                        }
+                    }
+                    None => ExecOutcome::Value(Value::Int(i64::MIN + 1)),
+                }
+            }
+            "p_chan_close" => {
+                // p_chan_close(ch: i64) -> void — close the channel
+                let ch_handle = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let ch_arc = {
+                    let chans = self.channels.lock().unwrap();
+                    chans.get(&ch_handle).cloned()
+                };
+                if let Some(ch) = ch_arc {
+                    ch.lock().unwrap().closed = true;
+                }
+                ExecOutcome::Continue
+            }
+            "p_chan_is_closed" => {
+                // p_chan_is_closed(ch: i64) -> bool — check if channel is closed
+                let ch_handle = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let ch_arc = {
+                    let chans = self.channels.lock().unwrap();
+                    chans.get(&ch_handle).cloned()
+                };
+                match ch_arc {
+                    Some(ch) => ExecOutcome::Value(Value::Bool(ch.lock().unwrap().closed)),
+                    None => ExecOutcome::Value(Value::Bool(true)),
+                }
+            }
+
             // ─── C library function stubs (for extern FFI in interpreter mode) ───
             "abs" => {
                 if let Some(Value::Int(n)) = args.first() {
@@ -4305,7 +4775,7 @@ enum ExecOutcome {
 }
 
 /// Convenience function — lower and interpret a program
-pub fn interpret(module: IrModule, verbose: bool, release: bool) -> RunResult {
+pub fn interpret(module: IrModule, verbose: bool, release: bool) -> (RunResult, Option<String>) {
     let mut interp = Interpreter::new(module);
     if verbose {
         interp.verbose = true;
@@ -4313,5 +4783,7 @@ pub fn interpret(module: IrModule, verbose: bool, release: bool) -> RunResult {
     if release {
         interp.debug_mode = false;
     }
-    interp.run()
+    let result = interp.run();
+    let trace = interp.take_panic_stack_trace();
+    (result, trace)
 }
