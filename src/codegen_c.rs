@@ -534,6 +534,8 @@ impl CCodeGen {
             ("p_file_write", &[p(), p()]),
             ("p_file_exists", &[p()]),
             ("p_file_append", &[p(), p()]),
+            ("p_file_delete", &[p()]),
+            ("p_file_size", &[p()]),
             // Varargs functions: register the fixed prefix (non-varargs params).
             // p_thread_spawn(func_name: const char*, num_args: i64, ...args)
             // p_executor_spawn(exec: i64, func_name: const char*, num_args: i64, ...args)
@@ -569,6 +571,7 @@ impl CCodeGen {
             "p_json_append", "p_json_append_int", "p_json_append_float",
             "p_http_send_response",
             "p_db_exec", "p_db_set", "p_db_mem_close",
+            "p_rc_decr",
         ];
         for name in void_ret {
             self.fn_ret_types.insert(name.to_string(), IrType::Void);
@@ -581,6 +584,8 @@ impl CCodeGen {
         for name in &["p_simd_add", "p_simd_sub", "p_simd_mul", "p_simd_div", "p_simd_scale", "p_simd_from_vec"] {
             self.fn_ret_types.insert(name.to_string(), IrType::I64);
         }
+        // Rc/Arc refcount functions return i64 (the pointer value)
+        self.fn_ret_types.insert("p_rc_incr".to_string(), IrType::I64);
     }
 
     fn emit_runtime_header(&mut self) {
@@ -869,6 +874,8 @@ impl CCodeGen {
         wln!(self, "int64_t p_file_write(const char* path, const char* content);");
         wln!(self, "bool p_file_exists(const char* path);");
         wln!(self, "int64_t p_file_append(const char* path, const char* content);");
+        wln!(self, "int64_t p_file_delete(const char* path);");
+        wln!(self, "int64_t p_file_size(const char* path);");
         // Environment variable builtins
         wln!(self, "char* p_getenv(const char* name);");
         // Command-line argument builtins — globals saved by main wrapper
@@ -906,6 +913,9 @@ impl CCodeGen {
         wln!(self, "void p_atomic_store(int64_t addr, int64_t val);");
         wln!(self, "bool p_atomic_cas(int64_t addr, int64_t expected, int64_t new_val);");
         wln!(self, "int64_t p_atomic_add(int64_t addr, int64_t val);");
+        wln!(self, "int64_t p_atomic_sub(int64_t addr, int64_t val);");
+        wln!(self, "int64_t p_rc_incr(int64_t rc_addr, int64_t val);");
+        wln!(self, "void p_rc_decr(int64_t rc_addr, int64_t val);");
         wln!(self, "int64_t p_mutex_init(void);");
         wln!(self, "void p_mutex_lock(int64_t m);");
         wln!(self, "void p_mutex_unlock(int64_t m);");
@@ -1130,7 +1140,7 @@ impl CCodeGen {
             Inst::ConstNull { .. } => {
                 wln!(self, "    {} = NULL;", dst);
             }
-            Inst::BinOp { op, left, right, ty: _ } => {
+            Inst::BinOp { op, left, right, ty } => {
                 let l_raw = self.val_name(*left);
                 let r_raw = self.val_name(*right);
                 // Cast pointer-typed operands to int64_t for arithmetic —
@@ -1163,7 +1173,13 @@ impl CCodeGen {
                     BinOp::And => "&&",
                     BinOp::Or => "||",
                 };
-                wln!(self, "    {} = {} {} {};", dst, l, cop, r);
+                // If the result type is a pointer/opaque, cast back from int64_t
+                let result_is_ptr = is_ptr(Some(ty));
+                if result_is_ptr {
+                    wln!(self, "    {} = (void*)(intptr_t)({} {} {});", dst, l, cop, r);
+                } else {
+                    wln!(self, "    {} = {} {} {};", dst, l, cop, r);
+                }
             }
             Inst::UnaryOp { op, operand, ty: _ } => {
                 let o = self.val_name(*operand);
@@ -1494,7 +1510,8 @@ impl CCodeGen {
                                 // For other functions (e.g. FFI externs), pass as-is
                                 // to avoid breaking pointer-parameter calls.
                                 let is_varargs = fname == "p_thread_spawn" || fname == "p_executor_spawn";
-                                if is_varargs && matches!(arg_ty, IrType::Ptr(_) | IrType::Opaque(_) | IrType::Generic(_, _)) {
+                                let is_rc_func = fname == "p_rc_incr" || fname == "p_rc_decr";
+                                if (is_varargs || is_rc_func) && matches!(arg_ty, IrType::Ptr(_) | IrType::Opaque(_) | IrType::Generic(_, _)) {
                                     format!("(int64_t){}", base)
                                 } else {
                                     base
@@ -2023,6 +2040,8 @@ impl CCodeGen {
         wln!(self, "    if (!f) return -1;");
         wln!(self, "    fputs(content, f); fclose(f); return 0;");
         wln!(self, "}}");
+        wln!(self, "int64_t p_file_delete(const char* path) {{ return remove(path) == 0 ? 0 : -1; }}");
+        wln!(self, "int64_t p_file_size(const char* path) {{ FILE* f = fopen(path, \"rb\"); if (!f) return -1; fseek(f, 0, SEEK_END); int64_t sz = ftell(f); fclose(f); return sz; }}");
         // Environment variable builtins
         wln!(self, "char* p_getenv(const char* name) {{ return getenv(name); }}");
         // Command-line argument builtins — globals declared in emit_runtime_types
@@ -2291,6 +2310,14 @@ impl CCodeGen {
         wln!(self, "    return atomic_compare_exchange_strong((atomic_int_least64_t*)(intptr_t)addr, &expected, new_val);");
         wln!(self, "}");
         wln!(self, "int64_t p_atomic_add(int64_t addr, int64_t val) { return atomic_fetch_add((atomic_int_least64_t*)(intptr_t)addr, val); }");
+        wln!(self, "int64_t p_atomic_sub(int64_t addr, int64_t val) { return atomic_fetch_sub((atomic_int_least64_t*)(intptr_t)addr, val); }");
+        wln!(self, "int64_t p_rc_incr(int64_t rc_addr, int64_t val) { (*(int64_t*)(intptr_t)rc_addr)++; return val; }");
+        wln!(self, "void p_rc_decr(int64_t rc_addr, int64_t val) {");
+        wln!(self, "    (void)val;");
+        wln!(self, "    int64_t* rc = (int64_t*)(intptr_t)rc_addr;");
+        wln!(self, "    (*rc)--;");
+        wln!(self, "    if (*rc <= 0) { free((void*)(intptr_t)rc_addr); }");
+        wln!(self, "}");
         // Mutex — use pthread_mutex_t allocated on heap
         wln!(self, "int64_t p_mutex_init(void) {");
         wln!(self, "    pthread_mutex_t* m = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));");

@@ -1,5 +1,138 @@
 # Fides Language Changelog
 
+## Self-Hosting Blockers Phase (August 2026)
+
+### Self-Host Stdlib Gaps Filled
+
+All stdlib functions needed for self-hosting are now implemented:
+
+**String utilities** (`stdlib/core.fd`):
+- `str_bytes(s)` — iterate string as Vec of byte values
+- `str_from_bytes(bytes)` — build string from Vec of bytes
+- `str_slice(s, start, end)` — substring by byte range
+- `str_split(s, delim)` — split string returning Vec<str>
+- `str_split_char(s, delim)` — fast single-char split
+- `str_trim_start(s)` / `str_trim_end(s)` / `str_trim(s)` — whitespace trimming
+- `str_starts_with` / `str_ends_with` / `str_contains` / `str_find` / `str_rfind`
+- `str_replace` / `str_repeat` / `str_to_upper` / `str_to_lower`
+- `str_parse_int(s)` / `str_parse_hex(s)` / `str_parse_int_range(s, start, end)`
+- `str_len` / `str_is_empty` / `str_concat` / `str_compare` / `str_equal`
+- `str_byte_at(s, idx)` / `int_to_str(n)` / `byte_to_str(b)`
+
+**Binary file IO** (`stdlib/file.fd`):
+- `file_write_bytes(path, bytes)` — write Vec of bytes as binary
+- `file_read_bytes(path)` — read file as Vec of bytes
+- `file_write_raw(path, content)` — write string in binary mode
+- `file_delete(path)` — delete a file
+- `file_size(path)` — get file size in bytes
+
+**Runtime functions** (`src/interp.rs`, `src/codegen_c.rs`, `src/lower.rs`):
+- `p_file_delete(path)` — delete file (interpreter + C codegen)
+- `p_file_size(path)` — file size (interpreter + C codegen)
+
+**Test**: `tests/test_stdlib_selfhost.fd` — 10 tests covering all new functions,
+passing on interpreter and C codegen.
+
+### Typed Enum Payloads (Blocker 2)
+
+- Enum variant payloads now keep their declared type in `match` bindings
+  instead of collapsing to `i32`/`i64`.
+- `Node::Leaf(t: Token) => t.text` now works — field access on the binding
+  resolves correctly.
+- Typechecker: added `enum_variants` / `enum_type_params` maps,
+  `pattern_binding_types()` with type-param substitution from the scrutinee's
+  generic args, `resolve_pattern_enum()`, `is_type_param_name()`.
+- Lowerer: added `pattern_binding_ir_types()` so payload `Load` uses the real
+  IR type — aggregates as `Ptr(Struct(..))` instead of bare `I64`.
+- Test: `tests/test_enum_payload_types.fd`.
+
+### Real Generics at Value Level (Blocker 1)
+
+- `Vec<T>`, `HashMap<K,V>` now carry their actual element types from `let`
+  annotations instead of always defaulting to `i64`.
+- `pv v: Vec<Token> = Vec::new()` now works — the element type is picked up
+  from the annotation.
+- `Vec::get()` returns `Ptr(Struct(..))` for struct elements (via
+  `word_repr()`), enabling field access on retrieved elements.
+- Typechecker: `Vec::new()` / `HashMap::new()` honor the `let` type hint;
+  `types_compatible()` treats any two `Vec<X>` / `HashMap<K,V>` instantiations
+  as compatible (opaque at runtime).
+- Lowerer: added `let_hint` field threaded through `Stmt::Let`; `Stmt::Let`
+  alloca type follows the value's IR type when declared is aggregate but value
+  is a pointer.
+- Test: `tests/test_generic_vec_typed.fd`.
+
+### Recursive Types via Box<T> (Blocker 3)
+
+- `Box<T>` now works as a real indirection type, enabling recursive data
+  structures like ASTs.
+- `enum Expr { Num(i64), Add(Box<Expr>, Box<Expr>) }` compiles and runs
+  correctly, including recursive `eval` and `count_nodes` functions.
+- Lowerer: added `maybe_deref_box()` to the match lowerer — when the scrutinee
+  is a `Box<T>` (either `Ptr(Ptr(Struct(..)))` from `Box::new` or
+  `Generic("Box", [Struct(..)])` from a typed parameter), it loads through
+  the Box once to get the inner struct pointer before pattern matching.
+- Test: `tests/test_recursive_box.fd` — `(1+2)*(3+4)` = 21 with 7 nodes.
+
+### Test Baseline Update
+
+- Unit tests: 257 → 265 (8 new tests for S-1B incremental cache + S-1C parallelism).
+- Normal .fd tests: 104 → 137 (33 new tests, all pass on all 3 backends).
+- All 3 self-host blockers pass on interpreter, C codegen, and PE emitter.
+- Zero regressions.
+
+## Compiler Optimization Phase (August 2026)
+
+### LEA Instruction Selection (F-4C)
+
+- `gen_field_addr` and `gen_elem_addr` in `src/codegen_x64.rs` now emit `leaq`
+  for offset calculations instead of `shlq`+`addq` sequences.
+- Field access: `leaq off(base), dst`. Element access: `leaq (base, idx, scale), dst`.
+- Reduces instruction count for struct/array indexing.
+
+### Borrow-Based Alias Analysis (I-7A)
+
+- Added `BorrowKind` enum (Shared/Mutable/None) to `ValueMeta` in `src/ir.rs`.
+- Propagated through IR→L1→L2 lowering (`src/lower.rs`, `src/pir.rs`).
+- Alias analysis pass (`src/opt.rs`) uses `borrow_kinds` to determine that a
+  shared borrow cannot alias a mutable borrow, enabling more store-load
+  forwarding and code motion.
+- `borrow_non_aliasing()` helper integrated into Phase 1 (predecessor replay +
+  main loop) and Phase 2 (cross-region reordering) of alias analysis.
+
+### Linear Type Stack Promotion (I-6A)
+
+- Linear types promoted to stack slots, reducing heap allocation pressure.
+
+### x86-64 ABI Compliance (F-4A)
+
+- `gen_call_abi` in `src/codegen_x64.rs` handles the System V AMD64 ABI:
+  integer args in RDI/RSI/RDX/RCX/R8/R9, float args in XMM0-XMM7, struct
+  args by value, stack alignment to 16 bytes before calls.
+- `gen_prologue_abi` saves XMM argument registers for extern functions.
+- Old `gen_call` removed as dead code.
+
+### Incremental Compilation (S-1B)
+
+- New `src/inc.rs` module: in-memory `IncrementalCache` stores optimized L2
+  modules keyed by (source_path, source_hash, opt_flags).
+- `build_executable_with_lto()` checks the cache before running the full
+  pipeline; on a hit, skips IR lowering, L1→L2 lowering, and L2 optimization.
+- Global cache (`global_cache()`) shared across calls within a process,
+  benefiting LSP server, watch mode, and the test harness.
+- 7 unit tests in `inc.rs` verify store/get/clear/hash behavior.
+
+### Function-Level Parallelism (S-1C)
+
+- `parallel_functions()` helper in `src/opt.rs` uses `std::thread::scope` to
+  process function chunks in parallel across available CPU cores.
+- 19 of 22 optimization passes parallelized (all except `pass_inline`,
+  `pass_devirt`, `pass_partial_eval` which need cross-function info).
+- For modules with < 4 functions, runs sequentially to avoid thread overhead.
+- Fixed loop vectorizer cost model: correctly excludes condition recomputation
+  and induction variable instructions from cost calculation, and changed
+  profitability threshold from `benefit > cost * 1.5` to `benefit >= cost`.
+
 ## Tooling Ecosystem Phase (August 2026)
 
 ### Package Manager — pacte

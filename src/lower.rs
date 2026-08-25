@@ -122,6 +122,11 @@ pub struct Lowerer {
     /// I-6B: Set of @linear struct names (from typechecker).
     /// Used to mark ValueMeta.is_linear for alias analysis.
     linear_structs: std::collections::HashSet<String>,
+    /// Current `let` type hint — the declared type of the binding being
+    /// initialized, or None. Lets `Vec::new()` / `HashMap::new()` pick up
+    /// the element type from `pv v: Vec<Token> = Vec::new();` instead of
+    /// always defaulting to i64.
+    let_hint: Option<Type>,
 }
 
 impl Lowerer {
@@ -161,6 +166,7 @@ impl Lowerer {
             current_func_param_types: HashMap::new(),
             vec_allocas: std::collections::HashSet::new(),
             linear_structs: std::collections::HashSet::new(),
+            let_hint: None,
         }
     }
 
@@ -497,6 +503,10 @@ impl Lowerer {
         self.module.add_extern("p_file_write", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
         self.module.add_extern("p_file_exists", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Bool);
         self.module.add_extern("p_file_append", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
+        // p_file_delete(path: *u8) -> i64  — delete a file, returns 0 on success
+        self.module.add_extern("p_file_delete", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
+        // p_file_size(path: *u8) -> i64  — get file size in bytes, or -1
+        self.module.add_extern("p_file_size", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
 
         // ─── Phase 5D.4: Database driver framework ───
         let db_ty = IrType::Opaque("Database".to_string());
@@ -617,6 +627,12 @@ impl Lowerer {
         self.module.add_extern("p_atomic_cas", vec![IrType::I64, IrType::I64, IrType::I64], IrType::Bool);
         // p_atomic_add(addr: i64, val: i64) -> i64  — atomic fetch-and-add, returns old value
         self.module.add_extern("p_atomic_add", vec![IrType::I64, IrType::I64], IrType::I64);
+        // p_atomic_sub(addr: i64, val: i64) -> i64  — atomic fetch-and-sub, returns old value
+        self.module.add_extern("p_atomic_sub", vec![IrType::I64, IrType::I64], IrType::I64);
+        // p_rc_incr(rc_addr: i64, val: i64) -> i64  — non-atomic refcount increment, returns val
+        self.module.add_extern("p_rc_incr", vec![IrType::I64, IrType::I64], IrType::I64);
+        // p_rc_decr(rc_addr: i64, val: i64) -> void  — non-atomic refcount decrement, frees if zero
+        self.module.add_extern("p_rc_decr", vec![IrType::I64, IrType::I64], IrType::Void);
         // p_mutex_init() -> i64  — create a mutex, return handle
         self.module.add_extern("p_mutex_init", vec![], IrType::I64);
         // p_mutex_lock(m: i64) -> void  — lock a mutex (blocks if contended)
@@ -965,6 +981,156 @@ impl Lowerer {
         name.to_string()
     }
 
+    /// Look up the EnumDef a variant pattern refers to. `enum_name` may be
+    /// empty for shorthand patterns like `Some(x)`, in which case we search
+    /// all enums for a variant with that name.
+    fn lookup_pattern_enum(&self, enum_name: &str, variant: &str) -> Option<&EnumDef> {
+        if !enum_name.is_empty() {
+            let resolved = self.resolve_struct_name(enum_name);
+            if let Some(def) = self.enums.get(&resolved) {
+                return Some(def);
+            }
+            if let Some(def) = self.enums.get(enum_name) {
+                return Some(def);
+            }
+        }
+        self.enums.values().find(|def| def.variants.iter().any(|v| v.name == variant))
+    }
+
+    /// IR types for the values bound by an enum-variant pattern.
+    ///
+    /// Payload slots are one machine word wide, so aggregates (structs, enums,
+    /// Vec, ...) are stored as pointers. Returning the pointer type here — not
+    /// a bare I64 — is what lets field access and method calls on the binding
+    /// resolve, since the lowerer keys those off the value's IR type.
+    ///
+    /// Falls back to the pattern's explicit annotation, then I64.
+    fn pattern_binding_ir_types(
+        &self,
+        enum_name: &str,
+        variant: &str,
+        bindings: &[(String, String)],
+    ) -> Vec<IrType> {
+        let payload: Vec<Type> = self.lookup_pattern_enum(enum_name, variant)
+            .and_then(|def| def.variants.iter().find(|v| v.name == variant))
+            .and_then(|v| v.data.as_ref())
+            .map(|params| params.iter().map(|p| p.ty.clone()).collect())
+            .unwrap_or_default();
+
+        bindings.iter().enumerate().map(|(i, (_, annot))| {
+            // A payload declared as the enum's own type param carries no
+            // layout information — prefer the pattern's annotation instead.
+            let declared = payload.get(i).filter(|t| !self.is_opaque_type_param(t));
+            let ty = match declared {
+                Some(t) => Some(t.clone()),
+                None => self.ast_type_from_name(annot),
+            };
+            match ty {
+                Some(t) => Self::word_repr(self.lower_type(&t)),
+                None => IrType::I64,
+            }
+        }).collect()
+    }
+
+    /// Whether `ty` names a type parameter rather than a concrete type.
+    fn is_opaque_type_param(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Named(n) => {
+                !self.enums.contains_key(n)
+                    && self.module.get_struct(n).is_none()
+                    && !self.type_aliases.contains_key(n)
+                    && !matches!(n.as_str(), "Vec" | "HashMap" | "Tensor" | "Allocator")
+            }
+            _ => false,
+        }
+    }
+
+    /// Narrow an IR type to how it is represented in a single machine word.
+    /// Aggregates become pointers; scalars pass through unchanged.
+    fn word_repr(ty: IrType) -> IrType {
+        match ty {
+            IrType::Struct(_) | IrType::Array(_, _) => IrType::Ptr(Box::new(ty)),
+            other => other,
+        }
+    }
+
+    /// If `val` is a Box<T> (Ptr(Ptr(Struct(..)))), load through it once
+    /// so enum/struct pattern matching sees the inner struct pointer.
+    /// Otherwise return `val` unchanged.
+    fn maybe_deref_box(&mut self, val: ValueId) -> ValueId {
+        let ty = self.get_value_type(val);
+        // Box<T> arrives as either Ptr(Ptr(Struct(..))) (from Box::new) or
+        // Generic("Box", [Struct(..)]) (from a typed parameter). In both
+        // cases the runtime value is a pointer to a pointer to the inner
+        // struct, so we load through it once to get the struct pointer.
+        let inner_struct_ty = match &ty {
+            IrType::Ptr(inner) => {
+                match inner.as_ref() {
+                    IrType::Ptr(inner2) if inner2.is_aggregate() => Some((**inner).clone()),
+                    _ => None,
+                }
+            }
+            IrType::Generic(name, args) if name == "Box" => {
+                args.first().filter(|t| t.is_aggregate()).cloned()
+            }
+            _ => None,
+        };
+        if let Some(inner_ty) = inner_struct_ty {
+            // The Box stores a *pointer* to the struct (from the alloca),
+            // so the load type is Ptr(inner), not inner itself.
+            let load_ty = IrType::Ptr(Box::new(inner_ty));
+            let field_ptr = self.emit_inst(Inst::GetFieldPtr {
+                struct_ptr: val,
+                field_index: 0,
+                field_ty: load_ty.clone(),
+            });
+            return self.emit_inst(Inst::Load {
+                ptr: field_ptr,
+                ty: load_ty,
+            });
+        }
+        val
+    }
+
+    /// Whether two IR types have the same machine-word representation.
+    /// Used to decide if a `let` binding can use the declared type's IR type
+    /// or must fall back to the value's actual IR type.
+    fn ir_types_repr_compatible(a: &IrType, b: &IrType) -> bool {
+        a == b
+            || (a.is_scalar() && b.is_scalar())
+            || (a.is_ptr_like() && b.is_ptr_like())
+    }
+
+    /// Parse a type name as written in a pattern annotation into an AST type.
+    fn ast_type_from_name(&self, name: &str) -> Option<Type> {
+        if name.is_empty() {
+            return None;
+        }
+        let ty = match name {
+            "i8" => Type::I8,
+            "i16" => Type::I16,
+            "i32" => Type::I32,
+            "i64" => Type::I64,
+            "i128" => Type::I128,
+            "u8" => Type::U8,
+            "u16" => Type::U16,
+            "u32" => Type::U32,
+            "u64" => Type::U64,
+            "u128" => Type::U128,
+            "f32" => Type::F32,
+            "f64" => Type::F64,
+            "bool" => Type::Bool,
+            "str" => Type::Str,
+            other => Type::Named(other.to_string()),
+        };
+        // Unknown named types would lower to an unregistered struct — reject
+        // them so the caller falls back to I64.
+        if self.is_opaque_type_param(&ty) {
+            return None;
+        }
+        Some(ty)
+    }
+
     /// Resolve `Self` to the current impl's type name
     fn resolve_self_in_type(&self, ty: &Type) -> Type {
         match ty {
@@ -1015,10 +1181,26 @@ impl Lowerer {
         self.current_line = Some(stmt.line());
         match stmt {
             Stmt::Let { name, ty, expr, is_mut: _, is_persist, line: _ } => {
+                // Pass the declared type as a hint so Vec::new()/HashMap::new()
+                // can pick up the element type from the annotation.
+                let saved_hint = self.let_hint.take();
+                if let Some(t) = ty {
+                    self.let_hint = Some(self.resolve_self_in_type(t));
+                }
                 let val = self.lower_expr(expr);
-                let ir_ty = ty.as_ref().map(|t| self.lower_type(t)).unwrap_or_else(|| {
-                    self.get_value_type(val)
-                });
+                self.let_hint = saved_hint;
+                // The alloca type normally follows the declared type. But when
+                // the value is a pointer to a struct (e.g. from Vec_get) and
+                // the declared type is a struct, the value's pointer type must
+                // win — otherwise field access would treat the pointer as an
+                // inline struct value.
+                let val_ty = self.get_value_type(val);
+                let declared_ir = ty.as_ref().map(|t| self.lower_type(t));
+                let ir_ty = match (declared_ir, &val_ty) {
+                    (Some(d), v) if d.is_aggregate() && v.is_ptr() => v.clone(),
+                    (Some(d), _) => d,
+                    (None, _) => val_ty,
+                };
                 let alloca = self.emit_inst(Inst::Alloca {
                     ty: ir_ty.clone(),
                     region: self.current_region(),
@@ -1205,10 +1387,11 @@ impl Lowerer {
                     } else {
                         // Compound assignment: Vec_get, binop, Vec_set
                         let dummy_env2 = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                        let get_ret_ty = Self::word_repr(elem_ty.clone());
                         let current = self.emit_inst(Inst::Call {
                             func: "Vec_get".to_string(),
                             args: vec![dummy_env2, arr_val, idx_val],
-                            ret_ty: elem_ty.clone(),
+                            ret_ty: get_ret_ty.clone(),
                             effects: EffectSet::new(),
                         });
                         let rhs = self.lower_expr(expr);
@@ -2007,10 +2190,11 @@ impl Lowerer {
         self.set_current_block(body_block);
         let cur_idx = self.emit_inst(Inst::Load { ptr: idx_alloca, ty: IrType::I64 });
         let dummy_env2 = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+        let get_ret_ty = Self::word_repr(elem_ty.clone());
         let elem_val = self.emit_inst(Inst::Call {
             func: "Vec_get".to_string(),
             args: vec![dummy_env2, vec_val, cur_idx],
-            ret_ty: elem_ty.clone(),
+            ret_ty: get_ret_ty,
             effects: EffectSet::new(),
         });
         self.emit_inst(Inst::Store { ptr: var_alloca, value: elem_val, store_ty: None });
@@ -2146,6 +2330,9 @@ impl Lowerer {
     /// Lower a match statement (lowered to if/else chains)
     fn lower_match(&mut self, expr: &Expr, arms: &[MatchArm]) {
         let match_val = self.lower_expr(expr);
+        // If the scrutinee is a Box<T> (pointer to pointer to struct),
+        // dereference it once so enum/struct patterns see the inner value.
+        let match_val = self.maybe_deref_box(match_val);
 
         let merge_block = self.new_block();
 
@@ -2259,13 +2446,15 @@ impl Lowerer {
                     });
                     // Bind data fields in the match block
                     self.set_current_block(match_block);
+                    let binding_tys = self.pattern_binding_ir_types(enum_name, variant, bindings);
                     for (i, (binding, _ty_name)) in bindings.iter().enumerate() {
+                        let field_ty = binding_tys.get(i).cloned().unwrap_or(IrType::I64);
                         let field_ptr = self.emit_inst(Inst::GetFieldPtr {
                             struct_ptr: match_val,
                             field_index: (i + 1) as u32,
-                            field_ty: IrType::I64,
+                            field_ty: field_ty.clone(),
                         });
-                        let field_val = self.emit_inst(Inst::Load { ptr: field_ptr, ty: IrType::I64 });
+                        let field_val = self.emit_inst(Inst::Load { ptr: field_ptr, ty: field_ty });
                         if let Some(ref mut f) = self.current_func {
                             f.bind_local(binding, field_val);
                         }
@@ -2323,6 +2512,9 @@ impl Lowerer {
     /// Lower a match expression — stores arm result into result_slot
     fn lower_match_expr(&mut self, expr: &Expr, arms: &[MatchArm], result_slot: ValueId) {
         let match_val = self.lower_expr(expr);
+        // If the scrutinee is a Box<T> (pointer to pointer to struct),
+        // dereference it once so enum/struct patterns see the inner value.
+        let match_val = self.maybe_deref_box(match_val);
         let merge_block = self.new_block();
 
         for arm in arms {
@@ -2385,9 +2577,11 @@ impl Lowerer {
                     let cmp = self.emit_inst(Inst::BinOp { op: BinOp::Eq, left: tag, right: expected, ty: IrType::Bool });
                     self.emit_terminator(Inst::Branch { cond: cmp, then: match_block, else_: next_arm_block });
                     self.set_current_block(match_block);
+                    let binding_tys = self.pattern_binding_ir_types(enum_name, variant, bindings);
                     for (i, (binding, _ty_name)) in bindings.iter().enumerate() {
-                        let field_ptr = self.emit_inst(Inst::GetFieldPtr { struct_ptr: match_val, field_index: (i + 1) as u32, field_ty: IrType::I64 });
-                        let field_val = self.emit_inst(Inst::Load { ptr: field_ptr, ty: IrType::I64 });
+                        let field_ty = binding_tys.get(i).cloned().unwrap_or(IrType::I64);
+                        let field_ptr = self.emit_inst(Inst::GetFieldPtr { struct_ptr: match_val, field_index: (i + 1) as u32, field_ty: field_ty.clone() });
+                        let field_val = self.emit_inst(Inst::Load { ptr: field_ptr, ty: field_ty });
                         if let Some(ref mut f) = self.current_func {
                             f.bind_local(binding, field_val);
                         }
@@ -2800,6 +2994,63 @@ impl Lowerer {
                         self.emit_inst(Inst::Store { ptr, value: val, store_ty: None });
                         return ptr;
                     }
+                    // Rc::new(x) — allocate [refcount:i64 | value:T], return ptr to value
+                    if name == "Rc" && method == "new" {
+                        let val = self.lower_expr(&args[0]);
+                        let val_ty = self.get_value_type(val);
+                        let val_size = self.module.type_size(&val_ty) as i64;
+                        // Total = refcount (8 bytes) + value
+                        let total = val_size + 8;
+                        let size_val = self.emit_inst(Inst::ConstInt { value: total, ty: IrType::I64 });
+                        let raw_ptr = self.emit_inst(Inst::Call {
+                            func: "p_malloc".to_string(),
+                            args: vec![size_val],
+                            ret_ty: IrType::Ptr(Box::new(IrType::U8)),
+                            effects: {
+                                let mut e = EffectSet::new();
+                                e.add(Effect::Alloc);
+                                e
+                            },
+                        });
+                        // Store refcount = 1 at offset 0
+                        let one = self.emit_inst(Inst::ConstInt { value: 1, ty: IrType::I64 });
+                        self.emit_inst(Inst::Store { ptr: raw_ptr, value: one, store_ty: None });
+                        // Value pointer = raw_ptr + 8
+                        let eight = self.emit_inst(Inst::ConstInt { value: 8, ty: IrType::I64 });
+                        let rc_ty = IrType::Opaque("Rc".to_string());
+                        let val_ptr = self.emit_inst(Inst::BinOp { op: BinOp::Add, left: raw_ptr, right: eight, ty: rc_ty.clone() });
+                        // Store the value at val_ptr
+                        let typed_ptr = self.emit_inst(Inst::BitCast { value: val_ptr, from: rc_ty.clone(), to: IrType::Ptr(Box::new(val_ty.clone())) });
+                        self.emit_inst(Inst::Store { ptr: typed_ptr, value: val, store_ty: None });
+                        // Return the value pointer (user never sees the refcount header)
+                        return val_ptr;
+                    }
+                    // Arc::new(x) — same layout as Rc, but uses atomic increment/decrement
+                    if name == "Arc" && method == "new" {
+                        let val = self.lower_expr(&args[0]);
+                        let val_ty = self.get_value_type(val);
+                        let val_size = self.module.type_size(&val_ty) as i64;
+                        let total = val_size + 8;
+                        let size_val = self.emit_inst(Inst::ConstInt { value: total, ty: IrType::I64 });
+                        let raw_ptr = self.emit_inst(Inst::Call {
+                            func: "p_malloc".to_string(),
+                            args: vec![size_val],
+                            ret_ty: IrType::Ptr(Box::new(IrType::U8)),
+                            effects: {
+                                let mut e = EffectSet::new();
+                                e.add(Effect::Alloc);
+                                e
+                            },
+                        });
+                        let one = self.emit_inst(Inst::ConstInt { value: 1, ty: IrType::I64 });
+                        self.emit_inst(Inst::Store { ptr: raw_ptr, value: one, store_ty: None });
+                        let eight = self.emit_inst(Inst::ConstInt { value: 8, ty: IrType::I64 });
+                        let arc_ty = IrType::Opaque("Arc".to_string());
+                        let val_ptr = self.emit_inst(Inst::BinOp { op: BinOp::Add, left: raw_ptr, right: eight, ty: arc_ty.clone() });
+                        let typed_ptr = self.emit_inst(Inst::BitCast { value: val_ptr, from: arc_ty.clone(), to: IrType::Ptr(Box::new(val_ty.clone())) });
+                        self.emit_inst(Inst::Store { ptr: typed_ptr, value: val, store_ty: None });
+                        return val_ptr;
+                    }
                 }
                 // Check if this is Vec::new() — Phase 10B: now calls Fides implementation
                 if let Expr::Ident(name) = receiver.as_ref() {
@@ -2906,6 +3157,55 @@ impl Lowerer {
                 // Regular method call: receiver is a value, pass as first arg
                 let recv_val = self.lower_expr(receiver);
 
+                // Rc<T> / Arc<T> method dispatch — refcount operations
+                let recv_ty = self.get_value_type(recv_val);
+                if recv_ty.is_opaque_named("Rc") || recv_ty.is_opaque_named("Arc") {
+                    let is_arc = recv_ty.is_opaque_named("Arc");
+                    let elem_ty = recv_ty.generic_elem().cloned().unwrap_or(IrType::I64);
+                    let elem_ptr = Self::word_repr(elem_ty.clone());
+                    match method.as_str() {
+                        "clone" => {
+                            // Increment refcount at ptr-8, return same ptr
+                            let eight = self.emit_inst(Inst::ConstInt { value: 8, ty: IrType::I64 });
+                            let rc_addr = self.emit_inst(Inst::BinOp { op: BinOp::Sub, left: recv_val, right: eight, ty: IrType::I64 });
+                            // Both Rc and Arc use p_rc_incr at the IR level.
+                            // The C codegen implements p_rc_incr with atomic ops for Arc
+                            // (detected via the function name convention).
+                            let ret_ty = if is_arc { IrType::Opaque("Arc".to_string()) } else { IrType::Opaque("Rc".to_string()) };
+                            return self.emit_inst(Inst::Call {
+                                func: "p_rc_incr".to_string(),
+                                args: vec![rc_addr, recv_val],
+                                ret_ty,
+                                effects: EffectSet::new(),
+                            });
+                        }
+                        "drop" => {
+                            // Decrement refcount at ptr-8, free if zero
+                            let eight = self.emit_inst(Inst::ConstInt { value: 8, ty: IrType::I64 });
+                            let rc_addr = self.emit_inst(Inst::BinOp { op: BinOp::Sub, left: recv_val, right: eight, ty: IrType::I64 });
+                            return self.emit_inst(Inst::Call {
+                                func: "p_rc_decr".to_string(),
+                                args: vec![rc_addr, recv_val],
+                                ret_ty: IrType::Void,
+                                effects: EffectSet::new(),
+                            });
+                        }
+                        "get" => {
+                            // Load value from the pointer
+                            let typed_ptr = self.emit_inst(Inst::BitCast { value: recv_val, from: IrType::I64, to: IrType::Ptr(Box::new(elem_ty.clone())) });
+                            return self.emit_inst(Inst::Load { ptr: typed_ptr, ty: elem_ptr });
+                        }
+                        "count" => {
+                            // Load refcount from ptr-8
+                            let eight = self.emit_inst(Inst::ConstInt { value: 8, ty: IrType::I64 });
+                            let rc_addr = self.emit_inst(Inst::BinOp { op: BinOp::Sub, left: recv_val, right: eight, ty: IrType::I64 });
+                            let rc_ptr = self.emit_inst(Inst::BitCast { value: rc_addr, from: IrType::I64, to: IrType::Ptr(Box::new(IrType::I64)) });
+                            return self.emit_inst(Inst::Load { ptr: rc_ptr, ty: IrType::I64 });
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Builtin collection method dispatch
                 let recv_ty = self.get_value_type(recv_val);
                 let is_builtin_collection = recv_ty.is_opaque_named("Vec")
@@ -2923,21 +3223,25 @@ impl Lowerer {
                         runtime_args.insert(0, dummy_env);
                         // Element type from Generic args, default to I64
                         let elem_ty = recv_ty.generic_elem().cloned().unwrap_or(IrType::I64);
+                        // Vec_get/pop/first/last/remove return a pointer when
+                        // the element is a struct (the runtime stores structs
+                        // by reference). Wrap it so field access works.
+                        let elem_ptr = Self::word_repr(elem_ty.clone());
                         let rt = match method.as_str() {
                             "push" => IrType::Void,
-                            "pop" => elem_ty.clone(),
+                            "pop" => elem_ptr.clone(),
                             "len" => IrType::I64,
                             "is_empty" => IrType::Bool,
-                            "get" => elem_ty.clone(),
+                            "get" => elem_ptr.clone(),
                             "set" => IrType::Void,
                             "clear" => IrType::Void,
                             "capacity" => IrType::I64,
                             "insert" => IrType::Void,
-                            "remove" => elem_ty.clone(),
+                            "remove" => elem_ptr.clone(),
                             "contains" => IrType::Bool,
                             "reverse" => IrType::Void,
-                            "first" => elem_ty.clone(),
-                            "last" => elem_ty.clone(),
+                            "first" => elem_ptr.clone(),
+                            "last" => elem_ptr.clone(),
                             "extend" => IrType::Void,
                             "truncate" => IrType::Void,
                             "sort" => IrType::Void,
@@ -3443,7 +3747,7 @@ impl Lowerer {
                     return self.emit_inst(Inst::Call {
                         func: "Vec_get".to_string(),
                         args: vec![dummy_env, arr_val, idx_val],
-                        ret_ty: elem_ty,
+                        ret_ty: Self::word_repr(elem_ty),
                         effects: EffectSet::new(),
                     });
                 }
@@ -4852,20 +5156,31 @@ impl Lowerer {
     }
 
     /// Infer the element type for Vec::new() based on the current context.
-    /// Since the typechecker already resolved the type, we default to I64
-    /// (the most common element type) but could be extended to use type
-    /// annotations from the AST.
+    /// Uses the `let` hint (`pv v: Vec<Token> = Vec::new();`) when available,
+    /// otherwise defaults to I64.
     fn infer_vec_elem_type(&self) -> IrType {
-        // Default to I64 — the typechecker hardcodes Vec<i64> for Vec::new()
-        // Future: infer from type annotations or first push() call
+        if let Some(Type::Generic { name, args }) = &self.let_hint {
+            if name == "Vec" {
+                if let Some(elem) = args.first() {
+                    return self.lower_type(elem);
+                }
+            }
+        }
         IrType::I64
     }
 
     /// Infer key and value types for HashMap::new() based on the current context.
-    /// Returns (key_type, value_type).
+    /// Returns (key_type, value_type). Uses the `let` hint when available.
     fn infer_map_types(&self) -> (IrType, IrType) {
-        // Default to (String, I64) — the typechecker hardcodes HashMap<String, i64>
-        // Future: infer from type annotations or first insert() call
+        if let Some(Type::Generic { name, args }) = &self.let_hint {
+            if name == "HashMap" {
+                let key = args.first().map(|t| self.lower_type(t))
+                    .unwrap_or(IrType::Opaque("String".to_string()));
+                let val = args.get(1).map(|t| self.lower_type(t))
+                    .unwrap_or(IrType::I64);
+                return (key, val);
+            }
+        }
         (IrType::Opaque("String".to_string()), IrType::I64)
     }
 

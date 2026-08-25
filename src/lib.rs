@@ -32,6 +32,7 @@ pub mod elf64;
 pub mod coff;
 pub mod macho;
 pub mod hotreload;
+pub mod inc;
 pub mod linker;
 pub mod runtime_linux;
 pub mod runtime_arm64;

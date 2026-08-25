@@ -323,6 +323,10 @@ pub struct Interpreter {
     trace: Vec<TraceEntry>,
     /// Whether to record a trace (for record/replay debugging)
     recording: bool,
+    /// Profiling mode — when enabled, tracks per-function call count and time.
+    profile_mode: bool,
+    /// Per-function profiling data: (call_count, total_time_ns)
+    profile_data: HashMap<String, (u64, u64)>,
 }
 
 /// Action returned by the debug hook
@@ -414,6 +418,8 @@ impl Interpreter {
             debug_hook: None,
             trace: Vec::new(),
             recording: false,
+            profile_mode: false,
+            profile_data: HashMap::new(),
         };
         // Pre-allocate string constants
         interp.init_strings();
@@ -436,6 +442,22 @@ impl Interpreter {
     pub fn enable_recording(&mut self) {
         self.recording = true;
         self.trace.clear();
+    }
+
+    /// Enable profiling mode — tracks per-function call count and time.
+    pub fn enable_profiling(&mut self) {
+        self.profile_mode = true;
+        self.profile_data.clear();
+    }
+
+    /// Get profiling results as a sorted list of (function_name, call_count, total_ns).
+    /// Sorted by total time descending (hottest functions first).
+    pub fn get_profile(&self) -> Vec<(String, u64, u64)> {
+        let mut results: Vec<(String, u64, u64)> = self.profile_data.iter()
+            .map(|(name, (count, ns))| (name.clone(), *count, *ns))
+            .collect();
+        results.sort_by(|a, b| b.2.cmp(&a.2));
+        results
     }
 
     /// Get the recorded trace (for record/replay debugging).
@@ -669,9 +691,23 @@ impl Interpreter {
 
     /// Run a specific function with arguments
     fn run_function(&mut self, func: &IrFunction, args: &[Value]) -> RunResult {
+        let profile_start = if self.profile_mode {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let func_name = func.name.clone();
         let saved_func_name = self.current_func_name.clone();
         self.current_func_name = func.name.clone();
         self.call_stack.push(func.name.clone());
+        macro_rules! record_profile { () => {{
+            if let Some(start) = profile_start {
+                let elapsed = start.elapsed().as_nanos() as u64;
+                let entry = self.profile_data.entry(func_name.clone()).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 += elapsed;
+            }
+        }}}
         // Build value table for this function
         let mut values: HashMap<ValueId, Value> = HashMap::new();
 
@@ -768,6 +804,7 @@ impl Interpreter {
                     match action {
                         DebugAction::Continue | DebugAction::Pause => {}
                         DebugAction::InjectReturn(v) => {
+                            record_profile!();
                             self.current_func_name = saved_func_name;
                             self.call_stack.pop();
                             return RunResult::Return(v);
@@ -777,6 +814,7 @@ impl Interpreter {
                                 let trace = self.format_call_stack();
                                 self.panic_stack_trace = Some(trace);
                             }
+                            record_profile!();
                             self.current_func_name = saved_func_name;
                             self.call_stack.pop();
                             return RunResult::Panic(msg);
@@ -794,6 +832,7 @@ impl Interpreter {
                         break;
                     }
                     ExecOutcome::Return(val) => {
+                        record_profile!();
                         self.current_func_name = saved_func_name;
                         self.call_stack.pop();
                         return RunResult::Return(val);
@@ -810,6 +849,7 @@ impl Interpreter {
                             self.memory = mem_snap;
                             self.opaque_values = opaque_snap;
                         }
+                        record_profile!();
                         self.current_func_name = saved_func_name;
                         self.call_stack.pop();
                         return RunResult::Panic(msg);
@@ -823,6 +863,7 @@ impl Interpreter {
                 }
                 None => {
                     // No terminator found — return void
+                    record_profile!();
                     self.current_func_name = saved_func_name;
                     self.call_stack.pop();
                     return RunResult::Return(Value::Void);
@@ -3429,6 +3470,30 @@ impl Interpreter {
                 }
                 ExecOutcome::Value(Value::Int(-1))
             }
+            "p_file_delete" => {
+                if let Some(path_arg) = args.get(0) {
+                    let path_str = self.value_to_string(path_arg);
+                    if !path_str.is_empty() {
+                        match std::fs::remove_file(&path_str) {
+                            Ok(_) => return ExecOutcome::Value(Value::Int(0)),
+                            Err(_) => return ExecOutcome::Value(Value::Int(-1)),
+                        }
+                    }
+                }
+                ExecOutcome::Value(Value::Int(-1))
+            }
+            "p_file_size" => {
+                if let Some(path_arg) = args.get(0) {
+                    let path_str = self.value_to_string(path_arg);
+                    if !path_str.is_empty() {
+                        match std::fs::metadata(&path_str) {
+                            Ok(m) => return ExecOutcome::Value(Value::Int(m.len() as i64)),
+                            Err(_) => return ExecOutcome::Value(Value::Int(-1)),
+                        }
+                    }
+                }
+                ExecOutcome::Value(Value::Int(-1))
+            }
 
             // ─── Phase 5A.3: Interrupt handler builtins (bare-metal) ───
             "p_cli" => {
@@ -4216,6 +4281,55 @@ impl Interpreter {
                 let old = shared.get(&addr).copied().unwrap_or(0);
                 shared.insert(addr, old + val);
                 ExecOutcome::Value(Value::Int(old))
+            }
+            "p_atomic_sub" => {
+                // p_atomic_sub(addr: i64, val: i64) -> i64 (returns old value)
+                let addr = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let val = match args.get(1) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let mut shared = self.shared_memory.lock().unwrap();
+                let old = shared.get(&addr).copied().unwrap_or(0);
+                shared.insert(addr, old - val);
+                ExecOutcome::Value(Value::Int(old))
+            }
+            "p_rc_incr" => {
+                // p_rc_incr(rc_addr: i64, val: i64) -> i64
+                // Increment refcount stored at rc_addr in heap memory, return val.
+                let rc_addr = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    Some(Value::Ptr(a)) => *a as i64,
+                    _ => 0,
+                };
+                let val = match args.get(1) {
+                    Some(Value::Int(n)) => *n,
+                    Some(Value::Ptr(a)) => *a as i64,
+                    _ => 0,
+                };
+                let bytes = self.memory.load(rc_addr as u64, 8);
+                let count = i64::from_le_bytes(bytes.try_into().unwrap_or([0u8; 8]));
+                self.memory.store(rc_addr as u64, &(count + 1).to_le_bytes());
+                ExecOutcome::Value(Value::Int(val))
+            }
+            "p_rc_decr" => {
+                // p_rc_decr(rc_addr: i64, val: i64) -> void
+                // Decrement refcount at rc_addr. If it reaches 0, free the block
+                // (rc_addr - 0 is the raw allocation start since refcount is at offset 0).
+                let rc_addr = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    Some(Value::Ptr(a)) => *a as i64,
+                    _ => 0,
+                };
+                let bytes = self.memory.load(rc_addr as u64, 8);
+                let count = i64::from_le_bytes(bytes.try_into().unwrap_or([0u8; 8]));
+                let new_count = count - 1;
+                self.memory.store(rc_addr as u64, &new_count.to_le_bytes());
+                // Interpreter doesn't actually free — memory is arena-based
+                ExecOutcome::Value(Value::Void)
             }
 
             // ─── Phase 8A: Mutex ───

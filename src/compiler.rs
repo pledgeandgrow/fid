@@ -1359,25 +1359,54 @@ pub fn build_executable(source: &str, source_path: &str, target: &str, do_opt: b
 /// Build a native executable with optional LTO (Link-Time Optimization).
 /// LTO mode uses more aggressive inline limits for cross-module inlining.
 pub fn build_executable_with_lto(source: &str, source_path: &str, target: &str, do_opt: bool, do_lto: bool, granted_caps: Option<&[String]>) -> Result<Vec<u8>, Vec<String>> {
-    let program = build_program_with_path(source, Some(source_path))?;
-    let mut module = lower::lower(&program);
+    // S-1B: Incremental compilation — try to reuse a cached L2 module when the
+    // source content hasn't changed. This skips parse/typecheck/lower/optimize.
+    // The cache key incorporates the opt/lto flags so that compiling the same
+    // source with different optimization settings doesn't return a stale L2.
+    let mut source_hash = crate::inc::hash_source(source);
+    source_hash ^= (do_opt as u64).wrapping_shl(1) ^ (do_lto as u64);
+    let cache = crate::inc::global_cache();
+    let cached_l2 = cache.get(source_path, source_hash);
 
-    // Autograd pass: process grad blocks, generate backward code
-    autograd::process_module(&mut module);
+    let (l2, module) = if let Some(cached) = cached_l2 {
+        // Cache hit: reuse the cached (already-optimized) L2 module.
+        // We still need an IR module for L2→L3 lowering (type info, extern decls).
+        // Re-parse is cheap relative to optimization; in future we can cache the
+        // IR module too. For now, only skip the expensive optimization pass.
+        let program = build_program_with_path(source, Some(source_path))?;
+        let mut module = lower::lower(&program);
+        autograd::process_module(&mut module);
+        if let Some(caps) = granted_caps {
+            strip_ungranted_caps(&mut module, caps);
+        }
+        (cached, module)
+    } else {
+        // Cache miss: full pipeline.
+        let program = build_program_with_path(source, Some(source_path))?;
+        let mut module = lower::lower(&program);
 
-    // F5: Capability-aware linking — strip functions requiring ungranted capabilities
-    if let Some(caps) = granted_caps {
-        strip_ungranted_caps(&mut module, caps);
-    }
+        // Autograd pass: process grad blocks, generate backward code
+        autograd::process_module(&mut module);
 
-    let l1 = pir::lower_ir_to_l1(&module);
-    let mut l2 = pir::lower_l1_to_l2(&l1);
+        // F5: Capability-aware linking — strip functions requiring ungranted capabilities
+        if let Some(caps) = granted_caps {
+            strip_ungranted_caps(&mut module, caps);
+        }
 
-    if do_lto {
-        let _ = crate::opt::optimize_l2_lto(&mut l2);
-    } else if do_opt {
-        let _ = crate::opt::optimize_l2(&mut l2);
-    }
+        let l1 = pir::lower_ir_to_l1(&module);
+        let mut l2 = pir::lower_l1_to_l2(&l1);
+
+        if do_lto {
+            let _ = crate::opt::optimize_l2_lto(&mut l2);
+        } else if do_opt {
+            let _ = crate::opt::optimize_l2(&mut l2);
+        }
+
+        // Store the optimized L2 in the cache for future reuse.
+        cache.store(source_path, source_hash, l2.clone());
+
+        (l2, module)
+    };
 
     let l3 = pir::lower_l2_to_l3(&l2, &module);
 

@@ -2239,3 +2239,312 @@ impl ByteBuffer {
         ret result;
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Self-host stdlib gaps — string/byte/parsing utilities needed by the
+// lexer, parser, and typechecker when rewritten in Fides.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Iterate over the bytes of a string, returning a Vec of byte values.
+/// Usage: `pv bytes = str_bytes("hello");  // [104, 101, 108, 108, 111]`
+pub pf str_bytes(s: str) -> Vec {
+    pv result: Vec = Vec::new();
+    pv slen: i64 = String_len(s);
+    pv i: i64 = 0;
+    while i < slen {
+        pv addr: i64 = s + i;
+        pv ptr: *mut u8 = addr;
+        pv b: i64 = 0;
+        unsafe { b = *ptr; }
+        result.push(b);
+        i = i + 1;
+    }
+    ret result;
+}
+
+/// Build a string from a Vec of byte values.
+pub pf str_from_bytes(bytes: Vec) -> str {
+    pv result: str = "";
+    pv i: i64 = 0;
+    pv n: i64 = bytes.len();
+    while i < n {
+        result = p_str_concat(result, p_char_to_str(bytes.get(i)));
+        i = i + 1;
+    }
+    ret result;
+}
+
+/// Get a substring by byte range [start, end).
+pub pf str_slice(s: str, start: i64, end: i64) -> str {
+    pv slen: i64 = String_len(s);
+    pv s0: i64 = start;
+    pv e0: i64 = end;
+    if s0 < 0 { s0 = 0; }
+    if e0 > slen { e0 = slen; }
+    if s0 >= e0 { ret ""; }
+    ret String_slice(s, s0, e0);
+}
+
+/// Check if a string starts with a prefix.
+pub pf str_starts_with(s: str, prefix: str) -> bool {
+    ret String_starts_with(s, prefix);
+}
+
+/// Check if a string ends with a suffix.
+pub pf str_ends_with(s: str, suffix: str) -> bool {
+    ret String_ends_with(s, suffix);
+}
+
+/// Check if a string contains a substring.
+pub pf str_contains(s: str, sub: str) -> bool {
+    ret String_contains(s, sub);
+}
+
+/// Find the first index of a substring, or -1 if not found.
+pub pf str_find(s: str, sub: str) -> i64 {
+    ret String_find(s, sub);
+}
+
+/// Find the last index of a substring, or -1 if not found.
+pub pf str_rfind(s: str, sub: str) -> i64 {
+    ret String_rfind(s, sub);
+}
+
+/// Trim leading whitespace from a string.
+pub pf str_trim_start(s: str) -> str {
+    pv slen: i64 = String_len(s);
+    pv i: i64 = 0;
+    while i < slen {
+        pv addr: i64 = s + i;
+        pv ptr: *mut u8 = addr;
+        pv b: i64 = 0;
+        unsafe { b = *ptr; }
+        if !char_is_whitespace(b) { break; }
+        i = i + 1;
+    }
+    if i >= slen { ret ""; }
+    ret String_slice(s, i, slen);
+}
+
+/// Trim trailing whitespace from a string.
+pub pf str_trim_end(s: str) -> str {
+    pv slen: i64 = String_len(s);
+    pv end: i64 = slen;
+    while end > 0 {
+        pv addr: i64 = s + end - 1;
+        pv ptr: *mut u8 = addr;
+        pv b: i64 = 0;
+        unsafe { b = *ptr; }
+        if !char_is_whitespace(b) { break; }
+        end = end - 1;
+    }
+    if end <= 0 { ret ""; }
+    ret String_slice(s, 0, end);
+}
+
+/// Trim both leading and trailing whitespace.
+pub pf str_trim(s: str) -> str {
+    ret String_trim(s);
+}
+
+/// Split a string by delimiter, returning a Vec of string parts.
+pub pf str_split(s: str, delim: str) -> Vec {
+    pv result: Vec = Vec::new();
+    if String_len(delim) == 0 {
+        result.push(s);
+        ret result;
+    }
+    pv start: i64 = 0;
+    pv s_len: i64 = String_len(s);
+    pv dlen: i64 = String_len(delim);
+    pv pos: i64 = 0;
+    while pos <= s_len - dlen {
+        pv matched: bool = true;
+        pv j: i64 = 0;
+        while j < dlen {
+            pv s_addr: i64 = s + pos + j;
+            pv d_addr: i64 = delim + j;
+            pv s_ptr: *mut u8 = s_addr;
+            pv d_ptr: *mut u8 = d_addr;
+            pv sb: i64 = 0;
+            pv db: i64 = 0;
+            unsafe { sb = *s_ptr; db = *d_ptr; }
+            if sb != db { matched = false; break; }
+            j = j + 1;
+        }
+        if matched {
+            result.push(String_slice(s, start, pos));
+            start = pos + dlen;
+            pos = start;
+        } else {
+            pos = pos + 1;
+        }
+    }
+    result.push(String_slice(s, start, s_len));
+    ret result;
+}
+
+/// Split a string by a single character delimiter, returning a Vec of parts.
+/// Faster than str_split for single-char delimiters.
+pub pf str_split_char(s: str, delim: i64) -> Vec {
+    pv result: Vec = Vec::new();
+    pv start: i64 = 0;
+    pv s_len: i64 = String_len(s);
+    pv i: i64 = 0;
+    while i < s_len {
+        pv addr: i64 = s + i;
+        pv ptr: *mut u8 = addr;
+        pv b: i64 = 0;
+        unsafe { b = *ptr; }
+        if b == delim {
+            result.push(String_slice(s, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    result.push(String_slice(s, start, s_len));
+    ret result;
+}
+
+/// Replace all occurrences of `from` with `to` in a string.
+pub pf str_replace(s: str, from: str, to: str) -> str {
+    ret String_replace(s, from, to);
+}
+
+/// Repeat a string n times.
+pub pf str_repeat(s: str, n: i64) -> str {
+    ret String_repeat(s, n);
+}
+
+/// Convert a string to uppercase.
+pub pf str_to_upper(s: str) -> str {
+    ret String_to_uppercase(s);
+}
+
+/// Convert a string to lowercase.
+pub pf str_to_lower(s: str) -> str {
+    ret String_to_lowercase(s);
+}
+
+/// Parse a decimal integer from a string. Returns 0 on failure.
+pub pf str_parse_int(s: str) -> i64 {
+    ret String_parse_int(s);
+}
+
+/// Parse a hexadecimal integer from a string. Supports optional "0x" prefix.
+/// Returns 0 on failure.
+pub pf str_parse_hex(s: str) -> i64 {
+    pv slen: i64 = String_len(s);
+    if slen == 0 { ret 0; }
+    pv i: i64 = 0;
+    pv result: i64 = 0;
+    pv negative: bool = false;
+    // Skip leading whitespace
+    while i < slen {
+        pv addr: i64 = s + i;
+        pv ptr: *mut u8 = addr;
+        pv b: i64 = 0;
+        unsafe { b = *ptr; }
+        if !char_is_whitespace(b) { break; }
+        i = i + 1;
+    }
+    if i >= slen { ret 0; }
+    // Check sign
+    pv addr0: i64 = s + i;
+    pv ptr0: *mut u8 = addr0;
+    pv c0: i64 = 0;
+    unsafe { c0 = *ptr0; }
+    if c0 == 45 { negative = true; i = i + 1; }
+    else if c0 == 43 { i = i + 1; }
+    // Check for 0x prefix
+    if i + 1 < slen {
+        pv a1: i64 = s + i;
+        pv p1: *mut u8 = a1;
+        pv c1: i64 = 0;
+        unsafe { c1 = *p1; }
+        pv a2: i64 = s + i + 1;
+        pv p2: *mut u8 = a2;
+        pv c2: i64 = 0;
+        unsafe { c2 = *p2; }
+        if c1 == 48 && (c2 == 120 || c2 == 88) { i = i + 2; }
+    }
+    // Parse hex digits
+    while i < slen {
+        pv addr: i64 = s + i;
+        pv ptr: *mut u8 = addr;
+        pv b: i64 = 0;
+        unsafe { b = *ptr; }
+        pv digit: i64 = -1;
+        if b >= 48 && b <= 57 { digit = b - 48; }
+        else if b >= 65 && b <= 70 { digit = b - 55; }
+        else if b >= 97 && b <= 102 { digit = b - 87; }
+        else { break; }
+        result = result * 16 + digit;
+        i = i + 1;
+    }
+    if negative { result = 0 - result; }
+    ret result;
+}
+
+/// Parse an integer from a substring [start, end) of a string.
+/// Useful for the lexer which has already extracted digit positions.
+pub pf str_parse_int_range(s: str, start: i64, end: i64) -> i64 {
+    pv slen: i64 = String_len(s);
+    pv s0: i64 = start;
+    pv e0: i64 = end;
+    if s0 < 0 { s0 = 0; }
+    if e0 > slen { e0 = slen; }
+    if s0 >= e0 { ret 0; }
+    pv result: i64 = 0;
+    pv i: i64 = s0;
+    while i < e0 {
+        pv addr: i64 = s + i;
+        pv ptr: *mut u8 = addr;
+        pv b: i64 = 0;
+        unsafe { b = *ptr; }
+        if b < 48 || b > 57 { break; }
+        result = result * 10 + (b - 48);
+        i = i + 1;
+    }
+    ret result;
+}
+
+/// Get the byte at a given index, or -1 if out of bounds.
+pub pf str_byte_at(s: str, idx: i64) -> i64 {
+    ret String_byte_at(s, idx);
+}
+
+/// Get the length of a string in bytes.
+pub pf str_len(s: str) -> i64 {
+    ret String_len(s);
+}
+
+/// Check if a string is empty.
+pub pf str_is_empty(s: str) -> bool {
+    ret String_is_empty(s);
+}
+
+/// Concatenate two strings.
+pub pf str_concat(a: str, b: str) -> str {
+    ret p_str_concat(a, b);
+}
+
+/// Compare two strings. Returns 0 if equal, negative if a < b, positive if a > b.
+pub pf str_compare(a: str, b: str) -> i64 {
+    ret p_str_compare(a, b);
+}
+
+/// Check if two strings are equal.
+pub pf str_equal(a: str, b: str) -> bool {
+    ret p_str_equal(a, b);
+}
+
+/// Convert an integer to a string.
+pub pf int_to_str(n: i64) -> str {
+    ret p_to_str(n);
+}
+
+/// Convert a byte value to a single-character string.
+pub pf byte_to_str(b: i64) -> str {
+    ret p_char_to_str(b);
+}

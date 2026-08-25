@@ -1,0 +1,84 @@
+// Enum payloads keep their declared type when destructured.
+//
+// Before this worked, every binding in an enum-variant pattern was typed i32
+// and lowered as a bare i64 load, so a struct payload lost its identity and
+// field access on the binding silently folded to 0.
+use core;
+
+struct Token {
+    kind: i64,
+    text: str,
+}
+
+struct Span {
+    lo: i64,
+    hi: i64,
+}
+
+enum Node {
+    Leaf(Token),
+    Pair(Token, Span),
+    Count(i64),
+    Empty,
+}
+
+// Struct payload: field access on the binding must resolve.
+pf leaf_kind(n: Node) -> i64 {
+    match n {
+        Node::Leaf(t: Token) => { ret t.kind; }
+        Node::Empty => { ret 0 - 1; }
+    }
+}
+
+pf leaf_text(n: Node) -> str {
+    match n {
+        Node::Leaf(t: Token) => { ret t.text; }
+        Node::Empty => { ret "none"; }
+    }
+}
+
+// Multiple payload fields of different struct types.
+pf pair_sum(n: Node) -> i64 {
+    match n {
+        Node::Pair(t: Token, s: Span) => { ret t.kind + s.lo + s.hi; }
+        Node::Empty => { ret 0; }
+    }
+}
+
+// Scalar payloads still work.
+pf count_of(n: Node) -> i64 {
+    match n {
+        Node::Count(c: i64) => { ret c; }
+        Node::Empty => { ret 0; }
+    }
+}
+
+// The declared payload type wins even without an annotation on the binding.
+pf leaf_kind_unannotated(n: Node) -> i64 {
+    match n {
+        Node::Leaf(t) => { ret t.kind; }
+        Node::Empty => { ret 0 - 1; }
+    }
+}
+
+pf main() -> i64 {
+    pv t = Token { kind: 7, text: "ident" };
+    pv s = Span { lo: 10, hi: 20 };
+
+    pv leaf = Node::Leaf(t);
+    print(leaf_kind(leaf));            // 7
+    print(leaf_text(leaf));            // ident
+    print(leaf_kind_unannotated(leaf)); // 7
+
+    pv pair = Node::Pair(t, s);
+    print(pair_sum(pair));             // 37
+
+    pv cnt = Node::Count(99);
+    print(count_of(cnt));              // 99
+
+    pv empty = Node::Empty;
+    print(leaf_kind(empty));           // -1
+    print(leaf_text(empty));           // none
+
+    ret 0;
+}

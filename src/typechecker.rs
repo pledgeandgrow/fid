@@ -66,6 +66,11 @@ pub struct TypeChecker {
     funcs: HashMap<String, (Vec<Type>, Type)>,
     structs: HashMap<String, Vec<(String, Type)>>,
     enums: HashSet<String>,
+    /// Enum name → list of (variant name, payload field types).
+    /// Payload types may reference the enum's own type params (see `enum_type_params`).
+    enum_variants: HashMap<String, Vec<(String, Vec<Type>)>>,
+    /// Enum name → declared type parameters (e.g. ["T"] for Option<T>).
+    enum_type_params: HashMap<String, Vec<String>>,
     consts: HashMap<String, Type>,
     type_aliases: HashMap<String, Type>,
     methods: HashMap<String, HashMap<String, (Vec<Type>, Type, bool, bool)>>,
@@ -164,6 +169,8 @@ impl TypeChecker {
             funcs: HashMap::new(),
             structs: HashMap::new(),
             enums: HashSet::new(),
+            enum_variants: HashMap::new(),
+            enum_type_params: HashMap::new(),
             consts: HashMap::new(),
             type_aliases: HashMap::new(),
             methods: HashMap::new(),
@@ -667,6 +674,14 @@ impl TypeChecker {
             self.enums.insert(e.name.clone());
             self.item_modules.insert(e.name.clone(), module.to_string());
             self.item_visibility.insert(e.name.clone(), e.is_pub);
+            let variants: Vec<(String, Vec<Type>)> = e.variants.iter().map(|v| {
+                let tys = v.data.as_ref()
+                    .map(|params| params.iter().map(|p| p.ty.clone()).collect())
+                    .unwrap_or_default();
+                (v.name.clone(), tys)
+            }).collect();
+            self.enum_variants.insert(e.name.clone(), variants);
+            self.enum_type_params.insert(e.name.clone(), e.type_params.clone());
         }
 
         for c in &program.consts {
@@ -3204,9 +3219,10 @@ impl TypeChecker {
                         Pattern::Ident(name) => {
                             self.declare(name, match_ty.clone());
                         }
-                        Pattern::EnumVariant { enum_name: _, variant: _, bindings } => {
-                            for (bname, _bty) in bindings {
-                                self.declare(bname, Type::I32);
+                        Pattern::EnumVariant { enum_name, variant, bindings } => {
+                            let tys = self.pattern_binding_types(&match_ty, enum_name, variant, bindings);
+                            for ((bname, _), ty) in bindings.iter().zip(tys) {
+                                self.declare(bname, ty);
                             }
                         }
                         Pattern::StrLit(_) => {}
@@ -4071,16 +4087,38 @@ impl TypeChecker {
                         let arg_ty = self.check_expr(&args[0]);
                         return Type::Ref { inner: Box::new(arg_ty), is_mut: true };
                     }
+                    // Rc::new(x) — single-threaded reference counting
+                    if name == "Rc" && method == "new" {
+                        let arg_ty = self.check_expr(&args[0]);
+                        return Type::Generic { name: "Rc".to_string(), args: vec![arg_ty] };
+                    }
+                    // Arc::new(x) — atomic reference counting (thread-safe)
+                    if name == "Arc" && method == "new" {
+                        let arg_ty = self.check_expr(&args[0]);
+                        return Type::Generic { name: "Arc".to_string(), args: vec![arg_ty] };
+                    }
                 }
-                // Check if this is Vec::new() — built-in
+                // Check if this is Vec::new() — built-in.
+                // Honor a `let` hint (e.g. `pv v: Vec<Token> = Vec::new();`)
+                // so the element type is picked up from the annotation.
                 if let Expr::Ident(name) = receiver.as_ref() {
                     if name == "Vec" && method == "new" {
+                        if let Type::Generic { name: hn, args } = hint {
+                            if hn == "Vec" {
+                                return Type::Generic { name: "Vec".to_string(), args: args.clone() };
+                            }
+                        }
                         return Type::Generic { name: "Vec".to_string(), args: vec![Type::I64] };
                     }
                 }
                 // Check if this is HashMap::new() — built-in
                 if let Expr::Ident(name) = receiver.as_ref() {
                     if name == "HashMap" && method == "new" {
+                        if let Type::Generic { name: hn, args } = hint {
+                            if hn == "HashMap" && args.len() == 2 {
+                                return Type::Generic { name: "HashMap".to_string(), args: args.clone() };
+                            }
+                        }
                         return Type::Generic { name: "HashMap".to_string(), args: vec![Type::Str, Type::I64] };
                     }
                 }
@@ -4186,9 +4224,37 @@ impl TypeChecker {
                             }
                         };
                     }
+                    // Rc<T> methods — single-threaded reference counting
+                    if name == "Rc" {
+                        let elem_ty = args.first().cloned().unwrap_or(Type::I64);
+                        return match method.as_str() {
+                            "clone" => Type::Generic { name: "Rc".to_string(), args: args.clone() },
+                            "drop" => Type::Void,
+                            "get" => elem_ty,
+                            "count" => Type::I64,
+                            _ => {
+                                let known = ["clone", "drop", "get", "count"];
+                                self.errors.push(format!("Type error: no method '{}' on Rc{}", method, self.method_suggestion_suffix(method, &known)));
+                                Type::Never
+                            }
+                        };
+                    }
+                    // Arc<T> methods — atomic reference counting (thread-safe)
+                    if name == "Arc" {
+                        let elem_ty = args.first().cloned().unwrap_or(Type::I64);
+                        return match method.as_str() {
+                            "clone" => Type::Generic { name: "Arc".to_string(), args: args.clone() },
+                            "drop" => Type::Void,
+                            "get" => elem_ty,
+                            "count" => Type::I64,
+                            _ => {
+                                let known = ["clone", "drop", "get", "count"];
+                                self.errors.push(format!("Type error: no method '{}' on Arc{}", method, self.method_suggestion_suffix(method, &known)));
+                                Type::Never
+                            }
+                        };
+                    }
                 }
-
-                // Handle Type::Named("Vec") — Vec without type args (used as struct field type)
                 if let Type::Named(n) = &recv_ty {
                     if n == "Vec" {
                         let elem_ty = Type::I64;
@@ -4437,9 +4503,10 @@ impl TypeChecker {
                         Pattern::Ident(name) => {
                             self.declare(name, match_ty.clone());
                         }
-                        Pattern::EnumVariant { enum_name: _, variant: _, bindings } => {
-                            for (bname, _bty) in bindings {
-                                self.declare(bname, Type::I32);
+                        Pattern::EnumVariant { enum_name, variant, bindings } => {
+                            let tys = self.pattern_binding_types(&match_ty, enum_name, variant, bindings);
+                            for ((bname, _), ty) in bindings.iter().zip(tys) {
+                                self.declare(bname, ty);
                             }
                         }
                         Pattern::StrLit(_) => {}
@@ -5038,6 +5105,20 @@ impl TypeChecker {
         if let (Type::Generic { name: gen_name, .. }, Type::Named(decl_name)) = (&declared, &actual) {
             if decl_name == gen_name { return true; }
         }
+        // Vec<T> and HashMap<K,V> are opaque at runtime (a single pointer),
+        // so any two instantiations are compatible. This lets
+        // `pv v: Vec<Token> = Vec::new();` work even though Vec::new()
+        // might infer a different element type.
+        if let (Type::Generic { name: dn, .. }, Type::Generic { name: an, .. }) = (&declared, &actual) {
+            if (dn == "Vec" && an == "Vec") || (dn == "HashMap" && an == "HashMap") {
+                return true;
+            }
+            // Rc/Arc are opaque pointers at runtime — any two instantiations
+            // of the same wrapper type are compatible.
+            if (dn == "Rc" && an == "Rc") || (dn == "Arc" && an == "Arc") {
+                return true;
+            }
+        }
         // Const generic arrays are compatible with concrete arrays of any size
         if matches!(declared, Type::ArrayConst { .. }) || matches!(actual, Type::ArrayConst { .. }) {
             return true;
@@ -5101,6 +5182,162 @@ impl TypeChecker {
 
     fn is_known_enum(&self, name: &str) -> bool {
         self.enums.contains(name)
+    }
+
+    /// Convert a type name as written in source (e.g. "i64", "Token") into a Type.
+    /// Returns None if the name is empty or not recognizable.
+    fn type_from_name(&self, name: &str) -> Option<Type> {
+        if name.is_empty() {
+            return None;
+        }
+        let ty = match name {
+            "i8" => Type::I8,
+            "i16" => Type::I16,
+            "i32" => Type::I32,
+            "i64" => Type::I64,
+            "i128" => Type::I128,
+            "u8" => Type::U8,
+            "u16" => Type::U16,
+            "u32" => Type::U32,
+            "u64" => Type::U64,
+            "u128" => Type::U128,
+            "f32" => Type::F32,
+            "f64" => Type::F64,
+            "bool" => Type::Bool,
+            "str" => Type::Str,
+            "void" => Type::Void,
+            other => {
+                if self.structs.contains_key(other)
+                    || self.enums.contains(other)
+                    || self.type_aliases.contains_key(other)
+                    || self.current_type_params.contains(other)
+                {
+                    Type::Named(other.to_string())
+                } else {
+                    return None;
+                }
+            }
+        };
+        Some(ty)
+    }
+
+    /// Resolve the enum a variant pattern refers to.
+    /// `enum_name` may be empty for shorthand patterns like `Some(x)`, in which
+    /// case we infer from the scrutinee type, then fall back to a unique
+    /// variant-name match across all known enums.
+    fn resolve_pattern_enum(&self, match_ty: &Type, enum_name: &str, variant: &str) -> Option<String> {
+        if !enum_name.is_empty() {
+            let resolved = self.resolve_struct_name(enum_name);
+            if self.enum_variants.contains_key(&resolved) {
+                return Some(resolved);
+            }
+            if self.enum_variants.contains_key(enum_name) {
+                return Some(enum_name.to_string());
+            }
+        }
+        let from_scrutinee = match match_ty {
+            Type::Named(n) => Some(n.clone()),
+            Type::Generic { name, .. } => Some(name.clone()),
+            _ => None,
+        };
+        if let Some(n) = from_scrutinee {
+            let resolved = self.resolve_struct_name(&n);
+            if self.enum_variants.contains_key(&resolved) {
+                return Some(resolved);
+            }
+        }
+        // Last resort: a variant name unique across all enums.
+        let mut found = None;
+        for (ename, variants) in &self.enum_variants {
+            if variants.iter().any(|(vname, _)| vname == variant) {
+                if found.is_some() {
+                    return None; // ambiguous
+                }
+                found = Some(ename.clone());
+            }
+        }
+        found
+    }
+
+    /// Resolve the types bound by an enum-variant pattern, in priority order:
+    ///   1. The variant's declared payload types, with the enum's type params
+    ///      substituted from the scrutinee's generic arguments.
+    ///   2. An explicit annotation on the binding (`Some(x: Token)`), used when
+    ///      the declared payload is an unsubstituted type param.
+    ///   3. `Type::I64` — the uniform fallback representation.
+    fn pattern_binding_types(
+        &self,
+        match_ty: &Type,
+        enum_name: &str,
+        variant: &str,
+        bindings: &[(String, String)],
+    ) -> Vec<Type> {
+        let payload = self.resolve_pattern_enum(match_ty, enum_name, variant)
+            .and_then(|ename| {
+                let variants = self.enum_variants.get(&ename)?;
+                let tys = variants.iter()
+                    .find(|(vname, _)| vname == variant)
+                    .map(|(_, tys)| tys.clone())?;
+                // Build the type-param substitution from the scrutinee's args.
+                let params = self.enum_type_params.get(&ename).cloned().unwrap_or_default();
+                let args = match match_ty {
+                    Type::Generic { name, args } if *name == ename => args.clone(),
+                    _ => Vec::new(),
+                };
+                let subst: HashMap<&str, &Type> = params.iter()
+                    .map(|p| p.as_str())
+                    .zip(args.iter())
+                    .collect();
+                Some(tys.into_iter().map(|t| Self::subst_type_params(&t, &subst)).collect::<Vec<_>>())
+            })
+            .unwrap_or_default();
+
+        bindings.iter().enumerate().map(|(i, (_, annot))| {
+            let declared = payload.get(i);
+            // An unsubstituted type param carries no information — prefer the
+            // annotation when one is present.
+            let declared_is_param = matches!(declared, Some(Type::Named(n)) if self.is_type_param_name(n));
+            match declared {
+                Some(t) if !declared_is_param => t.clone(),
+                _ => self.type_from_name(annot).unwrap_or(Type::I64),
+            }
+        }).collect()
+    }
+
+    /// Whether `name` is a type parameter of some generic enum rather than a
+    /// real struct/enum/alias in scope.
+    fn is_type_param_name(&self, name: &str) -> bool {
+        if self.structs.contains_key(name) || self.enums.contains(name)
+            || self.type_aliases.contains_key(name) {
+            return false;
+        }
+        self.enum_type_params.values().any(|ps| ps.iter().any(|p| p == name))
+            || self.current_type_params.contains(name)
+    }
+
+    /// Substitute type parameters in `ty` using `subst`.
+    fn subst_type_params(ty: &Type, subst: &HashMap<&str, &Type>) -> Type {
+        match ty {
+            Type::Named(n) => subst.get(n.as_str()).map(|t| (*t).clone()).unwrap_or_else(|| ty.clone()),
+            Type::Array { elem, size } => Type::Array {
+                elem: Box::new(Self::subst_type_params(elem, subst)),
+                size: *size,
+            },
+            Type::Ref { inner, is_mut } => Type::Ref {
+                inner: Box::new(Self::subst_type_params(inner, subst)),
+                is_mut: *is_mut,
+            },
+            Type::RawPtr { inner, is_mut } => Type::RawPtr {
+                inner: Box::new(Self::subst_type_params(inner, subst)),
+                is_mut: *is_mut,
+            },
+            Type::Generic { name, args } => Type::Generic {
+                name: name.clone(),
+                args: args.iter().map(|a| Self::subst_type_params(a, subst)).collect(),
+            },
+            Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| Self::subst_type_params(t, subst)).collect()),
+            other => other.clone(),
+        }
     }
 }
 

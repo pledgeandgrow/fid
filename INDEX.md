@@ -68,7 +68,6 @@ and `AGENTS.md` first when working on the compiler.
 | [ibm-lessons.md](ibm-lessons.md) | What Fides can learn from IBM's AIX/z/OS — vertical integration on mainstream hardware. 4 concrete features (io_uring, capability isolation, transactional memory, deterministic mode) with benefits/cons. Road to a Fides OS. |
 | [direction-analysis.md](direction-analysis.md) | Are we going in the right direction? |
 | [competitive-analysis.md](competitive-analysis.md) | Fides vs the world — honest competitive assessment. |
-| [strategy.md](strategy.md) | Strategic improvement plan — where to focus to beat competitors. |
 | [adoption-strategy.md](adoption-strategy.md) | How to make switching to Fides easy. |
 | [industry-conversion.md](industry-conversion.md) | Migration guide for projects from different sectors. |
 | [innovation.md](innovation.md) | AI, robotics, hardware, IoT applications. |

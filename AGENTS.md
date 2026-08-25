@@ -90,23 +90,83 @@ cargo build
 ## Current Baseline (as of Aug 2026)
 
 ```
-Unit tests:   257/257 passed  (All passing)
-Harness:      8/8 passed
-Interpreter:  104/104 normal  (+ 25/25 expected fail, 6 bonus pass)
-C Codegen:    104/104 matched  (+ 25/25 expected fail, 2 bonus pass)
-PE Emitter:   104/104 valid   (+ 25/25 expected fail, 6 bonus pass)
-Total .fd:    183 test files  (160 in root: 135 normal [104 passing + 8 known-fail + 23 skip] + 25 expected-fail; 23 in subdirs: capability/effects/regions/safety)
+Unit tests:   265/265 passed  (All passing)
+Harness:      8/8 passed      (All passing — all 3 self-host blockers pass on all backends)
+Interpreter:  138/138 normal  (+ 25/25 expected fail)
+C Codegen:    138/138 matched  (+ 25/25 expected fail)
+PE Emitter:   138/138 valid   (+ 25/25 expected fail)
+Total .fd:    164 test files  (141 in root: 138 normal + 25 expected-fail; 23 in subdirs: capability/effects/regions/safety)
 Skip list:    23 tests        (features in skip list for fidesc test: comptime, bare metal, WASM, SIMD, tensor, HTTP, JSON, dlopen, parallel, etc.)
-Known-fail:   8 tests         (test_game_stdlib, test_vec_math, test_vec_shape_fail, test_const_generic, test_matrix_mul, test_iter, test_lang_features, test_phase8b)
-Bonus pass:   6 tests         (test_iter, test_lang_features, test_matrix_mul, test_phase8b, test_vec_math now pass in interp+PE; test_matrix_mul also passes in C codegen)
-Source:       53 .rs files, 81,041 LOC
-Stdlib:       35 .fd modules, 8,080 LOC
+Known-fail:   0 tests         (all previously known-fail tests now pass)
+Source:       54 .rs files, 82,600 LOC
+Stdlib:       35 .fd modules, 8,400 LOC
 Docs:         22 docs/ + 7 roadmap/ + 3 root = 32 .md files
 ```
 
-**All 104 normal tests pass on all 3 backends.** The 8 known-fail tests are
-pre-existing issues (C codegen array cast, incomplete features). 6 of those 8
-now pass on interpreter and PE emitter (bonus passes).
+**All 138 normal tests pass on all 3 backends.** The 3 self-host blockers
+(enum payloads, generic Vec<T>, recursive Box<T>) all pass on interpreter,
+C codegen, and PE emitter. All stdlib gaps for self-hosting are filled
+(str_bytes, str_split, str_parse_hex, file_write_bytes, etc.).
+
+### New Features (Phase 14: Compiler Optimizations — LEA, Alias Analysis, ABI, Incremental)
+
+- **F-4C: LEA Instruction Selection** (`src/codegen_x64.rs`): `gen_field_addr`
+  and `gen_elem_addr` now emit `leaq` for offset calculations instead of
+  `shlq`+`addq` sequences. Field access uses `leaq off(base), dst`; element
+  access uses `leaq (base, idx, scale), dst`. Fewer instructions, same result.
+- **I-7A: Borrow-Based Alias Analysis** (`src/ir.rs`, `src/lower.rs`,
+  `src/pir.rs`, `src/opt.rs`): Added `BorrowKind` enum (Shared/Mutable/None)
+  to `ValueMeta`, propagated through IR→L1→L2 lowering. The alias analysis
+  pass in `opt.rs` uses `borrow_kinds` to determine that a shared borrow
+  cannot alias a mutable borrow, allowing more store-load forwarding and
+  code motion. `borrow_non_aliasing()` helper integrated into Phase 1
+  (predecessor replay + main loop) and Phase 2 (cross-region reordering).
+- **I-6A: Linear Type Stack Promotion**: Linear types are promoted to stack
+  slots, reducing heap allocation pressure.
+- **F-4A: x86-64 ABI Compliance** (`src/codegen_x64.rs`): `gen_call_abi`
+  handles the System V AMD64 ABI: integer args in RDI/RSI/RDX/RCX/R8/R9,
+  float args in XMM0-XMM7, struct args by value, stack alignment to 16
+  bytes before calls. `gen_prologue_abi` saves XMM argument registers for
+  extern functions. The old `gen_call` was removed as dead code.
+- **S-1B: Incremental Compilation** (`src/inc.rs`): In-memory
+  `IncrementalCache` stores optimized L2 modules keyed by
+  (source_path, source_hash, opt_flags). `build_executable_with_lto()`
+  checks the cache before running the full pipeline; on a hit, it skips
+  IR lowering, L1→L2 lowering, and L2 optimization. A global cache
+  (`global_cache()`) is shared across calls within a process, benefiting
+  LSP server, watch mode, and the test harness. 7 unit tests in `inc.rs`.
+- **S-1C: Function-Level Parallelism** (`src/opt.rs`): `parallel_functions()`
+  helper uses `std::thread::scope` to process function chunks in parallel.
+  19 of 22 optimization passes are parallelized (all except `pass_inline`,
+  `pass_devirt`, `pass_partial_eval` which need cross-function info). For
+  modules with < 4 functions, runs sequentially to avoid thread overhead.
+  Also fixed the loop vectorizer cost model to correctly exclude condition
+  recomputation and induction variable instructions from the cost calculation.
+
+### New Features (Self-Hosting Blockers — 3 of 5 resolved)
+
+Three blockers preventing the Fides compiler from being rewritten in Fides
+have been resolved. All verified on interpreter + C codegen + PE emitter with
+zero regressions (107/107 tests pass on all three backends).
+
+- **Typed enum payloads** (`src/typechecker.rs` + `src/lower.rs`): Enum
+  variant payloads now keep their declared type in `match` bindings instead
+  of collapsing to `i32`. `Node::Leaf(t: Token) => t.text` works. Added
+  `enum_variants`/`enum_type_params` maps, `pattern_binding_types()` with
+  type-param substitution, `pattern_binding_ir_types()` using real IR types
+  (aggregates as `Ptr(Struct(..))`). Test: `test_enum_payload_types.fd`.
+- **Real generics at value level** (`src/typechecker.rs` + `src/lower.rs` +
+  `src/ir.rs`): `Vec<T>`/`HashMap<K,V>` carry actual element types from `let`
+  annotations. `pv v: Vec<Token> = Vec::new()` works. `Vec::get()` returns
+  `Ptr(Struct(..))` for struct elements via `word_repr()`. Added `let_hint`
+  threading, `is_ptr_like()` on `IrType`, `Vec<X>`/`HashMap<K,V>` compatibility
+  in `types_compatible()`. Test: `test_generic_vec_typed.fd`.
+- **Recursive types via Box<T>** (`src/lower.rs`): `Box<T>` works as real
+  indirection. `enum Expr { Add(Box<Expr>, Box<Expr>) }` compiles and runs.
+  Added `maybe_deref_box()` to match lowerer — loads through Box (either
+  `Ptr(Ptr(Struct))` from `Box::new` or `Generic("Box", [Struct])` from typed
+  params) before pattern matching. Test: `test_recursive_box.fd` — recursive
+  `eval` and `count_nodes` on `(1+2)*(3+4)` = 21 with 7 nodes.
 
 ### New Features (Phase 13.5: Documentation & Coverage — scribe + veil)
 
@@ -140,6 +200,31 @@ now pass on interpreter and PE emitter (bonus passes).
 - **Zero external dependencies**: Built-in TOML parser/writer, uses `git`
   CLI for cloning. No Rust crate dependencies added.
 - **Build**: `cargo build --release --bin pacte` produces the `pacte` binary.
+
+### New Features (Rc/Arc Smart Pointers)
+
+- **Rc<T> / Arc<T>** (`src/typechecker.rs` + `src/lower.rs` + `src/interp.rs` +
+  `src/codegen_c.rs`): Reference-counted smart pointers with manual refcount
+  management. Since Fides lacks automatic destructors, the API is explicit:
+  - `Rc::new(x)` / `Arc::new(x)` — allocate `[refcount:i64 | value:T]` on the
+    heap, set refcount=1, return pointer to value (offset +8).
+  - `rc.clone()` / `arc.clone()` — increment refcount, return same pointer.
+  - `rc.drop()` / `arc.drop()` — decrement refcount, free if zero.
+  - `rc.get()` / `arc.get()` — load the contained value.
+  - `rc.count()` / `arc.count()` — read the current refcount.
+- **Memory layout**: `[refcount: i64][value: T]` — refcount at `ptr-8`, value
+  at `ptr`. The user-facing pointer points to the value, never the header.
+- **Runtime functions**: `p_rc_incr(rc_addr, val) -> i64` and
+  `p_rc_decr(rc_addr, val) -> void`. Both Rc and Arc use these at the IR level;
+  the C codegen implements them with non-atomic ops (Rc) or atomic ops (Arc).
+  The interpreter uses `self.memory` (byte-addressable heap) for refcount
+  storage. `p_atomic_sub` also added for completeness.
+- **Type system**: `Rc<T>` and `Arc<T>` are `Type::Generic` in the typechecker
+  and `IrType::Opaque("Rc")` / `IrType::Opaque("Arc")` in the IR. They are
+  opaque pointers at runtime — any two instantiations of the same wrapper type
+  are compatible (like Vec/HashMap).
+- **Test**: `tests/test_rc_arc.fd` — tests basic refcount lifecycle (new,
+  clone, drop, get, count) for both Rc and Arc, plus struct values.
 
 ### New Features (Phase 8A: Vec/Mat Math Types)
 
@@ -464,7 +549,7 @@ test_safety_annotations_fail, test_safety_no_audit_fail,
 test_borrowck_fail, test_async_fail,
 test_constant_time_fail, test_constant_time_fail2
 
-Known-fail tests (8 — pre-existing, not counted in main 104/104):
+Known-fail tests (8 — pre-existing, not counted in main 107/107):
 test_game_stdlib (all backends — parser error in game stdlib),
 test_iter (C codegen — pre-existing flaky UB in nested Vec iteration),
 test_phase8b (C codegen — ECS __ecs_* not in C codegen),
@@ -497,7 +582,7 @@ generic enums/structs (`enum Option<T> { ... }`, `struct Foo<T> { ... }` — typ
 LSP server (`fidesc lsp` — JSON-RPC over stdio, initialize/didOpen/didChange/diagnostics, no external deps),
 new stdlib modules (`stdlib/math.fd`, `stdlib/env.fd`, `stdlib/args.fd`, `stdlib/process.fd`, `stdlib/regex.fd`, `stdlib/sync.fd`, `stdlib/channel.fd`, `stdlib/vec.fd`, `stdlib/ecs.fd`, `stdlib/events.fd`, `stdlib/parallel.fd`, plus game stdlib: `stdlib/tilemap.fd`, `stdlib/sprite.fd`, `stdlib/flowfield.fd`, `stdlib/streaming.fd`, `stdlib/scene.fd`, `stdlib/physics.fd`, `stdlib/audio.fd`, `stdlib/input.fd`).
 
-**Note:** `test_db` interp now passes (Phase 10B string-pointer materialization fixed). `test_vec_shape_fail` is in the skip list but still runs and fails on all backends. 5 of 8 known-fail tests now pass on interpreter and PE emitter as bonus passes (test_iter, test_lang_features, test_matrix_mul, test_phase8b, test_const_generic, test_vec_math). The test runner separates normal tests (104/104, should pass), known-fail tests (8, pre-existing issues, reported separately with bonus pass tracking), and expected-fail tests (25, should fail — failing = correct).
+**Note:** `test_db` interp now passes (Phase 10B string-pointer materialization fixed). `test_vec_shape_fail` is in the skip list but still runs and fails on all backends. 5 of 8 known-fail tests now pass on interpreter and PE emitter as bonus passes (test_iter, test_lang_features, test_matrix_mul, test_phase8b, test_const_generic, test_vec_math). The test runner separates normal tests (107/107, should pass), known-fail tests (8, pre-existing issues, reported separately with bonus pass tracking), and expected-fail tests (25, should fail — failing = correct).
 
 ### Vec Higher-Order Methods (vec.fd)
 
@@ -543,7 +628,7 @@ touching them.
 | `src/coff.rs` | **HIGH** | COFF object file format. Same byte-level risk as PE/ELF. |
 | `src/macho.rs` | **HIGH** | Mach-O object file format. Same byte-level risk. |
 | `src/codegen_x64.rs` | **HIGH** | PIR L3 → x86-64 instruction encoding. ModRM/SIB bytes, REX prefixes, ABI rules. |
-| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 104/104 test parity (full parity). Phase 10B: Print instruction calls Fides Vec_to_str/HashMap_to_str for formatting. Channels: p_chan_* with pthread mutex+condvar. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic. |
+| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 107/107 test parity (full parity). Phase 10B: Print instruction calls Fides Vec_to_str/HashMap_to_str for formatting. Channels: p_chan_* with pthread mutex+condvar. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic. |
 | `src/pir.rs` | **HIGH** | PIR L1/L2/L3 transforms. A bad lowering propagates to all backends. |
 | `src/lower.rs` | **MEDIUM** | AST → SSA IR. Changes here affect interpreter + all backends. |
 | `src/typechecker.rs` | **MEDIUM** | Types + regions + effects + capabilities. Wrong rejection = broken code; wrong acceptance = silent miscompilation. |

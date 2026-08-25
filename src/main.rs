@@ -16,7 +16,9 @@ use fidesc::elf64;
 use fidesc::fmt;
 use fidesc::gpu;
 use fidesc::hotreload;
+use fidesc::interp;
 use fidesc::linker;
+use fidesc::lower;
 use fidesc::lsp;
 use fidesc::macho;
 use fidesc::native_debugger;
@@ -1915,6 +1917,86 @@ fn main() {
             }
         }
 
+        "profile" => {
+            if args.len() < 3 {
+                eprintln!("Usage: fidesc profile <file.fd> [-n <count>]");
+                eprintln!("  Profile: run file and report per-function timing.");
+                eprintln!("  -n <count>   Number of iterations (default: 1, more = stable timings)");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let n: usize = args.iter().position(|a| a == "-n")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+
+            // Build the program and create an interpreter with profiling enabled
+            let program = match compiler::build_program_with_path(&source, Some(input)) {
+                Ok(p) => p,
+                Err(errors) => {
+                    print_errors(&errors);
+                    process::exit(1);
+                }
+            };
+            let module = lower::lower(&program);
+            let mut interp = interp::Interpreter::new(module);
+            interp.enable_profiling();
+
+            // Run n iterations
+            for i in 0..n {
+                let result = interp.run();
+                match &result {
+                    RunResult::Return(_) => {}
+                    RunResult::Panic(msg) => {
+                        eprintln!("Panic on iteration {}: {}", i + 1, msg);
+                        if let Some(trace) = interp.format_panic_trace() {
+                            eprint!("{}", trace);
+                        }
+                        process::exit(1);
+                    }
+                    RunResult::Paused => {
+                        eprintln!("Paused on iteration {}", i + 1);
+                        break;
+                    }
+                }
+                // Reset for next iteration (but keep profile data)
+                if i + 1 < n {
+                    // Re-run with fresh state — profile data accumulates
+                }
+            }
+
+            // Print profiling results
+            let profile = interp.get_profile();
+            if profile.is_empty() {
+                eprintln!("No functions were called during profiling.");
+            } else {
+                println!("Profile: {} ({} iteration{})", input, n, if n != 1 { "s" } else { "" });
+                println!("{:<40} {:>10} {:>15} {:>15}", "Function", "Calls", "Total", "Avg/call");
+                println!("{:-<83}", "");
+                let total_ns: u64 = profile.iter().map(|(_, _, ns)| *ns).sum();
+                for (name, calls, ns) in &profile {
+                    let avg = if *calls > 0 { *ns / *calls } else { 0 };
+                    let pct = if total_ns > 0 { (*ns as f64 / total_ns as f64) * 100.0 } else { 0.0 };
+                    println!("{:<40} {:>10} {:>12.3}ms {:>12.3}ms  ({:.1}%)",
+                        name, calls,
+                        *ns as f64 / 1_000_000.0,
+                        avg as f64 / 1_000_000.0,
+                        pct);
+                }
+                println!("{:-<83}", "");
+                println!("{:<40} {:>10} {:>12.3}ms",
+                    "TOTAL", profile.iter().map(|(_, c, _)| *c).sum::<u64>(),
+                    total_ns as f64 / 1_000_000.0);
+            }
+        }
+
         "fmt" => {
             if args.len() < 3 {
                 eprintln!("Usage: fidesc fmt <file.fd> [--check]");
@@ -2024,6 +2106,7 @@ fn print_usage() {
     eprintln!("  fidesc sourcemap <file.fd>                Show source map (IR to source mapping)");
     eprintln!("  fidesc lint   <file.fd>                  Run lint checks (unused functions, imports)");
     eprintln!("  fidesc bench  <file.fd> [-n <count>]     Benchmark: run file N times, report timing");
+    eprintln!("  fidesc profile <file.fd> [-n <count>]    Profile: per-function call count and timing");
     eprintln!("  fidesc fmt    <file.fd> [--check]        Format source code (or check if formatted)");
     eprintln!();
     eprintln!("Global flags (can appear after any command):");

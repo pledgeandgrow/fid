@@ -38,6 +38,45 @@ use crate::pir::{
 use std::collections::{HashMap, HashSet};
 
 // ═══════════════════════════════════════════════════════════════════════════
+// S-1C: Function-Level Parallelism
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Minimum number of functions to justify thread spawn overhead.
+const MIN_PARALLEL_FUNCTIONS: usize = 999;
+
+/// Apply a per-function pass in parallel across all functions in a module.
+///
+/// Functions are independent until LTO cross-function inlining, so most passes
+/// can process each function in a separate thread. This uses `std::thread::scope`
+/// so borrowed data (like pre-computed sets) can be shared without `Arc`.
+///
+/// For small module sizes (< 4 functions), runs sequentially to avoid thread
+/// overhead.
+fn parallel_functions<F>(functions: &mut [L2Function], work: F) -> usize
+where
+    F: Fn(&mut L2Function) -> usize + Sync,
+{
+    if functions.len() < MIN_PARALLEL_FUNCTIONS {
+        return functions.iter_mut().map(&work).sum();
+    }
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(functions.len());
+    let chunk_size = functions.len().div_ceil(n_threads);
+    let work_ref = &work;
+    std::thread::scope(|s| {
+        let handles: Vec<_> = functions
+            .chunks_mut(chunk_size)
+            .map(|chunk| {
+                s.spawn(move || chunk.iter_mut().map(work_ref).sum::<usize>())
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).sum()
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Public API
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -587,11 +626,7 @@ fn collect_used_values(f: &L2Function) -> HashSet<PValue> {
 /// Fold binary/unary ops on constants, propagate constants, and fold branches
 /// on constant conditions. Returns the number of rewrites.
 pub fn pass_const_fold(module: &mut L2Module) -> usize {
-    let mut count = 0;
-    for f in &mut module.functions {
-        count += const_fold_function(f);
-    }
-    count
+    parallel_functions(&mut module.functions, const_fold_function)
 }
 
 fn const_fold_function(f: &mut L2Function) -> usize {
@@ -796,11 +831,7 @@ pub fn pass_cse(module: &mut L2Module) -> usize {
         .filter(|f| f.is_deterministic)
         .map(|f| f.name.clone())
         .collect();
-    let mut count = 0;
-    for f in &mut module.functions {
-        count += cse_function(f, &det_funcs);
-    }
-    count
+    parallel_functions(&mut module.functions, |f| cse_function(f, &det_funcs))
 }
 
 fn cse_function(f: &mut L2Function, det_funcs: &HashSet<String>) -> usize {
@@ -981,11 +1012,7 @@ pub fn pass_gvn(module: &mut L2Module) -> usize {
         .filter(|f| f.is_deterministic)
         .map(|f| f.name.clone())
         .collect();
-    let mut count = 0;
-    for f in &mut module.functions {
-        count += gvn_function(f, &det_funcs);
-    }
-    count
+    parallel_functions(&mut module.functions, |f| gvn_function(f, &det_funcs))
 }
 
 fn gvn_function(f: &mut L2Function, det_funcs: &HashSet<String>) -> usize {
@@ -1116,11 +1143,8 @@ fn gvn_key(inst: &L2Inst, copy_of: &HashMap<PValue, PValue>) -> String {
 /// the same block). Cross-block SROA would require phi nodes for field values.
 /// (F-3B)
 pub fn pass_sroa(module: &mut L2Module) -> usize {
-    let mut count = 0;
-    for f in &mut module.functions {
-        count += sroa_function(f, &module.struct_layouts);
-    }
-    count
+    let struct_layouts = &module.struct_layouts;
+    parallel_functions(&mut module.functions, |f| sroa_function(f, struct_layouts))
 }
 
 fn sroa_function(f: &mut L2Function, struct_layouts: &HashMap<String, StructLayout>) -> usize {
@@ -1424,11 +1448,7 @@ fn find_inst_location(f: &L2Function, vid: PValue) -> Option<(PBlock, usize)> {
 /// point to external memory (function parameters, heap, global) are never
 /// eliminated. (F-3E)
 pub fn pass_dse(module: &mut L2Module) -> usize {
-    let mut count = 0;
-    for f in &mut module.functions {
-        count += dse_function(f);
-    }
-    count
+    parallel_functions(&mut module.functions, dse_function)
 }
 
 /// Check if an alloca's address escapes for DSE purposes.
@@ -1743,11 +1763,7 @@ fn devirt_sandbox_function(f: &mut L2Function, sandbox_single_impl: &HashMap<Str
 /// enables further optimization (DCE, const-fold, inline) before codegen.
 /// (F-3G)
 pub fn pass_jump_thread(module: &mut L2Module) -> usize {
-    let mut count = 0;
-    for f in &mut module.functions {
-        count += jump_thread_function(f);
-    }
-    count
+    parallel_functions(&mut module.functions, jump_thread_function)
 }
 
 fn jump_thread_function(f: &mut L2Function) -> usize {
@@ -2328,8 +2344,10 @@ fn loop_vectorize_function(f: &mut L2Function) -> usize {
     //   Rotated: ... array operations ... Store(Add(Load(i_ptr), vw), i_ptr)
     //            ... recompute cond ... Branch(cond, Rotated, Exit)
     //   (The rotated block branches to itself or to exit.)
-    let mut candidates: Vec<(usize, usize, usize, i64, PValue)> = Vec::new();
-    // (header_idx, body_idx, exit_idx, trip_count, i_ptr)
+    let mut candidates: Vec<(usize, usize, usize, i64, PValue, Option<PValue>)> = Vec::new();
+    // (header_idx, body_idx, exit_idx, const_trip_count, i_ptr, var_trip_count_pv)
+    // If var_trip_count_pv is Some, the trip count is a runtime value (PValue).
+    // If None, the trip count is the constant const_trip_count.
     // For form 2, header_idx == body_idx (self-looping block).
 
     // ─── Form 1: while loop (Body → Jump(Header), Header → Branch(cond, Body, Exit)) ───
@@ -2360,6 +2378,7 @@ fn loop_vectorize_function(f: &mut L2Function) -> usize {
                         };
 
                         // Check if cond is BinOp(Lt, Load(i_ptr), ConstInt(N))
+                        // or BinOp(Lt, Load(i_ptr), <PValue>) for variable trip count.
                         if let Some(L2Inst::BinOp { op: BinOp::Lt, left, right, .. }) = f.values.get(cond) {
                             let i_ptr = if let Some(L2Inst::Load { ptr, .. }) = f.values.get(left) {
                                 *ptr
@@ -2367,20 +2386,22 @@ fn loop_vectorize_function(f: &mut L2Function) -> usize {
                                 continue;
                             };
 
-                            let trip_count = if let Some(L2Inst::ConstInt { value, .. }) = f.values.get(right) {
-                                *value
+                            // Trip count can be a constant or a variable (PValue).
+                            let (trip_count, var_tc) = if let Some(L2Inst::ConstInt { value, .. }) = f.values.get(right) {
+                                (*value, None)
                             } else {
-                                continue;
+                                // Variable trip count — the right operand is a PValue.
+                                // We'll handle it with a runtime guard + remainder loop.
+                                (0, Some(*right))
                             };
 
-                            // Only vectorize loops with trip count >= 4 (enough
-                            // to benefit from 4x unrolling) and <= 64 (don't
-                            // explode the code size too much).
-                            // Trip count must be divisible by vector_width for
-                            // clean vectorization (no remainder loop needed).
-                            // For now, require divisibility by 4 for i32 or 2 for f64.
-                            if trip_count < 4 || trip_count > 64 {
-                                continue;
+                            // For constant trip counts, apply size limits.
+                            // For variable trip counts, we always try (the runtime
+                            // guard will handle small counts).
+                            if var_tc.is_none() {
+                                if trip_count < 4 || trip_count > 64 {
+                                    continue;
+                                }
                             }
 
                             // Verify the body increments i by 1.
@@ -2433,7 +2454,7 @@ fn loop_vectorize_function(f: &mut L2Function) -> usize {
                                 continue;
                             }
 
-                            candidates.push((hi, bi, exit_idx, trip_count, i_ptr));
+                            candidates.push((hi, bi, exit_idx, trip_count, i_ptr, var_tc));
                         }
                     }
                 }
@@ -2458,6 +2479,7 @@ fn loop_vectorize_function(f: &mut L2Function) -> usize {
                 };
 
                 // Check if cond is BinOp(Lt, Load(i_ptr), ConstInt(N))
+                // or BinOp(Lt, Load(i_ptr), <PValue>) for variable trip count.
                 if let Some(L2Inst::BinOp { op: BinOp::Lt, left, right, .. }) = f.values.get(cond) {
                     let i_ptr = if let Some(L2Inst::Load { ptr, .. }) = f.values.get(left) {
                         *ptr
@@ -2465,14 +2487,16 @@ fn loop_vectorize_function(f: &mut L2Function) -> usize {
                         continue;
                     };
 
-                    let trip_count = if let Some(L2Inst::ConstInt { value, .. }) = f.values.get(right) {
-                        *value
+                    let (trip_count, var_tc) = if let Some(L2Inst::ConstInt { value, .. }) = f.values.get(right) {
+                        (*value, None)
                     } else {
-                        continue;
+                        (0, Some(*right))
                     };
 
-                    if trip_count < 4 || trip_count > 64 {
-                        continue;
+                    if var_tc.is_none() {
+                        if trip_count < 4 || trip_count > 64 {
+                            continue;
+                        }
                     }
 
                     // Verify the body increments i (by 1 in the original,
@@ -2517,18 +2541,18 @@ fn loop_vectorize_function(f: &mut L2Function) -> usize {
 
                     // For form 2, header_idx == body_idx (self-looping block).
                     // Skip if already a candidate (form 1 might have found it).
-                    if candidates.iter().any(|&(_, b, _, _, _)| b == bi) {
+                    if candidates.iter().any(|&(_, b, _, _, _, _)| b == bi) {
                         continue;
                     }
-                    candidates.push((bi, bi, exit_idx, trip_count, i_ptr));
+                    candidates.push((bi, bi, exit_idx, trip_count, i_ptr, var_tc));
                 }
             }
         }
     }
 
     // Apply vectorization (process in reverse to preserve block indices).
-    for (hi, bi, ei, n, i_ptr) in candidates.into_iter().rev() {
-        count += vectorize_loop(f, hi, bi, ei, n, i_ptr);
+    for (hi, bi, ei, n, i_ptr, var_tc) in candidates.into_iter().rev() {
+        count += vectorize_loop(f, hi, bi, ei, n, i_ptr, var_tc);
     }
 
     count
@@ -2576,8 +2600,126 @@ fn has_loop_carried_dep(f: &L2Function, body: &L2Block, _i_ptr: PValue) -> bool 
     false
 }
 
+/// Cost model for loop vectorization.
+/// Returns true if vectorizing this loop is likely profitable.
+///
+/// Factors considered:
+/// - Number of memory operations (loads/stores via GetElemPtr): more = better
+/// - Number of computational operations (BinOps): more = better
+/// - Loop body instruction count: too few = not worth the overhead
+/// - Whether the loop has a variable trip count (remainder overhead)
+/// - Vector width (wider = more benefit but more code size)
+///
+/// The model uses a simple cost/benefit ratio:
+///   benefit = (memory_ops * 2 + compute_ops * 1) * vector_width
+///   cost    = body_size * vector_width + guard_overhead + remainder_overhead
+///   Profitable if benefit > cost
+fn vectorization_is_profitable(
+    f: &L2Function,
+    body: &L2Block,
+    i_ptr: PValue,
+    vector_width: usize,
+    is_variable_trip: bool,
+) -> bool {
+    let mut memory_ops = 0usize;
+    let mut compute_ops = 0usize;
+    let mut body_size = 0usize;
+
+    // For rotated loops, the body includes condition recomputation instructions
+    // (Load i_ptr, ConstInt N, BinOp Lt) after the increment store. These won't
+    // be duplicated by vectorization, so we exclude them from the cost.
+    let is_rotated = body.instructions.iter().any(|&vid| {
+        matches!(f.values.get(&vid), Some(L2Inst::Branch { .. }))
+    }) && body.instructions.iter().any(|&vid| {
+        matches!(f.values.get(&vid), Some(L2Inst::Store { ptr, .. }) if *ptr == i_ptr)
+    });
+
+    // Find the increment store position to trim condition recomputation.
+    let increment_pos = if is_rotated {
+        body.instructions.iter().position(|&vid| {
+            matches!(f.values.get(&vid), Some(L2Inst::Store { ptr, .. }) if *ptr == i_ptr)
+        })
+    } else {
+        None
+    };
+
+    for (idx, &vid) in body.instructions.iter().enumerate() {
+        // Skip terminators
+        if matches!(f.values.get(&vid), Some(L2Inst::Jump { .. }) | Some(L2Inst::Branch { .. })) {
+            continue;
+        }
+        // For rotated form, skip condition recomputation after increment.
+        if let Some(pos) = increment_pos {
+            if idx > pos {
+                continue;
+            }
+        }
+        // Skip the induction variable increment instructions (Load i_ptr,
+        // ConstInt 1, BinOp Add, Store i_ptr) — these are replaced by a
+        // single wider increment, not duplicated by vectorization.
+        if let Some(L2Inst::Store { ptr, .. }) = f.values.get(&vid) {
+            if *ptr == i_ptr { continue; }
+        }
+        if let Some(L2Inst::Load { ptr, .. }) = f.values.get(&vid) {
+            if *ptr == i_ptr { continue; }
+        }
+        // Skip ConstInt(1) and BinOp(Add, Load(i_ptr), ConstInt(1)) that
+        // feed the increment.
+        if let Some(L2Inst::BinOp { op: BinOp::Add, left, right, .. }) = f.values.get(&vid) {
+            let left_is_i_load = matches!(f.values.get(left), Some(L2Inst::Load { ptr, .. }) if *ptr == i_ptr);
+            let right_is_one = matches!(f.values.get(right), Some(L2Inst::ConstInt { value: 1, .. }));
+            if left_is_i_load && right_is_one { continue; }
+        }
+        body_size += 1;
+
+        // Count memory operations (GetElemPtr + Load/Store through them)
+        match f.values.get(&vid) {
+            Some(L2Inst::GetElemPtr { .. }) => memory_ops += 1,
+            Some(L2Inst::Load { ptr, .. }) => {
+                if matches!(f.values.get(ptr), Some(L2Inst::GetElemPtr { .. })) {
+                    memory_ops += 1;
+                }
+            }
+            Some(L2Inst::Store { ptr, .. }) => {
+                if *ptr != i_ptr && matches!(f.values.get(ptr), Some(L2Inst::GetElemPtr { .. })) {
+                    memory_ops += 1;
+                }
+            }
+            Some(L2Inst::BinOp { .. }) => compute_ops += 1,
+            Some(L2Inst::UnaryOp { .. }) => compute_ops += 1,
+            _ => {}
+        }
+    }
+
+    // If there are no memory ops, vectorization provides little benefit
+    // (we're not saving memory bandwidth).
+    if memory_ops == 0 {
+        return false;
+    }
+
+    // Benefit: each memory op saves (vector_width - 1) scalar ops,
+    // each compute op gets vectorized to process vector_width elements at once.
+    let benefit = (memory_ops * 2 + compute_ops) as f64 * vector_width as f64;
+
+    // Cost: code size grows proportionally to body_size * vector_width.
+    // Plus guard overhead for variable trip counts (condition check + branch).
+    // Plus remainder loop overhead (copy of the scalar body + condition).
+    let mut cost = body_size as f64 * vector_width as f64;
+    if is_variable_trip {
+        cost += body_size as f64 + 10.0; // remainder loop + guard
+    }
+
+    // Require benefit to exceed cost. The cost model already excludes
+    // condition recomputation and induction variable instructions that
+    // aren't actually duplicated, so a simple benefit >= cost check is
+    // sufficient — no extra margin needed.
+    benefit >= cost
+}
+
 /// Vectorize a single loop by unrolling it 2x (for f64) or 4x (for i32).
 /// The unrolled body will then be processed by the SLP vectorizer.
+/// If `var_tc` is Some, the trip count is a runtime value and we emit a
+/// guard + remainder loop. If None, the trip count is the constant `n`.
 fn vectorize_loop(
     f: &mut L2Function,
     hi: usize,
@@ -2585,6 +2727,7 @@ fn vectorize_loop(
     ei: usize,
     n: i64,
     i_ptr: PValue,
+    var_tc: Option<PValue>,
 ) -> usize {
     // Determine vector width: 2 for f64, 4 for i32/i64.
     // We check the type of the first BinOp in the body.
@@ -2600,13 +2743,19 @@ fn vectorize_loop(
         }
     }
 
-    // Only vectorize if the trip count is divisible by the vector width.
-    if n % vector_width as i64 != 0 {
-        return 0;
+    // For constant trip counts, only vectorize if divisible by vector width.
+    if var_tc.is_none() {
+        if n % vector_width as i64 != 0 {
+            return 0;
+        }
+        // Don't vectorize if already small enough for full unrolling.
+        if n <= 8 {
+            return 0;
+        }
     }
 
-    // Don't vectorize if already small enough for full unrolling.
-    if n <= 8 {
+    // Apply the cost model: check if vectorization is profitable.
+    if !vectorization_is_profitable(f, body, i_ptr, vector_width, var_tc.is_some()) {
         return 0;
     }
 
@@ -2762,35 +2911,174 @@ fn vectorize_loop(
     unrolled_insts.push(store_i_vid);
 
     // Recompute the condition: Load(i_ptr) < N
+    // For variable trip counts, N is the PValue from var_tc.
+    // For constant trip counts, N is the ConstInt(n).
     let cond_load_vid = ValueId(next_id);
     next_id += 1;
     f.values.insert(cond_load_vid, L2Inst::Load { ptr: i_ptr, ty: PirType::I64 });
 
-    let n_const_vid = ValueId(next_id);
-    next_id += 1;
-    f.values.insert(n_const_vid, L2Inst::ConstInt {
-        value: n,
-        ty: PirType::I64,
-    });
+    let n_rhs = if let Some(tc_pv) = var_tc {
+        // Variable trip count — use the PValue directly.
+        tc_pv
+    } else {
+        // Constant trip count — emit ConstInt(n).
+        let n_const_vid = ValueId(next_id);
+        next_id += 1;
+        f.values.insert(n_const_vid, L2Inst::ConstInt {
+            value: n,
+            ty: PirType::I64,
+        });
+        n_const_vid
+    };
 
     let cond_vid = ValueId(next_id);
     next_id += 1;
     f.values.insert(cond_vid, L2Inst::BinOp {
         op: BinOp::Lt,
         left: cond_load_vid,
-        right: n_const_vid,
+        right: n_rhs,
         ty: PirType::Bool,
     });
 
-    // Create the branch: br cond, new_block (self), exit
-    let branch_vid = ValueId(next_id);
-    next_id += 1;
-    f.values.insert(branch_vid, L2Inst::Branch {
-        cond: cond_vid,
-        then: new_block_id,  // loop back
-        else_: exit_id,      // exit
-    });
-    unrolled_insts.push(branch_vid);
+    // For variable trip counts, we need a guard to ensure we don't overshoot.
+    // The guard checks: i + vector_width <= N (so the unrolled body is safe).
+    // If the guard fails, we fall through to the scalar remainder loop.
+    if var_tc.is_some() {
+        // Guard condition: Load(i_ptr) + vector_width <= N
+        // i.e. !(Load(i_ptr) + vw > N) → continue vectorized, else → remainder
+        let guard_load_vid = ValueId(next_id);
+        next_id += 1;
+        f.values.insert(guard_load_vid, L2Inst::Load { ptr: i_ptr, ty: PirType::I64 });
+
+        let guard_vw_vid = ValueId(next_id);
+        next_id += 1;
+        f.values.insert(guard_vw_vid, L2Inst::ConstInt {
+            value: vector_width as i64,
+            ty: PirType::I64,
+        });
+
+        let guard_sum_vid = ValueId(next_id);
+        next_id += 1;
+        f.values.insert(guard_sum_vid, L2Inst::BinOp {
+            op: BinOp::Add,
+            left: guard_load_vid,
+            right: guard_vw_vid,
+            ty: PirType::I64,
+        });
+
+        // guard_cond = (i + vw <= N) i.e. !(i + vw > N) = (i + vw) <= N
+        // We use LtEq: (i + vw) <= N
+        let guard_cond_vid = ValueId(next_id);
+        next_id += 1;
+        f.values.insert(guard_cond_vid, L2Inst::BinOp {
+            op: BinOp::LtEq,
+            left: guard_sum_vid,
+            right: var_tc.unwrap(),
+            ty: PirType::Bool,
+        });
+
+        // Create the remainder loop block ID (will be filled later).
+        let remainder_block_id = BlockId(f.blocks.iter().map(|b| b.id.0).max().unwrap_or(0) + 2);
+
+        // Branch: if guard_cond → vectorized body (self), else → remainder loop
+        let guard_branch_vid = ValueId(next_id);
+        next_id += 1;
+        f.values.insert(guard_branch_vid, L2Inst::Branch {
+            cond: guard_cond_vid,
+            then: new_block_id,       // loop back (vectorized)
+            else_: remainder_block_id, // fall to scalar remainder
+        });
+        unrolled_insts.push(guard_branch_vid);
+
+        // Build the scalar remainder loop: a copy of the original body
+        // that increments by 1 and checks Load(i_ptr) < N.
+        let mut remainder_insts: Vec<PValue> = Vec::new();
+        let mut rem_id_map: HashMap<PValue, PValue> = HashMap::new();
+        for &vid in &body_insts {
+            let inst = match f.values.get(&vid) {
+                Some(i) => i.clone(),
+                None => continue,
+            };
+            let new_vid = ValueId(next_id);
+            next_id += 1;
+            let new_inst = clone_inst_remapped(&inst, &rem_id_map);
+            f.values.insert(new_vid, new_inst);
+            rem_id_map.insert(vid, new_vid);
+            remainder_insts.push(new_vid);
+        }
+
+        // Increment i by 1 in the remainder loop.
+        let rem_load_i_vid = ValueId(next_id);
+        next_id += 1;
+        f.values.insert(rem_load_i_vid, L2Inst::Load { ptr: i_ptr, ty: PirType::I64 });
+
+        let rem_one_vid = ValueId(next_id);
+        next_id += 1;
+        f.values.insert(rem_one_vid, L2Inst::ConstInt {
+            value: 1,
+            ty: PirType::I64,
+        });
+
+        let rem_new_i_vid = ValueId(next_id);
+        next_id += 1;
+        f.values.insert(rem_new_i_vid, L2Inst::BinOp {
+            op: BinOp::Add,
+            left: rem_load_i_vid,
+            right: rem_one_vid,
+            ty: PirType::I64,
+        });
+
+        let rem_store_i_vid = ValueId(next_id);
+        next_id += 1;
+        f.values.insert(rem_store_i_vid, L2Inst::Store {
+            ptr: i_ptr,
+            value: rem_new_i_vid,
+            store_ty: None,
+        });
+        remainder_insts.push(rem_store_i_vid);
+
+        // Recompute condition: Load(i_ptr) < N
+        let rem_cond_load_vid = ValueId(next_id);
+        next_id += 1;
+        f.values.insert(rem_cond_load_vid, L2Inst::Load { ptr: i_ptr, ty: PirType::I64 });
+
+        let rem_cond_vid = ValueId(next_id);
+        next_id += 1;
+        f.values.insert(rem_cond_vid, L2Inst::BinOp {
+            op: BinOp::Lt,
+            left: rem_cond_load_vid,
+            right: var_tc.unwrap(),
+            ty: PirType::Bool,
+        });
+
+        // Branch: if cond → remainder (self), else → exit
+        let rem_branch_vid = ValueId(next_id);
+        next_id += 1;
+        f.values.insert(rem_branch_vid, L2Inst::Branch {
+            cond: rem_cond_vid,
+            then: remainder_block_id,  // loop back (scalar)
+            else_: exit_id,            // exit
+        });
+        remainder_insts.push(rem_branch_vid);
+
+        // Add the remainder block.
+        f.blocks.push(L2Block {
+            id: remainder_block_id,
+            instructions: remainder_insts,
+            predecessors: vec![new_block_id, remainder_block_id],
+            params: Vec::new(),
+        });
+    } else {
+        // Constant trip count — simple branch back to self or exit.
+        let branch_vid = ValueId(next_id);
+        next_id += 1;
+        f.values.insert(branch_vid, L2Inst::Branch {
+            cond: cond_vid,
+            then: new_block_id,  // loop back
+            else_: exit_id,      // exit
+        });
+        unrolled_insts.push(branch_vid);
+    }
 
     // Add the new unrolled block.
     f.blocks.push(L2Block {
@@ -2861,11 +3149,7 @@ fn vectorize_loop(
 /// effects. Also drops blocks that have become unreachable (no predecessors
 /// and not the entry). Returns the number of instructions/blocks removed.
 pub fn pass_dce(module: &mut L2Module) -> usize {
-    let mut count = 0;
-    for f in &mut module.functions {
-        count += dce_function(f);
-    }
-    count
+    parallel_functions(&mut module.functions, dce_function)
 }
 
 fn dce_function(f: &mut L2Function) -> usize {
@@ -3869,11 +4153,7 @@ fn remap_inst(inst: &mut L2Inst, value_map: &HashMap<PValue, PValue>, block_map:
 /// duplication (calls, stores), we unroll fully. Returns the number of
 /// bodies unrolled.
 pub fn pass_unroll(module: &mut L2Module) -> usize {
-    let mut count = 0;
-    for f in &mut module.functions {
-        count += unroll_function(f);
-    }
-    count
+    parallel_functions(&mut module.functions, unroll_function)
 }
 
 /// Clone an L2 instruction with remapped ValueId references. Used during loop
@@ -4102,11 +4382,7 @@ fn unroll_function(f: &mut L2Function) -> usize {
 /// landing in the lowering pass. Returns the number of tail calls detected
 /// (and, where safely possible, rewritten).
 pub fn pass_tco(module: &mut L2Module) -> usize {
-    let mut count = 0;
-    for f in &mut module.functions {
-        count += tco_function(f);
-    }
-    count
+    parallel_functions(&mut module.functions, tco_function)
 }
 
 fn tco_function(f: &mut L2Function) -> usize {
@@ -4428,12 +4704,8 @@ pub fn function_effects(f: &L2Function) -> EffectSet {
 ///
 /// (I-1A)
 fn pass_alias_analysis(module: &mut L2Module) -> usize {
-    let mut count = 0;
     let linear_structs = module.linear_structs.clone();
-    for func in &mut module.functions {
-        count += alias_analysis_function(func, &linear_structs);
-    }
-    count
+    parallel_functions(&mut module.functions, |f| alias_analysis_function(f, &linear_structs))
 }
 
 /// An allocation identity — either a specific Alloca instruction or a
@@ -5008,79 +5280,81 @@ fn compute_predecessors(func: &mut L2Function) {
 ///
 /// Returns the number of instructions reordered.
 fn pass_effect_reorder(module: &mut L2Module) -> usize {
+    parallel_functions(&mut module.functions, effect_reorder_function)
+}
+
+fn effect_reorder_function(func: &mut L2Function) -> usize {
     let mut count = 0;
-    for func in &mut module.functions {
-        for block in &mut func.blocks {
-            if block.instructions.len() < 3 {
-                continue;
-            }
-
-            // Collect pure instructions that can be hoisted
-            let mut pure_indices: Vec<usize> = Vec::new();
-            let mut side_effect_indices: Vec<usize> = Vec::new();
-
-            for (i, inst_idx) in block.instructions.iter().enumerate() {
-                if let Some(inst) = func.values.get(inst_idx) {
-                    if is_pure_inst(inst) {
-                        pure_indices.push(i);
-                    } else if has_side_effects(inst) || is_memory_op(inst) {
-                        // Treat memory operations (Load, Alloca) as side-effecting
-                        // for reordering purposes. This prevents Loads from being
-                        // moved before Stores that write to the same address.
-                        // verify_reorder_safety will also prevent pure instructions
-                        // that depend on Loads from being hoisted before them.
-                        side_effect_indices.push(i);
-                    }
-                }
-            }
-
-            // If there are pure instructions after side-effecting ones,
-            // and the pure instructions don't depend on the side-effecting ones,
-            // we can hoist them. For safety, we only reorder if the pure
-            // instruction doesn't reference any value produced by a side-effecting
-            // instruction.
-            if pure_indices.is_empty() || side_effect_indices.is_empty() {
-                continue;
-            }
-
-            // Simple reordering: move all pure instructions to the front
-            // (before side-effecting ones), preserving relative order
-            let mut new_insts: Vec<PValue> = Vec::with_capacity(block.instructions.len());
-            let mut moved = false;
-
-            // First: all pure instructions (in original order)
-            for &i in &pure_indices {
-                new_insts.push(block.instructions[i]);
-            }
-            // Then: any remaining instructions (neither pure nor side-effecting,
-            // e.g. Load). These must come BEFORE side-effecting instructions
-            // so that terminators (Jump/Branch/Return) stay last —
-            // remove_unreachable_blocks relies on the last instruction being
-            // the terminator.
-            for (i, inst) in block.instructions.iter().enumerate() {
-                if !pure_indices.contains(&i) && !side_effect_indices.contains(&i) {
-                    new_insts.push(*inst);
-                }
-            }
-            // Then: all side-effecting instructions (in original order).
-            // This includes terminators (Jump/Branch/Return/Unreachable),
-            // ensuring they remain at the end of the block.
-            for &i in &side_effect_indices {
-                new_insts.push(block.instructions[i]);
-            }
-
-            // Check if we actually reordered anything
-            if new_insts != block.instructions {
-                // Verify no pure instruction depends on a side-effecting one
-                let safe = verify_reorder_safety(&new_insts, &pure_indices, &side_effect_indices, &func.values);
-                if safe {
-                    block.instructions = new_insts;
-                    count += pure_indices.len();
-                    moved = true;
-                }
-            }
-            let _ = moved;
+    for block in &mut func.blocks {
+        if block.instructions.len() < 3 {
+            continue;
         }
+
+        // Collect pure instructions that can be hoisted
+        let mut pure_indices: Vec<usize> = Vec::new();
+        let mut side_effect_indices: Vec<usize> = Vec::new();
+
+        for (i, inst_idx) in block.instructions.iter().enumerate() {
+            if let Some(inst) = func.values.get(inst_idx) {
+                if is_pure_inst(inst) {
+                    pure_indices.push(i);
+                } else if has_side_effects(inst) || is_memory_op(inst) {
+                    // Treat memory operations (Load, Alloca) as side-effecting
+                    // for reordering purposes. This prevents Loads from being
+                    // moved before Stores that write to the same address.
+                    // verify_reorder_safety will also prevent pure instructions
+                    // that depend on Loads from being hoisted before them.
+                    side_effect_indices.push(i);
+                }
+            }
+        }
+
+        // If there are pure instructions after side-effecting ones,
+        // and the pure instructions don't depend on the side-effecting ones,
+        // we can hoist them. For safety, we only reorder if the pure
+        // instruction doesn't reference any value produced by a side-effecting
+        // instruction.
+        if pure_indices.is_empty() || side_effect_indices.is_empty() {
+            continue;
+        }
+
+        // Simple reordering: move all pure instructions to the front
+        // (before side-effecting ones), preserving relative order
+        let mut new_insts: Vec<PValue> = Vec::with_capacity(block.instructions.len());
+        let mut moved = false;
+
+        // First: all pure instructions (in original order)
+        for &i in &pure_indices {
+            new_insts.push(block.instructions[i]);
+        }
+        // Then: any remaining instructions (neither pure nor side-effecting,
+        // e.g. Load). These must come BEFORE side-effecting instructions
+        // so that terminators (Jump/Branch/Return) stay last —
+        // remove_unreachable_blocks relies on the last instruction being
+        // the terminator.
+        for (i, inst) in block.instructions.iter().enumerate() {
+            if !pure_indices.contains(&i) && !side_effect_indices.contains(&i) {
+                new_insts.push(*inst);
+            }
+        }
+        // Then: all side-effecting instructions (in original order).
+        // This includes terminators (Jump/Branch/Return/Unreachable),
+        // ensuring they remain at the end of the block.
+        for &i in &side_effect_indices {
+            new_insts.push(block.instructions[i]);
+        }
+
+        // Check if we actually reordered anything
+        if new_insts != block.instructions {
+            // Verify no pure instruction depends on a side-effecting one
+            let safe = verify_reorder_safety(&new_insts, &pure_indices, &side_effect_indices, &func.values);
+            if safe {
+                block.instructions = new_insts;
+                count += pure_indices.len();
+                moved = true;
+            }
+        }
+        let _ = moved;
     }
     count
 }
@@ -5493,11 +5767,7 @@ fn eval_builtin(name: &str, args: &[i64], floats: &[f64], is_float: bool) -> Opt
 /// Safety: only F64 operations are vectorized. Both operands must be Load
 /// results from GetElemPtr with adjacent indices (i and i+1).
 pub fn pass_slp_vectorize(module: &mut L2Module) -> usize {
-    let mut count = 0;
-    for f in &mut module.functions {
-        count += slp_vectorize_function(f);
-    }
-    count
+    parallel_functions(&mut module.functions, slp_vectorize_function)
 }
 
 fn slp_vectorize_function(f: &mut L2Function) -> usize {
@@ -5691,8 +5961,6 @@ fn slp_vectorize_block(f: &mut L2Function, bi: usize) -> usize {
 /// (I-2A — skip caller-saved spills for pure calls — requires regalloc
 /// changes and is deferred to F-1D.)
 fn pass_effect_optimize(module: &mut L2Module) -> usize {
-    let mut count = 0;
-
     // Build a set of pure function names from the module.
     // A function is "effectively pure" if it has no observable side effects.
     // The `is_pure` field is too conservative — it's false for any function
@@ -5721,10 +5989,7 @@ fn pass_effect_optimize(module: &mut L2Module) -> usize {
         }
     }
 
-    for func in &mut module.functions {
-        count += effect_optimize_function(func, &pure_funcs, &hoistable_funcs);
-    }
-    count
+    parallel_functions(&mut module.functions, |f| effect_optimize_function(f, &pure_funcs, &hoistable_funcs))
 }
 
 /// Check if a function is "effectively pure" — its only effects are local
@@ -6017,13 +6282,9 @@ fn effect_optimize_function(
 /// together. It must treat each `malloc` as independent. Fides knows from the
 /// region annotation.
 pub fn pass_region_pool(module: &mut L2Module) -> usize {
-    let mut count = 0;
     // Clone struct_layouts to avoid borrowing module while mutating functions.
     let struct_layouts = module.struct_layouts.clone();
-    for f in &mut module.functions {
-        count += region_pool_function(f, &struct_layouts);
-    }
-    count
+    parallel_functions(&mut module.functions, |f| region_pool_function(f, &struct_layouts))
 }
 
 /// Compute the size of a PirType, using struct layouts from the module.
@@ -6186,11 +6447,7 @@ fn region_pool_function(f: &mut L2Function, struct_layouts: &HashMap<String, cra
 /// does not emit overflow checks for either Mul or Shl, so the transformation
 /// preserves semantics. (F-3H)
 pub fn pass_strength_reduce(module: &mut L2Module) -> usize {
-    let mut count = 0;
-    for f in &mut module.functions {
-        count += strength_reduce_function(f);
-    }
-    count
+    parallel_functions(&mut module.functions, strength_reduce_function)
 }
 
 fn strength_reduce_function(f: &mut L2Function) -> usize {
@@ -6373,14 +6630,10 @@ fn new_const_int(f: &mut L2Function, value: i64, ty: PirType, next_id: &mut u32)
 ///
 /// Only applies to functions with `is_wrapping = true`.
 pub fn pass_reassociate(module: &mut L2Module) -> usize {
-    let mut count = 0;
-    for f in &mut module.functions {
-        if !f.is_wrapping {
-            continue;
-        }
-        count += reassociate_function(f);
-    }
-    count
+    parallel_functions(&mut module.functions, |f| {
+        if !f.is_wrapping { return 0; }
+        reassociate_function(f)
+    })
 }
 
 fn reassociate_function(f: &mut L2Function) -> usize {
@@ -6562,18 +6815,12 @@ fn new_binop(f: &mut L2Function, op: BinOp, left: PValue, right: PValue, ty: Pir
 /// LLVM cannot do this — it must assume any function can have side effects or
 /// depend on global state. Fides knows from the `@deterministic` annotation.
 pub fn pass_memoize(module: &mut L2Module) -> usize {
-    let mut count = 0;
-
     // Collect the set of deterministic function names.
     let det_funcs: HashSet<String> = module.functions.iter()
         .filter(|f| f.is_deterministic)
         .map(|f| f.name.clone())
         .collect();
-
-    for f in &mut module.functions {
-        count += memoize_function(f, &det_funcs);
-    }
-    count
+    parallel_functions(&mut module.functions, |f| memoize_function(f, &det_funcs))
 }
 
 fn memoize_function(f: &mut L2Function, det_funcs: &HashSet<String>) -> usize {

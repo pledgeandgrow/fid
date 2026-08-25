@@ -2,6 +2,12 @@
 
 > How Fides eliminates entire classes of binary-level and language-level exploits
 > — without sacrificing the power of C, Rust, or Zig.
+>
+> **Note:** This is a reference document, not a roadmap. The security annotations
+> and binary hardening features documented here are implemented and tracked in
+> `roadmap.md` Phase 12. The "Not Yet Prevented" items (CFI, full taint
+> propagation, runtime sandbox, runtime resource limits) are tracked as
+> Phase 12 remaining work in `roadmap.md`.
 
 ## Design Philosophy
 

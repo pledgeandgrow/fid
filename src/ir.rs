@@ -101,6 +101,17 @@ impl IrType {
         matches!(self, IrType::Ptr(_))
     }
 
+    /// Is this pointer-like (a pointer, an opaque handle, or a generic that
+    /// represents a heap-allocated collection)?  These all occupy one machine
+    /// word and can be stored interchangeably in a let-binding's alloca.
+    pub fn is_ptr_like(&self) -> bool {
+        matches!(self,
+            IrType::Ptr(_)
+            | IrType::Opaque(_)
+            | IrType::Generic(..)
+        )
+    }
+
     /// Check if this type is a named opaque or generic with the given name
     /// e.g. `is_opaque_named("Vec")` matches both `Opaque("Vec")` and `Generic("Vec", _)`
     pub fn is_opaque_named(&self, name: &str) -> bool {
