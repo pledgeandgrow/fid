@@ -199,16 +199,16 @@ implemented via a two-pass approach:
 
 This allows patterns like:
 ```
-pv mut v = 10;
-pv r = &v;       // borrow v
+var v = 10;
+val r = &v;       // borrow v
 print(*r);       // last use of r — borrow ends here (NLL)
 v = 20;          // OK — r is dead, borrow released
 ```
 
 While still correctly rejecting:
 ```
-pv mut n = 10;
-pv nr = &n;       // borrow n
+var n = 10;
+val nr = &n;       // borrow n
 n = 20;           // ERROR — nr is still live (used below)
 print(*nr);       // nr used after mutation
 ```

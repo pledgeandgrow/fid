@@ -743,6 +743,20 @@ pub enum Inst {
     UnsafeBegin,
     /// End an unsafe block — resume bounds checking.
     UnsafeEnd,
+
+    // ─── Autograd (ML3: Effect-Traced Autodiff) ───
+    /// Begin a grad block — the interpreter enables gradient tracking for
+    /// tensor operations. `var_name` is the variable to compute gradients for.
+    GradBegin {
+        var_name: String,
+    },
+    /// End a grad block — disable gradient tracking.
+    GradEnd,
+    /// Backward pass — compute gradients by reverse-mode AD.
+    /// `loss` is the loss tensor to differentiate.
+    Backward {
+        loss: ValueId,
+    },
 }
 
 impl Inst {
@@ -786,6 +800,9 @@ impl Inst {
             Inst::TxnEnd => IrType::Void,
             Inst::UnsafeBegin => IrType::Void,
             Inst::UnsafeEnd => IrType::Void,
+            Inst::GradBegin { .. } => IrType::Void,
+            Inst::GradEnd => IrType::Void,
+            Inst::Backward { .. } => IrType::Void,
         }
     }
 
@@ -820,6 +837,8 @@ impl Inst {
             Inst::PersistSave { .. } => effects.add(Effect::Write),
             Inst::TxnBegin | Inst::TxnEnd => effects.add(Effect::Write),
             Inst::UnsafeBegin | Inst::UnsafeEnd => {}
+            Inst::GradBegin { .. } | Inst::GradEnd => effects.add(Effect::Diff),
+            Inst::Backward { .. } => effects.add(Effect::Diff),
             _ => {}
         }
         effects
@@ -865,6 +884,9 @@ impl Inst {
             Inst::TxnEnd => "TxnEnd",
             Inst::UnsafeBegin => "UnsafeBegin",
             Inst::UnsafeEnd => "UnsafeEnd",
+            Inst::GradBegin { .. } => "GradBegin",
+            Inst::GradEnd => "GradEnd",
+            Inst::Backward { .. } => "Backward",
         }
     }
 
@@ -926,6 +948,8 @@ impl Inst {
             Inst::PersistLoad { default, .. } => vec![*default],
             Inst::PersistSave { value, .. } => vec![*value],
             Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd => vec![],
+            Inst::GradBegin { .. } | Inst::GradEnd => vec![],
+            Inst::Backward { loss } => vec![*loss],
         }
     }
 }
@@ -984,6 +1008,9 @@ pub struct IrFunction {
     /// Persist variables in this function — (name, alloca_ptr)
     /// Used to emit PersistSave before returns
     pub persist_vars: Vec<(String, ValueId)>,
+    /// Drop-eligible locals — (alloca_ptr, struct_name) for variables whose
+    /// type implements Drop. The compiler inserts drop calls at exit points.
+    pub drop_locals: Vec<(ValueId, String)>,
     /// Whether this function is annotated @wrapping (F65).
     /// @wrapping functions use wrap-around arithmetic instead of checked arithmetic.
     pub is_wrapping: bool,
@@ -1026,6 +1053,7 @@ impl IrFunction {
             locals: HashMap::new(),
             is_interrupt: false,
             persist_vars: Vec::new(),
+            drop_locals: Vec::new(),
             is_wrapping: false,
             is_deterministic: false,
             is_crashfree: false,

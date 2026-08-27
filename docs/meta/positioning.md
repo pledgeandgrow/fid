@@ -42,7 +42,7 @@ Every new language faces the chicken-and-egg problem:
 > - ✅ **FixedBufferAllocator** — deterministic, no-allocation embedded memory management is operational (`src/embedded.rs`)
 > - ✅ **Hot reload** — native JIT + function-level change detection works
 > - ✅ **C interop** — C header parser → Fides FFI bindings (`src/cparser.rs`) is functional
-> - ✅ **C codegen backend** — 116/116 test parity (full parity with interpreter)
+> - ✅ **C codegen backend** — 146/146 test parity
 >
 > These niches are no longer aspirational — the foundational capabilities are built and running.
 
@@ -102,7 +102,7 @@ Every new language faces the chicken-and-egg problem:
 SSL_CTX* SSL_CTX_new(const SSL_METHOD* method);
 
 // Output: Fides FFI binding
-extern "C" pf SSL_CTX_new(method: *const SSL_METHOD) -> *mut SSL_CTX;
+extern "C" fn SSL_CTX_new(method: *const SSL_METHOD) -> *mut SSL_CTX;
 ```
 - Parse C headers automatically
 - Generate Fides FFI bindings
@@ -311,7 +311,7 @@ Advocacy (people recommend Fides to others)
 > - ✅ **`watch --diff` works** — PIR L2 line diff + binary size delta on each reload
 > - ✅ **Capability-aware linking works** — `--caps` flag strips ungranted functions from binary
 > - ✅ **Optimizer enabled by default** — 23 passes including const-fold, CSE, GVN, DCE, DSE, inline, unroll, TCO, loop-vec, SLP. `--lto` for aggressive cross-module inlining.
-> - ✅ **C codegen at 116/116 test parity** — Full parity with interpreter. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic.
+> - ✅ **C codegen at 146/146 test parity** — 1 fail: test_autodiff_grad. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic.
 > - ✅ **LSP server works** — `fidesc lsp` provides JSON-RPC over stdio with diagnostics, completion, hover, goto-definition. No external dependencies.
 > - ✅ **Generic enums/structs work** — `enum Option<T>`, `struct Foo<T>` with type parameters
 > - ✅ **Concurrency works** — `spawn` (OS threads), bounded MPSC channels (`p_chan_*`), executor runtime (`p_executor_*`), async IO (`p_net_*`, `p_fs_read_async`), `select` statement
@@ -653,7 +653,7 @@ codegen will improve over time; C's compilation model won't.
 | Feature | C | Fides |
 |---------|---|---|
 | Hot reload | ❌ None | ✅ `fidesc watch` — native JIT, function-level detection |
-| Persist state across reloads | ❌ None | ✅ `persist pv x = 0;` |
+| Persist state across reloads | ❌ None | ✅ `persist val x = 0;` |
 | See optimizer changes | ❌ None | ✅ `fidesc watch --diff` |
 | REPL | ❌ None | ✅ `fidesc repl` |
 | Error messages | ❌ Cryptic preprocessor errors | ⚠️ Structured but less detailed than Rust/Go |
@@ -681,7 +681,7 @@ without losing state. C requires a full recompile.
 | Generic code | ⚠️ `_Generic` + macros (ugly) | ✅ Generics `<T>` + traits |
 | Reflection | ❌ None | ✅ `comptime` reflection (field_names, field_types, etc.) |
 | Code generation | ❌ Preprocessor hacks | ✅ `comptime gen { }` — parse string as Fides source, inject |
-| Type-safe macros | ❌ None | ✅ `comptime pf` — compile-time functions with types |
+| Type-safe macros | ❌ None | ✅ `comptime fn` — compile-time functions with types |
 
 **Verdict:** C's preprocessor is a text substitution engine that creates
 bugs. Fides's comptime is a type-safe compile-time evaluation system with
@@ -851,7 +851,7 @@ massively on compilation speed — this is Rust's #1 pain point and Fides's
 | Feature | Rust | Fides |
 |---------|------|---|
 | Hot reload | ❌ None (full recompile) | ✅ `fidesc watch` (native JIT) |
-| Persist state across reloads | ❌ None | ✅ `persist pv x = 0;` |
+| Persist state across reloads | ❌ None | ✅ `persist val x = 0;` |
 | See optimizer changes | ❌ None (LLVM black box) | ✅ `fidesc watch --diff` |
 | REPL | ❌ None (evcxr is external) | ✅ `fidesc repl` |
 | Error messages | ✅ Excellent (detailed, helpful, with suggestions) | ⚠️ Basic (line/column, no suggestions) |
@@ -889,7 +889,7 @@ rust-analyzer) — Fides needs to build that infrastructure.
 | Macros | ⚠️ Two systems (declarative + proc) | ✅ `comptime gen { }` (one system) |
 | Reflection | ❌ None (no reflection in safe Rust) | ✅ `comptime` reflection |
 | Code generation | ⚠️ Proc macros (external crate, complex) | ✅ `comptime gen { }` (built-in) |
-| Type-safe macros | ⚠️ Proc macros are not type-checked | ✅ `comptime pf` is type-safe |
+| Type-safe macros | ⚠️ Proc macros are not type-checked | ✅ `comptime fn` is type-safe |
 | Derive macros | ✅ `#[derive(Debug, Clone, Serialize)]` (powerful) | ✅ `@derive(Debug, Clone, Serialize, Deserialize)` |
 | Build scripts | ⚠️ `build.rs` (separate file) | ✅ `comptime` (inline, same file) |
 | Serde (serialization) | ✅ `#[derive(Serialize, Deserialize)]` | ✅ `@derive(Serialize, Deserialize)` → JSON |
@@ -1093,7 +1093,7 @@ optimization quality today.
 | Feature | Zig | Fides |
 |---------|-----|---|
 | Hot reload | ⚠️ Partial (Zap, not native) | ✅ `fidesc watch` (native JIT) |
-| Persist state across reloads | ❌ None | ✅ `persist pv x = 0;` |
+| Persist state across reloads | ❌ None | ✅ `persist val x = 0;` |
 | See optimizer changes | ❌ None (LLVM black box) | ✅ `fidesc watch --diff` |
 | REPL | ❌ None | ✅ `fidesc repl` |
 | Error messages | ✅ Excellent (detailed, helpful) | ✅ Structured (error codes, source context, suggestions) |
@@ -1711,7 +1711,7 @@ in <1ms. That's something Go and Node.js cannot match.
 
 | Fides Feature | Benefit | Impossible In |
 |-----------|---------|---------------|
-| `@differentiable` | Compiler traces IR, auto-generates backward pass | Python (PyTorch runtime), C++ (manual), Mojo (yes but new) |
+| `@differentiable` | ⚠️ Typechecker proves differentiability (no IO/Net/Spawn). Autograd transform NOT implemented — no backward pass generated. See Issue 7. | Python (PyTorch runtime), C++ (manual), Mojo (yes but new) |
 | `@no_grad` | Disable gradient tracking for inference — zero overhead | Python (torch.no_grad() but runtime), C++ (manual) |
 | Shape types | Compile-time dimension checking — shape mismatch = compile error | Python (runtime), C++ (no), Mojo (partial) |
 | `@shader` / GPU | Write GPU kernels in Fides, compiler emits SPIR-V | Python (CUDA strings), C++ (CUDA strings) |

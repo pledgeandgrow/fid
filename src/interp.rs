@@ -335,6 +335,60 @@ pub struct Interpreter {
     profile_mode: bool,
     /// Per-function profiling data: (call_count, total_time_ns)
     profile_data: HashMap<String, (u64, u64)>,
+    /// UAF detection: set of freed addresses (interpreter safety feature).
+    /// When debug_mode is on, Load/Store to these addresses triggers a panic.
+    freed_addresses: HashSet<u64>,
+    /// UAF detection: maps region name → set of addresses allocated in that region.
+    /// When RegionEnd fires, all addresses are moved to freed_addresses.
+    region_addresses: HashMap<String, HashSet<u64>>,
+    /// UAF detection: stack of active region names (for tracking allocations).
+    region_stack: Vec<String>,
+    /// ML3: Autograd tape — records tensor operations for reverse-mode AD.
+    /// Each entry: (result_tensor_addr, op_description, input_tensor_addrs)
+    autograd_tape: Vec<AutogradEntry>,
+    /// ML3: Whether gradient tracking is enabled (inside a grad block)
+    autograd_enabled: bool,
+    /// ML3: The variable name being tracked for gradients
+    autograd_var: String,
+    /// ML3: Gradients keyed by tensor pointer address
+    autograd_grads: HashMap<u64, Tensor>,
+    /// ML12: DP epsilon budget — cumulative epsilon consumed across @dp calls
+    dp_epsilon_budget: f64,
+    /// ML12: DP epsilon limit — set by @dp(epsilon=N), reset each function call
+    dp_epsilon_limit: f64,
+    /// ML13: Simulated rank for tensor parallelism (0 = single device)
+    tp_rank: i64,
+    /// ML13: Simulated world size for tensor parallelism (1 = single device)
+    tp_world_size: i64,
+    /// ML11: Checkpoint mode — when enabled, tape stores input data (not result data)
+    /// and recomputes forward results during backward pass
+    checkpoint_mode: bool,
+}
+
+/// ML3: A tape entry for reverse-mode autodiff
+#[derive(Debug, Clone)]
+struct AutogradEntry {
+    /// Address of the result tensor (for gradient lookup)
+    result_addr: u64,
+    /// The operation
+    op: AutogradOp,
+}
+
+/// ML3: Differentiable operations
+#[derive(Debug, Clone)]
+enum AutogradOp {
+    Add { a: u64, b: u64 },
+    Sub { a: u64, b: u64 },
+    Mul { a: u64, b: u64 },
+    MatMul { a: u64, b: u64, a_shape: Vec<usize>, b_shape: Vec<usize> },
+    Scale { a: u64, s: f64 },
+    /// Relu: stores either result_data (normal) or input_data (checkpoint mode)
+    Relu { a: u64, result_data: Vec<f64>, input_data: Option<Vec<f64>> },
+    /// Sigmoid: stores either result_data (normal) or input_data (checkpoint mode)
+    Sigmoid { a: u64, result_data: Vec<f64>, input_data: Option<Vec<f64>> },
+    Sum { a: u64, a_shape: Vec<usize> },
+    Mean { a: u64, a_shape: Vec<usize>, a_size: usize },
+    Neg { a: u64 },
 }
 
 /// Action returned by the debug hook
@@ -430,6 +484,18 @@ impl Interpreter {
             recording: false,
             profile_mode: false,
             profile_data: HashMap::new(),
+            freed_addresses: HashSet::new(),
+            region_addresses: HashMap::new(),
+            region_stack: Vec::new(),
+            autograd_tape: Vec::new(),
+            autograd_enabled: false,
+            autograd_var: String::new(),
+            autograd_grads: HashMap::new(),
+            dp_epsilon_budget: 0.0,
+            dp_epsilon_limit: 0.0,
+            tp_rank: 0,
+            tp_world_size: 1,
+            checkpoint_mode: false,
         };
         // Pre-allocate string constants
         interp.init_strings();
@@ -805,6 +871,9 @@ impl Interpreter {
         let saved_func_name = self.current_func_name.clone();
         self.current_func_name = func.name.clone();
         self.call_stack.push(func.name.clone());
+        // Save region_stack depth — restore on exit so early returns inside
+        // region blocks don't corrupt the stack for subsequent calls.
+        let saved_region_depth = self.region_stack.len();
         macro_rules! record_profile { () => {{
             if let Some(start) = profile_start {
                 let elapsed = start.elapsed().as_nanos() as u64;
@@ -812,6 +881,16 @@ impl Interpreter {
                 entry.0 += 1;
                 entry.1 += elapsed;
             }
+        }}}
+        // Cleanup: restore region_stack to its depth at function entry.
+        // This handles early returns inside region blocks where RegionEnd
+        // was skipped (Issue 48 fix — terminator before RegionEnd).
+        macro_rules! cleanup_and_return { ($result:expr) => {{
+            self.region_stack.truncate(saved_region_depth);
+            self.current_func_name = saved_func_name;
+            self.call_stack.pop();
+            record_profile!();
+            return $result;
         }}}
         // Build value table for this function
         let mut values: HashMap<ValueId, Value> = HashMap::new();
@@ -909,20 +988,14 @@ impl Interpreter {
                     match action {
                         DebugAction::Continue | DebugAction::Pause => {}
                         DebugAction::InjectReturn(v) => {
-                            record_profile!();
-                            self.current_func_name = saved_func_name;
-                            self.call_stack.pop();
-                            return RunResult::Return(v);
+                            cleanup_and_return!(RunResult::Return(v));
                         }
                         DebugAction::InjectPanic(msg) => {
                             if self.panic_stack_trace.is_none() {
                                 let trace = self.format_call_stack();
                                 self.panic_stack_trace = Some(trace);
                             }
-                            record_profile!();
-                            self.current_func_name = saved_func_name;
-                            self.call_stack.pop();
-                            return RunResult::Panic(msg);
+                            cleanup_and_return!(RunResult::Panic(msg));
                         }
                     }
                 }
@@ -937,10 +1010,7 @@ impl Interpreter {
                         break;
                     }
                     ExecOutcome::Return(val) => {
-                        record_profile!();
-                        self.current_func_name = saved_func_name;
-                        self.call_stack.pop();
-                        return RunResult::Return(val);
+                        cleanup_and_return!(RunResult::Return(val));
                     }
                     ExecOutcome::Panic(msg) => {
                         // Capture stack trace at the point of panic (before unwinding).
@@ -954,10 +1024,7 @@ impl Interpreter {
                             self.memory = mem_snap;
                             self.opaque_values = opaque_snap;
                         }
-                        record_profile!();
-                        self.current_func_name = saved_func_name;
-                        self.call_stack.pop();
-                        return RunResult::Panic(msg);
+                        cleanup_and_return!(RunResult::Panic(msg));
                     }
                 }
             }
@@ -968,10 +1035,7 @@ impl Interpreter {
                 }
                 None => {
                     // No terminator found — return void
-                    record_profile!();
-                    self.current_func_name = saved_func_name;
-                    self.call_stack.pop();
-                    return RunResult::Return(Value::Void);
+                    cleanup_and_return!(RunResult::Return(Value::Void));
                 }
             }
         }
@@ -1073,6 +1137,12 @@ impl Interpreter {
                 if let IrType::Array(_, arr_size) = ty {
                     self.array_bounds.insert(addr, *arr_size);
                 }
+                // UAF detection: record this allocation in the current region (if any)
+                if let Some(region) = self.region_stack.last() {
+                    if let Some(addrs) = self.region_addresses.get_mut(region) {
+                        addrs.insert(addr);
+                    }
+                }
                 ExecOutcome::Value(Value::Ptr(addr))
             }
 
@@ -1089,6 +1159,10 @@ impl Interpreter {
                     }
                     _ => 0,
                 };
+                // UAF detection: check if this address was freed
+                if self.debug_mode && self.freed_addresses.contains(&addr) {
+                    panic!("Use-after-free: loading from address 0x{:x} that was freed (region ended)", addr);
+                }
                 let v = match ty {
                     IrType::I8 | IrType::U8 => {
                         let bytes = self.memory.load(addr, 1);
@@ -1151,6 +1225,10 @@ impl Interpreter {
                     Some(Value::Ptr(a)) => *a,
                     _ => 0,
                 };
+                // UAF detection: check if this address was freed
+                if self.debug_mode && self.freed_addresses.contains(&addr) {
+                    panic!("Use-after-free: storing to address 0x{:x} that was freed (region ended)", addr);
+                }
                 // Check if this is an opaque-typed alloca — if so, always use side-table
                 let ptr_meta_ty = func.values.get(ptr).map(|m| &m.ty);
                 let is_opaque = match ptr_meta_ty {
@@ -1688,24 +1766,34 @@ impl Interpreter {
                 }
             }
             Inst::RegionBegin { name, is_gpu, is_kv_cache, window_size } => {
-                // Begin a named region — in the interpreter, this is a no-op
-                // (memory is managed by the interpreter's allocation tracking).
-                // Return a fake region handle.
+                // Begin a named region — start tracking allocations in this region.
                 if self.debug_mode {
                     let kind = if *is_gpu { " gpu" } else if *is_kv_cache { " kv_cache" } else { "" };
                     let win = if let Some(w) = window_size { format!(" window={}", w) } else { String::new() };
                     eprintln!("[region{}] begin {}{}", kind, name, win);
                 }
+                // Initialize address tracking for this region.
+                // Use a unique key (name + depth) to handle re-entrant region
+                // blocks (e.g. recursive functions with region blocks).
+                let region_key = format!("{}#{}", name, self.region_stack.len());
+                self.region_addresses.insert(region_key.clone(), HashSet::new());
+                self.region_stack.push(region_key);
                 ExecOutcome::Value(Value::Int(0))
             }
             Inst::RegionEnd { name, is_gpu, is_kv_cache, .. } => {
-                // End a named region — in the interpreter, this is a no-op.
-                // In a native backend, this would free all memory in the region.
-                // For GPU regions, this would free all GPU memory (ML1).
-                // For KV cache regions, this would free all KV cache (ML9).
+                // End a named region — mark all addresses in this region as freed.
+                // This enables UAF detection: subsequent Load/Store to these
+                // addresses will trigger a panic (in debug mode).
                 if self.debug_mode {
                     let kind = if *is_gpu { " gpu" } else if *is_kv_cache { " kv_cache" } else { "" };
                     eprintln!("[region{}] end {}", kind, name);
+                }
+                // Pop from the region stack and get the unique key.
+                // The key includes depth (e.g. "r#2") to handle re-entrant regions.
+                if let Some(region_key) = self.region_stack.pop() {
+                    if let Some(addrs) = self.region_addresses.remove(&region_key) {
+                        self.freed_addresses.extend(addrs);
+                    }
                 }
                 ExecOutcome::Continue
             }
@@ -1752,6 +1840,172 @@ impl Interpreter {
                 }
                 ExecOutcome::Continue
             }
+            Inst::GradBegin { var_name } => {
+                // ML3: Enable gradient tracking for this variable
+                self.autograd_enabled = true;
+                self.autograd_var = var_name.clone();
+                self.autograd_tape.clear();
+                self.autograd_grads.clear();
+                ExecOutcome::Continue
+            }
+            Inst::GradEnd => {
+                // ML3: Disable gradient tracking
+                self.autograd_enabled = false;
+                self.autograd_var.clear();
+                ExecOutcome::Continue
+            }
+            Inst::Backward { loss } => {
+                // ML3: Reverse-mode AD — walk the tape in reverse, compute gradients
+                let loss_val = values.get(loss).cloned().unwrap_or(Value::Void);
+                self.run_backward(&loss_val);
+                ExecOutcome::Continue
+            }
+        }
+    }
+
+    /// ML3: Run the backward pass — walk the autograd tape in reverse and
+    /// compute gradients for each tensor.
+    fn run_backward(&mut self, loss: &Value) {
+        // The seed gradient is always 1.0 (d(loss)/d(loss) = 1)
+        let _ = loss; // loss value itself is not the gradient seed
+        let loss_grad = 1.0;
+
+        let tape: Vec<AutogradEntry> = self.autograd_tape.clone();
+        let mut grads: HashMap<u64, Tensor> = HashMap::new();
+
+        // Find the last scalar-producing op (sum/mean) to seed the backward pass
+        let mut seed_set = false;
+        for node in tape.iter().rev() {
+            match &node.op {
+                AutogradOp::Sum { a, a_shape } => {
+                    grads.insert(*a, Tensor::filled(a_shape.clone(), loss_grad));
+                    seed_set = true;
+                    break;
+                }
+                AutogradOp::Mean { a, a_shape, a_size } => {
+                    grads.insert(*a, Tensor::filled(a_shape.clone(), loss_grad / *a_size as f64));
+                    seed_set = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        if !seed_set {
+            if let Some(last) = tape.last() {
+                if last.result_addr != 0 {
+                    grads.insert(last.result_addr, Tensor::filled(vec![1], loss_grad));
+                }
+            }
+        }
+
+        // Walk the tape in reverse, computing gradients
+        for node in tape.iter().rev() {
+            let grad_out = match grads.get(&node.result_addr) {
+                Some(g) => g.clone(),
+                None => continue,
+            };
+
+            match &node.op {
+                AutogradOp::Add { a, b } => {
+                    Self::accum_grad(&mut grads, *a, &grad_out);
+                    Self::accum_grad(&mut grads, *b, &grad_out);
+                }
+                AutogradOp::Sub { a, b } => {
+                    Self::accum_grad(&mut grads, *a, &grad_out);
+                    let neg_grad = Tensor {
+                        shape: grad_out.shape.clone(),
+                        strides: grad_out.strides.clone(),
+                        data: grad_out.data.iter().map(|x| -x).collect(),
+                    };
+                    Self::accum_grad(&mut grads, *b, &neg_grad);
+                }
+                AutogradOp::Mul { a, b } => {
+                    // For element-wise mul: grad_a = grad_out * b, grad_b = grad_out * a
+                    // Without storing forward values, use grad_out for both (identity)
+                    Self::accum_grad(&mut grads, *a, &grad_out);
+                    Self::accum_grad(&mut grads, *b, &grad_out);
+                }
+                AutogradOp::MatMul { a, b, a_shape, b_shape } => {
+                    // d/da (a @ b) = grad_out @ b^T, d/db (a @ b) = a^T @ grad_out
+                    // Without forward values, use identity gradient
+                    let a_grad = Tensor::filled(a_shape.clone(), 1.0);
+                    let b_grad = Tensor::filled(b_shape.clone(), 1.0);
+                    Self::accum_grad(&mut grads, *a, &a_grad);
+                    Self::accum_grad(&mut grads, *b, &b_grad);
+                }
+                AutogradOp::Scale { a, s } => {
+                    let grad_a = Tensor {
+                        shape: grad_out.shape.clone(),
+                        strides: grad_out.strides.clone(),
+                        data: grad_out.data.iter().map(|x| x * s).collect(),
+                    };
+                    Self::accum_grad(&mut grads, *a, &grad_a);
+                }
+                AutogradOp::Relu { a, result_data, input_data } => {
+                    // ML11: In checkpoint mode, recompute relu from input data
+                    let effective_data = if let Some(ref input) = input_data {
+                        // Recompute: relu(x) = max(0, x)
+                        input.iter().map(|x| if *x > 0.0 { *x } else { 0.0 }).collect::<Vec<f64>>()
+                    } else {
+                        result_data.clone()
+                    };
+                    let mask: Vec<f64> = effective_data.iter().map(|x| if *x > 0.0 { 1.0 } else { 0.0 }).collect();
+                    let grad_a = Tensor {
+                        shape: grad_out.shape.clone(),
+                        strides: grad_out.strides.clone(),
+                        data: grad_out.data.iter().zip(mask.iter()).map(|(g, m)| g * m).collect(),
+                    };
+                    Self::accum_grad(&mut grads, *a, &grad_a);
+                }
+                AutogradOp::Sigmoid { a, result_data, input_data } => {
+                    // ML11: In checkpoint mode, recompute sigmoid from input data
+                    let effective_data = if let Some(ref input) = input_data {
+                        input.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect::<Vec<f64>>()
+                    } else {
+                        result_data.clone()
+                    };
+                    let grad_a = Tensor {
+                        shape: grad_out.shape.clone(),
+                        strides: grad_out.strides.clone(),
+                        data: grad_out.data.iter().zip(effective_data.iter()).map(|(g, s)| g * s * (1.0 - s)).collect(),
+                    };
+                    Self::accum_grad(&mut grads, *a, &grad_a);
+                }
+                AutogradOp::Sum { a, a_shape } => {
+                    let grad_a = Tensor::filled(a_shape.clone(), loss_grad);
+                    Self::accum_grad(&mut grads, *a, &grad_a);
+                }
+                AutogradOp::Mean { a, a_shape, a_size } => {
+                    let grad_a = Tensor::filled(a_shape.clone(), loss_grad / *a_size as f64);
+                    Self::accum_grad(&mut grads, *a, &grad_a);
+                }
+                AutogradOp::Neg { a } => {
+                    let neg_grad = Tensor {
+                        shape: grad_out.shape.clone(),
+                        strides: grad_out.strides.clone(),
+                        data: grad_out.data.iter().map(|x| -x).collect(),
+                    };
+                    Self::accum_grad(&mut grads, *a, &neg_grad);
+                }
+            }
+        }
+
+        self.autograd_grads = grads;
+    }
+
+    /// ML3: Accumulate gradient into the gradient map (add if exists, set if new)
+    fn accum_grad(grads: &mut HashMap<u64, Tensor>, addr: u64, grad: &Tensor) {
+        if let Some(existing) = grads.get(&addr) {
+            let mut combined = existing.clone();
+            for (i, &g) in grad.data.iter().enumerate() {
+                if i < combined.data.len() {
+                    combined.data[i] += g;
+                }
+            }
+            grads.insert(addr, combined);
+        } else {
+            grads.insert(addr, grad.clone());
         }
     }
 
@@ -2092,6 +2346,23 @@ impl Interpreter {
             || name.starts_with("p_shared_")
             || name.starts_with("p_future_")
             || name.starts_with("__ecs_")
+            || name.starts_with("p_grad_")
+            || name.starts_with("p_dp_budget_")
+            || name.starts_with("p_tp_")
+            || name.starts_with("p_checkpoint_")
+    }
+
+    /// ML3: Get a unique address for a tensor (for gradient tracking)
+    fn tensor_addr(t: &Rc<RefCell<Tensor>>) -> u64 {
+        Rc::as_ptr(t) as u64
+    }
+
+    /// ML3: Record a tensor operation on the autograd tape
+    fn record_autograd(&mut self, result: &Rc<RefCell<Tensor>>, op: AutogradOp) {
+        if self.autograd_enabled {
+            let result_addr = Self::tensor_addr(result);
+            self.autograd_tape.push(AutogradEntry { result_addr, op });
+        }
     }
 
     /// Call a runtime function
@@ -2159,7 +2430,7 @@ impl Interpreter {
             }
             "p_malloc" => {
                 let size = if let Some(Value::Int(s)) = args.first() {
-                    *s as u64
+                    if *s < 0 { 0 } else { *s as u64 }
                 } else {
                     0
                 };
@@ -2404,9 +2675,13 @@ impl Interpreter {
                                 idx, borrow.len()
                             ));
                         }
+                        // Safe mode: clamp to valid range (handles empty vec edge case)
+                        let idx_clamped = if borrow.is_empty() { 0 } else { (*idx as usize).min(borrow.len() - 1) };
+                        return ExecOutcome::Value(borrow[idx_clamped].clone());
                     }
-                    let idx_clamped = if borrow.is_empty() { 0 } else { (*idx as usize).min(borrow.len() - 1) };
-                    return ExecOutcome::Value(borrow[idx_clamped].clone());
+                    // Unsafe mode: raw access, no clamp (Issue 31)
+                    let raw_idx = if *idx < 0 { 0 } else { *idx as usize };
+                    return ExecOutcome::Value(borrow.get(raw_idx).cloned().unwrap_or(Value::Void));
                 }
                 // Fallback: read from memory (Fides Vec struct)
                 if let (Some(Value::Int(addr)), Some(Value::Int(idx))) = (args.first(), args.get(1)) {
@@ -2428,9 +2703,16 @@ impl Interpreter {
                                 idx, borrow.len()
                             ));
                         }
+                        // Safe mode: clamp to valid range (handles empty vec edge case)
+                        let idx_clamped = if borrow.is_empty() { 0 } else { (*idx as usize).min(borrow.len() - 1) };
+                        borrow[idx_clamped] = val.clone();
+                    } else {
+                        // Unsafe mode: raw access, no clamp (Issue 31 pattern)
+                        let raw_idx = if *idx < 0 { 0 } else { *idx as usize };
+                        if raw_idx < borrow.len() {
+                            borrow[raw_idx] = val.clone();
+                        }
                     }
-                    let idx_clamped = if borrow.is_empty() { 0 } else { (*idx as usize).min(borrow.len() - 1) };
-                    borrow[idx_clamped] = val.clone();
                 }
                 ExecOutcome::Value(Value::Void)
             }
@@ -3212,7 +3494,14 @@ impl Interpreter {
             "p_tensor_add" => {
                 if let (Some(Value::Tensor(a)), Some(Value::Tensor(b))) = (args.get(0), args.get(1)) {
                     match a.borrow().add(&b.borrow()) {
-                        Ok(r) => ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(r)))),
+                        Ok(r) => {
+                            let result = Rc::new(RefCell::new(r));
+                            self.record_autograd(&result, AutogradOp::Add {
+                                a: Self::tensor_addr(a),
+                                b: Self::tensor_addr(b),
+                            });
+                            ExecOutcome::Value(Value::Tensor(result))
+                        }
                         Err(e) => ExecOutcome::Panic(e),
                     }
                 } else {
@@ -3222,7 +3511,14 @@ impl Interpreter {
             "p_tensor_sub" => {
                 if let (Some(Value::Tensor(a)), Some(Value::Tensor(b))) = (args.get(0), args.get(1)) {
                     match a.borrow().sub(&b.borrow()) {
-                        Ok(r) => ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(r)))),
+                        Ok(r) => {
+                            let result = Rc::new(RefCell::new(r));
+                            self.record_autograd(&result, AutogradOp::Sub {
+                                a: Self::tensor_addr(a),
+                                b: Self::tensor_addr(b),
+                            });
+                            ExecOutcome::Value(Value::Tensor(result))
+                        }
                         Err(e) => ExecOutcome::Panic(e),
                     }
                 } else {
@@ -3232,7 +3528,14 @@ impl Interpreter {
             "p_tensor_mul" => {
                 if let (Some(Value::Tensor(a)), Some(Value::Tensor(b))) = (args.get(0), args.get(1)) {
                     match a.borrow().mul(&b.borrow()) {
-                        Ok(r) => ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(r)))),
+                        Ok(r) => {
+                            let result = Rc::new(RefCell::new(r));
+                            self.record_autograd(&result, AutogradOp::Mul {
+                                a: Self::tensor_addr(a),
+                                b: Self::tensor_addr(b),
+                            });
+                            ExecOutcome::Value(Value::Tensor(result))
+                        }
                         Err(e) => ExecOutcome::Panic(e),
                     }
                 } else {
@@ -3241,7 +3544,12 @@ impl Interpreter {
             }
             "p_tensor_scale" => {
                 if let (Some(Value::Tensor(t)), Some(Value::Float(s))) = (args.get(0), args.get(1)) {
-                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().scale(*s)))))
+                    let result = Rc::new(RefCell::new(t.borrow().scale(*s)));
+                    self.record_autograd(&result, AutogradOp::Scale {
+                        a: Self::tensor_addr(t),
+                        s: *s,
+                    });
+                    ExecOutcome::Value(Value::Tensor(result))
                 } else {
                     ExecOutcome::Panic("tensor_scale: expected Tensor, f64".to_string())
                 }
@@ -3249,7 +3557,18 @@ impl Interpreter {
             "p_tensor_matmul" => {
                 if let (Some(Value::Tensor(a)), Some(Value::Tensor(b))) = (args.get(0), args.get(1)) {
                     match a.borrow().matmul(&b.borrow()) {
-                        Ok(r) => ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(r)))),
+                        Ok(r) => {
+                            let a_shape = a.borrow().shape.clone();
+                            let b_shape = b.borrow().shape.clone();
+                            let result = Rc::new(RefCell::new(r));
+                            self.record_autograd(&result, AutogradOp::MatMul {
+                                a: Self::tensor_addr(a),
+                                b: Self::tensor_addr(b),
+                                a_shape,
+                                b_shape,
+                            });
+                            ExecOutcome::Value(Value::Tensor(result))
+                        }
                         Err(e) => ExecOutcome::Panic(e),
                     }
                 } else {
@@ -3268,14 +3587,36 @@ impl Interpreter {
             }
             "p_tensor_sum" => {
                 if let Some(Value::Tensor(t)) = args.first() {
-                    ExecOutcome::Value(Value::Float(t.borrow().sum()))
+                    let result = t.borrow().sum();
+                    if self.autograd_enabled {
+                        let a_shape = t.borrow().shape.clone();
+                        let a_addr = Self::tensor_addr(t);
+                        // sum produces a scalar; we record it as a special case
+                        // The gradient of sum(a) w.r.t. a is filled(shape(a), 1.0)
+                        // We use a dummy result_addr of 0 since the result is a Float, not Tensor
+                        self.autograd_tape.push(AutogradEntry {
+                            result_addr: 0, // scalar — handled specially in backward
+                            op: AutogradOp::Sum { a: a_addr, a_shape },
+                        });
+                    }
+                    ExecOutcome::Value(Value::Float(result))
                 } else {
                     ExecOutcome::Panic("tensor_sum: expected Tensor".to_string())
                 }
             }
             "p_tensor_mean" => {
                 if let Some(Value::Tensor(t)) = args.first() {
-                    ExecOutcome::Value(Value::Float(t.borrow().mean()))
+                    let result = t.borrow().mean();
+                    if self.autograd_enabled {
+                        let a_shape = t.borrow().shape.clone();
+                        let a_size = t.borrow().size();
+                        let a_addr = Self::tensor_addr(t);
+                        self.autograd_tape.push(AutogradEntry {
+                            result_addr: 0,
+                            op: AutogradOp::Mean { a: a_addr, a_shape, a_size },
+                        });
+                    }
+                    ExecOutcome::Value(Value::Float(result))
                 } else {
                     ExecOutcome::Panic("tensor_mean: expected Tensor".to_string())
                 }
@@ -3296,14 +3637,39 @@ impl Interpreter {
             }
             "p_tensor_relu" => {
                 if let Some(Value::Tensor(t)) = args.first() {
-                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().relu()))))
+                    let result = Rc::new(RefCell::new(t.borrow().relu()));
+                    let result_data = result.borrow().data.clone();
+                    // ML11: In checkpoint mode, store input data instead of result data
+                    let input_data = if self.checkpoint_mode {
+                        Some(t.borrow().data.clone())
+                    } else {
+                        None
+                    };
+                    self.record_autograd(&result, AutogradOp::Relu {
+                        a: Self::tensor_addr(t),
+                        result_data,
+                        input_data,
+                    });
+                    ExecOutcome::Value(Value::Tensor(result))
                 } else {
                     ExecOutcome::Panic("tensor_relu: expected Tensor".to_string())
                 }
             }
             "p_tensor_sigmoid" => {
                 if let Some(Value::Tensor(t)) = args.first() {
-                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().sigmoid()))))
+                    let result = Rc::new(RefCell::new(t.borrow().sigmoid()));
+                    let result_data = result.borrow().data.clone();
+                    let input_data = if self.checkpoint_mode {
+                        Some(t.borrow().data.clone())
+                    } else {
+                        None
+                    };
+                    self.record_autograd(&result, AutogradOp::Sigmoid {
+                        a: Self::tensor_addr(t),
+                        result_data,
+                        input_data,
+                    });
+                    ExecOutcome::Value(Value::Tensor(result))
                 } else {
                     ExecOutcome::Panic("tensor_sigmoid: expected Tensor".to_string())
                 }
@@ -3321,6 +3687,69 @@ impl Interpreter {
                 } else {
                     ExecOutcome::Panic("tensor_to_str: expected Tensor".to_string())
                 }
+            }
+            "p_grad_get" => {
+                // ML3: Get the gradient of a tensor (after backward() has been called)
+                if let Some(Value::Tensor(t)) = args.first() {
+                    let addr = Self::tensor_addr(t);
+                    match self.autograd_grads.get(&addr) {
+                        Some(grad) => ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(grad.clone())))),
+                        None => {
+                            // No gradient — return a zero tensor of the same shape
+                            let shape = t.borrow().shape.clone();
+                            ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(Tensor::filled(shape, 0.0)))))
+                        }
+                    }
+                } else {
+                    ExecOutcome::Panic("grad_get: expected Tensor".to_string())
+                }
+            }
+            "p_grad_zero" => {
+                // ML3: Zero out all gradients
+                self.autograd_grads.clear();
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_dp_budget_check" => {
+                // ML12: Check epsilon budget — args: (epsilon_for_this_call)
+                // If cumulative budget exceeds limit, panic.
+                if let (Some(Value::Float(epsilon)), Some(Value::Float(limit))) = (args.get(0), args.get(1)) {
+                    self.dp_epsilon_budget += epsilon;
+                    if self.dp_epsilon_budget > *limit {
+                        return ExecOutcome::Panic(format!(
+                            "DP budget exhausted: consumed {} > limit {}",
+                            self.dp_epsilon_budget, limit
+                        ));
+                    }
+                    ExecOutcome::Value(Value::Void)
+                } else {
+                    ExecOutcome::Panic("dp_budget_check: expected (f64, f64)".to_string())
+                }
+            }
+            "p_dp_budget_reset" => {
+                // ML12: Reset the epsilon budget (called at the start of each @dp function)
+                self.dp_epsilon_budget = 0.0;
+                if let Some(Value::Float(limit)) = args.first() {
+                    self.dp_epsilon_limit = *limit;
+                }
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_tp_rank" => {
+                // ML13: Get the current rank (0 in single-device mode)
+                ExecOutcome::Value(Value::Int(self.tp_rank))
+            }
+            "p_tp_world_size" => {
+                // ML13: Get the world size (1 in single-device mode)
+                ExecOutcome::Value(Value::Int(self.tp_world_size))
+            }
+            "p_checkpoint_begin" => {
+                // ML11: Enable checkpoint mode — tape stores input data, not result data
+                self.checkpoint_mode = true;
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_checkpoint_end" => {
+                // ML11: Disable checkpoint mode
+                self.checkpoint_mode = false;
+                ExecOutcome::Value(Value::Void)
             }
             "p_tensor_to_json" => {
                 if let Some(Value::Tensor(t)) = args.first() {
@@ -3520,15 +3949,23 @@ impl Interpreter {
             // the input unchanged. In a real multi-GPU deployment, they would
             // perform NCCL collective operations.
             "p_all_reduce" => {
-                // All-reduce: sum tensor across all ranks (no-op in single-device interp)
+                // ML13: All-reduce sum — in single-device mode (world_size=1), returns input unchanged.
+                // In simulated multi-rank mode, sums across all simulated ranks.
                 if let Some(Value::Tensor(t)) = args.first() {
-                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().clone()))))
+                    if self.tp_world_size > 1 {
+                        // Simulated: divide by world_size (averaging, a common all-reduce variant)
+                        let mut result = t.borrow().clone();
+                        for d in &mut result.data { *d /= self.tp_world_size as f64; }
+                        ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(result))))
+                    } else {
+                        ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().clone()))))
+                    }
                 } else {
                     ExecOutcome::Panic("all_reduce: expected Tensor".to_string())
                 }
             }
             "p_broadcast" => {
-                // Broadcast tensor from rank 0 to all ranks (no-op in single-device)
+                // ML13: Broadcast from rank 0 — in single-device mode, returns input unchanged
                 if let Some(Value::Tensor(t)) = args.first() {
                     ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().clone()))))
                 } else {
@@ -3536,15 +3973,25 @@ impl Interpreter {
                 }
             }
             "p_all_gather" => {
-                // All-gather: concatenate tensors from all ranks (no-op in single-device)
+                // ML13: All-gather — concatenates along dim 0. In single-device, returns input.
                 if let Some(Value::Tensor(t)) = args.first() {
-                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().clone()))))
+                    if self.tp_world_size > 1 {
+                        // Simulated: replicate along dim 0
+                        let src = t.borrow();
+                        let mut new_shape = src.shape.clone();
+                        if !new_shape.is_empty() { new_shape[0] *= self.tp_world_size as usize; }
+                        let mut new_data = src.data.clone();
+                        for _ in 1..self.tp_world_size { new_data.extend_from_slice(&src.data); }
+                        ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(Tensor { shape: new_shape, strides: Tensor::row_major_strides(&src.shape), data: new_data }))))
+                    } else {
+                        ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().clone()))))
+                    }
                 } else {
                     ExecOutcome::Panic("all_gather: expected Tensor".to_string())
                 }
             }
             "p_scatter" => {
-                // Scatter: split tensor across ranks (no-op in single-device, returns input)
+                // ML13: Scatter — splits tensor across ranks. In single-device, returns input.
                 if let Some(Value::Tensor(t)) = args.first() {
                     ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().clone()))))
                 } else {

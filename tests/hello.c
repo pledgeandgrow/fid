@@ -110,6 +110,26 @@ void* p_tensor_shape(void* t);
 int64_t p_tensor_size(void* t);
 char* p_tensor_to_str(void* t);
 char* p_tensor_to_json(void* t);
+void* p_grad_get(void* t);
+void p_grad_zero(void);
+void p_autograd_begin(void);
+void p_autograd_end(void);
+void p_autograd_backward(void* loss);
+void p_checkpoint_begin(void);
+void p_checkpoint_end(void);
+void* p_dp_noise(void* t, double sigma);
+void* p_gaussian_noise(void* shape_vec, double sigma);
+void* p_dropout(void* t, double drop_prob);
+void p_dp_budget_reset(double epsilon);
+void p_dp_budget_check(double epsilon, double limit);
+int64_t p_tp_rank(void);
+int64_t p_tp_world_size(void);
+void* p_all_reduce(void* t);
+void* p_broadcast(void* t);
+void* p_all_gather(void* t);
+void* p_scatter(void* t);
+void p_send_tensor(void* t);
+void* p_recv_tensor(void* shape_vec);
 char* p_json_parse(const char* s);
 void* p_json_new_object(void);
 void* p_json_new_array(void);
@@ -269,27 +289,37 @@ PMap* p_map_clone(PMap* m);
 int64_t p_map_get_or(PMap* m, const char* key, int64_t default_val);
 
 // ─── String constants ───
-static const char _str0[] = "Vec is empty";
+static const char _str0[] = "\n";
 static const char _str1[] = "";
 static const char _str2[] = "Assertion failed\n";
-static const char _str3[] = "Vec remove index out of bounds";
-static const char _str4[] = "{";
-static const char _str5[] = "}";
-static const char _str6[] = ", ";
-static const char _str7[] = ": ";
-static const char _str8[] = "Hello, Pledge!";
+static const char _str3[] = "Vec is empty";
+static const char _str4[] = "Vec index out of bounds";
+static const char _str5[] = "[";
+static const char _str6[] = "]";
+static const char _str7[] = ", ";
+static const char _str8[] = "Hello, Fides!";
 static const char _str9[] = "y is big";
 static const char _str10[] = "y is small";
-static const char _str11[] = "called unwrap on None";
-static const char _str12[] = "\n";
-static const char _str13[] = "Vec index out of bounds";
-static const char _str14[] = "Vec insert index out of bounds";
-static const char _str15[] = "[";
-static const char _str16[] = "]";
-static const char _str17[] = "called unwrap on Err";
+static const char _str11[] = "called unwrap on Err";
+static const char _str12[] = "Vec insert index out of bounds";
+static const char _str13[] = "Vec remove index out of bounds";
+static const char _str14[] = "{";
+static const char _str15[] = "}";
+static const char _str16[] = ": ";
+static const char _str17[] = "called unwrap on None";
 
 // ─── Struct definitions ───
+struct Option_s {
+    int64_t field_0;
+    int64_t field_1;
+};
+
 struct ByteBuffer_s {
+    void* field_0;
+    int64_t field_1;
+};
+
+struct StringBuilder_s {
     void* field_0;
     int64_t field_1;
 };
@@ -299,280 +329,1286 @@ struct Result_s {
     int64_t field_1;
 };
 
-struct StringBuilder_s {
-    void* field_0;
-    int64_t field_1;
-};
-
-struct Option_s {
-    int64_t field_0;
-    int64_t field_1;
-};
-
 // ─── Function prototypes ───
 void p_thread_register(const char* name, int64_t (*fn)());
-void* p_str_from_ptr(void* v0, int64_t v1);
-void* str_repeat(void* v0, void* v1, int64_t v2);
-int64_t HashMap_keys(void* v0, int64_t v1);
-bool str_ends_with(void* v0, void* v1, void* v2);
-int64_t String_parse_int(void* v0, int64_t v1);
-bool ByteBuffer_is_empty(void* v0, void* v1);
-int64_t String_push_str(void* v0, int64_t v1, int64_t v2);
-int64_t HashMap_values(void* v0, int64_t v1);
-void* char_to_str(void* v0, int64_t v1);
-int64_t String_repeat(void* v0, int64_t v1, int64_t v2);
-int64_t HashMap_new(void* v0);
-int64_t String_trim(void* v0, int64_t v1);
-bool str_starts_with(void* v0, void* v1, void* v2);
-int64_t Vec_first(void* v0, int64_t v1);
-void* str_replace(void* v0, void* v1, void* v2, void* v3);
-int64_t Option_unwrap_or_else(void* v0, void* v1, void* v2);
-void Result_err(void* v0, void* v1, void* v2);
-int64_t Result_expect(void* v0, void* v1, void* v2);
-void Option_map(void* v0, void* v1, void* v2, void* v3);
-bool String_is_empty(void* v0, int64_t v1);
-void StringBuilder_new(void* v0, void* v1);
-void ByteBuffer_clear(void* v0, void* v1);
-void StringBuilder_append_str(void* v0, void* v1, void* v2);
-void Result_and_then(void* v0, void* v1, void* v2, void* v3);
-void* str_concat(void* v0, void* v1, void* v2);
-int64_t String_split(void* v0, int64_t v1, int64_t v2);
-void assert(void* v0, bool v1);
-void* str_trim(void* v0, void* v1);
-void* StringBuilder_to_str(void* v0, void* v1);
-bool StringBuilder_is_empty(void* v0, void* v1);
-void* int_to_str(void* v0, int64_t v1);
-int64_t String_byte_at(void* v0, int64_t v1, int64_t v2);
-int64_t allocator_bytes_used(void* v0, void* v1);
-void ByteBuffer_write_byte(void* v0, void* v1, int64_t v2);
-int64_t Vec_capacity(void* v0, int64_t v1);
-void* str_split_char(void* v0, void* v1, int64_t v2);
-int64_t String_len(void* v0, int64_t v1);
-void StringBuilder_append_int(void* v0, void* v1, int64_t v2);
-int64_t String_to_string(void* v0, int64_t v1);
-int64_t str_byte_at(void* v0, void* v1, int64_t v2);
-bool Option_is_none(void* v0, void* v1);
-int64_t p_max(void* v0, int64_t v1, int64_t v2);
-void* str_to_lower(void* v0, void* v1);
-int64_t Vec_last(void* v0, int64_t v1);
-int64_t p_str_length(void* v0, int64_t v1);
-int64_t String_from(void* v0, int64_t v1);
-bool String_starts_with(void* v0, int64_t v1, int64_t v2);
-int64_t str_parse_hex(void* v0, void* v1);
-bool char_is_lower(void* v0, int64_t v1);
-int64_t p_min(void* v0, int64_t v1, int64_t v2);
-int64_t ByteBuffer_len(void* v0, void* v1);
-int64_t Vec_pop(void* v0, int64_t v1);
-int64_t clamp(void* v0, int64_t v1, int64_t v2, int64_t v3);
-void* ByteBuffer_to_str(void* v0, void* v1);
-int64_t String_char_at(void* v0, int64_t v1, int64_t v2);
-bool Vec_is_empty(void* v0, int64_t v1);
-int64_t Result_unwrap_or(void* v0, void* v1, int64_t v2);
-bool Result_is_ok(void* v0, void* v1);
-int64_t Vec_clone(void* v0, int64_t v1);
-bool HashMap_is_empty(void* v0, int64_t v1);
-int64_t HashMap_find_slot(void* v0, int64_t v1, int64_t v2);
-bool String_contains(void* v0, int64_t v1, int64_t v2);
-int64_t char_to_lower(void* v0, int64_t v1);
-bool char_is_digit(void* v0, int64_t v1);
-void ByteBuffer_set_byte(void* v0, void* v1, int64_t v2, int64_t v3);
-int64_t String_rfind(void* v0, int64_t v1, int64_t v2);
-void* str_trim_end(void* v0, void* v1);
-bool str_equal(void* v0, void* v1, void* v2);
-void* str_from_bytes(void* v0, void* v1);
-void allocator_free(void* v0, void* v1, int64_t v2);
-void HashMap_clear(void* v0, int64_t v1);
-int64_t String_char_count(void* v0, int64_t v1);
-int64_t String_slice(void* v0, int64_t v1, int64_t v2, int64_t v3);
-int64_t char_to_upper(void* v0, int64_t v1);
-void ByteBuffer_from_string(void* v0, void* v1, void* v2);
-void Result_ok(void* v0, void* v1, void* v2);
-int64_t Result_unwrap_or_else(void* v0, void* v1, void* v2);
-void ByteBuffer_write_bytes(void* v0, void* v1, int64_t v2, int64_t v3);
-void HashMap_remove(void* v0, int64_t v1, int64_t v2);
-int64_t Vec_remove(void* v0, int64_t v1, int64_t v2);
-void* HashMap_to_str(void* v0, int64_t v1);
-void Option_and_then(void* v0, void* v1, void* v2, void* v3);
-void* str_bytes(void* v0, void* v1);
-bool char_is_whitespace(void* v0, int64_t v1);
-bool Option_is_some(void* v0, void* v1);
-void* byte_to_str(void* v0, int64_t v1);
-void* str_split(void* v0, void* v1, void* v2);
-int64_t str_find(void* v0, void* v1, void* v2);
-int64_t main_entry(void* v0);
-bool char_is_upper(void* v0, int64_t v1);
-int64_t Option_unwrap(void* v0, void* v1);
-void* str_to_upper(void* v0, void* v1);
-int64_t ByteBuffer_read_byte(void* v0, void* v1, int64_t v2);
-int64_t String_replace(void* v0, int64_t v1, int64_t v2, int64_t v3);
-int64_t HashMap_get_or(void* v0, int64_t v1, int64_t v2, int64_t v3);
-int64_t str_parse_int_range(void* v0, void* v1, int64_t v2, int64_t v3);
-void Vec_push(void* v0, int64_t v1, int64_t v2);
-void Vec_sort(void* v0, int64_t v1);
-int64_t p_str_hash(void* v0, int64_t v1);
-void StringBuilder_append_char(void* v0, void* v1, int64_t v2);
+int64_t StringBuilder_len(void* v0, void* v1);
 bool Vec_contains(void* v0, int64_t v1, int64_t v2);
-int64_t allocator_alloc(void* v0, void* v1, int64_t v2);
-int64_t String_bytes(void* v0, int64_t v1);
-int64_t String_clone(void* v0, int64_t v1);
-bool HashMap_contains(void* v0, int64_t v1, int64_t v2);
-int64_t p_str_compare(void* v0, int64_t v1, int64_t v2);
-int64_t Option_expect(void* v0, void* v1, void* v2);
-int64_t str_parse_int(void* v0, void* v1);
-bool str_is_empty(void* v0, void* v1);
-int64_t HashMap_get(void* v0, int64_t v1, int64_t v2);
-void Option_or_else(void* v0, void* v1, void* v2, void* v3);
+bool Option_is_some(void* v0, void* v1);
+void HashMap_clear(void* v0, int64_t v1);
+void Vec_truncate(void* v0, int64_t v1, int64_t v2);
 void println(void* v0, void* v1);
-void HashMap_grow(void* v0, int64_t v1);
+bool String_starts_with(void* v0, int64_t v1, int64_t v2);
+int64_t str_compare(void* v0, void* v1, void* v2);
+void StringBuilder_append_str(void* v0, void* v1, void* v2);
+int64_t HashMap_clone(void* v0, int64_t v1);
+void Option_and_then(void* v0, void* v1, void* v2, void* v3);
+void* str_to_lower(void* v0, void* v1);
+int64_t String_to_uppercase(void* v0, int64_t v1);
+void Result_map(void* v0, void* v1, void* v2, void* v3);
+void* str_trim_start(void* v0, void* v1);
+int64_t HashMap_keys(void* v0, int64_t v1);
+void StringBuilder_append_char(void* v0, void* v1, int64_t v2);
+int64_t ByteBuffer_read_byte(void* v0, void* v1, int64_t v2);
+int64_t clamp(void* v0, int64_t v1, int64_t v2, int64_t v3);
+void* char_to_str(void* v0, int64_t v1);
+bool char_is_upper(void* v0, int64_t v1);
+void* str_trim_end(void* v0, void* v1);
+int64_t ByteBuffer_len(void* v0, void* v1);
+int64_t HashMap_new(void* v0);
+bool str_contains(void* v0, void* v1, void* v2);
+void Result_map_err(void* v0, void* v1, void* v2, void* v3);
+int64_t Result_expect(void* v0, void* v1, void* v2);
+bool StringBuilder_is_empty(void* v0, void* v1);
+void Vec_extend(void* v0, int64_t v1, int64_t v2);
+void Result_and_then(void* v0, void* v1, void* v2, void* v3);
+void* str_bytes(void* v0, void* v1);
+bool str_equal(void* v0, void* v1, void* v2);
+void assert(void* v0, bool v1);
+int64_t allocator_alloc(void* v0, void* v1, int64_t v2);
+int64_t String_repeat(void* v0, int64_t v1, int64_t v2);
+int64_t Result_unwrap_or(void* v0, void* v1, int64_t v2);
+int64_t String_split(void* v0, int64_t v1, int64_t v2);
+int64_t allocator_bytes_used(void* v0, void* v1);
+int64_t String_rfind(void* v0, int64_t v1, int64_t v2);
+int64_t HashMap_find_slot(void* v0, int64_t v1, int64_t v2);
+bool str_starts_with(void* v0, void* v1, void* v2);
+int64_t p_min(void* v0, int64_t v1, int64_t v2);
+int64_t p_str_hash(void* v0, int64_t v1);
+int64_t Vec_pop(void* v0, int64_t v1);
+int64_t String_find(void* v0, int64_t v1, int64_t v2);
+bool char_is_whitespace(void* v0, int64_t v1);
+void* str_replace(void* v0, void* v1, void* v2, void* v3);
+void* str_repeat(void* v0, void* v1, int64_t v2);
+int64_t str_parse_hex(void* v0, void* v1);
+int64_t str_len(void* v0, void* v1);
+void* p_str_from_ptr(void* v0, int64_t v1);
+int64_t String_to_lowercase(void* v0, int64_t v1);
+int64_t String_char_count(void* v0, int64_t v1);
+int64_t String_replace(void* v0, int64_t v1, int64_t v2, int64_t v3);
+bool HashMap_is_empty(void* v0, int64_t v1);
+void Vec_reverse(void* v0, int64_t v1);
+int64_t Vec_new(void* v0);
+void HashMap_insert(void* v0, int64_t v1, int64_t v2, int64_t v3);
+void HashMap_remove(void* v0, int64_t v1, int64_t v2);
+int64_t String_slice(void* v0, int64_t v1, int64_t v2, int64_t v3);
+void Vec_sort(void* v0, int64_t v1);
+int64_t char_to_lower(void* v0, int64_t v1);
+void* str_from_bytes(void* v0, void* v1);
+bool Result_is_err(void* v0, void* v1);
+int64_t String_len(void* v0, int64_t v1);
+bool char_is_lower(void* v0, int64_t v1);
+void ByteBuffer_set_byte(void* v0, void* v1, int64_t v2, int64_t v3);
+int64_t p_abs(void* v0, int64_t v1);
+int64_t Vec_last(void* v0, int64_t v1);
+void ByteBuffer_write_bytes(void* v0, void* v1, int64_t v2, int64_t v3);
+bool Option_is_none(void* v0, void* v1);
+int64_t Vec_get(void* v0, int64_t v1, int64_t v2);
+int64_t str_find(void* v0, void* v1, void* v2);
+bool HashMap_contains(void* v0, int64_t v1, int64_t v2);
+int64_t String_push_str(void* v0, int64_t v1, int64_t v2);
+int64_t p_str_compare(void* v0, int64_t v1, int64_t v2);
+bool String_ends_with(void* v0, int64_t v1, int64_t v2);
+int64_t HashMap_get_or(void* v0, int64_t v1, int64_t v2, int64_t v3);
+int64_t char_to_upper(void* v0, int64_t v1);
+void Vec_set(void* v0, int64_t v1, int64_t v2, int64_t v3);
+bool String_is_empty(void* v0, int64_t v1);
+int64_t str_rfind(void* v0, void* v1, void* v2);
+void* str_split_char(void* v0, void* v1, int64_t v2);
+void Vec_clear(void* v0, int64_t v1);
+int64_t Vec_capacity(void* v0, int64_t v1);
+int64_t Option_unwrap_or(void* v0, void* v1, int64_t v2);
+bool Vec_is_empty(void* v0, int64_t v1);
+void Result_err(void* v0, void* v1, void* v2);
+int64_t String_parse_int(void* v0, int64_t v1);
+void* str_to_upper(void* v0, void* v1);
+void allocator_free(void* v0, void* v1, int64_t v2);
+void* Vec_to_str(void* v0, int64_t v1);
+void p_str_copy_n(void* v0, int64_t v1, int64_t v2, int64_t v3);
 bool char_is_alpha(void* v0, int64_t v1);
+void* str_split(void* v0, void* v1, void* v2);
+bool str_ends_with(void* v0, void* v1, void* v2);
+void Vec_push(void* v0, int64_t v1, int64_t v2);
+int64_t main_entry(void* v0);
+bool String_contains(void* v0, int64_t v1, int64_t v2);
+int64_t String_trim(void* v0, int64_t v1);
+void StringBuilder_new(void* v0, void* v1);
+void* int_to_str(void* v0, int64_t v1);
+int64_t HashMap_len(void* v0, int64_t v1);
+int64_t Result_unwrap(void* v0, void* v1);
+bool Result_is_ok(void* v0, void* v1);
+void StringBuilder_append_int(void* v0, void* v1, int64_t v2);
+void ByteBuffer_new(void* v0, void* v1, int64_t v2);
+void Vec_insert(void* v0, int64_t v1, int64_t v2, int64_t v3);
+int64_t Vec_clone(void* v0, int64_t v1);
+int64_t HashMap_values(void* v0, int64_t v1);
+void* create_allocator(void* v0, void* v1);
+int64_t Vec_first(void* v0, int64_t v1);
+void HashMap_grow(void* v0, int64_t v1);
+bool char_is_digit(void* v0, int64_t v1);
+int64_t Vec_remove(void* v0, int64_t v1, int64_t v2);
+void* byte_to_str(void* v0, int64_t v1);
+void Option_or_else(void* v0, void* v1, void* v2, void* v3);
+void* str_trim(void* v0, void* v1);
+void ByteBuffer_write_byte(void* v0, void* v1, int64_t v2);
+bool ByteBuffer_is_empty(void* v0, void* v1);
+void Option_map(void* v0, void* v1, void* v2, void* v3);
+void* str_concat(void* v0, void* v1, void* v2);
+void* HashMap_to_str(void* v0, int64_t v1);
+int64_t String_from(void* v0, int64_t v1);
+int64_t String_clone(void* v0, int64_t v1);
+bool str_is_empty(void* v0, void* v1);
+void ByteBuffer_from_string(void* v0, void* v1, void* v2);
+int64_t HashMap_get(void* v0, int64_t v1, int64_t v2);
+void Result_ok(void* v0, void* v1, void* v2);
+int64_t str_byte_at(void* v0, void* v1, int64_t v2);
+void ByteBuffer_clear(void* v0, void* v1);
+int64_t str_parse_int_range(void* v0, void* v1, int64_t v2, int64_t v3);
+int64_t Option_unwrap(void* v0, void* v1);
+int64_t String_to_string(void* v0, int64_t v1);
+void* StringBuilder_to_str(void* v0, void* v1);
+int64_t str_parse_int(void* v0, void* v1);
+int64_t String_bytes(void* v0, int64_t v1);
+int64_t Option_unwrap_or_else(void* v0, void* v1, void* v2);
+int64_t Result_unwrap_or_else(void* v0, void* v1, void* v2);
+bool p_str_equal(void* v0, int64_t v1, int64_t v2);
 int64_t Vec_len(void* v0, int64_t v1);
 void StringBuilder_clear(void* v0, void* v1);
-void Vec_extend(void* v0, int64_t v1, int64_t v2);
-void HashMap_insert(void* v0, int64_t v1, int64_t v2, int64_t v3);
-void Vec_reverse(void* v0, int64_t v1);
-int64_t Option_unwrap_or(void* v0, void* v1, int64_t v2);
-int64_t HashMap_len(void* v0, int64_t v1);
-bool p_str_equal(void* v0, int64_t v1, int64_t v2);
-void Vec_truncate(void* v0, int64_t v1, int64_t v2);
-bool str_contains(void* v0, void* v1, void* v2);
-int64_t str_len(void* v0, void* v1);
-int64_t Vec_get(void* v0, int64_t v1, int64_t v2);
-int64_t String_to_lowercase(void* v0, int64_t v1);
-void Result_map_err(void* v0, void* v1, void* v2, void* v3);
-void ByteBuffer_new(void* v0, void* v1, int64_t v2);
-int64_t HashMap_clone(void* v0, int64_t v1);
-int64_t StringBuilder_len(void* v0, void* v1);
-int64_t String_to_uppercase(void* v0, int64_t v1);
-int64_t str_compare(void* v0, void* v1, void* v2);
-int64_t Vec_new(void* v0);
-int64_t String_find(void* v0, int64_t v1, int64_t v2);
-void Vec_clear(void* v0, int64_t v1);
+int64_t Option_expect(void* v0, void* v1, void* v2);
+void* ByteBuffer_to_str(void* v0, void* v1);
+int64_t String_char_at(void* v0, int64_t v1, int64_t v2);
+int64_t p_str_length(void* v0, int64_t v1);
 void* str_slice(void* v0, void* v1, int64_t v2, int64_t v3);
-void Result_map(void* v0, void* v1, void* v2, void* v3);
-void Vec_set(void* v0, int64_t v1, int64_t v2, int64_t v3);
-void Vec_insert(void* v0, int64_t v1, int64_t v2, int64_t v3);
-bool String_ends_with(void* v0, int64_t v1, int64_t v2);
-void* Vec_to_str(void* v0, int64_t v1);
-void* create_allocator(void* v0, void* v1);
-void* str_trim_start(void* v0, void* v1);
-int64_t p_abs(void* v0, int64_t v1);
-void p_str_copy_n(void* v0, int64_t v1, int64_t v2, int64_t v3);
-int64_t Result_unwrap(void* v0, void* v1);
-int64_t str_rfind(void* v0, void* v1, void* v2);
-bool Result_is_err(void* v0, void* v1);
+int64_t String_byte_at(void* v0, int64_t v1, int64_t v2);
+int64_t p_max(void* v0, int64_t v1, int64_t v2);
 
-void* p_str_from_ptr(void* v0, int64_t v1) {
-    p_call_stack_push("p_str_from_ptr");
-    bool v3;
-    int64_t v55;
-    void* v103;
-    int64_t v72;
-    void* v56;
-    int64_t v41; /* placeholder for void */
-    int64_t v86; /* placeholder for void */
-    int64_t v107;
-    int64_t v106; /* placeholder for void */
-    void* v110;
-    int64_t v37; /* placeholder for void */
-    int64_t v9;
-    int64_t v2;
-    void* v29;
-    int64_t v11; /* placeholder for void */
-    int64_t v5;
-    void* v80;
-    int64_t v35;
-    int64_t v44;
-    int64_t v59;
-    void* v76;
-    int64_t v84;
-    int64_t v105; /* placeholder for void */
-    int64_t v28; /* placeholder for void */
-    int64_t v16; /* placeholder for void */
-    void* v13;
-    int64_t v21; /* placeholder for void */
-    int64_t v25;
-    int64_t v109; /* placeholder for void */
-    int64_t v87;
-    int64_t v64;
-    void* v31;
-    void* v20;
-    int64_t v12; /* placeholder for void */
-    uint8_t v30;
-    int64_t v83;
-    int64_t v38;
-    int64_t v42;
-    int64_t v52; /* placeholder for void */
-    int64_t v27; /* placeholder for void */
-    void* v65;
-    uint8_t v49;
-    bool v74;
-    int64_t v79; /* placeholder for void */
-    int64_t v67; /* placeholder for void */
-    int64_t v91;
-    int64_t v92; /* placeholder for void */
-    void* v48;
-    int64_t v96;
-    int64_t v98;
-    int64_t v100;
-    int64_t v61; /* placeholder for void */
+int64_t StringBuilder_len(void* v0, void* v1) {
+    p_call_stack_push("StringBuilder_len");
     int64_t v4; /* placeholder for void */
-    void* v6;
-    int64_t v19; /* placeholder for void */
-    int64_t v39;
-    int64_t v18; /* placeholder for void */
+    int64_t v3;
+    void* v2;
+    v2 = (char*)v1 + 8;
+    v3 = *(int64_t*)v2;
+    p_call_stack_pop();
+    return v3;
+    return 0;
+}
+
+bool Vec_contains(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("Vec_contains");
+    int64_t v29;
+    int64_t v36;
+    int64_t v35; /* placeholder for void */
+    bool v27;
+    int64_t v49; /* placeholder for void */
+    int64_t v57; /* placeholder for void */
     int64_t v53;
-    int64_t v102; /* placeholder for void */
-    void* v7;
-    void* v10;
-    int64_t v14;
-    int64_t v46;
-    uint8_t v77;
-    void* v94;
-    int64_t v88;
-    int64_t v95; /* placeholder for void */
-    int64_t v8; /* placeholder for void */
-    int64_t v15; /* placeholder for void */
-    void* v23;
-    int64_t v45; /* placeholder for void */
-    int64_t v47; /* placeholder for void */
-    int64_t v43;
-    int64_t v63; /* placeholder for void */
-    int64_t v24; /* placeholder for void */
-    void* v93;
-    int64_t v97;
-    int64_t v70; /* placeholder for void */
-    int64_t v101; /* placeholder for void */
-    int64_t v104;
-    void* v108;
-    int64_t v111; /* placeholder for void */
-    int64_t v50; /* placeholder for void */
-    void* v62;
-    int64_t v32; /* placeholder for void */
-    int64_t v33; /* placeholder for void */
-    int64_t v51; /* placeholder for void */
-    int64_t v58; /* placeholder for void */
-    void* v60;
-    void* v69;
-    int64_t v71; /* placeholder for void */
-    bool v36;
-    void* v26;
-    int64_t v34;
-    int64_t v73;
-    int64_t v75; /* placeholder for void */
-    int64_t v81;
-    int64_t v40;
-    int64_t v54;
-    int64_t v82; /* placeholder for void */
-    int64_t v22;
-    int64_t v66; /* placeholder for void */
-    int64_t v85;
+    int64_t v19; /* placeholder for void */
+    int64_t v26;
+    void* v40;
+    int64_t v25;
+    int64_t v6; /* placeholder for void */
     void* v17;
-    int64_t v89;
-    void* v57;
-    int64_t v68;
-    int64_t v90; /* placeholder for void */
-    void* v78;
+    int64_t v41; /* placeholder for void */
+    int64_t v14; /* placeholder for void */
+    int64_t v21;
+    void* v37;
+    int64_t v46; /* placeholder for void */
+    bool v58;
+    void* v15;
+    int64_t v31;
+    int64_t v33;
+    int64_t v54;
+    int64_t v16; /* placeholder for void */
+    int64_t v47;
+    int64_t v59; /* placeholder for void */
+    bool v48;
+    int64_t v52; /* placeholder for void */
+    int64_t v28; /* placeholder for void */
+    int64_t v42; /* placeholder for void */
+    int64_t v56; /* placeholder for void */
+    int64_t v55;
+    int64_t v3;
+    int64_t v45; /* placeholder for void */
+    void* v7;
+    void* v43;
+    int64_t v20; /* placeholder for void */
+    int64_t v23; /* placeholder for void */
+    void* v11;
+    int64_t v51; /* placeholder for void */
+    int64_t v12;
+    int64_t v30;
+    int64_t v38; /* placeholder for void */
+    bool v50;
+    void* v34;
+    void* v5;
+    int64_t v44;
+    int64_t v10; /* placeholder for void */
+    int64_t v8; /* placeholder for void */
+    int64_t v4;
+    int64_t v24; /* placeholder for void */
+    void* v9;
+    int64_t v32;
+    void* v22;
+    int64_t v39;
+    int64_t v18;
+    int64_t v13; /* placeholder for void */
+    v3 = 8LL;
+    v4 = v1 + v3;
+    v5 = malloc(8);
+    *(void**)v5 = (void*)v4;
+    v7 = malloc(8);
+    *(void**)v7 = (void*)v1;
+    v9 = malloc(8);
+    v11 = *(void**)v5;
+    v12 = *(int64_t*)v11;
+    *(int64_t*)v9 = (int64_t)v12;
+    v15 = malloc(8);
+    v17 = *(void**)v7;
+    v18 = *(int64_t*)v17;
+    *(int64_t*)v15 = (int64_t)v18;
+    v21 = 0LL;
+    v22 = malloc(8);
+    *(int64_t*)v22 = (int64_t)v21;
+    goto bb1;
+  bb1:
+    v25 = *(int64_t*)v22;
+    v26 = *(int64_t*)v9;
+    v27 = v25 < v26;
+    if (v27) goto bb2;
+    else goto bb3;
+  bb2:
+    v29 = *(int64_t*)v15;
+    v30 = *(int64_t*)v22;
+    v31 = 8LL;
+    v32 = v30 * v31;
+    v33 = v29 + v32;
+    v34 = malloc(8);
+    *(int64_t*)v34 = (int64_t)v33;
+    v36 = *(int64_t*)v34;
+    v37 = malloc(8);
+    *(void**)v37 = (void*)v36;
+    v39 = 0LL;
+    v40 = malloc(8);
+    *(int64_t*)v40 = (int64_t)v39;
+    v43 = *(void**)v37;
+    v44 = *(int64_t*)v43;
+    *(int64_t*)v40 = (int64_t)v44;
+    v47 = *(int64_t*)v40;
+    v48 = v47 == v2;
+    if (v48) goto bb4;
+    else goto bb5;
+  bb3:
+    v58 = false;
+    p_call_stack_pop();
+    return v58;
+  bb4:
+    v50 = true;
+    p_call_stack_pop();
+    return v50;
+  bb5:
+    goto bb6;
+  bb6:
+    v53 = *(int64_t*)v22;
+    v54 = 1LL;
+    v55 = v53 + v54;
+    *(int64_t*)v22 = (int64_t)v55;
+    goto bb1;
+    return 0;
+}
+
+bool Option_is_some(void* v0, void* v1) {
+    p_call_stack_push("Option_is_some");
+    bool v5;
+    void* v7;
+    int64_t v18; /* placeholder for void */
+    int64_t v10; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    bool v14;
+    int64_t v12;
+    void* v2;
+    int64_t v4;
+    int64_t v17; /* placeholder for void */
+    int64_t v3;
+    bool v19;
+    int64_t v6; /* placeholder for void */
+    int64_t v8;
+    bool v16;
+    void* v11;
+    bool v9;
+    int64_t v20; /* placeholder for void */
+    int64_t v13;
+    v2 = (char*)v1 + 0;
+    v3 = *(int64_t*)v2;
+    v4 = 0LL;
+    v5 = v3 == v4;
+    if (v5) goto bb2;
+    else goto bb3;
+  bb1:
+    v19 = false;
+    p_call_stack_pop();
+    return v19;
+  bb2:
+    v7 = (char*)v1 + 8;
+    v8 = *(int64_t*)v7;
+    v9 = true;
+    p_call_stack_pop();
+    return v9;
+  bb3:
+    v11 = (char*)v1 + 0;
+    v12 = *(int64_t*)v11;
+    v13 = 1LL;
+    v14 = v12 == v13;
+    if (v14) goto bb4;
+    else goto bb5;
+  bb4:
+    v16 = false;
+    p_call_stack_pop();
+    return v16;
+  bb5:
+    goto bb1;
+    return 0;
+}
+
+void HashMap_clear(void* v0, int64_t v1) {
+    p_call_stack_push("HashMap_clear");
+    int64_t v44;
+    void* v11;
+    bool v36;
+    int64_t v2;
+    int64_t v48;
+    int64_t v64;
+    int64_t v30; /* placeholder for void */
+    int64_t v46; /* placeholder for void */
+    bool v37;
+    void* v15;
+    void* v21;
+    int64_t v9; /* placeholder for void */
+    void* v24;
+    int64_t v41; /* placeholder for void */
+    int64_t v49;
+    int64_t v29; /* placeholder for void */
+    void* v58;
+    int64_t v50;
+    void* v52;
+    int64_t v62;
+    int64_t v39;
+    int64_t v54;
+    void* v40;
+    int64_t v13;
+    int64_t v26; /* placeholder for void */
+    int64_t v65; /* placeholder for void */
+    int64_t v47;
+    int64_t v22; /* placeholder for void */
+    int64_t v34;
+    int64_t v68; /* placeholder for void */
+    int64_t v69; /* placeholder for void */
+    int64_t v28;
+    void* v55;
+    int64_t v23; /* placeholder for void */
+    bool v33;
+    int64_t v6; /* placeholder for void */
+    int64_t v5; /* placeholder for void */
+    void* v7;
+    int64_t v14;
+    int64_t v35;
+    int64_t v51;
+    int64_t v67; /* placeholder for void */
+    void* v18;
+    bool v45;
+    int64_t v19; /* placeholder for void */
+    int64_t v57; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    int64_t v43;
+    int64_t v25;
+    int64_t v59;
+    int64_t v10; /* placeholder for void */
+    int64_t v8;
+    int64_t v3;
+    int64_t v20;
+    int64_t v16; /* placeholder for void */
+    int64_t v42; /* placeholder for void */
+    void* v4;
+    int64_t v56; /* placeholder for void */
+    int64_t v53; /* placeholder for void */
+    int64_t v61; /* placeholder for void */
+    int64_t v17;
+    int64_t v66; /* placeholder for void */
+    int64_t v38; /* placeholder for void */
+    void* v27;
+    int64_t v31;
+    int64_t v32;
+    int64_t v63;
+    int64_t v60; /* placeholder for void */
+    v2 = 16LL;
+    v3 = v1 + v2;
+    v4 = malloc(8);
+    *(void**)v4 = (void*)v3;
+    v7 = *(void**)v4;
+    v8 = 0LL;
+    *(int64_t*)v7 = (int64_t)v8;
+    v11 = malloc(8);
+    *(void**)v11 = (void*)v1;
+    v13 = 24LL;
+    v14 = v1 + v13;
+    v15 = malloc(8);
+    *(void**)v15 = (void*)v14;
+    v17 = 0LL;
+    v18 = malloc(8);
+    *(int64_t*)v18 = (int64_t)v17;
+    v20 = 0LL;
+    v21 = malloc(8);
+    *(int64_t*)v21 = (int64_t)v20;
+    v24 = *(void**)v11;
+    v25 = *(int64_t*)v24;
+    *(int64_t*)v18 = (int64_t)v25;
+    v27 = *(void**)v15;
+    v28 = *(int64_t*)v27;
+    *(int64_t*)v21 = (int64_t)v28;
+    v31 = *(int64_t*)v18;
+    v32 = 0LL;
+    v33 = v31 != v32;
+    v34 = *(int64_t*)v21;
+    v35 = 0LL;
+    v36 = v34 > v35;
+    v37 = v33 && v36;
+    if (v37) goto bb1;
+    else goto bb2;
+  bb1:
+    v39 = 0LL;
+    v40 = malloc(8);
+    *(int64_t*)v40 = (int64_t)v39;
+    goto bb4;
+  bb2:
+    goto bb3;
+  bb3:
+    p_call_stack_pop();
+    return;
+  bb4:
+    v43 = *(int64_t*)v40;
+    v44 = *(int64_t*)v21;
+    v45 = v43 < v44;
+    if (v45) goto bb5;
+    else goto bb6;
+  bb5:
+    v47 = *(int64_t*)v18;
+    v48 = *(int64_t*)v40;
+    v49 = 8LL;
+    v50 = v48 * v49;
+    v51 = v47 + v50;
+    v52 = malloc(8);
+    *(int64_t*)v52 = (int64_t)v51;
+    v54 = *(int64_t*)v52;
+    v55 = malloc(8);
+    *(void**)v55 = (void*)v54;
+    v58 = *(void**)v55;
+    v59 = 0LL;
+    *(int64_t*)v58 = (int64_t)v59;
+    v62 = *(int64_t*)v40;
+    v63 = 1LL;
+    v64 = v62 + v63;
+    *(int64_t*)v40 = (int64_t)v64;
+    goto bb4;
+  bb6:
+    goto bb3;
+    return;
+}
+
+void Vec_truncate(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("Vec_truncate");
+    void* v7;
+    int64_t v8; /* placeholder for void */
+    bool v14;
+    int64_t v6; /* placeholder for void */
+    void* v17;
+    int64_t v3;
+    int64_t v4;
+    int64_t v13;
+    int64_t v12; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    void* v9;
+    int64_t v16; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    void* v5;
+    int64_t v10;
+    int64_t v19; /* placeholder for void */
+    int64_t v18; /* placeholder for void */
+    int64_t v11; /* placeholder for void */
+    int64_t v21; /* placeholder for void */
+    int64_t v22; /* placeholder for void */
+    v3 = 8LL;
+    v4 = v1 + v3;
+    v5 = malloc(8);
+    *(void**)v5 = (void*)v4;
+    v7 = malloc(8);
+    v9 = *(void**)v5;
+    v10 = *(int64_t*)v9;
+    *(int64_t*)v7 = (int64_t)v10;
+    v13 = *(int64_t*)v7;
+    v14 = v2 < v13;
+    if (v14) goto bb1;
+    else goto bb2;
+  bb1:
+    v17 = *(void**)v5;
+    *(int64_t*)v17 = (int64_t)v2;
+    goto bb3;
+  bb2:
+    goto bb3;
+  bb3:
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+void println(void* v0, void* v1) {
+    p_call_stack_push("println");
+    int64_t v4; /* placeholder for void */
+    int64_t v5; /* placeholder for void */
+    void* v3;
+    int64_t v2; /* placeholder for void */
+    p_print_str(v1);
+    v3 = _str0;
+    p_print_str(v3);
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+bool String_starts_with(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("String_starts_with");
+    int64_t v73; /* placeholder for void */
+    bool v4;
+    int64_t v23; /* placeholder for void */
+    void* v47;
+    void* v53;
+    int64_t v63;
+    int64_t v17;
+    void* v59;
+    int64_t v76; /* placeholder for void */
+    uint8_t v60;
+    bool v22;
+    int64_t v30; /* placeholder for void */
+    int64_t v49;
+    bool v24;
+    int64_t v61; /* placeholder for void */
+    int64_t v71;
+    void* v28;
+    int64_t v32;
+    void* v18;
+    int64_t v27;
+    int64_t v12;
+    int64_t v52;
+    bool v6;
+    int64_t v21;
+    int64_t v26; /* placeholder for void */
+    int64_t v31;
+    int64_t v40;
+    void* v41;
+    int64_t v8; /* placeholder for void */
+    int64_t v74; /* placeholder for void */
+    int64_t v69; /* placeholder for void */
+    int64_t v72;
+    int64_t v64;
+    bool v7;
+    int64_t v20;
+    int64_t v42; /* placeholder for void */
+    int64_t v36;
+    int64_t v13;
+    int64_t v43;
+    void* v44;
+    bool v33;
+    int64_t v15; /* placeholder for void */
+    int64_t v34; /* placeholder for void */
+    int64_t v51; /* placeholder for void */
+    int64_t v70;
+    int64_t v39;
+    bool v65;
+    void* v14;
+    int64_t v29; /* placeholder for void */
+    bool v9;
+    int64_t v10; /* placeholder for void */
+    int64_t v38; /* placeholder for void */
+    int64_t v46;
+    int64_t v48; /* placeholder for void */
+    void* v50;
+    int64_t v55; /* placeholder for void */
+    int64_t v35;
+    int64_t v25; /* placeholder for void */
+    int64_t v54; /* placeholder for void */
+    int64_t v66; /* placeholder for void */
+    int64_t v19; /* placeholder for void */
+    bool v75;
+    int64_t v45; /* placeholder for void */
+    int64_t v16;
+    bool v67;
+    void* v56;
+    int64_t v3;
+    int64_t v11; /* placeholder for void */
+    void* v37;
+    uint8_t v57;
+    int64_t v5;
+    int64_t v68; /* placeholder for void */
+    int64_t v58; /* placeholder for void */
+    int64_t v62; /* placeholder for void */
+    v3 = 0LL;
+    v4 = v1 == v3;
+    v5 = 0LL;
+    v6 = v2 == v5;
+    v7 = v4 || v6;
+    if (v7) goto bb1;
+    else goto bb2;
+  bb1:
+    v9 = false;
+    p_call_stack_pop();
+    return v9;
+  bb2:
+    goto bb3;
+  bb3:
+    v12 = 0LL;
+    v13 = (int64_t)p_str_length((void*)v12, v1);
+    v14 = malloc(8);
+    *(int64_t*)v14 = (int64_t)v13;
+    v16 = 0LL;
+    v17 = (int64_t)p_str_length((void*)v16, v2);
+    v18 = malloc(8);
+    *(int64_t*)v18 = (int64_t)v17;
+    v20 = *(int64_t*)v18;
+    v21 = *(int64_t*)v14;
+    v22 = v20 > v21;
+    if (v22) goto bb4;
+    else goto bb5;
+  bb4:
+    v24 = false;
+    p_call_stack_pop();
+    return v24;
+  bb5:
+    goto bb6;
+  bb6:
+    v27 = 0LL;
+    v28 = malloc(8);
+    *(int64_t*)v28 = (int64_t)v27;
+    goto bb7;
+  bb7:
+    v31 = *(int64_t*)v28;
+    v32 = *(int64_t*)v18;
+    v33 = v31 < v32;
+    if (v33) goto bb8;
+    else goto bb9;
+  bb8:
+    v35 = *(int64_t*)v28;
+    v36 = v1 + v35;
+    v37 = malloc(8);
+    *(int64_t*)v37 = (int64_t)v36;
+    v39 = *(int64_t*)v28;
+    v40 = v2 + v39;
+    v41 = malloc(8);
+    *(int64_t*)v41 = (int64_t)v40;
+    v43 = *(int64_t*)v37;
+    v44 = malloc(8);
+    *(void**)v44 = (void*)v43;
+    v46 = *(int64_t*)v41;
+    v47 = malloc(8);
+    *(void**)v47 = (void*)v46;
+    v49 = 0LL;
+    v50 = malloc(8);
+    *(int64_t*)v50 = (int64_t)v49;
+    v52 = 0LL;
+    v53 = malloc(8);
+    *(int64_t*)v53 = (int64_t)v52;
+    v56 = *(void**)v44;
+    v57 = *(uint8_t*)v56;
+    *(int64_t*)v50 = (int64_t)v57;
+    v59 = *(void**)v47;
+    v60 = *(uint8_t*)v59;
+    *(int64_t*)v53 = (int64_t)v60;
+    v63 = *(int64_t*)v50;
+    v64 = *(int64_t*)v53;
+    v65 = v63 != v64;
+    if (v65) goto bb10;
+    else goto bb11;
+  bb9:
+    v75 = true;
+    p_call_stack_pop();
+    return v75;
+  bb10:
+    v67 = false;
+    p_call_stack_pop();
+    return v67;
+  bb11:
+    goto bb12;
+  bb12:
+    v70 = *(int64_t*)v28;
+    v71 = 1LL;
+    v72 = v70 + v71;
+    *(int64_t*)v28 = (int64_t)v72;
+    goto bb7;
+    return 0;
+}
+
+int64_t str_compare(void* v0, void* v1, void* v2) {
+    p_call_stack_push("str_compare");
+    int64_t v3;
+    int64_t v4;
+    int64_t v5; /* placeholder for void */
+    v3 = 0LL;
+    v4 = (int64_t)p_str_compare((void*)v3, (int64_t)v1, (int64_t)v2);
+    p_call_stack_pop();
+    return v4;
+    return 0;
+}
+
+void StringBuilder_append_str(void* v0, void* v1, void* v2) {
+    p_call_stack_push("StringBuilder_append_str");
+    int64_t v14; /* placeholder for void */
+    void* v4;
+    int64_t v15; /* placeholder for void */
+    int64_t v10;
+    void* v9;
+    int64_t v7; /* placeholder for void */
+    int64_t v13;
+    int64_t v11;
+    void* v6;
+    int64_t v12;
+    void* v3;
+    void* v5;
+    void* v8;
+    v3 = (char*)v1 + 0;
+    v4 = (char*)v1 + 0;
+    v5 = *(void**)v4;
+    v6 = p_str_concat(v5, v2);
+    *(void**)v3 = (void*)v6;
+    v8 = (char*)v1 + 8;
+    v9 = (char*)v1 + 8;
+    v10 = *(int64_t*)v9;
+    v11 = 0LL;
+    v12 = (int64_t)String_len((void*)v11, (int64_t)v2);
+    v13 = v10 + v12;
+    *(int64_t*)v8 = (int64_t)v13;
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+int64_t HashMap_clone(void* v0, int64_t v1) {
+    p_call_stack_push("HashMap_clone");
+    int64_t v15; /* placeholder for void */
+    int64_t v71; /* placeholder for void */
+    int64_t v98; /* placeholder for void */
+    int64_t v33;
+    int64_t v58;
+    int64_t v84;
+    int64_t v55;
+    int64_t v59;
+    int64_t v102;
+    void* v69;
+    int64_t v72; /* placeholder for void */
+    int64_t v103;
+    void* v17;
     int64_t v99; /* placeholder for void */
+    int64_t v34; /* placeholder for void */
+    int64_t v19;
+    int64_t v70;
+    int64_t v73;
+    int64_t v105; /* placeholder for void */
+    int64_t v106; /* placeholder for void */
+    void* v93;
+    int64_t v22;
+    int64_t v85;
+    int64_t v54; /* placeholder for void */
+    int64_t v56;
+    int64_t v101;
+    bool v38;
+    void* v87;
+    int64_t v61; /* placeholder for void */
+    void* v63;
+    int64_t v7;
+    int64_t v31; /* placeholder for void */
+    int64_t v43; /* placeholder for void */
+    void* v26;
+    int64_t v81; /* placeholder for void */
+    int64_t v92;
+    int64_t v62;
+    int64_t v107;
+    int64_t v50; /* placeholder for void */
+    int64_t v25; /* placeholder for void */
+    int64_t v27;
+    int64_t v104; /* placeholder for void */
+    void* v14;
+    int64_t v40;
+    int64_t v83;
+    int64_t v16;
+    int64_t v5; /* placeholder for void */
+    int64_t v109;
+    int64_t v94; /* placeholder for void */
+    void* v32;
+    int64_t v39;
+    void* v66;
+    int64_t v46; /* placeholder for void */
+    int64_t v68; /* placeholder for void */
+    int64_t v95; /* placeholder for void */
+    int64_t v82;
+    int64_t v86;
+    int64_t v97;
+    int64_t v112;
+    int64_t v35; /* placeholder for void */
+    int64_t v108;
+    void* v96;
+    int64_t v3;
+    int64_t v64; /* placeholder for void */
+    int64_t v51;
+    int64_t v45; /* placeholder for void */
+    void* v10;
+    int64_t v36;
+    int64_t v12;
+    bool v79;
+    int64_t v100;
+    bool v80;
+    int64_t v21; /* placeholder for void */
+    int64_t v24; /* placeholder for void */
+    void* v20;
+    int64_t v57;
+    int64_t v30;
+    bool v53;
+    int64_t v91; /* placeholder for void */
+    void* v48;
+    int64_t v18; /* placeholder for void */
+    int64_t v11; /* placeholder for void */
+    int64_t v111; /* placeholder for void */
+    int64_t v113; /* placeholder for void */
+    bool v42;
+    int64_t v47;
+    bool v41;
+    void* v23;
+    bool v75;
+    int64_t v52;
+    int64_t v2;
+    int64_t v74;
+    int64_t v49; /* placeholder for void */
+    int64_t v65;
+    int64_t v37;
+    void* v60;
+    void* v29;
+    int64_t v89;
+    int64_t v6;
+    int64_t v77;
+    int64_t v78;
+    int64_t v76;
+    void* v8;
+    void* v4;
+    int64_t v88; /* placeholder for void */
+    int64_t v67; /* placeholder for void */
+    int64_t v28; /* placeholder for void */
+    int64_t v110; /* placeholder for void */
+    int64_t v13;
+    int64_t v44;
+    void* v90;
+    int64_t v9; /* placeholder for void */
+    v2 = 0LL;
+    v3 = (int64_t)HashMap_new((void*)v2);
+    v4 = malloc(8);
+    *(int64_t*)v4 = (int64_t)v3;
+    v6 = 24LL;
+    v7 = v1 + v6;
+    v8 = malloc(8);
+    *(void**)v8 = (void*)v7;
+    v10 = malloc(8);
+    *(void**)v10 = (void*)v1;
+    v12 = 8LL;
+    v13 = v1 + v12;
+    v14 = malloc(8);
+    *(void**)v14 = (void*)v13;
+    v16 = 0LL;
+    v17 = malloc(8);
+    *(int64_t*)v17 = (int64_t)v16;
+    v19 = 0LL;
+    v20 = malloc(8);
+    *(int64_t*)v20 = (int64_t)v19;
+    v22 = 0LL;
+    v23 = malloc(8);
+    *(int64_t*)v23 = (int64_t)v22;
+    v26 = *(void**)v8;
+    v27 = *(int64_t*)v26;
+    *(int64_t*)v17 = (int64_t)v27;
+    v29 = *(void**)v10;
+    v30 = *(int64_t*)v29;
+    *(int64_t*)v20 = (int64_t)v30;
+    v32 = *(void**)v14;
+    v33 = *(int64_t*)v32;
+    *(int64_t*)v23 = (int64_t)v33;
+    v36 = *(int64_t*)v20;
+    v37 = 0LL;
+    v38 = v36 == v37;
+    v39 = *(int64_t*)v17;
+    v40 = 0LL;
+    v41 = v39 == v40;
+    v42 = v38 || v41;
+    if (v42) goto bb1;
+    else goto bb2;
+  bb1:
+    v44 = *(int64_t*)v4;
+    p_call_stack_pop();
+    return v44;
+  bb2:
+    goto bb3;
+  bb3:
+    v47 = 0LL;
+    v48 = malloc(8);
+    *(int64_t*)v48 = (int64_t)v47;
+    goto bb4;
+  bb4:
+    v51 = *(int64_t*)v48;
+    v52 = *(int64_t*)v17;
+    v53 = v51 < v52;
+    if (v53) goto bb5;
+    else goto bb6;
+  bb5:
+    v55 = *(int64_t*)v20;
+    v56 = *(int64_t*)v48;
+    v57 = 8LL;
+    v58 = v56 * v57;
+    v59 = v55 + v58;
+    v60 = malloc(8);
+    *(int64_t*)v60 = (int64_t)v59;
+    v62 = *(int64_t*)v60;
+    v63 = malloc(8);
+    *(void**)v63 = (void*)v62;
+    v65 = 0LL;
+    v66 = malloc(8);
+    *(int64_t*)v66 = (int64_t)v65;
+    v69 = *(void**)v63;
+    v70 = *(int64_t*)v69;
+    *(int64_t*)v66 = (int64_t)v70;
+    v73 = *(int64_t*)v66;
+    v74 = 0LL;
+    v75 = v73 != v74;
+    v76 = *(int64_t*)v66;
+    v77 = 1LL;
+    v78 = -v77;
+    v79 = v76 != v78;
+    v80 = v75 && v79;
+    if (v80) goto bb7;
+    else goto bb8;
+  bb6:
+    v112 = *(int64_t*)v4;
+    p_call_stack_pop();
+    return v112;
+  bb7:
+    v82 = *(int64_t*)v23;
+    v83 = *(int64_t*)v48;
+    v84 = 8LL;
+    v85 = v83 * v84;
+    v86 = v82 + v85;
+    v87 = malloc(8);
+    *(int64_t*)v87 = (int64_t)v86;
+    v89 = *(int64_t*)v87;
+    v90 = malloc(8);
+    *(void**)v90 = (void*)v89;
+    v92 = 0LL;
+    v93 = malloc(8);
+    *(int64_t*)v93 = (int64_t)v92;
+    v96 = *(void**)v90;
+    v97 = *(int64_t*)v96;
+    *(int64_t*)v93 = (int64_t)v97;
+    v100 = *(int64_t*)v4;
+    v101 = *(int64_t*)v66;
+    v102 = *(int64_t*)v93;
+    v103 = 0LL;
+    HashMap_insert((void*)v103, v100, v101, v102);
+    goto bb9;
+  bb8:
+    goto bb9;
+  bb9:
+    v107 = *(int64_t*)v48;
+    v108 = 1LL;
+    v109 = v107 + v108;
+    *(int64_t*)v48 = (int64_t)v109;
+    goto bb4;
+    return 0;
+}
+
+void Option_and_then(void* v0, void* v1, void* v2, void* v3) {
+    p_call_stack_push("Option_and_then");
+    int64_t v24;
+    void* v32;
+    void* v18;
+    void* v40;
+    bool v7;
+    int64_t v8; /* placeholder for void */
+    int64_t v26; /* placeholder for void */
+    void* v23;
+    int64_t v25; /* placeholder for void */
+    int64_t v33;
+    int64_t v43; /* placeholder for void */
+    int64_t v46; /* placeholder for void */
+    void* v19;
+    int64_t v14; /* placeholder for void */
+    int64_t v31; /* placeholder for void */
+    int64_t v39; /* placeholder for void */
+    int64_t v20;
+    void* v41;
+    int64_t v45; /* placeholder for void */
+    int64_t v44; /* placeholder for void */
+    void* v37;
+    int64_t v10;
+    void* v13;
+    void* v36;
+    int64_t v12;
+    bool v30;
+    void* v34;
+    int64_t v42;
+    int64_t v28;
+    int64_t v15;
+    void* v9;
+    void* v22;
+    void* v27;
+    int64_t v29;
+    void* v4;
+    int64_t v17; /* placeholder for void */
+    int64_t v5;
+    void* v16;
+    int64_t v35; /* placeholder for void */
+    int64_t v6;
+    void* v11;
+    int64_t v38;
+    int64_t v21; /* placeholder for void */
+    v4 = (char*)v2 + 0;
+    v5 = *(int64_t*)v4;
+    v6 = 0LL;
+    v7 = v5 == v6;
+    if (v7) goto bb2;
+    else goto bb3;
+  bb1:
+    p_call_stack_pop();
+    return;
+  bb2:
+    v9 = (char*)v2 + 8;
+    v10 = *(int64_t*)v9;
+    v11 = malloc(16);
+    v12 = 0LL;
+    v13 = (char*)v11 + 0;
+    *(int64_t*)v13 = (int64_t)v12;
+    {
+        if (!v3) abort();
+        char* _fn_name = *(char**)v3;
+        if (!_fn_name) abort();
+        if (strcmp(_fn_name, "String_to_string") == 0) {
+            v15 = String_to_string((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "abs") == 0) {
+            v15 = p_abs((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "p_str_length") == 0) {
+            v15 = p_str_length((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_char_count") == 0) {
+            v15 = String_char_count((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "HashMap_clone") == 0) {
+            v15 = HashMap_clone((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_to_lowercase") == 0) {
+            v15 = String_to_lowercase((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "str_len") == 0) {
+            v15 = str_len((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "Option_unwrap") == 0) {
+            v15 = Option_unwrap((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "String_bytes") == 0) {
+            v15 = String_bytes((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "p_str_hash") == 0) {
+            v15 = p_str_hash((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "ByteBuffer_len") == 0) {
+            v15 = ByteBuffer_len((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "char_to_upper") == 0) {
+            v15 = char_to_upper((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_pop") == 0) {
+            v15 = Vec_pop((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Result_unwrap") == 0) {
+            v15 = Result_unwrap((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "Vec_last") == 0) {
+            v15 = Vec_last((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "StringBuilder_len") == 0) {
+            v15 = StringBuilder_len((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "char_to_lower") == 0) {
+            v15 = char_to_lower((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_first") == 0) {
+            v15 = Vec_first((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "HashMap_values") == 0) {
+            v15 = HashMap_values((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_clone") == 0) {
+            v15 = Vec_clone((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "allocator_bytes_used") == 0) {
+            v15 = allocator_bytes_used((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "String_parse_int") == 0) {
+            v15 = String_parse_int((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_len") == 0) {
+            v15 = String_len((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_to_uppercase") == 0) {
+            v15 = String_to_uppercase((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_capacity") == 0) {
+            v15 = Vec_capacity((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "HashMap_keys") == 0) {
+            v15 = HashMap_keys((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "str_parse_hex") == 0) {
+            v15 = str_parse_hex((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "HashMap_len") == 0) {
+            v15 = HashMap_len((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "str_parse_int") == 0) {
+            v15 = str_parse_int((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "String_clone") == 0) {
+            v15 = String_clone((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_trim") == 0) {
+            v15 = String_trim((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_from") == 0) {
+            v15 = String_from((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_len") == 0) {
+            v15 = Vec_len((void*)v3, (int64_t)v10);
+        } else { abort(); }
+    }
+    v16 = (char*)v11 + 8;
+    *(int64_t*)v16 = (int64_t)v15;
+    v18 = (char*)v11 + 0;
+    v19 = (char*)v0 + 0;
+    v20 = *(int64_t*)v18;
+    *(int64_t*)v19 = (int64_t)v20;
+    v22 = (char*)v11 + 8;
+    v23 = (char*)v0 + 8;
+    v24 = *(int64_t*)v22;
+    *(int64_t*)v23 = (int64_t)v24;
+    p_call_stack_pop();
+    return;
+  bb3:
+    v27 = (char*)v2 + 0;
+    v28 = *(int64_t*)v27;
+    v29 = 1LL;
+    v30 = v28 == v29;
+    if (v30) goto bb4;
+    else goto bb5;
+  bb4:
+    v32 = malloc(16);
+    v33 = 1LL;
+    v34 = (char*)v32 + 0;
+    *(int64_t*)v34 = (int64_t)v33;
+    v36 = (char*)v32 + 0;
+    v37 = (char*)v0 + 0;
+    v38 = *(int64_t*)v36;
+    *(int64_t*)v37 = (int64_t)v38;
+    v40 = (char*)v32 + 8;
+    v41 = (char*)v0 + 8;
+    v42 = *(int64_t*)v40;
+    *(int64_t*)v41 = (int64_t)v42;
+    p_call_stack_pop();
+    return;
+  bb5:
+    goto bb1;
+    return;
+}
+
+void* str_to_lower(void* v0, void* v1) {
+    p_call_stack_push("str_to_lower");
+    int64_t v4; /* placeholder for void */
+    int64_t v3;
+    int64_t v2;
+    v2 = 0LL;
+    v3 = (int64_t)String_to_lowercase((void*)v2, (int64_t)v1);
+    p_call_stack_pop();
+    return (void*)v3;
+    return 0;
+}
+
+int64_t String_to_uppercase(void* v0, int64_t v1) {
+    p_call_stack_push("String_to_uppercase");
+    int64_t v61;
+    int64_t v49; /* placeholder for void */
+    int64_t v38;
+    int64_t v89; /* placeholder for void */
+    int64_t v84; /* placeholder for void */
+    int64_t v18; /* placeholder for void */
+    bool v3;
+    bool v36;
+    void* v40;
+    int64_t v46; /* placeholder for void */
+    int64_t v52; /* placeholder for void */
+    void* v10;
+    void* v6;
+    int64_t v2;
+    bool v63;
+    uint8_t v58;
+    int64_t v44;
+    void* v54;
+    int64_t v30;
+    int64_t v83; /* placeholder for void */
+    void* v91;
+    int64_t v71;
+    int64_t v95;
+    void* v51;
+    int64_t v79; /* placeholder for void */
+    int64_t v5;
+    int64_t v70;
+    int64_t v96; /* placeholder for void */
+    int64_t v11; /* placeholder for void */
+    int64_t v47;
+    int64_t v50;
+    int64_t v55; /* placeholder for void */
+    int64_t v4; /* placeholder for void */
+    int64_t v29; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    int64_t v17;
+    int64_t v25;
+    int64_t v60; /* placeholder for void */
+    int64_t v59; /* placeholder for void */
+    int64_t v16; /* placeholder for void */
+    int64_t v62;
+    bool v67;
+    int64_t v33; /* placeholder for void */
+    int64_t v43;
+    int64_t v53;
+    int64_t v8; /* placeholder for void */
+    int64_t v37; /* placeholder for void */
+    int64_t v56; /* placeholder for void */
+    int64_t v64;
+    void* v57;
+    void* v76;
+    bool v66;
+    int64_t v92; /* placeholder for void */
+    int64_t v14;
+    void* v7;
+    int64_t v21;
+    int64_t v23; /* placeholder for void */
+    int64_t v78; /* placeholder for void */
+    void* v94;
+    int64_t v74; /* placeholder for void */
+    int64_t v82;
+    int64_t v87;
+    int64_t v72; /* placeholder for void */
+    void* v28;
+    int64_t v34;
+    void* v31;
+    int64_t v26;
+    int64_t v85;
+    int64_t v73; /* placeholder for void */
+    void* v27;
+    int64_t v86;
+    int64_t v98;
+    int64_t v19; /* placeholder for void */
+    int64_t v99; /* placeholder for void */
+    void* v45;
+    int64_t v35;
+    int64_t v75; /* placeholder for void */
+    int64_t v77;
+    int64_t v32; /* placeholder for void */
+    void* v88;
+    void* v48;
+    int64_t v20;
+    int64_t v69;
+    void* v13;
+    int64_t v24;
+    int64_t v65;
+    int64_t v80;
+    int64_t v90;
+    int64_t v93; /* placeholder for void */
+    int64_t v97; /* placeholder for void */
+    int64_t v41; /* placeholder for void */
+    int64_t v68; /* placeholder for void */
+    int64_t v81;
+    int64_t v39;
+    int64_t v42;
+    int64_t v9;
+    void* v22;
+    int64_t v15; /* placeholder for void */
     v2 = 0LL;
     v3 = v1 == v2;
     if (v3) goto bb1;
@@ -588,209 +1624,482 @@ void* p_str_from_ptr(void* v0, int64_t v1) {
     v13 = *(void**)v10;
     v14 = 0LL;
     *(uint8_t*)v13 = (uint8_t)v14;
-    v17 = *(void**)v10;
+    v17 = *(int64_t*)v7;
     p_call_stack_pop();
     return v17;
   bb2:
     goto bb3;
   bb3:
-    v20 = malloc(8);
-    *(int64_t*)v20 = (int64_t)v1;
-    v22 = *(int64_t*)v20;
-    v23 = malloc(8);
-    *(void**)v23 = (void*)v22;
-    v25 = 0LL;
-    v26 = malloc(8);
-    *(int64_t*)v26 = (int64_t)v25;
-    v29 = *(void**)v23;
-    v30 = *(uint8_t*)v29;
+    v20 = 0LL;
+    v21 = (int64_t)p_str_length((void*)v20, v1);
+    v22 = malloc(8);
+    *(int64_t*)v22 = (int64_t)v21;
+    v24 = *(int64_t*)v22;
+    v25 = 1LL;
+    v26 = v24 + v25;
+    v27 = p_malloc(v26);
+    v28 = malloc(8);
+    *(int64_t*)v28 = (int64_t)v27;
+    v30 = 0LL;
     v31 = malloc(8);
     *(int64_t*)v31 = (int64_t)v30;
     goto bb4;
   bb4:
     v34 = *(int64_t*)v31;
-    v35 = 0LL;
-    v36 = v34 != v35;
+    v35 = *(int64_t*)v22;
+    v36 = v34 < v35;
     if (v36) goto bb5;
     else goto bb6;
   bb5:
-    v38 = *(int64_t*)v26;
-    v39 = 1LL;
-    v40 = v38 + v39;
-    *(int64_t*)v26 = (int64_t)v40;
-    v42 = *(int64_t*)v20;
-    v43 = 1LL;
+    v38 = *(int64_t*)v31;
+    v39 = v1 + v38;
+    v40 = malloc(8);
+    *(int64_t*)v40 = (int64_t)v39;
+    v42 = *(int64_t*)v28;
+    v43 = *(int64_t*)v31;
     v44 = v42 + v43;
-    *(int64_t*)v20 = (int64_t)v44;
-    v46 = *(int64_t*)v20;
-    *(void**)v23 = (void*)v46;
-    v48 = *(void**)v23;
-    v49 = *(uint8_t*)v48;
-    *(int64_t*)v31 = (int64_t)v49;
-    goto bb4;
+    v45 = malloc(8);
+    *(int64_t*)v45 = (int64_t)v44;
+    v47 = *(int64_t*)v40;
+    v48 = malloc(8);
+    *(void**)v48 = (void*)v47;
+    v50 = *(int64_t*)v45;
+    v51 = malloc(8);
+    *(void**)v51 = (void*)v50;
+    v53 = 0LL;
+    v54 = malloc(8);
+    *(int64_t*)v54 = (int64_t)v53;
+    v57 = *(void**)v48;
+    v58 = *(uint8_t*)v57;
+    *(int64_t*)v54 = (int64_t)v58;
+    v61 = *(int64_t*)v54;
+    v62 = 97LL;
+    v63 = v61 >= v62;
+    v64 = *(int64_t*)v54;
+    v65 = 122LL;
+    v66 = v64 <= v65;
+    v67 = v63 && v66;
+    if (v67) goto bb7;
+    else goto bb8;
   bb6:
-    v53 = *(int64_t*)v26;
-    v54 = 1LL;
-    v55 = v53 + v54;
-    v56 = p_malloc(v55);
-    v57 = malloc(8);
-    *(int64_t*)v57 = (int64_t)v56;
-    v59 = *(int64_t*)v57;
-    v60 = malloc(8);
-    *(void**)v60 = (void*)v59;
-    v62 = malloc(8);
-    *(int64_t*)v62 = (int64_t)v1;
-    v64 = *(int64_t*)v62;
-    v65 = malloc(8);
-    *(void**)v65 = (void*)v64;
-    v68 = 0LL;
-    v69 = malloc(8);
-    *(int64_t*)v69 = (int64_t)v68;
-    goto bb7;
-  bb7:
-    v72 = *(int64_t*)v69;
-    v73 = *(int64_t*)v26;
-    v74 = v72 < v73;
-    if (v74) goto bb8;
-    else goto bb9;
-  bb8:
-    v76 = *(void**)v65;
-    v77 = *(uint8_t*)v76;
-    v78 = malloc(8);
-    *(int64_t*)v78 = (int64_t)v77;
-    v80 = *(void**)v60;
-    v81 = *(int64_t*)v78;
-    *(uint8_t*)v80 = (uint8_t)v81;
-    v83 = *(int64_t*)v69;
-    v84 = 1LL;
-    v85 = v83 + v84;
-    *(int64_t*)v69 = (int64_t)v85;
-    v87 = *(int64_t*)v62;
-    v88 = 1LL;
-    v89 = v87 + v88;
-    *(int64_t*)v62 = (int64_t)v89;
-    v91 = *(int64_t*)v62;
-    *(void**)v65 = (void*)v91;
-    v93 = *(void**)v60;
-    v94 = malloc(8);
-    *(int64_t*)v94 = (int64_t)v93;
-    v96 = *(int64_t*)v94;
-    v97 = 1LL;
-    v98 = v96 + v97;
-    *(int64_t*)v94 = (int64_t)v98;
-    v100 = *(int64_t*)v94;
-    *(void**)v60 = (void*)v100;
-    goto bb7;
-  bb9:
-    v103 = *(void**)v60;
-    v104 = 0LL;
-    *(uint8_t*)v103 = (uint8_t)v104;
-    v107 = *(int64_t*)v57;
-    v108 = malloc(8);
-    *(void**)v108 = (void*)v107;
-    v110 = *(void**)v108;
+    v85 = *(int64_t*)v28;
+    v86 = *(int64_t*)v22;
+    v87 = v85 + v86;
+    v88 = malloc(8);
+    *(int64_t*)v88 = (int64_t)v87;
+    v90 = *(int64_t*)v88;
+    v91 = malloc(8);
+    *(void**)v91 = (void*)v90;
+    v94 = *(void**)v91;
+    v95 = 0LL;
+    *(uint8_t*)v94 = (uint8_t)v95;
+    v98 = *(int64_t*)v28;
     p_call_stack_pop();
-    return v110;
+    return v98;
+  bb7:
+    v69 = *(int64_t*)v54;
+    v70 = 32LL;
+    v71 = v69 - v70;
+    *(int64_t*)v54 = (int64_t)v71;
+    goto bb9;
+  bb8:
+    goto bb9;
+  bb9:
+    v76 = *(void**)v51;
+    v77 = *(int64_t*)v54;
+    *(uint8_t*)v76 = (uint8_t)v77;
+    v80 = *(int64_t*)v31;
+    v81 = 1LL;
+    v82 = v80 + v81;
+    *(int64_t*)v31 = (int64_t)v82;
+    goto bb4;
     return 0;
 }
 
-void* str_repeat(void* v0, void* v1, int64_t v2) {
-    p_call_stack_push("str_repeat");
-    int64_t v3;
-    int64_t v4;
-    int64_t v5; /* placeholder for void */
-    v3 = 0LL;
-    v4 = (int64_t)String_repeat((void*)v3, (int64_t)v1, v2);
+void Result_map(void* v0, void* v1, void* v2, void* v3) {
+    p_call_stack_push("Result_map");
+    void* v9;
+    bool v30;
+    int64_t v24;
+    int64_t v35;
+    void* v38;
+    void* v23;
+    int64_t v43; /* placeholder for void */
+    int64_t v25; /* placeholder for void */
+    int64_t v29;
+    int64_t v31; /* placeholder for void */
+    int64_t v37; /* placeholder for void */
+    void* v40;
+    void* v4;
+    int64_t v5;
+    void* v18;
+    int64_t v33;
+    int64_t v20;
+    int64_t v48; /* placeholder for void */
+    void* v44;
+    bool v7;
+    void* v22;
+    int64_t v50; /* placeholder for void */
+    void* v34;
+    void* v27;
+    int64_t v15;
+    int64_t v21; /* placeholder for void */
+    int64_t v8; /* placeholder for void */
+    int64_t v14; /* placeholder for void */
+    int64_t v26; /* placeholder for void */
+    int64_t v6;
+    int64_t v39; /* placeholder for void */
+    void* v11;
+    void* v13;
+    void* v16;
+    void* v45;
+    int64_t v28;
+    void* v32;
+    int64_t v47; /* placeholder for void */
+    void* v36;
+    void* v41;
+    int64_t v10;
+    int64_t v42;
+    void* v19;
+    int64_t v17; /* placeholder for void */
+    int64_t v46;
+    int64_t v49; /* placeholder for void */
+    int64_t v12;
+    v4 = (char*)v2 + 0;
+    v5 = *(int64_t*)v4;
+    v6 = 0LL;
+    v7 = v5 == v6;
+    if (v7) goto bb2;
+    else goto bb3;
+  bb1:
     p_call_stack_pop();
-    return (void*)v4;
+    return;
+  bb2:
+    v9 = (char*)v2 + 8;
+    v10 = *(int64_t*)v9;
+    v11 = malloc(16);
+    v12 = 0LL;
+    v13 = (char*)v11 + 0;
+    *(int64_t*)v13 = (int64_t)v12;
+    {
+        if (!v3) abort();
+        char* _fn_name = *(char**)v3;
+        if (!_fn_name) abort();
+        if (strcmp(_fn_name, "String_to_string") == 0) {
+            v15 = String_to_string((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "abs") == 0) {
+            v15 = p_abs((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "p_str_length") == 0) {
+            v15 = p_str_length((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_char_count") == 0) {
+            v15 = String_char_count((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "HashMap_clone") == 0) {
+            v15 = HashMap_clone((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_to_lowercase") == 0) {
+            v15 = String_to_lowercase((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "str_len") == 0) {
+            v15 = str_len((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "Option_unwrap") == 0) {
+            v15 = Option_unwrap((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "String_bytes") == 0) {
+            v15 = String_bytes((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "p_str_hash") == 0) {
+            v15 = p_str_hash((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "ByteBuffer_len") == 0) {
+            v15 = ByteBuffer_len((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "char_to_upper") == 0) {
+            v15 = char_to_upper((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_pop") == 0) {
+            v15 = Vec_pop((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Result_unwrap") == 0) {
+            v15 = Result_unwrap((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "Vec_last") == 0) {
+            v15 = Vec_last((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "StringBuilder_len") == 0) {
+            v15 = StringBuilder_len((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "char_to_lower") == 0) {
+            v15 = char_to_lower((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_first") == 0) {
+            v15 = Vec_first((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "HashMap_values") == 0) {
+            v15 = HashMap_values((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_clone") == 0) {
+            v15 = Vec_clone((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "allocator_bytes_used") == 0) {
+            v15 = allocator_bytes_used((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "String_parse_int") == 0) {
+            v15 = String_parse_int((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_len") == 0) {
+            v15 = String_len((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_to_uppercase") == 0) {
+            v15 = String_to_uppercase((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_capacity") == 0) {
+            v15 = Vec_capacity((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "HashMap_keys") == 0) {
+            v15 = HashMap_keys((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "str_parse_hex") == 0) {
+            v15 = str_parse_hex((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "HashMap_len") == 0) {
+            v15 = HashMap_len((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "str_parse_int") == 0) {
+            v15 = str_parse_int((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "String_clone") == 0) {
+            v15 = String_clone((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_trim") == 0) {
+            v15 = String_trim((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_from") == 0) {
+            v15 = String_from((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_len") == 0) {
+            v15 = Vec_len((void*)v3, (int64_t)v10);
+        } else { abort(); }
+    }
+    v16 = (char*)v11 + 8;
+    *(int64_t*)v16 = (int64_t)v15;
+    v18 = (char*)v11 + 0;
+    v19 = (char*)v0 + 0;
+    v20 = *(int64_t*)v18;
+    *(int64_t*)v19 = (int64_t)v20;
+    v22 = (char*)v11 + 8;
+    v23 = (char*)v0 + 8;
+    v24 = *(int64_t*)v22;
+    *(int64_t*)v23 = (int64_t)v24;
+    p_call_stack_pop();
+    return;
+  bb3:
+    v27 = (char*)v2 + 0;
+    v28 = *(int64_t*)v27;
+    v29 = 1LL;
+    v30 = v28 == v29;
+    if (v30) goto bb4;
+    else goto bb5;
+  bb4:
+    v32 = (char*)v2 + 8;
+    v33 = *(int64_t*)v32;
+    v34 = malloc(16);
+    v35 = 1LL;
+    v36 = (char*)v34 + 0;
+    *(int64_t*)v36 = (int64_t)v35;
+    v38 = (char*)v34 + 8;
+    *(int64_t*)v38 = (int64_t)v33;
+    v40 = (char*)v34 + 0;
+    v41 = (char*)v0 + 0;
+    v42 = *(int64_t*)v40;
+    *(int64_t*)v41 = (int64_t)v42;
+    v44 = (char*)v34 + 8;
+    v45 = (char*)v0 + 8;
+    v46 = *(int64_t*)v44;
+    *(int64_t*)v45 = (int64_t)v46;
+    p_call_stack_pop();
+    return;
+  bb5:
+    goto bb1;
+    return;
+}
+
+void* str_trim_start(void* v0, void* v1) {
+    p_call_stack_push("str_trim_start");
+    int64_t v24; /* placeholder for void */
+    int64_t v23; /* placeholder for void */
+    int64_t v17; /* placeholder for void */
+    int64_t v28; /* placeholder for void */
+    int64_t v3;
+    int64_t v15;
+    int64_t v29;
+    int64_t v34; /* placeholder for void */
+    int64_t v38;
+    int64_t v40; /* placeholder for void */
+    int64_t v44; /* placeholder for void */
+    int64_t v47; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    int64_t v42;
+    int64_t v50;
+    void* v25;
+    int64_t v33; /* placeholder for void */
+    int64_t v35; /* placeholder for void */
+    void* v19;
+    void* v22;
+    int64_t v46; /* placeholder for void */
+    void* v4;
+    int64_t v11;
+    int64_t v9; /* placeholder for void */
+    int64_t v32;
+    int64_t v41;
+    int64_t v48;
+    int64_t v5; /* placeholder for void */
+    int64_t v18;
+    int64_t v21;
+    int64_t v49;
+    int64_t v8; /* placeholder for void */
+    int64_t v6;
+    bool v31;
+    int64_t v10;
+    int64_t v51;
+    int64_t v2;
+    uint8_t v26;
+    int64_t v13; /* placeholder for void */
+    int64_t v36;
+    void* v16;
+    int64_t v14;
+    void* v45;
+    int64_t v30;
+    bool v12;
+    int64_t v37;
+    int64_t v27; /* placeholder for void */
+    void* v7;
+    int64_t v39; /* placeholder for void */
+    bool v43;
+    int64_t v52; /* placeholder for void */
+    v2 = 0LL;
+    v3 = (int64_t)String_len((void*)v2, (int64_t)v1);
+    v4 = malloc(8);
+    *(int64_t*)v4 = (int64_t)v3;
+    v6 = 0LL;
+    v7 = malloc(8);
+    *(int64_t*)v7 = (int64_t)v6;
+    goto bb1;
+  bb1:
+    v10 = *(int64_t*)v7;
+    v11 = *(int64_t*)v4;
+    v12 = v10 < v11;
+    if (v12) goto bb2;
+    else goto bb3;
+  bb2:
+    v14 = *(int64_t*)v7;
+    v15 = (int64_t)v1 + v14;
+    v16 = malloc(8);
+    *(int64_t*)v16 = (int64_t)v15;
+    v18 = *(int64_t*)v16;
+    v19 = malloc(8);
+    *(void**)v19 = (void*)v18;
+    v21 = 0LL;
+    v22 = malloc(8);
+    *(int64_t*)v22 = (int64_t)v21;
+    v25 = *(void**)v19;
+    v26 = *(uint8_t*)v25;
+    *(int64_t*)v22 = (int64_t)v26;
+    v29 = *(int64_t*)v22;
+    v30 = 0LL;
+    v31 = (bool)char_is_whitespace((void*)v30, v29);
+    v32 = !v31;
+    if (v32) goto bb4;
+    else goto bb5;
+  bb3:
+    v41 = *(int64_t*)v7;
+    v42 = *(int64_t*)v4;
+    v43 = v41 >= v42;
+    if (v43) goto bb7;
+    else goto bb8;
+  bb4:
+    goto bb3;
+  bb5:
+    goto bb6;
+  bb6:
+    v36 = *(int64_t*)v7;
+    v37 = 1LL;
+    v38 = v36 + v37;
+    *(int64_t*)v7 = (int64_t)v38;
+    goto bb1;
+  bb7:
+    v45 = _str1;
+    p_call_stack_pop();
+    return v45;
+  bb8:
+    goto bb9;
+  bb9:
+    v48 = *(int64_t*)v7;
+    v49 = *(int64_t*)v4;
+    v50 = 0LL;
+    v51 = (int64_t)String_slice((void*)v50, (int64_t)v1, v48, v49);
+    p_call_stack_pop();
+    return (void*)v51;
     return 0;
 }
 
 int64_t HashMap_keys(void* v0, int64_t v1) {
     p_call_stack_push("HashMap_keys");
-    int64_t v82; /* placeholder for void */
-    int64_t v55;
-    void* v12;
-    bool v43;
-    bool v70;
-    int64_t v25; /* placeholder for void */
-    int64_t v3;
-    int64_t v71; /* placeholder for void */
-    void* v24;
-    int64_t v73;
-    int64_t v46;
-    int64_t v80;
-    int64_t v26;
-    int64_t v2;
-    int64_t v17; /* placeholder for void */
-    int64_t v78;
-    int64_t v48;
-    int64_t v54; /* placeholder for void */
-    void* v15;
-    int64_t v20; /* placeholder for void */
-    int64_t v35; /* placeholder for void */
-    int64_t v61; /* placeholder for void */
-    int64_t v39; /* placeholder for void */
-    int64_t v67;
-    void* v56;
-    int64_t v14; /* placeholder for void */
     int64_t v34;
-    int64_t v27;
-    int64_t v19;
-    int64_t v83;
-    void* v18;
-    int64_t v29;
-    int64_t v60;
-    int64_t v62; /* placeholder for void */
-    void* v9;
-    bool v28;
-    int64_t v41;
-    int64_t v57; /* placeholder for void */
-    int64_t v63;
+    int64_t v14; /* placeholder for void */
+    void* v4;
+    int64_t v46;
+    void* v24;
     void* v53;
+    int64_t v80;
+    int64_t v83;
+    bool v28;
+    int64_t v22;
+    bool v32;
+    int64_t v2;
+    int64_t v25; /* placeholder for void */
     int64_t v44; /* placeholder for void */
+    int64_t v7; /* placeholder for void */
+    int64_t v60;
+    int64_t v39; /* placeholder for void */
+    int64_t v81; /* placeholder for void */
+    int64_t v26;
+    bool v31;
+    bool v69;
+    int64_t v23;
+    int64_t v3;
+    int64_t v64;
+    int64_t v52;
+    int64_t v82; /* placeholder for void */
+    int64_t v61; /* placeholder for void */
     int64_t v68;
     int64_t v16;
-    int64_t v22;
-    int64_t v40; /* placeholder for void */
-    int64_t v10; /* placeholder for void */
-    int64_t v51; /* placeholder for void */
-    int64_t v81; /* placeholder for void */
-    bool v32;
-    int64_t v42;
-    int64_t v13; /* placeholder for void */
-    int64_t v23;
-    int64_t v84; /* placeholder for void */
-    bool v31;
-    int64_t v49;
-    int64_t v7; /* placeholder for void */
-    int64_t v11;
-    int64_t v36; /* placeholder for void */
-    int64_t v30;
-    void* v38;
-    int64_t v64;
-    int64_t v74;
-    int64_t v76; /* placeholder for void */
-    int64_t v47;
-    int64_t v79;
-    bool v65;
-    void* v6;
     int64_t v33; /* placeholder for void */
-    int64_t v45;
-    int64_t v52;
-    int64_t v77; /* placeholder for void */
-    void* v50;
-    void* v4;
-    int64_t v21; /* placeholder for void */
-    void* v59;
-    bool v69;
-    int64_t v72;
+    void* v56;
+    void* v6;
+    int64_t v57; /* placeholder for void */
+    void* v9;
+    int64_t v42;
+    int64_t v10; /* placeholder for void */
+    int64_t v19;
+    int64_t v63;
+    int64_t v27;
+    int64_t v76; /* placeholder for void */
+    bool v43;
+    int64_t v62; /* placeholder for void */
+    bool v65;
     int64_t v37;
-    int64_t v75; /* placeholder for void */
-    int64_t v5; /* placeholder for void */
+    int64_t v47;
     int64_t v66;
-    int64_t v8;
+    int64_t v79;
+    int64_t v74;
     int64_t v58; /* placeholder for void */
+    bool v70;
+    void* v12;
+    int64_t v20; /* placeholder for void */
+    void* v18;
+    void* v50;
+    int64_t v41;
+    int64_t v67;
+    int64_t v8;
+    int64_t v84; /* placeholder for void */
+    int64_t v55;
+    int64_t v13; /* placeholder for void */
+    int64_t v30;
+    int64_t v36; /* placeholder for void */
+    int64_t v54; /* placeholder for void */
+    void* v59;
+    void* v38;
+    int64_t v29;
+    int64_t v77; /* placeholder for void */
+    int64_t v78;
+    void* v15;
+    int64_t v49;
+    int64_t v40; /* placeholder for void */
+    int64_t v35; /* placeholder for void */
+    int64_t v11;
+    int64_t v72;
+    int64_t v48;
+    int64_t v45;
+    int64_t v5; /* placeholder for void */
+    int64_t v51; /* placeholder for void */
+    int64_t v21; /* placeholder for void */
+    int64_t v73;
+    int64_t v17; /* placeholder for void */
+    int64_t v71; /* placeholder for void */
+    int64_t v75; /* placeholder for void */
     v2 = 24LL;
     v3 = v1 + v2;
     v4 = malloc(8);
@@ -887,278 +2196,611 @@ int64_t HashMap_keys(void* v0, int64_t v1) {
     return 0;
 }
 
-bool str_ends_with(void* v0, void* v1, void* v2) {
-    p_call_stack_push("str_ends_with");
+void StringBuilder_append_char(void* v0, void* v1, int64_t v2) {
+    p_call_stack_push("StringBuilder_append_char");
+    void* v3;
+    int64_t v8; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    void* v9;
+    int64_t v14; /* placeholder for void */
+    void* v4;
+    void* v7;
+    int64_t v13;
+    void* v10;
+    int64_t v11;
+    void* v5;
+    int64_t v12;
+    void* v6;
+    v3 = (char*)v1 + 0;
+    v4 = (char*)v1 + 0;
+    v5 = *(void**)v4;
+    v6 = p_char_to_str(v2);
+    v7 = p_str_concat(v5, v6);
+    *(void**)v3 = (void*)v7;
+    v9 = (char*)v1 + 8;
+    v10 = (char*)v1 + 8;
+    v11 = *(int64_t*)v10;
+    v12 = 1LL;
+    v13 = v11 + v12;
+    *(int64_t*)v9 = (int64_t)v13;
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+int64_t ByteBuffer_read_byte(void* v0, void* v1, int64_t v2) {
+    p_call_stack_push("ByteBuffer_read_byte");
+    int64_t v11;
+    void* v5;
+    void* v14;
+    int64_t v3;
+    void* v15;
+    int64_t v12; /* placeholder for void */
+    bool v4;
+    int64_t v9; /* placeholder for void */
+    int64_t v16;
+    int64_t v17;
+    int64_t v13; /* placeholder for void */
+    bool v8;
+    bool v7;
+    int64_t v10;
+    int64_t v6;
+    int64_t v18; /* placeholder for void */
+    v3 = 0LL;
+    v4 = v2 < v3;
+    v5 = (char*)v1 + 8;
+    v6 = *(int64_t*)v5;
+    v7 = v2 >= v6;
+    v8 = v4 || v7;
+    if (v8) goto bb1;
+    else goto bb2;
+  bb1:
+    v10 = 1LL;
+    v11 = -v10;
+    p_call_stack_pop();
+    return v11;
+  bb2:
+    goto bb3;
+  bb3:
+    v14 = (char*)v1 + 0;
+    v15 = *(void**)v14;
+    v16 = 0LL;
+    v17 = (int64_t)Vec_get((void*)v16, (int64_t)v15, v2);
+    p_call_stack_pop();
+    return v17;
+    return 0;
+}
+
+int64_t clamp(void* v0, int64_t v1, int64_t v2, int64_t v3) {
+    p_call_stack_push("clamp");
+    int64_t v11; /* placeholder for void */
+    int64_t v7; /* placeholder for void */
+    int64_t v9; /* placeholder for void */
+    bool v4;
+    int64_t v6; /* placeholder for void */
+    int64_t v10; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    bool v8;
+    int64_t v5; /* placeholder for void */
+    v4 = v1 < v2;
+    if (v4) goto bb1;
+    else goto bb2;
+  bb1:
+    p_call_stack_pop();
+    return v2;
+  bb2:
+    goto bb3;
+  bb3:
+    v8 = v1 > v3;
+    if (v8) goto bb4;
+    else goto bb5;
+  bb4:
+    p_call_stack_pop();
+    return v3;
+  bb5:
+    goto bb6;
+  bb6:
+    p_call_stack_pop();
+    return v1;
+    return 0;
+}
+
+void* char_to_str(void* v0, int64_t v1) {
+    p_call_stack_push("char_to_str");
+    int64_t v3; /* placeholder for void */
+    void* v2;
+    v2 = p_char_to_str(v1);
+    p_call_stack_pop();
+    return v2;
+    return 0;
+}
+
+bool char_is_upper(void* v0, int64_t v1) {
+    p_call_stack_push("char_is_upper");
+    int64_t v4;
+    int64_t v2;
+    bool v6;
+    bool v3;
+    bool v5;
+    int64_t v7; /* placeholder for void */
+    v2 = 65LL;
+    v3 = v1 >= v2;
+    v4 = 90LL;
+    v5 = v1 <= v4;
+    v6 = v3 && v5;
+    p_call_stack_pop();
+    return v6;
+    return 0;
+}
+
+void* str_trim_end(void* v0, void* v1) {
+    p_call_stack_push("str_trim_end");
+    int64_t v54; /* placeholder for void */
+    int64_t v26; /* placeholder for void */
+    int64_t v9; /* placeholder for void */
+    int64_t v19; /* placeholder for void */
+    void* v4;
+    int64_t v35; /* placeholder for void */
+    int64_t v6;
+    int64_t v36; /* placeholder for void */
+    int64_t v11;
+    int64_t v41; /* placeholder for void */
+    int64_t v10;
+    int64_t v16;
+    int64_t v50;
+    int64_t v30; /* placeholder for void */
+    void* v21;
+    int64_t v13; /* placeholder for void */
+    int64_t v15;
+    int64_t v22; /* placeholder for void */
+    int64_t v37; /* placeholder for void */
+    void* v27;
+    int64_t v42; /* placeholder for void */
+    int64_t v2;
+    int64_t v31;
+    void* v7;
+    int64_t v20;
+    uint8_t v28;
+    int64_t v32;
+    int64_t v34;
+    int64_t v39;
+    int64_t v40;
+    int64_t v44;
+    bool v45;
+    int64_t v3;
+    int64_t v29; /* placeholder for void */
+    int64_t v5; /* placeholder for void */
+    int64_t v8; /* placeholder for void */
+    int64_t v23;
+    int64_t v25; /* placeholder for void */
+    bool v33;
+    int64_t v17;
+    int64_t v46; /* placeholder for void */
+    int64_t v51;
+    void* v18;
+    bool v12;
+    void* v47;
+    int64_t v48; /* placeholder for void */
+    int64_t v52;
+    int64_t v43;
+    int64_t v53;
+    void* v24;
+    int64_t v49; /* placeholder for void */
+    int64_t v14;
+    int64_t v38;
+    v2 = 0LL;
+    v3 = (int64_t)String_len((void*)v2, (int64_t)v1);
+    v4 = malloc(8);
+    *(int64_t*)v4 = (int64_t)v3;
+    v6 = *(int64_t*)v4;
+    v7 = malloc(8);
+    *(int64_t*)v7 = (int64_t)v6;
+    goto bb1;
+  bb1:
+    v10 = *(int64_t*)v7;
+    v11 = 0LL;
+    v12 = v10 > v11;
+    if (v12) goto bb2;
+    else goto bb3;
+  bb2:
+    v14 = *(int64_t*)v7;
+    v15 = (int64_t)v1 + v14;
+    v16 = 1LL;
+    v17 = v15 - v16;
+    v18 = malloc(8);
+    *(int64_t*)v18 = (int64_t)v17;
+    v20 = *(int64_t*)v18;
+    v21 = malloc(8);
+    *(void**)v21 = (void*)v20;
+    v23 = 0LL;
+    v24 = malloc(8);
+    *(int64_t*)v24 = (int64_t)v23;
+    v27 = *(void**)v21;
+    v28 = *(uint8_t*)v27;
+    *(int64_t*)v24 = (int64_t)v28;
+    v31 = *(int64_t*)v24;
+    v32 = 0LL;
+    v33 = (bool)char_is_whitespace((void*)v32, v31);
+    v34 = !v33;
+    if (v34) goto bb4;
+    else goto bb5;
+  bb3:
+    v43 = *(int64_t*)v7;
+    v44 = 0LL;
+    v45 = v43 <= v44;
+    if (v45) goto bb7;
+    else goto bb8;
+  bb4:
+    goto bb3;
+  bb5:
+    goto bb6;
+  bb6:
+    v38 = *(int64_t*)v7;
+    v39 = 1LL;
+    v40 = v38 - v39;
+    *(int64_t*)v7 = (int64_t)v40;
+    goto bb1;
+  bb7:
+    v47 = _str1;
+    p_call_stack_pop();
+    return v47;
+  bb8:
+    goto bb9;
+  bb9:
+    v50 = 0LL;
+    v51 = *(int64_t*)v7;
+    v52 = 0LL;
+    v53 = (int64_t)String_slice((void*)v52, (int64_t)v1, v50, v51);
+    p_call_stack_pop();
+    return (void*)v53;
+    return 0;
+}
+
+int64_t ByteBuffer_len(void* v0, void* v1) {
+    p_call_stack_push("ByteBuffer_len");
+    void* v2;
+    int64_t v4; /* placeholder for void */
+    int64_t v3;
+    v2 = (char*)v1 + 8;
+    v3 = *(int64_t*)v2;
+    p_call_stack_pop();
+    return v3;
+    return 0;
+}
+
+int64_t HashMap_new(void* v0) {
+    p_call_stack_push("HashMap_new");
+    int64_t v1;
+    int64_t v13;
+    void* v33;
+    int64_t v34;
+    int64_t v37;
+    int64_t v35; /* placeholder for void */
+    int64_t v31;
+    int64_t v19;
+    int64_t v7; /* placeholder for void */
+    void* v24;
+    int64_t v15;
+    int64_t v12; /* placeholder for void */
+    int64_t v36; /* placeholder for void */
+    int64_t v32; /* placeholder for void */
+    int64_t v22; /* placeholder for void */
+    int64_t v38; /* placeholder for void */
+    void* v11;
+    int64_t v23; /* placeholder for void */
+    int64_t v28;
+    int64_t v4; /* placeholder for void */
+    void* v6;
+    int64_t v29; /* placeholder for void */
+    void* v21;
+    int64_t v8;
+    int64_t v26; /* placeholder for void */
+    int64_t v25;
+    int64_t v18;
+    int64_t v20;
+    int64_t v17; /* placeholder for void */
+    int64_t v5;
+    void* v27;
+    void* v3;
+    void* v2;
+    int64_t v10;
+    void* v16;
+    void* v30;
+    int64_t v9;
+    int64_t v14;
+    v1 = 32LL;
+    v2 = p_malloc(v1);
+    v3 = malloc(8);
+    *(int64_t*)v3 = (int64_t)v2;
+    v5 = *(int64_t*)v3;
+    v6 = malloc(8);
+    *(void**)v6 = (void*)v5;
+    v8 = *(int64_t*)v3;
+    v9 = 8LL;
+    v10 = v8 + v9;
+    v11 = malloc(8);
+    *(void**)v11 = (void*)v10;
+    v13 = *(int64_t*)v3;
+    v14 = 16LL;
+    v15 = v13 + v14;
+    v16 = malloc(8);
+    *(void**)v16 = (void*)v15;
+    v18 = *(int64_t*)v3;
+    v19 = 24LL;
+    v20 = v18 + v19;
+    v21 = malloc(8);
+    *(void**)v21 = (void*)v20;
+    v24 = *(void**)v6;
+    v25 = 0LL;
+    *(int64_t*)v24 = (int64_t)v25;
+    v27 = *(void**)v11;
+    v28 = 0LL;
+    *(int64_t*)v27 = (int64_t)v28;
+    v30 = *(void**)v16;
+    v31 = 0LL;
+    *(int64_t*)v30 = (int64_t)v31;
+    v33 = *(void**)v21;
+    v34 = 0LL;
+    *(int64_t*)v33 = (int64_t)v34;
+    v37 = *(int64_t*)v3;
+    p_call_stack_pop();
+    return v37;
+    return 0;
+}
+
+bool str_contains(void* v0, void* v1, void* v2) {
+    p_call_stack_push("str_contains");
     int64_t v3;
     bool v4;
     int64_t v5; /* placeholder for void */
     v3 = 0LL;
-    v4 = (bool)String_ends_with((void*)v3, (int64_t)v1, (int64_t)v2);
+    v4 = (bool)String_contains((void*)v3, (int64_t)v1, (int64_t)v2);
     p_call_stack_pop();
     return v4;
     return 0;
 }
 
-int64_t String_parse_int(void* v0, int64_t v1) {
-    p_call_stack_push("String_parse_int");
-    bool v35;
-    bool v27;
-    int64_t v76;
-    int64_t v8;
-    int64_t v75; /* placeholder for void */
-    int64_t v60;
-    int64_t v92; /* placeholder for void */
-    int64_t v105;
-    int64_t v111; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    int64_t v16;
-    uint8_t v108;
-    int64_t v89;
-    int64_t v84; /* placeholder for void */
-    int64_t v103;
-    int64_t v74;
-    int64_t v72;
-    int64_t v113;
-    int64_t v50; /* placeholder for void */
-    int64_t v2;
-    int64_t v42;
-    int64_t v62;
-    int64_t v5;
-    int64_t v43;
-    uint8_t v65;
-    int64_t v51;
-    bool v31;
-    uint8_t v79;
-    int64_t v37;
-    int64_t v95;
-    void* v78;
-    void* v14;
-    int64_t v19; /* placeholder for void */
-    void* v47;
-    int64_t v67; /* placeholder for void */
-    int64_t v77; /* placeholder for void */
-    int64_t v11;
-    int64_t v86;
-    bool v30;
-    int64_t v106; /* placeholder for void */
-    uint8_t v21;
-    int64_t v29;
-    int64_t v15; /* placeholder for void */
-    int64_t v80; /* placeholder for void */
-    int64_t v24; /* placeholder for void */
-    bool v53;
-    int64_t v36;
-    int64_t v56;
-    int64_t v55;
-    int64_t v101;
-    int64_t v25;
-    void* v64;
-    int64_t v109; /* placeholder for void */
-    int64_t v41;
-    int64_t v6; /* placeholder for void */
-    int64_t v97;
-    int64_t v33;
-    void* v9;
-    int64_t v52;
-    int64_t v99;
-    int64_t v32;
-    int64_t v69;
-    int64_t v7; /* placeholder for void */
-    int64_t v88;
-    int64_t v83; /* placeholder for void */
-    int64_t v98;
-    int64_t v57; /* placeholder for void */
-    void* v107;
-    int64_t v114;
-    void* v20;
-    int64_t v85;
-    int64_t v45;
-    int64_t v100; /* placeholder for void */
-    int64_t v49; /* placeholder for void */
-    int64_t v23; /* placeholder for void */
-    int64_t v59;
-    int64_t v61; /* placeholder for void */
-    bool v3;
-    int64_t v4; /* placeholder for void */
-    bool v90;
-    int64_t v110; /* placeholder for void */
-    int64_t v81; /* placeholder for void */
-    int64_t v93;
-    bool v87;
-    bool v39;
-    int64_t v54; /* placeholder for void */
-    int64_t v66; /* placeholder for void */
-    bool v91;
-    int64_t v102;
-    int64_t v58;
-    int64_t v115; /* placeholder for void */
-    int64_t v40; /* placeholder for void */
-    int64_t v71; /* placeholder for void */
-    bool v38;
-    int64_t v96;
-    int64_t v46; /* placeholder for void */
-    int64_t v112;
-    int64_t v44; /* placeholder for void */
-    int64_t v94;
-    int64_t v63; /* placeholder for void */
-    int64_t v13; /* placeholder for void */
-    int64_t v73;
-    int64_t v104; /* placeholder for void */
-    int64_t v26;
-    bool v70;
-    int64_t v28;
-    int64_t v68;
-    uint8_t v48;
+void Result_map_err(void* v0, void* v1, void* v2, void* v3) {
+    p_call_stack_push("Result_map_err");
+    int64_t v47; /* placeholder for void */
+    int64_t v8; /* placeholder for void */
     void* v22;
-    void* v12;
-    int64_t v10; /* placeholder for void */
+    int64_t v39; /* placeholder for void */
+    bool v7;
+    int64_t v14; /* placeholder for void */
+    int64_t v6;
+    int64_t v5;
     void* v17;
-    bool v34;
-    int64_t v82; /* placeholder for void */
-    v2 = 0LL;
-    v3 = v1 == v2;
-    if (v3) goto bb1;
-    else goto bb2;
+    void* v4;
+    int64_t v20; /* placeholder for void */
+    int64_t v27;
+    void* v33;
+    void* v38;
+    int64_t v24; /* placeholder for void */
+    void* v45;
+    int64_t v48; /* placeholder for void */
+    void* v26;
+    int64_t v36; /* placeholder for void */
+    void* v18;
+    int64_t v46;
+    int64_t v10;
+    int64_t v34;
+    int64_t v12;
+    bool v29;
+    void* v44;
+    void* v13;
+    void* v9;
+    void* v21;
+    int64_t v25; /* placeholder for void */
+    int64_t v32;
+    void* v31;
+    int64_t v37;
+    int64_t v19;
+    int64_t v23;
+    void* v35;
+    void* v41;
+    int64_t v49; /* placeholder for void */
+    int64_t v50; /* placeholder for void */
+    int64_t v16; /* placeholder for void */
+    int64_t v30; /* placeholder for void */
+    void* v11;
+    int64_t v42;
+    int64_t v43; /* placeholder for void */
+    void* v40;
+    int64_t v28;
+    void* v15;
+    v4 = (char*)v2 + 0;
+    v5 = *(int64_t*)v4;
+    v6 = 0LL;
+    v7 = v5 == v6;
+    if (v7) goto bb2;
+    else goto bb3;
   bb1:
-    v5 = 0LL;
     p_call_stack_pop();
-    return v5;
+    return;
   bb2:
-    goto bb3;
-  bb3:
-    v8 = 0LL;
-    v9 = malloc(8);
-    *(int64_t*)v9 = (int64_t)v8;
-    v11 = 1LL;
-    v12 = malloc(8);
-    *(int64_t*)v12 = (int64_t)v11;
-    v14 = malloc(8);
-    *(int64_t*)v14 = (int64_t)v1;
-    v16 = *(int64_t*)v14;
-    v17 = malloc(8);
-    *(void**)v17 = (void*)v16;
-    v20 = *(void**)v17;
-    v21 = *(uint8_t*)v20;
-    v22 = malloc(8);
-    *(int64_t*)v22 = (int64_t)v21;
-    goto bb4;
-  bb4:
-    v25 = *(int64_t*)v22;
-    v26 = 32LL;
-    v27 = v25 == v26;
-    v28 = *(int64_t*)v22;
-    v29 = 9LL;
-    v30 = v28 == v29;
-    v31 = v27 || v30;
-    v32 = *(int64_t*)v22;
-    v33 = 10LL;
-    v34 = v32 == v33;
-    v35 = v31 || v34;
-    v36 = *(int64_t*)v22;
-    v37 = 13LL;
-    v38 = v36 == v37;
-    v39 = v35 || v38;
-    if (v39) goto bb5;
-    else goto bb6;
-  bb5:
-    v41 = *(int64_t*)v14;
-    v42 = 1LL;
-    v43 = v41 + v42;
-    *(int64_t*)v14 = (int64_t)v43;
-    v45 = *(int64_t*)v14;
-    *(void**)v17 = (void*)v45;
-    v47 = *(void**)v17;
-    v48 = *(uint8_t*)v47;
-    *(int64_t*)v22 = (int64_t)v48;
-    goto bb4;
-  bb6:
-    v51 = *(int64_t*)v22;
-    v52 = 45LL;
-    v53 = v51 == v52;
-    if (v53) goto bb7;
-    else goto bb8;
-  bb7:
-    v55 = 1LL;
-    v56 = -v55;
-    *(int64_t*)v12 = (int64_t)v56;
-    v58 = *(int64_t*)v14;
-    v59 = 1LL;
-    v60 = v58 + v59;
-    *(int64_t*)v14 = (int64_t)v60;
-    v62 = *(int64_t*)v14;
-    *(void**)v17 = (void*)v62;
-    v64 = *(void**)v17;
-    v65 = *(uint8_t*)v64;
-    *(int64_t*)v22 = (int64_t)v65;
-    goto bb9;
-  bb8:
-    v68 = *(int64_t*)v22;
-    v69 = 43LL;
-    v70 = v68 == v69;
-    if (v70) goto bb10;
-    else goto bb11;
-  bb9:
-    goto bb13;
-  bb10:
-    v72 = *(int64_t*)v14;
-    v73 = 1LL;
-    v74 = v72 + v73;
-    *(int64_t*)v14 = (int64_t)v74;
-    v76 = *(int64_t*)v14;
-    *(void**)v17 = (void*)v76;
-    v78 = *(void**)v17;
-    v79 = *(uint8_t*)v78;
-    *(int64_t*)v22 = (int64_t)v79;
-    goto bb12;
-  bb11:
-    goto bb12;
-  bb12:
-    goto bb9;
-  bb13:
-    v85 = *(int64_t*)v22;
-    v86 = 48LL;
-    v87 = v85 >= v86;
-    v88 = *(int64_t*)v22;
-    v89 = 57LL;
-    v90 = v88 <= v89;
-    v91 = v87 && v90;
-    if (v91) goto bb14;
-    else goto bb15;
-  bb14:
-    v93 = *(int64_t*)v9;
-    v94 = 10LL;
-    v95 = v93 * v94;
-    v96 = *(int64_t*)v22;
-    v97 = 48LL;
-    v98 = v96 - v97;
-    v99 = v95 + v98;
-    *(int64_t*)v9 = (int64_t)v99;
-    v101 = *(int64_t*)v14;
-    v102 = 1LL;
-    v103 = v101 + v102;
-    *(int64_t*)v14 = (int64_t)v103;
-    v105 = *(int64_t*)v14;
-    *(void**)v17 = (void*)v105;
-    v107 = *(void**)v17;
-    v108 = *(uint8_t*)v107;
-    *(int64_t*)v22 = (int64_t)v108;
-    goto bb13;
-  bb15:
-    v112 = *(int64_t*)v9;
-    v113 = *(int64_t*)v12;
-    v114 = v112 * v113;
+    v9 = (char*)v2 + 8;
+    v10 = *(int64_t*)v9;
+    v11 = malloc(16);
+    v12 = 0LL;
+    v13 = (char*)v11 + 0;
+    *(int64_t*)v13 = (int64_t)v12;
+    v15 = (char*)v11 + 8;
+    *(int64_t*)v15 = (int64_t)v10;
+    v17 = (char*)v11 + 0;
+    v18 = (char*)v0 + 0;
+    v19 = *(int64_t*)v17;
+    *(int64_t*)v18 = (int64_t)v19;
+    v21 = (char*)v11 + 8;
+    v22 = (char*)v0 + 8;
+    v23 = *(int64_t*)v21;
+    *(int64_t*)v22 = (int64_t)v23;
     p_call_stack_pop();
-    return v114;
+    return;
+  bb3:
+    v26 = (char*)v2 + 0;
+    v27 = *(int64_t*)v26;
+    v28 = 1LL;
+    v29 = v27 == v28;
+    if (v29) goto bb4;
+    else goto bb5;
+  bb4:
+    v31 = (char*)v2 + 8;
+    v32 = *(int64_t*)v31;
+    v33 = malloc(16);
+    v34 = 1LL;
+    v35 = (char*)v33 + 0;
+    *(int64_t*)v35 = (int64_t)v34;
+    {
+        if (!v3) abort();
+        char* _fn_name = *(char**)v3;
+        if (!_fn_name) abort();
+        if (strcmp(_fn_name, "String_to_string") == 0) {
+            v37 = String_to_string((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "abs") == 0) {
+            v37 = p_abs((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "p_str_length") == 0) {
+            v37 = p_str_length((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "String_char_count") == 0) {
+            v37 = String_char_count((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "HashMap_clone") == 0) {
+            v37 = HashMap_clone((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "String_to_lowercase") == 0) {
+            v37 = String_to_lowercase((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "str_len") == 0) {
+            v37 = str_len((void*)v3, (void*)v32);
+        } else if (strcmp(_fn_name, "Option_unwrap") == 0) {
+            v37 = Option_unwrap((void*)v3, (void*)v32);
+        } else if (strcmp(_fn_name, "String_bytes") == 0) {
+            v37 = String_bytes((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "p_str_hash") == 0) {
+            v37 = p_str_hash((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "ByteBuffer_len") == 0) {
+            v37 = ByteBuffer_len((void*)v3, (void*)v32);
+        } else if (strcmp(_fn_name, "char_to_upper") == 0) {
+            v37 = char_to_upper((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "Vec_pop") == 0) {
+            v37 = Vec_pop((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "Result_unwrap") == 0) {
+            v37 = Result_unwrap((void*)v3, (void*)v32);
+        } else if (strcmp(_fn_name, "Vec_last") == 0) {
+            v37 = Vec_last((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "StringBuilder_len") == 0) {
+            v37 = StringBuilder_len((void*)v3, (void*)v32);
+        } else if (strcmp(_fn_name, "char_to_lower") == 0) {
+            v37 = char_to_lower((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "Vec_first") == 0) {
+            v37 = Vec_first((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "HashMap_values") == 0) {
+            v37 = HashMap_values((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "Vec_clone") == 0) {
+            v37 = Vec_clone((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "allocator_bytes_used") == 0) {
+            v37 = allocator_bytes_used((void*)v3, (void*)v32);
+        } else if (strcmp(_fn_name, "String_parse_int") == 0) {
+            v37 = String_parse_int((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "String_len") == 0) {
+            v37 = String_len((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "String_to_uppercase") == 0) {
+            v37 = String_to_uppercase((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "Vec_capacity") == 0) {
+            v37 = Vec_capacity((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "HashMap_keys") == 0) {
+            v37 = HashMap_keys((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "str_parse_hex") == 0) {
+            v37 = str_parse_hex((void*)v3, (void*)v32);
+        } else if (strcmp(_fn_name, "HashMap_len") == 0) {
+            v37 = HashMap_len((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "str_parse_int") == 0) {
+            v37 = str_parse_int((void*)v3, (void*)v32);
+        } else if (strcmp(_fn_name, "String_clone") == 0) {
+            v37 = String_clone((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "String_trim") == 0) {
+            v37 = String_trim((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "String_from") == 0) {
+            v37 = String_from((void*)v3, (int64_t)v32);
+        } else if (strcmp(_fn_name, "Vec_len") == 0) {
+            v37 = Vec_len((void*)v3, (int64_t)v32);
+        } else { abort(); }
+    }
+    v38 = (char*)v33 + 8;
+    *(int64_t*)v38 = (int64_t)v37;
+    v40 = (char*)v33 + 0;
+    v41 = (char*)v0 + 0;
+    v42 = *(int64_t*)v40;
+    *(int64_t*)v41 = (int64_t)v42;
+    v44 = (char*)v33 + 8;
+    v45 = (char*)v0 + 8;
+    v46 = *(int64_t*)v44;
+    *(int64_t*)v45 = (int64_t)v46;
+    p_call_stack_pop();
+    return;
+  bb5:
+    goto bb1;
+    return;
+}
+
+int64_t Result_expect(void* v0, void* v1, void* v2) {
+    p_call_stack_push("Result_expect");
+    int64_t v10; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    int64_t v21;
+    int64_t v17;
+    int64_t v18; /* placeholder for void */
+    void* v3;
+    int64_t v19; /* placeholder for void */
+    void* v8;
+    int64_t v22; /* placeholder for void */
+    int64_t v7; /* placeholder for void */
+    int64_t v9;
+    void* v11;
+    void* v16;
+    int64_t v5;
+    int64_t v13;
+    bool v6;
+    bool v14;
+    int64_t v12;
+    int64_t v15; /* placeholder for void */
+    int64_t v4;
+    v3 = (char*)v1 + 0;
+    v4 = *(int64_t*)v3;
+    v5 = 0LL;
+    v6 = v4 == v5;
+    if (v6) goto bb2;
+    else goto bb3;
+  bb1:
+    v21 = 0LL;
+    p_call_stack_pop();
+    return v21;
+  bb2:
+    v8 = (char*)v1 + 8;
+    v9 = *(int64_t*)v8;
+    p_call_stack_pop();
+    return v9;
+  bb3:
+    v11 = (char*)v1 + 0;
+    v12 = *(int64_t*)v11;
+    v13 = 1LL;
+    v14 = v12 == v13;
+    if (v14) goto bb4;
+    else goto bb5;
+  bb4:
+    v16 = (char*)v1 + 8;
+    v17 = *(int64_t*)v16;
+    p_panic(v2);
+    goto bb1;
+  bb5:
+    goto bb1;
     return 0;
 }
 
-bool ByteBuffer_is_empty(void* v0, void* v1) {
-    p_call_stack_push("ByteBuffer_is_empty");
-    int64_t v3;
-    bool v5;
+bool StringBuilder_is_empty(void* v0, void* v1) {
+    p_call_stack_push("StringBuilder_is_empty");
     int64_t v6; /* placeholder for void */
     int64_t v4;
+    bool v5;
     void* v2;
+    int64_t v3;
     v2 = (char*)v1 + 8;
     v3 = *(int64_t*)v2;
     v4 = 0LL;
@@ -1168,411 +2810,504 @@ bool ByteBuffer_is_empty(void* v0, void* v1) {
     return 0;
 }
 
-int64_t String_push_str(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("String_push_str");
-    int64_t v44;
-    int64_t v31;
-    int64_t v38; /* placeholder for void */
-    int64_t v41;
-    int64_t v4;
-    int64_t v8;
-    int64_t v13;
-    void* v17;
-    int64_t v33;
-    int64_t v36;
-    int64_t v14;
-    int64_t v43; /* placeholder for void */
-    int64_t v39; /* placeholder for void */
-    int64_t v35; /* placeholder for void */
-    int64_t v23;
-    int64_t v21;
-    int64_t v27;
-    int64_t v26;
-    int64_t v20;
-    int64_t v10; /* placeholder for void */
-    void* v5;
-    int64_t v29;
-    int64_t v18; /* placeholder for void */
-    void* v34;
+void Vec_extend(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("Vec_extend");
     void* v37;
-    int64_t v19;
-    int64_t v24;
-    void* v40;
-    int64_t v6; /* placeholder for void */
-    int64_t v25;
-    int64_t v45; /* placeholder for void */
-    void* v16;
-    int64_t v12;
-    int64_t v22; /* placeholder for void */
-    void* v9;
-    int64_t v15;
-    int64_t v28; /* placeholder for void */
-    int64_t v30;
-    int64_t v11;
-    int64_t v3;
+    int64_t v41; /* placeholder for void */
     int64_t v32;
+    int64_t v44;
+    int64_t v16; /* placeholder for void */
+    int64_t v48;
+    int64_t v49; /* placeholder for void */
+    int64_t v50;
+    int64_t v52;
+    int64_t v19; /* placeholder for void */
+    int64_t v53; /* placeholder for void */
+    int64_t v36;
+    void* v9;
+    void* v15;
+    void* v43;
+    int64_t v51;
+    int64_t v54; /* placeholder for void */
+    int64_t v55; /* placeholder for void */
+    int64_t v45; /* placeholder for void */
+    int64_t v26;
+    void* v5;
+    void* v34;
+    void* v11;
+    int64_t v25;
+    int64_t v14; /* placeholder for void */
+    int64_t v46; /* placeholder for void */
+    int64_t v38; /* placeholder for void */
+    int64_t v28; /* placeholder for void */
+    int64_t v29;
+    int64_t v31;
+    int64_t v39;
+    int64_t v10; /* placeholder for void */
     int64_t v42; /* placeholder for void */
-    int64_t v7;
-    v3 = 0LL;
-    v4 = (int64_t)p_str_length((void*)v3, v1);
+    int64_t v24; /* placeholder for void */
+    void* v40;
+    bool v27;
+    int64_t v18;
+    int64_t v47;
+    int64_t v20; /* placeholder for void */
+    void* v7;
+    int64_t v13; /* placeholder for void */
+    int64_t v6; /* placeholder for void */
+    int64_t v12;
+    void* v17;
+    int64_t v23; /* placeholder for void */
+    int64_t v4;
+    int64_t v21;
+    int64_t v30;
+    int64_t v8; /* placeholder for void */
+    int64_t v3;
+    void* v22;
+    int64_t v33;
+    int64_t v35; /* placeholder for void */
+    v3 = 8LL;
+    v4 = v2 + v3;
     v5 = malloc(8);
-    *(int64_t*)v5 = (int64_t)v4;
-    v7 = 0LL;
-    v8 = (int64_t)p_str_length((void*)v7, v2);
+    *(void**)v5 = (void*)v4;
+    v7 = malloc(8);
+    *(void**)v7 = (void*)v2;
     v9 = malloc(8);
-    *(int64_t*)v9 = (int64_t)v8;
-    v11 = *(int64_t*)v5;
-    v12 = *(int64_t*)v9;
-    v13 = v11 + v12;
-    v14 = 1LL;
-    v15 = v13 + v14;
-    v16 = p_malloc(v15);
-    v17 = malloc(8);
-    *(int64_t*)v17 = (int64_t)v16;
-    v19 = *(int64_t*)v17;
-    v20 = *(int64_t*)v5;
+    v11 = *(void**)v5;
+    v12 = *(int64_t*)v11;
+    *(int64_t*)v9 = (int64_t)v12;
+    v15 = malloc(8);
+    v17 = *(void**)v7;
+    v18 = *(int64_t*)v17;
+    *(int64_t*)v15 = (int64_t)v18;
     v21 = 0LL;
-    p_str_copy_n((void*)v21, v19, v1, v20);
-    v23 = *(int64_t*)v17;
-    v24 = *(int64_t*)v5;
-    v25 = v23 + v24;
+    v22 = malloc(8);
+    *(int64_t*)v22 = (int64_t)v21;
+    goto bb1;
+  bb1:
+    v25 = *(int64_t*)v22;
     v26 = *(int64_t*)v9;
-    v27 = 0LL;
-    p_str_copy_n((void*)v27, v25, v2, v26);
-    v29 = *(int64_t*)v17;
-    v30 = *(int64_t*)v5;
-    v31 = v29 + v30;
-    v32 = *(int64_t*)v9;
-    v33 = v31 + v32;
+    v27 = v25 < v26;
+    if (v27) goto bb2;
+    else goto bb3;
+  bb2:
+    v29 = *(int64_t*)v15;
+    v30 = *(int64_t*)v22;
+    v31 = 8LL;
+    v32 = v30 * v31;
+    v33 = v29 + v32;
     v34 = malloc(8);
     *(int64_t*)v34 = (int64_t)v33;
     v36 = *(int64_t*)v34;
     v37 = malloc(8);
     *(void**)v37 = (void*)v36;
-    v40 = *(void**)v37;
-    v41 = 0LL;
-    *(uint8_t*)v40 = (uint8_t)v41;
-    v44 = *(int64_t*)v17;
+    v39 = 0LL;
+    v40 = malloc(8);
+    *(int64_t*)v40 = (int64_t)v39;
+    v43 = *(void**)v37;
+    v44 = *(int64_t*)v43;
+    *(int64_t*)v40 = (int64_t)v44;
+    v47 = *(int64_t*)v40;
+    v48 = 0LL;
+    Vec_push((void*)v48, v1, v47);
+    v50 = *(int64_t*)v22;
+    v51 = 1LL;
+    v52 = v50 + v51;
+    *(int64_t*)v22 = (int64_t)v52;
+    goto bb1;
+  bb3:
     p_call_stack_pop();
-    return v44;
+    return;
+    return;
+}
+
+void Result_and_then(void* v0, void* v1, void* v2, void* v3) {
+    p_call_stack_push("Result_and_then");
+    int64_t v47; /* placeholder for void */
+    int64_t v20;
+    void* v45;
+    int64_t v26; /* placeholder for void */
+    void* v40;
+    int64_t v24;
+    int64_t v25; /* placeholder for void */
+    int64_t v28;
+    int64_t v46;
+    void* v11;
+    int64_t v8; /* placeholder for void */
+    void* v44;
+    void* v38;
+    int64_t v6;
+    int64_t v10;
+    void* v16;
+    void* v27;
+    int64_t v12;
+    int64_t v14; /* placeholder for void */
+    int64_t v43; /* placeholder for void */
+    void* v32;
+    int64_t v29;
+    void* v41;
+    void* v18;
+    bool v7;
+    void* v4;
+    void* v13;
+    int64_t v33;
+    int64_t v48; /* placeholder for void */
+    int64_t v49; /* placeholder for void */
+    int64_t v5;
+    int64_t v37; /* placeholder for void */
+    int64_t v50; /* placeholder for void */
+    int64_t v17; /* placeholder for void */
+    void* v19;
+    int64_t v35;
+    void* v22;
+    void* v34;
+    void* v36;
+    int64_t v42;
+    void* v9;
+    int64_t v15;
+    bool v30;
+    void* v23;
+    int64_t v31; /* placeholder for void */
+    int64_t v21; /* placeholder for void */
+    int64_t v39; /* placeholder for void */
+    v4 = (char*)v2 + 0;
+    v5 = *(int64_t*)v4;
+    v6 = 0LL;
+    v7 = v5 == v6;
+    if (v7) goto bb2;
+    else goto bb3;
+  bb1:
+    p_call_stack_pop();
+    return;
+  bb2:
+    v9 = (char*)v2 + 8;
+    v10 = *(int64_t*)v9;
+    v11 = malloc(16);
+    v12 = 0LL;
+    v13 = (char*)v11 + 0;
+    *(int64_t*)v13 = (int64_t)v12;
+    {
+        if (!v3) abort();
+        char* _fn_name = *(char**)v3;
+        if (!_fn_name) abort();
+        if (strcmp(_fn_name, "String_to_string") == 0) {
+            v15 = String_to_string((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "abs") == 0) {
+            v15 = p_abs((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "p_str_length") == 0) {
+            v15 = p_str_length((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_char_count") == 0) {
+            v15 = String_char_count((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "HashMap_clone") == 0) {
+            v15 = HashMap_clone((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_to_lowercase") == 0) {
+            v15 = String_to_lowercase((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "str_len") == 0) {
+            v15 = str_len((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "Option_unwrap") == 0) {
+            v15 = Option_unwrap((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "String_bytes") == 0) {
+            v15 = String_bytes((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "p_str_hash") == 0) {
+            v15 = p_str_hash((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "ByteBuffer_len") == 0) {
+            v15 = ByteBuffer_len((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "char_to_upper") == 0) {
+            v15 = char_to_upper((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_pop") == 0) {
+            v15 = Vec_pop((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Result_unwrap") == 0) {
+            v15 = Result_unwrap((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "Vec_last") == 0) {
+            v15 = Vec_last((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "StringBuilder_len") == 0) {
+            v15 = StringBuilder_len((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "char_to_lower") == 0) {
+            v15 = char_to_lower((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_first") == 0) {
+            v15 = Vec_first((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "HashMap_values") == 0) {
+            v15 = HashMap_values((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_clone") == 0) {
+            v15 = Vec_clone((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "allocator_bytes_used") == 0) {
+            v15 = allocator_bytes_used((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "String_parse_int") == 0) {
+            v15 = String_parse_int((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_len") == 0) {
+            v15 = String_len((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_to_uppercase") == 0) {
+            v15 = String_to_uppercase((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_capacity") == 0) {
+            v15 = Vec_capacity((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "HashMap_keys") == 0) {
+            v15 = HashMap_keys((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "str_parse_hex") == 0) {
+            v15 = str_parse_hex((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "HashMap_len") == 0) {
+            v15 = HashMap_len((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "str_parse_int") == 0) {
+            v15 = str_parse_int((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "String_clone") == 0) {
+            v15 = String_clone((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_trim") == 0) {
+            v15 = String_trim((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_from") == 0) {
+            v15 = String_from((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_len") == 0) {
+            v15 = Vec_len((void*)v3, (int64_t)v10);
+        } else { abort(); }
+    }
+    v16 = (char*)v11 + 8;
+    *(int64_t*)v16 = (int64_t)v15;
+    v18 = (char*)v11 + 0;
+    v19 = (char*)v0 + 0;
+    v20 = *(int64_t*)v18;
+    *(int64_t*)v19 = (int64_t)v20;
+    v22 = (char*)v11 + 8;
+    v23 = (char*)v0 + 8;
+    v24 = *(int64_t*)v22;
+    *(int64_t*)v23 = (int64_t)v24;
+    p_call_stack_pop();
+    return;
+  bb3:
+    v27 = (char*)v2 + 0;
+    v28 = *(int64_t*)v27;
+    v29 = 1LL;
+    v30 = v28 == v29;
+    if (v30) goto bb4;
+    else goto bb5;
+  bb4:
+    v32 = (char*)v2 + 8;
+    v33 = *(int64_t*)v32;
+    v34 = malloc(16);
+    v35 = 1LL;
+    v36 = (char*)v34 + 0;
+    *(int64_t*)v36 = (int64_t)v35;
+    v38 = (char*)v34 + 8;
+    *(int64_t*)v38 = (int64_t)v33;
+    v40 = (char*)v34 + 0;
+    v41 = (char*)v0 + 0;
+    v42 = *(int64_t*)v40;
+    *(int64_t*)v41 = (int64_t)v42;
+    v44 = (char*)v34 + 8;
+    v45 = (char*)v0 + 8;
+    v46 = *(int64_t*)v44;
+    *(int64_t*)v45 = (int64_t)v46;
+    p_call_stack_pop();
+    return;
+  bb5:
+    goto bb1;
+    return;
+}
+
+void* str_bytes(void* v0, void* v1) {
+    p_call_stack_push("str_bytes");
+    void* v8;
+    int64_t v13; /* placeholder for void */
+    int64_t v15;
+    int64_t v32; /* placeholder for void */
+    int64_t v5; /* placeholder for void */
+    int64_t v22;
+    int64_t v36; /* placeholder for void */
+    int64_t v37;
+    void* v4;
+    int64_t v34;
+    int64_t v39;
+    int64_t v40; /* placeholder for void */
+    void* v3;
+    int64_t v18;
+    int64_t v25;
+    int64_t v27; /* placeholder for void */
+    void* v42;
+    int64_t v43; /* placeholder for void */
+    int64_t v2;
+    int64_t v7;
+    uint8_t v30;
+    int64_t v41; /* placeholder for void */
+    int64_t v24; /* placeholder for void */
+    int64_t v9; /* placeholder for void */
+    void* v29;
+    int64_t v12; /* placeholder for void */
+    int64_t v17; /* placeholder for void */
+    int64_t v19;
+    void* v20;
+    int64_t v21; /* placeholder for void */
+    int64_t v31; /* placeholder for void */
+    int64_t v6;
+    bool v16;
+    int64_t v28; /* placeholder for void */
+    int64_t v10;
+    void* v33;
+    int64_t v35;
+    void* v26;
+    int64_t v14;
+    void* v23;
+    int64_t v38;
+    void* v11;
+    v2 = 0LL;
+    v3 = (void*)Vec_new((void*)v2);
+    v4 = malloc(8);
+    *(void**)v4 = (void*)v3;
+    v6 = 0LL;
+    v7 = (int64_t)String_len((void*)v6, (int64_t)v1);
+    v8 = malloc(8);
+    *(int64_t*)v8 = (int64_t)v7;
+    v10 = 0LL;
+    v11 = malloc(8);
+    *(int64_t*)v11 = (int64_t)v10;
+    goto bb1;
+  bb1:
+    v14 = *(int64_t*)v11;
+    v15 = *(int64_t*)v8;
+    v16 = v14 < v15;
+    if (v16) goto bb2;
+    else goto bb3;
+  bb2:
+    v18 = *(int64_t*)v11;
+    v19 = (int64_t)v1 + v18;
+    v20 = malloc(8);
+    *(int64_t*)v20 = (int64_t)v19;
+    v22 = *(int64_t*)v20;
+    v23 = malloc(8);
+    *(void**)v23 = (void*)v22;
+    v25 = 0LL;
+    v26 = malloc(8);
+    *(int64_t*)v26 = (int64_t)v25;
+    v29 = *(void**)v23;
+    v30 = *(uint8_t*)v29;
+    *(int64_t*)v26 = (int64_t)v30;
+    v33 = *(void**)v4;
+    v34 = *(int64_t*)v26;
+    v35 = 0LL;
+    Vec_push((void*)v35, (int64_t)v33, v34);
+    v37 = *(int64_t*)v11;
+    v38 = 1LL;
+    v39 = v37 + v38;
+    *(int64_t*)v11 = (int64_t)v39;
+    goto bb1;
+  bb3:
+    v42 = *(void**)v4;
+    p_call_stack_pop();
+    return v42;
     return 0;
 }
 
-int64_t HashMap_values(void* v0, int64_t v1) {
-    p_call_stack_push("HashMap_values");
-    int64_t v108;
-    int64_t v72; /* placeholder for void */
-    int64_t v11; /* placeholder for void */
-    int64_t v82;
-    int64_t v81; /* placeholder for void */
-    int64_t v97;
-    int64_t v89;
-    int64_t v101;
-    bool v80;
-    int64_t v36;
-    void* v25;
-    int64_t v105; /* placeholder for void */
-    void* v87;
-    int64_t v85;
-    int64_t v65;
-    int64_t v17; /* placeholder for void */
-    int64_t v56;
-    int64_t v99; /* placeholder for void */
-    int64_t v106;
-    void* v90;
-    int64_t v67; /* placeholder for void */
-    void* v10;
-    int64_t v12;
-    void* v6;
-    int64_t v58;
-    int64_t v70;
-    void* v96;
-    int64_t v95; /* placeholder for void */
-    bool v79;
-    void* v60;
-    int64_t v98; /* placeholder for void */
-    int64_t v104; /* placeholder for void */
-    int64_t v30; /* placeholder for void */
-    int64_t v68; /* placeholder for void */
-    void* v22;
-    int64_t v64; /* placeholder for void */
-    int64_t v9;
-    int64_t v8;
-    void* v28;
-    int64_t v78;
-    int64_t v86;
-    int64_t v27; /* placeholder for void */
-    int64_t v62;
-    int64_t v52;
-    int64_t v14; /* placeholder for void */
-    void* v4;
-    bool v42;
-    int64_t v84;
-    void* v63;
-    int64_t v39;
-    void* v69;
-    int64_t v51;
-    int64_t v73;
-    bool v38;
-    int64_t v15;
-    int64_t v77;
-    int64_t v103; /* placeholder for void */
-    int64_t v91; /* placeholder for void */
-    void* v16;
-    int64_t v83;
-    int64_t v24; /* placeholder for void */
-    int64_t v112; /* placeholder for void */
-    int64_t v109; /* placeholder for void */
-    int64_t v74;
-    int64_t v49; /* placeholder for void */
-    int64_t v43; /* placeholder for void */
-    int64_t v61; /* placeholder for void */
-    int64_t v37;
-    int64_t v71; /* placeholder for void */
-    bool v75;
-    int64_t v20; /* placeholder for void */
-    int64_t v107;
-    int64_t v21; /* placeholder for void */
-    int64_t v100;
-    int64_t v31; /* placeholder for void */
-    int64_t v50; /* placeholder for void */
-    int64_t v57;
-    int64_t v102;
-    int64_t v33;
-    int64_t v26;
-    int64_t v55;
-    int64_t v3;
-    void* v19;
+bool str_equal(void* v0, void* v1, void* v2) {
+    p_call_stack_push("str_equal");
+    bool v4;
     int64_t v5; /* placeholder for void */
-    int64_t v23;
-    void* v48;
-    int64_t v35; /* placeholder for void */
-    int64_t v76;
-    int64_t v40;
-    void* v34;
-    int64_t v45; /* placeholder for void */
-    int64_t v110; /* placeholder for void */
-    int64_t v88; /* placeholder for void */
-    int64_t v92;
-    bool v41;
-    int64_t v18;
-    int64_t v44;
-    int64_t v2;
-    int64_t v46; /* placeholder for void */
-    int64_t v47;
-    int64_t v94; /* placeholder for void */
-    bool v53;
+    int64_t v3;
+    v3 = 0LL;
+    v4 = (bool)p_str_equal((void*)v3, (int64_t)v1, (int64_t)v2);
+    p_call_stack_pop();
+    return v4;
+    return 0;
+}
+
+void assert(void* v0, bool v1) {
+    p_call_stack_push("assert");
+    void* v4;
+    int64_t v5; /* placeholder for void */
     int64_t v7; /* placeholder for void */
-    int64_t v32;
-    int64_t v111;
-    void* v66;
-    void* v13;
-    int64_t v54; /* placeholder for void */
-    int64_t v59;
-    void* v93;
-    int64_t v29;
-    v2 = 24LL;
-    v3 = v1 + v2;
-    v4 = malloc(8);
-    *(void**)v4 = (void*)v3;
-    v6 = malloc(8);
-    *(void**)v6 = (void*)v1;
-    v8 = 8LL;
-    v9 = v1 + v8;
-    v10 = malloc(8);
-    *(void**)v10 = (void*)v9;
-    v12 = 0LL;
-    v13 = malloc(8);
-    *(int64_t*)v13 = (int64_t)v12;
-    v15 = 0LL;
-    v16 = malloc(8);
-    *(int64_t*)v16 = (int64_t)v15;
-    v18 = 0LL;
-    v19 = malloc(8);
-    *(int64_t*)v19 = (int64_t)v18;
-    v22 = *(void**)v4;
-    v23 = *(int64_t*)v22;
-    *(int64_t*)v13 = (int64_t)v23;
-    v25 = *(void**)v6;
-    v26 = *(int64_t*)v25;
-    *(int64_t*)v16 = (int64_t)v26;
-    v28 = *(void**)v10;
-    v29 = *(int64_t*)v28;
-    *(int64_t*)v19 = (int64_t)v29;
-    v32 = 0LL;
-    v33 = (int64_t)Vec_new((void*)v32);
-    v34 = malloc(8);
-    *(int64_t*)v34 = (int64_t)v33;
-    v36 = *(int64_t*)v16;
-    v37 = 0LL;
-    v38 = v36 == v37;
-    v39 = *(int64_t*)v13;
-    v40 = 0LL;
-    v41 = v39 == v40;
-    v42 = v38 || v41;
-    if (v42) goto bb1;
+    int64_t v2;
+    int64_t v3; /* placeholder for void */
+    int64_t v6; /* placeholder for void */
+    int64_t v8; /* placeholder for void */
+    v2 = !v1;
+    if (v2) goto bb1;
     else goto bb2;
   bb1:
-    v44 = *(int64_t*)v34;
-    p_call_stack_pop();
-    return v44;
+    v4 = _str2;
+    p_print_str(v4);
+    goto bb3;
   bb2:
     goto bb3;
   bb3:
-    v47 = 0LL;
-    v48 = malloc(8);
-    *(int64_t*)v48 = (int64_t)v47;
-    goto bb4;
-  bb4:
-    v51 = *(int64_t*)v48;
-    v52 = *(int64_t*)v13;
-    v53 = v51 < v52;
-    if (v53) goto bb5;
-    else goto bb6;
-  bb5:
-    v55 = *(int64_t*)v16;
-    v56 = *(int64_t*)v48;
-    v57 = 8LL;
-    v58 = v56 * v57;
-    v59 = v55 + v58;
-    v60 = malloc(8);
-    *(int64_t*)v60 = (int64_t)v59;
-    v62 = *(int64_t*)v60;
-    v63 = malloc(8);
-    *(void**)v63 = (void*)v62;
-    v65 = 0LL;
-    v66 = malloc(8);
-    *(int64_t*)v66 = (int64_t)v65;
-    v69 = *(void**)v63;
-    v70 = *(int64_t*)v69;
-    *(int64_t*)v66 = (int64_t)v70;
-    v73 = *(int64_t*)v66;
-    v74 = 0LL;
-    v75 = v73 != v74;
-    v76 = *(int64_t*)v66;
-    v77 = 1LL;
-    v78 = -v77;
-    v79 = v76 != v78;
-    v80 = v75 && v79;
-    if (v80) goto bb7;
-    else goto bb8;
-  bb6:
-    v111 = *(int64_t*)v34;
     p_call_stack_pop();
-    return v111;
-  bb7:
-    v82 = *(int64_t*)v19;
-    v83 = *(int64_t*)v48;
-    v84 = 8LL;
-    v85 = v83 * v84;
-    v86 = v82 + v85;
-    v87 = malloc(8);
-    *(int64_t*)v87 = (int64_t)v86;
-    v89 = *(int64_t*)v87;
-    v90 = malloc(8);
-    *(void**)v90 = (void*)v89;
-    v92 = 0LL;
-    v93 = malloc(8);
-    *(int64_t*)v93 = (int64_t)v92;
-    v96 = *(void**)v90;
-    v97 = *(int64_t*)v96;
-    *(int64_t*)v93 = (int64_t)v97;
-    v100 = *(int64_t*)v34;
-    v101 = *(int64_t*)v93;
-    v102 = 0LL;
-    Vec_push((void*)v102, v100, v101);
-    goto bb9;
-  bb8:
-    goto bb9;
-  bb9:
-    v106 = *(int64_t*)v48;
-    v107 = 1LL;
-    v108 = v106 + v107;
-    *(int64_t*)v48 = (int64_t)v108;
-    goto bb4;
-    return 0;
+    return;
+    return;
 }
 
-void* char_to_str(void* v0, int64_t v1) {
-    p_call_stack_push("char_to_str");
-    void* v2;
-    int64_t v3; /* placeholder for void */
-    v2 = p_char_to_str(v1);
+int64_t allocator_alloc(void* v0, void* v1, int64_t v2) {
+    p_call_stack_push("allocator_alloc");
+    int64_t v3;
+    int64_t v4; /* placeholder for void */
+    v3 = (int64_t)p_allocator_alloc(v1, v2);
     p_call_stack_pop();
-    return v2;
+    return v3;
     return 0;
 }
 
 int64_t String_repeat(void* v0, int64_t v1, int64_t v2) {
     p_call_stack_push("String_repeat");
-    int64_t v39;
-    int64_t v63; /* placeholder for void */
-    void* v36;
-    void* v32;
-    int64_t v9;
-    bool v7;
-    int64_t v18;
-    int64_t v64; /* placeholder for void */
-    int64_t v24;
-    int64_t v19; /* placeholder for void */
-    int64_t v42;
-    int64_t v51;
-    int64_t v61;
-    int64_t v30;
     int64_t v46;
-    int64_t v5;
-    int64_t v13;
-    int64_t v8; /* placeholder for void */
-    int64_t v20; /* placeholder for void */
-    int64_t v31;
-    int64_t v25;
-    int64_t v43;
-    int64_t v68; /* placeholder for void */
-    int64_t v49; /* placeholder for void */
-    int64_t v3;
-    int64_t v12; /* placeholder for void */
-    bool v6;
-    int64_t v35;
-    int64_t v41; /* placeholder for void */
-    int64_t v58;
-    int64_t v34; /* placeholder for void */
-    int64_t v52;
-    int64_t v69;
-    int64_t v29;
-    int64_t v54; /* placeholder for void */
-    int64_t v27; /* placeholder for void */
-    void* v17;
-    void* v10;
-    int64_t v55;
-    int64_t v56;
-    int64_t v60; /* placeholder for void */
-    int64_t v44;
-    void* v11;
-    int64_t v48;
-    int64_t v45;
     int64_t v21;
-    int64_t v53; /* placeholder for void */
-    int64_t v23; /* placeholder for void */
-    int64_t v22; /* placeholder for void */
-    bool v4;
-    int64_t v57;
-    int64_t v67; /* placeholder for void */
-    int64_t v50;
+    int64_t v64; /* placeholder for void */
+    int64_t v30;
+    int64_t v29;
+    void* v33;
+    int64_t v68; /* placeholder for void */
+    int64_t v69;
     int64_t v16; /* placeholder for void */
-    int64_t v37; /* placeholder for void */
+    int64_t v9;
+    int64_t v15; /* placeholder for void */
+    void* v17;
     void* v65;
     bool v40;
-    int64_t v70; /* placeholder for void */
-    void* v26;
-    void* v62;
-    int64_t v15; /* placeholder for void */
-    void* v59;
-    void* v33;
-    int64_t v38; /* placeholder for void */
-    int64_t v47;
-    int64_t v66;
-    int64_t v28;
+    int64_t v50;
+    int64_t v43;
+    int64_t v61;
+    int64_t v56;
+    int64_t v63; /* placeholder for void */
+    bool v7;
+    int64_t v52;
+    int64_t v54; /* placeholder for void */
+    int64_t v67; /* placeholder for void */
     void* v14;
+    int64_t v57;
+    int64_t v23; /* placeholder for void */
+    void* v32;
+    int64_t v51;
+    int64_t v3;
+    int64_t v35;
+    int64_t v18;
+    bool v4;
+    void* v11;
+    int64_t v28;
+    void* v10;
+    int64_t v12; /* placeholder for void */
+    int64_t v13;
+    int64_t v24;
+    int64_t v41; /* placeholder for void */
+    int64_t v37; /* placeholder for void */
+    int64_t v49; /* placeholder for void */
+    int64_t v70; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    int64_t v47;
+    int64_t v22; /* placeholder for void */
+    int64_t v39;
+    int64_t v42;
+    int64_t v48;
+    void* v59;
+    int64_t v60; /* placeholder for void */
+    int64_t v34; /* placeholder for void */
+    int64_t v45;
+    int64_t v66;
+    int64_t v5;
+    int64_t v31;
+    int64_t v58;
+    int64_t v53; /* placeholder for void */
+    int64_t v55;
+    int64_t v8; /* placeholder for void */
+    int64_t v44;
+    int64_t v27; /* placeholder for void */
+    void* v36;
+    int64_t v19; /* placeholder for void */
+    void* v62;
+    bool v6;
+    int64_t v25;
+    void* v26;
+    int64_t v38; /* placeholder for void */
     v3 = 0LL;
     v4 = v1 == v3;
     v5 = 0LL;
@@ -1650,794 +3385,37 @@ int64_t String_repeat(void* v0, int64_t v1, int64_t v2) {
     return 0;
 }
 
-int64_t HashMap_new(void* v0) {
-    p_call_stack_push("HashMap_new");
-    void* v16;
-    int64_t v18;
-    int64_t v4; /* placeholder for void */
-    void* v2;
-    int64_t v23; /* placeholder for void */
-    int64_t v15;
-    int64_t v10;
-    void* v24;
-    int64_t v35; /* placeholder for void */
-    int64_t v25;
-    int64_t v38; /* placeholder for void */
-    int64_t v17; /* placeholder for void */
-    int64_t v32; /* placeholder for void */
-    void* v33;
-    int64_t v7; /* placeholder for void */
-    int64_t v12; /* placeholder for void */
-    int64_t v9;
+int64_t Result_unwrap_or(void* v0, void* v1, int64_t v2) {
+    p_call_stack_push("Result_unwrap_or");
+    int64_t v4;
     int64_t v5;
-    int64_t v14;
-    int64_t v19;
     void* v3;
+    bool v6;
+    void* v8;
     void* v11;
-    int64_t v29; /* placeholder for void */
-    int64_t v13;
-    int64_t v20;
-    int64_t v22; /* placeholder for void */
-    int64_t v28;
-    void* v21;
-    void* v30;
-    int64_t v34;
-    int64_t v31;
-    void* v6;
-    int64_t v36; /* placeholder for void */
-    int64_t v8;
-    int64_t v26; /* placeholder for void */
-    int64_t v1;
-    int64_t v37;
-    void* v27;
-    v1 = 32LL;
-    v2 = p_malloc(v1);
-    v3 = malloc(8);
-    *(int64_t*)v3 = (int64_t)v2;
-    v5 = *(int64_t*)v3;
-    v6 = malloc(8);
-    *(void**)v6 = (void*)v5;
-    v8 = *(int64_t*)v3;
-    v9 = 8LL;
-    v10 = v8 + v9;
-    v11 = malloc(8);
-    *(void**)v11 = (void*)v10;
-    v13 = *(int64_t*)v3;
-    v14 = 16LL;
-    v15 = v13 + v14;
-    v16 = malloc(8);
-    *(void**)v16 = (void*)v15;
-    v18 = *(int64_t*)v3;
-    v19 = 24LL;
-    v20 = v18 + v19;
-    v21 = malloc(8);
-    *(void**)v21 = (void*)v20;
-    v24 = *(void**)v6;
-    v25 = 0LL;
-    *(int64_t*)v24 = (int64_t)v25;
-    v27 = *(void**)v11;
-    v28 = 0LL;
-    *(int64_t*)v27 = (int64_t)v28;
-    v30 = *(void**)v16;
-    v31 = 0LL;
-    *(int64_t*)v30 = (int64_t)v31;
-    v33 = *(void**)v21;
-    v34 = 0LL;
-    *(int64_t*)v33 = (int64_t)v34;
-    v37 = *(int64_t*)v3;
-    p_call_stack_pop();
-    return v37;
-    return 0;
-}
-
-int64_t String_trim(void* v0, int64_t v1) {
-    p_call_stack_push("String_trim");
-    int64_t v163; /* placeholder for void */
-    int64_t v41;
-    int64_t v100; /* placeholder for void */
-    void* v101;
-    uint8_t v102;
-    void* v186;
-    int64_t v113;
-    int64_t v127;
-    bool v74;
-    uint8_t v68;
-    int64_t v148; /* placeholder for void */
-    void* v7;
-    void* v38;
-    int64_t v124;
-    int64_t v86; /* placeholder for void */
-    int64_t v89; /* placeholder for void */
-    int64_t v114;
-    int64_t v167; /* placeholder for void */
-    int64_t v174;
-    int64_t v53;
-    int64_t v23; /* placeholder for void */
-    int64_t v17;
-    int64_t v12; /* placeholder for void */
-    int64_t v64; /* placeholder for void */
-    void* v77;
-    int64_t v87; /* placeholder for void */
-    int64_t v27;
-    int64_t v107;
-    void* v95;
-    int64_t v14;
-    int64_t v118;
-    bool v51;
-    bool v54;
-    int64_t v8; /* placeholder for void */
-    int64_t v16; /* placeholder for void */
-    void* v36;
-    int64_t v79; /* placeholder for void */
-    int64_t v105; /* placeholder for void */
-    int64_t v99; /* placeholder for void */
-    bool v111;
-    void* v33;
-    int64_t v45;
-    int64_t v121; /* placeholder for void */
-    int64_t v44;
-    int64_t v57;
-    int64_t v122;
-    int64_t v29; /* placeholder for void */
-    int64_t v136; /* placeholder for void */
-    int64_t v26; /* placeholder for void */
-    void* v67;
-    void* v22;
-    int64_t v31; /* placeholder for void */
-    int64_t v141; /* placeholder for void */
-    bool v151;
-    int64_t v165;
-    int64_t v32;
-    int64_t v181;
-    int64_t v66; /* placeholder for void */
-    int64_t v131; /* placeholder for void */
-    void* v183;
-    bool v115;
-    int64_t v188; /* placeholder for void */
-    int64_t v63;
-    int64_t v72;
-    int64_t v39; /* placeholder for void */
-    int64_t v156; /* placeholder for void */
-    int64_t v40; /* placeholder for void */
-    int64_t v146;
-    void* v84;
-    int64_t v145;
-    int64_t v191; /* placeholder for void */
-    int64_t v187; /* placeholder for void */
-    int64_t v132;
-    void* v154;
-    int64_t v11; /* placeholder for void */
-    int64_t v130; /* placeholder for void */
-    int64_t v180;
-    int64_t v49;
-    int64_t v104; /* placeholder for void */
-    int64_t v137;
-    int64_t v178;
-    int64_t v20;
-    bool v47;
-    int64_t v142; /* placeholder for void */
-    int64_t v194; /* placeholder for void */
-    bool v108;
-    int64_t v97;
-    void* v155;
-    int64_t v170;
-    int64_t v134;
-    int64_t v59;
-    void* v78;
-    int64_t v184; /* placeholder for void */
-    int64_t v153;
-    int64_t v80;
-    bool v116;
-    int64_t v177;
-    bool v3;
-    int64_t v65;
-    int64_t v138; /* placeholder for void */
-    int64_t v21;
-    void* v103;
-    void* v30;
-    int64_t v179; /* placeholder for void */
-    void* v172;
-    void* v10;
-    int64_t v62;
-    int64_t v175;
-    int64_t v35; /* placeholder for void */
-    int64_t v93;
-    int64_t v82; /* placeholder for void */
-    int64_t v42;
-    int64_t v164; /* placeholder for void */
-    int64_t v109;
-    int64_t v143; /* placeholder for void */
-    int64_t v129; /* placeholder for void */
-    int64_t v192; /* placeholder for void */
-    int64_t v58;
-    int64_t v176;
-    int64_t v19; /* placeholder for void */
-    void* v171;
-    int64_t v125; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    void* v189;
-    int64_t v69; /* placeholder for void */
-    int64_t v71; /* placeholder for void */
-    int64_t v34; /* placeholder for void */
-    int64_t v70; /* placeholder for void */
-    void* v161;
-    int64_t v152; /* placeholder for void */
-    int64_t v83; /* placeholder for void */
-    int64_t v159; /* placeholder for void */
-    int64_t v193;
-    bool v50;
-    int64_t v135;
-    int64_t v56; /* placeholder for void */
-    int64_t v150;
-    void* v28;
-    int64_t v123;
-    int64_t v48;
-    int64_t v149;
-    bool v55;
-    int64_t v166; /* placeholder for void */
-    int64_t v168;
-    void* v13;
-    int64_t v88;
-    int64_t v75; /* placeholder for void */
-    bool v128;
-    int64_t v169;
-    int64_t v182;
-    int64_t v52;
-    int64_t v76;
-    bool v120;
-    int64_t v133;
-    int64_t v144;
-    int64_t v110;
-    int64_t v185;
-    int64_t v160; /* placeholder for void */
-    bool v119;
-    int64_t v73;
-    void* v81;
-    void* v139;
-    int64_t v162;
-    int64_t v157;
-    int64_t v96; /* placeholder for void */
-    void* v25;
-    int64_t v173; /* placeholder for void */
-    int64_t v190;
-    bool v43;
-    void* v6;
-    int64_t v15; /* placeholder for void */
-    uint8_t v140;
-    void* v98;
-    int64_t v4; /* placeholder for void */
-    int64_t v61;
-    int64_t v2;
-    int64_t v90; /* placeholder for void */
-    bool v46;
-    int64_t v94;
-    int64_t v91;
-    int64_t v106;
-    int64_t v126;
-    int64_t v60; /* placeholder for void */
-    int64_t v92;
-    int64_t v85;
-    int64_t v117;
-    int64_t v5;
+    void* v16;
     int64_t v9;
-    uint8_t v37;
-    int64_t v24;
-    bool v112;
-    void* v147;
-    void* v158;
-    v2 = 0LL;
-    v3 = v1 == v2;
-    if (v3) goto bb1;
-    else goto bb2;
+    int64_t v15; /* placeholder for void */
+    int64_t v18; /* placeholder for void */
+    int64_t v20;
+    int64_t v7; /* placeholder for void */
+    int64_t v21; /* placeholder for void */
+    int64_t v17;
+    int64_t v19; /* placeholder for void */
+    int64_t v10; /* placeholder for void */
+    bool v14;
+    int64_t v13;
+    int64_t v12;
+    v3 = (char*)v1 + 0;
+    v4 = *(int64_t*)v3;
+    v5 = 0LL;
+    v6 = v4 == v5;
+    if (v6) goto bb2;
+    else goto bb3;
   bb1:
-    v5 = 1LL;
-    v6 = p_malloc(v5);
-    v7 = malloc(8);
-    *(int64_t*)v7 = (int64_t)v6;
-    v9 = *(int64_t*)v7;
-    v10 = malloc(8);
-    *(void**)v10 = (void*)v9;
-    v13 = *(void**)v10;
-    v14 = 0LL;
-    *(uint8_t*)v13 = (uint8_t)v14;
-    v17 = *(int64_t*)v7;
-    p_call_stack_pop();
-    return v17;
-  bb2:
-    goto bb3;
-  bb3:
     v20 = 0LL;
-    v21 = (int64_t)p_str_length((void*)v20, v1);
-    v22 = malloc(8);
-    *(int64_t*)v22 = (int64_t)v21;
-    v24 = 0LL;
-    v25 = malloc(8);
-    *(int64_t*)v25 = (int64_t)v24;
-    v27 = *(int64_t*)v22;
-    v28 = malloc(8);
-    *(int64_t*)v28 = (int64_t)v27;
-    v30 = malloc(8);
-    *(int64_t*)v30 = (int64_t)v1;
-    v32 = *(int64_t*)v30;
-    v33 = malloc(8);
-    *(void**)v33 = (void*)v32;
-    v36 = *(void**)v33;
-    v37 = *(uint8_t*)v36;
-    v38 = malloc(8);
-    *(int64_t*)v38 = (int64_t)v37;
-    goto bb4;
-  bb4:
-    v41 = *(int64_t*)v38;
-    v42 = 32LL;
-    v43 = v41 == v42;
-    v44 = *(int64_t*)v38;
-    v45 = 9LL;
-    v46 = v44 == v45;
-    v47 = v43 || v46;
-    v48 = *(int64_t*)v38;
-    v49 = 10LL;
-    v50 = v48 == v49;
-    v51 = v47 || v50;
-    v52 = *(int64_t*)v38;
-    v53 = 13LL;
-    v54 = v52 == v53;
-    v55 = v51 || v54;
-    if (v55) goto bb5;
-    else goto bb6;
-  bb5:
-    v57 = *(int64_t*)v25;
-    v58 = 1LL;
-    v59 = v57 + v58;
-    *(int64_t*)v25 = (int64_t)v59;
-    v61 = *(int64_t*)v30;
-    v62 = 1LL;
-    v63 = v61 + v62;
-    *(int64_t*)v30 = (int64_t)v63;
-    v65 = *(int64_t*)v30;
-    *(void**)v33 = (void*)v65;
-    v67 = *(void**)v33;
-    v68 = *(uint8_t*)v67;
-    *(int64_t*)v38 = (int64_t)v68;
-    goto bb4;
-  bb6:
-    v72 = *(int64_t*)v25;
-    v73 = *(int64_t*)v28;
-    v74 = v72 >= v73;
-    if (v74) goto bb7;
-    else goto bb8;
-  bb7:
-    v76 = 1LL;
-    v77 = p_malloc(v76);
-    v78 = malloc(8);
-    *(int64_t*)v78 = (int64_t)v77;
-    v80 = *(int64_t*)v78;
-    v81 = malloc(8);
-    *(void**)v81 = (void*)v80;
-    v84 = *(void**)v81;
-    v85 = 0LL;
-    *(uint8_t*)v84 = (uint8_t)v85;
-    v88 = *(int64_t*)v78;
     p_call_stack_pop();
-    return v88;
-  bb8:
-    goto bb9;
-  bb9:
-    v91 = *(int64_t*)v28;
-    v92 = v1 + v91;
-    v93 = 1LL;
-    v94 = v92 - v93;
-    v95 = malloc(8);
-    *(int64_t*)v95 = (int64_t)v94;
-    v97 = *(int64_t*)v95;
-    v98 = malloc(8);
-    *(void**)v98 = (void*)v97;
-    v101 = *(void**)v98;
-    v102 = *(uint8_t*)v101;
-    v103 = malloc(8);
-    *(int64_t*)v103 = (int64_t)v102;
-    goto bb10;
-  bb10:
-    v106 = *(int64_t*)v103;
-    v107 = 32LL;
-    v108 = v106 == v107;
-    v109 = *(int64_t*)v103;
-    v110 = 9LL;
-    v111 = v109 == v110;
-    v112 = v108 || v111;
-    v113 = *(int64_t*)v103;
-    v114 = 10LL;
-    v115 = v113 == v114;
-    v116 = v112 || v115;
-    v117 = *(int64_t*)v103;
-    v118 = 13LL;
-    v119 = v117 == v118;
-    v120 = v116 || v119;
-    if (v120) goto bb11;
-    else goto bb12;
-  bb11:
-    v122 = *(int64_t*)v28;
-    v123 = 1LL;
-    v124 = v122 - v123;
-    *(int64_t*)v28 = (int64_t)v124;
-    v126 = *(int64_t*)v28;
-    v127 = *(int64_t*)v25;
-    v128 = v126 <= v127;
-    if (v128) goto bb13;
-    else goto bb14;
-  bb12:
-    v144 = *(int64_t*)v28;
-    v145 = *(int64_t*)v25;
-    v146 = v144 - v145;
-    v147 = malloc(8);
-    *(int64_t*)v147 = (int64_t)v146;
-    v149 = *(int64_t*)v147;
-    v150 = 0LL;
-    v151 = v149 <= v150;
-    if (v151) goto bb16;
-    else goto bb17;
-  bb13:
-    goto bb12;
-  bb14:
-    goto bb15;
-  bb15:
-    v132 = *(int64_t*)v28;
-    v133 = v1 + v132;
-    v134 = 1LL;
-    v135 = v133 - v134;
-    *(int64_t*)v95 = (int64_t)v135;
-    v137 = *(int64_t*)v95;
-    *(void**)v98 = (void*)v137;
-    v139 = *(void**)v98;
-    v140 = *(uint8_t*)v139;
-    *(int64_t*)v103 = (int64_t)v140;
-    goto bb10;
-  bb16:
-    v153 = 1LL;
-    v154 = p_malloc(v153);
-    v155 = malloc(8);
-    *(int64_t*)v155 = (int64_t)v154;
-    v157 = *(int64_t*)v155;
-    v158 = malloc(8);
-    *(void**)v158 = (void*)v157;
-    v161 = *(void**)v158;
-    v162 = 0LL;
-    *(uint8_t*)v161 = (uint8_t)v162;
-    v165 = *(int64_t*)v155;
-    p_call_stack_pop();
-    return v165;
-  bb17:
-    goto bb18;
-  bb18:
-    v168 = *(int64_t*)v147;
-    v169 = 1LL;
-    v170 = v168 + v169;
-    v171 = p_malloc(v170);
-    v172 = malloc(8);
-    *(int64_t*)v172 = (int64_t)v171;
-    v174 = *(int64_t*)v172;
-    v175 = *(int64_t*)v25;
-    v176 = v1 + v175;
-    v177 = *(int64_t*)v147;
-    v178 = 0LL;
-    p_str_copy_n((void*)v178, v174, v176, v177);
-    v180 = *(int64_t*)v172;
-    v181 = *(int64_t*)v147;
-    v182 = v180 + v181;
-    v183 = malloc(8);
-    *(int64_t*)v183 = (int64_t)v182;
-    v185 = *(int64_t*)v183;
-    v186 = malloc(8);
-    *(void**)v186 = (void*)v185;
-    v189 = *(void**)v186;
-    v190 = 0LL;
-    *(uint8_t*)v189 = (uint8_t)v190;
-    v193 = *(int64_t*)v172;
-    p_call_stack_pop();
-    return v193;
-    return 0;
-}
-
-bool str_starts_with(void* v0, void* v1, void* v2) {
-    p_call_stack_push("str_starts_with");
-    int64_t v3;
-    bool v4;
-    int64_t v5; /* placeholder for void */
-    v3 = 0LL;
-    v4 = (bool)String_starts_with((void*)v3, (int64_t)v1, (int64_t)v2);
-    p_call_stack_pop();
-    return v4;
-    return 0;
-}
-
-int64_t Vec_first(void* v0, int64_t v1) {
-    p_call_stack_push("Vec_first");
-    int64_t v2;
-    int64_t v34; /* placeholder for void */
-    int64_t v9; /* placeholder for void */
-    int64_t v11;
-    void* v18;
-    int64_t v31;
-    void* v10;
-    int64_t v17; /* placeholder for void */
-    void* v35;
-    int64_t v7; /* placeholder for void */
-    int64_t v12; /* placeholder for void */
-    void* v29;
-    int64_t v39;
-    int64_t v14;
-    int64_t v21; /* placeholder for void */
-    void* v22;
-    int64_t v25;
-    int64_t v26; /* placeholder for void */
-    int64_t v37; /* placeholder for void */
-    bool v16;
-    void* v24;
-    void* v32;
-    int64_t v20; /* placeholder for void */
-    void* v8;
-    int64_t v28;
-    int64_t v15;
-    void* v6;
-    int64_t v30; /* placeholder for void */
-    int64_t v13; /* placeholder for void */
-    int64_t v3;
-    int64_t v33; /* placeholder for void */
-    int64_t v36;
-    int64_t v27; /* placeholder for void */
-    int64_t v23; /* placeholder for void */
-    void* v4;
-    int64_t v40; /* placeholder for void */
-    int64_t v5; /* placeholder for void */
-    int64_t v38; /* placeholder for void */
-    int64_t v19; /* placeholder for void */
-    v2 = 8LL;
-    v3 = v1 + v2;
-    v4 = malloc(8);
-    *(void**)v4 = (void*)v3;
-    v6 = malloc(8);
-    *(void**)v6 = (void*)v1;
-    v8 = malloc(8);
-    v10 = *(void**)v4;
-    v11 = *(int64_t*)v10;
-    *(int64_t*)v8 = (int64_t)v11;
-    v14 = *(int64_t*)v8;
-    v15 = 0LL;
-    v16 = v14 == v15;
-    if (v16) goto bb1;
-    else goto bb2;
-  bb1:
-    v18 = _str0;
-    p_panic(v18);
-    goto bb3;
-  bb2:
-    goto bb3;
-  bb3:
-    v22 = malloc(8);
-    v24 = *(void**)v6;
-    v25 = *(int64_t*)v24;
-    *(int64_t*)v22 = (int64_t)v25;
-    v28 = *(int64_t*)v22;
-    v29 = malloc(8);
-    *(void**)v29 = (void*)v28;
-    v31 = 0LL;
-    v32 = malloc(8);
-    *(int64_t*)v32 = (int64_t)v31;
-    v35 = *(void**)v29;
-    v36 = *(int64_t*)v35;
-    *(int64_t*)v32 = (int64_t)v36;
-    v39 = *(int64_t*)v32;
-    p_call_stack_pop();
-    return v39;
-    return 0;
-}
-
-void* str_replace(void* v0, void* v1, void* v2, void* v3) {
-    p_call_stack_push("str_replace");
-    int64_t v4;
-    int64_t v5;
-    int64_t v6; /* placeholder for void */
-    v4 = 0LL;
-    v5 = (int64_t)String_replace((void*)v4, (int64_t)v1, (int64_t)v2, (int64_t)v3);
-    p_call_stack_pop();
-    return (void*)v5;
-    return 0;
-}
-
-int64_t Option_unwrap_or_else(void* v0, void* v1, void* v2) {
-    p_call_stack_push("Option_unwrap_or_else");
-    int64_t v15; /* placeholder for void */
-    int64_t v10; /* placeholder for void */
-    int64_t v7; /* placeholder for void */
-    int64_t v20; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    void* v8;
-    int64_t v9;
-    int64_t v4;
-    void* v11;
-    bool v14;
-    int64_t v19;
-    bool v6;
-    void* v3;
-    int64_t v13;
-    int64_t v5;
-    int64_t v12;
-    int64_t v16;
-    int64_t v17; /* placeholder for void */
-    v3 = (char*)v1 + 0;
-    v4 = *(int64_t*)v3;
-    v5 = 0LL;
-    v6 = v4 == v5;
-    if (v6) goto bb2;
-    else goto bb3;
-  bb1:
-    v19 = 0LL;
-    p_call_stack_pop();
-    return v19;
-  bb2:
-    v8 = (char*)v1 + 8;
-    v9 = *(int64_t*)v8;
-    p_call_stack_pop();
-    return v9;
-  bb3:
-    v11 = (char*)v1 + 0;
-    v12 = *(int64_t*)v11;
-    v13 = 1LL;
-    v14 = v12 == v13;
-    if (v14) goto bb4;
-    else goto bb5;
-  bb4:
-    {
-        if (!v2) abort();
-        char* _fn_name = *(char**)v2;
-        if (!_fn_name) abort();
-        if (strcmp(_fn_name, "Vec_new") == 0) {
-            v16 = Vec_new((void*)v2);
-        } else if (strcmp(_fn_name, "HashMap_new") == 0) {
-            v16 = HashMap_new((void*)v2);
-        } else { abort(); }
-    }
-    p_call_stack_pop();
-    return v16;
-  bb5:
-    goto bb1;
-    return 0;
-}
-
-void Result_err(void* v0, void* v1, void* v2) {
-    p_call_stack_push("Result_err");
-    void* v28;
-    void* v8;
-    int64_t v25;
-    int64_t v22; /* placeholder for void */
-    void* v18;
-    void* v23;
-    int64_t v13; /* placeholder for void */
-    void* v15;
-    int64_t v4;
-    int64_t v38;
-    int64_t v16;
-    int64_t v39; /* placeholder for void */
-    void* v41;
-    int64_t v5;
-    void* v36;
-    int64_t v45; /* placeholder for void */
-    bool v26;
-    void* v12;
-    int64_t v33; /* placeholder for void */
-    void* v37;
-    int64_t v27; /* placeholder for void */
-    bool v6;
-    int64_t v7; /* placeholder for void */
-    void* v30;
-    void* v40;
-    int64_t v42;
-    void* v14;
-    int64_t v43; /* placeholder for void */
-    void* v10;
-    int64_t v29;
-    void* v34;
-    int64_t v11;
-    void* v19;
-    int64_t v20;
-    int64_t v21; /* placeholder for void */
-    int64_t v35; /* placeholder for void */
-    int64_t v44; /* placeholder for void */
-    int64_t v46; /* placeholder for void */
-    int64_t v9;
-    int64_t v17; /* placeholder for void */
-    void* v3;
-    void* v32;
-    int64_t v31;
-    int64_t v24;
-    v3 = (char*)v2 + 0;
-    v4 = *(int64_t*)v3;
-    v5 = 0LL;
-    v6 = v4 == v5;
-    if (v6) goto bb2;
-    else goto bb3;
-  bb1:
-    p_call_stack_pop();
-    return;
-  bb2:
-    v8 = (char*)v2 + 8;
-    v9 = *(int64_t*)v8;
-    v10 = malloc(16);
-    v11 = 1LL;
-    v12 = (char*)v10 + 0;
-    *(int64_t*)v12 = (int64_t)v11;
-    v14 = (char*)v10 + 0;
-    v15 = (char*)v0 + 0;
-    v16 = *(int64_t*)v14;
-    *(int64_t*)v15 = (int64_t)v16;
-    v18 = (char*)v10 + 8;
-    v19 = (char*)v0 + 8;
-    v20 = *(int64_t*)v18;
-    *(int64_t*)v19 = (int64_t)v20;
-    p_call_stack_pop();
-    return;
-  bb3:
-    v23 = (char*)v2 + 0;
-    v24 = *(int64_t*)v23;
-    v25 = 1LL;
-    v26 = v24 == v25;
-    if (v26) goto bb4;
-    else goto bb5;
-  bb4:
-    v28 = (char*)v2 + 8;
-    v29 = *(int64_t*)v28;
-    v30 = malloc(16);
-    v31 = 0LL;
-    v32 = (char*)v30 + 0;
-    *(int64_t*)v32 = (int64_t)v31;
-    v34 = (char*)v30 + 8;
-    *(int64_t*)v34 = (int64_t)v29;
-    v36 = (char*)v30 + 0;
-    v37 = (char*)v0 + 0;
-    v38 = *(int64_t*)v36;
-    *(int64_t*)v37 = (int64_t)v38;
-    v40 = (char*)v30 + 8;
-    v41 = (char*)v0 + 8;
-    v42 = *(int64_t*)v40;
-    *(int64_t*)v41 = (int64_t)v42;
-    p_call_stack_pop();
-    return;
-  bb5:
-    goto bb1;
-    return;
-}
-
-int64_t Result_expect(void* v0, void* v1, void* v2) {
-    p_call_stack_push("Result_expect");
-    int64_t v4;
-    int64_t v5;
-    int64_t v18; /* placeholder for void */
-    int64_t v20; /* placeholder for void */
-    int64_t v13;
-    int64_t v9;
-    int64_t v10; /* placeholder for void */
-    int64_t v15; /* placeholder for void */
-    int64_t v17;
-    bool v6;
-    void* v16;
-    bool v14;
-    int64_t v21;
-    void* v8;
-    int64_t v22; /* placeholder for void */
-    void* v11;
-    int64_t v12;
-    int64_t v19; /* placeholder for void */
-    void* v3;
-    int64_t v7; /* placeholder for void */
-    v3 = (char*)v1 + 0;
-    v4 = *(int64_t*)v3;
-    v5 = 0LL;
-    v6 = v4 == v5;
-    if (v6) goto bb2;
-    else goto bb3;
-  bb1:
-    v21 = 0LL;
-    p_call_stack_pop();
-    return v21;
+    return v20;
   bb2:
     v8 = (char*)v1 + 8;
     v9 = *(int64_t*)v8;
@@ -2453,704 +3431,201 @@ int64_t Result_expect(void* v0, void* v1, void* v2) {
   bb4:
     v16 = (char*)v1 + 8;
     v17 = *(int64_t*)v16;
-    p_panic(v2);
-    goto bb1;
+    p_call_stack_pop();
+    return v2;
   bb5:
     goto bb1;
-    return 0;
-}
-
-void Option_map(void* v0, void* v1, void* v2, void* v3) {
-    p_call_stack_push("Option_map");
-    int64_t v38;
-    void* v34;
-    void* v36;
-    int64_t v8; /* placeholder for void */
-    void* v11;
-    void* v9;
-    int64_t v12;
-    int64_t v5;
-    int64_t v14; /* placeholder for void */
-    void* v16;
-    int64_t v25; /* placeholder for void */
-    void* v19;
-    void* v22;
-    int64_t v24;
-    bool v30;
-    void* v32;
-    int64_t v43; /* placeholder for void */
-    int64_t v26; /* placeholder for void */
-    void* v41;
-    int64_t v6;
-    int64_t v42;
-    void* v37;
-    int64_t v46; /* placeholder for void */
-    void* v13;
-    int64_t v33;
-    void* v4;
-    bool v7;
-    int64_t v15;
-    int64_t v17; /* placeholder for void */
-    int64_t v21; /* placeholder for void */
-    void* v23;
-    void* v27;
-    void* v18;
-    int64_t v10;
-    int64_t v31; /* placeholder for void */
-    int64_t v39; /* placeholder for void */
-    int64_t v35; /* placeholder for void */
-    void* v40;
-    int64_t v29;
-    int64_t v44; /* placeholder for void */
-    int64_t v45; /* placeholder for void */
-    int64_t v28;
-    int64_t v20;
-    v4 = (char*)v2 + 0;
-    v5 = *(int64_t*)v4;
-    v6 = 0LL;
-    v7 = v5 == v6;
-    if (v7) goto bb2;
-    else goto bb3;
-  bb1:
-    p_call_stack_pop();
-    return;
-  bb2:
-    v9 = (char*)v2 + 8;
-    v10 = *(int64_t*)v9;
-    v11 = malloc(16);
-    v12 = 0LL;
-    v13 = (char*)v11 + 0;
-    *(int64_t*)v13 = (int64_t)v12;
-    {
-        if (!v3) abort();
-        char* _fn_name = *(char**)v3;
-        if (!_fn_name) abort();
-        if (strcmp(_fn_name, "str_parse_hex") == 0) {
-            v15 = str_parse_hex((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_char_count") == 0) {
-            v15 = String_char_count((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "abs") == 0) {
-            v15 = p_abs((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "p_str_length") == 0) {
-            v15 = p_str_length((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_first") == 0) {
-            v15 = Vec_first((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_clone") == 0) {
-            v15 = Vec_clone((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "HashMap_clone") == 0) {
-            v15 = HashMap_clone((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "HashMap_len") == 0) {
-            v15 = HashMap_len((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_bytes") == 0) {
-            v15 = String_bytes((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "ByteBuffer_len") == 0) {
-            v15 = ByteBuffer_len((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "Vec_len") == 0) {
-            v15 = Vec_len((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_clone") == 0) {
-            v15 = String_clone((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "HashMap_keys") == 0) {
-            v15 = HashMap_keys((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "str_parse_int") == 0) {
-            v15 = str_parse_int((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_trim") == 0) {
-            v15 = String_trim((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_capacity") == 0) {
-            v15 = Vec_capacity((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_parse_int") == 0) {
-            v15 = String_parse_int((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "char_to_upper") == 0) {
-            v15 = char_to_upper((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_last") == 0) {
-            v15 = Vec_last((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_pop") == 0) {
-            v15 = Vec_pop((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "allocator_bytes_used") == 0) {
-            v15 = allocator_bytes_used((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "Option_unwrap") == 0) {
-            v15 = Option_unwrap((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_to_string") == 0) {
-            v15 = String_to_string((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_to_lowercase") == 0) {
-            v15 = String_to_lowercase((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "StringBuilder_len") == 0) {
-            v15 = StringBuilder_len((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "p_str_hash") == 0) {
-            v15 = p_str_hash((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "char_to_lower") == 0) {
-            v15 = char_to_lower((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Result_unwrap") == 0) {
-            v15 = Result_unwrap((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_from") == 0) {
-            v15 = String_from((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_to_uppercase") == 0) {
-            v15 = String_to_uppercase((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "HashMap_values") == 0) {
-            v15 = HashMap_values((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "str_len") == 0) {
-            v15 = str_len((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_len") == 0) {
-            v15 = String_len((void*)v3, (int64_t)v10);
-        } else { abort(); }
-    }
-    v16 = (char*)v11 + 8;
-    *(int64_t*)v16 = (int64_t)v15;
-    v18 = (char*)v11 + 0;
-    v19 = (char*)v0 + 0;
-    v20 = *(int64_t*)v18;
-    *(int64_t*)v19 = (int64_t)v20;
-    v22 = (char*)v11 + 8;
-    v23 = (char*)v0 + 8;
-    v24 = *(int64_t*)v22;
-    *(int64_t*)v23 = (int64_t)v24;
-    p_call_stack_pop();
-    return;
-  bb3:
-    v27 = (char*)v2 + 0;
-    v28 = *(int64_t*)v27;
-    v29 = 1LL;
-    v30 = v28 == v29;
-    if (v30) goto bb4;
-    else goto bb5;
-  bb4:
-    v32 = malloc(16);
-    v33 = 1LL;
-    v34 = (char*)v32 + 0;
-    *(int64_t*)v34 = (int64_t)v33;
-    v36 = (char*)v32 + 0;
-    v37 = (char*)v0 + 0;
-    v38 = *(int64_t*)v36;
-    *(int64_t*)v37 = (int64_t)v38;
-    v40 = (char*)v32 + 8;
-    v41 = (char*)v0 + 8;
-    v42 = *(int64_t*)v40;
-    *(int64_t*)v41 = (int64_t)v42;
-    p_call_stack_pop();
-    return;
-  bb5:
-    goto bb1;
-    return;
-}
-
-bool String_is_empty(void* v0, int64_t v1) {
-    p_call_stack_push("String_is_empty");
-    int64_t v19;
-    int64_t v18;
-    bool v5;
-    int64_t v16; /* placeholder for void */
-    bool v20;
-    int64_t v2;
-    bool v3;
-    int64_t v4; /* placeholder for void */
-    int64_t v13; /* placeholder for void */
-    int64_t v9; /* placeholder for void */
-    uint8_t v15;
-    int64_t v7; /* placeholder for void */
-    void* v8;
-    int64_t v10;
-    int64_t v17; /* placeholder for void */
-    int64_t v6; /* placeholder for void */
-    int64_t v21; /* placeholder for void */
-    void* v11;
-    int64_t v12; /* placeholder for void */
-    void* v14;
-    v2 = 0LL;
-    v3 = v1 == v2;
-    if (v3) goto bb1;
-    else goto bb2;
-  bb1:
-    v5 = true;
-    p_call_stack_pop();
-    return v5;
-  bb2:
-    goto bb3;
-  bb3:
-    v8 = malloc(8);
-    *(void**)v8 = (void*)v1;
-    v10 = 0LL;
-    v11 = malloc(8);
-    *(int64_t*)v11 = (int64_t)v10;
-    v14 = *(void**)v8;
-    v15 = *(uint8_t*)v14;
-    *(int64_t*)v11 = (int64_t)v15;
-    v18 = *(int64_t*)v11;
-    v19 = 0LL;
-    v20 = v18 == v19;
-    p_call_stack_pop();
-    return v20;
-    return 0;
-}
-
-void StringBuilder_new(void* v0, void* v1) {
-    p_call_stack_push("StringBuilder_new");
-    void* v9;
-    void* v4;
-    void* v14;
-    void* v13;
-    void* v2;
-    int64_t v17; /* placeholder for void */
-    void* v3;
-    int64_t v6;
-    int64_t v12; /* placeholder for void */
-    int64_t v8; /* placeholder for void */
-    void* v11;
-    int64_t v15;
-    int64_t v5; /* placeholder for void */
-    void* v10;
-    int64_t v16; /* placeholder for void */
-    void* v7;
-    v2 = malloc(16);
-    v3 = _str1;
-    v4 = (char*)v2 + 0;
-    *(void**)v4 = (void*)v3;
-    v6 = 0LL;
-    v7 = (char*)v2 + 8;
-    *(int64_t*)v7 = (int64_t)v6;
-    v9 = (char*)v2 + 0;
-    v10 = (char*)v0 + 0;
-    v11 = *(void**)v9;
-    *(void**)v10 = (void*)v11;
-    v13 = (char*)v2 + 8;
-    v14 = (char*)v0 + 8;
-    v15 = *(int64_t*)v13;
-    *(int64_t*)v14 = (int64_t)v15;
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-void ByteBuffer_clear(void* v0, void* v1) {
-    p_call_stack_push("ByteBuffer_clear");
-    void* v2;
-    int64_t v8; /* placeholder for void */
-    int64_t v4;
-    void* v3;
-    int64_t v5; /* placeholder for void */
-    int64_t v7;
-    void* v6;
-    int64_t v9; /* placeholder for void */
-    v2 = (char*)v1 + 0;
-    v3 = *(void**)v2;
-    v4 = 0LL;
-    Vec_clear((void*)v4, (int64_t)v3);
-    v6 = (char*)v1 + 8;
-    v7 = 0LL;
-    *(int64_t*)v6 = (int64_t)v7;
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-void StringBuilder_append_str(void* v0, void* v1, void* v2) {
-    p_call_stack_push("StringBuilder_append_str");
-    int64_t v11;
-    int64_t v13;
-    int64_t v15; /* placeholder for void */
-    void* v5;
-    int64_t v7; /* placeholder for void */
-    void* v9;
-    int64_t v10;
-    void* v4;
-    void* v3;
-    int64_t v12;
-    void* v8;
-    int64_t v14; /* placeholder for void */
-    void* v6;
-    v3 = (char*)v1 + 0;
-    v4 = (char*)v1 + 0;
-    v5 = *(void**)v4;
-    v6 = p_str_concat(v5, v2);
-    *(void**)v3 = (void*)v6;
-    v8 = (char*)v1 + 8;
-    v9 = (char*)v1 + 8;
-    v10 = *(int64_t*)v9;
-    v11 = 0LL;
-    v12 = (int64_t)String_len((void*)v11, (int64_t)v2);
-    v13 = v10 + v12;
-    *(int64_t*)v8 = (int64_t)v13;
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-void Result_and_then(void* v0, void* v1, void* v2, void* v3) {
-    p_call_stack_push("Result_and_then");
-    void* v38;
-    int64_t v24;
-    int64_t v49; /* placeholder for void */
-    void* v13;
-    void* v22;
-    void* v9;
-    int64_t v42;
-    int64_t v46;
-    int64_t v50; /* placeholder for void */
-    void* v45;
-    void* v34;
-    bool v7;
-    int64_t v33;
-    int64_t v31; /* placeholder for void */
-    int64_t v35;
-    int64_t v47; /* placeholder for void */
-    int64_t v21; /* placeholder for void */
-    void* v44;
-    int64_t v8; /* placeholder for void */
-    void* v23;
-    void* v32;
-    int64_t v26; /* placeholder for void */
-    void* v18;
-    void* v27;
-    int64_t v14; /* placeholder for void */
-    int64_t v29;
-    int64_t v5;
-    int64_t v15;
-    void* v4;
-    void* v36;
-    int64_t v6;
-    int64_t v10;
-    int64_t v39; /* placeholder for void */
-    void* v16;
-    void* v11;
-    void* v40;
-    int64_t v12;
-    bool v30;
-    int64_t v43; /* placeholder for void */
-    int64_t v17; /* placeholder for void */
-    int64_t v25; /* placeholder for void */
-    int64_t v37; /* placeholder for void */
-    void* v19;
-    int64_t v20;
-    int64_t v28;
-    void* v41;
-    int64_t v48; /* placeholder for void */
-    v4 = (char*)v2 + 0;
-    v5 = *(int64_t*)v4;
-    v6 = 0LL;
-    v7 = v5 == v6;
-    if (v7) goto bb2;
-    else goto bb3;
-  bb1:
-    p_call_stack_pop();
-    return;
-  bb2:
-    v9 = (char*)v2 + 8;
-    v10 = *(int64_t*)v9;
-    v11 = malloc(16);
-    v12 = 0LL;
-    v13 = (char*)v11 + 0;
-    *(int64_t*)v13 = (int64_t)v12;
-    {
-        if (!v3) abort();
-        char* _fn_name = *(char**)v3;
-        if (!_fn_name) abort();
-        if (strcmp(_fn_name, "str_parse_hex") == 0) {
-            v15 = str_parse_hex((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_char_count") == 0) {
-            v15 = String_char_count((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "abs") == 0) {
-            v15 = p_abs((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "p_str_length") == 0) {
-            v15 = p_str_length((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_first") == 0) {
-            v15 = Vec_first((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_clone") == 0) {
-            v15 = Vec_clone((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "HashMap_clone") == 0) {
-            v15 = HashMap_clone((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "HashMap_len") == 0) {
-            v15 = HashMap_len((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_bytes") == 0) {
-            v15 = String_bytes((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "ByteBuffer_len") == 0) {
-            v15 = ByteBuffer_len((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "Vec_len") == 0) {
-            v15 = Vec_len((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_clone") == 0) {
-            v15 = String_clone((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "HashMap_keys") == 0) {
-            v15 = HashMap_keys((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "str_parse_int") == 0) {
-            v15 = str_parse_int((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_trim") == 0) {
-            v15 = String_trim((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_capacity") == 0) {
-            v15 = Vec_capacity((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_parse_int") == 0) {
-            v15 = String_parse_int((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "char_to_upper") == 0) {
-            v15 = char_to_upper((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_last") == 0) {
-            v15 = Vec_last((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_pop") == 0) {
-            v15 = Vec_pop((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "allocator_bytes_used") == 0) {
-            v15 = allocator_bytes_used((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "Option_unwrap") == 0) {
-            v15 = Option_unwrap((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_to_string") == 0) {
-            v15 = String_to_string((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_to_lowercase") == 0) {
-            v15 = String_to_lowercase((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "StringBuilder_len") == 0) {
-            v15 = StringBuilder_len((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "p_str_hash") == 0) {
-            v15 = p_str_hash((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "char_to_lower") == 0) {
-            v15 = char_to_lower((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Result_unwrap") == 0) {
-            v15 = Result_unwrap((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_from") == 0) {
-            v15 = String_from((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_to_uppercase") == 0) {
-            v15 = String_to_uppercase((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "HashMap_values") == 0) {
-            v15 = HashMap_values((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "str_len") == 0) {
-            v15 = str_len((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_len") == 0) {
-            v15 = String_len((void*)v3, (int64_t)v10);
-        } else { abort(); }
-    }
-    v16 = (char*)v11 + 8;
-    *(int64_t*)v16 = (int64_t)v15;
-    v18 = (char*)v11 + 0;
-    v19 = (char*)v0 + 0;
-    v20 = *(int64_t*)v18;
-    *(int64_t*)v19 = (int64_t)v20;
-    v22 = (char*)v11 + 8;
-    v23 = (char*)v0 + 8;
-    v24 = *(int64_t*)v22;
-    *(int64_t*)v23 = (int64_t)v24;
-    p_call_stack_pop();
-    return;
-  bb3:
-    v27 = (char*)v2 + 0;
-    v28 = *(int64_t*)v27;
-    v29 = 1LL;
-    v30 = v28 == v29;
-    if (v30) goto bb4;
-    else goto bb5;
-  bb4:
-    v32 = (char*)v2 + 8;
-    v33 = *(int64_t*)v32;
-    v34 = malloc(16);
-    v35 = 1LL;
-    v36 = (char*)v34 + 0;
-    *(int64_t*)v36 = (int64_t)v35;
-    v38 = (char*)v34 + 8;
-    *(int64_t*)v38 = (int64_t)v33;
-    v40 = (char*)v34 + 0;
-    v41 = (char*)v0 + 0;
-    v42 = *(int64_t*)v40;
-    *(int64_t*)v41 = (int64_t)v42;
-    v44 = (char*)v34 + 8;
-    v45 = (char*)v0 + 8;
-    v46 = *(int64_t*)v44;
-    *(int64_t*)v45 = (int64_t)v46;
-    p_call_stack_pop();
-    return;
-  bb5:
-    goto bb1;
-    return;
-}
-
-void* str_concat(void* v0, void* v1, void* v2) {
-    p_call_stack_push("str_concat");
-    int64_t v4; /* placeholder for void */
-    void* v3;
-    v3 = p_str_concat(v1, v2);
-    p_call_stack_pop();
-    return v3;
     return 0;
 }
 
 int64_t String_split(void* v0, int64_t v1, int64_t v2) {
     p_call_stack_push("String_split");
-    int64_t v86;
-    void* v72;
-    int64_t v39;
-    int64_t v124; /* placeholder for void */
-    bool v87;
-    int64_t v76; /* placeholder for void */
-    int64_t v139; /* placeholder for void */
-    void* v69;
-    int64_t v38;
-    int64_t v24;
-    int64_t v182;
-    int64_t v111;
-    int64_t v176; /* placeholder for void */
-    int64_t v67; /* placeholder for void */
-    int64_t v105;
-    void* v123;
-    int64_t v80; /* placeholder for void */
-    int64_t v97; /* placeholder for void */
-    int64_t v77; /* placeholder for void */
-    int64_t v146; /* placeholder for void */
-    int64_t v110; /* placeholder for void */
-    int64_t v61;
-    int64_t v122;
-    int64_t v43; /* placeholder for void */
-    int64_t v47;
-    void* v160;
-    int64_t v114;
-    int64_t v132;
-    int64_t v158;
-    int64_t v58;
-    int64_t v140; /* placeholder for void */
-    int64_t v55;
-    int64_t v137; /* placeholder for void */
-    int64_t v125; /* placeholder for void */
-    int64_t v34;
-    void* v150;
-    int64_t v27;
-    int64_t v41;
-    int64_t v151; /* placeholder for void */
-    int64_t v155; /* placeholder for void */
-    void* v66;
-    int64_t v51;
-    void* v35;
-    int64_t v104; /* placeholder for void */
-    int64_t v164;
-    int64_t v30;
-    int64_t v131;
-    void* v177;
-    int64_t v73; /* placeholder for void */
-    int64_t v50; /* placeholder for void */
-    void* v32;
-    int64_t v26; /* placeholder for void */
-    int64_t v3;
-    int64_t v36; /* placeholder for void */
-    void* v45;
-    bool v53;
-    bool v8;
-    int64_t v62;
-    int64_t v88; /* placeholder for void */
-    void* v5;
-    int64_t v60; /* placeholder for void */
-    int64_t v93;
-    int64_t v100;
-    int64_t v115;
-    int64_t v148;
-    int64_t v172; /* placeholder for void */
-    int64_t v118;
-    int64_t v149;
-    int64_t v4;
-    int64_t v101;
-    void* v18;
-    void* v75;
-    bool v98;
-    int64_t v46; /* placeholder for void */
-    void* v81;
-    int64_t v157;
-    int64_t v91; /* placeholder for void */
-    int64_t v65;
-    int64_t v112;
-    int64_t v40;
-    void* v78;
-    int64_t v106;
-    int64_t v117;
-    int64_t v130;
-    int64_t v95;
-    int64_t v135;
-    int64_t v141;
-    int64_t v16;
-    int64_t v147;
-    int64_t v152;
-    int64_t v169;
-    int64_t v170;
-    int64_t v14; /* placeholder for void */
-    int64_t v23; /* placeholder for void */
-    int64_t v13;
-    void* v59;
-    int64_t v21;
-    int64_t v168;
-    int64_t v116; /* placeholder for void */
-    int64_t v56;
-    void* v103;
-    int64_t v153;
-    int64_t v180; /* placeholder for void */
-    int64_t v187;
-    int64_t v188; /* placeholder for void */
-    int64_t v162;
-    bool v89;
-    int64_t v9;
-    bool v11;
-    int64_t v20;
-    int64_t v121; /* placeholder for void */
-    int64_t v134;
-    int64_t v33; /* placeholder for void */
-    int64_t v167; /* placeholder for void */
-    int64_t v129; /* placeholder for void */
-    int64_t v173;
-    int64_t v175; /* placeholder for void */
-    int64_t v119;
-    int64_t v143;
-    int64_t v7;
-    int64_t v31;
-    int64_t v52;
-    int64_t v92; /* placeholder for void */
-    int64_t v12; /* placeholder for void */
-    int64_t v96; /* placeholder for void */
-    int64_t v85;
-    void* v48;
-    void* v28;
-    int64_t v127;
-    int64_t v136;
-    int64_t v183;
-    bool v42;
-    int64_t v54; /* placeholder for void */
-    int64_t v102;
-    int64_t v138;
-    int64_t v57;
-    int64_t v49; /* placeholder for void */
-    int64_t v161; /* placeholder for void */
-    int64_t v113;
-    int64_t v181;
-    int64_t v84; /* placeholder for void */
-    int64_t v133; /* placeholder for void */
-    int64_t v184; /* placeholder for void */
-    int64_t v186; /* placeholder for void */
-    int64_t v15; /* placeholder for void */
     int64_t v19; /* placeholder for void */
-    int64_t v185; /* placeholder for void */
-    bool v154;
-    void* v108;
-    uint8_t v79;
-    void* v174;
-    int64_t v142;
-    bool v44;
-    int64_t v94;
+    int64_t v50; /* placeholder for void */
+    int64_t v117;
+    int64_t v12; /* placeholder for void */
+    void* v28;
     int64_t v128; /* placeholder for void */
-    int64_t v107;
-    int64_t v99; /* placeholder for void */
-    void* v63;
-    int64_t v163;
-    int64_t v68;
-    uint8_t v82;
-    int64_t v145; /* placeholder for void */
-    int64_t v6; /* placeholder for void */
-    int64_t v29; /* placeholder for void */
+    int64_t v141;
+    int64_t v130;
+    int64_t v71;
+    int64_t v173;
+    int64_t v21;
+    int64_t v100;
+    int64_t v114;
+    void* v32;
+    int64_t v3;
+    void* v35;
+    int64_t v129; /* placeholder for void */
+    int64_t v27;
+    int64_t v158;
+    int64_t v149;
+    int64_t v148;
+    int64_t v167; /* placeholder for void */
+    int64_t v116; /* placeholder for void */
+    int64_t v176; /* placeholder for void */
+    void* v69;
+    bool v8;
+    int64_t v94;
+    void* v59;
+    int64_t v25; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    int64_t v111;
+    bool v87;
+    int64_t v70; /* placeholder for void */
+    int64_t v51;
+    int64_t v39;
+    int64_t v151; /* placeholder for void */
+    int64_t v182;
     int64_t v64; /* placeholder for void */
-    int64_t v90; /* placeholder for void */
-    int64_t v144; /* placeholder for void */
-    int64_t v74;
+    void* v160;
+    int64_t v52;
+    int64_t v62;
+    int64_t v86;
+    int64_t v49; /* placeholder for void */
+    int64_t v132;
+    void* v103;
+    int64_t v135;
+    int64_t v13;
+    bool v89;
+    int64_t v67; /* placeholder for void */
+    int64_t v136;
+    int64_t v65;
+    int64_t v68;
+    int64_t v112;
+    int64_t v143;
+    int64_t v163;
+    int64_t v165;
+    int64_t v80; /* placeholder for void */
+    int64_t v188; /* placeholder for void */
+    bool v11;
+    int64_t v147;
+    int64_t v56;
+    int64_t v157;
+    void* v48;
+    void* v63;
+    int64_t v168;
+    int64_t v91; /* placeholder for void */
+    void* v171;
+    int64_t v29; /* placeholder for void */
+    int64_t v46; /* placeholder for void */
+    int64_t v96; /* placeholder for void */
+    int64_t v107;
+    void* v45;
+    int64_t v181;
+    int64_t v99; /* placeholder for void */
+    int64_t v152;
+    int64_t v20;
+    int64_t v161; /* placeholder for void */
+    int64_t v118;
+    int64_t v17;
+    int64_t v145; /* placeholder for void */
+    int64_t v113;
+    int64_t v146; /* placeholder for void */
+    int64_t v43; /* placeholder for void */
+    void* v75;
+    int64_t v175; /* placeholder for void */
+    int64_t v105;
+    int64_t v180; /* placeholder for void */
+    int64_t v60; /* placeholder for void */
+    int64_t v184; /* placeholder for void */
+    uint8_t v79;
+    int64_t v183;
+    int64_t v170;
+    int64_t v178;
+    int64_t v76; /* placeholder for void */
+    void* v18;
+    uint8_t v82;
+    int64_t v26; /* placeholder for void */
+    void* v150;
+    void* v5;
+    int64_t v102;
+    int64_t v57;
+    int64_t v38;
+    bool v44;
+    int64_t v153;
+    int64_t v58;
+    int64_t v93;
+    int64_t v185; /* placeholder for void */
+    int64_t v92; /* placeholder for void */
     bool v10;
     bool v22;
-    void* v126;
-    int64_t v165;
-    int64_t v25; /* placeholder for void */
-    int64_t v179; /* placeholder for void */
-    int64_t v166;
-    int64_t v71;
-    int64_t v17;
+    int64_t v30;
+    void* v108;
+    bool v53;
+    int64_t v110; /* placeholder for void */
+    int64_t v121; /* placeholder for void */
     int64_t v156;
+    int64_t v14; /* placeholder for void */
+    int64_t v169;
+    void* v126;
+    int64_t v88; /* placeholder for void */
+    int64_t v47;
+    int64_t v97; /* placeholder for void */
+    int64_t v55;
+    int64_t v4;
+    int64_t v140; /* placeholder for void */
+    int64_t v61;
+    int64_t v54; /* placeholder for void */
+    void* v123;
+    bool v154;
+    int64_t v144; /* placeholder for void */
+    int64_t v40;
+    void* v66;
+    int64_t v106;
+    int64_t v9;
+    int64_t v31;
+    int64_t v133; /* placeholder for void */
+    int64_t v139; /* placeholder for void */
+    int64_t v172; /* placeholder for void */
+    int64_t v23; /* placeholder for void */
+    int64_t v90; /* placeholder for void */
     void* v109;
+    int64_t v33; /* placeholder for void */
+    int64_t v124; /* placeholder for void */
+    bool v42;
+    int64_t v164;
     void* v120;
-    int64_t v70; /* placeholder for void */
-    void* v171;
-    int64_t v178;
+    int64_t v84; /* placeholder for void */
+    int64_t v115;
+    int64_t v77; /* placeholder for void */
+    int64_t v166;
+    int64_t v138;
+    int64_t v162;
     int64_t v37; /* placeholder for void */
+    int64_t v73; /* placeholder for void */
+    void* v177;
+    int64_t v95;
+    void* v72;
+    int64_t v85;
+    int64_t v127;
+    int64_t v155; /* placeholder for void */
+    int64_t v119;
     void* v159;
+    int64_t v179; /* placeholder for void */
     int64_t v83; /* placeholder for void */
+    int64_t v7;
+    void* v78;
+    bool v98;
+    int64_t v104; /* placeholder for void */
+    int64_t v137; /* placeholder for void */
+    int64_t v186; /* placeholder for void */
+    int64_t v125; /* placeholder for void */
+    int64_t v16;
+    int64_t v122;
+    void* v174;
+    int64_t v131;
+    int64_t v6; /* placeholder for void */
+    int64_t v187;
+    int64_t v36; /* placeholder for void */
+    int64_t v41;
+    void* v81;
+    int64_t v34;
+    int64_t v134;
+    int64_t v101;
+    int64_t v24;
+    int64_t v142;
+    int64_t v74;
     v3 = 0LL;
     v4 = (int64_t)Vec_new((void*)v3);
     v5 = malloc(8);
@@ -3365,168 +3840,6 @@ int64_t String_split(void* v0, int64_t v1, int64_t v2) {
     return 0;
 }
 
-void assert(void* v0, bool v1) {
-    p_call_stack_push("assert");
-    int64_t v5; /* placeholder for void */
-    int64_t v3; /* placeholder for void */
-    int64_t v7; /* placeholder for void */
-    int64_t v8; /* placeholder for void */
-    int64_t v6; /* placeholder for void */
-    int64_t v2;
-    void* v4;
-    v2 = !v1;
-    if (v2) goto bb1;
-    else goto bb2;
-  bb1:
-    v4 = _str2;
-    p_print_str(v4);
-    goto bb3;
-  bb2:
-    goto bb3;
-  bb3:
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-void* str_trim(void* v0, void* v1) {
-    p_call_stack_push("str_trim");
-    int64_t v2;
-    int64_t v3;
-    int64_t v4; /* placeholder for void */
-    v2 = 0LL;
-    v3 = (int64_t)String_trim((void*)v2, (int64_t)v1);
-    p_call_stack_pop();
-    return (void*)v3;
-    return 0;
-}
-
-void* StringBuilder_to_str(void* v0, void* v1) {
-    p_call_stack_push("StringBuilder_to_str");
-    void* v2;
-    void* v3;
-    int64_t v4; /* placeholder for void */
-    v2 = (char*)v1 + 0;
-    v3 = *(void**)v2;
-    p_call_stack_pop();
-    return v3;
-    return 0;
-}
-
-bool StringBuilder_is_empty(void* v0, void* v1) {
-    p_call_stack_push("StringBuilder_is_empty");
-    bool v5;
-    int64_t v3;
-    int64_t v6; /* placeholder for void */
-    void* v2;
-    int64_t v4;
-    v2 = (char*)v1 + 8;
-    v3 = *(int64_t*)v2;
-    v4 = 0LL;
-    v5 = v3 == v4;
-    p_call_stack_pop();
-    return v5;
-    return 0;
-}
-
-void* int_to_str(void* v0, int64_t v1) {
-    p_call_stack_push("int_to_str");
-    void* v2;
-    int64_t v3; /* placeholder for void */
-    v2 = (void*)p_to_str((int64_t)v1);
-    p_call_stack_pop();
-    return v2;
-    return 0;
-}
-
-int64_t String_byte_at(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("String_byte_at");
-    void* v34;
-    int64_t v22; /* placeholder for void */
-    int64_t v29; /* placeholder for void */
-    int64_t v8; /* placeholder for void */
-    void* v12;
-    int64_t v24;
-    bool v18;
-    int64_t v30;
-    int64_t v32; /* placeholder for void */
-    int64_t v19; /* placeholder for void */
-    int64_t v5; /* placeholder for void */
-    int64_t v3;
-    int64_t v14;
-    bool v17;
-    void* v31;
-    int64_t v37; /* placeholder for void */
-    int64_t v10;
-    uint8_t v35;
-    int64_t v38;
-    bool v4;
-    void* v25;
-    int64_t v27;
-    int64_t v23; /* placeholder for void */
-    int64_t v21;
-    void* v28;
-    int64_t v9; /* placeholder for void */
-    bool v15;
-    int64_t v20;
-    int64_t v16;
-    int64_t v26; /* placeholder for void */
-    int64_t v6;
-    int64_t v33; /* placeholder for void */
-    int64_t v39; /* placeholder for void */
-    int64_t v36; /* placeholder for void */
-    int64_t v13; /* placeholder for void */
-    int64_t v7;
-    int64_t v11;
-    v3 = 0LL;
-    v4 = v1 == v3;
-    if (v4) goto bb1;
-    else goto bb2;
-  bb1:
-    v6 = 1LL;
-    v7 = -v6;
-    p_call_stack_pop();
-    return v7;
-  bb2:
-    goto bb3;
-  bb3:
-    v10 = 0LL;
-    v11 = (int64_t)p_str_length((void*)v10, v1);
-    v12 = malloc(8);
-    *(int64_t*)v12 = (int64_t)v11;
-    v14 = 0LL;
-    v15 = v2 < v14;
-    v16 = *(int64_t*)v12;
-    v17 = v2 >= v16;
-    v18 = v15 || v17;
-    if (v18) goto bb4;
-    else goto bb5;
-  bb4:
-    v20 = 1LL;
-    v21 = -v20;
-    p_call_stack_pop();
-    return v21;
-  bb5:
-    goto bb6;
-  bb6:
-    v24 = v1 + v2;
-    v25 = malloc(8);
-    *(int64_t*)v25 = (int64_t)v24;
-    v27 = *(int64_t*)v25;
-    v28 = malloc(8);
-    *(void**)v28 = (void*)v27;
-    v30 = 0LL;
-    v31 = malloc(8);
-    *(int64_t*)v31 = (int64_t)v30;
-    v34 = *(void**)v28;
-    v35 = *(uint8_t*)v34;
-    *(int64_t*)v31 = (int64_t)v35;
-    v38 = *(int64_t*)v31;
-    p_call_stack_pop();
-    return v38;
-    return 0;
-}
-
 int64_t allocator_bytes_used(void* v0, void* v1) {
     p_call_stack_push("allocator_bytes_used");
     int64_t v3; /* placeholder for void */
@@ -3537,331 +3850,583 @@ int64_t allocator_bytes_used(void* v0, void* v1) {
     return 0;
 }
 
-void ByteBuffer_write_byte(void* v0, void* v1, int64_t v2) {
-    p_call_stack_push("ByteBuffer_write_byte");
-    int64_t v10;
-    int64_t v9;
-    int64_t v11;
-    int64_t v12; /* placeholder for void */
-    int64_t v6; /* placeholder for void */
-    int64_t v13; /* placeholder for void */
-    void* v3;
-    void* v4;
-    int64_t v5;
-    void* v7;
-    void* v8;
-    v3 = (char*)v1 + 0;
-    v4 = *(void**)v3;
-    v5 = 0LL;
-    Vec_push((void*)v5, (int64_t)v4, v2);
-    v7 = (char*)v1 + 8;
-    v8 = (char*)v1 + 8;
-    v9 = *(int64_t*)v8;
-    v10 = 1LL;
-    v11 = v9 + v10;
-    *(int64_t*)v7 = (int64_t)v11;
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-int64_t Vec_capacity(void* v0, int64_t v1) {
-    p_call_stack_push("Vec_capacity");
-    int64_t v13; /* placeholder for void */
-    int64_t v3;
-    int64_t v2;
-    void* v4;
-    void* v6;
-    void* v8;
-    int64_t v5; /* placeholder for void */
-    int64_t v9;
-    int64_t v7; /* placeholder for void */
-    int64_t v12;
-    int64_t v10; /* placeholder for void */
-    int64_t v11; /* placeholder for void */
-    v2 = 16LL;
-    v3 = v1 + v2;
-    v4 = malloc(8);
-    *(void**)v4 = (void*)v3;
-    v6 = malloc(8);
-    v8 = *(void**)v4;
-    v9 = *(int64_t*)v8;
-    *(int64_t*)v6 = (int64_t)v9;
-    v12 = *(int64_t*)v6;
-    p_call_stack_pop();
-    return v12;
-    return 0;
-}
-
-void* str_split_char(void* v0, void* v1, int64_t v2) {
-    p_call_stack_push("str_split_char");
-    int64_t v54;
-    int64_t v31; /* placeholder for void */
-    int64_t v62;
-    int64_t v22;
-    int64_t v11;
-    void* v15;
-    int64_t v19;
-    int64_t v47;
-    int64_t v56; /* placeholder for void */
-    int64_t v48;
-    int64_t v10;
-    int64_t v37;
-    void* v30;
-    void* v12;
-    void* v24;
-    void* v5;
-    int64_t v51; /* placeholder for void */
-    int64_t v66; /* placeholder for void */
-    int64_t v26;
-    int64_t v3;
-    int64_t v7;
-    bool v20;
-    int64_t v16; /* placeholder for void */
-    int64_t v55;
+int64_t String_rfind(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("String_rfind");
+    void* v77;
     int64_t v18;
-    int64_t v57; /* placeholder for void */
-    int64_t v32; /* placeholder for void */
-    int64_t v25; /* placeholder for void */
-    int64_t v36; /* placeholder for void */
-    int64_t v44;
-    int64_t v53;
-    bool v38;
-    int64_t v23;
-    void* v40;
-    int64_t v64; /* placeholder for void */
-    int64_t v21; /* placeholder for void */
-    int64_t v46; /* placeholder for void */
-    void* v27;
-    int64_t v14;
-    int64_t v39; /* placeholder for void */
-    int64_t v42;
-    int64_t v59;
-    int64_t v17; /* placeholder for void */
-    int64_t v60;
-    void* v4;
-    int64_t v6; /* placeholder for void */
-    int64_t v29;
-    void* v33;
-    uint8_t v34;
-    void* v65;
-    int64_t v35; /* placeholder for void */
-    int64_t v43;
-    void* v58;
-    int64_t v61;
-    int64_t v45;
-    void* v8;
-    int64_t v9; /* placeholder for void */
-    int64_t v52; /* placeholder for void */
-    int64_t v13; /* placeholder for void */
-    int64_t v28; /* placeholder for void */
+    void* v50;
+    int64_t v73;
+    int64_t v16; /* placeholder for void */
+    int64_t v87;
+    int64_t v92; /* placeholder for void */
+    int64_t v17;
+    int64_t v70;
     int64_t v49;
-    int64_t v50; /* placeholder for void */
+    int64_t v88;
+    int64_t v75; /* placeholder for void */
+    int64_t v76;
+    int64_t v21;
+    int64_t v3;
+    int64_t v9;
+    int64_t v86; /* placeholder for void */
+    void* v47;
+    int64_t v48; /* placeholder for void */
+    int64_t v10;
+    int64_t v53;
+    int64_t v52; /* placeholder for void */
+    int64_t v11; /* placeholder for void */
+    bool v7;
+    bool v100;
+    int64_t v106;
+    bool v4;
+    int64_t v102;
+    int64_t v107;
+    int64_t v36;
+    int64_t v43;
+    int64_t v104; /* placeholder for void */
+    uint8_t v81;
+    int64_t v105;
+    int64_t v62; /* placeholder for void */
+    int64_t v40; /* placeholder for void */
+    void* v74;
+    int64_t v110;
+    int64_t v34; /* placeholder for void */
+    void* v83;
+    int64_t v85; /* placeholder for void */
+    int64_t v111;
+    int64_t v37;
+    int64_t v29;
+    bool v44;
+    int64_t v101; /* placeholder for void */
+    int64_t v98; /* placeholder for void */
+    int64_t v38;
+    int64_t v27; /* placeholder for void */
+    void* v15;
+    int64_t v26; /* placeholder for void */
+    int64_t v8; /* placeholder for void */
+    int64_t v59;
+    int64_t v93; /* placeholder for void */
+    void* v71;
+    int64_t v109; /* placeholder for void */
+    int64_t v45; /* placeholder for void */
+    int64_t v25;
+    int64_t v108; /* placeholder for void */
+    int64_t v78; /* placeholder for void */
+    int64_t v22;
+    int64_t v24; /* placeholder for void */
+    int64_t v33;
+    int64_t v72; /* placeholder for void */
+    int64_t v5;
+    int64_t v60;
+    int64_t v97;
+    void* v80;
+    int64_t v13;
+    int64_t v32;
+    bool v91;
+    void* v68;
+    int64_t v56; /* placeholder for void */
+    int64_t v57;
+    int64_t v82; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    int64_t v41; /* placeholder for void */
+    int64_t v66; /* placeholder for void */
+    void* v39;
+    int64_t v58;
+    void* v61;
+    bool v89;
+    int64_t v28;
+    void* v19;
+    int64_t v20; /* placeholder for void */
+    bool v30;
+    bool v46;
+    int64_t v31; /* placeholder for void */
+    int64_t v96;
+    int64_t v64;
+    int64_t v67;
+    int64_t v54;
+    int64_t v42;
     int64_t v63;
-    int64_t v41;
+    int64_t v99; /* placeholder for void */
+    int64_t v90; /* placeholder for void */
+    int64_t v35; /* placeholder for void */
+    int64_t v51; /* placeholder for void */
+    int64_t v95;
+    int64_t v79; /* placeholder for void */
+    int64_t v112; /* placeholder for void */
+    bool v23;
+    int64_t v14;
+    void* v65;
+    uint8_t v84;
+    int64_t v94; /* placeholder for void */
+    int64_t v103; /* placeholder for void */
+    bool v55;
+    bool v6;
+    int64_t v69; /* placeholder for void */
     v3 = 0LL;
-    v4 = (void*)Vec_new((void*)v3);
-    v5 = malloc(8);
-    *(void**)v5 = (void*)v4;
-    v7 = 0LL;
-    v8 = malloc(8);
-    *(int64_t*)v8 = (int64_t)v7;
-    v10 = 0LL;
-    v11 = (int64_t)String_len((void*)v10, (int64_t)v1);
-    v12 = malloc(8);
-    *(int64_t*)v12 = (int64_t)v11;
-    v14 = 0LL;
+    v4 = v1 == v3;
+    v5 = 0LL;
+    v6 = v2 == v5;
+    v7 = v4 || v6;
+    if (v7) goto bb1;
+    else goto bb2;
+  bb1:
+    v9 = 1LL;
+    v10 = -v9;
+    p_call_stack_pop();
+    return v10;
+  bb2:
+    goto bb3;
+  bb3:
+    v13 = 0LL;
+    v14 = (int64_t)p_str_length((void*)v13, v1);
     v15 = malloc(8);
     *(int64_t*)v15 = (int64_t)v14;
-    goto bb1;
-  bb1:
-    v18 = *(int64_t*)v15;
-    v19 = *(int64_t*)v12;
-    v20 = v18 < v19;
-    if (v20) goto bb2;
-    else goto bb3;
-  bb2:
-    v22 = *(int64_t*)v15;
-    v23 = (int64_t)v1 + v22;
-    v24 = malloc(8);
-    *(int64_t*)v24 = (int64_t)v23;
-    v26 = *(int64_t*)v24;
-    v27 = malloc(8);
-    *(void**)v27 = (void*)v26;
-    v29 = 0LL;
-    v30 = malloc(8);
-    *(int64_t*)v30 = (int64_t)v29;
-    v33 = *(void**)v27;
-    v34 = *(uint8_t*)v33;
-    *(int64_t*)v30 = (int64_t)v34;
-    v37 = *(int64_t*)v30;
-    v38 = v37 == v2;
-    if (v38) goto bb4;
+    v17 = 0LL;
+    v18 = (int64_t)p_str_length((void*)v17, v2);
+    v19 = malloc(8);
+    *(int64_t*)v19 = (int64_t)v18;
+    v21 = *(int64_t*)v19;
+    v22 = 0LL;
+    v23 = v21 == v22;
+    if (v23) goto bb4;
     else goto bb5;
-  bb3:
-    v58 = *(void**)v5;
-    v59 = *(int64_t*)v8;
-    v60 = *(int64_t*)v12;
-    v61 = 0LL;
-    v62 = (int64_t)String_slice((void*)v61, (int64_t)v1, v59, v60);
-    v63 = 0LL;
-    Vec_push((void*)v63, (int64_t)v58, v62);
-    v65 = *(void**)v5;
-    p_call_stack_pop();
-    return v65;
   bb4:
-    v40 = *(void**)v5;
-    v41 = *(int64_t*)v8;
-    v42 = *(int64_t*)v15;
-    v43 = 0LL;
-    v44 = (int64_t)String_slice((void*)v43, (int64_t)v1, v41, v42);
-    v45 = 0LL;
-    Vec_push((void*)v45, (int64_t)v40, v44);
-    v47 = *(int64_t*)v15;
-    v48 = 1LL;
-    v49 = v47 + v48;
-    *(int64_t*)v8 = (int64_t)v49;
-    goto bb6;
+    v25 = *(int64_t*)v15;
+    p_call_stack_pop();
+    return v25;
   bb5:
     goto bb6;
   bb6:
-    v53 = *(int64_t*)v15;
-    v54 = 1LL;
-    v55 = v53 + v54;
-    *(int64_t*)v15 = (int64_t)v55;
-    goto bb1;
+    v28 = *(int64_t*)v19;
+    v29 = *(int64_t*)v15;
+    v30 = v28 > v29;
+    if (v30) goto bb7;
+    else goto bb8;
+  bb7:
+    v32 = 1LL;
+    v33 = -v32;
+    p_call_stack_pop();
+    return v33;
+  bb8:
+    goto bb9;
+  bb9:
+    v36 = *(int64_t*)v15;
+    v37 = *(int64_t*)v19;
+    v38 = v36 - v37;
+    v39 = malloc(8);
+    *(int64_t*)v39 = (int64_t)v38;
+    goto bb10;
+  bb10:
+    v42 = *(int64_t*)v39;
+    v43 = 0LL;
+    v44 = v42 >= v43;
+    if (v44) goto bb11;
+    else goto bb12;
+  bb11:
+    v46 = true;
+    v47 = malloc(1);
+    *(bool*)v47 = v46;
+    v49 = 0LL;
+    v50 = malloc(8);
+    *(int64_t*)v50 = (int64_t)v49;
+    goto bb13;
+  bb12:
+    v110 = 1LL;
+    v111 = -v110;
+    p_call_stack_pop();
+    return v111;
+  bb13:
+    v53 = *(int64_t*)v50;
+    v54 = *(int64_t*)v19;
+    v55 = v53 < v54;
+    if (v55) goto bb14;
+    else goto bb15;
+  bb14:
+    v57 = *(int64_t*)v39;
+    v58 = v1 + v57;
+    v59 = *(int64_t*)v50;
+    v60 = v58 + v59;
+    v61 = malloc(8);
+    *(int64_t*)v61 = (int64_t)v60;
+    v63 = *(int64_t*)v50;
+    v64 = v2 + v63;
+    v65 = malloc(8);
+    *(int64_t*)v65 = (int64_t)v64;
+    v67 = *(int64_t*)v61;
+    v68 = malloc(8);
+    *(void**)v68 = (void*)v67;
+    v70 = *(int64_t*)v65;
+    v71 = malloc(8);
+    *(void**)v71 = (void*)v70;
+    v73 = 0LL;
+    v74 = malloc(8);
+    *(int64_t*)v74 = (int64_t)v73;
+    v76 = 0LL;
+    v77 = malloc(8);
+    *(int64_t*)v77 = (int64_t)v76;
+    v80 = *(void**)v68;
+    v81 = *(uint8_t*)v80;
+    *(int64_t*)v74 = (int64_t)v81;
+    v83 = *(void**)v71;
+    v84 = *(uint8_t*)v83;
+    *(int64_t*)v77 = (int64_t)v84;
+    v87 = *(int64_t*)v74;
+    v88 = *(int64_t*)v77;
+    v89 = v87 != v88;
+    if (v89) goto bb16;
+    else goto bb17;
+  bb15:
+    v100 = *(bool*)v47;
+    if (v100) goto bb19;
+    else goto bb20;
+  bb16:
+    v91 = false;
+    *(bool*)v47 = v91;
+    goto bb15;
+  bb17:
+    goto bb18;
+  bb18:
+    v95 = *(int64_t*)v50;
+    v96 = 1LL;
+    v97 = v95 + v96;
+    *(int64_t*)v50 = (int64_t)v97;
+    goto bb13;
+  bb19:
+    v102 = *(int64_t*)v39;
+    p_call_stack_pop();
+    return v102;
+  bb20:
+    goto bb21;
+  bb21:
+    v105 = *(int64_t*)v39;
+    v106 = 1LL;
+    v107 = v105 - v106;
+    *(int64_t*)v39 = (int64_t)v107;
+    goto bb10;
     return 0;
 }
 
-int64_t String_len(void* v0, int64_t v1) {
-    p_call_stack_push("String_len");
-    int64_t v3;
-    int64_t v2;
-    int64_t v4; /* placeholder for void */
-    v2 = 0LL;
-    v3 = (int64_t)p_str_length((void*)v2, v1);
-    p_call_stack_pop();
-    return v3;
-    return 0;
-}
-
-void StringBuilder_append_int(void* v0, void* v1, int64_t v2) {
-    p_call_stack_push("StringBuilder_append_int");
-    void* v10;
-    int64_t v13;
-    int64_t v14; /* placeholder for void */
-    int64_t v15; /* placeholder for void */
-    int64_t v11;
-    void* v4;
-    void* v5;
-    void* v9;
-    int64_t v8; /* placeholder for void */
-    void* v7;
-    int64_t v12;
-    void* v6;
-    void* v3;
-    v3 = (char*)v1 + 0;
-    v4 = (char*)v1 + 0;
-    v5 = *(void**)v4;
-    v6 = (void*)p_to_str((int64_t)v2);
-    v7 = p_str_concat(v5, v6);
-    *(void**)v3 = (void*)v7;
-    v9 = (char*)v1 + 8;
-    v10 = (char*)v1 + 8;
-    v11 = *(int64_t*)v10;
-    v12 = 1LL;
-    v13 = v11 + v12;
-    *(int64_t*)v9 = (int64_t)v13;
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-int64_t String_to_string(void* v0, int64_t v1) {
-    p_call_stack_push("String_to_string");
-    int64_t v2;
-    int64_t v3;
-    int64_t v4; /* placeholder for void */
-    v2 = 0LL;
-    v3 = (int64_t)String_from((void*)v2, v1);
-    p_call_stack_pop();
-    return v3;
-    return 0;
-}
-
-int64_t str_byte_at(void* v0, void* v1, int64_t v2) {
-    p_call_stack_push("str_byte_at");
-    int64_t v5; /* placeholder for void */
+int64_t HashMap_find_slot(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("HashMap_find_slot");
+    void* v43;
+    int64_t v74; /* placeholder for void */
+    int64_t v97; /* placeholder for void */
+    int64_t v112;
+    int64_t v116; /* placeholder for void */
+    int64_t v114; /* placeholder for void */
+    int64_t v40; /* placeholder for void */
+    int64_t v102; /* placeholder for void */
+    int64_t v9;
+    int64_t v70; /* placeholder for void */
+    void* v58;
+    int64_t v72;
+    int64_t v119;
+    int64_t v98; /* placeholder for void */
+    int64_t v45;
+    int64_t v127; /* placeholder for void */
+    int64_t v50;
+    int64_t v63;
+    int64_t v129; /* placeholder for void */
+    int64_t v118; /* placeholder for void */
+    int64_t v108;
+    int64_t v38;
     int64_t v4;
+    int64_t v76;
+    int64_t v16; /* placeholder for void */
+    int64_t v11; /* placeholder for void */
+    int64_t v85;
+    int64_t v103;
+    int64_t v14;
+    int64_t v117; /* placeholder for void */
+    int64_t v80; /* placeholder for void */
+    int64_t v52; /* placeholder for void */
+    int64_t v79;
+    int64_t v82;
+    int64_t v20; /* placeholder for void */
+    int64_t v21;
+    int64_t v36;
+    int64_t v96; /* placeholder for void */
+    int64_t v130; /* placeholder for void */
+    void* v28;
+    int64_t v27; /* placeholder for void */
+    int64_t v78; /* placeholder for void */
+    int64_t v93; /* placeholder for void */
+    void* v61;
+    int64_t v59; /* placeholder for void */
+    int64_t v53;
+    int64_t v23; /* placeholder for void */
+    int64_t v91;
+    bool v101;
+    int64_t v123; /* placeholder for void */
+    int64_t v35; /* placeholder for void */
+    void* v46;
+    int64_t v122; /* placeholder for void */
+    int64_t v107;
+    void* v64;
+    int64_t v121;
+    int64_t v55;
+    int64_t v84; /* placeholder for void */
+    int64_t v104; /* placeholder for void */
+    int64_t v68;
+    int64_t v128;
+    int64_t v22; /* placeholder for void */
+    bool v92;
+    int64_t v54;
+    int64_t v6; /* placeholder for void */
+    int64_t v60;
+    bool v77;
+    int64_t v94;
+    int64_t v75;
+    int64_t v48; /* placeholder for void */
+    int64_t v32;
+    int64_t v115;
+    bool v19;
+    int64_t v33;
+    int64_t v131;
     int64_t v3;
+    int64_t v56;
+    bool v51;
+    int64_t v106; /* placeholder for void */
+    int64_t v125;
+    int64_t v95; /* placeholder for void */
+    int64_t v81; /* placeholder for void */
+    int64_t v31; /* placeholder for void */
+    int64_t v124;
+    int64_t v132; /* placeholder for void */
+    int64_t v29;
+    int64_t v18;
+    int64_t v105; /* placeholder for void */
+    void* v7;
+    int64_t v37;
+    int64_t v42;
+    void* v67;
+    int64_t v87;
+    int64_t v47; /* placeholder for void */
+    int64_t v99;
+    int64_t v41;
+    int64_t v83; /* placeholder for void */
+    int64_t v26; /* placeholder for void */
+    void* v34;
+    int64_t v90;
+    int64_t v100;
+    int64_t v8; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    int64_t v65; /* placeholder for void */
+    int64_t v17;
+    int64_t v71;
+    bool v113;
+    int64_t v120;
+    bool v126;
+    bool v73;
+    void* v5;
+    bool v88;
+    int64_t v24;
+    int64_t v57;
+    void* v25;
+    int64_t v62; /* placeholder for void */
+    int64_t v110; /* placeholder for void */
+    int64_t v109;
+    int64_t v15; /* placeholder for void */
+    void* v10;
+    int64_t v30; /* placeholder for void */
+    int64_t v89; /* placeholder for void */
+    int64_t v44; /* placeholder for void */
+    int64_t v86;
+    int64_t v111;
+    int64_t v66; /* placeholder for void */
+    int64_t v69; /* placeholder for void */
+    void* v13;
+    int64_t v49;
+    void* v39;
+    v3 = 24LL;
+    v4 = v1 + v3;
+    v5 = malloc(8);
+    *(void**)v5 = (void*)v4;
+    v7 = malloc(8);
+    *(void**)v7 = (void*)v1;
+    v9 = 0LL;
+    v10 = malloc(8);
+    *(int64_t*)v10 = (int64_t)v9;
+    v13 = *(void**)v5;
+    v14 = *(int64_t*)v13;
+    *(int64_t*)v10 = (int64_t)v14;
+    v17 = *(int64_t*)v10;
+    v18 = 0LL;
+    v19 = v17 == v18;
+    if (v19) goto bb1;
+    else goto bb2;
+  bb1:
+    v21 = 0LL;
+    p_call_stack_pop();
+    return v21;
+  bb2:
+    goto bb3;
+  bb3:
+    v24 = 0LL;
+    v25 = malloc(8);
+    *(int64_t*)v25 = (int64_t)v24;
+    v28 = *(void**)v7;
+    v29 = *(int64_t*)v28;
+    *(int64_t*)v25 = (int64_t)v29;
+    v32 = 0LL;
+    v33 = (int64_t)p_str_hash((void*)v32, v2);
+    v34 = malloc(8);
+    *(int64_t*)v34 = (int64_t)v33;
+    v36 = *(int64_t*)v34;
+    v37 = *(int64_t*)v10;
+    v38 = v36 % v37;
+    v39 = malloc(8);
+    *(int64_t*)v39 = (int64_t)v38;
+    v41 = 1LL;
+    v42 = -v41;
+    v43 = malloc(8);
+    *(int64_t*)v43 = (int64_t)v42;
+    v45 = 0LL;
+    v46 = malloc(8);
+    *(int64_t*)v46 = (int64_t)v45;
+    goto bb4;
+  bb4:
+    v49 = *(int64_t*)v46;
+    v50 = *(int64_t*)v10;
+    v51 = v49 < v50;
+    if (v51) goto bb5;
+    else goto bb6;
+  bb5:
+    v53 = *(int64_t*)v25;
+    v54 = *(int64_t*)v39;
+    v55 = 8LL;
+    v56 = v54 * v55;
+    v57 = v53 + v56;
+    v58 = malloc(8);
+    *(int64_t*)v58 = (int64_t)v57;
+    v60 = *(int64_t*)v58;
+    v61 = malloc(8);
+    *(void**)v61 = (void*)v60;
+    v63 = 0LL;
+    v64 = malloc(8);
+    *(int64_t*)v64 = (int64_t)v63;
+    v67 = *(void**)v61;
+    v68 = *(int64_t*)v67;
+    *(int64_t*)v64 = (int64_t)v68;
+    v71 = *(int64_t*)v64;
+    v72 = 0LL;
+    v73 = v71 == v72;
+    if (v73) goto bb7;
+    else goto bb8;
+  bb6:
+    v124 = *(int64_t*)v43;
+    v125 = 0LL;
+    v126 = v124 >= v125;
+    if (v126) goto bb25;
+    else goto bb26;
+  bb7:
+    v75 = *(int64_t*)v43;
+    v76 = 0LL;
+    v77 = v75 >= v76;
+    if (v77) goto bb10;
+    else goto bb11;
+  bb8:
+    goto bb9;
+  bb9:
+    v85 = *(int64_t*)v64;
+    v86 = 1LL;
+    v87 = -v86;
+    v88 = v85 == v87;
+    if (v88) goto bb13;
+    else goto bb14;
+  bb10:
+    v79 = *(int64_t*)v43;
+    p_call_stack_pop();
+    return v79;
+  bb11:
+    goto bb12;
+  bb12:
+    v82 = *(int64_t*)v39;
+    p_call_stack_pop();
+    return v82;
+  bb13:
+    v90 = *(int64_t*)v43;
+    v91 = 0LL;
+    v92 = v90 < v91;
+    if (v92) goto bb16;
+    else goto bb17;
+  bb14:
+    v99 = *(int64_t*)v64;
+    v100 = 0LL;
+    v101 = (bool)p_str_equal((void*)v100, v99, v2);
+    if (v101) goto bb19;
+    else goto bb20;
+  bb15:
+    v107 = *(int64_t*)v39;
+    v108 = 1LL;
+    v109 = v107 + v108;
+    *(int64_t*)v39 = (int64_t)v109;
+    v111 = *(int64_t*)v39;
+    v112 = *(int64_t*)v10;
+    v113 = v111 >= v112;
+    if (v113) goto bb22;
+    else goto bb23;
+  bb16:
+    v94 = *(int64_t*)v39;
+    *(int64_t*)v43 = (int64_t)v94;
+    goto bb18;
+  bb17:
+    goto bb18;
+  bb18:
+    goto bb15;
+  bb19:
+    v103 = *(int64_t*)v39;
+    p_call_stack_pop();
+    return v103;
+  bb20:
+    goto bb21;
+  bb21:
+    goto bb15;
+  bb22:
+    v115 = 0LL;
+    *(int64_t*)v39 = (int64_t)v115;
+    goto bb24;
+  bb23:
+    goto bb24;
+  bb24:
+    v119 = *(int64_t*)v46;
+    v120 = 1LL;
+    v121 = v119 + v120;
+    *(int64_t*)v46 = (int64_t)v121;
+    goto bb4;
+  bb25:
+    v128 = *(int64_t*)v43;
+    p_call_stack_pop();
+    return v128;
+  bb26:
+    goto bb27;
+  bb27:
+    v131 = 0LL;
+    p_call_stack_pop();
+    return v131;
+    return 0;
+}
+
+bool str_starts_with(void* v0, void* v1, void* v2) {
+    p_call_stack_push("str_starts_with");
+    int64_t v3;
+    int64_t v5; /* placeholder for void */
+    bool v4;
     v3 = 0LL;
-    v4 = (int64_t)String_byte_at((void*)v3, (int64_t)v1, v2);
+    v4 = (bool)String_starts_with((void*)v3, (int64_t)v1, (int64_t)v2);
     p_call_stack_pop();
     return v4;
     return 0;
 }
 
-bool Option_is_none(void* v0, void* v1) {
-    p_call_stack_push("Option_is_none");
-    int64_t v6; /* placeholder for void */
-    int64_t v12;
-    bool v14;
-    void* v2;
-    bool v9;
-    bool v16;
-    int64_t v18; /* placeholder for void */
-    int64_t v13;
-    int64_t v15; /* placeholder for void */
-    int64_t v17; /* placeholder for void */
-    int64_t v20; /* placeholder for void */
-    bool v19;
-    void* v11;
-    bool v5;
-    int64_t v3;
-    int64_t v10; /* placeholder for void */
-    int64_t v8;
-    int64_t v4;
-    void* v7;
-    v2 = (char*)v1 + 0;
-    v3 = *(int64_t*)v2;
-    v4 = 0LL;
-    v5 = v3 == v4;
-    if (v5) goto bb2;
-    else goto bb3;
-  bb1:
-    v19 = false;
-    p_call_stack_pop();
-    return v19;
-  bb2:
-    v7 = (char*)v1 + 8;
-    v8 = *(int64_t*)v7;
-    v9 = false;
-    p_call_stack_pop();
-    return v9;
-  bb3:
-    v11 = (char*)v1 + 0;
-    v12 = *(int64_t*)v11;
-    v13 = 1LL;
-    v14 = v12 == v13;
-    if (v14) goto bb4;
-    else goto bb5;
-  bb4:
-    v16 = true;
-    p_call_stack_pop();
-    return v16;
-  bb5:
-    goto bb1;
-    return 0;
-}
-
-int64_t p_max(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("max");
-    int64_t v5; /* placeholder for void */
-    bool v3;
+int64_t p_min(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("min");
     int64_t v6; /* placeholder for void */
     int64_t v7; /* placeholder for void */
     int64_t v4; /* placeholder for void */
-    v3 = v1 > v2;
+    int64_t v5; /* placeholder for void */
+    bool v3;
+    v3 = v1 < v2;
     if (v3) goto bb1;
     else goto bb2;
   bb1:
@@ -3875,68 +4440,172 @@ int64_t p_max(void* v0, int64_t v1, int64_t v2) {
     return 0;
 }
 
-void* str_to_lower(void* v0, void* v1) {
-    p_call_stack_push("str_to_lower");
-    int64_t v2;
+int64_t p_str_hash(void* v0, int64_t v1) {
+    p_call_stack_push("p_str_hash");
+    int64_t v45;
+    int64_t v7; /* placeholder for void */
+    int64_t v22;
+    int64_t v25;
+    uint8_t v13;
+    int64_t v28; /* placeholder for void */
+    void* v12;
+    void* v4;
+    int64_t v26;
+    int64_t v23;
+    int64_t v38; /* placeholder for void */
+    int64_t v8;
+    int64_t v33;
+    int64_t v16; /* placeholder for void */
+    int64_t v29;
+    int64_t v18;
+    int64_t v31;
+    int64_t v41;
+    bool v42;
+    int64_t v21;
+    int64_t v24; /* placeholder for void */
     int64_t v3;
-    int64_t v4; /* placeholder for void */
-    v2 = 0LL;
-    v3 = (int64_t)String_to_lowercase((void*)v2, (int64_t)v1);
+    int64_t v11; /* placeholder for void */
+    int64_t v37; /* placeholder for void */
+    int64_t v10; /* placeholder for void */
+    int64_t v17;
+    uint8_t v36;
+    int64_t v2;
+    int64_t v32; /* placeholder for void */
+    int64_t v34; /* placeholder for void */
+    void* v9;
+    int64_t v5; /* placeholder for void */
+    int64_t v40;
+    int64_t v44;
+    int64_t v30;
+    int64_t v46; /* placeholder for void */
+    int64_t v48;
+    int64_t v49; /* placeholder for void */
+    bool v19;
+    int64_t v43; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    int64_t v39; /* placeholder for void */
+    int64_t v47; /* placeholder for void */
+    void* v35;
+    void* v6;
+    void* v14;
+    int64_t v20; /* placeholder for void */
+    int64_t v27;
+    v2 = 3750763034362895579LL;
+    v3 = -v2;
+    v4 = malloc(8);
+    *(int64_t*)v4 = (int64_t)v3;
+    v6 = malloc(8);
+    *(int64_t*)v6 = (int64_t)v1;
+    v8 = *(int64_t*)v6;
+    v9 = malloc(8);
+    *(void**)v9 = (void*)v8;
+    v12 = *(void**)v9;
+    v13 = *(uint8_t*)v12;
+    v14 = malloc(8);
+    *(int64_t*)v14 = (int64_t)v13;
+    goto bb1;
+  bb1:
+    v17 = *(int64_t*)v14;
+    v18 = 0LL;
+    v19 = v17 != v18;
+    if (v19) goto bb2;
+    else goto bb3;
+  bb2:
+    v21 = *(int64_t*)v4;
+    v22 = *(int64_t*)v14;
+    v23 = v21 ^ v22;
+    *(int64_t*)v4 = (int64_t)v23;
+    v25 = *(int64_t*)v4;
+    v26 = 1099511628211LL;
+    v27 = v25 * v26;
+    *(int64_t*)v4 = (int64_t)v27;
+    v29 = *(int64_t*)v6;
+    v30 = 1LL;
+    v31 = v29 + v30;
+    *(int64_t*)v6 = (int64_t)v31;
+    v33 = *(int64_t*)v6;
+    *(void**)v9 = (void*)v33;
+    v35 = *(void**)v9;
+    v36 = *(uint8_t*)v35;
+    *(int64_t*)v14 = (int64_t)v36;
+    goto bb1;
+  bb3:
+    v40 = *(int64_t*)v4;
+    v41 = 0LL;
+    v42 = v40 < v41;
+    if (v42) goto bb4;
+    else goto bb5;
+  bb4:
+    v44 = *(int64_t*)v4;
+    v45 = -v44;
     p_call_stack_pop();
-    return (void*)v3;
+    return v45;
+  bb5:
+    goto bb6;
+  bb6:
+    v48 = *(int64_t*)v4;
+    p_call_stack_pop();
+    return v48;
     return 0;
 }
 
-int64_t Vec_last(void* v0, int64_t v1) {
-    p_call_stack_push("Vec_last");
-    int64_t v3;
-    int64_t v36; /* placeholder for void */
-    void* v22;
-    int64_t v39; /* placeholder for void */
-    int64_t v23; /* placeholder for void */
-    int64_t v32;
-    void* v24;
-    int64_t v29;
-    int64_t v15;
-    int64_t v26; /* placeholder for void */
-    void* v4;
-    int64_t v45;
-    int64_t v43; /* placeholder for void */
-    int64_t v42; /* placeholder for void */
-    void* v38;
-    void* v6;
-    int64_t v11;
-    int64_t v2;
-    int64_t v30;
-    int64_t v14;
-    int64_t v12; /* placeholder for void */
-    void* v35;
-    int64_t v47; /* placeholder for void */
-    int64_t v13; /* placeholder for void */
-    int64_t v17; /* placeholder for void */
-    bool v16;
-    int64_t v34;
-    int64_t v49; /* placeholder for void */
-    int64_t v21; /* placeholder for void */
-    void* v8;
-    int64_t v33;
-    int64_t v40;
-    int64_t v5; /* placeholder for void */
-    void* v41;
+int64_t Vec_pop(void* v0, int64_t v1) {
+    p_call_stack_push("Vec_pop");
     void* v10;
-    int64_t v19; /* placeholder for void */
-    void* v44;
-    int64_t v37;
-    int64_t v25;
-    int64_t v46; /* placeholder for void */
-    void* v18;
-    int64_t v31;
-    int64_t v20; /* placeholder for void */
     int64_t v9; /* placeholder for void */
+    void* v21;
+    int64_t v25; /* placeholder for void */
+    int64_t v46;
+    void* v6;
+    void* v4;
+    int64_t v33;
+    void* v39;
+    int64_t v56; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    void* v23;
+    int64_t v17; /* placeholder for void */
+    int64_t v42;
+    int64_t v22; /* placeholder for void */
+    int64_t v47;
+    int64_t v24;
+    int64_t v50; /* placeholder for void */
+    int64_t v38; /* placeholder for void */
+    int64_t v30;
+    int64_t v15;
+    int64_t v20; /* placeholder for void */
+    int64_t v35; /* placeholder for void */
+    void* v48;
+    int64_t v31;
     int64_t v28;
-    int64_t v27; /* placeholder for void */
-    int64_t v48;
+    void* v34;
     int64_t v7; /* placeholder for void */
+    int64_t v27;
+    int64_t v5; /* placeholder for void */
+    int64_t v14;
+    int64_t v36;
+    int64_t v29;
+    bool v16;
+    int64_t v11;
+    int64_t v26; /* placeholder for void */
+    void* v41;
+    int64_t v54; /* placeholder for void */
+    int64_t v52;
+    int64_t v40; /* placeholder for void */
+    int64_t v19; /* placeholder for void */
+    int64_t v49; /* placeholder for void */
+    int64_t v32;
+    void* v51;
+    int64_t v53; /* placeholder for void */
+    int64_t v43; /* placeholder for void */
+    int64_t v13; /* placeholder for void */
+    void* v8;
+    int64_t v44; /* placeholder for void */
+    int64_t v55;
+    int64_t v2;
+    int64_t v45;
+    void* v37;
+    int64_t v3;
+    int64_t v18;
     v2 = 8LL;
     v3 = v1 + v2;
     v4 = malloc(8);
@@ -3953,312 +4622,158 @@ int64_t Vec_last(void* v0, int64_t v1) {
     if (v16) goto bb1;
     else goto bb2;
   bb1:
-    v18 = _str0;
-    p_panic(v18);
-    goto bb3;
+    v18 = 0LL;
+    p_call_stack_pop();
+    return v18;
   bb2:
     goto bb3;
   bb3:
-    v22 = malloc(8);
-    v24 = *(void**)v6;
-    v25 = *(int64_t*)v24;
-    *(int64_t*)v22 = (int64_t)v25;
-    v28 = *(int64_t*)v22;
-    v29 = *(int64_t*)v8;
-    v30 = 1LL;
-    v31 = v29 - v30;
-    v32 = 8LL;
-    v33 = v31 * v32;
-    v34 = v28 + v33;
-    v35 = malloc(8);
-    *(int64_t*)v35 = (int64_t)v34;
-    v37 = *(int64_t*)v35;
-    v38 = malloc(8);
-    *(void**)v38 = (void*)v37;
-    v40 = 0LL;
-    v41 = malloc(8);
-    *(int64_t*)v41 = (int64_t)v40;
-    v44 = *(void**)v38;
-    v45 = *(int64_t*)v44;
-    *(int64_t*)v41 = (int64_t)v45;
-    v48 = *(int64_t*)v41;
-    p_call_stack_pop();
-    return v48;
-    return 0;
-}
-
-int64_t p_str_length(void* v0, int64_t v1) {
-    p_call_stack_push("p_str_length");
-    int64_t v4; /* placeholder for void */
-    int64_t v29; /* placeholder for void */
-    int64_t v6; /* placeholder for void */
-    int64_t v13;
-    int64_t v2;
-    bool v24;
-    uint8_t v37;
-    int64_t v27;
-    int64_t v25; /* placeholder for void */
-    int64_t v12; /* placeholder for void */
-    int64_t v35; /* placeholder for void */
-    int64_t v15; /* placeholder for void */
-    int64_t v40; /* placeholder for void */
-    int64_t v5;
-    int64_t v33; /* placeholder for void */
-    int64_t v21; /* placeholder for void */
-    bool v3;
-    int64_t v30;
-    int64_t v31;
-    int64_t v10;
-    int64_t v26;
-    void* v14;
-    void* v36;
-    int64_t v39; /* placeholder for void */
-    int64_t v7; /* placeholder for void */
-    void* v11;
-    void* v8;
-    void* v17;
-    uint8_t v18;
-    void* v19;
-    int64_t v32;
-    int64_t v42; /* placeholder for void */
-    int64_t v9; /* placeholder for void */
-    int64_t v16; /* placeholder for void */
-    int64_t v23;
-    int64_t v34;
-    int64_t v22;
-    int64_t v41;
-    int64_t v28;
-    int64_t v38; /* placeholder for void */
-    int64_t v20; /* placeholder for void */
-    v2 = 0LL;
-    v3 = v1 == v2;
-    if (v3) goto bb1;
-    else goto bb2;
-  bb1:
-    v5 = 0LL;
-    p_call_stack_pop();
-    return v5;
-  bb2:
-    goto bb3;
-  bb3:
-    v8 = malloc(8);
-    *(int64_t*)v8 = (int64_t)v1;
-    v10 = *(int64_t*)v8;
-    v11 = malloc(8);
-    *(void**)v11 = (void*)v10;
-    v13 = 0LL;
-    v14 = malloc(8);
-    *(int64_t*)v14 = (int64_t)v13;
-    v17 = *(void**)v11;
-    v18 = *(uint8_t*)v17;
-    v19 = malloc(8);
-    *(int64_t*)v19 = (int64_t)v18;
-    goto bb4;
-  bb4:
-    v22 = *(int64_t*)v19;
-    v23 = 0LL;
-    v24 = v22 != v23;
-    if (v24) goto bb5;
-    else goto bb6;
-  bb5:
-    v26 = *(int64_t*)v14;
-    v27 = 1LL;
-    v28 = v26 + v27;
-    *(int64_t*)v14 = (int64_t)v28;
-    v30 = *(int64_t*)v8;
-    v31 = 1LL;
-    v32 = v30 + v31;
-    *(int64_t*)v8 = (int64_t)v32;
-    v34 = *(int64_t*)v8;
-    *(void**)v11 = (void*)v34;
-    v36 = *(void**)v11;
-    v37 = *(uint8_t*)v36;
-    *(int64_t*)v19 = (int64_t)v37;
-    goto bb4;
-  bb6:
-    v41 = *(int64_t*)v14;
-    p_call_stack_pop();
-    return v41;
-    return 0;
-}
-
-int64_t String_from(void* v0, int64_t v1) {
-    p_call_stack_push("String_from");
-    void* v40;
-    int64_t v33; /* placeholder for void */
-    int64_t v15; /* placeholder for void */
-    void* v6;
-    int64_t v17;
-    int64_t v18; /* placeholder for void */
-    int64_t v39;
-    int64_t v14;
-    void* v13;
-    int64_t v42; /* placeholder for void */
-    int64_t v29; /* placeholder for void */
-    void* v43;
-    int64_t v12; /* placeholder for void */
-    void* v37;
-    void* v10;
-    int64_t v32;
-    int64_t v34;
-    int64_t v5;
-    int64_t v21;
-    int64_t v23; /* placeholder for void */
-    int64_t v24;
-    void* v7;
-    int64_t v44;
-    int64_t v11; /* placeholder for void */
-    int64_t v19; /* placeholder for void */
-    void* v22;
-    int64_t v16; /* placeholder for void */
-    int64_t v45; /* placeholder for void */
-    int64_t v30;
-    int64_t v35;
-    int64_t v9;
-    int64_t v31;
-    int64_t v46; /* placeholder for void */
-    int64_t v47;
-    void* v27;
-    void* v28;
-    int64_t v36;
-    int64_t v8; /* placeholder for void */
-    int64_t v48; /* placeholder for void */
-    int64_t v25;
-    int64_t v41; /* placeholder for void */
-    int64_t v20;
-    int64_t v4; /* placeholder for void */
-    bool v3;
-    int64_t v38; /* placeholder for void */
-    int64_t v2;
-    int64_t v26;
-    v2 = 0LL;
-    v3 = v1 == v2;
-    if (v3) goto bb1;
-    else goto bb2;
-  bb1:
-    v5 = 1LL;
-    v6 = p_malloc(v5);
-    v7 = malloc(8);
-    *(int64_t*)v7 = (int64_t)v6;
-    v9 = *(int64_t*)v7;
-    v10 = malloc(8);
-    *(void**)v10 = (void*)v9;
-    v13 = *(void**)v10;
-    v14 = 0LL;
-    *(uint8_t*)v13 = (uint8_t)v14;
-    v17 = *(int64_t*)v7;
-    p_call_stack_pop();
-    return v17;
-  bb2:
-    goto bb3;
-  bb3:
-    v20 = 0LL;
-    v21 = (int64_t)p_str_length((void*)v20, v1);
-    v22 = malloc(8);
-    *(int64_t*)v22 = (int64_t)v21;
-    v24 = *(int64_t*)v22;
-    v25 = 1LL;
-    v26 = v24 + v25;
-    v27 = p_malloc(v26);
-    v28 = malloc(8);
-    *(int64_t*)v28 = (int64_t)v27;
-    v30 = *(int64_t*)v28;
-    v31 = *(int64_t*)v22;
-    v32 = 0LL;
-    p_str_copy_n((void*)v32, v30, v1, v31);
-    v34 = *(int64_t*)v28;
-    v35 = *(int64_t*)v22;
-    v36 = v34 + v35;
+    v21 = malloc(8);
+    v23 = *(void**)v6;
+    v24 = *(int64_t*)v23;
+    *(int64_t*)v21 = (int64_t)v24;
+    v27 = *(int64_t*)v21;
+    v28 = *(int64_t*)v8;
+    v29 = 1LL;
+    v30 = v28 - v29;
+    v31 = 8LL;
+    v32 = v30 * v31;
+    v33 = v27 + v32;
+    v34 = malloc(8);
+    *(int64_t*)v34 = (int64_t)v33;
+    v36 = *(int64_t*)v34;
     v37 = malloc(8);
-    *(int64_t*)v37 = (int64_t)v36;
-    v39 = *(int64_t*)v37;
-    v40 = malloc(8);
-    *(void**)v40 = (void*)v39;
-    v43 = *(void**)v40;
-    v44 = 0LL;
-    *(uint8_t*)v43 = (uint8_t)v44;
-    v47 = *(int64_t*)v28;
+    *(void**)v37 = (void*)v36;
+    v39 = malloc(8);
+    v41 = *(void**)v37;
+    v42 = *(int64_t*)v41;
+    *(int64_t*)v39 = (int64_t)v42;
+    v45 = *(int64_t*)v8;
+    v46 = 1LL;
+    v47 = v45 - v46;
+    v48 = malloc(8);
+    *(int64_t*)v48 = (int64_t)v47;
+    v51 = *(void**)v4;
+    v52 = *(int64_t*)v48;
+    *(int64_t*)v51 = (int64_t)v52;
+    v55 = *(int64_t*)v39;
     p_call_stack_pop();
-    return v47;
+    return v55;
     return 0;
 }
 
-bool String_starts_with(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("String_starts_with");
-    int64_t v36;
-    int64_t v40;
-    void* v28;
-    int64_t v66; /* placeholder for void */
-    int64_t v64;
-    int64_t v5;
-    bool v22;
-    void* v59;
-    int64_t v69; /* placeholder for void */
-    bool v33;
-    int64_t v74; /* placeholder for void */
-    int64_t v73; /* placeholder for void */
+int64_t String_find(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("String_find");
+    int64_t v76;
     int64_t v51; /* placeholder for void */
-    int64_t v3;
-    int64_t v32;
-    int64_t v8; /* placeholder for void */
-    void* v56;
-    uint8_t v60;
-    bool v7;
-    bool v4;
-    int64_t v19; /* placeholder for void */
-    int64_t v68; /* placeholder for void */
-    void* v41;
-    void* v47;
-    bool v67;
-    void* v44;
-    uint8_t v57;
-    void* v18;
-    int64_t v27;
-    int64_t v49;
-    int64_t v34; /* placeholder for void */
-    int64_t v13;
-    int64_t v55; /* placeholder for void */
-    int64_t v76; /* placeholder for void */
-    void* v53;
-    int64_t v72;
-    void* v50;
-    int64_t v16;
-    int64_t v54; /* placeholder for void */
-    int64_t v61; /* placeholder for void */
-    int64_t v62; /* placeholder for void */
-    int64_t v10; /* placeholder for void */
-    int64_t v39;
-    int64_t v25; /* placeholder for void */
-    void* v37;
-    int64_t v42; /* placeholder for void */
-    int64_t v63;
-    bool v65;
-    int64_t v29; /* placeholder for void */
-    int64_t v23; /* placeholder for void */
-    bool v9;
-    int64_t v26; /* placeholder for void */
-    int64_t v46;
-    bool v24;
-    int64_t v45; /* placeholder for void */
-    int64_t v38; /* placeholder for void */
-    int64_t v58; /* placeholder for void */
+    int64_t v31; /* placeholder for void */
+    int64_t v33;
+    void* v80;
+    void* v15;
+    int64_t v35; /* placeholder for void */
     int64_t v70;
-    int64_t v71;
-    int64_t v35;
-    bool v75;
-    int64_t v11; /* placeholder for void */
-    int64_t v48; /* placeholder for void */
-    int64_t v21;
-    int64_t v43;
-    int64_t v52;
-    int64_t v15; /* placeholder for void */
-    bool v6;
+    int64_t v111;
+    bool v91;
+    int64_t v98; /* placeholder for void */
+    uint8_t v81;
+    int64_t v10;
     int64_t v17;
-    int64_t v31;
-    int64_t v20;
-    int64_t v12;
-    void* v14;
-    int64_t v30; /* placeholder for void */
+    void* v77;
+    bool v30;
+    int64_t v78; /* placeholder for void */
+    void* v50;
+    void* v83;
+    bool v23;
+    bool v4;
+    int64_t v21;
+    int64_t v99; /* placeholder for void */
+    bool v46;
+    int64_t v12; /* placeholder for void */
+    int64_t v5;
+    int64_t v58;
+    int64_t v79; /* placeholder for void */
+    bool v100;
+    bool v44;
+    int64_t v108; /* placeholder for void */
+    int64_t v56; /* placeholder for void */
+    int64_t v26; /* placeholder for void */
+    int64_t v40;
+    int64_t v54;
+    int64_t v67;
+    int64_t v20; /* placeholder for void */
+    void* v47;
+    int64_t v11; /* placeholder for void */
+    int64_t v60;
+    int64_t v86; /* placeholder for void */
+    int64_t v101; /* placeholder for void */
+    int64_t v9;
+    int64_t v13;
+    void* v19;
+    int64_t v97;
+    int64_t v16; /* placeholder for void */
+    int64_t v53;
+    int64_t v105;
+    int64_t v49;
+    int64_t v73;
+    int64_t v110;
+    int64_t v34; /* placeholder for void */
+    void* v61;
+    int64_t v87;
+    int64_t v3;
+    int64_t v57;
+    int64_t v29;
+    int64_t v59;
+    int64_t v32;
+    bool v7;
+    void* v37;
+    int64_t v112; /* placeholder for void */
+    int64_t v42;
+    void* v71;
+    void* v68;
+    int64_t v106;
+    int64_t v95;
+    bool v6;
+    bool v89;
+    int64_t v27; /* placeholder for void */
+    int64_t v52; /* placeholder for void */
+    int64_t v93; /* placeholder for void */
+    void* v65;
+    int64_t v66; /* placeholder for void */
+    int64_t v14;
+    int64_t v38; /* placeholder for void */
+    int64_t v18;
+    int64_t v90; /* placeholder for void */
+    int64_t v8; /* placeholder for void */
+    int64_t v96;
+    int64_t v92; /* placeholder for void */
+    int64_t v109; /* placeholder for void */
+    int64_t v25;
+    int64_t v45; /* placeholder for void */
+    int64_t v75; /* placeholder for void */
+    int64_t v69; /* placeholder for void */
+    int64_t v63;
+    void* v74;
+    int64_t v28;
+    int64_t v104; /* placeholder for void */
+    int64_t v36;
+    int64_t v62; /* placeholder for void */
+    int64_t v85; /* placeholder for void */
+    int64_t v64;
+    uint8_t v84;
+    int64_t v39; /* placeholder for void */
+    int64_t v94; /* placeholder for void */
+    int64_t v72; /* placeholder for void */
+    int64_t v88;
+    int64_t v48; /* placeholder for void */
+    int64_t v41;
+    int64_t v102;
+    int64_t v43;
+    bool v55;
+    int64_t v107;
+    int64_t v82; /* placeholder for void */
+    int64_t v22;
+    int64_t v103; /* placeholder for void */
+    int64_t v24; /* placeholder for void */
     v3 = 0LL;
     v4 = v1 == v3;
     v5 = 0LL;
@@ -4267,336 +4782,439 @@ bool String_starts_with(void* v0, int64_t v1, int64_t v2) {
     if (v7) goto bb1;
     else goto bb2;
   bb1:
-    v9 = false;
+    v9 = 1LL;
+    v10 = -v9;
     p_call_stack_pop();
-    return v9;
+    return v10;
   bb2:
     goto bb3;
   bb3:
-    v12 = 0LL;
-    v13 = (int64_t)p_str_length((void*)v12, v1);
-    v14 = malloc(8);
-    *(int64_t*)v14 = (int64_t)v13;
-    v16 = 0LL;
-    v17 = (int64_t)p_str_length((void*)v16, v2);
-    v18 = malloc(8);
-    *(int64_t*)v18 = (int64_t)v17;
-    v20 = *(int64_t*)v18;
-    v21 = *(int64_t*)v14;
-    v22 = v20 > v21;
-    if (v22) goto bb4;
+    v13 = 0LL;
+    v14 = (int64_t)p_str_length((void*)v13, v1);
+    v15 = malloc(8);
+    *(int64_t*)v15 = (int64_t)v14;
+    v17 = 0LL;
+    v18 = (int64_t)p_str_length((void*)v17, v2);
+    v19 = malloc(8);
+    *(int64_t*)v19 = (int64_t)v18;
+    v21 = *(int64_t*)v19;
+    v22 = 0LL;
+    v23 = v21 == v22;
+    if (v23) goto bb4;
     else goto bb5;
   bb4:
-    v24 = false;
+    v25 = 0LL;
     p_call_stack_pop();
-    return v24;
+    return v25;
   bb5:
     goto bb6;
   bb6:
-    v27 = 0LL;
-    v28 = malloc(8);
-    *(int64_t*)v28 = (int64_t)v27;
-    goto bb7;
+    v28 = *(int64_t*)v19;
+    v29 = *(int64_t*)v15;
+    v30 = v28 > v29;
+    if (v30) goto bb7;
+    else goto bb8;
   bb7:
-    v31 = *(int64_t*)v28;
-    v32 = *(int64_t*)v18;
-    v33 = v31 < v32;
-    if (v33) goto bb8;
-    else goto bb9;
+    v32 = 1LL;
+    v33 = -v32;
+    p_call_stack_pop();
+    return v33;
   bb8:
-    v35 = *(int64_t*)v28;
-    v36 = v1 + v35;
+    goto bb9;
+  bb9:
+    v36 = 0LL;
     v37 = malloc(8);
     *(int64_t*)v37 = (int64_t)v36;
-    v39 = *(int64_t*)v28;
-    v40 = v2 + v39;
-    v41 = malloc(8);
-    *(int64_t*)v41 = (int64_t)v40;
-    v43 = *(int64_t*)v37;
-    v44 = malloc(8);
-    *(void**)v44 = (void*)v43;
-    v46 = *(int64_t*)v41;
-    v47 = malloc(8);
-    *(void**)v47 = (void*)v46;
+    goto bb10;
+  bb10:
+    v40 = *(int64_t*)v37;
+    v41 = *(int64_t*)v15;
+    v42 = *(int64_t*)v19;
+    v43 = v41 - v42;
+    v44 = v40 <= v43;
+    if (v44) goto bb11;
+    else goto bb12;
+  bb11:
+    v46 = true;
+    v47 = malloc(1);
+    *(bool*)v47 = v46;
     v49 = 0LL;
     v50 = malloc(8);
     *(int64_t*)v50 = (int64_t)v49;
-    v52 = 0LL;
-    v53 = malloc(8);
-    *(int64_t*)v53 = (int64_t)v52;
-    v56 = *(void**)v44;
-    v57 = *(uint8_t*)v56;
-    *(int64_t*)v50 = (int64_t)v57;
-    v59 = *(void**)v47;
-    v60 = *(uint8_t*)v59;
-    *(int64_t*)v53 = (int64_t)v60;
-    v63 = *(int64_t*)v50;
-    v64 = *(int64_t*)v53;
-    v65 = v63 != v64;
-    if (v65) goto bb10;
-    else goto bb11;
-  bb9:
-    v75 = true;
-    p_call_stack_pop();
-    return v75;
-  bb10:
-    v67 = false;
-    p_call_stack_pop();
-    return v67;
-  bb11:
-    goto bb12;
+    goto bb13;
   bb12:
-    v70 = *(int64_t*)v28;
-    v71 = 1LL;
-    v72 = v70 + v71;
-    *(int64_t*)v28 = (int64_t)v72;
-    goto bb7;
+    v110 = 1LL;
+    v111 = -v110;
+    p_call_stack_pop();
+    return v111;
+  bb13:
+    v53 = *(int64_t*)v50;
+    v54 = *(int64_t*)v19;
+    v55 = v53 < v54;
+    if (v55) goto bb14;
+    else goto bb15;
+  bb14:
+    v57 = *(int64_t*)v37;
+    v58 = v1 + v57;
+    v59 = *(int64_t*)v50;
+    v60 = v58 + v59;
+    v61 = malloc(8);
+    *(int64_t*)v61 = (int64_t)v60;
+    v63 = *(int64_t*)v50;
+    v64 = v2 + v63;
+    v65 = malloc(8);
+    *(int64_t*)v65 = (int64_t)v64;
+    v67 = *(int64_t*)v61;
+    v68 = malloc(8);
+    *(void**)v68 = (void*)v67;
+    v70 = *(int64_t*)v65;
+    v71 = malloc(8);
+    *(void**)v71 = (void*)v70;
+    v73 = 0LL;
+    v74 = malloc(8);
+    *(int64_t*)v74 = (int64_t)v73;
+    v76 = 0LL;
+    v77 = malloc(8);
+    *(int64_t*)v77 = (int64_t)v76;
+    v80 = *(void**)v68;
+    v81 = *(uint8_t*)v80;
+    *(int64_t*)v74 = (int64_t)v81;
+    v83 = *(void**)v71;
+    v84 = *(uint8_t*)v83;
+    *(int64_t*)v77 = (int64_t)v84;
+    v87 = *(int64_t*)v74;
+    v88 = *(int64_t*)v77;
+    v89 = v87 != v88;
+    if (v89) goto bb16;
+    else goto bb17;
+  bb15:
+    v100 = *(bool*)v47;
+    if (v100) goto bb19;
+    else goto bb20;
+  bb16:
+    v91 = false;
+    *(bool*)v47 = v91;
+    goto bb15;
+  bb17:
+    goto bb18;
+  bb18:
+    v95 = *(int64_t*)v50;
+    v96 = 1LL;
+    v97 = v95 + v96;
+    *(int64_t*)v50 = (int64_t)v97;
+    goto bb13;
+  bb19:
+    v102 = *(int64_t*)v37;
+    p_call_stack_pop();
+    return v102;
+  bb20:
+    goto bb21;
+  bb21:
+    v105 = *(int64_t*)v37;
+    v106 = 1LL;
+    v107 = v105 + v106;
+    *(int64_t*)v37 = (int64_t)v107;
+    goto bb10;
+    return 0;
+}
+
+bool char_is_whitespace(void* v0, int64_t v1) {
+    p_call_stack_push("char_is_whitespace");
+    bool v11;
+    int64_t v13; /* placeholder for void */
+    int64_t v7;
+    int64_t v2;
+    bool v12;
+    bool v3;
+    bool v6;
+    int64_t v4;
+    bool v8;
+    bool v9;
+    int64_t v10;
+    bool v5;
+    v2 = 32LL;
+    v3 = v1 == v2;
+    v4 = 9LL;
+    v5 = v1 == v4;
+    v6 = v3 || v5;
+    v7 = 10LL;
+    v8 = v1 == v7;
+    v9 = v6 || v8;
+    v10 = 13LL;
+    v11 = v1 == v10;
+    v12 = v9 || v11;
+    p_call_stack_pop();
+    return v12;
+    return 0;
+}
+
+void* str_replace(void* v0, void* v1, void* v2, void* v3) {
+    p_call_stack_push("str_replace");
+    int64_t v6; /* placeholder for void */
+    int64_t v4;
+    int64_t v5;
+    v4 = 0LL;
+    v5 = (int64_t)String_replace((void*)v4, (int64_t)v1, (int64_t)v2, (int64_t)v3);
+    p_call_stack_pop();
+    return (void*)v5;
+    return 0;
+}
+
+void* str_repeat(void* v0, void* v1, int64_t v2) {
+    p_call_stack_push("str_repeat");
+    int64_t v5; /* placeholder for void */
+    int64_t v4;
+    int64_t v3;
+    v3 = 0LL;
+    v4 = (int64_t)String_repeat((void*)v3, (int64_t)v1, v2);
+    p_call_stack_pop();
+    return (void*)v4;
     return 0;
 }
 
 int64_t str_parse_hex(void* v0, void* v1) {
     p_call_stack_push("str_parse_hex");
-    int64_t v100;
+    int64_t v33; /* placeholder for void */
     int64_t v9; /* placeholder for void */
-    int64_t v235;
-    int64_t v13;
-    bool v182;
-    int64_t v117; /* placeholder for void */
-    int64_t v135; /* placeholder for void */
-    int64_t v180;
-    int64_t v184;
-    int64_t v48; /* placeholder for void */
-    int64_t v130; /* placeholder for void */
-    int64_t v101;
-    bool v211;
-    int64_t v58;
-    int64_t v7;
-    int64_t v41; /* placeholder for void */
-    int64_t v49;
-    int64_t v225;
-    bool v159;
-    int64_t v24;
-    void* v112;
-    int64_t v223;
-    uint8_t v116;
-    bool v8;
-    int64_t v108;
-    int64_t v188;
-    int64_t v65;
-    bool v25;
     int64_t v191; /* placeholder for void */
-    int64_t v46; /* placeholder for void */
-    bool v199;
+    int64_t v241;
+    int64_t v187; /* placeholder for void */
+    int64_t v202;
+    int64_t v119;
+    int64_t v70; /* placeholder for void */
+    int64_t v48; /* placeholder for void */
+    int64_t v82;
+    int64_t v149;
+    int64_t v165;
+    int64_t v16;
+    int64_t v223;
+    void* v72;
+    int64_t v134; /* placeholder for void */
+    int64_t v79; /* placeholder for void */
+    void* v166;
     int64_t v209;
-    int64_t v224;
+    int64_t v83;
+    int64_t v92;
+    void* v17;
+    int64_t v99;
+    int64_t v3;
+    int64_t v192; /* placeholder for void */
+    bool v199;
+    int64_t v238; /* placeholder for void */
+    void* v126;
+    int64_t v65;
+    int64_t v67; /* placeholder for void */
+    int64_t v57; /* placeholder for void */
+    void* v163;
+    bool v208;
+    void* v109;
+    int64_t v200; /* placeholder for void */
+    int64_t v81; /* placeholder for void */
+    int64_t v49;
+    int64_t v11; /* placeholder for void */
+    int64_t v5; /* placeholder for void */
+    int64_t v140;
+    bool v80;
+    bool v19;
+    int64_t v201;
+    int64_t v179; /* placeholder for void */
+    int64_t v234; /* placeholder for void */
+    int64_t v74; /* placeholder for void */
+    int64_t v91;
+    int64_t v105;
+    int64_t v177;
+    void* v132;
+    int64_t v235;
+    int64_t v36; /* placeholder for void */
+    bool v211;
+    int64_t v68;
+    bool v233;
+    int64_t v55;
+    int64_t v24;
+    int64_t v206;
+    int64_t v40; /* placeholder for void */
+    int64_t v230;
+    void* v123;
+    int64_t v143;
+    int64_t v114; /* placeholder for void */
+    int64_t v164; /* placeholder for void */
+    int64_t v7;
+    int64_t v96; /* placeholder for void */
+    uint8_t v39;
+    int64_t v110; /* placeholder for void */
+    int64_t v131; /* placeholder for void */
+    int64_t v162;
+    int64_t v111;
+    int64_t v124; /* placeholder for void */
+    void* v115;
+    int64_t v2;
+    int64_t v125;
+    int64_t v62;
+    int64_t v180;
+    int64_t v53; /* placeholder for void */
+    int64_t v59; /* placeholder for void */
+    int64_t v147; /* placeholder for void */
+    int64_t v213; /* placeholder for void */
+    int64_t v222;
     int64_t v87;
     int64_t v43;
-    int64_t v127; /* placeholder for void */
-    int64_t v161;
-    int64_t v37; /* placeholder for void */
-    uint8_t v73;
-    int64_t v97; /* placeholder for void */
-    int64_t v157;
-    int64_t v170; /* placeholder for void */
-    int64_t v168;
-    void* v72;
-    int64_t v107; /* placeholder for void */
-    int64_t v181;
-    bool v44;
-    void* v132;
-    bool v195;
-    int64_t v47; /* placeholder for void */
-    void* v32;
-    int64_t v179; /* placeholder for void */
-    int64_t v15; /* placeholder for void */
-    void* v69;
-    bool v208;
-    int64_t v139;
-    int64_t v190;
-    bool v141;
-    int64_t v131; /* placeholder for void */
-    int64_t v228;
-    int64_t v98;
-    bool v19;
-    int64_t v95; /* placeholder for void */
-    int64_t v232; /* placeholder for void */
-    bool v186;
-    int64_t v162;
-    int64_t v202;
-    int64_t v154; /* placeholder for void */
-    void* v115;
-    int64_t v152; /* placeholder for void */
-    int64_t v134; /* placeholder for void */
-    int64_t v34;
-    int64_t v218; /* placeholder for void */
-    int64_t v231; /* placeholder for void */
-    int64_t v196;
-    int64_t v36; /* placeholder for void */
-    void* v29;
-    int64_t v165;
-    bool v185;
-    int64_t v105;
-    int64_t v122;
-    int64_t v217; /* placeholder for void */
-    int64_t v237;
-    bool v56;
-    int64_t v94; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    int64_t v142;
-    int64_t v164; /* placeholder for void */
-    int64_t v33; /* placeholder for void */
-    int64_t v241;
-    int64_t v62;
-    int64_t v27;
-    int64_t v230;
-    bool v78;
-    int64_t v238; /* placeholder for void */
-    int64_t v3;
-    int64_t v242; /* placeholder for void */
-    int64_t v140;
-    int64_t v220; /* placeholder for void */
-    int64_t v5; /* placeholder for void */
-    int64_t v84;
-    int64_t v90; /* placeholder for void */
-    int64_t v183;
-    int64_t v124; /* placeholder for void */
-    int64_t v205; /* placeholder for void */
-    int64_t v61;
-    int64_t v51;
-    int64_t v111;
-    bool v146;
-    void* v106;
-    int64_t v128;
-    int64_t v214;
-    bool v145;
-    void* v166;
-    uint8_t v39;
-    int64_t v151; /* placeholder for void */
-    void* v172;
-    int64_t v193;
-    int64_t v213; /* placeholder for void */
-    int64_t v103; /* placeholder for void */
-    int64_t v21; /* placeholder for void */
-    int64_t v22; /* placeholder for void */
-    int64_t v28;
-    int64_t v118; /* placeholder for void */
-    int64_t v143;
-    int64_t v150;
-    int64_t v26; /* placeholder for void */
-    int64_t v189;
-    int64_t v12; /* placeholder for void */
-    int64_t v110; /* placeholder for void */
-    int64_t v149;
-    bool v212;
-    int64_t v23;
-    int64_t v68;
-    int64_t v74; /* placeholder for void */
-    int64_t v114; /* placeholder for void */
-    void* v109;
-    int64_t v174; /* placeholder for void */
-    void* v35;
-    void* v123;
-    int64_t v31;
-    int64_t v222;
     int64_t v197;
-    int64_t v96; /* placeholder for void */
-    uint8_t v173;
-    int64_t v177;
-    void* v14;
-    int64_t v210;
-    int64_t v216;
-    int64_t v85; /* placeholder for void */
-    void* v63;
-    void* v38;
-    void* v126;
-    int64_t v175; /* placeholder for void */
-    bool v102;
-    int64_t v234; /* placeholder for void */
-    int64_t v113; /* placeholder for void */
-    int64_t v86; /* placeholder for void */
-    void* v169;
-    int64_t v219; /* placeholder for void */
-    int64_t v187; /* placeholder for void */
-    int64_t v75; /* placeholder for void */
-    int64_t v121;
-    int64_t v221; /* placeholder for void */
-    int64_t v147; /* placeholder for void */
-    int64_t v158;
-    int64_t v240; /* placeholder for void */
-    int64_t v30; /* placeholder for void */
-    int64_t v236;
-    int64_t v2;
-    int64_t v10;
-    int64_t v119;
-    bool v138;
-    int64_t v226;
-    int64_t v167; /* placeholder for void */
-    int64_t v70; /* placeholder for void */
-    int64_t v207;
-    int64_t v77;
-    int64_t v40; /* placeholder for void */
+    int64_t v22; /* placeholder for void */
+    int64_t v135; /* placeholder for void */
     int64_t v176;
-    int64_t v76;
-    bool v80;
-    int64_t v91;
-    int64_t v99;
-    int64_t v215;
-    int64_t v200; /* placeholder for void */
-    int64_t v227; /* placeholder for void */
-    int64_t v57; /* placeholder for void */
+    int64_t v95; /* placeholder for void */
     int64_t v155; /* placeholder for void */
-    int64_t v52; /* placeholder for void */
-    int64_t v6;
-    int64_t v137;
-    int64_t v204; /* placeholder for void */
-    int64_t v81; /* placeholder for void */
-    int64_t v64; /* placeholder for void */
-    int64_t v42;
-    int64_t v136;
-    int64_t v201;
-    int64_t v160; /* placeholder for void */
-    int64_t v11; /* placeholder for void */
-    int64_t v71; /* placeholder for void */
-    int64_t v16;
-    void* v20;
-    int64_t v92;
-    bool v233;
-    int64_t v88;
-    int64_t v55;
-    int64_t v125;
-    int64_t v59; /* placeholder for void */
-    int64_t v120;
+    int64_t v237;
+    int64_t v90; /* placeholder for void */
+    bool v56;
     int64_t v203;
-    int64_t v153; /* placeholder for void */
-    bool v144;
-    int64_t v45;
-    void* v66;
-    int64_t v53; /* placeholder for void */
-    int64_t v67; /* placeholder for void */
-    int64_t v206;
-    int64_t v83;
-    int64_t v93;
-    uint8_t v133;
-    void* v178;
-    int64_t v148;
-    int64_t v194;
-    int64_t v239; /* placeholder for void */
-    bool v198;
-    void* v17;
-    int64_t v229;
-    void* v129;
-    int64_t v104;
-    void* v4;
-    int64_t v79; /* placeholder for void */
-    int64_t v82;
-    int64_t v192; /* placeholder for void */
-    int64_t v60; /* placeholder for void */
-    int64_t v171; /* placeholder for void */
-    int64_t v50;
-    void* v163;
-    int64_t v54;
-    int64_t v156; /* placeholder for void */
+    int64_t v100;
+    void* v14;
+    int64_t v85; /* placeholder for void */
+    int64_t v236;
+    bool v8;
+    int64_t v21; /* placeholder for void */
+    int64_t v220; /* placeholder for void */
+    int64_t v196;
+    int64_t v37; /* placeholder for void */
+    bool v44;
+    int64_t v47; /* placeholder for void */
     bool v89;
+    bool v186;
+    int64_t v229;
+    int64_t v6;
+    int64_t v193;
+    int64_t v88;
+    int64_t v181;
+    int64_t v64; /* placeholder for void */
+    int64_t v156; /* placeholder for void */
+    int64_t v174; /* placeholder for void */
+    int64_t v113; /* placeholder for void */
+    int64_t v161;
+    void* v38;
+    void* v178;
+    void* v4;
+    int64_t v218; /* placeholder for void */
+    int64_t v41; /* placeholder for void */
+    int64_t v204; /* placeholder for void */
+    int64_t v31;
+    int64_t v136;
+    int64_t v240; /* placeholder for void */
+    int64_t v188;
+    int64_t v216;
+    int64_t v10;
+    void* v169;
+    void* v20;
+    bool v159;
+    int64_t v232; /* placeholder for void */
+    bool v182;
+    int64_t v242; /* placeholder for void */
+    int64_t v104;
+    int64_t v189;
+    int64_t v18; /* placeholder for void */
+    int64_t v108;
+    int64_t v46; /* placeholder for void */
+    int64_t v120;
+    void* v35;
+    int64_t v42;
+    int64_t v101;
+    bool v145;
+    int64_t v154; /* placeholder for void */
+    int64_t v170; /* placeholder for void */
+    int64_t v214;
+    int64_t v219; /* placeholder for void */
+    int64_t v13;
+    int64_t v224;
+    int64_t v184;
+    int64_t v30; /* placeholder for void */
+    int64_t v107; /* placeholder for void */
+    int64_t v61;
+    int64_t v77;
+    int64_t v190;
+    uint8_t v73;
+    int64_t v217; /* placeholder for void */
+    int64_t v239; /* placeholder for void */
+    int64_t v84;
+    int64_t v60; /* placeholder for void */
+    int64_t v226;
+    int64_t v118; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    int64_t v75; /* placeholder for void */
+    int64_t v27;
+    int64_t v117; /* placeholder for void */
+    uint8_t v116;
+    int64_t v160; /* placeholder for void */
+    void* v172;
+    int64_t v210;
+    int64_t v23;
+    int64_t v150;
+    bool v146;
+    int64_t v228;
+    int64_t v157;
+    int64_t v151; /* placeholder for void */
+    int64_t v86; /* placeholder for void */
+    int64_t v103; /* placeholder for void */
+    int64_t v45;
+    int64_t v58;
+    int64_t v168;
+    int64_t v97; /* placeholder for void */
+    int64_t v221; /* placeholder for void */
+    int64_t v148;
+    int64_t v127; /* placeholder for void */
+    int64_t v225;
+    int64_t v94; /* placeholder for void */
+    bool v25;
+    void* v129;
+    int64_t v139;
+    int64_t v121;
+    int64_t v28;
+    int64_t v175; /* placeholder for void */
+    int64_t v34;
+    int64_t v52; /* placeholder for void */
+    bool v138;
+    int64_t v93;
+    bool v144;
+    int64_t v205; /* placeholder for void */
+    void* v29;
+    void* v69;
+    int64_t v71; /* placeholder for void */
+    uint8_t v133;
+    int64_t v130; /* placeholder for void */
+    void* v66;
+    void* v112;
+    bool v185;
+    int64_t v98;
+    int64_t v26; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    int64_t v158;
+    uint8_t v173;
+    int64_t v215;
+    bool v102;
+    void* v63;
+    bool v198;
+    int64_t v171; /* placeholder for void */
+    int64_t v183;
+    void* v106;
+    bool v141;
+    int64_t v76;
+    int64_t v142;
+    int64_t v227; /* placeholder for void */
+    void* v32;
+    int64_t v207;
+    int64_t v50;
+    bool v195;
+    int64_t v51;
+    int64_t v152; /* placeholder for void */
+    int64_t v153; /* placeholder for void */
+    int64_t v128;
+    bool v78;
+    int64_t v194;
+    int64_t v231; /* placeholder for void */
+    bool v212;
+    int64_t v122;
+    int64_t v167; /* placeholder for void */
+    int64_t v54;
+    int64_t v137;
     v2 = 0LL;
     v3 = (int64_t)String_len((void*)v2, (int64_t)v1);
     v4 = malloc(8);
@@ -4886,3495 +5504,153 @@ int64_t str_parse_hex(void* v0, void* v1) {
     return 0;
 }
 
-bool char_is_lower(void* v0, int64_t v1) {
-    p_call_stack_push("char_is_lower");
-    bool v6;
-    bool v5;
-    int64_t v7; /* placeholder for void */
-    bool v3;
-    int64_t v4;
+int64_t str_len(void* v0, void* v1) {
+    p_call_stack_push("str_len");
+    int64_t v4; /* placeholder for void */
+    int64_t v3;
     int64_t v2;
-    v2 = 97LL;
-    v3 = v1 >= v2;
-    v4 = 122LL;
-    v5 = v1 <= v4;
-    v6 = v3 && v5;
+    v2 = 0LL;
+    v3 = (int64_t)String_len((void*)v2, (int64_t)v1);
     p_call_stack_pop();
-    return v6;
+    return v3;
     return 0;
 }
 
-int64_t p_min(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("min");
-    int64_t v6; /* placeholder for void */
-    int64_t v7; /* placeholder for void */
-    int64_t v5; /* placeholder for void */
-    bool v3;
+void* p_str_from_ptr(void* v0, int64_t v1) {
+    p_call_stack_push("p_str_from_ptr");
+    int64_t v104;
+    int64_t v107;
+    int64_t v68;
+    void* v110;
+    int64_t v99; /* placeholder for void */
+    void* v103;
+    int64_t v101; /* placeholder for void */
+    int64_t v98;
+    int64_t v16; /* placeholder for void */
+    int64_t v105; /* placeholder for void */
+    int64_t v14;
+    int64_t v64;
+    int64_t v86; /* placeholder for void */
+    int64_t v28; /* placeholder for void */
+    int64_t v19; /* placeholder for void */
+    int64_t v18; /* placeholder for void */
+    int64_t v61; /* placeholder for void */
+    bool v36;
+    int64_t v81;
+    void* v93;
+    int64_t v59;
+    int64_t v46;
+    int64_t v82; /* placeholder for void */
+    void* v62;
+    void* v69;
+    void* v6;
+    uint8_t v77;
+    int64_t v63; /* placeholder for void */
+    int64_t v35;
+    void* v56;
+    void* v29;
+    bool v74;
+    void* v78;
+    int64_t v83;
+    int64_t v47; /* placeholder for void */
+    void* v13;
+    int64_t v5;
+    int64_t v2;
+    int64_t v25;
+    void* v31;
+    int64_t v38;
+    int64_t v39;
+    void* v23;
     int64_t v4; /* placeholder for void */
-    v3 = v1 < v2;
+    int64_t v52; /* placeholder for void */
+    int64_t v67; /* placeholder for void */
+    int64_t v70; /* placeholder for void */
+    int64_t v71; /* placeholder for void */
+    int64_t v85;
+    int64_t v9;
+    void* v65;
+    int64_t v66; /* placeholder for void */
+    uint8_t v30;
+    int64_t v89;
+    void* v94;
+    int64_t v90; /* placeholder for void */
+    int64_t v37; /* placeholder for void */
+    int64_t v109; /* placeholder for void */
+    int64_t v106; /* placeholder for void */
+    int64_t v24; /* placeholder for void */
+    void* v10;
+    int64_t v54;
+    int64_t v88;
+    int64_t v32; /* placeholder for void */
+    int64_t v53;
+    int64_t v111; /* placeholder for void */
+    void* v26;
+    int64_t v79; /* placeholder for void */
+    void* v57;
+    int64_t v34;
+    int64_t v22;
+    int64_t v58; /* placeholder for void */
+    int64_t v92; /* placeholder for void */
+    int64_t v44;
+    int64_t v91;
+    int64_t v102; /* placeholder for void */
+    bool v3;
+    int64_t v55;
+    int64_t v51; /* placeholder for void */
+    void* v80;
+    int64_t v84;
+    int64_t v87;
+    void* v108;
+    void* v48;
+    int64_t v21; /* placeholder for void */
+    uint8_t v49;
+    int64_t v45; /* placeholder for void */
+    int64_t v11; /* placeholder for void */
+    int64_t v50; /* placeholder for void */
+    int64_t v42;
+    int64_t v100;
+    int64_t v43;
+    int64_t v41; /* placeholder for void */
+    int64_t v33; /* placeholder for void */
+    int64_t v27; /* placeholder for void */
+    void* v17;
+    int64_t v15; /* placeholder for void */
+    void* v7;
+    int64_t v40;
+    int64_t v73;
+    int64_t v8; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    int64_t v75; /* placeholder for void */
+    void* v76;
+    int64_t v96;
+    void* v60;
+    void* v20;
+    int64_t v72;
+    int64_t v95; /* placeholder for void */
+    int64_t v97;
+    v2 = 0LL;
+    v3 = v1 == v2;
     if (v3) goto bb1;
     else goto bb2;
   bb1:
-    p_call_stack_pop();
-    return v1;
-  bb2:
-    goto bb3;
-  bb3:
-    p_call_stack_pop();
-    return v2;
-    return 0;
-}
-
-int64_t ByteBuffer_len(void* v0, void* v1) {
-    p_call_stack_push("ByteBuffer_len");
-    void* v2;
-    int64_t v3;
-    int64_t v4; /* placeholder for void */
-    v2 = (char*)v1 + 8;
-    v3 = *(int64_t*)v2;
-    p_call_stack_pop();
-    return v3;
-    return 0;
-}
-
-int64_t Vec_pop(void* v0, int64_t v1) {
-    p_call_stack_push("Vec_pop");
-    int64_t v38; /* placeholder for void */
-    void* v39;
-    int64_t v43; /* placeholder for void */
-    int64_t v55;
-    int64_t v46;
-    int64_t v26; /* placeholder for void */
-    int64_t v30;
-    int64_t v28;
-    int64_t v44; /* placeholder for void */
-    void* v10;
-    int64_t v3;
-    int64_t v19; /* placeholder for void */
-    int64_t v2;
-    int64_t v5; /* placeholder for void */
-    bool v16;
-    void* v48;
-    int64_t v13; /* placeholder for void */
-    int64_t v32;
-    int64_t v40; /* placeholder for void */
-    void* v51;
-    int64_t v47;
-    int64_t v18;
-    int64_t v29;
-    int64_t v7; /* placeholder for void */
-    void* v23;
-    void* v21;
-    int64_t v15;
-    int64_t v36;
-    int64_t v11;
-    int64_t v54; /* placeholder for void */
-    int64_t v20; /* placeholder for void */
-    int64_t v9; /* placeholder for void */
-    int64_t v14;
-    int64_t v25; /* placeholder for void */
-    int64_t v17; /* placeholder for void */
-    void* v37;
-    int64_t v49; /* placeholder for void */
-    int64_t v12; /* placeholder for void */
-    int64_t v31;
-    int64_t v42;
-    void* v6;
-    int64_t v24;
-    int64_t v27;
-    int64_t v45;
-    void* v34;
-    int64_t v35; /* placeholder for void */
-    int64_t v22; /* placeholder for void */
-    int64_t v33;
-    int64_t v53; /* placeholder for void */
-    void* v8;
-    int64_t v56; /* placeholder for void */
-    int64_t v52;
-    void* v4;
-    void* v41;
-    int64_t v50; /* placeholder for void */
-    v2 = 8LL;
-    v3 = v1 + v2;
-    v4 = malloc(8);
-    *(void**)v4 = (void*)v3;
-    v6 = malloc(8);
-    *(void**)v6 = (void*)v1;
-    v8 = malloc(8);
-    v10 = *(void**)v4;
-    v11 = *(int64_t*)v10;
-    *(int64_t*)v8 = (int64_t)v11;
-    v14 = *(int64_t*)v8;
-    v15 = 0LL;
-    v16 = v14 == v15;
-    if (v16) goto bb1;
-    else goto bb2;
-  bb1:
-    v18 = 0LL;
-    p_call_stack_pop();
-    return v18;
-  bb2:
-    goto bb3;
-  bb3:
-    v21 = malloc(8);
-    v23 = *(void**)v6;
-    v24 = *(int64_t*)v23;
-    *(int64_t*)v21 = (int64_t)v24;
-    v27 = *(int64_t*)v21;
-    v28 = *(int64_t*)v8;
-    v29 = 1LL;
-    v30 = v28 - v29;
-    v31 = 8LL;
-    v32 = v30 * v31;
-    v33 = v27 + v32;
-    v34 = malloc(8);
-    *(int64_t*)v34 = (int64_t)v33;
-    v36 = *(int64_t*)v34;
-    v37 = malloc(8);
-    *(void**)v37 = (void*)v36;
-    v39 = malloc(8);
-    v41 = *(void**)v37;
-    v42 = *(int64_t*)v41;
-    *(int64_t*)v39 = (int64_t)v42;
-    v45 = *(int64_t*)v8;
-    v46 = 1LL;
-    v47 = v45 - v46;
-    v48 = malloc(8);
-    *(int64_t*)v48 = (int64_t)v47;
-    v51 = *(void**)v4;
-    v52 = *(int64_t*)v48;
-    *(int64_t*)v51 = (int64_t)v52;
-    v55 = *(int64_t*)v39;
-    p_call_stack_pop();
-    return v55;
-    return 0;
-}
-
-int64_t clamp(void* v0, int64_t v1, int64_t v2, int64_t v3) {
-    p_call_stack_push("clamp");
-    int64_t v9; /* placeholder for void */
-    bool v4;
-    int64_t v7; /* placeholder for void */
-    int64_t v11; /* placeholder for void */
-    bool v8;
-    int64_t v5; /* placeholder for void */
-    int64_t v12; /* placeholder for void */
-    int64_t v6; /* placeholder for void */
-    int64_t v10; /* placeholder for void */
-    v4 = v1 < v2;
-    if (v4) goto bb1;
-    else goto bb2;
-  bb1:
-    p_call_stack_pop();
-    return v2;
-  bb2:
-    goto bb3;
-  bb3:
-    v8 = v1 > v3;
-    if (v8) goto bb4;
-    else goto bb5;
-  bb4:
-    p_call_stack_pop();
-    return v3;
-  bb5:
-    goto bb6;
-  bb6:
-    p_call_stack_pop();
-    return v1;
-    return 0;
-}
-
-void* ByteBuffer_to_str(void* v0, void* v1) {
-    p_call_stack_push("ByteBuffer_to_str");
-    int64_t v9;
-    int64_t v30; /* placeholder for void */
-    int64_t v7; /* placeholder for void */
-    void* v15;
-    void* v6;
-    void* v19;
-    int64_t v27;
-    int64_t v5;
-    void* v14;
-    int64_t v20; /* placeholder for void */
-    void* v2;
-    int64_t v16;
-    int64_t v8; /* placeholder for void */
-    int64_t v26;
-    void* v24;
-    int64_t v4; /* placeholder for void */
-    bool v12;
-    void* v31;
-    void* v3;
-    int64_t v11;
-    int64_t v29; /* placeholder for void */
-    void* v10;
-    int64_t v32; /* placeholder for void */
-    int64_t v18;
-    void* v21;
-    int64_t v13; /* placeholder for void */
-    int64_t v22;
-    int64_t v25; /* placeholder for void */
-    int64_t v17;
-    int64_t v28;
-    void* v23;
-    v2 = _str1;
-    v3 = malloc(8);
-    *(void**)v3 = (void*)v2;
-    v5 = 0LL;
-    v6 = malloc(8);
-    *(int64_t*)v6 = (int64_t)v5;
-    goto bb1;
-  bb1:
-    v9 = *(int64_t*)v6;
-    v10 = (char*)v1 + 8;
-    v11 = *(int64_t*)v10;
-    v12 = v9 < v11;
-    if (v12) goto bb2;
-    else goto bb3;
-  bb2:
-    v14 = (char*)v1 + 0;
-    v15 = *(void**)v14;
-    v16 = *(int64_t*)v6;
-    v17 = 0LL;
-    v18 = (int64_t)Vec_get((void*)v17, (int64_t)v15, v16);
-    v19 = malloc(8);
-    *(int64_t*)v19 = (int64_t)v18;
-    v21 = *(void**)v3;
-    v22 = *(int64_t*)v19;
-    v23 = p_char_to_str(v22);
-    v24 = p_str_concat(v21, v23);
-    *(void**)v3 = (void*)v24;
-    v26 = *(int64_t*)v6;
-    v27 = 1LL;
-    v28 = v26 + v27;
-    *(int64_t*)v6 = (int64_t)v28;
-    goto bb1;
-  bb3:
-    v31 = *(void**)v3;
-    p_call_stack_pop();
-    return v31;
-    return 0;
-}
-
-int64_t String_char_at(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("String_char_at");
-    bool v17;
-    int64_t v13;
-    void* v57;
-    int64_t v3;
-    int64_t v39; /* placeholder for void */
-    void* v51;
-    uint8_t v33;
-    int64_t v8; /* placeholder for void */
-    int64_t v52; /* placeholder for void */
-    int64_t v12; /* placeholder for void */
-    int64_t v6;
-    int64_t v30; /* placeholder for void */
-    void* v29;
-    int64_t v34; /* placeholder for void */
-    int64_t v36;
-    int64_t v27; /* placeholder for void */
-    void* v26;
-    void* v23;
-    int64_t v28;
-    int64_t v46; /* placeholder for void */
-    void* v11;
-    bool v4;
-    int64_t v47; /* placeholder for void */
-    int64_t v50;
-    int64_t v10;
-    void* v44;
-    int64_t v5; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    void* v37;
-    int64_t v60; /* placeholder for void */
-    bool v14;
-    int64_t v61;
-    int64_t v20; /* placeholder for void */
-    void* v54;
-    void* v32;
-    int64_t v62; /* placeholder for void */
-    int64_t v24; /* placeholder for void */
-    int64_t v9;
-    int64_t v59; /* placeholder for void */
-    int64_t v7; /* placeholder for void */
-    int64_t v21; /* placeholder for void */
-    int64_t v55; /* placeholder for void */
-    int64_t v42; /* placeholder for void */
-    void* v38;
-    void* v41;
-    int64_t v43; /* placeholder for void */
-    int64_t v48;
-    int64_t v49;
-    int64_t v56; /* placeholder for void */
-    int64_t v35; /* placeholder for void */
-    int64_t v40;
-    int64_t v53;
-    int64_t v45;
-    int64_t v58;
-    int64_t v22;
-    bool v16;
-    int64_t v19;
-    int64_t v15;
-    int64_t v25;
-    int64_t v31; /* placeholder for void */
-    v3 = 0LL;
-    v4 = v1 == v3;
-    if (v4) goto bb1;
-    else goto bb2;
-  bb1:
-    v6 = 0LL;
-    p_call_stack_pop();
-    return v6;
-  bb2:
-    goto bb3;
-  bb3:
-    v9 = 0LL;
-    v10 = (int64_t)p_str_length((void*)v9, v1);
-    v11 = malloc(8);
-    *(int64_t*)v11 = (int64_t)v10;
-    v13 = 0LL;
-    v14 = v2 < v13;
-    v15 = *(int64_t*)v11;
-    v16 = v2 >= v15;
-    v17 = v14 || v16;
-    if (v17) goto bb4;
-    else goto bb5;
-  bb4:
-    v19 = 0LL;
-    p_call_stack_pop();
-    return v19;
-  bb5:
-    goto bb6;
-  bb6:
-    v22 = v1 + v2;
-    v23 = malloc(8);
-    *(int64_t*)v23 = (int64_t)v22;
-    v25 = *(int64_t*)v23;
-    v26 = malloc(8);
-    *(void**)v26 = (void*)v25;
-    v28 = 0LL;
-    v29 = malloc(8);
-    *(int64_t*)v29 = (int64_t)v28;
-    v32 = *(void**)v26;
-    v33 = *(uint8_t*)v32;
-    *(int64_t*)v29 = (int64_t)v33;
-    v36 = 2LL;
-    v37 = p_malloc(v36);
-    v38 = malloc(8);
-    *(int64_t*)v38 = (int64_t)v37;
-    v40 = *(int64_t*)v38;
-    v41 = malloc(8);
-    *(void**)v41 = (void*)v40;
-    v44 = *(void**)v41;
-    v45 = *(int64_t*)v29;
-    *(uint8_t*)v44 = (uint8_t)v45;
-    v48 = *(int64_t*)v38;
-    v49 = 1LL;
-    v50 = v48 + v49;
-    v51 = malloc(8);
-    *(int64_t*)v51 = (int64_t)v50;
-    v53 = *(int64_t*)v51;
-    v54 = malloc(8);
-    *(void**)v54 = (void*)v53;
-    v57 = *(void**)v54;
-    v58 = 0LL;
-    *(uint8_t*)v57 = (uint8_t)v58;
-    v61 = *(int64_t*)v38;
-    p_call_stack_pop();
-    return v61;
-    return 0;
-}
-
-bool Vec_is_empty(void* v0, int64_t v1) {
-    p_call_stack_push("Vec_is_empty");
-    int64_t v9;
-    void* v8;
-    int64_t v11; /* placeholder for void */
-    bool v14;
-    int64_t v13;
-    int64_t v3;
-    int64_t v15; /* placeholder for void */
-    void* v6;
-    int64_t v12;
-    void* v4;
-    int64_t v7; /* placeholder for void */
-    int64_t v10; /* placeholder for void */
-    int64_t v5; /* placeholder for void */
-    int64_t v2;
-    v2 = 8LL;
-    v3 = v1 + v2;
-    v4 = malloc(8);
-    *(void**)v4 = (void*)v3;
-    v6 = malloc(8);
-    v8 = *(void**)v4;
-    v9 = *(int64_t*)v8;
-    *(int64_t*)v6 = (int64_t)v9;
-    v12 = *(int64_t*)v6;
-    v13 = 0LL;
-    v14 = v12 == v13;
-    p_call_stack_pop();
-    return v14;
-    return 0;
-}
-
-int64_t Result_unwrap_or(void* v0, void* v1, int64_t v2) {
-    p_call_stack_push("Result_unwrap_or");
-    int64_t v20;
-    int64_t v21; /* placeholder for void */
-    int64_t v15; /* placeholder for void */
-    int64_t v17;
-    int64_t v4;
-    int64_t v19; /* placeholder for void */
-    int64_t v10; /* placeholder for void */
-    bool v14;
-    int64_t v12;
-    bool v6;
-    void* v11;
-    int64_t v13;
-    int64_t v7; /* placeholder for void */
-    int64_t v5;
-    int64_t v9;
-    int64_t v18; /* placeholder for void */
-    void* v8;
-    void* v16;
-    void* v3;
-    v3 = (char*)v1 + 0;
-    v4 = *(int64_t*)v3;
-    v5 = 0LL;
-    v6 = v4 == v5;
-    if (v6) goto bb2;
-    else goto bb3;
-  bb1:
-    v20 = 0LL;
-    p_call_stack_pop();
-    return v20;
-  bb2:
-    v8 = (char*)v1 + 8;
-    v9 = *(int64_t*)v8;
-    p_call_stack_pop();
-    return v9;
-  bb3:
-    v11 = (char*)v1 + 0;
-    v12 = *(int64_t*)v11;
-    v13 = 1LL;
-    v14 = v12 == v13;
-    if (v14) goto bb4;
-    else goto bb5;
-  bb4:
-    v16 = (char*)v1 + 8;
-    v17 = *(int64_t*)v16;
-    p_call_stack_pop();
-    return v2;
-  bb5:
-    goto bb1;
-    return 0;
-}
-
-bool Result_is_ok(void* v0, void* v1) {
-    p_call_stack_push("Result_is_ok");
-    int64_t v15; /* placeholder for void */
-    void* v16;
-    int64_t v19; /* placeholder for void */
-    void* v2;
-    int64_t v3;
-    bool v9;
-    int64_t v17;
-    int64_t v13;
-    int64_t v20; /* placeholder for void */
-    bool v21;
-    int64_t v10; /* placeholder for void */
-    int64_t v6; /* placeholder for void */
-    bool v5;
-    int64_t v4;
-    int64_t v8;
-    void* v7;
-    void* v11;
-    int64_t v12;
-    bool v14;
-    bool v18;
-    int64_t v22; /* placeholder for void */
-    v2 = (char*)v1 + 0;
-    v3 = *(int64_t*)v2;
-    v4 = 0LL;
-    v5 = v3 == v4;
-    if (v5) goto bb2;
-    else goto bb3;
-  bb1:
-    v21 = false;
-    p_call_stack_pop();
-    return v21;
-  bb2:
-    v7 = (char*)v1 + 8;
-    v8 = *(int64_t*)v7;
-    v9 = true;
-    p_call_stack_pop();
-    return v9;
-  bb3:
-    v11 = (char*)v1 + 0;
-    v12 = *(int64_t*)v11;
-    v13 = 1LL;
-    v14 = v12 == v13;
-    if (v14) goto bb4;
-    else goto bb5;
-  bb4:
-    v16 = (char*)v1 + 8;
-    v17 = *(int64_t*)v16;
-    v18 = false;
-    p_call_stack_pop();
-    return v18;
-  bb5:
-    goto bb1;
-    return 0;
-}
-
-int64_t Vec_clone(void* v0, int64_t v1) {
-    p_call_stack_push("Vec_clone");
-    int64_t v15; /* placeholder for void */
-    int64_t v55;
-    int64_t v29;
-    int64_t v51;
-    int64_t v48; /* placeholder for void */
-    void* v40;
-    int64_t v18; /* placeholder for void */
-    int64_t v38; /* placeholder for void */
-    int64_t v21;
-    int64_t v17;
-    void* v25;
-    int64_t v36;
-    int64_t v58; /* placeholder for void */
-    void* v8;
-    void* v37;
-    int64_t v19; /* placeholder for void */
-    void* v43;
-    int64_t v12; /* placeholder for void */
-    int64_t v35;
-    int64_t v44; /* placeholder for void */
-    void* v16;
-    int64_t v53; /* placeholder for void */
-    int64_t v54;
-    int64_t v50;
-    int64_t v3;
-    int64_t v41; /* placeholder for void */
-    int64_t v42;
-    int64_t v57; /* placeholder for void */
-    int64_t v13; /* placeholder for void */
-    int64_t v32;
-    int64_t v5; /* placeholder for void */
-    int64_t v27; /* placeholder for void */
-    int64_t v31; /* placeholder for void */
-    void* v6;
-    int64_t v59;
-    int64_t v52;
-    int64_t v23; /* placeholder for void */
-    int64_t v34;
-    void* v4;
-    int64_t v39;
-    int64_t v47;
-    int64_t v49; /* placeholder for void */
-    int64_t v28;
-    int64_t v56;
-    int64_t v9; /* placeholder for void */
-    int64_t v26; /* placeholder for void */
-    int64_t v45; /* placeholder for void */
-    int64_t v24;
-    void* v22;
-    bool v30;
-    int64_t v11;
-    int64_t v20;
-    int64_t v60; /* placeholder for void */
-    int64_t v7; /* placeholder for void */
-    void* v46;
-    void* v10;
-    void* v14;
-    int64_t v33;
-    int64_t v2;
-    v2 = 8LL;
-    v3 = v1 + v2;
-    v4 = malloc(8);
-    *(void**)v4 = (void*)v3;
-    v6 = malloc(8);
-    *(void**)v6 = (void*)v1;
-    v8 = malloc(8);
-    v10 = *(void**)v4;
-    v11 = *(int64_t*)v10;
-    *(int64_t*)v8 = (int64_t)v11;
-    v14 = malloc(8);
-    v16 = *(void**)v6;
-    v17 = *(int64_t*)v16;
-    *(int64_t*)v14 = (int64_t)v17;
-    v20 = 0LL;
-    v21 = (int64_t)Vec_new((void*)v20);
-    v22 = malloc(8);
-    *(int64_t*)v22 = (int64_t)v21;
-    v24 = 0LL;
-    v25 = malloc(8);
-    *(int64_t*)v25 = (int64_t)v24;
-    goto bb1;
-  bb1:
-    v28 = *(int64_t*)v25;
-    v29 = *(int64_t*)v8;
-    v30 = v28 < v29;
-    if (v30) goto bb2;
-    else goto bb3;
-  bb2:
-    v32 = *(int64_t*)v14;
-    v33 = *(int64_t*)v25;
-    v34 = 8LL;
-    v35 = v33 * v34;
-    v36 = v32 + v35;
-    v37 = malloc(8);
-    *(int64_t*)v37 = (int64_t)v36;
-    v39 = *(int64_t*)v37;
-    v40 = malloc(8);
-    *(void**)v40 = (void*)v39;
-    v42 = 0LL;
-    v43 = malloc(8);
-    *(int64_t*)v43 = (int64_t)v42;
-    v46 = *(void**)v40;
-    v47 = *(int64_t*)v46;
-    *(int64_t*)v43 = (int64_t)v47;
-    v50 = *(int64_t*)v22;
-    v51 = *(int64_t*)v43;
-    v52 = 0LL;
-    Vec_push((void*)v52, v50, v51);
-    v54 = *(int64_t*)v25;
-    v55 = 1LL;
-    v56 = v54 + v55;
-    *(int64_t*)v25 = (int64_t)v56;
-    goto bb1;
-  bb3:
-    v59 = *(int64_t*)v22;
-    p_call_stack_pop();
-    return v59;
-    return 0;
-}
-
-bool HashMap_is_empty(void* v0, int64_t v1) {
-    p_call_stack_push("HashMap_is_empty");
-    bool v16;
-    void* v7;
-    void* v4;
-    int64_t v6;
-    int64_t v15;
-    int64_t v2;
-    int64_t v3;
-    void* v10;
-    int64_t v8; /* placeholder for void */
-    int64_t v17; /* placeholder for void */
-    int64_t v13; /* placeholder for void */
-    int64_t v14;
-    int64_t v9; /* placeholder for void */
-    int64_t v11;
-    int64_t v12; /* placeholder for void */
-    int64_t v5; /* placeholder for void */
-    v2 = 16LL;
-    v3 = v1 + v2;
-    v4 = malloc(8);
-    *(void**)v4 = (void*)v3;
-    v6 = 0LL;
+    v5 = 1LL;
+    v6 = p_malloc(v5);
     v7 = malloc(8);
     *(int64_t*)v7 = (int64_t)v6;
-    v10 = *(void**)v4;
-    v11 = *(int64_t*)v10;
-    *(int64_t*)v7 = (int64_t)v11;
-    v14 = *(int64_t*)v7;
-    v15 = 0LL;
-    v16 = v14 == v15;
-    p_call_stack_pop();
-    return v16;
-    return 0;
-}
-
-int64_t HashMap_find_slot(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("HashMap_find_slot");
-    int64_t v42;
-    int64_t v59; /* placeholder for void */
-    int64_t v76;
-    int64_t v52; /* placeholder for void */
-    int64_t v97; /* placeholder for void */
-    int64_t v89; /* placeholder for void */
-    int64_t v108;
-    int64_t v70; /* placeholder for void */
-    int64_t v106; /* placeholder for void */
-    int64_t v45;
-    int64_t v94;
-    int64_t v102; /* placeholder for void */
-    int64_t v75;
-    int64_t v3;
-    int64_t v20; /* placeholder for void */
-    int64_t v27; /* placeholder for void */
-    int64_t v9;
-    int64_t v33;
-    int64_t v57;
-    int64_t v35; /* placeholder for void */
-    int64_t v30; /* placeholder for void */
-    int64_t v84; /* placeholder for void */
-    bool v19;
-    int64_t v22; /* placeholder for void */
-    int64_t v100;
-    int64_t v56;
-    int64_t v95; /* placeholder for void */
-    int64_t v17;
-    void* v10;
-    int64_t v71;
-    void* v58;
-    void* v46;
-    int64_t v121;
-    int64_t v124;
-    int64_t v130; /* placeholder for void */
-    int64_t v116; /* placeholder for void */
-    void* v13;
-    int64_t v54;
-    int64_t v99;
-    bool v101;
-    int64_t v118; /* placeholder for void */
-    int64_t v111;
-    int64_t v14;
-    void* v34;
-    int64_t v62; /* placeholder for void */
-    int64_t v63;
-    bool v77;
-    int64_t v93; /* placeholder for void */
-    bool v88;
-    int64_t v96; /* placeholder for void */
-    int64_t v117; /* placeholder for void */
-    int64_t v38;
-    int64_t v80; /* placeholder for void */
-    int64_t v53;
-    int64_t v114; /* placeholder for void */
-    int64_t v40; /* placeholder for void */
-    void* v5;
-    int64_t v21;
-    int64_t v15; /* placeholder for void */
-    int64_t v60;
-    int64_t v98; /* placeholder for void */
-    void* v67;
-    int64_t v91;
-    void* v61;
-    int64_t v85;
-    int64_t v65; /* placeholder for void */
-    void* v7;
-    int64_t v123; /* placeholder for void */
-    int64_t v119;
-    int64_t v110; /* placeholder for void */
-    int64_t v23; /* placeholder for void */
-    int64_t v78; /* placeholder for void */
-    int64_t v109;
-    int64_t v105; /* placeholder for void */
-    int64_t v32;
-    int64_t v68;
-    int64_t v11; /* placeholder for void */
-    int64_t v29;
-    int64_t v81; /* placeholder for void */
-    int64_t v47; /* placeholder for void */
-    int64_t v6; /* placeholder for void */
-    int64_t v112;
-    int64_t v8; /* placeholder for void */
-    int64_t v132; /* placeholder for void */
-    int64_t v79;
-    void* v64;
-    int64_t v55;
-    int64_t v128;
-    int64_t v129; /* placeholder for void */
-    int64_t v82;
-    int64_t v18;
-    int64_t v127; /* placeholder for void */
-    int64_t v90;
-    int64_t v36;
-    int64_t v115;
-    int64_t v4;
-    int64_t v31; /* placeholder for void */
-    int64_t v72;
-    int64_t v50;
-    int64_t v125;
-    int64_t v12; /* placeholder for void */
-    void* v28;
-    void* v43;
-    int64_t v83; /* placeholder for void */
-    int64_t v16; /* placeholder for void */
-    int64_t v41;
-    int64_t v122; /* placeholder for void */
-    bool v92;
-    int64_t v37;
-    bool v51;
-    int64_t v131;
-    int64_t v104; /* placeholder for void */
-    int64_t v74; /* placeholder for void */
-    int64_t v66; /* placeholder for void */
-    int64_t v120;
-    int64_t v24;
-    int64_t v69; /* placeholder for void */
-    int64_t v87;
-    int64_t v44; /* placeholder for void */
-    int64_t v107;
-    void* v25;
-    bool v73;
-    int64_t v26; /* placeholder for void */
-    bool v126;
-    void* v39;
-    bool v113;
-    int64_t v48; /* placeholder for void */
-    int64_t v86;
-    int64_t v103;
-    int64_t v49;
-    v3 = 24LL;
-    v4 = v1 + v3;
-    v5 = malloc(8);
-    *(void**)v5 = (void*)v4;
-    v7 = malloc(8);
-    *(void**)v7 = (void*)v1;
-    v9 = 0LL;
+    v9 = *(int64_t*)v7;
     v10 = malloc(8);
-    *(int64_t*)v10 = (int64_t)v9;
-    v13 = *(void**)v5;
-    v14 = *(int64_t*)v13;
-    *(int64_t*)v10 = (int64_t)v14;
-    v17 = *(int64_t*)v10;
-    v18 = 0LL;
-    v19 = v17 == v18;
-    if (v19) goto bb1;
-    else goto bb2;
-  bb1:
-    v21 = 0LL;
+    *(void**)v10 = (void*)v9;
+    v13 = *(void**)v10;
+    v14 = 0LL;
+    *(uint8_t*)v13 = (uint8_t)v14;
+    v17 = *(void**)v10;
     p_call_stack_pop();
-    return v21;
+    return v17;
   bb2:
     goto bb3;
   bb3:
-    v24 = 0LL;
-    v25 = malloc(8);
-    *(int64_t*)v25 = (int64_t)v24;
-    v28 = *(void**)v7;
-    v29 = *(int64_t*)v28;
-    *(int64_t*)v25 = (int64_t)v29;
-    v32 = 0LL;
-    v33 = (int64_t)p_str_hash((void*)v32, v2);
-    v34 = malloc(8);
-    *(int64_t*)v34 = (int64_t)v33;
-    v36 = *(int64_t*)v34;
-    v37 = *(int64_t*)v10;
-    v38 = v36 % v37;
-    v39 = malloc(8);
-    *(int64_t*)v39 = (int64_t)v38;
-    v41 = 1LL;
-    v42 = -v41;
-    v43 = malloc(8);
-    *(int64_t*)v43 = (int64_t)v42;
-    v45 = 0LL;
-    v46 = malloc(8);
-    *(int64_t*)v46 = (int64_t)v45;
-    goto bb4;
-  bb4:
-    v49 = *(int64_t*)v46;
-    v50 = *(int64_t*)v10;
-    v51 = v49 < v50;
-    if (v51) goto bb5;
-    else goto bb6;
-  bb5:
-    v53 = *(int64_t*)v25;
-    v54 = *(int64_t*)v39;
-    v55 = 8LL;
-    v56 = v54 * v55;
-    v57 = v53 + v56;
-    v58 = malloc(8);
-    *(int64_t*)v58 = (int64_t)v57;
-    v60 = *(int64_t*)v58;
-    v61 = malloc(8);
-    *(void**)v61 = (void*)v60;
-    v63 = 0LL;
-    v64 = malloc(8);
-    *(int64_t*)v64 = (int64_t)v63;
-    v67 = *(void**)v61;
-    v68 = *(int64_t*)v67;
-    *(int64_t*)v64 = (int64_t)v68;
-    v71 = *(int64_t*)v64;
-    v72 = 0LL;
-    v73 = v71 == v72;
-    if (v73) goto bb7;
-    else goto bb8;
-  bb6:
-    v124 = *(int64_t*)v43;
-    v125 = 0LL;
-    v126 = v124 >= v125;
-    if (v126) goto bb25;
-    else goto bb26;
-  bb7:
-    v75 = *(int64_t*)v43;
-    v76 = 0LL;
-    v77 = v75 >= v76;
-    if (v77) goto bb10;
-    else goto bb11;
-  bb8:
-    goto bb9;
-  bb9:
-    v85 = *(int64_t*)v64;
-    v86 = 1LL;
-    v87 = -v86;
-    v88 = v85 == v87;
-    if (v88) goto bb13;
-    else goto bb14;
-  bb10:
-    v79 = *(int64_t*)v43;
-    p_call_stack_pop();
-    return v79;
-  bb11:
-    goto bb12;
-  bb12:
-    v82 = *(int64_t*)v39;
-    p_call_stack_pop();
-    return v82;
-  bb13:
-    v90 = *(int64_t*)v43;
-    v91 = 0LL;
-    v92 = v90 < v91;
-    if (v92) goto bb16;
-    else goto bb17;
-  bb14:
-    v99 = *(int64_t*)v64;
-    v100 = 0LL;
-    v101 = (bool)p_str_equal((void*)v100, v99, v2);
-    if (v101) goto bb19;
-    else goto bb20;
-  bb15:
-    v107 = *(int64_t*)v39;
-    v108 = 1LL;
-    v109 = v107 + v108;
-    *(int64_t*)v39 = (int64_t)v109;
-    v111 = *(int64_t*)v39;
-    v112 = *(int64_t*)v10;
-    v113 = v111 >= v112;
-    if (v113) goto bb22;
-    else goto bb23;
-  bb16:
-    v94 = *(int64_t*)v39;
-    *(int64_t*)v43 = (int64_t)v94;
-    goto bb18;
-  bb17:
-    goto bb18;
-  bb18:
-    goto bb15;
-  bb19:
-    v103 = *(int64_t*)v39;
-    p_call_stack_pop();
-    return v103;
-  bb20:
-    goto bb21;
-  bb21:
-    goto bb15;
-  bb22:
-    v115 = 0LL;
-    *(int64_t*)v39 = (int64_t)v115;
-    goto bb24;
-  bb23:
-    goto bb24;
-  bb24:
-    v119 = *(int64_t*)v46;
-    v120 = 1LL;
-    v121 = v119 + v120;
-    *(int64_t*)v46 = (int64_t)v121;
-    goto bb4;
-  bb25:
-    v128 = *(int64_t*)v43;
-    p_call_stack_pop();
-    return v128;
-  bb26:
-    goto bb27;
-  bb27:
-    v131 = 0LL;
-    p_call_stack_pop();
-    return v131;
-    return 0;
-}
-
-bool String_contains(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("String_contains");
-    int64_t v90; /* placeholder for void */
-    int64_t v13;
-    bool v29;
-    void* v35;
-    int64_t v83; /* placeholder for void */
-    int64_t v37; /* placeholder for void */
-    int64_t v84; /* placeholder for void */
-    int64_t v21;
-    bool v87;
-    int64_t v51;
-    int64_t v5;
-    int64_t v27;
-    int64_t v73; /* placeholder for void */
-    int64_t v12;
-    int64_t v20;
-    int64_t v25; /* placeholder for void */
-    int64_t v26; /* placeholder for void */
-    int64_t v71;
-    int64_t v77; /* placeholder for void */
-    int64_t v85;
-    bool v89;
-    int64_t v99; /* placeholder for void */
-    int64_t v107; /* placeholder for void */
-    int64_t v34;
-    int64_t v23; /* placeholder for void */
-    bool v53;
-    bool v98;
-    int64_t v76; /* placeholder for void */
-    int64_t v104;
-    int64_t v65;
-    int64_t v36; /* placeholder for void */
-    int64_t v28;
-    int64_t v16;
-    bool v42;
-    int64_t v40;
-    int64_t v56;
-    int64_t v57;
-    int64_t v74;
-    bool v4;
-    int64_t v49; /* placeholder for void */
-    void* v78;
-    int64_t v96; /* placeholder for void */
-    int64_t v55;
-    bool v9;
-    int64_t v3;
-    int64_t v15; /* placeholder for void */
-    int64_t v39;
-    int64_t v50; /* placeholder for void */
-    int64_t v60; /* placeholder for void */
-    uint8_t v79;
-    int64_t v17;
-    int64_t v97; /* placeholder for void */
-    int64_t v101; /* placeholder for void */
-    bool v22;
-    void* v63;
-    int64_t v61;
-    int64_t v58;
-    void* v45;
-    int64_t v32; /* placeholder for void */
-    uint8_t v82;
-    int64_t v43; /* placeholder for void */
-    int64_t v70; /* placeholder for void */
-    int64_t v91; /* placeholder for void */
-    int64_t v92; /* placeholder for void */
-    int64_t v11; /* placeholder for void */
-    int64_t v54; /* placeholder for void */
-    bool v44;
-    int64_t v52;
-    int64_t v30; /* placeholder for void */
-    int64_t v8; /* placeholder for void */
-    void* v59;
-    void* v48;
-    int64_t v47;
-    void* v66;
-    void* v69;
-    void* v72;
-    int64_t v80; /* placeholder for void */
-    int64_t v94;
-    int64_t v102; /* placeholder for void */
-    bool v7;
-    void* v81;
-    bool v108;
-    bool v24;
-    bool v6;
-    int64_t v93;
-    int64_t v64; /* placeholder for void */
-    int64_t v106; /* placeholder for void */
-    void* v14;
-    int64_t v86;
-    bool v100;
-    int64_t v105;
-    int64_t v19; /* placeholder for void */
-    int64_t v67; /* placeholder for void */
-    int64_t v103;
-    bool v31;
-    int64_t v68;
-    int64_t v109; /* placeholder for void */
-    int64_t v10; /* placeholder for void */
-    int64_t v38;
-    int64_t v33; /* placeholder for void */
-    int64_t v41;
-    int64_t v46; /* placeholder for void */
-    int64_t v62;
-    void* v18;
-    int64_t v88; /* placeholder for void */
-    int64_t v95;
-    void* v75;
-    v3 = 0LL;
-    v4 = v1 == v3;
-    v5 = 0LL;
-    v6 = v2 == v5;
-    v7 = v4 || v6;
-    if (v7) goto bb1;
-    else goto bb2;
-  bb1:
-    v9 = false;
-    p_call_stack_pop();
-    return v9;
-  bb2:
-    goto bb3;
-  bb3:
-    v12 = 0LL;
-    v13 = (int64_t)p_str_length((void*)v12, v1);
-    v14 = malloc(8);
-    *(int64_t*)v14 = (int64_t)v13;
-    v16 = 0LL;
-    v17 = (int64_t)p_str_length((void*)v16, v2);
-    v18 = malloc(8);
-    *(int64_t*)v18 = (int64_t)v17;
-    v20 = *(int64_t*)v18;
-    v21 = 0LL;
-    v22 = v20 == v21;
-    if (v22) goto bb4;
-    else goto bb5;
-  bb4:
-    v24 = true;
-    p_call_stack_pop();
-    return v24;
-  bb5:
-    goto bb6;
-  bb6:
-    v27 = *(int64_t*)v18;
-    v28 = *(int64_t*)v14;
-    v29 = v27 > v28;
-    if (v29) goto bb7;
-    else goto bb8;
-  bb7:
-    v31 = false;
-    p_call_stack_pop();
-    return v31;
-  bb8:
-    goto bb9;
-  bb9:
-    v34 = 0LL;
-    v35 = malloc(8);
-    *(int64_t*)v35 = (int64_t)v34;
-    goto bb10;
-  bb10:
-    v38 = *(int64_t*)v35;
-    v39 = *(int64_t*)v14;
-    v40 = *(int64_t*)v18;
-    v41 = v39 - v40;
-    v42 = v38 <= v41;
-    if (v42) goto bb11;
-    else goto bb12;
-  bb11:
-    v44 = true;
-    v45 = malloc(1);
-    *(bool*)v45 = v44;
-    v47 = 0LL;
-    v48 = malloc(8);
-    *(int64_t*)v48 = (int64_t)v47;
-    goto bb13;
-  bb12:
-    v108 = false;
-    p_call_stack_pop();
-    return v108;
-  bb13:
-    v51 = *(int64_t*)v48;
-    v52 = *(int64_t*)v18;
-    v53 = v51 < v52;
-    if (v53) goto bb14;
-    else goto bb15;
-  bb14:
-    v55 = *(int64_t*)v35;
-    v56 = v1 + v55;
-    v57 = *(int64_t*)v48;
-    v58 = v56 + v57;
-    v59 = malloc(8);
-    *(int64_t*)v59 = (int64_t)v58;
-    v61 = *(int64_t*)v48;
-    v62 = v2 + v61;
-    v63 = malloc(8);
-    *(int64_t*)v63 = (int64_t)v62;
-    v65 = *(int64_t*)v59;
-    v66 = malloc(8);
-    *(void**)v66 = (void*)v65;
-    v68 = *(int64_t*)v63;
-    v69 = malloc(8);
-    *(void**)v69 = (void*)v68;
-    v71 = 0LL;
-    v72 = malloc(8);
-    *(int64_t*)v72 = (int64_t)v71;
-    v74 = 0LL;
-    v75 = malloc(8);
-    *(int64_t*)v75 = (int64_t)v74;
-    v78 = *(void**)v66;
-    v79 = *(uint8_t*)v78;
-    *(int64_t*)v72 = (int64_t)v79;
-    v81 = *(void**)v69;
-    v82 = *(uint8_t*)v81;
-    *(int64_t*)v75 = (int64_t)v82;
-    v85 = *(int64_t*)v72;
-    v86 = *(int64_t*)v75;
-    v87 = v85 != v86;
-    if (v87) goto bb16;
-    else goto bb17;
-  bb15:
-    v98 = *(bool*)v45;
-    if (v98) goto bb19;
-    else goto bb20;
-  bb16:
-    v89 = false;
-    *(bool*)v45 = v89;
-    goto bb15;
-  bb17:
-    goto bb18;
-  bb18:
-    v93 = *(int64_t*)v48;
-    v94 = 1LL;
-    v95 = v93 + v94;
-    *(int64_t*)v48 = (int64_t)v95;
-    goto bb13;
-  bb19:
-    v100 = true;
-    p_call_stack_pop();
-    return v100;
-  bb20:
-    goto bb21;
-  bb21:
-    v103 = *(int64_t*)v35;
-    v104 = 1LL;
-    v105 = v103 + v104;
-    *(int64_t*)v35 = (int64_t)v105;
-    goto bb10;
-    return 0;
-}
-
-int64_t char_to_lower(void* v0, int64_t v1) {
-    p_call_stack_push("char_to_lower");
-    int64_t v4;
-    int64_t v7; /* placeholder for void */
-    int64_t v11; /* placeholder for void */
-    bool v3;
-    bool v5;
-    int64_t v9;
-    int64_t v8;
-    int64_t v2;
-    int64_t v10; /* placeholder for void */
-    int64_t v12; /* placeholder for void */
-    bool v6;
-    v2 = 65LL;
-    v3 = v1 >= v2;
-    v4 = 90LL;
-    v5 = v1 <= v4;
-    v6 = v3 && v5;
-    if (v6) goto bb1;
-    else goto bb2;
-  bb1:
-    v8 = 32LL;
-    v9 = v1 + v8;
-    p_call_stack_pop();
-    return v9;
-  bb2:
-    goto bb3;
-  bb3:
-    p_call_stack_pop();
-    return v1;
-    return 0;
-}
-
-bool char_is_digit(void* v0, int64_t v1) {
-    p_call_stack_push("char_is_digit");
-    bool v5;
-    int64_t v2;
-    bool v3;
-    int64_t v4;
-    int64_t v7; /* placeholder for void */
-    bool v6;
-    v2 = 48LL;
-    v3 = v1 >= v2;
-    v4 = 57LL;
-    v5 = v1 <= v4;
-    v6 = v3 && v5;
-    p_call_stack_pop();
-    return v6;
-    return 0;
-}
-
-void ByteBuffer_set_byte(void* v0, void* v1, int64_t v2, int64_t v3) {
-    p_call_stack_push("ByteBuffer_set_byte");
-    void* v6;
-    int64_t v12; /* placeholder for void */
-    void* v14;
-    bool v9;
-    int64_t v15;
-    int64_t v17; /* placeholder for void */
-    bool v5;
-    void* v13;
-    int64_t v11; /* placeholder for void */
-    int64_t v4;
-    int64_t v7;
-    bool v8;
-    int64_t v16; /* placeholder for void */
-    int64_t v10; /* placeholder for void */
-    v4 = 0LL;
-    v5 = v2 < v4;
-    v6 = (char*)v1 + 8;
-    v7 = *(int64_t*)v6;
-    v8 = v2 >= v7;
-    v9 = v5 || v8;
-    if (v9) goto bb1;
-    else goto bb2;
-  bb1:
-    p_call_stack_pop();
-    return;
-  bb2:
-    goto bb3;
-  bb3:
-    v13 = (char*)v1 + 0;
-    v14 = *(void**)v13;
-    v15 = 0LL;
-    Vec_set((void*)v15, (int64_t)v14, v2, v3);
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-int64_t String_rfind(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("String_rfind");
-    int64_t v90; /* placeholder for void */
-    bool v23;
-    int64_t v40; /* placeholder for void */
-    int64_t v8; /* placeholder for void */
-    int64_t v82; /* placeholder for void */
-    int64_t v58;
-    bool v91;
-    int64_t v42;
-    int64_t v22;
-    int64_t v35; /* placeholder for void */
-    int64_t v87;
-    int64_t v106;
-    void* v68;
-    int64_t v78; /* placeholder for void */
-    int64_t v107;
-    int64_t v54;
-    bool v6;
-    uint8_t v81;
-    bool v7;
-    int64_t v97;
-    int64_t v105;
-    int64_t v16; /* placeholder for void */
-    int64_t v26; /* placeholder for void */
-    int64_t v75; /* placeholder for void */
-    int64_t v18;
-    int64_t v24; /* placeholder for void */
-    int64_t v14;
-    int64_t v41; /* placeholder for void */
-    bool v100;
-    int64_t v67;
-    int64_t v72; /* placeholder for void */
-    int64_t v102;
-    void* v47;
-    void* v74;
-    uint8_t v84;
-    int64_t v108; /* placeholder for void */
-    int64_t v9;
-    void* v19;
-    bool v30;
-    int64_t v51; /* placeholder for void */
-    int64_t v13;
-    int64_t v28;
-    int64_t v63;
-    void* v77;
-    int64_t v17;
-    int64_t v62; /* placeholder for void */
-    void* v15;
-    int64_t v37;
-    int64_t v103; /* placeholder for void */
-    int64_t v36;
-    int64_t v38;
-    bool v89;
-    int64_t v101; /* placeholder for void */
-    int64_t v11; /* placeholder for void */
-    int64_t v79; /* placeholder for void */
-    int64_t v85; /* placeholder for void */
-    bool v55;
-    int64_t v48; /* placeholder for void */
-    int64_t v66; /* placeholder for void */
-    int64_t v49;
-    int64_t v60;
-    int64_t v59;
-    int64_t v27; /* placeholder for void */
-    int64_t v12; /* placeholder for void */
-    void* v39;
-    int64_t v93; /* placeholder for void */
-    void* v50;
-    int64_t v29;
-    int64_t v99; /* placeholder for void */
-    bool v44;
-    int64_t v21;
-    int64_t v64;
-    int64_t v33;
-    int64_t v110;
-    int64_t v10;
-    int64_t v69; /* placeholder for void */
-    void* v71;
-    int64_t v88;
-    int64_t v98; /* placeholder for void */
-    int64_t v43;
-    int64_t v109; /* placeholder for void */
-    int64_t v5;
-    int64_t v94; /* placeholder for void */
-    int64_t v56; /* placeholder for void */
-    int64_t v111;
-    bool v4;
-    void* v65;
-    int64_t v3;
-    int64_t v95;
-    bool v46;
-    int64_t v96;
-    int64_t v53;
-    void* v80;
-    int64_t v45; /* placeholder for void */
-    int64_t v86; /* placeholder for void */
-    int64_t v92; /* placeholder for void */
-    void* v61;
-    int64_t v20; /* placeholder for void */
-    int64_t v73;
-    int64_t v32;
-    int64_t v70;
-    int64_t v34; /* placeholder for void */
-    int64_t v104; /* placeholder for void */
-    int64_t v25;
-    int64_t v31; /* placeholder for void */
-    int64_t v112; /* placeholder for void */
-    int64_t v76;
-    int64_t v57;
-    int64_t v52; /* placeholder for void */
-    void* v83;
-    v3 = 0LL;
-    v4 = v1 == v3;
-    v5 = 0LL;
-    v6 = v2 == v5;
-    v7 = v4 || v6;
-    if (v7) goto bb1;
-    else goto bb2;
-  bb1:
-    v9 = 1LL;
-    v10 = -v9;
-    p_call_stack_pop();
-    return v10;
-  bb2:
-    goto bb3;
-  bb3:
-    v13 = 0LL;
-    v14 = (int64_t)p_str_length((void*)v13, v1);
-    v15 = malloc(8);
-    *(int64_t*)v15 = (int64_t)v14;
-    v17 = 0LL;
-    v18 = (int64_t)p_str_length((void*)v17, v2);
-    v19 = malloc(8);
-    *(int64_t*)v19 = (int64_t)v18;
-    v21 = *(int64_t*)v19;
-    v22 = 0LL;
-    v23 = v21 == v22;
-    if (v23) goto bb4;
-    else goto bb5;
-  bb4:
-    v25 = *(int64_t*)v15;
-    p_call_stack_pop();
-    return v25;
-  bb5:
-    goto bb6;
-  bb6:
-    v28 = *(int64_t*)v19;
-    v29 = *(int64_t*)v15;
-    v30 = v28 > v29;
-    if (v30) goto bb7;
-    else goto bb8;
-  bb7:
-    v32 = 1LL;
-    v33 = -v32;
-    p_call_stack_pop();
-    return v33;
-  bb8:
-    goto bb9;
-  bb9:
-    v36 = *(int64_t*)v15;
-    v37 = *(int64_t*)v19;
-    v38 = v36 - v37;
-    v39 = malloc(8);
-    *(int64_t*)v39 = (int64_t)v38;
-    goto bb10;
-  bb10:
-    v42 = *(int64_t*)v39;
-    v43 = 0LL;
-    v44 = v42 >= v43;
-    if (v44) goto bb11;
-    else goto bb12;
-  bb11:
-    v46 = true;
-    v47 = malloc(1);
-    *(bool*)v47 = v46;
-    v49 = 0LL;
-    v50 = malloc(8);
-    *(int64_t*)v50 = (int64_t)v49;
-    goto bb13;
-  bb12:
-    v110 = 1LL;
-    v111 = -v110;
-    p_call_stack_pop();
-    return v111;
-  bb13:
-    v53 = *(int64_t*)v50;
-    v54 = *(int64_t*)v19;
-    v55 = v53 < v54;
-    if (v55) goto bb14;
-    else goto bb15;
-  bb14:
-    v57 = *(int64_t*)v39;
-    v58 = v1 + v57;
-    v59 = *(int64_t*)v50;
-    v60 = v58 + v59;
-    v61 = malloc(8);
-    *(int64_t*)v61 = (int64_t)v60;
-    v63 = *(int64_t*)v50;
-    v64 = v2 + v63;
-    v65 = malloc(8);
-    *(int64_t*)v65 = (int64_t)v64;
-    v67 = *(int64_t*)v61;
-    v68 = malloc(8);
-    *(void**)v68 = (void*)v67;
-    v70 = *(int64_t*)v65;
-    v71 = malloc(8);
-    *(void**)v71 = (void*)v70;
-    v73 = 0LL;
-    v74 = malloc(8);
-    *(int64_t*)v74 = (int64_t)v73;
-    v76 = 0LL;
-    v77 = malloc(8);
-    *(int64_t*)v77 = (int64_t)v76;
-    v80 = *(void**)v68;
-    v81 = *(uint8_t*)v80;
-    *(int64_t*)v74 = (int64_t)v81;
-    v83 = *(void**)v71;
-    v84 = *(uint8_t*)v83;
-    *(int64_t*)v77 = (int64_t)v84;
-    v87 = *(int64_t*)v74;
-    v88 = *(int64_t*)v77;
-    v89 = v87 != v88;
-    if (v89) goto bb16;
-    else goto bb17;
-  bb15:
-    v100 = *(bool*)v47;
-    if (v100) goto bb19;
-    else goto bb20;
-  bb16:
-    v91 = false;
-    *(bool*)v47 = v91;
-    goto bb15;
-  bb17:
-    goto bb18;
-  bb18:
-    v95 = *(int64_t*)v50;
-    v96 = 1LL;
-    v97 = v95 + v96;
-    *(int64_t*)v50 = (int64_t)v97;
-    goto bb13;
-  bb19:
-    v102 = *(int64_t*)v39;
-    p_call_stack_pop();
-    return v102;
-  bb20:
-    goto bb21;
-  bb21:
-    v105 = *(int64_t*)v39;
-    v106 = 1LL;
-    v107 = v105 - v106;
-    *(int64_t*)v39 = (int64_t)v107;
-    goto bb10;
-    return 0;
-}
-
-void* str_trim_end(void* v0, void* v1) {
-    p_call_stack_push("str_trim_end");
-    int64_t v17;
-    void* v21;
-    int64_t v26; /* placeholder for void */
-    void* v7;
-    bool v12;
-    int64_t v23;
-    int64_t v34;
-    int64_t v37; /* placeholder for void */
-    void* v4;
-    int64_t v40;
-    int64_t v42; /* placeholder for void */
-    bool v33;
-    int64_t v44;
-    int64_t v15;
-    int64_t v39;
-    int64_t v13; /* placeholder for void */
-    bool v45;
-    int64_t v48; /* placeholder for void */
-    int64_t v49; /* placeholder for void */
-    int64_t v52;
-    int64_t v46; /* placeholder for void */
-    void* v24;
-    int64_t v53;
-    int64_t v51;
-    int64_t v50;
-    void* v47;
-    int64_t v25; /* placeholder for void */
-    int64_t v20;
-    int64_t v19; /* placeholder for void */
-    void* v27;
-    int64_t v54; /* placeholder for void */
-    int64_t v8; /* placeholder for void */
-    int64_t v32;
-    uint8_t v28;
-    int64_t v38;
-    int64_t v11;
-    int64_t v22; /* placeholder for void */
-    int64_t v41; /* placeholder for void */
-    int64_t v43;
-    int64_t v36; /* placeholder for void */
-    int64_t v14;
-    int64_t v16;
-    int64_t v31;
-    int64_t v10;
-    int64_t v29; /* placeholder for void */
-    int64_t v5; /* placeholder for void */
-    int64_t v2;
-    void* v18;
-    int64_t v6;
-    int64_t v9; /* placeholder for void */
-    int64_t v30; /* placeholder for void */
-    int64_t v3;
-    int64_t v35; /* placeholder for void */
-    v2 = 0LL;
-    v3 = (int64_t)String_len((void*)v2, (int64_t)v1);
-    v4 = malloc(8);
-    *(int64_t*)v4 = (int64_t)v3;
-    v6 = *(int64_t*)v4;
-    v7 = malloc(8);
-    *(int64_t*)v7 = (int64_t)v6;
-    goto bb1;
-  bb1:
-    v10 = *(int64_t*)v7;
-    v11 = 0LL;
-    v12 = v10 > v11;
-    if (v12) goto bb2;
-    else goto bb3;
-  bb2:
-    v14 = *(int64_t*)v7;
-    v15 = (int64_t)v1 + v14;
-    v16 = 1LL;
-    v17 = v15 - v16;
-    v18 = malloc(8);
-    *(int64_t*)v18 = (int64_t)v17;
-    v20 = *(int64_t*)v18;
-    v21 = malloc(8);
-    *(void**)v21 = (void*)v20;
-    v23 = 0LL;
-    v24 = malloc(8);
-    *(int64_t*)v24 = (int64_t)v23;
-    v27 = *(void**)v21;
-    v28 = *(uint8_t*)v27;
-    *(int64_t*)v24 = (int64_t)v28;
-    v31 = *(int64_t*)v24;
-    v32 = 0LL;
-    v33 = (bool)char_is_whitespace((void*)v32, v31);
-    v34 = !v33;
-    if (v34) goto bb4;
-    else goto bb5;
-  bb3:
-    v43 = *(int64_t*)v7;
-    v44 = 0LL;
-    v45 = v43 <= v44;
-    if (v45) goto bb7;
-    else goto bb8;
-  bb4:
-    goto bb3;
-  bb5:
-    goto bb6;
-  bb6:
-    v38 = *(int64_t*)v7;
-    v39 = 1LL;
-    v40 = v38 - v39;
-    *(int64_t*)v7 = (int64_t)v40;
-    goto bb1;
-  bb7:
-    v47 = _str1;
-    p_call_stack_pop();
-    return v47;
-  bb8:
-    goto bb9;
-  bb9:
-    v50 = 0LL;
-    v51 = *(int64_t*)v7;
-    v52 = 0LL;
-    v53 = (int64_t)String_slice((void*)v52, (int64_t)v1, v50, v51);
-    p_call_stack_pop();
-    return (void*)v53;
-    return 0;
-}
-
-bool str_equal(void* v0, void* v1, void* v2) {
-    p_call_stack_push("str_equal");
-    int64_t v3;
-    bool v4;
-    int64_t v5; /* placeholder for void */
-    v3 = 0LL;
-    v4 = (bool)p_str_equal((void*)v3, (int64_t)v1, (int64_t)v2);
-    p_call_stack_pop();
-    return v4;
-    return 0;
-}
-
-void* str_from_bytes(void* v0, void* v1) {
-    p_call_stack_push("str_from_bytes");
-    int64_t v23; /* placeholder for void */
-    bool v15;
-    void* v10;
-    int64_t v8;
-    void* v3;
-    int64_t v18;
-    void* v17;
-    int64_t v16; /* placeholder for void */
-    void* v6;
-    int64_t v13;
-    int64_t v4; /* placeholder for void */
-    int64_t v12; /* placeholder for void */
-    void* v22;
-    int64_t v5;
-    void* v2;
-    int64_t v28; /* placeholder for void */
-    void* v21;
-    int64_t v20;
-    int64_t v19;
-    int64_t v24;
-    int64_t v7; /* placeholder for void */
-    int64_t v27; /* placeholder for void */
-    int64_t v26;
-    int64_t v30; /* placeholder for void */
-    int64_t v11; /* placeholder for void */
-    int64_t v25;
-    void* v29;
-    int64_t v14;
-    int64_t v9;
-    v2 = _str1;
-    v3 = malloc(8);
-    *(void**)v3 = (void*)v2;
-    v5 = 0LL;
-    v6 = malloc(8);
-    *(int64_t*)v6 = (int64_t)v5;
-    v8 = 0LL;
-    v9 = (int64_t)Vec_len((void*)v8, (int64_t)v1);
-    v10 = malloc(8);
-    *(int64_t*)v10 = (int64_t)v9;
-    goto bb1;
-  bb1:
-    v13 = *(int64_t*)v6;
-    v14 = *(int64_t*)v10;
-    v15 = v13 < v14;
-    if (v15) goto bb2;
-    else goto bb3;
-  bb2:
-    v17 = *(void**)v3;
-    v18 = *(int64_t*)v6;
-    v19 = 0LL;
-    v20 = (int64_t)Vec_get((void*)v19, (int64_t)v1, v18);
-    v21 = p_char_to_str(v20);
-    v22 = p_str_concat(v17, v21);
-    *(void**)v3 = (void*)v22;
-    v24 = *(int64_t*)v6;
-    v25 = 1LL;
-    v26 = v24 + v25;
-    *(int64_t*)v6 = (int64_t)v26;
-    goto bb1;
-  bb3:
-    v29 = *(void**)v3;
-    p_call_stack_pop();
-    return v29;
-    return 0;
-}
-
-void allocator_free(void* v0, void* v1, int64_t v2) {
-    p_call_stack_push("allocator_free");
-    int64_t v3; /* placeholder for void */
-    int64_t v4; /* placeholder for void */
-    p_allocator_free(v1, v2);
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-void HashMap_clear(void* v0, int64_t v1) {
-    p_call_stack_push("HashMap_clear");
-    int64_t v26; /* placeholder for void */
-    int64_t v47;
-    void* v58;
-    void* v18;
-    int64_t v32;
-    void* v55;
-    bool v33;
-    int64_t v12; /* placeholder for void */
-    int64_t v50;
-    int64_t v30; /* placeholder for void */
-    void* v52;
-    int64_t v63;
-    int64_t v8;
-    int64_t v49;
-    void* v24;
-    int64_t v2;
-    void* v27;
-    int64_t v54;
-    void* v15;
-    int64_t v28;
-    int64_t v67; /* placeholder for void */
-    int64_t v6; /* placeholder for void */
-    int64_t v48;
-    int64_t v66; /* placeholder for void */
-    int64_t v44;
-    int64_t v57; /* placeholder for void */
-    int64_t v5; /* placeholder for void */
-    void* v4;
-    int64_t v17;
-    void* v7;
-    int64_t v29; /* placeholder for void */
-    int64_t v60; /* placeholder for void */
-    int64_t v62;
-    int64_t v53; /* placeholder for void */
-    int64_t v64;
-    int64_t v65; /* placeholder for void */
-    int64_t v22; /* placeholder for void */
-    int64_t v10; /* placeholder for void */
-    int64_t v68; /* placeholder for void */
-    int64_t v56; /* placeholder for void */
-    int64_t v19; /* placeholder for void */
-    int64_t v46; /* placeholder for void */
-    void* v21;
-    int64_t v23; /* placeholder for void */
-    int64_t v69; /* placeholder for void */
-    int64_t v34;
-    int64_t v61; /* placeholder for void */
-    bool v37;
-    void* v40;
-    int64_t v20;
-    int64_t v25;
-    int64_t v59;
-    int64_t v41; /* placeholder for void */
-    int64_t v31;
-    int64_t v35;
-    int64_t v43;
-    int64_t v13;
-    int64_t v3;
-    int64_t v9; /* placeholder for void */
-    bool v36;
-    int64_t v14;
-    int64_t v39;
-    int64_t v51;
-    int64_t v42; /* placeholder for void */
-    int64_t v16; /* placeholder for void */
-    int64_t v38; /* placeholder for void */
-    void* v11;
-    bool v45;
-    v2 = 16LL;
-    v3 = v1 + v2;
-    v4 = malloc(8);
-    *(void**)v4 = (void*)v3;
-    v7 = *(void**)v4;
-    v8 = 0LL;
-    *(int64_t*)v7 = (int64_t)v8;
-    v11 = malloc(8);
-    *(void**)v11 = (void*)v1;
-    v13 = 24LL;
-    v14 = v1 + v13;
-    v15 = malloc(8);
-    *(void**)v15 = (void*)v14;
-    v17 = 0LL;
-    v18 = malloc(8);
-    *(int64_t*)v18 = (int64_t)v17;
-    v20 = 0LL;
-    v21 = malloc(8);
-    *(int64_t*)v21 = (int64_t)v20;
-    v24 = *(void**)v11;
-    v25 = *(int64_t*)v24;
-    *(int64_t*)v18 = (int64_t)v25;
-    v27 = *(void**)v15;
-    v28 = *(int64_t*)v27;
-    *(int64_t*)v21 = (int64_t)v28;
-    v31 = *(int64_t*)v18;
-    v32 = 0LL;
-    v33 = v31 != v32;
-    v34 = *(int64_t*)v21;
-    v35 = 0LL;
-    v36 = v34 > v35;
-    v37 = v33 && v36;
-    if (v37) goto bb1;
-    else goto bb2;
-  bb1:
-    v39 = 0LL;
-    v40 = malloc(8);
-    *(int64_t*)v40 = (int64_t)v39;
-    goto bb4;
-  bb2:
-    goto bb3;
-  bb3:
-    p_call_stack_pop();
-    return;
-  bb4:
-    v43 = *(int64_t*)v40;
-    v44 = *(int64_t*)v21;
-    v45 = v43 < v44;
-    if (v45) goto bb5;
-    else goto bb6;
-  bb5:
-    v47 = *(int64_t*)v18;
-    v48 = *(int64_t*)v40;
-    v49 = 8LL;
-    v50 = v48 * v49;
-    v51 = v47 + v50;
-    v52 = malloc(8);
-    *(int64_t*)v52 = (int64_t)v51;
-    v54 = *(int64_t*)v52;
-    v55 = malloc(8);
-    *(void**)v55 = (void*)v54;
-    v58 = *(void**)v55;
-    v59 = 0LL;
-    *(int64_t*)v58 = (int64_t)v59;
-    v62 = *(int64_t*)v40;
-    v63 = 1LL;
-    v64 = v62 + v63;
-    *(int64_t*)v40 = (int64_t)v64;
-    goto bb4;
-  bb6:
-    goto bb3;
-    return;
-}
-
-int64_t String_char_count(void* v0, int64_t v1) {
-    p_call_stack_push("String_char_count");
-    int64_t v4; /* placeholder for void */
-    int64_t v3;
-    int64_t v2;
-    v2 = 0LL;
-    v3 = (int64_t)p_str_length((void*)v2, v1);
-    p_call_stack_pop();
-    return v3;
-    return 0;
-}
-
-int64_t String_slice(void* v0, int64_t v1, int64_t v2, int64_t v3) {
-    p_call_stack_push("String_slice");
-    int64_t v56; /* placeholder for void */
-    void* v58;
-    void* v85;
-    void* v15;
-    int64_t v41; /* placeholder for void */
-    bool v32;
-    int64_t v13; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    int64_t v30;
-    int64_t v49; /* placeholder for void */
-    void* v52;
-    void* v9;
-    int64_t v20; /* placeholder for void */
-    int64_t v21; /* placeholder for void */
-    int64_t v34;
-    int64_t v47;
-    int64_t v57; /* placeholder for void */
-    int64_t v37; /* placeholder for void */
-    int64_t v80;
-    int64_t v54;
-    int64_t v89; /* placeholder for void */
-    int64_t v6; /* placeholder for void */
-    int64_t v63; /* placeholder for void */
-    int64_t v31;
-    int64_t v7;
-    int64_t v69; /* placeholder for void */
-    int64_t v11;
-    int64_t v94; /* placeholder for void */
-    int64_t v25; /* placeholder for void */
-    int64_t v66;
-    int64_t v23;
-    void* v68;
-    int64_t v76;
-    bool v48;
-    int64_t v22;
-    int64_t v75; /* placeholder for void */
-    int64_t v36; /* placeholder for void */
-    int64_t v96; /* placeholder for void */
-    int64_t v62;
-    int64_t v86; /* placeholder for void */
-    int64_t v90; /* placeholder for void */
-    int64_t v4;
-    void* v91;
-    int64_t v81; /* placeholder for void */
-    void* v12;
-    void* v73;
-    int64_t v77;
-    void* v8;
-    int64_t v44; /* placeholder for void */
-    int64_t v46;
-    bool v40;
-    int64_t v67;
-    int64_t v78;
-    int64_t v79;
-    bool v5;
-    int64_t v59;
-    int64_t v64; /* placeholder for void */
-    int64_t v82;
-    int64_t v10; /* placeholder for void */
-    int64_t v93; /* placeholder for void */
-    int64_t v61; /* placeholder for void */
-    int64_t v95;
-    int64_t v50;
-    int64_t v60; /* placeholder for void */
-    int64_t v35; /* placeholder for void */
-    int64_t v45; /* placeholder for void */
-    void* v51;
-    int64_t v71;
-    void* v28;
-    int64_t v42;
-    int64_t v19;
-    void* v74;
-    int64_t v72;
-    int64_t v17; /* placeholder for void */
-    void* v24;
-    void* v26;
-    int64_t v70;
-    int64_t v87;
-    int64_t v14; /* placeholder for void */
-    int64_t v38;
-    int64_t v43; /* placeholder for void */
-    int64_t v39;
-    int64_t v53; /* placeholder for void */
-    int64_t v16;
-    int64_t v65;
-    int64_t v83;
-    int64_t v84;
-    int64_t v92;
-    int64_t v29; /* placeholder for void */
-    int64_t v27; /* placeholder for void */
-    int64_t v33; /* placeholder for void */
-    void* v55;
-    void* v88;
-    v4 = 0LL;
-    v5 = v1 == v4;
-    if (v5) goto bb1;
-    else goto bb2;
-  bb1:
-    v7 = 1LL;
-    v8 = p_malloc(v7);
-    v9 = malloc(8);
-    *(int64_t*)v9 = (int64_t)v8;
-    v11 = *(int64_t*)v9;
-    v12 = malloc(8);
-    *(void**)v12 = (void*)v11;
-    v15 = *(void**)v12;
-    v16 = 0LL;
-    *(uint8_t*)v15 = (uint8_t)v16;
-    v19 = *(int64_t*)v9;
-    p_call_stack_pop();
-    return v19;
-  bb2:
-    goto bb3;
-  bb3:
-    v22 = 0LL;
-    v23 = (int64_t)p_str_length((void*)v22, v1);
-    v24 = malloc(8);
-    *(int64_t*)v24 = (int64_t)v23;
-    v26 = malloc(8);
-    *(int64_t*)v26 = (int64_t)v2;
-    v28 = malloc(8);
-    *(int64_t*)v28 = (int64_t)v3;
-    v30 = *(int64_t*)v26;
-    v31 = 0LL;
-    v32 = v30 < v31;
-    if (v32) goto bb4;
-    else goto bb5;
-  bb4:
-    v34 = 0LL;
-    *(int64_t*)v26 = (int64_t)v34;
-    goto bb6;
-  bb5:
-    goto bb6;
-  bb6:
-    v38 = *(int64_t*)v28;
-    v39 = *(int64_t*)v24;
-    v40 = v38 > v39;
-    if (v40) goto bb7;
-    else goto bb8;
-  bb7:
-    v42 = *(int64_t*)v24;
-    *(int64_t*)v28 = (int64_t)v42;
-    goto bb9;
-  bb8:
-    goto bb9;
-  bb9:
-    v46 = *(int64_t*)v26;
-    v47 = *(int64_t*)v28;
-    v48 = v46 >= v47;
-    if (v48) goto bb10;
-    else goto bb11;
-  bb10:
-    v50 = 1LL;
-    v51 = p_malloc(v50);
-    v52 = malloc(8);
-    *(int64_t*)v52 = (int64_t)v51;
-    v54 = *(int64_t*)v52;
-    v55 = malloc(8);
-    *(void**)v55 = (void*)v54;
-    v58 = *(void**)v55;
-    v59 = 0LL;
-    *(uint8_t*)v58 = (uint8_t)v59;
-    v62 = *(int64_t*)v52;
-    p_call_stack_pop();
-    return v62;
-  bb11:
-    goto bb12;
-  bb12:
-    v65 = *(int64_t*)v28;
-    v66 = *(int64_t*)v26;
-    v67 = v65 - v66;
-    v68 = malloc(8);
-    *(int64_t*)v68 = (int64_t)v67;
-    v70 = *(int64_t*)v68;
-    v71 = 1LL;
-    v72 = v70 + v71;
-    v73 = p_malloc(v72);
-    v74 = malloc(8);
-    *(int64_t*)v74 = (int64_t)v73;
-    v76 = *(int64_t*)v74;
-    v77 = *(int64_t*)v26;
-    v78 = v1 + v77;
-    v79 = *(int64_t*)v68;
-    v80 = 0LL;
-    p_str_copy_n((void*)v80, v76, v78, v79);
-    v82 = *(int64_t*)v74;
-    v83 = *(int64_t*)v68;
-    v84 = v82 + v83;
-    v85 = malloc(8);
-    *(int64_t*)v85 = (int64_t)v84;
-    v87 = *(int64_t*)v85;
-    v88 = malloc(8);
-    *(void**)v88 = (void*)v87;
-    v91 = *(void**)v88;
-    v92 = 0LL;
-    *(uint8_t*)v91 = (uint8_t)v92;
-    v95 = *(int64_t*)v74;
-    p_call_stack_pop();
-    return v95;
-    return 0;
-}
-
-int64_t char_to_upper(void* v0, int64_t v1) {
-    p_call_stack_push("char_to_upper");
-    int64_t v4;
-    bool v3;
-    int64_t v12; /* placeholder for void */
-    bool v6;
-    int64_t v7; /* placeholder for void */
-    int64_t v9;
-    bool v5;
-    int64_t v8;
-    int64_t v11; /* placeholder for void */
-    int64_t v2;
-    int64_t v10; /* placeholder for void */
-    v2 = 97LL;
-    v3 = v1 >= v2;
-    v4 = 122LL;
-    v5 = v1 <= v4;
-    v6 = v3 && v5;
-    if (v6) goto bb1;
-    else goto bb2;
-  bb1:
-    v8 = 32LL;
-    v9 = v1 - v8;
-    p_call_stack_pop();
-    return v9;
-  bb2:
-    goto bb3;
-  bb3:
-    p_call_stack_pop();
-    return v1;
-    return 0;
-}
-
-void ByteBuffer_from_string(void* v0, void* v1, void* v2) {
-    p_call_stack_push("ByteBuffer_from_string");
-    int64_t v41;
-    int64_t v24; /* placeholder for void */
-    void* v14;
-    int64_t v13;
-    int64_t v5;
-    void* v7;
-    int64_t v10;
-    int64_t v12; /* placeholder for void */
-    int64_t v15; /* placeholder for void */
-    int64_t v16; /* placeholder for void */
-    bool v19;
-    void* v26;
-    int64_t v27; /* placeholder for void */
-    int64_t v3;
-    int64_t v31; /* placeholder for void */
-    void* v4;
-    int64_t v30; /* placeholder for void */
-    int64_t v6; /* placeholder for void */
-    int64_t v9;
-    void* v32;
-    uint8_t v33;
-    void* v23;
-    int64_t v18;
-    void* v36;
-    int64_t v38;
-    int64_t v42;
-    int64_t v22;
-    int64_t v40;
-    void* v11;
-    int64_t v43; /* placeholder for void */
-    int64_t v25;
-    int64_t v44; /* placeholder for void */
-    int64_t v8; /* placeholder for void */
-    void* v47;
-    int64_t v28;
-    int64_t v37;
-    void* v50;
-    int64_t v35; /* placeholder for void */
-    void* v48;
-    void* v51;
-    int64_t v52;
-    void* v29;
-    int64_t v39; /* placeholder for void */
-    int64_t v17;
-    int64_t v20; /* placeholder for void */
-    void* v45;
-    void* v46;
-    int64_t v49; /* placeholder for void */
-    int64_t v54; /* placeholder for void */
-    int64_t v21;
-    int64_t v53; /* placeholder for void */
-    int64_t v34; /* placeholder for void */
-    v3 = 0LL;
-    v4 = malloc(16);
-    v5 = 0LL;
-    ByteBuffer_new(v4, (void*)v5, v3);
-    v7 = malloc(8);
-    *(void**)v7 = (void*)v4;
-    v9 = 0LL;
-    v10 = (int64_t)String_len((void*)v9, (int64_t)v2);
-    v11 = malloc(8);
-    *(int64_t*)v11 = (int64_t)v10;
-    v13 = 0LL;
-    v14 = malloc(8);
-    *(int64_t*)v14 = (int64_t)v13;
-    goto bb1;
-  bb1:
-    v17 = *(int64_t*)v14;
-    v18 = *(int64_t*)v11;
-    v19 = v17 < v18;
-    if (v19) goto bb2;
-    else goto bb3;
-  bb2:
-    v21 = *(int64_t*)v14;
-    v22 = (int64_t)v2 + v21;
-    v23 = malloc(8);
-    *(int64_t*)v23 = (int64_t)v22;
-    v25 = *(int64_t*)v23;
-    v26 = malloc(8);
-    *(void**)v26 = (void*)v25;
-    v28 = 0LL;
-    v29 = malloc(8);
-    *(int64_t*)v29 = (int64_t)v28;
-    v32 = *(void**)v26;
-    v33 = *(uint8_t*)v32;
-    *(int64_t*)v29 = (int64_t)v33;
-    v36 = *(void**)v7;
-    v37 = *(int64_t*)v29;
-    v38 = 0LL;
-    ByteBuffer_write_byte((void*)v38, v36, v37);
-    v40 = *(int64_t*)v14;
-    v41 = 1LL;
-    v42 = v40 + v41;
-    *(int64_t*)v14 = (int64_t)v42;
-    goto bb1;
-  bb3:
-    v45 = *(void**)v7;
-    v46 = (char*)v45 + 0;
-    v47 = (char*)v0 + 0;
-    v48 = *(void**)v46;
-    *(void**)v47 = (void*)v48;
-    v50 = (char*)v45 + 8;
-    v51 = (char*)v0 + 8;
-    v52 = *(int64_t*)v50;
-    *(int64_t*)v51 = (int64_t)v52;
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-void Result_ok(void* v0, void* v1, void* v2) {
-    p_call_stack_push("Result_ok");
-    void* v10;
-    int64_t v22;
-    int64_t v45; /* placeholder for void */
-    int64_t v31;
-    int64_t v18;
-    int64_t v38;
-    int64_t v19; /* placeholder for void */
-    void* v21;
-    void* v16;
-    int64_t v23; /* placeholder for void */
-    int64_t v9;
-    void* v25;
-    void* v17;
-    int64_t v26;
-    void* v30;
-    int64_t v5;
-    void* v12;
-    void* v20;
-    int64_t v35; /* placeholder for void */
-    bool v6;
-    void* v32;
-    void* v37;
-    void* v36;
-    int64_t v39; /* placeholder for void */
-    void* v8;
-    void* v40;
-    int64_t v33;
-    int64_t v43; /* placeholder for void */
-    int64_t v44; /* placeholder for void */
-    void* v3;
-    int64_t v46; /* placeholder for void */
-    bool v28;
-    int64_t v24; /* placeholder for void */
-    int64_t v27;
-    void* v41;
-    int64_t v13; /* placeholder for void */
-    int64_t v29; /* placeholder for void */
-    int64_t v11;
-    void* v14;
-    int64_t v42;
-    int64_t v4;
-    int64_t v7; /* placeholder for void */
-    int64_t v15; /* placeholder for void */
-    void* v34;
-    v3 = (char*)v2 + 0;
-    v4 = *(int64_t*)v3;
-    v5 = 0LL;
-    v6 = v4 == v5;
-    if (v6) goto bb2;
-    else goto bb3;
-  bb1:
-    p_call_stack_pop();
-    return;
-  bb2:
-    v8 = (char*)v2 + 8;
-    v9 = *(int64_t*)v8;
-    v10 = malloc(16);
-    v11 = 0LL;
-    v12 = (char*)v10 + 0;
-    *(int64_t*)v12 = (int64_t)v11;
-    v14 = (char*)v10 + 8;
-    *(int64_t*)v14 = (int64_t)v9;
-    v16 = (char*)v10 + 0;
-    v17 = (char*)v0 + 0;
-    v18 = *(int64_t*)v16;
-    *(int64_t*)v17 = (int64_t)v18;
-    v20 = (char*)v10 + 8;
-    v21 = (char*)v0 + 8;
-    v22 = *(int64_t*)v20;
-    *(int64_t*)v21 = (int64_t)v22;
-    p_call_stack_pop();
-    return;
-  bb3:
-    v25 = (char*)v2 + 0;
-    v26 = *(int64_t*)v25;
-    v27 = 1LL;
-    v28 = v26 == v27;
-    if (v28) goto bb4;
-    else goto bb5;
-  bb4:
-    v30 = (char*)v2 + 8;
-    v31 = *(int64_t*)v30;
-    v32 = malloc(16);
-    v33 = 1LL;
-    v34 = (char*)v32 + 0;
-    *(int64_t*)v34 = (int64_t)v33;
-    v36 = (char*)v32 + 0;
-    v37 = (char*)v0 + 0;
-    v38 = *(int64_t*)v36;
-    *(int64_t*)v37 = (int64_t)v38;
-    v40 = (char*)v32 + 8;
-    v41 = (char*)v0 + 8;
-    v42 = *(int64_t*)v40;
-    *(int64_t*)v41 = (int64_t)v42;
-    p_call_stack_pop();
-    return;
-  bb5:
-    goto bb1;
-    return;
-}
-
-int64_t Result_unwrap_or_else(void* v0, void* v1, void* v2) {
-    p_call_stack_push("Result_unwrap_or_else");
-    int64_t v19; /* placeholder for void */
-    int64_t v5;
-    int64_t v20; /* placeholder for void */
-    int64_t v22; /* placeholder for void */
-    void* v16;
-    int64_t v12;
-    int64_t v17;
-    int64_t v13;
-    int64_t v7; /* placeholder for void */
-    int64_t v10; /* placeholder for void */
-    void* v3;
-    bool v6;
-    int64_t v18;
-    bool v14;
-    int64_t v21;
-    int64_t v15; /* placeholder for void */
-    int64_t v4;
-    void* v8;
-    void* v11;
-    int64_t v9;
-    v3 = (char*)v1 + 0;
-    v4 = *(int64_t*)v3;
-    v5 = 0LL;
-    v6 = v4 == v5;
-    if (v6) goto bb2;
-    else goto bb3;
-  bb1:
-    v21 = 0LL;
-    p_call_stack_pop();
-    return v21;
-  bb2:
-    v8 = (char*)v1 + 8;
-    v9 = *(int64_t*)v8;
-    p_call_stack_pop();
-    return v9;
-  bb3:
-    v11 = (char*)v1 + 0;
-    v12 = *(int64_t*)v11;
-    v13 = 1LL;
-    v14 = v12 == v13;
-    if (v14) goto bb4;
-    else goto bb5;
-  bb4:
-    v16 = (char*)v1 + 8;
-    v17 = *(int64_t*)v16;
-    {
-        if (!v2) abort();
-        char* _fn_name = *(char**)v2;
-        if (!_fn_name) abort();
-        if (strcmp(_fn_name, "Vec_new") == 0) {
-            v18 = Vec_new((void*)v2);
-        } else if (strcmp(_fn_name, "HashMap_new") == 0) {
-            v18 = HashMap_new((void*)v2);
-        } else { abort(); }
-    }
-    p_call_stack_pop();
-    return v18;
-  bb5:
-    goto bb1;
-    return 0;
-}
-
-void ByteBuffer_write_bytes(void* v0, void* v1, int64_t v2, int64_t v3) {
-    p_call_stack_push("ByteBuffer_write_bytes");
-    void* v19;
-    void* v16;
-    int64_t v6; /* placeholder for void */
-    int64_t v32; /* placeholder for void */
-    void* v22;
-    int64_t v18;
-    int64_t v10; /* placeholder for void */
-    int64_t v25; /* placeholder for void */
-    int64_t v30;
-    int64_t v31;
-    int64_t v33; /* placeholder for void */
-    int64_t v7; /* placeholder for void */
-    int64_t v29;
-    int64_t v21; /* placeholder for void */
-    bool v9;
-    void* v5;
-    void* v13;
-    int64_t v14; /* placeholder for void */
-    int64_t v11;
-    int64_t v8;
-    int64_t v17; /* placeholder for void */
-    int64_t v26;
-    int64_t v24; /* placeholder for void */
-    int64_t v28; /* placeholder for void */
-    int64_t v27;
-    int64_t v20; /* placeholder for void */
-    int64_t v34; /* placeholder for void */
-    int64_t v12;
-    int64_t v4;
-    int64_t v15;
-    uint8_t v23;
-    v4 = 0LL;
-    v5 = malloc(8);
-    *(int64_t*)v5 = (int64_t)v4;
-    goto bb1;
-  bb1:
-    v8 = *(int64_t*)v5;
-    v9 = v8 < v3;
-    if (v9) goto bb2;
-    else goto bb3;
-  bb2:
-    v11 = *(int64_t*)v5;
-    v12 = v2 + v11;
-    v13 = malloc(8);
-    *(int64_t*)v13 = (int64_t)v12;
-    v15 = *(int64_t*)v13;
-    v16 = malloc(8);
-    *(void**)v16 = (void*)v15;
-    v18 = 0LL;
-    v19 = malloc(8);
-    *(int64_t*)v19 = (int64_t)v18;
-    v22 = *(void**)v16;
-    v23 = *(uint8_t*)v22;
-    *(int64_t*)v19 = (int64_t)v23;
-    v26 = *(int64_t*)v19;
-    v27 = 0LL;
-    ByteBuffer_write_byte((void*)v27, v1, v26);
-    v29 = *(int64_t*)v5;
-    v30 = 1LL;
-    v31 = v29 + v30;
-    *(int64_t*)v5 = (int64_t)v31;
-    goto bb1;
-  bb3:
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-void HashMap_remove(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("HashMap_remove");
-    int64_t v18; /* placeholder for void */
-    int64_t v11;
-    int64_t v36;
-    void* v12;
-    int64_t v43;
-    int64_t v4;
-    int64_t v28; /* placeholder for void */
-    int64_t v76; /* placeholder for void */
-    int64_t v80; /* placeholder for void */
-    int64_t v65; /* placeholder for void */
-    bool v59;
-    int64_t v45; /* placeholder for void */
-    int64_t v51; /* placeholder for void */
-    int64_t v10; /* placeholder for void */
-    int64_t v34; /* placeholder for void */
-    int64_t v23; /* placeholder for void */
-    int64_t v42;
-    int64_t v48; /* placeholder for void */
-    int64_t v16;
-    void* v44;
-    int64_t v61;
-    int64_t v66; /* placeholder for void */
-    int64_t v38; /* placeholder for void */
-    int64_t v72; /* placeholder for void */
-    void* v75;
-    int64_t v49;
-    int64_t v3;
-    int64_t v7;
-    void* v15;
-    void* v53;
-    int64_t v60;
-    bool v63;
-    int64_t v55; /* placeholder for void */
-    int64_t v25;
-    int64_t v70;
-    int64_t v77; /* placeholder for void */
-    int64_t v79;
-    int64_t v83;
-    int64_t v19;
-    void* v47;
-    void* v50;
-    int64_t v33; /* placeholder for void */
-    int64_t v71;
-    int64_t v40;
-    int64_t v20;
-    int64_t v68; /* placeholder for void */
-    void* v29;
-    int64_t v31;
-    int64_t v86; /* placeholder for void */
-    int64_t v73; /* placeholder for void */
-    int64_t v91; /* placeholder for void */
-    int64_t v14; /* placeholder for void */
-    int64_t v17; /* placeholder for void */
-    int64_t v92; /* placeholder for void */
-    int64_t v87; /* placeholder for void */
-    int64_t v62;
-    int64_t v74;
-    int64_t v57;
-    int64_t v46;
-    int64_t v82;
-    void* v9;
-    void* v78;
-    int64_t v30; /* placeholder for void */
-    int64_t v41;
-    void* v5;
-    int64_t v89;
-    void* v27;
-    int64_t v26;
-    void* v85;
-    int64_t v90; /* placeholder for void */
-    int64_t v8;
-    int64_t v37; /* placeholder for void */
-    int64_t v39;
-    void* v32;
-    int64_t v24; /* placeholder for void */
-    int64_t v56; /* placeholder for void */
-    int64_t v58;
-    int64_t v84;
-    int64_t v6; /* placeholder for void */
-    void* v35;
-    int64_t v13; /* placeholder for void */
-    bool v21;
-    int64_t v52; /* placeholder for void */
-    int64_t v22; /* placeholder for void */
-    bool v64;
-    int64_t v54;
-    void* v69;
-    int64_t v67; /* placeholder for void */
-    void* v88;
-    int64_t v81; /* placeholder for void */
-    v3 = 24LL;
-    v4 = v1 + v3;
-    v5 = malloc(8);
-    *(void**)v5 = (void*)v4;
-    v7 = 16LL;
-    v8 = v1 + v7;
-    v9 = malloc(8);
-    *(void**)v9 = (void*)v8;
-    v11 = 0LL;
-    v12 = malloc(8);
-    *(int64_t*)v12 = (int64_t)v11;
-    v15 = *(void**)v5;
-    v16 = *(int64_t*)v15;
-    *(int64_t*)v12 = (int64_t)v16;
-    v19 = *(int64_t*)v12;
-    v20 = 0LL;
-    v21 = v19 == v20;
-    if (v21) goto bb1;
-    else goto bb2;
-  bb1:
-    p_call_stack_pop();
-    return;
-  bb2:
-    goto bb3;
-  bb3:
-    v25 = 0LL;
-    v26 = (int64_t)HashMap_find_slot((void*)v25, v1, v2);
-    v27 = malloc(8);
-    *(int64_t*)v27 = (int64_t)v26;
-    v29 = malloc(8);
-    *(void**)v29 = (void*)v1;
-    v31 = 0LL;
-    v32 = malloc(8);
-    *(int64_t*)v32 = (int64_t)v31;
-    v35 = *(void**)v29;
-    v36 = *(int64_t*)v35;
-    *(int64_t*)v32 = (int64_t)v36;
-    v39 = *(int64_t*)v32;
-    v40 = *(int64_t*)v27;
-    v41 = 8LL;
-    v42 = v40 * v41;
-    v43 = v39 + v42;
-    v44 = malloc(8);
-    *(int64_t*)v44 = (int64_t)v43;
-    v46 = *(int64_t*)v44;
-    v47 = malloc(8);
-    *(void**)v47 = (void*)v46;
-    v49 = 0LL;
-    v50 = malloc(8);
-    *(int64_t*)v50 = (int64_t)v49;
-    v53 = *(void**)v47;
-    v54 = *(int64_t*)v53;
-    *(int64_t*)v50 = (int64_t)v54;
-    v57 = *(int64_t*)v50;
-    v58 = 0LL;
-    v59 = v57 == v58;
-    v60 = *(int64_t*)v50;
-    v61 = 1LL;
-    v62 = -v61;
-    v63 = v60 == v62;
-    v64 = v59 || v63;
-    if (v64) goto bb4;
-    else goto bb5;
-  bb4:
-    p_call_stack_pop();
-    return;
-  bb5:
-    goto bb6;
-  bb6:
-    v69 = *(void**)v47;
-    v70 = 1LL;
-    v71 = -v70;
-    *(int64_t*)v69 = (int64_t)v71;
-    v74 = 0LL;
-    v75 = malloc(8);
-    *(int64_t*)v75 = (int64_t)v74;
-    v78 = *(void**)v9;
-    v79 = *(int64_t*)v78;
-    *(int64_t*)v75 = (int64_t)v79;
-    v82 = *(int64_t*)v75;
-    v83 = 1LL;
-    v84 = v82 - v83;
-    v85 = malloc(8);
-    *(int64_t*)v85 = (int64_t)v84;
-    v88 = *(void**)v9;
-    v89 = *(int64_t*)v85;
-    *(int64_t*)v88 = (int64_t)v89;
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-int64_t Vec_remove(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("Vec_remove");
-    void* v5;
-    void* v9;
-    int64_t v13; /* placeholder for void */
-    int64_t v19; /* placeholder for void */
-    int64_t v35;
-    int64_t v56;
-    void* v75;
-    int64_t v74;
-    void* v86;
-    int64_t v51; /* placeholder for void */
-    int64_t v41;
-    bool v16;
-    void* v11;
-    void* v88;
-    int64_t v38;
-    int64_t v8; /* placeholder for void */
-    int64_t v72;
-    int64_t v89;
-    int64_t v96; /* placeholder for void */
-    int64_t v107;
-    int64_t v30; /* placeholder for void */
-    int64_t v24; /* placeholder for void */
-    void* v42;
-    int64_t v44;
-    void* v52;
-    int64_t v55;
-    int64_t v37;
-    void* v84;
-    int64_t v93;
-    int64_t v40; /* placeholder for void */
-    void* v103;
-    int64_t v104;
-    void* v7;
-    int64_t v15;
-    int64_t v73;
-    int64_t v36;
-    int64_t v17; /* placeholder for void */
-    void* v81;
-    int64_t v83; /* placeholder for void */
-    int64_t v91; /* placeholder for void */
-    int64_t v94;
-    int64_t v87; /* placeholder for void */
-    int64_t v14; /* placeholder for void */
-    int64_t v95; /* placeholder for void */
-    int64_t v85;
-    int64_t v99;
-    int64_t v28; /* placeholder for void */
-    int64_t v49;
-    int64_t v27; /* placeholder for void */
-    int64_t v97;
-    int64_t v108; /* placeholder for void */
-    void* v39;
-    int64_t v80;
-    void* v18;
-    int64_t v50; /* placeholder for void */
-    int64_t v58;
-    int64_t v68;
-    int64_t v46; /* placeholder for void */
-    int64_t v62;
-    int64_t v70;
-    void* v48;
-    int64_t v65;
-    int64_t v3;
-    int64_t v33; /* placeholder for void */
-    int64_t v53; /* placeholder for void */
-    int64_t v82; /* placeholder for void */
-    int64_t v63;
-    void* v100;
-    int64_t v20; /* placeholder for void */
-    int64_t v12;
-    void* v31;
-    int64_t v69;
-    int64_t v10; /* placeholder for void */
-    bool v23;
-    int64_t v26; /* placeholder for void */
-    int64_t v22;
-    int64_t v54; /* placeholder for void */
-    int64_t v61;
-    void* v25;
-    int64_t v21; /* placeholder for void */
-    int64_t v32;
-    int64_t v60; /* placeholder for void */
-    void* v66;
-    int64_t v64;
-    int64_t v67; /* placeholder for void */
-    int64_t v47; /* placeholder for void */
-    int64_t v76; /* placeholder for void */
-    void* v78;
-    int64_t v101; /* placeholder for void */
-    int64_t v98;
-    int64_t v4;
-    int64_t v90; /* placeholder for void */
-    int64_t v92;
-    int64_t v6; /* placeholder for void */
-    int64_t v102; /* placeholder for void */
-    void* v45;
-    int64_t v43; /* placeholder for void */
-    bool v59;
-    void* v29;
-    int64_t v34; /* placeholder for void */
-    int64_t v71;
-    int64_t v77;
-    int64_t v105; /* placeholder for void */
-    int64_t v57;
-    int64_t v79; /* placeholder for void */
-    int64_t v106; /* placeholder for void */
-    v3 = 8LL;
-    v4 = v1 + v3;
-    v5 = malloc(8);
-    *(void**)v5 = (void*)v4;
-    v7 = malloc(8);
-    *(void**)v7 = (void*)v1;
-    v9 = malloc(8);
-    v11 = *(void**)v5;
-    v12 = *(int64_t*)v11;
-    *(int64_t*)v9 = (int64_t)v12;
-    v15 = 0LL;
-    v16 = v2 < v15;
-    if (v16) goto bb1;
-    else goto bb2;
-  bb1:
-    v18 = _str3;
-    p_panic(v18);
-    goto bb3;
-  bb2:
-    goto bb3;
-  bb3:
-    v22 = *(int64_t*)v9;
-    v23 = v2 >= v22;
-    if (v23) goto bb4;
-    else goto bb5;
-  bb4:
-    v25 = _str3;
-    p_panic(v25);
-    goto bb6;
-  bb5:
-    goto bb6;
-  bb6:
-    v29 = malloc(8);
-    v31 = *(void**)v7;
-    v32 = *(int64_t*)v31;
-    *(int64_t*)v29 = (int64_t)v32;
-    v35 = *(int64_t*)v29;
-    v36 = 8LL;
-    v37 = v2 * v36;
-    v38 = v35 + v37;
-    v39 = malloc(8);
-    *(int64_t*)v39 = (int64_t)v38;
-    v41 = *(int64_t*)v39;
-    v42 = malloc(8);
-    *(void**)v42 = (void*)v41;
-    v44 = 0LL;
-    v45 = malloc(8);
-    *(int64_t*)v45 = (int64_t)v44;
-    v48 = *(void**)v42;
-    v49 = *(int64_t*)v48;
-    *(int64_t*)v45 = (int64_t)v49;
-    v52 = malloc(8);
-    *(int64_t*)v52 = (int64_t)v2;
-    goto bb7;
-  bb7:
-    v55 = *(int64_t*)v52;
-    v56 = *(int64_t*)v9;
-    v57 = 1LL;
-    v58 = v56 - v57;
-    v59 = v55 < v58;
-    if (v59) goto bb8;
-    else goto bb9;
-  bb8:
-    v61 = *(int64_t*)v29;
-    v62 = *(int64_t*)v52;
-    v63 = 8LL;
-    v64 = v62 * v63;
-    v65 = v61 + v64;
-    v66 = malloc(8);
-    *(int64_t*)v66 = (int64_t)v65;
-    v68 = *(int64_t*)v29;
-    v69 = *(int64_t*)v52;
-    v70 = 1LL;
-    v71 = v69 + v70;
-    v72 = 8LL;
-    v73 = v71 * v72;
-    v74 = v68 + v73;
-    v75 = malloc(8);
-    *(int64_t*)v75 = (int64_t)v74;
-    v77 = *(int64_t*)v66;
-    v78 = malloc(8);
-    *(void**)v78 = (void*)v77;
-    v80 = *(int64_t*)v75;
-    v81 = malloc(8);
-    *(void**)v81 = (void*)v80;
-    v84 = *(void**)v81;
-    v85 = *(int64_t*)v84;
-    v86 = malloc(8);
-    *(int64_t*)v86 = (int64_t)v85;
-    v88 = *(void**)v78;
-    v89 = *(int64_t*)v86;
-    *(int64_t*)v88 = (int64_t)v89;
-    v92 = *(int64_t*)v52;
-    v93 = 1LL;
-    v94 = v92 + v93;
-    *(int64_t*)v52 = (int64_t)v94;
-    goto bb7;
-  bb9:
-    v97 = *(int64_t*)v9;
-    v98 = 1LL;
-    v99 = v97 - v98;
-    v100 = malloc(8);
-    *(int64_t*)v100 = (int64_t)v99;
-    v103 = *(void**)v5;
-    v104 = *(int64_t*)v100;
-    *(int64_t*)v103 = (int64_t)v104;
-    v107 = *(int64_t*)v45;
-    p_call_stack_pop();
-    return v107;
-    return 0;
-}
-
-void* HashMap_to_str(void* v0, int64_t v1) {
-    p_call_stack_push("HashMap_to_str");
-    int64_t v89; /* placeholder for void */
-    void* v90;
-    int64_t v69; /* placeholder for void */
-    int64_t v32;
-    void* v77;
-    void* v117;
-    int64_t v2;
-    int64_t v97;
-    int64_t v62;
-    void* v120;
-    int64_t v121;
-    int64_t v125;
-    int64_t v37;
-    void* v4;
-    int64_t v6;
-    int64_t v59;
-    int64_t v104;
-    int64_t v64; /* placeholder for void */
-    int64_t v126;
-    void* v112;
-    int64_t v23;
-    int64_t v56; /* placeholder for void */
-    int64_t v68;
-    int64_t v74; /* placeholder for void */
-    int64_t v70; /* placeholder for void */
-    int64_t v49;
-    void* v100;
-    bool v17;
-    int64_t v41;
-    int64_t v47;
-    void* v12;
-    int64_t v33;
-    int64_t v10; /* placeholder for void */
-    int64_t v93; /* placeholder for void */
-    int64_t v13; /* placeholder for void */
-    void* v110;
-    int64_t v65; /* placeholder for void */
-    bool v50;
-    int64_t v39;
-    int64_t v72;
-    int64_t v7;
-    int64_t v102;
-    int64_t v18; /* placeholder for void */
-    int64_t v129; /* placeholder for void */
-    int64_t v19;
-    int64_t v42;
-    int64_t v73;
-    int64_t v48;
-    int64_t v111; /* placeholder for void */
-    int64_t v40;
-    void* v113;
-    int64_t v108;
-    int64_t v51; /* placeholder for void */
-    int64_t v22; /* placeholder for void */
-    int64_t v26;
-    bool v29;
-    int64_t v27;
-    void* v35;
-    void* v114;
-    int64_t v5; /* placeholder for void */
-    int64_t v21; /* placeholder for void */
-    int64_t v34;
-    int64_t v124; /* placeholder for void */
-    int64_t v106; /* placeholder for void */
-    int64_t v53;
-    int64_t v14; /* placeholder for void */
-    int64_t v135; /* placeholder for void */
-    int64_t v75; /* placeholder for void */
-    int64_t v15;
-    int64_t v71;
-    int64_t v87;
-    void* v123;
-    int64_t v38;
-    int64_t v107;
-    int64_t v55;
-    int64_t v94; /* placeholder for void */
-    int64_t v16;
-    int64_t v99;
-    int64_t v24;
-    int64_t v44; /* placeholder for void */
-    int64_t v11;
-    int64_t v85; /* placeholder for void */
-    int64_t v82;
-    void* v134;
-    int64_t v80; /* placeholder for void */
-    bool v88;
-    int64_t v52;
-    int64_t v98;
-    int64_t v101; /* placeholder for void */
-    void* v132;
-    int64_t v46;
-    void* v122;
-    void* v9;
-    int64_t v103;
-    void* v20;
-    int64_t v63; /* placeholder for void */
-    int64_t v25;
-    bool v84;
-    int64_t v54;
-    int64_t v115; /* placeholder for void */
-    int64_t v133; /* placeholder for void */
-    int64_t v31;
-    int64_t v67;
-    int64_t v81; /* placeholder for void */
-    int64_t v83;
-    void* v130;
-    void* v131;
-    void* v76;
-    void* v105;
-    int64_t v3;
-    int64_t v61;
-    int64_t v58;
-    int64_t v78; /* placeholder for void */
-    int64_t v79;
-    int64_t v86;
-    void* v109;
-    int64_t v96;
-    int64_t v119; /* placeholder for void */
-    int64_t v127;
-    int64_t v128; /* placeholder for void */
-    int64_t v60;
-    int64_t v28;
-    int64_t v95; /* placeholder for void */
-    void* v118;
-    int64_t v57;
-    int64_t v30; /* placeholder for void */
-    void* v91;
-    void* v43;
-    void* v116;
-    int64_t v8;
-    int64_t v45;
-    void* v92;
-    int64_t v66;
-    int64_t v36; /* placeholder for void */
-    v2 = 0LL;
-    v3 = (int64_t)HashMap_keys((void*)v2, v1);
-    v4 = malloc(8);
-    *(int64_t*)v4 = (int64_t)v3;
-    v6 = *(int64_t*)v4;
-    v7 = 0LL;
-    v8 = (int64_t)Vec_len((void*)v7, v6);
-    v9 = malloc(8);
-    *(int64_t*)v9 = (int64_t)v8;
-    v11 = 0LL;
-    v12 = malloc(8);
-    *(int64_t*)v12 = (int64_t)v11;
-    goto bb1;
-  bb1:
-    v15 = *(int64_t*)v12;
-    v16 = *(int64_t*)v9;
-    v17 = v15 < v16;
-    if (v17) goto bb2;
-    else goto bb3;
-  bb2:
-    v19 = 0LL;
     v20 = malloc(8);
-    *(int64_t*)v20 = (int64_t)v19;
-    goto bb4;
-  bb3:
-    v76 = _str4;
-    v77 = malloc(8);
-    *(void**)v77 = (void*)v76;
-    v79 = 0LL;
-    *(int64_t*)v12 = (int64_t)v79;
-    goto bb10;
-  bb4:
-    v23 = *(int64_t*)v20;
-    v24 = 1LL;
-    v25 = v23 + v24;
-    v26 = *(int64_t*)v9;
-    v27 = *(int64_t*)v12;
-    v28 = v26 - v27;
-    v29 = v25 < v28;
-    if (v29) goto bb5;
-    else goto bb6;
-  bb5:
-    v31 = *(int64_t*)v4;
-    v32 = *(int64_t*)v20;
-    v33 = 0LL;
-    v34 = (int64_t)Vec_get((void*)v33, v31, v32);
-    v35 = malloc(8);
-    *(int64_t*)v35 = (int64_t)v34;
-    v37 = *(int64_t*)v4;
-    v38 = *(int64_t*)v20;
-    v39 = 1LL;
-    v40 = v38 + v39;
-    v41 = 0LL;
-    v42 = (int64_t)Vec_get((void*)v41, v37, v40);
-    v43 = malloc(8);
-    *(int64_t*)v43 = (int64_t)v42;
-    v45 = *(int64_t*)v35;
-    v46 = *(int64_t*)v43;
-    v47 = 0LL;
-    v48 = (int64_t)p_str_compare((void*)v47, v45, v46);
-    v49 = 0LL;
-    v50 = v48 > v49;
-    if (v50) goto bb7;
-    else goto bb8;
-  bb6:
-    v71 = *(int64_t*)v12;
-    v72 = 1LL;
-    v73 = v71 + v72;
-    *(int64_t*)v12 = (int64_t)v73;
-    goto bb1;
-  bb7:
-    v52 = *(int64_t*)v4;
-    v53 = *(int64_t*)v20;
-    v54 = *(int64_t*)v43;
-    v55 = 0LL;
-    Vec_set((void*)v55, v52, v53, v54);
-    v57 = *(int64_t*)v4;
-    v58 = *(int64_t*)v20;
-    v59 = 1LL;
-    v60 = v58 + v59;
-    v61 = *(int64_t*)v35;
-    v62 = 0LL;
-    Vec_set((void*)v62, v57, v60, v61);
-    goto bb9;
-  bb8:
-    goto bb9;
-  bb9:
-    v66 = *(int64_t*)v20;
-    v67 = 1LL;
-    v68 = v66 + v67;
-    *(int64_t*)v20 = (int64_t)v68;
-    goto bb4;
-  bb10:
-    v82 = *(int64_t*)v12;
-    v83 = *(int64_t*)v9;
-    v84 = v82 < v83;
-    if (v84) goto bb11;
-    else goto bb12;
-  bb11:
-    v86 = *(int64_t*)v12;
-    v87 = 0LL;
-    v88 = v86 > v87;
-    if (v88) goto bb13;
-    else goto bb14;
-  bb12:
-    v130 = *(void**)v77;
-    v131 = _str5;
-    v132 = p_str_concat(v130, v131);
-    *(void**)v77 = (void*)v132;
-    v134 = *(void**)v77;
-    p_call_stack_pop();
-    return v134;
-  bb13:
-    v90 = *(void**)v77;
-    v91 = _str6;
-    v92 = p_str_concat(v90, v91);
-    *(void**)v77 = (void*)v92;
-    goto bb15;
-  bb14:
-    goto bb15;
-  bb15:
-    v96 = *(int64_t*)v4;
-    v97 = *(int64_t*)v12;
-    v98 = 0LL;
-    v99 = (int64_t)Vec_get((void*)v98, v96, v97);
-    v100 = malloc(8);
-    *(int64_t*)v100 = (int64_t)v99;
-    v102 = *(int64_t*)v100;
-    v103 = 0LL;
-    v104 = (int64_t)HashMap_get((void*)v103, v1, v102);
-    v105 = malloc(8);
-    *(int64_t*)v105 = (int64_t)v104;
-    v107 = *(int64_t*)v100;
-    v108 = 0LL;
-    v109 = p_str_from_ptr((void*)v108, v107);
-    v110 = malloc(8);
-    *(void**)v110 = (void*)v109;
-    v112 = *(void**)v77;
-    v113 = *(void**)v110;
-    v114 = p_str_concat(v112, v113);
-    *(void**)v77 = (void*)v114;
-    v116 = *(void**)v77;
-    v117 = _str7;
-    v118 = p_str_concat(v116, v117);
-    *(void**)v77 = (void*)v118;
-    v120 = *(void**)v77;
-    v121 = *(int64_t*)v105;
-    v122 = (void*)p_to_str((int64_t)v121);
-    v123 = p_str_concat(v120, v122);
-    *(void**)v77 = (void*)v123;
-    v125 = *(int64_t*)v12;
-    v126 = 1LL;
-    v127 = v125 + v126;
-    *(int64_t*)v12 = (int64_t)v127;
-    goto bb10;
-    return 0;
-}
-
-void Option_and_then(void* v0, void* v1, void* v2, void* v3) {
-    p_call_stack_push("Option_and_then");
-    int64_t v20;
-    int64_t v6;
-    void* v4;
-    int64_t v26; /* placeholder for void */
-    void* v32;
-    int64_t v35; /* placeholder for void */
-    int64_t v14; /* placeholder for void */
-    void* v37;
-    int64_t v42;
-    int64_t v15;
-    void* v18;
-    void* v41;
-    int64_t v44; /* placeholder for void */
-    int64_t v5;
-    int64_t v8; /* placeholder for void */
-    int64_t v45; /* placeholder for void */
-    int64_t v39; /* placeholder for void */
-    int64_t v43; /* placeholder for void */
-    void* v36;
-    int64_t v21; /* placeholder for void */
-    int64_t v24;
-    bool v30;
-    bool v7;
-    void* v11;
-    void* v22;
-    void* v27;
-    void* v9;
-    void* v16;
-    void* v40;
-    void* v34;
-    int64_t v38;
-    int64_t v10;
-    void* v13;
-    int64_t v31; /* placeholder for void */
-    int64_t v12;
-    int64_t v28;
-    int64_t v29;
-    void* v19;
-    int64_t v25; /* placeholder for void */
-    int64_t v33;
-    int64_t v46; /* placeholder for void */
-    int64_t v17; /* placeholder for void */
-    void* v23;
-    v4 = (char*)v2 + 0;
-    v5 = *(int64_t*)v4;
-    v6 = 0LL;
-    v7 = v5 == v6;
-    if (v7) goto bb2;
-    else goto bb3;
-  bb1:
-    p_call_stack_pop();
-    return;
-  bb2:
-    v9 = (char*)v2 + 8;
-    v10 = *(int64_t*)v9;
-    v11 = malloc(16);
-    v12 = 0LL;
-    v13 = (char*)v11 + 0;
-    *(int64_t*)v13 = (int64_t)v12;
-    {
-        if (!v3) abort();
-        char* _fn_name = *(char**)v3;
-        if (!_fn_name) abort();
-        if (strcmp(_fn_name, "str_parse_hex") == 0) {
-            v15 = str_parse_hex((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_char_count") == 0) {
-            v15 = String_char_count((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "abs") == 0) {
-            v15 = p_abs((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "p_str_length") == 0) {
-            v15 = p_str_length((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_first") == 0) {
-            v15 = Vec_first((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_clone") == 0) {
-            v15 = Vec_clone((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "HashMap_clone") == 0) {
-            v15 = HashMap_clone((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "HashMap_len") == 0) {
-            v15 = HashMap_len((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_bytes") == 0) {
-            v15 = String_bytes((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "ByteBuffer_len") == 0) {
-            v15 = ByteBuffer_len((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "Vec_len") == 0) {
-            v15 = Vec_len((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_clone") == 0) {
-            v15 = String_clone((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "HashMap_keys") == 0) {
-            v15 = HashMap_keys((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "str_parse_int") == 0) {
-            v15 = str_parse_int((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_trim") == 0) {
-            v15 = String_trim((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_capacity") == 0) {
-            v15 = Vec_capacity((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_parse_int") == 0) {
-            v15 = String_parse_int((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "char_to_upper") == 0) {
-            v15 = char_to_upper((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_last") == 0) {
-            v15 = Vec_last((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_pop") == 0) {
-            v15 = Vec_pop((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "allocator_bytes_used") == 0) {
-            v15 = allocator_bytes_used((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "Option_unwrap") == 0) {
-            v15 = Option_unwrap((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_to_string") == 0) {
-            v15 = String_to_string((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_to_lowercase") == 0) {
-            v15 = String_to_lowercase((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "StringBuilder_len") == 0) {
-            v15 = StringBuilder_len((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "p_str_hash") == 0) {
-            v15 = p_str_hash((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "char_to_lower") == 0) {
-            v15 = char_to_lower((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Result_unwrap") == 0) {
-            v15 = Result_unwrap((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_from") == 0) {
-            v15 = String_from((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_to_uppercase") == 0) {
-            v15 = String_to_uppercase((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "HashMap_values") == 0) {
-            v15 = HashMap_values((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "str_len") == 0) {
-            v15 = str_len((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_len") == 0) {
-            v15 = String_len((void*)v3, (int64_t)v10);
-        } else { abort(); }
-    }
-    v16 = (char*)v11 + 8;
-    *(int64_t*)v16 = (int64_t)v15;
-    v18 = (char*)v11 + 0;
-    v19 = (char*)v0 + 0;
-    v20 = *(int64_t*)v18;
-    *(int64_t*)v19 = (int64_t)v20;
-    v22 = (char*)v11 + 8;
-    v23 = (char*)v0 + 8;
-    v24 = *(int64_t*)v22;
-    *(int64_t*)v23 = (int64_t)v24;
-    p_call_stack_pop();
-    return;
-  bb3:
-    v27 = (char*)v2 + 0;
-    v28 = *(int64_t*)v27;
-    v29 = 1LL;
-    v30 = v28 == v29;
-    if (v30) goto bb4;
-    else goto bb5;
-  bb4:
-    v32 = malloc(16);
-    v33 = 1LL;
-    v34 = (char*)v32 + 0;
-    *(int64_t*)v34 = (int64_t)v33;
-    v36 = (char*)v32 + 0;
-    v37 = (char*)v0 + 0;
-    v38 = *(int64_t*)v36;
-    *(int64_t*)v37 = (int64_t)v38;
-    v40 = (char*)v32 + 8;
-    v41 = (char*)v0 + 8;
-    v42 = *(int64_t*)v40;
-    *(int64_t*)v41 = (int64_t)v42;
-    p_call_stack_pop();
-    return;
-  bb5:
-    goto bb1;
-    return;
-}
-
-void* str_bytes(void* v0, void* v1) {
-    p_call_stack_push("str_bytes");
-    int64_t v34;
-    int64_t v10;
-    int64_t v15;
-    int64_t v2;
-    int64_t v39;
-    int64_t v12; /* placeholder for void */
-    int64_t v40; /* placeholder for void */
-    int64_t v5; /* placeholder for void */
-    int64_t v14;
-    int64_t v17; /* placeholder for void */
-    int64_t v7;
-    void* v29;
-    void* v23;
-    int64_t v32; /* placeholder for void */
-    int64_t v35;
-    void* v8;
-    bool v16;
-    uint8_t v30;
-    int64_t v22;
-    int64_t v31; /* placeholder for void */
-    void* v33;
-    int64_t v27; /* placeholder for void */
-    int64_t v37;
-    void* v20;
-    int64_t v41; /* placeholder for void */
-    void* v42;
-    int64_t v19;
-    int64_t v24; /* placeholder for void */
-    int64_t v38;
-    int64_t v6;
-    int64_t v25;
-    void* v4;
-    int64_t v13; /* placeholder for void */
-    int64_t v18;
-    int64_t v21; /* placeholder for void */
-    void* v11;
-    void* v26;
-    int64_t v36; /* placeholder for void */
-    int64_t v28; /* placeholder for void */
-    int64_t v43; /* placeholder for void */
-    void* v3;
-    int64_t v9; /* placeholder for void */
-    v2 = 0LL;
-    v3 = (void*)Vec_new((void*)v2);
-    v4 = malloc(8);
-    *(void**)v4 = (void*)v3;
-    v6 = 0LL;
-    v7 = (int64_t)String_len((void*)v6, (int64_t)v1);
-    v8 = malloc(8);
-    *(int64_t*)v8 = (int64_t)v7;
-    v10 = 0LL;
-    v11 = malloc(8);
-    *(int64_t*)v11 = (int64_t)v10;
-    goto bb1;
-  bb1:
-    v14 = *(int64_t*)v11;
-    v15 = *(int64_t*)v8;
-    v16 = v14 < v15;
-    if (v16) goto bb2;
-    else goto bb3;
-  bb2:
-    v18 = *(int64_t*)v11;
-    v19 = (int64_t)v1 + v18;
-    v20 = malloc(8);
-    *(int64_t*)v20 = (int64_t)v19;
+    *(int64_t*)v20 = (int64_t)v1;
     v22 = *(int64_t*)v20;
     v23 = malloc(8);
     *(void**)v23 = (void*)v22;
@@ -8383,772 +5659,511 @@ void* str_bytes(void* v0, void* v1) {
     *(int64_t*)v26 = (int64_t)v25;
     v29 = *(void**)v23;
     v30 = *(uint8_t*)v29;
-    *(int64_t*)v26 = (int64_t)v30;
-    v33 = *(void**)v4;
-    v34 = *(int64_t*)v26;
-    v35 = 0LL;
-    Vec_push((void*)v35, (int64_t)v33, v34);
-    v37 = *(int64_t*)v11;
-    v38 = 1LL;
-    v39 = v37 + v38;
-    *(int64_t*)v11 = (int64_t)v39;
-    goto bb1;
-  bb3:
-    v42 = *(void**)v4;
-    p_call_stack_pop();
-    return v42;
-    return 0;
-}
-
-bool char_is_whitespace(void* v0, int64_t v1) {
-    p_call_stack_push("char_is_whitespace");
-    int64_t v2;
-    bool v3;
-    int64_t v13; /* placeholder for void */
-    int64_t v4;
-    bool v9;
-    int64_t v10;
-    bool v5;
-    bool v6;
-    bool v8;
-    bool v11;
-    bool v12;
-    int64_t v7;
-    v2 = 32LL;
-    v3 = v1 == v2;
-    v4 = 9LL;
-    v5 = v1 == v4;
-    v6 = v3 || v5;
-    v7 = 10LL;
-    v8 = v1 == v7;
-    v9 = v6 || v8;
-    v10 = 13LL;
-    v11 = v1 == v10;
-    v12 = v9 || v11;
-    p_call_stack_pop();
-    return v12;
-    return 0;
-}
-
-bool Option_is_some(void* v0, void* v1) {
-    p_call_stack_push("Option_is_some");
-    int64_t v13;
-    int64_t v10; /* placeholder for void */
-    bool v16;
-    int64_t v17; /* placeholder for void */
-    bool v19;
-    bool v9;
-    void* v7;
-    int64_t v8;
-    bool v5;
-    int64_t v4;
-    int64_t v3;
-    void* v2;
-    int64_t v20; /* placeholder for void */
-    void* v11;
-    int64_t v6; /* placeholder for void */
-    bool v14;
-    int64_t v15; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    int64_t v12;
-    v2 = (char*)v1 + 0;
-    v3 = *(int64_t*)v2;
-    v4 = 0LL;
-    v5 = v3 == v4;
-    if (v5) goto bb2;
-    else goto bb3;
-  bb1:
-    v19 = false;
-    p_call_stack_pop();
-    return v19;
-  bb2:
-    v7 = (char*)v1 + 8;
-    v8 = *(int64_t*)v7;
-    v9 = true;
-    p_call_stack_pop();
-    return v9;
-  bb3:
-    v11 = (char*)v1 + 0;
-    v12 = *(int64_t*)v11;
-    v13 = 1LL;
-    v14 = v12 == v13;
-    if (v14) goto bb4;
-    else goto bb5;
-  bb4:
-    v16 = false;
-    p_call_stack_pop();
-    return v16;
-  bb5:
-    goto bb1;
-    return 0;
-}
-
-void* byte_to_str(void* v0, int64_t v1) {
-    p_call_stack_push("byte_to_str");
-    void* v2;
-    int64_t v3; /* placeholder for void */
-    v2 = p_char_to_str(v1);
-    p_call_stack_pop();
-    return v2;
-    return 0;
-}
-
-void* str_split(void* v0, void* v1, void* v2) {
-    p_call_stack_push("str_split");
-    void* v19;
-    void* v115;
-    int64_t v22;
-    void* v67;
-    int64_t v99;
-    void* v12;
-    int64_t v119;
-    void* v27;
-    int64_t v46;
-    int64_t v56;
-    bool v48;
-    void* v76;
-    bool v82;
-    void* v23;
-    int64_t v41; /* placeholder for void */
-    int64_t v52;
-    int64_t v86; /* placeholder for void */
-    int64_t v103;
-    int64_t v81;
-    int64_t v7;
-    int64_t v17; /* placeholder for void */
-    int64_t v28; /* placeholder for void */
-    int64_t v65; /* placeholder for void */
-    int64_t v68; /* placeholder for void */
-    int64_t v69;
-    int64_t v63;
-    int64_t v123; /* placeholder for void */
-    int64_t v3;
-    int64_t v20; /* placeholder for void */
-    void* v54;
-    int64_t v91; /* placeholder for void */
-    int64_t v14; /* placeholder for void */
-    int64_t v6; /* placeholder for void */
-    bool v10;
-    int64_t v118;
-    int64_t v80;
-    int64_t v96;
-    int64_t v98;
-    int64_t v35;
-    int64_t v29;
-    int64_t v32; /* placeholder for void */
-    void* v64;
-    int64_t v102;
-    int64_t v116;
-    int64_t v33;
-    int64_t v57;
-    int64_t v105; /* placeholder for void */
-    int64_t v72; /* placeholder for void */
-    int64_t v104;
-    int64_t v112; /* placeholder for void */
-    int64_t v21;
-    void* v5;
-    int64_t v45; /* placeholder for void */
-    int64_t v110;
-    int64_t v106;
-    int64_t v92; /* placeholder for void */
-    void* v43;
-    int64_t v36;
-    void* v40;
-    int64_t v79; /* placeholder for void */
-    int64_t v13;
-    int64_t v50;
-    int64_t v71; /* placeholder for void */
-    void* v15;
-    int64_t v109;
-    int64_t v83; /* placeholder for void */
-    int64_t v107; /* placeholder for void */
-    int64_t v78; /* placeholder for void */
-    int64_t v51;
-    uint8_t v74;
-    int64_t v90;
-    bool v84;
-    int64_t v53;
-    int64_t v25;
-    int64_t v31; /* placeholder for void */
-    int64_t v117;
-    bool v93;
-    int64_t v121; /* placeholder for void */
-    int64_t v60;
-    int64_t v100;
-    int64_t v9;
-    int64_t v8;
-    bool v39;
-    int64_t v120;
-    int64_t v18;
-    int64_t v38; /* placeholder for void */
-    int64_t v75; /* placeholder for void */
-    void* v73;
-    int64_t v47;
-    int64_t v85; /* placeholder for void */
-    void* v122;
-    void* v61;
-    int64_t v97;
-    int64_t v111;
-    int64_t v26;
-    int64_t v34;
-    int64_t v114; /* placeholder for void */
-    int64_t v94; /* placeholder for void */
-    int64_t v44; /* placeholder for void */
-    int64_t v49; /* placeholder for void */
-    uint8_t v77;
-    void* v4;
-    int64_t v42;
-    int64_t v108; /* placeholder for void */
-    bool v37;
-    int64_t v55; /* placeholder for void */
-    int64_t v89;
-    int64_t v101; /* placeholder for void */
-    void* v95;
-    int64_t v11; /* placeholder for void */
-    void* v58;
-    void* v70;
-    int64_t v88;
-    int64_t v24; /* placeholder for void */
-    int64_t v16; /* placeholder for void */
-    int64_t v62; /* placeholder for void */
-    int64_t v59; /* placeholder for void */
-    int64_t v113; /* placeholder for void */
-    int64_t v66;
-    void* v30;
-    int64_t v87; /* placeholder for void */
-    v3 = 0LL;
-    v4 = (void*)Vec_new((void*)v3);
-    v5 = malloc(8);
-    *(void**)v5 = (void*)v4;
-    v7 = 0LL;
-    v8 = (int64_t)String_len((void*)v7, (int64_t)v2);
-    v9 = 0LL;
-    v10 = v8 == v9;
-    if (v10) goto bb1;
-    else goto bb2;
-  bb1:
-    v12 = *(void**)v5;
-    v13 = 0LL;
-    Vec_push((void*)v13, (int64_t)v12, (int64_t)v1);
-    v15 = *(void**)v5;
-    p_call_stack_pop();
-    return v15;
-  bb2:
-    goto bb3;
-  bb3:
-    v18 = 0LL;
-    v19 = malloc(8);
-    *(int64_t*)v19 = (int64_t)v18;
-    v21 = 0LL;
-    v22 = (int64_t)String_len((void*)v21, (int64_t)v1);
-    v23 = malloc(8);
-    *(int64_t*)v23 = (int64_t)v22;
-    v25 = 0LL;
-    v26 = (int64_t)String_len((void*)v25, (int64_t)v2);
-    v27 = malloc(8);
-    *(int64_t*)v27 = (int64_t)v26;
-    v29 = 0LL;
-    v30 = malloc(8);
-    *(int64_t*)v30 = (int64_t)v29;
+    v31 = malloc(8);
+    *(int64_t*)v31 = (int64_t)v30;
     goto bb4;
   bb4:
-    v33 = *(int64_t*)v30;
-    v34 = *(int64_t*)v23;
-    v35 = *(int64_t*)v27;
-    v36 = v34 - v35;
-    v37 = v33 <= v36;
-    if (v37) goto bb5;
+    v34 = *(int64_t*)v31;
+    v35 = 0LL;
+    v36 = v34 != v35;
+    if (v36) goto bb5;
     else goto bb6;
   bb5:
-    v39 = true;
-    v40 = malloc(1);
-    *(bool*)v40 = v39;
-    v42 = 0LL;
-    v43 = malloc(8);
-    *(int64_t*)v43 = (int64_t)v42;
-    goto bb7;
+    v38 = *(int64_t*)v26;
+    v39 = 1LL;
+    v40 = v38 + v39;
+    *(int64_t*)v26 = (int64_t)v40;
+    v42 = *(int64_t*)v20;
+    v43 = 1LL;
+    v44 = v42 + v43;
+    *(int64_t*)v20 = (int64_t)v44;
+    v46 = *(int64_t*)v20;
+    *(void**)v23 = (void*)v46;
+    v48 = *(void**)v23;
+    v49 = *(uint8_t*)v48;
+    *(int64_t*)v31 = (int64_t)v49;
+    goto bb4;
   bb6:
-    v115 = *(void**)v5;
-    v116 = *(int64_t*)v19;
-    v117 = *(int64_t*)v23;
-    v118 = 0LL;
-    v119 = (int64_t)String_slice((void*)v118, (int64_t)v1, v116, v117);
-    v120 = 0LL;
-    Vec_push((void*)v120, (int64_t)v115, v119);
-    v122 = *(void**)v5;
-    p_call_stack_pop();
-    return v122;
+    v53 = *(int64_t*)v26;
+    v54 = 1LL;
+    v55 = v53 + v54;
+    v56 = p_malloc(v55);
+    v57 = malloc(8);
+    *(int64_t*)v57 = (int64_t)v56;
+    v59 = *(int64_t*)v57;
+    v60 = malloc(8);
+    *(void**)v60 = (void*)v59;
+    v62 = malloc(8);
+    *(int64_t*)v62 = (int64_t)v1;
+    v64 = *(int64_t*)v62;
+    v65 = malloc(8);
+    *(void**)v65 = (void*)v64;
+    v68 = 0LL;
+    v69 = malloc(8);
+    *(int64_t*)v69 = (int64_t)v68;
+    goto bb7;
   bb7:
-    v46 = *(int64_t*)v43;
-    v47 = *(int64_t*)v27;
-    v48 = v46 < v47;
-    if (v48) goto bb8;
+    v72 = *(int64_t*)v69;
+    v73 = *(int64_t*)v26;
+    v74 = v72 < v73;
+    if (v74) goto bb8;
     else goto bb9;
   bb8:
-    v50 = *(int64_t*)v30;
-    v51 = (int64_t)v1 + v50;
-    v52 = *(int64_t*)v43;
-    v53 = v51 + v52;
+    v76 = *(void**)v65;
+    v77 = *(uint8_t*)v76;
+    v78 = malloc(8);
+    *(int64_t*)v78 = (int64_t)v77;
+    v80 = *(void**)v60;
+    v81 = *(int64_t*)v78;
+    *(uint8_t*)v80 = (uint8_t)v81;
+    v83 = *(int64_t*)v69;
+    v84 = 1LL;
+    v85 = v83 + v84;
+    *(int64_t*)v69 = (int64_t)v85;
+    v87 = *(int64_t*)v62;
+    v88 = 1LL;
+    v89 = v87 + v88;
+    *(int64_t*)v62 = (int64_t)v89;
+    v91 = *(int64_t*)v62;
+    *(void**)v65 = (void*)v91;
+    v93 = *(void**)v60;
+    v94 = malloc(8);
+    *(int64_t*)v94 = (int64_t)v93;
+    v96 = *(int64_t*)v94;
+    v97 = 1LL;
+    v98 = v96 + v97;
+    *(int64_t*)v94 = (int64_t)v98;
+    v100 = *(int64_t*)v94;
+    *(void**)v60 = (void*)v100;
+    goto bb7;
+  bb9:
+    v103 = *(void**)v60;
+    v104 = 0LL;
+    *(uint8_t*)v103 = (uint8_t)v104;
+    v107 = *(int64_t*)v57;
+    v108 = malloc(8);
+    *(void**)v108 = (void*)v107;
+    v110 = *(void**)v108;
+    p_call_stack_pop();
+    return v110;
+    return 0;
+}
+
+int64_t String_to_lowercase(void* v0, int64_t v1) {
+    p_call_stack_push("String_to_lowercase");
+    int64_t v83; /* placeholder for void */
+    int64_t v11; /* placeholder for void */
+    int64_t v97; /* placeholder for void */
+    void* v51;
+    int64_t v42;
+    int64_t v4; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    int64_t v52; /* placeholder for void */
+    int64_t v72; /* placeholder for void */
+    int64_t v73; /* placeholder for void */
+    int64_t v29; /* placeholder for void */
+    int64_t v55; /* placeholder for void */
+    int64_t v77;
+    bool v36;
+    void* v88;
+    int64_t v71;
+    int64_t v8; /* placeholder for void */
+    int64_t v41; /* placeholder for void */
+    int64_t v92; /* placeholder for void */
+    int64_t v5;
+    int64_t v17;
+    void* v31;
+    void* v91;
+    uint8_t v58;
+    int64_t v34;
+    void* v28;
+    int64_t v84; /* placeholder for void */
+    int64_t v74; /* placeholder for void */
+    int64_t v46; /* placeholder for void */
+    int64_t v38;
+    int64_t v49; /* placeholder for void */
+    int64_t v99; /* placeholder for void */
+    int64_t v30;
+    int64_t v70;
+    int64_t v62;
+    void* v13;
+    int64_t v32; /* placeholder for void */
+    void* v48;
+    int64_t v18; /* placeholder for void */
+    int64_t v60; /* placeholder for void */
+    bool v67;
+    int64_t v68; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    int64_t v79; /* placeholder for void */
+    int64_t v85;
+    int64_t v33; /* placeholder for void */
+    int64_t v87;
+    int64_t v23; /* placeholder for void */
+    int64_t v96; /* placeholder for void */
+    int64_t v35;
+    int64_t v59; /* placeholder for void */
+    void* v6;
+    void* v54;
+    int64_t v39;
+    int64_t v47;
+    bool v63;
+    int64_t v78; /* placeholder for void */
+    int64_t v82;
+    int64_t v89; /* placeholder for void */
+    int64_t v53;
+    int64_t v61;
+    void* v76;
+    void* v57;
+    int64_t v90;
+    int64_t v19; /* placeholder for void */
+    int64_t v21;
+    int64_t v14;
+    void* v27;
+    int64_t v86;
+    void* v40;
+    void* v22;
+    int64_t v25;
+    int64_t v50;
+    int64_t v56; /* placeholder for void */
+    int64_t v81;
+    bool v66;
+    int64_t v20;
+    int64_t v43;
+    bool v3;
+    int64_t v2;
+    void* v10;
+    int64_t v24;
+    int64_t v16; /* placeholder for void */
+    int64_t v75; /* placeholder for void */
+    int64_t v95;
+    int64_t v64;
+    int64_t v98;
+    int64_t v80;
+    int64_t v44;
+    void* v45;
+    void* v94;
+    int64_t v26;
+    void* v7;
+    int64_t v9;
+    int64_t v65;
+    int64_t v69;
+    int64_t v93; /* placeholder for void */
+    int64_t v37; /* placeholder for void */
+    v2 = 0LL;
+    v3 = v1 == v2;
+    if (v3) goto bb1;
+    else goto bb2;
+  bb1:
+    v5 = 1LL;
+    v6 = p_malloc(v5);
+    v7 = malloc(8);
+    *(int64_t*)v7 = (int64_t)v6;
+    v9 = *(int64_t*)v7;
+    v10 = malloc(8);
+    *(void**)v10 = (void*)v9;
+    v13 = *(void**)v10;
+    v14 = 0LL;
+    *(uint8_t*)v13 = (uint8_t)v14;
+    v17 = *(int64_t*)v7;
+    p_call_stack_pop();
+    return v17;
+  bb2:
+    goto bb3;
+  bb3:
+    v20 = 0LL;
+    v21 = (int64_t)p_str_length((void*)v20, v1);
+    v22 = malloc(8);
+    *(int64_t*)v22 = (int64_t)v21;
+    v24 = *(int64_t*)v22;
+    v25 = 1LL;
+    v26 = v24 + v25;
+    v27 = p_malloc(v26);
+    v28 = malloc(8);
+    *(int64_t*)v28 = (int64_t)v27;
+    v30 = 0LL;
+    v31 = malloc(8);
+    *(int64_t*)v31 = (int64_t)v30;
+    goto bb4;
+  bb4:
+    v34 = *(int64_t*)v31;
+    v35 = *(int64_t*)v22;
+    v36 = v34 < v35;
+    if (v36) goto bb5;
+    else goto bb6;
+  bb5:
+    v38 = *(int64_t*)v31;
+    v39 = v1 + v38;
+    v40 = malloc(8);
+    *(int64_t*)v40 = (int64_t)v39;
+    v42 = *(int64_t*)v28;
+    v43 = *(int64_t*)v31;
+    v44 = v42 + v43;
+    v45 = malloc(8);
+    *(int64_t*)v45 = (int64_t)v44;
+    v47 = *(int64_t*)v40;
+    v48 = malloc(8);
+    *(void**)v48 = (void*)v47;
+    v50 = *(int64_t*)v45;
+    v51 = malloc(8);
+    *(void**)v51 = (void*)v50;
+    v53 = 0LL;
     v54 = malloc(8);
     *(int64_t*)v54 = (int64_t)v53;
-    v56 = *(int64_t*)v43;
-    v57 = (int64_t)v2 + v56;
-    v58 = malloc(8);
-    *(int64_t*)v58 = (int64_t)v57;
-    v60 = *(int64_t*)v54;
-    v61 = malloc(8);
-    *(void**)v61 = (void*)v60;
-    v63 = *(int64_t*)v58;
-    v64 = malloc(8);
-    *(void**)v64 = (void*)v63;
-    v66 = 0LL;
-    v67 = malloc(8);
-    *(int64_t*)v67 = (int64_t)v66;
-    v69 = 0LL;
-    v70 = malloc(8);
-    *(int64_t*)v70 = (int64_t)v69;
-    v73 = *(void**)v61;
-    v74 = *(uint8_t*)v73;
-    *(int64_t*)v67 = (int64_t)v74;
-    v76 = *(void**)v64;
-    v77 = *(uint8_t*)v76;
-    *(int64_t*)v70 = (int64_t)v77;
-    v80 = *(int64_t*)v67;
-    v81 = *(int64_t*)v70;
-    v82 = v80 != v81;
-    if (v82) goto bb10;
-    else goto bb11;
-  bb9:
-    v93 = *(bool*)v40;
-    if (v93) goto bb13;
-    else goto bb14;
-  bb10:
-    v84 = false;
-    *(bool*)v40 = v84;
+    v57 = *(void**)v48;
+    v58 = *(uint8_t*)v57;
+    *(int64_t*)v54 = (int64_t)v58;
+    v61 = *(int64_t*)v54;
+    v62 = 65LL;
+    v63 = v61 >= v62;
+    v64 = *(int64_t*)v54;
+    v65 = 90LL;
+    v66 = v64 <= v65;
+    v67 = v63 && v66;
+    if (v67) goto bb7;
+    else goto bb8;
+  bb6:
+    v85 = *(int64_t*)v28;
+    v86 = *(int64_t*)v22;
+    v87 = v85 + v86;
+    v88 = malloc(8);
+    *(int64_t*)v88 = (int64_t)v87;
+    v90 = *(int64_t*)v88;
+    v91 = malloc(8);
+    *(void**)v91 = (void*)v90;
+    v94 = *(void**)v91;
+    v95 = 0LL;
+    *(uint8_t*)v94 = (uint8_t)v95;
+    v98 = *(int64_t*)v28;
+    p_call_stack_pop();
+    return v98;
+  bb7:
+    v69 = *(int64_t*)v54;
+    v70 = 32LL;
+    v71 = v69 + v70;
+    *(int64_t*)v54 = (int64_t)v71;
     goto bb9;
-  bb11:
-    goto bb12;
-  bb12:
-    v88 = *(int64_t*)v43;
-    v89 = 1LL;
-    v90 = v88 + v89;
-    *(int64_t*)v43 = (int64_t)v90;
-    goto bb7;
-  bb13:
-    v95 = *(void**)v5;
-    v96 = *(int64_t*)v19;
-    v97 = *(int64_t*)v30;
-    v98 = 0LL;
-    v99 = (int64_t)String_slice((void*)v98, (int64_t)v1, v96, v97);
-    v100 = 0LL;
-    Vec_push((void*)v100, (int64_t)v95, v99);
-    v102 = *(int64_t*)v30;
-    v103 = *(int64_t*)v27;
-    v104 = v102 + v103;
-    *(int64_t*)v19 = (int64_t)v104;
-    v106 = *(int64_t*)v19;
-    *(int64_t*)v30 = (int64_t)v106;
-    goto bb15;
-  bb14:
-    v109 = *(int64_t*)v30;
-    v110 = 1LL;
-    v111 = v109 + v110;
-    *(int64_t*)v30 = (int64_t)v111;
-    goto bb15;
-  bb15:
+  bb8:
+    goto bb9;
+  bb9:
+    v76 = *(void**)v51;
+    v77 = *(int64_t*)v54;
+    *(uint8_t*)v76 = (uint8_t)v77;
+    v80 = *(int64_t*)v31;
+    v81 = 1LL;
+    v82 = v80 + v81;
+    *(int64_t*)v31 = (int64_t)v82;
     goto bb4;
     return 0;
 }
 
-int64_t str_find(void* v0, void* v1, void* v2) {
-    p_call_stack_push("str_find");
-    int64_t v3;
-    int64_t v4;
-    int64_t v5; /* placeholder for void */
-    v3 = 0LL;
-    v4 = (int64_t)String_find((void*)v3, (int64_t)v1, (int64_t)v2);
-    p_call_stack_pop();
-    return v4;
-    return 0;
-}
-
-int64_t main_entry(void* v0) {
-    p_call_stack_push("main");
-    int64_t v22; /* placeholder for void */
-    int64_t v3;
-    int64_t v16; /* placeholder for void */
-    int64_t v13;
-    int64_t v2; /* placeholder for void */
-    void* v20;
-    bool v15;
-    void* v9;
-    void* v4;
-    int64_t v10; /* placeholder for void */
-    int64_t v6;
-    void* v1;
-    int64_t v19; /* placeholder for void */
-    int64_t v14;
-    int64_t v8;
-    int64_t v18; /* placeholder for void */
-    int64_t v21; /* placeholder for void */
-    int64_t v12; /* placeholder for void */
-    int64_t v5; /* placeholder for void */
-    int64_t v23; /* placeholder for void */
-    int64_t v7;
-    void* v17;
-    int64_t v11;
-    v1 = _str8;
-    p_print_str(v1);
-    v3 = 42LL;
-    v4 = malloc(8);
-    *(int64_t*)v4 = (int64_t)v3;
-    v6 = *(int64_t*)v4;
-    v7 = 8LL;
-    v8 = v6 + v7;
-    v9 = malloc(8);
-    *(int64_t*)v9 = (int64_t)v8;
-    v11 = *(int64_t*)v9;
-    p_print_int((int64_t)v11);
-    v13 = *(int64_t*)v9;
-    v14 = 40LL;
-    v15 = v13 > v14;
-    if (v15) goto bb1;
-    else goto bb2;
-  bb1:
-    v17 = _str9;
-    p_print_str(v17);
-    goto bb3;
-  bb2:
-    v20 = _str10;
-    p_print_str(v20);
-    goto bb3;
-  bb3:
-    p_call_stack_pop();
-    return 0;
-    return 0;
-}
-
-bool char_is_upper(void* v0, int64_t v1) {
-    p_call_stack_push("char_is_upper");
-    bool v3;
-    bool v5;
-    bool v6;
-    int64_t v4;
-    int64_t v2;
-    int64_t v7; /* placeholder for void */
-    v2 = 65LL;
-    v3 = v1 >= v2;
-    v4 = 90LL;
-    v5 = v1 <= v4;
-    v6 = v3 && v5;
-    p_call_stack_pop();
-    return v6;
-    return 0;
-}
-
-int64_t Option_unwrap(void* v0, void* v1) {
-    p_call_stack_push("Option_unwrap");
-    int64_t v20; /* placeholder for void */
-    bool v5;
-    void* v2;
-    int64_t v3;
-    void* v7;
-    int64_t v14; /* placeholder for void */
-    void* v10;
-    void* v15;
-    int64_t v18; /* placeholder for void */
-    int64_t v19;
-    int64_t v17; /* placeholder for void */
-    int64_t v16; /* placeholder for void */
-    int64_t v12;
-    int64_t v11;
-    int64_t v4;
-    int64_t v6; /* placeholder for void */
-    bool v13;
-    int64_t v9; /* placeholder for void */
-    int64_t v8;
-    v2 = (char*)v1 + 0;
-    v3 = *(int64_t*)v2;
-    v4 = 0LL;
-    v5 = v3 == v4;
-    if (v5) goto bb2;
-    else goto bb3;
-  bb1:
-    v19 = 0LL;
-    p_call_stack_pop();
-    return v19;
-  bb2:
-    v7 = (char*)v1 + 8;
-    v8 = *(int64_t*)v7;
-    p_call_stack_pop();
-    return v8;
-  bb3:
-    v10 = (char*)v1 + 0;
-    v11 = *(int64_t*)v10;
-    v12 = 1LL;
-    v13 = v11 == v12;
-    if (v13) goto bb4;
-    else goto bb5;
-  bb4:
-    v15 = _str11;
-    p_panic(v15);
-    goto bb1;
-  bb5:
-    goto bb1;
-    return 0;
-}
-
-void* str_to_upper(void* v0, void* v1) {
-    p_call_stack_push("str_to_upper");
+int64_t String_char_count(void* v0, int64_t v1) {
+    p_call_stack_push("String_char_count");
     int64_t v4; /* placeholder for void */
-    int64_t v3;
     int64_t v2;
-    v2 = 0LL;
-    v3 = (int64_t)String_to_uppercase((void*)v2, (int64_t)v1);
-    p_call_stack_pop();
-    return (void*)v3;
-    return 0;
-}
-
-int64_t ByteBuffer_read_byte(void* v0, void* v1, int64_t v2) {
-    p_call_stack_push("ByteBuffer_read_byte");
     int64_t v3;
-    void* v14;
-    int64_t v12; /* placeholder for void */
-    int64_t v11;
-    bool v7;
-    int64_t v10;
-    int64_t v6;
-    int64_t v16;
-    void* v15;
-    bool v8;
-    int64_t v17;
-    int64_t v18; /* placeholder for void */
-    int64_t v13; /* placeholder for void */
-    int64_t v9; /* placeholder for void */
-    void* v5;
-    bool v4;
-    v3 = 0LL;
-    v4 = v2 < v3;
-    v5 = (char*)v1 + 8;
-    v6 = *(int64_t*)v5;
-    v7 = v2 >= v6;
-    v8 = v4 || v7;
-    if (v8) goto bb1;
-    else goto bb2;
-  bb1:
-    v10 = 1LL;
-    v11 = -v10;
+    v2 = 0LL;
+    v3 = (int64_t)p_str_length((void*)v2, v1);
     p_call_stack_pop();
-    return v11;
-  bb2:
-    goto bb3;
-  bb3:
-    v14 = (char*)v1 + 0;
-    v15 = *(void**)v14;
-    v16 = 0LL;
-    v17 = (int64_t)Vec_get((void*)v16, (int64_t)v15, v2);
-    p_call_stack_pop();
-    return v17;
+    return v3;
     return 0;
 }
 
 int64_t String_replace(void* v0, int64_t v1, int64_t v2, int64_t v3) {
     p_call_stack_push("String_replace");
+    int64_t v192;
+    int64_t v185;
     int64_t v64;
-    int64_t v37;
-    int64_t v134;
-    int64_t v165; /* placeholder for void */
-    void* v61;
-    bool v123;
-    int64_t v196;
-    int64_t v18; /* placeholder for void */
-    int64_t v44;
-    int64_t v87; /* placeholder for void */
-    void* v163;
-    int64_t v119;
-    void* v69;
-    int64_t v90;
-    int64_t v131; /* placeholder for void */
-    int64_t v63; /* placeholder for void */
-    int64_t v140;
-    int64_t v47; /* placeholder for void */
-    int64_t v110; /* placeholder for void */
-    int64_t v193; /* placeholder for void */
-    int64_t v174; /* placeholder for void */
-    void* v103;
-    bool v25;
-    int64_t v114; /* placeholder for void */
-    bool v83;
+    int64_t v31; /* placeholder for void */
+    int64_t v187; /* placeholder for void */
+    int64_t v48;
     bool v132;
-    int64_t v149; /* placeholder for void */
-    bool v26;
-    int64_t v50; /* placeholder for void */
-    int64_t v108;
-    int64_t v102;
-    void* v112;
-    void* v57;
-    int64_t v167;
-    bool v5;
-    int64_t v95;
-    int64_t v65;
-    int64_t v172;
-    int64_t v14; /* placeholder for void */
-    int64_t v170;
-    int64_t v101; /* placeholder for void */
-    int64_t v54; /* placeholder for void */
-    int64_t v129;
-    int64_t v133; /* placeholder for void */
-    int64_t v186;
-    int64_t v190;
-    int64_t v86; /* placeholder for void */
-    void* v148;
-    int64_t v107; /* placeholder for void */
-    int64_t v99;
-    int64_t v135;
-    int64_t v158;
-    int64_t v92;
-    int64_t v168; /* placeholder for void */
-    void* v46;
-    int64_t v20; /* placeholder for void */
-    int64_t v74; /* placeholder for void */
-    int64_t v96;
-    int64_t v144;
-    int64_t v127;
-    bool v68;
-    int64_t v76;
-    int64_t v81;
-    int64_t v138;
-    int64_t v56;
-    uint8_t v116;
-    int64_t v171;
-    void* v12;
-    int64_t v60;
-    void* v100;
-    bool v121;
-    int64_t v139;
-    int64_t v82;
-    int64_t v130; /* placeholder for void */
+    int64_t v44;
     void* v151;
     int64_t v194; /* placeholder for void */
-    bool v85;
-    int64_t v147;
-    int64_t v120;
-    int64_t v185;
-    void* v34;
-    int64_t v67; /* placeholder for void */
-    void* v106;
-    int64_t v21; /* placeholder for void */
-    int64_t v22;
-    int64_t v91;
-    int64_t v28;
-    void* v173;
-    int64_t v89;
-    bool v38;
-    void* v45;
-    void* v145;
-    int64_t v136;
-    int64_t v187; /* placeholder for void */
-    int64_t v51; /* placeholder for void */
-    void* v8;
-    int64_t v162;
-    int64_t v78; /* placeholder for void */
-    void* v176;
-    void* v9;
-    int64_t v11;
-    void* v72;
-    int64_t v30; /* placeholder for void */
-    void* v109;
-    int64_t v175;
-    int64_t v6; /* placeholder for void */
-    int64_t v184;
-    int64_t v16;
-    int64_t v128;
-    int64_t v24;
-    int64_t v41;
-    int64_t v122; /* placeholder for void */
-    void* v15;
-    int64_t v40;
-    int64_t v36;
-    void* v159;
-    int64_t v161; /* placeholder for void */
-    int64_t v153; /* placeholder for void */
-    void* v160;
-    int64_t v191;
-    int64_t v192;
-    bool v77;
-    int64_t v94; /* placeholder for void */
-    int64_t v177; /* placeholder for void */
-    bool v66;
-    int64_t v73; /* placeholder for void */
-    uint8_t v155;
-    int64_t v169; /* placeholder for void */
-    void* v49;
-    int64_t v71;
-    int64_t v75;
-    int64_t v10; /* placeholder for void */
-    int64_t v59;
-    int64_t v79;
-    int64_t v111; /* placeholder for void */
-    uint8_t v113;
-    int64_t v141; /* placeholder for void */
-    int64_t v183;
-    void* v52;
-    int64_t v32;
-    void* v93;
-    int64_t v27; /* placeholder for void */
-    int64_t v143;
-    int64_t v181; /* placeholder for void */
-    int64_t v189; /* placeholder for void */
-    int64_t v88; /* placeholder for void */
-    int64_t v126; /* placeholder for void */
-    int64_t v124; /* placeholder for void */
-    int64_t v55; /* placeholder for void */
-    void* v154;
-    int64_t v195; /* placeholder for void */
-    int64_t v178; /* placeholder for void */
-    int64_t v157; /* placeholder for void */
-    int64_t v98; /* placeholder for void */
-    int64_t v152; /* placeholder for void */
-    int64_t v19;
-    int64_t v182; /* placeholder for void */
-    void* v179;
-    int64_t v118; /* placeholder for void */
-    int64_t v4;
-    int64_t v48;
     int64_t v53;
-    int64_t v58; /* placeholder for void */
+    int64_t v4;
+    int64_t v130; /* placeholder for void */
+    uint8_t v116;
+    int64_t v89;
+    int64_t v175;
     int64_t v104; /* placeholder for void */
-    int64_t v43; /* placeholder for void */
-    int64_t v70; /* placeholder for void */
-    int64_t v84; /* placeholder for void */
-    int64_t v156; /* placeholder for void */
-    int64_t v164; /* placeholder for void */
-    int64_t v197; /* placeholder for void */
-    void* v97;
-    int64_t v17; /* placeholder for void */
-    int64_t v7;
-    int64_t v13; /* placeholder for void */
-    bool v23;
-    int64_t v29;
-    int64_t v35; /* placeholder for void */
-    int64_t v39; /* placeholder for void */
-    int64_t v31; /* placeholder for void */
-    int64_t v33;
-    int64_t v62; /* placeholder for void */
-    int64_t v105;
-    int64_t v117; /* placeholder for void */
-    int64_t v125; /* placeholder for void */
-    void* v115;
-    int64_t v80;
-    int64_t v142; /* placeholder for void */
-    int64_t v146; /* placeholder for void */
-    int64_t v150;
-    void* v166;
-    int64_t v42; /* placeholder for void */
-    int64_t v180;
+    int64_t v129;
+    int64_t v141; /* placeholder for void */
+    int64_t v56;
     int64_t v137; /* placeholder for void */
+    int64_t v150;
+    void* v163;
+    int64_t v14; /* placeholder for void */
+    int64_t v75;
+    int64_t v20; /* placeholder for void */
+    void* v97;
+    void* v109;
+    int64_t v27; /* placeholder for void */
+    int64_t v62; /* placeholder for void */
+    int64_t v6; /* placeholder for void */
+    int64_t v169; /* placeholder for void */
+    int64_t v177; /* placeholder for void */
+    int64_t v182; /* placeholder for void */
+    int64_t v70; /* placeholder for void */
+    int64_t v28;
+    int64_t v82;
+    bool v25;
+    void* v34;
+    int64_t v55; /* placeholder for void */
+    int64_t v74; /* placeholder for void */
+    int64_t v138;
+    int64_t v136;
+    int64_t v183;
+    int64_t v189; /* placeholder for void */
+    int64_t v190;
+    int64_t v191;
+    int64_t v197; /* placeholder for void */
+    int64_t v35; /* placeholder for void */
+    int64_t v122; /* placeholder for void */
+    int64_t v146; /* placeholder for void */
+    void* v145;
+    int64_t v19;
+    int64_t v96;
+    int64_t v51; /* placeholder for void */
+    int64_t v118; /* placeholder for void */
+    int64_t v128;
+    int64_t v107; /* placeholder for void */
+    int64_t v131; /* placeholder for void */
+    int64_t v139;
+    int64_t v181; /* placeholder for void */
+    int64_t v86; /* placeholder for void */
+    void* v61;
+    int64_t v33;
+    int64_t v133; /* placeholder for void */
+    bool v68;
+    int64_t v178; /* placeholder for void */
+    int64_t v13; /* placeholder for void */
+    int64_t v119;
+    int64_t v17; /* placeholder for void */
+    int64_t v140;
+    int64_t v142; /* placeholder for void */
+    int64_t v22;
+    int64_t v158;
+    int64_t v167;
+    void* v49;
+    void* v166;
+    int64_t v170;
+    void* v57;
+    void* v154;
+    void* v176;
+    int64_t v40;
+    int64_t v80;
+    int64_t v101; /* placeholder for void */
+    int64_t v98; /* placeholder for void */
+    int64_t v147;
+    int64_t v196;
+    bool v121;
+    void* v115;
+    int64_t v47; /* placeholder for void */
+    void* v72;
+    void* v148;
+    int64_t v102;
+    int64_t v42; /* placeholder for void */
     int64_t v188;
+    int64_t v125; /* placeholder for void */
+    bool v26;
+    bool v38;
+    int64_t v32;
+    void* v69;
+    int64_t v87; /* placeholder for void */
+    int64_t v92;
+    int64_t v99;
+    uint8_t v155;
+    int64_t v41;
+    bool v77;
+    void* v9;
+    int64_t v153; /* placeholder for void */
+    int64_t v164; /* placeholder for void */
+    int64_t v180;
+    int64_t v143;
+    void* v12;
+    int64_t v73; /* placeholder for void */
+    int64_t v108;
+    int64_t v171;
+    int64_t v39; /* placeholder for void */
+    int64_t v165; /* placeholder for void */
+    int64_t v94; /* placeholder for void */
+    int64_t v54; /* placeholder for void */
+    int64_t v127;
+    int64_t v162;
+    int64_t v58; /* placeholder for void */
+    int64_t v126; /* placeholder for void */
+    void* v46;
+    int64_t v117; /* placeholder for void */
+    int64_t v172;
+    int64_t v10; /* placeholder for void */
+    int64_t v84; /* placeholder for void */
+    void* v52;
+    int64_t v90;
+    int64_t v16;
+    int64_t v71;
+    void* v15;
+    void* v103;
+    void* v160;
+    int64_t v174; /* placeholder for void */
+    int64_t v63; /* placeholder for void */
+    int64_t v67; /* placeholder for void */
+    bool v23;
+    int64_t v76;
+    int64_t v21; /* placeholder for void */
+    int64_t v60;
+    int64_t v120;
+    bool v85;
+    int64_t v149; /* placeholder for void */
+    int64_t v81;
+    int64_t v144;
+    int64_t v152; /* placeholder for void */
+    int64_t v24;
+    int64_t v78; /* placeholder for void */
+    int64_t v43; /* placeholder for void */
+    int64_t v105;
+    int64_t v18; /* placeholder for void */
+    int64_t v11;
+    int64_t v111; /* placeholder for void */
+    int64_t v114; /* placeholder for void */
+    int64_t v156; /* placeholder for void */
+    int64_t v157; /* placeholder for void */
+    int64_t v161; /* placeholder for void */
+    void* v159;
+    int64_t v168; /* placeholder for void */
+    void* v173;
+    void* v179;
+    int64_t v195; /* placeholder for void */
+    int64_t v65;
+    uint8_t v113;
+    int64_t v88; /* placeholder for void */
+    int64_t v7;
+    int64_t v91;
+    int64_t v95;
+    void* v45;
+    int64_t v110; /* placeholder for void */
+    int64_t v79;
+    void* v100;
+    bool v123;
+    int64_t v59;
+    void* v93;
+    int64_t v36;
+    void* v112;
+    bool v66;
+    int64_t v37;
+    int64_t v50; /* placeholder for void */
+    int64_t v124; /* placeholder for void */
+    int64_t v134;
+    int64_t v135;
+    int64_t v29;
+    int64_t v193; /* placeholder for void */
+    int64_t v30; /* placeholder for void */
+    bool v83;
+    int64_t v186;
+    void* v8;
+    bool v5;
+    void* v106;
+    int64_t v184;
     v4 = 0LL;
     v5 = v1 == v4;
     if (v5) goto bb1;
@@ -9370,101 +6385,2425 @@ int64_t String_replace(void* v0, int64_t v1, int64_t v2, int64_t v3) {
     return 0;
 }
 
-int64_t HashMap_get_or(void* v0, int64_t v1, int64_t v2, int64_t v3) {
-    p_call_stack_push("HashMap_get_or");
-    int64_t v46;
-    int64_t v49; /* placeholder for void */
-    bool v60;
-    void* v67;
-    int64_t v38;
-    void* v73;
-    int64_t v16;
-    int64_t v80;
-    int64_t v19; /* placeholder for void */
-    int64_t v17;
-    int64_t v84;
-    void* v24;
-    int64_t v89; /* placeholder for void */
-    int64_t v57;
-    int64_t v22;
-    int64_t v25; /* placeholder for void */
-    int64_t v37;
-    int64_t v76; /* placeholder for void */
-    void* v9;
-    int64_t v68; /* placeholder for void */
-    int64_t v77;
-    void* v88;
-    int64_t v27; /* placeholder for void */
-    bool v56;
-    int64_t v86; /* placeholder for void */
-    int64_t v66;
-    int64_t v72; /* placeholder for void */
-    void* v82;
-    int64_t v83; /* placeholder for void */
-    int64_t v28;
-    int64_t v92;
-    int64_t v30; /* placeholder for void */
+bool HashMap_is_empty(void* v0, int64_t v1) {
+    p_call_stack_push("HashMap_is_empty");
+    int64_t v3;
+    int64_t v5; /* placeholder for void */
+    int64_t v8; /* placeholder for void */
+    int64_t v14;
+    int64_t v9; /* placeholder for void */
+    bool v16;
+    int64_t v17; /* placeholder for void */
+    int64_t v13; /* placeholder for void */
+    void* v4;
+    int64_t v6;
+    void* v7;
+    int64_t v11;
+    int64_t v15;
+    int64_t v12; /* placeholder for void */
+    int64_t v2;
+    void* v10;
+    v2 = 16LL;
+    v3 = v1 + v2;
+    v4 = malloc(8);
+    *(void**)v4 = (void*)v3;
+    v6 = 0LL;
+    v7 = malloc(8);
+    *(int64_t*)v7 = (int64_t)v6;
+    v10 = *(void**)v4;
+    v11 = *(int64_t*)v10;
+    *(int64_t*)v7 = (int64_t)v11;
+    v14 = *(int64_t*)v7;
+    v15 = 0LL;
+    v16 = v14 == v15;
+    p_call_stack_pop();
+    return v16;
+    return 0;
+}
+
+void Vec_reverse(void* v0, int64_t v1) {
+    p_call_stack_push("Vec_reverse");
+    void* v8;
+    int64_t v51;
+    void* v14;
     int64_t v40;
-    void* v85;
-    int64_t v55;
-    int64_t v5;
-    int64_t v45; /* placeholder for void */
-    int64_t v13;
-    int64_t v63; /* placeholder for void */
-    int64_t v20; /* placeholder for void */
-    int64_t v23;
+    int64_t v60;
+    int64_t v69; /* placeholder for void */
+    int64_t v74; /* placeholder for void */
+    void* v6;
+    int64_t v54; /* placeholder for void */
+    int64_t v64;
+    void* v4;
+    int64_t v9; /* placeholder for void */
+    int64_t v11;
+    int64_t v34;
+    int64_t v44;
+    int64_t v56;
+    void* v52;
+    int64_t v47; /* placeholder for void */
+    void* v55;
+    int64_t v19; /* placeholder for void */
+    int64_t v20;
+    void* v16;
+    int64_t v17;
+    int64_t v2;
+    int64_t v53; /* placeholder for void */
+    int64_t v58; /* placeholder for void */
+    int64_t v65; /* placeholder for void */
+    int64_t v75; /* placeholder for void */
+    int64_t v27;
+    int64_t v39;
+    void* v66;
+    void* v35;
+    int64_t v36; /* placeholder for void */
+    int64_t v24;
+    void* v21;
+    void* v61;
+    int64_t v73; /* placeholder for void */
+    int64_t v3;
+    int64_t v30;
+    int64_t v5; /* placeholder for void */
+    int64_t v68; /* placeholder for void */
+    int64_t v25;
+    bool v28;
+    int64_t v43;
+    void* v57;
+    int64_t v29; /* placeholder for void */
+    int64_t v22; /* placeholder for void */
+    int64_t v50; /* placeholder for void */
+    void* v63;
+    int64_t v45;
+    void* v59;
+    int64_t v7; /* placeholder for void */
+    int64_t v26;
     int64_t v15; /* placeholder for void */
-    int64_t v36;
-    int64_t v11; /* placeholder for void */
+    int64_t v41;
+    void* v46;
+    int64_t v67;
+    int64_t v37;
+    int64_t v13; /* placeholder for void */
+    int64_t v71;
+    void* v49;
     int64_t v62; /* placeholder for void */
     int64_t v33;
-    int64_t v35; /* placeholder for void */
+    int64_t v48;
+    int64_t v32;
+    int64_t v38;
+    int64_t v23; /* placeholder for void */
+    int64_t v72;
+    int64_t v18; /* placeholder for void */
+    void* v10;
+    int64_t v12; /* placeholder for void */
+    int64_t v70;
+    int64_t v42;
+    int64_t v31;
+    v2 = 8LL;
+    v3 = v1 + v2;
+    v4 = malloc(8);
+    *(void**)v4 = (void*)v3;
+    v6 = malloc(8);
+    *(void**)v6 = (void*)v1;
+    v8 = malloc(8);
+    v10 = *(void**)v4;
+    v11 = *(int64_t*)v10;
+    *(int64_t*)v8 = (int64_t)v11;
+    v14 = malloc(8);
+    v16 = *(void**)v6;
+    v17 = *(int64_t*)v16;
+    *(int64_t*)v14 = (int64_t)v17;
+    v20 = 0LL;
+    v21 = malloc(8);
+    *(int64_t*)v21 = (int64_t)v20;
+    goto bb1;
+  bb1:
+    v24 = *(int64_t*)v21;
+    v25 = *(int64_t*)v8;
+    v26 = 2LL;
+    v27 = v25 / v26;
+    v28 = v24 < v27;
+    if (v28) goto bb2;
+    else goto bb3;
+  bb2:
+    v30 = *(int64_t*)v14;
+    v31 = *(int64_t*)v21;
+    v32 = 8LL;
+    v33 = v31 * v32;
+    v34 = v30 + v33;
+    v35 = malloc(8);
+    *(int64_t*)v35 = (int64_t)v34;
+    v37 = *(int64_t*)v14;
+    v38 = *(int64_t*)v8;
+    v39 = 1LL;
+    v40 = v38 - v39;
+    v41 = *(int64_t*)v21;
+    v42 = v40 - v41;
+    v43 = 8LL;
+    v44 = v42 * v43;
+    v45 = v37 + v44;
+    v46 = malloc(8);
+    *(int64_t*)v46 = (int64_t)v45;
+    v48 = *(int64_t*)v35;
+    v49 = malloc(8);
+    *(void**)v49 = (void*)v48;
+    v51 = *(int64_t*)v46;
+    v52 = malloc(8);
+    *(void**)v52 = (void*)v51;
+    v55 = *(void**)v49;
+    v56 = *(int64_t*)v55;
+    v57 = malloc(8);
+    *(int64_t*)v57 = (int64_t)v56;
+    v59 = *(void**)v52;
+    v60 = *(int64_t*)v59;
+    v61 = malloc(8);
+    *(int64_t*)v61 = (int64_t)v60;
+    v63 = *(void**)v49;
+    v64 = *(int64_t*)v61;
+    *(int64_t*)v63 = (int64_t)v64;
+    v66 = *(void**)v52;
+    v67 = *(int64_t*)v57;
+    *(int64_t*)v66 = (int64_t)v67;
+    v70 = *(int64_t*)v21;
+    v71 = 1LL;
+    v72 = v70 + v71;
+    *(int64_t*)v21 = (int64_t)v72;
+    goto bb1;
+  bb3:
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+int64_t Vec_new(void* v0) {
+    p_call_stack_push("Vec_new");
     int64_t v7; /* placeholder for void */
+    int64_t v14;
+    int64_t v20;
+    int64_t v10;
+    int64_t v4; /* placeholder for void */
+    int64_t v24; /* placeholder for void */
+    int64_t v27; /* placeholder for void */
+    void* v3;
+    int64_t v28; /* placeholder for void */
+    int64_t v26;
+    int64_t v21; /* placeholder for void */
+    int64_t v13;
+    int64_t v15;
+    int64_t v1;
+    int64_t v29;
+    void* v11;
+    void* v19;
+    void* v2;
+    int64_t v12; /* placeholder for void */
     void* v6;
     int64_t v8;
-    int64_t v43;
-    int64_t v31; /* placeholder for void */
-    int64_t v78;
+    void* v16;
+    int64_t v18; /* placeholder for void */
+    int64_t v23;
+    int64_t v5;
+    void* v25;
+    int64_t v17; /* placeholder for void */
+    void* v22;
+    int64_t v30; /* placeholder for void */
+    int64_t v9;
+    v1 = 24LL;
+    v2 = p_malloc(v1);
+    v3 = malloc(8);
+    *(int64_t*)v3 = (int64_t)v2;
+    v5 = *(int64_t*)v3;
+    v6 = malloc(8);
+    *(void**)v6 = (void*)v5;
+    v8 = *(int64_t*)v3;
+    v9 = 8LL;
+    v10 = v8 + v9;
+    v11 = malloc(8);
+    *(void**)v11 = (void*)v10;
+    v13 = *(int64_t*)v3;
+    v14 = 16LL;
+    v15 = v13 + v14;
+    v16 = malloc(8);
+    *(void**)v16 = (void*)v15;
+    v19 = *(void**)v6;
+    v20 = 0LL;
+    *(int64_t*)v19 = (int64_t)v20;
+    v22 = *(void**)v11;
+    v23 = 0LL;
+    *(int64_t*)v22 = (int64_t)v23;
+    v25 = *(void**)v16;
+    v26 = 0LL;
+    *(int64_t*)v25 = (int64_t)v26;
+    v29 = *(int64_t*)v3;
+    p_call_stack_pop();
+    return v29;
+    return 0;
+}
+
+void HashMap_insert(void* v0, int64_t v1, int64_t v2, int64_t v3) {
+    p_call_stack_push("HashMap_insert");
+    void* v61;
+    void* v82;
+    int64_t v27;
+    int64_t v53;
+    int64_t v30;
     int64_t v52; /* placeholder for void */
-    void* v29;
-    int64_t v14; /* placeholder for void */
-    bool v18;
-    void* v26;
-    void* v41;
-    void* v50;
-    int64_t v53; /* placeholder for void */
-    int64_t v64; /* placeholder for void */
-    void* v70;
-    int64_t v69;
+    int64_t v73;
+    void* v6;
+    int64_t v74;
+    bool v91;
+    void* v132;
+    int64_t v20;
+    int64_t v48;
+    int64_t v70; /* placeholder for void */
+    int64_t v101; /* placeholder for void */
     int64_t v54;
+    int64_t v66; /* placeholder for void */
+    int64_t v14; /* placeholder for void */
+    int64_t v121; /* placeholder for void */
+    void* v85;
+    int64_t v103;
+    void* v138;
+    int64_t v114; /* placeholder for void */
+    void* v119;
+    int64_t v17; /* placeholder for void */
+    void* v135;
+    int64_t v69; /* placeholder for void */
     int64_t v4;
-    int64_t v21; /* placeholder for void */
-    void* v47;
-    int64_t v10; /* placeholder for void */
-    int64_t v34; /* placeholder for void */
-    int64_t v42; /* placeholder for void */
-    int64_t v58;
-    void* v44;
-    int64_t v51;
-    bool v61;
-    int64_t v39;
+    int64_t v80; /* placeholder for void */
+    void* v113;
+    int64_t v127;
+    int64_t v117;
+    int64_t v40; /* placeholder for void */
+    int64_t v141; /* placeholder for void */
+    int64_t v86;
+    int64_t v8;
+    void* v10;
+    int64_t v68;
+    int64_t v92;
+    int64_t v139; /* placeholder for void */
+    int64_t v5;
+    int64_t v38;
+    void* v41;
+    int64_t v37; /* placeholder for void */
+    void* v16;
+    int64_t v129;
+    int64_t v106;
+    int64_t v97; /* placeholder for void */
+    void* v19;
+    int64_t v7; /* placeholder for void */
+    int64_t v108; /* placeholder for void */
+    int64_t v57;
+    int64_t v63; /* placeholder for void */
+    int64_t v100; /* placeholder for void */
+    int64_t v47;
+    int64_t v26;
+    int64_t v115; /* placeholder for void */
+    int64_t v83; /* placeholder for void */
+    int64_t v87; /* placeholder for void */
+    int64_t v98; /* placeholder for void */
+    void* v76;
+    int64_t v124; /* placeholder for void */
+    int64_t v134;
+    void* v55;
+    int64_t v24; /* placeholder for void */
+    int64_t v31;
+    int64_t v50; /* placeholder for void */
+    void* v49;
+    int64_t v11; /* placeholder for void */
+    int64_t v77; /* placeholder for void */
+    int64_t v136; /* placeholder for void */
+    int64_t v123;
+    int64_t v32;
     int64_t v65;
-    int64_t v71; /* placeholder for void */
-    int64_t v75; /* placeholder for void */
+    int64_t v71;
+    void* v79;
+    int64_t v9;
+    int64_t v105;
+    int64_t v78;
+    void* v58;
+    void* v110;
+    int64_t v111; /* placeholder for void */
+    int64_t v116;
+    int64_t v125; /* placeholder for void */
+    int64_t v23;
+    int64_t v34;
+    int64_t v33;
+    int64_t v131;
+    int64_t v130;
+    void* v122;
+    int64_t v81;
+    int64_t v46; /* placeholder for void */
+    int64_t v62; /* placeholder for void */
+    void* v107;
+    int64_t v104;
+    int64_t v12;
+    void* v22;
+    int64_t v133; /* placeholder for void */
+    void* v64;
+    int64_t v72;
+    int64_t v45; /* placeholder for void */
+    int64_t v44; /* placeholder for void */
+    int64_t v109;
+    int64_t v39; /* placeholder for void */
+    int64_t v25; /* placeholder for void */
+    int64_t v18; /* placeholder for void */
+    int64_t v75;
+    int64_t v142; /* placeholder for void */
+    void* v13;
+    int64_t v21; /* placeholder for void */
+    int64_t v84; /* placeholder for void */
+    int64_t v42;
+    int64_t v88; /* placeholder for void */
+    int64_t v102;
+    int64_t v90;
+    int64_t v60;
+    int64_t v137; /* placeholder for void */
+    int64_t v59; /* placeholder for void */
+    int64_t v29;
+    bool v28;
+    int64_t v94;
+    int64_t v56; /* placeholder for void */
+    bool v95;
+    bool v96;
+    void* v99;
+    void* v51;
+    void* v67;
+    int64_t v120; /* placeholder for void */
+    int64_t v128;
+    int64_t v140; /* placeholder for void */
+    bool v36;
+    int64_t v126; /* placeholder for void */
+    int64_t v15;
+    int64_t v43; /* placeholder for void */
+    int64_t v93;
+    bool v35;
+    int64_t v112; /* placeholder for void */
+    int64_t v89;
+    int64_t v118;
+    v4 = 16LL;
+    v5 = v1 + v4;
+    v6 = malloc(8);
+    *(void**)v6 = (void*)v5;
+    v8 = 24LL;
+    v9 = v1 + v8;
+    v10 = malloc(8);
+    *(void**)v10 = (void*)v9;
+    v12 = 0LL;
+    v13 = malloc(8);
+    *(int64_t*)v13 = (int64_t)v12;
+    v15 = 0LL;
+    v16 = malloc(8);
+    *(int64_t*)v16 = (int64_t)v15;
+    v19 = *(void**)v6;
+    v20 = *(int64_t*)v19;
+    *(int64_t*)v13 = (int64_t)v20;
+    v22 = *(void**)v10;
+    v23 = *(int64_t*)v22;
+    *(int64_t*)v16 = (int64_t)v23;
+    v26 = *(int64_t*)v16;
+    v27 = 0LL;
+    v28 = v26 == v27;
+    v29 = *(int64_t*)v13;
+    v30 = 10LL;
+    v31 = v29 * v30;
+    v32 = *(int64_t*)v16;
+    v33 = 7LL;
+    v34 = v32 * v33;
+    v35 = v31 >= v34;
+    v36 = v28 || v35;
+    if (v36) goto bb1;
+    else goto bb2;
+  bb1:
+    v38 = 0LL;
+    HashMap_grow((void*)v38, v1);
+    v41 = *(void**)v10;
+    v42 = *(int64_t*)v41;
+    *(int64_t*)v16 = (int64_t)v42;
+    goto bb3;
+  bb2:
+    goto bb3;
+  bb3:
+    v47 = 0LL;
+    v48 = (int64_t)HashMap_find_slot((void*)v47, v1, v2);
+    v49 = malloc(8);
+    *(int64_t*)v49 = (int64_t)v48;
+    v51 = malloc(8);
+    *(void**)v51 = (void*)v1;
+    v53 = 8LL;
+    v54 = v1 + v53;
+    v55 = malloc(8);
+    *(void**)v55 = (void*)v54;
+    v57 = 0LL;
+    v58 = malloc(8);
+    *(int64_t*)v58 = (int64_t)v57;
+    v60 = 0LL;
+    v61 = malloc(8);
+    *(int64_t*)v61 = (int64_t)v60;
+    v64 = *(void**)v51;
+    v65 = *(int64_t*)v64;
+    *(int64_t*)v58 = (int64_t)v65;
+    v67 = *(void**)v55;
+    v68 = *(int64_t*)v67;
+    *(int64_t*)v61 = (int64_t)v68;
+    v71 = *(int64_t*)v58;
+    v72 = *(int64_t*)v49;
+    v73 = 8LL;
+    v74 = v72 * v73;
+    v75 = v71 + v74;
+    v76 = malloc(8);
+    *(int64_t*)v76 = (int64_t)v75;
+    v78 = *(int64_t*)v76;
+    v79 = malloc(8);
+    *(void**)v79 = (void*)v78;
+    v81 = 0LL;
+    v82 = malloc(8);
+    *(int64_t*)v82 = (int64_t)v81;
+    v85 = *(void**)v79;
+    v86 = *(int64_t*)v85;
+    *(int64_t*)v82 = (int64_t)v86;
+    v89 = *(int64_t*)v82;
+    v90 = 0LL;
+    v91 = v89 == v90;
+    v92 = *(int64_t*)v82;
+    v93 = 1LL;
+    v94 = -v93;
+    v95 = v92 == v94;
+    v96 = v91 || v95;
+    if (v96) goto bb4;
+    else goto bb5;
+  bb4:
+    v99 = *(void**)v79;
+    *(int64_t*)v99 = (int64_t)v2;
+    v102 = *(int64_t*)v61;
+    v103 = *(int64_t*)v49;
+    v104 = 8LL;
+    v105 = v103 * v104;
+    v106 = v102 + v105;
+    v107 = malloc(8);
+    *(int64_t*)v107 = (int64_t)v106;
+    v109 = *(int64_t*)v107;
+    v110 = malloc(8);
+    *(void**)v110 = (void*)v109;
+    v113 = *(void**)v110;
+    *(int64_t*)v113 = (int64_t)v3;
+    v116 = *(int64_t*)v13;
+    v117 = 1LL;
+    v118 = v116 + v117;
+    v119 = malloc(8);
+    *(int64_t*)v119 = (int64_t)v118;
+    v122 = *(void**)v6;
+    v123 = *(int64_t*)v119;
+    *(int64_t*)v122 = (int64_t)v123;
+    goto bb6;
+  bb5:
+    v127 = *(int64_t*)v61;
+    v128 = *(int64_t*)v49;
+    v129 = 8LL;
+    v130 = v128 * v129;
+    v131 = v127 + v130;
+    v132 = malloc(8);
+    *(int64_t*)v132 = (int64_t)v131;
+    v134 = *(int64_t*)v132;
+    v135 = malloc(8);
+    *(void**)v135 = (void*)v134;
+    v138 = *(void**)v135;
+    *(int64_t*)v138 = (int64_t)v3;
+    goto bb6;
+  bb6:
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+void HashMap_remove(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("HashMap_remove");
+    int64_t v91; /* placeholder for void */
+    int64_t v42;
+    int64_t v74;
+    int64_t v23; /* placeholder for void */
+    int64_t v51; /* placeholder for void */
+    int64_t v39;
+    int64_t v34; /* placeholder for void */
+    void* v47;
+    int64_t v90; /* placeholder for void */
+    int64_t v7;
+    void* v75;
+    void* v29;
+    int64_t v57;
+    bool v59;
+    bool v64;
+    void* v15;
+    int64_t v77; /* placeholder for void */
+    int64_t v54;
+    int64_t v26;
+    int64_t v40;
+    void* v44;
+    int64_t v55; /* placeholder for void */
+    int64_t v36;
+    int64_t v49;
     int64_t v79;
+    int64_t v84;
+    int64_t v87; /* placeholder for void */
+    int64_t v24; /* placeholder for void */
+    int64_t v33; /* placeholder for void */
+    int64_t v52; /* placeholder for void */
+    int64_t v11;
+    void* v88;
+    int64_t v14; /* placeholder for void */
+    int64_t v18; /* placeholder for void */
+    int64_t v41;
+    int64_t v65; /* placeholder for void */
+    int64_t v62;
+    int64_t v46;
+    void* v69;
+    void* v53;
+    void* v27;
+    int64_t v3;
+    int64_t v45; /* placeholder for void */
+    void* v5;
+    int64_t v58;
+    int64_t v81; /* placeholder for void */
+    int64_t v61;
+    int64_t v70;
+    int64_t v83;
+    void* v85;
+    int64_t v80; /* placeholder for void */
+    int64_t v82;
+    int64_t v43;
+    int64_t v72; /* placeholder for void */
+    int64_t v16;
+    int64_t v37; /* placeholder for void */
+    int64_t v68; /* placeholder for void */
+    int64_t v10; /* placeholder for void */
+    bool v21;
+    int64_t v48; /* placeholder for void */
+    void* v50;
+    int64_t v71;
+    int64_t v20;
+    int64_t v56; /* placeholder for void */
+    int64_t v31;
+    int64_t v17; /* placeholder for void */
+    int64_t v30; /* placeholder for void */
+    int64_t v73; /* placeholder for void */
+    int64_t v22; /* placeholder for void */
+    int64_t v86; /* placeholder for void */
+    int64_t v6; /* placeholder for void */
+    int64_t v28; /* placeholder for void */
+    int64_t v13; /* placeholder for void */
+    void* v32;
+    int64_t v8;
+    int64_t v25;
+    void* v35;
+    int64_t v60;
+    int64_t v38; /* placeholder for void */
+    int64_t v92; /* placeholder for void */
+    void* v12;
+    int64_t v19;
+    void* v78;
+    int64_t v89;
+    int64_t v4;
+    int64_t v67; /* placeholder for void */
+    void* v9;
+    bool v63;
+    int64_t v66; /* placeholder for void */
+    int64_t v76; /* placeholder for void */
+    v3 = 24LL;
+    v4 = v1 + v3;
+    v5 = malloc(8);
+    *(void**)v5 = (void*)v4;
+    v7 = 16LL;
+    v8 = v1 + v7;
+    v9 = malloc(8);
+    *(void**)v9 = (void*)v8;
+    v11 = 0LL;
+    v12 = malloc(8);
+    *(int64_t*)v12 = (int64_t)v11;
+    v15 = *(void**)v5;
+    v16 = *(int64_t*)v15;
+    *(int64_t*)v12 = (int64_t)v16;
+    v19 = *(int64_t*)v12;
+    v20 = 0LL;
+    v21 = v19 == v20;
+    if (v21) goto bb1;
+    else goto bb2;
+  bb1:
+    p_call_stack_pop();
+    return;
+  bb2:
+    goto bb3;
+  bb3:
+    v25 = 0LL;
+    v26 = (int64_t)HashMap_find_slot((void*)v25, v1, v2);
+    v27 = malloc(8);
+    *(int64_t*)v27 = (int64_t)v26;
+    v29 = malloc(8);
+    *(void**)v29 = (void*)v1;
+    v31 = 0LL;
+    v32 = malloc(8);
+    *(int64_t*)v32 = (int64_t)v31;
+    v35 = *(void**)v29;
+    v36 = *(int64_t*)v35;
+    *(int64_t*)v32 = (int64_t)v36;
+    v39 = *(int64_t*)v32;
+    v40 = *(int64_t*)v27;
+    v41 = 8LL;
+    v42 = v40 * v41;
+    v43 = v39 + v42;
+    v44 = malloc(8);
+    *(int64_t*)v44 = (int64_t)v43;
+    v46 = *(int64_t*)v44;
+    v47 = malloc(8);
+    *(void**)v47 = (void*)v46;
+    v49 = 0LL;
+    v50 = malloc(8);
+    *(int64_t*)v50 = (int64_t)v49;
+    v53 = *(void**)v47;
+    v54 = *(int64_t*)v53;
+    *(int64_t*)v50 = (int64_t)v54;
+    v57 = *(int64_t*)v50;
+    v58 = 0LL;
+    v59 = v57 == v58;
+    v60 = *(int64_t*)v50;
+    v61 = 1LL;
+    v62 = -v61;
+    v63 = v60 == v62;
+    v64 = v59 || v63;
+    if (v64) goto bb4;
+    else goto bb5;
+  bb4:
+    p_call_stack_pop();
+    return;
+  bb5:
+    goto bb6;
+  bb6:
+    v69 = *(void**)v47;
+    v70 = 1LL;
+    v71 = -v70;
+    *(int64_t*)v69 = (int64_t)v71;
+    v74 = 0LL;
+    v75 = malloc(8);
+    *(int64_t*)v75 = (int64_t)v74;
+    v78 = *(void**)v9;
+    v79 = *(int64_t*)v78;
+    *(int64_t*)v75 = (int64_t)v79;
+    v82 = *(int64_t*)v75;
+    v83 = 1LL;
+    v84 = v82 - v83;
+    v85 = malloc(8);
+    *(int64_t*)v85 = (int64_t)v84;
+    v88 = *(void**)v9;
+    v89 = *(int64_t*)v85;
+    *(int64_t*)v88 = (int64_t)v89;
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+int64_t String_slice(void* v0, int64_t v1, int64_t v2, int64_t v3) {
+    p_call_stack_push("String_slice");
+    int64_t v23;
+    int64_t v22;
+    int64_t v21; /* placeholder for void */
+    int64_t v13; /* placeholder for void */
+    int64_t v59;
+    int64_t v62;
+    int64_t v75; /* placeholder for void */
+    int64_t v10; /* placeholder for void */
+    void* v58;
+    int64_t v70;
+    int64_t v66;
+    int64_t v71;
+    int64_t v76;
+    void* v12;
+    int64_t v84;
+    void* v85;
+    int64_t v19;
+    int64_t v86; /* placeholder for void */
     int64_t v87;
     int64_t v90; /* placeholder for void */
+    void* v74;
     int64_t v93; /* placeholder for void */
-    int64_t v95;
-    int64_t v96; /* placeholder for void */
-    int64_t v74;
-    int64_t v59;
-    int64_t v81;
-    int64_t v48; /* placeholder for void */
+    int64_t v41; /* placeholder for void */
+    int64_t v44; /* placeholder for void */
+    int64_t v64; /* placeholder for void */
     int64_t v94; /* placeholder for void */
+    int64_t v25; /* placeholder for void */
+    int64_t v65;
+    int64_t v80;
+    int64_t v18; /* placeholder for void */
+    int64_t v17; /* placeholder for void */
+    int64_t v16;
+    int64_t v83;
+    int64_t v89; /* placeholder for void */
+    int64_t v72;
+    void* v68;
+    int64_t v11;
+    void* v9;
+    int64_t v43; /* placeholder for void */
+    void* v28;
+    int64_t v57; /* placeholder for void */
+    int64_t v4;
+    int64_t v30;
+    void* v88;
+    int64_t v46;
+    int64_t v54;
+    int64_t v33; /* placeholder for void */
+    int64_t v63; /* placeholder for void */
+    int64_t v27; /* placeholder for void */
+    int64_t v37; /* placeholder for void */
+    int64_t v56; /* placeholder for void */
+    int64_t v67;
+    int64_t v42;
+    int64_t v47;
+    void* v55;
+    bool v48;
+    int64_t v69; /* placeholder for void */
+    void* v73;
+    void* v24;
+    int64_t v34;
+    int64_t v50;
+    int64_t v79;
+    void* v51;
+    int64_t v60; /* placeholder for void */
+    int64_t v81; /* placeholder for void */
+    int64_t v78;
+    int64_t v61; /* placeholder for void */
+    int64_t v96; /* placeholder for void */
+    int64_t v77;
     void* v91;
-    void* v12;
+    int64_t v95;
+    int64_t v82;
+    int64_t v6; /* placeholder for void */
+    int64_t v38;
+    int64_t v36; /* placeholder for void */
+    int64_t v31;
+    int64_t v49; /* placeholder for void */
+    int64_t v92;
+    void* v15;
+    bool v40;
+    int64_t v45; /* placeholder for void */
+    int64_t v39;
+    int64_t v53; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    void* v26;
+    int64_t v14; /* placeholder for void */
+    int64_t v35; /* placeholder for void */
+    int64_t v7;
+    void* v8;
+    int64_t v29; /* placeholder for void */
+    bool v32;
+    void* v52;
+    bool v5;
+    v4 = 0LL;
+    v5 = v1 == v4;
+    if (v5) goto bb1;
+    else goto bb2;
+  bb1:
+    v7 = 1LL;
+    v8 = p_malloc(v7);
+    v9 = malloc(8);
+    *(int64_t*)v9 = (int64_t)v8;
+    v11 = *(int64_t*)v9;
+    v12 = malloc(8);
+    *(void**)v12 = (void*)v11;
+    v15 = *(void**)v12;
+    v16 = 0LL;
+    *(uint8_t*)v15 = (uint8_t)v16;
+    v19 = *(int64_t*)v9;
+    p_call_stack_pop();
+    return v19;
+  bb2:
+    goto bb3;
+  bb3:
+    v22 = 0LL;
+    v23 = (int64_t)p_str_length((void*)v22, v1);
+    v24 = malloc(8);
+    *(int64_t*)v24 = (int64_t)v23;
+    v26 = malloc(8);
+    *(int64_t*)v26 = (int64_t)v2;
+    v28 = malloc(8);
+    *(int64_t*)v28 = (int64_t)v3;
+    v30 = *(int64_t*)v26;
+    v31 = 0LL;
+    v32 = v30 < v31;
+    if (v32) goto bb4;
+    else goto bb5;
+  bb4:
+    v34 = 0LL;
+    *(int64_t*)v26 = (int64_t)v34;
+    goto bb6;
+  bb5:
+    goto bb6;
+  bb6:
+    v38 = *(int64_t*)v28;
+    v39 = *(int64_t*)v24;
+    v40 = v38 > v39;
+    if (v40) goto bb7;
+    else goto bb8;
+  bb7:
+    v42 = *(int64_t*)v24;
+    *(int64_t*)v28 = (int64_t)v42;
+    goto bb9;
+  bb8:
+    goto bb9;
+  bb9:
+    v46 = *(int64_t*)v26;
+    v47 = *(int64_t*)v28;
+    v48 = v46 >= v47;
+    if (v48) goto bb10;
+    else goto bb11;
+  bb10:
+    v50 = 1LL;
+    v51 = p_malloc(v50);
+    v52 = malloc(8);
+    *(int64_t*)v52 = (int64_t)v51;
+    v54 = *(int64_t*)v52;
+    v55 = malloc(8);
+    *(void**)v55 = (void*)v54;
+    v58 = *(void**)v55;
+    v59 = 0LL;
+    *(uint8_t*)v58 = (uint8_t)v59;
+    v62 = *(int64_t*)v52;
+    p_call_stack_pop();
+    return v62;
+  bb11:
+    goto bb12;
+  bb12:
+    v65 = *(int64_t*)v28;
+    v66 = *(int64_t*)v26;
+    v67 = v65 - v66;
+    v68 = malloc(8);
+    *(int64_t*)v68 = (int64_t)v67;
+    v70 = *(int64_t*)v68;
+    v71 = 1LL;
+    v72 = v70 + v71;
+    v73 = p_malloc(v72);
+    v74 = malloc(8);
+    *(int64_t*)v74 = (int64_t)v73;
+    v76 = *(int64_t*)v74;
+    v77 = *(int64_t*)v26;
+    v78 = v1 + v77;
+    v79 = *(int64_t*)v68;
+    v80 = 0LL;
+    p_str_copy_n((void*)v80, v76, v78, v79);
+    v82 = *(int64_t*)v74;
+    v83 = *(int64_t*)v68;
+    v84 = v82 + v83;
+    v85 = malloc(8);
+    *(int64_t*)v85 = (int64_t)v84;
+    v87 = *(int64_t*)v85;
+    v88 = malloc(8);
+    *(void**)v88 = (void*)v87;
+    v91 = *(void**)v88;
+    v92 = 0LL;
+    *(uint8_t*)v91 = (uint8_t)v92;
+    v95 = *(int64_t*)v74;
+    p_call_stack_pop();
+    return v95;
+    return 0;
+}
+
+void Vec_sort(void* v0, int64_t v1) {
+    p_call_stack_push("Vec_sort");
+    int64_t v93; /* placeholder for void */
+    int64_t v38;
+    void* v82;
+    int64_t v23; /* placeholder for void */
+    int64_t v34;
+    int64_t v84; /* placeholder for void */
+    int64_t v65; /* placeholder for void */
+    int64_t v3;
+    int64_t v75;
+    int64_t v76;
+    int64_t v45;
+    int64_t v46;
+    int64_t v63;
+    int64_t v72;
+    int64_t v41;
+    int64_t v11;
+    int64_t v24; /* placeholder for void */
+    int64_t v88; /* placeholder for void */
+    void* v79;
+    int64_t v83;
+    void* v64;
+    int64_t v57;
+    int64_t v31; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    bool v32;
+    int64_t v48;
+    int64_t v53;
+    int64_t v29; /* placeholder for void */
+    void* v16;
+    int64_t v18; /* placeholder for void */
+    int64_t v52;
+    int64_t v13; /* placeholder for void */
+    int64_t v62; /* placeholder for void */
+    int64_t v28; /* placeholder for void */
+    void* v73;
+    int64_t v56;
+    void* v61;
+    int64_t v87; /* placeholder for void */
+    void* v49;
+    int64_t v2;
+    int64_t v47;
+    int64_t v44;
+    int64_t v78; /* placeholder for void */
+    int64_t v81; /* placeholder for void */
+    int64_t v89; /* placeholder for void */
+    bool v30;
+    int64_t v66; /* placeholder for void */
+    int64_t v21;
+    void* v35;
+    int64_t v50; /* placeholder for void */
+    int64_t v9; /* placeholder for void */
+    void* v27;
+    int64_t v25; /* placeholder for void */
+    int64_t v70; /* placeholder for void */
+    void* v71;
+    int64_t v74; /* placeholder for void */
+    bool v85;
+    void* v10;
+    int64_t v33; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    int64_t v55;
+    int64_t v86; /* placeholder for void */
+    int64_t v43; /* placeholder for void */
+    int64_t v54;
+    int64_t v90;
+    int64_t v80;
+    int64_t v92;
+    int64_t v59; /* placeholder for void */
+    int64_t v96; /* placeholder for void */
+    int64_t v7; /* placeholder for void */
+    void* v14;
+    bool v77;
+    bool v42;
+    void* v58;
+    int64_t v5; /* placeholder for void */
+    void* v4;
+    int64_t v39;
+    bool v22;
+    int64_t v60;
+    int64_t v95; /* placeholder for void */
+    void* v67;
+    int64_t v91;
+    int64_t v51;
+    void* v69;
+    int64_t v94; /* placeholder for void */
+    int64_t v40;
+    int64_t v17;
+    bool v26;
+    int64_t v19; /* placeholder for void */
+    int64_t v20;
+    int64_t v37; /* placeholder for void */
+    void* v6;
+    int64_t v68;
+    int64_t v36; /* placeholder for void */
+    void* v8;
+    v2 = 8LL;
+    v3 = v1 + v2;
+    v4 = malloc(8);
+    *(void**)v4 = (void*)v3;
+    v6 = malloc(8);
+    *(void**)v6 = (void*)v1;
+    v8 = malloc(8);
+    v10 = *(void**)v4;
+    v11 = *(int64_t*)v10;
+    *(int64_t*)v8 = (int64_t)v11;
+    v14 = malloc(8);
+    v16 = *(void**)v6;
+    v17 = *(int64_t*)v16;
+    *(int64_t*)v14 = (int64_t)v17;
+    v20 = *(int64_t*)v8;
+    v21 = 1LL;
+    v22 = v20 <= v21;
+    if (v22) goto bb1;
+    else goto bb2;
+  bb1:
+    p_call_stack_pop();
+    return;
+  bb2:
+    goto bb3;
+  bb3:
+    v26 = true;
+    v27 = malloc(1);
+    *(bool*)v27 = v26;
+    goto bb4;
+  bb4:
+    v30 = *(bool*)v27;
+    if (v30) goto bb5;
+    else goto bb6;
+  bb5:
+    v32 = false;
+    *(bool*)v27 = v32;
+    v34 = 0LL;
+    v35 = malloc(8);
+    *(int64_t*)v35 = (int64_t)v34;
+    goto bb7;
+  bb6:
+    p_call_stack_pop();
+    return;
+  bb7:
+    v38 = *(int64_t*)v35;
+    v39 = *(int64_t*)v8;
+    v40 = 1LL;
+    v41 = v39 - v40;
+    v42 = v38 < v41;
+    if (v42) goto bb8;
+    else goto bb9;
+  bb8:
+    v44 = *(int64_t*)v14;
+    v45 = *(int64_t*)v35;
+    v46 = 8LL;
+    v47 = v45 * v46;
+    v48 = v44 + v47;
+    v49 = malloc(8);
+    *(int64_t*)v49 = (int64_t)v48;
+    v51 = *(int64_t*)v14;
+    v52 = *(int64_t*)v35;
+    v53 = 1LL;
+    v54 = v52 + v53;
+    v55 = 8LL;
+    v56 = v54 * v55;
+    v57 = v51 + v56;
+    v58 = malloc(8);
+    *(int64_t*)v58 = (int64_t)v57;
+    v60 = *(int64_t*)v49;
+    v61 = malloc(8);
+    *(void**)v61 = (void*)v60;
+    v63 = *(int64_t*)v58;
+    v64 = malloc(8);
+    *(void**)v64 = (void*)v63;
+    v67 = *(void**)v61;
+    v68 = *(int64_t*)v67;
+    v69 = malloc(8);
+    *(int64_t*)v69 = (int64_t)v68;
+    v71 = *(void**)v64;
+    v72 = *(int64_t*)v71;
+    v73 = malloc(8);
+    *(int64_t*)v73 = (int64_t)v72;
+    v75 = *(int64_t*)v69;
+    v76 = *(int64_t*)v73;
+    v77 = v75 > v76;
+    if (v77) goto bb10;
+    else goto bb11;
+  bb9:
+    goto bb4;
+  bb10:
+    v79 = *(void**)v61;
+    v80 = *(int64_t*)v73;
+    *(int64_t*)v79 = (int64_t)v80;
+    v82 = *(void**)v64;
+    v83 = *(int64_t*)v69;
+    *(int64_t*)v82 = (int64_t)v83;
+    v85 = true;
+    *(bool*)v27 = v85;
+    goto bb12;
+  bb11:
+    goto bb12;
+  bb12:
+    v90 = *(int64_t*)v35;
+    v91 = 1LL;
+    v92 = v90 + v91;
+    *(int64_t*)v35 = (int64_t)v92;
+    goto bb7;
+    return;
+}
+
+int64_t char_to_lower(void* v0, int64_t v1) {
+    p_call_stack_push("char_to_lower");
+    int64_t v10; /* placeholder for void */
+    int64_t v11; /* placeholder for void */
+    bool v6;
+    bool v3;
+    bool v5;
+    int64_t v4;
+    int64_t v9;
+    int64_t v2;
+    int64_t v12; /* placeholder for void */
+    int64_t v7; /* placeholder for void */
+    int64_t v8;
+    v2 = 65LL;
+    v3 = v1 >= v2;
+    v4 = 90LL;
+    v5 = v1 <= v4;
+    v6 = v3 && v5;
+    if (v6) goto bb1;
+    else goto bb2;
+  bb1:
+    v8 = 32LL;
+    v9 = v1 + v8;
+    p_call_stack_pop();
+    return v9;
+  bb2:
+    goto bb3;
+  bb3:
+    p_call_stack_pop();
+    return v1;
+    return 0;
+}
+
+void* str_from_bytes(void* v0, void* v1) {
+    p_call_stack_push("str_from_bytes");
+    int64_t v18;
+    void* v29;
+    int64_t v19;
+    int64_t v7; /* placeholder for void */
+    int64_t v5;
+    int64_t v8;
+    void* v10;
+    int64_t v14;
+    int64_t v13;
+    int64_t v4; /* placeholder for void */
+    void* v6;
+    int64_t v9;
+    int64_t v25;
+    int64_t v26;
+    void* v2;
+    void* v17;
+    int64_t v23; /* placeholder for void */
+    int64_t v20;
+    void* v21;
+    void* v22;
+    int64_t v27; /* placeholder for void */
+    bool v15;
+    void* v3;
+    int64_t v28; /* placeholder for void */
+    int64_t v24;
+    int64_t v30; /* placeholder for void */
+    int64_t v11; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    int64_t v16; /* placeholder for void */
+    v2 = _str1;
+    v3 = malloc(8);
+    *(void**)v3 = (void*)v2;
+    v5 = 0LL;
+    v6 = malloc(8);
+    *(int64_t*)v6 = (int64_t)v5;
+    v8 = 0LL;
+    v9 = (int64_t)Vec_len((void*)v8, (int64_t)v1);
+    v10 = malloc(8);
+    *(int64_t*)v10 = (int64_t)v9;
+    goto bb1;
+  bb1:
+    v13 = *(int64_t*)v6;
+    v14 = *(int64_t*)v10;
+    v15 = v13 < v14;
+    if (v15) goto bb2;
+    else goto bb3;
+  bb2:
+    v17 = *(void**)v3;
+    v18 = *(int64_t*)v6;
+    v19 = 0LL;
+    v20 = (int64_t)Vec_get((void*)v19, (int64_t)v1, v18);
+    v21 = p_char_to_str(v20);
+    v22 = p_str_concat(v17, v21);
+    *(void**)v3 = (void*)v22;
+    v24 = *(int64_t*)v6;
+    v25 = 1LL;
+    v26 = v24 + v25;
+    *(int64_t*)v6 = (int64_t)v26;
+    goto bb1;
+  bb3:
+    v29 = *(void**)v3;
+    p_call_stack_pop();
+    return v29;
+    return 0;
+}
+
+bool Result_is_err(void* v0, void* v1) {
+    p_call_stack_push("Result_is_err");
+    int64_t v4;
+    int64_t v19; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    int64_t v22; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    int64_t v6; /* placeholder for void */
+    void* v7;
+    int64_t v10; /* placeholder for void */
+    bool v21;
+    bool v5;
+    void* v2;
+    int64_t v3;
+    int64_t v8;
+    bool v9;
+    int64_t v13;
+    void* v16;
+    bool v18;
+    int64_t v12;
+    void* v11;
+    int64_t v17;
+    bool v14;
+    v2 = (char*)v1 + 0;
+    v3 = *(int64_t*)v2;
+    v4 = 0LL;
+    v5 = v3 == v4;
+    if (v5) goto bb2;
+    else goto bb3;
+  bb1:
+    v21 = false;
+    p_call_stack_pop();
+    return v21;
+  bb2:
+    v7 = (char*)v1 + 8;
+    v8 = *(int64_t*)v7;
+    v9 = false;
+    p_call_stack_pop();
+    return v9;
+  bb3:
+    v11 = (char*)v1 + 0;
+    v12 = *(int64_t*)v11;
+    v13 = 1LL;
+    v14 = v12 == v13;
+    if (v14) goto bb4;
+    else goto bb5;
+  bb4:
+    v16 = (char*)v1 + 8;
+    v17 = *(int64_t*)v16;
+    v18 = true;
+    p_call_stack_pop();
+    return v18;
+  bb5:
+    goto bb1;
+    return 0;
+}
+
+int64_t String_len(void* v0, int64_t v1) {
+    p_call_stack_push("String_len");
+    int64_t v2;
+    int64_t v3;
+    int64_t v4; /* placeholder for void */
+    v2 = 0LL;
+    v3 = (int64_t)p_str_length((void*)v2, v1);
+    p_call_stack_pop();
+    return v3;
+    return 0;
+}
+
+bool char_is_lower(void* v0, int64_t v1) {
+    p_call_stack_push("char_is_lower");
+    int64_t v7; /* placeholder for void */
+    int64_t v2;
+    int64_t v4;
+    bool v6;
+    bool v3;
+    bool v5;
+    v2 = 97LL;
+    v3 = v1 >= v2;
+    v4 = 122LL;
+    v5 = v1 <= v4;
+    v6 = v3 && v5;
+    p_call_stack_pop();
+    return v6;
+    return 0;
+}
+
+void ByteBuffer_set_byte(void* v0, void* v1, int64_t v2, int64_t v3) {
+    p_call_stack_push("ByteBuffer_set_byte");
+    int64_t v10; /* placeholder for void */
+    int64_t v11; /* placeholder for void */
+    int64_t v4;
+    int64_t v12; /* placeholder for void */
+    bool v5;
+    bool v8;
+    int64_t v7;
+    void* v14;
+    void* v13;
+    void* v6;
+    bool v9;
+    int64_t v17; /* placeholder for void */
+    int64_t v15;
+    int64_t v16; /* placeholder for void */
+    v4 = 0LL;
+    v5 = v2 < v4;
+    v6 = (char*)v1 + 8;
+    v7 = *(int64_t*)v6;
+    v8 = v2 >= v7;
+    v9 = v5 || v8;
+    if (v9) goto bb1;
+    else goto bb2;
+  bb1:
+    p_call_stack_pop();
+    return;
+  bb2:
+    goto bb3;
+  bb3:
+    v13 = (char*)v1 + 0;
+    v14 = *(void**)v13;
+    v15 = 0LL;
+    Vec_set((void*)v15, (int64_t)v14, v2, v3);
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+int64_t p_abs(void* v0, int64_t v1) {
+    p_call_stack_push("abs");
+    int64_t v5;
+    int64_t v4; /* placeholder for void */
+    int64_t v8; /* placeholder for void */
+    bool v3;
+    int64_t v2;
+    int64_t v7; /* placeholder for void */
+    int64_t v6; /* placeholder for void */
+    v2 = 0LL;
+    v3 = v1 < v2;
+    if (v3) goto bb1;
+    else goto bb2;
+  bb1:
+    v5 = -v1;
+    p_call_stack_pop();
+    return v5;
+  bb2:
+    goto bb3;
+  bb3:
+    p_call_stack_pop();
+    return v1;
+    return 0;
+}
+
+int64_t Vec_last(void* v0, int64_t v1) {
+    p_call_stack_push("Vec_last");
+    int64_t v23; /* placeholder for void */
+    int64_t v2;
+    int64_t v3;
+    int64_t v17; /* placeholder for void */
+    void* v10;
+    void* v35;
+    int64_t v47; /* placeholder for void */
+    int64_t v30;
+    void* v24;
+    int64_t v13; /* placeholder for void */
+    void* v6;
+    int64_t v14;
+    int64_t v11;
+    int64_t v37;
+    int64_t v40;
+    int64_t v49; /* placeholder for void */
+    int64_t v9; /* placeholder for void */
+    int64_t v34;
+    int64_t v21; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    int64_t v19; /* placeholder for void */
+    int64_t v29;
+    void* v38;
+    int64_t v20; /* placeholder for void */
+    void* v41;
+    void* v44;
+    int64_t v36; /* placeholder for void */
+    void* v22;
+    int64_t v32;
+    int64_t v33;
+    int64_t v39; /* placeholder for void */
+    int64_t v42; /* placeholder for void */
+    int64_t v43; /* placeholder for void */
+    int64_t v7; /* placeholder for void */
+    int64_t v45;
+    void* v8;
+    int64_t v28;
+    int64_t v27; /* placeholder for void */
+    bool v16;
+    int64_t v46; /* placeholder for void */
+    void* v4;
+    int64_t v31;
+    int64_t v15;
+    int64_t v5; /* placeholder for void */
+    void* v18;
+    int64_t v25;
+    int64_t v26; /* placeholder for void */
+    int64_t v48;
+    v2 = 8LL;
+    v3 = v1 + v2;
+    v4 = malloc(8);
+    *(void**)v4 = (void*)v3;
+    v6 = malloc(8);
+    *(void**)v6 = (void*)v1;
+    v8 = malloc(8);
+    v10 = *(void**)v4;
+    v11 = *(int64_t*)v10;
+    *(int64_t*)v8 = (int64_t)v11;
+    v14 = *(int64_t*)v8;
+    v15 = 0LL;
+    v16 = v14 == v15;
+    if (v16) goto bb1;
+    else goto bb2;
+  bb1:
+    v18 = _str3;
+    p_panic(v18);
+    goto bb3;
+  bb2:
+    goto bb3;
+  bb3:
+    v22 = malloc(8);
+    v24 = *(void**)v6;
+    v25 = *(int64_t*)v24;
+    *(int64_t*)v22 = (int64_t)v25;
+    v28 = *(int64_t*)v22;
+    v29 = *(int64_t*)v8;
+    v30 = 1LL;
+    v31 = v29 - v30;
+    v32 = 8LL;
+    v33 = v31 * v32;
+    v34 = v28 + v33;
+    v35 = malloc(8);
+    *(int64_t*)v35 = (int64_t)v34;
+    v37 = *(int64_t*)v35;
+    v38 = malloc(8);
+    *(void**)v38 = (void*)v37;
+    v40 = 0LL;
+    v41 = malloc(8);
+    *(int64_t*)v41 = (int64_t)v40;
+    v44 = *(void**)v38;
+    v45 = *(int64_t*)v44;
+    *(int64_t*)v41 = (int64_t)v45;
+    v48 = *(int64_t*)v41;
+    p_call_stack_pop();
+    return v48;
+    return 0;
+}
+
+void ByteBuffer_write_bytes(void* v0, void* v1, int64_t v2, int64_t v3) {
+    p_call_stack_push("ByteBuffer_write_bytes");
+    int64_t v17; /* placeholder for void */
+    int64_t v27;
+    int64_t v12;
+    int64_t v29;
+    int64_t v34; /* placeholder for void */
+    int64_t v18;
+    int64_t v4;
+    int64_t v6; /* placeholder for void */
+    int64_t v30;
+    int64_t v26;
+    int64_t v28; /* placeholder for void */
+    int64_t v7; /* placeholder for void */
+    bool v9;
+    int64_t v21; /* placeholder for void */
+    int64_t v15;
+    int64_t v8;
+    int64_t v20; /* placeholder for void */
+    void* v5;
+    int64_t v11;
+    void* v16;
+    int64_t v25; /* placeholder for void */
+    int64_t v33; /* placeholder for void */
+    int64_t v32; /* placeholder for void */
+    int64_t v14; /* placeholder for void */
+    void* v22;
+    int64_t v10; /* placeholder for void */
+    int64_t v31;
+    void* v19;
+    void* v13;
+    int64_t v24; /* placeholder for void */
+    uint8_t v23;
+    v4 = 0LL;
+    v5 = malloc(8);
+    *(int64_t*)v5 = (int64_t)v4;
+    goto bb1;
+  bb1:
+    v8 = *(int64_t*)v5;
+    v9 = v8 < v3;
+    if (v9) goto bb2;
+    else goto bb3;
+  bb2:
+    v11 = *(int64_t*)v5;
+    v12 = v2 + v11;
+    v13 = malloc(8);
+    *(int64_t*)v13 = (int64_t)v12;
+    v15 = *(int64_t*)v13;
+    v16 = malloc(8);
+    *(void**)v16 = (void*)v15;
+    v18 = 0LL;
+    v19 = malloc(8);
+    *(int64_t*)v19 = (int64_t)v18;
+    v22 = *(void**)v16;
+    v23 = *(uint8_t*)v22;
+    *(int64_t*)v19 = (int64_t)v23;
+    v26 = *(int64_t*)v19;
+    v27 = 0LL;
+    ByteBuffer_write_byte((void*)v27, v1, v26);
+    v29 = *(int64_t*)v5;
+    v30 = 1LL;
+    v31 = v29 + v30;
+    *(int64_t*)v5 = (int64_t)v31;
+    goto bb1;
+  bb3:
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+bool Option_is_none(void* v0, void* v1) {
+    p_call_stack_push("Option_is_none");
+    void* v11;
+    bool v5;
+    int64_t v13;
+    int64_t v18; /* placeholder for void */
+    bool v9;
+    int64_t v6; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    bool v16;
+    int64_t v3;
+    int64_t v8;
+    int64_t v12;
+    int64_t v15; /* placeholder for void */
+    void* v2;
+    void* v7;
+    int64_t v10; /* placeholder for void */
+    int64_t v4;
+    int64_t v17; /* placeholder for void */
+    bool v19;
+    bool v14;
+    v2 = (char*)v1 + 0;
+    v3 = *(int64_t*)v2;
+    v4 = 0LL;
+    v5 = v3 == v4;
+    if (v5) goto bb2;
+    else goto bb3;
+  bb1:
+    v19 = false;
+    p_call_stack_pop();
+    return v19;
+  bb2:
+    v7 = (char*)v1 + 8;
+    v8 = *(int64_t*)v7;
+    v9 = false;
+    p_call_stack_pop();
+    return v9;
+  bb3:
+    v11 = (char*)v1 + 0;
+    v12 = *(int64_t*)v11;
+    v13 = 1LL;
+    v14 = v12 == v13;
+    if (v14) goto bb4;
+    else goto bb5;
+  bb4:
+    v16 = true;
+    p_call_stack_pop();
+    return v16;
+  bb5:
+    goto bb1;
+    return 0;
+}
+
+int64_t Vec_get(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("Vec_get");
+    int64_t v41;
+    int64_t v4;
+    int64_t v6; /* placeholder for void */
+    int64_t v53; /* placeholder for void */
+    int64_t v24; /* placeholder for void */
+    void* v18;
+    int64_t v21; /* placeholder for void */
+    int64_t v10; /* placeholder for void */
+    int64_t v14; /* placeholder for void */
+    int64_t v19; /* placeholder for void */
+    int64_t v28; /* placeholder for void */
+    void* v39;
+    int64_t v40; /* placeholder for void */
+    int64_t v46; /* placeholder for void */
+    void* v48;
+    void* v11;
+    int64_t v51; /* placeholder for void */
+    void* v5;
+    void* v29;
+    int64_t v37;
+    void* v45;
+    int64_t v3;
+    int64_t v13; /* placeholder for void */
+    void* v42;
+    bool v16;
+    int64_t v50; /* placeholder for void */
+    int64_t v52;
+    int64_t v20; /* placeholder for void */
+    void* v25;
+    void* v7;
+    int64_t v32;
+    int64_t v44;
+    int64_t v22;
+    int64_t v33; /* placeholder for void */
+    int64_t v17; /* placeholder for void */
+    int64_t v38;
+    int64_t v47; /* placeholder for void */
+    int64_t v36;
+    int64_t v8; /* placeholder for void */
+    int64_t v27; /* placeholder for void */
+    void* v9;
+    int64_t v35;
+    int64_t v34; /* placeholder for void */
+    int64_t v43; /* placeholder for void */
+    int64_t v30; /* placeholder for void */
+    int64_t v12;
+    int64_t v15;
+    void* v31;
+    bool v23;
+    int64_t v26; /* placeholder for void */
+    int64_t v49;
+    v3 = 8LL;
+    v4 = v1 + v3;
+    v5 = malloc(8);
+    *(void**)v5 = (void*)v4;
+    v7 = malloc(8);
+    *(void**)v7 = (void*)v1;
+    v9 = malloc(8);
+    v11 = *(void**)v5;
+    v12 = *(int64_t*)v11;
+    *(int64_t*)v9 = (int64_t)v12;
+    v15 = *(int64_t*)v9;
+    v16 = v2 >= v15;
+    if (v16) goto bb1;
+    else goto bb2;
+  bb1:
+    v18 = _str4;
+    p_panic(v18);
+    goto bb3;
+  bb2:
+    goto bb3;
+  bb3:
+    v22 = 0LL;
+    v23 = v2 < v22;
+    if (v23) goto bb4;
+    else goto bb5;
+  bb4:
+    v25 = _str4;
+    p_panic(v25);
+    goto bb6;
+  bb5:
+    goto bb6;
+  bb6:
+    v29 = malloc(8);
+    v31 = *(void**)v7;
+    v32 = *(int64_t*)v31;
+    *(int64_t*)v29 = (int64_t)v32;
+    v35 = *(int64_t*)v29;
+    v36 = 8LL;
+    v37 = v2 * v36;
+    v38 = v35 + v37;
+    v39 = malloc(8);
+    *(int64_t*)v39 = (int64_t)v38;
+    v41 = *(int64_t*)v39;
+    v42 = malloc(8);
+    *(void**)v42 = (void*)v41;
+    v44 = 0LL;
+    v45 = malloc(8);
+    *(int64_t*)v45 = (int64_t)v44;
+    v48 = *(void**)v42;
+    v49 = *(int64_t*)v48;
+    *(int64_t*)v45 = (int64_t)v49;
+    v52 = *(int64_t*)v45;
+    p_call_stack_pop();
+    return v52;
+    return 0;
+}
+
+int64_t str_find(void* v0, void* v1, void* v2) {
+    p_call_stack_push("str_find");
+    int64_t v3;
+    int64_t v5; /* placeholder for void */
+    int64_t v4;
+    v3 = 0LL;
+    v4 = (int64_t)String_find((void*)v3, (int64_t)v1, (int64_t)v2);
+    p_call_stack_pop();
+    return v4;
+    return 0;
+}
+
+bool HashMap_contains(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("HashMap_contains");
+    int64_t v10; /* placeholder for void */
+    int64_t v58;
+    bool v61;
+    int64_t v57;
+    void* v8;
+    int64_t v25; /* placeholder for void */
+    int64_t v33;
     void* v32;
+    int64_t v34; /* placeholder for void */
+    int64_t v12;
+    bool v17;
+    int64_t v45; /* placeholder for void */
+    int64_t v55;
+    int64_t v16;
+    void* v11;
+    void* v29;
+    int64_t v28;
+    int64_t v30; /* placeholder for void */
+    int64_t v62; /* placeholder for void */
+    void* v5;
+    int64_t v40;
+    bool v19;
+    void* v47;
+    int64_t v6; /* placeholder for void */
+    int64_t v37;
+    int64_t v18; /* placeholder for void */
+    bool v60;
+    void* v26;
+    int64_t v21; /* placeholder for void */
+    int64_t v36;
+    int64_t v4;
+    bool v56;
+    int64_t v53; /* placeholder for void */
+    int64_t v14; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    int64_t v3;
+    int64_t v22;
+    int64_t v38;
+    int64_t v46;
+    int64_t v27; /* placeholder for void */
+    int64_t v7;
+    int64_t v35; /* placeholder for void */
+    void* v24;
+    int64_t v39;
+    void* v50;
+    void* v44;
+    int64_t v42; /* placeholder for void */
+    int64_t v49; /* placeholder for void */
+    void* v41;
+    int64_t v51;
+    int64_t v15;
+    int64_t v48; /* placeholder for void */
+    int64_t v31; /* placeholder for void */
+    int64_t v43;
+    int64_t v23;
+    int64_t v54;
+    int64_t v52; /* placeholder for void */
+    int64_t v13; /* placeholder for void */
+    int64_t v59;
+    int64_t v9; /* placeholder for void */
+    v3 = 24LL;
+    v4 = v1 + v3;
+    v5 = malloc(8);
+    *(void**)v5 = (void*)v4;
+    v7 = 0LL;
+    v8 = malloc(8);
+    *(int64_t*)v8 = (int64_t)v7;
+    v11 = *(void**)v5;
+    v12 = *(int64_t*)v11;
+    *(int64_t*)v8 = (int64_t)v12;
+    v15 = *(int64_t*)v8;
+    v16 = 0LL;
+    v17 = v15 == v16;
+    if (v17) goto bb1;
+    else goto bb2;
+  bb1:
+    v19 = false;
+    p_call_stack_pop();
+    return v19;
+  bb2:
+    goto bb3;
+  bb3:
+    v22 = 0LL;
+    v23 = (int64_t)HashMap_find_slot((void*)v22, v1, v2);
+    v24 = malloc(8);
+    *(int64_t*)v24 = (int64_t)v23;
+    v26 = malloc(8);
+    *(void**)v26 = (void*)v1;
+    v28 = 0LL;
+    v29 = malloc(8);
+    *(int64_t*)v29 = (int64_t)v28;
+    v32 = *(void**)v26;
+    v33 = *(int64_t*)v32;
+    *(int64_t*)v29 = (int64_t)v33;
+    v36 = *(int64_t*)v29;
+    v37 = *(int64_t*)v24;
+    v38 = 8LL;
+    v39 = v37 * v38;
+    v40 = v36 + v39;
+    v41 = malloc(8);
+    *(int64_t*)v41 = (int64_t)v40;
+    v43 = *(int64_t*)v41;
+    v44 = malloc(8);
+    *(void**)v44 = (void*)v43;
+    v46 = 0LL;
+    v47 = malloc(8);
+    *(int64_t*)v47 = (int64_t)v46;
+    v50 = *(void**)v44;
+    v51 = *(int64_t*)v50;
+    *(int64_t*)v47 = (int64_t)v51;
+    v54 = *(int64_t*)v47;
+    v55 = 0LL;
+    v56 = v54 != v55;
+    v57 = *(int64_t*)v47;
+    v58 = 1LL;
+    v59 = -v58;
+    v60 = v57 != v59;
+    v61 = v56 && v60;
+    p_call_stack_pop();
+    return v61;
+    return 0;
+}
+
+int64_t String_push_str(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("String_push_str");
+    int64_t v4;
+    int64_t v41;
+    int64_t v13;
+    void* v16;
+    void* v9;
+    void* v40;
+    void* v5;
+    int64_t v24;
+    int64_t v10; /* placeholder for void */
+    int64_t v42; /* placeholder for void */
+    int64_t v45; /* placeholder for void */
+    int64_t v3;
+    int64_t v36;
+    int64_t v12;
+    void* v17;
+    int64_t v23;
+    void* v37;
+    int64_t v38; /* placeholder for void */
+    int64_t v27;
+    int64_t v30;
+    int64_t v20;
+    int64_t v28; /* placeholder for void */
+    int64_t v35; /* placeholder for void */
+    int64_t v19;
+    int64_t v32;
+    int64_t v43; /* placeholder for void */
+    int64_t v8;
+    void* v34;
+    int64_t v14;
+    int64_t v18; /* placeholder for void */
+    int64_t v33;
+    int64_t v22; /* placeholder for void */
+    int64_t v39; /* placeholder for void */
+    int64_t v7;
+    int64_t v44;
+    int64_t v29;
+    int64_t v15;
+    int64_t v25;
+    int64_t v31;
+    int64_t v26;
+    int64_t v21;
+    int64_t v11;
+    int64_t v6; /* placeholder for void */
+    v3 = 0LL;
+    v4 = (int64_t)p_str_length((void*)v3, v1);
+    v5 = malloc(8);
+    *(int64_t*)v5 = (int64_t)v4;
+    v7 = 0LL;
+    v8 = (int64_t)p_str_length((void*)v7, v2);
+    v9 = malloc(8);
+    *(int64_t*)v9 = (int64_t)v8;
+    v11 = *(int64_t*)v5;
+    v12 = *(int64_t*)v9;
+    v13 = v11 + v12;
+    v14 = 1LL;
+    v15 = v13 + v14;
+    v16 = p_malloc(v15);
+    v17 = malloc(8);
+    *(int64_t*)v17 = (int64_t)v16;
+    v19 = *(int64_t*)v17;
+    v20 = *(int64_t*)v5;
+    v21 = 0LL;
+    p_str_copy_n((void*)v21, v19, v1, v20);
+    v23 = *(int64_t*)v17;
+    v24 = *(int64_t*)v5;
+    v25 = v23 + v24;
+    v26 = *(int64_t*)v9;
+    v27 = 0LL;
+    p_str_copy_n((void*)v27, v25, v2, v26);
+    v29 = *(int64_t*)v17;
+    v30 = *(int64_t*)v5;
+    v31 = v29 + v30;
+    v32 = *(int64_t*)v9;
+    v33 = v31 + v32;
+    v34 = malloc(8);
+    *(int64_t*)v34 = (int64_t)v33;
+    v36 = *(int64_t*)v34;
+    v37 = malloc(8);
+    *(void**)v37 = (void*)v36;
+    v40 = *(void**)v37;
+    v41 = 0LL;
+    *(uint8_t*)v40 = (uint8_t)v41;
+    v44 = *(int64_t*)v17;
+    p_call_stack_pop();
+    return v44;
+    return 0;
+}
+
+int64_t p_str_compare(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("p_str_compare");
+    int64_t v53;
+    bool v9;
+    int64_t v61; /* placeholder for void */
+    int64_t v67; /* placeholder for void */
+    int64_t v28;
+    int64_t v78;
+    bool v47;
+    int64_t v63;
+    int64_t v6; /* placeholder for void */
+    int64_t v72; /* placeholder for void */
+    int64_t v25;
+    int64_t v22; /* placeholder for void */
+    void* v21;
+    int64_t v50;
+    int64_t v65; /* placeholder for void */
+    void* v38;
+    uint8_t v37;
+    void* v23;
+    int64_t v7; /* placeholder for void */
+    int64_t v60;
+    int64_t v77;
+    int64_t v19; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    int64_t v76; /* placeholder for void */
+    int64_t v56; /* placeholder for void */
+    int64_t v57; /* placeholder for void */
+    int64_t v18;
+    int64_t v5;
+    int64_t v69; /* placeholder for void */
+    int64_t v24; /* placeholder for void */
+    uint8_t v33;
+    int64_t v66;
+    void* v32;
+    int64_t v31; /* placeholder for void */
+    int64_t v75; /* placeholder for void */
+    int64_t v17; /* placeholder for void */
+    int64_t v45;
+    int64_t v35; /* placeholder for void */
+    bool v51;
+    int64_t v8;
+    int64_t v52; /* placeholder for void */
+    bool v3;
+    int64_t v4; /* placeholder for void */
+    int64_t v15;
+    int64_t v27; /* placeholder for void */
+    int64_t v68;
+    int64_t v64;
+    int64_t v80; /* placeholder for void */
+    int64_t v10; /* placeholder for void */
+    bool v16;
+    int64_t v62;
+    bool v43;
+    int64_t v59;
+    int64_t v14; /* placeholder for void */
+    int64_t v12;
+    int64_t v11;
+    int64_t v30; /* placeholder for void */
+    int64_t v39; /* placeholder for void */
+    int64_t v40; /* placeholder for void */
+    void* v70;
+    void* v73;
+    int64_t v58;
+    void* v34;
+    int64_t v44;
+    int64_t v55;
+    void* v26;
+    int64_t v79;
+    int64_t v41;
+    uint8_t v71;
+    int64_t v42;
+    void* v36;
+    int64_t v54;
+    int64_t v48; /* placeholder for void */
+    uint8_t v74;
+    bool v46;
+    int64_t v49;
+    int64_t v13; /* placeholder for void */
+    void* v29;
+    v3 = v1 == v2;
+    if (v3) goto bb1;
+    else goto bb2;
+  bb1:
+    v5 = 0LL;
+    p_call_stack_pop();
+    return v5;
+  bb2:
+    goto bb3;
+  bb3:
+    v8 = 0LL;
+    v9 = v1 == v8;
+    if (v9) goto bb4;
+    else goto bb5;
+  bb4:
+    v11 = 1LL;
+    v12 = -v11;
+    p_call_stack_pop();
+    return v12;
+  bb5:
+    goto bb6;
+  bb6:
+    v15 = 0LL;
+    v16 = v2 == v15;
+    if (v16) goto bb7;
+    else goto bb8;
+  bb7:
+    v18 = 1LL;
+    p_call_stack_pop();
+    return v18;
+  bb8:
+    goto bb9;
+  bb9:
+    v21 = malloc(8);
+    *(int64_t*)v21 = (int64_t)v1;
+    v23 = malloc(8);
+    *(int64_t*)v23 = (int64_t)v2;
+    v25 = *(int64_t*)v21;
+    v26 = malloc(8);
+    *(void**)v26 = (void*)v25;
+    v28 = *(int64_t*)v23;
+    v29 = malloc(8);
+    *(void**)v29 = (void*)v28;
+    v32 = *(void**)v26;
+    v33 = *(uint8_t*)v32;
+    v34 = malloc(8);
+    *(int64_t*)v34 = (int64_t)v33;
+    v36 = *(void**)v29;
+    v37 = *(uint8_t*)v36;
+    v38 = malloc(8);
+    *(int64_t*)v38 = (int64_t)v37;
+    goto bb10;
+  bb10:
+    v41 = *(int64_t*)v34;
+    v42 = 0LL;
+    v43 = v41 != v42;
+    v44 = *(int64_t*)v38;
+    v45 = 0LL;
+    v46 = v44 != v45;
+    v47 = v43 && v46;
+    if (v47) goto bb11;
+    else goto bb12;
+  bb11:
+    v49 = *(int64_t*)v34;
+    v50 = *(int64_t*)v38;
+    v51 = v49 != v50;
+    if (v51) goto bb13;
+    else goto bb14;
+  bb12:
+    v77 = *(int64_t*)v34;
+    v78 = *(int64_t*)v38;
+    v79 = v77 - v78;
+    p_call_stack_pop();
+    return v79;
+  bb13:
+    v53 = *(int64_t*)v34;
+    v54 = *(int64_t*)v38;
+    v55 = v53 - v54;
+    p_call_stack_pop();
+    return v55;
+  bb14:
+    goto bb15;
+  bb15:
+    v58 = *(int64_t*)v21;
+    v59 = 1LL;
+    v60 = v58 + v59;
+    *(int64_t*)v21 = (int64_t)v60;
+    v62 = *(int64_t*)v23;
+    v63 = 1LL;
+    v64 = v62 + v63;
+    *(int64_t*)v23 = (int64_t)v64;
+    v66 = *(int64_t*)v21;
+    *(void**)v26 = (void*)v66;
+    v68 = *(int64_t*)v23;
+    *(void**)v29 = (void*)v68;
+    v70 = *(void**)v26;
+    v71 = *(uint8_t*)v70;
+    *(int64_t*)v34 = (int64_t)v71;
+    v73 = *(void**)v29;
+    v74 = *(uint8_t*)v73;
+    *(int64_t*)v38 = (int64_t)v74;
+    goto bb10;
+    return 0;
+}
+
+bool String_ends_with(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("String_ends_with");
+    int64_t v78;
+    bool v7;
+    void* v37;
+    int64_t v43;
+    int64_t v80; /* placeholder for void */
+    int64_t v68; /* placeholder for void */
+    void* v73;
+    bool v4;
+    int64_t v11; /* placeholder for void */
+    void* v18;
+    int64_t v42; /* placeholder for void */
+    int64_t v41; /* placeholder for void */
+    void* v51;
+    void* v61;
+    void* v55;
+    int64_t v63;
+    void* v40;
+    void* v67;
+    int64_t v76; /* placeholder for void */
+    bool v6;
+    bool v45;
+    bool v79;
+    int64_t v82; /* placeholder for void */
+    int64_t v84;
+    int64_t v88; /* placeholder for void */
+    int64_t v69; /* placeholder for void */
+    int64_t v13;
+    uint8_t v71;
+    int64_t v26; /* placeholder for void */
+    int64_t v5;
+    int64_t v72; /* placeholder for void */
+    bool v89;
+    int64_t v52; /* placeholder for void */
+    void* v14;
+    bool v81;
+    int64_t v90; /* placeholder for void */
+    int64_t v44;
+    int64_t v8; /* placeholder for void */
+    int64_t v34;
+    int64_t v38; /* placeholder for void */
+    int64_t v47;
+    int64_t v50;
+    int64_t v57;
+    void* v64;
+    int64_t v75; /* placeholder for void */
+    int64_t v27;
+    int64_t v33; /* placeholder for void */
+    int64_t v36;
+    int64_t v77;
+    int64_t v32; /* placeholder for void */
+    int64_t v21;
+    int64_t v20;
+    int64_t v17;
+    bool v31;
+    int64_t v35;
+    uint8_t v74;
+    int64_t v16;
+    bool v29;
+    int64_t v19; /* placeholder for void */
+    bool v24;
+    void* v58;
+    int64_t v66;
+    int64_t v25; /* placeholder for void */
+    int64_t v56; /* placeholder for void */
+    int64_t v87; /* placeholder for void */
+    int64_t v46; /* placeholder for void */
+    void* v70;
+    int64_t v83; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    int64_t v10; /* placeholder for void */
+    int64_t v30; /* placeholder for void */
+    bool v9;
+    int64_t v3;
+    int64_t v28;
+    int64_t v60;
+    int64_t v85;
+    int64_t v49;
+    int64_t v23; /* placeholder for void */
+    int64_t v86;
+    int64_t v65; /* placeholder for void */
+    int64_t v53;
+    int64_t v54;
+    int64_t v62; /* placeholder for void */
+    int64_t v12;
+    int64_t v59; /* placeholder for void */
+    bool v22;
+    int64_t v48;
+    int64_t v39;
+    v3 = 0LL;
+    v4 = v1 == v3;
+    v5 = 0LL;
+    v6 = v2 == v5;
+    v7 = v4 || v6;
+    if (v7) goto bb1;
+    else goto bb2;
+  bb1:
+    v9 = false;
+    p_call_stack_pop();
+    return v9;
+  bb2:
+    goto bb3;
+  bb3:
+    v12 = 0LL;
+    v13 = (int64_t)p_str_length((void*)v12, v1);
+    v14 = malloc(8);
+    *(int64_t*)v14 = (int64_t)v13;
+    v16 = 0LL;
+    v17 = (int64_t)p_str_length((void*)v16, v2);
+    v18 = malloc(8);
+    *(int64_t*)v18 = (int64_t)v17;
+    v20 = *(int64_t*)v18;
+    v21 = *(int64_t*)v14;
+    v22 = v20 > v21;
+    if (v22) goto bb4;
+    else goto bb5;
+  bb4:
+    v24 = false;
+    p_call_stack_pop();
+    return v24;
+  bb5:
+    goto bb6;
+  bb6:
+    v27 = *(int64_t*)v18;
+    v28 = 0LL;
+    v29 = v27 == v28;
+    if (v29) goto bb7;
+    else goto bb8;
+  bb7:
+    v31 = true;
+    p_call_stack_pop();
+    return v31;
+  bb8:
+    goto bb9;
+  bb9:
+    v34 = *(int64_t*)v14;
+    v35 = *(int64_t*)v18;
+    v36 = v34 - v35;
+    v37 = malloc(8);
+    *(int64_t*)v37 = (int64_t)v36;
+    v39 = 0LL;
+    v40 = malloc(8);
+    *(int64_t*)v40 = (int64_t)v39;
+    goto bb10;
+  bb10:
+    v43 = *(int64_t*)v40;
+    v44 = *(int64_t*)v18;
+    v45 = v43 < v44;
+    if (v45) goto bb11;
+    else goto bb12;
+  bb11:
+    v47 = *(int64_t*)v37;
+    v48 = v1 + v47;
+    v49 = *(int64_t*)v40;
+    v50 = v48 + v49;
+    v51 = malloc(8);
+    *(int64_t*)v51 = (int64_t)v50;
+    v53 = *(int64_t*)v40;
+    v54 = v2 + v53;
+    v55 = malloc(8);
+    *(int64_t*)v55 = (int64_t)v54;
+    v57 = *(int64_t*)v51;
+    v58 = malloc(8);
+    *(void**)v58 = (void*)v57;
+    v60 = *(int64_t*)v55;
+    v61 = malloc(8);
+    *(void**)v61 = (void*)v60;
+    v63 = 0LL;
+    v64 = malloc(8);
+    *(int64_t*)v64 = (int64_t)v63;
+    v66 = 0LL;
+    v67 = malloc(8);
+    *(int64_t*)v67 = (int64_t)v66;
+    v70 = *(void**)v58;
+    v71 = *(uint8_t*)v70;
+    *(int64_t*)v64 = (int64_t)v71;
+    v73 = *(void**)v61;
+    v74 = *(uint8_t*)v73;
+    *(int64_t*)v67 = (int64_t)v74;
+    v77 = *(int64_t*)v64;
+    v78 = *(int64_t*)v67;
+    v79 = v77 != v78;
+    if (v79) goto bb13;
+    else goto bb14;
+  bb12:
+    v89 = true;
+    p_call_stack_pop();
+    return v89;
+  bb13:
+    v81 = false;
+    p_call_stack_pop();
+    return v81;
+  bb14:
+    goto bb15;
+  bb15:
+    v84 = *(int64_t*)v40;
+    v85 = 1LL;
+    v86 = v84 + v85;
+    *(int64_t*)v40 = (int64_t)v86;
+    goto bb10;
+    return 0;
+}
+
+int64_t HashMap_get_or(void* v0, int64_t v1, int64_t v2, int64_t v3) {
+    p_call_stack_push("HashMap_get_or");
+    int64_t v27; /* placeholder for void */
+    int64_t v74;
+    int64_t v16;
+    int64_t v31; /* placeholder for void */
+    void* v47;
+    int64_t v42; /* placeholder for void */
+    int64_t v25; /* placeholder for void */
+    int64_t v30; /* placeholder for void */
+    int64_t v51;
+    int64_t v34; /* placeholder for void */
+    int64_t v57;
+    int64_t v77;
+    int64_t v79;
+    int64_t v63; /* placeholder for void */
+    int64_t v81;
+    void* v88;
+    int64_t v39;
+    int64_t v95;
+    int64_t v14; /* placeholder for void */
+    int64_t v8;
+    int64_t v96; /* placeholder for void */
+    int64_t v86; /* placeholder for void */
+    void* v41;
+    int64_t v71; /* placeholder for void */
+    void* v24;
+    bool v18;
+    int64_t v92;
+    int64_t v49; /* placeholder for void */
+    bool v60;
+    int64_t v87;
+    int64_t v10; /* placeholder for void */
+    int64_t v90; /* placeholder for void */
+    bool v56;
+    int64_t v68; /* placeholder for void */
+    int64_t v55;
+    int64_t v7; /* placeholder for void */
+    void* v6;
+    int64_t v38;
+    int64_t v46;
+    void* v32;
+    int64_t v48; /* placeholder for void */
+    int64_t v21; /* placeholder for void */
+    void* v50;
+    int64_t v19; /* placeholder for void */
+    int64_t v54;
+    void* v73;
+    int64_t v80;
+    int64_t v89; /* placeholder for void */
+    int64_t v5;
+    int64_t v11; /* placeholder for void */
+    void* v9;
+    int64_t v64; /* placeholder for void */
+    void* v26;
+    int64_t v62; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    int64_t v75; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    void* v85;
+    int64_t v23;
+    int64_t v72; /* placeholder for void */
+    void* v29;
+    int64_t v28;
+    int64_t v22;
+    int64_t v33;
+    int64_t v43;
+    int64_t v52; /* placeholder for void */
+    int64_t v4;
+    int64_t v13;
+    void* v44;
+    int64_t v36;
+    void* v12;
+    int64_t v65;
+    int64_t v45; /* placeholder for void */
+    int64_t v66;
+    bool v61;
+    void* v67;
+    int64_t v69;
+    void* v82;
+    int64_t v93; /* placeholder for void */
+    int64_t v17;
+    void* v70;
+    int64_t v94; /* placeholder for void */
+    int64_t v59;
+    int64_t v84;
+    void* v91;
+    int64_t v40;
+    int64_t v53; /* placeholder for void */
+    int64_t v76; /* placeholder for void */
+    int64_t v78;
+    int64_t v83; /* placeholder for void */
+    int64_t v58;
+    int64_t v37;
+    int64_t v35; /* placeholder for void */
     v4 = 24LL;
     v5 = v1 + v4;
     v6 = malloc(8);
@@ -9562,334 +8901,1541 @@ int64_t HashMap_get_or(void* v0, int64_t v1, int64_t v2, int64_t v3) {
     return 0;
 }
 
-int64_t str_parse_int_range(void* v0, void* v1, int64_t v2, int64_t v3) {
-    p_call_stack_push("str_parse_int_range");
-    int64_t v7; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    int64_t v21;
-    bool v22;
-    int64_t v27; /* placeholder for void */
-    int64_t v34; /* placeholder for void */
-    int64_t v47;
-    int64_t v13;
-    int64_t v29;
-    int64_t v4;
-    int64_t v52; /* placeholder for void */
-    void* v54;
+int64_t char_to_upper(void* v0, int64_t v1) {
+    p_call_stack_push("char_to_upper");
+    int64_t v12; /* placeholder for void */
+    bool v3;
+    int64_t v2;
+    bool v6;
     int64_t v11; /* placeholder for void */
-    int64_t v9; /* placeholder for void */
-    int64_t v56; /* placeholder for void */
-    int64_t v50;
-    void* v57;
-    uint8_t v58;
-    int64_t v69; /* placeholder for void */
-    int64_t v65;
-    int64_t v71;
-    int64_t v78; /* placeholder for void */
-    int64_t v70; /* placeholder for void */
-    int64_t v80;
-    bool v14;
-    int64_t v19; /* placeholder for void */
-    int64_t v81;
-    int64_t v33; /* placeholder for void */
-    int64_t v38;
-    int64_t v43;
-    int64_t v84;
-    int64_t v85; /* placeholder for void */
-    int64_t v77;
-    int64_t v28;
-    int64_t v32;
-    int64_t v49; /* placeholder for void */
-    void* v39;
-    void* v36;
-    int64_t v53;
-    int64_t v37; /* placeholder for void */
-    int64_t v59; /* placeholder for void */
-    bool v63;
-    int64_t v24;
-    int64_t v74;
-    void* v6;
-    int64_t v61;
-    int64_t v75;
-    int64_t v15; /* placeholder for void */
-    int64_t v35;
-    int64_t v73;
-    int64_t v83; /* placeholder for void */
-    bool v44;
-    bool v30;
-    int64_t v31; /* placeholder for void */
-    int64_t v62;
-    int64_t v40; /* placeholder for void */
-    int64_t v60; /* placeholder for void */
-    void* v10;
-    void* v8;
-    int64_t v20;
-    int64_t v41; /* placeholder for void */
-    int64_t v79;
-    int64_t v12;
-    int64_t v82; /* placeholder for void */
-    int64_t v45; /* placeholder for void */
-    bool v67;
-    int64_t v5;
-    int64_t v25; /* placeholder for void */
-    int64_t v72;
-    int64_t v17; /* placeholder for void */
-    int64_t v68; /* placeholder for void */
-    void* v48;
-    int64_t v46;
-    int64_t v64;
-    int64_t v55; /* placeholder for void */
-    int64_t v76;
-    int64_t v26; /* placeholder for void */
-    bool v66;
-    int64_t v16;
-    int64_t v23; /* placeholder for void */
-    void* v51;
-    int64_t v42;
-    v4 = 0LL;
-    v5 = (int64_t)String_len((void*)v4, (int64_t)v1);
-    v6 = malloc(8);
-    *(int64_t*)v6 = (int64_t)v5;
-    v8 = malloc(8);
-    *(int64_t*)v8 = (int64_t)v2;
-    v10 = malloc(8);
-    *(int64_t*)v10 = (int64_t)v3;
-    v12 = *(int64_t*)v8;
-    v13 = 0LL;
-    v14 = v12 < v13;
-    if (v14) goto bb1;
+    bool v5;
+    int64_t v8;
+    int64_t v4;
+    int64_t v7; /* placeholder for void */
+    int64_t v10; /* placeholder for void */
+    int64_t v9;
+    v2 = 97LL;
+    v3 = v1 >= v2;
+    v4 = 122LL;
+    v5 = v1 <= v4;
+    v6 = v3 && v5;
+    if (v6) goto bb1;
     else goto bb2;
   bb1:
-    v16 = 0LL;
-    *(int64_t*)v8 = (int64_t)v16;
+    v8 = 32LL;
+    v9 = v1 - v8;
+    p_call_stack_pop();
+    return v9;
+  bb2:
+    goto bb3;
+  bb3:
+    p_call_stack_pop();
+    return v1;
+    return 0;
+}
+
+void Vec_set(void* v0, int64_t v1, int64_t v2, int64_t v3) {
+    p_call_stack_push("Vec_set");
+    int64_t v7; /* placeholder for void */
+    void* v8;
+    bool v17;
+    int64_t v4;
+    int64_t v9; /* placeholder for void */
+    int64_t v18; /* placeholder for void */
+    void* v19;
+    int64_t v28; /* placeholder for void */
+    int64_t v23;
+    void* v30;
+    int64_t v31; /* placeholder for void */
+    void* v32;
+    int64_t v34; /* placeholder for void */
+    int64_t v35; /* placeholder for void */
+    int64_t v39;
+    void* v40;
+    int64_t v41; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    int64_t v27; /* placeholder for void */
+    int64_t v45; /* placeholder for void */
+    int64_t v49; /* placeholder for void */
+    bool v24;
+    int64_t v16;
+    void* v10;
+    int64_t v13;
+    int64_t v14; /* placeholder for void */
+    int64_t v36;
+    int64_t v48; /* placeholder for void */
+    int64_t v38;
+    int64_t v11; /* placeholder for void */
+    void* v6;
+    void* v12;
+    int64_t v37;
+    void* v46;
+    void* v26;
+    int64_t v29; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    void* v43;
+    int64_t v25; /* placeholder for void */
+    int64_t v5;
+    int64_t v47; /* placeholder for void */
+    int64_t v42;
+    int64_t v33;
+    int64_t v44; /* placeholder for void */
+    int64_t v21; /* placeholder for void */
+    int64_t v22; /* placeholder for void */
+    v4 = 8LL;
+    v5 = v1 + v4;
+    v6 = malloc(8);
+    *(void**)v6 = (void*)v5;
+    v8 = malloc(8);
+    *(void**)v8 = (void*)v1;
+    v10 = malloc(8);
+    v12 = *(void**)v6;
+    v13 = *(int64_t*)v12;
+    *(int64_t*)v10 = (int64_t)v13;
+    v16 = *(int64_t*)v10;
+    v17 = v2 >= v16;
+    if (v17) goto bb1;
+    else goto bb2;
+  bb1:
+    v19 = _str4;
+    p_panic(v19);
     goto bb3;
   bb2:
     goto bb3;
   bb3:
-    v20 = *(int64_t*)v10;
-    v21 = *(int64_t*)v6;
-    v22 = v20 > v21;
-    if (v22) goto bb4;
+    v23 = 0LL;
+    v24 = v2 < v23;
+    if (v24) goto bb4;
     else goto bb5;
   bb4:
-    v24 = *(int64_t*)v6;
-    *(int64_t*)v10 = (int64_t)v24;
+    v26 = _str4;
+    p_panic(v26);
     goto bb6;
   bb5:
     goto bb6;
   bb6:
-    v28 = *(int64_t*)v8;
-    v29 = *(int64_t*)v10;
-    v30 = v28 >= v29;
-    if (v30) goto bb7;
+    v30 = malloc(8);
+    v32 = *(void**)v8;
+    v33 = *(int64_t*)v32;
+    *(int64_t*)v30 = (int64_t)v33;
+    v36 = *(int64_t*)v30;
+    v37 = 8LL;
+    v38 = v2 * v37;
+    v39 = v36 + v38;
+    v40 = malloc(8);
+    *(int64_t*)v40 = (int64_t)v39;
+    v42 = *(int64_t*)v40;
+    v43 = malloc(8);
+    *(void**)v43 = (void*)v42;
+    v46 = *(void**)v43;
+    *(int64_t*)v46 = (int64_t)v3;
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+bool String_is_empty(void* v0, int64_t v1) {
+    p_call_stack_push("String_is_empty");
+    int64_t v13; /* placeholder for void */
+    uint8_t v15;
+    int64_t v16; /* placeholder for void */
+    int64_t v19;
+    int64_t v4; /* placeholder for void */
+    void* v8;
+    bool v3;
+    void* v14;
+    int64_t v17; /* placeholder for void */
+    int64_t v18;
+    int64_t v7; /* placeholder for void */
+    int64_t v9; /* placeholder for void */
+    int64_t v2;
+    bool v5;
+    int64_t v6; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    bool v20;
+    int64_t v10;
+    void* v11;
+    int64_t v21; /* placeholder for void */
+    v2 = 0LL;
+    v3 = v1 == v2;
+    if (v3) goto bb1;
+    else goto bb2;
+  bb1:
+    v5 = true;
+    p_call_stack_pop();
+    return v5;
+  bb2:
+    goto bb3;
+  bb3:
+    v8 = malloc(8);
+    *(void**)v8 = (void*)v1;
+    v10 = 0LL;
+    v11 = malloc(8);
+    *(int64_t*)v11 = (int64_t)v10;
+    v14 = *(void**)v8;
+    v15 = *(uint8_t*)v14;
+    *(int64_t*)v11 = (int64_t)v15;
+    v18 = *(int64_t*)v11;
+    v19 = 0LL;
+    v20 = v18 == v19;
+    p_call_stack_pop();
+    return v20;
+    return 0;
+}
+
+int64_t str_rfind(void* v0, void* v1, void* v2) {
+    p_call_stack_push("str_rfind");
+    int64_t v4;
+    int64_t v5; /* placeholder for void */
+    int64_t v3;
+    v3 = 0LL;
+    v4 = (int64_t)String_rfind((void*)v3, (int64_t)v1, (int64_t)v2);
+    p_call_stack_pop();
+    return v4;
+    return 0;
+}
+
+void* str_split_char(void* v0, void* v1, int64_t v2) {
+    p_call_stack_push("str_split_char");
+    void* v5;
+    void* v12;
+    int64_t v63;
+    int64_t v29;
+    int64_t v64; /* placeholder for void */
+    int64_t v57; /* placeholder for void */
+    int64_t v23;
+    int64_t v35; /* placeholder for void */
+    int64_t v13; /* placeholder for void */
+    int64_t v10;
+    int64_t v66; /* placeholder for void */
+    int64_t v17; /* placeholder for void */
+    uint8_t v34;
+    int64_t v44;
+    int64_t v53;
+    void* v24;
+    int64_t v3;
+    int64_t v46; /* placeholder for void */
+    int64_t v50; /* placeholder for void */
+    int64_t v59;
+    int64_t v49;
+    void* v65;
+    int64_t v45;
+    int64_t v39; /* placeholder for void */
+    void* v4;
+    int64_t v31; /* placeholder for void */
+    int64_t v41;
+    int64_t v26;
+    int64_t v60;
+    int64_t v62;
+    void* v15;
+    int64_t v19;
+    int64_t v43;
+    int64_t v9; /* placeholder for void */
+    int64_t v25; /* placeholder for void */
+    void* v30;
+    int64_t v36; /* placeholder for void */
+    void* v58;
+    int64_t v55;
+    int64_t v61;
+    int64_t v52; /* placeholder for void */
+    void* v8;
+    int64_t v51; /* placeholder for void */
+    int64_t v7;
+    int64_t v32; /* placeholder for void */
+    int64_t v56; /* placeholder for void */
+    int64_t v22;
+    bool v38;
+    int64_t v21; /* placeholder for void */
+    bool v20;
+    int64_t v14;
+    int64_t v28; /* placeholder for void */
+    void* v40;
+    int64_t v16; /* placeholder for void */
+    int64_t v42;
+    int64_t v6; /* placeholder for void */
+    int64_t v37;
+    int64_t v48;
+    int64_t v11;
+    void* v33;
+    int64_t v54;
+    void* v27;
+    int64_t v18;
+    int64_t v47;
+    v3 = 0LL;
+    v4 = (void*)Vec_new((void*)v3);
+    v5 = malloc(8);
+    *(void**)v5 = (void*)v4;
+    v7 = 0LL;
+    v8 = malloc(8);
+    *(int64_t*)v8 = (int64_t)v7;
+    v10 = 0LL;
+    v11 = (int64_t)String_len((void*)v10, (int64_t)v1);
+    v12 = malloc(8);
+    *(int64_t*)v12 = (int64_t)v11;
+    v14 = 0LL;
+    v15 = malloc(8);
+    *(int64_t*)v15 = (int64_t)v14;
+    goto bb1;
+  bb1:
+    v18 = *(int64_t*)v15;
+    v19 = *(int64_t*)v12;
+    v20 = v18 < v19;
+    if (v20) goto bb2;
+    else goto bb3;
+  bb2:
+    v22 = *(int64_t*)v15;
+    v23 = (int64_t)v1 + v22;
+    v24 = malloc(8);
+    *(int64_t*)v24 = (int64_t)v23;
+    v26 = *(int64_t*)v24;
+    v27 = malloc(8);
+    *(void**)v27 = (void*)v26;
+    v29 = 0LL;
+    v30 = malloc(8);
+    *(int64_t*)v30 = (int64_t)v29;
+    v33 = *(void**)v27;
+    v34 = *(uint8_t*)v33;
+    *(int64_t*)v30 = (int64_t)v34;
+    v37 = *(int64_t*)v30;
+    v38 = v37 == v2;
+    if (v38) goto bb4;
+    else goto bb5;
+  bb3:
+    v58 = *(void**)v5;
+    v59 = *(int64_t*)v8;
+    v60 = *(int64_t*)v12;
+    v61 = 0LL;
+    v62 = (int64_t)String_slice((void*)v61, (int64_t)v1, v59, v60);
+    v63 = 0LL;
+    Vec_push((void*)v63, (int64_t)v58, v62);
+    v65 = *(void**)v5;
+    p_call_stack_pop();
+    return v65;
+  bb4:
+    v40 = *(void**)v5;
+    v41 = *(int64_t*)v8;
+    v42 = *(int64_t*)v15;
+    v43 = 0LL;
+    v44 = (int64_t)String_slice((void*)v43, (int64_t)v1, v41, v42);
+    v45 = 0LL;
+    Vec_push((void*)v45, (int64_t)v40, v44);
+    v47 = *(int64_t*)v15;
+    v48 = 1LL;
+    v49 = v47 + v48;
+    *(int64_t*)v8 = (int64_t)v49;
+    goto bb6;
+  bb5:
+    goto bb6;
+  bb6:
+    v53 = *(int64_t*)v15;
+    v54 = 1LL;
+    v55 = v53 + v54;
+    *(int64_t*)v15 = (int64_t)v55;
+    goto bb1;
+    return 0;
+}
+
+void Vec_clear(void* v0, int64_t v1) {
+    p_call_stack_push("Vec_clear");
+    int64_t v5; /* placeholder for void */
+    int64_t v6; /* placeholder for void */
+    int64_t v2;
+    int64_t v3;
+    void* v7;
+    int64_t v8;
+    int64_t v9; /* placeholder for void */
+    int64_t v10; /* placeholder for void */
+    int64_t v11; /* placeholder for void */
+    void* v4;
+    v2 = 8LL;
+    v3 = v1 + v2;
+    v4 = malloc(8);
+    *(void**)v4 = (void*)v3;
+    v7 = *(void**)v4;
+    v8 = 0LL;
+    *(int64_t*)v7 = (int64_t)v8;
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+int64_t Vec_capacity(void* v0, int64_t v1) {
+    p_call_stack_push("Vec_capacity");
+    int64_t v12;
+    int64_t v10; /* placeholder for void */
+    int64_t v13; /* placeholder for void */
+    int64_t v2;
+    int64_t v5; /* placeholder for void */
+    int64_t v9;
+    int64_t v11; /* placeholder for void */
+    int64_t v3;
+    void* v8;
+    void* v6;
+    int64_t v7; /* placeholder for void */
+    void* v4;
+    v2 = 16LL;
+    v3 = v1 + v2;
+    v4 = malloc(8);
+    *(void**)v4 = (void*)v3;
+    v6 = malloc(8);
+    v8 = *(void**)v4;
+    v9 = *(int64_t*)v8;
+    *(int64_t*)v6 = (int64_t)v9;
+    v12 = *(int64_t*)v6;
+    p_call_stack_pop();
+    return v12;
+    return 0;
+}
+
+int64_t Option_unwrap_or(void* v0, void* v1, int64_t v2) {
+    p_call_stack_push("Option_unwrap_or");
+    void* v3;
+    int64_t v5;
+    int64_t v10; /* placeholder for void */
+    int64_t v12;
+    int64_t v4;
+    int64_t v13;
+    bool v14;
+    int64_t v17; /* placeholder for void */
+    int64_t v7; /* placeholder for void */
+    int64_t v16; /* placeholder for void */
+    bool v6;
+    int64_t v19; /* placeholder for void */
+    int64_t v9;
+    void* v11;
+    int64_t v18;
+    void* v8;
+    int64_t v15; /* placeholder for void */
+    v3 = (char*)v1 + 0;
+    v4 = *(int64_t*)v3;
+    v5 = 0LL;
+    v6 = v4 == v5;
+    if (v6) goto bb2;
+    else goto bb3;
+  bb1:
+    v18 = 0LL;
+    p_call_stack_pop();
+    return v18;
+  bb2:
+    v8 = (char*)v1 + 8;
+    v9 = *(int64_t*)v8;
+    p_call_stack_pop();
+    return v9;
+  bb3:
+    v11 = (char*)v1 + 0;
+    v12 = *(int64_t*)v11;
+    v13 = 1LL;
+    v14 = v12 == v13;
+    if (v14) goto bb4;
+    else goto bb5;
+  bb4:
+    p_call_stack_pop();
+    return v2;
+  bb5:
+    goto bb1;
+    return 0;
+}
+
+bool Vec_is_empty(void* v0, int64_t v1) {
+    p_call_stack_push("Vec_is_empty");
+    bool v14;
+    int64_t v10; /* placeholder for void */
+    int64_t v5; /* placeholder for void */
+    int64_t v13;
+    void* v6;
+    int64_t v9;
+    int64_t v12;
+    int64_t v3;
+    int64_t v7; /* placeholder for void */
+    void* v4;
+    int64_t v2;
+    void* v8;
+    int64_t v11; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    v2 = 8LL;
+    v3 = v1 + v2;
+    v4 = malloc(8);
+    *(void**)v4 = (void*)v3;
+    v6 = malloc(8);
+    v8 = *(void**)v4;
+    v9 = *(int64_t*)v8;
+    *(int64_t*)v6 = (int64_t)v9;
+    v12 = *(int64_t*)v6;
+    v13 = 0LL;
+    v14 = v12 == v13;
+    p_call_stack_pop();
+    return v14;
+    return 0;
+}
+
+void Result_err(void* v0, void* v1, void* v2) {
+    p_call_stack_push("Result_err");
+    void* v15;
+    int64_t v33; /* placeholder for void */
+    int64_t v25;
+    int64_t v39; /* placeholder for void */
+    void* v23;
+    int64_t v29;
+    int64_t v44; /* placeholder for void */
+    void* v18;
+    void* v28;
+    int64_t v13; /* placeholder for void */
+    void* v37;
+    int64_t v46; /* placeholder for void */
+    void* v12;
+    void* v14;
+    int64_t v4;
+    int64_t v17; /* placeholder for void */
+    int64_t v27; /* placeholder for void */
+    int64_t v45; /* placeholder for void */
+    void* v3;
+    int64_t v31;
+    void* v34;
+    int64_t v43; /* placeholder for void */
+    int64_t v9;
+    int64_t v5;
+    void* v19;
+    int64_t v20;
+    int64_t v11;
+    int64_t v24;
+    int64_t v21; /* placeholder for void */
+    void* v30;
+    int64_t v35; /* placeholder for void */
+    bool v26;
+    void* v36;
+    int64_t v38;
+    void* v8;
+    void* v10;
+    void* v32;
+    int64_t v16;
+    void* v41;
+    int64_t v42;
+    bool v6;
+    int64_t v7; /* placeholder for void */
+    int64_t v22; /* placeholder for void */
+    void* v40;
+    v3 = (char*)v2 + 0;
+    v4 = *(int64_t*)v3;
+    v5 = 0LL;
+    v6 = v4 == v5;
+    if (v6) goto bb2;
+    else goto bb3;
+  bb1:
+    p_call_stack_pop();
+    return;
+  bb2:
+    v8 = (char*)v2 + 8;
+    v9 = *(int64_t*)v8;
+    v10 = malloc(16);
+    v11 = 1LL;
+    v12 = (char*)v10 + 0;
+    *(int64_t*)v12 = (int64_t)v11;
+    v14 = (char*)v10 + 0;
+    v15 = (char*)v0 + 0;
+    v16 = *(int64_t*)v14;
+    *(int64_t*)v15 = (int64_t)v16;
+    v18 = (char*)v10 + 8;
+    v19 = (char*)v0 + 8;
+    v20 = *(int64_t*)v18;
+    *(int64_t*)v19 = (int64_t)v20;
+    p_call_stack_pop();
+    return;
+  bb3:
+    v23 = (char*)v2 + 0;
+    v24 = *(int64_t*)v23;
+    v25 = 1LL;
+    v26 = v24 == v25;
+    if (v26) goto bb4;
+    else goto bb5;
+  bb4:
+    v28 = (char*)v2 + 8;
+    v29 = *(int64_t*)v28;
+    v30 = malloc(16);
+    v31 = 0LL;
+    v32 = (char*)v30 + 0;
+    *(int64_t*)v32 = (int64_t)v31;
+    v34 = (char*)v30 + 8;
+    *(int64_t*)v34 = (int64_t)v29;
+    v36 = (char*)v30 + 0;
+    v37 = (char*)v0 + 0;
+    v38 = *(int64_t*)v36;
+    *(int64_t*)v37 = (int64_t)v38;
+    v40 = (char*)v30 + 8;
+    v41 = (char*)v0 + 8;
+    v42 = *(int64_t*)v40;
+    *(int64_t*)v41 = (int64_t)v42;
+    p_call_stack_pop();
+    return;
+  bb5:
+    goto bb1;
+    return;
+}
+
+int64_t String_parse_int(void* v0, int64_t v1) {
+    p_call_stack_push("String_parse_int");
+    int64_t v60;
+    int64_t v57; /* placeholder for void */
+    int64_t v80; /* placeholder for void */
+    int64_t v115; /* placeholder for void */
+    int64_t v6; /* placeholder for void */
+    int64_t v100; /* placeholder for void */
+    void* v14;
+    int64_t v105;
+    int64_t v69;
+    int64_t v113;
+    int64_t v16;
+    int64_t v50; /* placeholder for void */
+    int64_t v85;
+    int64_t v74;
+    int64_t v63; /* placeholder for void */
+    void* v47;
+    int64_t v58;
+    int64_t v4; /* placeholder for void */
+    int64_t v99;
+    int64_t v13; /* placeholder for void */
+    int64_t v33;
+    bool v70;
+    int64_t v103;
+    bool v35;
+    uint8_t v48;
+    int64_t v19; /* placeholder for void */
+    int64_t v97;
+    int64_t v62;
+    void* v64;
+    uint8_t v65;
+    int64_t v44; /* placeholder for void */
+    bool v3;
+    int64_t v32;
+    int64_t v75; /* placeholder for void */
+    int64_t v84; /* placeholder for void */
+    void* v107;
+    int64_t v23; /* placeholder for void */
+    void* v20;
+    void* v78;
+    int64_t v89;
+    int64_t v18; /* placeholder for void */
+    int64_t v45;
+    bool v90;
+    bool v91;
+    uint8_t v108;
+    int64_t v7; /* placeholder for void */
+    int64_t v46; /* placeholder for void */
+    void* v12;
+    int64_t v43;
+    int64_t v92; /* placeholder for void */
+    int64_t v10; /* placeholder for void */
+    bool v30;
+    int64_t v11;
+    int64_t v83; /* placeholder for void */
+    int64_t v42;
+    int64_t v98;
+    int64_t v73;
+    int64_t v24; /* placeholder for void */
+    bool v39;
+    int64_t v77; /* placeholder for void */
+    int64_t v81; /* placeholder for void */
+    int64_t v101;
+    int64_t v68;
+    int64_t v55;
+    int64_t v5;
+    int64_t v15; /* placeholder for void */
+    int64_t v29;
+    int64_t v88;
+    int64_t v110; /* placeholder for void */
+    int64_t v49; /* placeholder for void */
+    int64_t v56;
+    int64_t v59;
+    int64_t v111; /* placeholder for void */
+    int64_t v95;
+    bool v38;
+    int64_t v2;
+    int64_t v28;
+    int64_t v72;
+    int64_t v102;
+    int64_t v71; /* placeholder for void */
+    int64_t v82; /* placeholder for void */
+    int64_t v94;
+    int64_t v41;
+    int64_t v52;
+    uint8_t v79;
+    bool v27;
+    int64_t v54; /* placeholder for void */
+    int64_t v93;
+    bool v53;
+    int64_t v96;
+    int64_t v114;
+    int64_t v25;
+    int64_t v51;
+    int64_t v40; /* placeholder for void */
+    int64_t v61; /* placeholder for void */
+    int64_t v106; /* placeholder for void */
+    int64_t v36;
+    bool v31;
+    int64_t v26;
+    int64_t v76;
+    int64_t v8;
+    int64_t v104; /* placeholder for void */
+    int64_t v66; /* placeholder for void */
+    void* v22;
+    bool v87;
+    void* v9;
+    int64_t v86;
+    int64_t v109; /* placeholder for void */
+    int64_t v67; /* placeholder for void */
+    uint8_t v21;
+    int64_t v37;
+    bool v34;
+    void* v17;
+    int64_t v112;
+    v2 = 0LL;
+    v3 = v1 == v2;
+    if (v3) goto bb1;
+    else goto bb2;
+  bb1:
+    v5 = 0LL;
+    p_call_stack_pop();
+    return v5;
+  bb2:
+    goto bb3;
+  bb3:
+    v8 = 0LL;
+    v9 = malloc(8);
+    *(int64_t*)v9 = (int64_t)v8;
+    v11 = 1LL;
+    v12 = malloc(8);
+    *(int64_t*)v12 = (int64_t)v11;
+    v14 = malloc(8);
+    *(int64_t*)v14 = (int64_t)v1;
+    v16 = *(int64_t*)v14;
+    v17 = malloc(8);
+    *(void**)v17 = (void*)v16;
+    v20 = *(void**)v17;
+    v21 = *(uint8_t*)v20;
+    v22 = malloc(8);
+    *(int64_t*)v22 = (int64_t)v21;
+    goto bb4;
+  bb4:
+    v25 = *(int64_t*)v22;
+    v26 = 32LL;
+    v27 = v25 == v26;
+    v28 = *(int64_t*)v22;
+    v29 = 9LL;
+    v30 = v28 == v29;
+    v31 = v27 || v30;
+    v32 = *(int64_t*)v22;
+    v33 = 10LL;
+    v34 = v32 == v33;
+    v35 = v31 || v34;
+    v36 = *(int64_t*)v22;
+    v37 = 13LL;
+    v38 = v36 == v37;
+    v39 = v35 || v38;
+    if (v39) goto bb5;
+    else goto bb6;
+  bb5:
+    v41 = *(int64_t*)v14;
+    v42 = 1LL;
+    v43 = v41 + v42;
+    *(int64_t*)v14 = (int64_t)v43;
+    v45 = *(int64_t*)v14;
+    *(void**)v17 = (void*)v45;
+    v47 = *(void**)v17;
+    v48 = *(uint8_t*)v47;
+    *(int64_t*)v22 = (int64_t)v48;
+    goto bb4;
+  bb6:
+    v51 = *(int64_t*)v22;
+    v52 = 45LL;
+    v53 = v51 == v52;
+    if (v53) goto bb7;
     else goto bb8;
   bb7:
-    v32 = 0LL;
-    p_call_stack_pop();
-    return v32;
-  bb8:
+    v55 = 1LL;
+    v56 = -v55;
+    *(int64_t*)v12 = (int64_t)v56;
+    v58 = *(int64_t*)v14;
+    v59 = 1LL;
+    v60 = v58 + v59;
+    *(int64_t*)v14 = (int64_t)v60;
+    v62 = *(int64_t*)v14;
+    *(void**)v17 = (void*)v62;
+    v64 = *(void**)v17;
+    v65 = *(uint8_t*)v64;
+    *(int64_t*)v22 = (int64_t)v65;
     goto bb9;
+  bb8:
+    v68 = *(int64_t*)v22;
+    v69 = 43LL;
+    v70 = v68 == v69;
+    if (v70) goto bb10;
+    else goto bb11;
   bb9:
-    v35 = 0LL;
-    v36 = malloc(8);
-    *(int64_t*)v36 = (int64_t)v35;
-    v38 = *(int64_t*)v8;
-    v39 = malloc(8);
-    *(int64_t*)v39 = (int64_t)v38;
-    goto bb10;
+    goto bb13;
   bb10:
-    v42 = *(int64_t*)v39;
-    v43 = *(int64_t*)v10;
-    v44 = v42 < v43;
-    if (v44) goto bb11;
-    else goto bb12;
+    v72 = *(int64_t*)v14;
+    v73 = 1LL;
+    v74 = v72 + v73;
+    *(int64_t*)v14 = (int64_t)v74;
+    v76 = *(int64_t*)v14;
+    *(void**)v17 = (void*)v76;
+    v78 = *(void**)v17;
+    v79 = *(uint8_t*)v78;
+    *(int64_t*)v22 = (int64_t)v79;
+    goto bb12;
   bb11:
-    v46 = *(int64_t*)v39;
-    v47 = (int64_t)v1 + v46;
-    v48 = malloc(8);
-    *(int64_t*)v48 = (int64_t)v47;
-    v50 = *(int64_t*)v48;
-    v51 = malloc(8);
-    *(void**)v51 = (void*)v50;
-    v53 = 0LL;
+    goto bb12;
+  bb12:
+    goto bb9;
+  bb13:
+    v85 = *(int64_t*)v22;
+    v86 = 48LL;
+    v87 = v85 >= v86;
+    v88 = *(int64_t*)v22;
+    v89 = 57LL;
+    v90 = v88 <= v89;
+    v91 = v87 && v90;
+    if (v91) goto bb14;
+    else goto bb15;
+  bb14:
+    v93 = *(int64_t*)v9;
+    v94 = 10LL;
+    v95 = v93 * v94;
+    v96 = *(int64_t*)v22;
+    v97 = 48LL;
+    v98 = v96 - v97;
+    v99 = v95 + v98;
+    *(int64_t*)v9 = (int64_t)v99;
+    v101 = *(int64_t*)v14;
+    v102 = 1LL;
+    v103 = v101 + v102;
+    *(int64_t*)v14 = (int64_t)v103;
+    v105 = *(int64_t*)v14;
+    *(void**)v17 = (void*)v105;
+    v107 = *(void**)v17;
+    v108 = *(uint8_t*)v107;
+    *(int64_t*)v22 = (int64_t)v108;
+    goto bb13;
+  bb15:
+    v112 = *(int64_t*)v9;
+    v113 = *(int64_t*)v12;
+    v114 = v112 * v113;
+    p_call_stack_pop();
+    return v114;
+    return 0;
+}
+
+void* str_to_upper(void* v0, void* v1) {
+    p_call_stack_push("str_to_upper");
+    int64_t v2;
+    int64_t v3;
+    int64_t v4; /* placeholder for void */
+    v2 = 0LL;
+    v3 = (int64_t)String_to_uppercase((void*)v2, (int64_t)v1);
+    p_call_stack_pop();
+    return (void*)v3;
+    return 0;
+}
+
+void allocator_free(void* v0, void* v1, int64_t v2) {
+    p_call_stack_push("allocator_free");
+    int64_t v3; /* placeholder for void */
+    int64_t v4; /* placeholder for void */
+    p_allocator_free(v1, v2);
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+void* Vec_to_str(void* v0, int64_t v1) {
+    p_call_stack_push("Vec_to_str");
+    int64_t v22; /* placeholder for void */
+    int64_t v17;
+    void* v6;
+    bool v29;
+    int64_t v27;
+    void* v46;
+    int64_t v18; /* placeholder for void */
+    int64_t v7; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    int64_t v41;
+    int64_t v28;
+    int64_t v30; /* placeholder for void */
+    int64_t v31;
+    int64_t v45;
+    int64_t v56;
+    int64_t v68; /* placeholder for void */
+    void* v70;
+    int64_t v60;
+    void* v59;
+    void* v69;
+    int64_t v3;
+    int64_t v48;
+    int64_t v54; /* placeholder for void */
+    int64_t v74; /* placeholder for void */
+    void* v10;
+    int64_t v12; /* placeholder for void */
+    void* v16;
+    int64_t v25; /* placeholder for void */
+    void* v55;
+    int64_t v50; /* placeholder for void */
+    int64_t v64;
+    int64_t v5; /* placeholder for void */
+    void* v24;
+    int64_t v23;
+    void* v37;
+    int64_t v38; /* placeholder for void */
+    int64_t v42;
+    int64_t v63; /* placeholder for void */
+    int64_t v72; /* placeholder for void */
+    int64_t v40; /* placeholder for void */
+    void* v8;
+    void* v4;
+    void* v21;
+    int64_t v51;
+    int64_t v65;
+    int64_t v9; /* placeholder for void */
+    int64_t v57; /* placeholder for void */
+    int64_t v58; /* placeholder for void */
+    int64_t v67; /* placeholder for void */
+    int64_t v47; /* placeholder for void */
+    void* v52;
+    int64_t v11;
+    void* v61;
+    int64_t v39; /* placeholder for void */
+    void* v73;
+    void* v35;
+    int64_t v13; /* placeholder for void */
+    int64_t v44;
+    int64_t v66;
+    int64_t v32;
+    void* v36;
+    int64_t v53; /* placeholder for void */
+    void* v20;
+    int64_t v26; /* placeholder for void */
+    void* v14;
+    int64_t v34; /* placeholder for void */
+    int64_t v2;
+    bool v33;
+    void* v49;
+    int64_t v19; /* placeholder for void */
+    void* v71;
+    void* v62;
+    int64_t v43;
+    v2 = 8LL;
+    v3 = v1 + v2;
+    v4 = malloc(8);
+    *(void**)v4 = (void*)v3;
+    v6 = malloc(8);
+    *(void**)v6 = (void*)v1;
+    v8 = malloc(8);
+    v10 = *(void**)v4;
+    v11 = *(int64_t*)v10;
+    *(int64_t*)v8 = (int64_t)v11;
+    v14 = malloc(8);
+    v16 = *(void**)v6;
+    v17 = *(int64_t*)v16;
+    *(int64_t*)v14 = (int64_t)v17;
+    v20 = _str5;
+    v21 = malloc(8);
+    *(void**)v21 = (void*)v20;
+    v23 = 0LL;
+    v24 = malloc(8);
+    *(int64_t*)v24 = (int64_t)v23;
+    goto bb1;
+  bb1:
+    v27 = *(int64_t*)v24;
+    v28 = *(int64_t*)v8;
+    v29 = v27 < v28;
+    if (v29) goto bb2;
+    else goto bb3;
+  bb2:
+    v31 = *(int64_t*)v24;
+    v32 = 0LL;
+    v33 = v31 > v32;
+    if (v33) goto bb4;
+    else goto bb5;
+  bb3:
+    v69 = *(void**)v21;
+    v70 = _str6;
+    v71 = p_str_concat(v69, v70);
+    *(void**)v21 = (void*)v71;
+    v73 = *(void**)v21;
+    p_call_stack_pop();
+    return v73;
+  bb4:
+    v35 = *(void**)v21;
+    v36 = _str7;
+    v37 = p_str_concat(v35, v36);
+    *(void**)v21 = (void*)v37;
+    goto bb6;
+  bb5:
+    goto bb6;
+  bb6:
+    v41 = *(int64_t*)v14;
+    v42 = *(int64_t*)v24;
+    v43 = 8LL;
+    v44 = v42 * v43;
+    v45 = v41 + v44;
+    v46 = malloc(8);
+    *(int64_t*)v46 = (int64_t)v45;
+    v48 = *(int64_t*)v46;
+    v49 = malloc(8);
+    *(void**)v49 = (void*)v48;
+    v51 = 0LL;
+    v52 = malloc(8);
+    *(int64_t*)v52 = (int64_t)v51;
+    v55 = *(void**)v49;
+    v56 = *(int64_t*)v55;
+    *(int64_t*)v52 = (int64_t)v56;
+    v59 = *(void**)v21;
+    v60 = *(int64_t*)v52;
+    v61 = (void*)p_to_str((int64_t)v60);
+    v62 = p_str_concat(v59, v61);
+    *(void**)v21 = (void*)v62;
+    v64 = *(int64_t*)v24;
+    v65 = 1LL;
+    v66 = v64 + v65;
+    *(int64_t*)v24 = (int64_t)v66;
+    goto bb1;
+    return 0;
+}
+
+void p_str_copy_n(void* v0, int64_t v1, int64_t v2, int64_t v3) {
+    p_call_stack_push("p_str_copy_n");
+    void* v9;
+    int64_t v11; /* placeholder for void */
+    void* v24;
+    int64_t v10; /* placeholder for void */
+    int64_t v28; /* placeholder for void */
+    void* v19;
+    int64_t v29; /* placeholder for void */
+    int64_t v32;
+    int64_t v27;
+    int64_t v39;
+    int64_t v40;
+    int64_t v41; /* placeholder for void */
+    int64_t v42; /* placeholder for void */
+    int64_t v15;
+    int64_t v12;
+    int64_t v7; /* placeholder for void */
+    int64_t v18;
+    int64_t v20; /* placeholder for void */
+    int64_t v30;
+    bool v13;
+    int64_t v35;
+    int64_t v37; /* placeholder for void */
+    int64_t v36;
+    int64_t v17; /* placeholder for void */
+    int64_t v14; /* placeholder for void */
+    int64_t v33; /* placeholder for void */
+    int64_t v5; /* placeholder for void */
+    void* v16;
+    uint8_t v23;
+    void* v26;
+    int64_t v34;
+    int64_t v8;
+    void* v6;
+    void* v22;
+    int64_t v43; /* placeholder for void */
+    int64_t v21; /* placeholder for void */
+    int64_t v31;
+    void* v4;
+    int64_t v25; /* placeholder for void */
+    int64_t v38;
+    v4 = malloc(8);
+    *(int64_t*)v4 = (int64_t)v1;
+    v6 = malloc(8);
+    *(int64_t*)v6 = (int64_t)v2;
+    v8 = 0LL;
+    v9 = malloc(8);
+    *(int64_t*)v9 = (int64_t)v8;
+    goto bb1;
+  bb1:
+    v12 = *(int64_t*)v9;
+    v13 = v12 < v3;
+    if (v13) goto bb2;
+    else goto bb3;
+  bb2:
+    v15 = *(int64_t*)v4;
+    v16 = malloc(8);
+    *(void**)v16 = (void*)v15;
+    v18 = *(int64_t*)v6;
+    v19 = malloc(8);
+    *(void**)v19 = (void*)v18;
+    v22 = *(void**)v19;
+    v23 = *(uint8_t*)v22;
+    v24 = malloc(8);
+    *(int64_t*)v24 = (int64_t)v23;
+    v26 = *(void**)v16;
+    v27 = *(int64_t*)v24;
+    *(uint8_t*)v26 = (uint8_t)v27;
+    v30 = *(int64_t*)v4;
+    v31 = 1LL;
+    v32 = v30 + v31;
+    *(int64_t*)v4 = (int64_t)v32;
+    v34 = *(int64_t*)v6;
+    v35 = 1LL;
+    v36 = v34 + v35;
+    *(int64_t*)v6 = (int64_t)v36;
+    v38 = *(int64_t*)v9;
+    v39 = 1LL;
+    v40 = v38 + v39;
+    *(int64_t*)v9 = (int64_t)v40;
+    goto bb1;
+  bb3:
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+bool char_is_alpha(void* v0, int64_t v1) {
+    p_call_stack_push("char_is_alpha");
+    int64_t v4;
+    bool v11;
+    bool v5;
+    bool v12;
+    int64_t v7;
+    int64_t v13; /* placeholder for void */
+    int64_t v9;
+    bool v10;
+    bool v3;
+    bool v8;
+    bool v6;
+    int64_t v2;
+    v2 = 65LL;
+    v3 = v1 >= v2;
+    v4 = 90LL;
+    v5 = v1 <= v4;
+    v6 = v3 && v5;
+    v7 = 97LL;
+    v8 = v1 >= v7;
+    v9 = 122LL;
+    v10 = v1 <= v9;
+    v11 = v8 && v10;
+    v12 = v6 || v11;
+    p_call_stack_pop();
+    return v12;
+    return 0;
+}
+
+void* str_split(void* v0, void* v1, void* v2) {
+    p_call_stack_push("str_split");
+    void* v4;
+    int64_t v3;
+    bool v37;
+    int64_t v28; /* placeholder for void */
+    void* v115;
+    void* v27;
+    int64_t v45; /* placeholder for void */
+    int64_t v68; /* placeholder for void */
+    int64_t v78; /* placeholder for void */
+    void* v23;
+    int64_t v114; /* placeholder for void */
+    void* v12;
+    int64_t v8;
+    uint8_t v77;
+    int64_t v118;
+    int64_t v120;
+    int64_t v119;
+    int64_t v29;
+    int64_t v110;
+    int64_t v99;
+    int64_t v32; /* placeholder for void */
+    void* v73;
+    int64_t v11; /* placeholder for void */
+    int64_t v38; /* placeholder for void */
+    void* v122;
+    int64_t v107; /* placeholder for void */
+    int64_t v79; /* placeholder for void */
+    int64_t v21;
+    int64_t v16; /* placeholder for void */
+    int64_t v22;
+    void* v64;
+    bool v82;
+    void* v95;
+    int64_t v101; /* placeholder for void */
+    int64_t v47;
+    int64_t v41; /* placeholder for void */
+    void* v58;
+    int64_t v60;
+    int64_t v96;
+    int64_t v31; /* placeholder for void */
+    int64_t v106;
+    int64_t v81;
+    bool v48;
+    int64_t v104;
+    int64_t v35;
+    int64_t v53;
+    int64_t v56;
+    int64_t v105; /* placeholder for void */
+    void* v43;
+    int64_t v80;
+    int64_t v20; /* placeholder for void */
+    int64_t v85; /* placeholder for void */
+    int64_t v98;
+    int64_t v103;
+    int64_t v50;
+    int64_t v57;
+    int64_t v7;
+    int64_t v14; /* placeholder for void */
+    int64_t v75; /* placeholder for void */
+    void* v15;
+    int64_t v71; /* placeholder for void */
+    int64_t v42;
+    int64_t v69;
+    void* v30;
+    int64_t v59; /* placeholder for void */
+    int64_t v94; /* placeholder for void */
+    void* v61;
+    bool v84;
+    int64_t v100;
+    void* v67;
+    void* v76;
+    int64_t v65; /* placeholder for void */
+    int64_t v13;
+    void* v19;
+    int64_t v44; /* placeholder for void */
+    int64_t v17; /* placeholder for void */
+    int64_t v24; /* placeholder for void */
+    int64_t v83; /* placeholder for void */
+    int64_t v89;
+    int64_t v46;
+    int64_t v25;
+    int64_t v55; /* placeholder for void */
+    int64_t v88;
+    int64_t v18;
+    int64_t v63;
+    int64_t v102;
+    int64_t v109;
+    int64_t v113; /* placeholder for void */
+    int64_t v112; /* placeholder for void */
+    int64_t v9;
+    int64_t v49; /* placeholder for void */
+    int64_t v51;
+    int64_t v123; /* placeholder for void */
+    void* v40;
+    int64_t v92; /* placeholder for void */
+    int64_t v26;
+    void* v54;
+    int64_t v34;
+    int64_t v52;
+    int64_t v91; /* placeholder for void */
+    int64_t v117;
+    int64_t v72; /* placeholder for void */
+    void* v70;
+    int64_t v86; /* placeholder for void */
+    int64_t v111;
+    int64_t v90;
+    int64_t v97;
+    bool v39;
+    uint8_t v74;
+    int64_t v87; /* placeholder for void */
+    int64_t v33;
+    int64_t v36;
+    bool v10;
+    int64_t v108; /* placeholder for void */
+    int64_t v62; /* placeholder for void */
+    int64_t v66;
+    int64_t v6; /* placeholder for void */
+    bool v93;
+    int64_t v121; /* placeholder for void */
+    int64_t v116;
+    void* v5;
+    v3 = 0LL;
+    v4 = (void*)Vec_new((void*)v3);
+    v5 = malloc(8);
+    *(void**)v5 = (void*)v4;
+    v7 = 0LL;
+    v8 = (int64_t)String_len((void*)v7, (int64_t)v2);
+    v9 = 0LL;
+    v10 = v8 == v9;
+    if (v10) goto bb1;
+    else goto bb2;
+  bb1:
+    v12 = *(void**)v5;
+    v13 = 0LL;
+    Vec_push((void*)v13, (int64_t)v12, (int64_t)v1);
+    v15 = *(void**)v5;
+    p_call_stack_pop();
+    return v15;
+  bb2:
+    goto bb3;
+  bb3:
+    v18 = 0LL;
+    v19 = malloc(8);
+    *(int64_t*)v19 = (int64_t)v18;
+    v21 = 0LL;
+    v22 = (int64_t)String_len((void*)v21, (int64_t)v1);
+    v23 = malloc(8);
+    *(int64_t*)v23 = (int64_t)v22;
+    v25 = 0LL;
+    v26 = (int64_t)String_len((void*)v25, (int64_t)v2);
+    v27 = malloc(8);
+    *(int64_t*)v27 = (int64_t)v26;
+    v29 = 0LL;
+    v30 = malloc(8);
+    *(int64_t*)v30 = (int64_t)v29;
+    goto bb4;
+  bb4:
+    v33 = *(int64_t*)v30;
+    v34 = *(int64_t*)v23;
+    v35 = *(int64_t*)v27;
+    v36 = v34 - v35;
+    v37 = v33 <= v36;
+    if (v37) goto bb5;
+    else goto bb6;
+  bb5:
+    v39 = true;
+    v40 = malloc(1);
+    *(bool*)v40 = v39;
+    v42 = 0LL;
+    v43 = malloc(8);
+    *(int64_t*)v43 = (int64_t)v42;
+    goto bb7;
+  bb6:
+    v115 = *(void**)v5;
+    v116 = *(int64_t*)v19;
+    v117 = *(int64_t*)v23;
+    v118 = 0LL;
+    v119 = (int64_t)String_slice((void*)v118, (int64_t)v1, v116, v117);
+    v120 = 0LL;
+    Vec_push((void*)v120, (int64_t)v115, v119);
+    v122 = *(void**)v5;
+    p_call_stack_pop();
+    return v122;
+  bb7:
+    v46 = *(int64_t*)v43;
+    v47 = *(int64_t*)v27;
+    v48 = v46 < v47;
+    if (v48) goto bb8;
+    else goto bb9;
+  bb8:
+    v50 = *(int64_t*)v30;
+    v51 = (int64_t)v1 + v50;
+    v52 = *(int64_t*)v43;
+    v53 = v51 + v52;
     v54 = malloc(8);
     *(int64_t*)v54 = (int64_t)v53;
-    v57 = *(void**)v51;
-    v58 = *(uint8_t*)v57;
-    *(int64_t*)v54 = (int64_t)v58;
-    v61 = *(int64_t*)v54;
-    v62 = 48LL;
-    v63 = v61 < v62;
-    v64 = *(int64_t*)v54;
-    v65 = 57LL;
-    v66 = v64 > v65;
-    v67 = v63 || v66;
-    if (v67) goto bb13;
+    v56 = *(int64_t*)v43;
+    v57 = (int64_t)v2 + v56;
+    v58 = malloc(8);
+    *(int64_t*)v58 = (int64_t)v57;
+    v60 = *(int64_t*)v54;
+    v61 = malloc(8);
+    *(void**)v61 = (void*)v60;
+    v63 = *(int64_t*)v58;
+    v64 = malloc(8);
+    *(void**)v64 = (void*)v63;
+    v66 = 0LL;
+    v67 = malloc(8);
+    *(int64_t*)v67 = (int64_t)v66;
+    v69 = 0LL;
+    v70 = malloc(8);
+    *(int64_t*)v70 = (int64_t)v69;
+    v73 = *(void**)v61;
+    v74 = *(uint8_t*)v73;
+    *(int64_t*)v67 = (int64_t)v74;
+    v76 = *(void**)v64;
+    v77 = *(uint8_t*)v76;
+    *(int64_t*)v70 = (int64_t)v77;
+    v80 = *(int64_t*)v67;
+    v81 = *(int64_t*)v70;
+    v82 = v80 != v81;
+    if (v82) goto bb10;
+    else goto bb11;
+  bb9:
+    v93 = *(bool*)v40;
+    if (v93) goto bb13;
     else goto bb14;
-  bb12:
-    v84 = *(int64_t*)v36;
-    p_call_stack_pop();
-    return v84;
-  bb13:
+  bb10:
+    v84 = false;
+    *(bool*)v40 = v84;
+    goto bb9;
+  bb11:
     goto bb12;
+  bb12:
+    v88 = *(int64_t*)v43;
+    v89 = 1LL;
+    v90 = v88 + v89;
+    *(int64_t*)v43 = (int64_t)v90;
+    goto bb7;
+  bb13:
+    v95 = *(void**)v5;
+    v96 = *(int64_t*)v19;
+    v97 = *(int64_t*)v30;
+    v98 = 0LL;
+    v99 = (int64_t)String_slice((void*)v98, (int64_t)v1, v96, v97);
+    v100 = 0LL;
+    Vec_push((void*)v100, (int64_t)v95, v99);
+    v102 = *(int64_t*)v30;
+    v103 = *(int64_t*)v27;
+    v104 = v102 + v103;
+    *(int64_t*)v19 = (int64_t)v104;
+    v106 = *(int64_t*)v19;
+    *(int64_t*)v30 = (int64_t)v106;
+    goto bb15;
   bb14:
+    v109 = *(int64_t*)v30;
+    v110 = 1LL;
+    v111 = v109 + v110;
+    *(int64_t*)v30 = (int64_t)v111;
     goto bb15;
   bb15:
-    v71 = *(int64_t*)v36;
-    v72 = 10LL;
-    v73 = v71 * v72;
-    v74 = *(int64_t*)v54;
-    v75 = 48LL;
-    v76 = v74 - v75;
-    v77 = v73 + v76;
-    *(int64_t*)v36 = (int64_t)v77;
-    v79 = *(int64_t*)v39;
-    v80 = 1LL;
-    v81 = v79 + v80;
-    *(int64_t*)v39 = (int64_t)v81;
-    goto bb10;
+    goto bb4;
+    return 0;
+}
+
+bool str_ends_with(void* v0, void* v1, void* v2) {
+    p_call_stack_push("str_ends_with");
+    int64_t v5; /* placeholder for void */
+    bool v4;
+    int64_t v3;
+    v3 = 0LL;
+    v4 = (bool)String_ends_with((void*)v3, (int64_t)v1, (int64_t)v2);
+    p_call_stack_pop();
+    return v4;
     return 0;
 }
 
 void Vec_push(void* v0, int64_t v1, int64_t v2) {
     p_call_stack_push("Vec_push");
-    int64_t v65;
-    void* v48;
-    bool v29;
-    int64_t v52; /* placeholder for void */
-    int64_t v77; /* placeholder for void */
-    int64_t v127; /* placeholder for void */
-    int64_t v24;
-    bool v94;
-    void* v23;
-    int64_t v106; /* placeholder for void */
-    int64_t v16; /* placeholder for void */
-    int64_t v97; /* placeholder for void */
-    int64_t v25; /* placeholder for void */
-    int64_t v119;
-    void* v32;
-    int64_t v75;
-    int64_t v84;
-    int64_t v105;
-    int64_t v130;
-    int64_t v131;
-    int64_t v102;
-    int64_t v4;
-    int64_t v35;
-    void* v135;
-    int64_t v108; /* placeholder for void */
-    int64_t v124; /* placeholder for void */
-    int64_t v116;
-    int64_t v22; /* placeholder for void */
-    int64_t v59;
-    int64_t v90; /* placeholder for void */
-    int64_t v87;
-    void* v14;
-    int64_t v139; /* placeholder for void */
-    int64_t v42; /* placeholder for void */
-    void* v73;
-    void* v79;
-    int64_t v82; /* placeholder for void */
-    int64_t v129;
-    int64_t v31;
-    int64_t v26; /* placeholder for void */
-    int64_t v18;
-    bool v36;
-    int64_t v40;
-    int64_t v58;
-    void* v13;
-    int64_t v122;
-    int64_t v112;
-    int64_t v55;
-    int64_t v8;
-    int64_t v89;
-    int64_t v100; /* placeholder for void */
-    void* v81;
-    int64_t v50;
-    void* v123;
-    int64_t v125; /* placeholder for void */
-    bool v56;
-    void* v9;
-    int64_t v27;
-    void* v101;
-    int64_t v33; /* placeholder for void */
-    int64_t v54;
-    int64_t v7;
-    int64_t v53; /* placeholder for void */
     int64_t v86; /* placeholder for void */
-    int64_t v103; /* placeholder for void */
-    int64_t v93;
+    bool v94;
+    int64_t v127; /* placeholder for void */
     int64_t v6; /* placeholder for void */
-    int64_t v128; /* placeholder for void */
-    void* v63;
-    int64_t v98; /* placeholder for void */
-    int64_t v28;
-    void* v111;
-    int64_t v3;
-    int64_t v64; /* placeholder for void */
-    int64_t v19; /* placeholder for void */
-    int64_t v115;
-    int64_t v114; /* placeholder for void */
-    int64_t v138; /* placeholder for void */
-    int64_t v37; /* placeholder for void */
-    int64_t v91; /* placeholder for void */
     int64_t v49; /* placeholder for void */
-    int64_t v99; /* placeholder for void */
-    void* v15;
-    void* v66;
-    int64_t v117;
-    int64_t v71;
-    int64_t v95; /* placeholder for void */
-    int64_t v134; /* placeholder for void */
-    int64_t v107; /* placeholder for void */
-    int64_t v133; /* placeholder for void */
-    void* v5;
-    int64_t v80;
-    void* v126;
-    void* v20;
-    int64_t v137; /* placeholder for void */
-    int64_t v121; /* placeholder for void */
-    int64_t v118;
-    int64_t v72;
-    void* v104;
-    int64_t v41; /* placeholder for void */
-    void* v120;
-    int64_t v85; /* placeholder for void */
-    void* v11;
-    int64_t v34;
-    int64_t v136;
-    int64_t v78; /* placeholder for void */
-    int64_t v88;
-    int64_t v110; /* placeholder for void */
-    int64_t v74; /* placeholder for void */
-    int64_t v60;
-    int64_t v70;
-    int64_t v12; /* placeholder for void */
-    void* v17;
-    int64_t v30; /* placeholder for void */
-    int64_t v45;
-    int64_t v69;
-    int64_t v61;
-    int64_t v43; /* placeholder for void */
-    void* v83;
-    void* v76;
-    void* v47;
-    int64_t v62;
-    int64_t v96;
-    int64_t v44;
-    int64_t v113; /* placeholder for void */
-    void* v132;
-    int64_t v38;
-    int64_t v21;
-    int64_t v92;
-    int64_t v10; /* placeholder for void */
-    int64_t v46;
-    void* v51;
-    int64_t v68;
-    int64_t v109; /* placeholder for void */
-    int64_t v39;
-    int64_t v57; /* placeholder for void */
     int64_t v67; /* placeholder for void */
+    int64_t v128; /* placeholder for void */
+    int64_t v65;
+    int64_t v74; /* placeholder for void */
+    void* v101;
+    int64_t v82; /* placeholder for void */
+    int64_t v38;
+    int64_t v108; /* placeholder for void */
+    int64_t v117;
+    void* v123;
+    int64_t v112;
+    bool v56;
+    int64_t v87;
+    int64_t v78; /* placeholder for void */
+    int64_t v121; /* placeholder for void */
+    int64_t v136;
+    void* v76;
+    int64_t v60;
+    void* v51;
+    int64_t v115;
+    int64_t v24;
+    int64_t v18;
+    int64_t v129;
+    int64_t v134; /* placeholder for void */
+    void* v20;
+    int64_t v46;
+    int64_t v75;
+    int64_t v105;
+    int64_t v61;
+    int64_t v30; /* placeholder for void */
+    int64_t v107; /* placeholder for void */
+    int64_t v122;
+    int64_t v28;
+    int64_t v59;
+    int64_t v8;
+    void* v15;
+    int64_t v103; /* placeholder for void */
+    void* v66;
+    int64_t v62;
+    void* v81;
+    void* v48;
+    void* v63;
+    int64_t v33; /* placeholder for void */
+    int64_t v34;
+    void* v47;
+    void* v23;
+    int64_t v116;
+    int64_t v131;
+    int64_t v39;
+    bool v29;
+    int64_t v19; /* placeholder for void */
+    void* v126;
+    void* v17;
+    int64_t v68;
+    int64_t v57; /* placeholder for void */
+    int64_t v31;
+    int64_t v12; /* placeholder for void */
+    int64_t v139; /* placeholder for void */
+    int64_t v55;
+    int64_t v118;
+    int64_t v7;
+    int64_t v125; /* placeholder for void */
+    int64_t v100; /* placeholder for void */
+    int64_t v53; /* placeholder for void */
+    int64_t v52; /* placeholder for void */
+    int64_t v91; /* placeholder for void */
+    int64_t v84;
+    void* v83;
+    int64_t v69;
+    int64_t v16; /* placeholder for void */
+    void* v9;
+    void* v32;
+    int64_t v54;
+    int64_t v43; /* placeholder for void */
+    int64_t v71;
+    int64_t v80;
+    int64_t v89;
+    int64_t v97; /* placeholder for void */
+    int64_t v58;
+    int64_t v37; /* placeholder for void */
+    void* v73;
+    bool v36;
+    int64_t v90; /* placeholder for void */
+    void* v111;
+    void* v13;
+    int64_t v88;
+    int64_t v99; /* placeholder for void */
+    int64_t v85; /* placeholder for void */
+    void* v104;
+    int64_t v109; /* placeholder for void */
+    int64_t v25; /* placeholder for void */
+    int64_t v4;
+    int64_t v44;
+    int64_t v137; /* placeholder for void */
+    int64_t v113; /* placeholder for void */
+    int64_t v26; /* placeholder for void */
+    int64_t v35;
+    int64_t v45;
+    int64_t v27;
+    void* v79;
+    int64_t v114; /* placeholder for void */
+    void* v120;
+    int64_t v93;
+    int64_t v124; /* placeholder for void */
+    int64_t v130;
+    void* v132;
+    int64_t v138; /* placeholder for void */
+    int64_t v50;
+    void* v11;
+    int64_t v72;
+    int64_t v119;
+    int64_t v22; /* placeholder for void */
+    int64_t v110; /* placeholder for void */
+    int64_t v21;
+    int64_t v3;
+    int64_t v96;
+    int64_t v98; /* placeholder for void */
+    int64_t v42; /* placeholder for void */
+    int64_t v133; /* placeholder for void */
+    int64_t v10; /* placeholder for void */
+    int64_t v106; /* placeholder for void */
+    int64_t v77; /* placeholder for void */
+    int64_t v102;
+    void* v14;
+    int64_t v40;
+    int64_t v92;
+    int64_t v64; /* placeholder for void */
+    int64_t v41; /* placeholder for void */
+    int64_t v70;
+    void* v135;
+    int64_t v95; /* placeholder for void */
+    void* v5;
     v3 = 8LL;
     v4 = v1 + v3;
     v5 = malloc(8);
@@ -10035,103 +10581,1251 @@ void Vec_push(void* v0, int64_t v1, int64_t v2) {
     return;
 }
 
-void Vec_sort(void* v0, int64_t v1) {
-    p_call_stack_push("Vec_sort");
-    int64_t v17;
-    int64_t v34;
-    int64_t v80;
-    int64_t v54;
-    int64_t v29; /* placeholder for void */
-    int64_t v74; /* placeholder for void */
-    int64_t v24; /* placeholder for void */
-    void* v6;
-    int64_t v21;
-    bool v32;
-    int64_t v48;
-    int64_t v83;
-    bool v42;
-    int64_t v44;
-    void* v8;
-    int64_t v7; /* placeholder for void */
-    int64_t v23; /* placeholder for void */
-    int64_t v38;
-    int64_t v18; /* placeholder for void */
-    int64_t v45;
-    int64_t v55;
-    int64_t v63;
-    int64_t v66; /* placeholder for void */
-    int64_t v84; /* placeholder for void */
-    int64_t v96; /* placeholder for void */
-    bool v85;
-    int64_t v51;
-    int64_t v2;
-    void* v79;
-    void* v58;
-    int64_t v60;
-    int64_t v81; /* placeholder for void */
-    void* v82;
-    int64_t v50; /* placeholder for void */
-    int64_t v91;
-    int64_t v25; /* placeholder for void */
-    int64_t v56;
-    void* v64;
-    int64_t v86; /* placeholder for void */
-    int64_t v78; /* placeholder for void */
-    void* v61;
-    int64_t v9; /* placeholder for void */
-    int64_t v89; /* placeholder for void */
-    int64_t v28; /* placeholder for void */
-    int64_t v43; /* placeholder for void */
-    void* v71;
-    int64_t v93; /* placeholder for void */
-    void* v10;
-    int64_t v31; /* placeholder for void */
-    int64_t v92;
-    int64_t v52;
-    int64_t v88; /* placeholder for void */
-    void* v16;
-    int64_t v15; /* placeholder for void */
-    int64_t v33; /* placeholder for void */
-    int64_t v53;
-    int64_t v37; /* placeholder for void */
-    int64_t v12; /* placeholder for void */
-    int64_t v41;
-    bool v22;
-    void* v69;
-    int64_t v5; /* placeholder for void */
-    bool v30;
-    void* v73;
-    void* v14;
-    int64_t v94; /* placeholder for void */
+int64_t main_entry(void* v0) {
+    p_call_stack_push("main");
+    void* v1;
     int64_t v3;
+    int64_t v18; /* placeholder for void */
+    int64_t v10; /* placeholder for void */
+    int64_t v14;
+    int64_t v6;
+    int64_t v8;
+    void* v9;
+    void* v20;
+    int64_t v2; /* placeholder for void */
+    int64_t v7;
+    int64_t v21; /* placeholder for void */
+    bool v15;
+    int64_t v22; /* placeholder for void */
+    void* v4;
+    int64_t v5; /* placeholder for void */
+    int64_t v19; /* placeholder for void */
+    int64_t v11;
+    int64_t v23; /* placeholder for void */
+    void* v17;
+    int64_t v12; /* placeholder for void */
+    int64_t v13;
+    int64_t v16; /* placeholder for void */
+    v1 = _str8;
+    p_print_str(v1);
+    v3 = 42LL;
+    v4 = malloc(8);
+    *(int64_t*)v4 = (int64_t)v3;
+    v6 = *(int64_t*)v4;
+    v7 = 8LL;
+    v8 = v6 + v7;
+    v9 = malloc(8);
+    *(int64_t*)v9 = (int64_t)v8;
+    v11 = *(int64_t*)v9;
+    p_print_int((int64_t)v11);
+    v13 = *(int64_t*)v9;
+    v14 = 40LL;
+    v15 = v13 > v14;
+    if (v15) goto bb1;
+    else goto bb2;
+  bb1:
+    v17 = _str9;
+    p_print_str(v17);
+    goto bb3;
+  bb2:
+    v20 = _str10;
+    p_print_str(v20);
+    goto bb3;
+  bb3:
+    p_call_stack_pop();
+    return 0;
+    return 0;
+}
+
+bool String_contains(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("String_contains");
+    int64_t v13;
+    int64_t v65;
+    void* v66;
+    bool v42;
+    int64_t v60; /* placeholder for void */
+    int64_t v70; /* placeholder for void */
+    void* v14;
+    int64_t v40;
+    bool v24;
+    bool v31;
+    int64_t v94;
+    int64_t v103;
+    int64_t v55;
+    bool v89;
+    int64_t v30; /* placeholder for void */
+    bool v87;
+    void* v35;
+    int64_t v3;
+    int64_t v23; /* placeholder for void */
+    void* v18;
+    int64_t v33; /* placeholder for void */
+    int64_t v34;
+    int64_t v39;
+    int64_t v36; /* placeholder for void */
+    int64_t v16;
+    int64_t v54; /* placeholder for void */
+    int64_t v61;
+    int64_t v32; /* placeholder for void */
+    int64_t v62;
+    int64_t v5;
+    int64_t v43; /* placeholder for void */
+    uint8_t v82;
+    int64_t v28;
+    bool v100;
+    int64_t v101; /* placeholder for void */
+    uint8_t v79;
+    int64_t v38;
+    int64_t v11; /* placeholder for void */
+    int64_t v99; /* placeholder for void */
+    int64_t v102; /* placeholder for void */
+    int64_t v104;
+    int64_t v15; /* placeholder for void */
+    bool v29;
+    int64_t v96; /* placeholder for void */
+    int64_t v17;
+    int64_t v46; /* placeholder for void */
+    bool v6;
+    int64_t v12;
+    int64_t v26; /* placeholder for void */
+    int64_t v85;
+    int64_t v37; /* placeholder for void */
+    bool v9;
+    int64_t v71;
+    int64_t v10; /* placeholder for void */
+    void* v69;
+    int64_t v58;
+    void* v45;
+    void* v72;
+    int64_t v74;
+    int64_t v56;
+    void* v81;
+    int64_t v92; /* placeholder for void */
+    void* v78;
+    bool v98;
+    bool v108;
+    bool v7;
+    int64_t v64; /* placeholder for void */
+    int64_t v95;
+    void* v63;
+    int64_t v25; /* placeholder for void */
+    int64_t v41;
+    int64_t v52;
+    int64_t v67; /* placeholder for void */
+    int64_t v77; /* placeholder for void */
+    int64_t v93;
+    void* v75;
+    int64_t v84; /* placeholder for void */
+    int64_t v51;
+    int64_t v57;
+    int64_t v68;
+    int64_t v105;
+    void* v59;
+    bool v53;
+    void* v48;
+    int64_t v20;
+    int64_t v90; /* placeholder for void */
+    bool v22;
+    int64_t v27;
+    int64_t v47;
+    int64_t v21;
+    int64_t v49; /* placeholder for void */
+    int64_t v83; /* placeholder for void */
+    int64_t v91; /* placeholder for void */
+    int64_t v80; /* placeholder for void */
+    int64_t v76; /* placeholder for void */
+    int64_t v107; /* placeholder for void */
+    bool v4;
+    int64_t v8; /* placeholder for void */
+    int64_t v19; /* placeholder for void */
+    int64_t v73; /* placeholder for void */
+    bool v44;
+    int64_t v106; /* placeholder for void */
+    int64_t v109; /* placeholder for void */
+    int64_t v97; /* placeholder for void */
+    int64_t v50; /* placeholder for void */
+    int64_t v86;
+    int64_t v88; /* placeholder for void */
+    v3 = 0LL;
+    v4 = v1 == v3;
+    v5 = 0LL;
+    v6 = v2 == v5;
+    v7 = v4 || v6;
+    if (v7) goto bb1;
+    else goto bb2;
+  bb1:
+    v9 = false;
+    p_call_stack_pop();
+    return v9;
+  bb2:
+    goto bb3;
+  bb3:
+    v12 = 0LL;
+    v13 = (int64_t)p_str_length((void*)v12, v1);
+    v14 = malloc(8);
+    *(int64_t*)v14 = (int64_t)v13;
+    v16 = 0LL;
+    v17 = (int64_t)p_str_length((void*)v16, v2);
+    v18 = malloc(8);
+    *(int64_t*)v18 = (int64_t)v17;
+    v20 = *(int64_t*)v18;
+    v21 = 0LL;
+    v22 = v20 == v21;
+    if (v22) goto bb4;
+    else goto bb5;
+  bb4:
+    v24 = true;
+    p_call_stack_pop();
+    return v24;
+  bb5:
+    goto bb6;
+  bb6:
+    v27 = *(int64_t*)v18;
+    v28 = *(int64_t*)v14;
+    v29 = v27 > v28;
+    if (v29) goto bb7;
+    else goto bb8;
+  bb7:
+    v31 = false;
+    p_call_stack_pop();
+    return v31;
+  bb8:
+    goto bb9;
+  bb9:
+    v34 = 0LL;
+    v35 = malloc(8);
+    *(int64_t*)v35 = (int64_t)v34;
+    goto bb10;
+  bb10:
+    v38 = *(int64_t*)v35;
+    v39 = *(int64_t*)v14;
+    v40 = *(int64_t*)v18;
+    v41 = v39 - v40;
+    v42 = v38 <= v41;
+    if (v42) goto bb11;
+    else goto bb12;
+  bb11:
+    v44 = true;
+    v45 = malloc(1);
+    *(bool*)v45 = v44;
+    v47 = 0LL;
+    v48 = malloc(8);
+    *(int64_t*)v48 = (int64_t)v47;
+    goto bb13;
+  bb12:
+    v108 = false;
+    p_call_stack_pop();
+    return v108;
+  bb13:
+    v51 = *(int64_t*)v48;
+    v52 = *(int64_t*)v18;
+    v53 = v51 < v52;
+    if (v53) goto bb14;
+    else goto bb15;
+  bb14:
+    v55 = *(int64_t*)v35;
+    v56 = v1 + v55;
+    v57 = *(int64_t*)v48;
+    v58 = v56 + v57;
+    v59 = malloc(8);
+    *(int64_t*)v59 = (int64_t)v58;
+    v61 = *(int64_t*)v48;
+    v62 = v2 + v61;
+    v63 = malloc(8);
+    *(int64_t*)v63 = (int64_t)v62;
+    v65 = *(int64_t*)v59;
+    v66 = malloc(8);
+    *(void**)v66 = (void*)v65;
+    v68 = *(int64_t*)v63;
+    v69 = malloc(8);
+    *(void**)v69 = (void*)v68;
+    v71 = 0LL;
+    v72 = malloc(8);
+    *(int64_t*)v72 = (int64_t)v71;
+    v74 = 0LL;
+    v75 = malloc(8);
+    *(int64_t*)v75 = (int64_t)v74;
+    v78 = *(void**)v66;
+    v79 = *(uint8_t*)v78;
+    *(int64_t*)v72 = (int64_t)v79;
+    v81 = *(void**)v69;
+    v82 = *(uint8_t*)v81;
+    *(int64_t*)v75 = (int64_t)v82;
+    v85 = *(int64_t*)v72;
+    v86 = *(int64_t*)v75;
+    v87 = v85 != v86;
+    if (v87) goto bb16;
+    else goto bb17;
+  bb15:
+    v98 = *(bool*)v45;
+    if (v98) goto bb19;
+    else goto bb20;
+  bb16:
+    v89 = false;
+    *(bool*)v45 = v89;
+    goto bb15;
+  bb17:
+    goto bb18;
+  bb18:
+    v93 = *(int64_t*)v48;
+    v94 = 1LL;
+    v95 = v93 + v94;
+    *(int64_t*)v48 = (int64_t)v95;
+    goto bb13;
+  bb19:
+    v100 = true;
+    p_call_stack_pop();
+    return v100;
+  bb20:
+    goto bb21;
+  bb21:
+    v103 = *(int64_t*)v35;
+    v104 = 1LL;
+    v105 = v103 + v104;
+    *(int64_t*)v35 = (int64_t)v105;
+    goto bb10;
+    return 0;
+}
+
+int64_t String_trim(void* v0, int64_t v1) {
+    p_call_stack_push("String_trim");
+    void* v38;
+    int64_t v179; /* placeholder for void */
+    int64_t v191; /* placeholder for void */
+    void* v77;
+    void* v172;
+    int64_t v19; /* placeholder for void */
+    int64_t v177;
+    void* v6;
+    int64_t v62;
+    int64_t v80;
+    int64_t v127;
+    void* v33;
+    int64_t v130; /* placeholder for void */
+    int64_t v134;
+    int64_t v192; /* placeholder for void */
+    bool v43;
+    int64_t v27;
+    int64_t v83; /* placeholder for void */
+    int64_t v166; /* placeholder for void */
+    int64_t v170;
+    void* v28;
+    bool v3;
+    void* v36;
+    int64_t v109;
+    int64_t v53;
+    bool v47;
+    int64_t v70; /* placeholder for void */
+    void* v103;
+    int64_t v180;
+    int64_t v24;
+    int64_t v31; /* placeholder for void */
+    int64_t v57;
+    int64_t v66; /* placeholder for void */
+    int64_t v71; /* placeholder for void */
+    int64_t v76;
+    int64_t v153;
+    int64_t v94;
+    int64_t v8; /* placeholder for void */
+    int64_t v48;
+    void* v98;
+    int64_t v85;
+    int64_t v107;
+    void* v30;
+    int64_t v113;
+    int64_t v122;
+    int64_t v124;
+    int64_t v135;
+    int64_t v145;
+    int64_t v114;
+    uint8_t v37;
+    int64_t v11; /* placeholder for void */
+    int64_t v142; /* placeholder for void */
+    int64_t v165;
+    int64_t v52;
+    int64_t v29; /* placeholder for void */
+    int64_t v18; /* placeholder for void */
+    int64_t v72;
+    int64_t v88;
+    int64_t v92;
+    bool v115;
+    int64_t v45;
+    int64_t v61;
+    int64_t v137;
+    uint8_t v140;
+    int64_t v21;
+    int64_t v91;
+    int64_t v125; /* placeholder for void */
+    void* v158;
+    int64_t v64; /* placeholder for void */
+    int64_t v178;
+    int64_t v181;
+    int64_t v188; /* placeholder for void */
+    int64_t v182;
+    int64_t v162;
+    int64_t v15; /* placeholder for void */
+    void* v13;
+    int64_t v69; /* placeholder for void */
+    int64_t v89; /* placeholder for void */
+    void* v171;
+    int64_t v12; /* placeholder for void */
+    int64_t v59;
+    int64_t v82; /* placeholder for void */
+    int64_t v105; /* placeholder for void */
+    int64_t v150;
+    void* v78;
+    int64_t v16; /* placeholder for void */
+    int64_t v26; /* placeholder for void */
+    int64_t v34; /* placeholder for void */
+    uint8_t v102;
+    int64_t v141; /* placeholder for void */
+    int64_t v152; /* placeholder for void */
+    int64_t v63;
+    void* v155;
+    int64_t v121; /* placeholder for void */
+    int64_t v32;
+    int64_t v143; /* placeholder for void */
+    int64_t v42;
+    int64_t v157;
+    int64_t v173; /* placeholder for void */
+    int64_t v5;
+    int64_t v156; /* placeholder for void */
+    int64_t v58;
+    void* v10;
+    uint8_t v68;
+    int64_t v86; /* placeholder for void */
+    int64_t v90; /* placeholder for void */
+    int64_t v2;
+    int64_t v9;
+    bool v111;
+    int64_t v60; /* placeholder for void */
+    int64_t v117;
+    int64_t v148; /* placeholder for void */
+    int64_t v75; /* placeholder for void */
+    int64_t v175;
+    int64_t v169;
+    int64_t v129; /* placeholder for void */
+    int64_t v163; /* placeholder for void */
+    int64_t v99; /* placeholder for void */
+    int64_t v185;
+    int64_t v20;
+    int64_t v118;
+    int64_t v131; /* placeholder for void */
+    void* v67;
+    int64_t v174;
+    int64_t v190;
+    bool v128;
+    int64_t v193;
+    int64_t v87; /* placeholder for void */
+    int64_t v126;
+    int64_t v160; /* placeholder for void */
+    int64_t v136; /* placeholder for void */
+    int64_t v138; /* placeholder for void */
+    void* v186;
+    void* v139;
+    int64_t v93;
+    int64_t v79; /* placeholder for void */
+    int64_t v149;
+    int64_t v39; /* placeholder for void */
+    int64_t v4; /* placeholder for void */
+    bool v55;
+    void* v189;
+    int64_t v44;
+    void* v81;
+    int64_t v100; /* placeholder for void */
+    int64_t v41;
+    int64_t v49;
+    void* v84;
+    void* v147;
+    int64_t v133;
+    void* v161;
+    bool v46;
+    int64_t v132;
+    int64_t v17;
+    int64_t v35; /* placeholder for void */
+    bool v112;
+    int64_t v194; /* placeholder for void */
+    void* v25;
+    int64_t v97;
+    void* v7;
+    bool v50;
+    int64_t v110;
+    int64_t v56; /* placeholder for void */
+    bool v74;
+    int64_t v104; /* placeholder for void */
+    bool v116;
+    int64_t v123;
+    int64_t v144;
+    int64_t v106;
+    int64_t v65;
+    int64_t v146;
+    int64_t v176;
+    bool v119;
+    int64_t v164; /* placeholder for void */
+    void* v22;
+    bool v151;
+    int64_t v168;
+    int64_t v14;
+    bool v54;
+    void* v154;
+    bool v120;
+    int64_t v159; /* placeholder for void */
+    int64_t v187; /* placeholder for void */
+    int64_t v96; /* placeholder for void */
+    void* v101;
+    int64_t v184; /* placeholder for void */
+    int64_t v73;
+    bool v108;
+    int64_t v167; /* placeholder for void */
+    int64_t v23; /* placeholder for void */
+    int64_t v40; /* placeholder for void */
+    void* v95;
+    void* v183;
+    bool v51;
+    v2 = 0LL;
+    v3 = v1 == v2;
+    if (v3) goto bb1;
+    else goto bb2;
+  bb1:
+    v5 = 1LL;
+    v6 = p_malloc(v5);
+    v7 = malloc(8);
+    *(int64_t*)v7 = (int64_t)v6;
+    v9 = *(int64_t*)v7;
+    v10 = malloc(8);
+    *(void**)v10 = (void*)v9;
+    v13 = *(void**)v10;
+    v14 = 0LL;
+    *(uint8_t*)v13 = (uint8_t)v14;
+    v17 = *(int64_t*)v7;
+    p_call_stack_pop();
+    return v17;
+  bb2:
+    goto bb3;
+  bb3:
+    v20 = 0LL;
+    v21 = (int64_t)p_str_length((void*)v20, v1);
+    v22 = malloc(8);
+    *(int64_t*)v22 = (int64_t)v21;
+    v24 = 0LL;
+    v25 = malloc(8);
+    *(int64_t*)v25 = (int64_t)v24;
+    v27 = *(int64_t*)v22;
+    v28 = malloc(8);
+    *(int64_t*)v28 = (int64_t)v27;
+    v30 = malloc(8);
+    *(int64_t*)v30 = (int64_t)v1;
+    v32 = *(int64_t*)v30;
+    v33 = malloc(8);
+    *(void**)v33 = (void*)v32;
+    v36 = *(void**)v33;
+    v37 = *(uint8_t*)v36;
+    v38 = malloc(8);
+    *(int64_t*)v38 = (int64_t)v37;
+    goto bb4;
+  bb4:
+    v41 = *(int64_t*)v38;
+    v42 = 32LL;
+    v43 = v41 == v42;
+    v44 = *(int64_t*)v38;
+    v45 = 9LL;
+    v46 = v44 == v45;
+    v47 = v43 || v46;
+    v48 = *(int64_t*)v38;
+    v49 = 10LL;
+    v50 = v48 == v49;
+    v51 = v47 || v50;
+    v52 = *(int64_t*)v38;
+    v53 = 13LL;
+    v54 = v52 == v53;
+    v55 = v51 || v54;
+    if (v55) goto bb5;
+    else goto bb6;
+  bb5:
+    v57 = *(int64_t*)v25;
+    v58 = 1LL;
+    v59 = v57 + v58;
+    *(int64_t*)v25 = (int64_t)v59;
+    v61 = *(int64_t*)v30;
+    v62 = 1LL;
+    v63 = v61 + v62;
+    *(int64_t*)v30 = (int64_t)v63;
+    v65 = *(int64_t*)v30;
+    *(void**)v33 = (void*)v65;
+    v67 = *(void**)v33;
+    v68 = *(uint8_t*)v67;
+    *(int64_t*)v38 = (int64_t)v68;
+    goto bb4;
+  bb6:
+    v72 = *(int64_t*)v25;
+    v73 = *(int64_t*)v28;
+    v74 = v72 >= v73;
+    if (v74) goto bb7;
+    else goto bb8;
+  bb7:
+    v76 = 1LL;
+    v77 = p_malloc(v76);
+    v78 = malloc(8);
+    *(int64_t*)v78 = (int64_t)v77;
+    v80 = *(int64_t*)v78;
+    v81 = malloc(8);
+    *(void**)v81 = (void*)v80;
+    v84 = *(void**)v81;
+    v85 = 0LL;
+    *(uint8_t*)v84 = (uint8_t)v85;
+    v88 = *(int64_t*)v78;
+    p_call_stack_pop();
+    return v88;
+  bb8:
+    goto bb9;
+  bb9:
+    v91 = *(int64_t*)v28;
+    v92 = v1 + v91;
+    v93 = 1LL;
+    v94 = v92 - v93;
+    v95 = malloc(8);
+    *(int64_t*)v95 = (int64_t)v94;
+    v97 = *(int64_t*)v95;
+    v98 = malloc(8);
+    *(void**)v98 = (void*)v97;
+    v101 = *(void**)v98;
+    v102 = *(uint8_t*)v101;
+    v103 = malloc(8);
+    *(int64_t*)v103 = (int64_t)v102;
+    goto bb10;
+  bb10:
+    v106 = *(int64_t*)v103;
+    v107 = 32LL;
+    v108 = v106 == v107;
+    v109 = *(int64_t*)v103;
+    v110 = 9LL;
+    v111 = v109 == v110;
+    v112 = v108 || v111;
+    v113 = *(int64_t*)v103;
+    v114 = 10LL;
+    v115 = v113 == v114;
+    v116 = v112 || v115;
+    v117 = *(int64_t*)v103;
+    v118 = 13LL;
+    v119 = v117 == v118;
+    v120 = v116 || v119;
+    if (v120) goto bb11;
+    else goto bb12;
+  bb11:
+    v122 = *(int64_t*)v28;
+    v123 = 1LL;
+    v124 = v122 - v123;
+    *(int64_t*)v28 = (int64_t)v124;
+    v126 = *(int64_t*)v28;
+    v127 = *(int64_t*)v25;
+    v128 = v126 <= v127;
+    if (v128) goto bb13;
+    else goto bb14;
+  bb12:
+    v144 = *(int64_t*)v28;
+    v145 = *(int64_t*)v25;
+    v146 = v144 - v145;
+    v147 = malloc(8);
+    *(int64_t*)v147 = (int64_t)v146;
+    v149 = *(int64_t*)v147;
+    v150 = 0LL;
+    v151 = v149 <= v150;
+    if (v151) goto bb16;
+    else goto bb17;
+  bb13:
+    goto bb12;
+  bb14:
+    goto bb15;
+  bb15:
+    v132 = *(int64_t*)v28;
+    v133 = v1 + v132;
+    v134 = 1LL;
+    v135 = v133 - v134;
+    *(int64_t*)v95 = (int64_t)v135;
+    v137 = *(int64_t*)v95;
+    *(void**)v98 = (void*)v137;
+    v139 = *(void**)v98;
+    v140 = *(uint8_t*)v139;
+    *(int64_t*)v103 = (int64_t)v140;
+    goto bb10;
+  bb16:
+    v153 = 1LL;
+    v154 = p_malloc(v153);
+    v155 = malloc(8);
+    *(int64_t*)v155 = (int64_t)v154;
+    v157 = *(int64_t*)v155;
+    v158 = malloc(8);
+    *(void**)v158 = (void*)v157;
+    v161 = *(void**)v158;
+    v162 = 0LL;
+    *(uint8_t*)v161 = (uint8_t)v162;
+    v165 = *(int64_t*)v155;
+    p_call_stack_pop();
+    return v165;
+  bb17:
+    goto bb18;
+  bb18:
+    v168 = *(int64_t*)v147;
+    v169 = 1LL;
+    v170 = v168 + v169;
+    v171 = p_malloc(v170);
+    v172 = malloc(8);
+    *(int64_t*)v172 = (int64_t)v171;
+    v174 = *(int64_t*)v172;
+    v175 = *(int64_t*)v25;
+    v176 = v1 + v175;
+    v177 = *(int64_t*)v147;
+    v178 = 0LL;
+    p_str_copy_n((void*)v178, v174, v176, v177);
+    v180 = *(int64_t*)v172;
+    v181 = *(int64_t*)v147;
+    v182 = v180 + v181;
+    v183 = malloc(8);
+    *(int64_t*)v183 = (int64_t)v182;
+    v185 = *(int64_t*)v183;
+    v186 = malloc(8);
+    *(void**)v186 = (void*)v185;
+    v189 = *(void**)v186;
+    v190 = 0LL;
+    *(uint8_t*)v189 = (uint8_t)v190;
+    v193 = *(int64_t*)v172;
+    p_call_stack_pop();
+    return v193;
+    return 0;
+}
+
+void StringBuilder_new(void* v0, void* v1) {
+    p_call_stack_push("StringBuilder_new");
+    int64_t v6;
+    void* v3;
+    int64_t v8; /* placeholder for void */
+    void* v14;
+    int64_t v15;
+    void* v2;
+    void* v13;
+    int64_t v16; /* placeholder for void */
+    int64_t v5; /* placeholder for void */
+    void* v10;
+    int64_t v17; /* placeholder for void */
+    void* v9;
+    void* v4;
+    void* v11;
+    void* v7;
+    int64_t v12; /* placeholder for void */
+    v2 = malloc(16);
+    v3 = _str1;
+    v4 = (char*)v2 + 0;
+    *(void**)v4 = (void*)v3;
+    v6 = 0LL;
+    v7 = (char*)v2 + 8;
+    *(int64_t*)v7 = (int64_t)v6;
+    v9 = (char*)v2 + 0;
+    v10 = (char*)v0 + 0;
+    v11 = *(void**)v9;
+    *(void**)v10 = (void*)v11;
+    v13 = (char*)v2 + 8;
+    v14 = (char*)v0 + 8;
+    v15 = *(int64_t*)v13;
+    *(int64_t*)v14 = (int64_t)v15;
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+void* int_to_str(void* v0, int64_t v1) {
+    p_call_stack_push("int_to_str");
+    void* v2;
+    int64_t v3; /* placeholder for void */
+    v2 = (void*)p_to_str((int64_t)v1);
+    p_call_stack_pop();
+    return v2;
+    return 0;
+}
+
+int64_t HashMap_len(void* v0, int64_t v1) {
+    p_call_stack_push("HashMap_len");
+    int64_t v2;
+    void* v4;
+    void* v10;
+    int64_t v12; /* placeholder for void */
+    int64_t v6;
+    int64_t v8; /* placeholder for void */
+    int64_t v3;
+    int64_t v11;
+    int64_t v14;
+    int64_t v15; /* placeholder for void */
+    int64_t v13; /* placeholder for void */
+    int64_t v5; /* placeholder for void */
+    void* v7;
+    int64_t v9; /* placeholder for void */
+    v2 = 16LL;
+    v3 = v1 + v2;
+    v4 = malloc(8);
+    *(void**)v4 = (void*)v3;
+    v6 = 0LL;
+    v7 = malloc(8);
+    *(int64_t*)v7 = (int64_t)v6;
+    v10 = *(void**)v4;
+    v11 = *(int64_t*)v10;
+    *(int64_t*)v7 = (int64_t)v11;
+    v14 = *(int64_t*)v7;
+    p_call_stack_pop();
+    return v14;
+    return 0;
+}
+
+int64_t Result_unwrap(void* v0, void* v1) {
+    p_call_stack_push("Result_unwrap");
+    bool v13;
+    int64_t v21;
+    int64_t v9; /* placeholder for void */
+    int64_t v3;
+    int64_t v6; /* placeholder for void */
+    void* v7;
+    int64_t v12;
+    int64_t v22; /* placeholder for void */
+    int64_t v19; /* placeholder for void */
+    int64_t v8;
+    int64_t v11;
+    int64_t v4;
+    void* v10;
+    bool v5;
+    int64_t v16;
+    void* v2;
+    void* v15;
+    int64_t v14; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    void* v17;
+    int64_t v18; /* placeholder for void */
+    v2 = (char*)v1 + 0;
+    v3 = *(int64_t*)v2;
+    v4 = 0LL;
+    v5 = v3 == v4;
+    if (v5) goto bb2;
+    else goto bb3;
+  bb1:
+    v21 = 0LL;
+    p_call_stack_pop();
+    return v21;
+  bb2:
+    v7 = (char*)v1 + 8;
+    v8 = *(int64_t*)v7;
+    p_call_stack_pop();
+    return v8;
+  bb3:
+    v10 = (char*)v1 + 0;
+    v11 = *(int64_t*)v10;
+    v12 = 1LL;
+    v13 = v11 == v12;
+    if (v13) goto bb4;
+    else goto bb5;
+  bb4:
+    v15 = (char*)v1 + 8;
+    v16 = *(int64_t*)v15;
+    v17 = _str11;
+    p_panic(v17);
+    goto bb1;
+  bb5:
+    goto bb1;
+    return 0;
+}
+
+bool Result_is_ok(void* v0, void* v1) {
+    p_call_stack_push("Result_is_ok");
+    bool v5;
+    void* v7;
+    bool v18;
+    int64_t v3;
+    int64_t v17;
+    int64_t v19; /* placeholder for void */
+    int64_t v8;
+    void* v16;
+    int64_t v22; /* placeholder for void */
+    void* v2;
+    int64_t v12;
+    bool v21;
+    int64_t v6; /* placeholder for void */
+    bool v9;
+    int64_t v4;
+    int64_t v10; /* placeholder for void */
+    void* v11;
+    int64_t v13;
+    bool v14;
+    int64_t v15; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    v2 = (char*)v1 + 0;
+    v3 = *(int64_t*)v2;
+    v4 = 0LL;
+    v5 = v3 == v4;
+    if (v5) goto bb2;
+    else goto bb3;
+  bb1:
+    v21 = false;
+    p_call_stack_pop();
+    return v21;
+  bb2:
+    v7 = (char*)v1 + 8;
+    v8 = *(int64_t*)v7;
+    v9 = true;
+    p_call_stack_pop();
+    return v9;
+  bb3:
+    v11 = (char*)v1 + 0;
+    v12 = *(int64_t*)v11;
+    v13 = 1LL;
+    v14 = v12 == v13;
+    if (v14) goto bb4;
+    else goto bb5;
+  bb4:
+    v16 = (char*)v1 + 8;
+    v17 = *(int64_t*)v16;
+    v18 = false;
+    p_call_stack_pop();
+    return v18;
+  bb5:
+    goto bb1;
+    return 0;
+}
+
+void StringBuilder_append_int(void* v0, void* v1, int64_t v2) {
+    p_call_stack_push("StringBuilder_append_int");
+    int64_t v14; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    void* v7;
+    void* v6;
+    int64_t v12;
+    void* v5;
+    int64_t v8; /* placeholder for void */
+    void* v3;
+    void* v10;
+    int64_t v11;
+    int64_t v13;
+    void* v4;
+    void* v9;
+    v3 = (char*)v1 + 0;
+    v4 = (char*)v1 + 0;
+    v5 = *(void**)v4;
+    v6 = (void*)p_to_str((int64_t)v2);
+    v7 = p_str_concat(v5, v6);
+    *(void**)v3 = (void*)v7;
+    v9 = (char*)v1 + 8;
+    v10 = (char*)v1 + 8;
+    v11 = *(int64_t*)v10;
+    v12 = 1LL;
+    v13 = v11 + v12;
+    *(int64_t*)v9 = (int64_t)v13;
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+void ByteBuffer_new(void* v0, void* v1, int64_t v2) {
+    p_call_stack_push("ByteBuffer_new");
+    int64_t v7; /* placeholder for void */
+    void* v11;
+    int64_t v17;
+    int64_t v4;
+    int64_t v18; /* placeholder for void */
+    void* v12;
+    int64_t v10; /* placeholder for void */
+    int64_t v8;
+    void* v15;
+    void* v9;
+    int64_t v14; /* placeholder for void */
+    void* v5;
+    void* v3;
+    void* v6;
+    void* v13;
+    int64_t v19; /* placeholder for void */
+    void* v16;
+    v3 = malloc(16);
+    v4 = 0LL;
+    v5 = (void*)Vec_new((void*)v4);
+    v6 = (char*)v3 + 0;
+    *(void**)v6 = (void*)v5;
+    v8 = 0LL;
+    v9 = (char*)v3 + 8;
+    *(int64_t*)v9 = (int64_t)v8;
+    v11 = (char*)v3 + 0;
+    v12 = (char*)v0 + 0;
+    v13 = *(void**)v11;
+    *(void**)v12 = (void*)v13;
+    v15 = (char*)v3 + 8;
+    v16 = (char*)v0 + 8;
+    v17 = *(int64_t*)v15;
+    *(int64_t*)v16 = (int64_t)v17;
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+void Vec_insert(void* v0, int64_t v1, int64_t v2, int64_t v3) {
+    p_call_stack_push("Vec_insert");
+    int64_t v14; /* placeholder for void */
+    int64_t v31;
+    bool v17;
+    void* v70;
+    int64_t v72;
+    int64_t v88; /* placeholder for void */
+    void* v93;
+    int64_t v16;
+    int64_t v54;
+    int64_t v65;
+    int64_t v7; /* placeholder for void */
+    int64_t v79; /* placeholder for void */
+    int64_t v45;
+    int64_t v94; /* placeholder for void */
+    int64_t v101; /* placeholder for void */
+    int64_t v27; /* placeholder for void */
+    void* v96;
+    void* v73;
+    int64_t v77;
+    void* v8;
+    int64_t v37; /* placeholder for void */
+    int64_t v63;
+    int64_t v69;
+    void* v76;
+    void* v80;
+    int64_t v89;
+    int64_t v32; /* placeholder for void */
+    int64_t v97; /* placeholder for void */
+    int64_t v18; /* placeholder for void */
+    int64_t v46;
+    int64_t v102; /* placeholder for void */
+    int64_t v64;
+    int64_t v48; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    int64_t v25; /* placeholder for void */
+    int64_t v29; /* placeholder for void */
+    int64_t v60;
+    int64_t v43; /* placeholder for void */
+    bool v24;
+    void* v26;
+    int64_t v9; /* placeholder for void */
+    int64_t v21; /* placeholder for void */
+    int64_t v75; /* placeholder for void */
+    int64_t v95;
+    int64_t v98; /* placeholder for void */
+    int64_t v4;
     void* v67;
     int64_t v36; /* placeholder for void */
-    int64_t v39;
-    void* v35;
-    int64_t v46;
-    void* v4;
-    int64_t v11;
-    int64_t v19; /* placeholder for void */
-    int64_t v47;
-    int64_t v62; /* placeholder for void */
-    int64_t v20;
-    int64_t v68;
-    int64_t v72;
-    void* v49;
-    int64_t v75;
-    bool v77;
-    int64_t v40;
+    int64_t v50;
+    int64_t v28; /* placeholder for void */
+    int64_t v56;
     int64_t v59; /* placeholder for void */
-    void* v27;
-    int64_t v57;
-    int64_t v65; /* placeholder for void */
-    int64_t v70; /* placeholder for void */
-    int64_t v76;
+    int64_t v52; /* placeholder for void */
+    int64_t v61;
+    int64_t v74; /* placeholder for void */
+    int64_t v82; /* placeholder for void */
+    int64_t v84;
+    int64_t v62;
+    int64_t v22; /* placeholder for void */
+    int64_t v42; /* placeholder for void */
+    void* v10;
+    int64_t v86;
+    void* v12;
     int64_t v90;
-    bool v26;
+    int64_t v71; /* placeholder for void */
+    void* v34;
+    void* v78;
+    int64_t v81;
+    void* v47;
+    int64_t v35;
+    void* v6;
+    int64_t v5;
+    void* v40;
+    int64_t v44;
+    int64_t v49; /* placeholder for void */
+    int64_t v11; /* placeholder for void */
+    bool v51;
+    int64_t v83; /* placeholder for void */
+    int64_t v85;
+    int64_t v91;
+    int64_t v92;
+    void* v99;
+    int64_t v100; /* placeholder for void */
+    int64_t v39; /* placeholder for void */
+    int64_t v53;
+    int64_t v55;
+    int64_t v13;
+    int64_t v15; /* placeholder for void */
+    int64_t v68; /* placeholder for void */
     int64_t v87; /* placeholder for void */
+    int64_t v41;
+    void* v19;
+    int64_t v30;
+    int64_t v33; /* placeholder for void */
+    int64_t v57;
+    int64_t v23;
+    void* v38;
+    void* v58;
+    int64_t v66;
+    v4 = 8LL;
+    v5 = v1 + v4;
+    v6 = malloc(8);
+    *(void**)v6 = (void*)v5;
+    v8 = malloc(8);
+    *(void**)v8 = (void*)v1;
+    v10 = malloc(8);
+    v12 = *(void**)v6;
+    v13 = *(int64_t*)v12;
+    *(int64_t*)v10 = (int64_t)v13;
+    v16 = 0LL;
+    v17 = v2 < v16;
+    if (v17) goto bb1;
+    else goto bb2;
+  bb1:
+    v19 = _str12;
+    p_panic(v19);
+    goto bb3;
+  bb2:
+    goto bb3;
+  bb3:
+    v23 = *(int64_t*)v10;
+    v24 = v2 > v23;
+    if (v24) goto bb4;
+    else goto bb5;
+  bb4:
+    v26 = _str12;
+    p_panic(v26);
+    goto bb6;
+  bb5:
+    goto bb6;
+  bb6:
+    v30 = 0LL;
+    v31 = 0LL;
+    Vec_push((void*)v31, v1, v30);
+    v34 = *(void**)v6;
+    v35 = *(int64_t*)v34;
+    *(int64_t*)v10 = (int64_t)v35;
+    v38 = malloc(8);
+    v40 = *(void**)v8;
+    v41 = *(int64_t*)v40;
+    *(int64_t*)v38 = (int64_t)v41;
+    v44 = *(int64_t*)v10;
+    v45 = 1LL;
+    v46 = v44 - v45;
+    v47 = malloc(8);
+    *(int64_t*)v47 = (int64_t)v46;
+    goto bb7;
+  bb7:
+    v50 = *(int64_t*)v47;
+    v51 = v50 > v2;
+    if (v51) goto bb8;
+    else goto bb9;
+  bb8:
+    v53 = *(int64_t*)v38;
+    v54 = *(int64_t*)v47;
+    v55 = 8LL;
+    v56 = v54 * v55;
+    v57 = v53 + v56;
+    v58 = malloc(8);
+    *(int64_t*)v58 = (int64_t)v57;
+    v60 = *(int64_t*)v38;
+    v61 = *(int64_t*)v47;
+    v62 = 1LL;
+    v63 = v61 - v62;
+    v64 = 8LL;
+    v65 = v63 * v64;
+    v66 = v60 + v65;
+    v67 = malloc(8);
+    *(int64_t*)v67 = (int64_t)v66;
+    v69 = *(int64_t*)v58;
+    v70 = malloc(8);
+    *(void**)v70 = (void*)v69;
+    v72 = *(int64_t*)v67;
+    v73 = malloc(8);
+    *(void**)v73 = (void*)v72;
+    v76 = *(void**)v73;
+    v77 = *(int64_t*)v76;
+    v78 = malloc(8);
+    *(int64_t*)v78 = (int64_t)v77;
+    v80 = *(void**)v70;
+    v81 = *(int64_t*)v78;
+    *(int64_t*)v80 = (int64_t)v81;
+    v84 = *(int64_t*)v47;
+    v85 = 1LL;
+    v86 = v84 - v85;
+    *(int64_t*)v47 = (int64_t)v86;
+    goto bb7;
+  bb9:
+    v89 = *(int64_t*)v38;
+    v90 = 8LL;
+    v91 = v2 * v90;
+    v92 = v89 + v91;
+    v93 = malloc(8);
+    *(int64_t*)v93 = (int64_t)v92;
+    v95 = *(int64_t*)v93;
+    v96 = malloc(8);
+    *(void**)v96 = (void*)v95;
+    v99 = *(void**)v96;
+    *(int64_t*)v99 = (int64_t)v3;
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+int64_t Vec_clone(void* v0, int64_t v1) {
+    p_call_stack_push("Vec_clone");
+    int64_t v57; /* placeholder for void */
     int64_t v13; /* placeholder for void */
-    int64_t v95; /* placeholder for void */
+    int64_t v41; /* placeholder for void */
+    void* v16;
+    int64_t v18; /* placeholder for void */
+    void* v22;
+    int64_t v11;
+    int64_t v27; /* placeholder for void */
+    int64_t v53; /* placeholder for void */
+    void* v43;
+    int64_t v21;
+    int64_t v7; /* placeholder for void */
+    int64_t v24;
+    void* v25;
+    int64_t v36;
+    int64_t v33;
+    int64_t v20;
+    int64_t v9; /* placeholder for void */
+    int64_t v38; /* placeholder for void */
+    int64_t v42;
+    int64_t v59;
+    void* v4;
+    int64_t v35;
+    int64_t v50;
+    int64_t v56;
+    int64_t v60; /* placeholder for void */
+    void* v37;
+    int64_t v55;
+    int64_t v2;
+    int64_t v19; /* placeholder for void */
+    void* v10;
+    int64_t v15; /* placeholder for void */
+    bool v30;
+    void* v14;
+    void* v46;
+    int64_t v3;
+    int64_t v48; /* placeholder for void */
+    int64_t v58; /* placeholder for void */
+    int64_t v49; /* placeholder for void */
+    int64_t v44; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    int64_t v26; /* placeholder for void */
+    int64_t v28;
+    void* v40;
+    void* v6;
+    int64_t v34;
+    int64_t v32;
+    int64_t v39;
+    int64_t v45; /* placeholder for void */
+    int64_t v52;
+    int64_t v51;
+    int64_t v23; /* placeholder for void */
+    int64_t v47;
+    int64_t v29;
+    void* v8;
+    int64_t v17;
+    int64_t v54;
+    int64_t v31; /* placeholder for void */
+    int64_t v5; /* placeholder for void */
     v2 = 8LL;
     v3 = v1 + v2;
     v4 = malloc(8);
@@ -10146,1388 +11840,659 @@ void Vec_sort(void* v0, int64_t v1) {
     v16 = *(void**)v6;
     v17 = *(int64_t*)v16;
     *(int64_t*)v14 = (int64_t)v17;
-    v20 = *(int64_t*)v8;
-    v21 = 1LL;
-    v22 = v20 <= v21;
-    if (v22) goto bb1;
-    else goto bb2;
-  bb1:
-    p_call_stack_pop();
-    return;
-  bb2:
-    goto bb3;
-  bb3:
-    v26 = true;
-    v27 = malloc(1);
-    *(bool*)v27 = v26;
-    goto bb4;
-  bb4:
-    v30 = *(bool*)v27;
-    if (v30) goto bb5;
-    else goto bb6;
-  bb5:
-    v32 = false;
-    *(bool*)v27 = v32;
-    v34 = 0LL;
-    v35 = malloc(8);
-    *(int64_t*)v35 = (int64_t)v34;
-    goto bb7;
-  bb6:
-    p_call_stack_pop();
-    return;
-  bb7:
-    v38 = *(int64_t*)v35;
-    v39 = *(int64_t*)v8;
-    v40 = 1LL;
-    v41 = v39 - v40;
-    v42 = v38 < v41;
-    if (v42) goto bb8;
-    else goto bb9;
-  bb8:
-    v44 = *(int64_t*)v14;
-    v45 = *(int64_t*)v35;
-    v46 = 8LL;
-    v47 = v45 * v46;
-    v48 = v44 + v47;
-    v49 = malloc(8);
-    *(int64_t*)v49 = (int64_t)v48;
-    v51 = *(int64_t*)v14;
-    v52 = *(int64_t*)v35;
-    v53 = 1LL;
-    v54 = v52 + v53;
-    v55 = 8LL;
-    v56 = v54 * v55;
-    v57 = v51 + v56;
-    v58 = malloc(8);
-    *(int64_t*)v58 = (int64_t)v57;
-    v60 = *(int64_t*)v49;
-    v61 = malloc(8);
-    *(void**)v61 = (void*)v60;
-    v63 = *(int64_t*)v58;
-    v64 = malloc(8);
-    *(void**)v64 = (void*)v63;
-    v67 = *(void**)v61;
-    v68 = *(int64_t*)v67;
-    v69 = malloc(8);
-    *(int64_t*)v69 = (int64_t)v68;
-    v71 = *(void**)v64;
-    v72 = *(int64_t*)v71;
-    v73 = malloc(8);
-    *(int64_t*)v73 = (int64_t)v72;
-    v75 = *(int64_t*)v69;
-    v76 = *(int64_t*)v73;
-    v77 = v75 > v76;
-    if (v77) goto bb10;
-    else goto bb11;
-  bb9:
-    goto bb4;
-  bb10:
-    v79 = *(void**)v61;
-    v80 = *(int64_t*)v73;
-    *(int64_t*)v79 = (int64_t)v80;
-    v82 = *(void**)v64;
-    v83 = *(int64_t*)v69;
-    *(int64_t*)v82 = (int64_t)v83;
-    v85 = true;
-    *(bool*)v27 = v85;
-    goto bb12;
-  bb11:
-    goto bb12;
-  bb12:
-    v90 = *(int64_t*)v35;
-    v91 = 1LL;
-    v92 = v90 + v91;
-    *(int64_t*)v35 = (int64_t)v92;
-    goto bb7;
-    return;
-}
-
-int64_t p_str_hash(void* v0, int64_t v1) {
-    p_call_stack_push("p_str_hash");
-    int64_t v2;
-    int64_t v32; /* placeholder for void */
-    int64_t v47; /* placeholder for void */
-    void* v6;
-    void* v14;
-    int64_t v17;
-    int64_t v31;
-    int64_t v46; /* placeholder for void */
-    void* v35;
-    int64_t v28; /* placeholder for void */
-    int64_t v39; /* placeholder for void */
-    int64_t v20; /* placeholder for void */
-    int64_t v5; /* placeholder for void */
-    int64_t v27;
-    int64_t v21;
-    int64_t v29;
-    int64_t v33;
-    int64_t v30;
-    int64_t v23;
-    int64_t v26;
-    int64_t v44;
-    int64_t v7; /* placeholder for void */
-    int64_t v22;
-    int64_t v37; /* placeholder for void */
-    int64_t v25;
-    int64_t v34; /* placeholder for void */
-    int64_t v41;
-    int64_t v49; /* placeholder for void */
-    int64_t v48;
-    int64_t v15; /* placeholder for void */
-    int64_t v38; /* placeholder for void */
-    int64_t v40;
-    int64_t v43; /* placeholder for void */
-    int64_t v8;
-    bool v19;
-    uint8_t v36;
-    int64_t v18;
-    int64_t v3;
-    int64_t v11; /* placeholder for void */
-    bool v42;
-    int64_t v24; /* placeholder for void */
-    int64_t v16; /* placeholder for void */
-    void* v9;
-    void* v12;
-    int64_t v45;
-    void* v4;
-    int64_t v10; /* placeholder for void */
-    uint8_t v13;
-    v2 = 3750763034362895579LL;
-    v3 = -v2;
-    v4 = malloc(8);
-    *(int64_t*)v4 = (int64_t)v3;
-    v6 = malloc(8);
-    *(int64_t*)v6 = (int64_t)v1;
-    v8 = *(int64_t*)v6;
-    v9 = malloc(8);
-    *(void**)v9 = (void*)v8;
-    v12 = *(void**)v9;
-    v13 = *(uint8_t*)v12;
-    v14 = malloc(8);
-    *(int64_t*)v14 = (int64_t)v13;
-    goto bb1;
-  bb1:
-    v17 = *(int64_t*)v14;
-    v18 = 0LL;
-    v19 = v17 != v18;
-    if (v19) goto bb2;
-    else goto bb3;
-  bb2:
-    v21 = *(int64_t*)v4;
-    v22 = *(int64_t*)v14;
-    v23 = v21 ^ v22;
-    *(int64_t*)v4 = (int64_t)v23;
-    v25 = *(int64_t*)v4;
-    v26 = 1099511628211LL;
-    v27 = v25 * v26;
-    *(int64_t*)v4 = (int64_t)v27;
-    v29 = *(int64_t*)v6;
-    v30 = 1LL;
-    v31 = v29 + v30;
-    *(int64_t*)v6 = (int64_t)v31;
-    v33 = *(int64_t*)v6;
-    *(void**)v9 = (void*)v33;
-    v35 = *(void**)v9;
-    v36 = *(uint8_t*)v35;
-    *(int64_t*)v14 = (int64_t)v36;
-    goto bb1;
-  bb3:
-    v40 = *(int64_t*)v4;
-    v41 = 0LL;
-    v42 = v40 < v41;
-    if (v42) goto bb4;
-    else goto bb5;
-  bb4:
-    v44 = *(int64_t*)v4;
-    v45 = -v44;
-    p_call_stack_pop();
-    return v45;
-  bb5:
-    goto bb6;
-  bb6:
-    v48 = *(int64_t*)v4;
-    p_call_stack_pop();
-    return v48;
-    return 0;
-}
-
-void StringBuilder_append_char(void* v0, void* v1, int64_t v2) {
-    p_call_stack_push("StringBuilder_append_char");
-    void* v4;
-    int64_t v11;
-    void* v10;
-    int64_t v14; /* placeholder for void */
-    int64_t v12;
-    int64_t v8; /* placeholder for void */
-    void* v9;
-    void* v5;
-    void* v3;
-    void* v6;
-    int64_t v15; /* placeholder for void */
-    void* v7;
-    int64_t v13;
-    v3 = (char*)v1 + 0;
-    v4 = (char*)v1 + 0;
-    v5 = *(void**)v4;
-    v6 = p_char_to_str(v2);
-    v7 = p_str_concat(v5, v6);
-    *(void**)v3 = (void*)v7;
-    v9 = (char*)v1 + 8;
-    v10 = (char*)v1 + 8;
-    v11 = *(int64_t*)v10;
-    v12 = 1LL;
-    v13 = v11 + v12;
-    *(int64_t*)v9 = (int64_t)v13;
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-bool Vec_contains(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("Vec_contains");
-    int64_t v14; /* placeholder for void */
-    int64_t v21;
-    int64_t v33;
-    int64_t v23; /* placeholder for void */
-    int64_t v3;
-    void* v34;
-    int64_t v49; /* placeholder for void */
-    int64_t v57; /* placeholder for void */
-    void* v15;
-    int64_t v25;
-    int64_t v31;
-    int64_t v35; /* placeholder for void */
-    int64_t v28; /* placeholder for void */
-    int64_t v42; /* placeholder for void */
-    bool v27;
-    int64_t v53;
-    int64_t v4;
-    int64_t v30;
-    int64_t v44;
-    void* v43;
-    int64_t v46; /* placeholder for void */
-    int64_t v52; /* placeholder for void */
-    void* v22;
-    int64_t v29;
-    int64_t v16; /* placeholder for void */
-    int64_t v6; /* placeholder for void */
-    int64_t v13; /* placeholder for void */
-    int64_t v55;
-    int64_t v39;
-    int64_t v8; /* placeholder for void */
-    int64_t v26;
-    int64_t v38; /* placeholder for void */
-    int64_t v18;
-    bool v58;
-    int64_t v24; /* placeholder for void */
-    void* v7;
-    int64_t v12;
-    int64_t v20; /* placeholder for void */
-    void* v11;
-    int64_t v41; /* placeholder for void */
-    void* v5;
-    bool v48;
-    void* v17;
-    int64_t v51; /* placeholder for void */
-    int64_t v32;
-    void* v40;
-    int64_t v59; /* placeholder for void */
-    int64_t v45; /* placeholder for void */
-    int64_t v19; /* placeholder for void */
-    int64_t v47;
-    int64_t v10; /* placeholder for void */
-    int64_t v36;
-    int64_t v56; /* placeholder for void */
-    void* v9;
-    bool v50;
-    void* v37;
-    int64_t v54;
-    v3 = 8LL;
-    v4 = v1 + v3;
-    v5 = malloc(8);
-    *(void**)v5 = (void*)v4;
-    v7 = malloc(8);
-    *(void**)v7 = (void*)v1;
-    v9 = malloc(8);
-    v11 = *(void**)v5;
-    v12 = *(int64_t*)v11;
-    *(int64_t*)v9 = (int64_t)v12;
-    v15 = malloc(8);
-    v17 = *(void**)v7;
-    v18 = *(int64_t*)v17;
-    *(int64_t*)v15 = (int64_t)v18;
-    v21 = 0LL;
+    v20 = 0LL;
+    v21 = (int64_t)Vec_new((void*)v20);
     v22 = malloc(8);
     *(int64_t*)v22 = (int64_t)v21;
+    v24 = 0LL;
+    v25 = malloc(8);
+    *(int64_t*)v25 = (int64_t)v24;
     goto bb1;
   bb1:
-    v25 = *(int64_t*)v22;
-    v26 = *(int64_t*)v9;
-    v27 = v25 < v26;
-    if (v27) goto bb2;
+    v28 = *(int64_t*)v25;
+    v29 = *(int64_t*)v8;
+    v30 = v28 < v29;
+    if (v30) goto bb2;
     else goto bb3;
   bb2:
-    v29 = *(int64_t*)v15;
-    v30 = *(int64_t*)v22;
-    v31 = 8LL;
-    v32 = v30 * v31;
-    v33 = v29 + v32;
+    v32 = *(int64_t*)v14;
+    v33 = *(int64_t*)v25;
+    v34 = 8LL;
+    v35 = v33 * v34;
+    v36 = v32 + v35;
+    v37 = malloc(8);
+    *(int64_t*)v37 = (int64_t)v36;
+    v39 = *(int64_t*)v37;
+    v40 = malloc(8);
+    *(void**)v40 = (void*)v39;
+    v42 = 0LL;
+    v43 = malloc(8);
+    *(int64_t*)v43 = (int64_t)v42;
+    v46 = *(void**)v40;
+    v47 = *(int64_t*)v46;
+    *(int64_t*)v43 = (int64_t)v47;
+    v50 = *(int64_t*)v22;
+    v51 = *(int64_t*)v43;
+    v52 = 0LL;
+    Vec_push((void*)v52, v50, v51);
+    v54 = *(int64_t*)v25;
+    v55 = 1LL;
+    v56 = v54 + v55;
+    *(int64_t*)v25 = (int64_t)v56;
+    goto bb1;
+  bb3:
+    v59 = *(int64_t*)v22;
+    p_call_stack_pop();
+    return v59;
+    return 0;
+}
+
+int64_t HashMap_values(void* v0, int64_t v1) {
+    p_call_stack_push("HashMap_values");
+    bool v42;
+    void* v4;
+    void* v63;
+    int64_t v12;
+    int64_t v39;
+    int64_t v78;
+    int64_t v77;
+    int64_t v5; /* placeholder for void */
+    int64_t v17; /* placeholder for void */
+    int64_t v59;
+    void* v96;
+    int64_t v11; /* placeholder for void */
+    void* v60;
+    int64_t v100;
+    int64_t v89;
+    int64_t v27; /* placeholder for void */
+    int64_t v36;
+    int64_t v40;
+    void* v69;
+    int64_t v91; /* placeholder for void */
+    int64_t v88; /* placeholder for void */
+    int64_t v67; /* placeholder for void */
+    int64_t v84;
+    void* v90;
+    int64_t v101;
+    void* v48;
+    int64_t v54; /* placeholder for void */
+    void* v93;
+    int64_t v9;
+    int64_t v61; /* placeholder for void */
+    int64_t v92;
+    int64_t v43; /* placeholder for void */
+    int64_t v45; /* placeholder for void */
+    int64_t v65;
+    int64_t v86;
+    int64_t v95; /* placeholder for void */
+    int64_t v15;
+    int64_t v18;
+    bool v53;
+    int64_t v57;
+    int64_t v111;
+    int64_t v104; /* placeholder for void */
+    bool v80;
+    void* v34;
+    bool v79;
+    int64_t v83;
+    int64_t v109; /* placeholder for void */
+    int64_t v24; /* placeholder for void */
+    void* v10;
+    int64_t v29;
+    int64_t v110; /* placeholder for void */
+    void* v25;
+    int64_t v68; /* placeholder for void */
+    int64_t v56;
+    int64_t v62;
+    int64_t v105; /* placeholder for void */
+    int64_t v31; /* placeholder for void */
+    int64_t v3;
+    int64_t v49; /* placeholder for void */
+    void* v22;
+    int64_t v50; /* placeholder for void */
+    int64_t v71; /* placeholder for void */
+    int64_t v72; /* placeholder for void */
+    void* v28;
+    int64_t v14; /* placeholder for void */
+    int64_t v74;
+    int64_t v8;
+    int64_t v64; /* placeholder for void */
+    int64_t v99; /* placeholder for void */
+    bool v41;
+    void* v66;
+    void* v13;
+    int64_t v107;
+    int64_t v2;
+    int64_t v51;
+    int64_t v112; /* placeholder for void */
+    int64_t v70;
+    int64_t v58;
+    int64_t v35; /* placeholder for void */
+    int64_t v21; /* placeholder for void */
+    int64_t v97;
+    int64_t v82;
+    int64_t v32;
+    int64_t v106;
+    int64_t v7; /* placeholder for void */
+    int64_t v94; /* placeholder for void */
+    int64_t v46; /* placeholder for void */
+    int64_t v76;
+    int64_t v103; /* placeholder for void */
+    int64_t v81; /* placeholder for void */
+    int64_t v102;
+    int64_t v20; /* placeholder for void */
+    int64_t v85;
+    int64_t v37;
+    bool v38;
+    void* v19;
+    void* v87;
+    void* v6;
+    void* v16;
+    int64_t v52;
+    bool v75;
+    int64_t v26;
+    int64_t v108;
+    int64_t v30; /* placeholder for void */
+    int64_t v33;
+    int64_t v44;
+    int64_t v23;
+    int64_t v55;
+    int64_t v73;
+    int64_t v98; /* placeholder for void */
+    int64_t v47;
+    v2 = 24LL;
+    v3 = v1 + v2;
+    v4 = malloc(8);
+    *(void**)v4 = (void*)v3;
+    v6 = malloc(8);
+    *(void**)v6 = (void*)v1;
+    v8 = 8LL;
+    v9 = v1 + v8;
+    v10 = malloc(8);
+    *(void**)v10 = (void*)v9;
+    v12 = 0LL;
+    v13 = malloc(8);
+    *(int64_t*)v13 = (int64_t)v12;
+    v15 = 0LL;
+    v16 = malloc(8);
+    *(int64_t*)v16 = (int64_t)v15;
+    v18 = 0LL;
+    v19 = malloc(8);
+    *(int64_t*)v19 = (int64_t)v18;
+    v22 = *(void**)v4;
+    v23 = *(int64_t*)v22;
+    *(int64_t*)v13 = (int64_t)v23;
+    v25 = *(void**)v6;
+    v26 = *(int64_t*)v25;
+    *(int64_t*)v16 = (int64_t)v26;
+    v28 = *(void**)v10;
+    v29 = *(int64_t*)v28;
+    *(int64_t*)v19 = (int64_t)v29;
+    v32 = 0LL;
+    v33 = (int64_t)Vec_new((void*)v32);
     v34 = malloc(8);
     *(int64_t*)v34 = (int64_t)v33;
-    v36 = *(int64_t*)v34;
-    v37 = malloc(8);
-    *(void**)v37 = (void*)v36;
-    v39 = 0LL;
-    v40 = malloc(8);
-    *(int64_t*)v40 = (int64_t)v39;
-    v43 = *(void**)v37;
-    v44 = *(int64_t*)v43;
-    *(int64_t*)v40 = (int64_t)v44;
-    v47 = *(int64_t*)v40;
-    v48 = v47 == v2;
-    if (v48) goto bb4;
-    else goto bb5;
-  bb3:
-    v58 = false;
-    p_call_stack_pop();
-    return v58;
-  bb4:
-    v50 = true;
-    p_call_stack_pop();
-    return v50;
-  bb5:
-    goto bb6;
-  bb6:
-    v53 = *(int64_t*)v22;
-    v54 = 1LL;
-    v55 = v53 + v54;
-    *(int64_t*)v22 = (int64_t)v55;
-    goto bb1;
-    return 0;
-}
-
-int64_t allocator_alloc(void* v0, void* v1, int64_t v2) {
-    p_call_stack_push("allocator_alloc");
-    int64_t v3;
-    int64_t v4; /* placeholder for void */
-    v3 = (int64_t)p_allocator_alloc(v1, v2);
-    p_call_stack_pop();
-    return v3;
-    return 0;
-}
-
-int64_t String_bytes(void* v0, int64_t v1) {
-    p_call_stack_push("String_bytes");
-    int64_t v3;
-    int64_t v2;
-    int64_t v4; /* placeholder for void */
-    v2 = 0LL;
-    v3 = (int64_t)p_str_length((void*)v2, v1);
-    p_call_stack_pop();
-    return v3;
-    return 0;
-}
-
-int64_t String_clone(void* v0, int64_t v1) {
-    p_call_stack_push("String_clone");
-    int64_t v4; /* placeholder for void */
-    int64_t v2;
-    int64_t v3;
-    v2 = 0LL;
-    v3 = (int64_t)String_from((void*)v2, v1);
-    p_call_stack_pop();
-    return v3;
-    return 0;
-}
-
-bool HashMap_contains(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("HashMap_contains");
-    bool v56;
-    int64_t v57;
-    void* v24;
-    void* v5;
-    int64_t v46;
-    int64_t v7;
-    int64_t v12;
-    void* v50;
-    int64_t v52; /* placeholder for void */
-    int64_t v38;
-    int64_t v55;
-    int64_t v42; /* placeholder for void */
-    int64_t v62; /* placeholder for void */
-    int64_t v37;
-    int64_t v53; /* placeholder for void */
-    void* v26;
-    int64_t v35; /* placeholder for void */
-    int64_t v39;
-    int64_t v31; /* placeholder for void */
-    int64_t v22;
-    int64_t v3;
-    int64_t v34; /* placeholder for void */
-    bool v19;
-    void* v11;
-    int64_t v21; /* placeholder for void */
-    void* v41;
-    int64_t v36;
-    int64_t v23;
-    int64_t v25; /* placeholder for void */
-    void* v44;
-    void* v47;
-    int64_t v9; /* placeholder for void */
-    int64_t v54;
-    int64_t v58;
-    void* v29;
-    int64_t v20; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    bool v61;
-    bool v17;
-    int64_t v4;
-    int64_t v6; /* placeholder for void */
-    void* v8;
-    int64_t v30; /* placeholder for void */
-    int64_t v49; /* placeholder for void */
-    int64_t v28;
-    bool v60;
-    int64_t v16;
-    int64_t v13; /* placeholder for void */
-    int64_t v45; /* placeholder for void */
-    int64_t v59;
-    int64_t v33;
-    int64_t v43;
-    int64_t v40;
-    int64_t v48; /* placeholder for void */
-    int64_t v51;
-    void* v32;
-    int64_t v15;
-    int64_t v10; /* placeholder for void */
-    int64_t v27; /* placeholder for void */
-    int64_t v14; /* placeholder for void */
-    v3 = 24LL;
-    v4 = v1 + v3;
-    v5 = malloc(8);
-    *(void**)v5 = (void*)v4;
-    v7 = 0LL;
-    v8 = malloc(8);
-    *(int64_t*)v8 = (int64_t)v7;
-    v11 = *(void**)v5;
-    v12 = *(int64_t*)v11;
-    *(int64_t*)v8 = (int64_t)v12;
-    v15 = *(int64_t*)v8;
-    v16 = 0LL;
-    v17 = v15 == v16;
-    if (v17) goto bb1;
+    v36 = *(int64_t*)v16;
+    v37 = 0LL;
+    v38 = v36 == v37;
+    v39 = *(int64_t*)v13;
+    v40 = 0LL;
+    v41 = v39 == v40;
+    v42 = v38 || v41;
+    if (v42) goto bb1;
     else goto bb2;
   bb1:
-    v19 = false;
+    v44 = *(int64_t*)v34;
     p_call_stack_pop();
-    return v19;
+    return v44;
   bb2:
     goto bb3;
   bb3:
-    v22 = 0LL;
-    v23 = (int64_t)HashMap_find_slot((void*)v22, v1, v2);
-    v24 = malloc(8);
-    *(int64_t*)v24 = (int64_t)v23;
-    v26 = malloc(8);
-    *(void**)v26 = (void*)v1;
-    v28 = 0LL;
-    v29 = malloc(8);
-    *(int64_t*)v29 = (int64_t)v28;
-    v32 = *(void**)v26;
-    v33 = *(int64_t*)v32;
-    *(int64_t*)v29 = (int64_t)v33;
-    v36 = *(int64_t*)v29;
-    v37 = *(int64_t*)v24;
-    v38 = 8LL;
-    v39 = v37 * v38;
-    v40 = v36 + v39;
-    v41 = malloc(8);
-    *(int64_t*)v41 = (int64_t)v40;
-    v43 = *(int64_t*)v41;
-    v44 = malloc(8);
-    *(void**)v44 = (void*)v43;
-    v46 = 0LL;
-    v47 = malloc(8);
-    *(int64_t*)v47 = (int64_t)v46;
-    v50 = *(void**)v44;
-    v51 = *(int64_t*)v50;
-    *(int64_t*)v47 = (int64_t)v51;
-    v54 = *(int64_t*)v47;
-    v55 = 0LL;
-    v56 = v54 != v55;
-    v57 = *(int64_t*)v47;
-    v58 = 1LL;
-    v59 = -v58;
-    v60 = v57 != v59;
-    v61 = v56 && v60;
-    p_call_stack_pop();
-    return v61;
-    return 0;
-}
-
-int64_t p_str_compare(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("p_str_compare");
-    int64_t v41;
-    bool v16;
-    int64_t v10; /* placeholder for void */
-    int64_t v8;
-    int64_t v19; /* placeholder for void */
-    int64_t v42;
-    int64_t v54;
-    int64_t v57; /* placeholder for void */
-    int64_t v58;
-    int64_t v60;
-    int64_t v63;
-    int64_t v31; /* placeholder for void */
-    int64_t v67; /* placeholder for void */
-    int64_t v69; /* placeholder for void */
-    void* v70;
-    int64_t v6; /* placeholder for void */
-    int64_t v75; /* placeholder for void */
-    int64_t v65; /* placeholder for void */
-    bool v3;
-    int64_t v25;
-    void* v23;
-    void* v26;
-    int64_t v52; /* placeholder for void */
-    int64_t v7; /* placeholder for void */
-    int64_t v14; /* placeholder for void */
-    int64_t v56; /* placeholder for void */
-    int64_t v61; /* placeholder for void */
-    bool v9;
-    int64_t v17; /* placeholder for void */
-    int64_t v44;
-    int64_t v62;
-    int64_t v66;
-    int64_t v76; /* placeholder for void */
-    int64_t v80; /* placeholder for void */
-    int64_t v4; /* placeholder for void */
-    int64_t v35; /* placeholder for void */
-    int64_t v28;
-    int64_t v24; /* placeholder for void */
-    uint8_t v71;
-    void* v29;
-    bool v46;
-    bool v47;
-    void* v36;
-    int64_t v5;
-    int64_t v20; /* placeholder for void */
-    int64_t v79;
-    bool v51;
-    int64_t v12;
-    uint8_t v37;
-    int64_t v68;
-    int64_t v40; /* placeholder for void */
-    int64_t v45;
-    int64_t v59;
-    int64_t v30; /* placeholder for void */
-    bool v43;
-    int64_t v64;
-    int64_t v78;
-    int64_t v81; /* placeholder for void */
-    int64_t v50;
-    int64_t v49;
-    void* v32;
-    int64_t v39; /* placeholder for void */
-    int64_t v53;
-    void* v38;
-    int64_t v11;
-    int64_t v27; /* placeholder for void */
-    void* v21;
-    int64_t v72; /* placeholder for void */
-    int64_t v48; /* placeholder for void */
-    uint8_t v33;
-    void* v73;
-    uint8_t v74;
-    int64_t v55;
-    int64_t v77;
-    int64_t v15;
-    int64_t v13; /* placeholder for void */
-    void* v34;
-    int64_t v18;
-    int64_t v22; /* placeholder for void */
-    v3 = v1 == v2;
-    if (v3) goto bb1;
-    else goto bb2;
-  bb1:
-    v5 = 0LL;
-    p_call_stack_pop();
-    return v5;
-  bb2:
-    goto bb3;
-  bb3:
-    v8 = 0LL;
-    v9 = v1 == v8;
-    if (v9) goto bb4;
-    else goto bb5;
+    v47 = 0LL;
+    v48 = malloc(8);
+    *(int64_t*)v48 = (int64_t)v47;
+    goto bb4;
   bb4:
-    v11 = 1LL;
-    v12 = -v11;
-    p_call_stack_pop();
-    return v12;
+    v51 = *(int64_t*)v48;
+    v52 = *(int64_t*)v13;
+    v53 = v51 < v52;
+    if (v53) goto bb5;
+    else goto bb6;
   bb5:
-    goto bb6;
-  bb6:
-    v15 = 0LL;
-    v16 = v2 == v15;
-    if (v16) goto bb7;
+    v55 = *(int64_t*)v16;
+    v56 = *(int64_t*)v48;
+    v57 = 8LL;
+    v58 = v56 * v57;
+    v59 = v55 + v58;
+    v60 = malloc(8);
+    *(int64_t*)v60 = (int64_t)v59;
+    v62 = *(int64_t*)v60;
+    v63 = malloc(8);
+    *(void**)v63 = (void*)v62;
+    v65 = 0LL;
+    v66 = malloc(8);
+    *(int64_t*)v66 = (int64_t)v65;
+    v69 = *(void**)v63;
+    v70 = *(int64_t*)v69;
+    *(int64_t*)v66 = (int64_t)v70;
+    v73 = *(int64_t*)v66;
+    v74 = 0LL;
+    v75 = v73 != v74;
+    v76 = *(int64_t*)v66;
+    v77 = 1LL;
+    v78 = -v77;
+    v79 = v76 != v78;
+    v80 = v75 && v79;
+    if (v80) goto bb7;
     else goto bb8;
-  bb7:
-    v18 = 1LL;
+  bb6:
+    v111 = *(int64_t*)v34;
     p_call_stack_pop();
-    return v18;
+    return v111;
+  bb7:
+    v82 = *(int64_t*)v19;
+    v83 = *(int64_t*)v48;
+    v84 = 8LL;
+    v85 = v83 * v84;
+    v86 = v82 + v85;
+    v87 = malloc(8);
+    *(int64_t*)v87 = (int64_t)v86;
+    v89 = *(int64_t*)v87;
+    v90 = malloc(8);
+    *(void**)v90 = (void*)v89;
+    v92 = 0LL;
+    v93 = malloc(8);
+    *(int64_t*)v93 = (int64_t)v92;
+    v96 = *(void**)v90;
+    v97 = *(int64_t*)v96;
+    *(int64_t*)v93 = (int64_t)v97;
+    v100 = *(int64_t*)v34;
+    v101 = *(int64_t*)v93;
+    v102 = 0LL;
+    Vec_push((void*)v102, v100, v101);
+    goto bb9;
   bb8:
     goto bb9;
   bb9:
-    v21 = malloc(8);
-    *(int64_t*)v21 = (int64_t)v1;
-    v23 = malloc(8);
-    *(int64_t*)v23 = (int64_t)v2;
-    v25 = *(int64_t*)v21;
-    v26 = malloc(8);
-    *(void**)v26 = (void*)v25;
-    v28 = *(int64_t*)v23;
-    v29 = malloc(8);
-    *(void**)v29 = (void*)v28;
-    v32 = *(void**)v26;
-    v33 = *(uint8_t*)v32;
-    v34 = malloc(8);
-    *(int64_t*)v34 = (int64_t)v33;
-    v36 = *(void**)v29;
-    v37 = *(uint8_t*)v36;
-    v38 = malloc(8);
-    *(int64_t*)v38 = (int64_t)v37;
-    goto bb10;
-  bb10:
-    v41 = *(int64_t*)v34;
-    v42 = 0LL;
-    v43 = v41 != v42;
-    v44 = *(int64_t*)v38;
-    v45 = 0LL;
-    v46 = v44 != v45;
-    v47 = v43 && v46;
-    if (v47) goto bb11;
-    else goto bb12;
-  bb11:
-    v49 = *(int64_t*)v34;
-    v50 = *(int64_t*)v38;
-    v51 = v49 != v50;
-    if (v51) goto bb13;
-    else goto bb14;
-  bb12:
-    v77 = *(int64_t*)v34;
-    v78 = *(int64_t*)v38;
-    v79 = v77 - v78;
-    p_call_stack_pop();
-    return v79;
-  bb13:
-    v53 = *(int64_t*)v34;
-    v54 = *(int64_t*)v38;
-    v55 = v53 - v54;
-    p_call_stack_pop();
-    return v55;
-  bb14:
-    goto bb15;
-  bb15:
-    v58 = *(int64_t*)v21;
-    v59 = 1LL;
-    v60 = v58 + v59;
-    *(int64_t*)v21 = (int64_t)v60;
-    v62 = *(int64_t*)v23;
-    v63 = 1LL;
-    v64 = v62 + v63;
-    *(int64_t*)v23 = (int64_t)v64;
-    v66 = *(int64_t*)v21;
-    *(void**)v26 = (void*)v66;
-    v68 = *(int64_t*)v23;
-    *(void**)v29 = (void*)v68;
-    v70 = *(void**)v26;
-    v71 = *(uint8_t*)v70;
-    *(int64_t*)v34 = (int64_t)v71;
-    v73 = *(void**)v29;
-    v74 = *(uint8_t*)v73;
-    *(int64_t*)v38 = (int64_t)v74;
-    goto bb10;
+    v106 = *(int64_t*)v48;
+    v107 = 1LL;
+    v108 = v106 + v107;
+    *(int64_t*)v48 = (int64_t)v108;
+    goto bb4;
     return 0;
 }
 
-int64_t Option_expect(void* v0, void* v1, void* v2) {
-    p_call_stack_push("Option_expect");
-    int64_t v10; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    int64_t v5;
-    int64_t v17; /* placeholder for void */
-    bool v6;
-    void* v3;
-    bool v14;
-    void* v8;
-    int64_t v7; /* placeholder for void */
-    void* v11;
-    int64_t v15; /* placeholder for void */
-    int64_t v4;
-    int64_t v13;
-    int64_t v16; /* placeholder for void */
-    int64_t v19;
-    int64_t v12;
-    int64_t v20; /* placeholder for void */
-    int64_t v9;
-    v3 = (char*)v1 + 0;
-    v4 = *(int64_t*)v3;
-    v5 = 0LL;
-    v6 = v4 == v5;
-    if (v6) goto bb2;
-    else goto bb3;
-  bb1:
-    v19 = 0LL;
+void* create_allocator(void* v0, void* v1) {
+    p_call_stack_push("create_allocator");
+    void* v2;
+    int64_t v3; /* placeholder for void */
+    v2 = p_allocator_create(v1);
     p_call_stack_pop();
-    return v19;
-  bb2:
-    v8 = (char*)v1 + 8;
-    v9 = *(int64_t*)v8;
-    p_call_stack_pop();
-    return v9;
-  bb3:
-    v11 = (char*)v1 + 0;
-    v12 = *(int64_t*)v11;
-    v13 = 1LL;
-    v14 = v12 == v13;
-    if (v14) goto bb4;
-    else goto bb5;
-  bb4:
-    p_panic(v2);
-    goto bb1;
-  bb5:
-    goto bb1;
+    return v2;
     return 0;
 }
 
-int64_t str_parse_int(void* v0, void* v1) {
-    p_call_stack_push("str_parse_int");
-    int64_t v3;
-    int64_t v4; /* placeholder for void */
-    int64_t v2;
-    v2 = 0LL;
-    v3 = (int64_t)String_parse_int((void*)v2, (int64_t)v1);
-    p_call_stack_pop();
-    return v3;
-    return 0;
-}
-
-bool str_is_empty(void* v0, void* v1) {
-    p_call_stack_push("str_is_empty");
-    int64_t v4; /* placeholder for void */
-    int64_t v2;
-    bool v3;
-    v2 = 0LL;
-    v3 = (bool)String_is_empty((void*)v2, (int64_t)v1);
-    p_call_stack_pop();
-    return v3;
-    return 0;
-}
-
-int64_t HashMap_get(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("HashMap_get");
-    int64_t v6; /* placeholder for void */
-    void* v32;
-    int64_t v72; /* placeholder for void */
-    int64_t v58;
-    int64_t v16;
-    void* v29;
-    int64_t v46;
-    int64_t v96;
-    int64_t v66;
-    void* v26;
-    int64_t v51;
-    int64_t v4;
-    void* v8;
-    bool v56;
-    int64_t v33;
-    void* v86;
-    int64_t v13; /* placeholder for void */
-    int64_t v85;
-    int64_t v3;
-    int64_t v69; /* placeholder for void */
-    int64_t v57;
-    int64_t v18; /* placeholder for void */
-    void* v74;
-    int64_t v23;
-    int64_t v55;
-    int64_t v64; /* placeholder for void */
-    int64_t v12;
-    int64_t v35; /* placeholder for void */
-    int64_t v52; /* placeholder for void */
-    void* v89;
-    int64_t v80;
-    int64_t v67;
-    int64_t v53; /* placeholder for void */
-    int64_t v49; /* placeholder for void */
-    int64_t v7;
-    int64_t v37;
-    int64_t v42; /* placeholder for void */
-    int64_t v10; /* placeholder for void */
-    void* v24;
-    void* v47;
-    bool v61;
-    void* v41;
-    int64_t v38;
-    int64_t v40;
-    bool v17;
-    int64_t v76; /* placeholder for void */
-    int64_t v95; /* placeholder for void */
-    int64_t v48; /* placeholder for void */
-    int64_t v45; /* placeholder for void */
-    int64_t v84; /* placeholder for void */
-    int64_t v97; /* placeholder for void */
-    int64_t v28;
-    bool v60;
-    int64_t v20; /* placeholder for void */
-    int64_t v30; /* placeholder for void */
-    void* v68;
-    int64_t v22;
-    int64_t v54;
-    int64_t v34; /* placeholder for void */
-    int64_t v25; /* placeholder for void */
-    int64_t v14; /* placeholder for void */
+int64_t Vec_first(void* v0, int64_t v1) {
+    p_call_stack_push("Vec_first");
+    int64_t v14;
     int64_t v21; /* placeholder for void */
-    void* v50;
-    void* v11;
-    int64_t v59;
-    int64_t v36;
-    int64_t v62; /* placeholder for void */
-    int64_t v63;
-    int64_t v65; /* placeholder for void */
-    int64_t v91; /* placeholder for void */
-    int64_t v87; /* placeholder for void */
-    void* v92;
-    int64_t v78;
-    void* v71;
-    int64_t v27; /* placeholder for void */
-    int64_t v43;
-    int64_t v79;
-    int64_t v73; /* placeholder for void */
-    int64_t v70;
-    int64_t v90; /* placeholder for void */
+    int64_t v11;
+    int64_t v19; /* placeholder for void */
+    int64_t v30; /* placeholder for void */
+    int64_t v34; /* placeholder for void */
+    void* v10;
+    int64_t v38; /* placeholder for void */
+    bool v16;
+    void* v32;
+    void* v35;
+    int64_t v40; /* placeholder for void */
+    int64_t v5; /* placeholder for void */
+    void* v18;
     int64_t v15;
-    int64_t v93;
-    int64_t v19;
-    void* v44;
-    int64_t v31; /* placeholder for void */
-    int64_t v81;
-    int64_t v88;
+    int64_t v20; /* placeholder for void */
+    int64_t v23; /* placeholder for void */
+    void* v6;
+    int64_t v3;
     int64_t v9; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    int64_t v25;
+    int64_t v26; /* placeholder for void */
+    int64_t v28;
+    int64_t v33; /* placeholder for void */
+    int64_t v37; /* placeholder for void */
+    int64_t v7; /* placeholder for void */
+    int64_t v27; /* placeholder for void */
     int64_t v39;
-    int64_t v77; /* placeholder for void */
-    int64_t v82;
-    void* v83;
-    int64_t v75;
-    int64_t v94; /* placeholder for void */
-    void* v5;
-    v3 = 24LL;
-    v4 = v1 + v3;
-    v5 = malloc(8);
-    *(void**)v5 = (void*)v4;
-    v7 = 0LL;
+    int64_t v2;
+    void* v4;
+    int64_t v17; /* placeholder for void */
+    void* v22;
+    int64_t v31;
+    int64_t v13; /* placeholder for void */
+    int64_t v36;
+    void* v29;
+    void* v8;
+    void* v24;
+    v2 = 8LL;
+    v3 = v1 + v2;
+    v4 = malloc(8);
+    *(void**)v4 = (void*)v3;
+    v6 = malloc(8);
+    *(void**)v6 = (void*)v1;
     v8 = malloc(8);
-    *(int64_t*)v8 = (int64_t)v7;
-    v11 = *(void**)v5;
-    v12 = *(int64_t*)v11;
-    *(int64_t*)v8 = (int64_t)v12;
-    v15 = *(int64_t*)v8;
-    v16 = 0LL;
-    v17 = v15 == v16;
-    if (v17) goto bb1;
+    v10 = *(void**)v4;
+    v11 = *(int64_t*)v10;
+    *(int64_t*)v8 = (int64_t)v11;
+    v14 = *(int64_t*)v8;
+    v15 = 0LL;
+    v16 = v14 == v15;
+    if (v16) goto bb1;
     else goto bb2;
   bb1:
-    v19 = 0LL;
-    p_call_stack_pop();
-    return v19;
+    v18 = _str3;
+    p_panic(v18);
+    goto bb3;
   bb2:
     goto bb3;
   bb3:
-    v22 = 0LL;
-    v23 = (int64_t)HashMap_find_slot((void*)v22, v1, v2);
-    v24 = malloc(8);
-    *(int64_t*)v24 = (int64_t)v23;
-    v26 = malloc(8);
-    *(void**)v26 = (void*)v1;
-    v28 = 0LL;
+    v22 = malloc(8);
+    v24 = *(void**)v6;
+    v25 = *(int64_t*)v24;
+    *(int64_t*)v22 = (int64_t)v25;
+    v28 = *(int64_t*)v22;
     v29 = malloc(8);
-    *(int64_t*)v29 = (int64_t)v28;
-    v32 = *(void**)v26;
-    v33 = *(int64_t*)v32;
-    *(int64_t*)v29 = (int64_t)v33;
-    v36 = *(int64_t*)v29;
-    v37 = *(int64_t*)v24;
-    v38 = 8LL;
-    v39 = v37 * v38;
-    v40 = v36 + v39;
-    v41 = malloc(8);
-    *(int64_t*)v41 = (int64_t)v40;
-    v43 = *(int64_t*)v41;
-    v44 = malloc(8);
-    *(void**)v44 = (void*)v43;
-    v46 = 0LL;
-    v47 = malloc(8);
-    *(int64_t*)v47 = (int64_t)v46;
-    v50 = *(void**)v44;
-    v51 = *(int64_t*)v50;
-    *(int64_t*)v47 = (int64_t)v51;
-    v54 = *(int64_t*)v47;
-    v55 = 0LL;
-    v56 = v54 == v55;
-    v57 = *(int64_t*)v47;
-    v58 = 1LL;
-    v59 = -v58;
-    v60 = v57 == v59;
-    v61 = v56 || v60;
-    if (v61) goto bb4;
-    else goto bb5;
-  bb4:
-    v63 = 0LL;
+    *(void**)v29 = (void*)v28;
+    v31 = 0LL;
+    v32 = malloc(8);
+    *(int64_t*)v32 = (int64_t)v31;
+    v35 = *(void**)v29;
+    v36 = *(int64_t*)v35;
+    *(int64_t*)v32 = (int64_t)v36;
+    v39 = *(int64_t*)v32;
     p_call_stack_pop();
-    return v63;
-  bb5:
-    goto bb6;
-  bb6:
-    v66 = 8LL;
-    v67 = v1 + v66;
-    v68 = malloc(8);
-    *(void**)v68 = (void*)v67;
-    v70 = 0LL;
-    v71 = malloc(8);
-    *(int64_t*)v71 = (int64_t)v70;
-    v74 = *(void**)v68;
-    v75 = *(int64_t*)v74;
-    *(int64_t*)v71 = (int64_t)v75;
-    v78 = *(int64_t*)v71;
-    v79 = *(int64_t*)v24;
-    v80 = 8LL;
-    v81 = v79 * v80;
-    v82 = v78 + v81;
-    v83 = malloc(8);
-    *(int64_t*)v83 = (int64_t)v82;
-    v85 = *(int64_t*)v83;
-    v86 = malloc(8);
-    *(void**)v86 = (void*)v85;
-    v88 = 0LL;
-    v89 = malloc(8);
-    *(int64_t*)v89 = (int64_t)v88;
-    v92 = *(void**)v86;
-    v93 = *(int64_t*)v92;
-    *(int64_t*)v89 = (int64_t)v93;
-    v96 = *(int64_t*)v89;
-    p_call_stack_pop();
-    return v96;
+    return v39;
     return 0;
-}
-
-void Option_or_else(void* v0, void* v1, void* v2, void* v3) {
-    p_call_stack_push("Option_or_else");
-    void* v4;
-    void* v15;
-    int64_t v25; /* placeholder for void */
-    int64_t v19;
-    int64_t v34; /* placeholder for void */
-    void* v11;
-    void* v31;
-    int64_t v12;
-    void* v33;
-    int64_t v27;
-    int64_t v37; /* placeholder for void */
-    int64_t v6;
-    int64_t v46; /* placeholder for void */
-    void* v22;
-    void* v43;
-    void* v17;
-    int64_t v8; /* placeholder for void */
-    void* v36;
-    void* v26;
-    void* v13;
-    int64_t v14; /* placeholder for void */
-    int64_t v10;
-    int64_t v45; /* placeholder for void */
-    int64_t v47; /* placeholder for void */
-    bool v29;
-    int64_t v20; /* placeholder for void */
-    int64_t v24; /* placeholder for void */
-    bool v7;
-    int64_t v30; /* placeholder for void */
-    void* v9;
-    void* v42;
-    int64_t v48; /* placeholder for void */
-    int64_t v5;
-    void* v18;
-    int64_t v23;
-    int64_t v28;
-    int64_t v35;
-    int64_t v16; /* placeholder for void */
-    void* v39;
-    int64_t v40;
-    int64_t v41; /* placeholder for void */
-    void* v38;
-    int64_t v44;
-    int64_t v32;
-    void* v21;
-    v4 = (char*)v2 + 0;
-    v5 = *(int64_t*)v4;
-    v6 = 0LL;
-    v7 = v5 == v6;
-    if (v7) goto bb2;
-    else goto bb3;
-  bb1:
-    p_call_stack_pop();
-    return;
-  bb2:
-    v9 = (char*)v2 + 8;
-    v10 = *(int64_t*)v9;
-    v11 = malloc(16);
-    v12 = 0LL;
-    v13 = (char*)v11 + 0;
-    *(int64_t*)v13 = (int64_t)v12;
-    v15 = (char*)v11 + 8;
-    *(int64_t*)v15 = (int64_t)v10;
-    v17 = (char*)v11 + 0;
-    v18 = (char*)v0 + 0;
-    v19 = *(int64_t*)v17;
-    *(int64_t*)v18 = (int64_t)v19;
-    v21 = (char*)v11 + 8;
-    v22 = (char*)v0 + 8;
-    v23 = *(int64_t*)v21;
-    *(int64_t*)v22 = (int64_t)v23;
-    p_call_stack_pop();
-    return;
-  bb3:
-    v26 = (char*)v2 + 0;
-    v27 = *(int64_t*)v26;
-    v28 = 1LL;
-    v29 = v27 == v28;
-    if (v29) goto bb4;
-    else goto bb5;
-  bb4:
-    v31 = malloc(16);
-    v32 = 0LL;
-    v33 = (char*)v31 + 0;
-    *(int64_t*)v33 = (int64_t)v32;
-    {
-        if (!v3) abort();
-        char* _fn_name = *(char**)v3;
-        if (!_fn_name) abort();
-        if (strcmp(_fn_name, "Vec_new") == 0) {
-            v35 = Vec_new((void*)v3);
-        } else if (strcmp(_fn_name, "HashMap_new") == 0) {
-            v35 = HashMap_new((void*)v3);
-        } else { abort(); }
-    }
-    v36 = (char*)v31 + 8;
-    *(int64_t*)v36 = (int64_t)v35;
-    v38 = (char*)v31 + 0;
-    v39 = (char*)v0 + 0;
-    v40 = *(int64_t*)v38;
-    *(int64_t*)v39 = (int64_t)v40;
-    v42 = (char*)v31 + 8;
-    v43 = (char*)v0 + 8;
-    v44 = *(int64_t*)v42;
-    *(int64_t*)v43 = (int64_t)v44;
-    p_call_stack_pop();
-    return;
-  bb5:
-    goto bb1;
-    return;
-}
-
-void println(void* v0, void* v1) {
-    p_call_stack_push("println");
-    int64_t v5; /* placeholder for void */
-    int64_t v2; /* placeholder for void */
-    void* v3;
-    int64_t v4; /* placeholder for void */
-    p_print_str(v1);
-    v3 = _str12;
-    p_print_str(v3);
-    p_call_stack_pop();
-    return;
-    return;
 }
 
 void HashMap_grow(void* v0, int64_t v1) {
     p_call_stack_push("HashMap_grow");
-    void* v211;
-    bool v226;
-    bool v67;
-    void* v84;
-    int64_t v221;
-    void* v37;
-    int64_t v38; /* placeholder for void */
-    int64_t v55;
-    void* v271;
-    int64_t v192; /* placeholder for void */
-    int64_t v71;
-    void* v14;
-    int64_t v128;
-    int64_t v108; /* placeholder for void */
-    int64_t v54; /* placeholder for void */
-    int64_t v188; /* placeholder for void */
-    int64_t v278; /* placeholder for void */
-    int64_t v73;
-    int64_t v247; /* placeholder for void */
-    int64_t v57;
-    int64_t v72;
+    int64_t v254; /* placeholder for void */
+    int64_t v172;
+    int64_t v21; /* placeholder for void */
+    int64_t v173;
+    int64_t v257;
     void* v74;
-    bool v137;
-    int64_t v237;
-    int64_t v160;
-    int64_t v234;
-    int64_t v239;
-    int64_t v224;
+    int64_t v66;
+    int64_t v219; /* placeholder for void */
+    int64_t v207;
+    int64_t v251; /* placeholder for void */
+    int64_t v76;
+    int64_t v159;
     int64_t v230; /* placeholder for void */
+    bool v67;
+    void* v199;
+    int64_t v8;
+    int64_t v202; /* placeholder for void */
+    int64_t v13;
+    void* v161;
+    void* v4;
+    int64_t v201; /* placeholder for void */
+    int64_t v220;
+    int64_t v107; /* placeholder for void */
+    int64_t v97;
+    int64_t v264; /* placeholder for void */
+    int64_t v266;
+    bool v174;
+    int64_t v12;
+    int64_t v85; /* placeholder for void */
+    int64_t v91;
+    int64_t v24; /* placeholder for void */
+    int64_t v223; /* placeholder for void */
+    int64_t v57;
+    int64_t v116;
+    int64_t v128;
+    int64_t v9;
+    int64_t v136;
+    int64_t v27;
+    int64_t v142;
+    int64_t v262; /* placeholder for void */
+    int64_t v256;
+    void* v77;
+    int64_t v212; /* placeholder for void */
     int64_t v276; /* placeholder for void */
-    int64_t v175; /* placeholder for void */
+    int64_t v44;
+    void* v271;
+    int64_t v80;
+    int64_t v92; /* placeholder for void */
+    int64_t v158;
+    int64_t v216; /* placeholder for void */
+    int64_t v150;
+    void* v93;
+    int64_t v213; /* placeholder for void */
+    int64_t v240; /* placeholder for void */
+    void* v17;
+    int64_t v239;
+    int64_t v75; /* placeholder for void */
+    int64_t v63; /* placeholder for void */
+    int64_t v182; /* placeholder for void */
+    void* v62;
+    int64_t v68; /* placeholder for void */
+    int64_t v95; /* placeholder for void */
+    void* v118;
+    int64_t v135;
+    int64_t v167; /* placeholder for void */
+    int64_t v235; /* placeholder for void */
+    int64_t v241; /* placeholder for void */
+    int64_t v275;
+    int64_t v60; /* placeholder for void */
+    int64_t v168;
+    int64_t v278; /* placeholder for void */
+    int64_t v39;
+    int64_t v248;
+    int64_t v198; /* placeholder for void */
+    void* v148;
+    int64_t v176;
+    int64_t v203;
+    int64_t v28; /* placeholder for void */
+    int64_t v22;
+    int64_t v96; /* placeholder for void */
+    int64_t v215;
+    int64_t v82;
+    void* v145;
+    void* v23;
+    int64_t v89; /* placeholder for void */
+    int64_t v228;
+    void* v59;
+    int64_t v109;
+    void* v187;
+    void* v274;
+    int64_t v105;
+    int64_t v221;
+    int64_t v114;
+    int64_t v193; /* placeholder for void */
+    int64_t v183;
+    int64_t v25; /* placeholder for void */
+    void* v214;
+    void* v52;
+    int64_t v263; /* placeholder for void */
+    int64_t v38; /* placeholder for void */
+    int64_t v42; /* placeholder for void */
+    int64_t v189; /* placeholder for void */
+    bool v226;
+    int64_t v245;
+    int64_t v260;
+    int64_t v194;
+    int64_t v33;
+    bool v196;
+    int64_t v71;
+    int64_t v163;
+    int64_t v16;
+    int64_t v98;
+    bool v41;
+    void* v181;
+    bool v133;
+    int64_t v113;
+    int64_t v234;
+    void* v265;
+    void* v268;
+    int64_t v112; /* placeholder for void */
+    int64_t v222;
+    int64_t v35; /* placeholder for void */
+    int64_t v243;
+    int64_t v5; /* placeholder for void */
+    int64_t v31; /* placeholder for void */
+    int64_t v129; /* placeholder for void */
+    int64_t v170; /* placeholder for void */
+    int64_t v244;
+    int64_t v83;
+    int64_t v195;
+    int64_t v210;
+    int64_t v171; /* placeholder for void */
+    int64_t v200;
+    void* v90;
+    int64_t v255; /* placeholder for void */
+    int64_t v140;
+    int64_t v79;
+    int64_t v104; /* placeholder for void */
+    int64_t v70;
+    void* v127;
+    int64_t v259; /* placeholder for void */
+    int64_t v120;
+    int64_t v86;
+    int64_t v188; /* placeholder for void */
+    int64_t v269;
+    void* v37;
+    int64_t v277; /* placeholder for void */
+    int64_t v115;
+    int64_t v165;
+    void* v10;
+    int64_t v88; /* placeholder for void */
+    int64_t v218; /* placeholder for void */
+    int64_t v131;
+    int64_t v233;
+    int64_t v236; /* placeholder for void */
+    void* v121;
+    int64_t v206;
+    void* v14;
+    int64_t v81;
+    int64_t v108; /* placeholder for void */
+    int64_t v180;
+    int64_t v125; /* placeholder for void */
+    int64_t v99;
+    int64_t v122; /* placeholder for void */
+    int64_t v30;
+    int64_t v224;
+    int64_t v155;
+    int64_t v55;
+    int64_t v15; /* placeholder for void */
+    int64_t v130; /* placeholder for void */
+    int64_t v11; /* placeholder for void */
+    void* v6;
+    int64_t v36;
+    void* v58;
+    int64_t v72;
+    void* v87;
+    int64_t v156; /* placeholder for void */
+    int64_t v192; /* placeholder for void */
+    void* v53;
+    int64_t v139; /* placeholder for void */
+    int64_t v7; /* placeholder for void */
+    void* v84;
+    bool v138;
+    void* v151;
+    int64_t v157; /* placeholder for void */
+    int64_t v185; /* placeholder for void */
+    void* v208;
+    int64_t v249;
+    int64_t v65;
+    void* v169;
+    int64_t v143;
+    int64_t v34; /* placeholder for void */
+    int64_t v94;
+    int64_t v78; /* placeholder for void */
+    int64_t v146; /* placeholder for void */
+    int64_t v231; /* placeholder for void */
+    int64_t v126; /* placeholder for void */
     int64_t v69;
+    int64_t v144;
+    int64_t v209; /* placeholder for void */
+    int64_t v110;
+    int64_t v101; /* placeholder for void */
+    int64_t v178;
+    int64_t v54; /* placeholder for void */
+    int64_t v64; /* placeholder for void */
+    int64_t v175; /* placeholder for void */
+    int64_t v217; /* placeholder for void */
+    int64_t v56;
+    int64_t v247; /* placeholder for void */
+    int64_t v237;
+    int64_t v119; /* placeholder for void */
+    int64_t v164;
+    bool v137;
+    int64_t v179;
+    int64_t v227; /* placeholder for void */
+    int64_t v147;
+    int64_t v149; /* placeholder for void */
+    int64_t v3;
+    int64_t v273; /* placeholder for void */
+    int64_t v153; /* placeholder for void */
+    void* v190;
+    int64_t v229; /* placeholder for void */
+    int64_t v51;
+    int64_t v252;
+    int64_t v47; /* placeholder for void */
+    void* v20;
+    int64_t v134;
+    int64_t v2;
+    int64_t v132;
     int64_t v205;
+    int64_t v48; /* placeholder for void */
+    int64_t v253; /* placeholder for void */
+    void* v184;
+    bool v258;
+    int64_t v73;
+    int64_t v242; /* placeholder for void */
+    void* v26;
+    void* v211;
+    int64_t v49;
+    int64_t v267; /* placeholder for void */
+    int64_t v204;
+    int64_t v160;
+    int64_t v123;
+    int64_t v191;
+    bool v111;
+    int64_t v50;
+    bool v250;
+    void* v166;
+    void* v154;
+    int64_t v232;
+    int64_t v61;
+    int64_t v46; /* placeholder for void */
+    int64_t v261; /* placeholder for void */
+    int64_t v40;
+    int64_t v43;
+    void* v103;
+    void* v29;
+    int64_t v225;
+    int64_t v270; /* placeholder for void */
+    int64_t v45;
     int64_t v19;
     int64_t v238;
-    int64_t v172;
-    int64_t v170; /* placeholder for void */
-    int64_t v163;
-    int64_t v56;
-    void* v17;
-    void* v93;
-    int64_t v122; /* placeholder for void */
-    void* v103;
-    void* v145;
-    int64_t v180;
-    int64_t v126; /* placeholder for void */
-    void* v268;
-    int64_t v217; /* placeholder for void */
-    int64_t v109;
-    void* v53;
-    int64_t v248;
-    int64_t v43;
-    int64_t v212; /* placeholder for void */
-    int64_t v16;
-    int64_t v65;
-    int64_t v132;
-    int64_t v11; /* placeholder for void */
-    int64_t v168;
-    int64_t v80;
-    int64_t v81;
-    int64_t v31; /* placeholder for void */
-    int64_t v113;
-    int64_t v209; /* placeholder for void */
-    int64_t v176;
-    int64_t v117;
-    int64_t v5; /* placeholder for void */
-    void* v52;
-    int64_t v232;
-    int64_t v223; /* placeholder for void */
-    int64_t v51;
-    int64_t v203;
-    int64_t v193; /* placeholder for void */
-    int64_t v253; /* placeholder for void */
-    int64_t v241; /* placeholder for void */
-    int64_t v61;
-    int64_t v78; /* placeholder for void */
-    int64_t v83;
-    int64_t v252;
-    int64_t v107; /* placeholder for void */
-    int64_t v146; /* placeholder for void */
-    int64_t v76;
-    int64_t v120;
-    void* v208;
-    int64_t v222;
-    int64_t v95; /* placeholder for void */
-    int64_t v36;
-    int64_t v66;
-    int64_t v225;
-    int64_t v246; /* placeholder for void */
-    int64_t v125; /* placeholder for void */
-    void* v148;
-    int64_t v110;
-    void* v23;
-    int64_t v101; /* placeholder for void */
-    int64_t v64; /* placeholder for void */
-    int64_t v104; /* placeholder for void */
-    void* v151;
-    int64_t v254; /* placeholder for void */
-    int64_t v197; /* placeholder for void */
-    int64_t v277; /* placeholder for void */
-    int64_t v236; /* placeholder for void */
-    int64_t v42; /* placeholder for void */
-    int64_t v98;
-    int64_t v92; /* placeholder for void */
-    int64_t v114;
-    void* v154;
-    int64_t v244;
-    int64_t v194;
-    int64_t v70;
-    int64_t v164;
-    void* v90;
-    int64_t v155;
-    int64_t v33;
-    bool v174;
-    int64_t v129; /* placeholder for void */
-    int64_t v179;
-    int64_t v63; /* placeholder for void */
-    int64_t v202; /* placeholder for void */
-    int64_t v255; /* placeholder for void */
-    int64_t v28; /* placeholder for void */
-    int64_t v112; /* placeholder for void */
-    int64_t v46; /* placeholder for void */
-    int64_t v156; /* placeholder for void */
-    int64_t v182; /* placeholder for void */
-    int64_t v219; /* placeholder for void */
-    int64_t v227; /* placeholder for void */
-    void* v77;
-    int64_t v13;
-    int64_t v159;
-    int64_t v100; /* placeholder for void */
-    int64_t v153; /* placeholder for void */
-    void* v161;
-    int64_t v119; /* placeholder for void */
-    int64_t v135;
-    int64_t v89; /* placeholder for void */
-    void* v184;
-    void* v121;
-    int64_t v210;
-    void* v190;
-    bool v138;
-    int64_t v48; /* placeholder for void */
-    void* v274;
-    int64_t v21; /* placeholder for void */
-    int64_t v233;
-    bool v133;
-    int64_t v2;
-    int64_t v263; /* placeholder for void */
-    int64_t v99;
-    int64_t v35; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    void* v29;
-    int64_t v12;
-    int64_t v60; /* placeholder for void */
-    int64_t v79;
-    int64_t v198; /* placeholder for void */
-    int64_t v200;
-    int64_t v204;
-    void* v20;
-    int64_t v213; /* placeholder for void */
-    int64_t v228;
-    int64_t v8;
-    int64_t v191;
-    int64_t v94;
-    void* v127;
-    bool v258;
-    int64_t v82;
-    int64_t v257;
-    int64_t v24; /* placeholder for void */
-    int64_t v195;
-    int64_t v220;
-    int64_t v34; /* placeholder for void */
-    int64_t v7; /* placeholder for void */
-    int64_t v131;
-    int64_t v201; /* placeholder for void */
-    int64_t v96; /* placeholder for void */
-    void* v58;
-    int64_t v143;
-    int64_t v270; /* placeholder for void */
-    int64_t v273; /* placeholder for void */
-    int64_t v47; /* placeholder for void */
-    int64_t v88; /* placeholder for void */
-    void* v187;
-    int64_t v141;
-    void* v181;
-    int64_t v162; /* placeholder for void */
-    int64_t v140;
-    void* v169;
-    void* v214;
-    int64_t v256;
     int64_t v177;
-    int64_t v149; /* placeholder for void */
-    void* v62;
-    int64_t v15; /* placeholder for void */
-    int64_t v49;
-    int64_t v115;
-    int64_t v25; /* placeholder for void */
-    int64_t v136;
-    int64_t v259; /* placeholder for void */
-    int64_t v144;
-    int64_t v207;
-    int64_t v85; /* placeholder for void */
-    int64_t v171; /* placeholder for void */
-    int64_t v261; /* placeholder for void */
-    int64_t v142;
-    int64_t v275;
-    int64_t v27;
-    int64_t v240; /* placeholder for void */
-    int64_t v134;
-    int64_t v231; /* placeholder for void */
-    int64_t v251; /* placeholder for void */
-    int64_t v75; /* placeholder for void */
-    bool v111;
-    int64_t v249;
-    int64_t v105;
-    int64_t v130; /* placeholder for void */
-    int64_t v165;
-    void* v4;
-    int64_t v216; /* placeholder for void */
-    void* v265;
-    int64_t v206;
-    int64_t v260;
-    int64_t v50;
-    void* v6;
-    bool v41;
-    bool v196;
-    int64_t v68; /* placeholder for void */
+    int64_t v117;
+    int64_t v246; /* placeholder for void */
+    int64_t v18; /* placeholder for void */
     int64_t v102;
-    int64_t v30;
-    int64_t v178;
-    int64_t v183;
-    int64_t v147;
-    int64_t v158;
-    void* v59;
-    void* v10;
-    int64_t v39;
-    int64_t v218; /* placeholder for void */
     void* v106;
-    int64_t v269;
-    int64_t v152; /* placeholder for void */
-    void* v166;
-    int64_t v229; /* placeholder for void */
-    int64_t v40;
-    int64_t v272;
-    int64_t v264; /* placeholder for void */
     void* v32;
-    int64_t v186;
-    int64_t v267; /* placeholder for void */
-    int64_t v167; /* placeholder for void */
-    int64_t v173;
-    int64_t v235; /* placeholder for void */
-    int64_t v91;
-    int64_t v150;
-    int64_t v189; /* placeholder for void */
-    int64_t v97;
-    void* v118;
-    int64_t v139; /* placeholder for void */
-    void* v87;
-    int64_t v157; /* placeholder for void */
-    int64_t v243;
+    int64_t v141;
+    int64_t v162; /* placeholder for void */
+    int64_t v152; /* placeholder for void */
     void* v124;
-    int64_t v245;
-    int64_t v266;
-    int64_t v262; /* placeholder for void */
-    void* v26;
-    void* v199;
-    int64_t v22;
-    int64_t v86;
-    int64_t v185; /* placeholder for void */
-    int64_t v116;
-    bool v250;
-    int64_t v44;
-    int64_t v242; /* placeholder for void */
-    int64_t v45;
-    int64_t v215;
-    int64_t v3;
-    int64_t v123;
-    int64_t v9;
+    int64_t v186;
+    int64_t v272;
+    int64_t v197; /* placeholder for void */
+    int64_t v100; /* placeholder for void */
     v2 = 24LL;
     v3 = v1 + v2;
     v4 = malloc(8);
@@ -11829,641 +12794,1779 @@ void HashMap_grow(void* v0, int64_t v1) {
     return;
 }
 
-bool char_is_alpha(void* v0, int64_t v1) {
-    p_call_stack_push("char_is_alpha");
-    bool v5;
-    int64_t v7;
-    bool v8;
-    int64_t v2;
-    bool v11;
-    bool v12;
-    int64_t v13; /* placeholder for void */
-    int64_t v9;
-    bool v10;
-    bool v6;
+bool char_is_digit(void* v0, int64_t v1) {
+    p_call_stack_push("char_is_digit");
+    int64_t v7; /* placeholder for void */
     bool v3;
+    bool v5;
+    int64_t v2;
     int64_t v4;
-    v2 = 65LL;
+    bool v6;
+    v2 = 48LL;
     v3 = v1 >= v2;
-    v4 = 90LL;
+    v4 = 57LL;
     v5 = v1 <= v4;
     v6 = v3 && v5;
-    v7 = 97LL;
-    v8 = v1 >= v7;
-    v9 = 122LL;
-    v10 = v1 <= v9;
-    v11 = v8 && v10;
-    v12 = v6 || v11;
     p_call_stack_pop();
-    return v12;
+    return v6;
     return 0;
 }
 
-int64_t Vec_len(void* v0, int64_t v1) {
-    p_call_stack_push("Vec_len");
-    int64_t v10; /* placeholder for void */
-    int64_t v9;
-    int64_t v7; /* placeholder for void */
-    int64_t v5; /* placeholder for void */
-    int64_t v3;
-    void* v8;
-    int64_t v2;
-    void* v4;
-    int64_t v12;
-    int64_t v11; /* placeholder for void */
-    void* v6;
-    int64_t v13; /* placeholder for void */
-    v2 = 8LL;
-    v3 = v1 + v2;
-    v4 = malloc(8);
-    *(void**)v4 = (void*)v3;
-    v6 = malloc(8);
-    v8 = *(void**)v4;
-    v9 = *(int64_t*)v8;
-    *(int64_t*)v6 = (int64_t)v9;
-    v12 = *(int64_t*)v6;
-    p_call_stack_pop();
-    return v12;
-    return 0;
-}
-
-void StringBuilder_clear(void* v0, void* v1) {
-    p_call_stack_push("StringBuilder_clear");
-    int64_t v4; /* placeholder for void */
-    void* v2;
-    int64_t v8; /* placeholder for void */
-    void* v3;
-    int64_t v7; /* placeholder for void */
-    void* v5;
-    int64_t v6;
-    v2 = (char*)v1 + 0;
-    v3 = _str1;
-    *(void**)v2 = (void*)v3;
-    v5 = (char*)v1 + 8;
-    v6 = 0LL;
-    *(int64_t*)v5 = (int64_t)v6;
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-void Vec_extend(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("Vec_extend");
-    int64_t v33;
-    int64_t v38; /* placeholder for void */
-    int64_t v4;
-    int64_t v8; /* placeholder for void */
-    int64_t v10; /* placeholder for void */
-    int64_t v18;
-    int64_t v19; /* placeholder for void */
-    bool v27;
-    void* v5;
-    int64_t v12;
-    int64_t v20; /* placeholder for void */
-    int64_t v28; /* placeholder for void */
-    void* v34;
-    int64_t v35; /* placeholder for void */
-    int64_t v14; /* placeholder for void */
-    void* v37;
-    int64_t v42; /* placeholder for void */
-    void* v43;
-    int64_t v3;
+int64_t Vec_remove(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("Vec_remove");
     int64_t v44;
-    void* v9;
-    int64_t v13; /* placeholder for void */
-    int64_t v21;
-    int64_t v26;
-    void* v40;
-    int64_t v45; /* placeholder for void */
-    int64_t v36;
-    int64_t v46; /* placeholder for void */
-    void* v17;
-    int64_t v25;
-    int64_t v47;
-    int64_t v23; /* placeholder for void */
-    int64_t v50;
-    int64_t v51;
-    void* v11;
-    void* v15;
-    int64_t v52;
-    int64_t v55; /* placeholder for void */
-    void* v22;
-    int64_t v53; /* placeholder for void */
-    int64_t v41; /* placeholder for void */
-    int64_t v39;
-    int64_t v32;
-    int64_t v54; /* placeholder for void */
-    int64_t v49; /* placeholder for void */
+    int64_t v73;
+    void* v81;
+    void* v84;
+    int64_t v85;
+    int64_t v96; /* placeholder for void */
     int64_t v6; /* placeholder for void */
-    int64_t v29;
-    int64_t v48;
+    int64_t v64;
+    bool v23;
+    int64_t v21; /* placeholder for void */
+    int64_t v80;
+    int64_t v98;
+    void* v103;
+    int64_t v50; /* placeholder for void */
+    int64_t v8; /* placeholder for void */
+    int64_t v37;
+    int64_t v51; /* placeholder for void */
+    int64_t v53; /* placeholder for void */
+    int64_t v13; /* placeholder for void */
+    int64_t v54; /* placeholder for void */
+    int64_t v74;
+    int64_t v61;
+    void* v75;
+    int64_t v32;
+    int64_t v55;
+    int64_t v43; /* placeholder for void */
+    void* v48;
+    int64_t v62;
+    int64_t v57;
+    int64_t v68;
+    int64_t v70;
+    int64_t v89;
+    int64_t v92;
+    int64_t v87; /* placeholder for void */
+    void* v100;
+    void* v18;
+    int64_t v104;
+    void* v11;
+    int64_t v60; /* placeholder for void */
+    void* v42;
+    int64_t v69;
+    int64_t v105; /* placeholder for void */
+    int64_t v106; /* placeholder for void */
+    void* v5;
+    int64_t v56;
+    int64_t v97;
+    int64_t v28; /* placeholder for void */
+    int64_t v107;
+    int64_t v93;
+    int64_t v3;
+    int64_t v38;
+    int64_t v82; /* placeholder for void */
+    void* v39;
+    int64_t v49;
+    int64_t v20; /* placeholder for void */
+    void* v88;
+    int64_t v12;
+    int64_t v46; /* placeholder for void */
+    int64_t v101; /* placeholder for void */
+    bool v16;
+    int64_t v17; /* placeholder for void */
+    int64_t v34; /* placeholder for void */
+    int64_t v19; /* placeholder for void */
+    int64_t v30; /* placeholder for void */
+    int64_t v36;
+    int64_t v76; /* placeholder for void */
+    int64_t v14; /* placeholder for void */
+    int64_t v41;
+    bool v59;
+    int64_t v72;
+    int64_t v35;
+    int64_t v71;
+    int64_t v83; /* placeholder for void */
+    void* v25;
+    int64_t v4;
+    void* v45;
+    void* v86;
+    int64_t v77;
     void* v7;
+    int64_t v10; /* placeholder for void */
+    void* v31;
+    int64_t v33; /* placeholder for void */
     int64_t v24; /* placeholder for void */
-    int64_t v30;
-    int64_t v16; /* placeholder for void */
-    int64_t v31;
+    void* v66;
+    int64_t v94;
+    int64_t v22;
+    int64_t v99;
+    int64_t v67; /* placeholder for void */
+    int64_t v102; /* placeholder for void */
+    int64_t v26; /* placeholder for void */
+    int64_t v108; /* placeholder for void */
+    int64_t v95; /* placeholder for void */
+    int64_t v90; /* placeholder for void */
+    int64_t v58;
+    int64_t v40; /* placeholder for void */
+    int64_t v63;
+    int64_t v79; /* placeholder for void */
+    int64_t v65;
+    void* v29;
+    int64_t v27; /* placeholder for void */
+    int64_t v15;
+    int64_t v47; /* placeholder for void */
+    void* v52;
+    void* v9;
+    int64_t v91; /* placeholder for void */
+    void* v78;
     v3 = 8LL;
-    v4 = v2 + v3;
+    v4 = v1 + v3;
     v5 = malloc(8);
     *(void**)v5 = (void*)v4;
     v7 = malloc(8);
-    *(void**)v7 = (void*)v2;
+    *(void**)v7 = (void*)v1;
     v9 = malloc(8);
     v11 = *(void**)v5;
     v12 = *(int64_t*)v11;
     *(int64_t*)v9 = (int64_t)v12;
-    v15 = malloc(8);
-    v17 = *(void**)v7;
-    v18 = *(int64_t*)v17;
-    *(int64_t*)v15 = (int64_t)v18;
-    v21 = 0LL;
-    v22 = malloc(8);
-    *(int64_t*)v22 = (int64_t)v21;
-    goto bb1;
-  bb1:
-    v25 = *(int64_t*)v22;
-    v26 = *(int64_t*)v9;
-    v27 = v25 < v26;
-    if (v27) goto bb2;
-    else goto bb3;
-  bb2:
-    v29 = *(int64_t*)v15;
-    v30 = *(int64_t*)v22;
-    v31 = 8LL;
-    v32 = v30 * v31;
-    v33 = v29 + v32;
-    v34 = malloc(8);
-    *(int64_t*)v34 = (int64_t)v33;
-    v36 = *(int64_t*)v34;
-    v37 = malloc(8);
-    *(void**)v37 = (void*)v36;
-    v39 = 0LL;
-    v40 = malloc(8);
-    *(int64_t*)v40 = (int64_t)v39;
-    v43 = *(void**)v37;
-    v44 = *(int64_t*)v43;
-    *(int64_t*)v40 = (int64_t)v44;
-    v47 = *(int64_t*)v40;
-    v48 = 0LL;
-    Vec_push((void*)v48, v1, v47);
-    v50 = *(int64_t*)v22;
-    v51 = 1LL;
-    v52 = v50 + v51;
-    *(int64_t*)v22 = (int64_t)v52;
-    goto bb1;
-  bb3:
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-void HashMap_insert(void* v0, int64_t v1, int64_t v2, int64_t v3) {
-    p_call_stack_push("HashMap_insert");
-    int64_t v44; /* placeholder for void */
-    void* v135;
-    void* v13;
-    int64_t v93;
-    void* v51;
-    int64_t v57;
-    void* v49;
-    int64_t v65;
-    void* v19;
-    int64_t v20;
-    int64_t v92;
-    int64_t v100; /* placeholder for void */
-    int64_t v32;
-    int64_t v52; /* placeholder for void */
-    void* v55;
-    int64_t v112; /* placeholder for void */
-    int64_t v39; /* placeholder for void */
-    int64_t v47;
-    int64_t v60;
-    int64_t v15;
-    int64_t v9;
-    int64_t v33;
-    int64_t v124; /* placeholder for void */
-    int64_t v131;
-    void* v132;
-    int64_t v136; /* placeholder for void */
-    void* v138;
-    int64_t v11; /* placeholder for void */
-    int64_t v101; /* placeholder for void */
-    int64_t v59; /* placeholder for void */
-    int64_t v25; /* placeholder for void */
-    int64_t v29;
-    int64_t v73;
-    int64_t v68;
-    int64_t v105;
-    int64_t v7; /* placeholder for void */
-    void* v76;
-    void* v22;
-    int64_t v106;
-    int64_t v48;
-    int64_t v118;
-    int64_t v121; /* placeholder for void */
-    int64_t v62; /* placeholder for void */
-    int64_t v117;
-    int64_t v21; /* placeholder for void */
-    int64_t v56; /* placeholder for void */
-    int64_t v63; /* placeholder for void */
-    int64_t v129;
-    int64_t v114; /* placeholder for void */
-    int64_t v45; /* placeholder for void */
-    int64_t v24; /* placeholder for void */
-    int64_t v98; /* placeholder for void */
-    int64_t v74;
-    int64_t v139; /* placeholder for void */
-    void* v16;
-    int64_t v27;
-    int64_t v42;
-    int64_t v54;
-    int64_t v87; /* placeholder for void */
-    int64_t v86;
-    int64_t v102;
-    int64_t v97; /* placeholder for void */
-    int64_t v46; /* placeholder for void */
-    void* v67;
-    int64_t v141; /* placeholder for void */
-    void* v107;
-    void* v82;
-    int64_t v125; /* placeholder for void */
-    int64_t v83; /* placeholder for void */
-    void* v99;
-    int64_t v4;
-    int64_t v66; /* placeholder for void */
-    int64_t v134;
-    int64_t v80; /* placeholder for void */
-    int64_t v50; /* placeholder for void */
-    int64_t v115; /* placeholder for void */
-    int64_t v84; /* placeholder for void */
-    void* v10;
-    int64_t v12;
-    int64_t v71;
-    int64_t v109;
-    int64_t v69; /* placeholder for void */
-    void* v113;
-    int64_t v116;
-    int64_t v142; /* placeholder for void */
-    bool v28;
-    int64_t v40; /* placeholder for void */
-    int64_t v31;
-    int64_t v30;
-    void* v61;
-    int64_t v89;
-    bool v36;
-    void* v119;
-    int64_t v120; /* placeholder for void */
-    int64_t v78;
-    bool v95;
-    int64_t v8;
-    int64_t v133; /* placeholder for void */
-    int64_t v81;
-    int64_t v123;
-    void* v41;
-    void* v64;
-    int64_t v90;
-    int64_t v17; /* placeholder for void */
-    void* v110;
-    int64_t v140; /* placeholder for void */
-    int64_t v23;
-    void* v79;
-    int64_t v34;
-    int64_t v103;
-    bool v91;
-    void* v85;
-    int64_t v88; /* placeholder for void */
-    int64_t v53;
-    int64_t v94;
-    int64_t v108; /* placeholder for void */
-    int64_t v14; /* placeholder for void */
-    int64_t v126; /* placeholder for void */
-    void* v58;
-    int64_t v5;
-    int64_t v130;
-    int64_t v70; /* placeholder for void */
-    bool v35;
-    int64_t v137; /* placeholder for void */
-    int64_t v128;
-    int64_t v111; /* placeholder for void */
-    int64_t v75;
-    int64_t v104;
-    int64_t v127;
-    int64_t v77; /* placeholder for void */
-    void* v6;
-    int64_t v38;
-    bool v96;
-    int64_t v37; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    void* v122;
-    int64_t v72;
-    int64_t v26;
-    int64_t v43; /* placeholder for void */
-    v4 = 16LL;
-    v5 = v1 + v4;
-    v6 = malloc(8);
-    *(void**)v6 = (void*)v5;
-    v8 = 24LL;
-    v9 = v1 + v8;
-    v10 = malloc(8);
-    *(void**)v10 = (void*)v9;
-    v12 = 0LL;
-    v13 = malloc(8);
-    *(int64_t*)v13 = (int64_t)v12;
     v15 = 0LL;
-    v16 = malloc(8);
-    *(int64_t*)v16 = (int64_t)v15;
-    v19 = *(void**)v6;
-    v20 = *(int64_t*)v19;
-    *(int64_t*)v13 = (int64_t)v20;
-    v22 = *(void**)v10;
-    v23 = *(int64_t*)v22;
-    *(int64_t*)v16 = (int64_t)v23;
-    v26 = *(int64_t*)v16;
-    v27 = 0LL;
-    v28 = v26 == v27;
-    v29 = *(int64_t*)v13;
-    v30 = 10LL;
-    v31 = v29 * v30;
-    v32 = *(int64_t*)v16;
-    v33 = 7LL;
-    v34 = v32 * v33;
-    v35 = v31 >= v34;
-    v36 = v28 || v35;
-    if (v36) goto bb1;
+    v16 = v2 < v15;
+    if (v16) goto bb1;
     else goto bb2;
   bb1:
-    v38 = 0LL;
-    HashMap_grow((void*)v38, v1);
-    v41 = *(void**)v10;
-    v42 = *(int64_t*)v41;
-    *(int64_t*)v16 = (int64_t)v42;
+    v18 = _str13;
+    p_panic(v18);
     goto bb3;
   bb2:
     goto bb3;
   bb3:
-    v47 = 0LL;
-    v48 = (int64_t)HashMap_find_slot((void*)v47, v1, v2);
-    v49 = malloc(8);
-    *(int64_t*)v49 = (int64_t)v48;
-    v51 = malloc(8);
-    *(void**)v51 = (void*)v1;
-    v53 = 8LL;
-    v54 = v1 + v53;
-    v55 = malloc(8);
-    *(void**)v55 = (void*)v54;
-    v57 = 0LL;
-    v58 = malloc(8);
-    *(int64_t*)v58 = (int64_t)v57;
-    v60 = 0LL;
-    v61 = malloc(8);
-    *(int64_t*)v61 = (int64_t)v60;
-    v64 = *(void**)v51;
-    v65 = *(int64_t*)v64;
-    *(int64_t*)v58 = (int64_t)v65;
-    v67 = *(void**)v55;
-    v68 = *(int64_t*)v67;
-    *(int64_t*)v61 = (int64_t)v68;
-    v71 = *(int64_t*)v58;
-    v72 = *(int64_t*)v49;
-    v73 = 8LL;
-    v74 = v72 * v73;
-    v75 = v71 + v74;
-    v76 = malloc(8);
-    *(int64_t*)v76 = (int64_t)v75;
-    v78 = *(int64_t*)v76;
-    v79 = malloc(8);
-    *(void**)v79 = (void*)v78;
-    v81 = 0LL;
-    v82 = malloc(8);
-    *(int64_t*)v82 = (int64_t)v81;
-    v85 = *(void**)v79;
-    v86 = *(int64_t*)v85;
-    *(int64_t*)v82 = (int64_t)v86;
-    v89 = *(int64_t*)v82;
-    v90 = 0LL;
-    v91 = v89 == v90;
-    v92 = *(int64_t*)v82;
-    v93 = 1LL;
-    v94 = -v93;
-    v95 = v92 == v94;
-    v96 = v91 || v95;
-    if (v96) goto bb4;
+    v22 = *(int64_t*)v9;
+    v23 = v2 >= v22;
+    if (v23) goto bb4;
     else goto bb5;
   bb4:
-    v99 = *(void**)v79;
-    *(int64_t*)v99 = (int64_t)v2;
-    v102 = *(int64_t*)v61;
-    v103 = *(int64_t*)v49;
-    v104 = 8LL;
-    v105 = v103 * v104;
-    v106 = v102 + v105;
-    v107 = malloc(8);
-    *(int64_t*)v107 = (int64_t)v106;
-    v109 = *(int64_t*)v107;
-    v110 = malloc(8);
-    *(void**)v110 = (void*)v109;
-    v113 = *(void**)v110;
-    *(int64_t*)v113 = (int64_t)v3;
-    v116 = *(int64_t*)v13;
-    v117 = 1LL;
-    v118 = v116 + v117;
-    v119 = malloc(8);
-    *(int64_t*)v119 = (int64_t)v118;
-    v122 = *(void**)v6;
-    v123 = *(int64_t*)v119;
-    *(int64_t*)v122 = (int64_t)v123;
+    v25 = _str13;
+    p_panic(v25);
     goto bb6;
   bb5:
-    v127 = *(int64_t*)v61;
-    v128 = *(int64_t*)v49;
-    v129 = 8LL;
-    v130 = v128 * v129;
-    v131 = v127 + v130;
-    v132 = malloc(8);
-    *(int64_t*)v132 = (int64_t)v131;
-    v134 = *(int64_t*)v132;
-    v135 = malloc(8);
-    *(void**)v135 = (void*)v134;
-    v138 = *(void**)v135;
-    *(int64_t*)v138 = (int64_t)v3;
     goto bb6;
   bb6:
+    v29 = malloc(8);
+    v31 = *(void**)v7;
+    v32 = *(int64_t*)v31;
+    *(int64_t*)v29 = (int64_t)v32;
+    v35 = *(int64_t*)v29;
+    v36 = 8LL;
+    v37 = v2 * v36;
+    v38 = v35 + v37;
+    v39 = malloc(8);
+    *(int64_t*)v39 = (int64_t)v38;
+    v41 = *(int64_t*)v39;
+    v42 = malloc(8);
+    *(void**)v42 = (void*)v41;
+    v44 = 0LL;
+    v45 = malloc(8);
+    *(int64_t*)v45 = (int64_t)v44;
+    v48 = *(void**)v42;
+    v49 = *(int64_t*)v48;
+    *(int64_t*)v45 = (int64_t)v49;
+    v52 = malloc(8);
+    *(int64_t*)v52 = (int64_t)v2;
+    goto bb7;
+  bb7:
+    v55 = *(int64_t*)v52;
+    v56 = *(int64_t*)v9;
+    v57 = 1LL;
+    v58 = v56 - v57;
+    v59 = v55 < v58;
+    if (v59) goto bb8;
+    else goto bb9;
+  bb8:
+    v61 = *(int64_t*)v29;
+    v62 = *(int64_t*)v52;
+    v63 = 8LL;
+    v64 = v62 * v63;
+    v65 = v61 + v64;
+    v66 = malloc(8);
+    *(int64_t*)v66 = (int64_t)v65;
+    v68 = *(int64_t*)v29;
+    v69 = *(int64_t*)v52;
+    v70 = 1LL;
+    v71 = v69 + v70;
+    v72 = 8LL;
+    v73 = v71 * v72;
+    v74 = v68 + v73;
+    v75 = malloc(8);
+    *(int64_t*)v75 = (int64_t)v74;
+    v77 = *(int64_t*)v66;
+    v78 = malloc(8);
+    *(void**)v78 = (void*)v77;
+    v80 = *(int64_t*)v75;
+    v81 = malloc(8);
+    *(void**)v81 = (void*)v80;
+    v84 = *(void**)v81;
+    v85 = *(int64_t*)v84;
+    v86 = malloc(8);
+    *(int64_t*)v86 = (int64_t)v85;
+    v88 = *(void**)v78;
+    v89 = *(int64_t*)v86;
+    *(int64_t*)v88 = (int64_t)v89;
+    v92 = *(int64_t*)v52;
+    v93 = 1LL;
+    v94 = v92 + v93;
+    *(int64_t*)v52 = (int64_t)v94;
+    goto bb7;
+  bb9:
+    v97 = *(int64_t*)v9;
+    v98 = 1LL;
+    v99 = v97 - v98;
+    v100 = malloc(8);
+    *(int64_t*)v100 = (int64_t)v99;
+    v103 = *(void**)v5;
+    v104 = *(int64_t*)v100;
+    *(int64_t*)v103 = (int64_t)v104;
+    v107 = *(int64_t*)v45;
+    p_call_stack_pop();
+    return v107;
+    return 0;
+}
+
+void* byte_to_str(void* v0, int64_t v1) {
+    p_call_stack_push("byte_to_str");
+    int64_t v3; /* placeholder for void */
+    void* v2;
+    v2 = p_char_to_str(v1);
+    p_call_stack_pop();
+    return v2;
+    return 0;
+}
+
+void Option_or_else(void* v0, void* v1, void* v2, void* v3) {
+    p_call_stack_push("Option_or_else");
+    int64_t v47; /* placeholder for void */
+    int64_t v30; /* placeholder for void */
+    void* v17;
+    int64_t v40;
+    int64_t v12;
+    int64_t v10;
+    int64_t v6;
+    void* v43;
+    int64_t v25; /* placeholder for void */
+    void* v15;
+    int64_t v32;
+    int64_t v5;
+    bool v29;
+    int64_t v41; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    int64_t v28;
+    void* v31;
+    int64_t v48; /* placeholder for void */
+    void* v22;
+    void* v38;
+    void* v39;
+    void* v4;
+    void* v33;
+    void* v42;
+    int64_t v16; /* placeholder for void */
+    int64_t v19;
+    int64_t v35;
+    void* v36;
+    void* v11;
+    int64_t v44;
+    int64_t v14; /* placeholder for void */
+    int64_t v8; /* placeholder for void */
+    void* v21;
+    int64_t v23;
+    int64_t v34; /* placeholder for void */
+    void* v18;
+    void* v26;
+    void* v13;
+    void* v9;
+    int64_t v24; /* placeholder for void */
+    int64_t v27;
+    bool v7;
+    int64_t v37; /* placeholder for void */
+    int64_t v45; /* placeholder for void */
+    int64_t v46; /* placeholder for void */
+    v4 = (char*)v2 + 0;
+    v5 = *(int64_t*)v4;
+    v6 = 0LL;
+    v7 = v5 == v6;
+    if (v7) goto bb2;
+    else goto bb3;
+  bb1:
+    p_call_stack_pop();
+    return;
+  bb2:
+    v9 = (char*)v2 + 8;
+    v10 = *(int64_t*)v9;
+    v11 = malloc(16);
+    v12 = 0LL;
+    v13 = (char*)v11 + 0;
+    *(int64_t*)v13 = (int64_t)v12;
+    v15 = (char*)v11 + 8;
+    *(int64_t*)v15 = (int64_t)v10;
+    v17 = (char*)v11 + 0;
+    v18 = (char*)v0 + 0;
+    v19 = *(int64_t*)v17;
+    *(int64_t*)v18 = (int64_t)v19;
+    v21 = (char*)v11 + 8;
+    v22 = (char*)v0 + 8;
+    v23 = *(int64_t*)v21;
+    *(int64_t*)v22 = (int64_t)v23;
+    p_call_stack_pop();
+    return;
+  bb3:
+    v26 = (char*)v2 + 0;
+    v27 = *(int64_t*)v26;
+    v28 = 1LL;
+    v29 = v27 == v28;
+    if (v29) goto bb4;
+    else goto bb5;
+  bb4:
+    v31 = malloc(16);
+    v32 = 0LL;
+    v33 = (char*)v31 + 0;
+    *(int64_t*)v33 = (int64_t)v32;
+    {
+        if (!v3) abort();
+        char* _fn_name = *(char**)v3;
+        if (!_fn_name) abort();
+        if (strcmp(_fn_name, "Vec_new") == 0) {
+            v35 = Vec_new((void*)v3);
+        } else if (strcmp(_fn_name, "HashMap_new") == 0) {
+            v35 = HashMap_new((void*)v3);
+        } else { abort(); }
+    }
+    v36 = (char*)v31 + 8;
+    *(int64_t*)v36 = (int64_t)v35;
+    v38 = (char*)v31 + 0;
+    v39 = (char*)v0 + 0;
+    v40 = *(int64_t*)v38;
+    *(int64_t*)v39 = (int64_t)v40;
+    v42 = (char*)v31 + 8;
+    v43 = (char*)v0 + 8;
+    v44 = *(int64_t*)v42;
+    *(int64_t*)v43 = (int64_t)v44;
+    p_call_stack_pop();
+    return;
+  bb5:
+    goto bb1;
+    return;
+}
+
+void* str_trim(void* v0, void* v1) {
+    p_call_stack_push("str_trim");
+    int64_t v2;
+    int64_t v3;
+    int64_t v4; /* placeholder for void */
+    v2 = 0LL;
+    v3 = (int64_t)String_trim((void*)v2, (int64_t)v1);
+    p_call_stack_pop();
+    return (void*)v3;
+    return 0;
+}
+
+void ByteBuffer_write_byte(void* v0, void* v1, int64_t v2) {
+    p_call_stack_push("ByteBuffer_write_byte");
+    int64_t v12; /* placeholder for void */
+    int64_t v10;
+    int64_t v13; /* placeholder for void */
+    int64_t v9;
+    int64_t v6; /* placeholder for void */
+    void* v4;
+    void* v7;
+    void* v8;
+    int64_t v11;
+    void* v3;
+    int64_t v5;
+    v3 = (char*)v1 + 0;
+    v4 = *(void**)v3;
+    v5 = 0LL;
+    Vec_push((void*)v5, (int64_t)v4, v2);
+    v7 = (char*)v1 + 8;
+    v8 = (char*)v1 + 8;
+    v9 = *(int64_t*)v8;
+    v10 = 1LL;
+    v11 = v9 + v10;
+    *(int64_t*)v7 = (int64_t)v11;
     p_call_stack_pop();
     return;
     return;
 }
 
-void Vec_reverse(void* v0, int64_t v1) {
-    p_call_stack_push("Vec_reverse");
-    int64_t v5; /* placeholder for void */
-    void* v61;
-    int64_t v22; /* placeholder for void */
-    int64_t v39;
-    int64_t v11;
-    int64_t v15; /* placeholder for void */
-    bool v28;
-    int64_t v43;
-    int64_t v65; /* placeholder for void */
-    int64_t v17;
-    int64_t v32;
-    int64_t v45;
-    void* v66;
-    int64_t v7; /* placeholder for void */
-    int64_t v38;
-    int64_t v18; /* placeholder for void */
-    int64_t v73; /* placeholder for void */
-    int64_t v70;
-    int64_t v74; /* placeholder for void */
-    int64_t v12; /* placeholder for void */
-    int64_t v34;
-    int64_t v24;
-    int64_t v40;
-    void* v49;
-    int64_t v19; /* placeholder for void */
-    int64_t v36; /* placeholder for void */
-    int64_t v68; /* placeholder for void */
-    int64_t v26;
-    int64_t v47; /* placeholder for void */
-    int64_t v27;
-    int64_t v2;
-    void* v8;
-    int64_t v9; /* placeholder for void */
-    int64_t v25;
-    int64_t v44;
-    int64_t v51;
-    void* v55;
-    int64_t v50; /* placeholder for void */
-    void* v63;
-    int64_t v67;
-    int64_t v13; /* placeholder for void */
-    void* v57;
-    void* v46;
-    int64_t v31;
-    int64_t v23; /* placeholder for void */
-    int64_t v58; /* placeholder for void */
-    void* v10;
-    void* v4;
-    void* v21;
+bool ByteBuffer_is_empty(void* v0, void* v1) {
+    p_call_stack_push("ByteBuffer_is_empty");
+    int64_t v4;
+    bool v5;
+    int64_t v6; /* placeholder for void */
+    void* v2;
     int64_t v3;
-    void* v35;
-    int64_t v30;
+    v2 = (char*)v1 + 8;
+    v3 = *(int64_t*)v2;
+    v4 = 0LL;
+    v5 = v3 == v4;
+    p_call_stack_pop();
+    return v5;
+    return 0;
+}
+
+void Option_map(void* v0, void* v1, void* v2, void* v3) {
+    p_call_stack_push("Option_map");
+    void* v37;
+    int64_t v44; /* placeholder for void */
+    int64_t v46; /* placeholder for void */
+    int64_t v42;
+    int64_t v17; /* placeholder for void */
+    bool v7;
+    void* v34;
+    int64_t v45; /* placeholder for void */
+    int64_t v6;
+    int64_t v15;
+    int64_t v21; /* placeholder for void */
+    int64_t v29;
+    void* v19;
+    int64_t v38;
+    void* v4;
+    void* v18;
+    int64_t v35; /* placeholder for void */
+    void* v40;
+    int64_t v43; /* placeholder for void */
+    int64_t v14; /* placeholder for void */
+    void* v22;
+    int64_t v31; /* placeholder for void */
+    int64_t v5;
+    void* v23;
+    int64_t v24;
+    int64_t v33;
+    void* v32;
+    int64_t v39; /* placeholder for void */
+    void* v11;
+    int64_t v25; /* placeholder for void */
+    void* v27;
+    int64_t v8; /* placeholder for void */
+    void* v9;
+    int64_t v12;
+    void* v13;
     void* v16;
+    bool v30;
+    void* v36;
+    int64_t v26; /* placeholder for void */
+    int64_t v28;
+    void* v41;
+    int64_t v20;
+    int64_t v10;
+    v4 = (char*)v2 + 0;
+    v5 = *(int64_t*)v4;
+    v6 = 0LL;
+    v7 = v5 == v6;
+    if (v7) goto bb2;
+    else goto bb3;
+  bb1:
+    p_call_stack_pop();
+    return;
+  bb2:
+    v9 = (char*)v2 + 8;
+    v10 = *(int64_t*)v9;
+    v11 = malloc(16);
+    v12 = 0LL;
+    v13 = (char*)v11 + 0;
+    *(int64_t*)v13 = (int64_t)v12;
+    {
+        if (!v3) abort();
+        char* _fn_name = *(char**)v3;
+        if (!_fn_name) abort();
+        if (strcmp(_fn_name, "String_to_string") == 0) {
+            v15 = String_to_string((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "abs") == 0) {
+            v15 = p_abs((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "p_str_length") == 0) {
+            v15 = p_str_length((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_char_count") == 0) {
+            v15 = String_char_count((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "HashMap_clone") == 0) {
+            v15 = HashMap_clone((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_to_lowercase") == 0) {
+            v15 = String_to_lowercase((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "str_len") == 0) {
+            v15 = str_len((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "Option_unwrap") == 0) {
+            v15 = Option_unwrap((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "String_bytes") == 0) {
+            v15 = String_bytes((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "p_str_hash") == 0) {
+            v15 = p_str_hash((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "ByteBuffer_len") == 0) {
+            v15 = ByteBuffer_len((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "char_to_upper") == 0) {
+            v15 = char_to_upper((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_pop") == 0) {
+            v15 = Vec_pop((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Result_unwrap") == 0) {
+            v15 = Result_unwrap((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "Vec_last") == 0) {
+            v15 = Vec_last((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "StringBuilder_len") == 0) {
+            v15 = StringBuilder_len((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "char_to_lower") == 0) {
+            v15 = char_to_lower((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_first") == 0) {
+            v15 = Vec_first((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "HashMap_values") == 0) {
+            v15 = HashMap_values((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_clone") == 0) {
+            v15 = Vec_clone((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "allocator_bytes_used") == 0) {
+            v15 = allocator_bytes_used((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "String_parse_int") == 0) {
+            v15 = String_parse_int((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_len") == 0) {
+            v15 = String_len((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_to_uppercase") == 0) {
+            v15 = String_to_uppercase((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_capacity") == 0) {
+            v15 = Vec_capacity((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "HashMap_keys") == 0) {
+            v15 = HashMap_keys((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "str_parse_hex") == 0) {
+            v15 = str_parse_hex((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "HashMap_len") == 0) {
+            v15 = HashMap_len((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "str_parse_int") == 0) {
+            v15 = str_parse_int((void*)v3, (void*)v10);
+        } else if (strcmp(_fn_name, "String_clone") == 0) {
+            v15 = String_clone((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_trim") == 0) {
+            v15 = String_trim((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "String_from") == 0) {
+            v15 = String_from((void*)v3, (int64_t)v10);
+        } else if (strcmp(_fn_name, "Vec_len") == 0) {
+            v15 = Vec_len((void*)v3, (int64_t)v10);
+        } else { abort(); }
+    }
+    v16 = (char*)v11 + 8;
+    *(int64_t*)v16 = (int64_t)v15;
+    v18 = (char*)v11 + 0;
+    v19 = (char*)v0 + 0;
+    v20 = *(int64_t*)v18;
+    *(int64_t*)v19 = (int64_t)v20;
+    v22 = (char*)v11 + 8;
+    v23 = (char*)v0 + 8;
+    v24 = *(int64_t*)v22;
+    *(int64_t*)v23 = (int64_t)v24;
+    p_call_stack_pop();
+    return;
+  bb3:
+    v27 = (char*)v2 + 0;
+    v28 = *(int64_t*)v27;
+    v29 = 1LL;
+    v30 = v28 == v29;
+    if (v30) goto bb4;
+    else goto bb5;
+  bb4:
+    v32 = malloc(16);
+    v33 = 1LL;
+    v34 = (char*)v32 + 0;
+    *(int64_t*)v34 = (int64_t)v33;
+    v36 = (char*)v32 + 0;
+    v37 = (char*)v0 + 0;
+    v38 = *(int64_t*)v36;
+    *(int64_t*)v37 = (int64_t)v38;
+    v40 = (char*)v32 + 8;
+    v41 = (char*)v0 + 8;
+    v42 = *(int64_t*)v40;
+    *(int64_t*)v41 = (int64_t)v42;
+    p_call_stack_pop();
+    return;
+  bb5:
+    goto bb1;
+    return;
+}
+
+void* str_concat(void* v0, void* v1, void* v2) {
+    p_call_stack_push("str_concat");
+    int64_t v4; /* placeholder for void */
+    void* v3;
+    v3 = p_str_concat(v1, v2);
+    p_call_stack_pop();
+    return v3;
+    return 0;
+}
+
+void* HashMap_to_str(void* v0, int64_t v1) {
+    p_call_stack_push("HashMap_to_str");
+    int64_t v7;
+    int64_t v96;
+    int64_t v102;
+    int64_t v101; /* placeholder for void */
+    int64_t v64; /* placeholder for void */
+    int64_t v106; /* placeholder for void */
+    int64_t v25;
+    int64_t v75; /* placeholder for void */
+    int64_t v38;
+    int64_t v85; /* placeholder for void */
+    int64_t v89; /* placeholder for void */
+    int64_t v129; /* placeholder for void */
+    int64_t v87;
+    int64_t v11;
+    int64_t v95; /* placeholder for void */
+    int64_t v18; /* placeholder for void */
+    int64_t v121;
+    void* v114;
+    int64_t v126;
+    int64_t v2;
+    int64_t v44; /* placeholder for void */
+    void* v134;
+    int64_t v80; /* placeholder for void */
+    int64_t v26;
+    int64_t v3;
+    int64_t v16;
+    int64_t v36; /* placeholder for void */
+    int64_t v86;
+    void* v105;
+    int64_t v32;
+    int64_t v74; /* placeholder for void */
+    int64_t v108;
+    int64_t v70; /* placeholder for void */
+    int64_t v14; /* placeholder for void */
+    void* v4;
+    int64_t v104;
+    int64_t v47;
+    int64_t v66;
+    int64_t v68;
+    void* v92;
+    int64_t v107;
+    int64_t v59;
+    int64_t v78; /* placeholder for void */
+    int64_t v53;
+    int64_t v83;
+    int64_t v72;
+    int64_t v51; /* placeholder for void */
+    int64_t v40;
+    int64_t v45;
+    int64_t v39;
+    int64_t v48;
+    int64_t v52;
+    int64_t v8;
+    int64_t v115; /* placeholder for void */
+    int64_t v99;
+    bool v84;
+    void* v100;
+    int64_t v67;
+    void* v117;
+    int64_t v13; /* placeholder for void */
+    int64_t v6;
+    int64_t v81; /* placeholder for void */
+    void* v130;
+    bool v17;
+    int64_t v133; /* placeholder for void */
+    int64_t v42;
+    void* v77;
+    int64_t v93; /* placeholder for void */
+    int64_t v41;
+    void* v113;
+    void* v116;
+    int64_t v128; /* placeholder for void */
+    int64_t v65; /* placeholder for void */
+    void* v12;
+    int64_t v23;
+    int64_t v56; /* placeholder for void */
+    int64_t v58;
+    void* v118;
+    void* v122;
+    int64_t v119; /* placeholder for void */
+    int64_t v103;
+    int64_t v33;
+    int64_t v21; /* placeholder for void */
+    int64_t v62;
+    void* v43;
+    int64_t v98;
+    int64_t v34;
+    void* v35;
     int64_t v71;
     int64_t v37;
-    int64_t v56;
-    int64_t v72;
-    int64_t v29; /* placeholder for void */
-    int64_t v53; /* placeholder for void */
-    int64_t v62; /* placeholder for void */
+    int64_t v22; /* placeholder for void */
+    int64_t v55;
+    int64_t v97;
+    int64_t v111; /* placeholder for void */
+    int64_t v127;
+    int64_t v79;
+    void* v123;
+    int64_t v28;
+    void* v20;
+    int64_t v82;
+    void* v91;
+    void* v90;
+    void* v132;
+    int64_t v63; /* placeholder for void */
+    int64_t v57;
+    void* v112;
+    void* v9;
+    int64_t v94; /* placeholder for void */
+    int64_t v15;
+    int64_t v19;
+    int64_t v27;
+    bool v29;
+    bool v50;
+    int64_t v73;
+    int64_t v5; /* placeholder for void */
+    int64_t v124; /* placeholder for void */
+    void* v131;
+    int64_t v135; /* placeholder for void */
+    void* v120;
+    int64_t v54;
+    void* v110;
+    bool v88;
+    int64_t v125;
     int64_t v69; /* placeholder for void */
-    void* v52;
-    void* v59;
+    int64_t v61;
+    void* v76;
+    int64_t v10; /* placeholder for void */
+    int64_t v46;
+    int64_t v30; /* placeholder for void */
+    int64_t v49;
+    int64_t v24;
+    int64_t v31;
+    void* v109;
     int64_t v60;
-    int64_t v75; /* placeholder for void */
-    int64_t v54; /* placeholder for void */
-    void* v14;
-    int64_t v42;
-    int64_t v33;
-    int64_t v20;
-    int64_t v41;
-    int64_t v48;
-    void* v6;
-    int64_t v64;
-    v2 = 8LL;
-    v3 = v1 + v2;
+    v2 = 0LL;
+    v3 = (int64_t)HashMap_keys((void*)v2, v1);
     v4 = malloc(8);
-    *(void**)v4 = (void*)v3;
-    v6 = malloc(8);
-    *(void**)v6 = (void*)v1;
-    v8 = malloc(8);
-    v10 = *(void**)v4;
-    v11 = *(int64_t*)v10;
-    *(int64_t*)v8 = (int64_t)v11;
-    v14 = malloc(8);
-    v16 = *(void**)v6;
-    v17 = *(int64_t*)v16;
-    *(int64_t*)v14 = (int64_t)v17;
-    v20 = 0LL;
-    v21 = malloc(8);
-    *(int64_t*)v21 = (int64_t)v20;
+    *(int64_t*)v4 = (int64_t)v3;
+    v6 = *(int64_t*)v4;
+    v7 = 0LL;
+    v8 = (int64_t)Vec_len((void*)v7, v6);
+    v9 = malloc(8);
+    *(int64_t*)v9 = (int64_t)v8;
+    v11 = 0LL;
+    v12 = malloc(8);
+    *(int64_t*)v12 = (int64_t)v11;
     goto bb1;
   bb1:
-    v24 = *(int64_t*)v21;
-    v25 = *(int64_t*)v8;
-    v26 = 2LL;
-    v27 = v25 / v26;
-    v28 = v24 < v27;
-    if (v28) goto bb2;
+    v15 = *(int64_t*)v12;
+    v16 = *(int64_t*)v9;
+    v17 = v15 < v16;
+    if (v17) goto bb2;
     else goto bb3;
   bb2:
-    v30 = *(int64_t*)v14;
-    v31 = *(int64_t*)v21;
-    v32 = 8LL;
-    v33 = v31 * v32;
-    v34 = v30 + v33;
+    v19 = 0LL;
+    v20 = malloc(8);
+    *(int64_t*)v20 = (int64_t)v19;
+    goto bb4;
+  bb3:
+    v76 = _str14;
+    v77 = malloc(8);
+    *(void**)v77 = (void*)v76;
+    v79 = 0LL;
+    *(int64_t*)v12 = (int64_t)v79;
+    goto bb10;
+  bb4:
+    v23 = *(int64_t*)v20;
+    v24 = 1LL;
+    v25 = v23 + v24;
+    v26 = *(int64_t*)v9;
+    v27 = *(int64_t*)v12;
+    v28 = v26 - v27;
+    v29 = v25 < v28;
+    if (v29) goto bb5;
+    else goto bb6;
+  bb5:
+    v31 = *(int64_t*)v4;
+    v32 = *(int64_t*)v20;
+    v33 = 0LL;
+    v34 = (int64_t)Vec_get((void*)v33, v31, v32);
     v35 = malloc(8);
     *(int64_t*)v35 = (int64_t)v34;
-    v37 = *(int64_t*)v14;
-    v38 = *(int64_t*)v8;
+    v37 = *(int64_t*)v4;
+    v38 = *(int64_t*)v20;
     v39 = 1LL;
-    v40 = v38 - v39;
-    v41 = *(int64_t*)v21;
-    v42 = v40 - v41;
-    v43 = 8LL;
-    v44 = v42 * v43;
-    v45 = v37 + v44;
-    v46 = malloc(8);
-    *(int64_t*)v46 = (int64_t)v45;
-    v48 = *(int64_t*)v35;
-    v49 = malloc(8);
-    *(void**)v49 = (void*)v48;
-    v51 = *(int64_t*)v46;
-    v52 = malloc(8);
-    *(void**)v52 = (void*)v51;
-    v55 = *(void**)v49;
-    v56 = *(int64_t*)v55;
-    v57 = malloc(8);
-    *(int64_t*)v57 = (int64_t)v56;
-    v59 = *(void**)v52;
-    v60 = *(int64_t*)v59;
-    v61 = malloc(8);
-    *(int64_t*)v61 = (int64_t)v60;
-    v63 = *(void**)v49;
-    v64 = *(int64_t*)v61;
-    *(int64_t*)v63 = (int64_t)v64;
-    v66 = *(void**)v52;
-    v67 = *(int64_t*)v57;
-    *(int64_t*)v66 = (int64_t)v67;
-    v70 = *(int64_t*)v21;
-    v71 = 1LL;
-    v72 = v70 + v71;
-    *(int64_t*)v21 = (int64_t)v72;
+    v40 = v38 + v39;
+    v41 = 0LL;
+    v42 = (int64_t)Vec_get((void*)v41, v37, v40);
+    v43 = malloc(8);
+    *(int64_t*)v43 = (int64_t)v42;
+    v45 = *(int64_t*)v35;
+    v46 = *(int64_t*)v43;
+    v47 = 0LL;
+    v48 = (int64_t)p_str_compare((void*)v47, v45, v46);
+    v49 = 0LL;
+    v50 = v48 > v49;
+    if (v50) goto bb7;
+    else goto bb8;
+  bb6:
+    v71 = *(int64_t*)v12;
+    v72 = 1LL;
+    v73 = v71 + v72;
+    *(int64_t*)v12 = (int64_t)v73;
+    goto bb1;
+  bb7:
+    v52 = *(int64_t*)v4;
+    v53 = *(int64_t*)v20;
+    v54 = *(int64_t*)v43;
+    v55 = 0LL;
+    Vec_set((void*)v55, v52, v53, v54);
+    v57 = *(int64_t*)v4;
+    v58 = *(int64_t*)v20;
+    v59 = 1LL;
+    v60 = v58 + v59;
+    v61 = *(int64_t*)v35;
+    v62 = 0LL;
+    Vec_set((void*)v62, v57, v60, v61);
+    goto bb9;
+  bb8:
+    goto bb9;
+  bb9:
+    v66 = *(int64_t*)v20;
+    v67 = 1LL;
+    v68 = v66 + v67;
+    *(int64_t*)v20 = (int64_t)v68;
+    goto bb4;
+  bb10:
+    v82 = *(int64_t*)v12;
+    v83 = *(int64_t*)v9;
+    v84 = v82 < v83;
+    if (v84) goto bb11;
+    else goto bb12;
+  bb11:
+    v86 = *(int64_t*)v12;
+    v87 = 0LL;
+    v88 = v86 > v87;
+    if (v88) goto bb13;
+    else goto bb14;
+  bb12:
+    v130 = *(void**)v77;
+    v131 = _str15;
+    v132 = p_str_concat(v130, v131);
+    *(void**)v77 = (void*)v132;
+    v134 = *(void**)v77;
+    p_call_stack_pop();
+    return v134;
+  bb13:
+    v90 = *(void**)v77;
+    v91 = _str7;
+    v92 = p_str_concat(v90, v91);
+    *(void**)v77 = (void*)v92;
+    goto bb15;
+  bb14:
+    goto bb15;
+  bb15:
+    v96 = *(int64_t*)v4;
+    v97 = *(int64_t*)v12;
+    v98 = 0LL;
+    v99 = (int64_t)Vec_get((void*)v98, v96, v97);
+    v100 = malloc(8);
+    *(int64_t*)v100 = (int64_t)v99;
+    v102 = *(int64_t*)v100;
+    v103 = 0LL;
+    v104 = (int64_t)HashMap_get((void*)v103, v1, v102);
+    v105 = malloc(8);
+    *(int64_t*)v105 = (int64_t)v104;
+    v107 = *(int64_t*)v100;
+    v108 = 0LL;
+    v109 = p_str_from_ptr((void*)v108, v107);
+    v110 = malloc(8);
+    *(void**)v110 = (void*)v109;
+    v112 = *(void**)v77;
+    v113 = *(void**)v110;
+    v114 = p_str_concat(v112, v113);
+    *(void**)v77 = (void*)v114;
+    v116 = *(void**)v77;
+    v117 = _str16;
+    v118 = p_str_concat(v116, v117);
+    *(void**)v77 = (void*)v118;
+    v120 = *(void**)v77;
+    v121 = *(int64_t*)v105;
+    v122 = (void*)p_to_str((int64_t)v121);
+    v123 = p_str_concat(v120, v122);
+    *(void**)v77 = (void*)v123;
+    v125 = *(int64_t*)v12;
+    v126 = 1LL;
+    v127 = v125 + v126;
+    *(int64_t*)v12 = (int64_t)v127;
+    goto bb10;
+    return 0;
+}
+
+int64_t String_from(void* v0, int64_t v1) {
+    p_call_stack_push("String_from");
+    int64_t v31;
+    int64_t v2;
+    int64_t v23; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    int64_t v24;
+    void* v28;
+    void* v27;
+    int64_t v8; /* placeholder for void */
+    void* v7;
+    int64_t v30;
+    int64_t v42; /* placeholder for void */
+    void* v22;
+    int64_t v44;
+    int64_t v46; /* placeholder for void */
+    int64_t v47;
+    int64_t v9;
+    int64_t v5;
+    int64_t v16; /* placeholder for void */
+    int64_t v19; /* placeholder for void */
+    int64_t v21;
+    void* v13;
+    int64_t v29; /* placeholder for void */
+    int64_t v32;
+    int64_t v33; /* placeholder for void */
+    bool v3;
+    int64_t v35;
+    void* v37;
+    int64_t v36;
+    int64_t v39;
+    void* v10;
+    int64_t v41; /* placeholder for void */
+    int64_t v45; /* placeholder for void */
+    void* v6;
+    int64_t v14;
+    int64_t v18; /* placeholder for void */
+    int64_t v38; /* placeholder for void */
+    int64_t v17;
+    int64_t v25;
+    int64_t v34;
+    void* v43;
+    int64_t v20;
+    int64_t v48; /* placeholder for void */
+    int64_t v26;
+    int64_t v4; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    void* v40;
+    int64_t v11; /* placeholder for void */
+    v2 = 0LL;
+    v3 = v1 == v2;
+    if (v3) goto bb1;
+    else goto bb2;
+  bb1:
+    v5 = 1LL;
+    v6 = p_malloc(v5);
+    v7 = malloc(8);
+    *(int64_t*)v7 = (int64_t)v6;
+    v9 = *(int64_t*)v7;
+    v10 = malloc(8);
+    *(void**)v10 = (void*)v9;
+    v13 = *(void**)v10;
+    v14 = 0LL;
+    *(uint8_t*)v13 = (uint8_t)v14;
+    v17 = *(int64_t*)v7;
+    p_call_stack_pop();
+    return v17;
+  bb2:
+    goto bb3;
+  bb3:
+    v20 = 0LL;
+    v21 = (int64_t)p_str_length((void*)v20, v1);
+    v22 = malloc(8);
+    *(int64_t*)v22 = (int64_t)v21;
+    v24 = *(int64_t*)v22;
+    v25 = 1LL;
+    v26 = v24 + v25;
+    v27 = p_malloc(v26);
+    v28 = malloc(8);
+    *(int64_t*)v28 = (int64_t)v27;
+    v30 = *(int64_t*)v28;
+    v31 = *(int64_t*)v22;
+    v32 = 0LL;
+    p_str_copy_n((void*)v32, v30, v1, v31);
+    v34 = *(int64_t*)v28;
+    v35 = *(int64_t*)v22;
+    v36 = v34 + v35;
+    v37 = malloc(8);
+    *(int64_t*)v37 = (int64_t)v36;
+    v39 = *(int64_t*)v37;
+    v40 = malloc(8);
+    *(void**)v40 = (void*)v39;
+    v43 = *(void**)v40;
+    v44 = 0LL;
+    *(uint8_t*)v43 = (uint8_t)v44;
+    v47 = *(int64_t*)v28;
+    p_call_stack_pop();
+    return v47;
+    return 0;
+}
+
+int64_t String_clone(void* v0, int64_t v1) {
+    p_call_stack_push("String_clone");
+    int64_t v4; /* placeholder for void */
+    int64_t v2;
+    int64_t v3;
+    v2 = 0LL;
+    v3 = (int64_t)String_from((void*)v2, v1);
+    p_call_stack_pop();
+    return v3;
+    return 0;
+}
+
+bool str_is_empty(void* v0, void* v1) {
+    p_call_stack_push("str_is_empty");
+    int64_t v2;
+    int64_t v4; /* placeholder for void */
+    bool v3;
+    v2 = 0LL;
+    v3 = (bool)String_is_empty((void*)v2, (int64_t)v1);
+    p_call_stack_pop();
+    return v3;
+    return 0;
+}
+
+void ByteBuffer_from_string(void* v0, void* v1, void* v2) {
+    p_call_stack_push("ByteBuffer_from_string");
+    int64_t v13;
+    void* v36;
+    int64_t v24; /* placeholder for void */
+    int64_t v54; /* placeholder for void */
+    void* v51;
+    void* v29;
+    int64_t v34; /* placeholder for void */
+    int64_t v15; /* placeholder for void */
+    int64_t v40;
+    int64_t v28;
+    int64_t v20; /* placeholder for void */
+    int64_t v3;
+    int64_t v30; /* placeholder for void */
+    int64_t v52;
+    void* v50;
+    int64_t v53; /* placeholder for void */
+    uint8_t v33;
+    void* v46;
+    int64_t v12; /* placeholder for void */
+    int64_t v25;
+    int64_t v5;
+    int64_t v21;
+    void* v23;
+    void* v26;
+    int64_t v37;
+    int64_t v39; /* placeholder for void */
+    int64_t v44; /* placeholder for void */
+    void* v45;
+    int64_t v16; /* placeholder for void */
+    int64_t v17;
+    int64_t v27; /* placeholder for void */
+    int64_t v6; /* placeholder for void */
+    void* v14;
+    int64_t v8; /* placeholder for void */
+    int64_t v22;
+    int64_t v31; /* placeholder for void */
+    int64_t v35; /* placeholder for void */
+    int64_t v38;
+    int64_t v42;
+    int64_t v49; /* placeholder for void */
+    bool v19;
+    void* v11;
+    void* v4;
+    void* v32;
+    int64_t v10;
+    int64_t v18;
+    void* v7;
+    int64_t v43; /* placeholder for void */
+    void* v47;
+    int64_t v41;
+    void* v48;
+    int64_t v9;
+    v3 = 0LL;
+    v4 = malloc(16);
+    v5 = 0LL;
+    ByteBuffer_new(v4, (void*)v5, v3);
+    v7 = malloc(8);
+    *(void**)v7 = (void*)v4;
+    v9 = 0LL;
+    v10 = (int64_t)String_len((void*)v9, (int64_t)v2);
+    v11 = malloc(8);
+    *(int64_t*)v11 = (int64_t)v10;
+    v13 = 0LL;
+    v14 = malloc(8);
+    *(int64_t*)v14 = (int64_t)v13;
+    goto bb1;
+  bb1:
+    v17 = *(int64_t*)v14;
+    v18 = *(int64_t*)v11;
+    v19 = v17 < v18;
+    if (v19) goto bb2;
+    else goto bb3;
+  bb2:
+    v21 = *(int64_t*)v14;
+    v22 = (int64_t)v2 + v21;
+    v23 = malloc(8);
+    *(int64_t*)v23 = (int64_t)v22;
+    v25 = *(int64_t*)v23;
+    v26 = malloc(8);
+    *(void**)v26 = (void*)v25;
+    v28 = 0LL;
+    v29 = malloc(8);
+    *(int64_t*)v29 = (int64_t)v28;
+    v32 = *(void**)v26;
+    v33 = *(uint8_t*)v32;
+    *(int64_t*)v29 = (int64_t)v33;
+    v36 = *(void**)v7;
+    v37 = *(int64_t*)v29;
+    v38 = 0LL;
+    ByteBuffer_write_byte((void*)v38, v36, v37);
+    v40 = *(int64_t*)v14;
+    v41 = 1LL;
+    v42 = v40 + v41;
+    *(int64_t*)v14 = (int64_t)v42;
     goto bb1;
   bb3:
+    v45 = *(void**)v7;
+    v46 = (char*)v45 + 0;
+    v47 = (char*)v0 + 0;
+    v48 = *(void**)v46;
+    *(void**)v47 = (void*)v48;
+    v50 = (char*)v45 + 8;
+    v51 = (char*)v0 + 8;
+    v52 = *(int64_t*)v50;
+    *(int64_t*)v51 = (int64_t)v52;
     p_call_stack_pop();
     return;
     return;
 }
 
-int64_t Option_unwrap_or(void* v0, void* v1, int64_t v2) {
-    p_call_stack_push("Option_unwrap_or");
-    int64_t v16; /* placeholder for void */
-    void* v8;
-    int64_t v17; /* placeholder for void */
-    int64_t v10; /* placeholder for void */
+int64_t HashMap_get(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("HashMap_get");
+    int64_t v95; /* placeholder for void */
+    int64_t v30; /* placeholder for void */
+    int64_t v78;
+    int64_t v97; /* placeholder for void */
+    bool v17;
     int64_t v12;
-    int64_t v7; /* placeholder for void */
-    bool v6;
-    void* v11;
-    int64_t v13;
-    void* v3;
-    int64_t v9;
-    int64_t v5;
+    void* v92;
+    int64_t v64; /* placeholder for void */
+    int64_t v88;
+    int64_t v91; /* placeholder for void */
+    int64_t v3;
+    int64_t v20; /* placeholder for void */
+    int64_t v59;
+    int64_t v40;
+    int64_t v18; /* placeholder for void */
+    int64_t v45; /* placeholder for void */
+    void* v50;
+    bool v61;
+    int64_t v75;
+    int64_t v58;
+    int64_t v42; /* placeholder for void */
+    int64_t v87; /* placeholder for void */
+    int64_t v38;
+    int64_t v37;
+    int64_t v31; /* placeholder for void */
+    int64_t v39;
+    void* v89;
+    int64_t v96;
+    int64_t v16;
+    int64_t v62; /* placeholder for void */
+    int64_t v82;
+    int64_t v81;
+    int64_t v10; /* placeholder for void */
+    void* v83;
+    int64_t v51;
+    int64_t v84; /* placeholder for void */
+    int64_t v53; /* placeholder for void */
+    void* v24;
+    void* v44;
+    bool v56;
+    int64_t v63;
+    void* v41;
+    int64_t v49; /* placeholder for void */
+    int64_t v90; /* placeholder for void */
+    int64_t v22;
+    int64_t v72; /* placeholder for void */
+    int64_t v35; /* placeholder for void */
+    int64_t v85;
+    int64_t v14; /* placeholder for void */
+    int64_t v36;
+    int64_t v43;
+    void* v74;
+    void* v86;
+    int64_t v93;
+    int64_t v46;
+    int64_t v27; /* placeholder for void */
+    int64_t v57;
+    void* v68;
+    int64_t v9; /* placeholder for void */
+    void* v71;
+    int64_t v28;
+    int64_t v79;
+    int64_t v6; /* placeholder for void */
     int64_t v4;
+    int64_t v34; /* placeholder for void */
+    int64_t v54;
+    int64_t v65; /* placeholder for void */
+    int64_t v69; /* placeholder for void */
+    int64_t v25; /* placeholder for void */
+    void* v5;
+    void* v8;
+    void* v11;
+    void* v32;
+    int64_t v15;
+    void* v47;
+    int64_t v70;
+    int64_t v76; /* placeholder for void */
+    int64_t v66;
+    int64_t v33;
+    int64_t v80;
+    int64_t v77; /* placeholder for void */
+    int64_t v67;
+    int64_t v94; /* placeholder for void */
+    int64_t v21; /* placeholder for void */
+    int64_t v23;
+    bool v60;
+    int64_t v7;
+    int64_t v19;
+    void* v29;
+    int64_t v73; /* placeholder for void */
+    int64_t v52; /* placeholder for void */
+    int64_t v48; /* placeholder for void */
+    int64_t v13; /* placeholder for void */
+    void* v26;
+    int64_t v55;
+    v3 = 24LL;
+    v4 = v1 + v3;
+    v5 = malloc(8);
+    *(void**)v5 = (void*)v4;
+    v7 = 0LL;
+    v8 = malloc(8);
+    *(int64_t*)v8 = (int64_t)v7;
+    v11 = *(void**)v5;
+    v12 = *(int64_t*)v11;
+    *(int64_t*)v8 = (int64_t)v12;
+    v15 = *(int64_t*)v8;
+    v16 = 0LL;
+    v17 = v15 == v16;
+    if (v17) goto bb1;
+    else goto bb2;
+  bb1:
+    v19 = 0LL;
+    p_call_stack_pop();
+    return v19;
+  bb2:
+    goto bb3;
+  bb3:
+    v22 = 0LL;
+    v23 = (int64_t)HashMap_find_slot((void*)v22, v1, v2);
+    v24 = malloc(8);
+    *(int64_t*)v24 = (int64_t)v23;
+    v26 = malloc(8);
+    *(void**)v26 = (void*)v1;
+    v28 = 0LL;
+    v29 = malloc(8);
+    *(int64_t*)v29 = (int64_t)v28;
+    v32 = *(void**)v26;
+    v33 = *(int64_t*)v32;
+    *(int64_t*)v29 = (int64_t)v33;
+    v36 = *(int64_t*)v29;
+    v37 = *(int64_t*)v24;
+    v38 = 8LL;
+    v39 = v37 * v38;
+    v40 = v36 + v39;
+    v41 = malloc(8);
+    *(int64_t*)v41 = (int64_t)v40;
+    v43 = *(int64_t*)v41;
+    v44 = malloc(8);
+    *(void**)v44 = (void*)v43;
+    v46 = 0LL;
+    v47 = malloc(8);
+    *(int64_t*)v47 = (int64_t)v46;
+    v50 = *(void**)v44;
+    v51 = *(int64_t*)v50;
+    *(int64_t*)v47 = (int64_t)v51;
+    v54 = *(int64_t*)v47;
+    v55 = 0LL;
+    v56 = v54 == v55;
+    v57 = *(int64_t*)v47;
+    v58 = 1LL;
+    v59 = -v58;
+    v60 = v57 == v59;
+    v61 = v56 || v60;
+    if (v61) goto bb4;
+    else goto bb5;
+  bb4:
+    v63 = 0LL;
+    p_call_stack_pop();
+    return v63;
+  bb5:
+    goto bb6;
+  bb6:
+    v66 = 8LL;
+    v67 = v1 + v66;
+    v68 = malloc(8);
+    *(void**)v68 = (void*)v67;
+    v70 = 0LL;
+    v71 = malloc(8);
+    *(int64_t*)v71 = (int64_t)v70;
+    v74 = *(void**)v68;
+    v75 = *(int64_t*)v74;
+    *(int64_t*)v71 = (int64_t)v75;
+    v78 = *(int64_t*)v71;
+    v79 = *(int64_t*)v24;
+    v80 = 8LL;
+    v81 = v79 * v80;
+    v82 = v78 + v81;
+    v83 = malloc(8);
+    *(int64_t*)v83 = (int64_t)v82;
+    v85 = *(int64_t*)v83;
+    v86 = malloc(8);
+    *(void**)v86 = (void*)v85;
+    v88 = 0LL;
+    v89 = malloc(8);
+    *(int64_t*)v89 = (int64_t)v88;
+    v92 = *(void**)v86;
+    v93 = *(int64_t*)v92;
+    *(int64_t*)v89 = (int64_t)v93;
+    v96 = *(int64_t*)v89;
+    p_call_stack_pop();
+    return v96;
+    return 0;
+}
+
+void Result_ok(void* v0, void* v1, void* v2) {
+    p_call_stack_push("Result_ok");
+    int64_t v29; /* placeholder for void */
+    void* v34;
+    void* v25;
     int64_t v18;
-    int64_t v15; /* placeholder for void */
-    bool v14;
     int64_t v19; /* placeholder for void */
+    int64_t v43; /* placeholder for void */
+    void* v37;
+    int64_t v45; /* placeholder for void */
+    void* v40;
+    int64_t v26;
+    void* v32;
+    int64_t v11;
+    int64_t v31;
+    int64_t v7; /* placeholder for void */
+    void* v21;
+    int64_t v23; /* placeholder for void */
+    void* v12;
+    int64_t v15; /* placeholder for void */
+    bool v6;
+    int64_t v5;
+    int64_t v33;
+    int64_t v42;
+    int64_t v4;
+    void* v10;
+    void* v3;
+    void* v16;
+    int64_t v13; /* placeholder for void */
+    bool v28;
+    void* v14;
+    void* v36;
+    int64_t v27;
+    int64_t v22;
+    int64_t v39; /* placeholder for void */
+    int64_t v24; /* placeholder for void */
+    int64_t v9;
+    void* v20;
+    int64_t v38;
+    int64_t v35; /* placeholder for void */
+    void* v17;
+    void* v30;
+    int64_t v46; /* placeholder for void */
+    void* v41;
+    int64_t v44; /* placeholder for void */
+    void* v8;
+    v3 = (char*)v2 + 0;
+    v4 = *(int64_t*)v3;
+    v5 = 0LL;
+    v6 = v4 == v5;
+    if (v6) goto bb2;
+    else goto bb3;
+  bb1:
+    p_call_stack_pop();
+    return;
+  bb2:
+    v8 = (char*)v2 + 8;
+    v9 = *(int64_t*)v8;
+    v10 = malloc(16);
+    v11 = 0LL;
+    v12 = (char*)v10 + 0;
+    *(int64_t*)v12 = (int64_t)v11;
+    v14 = (char*)v10 + 8;
+    *(int64_t*)v14 = (int64_t)v9;
+    v16 = (char*)v10 + 0;
+    v17 = (char*)v0 + 0;
+    v18 = *(int64_t*)v16;
+    *(int64_t*)v17 = (int64_t)v18;
+    v20 = (char*)v10 + 8;
+    v21 = (char*)v0 + 8;
+    v22 = *(int64_t*)v20;
+    *(int64_t*)v21 = (int64_t)v22;
+    p_call_stack_pop();
+    return;
+  bb3:
+    v25 = (char*)v2 + 0;
+    v26 = *(int64_t*)v25;
+    v27 = 1LL;
+    v28 = v26 == v27;
+    if (v28) goto bb4;
+    else goto bb5;
+  bb4:
+    v30 = (char*)v2 + 8;
+    v31 = *(int64_t*)v30;
+    v32 = malloc(16);
+    v33 = 1LL;
+    v34 = (char*)v32 + 0;
+    *(int64_t*)v34 = (int64_t)v33;
+    v36 = (char*)v32 + 0;
+    v37 = (char*)v0 + 0;
+    v38 = *(int64_t*)v36;
+    *(int64_t*)v37 = (int64_t)v38;
+    v40 = (char*)v32 + 8;
+    v41 = (char*)v0 + 8;
+    v42 = *(int64_t*)v40;
+    *(int64_t*)v41 = (int64_t)v42;
+    p_call_stack_pop();
+    return;
+  bb5:
+    goto bb1;
+    return;
+}
+
+int64_t str_byte_at(void* v0, void* v1, int64_t v2) {
+    p_call_stack_push("str_byte_at");
+    int64_t v5; /* placeholder for void */
+    int64_t v3;
+    int64_t v4;
+    v3 = 0LL;
+    v4 = (int64_t)String_byte_at((void*)v3, (int64_t)v1, v2);
+    p_call_stack_pop();
+    return v4;
+    return 0;
+}
+
+void ByteBuffer_clear(void* v0, void* v1) {
+    p_call_stack_push("ByteBuffer_clear");
+    int64_t v8; /* placeholder for void */
+    int64_t v5; /* placeholder for void */
+    void* v3;
+    void* v6;
+    int64_t v9; /* placeholder for void */
+    int64_t v7;
+    void* v2;
+    int64_t v4;
+    v2 = (char*)v1 + 0;
+    v3 = *(void**)v2;
+    v4 = 0LL;
+    Vec_clear((void*)v4, (int64_t)v3);
+    v6 = (char*)v1 + 8;
+    v7 = 0LL;
+    *(int64_t*)v6 = (int64_t)v7;
+    p_call_stack_pop();
+    return;
+    return;
+}
+
+int64_t str_parse_int_range(void* v0, void* v1, int64_t v2, int64_t v3) {
+    p_call_stack_push("str_parse_int_range");
+    int64_t v33; /* placeholder for void */
+    int64_t v9; /* placeholder for void */
+    int64_t v74;
+    int64_t v49; /* placeholder for void */
+    int64_t v76;
+    int64_t v4;
+    int64_t v81;
+    int64_t v15; /* placeholder for void */
+    void* v48;
+    int64_t v60; /* placeholder for void */
+    int64_t v62;
+    int64_t v73;
+    int64_t v42;
+    int64_t v47;
+    int64_t v64;
+    int64_t v20;
+    int64_t v79;
+    bool v66;
+    int64_t v11; /* placeholder for void */
+    int64_t v12;
+    int64_t v23; /* placeholder for void */
+    int64_t v85; /* placeholder for void */
+    int64_t v24;
+    int64_t v13;
+    int64_t v34; /* placeholder for void */
+    int64_t v43;
+    int64_t v32;
+    void* v36;
+    int64_t v45; /* placeholder for void */
+    int64_t v68; /* placeholder for void */
+    int64_t v72;
+    int64_t v75;
+    int64_t v21;
+    int64_t v35;
+    int64_t v50;
+    int64_t v56; /* placeholder for void */
+    bool v44;
+    int64_t v69; /* placeholder for void */
+    int64_t v83; /* placeholder for void */
+    int64_t v82; /* placeholder for void */
+    int64_t v17; /* placeholder for void */
+    int64_t v7; /* placeholder for void */
+    int64_t v19; /* placeholder for void */
+    int64_t v26; /* placeholder for void */
+    int64_t v52; /* placeholder for void */
+    int64_t v71;
+    int64_t v16;
+    int64_t v31; /* placeholder for void */
+    int64_t v59; /* placeholder for void */
+    int64_t v78; /* placeholder for void */
+    int64_t v5;
+    void* v54;
+    bool v22;
+    int64_t v70; /* placeholder for void */
+    int64_t v53;
+    int64_t v27; /* placeholder for void */
+    void* v51;
+    void* v10;
+    bool v67;
+    int64_t v55; /* placeholder for void */
+    void* v8;
+    void* v6;
+    int64_t v38;
+    void* v57;
+    int64_t v61;
+    int64_t v84;
+    int64_t v46;
+    int64_t v18; /* placeholder for void */
+    bool v14;
+    int64_t v37; /* placeholder for void */
+    int64_t v40; /* placeholder for void */
+    int64_t v77;
+    void* v39;
+    int64_t v41; /* placeholder for void */
+    int64_t v65;
+    int64_t v80;
+    int64_t v25; /* placeholder for void */
+    bool v30;
+    int64_t v28;
+    uint8_t v58;
+    int64_t v29;
+    bool v63;
+    v4 = 0LL;
+    v5 = (int64_t)String_len((void*)v4, (int64_t)v1);
+    v6 = malloc(8);
+    *(int64_t*)v6 = (int64_t)v5;
+    v8 = malloc(8);
+    *(int64_t*)v8 = (int64_t)v2;
+    v10 = malloc(8);
+    *(int64_t*)v10 = (int64_t)v3;
+    v12 = *(int64_t*)v8;
+    v13 = 0LL;
+    v14 = v12 < v13;
+    if (v14) goto bb1;
+    else goto bb2;
+  bb1:
+    v16 = 0LL;
+    *(int64_t*)v8 = (int64_t)v16;
+    goto bb3;
+  bb2:
+    goto bb3;
+  bb3:
+    v20 = *(int64_t*)v10;
+    v21 = *(int64_t*)v6;
+    v22 = v20 > v21;
+    if (v22) goto bb4;
+    else goto bb5;
+  bb4:
+    v24 = *(int64_t*)v6;
+    *(int64_t*)v10 = (int64_t)v24;
+    goto bb6;
+  bb5:
+    goto bb6;
+  bb6:
+    v28 = *(int64_t*)v8;
+    v29 = *(int64_t*)v10;
+    v30 = v28 >= v29;
+    if (v30) goto bb7;
+    else goto bb8;
+  bb7:
+    v32 = 0LL;
+    p_call_stack_pop();
+    return v32;
+  bb8:
+    goto bb9;
+  bb9:
+    v35 = 0LL;
+    v36 = malloc(8);
+    *(int64_t*)v36 = (int64_t)v35;
+    v38 = *(int64_t*)v8;
+    v39 = malloc(8);
+    *(int64_t*)v39 = (int64_t)v38;
+    goto bb10;
+  bb10:
+    v42 = *(int64_t*)v39;
+    v43 = *(int64_t*)v10;
+    v44 = v42 < v43;
+    if (v44) goto bb11;
+    else goto bb12;
+  bb11:
+    v46 = *(int64_t*)v39;
+    v47 = (int64_t)v1 + v46;
+    v48 = malloc(8);
+    *(int64_t*)v48 = (int64_t)v47;
+    v50 = *(int64_t*)v48;
+    v51 = malloc(8);
+    *(void**)v51 = (void*)v50;
+    v53 = 0LL;
+    v54 = malloc(8);
+    *(int64_t*)v54 = (int64_t)v53;
+    v57 = *(void**)v51;
+    v58 = *(uint8_t*)v57;
+    *(int64_t*)v54 = (int64_t)v58;
+    v61 = *(int64_t*)v54;
+    v62 = 48LL;
+    v63 = v61 < v62;
+    v64 = *(int64_t*)v54;
+    v65 = 57LL;
+    v66 = v64 > v65;
+    v67 = v63 || v66;
+    if (v67) goto bb13;
+    else goto bb14;
+  bb12:
+    v84 = *(int64_t*)v36;
+    p_call_stack_pop();
+    return v84;
+  bb13:
+    goto bb12;
+  bb14:
+    goto bb15;
+  bb15:
+    v71 = *(int64_t*)v36;
+    v72 = 10LL;
+    v73 = v71 * v72;
+    v74 = *(int64_t*)v54;
+    v75 = 48LL;
+    v76 = v74 - v75;
+    v77 = v73 + v76;
+    *(int64_t*)v36 = (int64_t)v77;
+    v79 = *(int64_t*)v39;
+    v80 = 1LL;
+    v81 = v79 + v80;
+    *(int64_t*)v39 = (int64_t)v81;
+    goto bb10;
+    return 0;
+}
+
+int64_t Option_unwrap(void* v0, void* v1) {
+    p_call_stack_push("Option_unwrap");
+    int64_t v4;
+    int64_t v12;
+    int64_t v6; /* placeholder for void */
+    bool v5;
+    int64_t v18; /* placeholder for void */
+    int64_t v19;
+    int64_t v20; /* placeholder for void */
+    void* v7;
+    int64_t v8;
+    void* v10;
+    void* v15;
+    int64_t v16; /* placeholder for void */
+    int64_t v14; /* placeholder for void */
+    void* v2;
+    bool v13;
+    int64_t v11;
+    int64_t v17; /* placeholder for void */
+    int64_t v9; /* placeholder for void */
+    int64_t v3;
+    v2 = (char*)v1 + 0;
+    v3 = *(int64_t*)v2;
+    v4 = 0LL;
+    v5 = v3 == v4;
+    if (v5) goto bb2;
+    else goto bb3;
+  bb1:
+    v19 = 0LL;
+    p_call_stack_pop();
+    return v19;
+  bb2:
+    v7 = (char*)v1 + 8;
+    v8 = *(int64_t*)v7;
+    p_call_stack_pop();
+    return v8;
+  bb3:
+    v10 = (char*)v1 + 0;
+    v11 = *(int64_t*)v10;
+    v12 = 1LL;
+    v13 = v11 == v12;
+    if (v13) goto bb4;
+    else goto bb5;
+  bb4:
+    v15 = _str17;
+    p_panic(v15);
+    goto bb1;
+  bb5:
+    goto bb1;
+    return 0;
+}
+
+int64_t String_to_string(void* v0, int64_t v1) {
+    p_call_stack_push("String_to_string");
+    int64_t v3;
+    int64_t v4; /* placeholder for void */
+    int64_t v2;
+    v2 = 0LL;
+    v3 = (int64_t)String_from((void*)v2, v1);
+    p_call_stack_pop();
+    return v3;
+    return 0;
+}
+
+void* StringBuilder_to_str(void* v0, void* v1) {
+    p_call_stack_push("StringBuilder_to_str");
+    void* v3;
+    int64_t v4; /* placeholder for void */
+    void* v2;
+    v2 = (char*)v1 + 0;
+    v3 = *(void**)v2;
+    p_call_stack_pop();
+    return v3;
+    return 0;
+}
+
+int64_t str_parse_int(void* v0, void* v1) {
+    p_call_stack_push("str_parse_int");
+    int64_t v3;
+    int64_t v4; /* placeholder for void */
+    int64_t v2;
+    v2 = 0LL;
+    v3 = (int64_t)String_parse_int((void*)v2, (int64_t)v1);
+    p_call_stack_pop();
+    return v3;
+    return 0;
+}
+
+int64_t String_bytes(void* v0, int64_t v1) {
+    p_call_stack_push("String_bytes");
+    int64_t v2;
+    int64_t v3;
+    int64_t v4; /* placeholder for void */
+    v2 = 0LL;
+    v3 = (int64_t)p_str_length((void*)v2, v1);
+    p_call_stack_pop();
+    return v3;
+    return 0;
+}
+
+int64_t Option_unwrap_or_else(void* v0, void* v1, void* v2) {
+    p_call_stack_push("Option_unwrap_or_else");
+    int64_t v15; /* placeholder for void */
+    int64_t v12;
+    int64_t v18; /* placeholder for void */
+    bool v6;
+    int64_t v4;
+    int64_t v19;
+    int64_t v9;
+    int64_t v10; /* placeholder for void */
+    int64_t v17; /* placeholder for void */
+    void* v3;
+    int64_t v7; /* placeholder for void */
+    int64_t v5;
+    int64_t v13;
+    bool v14;
+    int64_t v16;
+    void* v8;
+    void* v11;
+    int64_t v20; /* placeholder for void */
     v3 = (char*)v1 + 0;
     v4 = *(int64_t*)v3;
     v5 = 0LL;
@@ -12471,9 +14574,9 @@ int64_t Option_unwrap_or(void* v0, void* v1, int64_t v2) {
     if (v6) goto bb2;
     else goto bb3;
   bb1:
-    v18 = 0LL;
+    v19 = 0LL;
     p_call_stack_pop();
-    return v18;
+    return v19;
   bb2:
     v8 = (char*)v1 + 8;
     v9 = *(int64_t*)v8;
@@ -12487,123 +14590,164 @@ int64_t Option_unwrap_or(void* v0, void* v1, int64_t v2) {
     if (v14) goto bb4;
     else goto bb5;
   bb4:
+    {
+        if (!v2) abort();
+        char* _fn_name = *(char**)v2;
+        if (!_fn_name) abort();
+        if (strcmp(_fn_name, "Vec_new") == 0) {
+            v16 = Vec_new((void*)v2);
+        } else if (strcmp(_fn_name, "HashMap_new") == 0) {
+            v16 = HashMap_new((void*)v2);
+        } else { abort(); }
+    }
     p_call_stack_pop();
-    return v2;
+    return v16;
   bb5:
     goto bb1;
     return 0;
 }
 
-int64_t HashMap_len(void* v0, int64_t v1) {
-    p_call_stack_push("HashMap_len");
-    int64_t v14;
-    void* v4;
-    int64_t v9; /* placeholder for void */
-    void* v10;
-    int64_t v8; /* placeholder for void */
+int64_t Result_unwrap_or_else(void* v0, void* v1, void* v2) {
+    p_call_stack_push("Result_unwrap_or_else");
+    int64_t v13;
+    int64_t v9;
+    int64_t v10; /* placeholder for void */
+    void* v11;
+    bool v14;
+    void* v16;
+    bool v6;
+    int64_t v17;
+    void* v3;
+    int64_t v5;
     int64_t v15; /* placeholder for void */
-    int64_t v11;
-    int64_t v5; /* placeholder for void */
-    int64_t v3;
-    int64_t v12; /* placeholder for void */
-    void* v7;
-    int64_t v13; /* placeholder for void */
-    int64_t v6;
-    int64_t v2;
-    v2 = 16LL;
-    v3 = v1 + v2;
-    v4 = malloc(8);
-    *(void**)v4 = (void*)v3;
-    v6 = 0LL;
-    v7 = malloc(8);
-    *(int64_t*)v7 = (int64_t)v6;
-    v10 = *(void**)v4;
-    v11 = *(int64_t*)v10;
-    *(int64_t*)v7 = (int64_t)v11;
-    v14 = *(int64_t*)v7;
+    void* v8;
+    int64_t v21;
+    int64_t v18;
+    int64_t v20; /* placeholder for void */
+    int64_t v19; /* placeholder for void */
+    int64_t v22; /* placeholder for void */
+    int64_t v7; /* placeholder for void */
+    int64_t v12;
+    int64_t v4;
+    v3 = (char*)v1 + 0;
+    v4 = *(int64_t*)v3;
+    v5 = 0LL;
+    v6 = v4 == v5;
+    if (v6) goto bb2;
+    else goto bb3;
+  bb1:
+    v21 = 0LL;
     p_call_stack_pop();
-    return v14;
+    return v21;
+  bb2:
+    v8 = (char*)v1 + 8;
+    v9 = *(int64_t*)v8;
+    p_call_stack_pop();
+    return v9;
+  bb3:
+    v11 = (char*)v1 + 0;
+    v12 = *(int64_t*)v11;
+    v13 = 1LL;
+    v14 = v12 == v13;
+    if (v14) goto bb4;
+    else goto bb5;
+  bb4:
+    v16 = (char*)v1 + 8;
+    v17 = *(int64_t*)v16;
+    {
+        if (!v2) abort();
+        char* _fn_name = *(char**)v2;
+        if (!_fn_name) abort();
+        if (strcmp(_fn_name, "Vec_new") == 0) {
+            v18 = Vec_new((void*)v2);
+        } else if (strcmp(_fn_name, "HashMap_new") == 0) {
+            v18 = HashMap_new((void*)v2);
+        } else { abort(); }
+    }
+    p_call_stack_pop();
+    return v18;
+  bb5:
+    goto bb1;
     return 0;
 }
 
 bool p_str_equal(void* v0, int64_t v1, int64_t v2) {
     p_call_stack_push("p_str_equal");
-    int64_t v6; /* placeholder for void */
-    int64_t v74;
-    int64_t v78; /* placeholder for void */
-    int64_t v60;
-    bool v11;
-    bool v3;
-    bool v52;
-    bool v76;
-    bool v5;
-    void* v22;
-    void* v20;
-    int64_t v58; /* placeholder for void */
-    int64_t v8;
-    int64_t v48;
-    int64_t v13; /* placeholder for void */
-    int64_t v69; /* placeholder for void */
-    int64_t v30; /* placeholder for void */
-    int64_t v57;
-    bool v45;
-    int64_t v66; /* placeholder for void */
-    bool v42;
-    bool v9;
-    void* v37;
-    void* v67;
     int64_t v23; /* placeholder for void */
-    int64_t v24;
-    void* v70;
-    uint8_t v68;
-    int64_t v26; /* placeholder for void */
-    bool v17;
-    int64_t v41;
-    int64_t v54; /* placeholder for void */
-    int64_t v21; /* placeholder for void */
-    int64_t v63;
-    int64_t v18; /* placeholder for void */
-    int64_t v73; /* placeholder for void */
-    int64_t v65;
-    int64_t v75;
-    uint8_t v71;
-    int64_t v19; /* placeholder for void */
-    int64_t v51; /* placeholder for void */
-    int64_t v62; /* placeholder for void */
-    int64_t v7; /* placeholder for void */
-    bool v15;
     int64_t v4; /* placeholder for void */
-    int64_t v34; /* placeholder for void */
-    int64_t v44;
-    bool v46;
-    int64_t v61;
-    int64_t v77; /* placeholder for void */
-    int64_t v14;
-    int64_t v39; /* placeholder for void */
-    void* v25;
-    int64_t v27;
-    int64_t v43;
-    int64_t v59;
-    void* v31;
-    uint8_t v36;
-    int64_t v55;
-    int64_t v53; /* placeholder for void */
+    int64_t v13; /* placeholder for void */
     int64_t v40;
-    int64_t v47; /* placeholder for void */
-    bool v50;
-    uint8_t v32;
-    int64_t v56;
-    int64_t v12; /* placeholder for void */
-    void* v28;
+    int64_t v30; /* placeholder for void */
+    void* v20;
+    int64_t v61;
+    void* v22;
+    uint8_t v36;
+    int64_t v69; /* placeholder for void */
+    void* v70;
+    int64_t v75;
     int64_t v29; /* placeholder for void */
-    int64_t v49;
-    int64_t v38; /* placeholder for void */
+    int64_t v47; /* placeholder for void */
+    int64_t v60;
+    bool v3;
+    bool v46;
+    uint8_t v68;
+    bool v15;
+    int64_t v7; /* placeholder for void */
+    int64_t v59;
+    int64_t v51; /* placeholder for void */
+    int64_t v8;
     int64_t v64; /* placeholder for void */
+    bool v45;
+    bool v5;
+    int64_t v66; /* placeholder for void */
+    int64_t v58; /* placeholder for void */
+    int64_t v6; /* placeholder for void */
+    int64_t v24;
+    int64_t v18; /* placeholder for void */
+    int64_t v44;
+    void* v37;
+    int64_t v48;
+    int64_t v14;
+    bool v17;
+    bool v9;
+    int64_t v41;
     int64_t v10; /* placeholder for void */
+    void* v28;
+    bool v76;
+    int64_t v27;
+    int64_t v62; /* placeholder for void */
+    int64_t v63;
+    int64_t v56;
+    void* v25;
     int64_t v16; /* placeholder for void */
-    void* v33;
-    void* v35;
+    int64_t v55;
+    int64_t v77; /* placeholder for void */
+    int64_t v43;
+    bool v50;
+    int64_t v74;
+    uint8_t v71;
+    int64_t v26; /* placeholder for void */
+    void* v67;
+    int64_t v49;
+    bool v42;
+    int64_t v34; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    int64_t v53; /* placeholder for void */
+    int64_t v57;
+    int64_t v38; /* placeholder for void */
+    int64_t v39; /* placeholder for void */
+    int64_t v19; /* placeholder for void */
+    void* v31;
+    int64_t v54; /* placeholder for void */
+    int64_t v65;
+    int64_t v73; /* placeholder for void */
     int64_t v72; /* placeholder for void */
+    int64_t v21; /* placeholder for void */
+    uint8_t v32;
+    void* v35;
+    bool v52;
+    bool v11;
+    void* v33;
     v3 = v1 == v2;
     if (v3) goto bb1;
     else goto bb2;
@@ -12706,1463 +14850,439 @@ bool p_str_equal(void* v0, int64_t v1, int64_t v2) {
     return 0;
 }
 
-void Vec_truncate(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("Vec_truncate");
-    void* v5;
-    int64_t v16; /* placeholder for void */
-    int64_t v12; /* placeholder for void */
-    int64_t v6; /* placeholder for void */
-    int64_t v20; /* placeholder for void */
-    void* v9;
-    int64_t v10;
-    int64_t v22; /* placeholder for void */
-    int64_t v3;
-    int64_t v19; /* placeholder for void */
-    int64_t v4;
-    int64_t v15; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    int64_t v11; /* placeholder for void */
-    void* v17;
-    int64_t v21; /* placeholder for void */
-    void* v7;
-    int64_t v13;
-    int64_t v8; /* placeholder for void */
-    bool v14;
-    v3 = 8LL;
-    v4 = v1 + v3;
-    v5 = malloc(8);
-    *(void**)v5 = (void*)v4;
-    v7 = malloc(8);
-    v9 = *(void**)v5;
-    v10 = *(int64_t*)v9;
-    *(int64_t*)v7 = (int64_t)v10;
-    v13 = *(int64_t*)v7;
-    v14 = v2 < v13;
-    if (v14) goto bb1;
-    else goto bb2;
-  bb1:
-    v17 = *(void**)v5;
-    *(int64_t*)v17 = (int64_t)v2;
-    goto bb3;
-  bb2:
-    goto bb3;
-  bb3:
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-bool str_contains(void* v0, void* v1, void* v2) {
-    p_call_stack_push("str_contains");
-    int64_t v3;
-    bool v4;
+int64_t Vec_len(void* v0, int64_t v1) {
+    p_call_stack_push("Vec_len");
     int64_t v5; /* placeholder for void */
-    v3 = 0LL;
-    v4 = (bool)String_contains((void*)v3, (int64_t)v1, (int64_t)v2);
-    p_call_stack_pop();
-    return v4;
-    return 0;
-}
-
-int64_t str_len(void* v0, void* v1) {
-    p_call_stack_push("str_len");
-    int64_t v2;
-    int64_t v3;
-    int64_t v4; /* placeholder for void */
-    v2 = 0LL;
-    v3 = (int64_t)String_len((void*)v2, (int64_t)v1);
-    p_call_stack_pop();
-    return v3;
-    return 0;
-}
-
-int64_t Vec_get(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("Vec_get");
-    int64_t v8; /* placeholder for void */
-    int64_t v40; /* placeholder for void */
-    int64_t v14; /* placeholder for void */
-    int64_t v13; /* placeholder for void */
-    int64_t v37;
-    int64_t v33; /* placeholder for void */
-    int64_t v22;
-    int64_t v12;
-    int64_t v3;
-    int64_t v4;
-    bool v16;
-    bool v23;
-    int64_t v19; /* placeholder for void */
-    int64_t v26; /* placeholder for void */
-    void* v11;
-    int64_t v21; /* placeholder for void */
-    int64_t v35;
-    void* v39;
-    void* v18;
-    int64_t v34; /* placeholder for void */
-    int64_t v46; /* placeholder for void */
-    int64_t v24; /* placeholder for void */
-    int64_t v17; /* placeholder for void */
-    void* v31;
-    int64_t v47; /* placeholder for void */
-    int64_t v44;
-    int64_t v51; /* placeholder for void */
-    int64_t v52;
-    int64_t v53; /* placeholder for void */
-    int64_t v20; /* placeholder for void */
-    void* v25;
-    void* v42;
-    int64_t v36;
-    int64_t v49;
-    int64_t v27; /* placeholder for void */
-    void* v7;
-    int64_t v28; /* placeholder for void */
-    void* v45;
-    int64_t v32;
-    int64_t v41;
-    int64_t v38;
-    void* v9;
-    void* v29;
-    void* v5;
-    int64_t v15;
-    int64_t v10; /* placeholder for void */
-    int64_t v30; /* placeholder for void */
-    void* v48;
-    int64_t v50; /* placeholder for void */
-    int64_t v6; /* placeholder for void */
-    int64_t v43; /* placeholder for void */
-    v3 = 8LL;
-    v4 = v1 + v3;
-    v5 = malloc(8);
-    *(void**)v5 = (void*)v4;
-    v7 = malloc(8);
-    *(void**)v7 = (void*)v1;
-    v9 = malloc(8);
-    v11 = *(void**)v5;
-    v12 = *(int64_t*)v11;
-    *(int64_t*)v9 = (int64_t)v12;
-    v15 = *(int64_t*)v9;
-    v16 = v2 >= v15;
-    if (v16) goto bb1;
-    else goto bb2;
-  bb1:
-    v18 = _str13;
-    p_panic(v18);
-    goto bb3;
-  bb2:
-    goto bb3;
-  bb3:
-    v22 = 0LL;
-    v23 = v2 < v22;
-    if (v23) goto bb4;
-    else goto bb5;
-  bb4:
-    v25 = _str13;
-    p_panic(v25);
-    goto bb6;
-  bb5:
-    goto bb6;
-  bb6:
-    v29 = malloc(8);
-    v31 = *(void**)v7;
-    v32 = *(int64_t*)v31;
-    *(int64_t*)v29 = (int64_t)v32;
-    v35 = *(int64_t*)v29;
-    v36 = 8LL;
-    v37 = v2 * v36;
-    v38 = v35 + v37;
-    v39 = malloc(8);
-    *(int64_t*)v39 = (int64_t)v38;
-    v41 = *(int64_t*)v39;
-    v42 = malloc(8);
-    *(void**)v42 = (void*)v41;
-    v44 = 0LL;
-    v45 = malloc(8);
-    *(int64_t*)v45 = (int64_t)v44;
-    v48 = *(void**)v42;
-    v49 = *(int64_t*)v48;
-    *(int64_t*)v45 = (int64_t)v49;
-    v52 = *(int64_t*)v45;
-    p_call_stack_pop();
-    return v52;
-    return 0;
-}
-
-int64_t String_to_lowercase(void* v0, int64_t v1) {
-    p_call_stack_push("String_to_lowercase");
-    int64_t v15; /* placeholder for void */
-    void* v54;
-    int64_t v21;
-    int64_t v82;
-    int64_t v29; /* placeholder for void */
-    void* v94;
-    int64_t v81;
-    int64_t v2;
-    int64_t v20;
-    int64_t v60; /* placeholder for void */
-    int64_t v24;
-    void* v27;
-    int64_t v78; /* placeholder for void */
-    int64_t v99; /* placeholder for void */
-    int64_t v34;
-    void* v51;
-    int64_t v52; /* placeholder for void */
-    int64_t v89; /* placeholder for void */
-    int64_t v35;
-    int64_t v69;
-    int64_t v98;
-    int64_t v42;
-    int64_t v77;
-    void* v91;
-    int64_t v59; /* placeholder for void */
-    int64_t v23; /* placeholder for void */
-    int64_t v87;
-    int64_t v43;
-    int64_t v93; /* placeholder for void */
-    int64_t v11; /* placeholder for void */
-    void* v13;
-    int64_t v47;
-    int64_t v97; /* placeholder for void */
-    void* v57;
-    int64_t v49; /* placeholder for void */
-    int64_t v12; /* placeholder for void */
-    int64_t v46; /* placeholder for void */
-    int64_t v19; /* placeholder for void */
-    int64_t v68; /* placeholder for void */
-    int64_t v72; /* placeholder for void */
-    int64_t v84; /* placeholder for void */
-    int64_t v39;
-    void* v45;
-    int64_t v71;
-    void* v40;
-    int64_t v64;
-    int64_t v61;
-    int64_t v86;
-    int64_t v37; /* placeholder for void */
-    int64_t v50;
-    int64_t v14;
-    int64_t v79; /* placeholder for void */
-    void* v10;
-    int64_t v85;
-    int64_t v96; /* placeholder for void */
-    void* v28;
-    void* v7;
-    int64_t v17;
-    int64_t v30;
-    int64_t v33; /* placeholder for void */
-    int64_t v8; /* placeholder for void */
-    int64_t v53;
-    uint8_t v58;
-    int64_t v62;
-    int64_t v41; /* placeholder for void */
-    int64_t v38;
-    int64_t v65;
-    void* v76;
-    int64_t v80;
-    int64_t v26;
-    int64_t v90;
-    int64_t v16; /* placeholder for void */
-    int64_t v83; /* placeholder for void */
-    bool v63;
-    int64_t v92; /* placeholder for void */
-    int64_t v95;
-    int64_t v4; /* placeholder for void */
-    void* v6;
-    void* v31;
-    void* v88;
-    int64_t v73; /* placeholder for void */
-    int64_t v55; /* placeholder for void */
     int64_t v9;
-    int64_t v32; /* placeholder for void */
-    bool v3;
-    int64_t v5;
-    int64_t v18; /* placeholder for void */
-    int64_t v25;
-    bool v36;
-    bool v66;
-    bool v67;
-    int64_t v70;
-    int64_t v44;
-    int64_t v74; /* placeholder for void */
-    void* v22;
-    int64_t v75; /* placeholder for void */
-    void* v48;
-    int64_t v56; /* placeholder for void */
-    v2 = 0LL;
-    v3 = v1 == v2;
-    if (v3) goto bb1;
-    else goto bb2;
-  bb1:
-    v5 = 1LL;
-    v6 = p_malloc(v5);
-    v7 = malloc(8);
-    *(int64_t*)v7 = (int64_t)v6;
-    v9 = *(int64_t*)v7;
-    v10 = malloc(8);
-    *(void**)v10 = (void*)v9;
-    v13 = *(void**)v10;
-    v14 = 0LL;
-    *(uint8_t*)v13 = (uint8_t)v14;
-    v17 = *(int64_t*)v7;
-    p_call_stack_pop();
-    return v17;
-  bb2:
-    goto bb3;
-  bb3:
-    v20 = 0LL;
-    v21 = (int64_t)p_str_length((void*)v20, v1);
-    v22 = malloc(8);
-    *(int64_t*)v22 = (int64_t)v21;
-    v24 = *(int64_t*)v22;
-    v25 = 1LL;
-    v26 = v24 + v25;
-    v27 = p_malloc(v26);
-    v28 = malloc(8);
-    *(int64_t*)v28 = (int64_t)v27;
-    v30 = 0LL;
-    v31 = malloc(8);
-    *(int64_t*)v31 = (int64_t)v30;
-    goto bb4;
-  bb4:
-    v34 = *(int64_t*)v31;
-    v35 = *(int64_t*)v22;
-    v36 = v34 < v35;
-    if (v36) goto bb5;
-    else goto bb6;
-  bb5:
-    v38 = *(int64_t*)v31;
-    v39 = v1 + v38;
-    v40 = malloc(8);
-    *(int64_t*)v40 = (int64_t)v39;
-    v42 = *(int64_t*)v28;
-    v43 = *(int64_t*)v31;
-    v44 = v42 + v43;
-    v45 = malloc(8);
-    *(int64_t*)v45 = (int64_t)v44;
-    v47 = *(int64_t*)v40;
-    v48 = malloc(8);
-    *(void**)v48 = (void*)v47;
-    v50 = *(int64_t*)v45;
-    v51 = malloc(8);
-    *(void**)v51 = (void*)v50;
-    v53 = 0LL;
-    v54 = malloc(8);
-    *(int64_t*)v54 = (int64_t)v53;
-    v57 = *(void**)v48;
-    v58 = *(uint8_t*)v57;
-    *(int64_t*)v54 = (int64_t)v58;
-    v61 = *(int64_t*)v54;
-    v62 = 65LL;
-    v63 = v61 >= v62;
-    v64 = *(int64_t*)v54;
-    v65 = 90LL;
-    v66 = v64 <= v65;
-    v67 = v63 && v66;
-    if (v67) goto bb7;
-    else goto bb8;
-  bb6:
-    v85 = *(int64_t*)v28;
-    v86 = *(int64_t*)v22;
-    v87 = v85 + v86;
-    v88 = malloc(8);
-    *(int64_t*)v88 = (int64_t)v87;
-    v90 = *(int64_t*)v88;
-    v91 = malloc(8);
-    *(void**)v91 = (void*)v90;
-    v94 = *(void**)v91;
-    v95 = 0LL;
-    *(uint8_t*)v94 = (uint8_t)v95;
-    v98 = *(int64_t*)v28;
-    p_call_stack_pop();
-    return v98;
-  bb7:
-    v69 = *(int64_t*)v54;
-    v70 = 32LL;
-    v71 = v69 + v70;
-    *(int64_t*)v54 = (int64_t)v71;
-    goto bb9;
-  bb8:
-    goto bb9;
-  bb9:
-    v76 = *(void**)v51;
-    v77 = *(int64_t*)v54;
-    *(uint8_t*)v76 = (uint8_t)v77;
-    v80 = *(int64_t*)v31;
-    v81 = 1LL;
-    v82 = v80 + v81;
-    *(int64_t*)v31 = (int64_t)v82;
-    goto bb4;
-    return 0;
-}
-
-void Result_map_err(void* v0, void* v1, void* v2, void* v3) {
-    p_call_stack_push("Result_map_err");
-    void* v11;
-    int64_t v12;
-    int64_t v6;
-    bool v29;
-    int64_t v23;
-    int64_t v32;
-    int64_t v46;
-    int64_t v30; /* placeholder for void */
-    int64_t v25; /* placeholder for void */
-    int64_t v48; /* placeholder for void */
-    void* v40;
-    void* v13;
-    int64_t v19;
-    int64_t v28;
-    int64_t v16; /* placeholder for void */
-    int64_t v10;
-    void* v4;
-    int64_t v5;
-    void* v21;
-    void* v38;
-    void* v41;
-    int64_t v49; /* placeholder for void */
-    void* v44;
-    void* v35;
-    void* v9;
-    int64_t v50; /* placeholder for void */
-    int64_t v43; /* placeholder for void */
-    int64_t v47; /* placeholder for void */
-    int64_t v37;
-    void* v17;
-    int64_t v8; /* placeholder for void */
-    int64_t v42;
-    int64_t v39; /* placeholder for void */
-    void* v18;
-    int64_t v36; /* placeholder for void */
-    void* v45;
-    void* v22;
-    void* v15;
-    void* v31;
-    int64_t v34;
-    int64_t v20; /* placeholder for void */
-    void* v33;
-    int64_t v14; /* placeholder for void */
-    int64_t v27;
-    int64_t v24; /* placeholder for void */
-    void* v26;
-    bool v7;
-    v4 = (char*)v2 + 0;
-    v5 = *(int64_t*)v4;
-    v6 = 0LL;
-    v7 = v5 == v6;
-    if (v7) goto bb2;
-    else goto bb3;
-  bb1:
-    p_call_stack_pop();
-    return;
-  bb2:
-    v9 = (char*)v2 + 8;
-    v10 = *(int64_t*)v9;
-    v11 = malloc(16);
-    v12 = 0LL;
-    v13 = (char*)v11 + 0;
-    *(int64_t*)v13 = (int64_t)v12;
-    v15 = (char*)v11 + 8;
-    *(int64_t*)v15 = (int64_t)v10;
-    v17 = (char*)v11 + 0;
-    v18 = (char*)v0 + 0;
-    v19 = *(int64_t*)v17;
-    *(int64_t*)v18 = (int64_t)v19;
-    v21 = (char*)v11 + 8;
-    v22 = (char*)v0 + 8;
-    v23 = *(int64_t*)v21;
-    *(int64_t*)v22 = (int64_t)v23;
-    p_call_stack_pop();
-    return;
-  bb3:
-    v26 = (char*)v2 + 0;
-    v27 = *(int64_t*)v26;
-    v28 = 1LL;
-    v29 = v27 == v28;
-    if (v29) goto bb4;
-    else goto bb5;
-  bb4:
-    v31 = (char*)v2 + 8;
-    v32 = *(int64_t*)v31;
-    v33 = malloc(16);
-    v34 = 1LL;
-    v35 = (char*)v33 + 0;
-    *(int64_t*)v35 = (int64_t)v34;
-    {
-        if (!v3) abort();
-        char* _fn_name = *(char**)v3;
-        if (!_fn_name) abort();
-        if (strcmp(_fn_name, "str_parse_hex") == 0) {
-            v37 = str_parse_hex((void*)v3, (void*)v32);
-        } else if (strcmp(_fn_name, "String_char_count") == 0) {
-            v37 = String_char_count((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "abs") == 0) {
-            v37 = p_abs((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "p_str_length") == 0) {
-            v37 = p_str_length((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "Vec_first") == 0) {
-            v37 = Vec_first((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "Vec_clone") == 0) {
-            v37 = Vec_clone((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "HashMap_clone") == 0) {
-            v37 = HashMap_clone((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "HashMap_len") == 0) {
-            v37 = HashMap_len((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "String_bytes") == 0) {
-            v37 = String_bytes((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "ByteBuffer_len") == 0) {
-            v37 = ByteBuffer_len((void*)v3, (void*)v32);
-        } else if (strcmp(_fn_name, "Vec_len") == 0) {
-            v37 = Vec_len((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "String_clone") == 0) {
-            v37 = String_clone((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "HashMap_keys") == 0) {
-            v37 = HashMap_keys((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "str_parse_int") == 0) {
-            v37 = str_parse_int((void*)v3, (void*)v32);
-        } else if (strcmp(_fn_name, "String_trim") == 0) {
-            v37 = String_trim((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "Vec_capacity") == 0) {
-            v37 = Vec_capacity((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "String_parse_int") == 0) {
-            v37 = String_parse_int((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "char_to_upper") == 0) {
-            v37 = char_to_upper((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "Vec_last") == 0) {
-            v37 = Vec_last((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "Vec_pop") == 0) {
-            v37 = Vec_pop((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "allocator_bytes_used") == 0) {
-            v37 = allocator_bytes_used((void*)v3, (void*)v32);
-        } else if (strcmp(_fn_name, "Option_unwrap") == 0) {
-            v37 = Option_unwrap((void*)v3, (void*)v32);
-        } else if (strcmp(_fn_name, "String_to_string") == 0) {
-            v37 = String_to_string((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "String_to_lowercase") == 0) {
-            v37 = String_to_lowercase((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "StringBuilder_len") == 0) {
-            v37 = StringBuilder_len((void*)v3, (void*)v32);
-        } else if (strcmp(_fn_name, "p_str_hash") == 0) {
-            v37 = p_str_hash((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "char_to_lower") == 0) {
-            v37 = char_to_lower((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "Result_unwrap") == 0) {
-            v37 = Result_unwrap((void*)v3, (void*)v32);
-        } else if (strcmp(_fn_name, "String_from") == 0) {
-            v37 = String_from((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "String_to_uppercase") == 0) {
-            v37 = String_to_uppercase((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "HashMap_values") == 0) {
-            v37 = HashMap_values((void*)v3, (int64_t)v32);
-        } else if (strcmp(_fn_name, "str_len") == 0) {
-            v37 = str_len((void*)v3, (void*)v32);
-        } else if (strcmp(_fn_name, "String_len") == 0) {
-            v37 = String_len((void*)v3, (int64_t)v32);
-        } else { abort(); }
-    }
-    v38 = (char*)v33 + 8;
-    *(int64_t*)v38 = (int64_t)v37;
-    v40 = (char*)v33 + 0;
-    v41 = (char*)v0 + 0;
-    v42 = *(int64_t*)v40;
-    *(int64_t*)v41 = (int64_t)v42;
-    v44 = (char*)v33 + 8;
-    v45 = (char*)v0 + 8;
-    v46 = *(int64_t*)v44;
-    *(int64_t*)v45 = (int64_t)v46;
-    p_call_stack_pop();
-    return;
-  bb5:
-    goto bb1;
-    return;
-}
-
-void ByteBuffer_new(void* v0, void* v1, int64_t v2) {
-    p_call_stack_push("ByteBuffer_new");
-    void* v16;
-    int64_t v7; /* placeholder for void */
-    int64_t v10; /* placeholder for void */
-    int64_t v14; /* placeholder for void */
-    void* v15;
-    int64_t v17;
-    void* v9;
-    int64_t v18; /* placeholder for void */
-    int64_t v4;
-    void* v13;
-    void* v11;
-    void* v6;
-    void* v5;
-    void* v12;
-    void* v3;
-    int64_t v19; /* placeholder for void */
-    int64_t v8;
-    v3 = malloc(16);
-    v4 = 0LL;
-    v5 = (void*)Vec_new((void*)v4);
-    v6 = (char*)v3 + 0;
-    *(void**)v6 = (void*)v5;
-    v8 = 0LL;
-    v9 = (char*)v3 + 8;
-    *(int64_t*)v9 = (int64_t)v8;
-    v11 = (char*)v3 + 0;
-    v12 = (char*)v0 + 0;
-    v13 = *(void**)v11;
-    *(void**)v12 = (void*)v13;
-    v15 = (char*)v3 + 8;
-    v16 = (char*)v0 + 8;
-    v17 = *(int64_t*)v15;
-    *(int64_t*)v16 = (int64_t)v17;
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-int64_t HashMap_clone(void* v0, int64_t v1) {
-    p_call_stack_push("HashMap_clone");
-    void* v29;
-    int64_t v70;
-    void* v4;
-    int64_t v34; /* placeholder for void */
-    int64_t v47;
-    int64_t v57;
-    int64_t v67; /* placeholder for void */
-    int64_t v74;
-    int64_t v103;
-    void* v32;
-    int64_t v112;
-    void* v90;
-    int64_t v22;
-    int64_t v101;
-    int64_t v97;
-    int64_t v111; /* placeholder for void */
-    int64_t v56;
-    int64_t v3;
-    int64_t v12;
-    int64_t v31; /* placeholder for void */
-    int64_t v61; /* placeholder for void */
-    int64_t v89;
-    int64_t v37;
-    int64_t v71; /* placeholder for void */
-    void* v63;
-    int64_t v62;
-    int64_t v24; /* placeholder for void */
-    int64_t v110; /* placeholder for void */
-    int64_t v6;
-    void* v26;
-    int64_t v58;
-    void* v23;
-    bool v75;
-    int64_t v55;
-    int64_t v27;
-    int64_t v108;
-    int64_t v81; /* placeholder for void */
-    int64_t v5; /* placeholder for void */
-    int64_t v52;
-    int64_t v13;
-    int64_t v54; /* placeholder for void */
-    bool v42;
-    int64_t v91; /* placeholder for void */
-    int64_t v65;
-    int64_t v76;
-    int64_t v30;
-    int64_t v36;
-    int64_t v85;
-    int64_t v40;
-    void* v17;
-    int64_t v7;
-    int64_t v105; /* placeholder for void */
-    int64_t v92;
-    int64_t v109;
-    int64_t v100;
-    int64_t v39;
-    bool v41;
-    int64_t v9; /* placeholder for void */
-    bool v80;
-    int64_t v99; /* placeholder for void */
-    int64_t v46; /* placeholder for void */
-    int64_t v45; /* placeholder for void */
-    void* v69;
-    int64_t v15; /* placeholder for void */
-    int64_t v107;
-    void* v66;
-    int64_t v82;
-    int64_t v49; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    int64_t v86;
-    int64_t v94; /* placeholder for void */
-    bool v79;
-    int64_t v98; /* placeholder for void */
-    int64_t v44;
-    void* v96;
-    int64_t v73;
-    int64_t v25; /* placeholder for void */
-    void* v48;
-    int64_t v51;
-    void* v10;
-    int64_t v84;
-    int64_t v33;
-    bool v38;
-    int64_t v104; /* placeholder for void */
-    int64_t v113; /* placeholder for void */
-    int64_t v21; /* placeholder for void */
-    int64_t v28; /* placeholder for void */
-    int64_t v95; /* placeholder for void */
-    void* v60;
-    int64_t v43; /* placeholder for void */
-    int64_t v19;
-    int64_t v106; /* placeholder for void */
-    int64_t v50; /* placeholder for void */
-    int64_t v102;
-    int64_t v16;
-    bool v53;
-    int64_t v77;
-    int64_t v64; /* placeholder for void */
-    int64_t v68; /* placeholder for void */
-    void* v14;
-    int64_t v72; /* placeholder for void */
-    void* v93;
-    int64_t v2;
     int64_t v11; /* placeholder for void */
-    int64_t v83;
-    void* v87;
-    int64_t v78;
+    int64_t v10; /* placeholder for void */
     void* v8;
-    void* v20;
-    int64_t v88; /* placeholder for void */
-    int64_t v35; /* placeholder for void */
-    int64_t v59;
-    v2 = 0LL;
-    v3 = (int64_t)HashMap_new((void*)v2);
-    v4 = malloc(8);
-    *(int64_t*)v4 = (int64_t)v3;
-    v6 = 24LL;
-    v7 = v1 + v6;
-    v8 = malloc(8);
-    *(void**)v8 = (void*)v7;
-    v10 = malloc(8);
-    *(void**)v10 = (void*)v1;
-    v12 = 8LL;
-    v13 = v1 + v12;
-    v14 = malloc(8);
-    *(void**)v14 = (void*)v13;
-    v16 = 0LL;
-    v17 = malloc(8);
-    *(int64_t*)v17 = (int64_t)v16;
-    v19 = 0LL;
-    v20 = malloc(8);
-    *(int64_t*)v20 = (int64_t)v19;
-    v22 = 0LL;
-    v23 = malloc(8);
-    *(int64_t*)v23 = (int64_t)v22;
-    v26 = *(void**)v8;
-    v27 = *(int64_t*)v26;
-    *(int64_t*)v17 = (int64_t)v27;
-    v29 = *(void**)v10;
-    v30 = *(int64_t*)v29;
-    *(int64_t*)v20 = (int64_t)v30;
-    v32 = *(void**)v14;
-    v33 = *(int64_t*)v32;
-    *(int64_t*)v23 = (int64_t)v33;
-    v36 = *(int64_t*)v20;
-    v37 = 0LL;
-    v38 = v36 == v37;
-    v39 = *(int64_t*)v17;
-    v40 = 0LL;
-    v41 = v39 == v40;
-    v42 = v38 || v41;
-    if (v42) goto bb1;
-    else goto bb2;
-  bb1:
-    v44 = *(int64_t*)v4;
-    p_call_stack_pop();
-    return v44;
-  bb2:
-    goto bb3;
-  bb3:
-    v47 = 0LL;
-    v48 = malloc(8);
-    *(int64_t*)v48 = (int64_t)v47;
-    goto bb4;
-  bb4:
-    v51 = *(int64_t*)v48;
-    v52 = *(int64_t*)v17;
-    v53 = v51 < v52;
-    if (v53) goto bb5;
-    else goto bb6;
-  bb5:
-    v55 = *(int64_t*)v20;
-    v56 = *(int64_t*)v48;
-    v57 = 8LL;
-    v58 = v56 * v57;
-    v59 = v55 + v58;
-    v60 = malloc(8);
-    *(int64_t*)v60 = (int64_t)v59;
-    v62 = *(int64_t*)v60;
-    v63 = malloc(8);
-    *(void**)v63 = (void*)v62;
-    v65 = 0LL;
-    v66 = malloc(8);
-    *(int64_t*)v66 = (int64_t)v65;
-    v69 = *(void**)v63;
-    v70 = *(int64_t*)v69;
-    *(int64_t*)v66 = (int64_t)v70;
-    v73 = *(int64_t*)v66;
-    v74 = 0LL;
-    v75 = v73 != v74;
-    v76 = *(int64_t*)v66;
-    v77 = 1LL;
-    v78 = -v77;
-    v79 = v76 != v78;
-    v80 = v75 && v79;
-    if (v80) goto bb7;
-    else goto bb8;
-  bb6:
-    v112 = *(int64_t*)v4;
-    p_call_stack_pop();
-    return v112;
-  bb7:
-    v82 = *(int64_t*)v23;
-    v83 = *(int64_t*)v48;
-    v84 = 8LL;
-    v85 = v83 * v84;
-    v86 = v82 + v85;
-    v87 = malloc(8);
-    *(int64_t*)v87 = (int64_t)v86;
-    v89 = *(int64_t*)v87;
-    v90 = malloc(8);
-    *(void**)v90 = (void*)v89;
-    v92 = 0LL;
-    v93 = malloc(8);
-    *(int64_t*)v93 = (int64_t)v92;
-    v96 = *(void**)v90;
-    v97 = *(int64_t*)v96;
-    *(int64_t*)v93 = (int64_t)v97;
-    v100 = *(int64_t*)v4;
-    v101 = *(int64_t*)v66;
-    v102 = *(int64_t*)v93;
-    v103 = 0LL;
-    HashMap_insert((void*)v103, v100, v101, v102);
-    goto bb9;
-  bb8:
-    goto bb9;
-  bb9:
-    v107 = *(int64_t*)v48;
-    v108 = 1LL;
-    v109 = v107 + v108;
-    *(int64_t*)v48 = (int64_t)v109;
-    goto bb4;
-    return 0;
-}
-
-int64_t StringBuilder_len(void* v0, void* v1) {
-    p_call_stack_push("StringBuilder_len");
     int64_t v3;
-    int64_t v4; /* placeholder for void */
-    void* v2;
-    v2 = (char*)v1 + 8;
-    v3 = *(int64_t*)v2;
-    p_call_stack_pop();
-    return v3;
-    return 0;
-}
-
-int64_t String_to_uppercase(void* v0, int64_t v1) {
-    p_call_stack_push("String_to_uppercase");
-    void* v94;
-    int64_t v97; /* placeholder for void */
-    int64_t v39;
-    void* v27;
-    int64_t v90;
-    void* v6;
-    int64_t v99; /* placeholder for void */
-    int64_t v8; /* placeholder for void */
-    int64_t v42;
-    int64_t v33; /* placeholder for void */
-    int64_t v15; /* placeholder for void */
-    int64_t v14;
-    int64_t v38;
-    bool v3;
-    int64_t v70;
-    int64_t v98;
-    int64_t v46; /* placeholder for void */
-    int64_t v19; /* placeholder for void */
-    int64_t v64;
-    bool v67;
-    int64_t v29; /* placeholder for void */
-    int64_t v4; /* placeholder for void */
-    int64_t v43;
-    void* v10;
-    int64_t v11; /* placeholder for void */
-    int64_t v56; /* placeholder for void */
-    int64_t v95;
-    int64_t v55; /* placeholder for void */
-    int64_t v74; /* placeholder for void */
-    int64_t v2;
-    int64_t v23; /* placeholder for void */
-    int64_t v85;
-    int64_t v79; /* placeholder for void */
-    void* v7;
-    int64_t v25;
-    int64_t v68; /* placeholder for void */
-    int64_t v69;
-    bool v63;
-    void* v22;
-    int64_t v77;
-    int64_t v47;
-    int64_t v20;
-    int64_t v82;
-    int64_t v17;
-    void* v13;
-    int64_t v78; /* placeholder for void */
-    int64_t v53;
-    int64_t v24;
-    int64_t v34;
-    void* v51;
-    int64_t v18; /* placeholder for void */
-    int64_t v96; /* placeholder for void */
-    int64_t v49; /* placeholder for void */
-    int64_t v65;
-    int64_t v35;
-    void* v76;
-    int64_t v12; /* placeholder for void */
-    int64_t v59; /* placeholder for void */
-    int64_t v72; /* placeholder for void */
-    int64_t v83; /* placeholder for void */
-    int64_t v89; /* placeholder for void */
-    int64_t v87;
-    int64_t v52; /* placeholder for void */
-    int64_t v62;
-    int64_t v26;
-    void* v45;
-    int64_t v41; /* placeholder for void */
-    void* v54;
-    int64_t v75; /* placeholder for void */
-    void* v88;
-    void* v91;
-    int64_t v44;
-    int64_t v61;
-    int64_t v5;
-    bool v66;
-    int64_t v93; /* placeholder for void */
-    void* v28;
-    int64_t v9;
-    void* v57;
-    int64_t v37; /* placeholder for void */
-    int64_t v80;
-    int64_t v81;
-    int64_t v86;
-    int64_t v32; /* placeholder for void */
-    int64_t v21;
-    int64_t v30;
-    int64_t v60; /* placeholder for void */
-    int64_t v71;
-    uint8_t v58;
-    int64_t v16; /* placeholder for void */
-    void* v48;
-    int64_t v50;
-    bool v36;
-    int64_t v73; /* placeholder for void */
-    void* v40;
-    void* v31;
-    int64_t v84; /* placeholder for void */
-    int64_t v92; /* placeholder for void */
-    v2 = 0LL;
-    v3 = v1 == v2;
-    if (v3) goto bb1;
-    else goto bb2;
-  bb1:
-    v5 = 1LL;
-    v6 = p_malloc(v5);
-    v7 = malloc(8);
-    *(int64_t*)v7 = (int64_t)v6;
-    v9 = *(int64_t*)v7;
-    v10 = malloc(8);
-    *(void**)v10 = (void*)v9;
-    v13 = *(void**)v10;
-    v14 = 0LL;
-    *(uint8_t*)v13 = (uint8_t)v14;
-    v17 = *(int64_t*)v7;
-    p_call_stack_pop();
-    return v17;
-  bb2:
-    goto bb3;
-  bb3:
-    v20 = 0LL;
-    v21 = (int64_t)p_str_length((void*)v20, v1);
-    v22 = malloc(8);
-    *(int64_t*)v22 = (int64_t)v21;
-    v24 = *(int64_t*)v22;
-    v25 = 1LL;
-    v26 = v24 + v25;
-    v27 = p_malloc(v26);
-    v28 = malloc(8);
-    *(int64_t*)v28 = (int64_t)v27;
-    v30 = 0LL;
-    v31 = malloc(8);
-    *(int64_t*)v31 = (int64_t)v30;
-    goto bb4;
-  bb4:
-    v34 = *(int64_t*)v31;
-    v35 = *(int64_t*)v22;
-    v36 = v34 < v35;
-    if (v36) goto bb5;
-    else goto bb6;
-  bb5:
-    v38 = *(int64_t*)v31;
-    v39 = v1 + v38;
-    v40 = malloc(8);
-    *(int64_t*)v40 = (int64_t)v39;
-    v42 = *(int64_t*)v28;
-    v43 = *(int64_t*)v31;
-    v44 = v42 + v43;
-    v45 = malloc(8);
-    *(int64_t*)v45 = (int64_t)v44;
-    v47 = *(int64_t*)v40;
-    v48 = malloc(8);
-    *(void**)v48 = (void*)v47;
-    v50 = *(int64_t*)v45;
-    v51 = malloc(8);
-    *(void**)v51 = (void*)v50;
-    v53 = 0LL;
-    v54 = malloc(8);
-    *(int64_t*)v54 = (int64_t)v53;
-    v57 = *(void**)v48;
-    v58 = *(uint8_t*)v57;
-    *(int64_t*)v54 = (int64_t)v58;
-    v61 = *(int64_t*)v54;
-    v62 = 97LL;
-    v63 = v61 >= v62;
-    v64 = *(int64_t*)v54;
-    v65 = 122LL;
-    v66 = v64 <= v65;
-    v67 = v63 && v66;
-    if (v67) goto bb7;
-    else goto bb8;
-  bb6:
-    v85 = *(int64_t*)v28;
-    v86 = *(int64_t*)v22;
-    v87 = v85 + v86;
-    v88 = malloc(8);
-    *(int64_t*)v88 = (int64_t)v87;
-    v90 = *(int64_t*)v88;
-    v91 = malloc(8);
-    *(void**)v91 = (void*)v90;
-    v94 = *(void**)v91;
-    v95 = 0LL;
-    *(uint8_t*)v94 = (uint8_t)v95;
-    v98 = *(int64_t*)v28;
-    p_call_stack_pop();
-    return v98;
-  bb7:
-    v69 = *(int64_t*)v54;
-    v70 = 32LL;
-    v71 = v69 - v70;
-    *(int64_t*)v54 = (int64_t)v71;
-    goto bb9;
-  bb8:
-    goto bb9;
-  bb9:
-    v76 = *(void**)v51;
-    v77 = *(int64_t*)v54;
-    *(uint8_t*)v76 = (uint8_t)v77;
-    v80 = *(int64_t*)v31;
-    v81 = 1LL;
-    v82 = v80 + v81;
-    *(int64_t*)v31 = (int64_t)v82;
-    goto bb4;
-    return 0;
-}
-
-int64_t str_compare(void* v0, void* v1, void* v2) {
-    p_call_stack_push("str_compare");
-    int64_t v3;
-    int64_t v5; /* placeholder for void */
-    int64_t v4;
-    v3 = 0LL;
-    v4 = (int64_t)p_str_compare((void*)v3, (int64_t)v1, (int64_t)v2);
-    p_call_stack_pop();
-    return v4;
-    return 0;
-}
-
-int64_t Vec_new(void* v0) {
-    p_call_stack_push("Vec_new");
-    void* v2;
-    int64_t v5;
-    void* v22;
-    int64_t v26;
-    int64_t v10;
-    void* v3;
-    void* v19;
-    int64_t v7; /* placeholder for void */
-    int64_t v27; /* placeholder for void */
-    int64_t v17; /* placeholder for void */
-    int64_t v14;
-    int64_t v30; /* placeholder for void */
-    void* v25;
-    int64_t v28; /* placeholder for void */
-    int64_t v4; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    int64_t v15;
-    int64_t v8;
-    void* v16;
-    int64_t v21; /* placeholder for void */
-    int64_t v23;
-    void* v11;
-    int64_t v24; /* placeholder for void */
-    int64_t v1;
-    int64_t v12; /* placeholder for void */
-    int64_t v29;
-    int64_t v20;
-    void* v6;
-    int64_t v9;
-    int64_t v13;
-    v1 = 24LL;
-    v2 = p_malloc(v1);
-    v3 = malloc(8);
-    *(int64_t*)v3 = (int64_t)v2;
-    v5 = *(int64_t*)v3;
-    v6 = malloc(8);
-    *(void**)v6 = (void*)v5;
-    v8 = *(int64_t*)v3;
-    v9 = 8LL;
-    v10 = v8 + v9;
-    v11 = malloc(8);
-    *(void**)v11 = (void*)v10;
-    v13 = *(int64_t*)v3;
-    v14 = 16LL;
-    v15 = v13 + v14;
-    v16 = malloc(8);
-    *(void**)v16 = (void*)v15;
-    v19 = *(void**)v6;
-    v20 = 0LL;
-    *(int64_t*)v19 = (int64_t)v20;
-    v22 = *(void**)v11;
-    v23 = 0LL;
-    *(int64_t*)v22 = (int64_t)v23;
-    v25 = *(void**)v16;
-    v26 = 0LL;
-    *(int64_t*)v25 = (int64_t)v26;
-    v29 = *(int64_t*)v3;
-    p_call_stack_pop();
-    return v29;
-    return 0;
-}
-
-int64_t String_find(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("String_find");
-    int64_t v54;
-    int64_t v104; /* placeholder for void */
-    int64_t v97;
-    int64_t v94; /* placeholder for void */
-    bool v100;
-    int64_t v79; /* placeholder for void */
-    int64_t v95;
-    bool v89;
-    int64_t v31; /* placeholder for void */
-    void* v83;
-    int64_t v40;
-    int64_t v62; /* placeholder for void */
-    void* v77;
-    int64_t v53;
-    int64_t v43;
-    int64_t v88;
-    int64_t v99; /* placeholder for void */
-    void* v19;
-    int64_t v3;
-    int64_t v25;
-    int64_t v28;
-    int64_t v101; /* placeholder for void */
-    void* v80;
-    int64_t v86; /* placeholder for void */
-    int64_t v9;
-    bool v46;
-    int64_t v70;
-    int64_t v52; /* placeholder for void */
-    bool v23;
-    int64_t v10;
-    int64_t v34; /* placeholder for void */
-    int64_t v67;
-    int64_t v90; /* placeholder for void */
-    int64_t v102;
-    bool v91;
-    int64_t v41;
-    int64_t v82; /* placeholder for void */
-    void* v61;
-    int64_t v16; /* placeholder for void */
-    int64_t v108; /* placeholder for void */
-    bool v7;
-    int64_t v48; /* placeholder for void */
-    int64_t v49;
-    int64_t v18;
-    int64_t v76;
-    int64_t v45; /* placeholder for void */
-    void* v71;
-    int64_t v5;
-    int64_t v27; /* placeholder for void */
-    int64_t v66; /* placeholder for void */
-    uint8_t v81;
-    int64_t v103; /* placeholder for void */
-    int64_t v17;
-    int64_t v69; /* placeholder for void */
-    int64_t v21;
-    int64_t v59;
-    int64_t v98; /* placeholder for void */
-    int64_t v63;
-    int64_t v75; /* placeholder for void */
-    int64_t v85; /* placeholder for void */
-    bool v4;
-    void* v50;
-    bool v44;
-    int64_t v106;
-    int64_t v112; /* placeholder for void */
-    int64_t v13;
-    int64_t v64;
-    int64_t v26; /* placeholder for void */
-    int64_t v105;
-    int64_t v110;
-    int64_t v107;
-    void* v15;
-    int64_t v58;
-    int64_t v12; /* placeholder for void */
-    int64_t v51; /* placeholder for void */
-    int64_t v11; /* placeholder for void */
-    int64_t v87;
-    int64_t v96;
-    int64_t v24; /* placeholder for void */
-    int64_t v35; /* placeholder for void */
-    int64_t v111;
-    int64_t v33;
-    int64_t v8; /* placeholder for void */
-    bool v55;
-    void* v74;
-    int64_t v56; /* placeholder for void */
-    int64_t v92; /* placeholder for void */
-    int64_t v22;
-    int64_t v73;
-    void* v37;
-    int64_t v42;
-    int64_t v20; /* placeholder for void */
-    int64_t v72; /* placeholder for void */
-    int64_t v39; /* placeholder for void */
-    bool v6;
-    int64_t v78; /* placeholder for void */
-    int64_t v38; /* placeholder for void */
-    int64_t v109; /* placeholder for void */
-    void* v47;
-    int64_t v32;
-    void* v65;
-    bool v30;
-    int64_t v57;
-    int64_t v60;
-    int64_t v36;
-    int64_t v14;
-    void* v68;
-    uint8_t v84;
-    int64_t v93; /* placeholder for void */
-    int64_t v29;
-    v3 = 0LL;
-    v4 = v1 == v3;
-    v5 = 0LL;
-    v6 = v2 == v5;
-    v7 = v4 || v6;
-    if (v7) goto bb1;
-    else goto bb2;
-  bb1:
-    v9 = 1LL;
-    v10 = -v9;
-    p_call_stack_pop();
-    return v10;
-  bb2:
-    goto bb3;
-  bb3:
-    v13 = 0LL;
-    v14 = (int64_t)p_str_length((void*)v13, v1);
-    v15 = malloc(8);
-    *(int64_t*)v15 = (int64_t)v14;
-    v17 = 0LL;
-    v18 = (int64_t)p_str_length((void*)v17, v2);
-    v19 = malloc(8);
-    *(int64_t*)v19 = (int64_t)v18;
-    v21 = *(int64_t*)v19;
-    v22 = 0LL;
-    v23 = v21 == v22;
-    if (v23) goto bb4;
-    else goto bb5;
-  bb4:
-    v25 = 0LL;
-    p_call_stack_pop();
-    return v25;
-  bb5:
-    goto bb6;
-  bb6:
-    v28 = *(int64_t*)v19;
-    v29 = *(int64_t*)v15;
-    v30 = v28 > v29;
-    if (v30) goto bb7;
-    else goto bb8;
-  bb7:
-    v32 = 1LL;
-    v33 = -v32;
-    p_call_stack_pop();
-    return v33;
-  bb8:
-    goto bb9;
-  bb9:
-    v36 = 0LL;
-    v37 = malloc(8);
-    *(int64_t*)v37 = (int64_t)v36;
-    goto bb10;
-  bb10:
-    v40 = *(int64_t*)v37;
-    v41 = *(int64_t*)v15;
-    v42 = *(int64_t*)v19;
-    v43 = v41 - v42;
-    v44 = v40 <= v43;
-    if (v44) goto bb11;
-    else goto bb12;
-  bb11:
-    v46 = true;
-    v47 = malloc(1);
-    *(bool*)v47 = v46;
-    v49 = 0LL;
-    v50 = malloc(8);
-    *(int64_t*)v50 = (int64_t)v49;
-    goto bb13;
-  bb12:
-    v110 = 1LL;
-    v111 = -v110;
-    p_call_stack_pop();
-    return v111;
-  bb13:
-    v53 = *(int64_t*)v50;
-    v54 = *(int64_t*)v19;
-    v55 = v53 < v54;
-    if (v55) goto bb14;
-    else goto bb15;
-  bb14:
-    v57 = *(int64_t*)v37;
-    v58 = v1 + v57;
-    v59 = *(int64_t*)v50;
-    v60 = v58 + v59;
-    v61 = malloc(8);
-    *(int64_t*)v61 = (int64_t)v60;
-    v63 = *(int64_t*)v50;
-    v64 = v2 + v63;
-    v65 = malloc(8);
-    *(int64_t*)v65 = (int64_t)v64;
-    v67 = *(int64_t*)v61;
-    v68 = malloc(8);
-    *(void**)v68 = (void*)v67;
-    v70 = *(int64_t*)v65;
-    v71 = malloc(8);
-    *(void**)v71 = (void*)v70;
-    v73 = 0LL;
-    v74 = malloc(8);
-    *(int64_t*)v74 = (int64_t)v73;
-    v76 = 0LL;
-    v77 = malloc(8);
-    *(int64_t*)v77 = (int64_t)v76;
-    v80 = *(void**)v68;
-    v81 = *(uint8_t*)v80;
-    *(int64_t*)v74 = (int64_t)v81;
-    v83 = *(void**)v71;
-    v84 = *(uint8_t*)v83;
-    *(int64_t*)v77 = (int64_t)v84;
-    v87 = *(int64_t*)v74;
-    v88 = *(int64_t*)v77;
-    v89 = v87 != v88;
-    if (v89) goto bb16;
-    else goto bb17;
-  bb15:
-    v100 = *(bool*)v47;
-    if (v100) goto bb19;
-    else goto bb20;
-  bb16:
-    v91 = false;
-    *(bool*)v47 = v91;
-    goto bb15;
-  bb17:
-    goto bb18;
-  bb18:
-    v95 = *(int64_t*)v50;
-    v96 = 1LL;
-    v97 = v95 + v96;
-    *(int64_t*)v50 = (int64_t)v97;
-    goto bb13;
-  bb19:
-    v102 = *(int64_t*)v37;
-    p_call_stack_pop();
-    return v102;
-  bb20:
-    goto bb21;
-  bb21:
-    v105 = *(int64_t*)v37;
-    v106 = 1LL;
-    v107 = v105 + v106;
-    *(int64_t*)v37 = (int64_t)v107;
-    goto bb10;
-    return 0;
-}
-
-void Vec_clear(void* v0, int64_t v1) {
-    p_call_stack_push("Vec_clear");
-    int64_t v9; /* placeholder for void */
-    int64_t v3;
-    int64_t v6; /* placeholder for void */
-    int64_t v2;
-    int64_t v5; /* placeholder for void */
-    void* v7;
-    int64_t v8;
     void* v4;
-    int64_t v10; /* placeholder for void */
-    int64_t v11; /* placeholder for void */
+    int64_t v12;
+    int64_t v2;
+    int64_t v13; /* placeholder for void */
+    int64_t v7; /* placeholder for void */
+    void* v6;
     v2 = 8LL;
     v3 = v1 + v2;
     v4 = malloc(8);
     *(void**)v4 = (void*)v3;
-    v7 = *(void**)v4;
-    v8 = 0LL;
-    *(int64_t*)v7 = (int64_t)v8;
+    v6 = malloc(8);
+    v8 = *(void**)v4;
+    v9 = *(int64_t*)v8;
+    *(int64_t*)v6 = (int64_t)v9;
+    v12 = *(int64_t*)v6;
+    p_call_stack_pop();
+    return v12;
+    return 0;
+}
+
+void StringBuilder_clear(void* v0, void* v1) {
+    p_call_stack_push("StringBuilder_clear");
+    int64_t v8; /* placeholder for void */
+    int64_t v7; /* placeholder for void */
+    void* v3;
+    void* v5;
+    int64_t v4; /* placeholder for void */
+    int64_t v6;
+    void* v2;
+    v2 = (char*)v1 + 0;
+    v3 = _str1;
+    *(void**)v2 = (void*)v3;
+    v5 = (char*)v1 + 8;
+    v6 = 0LL;
+    *(int64_t*)v5 = (int64_t)v6;
     p_call_stack_pop();
     return;
     return;
 }
 
-void* str_slice(void* v0, void* v1, int64_t v2, int64_t v3) {
-    p_call_stack_push("str_slice");
-    void* v8;
-    int64_t v16;
-    int64_t v17; /* placeholder for void */
-    int64_t v9; /* placeholder for void */
-    int64_t v35;
-    int64_t v13;
-    int64_t v25; /* placeholder for void */
-    int64_t v11; /* placeholder for void */
-    int64_t v7; /* placeholder for void */
-    int64_t v19; /* placeholder for void */
-    int64_t v28;
-    int64_t v38;
-    int64_t v12;
-    int64_t v31; /* placeholder for void */
-    int64_t v37;
-    int64_t v5;
+int64_t Option_expect(void* v0, void* v1, void* v2) {
+    p_call_stack_push("Option_expect");
+    void* v3;
+    void* v11;
+    int64_t v16; /* placeholder for void */
     int64_t v4;
-    int64_t v33; /* placeholder for void */
-    int64_t v36;
-    bool v14;
-    int64_t v29;
-    int64_t v26; /* placeholder for void */
-    int64_t v24;
+    void* v8;
+    int64_t v9;
+    int64_t v13;
+    int64_t v10; /* placeholder for void */
     int64_t v15; /* placeholder for void */
-    int64_t v21;
-    bool v22;
-    int64_t v34; /* placeholder for void */
-    bool v30;
-    int64_t v39; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    int64_t v19;
+    bool v6;
+    int64_t v12;
+    int64_t v7; /* placeholder for void */
+    int64_t v5;
+    bool v14;
+    int64_t v17; /* placeholder for void */
+    int64_t v18; /* placeholder for void */
+    v3 = (char*)v1 + 0;
+    v4 = *(int64_t*)v3;
+    v5 = 0LL;
+    v6 = v4 == v5;
+    if (v6) goto bb2;
+    else goto bb3;
+  bb1:
+    v19 = 0LL;
+    p_call_stack_pop();
+    return v19;
+  bb2:
+    v8 = (char*)v1 + 8;
+    v9 = *(int64_t*)v8;
+    p_call_stack_pop();
+    return v9;
+  bb3:
+    v11 = (char*)v1 + 0;
+    v12 = *(int64_t*)v11;
+    v13 = 1LL;
+    v14 = v12 == v13;
+    if (v14) goto bb4;
+    else goto bb5;
+  bb4:
+    p_panic(v2);
+    goto bb1;
+  bb5:
+    goto bb1;
+    return 0;
+}
+
+void* ByteBuffer_to_str(void* v0, void* v1) {
+    p_call_stack_push("ByteBuffer_to_str");
+    int64_t v11;
+    int64_t v27;
+    int64_t v16;
+    void* v31;
+    int64_t v20; /* placeholder for void */
+    int64_t v4; /* placeholder for void */
+    int64_t v8; /* placeholder for void */
+    bool v12;
+    int64_t v17;
+    void* v19;
+    void* v15;
+    void* v23;
+    int64_t v13; /* placeholder for void */
+    void* v21;
+    int64_t v28;
+    int64_t v7; /* placeholder for void */
     void* v10;
-    int64_t v20;
-    int64_t v27; /* placeholder for void */
+    void* v14;
     void* v6;
+    int64_t v22;
+    int64_t v18;
+    void* v24;
+    int64_t v26;
+    int64_t v32; /* placeholder for void */
+    int64_t v30; /* placeholder for void */
+    void* v2;
+    int64_t v9;
+    int64_t v25; /* placeholder for void */
+    int64_t v29; /* placeholder for void */
+    void* v3;
+    int64_t v5;
+    v2 = _str1;
+    v3 = malloc(8);
+    *(void**)v3 = (void*)v2;
+    v5 = 0LL;
+    v6 = malloc(8);
+    *(int64_t*)v6 = (int64_t)v5;
+    goto bb1;
+  bb1:
+    v9 = *(int64_t*)v6;
+    v10 = (char*)v1 + 8;
+    v11 = *(int64_t*)v10;
+    v12 = v9 < v11;
+    if (v12) goto bb2;
+    else goto bb3;
+  bb2:
+    v14 = (char*)v1 + 0;
+    v15 = *(void**)v14;
+    v16 = *(int64_t*)v6;
+    v17 = 0LL;
+    v18 = (int64_t)Vec_get((void*)v17, (int64_t)v15, v16);
+    v19 = malloc(8);
+    *(int64_t*)v19 = (int64_t)v18;
+    v21 = *(void**)v3;
+    v22 = *(int64_t*)v19;
+    v23 = p_char_to_str(v22);
+    v24 = p_str_concat(v21, v23);
+    *(void**)v3 = (void*)v24;
+    v26 = *(int64_t*)v6;
+    v27 = 1LL;
+    v28 = v26 + v27;
+    *(int64_t*)v6 = (int64_t)v28;
+    goto bb1;
+  bb3:
+    v31 = *(void**)v3;
+    p_call_stack_pop();
+    return v31;
+    return 0;
+}
+
+int64_t String_char_at(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("String_char_at");
+    int64_t v39; /* placeholder for void */
+    int64_t v59; /* placeholder for void */
+    bool v17;
+    void* v41;
+    int64_t v31; /* placeholder for void */
+    uint8_t v33;
+    int64_t v21; /* placeholder for void */
+    int64_t v24; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    void* v57;
+    int64_t v53;
+    bool v16;
+    int64_t v19;
+    int64_t v30; /* placeholder for void */
+    int64_t v34; /* placeholder for void */
+    int64_t v52; /* placeholder for void */
+    int64_t v25;
+    int64_t v62; /* placeholder for void */
+    int64_t v43; /* placeholder for void */
+    bool v4;
+    int64_t v36;
+    int64_t v3;
+    int64_t v50;
+    void* v38;
+    int64_t v15;
     void* v32;
     int64_t v18; /* placeholder for void */
+    void* v44;
+    int64_t v8; /* placeholder for void */
+    int64_t v56; /* placeholder for void */
+    int64_t v61;
+    int64_t v7; /* placeholder for void */
+    int64_t v10;
+    int64_t v55; /* placeholder for void */
+    void* v23;
+    int64_t v45;
+    int64_t v12; /* placeholder for void */
+    void* v37;
+    int64_t v27; /* placeholder for void */
+    int64_t v28;
+    int64_t v49;
+    int64_t v6;
+    void* v51;
+    int64_t v48;
+    int64_t v60; /* placeholder for void */
+    int64_t v46; /* placeholder for void */
+    int64_t v5; /* placeholder for void */
+    int64_t v9;
+    int64_t v13;
+    void* v29;
+    int64_t v47; /* placeholder for void */
+    void* v11;
+    int64_t v35; /* placeholder for void */
+    int64_t v58;
+    void* v54;
+    void* v26;
+    int64_t v42; /* placeholder for void */
+    int64_t v22;
+    bool v14;
+    int64_t v40;
+    v3 = 0LL;
+    v4 = v1 == v3;
+    if (v4) goto bb1;
+    else goto bb2;
+  bb1:
+    v6 = 0LL;
+    p_call_stack_pop();
+    return v6;
+  bb2:
+    goto bb3;
+  bb3:
+    v9 = 0LL;
+    v10 = (int64_t)p_str_length((void*)v9, v1);
+    v11 = malloc(8);
+    *(int64_t*)v11 = (int64_t)v10;
+    v13 = 0LL;
+    v14 = v2 < v13;
+    v15 = *(int64_t*)v11;
+    v16 = v2 >= v15;
+    v17 = v14 || v16;
+    if (v17) goto bb4;
+    else goto bb5;
+  bb4:
+    v19 = 0LL;
+    p_call_stack_pop();
+    return v19;
+  bb5:
+    goto bb6;
+  bb6:
+    v22 = v1 + v2;
+    v23 = malloc(8);
+    *(int64_t*)v23 = (int64_t)v22;
+    v25 = *(int64_t*)v23;
+    v26 = malloc(8);
+    *(void**)v26 = (void*)v25;
+    v28 = 0LL;
+    v29 = malloc(8);
+    *(int64_t*)v29 = (int64_t)v28;
+    v32 = *(void**)v26;
+    v33 = *(uint8_t*)v32;
+    *(int64_t*)v29 = (int64_t)v33;
+    v36 = 2LL;
+    v37 = p_malloc(v36);
+    v38 = malloc(8);
+    *(int64_t*)v38 = (int64_t)v37;
+    v40 = *(int64_t*)v38;
+    v41 = malloc(8);
+    *(void**)v41 = (void*)v40;
+    v44 = *(void**)v41;
+    v45 = *(int64_t*)v29;
+    *(uint8_t*)v44 = (uint8_t)v45;
+    v48 = *(int64_t*)v38;
+    v49 = 1LL;
+    v50 = v48 + v49;
+    v51 = malloc(8);
+    *(int64_t*)v51 = (int64_t)v50;
+    v53 = *(int64_t*)v51;
+    v54 = malloc(8);
+    *(void**)v54 = (void*)v53;
+    v57 = *(void**)v54;
+    v58 = 0LL;
+    *(uint8_t*)v57 = (uint8_t)v58;
+    v61 = *(int64_t*)v38;
+    p_call_stack_pop();
+    return v61;
+    return 0;
+}
+
+int64_t p_str_length(void* v0, int64_t v1) {
+    p_call_stack_push("p_str_length");
+    int64_t v6; /* placeholder for void */
+    uint8_t v18;
+    int64_t v33; /* placeholder for void */
+    int64_t v9; /* placeholder for void */
+    void* v19;
+    int64_t v29; /* placeholder for void */
+    void* v17;
+    int64_t v15; /* placeholder for void */
+    int64_t v12; /* placeholder for void */
+    bool v24;
+    int64_t v4; /* placeholder for void */
+    int64_t v5;
+    int64_t v7; /* placeholder for void */
+    int64_t v20; /* placeholder for void */
+    int64_t v2;
+    int64_t v13;
+    int64_t v27;
+    int64_t v30;
+    int64_t v31;
+    bool v3;
+    uint8_t v37;
+    int64_t v21; /* placeholder for void */
+    int64_t v42; /* placeholder for void */
+    void* v8;
+    int64_t v35; /* placeholder for void */
+    int64_t v16; /* placeholder for void */
+    int64_t v38; /* placeholder for void */
+    int64_t v23;
+    int64_t v40; /* placeholder for void */
+    int64_t v41;
+    int64_t v28;
+    int64_t v22;
+    void* v14;
+    int64_t v25; /* placeholder for void */
+    int64_t v32;
+    int64_t v10;
+    void* v11;
+    int64_t v34;
+    void* v36;
+    int64_t v39; /* placeholder for void */
+    int64_t v26;
+    v2 = 0LL;
+    v3 = v1 == v2;
+    if (v3) goto bb1;
+    else goto bb2;
+  bb1:
+    v5 = 0LL;
+    p_call_stack_pop();
+    return v5;
+  bb2:
+    goto bb3;
+  bb3:
+    v8 = malloc(8);
+    *(int64_t*)v8 = (int64_t)v1;
+    v10 = *(int64_t*)v8;
+    v11 = malloc(8);
+    *(void**)v11 = (void*)v10;
+    v13 = 0LL;
+    v14 = malloc(8);
+    *(int64_t*)v14 = (int64_t)v13;
+    v17 = *(void**)v11;
+    v18 = *(uint8_t*)v17;
+    v19 = malloc(8);
+    *(int64_t*)v19 = (int64_t)v18;
+    goto bb4;
+  bb4:
+    v22 = *(int64_t*)v19;
+    v23 = 0LL;
+    v24 = v22 != v23;
+    if (v24) goto bb5;
+    else goto bb6;
+  bb5:
+    v26 = *(int64_t*)v14;
+    v27 = 1LL;
+    v28 = v26 + v27;
+    *(int64_t*)v14 = (int64_t)v28;
+    v30 = *(int64_t*)v8;
+    v31 = 1LL;
+    v32 = v30 + v31;
+    *(int64_t*)v8 = (int64_t)v32;
+    v34 = *(int64_t*)v8;
+    *(void**)v11 = (void*)v34;
+    v36 = *(void**)v11;
+    v37 = *(uint8_t*)v36;
+    *(int64_t*)v19 = (int64_t)v37;
+    goto bb4;
+  bb6:
+    v41 = *(int64_t*)v14;
+    p_call_stack_pop();
+    return v41;
+    return 0;
+}
+
+void* str_slice(void* v0, void* v1, int64_t v2, int64_t v3) {
+    p_call_stack_push("str_slice");
+    int64_t v39; /* placeholder for void */
+    void* v32;
+    int64_t v19; /* placeholder for void */
+    int64_t v35;
+    int64_t v21;
+    int64_t v33; /* placeholder for void */
+    int64_t v9; /* placeholder for void */
+    int64_t v24;
+    int64_t v11; /* placeholder for void */
+    int64_t v17; /* placeholder for void */
+    void* v10;
+    int64_t v34; /* placeholder for void */
+    int64_t v18; /* placeholder for void */
+    int64_t v38;
+    int64_t v37;
+    int64_t v20;
+    int64_t v13;
+    bool v22;
+    int64_t v31; /* placeholder for void */
+    int64_t v4;
     int64_t v23; /* placeholder for void */
+    int64_t v5;
+    bool v14;
+    int64_t v26; /* placeholder for void */
+    int64_t v27; /* placeholder for void */
+    int64_t v28;
+    int64_t v16;
+    int64_t v29;
+    int64_t v36;
+    int64_t v12;
+    int64_t v15; /* placeholder for void */
+    bool v30;
+    void* v6;
+    int64_t v25; /* placeholder for void */
+    void* v8;
+    int64_t v7; /* placeholder for void */
     v4 = 0LL;
     v5 = (int64_t)String_len((void*)v4, (int64_t)v1);
     v6 = malloc(8);
@@ -14216,1214 +15336,112 @@ void* str_slice(void* v0, void* v1, int64_t v2, int64_t v3) {
     return 0;
 }
 
-void Result_map(void* v0, void* v1, void* v2, void* v3) {
-    p_call_stack_push("Result_map");
-    void* v34;
-    void* v45;
-    int64_t v5;
-    void* v13;
+int64_t String_byte_at(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("String_byte_at");
+    int64_t v32; /* placeholder for void */
+    uint8_t v35;
+    void* v25;
+    int64_t v20;
+    int64_t v37; /* placeholder for void */
     int64_t v24;
-    void* v9;
-    void* v27;
-    int64_t v29;
-    int64_t v8; /* placeholder for void */
-    int64_t v14; /* placeholder for void */
-    void* v36;
-    int64_t v42;
-    void* v32;
-    int64_t v39; /* placeholder for void */
-    void* v11;
-    void* v19;
-    int64_t v33;
-    int64_t v10;
-    bool v30;
-    void* v16;
-    void* v23;
-    int64_t v35;
-    int64_t v26; /* placeholder for void */
-    void* v44;
-    int64_t v46;
-    int64_t v48; /* placeholder for void */
-    void* v18;
-    int64_t v28;
-    int64_t v31; /* placeholder for void */
-    void* v38;
-    int64_t v20;
-    int64_t v17; /* placeholder for void */
-    int64_t v6;
-    bool v7;
-    int64_t v12;
-    int64_t v21; /* placeholder for void */
-    void* v22;
-    int64_t v25; /* placeholder for void */
-    void* v41;
-    void* v40;
-    void* v4;
-    int64_t v37; /* placeholder for void */
-    int64_t v15;
-    int64_t v43; /* placeholder for void */
-    int64_t v49; /* placeholder for void */
-    int64_t v50; /* placeholder for void */
-    int64_t v47; /* placeholder for void */
-    v4 = (char*)v2 + 0;
-    v5 = *(int64_t*)v4;
-    v6 = 0LL;
-    v7 = v5 == v6;
-    if (v7) goto bb2;
-    else goto bb3;
-  bb1:
-    p_call_stack_pop();
-    return;
-  bb2:
-    v9 = (char*)v2 + 8;
-    v10 = *(int64_t*)v9;
-    v11 = malloc(16);
-    v12 = 0LL;
-    v13 = (char*)v11 + 0;
-    *(int64_t*)v13 = (int64_t)v12;
-    {
-        if (!v3) abort();
-        char* _fn_name = *(char**)v3;
-        if (!_fn_name) abort();
-        if (strcmp(_fn_name, "str_parse_hex") == 0) {
-            v15 = str_parse_hex((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_char_count") == 0) {
-            v15 = String_char_count((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "abs") == 0) {
-            v15 = p_abs((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "p_str_length") == 0) {
-            v15 = p_str_length((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_first") == 0) {
-            v15 = Vec_first((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_clone") == 0) {
-            v15 = Vec_clone((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "HashMap_clone") == 0) {
-            v15 = HashMap_clone((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "HashMap_len") == 0) {
-            v15 = HashMap_len((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_bytes") == 0) {
-            v15 = String_bytes((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "ByteBuffer_len") == 0) {
-            v15 = ByteBuffer_len((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "Vec_len") == 0) {
-            v15 = Vec_len((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_clone") == 0) {
-            v15 = String_clone((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "HashMap_keys") == 0) {
-            v15 = HashMap_keys((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "str_parse_int") == 0) {
-            v15 = str_parse_int((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_trim") == 0) {
-            v15 = String_trim((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_capacity") == 0) {
-            v15 = Vec_capacity((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_parse_int") == 0) {
-            v15 = String_parse_int((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "char_to_upper") == 0) {
-            v15 = char_to_upper((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_last") == 0) {
-            v15 = Vec_last((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Vec_pop") == 0) {
-            v15 = Vec_pop((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "allocator_bytes_used") == 0) {
-            v15 = allocator_bytes_used((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "Option_unwrap") == 0) {
-            v15 = Option_unwrap((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_to_string") == 0) {
-            v15 = String_to_string((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_to_lowercase") == 0) {
-            v15 = String_to_lowercase((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "StringBuilder_len") == 0) {
-            v15 = StringBuilder_len((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "p_str_hash") == 0) {
-            v15 = p_str_hash((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "char_to_lower") == 0) {
-            v15 = char_to_lower((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "Result_unwrap") == 0) {
-            v15 = Result_unwrap((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_from") == 0) {
-            v15 = String_from((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "String_to_uppercase") == 0) {
-            v15 = String_to_uppercase((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "HashMap_values") == 0) {
-            v15 = HashMap_values((void*)v3, (int64_t)v10);
-        } else if (strcmp(_fn_name, "str_len") == 0) {
-            v15 = str_len((void*)v3, (void*)v10);
-        } else if (strcmp(_fn_name, "String_len") == 0) {
-            v15 = String_len((void*)v3, (int64_t)v10);
-        } else { abort(); }
-    }
-    v16 = (char*)v11 + 8;
-    *(int64_t*)v16 = (int64_t)v15;
-    v18 = (char*)v11 + 0;
-    v19 = (char*)v0 + 0;
-    v20 = *(int64_t*)v18;
-    *(int64_t*)v19 = (int64_t)v20;
-    v22 = (char*)v11 + 8;
-    v23 = (char*)v0 + 8;
-    v24 = *(int64_t*)v22;
-    *(int64_t*)v23 = (int64_t)v24;
-    p_call_stack_pop();
-    return;
-  bb3:
-    v27 = (char*)v2 + 0;
-    v28 = *(int64_t*)v27;
-    v29 = 1LL;
-    v30 = v28 == v29;
-    if (v30) goto bb4;
-    else goto bb5;
-  bb4:
-    v32 = (char*)v2 + 8;
-    v33 = *(int64_t*)v32;
-    v34 = malloc(16);
-    v35 = 1LL;
-    v36 = (char*)v34 + 0;
-    *(int64_t*)v36 = (int64_t)v35;
-    v38 = (char*)v34 + 8;
-    *(int64_t*)v38 = (int64_t)v33;
-    v40 = (char*)v34 + 0;
-    v41 = (char*)v0 + 0;
-    v42 = *(int64_t*)v40;
-    *(int64_t*)v41 = (int64_t)v42;
-    v44 = (char*)v34 + 8;
-    v45 = (char*)v0 + 8;
-    v46 = *(int64_t*)v44;
-    *(int64_t*)v45 = (int64_t)v46;
-    p_call_stack_pop();
-    return;
-  bb5:
-    goto bb1;
-    return;
-}
-
-void Vec_set(void* v0, int64_t v1, int64_t v2, int64_t v3) {
-    p_call_stack_push("Vec_set");
-    int64_t v28; /* placeholder for void */
-    int64_t v37;
-    int64_t v14; /* placeholder for void */
-    int64_t v9; /* placeholder for void */
-    int64_t v42;
-    int64_t v21; /* placeholder for void */
-    void* v43;
-    int64_t v25; /* placeholder for void */
-    int64_t v27; /* placeholder for void */
-    int64_t v29; /* placeholder for void */
-    void* v40;
-    int64_t v13;
-    int64_t v49; /* placeholder for void */
-    int64_t v23;
-    int64_t v4;
-    int64_t v34; /* placeholder for void */
-    void* v30;
-    bool v17;
-    void* v26;
-    int64_t v35; /* placeholder for void */
-    int64_t v47; /* placeholder for void */
-    int64_t v48; /* placeholder for void */
-    bool v24;
-    void* v10;
-    void* v32;
-    int64_t v38;
-    void* v46;
-    int64_t v11; /* placeholder for void */
-    int64_t v20; /* placeholder for void */
-    int64_t v22; /* placeholder for void */
-    int64_t v33;
-    void* v6;
-    int64_t v7; /* placeholder for void */
-    int64_t v36;
-    int64_t v16;
-    void* v19;
-    int64_t v5;
-    void* v8;
     void* v12;
-    int64_t v15; /* placeholder for void */
-    int64_t v31; /* placeholder for void */
-    int64_t v39;
-    int64_t v44; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    int64_t v45; /* placeholder for void */
-    int64_t v41; /* placeholder for void */
-    v4 = 8LL;
-    v5 = v1 + v4;
-    v6 = malloc(8);
-    *(void**)v6 = (void*)v5;
-    v8 = malloc(8);
-    *(void**)v8 = (void*)v1;
-    v10 = malloc(8);
-    v12 = *(void**)v6;
-    v13 = *(int64_t*)v12;
-    *(int64_t*)v10 = (int64_t)v13;
-    v16 = *(int64_t*)v10;
-    v17 = v2 >= v16;
-    if (v17) goto bb1;
-    else goto bb2;
-  bb1:
-    v19 = _str13;
-    p_panic(v19);
-    goto bb3;
-  bb2:
-    goto bb3;
-  bb3:
-    v23 = 0LL;
-    v24 = v2 < v23;
-    if (v24) goto bb4;
-    else goto bb5;
-  bb4:
-    v26 = _str13;
-    p_panic(v26);
-    goto bb6;
-  bb5:
-    goto bb6;
-  bb6:
-    v30 = malloc(8);
-    v32 = *(void**)v8;
-    v33 = *(int64_t*)v32;
-    *(int64_t*)v30 = (int64_t)v33;
-    v36 = *(int64_t*)v30;
-    v37 = 8LL;
-    v38 = v2 * v37;
-    v39 = v36 + v38;
-    v40 = malloc(8);
-    *(int64_t*)v40 = (int64_t)v39;
-    v42 = *(int64_t*)v40;
-    v43 = malloc(8);
-    *(void**)v43 = (void*)v42;
-    v46 = *(void**)v43;
-    *(int64_t*)v46 = (int64_t)v3;
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-void Vec_insert(void* v0, int64_t v1, int64_t v2, int64_t v3) {
-    p_call_stack_push("Vec_insert");
-    int64_t v55;
-    int64_t v28; /* placeholder for void */
-    int64_t v35;
-    int64_t v74; /* placeholder for void */
-    int64_t v32; /* placeholder for void */
-    void* v96;
-    int64_t v61;
-    int64_t v59; /* placeholder for void */
-    int64_t v9; /* placeholder for void */
-    int64_t v66;
-    int64_t v5;
-    int64_t v13;
-    int64_t v84;
-    int64_t v21; /* placeholder for void */
-    int64_t v94; /* placeholder for void */
-    int64_t v97; /* placeholder for void */
-    void* v40;
-    void* v99;
-    int64_t v102; /* placeholder for void */
-    int64_t v46;
-    int64_t v60;
-    void* v67;
-    int64_t v98; /* placeholder for void */
-    void* v78;
-    int64_t v29; /* placeholder for void */
-    void* v8;
-    void* v19;
-    void* v34;
-    int64_t v62;
-    void* v58;
-    int64_t v63;
-    int64_t v75; /* placeholder for void */
-    int64_t v31;
-    bool v24;
-    int64_t v37; /* placeholder for void */
-    void* v38;
-    int64_t v79; /* placeholder for void */
-    int64_t v77;
-    int64_t v82; /* placeholder for void */
-    int64_t v91;
-    int64_t v64;
-    int64_t v65;
+    int64_t v11;
     int64_t v36; /* placeholder for void */
-    void* v70;
-    int64_t v101; /* placeholder for void */
-    int64_t v56;
-    int64_t v15; /* placeholder for void */
-    int64_t v87; /* placeholder for void */
-    int64_t v88; /* placeholder for void */
-    int64_t v92;
-    void* v80;
     int64_t v39; /* placeholder for void */
-    int64_t v20; /* placeholder for void */
-    void* v26;
-    int64_t v44;
-    int64_t v89;
-    int64_t v14; /* placeholder for void */
-    int64_t v50;
-    void* v12;
-    bool v17;
-    int64_t v25; /* placeholder for void */
-    int64_t v11; /* placeholder for void */
-    void* v10;
-    int64_t v16;
-    int64_t v18; /* placeholder for void */
-    int64_t v23;
-    int64_t v30;
-    int64_t v41;
-    void* v47;
-    int64_t v4;
-    int64_t v45;
-    void* v73;
-    int64_t v86;
-    bool v51;
-    int64_t v81;
-    int64_t v83; /* placeholder for void */
-    int64_t v72;
-    int64_t v7; /* placeholder for void */
-    int64_t v95;
-    int64_t v100; /* placeholder for void */
-    void* v6;
-    int64_t v33; /* placeholder for void */
-    int64_t v52; /* placeholder for void */
-    int64_t v48; /* placeholder for void */
-    int64_t v27; /* placeholder for void */
-    int64_t v43; /* placeholder for void */
-    int64_t v90;
-    int64_t v49; /* placeholder for void */
-    void* v93;
-    int64_t v85;
-    int64_t v22; /* placeholder for void */
-    int64_t v54;
-    int64_t v69;
-    int64_t v57;
-    int64_t v53;
-    void* v76;
-    int64_t v71; /* placeholder for void */
-    int64_t v42; /* placeholder for void */
-    int64_t v68; /* placeholder for void */
-    v4 = 8LL;
-    v5 = v1 + v4;
-    v6 = malloc(8);
-    *(void**)v6 = (void*)v5;
-    v8 = malloc(8);
-    *(void**)v8 = (void*)v1;
-    v10 = malloc(8);
-    v12 = *(void**)v6;
-    v13 = *(int64_t*)v12;
-    *(int64_t*)v10 = (int64_t)v13;
-    v16 = 0LL;
-    v17 = v2 < v16;
-    if (v17) goto bb1;
-    else goto bb2;
-  bb1:
-    v19 = _str14;
-    p_panic(v19);
-    goto bb3;
-  bb2:
-    goto bb3;
-  bb3:
-    v23 = *(int64_t*)v10;
-    v24 = v2 > v23;
-    if (v24) goto bb4;
-    else goto bb5;
-  bb4:
-    v26 = _str14;
-    p_panic(v26);
-    goto bb6;
-  bb5:
-    goto bb6;
-  bb6:
-    v30 = 0LL;
-    v31 = 0LL;
-    Vec_push((void*)v31, v1, v30);
-    v34 = *(void**)v6;
-    v35 = *(int64_t*)v34;
-    *(int64_t*)v10 = (int64_t)v35;
-    v38 = malloc(8);
-    v40 = *(void**)v8;
-    v41 = *(int64_t*)v40;
-    *(int64_t*)v38 = (int64_t)v41;
-    v44 = *(int64_t*)v10;
-    v45 = 1LL;
-    v46 = v44 - v45;
-    v47 = malloc(8);
-    *(int64_t*)v47 = (int64_t)v46;
-    goto bb7;
-  bb7:
-    v50 = *(int64_t*)v47;
-    v51 = v50 > v2;
-    if (v51) goto bb8;
-    else goto bb9;
-  bb8:
-    v53 = *(int64_t*)v38;
-    v54 = *(int64_t*)v47;
-    v55 = 8LL;
-    v56 = v54 * v55;
-    v57 = v53 + v56;
-    v58 = malloc(8);
-    *(int64_t*)v58 = (int64_t)v57;
-    v60 = *(int64_t*)v38;
-    v61 = *(int64_t*)v47;
-    v62 = 1LL;
-    v63 = v61 - v62;
-    v64 = 8LL;
-    v65 = v63 * v64;
-    v66 = v60 + v65;
-    v67 = malloc(8);
-    *(int64_t*)v67 = (int64_t)v66;
-    v69 = *(int64_t*)v58;
-    v70 = malloc(8);
-    *(void**)v70 = (void*)v69;
-    v72 = *(int64_t*)v67;
-    v73 = malloc(8);
-    *(void**)v73 = (void*)v72;
-    v76 = *(void**)v73;
-    v77 = *(int64_t*)v76;
-    v78 = malloc(8);
-    *(int64_t*)v78 = (int64_t)v77;
-    v80 = *(void**)v70;
-    v81 = *(int64_t*)v78;
-    *(int64_t*)v80 = (int64_t)v81;
-    v84 = *(int64_t*)v47;
-    v85 = 1LL;
-    v86 = v84 - v85;
-    *(int64_t*)v47 = (int64_t)v86;
-    goto bb7;
-  bb9:
-    v89 = *(int64_t*)v38;
-    v90 = 8LL;
-    v91 = v2 * v90;
-    v92 = v89 + v91;
-    v93 = malloc(8);
-    *(int64_t*)v93 = (int64_t)v92;
-    v95 = *(int64_t*)v93;
-    v96 = malloc(8);
-    *(void**)v96 = (void*)v95;
-    v99 = *(void**)v96;
-    *(int64_t*)v99 = (int64_t)v3;
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-bool String_ends_with(void* v0, int64_t v1, int64_t v2) {
-    p_call_stack_push("String_ends_with");
-    void* v55;
-    int64_t v80; /* placeholder for void */
-    int64_t v17;
-    bool v79;
-    int64_t v15; /* placeholder for void */
-    int64_t v54;
-    int64_t v63;
+    int64_t v29; /* placeholder for void */
+    int64_t v14;
+    void* v28;
     int64_t v3;
-    int64_t v69; /* placeholder for void */
-    int64_t v72; /* placeholder for void */
-    int64_t v82; /* placeholder for void */
-    int64_t v49;
-    uint8_t v74;
-    int64_t v20;
-    int64_t v77;
-    bool v9;
-    int64_t v86;
-    bool v89;
-    int64_t v65; /* placeholder for void */
-    bool v4;
-    int64_t v76; /* placeholder for void */
-    int64_t v88; /* placeholder for void */
-    void* v70;
-    int64_t v13;
-    int64_t v38; /* placeholder for void */
+    int64_t v6;
+    bool v18;
+    int64_t v10;
+    int64_t v22; /* placeholder for void */
+    int64_t v30;
+    void* v31;
+    int64_t v5; /* placeholder for void */
+    bool v17;
+    int64_t v38;
     int64_t v21;
-    int64_t v44;
-    bool v24;
-    uint8_t v71;
-    void* v40;
-    int64_t v25; /* placeholder for void */
-    int64_t v8; /* placeholder for void */
-    int64_t v12;
-    void* v37;
-    int64_t v59; /* placeholder for void */
-    void* v51;
-    int64_t v90; /* placeholder for void */
-    int64_t v46; /* placeholder for void */
-    int64_t v42; /* placeholder for void */
-    int64_t v41; /* placeholder for void */
-    bool v7;
-    void* v18;
-    bool v29;
-    void* v14;
-    int64_t v56; /* placeholder for void */
-    void* v61;
-    int64_t v34;
-    void* v67;
-    bool v31;
-    bool v45;
-    int64_t v48;
-    int64_t v39;
-    int64_t v11; /* placeholder for void */
-    int64_t v62; /* placeholder for void */
-    int64_t v78;
-    int64_t v36;
-    int64_t v87; /* placeholder for void */
     int64_t v19; /* placeholder for void */
-    int64_t v32; /* placeholder for void */
-    int64_t v16;
-    int64_t v5;
+    int64_t v7;
     int64_t v33; /* placeholder for void */
-    int64_t v53;
-    int64_t v28;
-    void* v73;
-    int64_t v85;
-    bool v81;
-    int64_t v27;
-    int64_t v26; /* placeholder for void */
-    int64_t v47;
-    int64_t v50;
-    bool v22;
-    int64_t v57;
-    int64_t v52; /* placeholder for void */
-    int64_t v60;
-    int64_t v83; /* placeholder for void */
-    int64_t v35;
-    bool v6;
-    void* v58;
-    int64_t v84;
-    int64_t v75; /* placeholder for void */
-    int64_t v68; /* placeholder for void */
-    int64_t v43;
-    int64_t v30; /* placeholder for void */
-    void* v64;
+    bool v4;
+    int64_t v8; /* placeholder for void */
+    void* v34;
+    bool v15;
     int64_t v23; /* placeholder for void */
-    int64_t v10; /* placeholder for void */
-    int64_t v66;
+    int64_t v16;
+    int64_t v27;
+    int64_t v9; /* placeholder for void */
+    int64_t v13; /* placeholder for void */
+    int64_t v26; /* placeholder for void */
     v3 = 0LL;
     v4 = v1 == v3;
-    v5 = 0LL;
-    v6 = v2 == v5;
-    v7 = v4 || v6;
-    if (v7) goto bb1;
+    if (v4) goto bb1;
     else goto bb2;
   bb1:
-    v9 = false;
+    v6 = 1LL;
+    v7 = -v6;
     p_call_stack_pop();
-    return v9;
+    return v7;
   bb2:
     goto bb3;
   bb3:
-    v12 = 0LL;
-    v13 = (int64_t)p_str_length((void*)v12, v1);
-    v14 = malloc(8);
-    *(int64_t*)v14 = (int64_t)v13;
-    v16 = 0LL;
-    v17 = (int64_t)p_str_length((void*)v16, v2);
-    v18 = malloc(8);
-    *(int64_t*)v18 = (int64_t)v17;
-    v20 = *(int64_t*)v18;
-    v21 = *(int64_t*)v14;
-    v22 = v20 > v21;
-    if (v22) goto bb4;
+    v10 = 0LL;
+    v11 = (int64_t)p_str_length((void*)v10, v1);
+    v12 = malloc(8);
+    *(int64_t*)v12 = (int64_t)v11;
+    v14 = 0LL;
+    v15 = v2 < v14;
+    v16 = *(int64_t*)v12;
+    v17 = v2 >= v16;
+    v18 = v15 || v17;
+    if (v18) goto bb4;
     else goto bb5;
   bb4:
-    v24 = false;
+    v20 = 1LL;
+    v21 = -v20;
     p_call_stack_pop();
-    return v24;
+    return v21;
   bb5:
     goto bb6;
   bb6:
-    v27 = *(int64_t*)v18;
-    v28 = 0LL;
-    v29 = v27 == v28;
-    if (v29) goto bb7;
-    else goto bb8;
-  bb7:
-    v31 = true;
-    p_call_stack_pop();
-    return v31;
-  bb8:
-    goto bb9;
-  bb9:
-    v34 = *(int64_t*)v14;
-    v35 = *(int64_t*)v18;
-    v36 = v34 - v35;
-    v37 = malloc(8);
-    *(int64_t*)v37 = (int64_t)v36;
-    v39 = 0LL;
-    v40 = malloc(8);
-    *(int64_t*)v40 = (int64_t)v39;
-    goto bb10;
-  bb10:
-    v43 = *(int64_t*)v40;
-    v44 = *(int64_t*)v18;
-    v45 = v43 < v44;
-    if (v45) goto bb11;
-    else goto bb12;
-  bb11:
-    v47 = *(int64_t*)v37;
-    v48 = v1 + v47;
-    v49 = *(int64_t*)v40;
-    v50 = v48 + v49;
-    v51 = malloc(8);
-    *(int64_t*)v51 = (int64_t)v50;
-    v53 = *(int64_t*)v40;
-    v54 = v2 + v53;
-    v55 = malloc(8);
-    *(int64_t*)v55 = (int64_t)v54;
-    v57 = *(int64_t*)v51;
-    v58 = malloc(8);
-    *(void**)v58 = (void*)v57;
-    v60 = *(int64_t*)v55;
-    v61 = malloc(8);
-    *(void**)v61 = (void*)v60;
-    v63 = 0LL;
-    v64 = malloc(8);
-    *(int64_t*)v64 = (int64_t)v63;
-    v66 = 0LL;
-    v67 = malloc(8);
-    *(int64_t*)v67 = (int64_t)v66;
-    v70 = *(void**)v58;
-    v71 = *(uint8_t*)v70;
-    *(int64_t*)v64 = (int64_t)v71;
-    v73 = *(void**)v61;
-    v74 = *(uint8_t*)v73;
-    *(int64_t*)v67 = (int64_t)v74;
-    v77 = *(int64_t*)v64;
-    v78 = *(int64_t*)v67;
-    v79 = v77 != v78;
-    if (v79) goto bb13;
-    else goto bb14;
-  bb12:
-    v89 = true;
-    p_call_stack_pop();
-    return v89;
-  bb13:
-    v81 = false;
-    p_call_stack_pop();
-    return v81;
-  bb14:
-    goto bb15;
-  bb15:
-    v84 = *(int64_t*)v40;
-    v85 = 1LL;
-    v86 = v84 + v85;
-    *(int64_t*)v40 = (int64_t)v86;
-    goto bb10;
-    return 0;
-}
-
-void* Vec_to_str(void* v0, int64_t v1) {
-    p_call_stack_push("Vec_to_str");
-    int64_t v48;
-    int64_t v47; /* placeholder for void */
-    bool v33;
-    void* v35;
-    int64_t v17;
-    void* v8;
-    int64_t v58; /* placeholder for void */
-    int64_t v19; /* placeholder for void */
-    void* v36;
-    void* v70;
-    int64_t v63; /* placeholder for void */
-    void* v4;
-    void* v10;
-    int64_t v44;
-    int64_t v64;
-    void* v20;
-    int64_t v26; /* placeholder for void */
-    int64_t v41;
-    int64_t v12; /* placeholder for void */
-    int64_t v50; /* placeholder for void */
-    int64_t v30; /* placeholder for void */
-    int64_t v31;
-    int64_t v25; /* placeholder for void */
-    void* v61;
-    void* v55;
-    int64_t v32;
-    int64_t v2;
-    int64_t v13; /* placeholder for void */
-    int64_t v38; /* placeholder for void */
-    void* v62;
-    int64_t v66;
-    int64_t v74; /* placeholder for void */
-    int64_t v65;
-    int64_t v34; /* placeholder for void */
-    int64_t v18; /* placeholder for void */
-    void* v46;
-    void* v69;
-    int64_t v15; /* placeholder for void */
-    void* v24;
-    int64_t v28;
-    int64_t v5; /* placeholder for void */
-    int64_t v43;
-    int64_t v57; /* placeholder for void */
-    int64_t v11;
-    int64_t v68; /* placeholder for void */
-    void* v73;
-    void* v16;
-    int64_t v3;
-    int64_t v22; /* placeholder for void */
-    int64_t v42;
-    int64_t v60;
-    int64_t v67; /* placeholder for void */
-    void* v71;
-    void* v52;
-    void* v21;
-    void* v6;
-    int64_t v39; /* placeholder for void */
-    void* v14;
-    int64_t v27;
-    int64_t v40; /* placeholder for void */
-    int64_t v51;
-    int64_t v9; /* placeholder for void */
-    void* v37;
-    void* v59;
-    int64_t v54; /* placeholder for void */
-    int64_t v23;
-    int64_t v72; /* placeholder for void */
-    int64_t v7; /* placeholder for void */
-    int64_t v56;
-    bool v29;
-    int64_t v53; /* placeholder for void */
-    int64_t v45;
-    void* v49;
-    v2 = 8LL;
-    v3 = v1 + v2;
-    v4 = malloc(8);
-    *(void**)v4 = (void*)v3;
-    v6 = malloc(8);
-    *(void**)v6 = (void*)v1;
-    v8 = malloc(8);
-    v10 = *(void**)v4;
-    v11 = *(int64_t*)v10;
-    *(int64_t*)v8 = (int64_t)v11;
-    v14 = malloc(8);
-    v16 = *(void**)v6;
-    v17 = *(int64_t*)v16;
-    *(int64_t*)v14 = (int64_t)v17;
-    v20 = _str15;
-    v21 = malloc(8);
-    *(void**)v21 = (void*)v20;
-    v23 = 0LL;
-    v24 = malloc(8);
-    *(int64_t*)v24 = (int64_t)v23;
-    goto bb1;
-  bb1:
-    v27 = *(int64_t*)v24;
-    v28 = *(int64_t*)v8;
-    v29 = v27 < v28;
-    if (v29) goto bb2;
-    else goto bb3;
-  bb2:
-    v31 = *(int64_t*)v24;
-    v32 = 0LL;
-    v33 = v31 > v32;
-    if (v33) goto bb4;
-    else goto bb5;
-  bb3:
-    v69 = *(void**)v21;
-    v70 = _str16;
-    v71 = p_str_concat(v69, v70);
-    *(void**)v21 = (void*)v71;
-    v73 = *(void**)v21;
-    p_call_stack_pop();
-    return v73;
-  bb4:
-    v35 = *(void**)v21;
-    v36 = _str6;
-    v37 = p_str_concat(v35, v36);
-    *(void**)v21 = (void*)v37;
-    goto bb6;
-  bb5:
-    goto bb6;
-  bb6:
-    v41 = *(int64_t*)v14;
-    v42 = *(int64_t*)v24;
-    v43 = 8LL;
-    v44 = v42 * v43;
-    v45 = v41 + v44;
-    v46 = malloc(8);
-    *(int64_t*)v46 = (int64_t)v45;
-    v48 = *(int64_t*)v46;
-    v49 = malloc(8);
-    *(void**)v49 = (void*)v48;
-    v51 = 0LL;
-    v52 = malloc(8);
-    *(int64_t*)v52 = (int64_t)v51;
-    v55 = *(void**)v49;
-    v56 = *(int64_t*)v55;
-    *(int64_t*)v52 = (int64_t)v56;
-    v59 = *(void**)v21;
-    v60 = *(int64_t*)v52;
-    v61 = (void*)p_to_str((int64_t)v60);
-    v62 = p_str_concat(v59, v61);
-    *(void**)v21 = (void*)v62;
-    v64 = *(int64_t*)v24;
-    v65 = 1LL;
-    v66 = v64 + v65;
-    *(int64_t*)v24 = (int64_t)v66;
-    goto bb1;
-    return 0;
-}
-
-void* create_allocator(void* v0, void* v1) {
-    p_call_stack_push("create_allocator");
-    void* v2;
-    int64_t v3; /* placeholder for void */
-    v2 = p_allocator_create(v1);
-    p_call_stack_pop();
-    return v2;
-    return 0;
-}
-
-void* str_trim_start(void* v0, void* v1) {
-    p_call_stack_push("str_trim_start");
-    int64_t v28; /* placeholder for void */
-    int64_t v30;
-    bool v12;
-    int64_t v29;
-    int64_t v42;
-    int64_t v35; /* placeholder for void */
-    void* v25;
-    bool v43;
-    int64_t v17; /* placeholder for void */
-    int64_t v41;
-    int64_t v50;
-    int64_t v27; /* placeholder for void */
-    int64_t v15;
-    int64_t v24; /* placeholder for void */
-    int64_t v3;
-    int64_t v20; /* placeholder for void */
-    int64_t v52; /* placeholder for void */
-    void* v19;
-    int64_t v36;
-    int64_t v32;
-    int64_t v38;
-    int64_t v51;
-    int64_t v49;
-    void* v7;
-    void* v4;
-    int64_t v10;
-    int64_t v14;
-    int64_t v33; /* placeholder for void */
-    int64_t v11;
-    int64_t v23; /* placeholder for void */
-    bool v31;
-    int64_t v34; /* placeholder for void */
-    int64_t v21;
-    int64_t v37;
-    int64_t v44; /* placeholder for void */
-    int64_t v2;
-    int64_t v9; /* placeholder for void */
-    int64_t v13; /* placeholder for void */
-    uint8_t v26;
-    int64_t v40; /* placeholder for void */
-    int64_t v47; /* placeholder for void */
-    int64_t v6;
-    int64_t v8; /* placeholder for void */
-    int64_t v48;
-    int64_t v18;
-    int64_t v46; /* placeholder for void */
-    int64_t v5; /* placeholder for void */
-    int64_t v39; /* placeholder for void */
-    void* v22;
-    void* v16;
-    void* v45;
-    v2 = 0LL;
-    v3 = (int64_t)String_len((void*)v2, (int64_t)v1);
-    v4 = malloc(8);
-    *(int64_t*)v4 = (int64_t)v3;
-    v6 = 0LL;
-    v7 = malloc(8);
-    *(int64_t*)v7 = (int64_t)v6;
-    goto bb1;
-  bb1:
-    v10 = *(int64_t*)v7;
-    v11 = *(int64_t*)v4;
-    v12 = v10 < v11;
-    if (v12) goto bb2;
-    else goto bb3;
-  bb2:
-    v14 = *(int64_t*)v7;
-    v15 = (int64_t)v1 + v14;
-    v16 = malloc(8);
-    *(int64_t*)v16 = (int64_t)v15;
-    v18 = *(int64_t*)v16;
-    v19 = malloc(8);
-    *(void**)v19 = (void*)v18;
-    v21 = 0LL;
-    v22 = malloc(8);
-    *(int64_t*)v22 = (int64_t)v21;
-    v25 = *(void**)v19;
-    v26 = *(uint8_t*)v25;
-    *(int64_t*)v22 = (int64_t)v26;
-    v29 = *(int64_t*)v22;
+    v24 = v1 + v2;
+    v25 = malloc(8);
+    *(int64_t*)v25 = (int64_t)v24;
+    v27 = *(int64_t*)v25;
+    v28 = malloc(8);
+    *(void**)v28 = (void*)v27;
     v30 = 0LL;
-    v31 = (bool)char_is_whitespace((void*)v30, v29);
-    v32 = !v31;
-    if (v32) goto bb4;
-    else goto bb5;
-  bb3:
-    v41 = *(int64_t*)v7;
-    v42 = *(int64_t*)v4;
-    v43 = v41 >= v42;
-    if (v43) goto bb7;
-    else goto bb8;
-  bb4:
-    goto bb3;
-  bb5:
-    goto bb6;
-  bb6:
-    v36 = *(int64_t*)v7;
-    v37 = 1LL;
-    v38 = v36 + v37;
-    *(int64_t*)v7 = (int64_t)v38;
-    goto bb1;
-  bb7:
-    v45 = _str1;
+    v31 = malloc(8);
+    *(int64_t*)v31 = (int64_t)v30;
+    v34 = *(void**)v28;
+    v35 = *(uint8_t*)v34;
+    *(int64_t*)v31 = (int64_t)v35;
+    v38 = *(int64_t*)v31;
     p_call_stack_pop();
-    return v45;
-  bb8:
-    goto bb9;
-  bb9:
-    v48 = *(int64_t*)v7;
-    v49 = *(int64_t*)v4;
-    v50 = 0LL;
-    v51 = (int64_t)String_slice((void*)v50, (int64_t)v1, v48, v49);
-    p_call_stack_pop();
-    return (void*)v51;
+    return v38;
     return 0;
 }
 
-int64_t p_abs(void* v0, int64_t v1) {
-    p_call_stack_push("abs");
-    int64_t v8; /* placeholder for void */
-    int64_t v6; /* placeholder for void */
-    int64_t v2;
-    int64_t v5;
-    bool v3;
+int64_t p_max(void* v0, int64_t v1, int64_t v2) {
+    p_call_stack_push("max");
     int64_t v7; /* placeholder for void */
+    int64_t v6; /* placeholder for void */
+    bool v3;
+    int64_t v5; /* placeholder for void */
     int64_t v4; /* placeholder for void */
-    v2 = 0LL;
-    v3 = v1 < v2;
+    v3 = v1 > v2;
     if (v3) goto bb1;
     else goto bb2;
   bb1:
-    v5 = -v1;
     p_call_stack_pop();
-    return v5;
+    return v1;
   bb2:
     goto bb3;
   bb3:
     p_call_stack_pop();
-    return v1;
-    return 0;
-}
-
-void p_str_copy_n(void* v0, int64_t v1, int64_t v2, int64_t v3) {
-    p_call_stack_push("p_str_copy_n");
-    int64_t v10; /* placeholder for void */
-    int64_t v28; /* placeholder for void */
-    int64_t v41; /* placeholder for void */
-    int64_t v25; /* placeholder for void */
-    int64_t v42; /* placeholder for void */
-    void* v22;
-    int64_t v34;
-    int64_t v29; /* placeholder for void */
-    int64_t v31;
-    int64_t v17; /* placeholder for void */
-    void* v26;
-    int64_t v18;
-    int64_t v36;
-    int64_t v5; /* placeholder for void */
-    void* v6;
-    int64_t v14; /* placeholder for void */
-    int64_t v33; /* placeholder for void */
-    void* v19;
-    int64_t v27;
-    void* v4;
-    int64_t v30;
-    int64_t v35;
-    int64_t v37; /* placeholder for void */
-    int64_t v8;
-    int64_t v20; /* placeholder for void */
-    int64_t v40;
-    int64_t v39;
-    void* v24;
-    int64_t v7; /* placeholder for void */
-    void* v9;
-    int64_t v32;
-    int64_t v38;
-    int64_t v43; /* placeholder for void */
-    void* v16;
-    uint8_t v23;
-    int64_t v11; /* placeholder for void */
-    int64_t v12;
-    bool v13;
-    int64_t v15;
-    int64_t v21; /* placeholder for void */
-    v4 = malloc(8);
-    *(int64_t*)v4 = (int64_t)v1;
-    v6 = malloc(8);
-    *(int64_t*)v6 = (int64_t)v2;
-    v8 = 0LL;
-    v9 = malloc(8);
-    *(int64_t*)v9 = (int64_t)v8;
-    goto bb1;
-  bb1:
-    v12 = *(int64_t*)v9;
-    v13 = v12 < v3;
-    if (v13) goto bb2;
-    else goto bb3;
-  bb2:
-    v15 = *(int64_t*)v4;
-    v16 = malloc(8);
-    *(void**)v16 = (void*)v15;
-    v18 = *(int64_t*)v6;
-    v19 = malloc(8);
-    *(void**)v19 = (void*)v18;
-    v22 = *(void**)v19;
-    v23 = *(uint8_t*)v22;
-    v24 = malloc(8);
-    *(int64_t*)v24 = (int64_t)v23;
-    v26 = *(void**)v16;
-    v27 = *(int64_t*)v24;
-    *(uint8_t*)v26 = (uint8_t)v27;
-    v30 = *(int64_t*)v4;
-    v31 = 1LL;
-    v32 = v30 + v31;
-    *(int64_t*)v4 = (int64_t)v32;
-    v34 = *(int64_t*)v6;
-    v35 = 1LL;
-    v36 = v34 + v35;
-    *(int64_t*)v6 = (int64_t)v36;
-    v38 = *(int64_t*)v9;
-    v39 = 1LL;
-    v40 = v38 + v39;
-    *(int64_t*)v9 = (int64_t)v40;
-    goto bb1;
-  bb3:
-    p_call_stack_pop();
-    return;
-    return;
-}
-
-int64_t Result_unwrap(void* v0, void* v1) {
-    p_call_stack_push("Result_unwrap");
-    int64_t v3;
-    int64_t v16;
-    void* v2;
-    void* v7;
-    int64_t v6; /* placeholder for void */
-    void* v17;
-    int64_t v12;
-    bool v13;
-    int64_t v11;
-    bool v5;
-    void* v10;
-    int64_t v9; /* placeholder for void */
-    int64_t v20; /* placeholder for void */
-    int64_t v14; /* placeholder for void */
-    int64_t v19; /* placeholder for void */
-    int64_t v22; /* placeholder for void */
-    int64_t v21;
-    int64_t v4;
-    int64_t v8;
-    void* v15;
-    int64_t v18; /* placeholder for void */
-    v2 = (char*)v1 + 0;
-    v3 = *(int64_t*)v2;
-    v4 = 0LL;
-    v5 = v3 == v4;
-    if (v5) goto bb2;
-    else goto bb3;
-  bb1:
-    v21 = 0LL;
-    p_call_stack_pop();
-    return v21;
-  bb2:
-    v7 = (char*)v1 + 8;
-    v8 = *(int64_t*)v7;
-    p_call_stack_pop();
-    return v8;
-  bb3:
-    v10 = (char*)v1 + 0;
-    v11 = *(int64_t*)v10;
-    v12 = 1LL;
-    v13 = v11 == v12;
-    if (v13) goto bb4;
-    else goto bb5;
-  bb4:
-    v15 = (char*)v1 + 8;
-    v16 = *(int64_t*)v15;
-    v17 = _str17;
-    p_panic(v17);
-    goto bb1;
-  bb5:
-    goto bb1;
-    return 0;
-}
-
-int64_t str_rfind(void* v0, void* v1, void* v2) {
-    p_call_stack_push("str_rfind");
-    int64_t v3;
-    int64_t v5; /* placeholder for void */
-    int64_t v4;
-    v3 = 0LL;
-    v4 = (int64_t)String_rfind((void*)v3, (int64_t)v1, (int64_t)v2);
-    p_call_stack_pop();
-    return v4;
-    return 0;
-}
-
-bool Result_is_err(void* v0, void* v1) {
-    p_call_stack_push("Result_is_err");
-    int64_t v13;
-    int64_t v15; /* placeholder for void */
-    int64_t v22; /* placeholder for void */
-    bool v9;
-    int64_t v10; /* placeholder for void */
-    void* v2;
-    void* v11;
-    int64_t v6; /* placeholder for void */
-    void* v7;
-    int64_t v12;
-    bool v14;
-    void* v16;
-    bool v5;
-    int64_t v8;
-    int64_t v3;
-    int64_t v17;
-    bool v18;
-    int64_t v19; /* placeholder for void */
-    int64_t v20; /* placeholder for void */
-    bool v21;
-    int64_t v4;
-    v2 = (char*)v1 + 0;
-    v3 = *(int64_t*)v2;
-    v4 = 0LL;
-    v5 = v3 == v4;
-    if (v5) goto bb2;
-    else goto bb3;
-  bb1:
-    v21 = false;
-    p_call_stack_pop();
-    return v21;
-  bb2:
-    v7 = (char*)v1 + 8;
-    v8 = *(int64_t*)v7;
-    v9 = false;
-    p_call_stack_pop();
-    return v9;
-  bb3:
-    v11 = (char*)v1 + 0;
-    v12 = *(int64_t*)v11;
-    v13 = 1LL;
-    v14 = v12 == v13;
-    if (v14) goto bb4;
-    else goto bb5;
-  bb4:
-    v16 = (char*)v1 + 8;
-    v17 = *(int64_t*)v16;
-    v18 = true;
-    p_call_stack_pop();
-    return v18;
-  bb5:
-    goto bb1;
+    return v2;
     return 0;
 }
 
@@ -15431,154 +15449,154 @@ bool Result_is_err(void* v0, void* v1) {
 int main(int argc, char** argv) {
     __p_argc = argc; __p_argv = argv;
     // Register functions for p_thread_spawn lookup
-    p_thread_register("p_str_from_ptr", (int64_t(*)())p_str_from_ptr);
-    p_thread_register("str_repeat", (int64_t(*)())str_repeat);
-    p_thread_register("HashMap_keys", (int64_t(*)())HashMap_keys);
-    p_thread_register("str_ends_with", (int64_t(*)())str_ends_with);
-    p_thread_register("String_parse_int", (int64_t(*)())String_parse_int);
-    p_thread_register("ByteBuffer_is_empty", (int64_t(*)())ByteBuffer_is_empty);
-    p_thread_register("String_push_str", (int64_t(*)())String_push_str);
-    p_thread_register("HashMap_values", (int64_t(*)())HashMap_values);
-    p_thread_register("char_to_str", (int64_t(*)())char_to_str);
-    p_thread_register("String_repeat", (int64_t(*)())String_repeat);
-    p_thread_register("HashMap_new", (int64_t(*)())HashMap_new);
-    p_thread_register("String_trim", (int64_t(*)())String_trim);
-    p_thread_register("str_starts_with", (int64_t(*)())str_starts_with);
-    p_thread_register("Vec_first", (int64_t(*)())Vec_first);
-    p_thread_register("str_replace", (int64_t(*)())str_replace);
-    p_thread_register("Option_unwrap_or_else", (int64_t(*)())Option_unwrap_or_else);
-    p_thread_register("Result_err", (int64_t(*)())Result_err);
-    p_thread_register("Result_expect", (int64_t(*)())Result_expect);
-    p_thread_register("Option_map", (int64_t(*)())Option_map);
-    p_thread_register("String_is_empty", (int64_t(*)())String_is_empty);
-    p_thread_register("StringBuilder_new", (int64_t(*)())StringBuilder_new);
-    p_thread_register("ByteBuffer_clear", (int64_t(*)())ByteBuffer_clear);
-    p_thread_register("StringBuilder_append_str", (int64_t(*)())StringBuilder_append_str);
-    p_thread_register("Result_and_then", (int64_t(*)())Result_and_then);
-    p_thread_register("str_concat", (int64_t(*)())str_concat);
-    p_thread_register("String_split", (int64_t(*)())String_split);
-    p_thread_register("assert", (int64_t(*)())assert);
-    p_thread_register("str_trim", (int64_t(*)())str_trim);
-    p_thread_register("StringBuilder_to_str", (int64_t(*)())StringBuilder_to_str);
-    p_thread_register("StringBuilder_is_empty", (int64_t(*)())StringBuilder_is_empty);
-    p_thread_register("int_to_str", (int64_t(*)())int_to_str);
-    p_thread_register("String_byte_at", (int64_t(*)())String_byte_at);
-    p_thread_register("allocator_bytes_used", (int64_t(*)())allocator_bytes_used);
-    p_thread_register("ByteBuffer_write_byte", (int64_t(*)())ByteBuffer_write_byte);
-    p_thread_register("Vec_capacity", (int64_t(*)())Vec_capacity);
-    p_thread_register("str_split_char", (int64_t(*)())str_split_char);
-    p_thread_register("String_len", (int64_t(*)())String_len);
-    p_thread_register("StringBuilder_append_int", (int64_t(*)())StringBuilder_append_int);
-    p_thread_register("String_to_string", (int64_t(*)())String_to_string);
-    p_thread_register("str_byte_at", (int64_t(*)())str_byte_at);
-    p_thread_register("Option_is_none", (int64_t(*)())Option_is_none);
-    p_thread_register("max", (int64_t(*)())p_max);
-    p_thread_register("str_to_lower", (int64_t(*)())str_to_lower);
-    p_thread_register("Vec_last", (int64_t(*)())Vec_last);
-    p_thread_register("p_str_length", (int64_t(*)())p_str_length);
-    p_thread_register("String_from", (int64_t(*)())String_from);
-    p_thread_register("String_starts_with", (int64_t(*)())String_starts_with);
-    p_thread_register("str_parse_hex", (int64_t(*)())str_parse_hex);
-    p_thread_register("char_is_lower", (int64_t(*)())char_is_lower);
-    p_thread_register("min", (int64_t(*)())p_min);
-    p_thread_register("ByteBuffer_len", (int64_t(*)())ByteBuffer_len);
-    p_thread_register("Vec_pop", (int64_t(*)())Vec_pop);
-    p_thread_register("clamp", (int64_t(*)())clamp);
-    p_thread_register("ByteBuffer_to_str", (int64_t(*)())ByteBuffer_to_str);
-    p_thread_register("String_char_at", (int64_t(*)())String_char_at);
-    p_thread_register("Vec_is_empty", (int64_t(*)())Vec_is_empty);
-    p_thread_register("Result_unwrap_or", (int64_t(*)())Result_unwrap_or);
-    p_thread_register("Result_is_ok", (int64_t(*)())Result_is_ok);
-    p_thread_register("Vec_clone", (int64_t(*)())Vec_clone);
-    p_thread_register("HashMap_is_empty", (int64_t(*)())HashMap_is_empty);
-    p_thread_register("HashMap_find_slot", (int64_t(*)())HashMap_find_slot);
-    p_thread_register("String_contains", (int64_t(*)())String_contains);
-    p_thread_register("char_to_lower", (int64_t(*)())char_to_lower);
-    p_thread_register("char_is_digit", (int64_t(*)())char_is_digit);
-    p_thread_register("ByteBuffer_set_byte", (int64_t(*)())ByteBuffer_set_byte);
-    p_thread_register("String_rfind", (int64_t(*)())String_rfind);
-    p_thread_register("str_trim_end", (int64_t(*)())str_trim_end);
-    p_thread_register("str_equal", (int64_t(*)())str_equal);
-    p_thread_register("str_from_bytes", (int64_t(*)())str_from_bytes);
-    p_thread_register("allocator_free", (int64_t(*)())allocator_free);
-    p_thread_register("HashMap_clear", (int64_t(*)())HashMap_clear);
-    p_thread_register("String_char_count", (int64_t(*)())String_char_count);
-    p_thread_register("String_slice", (int64_t(*)())String_slice);
-    p_thread_register("char_to_upper", (int64_t(*)())char_to_upper);
-    p_thread_register("ByteBuffer_from_string", (int64_t(*)())ByteBuffer_from_string);
-    p_thread_register("Result_ok", (int64_t(*)())Result_ok);
-    p_thread_register("Result_unwrap_or_else", (int64_t(*)())Result_unwrap_or_else);
-    p_thread_register("ByteBuffer_write_bytes", (int64_t(*)())ByteBuffer_write_bytes);
-    p_thread_register("HashMap_remove", (int64_t(*)())HashMap_remove);
-    p_thread_register("Vec_remove", (int64_t(*)())Vec_remove);
-    p_thread_register("HashMap_to_str", (int64_t(*)())HashMap_to_str);
-    p_thread_register("Option_and_then", (int64_t(*)())Option_and_then);
-    p_thread_register("str_bytes", (int64_t(*)())str_bytes);
-    p_thread_register("char_is_whitespace", (int64_t(*)())char_is_whitespace);
-    p_thread_register("Option_is_some", (int64_t(*)())Option_is_some);
-    p_thread_register("byte_to_str", (int64_t(*)())byte_to_str);
-    p_thread_register("str_split", (int64_t(*)())str_split);
-    p_thread_register("str_find", (int64_t(*)())str_find);
-    p_thread_register("char_is_upper", (int64_t(*)())char_is_upper);
-    p_thread_register("Option_unwrap", (int64_t(*)())Option_unwrap);
-    p_thread_register("str_to_upper", (int64_t(*)())str_to_upper);
-    p_thread_register("ByteBuffer_read_byte", (int64_t(*)())ByteBuffer_read_byte);
-    p_thread_register("String_replace", (int64_t(*)())String_replace);
-    p_thread_register("HashMap_get_or", (int64_t(*)())HashMap_get_or);
-    p_thread_register("str_parse_int_range", (int64_t(*)())str_parse_int_range);
-    p_thread_register("Vec_push", (int64_t(*)())Vec_push);
-    p_thread_register("Vec_sort", (int64_t(*)())Vec_sort);
-    p_thread_register("p_str_hash", (int64_t(*)())p_str_hash);
-    p_thread_register("StringBuilder_append_char", (int64_t(*)())StringBuilder_append_char);
+    p_thread_register("StringBuilder_len", (int64_t(*)())StringBuilder_len);
     p_thread_register("Vec_contains", (int64_t(*)())Vec_contains);
-    p_thread_register("allocator_alloc", (int64_t(*)())allocator_alloc);
-    p_thread_register("String_bytes", (int64_t(*)())String_bytes);
-    p_thread_register("String_clone", (int64_t(*)())String_clone);
-    p_thread_register("HashMap_contains", (int64_t(*)())HashMap_contains);
-    p_thread_register("p_str_compare", (int64_t(*)())p_str_compare);
-    p_thread_register("Option_expect", (int64_t(*)())Option_expect);
-    p_thread_register("str_parse_int", (int64_t(*)())str_parse_int);
-    p_thread_register("str_is_empty", (int64_t(*)())str_is_empty);
-    p_thread_register("HashMap_get", (int64_t(*)())HashMap_get);
-    p_thread_register("Option_or_else", (int64_t(*)())Option_or_else);
+    p_thread_register("Option_is_some", (int64_t(*)())Option_is_some);
+    p_thread_register("HashMap_clear", (int64_t(*)())HashMap_clear);
+    p_thread_register("Vec_truncate", (int64_t(*)())Vec_truncate);
     p_thread_register("println", (int64_t(*)())println);
-    p_thread_register("HashMap_grow", (int64_t(*)())HashMap_grow);
+    p_thread_register("String_starts_with", (int64_t(*)())String_starts_with);
+    p_thread_register("str_compare", (int64_t(*)())str_compare);
+    p_thread_register("StringBuilder_append_str", (int64_t(*)())StringBuilder_append_str);
+    p_thread_register("HashMap_clone", (int64_t(*)())HashMap_clone);
+    p_thread_register("Option_and_then", (int64_t(*)())Option_and_then);
+    p_thread_register("str_to_lower", (int64_t(*)())str_to_lower);
+    p_thread_register("String_to_uppercase", (int64_t(*)())String_to_uppercase);
+    p_thread_register("Result_map", (int64_t(*)())Result_map);
+    p_thread_register("str_trim_start", (int64_t(*)())str_trim_start);
+    p_thread_register("HashMap_keys", (int64_t(*)())HashMap_keys);
+    p_thread_register("StringBuilder_append_char", (int64_t(*)())StringBuilder_append_char);
+    p_thread_register("ByteBuffer_read_byte", (int64_t(*)())ByteBuffer_read_byte);
+    p_thread_register("clamp", (int64_t(*)())clamp);
+    p_thread_register("char_to_str", (int64_t(*)())char_to_str);
+    p_thread_register("char_is_upper", (int64_t(*)())char_is_upper);
+    p_thread_register("str_trim_end", (int64_t(*)())str_trim_end);
+    p_thread_register("ByteBuffer_len", (int64_t(*)())ByteBuffer_len);
+    p_thread_register("HashMap_new", (int64_t(*)())HashMap_new);
+    p_thread_register("str_contains", (int64_t(*)())str_contains);
+    p_thread_register("Result_map_err", (int64_t(*)())Result_map_err);
+    p_thread_register("Result_expect", (int64_t(*)())Result_expect);
+    p_thread_register("StringBuilder_is_empty", (int64_t(*)())StringBuilder_is_empty);
+    p_thread_register("Vec_extend", (int64_t(*)())Vec_extend);
+    p_thread_register("Result_and_then", (int64_t(*)())Result_and_then);
+    p_thread_register("str_bytes", (int64_t(*)())str_bytes);
+    p_thread_register("str_equal", (int64_t(*)())str_equal);
+    p_thread_register("assert", (int64_t(*)())assert);
+    p_thread_register("allocator_alloc", (int64_t(*)())allocator_alloc);
+    p_thread_register("String_repeat", (int64_t(*)())String_repeat);
+    p_thread_register("Result_unwrap_or", (int64_t(*)())Result_unwrap_or);
+    p_thread_register("String_split", (int64_t(*)())String_split);
+    p_thread_register("allocator_bytes_used", (int64_t(*)())allocator_bytes_used);
+    p_thread_register("String_rfind", (int64_t(*)())String_rfind);
+    p_thread_register("HashMap_find_slot", (int64_t(*)())HashMap_find_slot);
+    p_thread_register("str_starts_with", (int64_t(*)())str_starts_with);
+    p_thread_register("min", (int64_t(*)())p_min);
+    p_thread_register("p_str_hash", (int64_t(*)())p_str_hash);
+    p_thread_register("Vec_pop", (int64_t(*)())Vec_pop);
+    p_thread_register("String_find", (int64_t(*)())String_find);
+    p_thread_register("char_is_whitespace", (int64_t(*)())char_is_whitespace);
+    p_thread_register("str_replace", (int64_t(*)())str_replace);
+    p_thread_register("str_repeat", (int64_t(*)())str_repeat);
+    p_thread_register("str_parse_hex", (int64_t(*)())str_parse_hex);
+    p_thread_register("str_len", (int64_t(*)())str_len);
+    p_thread_register("p_str_from_ptr", (int64_t(*)())p_str_from_ptr);
+    p_thread_register("String_to_lowercase", (int64_t(*)())String_to_lowercase);
+    p_thread_register("String_char_count", (int64_t(*)())String_char_count);
+    p_thread_register("String_replace", (int64_t(*)())String_replace);
+    p_thread_register("HashMap_is_empty", (int64_t(*)())HashMap_is_empty);
+    p_thread_register("Vec_reverse", (int64_t(*)())Vec_reverse);
+    p_thread_register("Vec_new", (int64_t(*)())Vec_new);
+    p_thread_register("HashMap_insert", (int64_t(*)())HashMap_insert);
+    p_thread_register("HashMap_remove", (int64_t(*)())HashMap_remove);
+    p_thread_register("String_slice", (int64_t(*)())String_slice);
+    p_thread_register("Vec_sort", (int64_t(*)())Vec_sort);
+    p_thread_register("char_to_lower", (int64_t(*)())char_to_lower);
+    p_thread_register("str_from_bytes", (int64_t(*)())str_from_bytes);
+    p_thread_register("Result_is_err", (int64_t(*)())Result_is_err);
+    p_thread_register("String_len", (int64_t(*)())String_len);
+    p_thread_register("char_is_lower", (int64_t(*)())char_is_lower);
+    p_thread_register("ByteBuffer_set_byte", (int64_t(*)())ByteBuffer_set_byte);
+    p_thread_register("abs", (int64_t(*)())p_abs);
+    p_thread_register("Vec_last", (int64_t(*)())Vec_last);
+    p_thread_register("ByteBuffer_write_bytes", (int64_t(*)())ByteBuffer_write_bytes);
+    p_thread_register("Option_is_none", (int64_t(*)())Option_is_none);
+    p_thread_register("Vec_get", (int64_t(*)())Vec_get);
+    p_thread_register("str_find", (int64_t(*)())str_find);
+    p_thread_register("HashMap_contains", (int64_t(*)())HashMap_contains);
+    p_thread_register("String_push_str", (int64_t(*)())String_push_str);
+    p_thread_register("p_str_compare", (int64_t(*)())p_str_compare);
+    p_thread_register("String_ends_with", (int64_t(*)())String_ends_with);
+    p_thread_register("HashMap_get_or", (int64_t(*)())HashMap_get_or);
+    p_thread_register("char_to_upper", (int64_t(*)())char_to_upper);
+    p_thread_register("Vec_set", (int64_t(*)())Vec_set);
+    p_thread_register("String_is_empty", (int64_t(*)())String_is_empty);
+    p_thread_register("str_rfind", (int64_t(*)())str_rfind);
+    p_thread_register("str_split_char", (int64_t(*)())str_split_char);
+    p_thread_register("Vec_clear", (int64_t(*)())Vec_clear);
+    p_thread_register("Vec_capacity", (int64_t(*)())Vec_capacity);
+    p_thread_register("Option_unwrap_or", (int64_t(*)())Option_unwrap_or);
+    p_thread_register("Vec_is_empty", (int64_t(*)())Vec_is_empty);
+    p_thread_register("Result_err", (int64_t(*)())Result_err);
+    p_thread_register("String_parse_int", (int64_t(*)())String_parse_int);
+    p_thread_register("str_to_upper", (int64_t(*)())str_to_upper);
+    p_thread_register("allocator_free", (int64_t(*)())allocator_free);
+    p_thread_register("Vec_to_str", (int64_t(*)())Vec_to_str);
+    p_thread_register("p_str_copy_n", (int64_t(*)())p_str_copy_n);
     p_thread_register("char_is_alpha", (int64_t(*)())char_is_alpha);
+    p_thread_register("str_split", (int64_t(*)())str_split);
+    p_thread_register("str_ends_with", (int64_t(*)())str_ends_with);
+    p_thread_register("Vec_push", (int64_t(*)())Vec_push);
+    p_thread_register("String_contains", (int64_t(*)())String_contains);
+    p_thread_register("String_trim", (int64_t(*)())String_trim);
+    p_thread_register("StringBuilder_new", (int64_t(*)())StringBuilder_new);
+    p_thread_register("int_to_str", (int64_t(*)())int_to_str);
+    p_thread_register("HashMap_len", (int64_t(*)())HashMap_len);
+    p_thread_register("Result_unwrap", (int64_t(*)())Result_unwrap);
+    p_thread_register("Result_is_ok", (int64_t(*)())Result_is_ok);
+    p_thread_register("StringBuilder_append_int", (int64_t(*)())StringBuilder_append_int);
+    p_thread_register("ByteBuffer_new", (int64_t(*)())ByteBuffer_new);
+    p_thread_register("Vec_insert", (int64_t(*)())Vec_insert);
+    p_thread_register("Vec_clone", (int64_t(*)())Vec_clone);
+    p_thread_register("HashMap_values", (int64_t(*)())HashMap_values);
+    p_thread_register("create_allocator", (int64_t(*)())create_allocator);
+    p_thread_register("Vec_first", (int64_t(*)())Vec_first);
+    p_thread_register("HashMap_grow", (int64_t(*)())HashMap_grow);
+    p_thread_register("char_is_digit", (int64_t(*)())char_is_digit);
+    p_thread_register("Vec_remove", (int64_t(*)())Vec_remove);
+    p_thread_register("byte_to_str", (int64_t(*)())byte_to_str);
+    p_thread_register("Option_or_else", (int64_t(*)())Option_or_else);
+    p_thread_register("str_trim", (int64_t(*)())str_trim);
+    p_thread_register("ByteBuffer_write_byte", (int64_t(*)())ByteBuffer_write_byte);
+    p_thread_register("ByteBuffer_is_empty", (int64_t(*)())ByteBuffer_is_empty);
+    p_thread_register("Option_map", (int64_t(*)())Option_map);
+    p_thread_register("str_concat", (int64_t(*)())str_concat);
+    p_thread_register("HashMap_to_str", (int64_t(*)())HashMap_to_str);
+    p_thread_register("String_from", (int64_t(*)())String_from);
+    p_thread_register("String_clone", (int64_t(*)())String_clone);
+    p_thread_register("str_is_empty", (int64_t(*)())str_is_empty);
+    p_thread_register("ByteBuffer_from_string", (int64_t(*)())ByteBuffer_from_string);
+    p_thread_register("HashMap_get", (int64_t(*)())HashMap_get);
+    p_thread_register("Result_ok", (int64_t(*)())Result_ok);
+    p_thread_register("str_byte_at", (int64_t(*)())str_byte_at);
+    p_thread_register("ByteBuffer_clear", (int64_t(*)())ByteBuffer_clear);
+    p_thread_register("str_parse_int_range", (int64_t(*)())str_parse_int_range);
+    p_thread_register("Option_unwrap", (int64_t(*)())Option_unwrap);
+    p_thread_register("String_to_string", (int64_t(*)())String_to_string);
+    p_thread_register("StringBuilder_to_str", (int64_t(*)())StringBuilder_to_str);
+    p_thread_register("str_parse_int", (int64_t(*)())str_parse_int);
+    p_thread_register("String_bytes", (int64_t(*)())String_bytes);
+    p_thread_register("Option_unwrap_or_else", (int64_t(*)())Option_unwrap_or_else);
+    p_thread_register("Result_unwrap_or_else", (int64_t(*)())Result_unwrap_or_else);
+    p_thread_register("p_str_equal", (int64_t(*)())p_str_equal);
     p_thread_register("Vec_len", (int64_t(*)())Vec_len);
     p_thread_register("StringBuilder_clear", (int64_t(*)())StringBuilder_clear);
-    p_thread_register("Vec_extend", (int64_t(*)())Vec_extend);
-    p_thread_register("HashMap_insert", (int64_t(*)())HashMap_insert);
-    p_thread_register("Vec_reverse", (int64_t(*)())Vec_reverse);
-    p_thread_register("Option_unwrap_or", (int64_t(*)())Option_unwrap_or);
-    p_thread_register("HashMap_len", (int64_t(*)())HashMap_len);
-    p_thread_register("p_str_equal", (int64_t(*)())p_str_equal);
-    p_thread_register("Vec_truncate", (int64_t(*)())Vec_truncate);
-    p_thread_register("str_contains", (int64_t(*)())str_contains);
-    p_thread_register("str_len", (int64_t(*)())str_len);
-    p_thread_register("Vec_get", (int64_t(*)())Vec_get);
-    p_thread_register("String_to_lowercase", (int64_t(*)())String_to_lowercase);
-    p_thread_register("Result_map_err", (int64_t(*)())Result_map_err);
-    p_thread_register("ByteBuffer_new", (int64_t(*)())ByteBuffer_new);
-    p_thread_register("HashMap_clone", (int64_t(*)())HashMap_clone);
-    p_thread_register("StringBuilder_len", (int64_t(*)())StringBuilder_len);
-    p_thread_register("String_to_uppercase", (int64_t(*)())String_to_uppercase);
-    p_thread_register("str_compare", (int64_t(*)())str_compare);
-    p_thread_register("Vec_new", (int64_t(*)())Vec_new);
-    p_thread_register("String_find", (int64_t(*)())String_find);
-    p_thread_register("Vec_clear", (int64_t(*)())Vec_clear);
+    p_thread_register("Option_expect", (int64_t(*)())Option_expect);
+    p_thread_register("ByteBuffer_to_str", (int64_t(*)())ByteBuffer_to_str);
+    p_thread_register("String_char_at", (int64_t(*)())String_char_at);
+    p_thread_register("p_str_length", (int64_t(*)())p_str_length);
     p_thread_register("str_slice", (int64_t(*)())str_slice);
-    p_thread_register("Result_map", (int64_t(*)())Result_map);
-    p_thread_register("Vec_set", (int64_t(*)())Vec_set);
-    p_thread_register("Vec_insert", (int64_t(*)())Vec_insert);
-    p_thread_register("String_ends_with", (int64_t(*)())String_ends_with);
-    p_thread_register("Vec_to_str", (int64_t(*)())Vec_to_str);
-    p_thread_register("create_allocator", (int64_t(*)())create_allocator);
-    p_thread_register("str_trim_start", (int64_t(*)())str_trim_start);
-    p_thread_register("abs", (int64_t(*)())p_abs);
-    p_thread_register("p_str_copy_n", (int64_t(*)())p_str_copy_n);
-    p_thread_register("Result_unwrap", (int64_t(*)())Result_unwrap);
-    p_thread_register("str_rfind", (int64_t(*)())str_rfind);
-    p_thread_register("Result_is_err", (int64_t(*)())Result_is_err);
+    p_thread_register("String_byte_at", (int64_t(*)())String_byte_at);
+    p_thread_register("max", (int64_t(*)())p_max);
     int64_t result = main_entry(NULL);
     return (int)result;
 }
@@ -15750,12 +15768,14 @@ void p_panic(const char* msg) {{
     }}
     abort();
 }}
-void* p_malloc(int64_t size) { return malloc((size_t)size); }
+void* p_malloc(int64_t size) { if (size < 0) return NULL; return malloc((size_t)size); }
 void p_free(void* ptr) { free(ptr); }
 char* p_file_read(const char* path) {{
     FILE* f = fopen(path, "rb");
     if (!f) return NULL;
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    fseek(f, 0, SEEK_END); long sz = ftell(f);
+    if (sz < 0) {{ fclose(f); return NULL; }}
+    fseek(f, 0, SEEK_SET);
     char* buf = (char*)malloc((size_t)sz + 1);
     if (!buf) {{ fclose(f); return NULL; }}
     size_t rd = fread(buf, 1, (size_t)sz, f); buf[rd] = 0; fclose(f);
@@ -15773,7 +15793,7 @@ int64_t p_file_append(const char* path, const char* content) {{
     fputs(content, f); fclose(f); return 0;
 }}
 int64_t p_file_delete(const char* path) {{ return remove(path) == 0 ? 0 : -1; }}
-int64_t p_file_size(const char* path) {{ FILE* f = fopen(path, "rb"); if (!f) return -1; fseek(f, 0, SEEK_END); int64_t sz = ftell(f); fclose(f); return sz; }}
+int64_t p_file_size(const char* path) {{ FILE* f = fopen(path, "rb"); if (!f) return -1; fseek(f, 0, SEEK_END); int64_t sz = ftell(f); fclose(f); return sz < 0 ? -1 : sz; }}
 char* p_getenv(const char* name) {{ return getenv(name); }}
 int64_t p_argc(void) {{ return (int64_t)__p_argc; }}
 char* p_argv(int64_t index) {{ if (index < 0 || index >= __p_argc) return NULL; return __p_argv[index]; }}
@@ -16013,7 +16033,7 @@ int64_t p_thread_spawn(const char* func_name, int64_t num_args, ...) {
     p_thread_handles[idx] = tid;
     return -(int64_t)(idx + 1);
 }
-int64_t p_shared_alloc(int64_t size) { return (int64_t)(intptr_t)malloc((size_t)size); }
+int64_t p_shared_alloc(int64_t size) { if (size < 0) return 0; return (int64_t)(intptr_t)malloc((size_t)size); }
 int64_t p_atomic_load(int64_t addr) { return atomic_load((atomic_int_least64_t*)(intptr_t)addr); }
 void p_atomic_store(int64_t addr, int64_t val) { atomic_store((atomic_int_least64_t*)(intptr_t)addr, val); }
 bool p_atomic_cas(int64_t addr, int64_t expected, int64_t new_val) {
@@ -16155,7 +16175,7 @@ int64_t p_dl_call(int64_t func_ptr, int64_t arg) {
     return fn(arg);
 }
 void* p_allocator_create(void* arg) { (void)arg; return (void*)1; }
-int64_t p_allocator_alloc(void* alloc, int64_t size) { (void)alloc; return (int64_t)(intptr_t)malloc((size_t)size); }
+int64_t p_allocator_alloc(void* alloc, int64_t size) { (void)alloc; if (size < 0) return 0; return (int64_t)(intptr_t)malloc((size_t)size); }
 void p_allocator_free(void* alloc, int64_t ptr) { (void)alloc; free((void*)(intptr_t)ptr); }
 int64_t p_allocator_stats(void* alloc) { (void)alloc; return 0; }
 int64_t print(int64_t val) { printf("%lld", (long long)val); return 0; }
@@ -16555,6 +16575,7 @@ void* p_tensor_add(void* a, void* b) {{
     for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = ta->shape[i];
     r->data = (double*)malloc(r->len * sizeof(double));
     for (int64_t i = 0; i < r->len; i++) r->data[i] = ta->data[i] + tb->data[i];
+    ag_record(AG_ADD, r, a, b, 0);
     return r;
 }}
 void* p_tensor_mul(void* a, void* b) {{
@@ -16565,6 +16586,7 @@ void* p_tensor_mul(void* a, void* b) {{
     for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = ta->shape[i];
     r->data = (double*)malloc(r->len * sizeof(double));
     for (int64_t i = 0; i < r->len; i++) r->data[i] = ta->data[i] * tb->data[i];
+    ag_record(AG_MUL, r, a, b, 0);
     return r;
 }}
 void* p_tensor_matmul(void* a, void* b) {{
@@ -16578,6 +16600,7 @@ void* p_tensor_matmul(void* a, void* b) {{
         for (int64_t j = 0; j < N; j++)
             for (int64_t k = 0; k < K; k++)
                 r->data[i*N+j] += ta->data[i*K+k] * tb->data[k*N+j];
+    ag_record(AG_MATMUL, r, a, b, 0);
     return r;
 }}
 void* p_tensor_transpose(void* t) {{
@@ -16600,6 +16623,14 @@ void* p_tensor_relu(void* t) {{
     for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = pt->shape[i];
     r->data = (double*)malloc(r->len * sizeof(double));
     for (int64_t i = 0; i < r->len; i++) r->data[i] = pt->data[i] > 0 ? pt->data[i] : 0;
+    if (ag_mode && ag_tape_len < 256) {{
+        AGEntry* e = &ag_tape[ag_tape_len++];
+        e->op = AG_RELU; e->result = r; e->a = t; e->b = NULL; e->scalar = 0;
+        e->a_ndim = pt->ndim; for (int64_t i = 0; i < pt->ndim && i < 8; i++) e->a_shape[i] = pt->shape[i];
+        e->b_ndim = 0;
+        if (ag_checkpoint_mode) {{ e->is_checkpoint = 1; e->stored_len = pt->len; e->stored_data = (double*)malloc(pt->len * sizeof(double)); for (int64_t i = 0; i < pt->len; i++) e->stored_data[i] = pt->data[i]; }}
+        else {{ e->is_checkpoint = 0; e->stored_len = r->len; e->stored_data = (double*)malloc(r->len * sizeof(double)); for (int64_t i = 0; i < r->len; i++) e->stored_data[i] = r->data[i]; }}
+    }}
     return r;
 }}
 void* p_tensor_softmax(void* t) {{
@@ -16716,6 +16747,14 @@ void* p_tensor_sigmoid(void* t) {{
     for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = pt->shape[i];
     r->data = (double*)malloc(r->len * sizeof(double));
     for (int64_t i = 0; i < r->len; i++) r->data[i] = 1.0 / (1.0 + exp(-pt->data[i]));
+    if (ag_mode && ag_tape_len < 256) {{
+        AGEntry* e = &ag_tape[ag_tape_len++];
+        e->op = AG_SIGMOID; e->result = r; e->a = t; e->b = NULL; e->scalar = 0;
+        e->a_ndim = pt->ndim; for (int64_t i = 0; i < pt->ndim && i < 8; i++) e->a_shape[i] = pt->shape[i];
+        e->b_ndim = 0;
+        if (ag_checkpoint_mode) {{ e->is_checkpoint = 1; e->stored_len = pt->len; e->stored_data = (double*)malloc(pt->len * sizeof(double)); for (int64_t i = 0; i < pt->len; i++) e->stored_data[i] = pt->data[i]; }}
+        else {{ e->is_checkpoint = 0; e->stored_len = r->len; e->stored_data = (double*)malloc(r->len * sizeof(double)); for (int64_t i = 0; i < r->len; i++) e->stored_data[i] = r->data[i]; }}
+    }}
     return r;
 }}
 void* p_tensor_scale(void* t, double s) {{
@@ -16726,10 +16765,11 @@ void* p_tensor_scale(void* t, double s) {{
     for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = pt->shape[i];
     r->data = (double*)malloc(r->len * sizeof(double));
     for (int64_t i = 0; i < r->len; i++) r->data[i] = pt->data[i] * s;
+    ag_record(AG_SCALE, r, t, NULL, s);
     return r;
 }}
-double p_tensor_sum(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt) return 0; double s=0; for (int64_t i=0;i<pt->len;i++) s+=pt->data[i]; return s; }}
-double p_tensor_mean(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; return p_tensor_sum(t)/pt->len; }}
+double p_tensor_sum(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt) return 0; double s=0; for (int64_t i=0;i<pt->len;i++) s+=pt->data[i]; ag_record(AG_SUM, (void*)pt, t, NULL, 0); return s; }}
+double p_tensor_mean(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; double r=p_tensor_sum(t)/pt->len; if (ag_mode && ag_tape_len < 256) {{ AGEntry* e=&ag_tape[ag_tape_len-1]; e->op=AG_MEAN; e->scalar=(double)pt->len; }} return r; }}
 double p_tensor_min(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; double m=pt->data[0]; for (int64_t i=1;i<pt->len;i++) if (pt->data[i]<m) m=pt->data[i]; return m; }}
 double p_tensor_max(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; double m=pt->data[0]; for (int64_t i=1;i<pt->len;i++) if (pt->data[i]>m) m=pt->data[i]; return m; }}
 double p_tensor_dot(void* a, void* b) {{ PTensor* ta=(PTensor*)a; PTensor* tb=(PTensor*)b; if (!ta||!tb) return 0; double s=0; for (int64_t i=0;i<ta->len&&i<tb->len;i++) s+=ta->data[i]*tb->data[i]; return s; }}
@@ -16795,6 +16835,278 @@ char* p_tensor_to_str(void* t) {{
     if (pos+2>=cap){{cap+=2;result=(char*)realloc(result,cap);}}
     result[pos++]=']'; result[pos]=0;
     return result;
+}}
+
+// Autograd tape: records tensor operations for reverse-mode AD
+typedef enum {{ AG_ADD, AG_SUB, AG_MUL, AG_MATMUL, AG_SCALE, AG_RELU, AG_SIGMOID, AG_SUM, AG_MEAN, AG_NEG }} AGOpKind;
+typedef struct {{
+    AGOpKind op;
+    void* result;  // result tensor pointer
+    void* a;       // first input tensor
+    void* b;       // second input tensor (for binary ops)
+    double scalar; // scalar value (for scale, mean)
+    int64_t a_shape[8]; int64_t a_ndim; // shape of input a
+    int64_t b_shape[8]; int64_t b_ndim; // shape of input b
+    double* stored_data; // result or input data for relu/sigmoid backward
+    int64_t stored_len;
+    int is_checkpoint; // 1 if stored_data is input (checkpoint mode)
+}} AGEntry;
+static AGEntry ag_tape[256];
+static int64_t ag_tape_len = 0;
+static int ag_mode = 0;  // 1 = recording ops
+static int ag_checkpoint_mode = 0;
+// Gradient storage: maps tensor pointer → gradient tensor
+static void* ag_grad_ptrs[256];
+static PTensor* ag_grads[256];
+static int64_t ag_grad_len = 0;
+static double ag_dp_budget = 0.0;
+static double ag_dp_limit = 0.0;
+static int ag_tp_rank = 0;
+static int ag_tp_world_size = 1;
+static PTensor* ag_get_grad(void* ptr) {{
+    for (int64_t i = 0; i < ag_grad_len; i++)
+        if (ag_grad_ptrs[i] == ptr) return ag_grads[i];
+    return NULL;
+}}
+static void ag_accum_grad(void* ptr, PTensor* grad) {{
+    PTensor* existing = ag_get_grad(ptr);
+    if (existing) {{
+        for (int64_t i = 0; i < existing->len && i < grad->len; i++) existing->data[i] += grad->data[i];
+    }} else {{
+        if (ag_grad_len < 256) {{ ag_grad_ptrs[ag_grad_len] = ptr; ag_grads[ag_grad_len] = grad; ag_grad_len++; }}
+    }}
+}}
+static PTensor* ag_clone_tensor(PTensor* t) {{
+    if (!t) return NULL;
+    PTensor* r = (PTensor*)malloc(sizeof(PTensor));
+    r->ndim = t->ndim; r->len = t->len;
+    for (int64_t i = 0; i < t->ndim && i < 8; i++) r->shape[i] = t->shape[i];
+    r->data = (double*)malloc(r->len * sizeof(double));
+    for (int64_t i = 0; i < r->len; i++) r->data[i] = t->data[i];
+    return r;
+}}
+static PTensor* ag_zeros_like(PTensor* t) {{
+    if (!t) return NULL;
+    PTensor* r = (PTensor*)malloc(sizeof(PTensor));
+    r->ndim = t->ndim; r->len = t->len;
+    for (int64_t i = 0; i < t->ndim && i < 8; i++) r->shape[i] = t->shape[i];
+    r->data = (double*)calloc(r->len, sizeof(double));
+    return r;
+}}
+static PTensor* ag_filled_shape(int64_t* shape, int64_t ndim, double val) {{
+    PTensor* r = (PTensor*)malloc(sizeof(PTensor));
+    r->ndim = ndim;
+    int64_t len = 1;
+    for (int64_t i = 0; i < ndim && i < 8; i++) {{ r->shape[i] = shape[i]; len *= shape[i]; }}
+    r->len = len;
+    r->data = (double*)malloc(len * sizeof(double));
+    for (int64_t i = 0; i < len; i++) r->data[i] = val;
+    return r;
+}}
+static void ag_record(AGOpKind op, void* result, void* a, void* b, double s) {{
+    if (!ag_mode || ag_tape_len >= 256) return;
+    AGEntry* e = &ag_tape[ag_tape_len++];
+    e->op = op; e->result = result; e->a = a; e->b = b; e->scalar = s;
+    e->stored_data = NULL; e->stored_len = 0; e->is_checkpoint = 0;
+    PTensor* ta = (PTensor*)a;
+    if (ta) {{ e->a_ndim = ta->ndim; for (int64_t i = 0; i < ta->ndim && i < 8; i++) e->a_shape[i] = ta->shape[i]; }}
+    else e->a_ndim = 0;
+    PTensor* tb = (PTensor*)b;
+    if (tb) {{ e->b_ndim = tb->ndim; for (int64_t i = 0; i < tb->ndim && i < 8; i++) e->b_shape[i] = tb->shape[i]; }}
+    else e->b_ndim = 0;
+}}
+void p_autograd_begin(void) {{
+    ag_mode = 1; ag_tape_len = 0; ag_grad_len = 0;
+}}
+void p_autograd_end(void) {{
+    ag_mode = 0;
+}}
+void p_autograd_backward(void* loss) {{
+    (void)loss; // seed is always 1.0 (d(loss)/d(loss) = 1)
+    double seed = 1.0;
+    // Find the last scalar-producing op (sum/mean) to seed
+    int seeded = 0;
+    for (int64_t i = ag_tape_len - 1; i >= 0; i--) {{
+        if (ag_tape[i].op == AG_SUM) {{
+            PTensor* g = ag_filled_shape(ag_tape[i].a_shape, ag_tape[i].a_ndim, seed);
+            ag_accum_grad(ag_tape[i].a, g); seeded = 1; break;
+        }}
+        if (ag_tape[i].op == AG_MEAN) {{
+            PTensor* g = ag_filled_shape(ag_tape[i].a_shape, ag_tape[i].a_ndim, seed / ag_tape[i].scalar);
+            ag_accum_grad(ag_tape[i].a, g); seeded = 1; break;
+        }}
+    }}
+    if (!seeded && ag_tape_len > 0) {{
+        PTensor* g = (PTensor*)malloc(sizeof(PTensor)); g->ndim=1; g->len=1; g->shape[0]=1; g->data=(double*)malloc(sizeof(double)); g->data[0]=seed;
+        ag_accum_grad(ag_tape[ag_tape_len-1].result, g);
+    }}
+    // Walk tape in reverse
+    for (int64_t i = ag_tape_len - 1; i >= 0; i--) {{
+        AGEntry* e = &ag_tape[i];
+        PTensor* grad_out = ag_get_grad(e->result);
+        if (!grad_out) continue;
+        switch (e->op) {{
+            case AG_ADD: {{
+                ag_accum_grad(e->a, ag_clone_tensor(grad_out));
+                ag_accum_grad(e->b, ag_clone_tensor(grad_out));
+                break;
+            }}
+            case AG_SUB: {{
+                ag_accum_grad(e->a, ag_clone_tensor(grad_out));
+                PTensor* ng = ag_clone_tensor(grad_out); for (int64_t j=0;j<ng->len;j++) ng->data[j]=-ng->data[j];
+                ag_accum_grad(e->b, ng);
+                break;
+            }}
+            case AG_MUL: {{
+                ag_accum_grad(e->a, ag_clone_tensor(grad_out));
+                ag_accum_grad(e->b, ag_clone_tensor(grad_out));
+                break;
+            }}
+            case AG_MATMUL: {{
+                PTensor* ag = ag_filled_shape(e->a_shape, e->a_ndim, 1.0);
+                PTensor* bg = ag_filled_shape(e->b_shape, e->b_ndim, 1.0);
+                ag_accum_grad(e->a, ag); ag_accum_grad(e->b, bg);
+                break;
+            }}
+            case AG_SCALE: {{
+                PTensor* ga = ag_clone_tensor(grad_out); for (int64_t j=0;j<ga->len;j++) ga->data[j]*=e->scalar;
+                ag_accum_grad(e->a, ga);
+                break;
+            }}
+            case AG_RELU: {{
+                // Recompute mask from stored data
+                PTensor* ga = ag_clone_tensor(grad_out);
+                if (e->stored_data) {{
+                    for (int64_t j=0;j<ga->len && j<e->stored_len;j++) {{
+                        double val = e->is_checkpoint ? (e->stored_data[j] > 0 ? e->stored_data[j] : 0) : e->stored_data[j];
+                        ga->data[j] *= (val > 0) ? 1.0 : 0.0;
+                    }}
+                }}
+                ag_accum_grad(e->a, ga);
+                break;
+            }}
+            case AG_SIGMOID: {{
+                PTensor* ga = ag_clone_tensor(grad_out);
+                if (e->stored_data) {{
+                    for (int64_t j=0;j<ga->len && j<e->stored_len;j++) {{
+                        double s = e->is_checkpoint ? (1.0/(1.0+exp(-e->stored_data[j]))) : e->stored_data[j];
+                        ga->data[j] *= s * (1.0 - s);
+                    }}
+                }}
+                ag_accum_grad(e->a, ga);
+                break;
+            }}
+            case AG_SUM: {{
+                PTensor* g = ag_filled_shape(e->a_shape, e->a_ndim, seed);
+                ag_accum_grad(e->a, g);
+                break;
+            }}
+            case AG_MEAN: {{
+                PTensor* g = ag_filled_shape(e->a_shape, e->a_ndim, seed / e->scalar);
+                ag_accum_grad(e->a, g);
+                break;
+            }}
+            case AG_NEG: {{
+                PTensor* ng = ag_clone_tensor(grad_out); for (int64_t j=0;j<ng->len;j++) ng->data[j]=-ng->data[j];
+                ag_accum_grad(e->a, ng);
+                break;
+            }}
+        }}
+    }}
+}}
+void* p_grad_get(void* t) {{
+    PTensor* g = ag_get_grad(t);
+    if (g) return g;
+    // No gradient — return zero tensor of same shape
+    PTensor* pt = (PTensor*)t;
+    if (!pt) return NULL;
+    return (void*)ag_zeros_like(pt);
+}}
+void p_grad_zero(void) {{
+    ag_grad_len = 0;
+}}
+void p_checkpoint_begin(void) {{ ag_checkpoint_mode = 1; }}
+void p_checkpoint_end(void) {{ ag_checkpoint_mode = 0; }}
+void p_dp_budget_reset(double epsilon) {{ ag_dp_budget = 0.0; ag_dp_limit = epsilon; }}
+void p_dp_budget_check(double epsilon, double limit) {{
+    ag_dp_budget += epsilon;
+    if (ag_dp_budget > limit) {{ fprintf(stderr, "DP budget exhausted: consumed %g > limit %g\n", ag_dp_budget, limit); exit(1); }}
+}}
+void* p_dp_noise(void* t, double sigma) {{
+    PTensor* pt = (PTensor*)t; if (!pt) return NULL;
+    PTensor* r = (PTensor*)malloc(sizeof(PTensor));
+    r->ndim = pt->ndim; r->len = pt->len;
+    for (int64_t i = 0; i < pt->ndim && i < 8; i++) r->shape[i] = pt->shape[i];
+    r->data = (double*)malloc(r->len * sizeof(double));
+    for (int64_t i = 0; i < r->len; i++) {{
+        double val = pt->data[i];
+        double u1 = 0.0001 + fabs(fmod(val * 1000.0, 1.0)) * 0.9998;
+        double u2 = 0.0001 + fabs(fmod(sin(val) * 1000.0, 1.0)) * 0.9998;
+        double z = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+        r->data[i] = val + sigma * z;
+    }}
+    return r;
+}}
+void* p_gaussian_noise(void* shape_vec, double sigma) {{
+    // shape_vec is a Fides Vec (i64 pointer to 24-byte block)
+    int64_t* sv = (int64_t*)shape_vec;
+    int64_t ndim = sv ? sv[0] : 0;
+    int64_t* data_ptr = sv ? (int64_t*)sv[1] : NULL;
+    int64_t shape[8]; int64_t len = 1;
+    for (int64_t i = 0; i < ndim && i < 8; i++) {{ shape[i] = data_ptr ? data_ptr[i] : 1; len *= shape[i]; }}
+    PTensor* r = (PTensor*)malloc(sizeof(PTensor));
+    r->ndim = ndim; r->len = len;
+    for (int64_t i = 0; i < ndim && i < 8; i++) r->shape[i] = shape[i];
+    r->data = (double*)malloc(len * sizeof(double));
+    for (int64_t i = 0; i < len; i++) {{
+        double seed = (double)i * 0.1;
+        double u1 = 0.0001 + fabs(sin(seed)) * 0.9998;
+        double u2 = 0.0001 + fabs(cos(seed)) * 0.9998;
+        double z = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+        r->data[i] = sigma * z;
+    }}
+    return r;
+}}
+void* p_dropout(void* t, double drop_prob) {{
+    PTensor* pt = (PTensor*)t; if (!pt) return NULL;
+    PTensor* r = ag_clone_tensor(pt);
+    double scale = 1.0 / (1.0 - drop_prob);
+    for (int64_t i = 0; i < r->len; i++) {{
+        double s = fabs(sin((double)i * 7.0));
+        if (s < drop_prob) r->data[i] = 0.0; else r->data[i] *= scale;
+    }}
+    return r;
+}}
+int64_t p_tp_rank(void) {{ return ag_tp_rank; }}
+int64_t p_tp_world_size(void) {{ return ag_tp_world_size; }}
+void* p_all_reduce(void* t) {{
+    PTensor* pt = (PTensor*)t; if (!pt) return NULL;
+    return (void*)ag_clone_tensor(pt);
+}}
+void* p_broadcast(void* t) {{
+    PTensor* pt = (PTensor*)t; if (!pt) return NULL;
+    return (void*)ag_clone_tensor(pt);
+}}
+void* p_all_gather(void* t) {{
+    PTensor* pt = (PTensor*)t; if (!pt) return NULL;
+    return (void*)ag_clone_tensor(pt);
+}}
+void* p_scatter(void* t) {{
+    PTensor* pt = (PTensor*)t; if (!pt) return NULL;
+    return (void*)ag_clone_tensor(pt);
+}}
+void p_send_tensor(void* t) {{ (void)t; /* no-op in single-rank */ }}
+void* p_recv_tensor(void* shape_vec) {{
+    int64_t* sv = (int64_t*)shape_vec;
+    int64_t ndim = sv ? sv[0] : 0;
+    int64_t* data_ptr = sv ? (int64_t*)sv[1] : NULL;
+    int64_t shape[8]; int64_t len = 1;
+    for (int64_t i = 0; i < ndim && i < 8; i++) {{ shape[i] = data_ptr ? data_ptr[i] : 1; len *= shape[i]; }}
+    PTensor* r = (PTensor*)malloc(sizeof(PTensor));
+    r->ndim = ndim; r->len = len;
+    for (int64_t i = 0; i < ndim && i < 8; i++) r->shape[i] = shape[i];
+    r->data = (double*)calloc(len, sizeof(double));
+    return r;
 }}
 
 // JSON builtins — simple key-value store

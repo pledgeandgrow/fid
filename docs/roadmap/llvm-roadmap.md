@@ -107,7 +107,7 @@ These are language-independent. Every compiler needs them. Fides must match LLVM
 
 **Why these 8:** LLVM's -O2 has 50 passes, but 80% of the improvement comes from ~8 passes. The rest are micro-optimizations or C/C++-specific workarounds.
 
-**Status:** 21 passes exist (const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool). 20 in default pass list (region-pool available via `--region-pool` flag).
+**Status:** 23 passes exist (const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize). 22 in default pass list (region-pool available via `--region-pool` flag).
 
 #### F-3A: GVN (Global Value Numbering) — Replaces CSE ✅
 - [x] CSE catches identical expressions. GVN catches equivalent ones: `a = x + y; b = y + x` → GVN knows `a == b`
@@ -115,7 +115,7 @@ These are language-independent. Every compiler needs them. Fides must match LLVM
 - [x] Strict improvement over current CSE
 
 #### F-3B: SROA (Scalar Replacement of Aggregates) ✅
-- [x] Replace struct allocations with individual scalars: `pv p = Point{x:1, y:2}; print(p.x)` → just `x = 1; print(x)`
+- [x] Replace struct allocations with individual scalars: `val p = Point{x:1, y:2}; print(p.x)` → just `x = 1; print(x)`
 - [x] Enables all other optimizations to see through structs
 - [x] **Fides advantage:** Region system tells us a struct can't be aliased by external code — SROA is safe without LLVM's conservative checks
 
@@ -290,7 +290,7 @@ These phases use Fides's semantic information to optimize in ways LLVM fundament
 - [x] If `!Net` isn't granted, don't include `p_socket_*` runtime stubs
 - [x] If `!File` isn't granted, don't include `p_file_*` runtime stubs
 - [x] **Impact:** Smaller binaries, smaller attack surface. LLVM links everything and DCEs what it can prove is dead — Fides strips by policy.
-- [x] **Implementation:** `runtime_parts_with_caps()` in `runtime_linux.rs`. `stub_capability()` maps stub names to capabilities (p_socket_*/p_http_* → Net, p_file_*/p_read_file/p_write_file → FS, p_thread_*/p_spawn → Spawn). Stub macros (`stub_zero!`/`stub_void!`) check if the stub belongs to an ungranted capability — if so, emit `ud2` (trap) + `ret` instead of the normal stub body. Stubs remain at same offsets (preserving symbol table) but trap immediately if called. 3 unit tests in `runtime_linux.rs`. `compiler.rs` uses `runtime_parts_with_caps` when `--caps` is specified.
+- [x] **Implementation:** `runtime_parts_with_caps()` in `runtime_linux.rs`. `stub_capability()` maps stub names to capabilities (p_socket_*/p_http_* → Net, p_file_*/p_read_file/p_write_file → FS, p_thread_*/p_spawn → Spawn). Stub macros (`stub_zero!`/`stub_void!`) check if the stub belongs to an ungranted capability — if so, emit `ud2` (trap) + `return` instead of the normal stub body. Stubs remain at same offsets (preserving symbol table) but trap immediately if called. 3 unit tests in `runtime_linux.rs`. `compiler.rs` uses `runtime_parts_with_caps` when `--caps` is specified.
 
 #### I-3C: Sandbox-Aware Optimization ✅
 - [x] Inside a `sandbox {}` block, the optimizer knows exactly which functions are available
@@ -362,10 +362,10 @@ These phases use Fides's semantic information to optimize in ways LLVM fundament
 **Status:** Comptime exists with partial evaluation. Can be extended.
 
 #### I-5A: Aggressive Comptime Evaluation ✅
-- [x] If a `comptime pf` function is called with all-literal arguments, evaluate it at compile time — even without an explicit `comptime` wrapper
+- [x] If a `comptime fn` function is called with all-literal arguments, evaluate it at compile time — even without an explicit `comptime` wrapper
 - [x] Replace the call with the constant result
 - [x] **Impact:** Comptime can precompute lookup tables, unroll config-dependent code, specialize generics. LLVM's `constexpr` is more restrictive.
-- [x] **Implementation:** Added `aggressive_comptime_func` pass in `comptime.rs` that runs after normal substitution. Scans all functions for calls to `comptime pf` functions where all args are literals, evaluates them, and replaces with the result. Iterates to fixed point (4 iterations) for chains of comptime calls. Also eliminates dead branches in `if` statements with literal conditions.
+- [x] **Implementation:** Added `aggressive_comptime_func` pass in `comptime.rs` that runs after normal substitution. Scans all functions for calls to `comptime fn` functions where all args are literals, evaluates them, and replaces with the result. Iterates to fixed point (4 iterations) for chains of comptime calls. Also eliminates dead branches in `if` statements with literal conditions.
 
 #### I-5B: Comptime Specialization ✅ (covered by I-5A + partial_eval)
 - [x] If a generic function is called with a constant type parameter, specialize at compile time *(monomorphization already does this)*

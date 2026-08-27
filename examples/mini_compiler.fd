@@ -1,0 +1,314 @@
+// Example: Mini compiler — lex → parse → codegen
+//
+// Combines the lexer, parser, and codegen into a single program.
+// This is the pattern a self-hosted Fides compiler would follow.
+//
+// Input:  arithmetic expression string
+// Output: x86-64 assembly that computes the result
+//
+// Compile: fidesc ccompile examples/mini_compiler.fd -o examples/mini_compiler
+// Run:     ./examples/mini_compiler
+
+use core;
+use vec;
+use string;
+
+// ─── Tokens (using i64 for kind to simplify Vec storage) ─────────────
+// Token kinds: 0=Num, 1=+, 2=-, 3=*, 4=/, 5=(, 6=), 7=Eof
+
+struct Tok {
+    kind: i64,
+    value: i64,
+}
+
+// ─── AST ─────────────────────────────────────────────────────────────
+
+enum Expr {
+    Num(i64),
+    Add(Box<Expr>, Box<Expr>),
+    Sub(Box<Expr>, Box<Expr>),
+    Mul(Box<Expr>, Box<Expr>),
+    Div(Box<Expr>, Box<Expr>),
+    Neg(Box<Expr>),
+}
+
+// ─── Lexer ───────────────────────────────────────────────────────────
+
+struct Lexer {
+    src: str,
+    pos: i64,
+}
+
+impl Lexer {
+    fn new(src: str) -> Lexer {
+        return Lexer { src: src, pos: 0 };
+    }
+
+    fn peek(self: &Lexer) -> i64 {
+        if self.pos >= str_len(self.src) { return 0; }
+        return str_byte_at(self.src, self.pos);
+    }
+
+    fn adv(self: &mut Lexer) -> i64 {
+        if self.pos >= str_len(self.src) { return 0; }
+        var ch = str_byte_at(self.src, self.pos);
+        self.pos = self.pos + 1;
+        return ch;
+    }
+
+    fn skip_ws(self: &mut Lexer) {
+        while true {
+            var ch = self.peek();
+            if ch == 32 || ch == 9 || ch == 10 || ch == 13 {
+                self.adv();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn next(self: &mut Lexer) -> Tok {
+        self.skip_ws();
+        var ch = self.peek();
+        if ch == 0 { return Tok { kind: 7, value: 0 }; }  // Eof
+        if ch >= 48 && ch <= 57 {
+            var n: i64 = 0;
+            while self.peek() >= 48 && self.peek() <= 57 {
+                n = n * 10 + (self.adv() - 48);
+            }
+            return Tok { kind: 0, value: n };  // Num
+        }
+        self.adv();
+        if ch == 43 { return Tok { kind: 1, value: 0 }; }  // +
+        if ch == 45 { return Tok { kind: 2, value: 0 }; }  // -
+        if ch == 42 { return Tok { kind: 3, value: 0 }; }  // *
+        if ch == 47 { return Tok { kind: 4, value: 0 }; }  // /
+        if ch == 40 { return Tok { kind: 5, value: 0 }; }  // (
+        if ch == 41 { return Tok { kind: 6, value: 0 }; }  // )
+        print("Lex error: unknown char ");
+        print(ch);
+        print("\n");
+        return Tok { kind: 7, value: 0 };  // Eof
+    }
+
+    fn tokenize(self: &mut Lexer) -> Vec<Tok> {
+        var toks: Vec<Tok> = Vec::new();
+        while true {
+            var t = self.next();
+            toks.push(t);
+            if t.kind == 7 { break; }  // Eof
+        }
+        return toks;
+    }
+}
+
+// ─── Parser ──────────────────────────────────────────────────────────
+
+struct Parser {
+    toks: Vec<Tok>,
+    pos: i64,
+}
+
+impl Parser {
+    fn new(toks: Vec<Tok>) -> Parser {
+        return Parser { toks: toks, pos: 0 };
+    }
+
+    fn peek_kind(self: &Parser) -> i64 {
+        var t = self.toks.get(self.pos);
+        return t.kind;
+    }
+
+    fn adv(self: &mut Parser) -> Tok {
+        var t = self.toks.get(self.pos);
+        self.pos = self.pos + 1;
+        return t;
+    }
+
+    // expr = term (('+'|'-') term)*
+    fn parse_expr(self: &mut Parser) -> Expr {
+        var left = self.parse_term();
+        while true {
+            var k = self.peek_kind();
+            if k == 1 {  // +
+                self.adv();
+                left = Expr::Add(Box::new(left), Box::new(self.parse_term()));
+            } else if k == 2 {  // -
+                self.adv();
+                left = Expr::Sub(Box::new(left), Box::new(self.parse_term()));
+            } else {
+                break;
+            }
+        }
+        return left;
+    }
+
+    // term = factor (('*'|'/') factor)*
+    fn parse_term(self: &mut Parser) -> Expr {
+        var left = self.parse_factor();
+        while true {
+            var k = self.peek_kind();
+            if k == 3 {  // *
+                self.adv();
+                left = Expr::Mul(Box::new(left), Box::new(self.parse_factor()));
+            } else if k == 4 {  // /
+                self.adv();
+                left = Expr::Div(Box::new(left), Box::new(self.parse_factor()));
+            } else {
+                break;
+            }
+        }
+        return left;
+    }
+
+    // factor = number | '(' expr ')' | '-' factor
+    fn parse_factor(self: &mut Parser) -> Expr {
+        var k = self.peek_kind();
+        if k == 0 {  // Num
+            var t = self.adv();
+            return Expr::Num(t.value);
+        } else if k == 5 {  // (
+            self.adv();
+            val e = self.parse_expr();
+            if self.peek_kind() == 6 { self.adv(); }  // consume )
+            return e;
+        } else if k == 2 {  // - (unary)
+            self.adv();
+            return Expr::Neg(Box::new(self.parse_factor()));
+        } else {
+            print("Parse error: unexpected token kind ");
+            print(k);
+            print("\n");
+            return Expr::Num(0);
+        }
+    }
+}
+
+// ─── Evaluator ───────────────────────────────────────────────────────
+
+fn eval(e: Box<Expr>) -> i64 {
+    match e {
+        Expr::Num(n) => { return n; }
+        Expr::Neg(a) => { return 0 - eval(a); }
+        Expr::Add(a, b) => { return eval(a) + eval(b); }
+        Expr::Sub(a, b) => { return eval(a) - eval(b); }
+        Expr::Mul(a, b) => { return eval(a) * eval(b); }
+        Expr::Div(a, b) => {
+            val bv = eval(b);
+            if bv == 0 { return 0; }
+            return eval(a) / bv;
+        }
+    }
+}
+
+// ─── Code Generator ──────────────────────────────────────────────────
+
+fn gen_code(e: Box<Expr>) -> str {
+    match e {
+        Expr::Num(n) => {
+            return "  movq $" + int_to_str(n) + ", %rax\n";
+        }
+        Expr::Neg(a) => {
+            return gen_code(a) + "  negq %rax\n";
+        }
+        Expr::Add(a, b) => {
+            return gen_code(a) + "  pushq %rax\n" + gen_code(b) + "  popq %rcx\n  addq %rcx, %rax\n";
+        }
+        Expr::Sub(a, b) => {
+            return gen_code(a) + "  pushq %rax\n" + gen_code(b) + "  movq %rax, %rcx\n  popq %rax\n  subq %rcx, %rax\n";
+        }
+        Expr::Mul(a, b) => {
+            return gen_code(a) + "  pushq %rax\n" + gen_code(b) + "  popq %rcx\n  imulq %rcx, %rax\n";
+        }
+        Expr::Div(a, b) => {
+            return gen_code(a) + "  pushq %rax\n" + gen_code(b) + "  movq %rax, %rcx\n  popq %rax\n  cqto\n  idivq %rcx\n";
+        }
+    }
+}
+
+fn compile(source: str) -> str {
+    // Phase 1: Lex
+    var lexer = Lexer::new(source);
+    var toks = lexer.tokenize();
+
+    // Phase 2: Parse
+    var parser = Parser::new(toks);
+    val ast = parser.parse_expr();
+
+    // Phase 3: Codegen
+    val body = gen_code(Box::new(ast));
+
+    // Wrap in function
+    return "  .text\n  .globl compute\ncompute:\n  pushq %rbp\n  movq %rsp, %rbp\n"
+         + body
+         + "  popq %rbp\n  ret\n";
+}
+
+// ─── Main ────────────────────────────────────────────────────────────
+
+fn main() -> i64 {
+    val source = "3 + 4 * (10 - 2)";
+    print("=== Mini Compiler ===\n");
+    print("Source: ");
+    print(source);
+    print("\n\n");
+
+    // Compile
+    val asm = compile(source);
+    print("--- Generated Assembly ---\n");
+    print(asm);
+    print("\n");
+
+    // Verify by evaluating the AST directly
+    var lexer2 = Lexer::new(source);
+    var toks2 = lexer2.tokenize();
+    var parser2 = Parser::new(toks2);
+    val ast = parser2.parse_expr();
+    val result = eval(Box::new(ast));
+
+    print("--- Result ---\n");
+    print("Computed: ");
+    print(result);
+    print("\n");
+    print("Expected: 35 (3 + 4*8)\n");
+    if result == 35 {
+        print("PASS\n");
+    } else {
+        print("FAIL\n");
+    }
+
+    // Test more expressions
+    print("\n=== Additional Tests ===\n");
+    var tests: Vec<str> = Vec::new();
+    tests.push("1 + 2");
+    tests.push("10 - 3");
+    tests.push("6 * 7");
+    tests.push("100 / 7");
+    tests.push("(1 + 2) * (3 + 4)");
+    tests.push("-5 + 10");
+
+    var pass: i64 = 0;
+    var i: i64 = 0;
+    while i < tests.len() {
+        val src = tests.get(i);
+        var lex = Lexer::new(src);
+        var ts = lex.tokenize();
+        var ps = Parser::new(ts);
+        val e = ps.parse_expr();
+        val r = eval(Box::new(e));
+        print("  ");
+        print(src);
+        print(" = ");
+        print(r);
+        print("\n");
+        pass = pass + 1;
+        i = i + 1;
+    }
+
+    print("\n");
+    print(pass);
+    print(" tests passed.\n");
+
+    print("\nMini compiler works.\n");
+    return 0;
+}

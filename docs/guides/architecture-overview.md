@@ -41,7 +41,7 @@ External linkers (ld, lld, link.exe) are separate processes that:
 ### 1. Custom Lexer — ✅ Complete
 - Hand-written tokenizer in `src/lexer.rs`
 - No lexer generator (no flex, no nom)
-- All Fides keywords (`pf`, `pv`, `pc`, `ret`, etc.), operators, literals (decimal/hex/binary/octal/underscored ints, f32/f64 floats, strings, f-strings with brace-depth tracking)
+- All Fides keywords (`fn`, `val`, `const`, `return`, etc.), operators, literals (decimal/hex/binary/octal/underscored ints, f32/f64 floats, strings, f-strings with brace-depth tracking)
 - Line/column tracking for error messages
 
 ### 2. Custom Parser — ✅ Complete
@@ -233,7 +233,7 @@ Phase 6:
 - `src/codegen_c.rs` — IR → C99 source
 - `fidesc ccompile <file> -o <exe>` generates `.c`, invokes `gcc`/`clang`/`cl.exe`
 - Used when targeting platforms the native backends don't yet cover
-- Note: 116/116 test parity with interpreter — full parity. Binary hardening enabled.
+- Note: 146/146 test parity with interpreter. Binary hardening enabled.
 
 ---
 
@@ -489,7 +489,7 @@ bb0:
     %4 = call parse             ; call
     %5 = add rsp, 4096          ; stack free
     mov rax, %4                 ; return value
-    ret
+    return
 }
 ```
 

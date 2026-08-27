@@ -1,0 +1,239 @@
+// Example: Recursive-descent parser for arithmetic expressions
+//
+// This exercises the patterns a self-hosted compiler parser needs:
+// - Recursive descent parsing (precedence climbing)
+// - Box<T> for recursive AST nodes
+// - Pattern matching on enum with Box payloads
+// - Error handling via Result-like patterns
+//
+// Grammar:
+//   expr   = term (('+' | '-') term)*
+//   term   = factor (('*' | '/') factor)*
+//   factor = number | '(' expr ')'
+//
+// Compile: fidesc ccompile examples/parser.fd -o examples/parser
+// Run:     ./examples/parser
+
+use core;
+use vec;
+use string;
+
+// ─── AST ─────────────────────────────────────────────────────────────
+
+enum Expr {
+    Num(i64),
+    Add(Box<Expr>, Box<Expr>),
+    Sub(Box<Expr>, Box<Expr>),
+    Mul(Box<Expr>, Box<Expr>),
+    Div(Box<Expr>, Box<Expr>),
+}
+
+// ─── Tokenizer (simplified) ──────────────────────────────────────────
+
+struct Token {
+    kind: i64,   // 0=num, 1=+, 2=-, 3=*, 4=/, 5=(, 6=), 7=eof
+    value: i64,
+}
+
+fn tokenize(source: str) -> Vec<Token> {
+    var tokens: Vec<Token> = Vec::new();
+    var i: i64 = 0;
+    var len = str_len(source);
+    while i < len {
+        var ch = str_byte_at(source, i);
+        if ch == 32 || ch == 9 {  // whitespace
+            i = i + 1;
+        } else if ch >= 48 && ch <= 57 {  // digit
+            var num: i64 = 0;
+            while i < len && str_byte_at(source, i) >= 48 && str_byte_at(source, i) <= 57 {
+                num = num * 10 + (str_byte_at(source, i) - 48);
+                i = i + 1;
+            }
+            tokens.push(Token { kind: 0, value: num });
+        } else if ch == 43 { tokens.push(Token { kind: 1, value: 0 }); i = i + 1; }  // +
+        else if ch == 45 { tokens.push(Token { kind: 2, value: 0 }); i = i + 1; }     // -
+        else if ch == 42 { tokens.push(Token { kind: 3, value: 0 }); i = i + 1; }     // *
+        else if ch == 47 { tokens.push(Token { kind: 4, value: 0 }); i = i + 1; }     // /
+        else if ch == 40 { tokens.push(Token { kind: 5, value: 0 }); i = i + 1; }     // (
+        else if ch == 41 { tokens.push(Token { kind: 6, value: 0 }); i = i + 1; }     // )
+        else {
+            print("Unknown char: ");
+            print(ch);
+            print("\n");
+            i = i + 1;
+        }
+    }
+    tokens.push(Token { kind: 7, value: 0 });  // eof
+    return tokens;
+}
+
+// ─── Parser ──────────────────────────────────────────────────────────
+
+struct Parser {
+    tokens: Vec<Token>,
+    pos: i64,
+}
+
+impl Parser {
+    fn new(tokens: Vec<Token>) -> Parser {
+        return Parser { tokens: tokens, pos: 0 };
+    }
+
+    fn peek_kind(self: &Parser) -> i64 {
+        var tok = self.tokens.get(self.pos);
+        return tok.kind;
+    }
+
+    fn advance(self: &mut Parser) -> Token {
+        var tok = self.tokens.get(self.pos);
+        self.pos = self.pos + 1;
+        return tok;
+    }
+
+    fn expect(self: &mut Parser, kind: i64) -> Token {
+        var tok = self.tokens.get(self.pos);
+        if tok.kind != kind {
+            print("Parse error: expected ");
+            print(kind);
+            print(" but got ");
+            print(tok.kind);
+            print("\n");
+        }
+        self.pos = self.pos + 1;
+        return tok;
+    }
+
+    // expr = term (('+' | '-') term)*
+    fn parse_expr(self: &mut Parser) -> Expr {
+        var left = self.parse_term();
+        while true {
+            var kind = self.peek_kind();
+            if kind == 1 {  // +
+                self.advance();
+                val right = self.parse_term();
+                left = Expr::Add(Box::new(left), Box::new(right));
+            } else if kind == 2 {  // -
+                self.advance();
+                val right = self.parse_term();
+                left = Expr::Sub(Box::new(left), Box::new(right));
+            } else {
+                break;
+            }
+        }
+        return left;
+    }
+
+    // term = factor (('*' | '/') factor)*
+    fn parse_term(self: &mut Parser) -> Expr {
+        var left = self.parse_factor();
+        while true {
+            var kind = self.peek_kind();
+            if kind == 3 {  // *
+                self.advance();
+                val right = self.parse_factor();
+                left = Expr::Mul(Box::new(left), Box::new(right));
+            } else if kind == 4 {  // /
+                self.advance();
+                val right = self.parse_factor();
+                left = Expr::Div(Box::new(left), Box::new(right));
+            } else {
+                break;
+            }
+        }
+        return left;
+    }
+
+    // factor = number | '(' expr ')'
+    fn parse_factor(self: &mut Parser) -> Expr {
+        var kind = self.peek_kind();
+        if kind == 0 {  // number
+            var tok = self.advance();
+            return Expr::Num(tok.value);
+        } else if kind == 5 {  // (
+            self.advance();  // consume '('
+            val e = self.parse_expr();
+            self.expect(6);  // consume ')'
+            return e;
+        } else {
+            print("Parse error: expected number or '(' but got kind ");
+            print(kind);
+            print("\n");
+            return Expr::Num(0);
+        }
+    }
+}
+
+// ─── Evaluator ───────────────────────────────────────────────────────
+
+fn eval(e: Box<Expr>) -> i64 {
+    match e {
+        Expr::Num(n) => { return n; }
+        Expr::Add(a, b) => { return eval(a) + eval(b); }
+        Expr::Sub(a, b) => { return eval(a) - eval(b); }
+        Expr::Mul(a, b) => { return eval(a) * eval(b); }
+        Expr::Div(a, b) => {
+            val bv = eval(b);
+            if bv == 0 {
+                print("Division by zero!\n");
+                return 0;
+            }
+            return eval(a) / bv;
+        }
+    }
+}
+
+// ─── AST printer ─────────────────────────────────────────────────────
+
+fn print_expr(e: Box<Expr>, depth: i64) {
+    var indent: i64 = 0;
+    while indent < depth {
+        print("  ");
+        indent = indent + 1;
+    }
+    match e {
+        Expr::Num(n) => { print(n); print("\n"); }
+        Expr::Add(a, b) => { print("+\n"); print_expr(a, depth + 1); print_expr(b, depth + 1); }
+        Expr::Sub(a, b) => { print("-\n"); print_expr(a, depth + 1); print_expr(b, depth + 1); }
+        Expr::Mul(a, b) => { print("*\n"); print_expr(a, depth + 1); print_expr(b, depth + 1); }
+        Expr::Div(a, b) => { print("/\n"); print_expr(a, depth + 1); print_expr(b, depth + 1); }
+    }
+}
+
+// ─── Main ────────────────────────────────────────────────────────────
+
+fn main() -> i64 {
+    val source = "3 + 4 * (10 - 2)";
+    print("Source: ");
+    print(source);
+    print("\n\n");
+
+    var tokens = tokenize(source);
+    print("Tokens: ");
+    print(tokens.len());
+    print("\n\n");
+
+    var parser = Parser::new(tokens);
+    val ast = parser.parse_expr();
+
+    print("AST:\n");
+    print_expr(Box::new(ast), 0);
+    print("\n");
+
+    // Re-parse for eval (since print_expr consumed the Box)
+    var parser2 = Parser::new(tokens);
+    val ast2 = parser2.parse_expr();
+    val result = eval(Box::new(ast2));
+    print("Result: ");
+    print(result);
+    print("\n");
+
+    // Verify: 3 + 4 * (10 - 2) = 3 + 4 * 8 = 3 + 32 = 35
+    print("Expected: 35\n");
+    if result == 35 {
+        print("PASS\n");
+    } else {
+        print("FAIL\n");
+    }
+
+    return 0;
+}

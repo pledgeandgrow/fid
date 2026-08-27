@@ -703,6 +703,7 @@ fn is_reg_clobbered_in_range(
 fn inst_def(inst: &L3Inst) -> Option<VReg> {
     match inst {
         L3Inst::Mov { dst, .. }
+        | L3Inst::AddrOfSlot { dst, .. }
         | L3Inst::Bin { dst, .. }
         | L3Inst::Unary { dst, .. }
         | L3Inst::StackAlloc { dst, .. }
@@ -736,6 +737,7 @@ fn inst_uses(inst: &L3Inst) -> Vec<VReg> {
 
     match inst {
         L3Inst::Mov { src, .. } => collect(src, &mut uses),
+        L3Inst::AddrOfSlot { .. } => {}
         L3Inst::Bin { a, b, .. } => {
             collect(a, &mut uses);
             collect(b, &mut uses);

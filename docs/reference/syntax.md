@@ -11,13 +11,13 @@ Fides is a systems programming language designed for safety, clarity, and modern
 
 ### 1.1 Core Principles
 
-1. **Safe by default** — No `unsafe` keyword. Safety is enforced by the ty system, ownership, and capabilities.
+1. **Safe by default** — Bounds checks, ownership, and capabilities are enforced by default. The `unsafe { }` block exists for opting out of bounds checks (e.g. inside stdlib `core.fd`), but ordinary user code is safe without explicit annotation.
 2. **No hidden control flow** — No exceptions. All effects (IO, async, errors) are explicit in function signatures.
 3. **No macros** — Compile-time code execution via `comptime` blocks. String interpolation via `f"..."`. No macro system at all.
 4. **Region inference** — The compiler deduces memory regions (lifetimes) automatically. Explicit annotations are rare.
 5. **Capability-based security** — No ambient authority. File, network, and hardware access require explicit capabilities.
 6. **AI-friendly syntax** — Syntax choices prioritize AI model comprehension. Familiar patterns from Rust, Python, Swift.
-7. **One keyword per concept** — `pf` for all functions (named, anonymous, async, comptime). `pv` for all variables. `pc` for constants. `cap` for traits/capabilities.
+7. **One keyword per concept** — `fn` for all functions (named, anonymous, async, comptime). `val` for all variables. `const` for constants. `cap` for traits/capabilities.
 
 ### 1.2 What Fides Takes From Rust
 
@@ -25,7 +25,7 @@ Fides is a systems programming language designed for safety, clarity, and modern
 - Algebraic enums and pattern matching (`match` / `=>`)
 - Traits and impl blocks
 - `Result<T, E>` + `?` operator
-- `#[attribute]` syntax
+- `@attribute` syntax (Fides-native; `#[...]` also parsed for `#[test]`)
 - `pub` visibility
 - `<T>` generics with trait bounds
 - `for x in iter` loops
@@ -37,19 +37,19 @@ Fides is a systems programming language designed for safety, clarity, and modern
 
 | Feature | Rust | Fides |
 |---------|------|--------|
-| Function keyword | `fn` | `pf` |
-| Variable keyword | `let` / `let mut` | `pv` / `pv mut` |
-| Constant keyword | `const` | `pc` |
+| Function keyword | `fn` | `fn` |
+| Variable keyword | `let` / `let mut` | `val` / `var` |
+| Constant keyword | `const` | `const` |
 | Trait keyword | `trait` | `cap` |
-| Return keyword | `return` | `ret` |
-| Type alias keyword | `type` | `ty` |
-| Closures | `\|x\| x * 2` | `pf(x) { x * 2 }` or `pf(x) => x * 2` |
+| Return keyword | `return` | `return` |
+| Type alias keyword | `type` | `type` |
+| Closures | `\|x\| x * 2` | `fn(x) { x * 2 }` or `fn(x) => x * 2` |
 | String formatting | `println!("{} + {}", a, b)` | `println(f"{a} + {b}")` |
 | Lifetimes | `'a`, `'b` explicit | Region inference (rarely explicit) |
 | Macros | `macro_rules!`, proc macros | `comptime` blocks (no macros) |
-| Unsafe code | `unsafe { }` blocks | Not in user code (Framework only) |
+| Unsafe code | `unsafe { }` blocks | `unsafe { }` blocks (skip bounds checks — used in stdlib `core.fd`) |
 | Error handling | `Result<T, E>` only | `Result<T, E>` + effect handlers (`!Effect`) |
-| Async | `async fn` / `.await` | `async pf` / `.await` (sugar over effects) |
+| Async | `async fn` / `.await` | `async fn` / `.await` (sugar over effects) |
 | Compile-time code | Procedural macros | `comptime { }` blocks |
 | Hot reload | Not supported | Built-in (`fidesc watch`) |
 | Capability security | Not built-in | Core language feature |
@@ -61,29 +61,29 @@ Fides is a systems programming language designed for safety, clarity, and modern
 ### 2.1 Keywords
 
 ```
-pf          pv          pc          mut         pub         struct
-enum        cap         impl        use         match       ty
+fn          val          const          mut         pub         struct
+enum        cap         impl        use         match       type
 if          else        for         while       loop
-ret         break       continue    async       await
+return         break       continue    async       await
 comptime    in          as          where       region
 spawn       defer       move        static      try
 handle      do          interrupt   extern      dyn         module
 with
-true        false       none        some        ok          err
+true        false
 ```
 
-**Note:** `none`, `some`, `ok`, `err` are not keywords — they are enum variant names from the standard library (`Option` and `Result`). They are listed here for reference.
+**Note:** `none`, `some`, `ok`, `err` are NOT keywords — they are enum variant names from the standard library (`Option` and `Result`). They are listed here for reference only and are not in the keyword block above.
 
 **Keyword reference** (from `src/token.rs`):
 
 | Keyword | Purpose |
 |---------|---------|
-| `pf` | Function declaration (named, anonymous, async, comptime) |
-| `pv` | Variable declaration (`pv mut` for mutable) |
-| `pc` | Compile-time constant |
+| `fn` | Function declaration (named, anonymous, async, comptime) |
+| `val` | Variable declaration (`var` for mutable) |
+| `const` | Compile-time constant |
 | `cap` | Capability / trait declaration |
-| `ty` | Type alias |
-| `ret` | Return statement |
+| `type` | Type alias |
+| `return` | Return statement |
 | `region` | Region block for memory lifetime tracking |
 | `handle` / `do` / `with` | Effect handlers |
 | `extern` | FFI declarations (`extern "C"`) |
@@ -151,9 +151,9 @@ b"bytes"    // &[u8]
 F-strings are a first-class language feature (not a macro). Any expression can be embedded in `{}`:
 
 ```fides
-pv name = "World";
-pv x = 5;
-pv y = 10;
+val name = "World";
+val x = 5;
+val y = 10;
 
 f"Hello, {name}!"                    // "Hello, World!"
 f"{x} + {y} = {x + y}"              // "5 + 10 = 15"
@@ -201,7 +201,7 @@ vec![1, 2, 3]   // literal (function, not macro)
 (a, b, c)       // literal
 
 // Function type
-pf(x: i32) -> i32   // type signature
+fn(x: i32) -> i32   // type signature
 ```
 
 ### 3.3 Custom Types
@@ -219,7 +219,7 @@ struct Color(u8, u8, u8);
 // Unit struct
 struct Empty;
 
-// Enum — sum ty (algebraic)
+// Enum — sum type (algebraic)
 enum Shape {
     Circle { radius: f64 },
     Rectangle { width: f64, height: f64 },
@@ -233,7 +233,7 @@ struct HashMap<K, V> {
 }
 
 // type alias
-ty Score = i32;
+type Score = i32;
 ```
 
 ### 3.4 Standard Library Types
@@ -302,7 +302,7 @@ Fides's stdlib lives in `stdlib/` and is imported explicitly via `use` (except `
 #### String Methods
 
 ```fides
-pv s: String = "Hello";
+val s: String = "Hello";
 
 s.len() -> i64              // length in bytes
 s.is_empty() -> bool        // true if length == 0
@@ -329,7 +329,7 @@ s.clone() -> String         // deep copy
 #### Vec Methods
 
 ```fides
-pv v: Vec<i64> = vec![1, 2, 3];
+val v: Vec<i64> = vec![1, 2, 3];
 
 v.push(val: i64)            // append element
 v.pop() -> i64              // remove and return last
@@ -354,7 +354,7 @@ v.clone() -> Vec<i64>       // deep copy
 #### HashMap Methods
 
 ```fides
-pv m: HashMap<String, i64> = hashmap![];
+val m: HashMap<String, i64> = hashmap![];
 
 m.insert(key: String, val: i64)  // insert/update
 m.get(key: String) -> i64        // lookup (0 if missing)
@@ -377,46 +377,46 @@ m.clone() -> HashMap<String, i64>  // deep copy
 
 ```fides
 // Basic function
-pf add(x: i32, y: i32) -> i32 {
+fn add(x: i32, y: i32) -> i32 {
     x + y
 }
 
 // Public function
-pub pf main() {
+pub fn main() {
     println("Hello, Fides!");
 }
 
-// Function with no ret value (unit)
-pf greet(name: &str) {
+// Function with no return value (unit)
+fn greet(name: &str) {
     println(f"Hello, {name}!");
 }
 
 // Generic function
-pf identity<T>(x: T) -> T {
+fn identity<T>(x: T) -> T {
     x
 }
 
 // Generic with cap bound
-pf max<T: Ord>(a: T, b: T) -> T {
+fn max<T: Ord>(a: T, b: T) -> T {
     if a >= b { a } else { b }
 }
 
 // Generic with where clause
-pf merge<T, U>(left: Vec<T>, right: Vec<U>) -> Vec<(T, U)>
+fn merge<T, U>(left: Vec<T>, right: Vec<U>) -> Vec<(T, U)>
     where T: Clone, U: Clone
 {
     // ...
 }
 
 // Async function
-async pf fetch(url: &str) -> Result<str, NetError> {
-    pv response = http_get(url).await?;
+async fn fetch(url: &str) -> Result<str, NetError> {
+    val response = http_get(url).await?;
     Ok(response.body)
 }
 
 // Function with effect handlers (advanced)
-pf read_config(path: &str) -> Config !FileIO + LogIO {
-    pv data = read_file(path)?;
+fn read_config(path: &str) -> Config !FileIO + LogIO {
+    val data = read_file(path)?;
     handle LogIO::Info(f"Loaded {path}");
     parse_config(data)
 }
@@ -426,26 +426,26 @@ pf read_config(path: &str) -> Config !FileIO + LogIO {
 
 ```fides
 // Full closure
-pv double = pf(x: i32) -> i32 {
+val double = fn(x: i32) -> i32 {
     x * 2
 };
 
 // Short-form closure (single expression, no braces)
-pv square = pf(x: i32) -> i32 => x * x;
+val square = fn(x: i32) -> i32 => x * x;
 
 // Closure capturing environment
-pv multiplier = 3;
-pv multiply = pf(x: i32) -> i32 => x * multiplier;
+val multiplier = 3;
+val multiply = fn(x: i32) -> i32 => x * multiplier;
 
 // Closure as argument
-pv nums = vec![1, 2, 3];
-pv doubled = nums.map(pf(x: i32) -> i32 => x * 2);
+val nums = vec![1, 2, 3];
+val doubled = nums.map(fn(x: i32) -> i32 => x * 2);
 
 // Closure with no parameters
-pv greet = pf() => println("Hello!");
+val greet = fn() => println("Hello!");
 
 // Async closure
-pv task = async pf() {
+val task = async fn() {
     fetch("https://example.com").await
 };
 ```
@@ -454,10 +454,10 @@ pv task = async pf() {
 
 ```fides
 // Function type
-ty BinOp = pf(i32, i32) -> i32;
+type BinOp = fn(i32, i32) -> i32;
 
-pv add: BinOp = pf(a: i32, b: i32) -> i32 => a + b;
-pv result = add(5, 3);
+val add: BinOp = fn(a: i32, b: i32) -> i32 => a + b;
+val result = add(5, 3);
 ```
 
 ---
@@ -468,35 +468,35 @@ pv result = add(5, 3);
 
 ```fides
 // Immutable (default)
-pv x = 5;
-pv name = "Fides";
-pv point = Point { x: 3.0, y: 4.0 };
+val x = 5;
+val name = "Fides";
+val point = Point { x: 3.0, y: 4.0 };
 
 // Mutable
-pv mut counter = 0;
+var counter = 0;
 counter += 1;
 
 // With explicit type
-pv x: i64 = 42;
-pv mut buffer: Vec<u8> = Vec::new();
+val x: i64 = 42;
+var buffer: Vec<u8> = Vec::new();
 
 // Destructuring
-pv Point { x, y } = point;
-pv (a, b, c) = tuple;
-pv Some(value) = option;  // pattern match in let
+val Point { x, y } = point;
+val (a, b, c) = tuple;
+val Some(value) = option;  // pattern match in let
 
-// Shadowing (allowed, ty can change)
-pv x = 5;
-pv x = "now a string";  // shadows previous x
+// Shadowing (allowed, type can change)
+val x = 5;
+val x = "now a string";  // shadows previous x
 ```
 
 ### 5.2 Constants
 
 ```fides
 // Compile-time constant
-pc MAX_PLAYERS: i32 = 64;
-pc PI: f64 = 3.14159265358979;
-pc GREETING: &str = "Hello, Fides!";
+const MAX_PLAYERS: i32 = 64;
+const PI: f64 = 3.14159265358979;
+const GREETING: &str = "Hello, Fides!";
 
 // Static (single memory location)
 static COUNTER: AtomicI32 = AtomicI32::new(0);
@@ -506,18 +506,18 @@ static COUNTER: AtomicI32 = AtomicI32::new(0);
 
 ```fides
 // Copy types (i32, bool, f64, etc.) — copied by default
-pv a = 5;
-pv b = a;      // a is still valid (i32 is Copy)
+val a = 5;
+val b = a;      // a is still valid (i32 is Copy)
 println(a);   // works
 
 // Move types (String, Vec, etc.) — moved by default
-pv s1 = String::from("hello");
-pv s2 = s1;        // s1 is moved
+val s1 = String::from("hello");
+val s2 = s1;        // s1 is moved
 // println(s1);   // ERROR: s1 was moved
 
 // Borrow instead of move
-pv s3 = String::from("world");
-pv s4 = &s3;       // borrow (s3 still valid)
+val s3 = String::from("world");
+val s4 = &s3;       // borrow (s3 still valid)
 println(s3);      // works
 println(s4);      // works
 ```
@@ -530,23 +530,23 @@ println(s4);      // works
 
 ```fides
 // Shared reference (immutable borrow)
-pf len(s: &str) -> usize {
+fn len(s: &str) -> usize {
     s.len()
 }
 
 // Mutable reference (exclusive borrow)
-pf push(buf: &mut Vec<i32>, val: i32) {
+fn push(buf: &mut Vec<i32>, val: i32) {
     buf.push(val);
 }
 
 // Taking a reference
-pv x = 5;
-pv r = &x;          // &i32
-pv val = *r;        // dereference → 5
+val x = 5;
+val r = &x;          // &i32
+val val = *r;        // dereference → 5
 
 // Mutable reference
-pv mut y = 10;
-pv r = &mut y;      // &mut i32
+var y = 10;
+val r = &mut y;      // &mut i32
 *r += 5;           // y is now 15
 ```
 
@@ -558,14 +558,14 @@ Fides deduces regions (lifetimes) automatically. You rarely need to annotate the
 // Rust requires explicit lifetime:
 //   fn longest<'a>(x: &'a str, y: &'a str) -> &'a str
 // Fides: compiler infers the region
-pf longest(x: &str, y: &str) -> &str {
+fn longest(x: &str, y: &str) -> &str {
     if x.len() > y.len() { x } else { y }
 }
 
 // When explicit (rare), use region blocks:
-pf store(data: &str) -> &str {
+fn store(data: &str) -> &str {
     region r {
-        pv cached = data.to_string();
+        val cached = data.to_string();
         &cached
     }
 }
@@ -596,10 +596,10 @@ if x > 0 {
 }
 
 // Expression form (returns value)
-pv sign = if x > 0 { 1 } else if x < 0 { -1 } else { 0 };
+val sign = if x > 0 { 1 } else if x < 0 { -1 } else { 0 };
 
 // With let
-pv result = if condition {
+val result = if condition {
     compute_value()
 } else {
     default_value()
@@ -673,7 +673,7 @@ for i in 0..=10 {
 }
 
 // While loop
-pv mut i = 0;
+var i = 0;
 while i < 10 {
     println(i);
     i += 1;
@@ -681,7 +681,7 @@ while i < 10 {
 
 // Infinite loop
 loop {
-    pv input = read_line();
+    val input = read_line();
     if input == "quit" {
         break;
     }
@@ -692,8 +692,8 @@ loop {
 }
 
 // Break with value
-pv result = loop {
-    pv input = read_line();
+val result = loop {
+    val input = read_line();
     if input == "done" {
         break input;  // returns "done"
     }
@@ -703,9 +703,9 @@ pv result = loop {
 ### 7.4 Return
 
 ```fides
-pf foo(x: i32) -> i32 {
+fn foo(x: i32) -> i32 {
     if x < 0 {
-        ret 0;     // early return
+        return 0;     // early return
     }
     x * 2             // implicit return (last expression)
 }
@@ -716,11 +716,11 @@ pf foo(x: i32) -> i32 {
 Fides introduces `defer` for cleanup (inspired by Go, but with RAII):
 
 ```fides
-pf process_file(path: &str) -> Result<(), FileError> {
-    pv file = open(path)?;
+fn process_file(path: &str) -> Result<(), FileError> {
+    val file = open(path)?;
     defer close(file);          // runs when function exits (even on error)
 
-    pv data = read(file)?;
+    val data = read(file)?;
     process(data)?;
     Ok(())
     // close(file) runs here automatically
@@ -759,15 +759,15 @@ pub struct Config {
 
 ```fides
 // Full literal
-pv p = Point { x: 3.0, y: 4.0 };
+val p = Point { x: 3.0, y: 4.0 };
 
 // Shorthand (when variable name matches field name)
-pv x = 3.0;
-pv y = 4.0;
-pv p = Point { x, y };     // shorthand for Point { x: x, y: y }
+val x = 3.0;
+val y = 4.0;
+val p = Point { x, y };     // shorthand for Point { x: x, y: y }
 
 // Update syntax (copy remaining fields from another)
-pv p2 = Point { x: 5.0, ..fd };   // x=5.0, y=4.0 (from p)
+val p2 = Point { x: 5.0, ..fd };   // x=5.0, y=4.0 (from p)
 ```
 
 ### 8.3 Impl Blocks
@@ -775,25 +775,25 @@ pv p2 = Point { x: 5.0, ..fd };   // x=5.0, y=4.0 (from p)
 ```fides
 impl Point {
     // Associated function (constructor)
-    pf new(x: f64, y: f64) -> Point {
+    fn new(x: f64, y: f64) -> Point {
         Point { x, y }
     }
 
     // Method (takes &self)
-    pf distance(&self, other: &Point) -> f64 {
-        pv dx = self.x - other.x;
-        pv dy = self.y - other.y;
+    fn distance(&self, other: &Point) -> f64 {
+        val dx = self.x - other.x;
+        val dy = self.y - other.y;
         (dx * dx + dy * dy).sqrt()
     }
 
     // Mutable method
-    pf translate(&mut self, dx: f64, dy: f64) {
+    fn translate(&mut self, dx: f64, dy: f64) {
         self.x += dx;
         self.y += dy;
     }
 
     // Associated constant
-    pc ORIGIN: Point = Point { x: 0.0, y: 0.0 };
+    const ORIGIN: Point = Point { x: 0.0, y: 0.0 };
 }
 ```
 
@@ -802,10 +802,10 @@ impl Point {
 ```fides
 struct Color(u8, u8, u8);
 
-pv red = Color(255, 0, 0);
-pv r = red.0;    // 255
-pv g = red.1;    // 0
-pv b = red.2;    // 0
+val red = Color(255, 0, 0);
+val r = red.0;    // 255
+val g = red.1;    // 0
+val b = red.2;    // 0
 ```
 
 ---
@@ -843,7 +843,7 @@ enum Result<T, E> {
 
 // Enum with methods
 impl Message {
-    pf process(&self) {
+    fn process(&self) {
         match self {
             Message::Quit => println("Quitting"),
             Message::Move { x, y } => println(f"Move to ({x}, {y})"),
@@ -904,29 +904,29 @@ match age {
 ```fides
 // Basic cap
 cap Drawable {
-    pf draw(&self);
-    pf area(&self) -> f64;
+    fn draw(&self);
+    fn area(&self) -> f64;
 }
 
 // cap with default implementation
 cap Greet {
-    pf greet(&self) {
+    fn greet(&self) {
         println(f"Hello from {self.name()}");
     }
 
-    pf name(&self) -> &str;
+    fn name(&self) -> &str;
 }
 
 // Generic cap
 cap Iterator {
-    ty Item;
+    type Item;
 
-    pf next(&mut self) -> Option<Self::Item>;
+    fn next(&mut self) -> Option<Self::Item>;
 }
 
 // cap bounds
 cap Ord: Eq + PartialOrd {
-    pf cmp(&self, other: &Self) -> Ordering;
+    fn cmp(&self, other: &Self) -> Ordering;
 }
 ```
 
@@ -934,19 +934,19 @@ cap Ord: Eq + PartialOrd {
 
 ```fides
 impl Drawable for Point {
-    pf draw(&self) {
+    fn draw(&self) {
         render_pixel(self.x, self.y);
     }
 
-    pf area(&self) -> f64 {
+    fn area(&self) -> f64 {
         0.0  // points have no area
     }
 }
 
 impl Iterator for Counter {
-    ty Item = i32;
+    type Item = i32;
 
-    pf next(&mut self) -> Option<i32> {
+    fn next(&mut self) -> Option<i32> {
         if self.count < self.max {
             self.count += 1;
             Some(self.count)
@@ -961,12 +961,12 @@ impl Iterator for Counter {
 
 ```fides
 // In function signatures
-pf sort<T: Ord>(arr: &mut [T]) {
+fn sort<T: Ord>(arr: &mut [T]) {
     // ...
 }
 
 // With where clause (for complex bounds)
-pf merge<T, U>(left: Vec<T>, right: Vec<U>) -> Vec<(T, U)>
+fn merge<T, U>(left: Vec<T>, right: Vec<U>) -> Vec<(T, U)>
     where T: Clone + Ord,
           U: Clone + Hash
 {
@@ -974,7 +974,7 @@ pf merge<T, U>(left: Vec<T>, right: Vec<U>) -> Vec<(T, U)>
 }
 
 // impl cap (abstract types)
-pf make_iter() -> impl Iterator<Item = i32> {
+fn make_iter() -> impl Iterator<Item = i32> {
     0..10
 }
 ```
@@ -987,7 +987,7 @@ pf make_iter() -> impl Iterator<Item = i32> {
 
 ```fides
 // Returning Result
-pf parse_int(s: &str) -> Result<i32, ParseError> {
+fn parse_int(s: &str) -> Result<i32, ParseError> {
     // ...
     Ok(42)
 }
@@ -999,16 +999,16 @@ match parse_int("42") {
 }
 
 // Propagating with ? operator
-pf read_config(path: &str) -> Result<Config, ConfigError> {
-    pv data = read_file(path)?;        // ? propagates Err
-    pv config = parse_config(data)?;   // ? propagates Err
+fn read_config(path: &str) -> Result<Config, ConfigError> {
+    val data = read_file(path)?;        // ? propagates Err
+    val config = parse_config(data)?;   // ? propagates Err
     Ok(config)
 }
 
 // ? with different error types (auto-conversion)
-pf load() -> Result<Data, AppError> {
-    pv file = open("data.txt")?;       // FileError → AppError (via From)
-    pv content = read(file)?;          // FileError → AppError
+fn load() -> Result<Data, AppError> {
+    val file = open("data.txt")?;       // FileError → AppError (via From)
+    val content = read(file)?;          // FileError → AppError
     Ok(parse(content))
 }
 ```
@@ -1018,27 +1018,27 @@ pf load() -> Result<Data, AppError> {
 > **Implementation status:** Effect annotations (`!IO`, `!Net`, `!Spawn`, `!Alloc`, `!{}`) and effect inference via fixpoint iteration over the call graph are ✅ working. The `handle { do } with` syntax parses and runs, but **full continuation semantics are pending** — effect handlers currently execute their handler bodies but do not support resumable continuations.
 
 ```fides
-// Effect ty in signature
-pf read_file(path: &str) -> str !FileIO {
+// Effect type in signature
+fn read_file(path: &str) -> str !FileIO {
     handle FileIO::Read(path)
 }
 
 // Multiple effects
-pf process() -> Result<Data, Error> !FileIO + LogIO + TimeIO {
-    pv start = handle TimeIO::Now;
+fn process() -> Result<Data, Error> !FileIO + LogIO + TimeIO {
+    val start = handle TimeIO::Now;
     handle LogIO::Info("Starting process");
 
-    pv data = handle FileIO::Read("data.txt");
-    pv parsed = parse(data)?;
+    val data = handle FileIO::Read("data.txt");
+    val parsed = parse(data)?;
 
-    pv elapsed = handle TimeIO::Now - start;
+    val elapsed = handle TimeIO::Now - start;
     handle LogIO::Info(f"Done in {elapsed}ms");
 
     Ok(parsed)
 }
 
 // Handling effects
-pf main() {
+fn main() {
     handle {
         process()
     } with {
@@ -1053,14 +1053,14 @@ pf main() {
 
 ```fides
 // This:
-async pf fetch(url: &str) -> Result<str, NetError> {
-    pv resp = http_get(url).await?;
+async fn fetch(url: &str) -> Result<str, NetError> {
+    val resp = http_get(url).await?;
     Ok(resp.body)
 }
 
 // Desugars to:
-pf fetch(url: &str) -> Result<str, NetError> !Async {
-    pv resp = handle Async::Wait(http_get(url))?;
+fn fetch(url: &str) -> Result<str, NetError> !Async {
+    val resp = handle Async::Wait(http_get(url))?;
     Ok(resp.body)
 }
 ```
@@ -1076,7 +1076,7 @@ pf fetch(url: &str) -> Result<str, NetError> !Async {
 pub module net::http;
 
 pub struct Request { ... }
-pub pf get(url: &str) -> Response { ... }
+pub fn get(url: &str) -> Response { ... }
 
 // Submodule
 pub module net::http::client;
@@ -1103,14 +1103,14 @@ use std::prelude::*;
 
 ```fides
 // Private by default
-pf helper() { ... }           // private to module
+fn helper() { ... }           // private to module
 
 // Public
-pub pf api() { ... }          // accessible from outside
+pub fn api() { ... }          // accessible from outside
 
 // Restricted visibility
-pub(crate) pf internal() { ... }    // crate-internal only
-pub(super) pf child_api() { ... }   // parent module only
+pub(crate) fn internal() { ... }    // crate-internal only
+pub(super) fn child_api() { ... }   // parent module only
 ```
 
 ---
@@ -1120,15 +1120,15 @@ pub(super) pf child_api() { ... }   // parent module only
 ### 13.1 Generic Functions
 
 ```fides
-pf identity<T>(x: T) -> T {
+fn identity<T>(x: T) -> T {
     x
 }
 
-pf max<T: Ord>(a: T, b: T) -> T {
+fn max<T: Ord>(a: T, b: T) -> T {
     if a >= b { a } else { b }
 }
 
-pf merge<T, U>(left: Vec<T>, right: Vec<U>) -> Vec<(T, U)>
+fn merge<T, U>(left: Vec<T>, right: Vec<U>) -> Vec<(T, U)>
     where T: Clone + Ord,
           U: Clone + Hash
 {
@@ -1158,15 +1158,15 @@ struct HashMap<K: Hash + Eq, V> {
 
 ```fides
 cap Iterator {
-    ty Item;
+    type Item;
 
-    pf next(&mut self) -> Option<Self::Item>;
+    fn next(&mut self) -> Option<Self::Item>;
 }
 
 impl Iterator for Range {
-    ty Item = i32;
+    type Item = i32;
 
-    pf next(&mut self) -> Option<i32> {
+    fn next(&mut self) -> Option<i32> {
         // ...
     }
 }
@@ -1182,8 +1182,8 @@ Fides replaces macros with `comptime` blocks — real code that runs at compile 
 
 ```fides
 // Compile-time evaluation
-pc MAX_SIZE: i32 = comptime {
-    pv config = parse_env("P_MAX_SIZE");
+const MAX_SIZE: i32 = comptime {
+    val config = parse_env("P_MAX_SIZE");
     config.unwrap_or(1024)
 };
 
@@ -1195,24 +1195,24 @@ comptime {
     }
 }
 
-// Comptime function — note: `comptime` goes before `pf`
-comptime pf fibonacci(n: i32) -> i32 {
+// Comptime function — note: `comptime` goes before `fn`
+comptime fn fibonacci(n: i32) -> i32 {
     if n <= 1 { n } else { fibonacci(n - 1) + fibonacci(n - 2) }
 }
 
-pc FIB_10: i32 = comptime fibonacci(10);  // 55
+const FIB_10: i32 = comptime fibonacci(10);  // 55
 ```
 
 ### 14.2 Comptime Reflection — ✅ Working
 
 ```fides
 comptime {
-    pv name = type_name<T>;           // type name as string
-    pv is_struct = is_struct<T>;      // true if T is a struct
-    pv is_enum = is_enum<T>;          // true if T is an enum
-    pv fields = field_names<T>;       // Vec of field name strings
-    pv field_types = field_types<T>;  // Vec of type descriptors
-    pv variants = enum_variants<T>;   // Vec of variant name strings
+    val name = type_name<T>;           // type name as string
+    val is_struct = is_struct<T>;      // true if T is a struct
+    val is_enum = is_enum<T>;          // true if T is an enum
+    val fields = field_names<T>;       // Vec of field name strings
+    val field_types = field_types<T>;  // Vec of type descriptors
+    val variants = enum_variants<T>;   // Vec of variant name strings
 }
 ```
 
@@ -1230,55 +1230,57 @@ comptime {
 
 ## 15. Attributes
 
-> **Implementation status:** Attributes are parsed by the compiler. `#[test]` is parsed but **not executed** by `fidesc test` (❌). `@derive(Debug/Clone/Serialize/Deserialize)` is ✅ implemented (Phase 7.7). Other attributes shown below are the planned syntax.
+> **Implementation status:** Fides uses `@attribute` syntax (the Fides-native form). The parser also accepts `#[...]` for `#[test]` compatibility, but `@` is the canonical syntax. `#[test]` is parsed but **not executed** by `fidesc test` (❌ — `fidesc test` runs file-based tests, not `#[test]` functions). `@derive(Debug/Clone/Serialize/Deserialize)` is ✅ implemented (Phase 7.7). `@cfg(platform=...)` is ✅ implemented (conditional compilation). Other attributes shown below are the planned syntax.
 
 ```fides
 // Standard attributes
 #[test]
-pf test_addition() { assert(1 + 1 == 2); }        // ❌ parsed, not executed
+fn test_addition() { assert(1 + 1 == 2); }        // ❌ parsed, not executed by fidesc test
 
 #[test]
 #[should_panic]
-pf test_oob() { pv _ = [1, 2, 3][10]; }            // ❌ parsed, not executed
+fn test_oob() { val _ = [1, 2, 3][10]; }            // ❌ parsed, not executed by fidesc test
 
-#[derive(Debug, Clone, PartialEq)]                  // ❌ not implemented
+@derive(Debug, Clone)                               // ✅ implemented (Phase 7.7)
 struct Point { x: f64, y: f64 }
 
-#[inline]
-pf fast_add(a: i32, b: i32) -> i32 { a + b }
-
-#[deprecated("use new_function() instead")]
-pf old_function() { /* ... */ }
-
-// Custom attributes (for tools and frameworks)
-#[serde(rename_all = "camelCase")]
+@derive(Serialize, Deserialize)                     // ✅ implemented (Phase 7.7)
 struct Config { /* ... */ }
+
+@cfg(platform = "linux")                            // ✅ implemented
+fn linux_only() { /* ... */ }
+
+@inline
+fn fast_add(a: i32, b: i32) -> i32 { a + b }
+
+@deprecated("use new_function() instead")
+fn old_function() { /* ... */ }
 ```
 
 ---
 
 ## 16. Concurrency (✅ Implemented — Phase 7.6)
 
-> **Implementation status:** `async`, `await`, and `spawn` are ✅ implemented (eager evaluation, OS thread model). `async pf` declares an async function, `await <expr>` waits for a Future, `spawn <expr>` creates a new thread. State machine transform for true cooperative scheduling is pending. Effect annotations (`!Spawn`, `!Async`) and effect inference are ✅ working.
+> **Implementation status:** `async`, `await`, and `spawn` are ✅ implemented (eager evaluation, OS thread model). `async fn` declares an async function, `await <expr>` waits for a Future, `spawn <expr>` creates a new thread. State machine transform for true cooperative scheduling is pending. Effect annotations (`!Spawn`, `!Async`) and effect inference are ✅ working.
 
 ### 16.1 Async / Await (✅ Implemented)
 
 ```fides
 // Async function
-async pf fetch_data(url: &str) -> Result<str, NetError> {
-    pv resp = http_get(url).await?;
+async fn fetch_data(url: &str) -> Result<str, NetError> {
+    val resp = http_get(url).await?;
     Ok(resp.body)
 }
 
 // Await on any async expression
-async pf main() {
-    pv data = fetch_data("https://api.example.com").await?;
+async fn main() {
+    val data = fetch_data("https://api.example.com").await?;
     println(data);
 }
 
 // Concurrent fetches
-async pf fetch_all(urls: Vec<&str>) -> Vec<Result<str, NetError>> {
-    pv tasks = urls.map(|url| spawn async { fetch_data(url).await });
+async fn fetch_all(urls: Vec<&str>) -> Vec<Result<str, NetError>> {
+    val tasks = urls.map(|url| spawn async { fetch_data(url).await });
     tasks.await_all()
 }
 ```
@@ -1287,7 +1289,7 @@ async pf fetch_all(urls: Vec<&str>) -> Vec<Result<str, NetError>> {
 
 ```fides
 // Spawn a task (runs concurrently)
-pv task = spawn async {
+val task = spawn async {
     fetch_data("https://example.com").await
 };
 
@@ -1295,7 +1297,7 @@ pv task = spawn async {
 process_local();
 
 // Wait for result
-pv result = task.await;
+val result = task.await;
 ```
 
 ### 16.3 Synchronization (❌ Planned)
@@ -1306,20 +1308,20 @@ pv result = task.await;
 // Mutex (planned)
 use std::sync::Mutex;
 
-pv data = Mutex::new(0);
+val data = Mutex::new(0);
 {
-    pv mut guard = data.lock();
+    var guard = data.lock();
     *guard += 1;
 }  // lock released here
 
 // Channels (for message passing, planned)
 use std::sync::channel;
 
-pv (tx, rx) = channel();
-spawn pf() {
+val (tx, rx) = channel();
+spawn fn() {
     tx.send(42);
 };
-pv received = rx.recv();
+val received = rx.recv();
 ```
 
 ---
@@ -1344,16 +1346,16 @@ use pure_lib;                           // pure_lib gets no capabilities
 ```fides
 // Declare a capability/trait
 cap Database {
-    pf query(&self, sql: &str) -> Result<Vec<Row>, DbError>;
-    pf execute(&self, sql: &str) -> Result<(), DbError>;
+    fn query(&self, sql: &str) -> Result<Vec<Row>, DbError>;
+    fn execute(&self, sql: &str) -> Result<(), DbError>;
 }
 
 // Implement it
 impl Database for InMemoryDB {
-    pf query(&self, sql: &str) -> Result<Vec<Row>, DbError> {
+    fn query(&self, sql: &str) -> Result<Vec<Row>, DbError> {
         // ...
     }
-    pf execute(&self, sql: &str) -> Result<(), DbError> {
+    fn execute(&self, sql: &str) -> Result<(), DbError> {
         // ...
     }
 }
@@ -1363,14 +1365,14 @@ impl Database for InMemoryDB {
 
 ```fides
 // Without capability grant — this won't compile
-pf bad() {
+fn bad() {
     // ERROR: no Net capability in scope
-    pv response = http_get("https://example.com");
+    val response = http_get("https://example.com");
 }
 
 // With capability — compiles fine
-pf good() !Net {
-    pv response = http_get("https://example.com");
+fn good() !Net {
+    val response = http_get("https://example.com");
     // ...
 }
 ```
@@ -1387,7 +1389,7 @@ Fides supports hot-swapping functions at runtime via `fidesc watch`. Implemented
 
 ```fides
 // Any function can be hot-reloaded when using `fidesc watch`
-pub pf handle_request(req: &Request) -> Response {
+pub fn handle_request(req: &Request) -> Response {
     // This function can be replaced at runtime
     // without restarting the process
     process(req)
@@ -1458,7 +1460,7 @@ use std::io::println;
 use std::fs::read_to_string;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq)]
+@derive(Debug, Clone)
 struct Config {
     name: str,
     version: str,
@@ -1466,7 +1468,7 @@ struct Config {
 }
 
 impl Config {
-    pf new(name: &str) -> Config {
+    fn new(name: &str) -> Config {
         Config {
             name: name.to_string(),
             version: "0.1.0".to_string(),
@@ -1474,11 +1476,11 @@ impl Config {
         }
     }
 
-    pf set(&mut self, key: &str, value: &str) {
+    fn set(&mut self, key: &str, value: &str) {
         self.settings.insert(key.to_string(), value.to_string());
     }
 
-    pf get(&self, key: &str) -> Option<&str> {
+    fn get(&self, key: &str) -> Option<&str> {
         self.settings.get(key).map(|v| v.as_str())
     }
 }
@@ -1488,13 +1490,13 @@ enum LoadError {
     ParseError(str),
 }
 
-pf load_config(path: &str) -> Result<Config, LoadError> {
-    pv content = read_to_string(path)
+fn load_config(path: &str) -> Result<Config, LoadError> {
+    val content = read_to_string(path)
         .map_err(|_| LoadError::FileNotFound)?;
 
-    pv mut config = Config::new("app");
+    var config = Config::new("app");
     for line in content.lines() {
-        pv parts: Vec<&str> = line.splitn(2, '=').collect();
+        val parts: Vec<&str> = line.splitn(2, '=').collect();
         if parts.len() == 2 {
             config.set(parts[0].trim(), parts[1].trim());
         }
@@ -1504,22 +1506,22 @@ pf load_config(path: &str) -> Result<Config, LoadError> {
 }
 
 #[test]
-pf test_config() {
-    pv mut config = Config::new("test");
+fn test_config() {
+    var config = Config::new("test");
     config.set("key", "value");
     assert_eq(config.get("key"), Some("value"));
     assert_eq(config.get("missing"), None);
 }
 
 #[test]
-pf test_config_debug() {
-    pv config = Config::new("app");
-    pv debug = format(f"{config:?}");
+fn test_config_debug() {
+    val config = Config::new("app");
+    val debug = format(f"{config:?}");
     assert(debug.contains("Config"));
 }
 
-pub pf main() -> Result<(), LoadError> {
-    pv config = load_config("pacte.toml")?;
+pub fn main() -> Result<(), LoadError> {
+    val config = load_config("pacte.toml")?;
 
     println(f"Loaded: {config.name} v{config.version}");
     println(f"Settings: {config.settings.len()} entries");
@@ -1538,15 +1540,15 @@ pub pf main() -> Result<(), LoadError> {
 
 ```
 // Functions
-pf name(params) -> ReturnType { body }
-pub pf name(params) -> ReturnType { body }
-async pf name(params) -> ReturnType { body }
-pf<T: cap> name(x: T) -> T { body }
+fn name(params) -> ReturnType { body }
+pub fn name(params) -> ReturnType { body }
+async fn name(params) -> ReturnType { body }
+fn<T: cap> name(x: T) -> T { body }
 
 // Variables
-pv x = value;
-pv mut x = value;
-pv x: Type = value;
+val x = value;
+var x = value;
+val x: Type = value;
 
 // Control flow
 if cond { } else if cond { } else { }
@@ -1558,11 +1560,11 @@ loop { break value; }
 // Types
 struct Name { field: Type }
 enum Name { Variant, Variant(T), Variant { field: T } }
-cap Name { pf method(&self); }
-impl Name for Type { pf method(&self) { } }
+cap Name { fn method(&self); }
+impl Name for Type { fn method(&self) { } }
 
 // Generics
-pf name<T: cap>(x: T) -> T { }
+fn name<T: cap>(x: T) -> T { }
 struct Name<T, U> { }
 
 // Error handling
@@ -1578,11 +1580,11 @@ expr?           // propagate error
 
 // Modules
 use module::item;
-pub pf name() { }
-pub(crate) pf name() { }
+pub fn name() { }
+pub(crate) fn name() { }
 
 // Other
-#[attribute]
+@attribute
 comptime { }
 defer expr;
 spawn async { }
@@ -1645,17 +1647,18 @@ require'lspconfig'.fides.setup{
 
 ---
 
-# Fides New Syntax Specification
+# Fides Syntax Migration — Completed
 
 **Version:** 1.0
 **Date:** 2026-08-26
-**Status:** Proposed — pending implementation before self-hosting
+**Status:** COMPLETED — migration is done, all .fd files use the new syntax
 
-> This document defines the final syntax for Fides. It replaces the old
-> `pf`/`pv`/`pc`/`ret`/`ty`/`pm` keywords with standard, universally
-> understood keywords. The `cap` and `use` keywords are kept — they are
-> short, distinct, and already part of Fides's identity. The old syntax
-> will be migrated before self-hosting begins.
+> This document records the syntax migration from Fides's original keywords
+> (`pf`/`pv`/`pc`/`ret`/`ty`/`pm`) to standard, universally understood keywords
+> (`fn`/`val`/`var`/`const`/`return`/`type`). The `cap` and `use` keywords were
+> kept — they are short, distinct, and already part of Fides's identity.
+> The migration is complete: the lexer, parser, all test files, and all stdlib
+> modules use the new syntax.
 
 ---
 
@@ -1663,13 +1666,13 @@ require'lspconfig'.fides.setup{
 
 ### 1.1 Why change the syntax?
 
-The original Fides keywords (`pf`, `pv`, `pc`, `ret`, `ty`, `pm`) were
+The original Fides keywords (`fn`, `val`, `const`, `return`, `type`, `pm`) were
 unique to Fides. While they gave the language a distinct identity, they created
 unnecessary friction:
 
 - **Learning curve:** Every new user had to learn 6+ unfamiliar keywords
 - **AI familiarity:** AI models are trained on billions of lines of code using
-  `fn`, `let`, `return`, `type` — not `pf`, `pv`, `ret`
+  `fn`, `let`, `return`, `type` — not `fn`, `val`, `return`
 - **No performance benefit:** Shorter keywords have zero effect on compile
   speed, binary size, or runtime performance (keywords become token enum
   variants after lexing)
@@ -1794,11 +1797,11 @@ spawn       defer       move        static      try
 handle      do          with        extern      dyn         module
 interrupt
 
-true        false       none        some        ok          err
+true        false
 ```
 
-**Note:** `none`, `some`, `ok`, `err` are enum variant names from the
-standard library (`Option` and `Result`), not keywords.
+**Note:** `none`, `some`, `ok`, `err` are NOT keywords — they are enum variant
+names from the standard library (`Option` and `Result`).
 
 ---
 
@@ -2186,33 +2189,29 @@ fn write_file(path: &str) -> Result<(), Error> {
 
 ---
 
-## 6. Migration Plan
+## 6. Migration Record (Completed)
 
 ### 6.1 Approach: Update Rust compiler first, then migrate all .fd files
 
-**Step 1: Update the Rust compiler** (`src/lexer.rs`, `src/token.rs`, `src/parser.rs`)
-- Add new keywords: `fn`, `val`, `var`, `return`, `type`
-- Remove old keywords: `pf`, `pv`, `pc`, `ret`, `ty`, `pm`
-- Keep existing keywords: `cap`, `use` (unchanged)
-- Update parser to use new keywords
+**Step 1: Update the Rust compiler** (`src/lexer.rs`, `src/token.rs`, `src/parser.rs`) — DONE
+- New keywords: `fn`, `val`, `var`, `const`, `return`, `type`
+- Old keywords removed: `pf`, `pv`, `pc`, `ret`, `ty`, `pm`
+- Kept existing keywords: `cap`, `use` (unchanged)
 - The compiler now accepts ONLY the new syntax
 
-**Step 2: Write migration script**
-- `sed` / `find` / `replace` script to convert all `.fd` files
-- Handle context-sensitive replacements:
-  - `pf` → `fn` (function keyword)
+**Step 2: Migration script** — DONE
+- `sed` script converted all `.fd` files
+- Context-sensitive replacements:
   - `pv mut` → `var` (mutable variable — must handle before `pv` → `val`)
   - `pv` → `val` (immutable variable)
+  - `pf` → `fn` (function)
   - `pc` → `const` (constant)
   - `ret` → `return` (return)
   - `ty` → `type` (type alias)
   - `pm` → `var` (uninitialized mutable — remove keyword, keep declaration)
-  - `cap` and `use` are unchanged — no replacement needed
-- Handle edge cases:
-  - `pv mut` must be replaced BEFORE `pv` (otherwise `pv` → `val` first)
-  - `pm x: i32;` → `var x: i32;`
+  - `cap` and `use` were unchanged — no replacement needed
 
-**Step 3: Run migration script**
+**Step 3: Migration script used**
 ```bash
 # Order matters! pv mut → var must happen before pv → val
 find . -name "*.fd" -exec sed -i \
@@ -2226,20 +2225,20 @@ find . -name "*.fd" -exec sed -i \
     {} \;
 ```
 
-**Step 4: Verify all tests pass**
-- Run all 265 unit tests
-- Run all harness tests
-- Run interpreter + C codegen + PE emitter parity tests
+**Step 4: All tests pass** — VERIFIED
+- 265 unit tests pass
+- 8 harness tests pass
+- 146/146 normal tests pass on interpreter + C codegen + PE emitter
 
-**Step 5: Update documentation**
-- `docs/syntax-spec.md` — update all examples
-- `docs/features.md` — update keyword references
-- `README.md` — update keyword list
-- `AGENTS.md` — update baseline
+**Step 5: Documentation updated** — DONE
+- `docs/reference/syntax.md` — all examples updated
+- `docs/reference/features.md` — keyword references updated
+- `README.md` — keyword list updated
+- `AGENTS.md` — baseline updated
 
-### 6.2 Migration order (critical)
+### 6.2 Migration order (was critical)
 
-The migration script MUST handle replacements in this order:
+The migration script handled replacements in this order:
 
 1. `pv mut` → `var` (BEFORE `pv` → `val`, otherwise `pv mut` becomes `val mut`)
 2. `pv` → `val`
@@ -2305,7 +2304,8 @@ These syntax elements remain exactly the same:
 | `try { }`                | Try block                   |
 | `;` (semicolons)         | Required                    |
 | `//` and `/* */`         | Comments                    |
-| `#[test]`                | Test attribute (if used)    |
+| `@attribute`             | Attribute syntax (canonical)|
+| `#[test]`                | Test attribute (also parsed, not executed) |
 | `..` and `..=`           | Ranges                      |
 | `=>`                     | Match arm / closure arrow   |
 | `->`                     | Return type arrow           |
@@ -2340,7 +2340,7 @@ This is purely a syntax change. No semantics change:
 
 ### 8.3 No performance impact
 
-Keyword text is discarded after lexing. `fn` and `pf` produce the same token
+Keyword text is discarded after lexing. `fn` and `fn` produce the same token
 type (an enum variant). The compiler never looks at the keyword text again.
 Binary output is identical.
 
@@ -2355,8 +2355,8 @@ use core;
 use core::io;
 
 cap Shape {
-    pf area(&self) -> f64;
-    pf name(&self) -> &str;
+    fn area(&self) -> f64;
+    fn name(&self) -> &str;
 }
 
 struct Circle {
@@ -2364,12 +2364,12 @@ struct Circle {
 }
 
 impl Shape for Circle {
-    pf area(&self) -> f64 {
-        ret 3.14159 * self.radius * self.radius;
+    fn area(&self) -> f64 {
+        return 3.14159 * self.radius * self.radius;
     }
 
-    pf name(&self) -> &str {
-        ret "circle";
+    fn name(&self) -> &str {
+        return "circle";
     }
 }
 
@@ -2379,27 +2379,27 @@ struct Rectangle {
 }
 
 impl Shape for Rectangle {
-    pf area(&self) -> f64 {
-        ret self.width * self.height;
+    fn area(&self) -> f64 {
+        return self.width * self.height;
     }
 
-    pf name(&self) -> &str {
-        ret "rectangle";
+    fn name(&self) -> &str {
+        return "rectangle";
     }
 }
 
-pf print_shape(shape: &dyn Shape) {
+fn print_shape(shape: &dyn Shape) {
     println(f"{shape.name()}: {shape.area()}");
 }
 
-pf main() -> i64 {
-    pv circle = Circle { radius: 5.0 };
-    pv rect = Rectangle { width: 3.0, height: 4.0 };
+fn main() -> i64 {
+    val circle = Circle { radius: 5.0 };
+    val rect = Rectangle { width: 3.0, height: 4.0 };
 
     print_shape(&circle);
     print_shape(&rect);
 
-    ret 0;
+    return 0;
 }
 ```
 

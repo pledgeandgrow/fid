@@ -1,0 +1,180 @@
+// Example: Simple code generator — emits x86-64 assembly from an AST
+//
+// This exercises the patterns a self-hosted compiler codegen needs:
+// - String building (concatenation for assembly output)
+// - Pattern matching on AST nodes
+// - Recursive traversal
+// - Stack-based evaluation (push/pop pattern)
+//
+// Compile: fidesc ccompile examples/codegen.fd -o examples/codegen
+// Run:     ./examples/codegen
+
+use core;
+use vec;
+use string;
+
+// ─── AST (same as parser example) ────────────────────────────────────
+
+enum Expr {
+    Num(i64),
+    Add(Box<Expr>, Box<Expr>),
+    Sub(Box<Expr>, Box<Expr>),
+    Mul(Box<Expr>, Box<Expr>),
+    Div(Box<Expr>, Box<Expr>),
+    Neg(Box<Expr>),
+}
+
+// ─── Code Generator ──────────────────────────────────────────────────
+
+struct CodeGen {
+    output: str,
+    label_count: i64,
+}
+
+impl CodeGen {
+    fn new() -> CodeGen {
+        return CodeGen { output: "", label_count: 0 };
+    }
+
+    fn emit(self: &mut CodeGen, line: str) {
+        self.output = self.output + line + "\n";
+    }
+
+    fn new_label(self: &mut CodeGen) -> str {
+        self.label_count = self.label_count + 1;
+        return ".L" + int_to_str(self.label_count);
+    }
+
+    // Generate code that evaluates the expression and leaves result in rax
+    fn gen_expr(self: &mut CodeGen, e: Box<Expr>) {
+        match e {
+            Expr::Num(n) => {
+                self.emit("  movq $" + int_to_str(n) + ", %rax");
+            }
+            Expr::Neg(inner) => {
+                self.gen_expr(inner);
+                self.emit("  negq %rax");
+            }
+            Expr::Add(left, right) => {
+                // Evaluate left, push, evaluate right, pop, add
+                self.gen_expr(left);
+                self.emit("  pushq %rax");
+                self.gen_expr(right);
+                self.emit("  popq %rcx");
+                self.emit("  addq %rcx, %rax");
+            }
+            Expr::Sub(left, right) => {
+                self.gen_expr(left);
+                self.emit("  pushq %rax");
+                self.gen_expr(right);
+                self.emit("  movq %rax, %rcx");
+                self.emit("  popq %rax");
+                self.emit("  subq %rcx, %rax");
+            }
+            Expr::Mul(left, right) => {
+                self.gen_expr(left);
+                self.emit("  pushq %rax");
+                self.gen_expr(right);
+                self.emit("  popq %rcx");
+                self.emit("  imulq %rcx, %rax");
+            }
+            Expr::Div(left, right) => {
+                self.gen_expr(left);
+                self.emit("  pushq %rax");
+                self.gen_expr(right);
+                self.emit("  movq %rax, %rcx");
+                self.emit("  popq %rax");
+                self.emit("  cqto");        // sign-extend rax into rdx:rax
+                self.emit("  idivq %rcx");  // rax = rdx:rax / rcx
+            }
+        }
+    }
+
+    // Generate a complete function
+    fn gen_function(self: &mut CodeGen, name: str, body: Box<Expr>) {
+        self.emit("  .text");
+        self.emit("  .globl " + name);
+        self.emit(name + ":");
+        self.emit("  pushq %rbp");
+        self.emit("  movq %rsp, %rbp");
+        self.gen_expr(body);
+        self.emit("  popq %rbp");
+        self.emit("  ret");
+    }
+}
+
+// ─── AST builder helpers ─────────────────────────────────────────────
+
+fn num(n: i64) -> Expr {
+    return Expr::Num(n);
+}
+
+fn add(a: Expr, b: Expr) -> Expr {
+    return Expr::Add(Box::new(a), Box::new(b));
+}
+
+fn sub(a: Expr, b: Expr) -> Expr {
+    return Expr::Sub(Box::new(a), Box::new(b));
+}
+
+fn mul(a: Expr, b: Expr) -> Expr {
+    return Expr::Mul(Box::new(a), Box::new(b));
+}
+
+fn neg(a: Expr) -> Expr {
+    return Expr::Neg(Box::new(a));
+}
+
+// ─── Main ────────────────────────────────────────────────────────────
+
+fn main() -> i64 {
+    // Build AST for: (3 + 4) * (10 - 2) = 7 * 8 = 56
+    val ast = mul(add(num(3), num(4)), sub(num(10), num(2)));
+
+    print("Generating x86-64 assembly for: (3 + 4) * (10 - 2)\n\n");
+
+    var gen = CodeGen::new();
+    gen.gen_function("compute", Box::new(ast));
+
+    print(gen.output);
+    print("\n");
+
+    // Verify the assembly is well-formed
+    var lines = str_split(gen.output, "\n");
+    print("Generated ");
+    print(lines.len());
+    print(" lines of assembly.\n");
+
+    // Check for expected patterns
+    var has_mov = false;
+    var has_add = false;
+    var has_mul = false;
+    var has_ret = false;
+    var i: i64 = 0;
+    while i < lines.len() {
+        val line = lines.get(i);
+        if str_contains(line, "movq") { has_mov = true; }
+        if str_contains(line, "addq") { has_add = true; }
+        if str_contains(line, "imulq") { has_mul = true; }
+        if str_contains(line, "ret") { has_ret = true; }
+        i = i + 1;
+    }
+
+    print("\nVerification:\n");
+    if has_mov { print("  [OK] movq instructions present\n"); }
+    else { print("  [FAIL] no movq instructions\n"); }
+    if has_add { print("  [OK] addq instructions present\n"); }
+    else { print("  [FAIL] no addq instructions\n"); }
+    if has_mul { print("  [OK] imulq instructions present\n"); }
+    else { print("  [FAIL] no imulq instructions\n"); }
+    if has_ret { print("  [OK] ret instruction present\n"); }
+    else { print("  [FAIL] no ret instruction\n"); }
+
+    if has_mov && has_add && has_mul && has_ret {
+        print("\nCodegen works correctly.\n");
+    } else {
+        print("\nCodegen has issues.\n");
+    }
+
+    return 0;
+}

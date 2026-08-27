@@ -2728,7 +2728,7 @@ impl PeCodeGen {
             Inst::PersistSave { .. } => {
                 // No-op in PE emitter
             }
-            Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd => {
+            Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd | Inst::GradBegin { .. } | Inst::GradEnd | Inst::Backward { .. } => {
                 // No-op in PE emitter (rollback/unsafe not supported)
             }
             Inst::Panic { message } => {
@@ -2756,6 +2756,9 @@ impl PeCodeGen {
             }
             Inst::RegionEnd { .. } => {
                 // Region end — no-op in PE backend
+            }
+            Inst::GradBegin { .. } | Inst::GradEnd | Inst::Backward { .. } => {
+                // Autodiff markers — no-op in PE backend
             }
         }
     }

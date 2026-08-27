@@ -21,7 +21,7 @@ module sync;
 /// Allocate a shared atomic i64 slot, initialized to 0.
 /// Returns an address that can be used with atomic operations.
 pub fn sync_atomic_alloc(initial: i64) -> i64 {
-    val addr = p_shared_alloc(8);
+    var addr = p_shared_alloc(8);
     p_atomic_store(addr, initial);
     return addr;
 }
@@ -59,6 +59,105 @@ pub fn sync_mutex_lock(m: i64) -> void {
 /// Unlock a mutex.
 pub fn sync_mutex_unlock(m: i64) -> void {
     p_mutex_unlock(m);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RwLock — reader-writer lock (multiple readers OR one writer)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Create a reader-writer lock. Returns a handle.
+/// Allows multiple concurrent readers or one exclusive writer.
+pub fn sync_rwlock_create() -> i64 {
+    // RwLock is implemented as a mutex + reader count
+    var lock = p_mutex_init();
+    var reader_count = p_shared_alloc(8);
+    p_atomic_store(reader_count, 0);
+    // Pack: handle = lock | (reader_count << 32) — but we just return the lock
+    // and use a separate allocation for reader count.
+    // For simplicity, we return a struct pointer: [lock, reader_count]
+    var handle = p_shared_alloc(16);
+    unsafe {
+        var lock_ptr: *mut i64 = handle;
+        *lock_ptr = lock;
+        var rc_ptr: *mut i64 = handle + 8;
+        *rc_ptr = reader_count;
+    }
+    return handle;
+}
+
+/// Acquire a read lock (shared — multiple readers allowed).
+pub fn sync_rwlock_read_lock(rwlock: i64) -> void {
+    var lock_ptr: *mut i64 = rwlock;
+    var rc_ptr: *mut i64 = rwlock + 8;
+    unsafe {
+        p_mutex_lock(*lock_ptr);
+        // Atomically increment reader count. p_atomic_add returns the OLD value.
+        // If old value was 0, we're the first reader — keep the lock.
+        // Otherwise, release the lock (other readers already have access).
+        var old_rc = p_atomic_add(*rc_ptr, 1);
+        if old_rc != 0 {
+            p_mutex_unlock(*lock_ptr);
+        }
+    }
+}
+
+/// Release a read lock.
+pub fn sync_rwlock_read_unlock(rwlock: i64) -> void {
+    var lock_ptr: *mut i64 = rwlock;
+    var rc_ptr: *mut i64 = rwlock + 8;
+    unsafe {
+        // Atomically decrement reader count. If old value was 1, we're the
+        // last reader — release the lock so writers can acquire it.
+        var old_rc = p_atomic_add(*rc_ptr, -1);
+        if old_rc == 1 {
+            p_mutex_unlock(*lock_ptr);
+        }
+    }
+}
+
+/// Acquire a write lock (exclusive — no other readers or writers).
+pub fn sync_rwlock_write_lock(rwlock: i64) -> void {
+    var lock_ptr: *mut i64 = rwlock;
+    unsafe {
+        p_mutex_lock(*lock_ptr);
+    }
+}
+
+/// Release a write lock.
+pub fn sync_rwlock_write_unlock(rwlock: i64) -> void {
+    var lock_ptr: *mut i64 = rwlock;
+    unsafe {
+        p_mutex_unlock(*lock_ptr);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AtomicU64 — convenience wrapper for atomic 64-bit operations
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Create an AtomicU64 initialized to the given value.
+pub fn atomic_u64_new(initial: i64) -> i64 {
+    return sync_atomic_alloc(initial);
+}
+
+/// Atomically load an AtomicU64.
+pub fn atomic_u64_load(addr: i64) -> i64 {
+    return p_atomic_load(addr);
+}
+
+/// Atomically store a value to an AtomicU64.
+pub fn atomic_u64_store(addr: i64, value: i64) -> void {
+    p_atomic_store(addr, value);
+}
+
+/// Atomically add a value to an AtomicU64. Returns the old value.
+pub fn atomic_u64_fetch_add(addr: i64, value: i64) -> i64 {
+    return p_atomic_add(addr, value);
+}
+
+/// Atomically compare-and-swap. Returns true if successful.
+pub fn atomic_u64_cas(addr: i64, expected: i64, new_val: i64) -> bool {
+    return p_atomic_cas(addr, expected, new_val);
 }
 
 /// Spawn a function as a new OS thread.

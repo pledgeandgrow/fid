@@ -657,7 +657,7 @@ A new language is **hard to justify** if:
 - Tests: test_gas.fd (valid), test_gas_fail.fd (expected fail)
 
 ### Phase 7.5C: Production Primitives
-- Tuple destructuring: `pv (a, b) = expr` for multi-return unpacking
+- Tuple destructuring: `val (a, b) = expr` for multi-return unpacking
 - File I/O: stdlib/file.fd with file_read, file_write, file_append, file_exists
 - txn {} blocks: atomic transaction blocks (parsing + typechecking done, rollback pending)
 - Loop-aware linear types: linear variables can't be consumed inside loop bodies
@@ -673,7 +673,7 @@ A new language is **hard to justify** if:
   - Parameterized query helpers: sql_bind, sql_bind_int
   - Safety heuristics: is_safe() methods detect injection patterns
 - F63: Init guarantee
-  - `pm` keyword for uninitialized mutable variables (no dummy values needed)
+  - `var` keyword (without initializer) for uninitialized mutable variables (no dummy values needed)
   - Definite assignment analysis: reading before assignment = compile error
   - If/else branch analysis: variable initialized only if assigned in BOTH branches
   - Clear error messages with fix suggestions

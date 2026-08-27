@@ -181,7 +181,15 @@ impl X64CodeGen {
 
         let frame_size = f.frame_size + alloc.as_ref().map(|a| a.spill_size as u64).unwrap_or(0);
         // Align frame to 16 bytes.
+        // Issue 20: If the number of callee-saved registers is odd, add 8 bytes
+        // of padding so that RSP stays 16-byte aligned after pushing them.
+        // After `subq $aligned_frame, %rsp` RSP is 16-aligned. Each `pushq`
+        // subtracts 8. An odd number of pushes leaves RSP at 16n+8 (misaligned).
+        // Adding 8 to the frame makes it 16n-8-8*(odd) = 16-aligned.
+        let callee_count = alloc.as_ref().map(|a| a.used_callee_saved.len()).unwrap_or(0);
+        let pad = if callee_count % 2 == 1 { 8 } else { 0 };
         let aligned_frame = (frame_size + 15) & !15;
+        let aligned_frame = aligned_frame + pad;
 
         self.wl("");
         self.wl(&format!("    .globl {}", f.name));
@@ -326,6 +334,24 @@ impl X64CodeGen {
         match inst {
             L3Inst::Mov { dst, src } => {
                 self.gen_mov(*dst, src);
+            }
+
+            L3Inst::AddrOfSlot { dst, slot } => {
+                // Materialize the address of a stack slot (leaq -slot(%rbp), %reg).
+                // This is for Alloca — the result is a pointer to the stack slot.
+                let dst_loc = self.dst_loc(*dst);
+                match dst_loc {
+                    Some(Location::Reg(dr)) => {
+                        self.wl(&format!("    leaq -{}(%rbp), %{}", slot.0, dr.name()));
+                    }
+                    Some(Location::Spill(off)) => {
+                        self.wl(&format!("    leaq -{}(%rbp), %rax", slot.0));
+                        self.wl(&format!("    movq %rax, -{}(%rbp)", off));
+                    }
+                    _ => {
+                        self.wl(&format!("    leaq -{}(%rbp), %rax", slot.0));
+                    }
+                }
             }
 
             L3Inst::Bin { op, dst, a, b, ty } => {

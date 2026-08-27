@@ -125,6 +125,10 @@ impl Arm64CodeGen {
 
     fn gen_inst(&mut self, func: &L3Function, inst: &L3Inst) {
         match inst {
+            L3Inst::AddrOfSlot { dst, slot } => {
+                let d = vreg_to_reg(dst);
+                self.emit(&format!("    add {}, fp, #-{}", d, slot.0));
+            }
             L3Inst::Mov { dst, src } => {
                 let d = vreg_to_reg(dst);
                 match src {

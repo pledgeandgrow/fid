@@ -114,11 +114,11 @@ automatic and safe.
 **Impact:** High — eliminates the #1 runtime error in ML
 
 ```
-comptime pf verify_shapes(input: TensorShape, weight: TensorShape) -> bool {
+comptime fn verify_shapes(input: TensorShape, weight: TensorShape) -> bool {
     input.cols == weight.rows
 }
 
-pf linear(input: Tensor<f32, [batch, in_dim]>, weight: Tensor<f32, [in_dim, out_dim]>)
+fn linear(input: Tensor<f32, [batch, in_dim]>, weight: Tensor<f32, [in_dim, out_dim]>)
     -> Tensor<f32, [batch, out_dim]>
     where comptime verify_shapes(input.shape(), weight.shape())
 {
@@ -145,20 +145,20 @@ launch) and are hard to debug. Fides catches them at compile time.
 // Mark operations as differentiable
 effect Diff;  // new effect: "this operation supports autodiff"
 
-pf matmul(a: Tensor, b: Tensor) -> Tensor !{Diff, Alloc} {
+fn matmul(a: Tensor, b: Tensor) -> Tensor !{Diff, Alloc} {
     // Differentiable matmul
 }
 
-pf relu(x: Tensor) -> Tensor !{Diff} {
+fn relu(x: Tensor) -> Tensor !{Diff} {
     // Differentiable activation
 }
 
-pf load_model(path: String) -> Model !IO {
+fn load_model(path: String) -> Model !IO {
     // NOT differentiable — has IO effect
 }
 
 // The compiler verifies: is this model differentiable?
-pf forward(model: Model, input: Tensor) -> Tensor !{Diff, Alloc} {
+fn forward(model: Model, input: Tensor) -> Tensor !{Diff, Alloc} {
     let h1 = matmul(input, model.w1);  // !{Diff, Alloc} — OK
     let a1 = relu(h1);                 // !{Diff} — OK
     let h2 = matmul(a1, model.w2);     // !{Diff, Alloc} — OK
@@ -167,7 +167,7 @@ pf forward(model: Model, input: Tensor) -> Tensor !{Diff, Alloc} {
 }
 
 // This would be a COMPILE ERROR:
-pf bad_forward(model: Model, input: Tensor) -> Tensor !{Diff} {
+fn bad_forward(model: Model, input: Tensor) -> Tensor !{Diff} {
     let m = load_model("weights.bin");  // ERROR: load_model has !IO, not !{Diff}
     matmul(input, m.w1)
 }
@@ -188,10 +188,10 @@ discovered at runtime. Fides makes it a compile-time property.
 **Impact:** Critical — zero-downtime model updates
 
 ```
-pf serve_model() {
+fn serve_model() {
     // Model weights persist across hot reloads
-    persist pv weights: Tensor<f32, [4096, 4096]> = load_weights("v1.bin");
-    persist pv kv_cache: KVCache = KVCache::new();
+    persist val weights: Tensor<f32, [4096, 4096]> = load_weights("v1.bin");
+    persist val kv_cache: KVCache = KVCache::new();
 
     // Inference loop
     loop {
@@ -222,7 +222,7 @@ code while keeping weights in memory — zero downtime.
 
 ```
 // Load a custom activation function from an untrusted source
-pf run_custom_activation(plugin: extern fn(Tensor) -> Tensor, input: Tensor) -> Tensor {
+fn run_custom_activation(plugin: extern fn(Tensor) -> Tensor, input: Tensor) -> Tensor {
     sandbox {
         // Plugin CANNOT do IO, Net, or Spawn
         // It can only compute on the input tensor
@@ -301,10 +301,10 @@ strips this code at compile time.
 
 ```
 // Specialize a GEMM kernel for exact shapes at compile time
-comptime pf gemm_kernel(M: usize, N: usize, K: usize) -> String {
+comptime fn gemm_kernel(M: usize, N: usize, K: usize) -> String {
     // Generate a kernel string specialized for these exact dimensions
     f"""
-    pf gemm_{M}_{N}_{K}(a: Tensor<f32, [{M}, {K}]>,
+    fn gemm_{M}_{N}_{K}(a: Tensor<f32, [{M}, {K}]>,
                         b: Tensor<f32, [{K}, {N}]>)
         -> Tensor<f32, [{M}, {N}]> !{Alloc} {{
         // Unrolled loops for exact dimensions — no loop overhead
@@ -376,21 +376,22 @@ ML1: Region-scoped GPU memory       ✅ DONE — solves the #1 GPU bug class
 ML4: Hot-swap model weights         ✅ DONE — zero-downtime serving killer feature
 ML2: comptime shape verification    ✅ DONE — eliminates #1 ML runtime error
 ML-RT: @realtime enforcement        ✅ DONE — edge AI, robotics, autonomous systems
-ML3: Effect-traced autodiff         ✅ DONE — compile-time differentiability proof
+ML3: Effect-traced autodiff         ⚠️ PARTIAL — typechecker proves differentiability; autograd transform is no-op (Issue 7)
 ML8: comptime kernel specialization ✅ DONE — zero-cost kernel specialization
 ML9: KV cache with sliding window   ✅ DONE — bounded KV cache for LLM serving
 ML10: Real quantization (INT8)      ✅ DONE — q8 quantize/dequantize, qmatmul, @quantized
-ML11: Gradient checkpointing        ✅ DONE — @checkpoint annotation verification
-ML12: Differential privacy          ✅ DONE — @dp(epsilon), Noise effect, noise injection
-ML13: Tensor parallelism            ✅ DONE — @shard, Comm effect, all-reduce/broadcast
+ML11: Gradient checkpointing        ⚠️ PARTIAL — typechecker verifies @checkpoint; no runtime activation saving
+ML12: Differential privacy          ⚠️ PARTIAL — @dp(epsilon) verified, noise builtins work; no epsilon budget tracking
+ML13: Tensor parallelism            ⚠️ PARTIAL — @shard verified, comm builtins are no-ops in single-device mode
 ML14: LoRA/Adapter hot-swap         ✅ DONE — @adapter annotation, adapter-only weight updates
 ```
 
 ## What's Next (August 2026)
 
-**All 14 ML features are now implemented.** Fides covers the full spectrum
+**10 of 14 ML features are fully implemented; 4 are partially implemented
+(typechecker verification only).** Fides covers the full spectrum
 of AI/ML systems programming: safety (ML1, ML2, ML-RT), serving (ML4, ML9),
-performance (ML8, ML10), correctness (ML3, ML11), security (ML5, ML7, ML12),
+performance (ML8, ML10), correctness (ML3 ⚠️, ML11 ⚠️), security (ML5, ML7, ML12 ⚠️),
 edge deployment (ML6), distributed inference (ML13), and fine-tuning (ML14).
 
 ### Tensor Stdlib — ✅ Fixed
@@ -402,13 +403,13 @@ to 24-byte memory blocks from `stdlib/core.fd`). Fixed by adding
 `arg_to_vec_i64()` and `read_raw_vec_i64()` helpers. `test_tensor.fd`,
 `test_shape.fd`, and `test_shape_verify.fd` all pass now.
 
-### Summary: 14 of 14 ML features implemented
+### Summary: 10 of 14 ML features fully implemented, 4 partial
 
 | Feature | Status | Impact |
 |---------|--------|--------|
 | ML1: Region-scoped GPU memory | ✅ Done | Critical — GPU memory safety |
 | ML2: Comptime shape verification | ✅ Done | High — eliminates #1 ML runtime error |
-| ML3: Effect-traced autodiff | ✅ Done | High — compile-time differentiability |
+| ML3: Effect-traced autodiff | ⚠️ Partial | Partial — typechecker only, no gradients (Issue 7) |
 | ML4: Hot-swap model weights | ✅ Done | Critical — zero-downtime serving |
 | ML5: sandbox for plugins | ✅ Done | High — safe model marketplaces |
 | ML6: SRAM budget for edge AI | ✅ Done | High — embedded AI deployment |
@@ -417,9 +418,9 @@ to 24-byte memory blocks from `stdlib/core.fd`). Fixed by adding
 | ML-RT: @realtime enforcement | ✅ Done | High — edge AI, robotics |
 | ML9: KV cache with sliding window | ✅ Done | Critical — bounded KV cache for LLM serving |
 | ML10: Real quantization (INT8) | ✅ Done | High — INT8 inference, @quantized annotation |
-| ML11: Gradient checkpointing | ✅ Done | High — @checkpoint, memory-efficient training |
-| ML12: Differential privacy | ✅ Done | High — @dp(epsilon), Noise effect, privacy guarantees |
-| ML13: Tensor parallelism | ✅ Done | High — @shard, Comm effect, multi-GPU inference |
+| ML11: Gradient checkpointing | ⚠️ Partial | Partial — typechecker only, no runtime checkpointing |
+| ML12: Differential privacy | ⚠️ Partial | Partial — no epsilon budget tracking |
+| ML13: Tensor parallelism | ⚠️ Partial | Partial — comm builtins are no-ops in single-device |
 | ML14: LoRA/Adapter hot-swap | ✅ Done | Medium — @adapter, fine-tuning without retraining |
 
 ## The Story
@@ -441,7 +442,7 @@ to 24-byte memory blocks from `stdlib/core.fd`). Fixed by adding
 > - ✅ Shard tensors across GPUs with @shard and Comm effect (ML13)
 > - ✅ Hot-swap LoRA adapters without touching base weights (ML14)
 >
-> All 14 ML features are implemented. No other language — not Python, not C++,
+> 10 of 14 ML features are fully implemented; 4 are partial (typechecker only). No other language — not Python, not C++,
 > not Rust, not Zig, not Mojo — can do ALL of these. Fides's unique combination
 > of regions + capabilities + effects + comptime + hot reload + custom toolchain
 > makes this possible.
@@ -527,8 +528,8 @@ ROS2 has neither. Juliet has hot reload but is proprietary.
 
 ```
 // Robot control loop with hot reload
-pf control_loop() {
-    persist pv pid_state: PIDState = PIDState::new();
+fn control_loop() {
+    persist val pid_state: PIDState = PIDState::new();
 
     loop {
         let sensor = read_sensor();  // !IO
@@ -541,7 +542,7 @@ pf control_loop() {
 }
 
 // Safety: prove the control loop can't spawn threads
-pf control_loop() !{IO, Alloc} {  // no Spawn, no Net
+fn control_loop() !{IO, Alloc} {  // no Spawn, no Net
     // Compiler proves: this loop cannot spawn processes or make network calls
     // Critical for safety-critical robotics certification
 }
@@ -587,7 +588,7 @@ safe *by construction*, not safe *by linting*.
 
 ```
 // Brake controller — prove it can't do IO except sensor/actuator
-pf brake_controller() !{IO, Alloc} {
+fn brake_controller() !{IO, Alloc} {
     // Compiler PROVES: no network, no file system, no thread spawning
     // This is what ISO 26262 ASIL-D requires — currently verified by
     // expensive static analysis tools. Fides does it in the compiler.
@@ -679,7 +680,7 @@ is impossible to express in a language where external calls require an
 
 ```
 // Token contract — prove no reentrancy
-pf transfer(from: Account, to: Account, amount: u64) !{IO} {
+fn transfer(from: Account, to: Account, amount: u64) !{IO} {
     sandbox {
         // No external calls possible inside sandbox
         // Reentrancy attack is a COMPILE ERROR, not a runtime check
@@ -689,7 +690,7 @@ pf transfer(from: Account, to: Account, amount: u64) !{IO} {
 }
 
 // Prove a contract can't call other contracts
-pf pure_computation(x: u64) -> u64 !{} {
+fn pure_computation(x: u64) -> u64 !{} {
     // Compiler proves: no IO, no external calls, pure math only
     x * 2 + 1
 }
@@ -736,9 +737,9 @@ is a constant complaint.
 
 ```
 // Game loop with hot reload
-pf game_loop() {
-    persist pv player_pos: Vec3 = Vec3::new(0, 0, 0);
-    persist pv enemy_ai_state: AIState = AIState::Patrol;
+fn game_loop() {
+    persist val player_pos: Vec3 = Vec3::new(0, 0, 0);
+    persist val enemy_ai_state: AIState = AIState::Patrol;
 
     loop {
         let input = poll_input();  // !IO
@@ -753,7 +754,7 @@ pf game_loop() {
 }
 
 // Prove render code can't modify game state
-pf render(state: &GameState) !{IO} {
+fn render(state: &GameState) !{IO} {
     // No Alloc effect → can't allocate during render
     // No Write effect → can't modify game state
     // Just reads state and draws
@@ -809,9 +810,9 @@ region sensor with budget(4096) {
 }
 
 // OTA update without restart
-pf sensor_loop() {
-    persist pv calibration: f32 = 1.0;
-    persist pv readings: [f32; 64] = [0.0; 64];
+fn sensor_loop() {
+    persist val calibration: f32 = 1.0;
+    persist val readings: [f32; 64] = [0.0; 64];
 
     loop {
         let raw = read_adc();  // !IO

@@ -16,6 +16,104 @@ use crate::ast::*;
 use crate::ir::*;
 use std::collections::HashMap;
 
+/// Determine effects for runtime builtin functions (p_* functions).
+/// Functions that mutate data have Write effect; functions that allocate
+/// have Alloc effect; IO functions have IO effect. This prevents the
+/// optimizer from treating side-effecting runtime calls as pure.
+fn runtime_effects(name: &str) -> Option<EffectSet> {
+    let mut effects = EffectSet::new();
+    // Mutating vec operations
+    if matches!(name,
+        "p_vec_push" | "p_vec_push_str" | "p_vec_set" | "p_vec_clear"
+        | "p_vec_insert" | "p_vec_remove" | "p_vec_reverse" | "p_vec_extend"
+        | "p_vec_truncate" | "p_vec_sort" | "p_vec_resize"
+    ) {
+        effects.add(Effect::Write);
+        return Some(effects);
+    }
+    // Allocating functions
+    if matches!(name,
+        "p_vec_new" | "p_vec_new_with" | "p_vec_clone"
+        | "p_malloc" | "p_alloc" | "p_free"
+        | "p_str_concat" | "p_to_str" | "p_char_to_str" | "p_float_to_str" | "p_bool_to_str"
+        | "p_string_replace" | "p_string_split" | "p_string_trim"
+        | "p_string_to_uppercase" | "p_string_to_lowercase"
+    ) {
+        effects.add(Effect::Alloc);
+        return Some(effects);
+    }
+    // IO functions (print, panic, etc.)
+    if name.starts_with("p_print") || name == "p_panic" || name.starts_with("p_write") {
+        effects.add(Effect::IO);
+        return Some(effects);
+    }
+    // Map mutation
+    if matches!(name,
+        "p_map_insert" | "p_map_remove" | "p_map_clear" | "p_map_set"
+    ) {
+        effects.add(Effect::Write);
+        return Some(effects);
+    }
+    // String mutation
+    if matches!(name, "p_string_copy" | "p_str_copy" | "p_str_free") {
+        effects.add(Effect::Write);
+        return Some(effects);
+    }
+    // Atomic operations
+    if name.starts_with("p_atomic_") {
+        effects.add(Effect::Write);
+        return Some(effects);
+    }
+    // Channel operations
+    if name.starts_with("p_chan_") {
+        effects.add(Effect::IO);
+        return Some(effects);
+    }
+    // Mutex operations
+    if name.starts_with("p_mutex_") {
+        effects.add(Effect::Write);
+        return Some(effects);
+    }
+    // RC operations
+    if name.starts_with("p_rc_") {
+        effects.add(Effect::Write);
+        return Some(effects);
+    }
+    // Tensor operations (may allocate)
+    if name.starts_with("p_tensor_") {
+        effects.add(Effect::Alloc);
+        return Some(effects);
+    }
+    // File/IO operations
+    if name.starts_with("p_file_") || name.starts_with("p_fs_") || name.starts_with("p_socket_") {
+        effects.add(Effect::IO);
+        return Some(effects);
+    }
+    // DL operations
+    if name.starts_with("p_dl_") {
+        effects.add(Effect::IO);
+        return Some(effects);
+    }
+    // KV cache, quantization, etc.
+    if name.starts_with("p_kv_cache_") || name.starts_with("p_quantize") || name.starts_with("p_dequantize") {
+        effects.add(Effect::Write);
+        return Some(effects);
+    }
+    // Noise operations
+    if name.starts_with("p_dp_") || name.starts_with("p_gaussian_") || name.starts_with("p_dropout") {
+        effects.add(Effect::Write);
+        return Some(effects);
+    }
+    // Comm operations
+    if matches!(name, "p_all_reduce" | "p_broadcast" | "p_all_gather" | "p_scatter"
+        | "p_send_tensor" | "p_recv_tensor")
+    {
+        effects.add(Effect::IO);
+        return Some(effects);
+    }
+    None
+}
+
 /// Check if an IrType is a vec struct type and return its name
 fn get_vec_type_name(ty: &IrType) -> Option<String> {
     match ty {
@@ -706,6 +804,31 @@ impl Lowerer {
             vec![IrType::I64], IrType::Void);
         self.module.add_extern("p_dl_call",
             vec![IrType::I64, IrType::I64], IrType::I64);
+
+        // Vec runtime builtins (used by stdlib/vec.fd methods)
+        // These use the runtime calling convention (no env_ptr).
+        self.module.add_extern("p_vec_new", vec![], IrType::I64);
+        self.module.add_extern("p_vec_push", vec![IrType::I64, IrType::I64], IrType::Void);
+        self.module.add_extern("p_vec_push_str", vec![IrType::I64, IrType::Ptr(Box::new(IrType::U8))], IrType::Void);
+        self.module.add_extern("p_vec_pop", vec![IrType::I64], IrType::I64);
+        self.module.add_extern("p_vec_len", vec![IrType::I64], IrType::I64);
+        self.module.add_extern("p_vec_get", vec![IrType::I64, IrType::I64], IrType::I64);
+        self.module.add_extern("p_vec_set", vec![IrType::I64, IrType::I64, IrType::I64], IrType::Void);
+        self.module.add_extern("p_vec_is_empty", vec![IrType::I64], IrType::Bool);
+        self.module.add_extern("p_vec_clear", vec![IrType::I64], IrType::Void);
+        self.module.add_extern("p_vec_capacity", vec![IrType::I64], IrType::I64);
+        self.module.add_extern("p_vec_insert", vec![IrType::I64, IrType::I64, IrType::I64], IrType::Void);
+        self.module.add_extern("p_vec_remove", vec![IrType::I64, IrType::I64], IrType::I64);
+        self.module.add_extern("p_vec_contains", vec![IrType::I64, IrType::I64], IrType::Bool);
+        self.module.add_extern("p_vec_reverse", vec![IrType::I64], IrType::Void);
+        self.module.add_extern("p_vec_first", vec![IrType::I64], IrType::I64);
+        self.module.add_extern("p_vec_last", vec![IrType::I64], IrType::I64);
+        self.module.add_extern("p_vec_extend", vec![IrType::I64, IrType::I64], IrType::Void);
+        self.module.add_extern("p_vec_truncate", vec![IrType::I64, IrType::I64], IrType::Void);
+        self.module.add_extern("p_vec_sort", vec![IrType::I64], IrType::Void);
+        self.module.add_extern("p_vec_clone", vec![IrType::I64], IrType::I64);
+        self.module.add_extern("p_vec_resize", vec![IrType::I64, IrType::I64], IrType::Void);
+        self.module.add_extern("p_vec_new_with", vec![IrType::I64], IrType::I64);
     }
 
     /// Lower a single function
@@ -920,6 +1043,9 @@ impl Lowerer {
         };
 
         if !has_terminator {
+            // Emit compiler-inserted drops for locals with Drop impls
+            self.emit_drops();
+
             // Emit defer blocks before implicit return
             self.emit_defers();
 
@@ -1300,8 +1426,15 @@ impl Lowerer {
                     });
                 }
                 self.allocas.insert(name.clone(), alloca);
+                // Drop trait: check if the declared type has a Drop impl.
+                // Do this before borrowing current_func mutably.
+                let drop_struct = ty.as_ref().and_then(|t| self.type_struct_name(t))
+                    .filter(|sn| self.has_drop_impl(sn));
                 if let Some(ref mut f) = self.current_func {
                     f.bind_local(name, alloca);
+                    if let Some(struct_name) = drop_struct {
+                        f.drop_locals.push((alloca, struct_name));
+                    }
                 }
             }
             Stmt::LetUninit { name, ty, line: _ } => {
@@ -1621,6 +1754,9 @@ impl Lowerer {
             }
 
             Stmt::Return(expr, _) => {
+                // Emit compiler-inserted drops for locals with Drop impls
+                self.emit_drops();
+
                 // Emit defer blocks before returning (in reverse order)
                 self.emit_defers();
 
@@ -1750,11 +1886,14 @@ impl Lowerer {
                 self.region_stack.pop();
                 if *is_gpu { self.gpu_region_stack.pop(); }
                 // Emit RegionEnd — frees all memory allocated in this region.
-                self.emit_inst(Inst::RegionEnd {
-                    name: name.clone(),
-                    is_gpu: *is_gpu,
-                    is_kv_cache: *is_kv_cache,
-                });
+                // Issue 48 pattern: don't emit if block already has a terminator (e.g. return)
+                if !self.current_block_has_terminator() {
+                    self.emit_inst(Inst::RegionEnd {
+                        name: name.clone(),
+                        is_gpu: *is_gpu,
+                        is_kv_cache: *is_kv_cache,
+                    });
+                }
             }
             Stmt::ComptimeGen { .. } => {}
             Stmt::Sandbox { body, .. } => {
@@ -1775,7 +1914,13 @@ impl Lowerer {
                 for s in body {
                     self.lower_stmt(s);
                 }
-                self.emit_inst(Inst::UnsafeEnd);
+                // Issue 48: Don't emit UnsafeEnd if the block already has a
+                // terminator (e.g. `return` inside unsafe). The verifier
+                // rejects blocks that don't end with a terminator, and
+                // UnsafeEnd after a Return would be unreachable + violate that.
+                if !self.current_block_has_terminator() {
+                    self.emit_inst(Inst::UnsafeEnd);
+                }
             }
             Stmt::Txn { body, .. } => {
                 // Transaction block — emit TxnBegin, lower body, emit TxnEnd.
@@ -1788,16 +1933,26 @@ impl Lowerer {
                 for s in body {
                     self.lower_stmt(s);
                 }
-                self.emit_inst(Inst::TxnEnd);
+                // Issue 48 pattern: don't emit TxnEnd if block already terminated
+                if !self.current_block_has_terminator() {
+                    self.emit_inst(Inst::TxnEnd);
+                }
             }
-            Stmt::GradBlock { body, .. } => {
-                // The autograd transform happens later; lower the body as normal statements.
+            Stmt::GradBlock { var, body, .. } => {
+                // Emit GradBegin to enable gradient tracking in the interpreter.
+                self.emit_inst(Inst::GradBegin { var_name: var.clone() });
                 for s in body {
                     self.lower_stmt(s);
                 }
+                // Emit GradEnd to disable gradient tracking.
+                if !self.current_block_has_terminator() {
+                    self.emit_inst(Inst::GradEnd);
+                }
             }
-            Stmt::Backward { .. } => {
-                // Marker for the autograd pass — emit nothing here.
+            Stmt::Backward { loss, .. } => {
+                // Emit Backward instruction — triggers reverse-mode AD.
+                let loss_val = self.lower_expr(loss);
+                self.emit_inst(Inst::Backward { loss: loss_val });
             }
             Stmt::Query { body, .. } => {
                 for s in body { self.lower_stmt(s); }
@@ -3001,6 +3156,8 @@ impl Lowerer {
                     let mut effects = EffectSet::new();
                     if callee.starts_with("__pledge") {
                         effects.add(Effect::IO);
+                    } else if let Some(e) = runtime_effects(callee) {
+                        effects.add_all(&e);
                     } else if let Some(e) = self.module.function_effects.get(callee) {
                         effects.add_all(e);
                     }
@@ -3020,6 +3177,8 @@ impl Lowerer {
                         effects.add(Effect::IO);
                     } else if callee.starts_with("__pledge") {
                         effects.add(Effect::IO);
+                    } else if let Some(e) = runtime_effects(callee) {
+                        effects.add_all(&e);
                     } else {
                         // User function — look up effects
                         if let Some(e) = self.module.function_effects.get(callee) {
@@ -3256,7 +3415,7 @@ impl Lowerer {
                     }
                 }
                 // Regular method call: receiver is a value, pass as first arg
-                let recv_val = self.lower_expr(receiver);
+                let mut recv_val = self.lower_expr(receiver);
 
                 // Rc<T> / Arc<T> method dispatch — refcount operations
                 let recv_ty = self.get_value_type(recv_val);
@@ -3452,9 +3611,27 @@ impl Lowerer {
                     }
                 }
 
+                // Issue 45: Auto-deref &mut T for method calls.
+                // If recv_ty is Ptr(Ptr(...)), load through the reference first.
+                let recv_ty = if let IrType::Ptr(ref inner) = recv_ty {
+                    if let IrType::Ptr(_) = inner.as_ref() {
+                        recv_val = self.emit_inst(Inst::Load { ptr: recv_val, ty: IrType::I64 });
+                        self.get_value_type(recv_val)
+                    } else {
+                        recv_ty
+                    }
+                } else {
+                    recv_ty
+                };
+
                 let struct_name = match &recv_ty {
                     IrType::Ptr(inner) => match inner.as_ref() {
                         IrType::Struct(name) => Some(name.clone()),
+                        // Auto-deref: Ptr(Ptr(Struct(name))) → &mut T where T is a struct
+                        IrType::Ptr(inner2) => match inner2.as_ref() {
+                            IrType::Struct(name) => Some(name.clone()),
+                            _ => None,
+                        },
                         _ => None,
                     },
                     IrType::Struct(name) => Some(name.clone()),
@@ -4238,6 +4415,7 @@ impl Lowerer {
                     self.emit_terminator(Inst::Jump { target: try_err_block });
                 } else {
                     // Not inside a try block: return the error from the current function
+                    self.emit_drops();
                     self.emit_defers();
                     if self.current_sret.is_some() {
                         self.emit_terminator(Inst::Return { value: None });
@@ -5732,6 +5910,56 @@ impl Lowerer {
         let defers: Vec<Vec<Stmt>> = self.defer_stack.drain(..).rev().collect();
         for body in defers {
             self.lower_stmts(&body);
+        }
+    }
+
+    /// Emit compiler-inserted drop calls for all local variables whose type
+    /// implements Drop. Called before every Return and at function end.
+    /// Drops are emitted in reverse declaration order (LIFO — last declared
+    /// is dropped first, matching Rust's drop order).
+    fn emit_drops(&mut self) {
+        // Collect (alloca_ptr, struct_name) pairs for locals with Drop impls.
+        // Clone first to avoid borrowing self while emitting.
+        let drop_locals: Vec<(ValueId, String)> = if let Some(ref f) = self.current_func {
+            f.drop_locals.clone()
+        } else {
+            return;
+        };
+        // Emit drops in reverse order (LIFO)
+        for (alloca, struct_name) in drop_locals.into_iter().rev() {
+            // Only emit if the current block doesn't already have a terminator
+            if self.current_block_has_terminator() {
+                break;
+            }
+            // Mangle: struct_name + "_drop"
+            let drop_fn = format!("{}_drop", struct_name);
+            // Load the struct value from the alloca
+            let val = self.emit_inst(Inst::Load {
+                ptr: alloca,
+                ty: IrType::I64,
+            });
+            // User functions expect a dummy env_ptr as the first argument
+            let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+            self.emit_inst(Inst::Call {
+                func: drop_fn,
+                args: vec![dummy_env, val],
+                ret_ty: IrType::Void,
+                effects: EffectSet::new(),
+            });
+        }
+    }
+
+    /// Check if a struct type has a Drop impl (a `drop` method).
+    fn has_drop_impl(&self, struct_name: &str) -> bool {
+        self.impl_methods.contains_key(&(struct_name.to_string(), "drop".to_string()))
+    }
+
+    /// Extract the struct name from a Type, if it's a Named or Generic type.
+    fn type_struct_name(&self, ty: &Type) -> Option<String> {
+        match ty {
+            Type::Named(name) => Some(name.clone()),
+            Type::Generic { name, .. } => Some(name.clone()),
+            _ => None,
         }
     }
 

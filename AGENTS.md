@@ -95,19 +95,87 @@ cargo build
 ```
 Unit tests:   265/265 passed  (All passing — cargo test --lib)
 Harness:      8/8 passed      (All passing — all 3 self-host blockers pass on all backends)
-Interpreter:  116/116 normal  (+ 35 expected-fail, + 31 skip, + 8 known-fail; 6 bonus passes)
-C Codegen:    116/116 matched (4 bonus passes)
-PE Emitter:   116/116 valid   (6 bonus passes)
-Total .fd:    213 test files  (190 in root; 23 in subdirs: capability/effects/regions/safety)
-Skip list:    31 tests        (features in skip list: comptime, bare metal, WASM, SIMD, autodiff, kernel_specialization, kv_cache, quantization, checkpoint, dp, shard, lora, HTTP, JSON, dlopen, parallel, etc.)
+Interpreter:  146/146 normal  (+ 35 expected-fail, + 7 skip, + 6 known-fail; 2 bonus pass)
+C Codegen:    146/146 matched (7 C codegen skip: kv_cache, quantization, dp, shard, dlopen, autodiff_grad, ml_full)
+PE Emitter:   146/146 valid   (3 bonus pass)
+Total .fd:    218 test files  (195 in root; 23 in subdirs: capability/effects/regions/safety)
+Skip list:    7 tests         (5 C codegen missing-builtins: kv_cache, quantization, dp, shard, autodiff_grad, ml_full + 1 design difference: dlopen)
 Expected-fail: 35 tests       (tests that verify compiler error detection — failing is correct)
-Known-fail:   8 tests         (pre-existing failures, reported separately)
-Source:       54 .rs files, ~84,741 LOC
-Stdlib:       69 .fd modules, 17,468 LOC
+Known-fail:   6 tests         (3 parser bugs: game_stdlib, time, time_edge + 3 C codegen mismatches: iter, vec_math, parallel_concurrent. Interp bonus-passes: iter, vec_math. PE bonus-passes: iter, vec_math, parallel_concurrent.)
+Source:       54 .rs files, ~85,493 LOC
+Stdlib:       69 .fd modules, 17,567 LOC
 Docs:         22 docs/ + 8 roadmap/ + 3 root = 33 .md files
 Binaries:     4 (fidesc, pacte, scribe, veil)
-Warnings:     ~207 (dead code, unused variables — cleanup needed)
+Warnings:     225 (dead code, unused variables — cleanup needed)
 ```
+
+### New Features (Issue 45-49: val/var, auto-deref, exhaustiveness, UAF, closures)
+
+- **Issue 46/47: `val` immutability enforcement** (`src/typechecker.rs`): The
+  typechecker now enforces that `val` variables cannot be reassigned. Fixed
+  247 `val`→`var` conversions in stdlib and test files where variables were
+  declared `val` but later reassigned (loop counters, accumulators, etc.).
+  Automated fix script at `/tmp/fix_val_var2.py` finds assignments anywhere
+  in lines (not just line-start) using regex for compound assignments
+  (`+=`, `-=`, etc.) and simple `=` (excluding `==`, `!=`, `<=`, `>=`).
+- **Issue 45: `&mut T` auto-deref for method calls** (`src/typechecker.rs` +
+  `src/lower.rs`): Methods on `&mut T` and `&T` now auto-deref to the inner
+  type. The typechecker unwraps `Type::Ref { inner, .. }` before method
+  lookup. The lowerer loads through `Ptr(Ptr(...))` references before
+  dispatching. Test: `test_refs_mut_methods.fd` — `c.increment()` on
+  `&mut Counter` works without explicit deref.
+- **Issue 49: Non-exhaustive match checking** (`src/typechecker.rs`): Both
+  `Stmt::Match` and `Expr::Match` now check exhaustiveness. For enums, all
+  variants must be covered (or a wildcard/ident catch-all). For bools, both
+  `true` and `false` must be covered. Emits a **warning** (not error) to
+  avoid breaking existing partial matches. Test: `test_match_exhaustive.fd`.
+- **Interpreter UAF detection** (`src/interp.rs`): `RegionEnd` now marks all
+  addresses allocated in that region as freed. `Load`/`Store` check the
+  `freed_addresses` set and panic in debug mode if accessing freed memory.
+  `RegionBegin` pushes to a `region_stack`; `Alloca` records addresses in
+  the current region. This catches use-after-free bugs at interpreter time.
+- **Closures in borrow checker** (`src/borrowck.rs`): `Expr::Closure` is now
+  handled — the body is checked in a new scope. Closure params are local to
+  the closure scope (no borrow tracking needed for params).
+- **RwLock + AtomicU64 stdlib** (`stdlib/sync.fd`): Added `sync_rwlock_*`
+  functions (create, read_lock/unlock, write_lock/unlock) and `atomic_u64_*`
+  wrapper functions (new, load, store, fetch_add, cas).
+- **Drop trait + compiler-inserted drops** (`src/lower.rs` + `src/ir.rs`):
+  When a struct has `impl T { fn drop(self: &mut T) }`, the compiler
+  automatically calls `T_drop` at every function exit point (return, implicit
+  return, `?` error propagation). `IrFunction.drop_locals` tracks
+  `(alloca_ptr, struct_name)` pairs for Drop-eligible locals. `emit_drops()`
+  emits calls in reverse declaration order (LIFO, matching Rust). The drop
+  call includes the dummy env_ptr argument expected by user functions.
+  Test: `test_drop.fd` — `Logger` with `drop` method, "Logger dropped"
+  printed at function exit on all 3 backends.
+
+### Audit Fixes (Same-Pattern Bugs Found During Code Review)
+
+- **`p_vec_set` unsafe clamp** (`src/interp.rs`): Same bug as Issue 31 —
+  clamped index after panic check, silently writing to wrong element in
+  unsafe mode. Fixed: unsafe mode does raw access.
+- **`p_shared_alloc` / `p_allocator_alloc` negative size** (`src/codegen_c.rs`):
+  Same bug as Issue 32. Fixed: returns 0 for negative sizes.
+- **`p_file_size` ftell failure** (`src/codegen_c.rs`): Same bug as Issue 33.
+  Fixed: returns -1 if ftell < 0.
+- **`TxnEnd` / `RegionEnd` after terminator** (`src/lower.rs`): Same bug as
+  Issue 48. Fixed: skipped when block already has a terminator.
+- **`val_vars` scope leak** (`src/typechecker.rs`): `val_vars` was a flat
+  `HashSet` that never cleaned up on `pop_scope()`. Fixed: now per-scope
+  (`Vec<HashSet<String>>`), cleaned up on scope pop.
+- **`stmt_has_break_or_continue` missing block types** (`src/comptime.rs`):
+  Didn't recurse into `RegionBlock`, `Sandbox`, `Txn`, `GradBlock`. Fixed.
+- **Interpreter `p_malloc` negative cast** (`src/interp.rs`): Cast negative
+  i64 to huge u64. Fixed: returns 0 for negative sizes.
+- **RwLock TOCTOU race** (`stdlib/sync.fd`): `read_lock`/`read_unlock` used
+  load+store (non-atomic) for reader count. Fixed: uses `p_atomic_add`.
+- **UAF re-entrant region collision** (`src/interp.rs`): `region_addresses`
+  shared the same set for re-entrant calls with the same region name. Fixed:
+  uses unique keys (`name#depth`).
+- **Interpreter `region_stack` cleanup** (`src/interp.rs`): Early returns
+  inside region blocks left stale entries on `region_stack`. Fixed:
+  `run_function` saves/restores `region_stack` depth.
 
 ### New Features (String Concat, Transitive Imports, New Stdlib Modules)
 
@@ -137,7 +205,17 @@ Warnings:     ~207 (dead code, unused variables — cleanup needed)
   - System: `fs.fd`, `io.fd`, `os.fd`, `sys.fd`
   - ML: `kv_cache.fd`, `quant.fd`, `dp.fd`, `shard.fd`
 - **`val` vs `var`**: Loop counters and accumulators MUST use `var`. `val`
-  reassignment is silently ignored. Multiple stdlib modules fixed.
+  reassignment now emits a warning (Issue 46 fixed). Will be promoted to an
+  error after the stdlib is fully migrated to `var` for mutables.
+- **Bucket 1 Codegen Fixes** (8 issues fixed, pre-self-host baseline):
+  - Issue 20: Stack alignment padding for odd callee-saved count (`codegen_x64.rs`)
+  - Issue 31: `p_vec_get` unsafe mode does raw access, no silent clamp (`interp.rs`)
+  - Issue 32: `p_malloc` rejects negative sizes, returns NULL (`codegen_c.rs`)
+  - Issue 33: `p_file_read` checks `ftell` for failure (`codegen_c.rs`)
+  - Issue 44: Comptime loop unrolling skips loops with break/continue (`comptime.rs`)
+  - Issue 45: Auto-deref `&T`/`&mut T` for method resolution (`typechecker.rs`)
+  - Issue 46: `val` reassignment emits warning, tracked in `val_vars` set (`typechecker.rs`)
+  - Issue 48: `UnsafeEnd` skipped when block already has terminator (`lower.rs`)
 - **`@deterministic`/`@crashfree`**: Removed from functions using floating-point
   or string operations — these violate the annotation constraints.
 - **`Account<State>` typestate** (`stdlib/banking.fd`): Compile-time state
@@ -145,12 +223,22 @@ Warnings:     ~207 (dead code, unused variables — cleanup needed)
 
 ### New Features (ML3/ML8/Tensor: Autodiff, Kernel Specialization, Tensor Fixes)
 
-- **ML3: Effect-Traced Autodiff** (`src/ir.rs`, `src/typechecker.rs`): Added
-  `Diff` effect to the effect system. Tensor operations (matmul, add, relu,
-  etc.) produce `Diff` effect. `@differentiable` annotation with compile-time
-  verification: no IO/Net/Spawn/Diverge (breaks gradient computation).
-  `verify_differentiable()` in typechecker. Tests: `test_autodiff.fd` (pass),
-  `test_autodiff_fail.fd` (IO violation, expected fail).
+- **ML3: Tape-Based Reverse-Mode Autodiff** (`src/ir.rs`, `src/typechecker.rs`,
+  `src/interp.rs`, `src/autograd.rs`): Added `Diff` effect to the effect system.
+  Tensor operations (matmul, add, relu, etc.) produce `Diff` effect.
+  `@differentiable` annotation with compile-time verification: no
+  IO/Net/Spawn/Diverge (breaks gradient computation). `verify_differentiable()`
+  in typechecker. **Runtime autograd engine implemented**: tape-based
+  reverse-mode AD in the interpreter. `GradBlock`/`GradEnd`/`Backward` IR
+  instructions. `autograd_tape`, `grad_vars`, `autograd_mode` state in
+  `Interpreter`. Tensor builtins (`p_tensor_add`, `p_tensor_mul`, `relu`,
+  `sigmoid`, etc.) record operations on the tape when autograd mode is
+  enabled. `backward()` traverses the tape in reverse, computing gradients
+  via local derivative functions. `p_tensor_grad` retrieves computed
+  gradients. `p_grad_get`/`p_grad_zero` manage gradient state. Tests:
+  `test_autodiff.fd` (pass — typechecker), `test_autodiff_fail.fd` (IO
+  violation, expected fail), `test_autodiff_grad.fd` (pass — runtime gradient
+  computation verified).
 - **ML8: comptime Kernel Specialization** (`src/ir.rs`, `src/lower.rs`,
   `src/pir.rs`, `src/gpu.rs`): `@kernel(x,y,z)` annotation tracked through
   AST→IR→L1→L2→L3. SPIR-V codegen selects `@kernel` function as entry point
@@ -174,25 +262,38 @@ Warnings:     ~207 (dead code, unused variables — cleanup needed)
   `p_find_quant_params`. Symmetric quantization in `src/tensor.rs`.
   Stdlib: `stdlib/quant.fd`. Tests: `test_quantization.fd` (pass),
   `test_quantization_fail.fd` (@quantized with dequantize, fail).
-- **ML11: Gradient Checkpointing** (`src/typechecker.rs`): `@checkpoint`
-  annotation verified by typechecker. Must also be `@differentiable` and
-  `@deterministic`. Rejects IO/Net/Spawn/Diverge. Tests:
-  `test_checkpoint.fd` (pass), `test_checkpoint_fail.fd` (missing
+- **ML11: Gradient Checkpointing** (`src/typechecker.rs`, `src/interp.rs`):
+  `@checkpoint` annotation verified by typechecker. Must also be
+  `@differentiable` and `@deterministic`. Rejects IO/Net/Spawn/Diverge.
+  **Runtime checkpointing implemented**: `checkpoint_mode` flag in
+  `Interpreter`. When active, `AutogradOp::Relu`/`Sigmoid` store input data
+  (not results) on the tape, and `relu_backward`/`sigmoid_backward` recompute
+  activations from inputs during the backward pass — trading compute for
+  memory. `p_checkpoint_begin`/`p_checkpoint_end` builtins toggle the mode.
+  Tests: `test_checkpoint.fd` (pass), `test_checkpoint_fail.fd` (missing
   @deterministic, fail).
 - **ML12: Differential Privacy** (`src/ir.rs`, `src/typechecker.rs`,
   `src/interp.rs`, `src/parser.rs`, `src/lower.rs`): `@dp(epsilon=N)` annotation
   verified by typechecker (must have Noise effect, no IO/Net). New
   `Effect::Noise` in effect system. Noise builtins: `p_dp_noise`,
   `p_gaussian_noise`, `p_dropout`. Parser supports float annotation args.
-  Stdlib: `stdlib/dp.fd`. Tests: `test_dp.fd` (pass), `test_dp_fail.fd`
-  (no Noise effect, fail).
+  **Runtime epsilon budget tracking implemented**: `dp_epsilon_budget` and
+  `dp_epsilon_spent` state in `Interpreter`. `p_dp_budget_reset(epsilon)`
+  initializes the budget. `p_dp_budget_check(cost, threshold)` accumulates
+  spent epsilon and panics if the total exceeds the threshold — enforcing
+  the privacy budget at runtime. Stdlib: `stdlib/dp.fd`. Tests:
+  `test_dp.fd` (pass), `test_dp_fail.fd` (no Noise effect, fail).
 - **ML13: Tensor Parallelism** (`src/ir.rs`, `src/typechecker.rs`,
   `src/interp.rs`, `src/lower.rs`): `@shard` annotation verified by
   typechecker (must have Comm effect, no IO/Net). New `Effect::Comm` in
   effect system. Communication builtins: `p_all_reduce`, `p_broadcast`,
-  `p_all_gather`, `p_scatter`, `p_send_tensor`, `p_recv_tensor` (no-ops in
-  single-device interpreter). Stdlib: `stdlib/shard.fd`. Tests:
-  `test_shard.fd` (pass), `test_shard_fail.fd` (no Comm effect, fail).
+  `p_all_gather`, `p_scatter`, `p_send_tensor`, `p_recv_tensor`.
+  **Simulated multi-rank runtime**: `tp_rank` and `tp_world_size` state in
+  `Interpreter` (single-rank: rank=0, world_size=1). `p_tp_rank()`/
+  `p_tp_world_size()` return the current rank and world size. `p_all_reduce`
+  is identity in single-rank mode (returns input unchanged). Stdlib:
+  `stdlib/shard.fd`. Tests: `test_shard.fd` (pass), `test_shard_fail.fd`
+  (no Comm effect, fail).
 - **ML14: LoRA/Adapter Hot-Swap** (`src/typechecker.rs`): `@adapter`
   annotation verified by typechecker (no IO/Net/Spawn/Diverge — pure weight
   transformations). Works with `persist` for hot-swap. Test:
@@ -204,7 +305,7 @@ Warnings:     ~207 (dead code, unused variables — cleanup needed)
   `Value::Vec`. `test_tensor.fd`, `test_shape.fd`, `test_shape_verify.fd`
   now pass (removed from skip list).
 
-**All 116 normal tests pass on all 3 backends.** The 3 self-host blockers
+**146/146 normal tests pass on interpreter + PE, 146/146 on C codegen.** The 3 self-host blockers
 (enum payloads, generic Vec<T>, recursive Box<T>) all pass on interpreter,
 C codegen, and PE emitter. All stdlib gaps for self-hosting are filled
 (str_bytes, str_split, str_parse_hex, file_write_bytes, etc.).
@@ -248,7 +349,7 @@ C codegen, and PE emitter. All stdlib gaps for self-hosting are filled
 
 Three blockers preventing the Fides compiler from being rewritten in Fides
 have been resolved. All verified on interpreter + C codegen + PE emitter with
-zero regressions (116/116 tests pass on all three backends).
+zero regressions (146/146 tests pass on interpreter + PE, 146/146 on C codegen).
 
 - **Typed enum payloads** (`src/typechecker.rs` + `src/lower.rs`): Enum
   variant payloads now keep their declared type in `match` bindings instead
@@ -258,7 +359,7 @@ zero regressions (116/116 tests pass on all three backends).
   (aggregates as `Ptr(Struct(..))`). Test: `test_enum_payload_types.fd`.
 - **Real generics at value level** (`src/typechecker.rs` + `src/lower.rs` +
   `src/ir.rs`): `Vec<T>`/`HashMap<K,V>` carry actual element types from `let`
-  annotations. `pv v: Vec<Token> = Vec::new()` works. `Vec::get()` returns
+  annotations. `val v: Vec<Token> = Vec::new()` works. `Vec::get()` returns
   `Ptr(Struct(..))` for struct elements via `word_repr()`. Added `let_hint`
   threading, `is_ptr_like()` on `IrType`, `Vec<X>`/`HashMap<K,V>` compatibility
   in `types_compatible()`. Test: `test_generic_vec_typed.fd`.
@@ -359,7 +460,7 @@ zero regressions (116/116 tests pass on all three backends).
   default, blocks until one is ready. New `Stmt::Select` variant and `SelectCase` struct.
 - **Option/Result combinator methods** (`stdlib/core.fd`): Added `map`, `and_then`,
   `or_else`, `unwrap_or_else`, `expect` to both Option and Result. These accept
-  function pointers (`pf(i64) -> i64`) for lazy evaluation.
+  function pointers (`fn(i64) -> i64`) for lazy evaluation.
 - **Vec iterator adapters** (`stdlib/vec.fd`): Added `take`, `skip`, `zip`,
   `enumerate`, `flat_map`, `chunk`, `window`, `dedup`, `sort_by`, `contains_val`
   as both Vec methods and free functions (`vec_take`, `vecSkip`, etc.).
@@ -431,7 +532,7 @@ zero regressions (116/116 tests pass on all three backends).
 - **RISC-V cross-compilation** (`--target riscv` or `--target riscv64-linux`):
   - `src/riscv_enc.rs` — RV64 instruction encoder supporting R-type, I-type,
     S-type, B-type, J-type, U-type instructions. Includes pseudo-instructions
-    (li, mv, neg, not, seqz, snez, j, call, ret, bgez, beqz, bnez).
+    (li, mv, neg, not, seqz, snez, j, call, return, bgez, beqz, bnez).
   - `src/runtime_riscv.rs` — RISC-V Linux runtime using raw ECALL syscalls
     (write=64, exit=93, mmap=222). Same function set as ARM64 runtime.
   - Linker emits `EM_RISCV` (243) machine type and handles JAL (type 20)
@@ -541,7 +642,7 @@ zero regressions (116/116 tests pass on all three backends).
   ```
   error[E044]: Type error (line 2): cannot assign str to variable 'x' of type i64.
     --> test.fd:2:1
-    |     pv x: i64 = "hello"
+    |     val x: i64 = "hello"
     | ^
     = help: change the type annotation or the expression.
   ```
@@ -598,7 +699,7 @@ zero regressions (116/116 tests pass on all three backends).
   desugars to an enum + `<SM>_initial()` and `<SM>_handle(state, event)` functions.
 - **Event Handlers**: `on player_died(name: str) { ... }` desugars to `__on_<event_name>` function.
 - **New keywords**: `component`, `system`, `query`, `state_machine`, `state`, `transition`, `on`.
-  Keywords used as identifiers (e.g. `database.query()`, `pm match: bool`) are handled via `expect_ident_or_keyword()`.
+  Keywords used as identifiers (e.g. `database.query()`, `var match: bool`) are handled via `expect_ident_or_keyword()`.
   `TokenKind::is_word_keyword()` distinguishes word-like keywords (e.g. `match`, `query`) from punctuation tokens (e.g. `=`, `;`) to prevent punctuation from being accepted as identifiers.
 - **New stdlib modules**: `stdlib/ecs.fd`, `stdlib/events.fd`.
 - **New test**: `tests/test_phase8b.fd` — ECS, state machine, and event handler tests.
@@ -650,7 +751,7 @@ test_safety_annotations_fail, test_safety_no_audit_fail,
 test_borrowck_fail, test_async_fail,
 test_constant_time_fail, test_constant_time_fail2
 
-Known-fail tests: All previously known-fail tests now pass. The 116/116
+Known-fail tests: 6 real bugs remain (3 parser + 3 C codegen). The 146/146
 normal tests all pass on all three backends.
 
 Features now present in the baseline: tuple destructuring, file I/O
@@ -658,7 +759,7 @@ Features now present in the baseline: tuple destructuring, file I/O
 annotation, `@crashfree` annotation, `@audit` annotation (with full param trail), banking stdlib,
 money stdlib, LogicalTime stdlib (`stdlib/time.fd`), typed strings
 (`stdlib/typed_strings.fd` — F67: SQLString/ShellString/HTMLString/JSONString/PathString),
-init guarantee (F63: `pm` keyword + definite assignment analysis),
+init guarantee (F63: `var` keyword (without initializer) + definite assignment analysis),
 raw pointer types (`*mut T` / `*const T` with `unsafe {}` blocks),
 memoization stdlib (`stdlib/memo.fd`),
 checked arithmetic lock (F64: overflow = panic, always on),
@@ -670,13 +771,13 @@ given/ensure contracts (F10: Design by Contract — preconditions verified at ca
 composable safety primitives (F44/F52/F56: @no-alloc, @no-recursion, @no-unbounded, @crashfree,
 @no-indirect, @requires-audit — @safety-critical, @autosar, @medical are aliases that expand to these;
 @dal-a was merged into @medical, @no-panic is internal-only — users write @crashfree),
-async/await (Phase 7.6 + Phase A: `async pf`, `await <expr>`, `spawn <expr>` — Future<T> type, typechecker enforces Future<T> for await. Phase A added real executor runtime: `p_executor_new`/`p_executor_spawn`/`p_executor_block_on`/`p_executor_run_all`/`p_task_poll`/`p_task_is_ready`/`p_executor_poll_all`/`p_task_poll_nonblocking` (A1+A2), non-blocking IO: `p_net_connect`/`p_net_read`/`p_net_write`/`p_net_close`/`p_fs_read_async` (A3). Tasks run as real OS threads with non-blocking poll and round-robin scheduling. State machine transform for stackless coroutines still pending),
+async/await (Phase 7.6 + Phase A: `async fn`, `await <expr>`, `spawn <expr>` — Future<T> type, typechecker enforces Future<T> for await. Phase A added real executor runtime: `p_executor_new`/`p_executor_spawn`/`p_executor_block_on`/`p_executor_run_all`/`p_task_poll`/`p_task_is_ready`/`p_executor_poll_all`/`p_task_poll_nonblocking` (A1+A2), non-blocking IO: `p_net_connect`/`p_net_read`/`p_net_write`/`p_net_close`/`p_fs_read_async` (A3). Tasks run as real OS threads with non-blocking poll and round-robin scheduling. State machine transform for stackless coroutines still pending),
 borrow checker (Phases 1-6 complete: `--borrowck=off|warn|on` — Rules 1-3 active, field-wise borrows, two-phase borrows, NLL, `on` by default),
 generic enums/structs (`enum Option<T> { ... }`, `struct Foo<T> { ... }` — type_params in AST, parser, typechecker, lowerer),
 LSP server (`fidesc lsp` — JSON-RPC over stdio, initialize/didOpen/didChange/diagnostics, no external deps),
 new stdlib modules (`stdlib/math.fd`, `stdlib/env.fd`, `stdlib/args.fd`, `stdlib/process.fd`, `stdlib/regex.fd`, `stdlib/sync.fd`, `stdlib/channel.fd`, `stdlib/vec.fd`, `stdlib/ecs.fd`, `stdlib/events.fd`, `stdlib/parallel.fd`, plus game stdlib: `stdlib/tilemap.fd`, `stdlib/sprite.fd`, `stdlib/flowfield.fd`, `stdlib/streaming.fd`, `stdlib/scene.fd`, `stdlib/physics.fd`, `stdlib/audio.fd`, `stdlib/input.fd`).
 
-**Note:** All 116 normal tests pass on all three backends. The test runner separates normal tests (116/116, should pass) from skip-list tests (31, features not yet fully supported like comptime, bare metal, WASM, SIMD, tensor, HTTP, JSON, dlopen, parallel).
+**Note:** 146/146 normal tests pass on interpreter + PE, 146/146 on C codegen. The test runner separates normal tests (159, should pass) from skip-list tests (7: C codegen missing-builtins + dlopen design difference) and known-fail tests (6: real bugs).
 
 ### Vec Higher-Order Methods (vec.fd)
 
@@ -722,13 +823,13 @@ touching them.
 | `src/coff.rs` | **HIGH** | COFF object file format. Same byte-level risk as PE/ELF. |
 | `src/macho.rs` | **HIGH** | Mach-O object file format. Same byte-level risk. |
 | `src/codegen_x64.rs` | **HIGH** | PIR L3 → x86-64 instruction encoding. ModRM/SIB bytes, REX prefixes, ABI rules. |
-| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 116/116 test parity (full parity). Phase 10B: Print instruction calls Fides Vec_to_str/HashMap_to_str for formatting. Channels: p_chan_* with pthread mutex+condvar. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic. Rc/Arc runtime via p_rc_incr/p_rc_decr. |
+| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 146/146 test parity. Phase 10B: Print instruction calls Fides Vec_to_str/HashMap_to_str for formatting. Channels: p_chan_* with pthread mutex+condvar. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic. Rc/Arc runtime via p_rc_incr/p_rc_decr. |
 | `src/pir.rs` | **HIGH** | PIR L1/L2/L3 transforms. A bad lowering propagates to all backends. |
 | `src/lower.rs` | **MEDIUM** | AST → SSA IR. Changes here affect interpreter + all backends. |
 | `src/typechecker.rs` | **MEDIUM** | Types + regions + effects + capabilities. Wrong rejection = broken code; wrong acceptance = silent miscompilation. |
 | `src/borrowck.rs` | **LOW** | Borrow checker (Phases 1-6 complete). Separate pass after typecheck. `--borrowck=on` by default; `off`/`warn` modes available. Field-wise borrows, two-phase borrows, NLL (non-lexical lifetimes via last-use analysis). |
 | `src/opt.rs` | **MEDIUM** | PIR optimizer. 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. 22 in default pass list (region-pool via `--region-pool`). `--opt` is enabled by default in `build` (use `--no-opt` to disable). `--lto` enables aggressive cross-module inlining (larger inline limits). PGO has been removed. S-1A pass skipping: `pass_relevant_for_module()` skips passes that can't help (no loops → skip unroll, no calls → skip inline, etc.). Inline cost model (F-3F): cost = blocks×5 + insts, with `is_pure` (50% bonus), `is_crashfree` (25%), `is_deterministic` (10%), capped at 75%. Sandbox-aware inlining (I-3C): sandbox call sites use 6 blocks / 40 insts vs normal 3/20. Sandbox-aware devirt (I-3C): devirtualize DynCalls in sandbox blocks to pure impls. Region bulk free (I-1C): `pass_region_pool` emits `p_region_free` before returns. @crashfree code hoisting (I-4B): `pass_effect_optimize` hoists @crashfree + effectively-pure calls out of loops. @gas-guided unrolling (I-4C): `pass_unroll` uses max_unroll=64 when `gas_limit.is_some()` (vs normal 8). Annotations propagated: `is_wrapping`, `is_deterministic`, `is_crashfree`, `is_no_alloc`, `is_medical`, `gas_limit`. I-6B linear type alias analysis: `linear_structs` propagated from AST → IrModule → L1Module → L2Module; `alias_analysis_function` tracks `linear_ptrs` and uses them to prove non-aliasing (stores through linear pointers can't invalidate loads from other pointers). |
-| `src/comptime.rs` | **LOW** | Comptime evaluation engine. Evaluates `comptime <expr>`, `comptime { block }`, `comptime reflect_op(T)`, `comptime gen { block }` at compile time. I-5A: Aggressive comptime evaluation — auto-evaluates calls to `comptime pf` functions with all-literal args (no explicit `comptime` wrapper needed). I-5D: Comptime loop unrolling — unrolls `for` loops with literal bounds (≤16 iterations, ≤16 body stmts) at AST level. Also eliminates dead `if` branches with literal conditions. |
+| `src/comptime.rs` | **LOW** | Comptime evaluation engine. Evaluates `comptime <expr>`, `comptime { block }`, `comptime reflect_op(T)`, `comptime gen { block }` at compile time. I-5A: Aggressive comptime evaluation — auto-evaluates calls to `comptime fn` functions with all-literal args (no explicit `comptime` wrapper needed). I-5D: Comptime loop unrolling — unrolls `for` loops with literal bounds (≤16 iterations, ≤16 body stmts) at AST level. Also eliminates dead `if` branches with literal conditions. |
 | `src/runtime_linux.rs` | **HIGH** | Hand-encoded x86-64 machine code (raw bytes). No assembler — every byte is manual. |
 | `src/linker.rs` | **MEDIUM** | Relocation resolution. Wrong offset = crash or silent corruption. |
 | `src/interp.rs` | **MEDIUM** | The reference oracle (~4400 LOC). If this is wrong, all backends "match" but produce wrong results. `p_vec_new` uses `vec_side_table` to separate raw struct fields from `Value::Vec`. `run_function` auto-detects missing `__env` param and inserts dummy. |

@@ -3,7 +3,7 @@
 > Navigation hub for the Fides compiler. Every file in the project, grouped by
 > directory, with a one-line description. Use this to find anything fast.
 >
-> **Stats:** 54 `.rs` source files (84,741 LOC) · 69 stdlib modules (17,468 LOC) · 213 `.fd`
+> **Stats:** 54 `.rs` source files (85,493 LOC) · 69 stdlib modules (17,567 LOC) · 218 `.fd`
 > test files · 33 .md docs · 4 examples · 3 scripts · 3 benchmarks · 4 binaries (fidesc, pacte, scribe, veil).
 > Cross-compilation: ARM64, RISC-V, Windows — zero external tools.
 
@@ -35,7 +35,7 @@ and `AGENTS.md` first when working on the compiler.
 | File | Description |
 |------|-------------|
 | [reference/architecture.md](reference/architecture.md) | Compiler pipeline, data flow, source file map. **Start here.** |
-| [reference/syntax.md](reference/syntax.md) | Full language syntax specification (current `pf`/`pv`/`pc` syntax + proposed `fn`/`val`/`var` migration). |
+| [reference/syntax.md](reference/syntax.md) | Full language syntax specification (current `fn`/`val`/`var`/`const`/`return`/`type` syntax — migration from old `pf`/`pv`/`pc`/`ret`/`ty` is complete). |
 | [reference/features.md](reference/features.md) | Feature status — verified against actual test runs. |
 | [reference/tool.md](reference/tool.md) | Development tools (fidesc, pacte, scribe, veil). |
 | [reference/testing.md](reference/testing.md) | Current test results across all backends + test batch specifications. |
@@ -223,7 +223,7 @@ imported via `use`. See `docs/reference/features.md` for which are feature-compl
 
 ## Tests (tests/)
 
-213 `.fd` test files (190 in root; 23 in subdirs: capability/effects/regions/safety) plus the Rust test harness.
+218 `.fd` test files (195 in root; 23 in subdirs: capability/effects/regions/safety) plus the Rust test harness.
 Run all with `./target/release/fidesc test`; verify with `./verify.sh`.
 
 ### Test Infrastructure
@@ -256,9 +256,9 @@ typed strings, init guarantees, constant_time, etc.
 
 ### Current Test Results (Aug 2026)
 ```
-Interpreter:  116/116 normal  (6 bonus passes)
-C Codegen:    116/116 matched (4 bonus passes)
-PE Emitter:   116/116 valid   (6 bonus passes)
+Interpreter:  146/146 normal
+C Codegen:    146/146 matched
+PE Emitter:   146/146 valid
 Unit tests:   265/265 passed  (cargo test --lib)
 Harness:      8/8 passed
 ```

@@ -66,7 +66,7 @@ F8:  ?. optional chaining     ✅ IMPLEMENTED — null-safe navigation, None sho
 F10: given/ensure contracts   ✅ IMPLEMENTED — preconditions verified at call sites with constant args (Design by Contract)
 F18: ECS (component/system)   ✅ IMPLEMENTED — component/system/query desugar to structs/functions/loops, __ecs_* runtime in interpreter
 F13: parallel { | } fork-join 🔲 PLANNED — compiler emits thread spawn/join
-F14: @differentiable          🔲 PLANNED — compiler traces IR for autograd
+F14: @differentiable          ✅ DONE — typechecker verifies @differentiable (no IO/Net/Spawn/Diverge, transitive). Runtime tape-based reverse-mode AD in interpreter: `grad(var) { ... backward(loss) }` computes gradients. `p_grad_get` retrieves results.
 F21: @shader (vert/frag)      🔲 PLANNED — compiler emits SPIR-V for GPU
 F23: @simd                    🔲 PLANNED — compiler vectorizes loops to SSE/AVX/NEON
 F24: @crashfree               ✅ IMPLEMENTED — compile-time panic prevention: rejects unwrap, p_panic, non-const div/mod, while loops, non-crashfree calls
@@ -103,10 +103,14 @@ F42: Account<State> types     ✅ IMPLEMENTED — typestate pattern in stdlib/ba
 F43: LogicalTime type         ✅ IMPLEMENTED — stdlib/time.fd: timezone-free, clock-free, @deterministic date math (Howard Hinnant civil algorithm)
 
 ─── Production Primitives — Tier B: Ergonomic ───────────────────
-F61: tuple destructuring       ✅ IMPLEMENTED — `pv (a, b) = expr` multi-return unpacking
+F61: tuple destructuring       ✅ IMPLEMENTED — `val (a, b) = expr` multi-return unpacking
 F62: file I/O                  ✅ IMPLEMENTED — stdlib/file.fd: read/write/append/exists
 F63: loop-aware linear types   ✅ IMPLEMENTED — linear vars can't be consumed inside loops
 F95: raw pointer types         ✅ IMPLEMENTED — *mut T / *const T with unsafe {} blocks, typechecker enforces unsafe_depth, &T coerces to *mut T
+F96: Drop trait                ✅ IMPLEMENTED — `impl T { fn drop(self: &mut T) }` → compiler calls T_drop at function exit (return, implicit end, ? propagation). LIFO order. Test: test_drop.fd
+F97: val immutability          ✅ IMPLEMENTED — `val` reassignment and field mutation now rejected by typechecker (Issues 46-47). 247 stdlib fixes.
+F98: &mut T auto-deref         ✅ IMPLEMENTED — `&T`/`&mut T` auto-deref for method calls in typechecker + lowerer (Issue 45). No more `(*v).push()`.
+F99: match exhaustiveness      ✅ IMPLEMENTED — enum/bool exhaustiveness checking emits warnings for non-exhaustive matches (Issue 49)
 
 ─── Cross-Industry Safety — Tier A: Compiler-Verified Domain Guarantees ──
 F44: @safety-critical         ✅ IMPLEMENTED — composable safety primitives: @no-alloc + @no-recursion + @no-unbounded + @no-panic + @no-indirect (DO-178C/ISO 26262)
@@ -136,7 +140,7 @@ F60: @scada                   🔲 PLANNED — compiler generates SCADA protocol
 ─── Cybersecurity — Tier A: Compiler-Verified Exploit Prevention ──
 F61: @no-alias                🔲 PLANNED — compiler proves no two mutable refs to same data (memory safety)
 F62: bounds checking lock     ✅ IMPLEMENTED — bounds checks ALWAYS fire in safe mode, skippable in unsafe {} (memory safety)
-F63: init guarantee           ✅ IMPLEMENTED — `pm` keyword for uninitialized mutable vars, definite assignment analysis, compile error on read before assignment (memory safety)
+F63: init guarantee           ✅ IMPLEMENTED — `var` keyword (without initializer) for uninitialized mutable vars, definite assignment analysis, compile error on read before assignment (memory safety)
 F64: checked arithmetic lock  ✅ IMPLEMENTED — overflow = panic (not wrap), always on, @wrapping opt-out (integer safety)
 F65: @wrapping                ✅ IMPLEMENTED — explicit opt-in for wrap-around arithmetic (hashing, crypto)
 F67: typed strings            ✅ IMPLEMENTED — SQLString, ShellString, HTMLString, JSONString, PathString distinct types, injection prevention via type system
@@ -208,6 +212,8 @@ S31: stdlib/env.fd             ✅ IMPLEMENTED — env_get, env_exists (environm
 S32: stdlib/args.fd            ✅ IMPLEMENTED — args_len, args_get, args_program_name (command-line args)
 S33: stdlib/process.fd         ✅ IMPLEMENTED — process_exit, process_system (process control)
 S34: stdlib/regex.fd           ✅ IMPLEMENTED — regex_matches (?/* wildcards), regex_find, regex_contains, regex_starts_with, regex_ends_with
+S35: stdlib/sync.fd            ✅ IMPLEMENTED — Mutex<T>, RwLock<T> (atomic refcount read/write lock), AtomicU64, channels (send/recv/try_recv), barriers
+S36: stdlib/iter.fd            ✅ IMPLEMENTED — Iterator<T> trait: map, filter, reduce, for_each, collect, enumerate, zip, chain, take, skip
 
 ─── Debugging Tools — Phase 14 (Aug 2026) ───────────────────────
 D1: fidesc debug              ✅ IMPLEMENTED — interactive interpreter debugger: break, step, next, continue, print, backtrace, list, ir, effects, regions, capabilities, watch, reload, record
@@ -261,7 +267,7 @@ C15: @validated               ❌ CUT — already covered by given/ensure contra
 | **Robotics/IoT** | F27, F29–F31, F35, F37 (@realtime, @interrupt, @firmware, @lowpower, @watchdog, @ota) | S12–S16 (HAL, sensor, motor, protocol, OTA) | WCET proof + no-malloc proof + bare metal |
 | **Blockchain** | F28, F34, F50 (@gas, @emit, @signed) | S9–S11 (crypto, consensus, storage) | Compile-time gas verification + determinism |
 | **Gaming** | F16–F18, F21, F23–F25 (vec/mat, swizzle, ECS, @shader, @simd, @crashfree, @pool) | S1–S8 (tilemap, sprite, etc.) | Crash-free game loop proof |
-| **AI/ML** | F14 (@differentiable) | — (tensor.fd exists) | Compile-time shape checking + autograd |
+| **AI/ML** | F14 (@differentiable) ✅ | — (tensor.fd exists) | Compile-time shape checking + differentiability proof + runtime tape-based autodiff (gradient computation) |
 | **Serverless/Edge** | F32, F36 (@serverless, @handler) | S17–S18 (HTTP server, WASM API) | Tiny binaries + capability-stripped |
 
 **The key insight:** all these industries share the same 3 core safety systems (capabilities, effects, regions). Each industry's annotations are different *configurations* of those systems. Building @deterministic for medical makes @gas for blockchain cheaper. Building @bounded for aerospace makes @crashfree for gaming stronger. This is Fides's moat — one language, every industry, compile-time proofs.
@@ -285,7 +291,7 @@ plugin code with zero authority — verified at compile time, zero runtime cost.
 ```p
 use core with { IO, FS, Net };
 
-pf main() {
+fn main() {
     print("I can print");  // OK — IO granted
 
     sandbox {
@@ -348,8 +354,8 @@ real applications — tweak rendering code without resetting game state, edit
 data processing without losing loaded data.
 
 ```p
-pf main() {
-    persist pv counter: i64 = 0;
+fn main() {
+    persist val counter: i64 = 0;
 
     counter += 1;
     print(f"Called {counter} times");
@@ -362,7 +368,7 @@ pf main() {
 ### Implementation
 
 1. Add `Persist` modifier to `LetStmt` in AST (`ast.rs`)
-2. Parse `persist pv` in `parser.rs`
+2. Parse `persist val` in `parser.rs`
 3. In `lower.rs`: mark the variable, emit a save call on function exit and
    a restore call on function entry
 4. In `hotreload.rs`: `PersistentState` already exists (key-value store in
@@ -408,9 +414,9 @@ inside the region and produces a **compile error** if the total exceeds the
 budget. This is a hard guarantee — not a runtime check, not a hope.
 
 ```p
-pf sensor_loop() !RealTime {
+fn sensor_loop() !RealTime {
     region r with budget(2048) {
-        pv buf = Vec::new();
+        val buf = Vec::new();
         for i in 0..256 {
             buf.push(read_sensor(i));  // OK — 256 * 8 = 2048 bytes
         }
@@ -594,21 +600,21 @@ the happy path in nested `if` blocks, you state the precondition upfront and
 exit if it fails. The `=>` arrow makes the exit action explicit and visible.
 
 ```p
-pf process(data: Vec<i64>) -> i64 {
+fn process(data: Vec<i64>) -> i64 {
     guard data.len() > 0 => return 0;
     guard data.len() < 100 => return -1;
 
     // Happy path — no nesting, full width available
-    pv sum = 0;
+    val sum = 0;
     for x in data { sum += x; }
     sum
 }
 
 // Without guard — the pyramid of doom:
-pf process_bad(data: Vec<i64>) -> i64 {
+fn process_bad(data: Vec<i64>) -> i64 {
     if data.len() > 0 {
         if data.len() < 100 {
-            pv sum = 0;
+            val sum = 0;
             for x in data { sum += x; }
             sum
         } else { -1 }
@@ -654,22 +660,22 @@ clone arrays.
 
 ```p
 // ─── Struct spread: update one field, copy the rest ───────────
-pv player = Player { name: "Hero", hp: 100, pos: vec3(0, 0, 0), inventory: Vec::new() };
+val player = Player { name: "Hero", hp: 100, pos: vec3(0, 0, 0), inventory: Vec::new() };
 
 // Take damage — copy everything except hp
-pv hurt = Player { ..player, hp: player.hp - 10 };
+val hurt = Player { ..player, hp: player.hp - 10 };
 
 // Move — copy everything except pos
-pv moved = Player { ..player, pos: vec3(10, 0, 0) };
+val moved = Player { ..player, pos: vec3(10, 0, 0) };
 
 // ─── Array spread: combine arrays without loops ───────────────
-pv a = [1, 2, 3];
-pv b = [4, 5, 6];
-pv combined = [..a, ..b, 7];  // [1, 2, 3, 4, 5, 6, 7]
+val a = [1, 2, 3];
+val b = [4, 5, 6];
+val combined = [..a, ..b, 7];  // [1, 2, 3, 4, 5, 6, 7]
 
 // ─── Function arguments: spread a Vec into varargs ────────────
-pv args = [1, 2, 3];
-pv result = sum(..args);  // equivalent to sum(1, 2, 3)
+val args = [1, 2, 3];
+val result = sum(..args);  // equivalent to sum(1, 2, 3)
 ```
 
 ### Implementation
@@ -711,7 +717,7 @@ and the compiler inserts the null checks automatically.
 
 ```p
 // Without ?. — pyramid of match blocks
-pv zip = match user {
+val zip = match user {
     Some(u) => match u.address {
         Some(a) => match a.zip_code {
             Some(z) => z,
@@ -723,10 +729,10 @@ pv zip = match user {
 };
 
 // With ?. — one line
-pv zip = user?.address?.zip_code ?? "unknown";
+val zip = user?.address?.zip_code ?? "unknown";
 
 // Method chaining with ?.
-pv label = user?.get_profile()?.display_name ?? "Anonymous";
+val label = user?.get_profile()?.display_name ?? "Anonymous";
 
 // Assignment with ?. — only sets if the chain is valid
 user?.address?.city = "Portland";  // no-op if user or address is None
@@ -771,16 +777,16 @@ an `Option`, and `??` gives you a concrete value.
 
 ```p
 // Option coalescing
-pv name = user?.name ?? "Anonymous";
-pv port = config?.port ?? 8080;
+val name = user?.name ?? "Anonymous";
+val port = config?.port ?? 8080;
 
 // Primitive coalescing — 0 / "" / false are treated as "absent"
-pv timeout = config.timeout ?? 30;        // if timeout == 0, use 30
-pv label = config.label ?? "default";     // if label == "", use "default"
-pv enabled = config.enabled ?? true;       // if enabled == false, use true
+val timeout = config.timeout ?? 30;        // if timeout == 0, use 30
+val label = config.label ?? "default";     // if label == "", use "default"
+val enabled = config.enabled ?? true;       // if enabled == false, use true
 
 // Chaining with ?? for fallbacks
-pv server = primary ?? backup ?? local ?? "localhost:8080";
+val server = primary ?? backup ?? local ?? "localhost:8080";
 ```
 
 ### Implementation
@@ -815,29 +821,29 @@ contracts at compile time; complex ones become runtime assertions in debug
 builds and are elided in release builds.
 
 ```p
-pf sqrt(x: f64) -> f64
+fn sqrt(x: f64) -> f64
     given x >= 0.0
     ensure result >= 0.0
 {
     // Compiler verifies: x >= 0 is checked at call sites with known values
     // Runtime: assertion in debug mode, elided in release
-    if x == 0.0 { ret 0.0; }
-    pv r = x;
+    if x == 0.0 { return 0.0; }
+    val r = x;
     for _ in 0..20 {
         r = (r + x / r) / 2.0;
     }
     r
 }
 
-pf binary_search(arr: Vec<i64>, target: i64) -> i64
+fn binary_search(arr: Vec<i64>, target: i64) -> i64
     given arr.is_sorted()           // precondition: array must be sorted
     ensure result >= 0 || result == -1  // postcondition: valid index or -1
 {
-    pv lo = 0;
-    pv hi = arr.len() - 1;
+    val lo = 0;
+    val hi = arr.len() - 1;
     while lo <= hi {
-        pv mid = (lo + hi) / 2;
-        if arr[mid] == target { ret mid; }
+        val mid = (lo + hi) / 2;
+        if arr[mid] == target { return mid; }
         if arr[mid] < target { lo = mid + 1; }
         else { hi = mid - 1; }
     }
@@ -845,7 +851,7 @@ pf binary_search(arr: Vec<i64>, target: i64) -> i64
 }
 
 // Contracts on generic functions with trait bounds
-pf max<T: Ord>(a: T, b: T) -> T
+fn max<T: Ord>(a: T, b: T) -> T
     ensure result >= a && result >= b
 {
     if a >= b { a } else { b }
@@ -893,7 +899,7 @@ branch body. No more `as` casts after a type check — the compiler knows
 the type is narrowed.
 
 ```p
-pv value: dyn Display = get_value();
+val value: dyn Display = get_value();
 
 // is + type narrowing — no cast needed inside the branch
 if value is i64 {
@@ -905,7 +911,7 @@ if value is i64 {
 }
 
 // is with enum variants
-pv shape = Shape::Circle(5.0);
+val shape = Shape::Circle(5.0);
 if shape is Circle {
     println(shape.radius);  // field access without match binding
 }
@@ -926,7 +932,7 @@ if value is not null {
 ### Implementation
 
 1. Add `Is` keyword to `token.rs` / `lexer.rs` (already exists as `Is`? check)
-2. Add `Expr::Is { expr, ty }` to `ast.rs`
+2. Add `Expr::Is { expr, type }` to `ast.rs`
 3. Parse `expr is Type` in `parser.rs`
 4. Typechecker: evaluate `expr` type, compare to `Type`. In the `then` branch, narrow the variable's type to `Type`. Return `bool`.
 5. Lowering: for concrete types → emit a type tag check. For trait objects → check the vtable type. For enums → check the variant tag.
@@ -955,8 +961,8 @@ arguments, the cached result is returned without re-executing the function.
 
 ```p
 @memo
-pf fib(n: i64) -> i64 {
-    if n <= 1 { ret n; }
+fn fib(n: i64) -> i64 {
+    if n <= 1 { return n; }
     fib(n - 1) + fib(n - 2)
 }
 
@@ -964,17 +970,17 @@ pf fib(n: i64) -> i64 {
 // With @memo: fib(40) takes ~40 calls
 
 @memo(max_size=1024)
-pf expensive_hash(data: Vec<i64>) -> i64 {
+fn expensive_hash(data: Vec<i64>) -> i64 {
     // Cache up to 1024 unique argument combinations
     // LRU eviction when cache is full
-    pv h = 0;
+    val h = 0;
     for x in data { h = h * 31 + x; }
     h
 }
 
 // @memo requires pure functions — the effect system verifies this
 @memo
-pf impure_func(x: i64) -> i64 {
+fn impure_func(x: i64) -> i64 {
     print("side effect");  // COMPILE ERROR: @memo requires !{} (pure)
     x * 2
 }
@@ -1019,14 +1025,14 @@ tuple of all task results. If any task panics, the others are cancelled.
 
 ```p
 // Run three computations in parallel, auto-join at }
-pv (a, b, c) = parallel {
+val (a, b, c) = parallel {
     | heavy_computation_1()
     | heavy_computation_2()
     | heavy_computation_3()
 };
 
 // Parallel data processing
-pv results = parallel {
+val results = parallel {
     | process_batch(batch_1)
     | process_batch(batch_2)
     | process_batch(batch_3)
@@ -1034,15 +1040,15 @@ pv results = parallel {
 };
 
 // Parallel with shared read-only state (no locks needed)
-pv data = load_data();  // immutable after this point
-pv (min, max, avg) = parallel {
+val data = load_data();  // immutable after this point
+val (min, max, avg) = parallel {
     | data.iter().min()
     | data.iter().max()
     | data.iter().sum() / data.len()
 };
 
 // Error propagation — if any task fails, all are cancelled
-pv result = parallel {
+val result = parallel {
     | fetch_from_primary()    // if this fails, secondary is cancelled
     | fetch_from_secondary()
 };
@@ -1076,7 +1082,7 @@ pv result = parallel {
 ## F14 — `@differentiable` — Mark Functions for Autograd
 
 **Classification:** SYNTAX — Tier A (compiler must trace IR operations for autograd — a library can't inspect IR)
-**Status:** 🔲 Planned
+**Status:** ✅ Done — typechecker verifies `@differentiable` (no IO/Net/Spawn/Diverge, transitive). Runtime tape-based reverse-mode AD in interpreter: `grad(var) { ... backward(loss) }` records tensor ops on a tape and computes gradients via local derivative functions. `p_grad_get` retrieves results.
 **Impact:** High — AI/ML
 **Novelty:** JAX uses `jax.grad()` transformations. PyTorch uses runtime autograd graphs. Fides uses a compile-time annotation that tells the autograd pass to trace the function and generate backward code.
 
@@ -1089,23 +1095,23 @@ are treated as opaque (no gradients computed through them).
 
 ```p
 @differentiable
-pf relu(x: f64) -> f64 {
+fn relu(x: f64) -> f64 {
     if x > 0.0 { x } else { 0.0 }
 }
 
 @differentiable
-pf loss(pred: Tensor, target: Tensor) -> f64 {
-    pv diff = pred - target;
-    pv squared = diff * diff;
+fn loss(pred: Tensor, target: Tensor) -> f64 {
+    val diff = pred - target;
+    val squared = diff * diff;
     mean(squared)  // MSE loss
 }
 
 // Inside a grad block, @differentiable functions are traced
-pf train(model: Model, data: Tensor, labels: Tensor) {
+fn train(model: Model, data: Tensor, labels: Tensor) {
     grad(model.weights) {
-        pv pred = model.forward(data);
-        pv l = loss(pred, labels);
-        backward(l);  // gradients computed through @differentiable functions
+        val pred = model.forward(data);
+        val l = loss(pred, labels);
+        backward(l);  // ⚠️ no-op — autograd transform not implemented (Issue 7)
     }
 }
 ```
@@ -1160,38 +1166,38 @@ efficient SIMD code on supported hardware.
 
 ```p
 // ─── Vector types ─────────────────────────────────────────────
-pv a: vec3 = vec3(1.0, 2.0, 3.0);
-pv b: vec3 = vec3(4.0, 5.0, 6.0);
+val a: vec3 = vec3(1.0, 2.0, 3.0);
+val b: vec3 = vec3(4.0, 5.0, 6.0);
 
-pv sum = a + b;              // vec3(5, 7, 9)
-pv diff = a - b;             // vec3(-3, -3, -3)
-pv scaled = a * 2.0;         // vec3(2, 4, 6) — scalar mult
-pv dot_product = dot(a, b);  // 32.0 — scalar
-pv cross_product = cross(a, b);  // vec3 — perpendicular vector
-pv len = length(a);          // 3.741...
-pv unit = normalize(a);      // unit vector
-pv lerp_result = lerp(a, b, 0.5);  // vec3(2.5, 3.5, 4.5)
+val sum = a + b;              // vec3(5, 7, 9)
+val diff = a - b;             // vec3(-3, -3, -3)
+val scaled = a * 2.0;         // vec3(2, 4, 6) — scalar mult
+val dot_product = dot(a, b);  // 32.0 — scalar
+val cross_product = cross(a, b);  // vec3 — perpendicular vector
+val len = length(a);          // 3.741...
+val unit = normalize(a);      // unit vector
+val lerp_result = lerp(a, b, 0.5);  // vec3(2.5, 3.5, 4.5)
 
 // ─── Matrix types ─────────────────────────────────────────────
-pv model = translate(vec3(10, 0, 0)) * rotate_y(0.5) * scale(2.0);
-pv view = look_at(eye, target, up);
-pv proj = perspective(radians(60), 16.0/9.0, 0.1, 100.0);
-pv mvp = proj * view * model;
+val model = translate(vec3(10, 0, 0)) * rotate_y(0.5) * scale(2.0);
+val view = look_at(eye, target, up);
+val proj = perspective(radians(60), 16.0/9.0, 0.1, 100.0);
+val mvp = proj * view * model;
 
-pv clip_pos = mvp * vec4(local_pos, 1.0);  // matrix × vector
-pv screen = clip_pos.xyz / clip_pos.w;     // perspective divide
+val clip_pos = mvp * vec4(local_pos, 1.0);  // matrix × vector
+val screen = clip_pos.xyz / clip_pos.w;     // perspective divide
 
 // ─── 2D game helpers ──────────────────────────────────────────
-pv pos: vec2 = vec2(100, 200);
-pv size: vec2 = vec2(32, 32);
-pv rect = rect_from(pos, size);
+val pos: vec2 = vec2(100, 200);
+val size: vec2 = vec2(32, 32);
+val rect = rect_from(pos, size);
 if rect.contains(mouse_pos) { /* mouse is over button */ }
 
 // ─── Quaternion rotation ──────────────────────────────────────
-pv q = quat_from_axis_angle(vec3(0, 1, 0), radians(90));
-pv rotated = q * vec3(1, 0, 0);  // rotate vector by quaternion
-pv combined = q1 * q2;           // compose rotations
-pv smooth = slerp(q1, q2, 0.5);  // smooth interpolation
+val q = quat_from_axis_angle(vec3(0, 1, 0), radians(90));
+val rotated = q * vec3(1, 0, 0);  // rotate vector by quaternion
+val combined = q1 * q2;           // compose rotations
+val smooth = slerp(q1, q2, 0.5);  // smooth interpolation
 ```
 
 ### Implementation
@@ -1233,30 +1239,30 @@ Swizzle allows accessing and reordering vector components using `.xy`,
 `r/g/b/a` can be used. Components can be repeated, reordered, or omitted.
 
 ```p
-pv color: vec4 = vec4(1.0, 0.5, 0.2, 1.0);
+val color: vec4 = vec4(1.0, 0.5, 0.2, 1.0);
 
 // Read swizzles — any combination of x/y/z/w or r/g/b/a
-pv rgb = color.rgb;       // vec3(1.0, 0.5, 0.2) — color interpretation
-pv xy = color.xy;         // vec2(1.0, 0.5)     — position interpretation
-pv zz = color.zz;         // vec2(0.2, 0.2)     — replication
-pv yzx = color.yzx;       // vec3(0.5, 0.2, 1.0) — reordering
-pv xxx = color.xxx;       // vec3(1.0, 1.0, 1.0) — splat
+val rgb = color.rgb;       // vec3(1.0, 0.5, 0.2) — color interpretation
+val xy = color.xy;         // vec2(1.0, 0.5)     — position interpretation
+val zz = color.zz;         // vec2(0.2, 0.2)     — replication
+val yzx = color.yzx;       // vec3(0.5, 0.2, 1.0) — reordering
+val xxx = color.xxx;       // vec3(1.0, 1.0, 1.0) — splat
 
 // Write swizzles — assign multiple components at once
-pv pos: vec3 = vec3(0.0, 0.0, 0.0);
+val pos: vec3 = vec3(0.0, 0.0, 0.0);
 pos.xz = vec2(10.0, 20.0);     // modify x and z, y stays 0.0
 pos.rgb = vec3(1.0, 0.0, 0.0); // same thing, color syntax
 
 // Chaining with operators
-pv v: vec4 = vec4(1.0, 2.0, 3.0, 4.0);
-pv result = v.xyz * 2.0 + v.w;  // vec3(4, 6, 8) + 4 = vec3(8, 10, 12)
+val v: vec4 = vec4(1.0, 2.0, 3.0, 4.0);
+val result = v.xyz * 2.0 + v.w;  // vec3(4, 6, 8) + 4 = vec3(8, 10, 12)
 
 // In game code
-pv to_enemy = enemy.pos - player.pos;
-pv direction = normalize(to_enemy);
-pv forward = vec3(0, 0, -1);
-pv is_in_front = dot(direction, forward) > 0;
-pv right = cross(forward, up);  // perpendicular vector
+val to_enemy = enemy.pos - player.pos;
+val direction = normalize(to_enemy);
+val forward = vec3(0, 0, -1);
+val is_in_front = dot(direction, forward) > 0;
+val right = cross(forward, up);  // perpendicular vector
 ```
 
 ### Implementation
@@ -1336,8 +1342,8 @@ system Combat {
 }
 
 // ─── Spawning entities at runtime ─────────────────────────────
-pf spawn_enemy(x: f32, y: f32) -> Entity {
-    pv e = Entity::new();
+fn spawn_enemy(x: f32, y: f32) -> Entity {
+    val e = Entity::new();
     e.add(Position { x, y, z: 0.0 });
     e.add(Velocity { dx: 0.0, dy: 0.0, dz: 0.0 });
     e.add(Health { hp: 100, max_hp: 100 });
@@ -1459,7 +1465,7 @@ state Player {
 }
 
 // ─── Using the state machine ──────────────────────────────────
-pv player_state = Player::Idle;
+val player_state = Player::Idle;
 
 // In game loop:
 player_state.handle(input_event);  // dispatches to current state
@@ -1525,7 +1531,7 @@ on mouse_move(pos: vec2, delta: vec2) {
 // ─── Collision events ─────────────────────────────────────────
 on collision(other: Entity, point: vec3, normal: vec3) {
     if other.has(Health) {
-        pv push = normal * 0.5;
+        val push = normal * 0.5;
         entity.position += push;
         other.position -= push;
     }
@@ -1605,30 +1611,30 @@ and error messages — because it's just Fides code.
 ```p
 // ─── Vertex shader ────────────────────────────────────────────
 @vertex
-pf vert(in_pos: vec3, in_uv: vec2, in_normal: vec3) -> (vec4, vec2, vec3) {
-    pv world_pos = model * vec4(in_pos, 1.0);
-    pv clip_pos = view_proj * world_pos;
-    pv world_normal = normalize(mat3(model) * in_normal);
-    ret (clip_pos, in_uv, world_normal);
+fn vert(in_pos: vec3, in_uv: vec2, in_normal: vec3) -> (vec4, vec2, vec3) {
+    val world_pos = model * vec4(in_pos, 1.0);
+    val clip_pos = view_proj * world_pos;
+    val world_normal = normalize(mat3(model) * in_normal);
+    return (clip_pos, in_uv, world_normal);
 }
 
 // ─── Fragment shader ──────────────────────────────────────────
 @fragment
-pf frag(uv: vec2, normal: vec3) -> vec4 {
-    pv tex_color = texture(diffuse_map, uv);
-    pv light_dir = normalize(vec3(0.5, 1.0, 0.3));
-    pv diffuse = max(dot(normal, light_dir), 0.0);
-    pv ambient = 0.2;
-    pv color = tex_color.rgb * (diffuse + ambient);
-    ret vec4(color, tex_color.a);
+fn frag(uv: vec2, normal: vec3) -> vec4 {
+    val tex_color = texture(diffuse_map, uv);
+    val light_dir = normalize(vec3(0.5, 1.0, 0.3));
+    val diffuse = max(dot(normal, light_dir), 0.0);
+    val ambient = 0.2;
+    val color = tex_color.rgb * (diffuse + ambient);
+    return vec4(color, tex_color.a);
 }
 
 // ─── Compute shader: particle simulation on GPU ───────────────
 @kernel(workgroup=[64])
-pf particle_update(particles: Buffer<Particle>, dt: f32) {
-    pv i = thread_id(0);
-    if i >= particles.len { ret; }
-    pv p = particles[i];
+fn particle_update(particles: Buffer<Particle>, dt: f32) {
+    val i = thread_id(0);
+    if i >= particles.len { return; }
+    val p = particles[i];
     p.velocity.y -= 9.81 * dt;
     p.position += p.velocity * dt;
     if p.position.y < 0.0 {
@@ -1765,7 +1771,7 @@ scene GameWorld {
 ```p
 // ─── Vectorize a vertex transform loop ────────────────────────
 @simd
-pf transform_vertices(verts: Buffer<vec3>, mvp: mat4) {
+fn transform_vertices(verts: Buffer<vec3>, mvp: mat4) {
     for i in 0..verts.len {
         verts[i] = (mvp * vec4(verts[i], 1.0)).xyz;
     }
@@ -1774,8 +1780,8 @@ pf transform_vertices(verts: Buffer<vec3>, mvp: mat4) {
 
 // ─── SIMD with reduction (dot product) ────────────────────────
 @simd(reduce=+)
-pf dot_product(a: Buffer<f32>, b: Buffer<f32>) -> f32 {
-    pv sum = 0.0;
+fn dot_product(a: Buffer<f32>, b: Buffer<f32>) -> f32 {
+    val sum = 0.0;
     for i in 0..a.len {
         sum += a[i] * b[i];
     }
@@ -1784,7 +1790,7 @@ pf dot_product(a: Buffer<f32>, b: Buffer<f32>) -> f32 {
 
 // ─── Game use: particle update (10,000 particles) ─────────────
 @simd
-pf update_particles(particles: Buffer<Particle>, dt: f32) {
+fn update_particles(particles: Buffer<Particle>, dt: f32) {
     for i in 0..particles.len {
         particles[i].velocity.y -= 9.81 * dt;
         particles[i].position += particles[i].velocity * dt;
@@ -1840,14 +1846,14 @@ If any of these are found, it's a **compile error**.
 ```p
 // ─── Prove the game loop can't crash ──────────────────────────
 @crashfree
-pf update_position(entity: Entity, dt: f32) -> Entity {
+fn update_position(entity: Entity, dt: f32) -> Entity {
     guard dt > 0.0 => return entity;  // guard prevents divide-by-zero
     Entity { ..entity, pos: entity.pos + entity.vel * dt }
 }
 
 // @crashfree propagates: calling a non-crashfree function = compile error
 @crashfree
-pf game_loop(dt: f32) {
+fn game_loop(dt: f32) {
     update_position(player, dt);  // OK: update_position is @crashfree
 
     // COMPILE ERROR: load_texture can panic (file not found)
@@ -1857,7 +1863,7 @@ pf game_loop(dt: f32) {
 
 // The main loop is PROVABLY crash-free
 @crashfree
-pf main_loop() {
+fn main_loop() {
     loop {
         game_loop(get_delta_time());
     }
@@ -1931,8 +1937,8 @@ struct Bullet {
 }
 
 // Spawn from pool — O(1), no malloc
-pf fire_bullet(pos: vec3, dir: vec3) {
-    pv bullet = Bullet::acquire();  // reuse dead bullet or allocate from pre-pool
+fn fire_bullet(pos: vec3, dir: vec3) {
+    val bullet = Bullet::acquire();  // reuse dead bullet or allocate from pre-pool
     bullet.pos = pos;
     bullet.vel = dir * 100.0;
     bullet.active = true;
@@ -1992,7 +1998,7 @@ These modules are **not language keywords** — they're `.fd` files that ship wi
 ```p
 use tilemap;
 
-pv map = tilemap::Tilemap::new(256, 256, tile_size: 16);
+val map = tilemap::Tilemap::new(256, 256, tile_size: 16);
 map.fill("grass");
 map.set(10, 5, "stone");     // place a stone tile
 map.set_rect(0, 0, 10, 10, "water");  // fill a region
@@ -2001,7 +2007,7 @@ map.set_rect(0, 0, 10, 10, "water");  // fill a region
 if map.is_solid_at(player.pos) { /* can't walk here */ }
 
 // Rendering — cull to camera view
-pv visible = map.tiles_in_rect(camera.view_rect);
+val visible = map.tiles_in_rect(camera.view_rect);
 for tile in visible { draw_tile(tile); }
 ```
 
@@ -2015,7 +2021,7 @@ for tile in visible { draw_tile(tile); }
 ```p
 use sprite;
 
-pv sprite = sprite::Sprite::new("player.png", frame_size: vec2(32, 32));
+val sprite = sprite::Sprite::new("player.png", frame_size: vec2(32, 32));
 sprite.add_anim("idle", frames: 0..=3, fps: 4, loop: true);
 sprite.add_anim("walk", frames: 4..=11, fps: 8, loop: true);
 sprite.play("walk");
@@ -2034,7 +2040,7 @@ draw_sprite(sprite);
 ```p
 use flowfield;
 
-pv field = flowfield::FlowField::compute(
+val field = flowfield::FlowField::compute(
     target: vec2(50, 50),
     obstacles: collision_grid,
     cost_grid: terrain_costs,
@@ -2044,7 +2050,7 @@ pv field = flowfield::FlowField::compute(
 system MoveUnits(dt: f32) {
     query(Position, Velocity, Orders) {
         if entity.orders.current == MoveTo {
-            pv flow = field.sample(entity.position);
+            val flow = field.sample(entity.position);
             entity.velocity = flow.direction * entity.speed;
         }
     }
@@ -2061,7 +2067,7 @@ system MoveUnits(dt: f32) {
 ```p
 use streaming;
 
-pv world = streaming::ChunkManager::new(
+val world = streaming::ChunkManager::new(
     chunk_size: 256,
     load_radius: 3,
     unload_radius: 5,
@@ -2094,10 +2100,10 @@ system UpdateStreaming {
 use scene;
 
 // Scene is just a function that spawns entities
-pv level = scene::load("levels/forest.scn");
+val level = scene::load("levels/forest.scn");
 
 // Or build programmatically
-pv player = scene::entity("Player")
+val player = scene::entity("Player")
     .with(Position { x: 0, y: 0, z: 0 })
     .with(Health { hp: 100, max_hp: 100 })
     .with(Sprite { texture: "player.png", frame: 0 })
@@ -2115,12 +2121,12 @@ pv player = scene::entity("Player")
 ```p
 use physics;
 
-pv world = physics::World::new(gravity: vec3(0, -9.81, 0));
+val world = physics::World::new(gravity: vec3(0, -9.81, 0));
 world.add_body(player, physics::Body::dynamic(collider: physics::Capsule(0.5, 1.8)));
 world.add_body(ground, physics::Body::static(collider: physics::Box(100, 1, 100)));
 world.step(dt);  // integrate physics
 
-pv contacts = world.contacts_for(player);
+val contacts = world.contacts_for(player);
 for contact in contacts {
     on_collision(contact.other, contact.point, contact.normal);
 }
@@ -2135,11 +2141,11 @@ for contact in contacts {
 use audio;
 
 audio::init();
-pv bgm = audio::load("music/theme.ogg");
+val bgm = audio::load("music/theme.ogg");
 bgm.play(loop: true);
 bgm.set_volume(0.5);
 
-pv sfx = audio::load("sfx/sword.wav");
+val sfx = audio::load("sfx/sword.wav");
 sfx.play();  // one-shot
 ```
 
@@ -2171,7 +2177,7 @@ These features were considered and rejected. Each one can be built using existin
 
 ```p
 // Fog of war = tilemap visibility grid + distance check per unit
-pf update_fog(map: Tilemap, units: Vec<Entity>) {
+fn update_fog(map: Tilemap, units: Vec<Entity>) {
     for y in 0..map.height {
         for x in 0..map.width {
             map.fog[x][y] = Explored;
@@ -2190,11 +2196,11 @@ pf update_fog(map: Tilemap, units: Vec<Entity>) {
 **Why cut:** Build with ECS query (F18) + formation math. Group selection is just a rect query; formations are offset calculations.
 
 ```p
-pv selected = query(Position, Owner) {
+val selected = query(Position, Owner) {
     where entity.owner == current_player
     where select_box.contains(entity.position)
 };
-pv formation = Formation::grid(selected.len(), spacing: 2.0);
+val formation = Formation::grid(selected.len(), spacing: 2.0);
 ```
 
 ### C3 — `traffic` — CUT
@@ -2205,7 +2211,7 @@ pv formation = Formation::grid(selected.len(), spacing: 2.0);
 component Car { route: FlowField, speed: f32 }
 system Traffic(dt) {
     query(Position, Velocity, Car) {
-        pv flow = entity.car.route.sample(entity.position);
+        val flow = entity.car.route.sample(entity.position);
         entity.velocity = flow.dir * entity.car.speed;
     }
 }
@@ -2218,7 +2224,7 @@ system Traffic(dt) {
 ```p
 system UpdateLOD {
     query(Position, Renderable) {
-        pv dist = distance(entity.position, camera.pos);
+        val dist = distance(entity.position, camera.pos);
         entity.model = if dist < 50 { "high" } else if dist < 200 { "med" } else { "low" };
     }
 }
@@ -2253,7 +2259,7 @@ system UpdateLOD {
 | F8: `?.` chaining | ✅ Implemented | High | Typechecker narrows types through chain |
 | F10: `given`/`ensure` | 🔲 Planned | High | Typechecker verifies at all call sites |
 | F13: `parallel { \| }` | 🔲 Planned | High | Compiler emits thread spawn/join |
-| F14: `@differentiable` | 🔲 Planned | High | Compiler traces IR for autograd |
+| F14: `@differentiable` | ✅ Done | High | Typechecker verifies differentiability; runtime tape-based autodiff in interpreter |
 | F16: vec/mat types | 🔲 Planned | High | Compiler emits SIMD instructions |
 | F17: swizzle `.xyz` | 🔲 Planned | High | Parser + typechecker for components |
 | F18: ECS syntax | 🔲 Planned | Very High | Compiler controls SoA memory layout |
@@ -2327,15 +2333,15 @@ system UpdateLOD {
 ### Implementation Details
 
 All 5 original features (F1–F5) were implemented in a single session. Test results (current state):
-- Interpreter: 116/116 normal passed
-- PE Emitter: 116/116 valid
-- C Codegen: 116/116 matched — full parity
-- Total: 213 .fd test files (190 in root + 23 in subdirs)
+- Interpreter: 146/146 normal passed
+- PE Emitter: 146/146 valid
+- C Codegen: 146/146 matched
+- Total: 218 .fd test files (195 in root + 23 in subdirs)
 
 **Planned for implementation:**
 - 39 Tier A syntax features (F10, F13, F14, F16–F18, F21, F23–F60) — need compiler support
 - 7 Tier B syntax features (F12, F19, F20) — ergonomic keywords
-- 29 stdlib module slots (S1–S29) — Fides code, no compiler changes (69 actual .fd files as of Aug 2026, 17,468 LOC)
+- 29 stdlib module slots (S1–S29) — Fides code, no compiler changes (69 actual .fd files as of Aug 2026, 17,567 LOC)
 - 15 features cut (C1–C15) — redundant, build with existing features
 
 ---
@@ -2354,7 +2360,7 @@ financial bugs impossible at the type level:
 
 ```p
 // money is NOT just a number — it's a TYPE with dimensional rules
-pv balance: money(18, 2) = $1000.00    // 18 digits precision, 2 decimal places
+val balance: money(18, 2) = $1000.00    // 18 digits precision, 2 decimal places
 
 // Legal: money + money = money
 balance + $500.00
@@ -2375,7 +2381,7 @@ balance / balance    // COMPILE ERROR: use money_to_ratio() for explicit convers
 balance as f64       // COMPILE ERROR: money cannot be implicitly converted to float
 
 // Overflow: runtime abort (NOT silent truncation like COBOL)
-pv result: money(18, 2) = balance + $99999999999999.99
+val result: money(18, 2) = balance + $99999999999999.99
 // If overflow → transaction aborts, NOT silent corruption
 ```
 
@@ -2414,7 +2420,7 @@ code path — like Rust's borrow checker, but for money:
 
 ```p
 @conserve  // Compiler proves: money in = money out
-pf transfer(
+fn transfer(
     from: &mut Account,
     to: &mut Account,
     fee_account: &mut Account,
@@ -2431,12 +2437,12 @@ pf transfer(
     to.credit(amount)?;
     fee_account.credit(fee)?;
     
-    ret fee    // return value is money, tracked in conservation
+    return fee    // return value is money, tracked in conservation
 }
 
 // COMPILE ERROR — money not conserved:
 @conserve
-pf bad_transfer(from: &mut Account, to: &mut Account, amount: money) {
+fn bad_transfer(from: &mut Account, to: &mut Account, amount: money) {
     from.debit(amount)?;
     to.credit(amount / 2)?;    // ERROR: debited amount, credited amount/2
                                 // Missing: amount/2 — where did it go?
@@ -2475,7 +2481,7 @@ becomes impossible because the compiler notices the missing half-cent.
 ### Concept
 
 ```p
-pf transfer(from: &mut Account, to: &mut Account, amount: money) -> Result<(), Error> {
+fn transfer(from: &mut Account, to: &mut Account, amount: money) -> Result<(), Error> {
     txn {
         // Everything inside txn { } is atomic:
         // - If ANY operation fails → ALL changes roll back
@@ -2487,7 +2493,7 @@ pf transfer(from: &mut Account, to: &mut Account, amount: money) -> Result<(), E
         log.transfer(from.id, to.id, amount)?;  // if this fails → both rolled back
     }
     // After txn { } block completes → changes are committed atomically
-    ret Ok(())
+    return Ok(())
 }
 
 // COMPILE ERROR — irreversible operation inside txn:
@@ -2529,20 +2535,20 @@ fn bad_transfer(from: &mut Account, to: &mut Account, amount: money) {
 
 ```p
 // Money is LINEAR — can be moved, not copied
-pv balance: money = $1000.00
+val balance: money = $1000.00
 
-pv payment1: money = balance    // OK — balance is MOVED (consumed)
-pv payment2: money = balance    // COMPILE ERROR: balance already moved
+val payment1: money = balance    // OK — balance is MOVED (consumed)
+val payment2: money = balance    // COMPILE ERROR: balance already moved
 
 // For account balances (need repeated reads):
 struct Account {
     balance: money_ref,    // reference to money, can be read but not copied
 }
 
-pf debit(account: &mut Account, amount: money) -> Result<(), Error> {
+fn debit(account: &mut Account, amount: money) -> Result<(), Error> {
     // amount is CONSUMED here — caller can't use it again
     account.balance -= amount;
-    ret Ok(())
+    return Ok(())
 }
 ```
 
@@ -2580,17 +2586,17 @@ struct Account<state: AccountState> {
 }
 
 // transfer only works on Active accounts
-pf transfer(from: &mut Account<Active>, to: &mut Account<Active>, amount: money) -> Result<(), Error> { ... }
+fn transfer(from: &mut Account<Active>, to: &mut Account<Active>, amount: money) -> Result<(), Error> { ... }
 
 // COMPILE ERROR: can't transfer from closed account
-pf bad_transfer(from: &mut Account<Closed>) {
+fn bad_transfer(from: &mut Account<Closed>) {
     transfer(from, ...);  // ERROR: expected Account<Active>, got Account<Closed>
 }
 
 // State transitions are explicit and verified
-pf close_account(account: Account<Active>) -> Account<Closed> {
-    guard account.balance == $0.00 => ret Error("Balance must be zero");
-    ret Account<Closed> { ...account }
+fn close_account(account: Account<Active>) -> Account<Closed> {
+    guard account.balance == $0.00 => return Error("Balance must be zero");
+    return Account<Closed> { ...account }
 }
 ```
 
@@ -2616,21 +2622,21 @@ even call `transfer` on a `Closed` account.
 **Impact:** High — prevents timezone, clock-skew, and leap-year bugs
 **Novelty:** Most languages use system clock; Fides provides logical time as explicit parameter
 **Industries:** Banking, finance, medical, aerospace, blockchain
-**Implementation note:** This is a **stdlib struct** (`struct LogicalTime { nanos: i64 }` with methods), not a compiler feature. It will be implemented in Phase 7.5A alongside `@deterministic`, since its only purpose is to give `@deterministic` functions a way to do time math without wall clock access. A type alias (`ty LogicalTime = i64`) would provide zero safety — the compiler must treat it as a distinct type.
+**Implementation note:** This is a **stdlib struct** (`struct LogicalTime { nanos: i64 }` with methods), not a compiler feature. It will be implemented in Phase 7.5A alongside `@deterministic`, since its only purpose is to give `@deterministic` functions a way to do time math without wall clock access. A type alias (`type LogicalTime = i64`) would provide zero safety — the compiler must treat it as a distinct type.
 
 ### Concept
 
 ```p
 // LogicalTime is a pure time type — no timezone, no system clock
 @deterministic
-pf calculate_interest(
+fn calculate_interest(
     principal: money,
     rate_bps: i64,
     start: LogicalDate,
     end: LogicalDate,
 ) -> money {
     let days = date_diff(start, end);  // exact, timezone-free
-    ret (principal * rate_bps * days) / (10000 * 365)
+    return (principal * rate_bps * days) / (10000 * 365)
 }
 
 // ILLEGAL inside @deterministic:
@@ -2667,7 +2673,7 @@ let now = system_clock();  // COMPILE ERROR: system clock not allowed
 
 ```p
 @safety-critical  // Compiler enforces DO-178C / ISO 26262 rules
-pf flight_control_loop(
+fn flight_control_loop(
     sensor_data: &SensorData,
     controls: &mut Controls,
 ) -> Result<(), Error> {
@@ -2684,14 +2690,14 @@ pf flight_control_loop(
     // 10. Cyclomatic complexity ≤ 15 per function
     
     let altitude = sensor_data.altitude;
-    guard altitude > 0 => ret Error("Invalid altitude");
+    guard altitude > 0 => return Error("Invalid altitude");
     
     // Bounded loop — compiler verifies max iterations
     for i in 0..10 {
         controls.adjust(sensor_data.channels[i]);
     }
     
-    ret Ok(())
+    return Ok(())
 }
 ```
 
@@ -2734,11 +2740,11 @@ are compile errors, not late-stage audit findings.
 ```p
 @redundant  // Compiler generates TWO copies of this function on separate cores
 @crashfree
-pf compute_pitch_command(
+fn compute_pitch_command(
     sensor_data: &SensorData,
 ) -> i32 {
     let pitch = sensor_data.alpha * 100 + sensor_data.q * 50;
-    ret pitch.clamp(-1000, 1000)
+    return pitch.clamp(-1000, 1000)
 }
 
 // Compiler generates:
@@ -2775,7 +2781,7 @@ with the compiler ensuring they're identical but independently scheduled.
 
 ```p
 @bounded  // Compiler proves every loop in this function terminates
-pf process_packets(buffer: &Buffer) -> Result<(), Error> {
+fn process_packets(buffer: &Buffer) -> Result<(), Error> {
     // OK — constant trip count
     for i in 0..10 {
         process(buffer.get(i)?);
@@ -2824,7 +2830,7 @@ tools (aiT, Bound-T). Fides enforces it at compile time.
 
 ```p
 @partitioned  // Compiler enforces no shared mutable state between components
-pf avionics_system() {
+fn avionics_system() {
     partition flight_control {
         // Flight control code — own memory region, own time slice
         // Cannot access navigation's memory
@@ -2874,7 +2880,7 @@ shared mutable state between partitions.
 ```p
 @medical  // Compiler enforces IEC 62304 rules
 @audit    // Auto-instrument every function for FDA audit trail
-pf drug_dosage_calculator(
+fn drug_dosage_calculator(
     patient_weight_kg: i64,    // integer, not float (no FP in dosage calc)
     drug_mg_per_kg: i64,
 ) -> Result<i64, Error> {
@@ -2888,13 +2894,13 @@ pf drug_dosage_calculator(
     // 7. No undefined behavior
     // 8. All inputs range-checked
     
-    guard patient_weight_kg > 0 && patient_weight_kg < 500 => ret Error("Invalid weight");
-    guard drug_mg_per_kg > 0 && drug_mg_per_kg < 1000 => ret Error("Invalid dosage");
+    guard patient_weight_kg > 0 && patient_weight_kg < 500 => return Error("Invalid weight");
+    guard drug_mg_per_kg > 0 && drug_mg_per_kg < 1000 => return Error("Invalid dosage");
     
     let dose_mg = patient_weight_kg * drug_mg_per_kg;
-    guard dose_mg < 10000 => ret Error("Dose exceeds safety limit");
+    guard dose_mg < 10000 => return Error("Dose exceeds safety limit");
     
-    ret dose_mg
+    return dose_mg
 }
 ```
 
@@ -2934,7 +2940,7 @@ not audit findings months later.
 
 ```p
 @autosar  // Compiler enforces AUTOSAR coding guidelines
-pf engine_control(
+fn engine_control(
     sensors: &SensorData,
     actuators: &mut Actuators,
 ) -> Result<(), Error> {
@@ -2945,16 +2951,16 @@ pf engine_control(
     // 4. No exceptions (Fides uses Result — already compliant)
     // 5. No goto (Fides has no goto — already compliant)
     // 6. All parameters named and typed
-    // 7. No magic numbers (use pc constants)
+    // 7. No magic numbers (use const constants)
     // 8. Cyclomatic complexity ≤ 15
     // 9. No pointer arithmetic (Fides has no raw pointers in safe mode)
     // 10. Fixed-point math preferred over FP
     
     let rpm = sensors.rpm;
-    guard rpm < MAX_RPM => ret Error("RPM exceeds limit");
+    guard rpm < MAX_RPM => return Error("RPM exceeds limit");
     
     actuators.set_throttle(calculate_throttle(rpm, sensors.load));
-    ret Ok(())
+    return Ok(())
 }
 ```
 
@@ -2984,19 +2990,19 @@ Fides enforces AUTOSAR rules at compile time.
 
 ```p
 @can-bus  // Compiler generates CAN frame encoding/decoding
-pf send_engine_telemetry(ecu: &mut ECU, rpm: i32, temp: i32) -> Result<(), Error> {
+fn send_engine_telemetry(ecu: &mut ECU, rpm: i32, temp: i32) -> Result<(), Error> {
     // Compiler generates CAN frame:
     // - ID: 0x0C0 (engine telemetry, verified at compile time — no collision)
     // - DLC: 8 bytes
     // - Byte 0-3: rpm (i32, little-endian)
     // - Byte 4-7: temp (i32, little-endian)
     can_send(0x0C0, struct { rpm, temp });
-    ret Ok(())
+    return Ok(())
 }
 
 // COMPILE ERROR — CAN ID collision:
 @can-bus
-pf send_brake_status(ecu: &mut ECU, pressure: i32) -> Result<(), Error> {
+fn send_brake_status(ecu: &mut ECU, pressure: i32) -> Result<(), Error> {
     can_send(0x0C0, struct { pressure });  // ERROR: ID 0x0C0 already used by send_engine_telemetry
 }
 ```
@@ -3030,7 +3036,7 @@ Fides verifies uniqueness at compile time.
 @redundant  // Dual-channel execution
 @crashfree  // Proven no panic
 @bounded    // All loops terminate
-pf flight_control_primary(
+fn flight_control_primary(
     sensors: &SensorData,
     controls: &mut FlightControls,
 ) -> Result<(), Error> {
@@ -3053,7 +3059,7 @@ pf flight_control_primary(
     controls.set_elevator(pitch.clamp(-1000, 1000));
     controls.set_ailerons(roll.clamp(-1000, 1000));
     
-    ret Ok(())
+    return Ok(())
 }
 ```
 
@@ -3085,7 +3091,7 @@ rules at compile time, reducing verification cost.
 ```p
 @grid-safe  // Compiler enforces IEC 61850 rules
 @realtime   // WCET analysis, no malloc
-pf protection_relay(
+fn protection_relay(
     current: &SensorData,
     voltage: &SensorData,
     breaker: &mut Breaker,
@@ -3104,7 +3110,7 @@ pf protection_relay(
         goose_send(TRIP_MESSAGE, breaker.id)?;
     }
     
-    ret Ok(())
+    return Ok(())
 }
 ```
 

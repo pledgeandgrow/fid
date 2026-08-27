@@ -122,7 +122,7 @@ Before type-checking, the compiler:
 4. Merges stdlib + imported modules + user code (user wins on conflicts, `extern_decls` merged)
 5. Type-checks the merged program with module-level visibility enforcement
 
-**Standard library modules** (69 modules in `stdlib/`, 17,468 LOC): `core.fd` (auto-included), `vec.fd`, `math.fd`, `string.fd`, `fmt.fd`, `bits.fd`, `sort.fd`, `hash.fd`, `iter.fd`, `stack.fd`, `queue.fd`, `buffer.fd`, `collections.fd`, `result.fd`, `random.fd`, `path.fd`, `units.fd`, `uuid.fd`, `crypto.fd`, `storage.fd`, `clinical.fd`, `medical.fd`, `ecu.fd`, `scada.fd`, `swift.fd`, `grid.fd`, `ota.fd`, `banking.fd`, `kv_cache.fd`, `quant.fd`, `dp.fd`, `shard.fd`, `channel.fd`, `sync.fd`, `parallel.fd`, `ecs.fd`, `events.fd`, `db.fd`, `http.fd`, `json.fd`, `simd.fd`, `shape.fd`, `tensor.fd`, `money.fd`, `alloc.fd`, `file.fd`, `time.fd`, `typed_strings.fd`, `memo.fd`, `privacy.fd`, `env.fd`, `args.fd`, `process.fd`, `regex.fd`, `tilemap.fd`, `sprite.fd`, `flowfield.fd`, `streaming.fd`, `scene.fd`, `physics.fd`, `audio.fd`, `input.fd`, `arinc.fd`, `can.fd`, `fs.fd`, `io.fd`, `os.fd`, `sys.fd` — imported explicitly via `use`.
+**Standard library modules** (69 modules in `stdlib/`, 17,567 LOC): `core.fd` (auto-included), `vec.fd`, `math.fd`, `string.fd`, `fmt.fd`, `bits.fd`, `sort.fd`, `hash.fd`, `iter.fd`, `stack.fd`, `queue.fd`, `buffer.fd`, `collections.fd`, `result.fd`, `random.fd`, `path.fd`, `units.fd`, `uuid.fd`, `crypto.fd`, `storage.fd`, `clinical.fd`, `medical.fd`, `ecu.fd`, `scada.fd`, `swift.fd`, `grid.fd`, `ota.fd`, `banking.fd`, `kv_cache.fd`, `quant.fd`, `dp.fd`, `shard.fd`, `channel.fd`, `sync.fd`, `parallel.fd`, `ecs.fd`, `events.fd`, `db.fd`, `http.fd`, `json.fd`, `simd.fd`, `shape.fd`, `tensor.fd`, `money.fd`, `alloc.fd`, `file.fd`, `time.fd`, `typed_strings.fd`, `memo.fd`, `privacy.fd`, `env.fd`, `args.fd`, `process.fd`, `regex.fd`, `tilemap.fd`, `sprite.fd`, `flowfield.fd`, `streaming.fd`, `scene.fd`, `physics.fd`, `audio.fd`, `input.fd`, `arinc.fd`, `can.fd`, `fs.fd`, `io.fd`, `os.fd`, `sys.fd` — imported explicitly via `use`.
 
 **String concatenation**: `str + str` is lowered to a `p_str_concat` runtime call. Works with literals, variables, and inline function call results. `str + i64` is pointer arithmetic (not concatenation).
 
@@ -143,7 +143,7 @@ After type-checking, generic functions are monomorphized:
 Reads source text character-by-character and produces a `Vec<Token>`.
 
 **Key responsibilities:**
-- Tokenize all Fides keywords (`pf`, `pv`, `pc`, `ret`, `if`, `else`, `for`, `while`, `match`, etc.)
+- Tokenize all Fides keywords (`fn`, `val`, `const`, `return`, `if`, `else`, `for`, `while`, `match`, etc.)
 - Parse integer literals (decimal, hex `0xFF`, binary `0b1010`, octal `0o777`, underscores `1_000`)
 - Parse float literals (`3.14`, `3.14f32`)
 - Parse string literals (`"hello"`)
@@ -174,7 +174,7 @@ Func
 ├── name, params, ret_type, body: Vec<Stmt>, type_params
 
 Stmt
-├── Let { name, ty, init, is_mut }
+├── Let { name, type, init, is_mut }
 ├── Assign { target, op, value }
 ├── Ret { expr }
 ├── If { cond, then_body, else_body }
@@ -209,15 +209,15 @@ Expr
 Validates the AST before lowering. Collects all errors and reports them at once.
 
 **Key responsibilities:**
-- Type inference for `pv` bindings without explicit type
+- Type inference for `val` bindings without explicit type
 - Function call argument type matching
 - Binary operation type compatibility (arithmetic, comparison, logical, bitwise)
 - Struct literal field validation
 - Field access on valid struct types
 - Return statement type matching
 - Pattern match arm type consistency
-- Constant resolution (`pc` constants)
-- Type alias resolution (`ty`)
+- Constant resolution (`const` constants)
+- Type alias resolution (`type`)
 - Generic type parameter registration (simplified)
 
 **Output:** Either `Ok(())` or `Err(Vec<String>)` with all error messages.
@@ -244,14 +244,14 @@ BasicBlock
 └── terminator: Terminator
 
 Inst
-├── Const { value, ty }
+├── Const { value, type }
 ├── ConstStr { value }
 ├── BinOp { op, lhs, rhs }
 ├── UnaryOp { op, operand }
 ├── Call { func, args, ret_ty }
-├── Load { ptr, ty }
+├── Load { ptr, type }
 ├── Store { ptr, value }
-├── Alloca { ty }
+├── Alloca { type }
 ├── GetElemPtr { array_ptr, index, elem_ty }
 ├── GetFieldPtr { struct_ptr, field_index, field_ty }
 ├── StructConstruct { fields }
@@ -348,7 +348,7 @@ The **PE emitter** is the primary native backend. It encodes x86_64 instructions
 - `mov_rr`, `mov_mem_disp_reg`, `mov_mem_disp_reg32` (32-bit store), `mov_r_imm`, `mov_r8_imm`
 - `add_rr`, `sub_rr`, `imul_rr`, `xor_rr`, `and_rr`, `or_rr`
 - `cmp_rr`, `test_rr`, `jcc_label`, `call_label`, `call_reg`, `call_rip`
-- `ret`, `push`, `pop`, `lea_rbp`, `sub_rsp_i32`, `add_rsp_i32`
+- `return`, `push`, `pop`, `lea_rbp`, `sub_rsp_i32`, `add_rsp_i32`
 - `mov_mem_reg8` (byte store for digit conversion)
 
 ### 2.7 x86_64 MASM Code Generator (`x86.rs`)
@@ -552,8 +552,8 @@ The compiler includes a suite of scripts and conventions for maintaining correct
 | `src/parser.rs` | Recursive descent parser: `Vec<Token>` → `Program` |
 | `src/typechecker.rs` | Type validation: `Program` → `Ok` or `Err(Vec<String>)` |
 | `src/ir.rs` | SSA IR definitions: `IrModule`, `IrFunction`, `BasicBlock`, `Inst`, `IrType`, `ValueId` |
-| `src/lower.rs` | AST → SSA IR lowering: `Program` → `IrModule` |
-| `src/interp.rs` | IR interpreter: `IrModule` → execution result |
+| `src/lower.rs` | AST → SSA IR lowering: `Program` → `IrModule`. Auto-deref for &T/&mut T method calls. Drop trait: compiler-inserted `T_drop` calls at function exit (LIFO). `emit_drops()` at return, implicit end, `?` propagation. |
+| `src/interp.rs` | IR interpreter: `IrModule` → execution result. UAF detection: `freed_addresses` + `region_addresses` tracking, Load/Store panic on use-after-free. Re-entrant region blocks with depth-keyed keys. |
 | `src/pe.rs` | **Direct PE emitter**: `IrModule` → x86_64 machine code → PE `.exe` (no external tools) |
 | `src/elf64.rs` | **ELF64 emitter**: PIR L3 → codegen → peephole → ELF64 executable (Linux, zero external tools) + relocatable objects |
 | `src/macho.rs` | **Mach-O emitter**: object files for macOS |
@@ -580,6 +580,7 @@ The compiler includes a suite of scripts and conventions for maintaining correct
 | `src/compiler.rs` | Pipeline orchestration, module resolution, stdlib auto-include, layer/model desugaring |
 | `src/lsp.rs` | **LSP server**: JSON-RPC 2.0 over stdio, diagnostics, no external deps |
 | `src/autograd.rs` | **Autograd**: tape-based gradient computation framework — reverse-mode AD for `grad` blocks |
+| `src/borrowck.rs` | **Borrow checker**: Rules 1-3, field-wise borrows, NLL, @send/@sync, closures (Expr::Closure handled in new scope) |
 | `stdlib/core.fd` | Core standard library (Option<T>, Result<T, E>, println, assert, assert_eq) |
 | `tests/*.fd` | Test programs (hello, struct, struct_return, features2-6, control_flow, functions, strings) |
 
@@ -590,13 +591,13 @@ The compiler includes a suite of scripts and conventions for maintaining correct
 For `tests/strings.fd`:
 
 ```p
-pf main() {
+fn main() {
     print("Hello, World!");
-    pv name = "Fides";
+    val name = "Fides";
     print(name);
-    pv greeting = f"Hello, {name}!";
+    val greeting = f"Hello, {name}!";
     print(greeting);
-    pv x = 42;
+    val x = 42;
     print(f"x = {x}");
 }
 ```
@@ -659,7 +660,7 @@ This phase introduces compile-time guarantees for financial correctness and prod
 
 ### Tuple Destructuring
 
-- `pv (a, b) = expr` — unpack multi-return values
+- `val (a, b) = expr` — unpack multi-return values
 - AST: `Stmt::LetTuple` variant
 - Lowerer: extracts fields with correct types (`Ptr` for structs, `I64` for scalars)
 

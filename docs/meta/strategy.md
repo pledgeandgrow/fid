@@ -285,7 +285,7 @@ master of none.
 make it another D, Crystal, or V — technically good, commercially irrelevant.**
 
 The project has built an impressive amount of working compiler infrastructure
-(84,741 LOC, 54 source files, 116/116 test parity across 3 backends, 69 stdlib
+(85,493 LOC, 54 source files, 146/146 test parity across 3 backends, 69 stdlib
 modules, 6 backends, 4 binaries: fidesc/pacte/scribe/veil). But it's spreading into too many domains (games,
 blockchain, robotics, medical, serverless) before it has proven it can do the
 basics better than existing languages.
@@ -331,7 +331,7 @@ Fides source
   └── Hot reload (native JIT)
 ```
 
-116/116 test parity across interpreter, PE, and C codegen is real. This is more
+146/146 test parity across interpreter, PE, and C codegen is real. This is more
 backends than most languages ever achieve. History lesson: **"A great runtime
 can sustain multiple languages"** — Fides's IR is its "runtime" and it supports
 many targets.
@@ -354,7 +354,7 @@ doesn't burden the language forever. Scala should have done this. C++ couldn't.
 
 - 265/265 unit tests (cargo test --lib)
 - harness tests 8/8 passed
-- 116/116 interpreter + PE + C codegen (All passing)
+- 146/146 interpreter + PE, 146/146 C codegen
 - `verify.sh` with baseline tracking
 - Golden file generation
 - Bisect tooling
@@ -486,10 +486,10 @@ to choose a systems language.
 ~~Multiple docs are out of sync with reality:~~
 **UPDATE Aug 2026:** Docs have been synchronized with actual state. All test
 counts, LOC, file counts, and phase numbers now match verified reality:
-- `features.md` now says "116/116 C codegen — full parity" ✅
-- `features.md` now says "116/116 interpreter" ✅
-- `roadmap-limitations.md` now says "116/116 normal" ✅
-- `roadmap.md` summary now says "116/116" ✅
+- `features.md` now says "146/146 C codegen" ✅
+- `features.md` now says "146/146 interpreter" ✅
+- `roadmap-limitations.md` now says "146/146 normal" ✅
+- `roadmap.md` summary now says "146/146" ✅
 - Phase numbers updated (self-hosting is Phase 10, ecosystem Phase 11, world class Phase 12) ✅
 
 This was a symptom of moving fast without updating all docs. The docs now
@@ -497,7 +497,7 @@ match reality. A pre-commit check would prevent future drift.
 
 ### 5. 214 Compiler Warnings 🟡
 
-214 warnings in the Rust compiler means ~60 unused imports, dead code, and
+225 warnings in the Rust compiler means ~60 unused imports, dead code, and
 type naming issues. This is technical debt that accumulates. Every warning is
 a potential bug or a sign of abandoned code paths. The roadmap mentions
 "remove debug eprintln! statements" but the actual count is ~238 compiler warnings (dead code, unused variables).
@@ -633,7 +633,7 @@ well. Cut the rest until those 3 prove the concept.
 Every doc should be updated when test counts change. ~~The current state where
 `features.md` says 76/78 but reality is 114/114 is unacceptable for a project
 that wants to be taken seriously.~~ **UPDATE Aug 2026: All docs now match
-verified reality (116/116 interpreter+PE+C codegen).**
+verified reality (146/146 interpreter+PE, 146/146 C codegen).**
 
 **Recommendation:** Add a pre-commit check: run `fidesc test`, compare
 output to docs, fail if mismatch. Or at minimum, update all docs in the same
@@ -717,7 +717,7 @@ candidate:
 | Dimension | Score | Notes |
 |-----------|-------|-------|
 | Novel design space | 🟢 9/10 | Unique combination no one else has |
-| Technical execution | 🟢 8/10 | 116/116 parity, 6 backends, solid test infra |
+| Technical execution | 🟢 8/10 | 146/146 parity, 6 backends, solid test infra |
 | Scope discipline | 🔴 3/10 | Trying to do everything at once |
 | Ecosystem building | 🔴 2/10 | No users, no packages, no tooling |
 | Focus / prioritization | 🟡 5/10 | Optimizer enabled by default, but still adding features instead of fixing regalloc |

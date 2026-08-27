@@ -76,19 +76,15 @@ pub struct AutogradResult {
 }
 
 /// Process a module: find grad blocks, trace operations, generate backward code.
-/// Currently, this is a placeholder that marks grad blocks for future processing.
-/// The actual transform will be implemented as an IR-level pass.
+///
+/// Autodiff is implemented as a **runtime** engine in the interpreter, not as
+/// an IR-level transform. The lowerer emits `GradBegin`/`GradEnd`/`Backward`
+/// instructions, and the interpreter builds a tape at runtime and computes
+/// gradients when `Backward` is executed.
+///
+/// This function is kept for API compatibility but is a no-op. The actual
+/// gradient computation happens in `Interpreter::run_backward()`.
 pub fn process_module(module: &mut IrModule) {
-    // For now, grad blocks are lowered as normal code by lower.rs.
-    // The backward() statement is a no-op marker.
-    // A full implementation would:
-    // 1. Walk the IR in each function
-    // 2. Identify grad blocks (marked by RegionBegin or a special instruction)
-    // 3. Build the computation tape
-    // 4. Generate backward pass instructions
-    // 5. Replace the grad block with forward + backward code
-    //
-    // This is left as a framework for future implementation.
     let _ = module;
 }
 

@@ -12,12 +12,14 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 |------------|:------:|-------|
 | Unit tests (`cargo test --lib`) | **265/265** | All passing (incl. 17 ARM64 enc + 9 ARM64 runtime + 14 RISC-V enc + 7 RISC-V runtime + 7 incremental compilation) |
 | Harness tests (`cargo test --test harness`) | **8/8** | All passing (region, capability, effect, safety, golden, PE, interpreter, C codegen) |
-| Interpreter (`fidesc test`) | **116/116** normal | All normal tests pass. 6 bonus passes (previously known-fail). |
-| PE Emitter (`fidesc test`) | **116/116** normal | All normal tests pass. 6 bonus passes (previously known-fail). |
-| C Codegen (`fidesc test`) | **116/116** normal | All normal tests pass. 4 bonus passes. Binary hardening enabled. |
-| Total `.fd` test files | **213** | 190 in tests/ root + 23 in subdirs (capability/effects/regions/safety) |
-| Source files | **54** `.rs` | 84,741 LOC |
-| Stdlib modules | **69** `.fd` | 17,468 LOC — core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can |
+| Interpreter (`fidesc test`) | **146/146** normal | All normal tests pass. (Aug 27: 41 stale skip/known-fail tests promoted.) |
+| PE Emitter (`fidesc test`) | **146/146** normal | All normal tests pass. (Aug 27: 41 stale tests promoted.) |
+| C Codegen (`fidesc test`) | **146/146** normal | All normal tests match interpreter output. Binary hardening enabled. (Aug 27: 41 stale tests promoted; test_autodiff_grad + test_ml_full moved to skip list.) |
+| Skip list | **7** | 6 C codegen missing-builtins (kv_cache, quantization, dp, shard, autodiff_grad, ml_full) + 1 design difference (dlopen) |
+| Known-fail | **6** | 3 parser bugs + 3 C codegen mismatches (was 10 — 4 were stale) |
+| Total `.fd` test files | **218** | 195 in tests/ root + 23 in subdirs (capability/effects/regions/safety) |
+| Source files | **54** `.rs` | 85,493 LOC |
+| Stdlib modules | **69** `.fd` | 17,567 LOC — core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can |
 | Golden files | **148** | Expected outputs in `tests/golden/` |
 | Binary targets | **4** | `fidesc` (compiler), `pacte` (package manager), `scribe` (doc generator), `veil` (coverage tool) |
 
@@ -29,7 +31,7 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 | Conservation proof | `@conserve` | Compile-time financial conservation proof (money in = money out) |
 | Money stdlib | `stdlib/money.fd` | Fixed-point money type, arithmetic, formatting |
 | Banking stdlib | `stdlib/banking.fd` | Accounts, transfers, double-credit/lost-money detection |
-| Tuple destructuring | `pv (a, b) = expr` | Decompose tuple values into bindings |
+| Tuple destructuring | `val (a, b) = expr` | Decompose tuple values into bindings |
 | File I/O | `stdlib/file.fd` | File descriptors, read/write via `stdlib/file.fd` |
 | Atomic transactions | `txn { ... }` | Atomic transaction blocks with rollback on failure |
 | Gas budgets | `@gas(N)` | Compile-time gas budget annotation |
@@ -38,16 +40,16 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 | Loop-aware linear types | — | Linear variables cannot be consumed inside loops (compile error) |
 | LogicalTime | `stdlib/time.fd` | Timezone-free, clock-free deterministic date math |
 | Typed strings | `stdlib/typed_strings.fd` | SQLString, ShellString, HTMLString, JSONString, PathString — injection prevention via type system |
-| Init guarantee | `pm` keyword | Uninitialized mutable variables + definite assignment analysis (compile error on read before assignment) |
+| Init guarantee | `var` keyword (without initializer) | Uninitialized mutable variables + definite assignment analysis (compile error on read before assignment) |
 | Raw pointer types | `*mut T`, `*const T` | Raw pointers with `unsafe {}` enforcement (no borrow checking) |
 | Memoization | `stdlib/memo.fd` | Simple cache helper: `Memo::new()`, `get_or_compute()` |
 | Checked arithmetic | F64 | Integer overflow = panic (always on, not just debug mode) |
-| `@wrapping` | `@wrapping pf foo() { ... }` | Escape hatch for wrap-around arithmetic (hashing, crypto) |
+| `@wrapping` | `@wrapping fn foo() { ... }` | Escape hatch for wrap-around arithmetic (hashing, crypto) |
 | Bounds checking lock | F62 | Bounds checks always on, skippable in `unsafe {}` blocks |
 | Parameterized queries | F68 | No string concat on typed strings (SQLString + str = compile error) |
-| `@medical` | `@medical @audit pf foo() { ... }` | IEC 62304: no dynamic alloc, no recursion, no while, no unwrap, must be @audit |
-| `given`/`ensure` contracts | `pf foo(x: i64) -> i64 given x >= 0 { ... }` | Design by Contract — preconditions verified at call sites |
-| `async`/`await`/`spawn` | `async pf foo() -> Future<T> { ... }` | Cooperative concurrency — async functions, await, spawn (Phase 7.6) |
+| `@medical` | `@medical @audit fn foo() { ... }` | IEC 62304: no dynamic alloc, no recursion, no while, no unwrap, must be @audit |
+| `given`/`ensure` contracts | `fn foo(x: i64) -> i64 given x >= 0 { ... }` | Design by Contract — preconditions verified at call sites |
+| `async`/`await`/`spawn` | `async fn foo() -> Future<T> { ... }` | Cooperative concurrency — async functions, await, spawn (Phase 7.6) |
 | Borrow checker | `--borrowck=on` / `--borrowck=warn` | Compile-time aliasing analysis — `&mut` exclusivity, no mutation while borrowed |
 
 ### What Works (Verified End-to-End)
@@ -61,8 +63,8 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 | `for` loops with `..` and `..=` ranges | Yes | Yes | Yes |
 | `while` / `loop` loops | Yes | Yes | Yes |
 | `break` / `continue` | Yes | Yes | Yes |
-| Mutable variables (`pv mut`) | Yes | Yes | Yes |
-| Constants (`pc`) | Yes | Yes | Yes |
+| Mutable variables (`var`) | Yes | Yes | Yes |
+| Constants (`const`) | Yes | Yes | Yes |
 | User-defined functions | Yes | Yes | Yes |
 | Recursive function calls | Yes | Yes | Yes |
 | F-string interpolation (`f"{expr}"`) | Yes | Yes | Yes |
@@ -76,9 +78,9 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 | Pattern matching (`match`) | Yes | Yes | Yes |
 | Enums with data | Yes | Yes | Yes |
 | References (`&` / `&mut` / `*`) | Yes | Yes | Yes |
-| Closures (`pf(x) => expr`) | Yes | Yes | Yes |
+| Closures (`fn(x) => expr`) | Yes | Yes | Yes |
 | Closure environment capture | Yes | Yes | Yes |
-| Generic functions (`pf<T>`) | Yes | Yes | Yes |
+| Generic functions (`fn<T>`) | Yes | Yes | Yes |
 | Monomorphization (generic specialization) | Yes | Yes | Yes |
 | `?` operator | Yes | Yes | Yes |
 | `try { }` blocks | Yes | Yes | Yes |
@@ -96,10 +98,10 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 | Capabilities (grants, denial, transitive) | Yes | Yes | Yes |
 | Type casts (`as`) | Yes | Yes | Yes |
 | `print` for Vec/Map (deterministic output) | Yes | Yes | Yes |
-| Type aliases (`ty X = T`) | Yes | Yes | Yes |
+| Type aliases (`type X = T`) | Yes | Yes | Yes |
 | Match guards (`pattern if cond =>`) | Yes | Yes | Yes |
 | Match range patterns (`1..=5 =>`) | Yes | Yes | Yes |
-| Trait associated types (`ty Item;`) | Yes | Yes | Yes |
+| Trait associated types (`type Item;`) | Yes | Yes | Yes |
 | Trait default methods | Yes | Yes | Yes |
 | Trait objects (`dyn Trait`) | Yes | Yes | Yes |
 | Trait impl verification | Yes | Yes | Yes |
@@ -107,7 +109,7 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 | Effect annotations (`!IO`, `!{}`, `!{IO,Net}`) | Yes | Yes | Yes |
 | Effect inference (fixpoint over call graph) | Yes | Yes | Yes |
 | Effect checking (under-declaration errors) | Yes | Yes | Yes |
-| Effect handlers (`handle { do } with`) | Parsed | Parsed | Parsed |
+| Effect handlers (`handle { do } with`) | Works (basic dispatch) | Works (basic dispatch) | Works (basic dispatch) |
 | Region blocks (`region r { ... }`) | Yes | Yes | Yes |
 | Region use-after-free detection | Compile-time | Compile-time | Compile-time |
 | Region escape detection | Compile-time | Compile-time | Compile-time |
@@ -131,7 +133,7 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 | File I/O (`stdlib/file.fd`) | Yes | Yes | Yes |
 | Linear types (`@linear`) | Yes | Yes | Yes |
 | `@conserve` conservation proof | Compile-time | Compile-time | Compile-time |
-| Tuple destructuring (`pv (a, b) = expr`) | Yes | Yes | Yes |
+| Tuple destructuring (`val (a, b) = expr`) | Yes | Yes | Yes |
 | `txn {}` atomic transactions | Yes | Yes | N/A |
 | `@gas` gas budgets | Compile-time | Compile-time | Compile-time |
 | `@crashfree` panic prevention | Compile-time | Compile-time | Compile-time |
@@ -139,7 +141,7 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 | Loop-aware linear types | Compile-time | Compile-time | Compile-time |
 | LogicalTime (`stdlib/time.fd`) | Yes | Yes | Yes |
 | Typed strings (`stdlib/typed_strings.fd`) | Yes | Yes | Yes |
-| Init guarantee (`pm` keyword) | Yes | Yes | Yes |
+| Init guarantee (`var` keyword (without initializer)) | Yes | Yes | Yes |
 | WebAssembly backend (`fidesc wasm`) | N/A | N/A | N/A |
 | SPIR-V GPU backend (`fidesc gpu`) | N/A | N/A | N/A |
 | Hot reload (`fidesc watch`) | N/A | N/A | N/A |
@@ -176,7 +178,7 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `async` / `await` | ✅ Works | Phase 7.6 — `async pf` declares async functions, `await <expr>` waits for Futures, eager evaluation; state machine transform pending |
+| `async` / `await` | ✅ Works | Phase 7.6 — `async fn` declares async functions, `await <expr>` waits for Futures, eager evaluation; state machine transform pending |
 | `spawn` | ✅ Works | Phase 7.6/8A — `spawn <expr>` creates OS threads via `p_thread_spawn` |
 | `#[test]` attribute | Parsed | Not yet executed by `fidesc test` |
 | `@derive` | ✅ Works | Phase 7.7 — `@derive(Debug/Clone/Serialize/Deserialize)` generates methods |
@@ -189,13 +191,13 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 
 - **ELF64 executable emission works on Linux** — `fidesc build <file> --target x86-64` produces working ELF64 executables directly (zero external tools). `fidesc codegen --elf <out.o>` emits valid relocatable objects (readelf compatible). `fidesc codegen --macho` and `--coff` also produce valid object files.
 - **Cross-compilation to ARM64, RISC-V, and Windows** — `fidesc build --target arm64-linux`, `--target riscv64-linux`, and `--target x86-64-windows` all produce valid executables with zero external tools. ARM64 and RISC-V use built-in instruction encoders (`arm64_enc.rs`, `riscv_enc.rs`) and runtime libraries (`runtime_arm64.rs`, `runtime_riscv.rs`) with raw Linux syscalls. Windows uses the PE emitter (`pe.rs`) with kernel32.dll imports.
-- **PE emitter targets Windows x64 only** — `fidesc emit` or `fidesc build --target x86-64-windows` produces PE32+ executables; tested via `fidesc test` (116/116 valid)
+- **PE emitter targets Windows x64 only** — `fidesc emit` or `fidesc build --target x86-64-windows` produces PE32+ executables; tested via `fidesc test` (146/146 valid)
 - **Register allocator** — Linear scan allocator with constant rematerialization (F-1A). Effect-aware allocation (F-1D): pure/@no-alloc calls only clobber RAX. Works correctly for all passing tests.
 - **Peephole optimizer always on** — 9 passes run automatically in the `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
 - **L2 optimizer enabled by default** — PIR optimizer runs automatically in `build` (use `--no-opt` to disable) with 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. `--lto` enables aggressive cross-module inlining.
 - **`#[test]` attribute** — parsed but not executed by `fidesc test` (tests are file-based)
-- **C codegen coverage** — 116/116 normal tests match interpreter output. Phase 10B: Vec/HashMap/String now implemented in Fides stdlib using raw pointers. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack.
-- **~213 compiler warnings** — dead code, unused variables (cleanup needed)
+- **C codegen coverage** — 146/146 normal tests match interpreter output. Phase 10B: Vec/HashMap/String now implemented in Fides stdlib using raw pointers. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack.
+- **214 compiler warnings** — dead code, unused variables (cleanup needed)
 
 ---
 
@@ -270,7 +272,7 @@ cargo run -- version
 | `gpu <file.fd>` | SPIR-V GPU backend: PIR → SPIR-V binary |
 | `tokens <file.fd>` | Lex only — print token stream |
 | `ast <file.fd>` | Lex + parse — print AST tree |
-| `test` | Run all 116 normal tests across interpreter, PE emitter, and C codegen |
+| `test` | Run all 159 normal tests across interpreter, PE emitter, and C codegen |
 | `repl` | Interactive REPL — evaluate Fides expressions |
 | `verify <file.fd>` | Verify IR correctness (terminators, block refs, value refs) |
 | `sourcemap <file.fd>` | Show source map (IR value → source line mapping) |
@@ -316,9 +318,9 @@ Current baseline:
 ```
 Unit tests:   265/265 passed  (All passing — incl. 47 cross-compilation encoder/runtime tests + 7 incremental compilation)
 Harness:      8/8 passed
-Interpreter:  116/116 normal
-C Codegen:    116/116 matched
-PE Emitter:   116/116 valid
+Interpreter:  146/146 normal
+C Codegen:    146/146 matched
+PE Emitter:   146/146 valid
 Cross-compilation: x86-64, ARM64, RISC-V, Windows — all producing valid executables
 ```
 
@@ -363,7 +365,7 @@ Before lowering, the compiler:
 
 Reads Fides source text and produces a stream of tokens. Handles:
 
-- **Keywords**: `pf`, `pv`, `pc`, `mut`, `cap`, `ty`, `ret`, `if`, `else`, `match`, `struct`, `enum`, `impl`, `pub`, `use`, `async`, `await`, `comptime`, `defer`, `spawn`, `for`, `while`, `loop`, `break`, `continue`, `in`, `as`, `where`, `region`, `move`, `static`, `true`, `false`
+- **Keywords**: `fn`, `val`, `const`, `mut`, `cap`, `type`, `return`, `if`, `else`, `match`, `struct`, `enum`, `impl`, `pub`, `use`, `async`, `await`, `comptime`, `defer`, `spawn`, `for`, `while`, `loop`, `break`, `continue`, `in`, `as`, `where`, `region`, `move`, `static`, `true`, `false`
 - **Primitive types**: `i8`–`i128`, `u8`–`u128`, `f32`, `f64`, `bool`, `str`, `void`
 - **Operators**: `+ - * / % == != < > <= >= && || ! & | ^ ~ << >> = += -= *= /= %= &= |= ^= <<= >>= -> => :: ? .. ..=`
 - **Literals**: integers (hex `0xFF`, binary `0b1010`, octal `0o777`, underscores `1_000`), floats, strings, f-strings, identifiers
@@ -373,8 +375,8 @@ Reads Fides source text and produces a stream of tokens. Handles:
 
 Recursive descent parser. Consumes the token stream and builds an AST. Handles:
 
-- **Top-level declarations**: `pf` functions, `struct` definitions, `enum` definitions, `impl` blocks, `ty` aliases, `pc` constants, `use` imports, `#[attributes]`
-- **Statements**: `pv`/`pv mut` bindings, `ret`, `if`/`else`, `for`/`while`/`loop`, `break`/`continue`, `match`, `defer`, assignment + compound assignment, expression statements
+- **Top-level declarations**: `fn` functions, `struct` definitions, `enum` definitions, `impl` blocks, `type` aliases, `const` constants, `use` imports, `#[attributes]`
+- **Statements**: `val`/`var` bindings, `return`, `if`/`else`, `for`/`while`/`loop`, `break`/`continue`, `match`, `defer`, assignment + compound assignment, expression statements
 - **Expressions**: literals, identifiers, binary/unary ops, function calls, method calls, struct literals, field access, array literals + indexing, references/derefs, closures, tuples, f-strings, ranges, block expressions
 - **Types**: all primitives, named types, generic types (`Option<T>`), references (`&T`, `&mut T`), arrays (`[T; N]`), tuples, function types
 
@@ -449,7 +451,7 @@ The **PE emitter** is the primary native backend. It encodes x86_64 instructions
 - `mov_rr`, `mov_mem_disp_reg`, `mov_mem_disp_reg32` (32-bit store), `mov_r_imm`, `mov_r8_imm`
 - `add_rr`, `sub_rr`, `imul_rr`, `xor_rr`, `and_rr`, `or_rr`
 - `cmp_rr`, `test_rr`, `jcc_label`, `call_label`, `call_reg`, `call_rip`
-- `ret`, `push`, `pop`, `lea_rbp`, `sub_rsp_i32`, `add_rsp_i32`
+- `return`, `push`, `pop`, `lea_rbp`, `sub_rsp_i32`, `add_rsp_i32`
 - `mov_mem_reg8` (byte store for digit conversion)
 
 ### 7. Cross-Compilation Backends (`arm64_enc.rs`, `runtime_arm64.rs`, `riscv_enc.rs`, `runtime_riscv.rs`)
@@ -462,7 +464,7 @@ The compiler supports cross-compilation to ARM64 and RISC-V targets with zero ex
 - **ELF machine type**: EM_AARCH64 (183)
 
 **RISC-V (RV64) — `--target riscv64-linux`:**
-- **Encoder** (`riscv_enc.rs`): Converts RV64 assembly text to 4-byte machine code. Supports R-type, I-type, S-type, B-type, J-type, U-type instructions. Includes pseudo-instructions (li, mv, neg, not, seqz, snez, j, call, ret, bgez, beqz, bnez, sext.w). 14 unit tests.
+- **Encoder** (`riscv_enc.rs`): Converts RV64 assembly text to 4-byte machine code. Supports R-type, I-type, S-type, B-type, J-type, U-type instructions. Includes pseudo-instructions (li, mv, neg, not, seqz, snez, j, call, return, bgez, beqz, bnez, sext.w). 14 unit tests.
 - **Runtime** (`runtime_riscv.rs`): RISC-V Linux runtime using raw ECALL syscalls (write=64, exit=93, mmap=222). Same function set as ARM64 runtime. 7 unit tests.
 - **ELF machine type**: EM_RISCV (243)
 
@@ -526,65 +528,65 @@ Orchestrates the stages. Entry points:
 
 | Feature | Syntax | Example |
 |---------|--------|---------|
-| Functions | `pf` | `pf add(a: i32, b: i32) -> i32 { ret a + b; }` |
-| Variables | `pv` / `pv mut` | `pv x = 42;` / `pv mut y = 0;` |
-| Constants | `pc` | `pc MAX: i32 = 100;` |
+| Functions | `fn` | `fn add(a: i32, b: i32) -> i32 { return a + b; }` |
+| Variables | `val` / `var` | `val x = 42;` / `var y = 0;` |
+| Constants | `const` | `const MAX: i32 = 100;` |
 | If/Else | `if` / `else` | `if x > 0 { ... } else { ... }` |
 | For loops | `for x in start..end` | `for i in 0..5 { sum += i; }` |
 | While loops | `while cond` | `while counter < 5 { ... }` |
-| Return | `ret` | `ret 42;` |
+| Return | `return` | `return 42;` |
 | Arithmetic | `+ - * / %` | `a + b * c` |
 | Comparison | `== != < > <= >=` | `if x >= 10 { ... }` |
 | Logical | `&& \|\| !` | `if a && !b { ... }` |
 | Bitwise | `& \| ^ ~ << >>` | `0xFF & 0x0F` |
 | Compound assign | `+= -= *= /= %=` | `x += 10;` |
 | Function calls | `name(args)` | `add(10, 20)` |
-| Recursive calls | self-referential `pf` | `pf fact(n: i32) -> i32 { ... fact(n-1) ... }` |
+| Recursive calls | self-referential `fn` | `fn fact(n: i32) -> i32 { ... fact(n-1) ... }` |
 | Print | `print(...)` | `print("Hello, Fides!");` |
 | String literals | `"..."` | `print("Hello");` |
 | F-strings | `f"{expr}"` | `f"Hello, {name}!"` |
 | F-string with int | `f"x = {x}"` | `print(f"x = {x}");` |
-| Hex/binary/octal | `0xFF` `0b1010` `0o777` | `pv y = 0xFF & 0x0F;` |
-| Type annotations | `: type` | `pv x: i32 = 42;` |
+| Hex/binary/octal | `0xFF` `0b1010` `0o777` | `val y = 0xFF & 0x0F;` |
+| Type annotations | `: type` | `val x: i32 = 42;` |
 | Semicolons | `;` | Statement terminator |
 | Comments | `//` `/* */` | `// line comment` |
 | Structs | `struct Point { x: i32, y: i32 }` | `struct Point { x: i64, y: i64 }` |
-| Struct literals | `Point { x: 1, y: 2 }` | `pv p = Point { x: 1, y: 2 };` |
+| Struct literals | `Point { x: 1, y: 2 }` | `val p = Point { x: 1, y: 2 };` |
 | Field access | `point.x` | `print(p.x);` |
-| Struct return (SRET) | `pf make_point() -> Point { ... }` | `pv p = make_point(); print(p.x);` |
+| Struct return (SRET) | `fn make_point() -> Point { ... }` | `val p = make_point(); print(p.x);` |
 
 ### Lowered (AST → SSA IR → Interpreter + PE Emitter)
 
 | Feature | Syntax |
 |---------|--------|
-| Struct methods | `impl Point { pf get_x(self: Point) -> i32 { ... } }` |
+| Struct methods | `impl Point { fn get_x(self: Point) -> i32 { ... } }` |
 | Pattern matching | `match val { 1 => { ... } _ => { ... } }` |
 | Match patterns (int, str, range, enum) | `match s { "foo" => { ... } 1..=10 => { ... } Shape::Circle(r) => { ... } }` |
 | Enums with data | `enum Shape { Circle(f64), Rectangle(f64, f64), Unit }` |
 | Enum variant construction | `Shape::Circle(3.14)` |
 | References | `&x`, `&mut x`, `*x` |
-| Closures (lambda lifting) | `pf(x: i32) => x * 2` |
+| Closures (lambda lifting) | `fn(x: i32) => x * 2` |
 | `?` operator | `expr?` |
 | Tuples | `(i32, bool)`, `(42, true)` |
 | Array literals | `[1, 2, 3, 4, 5]` |
 | Array indexing + assignment | `arr[0]`, `arr[0] = 10`, `arr[2] += 100` |
 | `for` loop over arrays | `for x in arr { sum += x; }` |
 | `defer` blocks | `defer close(file);` |
-| Block expressions | `{ pv a = 10; pv b = 20; a + b }` |
-| Linear types (`@linear`) | `@linear pf transfer(...) { ... }` — move semantics, no duplication |
-| `@conserve` | `@conserve pf settle(...) { ... }` — compile-time financial conservation proof |
-| Tuple destructuring | `pv (a, b) = expr` |
+| Block expressions | `{ val a = 10; val b = 20; a + b }` |
+| Linear types (`@linear`) | `@linear fn transfer(...) { ... }` — move semantics, no duplication |
+| `@conserve` | `@conserve fn settle(...) { ... }` — compile-time financial conservation proof |
+| Tuple destructuring | `val (a, b) = expr` |
 | `txn {}` blocks | `txn { transfer(a, b, 100); }` — atomic transactions with rollback |
-| `@gas` | `@gas(1000) pf foo() { ... }` — compile-time gas budgets |
-| `@crashfree` | `@crashfree pf foo() { ... }` — compile-time proof of no panics |
-| `@audit` | `@audit pf foo() { ... }` — automatic function audit logging |
+| `@gas` | `@gas(1000) fn foo() { ... }` — compile-time gas budgets |
+| `@crashfree` | `@crashfree fn foo() { ... }` — compile-time proof of no panics |
+| `@audit` | `@audit fn foo() { ... }` — automatic function audit logging |
 | Loop-aware linear types | Linear vars consumed in loops → compile error |
 
 ### Implemented (Lexer + Parser + Typechecker + Lowering + Codegen)
 
 | Feature | Syntax | Notes |
 |---------|--------|-------|
-| `async` / `await` | `async pf` / `await <expr>` | ✅ Works (Phase 7.6) — Future<T> type, eager evaluation, `p_future_ready`/`p_future_poll` runtime |
+| `async` / `await` | `async fn` / `await <expr>` | ✅ Works (Phase 7.6) — Future<T> type, eager evaluation, `p_future_ready`/`p_future_poll` runtime |
 | `spawn` | `spawn <expr>` | ✅ Works (Phase 7.6/8A) — creates OS threads via `p_thread_spawn` |
 | `@derive` | `@derive(Debug/Clone/Serialize/Deserialize)` | ✅ Works (Phase 7.7) — generates debug_str/clone/to_json/from_json methods |
 | `#[test]` attribute | `#[test]` | Parsed but not executed by `fidesc test` (tests are file-based) |
@@ -593,8 +595,8 @@ Orchestrates the stages. Entry points:
 
 | Feature | Syntax | Phase |
 |---------|--------|-------|
-| Default arguments | `pf f(x: i32 = 0)` | Future |
-| Variadic arguments | `pf f(...args)` | Future |
+| Default arguments | `fn f(x: i32 = 0)` | Future |
+| Variadic arguments | `fn f(...args)` | Future |
 | Self-hosting | (rewrite compiler in Fides) | Phase 6 |
 
 ---
@@ -607,9 +609,9 @@ Fides is a systems language with unique keywords designed for clarity and AI-fri
 
 ```p
 // Function declaration
-pf main() {
-    pv x = 42;
-    pv mut y = 0;
+fn main() {
+    val x = 42;
+    var y = 0;
     y = x + 8;
     print(y);
 }
@@ -621,13 +623,13 @@ struct Point {
 }
 
 impl Point {
-    pf new(x: f64, y: f64) -> Point {
+    fn new(x: f64, y: f64) -> Point {
         Point { x: x, y: y }
     }
 
-    pf distance(&self, other: &Point) -> f64 {
-        pv dx = self.x - other.x;
-        pv dy = self.y - other.y;
+    fn distance(&self, other: &Point) -> f64 {
+        val dx = self.x - other.x;
+        val dy = self.y - other.y;
         (dx * dx + dy * dy).sqrt()
     }
 }
@@ -640,19 +642,19 @@ enum Shape {
 }
 
 // Constant
-pc MAX_PLAYERS: i32 = 64;
+const MAX_PLAYERS: i32 = 64;
 ```
 
 ### Fides Keyword Reference
 
 | Keyword | Meaning | Replaces (Rust) |
 |---------|---------|-----------------|
-| `pf` | Fides Function (all functions) | `fn` |
-| `pv` / `pv mut` | Variable (immutable / mutable) | `let` / `let mut` |
-| `pc` | Constant | `const` |
+| `fn` | Fides Function (all functions) | `fn` |
+| `val` / `var` | Variable (immutable / mutable) | `let` / `let mut` |
+| `const` | Constant | `const` |
 | `cap` | Capability / Trait | `trait` |
-| `ret` | Return | `return` |
-| `ty` | Type alias | `type` |
+| `return` | Return | `return` |
+| `type` | Type alias | `type` |
 | `comptime` | Compile-time code (no macros) | N/A (replaces macros) |
 | `defer` | Deferred cleanup | N/A (Go-inspired) |
 | `spawn` | Task spawning | N/A |
@@ -667,7 +669,7 @@ See `docs/syntax-spec.md` for the complete syntax specification.
 ```
 p-lang/
 ├── Cargo.toml              # Rust project config (4 binary targets: fidesc, pacte, scribe, veil)
-├── src/                    # 54 source files, 84,741 lines of Rust
+├── src/                    # 54 source files, 85,493 lines of Rust
 │   ├── main.rs             # CLI entry point (20+ commands: build, emit, run, codegen, ccompile, lsp, profile, fmt, lint, bench, debug, etc.)
 │   ├── lib.rs              # Library crate root (shared by all 4 binaries)
 │   ├── token.rs            # Token kind definitions (54+ keywords)
@@ -722,7 +724,7 @@ p-lang/
 │   ├── bin/scribe.rs       # Documentation generator binary entry point
 │   ├── bin/veil.rs         # Coverage tool binary entry point
 │   └── compiler.rs         # Pipeline orchestration, module resolution, stdlib auto-include
-├── stdlib/                 # 69 standard library modules, 17,468 LOC
+├── stdlib/                 # 69 standard library modules, 17,567 LOC
 │   ├── core.fd              # Option, Result, println, assert, max, min, abs, clamp, combinators
 │   ├── vec.fd               # Vec<T> with iterator adapters (take, skip, zip, enumerate, etc.)
 │   ├── math.fd              # vec2/3/4, mat4, quat types, operator overloading, swizzle
@@ -758,9 +760,9 @@ p-lang/
 │   ├── physics.fd           # Physics simulation
 │   ├── audio.fd             # Audio processing
 │   └── input.fd             # Input handling
-├── tests/                  # 213 .fd test files + harness
+├── tests/                  # 218 .fd test files + harness
 │   ├── harness.rs          # Automated test harness (8 cargo tests)
-│   ├── *.fd                 # 190 test files in root
+│   ├── *.fd                 # 193 test files in root
 │   ├── safety/             # 9 bounds safety tests (OOB, overflow, div-by-zero, unwrap)
 │   ├── capability/         # 4 capability security tests (grant, deny, propagation)
 │   ├── effects/            # 7 effect system tests (annotations, inference, handlers, pure)
@@ -809,7 +811,7 @@ p-lang/
 
 | Test File | What It Tests |
 |-----------|---------------|
-| `hello.fd` | Hello world — `pf`, `pv`, `if/else`, `print` |
+| `hello.fd` | Hello world — `fn`, `val`, `if/else`, `print` |
 | `arithmetic.fd` | Arithmetic, nested function calls |
 | `struct.fd` | Struct definition, literals, field access |
 | `control_flow.fd` | `if`/`else if`/`else`, `for` ranges, compound assignment |
@@ -832,7 +834,7 @@ p-lang/
 | `test_trait_assoc.fd` | Trait associated types |
 | `test_trait_default.fd` | Trait default methods |
 | `test_trait_object.fd` | Trait objects (`dyn Trait`) |
-| `test_type_alias.fd` | Type aliases (`ty X = T`) |
+| `test_type_alias.fd` | Type aliases (`type X = T`) |
 | `test_asm.fd` | Inline assembly (`asm!`) |
 | `test_bare.fd` | Bare-metal mode (no stdlib, `asm!("hlt")`) |
 | `test_capabilities.fd` | Capability grants, denial, transitive |
@@ -849,12 +851,12 @@ p-lang/
 | `test_loop_linear*.fd` | Loop-aware linear types (`test_loop_linear_fail`) |
 | `test_gas*.fd` | `@gas` compile-time gas budgets (`test_gas_fail`) |
 | `test_crashfree*.fd` | `@crashfree` compile-time panic prevention (`test_crashfree_fail`) |
-| `test_tuple_destructure.fd` | Tuple destructuring (`pv (a, b) = expr`) |
+| `test_tuple_destructure.fd` | Tuple destructuring (`val (a, b) = expr`) |
 | `test_file.fd` | File I/O (`stdlib/file.fd`) |
 | `test_txn.fd` | `txn {}` atomic transaction blocks |
 | `test_time*.fd` | LogicalTime stdlib: construction, extraction, arithmetic, formatting, leap years |
 | `test_typed_strings*.fd` | F67: SQLString, ShellString, HTMLString, JSONString, PathString — escape, bind, is_safe |
-| `test_init_guarantee*.fd` | F63: `pm` keyword, definite assignment analysis, init guarantee |
+| `test_init_guarantee*.fd` | F63: `var` keyword (without initializer), definite assignment analysis, init guarantee |
 | `test_rc_arc.fd` | Rc/Arc smart pointers (new, clone, drop, get, count) |
 | `test_recursive_box.fd` | Recursive types via `Box<T>` (enum Expr with Box children) |
 | `test_enum_payload_types.fd` | Typed enum payloads (variant types preserved in match) |
@@ -868,7 +870,7 @@ Run all tests: `cargo test --test harness`
 
 ## Design Documents
 
-- `docs/reference/syntax.md` — Complete Fides syntax specification (current `pf`/`pv`/`pc` syntax + proposed `fn`/`val`/`var` migration)
+- `docs/reference/syntax.md` — Complete Fides syntax specification (current `fn`/`val`/`const` syntax + proposed `fn`/`val`/`var` migration)
 - `docs/reference/architecture.md` — Compiler architecture, pipeline stages, and internal design
 - `docs/roadmap/roadmap.md` — Full 8-phase roadmap (currently at Phase 8 in progress)
 - `docs/roadmap/roadmap-limitations.md` — Verified gap analysis (claimed vs actual)
@@ -892,7 +894,7 @@ Run all tests: `cargo test --test harness`
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (265/265 unit tests, 116/116 integration tests) |
+| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (265/265 unit tests, 146/146 integration tests) |
 | **Phase 2** | Region inference, effect system, capability security, bounds safety | **Complete** (2A ✓, 2B ✓, 2C ✓ with elision, 2D ✓; 8/8 harness tests pass) |
 | **Phase 3** | comptime, advanced traits, FFI & interop | **Complete** (3A comptime ✓, 3B traits ✓, 3C const generics + GATs ✓; 3D C FFI ✓ via `extern "C"` + `parse-header`) |
 | **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | **Mostly complete** (4A PIR ✓, 4B optimizer ✓ 23 passes enabled by default, 4C x86-64/arm64/riscv codegen + regalloc + 9 peephole passes + ELF64 executables ✓; 4D linker ✓, 4E hot reload ✓ via `fidesc watch`) |

@@ -1,0 +1,68 @@
+// test_autodiff_grad.fd — ML3: Reverse-mode autodiff with actual gradient computation
+// Expected: PASS
+// Tests that grad() { backward(loss); } actually computes gradients.
+
+use tensor;
+
+@differentiable
+fn simple_loss(x: Tensor) -> f64 {
+    val h = relu(x);
+    val s = sum(h);
+    return s;
+}
+
+fn main() {
+    // Test: Simple gradient computation
+    // loss = sum(relu(x)) where x = [[1.0, -2.0], [3.0, -4.0]]
+    // relu(x) = [[1.0, 0.0], [3.0, 0.0]], sum = 4.0
+    // grad_x = [[1.0, 0.0], [1.0, 0.0]] (relu mask: 1 where x>0, 0 where x<=0)
+    val x = zeros(vec2(2, 2));
+    p_tensor_set(x, vec2(0, 0), 1.0);
+    p_tensor_set(x, vec2(0, 1), -2.0);
+    p_tensor_set(x, vec2(1, 0), 3.0);
+    p_tensor_set(x, vec2(1, 1), -4.0);
+
+    print("x = ");
+    print(x);
+
+    grad(x) {
+        val loss = simple_loss(x);
+        print("loss = ");
+        print(loss);
+        backward(loss);
+    }
+
+    // Get the gradient
+    val grad_x = p_grad_get(x);
+    print("grad_x = ");
+    print(grad_x);
+
+    // Verify: gradient should be [[1, 0], [1, 0]] (relu mask)
+    val g00 = p_tensor_get(grad_x, vec2(0, 0));
+    val g01 = p_tensor_get(grad_x, vec2(0, 1));
+    val g10 = p_tensor_get(grad_x, vec2(1, 0));
+    val g11 = p_tensor_get(grad_x, vec2(1, 1));
+    print("g00 = ");
+    print(g00);
+    print("g01 = ");
+    print(g01);
+    print("g10 = ");
+    print(g10);
+    print("g11 = ");
+    print(g11);
+
+    // Assertions
+    assert(g00 == 1.0);
+    assert(g01 == 0.0);
+    assert(g10 == 1.0);
+    assert(g11 == 0.0);
+
+    print("Autodiff gradient test passed!");
+}
+
+fn vec2(a: i64, b: i64) -> Vec<i64> {
+    var v = Vec::new();
+    v.push(a);
+    v.push(b);
+    return v;
+}

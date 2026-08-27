@@ -282,6 +282,10 @@ impl SpirVCodeGen {
 
     fn gen_inst(&mut self, inst: &L3Inst) {
         match inst {
+            L3Inst::AddrOfSlot { dst, slot } => {
+                // GPU: stack slots don't really apply, but emit a placeholder.
+                let _ = (dst, slot);
+            }
             L3Inst::Mov { dst, src } => {
                 let dst_id = self.get_vreg_id(dst);
                 match src {
@@ -501,6 +505,9 @@ impl PtxCodeGen {
 
     fn gen_inst(&mut self, inst: &L3Inst) {
         match inst {
+            L3Inst::AddrOfSlot { dst, slot } => {
+                let _ = (dst, slot);
+            }
             L3Inst::Mov { dst, src } => {
                 let d = dst.0 as usize;
                 match src {

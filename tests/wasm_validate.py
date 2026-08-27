@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Structural validator for Pledge-emitted WASM binaries.
+"""Structural validator for Fides-emitted WASM binaries.
 
 Verifies the binary is well-formed without needing a WASM runtime:
   - magic + version

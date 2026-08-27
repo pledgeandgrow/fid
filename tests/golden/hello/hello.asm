@@ -14113,7 +14113,7 @@ str_trim_start:
 .str_5: .asciz "Vec index out of bounds"
 .str_14: .asciz "}"
 .str_15: .asciz ""
-.str_0: .asciz "Hello, Pledge!"
+.str_0: .asciz "Hello, Fides!"
 .str_17: .asciz "called unwrap on Err"
 .str_13: .asciz ": "
 .str_9: .asciz "["

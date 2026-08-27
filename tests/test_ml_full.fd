@@ -1,0 +1,102 @@
+// test_ml_full.fd — ML3/ML11/ML12/ML13: Full implementation test
+// Expected: PASS
+// Tests actual runtime behavior of autodiff, checkpoint, DP budget, and TP.
+
+use tensor;
+
+@differentiable
+fn loss_fn(x: Tensor) -> f64 {
+    val h = relu(x);
+    val s = sum(h);
+    return s;
+}
+
+@differentiable
+fn checkpointed_loss(x: Tensor) -> f64 {
+    val h = relu(x);
+    val s = sum(h);
+    return s;
+}
+
+@dp(epsilon=1.0)
+fn dp_query(data: Tensor) -> f64 {
+    val noisy = p_dp_noise(data, 0.1);
+    val s = sum(noisy);
+    return s;
+}
+
+@shard
+fn sharded_forward(x: Tensor) -> Tensor {
+    val reduced = p_all_reduce(x);
+    return reduced;
+}
+
+fn main() {
+    // === ML3: Autodiff ===
+    val x = zeros(vec2(2, 2));
+    p_tensor_set(x, vec2(0, 0), 1.0);
+    p_tensor_set(x, vec2(0, 1), -2.0);
+    p_tensor_set(x, vec2(1, 0), 3.0);
+    p_tensor_set(x, vec2(1, 1), -4.0);
+
+    grad(x) {
+        val loss = loss_fn(x);
+        print("ML3 loss = ");
+        print(loss);
+        backward(loss);
+    }
+    val grad_x = p_grad_get(x);
+    print("ML3 grad = ");
+    print(grad_x);
+    val g00 = p_tensor_get(grad_x, vec2(0, 0));
+    val g10 = p_tensor_get(grad_x, vec2(1, 0));
+    assert(g00 == 1.0);
+    assert(g10 == 1.0);
+
+    // === ML11: Checkpoint mode (runtime, without @checkpoint annotation) ===
+    p_grad_zero();
+    p_checkpoint_begin();
+    grad(x) {
+        val loss = checkpointed_loss(x);
+        print("ML11 loss = ");
+        print(loss);
+        backward(loss);
+    }
+    p_checkpoint_end();
+    val grad_x2 = p_grad_get(x);
+    print("ML11 grad = ");
+    print(grad_x2);
+    val g00c = p_tensor_get(grad_x2, vec2(0, 0));
+    assert(g00c == 1.0);
+
+    // === ML12: DP epsilon budget ===
+    p_dp_budget_reset(1.0);
+    p_dp_budget_check(0.5, 1.0);
+    print("ML12 budget after 0.5: OK");
+    p_dp_budget_check(0.3, 1.0);
+    print("ML12 budget after 0.8: OK");
+
+    // === ML13: Tensor parallelism ===
+    val rank = p_tp_rank();
+    val world_size = p_tp_world_size();
+    print("ML13 rank = ");
+    print(rank);
+    print("ML13 world_size = ");
+    print(world_size);
+    assert(rank == 0);
+    assert(world_size == 1);
+
+    val t = filled(vec2(2, 2), 5.0);
+    val reduced = sharded_forward(t);
+    print("ML13 all_reduce = ");
+    print(reduced);
+
+    print("All ML features test passed!");
+}
+
+fn vec2(a: i64, b: i64) -> Vec<i64> {
+    var v = Vec::new();
+    v.push(a);
+    v.push(b);
+    return v;
+}

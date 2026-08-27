@@ -296,6 +296,7 @@ pub fn optimize_l2_with(module: &mut L2Module, passes: &[Pass], max_iters: usize
                 Pass::EffectReorder => stats.effect_reorder += pass_effect_reorder(module),
                 Pass::PartialEval => stats.partial_eval += pass_partial_eval(module),
                 // SLP vectorizer: combines adjacent scalar ops into SIMD ops
+                Pass::Vectorize => stats.vectorize += pass_slp_vectorize(module),
                 // after loop unrolling. Uses p_simd_load/store/add/sub/mul/div.
                 Pass::Vectorize => stats.vectorize += pass_slp_vectorize(module),
                 Pass::StrengthReduce => stats.strength_reduce += pass_strength_reduce(module),
@@ -5981,6 +5982,9 @@ fn pass_effect_optimize(module: &mut L2Module) -> usize {
     let mut hoistable_funcs: HashSet<String> = HashSet::new();
     for f in &module.functions {
         if f.is_pure || is_effectively_pure(f) {
+            if f.name == "Vec_push" {
+                eprintln!("DEBUG: Vec_push is pure! is_pure={}, is_effectively_pure={}", f.is_pure, is_effectively_pure(f));
+            }
             pure_funcs.insert(f.name.clone());
             hoistable_funcs.insert(f.name.clone());
         } else if f.is_crashfree && is_effectively_pure(f) {

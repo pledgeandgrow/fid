@@ -39,7 +39,7 @@ that neither Rust nor Zig enable by default.
 | Double-free | Linear types + region tracking | Vulnerable | Safe (borrow ck) | Safe (regions) |
 | Dangling pointers | Region escape detection | Vulnerable | Safe (lifetimes) | Safe (regions) |
 | Type confusion | Strong type system | Vulnerable | Safe | Safe |
-| Uninitialized memory | Init guarantee (F63: `pm` keyword) | Vulnerable | Safe | Safe |
+| Uninitialized memory | Init guarantee (F63: `var` keyword (without initializer)) | Vulnerable | Safe | Safe |
 | Format string | No C format strings; f-strings are compile-time | Vulnerable | N/A | N/A |
 | SQL injection | Typed strings (F67: SQLString) + parameterized queries (F68) | Vulnerable | Partial | Safe |
 | Shell injection | Typed strings (F67: ShellString) | Vulnerable | Partial | Safe |
@@ -105,11 +105,11 @@ Prevents timing side-channel attacks (Spectre, Meltdown, cache timing).
 
 ```fides
 @constant_time
-pf ct_eq(a: i64, b: i64) -> i64 {
-    pv diff = a - b;
-    pv result = 0;
+fn ct_eq(a: i64, b: i64) -> i64 {
+    val diff = a - b;
+    val result = 0;
     if diff == 0 { result = 1; } else { result = 0; }
-    ret result;
+    return result;
 }
 ```
 
@@ -123,9 +123,9 @@ pf ct_eq(a: i64, b: i64) -> i64 {
 **What it catches:**
 ```fides
 @constant_time
-pf bad_eq(a: i64, b: i64) -> i64 {
-    if a == b { ret 1; }  // ERROR: early return leaks timing
-    ret 0;
+fn bad_eq(a: i64, b: i64) -> i64 {
+    if a == b { return 1; }  // ERROR: early return leaks timing
+    return 0;
 }
 ```
 
@@ -135,7 +135,7 @@ Marks parameters as untrusted user input. Prevents tainted values from
 flowing into dangerous sinks without sanitization.
 
 ```fides
-pf handle_query(@tainted user_input: str) {
+fn handle_query(@tainted user_input: str) {
     // ERROR: tainted input passed to SQL sink without sanitization
     sql_query(user_input);
 }
@@ -153,7 +153,7 @@ Ensures a function can never panic. Required for safety-critical code.
 
 ```fides
 @crashfree
-pf safe_divide(a: i64, b: i64) -> i64 {
+fn safe_divide(a: i64, b: i64) -> i64 {
     // ERROR: division can panic if b == 0
     a / b
 }
@@ -167,7 +167,7 @@ Combines: `@no-alloc + @no-recursion + @crashfree + @no-indirect`.
 
 ```fides
 @safety-critical
-pf braking_controller(speed: i64, target: i64) -> i64 {
+fn braking_controller(speed: i64, target: i64) -> i64 {
     // No allocation, no recursion, no panic, no function pointers
     compute_brake_force(speed, target)
 }
@@ -179,7 +179,7 @@ Combines: `@no-alloc + @no-recursion + @crashfree + @requires-audit`.
 
 ```fides
 @medical @audit
-pf insulin_dose(glucose: i64) -> i64 {
+fn insulin_dose(glucose: i64) -> i64 {
     // No allocation, no recursion, no panic, must be audited
     calculate_dose(glucose)
 }
@@ -191,7 +191,7 @@ Ensures same inputs always produce same outputs.
 
 ```fides
 @deterministic
-pf hash(data: i64) -> i64 {
+fn hash(data: i64) -> i64 {
     // No IO, no Network, no floating-point, no Spawn
     data * 2654435761
 }
@@ -203,7 +203,7 @@ Ensures no Money is created, destroyed, or duplicated.
 
 ```fides
 @conserve
-pf transfer(from: Money, to: Money, amount: Money) -> (Money, Money) {
+fn transfer(from: Money, to: Money, amount: Money) -> (Money, Money) {
     // Cannot call Money::new, cannot use floating-point
     // Can only call other @conserve functions
     (from - amount, to + amount)
@@ -216,8 +216,8 @@ Compile-time gas budget (unlike Solidity's runtime gas).
 
 ```fides
 @gas(100)
-pf limited_loop(n: i64) -> i64 {
-    pv sum = 0;
+fn limited_loop(n: i64) -> i64 {
+    val sum = 0;
     for i in 0..n { sum = sum + i; }
     sum
 }
@@ -231,7 +231,7 @@ Prevents resource duplication (e.g., double-spending).
 @linear
 struct Money { cents: i64 }
 
-pf spend(m: Money, amount: i64) -> Money {
+fn spend(m: Money, amount: i64) -> Money {
     // m is consumed — cannot be used again
     Money { cents: m.cents - amount }
 }
@@ -243,7 +243,7 @@ Opt-in wrap-around arithmetic (default is checked).
 
 ```fides
 @wrapping
-pf hash_combine(a: i64, b: i64) -> i64 {
+fn hash_combine(a: i64, b: i64) -> i64 {
     a * 31 + b  // wraps on overflow instead of panicking
 }
 ```
@@ -254,7 +254,7 @@ Composable safety primitives. Can be combined freely:
 
 ```fides
 @no-alloc @no-recursion @no-unbounded
-pf embedded_task(x: i64) -> i64 {
+fn embedded_task(x: i64) -> i64 {
     // No heap, no recursion, no while loops
     x + 1
 }
@@ -267,7 +267,7 @@ pf embedded_task(x: i64) -> i64 {
 The `unsafe { }` block is the escape hatch for low-level operations:
 
 ```fides
-pf raw_access(buf: *mut u8, idx: i64) -> u8 {
+fn raw_access(buf: *mut u8, idx: i64) -> u8 {
     unsafe {
         // Bounds checks skipped here
         // Raw pointer dereference allowed

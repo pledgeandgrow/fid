@@ -1,0 +1,192 @@
+// Example: Lexer for a simple expression language
+//
+// This exercises the patterns a self-hosted compiler lexer needs:
+// - Character-by-character scanning via str_byte_at
+// - String building via str_slice
+// - Vec<T> with struct elements
+// - Match on enums
+// - Struct construction + impl methods
+//
+// Compile: fidesc ccompile examples/lexer.fd -o examples/lexer
+// Run:     ./examples/lexer
+
+use core;
+use vec;
+use string;
+
+// ─── Token types ─────────────────────────────────────────────────────
+
+enum TokenKind {
+    Number,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    LParen,
+    RParen,
+    Eof,
+}
+
+struct Token {
+    kind: TokenKind,
+    value: str,
+    line: i64,
+    col: i64,
+}
+
+// ─── Lexer ───────────────────────────────────────────────────────────
+
+struct Lexer {
+    source: str,
+    pos: i64,
+    line: i64,
+    col: i64,
+}
+
+impl Lexer {
+    fn new(source: str) -> Lexer {
+        return Lexer { source: source, pos: 0, line: 1, col: 1 };
+    }
+
+    fn peek(self: &Lexer) -> i64 {
+        if self.pos >= str_len(self.source) {
+            return 0;  // EOF
+        }
+        return str_byte_at(self.source, self.pos);
+    }
+
+    fn advance(self: &mut Lexer) -> i64 {
+        if self.pos >= str_len(self.source) {
+            return 0;
+        }
+        var ch = str_byte_at(self.source, self.pos);
+        self.pos = self.pos + 1;
+        if ch == 10 {  // newline
+            self.line = self.line + 1;
+            self.col = 1;
+        } else {
+            self.col = self.col + 1;
+        }
+        return ch;
+    }
+
+    fn skip_whitespace(self: &mut Lexer) {
+        while true {
+            var ch = self.peek();
+            if ch == 32 || ch == 9 || ch == 10 || ch == 13 {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn read_number(self: &mut Lexer) -> Token {
+        var start = self.pos;
+        while true {
+            var ch = self.peek();
+            if is_digit(ch) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        val text = str_slice(self.source, start, self.pos);
+        return Token { kind: TokenKind::Number, value: text, line: self.line, col: self.col };
+    }
+
+    fn next_token(self: &mut Lexer) -> Token {
+        self.skip_whitespace();
+
+        var ch = self.peek();
+        val line = self.line;
+        val col = self.col;
+
+        if ch == 0 {
+            return Token { kind: TokenKind::Eof, value: "", line: line, col: col };
+        }
+
+        if is_digit(ch) {
+            return self.read_number();
+        }
+
+        self.advance();  // consume the character
+        match ch {
+            43 => { return Token { kind: TokenKind::Plus, value: "+", line: line, col: col }; }
+            45 => { return Token { kind: TokenKind::Minus, value: "-", line: line, col: col }; }
+            42 => { return Token { kind: TokenKind::Star, value: "*", line: line, col: col }; }
+            47 => { return Token { kind: TokenKind::Slash, value: "/", line: line, col: col }; }
+            40 => { return Token { kind: TokenKind::LParen, value: "(", line: line, col: col }; }
+            41 => { return Token { kind: TokenKind::RParen, value: ")", line: line, col: col }; }
+            _ => {
+                print("Unknown character: ");
+                print(ch);
+                print("\n");
+                return Token { kind: TokenKind::Eof, value: "?", line: line, col: col };
+            }
+        }
+    }
+
+    fn tokenize(self: &mut Lexer) -> Vec<Token> {
+        var tokens: Vec<Token> = Vec::new();
+        while true {
+            var tok = self.next_token();
+            tokens.push(tok);
+            match tok.kind {
+                TokenKind::Eof => { break; }
+                _ => {}
+            }
+        }
+        return tokens;
+    }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────
+
+fn is_digit(ch: i64) -> bool {
+    return ch >= 48 && ch <= 57;  // '0'..'9'
+}
+
+fn token_kind_name(kind: TokenKind) -> str {
+    match kind {
+        TokenKind::Number => { return "Number"; }
+        TokenKind::Plus => { return "Plus"; }
+        TokenKind::Minus => { return "Minus"; }
+        TokenKind::Star => { return "Star"; }
+        TokenKind::Slash => { return "Slash"; }
+        TokenKind::LParen => { return "LParen"; }
+        TokenKind::RParen => { return "RParen"; }
+        TokenKind::Eof => { return "Eof"; }
+    }
+}
+
+// ─── Main ────────────────────────────────────────────────────────────
+
+fn main() -> i64 {
+    val source = "3 + 4 * (10 - 2) / 5";
+    print("Source: ");
+    print(source);
+    print("\n\n");
+
+    var lexer = Lexer::new(source);
+    var tokens = lexer.tokenize();
+
+    print("Tokens:\n");
+    var i: i64 = 0;
+    while i < tokens.len() {
+        var tok = tokens.get(i);
+        print("  ");
+        print(token_kind_name(tok.kind));
+        print("('");
+        print(tok.value);
+        print("') [line ");
+        print(tok.line);
+        print(", col ");
+        print(tok.col);
+        print("]\n");
+        i = i + 1;
+    }
+
+    print("\nTokenized successfully.\n");
+    return 0;
+}

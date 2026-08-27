@@ -184,6 +184,27 @@ fn aggressive_comptime_func(func: &mut Func, original: &Program, errs: &mut Vec<
     }
 }
 
+/// Issue 44: Check if a statement (recursively) contains a Break or Continue.
+/// Used to skip comptime loop unrolling when the body has flow control that
+/// would be silently broken by replacing the loop with `if true { ... }`.
+fn stmt_has_break_or_continue(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Break(_, _) | Stmt::Continue(_) => true,
+        Stmt::If { then_block, else_block, .. } => {
+            then_block.iter().any(stmt_has_break_or_continue)
+                || else_block.as_ref().map(|eb| eb.iter().any(stmt_has_break_or_continue)).unwrap_or(false)
+        }
+        Stmt::For { body, .. } => body.iter().any(stmt_has_break_or_continue),
+        Stmt::While { body, .. } => body.iter().any(stmt_has_break_or_continue),
+        Stmt::Unsafe { body, .. } => body.iter().any(stmt_has_break_or_continue),
+        Stmt::RegionBlock { body, .. } => body.iter().any(stmt_has_break_or_continue),
+        Stmt::Sandbox { body, .. } => body.iter().any(stmt_has_break_or_continue),
+        Stmt::Txn { body, .. } => body.iter().any(stmt_has_break_or_continue),
+        Stmt::GradBlock { body, .. } => body.iter().any(stmt_has_break_or_continue),
+        _ => false,
+    }
+}
+
 fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<String>) {
     match stmt {
         Stmt::Let { expr, .. } => aggressive_comptime_expr(expr, original, errs),
@@ -233,7 +254,11 @@ fn aggressive_comptime_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<
             if let Expr::Range { start, end, inclusive } = iterator {
                 if let (Expr::IntLit(s), Expr::IntLit(e)) = (start.as_ref(), end.as_ref()) {
                     let trip = if *inclusive { e - s + 1 } else { e - s };
-                    if trip > 0 && trip <= 16 && body.len() <= 16 {
+                    // Issue 44: Skip unrolling if the body contains break/continue.
+                    // Unrolling replaces the for loop with `if true { ... }`, which
+                    // has no loop context — break/continue become silently ignored.
+                    let has_break_or_continue = body.iter().any(stmt_has_break_or_continue);
+                    if trip > 0 && trip <= 16 && body.len() <= 16 && !has_break_or_continue {
                         // Build unrolled body: for each iteration, clone the body
                         // with the loop variable replaced by a literal.
                         let mut unrolled: Vec<Stmt> = Vec::new();

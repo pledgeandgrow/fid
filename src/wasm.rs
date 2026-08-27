@@ -948,7 +948,7 @@ impl WasmCodeGen {
             Inst::PersistSave { .. } => {
                 // No-op in WASM
             }
-            Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd => {
+            Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd | Inst::GradBegin { .. } | Inst::GradEnd | Inst::Backward { .. } => {
                 // No-op in WASM (rollback/unsafe not supported)
             }
             Inst::Panic { message } => {
@@ -972,6 +972,9 @@ impl WasmCodeGen {
             }
             Inst::RegionEnd { .. } => {
                 // Region end — no-op in WASM
+            }
+            Inst::GradBegin { .. } | Inst::GradEnd | Inst::Backward { .. } => {
+                // Autodiff markers — no-op in WASM
             }
         }
     }

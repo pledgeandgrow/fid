@@ -1151,6 +1151,19 @@ impl<'tc> BorrowChecker<'tc> {
                 self.pop_scope();
             }
             Expr::Await { expr } | Expr::Spawn { expr } => self.check_expr(expr),
+            Expr::Closure { params, body, ret_ty: _ } => {
+                // Closures capture variables from the enclosing scope.
+                // Check the body in a new scope — captured variables are
+                // treated as borrowed from the outer scope.
+                self.push_scope();
+                // Closure params are local to the closure scope.
+                // No borrow tracking needed — they're new variables.
+                let _ = params;
+                for s in body {
+                    self.check_stmt(s);
+                }
+                self.pop_scope();
+            }
             // Other expression variants — recurse into children if any.
             other => {
                 // Fallback: nothing to do for leaf expressions we haven't

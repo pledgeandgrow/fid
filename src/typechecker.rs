@@ -163,6 +163,10 @@ pub struct TypeChecker {
     /// Current source line being type-checked (for error messages).
     /// Updated from statement line numbers as check_stmt is called.
     current_line: usize,
+    /// Issue 46: Per-scope sets of variables declared with `val` (is_mut == false).
+    /// Reassigning a `val` variable emits a warning. Tracked per scope so that
+    /// a `val` in an inner scope doesn't leak to outer scopes.
+    val_vars_per_scope: Vec<HashSet<String>>,
 }
 
 impl TypeChecker {
@@ -213,6 +217,7 @@ impl TypeChecker {
             unsafe_depth: 0,
             uninit_vars: HashSet::new(),
             current_line: 0,
+            val_vars_per_scope: vec![HashSet::new()],
         }
     }
 
@@ -3166,9 +3171,12 @@ impl TypeChecker {
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
         self.scope_linear_vars.push(Vec::new());
+        self.val_vars_per_scope.push(HashSet::new());
     }
 
     fn pop_scope(&mut self) {
+        // Clean up val_vars for this scope
+        self.val_vars_per_scope.pop();
         // Check that all linear variables in this scope were consumed
         if let Some(linear_vars) = self.scope_linear_vars.pop() {
             for (name, line) in &linear_vars {
@@ -3543,7 +3551,7 @@ impl TypeChecker {
         // Track current line for error messages in check_expr
         self.current_line = stmt_line(stmt);
         match stmt {
-            Stmt::Let { name, ty, expr, is_mut: _, is_persist: _, line } => {
+            Stmt::Let { name, ty, expr, is_mut, is_persist: _, line } => {
                 // Bidirectional type inference: pass declared type as hint
                 let hint = ty.as_ref().map(|t| t.clone()).unwrap_or(Type::Never);
                 let expr_ty = self.check_expr_with_hint(expr, &hint);
@@ -3564,6 +3572,17 @@ impl TypeChecker {
                 } else {
                     expr_ty
                 };
+                // Issue 46: Track `val` (immutable) bindings — reassignment emits warning.
+                if !*is_mut {
+                    if let Some(scope) = self.val_vars_per_scope.last_mut() {
+                        scope.insert(name.clone());
+                    }
+                } else {
+                    // `var` redeclaration of a previously-`val` name: remove from current scope
+                    if let Some(scope) = self.val_vars_per_scope.last_mut() {
+                        scope.remove(name);
+                    }
+                }
                 // Track region: if inside a region block, record the allocation region
                 if let Some(region) = self.region_stack.last() {
                     self.var_regions.insert(name.clone(), region.clone());
@@ -3691,6 +3710,18 @@ impl TypeChecker {
                 self.consume_linear_in_expr(expr, *line);
                 // Mark as initialized (F63: init guarantee)
                 self.uninit_vars.remove(target);
+                // Issue 46: Warn about reassignment of `val` (immutable) bindings.
+                // Currently a warning to avoid breaking existing stdlib code that
+                // uses `val` for mutable variables. Will be promoted to an error
+                // after the stdlib is fully migrated to `var` for mutables.
+                let is_val = self.val_vars_per_scope.iter().any(|s| s.contains(target));
+                if is_val {
+                    self.warnings.push(format!(
+                        "Warning (line {}): reassigning '{}' which was declared with `val` (immutable).\n\
+                         \x20\x20\x20\x20Fix: declare it with `var` instead of `val` if you need to mutate it.",
+                        line, target
+                    ));
+                }
                 // Check target exists
                 if self.lookup(target).is_none() && !self.consts.contains_key(target) {
                     // Check if it was in a freed region (use-after-free)
@@ -3774,6 +3805,21 @@ impl TypeChecker {
             Stmt::FieldAssign { object, field, op, expr, line } => {
                 let obj_ty = self.check_expr(object);
                 self.current_line = *line;
+                // Issue 47: Reject field assignment on `val` (immutable) bindings.
+                // If the object is a simple identifier bound with `val`, the
+                // struct is immutable and its fields cannot be mutated.
+                if let Expr::Ident(var_name) = &*object {
+                    let is_val = self.val_vars_per_scope.iter().any(|s| s.contains(var_name));
+                    if is_val {
+                        self.errors.push(format!(
+                            "Type error (line {}): cannot assign to field '{}' of '{}' — \
+                             declared with `val` (immutable).\n\
+                             \x20\x20\x20\x20Fix: declare '{}' with `var` instead of `val` \
+                             if you need to mutate its fields.",
+                            line, field, var_name, var_name
+                        ));
+                    }
+                }
                 // Unwrap references (&T, &mut T) to get the underlying struct type.
                 let effective_ty = match &obj_ty {
                     Type::Ref { inner, .. } => (**inner).clone(),
@@ -3922,6 +3968,47 @@ impl TypeChecker {
                         self.check_stmt(s);
                     }
                     self.pop_scope();
+                }
+                // Issue 49: Non-exhaustive match checking.
+                let has_catchall = arms.iter().any(|a| matches!(a.pattern, Pattern::Wildcard | Pattern::Ident(_)));
+                if !has_catchall {
+                    if let Type::Named(enum_name) = &match_ty {
+                        if let Some(variants) = self.enum_variants.get(enum_name) {
+                            let covered: HashSet<String> = arms.iter().filter_map(|a| {
+                                if let Pattern::EnumVariant { variant, .. } = &a.pattern {
+                                    Some(variant.clone())
+                                } else {
+                                    None
+                                }
+                            }).collect();
+                            let missing: Vec<String> = variants.iter()
+                                .map(|(v, _)| v.clone())
+                                .filter(|v| !covered.contains(v))
+                                .collect();
+                            if !missing.is_empty() {
+                                self.warnings.push(format!(
+                                    "Warning: non-exhaustive match — missing variant(s): {}",
+                                    missing.iter().map(|v| format!("{}::{}", enum_name, v)).collect::<Vec<_>>().join(", ")
+                                ));
+                            }
+                        }
+                    }
+                    if match_ty == Type::Bool {
+                        let has_true = arms.iter().any(|a| matches!(a.pattern, Pattern::BoolLit(true)));
+                        let has_false = arms.iter().any(|a| matches!(a.pattern, Pattern::BoolLit(false)));
+                        if !has_true || !has_false {
+                            let missing: Vec<&str> = match (!has_true, !has_false) {
+                                (true, true) => vec!["true", "false"],
+                                (true, false) => vec!["true"],
+                                (false, true) => vec!["false"],
+                                _ => vec![],
+                            };
+                            self.warnings.push(format!(
+                                "Warning: non-exhaustive match on bool — missing: {}",
+                                missing.join(", ")
+                            ));
+                        }
+                    }
                 }
             }
             Stmt::Use { .. } => {}
@@ -4997,8 +5084,16 @@ impl TypeChecker {
                         return Type::Never;
                     }
                 }
-                let recv_ty = self.check_expr(receiver);
+                let recv_ty_raw = self.check_expr(receiver);
                 let arg_types: Vec<Type> = args.iter().map(|a| self.check_expr(a)).collect();
+                // Issue 45: Auto-deref &T / &mut T for method calls.
+                // A method call on `&mut Vec` should resolve to Vec's methods,
+                // not fail with "cannot call method on type &mut Vec".
+                let recv_ty = if let Type::Ref { inner, .. } = &recv_ty_raw {
+                    (**inner).clone()
+                } else {
+                    recv_ty_raw
+                };
 
                 // Builtin Vec methods — use element type from Generic args
                 if let Type::Generic { name, args } = &recv_ty {
@@ -5183,7 +5278,13 @@ impl TypeChecker {
                     return Type::Never;
                 }
 
-                if let Type::Named(struct_name) = &recv_ty {
+                // Issue 45: Auto-deref &T and &mut T for method calls.
+                // If recv_ty is Type::Ref { inner, .. }, unwrap and try method lookup on inner.
+                let effective_recv_ty = match &recv_ty {
+                    Type::Ref { inner, .. } => inner.as_ref().clone(),
+                    other => other.clone(),
+                };
+                if let Type::Named(struct_name) = &effective_recv_ty {
                     if let Some(method_map) = self.methods.get(struct_name) {
                         if let Some((params, ret, has_self, is_pub)) = method_map.get(method) {
                                 // Visibility check
@@ -5227,7 +5328,7 @@ impl TypeChecker {
                         "Type error: no method '{}' on struct '{}'",
                         method, struct_name
                     ));
-                } else if let Type::Generic { name: gen_name, .. } = &recv_ty {
+                } else if let Type::Generic { name: gen_name, .. } = &effective_recv_ty {
                     // Generic type (e.g. Option<i64>): look up methods by the base name
                     if let Some(method_map) = self.methods.get(gen_name) {
                         if let Some((params, ret, has_self, is_pub)) = method_map.get(method) {
@@ -5356,6 +5457,50 @@ impl TypeChecker {
                         self.check_stmt(s);
                     }
                     self.pop_scope();
+                }
+                // Issue 49: Non-exhaustive match checking.
+                // If there's no wildcard/ident arm, verify all enum variants are covered.
+                let has_catchall = arms.iter().any(|a| matches!(a.pattern, Pattern::Wildcard | Pattern::Ident(_)));
+                if !has_catchall {
+                    // Check enum exhaustiveness
+                    if let Type::Named(enum_name) = &match_ty {
+                        if let Some(variants) = self.enum_variants.get(enum_name) {
+                            let covered: HashSet<String> = arms.iter().filter_map(|a| {
+                                if let Pattern::EnumVariant { variant, .. } = &a.pattern {
+                                    Some(variant.clone())
+                                } else {
+                                    None
+                                }
+                            }).collect();
+                            let missing: Vec<String> = variants.iter()
+                                .map(|(v, _)| v.clone())
+                                .filter(|v| !covered.contains(v))
+                                .collect();
+                            if !missing.is_empty() {
+                                self.warnings.push(format!(
+                                    "Warning: non-exhaustive match — missing variant(s): {}",
+                                    missing.iter().map(|v| format!("{}::{}", enum_name, v)).collect::<Vec<_>>().join(", ")
+                                ));
+                            }
+                        }
+                    }
+                    // Check bool exhaustiveness
+                    if match_ty == Type::Bool {
+                        let has_true = arms.iter().any(|a| matches!(a.pattern, Pattern::BoolLit(true)));
+                        let has_false = arms.iter().any(|a| matches!(a.pattern, Pattern::BoolLit(false)));
+                        if !has_true || !has_false {
+                            let missing: Vec<&str> = match (!has_true, !has_false) {
+                                (true, true) => vec!["true", "false"],
+                                (true, false) => vec!["true"],
+                                (false, true) => vec!["false"],
+                                _ => vec![],
+                            };
+                            self.warnings.push(format!(
+                                "Warning: non-exhaustive match on bool — missing: {}",
+                                missing.join(", ")
+                            ));
+                        }
+                    }
                 }
                 Type::Void
             }

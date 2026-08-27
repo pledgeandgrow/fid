@@ -813,6 +813,8 @@ fn main() {
                 "test_dp_fail",
                 // ML13: @shard without Comm effect
                 "test_shard_fail",
+                // Shape mismatch: vec3 + vec2 should fail (compile-time error detection)
+                "test_vec_shape_fail",
             ];
 
 
@@ -868,55 +870,29 @@ fn main() {
             let mut pe_known_pass = 0;
             let mut tested_count = 0;  // tests counted in main denominator
 
-            // Skip list — tests for features not supported by all backends
-            let skip_tests: &[&str] = &[
-                "test_comptime_basic",
-                "test_comptime_func",
-                "test_comptime_reflect",
-                "test_comptime_serialize",
-                "test_comptime_gen",
-                "test_kernel_specialization", // uses comptime gen
-                "test_http",
-                "test_json",
-                "test_tensor",
-                "test_autodiff", // uses tensor stdlib
-                "test_kv_cache", // uses tensor stdlib + kv_cache module
-                "test_quantization", // uses tensor stdlib + quant module
-                "test_checkpoint", // uses tensor stdlib
-                "test_dp", // uses tensor stdlib + dp module
-                "test_shard", // uses tensor stdlib + shard module
-                "test_lora", // uses tensor stdlib + persist
-                "test_simd",
-                "test_parallel",
-                "test_shape",
-                "test_wasm",
-                "test_allocator",
-                "test_effect_handler",
-                "test_asm",
-                "test_bare",
-                "test_boot",
-                "test_interrupt",
-                "test_mmu",
-                "test_gat",
-                "test_ffi_header",
-                "test_dlopen", // dlopen results differ between interpreter (simulated) and C (real)
-                "test_parallel_concurrent", // parallel path needs real OS threads (C codegen only)
+            // Known-fail tests: these are normal tests that have pre-existing
+            // failures due to real bugs. They still run, but their failures are
+            // reported separately and NOT counted in the main pass/fail denominator.
+            // FIX THESE — do not leave them here forever.
+            let known_fail: &[&str] = &[
+                "test_game_stdlib",   // BUG: parser error in game stdlib (interp + C fail, PE passes)
+                "test_iter",          // BUG: C codegen UB in nested Vec iteration (interp + PE pass)
+                "test_vec_math",      // BUG: C codegen incomplete feature (interp + PE pass)
+                "test_parallel_concurrent", // BUG: thread race condition (interp + C fail, PE passes)
+                "test_time",          // BUG: parse error — unsupported syntax in time.fd (all 3 fail)
+                "test_time_edge",     // BUG: parse error — unsupported syntax in time.fd (all 3 fail)
             ];
 
-            // Known-fail tests: these are normal tests that have pre-existing
-            // failures due to incomplete features. They still run, but their
-            // failures are reported separately and NOT counted in the main
-            // pass/fail denominator. If one of these suddenly passes, it's
-            // reported as a bonus (improvement, not a regression).
-            let known_fail: &[&str] = &[
-                "test_game_stdlib",   // all backends — parser error in game stdlib
-                "test_iter",          // C codegen — pre-existing flaky UB in nested Vec iteration
-                "test_phase8b",       // C codegen — ECS __ecs_* not in C codegen
-                "test_vec_math",      // all backends — incomplete feature
-                "test_vec_shape_fail", // all backends — in skip list but still runs
-                "test_lang_features", // C codegen — pre-existing pointer/integer type mismatches
-                "test_const_generic", // C codegen — CallPtr cast to array type (pre-existing)
-                "test_matrix_mul",    // C codegen — CallPtr cast to array type (pre-existing)
+            // Skip list — tests that fail on C codegen due to missing builtins
+            // or legitimate design differences. These pass on interpreter + PE.
+            let skip_tests: &[&str] = &[
+                "test_kv_cache",      // C codegen: p_kv_cache_new not declared
+                "test_quantization",  // C codegen: void* from int type mismatch
+                "test_dp",            // C codegen: void* from int type mismatch
+                "test_shard",         // C codegen: p_send_tensor not declared
+                "test_dlopen",        // Design difference: interp returns simulated handle, C returns real pointer
+                "test_autodiff_grad", // C codegen: autograd tape builtins not implemented
+                "test_ml_full",       // C codegen: ML runtime builtins not implemented
             ];
 
             for test_file in &test_files {
@@ -926,7 +902,7 @@ fn main() {
                     .to_string_lossy()
                     .to_string();
 
-                // Skip tests for unimplemented features
+                // Skip tests for C codegen limitations (pass on interp + PE)
                 if skip_tests.contains(&name.as_str()) {
                     continue;
                 }

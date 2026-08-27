@@ -1,0 +1,336 @@
+// Example: JSON parser
+//
+// Exercises real-world parser patterns:
+// - Recursive descent with multiple value types
+// - String parsing with escape sequences
+// - Vec<T> and HashMap for arrays/objects
+// - Box<T> for recursive value tree
+//
+// Compile: fidesc ccompile examples/json_parser.fd -o examples/json_parser
+// Run:     ./examples/json_parser
+
+use core;
+use vec;
+use string;
+use collections;
+
+// ─── JSON Value ──────────────────────────────────────────────────────
+
+enum Json {
+    Null,
+    Bool(bool),
+    Num(i64),
+    Str(str),
+    Arr(Vec<Json>),
+    Obj(HashMap),  // HashMap<str, Json> — stored as i64 ptr
+}
+
+// ─── Tokenizer ───────────────────────────────────────────────────────
+
+struct JsonParser {
+    source: str,
+    pos: i64,
+}
+
+impl JsonParser {
+    fn new(source: str) -> JsonParser {
+        return JsonParser { source: source, pos: 0 };
+    }
+
+    fn peek(self: &JsonParser) -> i64 {
+        if self.pos >= str_len(self.source) {
+            return 0;
+        }
+        return str_byte_at(self.source, self.pos);
+    }
+
+    fn advance(self: &mut JsonParser) -> i64 {
+        if self.pos >= str_len(self.source) {
+            return 0;
+        }
+        var ch = str_byte_at(self.source, self.pos);
+        self.pos = self.pos + 1;
+        return ch;
+    }
+
+    fn skip_ws(self: &mut JsonParser) {
+        while true {
+            var ch = self.peek();
+            if ch == 32 || ch == 9 || ch == 10 || ch == 13 {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn parse_value(self: &mut JsonParser) -> Json {
+        self.skip_ws();
+        var ch = self.peek();
+        if ch == 123 { return self.parse_object(); }    // {
+        if ch == 91 { return self.parse_array(); }      // [
+        if ch == 34 { return self.parse_string(); }     // "
+        if ch == 116 { return self.parse_true(); }      // t
+        if ch == 102 { return self.parse_false(); }     // f
+        if ch == 110 { return self.parse_null(); }      // n
+        if ch >= 48 && ch <= 57 || ch == 45 { return self.parse_number(); }  // 0-9 or -
+        return Json::Null;
+    }
+
+    fn parse_true(self: &mut JsonParser) -> Json {
+        self.advance(); self.advance(); self.advance(); self.advance();  // "true"
+        return Json::Bool(true);
+    }
+
+    fn parse_false(self: &mut JsonParser) -> Json {
+        self.advance(); self.advance(); self.advance(); self.advance(); self.advance();  // "false"
+        return Json::Bool(false);
+    }
+
+    fn parse_null(self: &mut JsonParser) -> Json {
+        self.advance(); self.advance(); self.advance(); self.advance();  // "null"
+        return Json::Null;
+    }
+
+    fn parse_number(self: &mut JsonParser) -> Json {
+        var start = self.pos;
+        if self.peek() == 45 { self.advance(); }  // -
+        while true {
+            var ch = self.peek();
+            if (ch >= 48 && ch <= 57) || ch == 46 || ch == 101 || ch == 69 {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        val text = str_slice(self.source, start, self.pos);
+        // Simple integer parse (no float support yet)
+        var result: i64 = 0;
+        var sign: i64 = 1;
+        var idx: i64 = 0;
+        if str_byte_at(text, 0) == 45 { sign = -1; idx = 1; }
+        while idx < str_len(text) {
+            var ch = str_byte_at(text, idx);
+            if ch >= 48 && ch <= 57 {
+                result = result * 10 + (ch - 48);
+            }
+            idx = idx + 1;
+        }
+        return Json::Num(result * sign);
+    }
+
+    fn parse_string(self: &mut JsonParser) -> Json {
+        self.advance();  // opening "
+        var chars: Vec<i64> = Vec::new();
+        while true {
+            var ch = self.peek();
+            if ch == 0 || ch == 34 {  // EOF or closing "
+                break;
+            }
+            if ch == 92 {  // backslash escape
+                self.advance();
+                val esc = self.advance();
+                if esc == 110 { chars.push(10); }       // \n
+                else if esc == 116 { chars.push(9); }   // \t
+                else if esc == 114 { chars.push(13); }  // \r
+                else if esc == 34 { chars.push(34); }   // \"
+                else if esc == 92 { chars.push(92); }   // \\
+                else { chars.push(esc); }
+            } else {
+                chars.push(ch);
+                self.advance();
+            }
+        }
+        self.advance();  // closing "
+        // Build string from char codes
+        var result = "";
+        var i: i64 = 0;
+        while i < chars.len() {
+            result = result + str_from_char(chars.get(i));
+            i = i + 1;
+        }
+        return Json::Str(result);
+    }
+
+    fn parse_array(self: &mut JsonParser) -> Json {
+        self.advance();  // [
+        var items: Vec<Json> = Vec::new();
+        self.skip_ws();
+        if self.peek() == 93 {  // ]
+            self.advance();
+            return Json::Arr(items);
+        }
+        while true {
+            val val = self.parse_value();
+            items.push(val);
+            self.skip_ws();
+            var ch = self.peek();
+            if ch == 44 {  // ,
+                self.advance();
+            } else if ch == 93 {  // ]
+                self.advance();
+                break;
+            } else {
+                break;
+            }
+        }
+        return Json::Arr(items);
+    }
+
+    fn parse_object(self: &mut JsonParser) -> Json {
+        self.advance();  // {
+        var obj = HashMap::new();
+        self.skip_ws();
+        if self.peek() == 125 {  // }
+            self.advance();
+            return Json::Obj(obj);
+        }
+        while true {
+            self.skip_ws();
+            // Key must be a string
+            val key_val = self.parse_string();
+            var key = "";
+            match key_val {
+                Json::Str(s) => { key = s; }
+                _ => { print("Expected string key in object\n"); break; }
+            }
+            self.skip_ws();
+            if self.peek() == 58 { self.advance(); }  // :
+            val val = self.parse_value();
+            obj.insert(key, box_json(val));
+            self.skip_ws();
+            var ch = self.peek();
+            if ch == 44 {  // ,
+                self.advance();
+            } else if ch == 125 {  // }
+                self.advance();
+                break;
+            } else {
+                break;
+            }
+        }
+        return Json::Obj(obj);
+    }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────
+
+fn str_from_char(ch: i64) -> str {
+    // Convert a single ASCII char code to a string
+    var buf: Vec<i64> = Vec::new();
+    buf.push(ch);
+    return str_from_bytes(buf);
+}
+
+fn box_json(j: Json) -> i64 {
+    // Store Json value as i64 pointer (simplified — real impl would Box<Json>)
+    match j {
+        Json::Num(n) => { return n; }
+        _ => { return 0; }
+    }
+}
+
+fn json_to_string(j: Box<Json>, depth: i64) -> str {
+    var indent = "";
+    var i: i64 = 0;
+    while i < depth {
+        indent = indent + "  ";
+        i = i + 1;
+    }
+    match j {
+        Json::Null => { return indent + "null"; }
+        Json::Bool(b) => {
+            if b { return indent + "true"; }
+            return indent + "false";
+        }
+        Json::Num(n) => { return indent + int_to_str(n); }
+        Json::Str(s) => { return indent + "\"" + s + "\""; }
+        Json::Arr(items) => {
+            var result = indent + "[\n";
+            var i: i64 = 0;
+            while i < items.len() {
+                result = result + json_to_string(Box::new(items.get(i)), depth + 1);
+                if i < items.len() - 1 { result = result + ","; }
+                result = result + "\n";
+                i = i + 1;
+            }
+            return result + indent + "]";
+        }
+        Json::Obj(_) => { return indent + "{...}"; }
+    }
+}
+
+// ─── Main ────────────────────────────────────────────────────────────
+
+fn main() -> i64 {
+    val json_str = "{\"name\":\"test\",\"values\":[1,2,3],\"active\":true}";
+    print("Parsing: ");
+    print(json_str);
+    print("\n\n");
+
+    var parser = JsonParser::new(json_str);
+    val result = parser.parse_value();
+
+    // Extract and print some values
+    match result {
+        Json::Obj(obj) => {
+            print("Parsed object with keys:\n");
+            // For now, just verify we parsed without crashing
+            print("  (object parsed successfully)\n");
+        }
+        Json::Arr(items) => {
+            print("Parsed array with ");
+            print(items.len());
+            print(" items\n");
+        }
+        Json::Num(n) => {
+            print("Parsed number: ");
+            print(n);
+            print("\n");
+        }
+        Json::Str(s) => {
+            print("Parsed string: ");
+            print(s);
+            print("\n");
+        }
+        Json::Bool(b) => {
+            print("Parsed bool: ");
+            print(b);
+            print("\n");
+        }
+        Json::Null => {
+            print("Parsed null\n");
+        }
+    }
+
+    // Test array parsing
+    print("\n");
+    val arr_str = "[10, 20, 30, 40, 50]";
+    print("Parsing: ");
+    print(arr_str);
+    print("\n");
+    var parser2 = JsonParser::new(arr_str);
+    val arr_result = parser2.parse_value();
+    match arr_result {
+        Json::Arr(items) => {
+            print("Array has ");
+            print(items.len());
+            print(" elements\n");
+            var i: i64 = 0;
+            while i < items.len() {
+                print("  [");
+                print(i);
+                print("] = ");
+                match items.get(i) {
+                    Json::Num(n) => { print(n); print("\n"); }
+                    _ => { print("?\n"); }
+                }
+                i = i + 1;
+            }
+        }
+        _ => { print("Not an array!\n"); }
+    }
+
+    print("\nJSON parser works.\n");
+    return 0;
+}

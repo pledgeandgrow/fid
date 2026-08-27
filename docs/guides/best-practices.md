@@ -247,7 +247,7 @@ need a map for output, use `BTreeMap` or `IndexMap`.
 
 ```
                     ┌─────────────┐
-                    │  End-to-end │  fidesc test (213 .fd files)
+                    │  End-to-end │  fidesc test (218 .fd files)
                     │   tests     │  ← tells you SOMETHING broke
                     └──────┬──────┘
                   ┌────────┴────────┐
@@ -394,13 +394,13 @@ Format: `type(scope): description` where type is one of:
 
 ```fides
 // If this 100-line file fails, reduce to:
-pf main() {
-    pv x = 42;
-    pv y = add(x, 1);
+fn main() {
+    val x = 42;
+    val y = add(x, 1);
     print(y);
 }
 
-pf add(a: i64, b: i64) -> i64 {
+fn add(a: i64, b: i64) -> i64 {
     a + b
 }
 ```

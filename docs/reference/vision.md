@@ -45,7 +45,7 @@ Fides is a systems programming language built from first principles — every la
 
 ### 6. Adoption — Make Switching Easy
 - **C interop**: call C libraries directly, gradual migration path
-- **Familiar syntax**: Rust-like syntax with Fides keywords (pv/pf/pc)
+- **Familiar syntax**: Rust-like syntax with Fides keywords (val/fn/const)
 - **Hot reload**: instant feedback loop attracts game/GUI/web developers
 - **Fast compilation**: sub-second builds for small projects
 - **AI tooling**: LLM-friendly syntax, semantic IR enables AI-assisted refactoring

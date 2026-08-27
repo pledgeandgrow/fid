@@ -1,6 +1,6 @@
 # Fides Language — Feature Status
 
-*Last updated: Aug 2026 — verified against actual source code and test runs (265/265 unit tests, 8/8 harness tests, 116/116 interpreter tests, 116/116 C codegen tests, 116/116 PE emitter tests, 213 .fd test files, 69 stdlib modules (17,468 LOC), 54 .rs source files (84,741 LOC), 4 binaries (fidesc, pacte, scribe, veil), cross-compilation to ARM64/RISC-V/Windows)*
+*Last updated: Aug 27, 2026 — verified against actual source code and test runs (265/265 unit tests, 8/8 harness tests, 146/146 interpreter tests, 146/146 C codegen tests, 146/146 PE emitter tests, 218 .fd test files, 69 stdlib modules (17,567 LOC), 54 .rs source files (85,493 LOC), 4 binaries (fidesc, pacte, scribe, veil), cross-compilation to ARM64/RISC-V/Windows. Skip/known-fail lists cleaned Aug 27: 41 stale tests promoted to normal list.)*
 
 ## Legend
 
@@ -14,14 +14,14 @@
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Lexer (token.rs) | ✅ | All Fides keywords (pf, pv, pc, ret, etc.) |
+| Lexer (token.rs) | ✅ | All Fides keywords (fn, val, const, return, etc.) |
 | Parser (parser.rs) | ✅ | Produces AST from tokens |
 | Type Checker (typechecker.rs) | ✅ | Validates types, capabilities, effects, regions, traits |
 | IR Lowering (lower.rs) | ✅ | AST → typed SSA IR with effects/regions |
 | IR Interpreter (interp.rs) | ✅ | Runs IR directly via `fidesc run` |
 | PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables + flat binary (bare-metal mode) |
 | ELF64 Emitter (elf64.rs) | ✅ | Generates native ELF64 executables on Linux (zero external tools) + relocatable objects |
-| C Codegen (codegen_c.rs) | ✅ | Generates C code, 116/116 normal tests match interpreter output. Phase 10B: Print calls Fides Vec_to_str/HashMap_to_str for formatting. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic via p_call_stack. Rc/Arc runtime via p_rc_incr/p_rc_decr. |
+| C Codegen (codegen_c.rs) | ✅ | Generates C code, 146/146 normal tests match interpreter output. Phase 10B: Print calls Fides Vec_to_str/HashMap_to_str for formatting. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic via p_call_stack. Rc/Arc runtime via p_rc_incr/p_rc_decr. Drop trait: compiler-inserted drop calls. Negative size checks on p_malloc/p_shared_alloc/p_allocator_alloc. ftell failure check on p_file_read/p_file_size. |
 | PIR (pir.rs) | ✅ | PIR L1/L2/L3, `fidesc pir` command |
 | Optimizer (opt.rs) | ✅ | 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. 22 in default pass list. Enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive inlining. |
 | Peephole (peephole.rs) | ✅ | 9 passes, always on in `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection |
@@ -54,7 +54,7 @@
 | `fidesc emit <file> --bare -o <bin>` | ✅ | Bare-metal flat binary (no stdlib, no PE headers) |
 | `fidesc build <file> -o <out> [--target] [--opt]` | ✅ | Native build: PIR → codegen → peephole → ELF64/PE executable (zero external tools). Cross-compilation: `--target arm64-linux`, `--target riscv64-linux`, `--target x86-64-windows`. |
 | `fidesc ccompile <file> -o <exe>` | ✅ | C codegen → gcc/clang → executable |
-| `fidesc test` | ✅ | Runs all 116 normal tests across interpreter, PE emitter, and C codegen |
+| `fidesc test` | ✅ | Runs all 159 normal tests across interpreter, PE emitter, and C codegen |
 | `fidesc test --fail` | ✅ | Runs only expected-fail tests (failing = correct) |
 | `fidesc repl` | ✅ | Interactive REPL |
 | `fidesc audit <file>` | ✅ | IR verification pass (also `verify`) |
@@ -83,11 +83,11 @@
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `pf` function declarations | ✅ | Named functions with params and return types |
-| `pv` variable declarations | ✅ | Immutable bindings |
-| `pv mut` mutable variables | ✅ | Mutable bindings |
-| `pc` constants | ✅ | Compile-time constants |
-| `ret` return statement | ✅ | Return with optional value |
+| `fn` function declarations | ✅ | Named functions with params and return types |
+| `val` variable declarations | ✅ | Immutable bindings |
+| `var` mutable variables | ✅ | Mutable bindings |
+| `const` constants | ✅ | Compile-time constants |
+| `return` return statement | ✅ | Return with optional value |
 | `if` / `else` conditionals | ✅ | Branching |
 | `while` loops | ✅ | Conditional loops |
 | `for x in iter` loops | ✅ | Iterator-based loops (Vec, HashMap, range, nested Vec) |
@@ -114,7 +114,7 @@
 | Generic enums `enum Foo<T>` | ✅ | Type parameters on enum declarations |
 | Generic structs `struct Foo<T>` | ✅ | Type parameters on struct declarations |
 | Generics `<T>` | ✅ | Generic functions and types |
-| Type aliases `ty` | ✅ | Type alias declarations |
+| Type aliases `type` | ✅ | Type alias declarations |
 
 ### Expressions
 
@@ -126,7 +126,7 @@
 | Bitwise (`&`, `\|`, `^`, `<<`, `>>`) | ✅ | Bit operations |
 | f-string interpolation `f"{expr}"` | ✅ | String formatting |
 | Ranges `..` and `..=` | ✅ | Range expressions |
-| Closures `pf(x) { }` / `pf(x) => expr` | ✅ | Anonymous functions |
+| Closures `fn(x) { }` / `fn(x) => expr` | ✅ | Anonymous functions |
 | `match` expressions | ✅ | Int, string, enum, wildcard patterns; expression and statement forms |
 | `?` operator | ✅ | Error propagation |
 | Casts `as` | ✅ | Type casts |
@@ -147,11 +147,11 @@
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Named functions `pf name() { }` | ✅ | |
+| Named functions `fn name() { }` | ✅ | |
 | Function parameters | ✅ | Up to 4 register args, more on stack |
 | Return values | ✅ | Single return value |
 | Closures | ✅ | Captures environment |
-| Generic functions `pf name<T>()` | ✅ | Type parameters |
+| Generic functions `fn name<T>()` | ✅ | Type parameters |
 | Default arguments | ❌ | Not implemented |
 | Variadic arguments | ❌ | Not implemented |
 
@@ -173,11 +173,15 @@
 | Feature | Status | Notes |
 |---------|--------|-------|
 | `&` references | ✅ | Immutable borrows |
-| `&mut` references | ✅ | Mutable borrows |
+| `&mut` references | ✅ | Mutable borrows, auto-deref for method calls (Issue 45) |
 | `defer` | ✅ | Go-style deferred cleanup |
+| Drop trait | ✅ | Compiler-inserted drop calls at scope exit (LIFO order). Works on all 3 backends. |
 | Region blocks `region r { }` | ✅ | Compile-time region tracking, use-after-free detection |
 | Region escape detection | ✅ | Compile-time dangling pointer detection |
 | Region inference | ✅ | Auto-detect regions via region_stack tracking in typechecker |
+| UAF detection (interpreter) | ✅ | RegionEnd marks addresses freed; Load/Store panic in debug mode if accessing freed memory |
+| `val` immutability | ✅ | Type error on reassignment + field mutation (Issues 46-47). 247 stdlib vars migrated to `var`. |
+| Non-exhaustive match | ⚠️ | Emits warning for missing enum variants or bool arms (Issue 49). Intentional warning (not error) to allow partial matches. |
 
 ### Modules & Imports
 
@@ -217,6 +221,10 @@
 |---------|--------|-------|
 | `async` / `await` | ✅ | Parsed, lowered, works in interpreter + C codegen (Phase 7.6 — Future<T> type with eager evaluation; typechecker enforces Future<T> for await; state machine transform pending) |
 | `spawn` | ✅ | Parsed, lowered, works in interpreter + C codegen (Phase 7.6 — wraps result in Future<T>; concurrent execution pending) |
+| Mutex | ✅ | `sync_mutex_create/lock/unlock` via pthread mutex |
+| RwLock | ✅ | `sync_rwlock_create/read_lock/read_unlock/write_lock/write_unlock` — atomic reader count, no TOCTOU race |
+| AtomicU64 | ✅ | `atomic_u64_new/load/store/fetch_add/cas` wrappers |
+| Channels | ✅ | Bounded, thread-safe message passing (`sync_channel_create/send/recv/try_recv/close`) |
 | Effect handlers `handle { do } with` | ⚠️ | Syntax parses and runs; full continuation semantics pending |
 | Effect annotations `!IO`, `!{}` | ✅ | Compile-time effect inference and checking |
 | Effect propagation | ✅ | Fixpoint iteration over call graph |
@@ -241,14 +249,14 @@
 |---------|--------|-------|
 | `comptime` blocks | ✅ | `comptime <expr>`, `comptime { block }`, reflection |
 | `comptime` reflection | ✅ | type_name, is_struct, is_enum, field_names, field_types, enum_variants |
-| `comptime` functions | ✅ | `comptime pf func()` — evaluated at compile time |
+| `comptime` functions | ✅ | `comptime fn func()` — evaluated at compile time |
 | Match guards | ✅ | `pattern if cond => body` |
 | Match range patterns | ✅ | `1..=5 => body` |
-| Trait associated types | ✅ | `ty Item;` in trait, `ty Item = T;` in impl |
+| Trait associated types | ✅ | `type Item;` in trait, `type Item = T;` in impl |
 | Trait default methods | ✅ | Default body in trait, inherited by impls |
 | Trait objects (`dyn Trait`) | ✅ | Dynamic dispatch via vtable |
 | Trait impl verification | ✅ | Check all required methods implemented |
-| Type aliases (`ty`) | ✅ | `ty X = T` — parsed, typechecked, lowered |
+| Type aliases (`type`) | ✅ | `type X = T` — parsed, typechecked, lowered |
 | Inline assembly (`asm!`) | ✅ | Hardware-specific instructions |
 | Bare-metal mode (`--bare`) | ✅ | No stdlib, flat binary output |
 | SIMD types | ✅ | `stdlib/simd.fd` — elementwise ops, dot, sum, scale |
@@ -265,7 +273,7 @@
 | `@derive` | ✅ | `@derive(Debug/Clone/Serialize/Deserialize)` generates methods (Phase 7.7) |
 | Borrow checker | ✅ | Phases 1-6 complete: `--borrowck=off\|warn\|on`, field-wise borrows, two-phase borrows, NLL, on by default |
 | Raw pointers `*mut T` / `*const T` | ✅ | With `unsafe {}` blocks for dereference |
-| `pm` (uninitialized mutable) | ✅ | F63: definite assignment analysis |
+| `var` (uninitialized mutable) | ✅ | F63: definite assignment analysis |
 | `@wrapping` arithmetic | ✅ | F65: escape hatch from checked arithmetic |
 | `@gas(N)` budget | ✅ | Compile-time gas budget annotation |
 | `@crashfree` | ✅ | No panic, no unbounded loops |
@@ -310,14 +318,14 @@
 | x86-64 ABI compliance | ✅ | System V AMD64 ABI: RDI/RSI/RDX/RCX/R8/R9 + XMM0-XMM7, 16-byte alignment |
 | **ML1: Region-scoped GPU memory** | ✅ | `region gpu r { }` — GPU allocations freed at block exit, escape check |
 | **ML2: Comptime shape verification** | ✅ | Compile-time shape checking for matmul, conv2d, concat, flatten, etc. |
-| **ML3: Effect-traced autodiff** | ✅ | `@differentiable` annotation — `Diff` effect proves differentiability at compile time |
+| **ML3: Tape-based reverse-mode autodiff** | ✅ | `@differentiable` annotation verified by typechecker. Runtime tape-based reverse-mode AD in interpreter: `grad(var) { ... backward(loss) }` computes gradients. `p_grad_get`/`p_grad_zero` manage gradient state. |
 | **ML4: Hot-swap model weights** | ✅ | Extended `persist` with file-based persistence and pointer/Vec serialization |
 | **ML8: comptime kernel specialization** | ✅ | `@kernel(x,y,z)` annotation — SPIR-V/PTX entry point with workgroup size |
 | **ML9: KV cache with region memory** | ✅ | `region kv_cache r with budget(N) window(W) { }` — bounded cache, sliding window, compile-time OOM prevention |
 | **ML10: Real quantization (INT8)** | ✅ | `@quantized` annotation, `quantize_q8`/`dequantize_q8`/`qmatmul`, symmetric quantization |
-| **ML11: Gradient checkpointing** | ✅ | `@checkpoint` annotation — requires `@differentiable` + `@deterministic` for safe recompute |
-| **ML12: Differential privacy** | ✅ | `@dp(epsilon=N)` annotation, `Effect::Noise`, `dp_noise`/`gaussian_noise`/`dropout` builtins |
-| **ML13: Tensor parallelism** | ✅ | `@shard` annotation, `Effect::Comm`, `all_reduce`/`broadcast`/`all_gather`/`scatter` builtins |
+| **ML11: Gradient checkpointing** | ✅ | `@checkpoint` annotation verified by typechecker (requires `@differentiable` + `@deterministic`). Runtime checkpointing in interpreter: `p_checkpoint_begin`/`p_checkpoint_end` toggle activation saving/recompute mode. |
+| **ML12: Differential privacy** | ✅ | `@dp(epsilon=N)` annotation verified by typechecker (must have Noise effect, no IO/Net). Runtime epsilon budget tracking: `p_dp_budget_reset`/`p_dp_budget_check` enforce privacy budget at runtime. |
+| **ML13: Tensor parallelism** | ✅ | `@shard` annotation verified by typechecker (must have Comm effect, no IO/Net). Simulated multi-rank runtime: `p_tp_rank`/`p_tp_world_size` return rank info, `p_all_reduce` etc. work in single-rank mode. |
 | **ML14: LoRA/Adapter hot-swap** | ✅ | `@adapter` annotation — pure weight transformations, works with `persist` for hot-swap |
 | **`@realtime` annotation** | ✅ | Compile-time enforcement: no alloc, no blocking IO, no while loops, no recursion |
 
@@ -350,7 +358,7 @@ The PE emitter generates standalone Windows x64 PE executables with no external 
 | `cmp` / `test` | ✅ | Comparison |
 | `jcc` (conditional jumps) | ✅ | All common conditions |
 | `call` (label / RIP-relative) | ✅ | Local and IAT calls |
-| `push` / `pop` / `ret` | ✅ | Stack operations |
+| `push` / `pop` / `return` | ✅ | Stack operations |
 | `xor` / `shl` / `inc` | ✅ | Bit and increment ops |
 | `lea` (RIP-relative / RBP-relative) | ✅ | Address computation |
 | `ud2` (trap) | ✅ | Safety trap |
@@ -359,7 +367,7 @@ The PE emitter generates standalone Windows x64 PE executables with no external 
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Function prologue/epilogue | ✅ | push rbp, mov rbp rsp, sub rsp, ret |
+| Function prologue/epilogue | ✅ | push rbp, mov rbp rsp, sub rsp, return |
 | Stack frame allocation | ✅ | 16-byte aligned + 32 shadow space |
 | Parameter passing (Win64 ABI) | ✅ | RCX, RDX, R8, R9 + stack |
 | `ConstInt` | ✅ | Load immediate to stack slot |
@@ -447,7 +455,7 @@ Six AI/ML-oriented features have been added to the Fides language, enabling neur
 
 **Syntax example:**
 ```p
-pv result = x |> square |> add_one |> print;
+val result = x |> square |> add_one |> print;
 // equivalent to: print(add_one(square(x)));
 ```
 
@@ -467,7 +475,7 @@ layer Dense {
     w: Tensor,
     b: Tensor,
     forward(self, x: Tensor) -> Tensor {
-        ret matmul(x, self.w) + self.b;
+        return matmul(x, self.w) + self.b;
     }
 }
 
@@ -475,7 +483,7 @@ model MLP {
     l1: Dense(784, 128),
     l2: Dense(128, 10),
     forward(self, x: Tensor) -> Tensor {
-        ret x |> self.l1.forward |> relu |> self.l2.forward;
+        return x |> self.l1.forward |> relu |> self.l2.forward;
     }
 }
 ```
@@ -494,24 +502,25 @@ model MLP {
 
 **Syntax example:**
 ```p
-pv w: Tensor<f32, [784, 128]> = ...;
-pv x: Tensor<f32, [batch, 784]> = ...;
-pv y: Tensor<f32, [batch, 128]> = matmul(x, w);  // shape-checked at compile time
+val w: Tensor<f32, [784, 128]> = ...;
+val x: Tensor<f32, [batch, 784]> = ...;
+val y: Tensor<f32, [batch, 128]> = matmul(x, w);  // shape-checked at compile time
 ```
 
 ### Autograd Block
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `grad(var) { ... }` syntax | ✅ | Compile-time reverse-mode automatic differentiation |
-| `backward(loss)` statement | ✅ | Triggers reverse-mode AD within a grad block |
-| Tape-based gradient computation | ✅ | `src/autograd.rs` — traces operations and builds backward computation graph |
-| Compilation pipeline integration | ✅ | Autograd pass hooked into compilation pipeline |
+| `grad(var) { ... }` syntax | ✅ | Parsed, lowered to `GradBlock`/`GradEnd` IR instructions, executed by interpreter |
+| `backward(loss)` statement | ✅ | Triggers reverse-mode AD: traverses tape in reverse, computes gradients via local derivative functions |
+| Tape-based gradient computation | ✅ | Tape records tensor ops (`add`, `mul`, `relu`, `sigmoid`, etc.) with inputs. Backward pass computes gradients. |
+| `@differentiable` annotation | ✅ | Typechecker verifies: no IO/Net/Spawn/Diverge, transitive. Compile-time proof of differentiability. |
+| Compilation pipeline integration | ✅ | `GradBlock`/`GradEnd`/`Backward` instructions handled in interpreter, PIR lowering, C codegen, x86, PE, WASM backends |
 
 **Syntax example:**
 ```p
 grad(w) {
-    pv loss = compute_loss(w);
+    val loss = compute_loss(w);
     backward(loss);
 }
 // After the grad block, w has been updated with computed gradients
@@ -532,8 +541,8 @@ grad(w) {
 **Syntax example:**
 ```p
 @kernel
-pf vector_add(a: &Tensor, b: &Tensor, c: &mut Tensor, n: i64) {
-    pv i = thread_id(0);
+fn vector_add(a: &Tensor, b: &Tensor, c: &mut Tensor, n: i64) {
+    val i = thread_id(0);
     if i < n {
         c[i] = a[i] + b[i];
     }
@@ -556,11 +565,11 @@ pf vector_add(a: &Tensor, b: &Tensor, c: &mut Tensor, n: i64) {
 ```p
 use quant;
 
-pv w: Tensor = ...;
-pv q_w = w ~> q8;                    // quantize weights to 8-bit
-pv q_x = x ~> q8;                    // quantize activations
-pv q_out = quant::qmatmul(q_x, q_w); // quantized matmul
-pv out = quant::dequantize_q8(q_out); // dequantize result
+val w: Tensor = ...;
+val q_w = w ~> q8;                    // quantize weights to 8-bit
+val q_x = x ~> q8;                    // quantize activations
+val q_out = quant::qmatmul(q_x, q_w); // quantized matmul
+val out = quant::dequantize_q8(q_out); // dequantize result
 ```
 
 ---
@@ -643,13 +652,13 @@ pv out = quant::dequantize_q8(q_out); // dequantize result
 
 | Feature | Syntax | Status |
 |---------|--------|--------|
-| Tuple destructuring | `pv (a, b) = expr` | ✅ DONE |
+| Tuple destructuring | `val (a, b) = expr` | ✅ DONE |
 | Loop-aware linear types | Linear vars can't be consumed in loops | ✅ DONE |
 | `txn {}` blocks | `txn { ... }` | ✅ DONE (with interpreter rollback) |
 | Raw pointer types | `*mut T`, `*const T` | ✅ DONE (with `unsafe {}` enforcement) |
 | Memoization | `stdlib/memo.fd` | ✅ DONE (Memo::new, get_or_compute) |
 | Checked arithmetic (F64) | overflow = panic | ✅ DONE (always on, not just debug mode) |
-| `@wrapping` (F65) | `@wrapping pf foo() { ... }` | ✅ DONE (escape hatch for wrap-around) |
+| `@wrapping` (F65) | `@wrapping fn foo() { ... }` | ✅ DONE (escape hatch for wrap-around) |
 | Bounds checking lock (F62) | bounds checks always on | ✅ DONE (skippable in `unsafe {}`) |
 | Parameterized queries (F68) | no concat on typed strings | ✅ DONE (compile error on SQLString + str) |
 | `@medical` (F48) | IEC 62304 compliance | ✅ DONE (no alloc, no recursion, no while, must be @audit) |
@@ -712,10 +721,10 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 | Parser | 100% | — | — |
 | Type Checker | 100% | — | — |
 | IR Lowering | 100% | — | — |
-| Interpreter | 116/116 normal | — | All normal tests pass. 6 bonus passes (previously known-fail). |
-| PE Emitter | 116/116 normal | — | All normal tests pass. 6 bonus passes (previously known-fail). |
+| Interpreter | 146/146 normal | — | All normal tests pass. (Aug 27: 41 stale tests promoted.) |
+| PE Emitter | 146/146 normal | — | All normal tests pass. (Aug 27: 41 stale tests promoted.) |
 | ELF64 Emitter | ✅ | — | Working executables on Linux (zero external tools) |
-| C Codegen | 116/116 normal | — | All normal tests pass. 4 bonus passes. Binary hardening enabled. |
+| C Codegen | 146/146 normal | — | Binary hardening enabled. (Aug 27: 41 stale tests promoted.) |
 | Multi-arch Codegen | ✅ | — | x86-64, ARM64, RISC-V assembly all work |
 | Cross-compilation (ARM64) | ✅ | — | `build --target arm64-linux` → AArch64 ELF64 (27KB) |
 | Cross-compilation (RISC-V) | ✅ | — | `build --target riscv64-linux` → RISC-V ELF64 (29KB) |
@@ -740,11 +749,11 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 
 ### Test Coverage
 
-- **213 test files** in `tests/` (190 in root + 23 in subdirs: capability/effects/regions/safety)
+- **218 test files** in `tests/` (195 in root + 23 in subdirs: capability/effects/regions/safety)
 - **265 unit tests** in `cargo test --lib` — all pass (incl. 47 cross-compilation tests + 7 incremental compilation)
 - **Harness tests** 8/8 passed
-- **116/116** normal tests pass on all 3 backends (interpreter, PE emitter, C codegen)
+- **146/146** normal tests pass on interpreter and PE emitter, **146/146** on C codegen (all normal tests match; test_autodiff_grad + test_ml_full in skip list)
 - **148 golden files** in `tests/golden/` — expected outputs for regression testing
-- **69 stdlib modules** in `stdlib/` (17,468 LOC) — core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, and more
-- **54 source files** in `src/` (84,741 LOC)
+- **69 stdlib modules** in `stdlib/` (17,567 LOC) — core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, and more
+- **54 source files** in `src/` (85,493 LOC)
 - **4 binaries**: fidesc (compiler), pacte (package manager), scribe (doc generator), veil (coverage tool)

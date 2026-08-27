@@ -550,6 +550,27 @@ impl CCodeGen {
             ("p_chan_try_recv", &[I64]),
             ("p_chan_close", &[I64]),
             ("p_chan_is_closed", &[I64]),
+            // ML3: Autograd builtins
+            ("p_grad_get", &[p()]),
+            ("p_grad_zero", &[]),
+            // ML11: Checkpoint builtins
+            ("p_checkpoint_begin", &[]),
+            ("p_checkpoint_end", &[]),
+            // ML12: DP builtins
+            ("p_dp_noise", &[p(), F64]),
+            ("p_gaussian_noise", &[p(), F64]),
+            ("p_dropout", &[p(), F64]),
+            ("p_dp_budget_reset", &[F64]),
+            ("p_dp_budget_check", &[F64, F64]),
+            // ML13: Tensor parallelism builtins
+            ("p_tp_rank", &[]),
+            ("p_tp_world_size", &[]),
+            ("p_all_reduce", &[p()]),
+            ("p_broadcast", &[p()]),
+            ("p_all_gather", &[p()]),
+            ("p_scatter", &[p()]),
+            ("p_send_tensor", &[p()]),
+            ("p_recv_tensor", &[p()]),
         ];
         for (name, params) in sigs {
             self.fn_param_types
@@ -572,6 +593,8 @@ impl CCodeGen {
             "p_http_send_response",
             "p_db_exec", "p_db_set", "p_db_mem_close",
             "p_rc_decr",
+            "p_grad_zero", "p_checkpoint_begin", "p_checkpoint_end",
+            "p_dp_budget_reset", "p_dp_budget_check", "p_send_tensor",
         ];
         for name in void_ret {
             self.fn_ret_types.insert(name.to_string(), IrType::Void);
@@ -586,6 +609,9 @@ impl CCodeGen {
         }
         // Rc/Arc refcount functions return i64 (the pointer value)
         self.fn_ret_types.insert("p_rc_incr".to_string(), IrType::I64);
+        // ML13: TP rank/world_size return i64
+        self.fn_ret_types.insert("p_tp_rank".to_string(), IrType::I64);
+        self.fn_ret_types.insert("p_tp_world_size".to_string(), IrType::I64);
     }
 
     fn emit_runtime_header(&mut self) {
@@ -787,6 +813,30 @@ impl CCodeGen {
         wln!(self, "int64_t p_tensor_size(void* t);");
         wln!(self, "char* p_tensor_to_str(void* t);");
         wln!(self, "char* p_tensor_to_json(void* t);");
+        // ML3: Autograd builtins
+        wln!(self, "void* p_grad_get(void* t);");
+        wln!(self, "void p_grad_zero(void);");
+        wln!(self, "void p_autograd_begin(void);");
+        wln!(self, "void p_autograd_end(void);");
+        wln!(self, "void p_autograd_backward(void* loss);");
+        // ML11: Checkpoint builtins
+        wln!(self, "void p_checkpoint_begin(void);");
+        wln!(self, "void p_checkpoint_end(void);");
+        // ML12: DP builtins
+        wln!(self, "void* p_dp_noise(void* t, double sigma);");
+        wln!(self, "void* p_gaussian_noise(void* shape_vec, double sigma);");
+        wln!(self, "void* p_dropout(void* t, double drop_prob);");
+        wln!(self, "void p_dp_budget_reset(double epsilon);");
+        wln!(self, "void p_dp_budget_check(double epsilon, double limit);");
+        // ML13: Tensor parallelism builtins
+        wln!(self, "int64_t p_tp_rank(void);");
+        wln!(self, "int64_t p_tp_world_size(void);");
+        wln!(self, "void* p_all_reduce(void* t);");
+        wln!(self, "void* p_broadcast(void* t);");
+        wln!(self, "void* p_all_gather(void* t);");
+        wln!(self, "void* p_scatter(void* t);");
+        wln!(self, "void p_send_tensor(void* t);");
+        wln!(self, "void* p_recv_tensor(void* shape_vec);");
         // JSON builtins (Phase 5D)
         wln!(self, "char* p_json_parse(const char* s);");
         wln!(self, "void* p_json_new_object(void);");
@@ -1833,6 +1883,20 @@ impl CCodeGen {
             Inst::UnsafeBegin | Inst::UnsafeEnd => {
                 // Unsafe block markers — no-op in C backend
             }
+            Inst::GradBegin { .. } => {
+                // ML3: Enable gradient tracking — clear tape and grads, set mode on
+                wln!(self, "    p_autograd_begin();");
+            }
+            Inst::GradEnd => {
+                // ML3: Disable gradient tracking
+                wln!(self, "    p_autograd_end();");
+            }
+            Inst::Backward { loss } => {
+                // ML3: Run backward pass — walk tape in reverse, compute gradients
+                // The loss value is ignored (seed is always 1.0), pass NULL
+                let _ = loss;
+                wln!(self, "    p_autograd_backward(NULL);");
+            }
             Inst::Panic { message, .. } => {
                 wln!(self, "    p_panic(\"{}\");", message);
             }
@@ -2037,13 +2101,15 @@ impl CCodeGen {
         wln!(self, "    }}");
         wln!(self, "    abort();");
         wln!(self, "}}");
-        wln!(self, "void* p_malloc(int64_t size) { return malloc((size_t)size); }");
+        wln!(self, "void* p_malloc(int64_t size) { if (size < 0) return NULL; return malloc((size_t)size); }");
         wln!(self, "void p_free(void* ptr) { free(ptr); }");
         // File I/O builtins
         wln!(self, "char* p_file_read(const char* path) {{");
         wln!(self, "    FILE* f = fopen(path, \"rb\");");
         wln!(self, "    if (!f) return NULL;");
-        wln!(self, "    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);");
+        wln!(self, "    fseek(f, 0, SEEK_END); long sz = ftell(f);");
+        wln!(self, "    if (sz < 0) {{ fclose(f); return NULL; }}");
+        wln!(self, "    fseek(f, 0, SEEK_SET);");
         wln!(self, "    char* buf = (char*)malloc((size_t)sz + 1);");
         wln!(self, "    if (!buf) {{ fclose(f); return NULL; }}");
         wln!(self, "    size_t rd = fread(buf, 1, (size_t)sz, f); buf[rd] = 0; fclose(f);");
@@ -2061,7 +2127,7 @@ impl CCodeGen {
         wln!(self, "    fputs(content, f); fclose(f); return 0;");
         wln!(self, "}}");
         wln!(self, "int64_t p_file_delete(const char* path) {{ return remove(path) == 0 ? 0 : -1; }}");
-        wln!(self, "int64_t p_file_size(const char* path) {{ FILE* f = fopen(path, \"rb\"); if (!f) return -1; fseek(f, 0, SEEK_END); int64_t sz = ftell(f); fclose(f); return sz; }}");
+        wln!(self, "int64_t p_file_size(const char* path) {{ FILE* f = fopen(path, \"rb\"); if (!f) return -1; fseek(f, 0, SEEK_END); int64_t sz = ftell(f); fclose(f); return sz < 0 ? -1 : sz; }}");
         // Environment variable builtins
         wln!(self, "char* p_getenv(const char* name) {{ return getenv(name); }}");
         // Command-line argument builtins — globals declared in emit_runtime_types
@@ -2323,7 +2389,7 @@ impl CCodeGen {
         wln!(self, "    return -(int64_t)(idx + 1);");
         wln!(self, "}");
         // Shared memory — simple malloc-based, atomics use C11 stdatomic
-        wln!(self, "int64_t p_shared_alloc(int64_t size) { return (int64_t)(intptr_t)malloc((size_t)size); }");
+        wln!(self, "int64_t p_shared_alloc(int64_t size) { if (size < 0) return 0; return (int64_t)(intptr_t)malloc((size_t)size); }");
         wln!(self, "int64_t p_atomic_load(int64_t addr) { return atomic_load((atomic_int_least64_t*)(intptr_t)addr); }");
         wln!(self, "void p_atomic_store(int64_t addr, int64_t val) { atomic_store((atomic_int_least64_t*)(intptr_t)addr, val); }");
         wln!(self, "bool p_atomic_cas(int64_t addr, int64_t expected, int64_t new_val) {");
@@ -2471,7 +2537,7 @@ impl CCodeGen {
         wln!(self, "}");
         // Allocator builtins (Phase 2A.8) — simplified stubs
         wln!(self, "void* p_allocator_create(void* arg) { (void)arg; return (void*)1; }");
-        wln!(self, "int64_t p_allocator_alloc(void* alloc, int64_t size) { (void)alloc; return (int64_t)(intptr_t)malloc((size_t)size); }");
+        wln!(self, "int64_t p_allocator_alloc(void* alloc, int64_t size) { (void)alloc; if (size < 0) return 0; return (int64_t)(intptr_t)malloc((size_t)size); }");
         wln!(self, "void p_allocator_free(void* alloc, int64_t ptr) { (void)alloc; free((void*)(intptr_t)ptr); }");
         wln!(self, "int64_t p_allocator_stats(void* alloc) { (void)alloc; return 0; }");
         wln!(self, "int64_t print(int64_t val) { printf(\"%lld\", (long long)val); return 0; }");
@@ -2859,6 +2925,72 @@ impl CCodeGen {
         wln!(self, "");
         wln!(self, "// Tensor builtins — simple flat array with shape metadata");
         wln!(self, "typedef struct { double* data; int64_t len; int64_t ndim; int64_t shape[8]; } PTensor;");
+
+        // ─── ML3: Autograd tape data structures (must be before tensor builtins) ───
+        wln!(self, "typedef enum { AG_ADD, AG_SUB, AG_MUL, AG_MATMUL, AG_SCALE, AG_RELU, AG_SIGMOID, AG_SUM, AG_MEAN, AG_NEG } AGOpKind;");
+        wln!(self, "typedef struct {");
+        wln!(self, "    AGOpKind op;");
+        wln!(self, "    void* result;  void* a;  void* b;  double scalar;");
+        wln!(self, "    int64_t a_shape[8]; int64_t a_ndim;");
+        wln!(self, "    int64_t b_shape[8]; int64_t b_ndim;");
+        wln!(self, "    double* stored_data; int64_t stored_len; int is_checkpoint;");
+        wln!(self, "} AGEntry;");
+        wln!(self, "static AGEntry ag_tape[256];");
+        wln!(self, "static int64_t ag_tape_len = 0;");
+        wln!(self, "static int ag_mode = 0;");
+        wln!(self, "static int ag_checkpoint_mode = 0;");
+        wln!(self, "static void* ag_grad_ptrs[256];");
+        wln!(self, "static PTensor* ag_grads[256];");
+        wln!(self, "static int64_t ag_grad_len = 0;");
+        wln!(self, "static double ag_dp_budget = 0.0;");
+        wln!(self, "static double ag_dp_limit = 0.0;");
+        wln!(self, "static int ag_tp_rank = 0;");
+        wln!(self, "static int ag_tp_world_size = 1;");
+        wln!(self, "static PTensor* ag_get_grad(void* ptr) {{");
+        wln!(self, "    for (int64_t i = 0; i < ag_grad_len; i++) if (ag_grad_ptrs[i] == ptr) return ag_grads[i];");
+        wln!(self, "    return NULL;");
+        wln!(self, "}}");
+        wln!(self, "static void ag_accum_grad(void* ptr, PTensor* grad) {{");
+        wln!(self, "    PTensor* ex = ag_get_grad(ptr);");
+        wln!(self, "    if (ex) {{ for (int64_t i = 0; i < ex->len && i < grad->len; i++) ex->data[i] += grad->data[i]; }}");
+        wln!(self, "    else {{ if (ag_grad_len < 256) {{ ag_grad_ptrs[ag_grad_len] = ptr; ag_grads[ag_grad_len] = grad; ag_grad_len++; }} }}");
+        wln!(self, "}}");
+        wln!(self, "static PTensor* ag_clone_tensor(PTensor* t) {{");
+        wln!(self, "    if (!t) return NULL;");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = t->ndim; r->len = t->len;");
+        wln!(self, "    for (int64_t i = 0; i < t->ndim && i < 8; i++) r->shape[i] = t->shape[i];");
+        wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = t->data[i];");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "static PTensor* ag_zeros_like(PTensor* t) {{");
+        wln!(self, "    if (!t) return NULL;");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = t->ndim; r->len = t->len;");
+        wln!(self, "    for (int64_t i = 0; i < t->ndim && i < 8; i++) r->shape[i] = t->shape[i];");
+        wln!(self, "    r->data = (double*)calloc(r->len, sizeof(double));");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "static PTensor* ag_filled_shape(int64_t* shape, int64_t ndim, double val) {{");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = ndim; int64_t len = 1;");
+        wln!(self, "    for (int64_t i = 0; i < ndim && i < 8; i++) {{ r->shape[i] = shape[i]; len *= shape[i]; }}");
+        wln!(self, "    r->len = len; r->data = (double*)malloc(len * sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < len; i++) r->data[i] = val;");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "static void ag_record(AGOpKind op, void* result, void* a, void* b, double s) {{");
+        wln!(self, "    if (!ag_mode || ag_tape_len >= 256) return;");
+        wln!(self, "    AGEntry* e = &ag_tape[ag_tape_len++];");
+        wln!(self, "    e->op = op; e->result = result; e->a = a; e->b = b; e->scalar = s;");
+        wln!(self, "    e->stored_data = NULL; e->stored_len = 0; e->is_checkpoint = 0;");
+        wln!(self, "    PTensor* ta = (PTensor*)a;");
+        wln!(self, "    if (ta) {{ e->a_ndim = ta->ndim; for (int64_t i = 0; i < ta->ndim && i < 8; i++) e->a_shape[i] = ta->shape[i]; }} else e->a_ndim = 0;");
+        wln!(self, "    PTensor* tb = (PTensor*)b;");
+        wln!(self, "    if (tb) {{ e->b_ndim = tb->ndim; for (int64_t i = 0; i < tb->ndim && i < 8; i++) e->b_shape[i] = tb->shape[i]; }} else e->b_ndim = 0;");
+        wln!(self, "}}");
+
         wln!(self, "void* p_tensor_new(int64_t ndim, int64_t* shape) {{");
         wln!(self, "    PTensor* t = (PTensor*)malloc(sizeof(PTensor));");
         wln!(self, "    t->ndim = ndim;");
@@ -2884,6 +3016,7 @@ impl CCodeGen {
         wln!(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = ta->shape[i];");
         wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
         wln!(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = ta->data[i] + tb->data[i];");
+        wln!(self, "    ag_record(AG_ADD, r, a, b, 0);");
         wln!(self, "    return r;");
         wln!(self, "}}");
         wln!(self, "void* p_tensor_mul(void* a, void* b) {{");
@@ -2894,6 +3027,7 @@ impl CCodeGen {
         wln!(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = ta->shape[i];");
         wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
         wln!(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = ta->data[i] * tb->data[i];");
+        wln!(self, "    ag_record(AG_MUL, r, a, b, 0);");
         wln!(self, "    return r;");
         wln!(self, "}}");
         wln!(self, "void* p_tensor_matmul(void* a, void* b) {{");
@@ -2907,6 +3041,7 @@ impl CCodeGen {
         wln!(self, "        for (int64_t j = 0; j < N; j++)");
         wln!(self, "            for (int64_t k = 0; k < K; k++)");
         wln!(self, "                r->data[i*N+j] += ta->data[i*K+k] * tb->data[k*N+j];");
+        wln!(self, "    ag_record(AG_MATMUL, r, a, b, 0);");
         wln!(self, "    return r;");
         wln!(self, "}}");
         wln!(self, "void* p_tensor_transpose(void* t) {{");
@@ -2929,6 +3064,14 @@ impl CCodeGen {
         wln!(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = pt->shape[i];");
         wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
         wln!(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = pt->data[i] > 0 ? pt->data[i] : 0;");
+        wln!(self, "    if (ag_mode && ag_tape_len < 256) {{");
+        wln!(self, "        AGEntry* e = &ag_tape[ag_tape_len++];");
+        wln!(self, "        e->op = AG_RELU; e->result = r; e->a = t; e->b = NULL; e->scalar = 0;");
+        wln!(self, "        e->a_ndim = pt->ndim; for (int64_t i = 0; i < pt->ndim && i < 8; i++) e->a_shape[i] = pt->shape[i];");
+        wln!(self, "        e->b_ndim = 0;");
+        wln!(self, "        if (ag_checkpoint_mode) {{ e->is_checkpoint = 1; e->stored_len = pt->len; e->stored_data = (double*)malloc(pt->len * sizeof(double)); for (int64_t i = 0; i < pt->len; i++) e->stored_data[i] = pt->data[i]; }}");
+        wln!(self, "        else {{ e->is_checkpoint = 0; e->stored_len = r->len; e->stored_data = (double*)malloc(r->len * sizeof(double)); for (int64_t i = 0; i < r->len; i++) e->stored_data[i] = r->data[i]; }}");
+        wln!(self, "    }}");
         wln!(self, "    return r;");
         wln!(self, "}}");
         wln!(self, "void* p_tensor_softmax(void* t) {{");
@@ -3045,6 +3188,14 @@ impl CCodeGen {
         wln!(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = pt->shape[i];");
         wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
         wln!(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = 1.0 / (1.0 + exp(-pt->data[i]));");
+        wln!(self, "    if (ag_mode && ag_tape_len < 256) {{");
+        wln!(self, "        AGEntry* e = &ag_tape[ag_tape_len++];");
+        wln!(self, "        e->op = AG_SIGMOID; e->result = r; e->a = t; e->b = NULL; e->scalar = 0;");
+        wln!(self, "        e->a_ndim = pt->ndim; for (int64_t i = 0; i < pt->ndim && i < 8; i++) e->a_shape[i] = pt->shape[i];");
+        wln!(self, "        e->b_ndim = 0;");
+        wln!(self, "        if (ag_checkpoint_mode) {{ e->is_checkpoint = 1; e->stored_len = pt->len; e->stored_data = (double*)malloc(pt->len * sizeof(double)); for (int64_t i = 0; i < pt->len; i++) e->stored_data[i] = pt->data[i]; }}");
+        wln!(self, "        else {{ e->is_checkpoint = 0; e->stored_len = r->len; e->stored_data = (double*)malloc(r->len * sizeof(double)); for (int64_t i = 0; i < r->len; i++) e->stored_data[i] = r->data[i]; }}");
+        wln!(self, "    }}");
         wln!(self, "    return r;");
         wln!(self, "}}");
         wln!(self, "void* p_tensor_scale(void* t, double s) {{");
@@ -3055,10 +3206,11 @@ impl CCodeGen {
         wln!(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = pt->shape[i];");
         wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
         wln!(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = pt->data[i] * s;");
+        wln!(self, "    ag_record(AG_SCALE, r, t, NULL, s);");
         wln!(self, "    return r;");
         wln!(self, "}}");
-        wln!(self, "double p_tensor_sum(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt) return 0; double s=0; for (int64_t i=0;i<pt->len;i++) s+=pt->data[i]; return s; }}");
-        wln!(self, "double p_tensor_mean(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; return p_tensor_sum(t)/pt->len; }}");
+        wln!(self, "double p_tensor_sum(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt) return 0; double s=0; for (int64_t i=0;i<pt->len;i++) s+=pt->data[i]; ag_record(AG_SUM, (void*)pt, t, NULL, 0); return s; }}");
+        wln!(self, "double p_tensor_mean(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; double r=p_tensor_sum(t)/pt->len; if (ag_mode && ag_tape_len < 256) {{ AGEntry* e=&ag_tape[ag_tape_len-1]; e->op=AG_MEAN; e->scalar=(double)pt->len; }} return r; }}");
         wln!(self, "double p_tensor_min(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; double m=pt->data[0]; for (int64_t i=1;i<pt->len;i++) if (pt->data[i]<m) m=pt->data[i]; return m; }}");
         wln!(self, "double p_tensor_max(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; double m=pt->data[0]; for (int64_t i=1;i<pt->len;i++) if (pt->data[i]>m) m=pt->data[i]; return m; }}");
         wln!(self, "double p_tensor_dot(void* a, void* b) {{ PTensor* ta=(PTensor*)a; PTensor* tb=(PTensor*)b; if (!ta||!tb) return 0; double s=0; for (int64_t i=0;i<ta->len&&i<tb->len;i++) s+=ta->data[i]*tb->data[i]; return s; }}");
@@ -3124,6 +3276,214 @@ impl CCodeGen {
         wln!(self, "    if (pos+2>=cap){{cap+=2;result=(char*)realloc(result,cap);}}");
         wln!(self, "    result[pos++]=']'; result[pos]=0;");
         wln!(self, "    return result;");
+        wln!(self, "}}");
+
+        // ─── ML3: Autograd tape runtime (functions only — data structures defined above) ───
+        wln!(self, "");
+
+        // Begin/end autograd mode
+        wln!(self, "void p_autograd_begin(void) {{");
+        wln!(self, "    ag_mode = 1; ag_tape_len = 0; ag_grad_len = 0;");
+        wln!(self, "}}");
+        wln!(self, "void p_autograd_end(void) {{");
+        wln!(self, "    ag_mode = 0;");
+        wln!(self, "}}");
+
+        // Backward pass: walk tape in reverse
+        wln!(self, "void p_autograd_backward(void* loss) {{");
+        wln!(self, "    (void)loss; // seed is always 1.0 (d(loss)/d(loss) = 1)");
+        wln!(self, "    double seed = 1.0;");
+        wln!(self, "    // Find the last scalar-producing op (sum/mean) to seed");
+        wln!(self, "    int seeded = 0;");
+        wln!(self, "    for (int64_t i = ag_tape_len - 1; i >= 0; i--) {{");
+        wln!(self, "        if (ag_tape[i].op == AG_SUM) {{");
+        wln!(self, "            PTensor* g = ag_filled_shape(ag_tape[i].a_shape, ag_tape[i].a_ndim, seed);");
+        wln!(self, "            ag_accum_grad(ag_tape[i].a, g); seeded = 1; break;");
+        wln!(self, "        }}");
+        wln!(self, "        if (ag_tape[i].op == AG_MEAN) {{");
+        wln!(self, "            PTensor* g = ag_filled_shape(ag_tape[i].a_shape, ag_tape[i].a_ndim, seed / ag_tape[i].scalar);");
+        wln!(self, "            ag_accum_grad(ag_tape[i].a, g); seeded = 1; break;");
+        wln!(self, "        }}");
+        wln!(self, "    }}");
+        wln!(self, "    if (!seeded && ag_tape_len > 0) {{");
+        wln!(self, "        PTensor* g = (PTensor*)malloc(sizeof(PTensor)); g->ndim=1; g->len=1; g->shape[0]=1; g->data=(double*)malloc(sizeof(double)); g->data[0]=seed;");
+        wln!(self, "        ag_accum_grad(ag_tape[ag_tape_len-1].result, g);");
+        wln!(self, "    }}");
+        wln!(self, "    // Walk tape in reverse");
+        wln!(self, "    for (int64_t i = ag_tape_len - 1; i >= 0; i--) {{");
+        wln!(self, "        AGEntry* e = &ag_tape[i];");
+        wln!(self, "        PTensor* grad_out = ag_get_grad(e->result);");
+        wln!(self, "        if (!grad_out) continue;");
+        wln!(self, "        switch (e->op) {{");
+        wln!(self, "            case AG_ADD: {{");
+        wln!(self, "                ag_accum_grad(e->a, ag_clone_tensor(grad_out));");
+        wln!(self, "                ag_accum_grad(e->b, ag_clone_tensor(grad_out));");
+        wln!(self, "                break;");
+        wln!(self, "            }}");
+        wln!(self, "            case AG_SUB: {{");
+        wln!(self, "                ag_accum_grad(e->a, ag_clone_tensor(grad_out));");
+        wln!(self, "                PTensor* ng = ag_clone_tensor(grad_out); for (int64_t j=0;j<ng->len;j++) ng->data[j]=-ng->data[j];");
+        wln!(self, "                ag_accum_grad(e->b, ng);");
+        wln!(self, "                break;");
+        wln!(self, "            }}");
+        wln!(self, "            case AG_MUL: {{");
+        wln!(self, "                ag_accum_grad(e->a, ag_clone_tensor(grad_out));");
+        wln!(self, "                ag_accum_grad(e->b, ag_clone_tensor(grad_out));");
+        wln!(self, "                break;");
+        wln!(self, "            }}");
+        wln!(self, "            case AG_MATMUL: {{");
+        wln!(self, "                PTensor* ag = ag_filled_shape(e->a_shape, e->a_ndim, 1.0);");
+        wln!(self, "                PTensor* bg = ag_filled_shape(e->b_shape, e->b_ndim, 1.0);");
+        wln!(self, "                ag_accum_grad(e->a, ag); ag_accum_grad(e->b, bg);");
+        wln!(self, "                break;");
+        wln!(self, "            }}");
+        wln!(self, "            case AG_SCALE: {{");
+        wln!(self, "                PTensor* ga = ag_clone_tensor(grad_out); for (int64_t j=0;j<ga->len;j++) ga->data[j]*=e->scalar;");
+        wln!(self, "                ag_accum_grad(e->a, ga);");
+        wln!(self, "                break;");
+        wln!(self, "            }}");
+        wln!(self, "            case AG_RELU: {{");
+        wln!(self, "                // Recompute mask from stored data");
+        wln!(self, "                PTensor* ga = ag_clone_tensor(grad_out);");
+        wln!(self, "                if (e->stored_data) {{");
+        wln!(self, "                    for (int64_t j=0;j<ga->len && j<e->stored_len;j++) {{");
+        wln!(self, "                        double val = e->is_checkpoint ? (e->stored_data[j] > 0 ? e->stored_data[j] : 0) : e->stored_data[j];");
+        wln!(self, "                        ga->data[j] *= (val > 0) ? 1.0 : 0.0;");
+        wln!(self, "                    }}");
+        wln!(self, "                }}");
+        wln!(self, "                ag_accum_grad(e->a, ga);");
+        wln!(self, "                break;");
+        wln!(self, "            }}");
+        wln!(self, "            case AG_SIGMOID: {{");
+        wln!(self, "                PTensor* ga = ag_clone_tensor(grad_out);");
+        wln!(self, "                if (e->stored_data) {{");
+        wln!(self, "                    for (int64_t j=0;j<ga->len && j<e->stored_len;j++) {{");
+        wln!(self, "                        double s = e->is_checkpoint ? (1.0/(1.0+exp(-e->stored_data[j]))) : e->stored_data[j];");
+        wln!(self, "                        ga->data[j] *= s * (1.0 - s);");
+        wln!(self, "                    }}");
+        wln!(self, "                }}");
+        wln!(self, "                ag_accum_grad(e->a, ga);");
+        wln!(self, "                break;");
+        wln!(self, "            }}");
+        wln!(self, "            case AG_SUM: {{");
+        wln!(self, "                PTensor* g = ag_filled_shape(e->a_shape, e->a_ndim, seed);");
+        wln!(self, "                ag_accum_grad(e->a, g);");
+        wln!(self, "                break;");
+        wln!(self, "            }}");
+        wln!(self, "            case AG_MEAN: {{");
+        wln!(self, "                PTensor* g = ag_filled_shape(e->a_shape, e->a_ndim, seed / e->scalar);");
+        wln!(self, "                ag_accum_grad(e->a, g);");
+        wln!(self, "                break;");
+        wln!(self, "            }}");
+        wln!(self, "            case AG_NEG: {{");
+        wln!(self, "                PTensor* ng = ag_clone_tensor(grad_out); for (int64_t j=0;j<ng->len;j++) ng->data[j]=-ng->data[j];");
+        wln!(self, "                ag_accum_grad(e->a, ng);");
+        wln!(self, "                break;");
+        wln!(self, "            }}");
+        wln!(self, "        }}");
+        wln!(self, "    }}");
+        wln!(self, "}}");
+
+        // Get gradient for a tensor
+        wln!(self, "void* p_grad_get(void* t) {{");
+        wln!(self, "    PTensor* g = ag_get_grad(t);");
+        wln!(self, "    if (g) return g;");
+        wln!(self, "    // No gradient — return zero tensor of same shape");
+        wln!(self, "    PTensor* pt = (PTensor*)t;");
+        wln!(self, "    if (!pt) return NULL;");
+        wln!(self, "    return (void*)ag_zeros_like(pt);");
+        wln!(self, "}}");
+        wln!(self, "void p_grad_zero(void) {{");
+        wln!(self, "    ag_grad_len = 0;");
+        wln!(self, "}}");
+
+        // ML11: Checkpoint mode
+        wln!(self, "void p_checkpoint_begin(void) {{ ag_checkpoint_mode = 1; }}");
+        wln!(self, "void p_checkpoint_end(void) {{ ag_checkpoint_mode = 0; }}");
+
+        // ML12: DP builtins
+        wln!(self, "void p_dp_budget_reset(double epsilon) {{ ag_dp_budget = 0.0; ag_dp_limit = epsilon; }}");
+        wln!(self, "void p_dp_budget_check(double epsilon, double limit) {{");
+        wln!(self, "    ag_dp_budget += epsilon;");
+        wln!(self, "    if (ag_dp_budget > limit) {{ fprintf(stderr, \"DP budget exhausted: consumed %g > limit %g\\n\", ag_dp_budget, limit); exit(1); }}");
+        wln!(self, "}}");
+        wln!(self, "void* p_dp_noise(void* t, double sigma) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t; if (!pt) return NULL;");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = pt->ndim; r->len = pt->len;");
+        wln!(self, "    for (int64_t i = 0; i < pt->ndim && i < 8; i++) r->shape[i] = pt->shape[i];");
+        wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < r->len; i++) {{");
+        wln!(self, "        double val = pt->data[i];");
+        wln!(self, "        double u1 = 0.0001 + fabs(fmod(val * 1000.0, 1.0)) * 0.9998;");
+        wln!(self, "        double u2 = 0.0001 + fabs(fmod(sin(val) * 1000.0, 1.0)) * 0.9998;");
+        wln!(self, "        double z = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);");
+        wln!(self, "        r->data[i] = val + sigma * z;");
+        wln!(self, "    }}");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "void* p_gaussian_noise(void* shape_vec, double sigma) {{");
+        wln!(self, "    // shape_vec is a Fides Vec (i64 pointer to 24-byte block)");
+        wln!(self, "    int64_t* sv = (int64_t*)shape_vec;");
+        wln!(self, "    int64_t ndim = sv ? sv[0] : 0;");
+        wln!(self, "    int64_t* data_ptr = sv ? (int64_t*)sv[1] : NULL;");
+        wln!(self, "    int64_t shape[8]; int64_t len = 1;");
+        wln!(self, "    for (int64_t i = 0; i < ndim && i < 8; i++) {{ shape[i] = data_ptr ? data_ptr[i] : 1; len *= shape[i]; }}");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = ndim; r->len = len;");
+        wln!(self, "    for (int64_t i = 0; i < ndim && i < 8; i++) r->shape[i] = shape[i];");
+        wln!(self, "    r->data = (double*)malloc(len * sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < len; i++) {{");
+        wln!(self, "        double seed = (double)i * 0.1;");
+        wln!(self, "        double u1 = 0.0001 + fabs(sin(seed)) * 0.9998;");
+        wln!(self, "        double u2 = 0.0001 + fabs(cos(seed)) * 0.9998;");
+        wln!(self, "        double z = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);");
+        wln!(self, "        r->data[i] = sigma * z;");
+        wln!(self, "    }}");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "void* p_dropout(void* t, double drop_prob) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t; if (!pt) return NULL;");
+        wln!(self, "    PTensor* r = ag_clone_tensor(pt);");
+        wln!(self, "    double scale = 1.0 / (1.0 - drop_prob);");
+        wln!(self, "    for (int64_t i = 0; i < r->len; i++) {{");
+        wln!(self, "        double s = fabs(sin((double)i * 7.0));");
+        wln!(self, "        if (s < drop_prob) r->data[i] = 0.0; else r->data[i] *= scale;");
+        wln!(self, "    }}");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+
+        // ML13: Tensor parallelism builtins (single-rank: identity/no-ops)
+        wln!(self, "int64_t p_tp_rank(void) {{ return ag_tp_rank; }}");
+        wln!(self, "int64_t p_tp_world_size(void) {{ return ag_tp_world_size; }}");
+        wln!(self, "void* p_all_reduce(void* t) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t; if (!pt) return NULL;");
+        wln!(self, "    return (void*)ag_clone_tensor(pt);");
+        wln!(self, "}}");
+        wln!(self, "void* p_broadcast(void* t) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t; if (!pt) return NULL;");
+        wln!(self, "    return (void*)ag_clone_tensor(pt);");
+        wln!(self, "}}");
+        wln!(self, "void* p_all_gather(void* t) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t; if (!pt) return NULL;");
+        wln!(self, "    return (void*)ag_clone_tensor(pt);");
+        wln!(self, "}}");
+        wln!(self, "void* p_scatter(void* t) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t; if (!pt) return NULL;");
+        wln!(self, "    return (void*)ag_clone_tensor(pt);");
+        wln!(self, "}}");
+        wln!(self, "void p_send_tensor(void* t) {{ (void)t; /* no-op in single-rank */ }}");
+        wln!(self, "void* p_recv_tensor(void* shape_vec) {{");
+        wln!(self, "    int64_t* sv = (int64_t*)shape_vec;");
+        wln!(self, "    int64_t ndim = sv ? sv[0] : 0;");
+        wln!(self, "    int64_t* data_ptr = sv ? (int64_t*)sv[1] : NULL;");
+        wln!(self, "    int64_t shape[8]; int64_t len = 1;");
+        wln!(self, "    for (int64_t i = 0; i < ndim && i < 8; i++) {{ shape[i] = data_ptr ? data_ptr[i] : 1; len *= shape[i]; }}");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = ndim; r->len = len;");
+        wln!(self, "    for (int64_t i = 0; i < ndim && i < 8; i++) r->shape[i] = shape[i];");
+        wln!(self, "    r->data = (double*)calloc(len, sizeof(double));");
+        wln!(self, "    return r;");
         wln!(self, "}}");
 
         // ─── JSON builtins (Phase 5D) — simple JSON implementation ───

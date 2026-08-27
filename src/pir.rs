@@ -532,6 +532,10 @@ impl fmt::Display for Operand {
 pub enum L3Inst {
     /// `dst = imm` (or load immediate).
     Mov { dst: VReg, src: Operand },
+    /// `dst = &slot` (address-of stack slot — for Alloca).
+    /// Unlike `Mov { src: Slot }` which loads the VALUE at the slot,
+    /// this materializes the ADDRESS of the slot (leaq).
+    AddrOfSlot { dst: VReg, slot: Slot },
     /// `dst = src1 op src2`.
     Bin { op: BinOp, dst: VReg, a: Operand, b: Operand, ty: PirType },
     /// `dst = op src`.
@@ -857,16 +861,22 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
                 value: ValueId(0),
                 ty: PirType::I64,
             },
-            // UnsafeBegin/UnsafeEnd/TxnBegin/TxnEnd are compile-time markers
-            // (borrow checker, typechecker). They produce no runtime value.
-            // Skip them entirely — inserting a Copy{v0} clobbers RAX in codegen.
-            Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd => {
+            // UnsafeBegin/UnsafeEnd/TxnBegin/TxnEnd/Grad markers are compile-time
+            // markers (borrow checker, typechecker, autodiff). They produce no
+            // runtime value. Skip them entirely — inserting a Copy{v0} clobbers
+            // RAX in codegen.
+            Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd
+            | Inst::GradBegin { .. } | Inst::GradEnd | Inst::Backward { .. } => {
                 continue;
             }
             Inst::Panic { message } => L1Inst::Panic { message: message.clone() },
             Inst::Asm { template, .. } => L1Inst::Panic { message: format!("inline asm not supported in PIR: {}", template) },
             Inst::RegionBegin { name, .. } => L1Inst::NewRegion { name: name.clone() },
             Inst::RegionEnd { .. } => L1Inst::FreeRegion { region: ValueId(0) },
+            Inst::GradBegin { .. } | Inst::GradEnd | Inst::Backward { .. } => {
+                // Autodiff markers — lower to a no-op constant (will be DCE'd)
+                L1Inst::ConstInt { value: 0, ty: PirType::I64 }
+            }
         };
         values.insert(*vid, (l1_inst, region, effects, src_line));
     }
@@ -1363,7 +1373,7 @@ fn lower_l2_inst_to_l3(
             // If we computed a slot for it, materialize the slot address;
             // otherwise emit a StackAlloc.
             if let Some(s) = slot_of.get(&vid) {
-                L3Inst::Mov { dst, src: Operand::Slot(*s) }
+                L3Inst::AddrOfSlot { dst, slot: *s }
             } else {
                 L3Inst::StackAlloc {
                     dst,
@@ -1849,6 +1859,7 @@ fn fmt_l3_inst(i: &L3Inst) -> String {
     use L3Inst::*;
     match i {
         Mov { dst, src } => format!("{} = {}", dst, src),
+        AddrOfSlot { dst, slot } => format!("{} = addrof {}", dst, slot),
         Bin { op, dst, a, b, ty } => format!("{} = {:?} {}, {}  ; {}", dst, op, a, b, ty),
         Unary { op, dst, src, ty } => format!("{} = {:?} {}  ; {}", dst, op, src, ty),
         StackAlloc { dst, bytes, region } => format!("{} = stackalloc {} {}", dst, region, bytes),

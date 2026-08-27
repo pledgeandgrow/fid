@@ -627,7 +627,7 @@ impl X86CodeGen {
             Inst::PersistSave { .. } => {
                 // No-op
             }
-            Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd => {
+            Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd | Inst::GradBegin { .. } | Inst::GradEnd | Inst::Backward { .. } => {
                 // No-op (rollback/unsafe not supported)
             }
             Inst::Panic { message } => {
@@ -657,6 +657,9 @@ impl X86CodeGen {
             }
             Inst::RegionEnd { .. } => {
                 wln!(self, "    ; region end (no-op)");
+            }
+            Inst::GradBegin { .. } | Inst::GradEnd | Inst::Backward { .. } => {
+                wln!(self, "    ; autodiff marker (no-op)");
             }
         }
     }
