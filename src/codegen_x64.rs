@@ -1842,7 +1842,7 @@ mod tests {
 
     #[test]
     fn generates_function_label() {
-        let asm = compile_to_x64("pf main() -> i64 { ret 42; }\n");
+        let asm = compile_to_x64("fn main() -> i64 { return 42; }\n");
         assert!(
             asm.contains("main:"),
             "expected function label 'main:' in output:\n{}",
@@ -1852,16 +1852,16 @@ mod tests {
 
     #[test]
     fn generates_prologue_epilogue() {
-        let asm = compile_to_x64("pf main() -> i64 { ret 0; }\n");
+        let asm = compile_to_x64("fn main() -> i64 { return 0; }\n");
         assert!(asm.contains("pushq %rbp"), "expected pushq %rbp in prologue");
         assert!(asm.contains("movq %rsp, %rbp"), "expected movq %rsp, %rbp");
         assert!(asm.contains("leave"), "expected leave in epilogue");
-        assert!(asm.contains("ret"), "expected ret in epilogue");
+        assert!(asm.contains("ret"), "expected return in epilogue");
     }
 
     #[test]
     fn generates_return_value() {
-        let asm = compile_to_x64("pf main() -> i64 { ret 42; }\n");
+        let asm = compile_to_x64("fn main() -> i64 { return 42; }\n");
         assert!(
             asm.contains("movq $42, %rax") || asm.contains("$42"),
             "expected immediate 42 in output:\n{}",
@@ -1871,7 +1871,7 @@ mod tests {
 
     #[test]
     fn generates_add_instruction() {
-        let asm = compile_to_x64("pf main() -> i64 { ret 40 + 2; }\n");
+        let asm = compile_to_x64("fn main() -> i64 { return 40 + 2; }\n");
         assert!(
             asm.contains("addq") || asm.contains("imulq"),
             "expected addq or arithmetic in output:\n{}",
@@ -1881,7 +1881,7 @@ mod tests {
 
     #[test]
     fn generates_call_instruction() {
-        let asm = compile_to_x64("pf main() -> i64 { print(\"hi\"); ret 0; }\n");
+        let asm = compile_to_x64("fn main() -> i64 { print(\"hi\"); return 0; }\n");
         assert!(
             asm.contains("call") || asm.contains("Call"),
             "expected call instruction in output:\n{}",
@@ -1891,7 +1891,7 @@ mod tests {
 
     #[test]
     fn generates_string_constant() {
-        let asm = compile_to_x64("pf main() -> i64 { print(\"hello\"); ret 0; }\n");
+        let asm = compile_to_x64("fn main() -> i64 { print(\"hello\"); return 0; }\n");
         assert!(
             asm.contains("hello") || asm.contains(".str"),
             "expected string constant in output:\n{}",
@@ -1901,7 +1901,7 @@ mod tests {
 
     #[test]
     fn generates_branch_instruction() {
-        let asm = compile_to_x64("pf main() -> i64 { if true { ret 1; } else { ret 0; } ret 9; }\n");
+        let asm = compile_to_x64("fn main() -> i64 { if true { return 1; } else { return 0; } return 9; }\n");
         assert!(
             asm.contains("jne") || asm.contains("je") || asm.contains("jmp"),
             "expected branch/jump instruction in output:\n{}",
@@ -1912,7 +1912,7 @@ mod tests {
     #[test]
     fn generates_multiple_functions() {
         let asm = compile_to_x64(
-            "pf helper(x: i64) -> i64 { ret x + 1; }\npf main() -> i64 { ret helper(5); }\n",
+            "fn helper(x: i64) -> i64 { return x + 1; }\nfn main() -> i64 { return helper(5); }\n",
         );
         assert!(asm.contains("helper:"), "expected helper function label");
         assert!(asm.contains("main:"), "expected main function label");

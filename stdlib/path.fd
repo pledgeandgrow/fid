@@ -1,0 +1,225 @@
+// Fides Path standard library
+//
+// File path manipulation utilities. Pure string operations — no filesystem access.
+// Handles both Unix (/) and Windows (\) separators, preferring Unix.
+//
+// Usage:
+//   use path;
+//   println(path_join("foo", "bar"));        // "foo/bar"
+//   println(path_dirname("/a/b/c.txt"));      // "/a/b"
+//   println(path_basename("/a/b/c.txt"));     // "c.txt"
+//   println(path_extension("/a/b/c.txt"));    // ".txt"
+
+module path;
+
+use core;
+use vec;
+use string;
+
+// ─── Separator ──────────────────────────────────────────────────────────
+
+/// Path separator (always '/' for portability).
+pub const PATH_SEP: str = "/";
+
+/// Get the path separator character.
+pub fn path_sep() -> str {
+    return "/";
+}
+
+// ─── Join ───────────────────────────────────────────────────────────────
+
+/// Join two path components with a separator.
+/// path_join("foo", "bar") → "foo/bar"
+/// path_join("foo/", "bar") → "foo/bar"
+/// path_join("foo", "/bar") → "foo/bar"
+pub fn path_join(a: str, b: str) -> str {
+    if str_len(a) == 0 { return b; }
+    if str_len(b) == 0 { return a; }
+    val a_ends_sep = str_byte_at(a, str_len(a) - 1) == 47;  // '/'
+    val b_starts_sep = str_byte_at(b, 0) == 47;
+    if a_ends_sep && b_starts_sep {
+        return str_concat(a, str_slice(b, 1, str_len(b)));
+    }
+    if !a_ends_sep && !b_starts_sep {
+        return str_concat(str_concat(a, "/"), b);
+    }
+    return str_concat(a, b);
+}
+
+/// Join multiple path components.
+/// path_join_many(["a", "b", "c"]) → "a/b/c"
+pub fn path_join_many(parts: Vec) -> str {
+    if parts.len() == 0 { return ""; }
+    val result = parts.get(0);
+    var i = 1;
+    while i < parts.len() {
+        result = path_join(result, parts.get(i));
+        i = i + 1;
+    }
+    return result;
+}
+
+// ─── Split ──────────────────────────────────────────────────────────────
+
+/// Split a path into (dirname, basename).
+/// path_split("/a/b/c.txt") → ("/a/b", "c.txt")
+pub fn path_split(path: str) -> Vec {
+    val result = Vec::new();
+    val last_sep = str_rfind(path, "/");
+    if last_sep < 0 {
+        result.push("");
+        result.push(path);
+        return result;
+    }
+    if last_sep == 0 {
+        result.push("/");
+        result.push(str_slice(path, 1, str_len(path)));
+        return result;
+    }
+    result.push(str_slice(path, 0, last_sep));
+    result.push(str_slice(path, last_sep + 1, str_len(path)));
+    return result;
+}
+
+/// Get the directory name of a path.
+/// path_dirname("/a/b/c.txt") → "/a/b"
+pub fn path_dirname(path: str) -> str {
+    val last_sep = str_rfind(path, "/");
+    if last_sep < 0 { return ""; }
+    if last_sep == 0 { return "/"; }
+    return str_slice(path, 0, last_sep);
+}
+
+/// Get the base name (file name) of a path.
+/// path_basename("/a/b/c.txt") → "c.txt"
+pub fn path_basename(path: str) -> str {
+    val last_sep = str_rfind(path, "/");
+    if last_sep < 0 { return path; }
+    return str_slice(path, last_sep + 1, str_len(path));
+}
+
+// ─── Extension ──────────────────────────────────────────────────────────
+
+/// Get the file extension (including the dot).
+/// path_extension("file.txt") → ".txt"
+/// path_extension("file") → ""
+/// path_extension("file.tar.gz") → ".gz"
+pub fn path_extension(path: str) -> str {
+    val base = path_basename(path);
+    val last_dot = str_rfind(base, ".");
+    if last_dot <= 0 { return ""; }  // no dot or leading dot
+    return str_slice(base, last_dot, str_len(base));
+}
+
+/// Get the file name without extension.
+/// path_stem("file.txt") → "file"
+/// path_stem("file.tar.gz") → "file.tar"
+pub fn path_stem(path: str) -> str {
+    val base = path_basename(path);
+    val last_dot = str_rfind(base, ".");
+    if last_dot <= 0 { return base; }
+    return str_slice(base, 0, last_dot);
+}
+
+/// Change the extension of a path.
+/// path_set_extension("file.txt", ".md") → "file.md"
+/// path_set_extension("file", ".txt") → "file.txt"
+pub fn path_set_extension(path: str, ext: str) -> str {
+    val dir = path_dirname(path);
+    val stem = path_stem(path);
+    val result = str_concat(stem, ext);
+    if str_len(dir) > 0 {
+        return path_join(dir, result);
+    }
+    return result;
+}
+
+// ─── Normalize ──────────────────────────────────────────────────────────
+
+/// Normalize a path by resolving "." and ".." components.
+/// path_normalize("a/./b/../c") → "a/c"
+/// path_normalize("/a/b/../c") → "/a/c"
+pub fn path_normalize(path: str) -> str {
+    if str_len(path) == 0 { return "."; }
+    val is_absolute = str_byte_at(path, 0) == 47;
+    val parts = str_split(path, "/");
+    val stack = Vec::new();
+    var i = 0;
+    while i < parts.len() {
+        val part = parts.get(i);
+        if str_equal(part, ".") || str_len(part) == 0 {
+            // skip
+        } else if str_equal(part, "..") {
+            if !stack.is_empty() && !str_equal(stack.last(), "..") {
+                stack.pop();
+            } else if !is_absolute {
+                stack.push("..");
+            }
+        } else {
+            stack.push(part);
+        }
+        i = i + 1;
+    }
+    if stack.is_empty() {
+        if is_absolute { return "/"; }
+        return ".";
+    }
+    val result = Vec::new();
+    if is_absolute {
+        result.push("");
+    }
+    var j = 0;
+    while j < stack.len() {
+        result.push(stack.get(j));
+        j = j + 1;
+    }
+    return str_join(result, "/");
+}
+
+// ─── Predicates ─────────────────────────────────────────────────────────
+
+/// Check if a path is absolute.
+pub fn path_is_absolute(path: str) -> bool {
+    if str_len(path) == 0 { return false; }
+    return str_byte_at(path, 0) == 47;
+}
+
+/// Check if a path is relative.
+pub fn path_is_relative(path: str) -> bool {
+    return !path_is_absolute(path);
+}
+
+/// Check if a path has the given extension.
+pub fn path_has_extension(path: str, ext: str) -> bool {
+    val actual = path_extension(path);
+    return str_equal(actual, ext);
+}
+
+// ─── Components ─────────────────────────────────────────────────────────
+
+/// Split a path into its components.
+/// path_components("/a/b/c") → ["", "a", "b", "c"]
+pub fn path_components(path: str) -> Vec {
+    return str_split(path, "/");
+}
+
+/// Get the parent directory (same as dirname but handles trailing slashes).
+pub fn path_parent(path: str) -> str {
+    val trimmed = str_trim_end(path);
+    return path_dirname(trimmed);
+}
+
+/// Get the number of path components.
+pub fn path_depth(path: str) -> i64 {
+    val normalized = path_normalize(path);
+    val parts = str_split(normalized, "/");
+    var count = 0;
+    var i = 0;
+    while i < parts.len() {
+        if str_len(parts.get(i)) > 0 {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}

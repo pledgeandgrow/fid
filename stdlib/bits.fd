@@ -1,0 +1,217 @@
+// Fides Bit manipulation standard library
+//
+// Low-level bit operations for crypto, embedded, compression, and graphics.
+// All functions are pure arithmetic — no IO, no allocation.
+//
+// Usage:
+//   use bits;
+//   value x = bit_popcount(0xFF);  // 8
+//   value y = bit_rotate_left(0x80000000, 1);  // 0x00000001
+
+module bits;
+
+// ─── Single-bit operations ──────────────────────────────────────────────
+
+/// Get the value of bit at position `idx` (0 or 1).
+pub fn bit_get(n: i64, idx: i64) -> i64 {
+    return (n >> idx) & 1;
+}
+
+/// Set bit at position `idx` to 1. Returns the new value.
+pub fn bit_set(n: i64, idx: i64) -> i64 {
+    return n | (1 << idx);
+}
+
+/// Set bit at position `idx` to 0 (clear). Returns the new value.
+pub fn bit_clear(n: i64, idx: i64) -> i64 {
+    return n & ~(1 << idx);
+}
+
+/// Toggle bit at position `idx`. Returns the new value.
+pub fn bit_toggle(n: i64, idx: i64) -> i64 {
+    return n ^ (1 << idx);
+}
+
+// ─── Population count / leading/trailing zeros ──────────────────────────
+
+/// Count the number of 1-bits in n (population count / Hamming weight).
+pub fn bit_popcount(n: i64) -> i64 {
+    var count = 0;
+    var value = n;
+    while value != 0 {
+        count = count + (value & 1);
+        value = value >> 1;
+    }
+    return count;
+}
+
+/// Count leading zeros (number of 0-bits before the most significant 1).
+pub fn bit_leading_zeros(n: i64) -> i64 {
+    if n == 0 { return 64; }
+    var count = 0;
+    var value = n;
+    value = value >> 1;
+    while value != 0 {
+        count = count + 1;
+        value = value >> 1;
+    }
+    return 63 - count;
+}
+
+/// Count trailing zeros (number of 0-bits after the least significant 1).
+pub fn bit_trailing_zeros(n: i64) -> i64 {
+    if n == 0 { return 64; }
+    var count = 0;
+    var value = n;
+    while (value & 1) == 0 {
+        count = count + 1;
+        value = value >> 1;
+    }
+    return count;
+}
+
+/// Find the position of the highest set bit. Returns -1 if n == 0.
+pub fn bit_highest_set(n: i64) -> i64 {
+    if n == 0 { return -1; }
+    var pos = 0;
+    var value = n;
+    value = value >> 1;
+    while value != 0 {
+        pos = pos + 1;
+        value = value >> 1;
+    }
+    return pos;
+}
+
+/// Find the position of the lowest set bit. Returns -1 if n == 0.
+pub fn bit_lowest_set(n: i64) -> i64 {
+    if n == 0 { return -1; }
+    return bit_trailing_zeros(n);
+}
+
+// ─── Rotation ───────────────────────────────────────────────────────────
+
+/// Rotate bits left by k positions (64-bit).
+pub fn bit_rotate_left(n: i64, k: i64) -> i64 {
+    val shift = k & 63;
+    if shift == 0 { return n; }
+    return (n << shift) | (n >> (64 - shift));
+}
+
+/// Rotate bits right by k positions (64-bit).
+pub fn bit_rotate_right(n: i64, k: i64) -> i64 {
+    val shift = k & 63;
+    if shift == 0 { return n; }
+    return (n >> shift) | (n << (64 - shift));
+}
+
+// ─── Byte / nibble extraction ───────────────────────────────────────────
+
+/// Extract byte at position `idx` (0 = least significant byte).
+pub fn bit_byte_at(n: i64, idx: i64) -> i64 {
+    return (n >> (idx * 8)) & 0xFF;
+}
+
+/// Extract the high nibble (upper 4 bits of the lowest byte).
+pub fn bit_high_nibble(n: i64) -> i64 {
+    return (n >> 4) & 0xF;
+}
+
+/// Extract the low nibble (lower 4 bits).
+pub fn bit_low_nibble(n: i64) -> i64 {
+    return n & 0xF;
+}
+
+// ─── Power-of-two utilities ─────────────────────────────────────────────
+
+/// Check if n is a power of two.
+pub fn bit_is_power_of_two(n: i64) -> bool {
+    if n <= 0 { return false; }
+    return (n & (n - 1)) == 0;
+}
+
+/// Round up to the next power of two. Returns n if already a power of two.
+/// Returns 0 if n == 0. Returns -1 if n > 2^62.
+pub fn bit_next_power_of_two(n: i64) -> i64 {
+    if n <= 0 { return 0; }
+    if bit_is_power_of_two(n) { return n; }
+    var p = 1;
+    while p < n && p > 0 {
+        p = p << 1;
+    }
+    if p < 0 { return -1; }
+    return p;
+}
+
+/// Round up to the next power of two (alias).
+pub fn bit_ceil(n: i64) -> i64 {
+    return bit_next_power_of_two(n);
+}
+
+/// Floor log2 of n. Returns -1 if n <= 0.
+pub fn bit_log2(n: i64) -> i64 {
+    if n <= 0 { return -1; }
+    return bit_highest_set(n);
+}
+
+// ─── Bit reversal ───────────────────────────────────────────────────────
+
+/// Reverse the bits of a byte (8-bit reversal).
+pub fn bit_reverse_byte(b: i64) -> i64 {
+    val b = b & 0xFF;
+    val r = b & 1;
+    r = r << 1;
+    r = r | ((b >> 1) & 1);
+    r = r << 1;
+    r = r | ((b >> 2) & 1);
+    r = r << 1;
+    r = r | ((b >> 3) & 1);
+    r = r << 1;
+    r = r | ((b >> 4) & 1);
+    r = r << 1;
+    r = r | ((b >> 5) & 1);
+    r = r << 1;
+    r = r | ((b >> 6) & 1);
+    r = r << 1;
+    r = r | ((b >> 7) & 1);
+    return r & 0xFF;
+}
+
+/// Reverse all 64 bits.
+pub fn bit_reverse(n: i64) -> i64 {
+    val result = 0;
+    var i = 0;
+    while i < 64 {
+        result = result | (((n >> i) & 1) << (63 - i));
+        i = i + 1;
+    }
+    return result;
+}
+
+// ─── Mask utilities ─────────────────────────────────────────────────────
+
+/// Create a mask of `count` least-significant 1-bits.
+/// bit_mask(4) → 0b1111
+pub fn bit_mask(count: i64) -> i64 {
+    if count >= 64 { return -1; }
+    if count <= 0 { return 0; }
+    return (1 << count) - 1;
+}
+
+/// Create a mask of `count` most-significant 1-bits (in 64-bit space).
+pub fn bit_mask_high(count: i64) -> i64 {
+    if count >= 64 { return -1; }
+    if count <= 0 { return 0; }
+    return ~((1 << (64 - count)) - 1);
+}
+
+/// Extract `bits` bits starting from position `offset`.
+pub fn bit_extract(n: i64, offset: i64, bits: i64) -> i64 {
+    return (n >> offset) & bit_mask(bits);
+}
+
+/// Insert `bits` bits of `value` into `n` starting at position `offset`.
+pub fn bit_insert(n: i64, value: i64, offset: i64, bits: i64) -> i64 {
+    val mask = bit_mask(bits) << offset;
+    return (n & ~mask) | ((value & bit_mask(bits)) << offset);
+}

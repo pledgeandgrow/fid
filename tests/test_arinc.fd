@@ -1,0 +1,222 @@
+// Test: ARINC 653 stdlib (stdlib/arinc.fd)
+// Tests queuing ports, sampling ports, partition management,
+// health monitoring, and cyclic schedule.
+
+use core;
+use vec;
+use arinc;
+
+fn main() {
+    // ─── Queuing Port ──────────────────────────────────────────────────
+    val port = arinc_queuing_port_create("DISPLAY_Q", 4, 64,
+                                          ARINC_PORT_SOURCE, ARINC_PORT_FIFO);
+
+    if arinc_queuing_port_name(port) != "DISPLAY_Q" {
+        print("FAIL: port name expected 'DISPLAY_Q'\n");
+    }
+
+    if !arinc_queuing_port_is_empty(port) {
+        print("FAIL: new port should be empty\n");
+    }
+
+    // Send messages
+    val msg1 = Vec::new();
+    msg1.push(0x01);
+    msg1.push(0x02);
+    val msg2 = Vec::new();
+    msg2.push(0x03);
+    msg2.push(0x04);
+
+    val status1 = arinc_queuing_port_send(port, msg1);
+    if status1 != ARINC_NO_ERROR {
+        print("FAIL: send 1 should succeed\n");
+    }
+
+    val status2 = arinc_queuing_port_send(port, msg2);
+    if status2 != ARINC_NO_ERROR {
+        print("FAIL: send 2 should succeed\n");
+    }
+
+    if arinc_queuing_port_count(port) != 2 {
+        print("FAIL: port count expected 2, got ");
+        print(arinc_queuing_port_count(port));
+        print("\n");
+    }
+
+    if arinc_queuing_port_is_empty(port) {
+        print("FAIL: port with 2 messages should not be empty\n");
+    }
+
+    // Receive first message
+    val received = arinc_queuing_port_receive(port);
+    val r0 = received.get(0);
+    val r1 = received.get(1);
+    if r0 != 0x01 || r1 != 0x02 {
+        print("FAIL: received message mismatch\n");
+    }
+
+    // ─── Fill the queue ────────────────────────────────────────────────
+    val port2 = arinc_queuing_port_create("FULL_Q", 2, 32,
+                                           ARINC_PORT_SOURCE, ARINC_PORT_FIFO);
+    val m = Vec::new();
+    m.push(0xAA);
+    arinc_queuing_port_send(port2, m);
+    arinc_queuing_port_send(port2, m);
+
+    if !arinc_queuing_port_is_full(port2) {
+        print("FAIL: port with 2/2 messages should be full\n");
+    }
+
+    // Third send should fail with PORT_FULL
+    val status3 = arinc_queuing_port_send(port2, m);
+    if status3 != ARINC_PORT_FULL {
+        print("FAIL: send to full port should return PORT_FULL\n");
+    }
+
+    // ─── Sampling Port ─────────────────────────────────────────────────
+    val s_port = arinc_sampling_port_create("SENSOR_S", 32,
+                                             ARINC_PORT_SOURCE, 1000); // 1s refresh
+
+    if arinc_sampling_port_name(s_port) != "SENSOR_S" {
+        print("FAIL: sampling port name expected 'SENSOR_S'\n");
+    }
+
+    // Initially invalid (no data written)
+    if arinc_sampling_port_is_valid(s_port, 0) {
+        print("FAIL: new sampling port should be invalid\n");
+    }
+
+    // Write data at time 100
+    val sensor_data = Vec::new();
+    sensor_data.push(0x42);
+    arinc_sampling_port_write(s_port, sensor_data, 100);
+
+    // Read at time 150 (within refresh period of 1000ms)
+    val data = arinc_sampling_port_read(s_port);
+    if !arinc_sampling_port_is_valid(s_port, 150) {
+        print("FAIL: data written at t=100 should be fresh at t=150\n");
+    }
+    if data.get(0) != 0x42 {
+        print("FAIL: sampling port data mismatch\n");
+    }
+
+    // Read at time 2000 (stale — beyond refresh period)
+    if arinc_sampling_port_is_valid(s_port, 2000) {
+        print("FAIL: data written at t=100 should be stale at t=2000\n");
+    }
+
+    // Invalidate
+    arinc_sampling_port_invalidate(s_port);
+    if arinc_sampling_port_is_valid(s_port, 100) {
+        print("FAIL: invalidated port should not be valid\n");
+    }
+
+    // ─── Partition Management ──────────────────────────────────────────
+    val part = arinc_partition_create("FLIGHT_CTRL", 100, 50, 40);
+
+    if arinc_partition_name(part) != "FLIGHT_CTRL" {
+        print("FAIL: partition name expected 'FLIGHT_CTRL'\n");
+    }
+
+    if arinc_partition_state(part) != ARINC_PARTITION_COLD_START {
+        print("FAIL: new partition should be in COLD_START state\n");
+    }
+
+    // Transition to NORMAL
+    arinc_partition_set_state(part, ARINC_PARTITION_NORMAL);
+    if arinc_partition_state(part) != ARINC_PARTITION_NORMAL {
+        print("FAIL: partition should be in NORMAL state after transition\n");
+    }
+
+    if arinc_partition_period(part) != 100 {
+        print("FAIL: partition period expected 100\n");
+    }
+    if arinc_partition_duration(part) != 50 {
+        print("FAIL: partition duration expected 50\n");
+    }
+    if arinc_partition_time_capacity(part) != 40 {
+        print("FAIL: partition time capacity expected 40\n");
+    }
+
+    // State name lookup
+    if arinc_partition_state_name(ARINC_PARTITION_NORMAL) != "NORMAL" {
+        print("FAIL: state name for NORMAL expected 'NORMAL'\n");
+    }
+    if arinc_partition_state_name(ARINC_PARTITION_IDLE) != "IDLE" {
+        print("FAIL: state name for IDLE expected 'IDLE'\n");
+    }
+
+    // ─── Error Code Names ──────────────────────────────────────────────
+    if arinc_error_name(ARINC_NO_ERROR) != "NO_ERROR" {
+        print("FAIL: error name for NO_ERROR expected 'NO_ERROR'\n");
+    }
+    if arinc_error_name(ARINC_PORT_FULL) != "PORT_FULL" {
+        print("FAIL: error name for PORT_FULL expected 'PORT_FULL'\n");
+    }
+    if arinc_error_name(ARINC_TIME_OUT) != "TIME_OUT" {
+        print("FAIL: error name for TIME_OUT expected 'TIME_OUT'\n");
+    }
+
+    // ─── Health Monitoring ─────────────────────────────────────────────
+    val hm_event = arinc_hm_event(ARINC_HM_LEVEL_PARTITION,
+                                   ARINC_HM_ERROR_PROGRAM,
+                                   ARINC_HM_ACTION_PARTITION_RESTART,
+                                   "NAVIGATION", 12345);
+
+    if arinc_hm_level_name(hm_event.level) != "PARTITION" {
+        print("FAIL: HM level name expected 'PARTITION'\n");
+    }
+    if arinc_hm_error_name(hm_event.error_type) != "PROGRAM" {
+        print("FAIL: HM error name expected 'PROGRAM'\n");
+    }
+    if arinc_hm_action_name(hm_event.action) != "PARTITION_RESTART" {
+        print("FAIL: HM action name expected 'PARTITION_RESTART'\n");
+    }
+
+    // ─── Cyclic Schedule ───────────────────────────────────────────────
+    val schedule = arinc_cyclic_schedule(200); // 200ms cycle
+
+    // Add partition slots
+    val entry1 = arinc_schedule_entry("NAV", 0, 50);    // 0-50ms
+    val entry2 = arinc_schedule_entry("GUIDANCE", 50, 50); // 50-100ms
+    val entry3 = arinc_schedule_entry("DISPLAY", 100, 50); // 100-150ms
+    val entry4 = arinc_schedule_entry("HEALTH_MON", 150, 50); // 150-200ms
+
+    arinc_schedule_add_entry(schedule, entry1);
+    arinc_schedule_add_entry(schedule, entry2);
+    arinc_schedule_add_entry(schedule, entry3);
+    arinc_schedule_add_entry(schedule, entry4);
+
+    if arinc_schedule_count(schedule) != 4 {
+        print("FAIL: schedule count expected 4, got ");
+        print(arinc_schedule_count(schedule));
+        print("\n");
+    }
+
+    if arinc_schedule_cycle_length(schedule) != 200 {
+        print("FAIL: cycle length expected 200\n");
+    }
+
+    // Find which partition runs at various times
+    if arinc_schedule_partition_at(schedule, 25) != "NAV" {
+        print("FAIL: at t=25, NAV should be running\n");
+    }
+    if arinc_schedule_partition_at(schedule, 75) != "GUIDANCE" {
+        print("FAIL: at t=75, GUIDANCE should be running\n");
+    }
+    if arinc_schedule_partition_at(schedule, 125) != "DISPLAY" {
+        print("FAIL: at t=125, DISPLAY should be running\n");
+    }
+    if arinc_schedule_partition_at(schedule, 175) != "HEALTH_MON" {
+        print("FAIL: at t=175, HEALTH_MON should be running\n");
+    }
+    if arinc_schedule_partition_at(schedule, 199) != "HEALTH_MON" {
+        print("FAIL: at t=199, HEALTH_MON should be running\n");
+    }
+    // t=200 is outside the cycle (no partition)
+    if arinc_schedule_partition_at(schedule, 200) != "" {
+        print("FAIL: at t=200, no partition should be running\n");
+    }
+
+    print("PASS: ARINC 653 stdlib tests\n");
+}

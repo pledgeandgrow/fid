@@ -3,17 +3,16 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // Keywords
-    Pf,          // pf — Fides Function
-    Pv,          // pv — Fides Variable
-    Pm,          // pm — Fides Mutable (uninitialized)
+    Fn,          // fn — function declaration
+    Val,         // val — immutable variable
+    Var,         // var — mutable variable (with or without initializer)
     Mut,         // mut
-    Const,       // const — for *const T raw pointer types
+    Const,       // const — compile-time constant AND *const T raw pointer type
     Given,       // given — precondition contract (F10)
     Ensure,      // ensure — postcondition contract (F10)
-    Pc,          // pc — Fides Constant
-    Cap,         // cap — capability/trait
-    Ty,          // ty — type alias
-    Ret,         // ret — return
+    Cap,         // cap — capability/trait declaration
+    Type,        // type — type alias
+    Return,      // return — return statement
     If,
     Else,
     Match,
@@ -22,7 +21,7 @@ pub enum TokenKind {
     Enum,
     Impl,
     Pub,
-    Use,         // use — import
+    Use,         // use — module import
     Module,      // module — module declaration
     With,        // with — capability grant in imports
     Async,       // async
@@ -160,9 +159,9 @@ impl TokenKind {
     /// punctuation and operator tokens (e.g. `=`, `;`, `+`).
     pub fn is_word_keyword(&self) -> bool {
         matches!(self,
-            TokenKind::Pf | TokenKind::Pv | TokenKind::Pm | TokenKind::Mut |
-            TokenKind::Const | TokenKind::Given | TokenKind::Ensure | TokenKind::Pc |
-            TokenKind::Cap | TokenKind::Ty | TokenKind::Ret | TokenKind::If |
+            TokenKind::Fn | TokenKind::Val | TokenKind::Var | TokenKind::Mut |
+            TokenKind::Const | TokenKind::Given | TokenKind::Ensure | TokenKind::Cap |
+            TokenKind::Type | TokenKind::Return | TokenKind::If |
             TokenKind::Else | TokenKind::Match | TokenKind::Select | TokenKind::Struct | TokenKind::Enum |
             TokenKind::Impl | TokenKind::Pub | TokenKind::Use | TokenKind::Module |
             TokenKind::With | TokenKind::Async | TokenKind::Await | TokenKind::Comptime |
@@ -197,17 +196,16 @@ impl Token {
 impl fmt::Display for TokenKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TokenKind::Pf => write!(f, "pf"),
-            TokenKind::Pv => write!(f, "pv"),
-            TokenKind::Pm => write!(f, "pm"),
+            TokenKind::Fn => write!(f, "fn"),
+            TokenKind::Val => write!(f, "val"),
+            TokenKind::Var => write!(f, "var"),
             TokenKind::Mut => write!(f, "mut"),
             TokenKind::Const => write!(f, "const"),
             TokenKind::Given => write!(f, "given"),
             TokenKind::Ensure => write!(f, "ensure"),
-            TokenKind::Pc => write!(f, "pc"),
             TokenKind::Cap => write!(f, "cap"),
-            TokenKind::Ty => write!(f, "ty"),
-            TokenKind::Ret => write!(f, "ret"),
+            TokenKind::Type => write!(f, "type"),
+            TokenKind::Return => write!(f, "return"),
             TokenKind::If => write!(f, "if"),
             TokenKind::Else => write!(f, "else"),
             TokenKind::Match => write!(f, "match"),

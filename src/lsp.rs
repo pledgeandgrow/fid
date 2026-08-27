@@ -531,9 +531,9 @@ fn send_notification(stdout: &mut impl Write, msg: JsonValue) {
 
 /// Fides keywords for completion.
 const KEYWORDS: &[&str] = &[
-    "pf", "pv", "pm", "pc", "ty", "pub", "struct", "enum", "impl", "cap",
+    "fn", "val", "var", "const", "type", "pub", "struct", "enum", "impl", "cap",
     "if", "elif", "else", "while", "for", "in", "loop", "break", "continue",
-    "ret", "match", "use", "region", "sandbox", "unsafe", "txn", "do",
+    "return", "match", "use", "region", "sandbox", "unsafe", "txn", "do",
     "handle", "with", "await", "async", "comptime",
 ];
 
@@ -911,20 +911,20 @@ fn find_definition(text: &str, name: &str, is_func: bool) -> Option<(usize, usiz
             // Look for function definition patterns:
             //   pf name(   |   pv name(   |   pub pf name(   |   pub pv name(
             // Also: pm name( is not a function, but cap methods use pf/pv
-            for kw in &["pf ", "pv "] {
+            for kw in &["fn ", "val "] {
                 if let Some(pos) = find_word_after(line_str, kw, name) {
                     return Some((line_idx, pos));
                 }
             }
-            // Also check "pub pf" / "pub pv"
-            for kw in &["pub pf ", "pub pv "] {
+            // Also check "pub fn" / "pub val"
+            for kw in &["pub fn ", "pub val "] {
                 if let Some(pos) = find_word_after(line_str, kw, name) {
                     return Some((line_idx, pos));
                 }
             }
         } else {
             // Look for struct/enum/const/trait/type definitions
-            for kw in &["struct ", "enum ", "pc ", "ty ", "cap ", "pub struct ", "pub enum ", "pub pc ", "pub ty ", "pub cap "] {
+            for kw in &["struct ", "enum ", "const ", "type ", "cap ", "pub struct ", "pub enum ", "pub const ", "pub type ", "pub cap "] {
                 if let Some(pos) = find_word_after(line_str, kw, name) {
                     return Some((line_idx, pos));
                 }

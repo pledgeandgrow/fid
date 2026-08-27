@@ -1,0 +1,249 @@
+// Fides Formatting standard library
+//
+// Formatted output utilities for CLI tools, debugging, and reports.
+// Built on core.fd string primitives — pure, no IO.
+//
+// Usage:
+//   use fmt;
+//   println(fmt_int(42));           // "42"
+//   println(fmt_hex(255));          // "ff"
+//   println(fmt_pad("hi", 6, ' ')); // "    hi"
+//   println(fmt_table(rows));       // aligned table
+
+module fmt;
+
+use core;
+use vec;
+use string;
+
+// ─── Integer formatting ─────────────────────────────────────────────────
+
+/// Format an i64 as a decimal string.
+pub fn fmt_int(n: i64) -> str {
+    return int_to_str(n);
+}
+
+/// Format an i64 with a minimum width, padded with spaces on the left.
+pub fn fmt_int_width(n: i64, width: i64) -> str {
+    return str_pad_left(int_to_str(n), width, 32);  // space
+}
+
+/// Format an i64 with a minimum width, zero-padded on the left.
+pub fn fmt_int_zero_pad(n: i64, width: i64) -> str {
+    return str_pad_left(int_to_str(n), width, 48);  // '0'
+}
+
+/// Format an i64 as a signed string with a '+' for positive numbers.
+pub fn fmt_int_signed(n: i64) -> str {
+    if n >= 0 {
+        return str_concat("+", int_to_str(n));
+    }
+    return int_to_str(n);
+}
+
+/// Format an i64 as a hex string (lowercase).
+pub fn fmt_hex(n: i64) -> str {
+    return int_to_hex(n);
+}
+
+/// Format an i64 as a hex string with "0x" prefix.
+pub fn fmt_hex_prefix(n: i64) -> str {
+    return str_concat("0x", int_to_hex(n));
+}
+
+/// Format an i64 as a hex string with minimum width (zero-padded).
+pub fn fmt_hex_width(n: i64, width: i64) -> str {
+    return str_pad_left(int_to_hex(n), width, 48);
+}
+
+/// Format an i64 as a binary string.
+pub fn fmt_bin(n: i64) -> str {
+    return int_to_bin(n);
+}
+
+/// Format an i64 as a binary string with "0b" prefix.
+pub fn fmt_bin_prefix(n: i64) -> str {
+    return str_concat("0b", int_to_bin(n));
+}
+
+/// Format an i64 as an octal string.
+pub fn fmt_octal(n: i64) -> str {
+    if n == 0 { return "0"; }
+    val digits = Vec::new();
+    var value = n;
+    while value > 0 {
+        digits.push(str_byte_at("01234567", value & 7));
+        value = value >> 3;
+    }
+    val result = Vec::new();
+    val i = digits.len() - 1;
+    while i >= 0 {
+        result.push(digits.get(i));
+        i = i - 1;
+    }
+    return str_from_bytes(result);
+}
+
+// ─── Float formatting ───────────────────────────────────────────────────
+
+/// Format an f64 with a specified number of decimal places.
+/// fmt_float(3.14159, 2) → "3.14"
+pub fn fmt_float(f: f64, decimals: i64) -> str {
+    if f < 0 {
+        return str_concat("-", fmt_float(-f, decimals));
+    }
+    val int_part = f as i64;
+    var frac = f - (int_part as f64);
+    val result = int_to_str(int_part);
+    if decimals > 0 {
+        result = str_concat(result, ".");
+        var i = 0;
+        while i < decimals {
+            frac = frac * 10.0;
+            val digit = frac as i64;
+            result = str_concat(result, char_to_str(str_byte_at("0123456789", digit)));
+            frac = frac - (digit as f64);
+            i = i + 1;
+        }
+    }
+    return result;
+}
+
+/// Format an f64 with default 2 decimal places.
+pub fn fmt_float_default(f: f64) -> str {
+    return fmt_float(f, 2);
+}
+
+/// Format an f64 as a percentage with specified decimals.
+/// fmt_percent(0.875, 1) → "87.5%"
+pub fn fmt_percent(f: f64, decimals: i64) -> str {
+    return str_concat(fmt_float(f * 100.0, decimals), "%");
+}
+
+// ─── Boolean / pointer formatting ───────────────────────────────────────
+
+/// Format a bool as "true" or "false".
+pub fn fmt_bool(b: bool) -> str {
+    return bool_to_str(b);
+}
+
+/// Format a bool as "yes" or "no".
+pub fn fmt_yes_no(b: bool) -> str {
+    if b { return "yes"; }
+    return "no";
+}
+
+// ─── Padding / alignment ────────────────────────────────────────────────
+
+/// Pad a string to a minimum width, left-aligned (pad right with spaces).
+pub fn fmt_pad_left(s: str, width: i64) -> str {
+    return str_pad_left(s, width, 32);
+}
+
+/// Pad a string to a minimum width, left-aligned (pad right with spaces).
+pub fn fmt_pad_right(s: str, width: i64) -> str {
+    return str_pad_right(s, width, 32);
+}
+
+/// Pad a string to a minimum width, centered.
+pub fn fmt_pad_center(s: str, width: i64) -> str {
+    return str_center(s, width, 32);
+}
+
+// ─── Comma-separated numbers ────────────────────────────────────────────
+
+/// Format an i64 with thousands separators (commas).
+/// fmt_commas(1234567) → "1,234,567"
+pub fn fmt_commas(n: i64) -> str {
+    val negative = n < 0;
+    var value = n;
+    if negative { value = -value; }
+    val digits = Vec::new();
+    var count = 0;
+    if value == 0 {
+        digits.push(48);
+    }
+    while value > 0 {
+        if count > 0 && count % 3 == 0 {
+            digits.push(44);  // ','
+        }
+        digits.push(str_byte_at("0123456789", value % 10));
+        value = value / 10;
+        count = count + 1;
+    }
+    val result = Vec::new();
+    if negative {
+        result.push(45);  // '-'
+    }
+    val i = digits.len() - 1;
+    while i >= 0 {
+        result.push(digits.get(i));
+        i = i - 1;
+    }
+    return str_from_bytes(result);
+}
+
+// ─── Size formatting ────────────────────────────────────────────────────
+
+/// Format a byte count as a human-readable size.
+/// fmt_bytes(1536) → "1.5 KB"
+/// fmt_bytes(1048576) → "1.0 MB"
+pub fn fmt_bytes(bytes: i64) -> str {
+    val units = Vec::new();
+    units.push("B");
+    units.push(" KB");
+    units.push(" MB");
+    units.push(" GB");
+    units.push(" TB");
+    units.push(" PB");
+    var size = bytes as f64;
+    var unit_idx = 0;
+    while size >= 1024.0 && unit_idx < 5 {
+        size = size / 1024.0;
+        unit_idx = unit_idx + 1;
+    }
+    return str_concat(fmt_float(size, 1), units.get(unit_idx));
+}
+
+// ─── Table formatting ───────────────────────────────────────────────────
+
+/// Format a Vec of strings as a row in a table (pipe-separated).
+/// fmt_row(["Name", "Age", "City"]) → "| Name | Age | City |"
+pub fn fmt_row(cols: Vec) -> str {
+    val result = "|";
+    var i = 0;
+    while i < cols.len() {
+        result = str_concat(result, " ");
+        result = str_concat(result, cols.get(i));
+        result = str_concat(result, " |");
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Format a separator line for a table with N columns of given widths.
+/// fmt_separator([5, 3, 5]) → "+-----+---+-----+"
+pub fn fmt_separator(widths: Vec) -> str {
+    val result = "+";
+    var i = 0;
+    while i < widths.len() {
+        result = str_concat(result, str_repeat("-", widths.get(i) + 2));
+        result = str_concat(result, "+");
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Format a table row with specific column widths (left-aligned).
+pub fn fmt_row_widths(cols: Vec, widths: Vec) -> str {
+    val result = "|";
+    var i = 0;
+    while i < cols.len() {
+        val cell = fmt_pad_left(cols.get(i), widths.get(i));
+        result = str_concat(result, " ");
+        result = str_concat(result, cell);
+        result = str_concat(result, " |");
+        i = i + 1;
+    }
+    return result;
+}

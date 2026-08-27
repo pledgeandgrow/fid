@@ -6886,7 +6886,7 @@ mod tests {
     fn const_fold_folds_add() {
         // The lowering of `40 + 2` should produce a BinOp(Add, ConstInt 40,
         // ConstInt 2) that the optimizer can fold to ConstInt 42.
-        let src = "pf main() -> i64 { ret 40 + 2; }\n";
+        let src = "fn main() -> i64 { return 40 + 2; }\n";
         let mut l2 = compile_to_l2(src);
         let before = count_binops(&l2, "main");
         let n = pass_const_fold(&mut l2);
@@ -6909,7 +6909,7 @@ mod tests {
     fn const_fold_folds_branch() {
         // `if true { ret 1; } else { ret 0; }` lowers to a Branch on a
         // constant condition; the optimizer should fold it to a Jump.
-        let src = "pf main() -> i64 { if true { ret 1; } else { ret 0; } ret 9; }\n";
+        let src = "fn main() -> i64 { if true { return 1; } else { return 0; } return 9; }\n";
         let mut l2 = compile_to_l2(src);
         let n = pass_const_fold(&mut l2);
         assert!(n > 0, "expected at least one branch fold, got {}", n);
@@ -6929,7 +6929,7 @@ mod tests {
     fn dce_removes_unused_pure_insts() {
         // `pv unused = 1 + 2; ret 0;` — the BinOp is pure and its result is
         // never used, so DCE should remove it.
-        let src = "pf main() -> i64 { pv unused = 1 + 2; ret 0; }\n";
+        let src = "fn main() -> i64 { val unused = 1 + 2; return 0; }\n";
         let mut l2 = compile_to_l2(src);
         // Fold first so the BinOp becomes a ConstInt (still pure, still dead).
         pass_const_fold(&mut l2);
@@ -6942,10 +6942,10 @@ mod tests {
 
     #[test]
     fn dce_keeps_side_effects() {
-        // `print(\"hi\"); ret 0;` — print lowers to a Call to p_print_str,
+        // `print(\"hi\"); return 0;` — print lowers to a Call to p_print_str,
         // which has side effects and must survive DCE even though its result
         // is unused.
-        let src = "pf main() -> i64 { print(\"hi\"); ret 0; }\n";
+        let src = "fn main() -> i64 { print(\"hi\"); return 0; }\n";
         let mut l2 = compile_to_l2(src);
         let before = l2.functions.iter().find(|f| f.name == "main").unwrap().values.len();
         pass_dce(&mut l2);
@@ -6973,7 +6973,7 @@ mod tests {
         // duplicates depending on how it allocates values, so this test is
         // best-effort: it asserts CSE runs without crashing and that the
         // BinOp count doesn't increase.
-        let src = "pf main() -> i64 { pv a = 1 + 2; pv b = 1 + 2; ret a + b; }\n";
+        let src = "fn main() -> i64 { val a = 1 + 2; val b = 1 + 2; return a + b; }\n";
         let mut l2 = compile_to_l2(src);
         let before = count_binops(&l2, "main");
         let _ = pass_cse(&mut l2);
@@ -6983,7 +6983,7 @@ mod tests {
 
     #[test]
     fn optimize_l2_runs_to_fixed_point() {
-        let src = "pf main() -> i64 { ret 40 + 2; }\n";
+        let src = "fn main() -> i64 { return 40 + 2; }\n";
         let mut l2 = compile_to_l2(src);
         let stats = optimize_l2(&mut l2);
         assert!(stats.const_fold > 0, "expected const folding, got {:?}", stats);
@@ -6992,7 +6992,7 @@ mod tests {
 
     #[test]
     fn optimize_ir_module_end_to_end() {
-        let src = "pf main() -> i64 { ret 40 + 2; }\n";
+        let src = "fn main() -> i64 { return 40 + 2; }\n";
         let module = compiler::lower_to_ir_module(src).expect("compile failed");
         let (_l2, stats) = optimize_ir_module(&module);
         assert!(stats.total() > 0, "expected some optimization, got {:?}", stats);
@@ -7003,7 +7003,7 @@ mod tests {
         // A function that ends with `ret f(args)` should be detected as a
         // tail call. We use a self-call (recursion) which is the common case.
         // Note: `loop` is a keyword in Fides, so we use `count_down`.
-        let src = "pf count_down(n: i64) -> i64 { if n == 0 { ret 0; } ret count_down(n - 1); }\n";
+        let src = "fn count_down(n: i64) -> i64 { if n == 0 { return 0; } return count_down(n - 1); }\n";
         let l2 = compile_to_l2(src);
         let n = pass_tco(&mut l2.clone());
         // Detection runs on the unoptimized form; assert it doesn't crash
@@ -7022,7 +7022,7 @@ mod tests {
     #[test]
     fn strength_reduce_mul_by_power_of_two() {
         // x * 8 → x << 3
-        let src = "pf main(x: i64) -> i64 { ret x * 8; }\n";
+        let src = "fn main(x: i64) -> i64 { return x * 8; }\n";
         let mut l2 = compile_to_l2(src);
         let n = pass_strength_reduce(&mut l2);
         assert!(n > 0, "expected at least one strength reduction, got {}", n);
@@ -7037,7 +7037,7 @@ mod tests {
     #[test]
     fn strength_reduce_mul_by_zero_and_one() {
         // x * 0 → 0, x * 1 → x
-        let src = "pf main(x: i64) -> i64 { ret x * 0 + x * 1; }\n";
+        let src = "fn main(x: i64) -> i64 { return x * 0 + x * 1; }\n";
         let mut l2 = compile_to_l2(src);
         let n = pass_strength_reduce(&mut l2);
         assert!(n >= 2, "expected at least two strength reductions, got {}", n);
@@ -7046,7 +7046,7 @@ mod tests {
     #[test]
     fn strength_reduce_does_not_apply_to_non_power() {
         // x * 3 should NOT be strength-reduced (3 is not a power of 2).
-        let src = "pf main(x: i64) -> i64 { ret x * 3; }\n";
+        let src = "fn main(x: i64) -> i64 { return x * 3; }\n";
         let mut l2 = compile_to_l2(src);
         // Only run on the main function (stdlib functions may have reducible muls)
         let n = l2.functions.iter_mut()
@@ -7073,7 +7073,7 @@ mod tests {
     fn gvn_eliminates_duplicate_computation() {
         // x + y computed twice in the same function should be eliminated by GVN.
         // (CSE also catches this, but GVN should too.)
-        let src = "pf main(x: i64, y: i64) -> i64 { ret x + y + (x + y); }\n";
+        let src = "fn main(x: i64, y: i64) -> i64 { return x + y + (x + y); }\n";
         let mut l2 = compile_to_l2(src);
         let n = pass_gvn(&mut l2);
         assert!(n > 0, "expected GVN to eliminate duplicate x + y, got {}", n);
@@ -7086,7 +7086,7 @@ mod tests {
         // We test that GVN runs without crashing on a function with copies.
         // (Fides pf syntax doesn't support `let`, so we use function calls
         // that produce copies through argument passing.)
-        let src = "pf main(x: i64, y: i64) -> i64 { ret x + y + x + y; }\n";
+        let src = "fn main(x: i64, y: i64) -> i64 { return x + y + x + y; }\n";
         let mut l2 = compile_to_l2(src);
         // Run const_fold first to propagate, then GVN.
         pass_const_fold(&mut l2);
@@ -7101,7 +7101,7 @@ mod tests {
         // them back should have the alloca eliminated by SROA.
         let src = "
             struct Point { x: i32, y: i32 }
-            pf make_point(x: i32, y: i32) -> Point {
+            fn make_point(x: i32, y: i32) -> Point {
                 Point { x: x, y: y }
             }
         ";
@@ -7121,9 +7121,9 @@ mod tests {
         // If a struct's address is passed to a call, SROA should not touch it.
         let src = "
             struct Point { x: i32, y: i32 }
-            pf use_point(p: *Point) -> void { }
-            pf main() -> void {
-                pv p = Point { x: 1, y: 2 };
+            fn use_point(p: *Point) -> void { }
+            fn main() -> void {
+                val p = Point { x: 1, y: 2 };
                 use_point(&p);
             }
         ";
@@ -7142,9 +7142,9 @@ mod tests {
         // Uses a function that creates a struct and reads its fields.
         let src = "
             struct Pair { a: i64, b: i64 }
-            pf sum_pair(p: *Pair) -> i64 {
-                pv local = Pair { a: 10, b: 20 };
-                ret local.a + local.b;
+            fn sum_pair(p: *Pair) -> i64 {
+                val local = Pair { a: 10, b: 20 };
+                return local.a + local.b;
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7177,6 +7177,8 @@ mod tests {
             gas_limit: None,
             is_no_alloc: false,
             is_medical: false,
+            is_kernel: false,
+            workgroup_size: [1, 1, 1],
         };
 
         let alloca_id = ValueId(1);
@@ -7223,10 +7225,10 @@ mod tests {
         // We need a function that writes to a local variable twice without
         // reading in between. In Fides, this happens with mutable local vars.
         let src = "
-            pf main() -> i64 {
-                pv x = 1;
+            fn main() -> i64 {
+                val x = 1;
                 x = 2;
-                ret x;
+                return x;
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7241,9 +7243,9 @@ mod tests {
         // all stores are dead.
         let src = "
             struct Point { x: i32, y: i32 }
-            pf dead_struct() -> i64 {
-                pv p = Point { x: 1, y: 2 };
-                ret 42;
+            fn dead_struct() -> i64 {
+                val p = Point { x: 1, y: 2 };
+                return 42;
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7256,9 +7258,9 @@ mod tests {
     fn dse_keeps_stores_that_are_loaded() {
         // A store that is subsequently loaded must NOT be eliminated.
         let src = "
-            pf main() -> i64 {
-                pv x = 42;
-                ret x;
+            fn main() -> i64 {
+                val x = 42;
+                return x;
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7276,7 +7278,7 @@ mod tests {
         // Stores through a pointer parameter could be visible to the caller,
         // so DSE must not remove them.
         let src = "
-            pf write_ptr(p: *i64) -> void {
+            fn write_ptr(p: *i64) -> void {
                 p = 0;
                 p = 1;
             }
@@ -7292,18 +7294,18 @@ mod tests {
     fn devirt_replaces_dyncall_with_call() {
         // When a trait has only one impl, DynCall should become a direct Call.
         let src = "
-            cap Greeter { pf greet(self) -> i64; }
+            cap Greeter { fn greet(self) -> i64; }
             struct Hello { x: i64 }
             impl Greeter for Hello {
-                pub pf greet(self: Hello) -> i64 { ret self.x; }
+                pub fn greet(self: Hello) -> i64 { return self.x; }
             }
-            pf describe(g: dyn Greeter) -> i64 {
-                ret g.greet();
+            fn describe(g: dyn Greeter) -> i64 {
+                return g.greet();
             }
-            pf main() -> i64 {
-                pv h = Hello { x: 42 };
-                pv gh = h as dyn Greeter;
-                ret describe(gh);
+            fn main() -> i64 {
+                val h = Hello { x: 42 };
+                val gh = h as dyn Greeter;
+                return describe(gh);
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7339,17 +7341,17 @@ mod tests {
     fn devirt_skips_multi_impl_traits() {
         // When a trait has multiple impls, DynCall must NOT be devirtualized.
         let src = "
-            cap Animal { pf sound(self) -> i64; }
+            cap Animal { fn sound(self) -> i64; }
             struct Dog { age: i64 }
             impl Animal for Dog {
-                pub pf sound(self: Dog) -> i64 { ret 1; }
+                pub fn sound(self: Dog) -> i64 { return 1; }
             }
             struct Cat { age: i64 }
             impl Animal for Cat {
-                pub pf sound(self: Cat) -> i64 { ret 2; }
+                pub fn sound(self: Cat) -> i64 { return 2; }
             }
-            pf describe(a: dyn Animal) -> i64 {
-                ret a.sound();
+            fn describe(a: dyn Animal) -> i64 {
+                return a.sound();
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7361,7 +7363,7 @@ mod tests {
     #[test]
     fn devirt_no_op_without_traits() {
         // Devirt should be a no-op on code without traits.
-        let src = "pf main() -> i64 { ret 42; }";
+        let src = "fn main() -> i64 { return 42; }";
         let mut l2 = compile_to_l2(src);
         let n = pass_devirt(&mut l2);
         assert_eq!(n, 0, "devirt should be no-op without traits, got {}", n);
@@ -7372,8 +7374,8 @@ mod tests {
         // A small pure function should be inlined by the cost model.
         // `pf add(x: i64, y: i64) -> i64 { ret x + y; }` is pure and tiny.
         let src = "
-            pf add(x: i64, y: i64) -> i64 { ret x + y; }
-            pf main() -> i64 { ret add(1, 2); }
+            fn add(x: i64, y: i64) -> i64 { return x + y; }
+            fn main() -> i64 { return add(1, 2); }
         ";
         let mut l2 = compile_to_l2(src);
         let n = pass_inline(&mut l2);
@@ -7386,8 +7388,8 @@ mod tests {
         // The cost model should give pure functions a bonus.
         // Verify that is_inline_eligible_by_cost works correctly.
         let src = "
-            pf add(x: i64, y: i64) -> i64 { ret x + y; }
-            pf main() -> i64 { ret add(1, 2); }
+            fn add(x: i64, y: i64) -> i64 { return x + y; }
+            fn main() -> i64 { return add(1, 2); }
         ";
         let l2 = compile_to_l2(src);
         let add_fn = l2.functions.iter().find(|f| f.name == "add").unwrap();
@@ -7405,30 +7407,30 @@ mod tests {
         // A large function should NOT be inlined (cost too high).
         // We build a function with many instructions to exceed the threshold.
         let src = "
-            pf big(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
-                pv r1 = a + b;
-                pv r2 = r1 + c;
-                pv r3 = r2 + d;
-                pv r4 = r3 + e;
-                pv r5 = r4 + a;
-                pv r6 = r5 + b;
-                pv r7 = r6 + c;
-                pv r8 = r7 + d;
-                pv r9 = r8 + e;
-                pv r10 = r9 + a;
-                pv r11 = r10 + b;
-                pv r12 = r11 + c;
-                pv r13 = r12 + d;
-                pv r14 = r13 + e;
-                pv r15 = r14 + a;
-                pv r16 = r15 + b;
-                pv r17 = r16 + c;
-                pv r18 = r17 + d;
-                pv r19 = r18 + e;
-                pv r20 = r19 + a;
-                ret r20;
+            fn big(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
+                val r1 = a + b;
+                val r2 = r1 + c;
+                val r3 = r2 + d;
+                val r4 = r3 + e;
+                val r5 = r4 + a;
+                val r6 = r5 + b;
+                val r7 = r6 + c;
+                val r8 = r7 + d;
+                val r9 = r8 + e;
+                val r10 = r9 + a;
+                val r11 = r10 + b;
+                val r12 = r11 + c;
+                val r13 = r12 + d;
+                val r14 = r13 + e;
+                val r15 = r14 + a;
+                val r16 = r15 + b;
+                val r17 = r16 + c;
+                val r18 = r17 + d;
+                val r19 = r18 + e;
+                val r20 = r19 + a;
+                return r20;
             }
-            pf main() -> i64 { ret big(1, 2, 3, 4, 5); }
+            fn main() -> i64 { return big(1, 2, 3, 4, 5); }
         ";
         let l2 = compile_to_l2(src);
         let big_fn = l2.functions.iter().find(|f| f.name == "big").unwrap();
@@ -7448,12 +7450,12 @@ mod tests {
         // unreachable block becomes empty (just a jump). Jump threading
         // should redirect and clean up.
         let src = "
-            pf main() -> i64 {
-                pv x = 1;
+            fn main() -> i64 {
+                val x = 1;
                 if x > 0 {
-                    ret 42;
+                    return 42;
                 }
-                ret 0;
+                return 0;
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7468,7 +7470,7 @@ mod tests {
     #[test]
     fn jump_thread_no_op_on_straight_line() {
         // A simple function with no branches should not be affected.
-        let src = "pf main() -> i64 { ret 42; }";
+        let src = "fn main() -> i64 { return 42; }";
         let mut l2 = compile_to_l2(src);
         // Run jump threading — it may still find things to thread in stdlib
         // functions (Option methods, etc.), but main itself should not change.
@@ -7484,13 +7486,13 @@ mod tests {
         // A branch where both targets are the same should become a jump.
         // This can happen after other optimizations merge blocks.
         let src = "
-            pf main(x: i64) -> i64 {
+            fn main(x: i64) -> i64 {
                 if x > 0 {
-                    pv y = x + 1;
-                    ret y;
+                    val y = x + 1;
+                    return y;
                 }
-                pv y = x + 1;
-                ret y;
+                val y = x + 1;
+                return y;
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7507,14 +7509,14 @@ mod tests {
     fn loop_rotate_transforms_while_loop() {
         // A while loop with a large trip count should be rotated.
         let src = "
-            pf main() -> i64 {
-                pv sum = 0;
-                pv i = 0;
+            fn main() -> i64 {
+                val sum = 0;
+                val i = 0;
                 while i < 100 {
                     sum = sum + i;
                     i = i + 1;
                 }
-                ret sum;
+                return sum;
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7526,7 +7528,7 @@ mod tests {
     #[test]
     fn loop_rotate_does_not_crash_without_loops() {
         // A function without loops should be a no-op.
-        let src = "pf main() -> i64 { ret 42; }";
+        let src = "fn main() -> i64 { return 42; }";
         let mut l2 = compile_to_l2(src);
         let n = pass_loop_rotate(&mut l2);
         // May find loops in stdlib functions, but main should not be rotated.
@@ -7538,14 +7540,14 @@ mod tests {
         // A rotated loop should produce the same result.
         // We verify by checking the PIR has a self-looping block (the rotated body).
         let src = "
-            pf main() -> i64 {
-                pv sum = 0;
-                pv i = 0;
+            fn main() -> i64 {
+                val sum = 0;
+                val i = 0;
                 while i < 50 {
                     sum = sum + i;
                     i = i + 1;
                 }
-                ret sum;
+                return sum;
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7572,15 +7574,15 @@ mod tests {
         // A counted loop with array operations should be vectorized (unrolled
         // by the vector width).
         let src = "
-            pf main() -> i64 {
-                pv a = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-                pv c = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-                pv i = 0;
+            fn main() -> i64 {
+                val a = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+                val c = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                val i = 0;
                 while i < 12 {
                     c[i] = a[i] + 1;
                     i = i + 1;
                 }
-                ret c[0];
+                return c[0];
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7594,15 +7596,15 @@ mod tests {
     fn loop_vectorize_no_op_on_small_loops() {
         // Loops with trip count <= 8 should not be vectorized (too small).
         let src = "
-            pf main() -> i64 {
-                pv a = [1, 2, 3, 4];
-                pv c = [0, 0, 0, 0];
-                pv i = 0;
+            fn main() -> i64 {
+                val a = [1, 2, 3, 4];
+                val c = [0, 0, 0, 0];
+                val i = 0;
                 while i < 4 {
                     c[i] = a[i] + 1;
                     i = i + 1;
                 }
-                ret c[0];
+                return c[0];
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7617,15 +7619,15 @@ mod tests {
         // Loops with trip count not divisible by vector width should be skipped.
         // 13 is not divisible by 4 (i32 vector width).
         let src = "
-            pf main() -> i64 {
-                pv a = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
-                pv c = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-                pv i = 0;
+            fn main() -> i64 {
+                val a = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+                val c = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                val i = 0;
                 while i < 13 {
                     c[i] = a[i] + 1;
                     i = i + 1;
                 }
-                ret c[0];
+                return c[0];
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7640,13 +7642,13 @@ mod tests {
         // A load from a[i], then a store to b[i] (different array),
         // then another load from a[i] — the second load is redundant.
         let src = "
-            pf main() -> i64 {
-                pv a = [1, 2, 3, 4];
-                pv b = [10, 20, 30, 40];
-                pv x = a[0];
+            fn main() -> i64 {
+                val a = [1, 2, 3, 4];
+                val b = [10, 20, 30, 40];
+                val x = a[0];
                 b[0] = 99;
-                pv y = a[0];
-                ret x + y;
+                val y = a[0];
+                return x + y;
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7660,12 +7662,12 @@ mod tests {
         // A load from a[0], then a store to a[0] (same array),
         // then another load from a[0] — the second load is NOT redundant.
         let src = "
-            pf main() -> i64 {
-                pv a = [1, 2, 3, 4];
-                pv x = a[0];
+            fn main() -> i64 {
+                val a = [1, 2, 3, 4];
+                val x = a[0];
                 a[0] = 99;
-                pv y = a[0];
-                ret x + y;
+                val y = a[0];
+                return x + y;
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7679,7 +7681,7 @@ mod tests {
     #[test]
     fn alias_analysis_no_crash_on_simple_code() {
         // Simple code without arrays should be a no-op.
-        let src = "pf main() -> i64 { ret 42; }";
+        let src = "fn main() -> i64 { return 42; }";
         let mut l2 = compile_to_l2(src);
         let n = pass_alias_analysis(&mut l2);
         let _ = n;
@@ -7717,23 +7719,23 @@ mod tests {
         // We use a large function that won't be inlined.
         // Run DCE first to remove the dead store that uses the call result.
         let src = "
-            pf compute(x: i64, y: i64) -> i64 {
-                pv a = x * y;
-                pv b = a + y;
-                pv c = b * x;
-                pv d = c + a;
-                pv e = d - b;
-                pv f = e * 2;
-                pv g = f + c;
-                pv h = g - d;
-                pv j = h + e;
-                pv k = j * g;
-                ret k;
+            fn compute(x: i64, y: i64) -> i64 {
+                val a = x * y;
+                val b = a + y;
+                val c = b * x;
+                val d = c + a;
+                val e = d - b;
+                val f = e * 2;
+                val g = f + c;
+                val h = g - d;
+                val j = h + e;
+                val k = j * g;
+                return k;
             }
-            pf main() -> i64 {
-                pv x = compute(3, 4);
-                pv y = compute(5, 6);
-                ret y;
+            fn main() -> i64 {
+                val x = compute(3, 4);
+                val y = compute(5, 6);
+                return y;
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7750,28 +7752,28 @@ mod tests {
         // A call to a pure function with loop-invariant args inside a loop
         // should be hoisted to the preheader.
         let src = "
-            pf compute(x: i64, y: i64) -> i64 {
-                pv a = x * y;
-                pv b = a + y;
-                pv c = b * x;
-                pv d = c + a;
-                pv e = d - b;
-                pv f = e * 2;
-                pv g = f + c;
-                pv h = g - d;
-                pv j = h + e;
-                pv k = j * g;
-                ret k;
+            fn compute(x: i64, y: i64) -> i64 {
+                val a = x * y;
+                val b = a + y;
+                val c = b * x;
+                val d = c + a;
+                val e = d - b;
+                val f = e * 2;
+                val g = f + c;
+                val h = g - d;
+                val j = h + e;
+                val k = j * g;
+                return k;
             }
-            pf main() -> i64 {
-                pv sum = 0;
-                pv i = 0;
+            fn main() -> i64 {
+                val sum = 0;
+                val i = 0;
                 while i < 10 {
-                    pv r = compute(3, 4);
+                    val r = compute(3, 4);
                     sum = sum + r;
                     i = i + 1;
                 }
-                ret sum;
+                return sum;
             }
         ";
         let mut l2 = compile_to_l2(src);
@@ -7782,7 +7784,7 @@ mod tests {
 
     #[test]
     fn effect_opt_no_crash_on_simple_code() {
-        let src = "pf main() -> i64 { ret 42; }";
+        let src = "fn main() -> i64 { return 42; }";
         let mut l2 = compile_to_l2(src);
         let n = pass_effect_optimize(&mut l2);
         let _ = n;
@@ -7806,20 +7808,20 @@ mod tests {
         // I-1A: A load in a dominated block that reads the same pointer as a
         // load in the predecessor (with no intervening aliasing store) should
         // be eliminated.
-        let src = "pf main() -> i64 !IO {
+        let src = "fn main() -> i64 !IO {
             region r1 {
-                pv a = [1, 2, 3, 4];
+                val a = [1, 2, 3, 4];
                 region r2 {
-                    pv b = [10, 20, 30, 40];
-                    pv x = a[0];
+                    val b = [10, 20, 30, 40];
+                    val x = a[0];
                     b[0] = 99;
                     if x > 0 {
-                        pv y = a[0];
-                        ret x + y;
+                        val y = a[0];
+                        return x + y;
                     }
                 }
             }
-            ret 0;
+            return 0;
         }\n";
         let mut l2 = compile_to_l2(src);
         let n = pass_alias_analysis(&mut l2);
@@ -7832,18 +7834,18 @@ mod tests {
     fn i1a_call_invalidation_by_region() {
         // I-1A: A call that receives a pointer to region R invalidates loads
         // from region R, but NOT loads from other regions.
-        let src = "pf helper(a: *[i64; 4], n: i64) -> i64 !IO {
-            if n > 0 { pv _ = helper(a, n - 1); }
+        let src = "fn helper(a: *[i64; 4], n: i64) -> i64 !IO {
+            if n > 0 { val _ = helper(a, n - 1); }
             a[0] = 99;
-            ret 0;
+            return 0;
         }
-        pf main() -> i64 !IO {
+        fn main() -> i64 !IO {
             region r1 {
-                pv a = [1, 2, 3, 4];
-                pv x = a[0];
-                pv _ = helper(a, 3);
-                pv y = a[0];
-                ret x + y;
+                val a = [1, 2, 3, 4];
+                val x = a[0];
+                val _ = helper(a, 3);
+                val y = a[0];
+                return x + y;
             }
         }\n";
         let mut l2 = compile_to_l2(src);
@@ -7858,7 +7860,7 @@ mod tests {
     #[test]
     fn i4e_wrapping_reassociates_constants() {
         // I-4E: In @wrapping functions, (a + C1) + C2 → a + (C1 + C2).
-        let src = "@wrapping pf compute(a: i64) -> i64 { pv x = (a + 10) + 20; ret x; }\n";
+        let src = "@wrapping fn compute(a: i64) -> i64 { val x = (a + 10) + 20; return x; }\n";
         let mut l2 = compile_to_l2(src);
         let n = pass_reassociate(&mut l2);
         assert!(n > 0, "expected reassociation in @wrapping function, got {}", n);
@@ -7879,7 +7881,7 @@ mod tests {
         // I-4E: Without @wrapping, reassociation should NOT happen.
         // Note: stdlib may contain @wrapping functions that DO get reassociated,
         // so we check only the `compute` function, not the total count.
-        let src = "pf compute(a: i64) -> i64 { pv x = (a + 10) + 20; ret x; }\n";
+        let src = "fn compute(a: i64) -> i64 { val x = (a + 10) + 20; return x; }\n";
         let mut l2 = compile_to_l2(src);
         let before = count_binops(&l2, "compute");
         pass_reassociate(&mut l2);
@@ -7892,8 +7894,8 @@ mod tests {
         // I-4A: Duplicate calls to @deterministic functions should be memoized.
         // Uses a recursive function (can't be inlined) with the same argument
         // ValueId in the same block.
-        let src = "@deterministic pf fib(n: i64) -> i64 { if n <= 1 { ret n; } pv a = fib(n - 1); pv b = fib(n - 2); ret a + b; }
-        pf main() -> i64 !IO { pv x = fib(5); pv y = fib(5); print(x + y); ret 0; }\n";
+        let src = "@deterministic fn fib(n: i64) -> i64 { if n <= 1 { return n; } val a = fib(n - 1); val b = fib(n - 2); return a + b; }
+        fn main() -> i64 !IO { val x = fib(5); val y = fib(5); print(x + y); return 0; }\n";
         let mut l2 = compile_to_l2(src);
         // The memoize pass looks for calls with identical argument ValueIds.
         // In the unoptimized L2, the two fib(5) calls may have different
@@ -7911,8 +7913,8 @@ mod tests {
     #[test]
     fn i4a_does_not_memoize_non_deterministic() {
         // I-4A: Without @deterministic, calls should NOT be memoized.
-        let src = "pf double(x: i64) -> i64 { ret x * 2; }
-        pf main() -> i64 !IO { pv a = double(5); pv b = double(5); print(a + b); ret 0; }\n";
+        let src = "fn double(x: i64) -> i64 { return x * 2; }
+        fn main() -> i64 !IO { val a = double(5); val b = double(5); print(a + b); return 0; }\n";
         let mut l2 = compile_to_l2(src);
         let n = pass_memoize(&mut l2);
         assert_eq!(n, 0, "should not memoize without @deterministic, got {}", n);
@@ -7922,8 +7924,8 @@ mod tests {
     fn f3f_crashfree_reduces_inline_cost() {
         // F-3F: @crashfree functions should have lower inline cost than
         // non-crashfree functions of the same size.
-        let src_normal = "pf compute(a: i64) -> i64 { pv x = a + 1; pv y = x + 2; ret y; }\n";
-        let src_crashfree = "@crashfree pf compute(a: i64) -> i64 { pv x = a + 1; pv y = x + 2; ret y; }\n";
+        let src_normal = "fn compute(a: i64) -> i64 { val x = a + 1; val y = x + 2; return y; }\n";
+        let src_crashfree = "@crashfree fn compute(a: i64) -> i64 { val x = a + 1; val y = x + 2; return y; }\n";
         let l2_normal = compile_to_l2(src_normal);
         let l2_crashfree = compile_to_l2(src_crashfree);
         let f_normal = l2_normal.functions.iter().find(|f| f.name == "compute").unwrap();
@@ -7937,8 +7939,8 @@ mod tests {
     #[test]
     fn f3f_deterministic_reduces_inline_cost() {
         // F-3F: @deterministic functions should have lower inline cost.
-        let src_normal = "pf compute(a: i64) -> i64 { pv x = a + 1; pv y = x + 2; ret y; }\n";
-        let src_det = "@deterministic pf compute(a: i64) -> i64 { pv x = a + 1; pv y = x + 2; ret y; }\n";
+        let src_normal = "fn compute(a: i64) -> i64 { val x = a + 1; val y = x + 2; return y; }\n";
+        let src_det = "@deterministic fn compute(a: i64) -> i64 { val x = a + 1; val y = x + 2; return y; }\n";
         let l2_normal = compile_to_l2(src_normal);
         let l2_det = compile_to_l2(src_det);
         let f_normal = l2_normal.functions.iter().find(|f| f.name == "compute").unwrap();
@@ -7952,8 +7954,8 @@ mod tests {
     #[test]
     fn i3c_sandbox_values_populated() {
         // I-3C: Instructions inside sandbox blocks should be marked in_sandbox.
-        let src = "pf helper(x: i64) -> i64 { ret x * 2; }
-        pf main() -> i64 !IO { pv r: i64 = 0; sandbox { r = helper(5); } print(r); ret 0; }\n";
+        let src = "fn helper(x: i64) -> i64 { return x * 2; }
+        fn main() -> i64 !IO { val r: i64 = 0; sandbox { r = helper(5); } print(r); return 0; }\n";
         let l2 = compile_to_l2(src);
         let f = l2.functions.iter().find(|f| f.name == "main").unwrap();
         // At least some values should be marked as sandbox
@@ -7966,8 +7968,8 @@ mod tests {
         // I-3C: Functions called inside sandbox blocks should be inlined
         // even if they're slightly above the normal inline threshold.
         // The sandbox inline limit is 6 blocks / 40 insts vs normal 3/20.
-        let src = "pf helper(x: i64) -> i64 { pv a = x + 1; pv b = a + 2; pv c = b + 3; ret c; }
-        pf main() -> i64 !IO { pv r: i64 = 0; sandbox { r = helper(5); } print(r); ret 0; }\n";
+        let src = "fn helper(x: i64) -> i64 { val a = x + 1; val b = a + 2; val c = b + 3; return c; }
+        fn main() -> i64 !IO { val r: i64 = 0; sandbox { r = helper(5); } print(r); return 0; }\n";
         let mut l2 = compile_to_l2(src);
         // helper has 1 block but several instructions — should be inlined
         // in both normal and sandbox context (it's small enough).
@@ -7981,15 +7983,15 @@ mod tests {
         // before Return instructions when it pools allocations.
         // We need a region with many allocations to trigger pooling (>4KB).
         // Create a function with a large array in a region.
-        let mut src = String::from("pf main() -> i64 !IO {");
+        let mut src = String::from("fn main() -> i64 !IO {");
         src.push_str("region r {");
         // Many allocations to exceed 4KB threshold
         for i in 0..600 {
-            src.push_str(&format!("pv a{}: i64 = {};", i, i));
+            src.push_str(&format!("val a{}: i64 = {};", i, i));
         }
         src.push_str("print(a0);");
         src.push_str("}");
-        src.push_str("ret 0; }");
+        src.push_str("return 0; }");
         let mut l2 = compile_to_l2(&src);
         let n = pass_region_pool(&mut l2);
         assert!(n > 0, "expected region pooling to occur, got {}", n);
@@ -8009,8 +8011,8 @@ mod tests {
     fn i4b_crashfree_call_hoisted_from_loop() {
         // I-4B: @crashfree calls with loop-invariant args should be hoisted
         // out of loops (in addition to pure calls).
-        let src = "@crashfree pf safe_compute(x: i64) -> i64 { ret x * 2; }
-        pf main() -> i64 !IO { pv sum: i64 = 0; for i in 0..5 { sum = sum + safe_compute(10); } print(sum); ret 0; }\n";
+        let src = "@crashfree fn safe_compute(x: i64) -> i64 { return x * 2; }
+        fn main() -> i64 !IO { val sum: i64 = 0; for i in 0..5 { sum = sum + safe_compute(10); } print(sum); return 0; }\n";
         let mut l2 = compile_to_l2(src);
         let n = pass_effect_optimize(&mut l2);
         // safe_compute(10) has loop-invariant args and is @crashfree + effectively pure
@@ -8022,8 +8024,8 @@ mod tests {
         // S-1B: Duplicate calls to @deterministic functions should be CSE-able.
         // Two calls to the same @deterministic function with the same argument
         // in the same block should be reduced to one call + one copy.
-        let src = "@deterministic pf compute(x: i64) -> i64 { ret x * 3 + 1; }
-        pf main() -> i64 !IO { pv a = compute(7); pv b = compute(7); print(a + b); ret 0; }\n";
+        let src = "@deterministic fn compute(x: i64) -> i64 { return x * 3 + 1; }
+        fn main() -> i64 !IO { val a = compute(7); val b = compute(7); print(a + b); return 0; }\n";
         let mut l2 = compile_to_l2(src);
         // Run CSE — should eliminate the second compute(7) call.
         let n = pass_cse(&mut l2);
@@ -8051,8 +8053,8 @@ mod tests {
     #[test]
     fn s1b_gvn_eliminates_duplicate_deterministic_call() {
         // S-1B: GVN should also eliminate duplicate @deterministic calls.
-        let src = "@deterministic pf hash(x: i64) -> i64 { ret x * 2654435761; }
-        pf main() -> i64 !IO { pv a = hash(42); pv b = hash(42); print(a); print(b); ret 0; }\n";
+        let src = "@deterministic fn hash(x: i64) -> i64 { return x * 2654435761; }
+        fn main() -> i64 !IO { val a = hash(42); val b = hash(42); print(a); print(b); return 0; }\n";
         let mut l2 = compile_to_l2(src);
         let n = pass_gvn(&mut l2);
         assert!(n >= 0, "GVN pass should not crash, got {}", n);
@@ -8063,7 +8065,7 @@ mod tests {
         // I-4C: @gas functions should allow unrolling loops with trip count > 8
         // Use trip count 20 (> 16, so comptime loop unrolling won't handle it,
         // only the IR unroller with @gas will).
-        let src = "@gas(1000) pf compute() -> i64 { pv sum: i64 = 0; for i in 0..20 { sum = sum + i; } ret sum; }\n";
+        let src = "@gas(1000) fn compute() -> i64 { val sum: i64 = 0; for i in 0..20 { sum = sum + i; } return sum; }\n";
         let mut l2 = compile_to_l2(src);
         let n = pass_unroll(&mut l2);
         // Normal limit is 8, but @gas allows up to 64. Trip count 20 should unroll.
@@ -8073,7 +8075,7 @@ mod tests {
     #[test]
     fn i4c_no_gas_still_limits_unrolling() {
         // Without @gas, trip count > 8 should NOT unroll
-        let src = "pf compute() -> i64 { pv sum: i64 = 0; for i in 0..12 { sum = sum + i; } ret sum; }\n";
+        let src = "fn compute() -> i64 { val sum: i64 = 0; for i in 0..12 { sum = sum + i; } return sum; }\n";
         let mut l2 = compile_to_l2(src);
         let n = pass_unroll(&mut l2);
         assert_eq!(n, 0, "should not unroll trip count 12 without @gas, got {}", n);
@@ -8082,7 +8084,7 @@ mod tests {
     #[test]
     fn i2d_no_alloc_propagated() {
         // I-2D: @no-alloc annotation should be propagated to L2
-        let src = "@no-alloc pf compute(x: i64) -> i64 { ret x + 1; }\n";
+        let src = "@no-alloc fn compute(x: i64) -> i64 { return x + 1; }\n";
         let l2 = compile_to_l2(src);
         let f = l2.functions.iter().find(|f| f.name == "compute").unwrap();
         assert!(f.is_no_alloc, "expected is_no_alloc to be true for @no-alloc function");
@@ -8092,7 +8094,7 @@ mod tests {
     fn i4d_medical_implies_no_alloc() {
         // I-4D: @medical should imply @no-alloc for regalloc purposes
         // @medical requires @audit, so include both
-        let src = "@medical @audit pf compute(x: i64) -> i64 { ret x + 1; }\n";
+        let src = "@medical @audit fn compute(x: i64) -> i64 { return x + 1; }\n";
         let l2 = compile_to_l2(src);
         let f = l2.functions.iter().find(|f| f.name == "compute").unwrap();
         assert!(f.is_medical, "expected is_medical to be true");
@@ -8101,7 +8103,7 @@ mod tests {
     #[test]
     fn i4c_gas_limit_propagated() {
         // I-4C: @gas(N) should propagate the gas limit to L2
-        let src = "@gas(500) pf compute() -> i64 { ret 42; }\n";
+        let src = "@gas(500) fn compute() -> i64 { return 42; }\n";
         let l2 = compile_to_l2(src);
         let f = l2.functions.iter().find(|f| f.name == "compute").unwrap();
         assert_eq!(f.gas_limit, Some(500), "expected gas_limit to be Some(500)");

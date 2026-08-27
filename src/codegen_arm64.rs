@@ -241,7 +241,7 @@ impl Arm64CodeGen {
                 }
                 self.emit("    mov sp, x29");
                 self.emit("    ldp x29, x30, [sp], #16");
-                self.emit("    ret");
+                self.emit("    return");
             }
 
             L3Inst::Unreachable => self.emit("    brk #0"),

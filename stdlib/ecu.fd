@@ -1,0 +1,308 @@
+// Fides ECU (Electronic Control Unit) standard library
+//
+// Abstractions for automotive ECU development:
+// - Sensor reading and validation
+// - Actuator control with safety limits
+// - PID control loops
+// - Calibration parameter management
+// - ECU state machine (init, run, shutdown, fault)
+//
+// Use with @autosar (F52) for AUTOSAR compliance.
+//
+// Usage:
+//   use ecu;
+//   fn main() {
+//       val pid = pid_new(1.0, 0.1, 0.01);
+//       val output = pid_compute(pid, 100.0, 95.0, 0.01);
+//   }
+
+module ecu;
+
+use core;
+use vec;
+
+// ─── ECU States ────────────────────────────────────────────────────────
+
+pub const ECU_STATE_INIT: i64     = 0;
+pub const ECU_STATE_RUN: i64      = 1;
+pub const ECU_STATE_SHUTDOWN: i64 = 2;
+pub const ECU_STATE_FAULT: i64    = 3;
+pub const ECU_STATE_LIMP_HOME: i64 = 4;
+
+/// Get ECU state name.
+pub fn ecu_state_name(state: i64) -> str {
+    if state == ECU_STATE_INIT      { return "INIT"; }
+    if state == ECU_STATE_RUN       { return "RUN"; }
+    if state == ECU_STATE_SHUTDOWN  { return "SHUTDOWN"; }
+    if state == ECU_STATE_FAULT     { return "FAULT"; }
+    if state == ECU_STATE_LIMP_HOME { return "LIMP_HOME"; }
+    return "UNKNOWN";
+}
+
+// ─── Sensor Reading ────────────────────────────────────────────────────
+
+/// A sensor reading with validity and timestamp.
+pub struct SensorReading {
+    pub value: f64,
+    pub raw_value: i64,
+    pub is_valid: bool,
+    pub timestamp: i64,
+    pub error_code: i64,
+}
+
+/// Create a valid sensor reading.
+pub fn sensor_ok(value: f64, raw: i64, timestamp: i64) -> SensorReading {
+    return SensorReading {
+        value: value,
+        raw_value: raw,
+        is_valid: true,
+        timestamp: timestamp,
+        error_code: 0,
+    };
+}
+
+/// Create an invalid sensor reading (sensor fault).
+pub fn sensor_fault(error_code: i64, timestamp: i64) -> SensorReading {
+    return SensorReading {
+        value: 0.0,
+        raw_value: 0,
+        is_valid: false,
+        timestamp: timestamp,
+        error_code: error_code,
+    };
+}
+
+/// Validate a sensor reading against min/max range.
+pub fn sensor_validate(reading: SensorReading, min_val: f64, max_val: f64) -> SensorReading {
+    if !reading.is_valid {
+        return reading;
+    }
+    if reading.value < min_val || reading.value > max_val {
+        return SensorReading {
+            value: 0.0,
+            raw_value: reading.raw_value,
+            is_valid: false,
+            timestamp: reading.timestamp,
+            error_code: 1,  // out of range
+        };
+    }
+    return reading;
+}
+
+/// Convert raw ADC value to engineering value (linear conversion).
+pub fn sensor_raw_to_value(raw: i64, raw_min: i64, raw_max: i64,
+                            eng_min: f64, eng_max: f64) -> f64 {
+    if raw_max == raw_min {
+        return eng_min;
+    }
+    val raw_range = raw_max - raw_min;
+    val eng_range = eng_max - eng_min;
+    return eng_min + ((raw - raw_min) * eng_range) / raw_range;
+}
+
+// ─── Actuator Control ──────────────────────────────────────────────────
+
+/// An actuator command with safety limits.
+pub struct ActuatorCommand {
+    pub value: f64,
+    pub clamped: bool,
+    pub limited: bool,
+}
+
+/// Create an actuator command with safety clamping.
+pub fn actuator_command(value: f64, min_val: f64, max_val: f64) -> ActuatorCommand {
+    val result = value;
+    val clamped = false;
+    if result < min_val {
+        result = min_val;
+        clamped = true;
+    }
+    if result > max_val {
+        result = max_val;
+        clamped = true;
+    }
+    return ActuatorCommand {
+        value: result,
+        clamped: clamped,
+        limited: clamped,
+    };
+}
+
+/// Apply a rate limit to an actuator command.
+/// Limits how fast the command can change per time step.
+pub fn actuator_rate_limit(target: f64, current: f64, max_rate: f64) -> f64 {
+    val delta = target - current;
+    if delta > max_rate {
+        return current + max_rate;
+    }
+    if delta < -max_rate {
+        return current - max_rate;
+    }
+    return target;
+}
+
+// ─── PID Controller ────────────────────────────────────────────────────
+//
+// Standard PID controller: output = Kp * error + Ki * integral + Kd * derivative
+// With anti-windup and output clamping.
+
+/// A PID controller state.
+pub struct PIDController {
+    pub kp: f64,
+    pub ki: f64,
+    pub kd: f64,
+    pub integral: f64,
+    pub prev_error: f64,
+    pub output_min: f64,
+    pub output_max: f64,
+    pub integral_min: f64,
+    pub integral_max: f64,
+}
+
+/// Create a new PID controller.
+pub fn pid_new(kp: f64, ki: f64, kd: f64) -> PIDController {
+    return PIDController {
+        kp: kp,
+        ki: ki,
+        kd: kd,
+        integral: 0.0,
+        prev_error: 0.0,
+        output_min: -1000.0,
+        output_max: 1000.0,
+        integral_min: -1000.0,
+        integral_max: 1000.0,
+    };
+}
+
+/// Set output limits.
+pub fn pid_set_limits(pid: PIDController, out_min: f64, out_max: f64) -> void {
+    pid.output_min = out_min;
+    pid.output_max = out_max;
+}
+
+/// Set integral anti-windup limits.
+pub fn pid_set_integral_limits(pid: PIDController, int_min: f64, int_max: f64) -> void {
+    pid.integral_min = int_min;
+    pid.integral_max = int_max;
+}
+
+/// Compute PID output for one time step.
+/// setpoint: desired value, measured: current value, dt: time step in seconds
+
+pub fn pid_compute(pid: PIDController, setpoint: f64, measured: f64, dt: f64) -> f64 {
+    val error = setpoint - measured;
+    // Integral with anti-windup
+    pid.integral = pid.integral + error * dt;
+    if pid.integral > pid.integral_max {
+        pid.integral = pid.integral_max;
+    }
+    if pid.integral < pid.integral_min {
+        pid.integral = pid.integral_min;
+    }
+    // Derivative
+    val derivative = 0.0;
+    if dt > 0.0 {
+        derivative = (error - pid.prev_error) / dt;
+    }
+    pid.prev_error = error;
+    // PID output
+    val output = pid.kp * error + pid.ki * pid.integral + pid.kd * derivative;
+    // Clamp output
+    if output > pid.output_max {
+        return pid.output_max;
+    }
+    if output < pid.output_min {
+        return pid.output_min;
+    }
+    return output;
+}
+
+/// Reset PID controller state.
+pub fn pid_reset(pid: PIDController) -> void {
+    pid.integral = 0.0;
+    pid.prev_error = 0.0;
+}
+
+// ─── Calibration Parameters ────────────────────────────────────────────
+//
+// Tunable parameters that can be adjusted without recompiling.
+// In a real ECU, these are stored in non-volatile memory (EEPROM/Flash).
+
+/// A calibration parameter.
+pub struct CalParam {
+    pub name: str,
+    pub value: f64,
+    pub min_val: f64,
+    pub max_val: f64,
+    pub unit: str,
+}
+
+/// Create a calibration parameter.
+pub fn cal_param_new(name: str, value: f64, min_val: f64, max_val: f64, unit: str) -> CalParam {
+    return CalParam {
+        name: name,
+        value: value,
+        min_val: min_val,
+        max_val: max_val,
+        unit: unit,
+    };
+}
+
+/// Set a calibration parameter value (clamped to range).
+pub fn cal_param_set(param: CalParam, value: f64) -> void {
+    val v = value;
+    if v < param.min_val { v = param.min_val; }
+    if v > param.max_val { v = param.max_val; }
+    param.value = v;
+}
+
+/// Get a calibration parameter value.
+pub fn cal_param_get(param: CalParam) -> f64 {
+    return param.value;
+}
+
+/// Validate a calibration parameter is within range.
+pub fn cal_param_is_valid(param: CalParam) -> bool {
+    return param.value >= param.min_val && param.value <= param.max_val;
+}
+
+// ─── Watchdog Timer ────────────────────────────────────────────────────
+//
+// A simple watchdog that must be kicked periodically.
+// If not kicked within the timeout, the ECU enters fault state.
+
+/// A watchdog timer.
+pub struct Watchdog {
+    pub timeout_ms: i64,
+    pub last_kick: i64,
+    pub expired: bool,
+}
+
+/// Create a new watchdog timer.
+pub fn watchdog_new(timeout_ms: i64) -> Watchdog {
+    return Watchdog {
+        timeout_ms: timeout_ms,
+        last_kick: 0,
+        expired: false,
+    };
+}
+
+/// Kick the watchdog (reset the timer).
+pub fn watchdog_kick(wd: Watchdog, current_time: i64) -> void {
+    wd.last_kick = current_time;
+    wd.expired = false;
+}
+
+/// Check if the watchdog has expired.
+pub fn watchdog_check(wd: Watchdog, current_time: i64) -> bool {
+    val elapsed = current_time - wd.last_kick;
+    if elapsed > wd.timeout_ms {
+        wd.expired = true;
+    }
+    return wd.expired;
+}
+
+/// Check if watchdog is expired without updating state.
+pub fn watchdog_is_expired(wd: Watchdog) -> bool {
+    return wd.expired;
+}

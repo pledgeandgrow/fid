@@ -227,21 +227,21 @@ impl SpirVCodeGen {
         // Memory model
         self.emit(OP_MEMORY_MODEL, &[ADDRESSING_MODEL_LOGICAL, MEMORY_MODEL_GLSL450]);
 
-        // Entry point — find @kernel annotated function or use first function
-        let kernel_func = module.functions.iter().find(|f| {
-            // Check if function has @kernel annotation
-            // The annotation is stored in the AST, not in L3, so we check by name convention
-            // or by a special prefix. For now, we use the first function.
-            true
-        }).or_else(|| module.functions.first());
+        // Entry point — find @kernel annotated function, or use first function
+        let kernel_func = module.functions.iter().find(|f| f.is_kernel)
+            .or_else(|| module.functions.first());
 
         if let Some(func) = kernel_func {
             let entry_id = self.alloc_id();
             let void_type = self.get_void_type();
             let func_type = self.emit_with_result(OP_TYPE_FUNCTION, void_type, &[]);
 
-            // Parse workgroup size from annotation (default: 1, 1, 1)
-            let (wg_x, wg_y, wg_z) = (1u32, 1u32, 1u32);
+            // Workgroup size from @kernel annotation (default: 1, 1, 1)
+            let (wg_x, wg_y, wg_z) = (
+                func.workgroup_size[0],
+                func.workgroup_size[1],
+                func.workgroup_size[2],
+            );
 
             // Entry point
             self.emit(OP_ENTRY_POINT, &[EXEC_MODEL_GLCOMPUTE, entry_id, 0, 0]);
@@ -465,13 +465,21 @@ impl PtxCodeGen {
         self.output.push_str(".target sm_80\n");
         self.output.push_str(".address_size 64\n\n");
 
+        // Emit @kernel functions as .entry, others as .func
         for func in &module.functions {
             self.gen_function(func);
         }
     }
 
     fn gen_function(&mut self, func: &L3Function) {
-        self.output.push_str(&format!(".visible .entry {}()\n{{\n", func.name));
+        if func.is_kernel {
+            self.output.push_str(&format!(
+                ".visible .entry {}() .maxntid {},{},{}\n{{\n",
+                func.name, func.workgroup_size[0], func.workgroup_size[1], func.workgroup_size[2]
+            ));
+        } else {
+            self.output.push_str(&format!(".visible .entry {}()\n{{\n", func.name));
+        }
 
         // Register declarations
         self.output.push_str("    .reg .u64 r<32>;\n");
@@ -535,7 +543,7 @@ impl PtxCodeGen {
                     let v = self.operand_to_ptx(val);
                     self.output.push_str(&format!("    mov.u64 ret_val, {};\n", v));
                 }
-                self.output.push_str("    ret;\n");
+                self.output.push_str("    return;\n");
             }
 
             L3Inst::Jmp { target } => {

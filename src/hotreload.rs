@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_compile_and_run_hello() {
-        let source = "pf main() {\n    print(\"hot reload works!\");\n}\n";
+        let source = "fn main() {\n    print(\"hot reload works!\");\n}\n";
         let result = compile_and_run(source, "test.fd", false);
         assert!(result.is_ok(), "compile_and_run should succeed");
         let result = result.unwrap();
@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_compile_and_run_with_opt() {
-        let source = "pf main() {\n    print(\"optimized!\");\n}\n";
+        let source = "fn main() {\n    print(\"optimized!\");\n}\n";
         let result = compile_and_run(source, "test.fd", true);
         assert!(result.is_ok(), "compile_and_run with opt should succeed");
         let result = result.unwrap();

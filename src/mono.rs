@@ -556,9 +556,12 @@ fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, met
             args: args.iter().map(|a| subst_expr(a, subst, renames, method_renames)).collect(),
             line: *line,
         },
-        Stmt::RegionBlock { name, budget, body, line } => Stmt::RegionBlock {
+        Stmt::RegionBlock { name, budget, is_gpu, is_kv_cache, window_size, body, line } => Stmt::RegionBlock {
             name: name.clone(),
             budget: *budget,
+            is_gpu: *is_gpu,
+            is_kv_cache: *is_kv_cache,
+            window_size: *window_size,
             body: body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
             line: *line,
         },

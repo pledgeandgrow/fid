@@ -1,0 +1,165 @@
+// Fides Result type standard library
+//
+// Explicit error handling without exceptions.
+// Result<T, E> is either Ok(value) or Err(error).
+// Uses i64 for both value and error (Fides generics are limited).
+//
+// Usage:
+//   use result;
+//   value r = ResultValue_ok(42);
+//   if resultvalue_is_ok(r) {
+//       println(resultvalue_unwrap(r));  // 42
+//   }
+
+module result;
+
+use core;
+use vec;
+
+// ─── Result struct ──────────────────────────────────────────────────────
+
+/// A Result type — either Ok(value) or Err(error).
+/// Uses a tag (1 = Ok, 0 = Err) and two i64 fields.
+pub struct ResultValue {
+    pub tag: i64,   // 1 = Ok, 0 = Err
+    pub value: i64,
+    pub error: i64,
+}
+
+// ─── Constructors ───────────────────────────────────────────────────────
+
+/// Create an Ok result.
+pub fn ResultValue_ok(value: i64) -> ResultValue {
+    return ResultValue { tag: 1, value: value, error: 0 };
+}
+
+/// Create an Err result.
+pub fn ResultValue_err(error: i64) -> ResultValue {
+    return ResultValue { tag: 0, value: 0, error: error };
+}
+
+// ─── Predicates ─────────────────────────────────────────────────────────
+
+/// Check if a Result is Ok.
+pub fn resultvalue_is_ok(r: ResultValue) -> bool {
+    return r.tag == 1;
+}
+
+/// Check if a Result is Err.
+pub fn resultvalue_is_err(r: ResultValue) -> bool {
+    return r.tag == 0;
+}
+
+// ─── Extraction ─────────────────────────────────────────────────────────
+
+/// Unwrap the value. Panics if Err.
+pub fn resultvalue_unwrap(r: ResultValue) -> i64 {
+    if r.tag != 1 {
+        println("resultvalue_unwrap: called on Err value");
+        p_panic("resultvalue_unwrap: called on Err value");
+    }
+    return r.value;
+}
+
+/// Unwrap the error. Panics if Ok.
+pub fn resultvalue_unwrap_err(r: ResultValue) -> i64 {
+    if r.tag == 1 {
+        println("resultvalue_unwrap_err: called on Ok value");
+        p_panic("resultvalue_unwrap: called on Err value");
+    }
+    return r.error;
+}
+
+/// Return the value if Ok, otherwise return `default`.
+pub fn resultvalue_unwrap_or(r: ResultValue, default: i64) -> i64 {
+    if r.tag == 1 { return r.value; }
+    return default;
+}
+
+/// Return the value if Ok, otherwise call `fallback` and return its result.
+pub fn resultvalue_unwrap_or_else(r: ResultValue, fallback: fn(i64) -> i64) -> i64 {
+    if r.tag == 1 { return r.value; }
+    return fallback(r.error);
+}
+
+/// Expect the value with a custom panic message.
+pub fn resultvalue_expect(r: ResultValue, msg: str) -> i64 {
+    if r.tag != 1 {
+        println(msg);
+        p_panic("resultvalue_unwrap: called on Err value");
+    }
+    return r.value;
+}
+
+// ─── Combinators ────────────────────────────────────────────────────────
+
+/// Map an Ok value through a function. Err passes through unchanged.
+pub fn resultvalue_map(r: ResultValue, f: fn(i64) -> i64) -> ResultValue {
+    if r.tag == 1 {
+        return ResultValue_ok(f(r.value));
+    }
+    return r;
+}
+
+/// Map an Err value through a function. Ok passes through unchanged.
+pub fn resultvalue_map_err(r: ResultValue, f: fn(i64) -> i64) -> ResultValue {
+    if r.tag != 1 {
+        return ResultValue_err(f(r.error));
+    }
+    return r;
+}
+
+/// Chain: if Ok, apply f to the value to get a new Result.
+/// If Err, pass through unchanged (like flatMap / and_then).
+pub fn resultvalue_and_then(r: ResultValue, f: fn(i64) -> ResultValue) -> ResultValue {
+    if r.tag == 1 {
+        return f(r.value);
+    }
+    return r;
+}
+
+/// If Err, apply f to the error to get a new Result (orElse).
+pub fn resultvalue_or_else(r: ResultValue, f: fn(i64) -> ResultValue) -> ResultValue {
+    if r.tag != 1 {
+        return f(r.error);
+    }
+    return r;
+}
+
+// ─── Conversion ─────────────────────────────────────────────────────────
+
+/// Convert Result to Option (Ok → Some, Err → None).
+pub fn resultvalue_ok_option(r: ResultValue) -> Option {
+    if r.tag == 1 {
+        return Option::Some(r.value);
+    }
+    return Option::None;
+}
+
+/// Convert Result error to Option (Err → Some, Ok → None).
+pub fn resultvalue_err_option(r: ResultValue) -> Option {
+    if r.tag != 1 {
+        return Option::Some(r.error);
+    }
+    return Option::None;
+}
+
+// ─── Convenience ────────────────────────────────────────────────────────
+
+/// Check if the Result contains the given value.
+pub fn resultvalue_contains(r: ResultValue, value: i64) -> bool {
+    return r.tag == 1 && r.value == value;
+}
+
+/// Check if the Result contains the given error.
+pub fn resultvalue_contains_err(r: ResultValue, error: i64) -> bool {
+    return r.tag == 0 && r.error == error;
+}
+
+/// Get a string representation of the Result.
+pub fn resultvalue_to_str(r: ResultValue) -> str {
+    if r.tag == 1 {
+        return str_concat("Ok(", str_concat(int_to_str(r.value), ")"));
+    }
+    return str_concat("Err(", str_concat(int_to_str(r.error), ")"));
+}

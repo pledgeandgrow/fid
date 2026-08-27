@@ -1,0 +1,177 @@
+// Fides IO standard library
+//
+// Input/output utilities: stdin reading, formatted printing, and
+// stream-based reading/writing helpers.
+//
+// Usage:
+//   use io;
+//   io_print("Hello, ");
+//   io_println("World!");
+//   value line = io_readln();
+
+module io;
+
+use core;
+use vec;
+use string;
+
+// ─── FFI declarations ───────────────────────────────────────────────────
+
+extern "C" include "<stdio.h>" {
+    fn printf as pledge_printf(fmt: str) -> i64;
+    fn putchar as pledge_putchar(ch: i64) -> i64;
+    fn getchar as pledge_getchar() -> i64;
+    fn fgets as pledge_fgets(buf: str, size: i64, stream: i64) -> str;
+    fn fputs as pledge_fputs(s: str, stream: i64) -> i64;
+    fn fflush as pledge_fflush(stream: i64) -> i64;
+}
+
+// Standard stream handles
+pub const STDIN: i64 = 0;
+pub const STDOUT: i64 = 1;
+pub const STDERR: i64 = 2;
+
+// ─── Print ──────────────────────────────────────────────────────────────
+
+/// Print a string without a newline.
+pub fn io_print(s: str) -> void {
+    print(s);
+}
+
+/// Print a string followed by a newline.
+pub fn io_println(s: str) -> void {
+    println(s);
+}
+
+/// Print an integer.
+pub fn io_print_int(n: i64) -> void {
+    print(int_to_str(n));
+}
+
+/// Print an integer followed by a newline.
+pub fn io_println_int(n: i64) -> void {
+    println(int_to_str(n));
+}
+
+/// Print to stderr.
+pub fn io_eprint(s: str) -> void {
+    pledge_fputs(s, 2);  // stderr = 2
+}
+
+/// Print to stderr followed by a newline.
+pub fn io_eprintln(s: str) -> void {
+    pledge_fputs(s, 2);
+    pledge_fputs("\n", 2);
+}
+
+/// Print a character.
+pub fn io_putc(ch: i64) -> void {
+    pledge_putchar(ch);
+}
+
+/// Print a newline.
+pub fn io_newline() -> void {
+    pledge_putchar(10);  // '\n'
+}
+
+// ─── Read ───────────────────────────────────────────────────────────────
+
+/// Read a single character from stdin. Returns -1 on EOF.
+pub fn io_getc() -> i64 {
+    return pledge_getchar();
+}
+
+/// Read a line from stdin (without the trailing newline).
+/// Returns "" on EOF.
+pub fn io_readln() -> str {
+    val bytes = Vec::new();
+    var ch = pledge_getchar();
+    while ch >= 0 && ch != 10 {  // '\n'
+        bytes.push(ch);
+        ch = pledge_getchar();
+    }
+    return str_from_bytes(bytes);
+}
+
+/// Read all of stdin into a string.
+pub fn io_read_all() -> str {
+    val bytes = Vec::new();
+    var ch = pledge_getchar();
+    while ch >= 0 {
+        bytes.push(ch);
+        ch = pledge_getchar();
+    }
+    return str_from_bytes(bytes);
+}
+
+/// Read all of stdin into a Vec of lines.
+pub fn io_read_lines() -> Vec {
+    val lines = Vec::new();
+    val current = Vec::new();
+    var ch = pledge_getchar();
+    while ch >= 0 {
+        if ch == 10 {  // '\n'
+            lines.push(str_from_bytes(current));
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+        ch = pledge_getchar();
+    }
+    if current.len() > 0 {
+        lines.push(str_from_bytes(current));
+    }
+    return lines;
+}
+
+// ─── Flush ──────────────────────────────────────────────────────────────
+
+/// Flush stdout.
+pub fn io_flush() -> void {
+    pledge_fflush(1);  // stdout
+}
+
+/// Flush stderr.
+pub fn io_flush_err() -> void {
+    pledge_fflush(2);  // stderr
+}
+
+// ─── Formatted print ────────────────────────────────────────────────────
+
+/// Print multiple values separated by spaces, followed by a newline.
+pub fn io_print_args(args: Vec) -> void {
+    var i = 0;
+    while i < args.len() {
+        if i > 0 { pledge_putchar(32); }  // space
+        print(args.get(i));
+        i = i + 1;
+    }
+    pledge_putchar(10);  // newline
+}
+
+/// Print a separator line.
+pub fn io_print_separator(ch: i64, width: i64) -> void {
+    var i = 0;
+    while i < width {
+        pledge_putchar(ch);
+        i = i + 1;
+    }
+    pledge_putchar(10);
+}
+
+/// Print a header with separator lines above and below.
+pub fn io_print_header(title: str, width: i64) -> void {
+    io_print_separator(61, width);  // '='
+    val title_len = str_len(title);
+    val pad = (width - title_len) / 2;
+    if pad > 0 {
+        var i = 0;
+        while i < pad {
+            pledge_putchar(32);  // space
+            i = i + 1;
+        }
+    }
+    print(title);
+    pledge_putchar(10);
+    io_print_separator(61, width);  // '='
+}

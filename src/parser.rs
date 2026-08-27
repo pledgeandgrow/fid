@@ -94,12 +94,12 @@ impl Parser {
                     e.is_pub = is_pub;
                     program.enums.push(e);
                 }
-                TokenKind::Pc => {
+                TokenKind::Const => {
                     let mut c = self.parse_const()?;
                     c.is_pub = is_pub;
                     program.consts.push(c);
                 }
-                TokenKind::Ty => {
+                TokenKind::Type => {
                     let mut ta = self.parse_type_alias()?;
                     ta.is_pub = is_pub;
                     program.type_aliases.push(ta);
@@ -246,14 +246,14 @@ impl Parser {
                         // Block of extern declarations
                         self.advance();
                         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
-                            self.expect(TokenKind::Pf, "pf")?;
+                            self.expect(TokenKind::Fn, "fn")?;
                             let decl = self.parse_extern_func_decl(&abi, &include, &link_lib)?;
                             program.extern_decls.push(decl);
                         }
                         self.expect(TokenKind::RBrace, "}")?;
                     } else {
                         // Single extern function
-                        self.expect(TokenKind::Pf, "pf")?;
+                        self.expect(TokenKind::Fn, "fn")?;
                         let decl = self.parse_extern_func_decl(&abi, &include, &link_lib)?;
                         program.extern_decls.push(decl);
                     }
@@ -316,7 +316,7 @@ impl Parser {
                     return;
                 }
                 TokenKind::RBrace => return, // leave for caller
-                TokenKind::Pf
+                TokenKind::Fn
                 | TokenKind::Pub
                 | TokenKind::Struct
                 | TokenKind::Enum
@@ -486,7 +486,7 @@ impl Parser {
         let mut forward: Option<Func> = None;
 
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
-            if self.check(&TokenKind::Pf) {
+            if self.check(&TokenKind::Fn) {
                 // Parse the forward method
                 let mut func = self.parse_func()?;
                 if func.name == "forward" {
@@ -528,7 +528,7 @@ impl Parser {
         let mut forward: Option<Func> = None;
 
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
-            if self.check(&TokenKind::Pf) {
+            if self.check(&TokenKind::Fn) {
                 let mut func = self.parse_func()?;
                 if func.name == "forward" {
                     forward = Some(func);
@@ -746,7 +746,7 @@ impl Parser {
     }
 
     fn parse_const(&mut self) -> Result<ConstDef, String> {
-        self.expect(TokenKind::Pc, "pc")?;
+        self.expect(TokenKind::Const, "const")?;
         let name = self.expect_ident()?;
         self.expect(TokenKind::Colon, ":")?;
         let ty = self.parse_type()?;
@@ -757,7 +757,7 @@ impl Parser {
     }
 
     fn parse_type_alias(&mut self) -> Result<TypeAlias, String> {
-        self.expect(TokenKind::Ty, "ty")?;
+        self.expect(TokenKind::Type, "type")?;
         let name = self.expect_ident()?;
         self.expect(TokenKind::Eq, "=")?;
         let alias_for = self.parse_type()?;
@@ -802,7 +802,7 @@ impl Parser {
             let mut associated_types = Vec::new();
             while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
                 // Associated type binding: `ty Item = ConcreteType;` or GAT `ty Item<T> = ConcreteType;`
-                if self.check(&TokenKind::Ty) {
+                if self.check(&TokenKind::Type) {
                     self.advance();
                     let assoc_name = self.expect_ident()?;
                     // Parse optional GAT type params: <T, U>
@@ -878,7 +878,7 @@ impl Parser {
         let mut associated_types = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
             // Associated type declaration: `ty Item;` or GAT `ty Item<T, U>;`
-            if self.check(&TokenKind::Ty) {
+            if self.check(&TokenKind::Type) {
                 self.advance();
                 let assoc_name = self.expect_ident()?;
                 // Parse optional GAT type params: <T, U>
@@ -912,7 +912,7 @@ impl Parser {
             };
             // Parse method signature: pf name(params) -> ret_ty ;
             // or with default body: pf name(params) -> ret_ty { body }
-            self.expect(TokenKind::Pf, "pf")?;
+            self.expect(TokenKind::Fn, "fn")?;
             let method_name = self.expect_ident_or_keyword()?;
 
             // Generic type params
@@ -1014,7 +1014,7 @@ impl Parser {
     }
 
     fn parse_func(&mut self) -> Result<Func, String> {
-        self.expect(TokenKind::Pf, "fn")?;
+        self.expect(TokenKind::Fn, "fn")?;
         let name = self.expect_ident_or_keyword()?;
 
         // Generic type params: <T, U, ...> with optional trait bounds: <T: Display, U>
@@ -1186,7 +1186,7 @@ impl Parser {
     fn parse_type(&mut self) -> Result<Type, String> {
         let tok = self.peek_token().clone();
         let ty = match tok.kind {
-            TokenKind::Pf => {
+            TokenKind::Fn => {
                 // Function type: pf(params) -> ret
                 self.advance();
                 self.expect(TokenKind::LParen, "(")?;
@@ -1412,9 +1412,9 @@ impl Parser {
     fn parse_stmt(&mut self) -> Result<Stmt, String> {
         match self.peek() {
             TokenKind::Persist => self.parse_persist_let(),
-            TokenKind::Pv => self.parse_let(),
-            TokenKind::Pm => self.parse_let_uninit(),
-            TokenKind::Ret => self.parse_return(),
+            TokenKind::Val => self.parse_let(),
+            TokenKind::Var => self.parse_let(),
+            TokenKind::Return => self.parse_return(),
             TokenKind::Query => self.parse_query_stmt(),
             TokenKind::If => {
                 let line = self.peek_token().line;
@@ -1848,10 +1848,15 @@ impl Parser {
 
     fn parse_let(&mut self) -> Result<Stmt, String> {
         let line = self.peek_token().line;
-        self.expect(TokenKind::Pv, "pv")?;
-        let is_mut = self.match_tok(TokenKind::Mut);
+        // Accept either `val` (immutable) or `var` (mutable)
+        let kw = self.peek();
+        let is_mut = match kw {
+            TokenKind::Val => { self.advance(); false }
+            TokenKind::Var => { self.advance(); true }
+            _ => return Err(format!("expected 'val' or 'var' at line {}", line)),
+        };
 
-        // Check for tuple destructuring: `pv (a, b) = expr`
+        // Check for tuple destructuring: `val (a, b) = expr`
         if self.check(&TokenKind::LParen) && !is_mut {
             // Peek ahead to see if this is a tuple pattern (ident, ident, ...)
             // vs a tuple type annotation (which would be `pv name: (i64, i64) = ...`)
@@ -1882,22 +1887,39 @@ impl Parser {
             None
         };
 
+        // `var x: i32;` without `=` → uninitialized mutable variable
+        if is_mut && self.check(&TokenKind::Semicolon) {
+            self.advance(); // consume ;
+            // ty must be Some for uninit vars
+            let ty = ty.ok_or_else(|| format!("var {} needs type annotation for uninitialized declaration at line {}", name, line))?;
+            return Ok(Stmt::LetUninit { name, ty, line });
+        }
+        // Also handle `var x: i32` without semicolon (end of block etc.)
+        if is_mut && !self.check(&TokenKind::Eq) {
+            // No initializer — uninitialized variable
+            let ty = ty.ok_or_else(|| format!("var {} needs type annotation for uninitialized declaration at line {}", name, line))?;
+            self.match_tok(TokenKind::Semicolon);
+            return Ok(Stmt::LetUninit { name, ty, line });
+        }
+
         self.expect(TokenKind::Eq, "=")?;
         let expr = self.parse_expr()?;
         self.match_tok(TokenKind::Semicolon);
 
         // Check for `persist` modifier after the statement
-        // Syntax: `pv name = expr; persist` or `persist pv name = expr;`
-        // We use the prefix form: `persist pv name = expr;`
-        // This is handled in parse_stmt by checking for Persist token before Pv
+        // Syntax: `val name = expr; persist` or `persist val name = expr;`
+        // We use the prefix form: `persist val name = expr;`
+        // This is handled in parse_stmt by checking for Persist token before Val
         Ok(Stmt::Let { name, ty, expr, is_mut, is_persist: false, line })
     }
 
-    /// Parse `pm name: Type;` — uninitialized mutable variable (F63: init guarantee).
+    /// Parse `var name: Type;` — uninitialized mutable variable (F63: init guarantee).
     /// The variable must be assigned before it's read; the typechecker enforces this.
+    /// Note: parse_let() now handles this case internally, but this function is kept
+    /// for potential direct use.
     fn parse_let_uninit(&mut self) -> Result<Stmt, String> {
         let line = self.peek_token().line;
-        self.expect(TokenKind::Pm, "pm")?;
+        self.expect(TokenKind::Var, "var")?;
         let name = self.expect_ident_or_keyword()?;
         self.expect(TokenKind::Colon, ":")?;
         let ty = self.parse_type()?;
@@ -1905,12 +1927,18 @@ impl Parser {
         Ok(Stmt::LetUninit { name, ty, line })
     }
 
-    /// Parse `persist pv name = expr;` — variable that survives hot reloads.
+    /// Parse `persist val name = expr;` or `persist var name = expr;` — variable that survives hot reloads.
     fn parse_persist_let(&mut self) -> Result<Stmt, String> {
         let line = self.peek_token().line;
         self.expect(TokenKind::Persist, "persist")?;
-        self.expect(TokenKind::Pv, "pv")?;
-        let is_mut = self.match_tok(TokenKind::Mut);
+        // Accept either `val` (immutable) or `var` (mutable)
+        let is_mut = if self.check(&TokenKind::Var) {
+            self.advance();
+            true
+        } else {
+            self.expect(TokenKind::Val, "val")?;
+            false
+        };
         let name = self.expect_ident_or_keyword()?;
 
         let ty = if self.match_tok(TokenKind::Colon) {
@@ -1928,7 +1956,7 @@ impl Parser {
 
     fn parse_return(&mut self) -> Result<Stmt, String> {
         let line = self.peek_token().line;
-        self.expect(TokenKind::Ret, "ret")?;
+        self.expect(TokenKind::Return, "return")?;
         if self.check(&TokenKind::RBrace) || self.check(&TokenKind::Semicolon) {
             self.match_tok(TokenKind::Semicolon);
             Ok(Stmt::Return(None, line))
@@ -2420,7 +2448,7 @@ impl Parser {
                 self.advance();
                 Ok(Expr::BoolLit(false))
             }
-            TokenKind::Pf => {
+            TokenKind::Fn => {
                 // Closure: pf(params) -> ret { body } or pf(params) => expr
                 self.advance(); // consume pf
                 self.expect(TokenKind::LParen, "(")?;
@@ -2900,10 +2928,39 @@ impl Parser {
         Ok(Stmt::Do { effect, op, args, line })
     }
 
-    /// Parse `region r { body }` or `region r with budget(N) { body }`
+    /// Parse `region r { body }`, `region r with budget(N) { body }`,
+    /// `region gpu r { body }`, `region gpu r with budget(N) { body }`,
+    /// or `region kv_cache r with budget(N) [window(W)] { body }` (ML9)
     fn parse_region_block(&mut self) -> Result<Stmt, String> {
         let line = self.peek_token().line;
         self.expect(TokenKind::Region, "region")?;
+
+        // Optional modifier: `gpu` (ML1) or `kv_cache` (ML9)
+        let is_gpu = if let TokenKind::Ident(s) = self.peek() {
+            if s == "gpu" {
+                self.advance();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let is_kv_cache = if !is_gpu {
+            if let TokenKind::Ident(s) = self.peek() {
+                if s == "kv_cache" {
+                    self.advance();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         let name = self.expect_ident()?;
 
         // Optional: `with budget(N)`
@@ -2927,10 +2984,35 @@ impl Parser {
             None
         };
 
+        // Optional: `window(W)` — sliding window size for KV cache (ML9)
+        let window_size = if is_kv_cache {
+            if let TokenKind::Ident(s) = self.peek() {
+                if s == "window" {
+                    self.advance();
+                    self.expect(TokenKind::LParen, "(")?;
+                    let w = match self.peek().clone() {
+                        TokenKind::IntLit(n) => {
+                            self.advance();
+                            n as u64
+                        }
+                        _ => return Err("Expected integer literal in window(W)".to_string()),
+                    };
+                    self.expect(TokenKind::RParen, ")")?;
+                    Some(w)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         self.expect(TokenKind::LBrace, "{")?;
         let body = self.parse_block()?;
         self.expect(TokenKind::RBrace, "}")?;
-        Ok(Stmt::RegionBlock { name, budget, body, line })
+        Ok(Stmt::RegionBlock { name, budget, is_gpu, is_kv_cache, window_size, body, line })
     }
 
     /// Parse `sandbox { body }` — capability revocation block.
@@ -3047,6 +3129,10 @@ impl Parser {
             TokenKind::IntLit(n) => {
                 self.advance();
                 arg = n.to_string();
+            }
+            TokenKind::FloatLit(f) => {
+                self.advance();
+                arg = format!("{}", f);
             }
             TokenKind::StringLit(s) => {
                 self.advance();

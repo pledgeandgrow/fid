@@ -59,6 +59,15 @@ pub enum ShapeDim {
     Symbolic(String),
 }
 
+impl std::fmt::Display for ShapeDim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShapeDim::Known(n) => write!(f, "{}", n),
+            ShapeDim::Symbolic(s) => write!(f, "{}", s),
+        }
+    }
+}
+
 impl std::fmt::Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -476,9 +485,20 @@ pub enum Stmt {
     /// References to region-allocated data cannot escape the block.
     /// Optional `budget` specifies a compile-time memory budget in bytes.
     /// `region r with budget(4096) { body }` — compile error if exceeded.
+    /// `region gpu r { body }` — GPU memory region (ML1: region-scoped GPU memory).
+    /// Allocations use GPU memory; freed automatically at region exit.
+    /// `region kv_cache r with budget(N) { body }` — KV cache region (ML9).
+    /// Bounded attention cache with sliding window eviction.
     RegionBlock {
         name: String,
         budget: Option<u64>,
+        is_gpu: bool,
+        /// True if this is a KV cache region (ML9: bounded LLM attention cache).
+        /// Implies sliding window eviction and session-scoped lifetime.
+        is_kv_cache: bool,
+        /// Sliding window size for KV cache regions (number of tokens to keep).
+        /// None = no sliding window (keep all until budget exhausted).
+        window_size: Option<u64>,
         body: Vec<Stmt>,
         line: usize,
     },

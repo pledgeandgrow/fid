@@ -1,0 +1,330 @@
+// Fides Clinical Calculations standard library
+//
+// Common clinical calculations used in medical software:
+// - BMI (Body Mass Index)
+// - GFR (Glomerular Filtration Rate) — kidney function
+// - CHADS-VASc (stroke risk for atrial fibrillation)
+// - MELD (Model for End-stage Liver Disease)
+// - Drug dosage calculations
+// - Risk scores (Framingham, ASCVD)
+//
+// All functions are @deterministic (no IO, no floating-point randomness)
+// and @crashfree (no division by zero — all divisors are checked).
+// Use with @medical (F48) for IEC 62304 compliance.
+//
+// Usage:
+//   use clinical;
+//   fn main() {
+//       val bmi = clinical_bmi(70.0, 1.75);  // 22.86
+//       val gfr = clinical_gfr_egfr(60, 1.0, 72, 1);  // eGFR
+//   }
+
+module clinical;
+
+use math;
+
+// ─── BMI (Body Mass Index) ─────────────────────────────────────────────
+//
+// BMI = weight_kg / (height_m * height_m)
+// Categories: <18.5 underweight, 18.5-24.9 normal, 25-29.9 overweight, >=30 obese
+
+/// Calculate BMI from weight in kg and height in meters.
+
+pub fn clinical_bmi(weight_kg: f64, height_m: f64) -> f64 {
+    if height_m <= 0.0 {
+        return 0.0;
+    }
+    return weight_kg / (height_m * height_m);
+}
+
+/// Get BMI category string.
+
+pub fn clinical_bmi_category(bmi: f64) -> str {
+    if bmi < 18.5 { return "Underweight"; }
+    if bmi < 25.0 { return "Normal"; }
+    if bmi < 30.0 { return "Overweight"; }
+    return "Obese";
+}
+
+/// Calculate BMI from weight in pounds and height in inches.
+
+pub fn clinical_bmi_imperial(weight_lb: f64, height_in: f64) -> f64 {
+    if height_in <= 0.0 {
+        return 0.0;
+    }
+    return (weight_lb * 703.0) / (height_in * height_in);
+}
+
+// ─── eGFR (Estimated Glomerular Filtration Rate) ───────────────────────
+//
+// CKD-EPI 2021 formula (race-free):
+//   eGFR = 142 × min(Scr/κ, 1)^α × max(Scr/κ, 1)^(−1.200) × 0.9938^Age × 1.012 [if female]
+// where κ = 0.7 (female) or 0.9 (male), α = −0.241 (female) or −0.302 (male)
+//
+// Simplified version using integer math (Scr in mg/dL * 1000 for precision):
+
+/// Calculate eGFR using the simplified CKD-EPI 2021 formula.
+/// serum_creatinine: in mg/dL (e.g. 1.0 = normal)
+/// age: in years
+/// is_female: 1 = female, 0 = male
+/// Returns eGFR in mL/min/1.73m²
+
+pub fn clinical_gfr_egfr(serum_creatinine: f64, age: i64, is_female: i64) -> f64 {
+    val kappa = 0.7;
+    val alpha = -0.241;
+    if is_female == 0 {
+        kappa = 0.9;
+        alpha = -0.302;
+    }
+    val scr_k = serum_creatinine / kappa;
+    val min_val = scr_k;
+    if min_val > 1.0 { min_val = 1.0; }
+    val max_val = scr_k;
+    if max_val < 1.0 { max_val = 1.0; }
+    // 0.9938^age — approximate with repeated multiplication
+    val age_factor = 1.0;
+    for i in 0..age {
+        age_factor = age_factor * 0.9938;
+    }
+    val sex_factor = 1.0;
+    if is_female == 1 {
+        sex_factor = 1.012;
+    }
+    // min^alpha and max^(-1.200) — use pow
+    val result = 142.0 * math_pow(min_val, alpha) * math_pow(max_val, -1.200) * age_factor * sex_factor;
+    return result;
+}
+
+/// Get CKD stage from eGFR value.
+/// Stage 1: >=90, Stage 2: 60-89, Stage 3a: 45-59, Stage 3b: 30-44,
+/// Stage 4: 15-29, Stage 5: <15
+
+pub fn clinical_ckd_stage(egfr: f64) -> i64 {
+    if egfr >= 90.0 { return 1; }
+    if egfr >= 60.0 { return 2; }
+    if egfr >= 45.0 { return 3; }
+    if egfr >= 30.0 { return 3; }
+    if egfr >= 15.0 { return 4; }
+    return 5;
+}
+
+// ─── CHA₂DS₂-VASc (Stroke Risk for Atrial Fibrillation) ────────────────
+//
+// Score: C (CHF) + H (HTN) + A₂ (Age≥75 ×2) + D (Diabetes) + S₂ (Stroke×2)
+//        + V (Vascular) + A (Age 65-74) + Sc (Sex category)
+// 0 = low risk, 1 = moderate, ≥2 = high (anticoagulation recommended)
+
+/// Calculate CHA₂DS₂-VASc score.
+/// Parameters are 0 or 1 (presence of condition), age in years, is_female.
+
+pub fn clinical_chads2vasc(chf: i64, htn: i64, age: i64, diabetes: i64,
+                            stroke_history: i64, vascular: i64,
+                            is_female: i64) -> i64 {
+    val score = 0;
+    score = score + chf;           // C: Congestive heart failure
+    score = score + htn;            // H: Hypertension
+    if age >= 75 {
+        score = score + 2;          // A₂: Age ≥75 (2 points)
+    }
+    score = score + diabetes;       // D: Diabetes
+    score = score + stroke_history * 2;  // S₂: Stroke/TIA (2 points)
+    score = score + vascular;       // V: Vascular disease
+    if age >= 65 && age < 75 {
+        score = score + 1;          // A: Age 65-74
+    }
+    if is_female == 1 {
+        score = score + 1;          // Sc: Female sex category
+    }
+    return score;
+}
+
+/// Get stroke risk category from CHA₂DS₂-VASc score.
+
+pub fn clinical_chads2vasc_risk(score: i64) -> str {
+    if score == 0 { return "Low"; }
+    if score == 1 { return "Moderate"; }
+    return "High";
+}
+
+// ─── MELD Score (Liver Transplant Priority) ────────────────────────────
+//
+// MELD-Na = MELD(i) + 1.32 × (Na − 135) − [0.034 × MELD(i) × (Na − 135)]
+// MELD(i) = 0.957 × ln(creatinine) + 0.378 × ln(bilirubin) + 1.120 × ln(INR) + 0.643
+// (capped at 40, minimum 1.0 for each)
+
+/// Calculate MELD score (simplified, without sodium adjustment).
+/// creatinine: mg/dL, bilirubin: mg/dL, inr: INR value
+
+pub fn clinical_meld(creatinine: f64, bilirubin: f64, inr: f64) -> f64 {
+    // Floor values at 1.0
+    val cr = creatinine;
+    if cr < 1.0 { cr = 1.0; }
+    val bil = bilirubin;
+    if bil < 1.0 { bil = 1.0; }
+    val inr_val = inr;
+    if inr_val < 1.0 { inr_val = 1.0; }
+    // ln approximation: ln(x) ≈ (x-1) - (x-1)^2/2 + (x-1)^3/3 for x near 1
+    // For simplicity, use log10 * 2.303 (ln = log10 * ln(10))
+    val ln_cr = math_log(cr);
+    val ln_bil = math_log(bil);
+    val ln_inr = math_log(inr_val);
+    val meld = 0.957 * ln_cr + 0.378 * ln_bil + 1.120 * ln_inr + 0.643;
+    val result = meld * 10.0;  // MELD is typically reported as integer
+    if result > 40.0 {
+        return 40.0;
+    }
+    if result < 1.0 {
+        return 1.0;
+    }
+    return result;
+}
+
+// ─── Drug Dosage Calculations ──────────────────────────────────────────
+
+/// Calculate drug dosage based on weight.
+/// dose_mg_per_kg: mg of drug per kg of body weight
+/// weight_kg: patient weight in kg
+/// Returns total dose in mg
+pub fn clinical_dose_by_weight(dose_mg_per_kg: f64, weight_kg: f64) -> f64 {
+    return dose_mg_per_kg * weight_kg;
+}
+
+/// Calculate pediatric dose using Young's rule:
+/// dose = (adult_dose × age) / (age + 12)
+
+pub fn clinical_dose_young(adult_dose: f64, age_years: i64) -> f64 {
+    val age = age_years;
+    if age + 12 == 0 {
+        return 0.0;
+    }
+    return (adult_dose * age) / (age + 12);
+}
+
+/// Calculate pediatric dose using Clark's rule:
+/// dose = (adult_dose × weight_lb) / 150
+
+pub fn clinical_dose_clark(adult_dose: f64, weight_lb: f64) -> f64 {
+    return (adult_dose * weight_lb) / 150.0;
+}
+
+/// Calculate creatinine clearance (Cockcroft-Gault equation).
+/// Used for drug dosing in patients with renal impairment.
+/// CrCl = ((140 - age) × weight_kg) / (72 × serum_creatinine)
+/// For females: multiply by 0.85
+
+pub fn clinical_creatinine_clearance(age: i64, weight_kg: f64,
+                                      serum_creatinine: f64, is_female: i64) -> f64 {
+    if serum_creatinine <= 0.0 {
+        return 0.0;
+    }
+    val crcl = ((140 - age) * weight_kg) / (72.0 * serum_creatinine);
+    if is_female == 1 {
+        return crcl * 0.85;
+    }
+    return crcl;
+}
+
+// ─── Temperature Conversions ───────────────────────────────────────────
+
+/// Convert Celsius to Fahrenheit.
+pub fn clinical_c_to_f(celsius: f64) -> f64 {
+    return celsius * 9.0 / 5.0 + 32.0;
+}
+
+/// Convert Fahrenheit to Celsius.
+pub fn clinical_f_to_c(fahrenheit: f64) -> f64 {
+    return (fahrenheit - 32.0) * 5.0 / 9.0;
+}
+
+// ─── Heart Rate Zones ──────────────────────────────────────────────────
+
+/// Calculate maximum heart rate (Fox formula: 220 - age).
+pub fn clinical_max_hr(age: i64) -> i64 {
+    return 220 - age;
+}
+
+/// Calculate target heart rate zone (50-85% of max HR).
+/// Returns (lower, upper) as a Vec [lower, upper].
+pub fn clinical_target_hr_zone(age: i64) -> Vec {
+    val max_hr = clinical_max_hr(age);
+    val zone = Vec::new();
+    zone.push(max_hr * 50 / 100);
+    zone.push(max_hr * 85 / 100);
+    return zone;
+}
+
+// ─── Anion Gap (Acid-Base Balance) ─────────────────────────────────────
+
+/// Calculate anion gap: Na - (Cl + HCO3)
+/// Normal range: 8-16 mEq/L
+pub fn clinical_anion_gap(sodium: i64, chloride: i64, bicarbonate: i64) -> i64 {
+    return sodium - (chloride + bicarbonate);
+}
+
+/// Check if anion gap is normal (8-16).
+pub fn clinical_anion_gap_normal(gap: i64) -> bool {
+    return gap >= 8 && gap <= 16;
+}
+
+// ─── NEWS2 (National Early Warning Score) ──────────────────────────────
+//
+// Scores physiological parameters to detect deteriorating patients.
+// Each parameter scored 0-3. Total ≥7 = urgent review needed.
+
+/// Calculate NEWS2 score from vital signs.
+/// resp_rate: breaths/min, spo2: oxygen saturation %, air_or_o2: 0=air 1=oxygen
+/// systolic_bp: mmHg, pulse: bpm, temp_c: temperature in Celsius
+
+pub fn clinical_news2(resp_rate: i64, spo2: i64, air_or_o2: i64,
+                       systolic_bp: i64, pulse: i64, temp_c: f64) -> i64 {
+    val score = 0;
+
+    // Respiratory rate
+    if resp_rate <= 8 || resp_rate >= 25 { score = score + 3; }
+    else if resp_rate >= 21 { score = score + 2; }
+    else if resp_rate <= 11 { score = score + 1; }
+    // 12-20 = 0
+
+    // SpO2 (on air)
+    if air_or_o2 == 0 {
+        if spo2 <= 91 { score = score + 3; }
+        else if spo2 <= 93 { score = score + 2; }
+        else if spo2 <= 95 { score = score + 1; }
+        // >=96 = 0
+    } else {
+        // On oxygen — different scale
+        if spo2 <= 84 { score = score + 3; }
+        else if spo2 <= 86 { score = score + 2; }
+        else if spo2 <= 88 { score = score + 1; }
+        // >=93 on O2 = 0
+    }
+
+    // Systolic BP
+    if systolic_bp <= 90 || systolic_bp >= 220 { score = score + 3; }
+    else if systolic_bp <= 100 { score = score + 2; }
+    else if systolic_bp <= 110 { score = score + 1; }
+    else if systolic_bp >= 201 { score = score + 1; }
+    // 111-200 = 0
+
+    // Pulse
+    if pulse <= 40 || pulse >= 131 { score = score + 3; }
+    else if pulse >= 111 { score = score + 2; }
+    else if pulse >= 91 || pulse <= 50 { score = score + 1; }
+    // 51-90 = 0
+
+    // Temperature
+    if temp_c < 35.0 || temp_c >= 39.1 { score = score + 3; }
+    else if temp_c >= 38.1 { score = score + 2; }
+    else if temp_c <= 35.5 || temp_c >= 37.6 { score = score + 1; }
+    // 36.1-37.0 = 0 (approximate)
+
+    return score;
+}
+
+/// Get NEWS2 urgency category.
+pub fn clinical_news2_category(score: i64) -> str {
+    if score == 0 { return "Low"; }
+    if score <= 4 { return "Low-Medium"; }
+    if score <= 6 { return "Medium"; }
+    return "High — Urgent";
+}

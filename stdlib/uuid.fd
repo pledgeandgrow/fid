@@ -1,0 +1,189 @@
+// Fides UUID standard library
+//
+// RFC 4122 UUID generation and formatting.
+// Uses the runtime's random number generator (not cryptographically secure).
+// For secure UUIDs, use a crypto-secure RNG.
+//
+// Usage:
+//   use uuid;
+//   value u = uuid_v4();
+//   println(uuid_to_string(u));  // "550e8400-e29b-41d4-a716-446655440000"
+
+module uuid;
+
+use core;
+use vec;
+use string;
+use random;
+
+// ─── UUID struct ────────────────────────────────────────────────────────
+
+/// A 128-bit UUID stored as 16 bytes in a Vec.
+pub struct UUID {
+    pub bytes: Vec,  // 16 bytes
+}
+
+// ─── Generation ─────────────────────────────────────────────────────────
+
+/// Generate a random UUID v4.
+/// Uses random_int_range for each byte, then sets the version and variant bits.
+pub fn uuid_v4() -> UUID {
+    val bytes = Vec::new();
+    var i = 0;
+    while i < 16 {
+        bytes.push(random_int_range(0, 255));
+        i = i + 1;
+    }
+    // Set version 4 (bits 12-15 of byte 6)
+    val b6 = bytes.get(6);
+    bytes.set(6, (b6 & 0x0F) | 0x40);
+    // Set variant (bits 6-7 of byte 8 to 10)
+    val b8 = bytes.get(8);
+    bytes.set(8, (b8 & 0x3F) | 0x80);
+    return UUID { bytes: bytes };
+}
+
+/// Generate a nil UUID (all zeros).
+pub fn uuid_nil() -> UUID {
+    val bytes = Vec::new();
+    var i = 0;
+    while i < 16 {
+        bytes.push(0);
+        i = i + 1;
+    }
+    return UUID { bytes: bytes };
+}
+
+/// Generate a UUID from a Vec of 16 bytes.
+pub fn uuid_from_bytes(bytes: Vec) -> UUID {
+    val copy = Vec::new();
+    var i = 0;
+    while i < 16 && i < bytes.len() {
+        copy.push(bytes.get(i));
+        i = i + 1;
+    }
+    while copy.len() < 16 {
+        copy.push(0);
+    }
+    return UUID { bytes: copy };
+}
+
+// ─── Formatting ─────────────────────────────────────────────────────────
+
+/// Format a UUID as a lowercase string: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+pub fn uuid_to_string(u: UUID) -> str {
+    val hex_chars = "0123456789abcdef";
+    val result = Vec::new();
+    var i = 0;
+    while i < 16 {
+        val b = u.bytes.get(i);
+        result.push(str_byte_at(hex_chars, (b >> 4) & 0xF));
+        result.push(str_byte_at(hex_chars, b & 0xF));
+        if i == 3 || i == 5 || i == 7 || i == 9 {
+            result.push(45);  // '-'
+        }
+        i = i + 1;
+    }
+    return str_from_bytes(result);
+}
+
+/// Format a UUID as an uppercase string.
+pub fn uuid_to_string_upper(u: UUID) -> str {
+    val s = uuid_to_string(u);
+    return str_to_upper(s);
+}
+
+/// Format a UUID as a URN: "urn:uuid:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+pub fn uuid_to_urn(u: UUID) -> str {
+    return str_concat("urn:uuid:", uuid_to_string(u));
+}
+
+// ─── Parsing ────────────────────────────────────────────────────────────
+
+/// Parse a UUID string (with or without hyphens).
+/// Returns a UUID, or nil UUID if invalid.
+pub fn uuid_parse(s: str) -> UUID {
+    val bytes = Vec::new();
+    var i = 0;
+    var count = 0;
+    val len = str_len(s);
+    while i < len && count < 16 {
+        val ch = str_byte_at(s, i);
+        val nibble = hex_char_to_val(ch);
+        if nibble >= 0 {
+            i = i + 1;
+            val hi = nibble;
+            val lo = 0;
+            if i < len {
+                val ch2 = str_byte_at(s, i);
+                val nibble2 = hex_char_to_val(ch2);
+                if nibble2 >= 0 {
+                    lo = nibble2;
+                    i = i + 1;
+                }
+            }
+            bytes.push((hi << 4) | lo);
+            count = count + 1;
+            // Skip hyphens
+            if i < len && str_byte_at(s, i) == 45 {
+                i = i + 1;
+            }
+        } else {
+            i = i + 1;
+        }
+    }
+    if count != 16 {
+        return uuid_nil();
+    }
+    return UUID { bytes: bytes };
+}
+
+// ─── Comparison ─────────────────────────────────────────────────────────
+
+/// Check if two UUIDs are equal.
+pub fn uuid_equal(a: UUID, b: UUID) -> bool {
+    var i = 0;
+    while i < 16 {
+        if a.bytes.get(i) != b.bytes.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Check if a UUID is the nil UUID.
+pub fn uuid_is_nil(u: UUID) -> bool {
+    var i = 0;
+    while i < 16 {
+        if u.bytes.get(i) != 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Get the version of a UUID (1-5, or 0 for nil).
+pub fn uuid_version(u: UUID) -> i64 {
+    return (u.bytes.get(6) >> 4) & 0xF;
+}
+
+/// Get the variant of a UUID.
+/// Returns: 0 (NCS), 1 (RFC 4122), 2 (Microsoft), 3 (reserved).
+pub fn uuid_variant(u: UUID) -> i64 {
+    val b = u.bytes.get(8);
+    if (b & 0x80) == 0 { return 0; }
+    if (b & 0x40) == 0 { return 1; }
+    if (b & 0x20) == 0 { return 2; }
+    return 3;
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────
+
+fn hex_char_to_val(ch: i64) -> i64 {
+    if ch >= 48 && ch <= 57 { return ch - 48; }      // 0-9
+    if ch >= 97 && ch <= 102 { return ch - 97 + 10; } // a-f
+    if ch >= 65 && ch <= 70 { return ch - 65 + 10; }  // A-F
+    return -1;
+}

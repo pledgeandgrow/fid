@@ -725,7 +725,7 @@ fn main() {
                 }
                 // Wrap the input in a main function and interpret it
                 let source = format!(
-                    "pf main() -> i64 {{\n    println({});\n    ret 0;\n}}",
+                    "fn main() -> i64 {{\n    println({});\n    return 0;\n}}",
                     trimmed
                 );
                 match compiler::interpret_source(&source, false) {
@@ -792,6 +792,27 @@ fn main() {
                 "test_constant_time_fail2",
                 // @send fail test — sending reference through channel
                 "test_send_fail",
+                // ML1: GPU region budget exceeded
+                "test_gpu_region_fail",
+                // ML2: Shape mismatch is a compile error
+                "test_shape_verify_fail",
+                // Real-Time Effect Enforcement violations
+                "test_realtime_fail",
+                "test_realtime_fail2",
+                // ML3: @differentiable with IO effect
+                "test_autodiff_fail",
+                // ML2: Shape mismatch is a compile error
+                "test_shape_verify_fail",
+                // ML9: KV cache without budget
+                "test_kv_cache_fail",
+                // ML10: @quantized with dequantize
+                "test_quantization_fail",
+                // ML11: @checkpoint without @deterministic
+                "test_checkpoint_fail",
+                // ML12: @dp without Noise effect
+                "test_dp_fail",
+                // ML13: @shard without Comm effect
+                "test_shard_fail",
             ];
 
 
@@ -854,9 +875,17 @@ fn main() {
                 "test_comptime_reflect",
                 "test_comptime_serialize",
                 "test_comptime_gen",
+                "test_kernel_specialization", // uses comptime gen
                 "test_http",
                 "test_json",
                 "test_tensor",
+                "test_autodiff", // uses tensor stdlib
+                "test_kv_cache", // uses tensor stdlib + kv_cache module
+                "test_quantization", // uses tensor stdlib + quant module
+                "test_checkpoint", // uses tensor stdlib
+                "test_dp", // uses tensor stdlib + dp module
+                "test_shard", // uses tensor stdlib + shard module
+                "test_lora", // uses tensor stdlib + persist
                 "test_simd",
                 "test_parallel",
                 "test_shape",

@@ -1,0 +1,55 @@
+// test_kv_cache.fd — ML9: KV Cache with Region Memory
+// Expected: PASS
+// Tests bounded KV cache region with sliding window eviction.
+
+use tensor;
+use kv_cache;
+
+fn vec2(a: i64, b: i64) -> Vec<i64> {
+    val v = Vec::new();
+    v.push(a);
+    v.push(b);
+    return v;
+}
+
+fn main() {
+    // KV cache region with budget and sliding window
+    // Budget: 1024 bytes, Window: 4 tokens, Head dim: 2
+    region kv_cache kc with budget(1024) window(4) {
+        // Create a KV cache: 2 layers, max 8 tokens, window 4, head_dim 2
+        val cache = kv_cache_new(2, 8, 4, 2);
+
+        // Simulate attention: append K and V for layer 0
+        val k0 = ones(vec2(1, 2));  // 1 token, head_dim 2
+        val v0 = ones(vec2(1, 2));
+        kv_cache_append(cache, 0, k0, v0);
+        val len0 = kv_cache_len(cache, 0);
+        print(len0);
+        print("\n");
+
+        // Append more tokens
+        val k1 = ones(vec2(3, 2));  // 3 more tokens
+        val v1 = ones(vec2(3, 2));
+        kv_cache_append(cache, 0, k1, v1);
+        val len1 = kv_cache_len(cache, 0);
+        print(len1);
+        print("\n");
+
+        // Sliding window should evict oldest (4 tokens max)
+        // We had 4 tokens, now append 2 more → should evict 2 oldest
+        val k2 = ones(vec2(2, 2));
+        val v2 = ones(vec2(2, 2));
+        kv_cache_append(cache, 0, k2, v2);
+        val len2 = kv_cache_len(cache, 0);
+        print(len2);
+        print("\n");
+
+        // Clear the cache
+        kv_cache_clear(cache);
+        val len3 = kv_cache_len(cache, 0);
+        print(len3);
+        print("\n");
+    }
+
+    return 0;
+}

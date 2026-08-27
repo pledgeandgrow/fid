@@ -1,0 +1,287 @@
+// Fides Medical standard library — HL7 and FHIR
+//
+// HL7 (Health Level Seven) is the standard for exchanging medical
+// information. This module provides parsing and generation of HL7 v2
+// messages (pipe-delimited) and FHIR (JSON-based) resource helpers.
+//
+// Usage:
+//   use medical;
+//   fn main() {
+//       val msg = hl7_adt_a01("HMS", "12345", "Doe^John", "19800515", "M");
+//       val text = hl7_serialize(msg);
+//   }
+
+module medical;
+
+use core;
+use vec;
+
+// ─── HL7 Message Types ─────────────────────────────────────────────────
+
+pub const HL7_ADT_A01: i64 = 1;  // Admit a patient
+pub const HL7_ADT_A02: i64 = 2;  // Transfer a patient
+pub const HL7_ADT_A03: i64 = 3;  // Discharge a patient
+pub const HL7_ADT_A04: i64 = 4;  // Register a patient
+pub const HL7_ADT_A08: i64 = 8;  // Update patient information
+pub const HL7_ORU_R01: i64 = 10; // Observation result
+pub const HL7_OUL_R22: i64 = 11; // Unsolicited lab observation
+pub const HL7_MDM_T02: i64 = 12; // Medical document notification
+
+/// Get HL7 message type code.
+pub fn hl7_msg_type_code(msg_type: i64) -> str {
+    if msg_type == HL7_ADT_A01 { return "ADT^A01"; }
+    if msg_type == HL7_ADT_A02 { return "ADT^A02"; }
+    if msg_type == HL7_ADT_A03 { return "ADT^A03"; }
+    if msg_type == HL7_ADT_A04 { return "ADT^A04"; }
+    if msg_type == HL7_ADT_A08 { return "ADT^A08"; }
+    if msg_type == HL7_ORU_R01 { return "ORU^R01"; }
+    if msg_type == HL7_OUL_R22 { return "OUL^R22"; }
+    if msg_type == HL7_MDM_T02 { return "MDM^T02"; }
+    return "UNKNOWN";
+}
+
+/// Get HL7 message type name.
+pub fn hl7_msg_type_name(msg_type: i64) -> str {
+    if msg_type == HL7_ADT_A01 { return "Admit Patient"; }
+    if msg_type == HL7_ADT_A02 { return "Transfer Patient"; }
+    if msg_type == HL7_ADT_A03 { return "Discharge Patient"; }
+    if msg_type == HL7_ADT_A04 { return "Register Patient"; }
+    if msg_type == HL7_ADT_A08 { return "Update Patient Info"; }
+    if msg_type == HL7_ORU_R01 { return "Observation Result"; }
+    if msg_type == HL7_OUL_R22 { return "Lab Observation"; }
+    if msg_type == HL7_MDM_T02 { return "Medical Document"; }
+    return "Unknown";
+}
+
+// ─── HL7 Message Structure ─────────────────────────────────────────────
+
+/// An HL7 v2 message (pipe-delimited segments).
+pub struct HL7Message {
+    pub msg_type: i64,
+    pub msg_id: str,
+    pub sending_app: str,
+    pub sending_facility: str,
+    pub receiving_app: str,
+    pub receiving_facility: str,
+    pub timestamp: str,    // YYYYMMDDHHMMSS
+    pub segments: Vec,     // Vec of segment strings
+}
+
+/// Create a new HL7 message.
+pub fn hl7_new(msg_type: i64, msg_id: str, sending_app: str,
+               sending_facility: str, timestamp: str) -> HL7Message {
+    return HL7Message {
+        msg_type: msg_type,
+        msg_id: msg_id,
+        sending_app: sending_app,
+        sending_facility: sending_facility,
+        receiving_app: "",
+        receiving_facility: "",
+        timestamp: timestamp,
+        segments: Vec::new(),
+    };
+}
+
+/// Set receiving application and facility.
+pub fn hl7_set_receiver(msg: HL7Message, app: str, facility: str) -> void {
+    msg.receiving_app = app;
+    msg.receiving_facility = facility;
+}
+
+/// Add a segment to the message.
+pub fn hl7_add_segment(msg: HL7Message, segment: str) -> void {
+    msg.segments.push(segment);
+}
+
+/// Get segment count.
+pub fn hl7_segment_count(msg: HL7Message) -> i64 {
+    return msg.segments.len();
+}
+
+// ─── HL7 Segment Builders ──────────────────────────────────────────────
+
+/// Build MSH (Message Header) segment.
+pub fn hl7_msh_segment(msg: HL7Message) -> str {
+    val type_code = hl7_msg_type_code(msg.msg_type);
+    return "MSH|^~\\&|" + msg.sending_app + "|" + msg.sending_facility +
+           "|" + msg.receiving_app + "|" + msg.receiving_facility +
+           "|" + msg.timestamp + "||" + str_slice(type_code, 0, 3) +
+           "^" + str_slice(type_code, 4, 6) + "|" + msg.msg_id +
+           "|P|2.5|||||||";
+}
+
+/// Build PID (Patient Identification) segment.
+pub fn hl7_pid_segment(patient_id: str, patient_name: str,
+                        dob: str, gender: str) -> str {
+    // PID|||patient_id^^^HMS||name^dob^gender
+    return "PID|||" + patient_id + "^^^HMS||" + patient_name +
+           "||" + dob + "|" + gender + "|||||||||||";
+}
+
+/// Build PV1 (Patient Visit) segment.
+pub fn hl7_pv1_segment(patient_class: str, assigned_location: str,
+                        attending_doctor: str) -> str {
+    // PV1||patient_class|location|||doctor
+    return "PV1||" + patient_class + "|" + assigned_location +
+           "|||" + attending_doctor + "|||||||||||||||||||||||||||";
+}
+
+/// Build OBX (Observation Result) segment.
+pub fn hl7_obx_segment(set_id: i64, value_type: str, observation_id: str,
+                        observation_value: str, units: str) -> str {
+    // OBX|set_id|type|id|value|units
+    return "OBX|" + set_id + "|" + value_type + "|" + observation_id +
+           "||" + observation_value + "|" + units + "|||||F";
+}
+
+// ─── HL7 Message Builders ──────────────────────────────────────────────
+
+/// Build an ADT^A01 (Admit Patient) message.
+pub fn hl7_adt_a01(sending_facility: str, patient_id: str,
+                    patient_name: str, dob: str, gender: str) -> HL7Message {
+    val msg = hl7_new(HL7_ADT_A01, patient_id, "HMS", sending_facility, "20260826120000");
+    hl7_set_receiver(msg, "HIS", sending_facility);
+    // MSH segment
+    hl7_add_segment(msg, hl7_msh_segment(msg));
+    // EVN (Event Type) segment
+    hl7_add_segment(msg, "EVN|A01|20260826120000");
+    // PID segment
+    hl7_add_segment(msg, hl7_pid_segment(patient_id, patient_name, dob, gender));
+    // PV1 segment
+    hl7_add_segment(msg, hl7_pv1_segment("I", sending_facility + "^WARD01", "DR001"));
+    return msg;
+}
+
+/// Build an ADT^A03 (Discharge Patient) message.
+pub fn hl7_adt_a03(sending_facility: str, patient_id: str) -> HL7Message {
+    val msg = hl7_new(HL7_ADT_A03, patient_id, "HMS", sending_facility, "20260826120000");
+    hl7_set_receiver(msg, "HIS", sending_facility);
+    hl7_add_segment(msg, hl7_msh_segment(msg));
+    hl7_add_segment(msg, "EVN|A03|20260826120000");
+    hl7_add_segment(msg, hl7_pid_segment(patient_id, "DISCHARGED", "19000101", "U"));
+    hl7_add_segment(msg, hl7_pv1_segment("O", sending_facility + "^WARD01", "DR001"));
+    return msg;
+}
+
+// ─── HL7 Serialization ─────────────────────────────────────────────────
+
+/// Serialize an HL7 message to text (pipe-delimited, newline-separated).
+pub fn hl7_serialize(msg: HL7Message) -> str {
+    var result = "";
+    for i in 0..msg.segments.len() {
+        if i > 0 {
+            result = result + "\r";  // HL7 uses CR as segment separator
+        }
+        result = result + msg.segments.get(i);
+    }
+    return result;
+}
+
+// ─── HL7 Parsing ───────────────────────────────────────────────────────
+
+/// Parse an HL7 message from text. Returns an HL7Message.
+/// Segments are split by CR or LF.
+pub fn hl7_parse(text: str) -> HL7Message {
+    val segments: Vec = str_split(text, "\n");
+    // Extract message type from MSH segment
+    val msg_type = HL7_ADT_A01;  // default
+    val msg_id = "";
+    val sending_app = "";
+    val sending_facility = "";
+    val timestamp = "";
+
+    if segments.len() > 0 {
+        val msh = segments.get(0);
+        // MSH fields are pipe-separated
+        val fields: Vec = str_split(msh, "|");
+        if fields.len() > 3 {
+            sending_app = fields.get(2);
+            sending_facility = fields.get(3);
+        }
+        if fields.len() > 7 {
+            timestamp = fields.get(7);
+        }
+        if fields.len() > 9 {
+            msg_id = fields.get(9);
+        }
+    }
+
+    val msg = hl7_new(msg_type, msg_id, sending_app, sending_facility, timestamp);
+    for i in 0..segments.len() {
+        hl7_add_segment(msg, segments.get(i));
+    }
+    return msg;
+}
+
+/// Extract a field from a segment (pipe-separated).
+pub fn hl7_get_field(segment: str, field_num: i64) -> str {
+    val fields: Vec = str_split(segment, "|");
+    if field_num < 0 || field_num >= fields.len() {
+        return "";
+    }
+    return fields.get(field_num);
+}
+
+/// Get the segment type (first 3 characters).
+pub fn hl7_segment_type(segment: str) -> str {
+    return str_slice(segment, 0, 3);
+}
+
+// ─── FHIR Resource Types ───────────────────────────────────────────────
+
+pub const FHIR_PATIENT: i64    = 0;
+pub const FHIR_OBSERVATION: i64 = 1;
+pub const FHIR_CONDITION: i64  = 2;
+pub const FHIR_MEDICATION: i64 = 3;
+pub const FHIR_ENCOUNTER: i64  = 4;
+pub const FHIR_PRACTITIONER: i64 = 5;
+
+/// Get FHIR resource type name.
+pub fn fhir_resource_name(resource_type: i64) -> str {
+    if resource_type == FHIR_PATIENT     { return "Patient"; }
+    if resource_type == FHIR_OBSERVATION { return "Observation"; }
+    if resource_type == FHIR_CONDITION   { return "Condition"; }
+    if resource_type == FHIR_MEDICATION  { return "Medication"; }
+    if resource_type == FHIR_ENCOUNTER   { return "Encounter"; }
+    if resource_type == FHIR_PRACTITIONER { return "Practitioner"; }
+    return "Unknown";
+}
+
+// ─── ICD-10 Codes ──────────────────────────────────────────────────────
+
+/// Validate ICD-10 code format (e.g. "E11.9", "I10", "J45.909").
+pub fn icd10_validate(code: str) -> bool {
+    val len = str_len(code);
+    if len < 3 || len > 7 {
+        return false;
+    }
+    // First char must be a letter
+    val c0 = str_byte_at(code, 0);
+    if c0 < 65 || (c0 > 90 && c0 < 97) || c0 > 122 {
+        return false;
+    }
+    // Chars 2-3 must be digits
+    val c1 = str_byte_at(code, 1);
+    val c2 = str_byte_at(code, 2);
+    if c1 < 48 || c1 > 57 || c2 < 48 || c2 > 57 {
+        return false;
+    }
+    return true;
+}
+
+// ─── LOINC Codes (Lab Observations) ────────────────────────────────────
+
+pub const LOINC_GLUCOSE: str       = "2339-0";  // Glucose
+pub const LOINC_HEMOGLOBIN_A1C: str = "4548-4"; // HbA1c
+pub const LOINC_CHOLESTEROL: str    = "2093-3";  // Cholesterol
+pub const LOINC_CREATININE: str     = "2160-0";  // Creatinine
+pub const LOINC_WBC: str            = "6690-2";  // White Blood Cell
+pub const LOINC_RBC: str            = "789-8";   // Red Blood Cell
+pub const LOINC_PLATELETS: str      = "777-3";   // Platelets
+pub const LOINC_SODIUM: str         = "2951-2";  // Sodium
+pub const LOINC_POTASSIUM: str      = "2823-3";  // Potassium
+pub const LOINC_TEMPERATURE: str    = "8310-5";  // Body Temperature
+pub const LOINC_HEART_RATE: str     = "8867-4";  // Heart Rate
+pub const LOINC_BP_SYSTOLIC: str    = "8480-6";  // BP Systolic
+pub const LOINC_BP_DIASTOLIC: str   = "8462-4";  // BP Diastolic
+pub const LOINC_SPO2: str           = "59408-5"; // Oxygen Saturation

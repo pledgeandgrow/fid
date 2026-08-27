@@ -1,0 +1,328 @@
+// Fides SWIFT Message Format standard library
+//
+// SWIFT MT (Message Type) format parsing and generation for
+// international banking communication. SWIFT messages are used
+// for cross-border payments, trade finance, and treasury operations.
+//
+// MT message structure:
+//   {1: Basic Header Block}
+//   {2: Application Header Block}
+//   {3: User Header Block} (optional)
+//   {4: Text Block}
+//   {5: Trailer Block}
+//
+// Usage:
+//   use swift;
+//   fn main() {
+//       val msg = swift_mt103_new("BANKUS33", "DEUTDEFF", 100000, "USD");
+//       val text = swift_mt103_serialize(msg);
+//   }
+
+module swift;
+
+use core;
+use vec;
+
+// ─── SWIFT Message Types ───────────────────────────────────────────────
+
+pub const SWIFT_MT103: i64  = 103;  // Customer Credit Transfer
+pub const SWIFT_MT202: i64  = 202;  // General Financial Institution Transfer
+pub const SWIFT_MT900: i64  = 900;  // Confirmation of Debit
+pub const SWIFT_MT910: i64  = 910;  // Confirmation of Credit
+pub const SWIFT_MT940: i64  = 940;  // Statement Message
+pub const SWIFT_MT942: i64  = 942;  // Interim Transaction Report
+pub const SWIFT_MT199: i64  = 199;  // Free Format Message
+pub const SWIFT_MT299: i64  = 299;  // Free Format Message (FIN)
+pub const SWIFT_MT300: i64  = 300;  // Foreign Exchange Confirmation
+pub const SWIFT_MT320: i64  = 320;  // Loan/Deposit Confirmation
+pub const SWIFT_MT700: i64  = 700;  // Issue of a Documentary Credit
+pub const SWIFT_MT760: i64  = 760;  // Guarantee
+
+/// Get SWIFT message type name.
+pub fn swift_mt_name(mt: i64) -> str {
+    if mt == SWIFT_MT103 { return "MT103 - Customer Credit Transfer"; }
+    if mt == SWIFT_MT202 { return "MT202 - FI Transfer"; }
+    if mt == SWIFT_MT900 { return "MT900 - Confirmation of Debit"; }
+    if mt == SWIFT_MT910 { return "MT910 - Confirmation of Credit"; }
+    if mt == SWIFT_MT940 { return "MT940 - Statement Message"; }
+    if mt == SWIFT_MT942 { return "MT942 - Interim Transaction Report"; }
+    if mt == SWIFT_MT199 { return "MT199 - Free Format"; }
+    if mt == SWIFT_MT299 { return "MT299 - Free Format (FIN)"; }
+    if mt == SWIFT_MT300 { return "MT300 - FX Confirmation"; }
+    if mt == SWIFT_MT320 { return "MT320 - Loan/Deposit Confirmation"; }
+    if mt == SWIFT_MT700 { return "MT700 - Documentary Credit"; }
+    if mt == SWIFT_MT760 { return "MT760 - Guarantee"; }
+    return "Unknown";
+}
+
+// ─── BIC (Bank Identifier Code) ────────────────────────────────────────
+//
+// BIC format: 8 or 11 characters
+//   BBBBCCLL[bbb]
+//   BBBB = Bank code (4 letters)
+//   CC   = Country code (2 letters, ISO 3166)
+//   LL   = Location code (2 alphanumeric)
+//   bbb  = Branch code (3 alphanumeric, optional — 'XXX' = primary office)
+
+/// Validate a BIC code (8 or 11 characters).
+pub fn swift_bic_validate(bic: str) -> bool {
+    val len = str_len(bic);
+    if len != 8 && len != 11 {
+        return false;
+    }
+    // First 6 chars must be letters (bank + country)
+    for i in 0..6 {
+        val c = str_byte_at(bic, i);
+        if c < 65 || (c > 90 && c < 97) || c > 122 {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Get the bank code (first 4 characters) from a BIC.
+pub fn swift_bic_bank_code(bic: str) -> str {
+    return str_slice(bic, 0, 4);
+}
+
+/// Get the country code (characters 5-6) from a BIC.
+pub fn swift_bic_country(bic: str) -> str {
+    return str_slice(bic, 4, 6);
+}
+
+/// Get the location code (characters 7-8) from a BIC.
+pub fn swift_bic_location(bic: str) -> str {
+    return str_slice(bic, 6, 8);
+}
+
+/// Get the branch code (characters 9-11) from a BIC.
+/// Returns "XXX" if not present (primary office).
+pub fn swift_bic_branch(bic: str) -> str {
+    if str_len(bic) == 11 {
+        return str_slice(bic, 8, 11);
+    }
+    return "XXX";
+}
+
+// ─── IBAN (International Bank Account Number) ──────────────────────────
+//
+// IBAN format: CC + BB + ... (country-specific)
+// Length varies by country (15-34 characters).
+// Validation: mod-97 check.
+
+/// Validate IBAN length by country code.
+pub fn swift_iban_validate_length(iban: str) -> bool {
+    val len = str_len(iban);
+    if len < 15 || len > 34 {
+        return false;
+    }
+    val cc = str_slice(iban, 0, 2);
+    // Check country-specific lengths
+    if str_equal(cc, "DE") && len == 22 { return true; }
+    if str_equal(cc, "FR") && len == 27 { return true; }
+    if str_equal(cc, "GB") && len == 22 { return true; }
+    if str_equal(cc, "IT") && len == 27 { return true; }
+    if str_equal(cc, "ES") && len == 24 { return true; }
+    if str_equal(cc, "NL") && len == 18 { return true; }
+    if str_equal(cc, "BE") && len == 16 { return true; }
+    if str_equal(cc, "CH") && len == 21 { return true; }
+    if str_equal(cc, "AT") && len == 20 { return true; }
+    if str_equal(cc, "PL") && len == 28 { return true; }
+    if str_equal(cc, "PT") && len == 25 { return true; }
+    if str_equal(cc, "SE") && len == 24 { return true; }
+    if str_equal(cc, "NO") && len == 15 { return true; }
+    if str_equal(cc, "FI") && len == 18 { return true; }
+    if str_equal(cc, "DK") && len == 18 { return true; }
+    // For other countries, accept any length 15-34
+    return true;
+}
+
+/// Get country code from IBAN.
+pub fn swift_iban_country(iban: str) -> str {
+    return str_slice(iban, 0, 2);
+}
+
+/// Get check digits from IBAN (characters 3-4).
+pub fn swift_iban_check_digits(iban: str) -> str {
+    return str_slice(iban, 2, 4);
+}
+
+/// Get BBAN (Basic Bank Account Number) from IBAN (characters 5+).
+pub fn swift_iban_bban(iban: str) -> str {
+    return str_slice(iban, 4, str_len(iban));
+}
+
+// ─── MT103 Message (Customer Credit Transfer) ──────────────────────────
+//
+// MT103 is the most common SWIFT message — a single customer
+// credit transfer (payment instruction).
+
+/// An MT103 message structure.
+pub struct MT103 {
+    pub sender_bic: str,
+    pub receiver_bic: str,
+    pub message_id: str,
+    pub amount: i64,        // in cents
+    pub currency: str,      // 3-letter ISO 4217
+    pub ordering_customer: str,
+    pub beneficiary_customer: str,
+    pub ordering_institution: str,
+    pub beneficiary_institution: str,
+    pub remittance_info: str,
+    pub value_date: str,    // YYMMDD
+}
+
+/// Create a new MT103 message.
+pub fn swift_mt103_new(sender_bic: str, receiver_bic: str, amount_cents: i64,
+                        currency: str) -> MT103 {
+    return MT103 {
+        sender_bic: sender_bic,
+        receiver_bic: receiver_bic,
+        message_id: "",
+        amount: amount_cents,
+        currency: currency,
+        ordering_customer: "",
+        beneficiary_customer: "",
+        ordering_institution: "",
+        beneficiary_institution: "",
+        remittance_info: "",
+        value_date: "",
+    };
+}
+
+/// Set ordering customer (party initiating the payment).
+pub fn swift_mt103_set_ordering(msg: MT103, customer: str, institution: str) -> void {
+    msg.ordering_customer = customer;
+    msg.ordering_institution = institution;
+}
+
+/// Set beneficiary customer (party receiving the payment).
+pub fn swift_mt103_set_beneficiary(msg: MT103, customer: str, institution: str) -> void {
+    msg.beneficiary_customer = customer;
+    msg.beneficiary_institution = institution;
+}
+
+/// Set remittance information (payment reference).
+pub fn swift_mt103_set_remittance(msg: MT103, info: str) -> void {
+    msg.remittance_info = info;
+}
+
+/// Set value date (YYMMDD format).
+pub fn swift_mt103_set_value_date(msg: MT103, date: str) -> void {
+    msg.value_date = date;
+}
+
+/// Serialize an MT103 message to SWIFT text format.
+pub fn swift_mt103_serialize(msg: MT103) -> str {
+    var result = "";
+    // Block 1: Basic Header
+    result = result + "{1:F01" + msg.sender_bic + "XXXX0000000000}";
+    // Block 2: Application Header (Input)
+    result = result + "{2:I103" + msg.receiver_bic + "XXXXN}";
+    // Block 4: Text Block
+    result = result + "{4:";
+    // :20: Transaction Reference
+    result = result + "\n:20:" + msg.message_id;
+    // :23B: Bank Operation Code
+    result = result + "\n:23B:CRED";
+    // :32A: Value Date / Currency / Amount
+    result = result + "\n:32A:" + msg.value_date + msg.currency + int_to_str(msg.amount);
+    // :50K: Ordering Customer
+    if !str_equal(msg.ordering_customer, "") {
+        result = result + "\n:50K:" + msg.ordering_customer;
+    }
+    // :52A: Ordering Institution
+    if !str_equal(msg.ordering_institution, "") {
+        result = result + "\n:52A:" + msg.ordering_institution;
+    }
+    // :59: Beneficiary Customer
+    if !str_equal(msg.beneficiary_customer, "") {
+        result = result + "\n:59:" + msg.beneficiary_customer;
+    }
+    // :57A: Beneficiary Institution
+    if !str_equal(msg.beneficiary_institution, "") {
+        result = result + "\n:57A:" + msg.beneficiary_institution;
+    }
+    // :70: Remittance Information
+    if !str_equal(msg.remittance_info, "") {
+        result = result + "\n:70:" + msg.remittance_info;
+    }
+    // :71A: Charges (OUR = sender pays all)
+    result = result + "\n:71A:OUR";
+    result = result + "\n-}";
+    return result;
+}
+
+/// Get the amount in major currency units (e.g. dollars, not cents).
+pub fn swift_mt103_amount_major(msg: MT103) -> f64 {
+    return msg.amount / 100.0;
+}
+
+/// Get the amount as a formatted string (e.g. "1000.00 USD").
+pub fn swift_mt103_amount_formatted(msg: MT103) -> str {
+    val major = msg.amount / 100;
+    val minor = msg.amount % 100;
+    val result = int_to_str(major) + ".";
+    if minor < 10 {
+        result = result + "0";
+    }
+    result = result + int_to_str(minor) + " " + msg.currency;
+    return result;
+}
+
+// ─── SWIFT Field Parsing ───────────────────────────────────────────────
+
+/// Parse a field tag and value from a SWIFT text line.
+/// Format: ":TAG:VALUE" (e.g. ":20:REF12345")
+/// Returns (tag, value) as a Vec [tag_str, value_str].
+pub fn swift_parse_field(line: str) -> Vec {
+    val result = Vec::new();
+    val len = str_len(line);
+    if len < 4 {
+        result.push("");
+        result.push("");
+        return result;
+    }
+    // Must start with ':'
+    if str_byte_at(line, 0) != 58 {  // ':'
+        result.push("");
+        result.push("");
+        return result;
+    }
+    // Find second ':'
+    val colon_pos = -1;
+    for i in 1..len {
+        if str_byte_at(line, i) == 58 {  // ':'
+            colon_pos = i;
+            break;
+        }
+    }
+    if colon_pos < 0 {
+        result.push("");
+        result.push("");
+        return result;
+    }
+    result.push(str_slice(line, 1, colon_pos));
+    result.push(str_slice(line, colon_pos + 1, len));
+    return result;
+}
+
+/// Extract a specific field from a SWIFT text block.
+/// Returns the field value, or "" if not found.
+pub fn swift_extract_field(text: str, tag: str) -> str {
+    val search = ":" + tag + ":";
+    val pos = str_find(text, search);
+    if pos < 0 {
+        return "";
+    }
+    val start = pos + str_len(search);
+    // Find end of line (newline or end of text)
+    val end = str_len(text);
+    for i in start..str_len(text) {
+        if str_byte_at(text, i) == 10 {  // '\n'
+            end = i;
+            break;
+        }
+    }
+    return str_slice(text, start, end);
+}

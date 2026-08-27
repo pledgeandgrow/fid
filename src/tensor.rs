@@ -388,6 +388,152 @@ impl Tensor {
         }
         format_recursive(&self.data, &self.shape, &self.strides, 0)
     }
+
+    // ─── ML10: Quantization ──────────────────────────────────────────
+
+    /// Quantize a float tensor to int8 (symmetric quantization).
+    /// Each value is clamped to [-128, 127] after scaling.
+    /// The quantized value = round(value / scale) + zero_point, clamped to [-128, 127].
+    pub fn quantize_q8(&self, scale: f64, zero_point: i32) -> Tensor {
+        let data: Vec<f64> = self.data.iter().map(|&v| {
+            let q = (v / scale).round() as i32 + zero_point;
+            let clamped = q.clamp(-128, 127);
+            clamped as f64
+        }).collect();
+        Tensor {
+            shape: self.shape.clone(),
+            strides: self.strides.clone(),
+            data,
+        }
+    }
+
+    /// Dequantize an int8 tensor back to float.
+    /// value = (quantized - zero_point) * scale
+    pub fn dequantize_q8(&self, scale: f64, zero_point: i32) -> Tensor {
+        let data: Vec<f64> = self.data.iter().map(|&v| {
+            (v - zero_point as f64) * scale
+        }).collect();
+        Tensor {
+            shape: self.shape.clone(),
+            strides: self.strides.clone(),
+            data,
+        }
+    }
+
+    /// Find optimal quantization parameters (scale and zero_point) for a tensor.
+    /// Uses symmetric quantization: scale = max(|min|, |max|) / 127, zero_point = 0.
+    pub fn find_quant_params(&self) -> (f64, i32) {
+        let min = self.data.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let max = self.data.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let abs_max = min.abs().max(max.abs());
+        let scale = if abs_max > 0.0 { abs_max / 127.0 } else { 1.0 };
+        (scale, 0)
+    }
+}
+
+// ─── ML9: KV Cache ──────────────────────────────────────────────────
+
+/// A KV cache for LLM attention — stores K and V tensors per layer.
+/// Bounded by max_seq_len with optional sliding window eviction.
+pub struct KvCache {
+    /// K tensors per layer: shape [seq_len, head_dim]
+    pub k_cache: Vec<Vec<f64>>,
+    /// V tensors per layer: shape [seq_len, head_dim]
+    pub v_cache: Vec<Vec<f64>>,
+    /// Current sequence length per layer
+    pub seq_len: Vec<usize>,
+    /// Maximum sequence length (budget in tokens)
+    pub max_seq_len: usize,
+    /// Sliding window size (0 = no window, keep all until max)
+    pub window_size: usize,
+    /// Head dimension
+    pub head_dim: usize,
+}
+
+impl KvCache {
+    /// Create a new KV cache for `num_layers` layers.
+    pub fn new(num_layers: usize, max_seq_len: usize, window_size: usize, head_dim: usize) -> Self {
+        KvCache {
+            k_cache: vec![Vec::new(); num_layers],
+            v_cache: vec![Vec::new(); num_layers],
+            seq_len: vec![0; num_layers],
+            max_seq_len,
+            window_size,
+            head_dim,
+        }
+    }
+
+    /// Append K and V for a given layer. The tensor should be 2D [seq, head_dim].
+    /// If the cache exceeds max_seq_len, oldest tokens are evicted (sliding window).
+    pub fn append(&mut self, layer: usize, k: &Tensor, v: &Tensor) {
+        if layer >= self.k_cache.len() {
+            return;
+        }
+        let k_flat = &k.data;
+        let v_flat = &v.data;
+        // Append new tokens
+        self.k_cache[layer].extend_from_slice(k_flat);
+        self.v_cache[layer].extend_from_slice(v_flat);
+        self.seq_len[layer] = self.k_cache[layer].len() / self.head_dim.max(1);
+        // Enforce sliding window
+        let max_tokens = if self.window_size > 0 {
+            self.window_size.min(self.max_seq_len)
+        } else {
+            self.max_seq_len
+        };
+        let max_bytes = max_tokens * self.head_dim;
+        if self.k_cache[layer].len() > max_bytes {
+            let excess = self.k_cache[layer].len() - max_bytes;
+            self.k_cache[layer].drain(0..excess);
+            self.v_cache[layer].drain(0..excess);
+            self.seq_len[layer] = self.k_cache[layer].len() / self.head_dim.max(1);
+        }
+    }
+
+    /// Get K and V for a layer as a concatenated tensor [K; V].
+    pub fn get(&self, layer: usize) -> Tensor {
+        if layer >= self.k_cache.len() {
+            return Tensor::zeros(vec![0, self.head_dim]);
+        }
+        let seq = self.seq_len[layer];
+        let mut data = self.k_cache[layer].clone();
+        data.extend_from_slice(&self.v_cache[layer]);
+        Tensor::from_vec(vec![2, seq, self.head_dim], data)
+    }
+
+    /// Current sequence length for a layer.
+    pub fn len(&self, layer: usize) -> usize {
+        if layer < self.seq_len.len() {
+            self.seq_len[layer]
+        } else {
+            0
+        }
+    }
+
+    /// Clear all layers.
+    pub fn clear(&mut self) {
+        for layer in 0..self.k_cache.len() {
+            self.k_cache[layer].clear();
+            self.v_cache[layer].clear();
+            self.seq_len[layer] = 0;
+        }
+    }
+
+    /// Evict the oldest `n` tokens from all layers (sliding window).
+    pub fn evict_oldest(&mut self, n: usize) {
+        let bytes_to_evict = n * self.head_dim;
+        for layer in 0..self.k_cache.len() {
+            if self.k_cache[layer].len() >= bytes_to_evict {
+                self.k_cache[layer].drain(0..bytes_to_evict);
+                self.v_cache[layer].drain(0..bytes_to_evict);
+                self.seq_len[layer] = self.k_cache[layer].len() / self.head_dim.max(1);
+            } else {
+                self.k_cache[layer].clear();
+                self.v_cache[layer].clear();
+                self.seq_len[layer] = 0;
+            }
+        }
+    }
 }
 
 /// Convenience type for Rc<RefCell<Tensor>> (matches interpreter's opaque value pattern).

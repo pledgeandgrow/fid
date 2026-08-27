@@ -1,0 +1,179 @@
+// Fides OS standard library
+//
+// Operating system interface: environment variables, command-line args,
+// process control, and system information.
+//
+// Usage:
+//   use os;
+//   println(os_getenv("HOME"));     // "/home/user"
+//   println(os_args());             // ["./program", "arg1"]
+//   os_exit(0);
+
+module os;
+
+use core;
+use vec;
+use string;
+
+// ─── FFI declarations ───────────────────────────────────────────────────
+
+extern "C" include "<stdlib.h>" {
+    fn getenv as pledge_getenv(name: str) -> str;
+    fn exit as pledge_exit(code: i64) -> void;
+    fn c_system as pledge_system(cmd: str) -> i64;
+}
+
+extern "C" include "<stdio.h>" {
+    fn printf as pledge_printf(fmt: str) -> i64;
+}
+
+// ─── Environment variables ──────────────────────────────────────────────
+
+/// Get an environment variable value. Returns "" if not set.
+pub fn os_getenv(name: str) -> str {
+    return pledge_getenv(name);
+}
+
+/// Get an environment variable, or a default value if not set.
+pub fn os_getenv_or(name: str, default: str) -> str {
+    val value = pledge_getenv(name);
+    if str_len(value) == 0 { return default; }
+    return value;
+}
+
+/// Check if an environment variable is set.
+pub fn os_hasenv(name: str) -> bool {
+    return str_len(pledge_getenv(name)) > 0;
+}
+
+// ─── Command-line arguments ─────────────────────────────────────────────
+
+/// Get the number of command-line arguments.
+pub fn os_argc() -> i64 {
+    return p_argc();
+}
+
+/// Get a command-line argument by index.
+pub fn os_argv(idx: i64) -> str {
+    return p_argv(idx);
+}
+
+/// Get all command-line arguments as a Vec of strings.
+pub fn os_args() -> Vec {
+    val result = Vec::new();
+    val argc = p_argc();
+    var i = 0;
+    while i < argc {
+        result.push(p_argv(i));
+        i = i + 1;
+    }
+    return result;
+}
+
+// ─── Process control ────────────────────────────────────────────────────
+
+/// Exit the process with a status code.
+pub fn os_exit(code: i64) -> void {
+    pledge_exit(code);
+}
+
+/// Exit with success (code 0).
+pub fn os_exit_success() -> void {
+    pledge_exit(0);
+}
+
+/// Exit with failure (code 1).
+pub fn os_exit_failure() -> void {
+    pledge_exit(1);
+}
+
+/// Execute a system command. Returns the exit status.
+pub fn os_system(cmd: str) -> i64 {
+    return pledge_system(cmd);
+}
+
+// ─── System information ─────────────────────────────────────────────────
+
+/// Get the operating system name (best-effort, from environment).
+pub fn os_name() -> str {
+    val os = pledge_getenv("OS");
+    if str_len(os) > 0 { return os; }
+    // On Linux, "OS" is usually not set. Check uname via system.
+    return "linux";
+}
+
+/// Get the user's home directory.
+pub fn os_home_dir() -> str {
+    val home = pledge_getenv("HOME");
+    if str_len(home) > 0 { return home; }
+    return "/";
+}
+
+/// Get the current working directory (from PWD env var).
+pub fn os_cwd() -> str {
+    val pwd = pledge_getenv("PWD");
+    if str_len(pwd) > 0 { return pwd; }
+    return ".";
+}
+
+/// Get the user name (from USER env var).
+pub fn os_user() -> str {
+    val user = pledge_getenv("USER");
+    if str_len(user) > 0 { return user; }
+    val logname = pledge_getenv("LOGNAME");
+    if str_len(logname) > 0 { return logname; }
+    return "unknown";
+}
+
+/// Get the hostname (from HOSTNAME env var, best-effort).
+pub fn os_hostname() -> str {
+    val host = pledge_getenv("HOSTNAME");
+    if str_len(host) > 0 { return host; }
+    return "localhost";
+}
+
+/// Get the shell (from SHELL env var).
+pub fn os_shell() -> str {
+    val shell = pledge_getenv("SHELL");
+    if str_len(shell) > 0 { return shell; }
+    return "/bin/sh";
+}
+
+/// Get the terminal (from TERM env var).
+pub fn os_term() -> str {
+    val term = pledge_getenv("TERM");
+    if str_len(term) > 0 { return term; }
+    return "dumb";
+}
+
+/// Get the PATH environment variable as a Vec of paths.
+pub fn os_path() -> Vec {
+    val path = pledge_getenv("PATH");
+    if str_len(path) == 0 { return Vec::new(); }
+    return str_split(path, ":");
+}
+
+// ─── Temp directory ─────────────────────────────────────────────────────
+
+/// Get the system temporary directory.
+pub fn os_tmp_dir() -> str {
+    val tmpdir = pledge_getenv("TMPDIR");
+    if str_len(tmpdir) > 0 { return tmpdir; }
+    val tmp = pledge_getenv("TMP");
+    if str_len(tmp) > 0 { return tmp; }
+    val temp = pledge_getenv("TEMP");
+    if str_len(temp) > 0 { return temp; }
+    return "/tmp";
+}
+
+// ─── Path separator ─────────────────────────────────────────────────────
+
+/// Get the path separator for this OS.
+pub fn os_path_sep() -> str {
+    return "/";
+}
+
+/// Get the path list separator (for PATH-like variables).
+pub fn os_path_list_sep() -> str {
+    return ":";
+}

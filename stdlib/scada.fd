@@ -1,0 +1,419 @@
+// Fides SCADA standard library — Modbus Protocol
+//
+// Modbus is the most widely used SCADA/industrial protocol. This module
+// provides Modbus RTU frame encoding/decoding for serial communication
+// and Modbus TCP frame encoding for Ethernet.
+//
+// Functions:
+// - Read Coils (FC 0x01), Read Discrete Inputs (FC 0x02)
+// - Read Holding Registers (FC 0x03), Read Input Registers (FC 0x04)
+// - Write Single Coil (FC 0x05), Write Single Register (FC 0x06)
+// - Write Multiple Coils (FC 0x0F), Write Multiple Registers (FC 0x10)
+//
+// Usage:
+//   use scada;
+//   fn main() {
+//       val req = modbus_read_holding_registers(1, 0, 10);
+//       val resp = modbus_decode_response(req);
+//   }
+
+module scada;
+
+use core;
+use vec;
+
+// ─── Modbus Function Codes ─────────────────────────────────────────────
+
+pub const MODBUS_FC_READ_COILS: i64              = 0x01;
+pub const MODBUS_FC_READ_DISCRETE_INPUTS: i64    = 0x02;
+pub const MODBUS_FC_READ_HOLDING_REGS: i64       = 0x03;
+pub const MODBUS_FC_READ_INPUT_REGS: i64         = 0x04;
+pub const MODBUS_FC_WRITE_SINGLE_COIL: i64       = 0x05;
+pub const MODBUS_FC_WRITE_SINGLE_REG: i64        = 0x06;
+pub const MODBUS_FC_WRITE_MULTIPLE_COILS: i64    = 0x0F;
+pub const MODBUS_FC_WRITE_MULTIPLE_REGS: i64     = 0x10;
+pub const MODBUS_FC_READ_WRITE_MULTIPLE_REGS: i64 = 0x17;
+pub const MODBUS_FC_DIAGNOSTICS: i64             = 0x08;
+pub const MODBUS_FC_GET_COMM_EVENT_COUNTER: i64  = 0x0B;
+pub const MODBUS_FC_GET_COMM_EVENT_LOG: i64      = 0x0C;
+pub const MODBUS_FC_REPORT_SLAVE_ID: i64         = 0x11;
+pub const MODBUS_FC_READ_FILE_RECORD: i64        = 0x14;
+pub const MODBUS_FC_WRITE_FILE_RECORD: i64       = 0x15;
+pub const MODBUS_FC_MASK_WRITE_REGISTER: i64     = 0x16;
+pub const MODBUS_FC_READ_FIFO_QUEUE: i64         = 0x18;
+pub const MODBUS_FC_ENCAPSULATED_INTERFACE: i64  = 0x2B;
+
+// ─── Modbus Exception Codes ────────────────────────────────────────────
+
+pub const MODBUS_EXC_ILLEGAL_FUNCTION: i64      = 0x01;
+pub const MODBUS_EXC_ILLEGAL_DATA_ADDRESS: i64  = 0x02;
+pub const MODBUS_EXC_ILLEGAL_DATA_VALUE: i64    = 0x03;
+pub const MODBUS_EXC_SLAVE_DEVICE_FAILURE: i64  = 0x04;
+pub const MODBUS_EXC_ACKNOWLEDGE: i64           = 0x05;
+pub const MODBUS_EXC_SLAVE_BUSY: i64            = 0x06;
+pub const MODBUS_EXC_NEGATIVE_ACK: i64          = 0x07;
+pub const MODBUS_EXC_MEMORY_PARITY_ERROR: i64   = 0x08;
+pub const MODBUS_EXC_GATEWAY_PATH_UNAVAILABLE: i64 = 0x0A;
+pub const MODBUS_EXC_GATEWAY_TARGET_NO_RESPONSE: i64 = 0x0B;
+
+/// Get function code name.
+@crashfree
+pub fn modbus_fc_name(fc: i64) -> str {
+    if fc == MODBUS_FC_READ_COILS           { return "Read Coils"; }
+    if fc == MODBUS_FC_READ_DISCRETE_INPUTS { return "Read Discrete Inputs"; }
+    if fc == MODBUS_FC_READ_HOLDING_REGS    { return "Read Holding Registers"; }
+    if fc == MODBUS_FC_READ_INPUT_REGS      { return "Read Input Registers"; }
+    if fc == MODBUS_FC_WRITE_SINGLE_COIL    { return "Write Single Coil"; }
+    if fc == MODBUS_FC_WRITE_SINGLE_REG     { return "Write Single Register"; }
+    if fc == MODBUS_FC_WRITE_MULTIPLE_COILS { return "Write Multiple Coils"; }
+    if fc == MODBUS_FC_WRITE_MULTIPLE_REGS  { return "Write Multiple Registers"; }
+    return "Unknown";
+}
+
+/// Get exception code name.
+@crashfree
+pub fn modbus_exc_name(exc: i64) -> str {
+    if exc == MODBUS_EXC_ILLEGAL_FUNCTION      { return "Illegal Function"; }
+    if exc == MODBUS_EXC_ILLEGAL_DATA_ADDRESS  { return "Illegal Data Address"; }
+    if exc == MODBUS_EXC_ILLEGAL_DATA_VALUE    { return "Illegal Data Value"; }
+    if exc == MODBUS_EXC_SLAVE_DEVICE_FAILURE  { return "Slave Device Failure"; }
+    if exc == MODBUS_EXC_ACKNOWLEDGE           { return "Acknowledge"; }
+    if exc == MODBUS_EXC_SLAVE_BUSY            { return "Slave Busy"; }
+    if exc == MODBUS_EXC_NEGATIVE_ACK          { return "Negative Acknowledge"; }
+    if exc == MODBUS_EXC_MEMORY_PARITY_ERROR   { return "Memory Parity Error"; }
+    if exc == MODBUS_EXC_GATEWAY_PATH_UNAVAILABLE { return "Gateway Path Unavailable"; }
+    if exc == MODBUS_EXC_GATEWAY_TARGET_NO_RESPONSE { return "Gateway Target No Response"; }
+    return "Unknown";
+}
+
+// ─── Modbus RTU Frame ──────────────────────────────────────────────────
+//
+// RTU frame format: [Slave Address(1)] [Function(1)] [Data(N)] [CRC(2)]
+// CRC-16 (Modbus) is computed over Address + Function + Data.
+
+/// A Modbus RTU frame.
+pub struct ModbusFrame {
+    pub slave_address: i64,
+    pub function_code: i64,
+    pub data: Vec,
+    pub crc: i64,
+    pub is_exception: bool,
+}
+
+// ─── CRC-16 (Modbus) ───────────────────────────────────────────────────
+//
+// CRC-16 with polynomial 0xA001 (reversed 0x8005), initial value 0xFFFF.
+
+/// Compute CRC-16 (Modbus) over a Vec of bytes.
+@deterministic
+@crashfree
+pub fn modbus_crc16(data: Vec) -> i64 {
+    val crc = 0xFFFF;
+    for i in 0..data.len() {
+        crc = crc ^ data.get(i);
+        for j in 0..8 {
+            if (crc & 1) == 1 {
+                crc = (crc >> 1) ^ 0xA001;
+            } else {
+                crc = crc >> 1;
+            }
+        }
+    }
+    return crc & 0xFFFF;
+}
+
+/// Verify CRC-16 of a complete frame (including CRC bytes).
+@deterministic
+@crashfree
+pub fn modbus_crc_verify(data: Vec) -> bool {
+    if data.len() < 2 {
+        return false;
+    }
+    val n = data.len();
+    val received_crc = data.get(n - 2) | (data.get(n - 1) << 8);
+    val payload = Vec::new();
+    for i in 0..n - 2 {
+        payload.push(data.get(i));
+    }
+    val computed = modbus_crc16(payload);
+    return received_crc == computed;
+}
+
+// ─── Request Builders ──────────────────────────────────────────────────
+
+/// Build a Read Holding Registers request (FC 0x03).
+/// slave_addr: Modbus slave address (1-247)
+/// start_addr: starting register address (0-65535)
+/// quantity: number of registers to read (1-125)
+pub fn modbus_read_holding_registers(slave_addr: i64, start_addr: i64, quantity: i64) -> ModbusFrame {
+    val data = Vec::new();
+    data.push((start_addr >> 8) & 0xFF);
+    data.push(start_addr & 0xFF);
+    data.push((quantity >> 8) & 0xFF);
+    data.push(quantity & 0xFF);
+    return ModbusFrame {
+        slave_address: slave_addr,
+        function_code: MODBUS_FC_READ_HOLDING_REGS,
+        data: data,
+        crc: 0,
+        is_exception: false,
+    };
+}
+
+/// Build a Read Coils request (FC 0x01).
+pub fn modbus_read_coils(slave_addr: i64, start_addr: i64, quantity: i64) -> ModbusFrame {
+    val data = Vec::new();
+    data.push((start_addr >> 8) & 0xFF);
+    data.push(start_addr & 0xFF);
+    data.push((quantity >> 8) & 0xFF);
+    data.push(quantity & 0xFF);
+    return ModbusFrame {
+        slave_address: slave_addr,
+        function_code: MODBUS_FC_READ_COILS,
+        data: data,
+        crc: 0,
+        is_exception: false,
+    };
+}
+
+/// Build a Write Single Register request (FC 0x06).
+pub fn modbus_write_single_register(slave_addr: i64, reg_addr: i64, value: i64) -> ModbusFrame {
+    val data = Vec::new();
+    data.push((reg_addr >> 8) & 0xFF);
+    data.push(reg_addr & 0xFF);
+    data.push((value >> 8) & 0xFF);
+    data.push(value & 0xFF);
+    return ModbusFrame {
+        slave_address: slave_addr,
+        function_code: MODBUS_FC_WRITE_SINGLE_REG,
+        data: data,
+        crc: 0,
+        is_exception: false,
+    };
+}
+
+/// Build a Write Single Coil request (FC 0x05).
+/// value: 0xFF00 for ON, 0x0000 for OFF.
+pub fn modbus_write_single_coil(slave_addr: i64, coil_addr: i64, on: bool) -> ModbusFrame {
+    val data = Vec::new();
+    data.push((coil_addr >> 8) & 0xFF);
+    data.push(coil_addr & 0xFF);
+    if on {
+        data.push(0xFF);
+        data.push(0x00);
+    } else {
+        data.push(0x00);
+        data.push(0x00);
+    }
+    return ModbusFrame {
+        slave_address: slave_addr,
+        function_code: MODBUS_FC_WRITE_SINGLE_COIL,
+        data: data,
+        crc: 0,
+        is_exception: false,
+    };
+}
+
+/// Build a Write Multiple Registers request (FC 0x10).
+pub fn modbus_write_multiple_registers(slave_addr: i64, start_addr: i64,
+                                        values: Vec) -> ModbusFrame {
+    val quantity = values.len();
+    val byte_count = quantity * 2;
+    val data = Vec::new();
+    data.push((start_addr >> 8) & 0xFF);
+    data.push(start_addr & 0xFF);
+    data.push((quantity >> 8) & 0xFF);
+    data.push(quantity & 0xFF);
+    data.push(byte_count & 0xFF);
+    for i in 0..quantity {
+        val v = values.get(i);
+        data.push((v >> 8) & 0xFF);
+        data.push(v & 0xFF);
+    }
+    return ModbusFrame {
+        slave_address: slave_addr,
+        function_code: MODBUS_FC_WRITE_MULTIPLE_REGS,
+        data: data,
+        crc: 0,
+        is_exception: false,
+    };
+}
+
+// ─── Frame Serialization ───────────────────────────────────────────────
+
+/// Serialize a Modbus RTU frame to bytes (including CRC).
+pub fn modbus_frame_serialize(frame: ModbusFrame) -> Vec {
+    val bytes = Vec::new();
+    bytes.push(frame.slave_address & 0xFF);
+    val fc = frame.function_code;
+    if frame.is_exception {
+        fc = fc | 0x80;
+    }
+    bytes.push(fc & 0xFF);
+    for i in 0..frame.data.len() {
+        bytes.push(frame.data.get(i) & 0xFF);
+    }
+    // Compute and append CRC
+    val crc = modbus_crc16(bytes);
+    bytes.push(crc & 0xFF);
+    bytes.push((crc >> 8) & 0xFF);
+    return bytes;
+}
+
+/// Deserialize bytes into a Modbus RTU frame.
+/// Returns a ModbusFrame. Check is_exception to detect exception responses.
+pub fn modbus_frame_deserialize(bytes: Vec) -> ModbusFrame {
+    if bytes.len() < 4 {
+        return ModbusFrame {
+            slave_address: 0,
+            function_code: 0,
+            data: Vec::new(),
+            crc: 0,
+            is_exception: true,
+        };
+    }
+    val slave = bytes.get(0);
+    val fc_raw = bytes.get(1);
+    val is_exc = (fc_raw & 0x80) != 0;
+    val fc = fc_raw & 0x7F;
+    val data = Vec::new();
+    for i in 2..bytes.len() - 2 {
+        data.push(bytes.get(i));
+    }
+    val crc = bytes.get(bytes.len() - 2) | (bytes.get(bytes.len() - 1) << 8);
+    return ModbusFrame {
+        slave_address: slave,
+        function_code: fc,
+        data: data,
+        crc: crc,
+        is_exception: is_exc,
+    };
+}
+
+// ─── Response Decoding ─────────────────────────────────────────────────
+
+/// Decode register values from a Read Holding Registers response.
+/// Returns a Vec of register values (16-bit each).
+pub fn modbus_decode_registers(frame: ModbusFrame) -> Vec {
+    if frame.is_exception {
+        return Vec::new();
+    }
+    if frame.function_code != MODBUS_FC_READ_HOLDING_REGS {
+        return Vec::new();
+    }
+    if frame.data.len() < 1 {
+        return Vec::new();
+    }
+    val byte_count = frame.data.get(0);
+    val result = Vec::new();
+    val i = 1;
+    while i + 1 < frame.data.len() {
+        val reg = (frame.data.get(i) << 8) | frame.data.get(i + 1);
+        result.push(reg);
+        i = i + 2;
+    }
+    return result;
+}
+
+/// Decode coil status from a Read Coils response.
+/// Returns a Vec of 0/1 values.
+pub fn modbus_decode_coils(frame: ModbusFrame) -> Vec {
+    if frame.is_exception {
+        return Vec::new();
+    }
+    if frame.function_code != MODBUS_FC_READ_COILS {
+        return Vec::new();
+    }
+    if frame.data.len() < 1 {
+        return Vec::new();
+    }
+    val result = Vec::new();
+    val i = 1;
+    while i < frame.data.len() {
+        val byte = frame.data.get(i);
+        for bit in 0..8 {
+            result.push((byte >> bit) & 1);
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Get exception code from an exception response.
+/// Returns -1 if not an exception response.
+pub fn modbus_exception_code(frame: ModbusFrame) -> i64 {
+    if !frame.is_exception {
+        return -1;
+    }
+    if frame.data.len() < 1 {
+        return -1;
+    }
+    return frame.data.get(0);
+}
+
+// ─── Modbus TCP Frame ──────────────────────────────────────────────────
+//
+// Modbus TCP frame format:
+//   [Transaction ID(2)] [Protocol ID(2)=0] [Length(2)] [Unit ID(1)] [PDU...]
+// No CRC (TCP handles error detection).
+
+/// A Modbus TCP frame.
+pub struct ModbusTCPFrame {
+    pub transaction_id: i64,
+    pub unit_id: i64,
+    pub function_code: i64,
+    pub data: Vec,
+}
+
+/// Build a Modbus TCP frame from a function code and data.
+pub fn modbus_tcp_frame(transaction_id: i64, unit_id: i64, fc: i64, data: Vec) -> ModbusTCPFrame {
+    return ModbusTCPFrame {
+        transaction_id: transaction_id,
+        unit_id: unit_id,
+        function_code: fc,
+        data: data,
+    };
+}
+
+/// Serialize a Modbus TCP frame to bytes.
+pub fn modbus_tcp_serialize(frame: ModbusTCPFrame) -> Vec {
+    val bytes = Vec::new();
+    val length = frame.data.len() + 2;  // Unit ID + FC + data
+    bytes.push((frame.transaction_id >> 8) & 0xFF);
+    bytes.push(frame.transaction_id & 0xFF);
+    bytes.push(0);  // Protocol ID high
+    bytes.push(0);  // Protocol ID low
+    bytes.push((length >> 8) & 0xFF);
+    bytes.push(length & 0xFF);
+    bytes.push(frame.unit_id & 0xFF);
+    bytes.push(frame.function_code & 0xFF);
+    for i in 0..frame.data.len() {
+        bytes.push(frame.data.get(i) & 0xFF);
+    }
+    return bytes;
+}
+
+/// Deserialize bytes into a Modbus TCP frame.
+pub fn modbus_tcp_deserialize(bytes: Vec) -> ModbusTCPFrame {
+    if bytes.len() < 8 {
+        return ModbusTCPFrame {
+            transaction_id: 0,
+            unit_id: 0,
+            function_code: 0,
+            data: Vec::new(),
+        };
+    }
+    val trans_id = (bytes.get(0) << 8) | bytes.get(1);
+    val unit_id = bytes.get(6);
+    val fc = bytes.get(7);
+    val data = Vec::new();
+    for i in 8..bytes.len() {
+        data.push(bytes.get(i));
+    }
+    return ModbusTCPFrame {
+        transaction_id: trans_id,
+        unit_id: unit_id,
+        function_code: fc,
+        data: data,
+    };
+}

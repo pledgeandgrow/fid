@@ -378,13 +378,13 @@ impl HalFramework {
                     reg.name, reg.description, reg.offset, reg.width, access_fn
                 ));
                 code.push_str(&format!(
-                    "pf {}_{}_read() -> u{} !Read {{\n    ret p_phys_read{}(0x{:08X});\n}}\n",
+                    "fn {}_{}_read() -> u{} !Read {{\n    return p_phys_read{}(0x{:08X});\n}}\n",
                     device.name, reg.name, reg.width, reg.width, addr
                 ));
 
                 if !matches!(reg.access, RegisterAccess::ReadOnly) {
                     code.push_str(&format!(
-                        "pf {}_{}_write(val: u{}) -> void !Write {{\n    p_phys_write{}(0x{:08X}, val);\n}}\n",
+                        "fn {}_{}_write(val: u{}) -> void !Write {{\n    p_phys_write{}(0x{:08X}, val);\n}}\n",
                         device.name, reg.name, reg.width, reg.width, addr
                     ));
                 }

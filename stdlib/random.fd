@@ -1,0 +1,138 @@
+// Fides Random standard library
+//
+// Pseudo-random number generation using a pure-Fides LCG (Linear Congruential Generator).
+// Not cryptographically secure — use crypto.fd for security-sensitive randomness.
+//
+// Usage:
+//   use random;
+//   random_seed(42);
+//   println(random_int(100));     // random int in [0, 100)
+//   println(random_float());      // random float in [0.0, 1.0)
+
+module random;
+
+use core;
+use vec;
+
+// ─── Internal state ─────────────────────────────────────────────────────
+
+/// RNG state holder (LCG seed).
+pub struct RngState {
+    pub state: i64,
+}
+
+/// Global RNG state instance.
+pub const RNG_DEFAULT: RngState = RngState { state: 1 };
+
+// ─── Seeding ────────────────────────────────────────────────────────────
+
+/// Seed the random number generator.
+pub fn random_seed(seed: i64) -> void {
+    if seed == 0 {
+        RNG_DEFAULT.state = 1;
+    } else {
+        RNG_DEFAULT.state = seed;
+    }
+}
+
+/// Seed with current time (non-deterministic).
+/// Note: Requires p_time runtime function. Use random_seed(seed) instead
+/// if p_time is not available in your backend.
+pub fn random_seed_time() -> void {
+    RNG_DEFAULT.state = 12345;  // TODO: use p_time() when available
+}
+
+// ─── Integer generation ─────────────────────────────────────────────────
+
+/// Internal: next raw LCG value (masked to 32 bits to avoid overflow).
+fn next_raw() -> i64 {
+    // LCG: state = (state * 1103515245 + 12345) & 0x7FFFFFFF
+    // Using 32-bit mask to avoid i64 overflow
+    RNG_DEFAULT.state = (RNG_DEFAULT.state * 1103515245 + 12345) & 0x7FFFFFFF;
+    return RNG_DEFAULT.state;
+}
+
+/// Generate a random i64 in [0, RAND_MAX].
+pub fn random_raw() -> i64 {
+    return next_raw();
+}
+
+/// Generate a random i64 in [0, max).
+pub fn random_int(max: i64) -> i64 {
+    if max <= 0 { return 0; }
+    return next_raw() % max;
+}
+
+/// Generate a random i64 in [min, max].
+pub fn random_int_range(min: i64, max: i64) -> i64 {
+    if max < min { return min; }
+    val range = max - min + 1;
+    return min + (next_raw() % range);
+}
+
+// ─── Float generation ───────────────────────────────────────────────────
+
+/// Generate a random f64 in [0.0, 1.0).
+pub fn random_float() -> f64 {
+    return (next_raw() as f64) / 2147483647.0;
+}
+
+/// Generate a random f64 in [0.0, max).
+pub fn random_float_max(max: f64) -> f64 {
+    return random_float() * max;
+}
+
+/// Generate a random f64 in [min, max).
+pub fn random_float_range(min: f64, max: f64) -> f64 {
+    return min + random_float() * (max - min);
+}
+
+// ─── Boolean / choice ───────────────────────────────────────────────────
+
+/// Generate a random boolean.
+pub fn random_bool() -> bool {
+    return (next_raw() & 1) == 1;
+}
+
+/// Pick a random element from a Vec. Returns 0 if empty.
+pub fn random_choice(v: Vec) -> i64 {
+    if v.is_empty() { return 0; }
+    return v.get(random_int(v.len()));
+}
+
+/// Pick a random index from a Vec of the given length.
+pub fn random_choice_idx(len: i64) -> i64 {
+    if len <= 0 { return 0; }
+    return random_int(len);
+}
+
+// ─── Shuffle ────────────────────────────────────────────────────────────
+
+/// Shuffle a Vec in place (Fisher-Yates).
+pub fn random_shuffle(v: Vec) -> void {
+    var i = v.len() - 1;
+    while i > 0 {
+        val j = random_int(i + 1);
+        val tmp = v.get(i);
+        v.set(i, v.get(j));
+        v.set(j, tmp);
+        i = i - 1;
+    }
+}
+
+/// Generate a random byte (0-255).
+pub fn random_byte() -> i64 {
+    return next_raw() & 0xFF;
+}
+
+/// Generate a random hex string of the given length.
+pub fn random_hex(length: i64) -> str {
+    val hex_chars = "0123456789abcdef";
+    val bytes = Vec::new();
+    var i = 0;
+    while i < length {
+        bytes.push(str_byte_at(hex_chars, next_raw() & 0xF));
+        i = i + 1;
+    }
+    return str_from_bytes(bytes);
+}

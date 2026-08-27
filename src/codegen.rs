@@ -245,7 +245,7 @@ impl CodeGen {
     fn gen_epilogue(&mut self) {
         writeln!(self.output, "    add sp, sp, #{}", self.frame_size).unwrap();
         writeln!(self.output, "    ldp x29, x30, [sp], #16").unwrap();
-        writeln!(self.output, "    ret").unwrap();
+        writeln!(self.output, "    return").unwrap();
     }
 
     fn gen_stmt(&mut self, stmt: &Stmt) {

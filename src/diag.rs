@@ -272,7 +272,7 @@ impl Diag {
             let line_str = format!("{}", self.line);
             let line_width = line_str.len();
 
-            // Source line: "  2 | pv x: str = 42;"
+            // Source line: "  2 | val x: str = 42;"
             out.push_str(&format!(
                 "{}{} |{} {}\n",
                 dim, " ".repeat(line_width), reset, self.source_line,
@@ -431,14 +431,14 @@ mod tests {
     fn test_diag_render_no_color() {
         set_color(false);
         let d = Diag::error(ErrCode::TypeMismatch, "cannot assign i64 to str", "test.fd", 2, 15)
-            .with_source("    pv x: str = 42;")
+            .with_source("    val x: str = 42;")
             .with_span(2)
             .with_help("change the type annotation or the expression");
         let rendered = d.render();
         assert!(rendered.contains("error[E044]"));
         assert!(rendered.contains("cannot assign i64 to str"));
         assert!(rendered.contains("--> test.fd:2:15"));
-        assert!(rendered.contains("pv x: str = 42;"));
+        assert!(rendered.contains("val x: str = 42;"));
         assert!(rendered.contains("^^"));
         assert!(rendered.contains("help:"));
     }

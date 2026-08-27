@@ -285,6 +285,9 @@ impl fmt::Display for IrType {
 /// - **Net**: performs network I/O (connect, send, recv)
 /// - **Spawn**: spawns threads or processes
 /// - **Diverge**: may not return (infinite loop, panic, abort)
+/// - **Diff**: differentiable operation (supports autodiff gradient computation)
+/// - **Noise**: adds noise to data (differential privacy, dropout, etc.)
+/// - **Comm**: cross-device communication (tensor parallelism, all-reduce)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Effect {
     /// Allocates memory (heap or stack)
@@ -301,6 +304,14 @@ pub enum Effect {
     Read,
     /// Writes to memory
     Write,
+    /// Differentiable operation (supports autodiff — matmul, relu, etc.)
+    Diff,
+    /// Adds noise to data (differential privacy, dropout, data augmentation)
+    /// ML12: @dp functions must have this effect to prove noise was added.
+    Noise,
+    /// Cross-device communication (tensor parallelism, all-reduce, broadcast)
+    /// ML13: @shard functions use this for cross-rank ops.
+    Comm,
 }
 
 impl fmt::Display for Effect {
@@ -313,6 +324,9 @@ impl fmt::Display for Effect {
             Effect::Diverge => write!(f, "diverge"),
             Effect::Read => write!(f, "read"),
             Effect::Write => write!(f, "write"),
+            Effect::Diff => write!(f, "diff"),
+            Effect::Noise => write!(f, "noise"),
+            Effect::Comm => write!(f, "comm"),
         }
     }
 }
@@ -679,13 +693,22 @@ pub enum Inst {
     // ─── Region Management (Phase 2A) ───
     /// Begin a named region — allocations inside the region block use this region.
     /// Returns a region handle (as I64) that can be passed to Alloca.
+    /// If is_gpu, allocations go to GPU memory (ML1: region-scoped GPU memory).
+    /// If is_kv_cache, allocations go to bounded KV cache with sliding window (ML9).
     RegionBegin {
         name: String,
+        is_gpu: bool,
+        is_kv_cache: bool,
+        window_size: Option<u64>,
     },
     /// End a named region — all memory allocated in this region is freed.
     /// The region handle is consumed and must not be used after this.
+    /// If is_gpu, GPU memory is freed (ML1).
+    /// If is_kv_cache, KV cache is freed (ML9).
     RegionEnd {
         name: String,
+        is_gpu: bool,
+        is_kv_cache: bool,
     },
 
     // ─── Persist Variables (F2) ───
@@ -980,6 +1003,11 @@ pub struct IrFunction {
     /// Whether this function is @medical — IEC 62304 / DAL-A safety.
     /// Implies @no-alloc + @no-recursion + @crashfree + @requires-audit.
     pub is_medical: bool,
+    /// Whether this function is @kernel (GPU entry point for SPIR-V/PTX codegen).
+    /// ML8: comptime kernel specialization — @kernel functions are GPU entry points.
+    pub is_kernel: bool,
+    /// Workgroup size from @kernel annotation: [x, y, z]. Default: [1, 1, 1].
+    pub workgroup_size: [u32; 3],
 }
 
 impl IrFunction {
@@ -1004,6 +1032,8 @@ impl IrFunction {
             gas_limit: None,
             is_no_alloc: false,
             is_medical: false,
+            is_kernel: false,
+            workgroup_size: [1, 1, 1],
         };
         // Create entry block
         func.new_block();
@@ -1395,7 +1425,7 @@ impl IrModule {
             let param_strs: Vec<String> = func.params.iter()
                 .map(|(id, ty)| format!("{}: {}", id, ty))
                 .collect();
-            out.push_str(&format!("pf {}({}) -> {} {}\n",
+            out.push_str(&format!("fn {}({}) -> {} {}\n",
                 name,
                 param_strs.join(", "),
                 func.ret_ty,

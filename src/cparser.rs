@@ -287,7 +287,7 @@ pub fn generate_pledge_bindings(decls: &[ExternDecl], include: &str) -> String {
         } else {
             params.join(", ")
         };
-        out.push_str(&format!("    pf {}({}) -> {};\n", decl.c_name, params_str, ret));
+        out.push_str(&format!("    fn {}({}) -> {};\n", decl.c_name, params_str, ret));
     }
     out.push_str("}\n");
     out

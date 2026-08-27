@@ -1608,6 +1608,10 @@ impl CCodeGen {
                 for &fname in &candidates {
                     let c_fname = self.sanitize_c_name(fname);
                     let param_types = self.fn_param_types.get(fname);
+                    // Check the actual function's return type, not just the
+                    // CallPtr's expected type. This prevents assigning void
+                    // function results to a variable.
+                    let fn_ret = self.fn_ret_types.get(fname).cloned().unwrap_or(ret_ty.clone());
                     // Build call args, casting each to the candidate function's
                     // parameter type.  The first param is always the ctx/env
                     // pointer (void*).
@@ -1655,8 +1659,13 @@ impl CCodeGen {
                             fname
                         ));
                     }
-                    match ret_ty {
+                    match &fn_ret {
                         IrType::Void | IrType::Never => {
+                            dispatch.push_str(&format!("            {};\n", call_expr));
+                        }
+                        ty if Self::is_aggregate_ret(ty) => {
+                            // Aggregate types are returned via output pointer
+                            // in C, so the function returns void.
                             dispatch.push_str(&format!("            {};\n", call_expr));
                         }
                         _ => {
@@ -1840,8 +1849,19 @@ impl CCodeGen {
                     wln!(self, "    {} = 0LL;", dst);
                 }
             }
-            Inst::RegionBegin { .. } | Inst::RegionEnd { .. } => {
-                // Region begin/end — no-op in C backend (C manages its own memory)
+            Inst::RegionBegin { name, is_gpu, .. } => {
+                // Region begin — no-op in C backend for CPU regions.
+                // GPU regions (ML1) emit a marker comment for tooling.
+                if *is_gpu {
+                    wln!(self, "    /* GPU region begin: {} */", name);
+                }
+            }
+            Inst::RegionEnd { name, is_gpu, .. } => {
+                // Region end — no-op in C backend for CPU regions.
+                // GPU regions (ML1) would free GPU memory here.
+                if *is_gpu {
+                    wln!(self, "    /* GPU region end: {} (all GPU memory freed) */", name);
+                }
             }
         }
     }

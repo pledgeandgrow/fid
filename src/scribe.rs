@@ -64,7 +64,7 @@ pub fn extract_docs(source: &str) -> Vec<DocItem> {
         let doc = doc_lines.join("\n");
 
         // Detect item type
-        if line.starts_with("pub pf ") || line.starts_with("pf ") {
+        if line.starts_with("pub fn ") || line.starts_with("fn ") {
             let (item, end) = parse_function(&lines, i, doc);
             if let Some(it) = item {
                 items.push(it);
@@ -88,7 +88,7 @@ pub fn extract_docs(source: &str) -> Vec<DocItem> {
                 items.push(it);
             }
             i = end;
-        } else if line.starts_with("pub pf ") || line.starts_with("pf ") {
+        } else if line.starts_with("pub fn ") || line.starts_with("fn ") {
             // Already handled above
             i += 1;
         } else if line.starts_with("pub const ") || line.starts_with("const ") {
@@ -117,8 +117,8 @@ fn parse_function(lines: &[&str], start: usize, doc: String) -> (Option<DocItem>
     let sig_start = if is_pub { 4 } else { 0 };
     let sig = &line[sig_start..];
 
-    // Extract name: "pf name(" or "pf name<T>("
-    let name = extract_name_after(sig, "pf ");
+    // Extract name: "fn name(" or "fn name<T>("
+    let name = extract_name_after(sig, "fn ");
     if name.is_empty() {
         return (None, start + 1);
     }
@@ -313,8 +313,8 @@ fn parse_impl(lines: &[&str], start: usize, doc: String) -> (Option<DocItem>, us
             else if ch == '}' { brace_depth -= 1; }
         }
 
-        // Detect method: "pub pf name(" or "pf name("
-        if in_body && brace_depth == 1 && (l.starts_with("pub pf ") || l.starts_with("pf ")) {
+        // Detect method: "pub fn name(" or "fn name("
+        if in_body && brace_depth == 1 && (l.starts_with("pub fn ") || l.starts_with("fn ")) {
             method_start = end;
             let method_doc_str = method_doc.join("\n");
             method_doc.clear();

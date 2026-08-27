@@ -1,0 +1,373 @@
+// Fides Collections standard library
+//
+// Additional data structures: Deque (double-ended queue) and LinkedList.
+// Built on top of Vec for simplicity.
+//
+// Usage:
+//   use collections;
+//   value d = Deque::new();
+//   d.push_front(1);
+//   d.push_back(2);
+//   println(d.pop_front());  // 1
+//   println(d.pop_back());   // 2
+
+module collections;
+
+use core;
+use vec;
+
+// ─── Deque (Double-Ended Queue) ─────────────────────────────────────────
+
+/// A double-ended queue. Supports O(1) push/pop at both ends (amortized).
+/// Uses a Vec with head/tail indices and periodic compaction.
+pub struct Deque<T> {
+    pub data: Vec,
+    pub head: i64,
+}
+
+impl Deque {
+    /// Create a new empty deque.
+    pub fn new() -> Deque {
+        return Deque { data: Vec::new(), head: 0 };
+    }
+
+    /// Add a value to the front.
+    pub fn push_front(self: Deque, value: i64) -> void {
+        if self.head == 0 {
+            // Need to make room at the front
+            self.compact_and_prepend(value);
+        } else {
+            self.head = self.head - 1;
+            self.data.set(self.head, value);
+        }
+    }
+
+    /// Add a value to the back.
+    pub fn push_back(self: Deque, value: i64) -> void {
+        self.data.push(value);
+    }
+
+    /// Remove and return the front value. Returns 0 if empty.
+    pub fn pop_front(self: Deque) -> i64 {
+        if self.head >= self.data.len() { return 0; }
+        val value = self.data.get(self.head);
+        self.head = self.head + 1;
+        if self.head > 32 && self.head * 2 >= self.data.len() {
+            self.compact();
+        }
+        return value;
+    }
+
+    /// Remove and return the back value. Returns 0 if empty.
+    pub fn pop_back(self: Deque) -> i64 {
+        if self.head >= self.data.len() { return 0; }
+        return self.data.pop();
+    }
+
+    /// Peek at the front value without removing it. Returns 0 if empty.
+    pub fn peek_front(self: Deque) -> i64 {
+        if self.head >= self.data.len() { return 0; }
+        return self.data.get(self.head);
+    }
+
+    /// Peek at the back value without removing it. Returns 0 if empty.
+    pub fn peek_back(self: Deque) -> i64 {
+        if self.head >= self.data.len() { return 0; }
+        return self.data.last();
+    }
+
+    /// Check if the deque is empty.
+    pub fn is_empty(self: Deque) -> bool {
+        return self.head >= self.data.len();
+    }
+
+    /// Get the number of elements.
+    pub fn len(self: Deque) -> i64 {
+        val n = self.data.len() - self.head;
+        if n < 0 { return 0; }
+        return n;
+    }
+
+    /// Clear all elements.
+    pub fn clear(self: Deque) -> void {
+        self.data.clear();
+        self.head = 0;
+    }
+
+    /// Get element at index (0 = front).
+    pub fn get(self: Deque, idx: i64) -> i64 {
+        val real_idx = self.head + idx;
+        if real_idx < 0 || real_idx >= self.data.len() { return 0; }
+        return self.data.get(real_idx);
+    }
+
+    /// Compact internal storage.
+    fn compact(self: Deque) -> void {
+        // Shift elements to the front
+        val i = self.head;
+        var j = 0;
+        while i < self.data.len() {
+            self.data.set(j, self.data.get(i));
+            i = i + 1;
+            j = j + 1;
+        }
+        while self.data.len() > j {
+            self.data.pop();
+        }
+        self.head = 0;
+    }
+
+    /// Compact and prepend a value (make room at front).
+    fn compact_and_prepend(self: Deque, value: i64) -> void {
+        // Shift elements right by 1 to make room at front
+        val old_len = self.data.len();
+        val shift_count = old_len - self.head;
+        // Push a placeholder to grow the Vec
+        self.data.push(0);
+        // Shift elements right from the end
+        var i = old_len;
+        while i > self.head {
+            self.data.set(i, self.data.get(i - 1));
+            i = i - 1;
+        }
+        self.data.set(self.head, value);
+        self.head = 0;
+    }
+}
+
+// ─── Linked List (singly linked, using parallel arrays) ────────────────
+
+/// A singly linked list using parallel arrays for values and next pointers.
+pub struct LinkedList {
+    pub values: Vec,    // value of each node
+    pub nexts: Vec,     // next index of each node (-1 if none)
+    pub head: i64,      // index of head node, -1 if empty
+    pub tail: i64,      // index of tail node, -1 if empty
+    pub size: i64,
+}
+
+impl LinkedList {
+    /// Create a new empty linked list.
+    pub fn new() -> LinkedList {
+        return LinkedList { values: Vec::new(), nexts: Vec::new(), head: -1, tail: -1, size: 0 };
+    }
+
+    /// Add a value to the end of the list.
+    pub fn push_back(self: LinkedList, value: i64) -> void {
+        val idx = self.values.len();
+        self.values.push(value);
+        self.nexts.push(-1);
+        if self.tail >= 0 {
+            // Update old tail's next
+            self.nexts.set(self.tail, idx);
+        } else {
+            self.head = idx;
+        }
+        self.tail = idx;
+        self.size = self.size + 1;
+    }
+
+    /// Add a value to the front of the list.
+    pub fn push_front(self: LinkedList, value: i64) -> void {
+        val idx = self.values.len();
+        self.values.push(value);
+        self.nexts.push(self.head);
+        self.head = idx;
+        if self.tail < 0 {
+            self.tail = idx;
+        }
+        self.size = self.size + 1;
+    }
+
+    /// Remove and return the front value. Returns 0 if empty.
+    pub fn pop_front(self: LinkedList) -> i64 {
+        if self.head < 0 { return 0; }
+        val value = self.values.get(self.head);
+        self.head = self.nexts.get(self.head);
+        if self.head < 0 {
+            self.tail = -1;
+        }
+        self.size = self.size - 1;
+        return value;
+    }
+
+    /// Peek at the front value. Returns 0 if empty.
+    pub fn peek_front(self: LinkedList) -> i64 {
+        if self.head < 0 { return 0; }
+        return self.values.get(self.head);
+    }
+
+    /// Check if the list is empty.
+    pub fn is_empty(self: LinkedList) -> bool {
+        return self.head < 0;
+    }
+
+    /// Get the number of elements.
+    pub fn len(self: LinkedList) -> i64 {
+        return self.size;
+    }
+
+    /// Get the value at a given index (O(n)).
+    pub fn get(self: LinkedList, idx: i64) -> i64 {
+        var i = 0;
+        var current = self.head;
+        while current >= 0 && i < idx {
+            current = self.nexts.get(current);
+            i = i + 1;
+        }
+        if current < 0 { return 0; }
+        return self.values.get(current);
+    }
+
+    /// Convert to a Vec.
+    pub fn to_vec(self: LinkedList) -> Vec {
+        val result = Vec::new();
+        var current = self.head;
+        while current >= 0 {
+            result.push(self.values.get(current));
+            current = self.nexts.get(current);
+        }
+        return result;
+    }
+
+    /// Create a linked list from a Vec.
+    pub fn from_vec(v: Vec) -> LinkedList {
+        val list = LinkedList::new();
+        var i = 0;
+        while i < v.len() {
+            list.push_back(v.get(i));
+            i = i + 1;
+        }
+        return list;
+    }
+
+    /// Find the first index of a value. Returns -1 if not found.
+    pub fn find(self: LinkedList, value: i64) -> i64 {
+        var idx = 0;
+        var current = self.head;
+        while current >= 0 {
+            if self.values.get(current) == value { return idx; }
+            current = self.nexts.get(current);
+            idx = idx + 1;
+        }
+        return -1;
+    }
+
+    /// Check if the list contains a value.
+    pub fn contains(self: LinkedList, value: i64) -> bool {
+        return self.find(value) >= 0;
+    }
+}
+
+// ─── Set (using Vec, simple implementation) ─────────────────────────────
+
+/// A simple set of i64 values backed by a Vec.
+/// Not efficient for large sets — use HashMap for that.
+pub struct Set {
+    pub data: Vec,
+}
+
+impl Set {
+    /// Create a new empty set.
+    pub fn new() -> Set {
+        return Set { data: Vec::new() };
+    }
+
+    /// Insert a value into the set (no-op if already present).
+    pub fn insert(self: Set, value: i64) -> void {
+        if !self.data.contains(value) {
+            self.data.push(value);
+        }
+    }
+
+    /// Remove a value from the set. Returns true if it was present.
+    pub fn remove(self: Set, value: i64) -> bool {
+        var i = 0;
+        while i < self.data.len() {
+            if self.data.get(i) == value {
+                self.data.remove(i);
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// Check if the set contains a value.
+    pub fn contains(self: Set, value: i64) -> bool {
+        return self.data.contains(value);
+    }
+
+    /// Get the number of elements.
+    pub fn len(self: Set) -> i64 {
+        return self.data.len();
+    }
+
+    /// Check if the set is empty.
+    pub fn is_empty(self: Set) -> bool {
+        return self.data.is_empty();
+    }
+
+    /// Clear the set.
+    pub fn clear(self: Set) -> void {
+        self.data.clear();
+    }
+
+    /// Convert to a Vec.
+    pub fn to_vec(self: Set) -> Vec {
+        return self.data;
+    }
+
+    /// Create a set from a Vec.
+    pub fn from_vec(v: Vec) -> Set {
+        val s = Set::new();
+        var i = 0;
+        while i < v.len() {
+            s.insert(v.get(i));
+            i = i + 1;
+        }
+        return s;
+    }
+
+    /// Union: returns a new set with elements from both sets.
+    pub fn union(a: Set, b: Set) -> Set {
+        val result = Set::new();
+        var i = 0;
+        while i < a.data.len() {
+            result.insert(a.data.get(i));
+            i = i + 1;
+        }
+        var j = 0;
+        while j < b.data.len() {
+            result.insert(b.data.get(j));
+            j = j + 1;
+        }
+        return result;
+    }
+
+    /// Intersection: returns a new set with elements in both sets.
+    pub fn intersection(a: Set, b: Set) -> Set {
+        val result = Set::new();
+        var i = 0;
+        while i < a.data.len() {
+            if b.contains(a.data.get(i)) {
+                result.insert(a.data.get(i));
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    /// Difference: returns a new set with elements in a but not in b.
+    pub fn difference(a: Set, b: Set) -> Set {
+        val result = Set::new();
+        var i = 0;
+        while i < a.data.len() {
+            if !b.contains(a.data.get(i)) {
+                result.insert(a.data.get(i));
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+}

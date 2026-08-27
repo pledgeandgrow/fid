@@ -801,6 +801,8 @@ mod tests {
             entry: BlockId(0),
             frame_size: 0,
             next_vreg: 100,
+            is_kernel: false,
+            workgroup_size: [1, 1, 1],
         }
     }
 
@@ -966,6 +968,8 @@ mod tests {
             entry: BlockId(0),
             frame_size: 0,
             next_vreg: 10,
+            is_kernel: false,
+            workgroup_size: [1, 1, 1],
         };
         let alloc = allocate(&func, &HashSet::new(), &HashSet::new());
         assert_eq!(alloc.reg(vreg(0)), Some(PhysReg::Rdi));
@@ -994,6 +998,8 @@ mod tests {
             entry: BlockId(0),
             frame_size: 0,
             next_vreg: 20,
+            is_kernel: false,
+            workgroup_size: [1, 1, 1],
         };
         let alloc = allocate(&func, &HashSet::new(), &HashSet::new());
         // First 6 in registers

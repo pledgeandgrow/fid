@@ -1,0 +1,600 @@
+// Fides CAN Bus standard library
+//
+// CAN (Controller Area Network) frame encoding/decoding for automotive
+// and industrial applications. Implements ISO 11898 (CAN 2.0A/B) frame
+// format, J1939 protocol identifiers, and UDS/OBD-II diagnostic service
+// handlers.
+//
+// This is a protocol library — no compiler magic needed. The compiler's
+// @autosar safety annotation (F52) ensures the functions that use this
+// module are allocation-free, recursion-free, and crash-free.
+//
+// Usage:
+//   use can
+//   fn main() {
+//       val frame = can_frame_standard(0x123, [0x01, 0x02, 0x03, 0x04]);
+//       val id = can_frame_id(frame);
+//       val data = can_frame_data(frame);
+//   }
+//
+// For UDS diagnostics:
+//   use can
+//   fn handle_diagnostic(frame: CanFrame) -> CanFrame {
+//       val service = uds_service_id(frame);
+//       if service == UDS_SERVICE_TESTER_PRESENT {
+//           return uds_response_positive(frame, []);
+//       }
+//       return uds_response_negative(frame, UDS_NRC_SERVICE_NOT_SUPPORTED);
+//   }
+
+module can;
+
+// ─── CAN Frame Types ───────────────────────────────────────────────────
+//
+// CAN frames are represented as structs. The data field is a Vec of bytes
+// (0-255). Standard frames use 11-bit IDs (0x000-0x7FF). Extended frames
+// use 29-bit IDs (0x00000000-0x1FFFFFFF).
+
+/// A CAN frame (standard or extended, data or remote).
+/// Layout: [id: i64, dlc: i64, is_extended: bool, is_remote: bool, data: Vec]
+pub struct CanFrame {
+    id: i64,
+    dlc: i64,
+    is_extended: bool,
+    is_remote: bool,
+    data: Vec,
+}
+
+// ─── CAN Frame Construction ────────────────────────────────────────────
+
+/// Create a standard (11-bit ID) data frame.
+/// ID must be in range 0x000-0x7FF. DLC is the data length code (0-8).
+pub fn can_frame_standard(id: i64, data: Vec) -> CanFrame {
+    return CanFrame {
+        id: id,
+        dlc: data.len(),
+        is_extended: false,
+        is_remote: false,
+        data: data,
+    };
+}
+
+/// Create an extended (29-bit ID) data frame.
+/// ID must be in range 0x00000000-0x1FFFFFFF.
+pub fn can_frame_extended(id: i64, data: Vec) -> CanFrame {
+    return CanFrame {
+        id: id,
+        dlc: data.len(),
+        is_extended: true,
+        is_remote: false,
+        data: data,
+    };
+}
+
+/// Create a standard remote frame (request for data, no payload).
+pub fn can_frame_remote_standard(id: i64, dlc: i64) -> CanFrame {
+    return CanFrame {
+        id: id,
+        dlc: dlc,
+        is_extended: false,
+        is_remote: true,
+        data: Vec::new(),
+    };
+}
+
+/// Create an extended remote frame.
+pub fn can_frame_remote_extended(id: i64, dlc: i64) -> CanFrame {
+    return CanFrame {
+        id: id,
+        dlc: dlc,
+        is_extended: true,
+        is_remote: true,
+        data: Vec::new(),
+    };
+}
+
+// ─── CAN Frame Accessors ───────────────────────────────────────────────
+
+/// Get the CAN ID (11 or 29 bit).
+pub fn can_frame_id(frame: CanFrame) -> i64 {
+    return frame.id;
+}
+
+/// Get the data length code (0-8 for classic CAN, 0-64 for CAN FD).
+pub fn can_frame_dlc(frame: CanFrame) -> i64 {
+    return frame.dlc;
+}
+
+/// Check if the frame uses an extended (29-bit) ID.
+pub fn can_frame_is_extended(frame: CanFrame) -> bool {
+    return frame.is_extended;
+}
+
+/// Check if the frame is a remote frame (no data payload).
+pub fn can_frame_is_remote(frame: CanFrame) -> bool {
+    return frame.is_remote;
+}
+
+/// Get the data payload as a Vec of bytes.
+pub fn can_frame_data(frame: CanFrame) -> Vec {
+    return frame.data;
+}
+
+/// Get a single byte from the frame data at the given index.
+/// Returns -1 if index is out of bounds.
+pub fn can_frame_byte(frame: CanFrame, index: i64) -> i64 {
+    if index < 0 || index >= frame.dlc {
+        return -1;
+    }
+    return frame.data.get(index);
+}
+
+// ─── CAN ID Validation ─────────────────────────────────────────────────
+
+/// Validate a standard CAN ID (11-bit, 0x000-0x7FF).
+pub fn can_validate_standard_id(id: i64) -> bool {
+    return id >= 0 && id <= 0x7FF;
+}
+
+/// Validate an extended CAN ID (29-bit, 0x00000000-0x1FFFFFFF).
+pub fn can_validate_extended_id(id: i64) -> bool {
+    return id >= 0 && id <= 0x1FFFFFFF;
+}
+
+/// Validate a DLC value (0-8 for classic CAN).
+pub fn can_validate_dlc(dlc: i64) -> bool {
+    return dlc >= 0 && dlc <= 8;
+}
+
+// ─── J1939 Protocol Identifiers ────────────────────────────────────────
+//
+// J1939 uses 29-bit extended CAN IDs with a structured format:
+//   Priority (3 bits) | Reserved (1) | Data Page (1) | PDU Format (8)
+//   | PDU Specific (8) | Source Address (8)
+//
+// PDU Format >= 240: PDU1 (destination-specific), PF is destination
+// PDU Format < 240:  PDU2 (broadcast), PDU Specific is PS (Group Extension)
+
+/// Build a J1939 CAN ID from its components.
+/// priority: 0-7 (0 = highest)
+/// reserved: 0 or 1
+/// data_page: 0 or 1
+/// pdu_format: 0-255
+/// pdu_specific: 0-255
+/// source_addr: 0-255
+pub fn j1939_id(priority: i64, reserved: i64, data_page: i64,
+                pdu_format: i64, pdu_specific: i64, source_addr: i64) -> i64 {
+    val prio = (priority & 0x7) << 26;
+    val res = (reserved & 0x1) << 25;
+    val dp = (data_page & 0x1) << 24;
+    val pf = (pdu_format & 0xFF) << 16;
+    val ps = (pdu_specific & 0xFF) << 8;
+    val sa = source_addr & 0xFF;
+    return prio | res | dp | pf | ps | sa;
+}
+
+/// Extract the priority (0-7) from a J1939 CAN ID.
+pub fn j1939_priority(id: i64) -> i64 {
+    return (id >> 26) & 0x7;
+}
+
+/// Extract the PDU Format (0-255) from a J1939 CAN ID.
+pub fn j1939_pdu_format(id: i64) -> i64 {
+    return (id >> 16) & 0xFF;
+}
+
+/// Extract the PDU Specific (destination or group extension) from a J1939 CAN ID.
+pub fn j1939_pdu_specific(id: i64) -> i64 {
+    return (id >> 8) & 0xFF;
+}
+
+/// Extract the Source Address (0-255) from a J1939 CAN ID.
+pub fn j1939_source_addr(id: i64) -> i64 {
+    return id & 0xFF;
+}
+
+/// Check if a J1939 frame is PDU1 (destination-specific, PF >= 240).
+pub fn j1939_is_pdu1(id: i64) -> bool {
+    return j1939_pdu_format(id) >= 240;
+}
+
+/// Check if a J1939 frame is PDU2 (broadcast, PF < 240).
+pub fn j1939_is_pdu2(id: i64) -> bool {
+    return j1939_pdu_format(id) < 240;
+}
+
+/// Extract the PGN (Parameter Group Number) from a J1939 CAN ID.
+/// For PDU1 (PF >= 240): PGN = (DP << 16) | (PF << 8) | 0
+/// For PDU2 (PF < 240):  PGN = (DP << 16) | (PF << 8) | PS
+pub fn j1939_pgn(id: i64) -> i64 {
+    val dp = (id >> 24) & 0x1;
+    val pf = (id >> 16) & 0xFF;
+    val ps = (id >> 8) & 0xFF;
+    if pf >= 240 {
+        return (dp << 16) | (pf << 8);
+    }
+    return (dp << 16) | (pf << 8) | ps;
+}
+
+// ─── UDS (Unified Diagnostic Services) — ISO 14229 ─────────────────────
+//
+// UDS uses CAN frames with specific service IDs. The request format is:
+//   [Service ID (1 byte)] [Sub-function (1 byte)] [Data (N bytes)]
+//
+// The response format is:
+//   Positive: [Service ID + 0x40] [Sub-function] [Data]
+//   Negative: [0x7F] [Service ID] [Negative Response Code (NRC)]
+
+/// UDS Service IDs (ISO 14229-1)
+pub const UDS_SERVICE_DIAGNOSTIC_SESSION_CONTROL: i64   = 0x10;
+pub const UDS_SERVICE_ECU_RESET: i64                    = 0x11;
+pub const UDS_SERVICE_CLEAR_DTC: i64                    = 0x14;
+pub const UDS_SERVICE_READ_DTC: i64                     = 0x19;
+pub const UDS_SERVICE_READ_DATA_BY_ID: i64              = 0x22;
+pub const UDS_SERVICE_READ_MEMORY_BY_ADDR: i64          = 0x23;
+pub const UDS_SERVICE_WRITE_DATA_BY_ID: i64             = 0x2E;
+pub const UDS_SERVICE_INPUT_OUTPUT_CONTROL_BY_ID: i64   = 0x2F;
+pub const UDS_SERVICE_ROUTINE_CONTROL: i64              = 0x31;
+pub const UDS_SERVICE_REQUEST_DOWNLOAD: i64             = 0x34;
+pub const UDS_SERVICE_REQUEST_UPLOAD: i64               = 0x35;
+pub const UDS_SERVICE_TRANSFER_DATA: i64                = 0x36;
+pub const UDS_SERVICE_REQUEST_TRANSFER_EXIT: i64        = 0x37;
+pub const UDS_SERVICE_REQUEST_FILE_TRANSFER: i64        = 0x38;
+pub const UDS_SERVICE_TESTER_PRESENT: i64               = 0x3E;
+pub const UDS_SERVICE_ACCESS_TIMING: i64                = 0x83;
+pub const UDS_SERVICE_SECURED_DATA_TRANSMISSION: i64    = 0x84;
+pub const UDS_SERVICE_CONTROL_DTC_SETTING: i64          = 0x85;
+pub const UDS_SERVICE_RESPONSE_ON_EVENT: i64            = 0x86;
+pub const UDS_SERVICE_LINK_CONTROL: i64                 = 0x87;
+pub const UDS_SERVICE_READ_DATA_BY_PERIODIC_ID: i64     = 0x2A;
+pub const UDS_SERVICE_DYNAMICALLY_DEFINE_DATA_ID: i64   = 0x2C;
+pub const UDS_SERVICE_DEFINE_DATA_BY_ID: i64            = 0x2B;
+pub const UDS_SERVICE_WRITE_MEMORY_BY_ADDR: i64         = 0x3D;
+pub const UDS_SERVICE_COMMUNICATION_CONTROL: i64        = 0x28;
+pub const UDS_SERVICE_AUTHENTICATION: i64               = 0x29;
+
+/// UDS Negative Response Codes (NRC)
+pub const UDS_NRC_GENERAL_REJECT: i64                   = 0x10;
+pub const UDS_NRC_SERVICE_NOT_SUPPORTED: i64            = 0x11;
+pub const UDS_NRC_SUB_FUNCTION_NOT_SUPPORTED: i64       = 0x12;
+pub const UDS_NRC_INVALID_FORMAT: i64                   = 0x13;
+pub const UDS_NRC_RESPONSE_TOO_LONG: i64                = 0x14;
+pub const UDS_NRC_BUSY_REPEAT_REQUEST: i64              = 0x21;
+pub const UDS_NRC_CONDITIONS_NOT_CORRECT: i64           = 0x22;
+pub const UDS_NRC_REQUEST_SEQUENCE_ERROR: i64           = 0x24;
+pub const UDS_NRC_REQUEST_OUT_OF_RANGE: i64             = 0x31;
+pub const UDS_NRC_SECURITY_ACCESS_DENIED: i64           = 0x33;
+pub const UDS_NRC_INVALID_KEY: i64                      = 0x35;
+pub const UDS_NRC_EXCEEDED_NUMBER_OF_ATTEMPTS: i64      = 0x36;
+pub const UDS_NRC_REQUIRED_TIME_DELAY_NOT_EXPIRED: i64  = 0x37;
+pub const UDS_NRC_RESPONSE_PENDING: i64                 = 0x78;
+pub const UDS_NRC_SUB_FUNCTION_NOT_SUPPORTED_ACTIVE: i64 = 0x7E;
+pub const UDS_NRC_SERVICE_NOT_SUPPORTED_ACTIVE: i64     = 0x7F;
+
+/// Extract the UDS service ID from a CAN frame's first data byte.
+/// Returns -1 if the frame has no data.
+pub fn uds_service_id(frame: CanFrame) -> i64 {
+    if frame.dlc < 1 {
+        return -1;
+    }
+    return can_frame_byte(frame, 0);
+}
+
+/// Extract the UDS sub-function from a CAN frame's second data byte.
+/// Returns -1 if the frame has fewer than 2 bytes.
+pub fn uds_sub_function(frame: CanFrame) -> i64 {
+    if frame.dlc < 2 {
+        return -1;
+    }
+    return can_frame_byte(frame, 1);
+}
+
+/// Extract UDS data payload (bytes after service ID + sub-function).
+/// Returns a Vec of the remaining bytes.
+pub fn uds_data(frame: CanFrame) -> Vec {
+    if frame.dlc <= 2 {
+        return Vec::new();
+    }
+    val result = Vec::new();
+    for i in 2..frame.dlc {
+        result.push(can_frame_byte(frame, i));
+    }
+    return result;
+}
+
+/// Build a positive UDS response frame.
+/// The response service ID is (request_service_id | 0x40).
+/// Format: [Service ID + 0x40] [Sub-function] [data...]
+pub fn uds_response_positive(request: CanFrame, response_data: Vec) -> CanFrame {
+    val service = uds_service_id(request);
+    val sub_fn = uds_sub_function(request);
+    val data = Vec::new();
+    data.push(service | 0x40);
+    if sub_fn >= 0 {
+        data.push(sub_fn);
+    }
+    for i in 0..response_data.len() {
+        data.push(response_data.get(i));
+    }
+    return can_frame_standard(request.id, data);
+}
+
+/// Build a negative UDS response frame.
+/// Format: [0x7F] [Service ID] [NRC]
+pub fn uds_response_negative(request: CanFrame, nrc: i64) -> CanFrame {
+    val service = uds_service_id(request);
+    val data = Vec::new();
+    data.push(0x7F);
+    data.push(service);
+    data.push(nrc);
+    return can_frame_standard(request.id, data);
+}
+
+/// Check if a CAN frame is a UDS positive response.
+pub fn uds_is_positive_response(frame: CanFrame) -> bool {
+    val first = can_frame_byte(frame, 0);
+    return first >= 0x50 && first <= 0xEF;
+}
+
+/// Check if a CAN frame is a UDS negative response.
+pub fn uds_is_negative_response(frame: CanFrame) -> bool {
+    return can_frame_byte(frame, 0) == 0x7F;
+}
+
+/// Extract the NRC from a negative response frame.
+/// Returns -1 if the frame is not a negative response.
+pub fn uds_nrc(frame: CanFrame) -> i64 {
+    if !uds_is_negative_response(frame) {
+        return -1;
+    }
+    if frame.dlc < 3 {
+        return -1;
+    }
+    return can_frame_byte(frame, 2);
+}
+
+// ─── OBD-II Diagnostic Trouble Codes (DTCs) ────────────────────────────
+//
+// DTCs are 2-byte codes encoded as:
+//   [Byte 1: P-C-C-C-C] [Byte 2: C-C-C-C-C-C-C-C]
+// where P = powertrain code character, C = code digit.
+//
+// P = 00, C = 01, B = 10, U = 11 (top 2 bits of byte 1)
+
+/// DTC system prefixes
+pub const DTC_SYSTEM_POWERTRAIN: i64 = 0;
+pub const DTC_SYSTEM_CHASSIS: i64    = 1;
+pub const DTC_SYSTEM_BODY: i64       = 2;
+pub const DTC_SYSTEM_NETWORK: i64    = 3;
+
+/// Encode a DTC from system (0-3) and code digits (3 hex digits as i64).
+/// Returns a 2-byte packed i64: [system << 14 | code]
+pub fn dtc_encode(system: i64, code: i64) -> i64 {
+    return ((system & 0x3) << 14) | (code & 0x3FFF);
+}
+
+/// Decode the system prefix (0=Powertrain, 1=Chassis, 2=Body, 3=Network).
+pub fn dtc_system(dtc: i64) -> i64 {
+    return (dtc >> 14) & 0x3;
+}
+
+/// Decode the DTC code digits (14-bit).
+pub fn dtc_code(dtc: i64) -> i64 {
+    return dtc & 0x3FFF;
+}
+
+/// Get the DTC system as a character: 'P', 'C', 'B', 'U'.
+pub fn dtc_system_char(dtc: i64) -> str {
+    val sys = dtc_system(dtc);
+    if sys == DTC_SYSTEM_POWERTRAIN { return "P"; }
+    if sys == DTC_SYSTEM_CHASSIS    { return "C"; }
+    if sys == DTC_SYSTEM_BODY       { return "B"; }
+    return "U";
+}
+
+// ─── OBD-II Mode 03 / 04 (Read/Clear DTCs) ─────────────────────────────
+
+/// OBD-II Mode 03: Read DTCs. Build a request frame.
+pub fn obd_read_dtcs() -> CanFrame {
+    val data = Vec::new();
+    data.push(0x03);
+    return can_frame_standard(0x7DF, data);
+}
+
+/// OBD-II Mode 04: Clear DTCs. Build a request frame.
+pub fn obd_clear_dtcs() -> CanFrame {
+    val data = Vec::new();
+    data.push(0x04);
+    return can_frame_standard(0x7DF, data);
+}
+
+/// OBD-II Mode 01 PID 00: Supported PIDs 01-20.
+pub fn obd_supported_pids() -> CanFrame {
+    val data = Vec::new();
+    data.push(0x01);
+    data.push(0x00);
+    return can_frame_standard(0x7DF, data);
+}
+
+/// OBD-II Mode 01 PID 0C: Engine RPM.
+/// Response: [0x41, 0x0C, RPM_High, RPM_Low] where RPM = ((A*256)+B)/4
+pub fn obd_engine_rpm_request() -> CanFrame {
+    val data = Vec::new();
+    data.push(0x01);
+    data.push(0x0C);
+    return can_frame_standard(0x7DF, data);
+}
+
+/// Decode engine RPM from an OBD-II Mode 01 PID 0C response.
+/// Returns RPM as i64, or -1 if the frame is invalid.
+pub fn obd_decode_engine_rpm(frame: CanFrame) -> i64 {
+    if frame.dlc < 4 { return -1; }
+    if can_frame_byte(frame, 0) != 0x41 { return -1; }
+    if can_frame_byte(frame, 1) != 0x0C { return -1; }
+    val a = can_frame_byte(frame, 2);
+    val b = can_frame_byte(frame, 3);
+    return ((a * 256) + b) / 4;
+}
+
+/// OBD-II Mode 01 PID 0D: Vehicle Speed (km/h).
+pub fn obd_vehicle_speed_request() -> CanFrame {
+    val data = Vec::new();
+    data.push(0x01);
+    data.push(0x0D);
+    return can_frame_standard(0x7DF, data);
+}
+
+/// Decode vehicle speed from an OBD-II Mode 01 PID 0D response.
+/// Returns speed in km/h, or -1 if the frame is invalid.
+pub fn obd_decode_vehicle_speed(frame: CanFrame) -> i64 {
+    if frame.dlc < 3 { return -1; }
+    if can_frame_byte(frame, 0) != 0x41 { return -1; }
+    if can_frame_byte(frame, 1) != 0x0D { return -1; }
+    return can_frame_byte(frame, 2);
+}
+
+/// OBD-II Mode 01 PID 05: Engine Coolant Temperature (°C).
+/// Response: [0x41, 0x05, Temp] where Temp = A - 40
+pub fn obd_coolant_temp_request() -> CanFrame {
+    val data = Vec::new();
+    data.push(0x01);
+    data.push(0x05);
+    return can_frame_standard(0x7DF, data);
+}
+
+/// Decode coolant temperature from an OBD-II Mode 01 PID 05 response.
+/// Returns temperature in °C, or -1 if the frame is invalid.
+pub fn obd_decode_coolant_temp(frame: CanFrame) -> i64 {
+    if frame.dlc < 3 { return -1; }
+    if can_frame_byte(frame, 0) != 0x41 { return -1; }
+    if can_frame_byte(frame, 1) != 0x05 { return -1; }
+    return can_frame_byte(frame, 2) - 40;
+}
+
+// ─── CAN Bus Functional IDs ────────────────────────────────────────────
+
+/// OBD-II functional broadcast ID (requests to all ECUs).
+pub const OBD_BROADCAST_ID: i64 = 0x7DF;
+
+/// OBD-II ECU response ID base (0x7E8-0x7EF for 8 ECUs).
+pub const OBD_RESPONSE_BASE: i64 = 0x7E8;
+
+/// Build an OBD-II request to a specific ECU (0-7).
+pub fn obd_request_to_ecu(ecu: i64, mode: i64, pid: i64) -> CanFrame {
+    val data = Vec::new();
+    data.push(mode);
+    data.push(pid);
+    return can_frame_standard(OBD_RESPONSE_BASE + ecu, data);
+}
+
+/// Check if a frame is an OBD-II response from a specific ECU.
+pub fn obd_is_response_from_ecu(frame: CanFrame, ecu: i64) -> bool {
+    return frame.id == OBD_RESPONSE_BASE + ecu;
+}
+
+/// Check if a frame is an OBD-II response from any ECU.
+pub fn obd_is_response(frame: CanFrame) -> bool {
+    return frame.id >= OBD_RESPONSE_BASE && frame.id <= 0x7EF;
+}
+
+// ─── Diagnostic Session Control (UDS 0x10) ─────────────────────────────
+
+/// UDS Session Types
+pub const UDS_SESSION_DEFAULT: i64       = 0x01;
+pub const UDS_SESSION_PROGRAMMING: i64   = 0x02;
+pub const UDS_SESSION_EXTENDED: i64      = 0x03;
+pub const UDS_SESSION_SAFETY: i64        = 0x04;
+pub const UDS_SESSION_PROTECTION: i64    = 0x05;
+
+/// Build a UDS Diagnostic Session Control request.
+pub fn uds_session_control(session: i64) -> CanFrame {
+    val data = Vec::new();
+    data.push(UDS_SERVICE_DIAGNOSTIC_SESSION_CONTROL);
+    data.push(session);
+    return can_frame_standard(0x7E0, data);
+}
+
+// ─── ECU Reset (UDS 0x11) ──────────────────────────────────────────────
+
+/// UDS Reset Types
+pub const UDS_RESET_HARD: i64      = 0x01;
+pub const UDS_RESET_KEY_OFF: i64   = 0x02;
+pub const UDS_RESET_SOFT: i64      = 0x03;
+pub const UDS_RESET_ENABLE_RAPID: i64 = 0x04;
+pub const UDS_RESET_DISABLE_RAPID: i64 = 0x05;
+
+/// Build a UDS ECU Reset request.
+pub fn uds_ecu_reset(reset_type: i64) -> CanFrame {
+    val data = Vec::new();
+    data.push(UDS_SERVICE_ECU_RESET);
+    data.push(reset_type);
+    return can_frame_standard(0x7E0, data);
+}
+
+// ─── Security Access (UDS 0x27) ────────────────────────────────────────
+
+/// Build a UDS Security Access - Request Seed frame.
+pub fn uds_security_access_request_seed(level: i64) -> CanFrame {
+    val data = Vec::new();
+    data.push(0x27);
+    data.push(level);
+    return can_frame_standard(0x7E0, data);
+}
+
+/// Build a UDS Security Access - Send Key frame.
+pub fn uds_security_access_send_key(level: i64, key: Vec) -> CanFrame {
+    val data = Vec::new();
+    data.push(0x27);
+    data.push(level + 1);
+    for i in 0..key.len() {
+        data.push(key.get(i));
+    }
+    return can_frame_standard(0x7E0, data);
+}
+
+// ─── Read Data By Identifier (UDS 0x22) ────────────────────────────────
+
+/// Build a UDS Read Data By Identifier request.
+/// did: 16-bit Data Identifier (0x0000-0xFFFF)
+pub fn uds_read_data_by_id(did: i64) -> CanFrame {
+    val data = Vec::new();
+    data.push(UDS_SERVICE_READ_DATA_BY_ID);
+    data.push((did >> 8) & 0xFF);
+    data.push(did & 0xFF);
+    return can_frame_standard(0x7E0, data);
+}
+
+/// Common UDS Data Identifiers
+pub const UDS_DID_VIN: i64                       = 0xF190;
+pub const UDS_DID_ECU_SERIAL_NUMBER: i64         = 0xF18C;
+pub const UDS_DID_ECU_MANUFACTURE_DATE: i64      = 0xF18B;
+pub const UDS_DID_ECU_SOFTWARE_VERSION: i64      = 0xF191;
+pub const UDS_DID_ECU_HARDWARE_VERSION: i64      = 0xF192;
+pub const UDS_DID_BOOT_SOFTWARE_IDENTIFICATION: i64 = 0xF195;
+
+// ─── Frame Printing (debug) ────────────────────────────────────────────
+
+/// Print a CAN frame in a human-readable format.
+/// Format: "CAN [STD|EXT] ID:0xXXX DLC:N [DATA]"
+pub fn can_frame_print(frame: CanFrame) -> void {
+    if frame.is_extended {
+        print("CAN EXT ID:0x");
+    } else {
+        print("CAN STD ID:0x");
+    }
+    print(frame.id);
+    print(" DLC:");
+    print(frame.dlc);
+    if frame.is_remote {
+        print(" [REMOTE]");
+    } else {
+        print(" [");
+        for i in 0..frame.dlc {
+            if i > 0 { print(" "); }
+            val byte = can_frame_byte(frame, i);
+            print(byte);
+        }
+        print("]");
+    }
+    print("\n");
+}

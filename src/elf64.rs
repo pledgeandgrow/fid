@@ -2396,7 +2396,7 @@ mod tests {
         let elf = emit_object_file(&crate::pir::L3Module::default(), asm).unwrap();
         // The .text section starts right after the 64-byte ELF header.
         // The first byte of .text should be 0xc3 (ret).
-        assert_eq!(elf[64], 0xc3, "first .text byte should be ret (0xc3)");
+        assert_eq!(elf[64], 0xc3, "first .text byte should be return (0xc3)");
     }
 
     #[test]

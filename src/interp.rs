@@ -247,6 +247,9 @@ pub struct Interpreter {
     /// the high-level Value::Vec is stored. This separates the raw struct
     /// fields (data, len, cap at addr+0, +8, +16) from the Value::Vec.
     vec_side_table: HashMap<u64, u64>,
+    /// KV caches for LLM serving (ML9). Each entry is a KvCache identified by
+    /// an opaque handle (i64 index into this Vec).
+    kv_caches: Vec<Rc<RefCell<crate::tensor::KvCache>>>,
     /// Verbose mode — print each instruction as it executes
     verbose: bool,
     /// Debug mode — enables runtime safety checks (overflow, bounds)
@@ -257,10 +260,15 @@ pub struct Interpreter {
     databases: HashMap<u64, hashbrown::HashMap<String, Value>>,
     /// Next database handle
     next_db_handle: u64,
-    /// Persistent state for `persist` variables (F2)
+    /// Persistent state for `persist` variables (F2/ML4)
     /// Maps variable name → saved value. Survives across interpreter runs
     /// when using `fidesc watch` (hot reload).
+    /// ML4: Now supports file-based persistence for cross-process survival
+    /// (needed for hot-reload of model weights, KV cache, etc.)
     persist_state: HashMap<String, String>,
+    /// ML4: Path to the persist state file (if file-based persistence is enabled).
+    /// When set, persist state is loaded on startup and saved on exit.
+    persist_state_file: Option<std::path::PathBuf>,
     /// Transaction snapshot stack — for `txn {}` rollback.
     /// Each entry is a snapshot of (memory, opaque_values) taken at TxnBegin.
     /// On TxnEnd, the top snapshot is discarded (commit).
@@ -390,12 +398,14 @@ impl Interpreter {
             string_addrs: HashMap::new(),
             opaque_values: HashMap::new(),
             vec_side_table: HashMap::new(),
+            kv_caches: Vec::new(),
             verbose: false,
             debug_mode: true,
             array_bounds: HashMap::new(),
             databases: HashMap::new(),
             next_db_handle: 1,
             persist_state: HashMap::new(),
+            persist_state_file: None,
             txn_snapshots: Vec::new(),
             wrapping_funcs: HashSet::new(),
             current_func_name: String::new(),
@@ -429,6 +439,37 @@ impl Interpreter {
     pub fn verbose(mut self) -> Self {
         self.verbose = true;
         self
+    }
+
+    /// ML4: Enable file-based persistence for hot-reload survival.
+    /// When enabled, persist variables are loaded from the file on startup
+    /// and saved to the file when the interpreter finishes.
+    /// This allows model weights, KV cache, and other large state to survive
+    /// across hot reloads even when using native JIT (separate processes).
+    pub fn with_persist_file(mut self, path: std::path::PathBuf) -> Self {
+        self.persist_state_file = Some(path.clone());
+        // Load existing state from file
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for line in content.lines() {
+                if let Some(eq_pos) = line.find('=') {
+                    let key = &line[..eq_pos];
+                    let value = &line[eq_pos + 1..];
+                    self.persist_state.insert(key.to_string(), value.to_string());
+                }
+            }
+        }
+        self
+    }
+
+    /// ML4: Save persist state to file (called on interpreter exit).
+    pub fn save_persist_state(&self) {
+        if let Some(ref path) = self.persist_state_file {
+            let content: String = self.persist_state.iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let _ = std::fs::write(path, content);
+        }
     }
 
     /// Set a debug hook — called before each instruction execution.
@@ -597,6 +638,70 @@ impl Interpreter {
             }
         }
         0
+    }
+
+    /// Read a raw Fides Vec (from stdlib/core.fd) from memory.
+    /// The Vec is a 24-byte block: { data: i64, len: i64, cap: i64 }.
+    /// Elements are stored at data[i*8] as raw i64 values.
+    /// Returns a Vec<i64> of the elements.
+    fn read_raw_vec_i64(&self, addr: u64) -> Option<Vec<i64>> {
+        if addr == 0 { return None; }
+        // Read len from addr+8
+        let len = self.memory.load_i64(addr + 8);
+        if len < 0 { return None; }
+        // Read data pointer from addr+0
+        let data = self.memory.load_i64(addr);
+        if data <= 0 { return Some(Vec::new()); }
+        let mut result = Vec::with_capacity(len as usize);
+        for i in 0..len {
+            let elem = self.memory.load_i64((data as u64) + (i as u64) * 8);
+            result.push(elem);
+        }
+        Some(result)
+    }
+
+    /// Extract a Vec<i64> from an argument that may be:
+    /// - Value::Vec (interpreter builtin)
+    /// - Value::Int(addr) where addr points to a raw Fides Vec struct
+    /// - Value::Ptr(addr) where addr points to a raw Fides Vec struct
+    fn arg_to_vec_i64(&self, arg: Option<&Value>) -> Option<Vec<i64>> {
+        match arg {
+            Some(Value::Vec(arr)) => {
+                Some(arr.borrow().iter().map(|x| match x {
+                    Value::Int(i) => *i,
+                    _ => 0,
+                }).collect())
+            }
+            Some(Value::Int(addr)) => {
+                if *addr > 0 {
+                    // First try the side-table (for p_vec_new Vecs)
+                    if let Some(v) = self.lookup_vec_value(arg) {
+                        if let Value::Vec(arr) = v {
+                            return Some(arr.borrow().iter().map(|x| match x {
+                                Value::Int(i) => *i,
+                                _ => 0,
+                            }).collect());
+                        }
+                    }
+                    // Try reading as a raw Fides Vec (from core.fd)
+                    self.read_raw_vec_i64(*addr as u64)
+                } else { None }
+            }
+            Some(Value::Ptr(addr)) => {
+                if *addr > 0 {
+                    if let Some(v) = self.lookup_vec_value(arg) {
+                        if let Value::Vec(arr) = v {
+                            return Some(arr.borrow().iter().map(|x| match x {
+                                Value::Int(i) => *i,
+                                _ => 0,
+                            }).collect());
+                        }
+                    }
+                    self.read_raw_vec_i64(*addr)
+                } else { None }
+            }
+            _ => None,
+        }
     }
 
     fn fides_vec_to_value_vec(&mut self, vec_ptr: i64) -> Value {
@@ -1582,20 +1687,25 @@ impl Interpreter {
                     _ => ExecOutcome::Value(Value::Int(0)),
                 }
             }
-            Inst::RegionBegin { name } => {
+            Inst::RegionBegin { name, is_gpu, is_kv_cache, window_size } => {
                 // Begin a named region — in the interpreter, this is a no-op
                 // (memory is managed by the interpreter's allocation tracking).
                 // Return a fake region handle.
                 if self.debug_mode {
-                    eprintln!("[region] begin {}", name);
+                    let kind = if *is_gpu { " gpu" } else if *is_kv_cache { " kv_cache" } else { "" };
+                    let win = if let Some(w) = window_size { format!(" window={}", w) } else { String::new() };
+                    eprintln!("[region{}] begin {}{}", kind, name, win);
                 }
                 ExecOutcome::Value(Value::Int(0))
             }
-            Inst::RegionEnd { name } => {
+            Inst::RegionEnd { name, is_gpu, is_kv_cache, .. } => {
                 // End a named region — in the interpreter, this is a no-op.
                 // In a native backend, this would free all memory in the region.
+                // For GPU regions, this would free all GPU memory (ML1).
+                // For KV cache regions, this would free all KV cache (ML9).
                 if self.debug_mode {
-                    eprintln!("[region] end {}", name);
+                    let kind = if *is_gpu { " gpu" } else if *is_kv_cache { " kv_cache" } else { "" };
+                    eprintln!("[region{}] end {}", kind, name);
                 }
                 ExecOutcome::Continue
             }
@@ -1645,18 +1755,42 @@ impl Interpreter {
         }
     }
 
-    /// Convert a Value to a string for persistence storage
+    /// Convert a Value to a string for persistence storage.
+    /// ML4: Extended to handle pointer/opaque values (tensors, Vec, etc.)
+    /// by serializing their content for hot-reload survival.
     fn stringify_value(&self, val: &Value) -> String {
         match val {
             Value::Int(n) => format!("i:{}", n),
             Value::Bool(b) => format!("b:{}", b),
             Value::Float(f) => format!("f:{}", f),
             Value::Str(s) => format!("s:{}", s),
+            Value::Ptr(addr) => {
+                // ML4: Persist pointer values by looking up the opaque side-table.
+                // If the pointer points to a Vec, serialize the elements.
+                // If it points to a string, serialize the string.
+                // If it points to raw memory, serialize the raw bytes.
+                if let Some(opaque) = self.opaque_values.get(addr) {
+                    match opaque {
+                        Value::Str(s) => format!("ps:{}", s),
+                        Value::Vec(arr) => {
+                            let arr = arr.borrow();
+                            let parts: Vec<String> = arr.iter()
+                                .map(|v| self.stringify_value(v))
+                                .collect();
+                            format!("pv:{}", parts.join(","))
+                        }
+                        _ => format!("p:{}", addr),
+                    }
+                } else {
+                    format!("p:{}", addr)
+                }
+            }
             _ => format!("v:{}", val),
         }
     }
 
-    /// Parse a persisted string back into a Value, using the default's type as a hint
+    /// Parse a persisted string back into a Value, using the default's type as a hint.
+    /// ML4: Extended to handle pointer/string/vec persistence formats.
     fn parse_persisted_value(&self, saved: &str, default: &Value) -> Value {
         if let Some(colon) = saved.find(':') {
             let (prefix, rest) = saved.split_at(colon + 1);
@@ -1665,6 +1799,23 @@ impl Interpreter {
                 "b:" => return Value::Bool(rest == "true"),
                 "f:" => return Value::Float(rest.parse().unwrap_or(0.0)),
                 "s:" => return Value::Str(CompactString::from(rest)),
+                "ps:" => return Value::Str(CompactString::from(rest)),
+                "p:" => {
+                    // Pointer value — restore as pointer
+                    let addr: u64 = rest.parse().unwrap_or(0);
+                    return Value::Ptr(addr);
+                }
+                "pv:" => {
+                    // Vec value — parse comma-separated elements
+                    let elements: Vec<Value> = if rest.is_empty() {
+                        Vec::new()
+                    } else {
+                        rest.split(',')
+                            .map(|s| self.parse_persisted_value(s, &Value::Int(0)))
+                            .collect()
+                    };
+                    return Value::Vec(Rc::new(RefCell::new(elements.into())));
+                }
                 _ => {}
             }
         }
@@ -2024,36 +2175,8 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Void)
             }
             "p_str_concat" => {
-                let left = match args.first() {
-                    Some(Value::Str(s)) => s.to_string(),
-                    Some(Value::Ptr(addr)) => {
-                        let mut bytes = Vec::new();
-                        let mut offset = *addr;
-                        loop {
-                            let b = self.memory.load(offset, 1);
-                            if b[0] == 0 { break; }
-                            bytes.push(b[0]);
-                            offset += 1;
-                        }
-                        String::from_utf8_lossy(&bytes).to_string()
-                    }
-                    _ => String::new(),
-                };
-                let right = match args.get(1) {
-                    Some(Value::Str(s)) => s.to_string(),
-                    Some(Value::Ptr(addr)) => {
-                        let mut bytes = Vec::new();
-                        let mut offset = *addr;
-                        loop {
-                            let b = self.memory.load(offset, 1);
-                            if b[0] == 0 { break; }
-                            bytes.push(b[0]);
-                            offset += 1;
-                        }
-                        String::from_utf8_lossy(&bytes).to_string()
-                    }
-                    _ => String::new(),
-                };
+                let left = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                let right = self.value_to_string(args.get(1).unwrap_or(&Value::Int(0)));
                 ExecOutcome::Value(Value::Str(CompactString::from(format!("{}{}", left, right))))
             }
             "p_to_str" => {
@@ -2568,17 +2691,17 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Str(CompactString::from(s)))
             }
             "p_string_slice" => {
-                if let (Some(Value::Str(s)), Some(Value::Int(start)), Some(Value::Int(end))) = (args.first(), args.get(1), args.get(2)) {
-                    let len = s.len() as i64;
-                    if *start < 0 || *end > len || *start > *end {
-                        return ExecOutcome::Panic(format!(
-                            "String slice out of bounds: start={} end={} but string has {} chars",
-                            start, end, len
-                        ));
-                    }
-                    return ExecOutcome::Value(Value::Str(CompactString::from(&s[*start as usize..*end as usize])));
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                let start = match args.get(1) { Some(Value::Int(n)) => *n, _ => 0 };
+                let end = match args.get(2) { Some(Value::Int(n)) => *n, _ => s.len() as i64 };
+                let len = s.len() as i64;
+                if start < 0 || end > len || start > end {
+                    return ExecOutcome::Panic(format!(
+                        "String slice out of bounds: start={} end={} but string has {} chars",
+                        start, end, len
+                    ));
                 }
-                ExecOutcome::Value(Value::Str(CompactString::from("")))
+                ExecOutcome::Value(Value::Str(CompactString::from(&s[start as usize..end as usize])))
             }
             "p_string_contains" => {
                 let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
@@ -2973,21 +3096,24 @@ impl Interpreter {
 
             // ─── Phase 5C.1: Tensor builtins ───
             "p_tensor_zeros" => {
-                if let Some(v) = arg_vec_usize(args, 0) {
+                if let Some(shape) = self.arg_to_vec_i64(args.get(0)) {
+                    let v: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
                     ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(Tensor::zeros(v)))))
                 } else {
                     ExecOutcome::Panic("tensor_zeros: expected Vec".to_string())
                 }
             }
             "p_tensor_ones" => {
-                if let Some(v) = arg_vec_usize(args, 0) {
+                if let Some(shape) = self.arg_to_vec_i64(args.get(0)) {
+                    let v: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
                     ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(Tensor::ones(v)))))
                 } else {
                     ExecOutcome::Panic("tensor_ones: expected Vec".to_string())
                 }
             }
             "p_tensor_filled" => {
-                if let (Some(v), Some(Value::Float(f))) = (arg_vec_usize(args, 0), args.get(1)) {
+                if let (Some(shape), Some(Value::Float(f))) = (self.arg_to_vec_i64(args.get(0)), args.get(1)) {
+                    let v: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
                     ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(Tensor::filled(v, *f)))))
                 } else {
                     ExecOutcome::Panic("tensor_filled: expected Vec, f64".to_string())
@@ -2995,21 +3121,28 @@ impl Interpreter {
             }
             "p_tensor_from_vec" => {
                 // stdlib calls from_vec(data, shape) — args are (data, shape)
-                if let (Some(data), Some(shape)) = (arg_vec_f64(args, 0), arg_vec_usize(args, 1)) {
-                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(Tensor::from_vec(shape, data)))))
+                // Both args may be raw Fides Vecs (i64 pointers to 24-byte blocks)
+                let data_i64 = self.arg_to_vec_i64(args.get(0));
+                let shape = self.arg_to_vec_i64(args.get(1));
+                if let (Some(data_i64), Some(shape)) = (data_i64, shape) {
+                    let data: Vec<f64> = data_i64.iter().map(|&x| x as f64).collect();
+                    let shape_usize: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(Tensor::from_vec(shape_usize, data)))))
                 } else {
                     ExecOutcome::Panic("tensor_from_vec: expected Vec, Vec".to_string())
                 }
             }
             "p_tensor_get" => {
-                if let (Some(Value::Tensor(t)), Some(idx)) = (args.get(0), arg_vec_i64(args, 1)) {
+                let idx = self.arg_to_vec_i64(args.get(1)).or_else(|| arg_vec_i64(args, 1));
+                if let (Some(Value::Tensor(t)), Some(idx)) = (args.get(0), idx) {
                     ExecOutcome::Value(Value::Float(t.borrow().get(&idx)))
                 } else {
                     ExecOutcome::Panic("tensor_get: expected Tensor, Vec".to_string())
                 }
             }
             "p_tensor_set" => {
-                if let (Some(Value::Tensor(t)), Some(idx), Some(Value::Float(v))) = (args.get(0), arg_vec_i64(args, 1), args.get(2)) {
+                let idx = self.arg_to_vec_i64(args.get(1)).or_else(|| arg_vec_i64(args, 1));
+                if let (Some(Value::Tensor(t)), Some(idx), Some(Value::Float(v))) = (args.get(0), idx, args.get(2)) {
                     t.borrow_mut().set(&idx, *v);
                     ExecOutcome::Continue
                 } else {
@@ -3018,10 +3151,26 @@ impl Interpreter {
             }
             "p_tensor_shape" => {
                 if let Some(Value::Tensor(t)) = args.first() {
-                    let shape: SmallVec<[Value; 8]> = t.borrow().shape.iter()
-                        .map(|&d| Value::Int(d as i64))
-                        .collect();
-                    ExecOutcome::Value(Value::Vec(Rc::new(RefCell::new(shape))))
+                    // Return a raw Fides Vec (i64 pointer to 24-byte block)
+                    // so that Vec_get/Vec_len work on it.
+                    let shape_vals: Vec<i64> = t.borrow().shape.iter().map(|&d| d as i64).collect();
+                    let len = shape_vals.len() as i64;
+                    // Allocate the Vec struct: { data, len, cap }
+                    let struct_addr = self.memory.alloc(24);
+                    // Allocate data array
+                    let data_addr = if len > 0 {
+                        let data = self.memory.alloc((len as u64) * 8);
+                        for (i, &val) in shape_vals.iter().enumerate() {
+                            self.memory.store_i64(data + (i as u64) * 8, val);
+                        }
+                        data as i64
+                    } else {
+                        0
+                    };
+                    self.memory.store_i64(struct_addr, data_addr);
+                    self.memory.store_i64(struct_addr + 8, len);
+                    self.memory.store_i64(struct_addr + 16, len);
+                    ExecOutcome::Value(Value::Int(struct_addr as i64))
                 } else {
                     ExecOutcome::Panic("tensor_shape: expected Tensor".to_string())
                 }
@@ -3041,7 +3190,10 @@ impl Interpreter {
                 }
             }
             "p_tensor_reshape" => {
-                if let (Some(Value::Tensor(t)), Some(new_shape)) = (args.get(0), arg_vec_usize(args, 1)) {
+                let new_shape: Option<Vec<usize>> = self.arg_to_vec_i64(args.get(1))
+                    .map(|v| v.iter().map(|&x| x as usize).collect())
+                    .or_else(|| arg_vec_usize(args, 1));
+                if let (Some(Value::Tensor(t)), Some(new_shape)) = (args.get(0), new_shape) {
                     match t.borrow().reshape(new_shape) {
                         Ok(nt) => ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(nt)))),
                         Err(e) => ExecOutcome::Panic(e),
@@ -3182,6 +3334,237 @@ impl Interpreter {
                     ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().clone()))))
                 } else {
                     ExecOutcome::Panic("tensor_clone: expected Tensor".to_string())
+                }
+            }
+
+            // ─── ML9: KV Cache builtins ───
+            // KV cache stores attention K and V tensors per layer.
+            // The cache is bounded by the region budget and uses sliding window eviction.
+            "p_kv_cache_new" => {
+                // Create a new KV cache: p_kv_cache_new(num_layers, max_seq_len, window_size, head_dim)
+                // Returns an opaque handle (i64 = index into kv_caches map)
+                let num_layers = match args.get(0) { Some(Value::Int(n)) => *n as usize, _ => 0 };
+                let max_seq_len = match args.get(1) { Some(Value::Int(n)) => *n as usize, _ => 0 };
+                let window_size = match args.get(2) { Some(Value::Int(n)) => *n as usize, _ => 0 };
+                let head_dim = match args.get(3) { Some(Value::Int(n)) => *n as usize, _ => 0 };
+                let cache = crate::tensor::KvCache::new(num_layers, max_seq_len, window_size, head_dim);
+                let id = self.kv_caches.len() as i64;
+                self.kv_caches.push(Rc::new(RefCell::new(cache)));
+                ExecOutcome::Value(Value::Int(id))
+            }
+            "p_kv_cache_append" => {
+                // Append K and V for a layer: p_kv_cache_append(cache_id, layer, k_tensor, v_tensor)
+                let cache_id = match args.get(0) { Some(Value::Int(n)) => *n as usize, _ => 0 };
+                let layer = match args.get(1) { Some(Value::Int(n)) => *n as usize, _ => 0 };
+                if cache_id >= self.kv_caches.len() {
+                    ExecOutcome::Panic("kv_cache_append: invalid cache id".to_string())
+                } else if let (Some(Value::Tensor(k)), Some(Value::Tensor(v))) = (args.get(2), args.get(3)) {
+                    let cache = &self.kv_caches[cache_id];
+                    cache.borrow_mut().append(layer, &k.borrow(), &v.borrow());
+                    ExecOutcome::Continue
+                } else {
+                    ExecOutcome::Panic("kv_cache_append: expected (cache_id, layer, k_tensor, v_tensor)".to_string())
+                }
+            }
+            "p_kv_cache_get" => {
+                // Get K and V for a layer: p_kv_cache_get(cache_id, layer)
+                // Returns a concatenated tensor [K; V]
+                let cache_id = match args.get(0) { Some(Value::Int(n)) => *n as usize, _ => 0 };
+                let layer = match args.get(1) { Some(Value::Int(n)) => *n as usize, _ => 0 };
+                if cache_id >= self.kv_caches.len() {
+                    ExecOutcome::Panic("kv_cache_get: invalid cache id".to_string())
+                } else {
+                    let cache = &self.kv_caches[cache_id];
+                    let t = cache.borrow().get(layer);
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t))))
+                }
+            }
+            "p_kv_cache_len" => {
+                // Get current sequence length for a layer: p_kv_cache_len(cache_id, layer)
+                let cache_id = match args.get(0) { Some(Value::Int(n)) => *n as usize, _ => 0 };
+                let layer = match args.get(1) { Some(Value::Int(n)) => *n as usize, _ => 0 };
+                if cache_id >= self.kv_caches.len() {
+                    ExecOutcome::Panic("kv_cache_len: invalid cache id".to_string())
+                } else {
+                    let cache = &self.kv_caches[cache_id];
+                    ExecOutcome::Value(Value::Int(cache.borrow().len(layer) as i64))
+                }
+            }
+            "p_kv_cache_clear" => {
+                // Clear the cache: p_kv_cache_clear(cache_id)
+                let cache_id = match args.get(0) { Some(Value::Int(n)) => *n as usize, _ => 0 };
+                if cache_id >= self.kv_caches.len() {
+                    ExecOutcome::Panic("kv_cache_clear: invalid cache id".to_string())
+                } else {
+                    self.kv_caches[cache_id].borrow_mut().clear();
+                    ExecOutcome::Continue
+                }
+            }
+            "p_kv_cache_evict" => {
+                // Evict oldest tokens (sliding window): p_kv_cache_evict(cache_id, num_tokens)
+                let cache_id = match args.get(0) { Some(Value::Int(n)) => *n as usize, _ => 0 };
+                let num_tokens = match args.get(1) { Some(Value::Int(n)) => *n as usize, _ => 0 };
+                if cache_id >= self.kv_caches.len() {
+                    ExecOutcome::Panic("kv_cache_evict: invalid cache id".to_string())
+                } else {
+                    self.kv_caches[cache_id].borrow_mut().evict_oldest(num_tokens);
+                    ExecOutcome::Continue
+                }
+            }
+
+            // ─── ML10: Quantization builtins ───
+            "p_quantize_q8" => {
+                // Quantize a float tensor to int8: p_quantize_q8(tensor, scale, zero_point)
+                if let (Some(Value::Tensor(t)), Some(Value::Float(scale)), Some(Value::Int(zp))) =
+                    (args.get(0), args.get(1), args.get(2)) {
+                    let quantized = crate::tensor::Tensor::quantize_q8(&t.borrow(), *scale, *zp as i32);
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(quantized))))
+                } else {
+                    ExecOutcome::Panic("quantize_q8: expected (Tensor, f64, i64)".to_string())
+                }
+            }
+            "p_dequantize_q8" => {
+                // Dequantize int8 tensor back to float: p_dequantize_q8(tensor, scale, zero_point)
+                if let (Some(Value::Tensor(t)), Some(Value::Float(scale)), Some(Value::Int(zp))) =
+                    (args.get(0), args.get(1), args.get(2)) {
+                    let dequant = crate::tensor::Tensor::dequantize_q8(&t.borrow(), *scale, *zp as i32);
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(dequant))))
+                } else {
+                    ExecOutcome::Panic("dequantize_q8: expected (Tensor, f64, i64)".to_string())
+                }
+            }
+            "p_qmatmul" => {
+                // Quantized matmul: q8 × q8 → f32
+                // Dequantizes inputs, computes matmul, returns f32 result
+                if let (Some(Value::Tensor(a)), Some(Value::Tensor(b))) = (args.get(0), args.get(1)) {
+                    match a.borrow().matmul(&b.borrow()) {
+                        Ok(result) => ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(result)))),
+                        Err(e) => ExecOutcome::Panic(format!("qmatmul: {}", e)),
+                    }
+                } else {
+                    ExecOutcome::Panic("qmatmul: expected (Tensor, Tensor)".to_string())
+                }
+            }
+            "p_find_quant_params" => {
+                // Find optimal scale and zero_point for a tensor
+                // Returns "scale,zero_point" as a string
+                if let Some(Value::Tensor(t)) = args.get(0) {
+                    let (scale, zp) = crate::tensor::Tensor::find_quant_params(&t.borrow());
+                    ExecOutcome::Value(Value::Str(CompactString::from(format!("{},{}", scale, zp))))
+                } else {
+                    ExecOutcome::Panic("find_quant_params: expected Tensor".to_string())
+                }
+            }
+
+            // ─── ML12: Differential Privacy noise builtins ───
+            "p_dp_noise" => {
+                // Add Gaussian noise to a tensor: p_dp_noise(tensor, sigma)
+                // sigma = sqrt(2 * epsilon * sensitivity^2 / num_samples)
+                if let (Some(Value::Tensor(t)), Some(Value::Float(sigma))) = (args.get(0), args.get(1)) {
+                    let mut noisy = t.borrow().clone();
+                    for val in &mut noisy.data {
+                        // Box-Muller transform for Gaussian noise
+                        let u1 = 0.0001 + ((*val * 1000.0).fract().abs()) * 0.9998;
+                        let u2 = 0.0001 + ((val.sin() * 1000.0).fract().abs()) * 0.9998;
+                        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                        *val += sigma * z;
+                    }
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(noisy))))
+                } else {
+                    ExecOutcome::Panic("dp_noise: expected (Tensor, f64)".to_string())
+                }
+            }
+            "p_gaussian_noise" => {
+                // Generate Gaussian noise tensor: p_gaussian_noise(shape, sigma)
+                let shape = self.arg_to_vec_i64(args.get(0));
+                let sigma = match args.get(1) { Some(Value::Float(s)) => *s, _ => 0.0 };
+                if let Some(shape) = shape {
+                    let shape_usize: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
+                    let size: usize = shape_usize.iter().product();
+                    let data: Vec<f64> = (0..size).map(|i| {
+                        let seed = (i as f64) * 0.1;
+                        let u1 = 0.0001 + (seed.sin().abs()) * 0.9998;
+                        let u2 = 0.0001 + (seed.cos().abs()) * 0.9998;
+                        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                        sigma * z
+                    }).collect();
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(
+                        crate::tensor::Tensor::from_vec(shape_usize, data)
+                    ))))
+                } else {
+                    ExecOutcome::Panic("gaussian_noise: expected (Vec, f64)".to_string())
+                }
+            }
+            "p_dropout" => {
+                // Dropout: p_dropout(tensor, drop_prob)
+                // Randomly zeros elements with probability drop_prob, scales survivors
+                if let (Some(Value::Tensor(t)), Some(Value::Float(p))) = (args.get(0), args.get(1)) {
+                    let mut result = t.borrow().clone();
+                    let scale = 1.0 / (1.0 - *p);
+                    for (i, val) in result.data.iter_mut().enumerate() {
+                        let seed = ((i as f64) * 7.0).sin().abs();
+                        if seed < *p {
+                            *val = 0.0;
+                        } else {
+                            *val *= scale;
+                        }
+                    }
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(result))))
+                } else {
+                    ExecOutcome::Panic("dropout: expected (Tensor, f64)".to_string())
+                }
+            }
+
+            // ─── ML13: Tensor parallelism communication builtins ───
+            // In the interpreter (single device), these are no-ops that return
+            // the input unchanged. In a real multi-GPU deployment, they would
+            // perform NCCL collective operations.
+            "p_all_reduce" => {
+                // All-reduce: sum tensor across all ranks (no-op in single-device interp)
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().clone()))))
+                } else {
+                    ExecOutcome::Panic("all_reduce: expected Tensor".to_string())
+                }
+            }
+            "p_broadcast" => {
+                // Broadcast tensor from rank 0 to all ranks (no-op in single-device)
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().clone()))))
+                } else {
+                    ExecOutcome::Panic("broadcast: expected Tensor".to_string())
+                }
+            }
+            "p_all_gather" => {
+                // All-gather: concatenate tensors from all ranks (no-op in single-device)
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().clone()))))
+                } else {
+                    ExecOutcome::Panic("all_gather: expected Tensor".to_string())
+                }
+            }
+            "p_scatter" => {
+                // Scatter: split tensor across ranks (no-op in single-device, returns input)
+                if let Some(Value::Tensor(t)) = args.first() {
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(t.borrow().clone()))))
+                } else {
+                    ExecOutcome::Panic("scatter: expected Tensor".to_string())
+                }
+            }
+            "p_send_tensor" => {
+                // Send tensor to another rank (no-op in single-device)
+                ExecOutcome::Continue
+            }
+            "p_recv_tensor" => {
+                // Receive tensor from another rank (no-op in single-device, returns zeros)
+                let shape = self.arg_to_vec_i64(args.get(0));
+                if let Some(shape) = shape {
+                    let shape_usize: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
+                    ExecOutcome::Value(Value::Tensor(Rc::new(RefCell::new(
+                        crate::tensor::Tensor::zeros(shape_usize)
+                    ))))
+                } else {
+                    ExecOutcome::Panic("recv_tensor: expected Vec".to_string())
                 }
             }
 

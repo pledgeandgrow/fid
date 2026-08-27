@@ -1,0 +1,337 @@
+// Fides OTA (Over-The-Air Update) standard library
+//
+// Provides OTA update protocol: download, verify, apply, rollback.
+// Used for IoT devices, automotive ECUs, and embedded systems.
+//
+// The protocol:
+// 1. Download update manifest (metadata + checksum)
+// 2. Verify manifest signature
+// 3. Download update binary
+// 4. Verify binary checksum
+// 5. Apply update (write to flash/storage)
+// 6. Verify applied update
+// 7. Commit or rollback
+//
+// Usage:
+//   use ota;
+//   fn main() {
+//       val manifest = ota_manifest_new("fw_v2.bin", 102400, "sha256:abc123");
+//       if ota_verify_manifest(manifest) {
+//           ota_apply(manifest);
+//       }
+//   }
+
+module ota;
+
+use core;
+use vec;
+
+// ─── Simple Hash (for verification) ────────────────────────────────────
+//
+// Uses a simple FNV-1a hash for checksum verification.
+// For production use, replace with crypto_sha256 from crypto.fd.
+
+/// Compute a simple hash of binary data and return as hex string.
+fn ota_hash_hex(data: Vec) -> str {
+    val h = 0xcbf29ce484222325;
+    for i in 0..data.len() {
+        h = (h ^ data.get(i)) & 0xFFFFFFFFFFFFFFFF;
+        h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF;
+    }
+    // Convert to hex string
+    val hex_chars = "0123456789abcdef";
+    var result = "";
+    for i in 0..16 {
+        val shift = (15 - i) * 4;
+        val nibble = (h >> shift) & 0xF;
+        result = result + str_slice(hex_chars, nibble, nibble + 1);
+    }
+    return result;
+}
+
+// ─── OTA States ────────────────────────────────────────────────────────
+
+pub const OTA_STATE_IDLE: i64        = 0;
+pub const OTA_STATE_DOWNLOADING: i64 = 1;
+pub const OTA_STATE_VERIFYING: i64   = 2;
+pub const OTA_STATE_APPLYING: i64    = 3;
+pub const OTA_STATE_COMMITTED: i64   = 4;
+pub const OTA_STATE_ROLLBACK: i64    = 5;
+pub const OTA_STATE_FAILED: i64      = 6;
+
+/// Get OTA state name.
+pub fn ota_state_name(state: i64) -> str {
+    if state == OTA_STATE_IDLE        { return "IDLE"; }
+    if state == OTA_STATE_DOWNLOADING { return "DOWNLOADING"; }
+    if state == OTA_STATE_VERIFYING   { return "VERIFYING"; }
+    if state == OTA_STATE_APPLYING    { return "APPLYING"; }
+    if state == OTA_STATE_COMMITTED   { return "COMMITTED"; }
+    if state == OTA_STATE_ROLLBACK    { return "ROLLBACK"; }
+    if state == OTA_STATE_FAILED      { return "FAILED"; }
+    return "UNKNOWN";
+}
+
+// ─── OTA Manifest ──────────────────────────────────────────────────────
+//
+// The manifest contains metadata about the update: version, size,
+// checksum, and signature. It's downloaded first and verified before
+// the actual binary is downloaded.
+
+/// An OTA update manifest.
+pub struct OTAManifest {
+    pub version: str,
+    pub filename: str,
+    pub size: i64,             // in bytes
+    pub checksum: str,         // "sha256:hexstring"
+    pub signature: str,        // hex signature (empty if unsigned)
+    pub min_version: str,      // minimum current version required
+    pub max_version: str,      // maximum current version allowed
+    pub timestamp: i64,        // manifest creation time
+    pub description: str,
+}
+
+/// Create a new OTA manifest.
+pub fn ota_manifest_new(filename: str, size: i64, checksum: str) -> OTAManifest {
+    return OTAManifest {
+        version: "",
+        filename: filename,
+        size: size,
+        checksum: checksum,
+        signature: "",
+        min_version: "",
+        max_version: "",
+        timestamp: 0,
+        description: "",
+    };
+}
+
+/// Set version information.
+pub fn ota_manifest_set_version(manifest: OTAManifest, version: str,
+                                 min_ver: str, max_ver: str) -> void {
+    manifest.version = version;
+    manifest.min_version = min_ver;
+    manifest.max_version = max_ver;
+}
+
+/// Set signature.
+pub fn ota_manifest_set_signature(manifest: OTAManifest, signature: str) -> void {
+    manifest.signature = signature;
+}
+
+/// Set description.
+pub fn ota_manifest_set_description(manifest: OTAManifest, desc: str) -> void {
+    manifest.description = desc;
+}
+
+/// Verify manifest fields are valid.
+pub fn ota_verify_manifest(manifest: OTAManifest) -> bool {
+    if manifest.filename == "" { return false; }
+    if manifest.size <= 0 { return false; }
+    if manifest.checksum == "" { return false; }
+    // Check checksum starts with "sha256:"
+    if str_len(manifest.checksum) < 8 {
+        return false;
+    }
+    val prefix = str_slice(manifest.checksum, 0, 7);
+    if !str_equal(prefix, "sha256:") {
+        return false;
+    }
+    return true;
+}
+
+/// Check if the current version is compatible with the manifest.
+pub fn ota_check_compatibility(manifest: OTAManifest, current_version: str) -> bool {
+    // If min_version is set, current must be >= min
+    if !str_equal(manifest.min_version, "") {
+        if str_compare(current_version, manifest.min_version) < 0 {
+            return false;
+        }
+    }
+    // If max_version is set, current must be <= max
+    if !str_equal(manifest.max_version, "") {
+        if str_compare(current_version, manifest.max_version) > 0 {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ─── OTA Update Session ────────────────────────────────────────────────
+
+/// An OTA update session tracking the update process.
+pub struct OTASession {
+    pub manifest: OTAManifest,
+    pub state: i64,
+    pub bytes_downloaded: i64,
+    pub bytes_verified: i64,
+    pub error_msg: str,
+    pub retry_count: i64,
+    pub max_retries: i64,
+}
+
+/// Create a new OTA session from a manifest.
+pub fn ota_session_new(manifest: OTAManifest) -> OTASession {
+    return OTASession {
+        manifest: manifest,
+        state: OTA_STATE_IDLE,
+        bytes_downloaded: 0,
+        bytes_verified: 0,
+        error_msg: "",
+        retry_count: 0,
+        max_retries: 3,
+    };
+}
+
+/// Start downloading the update.
+pub fn ota_session_start_download(session: OTASession) -> void {
+    session.state = OTA_STATE_DOWNLOADING;
+    session.bytes_downloaded = 0;
+}
+
+/// Update download progress.
+pub fn ota_session_download_progress(session: OTASession, bytes: i64) -> void {
+    session.bytes_downloaded = session.bytes_downloaded + bytes;
+    if session.bytes_downloaded >= session.manifest.size {
+        session.state = OTA_STATE_VERIFYING;
+    }
+}
+
+/// Get download progress as percentage (0-100).
+pub fn ota_session_download_percent(session: OTASession) -> i64 {
+    if session.manifest.size == 0 {
+        return 0;
+    }
+    return (session.bytes_downloaded * 100) / session.manifest.size;
+}
+
+/// Verify the downloaded binary against the manifest checksum.
+/// binary_data: the downloaded bytes.
+/// Returns true if verification succeeds.
+pub fn ota_session_verify(session: OTASession, binary_data: Vec) -> bool {
+    if binary_data.len() != session.manifest.size {
+        session.error_msg = "Size mismatch";
+        session.state = OTA_STATE_FAILED;
+        return false;
+    }
+    // Compute hash of binary data
+    val computed_hash = ota_hash_hex(binary_data);
+    // Extract expected hash from manifest (after "sha256:")
+    val expected_hash = str_slice(session.manifest.checksum, 7, str_len(session.manifest.checksum));
+    if !str_equal(computed_hash, expected_hash) {
+        session.error_msg = "Checksum mismatch";
+        session.state = OTA_STATE_FAILED;
+        return false;
+    }
+    session.bytes_verified = binary_data.len();
+    session.state = OTA_STATE_APPLYING;
+    return true;
+}
+
+/// Apply the update (transition to applying state).
+pub fn ota_session_apply(session: OTASession) -> void {
+    session.state = OTA_STATE_APPLYING;
+}
+
+/// Commit the update (mark as committed, can't rollback).
+pub fn ota_session_commit(session: OTASession) -> void {
+    session.state = OTA_STATE_COMMITTED;
+}
+
+/// Rollback the update (revert to previous version).
+pub fn ota_session_rollback(session: OTASession) -> void {
+    session.state = OTA_STATE_ROLLBACK;
+}
+
+/// Mark the session as failed.
+pub fn ota_session_fail(session: OTASession, error_msg: str) -> void {
+    session.state = OTA_STATE_FAILED;
+    session.error_msg = error_msg;
+}
+
+/// Check if the session can be retried.
+pub fn ota_session_can_retry(session: OTASession) -> bool {
+    return session.retry_count < session.max_retries;
+}
+
+/// Retry the download.
+pub fn ota_session_retry(session: OTASession) -> void {
+    session.retry_count = session.retry_count + 1;
+    session.state = OTA_STATE_DOWNLOADING;
+    session.bytes_downloaded = 0;
+    session.bytes_verified = 0;
+    session.error_msg = "";
+}
+
+/// Get the session state name.
+pub fn ota_session_state_name(session: OTASession) -> str {
+    return ota_state_name(session.state);
+}
+
+// ─── Binary Diff (simplified) ──────────────────────────────────────────
+//
+// A simple binary diff format for efficient OTA updates.
+// Format: [offset(4)] [length(4)] [data(N)] repeated.
+// Only changed regions are included.
+
+/// A binary diff entry.
+pub struct DiffEntry {
+    pub offset: i64,
+    pub length: i64,
+    pub data: Vec,
+}
+
+/// Create a binary diff between old and new data.
+/// Returns a Vec of DiffEntry (flattened as alternating offset/length/data).
+pub fn ota_binary_diff(old_data: Vec, new_data: Vec) -> Vec {
+    val diff = Vec::new();
+    val min_len = old_data.len();
+    if new_data.len() < min_len {
+        min_len = new_data.len();
+    }
+    val i = 0;
+    while i < new_data.len() {
+        // Check if bytes differ
+        val old_byte = 0;
+        if i < old_data.len() {
+            old_byte = old_data.get(i);
+        }
+        val new_byte = new_data.get(i);
+        if old_byte != new_byte {
+            // Find the end of the changed region
+            val start = i;
+            val changed = true;
+            while changed && i < new_data.len() {
+                val ob = 0;
+                if i < old_data.len() {
+                    ob = old_data.get(i);
+                }
+                if new_data.get(i) != ob {
+                    i = i + 1;
+                } else {
+                    changed = false;
+                }
+            }
+            // Record: offset, length
+            diff.push(start);
+            diff.push(i - start);
+        }
+        i = i + 1;
+    }
+    return diff;
+}
+
+/// Compute the size of a binary diff (number of changed bytes).
+pub fn ota_diff_size(diff: Vec) -> i64 {
+    val total = 0;
+    val i = 0;
+    while i + 1 < diff.len() {
+        total = total + diff.get(i + 1);
+        i = i + 2;
+    }
+    return total;
+}
+
+/// Get the number of changed regions in a diff.
+pub fn ota_diff_region_count(diff: Vec) -> i64 {
+    return diff.len() / 2;
+}

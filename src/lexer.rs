@@ -90,17 +90,16 @@ impl Lexer {
         }
 
         let kind = match s.as_str() {
-            "pf" => TokenKind::Pf,
-            "pv" => TokenKind::Pv,
-            "pm" => TokenKind::Pm,
+            "fn" => TokenKind::Fn,
+            "val" => TokenKind::Val,
+            "var" => TokenKind::Var,
             "mut" => TokenKind::Mut,
             "const" => TokenKind::Const,
             "given" => TokenKind::Given,
             "ensure" => TokenKind::Ensure,
-            "pc" => TokenKind::Pc,
             "cap" => TokenKind::Cap,
-            "ty" => TokenKind::Ty,
-            "ret" => TokenKind::Ret,
+            "type" => TokenKind::Type,
+            "return" => TokenKind::Return,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
             "match" => TokenKind::Match,

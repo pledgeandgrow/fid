@@ -1,0 +1,259 @@
+// Fides Test utilities standard library
+//
+// Assertion helpers for writing tests in Fides.
+// Provides structured assertions with descriptive failure messages.
+//
+// Usage:
+//   use test;
+//   test_assert_eq(42, 42, "answer should be 42");
+//   test_assert_approx_eq(3.14159, 3.14, 0.01, "pi approximation");
+
+module test;
+
+use core;
+use vec;
+use string;
+
+// ─── Test state ─────────────────────────────────────────────────────────
+
+/// Global test counters (managed via a TestRunner struct since Fides has no globals).
+pub struct TestRunner {
+    pub passed: i64,
+    pub failed: i64,
+    pub current_test: str,
+}
+
+/// Create a new test runner.
+pub fn test_runner_new() -> TestRunner {
+    return TestRunner { passed: 0, failed: 0, current_test: "" };
+}
+
+/// Begin a named test.
+pub fn test_begin(runner: TestRunner, name: str) -> void {
+    runner.current_test = name;
+    print("  test: ");
+    println(name);
+}
+
+/// End the current test (mark as passed).
+pub fn test_pass(runner: TestRunner) -> void {
+    runner.passed = runner.passed + 1;
+}
+
+/// Mark the current test as failed.
+pub fn test_fail(runner: TestRunner, msg: str) -> void {
+    runner.failed = runner.failed + 1;
+    print("    FAIL: ");
+    println(msg);
+}
+
+/// Print test summary.
+pub fn test_summary(runner: TestRunner) -> void {
+    print("\n  Passed: ");
+    println(int_to_str(runner.passed));
+    print("  Failed: ");
+    println(int_to_str(runner.failed));
+    val total = runner.passed + runner.failed;
+    print("  Total:  ");
+    println(int_to_str(total));
+    if runner.failed == 0 {
+        println("\n  ALL TESTS PASSED");
+    } else {
+        print("\n  ");
+        print(int_to_str(runner.failed));
+        println(" TEST(S) FAILED");
+    }
+}
+
+/// Check if all tests passed.
+pub fn test_all_passed(runner: TestRunner) -> bool {
+    return runner.failed == 0;
+}
+
+// ─── Assertions ─────────────────────────────────────────────────────────
+
+/// Assert two i64 values are equal. Prints message on failure.
+pub fn test_assert_eq(a: i64, b: i64, msg: str) -> bool {
+    if a != b {
+        print("  ASSERT FAIL: ");
+        print(msg);
+        print(" — expected ");
+        print(int_to_str(b));
+        print(", got ");
+        println(int_to_str(a));
+        return false;
+    }
+    return true;
+}
+
+/// Assert two i64 values are NOT equal.
+pub fn test_assert_ne(a: i64, b: i64, msg: str) -> bool {
+    if a == b {
+        print("  ASSERT FAIL: ");
+        print(msg);
+        print(" — expected not ");
+        println(int_to_str(b));
+        return false;
+    }
+    return true;
+}
+
+/// Assert a condition is true.
+pub fn test_assert_true(cond: bool, msg: str) -> bool {
+    if !cond {
+        print("  ASSERT FAIL: ");
+        println(msg);
+        return false;
+    }
+    return true;
+}
+
+/// Assert a condition is false.
+pub fn test_assert_false(cond: bool, msg: str) -> bool {
+    if cond {
+        print("  ASSERT FAIL: ");
+        print("value false: ");
+        println(msg);
+        return false;
+    }
+    return true;
+}
+
+/// Assert two f64 values are approximately equal (within epsilon).
+pub fn test_assert_approx_eq(a: f64, b: f64, epsilon: f64, msg: str) -> bool {
+    val diff = a - b;
+    if diff < 0.0 { diff = -diff; }
+    if diff > epsilon {
+        print("  ASSERT FAIL: ");
+        print(msg);
+        print(" — expected ~");
+        // Simple float print
+        print(int_to_str(b as i64));
+        print(", got ");
+        println(int_to_str(a as i64));
+        return false;
+    }
+    return true;
+}
+
+/// Assert a value is greater than another.
+pub fn test_assert_gt(a: i64, b: i64, msg: str) -> bool {
+    if a <= b {
+        print("  ASSERT FAIL: ");
+        print(msg);
+        print(" — expected ");
+        print(int_to_str(a));
+        print(" > ");
+        println(int_to_str(b));
+        return false;
+    }
+    return true;
+}
+
+/// Assert a value is less than another.
+pub fn test_assert_lt(a: i64, b: i64, msg: str) -> bool {
+    if a >= b {
+        print("  ASSERT FAIL: ");
+        print(msg);
+        print(" — expected ");
+        print(int_to_str(a));
+        print(" < ");
+        println(int_to_str(b));
+        return false;
+    }
+    return true;
+}
+
+/// Assert a value is in a range [lo, hi].
+pub fn test_assert_in_range(value: i64, lo: i64, hi: i64, msg: str) -> bool {
+    if value < lo || value > hi {
+        print("  ASSERT FAIL: ");
+        print(msg);
+        print(" — expected ");
+        print(int_to_str(value));
+        print(" in [");
+        print(int_to_str(lo));
+        print(", ");
+        print(int_to_str(hi));
+        println("]");
+        return false;
+    }
+    return true;
+}
+
+/// Assert a string equals another string.
+pub fn test_assert_str_eq(a: str, b: str, msg: str) -> bool {
+    if !str_equal(a, b) {
+        print("  ASSERT FAIL: ");
+        print(msg);
+        print(" — expected \"");
+        print(b);
+        print("\", got \"");
+        print(a);
+        println("\"");
+        return false;
+    }
+    return true;
+}
+
+/// Assert a Vec is empty.
+pub fn test_assert_empty(v: Vec, msg: str) -> bool {
+    if !v.is_empty() {
+        print("  ASSERT FAIL: ");
+        print(msg);
+        print(" — expected empty, got len=");
+        println(int_to_str(v.len()));
+        return false;
+    }
+    return true;
+}
+
+/// Assert a Vec has a specific length.
+pub fn test_assert_len(v: Vec, expected: i64, msg: str) -> bool {
+    if v.len() != expected {
+        print("  ASSERT FAIL: ");
+        print(msg);
+        print(" — expected len=");
+        print(int_to_str(expected));
+        print(", got len=");
+        println(int_to_str(v.len()));
+        return false;
+    }
+    return true;
+}
+
+/// Assert a Vec contains a value.
+pub fn test_assert_contains(v: Vec, value: i64, msg: str) -> bool {
+    if !v.contains(value) {
+        print("  ASSERT FAIL: ");
+        print(msg);
+        print(" — Vec does not contain ");
+        println(int_to_str(value));
+        return false;
+    }
+    return true;
+}
+
+// ─── Hard assert (aborts on failure) ────────────────────────────────────
+
+/// Assert and abort if false.
+pub fn test_assert_or_abort(cond: bool, msg: str) -> void {
+    if !cond {
+        print("FATAL: ");
+        println(msg);
+        p_panic("abort");
+    }
+}
+
+/// Assert equal and abort if not.
+pub fn test_assert_eq_or_abort(a: i64, b: i64, msg: str) -> void {
+    if a != b {
+        print("FATAL: ");
+        print(msg);
+        print(" — expected ");
+        print(int_to_str(b));
+        print(", got ");
+        println(int_to_str(a));
+        p_panic("abort");
+    }
+}

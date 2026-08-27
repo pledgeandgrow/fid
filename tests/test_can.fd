@@ -1,0 +1,341 @@
+// Test: CAN bus stdlib (stdlib/can.fd)
+// Tests CAN 2.0A/B frame encoding/decoding, J1939 IDs, UDS services, OBD-II.
+
+use core;
+use vec;
+use can;
+
+fn main() {
+    // ─── CAN Frame Construction ────────────────────────────────────────
+    val data = Vec::new();
+    data.push(0x01);
+    data.push(0x02);
+    data.push(0x03);
+    data.push(0x04);
+
+    val frame = can_frame_standard(0x123, data);
+
+    // Verify frame fields
+    val id = can_frame_id(frame);
+    if id != 0x123 {
+        print("FAIL: can_frame_id expected 0x123, got ");
+        print(id);
+        print("\n");
+    }
+
+    val dlc = can_frame_dlc(frame);
+    if dlc != 4 {
+        print("FAIL: can_frame_dlc expected 4, got ");
+        print(dlc);
+        print("\n");
+    }
+
+    if can_frame_is_extended(frame) {
+        print("FAIL: standard frame should not be extended\n");
+    }
+
+    if can_frame_is_remote(frame) {
+        print("FAIL: data frame should not be remote\n");
+    }
+
+    // Verify frame data
+    val b0 = can_frame_byte(frame, 0);
+    val b1 = can_frame_byte(frame, 1);
+    val b2 = can_frame_byte(frame, 2);
+    val b3 = can_frame_byte(frame, 3);
+    if b0 != 0x01 || b1 != 0x02 || b2 != 0x03 || b3 != 0x04 {
+        print("FAIL: frame data mismatch\n");
+    }
+
+    // Out of bounds should return -1
+    val oob = can_frame_byte(frame, 10);
+    if oob != -1 {
+        print("FAIL: out of bounds should return -1, got ");
+        print(oob);
+        print("\n");
+    }
+
+    // ─── Extended Frame ────────────────────────────────────────────────
+    val ext_data = Vec::new();
+    ext_data.push(0xAA);
+    ext_data.push(0xBB);
+    val ext_frame = can_frame_extended(0x1ABCDE, ext_data);
+
+    if !can_frame_is_extended(ext_frame) {
+        print("FAIL: extended frame should be extended\n");
+    }
+
+    val ext_id = can_frame_id(ext_frame);
+    if ext_id != 0x1ABCDE {
+        print("FAIL: extended ID mismatch\n");
+    }
+
+    // ─── Remote Frame ──────────────────────────────────────────────────
+    val remote = can_frame_remote_standard(0x100, 8);
+    if !can_frame_is_remote(remote) {
+        print("FAIL: remote frame should be remote\n");
+    }
+    if can_frame_dlc(remote) != 8 {
+        print("FAIL: remote DLC should be 8\n");
+    }
+
+    // ─── ID Validation ────────────────────────────────────────────────
+    if !can_validate_standard_id(0x7FF) {
+        print("FAIL: 0x7FF should be valid standard ID\n");
+    }
+    if can_validate_standard_id(0x800) {
+        print("FAIL: 0x800 should be invalid standard ID\n");
+    }
+    if !can_validate_extended_id(0x1FFFFFFF) {
+        print("FAIL: 0x1FFFFFFF should be valid extended ID\n");
+    }
+    if can_validate_extended_id(0x20000000) {
+        print("FAIL: 0x20000000 should be invalid extended ID\n");
+    }
+    if !can_validate_dlc(8) {
+        print("FAIL: DLC 8 should be valid\n");
+    }
+    if can_validate_dlc(9) {
+        print("FAIL: DLC 9 should be invalid\n");
+    }
+
+    // ─── J1939 Protocol IDs ────────────────────────────────────────────
+    // Build a J1939 ID: priority=3, reserved=0, data_page=0,
+    // PF=0xF4 (244), PS=0x05, SA=0x00
+    val j_id = j1939_id(3, 0, 0, 0xF4, 0x05, 0x00);
+
+    val j_prio = j1939_priority(j_id);
+    if j_prio != 3 {
+        print("FAIL: J1939 priority expected 3, got ");
+        print(j_prio);
+        print("\n");
+    }
+
+    val j_pf = j1939_pdu_format(j_id);
+    if j_pf != 0xF4 {
+        print("FAIL: J1939 PF expected 0xF4, got ");
+        print(j_pf);
+        print("\n");
+    }
+
+    val j_ps = j1939_pdu_specific(j_id);
+    if j_ps != 0x05 {
+        print("FAIL: J1939 PS expected 0x05, got ");
+        print(j_ps);
+        print("\n");
+    }
+
+    val j_sa = j1939_source_addr(j_id);
+    if j_sa != 0x00 {
+        print("FAIL: J1939 SA expected 0x00, got ");
+        print(j_sa);
+        print("\n");
+    }
+
+    // PF >= 240 means PDU1 (destination-specific)
+    if !j1939_is_pdu1(j_id) {
+        print("FAIL: PF=0xF4 should be PDU1\n");
+    }
+    if j1939_is_pdu2(j_id) {
+        print("FAIL: PF=0xF4 should not be PDU2\n");
+    }
+
+    // PGN for PDU1: (DP << 16) | (PF << 8) = 0x00F400
+    val j_pgn = j1939_pgn(j_id);
+    if j_pgn != 0x00F400 {
+        print("FAIL: J1939 PGN expected 0xF400, got ");
+        print(j_pgn);
+        print("\n");
+    }
+
+    // PDU2 test: PF=0x80 (< 240)
+    val j2_id = j1939_id(6, 0, 0, 0x80, 0x10, 0x01);
+    if !j1939_is_pdu2(j2_id) {
+        print("FAIL: PF=0x80 should be PDU2\n");
+    }
+    // PGN for PDU2: (DP << 16) | (PF << 8) | PS = 0x008010
+    val j2_pgn = j1939_pgn(j2_id);
+    if j2_pgn != 0x008010 {
+        print("FAIL: J1939 PGN expected 0x8010, got ");
+        print(j2_pgn);
+        print("\n");
+    }
+
+    // ─── UDS Service IDs ───────────────────────────────────────────────
+    // Build a UDS Tester Present request: [0x3E, 0x00]
+    val uds_data = Vec::new();
+    uds_data.push(UDS_SERVICE_TESTER_PRESENT);
+    uds_data.push(0x00);
+    val uds_frame = can_frame_standard(0x7E0, uds_data);
+
+    val service = uds_service_id(uds_frame);
+    if service != UDS_SERVICE_TESTER_PRESENT {
+        print("FAIL: UDS service expected 0x3E, got ");
+        print(service);
+        print("\n");
+    }
+
+    val sub_fn = uds_sub_function(uds_frame);
+    if sub_fn != 0x00 {
+        print("FAIL: UDS sub-function expected 0x00, got ");
+        print(sub_fn);
+        print("\n");
+    }
+
+    // ─── UDS Positive Response ─────────────────────────────────────────
+    val resp_data = Vec::new();
+    val pos_resp = uds_response_positive(uds_frame, resp_data);
+    // Positive response: service ID + 0x40 = 0x3E | 0x40 = 0x7E
+    val resp_service = can_frame_byte(pos_resp, 0);
+    if resp_service != 0x7E {
+        print("FAIL: UDS positive response service expected 0x7E, got ");
+        print(resp_service);
+        print("\n");
+    }
+
+    if !uds_is_positive_response(pos_resp) {
+        print("FAIL: should be positive response\n");
+    }
+
+    // ─── UDS Negative Response ─────────────────────────────────────────
+    val neg_resp = uds_response_negative(uds_frame, UDS_NRC_SERVICE_NOT_SUPPORTED);
+    // Negative response: [0x7F, service, NRC]
+    if !uds_is_negative_response(neg_resp) {
+        print("FAIL: should be negative response\n");
+    }
+
+    val nrc = uds_nrc(neg_resp);
+    if nrc != UDS_NRC_SERVICE_NOT_SUPPORTED {
+        print("FAIL: NRC expected 0x11, got ");
+        print(nrc);
+        print("\n");
+    }
+
+    // ─── DTC Encoding ──────────────────────────────────────────────────
+    // P0301 = Powertrain, code 0x0301
+    val dtc = dtc_encode(DTC_SYSTEM_POWERTRAIN, 0x0301);
+    if dtc_system(dtc) != DTC_SYSTEM_POWERTRAIN {
+        print("FAIL: DTC system expected POWERTRAIN\n");
+    }
+    if dtc_code(dtc) != 0x0301 {
+        print("FAIL: DTC code expected 0x0301\n");
+    }
+    if dtc_system_char(dtc) != "P" {
+        print("FAIL: DTC system char expected 'P'\n");
+    }
+
+    // C0123 = Chassis
+    val dtc2 = dtc_encode(DTC_SYSTEM_CHASSIS, 0x0123);
+    if dtc_system_char(dtc2) != "C" {
+        print("FAIL: DTC system char expected 'C'\n");
+    }
+
+    // B1234 = Body
+    val dtc3 = dtc_encode(DTC_SYSTEM_BODY, 0x1234);
+    if dtc_system_char(dtc3) != "B" {
+        print("FAIL: DTC system char expected 'B'\n");
+    }
+
+    // U0100 = Network
+    val dtc4 = dtc_encode(DTC_SYSTEM_NETWORK, 0x0100);
+    if dtc_system_char(dtc4) != "U" {
+        print("FAIL: DTC system char expected 'U'\n");
+    }
+
+    // ─── OBD-II Requests ───────────────────────────────────────────────
+    val rpm_req = obd_engine_rpm_request();
+    val rpm_id = can_frame_id(rpm_req);
+    if rpm_id != OBD_BROADCAST_ID {
+        print("FAIL: OBD request should use broadcast ID 0x7DF\n");
+    }
+    val rpm_mode = can_frame_byte(rpm_req, 0);
+    if rpm_mode != 0x01 {
+        print("FAIL: OBD mode expected 0x01\n");
+    }
+    val rpm_pid = can_frame_byte(rpm_req, 1);
+    if rpm_pid != 0x0C {
+        print("FAIL: OBD PID expected 0x0C\n");
+    }
+
+    // Decode RPM response: [0x41, 0x0C, 0x1A, 0x00] → RPM = (0x1A * 256 + 0) / 4 = 26 * 256 / 4 = 1664
+    val rpm_resp_data = Vec::new();
+    rpm_resp_data.push(0x41);
+    rpm_resp_data.push(0x0C);
+    rpm_resp_data.push(0x1A);
+    rpm_resp_data.push(0x00);
+    val rpm_resp = can_frame_standard(0x7E8, rpm_resp_data);
+    val rpm = obd_decode_engine_rpm(rpm_resp);
+    if rpm != 1664 {
+        print("FAIL: OBD RPM expected 1664, got ");
+        print(rpm);
+        print("\n");
+    }
+
+    // Decode speed response: [0x41, 0x0D, 0x64] → 100 km/h
+    val spd_resp_data = Vec::new();
+    spd_resp_data.push(0x41);
+    spd_resp_data.push(0x0D);
+    spd_resp_data.push(0x64);
+    val spd_resp = can_frame_standard(0x7E8, spd_resp_data);
+    val speed = obd_decode_vehicle_speed(spd_resp);
+    if speed != 100 {
+        print("FAIL: OBD speed expected 100, got ");
+        print(speed);
+        print("\n");
+    }
+
+    // Decode coolant temp: [0x41, 0x05, 0x5A] → 90°C (0x5A=90, 90-40=50... wait)
+    // 0x5A = 90, temp = 90 - 40 = 50°C
+    val temp_resp_data = Vec::new();
+    temp_resp_data.push(0x41);
+    temp_resp_data.push(0x05);
+    temp_resp_data.push(0x5A);
+    val temp_resp = can_frame_standard(0x7E8, temp_resp_data);
+    val temp = obd_decode_coolant_temp(temp_resp);
+    if temp != 50 {
+        print("FAIL: OBD coolant temp expected 50, got ");
+        print(temp);
+        print("\n");
+    }
+
+    // ─── OBD Response Detection ────────────────────────────────────────
+    if !obd_is_response(rpm_resp) {
+        print("FAIL: 0x7E8 should be OBD response\n");
+    }
+    if !obd_is_response_from_ecu(rpm_resp, 0) {
+        print("FAIL: 0x7E8 should be from ECU 0\n");
+    }
+
+    // ─── UDS Session Control ───────────────────────────────────────────
+    val session_req = uds_session_control(UDS_SESSION_EXTENDED);
+    if can_frame_byte(session_req, 0) != UDS_SERVICE_DIAGNOSTIC_SESSION_CONTROL {
+        print("FAIL: session control service ID mismatch\n");
+    }
+    if can_frame_byte(session_req, 1) != UDS_SESSION_EXTENDED {
+        print("FAIL: session type mismatch\n");
+    }
+
+    // ─── UDS ECU Reset ─────────────────────────────────────────────────
+    val reset_req = uds_ecu_reset(UDS_RESET_HARD);
+    if can_frame_byte(reset_req, 0) != UDS_SERVICE_ECU_RESET {
+        print("FAIL: ECU reset service ID mismatch\n");
+    }
+    if can_frame_byte(reset_req, 1) != UDS_RESET_HARD {
+        print("FAIL: reset type mismatch\n");
+    }
+
+    // ─── UDS Read Data By ID ───────────────────────────────────────────
+    val read_vin = uds_read_data_by_id(UDS_DID_VIN);
+    // DID 0xF190 → [0xF1, 0x90]
+    if can_frame_byte(read_vin, 0) != UDS_SERVICE_READ_DATA_BY_ID {
+        print("FAIL: read data service ID mismatch\n");
+    }
+    if can_frame_byte(read_vin, 1) != 0xF1 {
+        print("FAIL: DID high byte expected 0xF1\n");
+    }
+    if can_frame_byte(read_vin, 2) != 0x90 {
+        print("FAIL: DID low byte expected 0x90\n");
+    }
+
+    print("PASS: CAN bus stdlib tests\n");
+}

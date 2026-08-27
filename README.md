@@ -4,21 +4,22 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 
 ## Status
 
-**Phase 1: Foundation — Complete.** **Phase 2: Safety — Complete.** **Phase 3: Power — Complete (interpreter).** **Phase 4: Performance — Mostly complete.** **Phase 5: Platform — Mostly complete.** **Cross-Compilation — Complete (x86-64, ARM64, RISC-V, Windows).** The compiler lexes, parses, type-checks, lowers to SSA IR, and generates native executables. The **ELF64 emitter** (`build --target x86-64` on Linux) produces working executables directly — no assembler, linker, or C compiler required. **Cross-compilation** to ARM64 (`--target arm64-linux`), RISC-V (`--target riscv64-linux`), and Windows (`--target x86-64-windows`) also works with zero external tools. Phase 2 adds region inference, effect system, capability security (with compile-time elision), and bounds safety. The optimizer is enabled by default in `build` (use `--no-opt` to disable); `--lto` enables aggressive cross-module inlining. See `docs/roadmap.md` for full phase status and what's left.
+**Phase 1: Foundation — Complete.** **Phase 2: Safety — Complete.** **Phase 3: Power — Complete (interpreter).** **Phase 4: Performance — Mostly complete.** **Phase 5: Platform — Mostly complete.** **Cross-Compilation — Complete (x86-64, ARM64, RISC-V, Windows).** The compiler lexes, parses, type-checks, lowers to SSA IR, and generates native executables. The **ELF64 emitter** (`build --target x86-64` on Linux) produces working executables directly — no assembler, linker, or C compiler required. **Cross-compilation** to ARM64 (`--target arm64-linux`), RISC-V (`--target riscv64-linux`), and Windows (`--target x86-64-windows`) also works with zero external tools. Phase 2 adds region inference, effect system, capability security (with compile-time elision), and bounds safety. The optimizer is enabled by default in `build` (use `--no-opt` to disable) with 23 passes; `--lto` enables aggressive cross-module inlining. See `docs/roadmap/roadmap.md` for full phase status and what's left.
 
 ### Test Results (Verified Aug 2026)
 
 | Test Group | Result | Notes |
 |------------|:------:|-------|
-| Unit tests (`cargo test --bin fidesc`) | **257/257** | All passing (incl. 17 ARM64 enc + 9 ARM64 runtime + 14 RISC-V enc + 7 RISC-V runtime) |
-| Harness tests (`cargo test --test harness`) | **8/8** | All passing |
-| Interpreter (`fidesc test`) | **104/104** normal + **25/25** expected-fail + 5 bonus | All normal tests pass. 5 of 8 known-fail pass as bonus. |
-| PE Emitter (`fidesc test`) | **104/104** normal + **25/25** expected-fail + 5 bonus | All normal tests pass. 5 of 8 known-fail pass as bonus. |
-| C Codegen (`fidesc test`) | **104/104** normal + **25/25** expected-fail + 2 bonus | All normal tests pass. 2 of 8 known-fail pass as bonus. Binary hardening enabled. |
-| Total `.fd` test files | **183** | 160 in tests/ root (135 normal + 25 expected-fail) + 23 in subdirs (capability/effects/regions/safety) |
-| Source files | **53** `.rs` | 81,041 LOC |
-| Stdlib modules | **35** `.fd` | core, vec, channel, math, ecs, events, parallel, sync, db, http, json, shape, simd, tensor, quant, money, banking, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input |
+| Unit tests (`cargo test --lib`) | **265/265** | All passing (incl. 17 ARM64 enc + 9 ARM64 runtime + 14 RISC-V enc + 7 RISC-V runtime + 7 incremental compilation) |
+| Harness tests (`cargo test --test harness`) | **8/8** | All passing (region, capability, effect, safety, golden, PE, interpreter, C codegen) |
+| Interpreter (`fidesc test`) | **116/116** normal | All normal tests pass. 6 bonus passes (previously known-fail). |
+| PE Emitter (`fidesc test`) | **116/116** normal | All normal tests pass. 6 bonus passes (previously known-fail). |
+| C Codegen (`fidesc test`) | **116/116** normal | All normal tests pass. 4 bonus passes. Binary hardening enabled. |
+| Total `.fd` test files | **213** | 190 in tests/ root + 23 in subdirs (capability/effects/regions/safety) |
+| Source files | **54** `.rs` | 84,741 LOC |
+| Stdlib modules | **69** `.fd` | 17,468 LOC — core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can |
 | Golden files | **148** | Expected outputs in `tests/golden/` |
+| Binary targets | **4** | `fidesc` (compiler), `pacte` (package manager), `scribe` (doc generator), `veil` (coverage tool) |
 
 ### Financial Safety Features (New)
 
@@ -149,6 +150,27 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 | ELF64/Mach-O/COFF object files | N/A | N/A | N/A |
 | Integrated linker (`fidesc link`) | N/A | N/A | N/A |
 | Embedded/IoT support (`embedded.rs`) | N/A | N/A | N/A |
+| `Rc<T>` / `Arc<T>` smart pointers | Yes | Yes | Yes |
+| `Box<T>` recursive types | Yes | Yes | Yes |
+| Vec/Mat math types (`vec2/3/4`, `mat4`, `quat`) | Yes | Yes | Yes |
+| Swizzle access (`.xyz`, `.rgb`) | Yes | Yes | Yes |
+| Operator overloading (vec + vec, etc.) | Yes | Yes | Yes |
+| `@derive(Debug/Clone/Serialize/Deserialize)` | Yes | Yes | Yes |
+| `select` statement (CSP channels) | Yes | Yes | Yes |
+| Option/Result combinators (`map`, `and_then`, etc.) | Yes | Yes | Yes |
+| Vec iterator adapters (`take`, `skip`, `zip`, etc.) | Yes | Yes | Yes |
+| Stack traces on panic | Yes | Yes | Yes |
+| `@constant_time` security annotation | Compile-time | Compile-time | Compile-time |
+| `@tainted` taint tracking | Compile-time | Compile-time | Compile-time |
+| Profiler (`fidesc profile`) | Yes | N/A | N/A |
+| Linter (`fidesc lint`) | Yes | Yes | Yes |
+| Benchmark (`fidesc bench`) | Yes | N/A | Yes |
+| Formatter (`fidesc fmt`) | Yes | Yes | Yes |
+| Package manager (`pacte`) | N/A | N/A | N/A |
+| Doc generator (`scribe`) | N/A | N/A | N/A |
+| Coverage tool (`veil`) | N/A | N/A | N/A |
+| Incremental compilation | N/A | Yes | N/A |
+| Function-level parallelism (opt) | N/A | Yes | N/A |
 
 ### What Is Parsed But Not Fully Working
 
@@ -167,13 +189,13 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 
 - **ELF64 executable emission works on Linux** — `fidesc build <file> --target x86-64` produces working ELF64 executables directly (zero external tools). `fidesc codegen --elf <out.o>` emits valid relocatable objects (readelf compatible). `fidesc codegen --macho` and `--coff` also produce valid object files.
 - **Cross-compilation to ARM64, RISC-V, and Windows** — `fidesc build --target arm64-linux`, `--target riscv64-linux`, and `--target x86-64-windows` all produce valid executables with zero external tools. ARM64 and RISC-V use built-in instruction encoders (`arm64_enc.rs`, `riscv_enc.rs`) and runtime libraries (`runtime_arm64.rs`, `runtime_riscv.rs`) with raw Linux syscalls. Windows uses the PE emitter (`pe.rs`) with kernel32.dll imports.
-- **PE emitter targets Windows x64 only** — `fidesc emit` or `fidesc build --target x86-64-windows` produces PE32+ executables; tested via `fidesc test` (104/104 valid + 25/25 expected-fail + 6 bonus pass)
+- **PE emitter targets Windows x64 only** — `fidesc emit` or `fidesc build --target x86-64-windows` produces PE32+ executables; tested via `fidesc test` (116/116 valid)
 - **Register allocator** — Linear scan allocator with constant rematerialization (F-1A). Effect-aware allocation (F-1D): pure/@no-alloc calls only clobber RAX. Works correctly for all passing tests.
 - **Peephole optimizer always on** — 9 passes run automatically in the `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
 - **L2 optimizer enabled by default** — PIR optimizer runs automatically in `build` (use `--no-opt` to disable) with 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. `--lto` enables aggressive cross-module inlining.
 - **`#[test]` attribute** — parsed but not executed by `fidesc test` (tests are file-based)
-- **C codegen coverage** — 104/104 normal tests match interpreter output (+ 25/25 expected-fail + 2 bonus pass). Phase 10B: Vec/HashMap/String now implemented in Fides stdlib using raw pointers. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack.
-- **~268 compiler warnings** — dead code, unused variables (cleanup needed)
+- **C codegen coverage** — 116/116 normal tests match interpreter output. Phase 10B: Vec/HashMap/String now implemented in Fides stdlib using raw pointers. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack.
+- **~213 compiler warnings** — dead code, unused variables (cleanup needed)
 
 ---
 
@@ -248,13 +270,20 @@ cargo run -- version
 | `gpu <file.fd>` | SPIR-V GPU backend: PIR → SPIR-V binary |
 | `tokens <file.fd>` | Lex only — print token stream |
 | `ast <file.fd>` | Lex + parse — print AST tree |
-| `test` | Run all 135 normal + 25 expected-fail tests across interpreter, PE emitter, and C codegen |
+| `test` | Run all 116 normal tests across interpreter, PE emitter, and C codegen |
 | `repl` | Interactive REPL — evaluate Fides expressions |
 | `verify <file.fd>` | Verify IR correctness (terminators, block refs, value refs) |
 | `sourcemap <file.fd>` | Show source map (IR value → source line mapping) |
 | `parse-header <file.h> -o <out.fd>` | Parse C header file → generate Fides FFI bindings |
 | `watch <file.fd>` | Hot reload: native JIT (ELF64) + function-level change detection |
 | `link <files...>` | Link multiple object files (integrated linker) |
+| `profile <file.fd>` | Per-function timing profiler (interpreter mode) |
+| `fmt <file.fd>` | Format a Fides source file |
+| `lint <file.fd>` | Lint checks (unused functions, unused imports) |
+| `bench <file.fd> [-n <count>] [--ccompile]` | Benchmark a file (interpreter or C native) |
+| `debug <file.fd>` | Interactive debugger (breakpoints, step, locals) |
+| `replay <trace.fdtrace>` | Replay a recorded execution trace |
+| `autopsy <file.fd>` | Native binary debug (ptrace-based, Linux only) |
 | `version` | Print compiler version |
 
 ---
@@ -285,11 +314,11 @@ The project includes automated verification scripts for ensuring correctness acr
 
 Current baseline:
 ```
-Unit tests:   257/257 passed  (All passing — incl. 47 cross-compilation encoder/runtime tests)
+Unit tests:   265/265 passed  (All passing — incl. 47 cross-compilation encoder/runtime tests + 7 incremental compilation)
 Harness:      8/8 passed
-Interpreter:  104/104 normal   (+ 25/25 expected fail, 6 bonus pass)
-C Codegen:    104/104 matched  (+ 25/25 expected fail, 2 bonus pass)
-PE Emitter:   104/104 valid    (+ 25/25 expected fail, 6 bonus pass)
+Interpreter:  116/116 normal
+C Codegen:    116/116 matched
+PE Emitter:   116/116 valid
 Cross-compilation: x86-64, ARM64, RISC-V, Windows — all producing valid executables
 ```
 
@@ -637,14 +666,16 @@ See `docs/syntax-spec.md` for the complete syntax specification.
 
 ```
 p-lang/
-├── Cargo.toml              # Rust project config
-├── src/                    # 53 source files, 81,041 lines of Rust
-│   ├── main.rs             # CLI entry point (23 commands: build, emit, run, codegen, ccompile, lsp, etc.)
+├── Cargo.toml              # Rust project config (4 binary targets: fidesc, pacte, scribe, veil)
+├── src/                    # 54 source files, 84,741 lines of Rust
+│   ├── main.rs             # CLI entry point (20+ commands: build, emit, run, codegen, ccompile, lsp, profile, fmt, lint, bench, debug, etc.)
+│   ├── lib.rs              # Library crate root (shared by all 4 binaries)
 │   ├── token.rs            # Token kind definitions (54+ keywords)
 │   ├── lexer.rs            # Tokenizer (source → tokens)
 │   ├── ast.rs              # AST node types (Expr, Stmt, Func, StructDef, EnumDef, TraitDef, etc.)
 │   ├── parser.rs           # Recursive descent parser (tokens → AST)
 │   ├── typechecker.rs      # Type checking + capability + effect + region enforcement
+│   ├── borrowck.rs         # Borrow checker (aliasing analysis, &mut exclusivity)
 │   ├── mono.rs             # Generic monomorphization (specialize generic functions per call site)
 │   ├── ir.rs               # SSA IR definitions (types, instructions, functions, modules, effects, regions)
 │   ├── lower.rs            # AST → SSA IR lowering
@@ -660,41 +691,76 @@ p-lang/
 │   ├── codegen_c.rs        # C codegen backend (IR → .c, for `ccompile` command)
 │   ├── x86.rs              # Legacy x86_64 MASM assembly generation (IR → .asm)
 │   ├── pir.rs              # PIR (Fides Intermediate Representation) — L1/L2/L3 levels
-│   ├── opt.rs              # PIR optimizer (const fold, CSE, DCE, inline, unroll, TCO, effect-based elision)
+│   ├── opt.rs              # PIR optimizer (23 passes, function-level parallelism)
 │   ├── peephole.rs         # Peephole optimizer (9 passes, always on in `build`)
 │   ├── regalloc.rs         # Linear scan register allocator
 │   ├── comptime.rs         # Comptime evaluation engine (Phase 3A)
 │   ├── cparser.rs          # C header parser for FFI bindings
 │   ├── tensor.rs           # Tensor type for AI/ML (Phase 5C)
+│   ├── autograd.rs         # Autograd / reverse-mode AD (Phase 5C)
 │   ├── json.rs             # JSON parsing/serialization (Phase 5D)
 │   ├── wasm.rs             # WebAssembly backend (Phase 5D)
 │   ├── gpu.rs              # SPIR-V GPU backend (Phase 5D)
 │   ├── embedded.rs         # Embedded/HAL framework (Phase 5B)
 │   ├── hotreload.rs        # Hot reload support (mmap-based code loading)
+│   ├── inc.rs              # Incremental compilation cache (in-memory, hash-keyed)
 │   ├── linker.rs           # Incremental linker (ELF64)
 │   ├── runtime_linux.rs    # Linux runtime (syscalls for bare-metal/standalone)
+│   ├── runtime_arm64.rs    # ARM64 Linux runtime (raw SVC syscalls)
+│   ├── runtime_riscv.rs    # RISC-V Linux runtime (raw ECALL syscalls)
+│   ├── arm64_enc.rs        # ARM64 instruction encoder
+│   ├── riscv_enc.rs        # RISC-V instruction encoder
+│   ├── debugger.rs         # Interactive IR-level debugger
+│   ├── native_debugger.rs  # Native ptrace-based debugger (Linux)
+│   ├── diag.rs             # Diagnostic messages with source context
+│   ├── fmt.rs              # Source code formatter
+│   ├── lsp.rs              # Language Server Protocol implementation
+│   ├── pacte.rs            # Package manager library
+│   ├── scribe.rs           # Documentation generator library
+│   ├── veil.rs             # Code coverage tool library
+│   ├── bin/pacte.rs        # Package manager binary entry point
+│   ├── bin/scribe.rs       # Documentation generator binary entry point
+│   ├── bin/veil.rs         # Coverage tool binary entry point
 │   └── compiler.rs         # Pipeline orchestration, module resolution, stdlib auto-include
-├── stdlib/                 # 17 standard library modules
-│   ├── core.fd              # Option, Result, println, assert, max, min, abs, clamp
-│   ├── json.fd              # JSON parsing and serialization
-│   ├── tensor.fd            # Tensor type for AI/ML (zeros, ones, matmul, relu, softmax, etc.)
+├── stdlib/                 # 69 standard library modules, 17,468 LOC
+│   ├── core.fd              # Option, Result, println, assert, max, min, abs, clamp, combinators
+│   ├── vec.fd               # Vec<T> with iterator adapters (take, skip, zip, enumerate, etc.)
+│   ├── math.fd              # vec2/3/4, mat4, quat types, operator overloading, swizzle
+│   ├── channel.fd           # Channel-based concurrency
+│   ├── sync.fd              # Sync primitives (sync_channel wrappers)
 │   ├── parallel.fd          # Parallel operations (par_map, par_sum, par_dot)
+│   ├── ecs.fd               # Entity Component System
+│   ├── events.fd            # Event system
 │   ├── db.fd                # Database driver framework
 │   ├── http.fd              # HTTP server stdlib
+│   ├── json.fd              # JSON parsing and serialization
 │   ├── simd.fd              # SIMD intrinsics
 │   ├── shape.fd             # Shape operations
+│   ├── tensor.fd            # Tensor type for AI/ML (zeros, ones, matmul, relu, softmax, etc.)
 │   ├── quant.fd             # Quantization (q8, find_quant_params, qmatmul)
 │   ├── money.fd             # Fixed-point money type, arithmetic, formatting
 │   ├── banking.fd           # Accounts, transfers, double-credit/lost-money detection
 │   ├── file.fd              # File I/O (file descriptors, read/write)
 │   ├── time.fd              # LogicalTime: timezone-free, clock-free deterministic date math
-│   ├── typed_strings.fd     # F67: SQLString, ShellString, HTMLString, JSONString, PathString
-│   ├── memo.fd              # F12: Memoization helper (Memo::new, get_or_compute)
+│   ├── typed_strings.fd     # SQLString, ShellString, HTMLString, JSONString, PathString
+│   ├── memo.fd              # Memoization helper (Memo::new, get_or_compute)
 │   ├── alloc.fd             # Heap allocation builtins (p_alloc_new, p_alloc_free)
-│   └── privacy.fd           # Field privacy test module
-├── tests/                  # 183 .fd test files + harness
+│   ├── privacy.fd           # Field privacy test module
+│   ├── env.fd               # Environment variable access
+│   ├── args.fd              # Command-line argument parsing
+│   ├── process.fd           # Process management
+│   ├── regex.fd             # Regular expressions
+│   ├── tilemap.fd           # Tilemap utilities
+│   ├── sprite.fd            # Sprite utilities
+│   ├── flowfield.fd         # Flow field utilities
+│   ├── streaming.fd         # Streaming data processing
+│   ├── scene.fd             # Scene graph
+│   ├── physics.fd           # Physics simulation
+│   ├── audio.fd             # Audio processing
+│   └── input.fd             # Input handling
+├── tests/                  # 213 .fd test files + harness
 │   ├── harness.rs          # Automated test harness (8 cargo tests)
-│   ├── *.fd                 # 135 normal (104 passing + 8 known-fail + 23 skip) + 25 expected-fail
+│   ├── *.fd                 # 190 test files in root
 │   ├── safety/             # 9 bounds safety tests (OOB, overflow, div-by-zero, unwrap)
 │   ├── capability/         # 4 capability security tests (grant, deny, propagation)
 │   ├── effects/            # 7 effect system tests (annotations, inference, handlers, pure)
@@ -707,26 +773,39 @@ p-lang/
 │   └── rpi_led_blink.fd     # Raspberry Pi LED blink (embedded)
 ├── benches/
 │   └── bench_main.rs       # Performance benchmarks
-└── docs/                   # 12 documentation files
-    ├── roadmap.md          # Full 8-phase roadmap
-    ├── roadmap-limitations.md # Verified gap analysis (claimed vs actual)
-    ├── syntax-spec.md      # Complete language syntax specification
-    ├── architecture.md     # Compiler architecture and pipeline
-    ├── changelog.md        # Version history and changes
-    ├── vision.md           # Language vision and 8 pillars
-    ├── design-principles.md # Core design principles
-    ├── competitive-analysis.md # Comparison with Rust, Zig, Go, Swift
-    ├── adoption-strategy.md # Language adoption strategy
-    ├── full-stack-architecture.md # Full-stack Fides ecosystem vision
-    ├── innovation.md       # Innovative language features
-    └── custom-toolchain.md # Custom toolchain plans
+└── docs/                   # 4 subdirectories: reference, guides, meta, roadmap
+    ├── reference/          # 7 core reference docs
+    │   ├── architecture.md # Compiler architecture and pipeline
+    │   ├── changelog.md    # Version history and changes
+    │   ├── features.md     # Feature list and status
+    │   ├── syntax.md       # Complete language syntax specification
+    │   ├── testing.md      # Test results + test batch specifications
+    │   ├── tool.md         # Tooling guide
+    │   └── vision.md       # Language vision and 8 pillars
+    ├── guides/             # How things work (3 files)
+    │   ├── best-practices.md   # Engineering lessons
+    │   ├── architecture-overview.md # Custom toolchain + full-stack
+    │   └── borrowchecker.md    # Borrow checker design
+    ├── meta/               # Big-picture thinking (4 files)
+    │   ├── strategy.md     # Design principles + direction analysis
+    │   ├── positioning.md  # Competitive analysis + adoption + industry
+    │   ├── future.md       # Innovation + community goals
+    │   └── lessons.md      # PL history + IBM lessons
+    └── roadmap/            # Roadmaps (7 files)
+        ├── roadmap.md      # Master milestone roadmap
+        ├── features-roadmap.md # Feature-by-feature roadmap
+        ├── llvm-roadmap.md # LLVM parity roadmap
+        ├── roadmap-limitations.md # Limitations & pain points
+        ├── roadmap-issues.md # Issues & debates
+        ├── opportunities.md # AI/ML + industry opportunities
+        └── security.md     # Security hardening guide
 ```
 
 ---
 
 ## Test Programs
 
-152 test files across `tests/` and subdirectories. Key tests:
+188 test files across `tests/` and subdirectories. Key tests:
 
 | Test File | What It Tests |
 |-----------|---------------|
@@ -776,6 +855,12 @@ p-lang/
 | `test_time*.fd` | LogicalTime stdlib: construction, extraction, arithmetic, formatting, leap years |
 | `test_typed_strings*.fd` | F67: SQLString, ShellString, HTMLString, JSONString, PathString — escape, bind, is_safe |
 | `test_init_guarantee*.fd` | F63: `pm` keyword, definite assignment analysis, init guarantee |
+| `test_rc_arc.fd` | Rc/Arc smart pointers (new, clone, drop, get, count) |
+| `test_recursive_box.fd` | Recursive types via `Box<T>` (enum Expr with Box children) |
+| `test_enum_payload_types.fd` | Typed enum payloads (variant types preserved in match) |
+| `test_generic_vec_typed.fd` | Generic Vec<T> with typed elements |
+| `test_vec_math.fd` | Vec2/3/4 + mat4 + quat math types |
+| `test_constant_time*.fd` | `@constant_time` security annotation (pass + fail tests) |
 
 Run all tests: `cargo test --test harness`
 
@@ -783,19 +868,23 @@ Run all tests: `cargo test --test harness`
 
 ## Design Documents
 
-- `docs/syntax-spec.md` — Complete Fides syntax specification (all keywords, types, features)
-- `docs/architecture.md` — Compiler architecture, pipeline stages, and internal design
-- `docs/roadmap.md` — Full 8-phase roadmap (currently at Phase 1 complete)
-- `docs/vision.md` — Language vision and 8 pillars (Originality, Security, Performance, etc.)
-- `docs/design-principles.md` — Core design principles
-- `docs/changelog.md` — Version history and detailed change log
-- `docs/competitive-analysis.md` — Comparison with Rust, Zig, Go, Swift
-- `docs/adoption-strategy.md` — Language adoption strategy
-- `docs/full-stack-architecture.md` — Full-stack Fides ecosystem vision
-- `docs/innovation.md` — Innovative language features
-- `docs/custom-toolchain.md` — Custom toolchain plans
-- `features.md` — Detailed feature status matrix
-- `TEST.md` — Complete test results across all backends
+- `docs/reference/syntax.md` — Complete Fides syntax specification (current `pf`/`pv`/`pc` syntax + proposed `fn`/`val`/`var` migration)
+- `docs/reference/architecture.md` — Compiler architecture, pipeline stages, and internal design
+- `docs/roadmap/roadmap.md` — Full 8-phase roadmap (currently at Phase 8 in progress)
+- `docs/roadmap/roadmap-limitations.md` — Verified gap analysis (claimed vs actual)
+- `docs/reference/vision.md` — Language vision and 8 pillars (Originality, Security, Performance, etc.)
+- `docs/meta/strategy.md` — Design principles + direction analysis
+- `docs/reference/changelog.md` — Version history and detailed change log
+- `docs/reference/features.md` — Feature list and status
+- `docs/meta/positioning.md` — Competitive analysis (vs Rust/Zig/Go/Swift) + adoption strategy + industry conversion guide
+- `docs/meta/lessons.md` — PL history lessons + IBM AIX/z/OS lessons
+- `docs/guides/architecture-overview.md` — Custom toolchain (no LLVM) + full-stack architecture
+- `docs/meta/future.md` — Innovation (AI/robotics) + community goals
+- `docs/guides/best-practices.md` — Best practices guide
+- `docs/guides/borrowchecker.md` — Borrow checker documentation
+- `docs/roadmap/opportunities.md` — AI/ML + industry opportunities
+- `docs/reference/testing.md` — Test results across all backends + test batch specifications
+- `docs/reference/tool.md` — Tooling guide
 
 ---
 
@@ -803,13 +892,13 @@ Run all tests: `cargo test --test harness`
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (257/257 unit tests, 104/104 + 25/25 expected-fail integration tests) |
-| **Phase 2** | Region inference, effect system, capability security, bounds safety | **Complete** (2A ✓, 2B ✓, 2C ✓ with elision, 2D ✓; 6/8 harness tests pass) |
+| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (265/265 unit tests, 116/116 integration tests) |
+| **Phase 2** | Region inference, effect system, capability security, bounds safety | **Complete** (2A ✓, 2B ✓, 2C ✓ with elision, 2D ✓; 8/8 harness tests pass) |
 | **Phase 3** | comptime, advanced traits, FFI & interop | **Complete** (3A comptime ✓, 3B traits ✓, 3C const generics + GATs ✓; 3D C FFI ✓ via `extern "C"` + `parse-header`) |
-| **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | **Mostly complete** (4A PIR ✓, 4B optimizer ✓ but disabled by default due to regalloc bug, 4C x86-64/arm64/riscv codegen + regalloc + 9 peephole passes + ELF64 executables ✓; 4D linker ✓, 4E hot reload ✓ via `fidesc watch`) |
+| **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | **Mostly complete** (4A PIR ✓, 4B optimizer ✓ 23 passes enabled by default, 4C x86-64/arm64/riscv codegen + regalloc + 9 peephole passes + ELF64 executables ✓; 4D linker ✓, 4E hot reload ✓ via `fidesc watch`) |
 | **Phase 5** | Bare metal, IoT, AI/ML, web & cloud | **Mostly complete** (5A bare-metal mode ✓, 5B IoT/embedded framework ✓ `embedded.rs`, 5C AI/ML tensor ✓, 5D WASM + GPU/SPIR-V + HTTP + JSON ✓) |
-| **Phase 6** | Self-hosting | Not started |
+| **Phase 6** | Self-hosting | 3 of 5 blockers resolved (enum payloads, generic Vec, recursive Box) |
 | **Phase 7** | Ecosystem (package manager, LSP, docs) | **Mostly complete** (pacte package manager ✓, LSP ✓, scribe doc generator ✓, veil coverage ✓) |
-| **Phase 8** | World class | **In progress** (type inference ✓, SLP+loop-vec ✓, @send/@sync ✓, debugger ✓, green threads pending) |
+| **Phase 8** | World class | **In progress** (type inference ✓, SLP+loop-vec ✓, @send/@sync ✓, debugger ✓, Rc/Arc ✓, vec/mat math ✓, incremental compilation ✓, green threads pending) |
 
-See `docs/roadmap.md` for the full 8-phase roadmap and `docs/roadmap-limitations.md` for the verified gap analysis.
+See `docs/roadmap/roadmap.md` for the full 8-phase roadmap and `docs/roadmap/roadmap-limitations.md` for the verified gap analysis.

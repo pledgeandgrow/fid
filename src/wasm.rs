@@ -1227,7 +1227,7 @@ mod tests {
 
     #[test]
     fn test_wasm_magic_and_header() {
-        let source = "pf main() { ret 0; }";
+        let source = "fn main() { return 0; }";
         let bytes = compiler::compile_to_wasm(source, "test.fd", false).unwrap();
         // WASM magic: \0asm
         assert_eq!(&bytes[0..4], b"\0asm");
@@ -1239,7 +1239,7 @@ mod tests {
 
     #[test]
     fn test_wat_dump() {
-        let source = "pf main() { ret 0; }";
+        let source = "fn main() { return 0; }";
         let wat = compiler::compile_to_wasm(source, "test.fd", true).unwrap();
         let s = String::from_utf8(wat).unwrap();
         assert!(s.contains("SPIR-V") || s.contains("WASM") || s.contains("magic"));

@@ -239,7 +239,7 @@ impl RiscVCodeGen {
                 self.emit("    ld ra, 8(sp)");
                 self.emit("    ld s0, 0(sp)");
                 self.emit("    addi sp, sp, 16");
-                self.emit("    ret");
+                self.emit("    return");
             }
 
             L3Inst::Unreachable => self.emit("    ebreak"),

@@ -281,6 +281,10 @@ pub struct L1Function {
     pub is_no_alloc: bool,
     /// Whether this function is @medical — IEC 62304 safety.
     pub is_medical: bool,
+    /// Whether this function is @kernel (GPU entry point). ML8.
+    pub is_kernel: bool,
+    /// Workgroup size from @kernel annotation. ML8.
+    pub workgroup_size: [u32; 3],
 }
 
 #[derive(Debug, Clone, Default)]
@@ -451,6 +455,10 @@ pub struct L2Function {
     pub is_no_alloc: bool,
     /// Whether this function is @medical — IEC 62304 safety.
     pub is_medical: bool,
+    /// Whether this function is @kernel (GPU entry point). ML8.
+    pub is_kernel: bool,
+    /// Workgroup size from @kernel annotation. ML8.
+    pub workgroup_size: [u32; 3],
 }
 
 #[derive(Debug, Clone, Default)]
@@ -606,6 +614,11 @@ pub struct L3Function {
     pub frame_size: u64,
     /// Next available virtual register id.
     pub next_vreg: u32,
+    /// True if this function has the @kernel annotation (GPU entry point).
+    /// Used by SPIR-V/PTX codegen to select the entry point.
+    pub is_kernel: bool,
+    /// Workgroup size from @kernel annotation: [x, y, z]. Default: [1, 1, 1].
+    pub workgroup_size: [u32; 3],
 }
 
 impl L3Function {
@@ -852,7 +865,7 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
             }
             Inst::Panic { message } => L1Inst::Panic { message: message.clone() },
             Inst::Asm { template, .. } => L1Inst::Panic { message: format!("inline asm not supported in PIR: {}", template) },
-            Inst::RegionBegin { name } => L1Inst::NewRegion { name: name.clone() },
+            Inst::RegionBegin { name, .. } => L1Inst::NewRegion { name: name.clone() },
             Inst::RegionEnd { .. } => L1Inst::FreeRegion { region: ValueId(0) },
         };
         values.insert(*vid, (l1_inst, region, effects, src_line));
@@ -913,6 +926,8 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
         gas_limit: f.gas_limit,
         is_no_alloc: f.is_no_alloc,
         is_medical: f.is_medical,
+        is_kernel: f.is_kernel,
+        workgroup_size: f.workgroup_size,
     }
 }
 
@@ -1122,6 +1137,8 @@ fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
         gas_limit: f.gas_limit,
         is_no_alloc: f.is_no_alloc,
         is_medical: f.is_medical,
+        is_kernel: f.is_kernel,
+        workgroup_size: f.workgroup_size,
     }
 }
 
@@ -1269,6 +1286,8 @@ fn lower_func_l2_to_l3(f: &L2Function, module: &IrModule) -> L3Function {
         entry: f.entry,
         frame_size,
         next_vreg: next,
+        is_kernel: f.is_kernel,
+        workgroup_size: f.workgroup_size,
     }
 }
 
@@ -1579,7 +1598,7 @@ fn print_l1_function(f: &L1Function, out: &mut String) {
     out.push_str(&format!("\n; ─── function {} ───\n", f.name));
     let params = fmt_params(&f.params);
     out.push_str(&format!(
-        "pf {}({}) -> {} {} {}\n{{\n",
+        "fn {}({}) -> {} {} {}\n{{\n",
         f.name, params, f.ret_ty, f.effects, f.caps
     ));
     for b in &f.blocks {
@@ -1640,7 +1659,7 @@ fn fmt_l1_inst(i: &L1Inst) -> String {
         Jump { target } => format!("jmp {}", target),
         Branch { cond, then, else_ } => format!("br {} ? {} : {}", cond, then, else_),
         Return { value } => match value {
-            Some(v) => format!("ret {}", v),
+            Some(v) => format!("return {}", v),
             None => "ret".to_string(),
         },
         Unreachable => "unreachable".to_string(),
@@ -1708,7 +1727,7 @@ fn print_l2_module(m: &L2Module, out: &mut String) {
 fn print_l2_function(f: &L2Function, out: &mut String) {
     out.push_str(&format!("\n; ─── function {} ───\n", f.name));
     let params = fmt_params(&f.params);
-    out.push_str(&format!("pf {}({}) -> {}\n{{\n", f.name, params, f.ret_ty));
+    out.push_str(&format!("fn {}({}) -> {}\n{{\n", f.name, params, f.ret_ty));
     for b in &f.blocks {
         print_l2_block(b, f, out);
     }
@@ -1755,7 +1774,7 @@ fn fmt_l2_inst(i: &L2Inst) -> String {
         Jump { target } => format!("jmp {}", target),
         Branch { cond, then, else_ } => format!("br {} ? {} : {}", cond, then, else_),
         Return { value } => match value {
-            Some(v) => format!("ret {}", v),
+            Some(v) => format!("return {}", v),
             None => "ret".to_string(),
         },
         Unreachable => "unreachable".to_string(),
@@ -1803,7 +1822,7 @@ fn print_l3_module(m: &L3Module, out: &mut String) {
 fn print_l3_function(f: &L3Function, out: &mut String) {
     out.push_str(&format!("\n; ─── function {} (frame={} bytes) ───\n", f.name, f.frame_size));
     let params: Vec<String> = f.params.iter().map(|(r, t)| format!("{}: {}", r, t)).collect();
-    out.push_str(&format!("pf {}({}) -> {}\n{{\n", f.name, params.join(", "), f.ret_ty));
+    out.push_str(&format!("fn {}({}) -> {}\n{{\n", f.name, params.join(", "), f.ret_ty));
     for b in &f.blocks {
         print_l3_block(b, out);
     }
@@ -1844,7 +1863,7 @@ fn fmt_l3_inst(i: &L3Inst) -> String {
         Jmp { target } => format!("jmp {}", target),
         Br { cond, then, else_ } => format!("br {} ? {} : {}", cond, then, else_),
         Ret { value } => match value {
-            Some(v) => format!("ret {}", v),
+            Some(v) => format!("return {}", v),
             None => "ret".to_string(),
         },
         Unreachable => "unreachable".to_string(),
@@ -1963,7 +1982,7 @@ mod tests {
 
     #[test]
     fn l1_preserves_function_count() {
-        let src = "pf add(x: i64, y: i64) -> i64 { ret x + y; }\n";
+        let src = "fn add(x: i64, y: i64) -> i64 { return x + y; }\n";
         let module = compile_to_ir(src);
         let l1 = lower_ir_to_l1(&module);
         // stdlib may add helpers; just ensure at least one function and `add` present.
@@ -1973,7 +1992,7 @@ mod tests {
     #[test]
     fn l1_carries_region_on_alloca() {
         // A function that takes a reference forces an alloca in lowering.
-        let src = "pf main() -> i64 { pv x = 42; ret x; }\n";
+        let src = "fn main() -> i64 { val x = 42; return x; }\n";
         let module = compile_to_ir(src);
         let l1 = lower_ir_to_l1(&module);
         let main = l1.functions.iter().find(|f| f.name == "main").expect("main");
@@ -1991,7 +2010,7 @@ mod tests {
 
     #[test]
     fn l2_drops_region_metadata() {
-        let src = "pf main() -> i64 { pv x = 42; ret x; }\n";
+        let src = "fn main() -> i64 { val x = 42; return x; }\n";
         let module = compile_to_ir(src);
         let l2 = lower_l1_to_l2(&lower_ir_to_l1(&module));
         let main = l2.functions.iter().find(|f| f.name == "main").expect("main");
@@ -2003,7 +2022,7 @@ mod tests {
 
     #[test]
     fn l3_uses_virtual_registers() {
-        let src = "pf main() -> i64 { ret 42; }\n";
+        let src = "fn main() -> i64 { return 42; }\n";
         let module = compile_to_ir(src);
         let l3 = lower_l2_to_l3(&lower_l1_to_l2(&lower_ir_to_l1(&module)), &module);
         let main = l3.functions.iter().find(|f| f.name == "main").expect("main");
@@ -2015,7 +2034,7 @@ mod tests {
 
     #[test]
     fn printer_emits_all_levels() {
-        let src = "pf main() -> i64 { ret 42; }\n";
+        let src = "fn main() -> i64 { return 42; }\n";
         let module = compile_to_ir(src);
         let out = generate_pir(&module, PirLevel::All);
         assert!(out.contains("Level 1"), "missing L1 header: {}", out);
@@ -2026,7 +2045,7 @@ mod tests {
 
     #[test]
     fn printer_single_level() {
-        let src = "pf main() -> i64 { ret 42; }\n";
+        let src = "fn main() -> i64 { return 42; }\n";
         let module = compile_to_ir(src);
         let out_l1 = generate_pir(&module, PirLevel::L1);
         assert!(out_l1.contains("Level 1"));
@@ -2053,7 +2072,7 @@ mod tests {
         // (elided) capability sets.
         // Note: print() is special-cased to emit Inst::Print (not Inst::Call),
         // so we use a user-defined function call to test capability elision.
-        let src = "pf helper() -> i64 { ret 42; }\npf main() -> i64 { pv x = helper(); ret x; }\n";
+        let src = "fn helper() -> i64 { return 42; }\nfn main() -> i64 { val x = helper(); return x; }\n";
         let module = compile_to_ir(src);
         let l1 = lower_ir_to_l1(&module);
         let main = l1.functions.iter().find(|f| f.name == "main").expect("main");
@@ -2070,7 +2089,7 @@ mod tests {
 
     #[test]
     fn l2_l3_preserve_externs_and_strings() {
-        let src = "pf main() -> i64 { println(\"hello\"); ret 0; }\n";
+        let src = "fn main() -> i64 { println(\"hello\"); return 0; }\n";
         let module = compile_to_ir(src);
         let l1 = lower_ir_to_l1(&module);
         let l2 = lower_l1_to_l2(&l1);

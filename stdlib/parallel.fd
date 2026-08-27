@@ -21,33 +21,33 @@ module parallel;
 // Threading overhead (spawn + join) is ~10-50us. For a sum of N i64s,
 // the sequential cost is ~N ns. Below 10000 elements, threading is
 // slower than sequential.
-pf PAR_THRESHOLD() -> i64 { ret 10000; }
+fn PAR_THRESHOLD() -> i64 { return 10000; }
 
 // ─── Internal worker functions ─────────────────────────────────────────
 
 /// Worker: sum elements [start, end) of a Vec.
 /// Takes raw i64 (not Vec<i64>) to avoid C codegen void* type mismatch
 /// when passing through p_thread_spawn varargs.
-pf __par_sum_worker(data: i64, start: i64, end: i64) -> i64 {
-    pv sum = 0;
-    pv i = start;
+fn __par_sum_worker(data: i64, start: i64, end: i64) -> i64 {
+    val sum = 0;
+    val i = start;
     while i < end {
         sum = sum + Vec_get(data, i);
         i = i + 1;
     }
-    ret sum;
+    return sum;
 }
 
 /// Worker: dot product of elements [start, end) of two Vecs.
 /// Takes raw i64 (not Vec<i64>) to avoid C codegen void* type mismatch.
-pf __par_dot_worker(a: i64, b: i64, start: i64, end: i64) -> i64 {
-    pv sum = 0;
-    pv i = start;
+fn __par_dot_worker(a: i64, b: i64, start: i64, end: i64) -> i64 {
+    val sum = 0;
+    val i = start;
     while i < end {
         sum = sum + Vec_get(a, i) * Vec_get(b, i);
         i = i + 1;
     }
-    ret sum;
+    return sum;
 }
 
 // ─── Public parallel operations ────────────────────────────────────────
@@ -55,106 +55,106 @@ pf __par_dot_worker(a: i64, b: i64, start: i64, end: i64) -> i64 {
 /// Parallel map: apply a function to each element of a Vec.
 /// Currently sequential — parallel write to a shared result Vec requires
 /// finer-grained synchronization. Each element is independent.
-pub pf par_map(n: i64) -> Vec<i64> {
-    pv result = Vec::new();
-    pv i = 0;
+pub fn par_map(n: i64) -> Vec<i64> {
+    val result = Vec::new();
+    val i = 0;
     while i < n {
         result.push(i * i);
         i = i + 1;
     }
-    ret result;
+    return result;
 }
 
 /// Parallel sum: compute the sum of a Vec.
 /// For large inputs (>= PAR_THRESHOLD), splits into 2 chunks processed
 /// by separate OS threads. For small inputs, runs sequentially.
-pub pf par_sum(data: Vec<i64>) -> i64 {
-    pv n = data.len();
+pub fn par_sum(data: Vec<i64>) -> i64 {
+    val n = data.len();
     if n < PAR_THRESHOLD() {
-        pv total = 0;
-        pv i = 0;
+        val total = 0;
+        val i = 0;
         while i < n {
             total = total + data.get(i);
             i = i + 1;
         }
-        ret total;
+        return total;
     }
     // Parallel: split into 2 chunks
-    pv mid = n / 2;
-    pv t1 = spawn __par_sum_worker(data, 0, mid);
-    pv t2 = spawn __par_sum_worker(data, mid, n);
-    pv s1 = await t1;
-    pv s2 = await t2;
-    ret s1 + s2;
+    val mid = n / 2;
+    val t1 = spawn __par_sum_worker(data, 0, mid);
+    val t2 = spawn __par_sum_worker(data, mid, n);
+    val s1 = await t1;
+    val s2 = await t2;
+    return s1 + s2;
 }
 
 /// Parallel dot product: compute the dot product of two Vecs.
 /// For large inputs (>= PAR_THRESHOLD), splits into 2 chunks processed
 /// by separate OS threads. For small inputs, runs sequentially.
-pub pf par_dot(a: Vec<i64>, b: Vec<i64>) -> i64 {
-    pv n = a.len();
+pub fn par_dot(a: Vec<i64>, b: Vec<i64>) -> i64 {
+    val n = a.len();
     if n < PAR_THRESHOLD() {
-        pv total = 0;
-        pv i = 0;
+        val total = 0;
+        val i = 0;
         while i < n {
             total = total + a.get(i) * b.get(i);
             i = i + 1;
         }
-        ret total;
+        return total;
     }
     // Parallel: split into 2 chunks
-    pv mid = n / 2;
-    pv t1 = spawn __par_dot_worker(a, b, 0, mid);
-    pv t2 = spawn __par_dot_worker(a, b, mid, n);
-    pv s1 = await t1;
-    pv s2 = await t2;
-    ret s1 + s2;
+    val mid = n / 2;
+    val t1 = spawn __par_dot_worker(a, b, 0, mid);
+    val t2 = spawn __par_dot_worker(a, b, mid, n);
+    val s1 = await t1;
+    val s2 = await t2;
+    return s1 + s2;
 }
 
 /// Parallel fill: fill a Vec with a constant value.
 /// Currently sequential — each element is independent (embarrassingly
 /// parallel) but parallel write to a shared result Vec requires
 /// finer-grained synchronization.
-pub pf par_fill(n: i64, val: i64) -> Vec<i64> {
-    pv result = Vec::new();
-    pv i = 0;
+pub fn par_fill(n: i64, value: i64) -> Vec<i64> {
+    val result = Vec::new();
+    val i = 0;
     while i < n {
-        result.push(val);
+        result.push(value);
         i = i + 1;
     }
-    ret result;
+    return result;
 }
 
 /// Parallel range: generate a sequence [start, start+1, ..., end-1].
 /// Currently sequential — same limitation as par_fill.
-pub pf par_range(start: i64, end: i64) -> Vec<i64> {
-    pv result = Vec::new();
-    pv i = start;
+pub fn par_range(start: i64, end: i64) -> Vec<i64> {
+    val result = Vec::new();
+    val i = start;
     while i < end {
         result.push(i);
         i = i + 1;
     }
-    ret result;
+    return result;
 }
 
 /// Check if a loop is parallelizable by analyzing its effects.
 /// Returns true if the loop body has no IO, no State, no Panic.
 /// A loop is parallelizable if it has no IO, no State, no Panic.
-pub pf is_parallelizable(effect_mask: i64) -> bool {
+pub fn is_parallelizable(effect_mask: i64) -> bool {
     // Effect bits:
     //   0 = IO
     //   1 = State (mutation)
     //   2 = Panic
     //   3 = RealTime
-    pv has_io = (effect_mask & 1) != 0;
-    pv has_state = (effect_mask & 2) != 0;
-    pv has_panic = (effect_mask & 4) != 0;
-    ret !has_io && !has_state && !has_panic;
+    val has_io = (effect_mask & 1) != 0;
+    val has_state = (effect_mask & 2) != 0;
+    val has_panic = (effect_mask & 4) != 0;
+    return !has_io && !has_state && !has_panic;
 }
 
 /// Mark a loop as parallel for the compiler.
 /// This is a hint — the compiler will verify safety before parallelizing.
 /// In the current implementation, it's a no-op.
-pub pf parallel_hint() -> void {
+pub fn parallel_hint() -> void {
     // No-op — compiler directive for future auto-parallelization
 }

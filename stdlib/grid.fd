@@ -1,0 +1,394 @@
+// Fides IEC 61850 Grid standard library
+//
+// IEC 61850 is the international standard for power utility automation.
+// It defines data models for substation equipment (breakers, transformers,
+// meters) and communication protocols (GOOSE, SV, MMS).
+//
+// This module provides:
+// - Logical Node types (XCBR, MMXU, PTUV, etc.)
+// - Common Data Classes (SPS, DPS, MV, ASG, etc.)
+// - GOOSE message encoding/decoding
+// - IEC 61850 object name construction
+//
+// Usage:
+//   use grid;
+//   fn main() {
+//       val breaker = iec61850_xcbr_new("CB1", 0);
+//       iec61850_xcbr_set_pos(breaker, 1);
+//   }
+
+module grid;
+
+use core;
+use vec;
+use math;
+
+// ─── IEC 61850 Logical Node Types ──────────────────────────────────────
+
+pub const LN_XCBR: i64 = 0;  // Circuit Breaker
+pub const LN_XSWI: i64 = 1;  // Switch / Disconnector
+pub const LN_MMXU: i64 = 2;  // Measurement (voltage, current, power)
+pub const LN_PTUV: i64 = 3;  // Voltage Time Protection
+pub const LN_PTOC: i64 = 4;  // Overcurrent Protection
+pub const LN_PDIS: i64 = 5;  // Distance Protection
+pub const LN_RREC: i64 = 6;  // Disturbance Recorder
+pub const LN_RBRF: i64 = 7;  // Breaker Failure
+pub const LN_CSWI: i64 = 8;  // Control Switch
+pub const LN_CILO: i64 = 9;  // Interlocking
+pub const LN_CSWI2: i64 = 10; // Control Switch (alternate)
+
+/// Get logical node name.
+pub fn iec61850_ln_name(ln_type: i64) -> str {
+    if ln_type == LN_XCBR { return "XCBR"; }
+    if ln_type == LN_XSWI { return "XSWI"; }
+    if ln_type == LN_MMXU { return "MMXU"; }
+    if ln_type == LN_PTUV { return "PTUV"; }
+    if ln_type == LN_PTOC { return "PTOC"; }
+    if ln_type == LN_PDIS { return "PDIS"; }
+    if ln_type == LN_RREC { return "RREC"; }
+    if ln_type == LN_RBRF { return "RBRF"; }
+    if ln_type == LN_CSWI { return "CSWI"; }
+    if ln_type == LN_CILO { return "CILO"; }
+    return "UNKNOWN";
+}
+
+// ─── Common Data Classes (CDC) ─────────────────────────────────────────
+
+pub const CDC_SPS: i64  = 0;  // Single Point Status
+pub const CDC_DPS: i64  = 1;  // Double Point Status
+pub const CDC_MV: i64   = 2;  // Measured Value
+pub const CDC_ASG: i64  = 3;  // Analog Setting
+pub const CDC_ING: i64  = 4;  // Integer Setting
+pub const CDC_ENG: i64  = 5;  // Enumerated Setting
+pub const CDC_SPC: i64  = 6;  // Single Point Controllable
+pub const CDC_DPC: i64  = 7;  // Double Point Controllable
+pub const CDC_INC: i64  = 8;  // Integer Controllable
+
+/// Get CDC name.
+pub fn iec61850_cdc_name(cdc: i64) -> str {
+    if cdc == CDC_SPS { return "SPS"; }
+    if cdc == CDC_DPS { return "DPS"; }
+    if cdc == CDC_MV  { return "MV"; }
+    if cdc == CDC_ASG { return "ASG"; }
+    if cdc == CDC_ING { return "ING"; }
+    if cdc == CDC_ENG { return "ENG"; }
+    if cdc == CDC_SPC { return "SPC"; }
+    if cdc == CDC_DPC { return "DPC"; }
+    if cdc == CDC_INC { return "INC"; }
+    return "UNKNOWN";
+}
+
+// ─── Circuit Breaker (XCBR) ────────────────────────────────────────────
+//
+// XCBR represents a circuit breaker with position, health, and control.
+
+/// A circuit breaker logical node.
+pub struct XCBR {
+    pub name: str,
+    pub ln_type: i64,
+    pub position: i64,       // 0=open, 1=closed, 2=invalid
+    pub health: i64,         // 0=ok, 1=warning, 2=alarm
+    pub capable_of_op: bool, // can operate
+    pub op_cnt: i64,         // operation counter
+    pub rated_current: i64,  // amperes
+}
+
+/// Create a new circuit breaker.
+pub fn iec61850_xcbr_new(name: str, rated_current: i64) -> XCBR {
+    return XCBR {
+        name: name,
+        ln_type: LN_XCBR,
+        position: 0,  // open
+        health: 0,    // ok
+        capable_of_op: true,
+        op_cnt: 0,
+        rated_current: rated_current,
+    };
+}
+
+/// Set breaker position (0=open, 1=closed).
+pub fn iec61850_xcbr_set_pos(breaker: XCBR, pos: i64) -> void {
+    if pos < 0 || pos > 1 {
+        breaker.position = 2;  // invalid
+        return;
+    }
+    breaker.position = pos;
+    breaker.op_cnt = breaker.op_cnt + 1;
+}
+
+/// Get breaker position name.
+pub fn iec61850_xcbr_pos_name(breaker: XCBR) -> str {
+    if breaker.position == 0 { return "Open"; }
+    if breaker.position == 1 { return "Closed"; }
+    return "Invalid";
+}
+
+/// Check if breaker is closed.
+pub fn iec61850_xcbr_is_closed(breaker: XCBR) -> bool {
+    return breaker.position == 1;
+}
+
+/// Check if breaker is open.
+pub fn iec61850_xcbr_is_open(breaker: XCBR) -> bool {
+    return breaker.position == 0;
+}
+
+/// Set breaker health.
+pub fn iec61850_xcbr_set_health(breaker: XCBR, health: i64) -> void {
+    breaker.health = health;
+    if health >= 2 {
+        breaker.capable_of_op = false;
+    }
+}
+
+/// Get breaker health name.
+pub fn iec61850_xcbr_health_name(breaker: XCBR) -> str {
+    if breaker.health == 0 { return "OK"; }
+    if breaker.health == 1 { return "Warning"; }
+    return "Alarm";
+}
+
+// ─── Measurement (MMXU) ────────────────────────────────────────────────
+//
+// MMXU provides three-phase voltage, current, power measurements.
+
+/// A measurement logical node.
+pub struct MMXU {
+    pub name: str,
+    pub ln_type: i64,
+    pub voltage_a: f64,  // phase A voltage (V)
+    pub voltage_b: f64,  // phase B voltage (V)
+    pub voltage_c: f64,  // phase C voltage (V)
+    pub current_a: f64,  // phase A current (A)
+    pub current_b: f64,  // phase B current (A)
+    pub current_c: f64,  // phase C current (A)
+    pub active_power: f64,   // watts
+    pub reactive_power: f64, // VAR
+    pub power_factor: f64,   // 0.0-1.0
+    pub frequency: f64,      // Hz
+}
+
+/// Create a new measurement node.
+pub fn iec61850_mmxu_new(name: str) -> MMXU {
+    return MMXU {
+        name: name,
+        ln_type: LN_MMXU,
+        voltage_a: 0.0,
+        voltage_b: 0.0,
+        voltage_c: 0.0,
+        current_a: 0.0,
+        current_b: 0.0,
+        current_c: 0.0,
+        active_power: 0.0,
+        reactive_power: 0.0,
+        power_factor: 0.0,
+        frequency: 50.0,
+    };
+}
+
+/// Set three-phase voltage measurements.
+pub fn iec61850_mmxu_set_voltage(mmxu: MMXU, va: f64, vb: f64, vc: f64) -> void {
+    mmxu.voltage_a = va;
+    mmxu.voltage_b = vb;
+    mmxu.voltage_c = vc;
+}
+
+/// Set three-phase current measurements.
+pub fn iec61850_mmxu_set_current(mmxu: MMXU, ia: f64, ib: f64, ic: f64) -> void {
+    mmxu.current_a = ia;
+    mmxu.current_b = ib;
+    mmxu.current_c = ic;
+}
+
+/// Set power measurements.
+pub fn iec61850_mmxu_set_power(mmxu: MMXU, active: f64, reactive: f64, pf: f64) -> void {
+    mmxu.active_power = active;
+    mmxu.reactive_power = reactive;
+    mmxu.power_factor = pf;
+}
+
+/// Calculate apparent power: sqrt(P² + Q²).
+pub fn iec61850_mmxu_apparent_power(mmxu: MMXU) -> f64 {
+    return math_sqrt(mmxu.active_power * mmxu.active_power +
+                     mmxu.reactive_power * mmxu.reactive_power);
+}
+
+/// Calculate three-phase total active power: P = Va*Ia + Vb*Ib + Vc*Ic (approx).
+pub fn iec61850_mmxu_total_power(mmxu: MMXU) -> f64 {
+    return mmxu.voltage_a * mmxu.current_a +
+           mmxu.voltage_b * mmxu.current_b +
+           mmxu.voltage_c * mmxu.current_c;
+}
+
+// ─── GOOSE Message ─────────────────────────────────────────────────────
+//
+// GOOSE (Generic Object Oriented Substation Event) is a fast,
+// publisher/subscriber protocol for inter-device communication.
+// Used for trip signals, interlocking, and status exchange.
+
+/// A GOOSE message.
+pub struct GOOSEMessage {
+    pub app_id: i64,
+    pub goose_ref: str,       // dataset reference
+    pub seq_num: i64,         // sequence number
+    pub time: i64,            // time of last change
+    pub st_num: i64,          // state number
+    pub data: Vec,            // dataset values
+}
+
+/// Create a new GOOSE message.
+pub fn iec61850_goose_new(app_id: i64, ref: str) -> GOOSEMessage {
+    return GOOSEMessage {
+        app_id: app_id,
+        goose_ref: ref,
+        seq_num: 0,
+        time: 0,
+        st_num: 0,
+        data: Vec::new(),
+    };
+}
+
+/// Add a data value to the GOOSE message.
+pub fn iec61850_goose_add_data(msg: GOOSEMessage, value: i64) -> void {
+    msg.data.push(value);
+    msg.st_num = msg.st_num + 1;
+    msg.seq_num = 0;
+}
+
+/// Update a data value in the GOOSE message (increments seq_num).
+pub fn iec61850_goose_update_data(msg: GOOSEMessage, index: i64, value: i64) -> void {
+    if index < 0 || index >= msg.data.len() {
+        return;
+    }
+    msg.data.set(index, value);
+    msg.seq_num = msg.seq_num + 1;
+}
+
+/// Get a data value from the GOOSE message.
+pub fn iec61850_goose_get_data(msg: GOOSEMessage, index: i64) -> i64 {
+    if index < 0 || index >= msg.data.len() {
+        return -1;
+    }
+    return msg.data.get(index);
+}
+
+/// Get the number of data values.
+pub fn iec61850_goose_data_count(msg: GOOSEMessage) -> i64 {
+    return msg.data.len();
+}
+
+/// Serialize GOOSE message to a Vec of bytes (simplified format).
+pub fn iec61850_goose_serialize(msg: GOOSEMessage) -> Vec {
+    val bytes = Vec::new();
+    // App ID (2 bytes)
+    bytes.push((msg.app_id >> 8) & 0xFF);
+    bytes.push(msg.app_id & 0xFF);
+    // State number (4 bytes)
+    bytes.push((msg.st_num >> 24) & 0xFF);
+    bytes.push((msg.st_num >> 16) & 0xFF);
+    bytes.push((msg.st_num >> 8) & 0xFF);
+    bytes.push(msg.st_num & 0xFF);
+    // Sequence number (4 bytes)
+    bytes.push((msg.seq_num >> 24) & 0xFF);
+    bytes.push((msg.seq_num >> 16) & 0xFF);
+    bytes.push((msg.seq_num >> 8) & 0xFF);
+    bytes.push(msg.seq_num & 0xFF);
+    // Data count (1 byte)
+    bytes.push(msg.data.len() & 0xFF);
+    // Data values (4 bytes each)
+    for i in 0..msg.data.len() {
+        val v = msg.data.get(i);
+        bytes.push((v >> 24) & 0xFF);
+        bytes.push((v >> 16) & 0xFF);
+        bytes.push((v >> 8) & 0xFF);
+        bytes.push(v & 0xFF);
+    }
+    return bytes;
+}
+
+// ─── IEC 61850 Object Reference ────────────────────────────────────────
+//
+// Object references use a hierarchical naming convention:
+// LD/LN.FCDCO
+// LD = Logical Device
+// LN = Logical Node
+// F = Functional Data
+// CDCO = Common Data Class Object
+
+/// Build an IEC 61850 object reference.
+pub fn iec61850_ref(ld: str, ln: str, field: str) -> str {
+    return ld + "/" + ln + "." + field;
+}
+
+/// Build a dataset reference.
+pub fn iec61850_dataset_ref(ld: str, ds_name: str) -> str {
+    return ld + "/" + ds_name;
+}
+
+/// Build a control object reference.
+pub fn iec61850_control_ref(ld: str, ln: str, co_name: str) -> str {
+    return ld + "/" + ln + "." + co_name + "CO";
+}
+
+// ─── Overcurrent Protection (PTOC) ─────────────────────────────────────
+
+/// Overcurrent protection settings.
+pub struct PTOC {
+    pub name: str,
+    pub ln_type: i64,
+    pub pickup_current: f64,  // A — trip threshold
+    pub time_delay: f64,      // seconds
+    pub inverse_curve: bool,  // true = inverse time, false = definite time
+    pub tds: f64,             // time dial setting (for inverse curves)
+    pub tripped: bool,
+}
+
+/// Create a new overcurrent protection element.
+pub fn iec61850_ptoc_new(name: str, pickup: f64, delay: f64) -> PTOC {
+    return PTOC {
+        name: name,
+        ln_type: LN_PTOC,
+        pickup_current: pickup,
+        time_delay: delay,
+        inverse_curve: false,
+        tds: 0.05,
+        tripped: false,
+    };
+}
+
+/// Check if overcurrent condition is met.
+pub fn iec61850_ptoc_check(ptoc: PTOC, measured_current: f64) -> bool {
+    if measured_current >= ptoc.pickup_current {
+        ptoc.tripped = true;
+        return true;
+    }
+    return false;
+}
+
+/// Set inverse time curve mode.
+pub fn iec61850_ptoc_set_inverse(ptoc: PTOC, tds: f64) -> void {
+    ptoc.inverse_curve = true;
+    ptoc.tds = tds;
+}
+
+/// Calculate trip time for inverse time curve (IEC 60255 standard).
+/// Trip time = TDS * (A / ((I/Is)^p - 1) + B)
+/// For standard inverse: A=0.14, p=0.02, B=0
+pub fn iec61850_ptoc_trip_time(ptoc: PTOC, measured_current: f64) -> f64 {
+    if !ptoc.inverse_curve {
+        return ptoc.time_delay;
+    }
+    if measured_current < ptoc.pickup_current {
+        return -1.0;  // no trip
+    }
+    val m = measured_current / ptoc.pickup_current;
+    if m <= 1.0 {
+        return -1.0;
+    }
+    // Standard inverse curve: T = TDS * 0.14 / (m^0.02 - 1)
+    val denom = math_pow(m, 0.02) - 1.0;
+    if denom <= 0.0 {
+        return 0.0;
+    }
+    return ptoc.tds * 0.14 / denom;
+}

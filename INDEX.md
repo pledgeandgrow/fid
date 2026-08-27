@@ -3,8 +3,8 @@
 > Navigation hub for the Fides compiler. Every file in the project, grouped by
 > directory, with a one-line description. Use this to find anything fast.
 >
-> **Stats:** 53 `.rs` source files (81,041 LOC) · 35 stdlib modules (8,080 LOC) · 183 `.fd`
-> test files · 32 .md docs · 4 examples · 3 scripts · 3 benchmarks · 4 binaries (fidesc, pacte, scribe, veil).
+> **Stats:** 54 `.rs` source files (84,741 LOC) · 69 stdlib modules (17,468 LOC) · 213 `.fd`
+> test files · 33 .md docs · 4 examples · 3 scripts · 3 benchmarks · 4 binaries (fidesc, pacte, scribe, veil).
 > Cross-compilation: ARM64, RISC-V, Windows — zero external tools.
 
 ---
@@ -34,46 +34,37 @@ and `AGENTS.md` first when working on the compiler.
 ### Core Reference
 | File | Description |
 |------|-------------|
-| [architecture.md](architecture.md) | Compiler pipeline, data flow, source file map. **Start here.** |
-| [syntax-spec.md](syntax-spec.md) | Full language syntax specification (v0.5.0). |
-| [features.md](features.md) | Feature status — verified against actual test runs. |
-| [security.md](security.md) | Security hardening — exploit prevention, annotations, binary hardening. |
-| [test.md](test.md) | Current test results across all backends. |
-| [test-batches.md](test-batches.md) | Specification of all test batches. |
-| [changelog.md](changelog.md) | Per-phase change history (newest first). |
-| [history.md](history.md) | Lessons learned from other programming languages. |
+| [reference/architecture.md](reference/architecture.md) | Compiler pipeline, data flow, source file map. **Start here.** |
+| [reference/syntax.md](reference/syntax.md) | Full language syntax specification (current `pf`/`pv`/`pc` syntax + proposed `fn`/`val`/`var` migration). |
+| [reference/features.md](reference/features.md) | Feature status — verified against actual test runs. |
+| [reference/tool.md](reference/tool.md) | Development tools (fidesc, pacte, scribe, veil). |
+| [reference/testing.md](reference/testing.md) | Current test results across all backends + test batch specifications. |
+| [reference/changelog.md](reference/changelog.md) | Per-phase change history (newest first). |
+| [reference/vision.md](reference/vision.md) | The overarching vision — "the last language the world needs." |
 
-### Design & Principles
+### Guides (how things work)
 | File | Description |
 |------|-------------|
-| [vision.md](vision.md) | The overarching vision — "the last language the world needs." |
-| [design-principles.md](design-principles.md) | Non-negotiable rules guiding every design decision. |
-| [best-practices.md](best-practices.md) | Hard-won insights from building a custom toolchain. |
-| [borrowchecker.md](borrowchecker.md) | Borrow checker design document (Phases 1-6). |
-| [custom-toolchain.md](custom-toolchain.md) | Why and how the toolchain is built from scratch (no LLVM/libc). |
-| [full-stack-architecture.md](full-stack-architecture.md) | Every layer of the stack, built in-house. |
+| [guides/best-practices.md](guides/best-practices.md) | Hard-won insights from building a custom toolchain. |
+| [guides/architecture-overview.md](guides/architecture-overview.md) | Custom toolchain rationale (no LLVM/libc) + full-stack architecture. |
+| [guides/borrowchecker.md](guides/borrowchecker.md) | Borrow checker design document (Phases 1-6). |
+
+### Meta (big-picture thinking)
+| File | Description |
+|------|-------------|
+| [meta/strategy.md](meta/strategy.md) | Design principles + direction analysis (are we going the right way?). |
+| [meta/positioning.md](meta/positioning.md) | Competitive analysis (vs Rust/Zig/Go/Swift) + adoption strategy + industry conversion guide. |
+| [meta/future.md](meta/future.md) | Innovation (AI, robotics, hardware, IoT) + nice-to-have community goals. |
+| [meta/lessons.md](meta/lessons.md) | PL history lessons + IBM AIX/z/OS lessons learned. |
 
 ### Roadmaps
 | File | Description |
 |------|-------------|
-| [roadmap.md](../roadmap/roadmap.md) | Milestones to "world domination" — the master roadmap. |
-| [features-roadmap.md](../roadmap/features-roadmap.md) | New language features roadmap (track of additions). |
-| [llvm-roadmap.md](../roadmap/llvm-roadmap.md) | LLVM parity & superset roadmap — compete, don't copy. |
-| [roadmap-limitations.md](../roadmap/roadmap-limitations.md) | Limitations & pain points to address. |
-| [industry-opportunities.md](../roadmap/industry-opportunities.md) | Where Fides could be groundbreaking, by industry. |
-
-### Strategy & Analysis
-| File | Description |
-|------|-------------|
-| [ibm-lessons.md](ibm-lessons.md) | What Fides can learn from IBM's AIX/z/OS — vertical integration on mainstream hardware. 4 concrete features (io_uring, capability isolation, transactional memory, deterministic mode) with benefits/cons. Road to a Fides OS. |
-| [direction-analysis.md](direction-analysis.md) | Are we going in the right direction? |
-| [competitive-analysis.md](competitive-analysis.md) | Fides vs the world — honest competitive assessment. |
-| [adoption-strategy.md](adoption-strategy.md) | How to make switching to Fides easy. |
-| [industry-conversion.md](industry-conversion.md) | Migration guide for projects from different sectors. |
-| [innovation.md](innovation.md) | AI, robotics, hardware, IoT applications. |
-| [ai-ml-features.md](ai-ml-features.md) | Mapping Fides capabilities to AI/ML problems. |
-| [tool.md](tool.md) | Names and roles of Fides development tools. |
-| [extra.md](extra.md) | Nice-to-have community goals (not on critical path). |
+| [roadmap/roadmap.md](roadmap/roadmap.md) | Milestones to "world domination" — the master roadmap. |
+| [roadmap/features-roadmap.md](roadmap/features-roadmap.md) | New language features roadmap (track of additions). |
+| [roadmap/llvm-roadmap.md](roadmap/llvm-roadmap.md) | LLVM parity & superset roadmap — compete, don't copy. |
+| [roadmap/roadmap-limitations.md](roadmap/roadmap-limitations.md) | Limitations & pain points to address. |
+| [roadmap/opportunities.md](roadmap/opportunities.md) | AI/ML feature opportunities + where Fides could be groundbreaking by industry. |
 
 ### Other
 | File | Description |
@@ -101,23 +92,23 @@ The front-end and middle-end pipeline: source → tokens → AST → types → I
 
 | File | LOC | Description |
 |------|----:|-------------|
-| [main.rs](../src/main.rs) | 2039 | CLI entry point, command dispatch, external tool invocation. |
+| [main.rs](../src/main.rs) | 2221 | CLI entry point, command dispatch, external tool invocation. |
 | [token.rs](../src/token.rs) | 263 | `TokenKind` enum — all Fides keywords and operators. |
 | [lexer.rs](../src/lexer.rs) | 539 | Tokenizer: source text → `Vec<Token>`. |
-| [ast.rs](../src/ast.rs) | 912 | AST node definitions: `Program`, `Func`, `Stmt`, `Expr`, `StructDef`, `EnumDef`, etc. |
+| [ast.rs](../src/ast.rs) | 916 | AST node definitions: `Program`, `Func`, `Stmt`, `Expr`, `StructDef`, `EnumDef`, etc. |
 | [parser.rs](../src/parser.rs) | 3136 | Recursive descent parser: `Vec<Token>` → `Program`. Error recovery + multiple error collection. |
-| [typechecker.rs](../src/typechecker.rs) | 5757 | Type validation, regions, effects, capabilities, traits, lints, @constant_time. ⚠️ MEDIUM risk. |
+| [typechecker.rs](../src/typechecker.rs) | 6435 | Type validation, regions, effects, capabilities, traits, lints, @constant_time, Rc/Arc. ⚠️ MEDIUM risk. |
 | [borrowck.rs](../src/borrowck.rs) | 1208 | Borrow checker (Phases 1-6): `--borrowck=off\|warn\|on`, field-wise borrows, NLL. |
-| [ir.rs](../src/ir.rs) | 1662 | SSA IR definitions: `IrModule`, `IrFunction`, `BasicBlock`, `Inst`, `IrType`. |
-| [lower.rs](../src/lower.rs) | 5202 | AST → SSA IR lowering. ⚠️ MEDIUM risk — affects all backends. |
+| [ir.rs](../src/ir.rs) | 1696 | SSA IR definitions: `IrModule`, `IrFunction`, `BasicBlock`, `Inst`, `IrType`, `BorrowKind`. |
+| [lower.rs](../src/lower.rs) | 5724 | AST → SSA IR lowering. ⚠️ MEDIUM risk — affects all backends. |
 | [mono.rs](../src/mono.rs) | 1471 | Generic monomorphization — specializes generic functions per call site. |
 | [comptime.rs](../src/comptime.rs) | 1316 | Compile-time eval: constant folding, reflection, f-string interpolation. |
-| [compiler.rs](../src/compiler.rs) | 1969 | Pipeline orchestration, module resolution, stdlib auto-include. |
+| [compiler.rs](../src/compiler.rs) | 2084 | Pipeline orchestration, module resolution, stdlib auto-include. |
 | [lsp.rs](../src/lsp.rs) | 892 | LSP server: JSON-RPC 2.0 over stdio, diagnostics, no external deps. |
 | [json.rs](../src/json.rs) | 289 | Built-in JSON parser/serializer (used by LSP, no external deps). |
 | [cparser.rs](../src/cparser.rs) | 315 | C header parser → generates Fides FFI bindings (`parse-header` command). |
 | [diag.rs](../src/diag.rs) | 463 | Unified diagnostic system: error codes, source context, colored output, Levenshtein suggestions. |
-| [fmt.rs](../src/fmt.rs) | 1113 | Source code formatter (`fmt` command). |
+| [fmt.rs](../src/fmt.rs) | 1165 | Source code formatter (`fmt` command). |
 
 ---
 
@@ -127,13 +118,13 @@ IR → target output. Multiple backends: interpreter, native ELF64, PE, C, WASM,
 
 | File | LOC | Description |
 |------|----:|-------------|
-| [interp.rs](../src/interp.rs) | 4647 | IR interpreter — the reference oracle. ⚠️ MEDIUM risk. Uses `vec_side_table` for p_vec_* ops. Call stack tracking for panic traces. |
-| [pir.rs](../src/pir.rs) | 2073 | PIR multi-level IR (L1/L2/L3) transforms. ⚠️ HIGH risk. |
-| [opt.rs](../src/opt.rs) | 7455 | PIR optimizer — 23 passes (const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, etc.). ⚠️ MEDIUM risk. |
+| [interp.rs](../src/interp.rs) | 4903 | IR interpreter — the reference oracle. ⚠️ MEDIUM risk. Uses `vec_side_table` for p_vec_* ops. Call stack tracking for panic traces. Rc/Arc runtime via p_rc_incr/p_rc_decr. |
+| [pir.rs](../src/pir.rs) | 2089 | PIR multi-level IR (L1/L2/L3) transforms. ⚠️ HIGH risk. |
+| [opt.rs](../src/opt.rs) | 8109 | PIR optimizer — 23 passes (const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, etc.). Function-level parallelism. ⚠️ MEDIUM risk. |
 | [peephole.rs](../src/peephole.rs) | 994 | 9-pass peephole optimizer, always on in `build`. ⚠️ CRITICAL. |
 | [regalloc.rs](../src/regalloc.rs) | 1170 | Linear scan register allocator with constant rematerialization. ⚠️ CRITICAL. |
-| [codegen_x64.rs](../src/codegen_x64.rs) | 1700 | PIR L3 → x86-64 assembly (used by `build` and `codegen`). ⚠️ HIGH risk. |
-| [codegen_c.rs](../src/codegen_c.rs) | 3503 | C codegen backend: IR → C99 source (`ccompile` command). Binary hardening + stack traces. ⚠️ HIGH risk. |
+| [codegen_x64.rs](../src/codegen_x64.rs) | 1939 | PIR L3 → x86-64 assembly (used by `build` and `codegen`). LEA instruction selection, System V ABI. ⚠️ HIGH risk. |
+| [codegen_c.rs](../src/codegen_c.rs) | 3622 | C codegen backend: IR → C99 source (`ccompile` command). Binary hardening + stack traces + Rc/Arc runtime. ⚠️ HIGH risk. |
 | [codegen_arm64.rs](../src/codegen_arm64.rs) | 364 | PIR L3 → ARM64 assembly (`codegen --target arm64`). |
 | [codegen_riscv.rs](../src/codegen_riscv.rs) | 360 | PIR L3 → RISC-V assembly (`codegen --target riscv`). |
 | [codegen.rs](../src/codegen.rs) | 1134 | Legacy codegen dispatch (unused). |
@@ -164,7 +155,7 @@ Binary emitters and the integrated linker. Byte-level correctness is critical.
 
 ## Source — Advanced / Experimental (src/)
 
-Specialized subsystems: embedded, hot reload, autograd, tensor.
+Specialized subsystems: embedded, hot reload, autograd, tensor, debugger, tools.
 
 | File | LOC | Description |
 |------|----:|-------------|
@@ -172,20 +163,30 @@ Specialized subsystems: embedded, hot reload, autograd, tensor.
 | [hotreload.rs](../src/hotreload.rs) | 559 | Hot reload: native JIT (ELF64) + function-level change detection (`watch` command). |
 | [autograd.rs](../src/autograd.rs) | 289 | Tape-based reverse-mode autograd for `grad` blocks. |
 | [tensor.rs](../src/tensor.rs) | 462 | Tensor type and operations support. |
+| [inc.rs](../src/inc.rs) | 171 | Incremental compilation cache (in-memory, hash-keyed by path+hash+flags). |
+| [debugger.rs](../src/debugger.rs) | 965 | Interactive IR-level debugger (`debug` command): breakpoints, step, locals. |
+| [native_debugger.rs](../src/native_debugger.rs) | 312 | Native ptrace-based debugger (`autopsy` command, Linux only). |
+| [pacte.rs](../src/pacte.rs) | 707 | Package manager library: init, add, install, remove, list, lock, search, publish. |
+| [scribe.rs](../src/scribe.rs) | 882 | Documentation generator library: HTML/Markdown from .fd source. |
+| [veil.rs](../src/veil.rs) | 367 | Code coverage tool library: function/line/instruction coverage. |
+| [lib.rs](../src/lib.rs) | 52 | Library crate root — shared by all 4 binaries. |
+| [bin/pacte.rs](../src/bin/pacte.rs) | — | `pacte` binary entry point. |
+| [bin/scribe.rs](../src/bin/scribe.rs) | — | `scribe` binary entry point. |
+| [bin/veil.rs](../src/bin/veil.rs) | — | `veil` binary entry point. |
 
 ---
 
 ## Standard Library (stdlib/)
 
 35 Fides source modules. `core.fd` is auto-included by the compiler; others are
-imported via `use`. See `docs/features.md` for which are feature-complete.
+imported via `use`. See `docs/reference/features.md` for which are feature-complete.
 
 | File | Description |
 |------|-------------|
 | [core.fd](../stdlib/core.fd) | Core stdlib (auto-included): `Option<T>`, `Result<T,E>`, `println`, `assert`, `assert_eq`. Option/Result combinators: map, and_then, or_else, unwrap_or_else, expect. |
 | [vec.fd](../stdlib/vec.fd) | `Vec<T>` container, higher-order methods (map, filter, fold), iterator adapters (take, skip, zip, enumerate, flat_map, chunk, window, dedup, sort_by, contains_val). |
 | [channel.fd](../stdlib/channel.fd) | Bounded MPSC channels: `channel_create`, `channel_send`, `channel_recv`, `channel_try_recv`, `channel_close`, `channel_is_closed`. |
-| [math.fd](../stdlib/math.fd) | Math functions: sqrt, sin, cos, floor, ceil, pow, fabs, constants. |
+| [math.fd](../stdlib/math.fd) | Math functions: sqrt, sin, cos, floor, ceil, pow, fabs, constants. Vec2/3/4, mat4, quat types with operator overloading + swizzle. |
 | [ecs.fd](../stdlib/ecs.fd) | Entity-Component-System runtime (Phase 8B: F18). |
 | [events.fd](../stdlib/events.fd) | Event system / handlers (Phase 8B: F20). |
 | [parallel.fd](../stdlib/parallel.fd) | Auto-parallelization framework (Phase 5C.4). |
@@ -222,7 +223,7 @@ imported via `use`. See `docs/features.md` for which are feature-complete.
 
 ## Tests (tests/)
 
-183 `.fd` test files (160 in root: 135 normal [104 passing + 8 known-fail + 23 skip] + 25 expected-fail; 23 in subdirs: capability/effects/regions/safety) plus the Rust test harness.
+213 `.fd` test files (190 in root; 23 in subdirs: capability/effects/regions/safety) plus the Rust test harness.
 Run all with `./target/release/fidesc test`; verify with `./verify.sh`.
 
 ### Test Infrastructure
@@ -241,12 +242,13 @@ Run all with `./target/release/fidesc test`; verify with `./verify.sh`.
 | [golden/](../tests/golden/) | Golden output files for intermediate compiler stages (IR, PIR L1/L2/L3, codegen, peephole) — used by `bisect.sh`. Contains 15 per-test subdirectories + `.txt` golden files. |
 
 ### Top-level `.fd` Tests (selected)
-135 normal (104 passing + 8 known-fail + 23 skip) + 25 expected-fail tests covering: arithmetic, control flow,
+165 test files in root covering: arithmetic, control flow,
 functions, strings, structs, pattern matching, enums, closures, generics,
 traits, capabilities, collections (Vec/HashMap/String), Option/Result, FFI,
 file I/O, async/await, borrow checking, linear types, contracts, ECS, state
 machines, serde, iterators, error chaining, conditional compilation, derive
-macros, dlopen, typed strings, raw pointers, select statements, and more.
+macros, dlopen, typed strings, raw pointers, select statements, Rc/Arc,
+Box recursive types, vec/mat math, and more.
 
 Expected-fail tests (24) verify that the compiler correctly *rejects* unsafe
 code: `test_*_fail` variants for banking, money, borrowck, safety, contracts,
@@ -254,10 +256,10 @@ typed strings, init guarantees, constant_time, etc.
 
 ### Current Test Results (Aug 2026)
 ```
-Interpreter:  104/104 normal  (+ 25/25 expected fail, 6 bonus pass)
-C Codegen:    104/104 matched  (+ 25/25 expected fail, 2 bonus pass)
-PE Emitter:   104/104 valid   (+ 25/25 expected fail, 6 bonus pass)
-Unit tests:   257/257 passed
+Interpreter:  116/116 normal  (6 bonus passes)
+C Codegen:    116/116 matched (4 bonus passes)
+PE Emitter:   116/116 valid   (6 bonus passes)
+Unit tests:   265/265 passed  (cargo test --lib)
 Harness:      8/8 passed
 ```
 

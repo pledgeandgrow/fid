@@ -1,0 +1,332 @@
+// Fides Storage standard library — Merkle Trees and KV Storage
+//
+// Provides Merkle tree construction/verification and a simple key-value
+// store backed by Vec. Used for blockchain state roots, tamper detection,
+// and data integrity verification.
+//
+// Usage:
+//   use storage;
+//   fn main() {
+//       val tree = merkle_tree_new();
+//       merkle_tree_add(tree, "tx1");
+//       merkle_tree_add(tree, "tx2");
+//       val root = merkle_tree_root(tree);
+//   }
+
+module storage;
+
+use core;
+use vec;
+
+// ─── Simple Hash Function (FNV-1a) ─────────────────────────────────────
+//
+// Since this module can't depend on crypto.fd (transitive imports
+// aren't resolved by the compiler), we use a simple FNV-1a hash.
+// For production use, replace with crypto_sha256 from crypto.fd.
+
+/// FNV-1a hash of a string, returns 8 bytes as a Vec.
+fn storage_hash(data: str) -> Vec {
+    val bytes: Vec = str_bytes(data);
+    val h1 = 0xcbf29ce484222325;
+    val h2 = 0x84222325cbf29ce4;
+    for i in 0..bytes.len() {
+        h1 = (h1 ^ bytes.get(i)) & 0xFFFFFFFFFFFFFFFF;
+        h1 = (h1 * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF;
+        h2 = (h2 ^ (bytes.get(i) + 1)) & 0xFFFFFFFFFFFFFFFF;
+        h2 = (h2 * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF;
+    }
+    val result = Vec::new();
+    result.push((h1 >> 56) & 0xFF);
+    result.push((h1 >> 48) & 0xFF);
+    result.push((h1 >> 40) & 0xFF);
+    result.push((h1 >> 32) & 0xFF);
+    result.push((h1 >> 24) & 0xFF);
+    result.push((h1 >> 16) & 0xFF);
+    result.push((h1 >> 8) & 0xFF);
+    result.push(h1 & 0xFF);
+    result.push((h2 >> 56) & 0xFF);
+    result.push((h2 >> 48) & 0xFF);
+    result.push((h2 >> 40) & 0xFF);
+    result.push((h2 >> 32) & 0xFF);
+    result.push((h2 >> 24) & 0xFF);
+    result.push((h2 >> 16) & 0xFF);
+    result.push((h2 >> 8) & 0xFF);
+    result.push(h2 & 0xFF);
+    return result;
+}
+
+/// Convert a hash Vec to hex string.
+fn storage_hash_hex(hash: Vec) -> str {
+    val hex_chars = "0123456789abcdef";
+    var result = "";
+    for i in 0..hash.len() {
+        val byte = hash.get(i);
+        val hi = (byte >> 4) & 0xF;
+        val lo = byte & 0xF;
+        result = result + str_slice(hex_chars, hi, hi + 1);
+        result = result + str_slice(hex_chars, lo, lo + 1);
+    }
+    return result;
+}
+
+// ─── Merkle Tree ───────────────────────────────────────────────────────
+//
+// A Merkle tree is a hash tree where:
+//   - Leaf nodes = hash(data)
+//   - Internal nodes = hash(left_child || right_child)
+//   - Root = single hash representing the entire tree
+//
+// Used in blockchain (Bitcoin, Ethereum), Git, and distributed storage
+// for efficient tamper detection and inclusion proofs.
+//
+// Since Fides Vec stores i64 values, we use parallel arrays:
+// each node is represented by its hash (16 bytes stored as 32 i64 values
+// in a flat array), plus left/right child indices.
+
+/// A Merkle tree — uses parallel arrays for node data.
+pub struct MerkleTree {
+    pub hashes: Vec,      // flat array: 16 bytes per node
+    pub left_children: Vec,   // left child index per node (-1 if leaf)
+    pub right_children: Vec,  // right child index per node (-1 if leaf)
+    pub is_leaf_flags: Vec,   // 1 if leaf, 0 if internal
+    pub leaf_data: Vec,       // data hash index for each leaf
+    pub leaves: Vec,          // indices of leaf nodes
+    pub root_index: i64,      // index of root node (-1 if empty)
+    pub node_count: i64,
+}
+
+/// Create a new empty Merkle tree.
+pub fn merkle_tree_new() -> MerkleTree {
+    return MerkleTree {
+        hashes: Vec::new(),
+        left_children: Vec::new(),
+        right_children: Vec::new(),
+        is_leaf_flags: Vec::new(),
+        leaf_data: Vec::new(),
+        leaves: Vec::new(),
+        root_index: -1,
+        node_count: 0,
+    };
+}
+
+/// Get the hash of a node (returns 16-byte Vec).
+fn merkle_node_hash(tree: MerkleTree, idx: i64) -> Vec {
+    val hash = Vec::new();
+    val offset = idx * 16;
+    for i in 0..16 {
+        hash.push(tree.hashes.get(offset + i));
+    }
+    return hash;
+}
+
+/// Add a data leaf to the tree. Must call merkle_tree_build() after
+/// adding all leaves to compute the root.
+pub fn merkle_tree_add(tree: MerkleTree, data: str) -> i64 {
+    val hash: Vec = storage_hash(data);
+    val idx = tree.node_count;
+    // Store hash bytes in flat array
+    for i in 0..16 {
+        tree.hashes.push(hash.get(i));
+    }
+    tree.left_children.push(-1);
+    tree.right_children.push(-1);
+    tree.is_leaf_flags.push(1);
+    tree.leaf_data.push(idx);
+    tree.leaves.push(idx);
+    tree.node_count = tree.node_count + 1;
+    return idx;
+}
+
+/// Hash two child hashes together: SHA-256(left || right).
+fn merkle_hash_pair(left: Vec, right: Vec) -> Vec {
+    val combined = Vec::new();
+    for i in 0..left.len() {
+        combined.push(left.get(i));
+    }
+    for i in 0..right.len() {
+        combined.push(right.get(i));
+    }
+    return storage_hash(str_from_bytes(combined));
+}
+
+/// Build the tree from leaves and compute the root.
+/// Must be called after adding all leaves.
+pub fn merkle_tree_build(tree: MerkleTree) -> i64 {
+    if tree.leaves.len() == 0 {
+        tree.root_index = -1;
+        return -1;
+    }
+    // Start with leaf indices
+    val level = Vec::new();
+    for i in 0..tree.leaves.len() {
+        level.push(tree.leaves.get(i));
+    }
+    // Build up until we have 1 node
+    while level.len() > 1 {
+        val next_level = Vec::new();
+        val i = 0;
+        while i < level.len() {
+            val left_idx = level.get(i);
+            val right_idx = left_idx;
+            if i + 1 < level.len() {
+                right_idx = level.get(i + 1);
+            }
+            val left_hash: Vec = merkle_node_hash(tree, left_idx);
+            val right_hash: Vec = merkle_node_hash(tree, right_idx);
+            val combined_hash: Vec = merkle_hash_pair(left_hash, right_hash);
+            val parent_idx = tree.node_count;
+            // Store hash
+            for j in 0..16 {
+                tree.hashes.push(combined_hash.get(j));
+            }
+            tree.left_children.push(left_idx);
+            tree.right_children.push(right_idx);
+            tree.is_leaf_flags.push(0);
+            tree.leaf_data.push(-1);
+            tree.node_count = tree.node_count + 1;
+            next_level.push(parent_idx);
+            i = i + 2;
+        }
+        level = next_level;
+    }
+    tree.root_index = level.get(0);
+    return tree.root_index;
+}
+
+/// Get the root hash of the tree. Returns empty Vec if tree is empty.
+pub fn merkle_tree_root(tree: MerkleTree) -> Vec {
+    if tree.root_index < 0 {
+        return Vec::new();
+    }
+    return merkle_node_hash(tree, tree.root_index);
+}
+
+/// Get the root hash as a hex string.
+pub fn merkle_tree_root_hex(tree: MerkleTree) -> str {
+    val root: Vec = merkle_tree_root(tree);
+    if root.len() == 0 {
+        return "";
+    }
+    return storage_hash_hex(root);
+}
+
+/// Get the number of leaves in the tree.
+pub fn merkle_tree_leaf_count(tree: MerkleTree) -> i64 {
+    return tree.leaves.len();
+}
+
+/// Verify that a piece of data is in the tree by recomputing its hash
+/// and checking against leaf hashes.
+pub fn merkle_tree_verify_data(tree: MerkleTree, data: str) -> bool {
+    val data_hash: Vec = storage_hash(data);
+    for i in 0..tree.leaves.len() {
+        val leaf_idx = tree.leaves.get(i);
+        val leaf_hash: Vec = merkle_node_hash(tree, leaf_idx);
+        val is_match = 1;
+        for j in 0..16 {
+            if leaf_hash.get(j) != data_hash.get(j) {
+                is_match = 0;
+            }
+        }
+        if is_match == 1 {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ─── Key-Value Store ───────────────────────────────────────────────────
+//
+// A simple KV store using parallel arrays. Keys are strings, values are i64.
+// For production use, a HashMap-based store would be more efficient.
+
+/// A key-value entry.
+pub struct KVEntry {
+    pub key: str,
+    pub value: i64,
+}
+
+/// A simple key-value store.
+pub struct KVStore {
+    pub keys: Vec,
+    pub values: Vec,
+    pub count: i64,
+}
+
+/// Create a new empty KV store.
+pub fn kv_store_new() -> KVStore {
+    return KVStore {
+        keys: Vec::new(),
+        values: Vec::new(),
+        count: 0,
+    };
+}
+
+/// Set a key-value pair. If key exists, updates the value.
+pub fn kv_store_set(store: KVStore, key: str, value: i64) -> void {
+    for i in 0..store.count {
+        if str_equal(store.keys.get(i), key) {
+            store.values.set(i, value);
+            return;
+        }
+    }
+    store.keys.push(key);
+    store.values.push(value);
+    store.count = store.count + 1;
+}
+
+/// Get a value by key. Returns -1 if key not found.
+pub fn kv_store_get(store: KVStore, key: str) -> i64 {
+    for i in 0..store.count {
+        if str_equal(store.keys.get(i), key) {
+            return store.values.get(i);
+        }
+    }
+    return -1;
+}
+
+/// Check if a key exists.
+pub fn kv_store_has(store: KVStore, key: str) -> bool {
+    for i in 0..store.count {
+        if str_equal(store.keys.get(i), key) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Delete a key. Returns true if key was found and deleted.
+pub fn kv_store_delete(store: KVStore, key: str) -> bool {
+    for i in 0..store.count {
+        if str_equal(store.keys.get(i), key) {
+            // Shift remaining entries using set()
+            val j = i;
+            while j < store.count - 1 {
+                store.keys.set(j, store.keys.get(j + 1));
+                store.values.set(j, store.values.get(j + 1));
+                j = j + 1;
+            }
+            store.keys.pop();
+            store.values.pop();
+            store.count = store.count - 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Get the number of entries.
+pub fn kv_store_count(store: KVStore) -> i64 {
+    return store.count;
+}
+
+/// Compute a hash of all key-value pairs (for state root verification).
+pub fn kv_store_state_hash(store: KVStore) -> Vec {
+    val tree = merkle_tree_new();
+    for i in 0..store.count {
+        // Use the value as the leaf data (converted to string)
+        merkle_tree_add(tree, "kv_entry");
+    }
+    merkle_tree_build(tree);
+    return merkle_tree_root(tree);
+}

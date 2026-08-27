@@ -229,19 +229,30 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
 
     // Resolve use imports — load files from disk
     let mut imported_modules: Vec<(String, Program)> = Vec::new();
+    // Track which modules have been loaded to avoid duplicates
+    let mut loaded_module_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(src_path) = source_path {
         let base_dir = Path::new(src_path)
             .parent()
             .unwrap_or(Path::new("."));
 
-        for import in &user.imports {
+        // Collect imports: start with user imports, then add transitive imports
+        let mut imports_to_process: Vec<String> = user.imports.iter()
+            .map(|i| i.path.clone())
+            .collect();
+
+        while let Some(import_path) = imports_to_process.pop() {
             // Skip "core" — it's auto-included
-            if import.path == "core" {
+            if import_path == "core" {
+                continue;
+            }
+            // Skip already-loaded modules
+            if loaded_module_names.contains(&import_path) {
                 continue;
             }
 
             // Try: <base_dir>/<path>.fd  and  <base_dir>/<path>/mod.fd
-            let path_str = import.path.replace("::", "/");
+            let path_str = import_path.replace("::", "/");
             let candidates = [
                 base_dir.join(format!("{}.fd", path_str)),
                 base_dir.join(format!("{}/mod.fd", path_str)),
@@ -271,11 +282,22 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
                 let imported = p.parse().map_err(|e| vec![e])?;
 
                 let module_name = imported.module.clone()
-                    .unwrap_or_else(|| import.path.clone());
+                    .unwrap_or_else(|| import_path.clone());
+
+                // Mark as loaded
+                loaded_module_names.insert(import_path.clone());
+                loaded_module_names.insert(module_name.clone());
 
                 // Extract names from imported module for future imports
                 struct_names.extend(imported.structs.iter().map(|s| s.name.clone()));
                 enum_names.extend(imported.enums.iter().map(|e| e.name.clone()));
+
+                // Add transitive imports from this module
+                for trans_import in &imported.imports {
+                    if !loaded_module_names.contains(&trans_import.path) {
+                        imports_to_process.push(trans_import.path.clone());
+                    }
+                }
 
                 imported_modules.push((module_name, imported));
             } else {
@@ -294,7 +316,7 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
                     // Find closest match
                     let mut best: Option<(usize, &String)> = None;
                     for s in &suggestions {
-                        let dist = edit_distance(&import.path, s);
+                        let dist = edit_distance(&import_path, s);
                         if dist <= 3 && best.map_or(true, |(b, _)| dist < b) {
                             best = Some((dist, s));
                         }
@@ -309,7 +331,7 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
                 };
                 return Err(vec![format!(
                     "Import error: could not resolve module '{}'{} (searched: {})",
-                    import.path,
+                    import_path,
                     suggestion,
                     candidates.iter().map(|c| c.display().to_string()).collect::<Vec<_>>().join(", ")
                 )]);

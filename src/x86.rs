@@ -231,7 +231,7 @@ impl X86CodeGen {
         // Function epilogue (in case we fall through)
         wln!(self, "    mov rsp, rbp");
         wln!(self, "    pop rbp");
-        wln!(self, "    ret");
+        wln!(self, "    return");
     }
 
     /// Generate code for a single instruction
@@ -445,7 +445,7 @@ impl X86CodeGen {
                 }
                 wln!(self, "    mov rsp, rbp");
                 wln!(self, "    pop rbp");
-                wln!(self, "    ret");
+                wln!(self, "    return");
             }
 
             Inst::Unreachable => {
@@ -915,7 +915,7 @@ impl X86CodeGen {
         wln!(self, "    pop r12");
         wln!(self, "    mov rsp, rbp");
         wln!(self, "    pop rbp");
-        wln!(self, "    ret");
+        wln!(self, "    return");
 
         // p_print_str(rcx = *u8 pointer to null-terminated string)
         wln!(self, "");
@@ -973,7 +973,7 @@ impl X86CodeGen {
         wln!(self, "    pop r12");
         wln!(self, "    mov rsp, rbp");
         wln!(self, "    pop rbp");
-        wln!(self, "    ret");
+        wln!(self, "    return");
 
         // p_print_bool(rcx = 0 or 1)
         wln!(self, "");
@@ -1032,7 +1032,7 @@ impl X86CodeGen {
         wln!(self, "    pop r12");
         wln!(self, "    mov rsp, rbp");
         wln!(self, "    pop rbp");
-        wln!(self, "    ret");
+        wln!(self, "    return");
 
         // p_print_float(rcx = f64 bits stored as i64)
         // Formats as integer.fractional with 6 decimal places
@@ -1190,7 +1190,7 @@ impl X86CodeGen {
         wln!(self, "    pop r12");
         wln!(self, "    mov rsp, rbp");
         wln!(self, "    pop rbp");
-        wln!(self, "    ret");
+        wln!(self, "    return");
 
         // p_to_str(rcx = i64 value) -> rax = pointer to null-terminated string
         // Converts an integer to a string in a static buffer
@@ -1229,7 +1229,7 @@ impl X86CodeGen {
         wln!(self, "    lea rax, [r8]  ; return pointer to start of string");
         wln!(self, "    mov rsp, rbp");
         wln!(self, "    pop rbp");
-        wln!(self, "    ret");
+        wln!(self, "    return");
 
         // p_str_concat(rcx = left ptr, rdx = right ptr) -> rax = new string ptr
         // Concatenates two null-terminated strings into a static buffer
@@ -1278,7 +1278,7 @@ impl X86CodeGen {
         wln!(self, "    mov rax, OFFSET str_concat_buf  ; return pointer");
         wln!(self, "    mov rsp, rbp");
         wln!(self, "    pop rbp");
-        wln!(self, "    ret");
+        wln!(self, "    return");
 
         // p_panic(rcx = message pointer)
         wln!(self, "");
@@ -1351,7 +1351,7 @@ impl X86CodeGen {
         wln!(self, "    ; rax = pointer");
         wln!(self, "    mov rsp, rbp");
         wln!(self, "    pop rbp");
-        wln!(self, "    ret");
+        wln!(self, "    return");
 
         // p_free(rcx = ptr) — free heap allocation
         wln!(self, "");
@@ -1377,7 +1377,7 @@ impl X86CodeGen {
         wln!(self, "    add rsp, 32");
         wln!(self, "    mov rsp, rbp");
         wln!(self, "    pop rbp");
-        wln!(self, "    ret");
+        wln!(self, "    return");
 
         // _main — Windows entry point that calls our main
         wln!(self, "");

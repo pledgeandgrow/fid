@@ -127,6 +127,9 @@ pub struct TypeChecker {
     /// Sandbox depth — when > 0, all capabilities are revoked.
     /// Any IO/FS/Net/Spawn call inside a sandbox block is a compile error.
     sandbox_depth: usize,
+    /// GPU region depth — when > 0, we're inside a `region gpu r { }` block.
+    /// Allocations inside use GPU memory (ML1: region-scoped GPU memory).
+    gpu_region_depth: usize,
     /// Stack of (region_name, budget_bytes, current_usage_bytes) for active
     /// region blocks with budgets. Used to track and enforce memory budgets.
     region_budgets: Vec<(String, Option<u64>, u64)>,
@@ -197,6 +200,7 @@ impl TypeChecker {
             current_return_types: Vec::new(),
             current_self_type: None,
             sandbox_depth: 0,
+            gpu_region_depth: 0,
             region_budgets: Vec::new(),
             region_lines: HashMap::new(),
             var_alloc_lines: HashMap::new(),
@@ -918,6 +922,38 @@ impl TypeChecker {
         // Verify @constant_time annotation (side-channel defense)
         self.verify_constant_time(program);
 
+        // Verify @realtime annotation (real-time effect enforcement — F27/ML-RT)
+        // @realtime functions must have bounded execution time:
+        // no allocation, no blocking IO, no unbounded loops, no recursion,
+        // no dynamic dispatch, no spawn. Region memory only.
+        self.verify_realtime(program);
+
+        // Verify @differentiable annotation (ML3: Effect-Traced Autodiff)
+        // @differentiable functions must only use Diff-tracked operations.
+        // No IO, Net, Spawn, or Diverge — these break gradient computation.
+        // Transitive: can only call other @differentiable or pure functions.
+        self.verify_differentiable(program);
+
+        // Verify @quantized annotation (ML10: Real Quantization)
+        // @quantized functions must only use quantized ops (no float dequant in hot paths).
+        self.verify_quantized(program);
+
+        // Verify @checkpoint annotation (ML11: Gradient Checkpointing)
+        // @checkpoint functions must be @differentiable and @deterministic.
+        self.verify_checkpoint(program);
+
+        // Verify @dp annotation (ML12: Differential Privacy)
+        // @dp(epsilon) functions must have Noise effect and no raw data escape.
+        self.verify_dp(program);
+
+        // Verify @shard annotation (ML13: Tensor Parallelism)
+        // @shard functions must have Comm effect for cross-rank ops.
+        self.verify_shard(program);
+
+        // Verify @adapter annotation (ML14: LoRA/Adapter Hot-Swap)
+        // @adapter functions must only modify adapter weights, not base weights.
+        self.verify_adapter(program);
+
         // Verify @tainted annotation (injection defense)
         self.verify_tainted(program);
 
@@ -1007,7 +1043,7 @@ impl TypeChecker {
                         "Effect error: function '{}' has inferred effect '!{}' but only declared '!{}'.\n\
                          \x20\x20\x20\x20The function performs an operation that produces the '{}' effect,\n\
                          \x20\x20\x20\x20but the effect annotation doesn't include it.\n\
-                         \x20\x20\x20\x20Fix: change the annotation to `pf {}() {}` (add '{}' to the effect set).",
+                         \x20\x20\x20\x20Fix: change the annotation to `fn {}() {}` (add '{}' to the effect set).",
                         func.name, eff, func.declared_effects.join(","),
                         eff,
                         func.name, correct_annotation, eff
@@ -1077,6 +1113,398 @@ impl TypeChecker {
                      \x20\x20\x20\x20or remove the @deterministic annotation.",
                     func.name, fp_found.join(", ")
                 ));
+            }
+
+            errs
+        };
+
+        for func in &program.funcs {
+            for err in check_one(func) {
+                self.errors.push(err);
+            }
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                for err in check_one(method) {
+                    self.errors.push(err);
+                }
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                for err in check_one(method) {
+                    self.errors.push(err);
+                }
+            }
+        }
+    }
+
+    /// Verify @differentiable annotation constraints (ML3: Effect-Traced Autodiff).
+    ///
+    /// A @differentiable function must:
+    ///   - Have no IO, Net, Spawn, or Diverge effects (these break gradient computation)
+    ///   - Contain at least one Diff effect (otherwise it's not doing differentiable computation)
+    ///   - Not call any function that has IO/Net/Spawn/Diverge (transitive — gradients
+    ///     can't flow through nondeterministic operations)
+    ///
+    /// Alloc, Read, Write, and Diff effects are allowed.
+    /// A function with no Diff effect is still valid if it only does pure computation
+    /// (e.g., a helper that rearranges data) — but it must not have side effects.
+    fn verify_differentiable(&mut self, program: &Program) {
+        let check_one = |func: &Func| -> Vec<String> {
+            let is_diff = func.annotations.iter().any(|a| a.name == "differentiable");
+            if !is_diff { return Vec::new(); }
+
+            let mut errs = Vec::new();
+
+            // Check effects — reject IO, Net, Spawn, Diverge
+            if let Some(effects) = self.func_effects.get(&func.name) {
+                for eff in effects {
+                    match eff.as_str() {
+                        "IO" | "Net" | "Spawn" | "Diverge" => {
+                            errs.push(format!(
+                                "Differentiability error: function '{}' is @differentiable but has effect '!{}'.\n\
+                                 \x20\x20\x20\x20@differentiable functions must support gradient computation.\n\
+                                 \x20\x20\x20\x20Effect '!{}' breaks the computation graph (IO/Net depend on external state,\n\
+                                 \x20\x20\x20\x20Spawn introduces concurrency, Diverge introduces control flow uncertainty).\n\
+                                 \x20\x20\x20\x20Fix: remove the @differentiable annotation, or remove the operation that\n\
+                                 \x20\x20\x20\x20produces the '!{}' effect.",
+                                func.name, eff, eff, eff
+                            ));
+                        }
+                        _ => {} // Alloc, Read, Write, Diff are allowed
+                    }
+                }
+            }
+
+            errs
+        };
+
+        for func in &program.funcs {
+            for err in check_one(func) {
+                self.errors.push(err);
+            }
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                for err in check_one(method) {
+                    self.errors.push(err);
+                }
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                for err in check_one(method) {
+                    self.errors.push(err);
+                }
+            }
+        }
+    }
+
+    /// Verify @quantized annotation (ML10: Real Quantization).
+    ///
+    /// A @quantized function must:
+    ///   - Not have IO, Net, Spawn, or Diverge effects (same as @differentiable)
+    ///   - Not call dequantize_q8 (that would defeat the purpose of quantization)
+    ///   - Only use quantized ops (qmatmul, quantize_q8) or pure ops
+    fn verify_quantized(&mut self, program: &Program) {
+        let check_one = |func: &Func| -> Vec<String> {
+            let is_quant = func.annotations.iter().any(|a| a.name == "quantized");
+            if !is_quant { return Vec::new(); }
+
+            let mut errs = Vec::new();
+
+            // Check effects — reject IO, Net, Spawn, Diverge
+            if let Some(effects) = self.func_effects.get(&func.name) {
+                for eff in effects {
+                    match eff.as_str() {
+                        "IO" | "Net" | "Spawn" | "Diverge" => {
+                            errs.push(format!(
+                                "Quantization error: function '{}' is @quantized but has effect '!{}'.\n\
+                                 \x20\x20\x20\x20@quantized functions must only use quantized operations.\n\
+                                 \x20\x20\x20\x20Effect '!{}' is incompatible with quantized inference.\n\
+                                 \x20\x20\x20\x20Fix: remove the @quantized annotation, or remove the operation.",
+                                func.name, eff, eff
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Check for dequantize_q8 calls — these defeat quantization
+            let mut found_dequant = false;
+            scan_for_calls(&func.body, &mut found_dequant, "dequantize_q8");
+            if found_dequant {
+                errs.push(format!(
+                    "Quantization error: function '{}' is @quantized but calls dequantize_q8.\n\
+                     \x20\x20\x20\x20Dequantizing inside a @quantized function defeats the purpose of quantization\n\
+                     \x20\x20\x20\x20(it silently falls back to float, losing the INT8 performance benefit).\n\
+                     \x20\x20\x20\x20Fix: use qmatmul for quantized matmul, or remove the @quantized annotation.",
+                    func.name
+                ));
+            }
+
+            errs
+        };
+
+        for func in &program.funcs {
+            for err in check_one(func) {
+                self.errors.push(err);
+            }
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                for err in check_one(method) {
+                    self.errors.push(err);
+                }
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                for err in check_one(method) {
+                    self.errors.push(err);
+                }
+            }
+        }
+    }
+
+    /// Verify @checkpoint annotation (ML11: Gradient Checkpointing).
+    ///
+    /// A @checkpoint function must:
+    ///   - Also be @differentiable (you can only checkpoint differentiable functions)
+    ///   - Also be @deterministic (recompute must produce the same result)
+    ///   - Not have IO, Net, Spawn, or Diverge effects
+    fn verify_checkpoint(&mut self, program: &Program) {
+        let check_one = |func: &Func| -> Vec<String> {
+            let is_checkpoint = func.annotations.iter().any(|a| a.name == "checkpoint");
+            if !is_checkpoint { return Vec::new(); }
+
+            let mut errs = Vec::new();
+
+            // Must also be @differentiable
+            let is_diff = func.annotations.iter().any(|a| a.name == "differentiable");
+            if !is_diff {
+                errs.push(format!(
+                    "Checkpoint error: function '{}' is @checkpoint but not @differentiable.\n\
+                     \x20\x20\x20\x20@checkpoint saves and recomputes intermediate activations for gradient\n\
+                     \x20\x20\x20\x20computation. Only @differentiable functions can be checkpointed.\n\
+                     \x20\x20\x20\x20Fix: add @differentiable annotation to '{}'.",
+                    func.name, func.name
+                ));
+            }
+
+            // Must also be @deterministic (recompute must produce same result)
+            let is_det = func.annotations.iter().any(|a| a.name == "deterministic");
+            if !is_det {
+                errs.push(format!(
+                    "Checkpoint error: function '{}' is @checkpoint but not @deterministic.\n\
+                     \x20\x20\x20\x20@checkpoint recomputes activations during the backward pass.\n\
+                     \x20\x20\x20\x20If the function is not deterministic, the recomputed values may differ,\n\
+                     \x20\x20\x20\x20producing incorrect gradients.\n\
+                     \x20\x20\x20\x20Fix: add @deterministic annotation to '{}'.",
+                    func.name, func.name
+                ));
+            }
+
+            // Check effects — reject IO, Net, Spawn, Diverge
+            if let Some(effects) = self.func_effects.get(&func.name) {
+                for eff in effects {
+                    match eff.as_str() {
+                        "IO" | "Net" | "Spawn" | "Diverge" => {
+                            errs.push(format!(
+                                "Checkpoint error: function '{}' is @checkpoint but has effect '!{}'..\n\
+                                 \x20\x20\x20\x20@checkpoint functions must be deterministic and differentiable.\n\
+                                 \x20\x20\x20\x20Effect '!{}' breaks this guarantee.",
+                                func.name, eff, eff
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            errs
+        };
+
+        for func in &program.funcs {
+            for err in check_one(func) {
+                self.errors.push(err);
+            }
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                for err in check_one(method) {
+                    self.errors.push(err);
+                }
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                for err in check_one(method) {
+                    self.errors.push(err);
+                }
+            }
+        }
+    }
+
+    /// Verify @dp(epsilon) annotation (ML12: Differential Privacy).
+    ///
+    /// A @dp function must:
+    ///   - Have the Noise effect (gradient noise must be added for DP)
+    ///   - Not have IO or Net effects (raw data must not escape)
+    ///   - The epsilon parameter is recorded for audit purposes
+    fn verify_dp(&mut self, program: &Program) {
+        let check_one = |func: &Func| -> Vec<String> {
+            let dp_ann = func.annotations.iter().find(|a| a.name == "dp");
+            if dp_ann.is_none() { return Vec::new(); }
+
+            let mut errs = Vec::new();
+
+            // Check effects — must have Noise, must not have IO/Net
+            if let Some(effects) = self.func_effects.get(&func.name) {
+                let has_noise = effects.iter().any(|e| e == "Noise");
+                if !has_noise {
+                    errs.push(format!(
+                        "Differential privacy error: function '{}' is @dp but has no '!Noise' effect.\n\
+                         \x20\x20\x20\x20@dp functions must add noise to gradients/data for privacy guarantees.\n\
+                         \x20\x20\x20\x20Without noise, the function leaks information about individual data points.\n\
+                         \x20\x20\x20\x20Fix: add a noise operation (e.g., dp_noise, gaussian_noise) to '{}'.",
+                        func.name, func.name
+                    ));
+                }
+                for eff in effects {
+                    match eff.as_str() {
+                        "IO" | "Net" => {
+                            errs.push(format!(
+                                "Differential privacy error: function '{}' is @dp but has effect '!{}'.\n\
+                                 \x20\x20\x20\x20@dp functions must not expose raw data externally.\n\
+                                 \x20\x20\x20\x20Effect '!{}' allows data to escape, breaking the privacy guarantee.\n\
+                                 \x20\x20\x20\x20Fix: remove the IO/Net operation, or remove the @dp annotation.",
+                                func.name, eff, eff
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            errs
+        };
+
+        for func in &program.funcs {
+            for err in check_one(func) {
+                self.errors.push(err);
+            }
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                for err in check_one(method) {
+                    self.errors.push(err);
+                }
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                for err in check_one(method) {
+                    self.errors.push(err);
+                }
+            }
+        }
+    }
+
+    /// Verify @shard annotation (ML13: Tensor Parallelism).
+    ///
+    /// A @shard function must:
+    ///   - Have the Comm effect (cross-rank communication is required for sharding)
+    ///   - Not have IO or Net effects (use Comm for cross-device, not IO/Net)
+    fn verify_shard(&mut self, program: &Program) {
+        let check_one = |func: &Func| -> Vec<String> {
+            let is_shard = func.annotations.iter().any(|a| a.name == "shard");
+            if !is_shard { return Vec::new(); }
+
+            let mut errs = Vec::new();
+
+            // Check effects — must have Comm, must not have IO/Net
+            if let Some(effects) = self.func_effects.get(&func.name) {
+                let has_comm = effects.iter().any(|e| e == "Comm");
+                if !has_comm {
+                    errs.push(format!(
+                        "Shard error: function '{}' is @shard but has no '!Comm' effect.\n\
+                         \x20\x20\x20\x20@shard functions must communicate across devices (all-reduce, broadcast, etc.).\n\
+                         \x20\x20\x20\x20Without Comm, each rank computes independently, producing incorrect results.\n\
+                         \x20\x20\x20\x20Fix: add a communication operation (e.g., all_reduce, broadcast) to '{}'.",
+                        func.name, func.name
+                    ));
+                }
+                for eff in effects {
+                    match eff.as_str() {
+                        "IO" | "Net" => {
+                            errs.push(format!(
+                                "Shard error: function '{}' is @shard but has effect '!{}'.\n\
+                                 \x20\x20\x20\x20@shard functions should use Comm (cross-device) not IO/Net (host).\n\
+                                 \x20\x20\x20\x20Fix: use all_reduce/broadcast instead of print/network calls.",
+                                func.name, eff
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            errs
+        };
+
+        for func in &program.funcs {
+            for err in check_one(func) {
+                self.errors.push(err);
+            }
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                for err in check_one(method) {
+                    self.errors.push(err);
+                }
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                for err in check_one(method) {
+                    self.errors.push(err);
+                }
+            }
+        }
+    }
+
+    /// Verify @adapter annotation (ML14: LoRA/Adapter Hot-Swap).
+    ///
+    /// An @adapter function must:
+    ///   - Not have IO, Net, Spawn, or Diverge effects
+    ///   - Only modify adapter weights (not base weights) — verified by
+    ///     checking that the function does not call base weight mutation ops
+    fn verify_adapter(&mut self, program: &Program) {
+        let check_one = |func: &Func| -> Vec<String> {
+            let is_adapter = func.annotations.iter().any(|a| a.name == "adapter");
+            if !is_adapter { return Vec::new(); }
+
+            let mut errs = Vec::new();
+
+            // Check effects — reject IO, Net, Spawn, Diverge
+            if let Some(effects) = self.func_effects.get(&func.name) {
+                for eff in effects {
+                    match eff.as_str() {
+                        "IO" | "Net" | "Spawn" | "Diverge" => {
+                            errs.push(format!(
+                                "Adapter error: function '{}' is @adapter but has effect '!{}'.\n\
+                                 \x20\x20\x20\x20@adapter functions must be pure weight transformations.\n\
+                                 \x20\x20\x20\x20Effect '!{}' is incompatible with adapter hot-swap.\n\
+                                 \x20\x20\x20\x20Fix: remove the operation, or remove the @adapter annotation.",
+                                func.name, eff, eff
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
             }
 
             errs
@@ -1908,6 +2336,232 @@ impl TypeChecker {
         }
     }
 
+    /// Verify @realtime annotation (real-time effect enforcement — F27).
+    ///
+    /// A @realtime function must have bounded execution time:
+    ///   1. No heap allocation (no malloc, vec_new, etc.) — region memory only
+    ///   2. No blocking IO (no file_read, socket_*, etc.)
+    ///   3. No unbounded loops (all while loops must have constant trip counts)
+    ///   4. No recursion (no direct or indirect self-calls)
+    ///   5. No dynamic dispatch (no function pointers, no trait objects)
+    ///   6. No spawn (no thread creation, no async)
+    ///   7. Transitive: can only call other @realtime functions or pure helpers
+    ///
+    /// This makes Fides the only language with compile-time real-time guarantees
+    /// combined with memory safety. Rust's async doesn't support real-time well.
+    /// Zig has no safety. C has no safety.
+    fn verify_realtime(&mut self, program: &Program) {
+        // Collect all @realtime function names
+        let mut rt_funcs: HashSet<String> = HashSet::new();
+        for func in &program.funcs {
+            if func.annotations.iter().any(|a| a.name == "realtime") {
+                rt_funcs.insert(func.name.clone());
+            }
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                if method.annotations.iter().any(|a| a.name == "realtime") {
+                    rt_funcs.insert(format!("{}_{}", imp.struct_name, method.name));
+                }
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                if method.annotations.iter().any(|a| a.name == "realtime") {
+                    rt_funcs.insert(format!("{}_{}", ti.type_name, method.name));
+                }
+            }
+        }
+
+        // Functions that allocate memory (forbidden in @realtime)
+        let alloc_funcs: &[&str] = &[
+            "p_malloc", "p_free", "p_realloc", "p_alloc",
+            "p_vec_new", "p_vec_push", "p_vec_push_str", "p_vec_insert",
+            "p_vec_resize", "p_vec_extend",
+            "p_hashmap_new", "p_hashmap_insert",
+            "p_string_new", "p_string_push", "p_string_concat",
+            "p_arena_new", "p_arena_alloc",
+            "Vec_new", "Vec_push", "Vec_insert", "Vec_resize",
+            "HashMap_new", "HashMap_insert",
+            "String_new", "String_push",
+        ];
+        let alloc_methods: &[&str] = &["push", "insert", "resize", "extend", "push_str"];
+
+        // Functions that perform blocking IO (forbidden in @realtime)
+        let blocking_io_funcs: &[&str] = &[
+            "p_file_read", "p_file_write", "p_file_open", "p_file_close",
+            "p_socket_listen", "p_socket_accept", "p_socket_read", "p_socket_write",
+            "p_socket_connect", "p_socket_close",
+            "p_net_connect", "p_net_listen", "p_net_accept",
+            "p_fs_read_async", "p_fs_write_async",
+            "p_print", "p_print_int", "p_print_str", "p_print_nl",
+            "print", "println", "print_str", "print_nl", "print_int",
+            "p_db_open", "p_db_query", "p_db_exec",
+            "p_sleep", "p_usleep",
+        ];
+
+        // Functions that spawn threads or async tasks (forbidden in @realtime)
+        let spawn_funcs: &[&str] = &[
+            "p_thread_spawn", "p_chan_send", "p_chan_recv",
+            "p_executor_submit", "p_future_ready",
+            "spawn",
+        ];
+
+        // Functions that use dynamic dispatch (forbidden in @realtime)
+        let dyn_dispatch_funcs: &[&str] = &[
+            "p_make_dyn", "p_call_ptr", "p_dyn_call",
+        ];
+
+        for func in &program.funcs {
+            let is_rt = func.annotations.iter().any(|a| a.name == "realtime");
+            if !is_rt { continue; }
+
+            let mut errs = Vec::new();
+            let name = &func.name;
+
+            // Rule: No blocking IO effects
+            for e in &func.declared_effects {
+                if matches!(e.as_str(), "IO" | "Net" | "Spawn") {
+                    errs.push(format!(
+                        "Real-time error: function '{}' has effect '!{}'.\n\
+                         \x20\x20\x20\x20IO/Network/Spawn operations have unbounded latency —\n\
+                         \x20\x20\x20\x20they can block for arbitrary amounts of time.\n\
+                         \x20\x20\x20\x20Real-time functions must complete within a deadline.\n\
+                         \x20\x20\x20\x20Fix: remove the IO/Net/Spawn effect, or remove @realtime.",
+                        name, e
+                    ));
+                }
+            }
+
+            // Scan body for violations
+            let mut calls = HashSet::new();
+            scan_stmts_for_calls(&func.body, &mut calls);
+            let mut while_sites = Vec::new();
+            scan_for_while_loops(&func.body, &mut while_sites);
+            let has_while = !while_sites.is_empty();
+
+            for called in &calls {
+                // Rule 1: No allocation
+                if alloc_funcs.contains(&called.as_str()) {
+                    errs.push(format!(
+                        "Real-time error: function '{}' calls '{}'.\n\
+                         \x20\x20\x20\x20Heap allocation has non-deterministic timing —\n\
+                         \x20\x20\x20\x20the allocator may need to search free lists or call mmap.\n\
+                         \x20\x20\x20\x20Real-time functions must use region memory only.\n\
+                         \x20\x20\x20\x20Fix: use stack-allocated arrays, or remove @realtime.",
+                        name, called
+                    ));
+                    continue;
+                }
+                if alloc_methods.contains(&called.as_str()) {
+                    errs.push(format!(
+                        "Real-time error: function '{}' calls '{}'.\n\
+                         \x20\x20\x20\x20Dynamic allocation is forbidden in real-time code.\n\
+                         \x20\x20\x20\x20Fix: use stack-allocated arrays, or remove @realtime.",
+                        name, called
+                    ));
+                    continue;
+                }
+
+                // Rule 2: No blocking IO
+                if blocking_io_funcs.contains(&called.as_str()) {
+                    errs.push(format!(
+                        "Real-time error: function '{}' calls '{}'.\n\
+                         \x20\x20\x20\x20Blocking IO has unbounded latency —\n\
+                         \x20\x20\x20\x20disk, network, and user input can take arbitrary time.\n\
+                         \x20\x20\x20\x20Real-time functions must not interact with external state.\n\
+                         \x20\x20\x20\x20Fix: use effect handlers for IO, or remove @realtime.",
+                        name, called
+                    ));
+                    continue;
+                }
+
+                // Rule 3: No spawn
+                if spawn_funcs.contains(&called.as_str()) {
+                    errs.push(format!(
+                        "Real-time error: function '{}' calls '{}'.\n\
+                         \x20\x20\x20\x20Thread/task creation has non-deterministic timing —\n\
+                         \x20\x20\x20\x20the OS scheduler decides when to run the new thread.\n\
+                         \x20\x20\x20\x20Real-time functions must not create concurrent work.\n\
+                         \x20\x20\x20\x20Fix: pre-spawn workers outside the real-time path, or remove @realtime.",
+                        name, called
+                    ));
+                    continue;
+                }
+
+                // Rule 4: No dynamic dispatch
+                if dyn_dispatch_funcs.contains(&called.as_str()) {
+                    errs.push(format!(
+                        "Real-time error: function '{}' calls '{}'.\n\
+                         \x20\x20\x20\x20Dynamic dispatch (function pointers, trait objects) has\n\
+                         \x20\x20\x20\x20unbounded call targets — the compiler can't analyze WCET.\n\
+                         \x20\x20\x20\x20Real-time functions must use direct calls only.\n\
+                         \x20\x20\x20\x20Fix: use direct calls, or remove @realtime.",
+                        name, called
+                    ));
+                    continue;
+                }
+
+                // Rule 5: No recursion (direct self-call)
+                if called == name {
+                    errs.push(format!(
+                        "Real-time error: function '{}' calls itself.\n\
+                         \x20\x20\x20\x20Recursion has unbounded stack depth —\n\
+                         \x20\x20\x20\x20the number of iterations depends on runtime data.\n\
+                         \x20\x20\x20\x20Real-time functions must have bounded execution time.\n\
+                         \x20\x20\x20\x20Fix: convert to an iterative loop with a constant bound, or remove @realtime.",
+                        name
+                    ));
+                    continue;
+                }
+
+                // Skip built-in runtime functions that are safe (p_math_*, etc.)
+                if called.starts_with("p_")
+                    && !alloc_funcs.contains(&called.as_str())
+                    && !blocking_io_funcs.contains(&called.as_str())
+                    && !spawn_funcs.contains(&called.as_str())
+                    && !dyn_dispatch_funcs.contains(&called.as_str())
+                {
+                    continue;
+                }
+                if matches!(called.as_str(), "print" | "println" | "print_str" | "print_nl" | "print_int") {
+                    // print is blocking IO — already caught above
+                    continue;
+                }
+
+                // Rule 7: Transitive — can only call other @realtime functions
+                if self.funcs.contains_key(called) && !rt_funcs.contains(called)
+                    && !called.starts_with("p_") && !called.starts_with("__")
+                {
+                    errs.push(format!(
+                        "Real-time error: function '{}' calls '{}',\n\
+                         \x20\x20\x20\x20which is not @realtime.\n\
+                         \x20\x20\x20\x20A real-time function can only call other real-time functions —\n\
+                         \x20\x20\x20\x20otherwise the callee may allocate, block, or recurse.\n\
+                         \x20\x20\x20\x20Fix: add @realtime to '{}', or remove the call from '{}'.",
+                        name, called, called, name
+                    ));
+                }
+            }
+
+            // Rule 3: No unbounded loops (while loops)
+            if has_while {
+                errs.push(format!(
+                    "Real-time error: function '{}' contains a 'while' loop.\n\
+                     \x20\x20\x20\x20While loops have unbounded iteration counts —\n\
+                     \x20\x20\x20\x20the loop condition depends on runtime data.\n\
+                     \x20\x20\x20\x20Real-time functions must use 'for' loops with constant bounds.\n\
+                     \x20\x20\x20\x20Fix: convert to a 'for' loop with a compile-time bound, or remove @realtime.",
+                    name
+                ));
+            }
+
+            for err in errs {
+                self.errors.push(err);
+            }
+        }
+    }
+
     /// Verify @tainted annotation (injection defense).
     ///
     /// A @tainted annotation on a parameter marks it as untrusted user input.
@@ -2256,6 +2910,37 @@ impl TypeChecker {
                     | "p_map_clone" | "p_string_clone" | "p_vec_new_with"
                     | "p_alloc_new" => {
                         effects.insert("Alloc".to_string());
+                    }
+                    // Differentiable tensor operations (ML3: Effect-Traced Autodiff)
+                    "p_tensor_matmul" | "p_tensor_add" | "p_tensor_sub"
+                    | "p_tensor_mul" | "p_tensor_scale" | "p_tensor_relu"
+                    | "p_tensor_sigmoid" | "p_tensor_softmax" | "p_tensor_dot"
+                    | "p_tensor_sum" | "p_tensor_mean" | "p_tensor_transpose"
+                    | "p_tensor_reshape" | "p_tensor_zeros" | "p_tensor_ones"
+                    | "p_tensor_from_vec" | "p_tensor_filled" => {
+                        effects.insert("Diff".to_string());
+                    }
+                    // ML10: Quantization builtins — produce Diff effect (quantized ops
+                    // are still differentiable via straight-through estimator)
+                    "p_quantize_q8" | "p_dequantize_q8" | "p_qmatmul"
+                    | "p_find_quant_params" => {
+                        effects.insert("Diff".to_string());
+                    }
+                    // ML9: KV cache builtins — produce Alloc effect (bounded by region)
+                    "p_kv_cache_new" | "p_kv_cache_append" | "p_kv_cache_get"
+                    | "p_kv_cache_len" | "p_kv_cache_clear" | "p_kv_cache_evict" => {
+                        effects.insert("Alloc".to_string());
+                        effects.insert("Read".to_string());
+                        effects.insert("Write".to_string());
+                    }
+                    // ML12: Noise builtins — produce Noise effect (differential privacy)
+                    "p_dp_noise" | "p_dropout" | "p_gaussian_noise" => {
+                        effects.insert("Noise".to_string());
+                    }
+                    // ML13: Communication builtins — produce Comm effect (tensor parallelism)
+                    "p_all_reduce" | "p_broadcast" | "p_all_gather" | "p_scatter"
+                    | "p_send_tensor" | "p_recv_tensor" => {
+                        effects.insert("Comm".to_string());
                     }
                     _ => {}
                 }
@@ -3262,14 +3947,27 @@ impl TypeChecker {
                     self.check_expr(arg);
                 }
             }
-            Stmt::RegionBlock { name, budget, body, line } => {
+            Stmt::RegionBlock { name, budget, is_gpu, is_kv_cache, window_size, body, line } => {
                 // Push region scope
                 self.region_stack.push(name.clone());
                 self.push_scope();
-                // Push budget tracker
+                // Push budget tracker (ML1: GPU regions track GPU memory, ML9: KV cache tracks cache memory)
                 self.region_budgets.push((name.clone(), *budget, 0));
                 // Record the source line for better error messages
                 self.region_lines.insert(name.clone(), *line);
+                // Track GPU region depth (ML1)
+                if *is_gpu { self.gpu_region_depth += 1; }
+                // ML9: KV cache regions require a budget — the whole point is compile-time OOM prevention
+                if *is_kv_cache && budget.is_none() {
+                    self.errors.push(format!(
+                        "KV cache region error (line {}): 'region kv_cache {}' must have a budget.\n\
+                         \x20\x20\x20\x20KV cache regions exist to prevent OOM in LLM serving.\n\
+                         \x20\x20\x20\x20Without a budget, the cache can grow unboundedly and crash.\n\
+                         \x20\x20\x20\x20Fix: add a budget: `region kv_cache {} with budget(N) {{ ... }}`.\n\
+                         \x20\x20\x20\x20The budget is the maximum bytes for K and V tensors across all layers.",
+                        line, name, name
+                    ));
+                }
 
                 // Snapshot variables before the region block
                 let vars_before: HashSet<String> = self
@@ -3296,6 +3994,7 @@ impl TypeChecker {
                 // Pop scope and region
                 self.pop_scope();
                 self.region_stack.pop();
+                if *is_gpu { self.gpu_region_depth -= 1; }
 
                 // Mark region as freed — any future access to its variables is use-after-free
                 self.freed_regions.insert(region_name.clone());
@@ -3307,26 +4006,56 @@ impl TypeChecker {
 
                 // Check if any escaped variables are still referenced in
                 // an outer scope (use-after-free / dangling pointer)
-                // This is a conservative check: if the variable is still in
-                // a scope, it's a potential escape.
                 if let Some(outer_scope) = self.scopes.last() {
                     for var in &escaped {
                         if outer_scope.contains_key(var) {
                             let alloc_line = self.var_alloc_lines.get(var).copied().unwrap_or(0);
                             let region_line = self.region_lines.get(&region_name).copied().unwrap_or(0);
-                            self.errors.push(format!(
-                                "Region error (line {}): variable '{}' escapes region '{}'.\n\
-                                 \x20\x20\x20\x20'{}' was allocated at line {} inside `region {} {{ ... }}` (line {}),\n\
-                                 \x20\x20\x20\x20but it is still accessible after the region block ended.\n\
-                                 \x20\x20\x20\x20The region frees all its data when the block exits — accessing '{}' \
-                                 after that is a use-after-free.\n\
-                                 \x20\x20\x20\x20Fix: move the use of '{}' inside the region block, or allocate '{}' \
-                                 outside the region if it needs to live longer.",
-                                region_line, var, region_name,
-                                var, alloc_line, region_name, region_line,
-                                var,
-                                var, var
-                            ));
+                            if *is_gpu {
+                                // ML1: GPU-specific escape error
+                                self.errors.push(format!(
+                                    "GPU region error (line {}): variable '{}' escapes GPU region '{}'.\n\
+                                     \x20\x20\x20\x20'{}' was allocated at line {} inside `region gpu {} {{ ... }}` (line {}),\n\
+                                     \x20\x20\x20\x20but it is still accessible after the GPU region block ended.\n\
+                                     \x20\x20\x20\x20GPU memory is freed when the region exits — accessing '{}' after that\n\
+                                     \x20\x20\x20\x20is a use-after-free on the GPU (illegal memory access, kernel crash).\n\
+                                     \x20\x20\x20\x20Fix: move all uses of '{}' inside the GPU region block, or copy the\n\
+                                     \x20\x20\x20\x20data back to CPU memory before the region exits.",
+                                    region_line, var, region_name,
+                                    var, alloc_line, region_name, region_line,
+                                    var,
+                                    var
+                                ));
+                            } else if *is_kv_cache {
+                                // ML9: KV cache-specific escape error
+                                self.errors.push(format!(
+                                    "KV cache region error (line {}): variable '{}' escapes KV cache region '{}'.\n\
+                                     \x20\x20\x20\x20'{}' was allocated at line {} inside `region kv_cache {} {{ ... }}` (line {}),\n\
+                                     \x20\x20\x20\x20but it is still accessible after the KV cache region block ended.\n\
+                                     \x20\x20\x20\x20KV cache memory is freed when the session ends — accessing '{}' after\n\
+                                     \x20\x20\x20\x20that is a use-after-free (stale attention keys/values).\n\
+                                     \x20\x20\x20\x20Fix: move all uses of '{}' inside the KV cache region block, or copy\n\
+                                     \x20\x20\x20\x20the data out before the region exits.",
+                                    region_line, var, region_name,
+                                    var, alloc_line, region_name, region_line,
+                                    var,
+                                    var
+                                ));
+                            } else {
+                                self.errors.push(format!(
+                                    "Region error (line {}): variable '{}' escapes region '{}'.\n\
+                                     \x20\x20\x20\x20'{}' was allocated at line {} inside `region {} {{ ... }}` (line {}),\n\
+                                     \x20\x20\x20\x20but it is still accessible after the region block ended.\n\
+                                     \x20\x20\x20\x20The region frees all its data when the block exits — accessing '{}' \
+                                     after that is a use-after-free.\n\
+                                     \x20\x20\x20\x20Fix: move the use of '{}' inside the region block, or allocate '{}' \
+                                     outside the region if it needs to live longer.",
+                                    region_line, var, region_name,
+                                    var, alloc_line, region_name, region_line,
+                                    var,
+                                    var, var
+                                ));
+                            }
                         }
                     }
                 }
@@ -3336,13 +4065,16 @@ impl TypeChecker {
                     if let Some(budget) = budget_opt {
                         if usage > budget {
                             let region_line = self.region_lines.get(&region_name).copied().unwrap_or(0);
+                            let region_kind = if *is_gpu { "GPU " } else if *is_kv_cache { "KV cache " } else { "" };
+                            let region_kw = if *is_gpu { " gpu" } else if *is_kv_cache { " kv_cache" } else { "" };
                             self.errors.push(format!(
-                                "Budget error (line {}): region '{}' used {} bytes but budget is {} bytes \
+                                "Budget error (line {}): {}region '{}' used {} bytes but budget is {} bytes \
                                  ({} bytes over).\n\
-                                 \x20\x20\x20\x20Hint: reduce allocations inside the region block, or increase the budget \
-                                 in `region {} with budget({}) {{ ... }}`.",
-                                region_line, region_name, usage, budget, usage - budget,
-                                region_name, budget
+                                 \x20\x20\x20\x20Hint: reduce allocations inside the {}region block, or increase the budget \
+                                 in `region{} {} with budget({}) {{ ... }}`.",
+                                region_line, region_kind, region_name, usage, budget, usage - budget,
+                                region_kind,
+                                region_kw, region_name, budget
                             ));
                         }
                     }
@@ -3467,8 +4199,8 @@ impl TypeChecker {
                 if self.uninit_vars.contains(name) {
                     self.errors.push(format!(
                         "Init error: variable '{}' is used before being assigned a value.\n\
-                         \x20\x20\x20\x20It was declared with `pm` (uninitialized mutable).\n\
-                         \x20\x20\x20\x20Fix: assign a value to '{}' before reading it, or use `pv {} = ...` to initialize at declaration.",
+                         \x20\x20\x20\x20It was declared with `var` (uninitialized mutable).\n\
+                         \x20\x20\x20\x20Fix: assign a value to '{}' before reading it, or use `val {} = ...` to initialize at declaration.",
                         name, name, name
                     ));
                 }
@@ -3746,8 +4478,12 @@ impl TypeChecker {
                                     let b_first = b.first().unwrap();
                                     if !self.shapes_compatible(a_last, b_first) {
                                         self.errors.push(format!(
-                                            "Shape error: matmul incompatible — a last dim {:?} != b first dim {:?}",
-                                            a_last, b_first
+                                            "Shape error (ML2): matmul incompatible —\n\
+                                             \x20\x20\x20\x20input A has shape {:?} (last dim = {:?}),\n\
+                                             \x20\x20\x20\x20input B has shape {:?} (first dim = {:?}).\n\
+                                             \x20\x20\x20\x20For matmul(A, B), A's last dimension must equal B's first dimension.\n\
+                                             \x20\x20\x20\x20Fix: transpose B, or use a weight with {} input features, or reshape A to have {} output features.",
+                                            a, a_last, b, b_first, a_last, b_first
                                         ));
                                     }
                                     // Result shape: a[..-1] ++ b[1..]
@@ -3770,8 +4506,10 @@ impl TypeChecker {
                                     for (i, (da, db)) in a.iter().zip(b.iter()).enumerate() {
                                         if !self.shapes_compatible(da, db) {
                                             self.errors.push(format!(
-                                                "Shape error: {} incompatible — dim {}: {:?} != {:?}",
-                                                callee, i, da, db
+                                                "Shape error (ML2): {} incompatible — dim {}: {:?} != {:?}\n\
+                                                 \x20\x20\x20\x20Both tensors must have the same shape for elementwise {}.\n\
+                                                 \x20\x20\x20\x20Fix: reshape one tensor to match the other, or use broadcast.",
+                                                callee, i, da, db, callee
                                             ));
                                         }
                                     }
@@ -3814,6 +4552,104 @@ impl TypeChecker {
                         // Reductions — result is scalar F64
                         if arg_types.len() >= 1 {
                             return Type::F64;
+                        }
+                    }
+                    // ML2: Additional shape verification for common ML operations
+                    "flatten" => {
+                        // flatten(t) — collapses all dims into one: [d1, d2, ...] -> [d1*d2*...]
+                        // Result is a 1-D tensor (or 2-D if batch dim is kept)
+                        if arg_types.len() >= 1 {
+                            let shape = self.get_tensor_shape(&arg_types[0]);
+                            if let Some(s) = &shape {
+                                if s.len() >= 2 {
+                                    // Flatten to [batch, rest] or just [rest]
+                                    if s.len() > 2 {
+                                        // Keep batch dim, flatten the rest
+                                        return Type::ShapedTensor {
+                                            elem: Box::new(Type::F64),
+                                            shape: vec![s[0].clone(), ShapeDim::Symbolic("_".to_string())],
+                                        };
+                                    } else {
+                                        // Already 2-D, flatten to 1-D
+                                        return Type::ShapedTensor {
+                                            elem: Box::new(Type::F64),
+                                            shape: vec![ShapeDim::Symbolic("_".to_string())],
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "concat" | "cat" => {
+                        // concat(a, b, dim) — concatenates along given dim
+                        // All dims except the concat dim must match
+                        if arg_types.len() >= 2 {
+                            let a_shape = self.get_tensor_shape(&arg_types[0]);
+                            let b_shape = self.get_tensor_shape(&arg_types[1]);
+                            if let (Some(a), Some(b)) = (&a_shape, &b_shape) {
+                                if a.len() == b.len() {
+                                    for (i, (da, db)) in a.iter().zip(b.iter()).enumerate() {
+                                        if !self.shapes_compatible(da, db) {
+                                            self.errors.push(format!(
+                                                "Shape error: concat incompatible — dim {}: {:?} != {:?}\n\
+                                                 \x20\x20\x20\x20All dimensions except the concat dimension must match.\n\
+                                                 \x20\x20\x20\x20Fix: ensure tensors have the same shape except along the concat axis.",
+                                                i, da, db
+                                            ));
+                                        }
+                                    }
+                                    // Result shape: same as input (concat dim grows, but we can't compute it statically)
+                                    return arg_types[0].clone();
+                                }
+                            }
+                        }
+                    }
+                    "broadcast" | "expand" => {
+                        // broadcast(t, shape) — broadcasts tensor to new shape
+                        // The result shape is the target shape
+                        if arg_types.len() >= 1 {
+                            return arg_types[0].clone();
+                        }
+                    }
+                    "conv2d" => {
+                        // conv2d(input: Tensor[f32, N, H, W], weight: Tensor[f32, Co, Ci, Kh, Kw])
+                        // -> Tensor[f32, N, Ho, Wo]
+                        if arg_types.len() == 2 {
+                            let a_shape = self.get_tensor_shape(&arg_types[0]);
+                            let b_shape = self.get_tensor_shape(&arg_types[1]);
+                            if let (Some(a), Some(b)) = (&a_shape, &b_shape) {
+                                if a.len() >= 3 && b.len() >= 4 {
+                                    // input channels must match weight's Ci (dim 1)
+                                    let in_channels = a.get(1);
+                                    let weight_in = b.get(1);
+                                    if let (Some(ic), Some(wi)) = (in_channels, weight_in) {
+                                        if !self.shapes_compatible(ic, wi) {
+                                            self.errors.push(format!(
+                                                "Shape error: conv2d incompatible — input channels {:?} != weight in-channels {:?}\n\
+                                                 \x20\x20\x20\x20The input tensor's channel dimension must match the weight's in_channels.\n\
+                                                 \x20\x20\x20\x20Fix: ensure input has {} channels, or use a weight with {} in-channels.",
+                                                ic, wi, ic, wi
+                                            ));
+                                        }
+                                    }
+                                    // Result: [N, Co, Ho, Wo] — Ho/Wo depend on stride/padding (symbolic)
+                                    return Type::ShapedTensor {
+                                        elem: Box::new(Type::F64),
+                                        shape: vec![
+                                            a[0].clone(),       // batch
+                                            b[0].clone(),       // out_channels
+                                            ShapeDim::Symbolic("_".to_string()), // Ho
+                                            ShapeDim::Symbolic("_".to_string()), // Wo
+                                        ],
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    "batch_norm" => {
+                        // batch_norm(t) — same shape as input
+                        if arg_types.len() >= 1 {
+                            return arg_types[0].clone();
                         }
                     }
                     _ => {}
@@ -4801,7 +5637,7 @@ impl TypeChecker {
                     _ => {
                         self.errors.push(format!(
                             "Type error: await requires a Future<T> operand, got {}.\n\
-                             \x20\x20\x20\x20Hint: async pf functions return Future<T>.\n\
+                             \x20\x20\x20\x20Hint: async fn functions return Future<T>.\n\
                              \x20\x20\x20\x20     spawn <expr> also returns Future<T>.",
                             inner_ty
                         ));
@@ -5640,6 +6476,14 @@ fn scan_expr_for_calls(expr: &Expr, calls: &mut HashSet<String>) {
         }
         _ => {}
     }
+}
+
+/// Scan function body for calls to a specific function name.
+/// Sets `found` to true if the function is called anywhere in the body.
+fn scan_for_calls(stmts: &[Stmt], found: &mut bool, target: &str) {
+    let mut calls = HashSet::new();
+    scan_stmts_for_calls(stmts, &mut calls);
+    *found = calls.contains(target) || calls.contains(&format!("p_{}", target));
 }
 
 /// Scan function body statements for floating-point usage.

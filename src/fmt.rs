@@ -357,8 +357,8 @@ fn is_block_kw(w: &str) -> bool {
 /// Keywords that begin a top-level definition (for blank-line spacing).
 fn is_def_kw(w: &str) -> bool {
     matches!(w,
-        "pf" | "pv" | "pm" | "pc" | "struct" | "enum" | "impl"
-            | "cap" | "ty" | "use" | "module" | "extern"
+        "fn" | "val" | "var" | "const" | "struct" | "enum" | "impl"
+            | "cap" | "type" | "use" | "module" | "extern"
             | "component" | "system" | "state_machine" | "on"
             | "layer" | "model"
     )
@@ -1000,7 +1000,7 @@ fn need_space(
                 {
                     return false; // prefix unary minus
                 }
-                if is_word_text(&bt) && (bt == "ret" || bt == "return") {
+                if is_word_text(&bt) && bt == "return" {
                     return false;
                 }
             } else {
@@ -1093,7 +1093,7 @@ fn is_number_text(s: &str) -> bool {
 }
 
 fn is_cond_or_match_kw(s: &str) -> bool {
-    matches!(s, "if" | "while" | "for" | "match" | "query" | "guard" | "return" | "ret")
+    matches!(s, "if" | "while" | "for" | "match" | "query" | "guard" | "return")
 }
 
 // ─── Public API ───────────────────────────────────────────────────────
@@ -1158,8 +1158,8 @@ mod tests {
 
     #[test]
     fn test_blank_line_between_defs() {
-        let input = "pf a() {\n    ret 1;\n}\npf b() {\n    ret 2;\n}\n";
+        let input = "fn a() {\n    return 1;\n}\nfn b() {\n    return 2;\n}\n";
         let out = format(input);
-        assert!(out.contains("}\n\npf b()"));
+        assert!(out.contains("}\n\nfn b()"));
     }
 }

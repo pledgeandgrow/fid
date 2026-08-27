@@ -105,6 +105,9 @@ pub struct Lowerer {
     /// Stack of active named regions — allocations inside a region block
     /// use Region::Named(name) instead of Region::Stack
     region_stack: Vec<String>,
+    /// Stack of active GPU regions — allocations inside a `region gpu r { }`
+    /// block use GPU memory (ML1: region-scoped GPU memory)
+    gpu_region_stack: Vec<String>,
     /// Sandbox depth — when > 0, emitted instructions are marked in_sandbox
     sandbox_depth: usize,
     /// AST function return types — maps function name to AST return type
@@ -160,6 +163,7 @@ impl Lowerer {
             current_self_type: None,
             effect_handler_stack: Vec::new(),
             region_stack: Vec::new(),
+            gpu_region_stack: Vec::new(),
             sandbox_depth: 0,
             func_ret_types: HashMap::new(),
             async_funcs: std::collections::HashSet::new(),
@@ -470,6 +474,47 @@ impl Lowerer {
         self.module.add_extern("p_tensor_to_json", vec![tensor_ty.clone()], IrType::Ptr(Box::new(IrType::U8)));
         self.module.add_extern("p_tensor_clone", vec![tensor_ty.clone()], tensor_ty.clone());
 
+        // ─── ML9: KV Cache builtins ───
+        self.module.add_extern("p_kv_cache_new",
+            vec![IrType::I64, IrType::I64, IrType::I64, IrType::I64], IrType::I64);
+        self.module.add_extern("p_kv_cache_append",
+            vec![IrType::I64, IrType::I64, tensor_ty.clone(), tensor_ty.clone()], IrType::Void);
+        self.module.add_extern("p_kv_cache_get",
+            vec![IrType::I64, IrType::I64], tensor_ty.clone());
+        self.module.add_extern("p_kv_cache_len",
+            vec![IrType::I64, IrType::I64], IrType::I64);
+        self.module.add_extern("p_kv_cache_clear",
+            vec![IrType::I64], IrType::Void);
+        self.module.add_extern("p_kv_cache_evict",
+            vec![IrType::I64, IrType::I64], IrType::Void);
+
+        // ─── ML10: Quantization builtins ───
+        self.module.add_extern("p_quantize_q8",
+            vec![tensor_ty.clone(), IrType::F64, IrType::I64], tensor_ty.clone());
+        self.module.add_extern("p_dequantize_q8",
+            vec![tensor_ty.clone(), IrType::F64, IrType::I64], tensor_ty.clone());
+        self.module.add_extern("p_qmatmul",
+            vec![tensor_ty.clone(), tensor_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_find_quant_params",
+            vec![tensor_ty.clone()], IrType::Ptr(Box::new(IrType::U8)));
+
+        // ─── ML12: DP noise builtins ───
+        self.module.add_extern("p_dp_noise",
+            vec![tensor_ty.clone(), IrType::F64], tensor_ty.clone());
+        self.module.add_extern("p_gaussian_noise",
+            vec![IrType::Opaque("Vec".to_string()), IrType::F64], tensor_ty.clone());
+        self.module.add_extern("p_dropout",
+            vec![tensor_ty.clone(), IrType::F64], tensor_ty.clone());
+
+        // ─── ML13: Tensor parallelism communication builtins ───
+        self.module.add_extern("p_all_reduce", vec![tensor_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_broadcast", vec![tensor_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_all_gather", vec![tensor_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_scatter", vec![tensor_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_send_tensor", vec![tensor_ty.clone()], IrType::Void);
+        self.module.add_extern("p_recv_tensor",
+            vec![IrType::Opaque("Vec".to_string())], tensor_ty.clone());
+
         // ─── Phase 5C.2: SIMD stdlib ───
         let simd_ty = IrType::Opaque("Vec".to_string());
         self.module.add_extern("p_simd_add", vec![simd_ty.clone(), simd_ty.clone()], simd_ty.clone());
@@ -686,6 +731,32 @@ impl Lowerer {
         // + @crashfree + @requires-audit. The optimizer can assume
         // no heap allocation, no recursion, bounded iteration, no panics.
         ir_func.is_medical = func.annotations.iter().any(|a| a.name == "medical");
+        // ML8: @kernel annotation — GPU entry point for SPIR-V/PTX codegen
+        ir_func.is_kernel = func.annotations.iter().any(|a| a.name == "kernel");
+        // Parse workgroup size from @kernel(x, y, z) or @kernel([x, y, z])
+        if ir_func.is_kernel {
+            if let Some(kann) = func.annotations.iter().find(|a| a.name == "kernel") {
+                if !kann.args.is_empty() {
+                    // Try parsing as [x,y,z] or x,y,z
+                    let args_str: String = kann.args.join(",");
+                    let cleaned = args_str.trim_matches(|c| c == '[' || c == ']');
+                    let parts: Vec<&str> = cleaned.split(',').collect();
+                    if parts.len() >= 3 {
+                        if let (Ok(x), Ok(y), Ok(z)) = (
+                            parts[0].trim().parse::<u32>(),
+                            parts[1].trim().parse::<u32>(),
+                            parts[2].trim().parse::<u32>(),
+                        ) {
+                            ir_func.workgroup_size = [x, y, z];
+                        }
+                    } else if parts.len() == 1 {
+                        if let Ok(x) = parts[0].trim().parse::<u32>() {
+                            ir_func.workgroup_size = [x, 1, 1];
+                        }
+                    }
+                }
+            }
+        }
 
         // If the function returns a struct, add a hidden SRET parameter
         // (caller-allocated pointer as first arg, callee writes struct data there)
@@ -1660,20 +1731,29 @@ impl Lowerer {
                     }
                 }
             }
-            Stmt::RegionBlock { name, budget: _, body, .. } => {
+            Stmt::RegionBlock { name, budget: _, is_gpu, is_kv_cache, window_size, body, .. } => {
                 // Emit RegionBegin — marks the start of a named region.
                 // Allocations inside the block will use Region::Named(name).
+                // If is_gpu, allocations go to GPU memory (ML1).
+                // If is_kv_cache, allocations go to bounded KV cache (ML9).
                 self.emit_inst(Inst::RegionBegin {
                     name: name.clone(),
+                    is_gpu: *is_gpu,
+                    is_kv_cache: *is_kv_cache,
+                    window_size: *window_size,
                 });
                 self.region_stack.push(name.clone());
+                if *is_gpu { self.gpu_region_stack.push(name.clone()); }
                 for s in body {
                     self.lower_stmt(s);
                 }
                 self.region_stack.pop();
+                if *is_gpu { self.gpu_region_stack.pop(); }
                 // Emit RegionEnd — frees all memory allocated in this region.
                 self.emit_inst(Inst::RegionEnd {
                     name: name.clone(),
+                    is_gpu: *is_gpu,
+                    is_kv_cache: *is_kv_cache,
                 });
             }
             Stmt::ComptimeGen { .. } => {}
@@ -2781,6 +2861,27 @@ impl Lowerer {
                 let left_val = self.lower_expr(left);
                 let right_val = self.lower_expr(right);
                 let result_ty = self.infer_binop_type(op, left, right);
+
+                // String concatenation: when + is used with two str operands,
+                // emit a call to p_str_concat instead of integer addition.
+                // Only when BOTH are strings — str + i64 is pointer arithmetic.
+                let str_ty = IrType::Ptr(Box::new(IrType::U8));
+                if matches!(op, BinOp::Add)
+                    && left_ir_ty == str_ty && right_ir_ty == str_ty
+                {
+                    return self.emit_inst(Inst::Call {
+                        func: "p_str_concat".to_string(),
+                        args: vec![left_val, right_val],
+                        ret_ty: str_ty,
+                        effects: {
+                            let mut e = EffectSet::new();
+                            e.add(Effect::Alloc);
+                            e.add(Effect::IO);
+                            e
+                        },
+                    });
+                }
+
                 self.emit_inst(Inst::BinOp {
                     op: op.clone(),
                     left: left_val,
@@ -5337,6 +5438,14 @@ impl Lowerer {
             _ => {
                 let lt = self.infer_expr_type(left);
                 let rt = self.infer_expr_type(right);
+                // String concatenation: str + str → str (Ptr(U8))
+                // Only when BOTH are strings — str + i64 is pointer arithmetic.
+                if matches!(op, BinOp::Add) {
+                    let str_ty = IrType::Ptr(Box::new(IrType::U8));
+                    if lt == str_ty && rt == str_ty {
+                        return str_ty;
+                    }
+                }
                 if lt.is_float() || rt.is_float() {
                     if lt == IrType::F32 || rt == IrType::F32 {
                         IrType::F32
@@ -5361,6 +5470,10 @@ impl Lowerer {
         }
         if let Some(f) = self.module.functions.get(name) {
             return f.ret_ty.clone();
+        }
+        // Fallback: check AST function return types (for functions not yet lowered)
+        if let Some(ast_ty) = self.func_ret_types.get(name) {
+            return self.lower_type(ast_ty);
         }
         IrType::I64 // Default for unknown functions
     }
@@ -5631,7 +5744,13 @@ impl Lowerer {
             return;
         };
         for (name, alloca) in persist_vars {
-            let loaded = self.emit_inst(Inst::Load { ptr: alloca, ty: IrType::I64 });
+            // ML4: Use the actual type of the persist variable instead of
+            // always loading as I64. This allows persisting pointers, tensors,
+            // and other opaque types for hot-reload of model weights.
+            let load_ty = self.alloca_types.get(&alloca)
+                .cloned()
+                .unwrap_or(IrType::I64);
+            let loaded = self.emit_inst(Inst::Load { ptr: alloca, ty: load_ty });
             self.emit_inst(Inst::PersistSave {
                 name,
                 value: loaded,

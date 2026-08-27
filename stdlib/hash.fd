@@ -1,0 +1,149 @@
+// Fides Hash standard library
+//
+// Non-cryptographic hash functions for HashMap, sets, and checksums.
+// NOT for security — use crypto.fd (SHA-256) for cryptographic hashing.
+//
+// Usage:
+//   use hash;
+//   value h = hash_str("hello");     // FNV-1a hash
+//   value c = hash_combine(h1, h2);  // combine two hashes
+
+module hash;
+
+use core;
+use vec;
+
+// ─── FNV-1a (Fowler-Noll-Vo) ────────────────────────────────────────────
+
+/// FNV-1a hash of a string. 32-bit (avoids i64 overflow).
+/// Fast, good distribution, widely used for hash tables.
+pub fn hash_str(s: str) -> i64 {
+    var hash: i64 = 0x811c9dc5;  // FNV offset basis (32-bit)
+    var i = 0;
+    while i < str_len(s) {
+        hash = hash ^ str_byte_at(s, i);
+        hash = (hash * 0x01000193) & 0xFFFFFFFF;  // FNV prime (32-bit)
+        i = i + 1;
+    }
+    return hash;
+}
+
+/// FNV-1a hash of a Vec of bytes.
+pub fn hash_bytes(bytes: Vec) -> i64 {
+    var hash: i64 = 0x811c9dc5;
+    var i = 0;
+    while i < bytes.len() {
+        hash = hash ^ bytes.get(i);
+        hash = (hash * 0x01000193) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    return hash;
+}
+
+/// FNV-1a hash of an i64.
+pub fn hash_i64(n: i64) -> i64 {
+    var hash: i64 = 0x811c9dc5;
+    var i = 0;
+    while i < 8 {
+        hash = hash ^ ((n >> (i * 8)) & 0xFF);
+        hash = (hash * 0x01000193) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    return hash;
+}
+
+// ─── Combine ────────────────────────────────────────────────────────────
+
+/// Combine two hash values (for hashing tuples/structs).
+/// Simple XOR-based combine to avoid overflow.
+pub fn hash_combine(a: i64, b: i64) -> i64 {
+    return (a ^ b) & 0xFFFFFFFF;
+}
+
+/// Hash a Vec of i64 values by combining their hashes.
+pub fn hash_vec(v: Vec) -> i64 {
+    var result: i64 = 0x811c9dc5;
+    var i = 0;
+    while i < v.len() {
+        result = hash_combine(result, hash_i64(v.get(i)));
+        i = i + 1;
+    }
+    return result;
+}
+
+// ─── DJB2 ───────────────────────────────────────────────────────────────
+
+/// DJB2 hash of a string. Simple, fast, good for small hash tables.
+pub fn hash_djb2(s: str) -> i64 {
+    var hash: i64 = 5381;
+    var i = 0;
+    while i < str_len(s) {
+        hash = ((hash << 5) + hash) + str_byte_at(s, i);
+        i = i + 1;
+    }
+    return hash;
+}
+
+/// DJB2 hash of a Vec of bytes.
+pub fn hash_djb2_bytes(bytes: Vec) -> i64 {
+    var hash: i64 = 5381;
+    var i = 0;
+    while i < bytes.len() {
+        hash = ((hash << 5) + hash) + bytes.get(i);
+        i = i + 1;
+    }
+    return hash;
+}
+
+// ─── Checksum (simple) ──────────────────────────────────────────────────
+
+/// Simple sum checksum of a Vec of bytes. NOT a real checksum.
+pub fn hash_checksum(bytes: Vec) -> i64 {
+    var sum: i64 = 0;
+    var i = 0;
+    while i < bytes.len() {
+        sum = sum + bytes.get(i);
+        i = i + 1;
+    }
+    return sum & 0xFF;
+}
+
+/// XOR checksum of a Vec of bytes.
+pub fn hash_xor_checksum(bytes: Vec) -> i64 {
+    var result: i64 = 0;
+    var i = 0;
+    while i < bytes.len() {
+        result = result ^ bytes.get(i);
+        i = i + 1;
+    }
+    return result & 0xFF;
+}
+
+// ─── CRC32 ──────────────────────────────────────────────────────────────
+
+/// CRC32 checksum of a Vec of bytes.
+/// Uses the standard CRC-32 polynomial (0xEDB88320).
+pub fn hash_crc32(bytes: Vec) -> i64 {
+    var crc: i64 = 0xFFFFFFFF;
+    var i = 0;
+    while i < bytes.len() {
+        crc = crc ^ bytes.get(i);
+        var j = 0;
+        while j < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc = crc >> 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
+/// CRC32 checksum of a string.
+pub fn hash_crc32_str(s: str) -> i64 {
+    val bytes = str_bytes(s);
+    return hash_crc32(bytes);
+}

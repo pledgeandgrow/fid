@@ -1,0 +1,220 @@
+// Fides System standard library
+//
+// Low-level system information: architecture, platform, memory, CPU count.
+// Wraps runtime functions and environment variables.
+//
+// Usage:
+//   use sys;
+//   println(sys_arch());       // "x86_64"
+//   println(sys_cpu_count());  // 8
+//   println(sys_page_size());  // 4096
+
+module sys;
+
+use core;
+use vec;
+use string;
+use os;
+
+// ─── FFI declarations ───────────────────────────────────────────────────
+
+extern "C" include "<unistd.h>" {
+    fn sysconf as pledge_sysconf(name: i64) -> i64;
+    fn getpagesize as pledge_getpagesize() -> i64;
+    fn getuid as pledge_getuid() -> i64;
+    fn getgid as pledge_getgid() -> i64;
+    fn getpid as pledge_getpid() -> i64;
+    fn getppid as pledge_getppid() -> i64;
+}
+
+// sysconf constants (POSIX)
+pub const _SC_PAGESIZE: i64 = 30;
+pub const _SC_CLK_TCK: i64 = 2;
+pub const _SC_NPROCESSORS_ONLN: i64 = 84;
+pub const _SC_NPROCESSORS_CONF: i64 = 83;
+pub const _SC_PHYS_PAGES: i64 = 85;
+pub const _SC_AVPHYS_PAGES: i64 = 86;
+
+// ─── CPU / Architecture ─────────────────────────────────────────────────
+
+/// Get the CPU architecture (best-effort).
+pub fn sys_arch() -> str {
+    // Check environment or use compile-time constant
+    val arch = os_getenv("PLEDGE_ARCH");
+    if str_len(arch) > 0 { return arch; }
+    return "x86_64";
+}
+
+/// Get the number of processors currently online.
+pub fn sys_cpu_count() -> i64 {
+    val n = pledge_sysconf(_SC_NPROCESSORS_ONLN);
+    if n > 0 { return n; }
+    return 1;
+}
+
+/// Get the number of configured processors.
+pub fn sys_cpu_count_conf() -> i64 {
+    val n = pledge_sysconf(_SC_NPROCESSORS_CONF);
+    if n > 0 { return n; }
+    return 1;
+}
+
+// ─── Memory ─────────────────────────────────────────────────────────────
+
+/// Get the system page size in bytes.
+pub fn sys_page_size() -> i64 {
+    val ps = pledge_getpagesize();
+    if ps > 0 { return ps; }
+    return 4096;
+}
+
+/// Get total physical memory in bytes.
+pub fn sys_total_memory() -> i64 {
+    val pages = pledge_sysconf(_SC_PHYS_PAGES);
+    val page_size = sys_page_size();
+    return pages * page_size;
+}
+
+/// Get available (free) physical memory in bytes.
+pub fn sys_available_memory() -> i64 {
+    val pages = pledge_sysconf(_SC_AVPHYS_PAGES);
+    val page_size = sys_page_size();
+    return pages * page_size;
+}
+
+/// Get total memory in KB (rounded).
+pub fn sys_total_memory_kb() -> i64 {
+    return sys_total_memory() / 1024;
+}
+
+/// Get total memory in MB (rounded).
+pub fn sys_total_memory_mb() -> i64 {
+    return sys_total_memory() / (1024 * 1024);
+}
+
+/// Get total memory in GB (rounded).
+pub fn sys_total_memory_gb() -> i64 {
+    return sys_total_memory() / (1024 * 1024 * 1024);
+}
+
+// ─── Process info ───────────────────────────────────────────────────────
+
+/// Get the current process ID.
+pub fn sys_pid() -> i64 {
+    return pledge_getpid();
+}
+
+/// Get the parent process ID.
+pub fn sys_ppid() -> i64 {
+    return pledge_getppid();
+}
+
+/// Get the user ID.
+pub fn sys_uid() -> i64 {
+    return pledge_getuid();
+}
+
+/// Get the group ID.
+pub fn sys_gid() -> i64 {
+    return pledge_getgid();
+}
+
+// ─── Clock ticks ────────────────────────────────────────────────────────
+
+/// Get the clock ticks per second.
+pub fn sys_clk_tck() -> i64 {
+    val tck = pledge_sysconf(_SC_CLK_TCK);
+    if tck > 0 { return tck; }
+    return 100;
+}
+
+// ─── Platform detection ─────────────────────────────────────────────────
+
+/// Check if running on Linux.
+pub fn sys_is_linux() -> bool {
+    return str_equal(os_name(), "linux");
+}
+
+/// Check if running on macOS.
+pub fn sys_is_macos() -> bool {
+    val name = os_name();
+    return str_equal(name, "darwin") || str_equal(name, "macos");
+}
+
+/// Check if running on Windows.
+pub fn sys_is_windows() -> bool {
+    val name = os_name();
+    return str_equal(name, "windows") || str_equal(name, "win32");
+}
+
+/// Check if running on a 64-bit system.
+pub fn sys_is_64bit() -> bool {
+    return str_contains(sys_arch(), "64");
+}
+
+/// Check if running on a 32-bit system.
+pub fn sys_is_32bit() -> bool {
+    return !sys_is_64bit();
+}
+
+// ─── Endianness ─────────────────────────────────────────────────────────
+
+/// Check if the system is little-endian.
+pub fn sys_is_little_endian() -> bool {
+    // x86 and ARM (usually) are little-endian
+    val arch = sys_arch();
+    if str_contains(arch, "x86") { return true; }
+    if str_contains(arch, "arm") { return true; }
+    if str_contains(arch, "aarch") { return true; }
+    return true;  // most systems are LE
+}
+
+/// Check if the system is big-endian.
+pub fn sys_is_big_endian() -> bool {
+    return !sys_is_little_endian();
+}
+
+// ─── System info struct ─────────────────────────────────────────────────
+
+/// A struct containing system information.
+pub struct SystemInfo {
+    pub arch: str,
+    pub os_name: str,
+    pub cpu_count: i64,
+    pub memory_bytes: i64,
+    pub page_size: i64,
+    pub pid: i64,
+    pub uid: i64,
+}
+
+/// Gather system information into a struct.
+pub fn sys_info() -> SystemInfo {
+    return SystemInfo {
+        arch: sys_arch(),
+        os_name: os_name(),
+        cpu_count: sys_cpu_count(),
+        memory_bytes: sys_total_memory(),
+        page_size: sys_page_size(),
+        pid: sys_pid(),
+        uid: sys_uid(),
+    };
+}
+
+/// Format system info as a human-readable string.
+pub fn sys_info_string(info: SystemInfo) -> str {
+    val result = "OS: ";
+    result = str_concat(result, info.os_name);
+    result = str_concat(result, "\nArch: ");
+    result = str_concat(result, info.arch);
+    result = str_concat(result, "\nCPUs: ");
+    result = str_concat(result, int_to_str(info.cpu_count));
+    result = str_concat(result, "\nMemory: ");
+    result = str_concat(result, int_to_str(info.memory_bytes / (1024 * 1024)));
+    result = str_concat(result, " MB\nPage size: ");
+    result = str_concat(result, int_to_str(info.page_size));
+    result = str_concat(result, "\nPID: ");
+    result = str_concat(result, int_to_str(info.pid));
+    result = str_concat(result, "\nUID: ");
+    result = str_concat(result, int_to_str(info.uid));
+    return result;
+}
