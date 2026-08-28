@@ -50,6 +50,9 @@ fn is_skip_test(name: &str) -> bool {
         | "test_phase8b.fd"
         | "test_vec_math.fd"
         | "test_vec_shape_fail.fd"
+        // Benchmark files produce timing-dependent output that differs
+        // between interpreter and native codegen — not correctness tests.
+        | "bench_stringbuilder.fd"
         // Borrow checker fail test is now in the expected-fail list
         // (borrow checking is on by default as of Phase 5).
     )

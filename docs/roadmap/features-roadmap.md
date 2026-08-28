@@ -2340,7 +2340,7 @@ All 5 original features (F1–F5) were implemented in a single session. Test res
 **Planned for implementation:**
 - 39 Tier A syntax features (F10, F13, F14, F16–F18, F21, F23–F60) — need compiler support
 - 7 Tier B syntax features (F12, F19, F20) — ergonomic keywords
-- 29 stdlib module slots (S1–S29) — Fides code, no compiler changes (69 actual .fd files as of Aug 2026, 17,541 LOC)
+- 29 stdlib module slots (S1–S29) — Fides code, no compiler changes (69 actual .fd files as of Aug 2026, 18,242 LOC)
 - 15 features cut (C1–C15) — redundant, build with existing features
 
 ---

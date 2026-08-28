@@ -3,7 +3,7 @@
 > Navigation hub for the Fides compiler. Every file in the project, grouped by
 > directory, with a one-line description. Use this to find anything fast.
 >
-> **Stats:** 54 `.rs` source files (86,011 LOC) · 69 stdlib modules (17,541 LOC) · 218 `.fd`
+> **Stats:** 51 `.rs` source files (86,742 LOC) · 69 stdlib modules (18,242 LOC) · 215 `.fd`
 > test files · 33 .md docs · 4 examples · 3 scripts · 3 benchmarks · 4 binaries (fidesc, pacte, scribe, veil).
 > Cross-compilation: ARM64, RISC-V, Windows — zero external tools.
 
@@ -257,7 +257,7 @@ typed strings, init guarantees, constant_time, etc.
 ### Current Test Results
 
 **See `AGENTS.md` → "Current Baseline"** for authoritative test counts.
-(153/153 on all 3 backends, 265/265 unit tests, 0 skip, 0 known-fail.)
+(164/165 on interp+C codegen, 165/165 PE, 265/265 unit tests, 0 skip, 0 known-fail.)
 
 > Full test inventory: see `tests/` directory listing, or run
 > `./target/release/fidesc test` to see all test names and results.

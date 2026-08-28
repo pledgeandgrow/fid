@@ -34,7 +34,7 @@ ByteBuffer_clear:
 ByteBuffer_from_string:
     pushq %rbp
     movq %rsp, %rbp
-    subq $96, %rsp
+    subq $104, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -44,13 +44,13 @@ ByteBuffer_from_string:
     movq %rdx, -80(%rbp)
 .LByteBuffer_from_string_bb0:
     movq $0, %rbx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq $0, %r12
     leaq -16(%rbp), %rdi
     movq %r12, %rsi
     movq %rbx, %rdx
     call ByteBuffer_new
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     leaq -16(%rbp), %rax
     movq %rax, -24(%rbp)
     movq $0, %rbx
@@ -58,11 +58,11 @@ ByteBuffer_from_string:
     movq -80(%rbp), %rsi
     call String_len
     movq %rax, %r12
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %r12, %rax
     movq %rax, -32(%rbp)
     movq $0, %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     jmp .LByteBuffer_from_string_bb1
@@ -82,15 +82,15 @@ ByteBuffer_from_string:
     movq -40(%rbp), %rdi
     movq -80(%rbp), %r8
     addq %rdi, %r8
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r8, %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %r8
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r8, %rax
     movq %rax, -56(%rbp)
     movq $0, %r8
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r8, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %rcx
@@ -141,6 +141,7 @@ ByteBuffer_from_string:
 ByteBuffer_is_empty:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .LByteBuffer_is_empty_bb0:
     movq %rsi, %rcx
@@ -185,7 +186,7 @@ ByteBuffer_new:
     pushq %r12
     movq %rdi, -24(%rbp)
 .LByteBuffer_new_bb0:
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq $0, %rbx
     movq %rbx, %rdi
     call Vec_new
@@ -223,7 +224,7 @@ ByteBuffer_new:
 ByteBuffer_read_byte:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -341,7 +342,7 @@ ByteBuffer_set_byte:
 ByteBuffer_to_str:
     pushq %rbp
     movq %rsp, %rbp
-    subq $64, %rsp
+    subq $72, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -350,11 +351,11 @@ ByteBuffer_to_str:
     movq %rsi, -32(%rbp)
 .LByteBuffer_to_str_bb0:
     leaq .str_15(%rip), %rdx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -8(%rbp)
     movq $0, %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     jmp .LByteBuffer_to_str_bb1
@@ -385,7 +386,7 @@ ByteBuffer_to_str:
     movq %r14, %rdx
     call Vec_get
     movq %rax, %r12
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r12, %rax
     movq %rax, -24(%rbp)
     movq -8(%rbp), %r12
@@ -428,19 +429,19 @@ ByteBuffer_write_byte:
     subq $16, %rsp
     pushq %rbx
     pushq %r12
-    movq %rsi, -8(%rbp)
-    movq %rdx, -16(%rbp)
+    movq %rsi, -16(%rbp)
+    movq %rdx, -8(%rbp)
 .LByteBuffer_write_byte_bb0:
-    movq -8(%rbp), %rcx
+    movq -16(%rbp), %rcx
     movq (%rcx), %rbx
     movq $0, %r12
     movq %r12, %rdi
     movq %rbx, %rsi
-    movq -16(%rbp), %rdx
+    movq -8(%rbp), %rdx
     call Vec_push
-    movq -8(%rbp), %rbx
+    movq -16(%rbp), %rbx
     leaq 8(%rbx), %rbx
-    movq -8(%rbp), %rcx
+    movq -16(%rbp), %rcx
     leaq 8(%rcx), %rcx
     movq (%rcx), %rsi
     movq $1, %rax
@@ -466,19 +467,19 @@ ByteBuffer_write_bytes:
     pushq %r12
     pushq %r13
     pushq %r14
-    movq %rsi, -40(%rbp)
-    movq %rdx, -48(%rbp)
-    movq %rcx, -56(%rbp)
+    movq %rsi, -48(%rbp)
+    movq %rdx, -56(%rbp)
+    movq %rcx, -40(%rbp)
 .LByteBuffer_write_bytes_bb0:
     movq $0, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
     jmp .LByteBuffer_write_bytes_bb1
 .LByteBuffer_write_bytes_bb1:
     movq -8(%rbp), %rbx
     movq %rbx, %r12
-    cmpq -56(%rbp), %r12
+    cmpq -40(%rbp), %r12
     setl %al
     movzbq %al, %r12
     movq %r12, %rax
@@ -487,17 +488,17 @@ ByteBuffer_write_bytes:
     jmp .LByteBuffer_write_bytes_bb3
 .LByteBuffer_write_bytes_bb2:
     movq -8(%rbp), %rsi
-    movq -48(%rbp), %r8
+    movq -56(%rbp), %r8
     addq %rsi, %r8
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %r8, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rdx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -24(%rbp)
     movq $0, %r8
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %r8, %rax
     movq %rax, -32(%rbp)
     movq -24(%rbp), %rcx
@@ -507,7 +508,7 @@ ByteBuffer_write_bytes:
     movq -32(%rbp), %r13
     movq $0, %r14
     movq %r14, %rdi
-    movq -40(%rbp), %rsi
+    movq -48(%rbp), %rsi
     movq %r13, %rdx
     call ByteBuffer_write_byte
     movq -8(%rbp), %r8
@@ -540,28 +541,28 @@ HashMap_clear:
     movq $16, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rdx
     movq $0, %rbx
     movq %rbx, %rax
     movq %rax, (%rdx)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -16(%rbp)
     movq $24, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -24(%rbp)
     movq $0, %rdx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -32(%rbp)
     movq $0, %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     movq -16(%rbp), %rcx
@@ -598,7 +599,7 @@ HashMap_clear:
     jmp .LHashMap_clear_bb2
 .LHashMap_clear_bb1:
     movq $0, %rdx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -48(%rbp)
     jmp .LHashMap_clear_bb4
@@ -626,11 +627,11 @@ HashMap_clear:
     imulq %rcx, %r12
     movq %r10, %r11
     addq %r12, %r11
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r11, %rax
     movq %rax, -56(%rbp)
     movq -56(%rbp), %rdx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -64(%rbp)
     movq -64(%rbp), %rdx
@@ -658,7 +659,7 @@ HashMap_clear:
 HashMap_clone:
     pushq %rbp
     movq %rsp, %rbp
-    subq $144, %rsp
+    subq $152, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -670,34 +671,34 @@ HashMap_clone:
     movq %rbx, %rdi
     call HashMap_new
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq $24, %rax
     movq -120(%rbp), %rbx
     addq %rax, %rbx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq -120(%rbp), %rax
     movq %rax, -24(%rbp)
     movq $8, %rax
     movq -120(%rbp), %rbx
     addq %rax, %rbx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -32(%rbp)
     movq $0, %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     movq $0, %rdx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -48(%rbp)
     movq $0, %rdx
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -56(%rbp)
     movq -16(%rbp), %rcx
@@ -744,7 +745,7 @@ HashMap_clone:
     jmp .LHashMap_clone_bb3
 .LHashMap_clone_bb3:
     movq $0, %rdx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -64(%rbp)
     jmp .LHashMap_clone_bb4
@@ -770,15 +771,15 @@ HashMap_clone:
     imulq %rcx, %r10
     movq %r8, %r9
     addq %r10, %r9
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %r9, %rax
     movq %rax, -72(%rbp)
     movq -72(%rbp), %rdx
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -80(%rbp)
     movq $0, %rdx
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -88(%rbp)
     movq -80(%rbp), %rcx
@@ -824,15 +825,15 @@ HashMap_clone:
     imulq %rcx, %r10
     movq %r8, %r9
     addq %r10, %r9
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %r9, %rax
     movq %rax, -96(%rbp)
     movq -96(%rbp), %rdx
-    movq -104(%rbp), %rax
+    leaq -104(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -104(%rbp)
     movq $0, %rdx
-    movq -112(%rbp), %rax
+    leaq -112(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -112(%rbp)
     movq -104(%rbp), %rcx
@@ -883,11 +884,11 @@ HashMap_contains:
     movq $24, %rax
     movq -80(%rbp), %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
     movq $0, %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq -8(%rbp), %rcx
@@ -916,14 +917,14 @@ HashMap_contains:
     movq -72(%rbp), %rdx
     call HashMap_find_slot
     movq %rax, %r12
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r12, %rax
     movq %rax, -24(%rbp)
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq -80(%rbp), %rax
     movq %rax, -32(%rbp)
     movq $0, %rbx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %rcx
@@ -938,15 +939,15 @@ HashMap_contains:
     imulq %rcx, %r9
     movq %rbx, %r8
     addq %r9, %r8
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r8, %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %rbx
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -56(%rbp)
     movq $0, %rbx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %rcx
@@ -989,7 +990,7 @@ HashMap_contains:
 HashMap_find_slot:
     pushq %rbp
     movq %rsp, %rbp
-    subq $112, %rsp
+    subq $120, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -1000,14 +1001,14 @@ HashMap_find_slot:
     movq $24, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -16(%rbp)
     movq $0, %rdx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -24(%rbp)
     movq -8(%rbp), %rcx
@@ -1031,7 +1032,7 @@ HashMap_find_slot:
     jmp .LHashMap_find_slot_bb3
 .LHashMap_find_slot_bb3:
     movq $0, %rbx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -32(%rbp)
     movq -16(%rbp), %rcx
@@ -1043,7 +1044,7 @@ HashMap_find_slot:
     movq -96(%rbp), %rsi
     call p_str_hash
     movq %rax, %r12
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r12, %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rbx
@@ -1053,17 +1054,17 @@ HashMap_find_slot:
     cqto
     idivq %r8
     movq %rdx, %r9
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r9, %rax
     movq %rax, -48(%rbp)
     movq $1, %rbx
     movq %rbx, %r8
     negq %r8
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r8, %rax
     movq %rax, -56(%rbp)
     movq $0, %rbx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -64(%rbp)
     jmp .LHashMap_find_slot_bb4
@@ -1088,15 +1089,15 @@ HashMap_find_slot:
     imulq %rcx, %r10
     movq %r8, %r9
     addq %r10, %r9
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %r9, %rax
     movq %rax, -72(%rbp)
     movq -72(%rbp), %r8
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %r8, %rax
     movq %rax, -80(%rbp)
     movq $0, %r8
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r8, %rax
     movq %rax, -88(%rbp)
     movq -80(%rbp), %rcx
@@ -1266,11 +1267,11 @@ HashMap_get:
     movq $24, %rax
     movq -120(%rbp), %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
     movq $0, %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq -8(%rbp), %rcx
@@ -1299,14 +1300,14 @@ HashMap_get:
     movq -112(%rbp), %rdx
     call HashMap_find_slot
     movq %rax, %r12
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r12, %rax
     movq %rax, -24(%rbp)
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq -120(%rbp), %rax
     movq %rax, -32(%rbp)
     movq $0, %rbx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %rcx
@@ -1321,15 +1322,15 @@ HashMap_get:
     imulq %rcx, %r9
     movq %rbx, %r8
     addq %r9, %r8
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r8, %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %rbx
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -56(%rbp)
     movq $0, %rbx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %rcx
@@ -1371,11 +1372,11 @@ HashMap_get:
     movq $8, %rax
     movq -120(%rbp), %rbx
     addq %rax, %rbx
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -72(%rbp)
     movq $0, %rbx
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -80(%rbp)
     movq -72(%rbp), %rcx
@@ -1390,15 +1391,15 @@ HashMap_get:
     imulq %rcx, %r9
     movq %rbx, %r8
     addq %r9, %r8
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r8, %rax
     movq %rax, -88(%rbp)
     movq -88(%rbp), %rbx
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -96(%rbp)
     movq $0, %rbx
-    movq -104(%rbp), %rax
+    leaq -104(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -104(%rbp)
     movq -96(%rbp), %rcx
@@ -1423,18 +1424,18 @@ HashMap_get_or:
     subq $128, %rsp
     pushq %rbx
     pushq %r12
-    movq %rsi, -128(%rbp)
-    movq %rdx, -120(%rbp)
-    movq %rcx, -112(%rbp)
+    movq %rsi, -112(%rbp)
+    movq %rdx, -128(%rbp)
+    movq %rcx, -120(%rbp)
 .LHashMap_get_or_bb0:
     movq $24, %rax
-    movq -128(%rbp), %rbx
+    movq -112(%rbp), %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
     movq $0, %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq -8(%rbp), %rcx
@@ -1452,25 +1453,25 @@ HashMap_get_or:
     jne .LHashMap_get_or_bb1
     jmp .LHashMap_get_or_bb2
 .LHashMap_get_or_bb1:
-    movq -112(%rbp), %rax
+    movq -120(%rbp), %rax
     jmp .LHashMap_get_or_epilogue
 .LHashMap_get_or_bb2:
     jmp .LHashMap_get_or_bb3
 .LHashMap_get_or_bb3:
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -128(%rbp), %rsi
-    movq -120(%rbp), %rdx
+    movq -112(%rbp), %rsi
+    movq -128(%rbp), %rdx
     call HashMap_find_slot
     movq %rax, %r12
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r12, %rax
     movq %rax, -24(%rbp)
-    movq -32(%rbp), %rax
-    movq -128(%rbp), %rax
+    leaq -32(%rbp), %rax
+    movq -112(%rbp), %rax
     movq %rax, -32(%rbp)
     movq $0, %rbx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %rbx
@@ -1485,15 +1486,15 @@ HashMap_get_or:
     imulq %rcx, %r9
     movq %rbx, %r8
     addq %r9, %r8
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r8, %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %rbx
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -56(%rbp)
     movq $0, %rbx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %rbx
@@ -1527,19 +1528,19 @@ HashMap_get_or:
     jne .LHashMap_get_or_bb4
     jmp .LHashMap_get_or_bb5
 .LHashMap_get_or_bb4:
-    movq -112(%rbp), %rax
+    movq -120(%rbp), %rax
     jmp .LHashMap_get_or_epilogue
 .LHashMap_get_or_bb5:
     jmp .LHashMap_get_or_bb6
 .LHashMap_get_or_bb6:
     movq $8, %rax
-    movq -128(%rbp), %rbx
+    movq -112(%rbp), %rbx
     addq %rax, %rbx
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -72(%rbp)
     movq $0, %rbx
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -80(%rbp)
     movq -72(%rbp), %rbx
@@ -1554,15 +1555,15 @@ HashMap_get_or:
     imulq %rcx, %r9
     movq %rbx, %r8
     addq %r9, %r8
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r8, %rax
     movq %rax, -88(%rbp)
     movq -88(%rbp), %rbx
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -96(%rbp)
     movq $0, %rbx
-    movq -104(%rbp), %rax
+    leaq -104(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -104(%rbp)
     movq -96(%rbp), %rbx
@@ -1584,7 +1585,7 @@ HashMap_get_or:
 HashMap_grow:
     pushq %rbp
     movq %rsp, %rbp
-    subq $336, %rsp
+    subq $344, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -1594,34 +1595,34 @@ HashMap_grow:
     movq $24, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -16(%rbp)
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -24(%rbp)
     movq $16, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -32(%rbp)
     movq $0, %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     movq $0, %rdx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -48(%rbp)
     movq $0, %rdx
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -56(%rbp)
     movq -8(%rbp), %rcx
@@ -1637,7 +1638,7 @@ HashMap_grow:
     movq %rdx, %rax
     movq %rax, -56(%rbp)
     movq $8, %rdx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -64(%rbp)
     movq -40(%rbp), %rbx
@@ -1670,7 +1671,7 @@ HashMap_grow:
     movq %r12, %rdi
     call p_malloc
     movq %rax, %rbx
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -72(%rbp)
     movq -64(%rbp), %rbx
@@ -1681,11 +1682,11 @@ HashMap_grow:
     movq %r12, %rdi
     call p_malloc
     movq %rax, %rbx
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -80(%rbp)
     movq $0, %rdx
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -88(%rbp)
     jmp .LHashMap_grow_bb4
@@ -1710,11 +1711,11 @@ HashMap_grow:
     imulq %rcx, %r10
     movq %r8, %r9
     addq %r10, %r9
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %r9, %rax
     movq %rax, -96(%rbp)
     movq -96(%rbp), %rdx
-    movq -104(%rbp), %rax
+    leaq -104(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -104(%rbp)
     movq -80(%rbp), %r8
@@ -1725,11 +1726,11 @@ HashMap_grow:
     imulq %rcx, %r10
     movq %r8, %r9
     addq %r10, %r9
-    movq -112(%rbp), %rax
+    leaq -112(%rbp), %rax
     movq %r9, %rax
     movq %rax, -112(%rbp)
     movq -112(%rbp), %rdx
-    movq -120(%rbp), %rax
+    leaq -120(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -120(%rbp)
     movq -104(%rbp), %rdx
@@ -1749,11 +1750,11 @@ HashMap_grow:
     jmp .LHashMap_grow_bb4
 .LHashMap_grow_bb6:
     movq $0, %rdx
-    movq -128(%rbp), %rax
+    leaq -128(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -128(%rbp)
     movq $0, %rdx
-    movq -136(%rbp), %rax
+    leaq -136(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -136(%rbp)
     jmp .LHashMap_grow_bb7
@@ -1780,15 +1781,15 @@ HashMap_grow:
     imulq %rcx, %r10
     movq %r8, %r9
     addq %r10, %r9
-    movq -144(%rbp), %rax
+    leaq -144(%rbp), %rax
     movq %r9, %rax
     movq %rax, -144(%rbp)
     movq -144(%rbp), %rdx
-    movq -152(%rbp), %rax
+    leaq -152(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -152(%rbp)
     movq $0, %rdx
-    movq -160(%rbp), %rax
+    leaq -160(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -160(%rbp)
     movq -152(%rbp), %rcx
@@ -1841,15 +1842,15 @@ HashMap_grow:
     imulq %rcx, %r10
     movq %r8, %r9
     addq %r10, %r9
-    movq -168(%rbp), %rax
+    leaq -168(%rbp), %rax
     movq %r9, %rax
     movq %rax, -168(%rbp)
     movq -168(%rbp), %rdx
-    movq -176(%rbp), %rax
+    leaq -176(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -176(%rbp)
     movq $0, %rdx
-    movq -184(%rbp), %rax
+    leaq -184(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -184(%rbp)
     movq -176(%rbp), %rcx
@@ -1862,7 +1863,7 @@ HashMap_grow:
     movq %r15, %rsi
     call p_str_hash
     movq %rax, %r13
-    movq -192(%rbp), %rax
+    leaq -192(%rbp), %rax
     movq %r13, %rax
     movq %rax, -192(%rbp)
     movq -192(%rbp), %r8
@@ -1872,11 +1873,11 @@ HashMap_grow:
     cqto
     idivq %r9
     movq %rdx, %r10
-    movq -200(%rbp), %rax
+    leaq -200(%rbp), %rax
     movq %r10, %rax
     movq %rax, -200(%rbp)
     movq $0, %rdx
-    movq -208(%rbp), %rax
+    leaq -208(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -208(%rbp)
     jmp .LHashMap_grow_bb13
@@ -1914,15 +1915,15 @@ HashMap_grow:
     imulq %rcx, %r10
     movq %r8, %r9
     addq %r10, %r9
-    movq -216(%rbp), %rax
+    leaq -216(%rbp), %rax
     movq %r9, %rax
     movq %rax, -216(%rbp)
     movq -216(%rbp), %rdx
-    movq -224(%rbp), %rax
+    leaq -224(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -224(%rbp)
     movq $0, %rdx
-    movq -232(%rbp), %rax
+    leaq -232(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -232(%rbp)
     movq -224(%rbp), %rcx
@@ -1961,11 +1962,11 @@ HashMap_grow:
     imulq %rcx, %r10
     movq %r8, %r9
     addq %r10, %r9
-    movq -240(%rbp), %rax
+    leaq -240(%rbp), %rax
     movq %r9, %rax
     movq %rax, -240(%rbp)
     movq -240(%rbp), %rdx
-    movq -248(%rbp), %rax
+    leaq -248(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -248(%rbp)
     movq -248(%rbp), %rdx
@@ -2069,27 +2070,27 @@ HashMap_insert:
     pushq %rbx
     pushq %r12
     movq %rsi, -144(%rbp)
-    movq %rdx, -152(%rbp)
-    movq %rcx, -160(%rbp)
+    movq %rdx, -160(%rbp)
+    movq %rcx, -152(%rbp)
 .LHashMap_insert_bb0:
     movq $16, %rax
     movq -144(%rbp), %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
     movq $24, %rax
     movq -144(%rbp), %rbx
     addq %rax, %rbx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -16(%rbp)
     movq $0, %rdx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -24(%rbp)
     movq $0, %rbx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -32(%rbp)
     movq -8(%rbp), %rcx
@@ -2148,27 +2149,27 @@ HashMap_insert:
     movq $0, %rbx
     movq %rbx, %rdi
     movq -144(%rbp), %rsi
-    movq -152(%rbp), %rdx
+    movq -160(%rbp), %rdx
     call HashMap_find_slot
     movq %rax, %r12
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r12, %rax
     movq %rax, -40(%rbp)
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq -144(%rbp), %rax
     movq %rax, -48(%rbp)
     movq $8, %rax
     movq -144(%rbp), %rbx
     addq %rax, %rbx
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -56(%rbp)
     movq $0, %rbx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -64(%rbp)
     movq $0, %rbx
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -72(%rbp)
     movq -48(%rbp), %rbx
@@ -2187,15 +2188,15 @@ HashMap_insert:
     imulq %rcx, %r9
     movq %rbx, %r8
     addq %r9, %r8
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %r8, %rax
     movq %rax, -80(%rbp)
     movq -80(%rbp), %rbx
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -88(%rbp)
     movq $0, %rbx
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -96(%rbp)
     movq -88(%rbp), %rbx
@@ -2230,7 +2231,7 @@ HashMap_insert:
     jmp .LHashMap_insert_bb5
 .LHashMap_insert_bb4:
     movq -88(%rbp), %rbx
-    movq -152(%rbp), %rax
+    movq -160(%rbp), %rax
     movq %rax, (%rbx)
     movq -72(%rbp), %rbx
     movq -40(%rbp), %r8
@@ -2240,21 +2241,21 @@ HashMap_insert:
     imulq %rcx, %r9
     movq %rbx, %r8
     addq %r9, %r8
-    movq -104(%rbp), %rax
+    leaq -104(%rbp), %rax
     movq %r8, %rax
     movq %rax, -104(%rbp)
     movq -104(%rbp), %rbx
-    movq -112(%rbp), %rax
+    leaq -112(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -112(%rbp)
     movq -112(%rbp), %rbx
-    movq -160(%rbp), %rax
+    movq -152(%rbp), %rax
     movq %rax, (%rbx)
     movq -24(%rbp), %rbx
     movq $1, %rax
     movq %rbx, %r8
     addq %rax, %r8
-    movq -120(%rbp), %rax
+    leaq -120(%rbp), %rax
     movq %r8, %rax
     movq %rax, -120(%rbp)
     movq -8(%rbp), %rbx
@@ -2271,15 +2272,15 @@ HashMap_insert:
     imulq %rcx, %r9
     movq %rbx, %r8
     addq %r9, %r8
-    movq -128(%rbp), %rax
+    leaq -128(%rbp), %rax
     movq %r8, %rax
     movq %rax, -128(%rbp)
     movq -128(%rbp), %rbx
-    movq -136(%rbp), %rax
+    leaq -136(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -136(%rbp)
     movq -136(%rbp), %rbx
-    movq -160(%rbp), %rax
+    movq -152(%rbp), %rax
     movq %rax, (%rbx)
     jmp .LHashMap_insert_bb6
 .LHashMap_insert_bb6:
@@ -2296,17 +2297,17 @@ HashMap_insert:
 HashMap_is_empty:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
 .LHashMap_is_empty_bb0:
     movq $16, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
     movq $0, %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq -8(%rbp), %rcx
@@ -2332,7 +2333,7 @@ HashMap_is_empty:
 HashMap_keys:
     pushq %rbp
     movq %rsp, %rbp
-    subq $80, %rsp
+    subq $88, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -2342,18 +2343,18 @@ HashMap_keys:
     movq $24, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -16(%rbp)
     movq $0, %rdx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -24(%rbp)
     movq $0, %rdx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -32(%rbp)
     movq -8(%rbp), %rcx
@@ -2368,7 +2369,7 @@ HashMap_keys:
     movq %rbx, %rdi
     call Vec_new
     movq %rax, %r12
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r12, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %rbx
@@ -2403,7 +2404,7 @@ HashMap_keys:
     jmp .LHashMap_keys_bb3
 .LHashMap_keys_bb3:
     movq $0, %rdx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -48(%rbp)
     jmp .LHashMap_keys_bb4
@@ -2428,15 +2429,15 @@ HashMap_keys:
     imulq %rcx, %r10
     movq %r8, %r9
     addq %r10, %r9
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r9, %rax
     movq %rax, -56(%rbp)
     movq -56(%rbp), %rdx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -64(%rbp)
     movq $0, %rdx
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -72(%rbp)
     movq -64(%rbp), %rcx
@@ -2470,6 +2471,11 @@ HashMap_keys:
     jne .LHashMap_keys_bb7
     jmp .LHashMap_keys_bb8
 .LHashMap_keys_bb6:
+    movq -40(%rbp), %r14
+    movq $0, %r15
+    movq %r15, %rdi
+    movq %r14, %rsi
+    call Vec_sort
     movq -40(%rbp), %rcx
     movq %rcx, %rax
     jmp .LHashMap_keys_epilogue
@@ -2507,17 +2513,17 @@ HashMap_keys:
 HashMap_len:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
 .LHashMap_len_bb0:
     movq $16, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
     movq $0, %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq -8(%rbp), %rcx
@@ -2546,32 +2552,32 @@ HashMap_new:
     movq %rbx, %rdi
     call p_malloc
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq -8(%rbp), %rbx
     movq $8, %rax
     movq %rbx, %rsi
     addq %rax, %rsi
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -24(%rbp)
     movq -8(%rbp), %rbx
     movq $16, %rax
     movq %rbx, %rsi
     addq %rax, %rsi
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -32(%rbp)
     movq -8(%rbp), %rbx
     movq $24, %rax
     movq %rbx, %rsi
     addq %rax, %rsi
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -40(%rbp)
     movq -16(%rbp), %rdx
@@ -2614,17 +2620,17 @@ HashMap_remove:
     movq $24, %rax
     movq -104(%rbp), %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
     movq $16, %rax
     movq -104(%rbp), %rbx
     addq %rax, %rbx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -16(%rbp)
     movq $0, %rdx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -24(%rbp)
     movq -8(%rbp), %rcx
@@ -2652,14 +2658,14 @@ HashMap_remove:
     movq -96(%rbp), %rdx
     call HashMap_find_slot
     movq %rax, %r12
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %r12, %rax
     movq %rax, -32(%rbp)
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq -104(%rbp), %rax
     movq %rax, -40(%rbp)
     movq $0, %rbx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -48(%rbp)
     movq -40(%rbp), %rcx
@@ -2674,15 +2680,15 @@ HashMap_remove:
     imulq %rcx, %r9
     movq %rbx, %r8
     addq %r9, %r8
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r8, %rax
     movq %rax, -56(%rbp)
     movq -56(%rbp), %rbx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -64(%rbp)
     movq $0, %rbx
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -72(%rbp)
     movq -64(%rbp), %rcx
@@ -2727,7 +2733,7 @@ HashMap_remove:
     movq %r9, %rax
     movq %rax, (%rbx)
     movq $0, %rbx
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -80(%rbp)
     movq -16(%rbp), %rcx
@@ -2738,7 +2744,7 @@ HashMap_remove:
     movq $1, %rax
     movq %rbx, %r8
     subq %rax, %r8
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r8, %rax
     movq %rax, -88(%rbp)
     movq -16(%rbp), %rbx
@@ -2758,7 +2764,7 @@ HashMap_remove:
 HashMap_to_str:
     pushq %rbp
     movq %rsp, %rbp
-    subq $176, %rsp
+    subq $184, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -2771,7 +2777,7 @@ HashMap_to_str:
     movq -88(%rbp), %rsi
     call HashMap_keys
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rbx
@@ -2780,11 +2786,11 @@ HashMap_to_str:
     movq %rbx, %rsi
     call Vec_len
     movq %rax, %r13
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %r13, %rax
     movq %rax, -16(%rbp)
     movq $0, %rdx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -24(%rbp)
     jmp .LHashMap_to_str_bb1
@@ -2803,13 +2809,13 @@ HashMap_to_str:
     jmp .LHashMap_to_str_bb3
 .LHashMap_to_str_bb2:
     movq $0, %rdx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -32(%rbp)
     jmp .LHashMap_to_str_bb4
 .LHashMap_to_str_bb3:
     leaq .str_12(%rip), %rdx
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -56(%rbp)
     movq $0, %rdx
@@ -2847,7 +2853,7 @@ HashMap_to_str:
     movq %r14, %rdx
     call Vec_get
     movq %rax, %r12
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r12, %rax
     movq %rax, -40(%rbp)
     movq -8(%rbp), %r12
@@ -2861,7 +2867,7 @@ HashMap_to_str:
     movq %r13, %rdx
     call Vec_get
     movq %rax, %r15
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r15, %rax
     movq %rax, -48(%rbp)
     movq -40(%rbp), %r12
@@ -2980,7 +2986,7 @@ HashMap_to_str:
     movq %r14, %rdx
     call Vec_get
     movq %rax, %r12
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r12, %rax
     movq %rax, -64(%rbp)
     movq -64(%rbp), %r12
@@ -2990,7 +2996,7 @@ HashMap_to_str:
     movq %r12, %rdx
     call HashMap_get
     movq %rax, %r14
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %r14, %rax
     movq %rax, -72(%rbp)
     movq -64(%rbp), %r12
@@ -2999,7 +3005,7 @@ HashMap_to_str:
     movq %r12, %rsi
     call p_str_from_ptr
     movq %rax, %r14
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %r14, %rax
     movq %rax, -80(%rbp)
     movq -56(%rbp), %r12
@@ -3051,203 +3057,96 @@ HashMap_to_str:
 HashMap_values:
     pushq %rbp
     movq %rsp, %rbp
-    subq $128, %rsp
+    subq $88, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
     pushq %r14
     pushq %r15
+    movq %rsi, -56(%rbp)
 .LHashMap_values_bb0:
-    movq $24, %rax
-    movq %rsi, %rbx
-    addq %rax, %rbx
-    movq -8(%rbp), %rax
-    movq %rbx, %rax
+    movq $0, %rbx
+    movq %rbx, %rdi
+    movq -56(%rbp), %rsi
+    call HashMap_keys
+    movq %rax, %r12
+    leaq -8(%rbp), %rax
+    movq %r12, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
-    movq %rsi, %rax
+    movq -8(%rbp), %rbx
+    movq $0, %r12
+    movq %r12, %rdi
+    movq %rbx, %rsi
+    call Vec_len
+    movq %rax, %r13
+    leaq -16(%rbp), %rax
+    movq %r13, %rax
     movq %rax, -16(%rbp)
-    movq $8, %rax
-    movq %rsi, %rbx
-    addq %rax, %rbx
-    movq -24(%rbp), %rax
-    movq %rbx, %rax
-    movq %rax, -24(%rbp)
-    movq $0, %rdx
-    movq -32(%rbp), %rax
-    movq %rdx, %rax
-    movq %rax, -32(%rbp)
-    movq $0, %rdx
-    movq -40(%rbp), %rax
-    movq %rdx, %rax
-    movq %rax, -40(%rbp)
-    movq $0, %rdx
-    movq -48(%rbp), %rax
-    movq %rdx, %rax
-    movq %rax, -48(%rbp)
-    movq -8(%rbp), %rcx
-    movq (%rcx), %rdx
-    movq %rdx, %rax
-    movq %rax, -32(%rbp)
-    movq -16(%rbp), %rcx
-    movq (%rcx), %rdx
-    movq %rdx, %rax
-    movq %rax, -40(%rbp)
-    movq -24(%rbp), %rcx
-    movq (%rcx), %rdx
-    movq %rdx, %rax
-    movq %rax, -48(%rbp)
     movq $0, %rbx
     movq %rbx, %rdi
     call Vec_new
     movq %rax, %r12
-    movq -56(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r12, %rax
-    movq %rax, -56(%rbp)
-    movq -40(%rbp), %rbx
-    movq $0, %rax
-    movq %rbx, %r8
-    cmpq %rax, %r8
-    sete %al
-    movzbq %al, %r8
-    movq -32(%rbp), %rbx
-    movq $0, %rax
-    movq %rbx, %r9
-    cmpq %rax, %r9
-    sete %al
-    movzbq %al, %r9
-    movq %r8, %rbx
-    movq %r9, %rcx
-    testq %rbx, %rbx
-    setne %al
-    testq %rcx, %rcx
-    setne %cl
-    orb %cl, %al
-    movzbq %al, %rbx
-    movq %rbx, %rax
-    testq %rax, %rax
-    jne .LHashMap_values_bb1
-    jmp .LHashMap_values_bb2
-.LHashMap_values_bb1:
-    movq -56(%rbp), %rcx
-    movq %rcx, %rax
-    jmp .LHashMap_values_epilogue
-.LHashMap_values_bb2:
-    jmp .LHashMap_values_bb3
-.LHashMap_values_bb3:
+    movq %rax, -24(%rbp)
     movq $0, %rdx
-    movq -64(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rdx, %rax
-    movq %rax, -64(%rbp)
-    jmp .LHashMap_values_bb4
-.LHashMap_values_bb4:
-    movq -64(%rbp), %rbx
-    movq -32(%rbp), %r12
+    movq %rax, -32(%rbp)
+    jmp .LHashMap_values_bb1
+.LHashMap_values_bb1:
+    movq -32(%rbp), %rbx
+    movq -16(%rbp), %rax
+    movq %rax, -72(%rbp)
     movq %rbx, %rax
-    cmpq %r12, %rax
+    cmpq -72(%rbp), %rax
     setl %al
     movzbq %al, %rax
-    movq %rax, -120(%rbp)
-    movq -120(%rbp), %rax
+    movq %rax, -64(%rbp)
+    movq -64(%rbp), %rax
     testq %rax, %rax
-    jne .LHashMap_values_bb5
-    jmp .LHashMap_values_bb6
-.LHashMap_values_bb5:
-    movq -40(%rbp), %r8
-    movq -64(%rbp), %r9
-    movq $8, %rax
-    movq %r9, %r10
-    movq %rax, %rcx
-    imulq %rcx, %r10
-    movq %r8, %r9
-    addq %r10, %r9
-    movq -72(%rbp), %rax
-    movq %r9, %rax
-    movq %rax, -72(%rbp)
-    movq -72(%rbp), %rdx
-    movq -80(%rbp), %rax
-    movq %rdx, %rax
-    movq %rax, -80(%rbp)
-    movq $0, %rdx
-    movq -88(%rbp), %rax
-    movq %rdx, %rax
-    movq %rax, -88(%rbp)
-    movq -80(%rbp), %rcx
-    movq (%rcx), %rdx
-    movq %rdx, %rax
-    movq %rax, -88(%rbp)
-    movq -88(%rbp), %r8
-    movq $0, %rax
-    movq %r8, %r9
-    cmpq %rax, %r9
-    setne %al
-    movzbq %al, %r9
-    movq -88(%rbp), %r8
-    movq $1, %rdx
-    movq %rdx, %r10
-    negq %r10
-    movq %r8, %rax
-    cmpq %r10, %rax
-    setne %al
-    movzbq %al, %rax
-    movq %r9, %r8
-    movq %rax, %rcx
-    testq %r8, %r8
-    setne %al
-    testq %rcx, %rcx
-    setne %cl
-    andb %cl, %al
-    movzbq %al, %r8
-    movq %r8, %rax
-    testq %rax, %rax
-    jne .LHashMap_values_bb7
-    jmp .LHashMap_values_bb8
-.LHashMap_values_bb6:
-    movq -56(%rbp), %rcx
-    movq %rcx, %rax
-    jmp .LHashMap_values_epilogue
-.LHashMap_values_bb7:
-    movq -48(%rbp), %r8
-    movq -64(%rbp), %r9
-    movq $8, %rax
-    movq %r9, %r10
-    movq %rax, %rcx
-    imulq %rcx, %r10
-    movq %r8, %r9
-    addq %r10, %r9
-    movq -96(%rbp), %rax
-    movq %r9, %rax
-    movq %rax, -96(%rbp)
-    movq -96(%rbp), %rdx
-    movq -104(%rbp), %rax
-    movq %rdx, %rax
-    movq %rax, -104(%rbp)
-    movq $0, %rdx
-    movq -112(%rbp), %rax
-    movq %rdx, %rax
-    movq %rax, -112(%rbp)
-    movq -104(%rbp), %rcx
-    movq (%rcx), %rdx
-    movq %rdx, %rax
-    movq %rax, -112(%rbp)
-    movq -56(%rbp), %r14
-    movq -112(%rbp), %r15
+    jne .LHashMap_values_bb2
+    jmp .LHashMap_values_bb3
+.LHashMap_values_bb2:
+    movq -8(%rbp), %r14
+    movq -32(%rbp), %r15
     movq $0, %r13
     movq %r13, %rdi
     movq %r14, %rsi
     movq %r15, %rdx
+    call Vec_get
+    movq %rax, %r12
+    leaq -40(%rbp), %rax
+    movq %r12, %rax
+    movq %rax, -40(%rbp)
+    movq -40(%rbp), %r12
+    movq $0, %r13
+    movq %r13, %rdi
+    movq -56(%rbp), %rsi
+    movq %r12, %rdx
+    call HashMap_get
+    movq %rax, %r14
+    leaq -48(%rbp), %rax
+    movq %r14, %rax
+    movq %rax, -48(%rbp)
+    movq -24(%rbp), %r12
+    movq -48(%rbp), %r13
+    movq $0, %r14
+    movq %r14, %rdi
+    movq %r12, %rsi
+    movq %r13, %rdx
     call Vec_push
-    jmp .LHashMap_values_bb9
-.LHashMap_values_bb8:
-    jmp .LHashMap_values_bb9
-.LHashMap_values_bb9:
-    movq -64(%rbp), %r8
+    movq -32(%rbp), %rsi
     movq $1, %rax
-    movq %r8, %r9
-    addq %rax, %r9
-    movq %r9, %rax
-    movq %rax, -64(%rbp)
-    jmp .LHashMap_values_bb4
+    movq %rsi, %r8
+    addq %rax, %r8
+    movq %r8, %rax
+    movq %rax, -32(%rbp)
+    jmp .LHashMap_values_bb1
+.LHashMap_values_bb3:
+    movq -24(%rbp), %rcx
+    movq %rcx, %rax
+    jmp .LHashMap_values_epilogue
 .LHashMap_values_epilogue:
     popq %r15
     popq %r14
@@ -3266,35 +3165,35 @@ Option_and_then:
     subq $64, %rsp
     pushq %rbx
     pushq %r12
-    movq %rdi, -40(%rbp)
+    movq %rdi, -56(%rbp)
     movq %rdx, -48(%rbp)
-    movq %rcx, -56(%rbp)
+    movq %rcx, -40(%rbp)
 .LOption_and_then_bb0:
-    movq -48(%rbp), %rbx
-    movq (%rbx), %rdi
+    movq -48(%rbp), %rcx
+    movq (%rcx), %rbx
     movq $0, %rax
-    movq %rdi, %rbx
-    cmpq %rax, %rbx
+    movq %rbx, %rdi
+    cmpq %rax, %rdi
     sete %al
-    movzbq %al, %rbx
-    movq %rbx, %rax
+    movzbq %al, %rdi
+    movq %rdi, %rax
     testq %rax, %rax
     jne .LOption_and_then_bb2
     jmp .LOption_and_then_bb3
 .LOption_and_then_bb1:
     jmp .LOption_and_then_epilogue
 .LOption_and_then_bb2:
-    movq -48(%rbp), %rcx
-    leaq 8(%rcx), %rcx
-    movq (%rcx), %rbx
-    movq -16(%rbp), %rax
-    movq $0, %rdx
-    leaq -16(%rbp), %r8
-    movq %rdx, %rax
-    movq %rax, (%r8)
-    movq -56(%rbp), %r11
+    movq -48(%rbp), %rdx
+    leaq 8(%rdx), %rdx
+    movq (%rdx), %rbx
+    leaq -16(%rbp), %rax
+    movq $0, %r8
+    leaq -16(%rbp), %r9
+    movq %r8, %rax
+    movq %rax, (%r9)
+    movq -40(%rbp), %r11
     movq (%r11), %r11
-    movq -56(%rbp), %rdi
+    movq -40(%rbp), %rdi
     movq %rbx, %rsi
     call *%r11
     movq %rax, %r12
@@ -3303,13 +3202,13 @@ Option_and_then:
     movq %r12, %rax
     movq %rax, (%rbx)
     leaq -16(%rbp), %rbx
-    movq -40(%rbp), %r8
+    movq -56(%rbp), %r8
     movq (%rbx), %r9
     movq %r9, %rax
     movq %rax, (%r8)
     leaq -16(%rbp), %rbx
     addq $8, %rbx
-    movq -40(%rbp), %r8
+    movq -56(%rbp), %r8
     leaq 8(%r8), %r8
     movq (%rbx), %r9
     movq %r9, %rax
@@ -3328,19 +3227,19 @@ Option_and_then:
     jne .LOption_and_then_bb4
     jmp .LOption_and_then_bb5
 .LOption_and_then_bb4:
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq $1, %rbx
     leaq -32(%rbp), %r8
     movq %rbx, %rax
     movq %rax, (%r8)
     leaq -32(%rbp), %rbx
-    movq -40(%rbp), %r8
+    movq -56(%rbp), %r8
     movq (%rbx), %r9
     movq %r9, %rax
     movq %rax, (%r8)
     leaq -32(%rbp), %rbx
     addq $8, %rbx
-    movq -40(%rbp), %r8
+    movq -56(%rbp), %r8
     leaq 8(%r8), %r8
     movq (%rbx), %r9
     movq %r9, %rax
@@ -3360,7 +3259,7 @@ Option_and_then:
 Option_expect:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
     movq %rdx, -8(%rbp)
 .LOption_expect_bb0:
@@ -3414,6 +3313,7 @@ Option_expect:
 Option_is_none:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .LOption_is_none_bb0:
     movq %rsi, %rcx
@@ -3465,6 +3365,7 @@ Option_is_none:
 Option_is_some:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .LOption_is_some_bb0:
     movq %rsi, %rcx
@@ -3519,32 +3420,32 @@ Option_map:
     subq $64, %rsp
     pushq %rbx
     pushq %r12
-    movq %rdi, -48(%rbp)
-    movq %rdx, -40(%rbp)
+    movq %rdi, -40(%rbp)
+    movq %rdx, -48(%rbp)
     movq %rcx, -56(%rbp)
 .LOption_map_bb0:
-    movq -40(%rbp), %rdx
-    movq (%rdx), %rbx
+    movq -48(%rbp), %rbx
+    movq (%rbx), %rdi
     movq $0, %rax
-    movq %rbx, %rdi
-    cmpq %rax, %rdi
+    movq %rdi, %rbx
+    cmpq %rax, %rbx
     sete %al
-    movzbq %al, %rdi
-    movq %rdi, %rax
+    movzbq %al, %rbx
+    movq %rbx, %rax
     testq %rax, %rax
     jne .LOption_map_bb2
     jmp .LOption_map_bb3
 .LOption_map_bb1:
     jmp .LOption_map_epilogue
 .LOption_map_bb2:
-    movq -40(%rbp), %rcx
+    movq -48(%rbp), %rcx
     leaq 8(%rcx), %rcx
     movq (%rcx), %rbx
-    movq -16(%rbp), %rax
-    movq $0, %r8
-    leaq -16(%rbp), %r9
-    movq %r8, %rax
-    movq %rax, (%r9)
+    leaq -16(%rbp), %rax
+    movq $0, %rdx
+    leaq -16(%rbp), %r8
+    movq %rdx, %rax
+    movq %rax, (%r8)
     movq -56(%rbp), %r11
     movq (%r11), %r11
     movq -56(%rbp), %rdi
@@ -3556,20 +3457,20 @@ Option_map:
     movq %r12, %rax
     movq %rax, (%rbx)
     leaq -16(%rbp), %rbx
-    movq -48(%rbp), %r8
+    movq -40(%rbp), %r8
     movq (%rbx), %r9
     movq %r9, %rax
     movq %rax, (%r8)
     leaq -16(%rbp), %rbx
     addq $8, %rbx
-    movq -48(%rbp), %r8
+    movq -40(%rbp), %r8
     leaq 8(%r8), %r8
     movq (%rbx), %r9
     movq %r9, %rax
     movq %rax, (%r8)
     jmp .LOption_map_epilogue
 .LOption_map_bb3:
-    movq -40(%rbp), %rbx
+    movq -48(%rbp), %rbx
     movq (%rbx), %r8
     movq $1, %rax
     movq %r8, %rbx
@@ -3581,19 +3482,19 @@ Option_map:
     jne .LOption_map_bb4
     jmp .LOption_map_bb5
 .LOption_map_bb4:
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq $1, %rbx
     leaq -32(%rbp), %r8
     movq %rbx, %rax
     movq %rax, (%r8)
     leaq -32(%rbp), %rbx
-    movq -48(%rbp), %r8
+    movq -40(%rbp), %r8
     movq (%rbx), %r9
     movq %r9, %rax
     movq %rax, (%r8)
     leaq -32(%rbp), %rbx
     addq $8, %rbx
-    movq -48(%rbp), %r8
+    movq -40(%rbp), %r8
     leaq 8(%r8), %r8
     movq (%rbx), %r9
     movq %r9, %rax
@@ -3613,53 +3514,53 @@ Option_map:
 Option_or_else:
     pushq %rbp
     movq %rsp, %rbp
-    subq $64, %rsp
+    subq $72, %rsp
     pushq %rbx
-    movq %rdi, -48(%rbp)
-    movq %rdx, -56(%rbp)
-    movq %rcx, -40(%rbp)
+    movq %rdi, -56(%rbp)
+    movq %rdx, -40(%rbp)
+    movq %rcx, -48(%rbp)
 .LOption_or_else_bb0:
-    movq -56(%rbp), %rcx
-    movq (%rcx), %rbx
+    movq -40(%rbp), %rbx
+    movq (%rbx), %rdi
     movq $0, %rax
-    movq %rbx, %rdi
-    cmpq %rax, %rdi
+    movq %rdi, %rbx
+    cmpq %rax, %rbx
     sete %al
-    movzbq %al, %rdi
-    movq %rdi, %rax
+    movzbq %al, %rbx
+    movq %rbx, %rax
     testq %rax, %rax
     jne .LOption_or_else_bb2
     jmp .LOption_or_else_bb3
 .LOption_or_else_bb1:
     jmp .LOption_or_else_epilogue
 .LOption_or_else_bb2:
-    movq -56(%rbp), %rdx
-    leaq 8(%rdx), %rdx
-    movq (%rdx), %rbx
-    movq -16(%rbp), %rax
-    movq $0, %r8
-    leaq -16(%rbp), %r9
-    movq %r8, %rax
-    movq %rax, (%r9)
+    movq -40(%rbp), %rcx
+    leaq 8(%rcx), %rcx
+    movq (%rcx), %rdx
+    leaq -16(%rbp), %rax
+    movq $0, %rbx
     leaq -16(%rbp), %r8
-    addq $8, %r8
     movq %rbx, %rax
     movq %rax, (%r8)
     leaq -16(%rbp), %rbx
-    movq -48(%rbp), %r8
+    addq $8, %rbx
+    movq %rdx, %rax
+    movq %rax, (%rbx)
+    leaq -16(%rbp), %rbx
+    movq -56(%rbp), %r8
     movq (%rbx), %r9
     movq %r9, %rax
     movq %rax, (%r8)
     leaq -16(%rbp), %rbx
     addq $8, %rbx
-    movq -48(%rbp), %r8
+    movq -56(%rbp), %r8
     leaq 8(%r8), %r8
     movq (%rbx), %r9
     movq %r9, %rax
     movq %rax, (%r8)
     jmp .LOption_or_else_epilogue
 .LOption_or_else_bb3:
-    movq -56(%rbp), %rbx
+    movq -40(%rbp), %rbx
     movq (%rbx), %r8
     movq $1, %rax
     movq %r8, %rbx
@@ -3671,14 +3572,14 @@ Option_or_else:
     jne .LOption_or_else_bb4
     jmp .LOption_or_else_bb5
 .LOption_or_else_bb4:
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq $0, %rbx
     leaq -32(%rbp), %r8
     movq %rbx, %rax
     movq %rax, (%r8)
-    movq -40(%rbp), %r11
+    movq -48(%rbp), %r11
     movq (%r11), %r11
-    movq -40(%rbp), %rdi
+    movq -48(%rbp), %rdi
     call *%r11
     movq %rax, %rbx
     leaq -32(%rbp), %r8
@@ -3686,13 +3587,13 @@ Option_or_else:
     movq %rbx, %rax
     movq %rax, (%r8)
     leaq -32(%rbp), %rbx
-    movq -48(%rbp), %r8
+    movq -56(%rbp), %r8
     movq (%rbx), %r9
     movq %r9, %rax
     movq %rax, (%r8)
     leaq -32(%rbp), %rbx
     addq $8, %rbx
-    movq -48(%rbp), %r8
+    movq -56(%rbp), %r8
     leaq 8(%r8), %r8
     movq (%rbx), %r9
     movq %r9, %rax
@@ -3766,7 +3667,7 @@ Option_unwrap:
 Option_unwrap_or:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
     movq %rdx, -8(%rbp)
 .LOption_unwrap_or_bb0:
@@ -3882,35 +3783,35 @@ Result_and_then:
     subq $64, %rsp
     pushq %rbx
     pushq %r12
-    movq %rdi, -48(%rbp)
-    movq %rdx, -56(%rbp)
-    movq %rcx, -40(%rbp)
+    movq %rdi, -40(%rbp)
+    movq %rdx, -48(%rbp)
+    movq %rcx, -56(%rbp)
 .LResult_and_then_bb0:
-    movq -56(%rbp), %rcx
-    movq (%rcx), %rbx
+    movq -48(%rbp), %rbx
+    movq (%rbx), %rdi
     movq $0, %rax
-    movq %rbx, %rdi
-    cmpq %rax, %rdi
+    movq %rdi, %rbx
+    cmpq %rax, %rbx
     sete %al
-    movzbq %al, %rdi
-    movq %rdi, %rax
+    movzbq %al, %rbx
+    movq %rbx, %rax
     testq %rax, %rax
     jne .LResult_and_then_bb2
     jmp .LResult_and_then_bb3
 .LResult_and_then_bb1:
     jmp .LResult_and_then_epilogue
 .LResult_and_then_bb2:
-    movq -56(%rbp), %rdx
-    leaq 8(%rdx), %rdx
-    movq (%rdx), %rbx
-    movq -16(%rbp), %rax
-    movq $0, %r8
-    leaq -16(%rbp), %r9
-    movq %r8, %rax
-    movq %rax, (%r9)
-    movq -40(%rbp), %r11
+    movq -48(%rbp), %rcx
+    leaq 8(%rcx), %rcx
+    movq (%rcx), %rbx
+    leaq -16(%rbp), %rax
+    movq $0, %rdx
+    leaq -16(%rbp), %r8
+    movq %rdx, %rax
+    movq %rax, (%r8)
+    movq -56(%rbp), %r11
     movq (%r11), %r11
-    movq -40(%rbp), %rdi
+    movq -56(%rbp), %rdi
     movq %rbx, %rsi
     call *%r11
     movq %rax, %r12
@@ -3919,20 +3820,20 @@ Result_and_then:
     movq %r12, %rax
     movq %rax, (%rbx)
     leaq -16(%rbp), %rbx
-    movq -48(%rbp), %r8
+    movq -40(%rbp), %r8
     movq (%rbx), %r9
     movq %r9, %rax
     movq %rax, (%r8)
     leaq -16(%rbp), %rbx
     addq $8, %rbx
-    movq -48(%rbp), %r8
+    movq -40(%rbp), %r8
     leaq 8(%r8), %r8
     movq (%rbx), %r9
     movq %r9, %rax
     movq %rax, (%r8)
     jmp .LResult_and_then_epilogue
 .LResult_and_then_bb3:
-    movq -56(%rbp), %rbx
+    movq -48(%rbp), %rbx
     movq (%rbx), %r8
     movq $1, %rax
     movq %r8, %rbx
@@ -3944,10 +3845,10 @@ Result_and_then:
     jne .LResult_and_then_bb4
     jmp .LResult_and_then_bb5
 .LResult_and_then_bb4:
-    movq -56(%rbp), %rbx
+    movq -48(%rbp), %rbx
     leaq 8(%rbx), %rbx
     movq (%rbx), %r8
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq $1, %rbx
     leaq -32(%rbp), %r9
     movq %rbx, %rax
@@ -3957,13 +3858,13 @@ Result_and_then:
     movq %r8, %rax
     movq %rax, (%rbx)
     leaq -32(%rbp), %rbx
-    movq -48(%rbp), %r8
+    movq -40(%rbp), %r8
     movq (%rbx), %r9
     movq %r9, %rax
     movq %rax, (%r8)
     leaq -32(%rbp), %rbx
     addq $8, %rbx
-    movq -48(%rbp), %r8
+    movq -40(%rbp), %r8
     leaq 8(%r8), %r8
     movq (%rbx), %r9
     movq %r9, %rax
@@ -3983,7 +3884,7 @@ Result_and_then:
 Result_err:
     pushq %rbp
     movq %rsp, %rbp
-    subq $48, %rsp
+    subq $56, %rsp
     pushq %rbx
     movq %rdx, -40(%rbp)
 .LResult_err_bb0:
@@ -4004,7 +3905,7 @@ Result_err:
     movq -40(%rbp), %rcx
     leaq 8(%rcx), %rcx
     movq (%rcx), %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq $1, %rbx
     leaq -16(%rbp), %r8
     movq %rbx, %rax
@@ -4038,7 +3939,7 @@ Result_err:
     movq -40(%rbp), %rcx
     leaq 8(%rcx), %rcx
     movq (%rcx), %rbx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq $0, %r8
     leaq -32(%rbp), %r9
     movq %r8, %rax
@@ -4073,7 +3974,7 @@ Result_err:
 Result_expect:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
     movq %rdx, -8(%rbp)
 .LResult_expect_bb0:
@@ -4130,6 +4031,7 @@ Result_expect:
 Result_is_err:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .LResult_is_err_bb0:
     movq %rsi, %rcx
@@ -4184,6 +4086,7 @@ Result_is_err:
 Result_is_ok:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .LResult_is_ok_bb0:
     movq %rsi, %rcx
@@ -4241,9 +4144,9 @@ Result_map:
     subq $64, %rsp
     pushq %rbx
     pushq %r12
-    movq %rdi, -40(%rbp)
+    movq %rdi, -48(%rbp)
     movq %rdx, -56(%rbp)
-    movq %rcx, -48(%rbp)
+    movq %rcx, -40(%rbp)
 .LResult_map_bb0:
     movq -56(%rbp), %rcx
     movq (%rcx), %rbx
@@ -4262,14 +4165,14 @@ Result_map:
     movq -56(%rbp), %rdx
     leaq 8(%rdx), %rdx
     movq (%rdx), %rbx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq $0, %r8
     leaq -16(%rbp), %r9
     movq %r8, %rax
     movq %rax, (%r9)
-    movq -48(%rbp), %r11
+    movq -40(%rbp), %r11
     movq (%r11), %r11
-    movq -48(%rbp), %rdi
+    movq -40(%rbp), %rdi
     movq %rbx, %rsi
     call *%r11
     movq %rax, %r12
@@ -4278,13 +4181,13 @@ Result_map:
     movq %r12, %rax
     movq %rax, (%rbx)
     leaq -16(%rbp), %rbx
-    movq -40(%rbp), %r8
+    movq -48(%rbp), %r8
     movq (%rbx), %r9
     movq %r9, %rax
     movq %rax, (%r8)
     leaq -16(%rbp), %rbx
     addq $8, %rbx
-    movq -40(%rbp), %r8
+    movq -48(%rbp), %r8
     leaq 8(%r8), %r8
     movq (%rbx), %r9
     movq %r9, %rax
@@ -4306,7 +4209,7 @@ Result_map:
     movq -56(%rbp), %rbx
     leaq 8(%rbx), %rbx
     movq (%rbx), %r8
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq $1, %rbx
     leaq -32(%rbp), %r9
     movq %rbx, %rax
@@ -4316,13 +4219,13 @@ Result_map:
     movq %r8, %rax
     movq %rax, (%rbx)
     leaq -32(%rbp), %rbx
-    movq -40(%rbp), %r8
+    movq -48(%rbp), %r8
     movq (%rbx), %r9
     movq %r9, %rax
     movq %rax, (%r8)
     leaq -32(%rbp), %rbx
     addq $8, %rbx
-    movq -40(%rbp), %r8
+    movq -48(%rbp), %r8
     leaq 8(%r8), %r8
     movq (%rbx), %r9
     movq %r9, %rax
@@ -4345,51 +4248,51 @@ Result_map_err:
     subq $64, %rsp
     pushq %rbx
     pushq %r12
-    movq %rdi, -56(%rbp)
-    movq %rdx, -40(%rbp)
-    movq %rcx, -48(%rbp)
+    movq %rdi, -48(%rbp)
+    movq %rdx, -56(%rbp)
+    movq %rcx, -40(%rbp)
 .LResult_map_err_bb0:
-    movq -40(%rbp), %rdx
-    movq (%rdx), %rbx
+    movq -56(%rbp), %rbx
+    movq (%rbx), %rdi
     movq $0, %rax
-    movq %rbx, %rdi
-    cmpq %rax, %rdi
+    movq %rdi, %rbx
+    cmpq %rax, %rbx
     sete %al
-    movzbq %al, %rdi
-    movq %rdi, %rax
+    movzbq %al, %rbx
+    movq %rbx, %rax
     testq %rax, %rax
     jne .LResult_map_err_bb2
     jmp .LResult_map_err_bb3
 .LResult_map_err_bb1:
     jmp .LResult_map_err_epilogue
 .LResult_map_err_bb2:
-    movq -40(%rbp), %rcx
+    movq -56(%rbp), %rcx
     leaq 8(%rcx), %rcx
-    movq (%rcx), %rbx
-    movq -16(%rbp), %rax
-    movq $0, %r8
-    leaq -16(%rbp), %r9
-    movq %r8, %rax
-    movq %rax, (%r9)
+    movq (%rcx), %rdx
+    leaq -16(%rbp), %rax
+    movq $0, %rbx
     leaq -16(%rbp), %r8
-    addq $8, %r8
     movq %rbx, %rax
     movq %rax, (%r8)
     leaq -16(%rbp), %rbx
-    movq -56(%rbp), %r8
+    addq $8, %rbx
+    movq %rdx, %rax
+    movq %rax, (%rbx)
+    leaq -16(%rbp), %rbx
+    movq -48(%rbp), %r8
     movq (%rbx), %r9
     movq %r9, %rax
     movq %rax, (%r8)
     leaq -16(%rbp), %rbx
     addq $8, %rbx
-    movq -56(%rbp), %r8
+    movq -48(%rbp), %r8
     leaq 8(%r8), %r8
     movq (%rbx), %r9
     movq %r9, %rax
     movq %rax, (%r8)
     jmp .LResult_map_err_epilogue
 .LResult_map_err_bb3:
-    movq -40(%rbp), %rbx
+    movq -56(%rbp), %rbx
     movq (%rbx), %r8
     movq $1, %rax
     movq %r8, %rbx
@@ -4401,17 +4304,17 @@ Result_map_err:
     jne .LResult_map_err_bb4
     jmp .LResult_map_err_bb5
 .LResult_map_err_bb4:
-    movq -40(%rbp), %rbx
+    movq -56(%rbp), %rbx
     leaq 8(%rbx), %rbx
     movq (%rbx), %r12
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq $1, %rbx
     leaq -32(%rbp), %r8
     movq %rbx, %rax
     movq %rax, (%r8)
-    movq -48(%rbp), %r11
+    movq -40(%rbp), %r11
     movq (%r11), %r11
-    movq -48(%rbp), %rdi
+    movq -40(%rbp), %rdi
     movq %r12, %rsi
     call *%r11
     movq %rax, %rbx
@@ -4420,13 +4323,13 @@ Result_map_err:
     movq %rbx, %rax
     movq %rax, (%r8)
     leaq -32(%rbp), %rbx
-    movq -56(%rbp), %r8
+    movq -48(%rbp), %r8
     movq (%rbx), %r9
     movq %r9, %rax
     movq %rax, (%r8)
     leaq -32(%rbp), %rbx
     addq $8, %rbx
-    movq -56(%rbp), %r8
+    movq -48(%rbp), %r8
     leaq 8(%r8), %r8
     movq (%rbx), %r9
     movq %r9, %rax
@@ -4446,7 +4349,7 @@ Result_map_err:
 Result_ok:
     pushq %rbp
     movq %rsp, %rbp
-    subq $48, %rsp
+    subq $56, %rsp
     pushq %rbx
     movq %rdx, -40(%rbp)
 .LResult_ok_bb0:
@@ -4467,7 +4370,7 @@ Result_ok:
     movq -40(%rbp), %rcx
     leaq 8(%rcx), %rcx
     movq (%rcx), %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq $0, %rbx
     leaq -16(%rbp), %r8
     movq %rbx, %rax
@@ -4505,7 +4408,7 @@ Result_ok:
     movq -40(%rbp), %rcx
     leaq 8(%rcx), %rcx
     movq (%rcx), %rbx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq $1, %rbx
     leaq -32(%rbp), %r8
     movq %rbx, %rax
@@ -4594,7 +4497,7 @@ Result_unwrap:
 Result_unwrap_or:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
     movq %rdx, -8(%rbp)
 .LResult_unwrap_or_bb0:
@@ -4718,13 +4621,13 @@ StringBuilder_append_char:
     pushq %r12
     pushq %r13
     pushq %r14
-    movq %rsi, -8(%rbp)
-    movq %rdx, -16(%rbp)
+    movq %rsi, -16(%rbp)
+    movq %rdx, -8(%rbp)
 .LStringBuilder_append_char_bb0:
-    movq -8(%rbp), %rbx
-    movq -8(%rbp), %rcx
+    movq -16(%rbp), %rbx
+    movq -16(%rbp), %rcx
     movq (%rcx), %r12
-    movq -16(%rbp), %rdi
+    movq -8(%rbp), %rdi
     call p_char_to_str
     movq %rax, %r13
     movq %r12, %rdi
@@ -4733,9 +4636,9 @@ StringBuilder_append_char:
     movq %rax, %r14
     movq %r14, %rax
     movq %rax, (%rbx)
-    movq -8(%rbp), %rbx
+    movq -16(%rbp), %rbx
     leaq 8(%rbx), %rbx
-    movq -8(%rbp), %rcx
+    movq -16(%rbp), %rcx
     leaq 8(%rcx), %rcx
     movq (%rcx), %rsi
     movq $1, %rax
@@ -4849,6 +4752,7 @@ StringBuilder_append_str:
 StringBuilder_clear:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .LStringBuilder_clear_bb0:
     movq %rsi, %rdx
@@ -4872,6 +4776,7 @@ StringBuilder_clear:
 StringBuilder_is_empty:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .LStringBuilder_is_empty_bb0:
     movq %rsi, %rcx
@@ -4911,10 +4816,10 @@ StringBuilder_len:
 StringBuilder_new:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
 .LStringBuilder_new_bb0:
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     leaq .str_15(%rip), %rdx
     leaq -16(%rbp), %rbx
     movq %rdx, %rax
@@ -4966,11 +4871,11 @@ String_byte_at:
     subq $48, %rsp
     pushq %rbx
     pushq %r12
-    movq %rsi, -48(%rbp)
-    movq %rdx, -40(%rbp)
+    movq %rsi, -40(%rbp)
+    movq %rdx, -48(%rbp)
 .LString_byte_at_bb0:
     movq $0, %rax
-    movq -48(%rbp), %rbx
+    movq -40(%rbp), %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rbx
@@ -4989,19 +4894,19 @@ String_byte_at:
 .LString_byte_at_bb3:
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -48(%rbp), %rsi
+    movq -40(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq $0, %rax
-    movq -40(%rbp), %rbx
+    movq -48(%rbp), %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rbx
     movq -8(%rbp), %rsi
-    movq -40(%rbp), %rax
+    movq -48(%rbp), %rax
     cmpq %rsi, %rax
     setge %al
     movzbq %al, %rax
@@ -5026,17 +4931,17 @@ String_byte_at:
 .LString_byte_at_bb5:
     jmp .LString_byte_at_bb6
 .LString_byte_at_bb6:
-    movq -48(%rbp), %rbx
-    addq -40(%rbp), %rbx
-    movq -16(%rbp), %rax
+    movq -40(%rbp), %rbx
+    addq -48(%rbp), %rbx
+    leaq -16(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rbx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -24(%rbp)
     movq $0, %rbx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -32(%rbp)
     movq -24(%rbp), %rcx
@@ -5108,7 +5013,7 @@ String_char_at:
     movq -80(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq $0, %rax
@@ -5141,15 +5046,15 @@ String_char_at:
 .LString_char_at_bb6:
     movq -80(%rbp), %rbx
     addq -72(%rbp), %rbx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rdx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -24(%rbp)
     movq $0, %rbx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -32(%rbp)
     movq -24(%rbp), %rcx
@@ -5160,11 +5065,11 @@ String_char_at:
     movq %rbx, %rdi
     call p_malloc
     movq %rax, %r12
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r12, %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rbx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %rbx
@@ -5175,11 +5080,11 @@ String_char_at:
     movq $1, %rax
     movq %rbx, %r8
     addq %rax, %r8
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r8, %rax
     movq %rax, -56(%rbp)
     movq -56(%rbp), %rbx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -64(%rbp)
     movq -64(%rbp), %rbx
@@ -5249,22 +5154,22 @@ String_clone:
 String_contains:
     pushq %rbp
     movq %rsp, %rbp
-    subq $128, %rsp
+    subq $136, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
     pushq %r14
     pushq %r15
-    movq %rsi, -96(%rbp)
-    movq %rdx, -104(%rbp)
+    movq %rsi, -104(%rbp)
+    movq %rdx, -96(%rbp)
 .LString_contains_bb0:
     movq $0, %rax
-    movq -96(%rbp), %rbx
+    movq -104(%rbp), %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rbx
     movq $0, %rax
-    movq -104(%rbp), %rsi
+    movq -96(%rbp), %rsi
     cmpq %rax, %rsi
     sete %al
     movzbq %al, %rsi
@@ -5288,18 +5193,18 @@ String_contains:
 .LString_contains_bb3:
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -96(%rbp), %rsi
+    movq -104(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -104(%rbp), %rsi
+    movq -96(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %r12, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rbx
@@ -5335,7 +5240,7 @@ String_contains:
     jmp .LString_contains_bb9
 .LString_contains_bb9:
     movq $0, %rdx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -24(%rbp)
     jmp .LString_contains_bb10
@@ -5355,11 +5260,11 @@ String_contains:
     jmp .LString_contains_bb12
 .LString_contains_bb11:
     movq $1, %r12
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %r12, %rax
     movq %rax, -32(%rbp)
     movq $0, %r12
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r12, %rax
     movq %rax, -40(%rbp)
     jmp .LString_contains_bb13
@@ -5381,34 +5286,34 @@ String_contains:
     jmp .LString_contains_bb15
 .LString_contains_bb14:
     movq -24(%rbp), %r15
-    movq -96(%rbp), %r14
+    movq -104(%rbp), %r14
     addq %r15, %r14
     movq -40(%rbp), %r15
     movq %r14, %r13
     addq %r15, %r13
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r13, %rax
     movq %rax, -48(%rbp)
     movq -40(%rbp), %r13
-    movq -104(%rbp), %r14
+    movq -96(%rbp), %r14
     addq %r13, %r14
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r14, %rax
     movq %rax, -56(%rbp)
     movq -48(%rbp), %r13
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r13, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %r13
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %r13, %rax
     movq %rax, -72(%rbp)
     movq $0, %r13
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %r13, %rax
     movq %rax, -80(%rbp)
     movq $0, %r13
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r13, %rax
     movq %rax, -88(%rbp)
     movq -64(%rbp), %rcx
@@ -5517,7 +5422,7 @@ String_ends_with:
     movq -96(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq $0, %rbx
@@ -5525,7 +5430,7 @@ String_ends_with:
     movq -88(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %r12, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rbx
@@ -5564,11 +5469,11 @@ String_ends_with:
     movq -16(%rbp), %r8
     movq %rbx, %r9
     subq %r8, %r9
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r9, %rax
     movq %rax, -24(%rbp)
     movq $0, %rdx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -32(%rbp)
     jmp .LString_ends_with_bb10
@@ -5590,29 +5495,29 @@ String_ends_with:
     movq -32(%rbp), %r10
     movq %r11, %r12
     addq %r10, %r12
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r12, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %r10
     movq -88(%rbp), %r11
     addq %r10, %r11
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r11, %rax
     movq %rax, -48(%rbp)
     movq -40(%rbp), %r10
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r10, %rax
     movq %rax, -56(%rbp)
     movq -48(%rbp), %r10
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r10, %rax
     movq %rax, -64(%rbp)
     movq $0, %r10
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %r10, %rax
     movq %rax, -72(%rbp)
     movq $0, %r10
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %r10, %rax
     movq %rax, -80(%rbp)
     movq -56(%rbp), %rcx
@@ -5661,22 +5566,22 @@ String_ends_with:
 String_find:
     pushq %rbp
     movq %rsp, %rbp
-    subq $128, %rsp
+    subq $136, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
     pushq %r14
     pushq %r15
-    movq %rsi, -104(%rbp)
-    movq %rdx, -96(%rbp)
+    movq %rsi, -96(%rbp)
+    movq %rdx, -104(%rbp)
 .LString_find_bb0:
     movq $0, %rax
-    movq -104(%rbp), %rbx
+    movq -96(%rbp), %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rbx
     movq $0, %rax
-    movq -96(%rbp), %rsi
+    movq -104(%rbp), %rsi
     cmpq %rax, %rsi
     sete %al
     movzbq %al, %rsi
@@ -5703,18 +5608,18 @@ String_find:
 .LString_find_bb3:
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -104(%rbp), %rsi
+    movq -96(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -96(%rbp), %rsi
+    movq -104(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %r12, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rbx
@@ -5753,7 +5658,7 @@ String_find:
     jmp .LString_find_bb9
 .LString_find_bb9:
     movq $0, %rbx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -24(%rbp)
     jmp .LString_find_bb10
@@ -5773,11 +5678,11 @@ String_find:
     jmp .LString_find_bb12
 .LString_find_bb11:
     movq $1, %r12
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %r12, %rax
     movq %rax, -32(%rbp)
     movq $0, %r12
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r12, %rax
     movq %rax, -40(%rbp)
     jmp .LString_find_bb13
@@ -5802,34 +5707,34 @@ String_find:
     jmp .LString_find_bb15
 .LString_find_bb14:
     movq -24(%rbp), %r15
-    movq -104(%rbp), %r14
+    movq -96(%rbp), %r14
     addq %r15, %r14
     movq -40(%rbp), %r15
     movq %r14, %r13
     addq %r15, %r13
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r13, %rax
     movq %rax, -48(%rbp)
     movq -40(%rbp), %r13
-    movq -96(%rbp), %r14
+    movq -104(%rbp), %r14
     addq %r13, %r14
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r14, %rax
     movq %rax, -56(%rbp)
     movq -48(%rbp), %r13
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r13, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %r13
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %r13, %rax
     movq %rax, -72(%rbp)
     movq $0, %r13
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %r13, %rax
     movq %rax, -80(%rbp)
     movq $0, %r13
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r13, %rax
     movq %rax, -88(%rbp)
     movq -64(%rbp), %rcx
@@ -5900,7 +5805,7 @@ String_find:
 String_from:
     pushq %rbp
     movq %rsp, %rbp
-    subq $64, %rsp
+    subq $72, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -5920,11 +5825,11 @@ String_from:
     movq %rbx, %rdi
     call p_malloc
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rdx
@@ -5942,7 +5847,7 @@ String_from:
     movq -56(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r12, %rax
     movq %rax, -24(%rbp)
     movq -24(%rbp), %rbx
@@ -5952,7 +5857,7 @@ String_from:
     movq %r12, %rdi
     call p_malloc
     movq %rax, %rbx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -32(%rbp)
     movq -32(%rbp), %rbx
@@ -5967,11 +5872,11 @@ String_from:
     movq -24(%rbp), %rsi
     movq %rbx, %r8
     addq %rsi, %r8
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r8, %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rdx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %rdx
@@ -5994,7 +5899,7 @@ String_from:
 String_is_empty:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
 .LString_is_empty_bb0:
     movq $0, %rax
@@ -6012,11 +5917,11 @@ String_is_empty:
 .LString_is_empty_bb2:
     jmp .LString_is_empty_bb3
 .LString_is_empty_bb3:
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -8(%rbp)
     movq $0, %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq -8(%rbp), %rcx
@@ -6066,7 +5971,7 @@ String_len:
 String_parse_int:
     pushq %rbp
     movq %rsp, %rbp
-    subq $144, %rsp
+    subq $152, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -6089,23 +5994,23 @@ String_parse_int:
     jmp .LString_parse_int_bb3
 .LString_parse_int_bb3:
     movq $0, %rdx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -8(%rbp)
     movq $1, %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -24(%rbp)
     movq -24(%rbp), %rdx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -32(%rbp)
     movq -32(%rbp), %rcx
     movzbq (%rcx), %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     jmp .LString_parse_int_bb4
@@ -6323,7 +6228,7 @@ String_parse_int:
 String_push_str:
     pushq %rbp
     movq %rsp, %rbp
-    subq $64, %rsp
+    subq $72, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -6335,7 +6240,7 @@ String_push_str:
     movq -48(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq $0, %rbx
@@ -6343,7 +6248,7 @@ String_push_str:
     movq -56(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %r12, %rax
     movq %rax, -16(%rbp)
     movq -8(%rbp), %rbx
@@ -6356,7 +6261,7 @@ String_push_str:
     movq %r12, %rdi
     call p_malloc
     movq %rax, %rbx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -24(%rbp)
     movq -24(%rbp), %rbx
@@ -6385,11 +6290,11 @@ String_push_str:
     movq -16(%rbp), %rbx
     movq %r9, %r8
     addq %rbx, %r8
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %r8, %rax
     movq %rax, -32(%rbp)
     movq -32(%rbp), %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rbx
@@ -6412,22 +6317,22 @@ String_push_str:
 String_repeat:
     pushq %rbp
     movq %rsp, %rbp
-    subq $80, %rsp
+    subq $88, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
     pushq %r14
     pushq %r15
-    movq %rsi, -64(%rbp)
-    movq %rdx, -72(%rbp)
+    movq %rsi, -72(%rbp)
+    movq %rdx, -64(%rbp)
 .LString_repeat_bb0:
     movq $0, %rax
-    movq -64(%rbp), %rbx
+    movq -72(%rbp), %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rbx
     movq $0, %rax
-    movq -72(%rbp), %rsi
+    movq -64(%rbp), %rsi
     cmpq %rax, %rsi
     setle %al
     movzbq %al, %rsi
@@ -6448,11 +6353,11 @@ String_repeat:
     movq %rbx, %rdi
     call p_malloc
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rbx
@@ -6467,15 +6372,15 @@ String_repeat:
 .LString_repeat_bb3:
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -64(%rbp), %rsi
+    movq -72(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r12, %rax
     movq %rax, -24(%rbp)
     movq -24(%rbp), %rbx
     movq %rbx, %rax
-    movq -72(%rbp), %rcx
+    movq -64(%rbp), %rcx
     imulq %rcx, %rax
     movq $1, %rbx
     movq %rax, %r12
@@ -6483,18 +6388,18 @@ String_repeat:
     movq %r12, %rdi
     call p_malloc
     movq %rax, %rbx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -32(%rbp)
     movq $0, %rbx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -40(%rbp)
     jmp .LString_repeat_bb4
 .LString_repeat_bb4:
     movq -40(%rbp), %rbx
     movq %rbx, %r12
-    cmpq -72(%rbp), %r12
+    cmpq -64(%rbp), %r12
     setl %al
     movzbq %al, %r12
     movq %r12, %rax
@@ -6514,7 +6419,7 @@ String_repeat:
     movq $0, %r15
     movq %r15, %rdi
     movq %r13, %rsi
-    movq -64(%rbp), %rdx
+    movq -72(%rbp), %rdx
     movq %r14, %rcx
     call p_str_copy_n
     movq -40(%rbp), %r8
@@ -6528,15 +6433,15 @@ String_repeat:
     movq -32(%rbp), %r8
     movq -24(%rbp), %r9
     movq %r9, %rax
-    movq -72(%rbp), %rcx
+    movq -64(%rbp), %rcx
     imulq %rcx, %rax
     movq %r8, %r9
     addq %rax, %r9
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r9, %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %r8
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r8, %rax
     movq %rax, -56(%rbp)
     movq -56(%rbp), %r8
@@ -6561,18 +6466,18 @@ String_repeat:
 String_replace:
     pushq %rbp
     movq %rsp, %rbp
-    subq $256, %rsp
+    subq $264, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
     pushq %r14
     pushq %r15
-    movq %rsi, -184(%rbp)
+    movq %rsi, -200(%rbp)
     movq %rdx, -192(%rbp)
-    movq %rcx, -200(%rbp)
+    movq %rcx, -184(%rbp)
 .LString_replace_bb0:
     movq $0, %rax
-    movq -184(%rbp), %rbx
+    movq -200(%rbp), %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rbx
@@ -6585,11 +6490,11 @@ String_replace:
     movq %rbx, %rdi
     call p_malloc
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rbx
@@ -6608,7 +6513,7 @@ String_replace:
     sete %al
     movzbq %al, %rbx
     movq $0, %rax
-    movq -200(%rbp), %r8
+    movq -184(%rbp), %r8
     cmpq %rax, %r8
     sete %al
     movzbq %al, %r8
@@ -6627,7 +6532,7 @@ String_replace:
 .LString_replace_bb4:
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -184(%rbp), %rsi
+    movq -200(%rbp), %rsi
     call String_from
     movq %rax, %r12
     movq %r12, %rax
@@ -6640,7 +6545,7 @@ String_replace:
     movq -192(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r12, %rax
     movq %rax, -24(%rbp)
     movq -24(%rbp), %rbx
@@ -6656,7 +6561,7 @@ String_replace:
 .LString_replace_bb7:
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -184(%rbp), %rsi
+    movq -200(%rbp), %rsi
     call String_from
     movq %rax, %r12
     movq %r12, %rax
@@ -6668,11 +6573,11 @@ String_replace:
     movq %rbx, %rdi
     call p_malloc
     movq %rax, %r12
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %r12, %rax
     movq %rax, -32(%rbp)
     movq -32(%rbp), %rbx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rbx
@@ -6680,15 +6585,15 @@ String_replace:
     movq %r8, %rax
     movb %al, (%rbx)
     movq $0, %rbx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -48(%rbp)
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -184(%rbp), %rsi
+    movq -200(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r12, %rax
     movq %rax, -56(%rbp)
     jmp .LString_replace_bb10
@@ -6707,11 +6612,11 @@ String_replace:
     jmp .LString_replace_bb12
 .LString_replace_bb11:
     movq $1, %r8
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r8, %rax
     movq %rax, -64(%rbp)
     movq $0, %r8
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %r8, %rax
     movq %rax, -72(%rbp)
     jmp .LString_replace_bb13
@@ -6763,34 +6668,34 @@ String_replace:
     jmp .LString_replace_bb18
 .LString_replace_bb18:
     movq -48(%rbp), %r8
-    movq -184(%rbp), %r9
+    movq -200(%rbp), %r9
     addq %r8, %r9
     movq -72(%rbp), %r8
     movq %r9, %r10
     addq %r8, %r10
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %r10, %rax
     movq %rax, -80(%rbp)
     movq -72(%rbp), %r8
     movq -192(%rbp), %r9
     addq %r8, %r9
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r9, %rax
     movq %rax, -88(%rbp)
     movq -80(%rbp), %r8
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %r8, %rax
     movq %rax, -96(%rbp)
     movq -88(%rbp), %r8
-    movq -104(%rbp), %rax
+    leaq -104(%rbp), %rax
     movq %r8, %rax
     movq %rax, -104(%rbp)
     movq $0, %r8
-    movq -112(%rbp), %rax
+    leaq -112(%rbp), %rax
     movq %r8, %rax
     movq %rax, -112(%rbp)
     movq $0, %r8
-    movq -120(%rbp), %rax
+    leaq -120(%rbp), %rax
     movq %r8, %rax
     movq %rax, -120(%rbp)
     movq -96(%rbp), %r8
@@ -6831,7 +6736,7 @@ String_replace:
     movq $0, %r14
     movq %r14, %rdi
     movq %r15, %rsi
-    movq -200(%rbp), %rdx
+    movq -184(%rbp), %rdx
     call String_push_str
     movq %rax, %r13
     movq %r13, %rax
@@ -6845,17 +6750,17 @@ String_replace:
     jmp .LString_replace_bb24
 .LString_replace_bb23:
     movq -48(%rbp), %r8
-    movq -184(%rbp), %r9
+    movq -200(%rbp), %r9
     addq %r8, %r9
-    movq -128(%rbp), %rax
+    leaq -128(%rbp), %rax
     movq %r9, %rax
     movq %rax, -128(%rbp)
     movq -128(%rbp), %r8
-    movq -136(%rbp), %rax
+    leaq -136(%rbp), %rax
     movq %r8, %rax
     movq %rax, -136(%rbp)
     movq $0, %r8
-    movq -144(%rbp), %rax
+    leaq -144(%rbp), %rax
     movq %r8, %rax
     movq %rax, -144(%rbp)
     movq -136(%rbp), %r8
@@ -6866,11 +6771,11 @@ String_replace:
     movq %r13, %rdi
     call p_malloc
     movq %rax, %r14
-    movq -152(%rbp), %rax
+    leaq -152(%rbp), %rax
     movq %r14, %rax
     movq %rax, -152(%rbp)
     movq -152(%rbp), %r8
-    movq -160(%rbp), %rax
+    leaq -160(%rbp), %rax
     movq %r8, %rax
     movq %rax, -160(%rbp)
     movq -160(%rbp), %r8
@@ -6881,11 +6786,11 @@ String_replace:
     movq $1, %rax
     movq %r8, %r9
     addq %rax, %r9
-    movq -168(%rbp), %rax
+    leaq -168(%rbp), %rax
     movq %r9, %rax
     movq %rax, -168(%rbp)
     movq -168(%rbp), %r8
-    movq -176(%rbp), %rax
+    leaq -176(%rbp), %rax
     movq %r8, %rax
     movq %rax, -176(%rbp)
     movq -176(%rbp), %r8
@@ -6929,7 +6834,7 @@ String_replace:
 String_rfind:
     pushq %rbp
     movq %rsp, %rbp
-    subq $112, %rsp
+    subq $120, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -6974,7 +6879,7 @@ String_rfind:
     movq -96(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq $0, %rbx
@@ -6982,7 +6887,7 @@ String_rfind:
     movq -104(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %r12, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rbx
@@ -7025,7 +6930,7 @@ String_rfind:
     movq -16(%rbp), %r8
     movq %rbx, %r9
     subq %r8, %r9
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r9, %rax
     movq %rax, -24(%rbp)
     jmp .LString_rfind_bb10
@@ -7042,11 +6947,11 @@ String_rfind:
     jmp .LString_rfind_bb12
 .LString_rfind_bb11:
     movq $1, %r10
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %r10, %rax
     movq %rax, -32(%rbp)
     movq $0, %r10
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r10, %rax
     movq %rax, -40(%rbp)
     jmp .LString_rfind_bb13
@@ -7074,29 +6979,29 @@ String_rfind:
     movq -40(%rbp), %r13
     movq %r14, %r15
     addq %r13, %r15
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r15, %rax
     movq %rax, -48(%rbp)
     movq -40(%rbp), %r13
     movq -104(%rbp), %r14
     addq %r13, %r14
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r14, %rax
     movq %rax, -56(%rbp)
     movq -48(%rbp), %r13
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r13, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %r13
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %r13, %rax
     movq %rax, -72(%rbp)
     movq $0, %r13
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %r13, %rax
     movq %rax, -80(%rbp)
     movq $0, %r13
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r13, %rax
     movq %rax, -88(%rbp)
     movq -64(%rbp), %rcx
@@ -7172,12 +7077,12 @@ String_slice:
     pushq %r12
     pushq %r13
     pushq %r14
-    movq %rsi, -104(%rbp)
-    movq %rdx, -112(%rbp)
-    movq %rcx, -96(%rbp)
+    movq %rsi, -96(%rbp)
+    movq %rdx, -104(%rbp)
+    movq %rcx, -112(%rbp)
 .LString_slice_bb0:
     movq $0, %rax
-    movq -104(%rbp), %rbx
+    movq -96(%rbp), %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rbx
@@ -7190,11 +7095,11 @@ String_slice:
     movq %rbx, %rdi
     call p_malloc
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rbx
@@ -7209,17 +7114,17 @@ String_slice:
 .LString_slice_bb3:
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -104(%rbp), %rsi
+    movq -96(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r12, %rax
     movq %rax, -24(%rbp)
-    movq -32(%rbp), %rax
-    movq -112(%rbp), %rax
+    leaq -32(%rbp), %rax
+    movq -104(%rbp), %rax
     movq %rax, -32(%rbp)
-    movq -40(%rbp), %rax
-    movq -96(%rbp), %rax
+    leaq -40(%rbp), %rax
+    movq -112(%rbp), %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %rbx
     movq $0, %rax
@@ -7272,11 +7177,11 @@ String_slice:
     movq %rbx, %rdi
     call p_malloc
     movq %rax, %r12
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r12, %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %rbx
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -56(%rbp)
     movq -56(%rbp), %rbx
@@ -7293,7 +7198,7 @@ String_slice:
     movq -32(%rbp), %r8
     movq %rbx, %r9
     subq %r8, %r9
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r9, %rax
     movq %rax, -64(%rbp)
     movq -64(%rbp), %rbx
@@ -7303,12 +7208,12 @@ String_slice:
     movq %r12, %rdi
     call p_malloc
     movq %rax, %rbx
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -72(%rbp)
     movq -72(%rbp), %rbx
     movq -32(%rbp), %r8
-    movq -104(%rbp), %r12
+    movq -96(%rbp), %r12
     addq %r8, %r12
     movq -64(%rbp), %r13
     movq $0, %r14
@@ -7321,11 +7226,11 @@ String_slice:
     movq -64(%rbp), %r8
     movq %rbx, %r9
     addq %r8, %r9
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %r9, %rax
     movq %rax, -80(%rbp)
     movq -80(%rbp), %rbx
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -88(%rbp)
     movq -88(%rbp), %rbx
@@ -7349,29 +7254,29 @@ String_slice:
 String_split:
     pushq %rbp
     movq %rsp, %rbp
-    subq $256, %rsp
+    subq $264, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
     pushq %r14
     pushq %r15
-    movq %rsi, -176(%rbp)
-    movq %rdx, -184(%rbp)
+    movq %rsi, -184(%rbp)
+    movq %rdx, -176(%rbp)
 .LString_split_bb0:
     movq $0, %rbx
     movq %rbx, %rdi
     call Vec_new
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq $0, %rax
-    movq -176(%rbp), %rbx
+    movq -184(%rbp), %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rbx
     movq $0, %rax
-    movq -184(%rbp), %rsi
+    movq -176(%rbp), %rsi
     cmpq %rax, %rsi
     sete %al
     movzbq %al, %rsi
@@ -7396,10 +7301,10 @@ String_split:
 .LString_split_bb3:
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -184(%rbp), %rsi
+    movq -176(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %r12, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rbx
@@ -7420,19 +7325,19 @@ String_split:
     jmp .LString_split_bb6
 .LString_split_bb6:
     movq $0, %rdx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -24(%rbp)
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -176(%rbp), %rsi
+    movq -184(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %r12, %rax
     movq %rax, -32(%rbp)
     movq $0, %rbx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -40(%rbp)
     jmp .LString_split_bb7
@@ -7456,11 +7361,11 @@ String_split:
     jmp .LString_split_bb9
 .LString_split_bb8:
     movq $1, %r8
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r8, %rax
     movq %rax, -48(%rbp)
     movq $0, %r8
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r8, %rax
     movq %rax, -56(%rbp)
     jmp .LString_split_bb10
@@ -7469,7 +7374,7 @@ String_split:
     movq -24(%rbp), %r9
     movq %r8, %r10
     subq %r9, %r10
-    movq -144(%rbp), %rax
+    leaq -144(%rbp), %rax
     movq %r10, %rax
     movq %rax, -144(%rbp)
     movq -144(%rbp), %r8
@@ -7498,34 +7403,34 @@ String_split:
     jmp .LString_split_bb12
 .LString_split_bb11:
     movq -40(%rbp), %r8
-    movq -176(%rbp), %r9
+    movq -184(%rbp), %r9
     addq %r8, %r9
     movq -56(%rbp), %r8
     movq %r9, %r10
     addq %r8, %r10
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r10, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %r8
-    movq -184(%rbp), %r9
+    movq -176(%rbp), %r9
     addq %r8, %r9
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %r9, %rax
     movq %rax, -72(%rbp)
     movq -64(%rbp), %r8
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %r8, %rax
     movq %rax, -80(%rbp)
     movq -72(%rbp), %r8
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r8, %rax
     movq %rax, -88(%rbp)
     movq $0, %r8
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %r8, %rax
     movq %rax, -96(%rbp)
     movq $0, %r8
-    movq -104(%rbp), %rax
+    leaq -104(%rbp), %rax
     movq %r8, %rax
     movq %rax, -104(%rbp)
     movq -80(%rbp), %rcx
@@ -7573,7 +7478,7 @@ String_split:
     movq -24(%rbp), %r9
     movq %r8, %r10
     subq %r9, %r10
-    movq -112(%rbp), %rax
+    leaq -112(%rbp), %rax
     movq %r10, %rax
     movq %rax, -112(%rbp)
     movq -112(%rbp), %r8
@@ -7583,12 +7488,12 @@ String_split:
     movq %r15, %rdi
     call p_malloc
     movq %rax, %r14
-    movq -120(%rbp), %rax
+    leaq -120(%rbp), %rax
     movq %r14, %rax
     movq %rax, -120(%rbp)
     movq -120(%rbp), %r14
     movq -24(%rbp), %r8
-    movq -176(%rbp), %r15
+    movq -184(%rbp), %r15
     addq %r8, %r15
     movq -112(%rbp), %r13
     movq $0, %r12
@@ -7601,11 +7506,11 @@ String_split:
     movq -112(%rbp), %r9
     movq %r8, %r10
     addq %r9, %r10
-    movq -128(%rbp), %rax
+    leaq -128(%rbp), %rax
     movq %r10, %rax
     movq %rax, -128(%rbp)
     movq -128(%rbp), %r8
-    movq -136(%rbp), %rax
+    leaq -136(%rbp), %rax
     movq %r8, %rax
     movq %rax, -136(%rbp)
     movq -136(%rbp), %r8
@@ -7647,12 +7552,12 @@ String_split:
     movq %r12, %rdi
     call p_malloc
     movq %rax, %r13
-    movq -152(%rbp), %rax
+    leaq -152(%rbp), %rax
     movq %r13, %rax
     movq %rax, -152(%rbp)
     movq -152(%rbp), %r12
     movq -24(%rbp), %r8
-    movq -176(%rbp), %r13
+    movq -184(%rbp), %r13
     addq %r8, %r13
     movq -144(%rbp), %r14
     movq $0, %r15
@@ -7665,11 +7570,11 @@ String_split:
     movq -144(%rbp), %r9
     movq %r8, %r10
     addq %r9, %r10
-    movq -160(%rbp), %rax
+    leaq -160(%rbp), %rax
     movq %r10, %rax
     movq %rax, -160(%rbp)
     movq -160(%rbp), %r8
-    movq -168(%rbp), %rax
+    leaq -168(%rbp), %rax
     movq %r8, %rax
     movq %rax, -168(%rbp)
     movq -168(%rbp), %r8
@@ -7708,16 +7613,16 @@ String_starts_with:
     subq $96, %rsp
     pushq %rbx
     pushq %r12
-    movq %rsi, -88(%rbp)
-    movq %rdx, -80(%rbp)
+    movq %rsi, -80(%rbp)
+    movq %rdx, -88(%rbp)
 .LString_starts_with_bb0:
     movq $0, %rax
-    movq -88(%rbp), %rbx
+    movq -80(%rbp), %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rbx
     movq $0, %rax
-    movq -80(%rbp), %rsi
+    movq -88(%rbp), %rsi
     cmpq %rax, %rsi
     sete %al
     movzbq %al, %rsi
@@ -7741,18 +7646,18 @@ String_starts_with:
 .LString_starts_with_bb3:
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -88(%rbp), %rsi
+    movq -80(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -80(%rbp), %rsi
+    movq -88(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %r12, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rbx
@@ -7772,7 +7677,7 @@ String_starts_with:
     jmp .LString_starts_with_bb6
 .LString_starts_with_bb6:
     movq $0, %rdx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -24(%rbp)
     jmp .LString_starts_with_bb7
@@ -7789,31 +7694,31 @@ String_starts_with:
     jmp .LString_starts_with_bb9
 .LString_starts_with_bb8:
     movq -24(%rbp), %r10
-    movq -88(%rbp), %r11
+    movq -80(%rbp), %r11
     addq %r10, %r11
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %r11, %rax
     movq %rax, -32(%rbp)
     movq -24(%rbp), %r10
-    movq -80(%rbp), %r11
+    movq -88(%rbp), %r11
     addq %r10, %r11
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r11, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %r10
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r10, %rax
     movq %rax, -48(%rbp)
     movq -40(%rbp), %r10
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r10, %rax
     movq %rax, -56(%rbp)
     movq $0, %r10
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r10, %rax
     movq %rax, -64(%rbp)
     movq $0, %r10
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %r10, %rax
     movq %rax, -72(%rbp)
     movq -48(%rbp), %rcx
@@ -7881,11 +7786,11 @@ String_to_lowercase:
     movq %rbx, %rdi
     call p_malloc
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rdx
@@ -7903,7 +7808,7 @@ String_to_lowercase:
     movq -104(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r12, %rax
     movq %rax, -24(%rbp)
     movq -24(%rbp), %rbx
@@ -7913,11 +7818,11 @@ String_to_lowercase:
     movq %r12, %rdi
     call p_malloc
     movq %rax, %rbx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -32(%rbp)
     movq $0, %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     jmp .LString_to_lowercase_bb4
@@ -7936,26 +7841,26 @@ String_to_lowercase:
     movq -40(%rbp), %r9
     movq -104(%rbp), %r10
     addq %r9, %r10
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r10, %rax
     movq %rax, -48(%rbp)
     movq -32(%rbp), %r9
     movq -40(%rbp), %r10
     movq %r9, %r11
     addq %r10, %r11
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r11, %rax
     movq %rax, -56(%rbp)
     movq -48(%rbp), %rdx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %rdx
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -72(%rbp)
     movq $0, %rdx
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -80(%rbp)
     movq -64(%rbp), %rcx
@@ -7991,11 +7896,11 @@ String_to_lowercase:
     movq -24(%rbp), %r10
     movq %r9, %r11
     addq %r10, %r11
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r11, %rax
     movq %rax, -88(%rbp)
     movq -88(%rbp), %rdx
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -96(%rbp)
     movq -96(%rbp), %rdx
@@ -8082,11 +7987,11 @@ String_to_uppercase:
     movq %rbx, %rdi
     call p_malloc
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rdx
@@ -8104,7 +8009,7 @@ String_to_uppercase:
     movq -104(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r12, %rax
     movq %rax, -24(%rbp)
     movq -24(%rbp), %rbx
@@ -8114,11 +8019,11 @@ String_to_uppercase:
     movq %r12, %rdi
     call p_malloc
     movq %rax, %rbx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -32(%rbp)
     movq $0, %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     jmp .LString_to_uppercase_bb4
@@ -8137,26 +8042,26 @@ String_to_uppercase:
     movq -40(%rbp), %r9
     movq -104(%rbp), %r10
     addq %r9, %r10
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r10, %rax
     movq %rax, -48(%rbp)
     movq -32(%rbp), %r9
     movq -40(%rbp), %r10
     movq %r9, %r11
     addq %r10, %r11
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r11, %rax
     movq %rax, -56(%rbp)
     movq -48(%rbp), %rdx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %rdx
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -72(%rbp)
     movq $0, %rdx
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -80(%rbp)
     movq -64(%rbp), %rcx
@@ -8192,11 +8097,11 @@ String_to_uppercase:
     movq -24(%rbp), %r10
     movq %r9, %r11
     addq %r10, %r11
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r11, %rax
     movq %rax, -88(%rbp)
     movq -88(%rbp), %rdx
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -96(%rbp)
     movq -96(%rbp), %rdx
@@ -8240,7 +8145,7 @@ String_to_uppercase:
 String_trim:
     pushq %rbp
     movq %rsp, %rbp
-    subq $368, %rsp
+    subq $376, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -8262,11 +8167,11 @@ String_trim:
     movq %rbx, %rdi
     call p_malloc
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rdx
@@ -8284,27 +8189,27 @@ String_trim:
     movq -160(%rbp), %rsi
     call p_str_length
     movq %rax, %r12
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r12, %rax
     movq %rax, -24(%rbp)
     movq $0, %rdx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -32(%rbp)
     movq -24(%rbp), %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq -160(%rbp), %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %rdx
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -56(%rbp)
     movq -56(%rbp), %rcx
     movzbq (%rcx), %rdx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -64(%rbp)
     jmp .LString_trim_bb4
@@ -8404,11 +8309,11 @@ String_trim:
     movq %r15, %rdi
     call p_malloc
     movq %rax, %r14
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %r14, %rax
     movq %rax, -72(%rbp)
     movq -72(%rbp), %rdx
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -80(%rbp)
     movq -80(%rbp), %rdx
@@ -8427,16 +8332,16 @@ String_trim:
     movq $1, %r8
     movq %rax, %r9
     subq %r8, %r9
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r9, %rax
     movq %rax, -88(%rbp)
     movq -88(%rbp), %rdx
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -96(%rbp)
     movq -96(%rbp), %rcx
     movzbq (%rcx), %rdx
-    movq -104(%rbp), %rax
+    leaq -104(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -104(%rbp)
     jmp .LString_trim_bb10
@@ -8525,7 +8430,7 @@ String_trim:
     movq -320(%rbp), %rax
     subq -328(%rbp), %rax
     movq %rax, -336(%rbp)
-    movq -112(%rbp), %rax
+    leaq -112(%rbp), %rax
     movq -336(%rbp), %rax
     movq %rax, -112(%rbp)
     movq -112(%rbp), %rax
@@ -8565,11 +8470,11 @@ String_trim:
     movq %r15, %rdi
     call p_malloc
     movq %rax, %r14
-    movq -120(%rbp), %rax
+    leaq -120(%rbp), %rax
     movq %r14, %rax
     movq %rax, -120(%rbp)
     movq -120(%rbp), %rdx
-    movq -128(%rbp), %rax
+    leaq -128(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -128(%rbp)
     movq -128(%rbp), %rdx
@@ -8589,7 +8494,7 @@ String_trim:
     movq %r14, %rdi
     call p_malloc
     movq %rax, %r15
-    movq -136(%rbp), %rax
+    leaq -136(%rbp), %rax
     movq %r15, %rax
     movq %rax, -136(%rbp)
     movq -136(%rbp), %r14
@@ -8607,11 +8512,11 @@ String_trim:
     movq -112(%rbp), %r9
     movq %r8, %r10
     addq %r9, %r10
-    movq -144(%rbp), %rax
+    leaq -144(%rbp), %rax
     movq %r10, %rax
     movq %rax, -144(%rbp)
     movq -144(%rbp), %rdx
-    movq -152(%rbp), %rax
+    leaq -152(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -152(%rbp)
     movq -152(%rbp), %rdx
@@ -8636,16 +8541,16 @@ String_trim:
 Vec_capacity:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
 .LVec_capacity_bb0:
     movq $16, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
@@ -8664,13 +8569,13 @@ Vec_capacity:
 Vec_clear:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
 .LVec_clear_bb0:
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rdx
@@ -8689,7 +8594,7 @@ Vec_clear:
 Vec_clone:
     pushq %rbp
     movq %rsp, %rbp
-    subq $80, %rsp
+    subq $88, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -8699,18 +8604,18 @@ Vec_clone:
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
     movq %rax, -24(%rbp)
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq -16(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
@@ -8719,11 +8624,11 @@ Vec_clone:
     movq %rbx, %rdi
     call Vec_new
     movq %rax, %r12
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r12, %rax
     movq %rax, -40(%rbp)
     movq $0, %rdx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -48(%rbp)
     jmp .LVec_clone_bb1
@@ -8748,15 +8653,15 @@ Vec_clone:
     imulq %rcx, %r10
     movq %r8, %r9
     addq %r10, %r9
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r9, %rax
     movq %rax, -56(%rbp)
     movq -56(%rbp), %rdx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -64(%rbp)
     movq $0, %rdx
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -72(%rbp)
     movq -64(%rbp), %rcx
@@ -8804,24 +8709,24 @@ Vec_contains:
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
     movq %rax, -24(%rbp)
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq -16(%rbp), %rcx
     movq (%rcx), %rbx
     movq %rbx, %rax
     movq %rax, -32(%rbp)
     movq $0, %rbx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -40(%rbp)
     jmp .LVec_contains_bb1
@@ -8845,15 +8750,15 @@ Vec_contains:
     imulq %rcx, %r12
     movq %r10, %r11
     addq %r12, %r11
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r11, %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %r10
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r10, %rax
     movq %rax, -56(%rbp)
     movq $0, %r10
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r10, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %rcx
@@ -8897,36 +8802,36 @@ Vec_contains:
 Vec_extend:
     pushq %rbp
     movq %rsp, %rbp
-    subq $80, %rsp
+    subq $88, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
     pushq %r14
     pushq %r15
-    movq %rsi, -80(%rbp)
-    movq %rdx, -72(%rbp)
+    movq %rsi, -72(%rbp)
+    movq %rdx, -80(%rbp)
 .LVec_extend_bb0:
     movq $8, %rax
-    movq -72(%rbp), %rbx
+    movq -80(%rbp), %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
-    movq -72(%rbp), %rax
+    leaq -16(%rbp), %rax
+    movq -80(%rbp), %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
     movq %rax, -24(%rbp)
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq -16(%rbp), %rcx
     movq (%rcx), %rbx
     movq %rbx, %rax
     movq %rax, -32(%rbp)
     movq $0, %rbx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -40(%rbp)
     jmp .LVec_extend_bb1
@@ -8950,15 +8855,15 @@ Vec_extend:
     imulq %rcx, %r9
     movq %rsi, %r8
     addq %r9, %r8
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r8, %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %r8
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r8, %rax
     movq %rax, -56(%rbp)
     movq $0, %r8
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r8, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %rcx
@@ -8968,7 +8873,7 @@ Vec_extend:
     movq -64(%rbp), %r14
     movq $0, %r15
     movq %r15, %rdi
-    movq -80(%rbp), %rsi
+    movq -72(%rbp), %rsi
     movq %r14, %rdx
     call Vec_push
     movq -40(%rbp), %r8
@@ -8995,19 +8900,19 @@ Vec_extend:
 Vec_first:
     pushq %rbp
     movq %rsp, %rbp
-    subq $48, %rsp
+    subq $56, %rsp
     pushq %rbx
 .LVec_first_bb0:
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
@@ -9030,17 +8935,17 @@ Vec_first:
 .LVec_first_bb2:
     jmp .LVec_first_bb3
 .LVec_first_bb3:
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq -16(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
     movq %rax, -32(%rbp)
     movq -32(%rbp), %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     movq $0, %rdx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -48(%rbp)
     movq -40(%rbp), %rcx
@@ -9061,20 +8966,20 @@ Vec_first:
 Vec_get:
     pushq %rbp
     movq %rsp, %rbp
-    subq $64, %rsp
+    subq $72, %rsp
     pushq %rbx
     movq %rdx, -64(%rbp)
 .LVec_get_bb0:
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
@@ -9113,7 +9018,7 @@ Vec_get:
 .LVec_get_bb5:
     jmp .LVec_get_bb6
 .LVec_get_bb6:
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq -16(%rbp), %rcx
     movq (%rcx), %rbx
     movq %rbx, %rax
@@ -9125,15 +9030,15 @@ Vec_get:
     imulq %rcx, %r8
     movq %rbx, %r9
     addq %r8, %r9
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r9, %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rbx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -48(%rbp)
     movq $0, %rbx
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -56(%rbp)
     movq -48(%rbp), %rcx
@@ -9157,26 +9062,26 @@ Vec_insert:
     subq $128, %rsp
     pushq %rbx
     pushq %r12
-    movq %rsi, -104(%rbp)
-    movq %rdx, -112(%rbp)
-    movq %rcx, -120(%rbp)
+    movq %rsi, -112(%rbp)
+    movq %rdx, -120(%rbp)
+    movq %rcx, -104(%rbp)
 .LVec_insert_bb0:
     movq $8, %rax
-    movq -104(%rbp), %rbx
+    movq -112(%rbp), %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
-    movq -104(%rbp), %rax
+    leaq -16(%rbp), %rax
+    movq -112(%rbp), %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
     movq %rax, -24(%rbp)
     movq $0, %rax
-    movq -112(%rbp), %rbx
+    movq -120(%rbp), %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rbx
@@ -9193,7 +9098,7 @@ Vec_insert:
     jmp .LVec_insert_bb3
 .LVec_insert_bb3:
     movq -24(%rbp), %rbx
-    movq -112(%rbp), %rsi
+    movq -120(%rbp), %rsi
     cmpq %rbx, %rsi
     setg %al
     movzbq %al, %rsi
@@ -9212,14 +9117,14 @@ Vec_insert:
     movq $0, %rbx
     movq $0, %r12
     movq %r12, %rdi
-    movq -104(%rbp), %rsi
+    movq -112(%rbp), %rsi
     movq %rbx, %rdx
     call Vec_push
     movq -8(%rbp), %rbx
     movq (%rbx), %r8
     movq %r8, %rax
     movq %rax, -24(%rbp)
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq -16(%rbp), %rbx
     movq (%rbx), %r8
     movq %r8, %rax
@@ -9228,14 +9133,14 @@ Vec_insert:
     movq $1, %rax
     movq %rbx, %r8
     subq %rax, %r8
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r8, %rax
     movq %rax, -40(%rbp)
     jmp .LVec_insert_bb7
 .LVec_insert_bb7:
     movq -40(%rbp), %rbx
     movq %rbx, %r8
-    cmpq -112(%rbp), %r8
+    cmpq -120(%rbp), %r8
     setg %al
     movzbq %al, %r8
     movq %r8, %rax
@@ -9251,7 +9156,7 @@ Vec_insert:
     imulq %rcx, %r11
     movq %r9, %r10
     addq %r11, %r10
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r10, %rax
     movq %rax, -48(%rbp)
     movq -32(%rbp), %r9
@@ -9265,20 +9170,20 @@ Vec_insert:
     imulq %rcx, %r10
     movq %r9, %r11
     addq %r10, %r11
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r11, %rax
     movq %rax, -56(%rbp)
     movq -48(%rbp), %r9
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r9, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %r9
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %r9, %rax
     movq %rax, -72(%rbp)
     movq -72(%rbp), %r9
     movq (%r9), %r10
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %r10, %rax
     movq %rax, -80(%rbp)
     movq -64(%rbp), %r9
@@ -9295,20 +9200,20 @@ Vec_insert:
 .LVec_insert_bb9:
     movq -32(%rbp), %r9
     movq $8, %rax
-    movq -112(%rbp), %r10
+    movq -120(%rbp), %r10
     movq %rax, %rcx
     imulq %rcx, %r10
     movq %r9, %r11
     addq %r10, %r11
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r11, %rax
     movq %rax, -88(%rbp)
     movq -88(%rbp), %r9
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %r9, %rax
     movq %rax, -96(%rbp)
     movq -96(%rbp), %r9
-    movq -120(%rbp), %rax
+    movq -104(%rbp), %rax
     movq %rax, (%r9)
     jmp .LVec_insert_epilogue
 .LVec_insert_epilogue:
@@ -9323,16 +9228,16 @@ Vec_insert:
 Vec_is_empty:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
 .LVec_is_empty_bb0:
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
@@ -9356,19 +9261,19 @@ Vec_is_empty:
 Vec_last:
     pushq %rbp
     movq %rsp, %rbp
-    subq $64, %rsp
+    subq $72, %rsp
     pushq %rbx
 .LVec_last_bb0:
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
@@ -9391,7 +9296,7 @@ Vec_last:
 .LVec_last_bb2:
     jmp .LVec_last_bb3
 .LVec_last_bb3:
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq -16(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
@@ -9407,15 +9312,15 @@ Vec_last:
     imulq %rcx, %r8
     movq %rbx, %r9
     addq %r8, %r9
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r9, %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rdx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -48(%rbp)
     movq $0, %rdx
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -56(%rbp)
     movq -48(%rbp), %rcx
@@ -9436,16 +9341,16 @@ Vec_last:
 Vec_len:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
 .LVec_len_bb0:
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
@@ -9472,25 +9377,25 @@ Vec_new:
     movq %rbx, %rdi
     call p_malloc
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq -8(%rbp), %rbx
     movq $8, %rax
     movq %rbx, %rsi
     addq %rax, %rsi
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -24(%rbp)
     movq -8(%rbp), %rbx
     movq $16, %rax
     movq %rbx, %rsi
     addq %rax, %rsi
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -32(%rbp)
     movq -16(%rbp), %rdx
@@ -9520,19 +9425,19 @@ Vec_new:
 Vec_pop:
     pushq %rbp
     movq %rsp, %rbp
-    subq $64, %rsp
+    subq $72, %rsp
     pushq %rbx
 .LVec_pop_bb0:
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
@@ -9553,7 +9458,7 @@ Vec_pop:
 .LVec_pop_bb2:
     jmp .LVec_pop_bb3
 .LVec_pop_bb3:
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq -16(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
@@ -9569,14 +9474,14 @@ Vec_pop:
     imulq %rcx, %r8
     movq %rbx, %r9
     addq %r8, %r9
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r9, %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rdx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -48(%rbp)
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq -48(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
@@ -9585,7 +9490,7 @@ Vec_pop:
     movq $1, %rax
     movq %rbx, %r8
     subq %rax, %r8
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r8, %rax
     movq %rax, -64(%rbp)
     movq -8(%rbp), %rdx
@@ -9606,7 +9511,7 @@ Vec_pop:
 Vec_push:
     pushq %rbp
     movq %rsp, %rbp
-    subq $240, %rsp
+    subq $248, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -9617,21 +9522,21 @@ Vec_push:
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
     movq $16, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -24(%rbp)
-    movq -32(%rbp), %rax
-    movq -40(%rbp), %rax
-    movq -48(%rbp), %rax
+    leaq -32(%rbp), %rax
+    leaq -40(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
@@ -9656,7 +9561,7 @@ Vec_push:
     jmp .LVec_push_bb2
 .LVec_push_bb1:
     movq $8, %rbx
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -56(%rbp)
     movq -40(%rbp), %rbx
@@ -9686,12 +9591,12 @@ Vec_push:
     movq %r13, %rax
     addq -152(%rbp), %rax
     movq %rax, -160(%rbp)
-    movq -120(%rbp), %rax
+    leaq -120(%rbp), %rax
     movq -160(%rbp), %rax
     movq %rax, -120(%rbp)
     movq -120(%rbp), %rax
     movq %rax, -168(%rbp)
-    movq -128(%rbp), %rax
+    leaq -128(%rbp), %rax
     movq -168(%rbp), %rax
     movq %rax, -128(%rbp)
     movq -128(%rbp), %rax
@@ -9704,7 +9609,7 @@ Vec_push:
     movq -184(%rbp), %rax
     addq $1, %rax
     movq %rax, -192(%rbp)
-    movq -136(%rbp), %rax
+    leaq -136(%rbp), %rax
     movq -192(%rbp), %rax
     movq %rax, -136(%rbp)
     movq -8(%rbp), %rax
@@ -9735,11 +9640,11 @@ Vec_push:
     movq %r15, %rdi
     call p_malloc
     movq %rax, %r14
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r14, %rax
     movq %rax, -64(%rbp)
     movq $0, %r8
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %r8, %rax
     movq %rax, -72(%rbp)
     jmp .LVec_push_bb7
@@ -9765,11 +9670,11 @@ Vec_push:
     imulq %rcx, %r10
     movq %r8, %r9
     addq %r10, %r9
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %r9, %rax
     movq %rax, -80(%rbp)
     movq -80(%rbp), %r8
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r8, %rax
     movq %rax, -88(%rbp)
     movq -64(%rbp), %r8
@@ -9780,16 +9685,16 @@ Vec_push:
     imulq %rcx, %r10
     movq %r8, %r9
     addq %r10, %r9
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %r9, %rax
     movq %rax, -96(%rbp)
     movq -96(%rbp), %r8
-    movq -104(%rbp), %rax
+    leaq -104(%rbp), %rax
     movq %r8, %rax
     movq %rax, -104(%rbp)
     movq -88(%rbp), %rcx
     movq (%rcx), %r8
-    movq -112(%rbp), %rax
+    leaq -112(%rbp), %rax
     movq %r8, %rax
     movq %rax, -112(%rbp)
     movq -104(%rbp), %r8
@@ -9856,13 +9761,13 @@ Vec_remove:
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
@@ -9901,7 +9806,7 @@ Vec_remove:
 .LVec_remove_bb5:
     jmp .LVec_remove_bb6
 .LVec_remove_bb6:
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq -16(%rbp), %rcx
     movq (%rcx), %rbx
     movq %rbx, %rax
@@ -9913,22 +9818,22 @@ Vec_remove:
     imulq %rcx, %r8
     movq %rbx, %r9
     addq %r8, %r9
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r9, %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rbx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -48(%rbp)
     movq $0, %rbx
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -56(%rbp)
     movq -48(%rbp), %rcx
     movq (%rcx), %rbx
     movq %rbx, %rax
     movq %rax, -56(%rbp)
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq -120(%rbp), %rax
     movq %rax, -64(%rbp)
     jmp .LVec_remove_bb7
@@ -9955,7 +9860,7 @@ Vec_remove:
     imulq %rcx, %r14
     movq %r12, %r13
     addq %r14, %r13
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %r13, %rax
     movq %rax, -72(%rbp)
     movq -32(%rbp), %r12
@@ -9969,20 +9874,20 @@ Vec_remove:
     imulq %rcx, %r13
     movq %r12, %r14
     addq %r13, %r14
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %r14, %rax
     movq %rax, -80(%rbp)
     movq -72(%rbp), %r12
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r12, %rax
     movq %rax, -88(%rbp)
     movq -80(%rbp), %r12
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %r12, %rax
     movq %rax, -96(%rbp)
     movq -96(%rbp), %rcx
     movq (%rcx), %r12
-    movq -104(%rbp), %rax
+    leaq -104(%rbp), %rax
     movq %r12, %rax
     movq %rax, -104(%rbp)
     movq -88(%rbp), %r12
@@ -10001,7 +9906,7 @@ Vec_remove:
     movq $1, %rax
     movq %r12, %r13
     subq %rax, %r13
-    movq -112(%rbp), %rax
+    leaq -112(%rbp), %rax
     movq %r13, %rax
     movq %rax, -112(%rbp)
     movq -8(%rbp), %r12
@@ -10034,24 +9939,24 @@ Vec_reverse:
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
     movq %rax, -24(%rbp)
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq -16(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
     movq %rax, -32(%rbp)
     movq $0, %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     jmp .LVec_reverse_bb1
@@ -10081,7 +9986,7 @@ Vec_reverse:
     imulq %rcx, %r14
     movq %r12, %r13
     addq %r14, %r13
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r13, %rax
     movq %rax, -48(%rbp)
     movq -32(%rbp), %r12
@@ -10098,25 +10003,25 @@ Vec_reverse:
     imulq %rcx, %r14
     movq %r12, %r13
     addq %r14, %r13
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r13, %rax
     movq %rax, -56(%rbp)
     movq -48(%rbp), %rdx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %rdx
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -72(%rbp)
     movq -64(%rbp), %rcx
     movq (%rcx), %rdx
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -80(%rbp)
     movq -72(%rbp), %rcx
     movq (%rcx), %rdx
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -88(%rbp)
     movq -64(%rbp), %rdx
@@ -10150,7 +10055,7 @@ Vec_reverse:
 Vec_set:
     pushq %rbp
     movq %rsp, %rbp
-    subq $64, %rsp
+    subq $72, %rsp
     pushq %rbx
     movq %rdx, -64(%rbp)
     movq %rcx, -56(%rbp)
@@ -10158,13 +10063,13 @@ Vec_set:
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
@@ -10203,7 +10108,7 @@ Vec_set:
 .LVec_set_bb5:
     jmp .LVec_set_bb6
 .LVec_set_bb6:
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq -16(%rbp), %rbx
     movq (%rbx), %r8
     movq %r8, %rax
@@ -10215,11 +10120,11 @@ Vec_set:
     imulq %rcx, %r8
     movq %rbx, %r9
     addq %r8, %r9
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r9, %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rbx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %rbx
@@ -10237,7 +10142,7 @@ Vec_set:
 Vec_sort:
     pushq %rbp
     movq %rsp, %rbp
-    subq $96, %rsp
+    subq $104, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -10247,18 +10152,18 @@ Vec_sort:
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
     movq %rax, -24(%rbp)
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq -16(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
@@ -10279,7 +10184,7 @@ Vec_sort:
     jmp .LVec_sort_bb3
 .LVec_sort_bb3:
     movq $1, %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     jmp .LVec_sort_bb4
@@ -10294,7 +10199,7 @@ Vec_sort:
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     movq $0, %rdx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -48(%rbp)
     jmp .LVec_sort_bb7
@@ -10323,7 +10228,7 @@ Vec_sort:
     imulq %rcx, %r15
     movq %r13, %r14
     addq %r15, %r14
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r14, %rax
     movq %rax, -56(%rbp)
     movq -32(%rbp), %r13
@@ -10337,25 +10242,25 @@ Vec_sort:
     imulq %rcx, %r14
     movq %r13, %r15
     addq %r14, %r15
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r15, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %rdx
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -72(%rbp)
     movq -64(%rbp), %rdx
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -80(%rbp)
     movq -72(%rbp), %rcx
     movq (%rcx), %rdx
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -88(%rbp)
     movq -80(%rbp), %rcx
     movq (%rcx), %rdx
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -96(%rbp)
     movq -88(%rbp), %r13
@@ -10408,7 +10313,7 @@ Vec_sort:
 Vec_to_str:
     pushq %rbp
     movq %rsp, %rbp
-    subq $80, %rsp
+    subq $88, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -10418,28 +10323,28 @@ Vec_to_str:
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
     movq %rax, -24(%rbp)
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq -16(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
     movq %rax, -32(%rbp)
     leaq .str_9(%rip), %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     movq $0, %rdx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -48(%rbp)
     jmp .LVec_to_str_bb1
@@ -10499,15 +10404,15 @@ Vec_to_str:
     imulq %rcx, %r10
     movq %r8, %r9
     addq %r10, %r9
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r9, %rax
     movq %rax, -56(%rbp)
     movq -56(%rbp), %rdx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -64(%rbp)
     movq $0, %rdx
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -72(%rbp)
     movq -64(%rbp), %rcx
@@ -10547,17 +10452,17 @@ Vec_to_str:
 Vec_truncate:
     pushq %rbp
     movq %rsp, %rbp
-    subq $32, %rsp
+    subq $40, %rsp
     pushq %rbx
     movq %rdx, -24(%rbp)
 .LVec_truncate_bb0:
     movq $8, %rax
     movq %rsi, %rbx
     addq %rax, %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq -8(%rbp), %rcx
     movq (%rcx), %rdx
     movq %rdx, %rax
@@ -10591,6 +10496,7 @@ Vec_truncate:
 abs:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .Labs_bb0:
     movq $0, %rax
@@ -10623,7 +10529,7 @@ abs:
 allocator_alloc:
     pushq %rbp
     movq %rsp, %rbp
-    subq $32, %rsp
+    subq $40, %rsp
     pushq %rbx
     movq %rdi, -16(%rbp)
     movq %rsi, -24(%rbp)
@@ -10646,12 +10552,12 @@ allocator_alloc:
 allocator_bytes_used:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
-    movq %rdi, -8(%rbp)
-    movq %rsi, -16(%rbp)
+    movq %rdi, -16(%rbp)
+    movq %rsi, -8(%rbp)
 .Lallocator_bytes_used_bb0:
-    movq -16(%rbp), %rdi
+    movq -8(%rbp), %rdi
     call p_allocator_stats
     movq %rax, %rbx
     movq %rbx, %rax
@@ -10668,12 +10574,12 @@ allocator_free:
     pushq %rbp
     movq %rsp, %rbp
     subq $32, %rsp
-    movq %rdi, -8(%rbp)
-    movq %rsi, -16(%rbp)
-    movq %rdx, -24(%rbp)
+    movq %rdi, -24(%rbp)
+    movq %rsi, -8(%rbp)
+    movq %rdx, -16(%rbp)
 .Lallocator_free_bb0:
-    movq -16(%rbp), %rdi
-    movq -24(%rbp), %rsi
+    movq -8(%rbp), %rdi
+    movq -16(%rbp), %rsi
     call p_allocator_free
     jmp .Lallocator_free_epilogue
 .Lallocator_free_epilogue:
@@ -10686,6 +10592,7 @@ allocator_free:
 assert:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .Lassert_bb0:
     movq %rsi, %rcx
@@ -10699,9 +10606,8 @@ assert:
     jmp .Lassert_bb2
 .Lassert_bb1:
     leaq .str_4(%rip), %rbx
-    # Print: v4 (*u8)
     movq %rbx, %rdi
-    call p_print_str
+    call p_panic
     jmp .Lassert_bb3
 .Lassert_bb2:
     jmp .Lassert_bb3
@@ -10713,17 +10619,47 @@ assert:
     ret
     .size assert, .-assert
 
+    .globl assert_msg
+    .type assert_msg, @function
+assert_msg:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $16, %rsp
+    movq %rdx, -8(%rbp)
+.Lassert_msg_bb0:
+    movq %rsi, %rcx
+    testq %rcx, %rcx
+    sete %al
+    movzbq %al, %rax
+    movq %rax, %rcx
+    movq %rcx, %rax
+    testq %rax, %rax
+    jne .Lassert_msg_bb1
+    jmp .Lassert_msg_bb2
+.Lassert_msg_bb1:
+    movq -8(%rbp), %rdi
+    call p_panic
+    jmp .Lassert_msg_bb3
+.Lassert_msg_bb2:
+    jmp .Lassert_msg_bb3
+.Lassert_msg_bb3:
+    jmp .Lassert_msg_epilogue
+.Lassert_msg_epilogue:
+    leave
+    ret
+    .size assert_msg, .-assert_msg
+
     .globl byte_to_str
     .type byte_to_str, @function
 byte_to_str:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
-    movq %rdi, -8(%rbp)
-    movq %rsi, -16(%rbp)
+    movq %rdi, -16(%rbp)
+    movq %rsi, -8(%rbp)
 .Lbyte_to_str_bb0:
-    movq -16(%rbp), %rdi
+    movq -8(%rbp), %rdi
     call p_char_to_str
     movq %rax, %rbx
     movq %rbx, %rax
@@ -10739,6 +10675,7 @@ byte_to_str:
 char_is_alpha:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .Lchar_is_alpha_bb0:
     movq $65, %rax
@@ -10798,6 +10735,7 @@ char_is_alpha:
 char_is_digit:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .Lchar_is_digit_bb0:
     movq $48, %rax
@@ -10830,6 +10768,7 @@ char_is_digit:
 char_is_lower:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .Lchar_is_lower_bb0:
     movq $97, %rax
@@ -10862,6 +10801,7 @@ char_is_lower:
 char_is_upper:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .Lchar_is_upper_bb0:
     movq $65, %rax
@@ -10894,6 +10834,7 @@ char_is_upper:
 char_is_whitespace:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .Lchar_is_whitespace_bb0:
     movq $32, %rax
@@ -10952,6 +10893,7 @@ char_is_whitespace:
 char_to_lower:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .Lchar_to_lower_bb0:
     movq $65, %rax
@@ -10998,7 +10940,7 @@ char_to_lower:
 char_to_str:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
@@ -11019,6 +10961,7 @@ char_to_str:
 char_to_upper:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .Lchar_to_upper_bb0:
     movq $97, %rax
@@ -11065,13 +11008,13 @@ char_to_upper:
 clamp:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
-    movq %rdx, -16(%rbp)
-    movq %rcx, -8(%rbp)
+    movq %rdx, -8(%rbp)
+    movq %rcx, -16(%rbp)
 .Lclamp_bb0:
     movq %rsi, %rbx
-    cmpq -16(%rbp), %rbx
+    cmpq -8(%rbp), %rbx
     setl %al
     movzbq %al, %rbx
     movq %rbx, %rax
@@ -11079,13 +11022,13 @@ clamp:
     jne .Lclamp_bb1
     jmp .Lclamp_bb2
 .Lclamp_bb1:
-    movq -16(%rbp), %rax
+    movq -8(%rbp), %rax
     jmp .Lclamp_epilogue
 .Lclamp_bb2:
     jmp .Lclamp_bb3
 .Lclamp_bb3:
     movq %rsi, %rbx
-    cmpq -8(%rbp), %rbx
+    cmpq -16(%rbp), %rbx
     setg %al
     movzbq %al, %rbx
     movq %rbx, %rax
@@ -11093,7 +11036,7 @@ clamp:
     jne .Lclamp_bb4
     jmp .Lclamp_bb5
 .Lclamp_bb4:
-    movq -8(%rbp), %rax
+    movq -16(%rbp), %rax
     jmp .Lclamp_epilogue
 .Lclamp_bb5:
     jmp .Lclamp_bb6
@@ -11111,6 +11054,7 @@ clamp:
 cleanup_a:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .Lcleanup_a_bb0:
     leaq .str_0(%rip), %rbx
@@ -11129,6 +11073,7 @@ cleanup_a:
 cleanup_b:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .Lcleanup_b_bb0:
     leaq .str_1(%rip), %rbx
@@ -11147,7 +11092,7 @@ cleanup_b:
 create_allocator:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
     movq %rdi, -16(%rbp)
     movq %rsi, -8(%rbp)
@@ -11163,12 +11108,34 @@ create_allocator:
     ret
     .size create_allocator, .-create_allocator
 
+    .globl float_to_str
+    .type float_to_str, @function
+float_to_str:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $24, %rsp
+    pushq %rbx
+    movq %rdi, -16(%rbp)
+    movq %rsi, -8(%rbp)
+.Lfloat_to_str_bb0:
+    movapd -8(%rbp), %xmm0
+    movb $1, %al
+    call p_float_to_str
+    movq %rax, %rbx
+    movq %rbx, %rax
+    jmp .Lfloat_to_str_epilogue
+.Lfloat_to_str_epilogue:
+    popq %rbx
+    leave
+    ret
+    .size float_to_str, .-float_to_str
+
     .globl int_to_str
     .type int_to_str, @function
 int_to_str:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
     movq %rdi, -16(%rbp)
     movq %rsi, -8(%rbp)
@@ -11189,6 +11156,7 @@ int_to_str:
 main:
     pushq %rbp
     movq %rsp, %rbp
+    subq $8, %rsp
     pushq %rbx
 .Lmain_bb0:
     leaq .str_2(%rip), %rbx
@@ -11214,7 +11182,7 @@ main:
 max:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
     movq %rdx, -8(%rbp)
 .Lmax_bb0:
@@ -11245,7 +11213,7 @@ max:
 min:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
     movq %rdx, -8(%rbp)
 .Lmin_bb0:
@@ -11276,7 +11244,7 @@ min:
 p_str_compare:
     pushq %rbp
     movq %rsp, %rbp
-    subq $64, %rsp
+    subq $72, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -11331,28 +11299,28 @@ p_str_compare:
 .Lp_str_compare_bb8:
     jmp .Lp_str_compare_bb9
 .Lp_str_compare_bb9:
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq -56(%rbp), %rax
     movq %rax, -16(%rbp)
     movq -8(%rbp), %rbx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -24(%rbp)
     movq -16(%rbp), %rbx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -32(%rbp)
     movq -24(%rbp), %rcx
     movzbq (%rcx), %rbx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %rcx
     movzbq (%rcx), %rbx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -48(%rbp)
     jmp .Lp_str_compare_bb10
@@ -11450,18 +11418,18 @@ p_str_compare:
 p_str_copy_n:
     pushq %rbp
     movq %rsp, %rbp
-    subq $64, %rsp
+    subq $72, %rsp
     pushq %rbx
     movq %rcx, -56(%rbp)
 .Lp_str_copy_n_bb0:
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq $0, %rbx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -24(%rbp)
     jmp .Lp_str_copy_n_bb1
@@ -11477,16 +11445,16 @@ p_str_copy_n:
     jmp .Lp_str_copy_n_bb3
 .Lp_str_copy_n_bb2:
     movq -8(%rbp), %r9
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %r9, %rax
     movq %rax, -32(%rbp)
     movq -16(%rbp), %r9
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r9, %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rcx
     movzbq (%rcx), %r9
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r9, %rax
     movq %rax, -48(%rbp)
     movq -32(%rbp), %r9
@@ -11525,7 +11493,7 @@ p_str_copy_n:
 p_str_equal:
     pushq %rbp
     movq %rsp, %rbp
-    subq $64, %rsp
+    subq $72, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -11577,28 +11545,28 @@ p_str_equal:
 .Lp_str_equal_bb8:
     jmp .Lp_str_equal_bb9
 .Lp_str_equal_bb9:
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq -56(%rbp), %rax
     movq %rax, -16(%rbp)
     movq -8(%rbp), %rdx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -24(%rbp)
     movq -16(%rbp), %rbx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -32(%rbp)
     movq -24(%rbp), %rcx
     movzbq (%rcx), %rbx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %rcx
     movzbq (%rcx), %rbx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -48(%rbp)
     jmp .Lp_str_equal_bb10
@@ -11695,7 +11663,7 @@ p_str_equal:
 p_str_from_ptr:
     pushq %rbp
     movq %rsp, %rbp
-    subq $128, %rsp
+    subq $136, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -11717,11 +11685,11 @@ p_str_from_ptr:
     movq %rbx, %rdi
     call p_malloc
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rdx
@@ -11734,20 +11702,20 @@ p_str_from_ptr:
 .Lp_str_from_ptr_bb2:
     jmp .Lp_str_from_ptr_bb3
 .Lp_str_from_ptr_bb3:
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq -120(%rbp), %rax
     movq %rax, -24(%rbp)
     movq -24(%rbp), %rdx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -32(%rbp)
     movq $0, %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %rcx
     movzbq (%rcx), %rdx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -48(%rbp)
     jmp .Lp_str_from_ptr_bb4
@@ -11791,22 +11759,22 @@ p_str_from_ptr:
     movq %r14, %rdi
     call p_malloc
     movq %rax, %r15
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r15, %rax
     movq %rax, -56(%rbp)
     movq -56(%rbp), %rdx
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -64(%rbp)
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq -120(%rbp), %rax
     movq %rax, -72(%rbp)
     movq -72(%rbp), %rdx
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -80(%rbp)
     movq $0, %rdx
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -88(%rbp)
     jmp .Lp_str_from_ptr_bb7
@@ -11824,7 +11792,7 @@ p_str_from_ptr:
 .Lp_str_from_ptr_bb8:
     movq -80(%rbp), %rcx
     movzbq (%rcx), %rdx
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -96(%rbp)
     movq -64(%rbp), %rdx
@@ -11847,7 +11815,7 @@ p_str_from_ptr:
     movq %rdx, %rax
     movq %rax, -80(%rbp)
     movq -64(%rbp), %rdx
-    movq -104(%rbp), %rax
+    leaq -104(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -104(%rbp)
     movq -104(%rbp), %r11
@@ -11866,7 +11834,7 @@ p_str_from_ptr:
     movq %r11, %rax
     movb %al, (%rdx)
     movq -56(%rbp), %rdx
-    movq -112(%rbp), %rax
+    leaq -112(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -112(%rbp)
     movq -112(%rbp), %rcx
@@ -11894,19 +11862,19 @@ p_str_hash:
     movq $3750763034362895579, %rdx
     movq %rdx, %rbx
     negq %rbx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rdx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -24(%rbp)
     movq -24(%rbp), %rcx
     movzbq (%rcx), %rdx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -32(%rbp)
     jmp .Lp_str_hash_bb1
@@ -11984,7 +11952,7 @@ p_str_hash:
 p_str_length:
     pushq %rbp
     movq %rsp, %rbp
-    subq $32, %rsp
+    subq $40, %rsp
     pushq %rbx
 .Lp_str_length_bb0:
     movq $0, %rax
@@ -12002,20 +11970,20 @@ p_str_length:
 .Lp_str_length_bb2:
     jmp .Lp_str_length_bb3
 .Lp_str_length_bb3:
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq $0, %rdx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -24(%rbp)
     movq -16(%rbp), %rcx
     movzbq (%rcx), %rdx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -32(%rbp)
     jmp .Lp_str_length_bb4
@@ -12066,13 +12034,13 @@ p_str_length:
 println:
     pushq %rbp
     movq %rsp, %rbp
-    subq $16, %rsp
+    subq $24, %rsp
     pushq %rbx
-    movq %rdi, -8(%rbp)
-    movq %rsi, -16(%rbp)
+    movq %rdi, -16(%rbp)
+    movq %rsi, -8(%rbp)
 .Lprintln_bb0:
     # Print: v1 (*u8)
-    movq -16(%rbp), %rdi
+    movq -8(%rbp), %rdi
     call p_print_str
     leaq .str_3(%rip), %rbx
     # Print: v3 (*u8)
@@ -12093,13 +12061,13 @@ str_byte_at:
     subq $16, %rsp
     pushq %rbx
     pushq %r12
-    movq %rsi, -16(%rbp)
-    movq %rdx, -8(%rbp)
+    movq %rsi, -8(%rbp)
+    movq %rdx, -16(%rbp)
 .Lstr_byte_at_bb0:
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -16(%rbp), %rsi
-    movq -8(%rbp), %rdx
+    movq -8(%rbp), %rsi
+    movq -16(%rbp), %rdx
     call String_byte_at
     movq %rax, %r12
     movq %r12, %rax
@@ -12116,7 +12084,7 @@ str_byte_at:
 str_bytes:
     pushq %rbp
     movq %rsp, %rbp
-    subq $64, %rsp
+    subq $72, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -12128,7 +12096,7 @@ str_bytes:
     movq %rbx, %rdi
     call Vec_new
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq $0, %rbx
@@ -12136,11 +12104,11 @@ str_bytes:
     movq -56(%rbp), %rsi
     call String_len
     movq %rax, %r12
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %r12, %rax
     movq %rax, -16(%rbp)
     movq $0, %rdx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -24(%rbp)
     jmp .Lstr_bytes_bb1
@@ -12160,15 +12128,15 @@ str_bytes:
     movq -24(%rbp), %rsi
     movq -56(%rbp), %r8
     addq %rsi, %r8
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %r8, %rax
     movq %rax, -32(%rbp)
     movq -32(%rbp), %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     movq $0, %rdx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -48(%rbp)
     movq -40(%rbp), %rcx
@@ -12211,13 +12179,13 @@ str_compare:
     subq $16, %rsp
     pushq %rbx
     pushq %r12
-    movq %rsi, -16(%rbp)
-    movq %rdx, -8(%rbp)
+    movq %rsi, -8(%rbp)
+    movq %rdx, -16(%rbp)
 .Lstr_compare_bb0:
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -16(%rbp), %rsi
-    movq -8(%rbp), %rdx
+    movq -8(%rbp), %rsi
+    movq -16(%rbp), %rdx
     call p_str_compare
     movq %rax, %r12
     movq %r12, %rax
@@ -12234,7 +12202,7 @@ str_compare:
 str_concat:
     pushq %rbp
     movq %rsp, %rbp
-    subq $32, %rsp
+    subq $40, %rsp
     pushq %rbx
     movq %rdi, -24(%rbp)
     movq %rsi, -8(%rbp)
@@ -12286,13 +12254,13 @@ str_ends_with:
     subq $16, %rsp
     pushq %rbx
     pushq %r12
-    movq %rsi, -16(%rbp)
-    movq %rdx, -8(%rbp)
+    movq %rsi, -8(%rbp)
+    movq %rdx, -16(%rbp)
 .Lstr_ends_with_bb0:
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -16(%rbp), %rsi
-    movq -8(%rbp), %rdx
+    movq -8(%rbp), %rsi
+    movq -16(%rbp), %rdx
     call String_ends_with
     movq %rax, %r12
     movq %r12, %rax
@@ -12338,13 +12306,13 @@ str_find:
     subq $16, %rsp
     pushq %rbx
     pushq %r12
-    movq %rsi, -16(%rbp)
-    movq %rdx, -8(%rbp)
+    movq %rsi, -8(%rbp)
+    movq %rdx, -16(%rbp)
 .Lstr_find_bb0:
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -16(%rbp), %rsi
-    movq -8(%rbp), %rdx
+    movq -8(%rbp), %rsi
+    movq -16(%rbp), %rdx
     call String_find
     movq %rax, %r12
     movq %r12, %rax
@@ -12361,7 +12329,7 @@ str_find:
 str_from_bytes:
     pushq %rbp
     movq %rsp, %rbp
-    subq $48, %rsp
+    subq $56, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -12370,11 +12338,11 @@ str_from_bytes:
     movq %rsi, -32(%rbp)
 .Lstr_from_bytes_bb0:
     leaq .str_15(%rip), %rdx
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -8(%rbp)
     movq $0, %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq $0, %rbx
@@ -12382,7 +12350,7 @@ str_from_bytes:
     movq -32(%rbp), %rsi
     call Vec_len
     movq %rax, %r12
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r12, %rax
     movq %rax, -24(%rbp)
     jmp .Lstr_from_bytes_bb1
@@ -12486,12 +12454,34 @@ str_len:
     ret
     .size str_len, .-str_len
 
+    .globl str_parse_float
+    .type str_parse_float, @function
+str_parse_float:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $24, %rsp
+    pushq %rbx
+    movq %rdi, -8(%rbp)
+    movq %rsi, -16(%rbp)
+.Lstr_parse_float_bb0:
+    movq -16(%rbp), %rdi
+    call p_str_to_float
+    movsd %xmm0, -8(%rbp)
+    movq -8(%rbp), %rbx
+    movq %rbx, %rax
+    jmp .Lstr_parse_float_epilogue
+.Lstr_parse_float_epilogue:
+    popq %rbx
+    leave
+    ret
+    .size str_parse_float, .-str_parse_float
+
     .globl str_parse_hex
     .type str_parse_hex, @function
 str_parse_hex:
     pushq %rbp
     movq %rsp, %rbp
-    subq $288, %rsp
+    subq $296, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -12504,7 +12494,7 @@ str_parse_hex:
     movq -168(%rbp), %rsi
     call String_len
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rbx
@@ -12524,15 +12514,15 @@ str_parse_hex:
     jmp .Lstr_parse_hex_bb3
 .Lstr_parse_hex_bb3:
     movq $0, %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq $0, %rdx
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -24(%rbp)
     movq $0, %rdx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -32(%rbp)
     jmp .Lstr_parse_hex_bb4
@@ -12551,15 +12541,15 @@ str_parse_hex:
     movq -16(%rbp), %r10
     movq -168(%rbp), %r11
     addq %r10, %r11
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r11, %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rdx
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -48(%rbp)
     movq $0, %rdx
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -56(%rbp)
     movq -48(%rbp), %rcx
@@ -12614,15 +12604,15 @@ str_parse_hex:
     movq -16(%rbp), %r13
     movq -168(%rbp), %r14
     addq %r13, %r14
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r14, %rax
     movq %rax, -64(%rbp)
     movq -64(%rbp), %rdx
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -72(%rbp)
     movq $0, %rdx
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -80(%rbp)
     movq -72(%rbp), %rcx
@@ -12694,15 +12684,15 @@ str_parse_hex:
     movq -16(%rbp), %r14
     movq -168(%rbp), %r15
     addq %r14, %r15
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r15, %rax
     movq %rax, -88(%rbp)
     movq -88(%rbp), %rdx
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -96(%rbp)
     movq $0, %rdx
-    movq -104(%rbp), %rax
+    leaq -104(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -104(%rbp)
     movq -96(%rbp), %rcx
@@ -12715,15 +12705,15 @@ str_parse_hex:
     movq $1, %r14
     movq %rax, %r15
     addq %r14, %r15
-    movq -112(%rbp), %rax
+    leaq -112(%rbp), %rax
     movq %r15, %rax
     movq %rax, -112(%rbp)
     movq -112(%rbp), %rdx
-    movq -120(%rbp), %rax
+    leaq -120(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -120(%rbp)
     movq $0, %rdx
-    movq -128(%rbp), %rax
+    leaq -128(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -128(%rbp)
     movq -120(%rbp), %rcx
@@ -12801,15 +12791,15 @@ str_parse_hex:
     movq -16(%rbp), %r15
     movq -168(%rbp), %r14
     addq %r15, %r14
-    movq -136(%rbp), %rax
+    leaq -136(%rbp), %rax
     movq %r14, %rax
     movq %rax, -136(%rbp)
     movq -136(%rbp), %rdx
-    movq -144(%rbp), %rax
+    leaq -144(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -144(%rbp)
     movq $0, %rdx
-    movq -152(%rbp), %rax
+    leaq -152(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -152(%rbp)
     movq -144(%rbp), %rcx
@@ -12819,7 +12809,7 @@ str_parse_hex:
     movq $1, %rdx
     movq %rdx, %r14
     negq %r14
-    movq -160(%rbp), %rax
+    leaq -160(%rbp), %rax
     movq %r14, %rax
     movq %rax, -160(%rbp)
     movq -152(%rbp), %r14
@@ -13008,27 +12998,27 @@ str_parse_int:
 str_parse_int_range:
     pushq %rbp
     movq %rsp, %rbp
-    subq $96, %rsp
+    subq $104, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
-    movq %rsi, -72(%rbp)
-    movq %rdx, -88(%rbp)
-    movq %rcx, -80(%rbp)
+    movq %rsi, -88(%rbp)
+    movq %rdx, -80(%rbp)
+    movq %rcx, -72(%rbp)
 .Lstr_parse_int_range_bb0:
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -72(%rbp), %rsi
+    movq -88(%rbp), %rsi
     call String_len
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
-    movq -88(%rbp), %rax
-    movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq -80(%rbp), %rax
+    movq %rax, -16(%rbp)
+    leaq -24(%rbp), %rax
+    movq -72(%rbp), %rax
     movq %rax, -24(%rbp)
     movq -16(%rbp), %rbx
     movq $0, %rax
@@ -13083,11 +13073,11 @@ str_parse_int_range:
     jmp .Lstr_parse_int_range_bb9
 .Lstr_parse_int_range_bb9:
     movq $0, %rbx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -32(%rbp)
     movq -16(%rbp), %rbx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -40(%rbp)
     jmp .Lstr_parse_int_range_bb10
@@ -13104,17 +13094,17 @@ str_parse_int_range:
     jmp .Lstr_parse_int_range_bb12
 .Lstr_parse_int_range_bb11:
     movq -40(%rbp), %r10
-    movq -72(%rbp), %r11
+    movq -88(%rbp), %r11
     addq %r10, %r11
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r11, %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %r10
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r10, %rax
     movq %rax, -56(%rbp)
     movq $0, %r10
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r10, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %rcx
@@ -13216,14 +13206,14 @@ str_replace:
     subq $32, %rsp
     pushq %rbx
     pushq %r12
-    movq %rsi, -16(%rbp)
-    movq %rdx, -8(%rbp)
+    movq %rsi, -8(%rbp)
+    movq %rdx, -16(%rbp)
     movq %rcx, -24(%rbp)
 .Lstr_replace_bb0:
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -16(%rbp), %rsi
-    movq -8(%rbp), %rdx
+    movq -8(%rbp), %rsi
+    movq -16(%rbp), %rdx
     movq -24(%rbp), %rcx
     call String_replace
     movq %rax, %r12
@@ -13281,13 +13271,13 @@ str_slice:
     movq -32(%rbp), %rsi
     call String_len
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq -48(%rbp), %rax
     movq %rax, -16(%rbp)
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq -40(%rbp), %rax
     movq %rax, -24(%rbp)
     movq -16(%rbp), %rbx
@@ -13367,7 +13357,7 @@ str_slice:
 str_split:
     pushq %rbp
     movq %rsp, %rbp
-    subq $192, %rsp
+    subq $200, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -13380,7 +13370,7 @@ str_split:
     movq %rbx, %rdi
     call Vec_new
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq $0, %rbx
@@ -13411,7 +13401,7 @@ str_split:
     jmp .Lstr_split_bb3
 .Lstr_split_bb3:
     movq $0, %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq $0, %rbx
@@ -13419,7 +13409,7 @@ str_split:
     movq -112(%rbp), %rsi
     call String_len
     movq %rax, %r12
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r12, %rax
     movq %rax, -24(%rbp)
     movq $0, %rbx
@@ -13427,11 +13417,11 @@ str_split:
     movq -120(%rbp), %rsi
     call String_len
     movq %rax, %r12
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %r12, %rax
     movq %rax, -32(%rbp)
     movq $0, %rbx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -40(%rbp)
     jmp .Lstr_split_bb4
@@ -13456,11 +13446,11 @@ str_split:
     jmp .Lstr_split_bb6
 .Lstr_split_bb5:
     movq $1, %rsi
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %rsi, %rax
     movq %rax, -48(%rbp)
     movq $0, %r8
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r8, %rax
     movq %rax, -56(%rbp)
     jmp .Lstr_split_bb7
@@ -13504,29 +13494,29 @@ str_split:
     movq -56(%rbp), %r8
     movq %r9, %r10
     addq %r8, %r10
-    movq -64(%rbp), %rax
+    leaq -64(%rbp), %rax
     movq %r10, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %r8
     movq -120(%rbp), %r9
     addq %r8, %r9
-    movq -72(%rbp), %rax
+    leaq -72(%rbp), %rax
     movq %r9, %rax
     movq %rax, -72(%rbp)
     movq -64(%rbp), %r8
-    movq -80(%rbp), %rax
+    leaq -80(%rbp), %rax
     movq %r8, %rax
     movq %rax, -80(%rbp)
     movq -72(%rbp), %r8
-    movq -88(%rbp), %rax
+    leaq -88(%rbp), %rax
     movq %r8, %rax
     movq %rax, -88(%rbp)
     movq $0, %r8
-    movq -96(%rbp), %rax
+    leaq -96(%rbp), %rax
     movq %r8, %rax
     movq %rax, -96(%rbp)
     movq $0, %r8
-    movq -104(%rbp), %rax
+    leaq -104(%rbp), %rax
     movq %r8, %rax
     movq %rax, -104(%rbp)
     movq -80(%rbp), %rcx
@@ -13620,36 +13610,36 @@ str_split:
 str_split_char:
     pushq %rbp
     movq %rsp, %rbp
-    subq $96, %rsp
+    subq $104, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
     pushq %r14
     pushq %r15
-    movq %rsi, -72(%rbp)
-    movq %rdx, -64(%rbp)
+    movq %rsi, -64(%rbp)
+    movq %rdx, -72(%rbp)
 .Lstr_split_char_bb0:
     movq $0, %rbx
     movq %rbx, %rdi
     call Vec_new
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq $0, %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     movq $0, %rbx
     movq %rbx, %rdi
-    movq -72(%rbp), %rsi
+    movq -64(%rbp), %rsi
     call String_len
     movq %rax, %r12
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r12, %rax
     movq %rax, -24(%rbp)
     movq $0, %rbx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rbx, %rax
     movq %rax, -32(%rbp)
     jmp .Lstr_split_char_bb1
@@ -13669,17 +13659,17 @@ str_split_char:
     jmp .Lstr_split_char_bb3
 .Lstr_split_char_bb2:
     movq -32(%rbp), %rsi
-    movq -72(%rbp), %r8
+    movq -64(%rbp), %r8
     addq %rsi, %r8
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %r8, %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %r8
-    movq -48(%rbp), %rax
+    leaq -48(%rbp), %rax
     movq %r8, %rax
     movq %rax, -48(%rbp)
     movq $0, %r8
-    movq -56(%rbp), %rax
+    leaq -56(%rbp), %rax
     movq %r8, %rax
     movq %rax, -56(%rbp)
     movq -48(%rbp), %rcx
@@ -13688,7 +13678,7 @@ str_split_char:
     movq %rax, -56(%rbp)
     movq -56(%rbp), %r8
     movq %r8, %r9
-    cmpq -64(%rbp), %r9
+    cmpq -72(%rbp), %r9
     sete %al
     movzbq %al, %r9
     movq %r9, %rax
@@ -13701,7 +13691,7 @@ str_split_char:
     movq -24(%rbp), %r13
     movq $0, %r12
     movq %r12, %rdi
-    movq -72(%rbp), %rsi
+    movq -64(%rbp), %rsi
     movq %r15, %rdx
     movq %r13, %rcx
     call String_slice
@@ -13720,7 +13710,7 @@ str_split_char:
     movq -32(%rbp), %r13
     movq $0, %r14
     movq %r14, %rdi
-    movq -72(%rbp), %rsi
+    movq -64(%rbp), %rsi
     movq %r12, %rdx
     movq %r13, %rcx
     call String_slice
@@ -13860,7 +13850,7 @@ str_trim:
 str_trim_end:
     pushq %rbp
     movq %rsp, %rbp
-    subq $80, %rsp
+    subq $88, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -13873,11 +13863,11 @@ str_trim_end:
     movq -48(%rbp), %rsi
     call String_len
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq -8(%rbp), %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     jmp .Lstr_trim_end_bb1
@@ -13899,15 +13889,15 @@ str_trim_end:
     movq $1, %r8
     movq %rax, %r9
     subq %r8, %r9
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r9, %rax
     movq %rax, -24(%rbp)
     movq -24(%rbp), %rdx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -32(%rbp)
     movq $0, %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %rcx
@@ -13985,7 +13975,7 @@ str_trim_end:
 str_trim_start:
     pushq %rbp
     movq %rsp, %rbp
-    subq $96, %rsp
+    subq $104, %rsp
     pushq %rbx
     pushq %r12
     pushq %r13
@@ -13998,11 +13988,11 @@ str_trim_start:
     movq -48(%rbp), %rsi
     call String_len
     movq %rax, %r12
-    movq -8(%rbp), %rax
+    leaq -8(%rbp), %rax
     movq %r12, %rax
     movq %rax, -8(%rbp)
     movq $0, %rdx
-    movq -16(%rbp), %rax
+    leaq -16(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -16(%rbp)
     jmp .Lstr_trim_start_bb1
@@ -14023,15 +14013,15 @@ str_trim_start:
     movq -16(%rbp), %rsi
     movq -48(%rbp), %r8
     addq %rsi, %r8
-    movq -24(%rbp), %rax
+    leaq -24(%rbp), %rax
     movq %r8, %rax
     movq %rax, -24(%rbp)
     movq -24(%rbp), %rdx
-    movq -32(%rbp), %rax
+    leaq -32(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -32(%rbp)
     movq $0, %rdx
-    movq -40(%rbp), %rax
+    leaq -40(%rbp), %rax
     movq %rdx, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %rcx
@@ -14108,170 +14098,225 @@ str_trim_start:
 
     .section .rodata
     .align 8
-.str_2: .asciz "main body"
-.str_7: .asciz "Vec insert index out of bounds"
-.str_12: .asciz "{"
-.str_10: .asciz ", "
-.str_9: .asciz "["
-.str_8: .asciz "Vec remove index out of bounds"
-.str_5: .asciz "Vec index out of bounds"
-.str_1: .asciz "cleanup B"
-.str_15: .asciz ""
-.str_11: .asciz "]"
-.str_6: .asciz "Vec is empty"
-.str_13: .asciz ": "
-.str_3: .asciz "\n"
-.str_17: .asciz "called unwrap on Err"
-.str_0: .asciz "cleanup A"
-.str_14: .asciz "}"
-.str_4: .asciz "Assertion failed\n"
 .str_16: .asciz "called unwrap on None"
+.str_9: .asciz "["
+.str_1: .asciz "cleanup B"
+.str_0: .asciz "cleanup A"
+.str_15: .asciz ""
+.str_6: .asciz "Vec is empty"
+.str_17: .asciz "called unwrap on Err"
+.str_4: .asciz "Assertion failed"
+.str_7: .asciz "Vec insert index out of bounds"
+.str_2: .asciz "main body"
+.str_5: .asciz "Vec index out of bounds"
+.str_11: .asciz "]"
+.str_3: .asciz "\n"
+.str_14: .asciz "}"
+.str_12: .asciz "{"
+.str_8: .asciz "Vec remove index out of bounds"
+.str_13: .asciz ": "
+.str_10: .asciz ", "
 
     # External runtime functions (linked from C runtime)
-    .globl p_simd_mul
-    .globl p_http_parse_request
-    .globl p_sti
-    .globl p_tensor_reshape
-    .globl p_cr3_write
-    .globl p_tensor_from_vec
-    .globl p_bool_to_str
-    .globl p_db_mem_close
-    .globl p_tensor_min
-    .globl p_allocator_create
-    .globl p_tensor_sub
-    .globl p_chan_close
-    .globl p_future_ready
-    .globl p_task_is_ready
-    .globl p_cli
-    .globl p_db_mem_query
-    .globl p_malloc
-    .globl p_chan_recv
-    .globl p_socket_listen
-    .globl p_argc
-    .globl p_hlt
-    .globl p_json_len
-    .globl p_argv
-    .globl p_executor_run_all
-    .globl p_simd_add
-    .globl p_executor_poll_all
-    .globl p_shared_alloc
-    .globl p_file_write
-    .globl p_float_to_str
-    .globl p_string_ends_with
-    .globl p_tensor_sum
-    .globl p_regex_match
-    .globl p_mutex_unlock
-    .globl p_tensor_add
-    .globl p_file_delete
-    .globl p_tensor_get
-    .globl p_json_at
-    .globl p_tensor_set
-    .globl p_free
-    .globl p_idt_set_entry
-    .globl p_chan_is_closed
-    .globl p_dl_call
-    .globl p_file_exists
-    .globl p_fs_read_async
-    .globl p_print_float
-    .globl p_tensor_dot
-    .globl p_tensor_size
-    .globl p_allocator_free
-    .globl p_print_bool
-    .globl p_char_to_str
-    .globl p_print_newline
-    .globl p_tensor_clone
-    .globl p_executor_spawn
-    .globl p_cr4_write
-    .globl p_alloc
-    .globl p_thread_spawn
-    .globl p_socket_recv_str
-    .globl p_file_size
-    .globl p_lidt
-    .globl p_allocator_stats
-    .globl p_invlpg
-    .globl p_tensor_max
-    .globl p_net_write
-    .globl p_atomic_store
-    .globl p_chan_create
-    .globl p_dl_sym
-    .globl p_chan_try_recv
-    .globl p_tensor_sigmoid
-    .globl p_rc_incr
-    .globl p_string_contains
-    .globl p_json_parse
-    .globl p_atomic_sub
-    .globl p_getenv
-    .globl p_simd_sum
-    .globl p_future_poll
-    .globl p_inb
-    .globl p_executor_new
-    .globl p_json_type
-    .globl p_tensor_shape
-    .globl p_net_read
-    .globl p_json_string
-    .globl p_page_map
-    .globl p_tensor_to_str
-    .globl p_socket_read
-    .globl p_tensor_scale
-    .globl p_chan_send
-    .globl p_task_poll
-    .globl p_net_connect
-    .globl p_phys_write64
-    .globl p_to_str
-    .globl p_json_pretty
-    .globl p_simd_div
-    .globl p_socket_close
-    .globl p_file_read
-    .globl p_page_unmap
-    .globl p_phys_read64
-    .globl p_outb
-    .globl p_string_replace
-    .globl p_cr4_read
-    .globl p_tensor_filled
-    .globl p_rc_decr
-    .globl p_atomic_load
-    .globl p_cr0_write
-    .globl p_tensor_softmax
-    .globl p_dl_close
-    .globl p_string_len
-    .globl p_print_int
-    .globl p_allocator_alloc
-    .globl p_simd_scale
-    .globl p_simd_to_str
-    .globl p_db_mem_exec
-    .globl p_json_dump
-    .globl p_cr3_read
-    .globl p_exit
-    .globl p_net_close
-    .globl p_atomic_add
     .globl p_tensor_transpose
-    .globl p_tensor_mul
-    .globl p_str_concat
-    .globl p_tensor_mean
-    .globl p_panic
+    .globl p_all_gather
+    .globl p_vec_clear
+    .globl p_tensor_from_vec
+    .globl p_string_ends_with
+    .globl p_tensor_shape
+    .globl p_print_float
+    .globl p_kv_cache_new
+    .globl p_socket_read
+    .globl p_file_read
+    .globl p_vec_len
+    .globl p_vec_remove
+    .globl p_cr4_write
+    .globl p_inb
+    .globl p_file_exists
+    .globl p_chan_send
+    .globl p_atomic_sub
+    .globl p_print_newline
     .globl p_mutex_lock
-    .globl p_db_mem_open
-    .globl p_tensor_ndim
-    .globl p_json_get
-    .globl p_string_find
-    .globl p_string_starts_with
-    .globl p_socket_write
-    .globl p_atomic_cas
+    .globl p_kv_cache_append
+    .globl p_tensor_max
+    .globl p_getenv
+    .globl p_executor_run_all
+    .globl p_print_bool
+    .globl p_checkpoint_begin
+    .globl p_tensor_add
+    .globl p_kv_cache_get
     .globl p_simd_sub
-    .globl p_simd_dot
-    .globl p_socket_accept
-    .globl p_tensor_zeros
+    .globl p_db_mem_exec
+    .globl p_thread_spawn
+    .globl p_string_replace
+    .globl p_tensor_reshape
     .globl p_task_poll_nonblocking
-    .globl p_tensor_to_json
-    .globl p_dl_open
-    .globl p_tensor_relu
-    .globl p_cr0_read
-    .globl p_tensor_matmul
-    .globl p_http_build_response
-    .globl p_mutex_init
-    .globl p_system
-    .globl p_tensor_ones
-    .globl p_print_str
-    .globl p_file_append
+    .globl p_tensor_min
     .globl p_simd_from_vec
+    .globl p_cr3_read
+    .globl p_phys_write64
+    .globl p_rc_decr
+    .globl p_chan_try_recv
+    .globl p_idt_set_entry
+    .globl p_net_connect
+    .globl p_argv
+    .globl p_vec_capacity
+    .globl p_vec_last
+    .globl p_allocator_free
+    .globl p_db_mem_open
+    .globl p_tensor_mean
+    .globl p_file_size
+    .globl p_invlpg
+    .globl p_json_dump
+    .globl p_find_quant_params
+    .globl p_tensor_matmul
+    .globl p_bool_to_str
+    .globl p_tensor_ndim
+    .globl p_simd_mul
+    .globl p_str_to_float
+    .globl p_tensor_dot
+    .globl p_atomic_add
+    .globl p_chan_close
+    .globl p_vec_contains
+    .globl p_vec_resize
+    .globl p_checkpoint_end
+    .globl p_rc_incr
+    .globl p_page_unmap
+    .globl p_alloc
+    .globl p_kv_cache_clear
+    .globl p_db_mem_close
+    .globl p_task_poll
+    .globl p_executor_poll_all
+    .globl p_all_reduce
+    .globl p_dl_sym
+    .globl p_vec_push_str
+    .globl p_executor_spawn
+    .globl p_malloc
+    .globl p_atomic_cas
+    .globl p_clock_now_ms
+    .globl p_tensor_to_str
+    .globl p_tls_get
+    .globl p_string_len
+    .globl p_socket_listen
+    .globl p_vec_extend
+    .globl p_vec_truncate
+    .globl p_vec_new
+    .globl p_allocator_alloc
+    .globl p_vec_is_empty
+    .globl p_db_mem_query
+    .globl p_vec_clone
+    .globl p_tensor_sigmoid
+    .globl p_json_type
+    .globl p_tensor_relu
+    .globl p_tls_create
+    .globl p_argc
+    .globl p_free
+    .globl p_file_append
+    .globl p_simd_dot
+    .globl p_dl_call
+    .globl p_to_str
+    .globl p_net_close
+    .globl p_cli
+    .globl p_cr0_read
     .globl p_executor_block_on
+    .globl p_http_parse_request
+    .globl p_net_write
+    .globl p_simd_sum
+    .globl p_tensor_ones
+    .globl p_fs_read_async
+    .globl p_dp_noise
+    .globl p_mutex_init
+    .globl p_grad_get
+    .globl p_tensor_to_json
+    .globl p_tls_set
+    .globl p_phys_read64
+    .globl p_panic
+    .globl p_string_contains
+    .globl p_sti
+    .globl p_vec_reverse
+    .globl p_kv_cache_len
+    .globl p_tensor_get
+    .globl p_file_delete
+    .globl p_clock_now
+    .globl p_json_at
+    .globl p_char_to_str
+    .globl p_tensor_sum
+    .globl p_str_concat
+    .globl p_string_find
+    .globl p_kv_cache_evict
+    .globl p_outb
+    .globl p_print_str
+    .globl p_send_tensor
+    .globl p_cr4_read
+    .globl p_dropout
+    .globl p_executor_new
+    .globl p_hlt
+    .globl p_shared_alloc
+    .globl p_chan_create
+    .globl p_exit
+    .globl p_simd_div
+    .globl p_tensor_clone
+    .globl p_chan_recv
+    .globl p_chan_is_closed
+    .globl p_json_get
+    .globl p_json_pretty
+    .globl p_vec_push
+    .globl p_float_to_str
+    .globl p_json_len
+    .globl p_tensor_zeros
+    .globl p_gaussian_noise
+    .globl p_socket_close
+    .globl p_vec_insert
+    .globl p_broadcast
+    .globl p_tensor_scale
+    .globl p_vec_first
+    .globl p_autograd_end
+    .globl p_grad_zero
+    .globl p_tensor_sub
+    .globl p_simd_add
+    .globl p_future_ready
+    .globl p_vec_pop
+    .globl p_tensor_size
+    .globl p_string_starts_with
+    .globl p_tensor_set
+    .globl p_autograd_backward
+    .globl p_simd_to_str
+    .globl p_atomic_load
+    .globl p_tensor_filled
+    .globl p_tensor_mul
+    .globl p_simd_scale
+    .globl p_allocator_create
+    .globl p_page_map
+    .globl p_dequantize_q8
+    .globl p_cr3_write
+    .globl p_json_parse
+    .globl p_scatter
+    .globl p_system
+    .globl p_lidt
+    .globl p_vec_set
+    .globl p_net_read
+    .globl p_autograd_begin
+    .globl p_recv_tensor
+    .globl p_qmatmul
+    .globl p_future_poll
+    .globl p_task_is_ready
+    .globl p_http_build_response
+    .globl p_clock_now_us
+    .globl p_vec_new_with
+    .globl p_allocator_stats
+    .globl p_tensor_softmax
+    .globl p_file_write
+    .globl p_regex_match
+    .globl p_cr0_write
+    .globl p_socket_write
+    .globl p_quantize_q8
+    .globl p_socket_recv_str
+    .globl p_dl_open
+    .globl p_print_int
+    .globl p_socket_accept
+    .globl p_vec_get
+    .globl p_dl_close
+    .globl p_vec_sort
+    .globl p_json_string
+    .globl p_mutex_unlock
+    .globl p_atomic_store

@@ -370,3 +370,607 @@ impl Set {
         return result;
     }
 }
+
+// ─── HashSet (hash-based set for i64 keys, O(1) lookup) ────────────────
+//
+// Uses an open-addressing hash table with integer keys.
+// Keys are i64 values (not string pointers like core.fd's HashMap).
+// For ordered iteration, use BTreeSet instead.
+//
+// Internal layout (heap block):
+//   offset  0: keys_ptr  (*i64) — array of keys (0 = empty, -1 = tombstone)
+//   offset  8: len        (i64)  — number of live entries
+//   offset 16: capacity   (i64)  — size of keys array
+
+// Integer hash function (FNV-1a variant for i64).
+@wrapping fn int_hash(val: i64) -> i64 {
+    var hash: i64 = 0x811c9dc5;
+    var i = 0;
+    while i < 8 {
+        hash = hash ^ ((val >> (i * 8)) & 0xFF);
+        hash = (hash * 0x01000193) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    if hash < 0 { return -hash; }
+    return hash;
+}
+
+pub struct HashSet {
+    pub table: i64,  // pointer to hash table block
+}
+
+impl HashSet {
+    /// Create a new empty hash set.
+    pub fn new() -> HashSet {
+        var ptr: i64 = p_malloc(24);
+        var p0: *mut i64 = ptr;
+        var p8: *mut i64 = ptr + 8;
+        var p16: *mut i64 = ptr + 16;
+        unsafe {
+            *p0 = 0;
+            *p8 = 0;
+            *p16 = 0;
+        }
+        return HashSet { table: ptr };
+    }
+
+    // Find the slot index for a key. Returns index if found, or first empty/tombstone slot.
+    fn find_slot(self: HashSet, key: i64) -> i64 {
+        var cap_ptr: *mut i64 = self.table + 16;
+        var keys_ptr_ptr: *mut i64 = self.table;
+        var capacity: i64 = 0;
+        unsafe { capacity = *cap_ptr; }
+        if capacity == 0 { return 0; }
+        var keys: i64 = 0;
+        unsafe { keys = *keys_ptr_ptr; }
+        var hash_val: i64 = int_hash(key);
+        var idx: i64 = hash_val % capacity;
+        var first_tombstone: i64 = -1;
+        var i: i64 = 0;
+        while i < capacity {
+            var key_addr: i64 = keys + idx * 8;
+            var key_ptr: *mut i64 = key_addr;
+            var slot_key: i64 = 0;
+            unsafe { slot_key = *key_ptr; }
+            if slot_key == 0 {
+                if first_tombstone >= 0 { return first_tombstone; }
+                return idx;
+            }
+            if slot_key == -1 {
+                if first_tombstone < 0 { first_tombstone = idx; }
+            } else if slot_key == key {
+                return idx;
+            }
+            idx = idx + 1;
+            if idx >= capacity { idx = 0; }
+            i = i + 1;
+        }
+        if first_tombstone >= 0 { return first_tombstone; }
+        return 0;
+    }
+
+    // Grow the hash table when load factor exceeds 0.75.
+    fn grow(self: HashSet) {
+        var cap_ptr: *mut i64 = self.table + 16;
+        var keys_ptr_ptr: *mut i64 = self.table;
+        var len_ptr: *mut i64 = self.table + 8;
+
+        var old_capacity: i64 = 0;
+        var old_keys: i64 = 0;
+        unsafe {
+            old_capacity = *cap_ptr;
+            old_keys = *keys_ptr_ptr;
+        }
+
+        var new_capacity: i64 = 8;
+        if old_capacity > 0 { new_capacity = old_capacity * 2; }
+
+        var new_keys: i64 = p_malloc(new_capacity * 8);
+        var i: i64 = 0;
+        while i < new_capacity {
+            var kaddr: i64 = new_keys + i * 8;
+            var kptr: *mut i64 = kaddr;
+            unsafe { *kptr = 0; }
+            i = i + 1;
+        }
+
+        // Rehash all entries
+        var count: i64 = 0;
+        var old_i: i64 = 0;
+        while old_i < old_capacity {
+            var old_kaddr: i64 = old_keys + old_i * 8;
+            var old_kptr: *mut i64 = old_kaddr;
+            var old_key: i64 = 0;
+            unsafe { old_key = *old_kptr; }
+            if old_key != 0 && old_key != -1 {
+                var hash_val: i64 = int_hash(old_key);
+                var new_idx: i64 = hash_val % new_capacity;
+                while true {
+                    var nkaddr: i64 = new_keys + new_idx * 8;
+                    var nkptr: *mut i64 = nkaddr;
+                    var slot: i64 = 0;
+                    unsafe { slot = *nkptr; }
+                    if slot == 0 {
+                        unsafe { *nkptr = old_key; }
+                        break;
+                    }
+                    new_idx = new_idx + 1;
+                    if new_idx >= new_capacity { new_idx = 0; }
+                }
+                count = count + 1;
+            }
+            old_i = old_i + 1;
+        }
+
+        unsafe {
+            *keys_ptr_ptr = new_keys;
+            *cap_ptr = new_capacity;
+            *len_ptr = count;
+        }
+    }
+
+    /// Insert a value into the set (no-op if already present).
+    pub fn insert(self: HashSet, value: i64) -> void {
+        var len_ptr: *mut i64 = self.table + 8;
+        var cap_ptr: *mut i64 = self.table + 16;
+        var len: i64 = 0;
+        var cap: i64 = 0;
+        unsafe {
+            len = *len_ptr;
+            cap = *cap_ptr;
+        }
+        // Grow if load factor > 0.75 or no capacity
+        if cap == 0 || (len * 4 > cap * 3) {
+            self.grow();
+            unsafe {
+                cap = *cap_ptr;
+            }
+        }
+        var idx: i64 = self.find_slot(value);
+        var keys_ptr_ptr: *mut i64 = self.table;
+        var keys: i64 = 0;
+        unsafe { keys = *keys_ptr_ptr; }
+        var key_addr: i64 = keys + idx * 8;
+        var key_ptr: *mut i64 = key_addr;
+        var slot_key: i64 = 0;
+        unsafe { slot_key = *key_ptr; }
+        if slot_key != value {
+            unsafe { *key_ptr = value; }
+            unsafe { *len_ptr = len + 1; }
+        }
+    }
+
+    /// Check if the set contains a value.
+    pub fn contains(self: HashSet, value: i64) -> bool {
+        var cap_ptr: *mut i64 = self.table + 16;
+        var cap: i64 = 0;
+        unsafe { cap = *cap_ptr; }
+        if cap == 0 { return false; }
+        var idx: i64 = self.find_slot(value);
+        var keys_ptr_ptr: *mut i64 = self.table;
+        var keys: i64 = 0;
+        unsafe { keys = *keys_ptr_ptr; }
+        var key_addr: i64 = keys + idx * 8;
+        var key_ptr: *mut i64 = key_addr;
+        var slot_key: i64 = 0;
+        unsafe { slot_key = *key_ptr; }
+        return slot_key == value;
+    }
+
+    /// Remove a value from the set. Returns true if it was present.
+    pub fn remove(self: HashSet, value: i64) -> bool {
+        if !self.contains(value) { return false; }
+        var idx: i64 = self.find_slot(value);
+        var keys_ptr_ptr: *mut i64 = self.table;
+        var keys: i64 = 0;
+        unsafe { keys = *keys_ptr_ptr; }
+        var key_addr: i64 = keys + idx * 8;
+        var key_ptr: *mut i64 = key_addr;
+        unsafe { *key_ptr = -1; }  // tombstone
+        var len_ptr: *mut i64 = self.table + 8;
+        var len: i64 = 0;
+        unsafe { len = *len_ptr; }
+        unsafe { *len_ptr = len - 1; }
+        return true;
+    }
+
+    /// Get the number of elements.
+    pub fn len(self: HashSet) -> i64 {
+        var len_ptr: *mut i64 = self.table + 8;
+        var len: i64 = 0;
+        unsafe { len = *len_ptr; }
+        return len;
+    }
+
+    /// Check if the set is empty.
+    pub fn is_empty(self: HashSet) -> bool {
+        return self.len() == 0;
+    }
+
+    /// Clear the set.
+    pub fn clear(self: HashSet) -> void {
+        var keys_ptr_ptr: *mut i64 = self.table;
+        var len_ptr: *mut i64 = self.table + 8;
+        var cap_ptr: *mut i64 = self.table + 16;
+        var cap: i64 = 0;
+        var keys: i64 = 0;
+        unsafe {
+            cap = *cap_ptr;
+            keys = *keys_ptr_ptr;
+        }
+        if cap > 0 && keys != 0 {
+            var i: i64 = 0;
+            while i < cap {
+                var kaddr: i64 = keys + i * 8;
+                var kptr: *mut i64 = kaddr;
+                unsafe { *kptr = 0; }
+                i = i + 1;
+            }
+        }
+        unsafe { *len_ptr = 0; }
+    }
+
+    /// Convert to a Vec of all elements.
+    pub fn to_vec(self: HashSet) -> Vec {
+        var result = Vec::new();
+        var cap_ptr: *mut i64 = self.table + 16;
+        var keys_ptr_ptr: *mut i64 = self.table;
+        var cap: i64 = 0;
+        var keys: i64 = 0;
+        unsafe {
+            cap = *cap_ptr;
+            keys = *keys_ptr_ptr;
+        }
+        if cap == 0 || keys == 0 { return result; }
+        var i: i64 = 0;
+        while i < cap {
+            var kaddr: i64 = keys + i * 8;
+            var kptr: *mut i64 = kaddr;
+            var slot: i64 = 0;
+            unsafe { slot = *kptr; }
+            if slot != 0 && slot != -1 {
+                result.push(slot);
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    /// Create a hash set from a Vec.
+    pub fn from_vec(v: Vec) -> HashSet {
+        var s = HashSet::new();
+        var i = 0;
+        while i < v.len() {
+            s.insert(v.get(i));
+            i = i + 1;
+        }
+        return s;
+    }
+
+    /// Union: returns a new set with elements from both sets.
+    pub fn union(a: HashSet, b: HashSet) -> HashSet {
+        var result = HashSet::new();
+        var a_keys = a.to_vec();
+        var i = 0;
+        while i < a_keys.len() {
+            result.insert(a_keys.get(i));
+            i = i + 1;
+        }
+        var b_keys = b.to_vec();
+        var j = 0;
+        while j < b_keys.len() {
+            result.insert(b_keys.get(j));
+            j = j + 1;
+        }
+        return result;
+    }
+
+    /// Intersection: returns a new set with elements in both sets.
+    pub fn intersection(a: HashSet, b: HashSet) -> HashSet {
+        var result = HashSet::new();
+        var a_keys = a.to_vec();
+        var i = 0;
+        while i < a_keys.len() {
+            if b.contains(a_keys.get(i)) {
+                result.insert(a_keys.get(i));
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    /// Difference: returns a new set with elements in a but not in b.
+    pub fn difference(a: HashSet, b: HashSet) -> HashSet {
+        var result = HashSet::new();
+        var a_keys = a.to_vec();
+        var i = 0;
+        while i < a_keys.len() {
+            if !b.contains(a_keys.get(i)) {
+                result.insert(a_keys.get(i));
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+}
+
+// ─── BTreeMap (ordered key-value map, sorted by key) ───────────────────
+//
+// Uses a sorted Vec of keys and a parallel Vec of values.
+// O(log n) lookup via binary search, O(n) insert/remove.
+// For O(1) lookup (unordered), use HashMap from core.fd instead.
+// Keys are i64, values are i64.
+
+pub struct BTreeMap {
+    pub keys: Vec,    // sorted keys
+    pub values: Vec,  // parallel values (values[i] corresponds to keys[i])
+}
+
+impl BTreeMap {
+    /// Create a new empty BTreeMap.
+    pub fn new() -> BTreeMap {
+        return BTreeMap { keys: Vec::new(), values: Vec::new() };
+    }
+
+    /// Binary search for a key. Returns index if found, or -(insertion_point + 1) if not.
+    fn binary_search(self: BTreeMap, key: i64) -> i64 {
+        var lo = 0;
+        var hi = self.keys.len() - 1;
+        while lo <= hi {
+            var mid = lo + (hi - lo) / 2;
+            var mid_key = self.keys.get(mid);
+            if mid_key == key {
+                return mid;
+            }
+            if mid_key < key {
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return -(lo + 1);  // not found: return -(insertion_point + 1)
+    }
+
+    /// Insert a key-value pair. If the key exists, updates the value.
+    pub fn insert(self: BTreeMap, key: i64, value: i64) -> void {
+        var idx = self.binary_search(key);
+        if idx >= 0 {
+            // Key exists — update value
+            self.values.set(idx, value);
+        } else {
+            // Key doesn't exist — insert at the right position
+            var insert_pos = -(idx + 1);
+            self.keys.insert(insert_pos, key);
+            self.values.insert(insert_pos, value);
+        }
+    }
+
+    /// Get the value for a key. Returns 0 if not found.
+    pub fn get(self: BTreeMap, key: i64) -> i64 {
+        var idx = self.binary_search(key);
+        if idx >= 0 {
+            return self.values.get(idx);
+        }
+        return 0;
+    }
+
+    /// Get the value for a key, or a default if not found.
+    pub fn get_or(self: BTreeMap, key: i64, default: i64) -> i64 {
+        var idx = self.binary_search(key);
+        if idx >= 0 {
+            return self.values.get(idx);
+        }
+        return default;
+    }
+
+    /// Check if the key exists.
+    pub fn contains(self: BTreeMap, key: i64) -> bool {
+        return self.binary_search(key) >= 0;
+    }
+
+    /// Remove a key-value pair. Returns true if the key was present.
+    pub fn remove(self: BTreeMap, key: i64) -> bool {
+        var idx = self.binary_search(key);
+        if idx >= 0 {
+            self.keys.remove(idx);
+            self.values.remove(idx);
+            return true;
+        }
+        return false;
+    }
+
+    /// Get the number of entries.
+    pub fn len(self: BTreeMap) -> i64 {
+        return self.keys.len();
+    }
+
+    /// Check if the map is empty.
+    pub fn is_empty(self: BTreeMap) -> bool {
+        return self.keys.is_empty();
+    }
+
+    /// Clear the map.
+    pub fn clear(self: BTreeMap) -> void {
+        self.keys.clear();
+        self.values.clear();
+    }
+
+    /// Get all keys in sorted order.
+    pub fn keys(self: BTreeMap) -> Vec {
+        return self.keys;
+    }
+
+    /// Get all values (in key order).
+    pub fn values(self: BTreeMap) -> Vec {
+        return self.values;
+    }
+
+    /// Get the first (smallest) key. Returns 0 if empty.
+    pub fn first_key(self: BTreeMap) -> i64 {
+        if self.keys.is_empty() { return 0; }
+        return self.keys.get(0);
+    }
+
+    /// Get the last (largest) key. Returns 0 if empty.
+    pub fn last_key(self: BTreeMap) -> i64 {
+        if self.keys.is_empty() { return 0; }
+        return self.keys.get(self.keys.len() - 1);
+    }
+
+    /// Create a BTreeMap from a Vec of keys and a Vec of values.
+    /// Inserts all pairs (does not assume sorted input).
+    pub fn from_vecs(ks: Vec, vs: Vec) -> BTreeMap {
+        var m = BTreeMap::new();
+        var i = 0;
+        while i < ks.len() {
+            m.insert(ks.get(i), vs.get(i));
+            i = i + 1;
+        }
+        return m;
+    }
+}
+
+// ─── BTreeSet (ordered set, sorted by key) ─────────────────────────────
+//
+// Uses a sorted Vec of keys with binary search.
+// O(log n) lookup, O(n) insert/remove.
+// For O(1) lookup (unordered), use HashSet instead.
+
+pub struct BTreeSet {
+    pub data: Vec,  // sorted keys
+}
+
+impl BTreeSet {
+    /// Create a new empty BTreeSet.
+    pub fn new() -> BTreeSet {
+        return BTreeSet { data: Vec::new() };
+    }
+
+    /// Binary search for a key. Returns index if found, or -(insertion_point + 1) if not.
+    fn binary_search(self: BTreeSet, key: i64) -> i64 {
+        var lo = 0;
+        var hi = self.data.len() - 1;
+        while lo <= hi {
+            var mid = lo + (hi - lo) / 2;
+            var mid_key = self.data.get(mid);
+            if mid_key == key {
+                return mid;
+            }
+            if mid_key < key {
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return -(lo + 1);
+    }
+
+    /// Insert a value into the set (no-op if already present).
+    pub fn insert(self: BTreeSet, value: i64) -> void {
+        var idx = self.binary_search(value);
+        if idx < 0 {
+            var insert_pos = -(idx + 1);
+            self.data.insert(insert_pos, value);
+        }
+    }
+
+    /// Check if the set contains a value.
+    pub fn contains(self: BTreeSet, value: i64) -> bool {
+        return self.binary_search(value) >= 0;
+    }
+
+    /// Remove a value from the set. Returns true if it was present.
+    pub fn remove(self: BTreeSet, value: i64) -> bool {
+        var idx = self.binary_search(value);
+        if idx >= 0 {
+            self.data.remove(idx);
+            return true;
+        }
+        return false;
+    }
+
+    /// Get the number of elements.
+    pub fn len(self: BTreeSet) -> i64 {
+        return self.data.len();
+    }
+
+    /// Check if the set is empty.
+    pub fn is_empty(self: BTreeSet) -> bool {
+        return self.data.is_empty();
+    }
+
+    /// Clear the set.
+    pub fn clear(self: BTreeSet) -> void {
+        self.data.clear();
+    }
+
+    /// Convert to a Vec (sorted order).
+    pub fn to_vec(self: BTreeSet) -> Vec {
+        return self.data;
+    }
+
+    /// Create a BTreeSet from a Vec.
+    pub fn from_vec(v: Vec) -> BTreeSet {
+        var s = BTreeSet::new();
+        var i = 0;
+        while i < v.len() {
+            s.insert(v.get(i));
+            i = i + 1;
+        }
+        return s;
+    }
+
+    /// Get the first (smallest) element. Returns 0 if empty.
+    pub fn first(self: BTreeSet) -> i64 {
+        if self.data.is_empty() { return 0; }
+        return self.data.get(0);
+    }
+
+    /// Get the last (largest) element. Returns 0 if empty.
+    pub fn last(self: BTreeSet) -> i64 {
+        if self.data.is_empty() { return 0; }
+        return self.data.get(self.data.len() - 1);
+    }
+
+    /// Union: returns a new set with elements from both sets.
+    pub fn union(a: BTreeSet, b: BTreeSet) -> BTreeSet {
+        var result = BTreeSet::new();
+        var i = 0;
+        while i < a.data.len() {
+            result.insert(a.data.get(i));
+            i = i + 1;
+        }
+        var j = 0;
+        while j < b.data.len() {
+            result.insert(b.data.get(j));
+            j = j + 1;
+        }
+        return result;
+    }
+
+    /// Intersection: returns a new set with elements in both sets.
+    pub fn intersection(a: BTreeSet, b: BTreeSet) -> BTreeSet {
+        var result = BTreeSet::new();
+        var i = 0;
+        while i < a.data.len() {
+            if b.contains(a.data.get(i)) {
+                result.insert(a.data.get(i));
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    /// Difference: returns a new set with elements in a but not in b.
+    pub fn difference(a: BTreeSet, b: BTreeSet) -> BTreeSet {
+        var result = BTreeSet::new();
+        var i = 0;
+        while i < a.data.len() {
+            if !b.contains(a.data.get(i)) {
+                result.insert(a.data.get(i));
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+}

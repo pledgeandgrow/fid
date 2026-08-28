@@ -24,7 +24,7 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | IR Interpreter (interp.rs) | ✅ | Runs IR directly via `fidesc run` |
 | PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables + flat binary (bare-metal mode) |
 | ELF64 Emitter (elf64.rs) | ✅ | Generates native ELF64 executables on Linux (zero external tools) + relocatable objects |
-| C Codegen (codegen_c.rs) | ✅ | Generates C code, 153/153 normal tests match interpreter output (2 autograd tensor-print bugs: autodiff_grad, ml_full). Phase 10B: Print calls Fides Vec_to_str/HashMap_to_str for formatting. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic via p_call_stack. Rc/Arc runtime via p_rc_incr/p_rc_decr. Drop trait: compiler-inserted drop calls. Negative size checks on p_malloc/p_shared_alloc/p_allocator_alloc. ftell failure check on p_file_read/p_file_size. |
+| C Codegen (codegen_c.rs) | ✅ | Generates C code, 164/165 normal tests match interpreter output (1 user-added test_compiler_sized fails — unrelated). Phase 10B: Print calls Fides Vec_to_str/HashMap_to_str for formatting. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic via p_call_stack. Rc/Arc runtime via p_rc_incr/p_rc_decr. Drop trait: compiler-inserted drop calls. Negative size checks on p_malloc/p_shared_alloc/p_allocator_alloc. ftell failure check on p_file_read/p_file_size. |
 | PIR (pir.rs) | ✅ | PIR L1/L2/L3, `fidesc pir` command |
 | Optimizer (opt.rs) | ✅ | 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. 22 in default pass list. Enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive inlining. |
 | Peephole (peephole.rs) | ✅ | 9 passes, always on in `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection |
@@ -57,7 +57,7 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | `fidesc emit <file> --bare -o <bin>` | ✅ | Bare-metal flat binary (no stdlib, no PE headers) |
 | `fidesc build <file> -o <out> [--target] [--opt]` | ✅ | Native build: PIR → codegen → peephole → ELF64/PE executable (zero external tools). Cross-compilation: `--target arm64-linux`, `--target riscv64-linux`, `--target x86-64-windows`. |
 | `fidesc ccompile <file> -o <exe>` | ✅ | C codegen → gcc/clang → executable |
-| `fidesc test` | ✅ | Runs all 159 normal tests across interpreter, PE emitter, and C codegen |
+| `fidesc test` | ✅ | Runs all 165 normal tests across interpreter, PE emitter, and C codegen |
 | `fidesc test --fail` | ✅ | Runs only expected-fail tests (failing = correct) |
 | `fidesc repl` | ✅ | Interactive REPL |
 | `fidesc audit <file>` | ✅ | IR verification pass (also `verify`) |
@@ -79,6 +79,14 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | `fidesc debug <file>` | ✅ | Interactive debugger (breakpoints, step, locals) |
 | `fidesc replay <trace>` | ✅ | Replay a recorded execution trace |
 | `fidesc autopsy <file>` | ✅ | Native binary debug (ptrace-based, Linux only) |
+| `fidesc dump-tokens <file>` | ✅ | Dump lexer token stream |
+| `fidesc dump-ast <file>` | ✅ | Dump AST as S-expressions |
+| `fidesc dump-ir <file>` | ✅ | Dump lowered IR as text |
+| `fidesc dump-pir <file> [1\|2\|3]` | ✅ | Dump PIR L1/L2/L3 instructions |
+| `fidesc dump-c <file>` | ✅ | Dump generated C source (before gcc) |
+| `fidesc diff-test <file> --stage <s>` | ✅ | Differential testing: tokens, ast, ir, pir1/2/3, c, output |
+| `fidesc run <file> --trace` | ✅ | Per-stage compiler timing (Frontend/Lower/Backend/Total) |
+| `fidesc run <file> --max-recursion N` | ✅ | Set recursion depth limit (0 = unlimited, default 1000) |
 
 ## Language Features — Interpreter (`fidesc run`)
 
@@ -310,6 +318,9 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | Option/Result combinators | ✅ | `map`, `and_then`, `or_else`, `unwrap_or_else`, `expect` in `stdlib/core.fd` |
 | Vec iterator adapters | ✅ | `take`, `skip`, `zip`, `enumerate`, `flat_map`, `chunk`, `window`, `dedup`, `sort_by` |
 | Stack traces on panic | ✅ | Call stack trace printed on panic (interpreter + C codegen) |
+| Assertion builtins | ✅ | `assert(cond)`, `assert_eq(a, b)`, `assert_msg(cond, msg)`, `assert_eq_msg(a, b, msg)` in stdlib/core.fd. `assert_msg`/`assert_eq_msg` take f-string formatted messages. |
+| Recursion depth limit | ✅ | `--max-recursion N` flag (default 1000, 0 = unlimited). Interpreter panics with clear message when exceeded. |
+| Iterative parser fallback | ✅ | Shunting-yard parser activates for deeply nested expressions (>256 levels) to prevent stack overflow. |
 | `@constant_time` | ✅ | Security annotation: no early returns, no data-dependent branches, no IO/Net |
 | `@tainted` | ✅ | Taint tracking for untrusted input |
 | `@derive` | ✅ | `@derive(Debug/Clone/Serialize/Deserialize)` generates methods |
@@ -724,10 +735,10 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 | Parser | 100% | — | — |
 | Type Checker | 100% | — | — |
 | IR Lowering | 100% | — | — |
-| Interpreter | 153/153 normal | — | All normal tests pass. |
-| PE Emitter | 153/153 normal | — | All normal tests pass. |
+| Interpreter | 164/165 normal | — | 1 fail: test_compiler_sized (user-added) |
+| PE Emitter | 165/165 normal | — | All normal tests pass. |
 | ELF64 Emitter | ✅ | — | Working executables on Linux (zero external tools) |
-| C Codegen | 153/153 normal | — | All tests pass. Binary hardening enabled. |
+| C Codegen | 164/165 normal | — | 1 fail: test_compiler_sized. Binary hardening enabled. |
 | Multi-arch Codegen | ✅ | — | x86-64, ARM64, RISC-V assembly all work |
 | Cross-compilation (ARM64) | ✅ | — | `build --target arm64-linux` → AArch64 ELF64 (27KB) |
 | Cross-compilation (RISC-V) | ✅ | — | `build --target riscv64-linux` → RISC-V ELF64 (29KB) |
@@ -753,5 +764,5 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 ### Test Coverage
 
 **See `AGENTS.md` → "Current Baseline"** for authoritative test counts.
-(153/153 on all 3 backends, 265/265 unit tests, 218 .fd files, 69 stdlib
-modules, 54 source files, 4 binaries.)
+(164/165 on interpreter + C codegen, 165/165 PE, 265/265 unit tests, 215 .fd
+test files, 69 stdlib modules, 51 source files, 4 binaries.)

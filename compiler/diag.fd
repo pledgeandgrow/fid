@@ -1,0 +1,659 @@
+// Fides compiler diagnostic system — SH-6.2 rewrite of diag.rs
+//
+// Provides structured error/warning/note output with:
+// - Source context display (shows the offending line with a caret ^^^)
+// - Color output (red errors, yellow warnings, cyan notes/help)
+// - Error codes (E001, E002, ...)
+// - Help/suggestion text
+// - File path in error location
+//
+// Design goals:
+// - Zero external dependencies (no annotate-snippets crate)
+// - Works with or without color (auto-detects TTY)
+// - Backwards compatible: Diag can be converted to/from String
+
+module compiler::diag;
+
+use vec;
+
+// ─── Color control ──────────────────────────────────────────────────────
+
+// Fides does not support module-level mutable state (no `var` at module scope).
+// Color preference is passed as a parameter to render functions.
+// The caller is responsible for tracking color preference.
+// In the Rust compiler, this was a global AtomicBool; here it's a parameter.
+
+// ─── Severity ───────────────────────────────────────────────────────────
+
+// Severity of a diagnostic. Uses i64 tags: 0=Error, 1=Warning, 2=Note, 3=Help.
+pub enum Severity {
+    Error,
+    Warning,
+    Note,
+    Help,
+}
+
+impl Severity {
+    pub fn label(self: Severity) -> str {
+        match self {
+            Severity::Error => { return "error"; }
+            Severity::Warning => { return "warning"; }
+            Severity::Note => { return "note"; }
+            Severity::Help => { return "help"; }
+        }
+    }
+
+    pub fn color_code(self: Severity) -> str {
+        match self {
+            Severity::Error => { return "\x1b[31m"; }
+            Severity::Warning => { return "\x1b[33m"; }
+            Severity::Note => { return "\x1b[36m"; }
+            Severity::Help => { return "\x1b[36m"; }
+        }
+    }
+
+    pub fn is_error(self: Severity) -> bool {
+        match self {
+            Severity::Error => { return true; }
+            _ => { return false; }
+        }
+    }
+}
+
+// Severity constructor functions (for use when enum names from imported
+// modules aren't visible to the parser — Fides parser limitation).
+pub fn Severity_error() -> Severity { return Severity::Error; }
+pub fn Severity_warning() -> Severity { return Severity::Warning; }
+pub fn Severity_note() -> Severity { return Severity::Note; }
+pub fn Severity_help() -> Severity { return Severity::Help; }
+
+// ─── Error codes ────────────────────────────────────────────────────────
+
+// Error codes for common diagnostic categories.
+// Format: E### (zero-padded to 3 digits).
+pub enum ErrCode {
+    // Lexer errors (E001-E019)
+    UnterminatedString,
+    UnterminatedFString,
+    UnknownEscape,
+    UnexpectedChar,
+
+    // Parser errors (E020-E039)
+    ExpectedToken,
+    ExpectedIdent,
+    ExpectedType,
+    InvalidAssignmentTarget,
+
+    // Type errors (E040-E079)
+    UndefinedVariable,
+    UndefinedFunction,
+    UndefinedStruct,
+    UndefinedField,
+    TypeMismatch,
+    IfConditionNotBool,
+    ArgCountMismatch,
+    MissingReturn,
+    InitBeforeAssign,
+    NotLinear,
+    LinearConsumed,
+    LinearInLoop,
+
+    // Borrow checker (E080-E089)
+    BorrowConflict,
+    MutableBorrowConflict,
+
+    // Safety/contract errors (E090-E109)
+    CapabilityDenied,
+    SandboxViolation,
+    ConservationViolation,
+    GasExceeded,
+    NotCrashfree,
+    ContractViolation,
+    MedicalViolation,
+
+    // Effect errors (E110-E119)
+    EffectMismatch,
+
+    // Misc (E120+)
+    NoMain,
+    Internal,
+    Custom,
+}
+
+impl ErrCode {
+    pub fn code(self: ErrCode) -> str {
+        match self {
+            // Lexer
+            ErrCode::UnterminatedString => { return "E001"; }
+            ErrCode::UnterminatedFString => { return "E002"; }
+            ErrCode::UnknownEscape => { return "E003"; }
+            ErrCode::UnexpectedChar => { return "E004"; }
+            // Parser
+            ErrCode::ExpectedToken => { return "E020"; }
+            ErrCode::ExpectedIdent => { return "E021"; }
+            ErrCode::ExpectedType => { return "E022"; }
+            ErrCode::InvalidAssignmentTarget => { return "E023"; }
+            // Type
+            ErrCode::UndefinedVariable => { return "E040"; }
+            ErrCode::UndefinedFunction => { return "E041"; }
+            ErrCode::UndefinedStruct => { return "E042"; }
+            ErrCode::UndefinedField => { return "E043"; }
+            ErrCode::TypeMismatch => { return "E044"; }
+            ErrCode::IfConditionNotBool => { return "E045"; }
+            ErrCode::ArgCountMismatch => { return "E046"; }
+            ErrCode::MissingReturn => { return "E047"; }
+            ErrCode::InitBeforeAssign => { return "E048"; }
+            ErrCode::NotLinear => { return "E049"; }
+            ErrCode::LinearConsumed => { return "E050"; }
+            ErrCode::LinearInLoop => { return "E051"; }
+            // Borrow
+            ErrCode::BorrowConflict => { return "E080"; }
+            ErrCode::MutableBorrowConflict => { return "E081"; }
+            // Safety
+            ErrCode::CapabilityDenied => { return "E090"; }
+            ErrCode::SandboxViolation => { return "E091"; }
+            ErrCode::ConservationViolation => { return "E092"; }
+            ErrCode::GasExceeded => { return "E093"; }
+            ErrCode::NotCrashfree => { return "E094"; }
+            ErrCode::ContractViolation => { return "E095"; }
+            ErrCode::MedicalViolation => { return "E096"; }
+            // Effect
+            ErrCode::EffectMismatch => { return "E110"; }
+            // Misc
+            ErrCode::NoMain => { return "E120"; }
+            ErrCode::Internal => { return "E999"; }
+            ErrCode::Custom => { return "E000"; }
+        }
+    }
+}
+
+// ErrCode constructor functions (for use when enum names from imported
+// modules aren't visible to the parser — Fides parser limitation).
+pub fn ErrCode_unterminated_string() -> ErrCode { return ErrCode::UnterminatedString; }
+pub fn ErrCode_unterminated_fstring() -> ErrCode { return ErrCode::UnterminatedFString; }
+pub fn ErrCode_unknown_escape() -> ErrCode { return ErrCode::UnknownEscape; }
+pub fn ErrCode_unexpected_char() -> ErrCode { return ErrCode::UnexpectedChar; }
+pub fn ErrCode_expected_token() -> ErrCode { return ErrCode::ExpectedToken; }
+pub fn ErrCode_expected_ident() -> ErrCode { return ErrCode::ExpectedIdent; }
+pub fn ErrCode_expected_type() -> ErrCode { return ErrCode::ExpectedType; }
+pub fn ErrCode_invalid_assignment_target() -> ErrCode { return ErrCode::InvalidAssignmentTarget; }
+pub fn ErrCode_undefined_variable() -> ErrCode { return ErrCode::UndefinedVariable; }
+pub fn ErrCode_undefined_function() -> ErrCode { return ErrCode::UndefinedFunction; }
+pub fn ErrCode_undefined_struct() -> ErrCode { return ErrCode::UndefinedStruct; }
+pub fn ErrCode_undefined_field() -> ErrCode { return ErrCode::UndefinedField; }
+pub fn ErrCode_type_mismatch() -> ErrCode { return ErrCode::TypeMismatch; }
+pub fn ErrCode_if_condition_not_bool() -> ErrCode { return ErrCode::IfConditionNotBool; }
+pub fn ErrCode_arg_count_mismatch() -> ErrCode { return ErrCode::ArgCountMismatch; }
+pub fn ErrCode_missing_return() -> ErrCode { return ErrCode::MissingReturn; }
+pub fn ErrCode_init_before_assign() -> ErrCode { return ErrCode::InitBeforeAssign; }
+pub fn ErrCode_not_linear() -> ErrCode { return ErrCode::NotLinear; }
+pub fn ErrCode_linear_consumed() -> ErrCode { return ErrCode::LinearConsumed; }
+pub fn ErrCode_linear_in_loop() -> ErrCode { return ErrCode::LinearInLoop; }
+pub fn ErrCode_borrow_conflict() -> ErrCode { return ErrCode::BorrowConflict; }
+pub fn ErrCode_mutable_borrow_conflict() -> ErrCode { return ErrCode::MutableBorrowConflict; }
+pub fn ErrCode_capability_denied() -> ErrCode { return ErrCode::CapabilityDenied; }
+pub fn ErrCode_sandbox_violation() -> ErrCode { return ErrCode::SandboxViolation; }
+pub fn ErrCode_conservation_violation() -> ErrCode { return ErrCode::ConservationViolation; }
+pub fn ErrCode_gas_exceeded() -> ErrCode { return ErrCode::GasExceeded; }
+pub fn ErrCode_not_crashfree() -> ErrCode { return ErrCode::NotCrashfree; }
+pub fn ErrCode_contract_violation() -> ErrCode { return ErrCode::ContractViolation; }
+pub fn ErrCode_medical_violation() -> ErrCode { return ErrCode::MedicalViolation; }
+pub fn ErrCode_effect_mismatch() -> ErrCode { return ErrCode::EffectMismatch; }
+pub fn ErrCode_no_main() -> ErrCode { return ErrCode::NoMain; }
+pub fn ErrCode_internal() -> ErrCode { return ErrCode::Internal; }
+pub fn ErrCode_custom() -> ErrCode { return ErrCode::Custom; }
+
+// ─── Diag struct ────────────────────────────────────────────────────────
+
+// A single diagnostic message.
+// Represents one error/warning/note with structured information.
+// Can be rendered with or without color, with or without source context.
+//
+// Note: notes is a Vec of str (i64 pointers). Strings work in Vecs because
+// str IS i64 in Fides's type system.
+pub struct Diag {
+    pub severity: Severity,
+    pub code: ErrCode,
+    // Primary message (without "error:" prefix).
+    pub message: str,
+    // Source file path (e.g. "tests/hello.fd" or "<stdin>").
+    pub file: str,
+    // 1-based line number.
+    pub line: i64,
+    // 1-based column number.
+    pub col: i64,
+    // The source line text (for context display). Empty if unavailable.
+    pub source_line: str,
+    // Length of the span (in characters). 0 if unknown. 1 = single char.
+    pub span_len: i64,
+    // Has help text?
+    pub has_help: bool,
+    // Help/suggestion text.
+    pub help: str,
+    // Secondary notes (Vec of str).
+    pub notes: Vec,
+}
+
+/// Create a new error diagnostic.
+pub fn Diag_error(code: ErrCode, msg: str, file: str, line: i64, col: i64) -> Diag {
+    return Diag {
+        severity: Severity::Error,
+        code: code,
+        message: msg,
+        file: file,
+        line: line,
+        col: col,
+        source_line: "",
+        span_len: 1,
+        has_help: false,
+        help: "",
+        notes: Vec::new(),
+    };
+}
+
+/// Create a new warning diagnostic.
+pub fn Diag_warning(code: ErrCode, msg: str, file: str, line: i64, col: i64) -> Diag {
+    return Diag {
+        severity: Severity::Warning,
+        code: code,
+        message: msg,
+        file: file,
+        line: line,
+        col: col,
+        source_line: "",
+        span_len: 1,
+        has_help: false,
+        help: "",
+        notes: Vec::new(),
+    };
+}
+
+/// Set the source line text for context display.
+/// Note: Due to an interpreter bug with struct str field returns,
+/// use direct field assignment (d.source_line = line) in interpreter code.
+/// This builder function works correctly with C codegen.
+pub fn Diag_with_source(d: Diag, line: str) -> Diag {
+    d.source_line = line;
+    return d;
+}
+
+/// Set the span length (number of characters underlined).
+pub fn Diag_with_span(d: Diag, len: i64) -> Diag {
+    if len < 1 {
+        d.span_len = 1;
+    } else {
+        d.span_len = len;
+    }
+    return d;
+}
+
+/// Add a help suggestion.
+/// Note: Due to an interpreter bug with struct str field returns,
+/// use direct field assignment (d.has_help = true; d.help = help) in interpreter code.
+pub fn Diag_with_help(d: Diag, help: str) -> Diag {
+    d.has_help = true;
+    d.help = help;
+    return d;
+}
+
+/// Add a secondary note.
+pub fn Diag_with_note(d: Diag, note: str) -> Diag {
+    d.notes.push(note);
+    return d;
+}
+
+/// Create a fully-specified error diagnostic with all fields.
+/// This avoids the builder pattern which has an interpreter bug with str fields.
+pub fn Diag_error_full(
+    code: ErrCode,
+    msg: str,
+    file: str,
+    line: i64,
+    col: i64,
+    source_line: str,
+    span_len: i64,
+    help_text: str,
+    has_help: bool,
+) -> Diag {
+    var sl = span_len;
+    if sl < 1 { sl = 1; }
+    return Diag {
+        severity: Severity::Error,
+        code: code,
+        message: msg,
+        file: file,
+        line: line,
+        col: col,
+        source_line: source_line,
+        span_len: sl,
+        has_help: has_help,
+        help: help_text,
+        notes: Vec::new(),
+    };
+}
+
+// ─── Render ─────────────────────────────────────────────────────────────
+
+// ANSI escape codes
+const DIAG_BOLD: str = "\x1b[1m";
+const DIAG_DIM: str = "\x1b[2m";
+const DIAG_RESET: str = "\x1b[0m";
+const DIAG_CYAN: str = "\x1b[36m";
+const DIAG_EMPTY: str = "";
+
+/// Repeat a character n times, returning a string.
+fn diag_repeat_char(c: i64, n: i64) -> str {
+    if n <= 0 { return ""; }
+    var result = "";
+    var i = 0;
+    while i < n {
+        result = p_str_concat(result, p_char_to_str(c));
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Render the diagnostic as a formatted string.
+///
+/// If use_color is true, uses ANSI escape codes.
+/// If source_line is non-empty, shows the source context with a caret.
+pub fn Diag_render(d: Diag, use_color: bool) -> str {
+    var bold = DIAG_EMPTY;
+    var dim = DIAG_EMPTY;
+    var reset = DIAG_EMPTY;
+    var sev_color = DIAG_EMPTY;
+    if use_color {
+        bold = DIAG_BOLD;
+        dim = DIAG_DIM;
+        reset = DIAG_RESET;
+        sev_color = d.severity.color_code();
+    }
+
+    var out = "";
+
+    // Header: error[E044]: type mismatch
+    out = p_str_concat(out, bold);
+    out = p_str_concat(out, sev_color);
+    out = p_str_concat(out, d.severity.label());
+    out = p_str_concat(out, reset);
+    out = p_str_concat(out, "[");
+    out = p_str_concat(out, d.code.code());
+    out = p_str_concat(out, "]: ");
+    out = p_str_concat(out, d.message);
+    out = p_str_concat(out, reset);
+    out = p_str_concat(out, "\n");
+
+    // Location: --> tests/hello.fd:2:15
+    if d.line > 0 {
+        out = p_str_concat(out, dim);
+        out = p_str_concat(out, "  -->");
+        out = p_str_concat(out, reset);
+        out = p_str_concat(out, " ");
+        out = p_str_concat(out, d.file);
+        out = p_str_concat(out, ":");
+        out = p_str_concat(out, int_to_str(d.line));
+        out = p_str_concat(out, ":");
+        out = p_str_concat(out, int_to_str(d.col));
+        out = p_str_concat(out, "\n");
+    }
+
+    // Source context with caret
+    if !str_is_empty(d.source_line) {
+        var line_str = int_to_str(d.line);
+        var line_width = str_len(line_str);
+
+        // Source line: "  2 | val x: str = 42;"
+        out = p_str_concat(out, dim);
+        out = p_str_concat(out, diag_repeat_char(32, line_width));  // spaces
+        out = p_str_concat(out, " |");
+        out = p_str_concat(out, reset);
+        out = p_str_concat(out, " ");
+        out = p_str_concat(out, d.source_line);
+        out = p_str_concat(out, "\n");
+
+        // Caret line: "  |        ^^^"
+        var pad = diag_repeat_char(32, line_width);  // spaces
+        var col_pad = "";
+        if d.col >= 1 {
+            col_pad = diag_repeat_char(32, d.col - 1);  // spaces (col is 1-based)
+        }
+        var carets = diag_repeat_char(94, d.span_len);  // '^' characters
+        if d.span_len < 1 {
+            carets = diag_repeat_char(94, 1);
+        }
+        out = p_str_concat(out, dim);
+        out = p_str_concat(out, pad);
+        out = p_str_concat(out, " |");
+        out = p_str_concat(out, reset);
+        out = p_str_concat(out, " ");
+        out = p_str_concat(out, col_pad);
+        out = p_str_concat(out, sev_color);
+        out = p_str_concat(out, bold);
+        out = p_str_concat(out, carets);
+        out = p_str_concat(out, reset);
+        out = p_str_concat(out, "\n");
+    }
+
+    // Notes
+    var i = 0;
+    while i < d.notes.len() {
+        var note: str = d.notes.get(i);
+        var note_color = DIAG_EMPTY;
+        if use_color {
+            note_color = DIAG_CYAN;
+        }
+        out = p_str_concat(out, note_color);
+        out = p_str_concat(out, "  = note:");
+        out = p_str_concat(out, reset);
+        out = p_str_concat(out, " ");
+        out = p_str_concat(out, note);
+        out = p_str_concat(out, "\n");
+        i = i + 1;
+    }
+
+    // Help
+    if d.has_help {
+        var help_color = DIAG_EMPTY;
+        if use_color {
+            help_color = DIAG_CYAN;
+        }
+        out = p_str_concat(out, help_color);
+        out = p_str_concat(out, "  = help:");
+        out = p_str_concat(out, reset);
+        out = p_str_concat(out, " ");
+        out = p_str_concat(out, d.help);
+        out = p_str_concat(out, "\n");
+    }
+
+    return out;
+}
+
+// ─── DiagList ───────────────────────────────────────────────────────────
+
+// A collection of diagnostics.
+// Since Fides can't store structs in Vecs (type system limitation:
+// Vec_get returns i64, not the struct type), we store rendered strings
+// and a separate error count.
+pub struct DiagList {
+    // Rendered diagnostic strings
+    pub rendered: Vec,
+    // Number of errors (for has_errors check)
+    pub error_count: i64,
+}
+
+pub fn DiagList_new() -> DiagList {
+    return DiagList { rendered: Vec::new(), error_count: 0 };
+}
+
+pub fn DiagList_push(dl: DiagList, d: Diag, use_color: bool) -> void {
+    if d.severity.is_error() {
+        dl.error_count = dl.error_count + 1;
+    }
+    dl.rendered.push(Diag_render(d, use_color));
+}
+
+pub fn DiagList_is_empty(dl: DiagList) -> bool {
+    return dl.rendered.len() == 0;
+}
+
+pub fn DiagList_len(dl: DiagList) -> i64 {
+    return dl.rendered.len();
+}
+
+pub fn DiagList_has_errors(dl: DiagList) -> bool {
+    return dl.error_count > 0;
+}
+
+/// Render all diagnostics as a single string.
+pub fn DiagList_render(dl: DiagList) -> str {
+    var out = "";
+    var i = 0;
+    while i < dl.rendered.len() {
+        var s: str = dl.rendered.get(i);
+        out = p_str_concat(out, s);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Helper functions ───────────────────────────────────────────────────
+
+/// Extract the source line at the given line number (1-based) from a source string.
+pub fn diag_extract_line(source: str, line: i64) -> str {
+    if line <= 0 { return ""; }
+    var current_line = 1;
+    var start = 0;
+    var i = 0;
+    var len = str_len(source);
+    while i < len {
+        var c = str_byte_at(source, i);
+        if c == 10 {  // newline
+            if current_line == line {
+                return str_slice(source, start, i);
+            }
+            current_line = current_line + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    // Last line (no trailing newline)
+    if current_line == line {
+        return str_slice(source, start, len);
+    }
+    return "";
+}
+
+/// Create an error Diag with source context from a source string.
+/// Extracts the source line at the given line number and sets the span.
+pub fn diag_error_with_source(
+    code: ErrCode,
+    msg: str,
+    file: str,
+    line: i64,
+    col: i64,
+    source: str,
+    span_len: i64,
+) -> Diag {
+    var source_line = diag_extract_line(source, line);
+    var sl = span_len;
+    if sl < 1 { sl = 1; }
+    // Construct Diag directly (avoiding builder pattern and struct return str field bug)
+    return Diag {
+        severity: Severity::Error,
+        code: code,
+        message: msg,
+        file: file,
+        line: line,
+        col: col,
+        source_line: source_line,
+        span_len: sl,
+        has_help: false,
+        help: "",
+        notes: Vec::new(),
+    };
+}
+
+// ─── Levenshtein distance ───────────────────────────────────────────────
+
+/// Simple Levenshtein distance for "did you mean" suggestions.
+/// Returns the edit distance between two strings.
+pub fn diag_levenshtein(a: str, b: str) -> i64 {
+    var a_len = str_len(a);
+    var b_len = str_len(b);
+
+    // Edge cases
+    if a_len == 0 { return b_len; }
+    if b_len == 0 { return a_len; }
+
+    // Use two rows (prev and curr) for O(min(a,b)) space
+    var prev = Vec::new();
+    var curr = Vec::new();
+
+    // Initialize prev = [0, 1, 2, ..., b_len]
+    var j = 0;
+    while j <= b_len {
+        prev.push(j);
+        j = j + 1;
+    }
+
+    var i = 1;
+    while i <= a_len {
+        // curr[0] = i
+        curr = Vec::new();
+        curr.push(i);
+
+        var jj = 1;
+        while jj <= b_len {
+            var cost = 1;
+            if str_byte_at(a, i - 1) == str_byte_at(b, jj - 1) {
+                cost = 0;
+            }
+            // curr[jj] = min(prev[jj] + 1, curr[jj-1] + 1, prev[jj-1] + cost)
+            var d1 = prev.get(jj) + 1;
+            var d2 = curr.get(jj - 1) + 1;
+            var d3 = prev.get(jj - 1) + cost;
+            var min_d = d1;
+            if d2 < min_d { min_d = d2; }
+            if d3 < min_d { min_d = d3; }
+            curr.push(min_d);
+            jj = jj + 1;
+        }
+
+        // Swap prev and curr
+        prev = curr;
+        i = i + 1;
+    }
+
+    return prev.get(b_len);
+}
+
+/// Suggest the closest match from a list of candidates.
+/// Returns a help string like "did you mean 'foo'?" if a close match is found.
+/// Returns empty string if no close match (distance > 2).
+pub fn diag_suggest_did_you_mean(input: str, candidates: Vec) -> str {
+    var best_dist = 999;
+    var best_cand = "";
+    var found = false;
+
+    var i = 0;
+    while i < candidates.len() {
+        var cand: str = candidates.get(i);
+        var dist = diag_levenshtein(input, cand);
+        // Use threshold of 2 — close enough to be a useful suggestion
+        if dist <= 2 {
+            if !found || dist < best_dist {
+                best_dist = dist;
+                // Workaround: str-to-str assignment from Vec.get doesn't work
+                // in the interpreter. Use p_str_concat to copy.
+                best_cand = p_str_concat(cand, "");
+                found = true;
+            }
+        }
+        i = i + 1;
+    }
+
+    if found {
+        return p_str_concat(p_str_concat("did you mean '", best_cand), "'?");
+    }
+    return "";
+}

@@ -2,19 +2,23 @@
 # gen_golden.sh — Generate golden files for intermediate compiler stages
 #
 # For each key test, captures:
+#   .tokens   — lexer token stream
+#   .ast      — parsed AST (S-expression)
 #   .ir       — SSA IR after lowering
 #   .pir_l1   — PIR Level 1 (semantic)
 #   .pir_l2   — PIR Level 2 (mid-level)
 #   .pir_l3   — PIR Level 3 (low-level)
 #   .asm      — x86-64 assembly after codegen
 #   .peephole — assembly after peephole optimization
+#   .c        — generated C source (C codegen)
 #   .out      — program output (interpreter)
 #
 # When a test fails, diff these against the current output to find which
 # layer introduced the regression:
-#   diff tests/golden/strings.ir <(fidesc ir tests/strings.fd)
-#   diff tests/golden/strings.pir_l3 <(fidesc pir tests/strings.fd 3)
-#   diff tests/golden/strings.asm <(fidesc codegen tests/strings.fd --target x86-64)
+#   diff tests/golden/strings/strings.ir <(fidesc dump-ir tests/strings.fd)
+#   diff tests/golden/strings/strings.pir_l3 <(fidesc dump-pir tests/strings.fd 3)
+#   diff tests/golden/strings/strings.c <(fidesc dump-c tests/strings.fd)
+#   diff tests/golden/strings/strings.asm <(fidesc codegen tests/strings.fd --target x86-64)
 
 set -e
 cd "$(dirname "$0")/.."
@@ -59,13 +63,22 @@ for name in "${KEY_TESTS[@]}"; do
     out_dir="$GOLDEN_DIR/${name}"
     mkdir -p "$out_dir"
 
+    # Tokens (SH-2: lexer golden files)
+    $PLEDGEC dump-tokens "$src" > "$out_dir/${name}.tokens" 2>/dev/null || true
+
+    # AST (SH-2: parser golden files)
+    $PLEDGEC dump-ast "$src" > "$out_dir/${name}.ast" 2>/dev/null || true
+
     # IR
-    $PLEDGEC ir "$src" > "$out_dir/${name}.ir" 2>/dev/null || true
+    $PLEDGEC dump-ir "$src" > "$out_dir/${name}.ir" 2>/dev/null || true
 
     # PIR L1, L2, L3
-    $PLEDGEC pir "$src" 1 > "$out_dir/${name}.pir_l1" 2>/dev/null || true
-    $PLEDGEC pir "$src" 2 > "$out_dir/${name}.pir_l2" 2>/dev/null || true
-    $PLEDGEC pir "$src" 3 > "$out_dir/${name}.pir_l3" 2>/dev/null || true
+    $PLEDGEC dump-pir "$src" 1 > "$out_dir/${name}.pir_l1" 2>/dev/null || true
+    $PLEDGEC dump-pir "$src" 2 > "$out_dir/${name}.pir_l2" 2>/dev/null || true
+    $PLEDGEC dump-pir "$src" 3 > "$out_dir/${name}.pir_l3" 2>/dev/null || true
+
+    # C source (SH-2: C codegen golden files)
+    $PLEDGEC dump-c "$src" > "$out_dir/${name}.c" 2>/dev/null || true
 
     # Assembly (x86-64, no peephole)
     $PLEDGEC codegen "$src" --target x86-64 > "$out_dir/${name}.asm" 2>/dev/null || true
@@ -76,7 +89,7 @@ for name in "${KEY_TESTS[@]}"; do
     # Interpreter output
     $PLEDGEC run "$src" > "$out_dir/${name}.out" 2>/dev/null || true
 
-    echo "  OK   $name ($(wc -l < "$out_dir/${name}.ir") IR lines, $(wc -l < "$out_dir/${name}.pir_l3") PIR L3 lines, $(wc -l < "$out_dir/${name}.asm") asm lines)"
+    echo "  OK   $name ($(wc -l < "$out_dir/${name}.tokens") tokens, $(wc -l < "$out_dir/${name}.ir") IR lines, $(wc -l < "$out_dir/${name}.c") C lines, $(wc -l < "$out_dir/${name}.asm") asm lines)"
 done
 
 echo ""

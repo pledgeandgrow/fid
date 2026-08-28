@@ -1,0 +1,147 @@
+// Test: diag.fd — SH-6.2 differential test for Fides rewrite of diag.rs
+// Tests all diag module functionality:
+//   - Severity enum + label/color_code
+//   - ErrCode enum + code strings
+//   - Diag struct + constructors + direct field assignment
+//   - Diag_render (no color, with source context, with help, with notes)
+//   - DiagList + push/render/has_errors
+//   - diag_error_with_source (extract source line)
+//   - diag_levenshtein
+//   - diag_suggest_did_you_mean
+//
+// Note: Builder pattern (Diag_with_source, etc.) has an interpreter bug with
+// str field returns. Use direct field assignment instead. Builder functions
+// work correctly with C codegen.
+
+use compiler::diag;
+use vec;
+
+fn main() -> i64 {
+    // Disable color for deterministic output
+    var use_color = false;
+
+    // ─── Severity ───────────────────────────────────────────────────────
+    assert_msg(Severity::Error.label() == "error", "Error label");
+    assert_msg(Severity::Warning.label() == "warning", "Warning label");
+    assert_msg(Severity::Note.label() == "note", "Note label");
+    assert_msg(Severity::Help.label() == "help", "Help label");
+    print("Severity labels OK\n");
+
+    assert_msg(Severity::Error.is_error(), "Error is_error");
+    assert_msg(!Severity::Warning.is_error(), "Warning not is_error");
+    assert_msg(!Severity::Note.is_error(), "Note not is_error");
+    print("Severity is_error OK\n");
+
+    // ─── ErrCode ────────────────────────────────────────────────────────
+    assert_msg(ErrCode::UnterminatedString.code() == "E001", "E001");
+    assert_msg(ErrCode::UnexpectedChar.code() == "E004", "E004");
+    assert_msg(ErrCode::ExpectedToken.code() == "E020", "E020");
+    assert_msg(ErrCode::TypeMismatch.code() == "E044", "E044");
+    assert_msg(ErrCode::BorrowConflict.code() == "E080", "E080");
+    assert_msg(ErrCode::CapabilityDenied.code() == "E090", "E090");
+    assert_msg(ErrCode::EffectMismatch.code() == "E110", "E110");
+    assert_msg(ErrCode::NoMain.code() == "E120", "E120");
+    assert_msg(ErrCode::Internal.code() == "E999", "E999");
+    assert_msg(ErrCode::Custom.code() == "E000", "E000");
+    print("ErrCode codes OK\n");
+
+    // ─── Diag construction + render (basic, no source) ─────────────────
+    var d1 = Diag_error(ErrCode::TypeMismatch, "cannot assign i64 to str", "test.fd", 2, 15);
+    var r1 = Diag_render(d1, use_color);
+    assert_msg(str_contains(r1, "error[E044]"), "render has error[E044]");
+    assert_msg(str_contains(r1, "cannot assign i64 to str"), "render has message");
+    assert_msg(str_contains(r1, "--> test.fd:2:15"), "render has location");
+    print("Diag basic render OK\n");
+
+    // ─── Diag with source context + caret (direct field assignment) ─────
+    var d2 = Diag_error(ErrCode::TypeMismatch, "cannot assign i64 to str", "test.fd", 2, 15);
+    d2.source_line = "    val x: str = 42;";
+    d2.span_len = 2;
+    var r2 = Diag_render(d2, use_color);
+    assert_msg(str_contains(r2, "val x: str = 42;"), "render has source line");
+    assert_msg(str_contains(r2, "^^"), "render has carets");
+    print("Diag source context OK\n");
+
+    // ─── Diag with help (direct field assignment) ───────────────────────
+    var d3 = Diag_error(ErrCode::TypeMismatch, "type mismatch", "test.fd", 1, 1);
+    d3.has_help = true;
+    d3.help = "change the type annotation or the expression";
+    var r3 = Diag_render(d3, use_color);
+    assert_msg(str_contains(r3, "help:"), "render has help");
+    assert_msg(str_contains(r3, "change the type annotation"), "render has help text");
+    print("Diag help OK\n");
+
+    // ─── Diag with notes (direct field assignment) ──────────────────────
+    var d4 = Diag_error(ErrCode::UndefinedVariable, "undefined variable 'foo'", "test.fd", 3, 5);
+    d4.notes.push("defined in this scope");
+    d4.notes.push("consider importing it");
+    var r4 = Diag_render(d4, use_color);
+    assert_msg(str_contains(r4, "note:"), "render has note");
+    assert_msg(str_contains(r4, "defined in this scope"), "render has first note");
+    assert_msg(str_contains(r4, "consider importing it"), "render has second note");
+    print("Diag notes OK\n");
+
+    // ─── Diag warning ───────────────────────────────────────────────────
+    var d5 = Diag_warning(ErrCode::Internal, "unused variable 'x'", "test.fd", 1, 5);
+    var r5 = Diag_render(d5, use_color);
+    assert_msg(str_contains(r5, "warning"), "warning render has 'warning'");
+    print("Diag warning OK\n");
+
+    // ─── DiagList ───────────────────────────────────────────────────────
+    var dl = DiagList_new();
+    assert_msg(DiagList_is_empty(dl), "DiagList starts empty");
+    assert_msg(!DiagList_has_errors(dl), "DiagList no errors initially");
+
+    DiagList_push(dl, Diag_error(ErrCode::TypeMismatch, "first error", "a.fd", 1, 1), use_color);
+    DiagList_push(dl, Diag_warning(ErrCode::Internal, "a warning", "b.fd", 2, 3), use_color);
+    DiagList_push(dl, Diag_error(ErrCode::UndefinedFunction, "second error", "c.fd", 5, 10), use_color);
+
+    assert_msg(!DiagList_is_empty(dl), "DiagList not empty after pushes");
+    assert_msg(DiagList_len(dl) == 3, "DiagList has 3 items");
+    assert_msg(DiagList_has_errors(dl), "DiagList has errors");
+
+    var dl_rendered = DiagList_render(dl);
+    assert_msg(str_contains(dl_rendered, "first error"), "DiagList render has first error");
+    assert_msg(str_contains(dl_rendered, "a warning"), "DiagList render has warning");
+    assert_msg(str_contains(dl_rendered, "second error"), "DiagList render has second error");
+    print("DiagList OK\n");
+
+    // ─── diag_error_with_source ─────────────────────────────────────────
+    var source = "fn main() -> i64 {\n    val x: str = 42;\n    return 0;\n}\n";
+    var d6 = diag_error_with_source(ErrCode::TypeMismatch, "cannot assign i64 to str", "test.fd", 2, 15, source, 2);
+    var r6 = Diag_render(d6, use_color);
+    assert_msg(str_contains(r6, "val x: str = 42;"), "error_with_source extracted correct line");
+    assert_msg(str_contains(r6, "^^"), "error_with_source has carets");
+    print("diag_error_with_source OK\n");
+
+    // ─── Levenshtein distance ───────────────────────────────────────────
+    assert_msg(diag_levenshtein("bar", "baz") == 1, "levenshtein bar baz = 1");
+    assert_msg(diag_levenshtein("hello", "hello") == 0, "levenshtein hello hello = 0");
+    assert_msg(diag_levenshtein("abc", "xyz") == 3, "levenshtein abc xyz = 3");
+    assert_msg(diag_levenshtein("", "abc") == 3, "levenshtein empty abc = 3");
+    assert_msg(diag_levenshtein("abc", "") == 3, "levenshtein abc empty = 3");
+    assert_msg(diag_levenshtein("kitten", "sitting") == 3, "levenshtein kitten sitting = 3");
+    print("Levenshtein OK\n");
+
+    // ─── suggest_did_you_mean ───────────────────────────────────────────
+    var candidates = Vec::new();
+    candidates.push("foo");
+    candidates.push("baz");
+    candidates.push("qux");
+
+    var suggestion = diag_suggest_did_you_mean("bar", candidates);
+    assert_msg(str_contains(suggestion, "did you mean 'baz'"), "suggest bar -> baz");
+
+    var no_suggestion = diag_suggest_did_you_mean("abcdef", candidates);
+    assert_msg(str_is_empty(no_suggestion), "suggest abcdef -> nothing");
+    print("suggest_did_you_mean OK\n");
+
+    // ─── Full render output (for visual inspection) ─────────────────────
+    print("\n--- Full render example ---\n");
+    var d_full = Diag_error_full(ErrCode::TypeMismatch, "cannot assign i64 to str", "test.fd", 2, 15, "    val x: str = 42;", 2, "change the type annotation or the expression", true);
+    d_full.notes.push("expected str because of type annotation");
+    print(Diag_render(d_full, use_color));
+
+    print("\n--- All diag tests passed ---\n");
+    return 0;
+}

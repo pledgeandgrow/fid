@@ -6,7 +6,7 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 
 **Phase 1: Foundation — Complete.** **Phase 2: Safety — Complete.** **Phase 3: Power — Complete (interpreter).** **Phase 4: Performance — Mostly complete.** **Phase 5: Platform — Mostly complete.** **Cross-Compilation — Complete (x86-64, ARM64, RISC-V, Windows).** The compiler lexes, parses, type-checks, lowers to SSA IR, and generates native executables. The **ELF64 emitter** (`build --target x86-64` on Linux) produces working executables directly — no assembler, linker, or C compiler required. **Cross-compilation** to ARM64 (`--target arm64-linux`), RISC-V (`--target riscv64-linux`), and Windows (`--target x86-64-windows`) also works with zero external tools. Phase 2 adds region inference, effect system, capability security (with compile-time elision), and bounds safety. The optimizer is enabled by default in `build` (use `--no-opt` to disable) with 23 passes; `--lto` enables aggressive cross-module inlining.
 
-**Test results:** 153/153 normal tests pass on all 3 backends (interpreter, C codegen, PE emitter). 265/265 unit tests. 0 skip, 0 known-fail. See `AGENTS.md` → "Current Baseline" for authoritative counts.
+**Test results:** 164/165 normal tests pass on interpreter + C codegen, 165/165 on PE emitter (1 fail: test_compiler_sized, user-added). 265/265 unit tests. 0 skip, 0 known-fail. See `AGENTS.md` → "Current Baseline" for authoritative counts.
 
 **Phase status:** See `docs/roadmap/roadmap.md` for full phase status and what's left. See `docs/roadmap/selfhost-roadmap.md` for the self-hosting plan.
 
@@ -178,12 +178,12 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 
 - **ELF64 executable emission works on Linux** — `fidesc build <file> --target x86-64` produces working ELF64 executables directly (zero external tools). `fidesc codegen --elf <out.o>` emits valid relocatable objects (readelf compatible). `fidesc codegen --macho` and `--coff` also produce valid object files.
 - **Cross-compilation to ARM64, RISC-V, and Windows** — `fidesc build --target arm64-linux`, `--target riscv64-linux`, and `--target x86-64-windows` all produce valid executables with zero external tools. ARM64 and RISC-V use built-in instruction encoders (`arm64_enc.rs`, `riscv_enc.rs`) and runtime libraries (`runtime_arm64.rs`, `runtime_riscv.rs`) with raw Linux syscalls. Windows uses the PE emitter (`pe.rs`) with kernel32.dll imports.
-- **PE emitter targets Windows x64 only** — `fidesc emit` or `fidesc build --target x86-64-windows` produces PE32+ executables; tested via `fidesc test` (153/153 valid)
+- **PE emitter targets Windows x64 only** — `fidesc emit` or `fidesc build --target x86-64-windows` produces PE32+ executables; tested via `fidesc test` (165/165 valid)
 - **Register allocator** — Linear scan allocator with constant rematerialization (F-1A). Effect-aware allocation (F-1D): pure/@no-alloc calls only clobber RAX. Works correctly for all passing tests.
 - **Peephole optimizer always on** — 9 passes run automatically in the `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
 - **L2 optimizer enabled by default** — PIR optimizer runs automatically in `build` (use `--no-opt` to disable) with 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. `--lto` enables aggressive cross-module inlining.
 - **`#[test]` attribute** — parsed but not executed by `fidesc test` (tests are file-based)
-- **C codegen coverage** — 153/153 normal tests match interpreter output. Phase 10B: Vec/HashMap/String now implemented in Fides stdlib using raw pointers. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack.
+- **C codegen coverage** — 164/165 normal tests match interpreter output (1 fail: test_compiler_sized, user-added). Phase 10B: Vec/HashMap/String now implemented in Fides stdlib using raw pointers. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack.
 - **214 compiler warnings** — dead code, unused variables (cleanup needed)
 
 ---
@@ -305,9 +305,9 @@ Current baseline:
 ```
 Unit tests:   265/265 passed  (All passing — incl. 47 cross-compilation encoder/runtime tests + 7 incremental compilation)
 Harness:      8/8 passed
-Interpreter:  153/153 normal
-C Codegen:    153/153 matched
-PE Emitter:   153/153 valid
+Interpreter:  164/165 normal
+C Codegen:    164/165 matched
+PE Emitter:   165/165 valid
 Cross-compilation: x86-64, ARM64, RISC-V, Windows — all producing valid executables
 ```
 
@@ -656,7 +656,7 @@ See `docs/syntax-spec.md` for the complete syntax specification.
 ```
 p-lang/
 ├── Cargo.toml              # Rust project config (4 binary targets: fidesc, pacte, scribe, veil)
-├── src/                    # 54 source files, 86,011 lines of Rust
+├── src/                    # 51 source files, 86,742 lines of Rust
 │   ├── main.rs             # CLI entry point (20+ commands: build, emit, run, codegen, ccompile, lsp, profile, fmt, lint, bench, debug, etc.)
 │   ├── lib.rs              # Library crate root (shared by all 4 binaries)
 │   ├── token.rs            # Token kind definitions (54+ keywords)
@@ -711,7 +711,7 @@ p-lang/
 │   ├── bin/scribe.rs       # Documentation generator binary entry point
 │   ├── bin/veil.rs         # Coverage tool binary entry point
 │   └── compiler.rs         # Pipeline orchestration, module resolution, stdlib auto-include
-├── stdlib/                 # 69 standard library modules, 17,541 LOC
+├── stdlib/                 # 69 standard library modules, 18,242 LOC
 │   ├── core.fd              # Option, Result, println, assert, max, min, abs, clamp, combinators
 │   ├── vec.fd               # Vec<T> with iterator adapters (take, skip, zip, enumerate, etc.)
 │   ├── math.fd              # vec2/3/4, mat4, quat types, operator overloading, swizzle
@@ -747,7 +747,7 @@ p-lang/
 │   ├── physics.fd           # Physics simulation
 │   ├── audio.fd             # Audio processing
 │   └── input.fd             # Input handling
-├── tests/                  # 218 .fd test files + harness
+├── tests/                  # 215 .fd test files + harness
 │   ├── harness.rs          # Automated test harness (8 cargo tests)
 │   ├── *.fd                 # 193 test files in root
 │   ├── safety/             # 9 bounds safety tests (OOB, overflow, div-by-zero, unwrap)

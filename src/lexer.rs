@@ -34,6 +34,8 @@ impl Lexer {
                 self.skip_block_comment();
             } else if c == 'f' && self.peek_at(1) == Some('"') {
                 tokens.push(self.read_fstring());
+            } else if c == 'r' && (self.peek_at(1) == Some('"') || self.peek_at(1) == Some('#')) {
+                tokens.push(self.read_raw_string());
             } else if c.is_alphabetic() || c == '_' {
                 tokens.push(self.read_identifier_or_keyword());
             } else if c.is_ascii_digit() {
@@ -341,6 +343,55 @@ impl Lexer {
             self.errors.push(format!("Error:{}:{}: unterminated string", line, col));
         }
 
+        Token::new(TokenKind::StringLit(s), line, col)
+    }
+
+    /// Read a raw string: r"..." or r#"..."# (with N hash signs).
+    /// No escape sequences are processed — the content is taken literally.
+    /// The closing delimiter is " followed by the same number of # signs.
+    fn read_raw_string(&mut self) -> Token {
+        let line = self.line;
+        let col = self.col;
+        self.advance(); // consume 'r'
+
+        // Count the number of # signs (0 or more)
+        let mut hash_count = 0;
+        while self.peek() == '#' {
+            self.advance();
+            hash_count += 1;
+        }
+
+        // Expect opening "
+        if self.peek() != '"' {
+            self.errors.push(format!("Error:{}:{}: expected '\"' after r{}", line, col, "#".repeat(hash_count)));
+            return Token::new(TokenKind::StringLit(String::new()), line, col);
+        }
+        self.advance(); // consume opening "
+
+        let mut s = String::new();
+        // Read until we find " followed by exactly hash_count # signs
+        while self.pos < self.source.len() {
+            if self.peek() == '"' {
+                // Check if this is the closing delimiter: " followed by hash_count # signs
+                let mut matched = true;
+                for i in 0..hash_count {
+                    if self.peek_at(1 + i) != Some('#') {
+                        matched = false;
+                        break;
+                    }
+                }
+                if matched {
+                    self.advance(); // consume "
+                    for _ in 0..hash_count {
+                        self.advance(); // consume each #
+                    }
+                    return Token::new(TokenKind::StringLit(s), line, col);
+                }
+            }
+            s.push(self.advance());
+        }
+
+        self.errors.push(format!("Error:{}:{}: unterminated raw string", line, col));
         Token::new(TokenKind::StringLit(s), line, col)
     }
 

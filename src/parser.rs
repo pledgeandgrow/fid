@@ -21,16 +21,24 @@ pub struct Parser {
     alias_to_struct: Vec<String>,
     /// Collected parse errors for error recovery (task 2.4).
     errors: Vec<String>,
+    /// Current expression nesting depth (SH-1.4 / 0.3 recursion depth audit).
+    /// Incremented each time we enter a parenthesized expression.
+    /// When this exceeds `max_expr_depth`, the parser switches from recursive
+    /// descent to an iterative shunting-yard parser to avoid stack overflow.
+    expr_depth: usize,
+    /// Maximum expression nesting depth before switching to iterative parser.
+    /// Default: 256 (well within the 8MB stack limit, but safe).
+    max_expr_depth: usize,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0, struct_names: Vec::new(), enum_names: Vec::new(), alias_to_struct: Vec::new(), errors: Vec::new() }
+        Parser { tokens, pos: 0, struct_names: Vec::new(), enum_names: Vec::new(), alias_to_struct: Vec::new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256 }
     }
 
     /// Create a parser with pre-populated struct/enum names (for stdlib auto-include)
     pub fn with_names(tokens: Vec<Token>, struct_names: Vec<String>, enum_names: Vec<String>) -> Self {
-        Parser { tokens, pos: 0, struct_names, enum_names, alias_to_struct: Vec::new(), errors: Vec::new() }
+        Parser { tokens, pos: 0, struct_names, enum_names, alias_to_struct: Vec::new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256 }
     }
 
     pub fn parse(&mut self) -> Result<Program, String> {
@@ -2405,6 +2413,190 @@ impl Parser {
         Ok(expr)
     }
 
+    /// SH-1.4 / 0.3: Iterative expression parser using shunting-yard algorithm.
+    ///
+    /// This is used as a fallback when expression nesting depth exceeds
+    /// `max_expr_depth` (default 256). It handles binary operators and
+    /// nested parentheses without recursion, preventing stack overflow on
+    /// deeply nested expressions like `((((1 + 2) + 3) + 4) ...)`.
+    ///
+    /// Handles: binary operators (all precedences), parenthesized grouping,
+    /// tuples, and delegates non-paren primaries to `parse_primary`.
+    /// Unary operators are handled by delegating to `parse_primary` (which
+    /// calls `parse_unary` → `parse_postfix` → `parse_primary`).
+    /// When `parse_primary` sees `(`, it checks depth and may call this
+    /// function again — but only for the content inside the parens, which
+    /// is handled iteratively by the shunting-yard loop.
+    fn parse_expr_iterative(&mut self) -> Result<Expr, String> {
+        // Operator stack entry: either a binary operator with its precedence,
+        // or a parenthesis marker.
+        enum OpEntry {
+            Op(BinOp, u8),
+            Paren,
+        }
+
+        let mut vals: Vec<Expr> = Vec::new();
+        let mut ops: Vec<OpEntry> = Vec::new();
+
+        // Helper: reduce the top of the operator stack by one binary op.
+        // Pops one operator and two operands, pushes the result.
+        macro_rules! reduce_one {
+            () => {{
+                let op_entry = ops.pop().unwrap();
+                if let OpEntry::Op(bop, _) = op_entry {
+                    let right = vals.pop().unwrap();
+                    let left = vals.pop().unwrap();
+                    vals.push(Expr::Binary {
+                        op: bop,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    });
+                }
+            }};
+        }
+
+        // Helper: get binary operator + precedence from current token.
+        // Returns None if the current token is not a binary operator.
+        // Precedence levels match the recursive descent chain:
+        //   1 = |>, 2 = ??, 3 = range, 4 = ||, 5 = |, 6 = ^, 7 = &,
+        //   8 = <<,>>, 9 = &&, 10 = ==,!=, 11 = <,>,<=,>=, 12 = +,-,
+        //   13 = *,/,%
+        macro_rules! peek_bin_op {
+            () => {{
+                match self.peek() {
+                    TokenKind::PipeArrow => Some((BinOp::Or, 1u8)), // |> desugars, but treat as binary for parsing
+                    TokenKind::QuestionQuestion => Some((BinOp::Or, 2u8)), // ?? — use Or as placeholder
+                    TokenKind::Or => Some((BinOp::Or, 4u8)),
+                    TokenKind::Pipe => Some((BinOp::BitOr, 5u8)),
+                    TokenKind::Caret => Some((BinOp::BitXor, 6u8)),
+                    TokenKind::Ampersand => Some((BinOp::BitAnd, 7u8)),
+                    TokenKind::Shl => Some((BinOp::Shl, 8u8)),
+                    TokenKind::Shr => Some((BinOp::Shr, 8u8)),
+                    TokenKind::And => Some((BinOp::And, 9u8)),
+                    TokenKind::EqEq => Some((BinOp::Eq, 10u8)),
+                    TokenKind::BangEq => Some((BinOp::Neq, 10u8)),
+                    TokenKind::Lt => Some((BinOp::Lt, 11u8)),
+                    TokenKind::Gt => Some((BinOp::Gt, 11u8)),
+                    TokenKind::LtEq => Some((BinOp::LtEq, 11u8)),
+                    TokenKind::GtEq => Some((BinOp::GtEq, 11u8)),
+                    TokenKind::Plus => Some((BinOp::Add, 12u8)),
+                    TokenKind::Minus => Some((BinOp::Sub, 12u8)),
+                    TokenKind::Star => Some((BinOp::Mul, 13u8)),
+                    TokenKind::Slash => Some((BinOp::Div, 13u8)),
+                    TokenKind::Percent => Some((BinOp::Mod, 13u8)),
+                    _ => None,
+                }
+            }};
+        }
+
+        // Parse the first primary value.
+        // If it's `(`, push a Paren marker and parse the next primary.
+        // This is iterative — no recursion for nested parens.
+        let mut need_primary = true;
+
+        loop {
+            if need_primary {
+                if self.check(&TokenKind::LParen) {
+                    // Open paren — push marker, consume `(`, still need a primary
+                    self.advance();
+                    ops.push(OpEntry::Paren);
+                    // Check for empty tuple ()
+                    if self.check(&TokenKind::RParen) {
+                        self.advance();
+                        ops.pop(); // remove the Paren marker we just pushed
+                        vals.push(Expr::TupleLit(vec![]));
+                        need_primary = false;
+                    }
+                    // else: still need_primary = true, loop will parse the inner primary
+                } else {
+                    // Delegate to parse_primary for everything except `(`.
+                    // parse_primary won't see `(` here since we handled it above.
+                    // It may see `(` for function call args (e.g., `foo(...)`),
+                    // which is fine — those don't cause deep recursion.
+                    vals.push(self.parse_primary()?);
+                    need_primary = false;
+                }
+            } else if let Some((bop, prec)) = peek_bin_op!() {
+                self.advance();
+                // Pop higher-or-equal precedence operators (left-associative)
+                while let Some(OpEntry::Op(_, tp)) = ops.last() {
+                    if *tp >= prec {
+                        reduce_one!();
+                    } else {
+                        break;
+                    }
+                }
+                ops.push(OpEntry::Op(bop, prec));
+                need_primary = true;
+            } else if self.check(&TokenKind::RParen) {
+                // Close paren — pop until Paren marker
+                let mut found_paren = false;
+                while let Some(top) = ops.last() {
+                    match top {
+                        OpEntry::Op(_, _) => {
+                            reduce_one!();
+                        }
+                        OpEntry::Paren => {
+                            ops.pop();
+                            found_paren = true;
+                            break;
+                        }
+                    }
+                }
+                if found_paren {
+                    self.advance(); // consume `)`
+                    // Check if this was a tuple: if next token is `,`, we're in tuple mode
+                    // But we've already reduced the expression inside parens.
+                    // The result is on vals. Check for comma to detect tuple.
+                    if self.check(&TokenKind::Comma) {
+                        // Tuple: collect remaining elements
+                        let mut elems = vec![vals.pop().unwrap()];
+                        while self.match_tok(TokenKind::Comma) {
+                            // Parse each element iteratively
+                            self.expr_depth += 1;
+                            let elem = if self.expr_depth > self.max_expr_depth {
+                                self.parse_expr_iterative()?
+                            } else {
+                                self.parse_expr()?
+                            };
+                            self.expr_depth -= 1;
+                            elems.push(elem);
+                        }
+                        self.expect(TokenKind::RParen, ")")?;
+                        vals.push(Expr::TupleLit(elems));
+                    }
+                    // Continue loop to check for more operators after the `)`
+                } else {
+                    // No matching paren — end of expression (unmatched `)`)
+                    break;
+                }
+            } else {
+                // Not a binary operator, not `)` — end of expression
+                break;
+            }
+        }
+
+        // Drain remaining operators
+        while let Some(top) = ops.last() {
+            match top {
+                OpEntry::Op(_, _) => {
+                    reduce_one!();
+                }
+                OpEntry::Paren => {
+                    // Unmatched `(` — shouldn't happen if the input is well-formed
+                    // The `)` handler should have consumed it. If we get here,
+                    // it means the expression ended inside parens.
+                    return Err("unmatched '(' in expression".to_string());
+                }
+            }
+        }
+
+        if vals.is_empty() {
+            return Err("expected expression".to_string());
+        }
+        Ok(vals.pop().unwrap())
+    }
+
     fn parse_primary(&mut self) -> Result<Expr, String> {
         let tok = self.peek_token().clone();
         match &tok.kind {
@@ -2596,12 +2788,27 @@ impl Parser {
             }
             TokenKind::LParen => {
                 self.advance();
-                let first = self.parse_expr()?;
+                // SH-1.4 / 0.3: Track expression nesting depth. When it exceeds
+                // max_expr_depth, switch to iterative parser to avoid stack overflow.
+                self.expr_depth += 1;
+                let first = if self.expr_depth > self.max_expr_depth {
+                    self.parse_expr_iterative()?
+                } else {
+                    self.parse_expr()?
+                };
+                self.expr_depth -= 1;
                 if self.match_tok(TokenKind::Comma) {
                     // Tuple literal: (expr, expr, ...)
                     let mut elems = vec![first];
                     loop {
-                        elems.push(self.parse_expr()?);
+                        self.expr_depth += 1;
+                        let next = if self.expr_depth > self.max_expr_depth {
+                            self.parse_expr_iterative()?
+                        } else {
+                            self.parse_expr()?
+                        };
+                        self.expr_depth -= 1;
+                        elems.push(next);
                         if !self.match_tok(TokenKind::Comma) {
                             break;
                         }

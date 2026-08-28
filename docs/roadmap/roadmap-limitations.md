@@ -21,8 +21,8 @@ baseline, and milestones. **See `roadmap.md` for phase status and test counts.**
 This section has been **verified by reading source code, running tests, and executing binaries**. Not based on docs — based on actual behavior.
 
 **Test baseline:** See `roadmap.md` → "Verified Test Baseline" table for current
-test counts (265/265 unit, 8/8 harness, 153/153 interp/PE/C codegen, 0 skip,
-6 known-fail, 218 .fd files, 54 .rs files, 69 stdlib modules).
+test counts (265/265 unit, 8/8 harness, 164/165 interp/C codegen, 165/165 PE, 0 skip,
+0 known-fail, 215 .fd files, 51 .rs files, 69 stdlib modules).
 
 ### Feature Verification Matrix (Code-Verified)
 
@@ -299,7 +299,7 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 - [ ] **Not redoing:** The type system features — just fixing docs and verifying backends
 
 #### L1I — Fix HTTP/JSON/DB/SIMD/Tensor in C Codegen
-- [x] **VERIFIED:** C codegen is at 153/153 parity with interpreter (Phase 10B: Vec/HashMap/String migrated to Fides stdlib).
+- [x] **VERIFIED:** C codegen is at 164/165 parity with interpreter (1 fail: test_compiler_sized, user-added. Phase 10B: Vec/HashMap/String migrated to Fides stdlib).
 - [x] **VERIFIED:** These now PASS in C codegen (previously failed): `test_http`, `test_json`, `test_simd`, `test_tensor`, `test_interrupt`, `test_mmu`, `test_matrix_mul`, `test_shape`, `test_const_generic`, `test_bounds_check`, `test_trait_object`, `test_gat`, `test_comptime_serialize`, `test_boot`, `test_parallel`, `test_print_map`, `test_regression_collections`, `test_type_alias`, `test_vec_one`, `strings`, `test_fstring_int`, `test_fstring_vec`
 - [x] **VERIFIED:** These all PASS in interpreter
 - [x] ~~Fix C codegen to support: inline assembly, comptime reflection, DB builtins~~ **ALL FIXED** — inline asm, comptime reflection, and DB builtins all work in C codegen now
@@ -330,7 +330,7 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 - [x] ~~HTTP/JSON/DB/SIMD/Tensor work in C codegen~~ **DONE** — all work in C codegen (previously in skip list, now pass)
 - [x] ~~README and features.md corrected to reflect actual state~~ **DONE**
 - [ ] Compiler warnings reduced from ~213 to <50 (or all suppressed with reasons)
-- [x] All 188 test files pass (currently 153/153 normal)
+- [x] All 215 test files pass (currently 164/165 normal, 1 fail: test_compiler_sized)
 
 **Success metric:** Every feature the roadmap claims as complete actually works in the default pipeline. No more "built but not wired in." No more dead code. No more stubs.
 
@@ -1168,8 +1168,8 @@ Every phase explicitly notes what is already built and what is new work. This ta
 |-----------------------------------|------------------------|
 | Lexer, parser, typechecker | Wire optimizer into `emit` command (L1A) |
 | IR, PIR (L1/L2/L3) | Wire register allocator into `emit` command (L1B) |
-| PE emitter (153/153 valid) | Wire peephole into `emit` command |
-| C codegen (153/153 match — Phase 10B) | ✅ DONE — Vec/HashMap/String migrated to Fides stdlib |
+| PE emitter (165/165 valid) | Wire peephole into `emit` command |
+| C codegen (164/165 match — Phase 10B) | ✅ DONE — Vec/HashMap/String migrated to Fides stdlib |
 | PIR optimizer (23 passes) — enabled by default in `build` | `--lto` for aggressive inlining; PGO removed |
 | Peephole optimizer (9 passes) — always on in `build` command | Wire peephole into `emit` command |
 | Register allocator — wired into `codegen_x64` (`build`/`codegen`) | Wire register allocator into `emit` (L1B) |
@@ -1197,7 +1197,7 @@ Every phase explicitly notes what is already built and what is new work. This ta
 | `parse-header` (verified working) | Extend header parsing (L6B) |
 | Sourcemap command | LSP integration (L7) |
 | REPL command | REPL improvements (L7G) |
-| Test harness (file-based, 153/153 normal pass) | `#[test]` attribute execution (L4J) |
+| Test harness (file-based, 164/165 normal pass) | `#[test]` attribute execution (L4J) |
 | Hot reload (`watch` — native JIT + function diff) | Wire optimizer into `emit` command |
 | **✅ DONE — GPU codegen** (`fidesc gpu --target spirv|ptx`) | Produces SPIR-V binary (340 bytes for hello.fd) |
 | **✅ DONE — `@derive`** (Phase 7.7) | `@derive(Debug/Clone/Serialize/Deserialize)` all work |
@@ -1249,7 +1249,7 @@ When choosing what to work on next, ask:
 **Category: Significant engineering (solvable with strategy)**
 
 **The decision**: Build everything from scratch — no LLVM, no libc, no
-external linker. 86,011 LOC of compiler code, 23 optimization passes,
+external linker. 86,742 LOC of compiler code, 23 optimization passes,
 4 backends (interpreter, C codegen, PE, ELF64).
 
 **Theoretical limitations**:
@@ -1543,7 +1543,7 @@ the "Phase 1: Fix the bugs" and "Phase 2: Close language gaps" work.
 
 **Category: Significant engineering (refocus)**
 
-**The observation**: 69 modules, 17,541 LOC. Average: 253 lines per
+**The observation**: 69 modules, 18,242 LOC. Average: 264 lines per
 module. Many are superficial (`regex.fd` is wildcard matching, not real
 regex; `crypto.fd` is 485 lines, not audited cryptography).
 
@@ -1594,7 +1594,7 @@ wrapper over C ecosystem, with safety on top.
 
 **Category: Strategic decision (not a limitation to solve, but to evaluate)**
 
-**The goal**: Self-hosting (rewrite Fides in Fides). 86,011 LOC to rewrite.
+**The goal**: Self-hosting (rewrite Fides in Fides). 86,742 LOC to rewrite.
 
 **Theoretical limitations**:
 

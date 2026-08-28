@@ -1344,12 +1344,12 @@ pub fn lower_type(ast_ty: &AstType) -> IrType {
         AstType::I16 => IrType::I16,
         AstType::I32 => IrType::I32,
         AstType::I64 => IrType::I64,
-        AstType::I128 => IrType::I64, // I128 lowered to I64 for now
+        AstType::I128 => IrType::I64, // I128 lowered to I64 — 128-bit not needed for self-hosting (C codegen uses AST types for signatures)
         AstType::U8 => IrType::U8,
         AstType::U16 => IrType::U16,
         AstType::U32 => IrType::U32,
         AstType::U64 => IrType::U64,
-        AstType::U128 => IrType::U64, // U128 lowered to U64 for now
+        AstType::U128 => IrType::U64, // U128 lowered to U64 — same reason
         AstType::F32 => IrType::F32,
         AstType::F64 => IrType::F64,
         AstType::Bool => IrType::Bool,
@@ -1667,6 +1667,12 @@ impl IrModule {
                 }
 
                 // Check: block ends with a terminator
+                if block.instructions.is_empty() {
+                    errors.push(format!(
+                        "function '{}': block {} has no instructions (empty block)",
+                        name, block.id.0
+                    ));
+                } else {
                 let last_id = *block.instructions.last().unwrap();
                 if let Some(last_inst) = func.instructions.get(&last_id) {
                     if !last_inst.is_terminator() {
@@ -1719,6 +1725,7 @@ impl IrModule {
                         }
                         _ => {}
                     }
+                }
                 }
             }
 

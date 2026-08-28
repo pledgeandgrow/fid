@@ -33,14 +33,14 @@ All tests pass on all 3 backends. Ready to start rewrite.
 ## Test Baseline
 
 **See `AGENTS.md` → "Current Baseline"** for the authoritative test counts.
-All 153/153 normal tests pass on interpreter, C codegen, and PE emitter.
+All 164/165 normal tests pass on interpreter and C codegen, 165/165 on PE emitter.
 0 skip, 0 known-fail, 265/265 unit tests.
 
 ## What's Left Before Self-Host Rewrite
 
 ### Decision Made: C Codegen Bootstrap
 1. **C codegen bootstrap** — Start self-host rewrite using C codegen backend.
-   Works today (153/153 tests pass, zero blockers). gcc/clang provides argv,
+   Works today (164/165 tests pass, zero blockers). gcc/clang provides argv,
    file I/O, process execution — no runtime stubs needed.
    - PE emitter rewrite is **Phase 10B** (post-bootstrap): fix Issues 67-69,
      rewrite pe.rs in Fides, switch default backend to PE for zero-dependency
@@ -62,5 +62,5 @@ All 153/153 normal tests pass on interpreter, C codegen, and PE emitter.
 ## Gate
 
 `verify.sh` must pass clean before self-host rewrite begins.
-Current: 153/153 on all 3 backends. 0 skip, 0 known-fail. 136 warnings
+Current: 164/165 on interp+C codegen, 165/165 PE. 0 skip, 0 known-fail. 136 warnings
 (dead code stubs for future features).

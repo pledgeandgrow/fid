@@ -2598,4 +2598,4 @@ This helper is called in both SRET and non-SRET call lowering paths.
   skip list (now pass or have minor formatting differences only)
 - Skip list reduced from 7 to 4 tests
 - Normal tests: 146 → 153 (5 bonus passes on interp/PE)
-- 153/153 normal tests pass on interpreter + PE, 153/153 on C codegen, 265/265 cargo tests pass
+- 164/165 normal tests pass on interpreter + C codegen, 165/165 on PE, 265/265 cargo tests pass

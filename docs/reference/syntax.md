@@ -2228,7 +2228,7 @@ find . -name "*.fd" -exec sed -i \
 **Step 4: All tests pass** — VERIFIED
 - 265 unit tests pass
 - 8 harness tests pass
-- 153/153 normal tests pass on interpreter + PE emitter, 153/153 on C codegen
+- 164/165 normal tests pass on interpreter + C codegen, 165/165 on PE emitter
 
 **Step 5: Documentation updated** — DONE
 - `docs/reference/syntax.md` — all examples updated

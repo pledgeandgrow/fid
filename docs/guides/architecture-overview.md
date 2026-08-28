@@ -233,7 +233,7 @@ Phase 6:
 - `src/codegen_c.rs` — IR → C99 source
 - `fidesc ccompile <file> -o <exe>` generates `.c`, invokes `gcc`/`clang`/`cl.exe`
 - Used when targeting platforms the native backends don't yet cover
-- Note: 153/153 test parity with interpreter. Binary hardening enabled.
+- Note: 164/165 test parity with interpreter. Binary hardening enabled.
 
 ---
 

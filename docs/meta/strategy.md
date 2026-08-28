@@ -285,7 +285,7 @@ master of none.
 make it another D, Crystal, or V — technically good, commercially irrelevant.**
 
 The project has built an impressive amount of working compiler infrastructure
-(86,011 LOC, 54 source files, 153/153 C codegen parity (153/153 interp+PE) across 3 backends, 69 stdlib
+(86,742 LOC, 51 source files, 164/165 C codegen parity (164/165 interp, 165/165 PE) across 3 backends, 69 stdlib
 modules, 6 backends, 4 binaries: fidesc/pacte/scribe/veil). But it's spreading into too many domains (games,
 blockchain, robotics, medical, serverless) before it has proven it can do the
 basics better than existing languages.
@@ -331,7 +331,7 @@ Fides source
   └── Hot reload (native JIT)
 ```
 
-153/153 C codegen parity (153/153 interp+PE) is real. This is more
+164/165 C codegen parity (164/165 interp, 165/165 PE) is real. This is more
 backends than most languages ever achieve. History lesson: **"A great runtime
 can sustain multiple languages"** — Fides's IR is its "runtime" and it supports
 many targets.
@@ -354,7 +354,7 @@ doesn't burden the language forever. Scala should have done this. C++ couldn't.
 
 - 265/265 unit tests (cargo test --lib)
 - harness tests 8/8 passed
-- 153/153 interpreter + PE, 153/153 C codegen
+- 164/165 interpreter + C codegen, 165/165 PE
 - `verify.sh` with baseline tracking
 - Golden file generation
 - Bisect tooling
@@ -486,10 +486,10 @@ to choose a systems language.
 ~~Multiple docs are out of sync with reality:~~
 **UPDATE Aug 2026:** Docs have been synchronized with actual state. All test
 counts, LOC, file counts, and phase numbers now match verified reality:
-- `features.md` now says "153/153 C codegen" ✅
-- `features.md` now says "153/153 interpreter" ✅
-- `roadmap-limitations.md` now says "153/153 normal" ✅
-- `roadmap.md` summary now says "153/153" ✅
+- `features.md` now says "164/165 C codegen" ✅
+- `features.md` now says "164/165 interpreter" ✅
+- `roadmap-limitations.md` now says "164/165 normal" ✅
+- `roadmap.md` summary now says "164/165" ✅
 - Phase numbers updated (self-hosting is Phase 10, ecosystem Phase 11, world class Phase 12) ✅
 
 This was a symptom of moving fast without updating all docs. The docs now
@@ -634,7 +634,7 @@ well. Cut the rest until those 3 prove the concept.
 Every doc should be updated when test counts change. ~~The current state where
 `features.md` says 76/78 but reality is 114/114 is unacceptable for a project
 that wants to be taken seriously.~~ **UPDATE Aug 2026: All docs now match
-verified reality (153/153 interpreter+PE, 153/153 C codegen).**
+verified reality (164/165 interpreter+C codegen, 165/165 PE).**
 
 **Recommendation:** Add a pre-commit check: run `fidesc test`, compare
 output to docs, fail if mismatch. Or at minimum, update all docs in the same
@@ -718,7 +718,7 @@ candidate:
 | Dimension | Score | Notes |
 |-----------|-------|-------|
 | Novel design space | 🟢 9/10 | Unique combination no one else has |
-| Technical execution | 🟢 8/10 | 153/153 parity, 6 backends, solid test infra |
+| Technical execution | 🟢 8/10 | 164/165 parity, 6 backends, solid test infra |
 | Scope discipline | 🔴 3/10 | Trying to do everything at once |
 | Ecosystem building | 🔴 2/10 | No users, no packages, no tooling |
 | Focus / prioritization | 🟡 5/10 | Optimizer enabled by default, but still adding features instead of fixing regalloc |

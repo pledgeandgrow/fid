@@ -457,7 +457,7 @@ to 24-byte memory blocks from `stdlib/core.fd`). Fixed by adding
 ## The Timing Question: Self-Host First or Add Features on Rust?
 
 **Note:** For current self-hosting blocker status, see `roadmap.md` Phase 10.
-All 3 language-level blockers are resolved; 153/153 tests pass on all backends.
+All 3 language-level blockers are resolved; 164/165 tests pass on interp+C codegen, 165/165 PE.
 
 **Recommendation: Add features while on Rust. Self-host later.**
 

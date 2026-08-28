@@ -3112,7 +3112,7 @@ impl TypeChecker {
     /// Format a "did you mean...?" suggestion suffix for error messages.
     fn suggestion_suffix(&self, name: &str) -> String {
         // Gather all known names (functions, consts, structs, type aliases, enums)
-        let builtin_names = vec!["print".to_string(), "assert".to_string(), "assert_eq".to_string()];
+        let builtin_names = vec!["print".to_string(), "assert".to_string(), "assert_msg".to_string(), "assert_eq".to_string(), "assert_eq_msg".to_string()];
         let all_names: Vec<&String> = self.funcs.keys()
             .chain(self.consts.keys())
             .chain(self.structs.keys())
@@ -3195,7 +3195,14 @@ impl TypeChecker {
     }
 
     fn declare(&mut self, name: &str, ty: Type) {
-        self.scopes.last_mut().unwrap().insert(name.to_string(), ty);
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name.to_string(), ty);
+        } else {
+            // Defensive: should never happen — a scope is always pushed before declare.
+            let mut scope = HashMap::new();
+            scope.insert(name.to_string(), ty);
+            self.scopes.push(scope);
+        }
     }
 
     fn lookup(&self, name: &str) -> Option<&Type> {

@@ -1,0 +1,566 @@
+// Test: SH-6.3 — Fides JSON module parity with Rust json.rs
+//
+// Tests parse, dump, escape_string for all JSON types.
+// Verifies round-trip: parse(dump(x)) == x
+use core;
+use vec;
+use string;
+use compiler::json;
+
+fn test_null() -> i64 {
+    val result = json_parse("null");
+    match result {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Null => { return 0; }
+                _ => { print("FAIL: expected Null\n"); return 1; }
+            }
+        }
+        JsonResult::Err(e) => { print("FAIL: parse error: "); print(e); print("\n"); return 1; }
+    }
+}
+
+fn test_bool() -> i64 {
+    val r1 = json_parse("true");
+    match r1 {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Bool(b) => {
+                    if !b { print("FAIL: expected true\n"); return 1; }
+                }
+                _ => { print("FAIL: expected Bool\n"); return 1; }
+            }
+        }
+        JsonResult::Err(_) => { print("FAIL: parse error for true\n"); return 1; }
+    }
+    val r2 = json_parse("false");
+    match r2 {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Bool(b) => {
+                    if b { print("FAIL: expected false\n"); return 1; }
+                }
+                _ => { print("FAIL: expected Bool\n"); return 1; }
+            }
+        }
+        JsonResult::Err(_) => { print("FAIL: parse error for false\n"); return 1; }
+    }
+    return 0;
+}
+
+fn test_number() -> i64 {
+    // Integer
+    val r1 = json_parse("42");
+    match r1 {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Num(n) => {
+                    if n != 42.0 { print("FAIL: expected 42.0\n"); return 1; }
+                }
+                _ => { print("FAIL: expected Num\n"); return 1; }
+            }
+        }
+        JsonResult::Err(_) => { print("FAIL: parse error for 42\n"); return 1; }
+    }
+    // Negative integer
+    val r2 = json_parse("-17");
+    match r2 {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Num(n) => {
+                    if n != -17.0 { print("FAIL: expected -17.0\n"); return 1; }
+                }
+                _ => { print("FAIL: expected Num\n"); return 1; }
+            }
+        }
+        JsonResult::Err(_) => { print("FAIL: parse error for -17\n"); return 1; }
+    }
+    // Float
+    val r3 = json_parse("3.14");
+    match r3 {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Num(n) => {
+                    if n != 3.14 { print("FAIL: expected 3.14\n"); return 1; }
+                }
+                _ => { print("FAIL: expected Num\n"); return 1; }
+            }
+        }
+        JsonResult::Err(_) => { print("FAIL: parse error for 3.14\n"); return 1; }
+    }
+    // Exponent
+    val r4 = json_parse("1e3");
+    match r4 {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Num(n) => {
+                    if n != 1000.0 { print("FAIL: expected 1000.0\n"); return 1; }
+                }
+                _ => { print("FAIL: expected Num\n"); return 1; }
+            }
+        }
+        JsonResult::Err(_) => { print("FAIL: parse error for 1e3\n"); return 1; }
+    }
+    return 0;
+}
+
+fn test_string() -> i64 {
+    val r = json_parse("\"hello world\"");
+    match r {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Str(s) => {
+                    if !str_equal(s, "hello world") {
+                        print("FAIL: expected 'hello world', got '"); print(s); print("'\n");
+                        return 1;
+                    }
+                }
+                _ => { print("FAIL: expected Str\n"); return 1; }
+            }
+        }
+        JsonResult::Err(_) => { print("FAIL: parse error for string\n"); return 1; }
+    }
+    // Escape sequences
+    val r2 = json_parse("\"hello\\nworld\"");
+    match r2 {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Str(s) => {
+                    if !str_equal(s, "hello\nworld") {
+                        print("FAIL: escape \\n not parsed correctly\n");
+                        return 1;
+                    }
+                }
+                _ => { print("FAIL: expected Str\n"); return 1; }
+            }
+        }
+        JsonResult::Err(_) => { print("FAIL: parse error for escaped string\n"); return 1; }
+    }
+    // Tab escape
+    val r3 = json_parse("\"a\\tb\"");
+    match r3 {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Str(s) => {
+                    if !str_equal(s, "a\tb") {
+                        print("FAIL: escape \\t not parsed correctly\n");
+                        return 1;
+                    }
+                }
+                _ => { print("FAIL: expected Str\n"); return 1; }
+            }
+        }
+        JsonResult::Err(_) => { print("FAIL: parse error for tab escape\n"); return 1; }
+    }
+    return 0;
+}
+
+fn test_array() -> i64 {
+    val r = json_parse("[1, 2, 3]");
+    match r {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Arr(arr) => {
+                    if arr.len() != 3 { print("FAIL: expected 3 elements\n"); return 1; }
+                    var i: i64 = 0;
+                    while i < arr.len() {
+                        match arr.get(i) {
+                            Json::Num(n) => {
+                                var expected = (i + 1) as f64;
+                                if n != expected {
+                                    print("FAIL: array element mismatch\n");
+                                    return 1;
+                                }
+                            }
+                            _ => { print("FAIL: expected Num in array\n"); return 1; }
+                        }
+                        i = i + 1;
+                    }
+                }
+                _ => { print("FAIL: expected Arr\n"); return 1; }
+            }
+        }
+        JsonResult::Err(_) => { print("FAIL: parse error for array\n"); return 1; }
+    }
+    // Empty array
+    val r2 = json_parse("[]");
+    match r2 {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Arr(arr) => {
+                    if arr.len() != 0 { print("FAIL: expected empty array\n"); return 1; }
+                }
+                _ => { print("FAIL: expected Arr\n"); return 1; }
+            }
+        }
+        JsonResult::Err(_) => { print("FAIL: parse error for empty array\n"); return 1; }
+    }
+    return 0;
+}
+
+fn test_object() -> i64 {
+    val r = json_parse("{\"name\":\"test\",\"age\":30}");
+    match r {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Obj(obj) => {
+                    if obj.len() != 2 { print("FAIL: expected 2 keys\n"); return 1; }
+                    // Check "name" field
+                    if !obj.contains("name") { print("FAIL: missing 'name' key\n"); return 1; }
+                    match obj.get("name") {
+                        Json::Str(s) => {
+                            if !str_equal(s, "test") {
+                                print("FAIL: name mismatch\n");
+                                return 1;
+                            }
+                        }
+                        _ => { print("FAIL: expected Str for name\n"); return 1; }
+                    }
+                    // Check "age" field
+                    match obj.get("age") {
+                        Json::Num(n) => {
+                            if n != 30.0 { print("FAIL: age mismatch\n"); return 1; }
+                        }
+                        _ => { print("FAIL: expected Num for age\n"); return 1; }
+                    }
+                }
+                _ => { print("FAIL: expected Obj\n"); return 1; }
+            }
+        }
+        JsonResult::Err(_) => { print("FAIL: parse error for object\n"); return 1; }
+    }
+    // Empty object
+    val r2 = json_parse("{}");
+    match r2 {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Obj(obj) => {
+                    if !obj.is_empty() { print("FAIL: expected empty object\n"); return 1; }
+                }
+                _ => { print("FAIL: expected Obj\n"); return 1; }
+            }
+        }
+        JsonResult::Err(_) => { print("FAIL: parse error for empty object\n"); return 1; }
+    }
+    return 0;
+}
+
+fn test_nested() -> i64 {
+    val r = json_parse("{\"a\":[1,2],\"b\":{\"c\":true}}");
+    match r {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Obj(obj) => {
+                    // Check "a" is array [1, 2]
+                    match obj.get("a") {
+                        Json::Arr(arr) => {
+                            if arr.len() != 2 { print("FAIL: nested array len\n"); return 1; }
+                        }
+                        _ => { print("FAIL: expected Arr for 'a'\n"); return 1; }
+                    }
+                    // Check "b" is object with "c": true
+                    match obj.get("b") {
+                        Json::Obj(inner) => {
+                            match inner.get("c") {
+                                Json::Bool(b) => {
+                                    if !b { print("FAIL: expected true for 'c'\n"); return 1; }
+                                }
+                                _ => { print("FAIL: expected Bool for 'c'\n"); return 1; }
+                            }
+                        }
+                        _ => { print("FAIL: expected Obj for 'b'\n"); return 1; }
+                    }
+                }
+                _ => { print("FAIL: expected Obj\n"); return 1; }
+            }
+        }
+        JsonResult::Err(_) => { print("FAIL: parse error for nested\n"); return 1; }
+    }
+    return 0;
+}
+
+fn test_dump() -> i64 {
+    // Dump null
+    val s1 = json_dump(Json::Null, false);
+    if !str_equal(s1, "null") { print("FAIL: dump null = '"); print(s1); print("'\n"); return 1; }
+
+    // Dump bool
+    val s2 = json_dump(Json::Bool(true), false);
+    if !str_equal(s2, "true") { print("FAIL: dump true\n"); return 1; }
+    val s3 = json_dump(Json::Bool(false), false);
+    if !str_equal(s3, "false") { print("FAIL: dump false\n"); return 1; }
+
+    // Dump number (integer)
+    val s4 = json_dump(Json::Num(42.0), false);
+    if !str_equal(s4, "42") { print("FAIL: dump 42 = '"); print(s4); print("'\n"); return 1; }
+
+    // Dump number (negative)
+    val s5 = json_dump(Json::Num(-17.0), false);
+    if !str_equal(s5, "-17") { print("FAIL: dump -17 = '"); print(s5); print("'\n"); return 1; }
+
+    // Dump string
+    val s6 = json_dump(Json::Str("hello"), false);
+    if !str_equal(s6, "\"hello\"") { print("FAIL: dump string = '"); print(s6); print("'\n"); return 1; }
+
+    // Dump empty array
+    val s7 = json_dump(Json::Arr(Vec::new()), false);
+    if !str_equal(s7, "[]") { print("FAIL: dump empty array\n"); return 1; }
+
+    // Dump empty object
+    val s8 = json_dump(Json::Obj(JsonObject::new()), false);
+    if !str_equal(s8, "{}") { print("FAIL: dump empty object\n"); return 1; }
+
+    return 0;
+}
+
+fn test_dump_array() -> i64 {
+    var arr = Vec::new();
+    arr.push(Json::Num(1.0));
+    arr.push(Json::Num(2.0));
+    arr.push(Json::Num(3.0));
+    val s = json_dump(Json::Arr(arr), false);
+    if !str_equal(s, "[1,2,3]") { print("FAIL: dump array = '"); print(s); print("'\n"); return 1; }
+    return 0;
+}
+
+fn test_dump_object() -> i64 {
+    var obj = JsonObject::new();
+    obj.insert("b", Json::Num(2.0));
+    obj.insert("a", Json::Num(1.0));
+    // Keys should be sorted in output
+    val s = json_dump(Json::Obj(obj), false);
+    if !str_equal(s, "{\"a\":1,\"b\":2}") {
+        print("FAIL: dump object = '"); print(s); print("'\n");
+        return 1;
+    }
+    return 0;
+}
+
+fn test_dump_pretty() -> i64 {
+    var arr = Vec::new();
+    arr.push(Json::Num(1.0));
+    arr.push(Json::Num(2.0));
+    val s = json_dump(Json::Arr(arr), true);
+    // Expected: [\n  1,\n  2\n]
+    val expected = "[\n  1,\n  2\n]";
+    if !str_equal(s, expected) {
+        print("FAIL: dump pretty array = '"); print(s); print("'\n");
+        return 1;
+    }
+    return 0;
+}
+
+fn test_roundtrip() -> i64 {
+    val inputs = Vec::new();
+    inputs.push("null");
+    inputs.push("true");
+    inputs.push("false");
+    inputs.push("42");
+    inputs.push("-17");
+    inputs.push("3.14");
+    inputs.push("\"hello\"");
+    inputs.push("[]");
+    inputs.push("[1,2,3]");
+    inputs.push("{}");
+    inputs.push("{\"a\":1,\"b\":2}");
+    inputs.push("{\"x\":[1,2],\"y\":{\"z\":true}}");
+    inputs.push("  42  ");  // whitespace
+    inputs.push("[ 1 , 2 , 3 ]");  // whitespace in array
+
+    var i: i64 = 0;
+    while i < inputs.len() {
+        val input = inputs.get(i);
+        val parse_result = json_parse(input);
+        match parse_result {
+            JsonResult::Ok(v) => {
+                val dumped = json_dump(v, false);
+                // For whitespace-containing inputs, compare against canonical form
+                val canonical = json_parse(dumped);
+                match canonical {
+                    JsonResult::Ok(v2) => {
+                        val dumped2 = json_dump(v2, false);
+                        if !str_equal(dumped, dumped2) {
+                            print("FAIL: roundtrip mismatch for '");
+                            print(input);
+                            print("': '");
+                            print(dumped);
+                            print("' vs '");
+                            print(dumped2);
+                            print("'\n");
+                            return 1;
+                        }
+                    }
+                    JsonResult::Err(_) => {
+                        print("FAIL: re-parse failed for '");
+                        print(dumped);
+                        print("'\n");
+                        return 1;
+                    }
+                }
+            }
+            JsonResult::Err(e) => {
+                print("FAIL: parse failed for '");
+                print(input);
+                print("': ");
+                print(e);
+                print("\n");
+                return 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_escape_string() -> i64 {
+    // Basic string
+    val s1 = json_escape_string("hello");
+    if !str_equal(s1, "\"hello\"") { print("FAIL: escape basic\n"); return 1; }
+
+    // Quote escape
+    val s2 = json_escape_string("say \"hi\"");
+    if !str_equal(s2, "\"say \\\"hi\\\"\"") { print("FAIL: escape quote = '"); print(s2); print("'\n"); return 1; }
+
+    // Backslash escape
+    val s3 = json_escape_string("back\\slash");
+    if !str_equal(s3, "\"back\\\\slash\"") { print("FAIL: escape backslash\n"); return 1; }
+
+    // Newline escape
+    val s4 = json_escape_string("line1\nline2");
+    if !str_equal(s4, "\"line1\\nline2\"") { print("FAIL: escape newline\n"); return 1; }
+
+    // Tab escape
+    val s5 = json_escape_string("a\tb");
+    if !str_equal(s5, "\"a\\tb\"") { print("FAIL: escape tab\n"); return 1; }
+
+    return 0;
+}
+
+fn test_error_cases() -> i64 {
+    // Trailing characters
+    val r1 = json_parse("42 extra");
+    match r1 {
+        JsonResult::Ok(_) => { print("FAIL: should reject trailing chars\n"); return 1; }
+        JsonResult::Err(_) => { }
+    }
+
+    // Unterminated string
+    val r2 = json_parse("\"hello");
+    match r2 {
+        JsonResult::Ok(_) => { print("FAIL: should reject unterminated string\n"); return 1; }
+        JsonResult::Err(_) => { }
+    }
+
+    // Unterminated array
+    val r3 = json_parse("[1, 2");
+    match r3 {
+        JsonResult::Ok(_) => { print("FAIL: should reject unterminated array\n"); return 1; }
+        JsonResult::Err(_) => { }
+    }
+
+    // Unterminated object
+    val r4 = json_parse("{\"a\":1");
+    match r4 {
+        JsonResult::Ok(_) => { print("FAIL: should reject unterminated object\n"); return 1; }
+        JsonResult::Err(_) => { }
+    }
+
+    // Empty input
+    val r5 = json_parse("");
+    match r5 {
+        JsonResult::Ok(_) => { print("FAIL: should reject empty input\n"); return 1; }
+        JsonResult::Err(_) => { }
+    }
+
+    return 0;
+}
+
+fn test_unicode_escape() -> i64 {
+    // \u0041 = 'A'
+    val r = json_parse("\"\\u0041\"");
+    match r {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Str(s) => {
+                    if !str_equal(s, "A") {
+                        print("FAIL: unicode escape \\u0041 = '"); print(s); print("'\n");
+                        return 1;
+                    }
+                }
+                _ => { print("FAIL: expected Str for unicode\n"); return 1; }
+            }
+        }
+        JsonResult::Err(e) => { print("FAIL: unicode parse error: "); print(e); print("\n"); return 1; }
+    }
+    // \u00e9 = é (2-byte UTF-8: 0xC3 0xA9)
+    val r2 = json_parse("\"\\u00e9\"");
+    match r2 {
+        JsonResult::Ok(v) => {
+            match v {
+                Json::Str(_) => { }  // Just verify it parses without error
+                _ => { print("FAIL: expected Str for unicode e9\n"); return 1; }
+            }
+        }
+        JsonResult::Err(e) => { print("FAIL: unicode e9 parse error: "); print(e); print("\n"); return 1; }
+    }
+    return 0;
+}
+
+fn main() -> i64 {
+    var failures: i64 = 0;
+
+    print("test_null... ");
+    if test_null() == 0 { print("OK\n"); } else { failures = failures + 1; }
+
+    print("test_bool... ");
+    if test_bool() == 0 { print("OK\n"); } else { failures = failures + 1; }
+
+    print("test_number... ");
+    if test_number() == 0 { print("OK\n"); } else { failures = failures + 1; }
+
+    print("test_string... ");
+    if test_string() == 0 { print("OK\n"); } else { failures = failures + 1; }
+
+    print("test_array... ");
+    if test_array() == 0 { print("OK\n"); } else { failures = failures + 1; }
+
+    print("test_object... ");
+    if test_object() == 0 { print("OK\n"); } else { failures = failures + 1; }
+
+    print("test_nested... ");
+    if test_nested() == 0 { print("OK\n"); } else { failures = failures + 1; }
+
+    print("test_dump... ");
+    if test_dump() == 0 { print("OK\n"); } else { failures = failures + 1; }
+
+    print("test_dump_array... ");
+    if test_dump_array() == 0 { print("OK\n"); } else { failures = failures + 1; }
+
+    print("test_dump_object... ");
+    if test_dump_object() == 0 { print("OK\n"); } else { failures = failures + 1; }
+
+    print("test_dump_pretty... ");
+    if test_dump_pretty() == 0 { print("OK\n"); } else { failures = failures + 1; }
+
+    print("test_roundtrip... ");
+    if test_roundtrip() == 0 { print("OK\n"); } else { failures = failures + 1; }
+
+    print("test_escape_string... ");
+    if test_escape_string() == 0 { print("OK\n"); } else { failures = failures + 1; }
+
+    print("test_error_cases... ");
+    if test_error_cases() == 0 { print("OK\n"); } else { failures = failures + 1; }
+
+    print("test_unicode_escape... ");
+    if test_unicode_escape() == 0 { print("OK\n"); } else { failures = failures + 1; }
+
+    print("\n");
+    if failures == 0 {
+        print("All JSON tests passed!\n");
+    } else {
+        print("FAILURES: ");
+        print(int_to_str(failures));
+        print("\n");
+    }
+    return failures;
+}

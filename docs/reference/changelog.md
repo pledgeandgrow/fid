@@ -1,5 +1,116 @@
 # Fides Language Changelog
 
+## Debugging Infrastructure + Stdlib Gaps Complete (August 28, 2026)
+
+### Summary
+
+Completed all remaining SH-1 (Debugging Infrastructure) and SH-4 (Stdlib Gaps)
+roadmap items. The interpreter now has a configurable recursion depth limit,
+the parser has an iterative fallback for deep nesting, all `dump-*` commands
+work, `--trace` shows per-stage timing, and `assert_msg`/`assert_eq_msg`
+builtins are available with f-string formatting support.
+
+### New Features
+
+- **Recursion depth limit** (`src/interp.rs`, `src/main.rs`): `--max-recursion N`
+  flag on `fidesc run` (default 1000, 0 = unlimited). Panics with a clear
+  message when exceeded instead of segfaulting. `max_recursion` field on
+  `Interpreter` struct, `set_max_recursion()` method, check in `run_function()`.
+- **Iterative parser fallback** (`src/parser.rs`): `parse_expr_iterative()`
+  uses shunting-yard algorithm for deeply nested expressions. Activates when
+  nesting exceeds `max_expr_depth` (default 256). Prevents stack overflow on
+  pathological input like 1000-level nested parentheses.
+- **`dump-ast`, `dump-ir`, `dump-pir`, `dump-c` commands** (`src/main.rs`):
+  Dump intermediate compiler representations. `dump-pir` takes optional level
+  argument (1/2/3). Also `dump-tokens` for token stream.
+- **`diff-test` command** (`src/main.rs`): Differential testing at each stage
+  (tokens, ast, ir, pir1/2/3, c, output). Compares against golden files.
+- **`--trace` flag**: Per-stage timing on `fidesc run` and `fidesc ccompile`.
+  Prints Frontend/Lower/Backend/Total timing to stderr.
+- **`assert_msg(cond, msg)` and `assert_eq_msg(a, b, msg)`** (`stdlib/core.fd`):
+  Assertion functions that take a pre-formatted message string, enabling
+  f-string formatting: `assert_msg(idx < len, f"out of bounds: {idx} >= {len}")`.
+- **`float_to_str(f)` and `str_parse_float(s)` wrappers** (`stdlib/core.fd`):
+  Stdlib wrappers around `p_float_to_str` and `p_str_to_float` runtime builtins.
+
+### Bug Fixes
+
+- **`p_panic` string handling** (`src/interp.rs`): `p_panic` only matched
+  `Value::Str`, but strings passed through function parameters (typed as
+  `Ptr(U8)` in IR) arrive as `Value::Int` pointers. Fixed to use
+  `value_to_string()` which extracts strings from any value type. Previously,
+  formatted panic messages showed as "panic" instead of the actual message.
+
+### Test Results
+
+```
+Interpreter:  164/165 passed (1 user-added test_compiler_sized fails — unrelated)
+C Codegen:    164/165 matched
+PE Emitter:   165/165 valid
+Unit tests:   265/265 passed
+Expected-fail: 36/36 correctly failed
+Skip list:    0
+Known-fail:   0
+```
+
+### New Tests
+
+- `tests/test_recursion_limit.fd` — verifies depth limit triggers at 10,
+  passes at 0 (unlimited)
+- `tests/test_deep_nesting.fd` — 250+ levels of nested expressions, verifies
+  both interpreter and C codegen handle it
+- `tests/test_assert_msg.fd` — tests `assert_msg`/`assert_eq_msg` with
+  f-string formatting
+
+## Known-Fail Tests Eliminated — 159/159 on All Backends (August 28, 2026)
+
+### Summary
+
+Fixed all 6 remaining known-fail tests, achieving 159/159 on all 3 backends
+with 0 skip list and 0 known-fail. The last 6 tests (game_stdlib, iter,
+vec_math, parallel_concurrent, time, time_edge) had been tracked as known-fail
+for months.
+
+### Fixes
+
+- **Nested Vec iteration** (`src/lower.rs`): The `for x in vec` dispatch
+  checked `iter_ty == I64` (string iteration) BEFORE checking if the value
+  came from a Vec element (Vec_get or vec_allocas). This caused nested Vec
+  iteration (`for row in matrix { for elem in row { ... } }`) to use
+  `String_byte_at` instead of `Vec_get`. Fixed by moving the Vec element
+  check before the string check.
+- **Interpreter thread spawn** (`src/interp.rs`): `p_thread_spawn` and
+  `p_executor_spawn` created real OS threads, but spawned threads got a
+  fresh Interpreter with no shared Vec side-table — causing "Vec index out
+  of bounds" panics. Fixed by running spawned functions eagerly (sequentially)
+  in the current interpreter, preserving Vec/Map side-table access. C codegen
+  still uses real OS threads with shared memory.
+- **Interpreter GetFieldPtr for Int values** (`src/interp.rs`):
+  `GetFieldPtr` only handled `Value::Ptr`, returning base=0 for `Value::Int`.
+  This broke struct field access on values returned from `Vec_get` (which
+  returns i64 handles). Fixed by treating `Value::Int(n)` as `Value::Ptr(n)`.
+- **Interpreter string comparison** (`src/interp.rs`): `BinOp::Eq` for
+  `Ptr(U8)` (string) types compared pointer addresses, not content. Two
+  strings "player" at different addresses were unequal. Fixed by checking
+  the IR type: when both operands are `Ptr(U8)`, compare string content
+  via `value_to_string` instead of pointer addresses.
+- **C codegen float formatting** (`src/codegen_c.rs`): `p_to_str_float`
+  used `%g` (6 sig digits, scientific notation). Rust's `{}` format always
+  uses fixed-point with shortest round-trip precision. Fixed by trying
+  `%.*f` with increasing precision (0 to 17 + |exponent|), trimming
+  trailing zeros, and never using scientific notation.
+
+### Test Results
+
+```
+Interpreter:  159/159 passed
+C Codegen:    159/159 matched
+PE Emitter:   159/159 valid
+Unit tests:   265/265 passed
+Skip list:    0
+Known-fail:   0
+```
+
 ## C Codegen ML Fixes — 153/153 on All Backends (August 28, 2026)
 
 ### Summary

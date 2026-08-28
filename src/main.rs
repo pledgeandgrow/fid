@@ -353,13 +353,19 @@ fn main() {
 
         "run" => {
             if args.len() < 3 {
-                eprintln!("Usage: fidesc run <file.fd> [-v] [--release] [--post-mortem]");
+                eprintln!("Usage: fidesc run <file.fd> [-v] [--release] [--post-mortem] [--max-recursion N] [--trace]");
                 process::exit(1);
             }
             let input = &args[2];
             let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
             let release = args.iter().any(|a| a == "--release");
             let post_mortem = args.iter().any(|a| a == "--post-mortem");
+            let trace = args.iter().any(|a| a == "--trace");
+            // SH-1.4: --max-recursion N (default 1000, 0 = unlimited)
+            let max_recursion = args.iter().position(|a| a == "--max-recursion")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1000);
             let source = match fs::read_to_string(input) {
                 Ok(s) => s,
                 Err(e) => {
@@ -410,7 +416,7 @@ fn main() {
                 }
             }
 
-            match compiler::interpret_source_with_path_release(&source, input, verbose, release) {
+            match compiler::interpret_source_traced(&source, input, verbose, release, max_recursion, trace) {
                 Ok((result, trace)) => {
                     match result {
                         RunResult::Return(val) => {
@@ -488,9 +494,368 @@ fn main() {
             println!("Written in Rust — will be replaced by self-hosted Fides compiler");
         }
 
+        "dump-c" => {
+            // SH-1.3: Print generated C source to stdout (for differential testing)
+            if args.len() < 3 {
+                eprintln!("Usage: fidesc dump-c <file.fd>");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+            match compiler::ccompile_source_traced(&source, input, false) {
+                Ok(c_code) => {
+                    print!("{}", c_code);
+                }
+                Err(errors) => {
+                    print_errors(&errors);
+                    process::exit(1);
+                }
+            }
+        }
+
+        // SH-1.3: dump-* aliases for existing dump commands.
+        // These provide a consistent "dump-<stage>" naming convention
+        // for golden-file generation and differential testing.
+        "dump-tokens" => {
+            if args.len() < 3 {
+                eprintln!("Usage: fidesc dump-tokens <file.fd>");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+            for tok in compiler::lex(&source) {
+                println!("{}", tok);
+            }
+        }
+        "dump-ast" => {
+            if args.len() < 3 {
+                eprintln!("Usage: fidesc dump-ast <file.fd>");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+            match compiler::parse_to_ast(&source) {
+                Ok(ast) => println!("{}", ast),
+                Err(e) => {
+                    eprintln!("{}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        "dump-ir" => {
+            if args.len() < 3 {
+                eprintln!("Usage: fidesc dump-ir <file.fd>");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+            match compiler::lower_to_ir(&source) {
+                Ok(ir) => println!("{}", ir),
+                Err(errors) => {
+                    print_errors(&errors);
+                    process::exit(1);
+                }
+            }
+        }
+        "dump-pir" => {
+            // dump-pir <file.fd> [1|2|3|all] [--opt]
+            // Alias for "pir" command with consistent naming.
+            if args.len() < 3 {
+                eprintln!("Usage: fidesc dump-pir <file.fd> [1|2|3|all] [--opt]");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let level_arg = args.get(3).map(|s| s.as_str()).unwrap_or("all");
+            let want_opt = args.iter().any(|a| a == "--opt");
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+            let module = match compiler::lower_to_ir_module(&source) {
+                Ok(m) => m,
+                Err(errors) => {
+                    print_errors(&errors);
+                    process::exit(1);
+                }
+            };
+            let level = pir::PirLevel::parse(level_arg).unwrap_or(pir::PirLevel::All);
+            match level {
+                pir::PirLevel::L1 => {
+                    let l1 = pir::lower_ir_to_l1(&module);
+                    print!("{}", pir::format_l1(&l1));
+                }
+                pir::PirLevel::L2 => {
+                    let l1 = pir::lower_ir_to_l1(&module);
+                    let mut l2 = pir::lower_l1_to_l2(&l1);
+                    if want_opt {
+                        let stats = opt::optimize_l2(&mut l2);
+                        eprintln!(";; optimization stats: {:?}", stats);
+                    }
+                    print!("{}", pir::format_l2(&l2));
+                }
+                pir::PirLevel::L3 => {
+                    let l1 = pir::lower_ir_to_l1(&module);
+                    let l2 = pir::lower_l1_to_l2(&l1);
+                    let l3 = pir::lower_l2_to_l3(&l2, &module);
+                    print!("{}", pir::format_l3(&l3));
+                }
+                pir::PirLevel::All => {
+                    if want_opt {
+                        eprintln!(";; note: --opt applies to L2 only; showing all levels with L2 optimized");
+                        let l1 = pir::lower_ir_to_l1(&module);
+                        let mut l2 = pir::lower_l1_to_l2(&l1);
+                        let stats = opt::optimize_l2(&mut l2);
+                        eprintln!(";; optimization stats: {:?}", stats);
+                        let l3 = pir::lower_l2_to_l3(&l2, &module);
+                        print!("{}", pir::format_l1(&l1));
+                        print!("\n");
+                        print!("{}", pir::format_l2(&l2));
+                        print!("\n");
+                        print!("{}", pir::format_l3(&l3));
+                    } else {
+                        print!("{}", pir::generate_pir(&module, pir::PirLevel::All));
+                    }
+                }
+            }
+        }
+        // SH-2: diff-test — differential testing against golden files.
+        // Usage: fidesc diff-test <file.fd> --stage <tokens|ast|ir|pir1|pir2|pir3|c|output>
+        // Compares current output to golden file in tests/golden/<name>/<name>.<ext>
+        "diff-test" => {
+            if args.len() < 3 {
+                eprintln!("Usage: fidesc diff-test <file.fd> --stage <stage>");
+                eprintln!("Stages: tokens, ast, ir, pir1, pir2, pir3, c, output");
+                eprintln!("Optional: --update  (overwrite golden file with current output)");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let mut stage: Option<&str> = None;
+            let mut update_golden = false;
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--stage" => {
+                        i += 1;
+                        if i < args.len() {
+                            stage = Some(&args[i]);
+                        }
+                    }
+                    "--update" => {
+                        update_golden = true;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let stage = match stage {
+                Some(s) => s,
+                None => {
+                    eprintln!("Error: --stage <stage> is required");
+                    eprintln!("Stages: tokens, ast, ir, pir1, pir2, pir3, c, output");
+                    process::exit(1);
+                }
+            };
+
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+
+            let test_name = std::path::Path::new(input)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let golden_dir = format!("tests/golden/{}", test_name);
+            let (golden_ext, current_output): (&str, String) = match stage {
+                "tokens" => ("tokens", {
+                    let mut s = String::new();
+                    for tok in compiler::lex(&source) {
+                        s.push_str(&format!("{}\n", tok));
+                    }
+                    s
+                }),
+                "ast" => ("ast", {
+                    match compiler::parse_to_ast(&source) {
+                        Ok(ast) => format!("{}\n", ast),
+                        Err(e) => {
+                            eprintln!("Parse error: {}", e);
+                            process::exit(1);
+                        }
+                    }
+                }),
+                "ir" => ("ir", {
+                    match compiler::lower_to_ir(&source) {
+                        Ok(ir) => format!("{}\n", ir),
+                        Err(errors) => {
+                            print_errors(&errors);
+                            process::exit(1);
+                        }
+                    }
+                }),
+                "pir1" | "pir2" | "pir3" => {
+                    let level_num: u32 = stage[3..].parse().unwrap_or(0);
+                    let ext_str: &'static str = match level_num {
+                        1 => "pir_l1",
+                        2 => "pir_l2",
+                        _ => "pir_l3",
+                    };
+                    let out = match compiler::lower_to_ir_module(&source) {
+                        Ok(module) => {
+                            let l1 = pir::lower_ir_to_l1(&module);
+                            if level_num == 1 {
+                                pir::format_l1(&l1)
+                            } else {
+                                let l2 = pir::lower_l1_to_l2(&l1);
+                                if level_num == 2 {
+                                    pir::format_l2(&l2)
+                                } else {
+                                    let l3 = pir::lower_l2_to_l3(&l2, &module);
+                                    pir::format_l3(&l3)
+                                }
+                            }
+                        }
+                        Err(errors) => {
+                            print_errors(&errors);
+                            process::exit(1);
+                        }
+                    };
+                    (ext_str, format!("{}\n", out))
+                }
+                "c" => ("c", {
+                    match compiler::ccompile_source_traced(&source, input, false) {
+                        Ok(c_code) => format!("{}\n", c_code),
+                        Err(errors) => {
+                            print_errors(&errors);
+                            process::exit(1);
+                        }
+                    }
+                }),
+                "output" => ("out", {
+                    // Capture stdout by running the program as a subprocess
+                    let current_exe = std::env::current_exe().unwrap_or_default();
+                    let out = process::Command::new(&current_exe)
+                        .args(["run", input])
+                        .output();
+                    match out {
+                        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+                        Err(e) => {
+                            eprintln!("Failed to run: {}", e);
+                            process::exit(1);
+                        }
+                    }
+                }),
+                _ => {
+                    eprintln!("Unknown stage: '{}'", stage);
+                    eprintln!("Stages: tokens, ast, ir, pir1, pir2, pir3, c, output");
+                    process::exit(1);
+                }
+            };
+            let golden_path = format!("{}/{}.{}", golden_dir, test_name, golden_ext);
+
+            if update_golden {
+                std::fs::create_dir_all(&golden_dir).ok();
+                std::fs::write(&golden_path, &current_output).ok();
+                println!("Updated golden file: {}", golden_path);
+                return;
+            }
+
+            let golden = match fs::read_to_string(&golden_path) {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!("No golden file: {}", golden_path);
+                    eprintln!("Run: fidesc diff-test {} --stage {} --update", input, stage);
+                    process::exit(2);
+                }
+            };
+
+            // Normalize: sort lines for stages with non-deterministic ordering
+            let normalize_sort = |s: &str| -> String {
+                let mut lines: Vec<&str> = s.lines().filter(|l| !l.is_empty()).collect();
+                lines.sort();
+                lines.join("\n")
+            };
+            let needs_sort = matches!(stage, "ir" | "pir1" | "pir2" | "pir3" | "c");
+
+            let (norm_current, norm_golden) = if needs_sort {
+                (normalize_sort(&current_output), normalize_sort(&golden))
+            } else {
+                (current_output.clone(), golden.clone())
+            };
+
+            if norm_current == norm_golden {
+                println!("{}: {} matches golden ✅", input, stage);
+            } else {
+                println!("{}: {} DIFFERS from golden ❌", input, stage);
+                println!();
+                let diff: Vec<String> = norm_current
+                    .lines()
+                    .zip(norm_golden.lines())
+                    .enumerate()
+                    .filter_map(|(i, (c, g))| {
+                        if c != g {
+                            Some(format!("  line {}: - {} | + {}", i + 1, g, c))
+                        } else {
+                            None
+                        }
+                    })
+                    .take(20)
+                    .collect();
+                if diff.is_empty() {
+                    // Length mismatch
+                    let cur_lines: Vec<&str> = norm_current.lines().collect();
+                    let gold_lines: Vec<&str> = norm_golden.lines().collect();
+                    println!("  Line count differs: golden={} vs current={}", gold_lines.len(), cur_lines.len());
+                    let max = cur_lines.len().max(gold_lines.len());
+                    for i in (cur_lines.len().min(gold_lines.len()))..max.min(cur_lines.len().min(gold_lines.len()) + 20) {
+                        let c = cur_lines.get(i).copied().unwrap_or("<missing>");
+                        let g = gold_lines.get(i).copied().unwrap_or("<missing>");
+                        if c != g {
+                            println!("  line {}: - {} | + {}", i + 1, g, c);
+                        }
+                    }
+                } else {
+                    for d in diff {
+                        println!("{}", d);
+                    }
+                }
+                process::exit(1);
+            }
+        }
+
         "ccompile" => {
             if args.len() < 3 {
-                eprintln!("Usage: fidesc ccompile <file.fd> [-o output.exe] [--target <triple>]");
+                eprintln!("Usage: fidesc ccompile <file.fd> [-o output.exe] [--target <triple>] [--trace]");
                 process::exit(1);
             }
             let input = &args[2];
@@ -505,6 +870,7 @@ fn main() {
             let target = args.iter().position(|a| a == "--target")
                 .and_then(|i| args.get(i + 1))
                 .map(|s| s.clone());
+            let trace = args.iter().any(|a| a == "--trace");
             let source = match fs::read_to_string(input) {
                 Ok(s) => s,
                 Err(e) => {
@@ -513,7 +879,7 @@ fn main() {
                 }
             };
 
-            match compiler::ccompile_source_with_path(&source, input) {
+            match compiler::ccompile_source_traced(&source, input, trace) {
                 Ok(c_code) => {
                     // Write C source
                     let c_path = if output.ends_with(".exe") {
@@ -819,21 +1185,46 @@ fn main() {
 
 
             let mut test_files: Vec<String> = Vec::new();
+            // Scan tests/ directory
             if let Ok(entries) = fs::read_dir(test_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.extension().map_or(false, |e| e == "fd") {
                         let stem = path.file_stem().unwrap().to_string_lossy().to_string();
                         let is_fail = expected_fail.contains(&stem.as_str());
-                        
+                        // Exclude benchmark files — they produce timing-dependent
+                        // output that can't match between interpreter and C codegen.
+                        let is_bench = stem.starts_with("bench_");
+
                         if fail_only {
                             // Only include expected-fail tests
                             if is_fail {
                                 test_files.push(path.to_string_lossy().to_string());
                             }
                         } else {
-                            // Only include normal tests (exclude expected-fail)
-                            if !is_fail {
+                            // Only include normal tests (exclude expected-fail and benchmarks)
+                            if !is_fail && !is_bench {
+                                test_files.push(path.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            // Also scan compiler/tests/ — self-hosted compiler module tests (SH-6)
+            if let Ok(entries) = fs::read_dir("compiler/tests") {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |e| e == "fd") {
+                        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+                        let is_fail = expected_fail.contains(&stem.as_str());
+                        let is_bench = stem.starts_with("bench_");
+
+                        if fail_only {
+                            if is_fail {
+                                test_files.push(path.to_string_lossy().to_string());
+                            }
+                        } else {
+                            if !is_fail && !is_bench {
                                 test_files.push(path.to_string_lossy().to_string());
                             }
                         }
@@ -2091,6 +2482,13 @@ fn print_usage() {
     eprintln!("           [-o output] [--text]             Write to file / SPIR-V text disassembly");
     eprintln!("  fidesc tokens  <file.fd>                  Show tokens");
     eprintln!("  fidesc ast     <file.fd>                  Show AST");
+    eprintln!("  fidesc dump-tokens <file.fd>              Show tokens (dump-* alias)");
+    eprintln!("  fidesc dump-ast    <file.fd>              Show AST (dump-* alias)");
+    eprintln!("  fidesc dump-ir     <file.fd>              Show IR (dump-* alias)");
+    eprintln!("  fidesc dump-pir    <file.fd> [1|2|3|all]  Show PIR (dump-* alias)");
+    eprintln!("  fidesc dump-c      <file.fd>              Show generated C source");
+    eprintln!("  fidesc diff-test <file.fd> --stage <s>    Compare output to golden file");
+    eprintln!("           [--update]                       Update golden file with current output");
     eprintln!("  fidesc version                           Show version");
     eprintln!("  fidesc watch   <file.fd> [--interval <ms>] [--run]  Hot reload: recompile on change");
     eprintln!("  fidesc test                              Run all tests across all backends");

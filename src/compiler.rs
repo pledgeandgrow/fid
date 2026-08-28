@@ -19,7 +19,7 @@ use crate::wasm;
 pub use crate::interp::RunResult;
 pub use crate::interp::Value;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
 
 /// Enrich a list of error strings with source context display.
@@ -183,6 +183,22 @@ pub struct CompileResult {
 
 const STDLIB_CORE: &str = include_str!("../stdlib/core.fd");
 
+/// Walk up from `start` to find the project root — the first directory
+/// containing a `stdlib/` or `compiler/` subdirectory. Falls back to `start`
+/// itself if none is found (preserving the old behavior).
+fn find_project_root(start: &Path) -> PathBuf {
+    let mut current = start.to_path_buf();
+    loop {
+        if current.join("stdlib").is_dir() || current.join("compiler").is_dir() {
+            return current;
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    start.to_path_buf()
+}
+
 fn parse_source(source: &str) -> Result<Program, Vec<String>> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();
@@ -217,8 +233,10 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
         let file = source_path.unwrap_or("<stdin>");
         return Err(enrich_errors(&lexer.errors, source, file));
     }
+    // Save tokens for re-parsing after imports are loaded
+    let user_tokens = tokens.clone();
     let mut parser = Parser::with_names(tokens, struct_names.clone(), enum_names.clone());
-    let user = parser.parse().map_err(|e| {
+    let mut user = parser.parse().map_err(|e| {
         let file = source_path.unwrap_or("<stdin>");
         enrich_errors(&[e], source, file)
     })?;
@@ -253,6 +271,9 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
 
             // Try: <base_dir>/<path>.fd  and  <base_dir>/<path>/mod.fd
             let path_str = import_path.replace("::", "/");
+            // Walk up from base_dir to find project root (the dir containing stdlib/ or compiler/).
+            // This handles tests in compiler/tests/ whose base_dir is a subdirectory.
+            let project_root = find_project_root(base_dir);
             let candidates = [
                 base_dir.join(format!("{}.fd", path_str)),
                 base_dir.join(format!("{}/mod.fd", path_str)),
@@ -261,6 +282,13 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
                 // Fallback: stdlib/ directory (for json, http, db, etc.)
                 std::path::Path::new("stdlib").join(format!("{}.fd", path_str)),
                 std::path::Path::new("stdlib").join(format!("{}/mod.fd", path_str)),
+                // Fallback: compiler/ directory at project root (for self-hosted
+                // compiler modules: token, diag, json, fmt — SH-6 leaf modules)
+                project_root.join("compiler").join(format!("{}.fd", path_str)),
+                project_root.join("compiler").join(format!("{}/mod.fd", path_str)),
+                // Also try stdlib/ at project root (when CWD isn't the project root)
+                project_root.join("stdlib").join(format!("{}.fd", path_str)),
+                project_root.join("stdlib").join(format!("{}/mod.fd", path_str)),
             ];
 
             let mut found = None;
@@ -337,6 +365,19 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
                 )]);
             }
         }
+    }
+
+    // Re-parse user code with full name set (including imported module names).
+    // The first parse only knew stdlib + user names. Now that imports are loaded,
+    // enum/struct names from imported modules are available, allowing the parser
+    // to correctly recognize EnumName::Variant expressions from imported modules.
+    if source_path.is_some() {
+        let mut reparser = Parser::with_names(user_tokens.clone(), struct_names.clone(), enum_names.clone());
+        if let Ok(reparsed) = reparser.parse() {
+            user = reparsed;
+        }
+        // If re-parsing fails, keep the original parse (it's likely a real error
+        // that the first parse already caught).
     }
 
     // Merge: start with stdlib, then add imported modules, then user (user wins)
@@ -1289,13 +1330,39 @@ fn build_program_with_lints(source: &str, source_path: Option<&str>) -> Result<(
 }
 
 pub fn interpret_source_with_path_release(source: &str, source_path: &str, verbose: bool, release: bool) -> Result<(RunResult, Option<String>), Vec<String>> {
+    interpret_source_with_options(source, source_path, verbose, release, 1000)
+}
+
+/// Interpret with configurable max_recursion (SH-1.4).
+/// max_recursion of 0 means unlimited.
+pub fn interpret_source_with_options(source: &str, source_path: &str, verbose: bool, release: bool, max_recursion: usize) -> Result<(RunResult, Option<String>), Vec<String>> {
+    interpret_source_traced(source, source_path, verbose, release, max_recursion, false)
+}
+
+/// Interpret with --trace flag (SH-1.2). Prints per-stage timing to stderr.
+pub fn interpret_source_traced(source: &str, source_path: &str, verbose: bool, release: bool, max_recursion: usize, trace: bool) -> Result<(RunResult, Option<String>), Vec<String>> {
+    use std::time::Instant;
+
+    let t0 = Instant::now();
     let program = build_program_with_path(source, Some(source_path))?;
+    let t1 = Instant::now();
+    if trace { eprintln!("[trace] Frontend (lex+parse+typecheck+borrowck+comptime+mono): {:.2}ms", t1.duration_since(t0).as_secs_f64() * 1000.0); }
 
     // Lower to IR
+    let t2 = Instant::now();
     let module = lower::lower(&program);
+    let t3 = Instant::now();
+    if trace { eprintln!("[trace] Lower (AST → IR): {:.2}ms, {} functions", t3.duration_since(t2).as_secs_f64() * 1000.0, module.functions.len()); }
 
     // Interpret
-    Ok(interp::interpret(module, verbose, release))
+    let t4 = Instant::now();
+    let result = interp::interpret_with_options(module, verbose, release, max_recursion);
+    let t5 = Instant::now();
+    if trace { eprintln!("[trace] Interpreter: {:.2}ms", t5.duration_since(t4).as_secs_f64() * 1000.0); }
+
+    if trace { eprintln!("[trace] Total: {:.2}ms", t5.duration_since(t0).as_secs_f64() * 1000.0); }
+
+    Ok(result)
 }
 
 /// Interpret with trace recording enabled (for post-mortem debugging).
@@ -1328,13 +1395,31 @@ pub fn build_source(source: &str) -> Result<String, Vec<String>> {
 
 /// Compile to C source code, then compile with gcc/clang to native binary
 pub fn ccompile_source_with_path(source: &str, source_path: &str) -> Result<String, Vec<String>> {
+    ccompile_source_traced(source, source_path, false)
+}
+
+/// C compile with --trace flag (SH-1.2). Prints per-stage timing to stderr.
+pub fn ccompile_source_traced(source: &str, source_path: &str, trace: bool) -> Result<String, Vec<String>> {
+    use std::time::Instant;
+
+    let t0 = Instant::now();
     let program = build_program_with_path(source, Some(source_path))?;
+    let t1 = Instant::now();
+    if trace { eprintln!("[trace] Frontend (lex+parse+typecheck+borrowck+comptime+mono): {:.2}ms", t1.duration_since(t0).as_secs_f64() * 1000.0); }
 
-    // Lower to IR
+    let t2 = Instant::now();
     let module = lower::lower(&program);
+    let t3 = Instant::now();
+    if trace { eprintln!("[trace] Lower (AST → IR): {:.2}ms, {} functions", t3.duration_since(t2).as_secs_f64() * 1000.0, module.functions.len()); }
 
-    // Generate C code
-    Ok(codegen_c::generate_c(&module))
+    let t4 = Instant::now();
+    let c_code = codegen_c::generate_c(&module);
+    let t5 = Instant::now();
+    if trace { eprintln!("[trace] C Codegen: {:.2}ms, {} lines", t5.duration_since(t4).as_secs_f64() * 1000.0, c_code.lines().count()); }
+
+    if trace { eprintln!("[trace] Total: {:.2}ms", t5.duration_since(t0).as_secs_f64() * 1000.0); }
+
+    Ok(c_code)
 }
 
 pub fn build_source_with_path(source: &str, source_path: &str) -> Result<String, Vec<String>> {
@@ -1619,6 +1704,8 @@ fn default_expr_for_type(ty: &crate::ast::Type) -> crate::ast::Expr {
 /// Supported derives:
 ///   @derive(Debug)  — generates a debug_str() method that returns a string representation
 ///   @derive(Clone)  — generates a clone() method that copies the struct
+///   @derive(Default) — generates a default() method that returns a zero-initialized struct
+///   @derive(PartialEq) — generates an equals() method that compares all fields with ==
 fn process_derive(program: &mut Program) {
     use crate::ast::{Func, Param, Type, Expr, Stmt};
 
@@ -1707,6 +1794,36 @@ fn process_derive(program: &mut Program) {
                             is_async: false,
                         };
                         generated.push(func);
+                    } else if arg == "Default" {
+                        // Generate: pf {name}_default() -> {name}
+                        // Returns a struct with all fields set to their default values.
+                        let func_name = format!("{}_default", s.name);
+                        let self_type = Type::Named(s.name.clone());
+                        let func = Func {
+                            name: func_name,
+                            type_params: Vec::new(),
+                            type_param_bounds: Vec::new(),
+                            const_params: Vec::new(),
+                            params: Vec::new(),
+                            ret_ty: self_type,
+                            body: vec![Stmt::Return(Some(Expr::StructLit {
+                                name: s.name.clone(),
+                                fields: s.fields.iter().map(|f| {
+                                    (f.name.clone(), default_expr_for_type(&f.ty))
+                                }).collect(),
+                                spread: None,
+                            }), 0)],
+                            is_pub: true,
+                            is_comptime: false,
+                            declared_effects: Vec::new(),
+                            has_effect_annotation: false,
+                            is_interrupt: false,
+                            annotations: Vec::new(),
+                            preconditions: Vec::new(),
+                            postconditions: Vec::new(),
+                            is_async: false,
+                        };
+                        generated.push(func);
                     } else if arg == "Deserialize" {
                         // Generate: pf from_json(json: str) -> StructName
                         // Creates a struct from a JSON string (default-constructed for now).
@@ -1726,6 +1843,61 @@ fn process_derive(program: &mut Program) {
                                 }).collect(),
                                 spread: None,
                             }), 0)],
+                            is_pub: true,
+                            is_comptime: false,
+                            declared_effects: Vec::new(),
+                            has_effect_annotation: false,
+                            is_interrupt: false,
+                            annotations: Vec::new(),
+                            preconditions: Vec::new(),
+                            postconditions: Vec::new(),
+                            is_async: false,
+                        };
+                        generated.push(func);
+                    } else if arg == "PartialEq" {
+                        // Generate: pf {name}_equals(self: {name}, other: {name}) -> bool
+                        // Compares all fields with == and ANDs the results.
+                        let func_name = format!("{}_equals", s.name);
+                        let self_type = Type::Named(s.name.clone());
+                        let other_param = Param { name: "other".to_string(), ty: self_type.clone(), is_pub: false, annotations: Vec::new() };
+                        // Build the comparison expression: self.f1 == other.f1 && self.f2 == other.f2 && ...
+                        let result_expr = if s.fields.is_empty() {
+                            Expr::BoolLit(true)
+                        } else {
+                            // Chain field comparisons with And
+                            s.fields.iter().enumerate().fold(None, |acc, (_, f)| {
+                                let cmp = Expr::Binary {
+                                    op: crate::ast::BinOp::Eq,
+                                    left: Box::new(Expr::FieldAccess {
+                                        expr: Box::new(Expr::Ident("self".to_string())),
+                                        field: f.name.clone(),
+                                    }),
+                                    right: Box::new(Expr::FieldAccess {
+                                        expr: Box::new(Expr::Ident("other".to_string())),
+                                        field: f.name.clone(),
+                                    }),
+                                };
+                                match acc {
+                                    None => Some(cmp),
+                                    Some(prev) => Some(Expr::Binary {
+                                        op: crate::ast::BinOp::And,
+                                        left: Box::new(prev),
+                                        right: Box::new(cmp),
+                                    }),
+                                }
+                            }).unwrap_or(Expr::BoolLit(true))
+                        };
+                        let func = Func {
+                            name: func_name,
+                            type_params: Vec::new(),
+                            type_param_bounds: Vec::new(),
+                            const_params: Vec::new(),
+                            params: vec![
+                                Param { name: "self".to_string(), ty: self_type.clone(), is_pub: false, annotations: Vec::new() },
+                                other_param,
+                            ],
+                            ret_ty: Type::Bool,
+                            body: vec![Stmt::Return(Some(result_expr), 0)],
                             is_pub: true,
                             is_comptime: false,
                             declared_effects: Vec::new(),
@@ -1760,36 +1932,47 @@ fn apply_cfg_filter(program: &mut Program) {
     let is_windows = cfg!(target_os = "windows");
     let is_macos = cfg!(target_os = "macos");
     let is_debug = cfg!(debug_assertions);
+    let is_x86_64 = cfg!(target_arch = "x86_64");
+    let is_arm64 = cfg!(target_arch = "aarch64");
+    let is_riscv = cfg!(target_arch = "riscv64");
 
     let check_cfg = |annotations: &[crate::ast::Annotation]| -> bool {
         for ann in annotations {
             if ann.name == "cfg" {
                 for arg in &ann.args {
                     let arg = arg.trim();
-                    if arg.starts_with("platform") {
-                        if let Some(eq_pos) = arg.find('=') {
-                            let val = arg[eq_pos+1..].trim().trim_matches('"');
-                            let include = match val {
-                                "linux" => is_linux,
-                                "windows" => is_windows,
-                                "macos" => is_macos,
-                                _ => true,
-                            };
-                            if !include { return false; }
-                        }
-                    } else if arg.starts_with("feature") {
-                        // Features are not yet supported via CLI — always include
-                        // (feature flags will be added in a future phase)
-                    } else if arg == "debug" {
-                        if !is_debug { return false; }
-                    } else if arg == "release" {
-                        if is_debug { return false; }
-                    } else if arg == "linux" {
-                        if !is_linux { return false; }
-                    } else if arg == "windows" {
-                        if !is_windows { return false; }
-                    } else if arg == "macos" {
-                        if !is_macos { return false; }
+                    // Parse key=value pairs
+                    if let Some(eq_pos) = arg.find('=') {
+                        let key = arg[..eq_pos].trim();
+                        let val = arg[eq_pos+1..].trim().trim_matches('"');
+                        let include = match (key, val) {
+                            ("platform", "linux") | ("os", "linux") => is_linux,
+                            ("platform", "windows") | ("os", "windows") => is_windows,
+                            ("platform", "macos") | ("os", "macos") => is_macos,
+                            ("target_arch", "x86_64") | ("arch", "x86_64") => is_x86_64,
+                            ("target_arch", "aarch64") | ("arch", "aarch64") => is_arm64,
+                            ("target_arch", "riscv64") | ("arch", "riscv64") => is_riscv,
+                            // Backend targeting — always include (backend selected at codegen time)
+                            ("backend", _) | ("target", _) => true,
+                            // Feature flags — always include (not yet supported via CLI)
+                            ("feature", _) => true,
+                            _ => true,
+                        };
+                        if !include { return false; }
+                    } else {
+                        // Bare flags (no = sign)
+                        let include = match arg {
+                            "debug" => is_debug,
+                            "release" => !is_debug,
+                            "linux" => is_linux,
+                            "windows" => is_windows,
+                            "macos" => is_macos,
+                            "x86_64" | "x64" => is_x86_64,
+                            "aarch64" | "arm64" => is_arm64,
+                            "riscv64" | "riscv" => is_riscv,
+                            _ => true,
+                        };
+                        if !include { return false; }
                     }
                 }
             }

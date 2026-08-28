@@ -986,6 +986,7 @@ impl CCodeGen {
         wln!(self, "char* p_to_str_float(double val);");
         wln!(self, "char* p_to_str_map(PMap* m);");
         wln!(self, "char* p_float_to_str(double val);");
+        wln!(self, "double p_str_to_float(const char* s);");
         wln!(self, "char* p_bool_to_str(bool val);");
         wln!(self, "char* p_vec_to_str(PVec* v);");
         wln!(self, "char* p_str_concat(const char* a, const char* b);");
@@ -1020,6 +1021,10 @@ impl CCodeGen {
         // Process control builtins
         wln!(self, "int64_t p_system(const char* cmd);");
         wln!(self, "void p_exit(int64_t code);");
+        // Wall-clock timing builtins
+        wln!(self, "int64_t p_clock_now(void);");
+        wln!(self, "int64_t p_clock_now_us(void);");
+        wln!(self, "int64_t p_clock_now_ms(void);");
         // Regex builtin
         wln!(self, "bool p_regex_match(const char* s, const char* pattern);");
         // Async/await runtime (Phase 7.6)
@@ -1053,6 +1058,10 @@ impl CCodeGen {
         wln!(self, "int64_t p_mutex_init(void);");
         wln!(self, "void p_mutex_lock(int64_t m);");
         wln!(self, "void p_mutex_unlock(int64_t m);");
+        // Thread-local storage builtins
+        wln!(self, "int64_t p_tls_create(void);");
+        wln!(self, "int64_t p_tls_get(int64_t key);");
+        wln!(self, "void p_tls_set(int64_t key, int64_t value);");
         // Channels (bounded MPSC queue)
         wln!(self, "int64_t p_chan_create(int64_t capacity);");
         wln!(self, "bool p_chan_send(int64_t ch, int64_t val);");
@@ -2232,6 +2241,18 @@ impl CCodeGen {
         // Process control builtins
         wln!(self, "int64_t p_system(const char* cmd) {{ return (int64_t)system(cmd); }}");
         wln!(self, "void p_exit(int64_t code) {{ exit((int)code); }}");
+        // Wall-clock timing builtins — use clock_gettime(CLOCK_REALTIME)
+        wln!(self, "#if defined(__linux__) || defined(__APPLE__)");
+        wln!(self, "#include <time.h>");
+        wln!(self, "int64_t p_clock_now(void) {{ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec; }}");
+        wln!(self, "int64_t p_clock_now_us(void) {{ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000000LL + (int64_t)ts.tv_nsec / 1000; }}");
+        wln!(self, "int64_t p_clock_now_ms(void) {{ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000LL + (int64_t)ts.tv_nsec / 1000000; }}");
+        wln!(self, "#else");
+        wln!(self, "#include <time.h>");
+        wln!(self, "int64_t p_clock_now(void) {{ return (int64_t)time(NULL) * 1000000000LL; }}");
+        wln!(self, "int64_t p_clock_now_us(void) {{ return (int64_t)time(NULL) * 1000000LL; }}");
+        wln!(self, "int64_t p_clock_now_ms(void) {{ return (int64_t)time(NULL) * 1000LL; }}");
+        wln!(self, "#endif");
         // Regex builtin — simple wildcard match (? and *)
         wln!(self, "bool p_regex_match(const char* s, const char* pattern) {{");
         wln!(self, "    if (!s || !pattern) return false;");
@@ -2508,6 +2529,10 @@ impl CCodeGen {
         wln!(self, "}");
         wln!(self, "void p_mutex_lock(int64_t m) { pthread_mutex_lock((pthread_mutex_t*)(intptr_t)m); }");
         wln!(self, "void p_mutex_unlock(int64_t m) { pthread_mutex_unlock((pthread_mutex_t*)(intptr_t)m); }");
+        // ─── Thread-local storage (pthread keys) ───
+        wln!(self, "int64_t p_tls_create(void) {{ pthread_key_t key; pthread_key_create(&key, NULL); return (int64_t)key; }}");
+        wln!(self, "int64_t p_tls_get(int64_t key) {{ return (int64_t)(intptr_t)pthread_getspecific((pthread_key_t)key); }}");
+        wln!(self, "void p_tls_set(int64_t key, int64_t value) {{ pthread_setspecific((pthread_key_t)key, (void*)(intptr_t)value); }}");
         // ─── Channels (bounded MPSC queue with mutex + condvar) ───
         // Channel layout: { mutex, cond_not_empty, cond_not_full, head, tail, count, capacity, closed, buffer[capacity] }
         // head = next read index, tail = next write index, count = current items
@@ -2849,6 +2874,8 @@ impl CCodeGen {
         wln!(self, "char* p_float_to_str(double val) {{ return p_to_str_float(val); }}");
         wln!(self, "char* p_bool_to_str(bool val) {{ return p_to_str_bool(val); }}");
         wln!(self, "char* p_vec_to_str(PVec* v) {{ return p_to_str_vec(v); }}");
+        // SH-4.1: String to float parsing
+        wln!(self, "double p_str_to_float(const char* s) {{ if (!s) return 0.0; return atof(s); }}");
 
         // ─── Socket builtins (native HTTP server, Phase 5D) ───
         wln!(self, "");

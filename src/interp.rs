@@ -307,6 +307,11 @@ pub struct Interpreter {
     channels: Arc<Mutex<HashMap<i64, Arc<Mutex<ChannelState>>>>>,
     /// Next channel handle
     next_channel_handle: i64,
+    /// Thread-local storage — maps (thread_id, tls_key) to value.
+    /// thread_id 0 is the main thread.
+    tls_storage: Arc<Mutex<HashMap<(i64, i64), i64>>>,
+    /// Next TLS key handle
+    next_tls_key: i64,
     /// Dynamic loading handles — maps handle to library path
     dl_handles: HashMap<i64, String>,
     /// Next dynamic loading handle
@@ -363,6 +368,10 @@ pub struct Interpreter {
     /// ML11: Checkpoint mode — when enabled, tape stores input data (not result data)
     /// and recomputes forward results during backward pass
     checkpoint_mode: bool,
+    /// Maximum call stack depth before the interpreter panics with a clear
+    /// message (SH-1.4). Prevents stack overflow segfaults from infinite
+    /// recursion or very deep nesting. Default: 1000.
+    max_recursion: usize,
 }
 
 /// ML3: A tape entry for reverse-mode autodiff
@@ -473,6 +482,8 @@ impl Interpreter {
             next_mutex_handle: 1,
             channels: Arc::new(Mutex::new(HashMap::new())),
             next_channel_handle: 1,
+            tls_storage: Arc::new(Mutex::new(HashMap::new())),
+            next_tls_key: 0,
             dl_handles: HashMap::new(),
             next_dl_handle: 1,
             ecs_entity_count: 0,
@@ -496,6 +507,7 @@ impl Interpreter {
             tp_rank: 0,
             tp_world_size: 1,
             checkpoint_mode: false,
+            max_recursion: 1000,
         };
         // Pre-allocate string constants
         interp.init_strings();
@@ -549,6 +561,13 @@ impl Interpreter {
     pub fn enable_recording(&mut self) {
         self.recording = true;
         self.trace.clear();
+    }
+
+    /// Set the maximum recursion depth (SH-1.4). When the call stack exceeds
+    /// this depth, the interpreter panics with a clear message instead of
+    /// segfaulting from stack overflow.
+    pub fn set_max_recursion(&mut self, depth: usize) {
+        self.max_recursion = depth;
     }
 
     /// Enable profiling mode — tracks per-function call count and time.
@@ -862,6 +881,20 @@ impl Interpreter {
 
     /// Run a specific function with arguments
     fn run_function(&mut self, func: &IrFunction, args: &[Value]) -> RunResult {
+        // SH-1.4: Recursion depth limit — check before pushing to call_stack.
+        // This prevents stack overflow segfaults from infinite recursion or
+        // very deep nesting, replacing them with a clear panic message.
+        if self.call_stack.len() >= self.max_recursion {
+            let depth = self.max_recursion;
+            let caller = self.call_stack.last().cloned().unwrap_or_default();
+            self.panic_stack_trace = Some(self.format_call_stack());
+            return RunResult::Panic(format!(
+                "Recursion depth limit ({}) exceeded in function '{}' (called from '{}')\n\
+                 This may indicate infinite recursion or very deep nesting.\n\
+                 Increase with --max-recursion or refactor to iterative.",
+                depth, func.name, caller
+            ));
+        }
         let profile_start = if self.profile_mode {
             Some(std::time::Instant::now())
         } else {
@@ -2431,10 +2464,9 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Void)
             }
             "p_panic" => {
-                let msg = if let Some(Value::Str(s)) = args.first() {
-                    s.to_string()
-                } else {
-                    "panic".to_string()
+                let msg = match args.first() {
+                    Some(v) => self.value_to_string(v),
+                    None => "panic".to_string(),
                 };
                 ExecOutcome::Panic(msg)
             }
@@ -2524,6 +2556,11 @@ impl Interpreter {
                     _ => String::new(),
                 };
                 ExecOutcome::Value(Value::Str(CompactString::from(s)))
+            }
+            "p_str_to_float" => {
+                let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                let f = s.parse::<f64>().unwrap_or(0.0);
+                ExecOutcome::Value(Value::Float(f))
             }
             "p_bool_to_str" => {
                 let s = match args.first() {
@@ -4504,6 +4541,33 @@ impl Interpreter {
                 std::process::exit(0);
             }
 
+            // ─── Wall-clock timing builtin ───
+            // Returns current time in nanoseconds since Unix epoch (1970-01-01 UTC).
+            // For measuring elapsed time, take the difference between two calls.
+            "p_clock_now" => {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
+                ExecOutcome::Value(Value::Int(now.as_nanos() as i64))
+            }
+            // Returns current time in microseconds since Unix epoch.
+            "p_clock_now_us" => {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
+                ExecOutcome::Value(Value::Int(now.as_micros() as i64))
+            }
+            // Returns current time in milliseconds since Unix epoch.
+            "p_clock_now_ms" => {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
+                ExecOutcome::Value(Value::Int(now.as_millis() as i64))
+            }
+
             // ─── Regex builtin ───
             "p_regex_match" => {
                 let s = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
@@ -5143,6 +5207,38 @@ impl Interpreter {
                 ExecOutcome::Continue
             }
 
+            // ─── Thread-local storage ───
+            "p_tls_create" => {
+                // p_tls_create() -> i64 — create a TLS key, return handle
+                let key = self.next_tls_key;
+                self.next_tls_key += 1;
+                ExecOutcome::Value(Value::Int(key))
+            }
+            "p_tls_get" => {
+                // p_tls_get(key: i64) -> i64 — get value for current thread (0 if unset)
+                let key = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                // thread_id 0 = main thread (interpreter is single-threaded for main)
+                let val = self.tls_storage.lock().unwrap()
+                    .get(&(0, key)).copied().unwrap_or(0);
+                ExecOutcome::Value(Value::Int(val))
+            }
+            "p_tls_set" => {
+                // p_tls_set(key: i64, value: i64) -> void — set value for current thread
+                let key = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let value = match args.get(1) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                self.tls_storage.lock().unwrap().insert((0, key), value);
+                ExecOutcome::Continue
+            }
+
             // ─── Channels (bounded MPSC queue) ───
             "p_chan_create" => {
                 // p_chan_create(capacity: i64) -> i64 — create a bounded channel
@@ -5672,12 +5768,24 @@ enum ExecOutcome {
 
 /// Convenience function — lower and interpret a program
 pub fn interpret(module: IrModule, verbose: bool, release: bool) -> (RunResult, Option<String>) {
+    interpret_with_options(module, verbose, release, 1000)
+}
+
+/// Interpret with configurable options (SH-1.4: max_recursion).
+/// max_recursion of 0 means unlimited (no depth check).
+pub fn interpret_with_options(module: IrModule, verbose: bool, release: bool, max_recursion: usize) -> (RunResult, Option<String>) {
     let mut interp = Interpreter::new(module);
     if verbose {
         interp.verbose = true;
     }
     if release {
         interp.debug_mode = false;
+    }
+    if max_recursion > 0 {
+        interp.max_recursion = max_recursion;
+    } else {
+        // 0 = unlimited: set to usize::MAX so the check never triggers
+        interp.max_recursion = usize::MAX;
     }
     let result = interp.run();
     let trace = interp.take_panic_stack_trace();

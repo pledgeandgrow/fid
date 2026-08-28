@@ -1192,20 +1192,52 @@ fn lower_func_l2_to_l3(f: &L2Function, module: &IrModule) -> L3Function {
         r
     };
 
+    // Build a value type map for looking up struct names in GetFieldPtr.
+    // This is needed because struct fields may have non-8-byte offsets
+    // (e.g., enum-typed fields need (1 + max_payload) * 8 bytes).
+    let mut value_types: HashMap<PValue, PirType> = HashMap::new();
+
     let mut params: Vec<(VReg, PirType)> = Vec::new();
     for (pv, ty) in &f.params {
         let r = new_vreg(&mut next);
         vreg_of.insert(*pv, r);
         params.push((r, ty.clone()));
+        value_types.insert(*pv, ty.clone());
     }
     for b in &f.blocks {
         for (pv, ty) in &b.params {
             if !vreg_of.contains_key(pv) {
                 let r = new_vreg(&mut next);
                 vreg_of.insert(*pv, r);
-                let _ = ty;
             }
+            value_types.insert(*pv, ty.clone());
         }
+    }
+
+    // Infer types from producing instructions
+    for (pv, inst) in &f.values {
+        let ty = match inst {
+            L2Inst::Alloca { ty, .. } => PirType::Ptr(Box::new(ty.clone())),
+            L2Inst::GetFieldPtr { field_ty, .. } => PirType::Ptr(Box::new(field_ty.clone())),
+            L2Inst::GetElemPtr { elem_ty, .. } => PirType::Ptr(Box::new(elem_ty.clone())),
+            L2Inst::Call { ret_ty, .. } => ret_ty.clone(),
+            L2Inst::CallPtr { ret_ty, .. } => ret_ty.clone(),
+            L2Inst::DynCall { ret_ty, .. } => ret_ty.clone(),
+            L2Inst::Load { ty, .. } => ty.clone(),
+            L2Inst::BinOp { ty, .. } => ty.clone(),
+            L2Inst::UnaryOp { ty, .. } => ty.clone(),
+            L2Inst::Copy { ty, .. } => ty.clone(),
+            L2Inst::BitCast { to, .. } => to.clone(),
+            L2Inst::IntExtend { to, .. } => to.clone(),
+            L2Inst::IntTrunc { to, .. } => to.clone(),
+            L2Inst::IntToFloat { to, .. } => to.clone(),
+            L2Inst::FloatToInt { to, .. } => to.clone(),
+            L2Inst::ConstInt { ty, .. } => ty.clone(),
+            L2Inst::ConstFloat { ty, .. } => ty.clone(),
+            L2Inst::ConstNull { ty, .. } => ty.clone(),
+            _ => PirType::I64,
+        };
+        value_types.insert(*pv, ty);
     }
 
     // Operand helper: map a PValue to a VReg operand, allocating a vreg on
@@ -1260,6 +1292,7 @@ fn lower_func_l2_to_l3(f: &L2Function, module: &IrModule) -> L3Function {
                 &mut operand,
                 &slot_of,
                 module,
+                &value_types,
             );
             l3_insts.push(l3_inst);
         }
@@ -1310,6 +1343,7 @@ fn lower_l2_inst_to_l3(
     operand: &mut impl FnMut(PValue, &mut u32, &mut HashMap<PValue, VReg>) -> Operand,
     slot_of: &HashMap<PValue, Slot>,
     module: &IrModule,
+    value_types: &HashMap<PValue, PirType>,
 ) -> L3Inst {
     let mut new_vreg = |next: &mut u32| -> VReg {
         let r = VReg(*next);
@@ -1392,12 +1426,31 @@ fn lower_l2_inst_to_l3(
             val: materialize(*value, next, vreg_of, operand),
             ty: store_ty.clone().unwrap_or(PirType::I64),
         },
-        L2Inst::GetFieldPtr { struct_ptr, field_index, field_ty } => L3Inst::FieldAddr {
-            dst,
-            base: materialize(*struct_ptr, next, vreg_of, operand),
-            offset: *field_index * 8,  // field index → byte offset (each field is 8 bytes)
-            field_ty: field_ty.clone(),
-        },
+        L2Inst::GetFieldPtr { struct_ptr, field_index, field_ty } => {
+            // Look up the actual field offset from the struct layout.
+            // The struct name is determined from the struct_ptr's type.
+            // Falls back to field_index * 8 if the struct can't be determined.
+            let offset = value_types.get(struct_ptr)
+                .and_then(|ty| match ty {
+                    PirType::Ptr(inner) => Some(inner.as_ref().clone()),
+                    _ => None,
+                })
+                .and_then(|pt| match pt {
+                    PirType::Struct(name) => {
+                        module.struct_layouts.get(&name).and_then(|layout| {
+                            layout.fields.get(*field_index as usize).map(|(_, _, off)| *off)
+                        })
+                    }
+                    _ => None,
+                })
+                .unwrap_or(*field_index * 8);
+            L3Inst::FieldAddr {
+                dst,
+                base: materialize(*struct_ptr, next, vreg_of, operand),
+                offset,
+                field_ty: field_ty.clone(),
+            }
+        }
         L2Inst::GetElemPtr { array_ptr, index, elem_ty } => L3Inst::ElemAddr {
             dst,
             base: materialize(*array_ptr, next, vreg_of, operand),

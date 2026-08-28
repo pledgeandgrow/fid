@@ -15,14 +15,29 @@ pub fn println(s: str) -> void {
 // Builtin: assert — crash if condition is false
 pub fn assert(cond: bool) -> void {
     if !cond {
-        print("Assertion failed\n");
+        p_panic("Assertion failed");
+    }
+}
+
+// Builtin: assert with message (SH-1.6) — crash with a custom message
+// Use f-strings for formatting: assert_msg(idx < len, f"out of bounds: {idx} >= {len}");
+pub fn assert_msg(cond: bool, msg: str) -> void {
+    if !cond {
+        p_panic(msg);
     }
 }
 
 // Builtin: assert_eq — check equality
 pub fn assert_eq<T>(a: T, b: T) -> void {
     if a != b {
-        print("Assertion failed: values not equal\n");
+        p_panic("Assertion failed: values not equal");
+    }
+}
+
+// Builtin: assert_eq with message (SH-1.6) — crash with a custom message
+pub fn assert_eq_msg<T>(a: T, b: T, msg: str) -> void {
+    if a != b {
+        p_panic(msg);
     }
 }
 
@@ -1288,40 +1303,22 @@ pub fn HashMap_keys(m: i64) -> i64 {
         }
         i = i + 1;
     }
+    // SH-3.4: Sort keys for deterministic iteration order
+    Vec_sort(result);
     return result;
 }
 
 pub fn HashMap_values(m: i64) -> i64 {
-    var cap_ptr: *mut i64 = m + 24;
-    var keys_ptr_ptr: *mut i64 = m;
-    var vals_ptr_ptr: *mut i64 = m + 8;
-    var capacity: i64 = 0;
-    var keys: i64 = 0;
-    var vals: i64 = 0;
-    unsafe {
-        capacity = *cap_ptr;
-        keys = *keys_ptr_ptr;
-        vals = *vals_ptr_ptr;
-    }
+    // SH-3.4: Return values in sorted-key order for deterministic iteration.
+    // Get sorted keys, then look up each value.
+    var keys: i64 = HashMap_keys(m);
+    var len: i64 = Vec_len(keys);
     var result: i64 = Vec_new();
-    if keys == 0 || capacity == 0 { return result; }
     var i: i64 = 0;
-    while i < capacity {
-        var kaddr: i64 = keys + i * 8;
-        var kptr: *mut i64 = kaddr;
-        var slot_key: i64 = 0;
-        unsafe {
-            slot_key = *kptr;
-        }
-        if slot_key != 0 && slot_key != -1 {
-            var vaddr: i64 = vals + i * 8;
-            var vptr: *mut i64 = vaddr;
-            var value: i64 = 0;
-            unsafe {
-                value = *vptr;
-            }
-            Vec_push(result, value);
-        }
+    while i < len {
+        var k: i64 = Vec_get(keys, i);
+        var v: i64 = HashMap_get(m, k);
+        Vec_push(result, v);
         i = i + 1;
     }
     return result;
@@ -2110,12 +2107,15 @@ impl StringBuilder {
 
 pub fn String_byte_at(s: i64, idx: i64) -> i64 {
     if s == 0 { return -1; }
-    var len: i64 = p_str_length(s);
-    if idx < 0 || idx >= len { return -1; }
+    if idx < 0 { return -1; }
+    // Direct byte access — skip p_str_length() call (O(n) scan).
+    // The caller is responsible for bounds checking via str_len().
+    // For safety, we check for null terminator (end of string).
     var addr: i64 = s + idx;
     var ptr: *mut u8 = addr;
     var b: i64 = 0;
     unsafe { b = *ptr; }
+    if b == 0 { return -1; }  // hit null terminator = out of bounds
     return b;
 }
 
@@ -2542,6 +2542,16 @@ pub fn str_equal(a: str, b: str) -> bool {
 /// Convert an integer to a string.
 pub fn int_to_str(n: i64) -> str {
     return p_to_str(n);
+}
+
+/// Convert a float to a string (SH-4.1).
+pub fn float_to_str(f: f64) -> str {
+    return p_float_to_str(f);
+}
+
+/// Parse a float from a string. Returns 0.0 on failure (SH-4.1).
+pub fn str_parse_float(s: str) -> f64 {
+    return p_str_to_float(s);
 }
 
 /// Convert a byte value to a single-character string.

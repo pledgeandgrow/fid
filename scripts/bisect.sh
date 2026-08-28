@@ -12,10 +12,13 @@
 #
 #   Layer         Command                    Golden file
 #   ─────────    ─────────                 ─────────────
-#   IR            fidesc ir                .ir
-#   PIR L1        fidesc pir 1             .pir_l1
-#   PIR L2        fidesc pir 2             .pir_l2
-#   PIR L3        fidesc pir 3             .pir_l3
+#   Tokens        fidesc dump-tokens       .tokens
+#   AST           fidesc dump-ast          .ast
+#   IR            fidesc dump-ir           .ir
+#   PIR L1        fidesc dump-pir 1        .pir_l1
+#   PIR L2        fidesc dump-pir 2        .pir_l2
+#   PIR L3        fidesc dump-pir 3        .pir_l3
+#   C Codegen     fidesc dump-c            .c
 #   Codegen       fidesc codegen           .asm
 #   Peephole      fidesc codegen --peephole .peephole
 #   Output        fidesc run               .out
@@ -163,24 +166,39 @@ check_layer() {
 echo "Checking each compiler layer:"
 echo ""
 
+check_layer "Tokens (lexer)" \
+    "$PLEDGEC dump-tokens $src" \
+    "$golden_dir/${name}.tokens" \
+    "exact"
+
+check_layer "AST (parser)" \
+    "$PLEDGEC dump-ast $src" \
+    "$golden_dir/${name}.ast" \
+    "exact"
+
 check_layer "IR (lowering)" \
-    "$PLEDGEC ir $src" \
+    "$PLEDGEC dump-ir $src" \
     "$golden_dir/${name}.ir" \
     "sort"
 
 check_layer "PIR L1 (semantic)" \
-    "$PLEDGEC pir $src 1" \
+    "$PLEDGEC dump-pir $src 1" \
     "$golden_dir/${name}.pir_l1" \
     "sort"
 
 check_layer "PIR L2 (mid-level)" \
-    "$PLEDGEC pir $src 2" \
+    "$PLEDGEC dump-pir $src 2" \
     "$golden_dir/${name}.pir_l2" \
     "sort"
 
 check_layer "PIR L3 (low-level)" \
-    "$PLEDGEC pir $src 3" \
+    "$PLEDGEC dump-pir $src 3" \
     "$golden_dir/${name}.pir_l3" \
+    "sort"
+
+check_layer "C Codegen (IR → C)" \
+    "$PLEDGEC dump-c $src" \
+    "$golden_dir/${name}.c" \
     "sort"
 
 check_layer "Codegen (x86-64 asm)" \
@@ -205,10 +223,13 @@ if [[ "$regression_found" == "true" ]]; then
     echo "The FIRST layer marked ✗ is where the regression was introduced."
     echo "Focus your debugging on the source file for that layer:"
     echo ""
+    echo "  Tokens   → src/lexer.rs, src/token.rs"
+    echo "  AST      → src/parser.rs, src/ast.rs"
     echo "  IR       → src/lower.rs, src/ir.rs"
     echo "  PIR L1   → src/pir.rs (L1 lowering)"
     echo "  PIR L2   → src/pir.rs (L2 transforms)"
     echo "  PIR L3   → src/pir.rs (L3 lowering)"
+    echo "  C Codegen→ src/codegen_c.rs"
     echo "  Codegen  → src/codegen_x64.rs, src/regalloc.rs"
     echo "  Peephole → src/peephole.rs"
     echo "  Output   → src/interp.rs (or a later layer if output differs but asm doesn't)"

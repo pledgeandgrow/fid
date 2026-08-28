@@ -1,0 +1,101 @@
+// Test @derive(Default), raw strings, wall-clock timing, and thread-local storage
+
+use time;
+use sync;
+
+// ─── Test 1: @derive(Default) ───────────────────────────────────────────
+@derive(Default)
+struct Point {
+    x: i64,
+    y: i64,
+    z: i64,
+}
+
+@derive(Default)
+struct Config {
+    name: str,
+    debug: bool,
+    count: i64,
+}
+
+// ─── Test 2: Raw strings ────────────────────────────────────────────────
+// r"..." — no escape processing
+// r#"..."# — with hash delimiters (allows " inside)
+
+fn test_raw_strings() -> i64 {
+    // Simple raw string
+    val s1 = r"hello world";
+    assert(s1 == "hello world");
+
+    // Raw string with backslashes (no escaping)
+    val s2 = r"line1\nline2";
+    // s2 should contain literal backslash-n, not a newline
+    assert(s2 == "line1\\nline2");
+
+    // Raw string with hash delimiters — can contain " inside
+    val s3 = r#"she said "hello""#;
+    assert(s3 == "she said \"hello\"");
+
+    // Raw string with double hash
+    val s4 = r##"has # inside"##;
+    assert(s4 == "has # inside");
+
+    return 1;
+}
+
+// ─── Test 3: Wall-clock timing ──────────────────────────────────────────
+fn test_clock() -> i64 {
+    val t1 = clock_now_ms();
+    // Do some work
+    var sum: i64 = 0;
+    for i in 0..1000 {
+        sum = sum + i;
+    }
+    val t2 = clock_now_ms();
+    // t2 should be >= t1 (time doesn't go backwards)
+    assert(t2 >= t1);
+    // Elapsed should be non-negative
+    val elapsed = clock_elapsed_ms(t1);
+    assert(elapsed >= 0);
+    return 1;
+}
+
+// ─── Test 4: Thread-local storage ───────────────────────────────────────
+fn test_tls() -> i64 {
+    val key = sync_tls_create();
+    // Initially should be 0 (unset)
+    val v0 = sync_tls_get(key);
+    assert(v0 == 0);
+    // Set and get
+    sync_tls_set(key, 42);
+    val v1 = sync_tls_get(key);
+    assert(v1 == 42);
+    // Overwrite
+    sync_tls_set(key, 100);
+    val v2 = sync_tls_get(key);
+    assert(v2 == 100);
+    return 1;
+}
+
+fn main() {
+    // Test @derive(Default)
+    val p = Point_default();
+    assert(p.x == 0);
+    assert(p.y == 0);
+    assert(p.z == 0);
+
+    val c = Config_default();
+    assert(c.debug == false);
+    assert(c.count == 0);
+
+    // Test raw strings
+    assert(test_raw_strings() == 1);
+
+    // Test wall-clock timing
+    assert(test_clock() == 1);
+
+    // Test thread-local storage
+    assert(test_tls() == 1);
+
+    println("All new feature tests passed!");
+}

@@ -1,0 +1,666 @@
+// Fides JSON module — SH-6.3 rewrite of json.rs
+//
+// Self-contained JSON parser and serializer written in Fides.
+// This is a leaf module with no dependencies on other compiler modules.
+//
+// Provides:
+//   enum Json { Null, Bool(bool), Num(f64), Str(str), Arr(Vec<Json>), Obj(JsonObject) }
+//   fn json_parse(s: str) -> JsonResult
+//   fn json_dump(v: Json, pretty: bool) -> str
+//   fn json_escape_string(s: str) -> str
+//
+// Parity with Rust src/json.rs:
+//   - Parse: same recursive descent, same error messages
+//   - Dump: same output format (compact and pretty)
+//   - Numbers: integer-valued floats printed without decimal point
+//   - Objects: keys sorted (Rust uses BTreeMap; we sort on dump)
+//   - Strings: same escape sequences (\n \r \t \" \\ \uXXXX)
+
+module compiler::json;
+
+use core;
+use vec;
+use string;
+
+// ─── JSON Value ──────────────────────────────────────────────────────
+
+// NOTE: Enum and struct declarations must come before any impl blocks.
+// The Fides parser adds enum/struct names as it encounters them, so impl
+// blocks that reference enum variants (e.g. Json::Null) need the enum
+// to be declared first.
+
+/// JSON value — recursive enum.
+pub enum Json {
+    Null,
+    Bool(bool),
+    Num(f64),
+    Str(str),
+    Arr(Vec<Json>),
+    Obj(JsonObject),
+}
+
+/// Result of parsing a JSON string.
+pub enum JsonResult {
+    Ok(Json),
+    Err(str),
+}
+
+/// JSON object — parallel keys and values.
+/// Keys are kept in insertion order; sorted on dump to match BTreeMap behavior.
+pub struct JsonObject {
+    keys: Vec<str>,
+    values: Vec<Json>,
+}
+
+impl JsonObject {
+    pub fn new() -> JsonObject {
+        return JsonObject { keys: Vec::new(), values: Vec::new() };
+    }
+
+    pub fn insert(self: JsonObject, key: str, value: Json) -> void {
+        // Check if key already exists — update in place
+        var i: i64 = 0;
+        while i < self.keys.len() {
+            if str_equal(self.keys.get(i), key) {
+                self.values.set(i, value);
+                return;
+            }
+            i = i + 1;
+        }
+        // New key — append
+        self.keys.push(key);
+        self.values.push(value);
+    }
+
+    pub fn get(self: JsonObject, key: str) -> Json {
+        var i: i64 = 0;
+        while i < self.keys.len() {
+            if str_equal(self.keys.get(i), key) {
+                return self.values.get(i);
+            }
+            i = i + 1;
+        }
+        return Json::Null;
+    }
+
+    pub fn contains(self: JsonObject, key: str) -> bool {
+        var i: i64 = 0;
+        while i < self.keys.len() {
+            if str_equal(self.keys.get(i), key) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    pub fn len(self: JsonObject) -> i64 {
+        return self.keys.len();
+    }
+
+    pub fn is_empty(self: JsonObject) -> bool {
+        return self.keys.len() == 0;
+    }
+}
+
+// ─── Parser ──────────────────────────────────────────────────────────
+
+struct JsonParser {
+    source: str,
+    pos: i64,
+    len: i64,
+}
+
+impl JsonParser {
+    fn new(source: str) -> JsonParser {
+        return JsonParser {
+            source: source,
+            pos: 0,
+            len: str_len(source),
+        };
+    }
+
+    fn peek(self: &JsonParser) -> i64 {
+        if self.pos >= self.len {
+            return 0;
+        }
+        return str_byte_at(self.source, self.pos);
+    }
+
+    fn peek_at(self: &JsonParser, offset: i64) -> i64 {
+        var idx = self.pos + offset;
+        if idx >= self.len {
+            return 0;
+        }
+        return str_byte_at(self.source, idx);
+    }
+
+    fn advance(self: &mut JsonParser) -> i64 {
+        if self.pos >= self.len {
+            return 0;
+        }
+        var ch = str_byte_at(self.source, self.pos);
+        self.pos = self.pos + 1;
+        return ch;
+    }
+
+    fn skip_ws(self: &mut JsonParser) {
+        while self.pos < self.len {
+            var ch = str_byte_at(self.source, self.pos);
+            if ch == 32 || ch == 9 || ch == 10 || ch == 13 {
+                self.pos = self.pos + 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn parse_value(self: &mut JsonParser) -> JsonResult {
+        self.skip_ws();
+        if self.pos >= self.len {
+            return JsonResult::Err("Unexpected end of input");
+        }
+        var ch = self.peek();
+        if ch == 110 { return self.parse_null(); }       // n
+        if ch == 116 || ch == 102 { return self.parse_bool(); }  // t or f
+        if ch == 34 { return self.parse_string(); }      // "
+        if ch == 91 { return self.parse_array(); }       // [
+        if ch == 123 { return self.parse_object(); }     // {
+        if ch == 45 || (ch >= 48 && ch <= 57) { return self.parse_number(); }  // - or 0-9
+        return JsonResult::Err(
+            p_str_concat(
+                p_str_concat(
+                    p_str_concat("Unexpected character '", p_char_to_str(ch)),
+                    "' at position "
+                ),
+                int_to_str(self.pos)
+            )
+        );
+    }
+
+    fn parse_null(self: &mut JsonParser) -> JsonResult {
+        // Check "null"
+        if self.pos + 4 <= self.len
+            && self.peek() == 110       // n
+            && self.peek_at(1) == 117   // u
+            && self.peek_at(2) == 108   // l
+            && self.peek_at(3) == 108   // l
+        {
+            self.pos = self.pos + 4;
+            return JsonResult::Ok(Json::Null);
+        }
+        return JsonResult::Err("Invalid null literal");
+    }
+
+    fn parse_bool(self: &mut JsonParser) -> JsonResult {
+        // Check "true"
+        if self.pos + 4 <= self.len
+            && self.peek() == 116       // t
+            && self.peek_at(1) == 114   // r
+            && self.peek_at(2) == 117   // u
+            && self.peek_at(3) == 101   // e
+        {
+            self.pos = self.pos + 4;
+            return JsonResult::Ok(Json::Bool(true));
+        }
+        // Check "false"
+        if self.pos + 5 <= self.len
+            && self.peek() == 102       // f
+            && self.peek_at(1) == 97    // a
+            && self.peek_at(2) == 108   // l
+            && self.peek_at(3) == 115   // s
+            && self.peek_at(4) == 101   // e
+        {
+            self.pos = self.pos + 5;
+            return JsonResult::Ok(Json::Bool(false));
+        }
+        return JsonResult::Err("Invalid boolean literal");
+    }
+
+    fn parse_string(self: &mut JsonParser) -> JsonResult {
+        self.pos = self.pos + 1;  // skip opening "
+        var sb = StringBuilder::new();
+        while self.pos < self.len {
+            var ch = str_byte_at(self.source, self.pos);
+            if ch == 34 {  // closing "
+                self.pos = self.pos + 1;
+                return JsonResult::Ok(Json::Str(sb.to_str()));
+            }
+            if ch == 92 {  // backslash escape
+                self.pos = self.pos + 1;
+                if self.pos >= self.len {
+                    return JsonResult::Err("Unterminated escape sequence");
+                }
+                var esc = str_byte_at(self.source, self.pos);
+                if esc == 34 { sb.append_char(34); }       // \"
+                else if esc == 92 { sb.append_char(92); }  // \\
+                else if esc == 47 { sb.append_char(47); }  // \/
+                else if esc == 110 { sb.append_char(10); } // \n
+                else if esc == 114 { sb.append_char(13); } // \r
+                else if esc == 116 { sb.append_char(9); }  // \t
+                else if esc == 98 { sb.append_char(8); }   // \b
+                else if esc == 102 { sb.append_char(12); } // \f
+                else if esc == 117 {  // \uXXXX
+                    if self.pos + 4 >= self.len {
+                        return JsonResult::Err("Invalid unicode escape");
+                    }
+                    var code: i64 = 0;
+                    var i: i64 = 1;
+                    while i <= 4 {
+                        var hex_ch = str_byte_at(self.source, self.pos + i);
+                        var digit: i64 = 0;
+                        if hex_ch >= 48 && hex_ch <= 57 {
+                            digit = hex_ch - 48;
+                        } else if hex_ch >= 65 && hex_ch <= 70 {
+                            digit = hex_ch - 55;  // A-F
+                        } else if hex_ch >= 97 && hex_ch <= 102 {
+                            digit = hex_ch - 87;  // a-f
+                        } else {
+                            return JsonResult::Err("Invalid unicode escape");
+                        }
+                        code = code * 16 + digit;
+                        i = i + 1;
+                    }
+                    // Encode as UTF-8
+                    append_utf8(sb, code);
+                    self.pos = self.pos + 4;
+                } else {
+                    return JsonResult::Err(
+                        p_str_concat(
+                            "Invalid escape character '",
+                            p_str_concat(p_char_to_str(esc), "'")
+                        )
+                    );
+                }
+                self.pos = self.pos + 1;
+            } else {
+                // Regular character — append byte directly (UTF-8 passthrough)
+                sb.append_char(ch);
+                self.pos = self.pos + 1;
+            }
+        }
+        return JsonResult::Err("Unterminated string");
+    }
+
+    fn parse_number(self: &mut JsonParser) -> JsonResult {
+        var start = self.pos;
+        if self.pos < self.len && str_byte_at(self.source, self.pos) == 45 {
+            self.pos = self.pos + 1;  // -
+        }
+        // Integer part
+        while self.pos < self.len {
+            var ch = str_byte_at(self.source, self.pos);
+            if ch >= 48 && ch <= 57 {
+                self.pos = self.pos + 1;
+            } else {
+                break;
+            }
+        }
+        // Fractional part
+        if self.pos < self.len && str_byte_at(self.source, self.pos) == 46 {
+            self.pos = self.pos + 1;  // .
+            while self.pos < self.len {
+                var ch = str_byte_at(self.source, self.pos);
+                if ch >= 48 && ch <= 57 {
+                    self.pos = self.pos + 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        // Exponent part
+        if self.pos < self.len {
+            var ch = str_byte_at(self.source, self.pos);
+            if ch == 101 || ch == 69 {  // e or E
+                self.pos = self.pos + 1;
+                if self.pos < self.len {
+                    var sign_ch = str_byte_at(self.source, self.pos);
+                    if sign_ch == 43 || sign_ch == 45 {  // + or -
+                        self.pos = self.pos + 1;
+                    }
+                }
+                while self.pos < self.len {
+                    var dch = str_byte_at(self.source, self.pos);
+                    if dch >= 48 && dch <= 57 {
+                        self.pos = self.pos + 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        var text = str_slice(self.source, start, self.pos);
+        var val = str_parse_float(text);
+        // str_parse_float returns 0.0 on failure — check if text is actually "0"
+        // to distinguish valid "0" from parse failure
+        if val == 0.0 {
+            // Check if the text is actually a valid zero
+            var is_valid_zero = false;
+            if str_equal(text, "0") { is_valid_zero = true; }
+            else if str_equal(text, "0.0") { is_valid_zero = true; }
+            else if str_equal(text, "-0") { is_valid_zero = true; }
+            else if str_equal(text, "0e0") { is_valid_zero = true; }
+            else if str_equal(text, "0E0") { is_valid_zero = true; }
+            if !is_valid_zero {
+                // Check if it's any other valid number that happens to be 0
+                // e.g. "0.00", "0e1", etc. — str_parse_float succeeded
+                // If the text starts with a digit or '-', it's a valid number
+                var first_ch = str_byte_at(text, 0);
+                if (first_ch >= 48 && first_ch <= 57) || first_ch == 45 {
+                    is_valid_zero = true;
+                }
+            }
+            if !is_valid_zero {
+                return JsonResult::Err(
+                    p_str_concat("Invalid number: ", text)
+                );
+            }
+        }
+        return JsonResult::Ok(Json::Num(val));
+    }
+
+    fn parse_array(self: &mut JsonParser) -> JsonResult {
+        self.pos = self.pos + 1;  // skip [
+        self.skip_ws();
+        var arr = Vec::new();
+        if self.pos < self.len && str_byte_at(self.source, self.pos) == 93 {
+            self.pos = self.pos + 1;  // ]
+            return JsonResult::Ok(Json::Arr(arr));
+        }
+        while true {
+            var result = self.parse_value();
+            match result {
+                JsonResult::Ok(v) => { arr.push(v); }
+                JsonResult::Err(e) => { return JsonResult::Err(e); }
+            }
+            self.skip_ws();
+            if self.pos >= self.len {
+                return JsonResult::Err("Unterminated array");
+            }
+            var ch = str_byte_at(self.source, self.pos);
+            if ch == 44 {  // ,
+                self.pos = self.pos + 1;
+                self.skip_ws();
+            } else if ch == 93 {  // ]
+                self.pos = self.pos + 1;
+                return JsonResult::Ok(Json::Arr(arr));
+            } else {
+                return JsonResult::Err(
+                    p_str_concat(
+                        p_str_concat(
+                            p_str_concat(
+                                "Expected ',' or ']' but got '",
+                                p_char_to_str(ch)
+                            ),
+                            "' at position "
+                        ),
+                        int_to_str(self.pos)
+                    )
+                );
+            }
+        }
+        return JsonResult::Err("Unterminated array");
+    }
+
+    fn parse_object(self: &mut JsonParser) -> JsonResult {
+        self.pos = self.pos + 1;  // skip {
+        self.skip_ws();
+        var obj = JsonObject::new();
+        if self.pos < self.len && str_byte_at(self.source, self.pos) == 125 {
+            self.pos = self.pos + 1;  // }
+            return JsonResult::Ok(Json::Obj(obj));
+        }
+        while true {
+            self.skip_ws();
+            // Key must be a string
+            if self.pos >= self.len || str_byte_at(self.source, self.pos) != 34 {
+                return JsonResult::Err("Expected string key in object");
+            }
+            var key_result = self.parse_string();
+            var key = "";
+            match key_result {
+                JsonResult::Ok(v) => {
+                    match v {
+                        Json::Str(s) => { key = s; }
+                        _ => { return JsonResult::Err("Expected string key in object"); }
+                    }
+                }
+                JsonResult::Err(e) => { return JsonResult::Err(e); }
+            }
+            self.skip_ws();
+            if self.pos >= self.len || str_byte_at(self.source, self.pos) != 58 {
+                return JsonResult::Err("Expected ':' after key in object");
+            }
+            self.pos = self.pos + 1;  // skip :
+            var val_result = self.parse_value();
+            match val_result {
+                JsonResult::Ok(v) => { obj.insert(key, v); }
+                JsonResult::Err(e) => { return JsonResult::Err(e); }
+            }
+            self.skip_ws();
+            if self.pos >= self.len {
+                return JsonResult::Err("Unterminated object");
+            }
+            var ch = str_byte_at(self.source, self.pos);
+            if ch == 44 {  // ,
+                self.pos = self.pos + 1;
+            } else if ch == 125 {  // }
+                self.pos = self.pos + 1;
+                return JsonResult::Ok(Json::Obj(obj));
+            } else {
+                return JsonResult::Err(
+                    p_str_concat(
+                        p_str_concat(
+                            p_str_concat(
+                                "Expected ',' or '}' but got '",
+                                p_char_to_str(ch)
+                            ),
+                            "' at position "
+                        ),
+                        int_to_str(self.pos)
+                    )
+                );
+            }
+        }
+        return JsonResult::Err("Unterminated object");
+    }
+}
+
+// ─── Public API ──────────────────────────────────────────────────────
+
+/// Parse a JSON string. Returns JsonResult::Ok(Json) or JsonResult::Err(msg).
+pub fn json_parse(s: str) -> JsonResult {
+    var parser = JsonParser::new(s);
+    parser.skip_ws();
+    var result = parser.parse_value();
+    match result {
+        JsonResult::Ok(v) => {
+            parser.skip_ws();
+            if parser.pos < parser.len {
+                return JsonResult::Err(
+                    p_str_concat(
+                        "Unexpected trailing characters at position ",
+                        int_to_str(parser.pos)
+                    )
+                );
+            }
+            return JsonResult::Ok(v);
+        }
+        JsonResult::Err(e) => { return JsonResult::Err(e); }
+    }
+}
+
+/// Serialize a Json value to a string.
+/// If pretty is true, uses 2-space indentation.
+pub fn json_dump(v: Json, pretty: bool) -> str {
+    var sb = StringBuilder::new();
+    dump_inner(v, sb, pretty, 0);
+    return sb.to_str();
+}
+
+/// Escape a string as a JSON string literal (with quotes).
+pub fn json_escape_string(s: str) -> str {
+    var sb = StringBuilder::new();
+    sb.append_char(34);  // opening "
+    var i: i64 = 0;
+    var len = str_len(s);
+    while i < len {
+        var ch = str_byte_at(s, i);
+        if ch == 34 { sb.append_str("\\\""); }       // "
+        else if ch == 92 { sb.append_str("\\\\"); }  // backslash
+        else if ch == 10 { sb.append_str("\\n"); }   // newline
+        else if ch == 13 { sb.append_str("\\r"); }   // carriage return
+        else if ch == 9 { sb.append_str("\\t"); }    // tab
+        else if ch == 8 { sb.append_str("\\b"); }    // backspace
+        else if ch == 12 { sb.append_str("\\f"); }   // form feed
+        else if ch < 32 {
+            // Control character — \uXXXX
+            sb.append_str("\\u");
+            sb.append_str(hex4(ch));
+        } else {
+            sb.append_char(ch);
+        }
+        i = i + 1;
+    }
+    sb.append_char(34);  // closing "
+    return sb.to_str();
+}
+
+// ─── Internal helpers ────────────────────────────────────────────────
+
+/// Append a Unicode code point as UTF-8 to a StringBuilder.
+fn append_utf8(sb: StringBuilder, code: i64) -> void {
+    if code < 128 {
+        // 1-byte: 0xxxxxxx
+        sb.append_char(code);
+    } else if code < 2048 {
+        // 2-byte: 110xxxxx 10xxxxxx
+        sb.append_char(192 | (code >> 6));
+        sb.append_char(128 | (code & 63));
+    } else {
+        // 3-byte: 1110xxxx 10xxxxxx 10xxxxxx
+        // (JSON \u escapes are at most 0xFFFF, so 3 bytes max)
+        sb.append_char(224 | (code >> 12));
+        sb.append_char(128 | ((code >> 6) & 63));
+        sb.append_char(128 | (code & 63));
+    }
+}
+
+/// Format a value as a 4-digit lowercase hex string (zero-padded).
+fn hex4(n: i64) -> str {
+    var hex_chars = "0123456789abcdef";
+    var bytes = Vec::new();
+    bytes.push(str_byte_at(hex_chars, (n >> 12) & 0xF));
+    bytes.push(str_byte_at(hex_chars, (n >> 8) & 0xF));
+    bytes.push(str_byte_at(hex_chars, (n >> 4) & 0xF));
+    bytes.push(str_byte_at(hex_chars, n & 0xF));
+    return str_from_bytes(bytes);
+}
+
+/// Format a JSON number — integers without decimal point, floats with.
+fn format_number(n: f64) -> str {
+    var int_val = n as i64;
+    var back = int_val as f64;
+    if back == n {
+        // No fractional part — check if within safe integer range
+        if n < 1000000000000000.0 && n > -1000000000000000.0 {
+            return int_to_str(int_val);
+        }
+    }
+    return float_to_str(n);
+}
+
+/// Recursive dump implementation.
+fn dump_inner(v: Json, sb: StringBuilder, pretty: bool, indent: i64) -> void {
+    match v {
+        Json::Null => { sb.append_str("null"); }
+        Json::Bool(b) => {
+            if b { sb.append_str("true"); }
+            else { sb.append_str("false"); }
+        }
+        Json::Num(n) => { sb.append_str(format_number(n)); }
+        Json::Str(s) => { sb.append_str(json_escape_string(s)); }
+        Json::Arr(arr) => {
+            if arr.len() == 0 {
+                sb.append_str("[]");
+                return;
+            }
+            sb.append_char(91);  // [
+            var i: i64 = 0;
+            while i < arr.len() {
+                if i > 0 { sb.append_char(44); }  // ,
+                if pretty {
+                    sb.append_char(10);  // newline
+                    append_indent(sb, indent + 1);
+                }
+                dump_inner(arr.get(i), sb, pretty, indent + 1);
+                i = i + 1;
+            }
+            if pretty {
+                sb.append_char(10);  // newline
+                append_indent(sb, indent);
+            }
+            sb.append_char(93);  // ]
+        }
+        Json::Obj(obj) => {
+            if obj.is_empty() {
+                sb.append_str("{}");
+                return;
+            }
+            sb.append_char(123);  // {
+            // Sort keys for deterministic output (matches Rust BTreeMap)
+            var sorted_keys = sort_keys(obj.keys);
+            var i: i64 = 0;
+            while i < sorted_keys.len() {
+                if i > 0 { sb.append_char(44); }  // ,
+                if pretty {
+                    sb.append_char(10);  // newline
+                    append_indent(sb, indent + 1);
+                }
+                sb.append_str(json_escape_string(sorted_keys.get(i)));
+                sb.append_char(58);  // :
+                if pretty { sb.append_char(32); }  // space
+                dump_inner(obj.get(sorted_keys.get(i)), sb, pretty, indent + 1);
+                i = i + 1;
+            }
+            if pretty {
+                sb.append_char(10);  // newline
+                append_indent(sb, indent);
+            }
+            sb.append_char(125);  // }
+        }
+    }
+}
+
+/// Append `n` levels of 2-space indentation to a StringBuilder.
+fn append_indent(sb: StringBuilder, n: i64) -> void {
+    var i: i64 = 0;
+    while i < n {
+        sb.append_str("  ");
+        i = i + 1;
+    }
+}
+
+/// Sort a Vec<str> using insertion sort (stable, simple, good for small N).
+fn sort_keys(keys: Vec<str>) -> Vec<str> {
+    // Copy the input
+    var result = Vec::new();
+    var i: i64 = 0;
+    while i < keys.len() {
+        result.push(keys.get(i));
+        i = i + 1;
+    }
+    // Insertion sort
+    i = 1;
+    while i < result.len() {
+        var key = result.get(i);
+        var j = i - 1;
+        while j >= 0 && str_compare(result.get(j), key) > 0 {
+            result.set(j + 1, result.get(j));
+            j = j - 1;
+        }
+        result.set(j + 1, key);
+        i = i + 1;
+    }
+    return result;
+}

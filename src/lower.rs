@@ -35,7 +35,7 @@ fn runtime_effects(name: &str) -> Option<EffectSet> {
     if matches!(name,
         "p_vec_new" | "p_vec_new_with" | "p_vec_clone"
         | "p_malloc" | "p_alloc" | "p_free"
-        | "p_str_concat" | "p_to_str" | "p_char_to_str" | "p_float_to_str" | "p_bool_to_str"
+        | "p_str_concat" | "p_to_str" | "p_char_to_str" | "p_float_to_str" | "p_bool_to_str" | "p_str_to_float"
         | "p_string_replace" | "p_string_split" | "p_string_trim"
         | "p_string_to_uppercase" | "p_string_to_lowercase"
     ) {
@@ -356,14 +356,15 @@ impl Lowerer {
                 .push(ti.type_name.clone());
         }
 
-        // Compute struct layouts
-        for s in &program.structs {
-            self.compute_struct_layout(s);
-        }
-
-        // Compute enum layouts
+        // Compute enum layouts first (structs may contain enum fields and need
+        // to know enum sizes for correct field offsets).
         for e in &program.enums {
             self.compute_enum_layout(e);
+        }
+
+        // Compute struct layouts (after enums so enum field sizes are known)
+        for s in &program.structs {
+            self.compute_struct_layout(s);
         }
 
         // Register runtime/external functions
@@ -438,9 +439,21 @@ impl Lowerer {
 
         for field in &def.fields {
             let ir_ty = self.lower_type(&field.ty);
-            // Every field gets an 8-byte slot (uniform representation).
+            // Every field gets at least an 8-byte slot (uniform representation).
+            // Enum-typed fields need more space: (1 + max_payload) * 8 bytes,
+            // because enums are stored inline as (tag, data0, data1, ...).
+            // Without this, the enum's payload overlaps with the next struct field.
+            let field_size = if let IrType::Struct(ref name) = ir_ty {
+                if let Some(layout) = self.module.get_struct(name) {
+                    layout.size
+                } else {
+                    8
+                }
+            } else {
+                8
+            };
             fields.push((field.name.clone(), ir_ty.clone(), offset as u32));
-            offset += 8;
+            offset += field_size;
         }
 
         // Align to 8 bytes (all structs are 8-byte aligned in the native codegen).
@@ -508,6 +521,10 @@ impl Lowerer {
         self.module.add_extern("p_float_to_str",
             vec![IrType::F64],
             IrType::Ptr(Box::new(IrType::U8)));
+        // p_str_to_float(s: *u8) -> f64 — parse a string as f64
+        self.module.add_extern("p_str_to_float",
+            vec![IrType::Ptr(Box::new(IrType::U8))],
+            IrType::F64);
         self.module.add_extern("p_bool_to_str",
             vec![IrType::Bool],
             IrType::Ptr(Box::new(IrType::U8)));
@@ -715,6 +732,12 @@ impl Lowerer {
         self.module.add_extern("p_system", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
         // p_exit(code: i64) -> void  — exit the process with a code
         self.module.add_extern("p_exit", vec![IrType::I64], IrType::Void);
+        // p_clock_now() -> i64  — wall-clock time in nanoseconds since Unix epoch
+        self.module.add_extern("p_clock_now", vec![], IrType::I64);
+        // p_clock_now_us() -> i64  — wall-clock time in microseconds since Unix epoch
+        self.module.add_extern("p_clock_now_us", vec![], IrType::I64);
+        // p_clock_now_ms() -> i64  — wall-clock time in milliseconds since Unix epoch
+        self.module.add_extern("p_clock_now_ms", vec![], IrType::I64);
 
         // ─── Regex builtin ───
         // p_regex_match(s: *u8, pattern: *u8) -> bool  — simple wildcard match (? and *)
@@ -795,6 +818,13 @@ impl Lowerer {
         self.module.add_extern("p_mutex_lock", vec![IrType::I64], IrType::Void);
         // p_mutex_unlock(m: i64) -> void  — unlock a mutex
         self.module.add_extern("p_mutex_unlock", vec![IrType::I64], IrType::Void);
+        // ─── Thread-local storage ───
+        // p_tls_create() -> i64  — create a thread-local key, return key handle
+        self.module.add_extern("p_tls_create", vec![], IrType::I64);
+        // p_tls_get(key: i64) -> i64  — get the value for the current thread (0 if unset)
+        self.module.add_extern("p_tls_get", vec![IrType::I64], IrType::I64);
+        // p_tls_set(key: i64, value: i64) -> void  — set the value for the current thread
+        self.module.add_extern("p_tls_set", vec![IrType::I64, IrType::I64], IrType::Void);
         // ─── Channels (bounded MPSC queue) ───
         // p_chan_create(capacity: i64) -> i64 — create a bounded channel
         self.module.add_extern("p_chan_create", vec![IrType::I64], IrType::I64);
@@ -1093,11 +1123,13 @@ impl Lowerer {
                         false
                     };
                     if needs_zero {
-                        let zero_val = if let Some(ref f) = self.current_func {
+                        let zero_val = {
+                            let region = self.current_region();
+                            if let Some(f) = self.current_func.as_mut() {
                             let ret_ty = f.ret_ty.clone();
                             let meta = ValueMeta {
                                 ty: ret_ty.clone(),
-                                region: self.current_region(),
+                                region,
                                 effects: EffectSet::none(),
                                 source_line: None,
                                 in_sandbox: false,
@@ -1105,21 +1137,21 @@ impl Lowerer {
                                 borrow_kind: crate::ir::BorrowKind::None,
                             };
                             let zid = {
-                                let fmut = self.current_func.as_mut().unwrap();
-                                let id = fmut.new_value(meta);
+                                let id = f.new_value(meta);
                                 let inst = match &ret_ty {
                                     IrType::F32 | IrType::F64 => Inst::ConstFloat { bits: 0, ty: ret_ty.clone() },
                                     IrType::Bool => Inst::ConstBool { value: false },
                                     _ => Inst::ConstInt { value: 0, ty: ret_ty.clone() },
                                 };
-                                fmut.instructions.insert(id, inst);
+                                f.instructions.insert(id, inst);
                                 let block_idx = self.current_block.0 as usize;
-                                fmut.blocks[block_idx].instructions.push(id);
+                                f.blocks[block_idx].instructions.push(id);
                                 id
                             };
                             Some(zid)
-                        } else {
+                            } else {
                             None
+                            }
                         };
                         self.emit_terminator(Inst::Return { value: zero_val });
                     } else {
@@ -3074,6 +3106,29 @@ impl Lowerer {
                             e
                         },
                     });
+                }
+
+                // String equality: when == or != is used with two str operands,
+                // emit a call to p_str_equal for content comparison.
+                // Without this, native codegen does pointer comparison (wrong).
+                if matches!(op, BinOp::Eq | BinOp::Neq)
+                    && left_ir_ty == str_ty && right_ir_ty == str_ty
+                {
+                    let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                    let eq_val = self.emit_inst(Inst::Call {
+                        func: "p_str_equal".to_string(),
+                        args: vec![dummy_env, left_val, right_val],
+                        ret_ty: IrType::Bool,
+                        effects: EffectSet::new(),
+                    });
+                    if matches!(op, BinOp::Neq) {
+                        return self.emit_inst(Inst::UnaryOp {
+                            op: UnaryOp::Not,
+                            operand: eq_val,
+                            ty: IrType::Bool,
+                        });
+                    }
+                    return eq_val;
                 }
 
                 self.emit_inst(Inst::BinOp {

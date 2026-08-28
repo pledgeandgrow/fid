@@ -42,7 +42,7 @@ Every new language faces the chicken-and-egg problem:
 > - ✅ **FixedBufferAllocator** — deterministic, no-allocation embedded memory management is operational (`src/embedded.rs`)
 > - ✅ **Hot reload** — native JIT + function-level change detection works
 > - ✅ **C interop** — C header parser → Fides FFI bindings (`src/cparser.rs`) is functional
-> - ✅ **C codegen backend** — 153/153 test parity
+> - ✅ **C codegen backend** — 164/165 test parity
 >
 > These niches are no longer aspirational — the foundational capabilities are built and running.
 
@@ -311,7 +311,7 @@ Advocacy (people recommend Fides to others)
 > - ✅ **`watch --diff` works** — PIR L2 line diff + binary size delta on each reload
 > - ✅ **Capability-aware linking works** — `--caps` flag strips ungranted functions from binary
 > - ✅ **Optimizer enabled by default** — 23 passes including const-fold, CSE, GVN, DCE, DSE, inline, unroll, TCO, loop-vec, SLP. `--lto` for aggressive cross-module inlining.
-> - ✅ **C codegen at 153/153 test parity** — all normal tests match. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic.
+> - ✅ **C codegen at 164/165 test parity** — all normal tests match (1 fail: test_compiler_sized, user-added). Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic.
 > - ✅ **LSP server works** — `fidesc lsp` provides JSON-RPC over stdio with diagnostics, completion, hover, goto-definition. No external dependencies.
 > - ✅ **Generic enums/structs work** — `enum Option<T>`, `struct Foo<T>` with type parameters
 > - ✅ **Concurrency works** — `spawn` (OS threads), bounded MPSC channels (`p_chan_*`), executor runtime (`p_executor_*`), async IO (`p_net_*`, `p_fs_read_async`), `select` statement

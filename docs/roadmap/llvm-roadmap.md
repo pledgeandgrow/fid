@@ -507,7 +507,7 @@ These phases use Fides's semantic information to optimize in ways LLVM fundament
 
 **See `roadmap.md` Phase 10** for blocker status, test baseline, and self-hosting
 readiness details. All 3 language-level blockers (generic Vec<T>, enum payloads,
-recursive Box<T>) are resolved. 153/153 tests pass on all 3 backends.
+recursive Box<T>) are resolved. 164/165 tests pass on interp+C codegen, 165/165 PE.
 
 ### Estimated Effort to Self-Host
 
