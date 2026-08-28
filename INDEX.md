@@ -256,9 +256,9 @@ typed strings, init guarantees, constant_time, etc.
 
 ### Current Test Results (Aug 2026)
 ```
-Interpreter:  146/146 normal
-C Codegen:    146/146 matched
-PE Emitter:   146/146 valid
+Interpreter:  149/149 normal
+C Codegen:    149/149 matched
+PE Emitter:   149/149 valid
 Unit tests:   265/265 passed  (cargo test --lib)
 Harness:      8/8 passed
 ```

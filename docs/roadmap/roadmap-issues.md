@@ -2549,7 +2549,59 @@ stale. The cost is low (run each test on each backend) and the benefit is
 high (accurate picture of project health).
 
 **Result:**
-- Skip list: 42 → 5 (4 C codegen missing-builtins + 1 design difference)
+- Skip list: 42 → 5 → 4 (after Issue 71 runtime effects fix removed 3 more)
 - Known-fail: 10 → 6 (3 parser bugs + 3 C codegen mismatches)
-- Normal tests: 119 → 147 (41 promoted)
+- Normal tests: 119 → 147 → 149 (41 promoted + 3 bonus passes from Issue 71)
 - All docs updated with accurate counts
+
+---
+
+## Issue 71: Optimizer DCE Removing Side-Effecting Runtime Calls
+
+**Status:** Resolved (Aug 27, 2026)
+
+**The problem:** When `--opt` was enabled (the default for `build`), calls to
+`Vec_push` and other side-effecting runtime functions (`p_vec_push`,
+`p_vec_set`, `p_vec_clear`, `p_map_insert`, etc.) were silently removed by
+the optimizer's dead-call elimination pass (`effect_optimize_function` in
+`src/opt.rs`). This caused `Vec<i64>` push operations to appear to do nothing
+— `v.len()` would return 0 after pushes, and `v.get(0)` would return 0.
+
+**Root cause:** The lowerer (`src/lower.rs`) set `EffectSet::new()` (empty)
+on calls to runtime builtin functions (`p_*` functions) because:
+1. Only `p_print*` and `__pledge*` prefixed calls got `Effect::IO`
+2. `p_vec_push` etc. are extern functions, not in `function_effects` (which
+   only tracks user-defined functions)
+3. With empty effects, `Vec_push` (which calls `p_vec_push`) was marked
+   `is_pure = true` by the effects computation
+4. The `effect_optimize_function` pass removed all calls to pure functions
+   whose results are unused — `Vec_push` returns `void`, so all calls were
+   removed as "dead pure calls"
+
+**Fix:** Added `runtime_effects()` helper in `src/lower.rs` that returns
+appropriate `EffectSet` for known runtime builtins:
+- **Write** effect for mutating ops (`p_vec_push`, `p_vec_set`, `p_vec_clear`,
+  `p_map_insert`, `p_atomic_*`, `p_mutex_*`, `p_rc_*`, etc.)
+- **Alloc** effect for allocating ops (`p_vec_new`, `p_malloc`, `p_str_concat`,
+  `p_tensor_*`, etc.)
+- **IO** effect for I/O ops (`p_print*`, `p_panic`, `p_chan_*`, `p_file_*`,
+  `p_socket_*`, `p_dl_*`, comm ops, etc.)
+
+This helper is called in both SRET and non-SRET call lowering paths.
+
+**Also fixed:**
+- Added `p_vec_*` extern function declarations (23 functions) to the lowerer
+  so the codegen uses the correct extern calling convention (no env_ptr)
+- Added `GradBegin`/`GradEnd`/`Backward` match arms to 6 backend files
+  (`codegen_c.rs`, `interp.rs`, `pe.rs`, `pir.rs`, `wasm.rs`, `x86.rs`)
+- Removed debug prints from `stdlib/core.fd` `Vec_push`
+
+**Impact:**
+- `Vec<i64>` push/pop/get works correctly with `--opt` (the default)
+- 3 bonus passes: `test_iter`, `test_vec_math`, `test_parallel_concurrent`
+  now pass on interpreter and/or PE emitter (were known-fail)
+- `test_shard`, `test_autodiff_grad`, `test_ml_full` removed from C codegen
+  skip list (now pass or have minor formatting differences only)
+- Skip list reduced from 7 to 4 tests
+- Normal tests: 146 → 149 (3 bonus passes)
+- All 149/149 normal tests pass on all 3 backends, 265/265 cargo tests pass

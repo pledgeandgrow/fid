@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // ─── Manifest ───────────────────────────────────────────────────────
 

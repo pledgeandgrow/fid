@@ -13,7 +13,7 @@
 //
 // ELF64 format overview:
 //   - ELF header (64 bytes)
-//   - Section headers (array of Elf64_Shdr, 64 bytes each)
+//   - Section headers (array of Elf64Shdr, 64 bytes each)
 //   - Sections: .text (code), .rela.text (relocations), .symtab, .strtab,
 //     .shstrtab (section name string table)
 //
@@ -139,12 +139,10 @@ const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
-const SHT_NOBITS: u32 = 8;
 
 // Section flags
 const SHF_ALLOC: u64 = 0x2;
 const SHF_EXECINSTR: u64 = 0x4;
-const SHF_WRITE: u64 = 0x1;
 const SHF_INFO_LINK: u64 = 0x40;
 
 // Symbol binding
@@ -165,8 +163,6 @@ const SHN_ABS: u16 = 0xfff1;
 const R_X86_64_PC32: u32 = 2;   // PC-relative 32-bit
 const R_X86_64_PLT32: u32 = 4;  // PC-relative PLT (like PC32 for static link)
 const R_X86_64_64: u32 = 1;     // absolute 64-bit
-const R_X86_64_PC64: u32 = 24;  // PC-relative 64-bit
-const R_X86_64_GOTPCREL: u32 = 9;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ELF emitter
@@ -1725,11 +1721,11 @@ impl ElfEmitter {
         // First symbol must be STN_UNDEF (null symbol).
         let mut symtab: Vec<u8> = Vec::new();
         // Symbol 0: null
-        symtab.extend_from_slice(&[0u8; 24]); // 24 bytes per Elf64_Sym
+        symtab.extend_from_slice(&[0u8; 24]); // 24 bytes per Elf64Sym
 
         // Add FILE symbol as first local symbol.
         let file_strtab_off = self.add_strtab_static("fides.c");
-        symtab.extend_from_slice(&Elf64_Sym {
+        symtab.extend_from_slice(&Elf64Sym {
             st_name: file_strtab_off,
             st_info: (STB_LOCAL << 4) | STT_FILE,
             st_other: 0,
@@ -1739,7 +1735,7 @@ impl ElfEmitter {
         }.to_bytes());
 
         // Add a section symbol for .text (needed for some relocations).
-        symtab.extend_from_slice(&Elf64_Sym {
+        symtab.extend_from_slice(&Elf64Sym {
             st_name: 0,
             st_info: (STB_LOCAL << 4) | STT_SECTION,
             st_other: 0,
@@ -1814,7 +1810,7 @@ impl ElfEmitter {
                 (SHN_UNDEF, sym.value, false)
             };
             let _ = is_def;
-            symtab.extend_from_slice(&Elf64_Sym {
+            symtab.extend_from_slice(&Elf64Sym {
                 st_name: name_off,
                 st_info: (sym.binding << 4) | sym.sym_type,
                 st_other: 0,
@@ -1835,7 +1831,7 @@ impl ElfEmitter {
             } else {
                 (SHN_UNDEF, sym.value)
             };
-            symtab.extend_from_slice(&Elf64_Sym {
+            symtab.extend_from_slice(&Elf64Sym {
                 st_name: name_off,
                 st_info: (sym.binding << 4) | sym.sym_type,
                 st_other: 0,
@@ -1849,7 +1845,7 @@ impl ElfEmitter {
         let mut rela_text: Vec<u8> = Vec::new();
         for reloc in &self.relocations {
             let new_sym = new_index.get(&reloc.symbol).copied().unwrap_or(0);
-            rela_text.extend_from_slice(&Elf64_Rela {
+            rela_text.extend_from_slice(&Elf64Rela {
                 r_offset: reloc.offset,
                 r_info: ((new_sym as u64) << 32) | (reloc.rtype as u64),
                 r_addend: reloc.addend,
@@ -1860,7 +1856,7 @@ impl ElfEmitter {
         let mut rela_rodata: Vec<u8> = Vec::new();
         for reloc in &self.rodata_relocations {
             let new_sym = new_index.get(&reloc.symbol).copied().unwrap_or(0);
-            rela_rodata.extend_from_slice(&Elf64_Rela {
+            rela_rodata.extend_from_slice(&Elf64Rela {
                 r_offset: reloc.offset,
                 r_info: ((new_sym as u64) << 32) | (reloc.rtype as u64),
                 r_addend: reloc.addend,
@@ -1976,10 +1972,10 @@ impl ElfEmitter {
 
         // Section header table
         // Section 0: NULL
-        out.extend_from_slice(&Elf64_Shdr::null().to_bytes());
+        out.extend_from_slice(&Elf64Shdr::null().to_bytes());
 
         // Section 1: .text
-        out.extend_from_slice(&Elf64_Shdr {
+        out.extend_from_slice(&Elf64Shdr {
             sh_name: self.shstrtab_offsets[".text"],
             sh_type: SHT_PROGBITS,
             sh_flags: SHF_ALLOC | SHF_EXECINSTR,
@@ -1994,7 +1990,7 @@ impl ElfEmitter {
 
         // Section 2: .rodata (if present)
         if has_rodata {
-            out.extend_from_slice(&Elf64_Shdr {
+            out.extend_from_slice(&Elf64Shdr {
                 sh_name: self.shstrtab_offsets[".rodata"],
                 sh_type: SHT_PROGBITS,
                 sh_flags: SHF_ALLOC,
@@ -2009,7 +2005,7 @@ impl ElfEmitter {
         }
 
         // Section: .symtab
-        out.extend_from_slice(&Elf64_Shdr {
+        out.extend_from_slice(&Elf64Shdr {
             sh_name: self.shstrtab_offsets[".symtab"],
             sh_type: SHT_SYMTAB,
             sh_flags: 0,
@@ -2019,11 +2015,11 @@ impl ElfEmitter {
             sh_link: strtab_idx as u32, // link to .strtab
             sh_info: first_global as u32, // index of first non-local symbol
             sh_addralign: 8,
-            sh_entsize: 24, // sizeof(Elf64_Sym)
+            sh_entsize: 24, // sizeof(Elf64Sym)
         }.to_bytes());
 
         // Section: .strtab
-        out.extend_from_slice(&Elf64_Shdr {
+        out.extend_from_slice(&Elf64Shdr {
             sh_name: self.shstrtab_offsets[".strtab"],
             sh_type: SHT_STRTAB,
             sh_flags: 0,
@@ -2037,7 +2033,7 @@ impl ElfEmitter {
         }.to_bytes());
 
         // Section: .shstrtab
-        out.extend_from_slice(&Elf64_Shdr {
+        out.extend_from_slice(&Elf64Shdr {
             sh_name: self.shstrtab_offsets[".shstrtab"],
             sh_type: SHT_STRTAB,
             sh_flags: 0,
@@ -2052,7 +2048,7 @@ impl ElfEmitter {
 
         // Section: .rela.text (if present)
         if has_relocations {
-            out.extend_from_slice(&Elf64_Shdr {
+            out.extend_from_slice(&Elf64Shdr {
                 sh_name: self.shstrtab_offsets[".rela.text"],
                 sh_type: SHT_RELA,
                 sh_flags: SHF_INFO_LINK,
@@ -2062,13 +2058,13 @@ impl ElfEmitter {
                 sh_link: symtab_idx as u32, // link to .symtab
                 sh_info: text_idx as u32,   // link to .text
                 sh_addralign: 8,
-                sh_entsize: 24, // sizeof(Elf64_Rela)
+                sh_entsize: 24, // sizeof(Elf64Rela)
             }.to_bytes());
         }
 
         // Section: .rela.rodata (if present)
         if has_rodata_relocations {
-            out.extend_from_slice(&Elf64_Shdr {
+            out.extend_from_slice(&Elf64Shdr {
                 sh_name: self.shstrtab_offsets[".rela.rodata"],
                 sh_type: SHT_RELA,
                 sh_flags: SHF_INFO_LINK,
@@ -2101,7 +2097,7 @@ impl ElfEmitter {
 // ELF structures
 // ═══════════════════════════════════════════════════════════════════════════
 
-struct Elf64_Shdr {
+struct Elf64Shdr {
     sh_name: u32,
     sh_type: u32,
     sh_flags: u64,
@@ -2114,9 +2110,9 @@ struct Elf64_Shdr {
     sh_entsize: u64,
 }
 
-impl Elf64_Shdr {
+impl Elf64Shdr {
     fn null() -> Self {
-        Elf64_Shdr {
+        Elf64Shdr {
             sh_name: 0,
             sh_type: SHT_NULL,
             sh_flags: 0,
@@ -2146,7 +2142,7 @@ impl Elf64_Shdr {
     }
 }
 
-struct Elf64_Sym {
+struct Elf64Sym {
     st_name: u32,
     st_info: u8,
     st_other: u8,
@@ -2155,7 +2151,7 @@ struct Elf64_Sym {
     st_size: u64,
 }
 
-impl Elf64_Sym {
+impl Elf64Sym {
     fn to_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(24);
         v.extend_from_slice(&self.st_name.to_le_bytes());
@@ -2168,13 +2164,13 @@ impl Elf64_Sym {
     }
 }
 
-struct Elf64_Rela {
+struct Elf64Rela {
     r_offset: u64,
     r_info: u64,
     r_addend: i64,
 }
 
-impl Elf64_Rela {
+impl Elf64Rela {
     fn to_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(24);
         v.extend_from_slice(&self.r_offset.to_le_bytes());

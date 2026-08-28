@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use crate::interp::{Interpreter, RunResult, DebugAction, Value, TraceEntry};
-use crate::ir::{IrModule, IrFunction, ValueId, BlockId};
+use crate::ir::{IrModule, IrFunction, ValueId};
 use crate::compiler;
 
 /// A breakpoint

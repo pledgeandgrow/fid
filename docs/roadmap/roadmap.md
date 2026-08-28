@@ -21,7 +21,8 @@ Phase 8B: ECS/States/Events   ← COMPLETE — component/system/query, state_mac
 Phase 8C: Shaders/SIMD       ← PARTIAL — SIMD stdlib + SPIR-V GPU codegen; @shader/@simd annotations not implemented
 Phase 8D: Game Stdlib         ← COMPLETE — 8 game stdlib modules (test_game_stdlib now passes — &mut T auto-deref fix)
 Phase 9: Industry Domains    ← NOT STARTED — only stdlib/banking.fd exists; medical/blockchain/robotics/automotive not built
-Phase 10: Self-Hosting       ← ALMOST READY — 3 blockers resolved + stdlib gaps filled + Issues 44-49 fixed. Skip/known-fail lists cleaned (Aug 27: 41 stale tests promoted to normal list, 146/146 normal tests now pass). Example projects (lexer, parser, codegen, mini-compiler, JSON parser) all work on interpreter + C codegen. PE emitter has 3 critical bugs (Issues 67-69: val-in-loop corruption, str_split failure, recursive Box<T> segfault) that must be fixed before PE self-host. C codegen self-host is ready to start.
+Phase 10: Self-Hosting       ← ALMOST READY — 3 blockers resolved + stdlib gaps filled + Issues 44-49 fixed + runtime effects fix (Vec_push no longer DCE'd by optimizer). Skip/known-fail lists cleaned (Aug 27: 41 stale tests promoted, 3 bonus passes). 149/149 normal tests pass on all 3 backends. Example projects (lexer, parser, codegen, mini-compiler, JSON parser) all work on interpreter + C codegen. PE emitter has 3 critical bugs (Issues 67-69: val-in-loop corruption, str_split failure, recursive Box<T> segfault) that must be fixed before PE self-host. C codegen self-host is ready to start.
+Phase 10B: PE Emitter Rewrite ← NOT STARTED — rewrite pe.rs in Fides after C codegen bootstrap. Fix Issues 67-69 first, then rewrite PE emitter in Fides, then switch default backend to PE for zero-dependency deployment. C backend stays as fallback.
 Phase 11: Ecosystem          ← IN PROGRESS — LSP (diag+completion+hover+def), formatter, linter, bench, profile
 Phase 12: Security Hardening ← MOSTLY COMPLETE — binary hardening + all safety annotations; CFI + full taint tracking + runtime sandbox remaining
 Phase 13: World Class        ← IN PROGRESS — type inference done, SLP+loop-vec done, @send/@sync done, debugger done, pacte package manager done, scribe doc generator done, veil coverage tool done, green threads remaining
@@ -34,10 +35,10 @@ Phase 14: Debugging Tools    ← COMPLETE — interpreter debugger, record/repla
 |---------|--------|-------|
 | Unit tests (`cargo test --lib`) | **265/265** | All passing (incl. 47 cross-compilation tests + 7 incremental compilation) |
 | Harness tests | **8/8** | All passing |
-| Interpreter | **146/146** normal | All normal tests pass. (After Aug 27 skip/known-fail cleanup: 41 tests promoted.) |
-| C Codegen | **146/146** matched | All matched. 7 C codegen skips (missing ML runtime builtins). Binary hardening enabled. |
-| PE Emitter | **146/146** valid | All normal tests pass. (After cleanup: 41 tests promoted.) |
-| Skip list | **5** tests | 4 C codegen missing-builtins (kv_cache, quantization, dp, shard) + 1 design difference (dlopen). Was 42 — 37 were stale and promoted to normal. |
+| Interpreter | **149/149** normal | All normal tests pass. (After Aug 27 skip/known-fail cleanup + runtime effects fix: 41 tests promoted, 3 bonus passes.) |
+| C Codegen | **149/149** matched | All matched. 4 C codegen skips (missing ML runtime builtins + float formatting). Binary hardening enabled. |
+| PE Emitter | **149/149** valid | All normal tests pass. (After cleanup: 41 tests promoted, 3 bonus passes.) |
+| Skip list | **4** tests | 3 C codegen missing-builtins (kv_cache, quantization, dp) + 1 design difference (dlopen). Was 42 — 37 stale + 3 more after runtime effects fix. |
 | Known-fail | **6** tests | 3 parser bugs (game_stdlib, time, time_edge) + 3 C codegen mismatches (iter, vec_math, parallel_concurrent). Was 10 — 4 were stale and promoted. |
 | Expected-fail | **35** tests | Correctly fail — error detection tests. |
 | Total `.fd` test files | **218** | 195 in root + 23 in subdirs (capability/effects/regions/safety) |
@@ -65,7 +66,7 @@ See `docs/security.md` for the full security hardening guide.
 
 **Goal:** A working language with basic features, custom codegen, no external dependencies.
 
-**Status:** Complete — 146/146 on all backends. Zero regressions.
+**Status:** Complete — 149/149 on all backends. Zero regressions.
 
 ### Milestones
 - [x] Lexer, parser, AST
@@ -524,6 +525,74 @@ rewritten in Fides. All are now resolved:
 | **8: Codegen** | Rewrite codegen_x64.rs in Fides | ~1500 | 2 sessions |
 | **9: Bootstrap** | Fides compiler compiles itself | — | 1 session |
 | **Total** | | ~14,300 | ~15-20 sessions |
+
+---
+
+## Phase 10B — PE Emitter Rewrite in Fides (NOT STARTED)
+
+**Goal:** Rewrite the PE emitter (`src/pe.rs`) in Fides, making the
+self-hosted compiler fully self-contained with zero external dependencies.
+
+**Strategy:** C codegen bootstrap first, PE emitter rewrite second.
+
+This follows the same path Zig took: bootstrap with C, self-host the
+compiler, then make the self-hosted compiler the default. The C backend
+stays as a fallback.
+
+### Why C Codegen Bootstrap First
+
+The PE emitter is a **nice-to-have for the end state**, not the bootstrap
+path. During self-hosting development, you want:
+
+1. **Fast iteration** — C codegen compiles fast, the C compiler gives errors
+2. **Debuggability** — gdb, valgrind, ASan all work on C codegen output
+3. **Correctness** — C codegen has 149/149 test parity; PE has 3 critical bugs
+
+The PE emitter's value proposition is "zero external dependencies." But that
+only matters for **deployment**, not for **development**.
+
+### Prerequisites (Must Fix Before PE Rewrite)
+
+Fix the 3 critical PE emitter bugs (Issues 67-69) that are self-hosting
+blockers for the PE path:
+
+- [ ] **Issue 67: `val` inside loop corrupts loop variable** — PE emitter
+      allocates `val`'s stack slot at the same offset as the loop variable.
+      A self-hosted lexer/parser is full of `val` declarations inside
+      `while`/`for` loops. Fix: stack slot allocation in PE lowering pass.
+- [ ] **Issue 68: `str_split` returns empty Vec in PE** — A self-hosted
+      compiler needs `str_split` for line-by-line tokenization. Fix: PE
+      emitter's `str_split` runtime implementation.
+- [ ] **Issue 69: Recursive `Box<T>` segfaults in PE** — A self-hosted
+      compiler's AST is inherently recursive (`Box<Expr>`, `Box<Stmt>`).
+      Fix: stack frame sizing or Box pointer handling in PE emitter.
+- [ ] **Native runtime stubs** — argv, file I/O, process execution in
+      `runtime_linux.rs` for PE emitter path. Not needed for C codegen
+      (libc provides these).
+
+### Rewrite Plan
+
+| Step | Description | LOC | Effort |
+|------|-------------|-----|--------|
+| **1: Fix Issues 67-69** | Fix PE emitter bugs in Rust (`src/pe.rs`) | — | 2-3 sessions |
+| **2: Native runtime stubs** | argv, file I/O, process exec in `runtime_linux.rs` | ~500 | 1-2 sessions |
+| **3: Rewrite pe.rs in Fides** | PE emitter in Fides, using self-hosted compiler | ~2000 | 3-4 sessions |
+| **4: Switch default backend** | Self-hosted compiler defaults to PE emitter | — | 1 session |
+| **5: Keep C backend as fallback** | `--backend c` flag for platforms without PE support | — | trivial |
+| **Total** | | ~2500 | ~7-10 sessions |
+
+### End State
+
+After Phase 10B:
+
+- `fidesc build` produces native executables with **zero external tools**
+  (PE emitter, no gcc/clang dependency)
+- `fidesc build --backend c` falls back to C codegen (for platforms where
+  PE emission is unsupported or for debugging with gdb/valgrind)
+- The self-hosted compiler is fully self-contained: Fides source → Fides
+  compiler → native binary, no C compiler in the toolchain
+
+The C backend stays as a permanent fallback, exactly like Zig's C backend.
 
 ---
 

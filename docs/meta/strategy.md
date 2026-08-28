@@ -285,7 +285,7 @@ master of none.
 make it another D, Crystal, or V — technically good, commercially irrelevant.**
 
 The project has built an impressive amount of working compiler infrastructure
-(85,493 LOC, 54 source files, 146/146 test parity across 3 backends, 69 stdlib
+(85,493 LOC, 54 source files, 149/149 test parity across 3 backends, 69 stdlib
 modules, 6 backends, 4 binaries: fidesc/pacte/scribe/veil). But it's spreading into too many domains (games,
 blockchain, robotics, medical, serverless) before it has proven it can do the
 basics better than existing languages.
@@ -331,7 +331,7 @@ Fides source
   └── Hot reload (native JIT)
 ```
 
-146/146 test parity across interpreter, PE, and C codegen is real. This is more
+149/149 test parity across interpreter, PE, and C codegen is real. This is more
 backends than most languages ever achieve. History lesson: **"A great runtime
 can sustain multiple languages"** — Fides's IR is its "runtime" and it supports
 many targets.
@@ -354,7 +354,7 @@ doesn't burden the language forever. Scala should have done this. C++ couldn't.
 
 - 265/265 unit tests (cargo test --lib)
 - harness tests 8/8 passed
-- 146/146 interpreter + PE, 146/146 C codegen
+- 149/149 interpreter + PE, 149/149 C codegen
 - `verify.sh` with baseline tracking
 - Golden file generation
 - Bisect tooling
@@ -486,10 +486,10 @@ to choose a systems language.
 ~~Multiple docs are out of sync with reality:~~
 **UPDATE Aug 2026:** Docs have been synchronized with actual state. All test
 counts, LOC, file counts, and phase numbers now match verified reality:
-- `features.md` now says "146/146 C codegen" ✅
-- `features.md` now says "146/146 interpreter" ✅
-- `roadmap-limitations.md` now says "146/146 normal" ✅
-- `roadmap.md` summary now says "146/146" ✅
+- `features.md` now says "149/149 C codegen" ✅
+- `features.md` now says "149/149 interpreter" ✅
+- `roadmap-limitations.md` now says "149/149 normal" ✅
+- `roadmap.md` summary now says "149/149" ✅
 - Phase numbers updated (self-hosting is Phase 10, ecosystem Phase 11, world class Phase 12) ✅
 
 This was a symptom of moving fast without updating all docs. The docs now
@@ -633,7 +633,7 @@ well. Cut the rest until those 3 prove the concept.
 Every doc should be updated when test counts change. ~~The current state where
 `features.md` says 76/78 but reality is 114/114 is unacceptable for a project
 that wants to be taken seriously.~~ **UPDATE Aug 2026: All docs now match
-verified reality (146/146 interpreter+PE, 146/146 C codegen).**
+verified reality (149/149 interpreter+PE, 149/149 C codegen).**
 
 **Recommendation:** Add a pre-commit check: run `fidesc test`, compare
 output to docs, fail if mismatch. Or at minimum, update all docs in the same
@@ -717,7 +717,7 @@ candidate:
 | Dimension | Score | Notes |
 |-----------|-------|-------|
 | Novel design space | 🟢 9/10 | Unique combination no one else has |
-| Technical execution | 🟢 8/10 | 146/146 parity, 6 backends, solid test infra |
+| Technical execution | 🟢 8/10 | 149/149 parity, 6 backends, solid test infra |
 | Scope discipline | 🔴 3/10 | Trying to do everything at once |
 | Ecosystem building | 🔴 2/10 | No users, no packages, no tooling |
 | Focus / prioritization | 🟡 5/10 | Optimizer enabled by default, but still adding features instead of fixing regalloc |
@@ -762,7 +762,14 @@ Based on the history.md lessons and current state:
 
 7. 🟢 Begin self-hosting (Phase 10)
    → Start with lexer (simplest component)
+   → C codegen bootstrap: gcc/clang provides runtime, zero blockers
    → Proves Fides is real
+
+7b. 🟢 PE emitter rewrite (Phase 10B — after C codegen self-host lands)
+   → Fix Issues 67-69 (val-in-loop, str_split, recursive Box<T>)
+   → Rewrite pe.rs in Fides, switch default backend to PE
+   → Zero-dependency deployment (no gcc/clang needed)
+   → C backend stays as fallback (like Zig)
 
 8. 🟢 Start ecosystem (Phase 11 basics)
    → LSP server (oracle/fidesc lsp), formatter (forge/fidesc fmt), package manager (pacte), doc generator (scribe), coverage (veil)

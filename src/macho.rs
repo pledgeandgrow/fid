@@ -13,7 +13,6 @@
 //   - String table
 
 use crate::pir::L3Module;
-use std::collections::HashMap;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Public API
@@ -39,8 +38,6 @@ const MH_OBJECT: u32 = 1;
 const LC_SEGMENT_64: u32 = 0x19;
 const LC_SYMTAB: u32 = 0x2;
 
-const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x80000000;
-const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x00004000;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Mach-O Emitter

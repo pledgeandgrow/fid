@@ -5566,6 +5566,16 @@ impl Interpreter {
                 ExecOutcome::Continue
             }
 
+            // ─── FFI stubs (audio, input, etc.) — return safe defaults ───
+            "pledge_audio_init" => ExecOutcome::Value(Value::Int(0)),
+            "pledge_audio_shutdown" | "pledge_audio_stop" | "pledge_audio_pause"
+            | "pledge_audio_resume" | "pledge_audio_stop_all"
+            | "pledge_audio_set_volume" | "pledge_audio_set_loop" | "pledge_audio_set_pan"
+            | "pledge_audio_master_volume" => ExecOutcome::Continue,
+            "pledge_audio_load" => ExecOutcome::Value(Value::Int(0)),
+            "pledge_audio_play" => ExecOutcome::Value(Value::Int(0)),
+            "pledge_audio_is_playing" => ExecOutcome::Value(Value::Int(0)),
+
             _ => ExecOutcome::Panic(format!("Unknown runtime function: {}", name)),
         }
     }

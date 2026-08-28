@@ -13,7 +13,7 @@
 //   - Stack 16-byte aligned at call sites
 
 use crate::ast::BinOp;
-use crate::pir::{L3Block, L3Function, L3Inst, L3Module, MemRegion, Operand, PBlock, VReg};
+use crate::pir::{L3Block, L3Function, L3Inst, L3Module, Operand, VReg};
 use std::collections::HashMap;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -31,7 +31,6 @@ pub fn generate_asm(module: &L3Module) -> String {
 // RISC-V Register definitions
 // ═══════════════════════════════════════════════════════════════════════════
 
-const NUM_REGS: usize = 28; // Use x1-x28 (x0 is zero, x29-x31 reserved)
 
 fn reg_name(idx: usize) -> &'static str {
     // RISC-V register names (ABI names)

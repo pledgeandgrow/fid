@@ -33,26 +33,17 @@ pub fn emit_object_file(_module: &L3Module, asm: &str) -> Result<Vec<u8>, String
 
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 const IMAGE_SCN_CNT_CODE: u32 = 0x00000020;
-const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x00000040;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x20000000;
 const IMAGE_SCN_MEM_READ: u32 = 0x40000000;
-const IMAGE_SCN_MEM_WRITE: u32 = 0x80000000;
 
 const IMAGE_SYM_UNDEFINED: i16 = 0;
-const IMAGE_SYM_ABSOLUTE: i16 = -1;
-const IMAGE_SYM_DEBUG: i16 = -2;
 
 const IMAGE_SYM_TYPE_NULL: u16 = 0;
-const IMAGE_SYM_TYPE_FUNCTION: u16 = 0x20;
-const IMAGE_SYM_DTYPE_FUNCTION: u16 = 2;
 
 const IMAGE_SYM_CLASS_EXTERNAL: u8 = 2;
 const IMAGE_SYM_CLASS_STATIC: u8 = 3;
-const IMAGE_SYM_CLASS_LABEL: u8 = 6;
 
 // Relocation types for AMD64 COFF
-const IMAGE_REL_AMD64_ADDR64: u16 = 1;    // 64-bit absolute
-const IMAGE_REL_AMD64_ADDR32NB: u16 = 3;  // 32-bit RIP-relative
 const IMAGE_REL_AMD64_REL32: u16 = 4;     // 32-bit PC-relative
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -63,7 +54,6 @@ struct CoffEmitter {
     text_bytes: Vec<u8>,
     symbols: Vec<SymbolEntry>,
     relocations: Vec<RelocEntry>,
-    string_table: Vec<u8>,
     symbol_name_map: HashMap<String, u32>,
 }
 
@@ -88,7 +78,6 @@ impl CoffEmitter {
             text_bytes: Vec::new(),
             symbols: Vec::new(),
             relocations: Vec::new(),
-            string_table: Vec::new(),
             symbol_name_map: HashMap::new(),
         }
     }

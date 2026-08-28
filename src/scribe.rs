@@ -10,9 +10,8 @@
 // Output:
 //   HTML files in the specified output directory (default: docs/)
 
-use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // ─── Doc extraction ─────────────────────────────────────────────────
 

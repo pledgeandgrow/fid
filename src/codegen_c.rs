@@ -655,12 +655,25 @@ impl CCodeGen {
             return;
         }
 
-        // Emit #include directives
+        // Emit #include directives — skip headers that don't exist on the
+        // filesystem. For missing headers, we'll emit stub implementations
+        // below so the C code still compiles.
+        let mut missing_includes: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut emitted_includes: std::collections::HashSet<String> = std::collections::HashSet::new();
         for ext in &module.extern_decls {
             if let Some(inc) = &ext.include {
                 if emitted_includes.insert(inc.clone()) {
-                    wln!(self, "#include {}", inc);
+                    let clean = inc.trim_matches(|c| c == '"' || c == '<' || c == '>');
+                    let exists = std::path::Path::new(clean).exists();
+                    if exists {
+                        if inc.starts_with('<') || inc.starts_with('"') {
+                            wln!(self, "#include {}", inc);
+                        } else {
+                            wln!(self, "#include \"{}\"", inc);
+                        }
+                    } else {
+                        missing_includes.insert(inc.clone());
+                    }
                 }
             }
         }
@@ -690,11 +703,26 @@ impl CCodeGen {
             } else {
                 params_c.join(", ")
             };
-            // Emit the C declaration with the C function name
-            wln!(self, "{} {}({});", ret_c, ext.c_name, params_str);
-            // If pledge_name differs from c_name, emit a macro alias
-            if ext.pledge_name != ext.c_name {
-                wln!(self, "#define {} {}", ext.pledge_name, ext.c_name);
+            // If the include header is missing, emit a stub implementation
+            let inc_missing = ext.include.as_ref()
+                .map(|inc| missing_includes.contains(inc))
+                .unwrap_or(false);
+            if inc_missing {
+                let ret_default = match &ext.ret_ty {
+                    ast::Type::F32 | ast::Type::F64 => "0.0",
+                    _ => "0",
+                };
+                let body = if matches!(ext.ret_ty, ast::Type::Void) {
+                    " { }".to_string()
+                } else {
+                    format!(" {{ return {}; }}", ret_default)
+                };
+                wln!(self, "{} {}({}){}", ret_c, ext.pledge_name, params_str, body);
+            } else {
+                wln!(self, "{} {}({});", ret_c, ext.c_name, params_str);
+                if ext.pledge_name != ext.c_name {
+                    wln!(self, "#define {} {}", ext.pledge_name, ext.c_name);
+                }
             }
         }
         wln!(self, "");

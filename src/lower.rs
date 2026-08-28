@@ -176,6 +176,9 @@ pub struct Lowerer {
     /// Types of alloca slots — maps alloca ValueId → stored IrType
     /// Used to correctly load mutable variables with their actual type
     alloca_types: HashMap<ValueId, IrType>,
+    /// AST types of variables — maps variable name → AST Type
+    /// Used by LetTuple to determine tuple element types for destructuring
+    var_ast_types: HashMap<String, Type>,
     /// Constants (pc) — maps name to expression for inline substitution
     constants: HashMap<String, Expr>,
     /// SRET pointer for current function (if it returns a struct)
@@ -249,6 +252,7 @@ impl Lowerer {
             structs: HashMap::new(),
             allocas: HashMap::new(),
             alloca_types: HashMap::new(),
+            var_ast_types: HashMap::new(),
             constants: HashMap::new(),
             current_sret: None,
             enums: HashMap::new(),
@@ -948,6 +952,7 @@ impl Lowerer {
         self.current_block = BlockId(0);
         self.allocas.clear();
         self.alloca_types.clear();
+        self.var_ast_types.clear();
         self.defer_stack.clear();
         // Save AST parameter types for function-typed param return type lookup
         self.current_func_param_types.clear();
@@ -1426,6 +1431,16 @@ impl Lowerer {
                     });
                 }
                 self.allocas.insert(name.clone(), alloca);
+                // Record AST type for LetTuple element type inference
+                if let Some(ast_ty) = ty {
+                    self.var_ast_types.insert(name.clone(), ast_ty.clone());
+                } else {
+                    // Infer AST type from the expression (for calls returning tuples)
+                    let inferred_ast = self.infer_expr_ast_type(expr);
+                    if !matches!(inferred_ast, Type::I64) {
+                        self.var_ast_types.insert(name.clone(), inferred_ast);
+                    }
+                }
                 // Drop trait: check if the declared type has a Drop impl.
                 // Do this before borrowing current_func mutably.
                 let drop_struct = ty.as_ref().and_then(|t| self.type_struct_name(t))
@@ -1465,8 +1480,21 @@ impl Lowerer {
                         })
                         .unwrap_or_else(|| vec![IrType::I64; n])
                 } else {
-                    // For non-call expressions, try to get types from the value
-                    vec![IrType::I64; n]
+                    // For non-call expressions, try to get element types from
+                    // the variable's AST type (recorded during Stmt::Let).
+                    if let Expr::Ident(name) = expr {
+                        if let Some(ast_ty) = self.var_ast_types.get(name) {
+                            if let Type::Tuple(elems) = ast_ty {
+                                elems.iter().map(|t| self.lower_type(t)).collect()
+                            } else {
+                                vec![IrType::I64; n]
+                            }
+                        } else {
+                            vec![IrType::I64; n]
+                        }
+                    } else {
+                        vec![IrType::I64; n]
+                    }
                 };
 
                 // For each name, extract the corresponding field
@@ -3468,15 +3496,29 @@ impl Lowerer {
 
                 // Builtin collection method dispatch
                 let recv_ty = self.get_value_type(recv_val);
-                let is_builtin_collection = recv_ty.is_opaque_named("Vec")
-                    || recv_ty.is_opaque_named("HashMap")
-                    || recv_ty.is_opaque_named("String");
+                // Unwrap Ptr (from &mut / & references) for collection method dispatch
+                let effective_ty = match &recv_ty {
+                    IrType::Ptr(inner) => inner.as_ref().clone(),
+                    _ => recv_ty.clone(),
+                };
+                let is_builtin_collection = effective_ty.is_opaque_named("Vec")
+                    || effective_ty.is_opaque_named("HashMap")
+                    || effective_ty.is_opaque_named("String");
                 if is_builtin_collection {
-                    let mut runtime_args = vec![recv_val];
+                    // For &mut Vec, load the Vec pointer from the reference
+                    let effective_val = if matches!(recv_ty, IrType::Ptr(_)) {
+                        self.emit_inst(Inst::Load {
+                            ptr: recv_val,
+                            ty: effective_ty.clone(),
+                        })
+                    } else {
+                        recv_val
+                    };
+                    let mut runtime_args = vec![effective_val];
                     for a in args {
                         runtime_args.push(self.lower_expr(a));
                     }
-                    let (func_name, ret_ty) = if recv_ty.is_opaque_named("Vec") {
+                    let (func_name, ret_ty) = if effective_ty.is_opaque_named("Vec") {
                         // Phase 10B: Vec methods now call Fides implementation (Vec_*)
                         // Prepend dummy env_ptr for user functions
                         let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
@@ -3525,7 +3567,7 @@ impl Lowerer {
                             }
                         };
                         (format!("Vec_{}", method), rt)
-                    } else if recv_ty.is_opaque_named("HashMap") {
+                    } else if effective_ty.is_opaque_named("HashMap") {
                         // Phase 10B: HashMap methods call Fides implementation (HashMap_*)
                         let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                         runtime_args.insert(0, dummy_env);
@@ -3544,7 +3586,7 @@ impl Lowerer {
                             _ => IrType::I64,
                         };
                         (format!("HashMap_{}", method), rt)
-                    } else if recv_ty.is_opaque_named("String") {
+                    } else if effective_ty.is_opaque_named("String") {
                         // Phase 10B: String methods call Fides implementation (String_*)
                         let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                         runtime_args.insert(0, dummy_env);
@@ -4284,6 +4326,19 @@ impl Lowerer {
                                 meta.borrow_kind = borrow;
                             }
                         }
+                        // If the variable holds a pointer to a struct (SRET return),
+                        // the alloca stores the struct pointer. &var should return
+                        // the struct pointer (loaded from alloca), not the alloca
+                        // address — otherwise we get an extra level of indirection.
+                        let alloca_ty = self.alloca_types.get(alloca).cloned();
+                        if let Some(IrType::Ptr(inner)) = &alloca_ty {
+                            if matches!(inner.as_ref(), IrType::Struct(_)) {
+                                return self.emit_inst(Inst::Load {
+                                    ptr: *alloca,
+                                    ty: alloca_ty.unwrap(),
+                                });
+                            }
+                        }
                         return *alloca;
                     }
                 }
@@ -4771,12 +4826,14 @@ impl Lowerer {
                 let saved_func = self.current_func.take();
                 let saved_allocas = std::mem::take(&mut self.allocas);
                 let saved_alloca_types = std::mem::take(&mut self.alloca_types);
+                let saved_var_ast_types = std::mem::take(&mut self.var_ast_types);
                 let saved_vec_allocas = std::mem::take(&mut self.vec_allocas);
                 let saved_block = self.current_block;
                 self.lower_func(&closure_func);
                 self.current_func = saved_func;
                 self.allocas = saved_allocas;
                 self.alloca_types = saved_alloca_types;
+                self.var_ast_types = saved_var_ast_types;
                 self.vec_allocas = saved_vec_allocas;
                 self.current_block = saved_block;
                 self.current_captures = saved_captures;
@@ -4997,6 +5054,10 @@ impl Lowerer {
             Expr::StringLit(_) => Type::Str,
             Expr::Call { callee, .. } => {
                 self.func_ret_types.get(callee).cloned().unwrap_or(Type::I64)
+            }
+            Expr::Ident(name) => {
+                // Look up variable's AST type (recorded during Stmt::Let)
+                self.var_ast_types.get(name).cloned().unwrap_or(Type::I64)
             }
             _ => Type::I64,
         }

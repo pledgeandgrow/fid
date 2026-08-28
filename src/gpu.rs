@@ -14,7 +14,7 @@
 //   - Schema: 0
 //   - Instructions: (opcode << 16 | word_count) + operands
 
-use crate::pir::{L3Block, L3Function, L3Inst, L3Module, Operand, PBlock, VReg};
+use crate::pir::{L3Block, L3Function, L3Inst, L3Module, Operand, VReg};
 use std::collections::HashMap;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -53,8 +53,6 @@ const SPIRV_GENERATOR: u32 = 0; // Placeholder
 
 // SPIR-V opcodes
 const OP_NOP: u16 = 0;
-const OP_SOURCE: u16 = 3;
-const OP_NAME: u16 = 5;
 const OP_MEMORY_MODEL: u16 = 14;
 const OP_ENTRY_POINT: u16 = 15;
 const OP_EXECUTION_MODE: u16 = 16;
@@ -63,19 +61,11 @@ const OP_TYPE_BOOL: u16 = 20;
 const OP_TYPE_INT: u16 = 21;
 const OP_TYPE_FLOAT: u16 = 22;
 const OP_TYPE_FUNCTION: u16 = 33;
-const OP_TYPE_STRUCT: u16 = 30;
-const OP_TYPE_POINTER: u16 = 32;
 const OP_CONSTANT: u16 = 43;
-const OP_CONSTANT_TRUE: u16 = 44;
-const OP_CONSTANT_FALSE: u16 = 45;
 const OP_FUNCTION: u16 = 54;
-const OP_FUNCTION_PARAMETER: u16 = 55;
 const OP_FUNCTION_END: u16 = 56;
-const OP_FUNCTION_CALL: u16 = 57;
-const OP_VARIABLE: u16 = 59;
 const OP_LOAD: u16 = 61;
 const OP_STORE: u16 = 62;
-const OP_ACCESS_CHAIN: u16 = 65;
 const OP_IADD: u16 = 126;
 const OP_ISUB: u16 = 127;
 const OP_IMUL: u16 = 128;
@@ -99,7 +89,6 @@ const OP_RETURN: u16 = 253;
 const OP_RETURN_VALUE: u16 = 254;
 
 // SPIR-V capabilities
-const CAP_MATRIX: u16 = 0;
 const CAP_SHADER: u16 = 1;
 const CAP_INT64: u16 = 33;
 
@@ -113,10 +102,6 @@ const ADDRESSING_MODEL_LOGICAL: u32 = 0;
 const MEMORY_MODEL_GLSL450: u32 = 1;
 
 // SPIR-V storage classes
-const STORAGE_CLASS_FUNCTION: u32 = 7;
-const STORAGE_CLASS_INPUT: u32 = 1;
-const STORAGE_CLASS_OUTPUT: u32 = 3;
-const STORAGE_CLASS_PRIVATE: u32 = 6;
 
 struct SpirVCodeGen {
     words: Vec<u32>,
@@ -166,17 +151,6 @@ impl SpirVCodeGen {
         }
         let id = self.alloc_id();
         self.emit(OP_TYPE_INT, &[bits, 1]); // signed=1
-        self.type_ids.insert(key, id);
-        id
-    }
-
-    fn get_float_type(&mut self, bits: u32) -> u32 {
-        let key = format!("float{}", bits);
-        if let Some(&id) = self.type_ids.get(&key) {
-            return id;
-        }
-        let id = self.alloc_id();
-        self.emit(OP_TYPE_FLOAT, &[bits]);
         self.type_ids.insert(key, id);
         id
     }

@@ -583,7 +583,9 @@ fn main() {
                         for line in c_code.lines() {
                             if line.starts_with("// PLINK:") {
                                 let lib = line.trim_start_matches("// PLINK:").trim();
-                                link_libs.push(format!("-l{}", lib));
+                                if !lib.is_empty() {
+                                    link_libs.push(format!("-l{}", lib));
+                                }
                             }
                         }
                         let mut cmd = process::Command::new(&cc);

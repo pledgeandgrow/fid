@@ -25,9 +25,8 @@
 //   allocate(&L3Function) -> Allocation  — run the allocator on one function
 //   allocate_module(&L3Module) -> ModuleAllocation  — run on all functions
 
-use crate::pir::{L3Function, L3Inst, L3Module, MemRegion, Operand, PBlock, VReg};
+use crate::pir::{L3Function, L3Inst, L3Module, Operand, PBlock, VReg};
 use crate::ast::BinOp;
-use crate::ir::BlockId;
 use std::collections::{HashMap, HashSet};
 
 // ═══════════════════════════════════════════════════════════════════════════

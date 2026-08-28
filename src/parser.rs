@@ -1857,7 +1857,7 @@ impl Parser {
         };
 
         // Check for tuple destructuring: `val (a, b) = expr`
-        if self.check(&TokenKind::LParen) && !is_mut {
+        if self.check(&TokenKind::LParen) {
             // Peek ahead to see if this is a tuple pattern (ident, ident, ...)
             // vs a tuple type annotation (which would be `pv name: (i64, i64) = ...`)
             // Since we already consumed `pv` and there's no name yet, `(` means destructuring.

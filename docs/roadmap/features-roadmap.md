@@ -2333,9 +2333,9 @@ system UpdateLOD {
 ### Implementation Details
 
 All 5 original features (F1–F5) were implemented in a single session. Test results (current state):
-- Interpreter: 146/146 normal passed
-- PE Emitter: 146/146 valid
-- C Codegen: 146/146 matched
+- Interpreter: 149/149 normal passed
+- PE Emitter: 149/149 valid
+- C Codegen: 149/149 matched
 - Total: 218 .fd test files (195 in root + 23 in subdirs)
 
 **Planned for implementation:**

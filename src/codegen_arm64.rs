@@ -13,7 +13,7 @@
 //   - Stack 16-byte aligned at call sites
 
 use crate::ast::BinOp;
-use crate::pir::{L3Block, L3Function, L3Inst, L3Module, MemRegion, Operand, PBlock, VReg};
+use crate::pir::{L3Block, L3Function, L3Inst, L3Module, Operand, VReg};
 use std::collections::HashMap;
 
 // ═══════════════════════════════════════════════════════════════════════════
