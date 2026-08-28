@@ -258,7 +258,7 @@ impl Debugger {
         // execution with the new source.
         let mut current_source = source.to_string();
         let mut current_source_lines: Vec<String> = source.lines().map(|s| s.to_string()).collect();
-        let mut current_source_path = source_path.to_string();
+        let current_source_path = source_path.to_string();
 
         loop {
             // Build the program and lower to IR

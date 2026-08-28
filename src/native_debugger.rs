@@ -137,7 +137,7 @@ impl NativeDebugger {
         // For now, we support basic continue/step/quit
 
         let stdin = io::stdin();
-        let mut stepping = false;
+        let _stepping = false;
         let mut running = true;
 
         while running {
@@ -152,7 +152,7 @@ impl NativeDebugger {
             let line = line.trim();
             let parts: Vec<&str> = line.splitn(2, ' ').collect();
             let cmd = parts[0];
-            let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+            let _arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
 
             match cmd {
                 "help" | "h" | "?" => {

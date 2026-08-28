@@ -304,7 +304,7 @@ pub fn run(input: &Path, format: &str, output_dir: &Path) -> Result<(), String> 
         .map_err(|e| format!("Cannot read {}: {}", input.display(), e))?;
     let source_path = input.to_str().unwrap_or("");
 
-    let (data, result, output) = run_with_coverage(&source, source_path)
+    let (data, _result, output) = run_with_coverage(&source, source_path)
         .map_err(|errors| errors.join("\n"))?;
 
     // Print program output

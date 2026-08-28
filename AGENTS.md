@@ -95,19 +95,61 @@ cargo build
 ```
 Unit tests:   265/265 passed  (All passing — cargo test --lib)
 Harness:      8/8 passed      (All passing — all 3 self-host blockers pass on all backends)
-Interpreter:  153/153 normal  (+ 35 expected-fail, + 0 skip, + 6 known-fail; 2 bonus pass)
-C Codegen:    153/153 matched (0 skip — all tests pass on C codegen)
-PE Emitter:   153/153 valid   (3 bonus pass)
+Interpreter:  146/146 normal  (+ 35 expected-fail, + 0 skip, + 6 known-fail; 5 bonus pass)
+C Codegen:    146/146 matched (0 skip — all tests pass on C codegen)
+PE Emitter:   146/146 valid   (6 bonus pass)
 Total .fd:    218 test files  (195 in root; 23 in subdirs: capability/effects/regions/safety)
 Skip list:    0 tests         (all previously skipped tests now pass)
 Expected-fail: 35 tests       (tests that verify compiler error detection — failing is correct)
-Known-fail:   6 tests         (3 parser bugs: game_stdlib, time, time_edge + 3 C codegen mismatches: iter, vec_math, parallel_concurrent. Interp bonus-passes: iter, vec_math. PE bonus-passes: iter, vec_math, parallel_concurrent.)
+Known-fail:   6 tests         (1 interp race: parallel_concurrent. 4 C codegen mismatches: game_stdlib, iter, vec_math, parallel_concurrent. Interp bonus-passes: game_stdlib, iter, time, time_edge, vec_math. PE bonus-passes: all 6.)
 Source:       54 .rs files, ~85,493 LOC
 Stdlib:       69 .fd modules, 17,567 LOC
 Docs:         22 docs/ + 8 roadmap/ + 3 root = 33 .md files
 Binaries:     4 (fidesc, pacte, scribe, veil)
-Warnings:     225 (dead code, unused variables — cleanup needed)
+Warnings:     157 (dead code, unused variables — cleanup needed)
 ```
+
+### New Features (Known-Fail Test Fixes — Parser, Tuple Destructuring, &mut Vec, FFI Stubs)
+
+- **`var` tuple destructuring** (`src/parser.rs`): Removed `&& !is_mut`
+  condition from tuple destructuring check. `var (a, b) = expr;` now parses
+  correctly (previously only `val (a, b) = expr;` was supported). This fixed
+  `test_game_stdlib`, `test_time`, and `test_time_edge` which all used
+  `var (dx, dy) = mtv;` syntax.
+- **`&mut` struct field mutation via SRET** (`src/lower.rs`): When a struct
+  is returned via SRET and bound to a variable, the alloca stores a pointer
+  to the struct. `Expr::Ref` now loads the struct pointer from the alloca
+  (instead of returning the alloca address) when the alloca type is
+  `Ptr(Struct(...))`. This fixes `&mut` references to struct variables
+  returned from functions (e.g., `tilemap_fill_rect(&tm, ...)`).
+- **Tuple element type inference for `LetTuple`** (`src/lower.rs`): Added
+  `var_ast_types` map that records the AST type of each variable during
+  `Stmt::Let`. `LetTuple` now looks up the variable's AST type to determine
+  tuple element types (e.g., `(f64, f64, f64, f64)` instead of defaulting
+  to `I64`). This fixes tuple destructuring from function calls that
+  return tuples of floats (e.g., `physics_aabb_overlap` returning
+  `(f64, f64, f64, f64)` — previously the f64 values were reinterpreted
+  as i64 bit patterns).
+- **`&mut Vec` method dispatch** (`src/lower.rs`): `MethodCall` now
+  unwraps `Ptr` (from `&mut`/`&` references) before checking for builtin
+  collection types. For `&mut Vec<T>`, the Vec pointer is loaded from the
+  reference before dispatching to `Vec_*` methods. This fixes
+  `pixels.len()`, `pixels.get(i)`, `pixels.set(i, val)` on `&mut Vec<i64>`
+  parameters.
+- **Audio FFI stubs** (`src/interp.rs`): Added interpreter stubs for
+  `pledge_audio_*` FFI functions (init, shutdown, load, play, stop, etc.)
+  that return safe defaults (0 for int, void for void functions). This
+  allows `test_game_stdlib` to run without the actual audio runtime.
+- **C codegen: missing header stubs** (`src/codegen_c.rs`): When an extern
+  declaration's include header doesn't exist on the filesystem (e.g.,
+  `pledge_audio.h`), the C codegen now emits a stub implementation
+  (returning 0/0.0) instead of just a declaration. System headers
+  (`<math.h>`, `<string.h>`) are always emitted as `#include` since the
+  C compiler knows where to find them. Local headers are checked for
+  existence and quoted properly.
+- **C codegen: empty PLINK fix** (`src/main.rs`): Empty `link ""` directives
+  no longer produce `-l` flags with missing arguments (which caused
+  `gcc: error: missing argument to '-l'`).
 
 ### New Features (Runtime Effects Fix — Optimizer DCE Bug)
 
@@ -790,7 +832,9 @@ test_safety_annotations_fail, test_safety_no_audit_fail,
 test_borrowck_fail, test_async_fail,
 test_constant_time_fail, test_constant_time_fail2
 
-Known-fail tests: 6 real bugs remain (3 parser + 3 C codegen). The 153/153
+Known-fail tests: 6 tests remain. 5 of 6 now pass on interpreter (all but
+parallel_concurrent which has a thread race condition). 2 of 6 pass on C codegen
+(test_time, test_time_edge). All 6 pass on PE emitter. The 146/146
 normal tests all pass on all three backends.
 
 Features now present in the baseline: tuple destructuring, file I/O
@@ -816,7 +860,7 @@ generic enums/structs (`enum Option<T> { ... }`, `struct Foo<T> { ... }` — typ
 LSP server (`fidesc lsp` — JSON-RPC over stdio, initialize/didOpen/didChange/diagnostics, no external deps),
 new stdlib modules (`stdlib/math.fd`, `stdlib/env.fd`, `stdlib/args.fd`, `stdlib/process.fd`, `stdlib/regex.fd`, `stdlib/sync.fd`, `stdlib/channel.fd`, `stdlib/vec.fd`, `stdlib/ecs.fd`, `stdlib/events.fd`, `stdlib/parallel.fd`, plus game stdlib: `stdlib/tilemap.fd`, `stdlib/sprite.fd`, `stdlib/flowfield.fd`, `stdlib/streaming.fd`, `stdlib/scene.fd`, `stdlib/physics.fd`, `stdlib/audio.fd`, `stdlib/input.fd`).
 
-**Note:** 153/153 normal tests pass on interpreter + PE, 153/153 on C codegen. The test runner separates normal tests (159, should pass) from skip-list tests (0: all previously skipped tests now pass) and known-fail tests (6: real bugs).
+**Note:** 146/146 normal tests pass on interpreter + PE, 146/146 on C codegen. The test runner separates normal tests (159, should pass) from skip-list tests (0: all previously skipped tests now pass) and known-fail tests (6: 5 pass on interp, 2 on C codegen, 6 on PE).
 
 ### Vec Higher-Order Methods (vec.fd)
 

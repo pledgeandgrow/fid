@@ -2,7 +2,6 @@ use std::env;
 use std::fs;
 use std::process;
 
-use fidesc::borrowck;
 use fidesc::codegen_arm64;
 use fidesc::codegen_riscv;
 use fidesc::codegen_x64;
@@ -11,7 +10,6 @@ use fidesc::compiler;
 use fidesc::compiler::RunResult;
 use fidesc::cparser;
 use fidesc::debugger;
-use fidesc::diag;
 use fidesc::elf64;
 use fidesc::fmt;
 use fidesc::gpu;
@@ -888,13 +886,7 @@ fn main() {
             // Skip list — tests that fail on C codegen due to missing builtins
             // or legitimate design differences. These pass on interpreter + PE.
             let skip_tests: &[&str] = &[
-                "test_kv_cache",      // C codegen: p_kv_cache_new not declared
-                "test_quantization",  // C codegen: void* from int type mismatch
-                "test_dp",            // C codegen: void* from int type mismatch
-                "test_shard",         // C codegen: p_send_tensor not declared
-                "test_dlopen",        // Design difference: interp returns simulated handle, C returns real pointer
-                "test_autodiff_grad", // C codegen: autograd tape builtins not implemented
-                "test_ml_full",       // C codegen: ML runtime builtins not implemented
+                // All previously skipped tests now pass on C codegen!
             ];
 
             for test_file in &test_files {
@@ -1690,7 +1682,7 @@ fn main() {
             // Watch loop
             let mut watcher = hotreload::Watcher::new(move |path| {
                 eprintln!("\n[watch] File changed: {} — reloading...", path);
-                let path_owned = path.to_string();
+                let _path_owned = path.to_string();
                 let source = match fs::read_to_string(&input_clone) {
                     Ok(s) => s,
                     Err(e) => {

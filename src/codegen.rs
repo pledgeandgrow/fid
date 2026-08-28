@@ -864,7 +864,7 @@ impl CodeGen {
                 }
                 writeln!(self.output, "{}:", end_label).unwrap();
             }
-            Expr::Range { start, end, .. } => {
+            Expr::Range { start, end: _, .. } => {
                 // Range evaluates to start value (for standalone use)
                 // For loops handle ranges specially in gen_stmt
                 self.gen_expr(start);
@@ -1018,7 +1018,7 @@ impl CodeGen {
                 writeln!(self.output, "{}:", end_label).unwrap();
                 self.next_offset -= 8;
             }
-            Expr::EnumLit { enum_name: _, variant, args } => {
+            Expr::EnumLit { enum_name: _, variant: _, args } => {
                 // Simplified: store variant index and args on stack
                 // For unit variants: just store the variant index in x0
                 let mut arg_offsets = Vec::new();

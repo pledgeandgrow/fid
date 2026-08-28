@@ -655,24 +655,32 @@ impl CCodeGen {
             return;
         }
 
-        // Emit #include directives — skip headers that don't exist on the
-        // filesystem. For missing headers, we'll emit stub implementations
-        // below so the C code still compiles.
+        // Emit #include directives — skip local headers that don't exist on
+        // the filesystem. System headers (<...>) are always emitted (the C
+        // compiler knows where to find them). For missing local headers,
+        // we'll emit stub implementations below so the C code still compiles.
         let mut missing_includes: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut emitted_includes: std::collections::HashSet<String> = std::collections::HashSet::new();
         for ext in &module.extern_decls {
             if let Some(inc) = &ext.include {
                 if emitted_includes.insert(inc.clone()) {
-                    let clean = inc.trim_matches(|c| c == '"' || c == '<' || c == '>');
-                    let exists = std::path::Path::new(clean).exists();
-                    if exists {
-                        if inc.starts_with('<') || inc.starts_with('"') {
-                            wln!(self, "#include {}", inc);
-                        } else {
-                            wln!(self, "#include \"{}\"", inc);
-                        }
+                    let is_system = inc.starts_with('<');
+                    if is_system {
+                        // System header — always emit, C compiler finds it
+                        wln!(self, "#include {}", inc);
                     } else {
-                        missing_includes.insert(inc.clone());
+                        // Local header — check if file exists
+                        let clean = inc.trim_matches(|c| c == '"' || c == '<' || c == '>');
+                        let exists = std::path::Path::new(clean).exists();
+                        if exists {
+                            if inc.starts_with('"') {
+                                wln!(self, "#include {}", inc);
+                            } else {
+                                wln!(self, "#include \"{}\"", inc);
+                            }
+                        } else {
+                            missing_includes.insert(inc.clone());
+                        }
                     }
                 }
             }

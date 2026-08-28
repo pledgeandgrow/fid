@@ -288,7 +288,7 @@ fn parse_impl(lines: &[&str], start: usize, doc: String) -> (Option<DocItem>, us
     let mut end = start;
     let mut brace_depth = 0;
     let mut in_body = false;
-    let mut method_start = 0;
+    let mut method_start;
     let mut method_doc: Vec<String> = Vec::new();
     while end < lines.len() {
         let l = lines[end].trim_start();

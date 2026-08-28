@@ -879,7 +879,7 @@ fn find_all_occurrences(text: &str, name: &str) -> Vec<(usize, usize, usize)> {
         return results;
     }
     for (line_idx, line_str) in text.lines().enumerate() {
-        let mut col = 0;
+        let _col = 0;
         let bytes = line_str.as_bytes();
         let mut i = 0;
         while i + name_len <= bytes.len() {

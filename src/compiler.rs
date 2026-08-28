@@ -13,7 +13,7 @@ use crate::typechecker::TypeChecker;
 use crate::x86;
 use crate::pe;
 use crate::pir;
-use crate::ir::{Effect, EffectSet, IrModule, Inst};
+use crate::ir::{Effect, IrModule, Inst};
 use crate::wasm;
 
 pub use crate::interp::RunResult;
@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 /// corresponding source line, and renders a full Diag with caret.
 /// Errors that don't have line info are passed through unchanged.
 fn enrich_errors(errors: &[String], source: &str, file: &str) -> Vec<String> {
-    use crate::diag::{ErrCode, error_with_source};
+    use crate::diag::error_with_source;
 
     let source_lines: Vec<&str> = source.lines().collect();
     let mut result = Vec::new();
@@ -455,7 +455,7 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
 ///   impl MLP { pf forward(self: MLP, x: Tensor) -> Tensor { ... } }
 ///   pf MLP_new() -> MLP { MLP { l1: Dense_new(784, 128), l2: Dense_new(128, 10) } }
 fn desugar_layers_models(program: &mut Program) {
-    use crate::ast::{Func, ImplDef, Param, StructDef, Type, Expr, Stmt, Annotation};
+    use crate::ast::{Func, ImplDef, Param, StructDef, Type, Expr, Stmt};
 
     // Desugar layers
     for layer in program.layers.drain(..) {
@@ -757,7 +757,6 @@ fn desugar_phase8b(program: &mut Program) {
 
 /// Recursively desugar all `Stmt::Query` nodes in a program's function bodies.
 fn desugar_query_stmts_in_program(program: &mut Program) {
-    use crate::ast::{Stmt, Expr};
     for func in &mut program.funcs {
         desugar_query_stmts(&mut func.body);
     }
@@ -1167,7 +1166,7 @@ pub fn interpret_source_with_path(source: &str, source_path: &str, verbose: bool
 /// Run lint checks on source code and return warnings.
 /// Returns Ok(warnings) if compilation succeeds, Err(errors) if it fails.
 pub fn lint_source(source: &str, source_path: &str) -> Result<Vec<String>, Vec<String>> {
-    let program = build_program_with_path(source, Some(source_path))?;
+    let _program = build_program_with_path(source, Some(source_path))?;
     // build_program_with_path already runs lints and stores warnings in tc,
     // but we don't have access to tc here. So we re-run lints on the program.
     // We need to reconstruct a typechecker and run just the lint portion.
@@ -1175,7 +1174,7 @@ pub fn lint_source(source: &str, source_path: &str) -> Result<Vec<String>, Vec<S
     // doesn't expose the warnings. Let's use get_diagnostics instead.
     
     // Re-run with a fresh typechecker to get warnings
-    let (program, _tc) = build_program_with_lints(source, Some(source_path))?;
+    let (_program, _tc) = build_program_with_lints(source, Some(source_path))?;
     Ok(_tc.warnings)
 }
 
@@ -1301,7 +1300,7 @@ pub fn interpret_source_with_path_release(source: &str, source_path: &str, verbo
 
 /// Interpret with trace recording enabled (for post-mortem debugging).
 /// Returns the run result, stack trace string, and the execution trace.
-pub fn interpret_source_with_trace(source: &str, source_path: &str, verbose: bool, release: bool) -> Result<(RunResult, Option<String>, Vec<interp::TraceEntry>), Vec<String>> {
+pub fn interpret_source_with_trace(source: &str, source_path: &str, verbose: bool, _release: bool) -> Result<(RunResult, Option<String>, Vec<interp::TraceEntry>), Vec<String>> {
     let program = build_program_with_path(source, Some(source_path))?;
     let module = lower::lower(&program);
     let mut interp = interp::Interpreter::new(module);
@@ -1547,7 +1546,7 @@ pub fn build_executable_with_lto(source: &str, source_path: &str, target: &str, 
 /// Bare-metal mode: skip stdlib, produce a flat binary (no PE headers, no C runtime).
 /// The entry point is the `main` function. The binary is loaded at address 0x10000.
 /// This is for No-OS / kernel / bootloader development (Phase 5A.2).
-pub fn emit_bare(source: &str, source_path: &str) -> Result<Vec<u8>, Vec<String>> {
+pub fn emit_bare(source: &str, _source_path: &str) -> Result<Vec<u8>, Vec<String>> {
     // Parse user code WITHOUT stdlib
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();
@@ -1573,7 +1572,7 @@ pub fn emit_bare(source: &str, source_path: &str) -> Result<Vec<u8>, Vec<String>
 
 /// Boot mode: generate a Multiboot2-compatible kernel binary (Phase 5A.5).
 /// Same as bare mode but with a multiboot2 header and boot entry point.
-pub fn emit_boot(source: &str, source_path: &str) -> Result<Vec<u8>, Vec<String>> {
+pub fn emit_boot(source: &str, _source_path: &str) -> Result<Vec<u8>, Vec<String>> {
     // Parse user code WITHOUT stdlib
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();

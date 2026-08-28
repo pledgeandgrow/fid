@@ -3388,7 +3388,7 @@ const MAX_INLINE_INSTS: usize = 20;
 const LTO_INLINE_BLOCKS: usize = 8;
 const LTO_INLINE_INSTS: usize = 60;
 
-/// Thread-local flag for LTO mode (enables larger inline limits).
+// Thread-local flag for LTO mode (enables larger inline limits).
 thread_local! {
     static LTO_MODE: std::cell::Cell<bool> = std::cell::Cell::new(false);
 }

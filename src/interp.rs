@@ -1576,7 +1576,7 @@ impl Interpreter {
                 ExecOutcome::Value(self.cast_value(&v, to))
             }
 
-            Inst::IntExtend { value, to, .. } => {
+            Inst::IntExtend { value, to: _, .. } => {
                 let v = values.get(value).cloned().unwrap_or(Value::Int(0));
                 let i = match v { Value::Int(i) => i, _ => 0 };
                 ExecOutcome::Value(Value::Int(i))
@@ -4936,12 +4936,12 @@ impl Interpreter {
             "p_net_connect" => {
                 // p_net_connect(host: *u8, port: i64) -> i64 (Future handle)
                 // Simulated: spawn a thread that "connects" (just returns a fake socket)
-                let host = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
+                let _host = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
                 let port = match args.get(1) {
                     Some(Value::Int(n)) => *n,
                     _ => 0,
                 };
-                let module = self.module.clone();
+                let _module = self.module.clone();
                 let future_idx = self.futures.len();
                 self.futures.push(FutureState::Pending(None));
                 self.task_done.lock().unwrap().insert(future_idx, false);
@@ -4960,7 +4960,7 @@ impl Interpreter {
             "p_net_read" => {
                 // p_net_read(sock: i64, buf: *u8, len: i64) -> i64 (Future handle)
                 // Simulated: returns a fake read result
-                let sock = match args.first() {
+                let _sock = match args.first() {
                     Some(Value::Int(n)) => *n,
                     _ => 0,
                 };
@@ -4969,7 +4969,7 @@ impl Interpreter {
                     Some(Value::Int(n)) => *n,
                     _ => 0,
                 };
-                let module = self.module.clone();
+                let _module = self.module.clone();
                 let future_idx = self.futures.len();
                 self.futures.push(FutureState::Pending(None));
                 self.task_done.lock().unwrap().insert(future_idx, false);
@@ -4987,7 +4987,7 @@ impl Interpreter {
             "p_net_write" => {
                 // p_net_write(sock: i64, buf: *u8, len: i64) -> i64 (Future handle)
                 // Simulated: returns the number of bytes "written"
-                let sock = match args.first() {
+                let _sock = match args.first() {
                     Some(Value::Int(n)) => *n,
                     _ => 0,
                 };
