@@ -90,24 +90,69 @@ cargo build
 ./target/release/veil <file.fd> [--format text|html] [--output <dir>]
 ```
 
-## Current Baseline (as of Aug 2026)
+## Current Baseline (as of Aug 28, 2026)
 
 ```
 Unit tests:   265/265 passed  (All passing — cargo test --lib)
 Harness:      8/8 passed      (All passing — all 3 self-host blockers pass on all backends)
-Interpreter:  146/146 normal  (+ 35 expected-fail, + 0 skip, + 6 known-fail; 5 bonus pass)
-C Codegen:    146/146 matched (0 skip — all tests pass on C codegen)
-PE Emitter:   146/146 valid   (6 bonus pass)
+Interpreter:  153/153 normal  (+ 35 expected-fail, + 0 skip, + 6 known-fail; 5 bonus pass)
+C Codegen:    153/153 matched (0 skip — all tests pass on C codegen)
+PE Emitter:   153/153 valid   (6 bonus pass)
 Total .fd:    218 test files  (195 in root; 23 in subdirs: capability/effects/regions/safety)
 Skip list:    0 tests         (all previously skipped tests now pass)
 Expected-fail: 35 tests       (tests that verify compiler error detection — failing is correct)
 Known-fail:   6 tests         (1 interp race: parallel_concurrent. 4 C codegen mismatches: game_stdlib, iter, vec_math, parallel_concurrent. Interp bonus-passes: game_stdlib, iter, time, time_edge, vec_math. PE bonus-passes: all 6.)
-Source:       54 .rs files, ~85,493 LOC
-Stdlib:       69 .fd modules, 17,567 LOC
-Docs:         22 docs/ + 8 roadmap/ + 3 root = 33 .md files
+Source:       54 .rs files, ~86,200 LOC
+Stdlib:       69 .fd modules, 17,541 LOC
+Docs:         21 docs/ + 4 root = 25 .md files
 Binaries:     4 (fidesc, pacte, scribe, veil)
-Warnings:     157 (dead code, unused variables — cleanup needed)
+Warnings:     136 (dead code in pe.rs/opt.rs/debugger.rs/wasm.rs/fmt.rs — future feature stubs)
 ```
+
+### New Features (C Codegen ML Fixes — KV Cache, Quantization, dlopen, Tensor Printing, Autograd)
+
+- **C codegen: KV Cache builtins** (`src/codegen_c.rs`): Added C runtime
+  implementations for `p_kv_cache_new`, `p_kv_cache_append`, `p_kv_cache_get`,
+  `p_kv_cache_len`, `p_kv_cache_clear`, `p_kv_cache_evict`. Uses a static
+  array of `KVCache` structs with per-layer `KVLayer` tracking seq_len,
+  K/V data, and sliding window eviction. Fixed `test_kv_cache`.
+- **C codegen: Quantization builtins** (`src/codegen_c.rs`): Added C runtime
+  for `p_quantize_q8`, `p_dequantize_q8`, `p_qmatmul`, `p_find_quant_params`.
+  Quantization uses symmetric quantization (abs_max/127, zero_point=0) to
+  match the interpreter. Clamped to [-128, 127]. Fixed `test_quantization`.
+- **C codegen: Simulated dlopen** (`src/codegen_c.rs`): Replaced real
+  `dlopen`/`dlsym`/`dlclose`/`dlcall` with simulated versions that return
+  sequential handles (1, 2, ...) and simulated function pointers
+  (0x1000 + handle * 0x100), matching the interpreter's simulation.
+  `p_dl_call` returns the arg unchanged. Fixed `test_dlopen`.
+- **C codegen: Tensor printing** (`src/codegen_c.rs`): Added `IrType::Opaque("Tensor")`
+  case to `Inst::Print` dispatch — calls `p_tensor_to_str` instead of
+  `p_print_int`. Fixed `p_tensor_to_str` to use integer format (`%lld`) for
+  whole numbers and `%.4f` for non-integers, matching the interpreter's
+  `Tensor::to_string()` format. Added `p_grad_get` extern declaration in
+  lowerer so the IR type is correctly tracked as `Opaque("Tensor")`.
+  Fixed `test_autodiff_grad` and `test_ml_full`.
+- **C codegen: Autograd backward double-seed fix** (`src/codegen_c.rs`): The
+  backward pass had two loops — the first seeded the gradient at the last
+  AG_SUM/AG_MEAN op, and the second loop processed ALL ops including the
+  seeded one, doubling the gradient. Fixed by tracking `seeded_idx` and
+  skipping that op in the second loop. Fixed `g00 = 2` → `g00 = 1`.
+- **C codegen: Float formatting in tensor to_str** (`src/codegen_c.rs`):
+  Changed `p_tensor_to_str` from `%g` (6 sig digits) to integer/`%.4f`
+  format, matching the interpreter's `{:.4}` for non-integer tensor values.
+  Fixed `test_dp`.
+- **C codegen: PTensor forward declaration** (`src/codegen_c.rs`): Moved
+  `PTensor` typedef to the header section (before function declarations)
+  so it can be used in function signatures like `p_tensor_to_str(PTensor*)`.
+- **C codegen: Tensor return types** (`src/codegen_c.rs`): Added
+  `Opaque("Tensor")` return types for `p_grad_get`, `p_all_reduce`,
+  `p_broadcast`, `p_all_gather`, `p_scatter`, `p_dp_noise`,
+  `p_gaussian_noise`, `p_dropout` so the print dispatch correctly
+  identifies them as tensors.
+- **Lowerer: ML3 autograd externs** (`src/lower.rs`): Added extern
+  declarations for `p_grad_get`, `p_grad_zero`, `p_autograd_begin`,
+  `p_autograd_end`, `p_autograd_backward`, `p_checkpoint_begin`,
+  `p_checkpoint_end` so the lowerer tracks correct IR types.
 
 ### New Features (Known-Fail Test Fixes — Parser, Tuple Destructuring, &mut Vec, FFI Stubs)
 
@@ -171,7 +216,7 @@ Warnings:     157 (dead code, unused variables — cleanup needed)
   `codegen_c.rs`, `interp.rs`, `pe.rs`, `pir.rs`, `wasm.rs`, `x86.rs`.
 - **Impact:** `Vec<i64>` push/pop/get works with `--opt` (default). 3
   bonus passes (test_iter, test_vec_math, test_parallel_concurrent).
-  Skip list reduced from 7 to 4. 149/149 normal tests pass on all 3
+  Skip list reduced from 7 to 0. 153/153 normal tests pass on interpreter + PE, 153/153 on C codegen
   backends.
 
 ### New Features (Issue 45-49: val/var, auto-deref, exhaustiveness, UAF, closures)
@@ -834,8 +879,8 @@ test_constant_time_fail, test_constant_time_fail2
 
 Known-fail tests: 6 tests remain. 5 of 6 now pass on interpreter (all but
 parallel_concurrent which has a thread race condition). 2 of 6 pass on C codegen
-(test_time, test_time_edge). All 6 pass on PE emitter. The 146/146
-normal tests all pass on all three backends.
+(test_time, test_time_edge). All 6 pass on PE emitter. The 153/153
+normal tests all pass on all 3 backends (interpreter, C codegen, PE).
 
 Features now present in the baseline: tuple destructuring, file I/O
 (`stdlib/file.fd`), `txn {}` blocks (with interpreter rollback), loop-aware linear types, `@gas`
@@ -860,7 +905,7 @@ generic enums/structs (`enum Option<T> { ... }`, `struct Foo<T> { ... }` — typ
 LSP server (`fidesc lsp` — JSON-RPC over stdio, initialize/didOpen/didChange/diagnostics, no external deps),
 new stdlib modules (`stdlib/math.fd`, `stdlib/env.fd`, `stdlib/args.fd`, `stdlib/process.fd`, `stdlib/regex.fd`, `stdlib/sync.fd`, `stdlib/channel.fd`, `stdlib/vec.fd`, `stdlib/ecs.fd`, `stdlib/events.fd`, `stdlib/parallel.fd`, plus game stdlib: `stdlib/tilemap.fd`, `stdlib/sprite.fd`, `stdlib/flowfield.fd`, `stdlib/streaming.fd`, `stdlib/scene.fd`, `stdlib/physics.fd`, `stdlib/audio.fd`, `stdlib/input.fd`).
 
-**Note:** 146/146 normal tests pass on interpreter + PE, 146/146 on C codegen. The test runner separates normal tests (159, should pass) from skip-list tests (0: all previously skipped tests now pass) and known-fail tests (6: 5 pass on interp, 2 on C codegen, 6 on PE).
+**Note:** 153/153 normal tests pass on interpreter + PE, 153/153 on C codegen. The test runner separates normal tests (159, should pass) from skip-list tests (0: all previously skipped tests now pass) and known-fail tests (6: 5 pass on interp, 2 on C codegen, 6 on PE).
 
 ### Vec Higher-Order Methods (vec.fd)
 
@@ -906,7 +951,7 @@ touching them.
 | `src/coff.rs` | **HIGH** | COFF object file format. Same byte-level risk as PE/ELF. |
 | `src/macho.rs` | **HIGH** | Mach-O object file format. Same byte-level risk. |
 | `src/codegen_x64.rs` | **HIGH** | PIR L3 → x86-64 instruction encoding. ModRM/SIB bytes, REX prefixes, ABI rules. |
-| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 153/153 test parity (0 skip). Phase 10B: Print instruction calls Fides Vec_to_str/HashMap_to_str for formatting. Channels: p_chan_* with pthread mutex+condvar. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic. Rc/Arc runtime via p_rc_incr/p_rc_decr. ML3: Autograd tape (ag_tape, ag_record, p_autograd_backward) with reverse-mode AD for add/sub/mul/matmul/scale/relu/sigmoid/sum/mean. ML11: Checkpoint mode stores input data for relu/sigmoid backward. ML12: DP noise/budget builtins. ML13: TP builtins (identity in single-rank). ML9: KV cache with sliding window eviction. ML10: Quantization (quantize/dequantize/qmatmul/find_quant_params). Tensor printing via p_tensor_to_str with %.4f for non-integers. Dlopen simulated to match interpreter (sequential handles). |
+| `src/codegen_c.rs` | **HIGH** | IR → C99. ABI casts, struct offsets, function renaming. 153/153 test parity (all tests pass). Phase 10B: Print instruction calls Fides Vec_to_str/HashMap_to_str for formatting. Channels: p_chan_* with pthread mutex+condvar. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic. Rc/Arc runtime via p_rc_incr/p_rc_decr. ML3: Autograd tape (ag_tape, ag_record, p_autograd_backward) with reverse-mode AD for add/sub/mul/matmul/scale/relu/sigmoid/sum/mean. ML11: Checkpoint mode stores input data for relu/sigmoid backward. ML12: DP noise/budget builtins. ML13: TP builtins (identity in single-rank). ML9: KV cache with sliding window eviction. ML10: Quantization (quantize/dequantize/qmatmul/find_quant_params). Tensor printing via p_tensor_to_str with %.4f for non-integers. Dlopen simulated to match interpreter (sequential handles). |
 | `src/pir.rs` | **HIGH** | PIR L1/L2/L3 transforms. A bad lowering propagates to all backends. |
 | `src/lower.rs` | **MEDIUM** | AST → SSA IR. Changes here affect interpreter + all backends. `runtime_effects()` helper sets Write/Alloc/IO effects on `p_*` builtin calls — without this, the optimizer DCE's side-effecting calls. `p_vec_*` extern declarations (23 functions) ensure correct calling convention. |
 | `src/typechecker.rs` | **MEDIUM** | Types + regions + effects + capabilities. Wrong rejection = broken code; wrong acceptance = silent miscompilation. |

@@ -505,41 +505,9 @@ These phases use Fides's semantic information to optimize in ways LLVM fundament
 
 ## Self-Hosting Readiness (Next Major Milestone)
 
-### Blockers — All Resolved ✅
-
-| Blocker | Status | Test |
-|---------|--------|------|
-| **Generic Vec<T>** — `Vec::new()` carried i64 only | ✅ Fixed | `test_generic_vec_typed.fd` |
-| **Enum payloads** — match bindings typed i32 | ✅ Fixed | `test_enum_payload_types.fd` |
-| **Recursive types** — no `Box<T>` indirection | ✅ Fixed | `test_recursive_box.fd` |
-
-### What's Ready Now
-
-- ✅ Enums with payloads (`Node::Leaf(Token)`, `Node::Pair(Token, Span)`)
-- ✅ Recursive types via `Box<T>` (`enum Expr { Add(Box<Expr>, Box<Expr>) }`)
-- ✅ Generic containers (`Vec<Token>`, `HashMap<String, Token>`)
-- ✅ Pattern matching with typed bindings
-- ✅ File I/O (`file_read`, `file_write`, `file_exists`)
-- ✅ String operations (concat, split, trim, contains, etc.)
-- ✅ HashMap/HashSet (used heavily in typechecker/opt)
-- ✅ Closures and function pointers
-- ✅ Structs with methods and trait impls
-- ✅ All primitive types (i8–i128, u8–u128, f32/f64, bool, str)
-- ✅ Match, if/else, while, for, loop/break/continue
-- ✅ 137 test files passing on interpreter + C codegen
-
-### What's Still Needed Before Self-Host
-
-| Feature | Why Needed | Status |
-|---------|-----------|--------|
-| **String builder / mutable strings** | Lexer builds strings incrementally | ✅ Done — StringBuilder with append/clear |
-| **Byte/char iteration** | Lexer iterates over input bytes | ✅ Done — str_bytes, str_from_bytes |
-| **Result/Option full API** | Parser returns Result extensively | ✅ Done — map, and_then, or_else, unwrap_or |
-| **Integer parsing** | Lexer parses numbers from strings | ✅ Done — str_parse_int, str_parse_hex, str_parse_int_range |
-| **Array indexing by range** | Slicing for substrings | ✅ Done — str_slice(s, start, end) |
-| **More string methods** | `starts_with`, `ends_with`, `trim`, etc. | ✅ Done — full str_* API (split, trim_start/end, find, replace, etc.) |
-| **Binary file IO** | Emitting executables needs byte writes | ✅ Done — file_write_bytes, file_read_bytes, file_delete, file_size |
-| **PE emitter: enum payload + generic Vec** | ✅ Fixed — all 3 blockers pass on PE | Done |
+**See `roadmap.md` Phase 10** for blocker status, test baseline, and self-hosting
+readiness details. All 3 language-level blockers (generic Vec<T>, enum payloads,
+recursive Box<T>) are resolved. 153/153 tests pass on all 3 backends.
 
 ### Estimated Effort to Self-Host
 

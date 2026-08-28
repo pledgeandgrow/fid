@@ -576,6 +576,15 @@ impl Lowerer {
         self.module.add_extern("p_tensor_to_json", vec![tensor_ty.clone()], IrType::Ptr(Box::new(IrType::U8)));
         self.module.add_extern("p_tensor_clone", vec![tensor_ty.clone()], tensor_ty.clone());
 
+        // ─── ML3: Autograd builtins ───
+        self.module.add_extern("p_grad_get", vec![tensor_ty.clone()], tensor_ty.clone());
+        self.module.add_extern("p_grad_zero", vec![], IrType::Void);
+        self.module.add_extern("p_autograd_begin", vec![], IrType::Void);
+        self.module.add_extern("p_autograd_end", vec![], IrType::Void);
+        self.module.add_extern("p_autograd_backward", vec![tensor_ty.clone()], IrType::Void);
+        self.module.add_extern("p_checkpoint_begin", vec![], IrType::Void);
+        self.module.add_extern("p_checkpoint_end", vec![], IrType::Void);
+
         // ─── ML9: KV Cache builtins ───
         self.module.add_extern("p_kv_cache_new",
             vec![IrType::I64, IrType::I64, IrType::I64, IrType::I64], IrType::I64);

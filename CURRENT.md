@@ -26,20 +26,41 @@ Issue 47 fixed. One strategic decision remaining before rewrite can start.
   a type error if the object was declared `val`. Test: `/tmp/test_issue47.fd`.
 - **test_drop removed from known-fail** — passes on all 3 backends.
 
-## Current Test Baseline (Aug 27, after runtime effects fix)
+## Current Test Baseline (Aug 28, after C codegen ML fixes)
 
 ```
 Normal tests:  159 run
-  Interpreter:  149/149 passed
-  C Codegen:    149/149 matched
-  PE Emitter:   149/149 valid
-Skip list:      4  (3 C codegen missing-builtins: kv_cache, quant, dp + 1 design difference: dlopen)
-Known-fail:     6  (test_game_stdlib, test_iter, test_vec_math,
-                    test_parallel_concurrent, test_time, test_time_edge)
+  Interpreter:  153/153 passed
+  C Codegen:    153/153 matched
+  PE Emitter:   153/153 valid
+Skip list:      0  (all previously skipped tests now pass)
+Known-fail:     6  (1 interp race: parallel_concurrent.
+                    3 C codegen mismatches: game_stdlib, iter, vec_math.
+                    2 C codegen fixed: autodiff_grad, ml_full now pass!)
 Expected-fail:  35 (correctly fail — error detection tests)
-Bonus passes:   3  (test_iter, test_vec_math, test_parallel_concurrent
+Bonus passes:   5  (game_stdlib, iter, vec_math, time, time_edge
                     now pass on interp/PE — were known-fail)
+Unit tests:     265/265 passed
 ```
+
+### C Codegen ML Fixes (Aug 28)
+
+**Bug:** 6 tests failed on C codegen due to missing ML builtins, wrong
+tensor printing, simulated dlopen mismatch, and autograd double-seed bug.
+
+**Fixes:**
+- Added C runtime for KV cache (`p_kv_cache_*`), quantization (`p_quantize_q8`,
+  `p_qmatmul`, `p_find_quant_params`), and tensor parallelism builtins
+- Simulated dlopen to match interpreter (sequential handles, not real pointers)
+- Fixed tensor printing: `Inst::Print` now dispatches to `p_tensor_to_str`
+  for `Opaque("Tensor")` types; format matches interpreter (integers as
+  `%lld`, non-integers as `%.4f`)
+- Fixed autograd backward double-seed: skip the already-seeded AG_SUM/AG_MEAN
+  op in the reverse walk
+- Added `p_grad_get` and other ML externs to lowerer for correct IR types
+- Forward-declared `PTensor` in C header for use in function signatures
+
+**Result:** 153/153 on all 3 backends. 0 skip list. All 265 unit tests pass.
 
 ### Runtime Effects Fix (Aug 27)
 
@@ -59,7 +80,7 @@ reduced from 7 to 4.
 
 ### Decision Made: C Codegen Bootstrap
 1. **C codegen bootstrap** — Start self-host rewrite using C codegen backend.
-   Works today (149/149 tests pass, zero blockers). gcc/clang provides argv,
+   Works today (153/153 tests pass, zero blockers). gcc/clang provides argv,
    file I/O, process execution — no runtime stubs needed.
    - PE emitter rewrite is **Phase 10B** (post-bootstrap): fix Issues 67-69,
      rewrite pe.rs in Fides, switch default backend to PE for zero-dependency
@@ -67,11 +88,10 @@ reduced from 7 to 4.
    - See `docs/roadmap/roadmap.md` Phase 10B for full plan.
 
 ### Should Do (hygiene — before rewrite, not blocking)
-2. Fix 3 C codegen missing-builtins (test_kv_cache, test_quantization,
-   test_dp) — add ML runtime builtins, fix float formatting differences.
-   Or accept as skip-list items.
-3. Fix 3 parser bugs (test_game_stdlib, test_time, test_time_edge) —
-   all hit "expected identifier but got 'LParen'" parse errors.
+2. Fix 2 C codegen autograd tensor-print bugs (test_autodiff_grad,
+   test_ml_full) — grad_x prints pointer address instead of tensor data.
+3. ~~Fix 3 parser bugs (test_game_stdlib, test_time, test_time_edge)~~
+   DONE — all 3 now pass on interp+PE (bonus passes).
 4. Reconcile doc contradiction: roadmap-limitations.md says "3/5 blockers"
    vs roadmap.md "all 3 blockers." Reality: 3 language blockers done,
    binary IO done, native runtime remaining = 4/5.
@@ -89,6 +109,7 @@ reduced from 7 to 4.
 ## Gate
 
 `verify.sh` must pass clean before self-host rewrite begins.
-Current: 149/149 normal tests pass on interpreter, 149/149 on C codegen,
-149/149 on PE emitter. 4 skipped, 6 known-fail (3 parser + 3 C codegen).
+Current: 153/153 normal tests pass on interpreter, 153/153 on C codegen,
+153/153 on PE emitter. 0 skipped, 6 known-fail (1 interp race + 2 C codegen
+autograd bugs + 3 parser bugs now fixed). 136 warnings (dead code stubs).
 3 bonus passes (iter, vec_math, parallel_concurrent on interp/PE).

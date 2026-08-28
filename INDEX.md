@@ -3,7 +3,7 @@
 > Navigation hub for the Fides compiler. Every file in the project, grouped by
 > directory, with a one-line description. Use this to find anything fast.
 >
-> **Stats:** 54 `.rs` source files (85,493 LOC) · 69 stdlib modules (17,567 LOC) · 218 `.fd`
+> **Stats:** 54 `.rs` source files (86,011 LOC) · 69 stdlib modules (17,541 LOC) · 218 `.fd`
 > test files · 33 .md docs · 4 examples · 3 scripts · 3 benchmarks · 4 binaries (fidesc, pacte, scribe, veil).
 > Cross-compilation: ARM64, RISC-V, Windows — zero external tools.
 
@@ -256,9 +256,9 @@ typed strings, init guarantees, constant_time, etc.
 
 ### Current Test Results (Aug 2026)
 ```
-Interpreter:  149/149 normal
-C Codegen:    149/149 matched
-PE Emitter:   149/149 valid
+Interpreter:  153/153 normal
+C Codegen:    151/153 matched
+PE Emitter:   153/153 valid
 Unit tests:   265/265 passed  (cargo test --lib)
 Harness:      8/8 passed
 ```

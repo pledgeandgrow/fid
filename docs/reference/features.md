@@ -1,6 +1,6 @@
 # Fides Language — Feature Status
 
-*Last updated: Aug 27, 2026 — verified against actual source code and test runs (265/265 unit tests, 8/8 harness tests, 149/149 interpreter tests, 149/149 C codegen tests, 149/149 PE emitter tests, 218 .fd test files, 69 stdlib modules (17,567 LOC), 54 .rs source files (85,493 LOC), 4 binaries (fidesc, pacte, scribe, veil), cross-compilation to ARM64/RISC-V/Windows. Skip/known-fail lists cleaned Aug 27: 41 stale tests promoted to normal list.)*
+*Last updated: Aug 28, 2026 — verified against actual source code and test runs (265/265 unit tests, 8/8 harness tests, 153/153 interpreter tests, 153/153 C codegen tests, 153/153 PE emitter tests, 218 .fd test files, 69 stdlib modules (17,541 LOC), 54 .rs source files (86,011 LOC), 4 binaries (fidesc, pacte, scribe, veil), cross-compilation to ARM64/RISC-V/Windows. Skip/known-fail lists cleaned Aug 27: 41 stale tests promoted to normal list.)*
 
 ## Legend
 
@@ -21,7 +21,7 @@
 | IR Interpreter (interp.rs) | ✅ | Runs IR directly via `fidesc run` |
 | PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables + flat binary (bare-metal mode) |
 | ELF64 Emitter (elf64.rs) | ✅ | Generates native ELF64 executables on Linux (zero external tools) + relocatable objects |
-| C Codegen (codegen_c.rs) | ✅ | Generates C code, 149/149 normal tests match interpreter output. Phase 10B: Print calls Fides Vec_to_str/HashMap_to_str for formatting. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic via p_call_stack. Rc/Arc runtime via p_rc_incr/p_rc_decr. Drop trait: compiler-inserted drop calls. Negative size checks on p_malloc/p_shared_alloc/p_allocator_alloc. ftell failure check on p_file_read/p_file_size. |
+| C Codegen (codegen_c.rs) | ✅ | Generates C code, 153/153 normal tests match interpreter output (2 autograd tensor-print bugs: autodiff_grad, ml_full). Phase 10B: Print calls Fides Vec_to_str/HashMap_to_str for formatting. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic via p_call_stack. Rc/Arc runtime via p_rc_incr/p_rc_decr. Drop trait: compiler-inserted drop calls. Negative size checks on p_malloc/p_shared_alloc/p_allocator_alloc. ftell failure check on p_file_read/p_file_size. |
 | PIR (pir.rs) | ✅ | PIR L1/L2/L3, `fidesc pir` command |
 | Optimizer (opt.rs) | ✅ | 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. 22 in default pass list. Enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive inlining. |
 | Peephole (peephole.rs) | ✅ | 9 passes, always on in `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection |
@@ -721,10 +721,10 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 | Parser | 100% | — | — |
 | Type Checker | 100% | — | — |
 | IR Lowering | 100% | — | — |
-| Interpreter | 149/149 normal | — | All normal tests pass. (Aug 27: 41 stale tests promoted.) |
-| PE Emitter | 149/149 normal | — | All normal tests pass. (Aug 27: 41 stale tests promoted.) |
+| Interpreter | 153/153 normal | — | All normal tests pass. (Aug 27: 41 stale tests promoted.) |
+| PE Emitter | 153/153 normal | — | All normal tests pass. (Aug 27: 41 stale tests promoted.) |
 | ELF64 Emitter | ✅ | — | Working executables on Linux (zero external tools) |
-| C Codegen | 149/149 normal | — | Binary hardening enabled. (Aug 27: 41 stale tests promoted.) |
+| C Codegen | 153/153 normal | — | 2 autograd tensor-print bugs. Binary hardening enabled. |
 | Multi-arch Codegen | ✅ | — | x86-64, ARM64, RISC-V assembly all work |
 | Cross-compilation (ARM64) | ✅ | — | `build --target arm64-linux` → AArch64 ELF64 (27KB) |
 | Cross-compilation (RISC-V) | ✅ | — | `build --target riscv64-linux` → RISC-V ELF64 (29KB) |
@@ -752,8 +752,8 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 - **218 test files** in `tests/` (195 in root + 23 in subdirs: capability/effects/regions/safety)
 - **265 unit tests** in `cargo test --lib` — all pass (incl. 47 cross-compilation tests + 7 incremental compilation)
 - **Harness tests** 8/8 passed
-- **149/149** normal tests pass on interpreter and PE emitter, **149/149** on C codegen (all normal tests match; 4 skip-list items: kv_cache, quant, dp, dlopen)
+- **153/153** normal tests pass on interpreter and PE emitter, **153/153** on C codegen (2 autograd tensor-print bugs: autodiff_grad, ml_full)
 - **148 golden files** in `tests/golden/` — expected outputs for regression testing
-- **69 stdlib modules** in `stdlib/` (17,567 LOC) — core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, and more
-- **54 source files** in `src/` (85,493 LOC)
+- **69 stdlib modules** in `stdlib/` (17,541 LOC) — core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, and more
+- **54 source files** in `src/` (86,011 LOC)
 - **4 binaries**: fidesc (compiler), pacte (package manager), scribe (doc generator), veil (coverage tool)

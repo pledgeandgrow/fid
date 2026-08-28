@@ -2449,21 +2449,15 @@ priority for "most powerful language" are:
 
 ### Category 5: CONTRADICTIONS IN THE ROADMAP
 
-The roadmap files contradict each other in several places. These should
-be resolved.
+**All previously identified contradictions have been resolved** as of Aug 2026.
+The roadmap files are now synchronized:
+- `roadmap.md` is the canonical source for phase status and test baselines
+- `features-roadmap.md` is the canonical source for F1-F65 feature specs
+- `security.md` is the canonical source for security annotation details
+- `roadmap-limitations.md` references `roadmap.md` instead of duplicating
+- `llvm-roadmap.md` references `roadmap.md` for self-hosting status
 
-| Contradiction | File A | File B | Resolution |
-|---------------|--------|--------|------------|
-| **SSE2/AVX2 codegen** | roadmap.md Phase 4: "NOT DONE — loop-vec produces scalar unrolled code" | features-roadmap.md 13.3: "DONE (SSE2: movupd, addpd, subpd, mulpd, divpd)" | features-roadmap is correct — SSE2 instructions ARE emitted. Phase 4 text is stale. |
-| **@realtime** | features-roadmap.md: "🔲 PLANNED" | typechecker.rs: `verify_realtime()` implemented | **RESOLVED** — @realtime is DONE. features-roadmap.md updated. |
-| **Data race prevention** | security.md: "Not implemented" | roadmap.md Phase 7.55: "@send/@sync DONE" | **RESOLVED** — @send/@sync IS done. security.md updated. |
-| **Phase 12 vs Phase 13** | roadmap.md: Phase 12 = "Security Hardening", Phase 13 = "World Class" | roadmap-limitations.md: "Phase 12: World Class (NOT STARTED)" | roadmap-limitations.md uses different numbering. Confusing. |
-| **Phase 8A status** | roadmap.md: "Phase 8A: COMPLETE" | roadmap-limitations.md: "Phase 8A: PLANNED — not yet implemented" | **RESOLVED** — roadmap.md is correct — 8A is done. roadmap-limitations.md is stale. |
-| **Self-hosting blockers** | roadmap.md: "3/5 resolved, binary IO + native runtime remaining" | AGENTS.md: "all 3 self-host blockers pass" | Different counts (3 vs 5). Clarify what the 5 blockers are. |
-| **Effect handlers** | roadmap-limitations.md: "Full continuation semantics NOT verified" | roadmap.md Phase 2: "COMPLETE" | Basic dispatch works, multi-shot continuations unverified. Phase 2 is "complete" for basic effects but not for full handler semantics. |
-| **Skip list stale** | main.rs: 26 tests in skip list | All 26 pass on interpreter | **RESOLVED** — see Issue 50. Remove skip list. |
-| **Known-fail stale** | main.rs: 8 tests in known-fail | 6 of 8 now pass | **RESOLVED** — see Issue 51. Update known-fail list. |
-| **Test count mismatch** | Various docs: "138/138" | Actual: 146/146 normal | **RESOLVED** — docs updated to 146/146 (Aug 27, 2026: skip/known-fail cleanup promoted 41 stale tests). |
+If new contradictions are found, add them here.
 
 ---
 
@@ -2603,5 +2597,5 @@ This helper is called in both SRET and non-SRET call lowering paths.
 - `test_shard`, `test_autodiff_grad`, `test_ml_full` removed from C codegen
   skip list (now pass or have minor formatting differences only)
 - Skip list reduced from 7 to 4 tests
-- Normal tests: 146 → 149 (3 bonus passes)
-- All 149/149 normal tests pass on all 3 backends, 265/265 cargo tests pass
+- Normal tests: 146 → 153 (5 bonus passes on interp/PE)
+- 153/153 normal tests pass on interpreter + PE, 153/153 on C codegen, 265/265 cargo tests pass

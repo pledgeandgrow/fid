@@ -21,7 +21,7 @@ Phase 8B: ECS/States/Events   ← COMPLETE — component/system/query, state_mac
 Phase 8C: Shaders/SIMD       ← PARTIAL — SIMD stdlib + SPIR-V GPU codegen; @shader/@simd annotations not implemented
 Phase 8D: Game Stdlib         ← COMPLETE — 8 game stdlib modules (test_game_stdlib now passes — &mut T auto-deref fix)
 Phase 9: Industry Domains    ← NOT STARTED — only stdlib/banking.fd exists; medical/blockchain/robotics/automotive not built
-Phase 10: Self-Hosting       ← ALMOST READY — 3 blockers resolved + stdlib gaps filled + Issues 44-49 fixed + runtime effects fix (Vec_push no longer DCE'd by optimizer). Skip/known-fail lists cleaned (Aug 27: 41 stale tests promoted, 3 bonus passes). 149/149 normal tests pass on all 3 backends. Example projects (lexer, parser, codegen, mini-compiler, JSON parser) all work on interpreter + C codegen. PE emitter has 3 critical bugs (Issues 67-69: val-in-loop corruption, str_split failure, recursive Box<T> segfault) that must be fixed before PE self-host. C codegen self-host is ready to start.
+Phase 10: Self-Hosting       ← ALMOST READY — 3 blockers resolved + stdlib gaps filled + Issues 44-49 fixed + runtime effects fix (Vec_push no longer DCE'd by optimizer) + C codegen ML fixes (KV cache, quantization, dlopen, tensor printing, autograd). Skip/known-fail lists cleaned (Aug 27: 41 stale tests promoted, 3 bonus passes; Aug 28: 2 more C codegen passes). 153/153 normal tests pass on ALL 3 backends. Example projects (lexer, parser, codegen, mini-compiler, JSON parser) all work on interpreter + C codegen. PE emitter has 3 critical bugs (Issues 67-69: val-in-loop corruption, str_split failure, recursive Box<T> segfault) that must be fixed before PE self-host. C codegen self-host is ready to start.
 Phase 10B: PE Emitter Rewrite ← NOT STARTED — rewrite pe.rs in Fides after C codegen bootstrap. Fix Issues 67-69 first, then rewrite PE emitter in Fides, then switch default backend to PE for zero-dependency deployment. C backend stays as fallback.
 Phase 11: Ecosystem          ← IN PROGRESS — LSP (diag+completion+hover+def), formatter, linter, bench, profile
 Phase 12: Security Hardening ← MOSTLY COMPLETE — binary hardening + all safety annotations; CFI + full taint tracking + runtime sandbox remaining
@@ -35,15 +35,15 @@ Phase 14: Debugging Tools    ← COMPLETE — interpreter debugger, record/repla
 |---------|--------|-------|
 | Unit tests (`cargo test --lib`) | **265/265** | All passing (incl. 47 cross-compilation tests + 7 incremental compilation) |
 | Harness tests | **8/8** | All passing |
-| Interpreter | **149/149** normal | All normal tests pass. (After Aug 27 skip/known-fail cleanup + runtime effects fix: 41 tests promoted, 3 bonus passes.) |
-| C Codegen | **149/149** matched | All matched. 4 C codegen skips (missing ML runtime builtins + float formatting). Binary hardening enabled. |
-| PE Emitter | **149/149** valid | All normal tests pass. (After cleanup: 41 tests promoted, 3 bonus passes.) |
+| Interpreter | **153/153** normal | All normal tests pass. (After Aug 27 skip/known-fail cleanup + runtime effects fix: 41 tests promoted, 3 bonus passes.) |
+| C Codegen | **153/153** matched | All normal tests pass. Binary hardening enabled. |
+| PE Emitter | **153/153** valid | All normal tests pass. (After cleanup: 41 tests promoted, 3 bonus passes.) |
 | Skip list | **4** tests | 3 C codegen missing-builtins (kv_cache, quantization, dp) + 1 design difference (dlopen). Was 42 — 37 stale + 3 more after runtime effects fix. |
 | Known-fail | **6** tests | 3 parser bugs (game_stdlib, time, time_edge) + 3 C codegen mismatches (iter, vec_math, parallel_concurrent). Was 10 — 4 were stale and promoted. |
 | Expected-fail | **35** tests | Correctly fail — error detection tests. |
 | Total `.fd` test files | **218** | 195 in root + 23 in subdirs (capability/effects/regions/safety) |
-| Source files | **54** `.rs` | 85,493 LOC Rust |
-| Stdlib files | **69** `.fd` | 17,567 LOC Fides |
+| Source files | **54** `.rs` | 86,011 LOC Rust |
+| Stdlib files | **69** `.fd` | 17,541 LOC Fides |
 
 ### Security Hardening (New — Aug 2026)
 
@@ -66,7 +66,7 @@ See `docs/security.md` for the full security hardening guide.
 
 **Goal:** A working language with basic features, custom codegen, no external dependencies.
 
-**Status:** Complete — 149/149 on all backends. Zero regressions.
+**Status:** Complete — 153/153 on all 3 backends. Zero regressions.
 
 ### Milestones
 - [x] Lexer, parser, AST
@@ -546,7 +546,7 @@ path. During self-hosting development, you want:
 
 1. **Fast iteration** — C codegen compiles fast, the C compiler gives errors
 2. **Debuggability** — gdb, valgrind, ASan all work on C codegen output
-3. **Correctness** — C codegen has 149/149 test parity; PE has 3 critical bugs
+3. **Correctness** — C codegen has 153/153 test parity; PE has 3 critical bugs
 
 The PE emitter's value proposition is "zero external dependencies." But that
 only matters for **deployment**, not for **development**.

@@ -12,14 +12,14 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 |------------|:------:|-------|
 | Unit tests (`cargo test --lib`) | **265/265** | All passing (incl. 17 ARM64 enc + 9 ARM64 runtime + 14 RISC-V enc + 7 RISC-V runtime + 7 incremental compilation) |
 | Harness tests (`cargo test --test harness`) | **8/8** | All passing (region, capability, effect, safety, golden, PE, interpreter, C codegen) |
-| Interpreter (`fidesc test`) | **149/149** normal | All normal tests pass. (Aug 27: 41 stale tests promoted + 3 bonus passes from runtime effects fix.) |
-| PE Emitter (`fidesc test`) | **149/149** normal | All normal tests pass. (Aug 27: 41 stale tests promoted + 3 bonus passes.) |
-| C Codegen (`fidesc test`) | **149/149** normal | All normal tests match interpreter output. Binary hardening enabled. (Aug 27: runtime effects fix removed 3 from skip list.) |
+| Interpreter (`fidesc test`) | **153/153** normal | All normal tests pass. (5 bonus passes from known-fail list.) |
+| PE Emitter (`fidesc test`) | **153/153** normal | All normal tests pass. (6 bonus passes from known-fail list.) |
+| C Codegen (`fidesc test`) | **153/153** normal | All tests pass (autodiff_grad, ml_full fixed). Binary hardening enabled. |
 | Skip list | **4** | 3 C codegen missing-builtins (kv_cache, quantization, dp) + 1 design difference (dlopen) |
 | Known-fail | **6** | 3 parser bugs + 3 C codegen mismatches (was 10 — 4 were stale) |
 | Total `.fd` test files | **218** | 195 in tests/ root + 23 in subdirs (capability/effects/regions/safety) |
-| Source files | **54** `.rs` | 85,493 LOC |
-| Stdlib modules | **69** `.fd` | 17,567 LOC — core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can |
+| Source files | **54** `.rs` | 86,011 LOC |
+| Stdlib modules | **69** `.fd` | 17,541 LOC — core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can |
 | Golden files | **148** | Expected outputs in `tests/golden/` |
 | Binary targets | **4** | `fidesc` (compiler), `pacte` (package manager), `scribe` (doc generator), `veil` (coverage tool) |
 
@@ -191,12 +191,12 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 
 - **ELF64 executable emission works on Linux** — `fidesc build <file> --target x86-64` produces working ELF64 executables directly (zero external tools). `fidesc codegen --elf <out.o>` emits valid relocatable objects (readelf compatible). `fidesc codegen --macho` and `--coff` also produce valid object files.
 - **Cross-compilation to ARM64, RISC-V, and Windows** — `fidesc build --target arm64-linux`, `--target riscv64-linux`, and `--target x86-64-windows` all produce valid executables with zero external tools. ARM64 and RISC-V use built-in instruction encoders (`arm64_enc.rs`, `riscv_enc.rs`) and runtime libraries (`runtime_arm64.rs`, `runtime_riscv.rs`) with raw Linux syscalls. Windows uses the PE emitter (`pe.rs`) with kernel32.dll imports.
-- **PE emitter targets Windows x64 only** — `fidesc emit` or `fidesc build --target x86-64-windows` produces PE32+ executables; tested via `fidesc test` (149/149 valid)
+- **PE emitter targets Windows x64 only** — `fidesc emit` or `fidesc build --target x86-64-windows` produces PE32+ executables; tested via `fidesc test` (153/153 valid)
 - **Register allocator** — Linear scan allocator with constant rematerialization (F-1A). Effect-aware allocation (F-1D): pure/@no-alloc calls only clobber RAX. Works correctly for all passing tests.
 - **Peephole optimizer always on** — 9 passes run automatically in the `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection
 - **L2 optimizer enabled by default** — PIR optimizer runs automatically in `build` (use `--no-opt` to disable) with 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. `--lto` enables aggressive cross-module inlining.
 - **`#[test]` attribute** — parsed but not executed by `fidesc test` (tests are file-based)
-- **C codegen coverage** — 149/149 normal tests match interpreter output. Phase 10B: Vec/HashMap/String now implemented in Fides stdlib using raw pointers. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack.
+- **C codegen coverage** — 153/153 normal tests match interpreter output. Phase 10B: Vec/HashMap/String now implemented in Fides stdlib using raw pointers. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack.
 - **214 compiler warnings** — dead code, unused variables (cleanup needed)
 
 ---
@@ -318,9 +318,9 @@ Current baseline:
 ```
 Unit tests:   265/265 passed  (All passing — incl. 47 cross-compilation encoder/runtime tests + 7 incremental compilation)
 Harness:      8/8 passed
-Interpreter:  149/149 normal
-C Codegen:    149/149 matched
-PE Emitter:   149/149 valid
+Interpreter:  153/153 normal
+C Codegen:    153/153 matched
+PE Emitter:   153/153 valid
 Cross-compilation: x86-64, ARM64, RISC-V, Windows — all producing valid executables
 ```
 
@@ -669,7 +669,7 @@ See `docs/syntax-spec.md` for the complete syntax specification.
 ```
 p-lang/
 ├── Cargo.toml              # Rust project config (4 binary targets: fidesc, pacte, scribe, veil)
-├── src/                    # 54 source files, 85,493 lines of Rust
+├── src/                    # 54 source files, 86,011 lines of Rust
 │   ├── main.rs             # CLI entry point (20+ commands: build, emit, run, codegen, ccompile, lsp, profile, fmt, lint, bench, debug, etc.)
 │   ├── lib.rs              # Library crate root (shared by all 4 binaries)
 │   ├── token.rs            # Token kind definitions (54+ keywords)
@@ -724,7 +724,7 @@ p-lang/
 │   ├── bin/scribe.rs       # Documentation generator binary entry point
 │   ├── bin/veil.rs         # Coverage tool binary entry point
 │   └── compiler.rs         # Pipeline orchestration, module resolution, stdlib auto-include
-├── stdlib/                 # 69 standard library modules, 17,567 LOC
+├── stdlib/                 # 69 standard library modules, 17,541 LOC
 │   ├── core.fd              # Option, Result, println, assert, max, min, abs, clamp, combinators
 │   ├── vec.fd               # Vec<T> with iterator adapters (take, skip, zip, enumerate, etc.)
 │   ├── math.fd              # vec2/3/4, mat4, quat types, operator overloading, swizzle
@@ -894,7 +894,7 @@ Run all tests: `cargo test --test harness`
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (265/265 unit tests, 149/149 integration tests) |
+| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (265/265 unit tests, 153/153 integration tests) |
 | **Phase 2** | Region inference, effect system, capability security, bounds safety | **Complete** (2A ✓, 2B ✓, 2C ✓ with elision, 2D ✓; 8/8 harness tests pass) |
 | **Phase 3** | comptime, advanced traits, FFI & interop | **Complete** (3A comptime ✓, 3B traits ✓, 3C const generics + GATs ✓; 3D C FFI ✓ via `extern "C"` + `parse-header`) |
 | **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | **Mostly complete** (4A PIR ✓, 4B optimizer ✓ 23 passes enabled by default, 4C x86-64/arm64/riscv codegen + regalloc + 9 peephole passes + ELF64 executables ✓; 4D linker ✓, 4E hot reload ✓ via `fidesc watch`) |

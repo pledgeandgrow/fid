@@ -2333,15 +2333,15 @@ system UpdateLOD {
 ### Implementation Details
 
 All 5 original features (F1–F5) were implemented in a single session. Test results (current state):
-- Interpreter: 149/149 normal passed
-- PE Emitter: 149/149 valid
-- C Codegen: 149/149 matched
+- Interpreter: 153/153 normal passed
+- PE Emitter: 153/153 valid
+- C Codegen: 153/153 matched
 - Total: 218 .fd test files (195 in root + 23 in subdirs)
 
 **Planned for implementation:**
 - 39 Tier A syntax features (F10, F13, F14, F16–F18, F21, F23–F60) — need compiler support
 - 7 Tier B syntax features (F12, F19, F20) — ergonomic keywords
-- 29 stdlib module slots (S1–S29) — Fides code, no compiler changes (69 actual .fd files as of Aug 2026, 17,567 LOC)
+- 29 stdlib module slots (S1–S29) — Fides code, no compiler changes (69 actual .fd files as of Aug 2026, 17,541 LOC)
 - 15 features cut (C1–C15) — redundant, build with existing features
 
 ---

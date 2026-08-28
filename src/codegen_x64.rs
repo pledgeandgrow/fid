@@ -24,7 +24,7 @@
 use crate::ast::BinOp;
 use crate::ir::IrType;
 use crate::pir::{
-    CastKind, L3Block, L3Function, L3Inst, L3Module, MemRegion, Operand, PBlock, PirType, VReg,
+    CastKind, L3Block, L3Function, L3Inst, L3Module, Operand, PBlock, VReg,
 };
 use crate::regalloc::{allocate_module, Allocation, Location, ModuleAllocation, PhysReg};
 use std::collections::HashMap;

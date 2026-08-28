@@ -1,6 +1,6 @@
 # TEST.md — Fides Test Results
 
-*Last updated: Aug 27, 2026 — verified against actual test runs (265/265 unit tests via cargo test --lib, 8/8 harness tests, 149/149 interpreter, 149/149 PE, 149/149 C codegen, 218 .fd test files, cross-compilation to ARM64/RISC-V/Windows. Skip/known-fail lists cleaned: 41 stale tests promoted + runtime effects fix gave 3 bonus passes.)
+*Last updated: Aug 28, 2026 — verified against actual test runs (265/265 unit tests via cargo test --lib, 8/8 harness tests, 153/153 interpreter, 153/153 C codegen, 153/153 PE, 218 .fd test files, cross-compilation to ARM64/RISC-V/Windows. Skip/known-fail lists cleaned: 41 stale tests promoted + runtime effects fix gave 3 bonus passes + C codegen ML fixes gave 2 more passes.)
 
 ## Legend
 
@@ -21,11 +21,11 @@
 |------------|-------|------|------|-------|
 | Harness (`cargo test --test harness`) | 8 | 8 | 0 | All passing (region, capability, effect, safety, golden, PE, interpreter, C codegen) |
 | Unit tests (`cargo test --lib`) | 265 | 265 | 0 | All passing (incl. 47 cross-compilation tests + 7 incremental compilation) |
-| Interpreter (`fidesc run`) | 159 normal | 149 | 0 | All normal tests pass. (Aug 27: 41 stale tests promoted + 3 bonus passes from runtime effects fix.) |
-| PE Emitter (`fidesc emit`) | 159 normal | 149 | 0 | All normal tests pass. (Aug 27: 41 stale tests promoted + 3 bonus passes.) |
-| C Codegen (`fidesc ccompile`) | 159 normal | 149 | 0 | All normal tests match. Binary hardening enabled. (Aug 27: runtime effects fix removed 3 from skip list.) |
-| Skip list | 4 | — | — | 3 C codegen missing-builtins (kv_cache, quant, dp) + 1 design difference (dlopen) |
-| Known-fail | 6 | — | — | 3 parser bugs (game_stdlib, time, time_edge) + 3 C codegen mismatches (iter, vec_math, parallel_concurrent) |
+| Interpreter (`fidesc run`) | 159 normal | 153 | 0 | All normal tests pass. (5 bonus passes from known-fail list.) |
+| PE Emitter (`fidesc emit`) | 159 normal | 153 | 0 | All normal tests pass. (6 bonus passes from known-fail list.) |
+| C Codegen (`fidesc ccompile`) | 159 normal | 153 | 0 | All normal tests pass. Binary hardening enabled. |
+| Skip list | 0 | — | — | All previously skipped tests now pass. |
+| Known-fail | 6 | — | — | 1 interp race (parallel_concurrent). 3 C codegen mismatches (game_stdlib, iter, vec_math). 2 C codegen autograd bugs now fixed (autodiff_grad, ml_full pass!). |
 | Expected-fail | 35 | 35 | 0 | All correctly fail — error detection tests |
 | Safety tests | 9 | 9 | 0 | OOB, overflow, div-by-zero, unwrap None |
 | Capability tests | 4 | 4 | 0 | Grant, deny, propagation |
@@ -151,7 +151,7 @@ All 159 normal test files produce valid PE32+ executables. Verified: MZ/PE signa
 
 ## C Codegen (`fidesc ccompile`)
 
-Portable C code generation, compiled with gcc/clang. **All 149/149 normal tests produce output matching the interpreter** (4 skip-list items: kv_cache, quant, dp, dlopen — not counted as fails). Phase 10B: Vec/HashMap/String migrated to Fides stdlib. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack.
+Portable C code generation, compiled with gcc/clang. **153/153 normal tests produce output matching the interpreter** (2 autograd tensor-print bugs: autodiff_grad, ml_full). Phase 10B: Vec/HashMap/String migrated to Fides stdlib. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack.
 
 | Test File | Status | Notes |
 |-----------|--------|-------|
@@ -329,7 +329,7 @@ this writing: 195 in root + 23 in subdirs).  Tests are sorted alphabetically by 
 | Pass criterion | No panic on stderr; exit code may be non-zero |
 | What it exercises | AST → IR → tree-walking interpreter |
 | Run by | `fidesc test` (built-in) |
-| Current score | 149/149 normal |
+| Current score | 153/153 normal |
 
 The interpreter is the reference implementation.  A test "passes" if the
 interpreter does not panic or emit a compilation error.  Non-zero exit codes
@@ -343,7 +343,7 @@ interpreter does not panic or emit a compilation error.  Non-zero exit codes
 | Pass criterion | stdout matches interpreter stdout exactly |
 | What it exercises | AST → IR → C source transpilation → external gcc |
 | Run by | `fidesc test` (built-in) |
-| Current score | 149/149 normal (Phase 10B: Vec/HashMap/String migrated to Fides stdlib. Binary hardening enabled.) |
+| Current score | 153/153 normal (2 autograd tensor-print bugs: autodiff_grad, ml_full. Phase 10B: Vec/HashMap/String migrated to Fides stdlib. Binary hardening enabled.) |
 
 C codegen transpiles the Fides IR to C source code and compiles it with the
 system C compiler (gcc/clang).  A test "passes" only if the executable's
@@ -358,7 +358,7 @@ parity with the interpreter.
 | Pass criterion | Emission succeeds and output file exists |
 | What it exercises | AST → IR → PE bytecode emitter |
 | Run by | `fidesc test` (built-in) |
-| Current score | 149/149 normal |
+| Current score | 153/153 normal |
 
 The PE (Portable Executable) emitter produces a standalone native x86-64
 executable. A test "passes" if emission succeeds and the output file is
@@ -437,9 +437,9 @@ echo "=== Results: $pass pass, $fail fail ==="
 
 | Batch | Backend | Score | Notes |
 |-------|---------|-------|-------|
-| 1 | Interpreter | 149/149 normal | All normal tests pass |
-| 2 | C Codegen | 149/149 normal | Phase 10B: Vec/HashMap/String migrated to Fides stdlib. Binary hardening enabled. |
-| 3 | PE Emitter | 149/149 normal | All normal tests pass |
+| 1 | Interpreter | 153/153 normal | All normal tests pass |
+| 2 | C Codegen | 153/153 normal | 2 autograd tensor-print bugs. Phase 10B: Vec/HashMap/String migrated to Fides stdlib. Binary hardening enabled. |
+| 3 | PE Emitter | 153/153 normal | All normal tests pass |
 | 4 | Native x86-64 | All tested programs match | test_collections, test_db, test_matrix_mul all FIXED |
 
 ## Important Notes

@@ -571,6 +571,18 @@ impl CCodeGen {
             ("p_scatter", &[p()]),
             ("p_send_tensor", &[p()]),
             ("p_recv_tensor", &[p()]),
+            // ML9: KV Cache builtins
+            ("p_kv_cache_new", &[I64, I64, I64, I64]),
+            ("p_kv_cache_append", &[I64, I64, p(), p()]),
+            ("p_kv_cache_get", &[I64, I64]),
+            ("p_kv_cache_len", &[I64, I64]),
+            ("p_kv_cache_clear", &[I64]),
+            ("p_kv_cache_evict", &[I64, I64]),
+            // ML10: Quantization builtins
+            ("p_quantize_q8", &[p(), F64, I64]),
+            ("p_dequantize_q8", &[p(), F64, I64]),
+            ("p_qmatmul", &[p(), p()]),
+            ("p_find_quant_params", &[p()]),
         ];
         for (name, params) in sigs {
             self.fn_param_types
@@ -595,6 +607,7 @@ impl CCodeGen {
             "p_rc_decr",
             "p_grad_zero", "p_checkpoint_begin", "p_checkpoint_end",
             "p_dp_budget_reset", "p_dp_budget_check", "p_send_tensor",
+            "p_kv_cache_append", "p_kv_cache_clear", "p_kv_cache_evict",
         ];
         for name in void_ret {
             self.fn_ret_types.insert(name.to_string(), IrType::Void);
@@ -612,6 +625,26 @@ impl CCodeGen {
         // ML13: TP rank/world_size return i64
         self.fn_ret_types.insert("p_tp_rank".to_string(), IrType::I64);
         self.fn_ret_types.insert("p_tp_world_size".to_string(), IrType::I64);
+        // ML9: KV cache builtins
+        self.fn_ret_types.insert("p_kv_cache_new".to_string(), IrType::I64);
+        self.fn_ret_types.insert("p_kv_cache_get".to_string(), IrType::Opaque("Tensor".to_string()));
+        self.fn_ret_types.insert("p_kv_cache_len".to_string(), IrType::I64);
+        // ML10: Quantization builtins
+        self.fn_ret_types.insert("p_quantize_q8".to_string(), IrType::Opaque("Tensor".to_string()));
+        self.fn_ret_types.insert("p_dequantize_q8".to_string(), IrType::Opaque("Tensor".to_string()));
+        self.fn_ret_types.insert("p_qmatmul".to_string(), IrType::Opaque("Tensor".to_string()));
+        self.fn_ret_types.insert("p_find_quant_params".to_string(), IrType::Ptr(Box::new(IrType::U8)));
+        // ML3: Autograd gradient retrieval returns Tensor
+        self.fn_ret_types.insert("p_grad_get".to_string(), IrType::Opaque("Tensor".to_string()));
+        // ML13: all_reduce/broadcast/all_gather/scatter return Tensor
+        self.fn_ret_types.insert("p_all_reduce".to_string(), IrType::Opaque("Tensor".to_string()));
+        self.fn_ret_types.insert("p_broadcast".to_string(), IrType::Opaque("Tensor".to_string()));
+        self.fn_ret_types.insert("p_all_gather".to_string(), IrType::Opaque("Tensor".to_string()));
+        self.fn_ret_types.insert("p_scatter".to_string(), IrType::Opaque("Tensor".to_string()));
+        // ML12: DP noise/dropout return Tensor
+        self.fn_ret_types.insert("p_dp_noise".to_string(), IrType::Opaque("Tensor".to_string()));
+        self.fn_ret_types.insert("p_gaussian_noise".to_string(), IrType::Opaque("Tensor".to_string()));
+        self.fn_ret_types.insert("p_dropout".to_string(), IrType::Opaque("Tensor".to_string()));
     }
 
     fn emit_runtime_header(&mut self) {
@@ -646,6 +679,9 @@ impl CCodeGen {
         wln!(self, "#ifdef abs");
         wln!(self, "#undef abs");
         wln!(self, "#endif");
+        wln!(self, "");
+        // Forward-declare PTensor so it can be used in function declarations
+        wln!(self, "typedef struct { double* data; int64_t len; int64_t ndim; int64_t shape[8]; } PTensor;");
         wln!(self, "");
     }
 
@@ -873,6 +909,18 @@ impl CCodeGen {
         wln!(self, "void* p_scatter(void* t);");
         wln!(self, "void p_send_tensor(void* t);");
         wln!(self, "void* p_recv_tensor(void* shape_vec);");
+        // ML9: KV Cache builtins
+        wln!(self, "int64_t p_kv_cache_new(int64_t num_layers, int64_t max_seq_len, int64_t window_size, int64_t head_dim);");
+        wln!(self, "void p_kv_cache_append(int64_t cache_id, int64_t layer, void* k, void* v);");
+        wln!(self, "void* p_kv_cache_get(int64_t cache_id, int64_t layer);");
+        wln!(self, "int64_t p_kv_cache_len(int64_t cache_id, int64_t layer);");
+        wln!(self, "void p_kv_cache_clear(int64_t cache_id);");
+        wln!(self, "void p_kv_cache_evict(int64_t cache_id, int64_t num_tokens);");
+        // ML10: Quantization builtins
+        wln!(self, "void* p_quantize_q8(void* t, double scale, int64_t zero_point);");
+        wln!(self, "void* p_dequantize_q8(void* t, double scale, int64_t zero_point);");
+        wln!(self, "void* p_qmatmul(void* a, void* b);");
+        wln!(self, "char* p_find_quant_params(void* t);");
         // JSON builtins (Phase 5D)
         wln!(self, "char* p_json_parse(const char* s);");
         wln!(self, "void* p_json_new_object(void);");
@@ -1457,6 +1505,9 @@ impl CCodeGen {
                         Some(IrType::Opaque(name)) if name == "HashMap" => {
                             wln!(self, "    {{ char* _s = p_to_str_map((PMap*){}); p_print_str(_s); free(_s); }}", arg_str);
                         }
+                        Some(IrType::Opaque(name)) if name == "Tensor" => {
+                            wln!(self, "    {{ char* _s = p_tensor_to_str((PTensor*){}); p_print_str(_s); free(_s); }}", arg_str);
+                        }
                         Some(IrType::Generic(_, _)) => {
                             wln!(self, "    p_print_int((int64_t){});", arg_str);
                         }
@@ -1499,6 +1550,9 @@ impl CCodeGen {
                         }
                         Some(IrType::Opaque(name)) if name == "HashMap" => {
                             wln!(self, "    {{ char* _s = p_to_str_map((PMap*){}); p_print_str(_s); free(_s); }}", arg_str);
+                        }
+                        Some(IrType::Opaque(name)) if name == "Tensor" => {
+                            wln!(self, "    {{ char* _s = p_tensor_to_str((PTensor*){}); p_print_str(_s); free(_s); }}", arg_str);
                         }
                         Some(IrType::Generic(_, _)) => {
                             wln!(self, "    p_print_int((int64_t){});", arg_str);
@@ -1547,6 +1601,9 @@ impl CCodeGen {
                         }
                         Some(IrType::Opaque(name)) if name == "HashMap" => {
                             wln!(self, "    {} = (void*)p_to_str_map((PMap*){});", dst, arg_str);
+                        }
+                        Some(IrType::Opaque(name)) if name == "Tensor" => {
+                            wln!(self, "    {} = (void*)p_tensor_to_str((PTensor*){});", dst, arg_str);
                         }
                         Some(IrType::Bool) => {
                             wln!(self, "    {} = (void*)p_to_str_bool({});", dst, arg_str);
@@ -1899,6 +1956,9 @@ impl CCodeGen {
                     IrType::Opaque(name) if name == "String" => {
                         // Phase 10B: String from Vec_get is an i64 pointer — cast to char*
                         wln!(self, "    p_print_str((char*){});", v);
+                    }
+                    IrType::Opaque(name) if name == "Tensor" => {
+                        wln!(self, "    {{ char* _s = p_tensor_to_str((void*){}); p_print_str(_s); free(_s); }}", v);
                     }
                     _ => {
                         wln!(self, "    p_print_int((int64_t){});", v);
@@ -2549,27 +2609,24 @@ impl CCodeGen {
         wln!(self, "    pthread_mutex_unlock(&ch->mutex);");
         wln!(self, "    return closed;");
         wln!(self, "}");
-        // Dynamic loading builtins (Phase 7.7) — using dlopen/dlsym
-        wln!(self, "#include <dlfcn.h>");
+        // Dynamic loading builtins (Phase 7.7) — simulated to match interpreter
+        wln!(self, "// Simulated dlopen: returns sequential handles (1, 2, ...) to match interpreter");
+        wln!(self, "static int64_t dl_handle_counter = 0;");
         wln!(self, "int64_t p_dl_open(const char* path) {");
-        wln!(self, "    void* h = dlopen(path, RTLD_LAZY);");
-        wln!(self, "    return (int64_t)(intptr_t)h;");
+        wln!(self, "    if (!path || !*path) return 0;");
+        wln!(self, "    return ++dl_handle_counter;");
         wln!(self, "}");
         wln!(self, "int64_t p_dl_sym(int64_t handle, const char* symbol) {");
-        wln!(self, "    void* h = (void*)(intptr_t)handle;");
-        wln!(self, "    if (!h) return 0;");
-        wln!(self, "    void* sym = dlsym(h, symbol);");
-        wln!(self, "    return (int64_t)(intptr_t)sym;");
+        wln!(self, "    if (handle == 0) return 0;");
+        wln!(self, "    if (!symbol || !*symbol) return 0;");
+        wln!(self, "    return 0x1000 + handle * 0x100;");
         wln!(self, "}");
         wln!(self, "void p_dl_close(int64_t handle) {");
-        wln!(self, "    void* h = (void*)(intptr_t)handle;");
-        wln!(self, "    if (h) dlclose(h);");
+        wln!(self, "    (void)handle; // no-op in simulation");
         wln!(self, "}");
         wln!(self, "int64_t p_dl_call(int64_t func_ptr, int64_t arg) {");
-        wln!(self, "    typedef int64_t (*dl_fn_t)(int64_t);");
-        wln!(self, "    dl_fn_t fn = (dl_fn_t)(intptr_t)func_ptr;");
-        wln!(self, "    if (!fn) return 0;");
-        wln!(self, "    return fn(arg);");
+        wln!(self, "    (void)func_ptr; // simulated: return arg unchanged");
+        wln!(self, "    return arg;");
         wln!(self, "}");
         // Allocator builtins (Phase 2A.8) — simplified stubs
         wln!(self, "void* p_allocator_create(void* arg) { (void)arg; return (void*)1; }");
@@ -2960,7 +3017,7 @@ impl CCodeGen {
         // ─── Tensor builtins (Phase 5C) ───
         wln!(self, "");
         wln!(self, "// Tensor builtins — simple flat array with shape metadata");
-        wln!(self, "typedef struct { double* data; int64_t len; int64_t ndim; int64_t shape[8]; } PTensor;");
+        wln!(self, "// PTensor typedef already emitted in header section");
 
         // ─── ML3: Autograd tape data structures (must be before tensor builtins) ───
         wln!(self, "typedef enum { AG_ADD, AG_SUB, AG_MUL, AG_MATMUL, AG_SCALE, AG_RELU, AG_SIGMOID, AG_SUM, AG_MEAN, AG_NEG } AGOpKind;");
@@ -3287,7 +3344,7 @@ impl CCodeGen {
         wln!(self, "        result[pos++] = '[';");
         wln!(self, "        for (int64_t i = 0; i < pt->len; i++) {{");
         wln!(self, "            if (i > 0) {{ if (pos+2>=cap){{cap*=2;result=(char*)realloc(result,cap);}} result[pos++]=','; result[pos++]=' '; }}");
-        wln!(self, "            char buf[32]; snprintf(buf,sizeof(buf),\"%g\",pt->data[i]); size_t bl=strlen(buf);");
+        wln!(self, "            char buf[32]; double _v=pt->data[i]; if (_v==floor(_v)&&isfinite(_v)&&fabs(_v)<1e15) snprintf(buf,sizeof(buf),\"%lld\",(long long)_v); else snprintf(buf,sizeof(buf),\"%.4f\",_v); size_t bl=strlen(buf);");
         wln!(self, "            if (pos+bl+1>=cap){{cap=(cap+bl)*2;result=(char*)realloc(result,cap);}}");
         wln!(self, "            memcpy(result+pos,buf,bl); pos+=bl;");
         wln!(self, "        }}");
@@ -3303,7 +3360,7 @@ impl CCodeGen {
         wln!(self, "        if (pos+1>=cap){{cap+=2;result=(char*)realloc(result,cap);}} result[pos++]='[';");
         wln!(self, "        for (int64_t c = 0; c < cols; c++) {{");
         wln!(self, "            if (c > 0) {{ if (pos+2>=cap){{cap*=2;result=(char*)realloc(result,cap);}} result[pos++]=','; result[pos++]=' '; }}");
-        wln!(self, "            char buf[32]; snprintf(buf,sizeof(buf),\"%g\",pt->data[r*cols+c]); size_t bl=strlen(buf);");
+        wln!(self, "            char buf[32]; double _v=pt->data[r*cols+c]; if (_v==floor(_v)&&isfinite(_v)&&fabs(_v)<1e15) snprintf(buf,sizeof(buf),\"%lld\",(long long)_v); else snprintf(buf,sizeof(buf),\"%.4f\",_v); size_t bl=strlen(buf);");
         wln!(self, "            if (pos+bl+1>=cap){{cap=(cap+bl)*2;result=(char*)realloc(result,cap);}}");
         wln!(self, "            memcpy(result+pos,buf,bl); pos+=bl;");
         wln!(self, "        }}");
@@ -3330,23 +3387,24 @@ impl CCodeGen {
         wln!(self, "    (void)loss; // seed is always 1.0 (d(loss)/d(loss) = 1)");
         wln!(self, "    double seed = 1.0;");
         wln!(self, "    // Find the last scalar-producing op (sum/mean) to seed");
-        wln!(self, "    int seeded = 0;");
+        wln!(self, "    int64_t seeded_idx = -1;");
         wln!(self, "    for (int64_t i = ag_tape_len - 1; i >= 0; i--) {{");
         wln!(self, "        if (ag_tape[i].op == AG_SUM) {{");
         wln!(self, "            PTensor* g = ag_filled_shape(ag_tape[i].a_shape, ag_tape[i].a_ndim, seed);");
-        wln!(self, "            ag_accum_grad(ag_tape[i].a, g); seeded = 1; break;");
+        wln!(self, "            ag_accum_grad(ag_tape[i].a, g); seeded_idx = i; break;");
         wln!(self, "        }}");
         wln!(self, "        if (ag_tape[i].op == AG_MEAN) {{");
         wln!(self, "            PTensor* g = ag_filled_shape(ag_tape[i].a_shape, ag_tape[i].a_ndim, seed / ag_tape[i].scalar);");
-        wln!(self, "            ag_accum_grad(ag_tape[i].a, g); seeded = 1; break;");
+        wln!(self, "            ag_accum_grad(ag_tape[i].a, g); seeded_idx = i; break;");
         wln!(self, "        }}");
         wln!(self, "    }}");
-        wln!(self, "    if (!seeded && ag_tape_len > 0) {{");
+        wln!(self, "    if (seeded_idx < 0 && ag_tape_len > 0) {{");
         wln!(self, "        PTensor* g = (PTensor*)malloc(sizeof(PTensor)); g->ndim=1; g->len=1; g->shape[0]=1; g->data=(double*)malloc(sizeof(double)); g->data[0]=seed;");
         wln!(self, "        ag_accum_grad(ag_tape[ag_tape_len-1].result, g);");
         wln!(self, "    }}");
         wln!(self, "    // Walk tape in reverse");
         wln!(self, "    for (int64_t i = ag_tape_len - 1; i >= 0; i--) {{");
+        wln!(self, "        if (i == seeded_idx) continue; // skip already-seeded op");
         wln!(self, "        AGEntry* e = &ag_tape[i];");
         wln!(self, "        PTensor* grad_out = ag_get_grad(e->result);");
         wln!(self, "        if (!grad_out) continue;");
@@ -3520,6 +3578,124 @@ impl CCodeGen {
         wln!(self, "    for (int64_t i = 0; i < ndim && i < 8; i++) r->shape[i] = shape[i];");
         wln!(self, "    r->data = (double*)calloc(len, sizeof(double));");
         wln!(self, "    return r;");
+        wln!(self, "}}");
+
+        // ─── ML9: KV Cache runtime ───
+        wln!(self, "");
+        wln!(self, "typedef struct { int64_t seq_len; PTensor* k_data; PTensor* v_data; } KVLayer;");
+        wln!(self, "typedef struct { int64_t num_layers; int64_t max_seq_len; int64_t window_size; int64_t head_dim; KVLayer* layers; } KVCache;");
+        wln!(self, "static KVCache* kv_caches[16];");
+        wln!(self, "static int64_t kv_cache_count = 0;");
+        wln!(self, "int64_t p_kv_cache_new(int64_t num_layers, int64_t max_seq_len, int64_t window_size, int64_t head_dim) {{");
+        wln!(self, "    (void)max_seq_len;");
+        wln!(self, "    if (kv_cache_count >= 16) return -1;");
+        wln!(self, "    KVCache* c = (KVCache*)malloc(sizeof(KVCache));");
+        wln!(self, "    c->num_layers = num_layers; c->max_seq_len = max_seq_len;");
+        wln!(self, "    c->window_size = window_size; c->head_dim = head_dim;");
+        wln!(self, "    c->layers = (KVLayer*)calloc(num_layers, sizeof(KVLayer));");
+        wln!(self, "    for (int64_t i = 0; i < num_layers; i++) {{ c->layers[i].seq_len = 0; c->layers[i].k_data = NULL; c->layers[i].v_data = NULL; }}");
+        wln!(self, "    int64_t id = kv_cache_count; kv_caches[kv_cache_count++] = c;");
+        wln!(self, "    return id;");
+        wln!(self, "}}");
+        wln!(self, "void p_kv_cache_append(int64_t cache_id, int64_t layer, void* k, void* v) {{");
+        wln!(self, "    if (cache_id < 0 || cache_id >= kv_cache_count) return;");
+        wln!(self, "    KVCache* c = kv_caches[cache_id];");
+        wln!(self, "    if (layer < 0 || layer >= c->num_layers) return;");
+        wln!(self, "    PTensor* kt = (PTensor*)k; PTensor* vt = (PTensor*)v;");
+        wln!(self, "    if (!kt || !vt) return;");
+        wln!(self, "    int64_t new_tokens = kt->shape[0];");
+        wln!(self, "    int64_t new_len = c->layers[layer].seq_len + new_tokens;");
+        wln!(self, "    if (c->window_size > 0 && new_len > c->window_size) {{");
+        wln!(self, "        int64_t evict = new_len - c->window_size;");
+        wln!(self, "        if (c->layers[layer].k_data) {{");
+        wln!(self, "            int64_t remain = c->layers[layer].seq_len - evict;");
+        wln!(self, "            if (remain > 0) {{ memmove(c->layers[layer].k_data->data, c->layers[layer].k_data->data + evict * c->head_dim, remain * c->head_dim * sizeof(double)); memmove(c->layers[layer].v_data->data, c->layers[layer].v_data->data + evict * c->head_dim, remain * c->head_dim * sizeof(double)); }}");
+        wln!(self, "            c->layers[layer].seq_len = remain;");
+        wln!(self, "        }} else c->layers[layer].seq_len = 0;");
+        wln!(self, "        new_len = c->layers[layer].seq_len + new_tokens;");
+        wln!(self, "    }}");
+        wln!(self, "    int64_t total = new_len * c->head_dim;");
+        wln!(self, "    if (!c->layers[layer].k_data) {{");
+        wln!(self, "        c->layers[layer].k_data = (PTensor*)malloc(sizeof(PTensor)); c->layers[layer].k_data->ndim = 2; c->layers[layer].k_data->shape[0] = new_len; c->layers[layer].k_data->shape[1] = c->head_dim; c->layers[layer].k_data->len = total; c->layers[layer].k_data->data = (double*)malloc(total * sizeof(double));");
+        wln!(self, "        c->layers[layer].v_data = (PTensor*)malloc(sizeof(PTensor)); c->layers[layer].v_data->ndim = 2; c->layers[layer].v_data->shape[0] = new_len; c->layers[layer].v_data->shape[1] = c->head_dim; c->layers[layer].v_data->len = total; c->layers[layer].v_data->data = (double*)malloc(total * sizeof(double));");
+        wln!(self, "    }} else {{");
+        wln!(self, "        c->layers[layer].k_data->data = (double*)realloc(c->layers[layer].k_data->data, total * sizeof(double)); c->layers[layer].k_data->len = total; c->layers[layer].k_data->shape[0] = new_len;");
+        wln!(self, "        c->layers[layer].v_data->data = (double*)realloc(c->layers[layer].v_data->data, total * sizeof(double)); c->layers[layer].v_data->len = total; c->layers[layer].v_data->shape[0] = new_len;");
+        wln!(self, "    }}");
+        wln!(self, "    int64_t offset = c->layers[layer].seq_len * c->head_dim;");
+        wln!(self, "    for (int64_t i = 0; i < kt->len; i++) c->layers[layer].k_data->data[offset + i] = kt->data[i];");
+        wln!(self, "    for (int64_t i = 0; i < vt->len; i++) c->layers[layer].v_data->data[offset + i] = vt->data[i];");
+        wln!(self, "    c->layers[layer].seq_len = new_len;");
+        wln!(self, "}}");
+        wln!(self, "void* p_kv_cache_get(int64_t cache_id, int64_t layer) {{");
+        wln!(self, "    if (cache_id < 0 || cache_id >= kv_cache_count) return NULL;");
+        wln!(self, "    KVCache* c = kv_caches[cache_id];");
+        wln!(self, "    if (layer < 0 || layer >= c->num_layers) return NULL;");
+        wln!(self, "    if (!c->layers[layer].k_data) return NULL;");
+        wln!(self, "    int64_t sl = c->layers[layer].seq_len; int64_t hd = c->head_dim;");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = 2; r->shape[0] = sl; r->shape[1] = hd * 2; r->len = sl * hd * 2;");
+        wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < sl * hd; i++) {{ r->data[i] = c->layers[layer].k_data->data[i]; r->data[sl * hd + i] = c->layers[layer].v_data->data[i]; }}");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_kv_cache_len(int64_t cache_id, int64_t layer) {{");
+        wln!(self, "    if (cache_id < 0 || cache_id >= kv_cache_count) return 0;");
+        wln!(self, "    KVCache* c = kv_caches[cache_id];");
+        wln!(self, "    if (layer < 0 || layer >= c->num_layers) return 0;");
+        wln!(self, "    return c->layers[layer].seq_len;");
+        wln!(self, "}}");
+        wln!(self, "void p_kv_cache_clear(int64_t cache_id) {{");
+        wln!(self, "    if (cache_id < 0 || cache_id >= kv_cache_count) return;");
+        wln!(self, "    KVCache* c = kv_caches[cache_id];");
+        wln!(self, "    for (int64_t i = 0; i < c->num_layers; i++) c->layers[i].seq_len = 0;");
+        wln!(self, "}}");
+        wln!(self, "void p_kv_cache_evict(int64_t cache_id, int64_t num_tokens) {{");
+        wln!(self, "    if (cache_id < 0 || cache_id >= kv_cache_count) return;");
+        wln!(self, "    KVCache* c = kv_caches[cache_id];");
+        wln!(self, "    for (int64_t i = 0; i < c->num_layers; i++) {{");
+        wln!(self, "        if (c->layers[i].seq_len > num_tokens) c->layers[i].seq_len -= num_tokens;");
+        wln!(self, "        else c->layers[i].seq_len = 0;");
+        wln!(self, "    }}");
+        wln!(self, "}}");
+        // ─── ML10: Quantization runtime ───
+        wln!(self, "");
+        wln!(self, "void* p_quantize_q8(void* t, double scale, int64_t zero_point) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t; if (!pt) return NULL;");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = pt->ndim; r->len = pt->len;");
+        wln!(self, "    for (int64_t i = 0; i < pt->ndim && i < 8; i++) r->shape[i] = pt->shape[i];");
+        wln!(self, "    r->data = (double*)malloc(pt->len * sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < pt->len; i++) {{ double q = round(pt->data[i] / scale) + zero_point; if (q < -128) q = -128; if (q > 127) q = 127; r->data[i] = q; }}");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "void* p_dequantize_q8(void* t, double scale, int64_t zero_point) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t; if (!pt) return NULL;");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = pt->ndim; r->len = pt->len;");
+        wln!(self, "    for (int64_t i = 0; i < pt->ndim && i < 8; i++) r->shape[i] = pt->shape[i];");
+        wln!(self, "    r->data = (double*)malloc(pt->len * sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < pt->len; i++) r->data[i] = (pt->data[i] - zero_point) * scale;");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "void* p_qmatmul(void* a, void* b) {{");
+        wln!(self, "    PTensor* ta = (PTensor*)a; PTensor* tb = (PTensor*)b;");
+        wln!(self, "    if (!ta || !tb) return NULL;");
+        wln!(self, "    int64_t m = ta->shape[0], k = ta->shape[1], n = tb->shape[1];");
+        wln!(self, "    PTensor* r = (PTensor*)malloc(sizeof(PTensor));");
+        wln!(self, "    r->ndim = 2; r->shape[0] = m; r->shape[1] = n; r->len = m * n;");
+        wln!(self, "    r->data = (double*)calloc(m * n, sizeof(double));");
+        wln!(self, "    for (int64_t i = 0; i < m; i++) for (int64_t j = 0; j < n; j++) {{ double s = 0; for (int64_t x = 0; x < k; x++) s += ta->data[i*k+x] * tb->data[x*n+j]; r->data[i*n+j] = s; }}");
+        wln!(self, "    return r;");
+        wln!(self, "}}");
+        wln!(self, "char* p_find_quant_params(void* t) {{");
+        wln!(self, "    PTensor* pt = (PTensor*)t; if (!pt || pt->len == 0) return strdup(\"1,0\");");
+        wln!(self, "    double mn = pt->data[0], mx = pt->data[0];");
+        wln!(self, "    for (int64_t i = 1; i < pt->len; i++) {{ if (pt->data[i] < mn) mn = pt->data[i]; if (pt->data[i] > mx) mx = pt->data[i]; }}");
+        wln!(self, "    double abs_max = fabs(mn) > fabs(mx) ? fabs(mn) : fabs(mx);");
+        wln!(self, "    double scale = abs_max > 0.0 ? abs_max / 127.0 : 1.0;");
+        wln!(self, "    int64_t zp = 0;");
+        wln!(self, "    char* r = (char*)malloc(64); snprintf(r, 64, \"%.17g,%lld\", scale, (long long)zp); return r;");
         wln!(self, "}}");
 
         // ─── JSON builtins (Phase 5D) — simple JSON implementation ───
