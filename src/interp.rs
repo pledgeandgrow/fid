@@ -1099,6 +1099,23 @@ impl Interpreter {
             Inst::BinOp { op, left, right, .. } => {
                 let l = values.get(left).cloned().unwrap_or(Value::Void);
                 let r = values.get(right).cloned().unwrap_or(Value::Void);
+                // String comparison: when both operands are Ptr(U8) (str type),
+                // compare content rather than pointer addresses.
+                let left_ty = func.values.get(left).map(|m| &m.ty);
+                let right_ty = func.values.get(right).map(|m| &m.ty);
+                let is_str_cmp = matches!(left_ty, Some(IrType::Ptr(inner)) if matches!(inner.as_ref(), IrType::U8))
+                    && matches!(right_ty, Some(IrType::Ptr(inner)) if matches!(inner.as_ref(), IrType::U8));
+                if is_str_cmp && matches!(op, BinOp::Eq | BinOp::Neq) {
+                    let l_str = self.value_to_string(&l);
+                    let r_str = self.value_to_string(&r);
+                    let eq = l_str == r_str;
+                    let result = match op {
+                        BinOp::Eq => Value::Bool(eq),
+                        BinOp::Neq => Value::Bool(!eq),
+                        _ => unreachable!(),
+                    };
+                    return ExecOutcome::Value(result);
+                }
                 let result = self.eval_binop(op, &l, &r);
                 // F64: checked arithmetic lock — overflow/div-by-zero ALWAYS panics
                 // (not just in debug mode). @wrapping functions never hit this
@@ -1332,8 +1349,11 @@ impl Interpreter {
             }
 
             Inst::GetFieldPtr { struct_ptr, field_index, field_ty, .. } => {
+                // Value::Int is also a valid pointer (e.g., Vec_get returns i64
+                // but the IR type is Ptr(Struct(...))). Treat Int as Ptr.
                 let base = match values.get(struct_ptr) {
                     Some(Value::Ptr(a)) => *a,
+                    Some(Value::Int(n)) => *n as u64,
                     _ => 0,
                 };
                 // Look up real field offset from struct layout
@@ -1442,7 +1462,6 @@ impl Interpreter {
 
                 // Check if it's a user function
                 if let Some(callee) = self.module.functions.get(name).cloned() {
-                    // Run the callee
                     return match self.run_function(&callee, &arg_vals) {
                         RunResult::Return(v) => ExecOutcome::Value(v),
                         RunResult::Panic(msg) => ExecOutcome::Panic(msg),
@@ -4541,86 +4560,45 @@ impl Interpreter {
             // ─── Phase 8A: Real OS threads ───
             "p_thread_spawn" => {
                 // p_thread_spawn(func_name: *u8, num_args: i64, args...) -> i64
-                // Spawns an OS thread that runs the named function with the given args.
-                // Returns a Future handle. Use p_future_poll to join.
-                // Note: Only primitive values (i64, f64, bool, str) can be passed
-                // to threads. Complex types (Vec, Map, etc.) are converted to i64(0).
+                // In the interpreter, spawn runs eagerly (sequentially) to preserve
+                // Vec/Map side-table access. C codegen uses real OS threads with
+                // shared memory. Returns a Future handle. Use p_future_poll to join.
                 let func_name = self.value_to_string(args.first().unwrap_or(&Value::Int(0)));
                 let num_args = match args.get(1) {
                     Some(Value::Int(n)) => *n as usize,
                     _ => 0,
                 };
-                // Convert args to Send-safe primitives (i64 only — threads get raw values)
-                let thread_args: Vec<i64> = if args.len() >= 2 + num_args {
-                    args[2..2 + num_args].iter().map(|v| match v {
-                        Value::Int(n) => *n,
-                        Value::Bool(b) => *b as i64,
-                        Value::Float(f) => f.to_bits() as i64,
-                        Value::Ptr(p) => *p as i64,
-                        _ => 0,
-                    }).collect()
+                // Collect the actual argument Values (preserving Vec/Map pointers)
+                let thread_args: Vec<Value> = if args.len() >= 2 + num_args {
+                    args[2..2 + num_args].to_vec()
                 } else {
-                    args[2..].iter().map(|v| match v {
-                        Value::Int(n) => *n,
-                        Value::Bool(b) => *b as i64,
-                        Value::Float(f) => f.to_bits() as i64,
-                        Value::Ptr(p) => *p as i64,
-                        _ => 0,
-                    }).collect()
+                    args[2..].to_vec()
                 };
 
-                // Clone the module (function table) for the thread
-                let module = self.module.clone();
-                // Clone shared state for the thread
-                let shared_memory = self.shared_memory.clone();
-                let mutexes = self.mutexes.clone();
-                let channels = self.channels.clone();
+                // Prepend a dummy env value (user functions have __env as first param)
+                let mut thread_values: Vec<Value> = vec![Value::Int(0)];
+                thread_values.extend(thread_args);
 
-                // Allocate a Future slot (Pending)
+                // Allocate a Future slot
                 let future_idx = self.futures.len();
-                self.futures.push(FutureState::Pending(None));
 
-                let handle = std::thread::spawn(move || {
-                    let mut interp = Interpreter::new(module);
-                    // Share the same shared_memory, mutexes, and channels
-                    interp.shared_memory = shared_memory;
-                    interp.mutexes = mutexes;
-                    interp.channels = channels;
-
-                    // Convert i64 args back to Values
-                    // Prepend a dummy env value (user functions have __env as first param)
-                    let mut thread_values: Vec<Value> = vec![Value::Int(0)];
-                    for n in &thread_args {
-                        thread_values.push(Value::Int(*n));
-                    }
-
-                    // Look up and run the function
-                    let result = if let Some(func) = interp.module.functions.get(&func_name).cloned()
-                    {
-                        match interp.run_function(&func, &thread_values) {
-                            RunResult::Return(v) => v,
-                            RunResult::Panic(msg) => {
-                                eprintln!("Thread panic: {}", msg);
-                                Value::Int(0)
-                            }
-                            RunResult::Paused => Value::Int(0),
+                // Run eagerly in the current interpreter (preserves Vec side-table access)
+                let result = if let Some(func) = self.module.functions.get(&func_name).cloned() {
+                    match self.run_function(&func, &thread_values) {
+                        RunResult::Return(v) => v,
+                        RunResult::Panic(msg) => {
+                            eprintln!("Thread panic: {}", msg);
+                            Value::Int(0)
                         }
-                    } else {
-                        eprintln!("Thread: unknown function '{}'", func_name);
-                        Value::Int(0)
-                    };
-                    // Convert result to Send-safe i64 (threads communicate via i64)
-                    match result {
-                        Value::Int(n) => n,
-                        Value::Bool(b) => b as i64,
-                        Value::Float(f) => f.to_bits() as i64,
-                        Value::Ptr(p) => p as i64,
-                        _ => 0,
+                        RunResult::Paused => Value::Int(0),
                     }
-                });
+                } else {
+                    eprintln!("Thread: unknown function '{}'", func_name);
+                    Value::Int(0)
+                };
 
-                // Store the JoinHandle in the Pending slot
-                self.futures[future_idx] = FutureState::Pending(Some(handle));
+                // Store result as Ready (eager execution — no JoinHandle needed)
+                self.futures.push(FutureState::Ready(result));
                 ExecOutcome::Value(Value::Future(future_idx))
             }
 
@@ -4634,8 +4612,8 @@ impl Interpreter {
             "p_executor_spawn" => {
                 // p_executor_spawn(exec: i64, func_name: *u8, num_args: i64, args...)
                 //   -> i64 (future handle)
-                // Spawns an OS thread (same as p_thread_spawn) but registers the
-                // future with the given executor.
+                // In the interpreter, spawn runs eagerly (sequentially) to preserve
+                // Vec/Map side-table access. C codegen uses real OS threads.
                 let exec_idx = match args.first() {
                     Some(Value::Int(n)) => *n as usize,
                     _ => 0,
@@ -4645,65 +4623,29 @@ impl Interpreter {
                     Some(Value::Int(n)) => *n as usize,
                     _ => 0,
                 };
-                let thread_args: Vec<i64> = if args.len() >= 3 + num_args {
-                    args[3..3 + num_args].iter().map(|v| match v {
-                        Value::Int(n) => *n,
-                        Value::Bool(b) => *b as i64,
-                        Value::Float(f) => f.to_bits() as i64,
-                        Value::Ptr(p) => *p as i64,
-                        _ => 0,
-                    }).collect()
+                let thread_args: Vec<Value> = if args.len() >= 3 + num_args {
+                    args[3..3 + num_args].to_vec()
                 } else {
-                    args[3..].iter().map(|v| match v {
-                        Value::Int(n) => *n,
-                        Value::Bool(b) => *b as i64,
-                        Value::Float(f) => f.to_bits() as i64,
-                        Value::Ptr(p) => *p as i64,
-                        _ => 0,
-                    }).collect()
+                    args[3..].to_vec()
                 };
-                let module = self.module.clone();
-                let shared_memory = self.shared_memory.clone();
-                let mutexes = self.mutexes.clone();
-                let channels = self.channels.clone();
-                let task_done = self.task_done.clone();
                 let future_idx = self.futures.len();
-                self.futures.push(FutureState::Pending(None));
-                self.task_done.lock().unwrap().insert(future_idx, false);
-                let handle = std::thread::spawn(move || {
-                    let mut interp = Interpreter::new(module);
-                    interp.shared_memory = shared_memory;
-                    interp.mutexes = mutexes;
-                    interp.channels = channels;
-                    let mut thread_values: Vec<Value> = vec![Value::Int(0)];
-                    for n in &thread_args {
-                        thread_values.push(Value::Int(*n));
-                    }
-                    let result = if let Some(func) = interp.module.functions.get(&func_name).cloned() {
-                        match interp.run_function(&func, &thread_values) {
-                            RunResult::Return(v) => v,
-                            RunResult::Panic(msg) => {
-                                eprintln!("Thread panic: {}", msg);
-                                Value::Int(0)
-                            }
-                            RunResult::Paused => Value::Int(0),
+                let mut thread_values: Vec<Value> = vec![Value::Int(0)];
+                thread_values.extend(thread_args);
+                let result = if let Some(func) = self.module.functions.get(&func_name).cloned() {
+                    match self.run_function(&func, &thread_values) {
+                        RunResult::Return(v) => v,
+                        RunResult::Panic(msg) => {
+                            eprintln!("Thread panic: {}", msg);
+                            Value::Int(0)
                         }
-                    } else {
-                        eprintln!("Executor: unknown function '{}'", func_name);
-                        Value::Int(0)
-                    };
-                    // Mark task as done
-                    task_done.lock().unwrap().insert(future_idx, true);
-                    match result {
-                        Value::Int(n) => n,
-                        Value::Bool(b) => b as i64,
-                        Value::Float(f) => f.to_bits() as i64,
-                        Value::Ptr(p) => p as i64,
-                        _ => 0,
+                        RunResult::Paused => Value::Int(0),
                     }
-                });
-                self.futures[future_idx] = FutureState::Pending(Some(handle));
-                // Register with executor
+                } else {
+                    eprintln!("Executor: unknown function '{}'", func_name);
+                    Value::Int(0)
+                };
+                self.futures.push(FutureState::Ready(result));
+                self.task_done.lock().unwrap().insert(future_idx, true);
                 if exec_idx < self.executors.len() {
                     self.executors[exec_idx].push(future_idx);
                 }

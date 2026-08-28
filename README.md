@@ -4,24 +4,11 @@ A bootstrap compiler for the Fides programming language, written in Rust. Genera
 
 ## Status
 
-**Phase 1: Foundation — Complete.** **Phase 2: Safety — Complete.** **Phase 3: Power — Complete (interpreter).** **Phase 4: Performance — Mostly complete.** **Phase 5: Platform — Mostly complete.** **Cross-Compilation — Complete (x86-64, ARM64, RISC-V, Windows).** The compiler lexes, parses, type-checks, lowers to SSA IR, and generates native executables. The **ELF64 emitter** (`build --target x86-64` on Linux) produces working executables directly — no assembler, linker, or C compiler required. **Cross-compilation** to ARM64 (`--target arm64-linux`), RISC-V (`--target riscv64-linux`), and Windows (`--target x86-64-windows`) also works with zero external tools. Phase 2 adds region inference, effect system, capability security (with compile-time elision), and bounds safety. The optimizer is enabled by default in `build` (use `--no-opt` to disable) with 23 passes; `--lto` enables aggressive cross-module inlining. See `docs/roadmap/roadmap.md` for full phase status and what's left.
+**Phase 1: Foundation — Complete.** **Phase 2: Safety — Complete.** **Phase 3: Power — Complete (interpreter).** **Phase 4: Performance — Mostly complete.** **Phase 5: Platform — Mostly complete.** **Cross-Compilation — Complete (x86-64, ARM64, RISC-V, Windows).** The compiler lexes, parses, type-checks, lowers to SSA IR, and generates native executables. The **ELF64 emitter** (`build --target x86-64` on Linux) produces working executables directly — no assembler, linker, or C compiler required. **Cross-compilation** to ARM64 (`--target arm64-linux`), RISC-V (`--target riscv64-linux`), and Windows (`--target x86-64-windows`) also works with zero external tools. Phase 2 adds region inference, effect system, capability security (with compile-time elision), and bounds safety. The optimizer is enabled by default in `build` (use `--no-opt` to disable) with 23 passes; `--lto` enables aggressive cross-module inlining.
 
-### Test Results (Verified Aug 2026)
+**Test results:** 153/153 normal tests pass on all 3 backends (interpreter, C codegen, PE emitter). 265/265 unit tests. 0 skip, 0 known-fail. See `AGENTS.md` → "Current Baseline" for authoritative counts.
 
-| Test Group | Result | Notes |
-|------------|:------:|-------|
-| Unit tests (`cargo test --lib`) | **265/265** | All passing (incl. 17 ARM64 enc + 9 ARM64 runtime + 14 RISC-V enc + 7 RISC-V runtime + 7 incremental compilation) |
-| Harness tests (`cargo test --test harness`) | **8/8** | All passing (region, capability, effect, safety, golden, PE, interpreter, C codegen) |
-| Interpreter (`fidesc test`) | **153/153** normal | All normal tests pass. (5 bonus passes from known-fail list.) |
-| PE Emitter (`fidesc test`) | **153/153** normal | All normal tests pass. (6 bonus passes from known-fail list.) |
-| C Codegen (`fidesc test`) | **153/153** normal | All tests pass (autodiff_grad, ml_full fixed). Binary hardening enabled. |
-| Skip list | **4** | 3 C codegen missing-builtins (kv_cache, quantization, dp) + 1 design difference (dlopen) |
-| Known-fail | **6** | 3 parser bugs + 3 C codegen mismatches (was 10 — 4 were stale) |
-| Total `.fd` test files | **218** | 195 in tests/ root + 23 in subdirs (capability/effects/regions/safety) |
-| Source files | **54** `.rs` | 86,011 LOC |
-| Stdlib modules | **69** `.fd` | 17,541 LOC — core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can |
-| Golden files | **148** | Expected outputs in `tests/golden/` |
-| Binary targets | **4** | `fidesc` (compiler), `pacte` (package manager), `scribe` (doc generator), `veil` (coverage tool) |
+**Phase status:** See `docs/roadmap/roadmap.md` for full phase status and what's left. See `docs/roadmap/selfhost-roadmap.md` for the self-hosting plan.
 
 ### Financial Safety Features (New)
 
@@ -892,15 +879,5 @@ Run all tests: `cargo test --test harness`
 
 ## Roadmap
 
-| Phase | Goal | Status |
-|-------|------|--------|
-| **Phase 1** | Bootstrap compiler in Rust — direct PE/ELF64 emission, C backend, IR interpreter | **Complete** (265/265 unit tests, 153/153 integration tests) |
-| **Phase 2** | Region inference, effect system, capability security, bounds safety | **Complete** (2A ✓, 2B ✓, 2C ✓ with elision, 2D ✓; 8/8 harness tests pass) |
-| **Phase 3** | comptime, advanced traits, FFI & interop | **Complete** (3A comptime ✓, 3B traits ✓, 3C const generics + GATs ✓; 3D C FFI ✓ via `extern "C"` + `parse-header`) |
-| **Phase 4** | PIR optimizer, multi-arch codegen, integrated linker, hot reload | **Mostly complete** (4A PIR ✓, 4B optimizer ✓ 23 passes enabled by default, 4C x86-64/arm64/riscv codegen + regalloc + 9 peephole passes + ELF64 executables ✓; 4D linker ✓, 4E hot reload ✓ via `fidesc watch`) |
-| **Phase 5** | Bare metal, IoT, AI/ML, web & cloud | **Mostly complete** (5A bare-metal mode ✓, 5B IoT/embedded framework ✓ `embedded.rs`, 5C AI/ML tensor ✓, 5D WASM + GPU/SPIR-V + HTTP + JSON ✓) |
-| **Phase 6** | Self-hosting | 3 of 5 blockers resolved (enum payloads, generic Vec, recursive Box) |
-| **Phase 7** | Ecosystem (package manager, LSP, docs) | **Mostly complete** (pacte package manager ✓, LSP ✓, scribe doc generator ✓, veil coverage ✓) |
-| **Phase 8** | World class | **In progress** (type inference ✓, SLP+loop-vec ✓, @send/@sync ✓, debugger ✓, Rc/Arc ✓, vec/mat math ✓, incremental compilation ✓, green threads pending) |
-
-See `docs/roadmap/roadmap.md` for the full 8-phase roadmap and `docs/roadmap/roadmap-limitations.md` for the verified gap analysis.
+See `docs/roadmap/roadmap.md` for the full phase status and milestones.
+See `docs/roadmap/selfhost-roadmap.md` for the 10-phase self-hosting plan.

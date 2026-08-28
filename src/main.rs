@@ -875,12 +875,7 @@ fn main() {
             // reported separately and NOT counted in the main pass/fail denominator.
             // FIX THESE — do not leave them here forever.
             let known_fail: &[&str] = &[
-                "test_game_stdlib",   // BUG: parser error in game stdlib (interp + C fail, PE passes)
-                "test_iter",          // BUG: C codegen UB in nested Vec iteration (interp + PE pass)
-                "test_vec_math",      // BUG: C codegen incomplete feature (interp + PE pass)
-                "test_parallel_concurrent", // BUG: thread race condition (interp + C fail, PE passes)
-                "test_time",          // BUG: parse error — unsupported syntax in time.fd (all 3 fail)
-                "test_time_edge",     // BUG: parse error — unsupported syntax in time.fd (all 3 fail)
+                // All previously known-fail tests now pass on all 3 backends!
             ];
 
             // Skip list — tests that fail on C codegen due to missing builtins

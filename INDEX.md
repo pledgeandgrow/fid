@@ -254,14 +254,10 @@ Expected-fail tests (24) verify that the compiler correctly *rejects* unsafe
 code: `test_*_fail` variants for banking, money, borrowck, safety, contracts,
 typed strings, init guarantees, constant_time, etc.
 
-### Current Test Results (Aug 2026)
-```
-Interpreter:  153/153 normal
-C Codegen:    151/153 matched
-PE Emitter:   153/153 valid
-Unit tests:   265/265 passed  (cargo test --lib)
-Harness:      8/8 passed
-```
+### Current Test Results
+
+**See `AGENTS.md` → "Current Baseline"** for authoritative test counts.
+(153/153 on all 3 backends, 265/265 unit tests, 0 skip, 0 known-fail.)
 
 > Full test inventory: see `tests/` directory listing, or run
 > `./target/release/fidesc test` to see all test names and results.

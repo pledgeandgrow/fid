@@ -449,6 +449,11 @@ to be built.
 
 **Goal:** Rewrite the Fides compiler in Fides.
 
+**Detailed plan:** See `selfhost-roadmap.md` for the 10-phase self-hosting
+roadmap (SH-0 through SH-9): pre-flight audit, debugging infrastructure,
+per-module test harness, language/stdlib gap fixes, C codegen hardening,
+and gradual file-by-file rewrite with differential testing at each stage.
+
 **Status:** All 3 language-level blockers resolved. The compiler can now
 express the data structures and patterns needed for self-hosting (recursive
 ASTs via Box<T>, typed enum payloads, generic containers). Remaining work is

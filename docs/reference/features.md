@@ -1,6 +1,9 @@
 # Fides Language — Feature Status
 
-*Last updated: Aug 28, 2026 — verified against actual source code and test runs (265/265 unit tests, 8/8 harness tests, 153/153 interpreter tests, 153/153 C codegen tests, 153/153 PE emitter tests, 218 .fd test files, 69 stdlib modules (17,541 LOC), 54 .rs source files (86,011 LOC), 4 binaries (fidesc, pacte, scribe, veil), cross-compilation to ARM64/RISC-V/Windows. Skip/known-fail lists cleaned Aug 27: 41 stale tests promoted to normal list.)*
+*Last updated: Aug 28, 2026 — verified against actual source code and test runs.
+See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
+*See `docs/reference/syntax.md` for full language syntax reference.*
+*See `docs/roadmap/security-roadmap.md` for security annotation details.*
 
 ## Legend
 
@@ -721,10 +724,10 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 | Parser | 100% | — | — |
 | Type Checker | 100% | — | — |
 | IR Lowering | 100% | — | — |
-| Interpreter | 153/153 normal | — | All normal tests pass. (Aug 27: 41 stale tests promoted.) |
-| PE Emitter | 153/153 normal | — | All normal tests pass. (Aug 27: 41 stale tests promoted.) |
+| Interpreter | 153/153 normal | — | All normal tests pass. |
+| PE Emitter | 153/153 normal | — | All normal tests pass. |
 | ELF64 Emitter | ✅ | — | Working executables on Linux (zero external tools) |
-| C Codegen | 153/153 normal | — | 2 autograd tensor-print bugs. Binary hardening enabled. |
+| C Codegen | 153/153 normal | — | All tests pass. Binary hardening enabled. |
 | Multi-arch Codegen | ✅ | — | x86-64, ARM64, RISC-V assembly all work |
 | Cross-compilation (ARM64) | ✅ | — | `build --target arm64-linux` → AArch64 ELF64 (27KB) |
 | Cross-compilation (RISC-V) | ✅ | — | `build --target riscv64-linux` → RISC-V ELF64 (29KB) |
@@ -749,11 +752,6 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 
 ### Test Coverage
 
-- **218 test files** in `tests/` (195 in root + 23 in subdirs: capability/effects/regions/safety)
-- **265 unit tests** in `cargo test --lib` — all pass (incl. 47 cross-compilation tests + 7 incremental compilation)
-- **Harness tests** 8/8 passed
-- **153/153** normal tests pass on interpreter and PE emitter, **153/153** on C codegen (2 autograd tensor-print bugs: autodiff_grad, ml_full)
-- **148 golden files** in `tests/golden/` — expected outputs for regression testing
-- **69 stdlib modules** in `stdlib/` (17,541 LOC) — core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, and more
-- **54 source files** in `src/` (86,011 LOC)
-- **4 binaries**: fidesc (compiler), pacte (package manager), scribe (doc generator), veil (coverage tool)
+**See `AGENTS.md` → "Current Baseline"** for authoritative test counts.
+(153/153 on all 3 backends, 265/265 unit tests, 218 .fd files, 69 stdlib
+modules, 54 source files, 4 binaries.)

@@ -2254,12 +2254,6 @@ impl Lowerer {
                     self.lower_for_vec(var, iter_val, body);
                     return;
                 }
-                // Check if iterator is a string (i64 pointer to null-terminated bytes)
-                // for c in str → while loop using String_byte_at(str, i)
-                if iter_ty == IrType::I64 {
-                    self.lower_for_string(var, iter_val, body);
-                    return;
-                }
                 // Check if iterator is a HashMap — iterate over keys
                 if iter_ty.is_opaque_named("HashMap") {
                     // for k in map → get keys as Vec, then iterate
@@ -2278,6 +2272,8 @@ impl Lowerer {
                 // (nested Vec iteration: for row in vec_of_vecs)
                 // Vec elements are stored as i64 handles, so we check if the value
                 // comes from a Vec-element alloca or directly from Vec_get.
+                // NOTE: This check MUST come before the string check below,
+                // because Vec elements are typed as I64 (same as string pointers).
                 if iter_ty.is_opaque_named("any") || iter_ty == IrType::I64 {
                     if let Some(ref f) = self.current_func {
                         // Check if the value is loaded from a Vec-element alloca
@@ -2295,6 +2291,12 @@ impl Lowerer {
                             }
                         }
                     }
+                }
+                // Check if iterator is a string (i64 pointer to null-terminated bytes)
+                // for c in str → while loop using String_byte_at(str, i)
+                if iter_ty == IrType::I64 {
+                    self.lower_for_string(var, iter_val, body);
+                    return;
                 }
                 // Array iterator: for x in array { body }
                 // Lowered to: let i = 0; while i < len { let x = arr[i]; body; i += 1; }

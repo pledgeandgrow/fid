@@ -69,6 +69,8 @@ F13: parallel { | } fork-join 🔲 PLANNED — compiler emits thread spawn/join
 F14: @differentiable          ✅ DONE — typechecker verifies @differentiable (no IO/Net/Spawn/Diverge, transitive). Runtime tape-based reverse-mode AD in interpreter: `grad(var) { ... backward(loss) }` computes gradients. `p_grad_get` retrieves results.
 F21: @shader (vert/frag)      🔲 PLANNED — compiler emits SPIR-V for GPU
 F23: @simd                    🔲 PLANNED — compiler vectorizes loops to SSE/AVX/NEON
+
+─── Safety Annotations — see security.md for full reference ─────
 F24: @crashfree               ✅ IMPLEMENTED — compile-time panic prevention: rejects unwrap, p_panic, non-const div/mod, while loops, non-crashfree calls
 F25: @pool                    🔲 PLANNED — compiler manages pool memory layout, zero alloc
 F26: @deterministic           ✅ IMPLEMENTED — compiler rejects FP/random/IO/time (medical+blockchain)
@@ -2332,11 +2334,8 @@ system UpdateLOD {
 
 ### Implementation Details
 
-All 5 original features (F1–F5) were implemented in a single session. Test results (current state):
-- Interpreter: 153/153 normal passed
-- PE Emitter: 153/153 valid
-- C Codegen: 153/153 matched
-- Total: 218 .fd test files (195 in root + 23 in subdirs)
+All 5 original features (F1–F5) were implemented in a single session. Test results:
+**See `roadmap.md` → "Verified Test Baseline" for current test counts.**
 
 **Planned for implementation:**
 - 39 Tier A syntax features (F10, F13, F14, F16–F18, F21, F23–F60) — need compiler support

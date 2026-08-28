@@ -456,14 +456,19 @@ to 24-byte memory blocks from `stdlib/core.fd`). Fixed by adding
 
 ## The Timing Question: Self-Host First or Add Features on Rust?
 
+**Note:** For current self-hosting blocker status, see `roadmap.md` Phase 10.
+All 3 language-level blockers are resolved; 153/153 tests pass on all backends.
+
 **Recommendation: Add features while on Rust. Self-host later.**
 
 ### Why not self-host now
 
-1. **Fides is not mature enough.** Missing: full concurrency (spawn), package
-   manager, LSP, effect handler continuations, GPU region support. Self-hosting
-   into a language missing these features means writing them in a language that
-   doesn't have them yet — circular dependency.
+1. **Fides is not mature enough.** ~~Missing: full concurrency (spawn), package
+   manager, LSP~~ — spawn, LSP, and package manager (pacte) now exist. Still
+   missing: effect handler continuations, GPU region support, state machine
+   transform for async. Self-hosting into a language missing these features
+   means writing them in a language that doesn't have them yet — circular
+   dependency.
 
 2. **Self-hosting is 3-6 months of zero user-facing features.** The compiler is
    ~35k lines of Rust. Rewriting in Fides produces no new capabilities, attracts
