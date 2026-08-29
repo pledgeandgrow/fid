@@ -364,6 +364,33 @@ fn is_struct_name(self: &Parser, name: str) -> bool {
     return false;
 }
 
+fn is_struct_name_debug(self: &Parser, name: str) -> bool {
+    p_print_str("is_struct_name(\"");
+    p_print_str(name);
+    p_print_str("\") len=");
+    p_print_str(int_to_str(self.struct_names.len()));
+    p_print_str("\n");
+    var i: i64 = 0;
+    while i < self.struct_names.len() {
+        p_print_str("  [");
+        p_print_str(int_to_str(i));
+        p_print_str("] = \"");
+        p_print_str(self.struct_names.get(i));
+        p_print_str("\"\n");
+        var eq: bool = self.struct_names.get(i) == name;
+        p_print_str("  eq=");
+        if eq { p_print_str("true"); } else { p_print_str("false"); }
+        p_print_str("\n");
+        if eq {
+            p_print_str("  MATCH!\n");
+            return true;
+        }
+        i = i + 1;
+    }
+    p_print_str("  NO MATCH\n");
+    return false;
+}
+
 fn is_enum_name(self: &Parser, name: str) -> bool {
     var i: i64 = 0;
     while i < self.enum_names.len() {
@@ -4625,6 +4652,58 @@ if self.match_tok(TokenKind::LBrace) {
         ParseResultUnit::Ok => {}
     }
 }
+// Strip trailing :: from path if items were specified
+if (items.len() > 0 || is_glob) && str_ends_with(path, "::") {
+    path = str_slice(path, 0, str_len(path) - 2);
+}
+// Check for capability grant: with { IO, FS }
+var capabilities: Vec<str> = Vec::new();
+if self.match_tok(TokenKind::With) {
+    match self.expect(TokenKind::LBrace, "{") {
+        ParseResultUnit::Err(e) => { return ParseResultImportDef::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    if !self.check(TokenKind::RBrace) {
+        loop {
+            var cap: str = "";
+            match self.expect_ident() {
+                ParseResultStr::Ok(s) => { cap = s; }
+                ParseResultStr::Err(e) => { return ParseResultImportDef::Err(e); }
+            }
+            capabilities.push(cap);
+            if !self.match_tok(TokenKind::Comma) { break; }
+        }
+    }
+    match self.expect(TokenKind::RBrace, "}") {
+        ParseResultUnit::Err(e) => { return ParseResultImportDef::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+}
+// Check for version pin: = "0.1.0"
+var version: OptStr = OptStr::None;
+if self.match_tok(TokenKind::Eq) {
+    var vtok: Token = self.peek_token();
+    match vtok.kind {
+        TokenKind::StringLit(s: str) => {
+            self.advance();
+            version = OptStr::Some(s);
+        }
+    }
+    return ParseResultImportDef::Err(
+        "Parse error at " + int_to_str(vtok.line) + ":" + int_to_str(vtok.col) +
+        ": expected version string but got '" + token_kind_to_str(vtok.kind) + "'"
+    );
+}
+self.match_tok(TokenKind::Semicolon);
+return ParseResultImportDef::Ok(ImportDef {
+    path: path,
+    items: items,
+    capabilities: capabilities,
+    version: version,
+    alias: alias,
+    is_pub: false,
+    is_glob: is_glob,
+});
 }
 
 fn parse_at_annotation(self: &mut Parser) -> ParseResultAnnotation {

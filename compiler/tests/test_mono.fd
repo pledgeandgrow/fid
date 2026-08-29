@@ -1,0 +1,473 @@
+// SH-8.4: Test for compiler::mono module (rewritten from mono.rs)
+// Tests mangle, mangle_type, subst_type, subst helpers, infer_subst,
+// infer_from_pair, MonoCtx, infer_expr_type, and monomorphize entry point.
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::mono;
+
+fn assert_eq(actual: str, expected: str, label: str) -> void {
+    if actual != expected {
+        print("FAIL: ");
+        print(label);
+        print(" — expected '");
+        print(expected);
+        print("', got '");
+        print(actual);
+        print("'\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_eq_i64(actual: i64, expected: i64, label: str) -> void {
+    if actual != expected {
+        print("FAIL: ");
+        print(label);
+        print(" — expected ");
+        print(int_to_str(expected));
+        print(", got ");
+        print(int_to_str(actual));
+        print("\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_true(b: bool, label: str) -> void {
+    if !b {
+        print("FAIL: ");
+        print(label);
+        print(" — expected true\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_false(b: bool, label: str) -> void {
+    if b {
+        print("FAIL: ");
+        print(label);
+        print(" — expected false\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+// ── Test 1: mangle_type ──
+fn test_mangle_type() -> void {
+    print("Test 1: mangle_type...\n");
+    assert_eq(mangle_type(Type::I32), "i32", "mangle I32");
+    assert_eq(mangle_type(Type::I64), "i64", "mangle I64");
+    assert_eq(mangle_type(Type::F64), "f64", "mangle F64");
+    assert_eq(mangle_type(Type::Bool), "bool", "mangle Bool");
+    assert_eq(mangle_type(Type::Str), "str", "mangle Str");
+    assert_eq(mangle_type(Type::Void), "void", "mangle Void");
+    assert_eq(mangle_type(Type::Named("Point")), "Point", "mangle Named(Point)");
+    assert_eq(mangle_type(Type::U8), "u8", "mangle U8");
+    assert_eq(mangle_type(Type::U64), "u64", "mangle U64");
+}
+
+// ── Test 2: mangle ──
+fn test_mangle() -> void {
+    print("Test 2: mangle...\n");
+    var subst: Vec<SubstEntry> = Vec::new();
+    subst_set(&mut subst, "T", Type::I32);
+    var type_params: Vec<str> = Vec::new();
+    type_params.push("T");
+    assert_eq(mangle("identity", subst, type_params), "identity__i32", "mangle identity<T> with I32");
+
+    // Two type params
+    var subst2: Vec<SubstEntry> = Vec::new();
+    subst_set(&mut subst2, "T", Type::I64);
+    subst_set(&mut subst2, "U", Type::F64);
+    var tps2: Vec<str> = Vec::new();
+    tps2.push("T");
+    tps2.push("U");
+    assert_eq(mangle("pair", subst2, tps2), "pair__i64_f64", "mangle pair<T,U> with I64,F64");
+}
+
+// ── Test 3: mangle_method ──
+fn test_mangle_method() -> void {
+    print("Test 3: mangle_method...\n");
+    var subst: Vec<SubstEntry> = Vec::new();
+    subst_set(&mut subst, "T", Type::I32);
+    var type_params: Vec<str> = Vec::new();
+    type_params.push("T");
+    assert_eq(mangle_method("Vec", "push", subst, type_params), "Vec__push__i32", "mangle Vec::push<T> with I32");
+}
+
+// ── Test 4: subst helpers ──
+fn test_subst_helpers() -> void {
+    print("Test 4: subst helpers...\n");
+    var subst: Vec<SubstEntry> = Vec::new();
+    assert_false(subst_contains(subst, "T"), "empty subst does not contain T");
+
+    subst_set(&mut subst, "T", Type::I32);
+    assert_true(subst_contains(subst, "T"), "subst contains T after set");
+
+    match subst_get(subst, "T") {
+        OptType::Some(t) => {
+            assert_eq(mangle_type(t), "i32", "subst_get T returns I32");
+        }
+        OptType::None => {
+            print("FAIL: subst_get T returned None\n");
+            p_panic("test failed");
+        }
+    }
+
+    match subst_get(subst, "U") {
+        OptType::Some(_) => {
+            print("FAIL: subst_get U returned Some\n");
+            p_panic("test failed");
+        }
+        OptType::None => {
+            assert_true(true, "subst_get U returns None");
+        }
+    }
+
+    // Overwrite
+    subst_set(&mut subst, "T", Type::I64);
+    match subst_get(subst, "T") {
+        OptType::Some(t) => {
+            assert_eq(mangle_type(t), "i64", "subst_get T after overwrite returns I64");
+        }
+        OptType::None => {
+            print("FAIL: subst_get T returned None after overwrite\n");
+            p_panic("test failed");
+        }
+    }
+}
+
+// ── Test 5: subst_type ──
+fn test_subst_type() -> void {
+    print("Test 5: subst_type...\n");
+    var subst: Vec<SubstEntry> = Vec::new();
+    subst_set(&mut subst, "T", Type::I32);
+
+    // Named type gets substituted
+    assert_eq(mangle_type(subst_type(Type::Named("T"), subst)), "i32", "subst_type Named(T) -> I32");
+
+    // Non-substituted Named type stays the same
+    assert_eq(mangle_type(subst_type(Type::Named("Foo"), subst)), "Foo", "subst_type Named(Foo) unchanged");
+
+    // Primitive types are unchanged
+    assert_eq(mangle_type(subst_type(Type::I64, subst)), "i64", "subst_type I64 unchanged");
+    assert_eq(mangle_type(subst_type(Type::Bool, subst)), "bool", "subst_type Bool unchanged");
+
+    // Ref gets inner substituted
+    var ref_ty: Type = Type::Ref(Box::new(Type::Named("T")), false);
+    assert_eq(mangle_type(subst_type(ref_ty, subst)), "ref_const_i32", "subst_type Ref(T) -> Ref(I32)");
+}
+
+// ── Test 6: infer_subst ──
+fn test_infer_subst() -> void {
+    print("Test 6: infer_subst...\n");
+    // param_types: [T], arg_types: [I32], type_params: [T]
+    var param_types: Vec<Type> = Vec::new();
+    param_types.push(Type::Named("T"));
+    var arg_types: Vec<Type> = Vec::new();
+    arg_types.push(Type::I32);
+    var type_params: Vec<str> = Vec::new();
+    type_params.push("T");
+
+    var subst: Vec<SubstEntry> = infer_subst(param_types, arg_types, type_params);
+    assert_true(subst_contains(subst, "T"), "infer_subst binds T");
+    match subst_get(subst, "T") {
+        OptType::Some(t) => {
+            assert_eq(mangle_type(t), "i32", "infer_subst T -> I32");
+        }
+        OptType::None => {
+            print("FAIL: infer_subst T is None\n");
+            p_panic("test failed");
+        }
+    }
+
+    // Two type params
+    var pt2: Vec<Type> = Vec::new();
+    pt2.push(Type::Named("T"));
+    pt2.push(Type::Named("U"));
+    var at2: Vec<Type> = Vec::new();
+    at2.push(Type::I64);
+    at2.push(Type::F64);
+    var tp2: Vec<str> = Vec::new();
+    tp2.push("T");
+    tp2.push("U");
+    var subst2: Vec<SubstEntry> = infer_subst(pt2, at2, tp2);
+    assert_true(subst_contains(subst2, "T"), "infer_subst binds T (two params)");
+    assert_true(subst_contains(subst2, "U"), "infer_subst binds U (two params)");
+}
+
+// ── Test 7: MonoCtx ──
+fn test_mono_ctx() -> void {
+    print("Test 7: MonoCtx...\n");
+    var ctx: MonoCtx = MonoCtx_new();
+    assert_eq_i64(ctx.generics.len(), 0, "new ctx has no generics");
+    assert_eq_i64(ctx.generic_methods.len(), 0, "new ctx has no generic methods");
+    assert_eq_i64(ctx.instantiated.len(), 0, "new ctx has no instantiated");
+    assert_eq_i64(ctx.seen.len(), 0, "new ctx has empty seen");
+    assert_eq_i64(ctx.trait_assoc_bindings.len(), 0, "new ctx has no trait assoc bindings");
+
+    // seen_insert
+    assert_true(MonoCtx_seen_insert(&mut ctx, "foo__i32"), "first insert of foo__i32");
+    assert_false(MonoCtx_seen_insert(&mut ctx, "foo__i32"), "second insert of foo__i32 returns false");
+    assert_true(MonoCtx_seen_insert(&mut ctx, "bar__i64"), "first insert of bar__i64");
+    assert_eq_i64(ctx.seen.len(), 2, "seen has 2 entries");
+}
+
+// ── Test 8: infer_expr_type ──
+fn test_infer_expr_type() -> void {
+    print("Test 8: infer_expr_type...\n");
+    var func: Func = Func_new("test", Type::I32);
+
+    // IntLit within i32 range -> I32
+    assert_eq(mangle_type(infer_expr_type(Expr::IntLit(42), func)), "i32", "infer IntLit(42) -> I32");
+
+    // IntLit outside i32 range -> I64
+    assert_eq(mangle_type(infer_expr_type(Expr::IntLit(3000000000), func)), "i64", "infer IntLit(3B) -> I64");
+
+    // BoolLit -> Bool
+    assert_eq(mangle_type(infer_expr_type(Expr::BoolLit(true), func)), "bool", "infer BoolLit -> Bool");
+
+    // StringLit -> Str
+    assert_eq(mangle_type(infer_expr_type(Expr::StringLit("hello"), func)), "str", "infer StringLit -> Str");
+
+    // FloatLit -> F64
+    assert_eq(mangle_type(infer_expr_type(Expr::FloatLit(3.14), func)), "f64", "infer FloatLit -> F64");
+
+    // Ident not found -> Named
+    assert_eq(mangle_type(infer_expr_type(Expr::Ident("unknown"), func)), "unknown", "infer Ident(unknown) -> Named(unknown)");
+}
+
+// ── Test 9: infer_expr_type with params ──
+fn test_infer_expr_type_with_params() -> void {
+    print("Test 9: infer_expr_type with params...\n");
+    var func: Func = Func_new("test", Type::I32);
+    func.params.push(Param_new("x", Type::I64, false));
+    func.params.push(Param_new("flag", Type::Bool, false));
+
+    assert_eq(mangle_type(infer_expr_type(Expr::Ident("x"), func)), "i64", "infer Ident(x) -> I64 from param");
+    assert_eq(mangle_type(infer_expr_type(Expr::Ident("flag"), func)), "bool", "infer Ident(flag) -> Bool from param");
+}
+
+// ── Test 10: infer_expr_type Binary ──
+fn test_infer_expr_type_binary() -> void {
+    print("Test 10: infer_expr_type Binary...\n");
+    var func: Func = Func_new("test", Type::I32);
+
+    // Comparison ops -> Bool
+    var eq_expr: Expr = Expr::Binary(BinOp::Eq, Box::new(Expr::IntLit(1)), Box::new(Expr::IntLit(2)));
+    assert_eq(mangle_type(infer_expr_type(eq_expr, func)), "bool", "infer Eq -> Bool");
+
+    var lt_expr: Expr = Expr::Binary(BinOp::Lt, Box::new(Expr::IntLit(1)), Box::new(Expr::IntLit(2)));
+    assert_eq(mangle_type(infer_expr_type(lt_expr, func)), "bool", "infer Lt -> Bool");
+
+    // Arithmetic -> type of left operand
+    var add_expr: Expr = Expr::Binary(BinOp::Add, Box::new(Expr::IntLit(42)), Box::new(Expr::IntLit(99)));
+    assert_eq(mangle_type(infer_expr_type(add_expr, func)), "i32", "infer Add -> I32 (from left)");
+}
+
+// ── Test 11: infer_expr_type Unary ──
+fn test_infer_expr_type_unary() -> void {
+    print("Test 11: infer_expr_type Unary...\n");
+    var func: Func = Func_new("test", Type::I32);
+
+    // Not -> Bool
+    var not_expr: Expr = Expr::Unary(UnaryOp::Not, Box::new(Expr::BoolLit(true)));
+    assert_eq(mangle_type(infer_expr_type(not_expr, func)), "bool", "infer Not -> Bool");
+
+    // Neg -> type of operand
+    var neg_expr: Expr = Expr::Unary(UnaryOp::Neg, Box::new(Expr::IntLit(42)));
+    assert_eq(mangle_type(infer_expr_type(neg_expr, func)), "i32", "infer Neg -> I32");
+}
+
+// ── Test 12: infer_expr_type Cast ──
+fn test_infer_expr_type_cast() -> void {
+    print("Test 12: infer_expr_type Cast...\n");
+    var func: Func = Func_new("test", Type::I32);
+
+    var cast_expr: Expr = Expr::Cast(Box::new(Expr::IntLit(42)), Type::F64);
+    assert_eq(mangle_type(infer_expr_type(cast_expr, func)), "f64", "infer Cast -> F64");
+}
+
+// ── Test 13: infer_expr_type StructLit ──
+fn test_infer_expr_type_structlit() -> void {
+    print("Test 13: infer_expr_type StructLit...\n");
+    var func: Func = Func_new("test", Type::I32);
+
+    var fields: Vec<FieldInit> = Vec::new();
+    fields.push(FieldInit_new("x", Expr::IntLit(1)));
+    fields.push(FieldInit_new("y", Expr::IntLit(2)));
+    var sl: Expr = Expr::StructLit("Point", fields, OptBoxExpr::None);
+    assert_eq(mangle_type(infer_expr_type(sl, func)), "Point", "infer StructLit -> Named(Point)");
+}
+
+// ── Test 14: rename helpers ──
+fn test_rename_helpers() -> void {
+    print("Test 14: rename helpers...\n");
+    var renames: Vec<RenameEntry> = rename_new();
+    match rename_get(renames, "foo") {
+        OptStr::Some(_) => { print("FAIL: empty rename returned Some\n"); p_panic("test failed"); }
+        OptStr::None => { assert_true(true, "empty rename returns None"); }
+    }
+
+    rename_set(&mut renames, "foo", "foo__i32");
+    match rename_get(renames, "foo") {
+        OptStr::Some(s) => { assert_eq(s, "foo__i32", "rename_get foo -> foo__i32"); }
+        OptStr::None => { print("FAIL: rename_get foo returned None\n"); p_panic("test failed"); }
+    }
+
+    // Overwrite
+    rename_set(&mut renames, "foo", "foo__i64");
+    match rename_get(renames, "foo") {
+        OptStr::Some(s) => { assert_eq(s, "foo__i64", "rename_get foo after overwrite -> foo__i64"); }
+        OptStr::None => { print("FAIL: rename_get foo returned None\n"); p_panic("test failed"); }
+    }
+}
+
+// ── Test 15: str_vec_contains ──
+fn test_str_vec_contains() -> void {
+    print("Test 15: str_vec_contains...\n");
+    var vec: Vec<str> = Vec::new();
+    vec.push("T");
+    vec.push("U");
+    vec.push("V");
+    assert_true(str_vec_contains(vec, "T"), "contains T");
+    assert_true(str_vec_contains(vec, "U"), "contains U");
+    assert_false(str_vec_contains(vec, "W"), "does not contain W");
+}
+
+// ── Test 16: generic_funcs helpers ──
+fn test_generic_funcs_helpers() -> void {
+    print("Test 16: generic_funcs helpers...\n");
+    var generics: Vec<GenericFuncEntry> = Vec::new();
+    var func: Func = Func_new("identity", Type::I32);
+    var tps: Vec<str> = Vec::new();
+    tps.push("T");
+    generics.push(GenericFuncEntry_new("identity", func, tps));
+
+    assert_true(generic_funcs_contains(generics, "identity"), "contains identity");
+    assert_false(generic_funcs_contains(generics, "other"), "does not contain other");
+
+    match generic_funcs_get(generics, "identity") {
+        OptGenericFunc::Some(entry) => {
+            assert_eq(entry.name, "identity", "get returns correct name");
+            assert_eq_i64(entry.type_params.len(), 1, "get returns correct type_params count");
+        }
+        OptGenericFunc::None => {
+            print("FAIL: generic_funcs_get returned None\n");
+            p_panic("test failed");
+        }
+    }
+}
+
+// ── Test 17: generic_methods helpers ──
+fn test_generic_methods_helpers() -> void {
+    print("Test 17: generic_methods helpers...\n");
+    var methods: Vec<GenericMethodEntry> = Vec::new();
+    var func: Func = Func_new("push", Type::Void);
+    var tps: Vec<str> = Vec::new();
+    tps.push("T");
+    methods.push(GenericMethodEntry_new("Vec", "push", func, tps));
+
+    assert_true(generic_methods_contains(methods, "Vec", "push"), "contains Vec::push");
+    assert_false(generic_methods_contains(methods, "Vec", "pop"), "does not contain Vec::pop");
+    assert_false(generic_methods_contains(methods, "Map", "push"), "does not contain Map::push");
+
+    match generic_methods_get(methods, "Vec", "push") {
+        OptGenericMethod::Some(entry) => {
+            assert_eq(entry.struct_name, "Vec", "get returns correct struct_name");
+            assert_eq(entry.method_name, "push", "get returns correct method_name");
+        }
+        OptGenericMethod::None => {
+            print("FAIL: generic_methods_get returned None\n");
+            p_panic("test failed");
+        }
+    }
+}
+
+// ── Test 18: infer_receiver_struct_name ──
+fn test_infer_receiver_struct_name() -> void {
+    print("Test 18: infer_receiver_struct_name...\n");
+    var func: Func = Func_new("test", Type::I32);
+
+    // Ident receiver -> Named
+    match infer_receiver_struct_name(Expr::Ident("Point"), func) {
+        OptStr::Some(s) => { assert_eq(s, "Point", "receiver Ident(Point) -> Point"); }
+        OptStr::None => { print("FAIL: receiver Ident returned None\n"); p_panic("test failed"); }
+    }
+
+    // IntLit receiver -> None (not a struct)
+    match infer_receiver_struct_name(Expr::IntLit(42), func) {
+        OptStr::Some(_) => { print("FAIL: receiver IntLit returned Some\n"); p_panic("test failed"); }
+        OptStr::None => { assert_true(true, "receiver IntLit -> None"); }
+    }
+}
+
+// ── Test 19: monomorphize empty program ──
+fn test_monomorphize_empty() -> void {
+    print("Test 19: monomorphize empty program...\n");
+    var prog: Program = program_new();
+    var result: Program = monomorphize(prog);
+    assert_eq_i64(result.funcs.len(), 0, "empty program has 0 funcs after mono");
+    assert_eq_i64(result.structs.len(), 0, "empty program has 0 structs after mono");
+    assert_eq_i64(result.impls.len(), 0, "empty program has 0 impls after mono");
+}
+
+// ── Test 20: monomorphize with concrete-only functions ──
+fn test_monomorphize_concrete() -> void {
+    print("Test 20: monomorphize with concrete functions...\n");
+    var prog: Program = program_new();
+
+    // Add a concrete function
+    var body: Vec<Stmt> = Vec::new();
+    body.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::IntLit(42))), 1));
+    var func: Func = Func_new("main", Type::I32);
+    func.is_pub = true;
+    func.body = body;
+    prog.funcs.push(func);
+
+    var result: Program = monomorphize(prog);
+    assert_eq_i64(result.funcs.len(), 1, "one concrete func -> 1 func after mono");
+    assert_eq(result.funcs.get(0).name, "main", "func name preserved");
+    assert_eq_i64(result.funcs.get(0).type_params.len(), 0, "concrete func has 0 type_params");
+}
+
+// ── Main ──
+fn main() -> i64 {
+    print("SH-8.4: Mono module test\n");
+    print("=========================\n\n");
+
+    test_mangle_type();
+    test_mangle();
+    test_mangle_method();
+    test_subst_helpers();
+    test_subst_type();
+    test_infer_subst();
+    test_mono_ctx();
+    test_infer_expr_type();
+    test_infer_expr_type_with_params();
+    test_infer_expr_type_binary();
+    test_infer_expr_type_unary();
+    test_infer_expr_type_cast();
+    test_infer_expr_type_structlit();
+    test_rename_helpers();
+    test_str_vec_contains();
+    test_generic_funcs_helpers();
+    test_generic_methods_helpers();
+    test_infer_receiver_struct_name();
+    test_monomorphize_empty();
+    test_monomorphize_concrete();
+
+    print("\nAll tests passed!\n");
+    return 0;
+}

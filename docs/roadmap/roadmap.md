@@ -27,6 +27,7 @@ Phase 11: Ecosystem          ← IN PROGRESS — LSP (diag+completion+hover+def)
 Phase 12: Security Hardening ← MOSTLY COMPLETE — binary hardening + all safety annotations; CFI + full taint tracking + runtime sandbox remaining
 Phase 13: World Class        ← IN PROGRESS — type inference done, SLP+loop-vec done, @send/@sync done, debugger done, pacte package manager done, scribe doc generator done, veil coverage tool done, green threads remaining
 Phase 14: Debugging Tools    ← COMPLETE — interpreter debugger, record/replay, hot-reload, post-mortem, native debugger
+Phase 15: Compete Where We Lose ← NOT STARTED — win in web/data-science/prototyping/games without adding a runtime (arena allocators, comptime frameworks, ergonomic modes)
 ```
 
 ### Verified Test Baseline (Aug 2026)
@@ -779,6 +780,230 @@ hot-reload, post-mortem, and native code debugging.
 - [ ] Breakpoint injection in native debugger (currently single-step + continue only)
 - [ ] Symbol table parsing for native debugger (variable inspection in native code)
 - [ ] DWARF debug info emission for external debugger support (gdb/lldb)
+
+---
+
+## Phase 15 — Compete Where We Lose (NOT STARTED)
+
+**Goal:** Win in domains where no-GC / no-RTTI / no-reflection designs
+traditionally lose to GC languages (Go, Java, Python). Win *without* adding
+a runtime — by moving the work to compile time and arena allocation.
+
+**Core thesis:** Fides doesn't need a GC to compete with GC languages. It
+needs (1) arena/region allocators that give GC-like ergonomics with zero
+pause, (2) comptime frameworks that replace runtime reflection, and (3)
+ergonomic modes that lower the safety barrier during prototyping. Every
+"loss" can be turned into a win by moving work from runtime to compile time.
+
+**Prerequisite:** Phase 10 (self-hosting) must be complete — these frameworks
+are built in Fides, using Fides, proving the language is productive enough
+to build its own ecosystem.
+
+### 15.1 Arena & Region Allocator — GC Ergonomics Without GC
+
+**Problem:** Manual memory management is the #1 reason developers choose Go
+over Rust/Fides. "Just allocate and forget" is powerful ergonomics.
+
+**Solution:** Region-based arena allocators. Each scope (HTTP request, game
+frame, transaction, test case) gets a region. All allocations go into the
+arena. One `p_region_free` call frees everything. Zero pause, zero tracing,
+perfect cache locality.
+
+- [ ] **Region allocator stdlib** (`stdlib/arena.fd`)
+  - `Arena.new()` → arena handle
+  - `Arena.alloc(size)` → pointer (bump allocator, no per-allocation free)
+  - `Arena.free()` → free entire arena in one call
+  - `Arena.reset()` → mark free but keep backing memory (reuse for next frame)
+  - Backed by `p_arena_new` / `p_arena_alloc` (already in runtime)
+- [ ] **Region-scoped allocations** — `region "request" { ... }` block
+  syntax. All `alloca` inside the region go to the arena. Compiler inserts
+  `p_region_free` at block exit (including panic paths via `defer`).
+  Already partially implemented (RegionBegin/RegionEnd IR instructions exist).
+- [ ] **Region inference** — compiler auto-assigns local allocations to the
+  enclosing region when no explicit annotation is given. During prototyping,
+  you write `var x = Vec::new()` and the compiler puts it in the function's
+  arena. No annotation needed.
+- [ ] **Frame allocator** — specialized arena for game loops / event loops.
+  `frame_arena { ... }` resets at the end of each iteration. Zero allocation
+  cost after warmup (backing memory is reused).
+- [ ] **HTTP request arena** — each HTTP request gets its own arena. All
+  parsing, routing, handler allocations go into it. Freed at response time.
+  This is how nginx and Tempeh (Rust web framework) achieve GC-like
+  ergonomics without GC.
+
+**Effort:** 2-3 weeks (stdlib + compiler region inference)
+**Files:** `stdlib/arena.fd`, `src/lower.rs` (region inference), `src/interp.rs` (arena runtime)
+
+---
+
+### 15.2 Web Framework — Comptime Replace Reflection
+
+**Problem:** GC languages have ORMs, serializers, middleware, routing — all
+built on runtime reflection. Fides has no reflection.
+
+**Solution:** `comptime` + `@derive` replaces reflection entirely. Types are
+known at compile time; code is generated at compile time; zero runtime
+overhead.
+
+- [ ] **HTTP server** (`stdlib/http.fd` — stub exists, needs implementation)
+  - Request/response types with `@derive(Serialize, Deserialize)`
+  - Router with compile-time route matching (`comptime match` on path patterns)
+  - Middleware chain via effect system (`!IO`, `!Db`, `!Net` enforce ordering)
+  - Async I/O compiled to epoll/kqueue state machine (no runtime — each binary
+    contains its own event loop, hand-coded via `p_epoll_*` syscalls)
+- [ ] **ORM via comptime** (`stdlib/db.fd` — stub exists)
+  - `comptime schema("users")` reads table schema at compile time, generates
+    typed struct + query functions
+  - `@derive(Serialize, Deserialize)` for JSON ↔ struct (already implemented)
+  - No runtime reflection — all types and queries are baked into the binary
+  - Parameterized queries via typed strings (SQLString already exists)
+- [ ] **Template engine via comptime gen**
+  - `comptime template("index.html")` parses template at compile time,
+    generates typed rendering function
+  - No runtime parsing, no runtime type checking — just function calls
+- [ ] **Effect-based middleware** — `fn handler(req: Request) !IO !Db { ... }`
+  - Compiler enforces that `!Db` middleware runs before `!IO` middleware
+  - GC languages can't do this — they have no effect system
+
+**Effort:** 1-2 months (HTTP server + ORM + templates)
+**Files:** `stdlib/http.fd`, `stdlib/db.fd`, `stdlib/template.fd` (new), `src/codegen_c.rs` (epoll runtime)
+
+---
+
+### 15.3 Data Science & Scripting — Comptime Replace eval()
+
+**Problem:** Python wins with `eval()`, runtime reflection, REPL, numpy,
+pandas, matplotlib. Fides has none of these at runtime.
+
+**Solution:** `comptime` is more powerful than `eval()` — it runs code at
+compile time and bakes results into the binary. A REPL uses incremental
+compilation (already exists in `src/inc.rs`). Tensor ops use comptime shape
+inference.
+
+- [ ] **REPL mode** — `fidesc repl`
+  - Uses incremental compilation cache (`src/inc.rs` already exists)
+  - Each line compiles to native code and runs immediately
+  - No VM — direct native execution with persistent state
+  - `:type` command shows inferred types, `:ir` shows generated IR
+- [ ] **Comptime CSV/JSON schema inference**
+  - `comptime load_csv("data.csv")` parses header at compile time, generates
+    typed struct matching columns
+  - `comptime load_json("config.json")` infers types from JSON structure
+  - No runtime parsing of schema — just typed data loading
+- [ ] **Comptime shape inference for tensors**
+  - `comptime infer_shapes(model)` traces the computation graph at compile
+    time, inserts shape checks, generates specialized kernels
+  - This is what JAX and `torch.compile` do, but natively — no Python overhead
+  - Fides already has autograd, quantization, KV cache, DP noise
+- [ ] **Plotting library** (`stdlib/plot.fd` — new)
+  - `comptime gen { ... }` generates SVG/HTML plots at compile time
+  - `@derive(Debug)` gives structured data printing
+  - Notebook mode: render comptime-evaluated values as HTML
+- [ ] **Notebook mode** — `fidesc notebook <file.fd>`
+  - Each `///` comment block becomes a markdown cell
+  - Each code block is evaluated, output rendered inline
+  - Uses incremental compilation — only re-evaluates changed cells
+  - No VM, no kernel — just the Fides compiler + HTML renderer
+
+**Effort:** 2-3 months (REPL + comptime data tools + plotting + notebook)
+**Files:** `src/main.rs` (REPL mode), `stdlib/plot.fd` (new), `stdlib/data.fd` (new), `src/inc.rs` (REPL integration)
+
+---
+
+### 15.4 Rapid Prototyping — Lower the Safety Barrier
+
+**Problem:** Borrow checker + manual memory management slows iteration.
+Python/Go let you write code fast and fix safety later.
+
+**Solution:** Ergonomic modes that lower safety barriers during prototyping,
+then tighten them for production. No language changes — just compiler flags.
+
+- [ ] **`--borrowck=warn` prototyping mode** — already exists
+  - Borrow check violations become warnings, not errors
+  - Code compiles and runs; you get warnings instead of hard stops
+  - Switch to `--borrowck=on` (default) when hardening for production
+- [ ] **`--no-opt` fast compile** — already exists
+  - Skip 23 optimizer passes during prototyping for instant compile
+  - Enable `--opt` (default in `build`) for production
+- [ ] **Hot-reload JIT (dev-only)** — in roadmap
+  - JIT-compile changed functions, hot-swap into running process
+  - No VM in production — the JIT is a dev tool only
+  - Already partially implemented in debugger (`reload` command)
+- [ ] **Region-inferred mode** — `--region-infer`
+  - All local allocations auto-assigned to function-level arena
+  - No explicit region annotations needed during prototyping
+  - Switch to explicit regions when optimizing for zero-alloc
+- [ ] **`--unsafe-all` escape hatch** — wrap entire file in `unsafe {}`
+  - For quick experiments where safety checks get in the way
+  - Produces a warning on every build: "unsafe mode — not for production"
+  - Never default, never silent
+
+**Effort:** 1-2 weeks (most infrastructure already exists)
+**Files:** `src/main.rs` (flag wiring), `src/borrowck.rs` (warn mode), `src/lower.rs` (region inference)
+
+---
+
+### 15.5 Game Engine Framework — ECS via Comptime
+
+**Problem:** Game engines need entity systems, scripting, asset loading,
+hot-reload. GC languages handle this with runtime reflection and embedded
+scripting VMs (Lua).
+
+**Solution:** Fides is its own scripting language. ECS layouts are generated
+at compile time. Frame arenas handle per-frame allocations. No VM, no
+reflection, no embedded scripting language.
+
+- [ ] **Comptime ECS** (`stdlib/ecs.fd` — stub exists)
+  - `comptime register_components(Position, Velocity, Health)` generates
+    storage layout + query code at compile time
+  - `comptime query(Position, Velocity)` generates specialized iteration code
+  - No RTTI — the vtable is generated, not queried at runtime
+  - Cache-perfect iteration (struct-of-arrays generated at compile time)
+- [ ] **Frame-based arena** — from 15.1
+  - All per-frame allocations (particles, transforms, debug draws) go into
+    frame arena; freed in one shot at frame end
+  - This is how Doom Eternal and Zig game engines work
+- [ ] **Asset serialization** — `@derive(Serialize, Deserialize)` (done)
+  - Load JSON/binary assets into typed structs at runtime
+  - No reflection — deserialization code generated at compile time
+- [ ] **Scripting via comptime gen**
+  - Game scripts are Fides code compiled with `comptime gen { ... }`
+  - The "scripting language" is Fides itself — no Lua, no separate VM
+  - Scripts can be hot-reloaded via dev JIT (15.4)
+- [ ] **Hot-reload dev mode** — reload changed systems without restarting
+  - Dev JIT hot-swaps changed functions into running game
+  - Production builds are fully AOT-compiled, no JIT
+
+**Effort:** 1-2 months (ECS framework + game loop + asset pipeline)
+**Files:** `stdlib/ecs.fd`, `stdlib/game.fd` (new), `src/codegen_c.rs` (frame arena runtime)
+
+---
+
+### 15.6 The Common Thread
+
+Every "loss" is turned into a win by **moving work to compile time**:
+
+| Problem | GC language solution | Fides solution | Phase |
+|---------|---------------------|----------------|-------|
+| "Don't think about freeing" | Garbage collector | Region/arena allocator (one free call) | 15.1 |
+| "Inspect types at runtime" | Reflection | `comptime` + `@derive` | 15.2-15.3 |
+| "Run generated code" | `eval()` / VM | `comptime gen { ... }` | 15.3 |
+| "Fast iteration" | Dynamic typing | `--borrowck=warn` + `--no-opt` + hot reload | 15.4 |
+| "Serialize anything" | Runtime reflection | Compile-time derive (done) | 15.2 |
+| "Scripting in games" | Embedded Lua VM | Fides is its own scripting language | 15.5 |
+| "Per-frame allocation" | GC collects between frames | Frame arena (one free per frame) | 15.1/15.5 |
+
+**Key insight:** Fides doesn't need to add a runtime to compete with GC
+languages. It needs to make its compile-time machinery powerful enough that
+you don't miss the runtime. The building blocks already exist (comptime,
+effects, regions, derive, incremental compilation). What's missing is the
+*framework layer* that makes them ergonomic.
+
+**Risk:** Building all these frameworks is significant work, and ecosystem
+size is a moat that GC languages have spent decades building. But the
+technical approach is sound — Zig is proving the same thesis (no GC, no
+reflection, comptime), and Rust is proving that borrow checking doesn't
+prevent productivity once the ecosystem matures.
 
 ---
 

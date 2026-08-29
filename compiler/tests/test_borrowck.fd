@@ -1,0 +1,223 @@
+// SH-8.5: Test for compiler::borrowck module (rewritten from borrowck.rs)
+// Tests BorrowChecker struct, pattern_bindings, box_expr_unbox, basic
+// borrow checks, mode parsing, and helper functions.
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::borrowck;
+
+fn assert_eq(actual: str, expected: str, label: str) -> void {
+    if actual != expected {
+        print("FAIL: ");
+        print(label);
+        print(" — expected '");
+        print(expected);
+        print("', got '");
+        print(actual);
+        print("'\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_eq_i64(actual: i64, expected: i64, label: str) -> void {
+    if actual != expected {
+        print("FAIL: ");
+        print(label);
+        print(" — expected ");
+        print(int_to_str(expected));
+        print(", got ");
+        print(int_to_str(actual));
+        print("\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_true(b: bool, label: str) -> void {
+    if !b {
+        print("FAIL: ");
+        print(label);
+        print(" — expected true\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_false(b: bool, label: str) -> void {
+    if b {
+        print("FAIL: ");
+        print(label);
+        print(" — expected false\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+// Helper: make a simple Func with no params, given ret type and body
+fn make_func(name: str, ret_ty: Type, body: Vec<Stmt>) -> Func {
+    var f: Func = Func_new(name, ret_ty);
+    f.body = body;
+    return f;
+}
+
+// ── Test 1: BorrowChecker_new ──
+fn test_borrowchecker_new() -> void {
+    print("Test 1: BorrowChecker_new...\n");
+    var bc: BorrowChecker = BorrowChecker_new(BorrowckMode::On);
+    assert_eq_i64(bc.errors.len(), 0, "new checker has no errors");
+    assert_eq_i64(bc.warnings.len(), 0, "new checker has no warnings");
+    assert_eq_i64(bc.shared_borrows.len(), 0, "new checker has no shared borrows");
+    assert_eq_i64(bc.mut_borrow.len(), 0, "new checker has no mut borrows");
+    assert_eq_i64(bc.unsafe_depth, 0, "new checker unsafe_depth is 0");
+    assert_eq_i64(bc.temp_counter, 0, "new checker temp_counter is 0");
+}
+
+// ── Test 2: pattern_bindings ──
+fn test_pattern_bindings() -> void {
+    print("Test 2: pattern_bindings...\n");
+    var ident: Pattern = Pattern::Ident("x");
+    var ident_binds: Vec<str> = pattern_bindings(ident);
+    assert_eq_i64(ident_binds.len(), 1, "Ident binding count");
+    if ident_binds.len() > 0 {
+        assert_eq(ident_binds.get(0), "x", "Ident binding name");
+    }
+
+    var bindings: Vec<Binding> = Vec::new();
+    bindings.push(Binding_new("a", "i64"));
+    bindings.push(Binding_new("b", "i64"));
+    var enum_pat: Pattern = Pattern::EnumVariant("Some", "Option", bindings);
+    var enum_binds: Vec<str> = pattern_bindings(enum_pat);
+    assert_eq_i64(enum_binds.len(), 2, "EnumVariant binding count");
+    if enum_binds.len() > 0 {
+        assert_eq(enum_binds.get(0), "a", "EnumVariant first binding");
+    }
+    if enum_binds.len() > 1 {
+        assert_eq(enum_binds.get(1), "b", "EnumVariant second binding");
+    }
+
+    var wildcard: Pattern = Pattern::Wildcard;
+    var wild_binds: Vec<str> = pattern_bindings(wildcard);
+    assert_eq_i64(wild_binds.len(), 0, "Wildcard binding count");
+}
+
+// ── Test 3: box_expr_unbox ──
+fn test_box_expr_unbox() -> void {
+    print("Test 3: box_expr_unbox...\n");
+    var unboxed: Expr = box_expr_unbox(Box::new(Expr::IntLit(42)));
+    match unboxed {
+        Expr::IntLit(v) => { assert_eq_i64(v, 42, "unbox IntLit"); }
+        _ => { p_panic("unbox failed"); }
+    }
+
+    var unboxed2: Expr = box_expr_unbox(Box::new(Expr::Ident("foo")));
+    match unboxed2 {
+        Expr::Ident(n) => { assert_eq(n, "foo", "unbox Ident"); }
+        _ => { p_panic("unbox ident failed"); }
+    }
+}
+
+// ── Test 4: borrowck_mode_parse ──
+fn test_borrowck_mode_parse() -> void {
+    print("Test 4: borrowck_mode_parse...\n");
+    match borrowck_mode_parse("off") {
+        OptBorrowckMode::Some(m) => { match m { BorrowckMode::Off => { assert_true(true, "parse off"); } _ => { p_panic("off wrong"); } } }
+        OptBorrowckMode::None => { p_panic("off returned None"); }
+    }
+    match borrowck_mode_parse("warn") {
+        OptBorrowckMode::Some(m) => { match m { BorrowckMode::Warn => { assert_true(true, "parse warn"); } _ => { p_panic("warn wrong"); } } }
+        OptBorrowckMode::None => { p_panic("warn returned None"); }
+    }
+    match borrowck_mode_parse("ON") {
+        OptBorrowckMode::Some(m) => { match m { BorrowckMode::On => { assert_true(true, "parse ON"); } _ => { p_panic("on wrong"); } } }
+        OptBorrowckMode::None => { p_panic("ON returned None"); }
+    }
+    match borrowck_mode_parse("unknown") {
+        OptBorrowckMode::Some(_) => { p_panic("unknown should fail"); }
+        OptBorrowckMode::None => { assert_true(true, "parse unknown returns None"); }
+    }
+}
+
+// ── Test 5: Basic borrow check (no violations) ──
+fn test_borrow_check_ok() -> void {
+    print("Test 5: borrow_check ok...\n");
+    var body: Vec<Stmt> = Vec::new();
+    // pv r = &x
+    body.push(Stmt::Let("r", OptType::None, Expr::Ref(Box::new(Expr::Ident("x")), false), false, false, 1));
+    var f: Func = make_func("test_ok", Type::Void, body);
+    var program: Program = program_new();
+    program.funcs.push(f);
+    var bc: BorrowChecker = BorrowChecker_new(BorrowckMode::On);
+    check(&mut bc, program);
+    assert_eq_i64(bc.errors.len(), 0, "single shared borrow is ok");
+}
+
+// ── Test 6: Mutable + shared conflict ──
+fn test_borrow_conflict() -> void {
+    print("Test 6: borrow conflict...\n");
+    var body: Vec<Stmt> = Vec::new();
+    // pv mr = &mut x
+    body.push(Stmt::Let("mr", OptType::None, Expr::Ref(Box::new(Expr::Ident("x")), true), false, false, 1));
+    // pv r = &x
+    body.push(Stmt::Let("r", OptType::None, Expr::Ref(Box::new(Expr::Ident("x")), false), false, false, 2));
+    var f: Func = make_func("test_conflict", Type::Void, body);
+    var program: Program = program_new();
+    program.funcs.push(f);
+    var bc: BorrowChecker = BorrowChecker_new(BorrowckMode::On);
+    check(&mut bc, program);
+    assert_true(bc.errors.len() > 0, "&mut then & is an error");
+}
+
+// ── Test 7: Warn mode does not emit errors ──
+fn test_borrow_warn_mode() -> void {
+    print("Test 7: warn mode...\n");
+    var body: Vec<Stmt> = Vec::new();
+    body.push(Stmt::Let("mr", OptType::None, Expr::Ref(Box::new(Expr::Ident("x")), true), false, false, 1));
+    body.push(Stmt::Let("r", OptType::None, Expr::Ref(Box::new(Expr::Ident("x")), false), false, false, 2));
+    var f: Func = make_func("test_warn", Type::Void, body);
+    var program: Program = program_new();
+    program.funcs.push(f);
+    var bc: BorrowChecker = BorrowChecker_new(BorrowckMode::Warn);
+    check(&mut bc, program);
+    assert_eq_i64(bc.errors.len(), 0, "warn mode emits no errors");
+    assert_true(bc.warnings.len() > 0, "warn mode emits a warning");
+}
+
+// ── Test 8: Off mode skips checks ──
+fn test_borrow_off_mode() -> void {
+    print("Test 8: off mode...\n");
+    var body: Vec<Stmt> = Vec::new();
+    body.push(Stmt::Let("mr", OptType::None, Expr::Ref(Box::new(Expr::Ident("x")), true), false, false, 1));
+    body.push(Stmt::Let("r", OptType::None, Expr::Ref(Box::new(Expr::Ident("x")), false), false, false, 2));
+    var f: Func = make_func("test_off", Type::Void, body);
+    var program: Program = program_new();
+    program.funcs.push(f);
+    var bc: BorrowChecker = BorrowChecker_new(BorrowckMode::Off);
+    check(&mut bc, program);
+    assert_eq_i64(bc.errors.len(), 0, "off mode emits no errors");
+    assert_eq_i64(bc.warnings.len(), 0, "off mode emits no warnings");
+}
+
+fn main() -> i64 {
+    print("=== compiler::borrowck tests ===\n");
+    test_borrowchecker_new();
+    test_pattern_bindings();
+    test_box_expr_unbox();
+    test_borrowck_mode_parse();
+    test_borrow_check_ok();
+    test_borrow_conflict();
+    test_borrow_warn_mode();
+    test_borrow_off_mode();
+    print("All tests passed!\n");
+    return 0;
+}

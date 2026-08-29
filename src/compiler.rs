@@ -254,9 +254,14 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
             .parent()
             .unwrap_or(Path::new("."));
 
-        // Collect imports: start with user imports, then add transitive imports
+        // Collect imports: start with user imports, then add transitive imports.
+        // Reverse the list so that earlier imports (e.g. compiler::ast) are
+        // processed before later ones (e.g. compiler::parser) when using pop()
+        // (LIFO). This ensures struct/enum names from dependencies are available
+        // when parsing dependent modules.
         let mut imports_to_process: Vec<String> = user.imports.iter()
             .map(|i| i.path.clone())
+            .rev()
             .collect();
 
         while let Some(import_path) = imports_to_process.pop() {

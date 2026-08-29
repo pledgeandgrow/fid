@@ -1,0 +1,1082 @@
+// opt.fd — PIR Optimizer core (rewritten from src/opt.rs, 8129 LOC)
+//
+// This is the core module: Pass enum, OptStats, the optimize_l2 driver,
+// and shared helper functions. Individual passes are in:
+//   opt_const.fd  — const-fold, CSE, GVN
+//   opt_dce.fd    — DCE, DSE, SROA
+//   opt_inline.fd — inline, unroll, TCO
+//   opt_loop.fd   — loop-rotate, loop-vec, SLP vectorize
+//   opt_other.fd  — devirt, jump-thread, alias-analysis, effect-reorder,
+//                   partial-eval, strength-reduce, reassociate, memoize,
+//                   effect-opt, region-pool
+//
+// Adaptations from Rust:
+// 1. HashMap<K,V> → Vec-based maps with helper structs
+// 2. HashSet<T> → Vec<T> with contains() helper
+// 3. usize → i64, &str → str
+// 4. thread_local! → module-level var (Fides is single-threaded for now)
+// 5. closures/Fn traits → explicit function pointers (not needed — passes are pub fns)
+// 6. parallel_functions → sequential (MIN_PARALLEL_FUNCTIONS=999 means always sequential)
+// 7. Option<T> → Opt* enums or i64 sentinel values
+
+module compiler::opt;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::pir;
+
+// ─── Pass enum ───────────────────────────────────────────────────────────
+
+pub enum Pass {
+    ConstFold,
+    Cse,
+    Dce,
+    Inline,
+    Unroll,
+    Tco,
+    AliasAnalysis,
+    EffectReorder,
+    PartialEval,
+    Vectorize,
+    StrengthReduce,
+    Gvn,
+    Sroa,
+    Dse,
+    Devirt,
+    JumpThread,
+    LoopRotate,
+    LoopVectorize,
+    EffectOpt,
+    RegionPool,
+    Reassociate,
+    Memoize,
+}
+
+pub fn Pass_name(p: Pass) -> str {
+    match p {
+        Pass::ConstFold => { return "const-fold"; }
+        Pass::Cse => { return "cse"; }
+        Pass::Dce => { return "dce"; }
+        Pass::Inline => { return "inline"; }
+        Pass::Unroll => { return "unroll"; }
+        Pass::Tco => { return "tco"; }
+        Pass::AliasAnalysis => { return "alias-analysis"; }
+        Pass::EffectReorder => { return "effect-reorder"; }
+        Pass::PartialEval => { return "partial-eval"; }
+        Pass::Vectorize => { return "vectorize"; }
+        Pass::StrengthReduce => { return "strength-reduce"; }
+        Pass::Gvn => { return "gvn"; }
+        Pass::Sroa => { return "sroa"; }
+        Pass::Dse => { return "dse"; }
+        Pass::Devirt => { return "devirt"; }
+        Pass::JumpThread => { return "jump-thread"; }
+        Pass::LoopRotate => { return "loop-rotate"; }
+        Pass::LoopVectorize => { return "loop-vec"; }
+        Pass::EffectOpt => { return "effect-opt"; }
+        Pass::RegionPool => { return "region-pool"; }
+        Pass::Reassociate => { return "reassociate"; }
+        Pass::Memoize => { return "memoize"; }
+    }
+    return "unknown";
+}
+
+pub enum OptPass {
+    Some(Pass),
+    None,
+}
+
+pub fn Pass_parse(s: str) -> OptPass {
+    if str_equal(s, "const-fold") || str_equal(s, "constfold") || str_equal(s, "cf") { return OptPass::Some(Pass::ConstFold); }
+    if str_equal(s, "cse") { return OptPass::Some(Pass::Cse); }
+    if str_equal(s, "dce") { return OptPass::Some(Pass::Dce); }
+    if str_equal(s, "inline") || str_equal(s, "inl") { return OptPass::Some(Pass::Inline); }
+    if str_equal(s, "unroll") { return OptPass::Some(Pass::Unroll); }
+    if str_equal(s, "tco") { return OptPass::Some(Pass::Tco); }
+    if str_equal(s, "alias-analysis") || str_equal(s, "alias") || str_equal(s, "aa") { return OptPass::Some(Pass::AliasAnalysis); }
+    if str_equal(s, "effect-reorder") || str_equal(s, "reorder") || str_equal(s, "er") { return OptPass::Some(Pass::EffectReorder); }
+    if str_equal(s, "partial-eval") || str_equal(s, "pe") { return OptPass::Some(Pass::PartialEval); }
+    if str_equal(s, "vectorize") || str_equal(s, "vec") || str_equal(s, "auto-vec") { return OptPass::Some(Pass::Vectorize); }
+    if str_equal(s, "strength-reduce") || str_equal(s, "sr") { return OptPass::Some(Pass::StrengthReduce); }
+    if str_equal(s, "gvn") { return OptPass::Some(Pass::Gvn); }
+    if str_equal(s, "sroa") { return OptPass::Some(Pass::Sroa); }
+    if str_equal(s, "dse") { return OptPass::Some(Pass::Dse); }
+    if str_equal(s, "devirt") { return OptPass::Some(Pass::Devirt); }
+    if str_equal(s, "jump-thread") || str_equal(s, "jt") { return OptPass::Some(Pass::JumpThread); }
+    if str_equal(s, "loop-rotate") || str_equal(s, "lr") { return OptPass::Some(Pass::LoopRotate); }
+    if str_equal(s, "loop-vec") || str_equal(s, "lv") { return OptPass::Some(Pass::LoopVectorize); }
+    if str_equal(s, "effect-opt") || str_equal(s, "eo") { return OptPass::Some(Pass::EffectOpt); }
+    if str_equal(s, "region-pool") || str_equal(s, "rp") { return OptPass::Some(Pass::RegionPool); }
+    if str_equal(s, "reassociate") || str_equal(s, "reassoc") { return OptPass::Some(Pass::Reassociate); }
+    if str_equal(s, "memoize") || str_equal(s, "memo") { return OptPass::Some(Pass::Memoize); }
+    return OptPass::None;
+}
+
+/// The default pass list (LoopRotate is disabled — see comment in Rust source).
+pub fn Pass_all() -> Vec<Pass> {
+    var passes: Vec<Pass> = Vec::new();
+    passes.push(Pass::ConstFold);
+    passes.push(Pass::Cse);
+    passes.push(Pass::Gvn);
+    passes.push(Pass::Dce);
+    passes.push(Pass::Inline);
+    passes.push(Pass::Unroll);
+    passes.push(Pass::Tco);
+    passes.push(Pass::AliasAnalysis);
+    passes.push(Pass::EffectReorder);
+    passes.push(Pass::PartialEval);
+    passes.push(Pass::StrengthReduce);
+    passes.push(Pass::Sroa);
+    passes.push(Pass::Dse);
+    passes.push(Pass::Devirt);
+    passes.push(Pass::JumpThread);
+    // LoopRotate disabled — produces incorrect code with EffectReorder.
+    // passes.push(Pass::LoopRotate);
+    passes.push(Pass::LoopVectorize);
+    passes.push(Pass::EffectOpt);
+    passes.push(Pass::Reassociate);
+    passes.push(Pass::Memoize);
+    return passes;
+}
+
+// ─── OptStats ────────────────────────────────────────────────────────────
+
+pub struct OptStats {
+    pub const_fold: i64,
+    pub cse: i64,
+    pub dce: i64,
+    pub inlined: i64,
+    pub unrolled: i64,
+    pub tco: i64,
+    pub alias_analysis: i64,
+    pub effect_reorder: i64,
+    pub partial_eval: i64,
+    pub vectorize: i64,
+    pub strength_reduce: i64,
+    pub gvn: i64,
+    pub sroa: i64,
+    pub dse: i64,
+    pub devirt: i64,
+    pub jump_thread: i64,
+    pub loop_rotate: i64,
+    pub loop_vectorize: i64,
+    pub effect_opt: i64,
+    pub region_pool: i64,
+    pub reassociate: i64,
+    pub memoize: i64,
+    pub iterations: i64,
+}
+
+pub fn OptStats_new() -> OptStats {
+    return OptStats {
+        const_fold: 0,
+        cse: 0,
+        dce: 0,
+        inlined: 0,
+        unrolled: 0,
+        tco: 0,
+        alias_analysis: 0,
+        effect_reorder: 0,
+        partial_eval: 0,
+        vectorize: 0,
+        strength_reduce: 0,
+        gvn: 0,
+        sroa: 0,
+        dse: 0,
+        devirt: 0,
+        jump_thread: 0,
+        loop_rotate: 0,
+        loop_vectorize: 0,
+        effect_opt: 0,
+        region_pool: 0,
+        reassociate: 0,
+        memoize: 0,
+        iterations: 0,
+    };
+}
+
+pub fn OptStats_total(s: OptStats) -> i64 {
+    return s.const_fold + s.cse + s.dce + s.inlined + s.unrolled + s.tco
+        + s.alias_analysis + s.effect_reorder + s.partial_eval + s.vectorize
+        + s.strength_reduce + s.gvn + s.sroa + s.dse + s.devirt
+        + s.jump_thread + s.loop_rotate + s.loop_vectorize + s.effect_opt
+        + s.region_pool + s.reassociate + s.memoize;
+}
+
+// ─── LTO mode ────────────────────────────────────────────────────────────
+// Rust uses thread_local!; Fides doesn't support module-level vars.
+// We use a wrapper struct approach: L2Module could carry an lto flag,
+// but for simplicity we just pass it as a parameter where needed.
+// For now, LTO mode is handled by calling optimize_l2_lto() which uses
+// larger max_iters. The inline threshold difference is handled in
+// opt_inline.fd by checking a global flag set via set_lto_mode.
+
+// Since Fides doesn't support module-level mutable state, we use a
+// pseudo-global via a Vec<bool> singleton pattern.
+// Actually, the simplest approach: LTO only affects inline limits,
+// and we can check max_iters > 8 as a proxy for LTO mode.
+
+pub fn is_lto_mode() -> bool {
+    // LTO mode is inferred from the caller using larger iteration counts.
+    // This is a simplification — the real check is in opt_inline.fd.
+    return false;
+}
+
+// ─── Main driver: optimize_l2 ────────────────────────────────────────────
+
+pub fn optimize_l2(module: &mut L2Module) -> OptStats {
+    return optimize_l2_with(module, Pass_all(), 8);
+}
+
+pub fn optimize_l2_lto(module: &mut L2Module) -> OptStats {
+    // LTO mode: use more iterations. Inline threshold differences are
+    // handled in opt_inline.fd by checking iteration count.
+    return optimize_l2_with(module, Pass_all(), 16);
+}
+
+pub fn optimize_l2_with(module: &mut L2Module, passes: Vec<Pass>, max_iters: i64) -> OptStats {
+    var stats: OptStats = OptStats_new();
+
+    var i: i64 = 0;
+    while i < max_iters {
+        stats.iterations = i + 1;
+        var before: i64 = OptStats_total(stats);
+
+        var j: i64 = 0;
+        while j < passes.len() {
+            var p: Pass = passes.get(j);
+            // S-1A: Skip passes that can't do anything based on module-level analysis
+            if !pass_relevant_for_module(module, p) {
+                j = j + 1;
+                continue;
+            }
+            match p {
+                Pass::ConstFold => { stats.const_fold = stats.const_fold + pass_const_fold(module); }
+                Pass::Cse => { stats.cse = stats.cse + pass_cse(module); }
+                Pass::Gvn => { stats.gvn = stats.gvn + pass_gvn(module); }
+                Pass::Sroa => { stats.sroa = stats.sroa + pass_sroa(module); }
+                Pass::Dse => { stats.dse = stats.dse + pass_dse(module); }
+                Pass::Devirt => { stats.devirt = stats.devirt + pass_devirt(module); }
+                Pass::JumpThread => { stats.jump_thread = stats.jump_thread + pass_jump_thread(module); }
+                Pass::LoopRotate => { stats.loop_rotate = stats.loop_rotate + pass_loop_rotate(module); }
+                Pass::LoopVectorize => { stats.loop_vectorize = stats.loop_vectorize + pass_loop_vectorize(module); }
+                Pass::Dce => { stats.dce = stats.dce + pass_dce(module); }
+                Pass::Inline => { stats.inlined = stats.inlined + pass_inline(module); }
+                Pass::Unroll => { stats.unrolled = stats.unrolled + pass_unroll(module); }
+                Pass::Tco => { stats.tco = stats.tco + pass_tco(module); }
+                Pass::AliasAnalysis => { stats.alias_analysis = stats.alias_analysis + pass_alias_analysis(module); }
+                Pass::EffectReorder => { stats.effect_reorder = stats.effect_reorder + pass_effect_reorder(module); }
+                Pass::PartialEval => { stats.partial_eval = stats.partial_eval + pass_partial_eval(module); }
+                Pass::Vectorize => { stats.vectorize = stats.vectorize + pass_slp_vectorize(module); }
+                Pass::StrengthReduce => { stats.strength_reduce = stats.strength_reduce + pass_strength_reduce(module); }
+                Pass::EffectOpt => { stats.effect_opt = stats.effect_opt + pass_effect_optimize(module); }
+                Pass::RegionPool => { stats.region_pool = stats.region_pool + pass_region_pool(module); }
+                Pass::Reassociate => { stats.reassociate = stats.reassociate + pass_reassociate(module); }
+                Pass::Memoize => { stats.memoize = stats.memoize + pass_memoize(module); }
+            }
+            j = j + 1;
+        }
+
+        if OptStats_total(stats) == before {
+            break;
+        }
+        i = i + 1;
+    }
+
+    // Final cleanup: topologically sort all block instruction lists
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var bi: i64 = 0;
+        while bi < module.functions.get(fi).blocks.len() {
+            topo_sort_block(&mut module.functions.get(fi).blocks.get(bi), module.functions.get(fi).values);
+            bi = bi + 1;
+        }
+        fi = fi + 1;
+    }
+
+    return stats;
+}
+
+// ─── Convenience: optimize_ir_module ─────────────────────────────────────
+
+pub fn optimize_ir_module(ir_module: IrModule) -> L2Module {
+    var l1: L1Module = lower_ir_to_l1(ir_module);
+    var l2: L2Module = lower_l1_to_l2(l1);
+    var stats: OptStats = optimize_l2(&mut l2);
+    return l2;
+}
+
+// ─── S-1A: Pass relevance checking ───────────────────────────────────────
+
+pub fn pass_relevant_for_module(module: &L2Module, pass: Pass) -> bool {
+    match pass {
+        Pass::Unroll => { return module_has_loops(module); }
+        Pass::LoopRotate => { return module_has_loops(module); }
+        Pass::LoopVectorize => { return module_has_loops(module); }
+        Pass::Inline => {
+            if module.functions.len() <= 1 { return false; }
+            return module_has_call_or_dyncall(module);
+        }
+        Pass::Tco => { return module_has_tail_call(module); }
+        Pass::Devirt => { return module_has_dyncall(module); }
+        Pass::Vectorize => { return module_has_binop(module); }
+        Pass::StrengthReduce => { return module_has_binop(module); }
+        Pass::Sroa => { return module_has_alloca(module); }
+        Pass::AliasAnalysis => { return module_has_load_or_store(module); }
+        Pass::Dse => { return module_has_store(module); }
+        Pass::JumpThread => { return module_has_branch(module); }
+        Pass::EffectReorder => { return module_has_call_print_panic(module); }
+        Pass::EffectOpt => { return module_has_call_print_panic(module); }
+        Pass::PartialEval => { return module_has_const_call(module); }
+        Pass::Reassociate => { return module_has_wrapping_nested_binop(module); }
+        Pass::Memoize => { return module_has_deterministic(module); }
+        Pass::RegionPool => { return module_has_named_region_alloca(module); }
+        Pass::ConstFold => { return true; }
+        Pass::Cse => { return true; }
+        Pass::Gvn => { return true; }
+        Pass::Dce => { return true; }
+    }
+    return true;
+}
+
+fn module_has_loops(module: &L2Module) -> bool {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        if has_loops(module.functions.get(i)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn module_has_call_or_dyncall(module: &L2Module) -> bool {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f: L2Function = module.functions.get(i);
+        var j: i64 = 0;
+        while j < f.values.len() {
+            match f.values.get(j).inst {
+                L2Inst::Call(_, _, _) => { return true; }
+                L2Inst::DynCall(_, _, _, _) => { return true; }
+                _ => {}
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn module_has_dyncall(module: &L2Module) -> bool {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f: L2Function = module.functions.get(i);
+        var j: i64 = 0;
+        while j < f.values.len() {
+            match f.values.get(j).inst {
+                L2Inst::DynCall(_, _, _, _) => { return true; }
+                _ => {}
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn module_has_binop(module: &L2Module) -> bool {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f: L2Function = module.functions.get(i);
+        var j: i64 = 0;
+        while j < f.values.len() {
+            match f.values.get(j).inst {
+                L2Inst::BinOp(_, _, _, _) => { return true; }
+                _ => {}
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn module_has_alloca(module: &L2Module) -> bool {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f: L2Function = module.functions.get(i);
+        var j: i64 = 0;
+        while j < f.values.len() {
+            match f.values.get(j).inst {
+                L2Inst::Alloca(_, _) => { return true; }
+                _ => {}
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn module_has_load_or_store(module: &L2Module) -> bool {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f: L2Function = module.functions.get(i);
+        var j: i64 = 0;
+        while j < f.values.len() {
+            match f.values.get(j).inst {
+                L2Inst::Load(_, _) => { return true; }
+                L2Inst::Store(_, _, _) => { return true; }
+                _ => {}
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn module_has_store(module: &L2Module) -> bool {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f: L2Function = module.functions.get(i);
+        var j: i64 = 0;
+        while j < f.values.len() {
+            match f.values.get(j).inst {
+                L2Inst::Store(_, _, _) => { return true; }
+                _ => {}
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn module_has_branch(module: &L2Module) -> bool {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f: L2Function = module.functions.get(i);
+        var j: i64 = 0;
+        while j < f.values.len() {
+            match f.values.get(j).inst {
+                L2Inst::Branch(_, _, _) => { return true; }
+                _ => {}
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn module_has_call_print_panic(module: &L2Module) -> bool {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f: L2Function = module.functions.get(i);
+        var j: i64 = 0;
+        while j < f.values.len() {
+            match f.values.get(j).inst {
+                L2Inst::Call(_, _, _) => { return true; }
+                L2Inst::Print(_, _) => { return true; }
+                L2Inst::Panic(_) => { return true; }
+                _ => {}
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn module_has_const_call(module: &L2Module) -> bool {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f: L2Function = module.functions.get(i);
+        var j: i64 = 0;
+        while j < f.values.len() {
+            match f.values.get(j).inst {
+                L2Inst::Call(func, args, ty) => {
+                    var all_const: bool = true;
+                    var k: i64 = 0;
+                    while k < args.len() {
+                        match L2Function_get_value(f, args.get(k)) {
+                            OptL2Inst::Some(inst) => {
+                                match inst {
+                                    L2Inst::ConstInt(_, _) => {}
+                                    L2Inst::ConstFloat(_, _) => {}
+                                    L2Inst::ConstBool(_) => {}
+                                    _ => { all_const = false; }
+                                }
+                            }
+                            OptL2Inst::None => { all_const = false; }
+                        }
+                        k = k + 1;
+                    }
+                    if all_const { return true; }
+                }
+                _ => {}
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn module_has_wrapping_nested_binop(module: &L2Module) -> bool {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f: L2Function = module.functions.get(i);
+        if !f.is_wrapping { i = i + 1; continue; }
+        var j: i64 = 0;
+        while j < f.values.len() {
+            match f.values.get(j).inst {
+                L2Inst::BinOp(op, left, right, ty) => {
+                    match L2Function_get_value(f, left) {
+                        OptL2Inst::Some(L2Inst::BinOp(_, _, _, _)) => { return true; }
+                        _ => {}
+                    }
+                    match L2Function_get_value(f, right) {
+                        OptL2Inst::Some(L2Inst::BinOp(_, _, _, _)) => { return true; }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn module_has_deterministic(module: &L2Module) -> bool {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        if module.functions.get(i).is_deterministic { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn module_has_named_region_alloca(module: &L2Module) -> bool {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f: L2Function = module.functions.get(i);
+        var j: i64 = 0;
+        while j < f.values.len() {
+            match f.values.get(j).inst {
+                L2Inst::Alloca(ty, region) => {
+                    match region {
+                        MemRegion::Stack => {}
+                        MemRegion::Heap => {}
+                        _ => { return true; }
+                    }
+                }
+                _ => {}
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn module_has_tail_call(module: &L2Module) -> bool {
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f: L2Function = module.functions.get(i);
+        var bi: i64 = 0;
+        while bi < f.blocks.len() {
+            var b: L2Block = f.blocks.get(bi);
+            if b.instructions.len() > 0 {
+                var term_vid: i64 = b.instructions.get(b.instructions.len() - 1);
+                match L2Function_get_value(f, term_vid) {
+                    OptL2Inst::Some(L2Inst::Return(ret_val)) => {
+                        if ret_val >= 0 {
+                            match L2Function_get_value(f, ret_val) {
+                                OptL2Inst::Some(L2Inst::Call(_, _, _)) => { return true; }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            bi = bi + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ─── has_loops: check if a function has back-edges ───────────────────────
+
+pub fn has_loops(f: L2Function) -> bool {
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        var b: L2Block = f.blocks.get(bi);
+        if b.instructions.len() > 0 {
+            var term_vid: i64 = b.instructions.get(b.instructions.len() - 1);
+            match L2Function_get_value(f, term_vid) {
+                OptL2Inst::Some(L2Inst::Jump(target)) => {
+                    if target <= bi { return true; }
+                }
+                OptL2Inst::Some(L2Inst::Branch(cond, then_b, else_b)) => {
+                    if then_b <= bi { return true; }
+                    if else_b <= bi { return true; }
+                }
+                _ => {}
+            }
+        }
+        bi = bi + 1;
+    }
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Shared helpers: side effects, purity, value references
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Does this instruction have observable side effects?
+pub fn has_side_effects(inst: L2Inst) -> bool {
+    match inst {
+        L2Inst::Store(_, _, _) => { return true; }
+        L2Inst::Print(_, _) => { return true; }
+        L2Inst::Panic(_) => { return true; }
+        L2Inst::Return(_) => { return true; }
+        L2Inst::Jump(_) => { return true; }
+        L2Inst::Branch(_, _, _) => { return true; }
+        L2Inst::Unreachable => { return true; }
+        L2Inst::TryUnwrap(_, _, _, _) => { return true; }
+        L2Inst::Call(func, _, _) => { return !is_known_pure_func(func); }
+        L2Inst::CallPtr(_, _, _, _) => { return true; }
+        L2Inst::DynCall(_, _, _, _) => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+/// Check if a function name is known to be pure (no side effects).
+pub fn is_known_pure_func(name: str) -> bool {
+    // Pure arithmetic helpers
+    if str_equal(name, "p_add") { return true; }
+    if str_equal(name, "p_sub") { return true; }
+    if str_equal(name, "p_mul") { return true; }
+    if str_equal(name, "p_div") { return true; }
+    if str_equal(name, "p_mod") { return true; }
+    // Pure comparison helpers
+    if str_equal(name, "p_eq") { return true; }
+    if str_equal(name, "p_neq") { return true; }
+    if str_equal(name, "p_lt") { return true; }
+    if str_equal(name, "p_gt") { return true; }
+    if str_equal(name, "p_le") { return true; }
+    if str_equal(name, "p_ge") { return true; }
+    // Pure conversion helpers
+    if str_equal(name, "p_int_to_float") { return true; }
+    if str_equal(name, "p_float_to_int") { return true; }
+    if str_equal(name, "p_int_extend") { return true; }
+    if str_equal(name, "p_int_trunc") { return true; }
+    // Pure string accessors
+    if str_equal(name, "p_string_len") { return true; }
+    if str_equal(name, "p_string_contains") { return true; }
+    if str_equal(name, "p_string_starts_with") { return true; }
+    if str_equal(name, "p_string_ends_with") { return true; }
+    if str_equal(name, "p_string_trim") { return true; }
+    if str_equal(name, "p_string_to_uppercase") { return true; }
+    if str_equal(name, "p_string_to_lowercase") { return true; }
+    if str_equal(name, "p_string_replace") { return true; }
+    if str_equal(name, "p_string_split") { return true; }
+    if str_equal(name, "p_string_char_at") { return true; }
+    // Pure vec accessors
+    if str_equal(name, "p_vec_len") { return true; }
+    if str_equal(name, "p_vec_get") { return true; }
+    if str_equal(name, "p_vec_contains") { return true; }
+    // Pure option/result
+    if str_equal(name, "p_option_some") { return true; }
+    if str_equal(name, "p_option_none") { return true; }
+    if str_equal(name, "p_option_is_some") { return true; }
+    if str_equal(name, "p_option_is_none") { return true; }
+    if str_equal(name, "p_result_ok") { return true; }
+    if str_equal(name, "p_result_err") { return true; }
+    if str_equal(name, "p_result_is_ok") { return true; }
+    if str_equal(name, "p_result_is_err") { return true; }
+    return false;
+}
+
+/// Is this instruction pure (no side effects, deterministic)?
+pub fn is_pure(inst: L2Inst) -> bool {
+    if has_side_effects(inst) { return false; }
+    match inst {
+        L2Inst::ConstInt(_, _) => { return true; }
+        L2Inst::ConstFloat(_, _) => { return true; }
+        L2Inst::ConstBool(_) => { return true; }
+        L2Inst::ConstStr(_) => { return true; }
+        L2Inst::ConstNull(_) => { return true; }
+        L2Inst::BinOp(_, _, _, _) => { return true; }
+        L2Inst::UnaryOp(_, _, _) => { return true; }
+        L2Inst::GetFieldPtr(_, _, _) => { return true; }
+        L2Inst::GetElemPtr(_, _, _) => { return true; }
+        L2Inst::BitCast(_, _, _) => { return true; }
+        L2Inst::IntExtend(_, _, _) => { return true; }
+        L2Inst::IntTrunc(_, _, _) => { return true; }
+        L2Inst::IntToFloat(_, _, _) => { return true; }
+        L2Inst::FloatToInt(_, _, _) => { return true; }
+        // NOTE: Alloca is NOT pure — each alloca returns a unique memory location.
+        _ => { return false; }
+    }
+    return false;
+}
+
+/// Check if an instruction is a call to a @deterministic user function.
+pub fn is_cseable_call(inst: L2Inst, det_funcs: Vec<str>) -> bool {
+    match inst {
+        L2Inst::Call(func, _, _) => { return str_vec_contains(det_funcs, func); }
+        _ => { return false; }
+    }
+    return false;
+}
+
+/// All PValue operands read by this instruction.
+pub fn value_refs(inst: L2Inst) -> Vec<i64> {
+    var result: Vec<i64> = Vec::new();
+    match inst {
+        L2Inst::ConstInt(_, _) => { return result; }
+        L2Inst::ConstFloat(_, _) => { return result; }
+        L2Inst::ConstBool(_) => { return result; }
+        L2Inst::ConstStr(_) => { return result; }
+        L2Inst::ConstNull(_) => { return result; }
+        L2Inst::Jump(_) => { return result; }
+        L2Inst::Unreachable => { return result; }
+        L2Inst::Panic(_) => { return result; }
+        L2Inst::BinOp(_, left, right, _) => {
+            result.push(left);
+            result.push(right);
+            return result;
+        }
+        L2Inst::UnaryOp(_, operand, _) => {
+            result.push(operand);
+            return result;
+        }
+        L2Inst::Alloca(_, _) => { return result; }
+        L2Inst::Load(ptr, _) => {
+            result.push(ptr);
+            return result;
+        }
+        L2Inst::Store(ptr, value, _) => {
+            result.push(ptr);
+            result.push(value);
+            return result;
+        }
+        L2Inst::GetFieldPtr(struct_ptr, _, _) => {
+            result.push(struct_ptr);
+            return result;
+        }
+        L2Inst::GetElemPtr(array_ptr, index, _) => {
+            result.push(array_ptr);
+            result.push(index);
+            return result;
+        }
+        L2Inst::Branch(cond, _, _) => {
+            result.push(cond);
+            return result;
+        }
+        L2Inst::Return(ret_val) => {
+            if ret_val >= 0 {
+                result.push(ret_val);
+            }
+            return result;
+        }
+        L2Inst::Call(_, args, _) => { return args; }
+        L2Inst::DynCall(_, _, args, _) => { return args; }
+        L2Inst::CallPtr(fn_ptr, args, _, _) => {
+            result.push(fn_ptr);
+            var i: i64 = 0;
+            while i < args.len() {
+                result.push(args.get(i));
+                i = i + 1;
+            }
+            return result;
+        }
+        L2Inst::MakeDyn(value, _, _) => {
+            result.push(value);
+            return result;
+        }
+        L2Inst::BitCast(value, _, _) => {
+            result.push(value);
+            return result;
+        }
+        L2Inst::Copy(value, _) => {
+            result.push(value);
+            return result;
+        }
+        L2Inst::IntExtend(value, _, _) => {
+            result.push(value);
+            return result;
+        }
+        L2Inst::IntTrunc(value, _, _) => {
+            result.push(value);
+            return result;
+        }
+        L2Inst::IntToFloat(value, _, _) => {
+            result.push(value);
+            return result;
+        }
+        L2Inst::FloatToInt(value, _, _) => {
+            result.push(value);
+            return result;
+        }
+        L2Inst::TryUnwrap(value, ok_dst, _, _) => {
+            result.push(value);
+            result.push(ok_dst);
+            return result;
+        }
+        L2Inst::Print(value, _) => {
+            result.push(value);
+            return result;
+        }
+    }
+    return result;
+}
+
+/// Collect every PValue that is *used* anywhere in the function.
+pub fn collect_used_values(f: L2Function) -> Vec<i64> {
+    var used: Vec<i64> = Vec::new();
+    // Block params are live
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        var pi: i64 = 0;
+        while pi < f.blocks.get(bi).params.len() {
+            used_push(&mut used, f.blocks.get(bi).params.get(pi).id);
+            pi = pi + 1;
+        }
+        bi = bi + 1;
+    }
+    // Function params are live
+    var pi: i64 = 0;
+    while pi < f.params.len() {
+        used_push(&mut used, f.params.get(pi).id);
+        pi = pi + 1;
+    }
+    // Every operand reference
+    var vi: i64 = 0;
+    while vi < f.values.len() {
+        var refs: Vec<i64> = value_refs(f.values.get(vi).inst);
+        var ri: i64 = 0;
+        while ri < refs.len() {
+            used_push(&mut used, refs.get(ri));
+            ri = ri + 1;
+        }
+        vi = vi + 1;
+    }
+    return used;
+}
+
+/// Push to used vec if not already present (dedup).
+fn used_push(used: &mut Vec<i64>, val: i64) {
+    var i: i64 = 0;
+    while i < used.len() {
+        if used.get(i) == val { return; }
+        i = i + 1;
+    }
+    used.push(val);
+}
+
+/// Check if a value is in a Vec<i64>.
+pub fn i64_vec_contains(vec: Vec<i64>, val: i64) -> bool {
+    var i: i64 = 0;
+    while i < vec.len() {
+        if vec.get(i) == val { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Check if a string is in a Vec<str>.
+pub fn str_vec_contains(vec: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < vec.len() {
+        if str_equal(vec.get(i), s) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ─── Topological sort of block instructions ──────────────────────────────
+
+pub fn topo_sort_block(b: &mut L2Block, values: Vec<ValueIdL2Entry>) {
+    var insts: Vec<i64> = b.instructions;
+    if insts.len() == 0 { return; }
+
+    // Build inst_set for quick lookup
+    var inst_set: Vec<i64> = insts;
+
+    // Build dependency lists: for each instruction, which other instructions
+    // in this block must come before it?
+    // deps: Vec<i64> per instruction — stored as flat Vec<DepEntry>
+    var deps: Vec<DepEntry> = Vec::new();
+    var i: i64 = 0;
+    while i < insts.len() {
+        var id: i64 = insts.get(i);
+        var inst: L2Inst;
+        match lookup_value(values, id) {
+            OptL2Inst::Some(found) => { inst = found; }
+            OptL2Inst::None => {
+                deps.push(DepEntry_new(id, Vec::new()));
+                i = i + 1;
+                continue;
+            }
+        }
+        var refs: Vec<i64> = value_refs(inst);
+        // Filter to only refs that are in this block
+        var block_refs: Vec<i64> = Vec::new();
+        var j: i64 = 0;
+        while j < refs.len() {
+            if i64_vec_contains(inst_set, refs.get(j)) {
+                block_refs.push(refs.get(j));
+            }
+            j = j + 1;
+        }
+        // Terminators must come last — depend on ALL other instructions
+        var is_term: bool = false;
+        match inst {
+            L2Inst::Return(_) => { is_term = true; }
+            L2Inst::Jump(_) => { is_term = true; }
+            L2Inst::Branch(_, _, _) => { is_term = true; }
+            L2Inst::Unreachable => { is_term = true; }
+            _ => {}
+        }
+        if is_term {
+            var all_others: Vec<i64> = Vec::new();
+            var k: i64 = 0;
+            while k < insts.len() {
+                if insts.get(k) != id {
+                    all_others.push(insts.get(k));
+                }
+                k = k + 1;
+            }
+            deps.push(DepEntry_new(id, all_others));
+        } else {
+            deps.push(DepEntry_new(id, block_refs));
+        }
+        i = i + 1;
+    }
+
+    // Kahn's algorithm: repeatedly pick the instruction with all deps
+    // satisfied and the lowest original position.
+    var visited: Vec<i64> = Vec::new();
+    var result: Vec<i64> = Vec::new();
+
+    while result.len() < insts.len() {
+        // Find all instructions whose deps are all visited
+        var ready: Vec<i64> = Vec::new();
+        var j: i64 = 0;
+        while j < insts.len() {
+            var id: i64 = insts.get(j);
+            if i64_vec_contains(visited, id) {
+                j = j + 1;
+                continue;
+            }
+            // Check if all deps are visited
+            var all_deps_visited: bool = true;
+            var di: i64 = 0;
+            while di < deps.len() {
+                if deps.get(di).id == id {
+                    var dk: i64 = 0;
+                    while dk < deps.get(di).deps.len() {
+                        if !i64_vec_contains(visited, deps.get(di).deps.get(dk)) {
+                            all_deps_visited = false;
+                        }
+                        dk = dk + 1;
+                    }
+                }
+                di = di + 1;
+            }
+            if all_deps_visited {
+                ready.push(id);
+            }
+            j = j + 1;
+        }
+
+        if ready.len() == 0 {
+            // Cycle detected — append remaining in original order
+            var k: i64 = 0;
+            while k < insts.len() {
+                if !i64_vec_contains(visited, insts.get(k)) {
+                    result.push(insts.get(k));
+                    visited.push(insts.get(k));
+                }
+                k = k + 1;
+            }
+            break;
+        }
+
+        // Pick the first ready instruction (lowest original position — they're
+        // already in original order since we iterated insts in order)
+        var id: i64 = ready.get(0);
+        visited.push(id);
+        result.push(id);
+    }
+
+    if result.len() == insts.len() {
+        b.instructions = result;
+    }
+}
+
+// Dep entry for topo sort
+struct DepEntry {
+    id: i64,
+    deps: Vec<i64>,
+}
+
+fn DepEntry_new(id: i64, deps: Vec<i64>) -> DepEntry {
+    return DepEntry { id: id, deps: deps };
+}
+
+// Lookup a value by id in a Vec<ValueIdL2Entry>
+fn lookup_value(values: Vec<ValueIdL2Entry>, id: i64) -> OptL2Inst {
+    var i: i64 = 0;
+    while i < values.len() {
+        if values.get(i).id == id {
+            return OptL2Inst::Some(values.get(i).inst);
+        }
+        i = i + 1;
+    }
+    return OptL2Inst::None;
+}
+
+// ─── Forward declarations for pass functions ─────────────────────────────
+// These are implemented in the opt_*.fd files. We declare them here so the
+// driver can call them. In Fides, cross-module function calls resolve at link
+// time, so these just need to be pub fn in the respective modules.
+// Since Fides doesn't have a module system for splitting files yet, we'll
+// implement all passes in this file for now.
+
+// === STUB IMPLEMENTATIONS ===
+// The actual pass implementations will be added incrementally.
+// For now, these return 0 (no changes made).
+
+pub fn pass_const_fold(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_cse(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_gvn(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_sroa(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_dse(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_devirt(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_jump_thread(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_loop_rotate(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_loop_vectorize(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_dce(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_inline(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_unroll(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_tco(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_alias_analysis(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_effect_reorder(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_partial_eval(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_slp_vectorize(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_strength_reduce(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_effect_optimize(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_region_pool(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_reassociate(module: &mut L2Module) -> i64 { return 0; }
+pub fn pass_memoize(module: &mut L2Module) -> i64 { return 0; }

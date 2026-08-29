@@ -1221,11 +1221,13 @@ impl CCodeGen {
                 match meta.ty {
                     IrType::Void | IrType::Never => {
                         // Skip void variables — use placeholder
-                        wln!(self, "    int64_t v{}; /* placeholder for void */", id.0);
+                        wln!(self, "    int64_t v{} = 0; /* placeholder for void */", id.0);
                     }
                     _ => {
                         let ty = Self::c_type(&meta.ty);
-                        wln!(self, "    {} v{};", ty, id.0);
+                        // Zero-initialize to prevent uninitialized variable bugs
+                        // when code paths skip the assignment (e.g. conditional branches)
+                        wln!(self, "    {} v{} = 0;", ty, id.0);
                     }
                 }
                 self.value_names.insert(id.0, format!("v{}", id.0));
@@ -1342,7 +1344,9 @@ impl CCodeGen {
                 };
                 // Ensure at least 1 byte to avoid malloc(0) undefined behavior
                 let size = if size == 0 { 8 } else { size };
-                wln!(self, "    {} = malloc({});", dst, size);
+                // Use calloc to zero-initialize memory, preventing uninitialized
+                // variable bugs when code paths skip the initialization store.
+                wln!(self, "    {} = calloc(1, {});", dst, size);
             }
             Inst::Load { ptr, ty } => {
                 let p = self.val_name(*ptr);

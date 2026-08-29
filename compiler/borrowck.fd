@@ -1,0 +1,1820 @@
+// borrowck.fd — Borrow checker for Fides, rewritten from src/borrowck.rs (1221 LOC)
+//
+// Runs as a separate pass AFTER typechecking succeeds and BEFORE comptime
+// substitution / monomorphization. Catches three classes of bugs at zero
+// runtime cost:
+//
+// 1. Creating &mut x while any borrow (& or &mut) on x is active.
+// 2. Creating &x while &mut x is active.
+// 3. Mutating x (assign, index-assign, deref-assign, method call on x)
+//    while any borrow on x is active.
+//
+// unsafe { ... } blocks skip all checks (reuses the same escape hatch as
+// raw pointers).
+//
+// Borrows end lexically: when the borrower goes out of scope or is
+// reassigned. NLL (non-lexical lifetimes) releases borrows at the borrower's
+// last use rather than at scope end.
+//
+// Adaptations from Rust:
+// 1. HashMap<K,V> → Vec-based maps with helper structs (Fides HashMap is i64→i64)
+// 2. HashSet<T> → Vec<T> with contains() helper
+// 3. String → str, usize → i64
+// 4. Option<T> → OptStr / custom Opt enums
+// 5. Box<Expr> auto-unboxes in match patterns
+// 6. format! → string concatenation with int_to_str
+// 7. .clone() → not needed (Fides values are copied by value)
+// 8. matches! macro → explicit match with _ => false
+// 9. No module-level mutable state → mode passed as parameter / stored in struct
+//
+// Dependencies: compiler::ast
+
+module compiler::borrowck;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+
+// ─── Vec-based map entry structs ──────────────────────────────────────────
+// These replace HashMap<String, T> with Vec<Entry> + linear search.
+
+// shared_borrows: var → set of borrowers (Vec<str>)
+pub struct SharedBorrowEntry {
+    pub key: str,
+    pub borrowers: Vec<str>,
+}
+
+pub fn SharedBorrowEntry_new(key: str) -> SharedBorrowEntry {
+    return SharedBorrowEntry { key: key, borrowers: Vec::new() };
+}
+
+// mut_borrow: var → optional single borrower
+pub struct MutBorrowEntry {
+    pub key: str,
+    pub borrower: OptStr,
+}
+
+pub fn MutBorrowEntry_new(key: str, borrower: OptStr) -> MutBorrowEntry {
+    return MutBorrowEntry { key: key, borrower: borrower };
+}
+
+// borrow_of: borrower → (borrowed_var, is_mut)
+pub struct BorrowOfEntry {
+    pub borrower: str,
+    pub borrowed: str,
+    pub is_mut: bool,
+}
+
+pub fn BorrowOfEntry_new(borrower: str, borrowed: str, is_mut: bool) -> BorrowOfEntry {
+    return BorrowOfEntry { borrower: borrower, borrowed: borrowed, is_mut: is_mut };
+}
+
+// reserved_mut_borrows: Vec<(path, borrower, line)>
+pub struct ReservedMutBorrow {
+    pub path: str,
+    pub borrower: str,
+    pub line: i64,
+}
+
+pub fn ReservedMutBorrow_new(path: str, borrower: str, line: i64) -> ReservedMutBorrow {
+    return ReservedMutBorrow { path: path, borrower: borrower, line: line };
+}
+
+// last_use: var → last statement index
+pub struct StringI64Entry {
+    pub key: str,
+    pub val: i64,
+}
+
+pub fn StringI64Entry_new(key: str, val: i64) -> StringI64Entry {
+    return StringI64Entry { key: key, val: val };
+}
+
+// Wrapper for Vec<str> to avoid Vec<Vec<str>> >> parse issue
+pub struct StringVec {
+    pub items: Vec<str>,
+}
+
+pub fn StringVec_new() -> StringVec {
+    return StringVec { items: Vec::new() };
+}
+
+// ─── Box unbox helper ────────────────────────────────────────────────────
+// Fides match patterns on Box<Expr> auto-unbox for matching, but the extracted
+// fields are still Box<Expr>. This helper converts Box<Expr> back to Expr
+// for passing to functions that expect unboxed values.
+
+pub fn box_expr_unbox(b: Box<Expr>) -> Expr {
+    match b {
+        Expr::IntLit(v) => { return Expr::IntLit(v); }
+        Expr::FloatLit(v) => { return Expr::FloatLit(v); }
+        Expr::StringLit(v) => { return Expr::StringLit(v); }
+        Expr::BoolLit(v) => { return Expr::BoolLit(v); }
+        Expr::Ident(n) => { return Expr::Ident(n); }
+        Expr::Binary(op, l, r) => { return Expr::Binary(op, l, r); }
+        Expr::Unary(op, e) => { return Expr::Unary(op, e); }
+        Expr::Call(c, args) => { return Expr::Call(c, args); }
+        Expr::FieldAccess(e, f) => { return Expr::FieldAccess(e, f); }
+        Expr::OptionalFieldAccess(e, f) => { return Expr::OptionalFieldAccess(e, f); }
+        Expr::StructLit(n, fields, spread) => { return Expr::StructLit(n, fields, spread); }
+        Expr::If(c, t, e) => { return Expr::If(c, t, e); }
+        Expr::Range(s, e, inclusive) => { return Expr::Range(s, e, inclusive); }
+        Expr::Block(stmts) => { return Expr::Block(stmts); }
+        Expr::MethodCall(recv, m, args) => { return Expr::MethodCall(recv, m, args); }
+        Expr::ArrayLit(et, elems) => { return Expr::ArrayLit(et, elems); }
+        Expr::Index(arr, idx) => { return Expr::Index(arr, idx); }
+        Expr::FString(parts) => { return Expr::FString(parts); }
+        Expr::Match(e, arms) => { return Expr::Match(e, arms); }
+        Expr::EnumLit(en, vn, args) => { return Expr::EnumLit(en, vn, args); }
+        Expr::Ref(e, is_mut) => { return Expr::Ref(e, is_mut); }
+        Expr::Deref(e) => { return Expr::Deref(e); }
+        Expr::StrConcat(l, r) => { return Expr::StrConcat(l, r); }
+        Expr::Try(e) => { return Expr::Try(e); }
+        Expr::Coalesce(e, d) => { return Expr::Coalesce(e, d); }
+        Expr::IsCheck(e, t) => { return Expr::IsCheck(e, t); }
+        Expr::TryBlock(body) => { return Expr::TryBlock(body); }
+        Expr::TupleLit(elems) => { return Expr::TupleLit(elems); }
+        Expr::Closure(p, b, r) => { return Expr::Closure(p, b, r); }
+        Expr::Cast(e, ty) => { return Expr::Cast(e, ty); }
+        Expr::Asm(s, ops) => { return Expr::Asm(s, ops); }
+        Expr::Comptime(e) => { return Expr::Comptime(e); }
+        Expr::ComptimeBlock(s) => { return Expr::ComptimeBlock(s); }
+        Expr::ComptimeReflect(op, ty) => { return Expr::ComptimeReflect(op, ty); }
+        Expr::PipeForward(l, r) => { return Expr::PipeForward(l, r); }
+        Expr::QuantCast(e, ty) => { return Expr::QuantCast(e, ty); }
+        Expr::Await(e) => { return Expr::Await(e); }
+        Expr::Spawn(e) => { return Expr::Spawn(e); }
+    }
+    return Expr::IntLit(0);
+}
+
+// ─── BorrowckMode ─────────────────────────────────────────────────────────
+// Borrow checker mode, controlled by --borrowck=off|warn|on.
+// 0 = Off, 1 = Warn, 2 = On. Default is 2 (On).
+
+pub enum BorrowckMode {
+    Off,
+    Warn,
+    On,
+}
+
+// Parse from a string (used by CLI flag --borrowck=...).
+pub fn borrowck_mode_parse(s: str) -> OptBorrowckMode {
+    var lower: str = str_to_lower(s);
+    if str_equal(lower, "off") { return OptBorrowckMode::Some(BorrowckMode::Off); }
+    if str_equal(lower, "0") { return OptBorrowckMode::Some(BorrowckMode::Off); }
+    if str_equal(lower, "no") { return OptBorrowckMode::Some(BorrowckMode::Off); }
+    if str_equal(lower, "warn") { return OptBorrowckMode::Some(BorrowckMode::Warn); }
+    if str_equal(lower, "warning") { return OptBorrowckMode::Some(BorrowckMode::Warn); }
+    if str_equal(lower, "w") { return OptBorrowckMode::Some(BorrowckMode::Warn); }
+    if str_equal(lower, "on") { return OptBorrowckMode::Some(BorrowckMode::On); }
+    if str_equal(lower, "1") { return OptBorrowckMode::Some(BorrowckMode::On); }
+    if str_equal(lower, "yes") { return OptBorrowckMode::Some(BorrowckMode::On); }
+    if str_equal(lower, "err") { return OptBorrowckMode::Some(BorrowckMode::On); }
+    if str_equal(lower, "error") { return OptBorrowckMode::Some(BorrowckMode::On); }
+    return OptBorrowckMode::None;
+}
+
+pub enum OptBorrowckMode {
+    Some(BorrowckMode),
+    None,
+}
+
+// ─── BorrowChecker struct ─────────────────────────────────────────────────
+// Holds maps that together encode the borrow state of every variable in the
+// current function.
+
+pub struct BorrowChecker {
+    // var → set of variables currently holding a shared borrow (&x) of it.
+    pub shared_borrows: Vec<SharedBorrowEntry>,
+
+    // var → the single variable currently holding a mutable borrow (&mut x).
+    // OptStr::None means no active mutable borrow.
+    pub mut_borrow: Vec<MutBorrowEntry>,
+
+    // borrower → (borrowed_var, is_mut). Used to release a borrow when the
+    // borrower goes out of scope or is reassigned.
+    pub borrow_of: Vec<BorrowOfEntry>,
+
+    // Stack of scopes; each scope is the set of variable names declared in it.
+    // On scope pop, all borrows held by names in that scope are released.
+    pub scope_stack: Vec<StringVec>,
+
+    // Current unsafe { ... } nesting depth. When > 0, all checks are skipped.
+    pub unsafe_depth: i64,
+
+    // Current function name (for error messages).
+    pub current_func: OptStr,
+
+    // Counter for synthetic temporary borrower names (e.g. __tmp_ref_0).
+    pub temp_counter: i64,
+
+    // Stack of checkpoints — each records temp_counter at the start of a
+    // Call/MethodCall. After the call, all temps >= checkpoint are released.
+    pub temp_checkpoints: Vec<i64>,
+
+    // Phase 4: Two-phase borrow support. Reserved &mut borrows.
+    pub reserved_mut_borrows: Vec<ReservedMutBorrow>,
+
+    // Phase 4: When true, &mut borrows are collected as "reserved" instead
+    // of immediately activated.
+    pub in_reservation_phase: bool,
+
+    // Phase 6: NLL. Maps each variable name to the last statement index.
+    pub last_use: Vec<StringI64Entry>,
+
+    // Phase 6: Current statement index within the function body.
+    pub stmt_index: i64,
+
+    // Collected errors (only populated in On mode; Warn uses warnings).
+    pub errors: Vec<str>,
+
+    // Collected warnings (populated in Warn mode).
+    pub warnings: Vec<str>,
+
+    // Active mode — controls whether violations become errors or warnings.
+    pub mode: BorrowckMode,
+}
+
+pub fn BorrowChecker_new(mode: BorrowckMode) -> BorrowChecker {
+    var scope: StringVec = StringVec_new();
+    var scope_stack: Vec<StringVec> = Vec::new();
+    scope_stack.push(scope);
+    return BorrowChecker {
+        shared_borrows: Vec::new(),
+        mut_borrow: Vec::new(),
+        borrow_of: Vec::new(),
+        scope_stack: scope_stack,
+        unsafe_depth: 0,
+        current_func: OptStr::None,
+        temp_counter: 0,
+        temp_checkpoints: Vec::new(),
+        reserved_mut_borrows: Vec::new(),
+        in_reservation_phase: false,
+        last_use: Vec::new(),
+        stmt_index: 0,
+        errors: Vec::new(),
+        warnings: Vec::new(),
+        mode: mode,
+    };
+}
+
+// ─── Check entry points ───────────────────────────────────────────────────
+
+// Check an entire program. Walks every function and impl method body.
+pub fn check(self: &mut BorrowChecker, program: Program) -> void {
+    var i: i64 = 0;
+    while i < program.funcs.len() {
+        var f: Func = program.funcs.get(i);
+        check_func(self, f);
+        i = i + 1;
+    }
+    var j: i64 = 0;
+    while j < program.impls.len() {
+        var impl_: ImplDef = program.impls.get(j);
+        var k: i64 = 0;
+        while k < impl_.methods.len() {
+            var m: Func = impl_.methods.get(k);
+            check_func(self, m);
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+}
+
+// Check a single function. Resets all borrow state between functions.
+pub fn check_func(self: &mut BorrowChecker, func: Func) -> void {
+    // Reset state — borrows don't cross function boundaries.
+    self.shared_borrows.clear();
+    self.mut_borrow.clear();
+    self.borrow_of.clear();
+    var scope: StringVec = StringVec_new();
+    var scope_stack: Vec<StringVec> = Vec::new();
+    scope_stack.push(scope);
+    self.scope_stack = scope_stack;
+    self.unsafe_depth = 0;
+    self.current_func = OptStr::Some(func.name);
+    self.temp_counter = 0;
+    self.temp_checkpoints.clear();
+    self.reserved_mut_borrows.clear();
+    self.in_reservation_phase = false;
+    self.last_use.clear();
+    self.stmt_index = 0;
+
+    // Phase 6: NLL pre-pass. Compute the last statement index that references
+    // each variable. This lets us release borrows at the borrower's last use
+    // rather than at scope end.
+    compute_last_use(self, func.body);
+
+    // Parameters are in scope at function entry.
+    var p: i64 = 0;
+    while p < func.params.len() {
+        var param: Param = func.params.get(p);
+        scope_stack_push_name(self, param.name);
+        p = p + 1;
+    }
+
+    var i: i64 = 0;
+    while i < func.body.len() {
+        self.stmt_index = i;
+        // Phase 6: Release borrows for borrowers whose last use was before
+        // this statement (NLL).
+        release_dead_borrows(self);
+        var stmt: Stmt = func.body.get(i);
+        check_stmt(self, stmt);
+        i = i + 1;
+    }
+
+    // Pop the function scope — releases any remaining borrows.
+    pop_scope(self);
+    self.current_func = OptStr::None;
+}
+
+// ─── Phase 6: NLL pre-pass ────────────────────────────────────────────────
+
+// Compute the last statement index that references each variable.
+fn compute_last_use(self: &mut BorrowChecker, body: Vec<Stmt>) -> void {
+    var i: i64 = 0;
+    while i < body.len() {
+        var stmt: Stmt = body.get(i);
+        collect_var_uses_stmt(self, stmt, i);
+        i = i + 1;
+    }
+}
+
+// Recursively collect all variable references in a statement and update
+// their last-use index.
+fn collect_var_uses_stmt(self: &mut BorrowChecker, stmt: Stmt, idx: i64) -> void {
+    match stmt {
+        Stmt::Let(name, _, expr, _, _, _) => {
+            collect_var_uses_expr(self, expr, idx);
+            last_use_set(self, name, idx);
+        }
+        Stmt::LetTuple(names, expr, _) => {
+            collect_var_uses_expr(self, expr, idx);
+            var n: i64 = 0;
+            while n < names.len() {
+                last_use_set(self, names.get(n), idx);
+                n = n + 1;
+            }
+        }
+        Stmt::LetUninit(name, _, _) => {
+            last_use_set(self, name, idx);
+        }
+        Stmt::Assign(target, _, expr, _) => {
+            last_use_set(self, target, idx);
+            collect_var_uses_expr(self, expr, idx);
+        }
+        Stmt::IndexAssign(array, index, _, expr, _) => {
+            last_use_set(self, array, idx);
+            collect_var_uses_expr(self, index, idx);
+            collect_var_uses_expr(self, expr, idx);
+        }
+        Stmt::DerefAssign(ptr_expr, _, expr, _) => {
+            collect_var_uses_expr(self, ptr_expr, idx);
+            collect_var_uses_expr(self, expr, idx);
+        }
+        Stmt::FieldAssign(object, _, _, expr, _) => {
+            collect_var_uses_expr(self, object, idx);
+            collect_var_uses_expr(self, expr, idx);
+        }
+        Stmt::Expr(e, _) => { collect_var_uses_expr(self, e, idx); }
+        Stmt::Return(opt_e, _) => {
+            match opt_e {
+                OptBoxExpr::Some(e) => { collect_var_uses_expr(self, box_expr_unbox(e), idx); }
+                OptBoxExpr::None => {}
+            }
+        }
+        Stmt::If(cond, then_block, else_block, _) => {
+            collect_var_uses_expr(self, cond, idx);
+            var t: i64 = 0;
+            while t < then_block.len() {
+                collect_var_uses_stmt(self, then_block.get(t), idx);
+                t = t + 1;
+            }
+            match else_block {
+                OptStmts::Some(eb) => {
+                    var e: i64 = 0;
+                    while e < eb.len() {
+                        collect_var_uses_stmt(self, eb.get(e), idx);
+                        e = e + 1;
+                    }
+                }
+                OptStmts::None => {}
+            }
+        }
+        Stmt::While(cond, body, _) => {
+            collect_var_uses_expr(self, cond, idx);
+            var b: i64 = 0;
+            while b < body.len() {
+                collect_var_uses_stmt(self, body.get(b), idx);
+                b = b + 1;
+            }
+        }
+        Stmt::For(loop_var, iterator, body, _) => {
+            collect_var_uses_expr(self, iterator, idx);
+            last_use_set(self, loop_var, idx);
+            var b: i64 = 0;
+            while b < body.len() {
+                collect_var_uses_stmt(self, body.get(b), idx);
+                b = b + 1;
+            }
+        }
+        Stmt::Loop(body, _) => {
+            var b: i64 = 0;
+            while b < body.len() {
+                collect_var_uses_stmt(self, body.get(b), idx);
+                b = b + 1;
+            }
+        }
+        Stmt::Break(opt_e, _) => {
+            match opt_e {
+                OptBoxExpr::Some(e) => { collect_var_uses_expr(self, box_expr_unbox(e), idx); }
+                OptBoxExpr::None => {}
+            }
+        }
+        Stmt::Continue(_) => {}
+        Stmt::Defer(body, _) => {
+            var b: i64 = 0;
+            while b < body.len() {
+                collect_var_uses_stmt(self, body.get(b), idx);
+                b = b + 1;
+            }
+        }
+        Stmt::Match(expr, arms, _) => {
+            collect_var_uses_expr(self, expr, idx);
+            var a: i64 = 0;
+            while a < arms.len() {
+                var arm: MatchArm = arms.get(a);
+                var bindings: Vec<str> = pattern_bindings(arm.pattern);
+                var bi: i64 = 0;
+                while bi < bindings.len() {
+                    last_use_set(self, bindings.get(bi), idx);
+                    bi = bi + 1;
+                }
+                match arm.guard {
+                    OptBoxExpr::Some(g) => { collect_var_uses_expr(self, box_expr_unbox(g), idx); }
+                    OptBoxExpr::None => {}
+                }
+                var b: i64 = 0;
+                while b < arm.body.len() {
+                    collect_var_uses_stmt(self, arm.body.get(b), idx);
+                    b = b + 1;
+                }
+                a = a + 1;
+            }
+        }
+        Stmt::Use(_, _, _) => {}
+        Stmt::Handle(body, handlers, _) => {
+            var b: i64 = 0;
+            while b < body.len() {
+                collect_var_uses_stmt(self, body.get(b), idx);
+                b = b + 1;
+            }
+            var h: i64 = 0;
+            while h < handlers.len() {
+                var handler: EffectHandler = handlers.get(h);
+                var p: i64 = 0;
+                while p < handler.params.len() {
+                    last_use_set(self, handler.params.get(p), idx);
+                    p = p + 1;
+                }
+                var b2: i64 = 0;
+                while b2 < handler.body.len() {
+                    collect_var_uses_stmt(self, handler.body.get(b2), idx);
+                    b2 = b2 + 1;
+                }
+                h = h + 1;
+            }
+        }
+        Stmt::Do(_, _, args, _) => {
+            var a: i64 = 0;
+            while a < args.len() {
+                collect_var_uses_expr(self, args.get(a), idx);
+                a = a + 1;
+            }
+        }
+        Stmt::RegionBlock(_, _, _, _, _, body, _) => {
+            var b: i64 = 0;
+            while b < body.len() {
+                collect_var_uses_stmt(self, body.get(b), idx);
+                b = b + 1;
+            }
+        }
+        Stmt::Sandbox(body, _) => {
+            var b: i64 = 0;
+            while b < body.len() {
+                collect_var_uses_stmt(self, body.get(b), idx);
+                b = b + 1;
+            }
+        }
+        Stmt::Unsafe(body, _) => {
+            var b: i64 = 0;
+            while b < body.len() {
+                collect_var_uses_stmt(self, body.get(b), idx);
+                b = b + 1;
+            }
+        }
+        Stmt::Txn(body, _) => {
+            var b: i64 = 0;
+            while b < body.len() {
+                collect_var_uses_stmt(self, body.get(b), idx);
+                b = b + 1;
+            }
+        }
+        Stmt::ComptimeGen(block, _) => {
+            var b: i64 = 0;
+            while b < block.len() {
+                collect_var_uses_stmt(self, block.get(b), idx);
+                b = b + 1;
+            }
+        }
+        Stmt::GradBlock(grad_var, body, _) => {
+            last_use_set(self, grad_var, idx);
+            var b: i64 = 0;
+            while b < body.len() {
+                collect_var_uses_stmt(self, body.get(b), idx);
+                b = b + 1;
+            }
+        }
+        Stmt::Backward(loss, _) => {
+            collect_var_uses_expr(self, loss, idx);
+        }
+        Stmt::Query(_, body, _) => {
+            var b: i64 = 0;
+            while b < body.len() {
+                collect_var_uses_stmt(self, body.get(b), idx);
+                b = b + 1;
+            }
+        }
+        Stmt::Select(cases, default, _) => {
+            var c: i64 = 0;
+            while c < cases.len() {
+                var case: SelectCase = cases.get(c);
+                collect_var_uses_expr(self, case.channel, idx);
+                var b: i64 = 0;
+                while b < case.body.len() {
+                    collect_var_uses_stmt(self, case.body.get(b), idx);
+                    b = b + 1;
+                }
+                c = c + 1;
+            }
+            match default {
+                OptStmts::Some(def) => {
+                    var b: i64 = 0;
+                    while b < def.len() {
+                        collect_var_uses_stmt(self, def.get(b), idx);
+                        b = b + 1;
+                    }
+                }
+                OptStmts::None => {}
+            }
+        }
+    }
+}
+
+// Recursively collect all variable references in an expression.
+fn collect_var_uses_expr(self: &mut BorrowChecker, expr: Expr, idx: i64) -> void {
+    match expr {
+        Expr::Ident(name) => {
+            last_use_set(self, name, idx);
+        }
+        Expr::Binary(_, left, right) => {
+            collect_var_uses_expr(self, box_expr_unbox(left), idx);
+            collect_var_uses_expr(self, box_expr_unbox(right), idx);
+        }
+        Expr::Unary(_, e) => { collect_var_uses_expr(self, box_expr_unbox(e), idx); }
+        Expr::Call(_, args) => {
+            var a: i64 = 0;
+            while a < args.len() {
+                collect_var_uses_expr(self, args.get(a), idx);
+                a = a + 1;
+            }
+        }
+        Expr::MethodCall(receiver, _, args) => {
+            collect_var_uses_expr(self, box_expr_unbox(receiver), idx);
+            var a: i64 = 0;
+            while a < args.len() {
+                collect_var_uses_expr(self, args.get(a), idx);
+                a = a + 1;
+            }
+        }
+        Expr::FieldAccess(e, _) => { collect_var_uses_expr(self, box_expr_unbox(e), idx); }
+        Expr::OptionalFieldAccess(e, _) => { collect_var_uses_expr(self, box_expr_unbox(e), idx); }
+        Expr::StructLit(_, fields, spread) => {
+            var f: i64 = 0;
+            while f < fields.len() {
+                var fi: FieldInit = fields.get(f);
+                collect_var_uses_expr(self, fi.value, idx);
+                f = f + 1;
+            }
+            match spread {
+                OptBoxExpr::Some(s) => { collect_var_uses_expr(self, box_expr_unbox(s), idx); }
+                OptBoxExpr::None => {}
+            }
+        }
+        Expr::If(cond, then_block, else_block) => {
+            collect_var_uses_expr(self, box_expr_unbox(cond), idx);
+            var t: i64 = 0;
+            while t < then_block.len() {
+                collect_var_uses_stmt(self, then_block.get(t), idx);
+                t = t + 1;
+            }
+            match else_block {
+                OptStmts::Some(eb) => {
+                    var e: i64 = 0;
+                    while e < eb.len() {
+                        collect_var_uses_stmt(self, eb.get(e), idx);
+                        e = e + 1;
+                    }
+                }
+                OptStmts::None => {}
+            }
+        }
+        Expr::Range(start, end, _) => {
+            collect_var_uses_expr(self, box_expr_unbox(start), idx);
+            collect_var_uses_expr(self, box_expr_unbox(end), idx);
+        }
+        Expr::Block(body) => {
+            var b: i64 = 0;
+            while b < body.len() {
+                collect_var_uses_stmt(self, body.get(b), idx);
+                b = b + 1;
+            }
+        }
+        Expr::ArrayLit(_, elements) => {
+            var e: i64 = 0;
+            while e < elements.len() {
+                collect_var_uses_expr(self, elements.get(e), idx);
+                e = e + 1;
+            }
+        }
+        Expr::Index(array, index) => {
+            collect_var_uses_expr(self, box_expr_unbox(array), idx);
+            collect_var_uses_expr(self, box_expr_unbox(index), idx);
+        }
+        Expr::FString(parts) => {
+            var p: i64 = 0;
+            while p < parts.len() {
+                var part: FStringPart = parts.get(p);
+                match part {
+                    FStringPart::Expr(e) => { collect_var_uses_expr(self, e, idx); }
+                    FStringPart::Literal(_) => {}
+                }
+                p = p + 1;
+            }
+        }
+        Expr::Match(expr, arms) => {
+            collect_var_uses_expr(self, box_expr_unbox(expr), idx);
+            var a: i64 = 0;
+            while a < arms.len() {
+                var arm: MatchArm = arms.get(a);
+                var bindings: Vec<str> = pattern_bindings(arm.pattern);
+                var bi: i64 = 0;
+                while bi < bindings.len() {
+                    last_use_set(self, bindings.get(bi), idx);
+                    bi = bi + 1;
+                }
+                match arm.guard {
+                    OptBoxExpr::Some(g) => { collect_var_uses_expr(self, box_expr_unbox(g), idx); }
+                    OptBoxExpr::None => {}
+                }
+                var b: i64 = 0;
+                while b < arm.body.len() {
+                    collect_var_uses_stmt(self, arm.body.get(b), idx);
+                    b = b + 1;
+                }
+                a = a + 1;
+            }
+        }
+        Expr::EnumLit(_, _, args) => {
+            var a: i64 = 0;
+            while a < args.len() {
+                collect_var_uses_expr(self, args.get(a), idx);
+                a = a + 1;
+            }
+        }
+        Expr::Ref(e, _) => { collect_var_uses_expr(self, box_expr_unbox(e), idx); }
+        Expr::Deref(e) => { collect_var_uses_expr(self, box_expr_unbox(e), idx); }
+        Expr::StrConcat(left, right) => {
+            collect_var_uses_expr(self, box_expr_unbox(left), idx);
+            collect_var_uses_expr(self, box_expr_unbox(right), idx);
+        }
+        Expr::Try(e) => { collect_var_uses_expr(self, box_expr_unbox(e), idx); }
+        Expr::Coalesce(e, default) => {
+            collect_var_uses_expr(self, box_expr_unbox(e), idx);
+            collect_var_uses_expr(self, box_expr_unbox(default), idx);
+        }
+        Expr::TryBlock(body) => {
+            var b: i64 = 0;
+            while b < body.len() {
+                collect_var_uses_stmt(self, body.get(b), idx);
+                b = b + 1;
+            }
+        }
+        Expr::Await(e) => { collect_var_uses_expr(self, box_expr_unbox(e), idx); }
+        Expr::Spawn(e) => { collect_var_uses_expr(self, box_expr_unbox(e), idx); }
+        _ => {}
+    }
+}
+
+// ─── last_use helper ──────────────────────────────────────────────────────
+
+// Set the last-use index for a variable. If it already exists, update it.
+fn last_use_set(self: &mut BorrowChecker, name: str, idx: i64) -> void {
+    var i: i64 = 0;
+    while i < self.last_use.len() {
+        if str_equal(self.last_use.get(i).key, name) {
+            self.last_use.get(i).val = idx;
+            return;
+        }
+        i = i + 1;
+    }
+    self.last_use.push(StringI64Entry_new(name, idx));
+}
+
+// Get the last-use index for a variable, or -1 if not found.
+fn last_use_get(self: &BorrowChecker, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < self.last_use.len() {
+        if str_equal(self.last_use.get(i).key, name) {
+            return self.last_use.get(i).val;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ─── Phase 6: NLL — release dead borrows ──────────────────────────────────
+
+// Release borrows for borrowers whose last use was before the current
+// statement index. This is the core of NLL — borrows end at the borrower's
+// last use, not at scope end.
+fn release_dead_borrows(self: &mut BorrowChecker) -> void {
+    var current_idx: i64 = self.stmt_index;
+    // Collect dead borrowers.
+    var dead: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < self.borrow_of.len() {
+        var borrower: str = self.borrow_of.get(i).borrower;
+        var last: i64 = last_use_get(self, borrower);
+        if last >= 0 {
+            if last < current_idx {
+                dead.push(borrower);
+            }
+        }
+        i = i + 1;
+    }
+    // Release them.
+    var j: i64 = 0;
+    while j < dead.len() {
+        release_borrow_by(self, dead.get(j));
+        j = j + 1;
+    }
+}
+
+// ─── Scope management ─────────────────────────────────────────────────────
+
+fn push_scope(self: &mut BorrowChecker) -> void {
+    var scope: StringVec = StringVec_new();
+    self.scope_stack.push(scope);
+}
+
+fn pop_scope(self: &mut BorrowChecker) -> void {
+    if self.scope_stack.len() > 0 {
+        var dead: StringVec = self.scope_stack.pop();
+        var i: i64 = 0;
+        while i < dead.items.len() {
+            var name: str = dead.items.get(i);
+            release_borrow_by(self, name);
+            // The variable itself is gone — any borrows ON it are stale.
+            shared_borrows_remove(self, name);
+            mut_borrow_remove(self, name);
+            i = i + 1;
+        }
+    }
+}
+
+// Add a name to the current (top) scope.
+fn scope_stack_push_name(self: &mut BorrowChecker, name: str) -> void {
+    var top: i64 = self.scope_stack.len() - 1;
+    self.scope_stack.get(top).items.push(name);
+}
+
+// Remove a name from the current (top) scope.
+fn scope_stack_remove_name(self: &mut BorrowChecker, name: str) -> void {
+    var top: i64 = self.scope_stack.len() - 1;
+    var scope: Vec<str> = self.scope_stack.get(top).items;
+    var i: i64 = 0;
+    while i < scope.len() {
+        if str_equal(scope.get(i), name) {
+            scope.remove(i);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+// Release any borrow held by `borrower`. Called when the borrower goes out
+// of scope or is reassigned.
+fn release_borrow_by(self: &mut BorrowChecker, borrower: str) -> void {
+    var found_idx: i64 = -1;
+    var borrowed: str = "";
+    var i: i64 = 0;
+    while i < self.borrow_of.len() {
+        if str_equal(self.borrow_of.get(i).borrower, borrower) {
+            borrowed = self.borrow_of.get(i).borrowed;
+            found_idx = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if found_idx < 0 { return; }
+    self.borrow_of.remove(found_idx);
+    // Remove borrower from shared_borrows set.
+    shared_borrows_remove_borrower(self, borrowed, borrower);
+    // Clear mut_borrow if it points to this borrower.
+    mut_borrow_clear_if_borrower(self, borrowed, borrower);
+}
+
+// Declare a variable in the current scope. If it was previously a borrower
+// (reassignment), release its old borrow first.
+fn declare_var(self: &mut BorrowChecker, name: str) -> void {
+    // Reassignment: if this name was a borrower, release the old borrow.
+    release_borrow_by(self, name);
+    scope_stack_push_name(self, name);
+}
+
+// Create a temporary borrow with a synthetic name. Used for &x / &mut x
+// that appear directly inside a call argument list (not assigned to a
+// variable). The caller releases it via release_borrow_by when the
+// enclosing expression completes.
+fn create_temp_borrow(self: &mut BorrowChecker, borrowed_var: str, is_mut: bool, line: i64) -> void {
+    var name: str = "__tmp_ref_" + int_to_str(self.temp_counter);
+    self.temp_counter = self.temp_counter + 1;
+    create_borrow(self, borrowed_var, name, is_mut, line);
+    // Track it in a scope so pop_scope can clean it up if forgotten.
+    scope_stack_push_name(self, name);
+}
+
+// Release all temporary borrows created since the checkpoint value.
+fn release_temps_since(self: &mut BorrowChecker, checkpoint: i64) -> void {
+    var i: i64 = checkpoint;
+    while i < self.temp_counter {
+        var name: str = "__tmp_ref_" + int_to_str(i);
+        release_borrow_by(self, name);
+        scope_stack_remove_name(self, name);
+        i = i + 1;
+    }
+}
+
+// Phase 4: Release only temp SHARED borrows created since the checkpoint.
+// Reserved &mut temp borrows are NOT released here.
+fn release_shared_temps_since(self: &mut BorrowChecker, checkpoint: i64) -> void {
+    var i: i64 = checkpoint;
+    while i < self.temp_counter {
+        var name: str = "__tmp_ref_" + int_to_str(i);
+        // Only release if this is NOT a reserved &mut borrow.
+        var is_reserved_mut: bool = false;
+        var j: i64 = 0;
+        while j < self.reserved_mut_borrows.len() {
+            if str_equal(self.reserved_mut_borrows.get(j).borrower, name) {
+                is_reserved_mut = true;
+                break;
+            }
+            j = j + 1;
+        }
+        if !is_reserved_mut {
+            release_borrow_by(self, name);
+            scope_stack_remove_name(self, name);
+        }
+        i = i + 1;
+    }
+}
+
+// ─── extract_field_path ───────────────────────────────────────────────────
+
+// Extract a field path from an expression. Returns Some("s.x.y") for s.x.y,
+// Some("s") for s, and None for anything else.
+fn extract_field_path(expr: Expr) -> OptStr {
+    match expr {
+        Expr::Ident(name) => { return OptStr::Some(name); }
+        Expr::FieldAccess(inner, field) => {
+            var inner_path: OptStr = extract_field_path(box_expr_unbox(inner));
+            match inner_path {
+                OptStr::Some(p) => { return OptStr::Some(p + "." + field); }
+                OptStr::None => { return OptStr::None; }
+            }
+        }
+        _ => { return OptStr::None; }
+    }
+}
+
+// ─── Borrow state queries ─────────────────────────────────────────────────
+
+fn has_shared_borrow(self: &BorrowChecker, var: str) -> bool {
+    var i: i64 = 0;
+    while i < self.shared_borrows.len() {
+        if str_equal(self.shared_borrows.get(i).key, var) {
+            return self.shared_borrows.get(i).borrowers.len() > 0;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn has_mut_borrow(self: &BorrowChecker, var: str) -> bool {
+    var i: i64 = 0;
+    while i < self.mut_borrow.len() {
+        if str_equal(self.mut_borrow.get(i).key, var) {
+            match self.mut_borrow.get(i).borrower {
+                OptStr::Some(_) => { return true; }
+                OptStr::None => { return false; }
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Check if any shared borrow exists on var OR any field path under it.
+fn has_shared_borrow_inclusive(self: &BorrowChecker, var: str) -> bool {
+    if has_shared_borrow(self, var) { return true; }
+    var prefix: str = var + ".";
+    var i: i64 = 0;
+    while i < self.shared_borrows.len() {
+        var path: str = self.shared_borrows.get(i).key;
+        if str_starts_with(path, prefix) {
+            if self.shared_borrows.get(i).borrowers.len() > 0 {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Check if any mutable borrow exists on var OR any field path under it.
+fn has_mut_borrow_inclusive(self: &BorrowChecker, var: str) -> bool {
+    if has_mut_borrow(self, var) { return true; }
+    var prefix: str = var + ".";
+    var i: i64 = 0;
+    while i < self.mut_borrow.len() {
+        var path: str = self.mut_borrow.get(i).key;
+        if str_starts_with(path, prefix) {
+            match self.mut_borrow.get(i).borrower {
+                OptStr::Some(_) => { return true; }
+                OptStr::None => {}
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Check if any shared borrow exists on a PREFIX of path.
+fn has_shared_borrow_on_prefix(self: &BorrowChecker, path: str) -> bool {
+    var current: str = path;
+    while true {
+        var dot: i64 = str_rfind(current, ".");
+        if dot < 0 { break; }
+        current = str_slice(current, 0, dot);
+        if has_shared_borrow(self, current) { return true; }
+    }
+    return false;
+}
+
+// Check if any mutable borrow exists on a PREFIX of path.
+fn has_mut_borrow_on_prefix(self: &BorrowChecker, path: str) -> bool {
+    var current: str = path;
+    while true {
+        var dot: i64 = str_rfind(current, ".");
+        if dot < 0 { break; }
+        current = str_slice(current, 0, dot);
+        if has_mut_borrow(self, current) { return true; }
+    }
+    return false;
+}
+
+// ─── shared_borrows / mut_borrow map helpers ──────────────────────────────
+
+fn shared_borrows_remove(self: &mut BorrowChecker, key: str) -> void {
+    var i: i64 = 0;
+    while i < self.shared_borrows.len() {
+        if str_equal(self.shared_borrows.get(i).key, key) {
+            self.shared_borrows.remove(i);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+fn mut_borrow_remove(self: &mut BorrowChecker, key: str) -> void {
+    var i: i64 = 0;
+    while i < self.mut_borrow.len() {
+        if str_equal(self.mut_borrow.get(i).key, key) {
+            self.mut_borrow.remove(i);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+fn shared_borrows_remove_borrower(self: &mut BorrowChecker, borrowed: str, borrower: str) -> void {
+    var i: i64 = 0;
+    while i < self.shared_borrows.len() {
+        if str_equal(self.shared_borrows.get(i).key, borrowed) {
+            var borrowers: Vec<str> = self.shared_borrows.get(i).borrowers;
+            var j: i64 = 0;
+            while j < borrowers.len() {
+                if str_equal(borrowers.get(j), borrower) {
+                    borrowers.remove(j);
+                    return;
+                }
+                j = j + 1;
+            }
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+fn mut_borrow_clear_if_borrower(self: &mut BorrowChecker, borrowed: str, borrower: str) -> void {
+    var i: i64 = 0;
+    while i < self.mut_borrow.len() {
+        if str_equal(self.mut_borrow.get(i).key, borrowed) {
+            match self.mut_borrow.get(i).borrower {
+                OptStr::Some(b) => {
+                    if str_equal(b, borrower) {
+                        self.mut_borrow.get(i).borrower = OptStr::None;
+                    }
+                }
+                OptStr::None => {}
+            }
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+fn shared_borrows_get_or_create(self: &mut BorrowChecker, key: str) -> void {
+    var i: i64 = 0;
+    while i < self.shared_borrows.len() {
+        if str_equal(self.shared_borrows.get(i).key, key) {
+            return;
+        }
+        i = i + 1;
+    }
+    self.shared_borrows.push(SharedBorrowEntry_new(key));
+}
+
+fn shared_borrows_add_borrower(self: &mut BorrowChecker, key: str, borrower: str) -> void {
+    shared_borrows_get_or_create(self, key);
+    var i: i64 = 0;
+    while i < self.shared_borrows.len() {
+        if str_equal(self.shared_borrows.get(i).key, key) {
+            self.shared_borrows.get(i).borrowers.push(borrower);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+fn mut_borrow_set(self: &mut BorrowChecker, key: str, borrower: OptStr) -> void {
+    var i: i64 = 0;
+    while i < self.mut_borrow.len() {
+        if str_equal(self.mut_borrow.get(i).key, key) {
+            self.mut_borrow.get(i).borrower = borrower;
+            return;
+        }
+        i = i + 1;
+    }
+    self.mut_borrow.push(MutBorrowEntry_new(key, borrower));
+}
+
+fn borrow_of_add(self: &mut BorrowChecker, borrower: str, borrowed: str, is_mut: bool) -> void {
+    // Remove existing entry for this borrower if any (reassignment).
+    var i: i64 = 0;
+    while i < self.borrow_of.len() {
+        if str_equal(self.borrow_of.get(i).borrower, borrower) {
+            self.borrow_of.remove(i);
+            break;
+        }
+        i = i + 1;
+    }
+    self.borrow_of.push(BorrowOfEntry_new(borrower, borrowed, is_mut));
+}
+
+// ─── The three rules ──────────────────────────────────────────────────────
+
+// Rule 1 & 2: creating a borrow. is_mut true = &mut x, false = &x.
+// borrowed_path is a field path like "s" or "s.x" or "s.inner.z".
+fn create_borrow(self: &mut BorrowChecker, borrowed_path: str, borrower: str, is_mut: bool, line: i64) -> void {
+    if is_mut {
+        // Phase 4: Two-phase borrows. If in reservation phase, don't activate
+        // the &mut yet — just reserve it.
+        if self.in_reservation_phase {
+            // Check for conflicts with EXISTING active borrows.
+            if has_shared_borrow_inclusive(self, borrowed_path)
+                || has_shared_borrow_on_prefix(self, borrowed_path)
+            {
+                violation(self, line, "cannot create &mut " + borrowed_path + ": shared borrow(s) already active on it or a related path");
+                return;
+            }
+            if has_mut_borrow_inclusive(self, borrowed_path)
+                || has_mut_borrow_on_prefix(self, borrowed_path)
+            {
+                violation(self, line, "cannot create &mut " + borrowed_path + ": a mutable borrow is already active on it or a related path");
+                return;
+            }
+            // Check for conflicts with other reserved &mut on the same path.
+            var i: i64 = 0;
+            while i < self.reserved_mut_borrows.len() {
+                var existing_path: str = self.reserved_mut_borrows.get(i).path;
+                if str_equal(existing_path, borrowed_path)
+                    || str_starts_with(existing_path, borrowed_path + ".")
+                    || str_starts_with(borrowed_path, existing_path + ".")
+                {
+                    violation(self, line, "cannot create &mut " + borrowed_path + ": a mutable borrow is already reserved on it or a related path");
+                    return;
+                }
+                i = i + 1;
+            }
+            // Reserve the borrow — don't activate it yet.
+            self.reserved_mut_borrows.push(ReservedMutBorrow_new(borrowed_path, borrower, line));
+            borrow_of_add(self, borrower, borrowed_path, is_mut);
+            return;
+        }
+
+        // Rule 1: &mut path requires NO active borrows on path, prefix, or extension.
+        if has_shared_borrow_inclusive(self, borrowed_path)
+            || has_shared_borrow_on_prefix(self, borrowed_path)
+        {
+            violation(self, line, "cannot create &mut " + borrowed_path + ": shared borrow(s) already active on it or a related path");
+            return;
+        }
+        if has_mut_borrow_inclusive(self, borrowed_path)
+            || has_mut_borrow_on_prefix(self, borrowed_path)
+        {
+            violation(self, line, "cannot create &mut " + borrowed_path + ": a mutable borrow is already active on it or a related path");
+            return;
+        }
+        mut_borrow_set(self, borrowed_path, OptStr::Some(borrower));
+    } else {
+        // Rule 2: &path requires no active &mut on path or prefix.
+        // Phase 4: reserved &mut borrows don't conflict with shared borrows.
+        if has_mut_borrow(self, borrowed_path)
+            || has_mut_borrow_on_prefix(self, borrowed_path)
+        {
+            violation(self, line, "cannot create &" + borrowed_path + ": a mutable borrow is already active on it or a parent path");
+            return;
+        }
+        shared_borrows_add_borrower(self, borrowed_path, borrower);
+    }
+    borrow_of_add(self, borrower, borrowed_path, is_mut);
+}
+
+// Phase 4: Activate all reserved &mut borrows. Called after all call
+// arguments have been evaluated.
+fn activate_reserved_borrows(self: &mut BorrowChecker) -> void {
+    var reserved: Vec<ReservedMutBorrow> = self.reserved_mut_borrows;
+    self.reserved_mut_borrows.clear();
+    var i: i64 = 0;
+    while i < reserved.len() {
+        var r: ReservedMutBorrow = reserved.get(i);
+        // Check for conflicts with shared borrows still active.
+        if has_shared_borrow_inclusive(self, r.path)
+            || has_shared_borrow_on_prefix(self, r.path)
+        {
+            violation(self, r.line, "cannot activate &mut " + r.path + ": shared borrow(s) are still active on it or a related path");
+            i = i + 1;
+            continue;
+        }
+        mut_borrow_set(self, r.path, OptStr::Some(r.borrower));
+        i = i + 1;
+    }
+}
+
+// Rule 3: mutating a variable. Fails if any borrow is active on it or on
+// any field path under it.
+fn check_mutation(self: &mut BorrowChecker, var: str, line: i64) -> void {
+    if has_shared_borrow_inclusive(self, var) {
+        violation(self, line, "cannot mutate " + var + ": shared borrow(s) are active on it or its fields");
+    }
+    if has_mut_borrow_inclusive(self, var) {
+        violation(self, line, "cannot mutate " + var + ": a mutable borrow is active on it or its fields");
+    }
+}
+
+// ─── Violation reporting ──────────────────────────────────────────────────
+
+fn violation(self: &mut BorrowChecker, line: i64, msg: str) -> void {
+    var full: str = "";
+    match self.current_func {
+        OptStr::Some(f) => {
+            full = "borrow error in " + f + " (line " + int_to_str(line) + "): " + msg;
+        }
+        OptStr::None => {
+            full = "borrow error (line " + int_to_str(line) + "): " + msg;
+        }
+    }
+    match self.mode {
+        BorrowckMode::On => { self.errors.push(full); }
+        BorrowckMode::Warn => { self.warnings.push(full); }
+        BorrowckMode::Off => {}
+    }
+}
+
+// ─── Statement walker ─────────────────────────────────────────────────────
+
+fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
+    match stmt {
+        Stmt::Let(name, _, expr, _, _, line) => {
+            // Check the initializer first (it may borrow from other vars).
+            check_expr(self, expr);
+            // Then declare the new variable (releases any old borrow it held).
+            declare_var(self, name);
+            // If the initializer is itself a borrow, record it.
+            maybe_record_borrow_from_expr(self, name, expr, line);
+        }
+        Stmt::LetTuple(names, expr, _) => {
+            check_expr(self, expr);
+            var n: i64 = 0;
+            while n < names.len() {
+                declare_var(self, names.get(n));
+                n = n + 1;
+            }
+        }
+        Stmt::LetUninit(name, _, _) => {
+            declare_var(self, name);
+        }
+        Stmt::Assign(target, _, expr, line) => {
+            // Mutating target — Rule 3.
+            check_mutation(self, target, line);
+            // If target was itself a borrower, release its old borrow BEFORE
+            // checking the RHS.
+            release_borrow_by(self, target);
+            // The RHS may create new borrows.
+            check_expr(self, expr);
+            // If the RHS is a Ref assigned to target, record the borrow.
+            maybe_record_borrow_from_expr(self, target, expr, line);
+        }
+        Stmt::IndexAssign(array, index, _, expr, line) => {
+            // Mutating array — Rule 3.
+            check_mutation(self, array, line);
+            check_expr(self, index);
+            check_expr(self, expr);
+        }
+        Stmt::DerefAssign(ptr_expr, _, expr, _) => {
+            check_expr(self, ptr_expr);
+            check_expr(self, expr);
+        }
+        Stmt::FieldAssign(object, _, _, expr, _) => {
+            check_expr(self, object);
+            check_expr(self, expr);
+        }
+        Stmt::Expr(e, _) => { check_expr(self, e); }
+        Stmt::Return(opt_e, _) => {
+            match opt_e {
+                OptBoxExpr::Some(e) => { check_expr(self, box_expr_unbox(e)); }
+                OptBoxExpr::None => {}
+            }
+        }
+        Stmt::If(cond, then_block, else_block, _) => {
+            check_expr(self, cond);
+            // Each branch gets its own scope; borrows inside don't escape.
+            push_scope(self);
+            var t: i64 = 0;
+            while t < then_block.len() {
+                check_stmt(self, then_block.get(t));
+                t = t + 1;
+            }
+            pop_scope(self);
+            match else_block {
+                OptStmts::Some(else_b) => {
+                    push_scope(self);
+                    var e: i64 = 0;
+                    while e < else_b.len() {
+                        check_stmt(self, else_b.get(e));
+                        e = e + 1;
+                    }
+                    pop_scope(self);
+                }
+                OptStmts::None => {}
+            }
+        }
+        Stmt::While(cond, body, _) => {
+            check_expr(self, cond);
+            push_scope(self);
+            var b: i64 = 0;
+            while b < body.len() {
+                check_stmt(self, body.get(b));
+                b = b + 1;
+            }
+            pop_scope(self);
+        }
+        Stmt::For(loop_var, iterator, body, _) => {
+            check_expr(self, iterator);
+            push_scope(self);
+            declare_var(self, loop_var);
+            var b: i64 = 0;
+            while b < body.len() {
+                check_stmt(self, body.get(b));
+                b = b + 1;
+            }
+            pop_scope(self);
+        }
+        Stmt::Loop(body, _) => {
+            push_scope(self);
+            var b: i64 = 0;
+            while b < body.len() {
+                check_stmt(self, body.get(b));
+                b = b + 1;
+            }
+            pop_scope(self);
+        }
+        Stmt::Break(opt_e, _) => {
+            match opt_e {
+                OptBoxExpr::Some(e) => { check_expr(self, box_expr_unbox(e)); }
+                OptBoxExpr::None => {}
+            }
+        }
+        Stmt::Continue(_) => {}
+        Stmt::Defer(body, _) => {
+            push_scope(self);
+            var b: i64 = 0;
+            while b < body.len() {
+                check_stmt(self, body.get(b));
+                b = b + 1;
+            }
+            pop_scope(self);
+        }
+        Stmt::Match(expr, arms, _) => {
+            check_expr(self, expr);
+            var a: i64 = 0;
+            while a < arms.len() {
+                var arm: MatchArm = arms.get(a);
+                push_scope(self);
+                // Bind pattern variables.
+                var bindings: Vec<str> = pattern_bindings(arm.pattern);
+                var bi: i64 = 0;
+                while bi < bindings.len() {
+                    declare_var(self, bindings.get(bi));
+                    bi = bi + 1;
+                }
+                match arm.guard {
+                    OptBoxExpr::Some(g) => { check_expr(self, box_expr_unbox(g)); }
+                    OptBoxExpr::None => {}
+                }
+                var b: i64 = 0;
+                while b < arm.body.len() {
+                    check_stmt(self, arm.body.get(b));
+                    b = b + 1;
+                }
+                pop_scope(self);
+                a = a + 1;
+            }
+        }
+        Stmt::Use(_, _, _) => {}
+        Stmt::Handle(body, handlers, _) => {
+            push_scope(self);
+            var b: i64 = 0;
+            while b < body.len() {
+                check_stmt(self, body.get(b));
+                b = b + 1;
+            }
+            pop_scope(self);
+            var h: i64 = 0;
+            while h < handlers.len() {
+                var handler: EffectHandler = handlers.get(h);
+                push_scope(self);
+                var p: i64 = 0;
+                while p < handler.params.len() {
+                    declare_var(self, handler.params.get(p));
+                    p = p + 1;
+                }
+                var b2: i64 = 0;
+                while b2 < handler.body.len() {
+                    check_stmt(self, handler.body.get(b2));
+                    b2 = b2 + 1;
+                }
+                pop_scope(self);
+                h = h + 1;
+            }
+        }
+        Stmt::Do(_, _, args, _) => {
+            var a: i64 = 0;
+            while a < args.len() {
+                check_expr(self, args.get(a));
+                a = a + 1;
+            }
+        }
+        Stmt::RegionBlock(_, _, _, _, _, body, _) => {
+            push_scope(self);
+            var b: i64 = 0;
+            while b < body.len() {
+                check_stmt(self, body.get(b));
+                b = b + 1;
+            }
+            pop_scope(self);
+        }
+        Stmt::Sandbox(body, _) => {
+            push_scope(self);
+            var b: i64 = 0;
+            while b < body.len() {
+                check_stmt(self, body.get(b));
+                b = b + 1;
+            }
+            pop_scope(self);
+        }
+        Stmt::Unsafe(body, _) => {
+            // Skip all borrow checks inside unsafe blocks.
+            self.unsafe_depth = self.unsafe_depth + 1;
+            push_scope(self);
+            var b: i64 = 0;
+            while b < body.len() {
+                check_stmt(self, body.get(b));
+                b = b + 1;
+            }
+            pop_scope(self);
+            self.unsafe_depth = self.unsafe_depth - 1;
+        }
+        Stmt::Txn(body, _) => {
+            push_scope(self);
+            var b: i64 = 0;
+            while b < body.len() {
+                check_stmt(self, body.get(b));
+                b = b + 1;
+            }
+            pop_scope(self);
+        }
+        Stmt::ComptimeGen(block, _) => {
+            push_scope(self);
+            var b: i64 = 0;
+            while b < block.len() {
+                check_stmt(self, block.get(b));
+                b = b + 1;
+            }
+            pop_scope(self);
+        }
+        Stmt::GradBlock(grad_var, body, _) => {
+            push_scope(self);
+            declare_var(self, grad_var);
+            var b: i64 = 0;
+            while b < body.len() {
+                check_stmt(self, body.get(b));
+                b = b + 1;
+            }
+            pop_scope(self);
+        }
+        Stmt::Backward(loss, _) => {
+            check_expr(self, loss);
+        }
+        Stmt::Query(_, body, _) => {
+            push_scope(self);
+            var b: i64 = 0;
+            while b < body.len() {
+                check_stmt(self, body.get(b));
+                b = b + 1;
+            }
+            pop_scope(self);
+        }
+        Stmt::Select(cases, default, _) => {
+            var c: i64 = 0;
+            while c < cases.len() {
+                var case: SelectCase = cases.get(c);
+                check_expr(self, case.channel);
+                push_scope(self);
+                var b: i64 = 0;
+                while b < case.body.len() {
+                    check_stmt(self, case.body.get(b));
+                    b = b + 1;
+                }
+                pop_scope(self);
+                c = c + 1;
+            }
+            match default {
+                OptStmts::Some(def) => {
+                    push_scope(self);
+                    var b: i64 = 0;
+                    while b < def.len() {
+                        check_stmt(self, def.get(b));
+                        b = b + 1;
+                    }
+                    pop_scope(self);
+                }
+                OptStmts::None => {}
+            }
+        }
+    }
+}
+
+// ─── Expression walker ────────────────────────────────────────────────────
+
+fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
+    match expr {
+        Expr::IntLit(_) => {}
+        Expr::FloatLit(_) => {}
+        Expr::StringLit(_) => {}
+        Expr::BoolLit(_) => {}
+        Expr::Ident(_) => {}
+        Expr::Binary(_, left, right) => {
+            check_expr(self, box_expr_unbox(left));
+            check_expr(self, box_expr_unbox(right));
+        }
+        Expr::Unary(_, e) => { check_expr(self, box_expr_unbox(e)); }
+        Expr::Call(_, args) => {
+            // Phase 4: Two-phase borrows. Evaluate all arguments in
+            // "reservation" mode — &mut borrows are reserved, not activated.
+            var checkpoint: i64 = self.temp_counter;
+            var prev_reservation: bool = self.in_reservation_phase;
+            self.in_reservation_phase = true;
+            var a: i64 = 0;
+            while a < args.len() {
+                check_expr(self, args.get(a));
+                a = a + 1;
+            }
+            self.in_reservation_phase = prev_reservation;
+            // 1. Release temp shared borrows only (reserved &mut temps stay).
+            release_shared_temps_since(self, checkpoint);
+            // 2. Activate reserved &mut borrows.
+            activate_reserved_borrows(self);
+            // 3. Release ALL temp borrows (including now-activated &mut ones).
+            release_temps_since(self, checkpoint);
+        }
+        Expr::FieldAccess(e, _) => { check_expr(self, box_expr_unbox(e)); }
+        Expr::OptionalFieldAccess(e, _) => { check_expr(self, box_expr_unbox(e)); }
+        Expr::StructLit(_, fields, spread) => {
+            var f: i64 = 0;
+            while f < fields.len() {
+                var fi: FieldInit = fields.get(f);
+                check_expr(self, fi.value);
+                f = f + 1;
+            }
+            match spread {
+                OptBoxExpr::Some(s) => { check_expr(self, box_expr_unbox(s)); }
+                OptBoxExpr::None => {}
+            }
+        }
+        Expr::If(cond, then_block, else_block) => {
+            check_expr(self, box_expr_unbox(cond));
+            push_scope(self);
+            var t: i64 = 0;
+            while t < then_block.len() {
+                check_stmt(self, then_block.get(t));
+                t = t + 1;
+            }
+            pop_scope(self);
+            match else_block {
+                OptStmts::Some(eb) => {
+                    push_scope(self);
+                    var e: i64 = 0;
+                    while e < eb.len() {
+                        check_stmt(self, eb.get(e));
+                        e = e + 1;
+                    }
+                    pop_scope(self);
+                }
+                OptStmts::None => {}
+            }
+        }
+        Expr::Range(start, end, _) => {
+            check_expr(self, box_expr_unbox(start));
+            check_expr(self, box_expr_unbox(end));
+        }
+        Expr::Block(body) => {
+            push_scope(self);
+            var b: i64 = 0;
+            while b < body.len() {
+                check_stmt(self, body.get(b));
+                b = b + 1;
+            }
+            pop_scope(self);
+        }
+        Expr::MethodCall(receiver, _, args) => {
+            // A method call on receiver may mutate it (e.g. arr.push()).
+            // If receiver is a simple Ident, treat it as a mutation.
+            // Phase 4: The receiver mutation check is deferred to after
+            // argument evaluation (reservation phase).
+            var receiver_path: OptStr = OptStr::None;
+            match receiver {
+                Expr::Ident(name) => { receiver_path = OptStr::Some(name); }
+                _ => {}
+            }
+            // Phase 4: Evaluate receiver + args in reservation mode.
+            var checkpoint: i64 = self.temp_counter;
+            var prev_reservation: bool = self.in_reservation_phase;
+            self.in_reservation_phase = true;
+            check_expr(self, box_expr_unbox(receiver));
+            var a: i64 = 0;
+            while a < args.len() {
+                check_expr(self, args.get(a));
+                a = a + 1;
+            }
+            self.in_reservation_phase = prev_reservation;
+            // 1. Release temp shared borrows only.
+            release_shared_temps_since(self, checkpoint);
+            // 2. Activate reserved &mut borrows.
+            activate_reserved_borrows(self);
+            // 3. Release ALL temp borrows.
+            release_temps_since(self, checkpoint);
+            // Now check the receiver mutation (after args are consumed).
+            match receiver_path {
+                OptStr::Some(name) => { check_mutation(self, name, 0); }
+                OptStr::None => {}
+            }
+        }
+        Expr::ArrayLit(_, elements) => {
+            var e: i64 = 0;
+            while e < elements.len() {
+                check_expr(self, elements.get(e));
+                e = e + 1;
+            }
+        }
+        Expr::Index(array, index) => {
+            check_expr(self, box_expr_unbox(array));
+            check_expr(self, box_expr_unbox(index));
+        }
+        Expr::FString(parts) => {
+            var p: i64 = 0;
+            while p < parts.len() {
+                var part: FStringPart = parts.get(p);
+                match part {
+                    FStringPart::Expr(e) => { check_expr(self, box_expr_unbox(e)); }
+                    FStringPart::Literal(_) => {}
+                }
+                p = p + 1;
+            }
+        }
+        Expr::Match(expr, arms) => {
+            check_expr(self, box_expr_unbox(expr));
+            var a: i64 = 0;
+            while a < arms.len() {
+                var arm: MatchArm = arms.get(a);
+                push_scope(self);
+                var bindings: Vec<str> = pattern_bindings(arm.pattern);
+                var bi: i64 = 0;
+                while bi < bindings.len() {
+                    declare_var(self, bindings.get(bi));
+                    bi = bi + 1;
+                }
+                match arm.guard {
+                    OptBoxExpr::Some(g) => { check_expr(self, box_expr_unbox(g)); }
+                    OptBoxExpr::None => {}
+                }
+                var b: i64 = 0;
+                while b < arm.body.len() {
+                    check_stmt(self, arm.body.get(b));
+                    b = b + 1;
+                }
+                pop_scope(self);
+                a = a + 1;
+            }
+        }
+        Expr::EnumLit(_, _, args) => {
+            var a: i64 = 0;
+            while a < args.len() {
+                check_expr(self, args.get(a));
+                a = a + 1;
+            }
+        }
+        Expr::Ref(inner, is_mut) => {
+            // Creating a reference. The borrowed variable is the inner
+            // expression — either a simple Ident (&x) or a field path
+            // (&s.x.y). Field paths allow simultaneous borrows of different
+            // fields (e.g. &s.x and &s.y coexist).
+            check_expr(self, box_expr_unbox(inner));
+            if self.unsafe_depth == 0 {
+                var path_opt: OptStr = extract_field_path(box_expr_unbox(inner));
+                match path_opt {
+                    OptStr::Some(path) => {
+                        // If this ref is assigned to a variable (e.g.
+                        // pv r = &x), the Let handler calls
+                        // maybe_record_borrow_from_expr which records the
+                        // borrow with the variable name as borrower. But we
+                        // ALSO need to record it here in case the ref is NOT
+                        // assigned (e.g. passed directly to a function call).
+                        // The temp borrow is released by the enclosing
+                        // Call/MethodCall via the checkpoint mechanism.
+                        create_temp_borrow(self, path, is_mut, 0);
+                    }
+                    OptStr::None => {}
+                }
+            }
+        }
+        Expr::Deref(e) => { check_expr(self, box_expr_unbox(e)); }
+        Expr::StrConcat(left, right) => {
+            check_expr(self, box_expr_unbox(left));
+            check_expr(self, box_expr_unbox(right));
+        }
+        Expr::Try(e) => { check_expr(self, box_expr_unbox(e)); }
+        Expr::Coalesce(e, default) => {
+            check_expr(self, box_expr_unbox(e));
+            check_expr(self, box_expr_unbox(default));
+        }
+        Expr::TryBlock(body) => {
+            push_scope(self);
+            var b: i64 = 0;
+            while b < body.len() {
+                check_stmt(self, body.get(b));
+                b = b + 1;
+            }
+            pop_scope(self);
+        }
+        Expr::Await(e) => { check_expr(self, box_expr_unbox(e)); }
+        Expr::Spawn(e) => { check_expr(self, box_expr_unbox(e)); }
+        Expr::Closure(_, body, _) => {
+            // Closures capture variables from the enclosing scope. Check the
+            // body in a new scope — captured variables are treated as
+            // borrowed from the outer scope.
+            push_scope(self);
+            var b: i64 = 0;
+            while b < body.len() {
+                check_stmt(self, body.get(b));
+                b = b + 1;
+            }
+            pop_scope(self);
+        }
+        // Other expression variants — recurse into children if any.
+        // Fallback: nothing to do for leaf expressions we haven't matched.
+        _ => {}
+    }
+}
+
+// ─── maybe_record_borrow_from_expr ────────────────────────────────────────
+
+// If expr is a Ref expression, record the borrow with name as the borrower.
+// Called from Stmt::Let after the variable is declared. This "promotes" the
+// temporary borrow created by check_expr into a named borrow tied to the
+// variable. The temp is released first to avoid a double-borrow.
+fn maybe_record_borrow_from_expr(self: &mut BorrowChecker, name: str, expr: Expr, line: i64) -> void {
+    match expr {
+        Expr::Ref(inner, is_mut) => {
+            if self.unsafe_depth == 0 {
+                var path_opt: OptStr = extract_field_path(box_expr_unbox(inner));
+                match path_opt {
+                    OptStr::Some(path) => {
+                        // Release the temp borrow that check_expr created for
+                        // this Ref. It's the most recent temp (highest index).
+                        if self.temp_counter > 0 {
+                            var last_temp: str = "__tmp_ref_" + int_to_str(self.temp_counter - 1);
+                            release_borrow_by(self, last_temp);
+                            scope_stack_remove_name(self, last_temp);
+                            self.temp_counter = self.temp_counter - 1;
+                        }
+                        // Now create the named borrow.
+                        create_borrow(self, path, name, is_mut, line);
+                    }
+                    OptStr::None => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ─── pattern_bindings ─────────────────────────────────────────────────────
+
+// Extract variable names bound by a match pattern.
+pub fn pattern_bindings(p: Pattern) -> Vec<str> {
+    match p {
+        Pattern::Ident(name) => {
+            var result: Vec<str> = Vec::new();
+            result.push(name);
+            return result;
+        }
+        Pattern::EnumVariant(_, _, bindings) => {
+            var result: Vec<str> = Vec::new();
+            var i: i64 = 0;
+            while i < bindings.len() {
+                result.push(bindings.get(i).name);
+                i = i + 1;
+            }
+            return result;
+        }
+        _ => {
+            var result: Vec<str> = Vec::new();
+            return result;
+        }
+    }
+}
+
+// ─── str_to_lower helper ──────────────────────────────────────────────────
+
+// Convert a string to lowercase (ASCII only).
+fn str_to_lower(s: str) -> str {
+    var len: i64 = str_len(s);
+    var result: str = "";
+    var i: i64 = 0;
+    while i < len {
+        var b: i64 = String_byte_at(s, i);
+        if b >= 65 && b <= 90 {
+            // 'A' = 65, 'Z' = 90 → add 32 for lowercase
+            b = b + 32;
+        }
+        result = result + char_to_str(b);
+        i = i + 1;
+    }
+    return result;
+}

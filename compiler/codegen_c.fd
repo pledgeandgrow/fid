@@ -1,0 +1,1587 @@
+// codegen_c.fd — C99 generator from Fides IR, rewritten from src/codegen_c.rs (4241 LOC)
+//
+// Strategy: translate IR functions to C functions, with a runtime library
+// implementing p_vec_*, p_map_*, p_string_* in C. This produces portable
+// native binaries via gcc/clang.
+//
+// Adaptations from Rust:
+// 1. HashMap<K,V> → Vec-based maps with helper structs
+// 2. HashSet<T> → Vec<T> with contains() helper
+// 3. format! / wln! macro → direct string concatenation with int_to_str
+// 4. Box<IrType> → box_ir_type_unbox helper
+// 5. matches! macro → explicit match with _ => false
+// 6. Option<T> → Opt* enums
+// 7. String → str, u32/u64 → i64
+// 8. Vec::iter() → explicit while loops with .get(i)
+//
+// Dependencies: compiler::ast, compiler::ir
+
+module compiler::codegen_c;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+
+// ─── Vec-based map entry structs ──────────────────────────────────────────
+// Replace HashMap with Vec<Entry> + linear search.
+
+// value_names: ValueId → C variable name
+pub struct ValueNameEntry {
+    pub id: i64,
+    pub name: str,
+}
+
+pub fn ValueNameEntry_new(id: i64, name: str) -> ValueNameEntry {
+    return ValueNameEntry { id: id, name: name };
+}
+
+// string_consts: original string → _strN name
+pub struct StringConstEntry {
+    pub key: str,
+    pub val: str,
+}
+
+pub fn StringConstEntry_new(key: str, val: str) -> StringConstEntry {
+    return StringConstEntry { key: key, val: val };
+}
+
+// fn_param_types: func name → Vec<IrType>
+pub struct FnParamTypesEntry {
+    pub key: str,
+    pub types: Vec<IrType>,
+}
+
+pub fn FnParamTypesEntry_new(key: str, types: Vec<IrType>) -> FnParamTypesEntry {
+    return FnParamTypesEntry { key: key, types: types };
+}
+
+// user_functions / extern_func_names: Vec<str> set
+// user_fn_param_types: func name → Vec<IrType>
+// fn_ret_types: func name → IrType
+pub struct FnRetTypeEntry {
+    pub key: str,
+    pub ty: IrType,
+}
+
+pub fn FnRetTypeEntry_new(key: str, ty: IrType) -> FnRetTypeEntry {
+    return FnRetTypeEntry { key: key, ty: ty };
+}
+
+// ─── CCodeGen struct ──────────────────────────────────────────────────────
+
+pub struct CCodeGen {
+    // Accumulated C output
+    pub out: str,
+    // Map from ValueId to C variable name
+    pub value_names: Vec<ValueNameEntry>,
+    // String constants collected from the module
+    pub string_consts: Vec<StringConstEntry>,
+    // Counter for unique labels
+    pub label_counter: i64,
+    // Counter for temp variables
+    pub temp_counter: i64,
+    // Whether the current function's C return type is void (true) or non-void (false)
+    pub cur_fn_c_ret_is_void: bool,
+    // The current function's C return type string
+    pub cur_fn_c_ret_type: str,
+    // Function parameter types, keyed by IR function name
+    pub fn_param_types: Vec<FnParamTypesEntry>,
+    // Set of user-defined function names
+    pub user_functions: Vec<str>,
+    // User function parameter types
+    pub user_fn_param_types: Vec<FnParamTypesEntry>,
+    // Function return types, keyed by IR function name
+    pub fn_ret_types: Vec<FnRetTypeEntry>,
+    // Set of user-defined extern function names (FFI)
+    pub extern_func_names: Vec<str>,
+}
+
+pub fn CCodeGen_new() -> CCodeGen {
+    var cg: CCodeGen = CCodeGen {
+        out: "",
+        value_names: Vec::new(),
+        string_consts: Vec::new(),
+        label_counter: 0,
+        temp_counter: 0,
+        cur_fn_c_ret_is_void: true,
+        cur_fn_c_ret_type: "void",
+        fn_param_types: Vec::new(),
+        user_functions: Vec::new(),
+        user_fn_param_types: Vec::new(),
+        fn_ret_types: Vec::new(),
+        extern_func_names: Vec::new(),
+    };
+    CCodeGen_insert_runtime_sigs(&mut cg);
+    return cg;
+}
+
+// ─── Output helpers ───────────────────────────────────────────────────────
+// Replaces the Rust wln! macro. All appends end with a newline.
+
+fn wln(self: &mut CCodeGen, s: str) -> void {
+    self.out = self.out + s + "\n";
+}
+
+// ─── C type helpers ───────────────────────────────────────────────────────
+
+pub fn c_type(ty: IrType) -> str {
+    match ty {
+        IrType::I8 => { return "int8_t"; }
+        IrType::I16 => { return "int16_t"; }
+        IrType::I32 => { return "int32_t"; }
+        IrType::I64 => { return "int64_t"; }
+        IrType::U8 => { return "uint8_t"; }
+        IrType::U16 => { return "uint16_t"; }
+        IrType::U32 => { return "uint32_t"; }
+        IrType::U64 => { return "uint64_t"; }
+        IrType::F32 => { return "float"; }
+        IrType::F64 => { return "double"; }
+        IrType::Bool => { return "bool"; }
+        IrType::Ptr(_) => { return "void*"; }
+        IrType::Struct(name) => { return "struct " + name + "_s*"; }
+        IrType::Array(elem, size) => { return c_type(box_ir_type_unbox(elem)) + "[" + int_to_str(size) + "]"; }
+        IrType::Void => { return "void"; }
+        IrType::Never => { return "void"; }
+        IrType::Opaque(name) => {
+            if str_equal(name, "String") { return "const char*"; }
+            if str_equal(name, "Vec") || str_equal(name, "HashMap") { return "void*"; }
+            return "void*";
+        }
+        IrType::Generic(name, _) => {
+            if str_equal(name, "String") { return "const char*"; }
+            if str_equal(name, "Vec") || str_equal(name, "HashMap") { return "void*"; }
+            return "void*";
+        }
+    }
+    return "void";
+}
+
+// Box<IrType> unbox helper
+pub fn box_ir_type_unbox(b: Box<IrType>) -> IrType {
+    match b {
+        IrType::I8 => { return IrType::I8; }
+        IrType::I16 => { return IrType::I16; }
+        IrType::I32 => { return IrType::I32; }
+        IrType::I64 => { return IrType::I64; }
+        IrType::U8 => { return IrType::U8; }
+        IrType::U16 => { return IrType::U16; }
+        IrType::U32 => { return IrType::U32; }
+        IrType::U64 => { return IrType::U64; }
+        IrType::F32 => { return IrType::F32; }
+        IrType::F64 => { return IrType::F64; }
+        IrType::Bool => { return IrType::Bool; }
+        IrType::Ptr(inner) => { return IrType::Ptr(inner); }
+        IrType::Struct(name) => { return IrType::Struct(name); }
+        IrType::Array(elem, size) => { return IrType::Array(elem, size); }
+        IrType::Void => { return IrType::Void; }
+        IrType::Never => { return IrType::Never; }
+        IrType::Opaque(name) => { return IrType::Opaque(name); }
+        IrType::Generic(name, args) => { return IrType::Generic(name, args); }
+    }
+    return IrType::Void;
+}
+
+// Format a C parameter declaration with the variable name in the right position.
+fn c_param_decl(ty: IrType, name: str) -> str {
+    match ty {
+        IrType::Array(elem, size) => {
+            return c_type(box_ir_type_unbox(elem)) + " " + name + "[" + int_to_str(size) + "]";
+        }
+        _ => {
+            return c_type(ty) + " " + name;
+        }
+    }
+}
+
+// Returns true if the type uses the out-parameter calling convention.
+fn is_aggregate_ret(ty: IrType) -> bool {
+    match ty {
+        IrType::Struct(_) => { return true; }
+        IrType::Array(_, _) => { return true; }
+        _ => { return false; }
+    }
+}
+
+// C return type for a function — aggregate types are `void` because the
+// result is returned via a hidden out-parameter (first function argument).
+fn c_ret_type(ty: IrType) -> str {
+    if is_aggregate_ret(ty) {
+        return "void";
+    }
+    return c_type(ty);
+}
+
+fn is_ptr_type(ty: IrType) -> bool {
+    match ty {
+        IrType::Ptr(_) => { return true; }
+        IrType::Opaque(_) => { return true; }
+        IrType::Generic(_, _) => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn is_float_type(ty: IrType) -> bool {
+    match ty {
+        IrType::F32 => { return true; }
+        IrType::F64 => { return true; }
+        _ => { return false; }
+    }
+}
+
+fn is_int_type(ty: IrType) -> bool {
+    match ty {
+        IrType::I64 => { return true; }
+        IrType::I32 => { return true; }
+        IrType::I16 => { return true; }
+        IrType::I8 => { return true; }
+        IrType::Bool => { return true; }
+        _ => { return false; }
+    }
+}
+
+// Cast a call argument from its IR type to the called function's parameter type.
+fn cast_arg(val: str, from: IrType, to: IrType) -> str {
+    var from_is_ptr: bool = is_ptr_type(from);
+    var from_is_float: bool = is_float_type(from);
+    var to_is_ptr: bool = is_ptr_type(to);
+
+    var to_is_array: bool = false;
+    var to_array_elem: IrType = IrType::Void;
+    match to {
+        IrType::Array(elem, _) => {
+            to_is_array = true;
+            to_array_elem = box_ir_type_unbox(elem);
+        }
+        _ => {}
+    }
+    var to_is_struct: bool = is_aggregate_ret(to);
+    var to_is_int: bool = is_int_type(to);
+
+    // Array params decay to pointers in C — cast to element pointer type
+    if to_is_array {
+        return "(" + c_type(to_array_elem) + "*)" + val;
+    }
+
+    if !from_is_ptr && to_is_ptr && from_is_float {
+        // float → pointer: use type punning via union
+        return "((union { double d; void* p; }){ .d = " + val + " }).p";
+    }
+    if !from_is_ptr && !to_is_ptr && from_is_float && to_is_int {
+        // float → int: use type punning via union
+        return "((union { double d; int64_t i; }){ .d = " + val + " }).i";
+    }
+    if !from_is_ptr && to_is_ptr {
+        // int → pointer: cast to void*
+        return "(void*)" + val;
+    }
+    if from_is_ptr && !to_is_ptr {
+        // pointer → int: cast to int64_t
+        return "(int64_t)" + val;
+    }
+    if !from_is_ptr && !to_is_ptr && to_is_struct {
+        // pointer → struct pointer (out-param): cast to void*
+        return "(void*)" + val;
+    }
+    return val;
+}
+
+// ─── sanitize_c_name ──────────────────────────────────────────────────────
+// Renames Fides functions that collide with C keywords or C runtime names.
+
+fn sanitize_c_name(self: &CCodeGen, name: str) -> str {
+    // Don't sanitize user-defined extern function names (FFI)
+    if vec_contains_str(self.extern_func_names, name) {
+        return name;
+    }
+    // Exact-name collisions
+    if str_equal(name, "main") { return "main_entry"; }
+    if str_equal(name, "abs") { return "p_abs"; }
+    if str_equal(name, "max") { return "p_max"; }
+    if str_equal(name, "min") { return "p_min"; }
+    if str_equal(name, "div") { return "p_div"; }
+    if str_equal(name, "exit") { return "p_exit"; }
+    if str_equal(name, "printf") { return "p_printf"; }
+    if str_equal(name, "malloc") { return "p_malloc_user"; }
+    if str_equal(name, "free") { return "p_free_user"; }
+    if str_equal(name, "calloc") { return "p_calloc_user"; }
+    if str_equal(name, "realloc") { return "p_realloc_user"; }
+    if str_equal(name, "memcpy") { return "p_memcpy_user"; }
+    if str_equal(name, "memset") { return "p_memset_user"; }
+    if str_equal(name, "strlen") { return "p_strlen_user"; }
+    if str_equal(name, "strcmp") { return "p_strcmp_user"; }
+    if str_equal(name, "strcpy") { return "p_strcpy_user"; }
+    if str_equal(name, "strcat") { return "p_strcat_user"; }
+    if str_equal(name, "rand") { return "p_rand_user"; }
+    if str_equal(name, "srand") { return "p_srand_user"; }
+    if str_equal(name, "time") { return "p_time_user"; }
+    if str_equal(name, "clock") { return "p_clock_user"; }
+    if str_equal(name, "sin") { return "p_sin_user"; }
+    if str_equal(name, "cos") { return "p_cos_user"; }
+    if str_equal(name, "tan") { return "p_tan_user"; }
+    if str_equal(name, "sqrt") { return "p_sqrt_user"; }
+    if str_equal(name, "pow") { return "p_pow_user"; }
+    if str_equal(name, "floor") { return "p_floor_user"; }
+    if str_equal(name, "ceil") { return "p_ceil_user"; }
+    if str_equal(name, "round") { return "p_round_user"; }
+    if str_equal(name, "log") { return "p_log_user"; }
+    if str_equal(name, "exp") { return "p_exp_user"; }
+    if str_equal(name, "asin") { return "p_asin_user"; }
+    if str_equal(name, "acos") { return "p_acos_user"; }
+    if str_equal(name, "atan") { return "p_atan_user"; }
+    if str_equal(name, "atan2") { return "p_atan2_user"; }
+    if str_equal(name, "fmod") { return "p_fmod_user"; }
+    if str_equal(name, "fabs") { return "p_fabs_user"; }
+    if str_equal(name, "isalpha") { return "p_isalpha_user"; }
+    if str_equal(name, "isdigit") { return "p_isdigit_user"; }
+    if str_equal(name, "isspace") { return "p_isspace_user"; }
+    if str_equal(name, "toupper") { return "p_toupper_user"; }
+    if str_equal(name, "tolower") { return "p_tolower_user"; }
+    // C keywords / reserved identifiers
+    if str_equal(name, "auto") { return "p_auto_user"; }
+    if str_equal(name, "break") { return "p_break_user"; }
+    if str_equal(name, "case") { return "p_case_user"; }
+    if str_equal(name, "char") { return "p_char_user"; }
+    if str_equal(name, "const") { return "p_const_user"; }
+    if str_equal(name, "continue") { return "p_continue_user"; }
+    if str_equal(name, "default") { return "p_default_user"; }
+    if str_equal(name, "do") { return "p_do_user"; }
+    if str_equal(name, "double") { return "p_double_user"; }
+    if str_equal(name, "else") { return "p_else_user"; }
+    if str_equal(name, "enum") { return "p_enum_user"; }
+    if str_equal(name, "extern") { return "p_extern_user"; }
+    if str_equal(name, "float") { return "p_float_user"; }
+    if str_equal(name, "for") { return "p_for_user"; }
+    if str_equal(name, "goto") { return "p_goto_user"; }
+    if str_equal(name, "if") { return "p_if_user"; }
+    if str_equal(name, "inline") { return "p_inline_user"; }
+    if str_equal(name, "int") { return "p_int_user"; }
+    if str_equal(name, "long") { return "p_long_user"; }
+    if str_equal(name, "register") { return "p_register_user"; }
+    if str_equal(name, "restrict") { return "p_restrict_user"; }
+    if str_equal(name, "return") { return "p_return_user"; }
+    if str_equal(name, "short") { return "p_short_user"; }
+    if str_equal(name, "signed") { return "p_signed_user"; }
+    if str_equal(name, "sizeof") { return "p_sizeof_user"; }
+    if str_equal(name, "static") { return "p_static_user"; }
+    if str_equal(name, "struct") { return "p_struct_user"; }
+    if str_equal(name, "switch") { return "p_switch_user"; }
+    if str_equal(name, "typedef") { return "p_typedef_user"; }
+    if str_equal(name, "union") { return "p_union_user"; }
+    if str_equal(name, "unsigned") { return "p_unsigned_user"; }
+    if str_equal(name, "void") { return "p_void_user"; }
+    if str_equal(name, "volatile") { return "p_volatile_user"; }
+    if str_equal(name, "while") { return "p_while_user"; }
+    return name;
+}
+
+// ─── String escaping ──────────────────────────────────────────────────────
+
+fn escape_c_string(s: str) -> str {
+    var result: str = "";
+    var i: i64 = 0;
+    var len: i64 = str_len(s);
+    while i < len {
+        var b: i64 = String_byte_at(s, i);
+        if b == 34 {
+            // "
+            result = result + "\\\"";
+        } else if b == 92 {
+            // backslash
+            result = result + "\\\\";
+        } else if b == 10 {
+            result = result + "\\n";
+        } else if b == 13 {
+            result = result + "\\r";
+        } else if b == 9 {
+            result = result + "\\t";
+        } else if b >= 32 && b < 127 {
+            result = result + char_to_str(b);
+        } else {
+            // Octal escape \ooo
+            result = result + "\\" + int_to_str(b / 64) + int_to_str((b % 64) / 8) + int_to_str(b % 8);
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+// ─── Value/name helpers ───────────────────────────────────────────────────
+
+fn val_name(self: &CCodeGen, id: i64) -> str {
+    var i: i64 = 0;
+    while i < self.value_names.len() {
+        if self.value_names.get(i).id == id {
+            return self.value_names.get(i).name;
+        }
+        i = i + 1;
+    }
+    return "v" + int_to_str(id);
+}
+
+fn fresh_label(self: &mut CCodeGen) -> str {
+    var n: i64 = self.label_counter;
+    self.label_counter = self.label_counter + 1;
+    return "L" + int_to_str(n);
+}
+
+fn fresh_temp(self: &mut CCodeGen) -> str {
+    var n: i64 = self.temp_counter;
+    self.temp_counter = self.temp_counter + 1;
+    return "t" + int_to_str(n);
+}
+
+// ─── Vec helper: contains str ─────────────────────────────────────────────
+
+fn vec_contains_str(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if str_equal(v.get(i), s) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ─── Map helpers ──────────────────────────────────────────────────────────
+
+fn value_names_set(self: &mut CCodeGen, id: i64, name: str) -> void {
+    var i: i64 = 0;
+    while i < self.value_names.len() {
+        if self.value_names.get(i).id == id {
+            self.value_names.get(i).name = name;
+            return;
+        }
+        i = i + 1;
+    }
+    self.value_names.push(ValueNameEntry_new(id, name));
+}
+
+fn string_consts_get(self: &CCodeGen, key: str) -> OptStr {
+    var i: i64 = 0;
+    while i < self.string_consts.len() {
+        if str_equal(self.string_consts.get(i).key, key) {
+            return OptStr::Some(self.string_consts.get(i).val);
+        }
+        i = i + 1;
+    }
+    return OptStr::None;
+}
+
+fn string_consts_set(self: &mut CCodeGen, key: str, val: str) -> void {
+    var i: i64 = 0;
+    while i < self.string_consts.len() {
+        if str_equal(self.string_consts.get(i).key, key) {
+            self.string_consts.get(i).val = val;
+            return;
+        }
+        i = i + 1;
+    }
+    self.string_consts.push(StringConstEntry_new(key, val));
+}
+
+fn fn_param_types_get(self: &CCodeGen, key: str) -> OptVecIrType {
+    var i: i64 = 0;
+    while i < self.fn_param_types.len() {
+        if str_equal(self.fn_param_types.get(i).key, key) {
+            return OptVecIrType::Some(self.fn_param_types.get(i).types);
+        }
+        i = i + 1;
+    }
+    return OptVecIrType::None;
+}
+
+fn fn_param_types_set(self: &mut CCodeGen, key: str, types: Vec<IrType>) -> void {
+    var i: i64 = 0;
+    while i < self.fn_param_types.len() {
+        if str_equal(self.fn_param_types.get(i).key, key) {
+            self.fn_param_types.get(i).types = types;
+            return;
+        }
+        i = i + 1;
+    }
+    self.fn_param_types.push(FnParamTypesEntry_new(key, types));
+}
+
+pub enum OptVecIrType {
+    Some(Vec<IrType>),
+    None,
+}
+
+pub enum OptIrType {
+    Some(IrType),
+    None,
+}
+
+fn fn_ret_types_get(self: &CCodeGen, key: str) -> OptIrType {
+    var i: i64 = 0;
+    while i < self.fn_ret_types.len() {
+        if str_equal(self.fn_ret_types.get(i).key, key) {
+            return OptIrType::Some(self.fn_ret_types.get(i).ty);
+        }
+        i = i + 1;
+    }
+    return OptIrType::None;
+}
+
+fn fn_ret_types_set(self: &mut CCodeGen, key: str, ty: IrType) -> void {
+    var i: i64 = 0;
+    while i < self.fn_ret_types.len() {
+        if str_equal(self.fn_ret_types.get(i).key, key) {
+            self.fn_ret_types.get(i).ty = ty;
+            return;
+        }
+        i = i + 1;
+    }
+    self.fn_ret_types.push(FnRetTypeEntry_new(key, ty));
+}
+
+// ─── Helpers for building small Vec<IrType> ───────────────────────────────
+
+fn t0() -> Vec<IrType> {
+    return Vec::new();
+}
+
+fn t1(a: IrType) -> Vec<IrType> {
+    var v: Vec<IrType> = Vec::new();
+    v.push(a);
+    return v;
+}
+
+fn t2(a: IrType, b: IrType) -> Vec<IrType> {
+    var v: Vec<IrType> = Vec::new();
+    v.push(a);
+    v.push(b);
+    return v;
+}
+
+fn t3(a: IrType, b: IrType, c: IrType) -> Vec<IrType> {
+    var v: Vec<IrType> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    return v;
+}
+
+fn t4(a: IrType, b: IrType, c: IrType, d: IrType) -> Vec<IrType> {
+    var v: Vec<IrType> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    v.push(d);
+    return v;
+}
+
+fn ptr_u8() -> IrType {
+    return IrType::Ptr(Box::new(IrType::U8));
+}
+
+// ─── Runtime builtin parameter signatures ─────────────────────────────────
+
+fn CCodeGen_insert_runtime_sigs(self: &mut CCodeGen) -> void {
+    // Vec builtins
+    fn_param_types_set(self, "p_vec_new", t0());
+    fn_param_types_set(self, "p_vec_push", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_vec_get", t2(ptr_u8(), IrType::I64));
+    fn_param_types_set(self, "p_vec_len", t1(ptr_u8()));
+    fn_param_types_set(self, "p_vec_pop", t1(ptr_u8()));
+    fn_param_types_set(self, "p_vec_is_empty", t1(ptr_u8()));
+    fn_param_types_set(self, "p_vec_clear", t1(ptr_u8()));
+    fn_param_types_set(self, "p_vec_clone", t1(ptr_u8()));
+    fn_param_types_set(self, "p_vec_contains", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_vec_extend", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_vec_first", t1(ptr_u8()));
+    fn_param_types_set(self, "p_vec_last", t1(ptr_u8()));
+    fn_param_types_set(self, "p_vec_insert", t3(ptr_u8(), IrType::I64, ptr_u8()));
+    fn_param_types_set(self, "p_vec_remove", t2(ptr_u8(), IrType::I64));
+    fn_param_types_set(self, "p_vec_reverse", t1(ptr_u8()));
+    fn_param_types_set(self, "p_vec_sort", t1(ptr_u8()));
+    fn_param_types_set(self, "p_vec_truncate", t2(ptr_u8(), IrType::I64));
+    fn_param_types_set(self, "p_vec_set", t3(ptr_u8(), IrType::I64, ptr_u8()));
+
+    // Map builtins
+    fn_param_types_set(self, "p_map_new", t0());
+    fn_param_types_set(self, "p_map_insert", t3(ptr_u8(), ptr_u8(), IrType::I64));
+    fn_param_types_set(self, "p_map_get", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_map_get_or", t3(ptr_u8(), ptr_u8(), IrType::I64));
+    fn_param_types_set(self, "p_map_contains", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_map_remove", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_map_len", t1(ptr_u8()));
+    fn_param_types_set(self, "p_map_is_empty", t1(ptr_u8()));
+    fn_param_types_set(self, "p_map_clear", t1(ptr_u8()));
+    fn_param_types_set(self, "p_map_clone", t1(ptr_u8()));
+    fn_param_types_set(self, "p_map_keys", t1(ptr_u8()));
+    fn_param_types_set(self, "p_map_values", t1(ptr_u8()));
+
+    // String builtins
+    fn_param_types_set(self, "p_string_len", t1(ptr_u8()));
+    fn_param_types_set(self, "p_string_is_empty", t1(ptr_u8()));
+    fn_param_types_set(self, "p_string_push_str", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_string_from", t1(ptr_u8()));
+    fn_param_types_set(self, "p_string_slice", t3(ptr_u8(), IrType::I64, IrType::I64));
+    fn_param_types_set(self, "p_string_contains", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_string_starts_with", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_string_ends_with", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_string_find", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_string_trim", t1(ptr_u8()));
+    fn_param_types_set(self, "p_string_to_uppercase", t1(ptr_u8()));
+    fn_param_types_set(self, "p_string_to_lowercase", t1(ptr_u8()));
+    fn_param_types_set(self, "p_string_repeat", t2(ptr_u8(), IrType::I64));
+    fn_param_types_set(self, "p_string_replace", t3(ptr_u8(), ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_string_split", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_string_parse_int", t1(ptr_u8()));
+    fn_param_types_set(self, "p_string_char_at", t2(ptr_u8(), IrType::I64));
+    fn_param_types_set(self, "p_string_substring", t3(ptr_u8(), IrType::I64, IrType::I64));
+
+    // to_str family
+    fn_param_types_set(self, "p_to_str", t1(IrType::I64));
+    fn_param_types_set(self, "p_char_to_str", t1(IrType::I64));
+    fn_param_types_set(self, "p_to_str_vec", t1(ptr_u8()));
+    fn_param_types_set(self, "p_to_str_str", t1(ptr_u8()));
+    fn_param_types_set(self, "p_to_str_bool", t1(IrType::Bool));
+    fn_param_types_set(self, "p_to_str_float", t1(IrType::F64));
+    fn_param_types_set(self, "p_to_str_map", t1(ptr_u8()));
+    fn_param_types_set(self, "p_float_to_str", t1(IrType::F64));
+    fn_param_types_set(self, "p_bool_to_str", t1(IrType::Bool));
+    fn_param_types_set(self, "p_vec_to_str", t1(ptr_u8()));
+    fn_param_types_set(self, "p_str_concat", t2(ptr_u8(), ptr_u8()));
+
+    // Print family
+    fn_param_types_set(self, "p_print", t1(IrType::I64));
+    fn_param_types_set(self, "p_print_str", t1(ptr_u8()));
+    fn_param_types_set(self, "p_print_int", t1(IrType::I64));
+    fn_param_types_set(self, "p_print_bool", t1(IrType::Bool));
+    fn_param_types_set(self, "p_print_float", t1(IrType::F64));
+    fn_param_types_set(self, "p_print_newline", t0());
+
+    // Memory / panic
+    fn_param_types_set(self, "p_malloc", t1(IrType::I64));
+    fn_param_types_set(self, "p_alloc", t1(IrType::I64));
+    fn_param_types_set(self, "p_free", t1(ptr_u8()));
+    fn_param_types_set(self, "p_region_free", t1(ptr_u8()));
+    fn_param_types_set(self, "p_panic", t1(ptr_u8()));
+    fn_param_types_set(self, "println", t2(ptr_u8(), ptr_u8()));
+
+    // Kernel / system
+    fn_param_types_set(self, "p_cli", t0());
+    fn_param_types_set(self, "p_sti", t0());
+    fn_param_types_set(self, "p_cr0_read", t0());
+    fn_param_types_set(self, "p_cr3_read", t0());
+    fn_param_types_set(self, "p_cr4_read", t0());
+    fn_param_types_set(self, "p_cr3_write", t1(IrType::I64));
+    fn_param_types_set(self, "p_invlpg", t1(IrType::I64));
+    fn_param_types_set(self, "p_page_map", t4(IrType::I64, IrType::I64, IrType::I64, IrType::I64));
+    fn_param_types_set(self, "p_page_unmap", t2(IrType::I64, IrType::I64));
+    fn_param_types_set(self, "p_phys_read64", t1(IrType::I64));
+    fn_param_types_set(self, "p_phys_write64", t2(IrType::I64, IrType::I64));
+
+    // SIMD
+    fn_param_types_set(self, "p_simd_add", t2(IrType::I64, IrType::I64));
+    fn_param_types_set(self, "p_simd_sub", t2(IrType::I64, IrType::I64));
+    fn_param_types_set(self, "p_simd_mul", t2(IrType::I64, IrType::I64));
+    fn_param_types_set(self, "p_simd_div", t2(IrType::I64, IrType::I64));
+    fn_param_types_set(self, "p_simd_dot", t2(IrType::I64, IrType::I64));
+    fn_param_types_set(self, "p_simd_sum", t1(IrType::I64));
+    fn_param_types_set(self, "p_simd_scale", t2(IrType::I64, IrType::F64));
+    fn_param_types_set(self, "p_simd_from_vec", t1(IrType::I64));
+    fn_param_types_set(self, "p_simd_to_str", t1(IrType::I64));
+
+    // Tensor
+    fn_param_types_set(self, "p_tensor_new", t2(IrType::I64, ptr_u8()));
+    fn_param_types_set(self, "p_tensor_from", t3(ptr_u8(), IrType::I64, ptr_u8()));
+    fn_param_types_set(self, "p_tensor_zeros", t1(ptr_u8()));
+    fn_param_types_set(self, "p_tensor_ones", t1(ptr_u8()));
+    fn_param_types_set(self, "p_tensor_filled", t2(ptr_u8(), IrType::F64));
+    fn_param_types_set(self, "p_tensor_from_vec", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_tensor_clone", t1(ptr_u8()));
+    fn_param_types_set(self, "p_tensor_at", t2(ptr_u8(), IrType::I64));
+    fn_param_types_set(self, "p_tensor_get", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_tensor_set", t3(ptr_u8(), ptr_u8(), IrType::F64));
+    fn_param_types_set(self, "p_tensor_add", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_tensor_sub", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_tensor_mul", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_tensor_matmul", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_tensor_transpose", t1(ptr_u8()));
+    fn_param_types_set(self, "p_tensor_relu", t1(ptr_u8()));
+    fn_param_types_set(self, "p_tensor_sigmoid", t1(ptr_u8()));
+    fn_param_types_set(self, "p_tensor_softmax", t1(ptr_u8()));
+    fn_param_types_set(self, "p_tensor_scale", t2(ptr_u8(), IrType::F64));
+    fn_param_types_set(self, "p_tensor_sum", t1(ptr_u8()));
+    fn_param_types_set(self, "p_tensor_mean", t1(ptr_u8()));
+    fn_param_types_set(self, "p_tensor_min", t1(ptr_u8()));
+    fn_param_types_set(self, "p_tensor_max", t1(ptr_u8()));
+    fn_param_types_set(self, "p_tensor_dot", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_tensor_reshape", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_tensor_len", t1(ptr_u8()));
+    fn_param_types_set(self, "p_tensor_ndim", t1(ptr_u8()));
+    fn_param_types_set(self, "p_tensor_shape", t1(ptr_u8()));
+    fn_param_types_set(self, "p_tensor_size", t1(ptr_u8()));
+    fn_param_types_set(self, "p_tensor_to_str", t1(ptr_u8()));
+    fn_param_types_set(self, "p_tensor_to_json", t1(ptr_u8()));
+
+    // JSON
+    fn_param_types_set(self, "p_json_parse", t1(ptr_u8()));
+    fn_param_types_set(self, "p_json_new_object", t0());
+    fn_param_types_set(self, "p_json_new_array", t0());
+    fn_param_types_set(self, "p_json_set", t3(ptr_u8(), ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_json_set_int", t3(ptr_u8(), ptr_u8(), IrType::I64));
+    fn_param_types_set(self, "p_json_set_float", t3(ptr_u8(), ptr_u8(), IrType::F64));
+    fn_param_types_set(self, "p_json_set_bool", t3(ptr_u8(), ptr_u8(), IrType::I64));
+    fn_param_types_set(self, "p_json_append", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_json_append_int", t2(ptr_u8(), IrType::I64));
+    fn_param_types_set(self, "p_json_append_float", t2(ptr_u8(), IrType::F64));
+    fn_param_types_set(self, "p_json_dump", t1(ptr_u8()));
+    fn_param_types_set(self, "p_json_dump_pretty", t1(ptr_u8()));
+    fn_param_types_set(self, "p_json_pretty", t1(ptr_u8()));
+    fn_param_types_set(self, "p_json_string", t1(ptr_u8()));
+    fn_param_types_set(self, "p_json_type", t1(ptr_u8()));
+    fn_param_types_set(self, "p_json_get", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_json_get_int", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_json_get_float", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_json_get_bool", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_json_at", t2(ptr_u8(), IrType::I64));
+    fn_param_types_set(self, "p_json_len", t1(ptr_u8()));
+    fn_param_types_set(self, "p_json_object_get", t2(ptr_u8(), ptr_u8()));
+
+    // HTTP / DB
+    fn_param_types_set(self, "p_http_listen", t1(IrType::I64));
+    fn_param_types_set(self, "p_http_recv_request", t1(IrType::I64));
+    fn_param_types_set(self, "p_http_send_response", t3(IrType::I64, IrType::I64, ptr_u8()));
+    fn_param_types_set(self, "p_http_build_response", t3(IrType::I64, ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_http_parse_request", t1(ptr_u8()));
+    fn_param_types_set(self, "p_db_connect", t1(ptr_u8()));
+    fn_param_types_set(self, "p_db_exec", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_db_query", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_db_get", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_db_set", t3(ptr_u8(), ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_db_mem_open", t1(IrType::I64));
+    fn_param_types_set(self, "p_db_mem_exec", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_db_mem_query", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_db_mem_close", t1(ptr_u8()));
+
+    // Misc
+    fn_param_types_set(self, "p_hlt", t0());
+    fn_param_types_set(self, "p_socket_write_str", t2(IrType::I64, ptr_u8()));
+    fn_param_types_set(self, "p_file_read", t1(ptr_u8()));
+    fn_param_types_set(self, "p_file_write", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_file_exists", t1(ptr_u8()));
+    fn_param_types_set(self, "p_file_append", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_file_delete", t1(ptr_u8()));
+    fn_param_types_set(self, "p_file_size", t1(ptr_u8()));
+
+    // Varargs (fixed prefix only)
+    fn_param_types_set(self, "p_thread_spawn", t2(ptr_u8(), IrType::I64));
+    fn_param_types_set(self, "p_executor_spawn", t3(IrType::I64, ptr_u8(), IrType::I64));
+
+    // Channels
+    fn_param_types_set(self, "p_chan_create", t1(IrType::I64));
+    fn_param_types_set(self, "p_chan_send", t2(IrType::I64, IrType::I64));
+    fn_param_types_set(self, "p_chan_recv", t1(IrType::I64));
+    fn_param_types_set(self, "p_chan_try_recv", t1(IrType::I64));
+    fn_param_types_set(self, "p_chan_close", t1(IrType::I64));
+    fn_param_types_set(self, "p_chan_is_closed", t1(IrType::I64));
+
+    // Autograd / checkpoint / DP
+    fn_param_types_set(self, "p_grad_get", t1(ptr_u8()));
+    fn_param_types_set(self, "p_grad_zero", t0());
+    fn_param_types_set(self, "p_checkpoint_begin", t0());
+    fn_param_types_set(self, "p_checkpoint_end", t0());
+    fn_param_types_set(self, "p_dp_noise", t2(ptr_u8(), IrType::F64));
+    fn_param_types_set(self, "p_gaussian_noise", t2(ptr_u8(), IrType::F64));
+    fn_param_types_set(self, "p_dropout", t2(ptr_u8(), IrType::F64));
+    fn_param_types_set(self, "p_dp_budget_reset", t1(IrType::F64));
+    fn_param_types_set(self, "p_dp_budget_check", t2(IrType::F64, IrType::F64));
+
+    // Tensor parallelism
+    fn_param_types_set(self, "p_tp_rank", t0());
+    fn_param_types_set(self, "p_tp_world_size", t0());
+    fn_param_types_set(self, "p_all_reduce", t1(ptr_u8()));
+    fn_param_types_set(self, "p_broadcast", t1(ptr_u8()));
+    fn_param_types_set(self, "p_all_gather", t1(ptr_u8()));
+    fn_param_types_set(self, "p_scatter", t1(ptr_u8()));
+    fn_param_types_set(self, "p_send_tensor", t1(ptr_u8()));
+    fn_param_types_set(self, "p_recv_tensor", t1(ptr_u8()));
+
+    // KV cache
+    fn_param_types_set(self, "p_kv_cache_new", t4(IrType::I64, IrType::I64, IrType::I64, IrType::I64));
+    fn_param_types_set(self, "p_kv_cache_append", t4(IrType::I64, IrType::I64, ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_kv_cache_get", t2(IrType::I64, IrType::I64));
+    fn_param_types_set(self, "p_kv_cache_len", t2(IrType::I64, IrType::I64));
+    fn_param_types_set(self, "p_kv_cache_clear", t1(IrType::I64));
+    fn_param_types_set(self, "p_kv_cache_evict", t2(IrType::I64, IrType::I64));
+
+    // Quantization
+    fn_param_types_set(self, "p_quantize_q8", t3(ptr_u8(), IrType::F64, IrType::I64));
+    fn_param_types_set(self, "p_dequantize_q8", t3(ptr_u8(), IrType::F64, IrType::I64));
+    fn_param_types_set(self, "p_qmatmul", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_find_quant_params", t1(ptr_u8()));
+
+    // Runtime function return types — most return int64_t or void*,
+    // but some return void (mutating operations).
+    var void_rets: Vec<str> = Vec::new();
+    void_rets.push("p_vec_push");
+    void_rets.push("p_vec_clear");
+    void_rets.push("p_vec_insert");
+    void_rets.push("p_vec_set");
+    void_rets.push("p_vec_reverse");
+    void_rets.push("p_vec_sort");
+    void_rets.push("p_vec_truncate");
+    void_rets.push("p_vec_extend");
+    void_rets.push("p_map_insert");
+    void_rets.push("p_map_remove");
+    void_rets.push("p_map_clear");
+    void_rets.push("p_print");
+    void_rets.push("p_print_str");
+    void_rets.push("p_print_int");
+    void_rets.push("p_print_bool");
+    void_rets.push("p_print_float");
+    void_rets.push("p_print_newline");
+    void_rets.push("p_free");
+    void_rets.push("p_region_free");
+    void_rets.push("p_panic");
+    void_rets.push("p_socket_close");
+    void_rets.push("p_cli");
+    void_rets.push("p_sti");
+    void_rets.push("p_cr3_write");
+    void_rets.push("p_invlpg");
+    void_rets.push("p_page_map");
+    void_rets.push("p_page_unmap");
+    void_rets.push("p_phys_write64");
+    void_rets.push("p_tensor_set");
+    void_rets.push("p_json_set");
+    void_rets.push("p_json_set_int");
+    void_rets.push("p_json_set_float");
+    void_rets.push("p_json_set_bool");
+    void_rets.push("p_json_append");
+    void_rets.push("p_json_append_int");
+    void_rets.push("p_json_append_float");
+    void_rets.push("p_http_send_response");
+    void_rets.push("p_db_exec");
+    void_rets.push("p_db_set");
+    void_rets.push("p_db_mem_close");
+    void_rets.push("p_rc_decr");
+    void_rets.push("p_grad_zero");
+    void_rets.push("p_checkpoint_begin");
+    void_rets.push("p_checkpoint_end");
+    void_rets.push("p_dp_budget_reset");
+    void_rets.push("p_dp_budget_check");
+    void_rets.push("p_send_tensor");
+    void_rets.push("p_kv_cache_append");
+    void_rets.push("p_kv_cache_clear");
+    void_rets.push("p_kv_cache_evict");
+    var v: i64 = 0;
+    while v < void_rets.len() {
+        fn_ret_types_set(self, void_rets.get(v), IrType::Void);
+        v = v + 1;
+    }
+
+    // Specific non-void returns
+    fn_ret_types_set(self, "p_map_keys", IrType::I64);
+    fn_ret_types_set(self, "p_map_values", IrType::I64);
+    fn_ret_types_set(self, "p_string_split", IrType::I64);
+    fn_ret_types_set(self, "p_simd_add", IrType::I64);
+    fn_ret_types_set(self, "p_simd_sub", IrType::I64);
+    fn_ret_types_set(self, "p_simd_mul", IrType::I64);
+    fn_ret_types_set(self, "p_simd_div", IrType::I64);
+    fn_ret_types_set(self, "p_simd_scale", IrType::I64);
+    fn_ret_types_set(self, "p_simd_from_vec", IrType::I64);
+    fn_ret_types_set(self, "p_rc_incr", IrType::I64);
+    fn_ret_types_set(self, "p_tp_rank", IrType::I64);
+    fn_ret_types_set(self, "p_tp_world_size", IrType::I64);
+    fn_ret_types_set(self, "p_kv_cache_new", IrType::I64);
+    fn_ret_types_set(self, "p_kv_cache_get", IrType::Opaque("Tensor"));
+    fn_ret_types_set(self, "p_kv_cache_len", IrType::I64);
+    fn_ret_types_set(self, "p_quantize_q8", IrType::Opaque("Tensor"));
+    fn_ret_types_set(self, "p_dequantize_q8", IrType::Opaque("Tensor"));
+    fn_ret_types_set(self, "p_qmatmul", IrType::Opaque("Tensor"));
+    fn_ret_types_set(self, "p_find_quant_params", IrType::Ptr(Box::new(IrType::U8)));
+    fn_ret_types_set(self, "p_grad_get", IrType::Opaque("Tensor"));
+    fn_ret_types_set(self, "p_all_reduce", IrType::Opaque("Tensor"));
+    fn_ret_types_set(self, "p_broadcast", IrType::Opaque("Tensor"));
+    fn_ret_types_set(self, "p_all_gather", IrType::Opaque("Tensor"));
+    fn_ret_types_set(self, "p_scatter", IrType::Opaque("Tensor"));
+    fn_ret_types_set(self, "p_dp_noise", IrType::Opaque("Tensor"));
+    fn_ret_types_set(self, "p_gaussian_noise", IrType::Opaque("Tensor"));
+    fn_ret_types_set(self, "p_dropout", IrType::Opaque("Tensor"));
+}
+
+// ─── String helpers for unique collections ────────────────────────────────
+
+fn vec_push_unique(v: &mut Vec<str>, s: str) -> void {
+    var i: i64 = 0;
+    while i < v.len() {
+        if str_equal(v.get(i), s) {
+            return;
+        }
+        i = i + 1;
+    }
+    v.push(s);
+}
+
+// ─── Header / runtime type emission ───────────────────────────────────────
+
+fn emit_runtime_header(self: &mut CCodeGen) -> void {
+    wln(self, "// Auto-generated C code from Fides IR");
+    wln(self, "#include <stdio.h>");
+    wln(self, "#include <stdlib.h>");
+    wln(self, "#include <string.h>");
+    wln(self, "#include <stdint.h>");
+    wln(self, "#include <stdbool.h>");
+    wln(self, "#include <ctype.h>");
+    wln(self, "#include <math.h>");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "#include <winsock2.h>");
+    wln(self, "#include <ws2tcpip.h>");
+    wln(self, "#pragma comment(lib, \"ws2_32.lib\")");
+    wln(self, "#else");
+    wln(self, "#include <sys/socket.h>");
+    wln(self, "#include <netinet/in.h>");
+    wln(self, "#include <arpa/inet.h>");
+    wln(self, "#include <unistd.h>");
+    wln(self, "#include <fcntl.h>");
+    wln(self, "#endif");
+    wln(self, "");
+    wln(self, "#ifdef max");
+    wln(self, "#undef max");
+    wln(self, "#endif");
+    wln(self, "#ifdef min");
+    wln(self, "#undef min");
+    wln(self, "#endif");
+    wln(self, "#ifdef abs");
+    wln(self, "#undef abs");
+    wln(self, "#endif");
+    wln(self, "");
+    wln(self, "typedef struct { double* data; int64_t len; int64_t ndim; int64_t shape[8]; } PTensor;");
+    wln(self, "");
+}
+
+// ─── FFI / extern declarations ────────────────────────────────────────────
+
+fn emit_extern_decls(self: &mut CCodeGen, module: IrModule) -> void {
+    if module.extern_decls.len() == 0 {
+        return;
+    }
+
+    var missing_includes: Vec<str> = Vec::new();
+    var emitted_includes: Vec<str> = Vec::new();
+    var ed: i64 = 0;
+    while ed < module.extern_decls.len() {
+        var ext: ExternDecl = module.extern_decls.get(ed);
+        match ext.include {
+            OptStr::Some(inc) => {
+                if !vec_contains_str(emitted_includes, inc) {
+                    if str_starts_with(inc, "<") {
+                        // System header
+                        wln(self, "#include " + inc);
+                    } else {
+                        // Local header — check if file exists via file_exists helper
+                        var clean: str = str_trim_chars(inc, "\"<>");
+                        if p_file_exists(clean) {
+                            if str_starts_with(inc, "\"") {
+                                wln(self, "#include " + inc);
+                            } else {
+                                wln(self, "#include \"" + clean + "\"");
+                            }
+                        } else {
+                            missing_includes.push(inc);
+                        }
+                    }
+                    vec_push_unique(emitted_includes, inc);
+                }
+            }
+            OptStr::None => {}
+        }
+        ed = ed + 1;
+    }
+    if emitted_includes.len() > 0 {
+        wln(self, "");
+    }
+
+    var emitted_libs: Vec<str> = Vec::new();
+    ed = 0;
+    while ed < module.extern_decls.len() {
+        var ext: ExternDecl = module.extern_decls.get(ed);
+        match ext.link_lib {
+            OptStr::Some(lib) => {
+                if !vec_contains_str(emitted_libs, lib) {
+                    wln(self, "// PLINK: " + lib);
+                    vec_push_unique(emitted_libs, lib);
+                }
+            }
+            OptStr::None => {}
+        }
+        ed = ed + 1;
+    }
+
+    wln(self, "// ─── User-defined extern declarations (FFI) ───");
+    ed = 0;
+    while ed < module.extern_decls.len() {
+        var ext: ExternDecl = module.extern_decls.get(ed);
+        var ret_c: str = c_type_from_ast(ext.ret_ty);
+        var params_str: str = "";
+        var p: i64 = 0;
+        while p < ext.params.len() {
+            var param: Param = ext.params.get(p);
+            if p > 0 { params_str = params_str + ", "; }
+            params_str = params_str + c_type_from_ast(param.ty) + " " + param.name;
+            p = p + 1;
+        }
+        if ext.params.len() == 0 {
+            params_str = "void";
+        }
+
+        var inc_missing: bool = false;
+        match ext.include {
+            OptStr::Some(inc) => {
+                inc_missing = vec_contains_str(missing_includes, inc);
+            }
+            OptStr::None => {}
+        }
+        if inc_missing {
+            var ret_default: str = "0";
+            match ext.ret_ty {
+                Type::F32 => { ret_default = "0.0"; }
+                Type::F64 => { ret_default = "0.0"; }
+                Type::Void => { ret_default = ""; }
+                _ => {}
+            }
+            match ext.ret_ty {
+                Type::Void => {
+                    wln(self, ret_c + " " + ext.pledge_name + "(" + params_str + ") { }");
+                }
+                _ => {
+                    wln(self, ret_c + " " + ext.pledge_name + "(" + params_str + ") { return " + ret_default + "; }");
+                }
+            }
+        } else {
+            wln(self, ret_c + " " + ext.c_name + "(" + params_str + ");");
+            if !str_equal(ext.pledge_name, ext.c_name) {
+                wln(self, "#define " + ext.pledge_name + " " + ext.c_name);
+            }
+        }
+        ed = ed + 1;
+    }
+    wln(self, "");
+}
+
+// Trim any of the characters in `chars` from both ends of `s`.
+fn str_trim_chars(s: str, chars: str) -> str {
+    var start: i64 = 0;
+    var len0: i64 = str_len(s);
+    var end: i64 = len0;
+    while start < end {
+        var ch: i64 = String_byte_at(s, start);
+        if str_contains_char(chars, ch) {
+            start = start + 1;
+        } else {
+            break;
+        }
+    }
+    while end > start {
+        var ch: i64 = String_byte_at(s, end - 1);
+        if str_contains_char(chars, ch) {
+            end = end - 1;
+        } else {
+            break;
+        }
+    }
+    return str_slice(s, start, end);
+}
+
+fn str_contains_char(chars: str, ch: i64) -> bool {
+    var i: i64 = 0;
+    var len: i64 = str_len(chars);
+    while i < len {
+        if String_byte_at(chars, i) == ch {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Convert an AST type to a C type string
+pub fn box_type_unbox(b: Box<Type>) -> Type {
+    match b {
+        Type::I8 => { return Type::I8; }
+        Type::I16 => { return Type::I16; }
+        Type::I32 => { return Type::I32; }
+        Type::I64 => { return Type::I64; }
+        Type::I128 => { return Type::I128; }
+        Type::U8 => { return Type::U8; }
+        Type::U16 => { return Type::U16; }
+        Type::U32 => { return Type::U32; }
+        Type::U64 => { return Type::U64; }
+        Type::U128 => { return Type::U128; }
+        Type::F32 => { return Type::F32; }
+        Type::F64 => { return Type::F64; }
+        Type::Bool => { return Type::Bool; }
+        Type::Str => { return Type::Str; }
+        Type::Void => { return Type::Void; }
+        Type::Never => { return Type::Never; }
+        Type::Infer => { return Type::Infer; }
+        Type::Named(n) => { return Type::Named(n); }
+        Type::Array(e, s) => { return Type::Array(e, s); }
+        Type::ArrayConst(e, s) => { return Type::ArrayConst(e, s); }
+        Type::Ref(e, m) => { return Type::Ref(e, m); }
+        Type::RawPtr(e, m) => { return Type::RawPtr(e, m); }
+        Type::Generic(n, a) => { return Type::Generic(n, a); }
+        Type::Tuple(a) => { return Type::Tuple(a); }
+        Type::Func(a, r) => { return Type::Func(a, r); }
+        Type::Assoc(a, b, c, d) => { return Type::Assoc(a, b, c, d); }
+        Type::Dyn(n) => { return Type::Dyn(n); }
+        Type::ShapedTensor(e, d) => { return Type::ShapedTensor(e, d); }
+    }
+    return Type::Void;
+}
+
+fn c_type_from_ast(ty: Type) -> str {
+    match ty {
+        Type::I8 => { return "int8_t"; }
+        Type::I16 => { return "int16_t"; }
+        Type::I32 => { return "int32_t"; }
+        Type::I64 => { return "int64_t"; }
+        Type::I128 => { return "__int128"; }
+        Type::U8 => { return "uint8_t"; }
+        Type::U16 => { return "uint16_t"; }
+        Type::U32 => { return "uint32_t"; }
+        Type::U64 => { return "uint64_t"; }
+        Type::U128 => { return "unsigned __int128"; }
+        Type::F32 => { return "float"; }
+        Type::F64 => { return "double"; }
+        Type::Bool => { return "bool"; }
+        Type::Void => { return "void"; }
+        Type::Str => { return "const char*"; }
+        Type::Named(n) => {
+            if str_equal(n, "str") { return "const char*"; }
+            return n;
+        }
+        Type::Ref(inner, _) => { return c_type_from_ast(box_type_unbox(inner)) + "*"; }
+        _ => { return "void*"; }
+    }
+    return "void*";
+}
+
+fn emit_runtime_types(self: &mut CCodeGen) -> void {
+    wln(self, "// ─── Runtime types ───");
+    wln(self, "typedef struct { void** data; int64_t len; int64_t cap; } PVec;");
+    wln(self, "typedef struct { char** keys; int64_t* vals; int64_t len; int64_t cap; } PMap;");
+    wln(self, "");
+    wln(self, "// ─── Runtime function declarations ───");
+    wln(self, "PVec* p_vec_new(void);");
+    wln(self, "void p_vec_push(PVec* v, void* val);");
+    wln(self, "void* p_vec_get(PVec* v, int64_t idx);");
+    wln(self, "void p_vec_set(PVec* v, int64_t idx, void* val);");
+    wln(self, "int64_t p_vec_len(PVec* v);");
+    wln(self, "int64_t p_vec_pop(PVec* v);");
+    wln(self, "bool p_vec_is_empty(PVec* v);");
+    wln(self, "void p_vec_clear(PVec* v);");
+    wln(self, "int64_t p_vec_capacity(PVec* v);");
+    wln(self, "PMap* p_map_new(void);");
+    wln(self, "void p_map_insert(PMap* m, const char* key, int64_t val);");
+    wln(self, "int64_t p_map_get(PMap* m, const char* key);");
+    wln(self, "bool p_map_contains(PMap* m, const char* key);");
+    wln(self, "void p_map_remove(PMap* m, const char* key);");
+    wln(self, "int64_t p_map_len(PMap* m);");
+    wln(self, "bool p_map_is_empty(PMap* m);");
+    wln(self, "void p_map_clear(PMap* m);");
+    wln(self, "int64_t p_map_keys(PMap* m);");
+    wln(self, "int64_t p_map_values(PMap* m);");
+    wln(self, "int64_t __ecs_create_entity(void);");
+    wln(self, "int64_t __ecs_entity_count(void);");
+    wln(self, "int64_t __ecs_has(const char* comp_name, int64_t entity);");
+    wln(self, "void* __ecs_get(const char* comp_name, int64_t entity);");
+    wln(self, "int64_t __ecs_add(const char* comp_name, int64_t entity, void* value);");
+    wln(self, "int64_t __ecs_remove(const char* comp_name, int64_t entity);");
+    wln(self, "void p_cli(void);");
+    wln(self, "void p_sti(void);");
+    wln(self, "void p_hlt(void);");
+    wln(self, "int64_t p_cr0_read(void);");
+    wln(self, "int64_t p_cr3_read(void);");
+    wln(self, "int64_t p_cr4_read(void);");
+    wln(self, "void p_cr3_write(int64_t val);");
+    wln(self, "void p_invlpg(int64_t addr);");
+    wln(self, "void p_page_map(int64_t cr3, int64_t virt, int64_t phys, int64_t flags);");
+    wln(self, "void p_page_unmap(int64_t cr3, int64_t virt);");
+    wln(self, "int64_t p_phys_read64(int64_t addr);");
+    wln(self, "void p_phys_write64(int64_t addr, int64_t val);");
+    wln(self, "int64_t p_simd_add(int64_t a, int64_t b);");
+    wln(self, "int64_t p_simd_sub(int64_t a, int64_t b);");
+    wln(self, "int64_t p_simd_mul(int64_t a, int64_t b);");
+    wln(self, "int64_t p_simd_div(int64_t a, int64_t b);");
+    wln(self, "double p_simd_dot(int64_t a, int64_t b);");
+    wln(self, "double p_simd_sum(int64_t a);");
+    wln(self, "int64_t p_simd_scale(int64_t a, double s);");
+    wln(self, "int64_t p_simd_from_vec(int64_t v);");
+    wln(self, "char* p_simd_to_str(int64_t a);");
+    wln(self, "void* p_tensor_new(int64_t ndim, int64_t* shape);");
+    wln(self, "void* p_tensor_from(void* data, int64_t ndim, int64_t* shape);");
+    wln(self, "void* p_tensor_zeros(void* shape_vec);");
+    wln(self, "void* p_tensor_ones(void* shape_vec);");
+    wln(self, "void* p_tensor_filled(void* shape_vec, double val);");
+    wln(self, "void* p_tensor_from_vec(void* v, void* shape_vec);");
+    wln(self, "void* p_tensor_clone(void* t);");
+    wln(self, "double p_tensor_at(void* t, int64_t idx);");
+    wln(self, "double p_tensor_get(void* t, void* idx_vec);");
+    wln(self, "void p_tensor_set(void* t, void* idx_vec, double val);");
+    wln(self, "void* p_tensor_add(void* a, void* b);");
+    wln(self, "void* p_tensor_sub(void* a, void* b);");
+    wln(self, "void* p_tensor_mul(void* a, void* b);");
+    wln(self, "void* p_tensor_matmul(void* a, void* b);");
+    wln(self, "void* p_tensor_transpose(void* t);");
+    wln(self, "void* p_tensor_relu(void* t);");
+    wln(self, "void* p_tensor_sigmoid(void* t);");
+    wln(self, "void* p_tensor_softmax(void* t);");
+    wln(self, "void* p_tensor_scale(void* t, double s);");
+    wln(self, "double p_tensor_sum(void* t);");
+    wln(self, "double p_tensor_mean(void* t);");
+    wln(self, "double p_tensor_min(void* t);");
+    wln(self, "double p_tensor_max(void* t);");
+    wln(self, "double p_tensor_dot(void* a, void* b);");
+    wln(self, "void* p_tensor_reshape(void* t, void* shape_vec);");
+    wln(self, "int64_t p_tensor_len(void* t);");
+    wln(self, "int64_t p_tensor_ndim(void* t);");
+    wln(self, "void* p_tensor_shape(void* t);");
+    wln(self, "int64_t p_tensor_size(void* t);");
+    wln(self, "char* p_tensor_to_str(void* t);");
+    wln(self, "char* p_tensor_to_json(void* t);");
+    wln(self, "void* p_grad_get(void* t);");
+    wln(self, "void p_grad_zero(void);");
+    wln(self, "void p_autograd_begin(void);");
+    wln(self, "void p_autograd_end(void);");
+    wln(self, "void p_autograd_backward(void* loss);");
+    wln(self, "void p_checkpoint_begin(void);");
+    wln(self, "void p_checkpoint_end(void);");
+    wln(self, "void* p_dp_noise(void* t, double sigma);");
+    wln(self, "void* p_gaussian_noise(void* shape_vec, double sigma);");
+    wln(self, "void* p_dropout(void* t, double drop_prob);");
+    wln(self, "void p_dp_budget_reset(double epsilon);");
+    wln(self, "void p_dp_budget_check(double epsilon, double limit);");
+    wln(self, "int64_t p_tp_rank(void);");
+    wln(self, "int64_t p_tp_world_size(void);");
+    wln(self, "void* p_all_reduce(void* t);");
+    wln(self, "void* p_broadcast(void* t);");
+    wln(self, "void* p_all_gather(void* t);");
+    wln(self, "void* p_scatter(void* t);");
+    wln(self, "void p_send_tensor(void* t);");
+    wln(self, "void* p_recv_tensor(void* shape_vec);");
+    wln(self, "int64_t p_kv_cache_new(int64_t num_layers, int64_t max_seq_len, int64_t window_size, int64_t head_dim);");
+    wln(self, "void p_kv_cache_append(int64_t cache_id, int64_t layer, void* k, void* v);");
+    wln(self, "void* p_kv_cache_get(int64_t cache_id, int64_t layer);");
+    wln(self, "int64_t p_kv_cache_len(int64_t cache_id, int64_t layer);");
+    wln(self, "void p_kv_cache_clear(int64_t cache_id);");
+    wln(self, "void p_kv_cache_evict(int64_t cache_id, int64_t num_tokens);");
+    wln(self, "void* p_quantize_q8(void* t, double scale, int64_t zero_point);");
+    wln(self, "void* p_dequantize_q8(void* t, double scale, int64_t zero_point);");
+    wln(self, "void* p_qmatmul(void* a, void* b);");
+    wln(self, "char* p_find_quant_params(void* t);");
+    wln(self, "char* p_json_parse(const char* s);");
+    wln(self, "void* p_json_new_object(void);");
+    wln(self, "void* p_json_new_array(void);");
+    wln(self, "void p_json_set(void* j, const char* key, const char* val);");
+    wln(self, "void p_json_set_int(void* j, const char* key, int64_t val);");
+    wln(self, "void p_json_set_float(void* j, const char* key, double val);");
+    wln(self, "void p_json_set_bool(void* j, const char* key, int64_t val);");
+    wln(self, "void p_json_append(void* j, const char* val);");
+    wln(self, "void p_json_append_int(void* j, int64_t val);");
+    wln(self, "void p_json_append_float(void* j, double val);");
+    wln(self, "char* p_json_dump(void* j);");
+    wln(self, "char* p_json_dump_pretty(void* j);");
+    wln(self, "char* p_json_pretty(void* j);");
+    wln(self, "char* p_json_string(void* j);");
+    wln(self, "const char* p_json_type(void* j);");
+    wln(self, "char* p_json_get(void* j, const char* key);");
+    wln(self, "int64_t p_json_get_int(void* j, const char* key);");
+    wln(self, "double p_json_get_float(void* j, const char* key);");
+    wln(self, "int64_t p_json_get_bool(void* j, const char* key);");
+    wln(self, "void* p_json_at(void* j, int64_t idx);");
+    wln(self, "int64_t p_json_len(void* j);");
+    wln(self, "void* p_json_object_get(void* j, const char* key);");
+    wln(self, "int64_t p_http_listen(int64_t port);");
+    wln(self, "char* p_http_recv_request(int64_t fd);");
+    wln(self, "void p_http_send_response(int64_t fd, int64_t status, const char* body);");
+    wln(self, "char* p_http_build_response(int64_t status, const char* content_type, const char* body);");
+    wln(self, "char* p_http_parse_request(const char* request);");
+    wln(self, "void* p_db_connect(const char* conn_str);");
+    wln(self, "void p_db_exec(void* db, const char* query);");
+    wln(self, "void* p_db_query(void* db, const char* query);");
+    wln(self, "char* p_db_get(void* db, const char* key);");
+    wln(self, "void p_db_set(void* db, const char* key, const char* val);");
+    wln(self, "void* p_db_mem_open(void);");
+    wln(self, "int64_t p_db_mem_exec(void* db, const char* query);");
+    wln(self, "char* p_db_mem_query(void* db, const char* query);");
+    wln(self, "void p_db_mem_close(void* db);");
+    wln(self, "int64_t p_string_len(const char* s);");
+    wln(self, "bool p_string_is_empty(const char* s);");
+    wln(self, "char* p_string_push_str(const char* s, const char* other);");
+    wln(self, "char* p_string_from(const char* s);");
+    wln(self, "char* p_string_slice(const char* s, int64_t start, int64_t end);");
+    wln(self, "bool p_string_contains(const char* s, const char* sub);");
+    wln(self, "bool p_string_starts_with(const char* s, const char* prefix);");
+    wln(self, "bool p_string_ends_with(const char* s, const char* suffix);");
+    wln(self, "int64_t p_string_find(const char* s, const char* sub);");
+    wln(self, "char* p_string_trim(const char* s);");
+    wln(self, "char* p_string_to_uppercase(const char* s);");
+    wln(self, "char* p_string_to_lowercase(const char* s);");
+    wln(self, "char* p_string_repeat(const char* s, int64_t n);");
+    wln(self, "char* p_string_replace(const char* s, const char* from, const char* to);");
+    wln(self, "int64_t p_string_split(const char* s, const char* delim);");
+    wln(self, "int64_t p_string_parse_int(const char* s);");
+    wln(self, "char* p_string_char_at(const char* s, int64_t idx);");
+    wln(self, "char* p_string_substring(const char* s, int64_t start, int64_t end);");
+    wln(self, "char* p_to_str(int64_t val);");
+    wln(self, "char* p_char_to_str(int64_t val);");
+    wln(self, "char* p_to_str_vec(PVec* v);");
+    wln(self, "char* p_to_str_str(const char* s);");
+    wln(self, "char* p_to_str_bool(bool val);");
+    wln(self, "char* p_to_str_float(double val);");
+    wln(self, "char* p_to_str_map(PMap* m);");
+    wln(self, "char* p_float_to_str(double val);");
+    wln(self, "double p_str_to_float(const char* s);");
+    wln(self, "char* p_bool_to_str(bool val);");
+    wln(self, "char* p_vec_to_str(PVec* v);");
+    wln(self, "char* p_str_concat(const char* a, const char* b);");
+    wln(self, "void p_print(int64_t val);");
+    wln(self, "void p_print_str(const char* s);");
+    wln(self, "void p_print_int(int64_t val);");
+    wln(self, "void p_print_bool(bool val);");
+    wln(self, "void p_print_float(double val);");
+    wln(self, "void p_print_newline(void);");
+    wln(self, "void p_panic(const char* msg);");
+    wln(self, "// Call stack for panic traces");
+    wln(self, "static const char* p_call_stack[256];");
+    wln(self, "static int p_call_stack_depth = 0;");
+    wln(self, "void p_call_stack_push(const char* name) { if (p_call_stack_depth < 256) p_call_stack[p_call_stack_depth++] = name; }");
+    wln(self, "void p_call_stack_pop(void) { if (p_call_stack_depth > 0) p_call_stack_depth--; }");
+    wln(self, "void* p_malloc(int64_t size);");
+    wln(self, "void p_free(void* ptr);");
+    wln(self, "char* p_file_read(const char* path);");
+    wln(self, "int64_t p_file_write(const char* path, const char* content);");
+    wln(self, "bool p_file_exists(const char* path);");
+    wln(self, "int64_t p_file_append(const char* path, const char* content);");
+    wln(self, "int64_t p_file_delete(const char* path);");
+    wln(self, "int64_t p_file_size(const char* path);");
+    wln(self, "char* p_getenv(const char* name);");
+    wln(self, "static int __p_argc = 0;");
+    wln(self, "static char** __p_argv = NULL;");
+    wln(self, "int64_t p_argc(void);");
+    wln(self, "char* p_argv(int64_t index);");
+    wln(self, "int64_t p_system(const char* cmd);");
+    wln(self, "void p_exit(int64_t code);");
+    wln(self, "int64_t p_clock_now(void);");
+    wln(self, "int64_t p_clock_now_us(void);");
+    wln(self, "int64_t p_clock_now_ms(void);");
+    wln(self, "bool p_regex_match(const char* s, const char* pattern);");
+    wln(self, "int64_t p_future_ready(int64_t value);");
+    wln(self, "int64_t p_future_poll(int64_t future);");
+    wln(self, "int64_t p_thread_spawn(const char* func_name, int64_t num_args, ...);");
+    wln(self, "int64_t p_executor_new(void);");
+    wln(self, "int64_t p_executor_spawn(int64_t exec, const char* func_name, int64_t num_args, ...);");
+    wln(self, "int64_t p_executor_block_on(int64_t exec, int64_t future);");
+    wln(self, "int64_t p_task_poll(int64_t future);");
+    wln(self, "bool p_task_is_ready(int64_t future);");
+    wln(self, "int64_t p_executor_run_all(int64_t exec);");
+    wln(self, "int64_t p_executor_poll_all(int64_t exec);");
+    wln(self, "int64_t p_task_poll_nonblocking(int64_t future);");
+    wln(self, "int64_t p_net_connect(const char* host, int64_t port);");
+    wln(self, "int64_t p_net_read(int64_t sock, char* buf, int64_t len);");
+    wln(self, "int64_t p_net_write(int64_t sock, const char* buf, int64_t len);");
+    wln(self, "void p_net_close(int64_t sock);");
+    wln(self, "int64_t p_fs_read_async(const char* path, char* buf, int64_t len);");
+    wln(self, "int64_t p_shared_alloc(int64_t size);");
+    wln(self, "int64_t p_atomic_load(int64_t addr);");
+    wln(self, "void p_atomic_store(int64_t addr, int64_t val);");
+    wln(self, "bool p_atomic_cas(int64_t addr, int64_t expected, int64_t new_val);");
+    wln(self, "int64_t p_atomic_add(int64_t addr, int64_t val);");
+    wln(self, "int64_t p_atomic_sub(int64_t addr, int64_t val);");
+    wln(self, "int64_t p_rc_incr(int64_t rc_addr, int64_t val);");
+    wln(self, "void p_rc_decr(int64_t rc_addr, int64_t val);");
+    wln(self, "int64_t p_mutex_init(void);");
+    wln(self, "void p_mutex_lock(int64_t m);");
+    wln(self, "void p_mutex_unlock(int64_t m);");
+    wln(self, "int64_t p_tls_create(void);");
+    wln(self, "int64_t p_tls_get(int64_t key);");
+    wln(self, "void p_tls_set(int64_t key, int64_t value);");
+    wln(self, "int64_t p_chan_create(int64_t capacity);");
+    wln(self, "bool p_chan_send(int64_t ch, int64_t val);");
+    wln(self, "int64_t p_chan_recv(int64_t ch);");
+    wln(self, "int64_t p_chan_try_recv(int64_t ch);");
+    wln(self, "void p_chan_close(int64_t ch);");
+    wln(self, "bool p_chan_is_closed(int64_t ch);");
+    wln(self, "void p_thread_register(const char* name, int64_t (*fn)());");
+    wln(self, "int64_t p_dl_open(const char* path);");
+    wln(self, "int64_t p_dl_sym(int64_t handle, const char* symbol);");
+    wln(self, "void p_dl_close(int64_t handle);");
+    wln(self, "int64_t p_dl_call(int64_t func_ptr, int64_t arg);");
+    wln(self, "void* p_allocator_create(void* arg);");
+    wln(self, "int64_t p_allocator_alloc(void* alloc, int64_t size);");
+    wln(self, "void p_allocator_free(void* alloc, int64_t ptr);");
+    wln(self, "int64_t p_allocator_stats(void* alloc);");
+    wln(self, "int64_t p_socket_listen(int64_t port);");
+    wln(self, "int64_t p_socket_accept(int64_t fd);");
+    wln(self, "int64_t p_socket_read(int64_t fd, char* buf, int64_t max_len);");
+    wln(self, "int64_t p_socket_write(int64_t fd, const char* buf, int64_t len);");
+    wln(self, "int64_t p_socket_write_str(int64_t fd, const char* buf);");
+    wln(self, "void p_socket_close(int64_t fd);");
+    wln(self, "char* p_socket_recv_str(int64_t fd);");
+    wln(self, "int64_t print(int64_t val);");
+    wln(self, "int64_t print_str(const char* s);");
+    wln(self, "void p_vec_clear(PVec* v);");
+    wln(self, "PVec* p_vec_clone(PVec* v);");
+    wln(self, "bool p_vec_contains(PVec* v, void* val);");
+    wln(self, "void p_vec_extend(PVec* v, PVec* other);");
+    wln(self, "void* p_vec_first(PVec* v);");
+    wln(self, "void* p_vec_last(PVec* v);");
+    wln(self, "void p_vec_insert(PVec* v, int64_t idx, void* val);");
+    wln(self, "void* p_vec_remove(PVec* v, int64_t idx);");
+    wln(self, "void p_vec_reverse(PVec* v);");
+    wln(self, "void p_vec_sort(PVec* v);");
+    wln(self, "void p_vec_truncate(PVec* v, int64_t len);");
+    wln(self, "void p_vec_set(PVec* v, int64_t idx, void* val);");
+    wln(self, "");
+}
+
+fn emit_string_consts(self: &mut CCodeGen, module: IrModule) -> void {
+    wln(self, "// ─── String constants ───");
+    var idx: i64 = 0;
+    var f: i64 = 0;
+    while f < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(f);
+        var func: IrFunction = entry.func;
+        var b: i64 = 0;
+        while b < func.blocks.len() {
+            var block: BasicBlock = func.blocks.get(b);
+            var i: i64 = 0;
+            while i < block.instructions.len() {
+                var inst_id: i64 = block.instructions.get(i);
+                var inst: OptInst = find_inst(func.insts, inst_id);
+                match inst {
+                    OptInst::Some(it) => {
+                        match it {
+                            Inst::ConstStr(value) => {
+                                if !string_consts_contains(self, value) {
+                                    var name: str = "_str" + int_to_str(idx);
+                                    idx = idx + 1;
+                                    var escaped: str = escape_c_string(value);
+                                    wln(self, "static const char " + name + "[] = \"" + escaped + "\";");
+                                    self.string_consts.push(StringConstEntry_new(value, name));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    OptInst::None => {}
+                }
+                i = i + 1;
+            }
+            b = b + 1;
+        }
+        f = f + 1;
+    }
+    wln(self, "");
+}
+
+fn string_consts_contains(self: &CCodeGen, value: str) -> bool {
+    var i: i64 = 0;
+    while i < self.string_consts.len() {
+        if str_equal(self.string_consts.get(i).key, value) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn find_inst(insts: Vec<ValueIdInst>, id: i64) -> OptInst {
+    var i: i64 = 0;
+    while i < insts.len() {
+        var vi: ValueIdInst = insts.get(i);
+        if vi.id == id {
+            return OptInst::Some(vi.inst);
+        }
+        i = i + 1;
+    }
+    return OptInst::None;
+}
+
+fn emit_struct_defs(self: &mut CCodeGen, module: IrModule) -> void {
+    wln(self, "// ─── Struct definitions ───");
+    var s: i64 = 0;
+    while s < module.struct_layouts.len() {
+        var entry: StructLayoutEntry = module.struct_layouts.get(s);
+        var name: str = entry.name;
+        var layout: StructLayout = entry.layout;
+        wln(self, "struct " + name + "_s {");
+        var i: i64 = 0;
+        while i < layout.fields.len() {
+            var field: StringIrTypeOffset = layout.fields.get(i);
+            wln(self, "    " + c_type(field.ty) + " field_" + int_to_str(i) + ";");
+            i = i + 1;
+        }
+        wln(self, "};");
+        wln(self, "");
+        s = s + 1;
+    }
+}
+
+fn emit_prototypes(self: &mut CCodeGen, module: IrModule) -> void {
+    wln(self, "// ─── Function prototypes ───");
+    wln(self, "void p_thread_register(const char* name, int64_t (*fn)());");
+    var f: i64 = 0;
+    while f < module.functions.len() {
+        var entry: IrFunctionEntry = module.functions.get(f);
+        var proto_name: str = sanitize_c_name(self, entry.name);
+        var ret_ty: str;
+        if str_equal(entry.name, "main") {
+            ret_ty = "int64_t";
+        } else {
+            ret_ty = c_ret_type(entry.func.ret_ty);
+        }
+        var params: str = "";
+        var p: i64 = 0;
+        while p < entry.func.params.len() {
+            var vp: ValueIdType = entry.func.params.get(p);
+            if p > 0 { params = params + ", "; }
+            params = params + c_param_decl(vp.ty, "v" + int_to_str(vp.id));
+            p = p + 1;
+        }
+        wln(self, ret_ty + " " + proto_name + "(" + params + ");");
+        f = f + 1;
+    }
+    wln(self, "");
+}
+
+fn emit_main_wrapper(self: &mut CCodeGen, module: IrModule) -> void {
+    if has_main(module) {
+        wln(self, "// ─── C entry point ───");
+        wln(self, "int main(int argc, char** argv) {");
+        wln(self, "    __p_argc = argc; __p_argv = argv;");
+        wln(self, "    // Register functions for p_thread_spawn lookup");
+        var f: i64 = 0;
+        while f < module.functions.len() {
+            var entry: IrFunctionEntry = module.functions.get(f);
+            if !str_equal(entry.name, "main") {
+                var c_name: str = sanitize_c_name(self, entry.name);
+                wln(self, "    p_thread_register(\"" + entry.name + "\", (int64_t(*)())" + c_name + ");");
+            }
+            f = f + 1;
+        }
+        wln(self, "    int64_t result = main_entry(NULL);");
+        wln(self, "    return (int)result;");
+        wln(self, "}");
+        wln(self, "");
+    }
+}
+
+fn has_main(module: IrModule) -> bool {
+    var f: i64 = 0;
+    while f < module.functions.len() {
+        if str_equal(module.functions.get(f).name, "main") {
+            return true;
+        }
+        f = f + 1;
+    }
+    return false;
+}

@@ -356,15 +356,13 @@ impl Lowerer {
                 .push(ti.type_name.clone());
         }
 
-        // Compute enum layouts first (structs may contain enum fields and need
-        // to know enum sizes for correct field offsets).
-        // Enum variants may contain other enum types, so we iterate to a
-        // fixpoint: keep recomputing until no layout size changes. This handles
-        // dependency cycles and ordering issues (e.g. ParseResultExpr contains
-        // Expr, but Expr may be processed after ParseResultExpr in iteration order).
+        // Compute enum and struct layouts iteratively to a fixpoint.
+        // Enums may contain structs (e.g. ParseResultProgram contains Program),
+        // and structs may contain enums (e.g. Func contains OptType).
+        // We interleave both passes until no size changes.
         let mut changed = true;
         let mut iterations = 0;
-        while changed && iterations < 10 {
+        while changed && iterations < 20 {
             changed = false;
             for e in &program.enums {
                 let old_size = self.module.get_struct(&e.name).map(|l| l.size).unwrap_or(0);
@@ -374,15 +372,6 @@ impl Lowerer {
                     changed = true;
                 }
             }
-            iterations += 1;
-        }
-
-        // Compute struct layouts (after enums so enum field sizes are known)
-        // Also iterate to fixpoint for structs that contain other structs.
-        changed = true;
-        iterations = 0;
-        while changed && iterations < 10 {
-            changed = false;
             for s in &program.structs {
                 let old_size = self.module.get_struct(&s.name).map(|l| l.size).unwrap_or(0);
                 self.compute_struct_layout(s);
@@ -2196,12 +2185,28 @@ impl Lowerer {
             else_: else_block_id,
         });
 
+        // Save variable bindings so they don't leak across branches.
+        // Variables declared inside then/else blocks should not be visible
+        // outside those blocks (or in the other branch).
+        let saved_allocas = self.allocas.clone();
+        let saved_alloca_types = self.alloca_types.clone();
+        let saved_var_ast_types = self.var_ast_types.clone();
+        let saved_locals = self.current_func.as_ref().map(|f| f.locals.clone());
+
         // Lower then block
         self.set_current_block(then_block_id);
         self.lower_stmts(then_block);
         // If then block doesn't end with terminator, jump to merge
         if !self.current_block_has_terminator() {
             self.emit_terminator(Inst::Jump { target: merge_block_id });
+        }
+
+        // Restore variable bindings for else block
+        self.allocas = saved_allocas.clone();
+        self.alloca_types = saved_alloca_types.clone();
+        self.var_ast_types = saved_var_ast_types.clone();
+        if let Some(ref mut f) = self.current_func {
+            f.locals = saved_locals.clone().unwrap_or_default();
         }
 
         // Lower else block
@@ -2211,6 +2216,14 @@ impl Lowerer {
         }
         if !self.current_block_has_terminator() {
             self.emit_terminator(Inst::Jump { target: merge_block_id });
+        }
+
+        // Restore variable bindings for merge block
+        self.allocas = saved_allocas;
+        self.alloca_types = saved_alloca_types;
+        self.var_ast_types = saved_var_ast_types;
+        if let Some(ref mut f) = self.current_func {
+            f.locals = saved_locals.unwrap_or_default();
         }
 
         // Continue in merge block
@@ -2728,7 +2741,9 @@ impl Lowerer {
                     });
                 }
                 Pattern::Ident(name) => {
-                    // Bind the match value to this identifier
+                    // Bind the match value to this identifier.
+                    // Remove any stale alloca binding so the local binding is used.
+                    self.allocas.remove(name);
                     if let Some(ref mut f) = self.current_func {
                         f.bind_local(name, match_val);
                     }
@@ -2800,6 +2815,12 @@ impl Lowerer {
                     });
                     // Bind data fields in the match block
                     self.set_current_block(match_block);
+                    // Save variable bindings so arm-local bindings don't leak
+                    // into other arms or code after the match.
+                    let saved_allocas = self.allocas.clone();
+                    let saved_alloca_types = self.alloca_types.clone();
+                    let saved_var_ast_types = self.var_ast_types.clone();
+                    let saved_locals = self.current_func.as_ref().map(|f| f.locals.clone());
                     let binding_tys = self.pattern_binding_ir_types(enum_name, variant, bindings);
                     for (i, (binding, _ty_name)) in bindings.iter().enumerate() {
                         let field_ty = binding_tys.get(i).cloned().unwrap_or(IrType::I64);
@@ -2809,6 +2830,9 @@ impl Lowerer {
                             field_ty: field_ty.clone(),
                         });
                         let field_val = self.emit_inst(Inst::Load { ptr: field_ptr, ty: field_ty });
+                        // Remove any stale alloca binding for this name so that
+                        // the local binding (via bind_local) is used instead.
+                        self.allocas.remove(binding);
                         if let Some(ref mut f) = self.current_func {
                             f.bind_local(binding, field_val);
                         }
@@ -2829,6 +2853,13 @@ impl Lowerer {
                     if !self.current_block_has_terminator() {
                         self.emit_terminator(Inst::Jump { target: merge_block });
                     }
+                    // Restore variable bindings
+                    self.allocas = saved_allocas;
+                    self.alloca_types = saved_alloca_types;
+                    self.var_ast_types = saved_var_ast_types;
+                    if let Some(ref mut f) = self.current_func {
+                        f.locals = saved_locals.unwrap_or_default();
+                    }
                     self.set_current_block(next_arm_block);
                     continue;
                 }
@@ -2836,6 +2867,11 @@ impl Lowerer {
 
             // Lower match arm body
             self.set_current_block(match_block);
+            // Save variable bindings so arm-local bindings don't leak
+            let saved_allocas = self.allocas.clone();
+            let saved_alloca_types = self.alloca_types.clone();
+            let saved_var_ast_types = self.var_ast_types.clone();
+            let saved_locals = self.current_func.as_ref().map(|f| f.locals.clone());
 
             // If there's a guard, evaluate it and branch
             if let Some(guard_expr) = &arm.guard {
@@ -2852,6 +2888,13 @@ impl Lowerer {
             self.lower_stmts(&arm.body);
             if !self.current_block_has_terminator() {
                 self.emit_terminator(Inst::Jump { target: merge_block });
+            }
+            // Restore variable bindings
+            self.allocas = saved_allocas;
+            self.alloca_types = saved_alloca_types;
+            self.var_ast_types = saved_var_ast_types;
+            if let Some(ref mut f) = self.current_func {
+                f.locals = saved_locals.unwrap_or_default();
             }
 
             // Continue to next arm
@@ -2890,6 +2933,7 @@ impl Lowerer {
                     self.emit_terminator(Inst::Branch { cond: cmp, then: match_block, else_: next_arm_block });
                 }
                 Pattern::Ident(name) => {
+                    self.allocas.remove(name);
                     if let Some(ref mut f) = self.current_func {
                         f.bind_local(name, match_val);
                     }
@@ -2931,11 +2975,17 @@ impl Lowerer {
                     let cmp = self.emit_inst(Inst::BinOp { op: BinOp::Eq, left: tag, right: expected, ty: IrType::Bool });
                     self.emit_terminator(Inst::Branch { cond: cmp, then: match_block, else_: next_arm_block });
                     self.set_current_block(match_block);
+                    // Save variable bindings so arm-local bindings don't leak
+                    let saved_allocas = self.allocas.clone();
+                    let saved_alloca_types = self.alloca_types.clone();
+                    let saved_var_ast_types = self.var_ast_types.clone();
+                    let saved_locals = self.current_func.as_ref().map(|f| f.locals.clone());
                     let binding_tys = self.pattern_binding_ir_types(enum_name, variant, bindings);
                     for (i, (binding, _ty_name)) in bindings.iter().enumerate() {
                         let field_ty = binding_tys.get(i).cloned().unwrap_or(IrType::I64);
                         let field_ptr = self.emit_inst(Inst::GetFieldPtr { struct_ptr: match_val, field_index: (i + 1) as u32, field_ty: field_ty.clone() });
                         let field_val = self.emit_inst(Inst::Load { ptr: field_ptr, ty: field_ty });
+                        self.allocas.remove(binding);
                         if let Some(ref mut f) = self.current_func {
                             f.bind_local(binding, field_val);
                         }
@@ -2967,6 +3017,13 @@ impl Lowerer {
                     if !self.current_block_has_terminator() {
                         self.emit_terminator(Inst::Jump { target: merge_block });
                     }
+                    // Restore variable bindings
+                    self.allocas = saved_allocas;
+                    self.alloca_types = saved_alloca_types;
+                    self.var_ast_types = saved_var_ast_types;
+                    if let Some(ref mut f) = self.current_func {
+                        f.locals = saved_locals.unwrap_or_default();
+                    }
                     self.set_current_block(next_arm_block);
                     continue;
                 }
@@ -2974,6 +3031,11 @@ impl Lowerer {
 
             // Lower match arm body and store result
             self.set_current_block(match_block);
+            // Save variable bindings so arm-local bindings don't leak
+            let saved_allocas = self.allocas.clone();
+            let saved_alloca_types = self.alloca_types.clone();
+            let saved_var_ast_types = self.var_ast_types.clone();
+            let saved_locals = self.current_func.as_ref().map(|f| f.locals.clone());
 
             // If there's a guard, evaluate it and branch
             if let Some(guard_expr) = &arm.guard {
@@ -3001,6 +3063,13 @@ impl Lowerer {
             }
             if !self.current_block_has_terminator() {
                 self.emit_terminator(Inst::Jump { target: merge_block });
+            }
+            // Restore variable bindings
+            self.allocas = saved_allocas;
+            self.alloca_types = saved_alloca_types;
+            self.var_ast_types = saved_var_ast_types;
+            if let Some(ref mut f) = self.current_func {
+                f.locals = saved_locals.unwrap_or_default();
             }
 
             self.set_current_block(next_arm_block);
@@ -4230,6 +4299,11 @@ impl Lowerer {
 
                 // Lower then block — capture last expression value, store to slot
                 self.set_current_block(then_bb);
+                // Save variable bindings so they don't leak across branches
+                let saved_allocas = self.allocas.clone();
+                let saved_alloca_types = self.alloca_types.clone();
+                let saved_var_ast_types = self.var_ast_types.clone();
+                let saved_locals = self.current_func.as_ref().map(|f| f.locals.clone());
                 let mut then_val: Option<ValueId> = None;
                 for stmt in then_block {
                     if let Stmt::Expr(e, _) = stmt {
@@ -4244,6 +4318,13 @@ impl Lowerer {
                 }
                 if !self.current_block_has_terminator() {
                     self.emit_terminator(Inst::Jump { target: merge_bb });
+                }
+                // Restore variable bindings
+                self.allocas = saved_allocas.clone();
+                self.alloca_types = saved_alloca_types.clone();
+                self.var_ast_types = saved_var_ast_types.clone();
+                if let Some(ref mut f) = self.current_func {
+                    f.locals = saved_locals.clone().unwrap_or_default();
                 }
 
                 // Lower else block — capture last expression value, store to slot
@@ -4264,6 +4345,13 @@ impl Lowerer {
                 }
                 if !self.current_block_has_terminator() {
                     self.emit_terminator(Inst::Jump { target: merge_bb });
+                }
+                // Restore variable bindings
+                self.allocas = saved_allocas;
+                self.alloca_types = saved_alloca_types;
+                self.var_ast_types = saved_var_ast_types;
+                if let Some(ref mut f) = self.current_func {
+                    f.locals = saved_locals.unwrap_or_default();
                 }
 
                 // Merge block — load the result from the slot
@@ -4497,6 +4585,20 @@ impl Lowerer {
                 // Otherwise: alloca, store, return pointer
                 let val = self.lower_expr(expr);
                 let val_ty = self.get_value_type(val);
+                // If the expression already evaluates to a pointer to a struct
+                // (e.g. from a FieldAccess on a &mut parameter), the value IS
+                // the pointer to the struct storage. &mut of this should return
+                // it directly — wrapping it in another alloca creates a double
+                // indirection (**struct instead of *struct) that breaks field
+                // access through the mutable reference.
+                if matches!(&val_ty, IrType::Ptr(inner) if matches!(inner.as_ref(), IrType::Struct(_))) {
+                    if let Some(f) = self.current_func.as_mut() {
+                        if let Some(meta) = f.values.get_mut(&val) {
+                            meta.borrow_kind = borrow;
+                        }
+                    }
+                    return val;
+                }
                 let ptr = self.emit_inst(Inst::Alloca {
                     ty: val_ty.clone(),
                     region: self.current_region(),
@@ -6008,6 +6110,25 @@ impl Lowerer {
                     }
                 }
                 let recv_ty = self.infer_expr_type(receiver);
+                // Builtin Vec methods — infer from generic element type
+                if let IrType::Generic(name, args) = &recv_ty {
+                    if name == "Vec" {
+                        let elem_ty = args.first().cloned().unwrap_or(IrType::I64);
+                        return match method.as_str() {
+                            "push" | "set" | "clear" | "insert" | "reverse" | "extend" | "truncate" | "sort" | "for_each" => IrType::Void,
+                            "pop" | "get" | "remove" | "first" | "last" => elem_ty,
+                            "len" | "find" | "position" => IrType::I64,
+                            "is_empty" | "contains" | "any" | "all" => IrType::Bool,
+                            "capacity" => IrType::I64,
+                            "clone" | "map" | "filter" => IrType::Generic("Vec".to_string(), vec![elem_ty]),
+                            "fold" => IrType::I64,
+                            _ => {
+                                let mangled = format!("Vec_{}", method);
+                                return self.lookup_func_ret_ty(&mangled);
+                            }
+                        };
+                    }
+                }
                 let struct_name = match &recv_ty {
                     IrType::Ptr(inner) => match inner.as_ref() {
                         IrType::Struct(name) => Some(name.clone()),

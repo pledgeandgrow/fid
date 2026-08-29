@@ -1,0 +1,817 @@
+// SH-9: Test for compiler::pir module (rewritten from pir.rs)
+// Tests L1/L2/L3 types, lowering IR→L1→L2→L3, printers, and helpers.
+use core;
+use vec;
+use compiler::ir;
+use compiler::pir;
+
+fn assert_eq(actual: str, expected: str, label: str) -> void {
+    if actual != expected {
+        print("FAIL: ");
+        print(label);
+        print(" — expected '");
+        print(expected);
+        print("', got '");
+        print(actual);
+        print("'\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_eq_i64(actual: i64, expected: i64, label: str) -> void {
+    if actual != expected {
+        print("FAIL: ");
+        print(label);
+        print(" — expected ");
+        print(int_to_str(expected));
+        print(", got ");
+        print(int_to_str(actual));
+        print("\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_true(b: bool, label: str) -> void {
+    if !b {
+        print("FAIL: ");
+        print(label);
+        print(" — expected true\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_false(b: bool, label: str) -> void {
+    if b {
+        print("FAIL: ");
+        print(label);
+        print(" — expected false\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+// ── Test 1: CapSet ──
+fn test_capset() -> void {
+    print("Test 1: CapSet...\n");
+    var cs: CapSet = CapSet_new();
+    assert_true(CapSet_is_empty(&cs), "empty CapSet");
+    assert_eq(CapSet_to_str(&cs), "no_cap", "empty CapSet to_str");
+
+    CapSet_add(&mut cs, "io");
+    assert_false(CapSet_is_empty(&cs), "non-empty CapSet");
+    assert_true(CapSet_contains(&cs, "io"), "contains io");
+    assert_false(CapSet_contains(&cs, "net"), "does not contain net");
+
+    CapSet_add(&mut cs, "io");  // duplicate — should not add
+    assert_eq_i64(cs.caps.len(), 1, "no duplicate caps");
+
+    CapSet_add(&mut cs, "net");
+    assert_eq(CapSet_to_str(&cs), "cap[io,net]", "two caps to_str");
+}
+
+// ── Test 2: RegionRef helpers ──
+fn test_region_ref() -> void {
+    print("Test 2: RegionRef...\n");
+    var r1: RegionRef = RegionRef::Builtin(Region::Stack);
+    var r2: RegionRef = RegionRef::Builtin(Region::Stack);
+    var r3: RegionRef = RegionRef::Builtin(Region::Heap);
+    var r4: RegionRef = RegionRef::Handle(42);
+    var r5: RegionRef = RegionRef::Unknown;
+
+    assert_true(region_ref_eq(r1, r2), "Stack == Stack");
+    assert_false(region_ref_eq(r1, r3), "Stack != Heap");
+    assert_true(region_ref_eq(r4, RegionRef::Handle(42)), "Handle(42) == Handle(42)");
+    assert_false(region_ref_eq(r4, RegionRef::Handle(1)), "Handle(42) != Handle(1)");
+    assert_true(region_ref_eq(r5, RegionRef::Unknown), "Unknown == Unknown");
+    assert_false(region_ref_eq(r5, r1), "Unknown != Stack");
+
+    assert_eq(region_ref_to_str(RegionRef::Builtin(Region::Stack)), "stack", "stack to_str");
+    assert_eq(region_ref_to_str(RegionRef::Handle(7)), "region(7)", "handle to_str");
+    assert_eq(region_ref_to_str(RegionRef::Unknown), "region?", "unknown to_str");
+}
+
+// ── Test 3: MemRegion ──
+fn test_mem_region() -> void {
+    print("Test 3: MemRegion...\n");
+    assert_eq(mem_region_to_str(MemRegion::Stack), "stack", "Stack to_str");
+    assert_eq(mem_region_to_str(MemRegion::Heap), "heap", "Heap to_str");
+    assert_eq(mem_region_to_str(MemRegion::Static), "static", "Static to_str");
+    assert_eq(mem_region_to_str(MemRegion::Named("foo")), "region.foo", "Named to_str");
+
+    assert_true(mem_region_eq(MemRegion::Stack, MemRegion::Stack), "Stack == Stack");
+    assert_false(mem_region_eq(MemRegion::Stack, MemRegion::Heap), "Stack != Heap");
+    assert_true(mem_region_eq(MemRegion::Named("a"), MemRegion::Named("a")), "Named(a) == Named(a)");
+    assert_false(mem_region_eq(MemRegion::Named("a"), MemRegion::Named("b")), "Named(a) != Named(b)");
+}
+
+// ── Test 4: VReg and Slot ──
+fn test_vreg_slot() -> void {
+    print("Test 4: VReg and Slot...\n");
+    var r1: VReg = VReg_new(0);
+    var r2: VReg = VReg_new(1);
+    assert_eq(vreg_to_str(r1), "v0", "vreg 0 to_str");
+    assert_eq(vreg_to_str(r2), "v1", "vreg 1 to_str");
+    assert_true(vreg_eq(r1, VReg_new(0)), "vreg eq 0");
+    assert_false(vreg_eq(r1, r2), "vreg neq 0/1");
+
+    var s1: Slot = Slot_new(16);
+    var s2: Slot = Slot_new(32);
+    assert_eq(slot_to_str(s1), "[fp-16]", "slot 16 to_str");
+    assert_eq(slot_to_str(s2), "[fp-32]", "slot 32 to_str");
+    assert_true(slot_eq(s1, Slot_new(16)), "slot eq 16");
+    assert_false(slot_eq(s1, s2), "slot neq 16/32");
+}
+
+// ── Test 5: Operand ──
+fn test_operand() -> void {
+    print("Test 5: Operand...\n");
+    assert_eq(operand_to_str(Operand::VReg(VReg_new(3))), "v3", "VReg operand");
+    assert_eq(operand_to_str(Operand::Slot(Slot_new(8))), "[fp-8]", "Slot operand");
+    assert_eq(operand_to_str(Operand::ImmI(42)), "#42", "ImmI operand");
+    assert_eq(operand_to_str(Operand::ImmF(0)), "#f:0", "ImmF operand");
+    assert_eq(operand_to_str(Operand::ImmStr("hello")), "\"hello\"", "ImmStr operand");
+    assert_eq(operand_to_str(Operand::ImmFunc("foo")), "&foo", "ImmFunc operand");
+    assert_eq(operand_to_str(Operand::ImmNull), "#null", "ImmNull operand");
+}
+
+// ── Test 6: CastKind ──
+fn test_cast_kind() -> void {
+    print("Test 6: CastKind...\n");
+    assert_eq(cast_kind_to_str(CastKind::BitCast), "bitcast", "BitCast to_str");
+    assert_eq(cast_kind_to_str(CastKind::IntExtend), "int_extend", "IntExtend to_str");
+    assert_eq(cast_kind_to_str(CastKind::IntTrunc), "int_trunc", "IntTrunc to_str");
+    assert_eq(cast_kind_to_str(CastKind::IntToFloat), "int_to_float", "IntToFloat to_str");
+    assert_eq(cast_kind_to_str(CastKind::FloatToInt), "float_to_int", "FloatToInt to_str");
+}
+
+// ── Test 7: L1Inst kind names and terminator check ──
+fn test_l1inst() -> void {
+    print("Test 7: L1Inst...\n");
+    var ci: L1Inst = L1Inst::ConstInt(42, IrType::I64);
+    assert_eq(l1inst_kind_name(&ci), "ConstInt", "ConstInt kind");
+
+    var jmp: L1Inst = L1Inst::Jump(1);
+    assert_eq(l1inst_kind_name(&jmp), "Jump", "Jump kind");
+    assert_true(l1inst_is_terminator(&jmp), "Jump is terminator");
+
+    var br: L1Inst = L1Inst::Branch(0, 1, 2);
+    assert_true(l1inst_is_terminator(&br), "Branch is terminator");
+
+    var ret: L1Inst = L1Inst::Return(OptValueId::None);
+    assert_true(l1inst_is_terminator(&ret), "Return is terminator");
+
+    var unreach: L1Inst = L1Inst::Unreachable;
+    assert_true(l1inst_is_terminator(&unreach), "Unreachable is terminator");
+
+    var panic: L1Inst = L1Inst::Panic("oops");
+    assert_true(l1inst_is_terminator(&panic), "Panic is terminator");
+
+    var binop: L1Inst = L1Inst::BinOp(BinOp::Add, 0, 1, IrType::I64);
+    assert_false(l1inst_is_terminator(&binop), "BinOp is not terminator");
+    assert_eq(l1inst_kind_name(&binop), "BinOp", "BinOp kind");
+}
+
+// ── Test 8: L2Inst kind names and terminator check ──
+fn test_l2inst() -> void {
+    print("Test 8: L2Inst...\n");
+    var ci: L2Inst = L2Inst::ConstInt(10, IrType::I32);
+    assert_eq(l2inst_kind_name(&ci), "ConstInt", "L2 ConstInt kind");
+
+    var jmp: L2Inst = L2Inst::Jump(0);
+    assert_true(l2inst_is_terminator(&jmp), "L2 Jump is terminator");
+
+    var ret: L2Inst = L2Inst::Return(OptValueId::None);
+    assert_true(l2inst_is_terminator(&ret), "L2 Return is terminator");
+
+    var load: L2Inst = L2Inst::Load(0, IrType::I64);
+    assert_false(l2inst_is_terminator(&load), "L2 Load is not terminator");
+    assert_eq(l2inst_kind_name(&load), "Load", "L2 Load kind");
+}
+
+// ── Test 9: L1Module/L1Function/L1Block construction ──
+fn test_l1_construction() -> void {
+    print("Test 9: L1 construction...\n");
+    var m: L1Module = L1Module_new();
+    assert_eq_i64(m.functions.len(), 0, "no functions initially");
+    assert_eq_i64(m.struct_layouts.len(), 0, "no struct layouts initially");
+
+    var f: L1Function = L1Function_new("foo", IrType::I64);
+    assert_eq(f.name, "foo", "function name");
+    assert_eq_i64(f.blocks.len(), 0, "no blocks initially");
+    assert_eq_i64(f.values.len(), 0, "no values initially");
+    assert_false(f.is_wrapping, "not wrapping by default");
+    assert_false(f.is_deterministic, "not deterministic by default");
+
+    var b: L1Block = L1Block_new(0);
+    assert_eq_i64(b.id, 0, "block id 0");
+    assert_eq_i64(b.instructions.len(), 0, "no instructions initially");
+
+    // Test set/get value
+    var entry: L1ValueEntry = L1ValueEntry_new(L1Inst::ConstInt(5, IrType::I64), RegionRef::Builtin(Region::Stack), EffectSet_new(), OptU64::None);
+    L1Function_set_value(&mut f, 0, entry);
+    assert_eq_i64(f.values.len(), 1, "one value after set");
+
+    match L1Function_get_value(&f, 0) {
+        OptL1ValueEntry::Some(e) => {
+            match e.inst {
+                L1Inst::ConstInt(v, _) => { assert_eq_i64(v, 5, "retrieved ConstInt value"); }
+                _ => { p_panic("wrong inst type"); }
+            }
+        }
+        OptL1ValueEntry::None => { p_panic("value not found"); }
+    }
+}
+
+// ── Test 10: L2Module/L2Function construction ──
+fn test_l2_construction() -> void {
+    print("Test 10: L2 construction...\n");
+    var m: L2Module = L2Module_new();
+    assert_eq_i64(m.functions.len(), 0, "no functions initially");
+
+    var f: L2Function = L2Function_new("bar", IrType::Void);
+    assert_eq(f.name, "bar", "function name");
+    assert_eq_i64(f.values.len(), 0, "no values initially");
+    assert_false(f.is_pure, "not pure by default");
+
+    L2Function_set_value(&mut f, 0, L2Inst::ConstInt(7, IrType::I64));
+    assert_eq_i64(f.values.len(), 1, "one value after set");
+
+    match L2Function_get_value(&f, 0) {
+        OptL2Inst::Some(inst) => {
+            match inst {
+                L2Inst::ConstInt(v, _) => { assert_eq_i64(v, 7, "retrieved L2 ConstInt"); }
+                _ => { p_panic("wrong inst type"); }
+            }
+        }
+        OptL2Inst::None => { p_panic("value not found"); }
+    }
+}
+
+// ── Test 11: L3Module/L3Function construction ──
+fn test_l3_construction() -> void {
+    print("Test 11: L3 construction...\n");
+    var m: L3Module = L3Module_new();
+    assert_eq_i64(m.functions.len(), 0, "no functions initially");
+    assert_false(L3Module_has_pure(&m, "foo"), "no pure functions");
+
+    m.pure_functions.push("foo");
+    assert_true(L3Module_has_pure(&m, "foo"), "foo is pure");
+
+    m.no_alloc_functions.push("bar");
+    assert_true(L3Module_has_no_alloc(&m, "bar"), "bar is no-alloc");
+
+    var f: L3Function = L3Function_new("baz", IrType::I64);
+    assert_eq(f.name, "baz", "function name");
+    assert_eq_i64(f.frame_size, 0, "frame size 0 initially");
+    assert_eq_i64(f.next_vreg, 0, "next_vreg 0 initially");
+
+    var r1: VReg = L3Function_new_vreg(&mut f);
+    assert_eq_i64(r1.id, 0, "first vreg id 0");
+    var r2: VReg = L3Function_new_vreg(&mut f);
+    assert_eq_i64(r2.id, 1, "second vreg id 1");
+    assert_eq_i64(f.next_vreg, 2, "next_vreg is 2");
+}
+
+// ── Test 12: PirLevel parsing ──
+fn test_pir_level() -> void {
+    print("Test 12: PirLevel...\n");
+    match PirLevel_parse("1") {
+        OptPirLevel::Some(l) => { assert_true(pir_level_eq(l, PirLevel::L1), "parse '1' as L1"); }
+        OptPirLevel::None => { p_panic("failed to parse '1'"); }
+    }
+    match PirLevel_parse("l2") {
+        OptPirLevel::Some(l) => { assert_true(pir_level_eq(l, PirLevel::L2), "parse 'l2' as L2"); }
+        OptPirLevel::None => { p_panic("failed to parse 'l2'"); }
+    }
+    match PirLevel_parse("3") {
+        OptPirLevel::Some(l) => { assert_true(pir_level_eq(l, PirLevel::L3), "parse '3' as L3"); }
+        OptPirLevel::None => { p_panic("failed to parse '3'"); }
+    }
+    match PirLevel_parse("all") {
+        OptPirLevel::Some(l) => { assert_true(pir_level_eq(l, PirLevel::All), "parse 'all' as All"); }
+        OptPirLevel::None => { p_panic("failed to parse 'all'"); }
+    }
+    match PirLevel_parse("xyz") {
+        OptPirLevel::Some(_) => { p_panic("should not parse 'xyz'"); }
+        OptPirLevel::None => { assert_true(true, "parse 'xyz' as None"); }
+    }
+}
+
+// ── Test 13: Full IR→L1→L2→L3 lowering pipeline ──
+fn test_full_pipeline() -> void {
+    print("Test 13: Full lowering pipeline...\n");
+
+    // Build a simple IrModule with one function: fn main() -> i64 { return 42; }
+    var module: IrModule = IrModule_new();
+    var f: IrFunction = IrFunction_new("main", IrType::I64);
+    IrFunction_new_block(&mut f);  // block 0
+
+    var v1: i64 = IrFunction_emit(&mut f, Inst::ConstInt(42, IrType::I64));
+    IrFunction_emit(&mut f, Inst::Return(OptValueId::Some(v1)));
+
+    IrModule_add_function(&mut module, f);
+
+    // Lower to all levels
+    var all: PirAllLevels = build_all(&module);
+
+    // L1 checks
+    assert_eq_i64(all.l1.functions.len(), 1, "L1 has 1 function");
+    assert_eq(all.l1.functions.get(0).name, "main", "L1 function name");
+
+    // L2 checks
+    assert_eq_i64(all.l2.functions.len(), 1, "L2 has 1 function");
+    assert_eq(all.l2.functions.get(0).name, "main", "L2 function name");
+
+    // L3 checks
+    assert_eq_i64(all.l3.functions.len(), 1, "L3 has 1 function");
+    assert_eq(all.l3.functions.get(0).name, "main", "L3 function name");
+    assert_true(all.l3.functions.get(0).next_vreg > 0, "L3 has vregs allocated");
+}
+
+// ── Test 14: L1 printer output ──
+fn test_l1_printer() -> void {
+    print("Test 14: L1 printer...\n");
+
+    var module: IrModule = IrModule_new();
+    var f: IrFunction = IrFunction_new("test_fn", IrType::I64);
+    IrFunction_new_block(&mut f);  // block 0
+    var v1: i64 = IrFunction_emit(&mut f, Inst::ConstInt(100, IrType::I64));
+    IrFunction_emit(&mut f, Inst::Return(OptValueId::Some(v1)));
+    IrModule_add_function(&mut module, f);
+
+    var l1: L1Module = lower_ir_to_l1(&module);
+    var output: str = format_l1(&l1);
+    assert_true(str_contains(output, "PIR Level 1"), "L1 header present");
+    assert_true(str_contains(output, "test_fn"), "function name in output");
+    assert_true(str_contains(output, "const"), "const instruction in output");
+}
+
+// ── Test 15: L2 printer output ──
+fn test_l2_printer() -> void {
+    print("Test 15: L2 printer...\n");
+
+    var module: IrModule = IrModule_new();
+    var f: IrFunction = IrFunction_new("print_test", IrType::Void);
+    IrFunction_new_block(&mut f);
+    IrFunction_emit(&mut f, Inst::Return(OptValueId::None));
+    IrModule_add_function(&mut module, f);
+
+    var l1: L1Module = lower_ir_to_l1(&module);
+    var l2: L2Module = lower_l1_to_l2(&l1);
+    var output: str = format_l2(&l2);
+    assert_true(str_contains(output, "PIR Level 2"), "L2 header present");
+    assert_true(str_contains(output, "print_test"), "function name in L2 output");
+}
+
+// ── Test 16: L3 printer output ──
+fn test_l3_printer() -> void {
+    print("Test 16: L3 printer...\n");
+
+    var module: IrModule = IrModule_new();
+    var f: IrFunction = IrFunction_new("l3_test", IrType::I64);
+    IrFunction_new_block(&mut f);
+    var v1: i64 = IrFunction_emit(&mut f, Inst::ConstInt(99, IrType::I64));
+    IrFunction_emit(&mut f, Inst::Return(OptValueId::Some(v1)));
+    IrModule_add_function(&mut module, f);
+
+    var l1: L1Module = lower_ir_to_l1(&module);
+    var l2: L2Module = lower_l1_to_l2(&l1);
+    var l3: L3Module = lower_l2_to_l3(&l2, &module);
+    var output: str = format_l3(&l3);
+    assert_true(str_contains(output, "PIR Level 3"), "L3 header present");
+    assert_true(str_contains(output, "l3_test"), "function name in L3 output");
+    assert_true(str_contains(output, "frame="), "frame size in L3 output");
+}
+
+// ── Test 17: generate_pir with All level ──
+fn test_generate_pir_all() -> void {
+    print("Test 17: generate_pir All...\n");
+
+    var module: IrModule = IrModule_new();
+    var f: IrFunction = IrFunction_new("gen_test", IrType::I64);
+    IrFunction_new_block(&mut f);
+    var v1: i64 = IrFunction_emit(&mut f, Inst::ConstInt(1, IrType::I64));
+    IrFunction_emit(&mut f, Inst::Return(OptValueId::Some(v1)));
+    IrModule_add_function(&mut module, f);
+
+    var output: str = generate_pir(&module, PirLevel::All);
+    assert_true(str_contains(output, "Level 1"), "All includes L1");
+    assert_true(str_contains(output, "Level 2"), "All includes L2");
+    assert_true(str_contains(output, "Level 3"), "All includes L3");
+}
+
+// ── Test 18: BinOp/UnaryOp debug strings ──
+fn test_debug_strings() -> void {
+    print("Test 18: debug strings...\n");
+    assert_eq(binop_debug_str(BinOp::Add), "Add", "Add debug str");
+    assert_eq(binop_debug_str(BinOp::Sub), "Sub", "Sub debug str");
+    assert_eq(binop_debug_str(BinOp::Mul), "Mul", "Mul debug str");
+    assert_eq(binop_debug_str(BinOp::Eq), "Eq", "Eq debug str");
+    assert_eq(binop_debug_str(BinOp::Shl), "Shl", "Shl debug str");
+
+    assert_eq(unaryop_debug_str(UnaryOp::Neg), "Neg", "Neg debug str");
+    assert_eq(unaryop_debug_str(UnaryOp::Not), "Not", "Not debug str");
+    assert_eq(unaryop_debug_str(UnaryOp::BitNot), "BitNot", "BitNot debug str");
+}
+
+// ── Test 19: L1 fmt_inst ──
+fn test_l1_fmt_inst() -> void {
+    print("Test 19: L1 fmt_inst...\n");
+    var ci: L1Inst = L1Inst::ConstInt(42, IrType::I64);
+    var s1: str = fmt_l1_inst(ci);
+    assert_true(str_contains(s1, "42"), "ConstInt fmt has value");
+    assert_true(str_contains(s1, "i64"), "ConstInt fmt has type");
+
+    var cs: L1Inst = L1Inst::ConstStr("hello");
+    var s2: str = fmt_l1_inst(cs);
+    assert_true(str_contains(s2, "hello"), "ConstStr fmt has value");
+
+    var jmp: L1Inst = L1Inst::Jump(1);
+    var s3: str = fmt_l1_inst(jmp);
+    assert_true(str_contains(s3, "jmp"), "Jump fmt has jmp");
+
+    var ret: L1Inst = L1Inst::Return(OptValueId::None);
+    var s4: str = fmt_l1_inst(ret);
+    assert_true(str_contains(s4, "ret"), "Return fmt has ret");
+}
+
+// ── Test 20: L2 fmt_inst ──
+fn test_l2_fmt_inst() -> void {
+    print("Test 20: L2 fmt_inst...\n");
+    var ci: L2Inst = L2Inst::ConstInt(10, IrType::I32);
+    var s1: str = fmt_l2_inst(ci);
+    assert_true(str_contains(s1, "10"), "L2 ConstInt fmt has value");
+
+    var alloca: L2Inst = L2Inst::Alloca(IrType::I64, MemRegion::Stack);
+    var s2: str = fmt_l2_inst(alloca);
+    assert_true(str_contains(s2, "alloca"), "L2 Alloca fmt has alloca");
+    assert_true(str_contains(s2, "stack"), "L2 Alloca fmt has stack");
+
+    var call: L2Inst = L2Inst::Call("foo", Vec::new(), IrType::I64);
+    var s3: str = fmt_l2_inst(call);
+    assert_true(str_contains(s3, "call"), "L2 Call fmt has call");
+    assert_true(str_contains(s3, "foo"), "L2 Call fmt has function name");
+}
+
+// ── Test 21: L3 fmt_inst ──
+fn test_l3_fmt_inst() -> void {
+    print("Test 21: L3 fmt_inst...\n");
+    var mov: L3Inst = L3Inst::Mov(VReg_new(0), Operand::ImmI(42));
+    var s1: str = fmt_l3_inst(mov);
+    assert_true(str_contains(s1, "v0"), "L3 Mov fmt has v0");
+    assert_true(str_contains(s1, "#42"), "L3 Mov fmt has #42");
+
+    var bin: L3Inst = L3Inst::Bin(BinOp::Add, VReg_new(0), Operand::VReg(VReg_new(1)), Operand::VReg(VReg_new(2)), IrType::I64);
+    var s2: str = fmt_l3_inst(bin);
+    assert_true(str_contains(s2, "Add"), "L3 Bin fmt has Add");
+    assert_true(str_contains(s2, "v0"), "L3 Bin fmt has v0");
+    assert_true(str_contains(s2, "v1"), "L3 Bin fmt has v1");
+    assert_true(str_contains(s2, "v2"), "L3 Bin fmt has v2");
+
+    var ret: L3Inst = L3Inst::Ret(OptOperand::None);
+    var s3: str = fmt_l3_inst(ret);
+    assert_true(str_contains(s3, "ret"), "L3 Ret fmt has ret");
+}
+
+// ── Test 22: Lowering with BinOp ──
+fn test_lower_binop() -> void {
+    print("Test 22: Lowering with BinOp...\n");
+
+    var module: IrModule = IrModule_new();
+    var f: IrFunction = IrFunction_new("add_fn", IrType::I64);
+    IrFunction_new_block(&mut f);
+
+    var v1: i64 = IrFunction_emit(&mut f, Inst::ConstInt(10, IrType::I64));
+    var v2: i64 = IrFunction_emit(&mut f, Inst::ConstInt(20, IrType::I64));
+    var v3: i64 = IrFunction_emit(&mut f, Inst::BinOp(BinOp::Add, v1, v2, IrType::I64));
+    IrFunction_emit(&mut f, Inst::Return(OptValueId::Some(v3)));
+    IrModule_add_function(&mut module, f);
+
+    var all: PirAllLevels = build_all(&module);
+
+    // L1 should have BinOp
+    var l1_f: L1Function = all.l1.functions.get(0);
+    var has_binop: bool = false;
+    var i: i64 = 0;
+    while i < l1_f.values.len() {
+        match l1_f.values.get(i).entry.inst {
+            L1Inst::BinOp(_, _, _, _) => { has_binop = true; }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    assert_true(has_binop, "L1 has BinOp instruction");
+
+    // L3 should have Bin instruction
+    var l3_f: L3Function = all.l3.functions.get(0);
+    var has_bin: bool = false;
+    var j: i64 = 0;
+    while j < l3_f.blocks.len() {
+        var k: i64 = 0;
+        while k < l3_f.blocks.get(j).instructions.len() {
+            match l3_f.blocks.get(j).instructions.get(k) {
+                L3Inst::Bin(_, _, _, _, _) => { has_bin = true; }
+                _ => {}
+            }
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+    assert_true(has_bin, "L3 has Bin instruction");
+}
+
+// ── Test 23: Lowering with Branch ──
+fn test_lower_branch() -> void {
+    print("Test 23: Lowering with Branch...\n");
+
+    var module: IrModule = IrModule_new();
+    var f: IrFunction = IrFunction_new("br_fn", IrType::I64);
+    // IrFunction_new already creates block 0
+    var b0: i64 = 0;  // block 0 already exists
+    var b1: i64 = IrFunction_new_block(&mut f);  // block 1
+    var b2: i64 = IrFunction_new_block(&mut f);  // block 2
+
+    var cond: i64 = IrFunction_emit(&mut f, Inst::ConstBool(true));
+    IrFunction_emit(&mut f, Inst::Branch(cond, b1, b2));
+
+    // block 1
+    var v1: i64 = IrFunction_emit(&mut f, Inst::ConstInt(1, IrType::I64));
+    IrFunction_emit(&mut f, Inst::Return(OptValueId::Some(v1)));
+
+    // block 2
+    var v2: i64 = IrFunction_emit(&mut f, Inst::ConstInt(2, IrType::I64));
+    IrFunction_emit(&mut f, Inst::Return(OptValueId::Some(v2)));
+
+    IrModule_add_function(&mut module, f);
+
+    var all: PirAllLevels = build_all(&module);
+
+    // L1 should have Branch
+    var l1_f: L1Function = all.l1.functions.get(0);
+    assert_eq_i64(l1_f.blocks.len(), 3, "L1 has 3 blocks");
+
+    // L3 should have Br instruction
+    var l3_f: L3Function = all.l3.functions.get(0);
+    assert_eq_i64(l3_f.blocks.len(), 3, "L3 has 3 blocks");
+
+    var has_br: bool = false;
+    var i: i64 = 0;
+    while i < l3_f.blocks.len() {
+        var j: i64 = 0;
+        while j < l3_f.blocks.get(i).instructions.len() {
+            match l3_f.blocks.get(i).instructions.get(j) {
+                L3Inst::Br(_, _, _) => { has_br = true; }
+                _ => {}
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    assert_true(has_br, "L3 has Br instruction");
+}
+
+// ── Test 24: Lowering with Call ──
+fn test_lower_call() -> void {
+    print("Test 24: Lowering with Call...\n");
+
+    var module: IrModule = IrModule_new();
+
+    // Create a simple callee
+    var callee: IrFunction = IrFunction_new("callee", IrType::I64);
+    IrFunction_new_block(&mut callee);
+    var v: i64 = IrFunction_emit(&mut callee, Inst::ConstInt(42, IrType::I64));
+    IrFunction_emit(&mut callee, Inst::Return(OptValueId::Some(v)));
+    IrModule_add_function(&mut module, callee);
+
+    // Create caller that calls callee
+    var caller: IrFunction = IrFunction_new("caller", IrType::I64);
+    IrFunction_new_block(&mut caller);
+    var args: Vec<i64> = Vec::new();
+    var call_result: i64 = IrFunction_emit(&mut caller, Inst::Call("callee", args, IrType::I64, EffectSet_new()));
+    IrFunction_emit(&mut caller, Inst::Return(OptValueId::Some(call_result)));
+    IrModule_add_function(&mut module, caller);
+
+    var all: PirAllLevels = build_all(&module);
+
+    assert_eq_i64(all.l1.functions.len(), 2, "L1 has 2 functions");
+    assert_eq_i64(all.l2.functions.len(), 2, "L2 has 2 functions");
+    assert_eq_i64(all.l3.functions.len(), 2, "L3 has 2 functions");
+
+    // Check L3 has a Call instruction in caller
+    var l3_caller: L3Function = all.l3.functions.get(0);  // sorted: "callee" < "caller"
+    // Find the caller function
+    var found_caller: bool = false;
+    var i: i64 = 0;
+    while i < all.l3.functions.len() {
+        if str_equal(all.l3.functions.get(i).name, "caller") {
+            found_caller = true;
+            var has_call: bool = false;
+            var j: i64 = 0;
+            while j < all.l3.functions.get(i).blocks.len() {
+                var k: i64 = 0;
+                while k < all.l3.functions.get(i).blocks.get(j).instructions.len() {
+                    match all.l3.functions.get(i).blocks.get(j).instructions.get(k) {
+                        L3Inst::Call(_, name, _, _) => {
+                            assert_true(str_contains(name, "callee"), "L3 Call target is callee");
+                            has_call = true;
+                        }
+                        _ => {}
+                    }
+                    k = k + 1;
+                }
+                j = j + 1;
+            }
+            assert_true(has_call, "L3 caller has Call instruction");
+        }
+        i = i + 1;
+    }
+    assert_true(found_caller, "found caller function in L3");
+}
+
+// ── Test 25: vec_sort_str and vec_sort_i64 ──
+fn test_sort_helpers() -> void {
+    print("Test 25: sort helpers...\n");
+    // Note: these are private fns, but we can test indirectly via sorted output
+    var module: IrModule = IrModule_new();
+
+    // Add functions in non-sorted order
+    var f3: IrFunction = IrFunction_new("zebra", IrType::Void);
+    IrFunction_new_block(&mut f3);
+    IrFunction_emit(&mut f3, Inst::Return(OptValueId::None));
+    IrModule_add_function(&mut module, f3);
+
+    var f1: IrFunction = IrFunction_new("alpha", IrType::Void);
+    IrFunction_new_block(&mut f1);
+    IrFunction_emit(&mut f1, Inst::Return(OptValueId::None));
+    IrModule_add_function(&mut module, f1);
+
+    var f2: IrFunction = IrFunction_new("middle", IrType::Void);
+    IrFunction_new_block(&mut f2);
+    IrFunction_emit(&mut f2, Inst::Return(OptValueId::None));
+    IrModule_add_function(&mut module, f2);
+
+    var l1: L1Module = lower_ir_to_l1(&module);
+    // Functions should be sorted alphabetically
+    assert_eq(l1.functions.get(0).name, "alpha", "first function is alpha");
+    assert_eq(l1.functions.get(1).name, "middle", "second function is middle");
+    assert_eq(l1.functions.get(2).name, "zebra", "third function is zebra");
+}
+
+// ── Test 26: str_join helper ──
+fn test_str_join() -> void {
+    print("Test 26: str_join...\n");
+    var v: Vec<str> = Vec::new();
+    assert_eq(str_join(v, ", "), "", "empty join");
+
+    v.push("a");
+    assert_eq(str_join(v, ", "), "a", "single element join");
+
+    v.push("b");
+    v.push("c");
+    assert_eq(str_join(v, ", "), "a, b, c", "three elements join");
+    assert_eq(str_join(v, ""), "abc", "three elements no separator");
+}
+
+// ── Test 27: escape_str helper ──
+fn test_escape_str() -> void {
+    print("Test 27: escape_str...\n");
+    assert_eq(escape_str("hello"), "hello", "no special chars");
+    assert_eq(escape_str("a\"b"), "a\\\"b", "escape double quote");
+    assert_eq(escape_str("a\\b"), "a\\\\b", "escape backslash");
+}
+
+// ── Test 28: Lowering with Alloca ──
+fn test_lower_alloca() -> void {
+    print("Test 28: Lowering with Alloca...\n");
+
+    var module: IrModule = IrModule_new();
+    var f: IrFunction = IrFunction_new("alloca_fn", IrType::I64);
+    IrFunction_new_block(&mut f);
+
+    var ptr: i64 = IrFunction_emit(&mut f, Inst::Alloca(IrType::I64, Region::Stack));
+    var val: i64 = IrFunction_emit(&mut f, Inst::ConstInt(42, IrType::I64));
+    IrFunction_emit(&mut f, Inst::Store(ptr, val, OptIrType::Some(IrType::I64)));
+    var loaded: i64 = IrFunction_emit(&mut f, Inst::Load(ptr, IrType::I64));
+    IrFunction_emit(&mut f, Inst::Return(OptValueId::Some(loaded)));
+    IrModule_add_function(&mut module, f);
+
+    var all: PirAllLevels = build_all(&module);
+
+    // L1 should have AllocaIn
+    var l1_f: L1Function = all.l1.functions.get(0);
+    var has_alloca_in: bool = false;
+    var i: i64 = 0;
+    while i < l1_f.values.len() {
+        match l1_f.values.get(i).entry.inst {
+            L1Inst::AllocaIn(_, _) => { has_alloca_in = true; }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    assert_true(has_alloca_in, "L1 has AllocaIn");
+
+    // L2 should have Alloca
+    var l2_f: L2Function = all.l2.functions.get(0);
+    var has_alloca: bool = false;
+    var j: i64 = 0;
+    while j < l2_f.values.len() {
+        match l2_f.values.get(j).inst {
+            L2Inst::Alloca(_, _) => { has_alloca = true; }
+            _ => {}
+        }
+        j = j + 1;
+    }
+    assert_true(has_alloca, "L2 has Alloca");
+
+    // L3 should have AddrOfSlot or StackAlloc
+    var l3_f: L3Function = all.l3.functions.get(0);
+    assert_true(l3_f.frame_size > 0, "L3 has non-zero frame size");
+    var has_addr: bool = false;
+    var k: i64 = 0;
+    while k < l3_f.blocks.len() {
+        var m: i64 = 0;
+        while m < l3_f.blocks.get(k).instructions.len() {
+            match l3_f.blocks.get(k).instructions.get(m) {
+                L3Inst::AddrOfSlot(_, _) => { has_addr = true; }
+                L3Inst::StackAlloc(_, _, _) => { has_addr = true; }
+                _ => {}
+            }
+            m = m + 1;
+        }
+        k = k + 1;
+    }
+    assert_true(has_addr, "L3 has AddrOfSlot or StackAlloc");
+}
+
+// ── Test 29: PirAllLevels ──
+fn test_pir_all_levels() -> void {
+    print("Test 29: PirAllLevels...\n");
+
+    var module: IrModule = IrModule_new();
+    var f: IrFunction = IrFunction_new("test_all", IrType::Void);
+    IrFunction_new_block(&mut f);
+    IrFunction_emit(&mut f, Inst::Return(OptValueId::None));
+    IrModule_add_function(&mut module, f);
+
+    var all: PirAllLevels = build_all(&module);
+    assert_eq_i64(all.l1.functions.len(), 1, "PirAllLevels L1 has 1 function");
+    assert_eq_i64(all.l2.functions.len(), 1, "PirAllLevels L2 has 1 function");
+    assert_eq_i64(all.l3.functions.len(), 1, "PirAllLevels L3 has 1 function");
+}
+
+// ── Test 30: bool_to_str helper ──
+fn test_bool_to_str() -> void {
+    print("Test 30: bool_to_str...\n");
+    assert_eq(bool_to_str(true), "true", "true to_str");
+    assert_eq(bool_to_str(false), "false", "false to_str");
+}
+
+// ── Main ──
+fn main() -> i64 {
+    print("=== SH-9: PIR Module Tests ===\n\n");
+
+    test_capset();
+    test_region_ref();
+    test_mem_region();
+    test_vreg_slot();
+    test_operand();
+    test_cast_kind();
+    test_l1inst();
+    test_l2inst();
+    test_l1_construction();
+    test_l2_construction();
+    test_l3_construction();
+    test_pir_level();
+    test_full_pipeline();
+    test_l1_printer();
+    test_l2_printer();
+    test_l3_printer();
+    test_generate_pir_all();
+    test_debug_strings();
+    test_l1_fmt_inst();
+    test_l2_fmt_inst();
+    test_l3_fmt_inst();
+    test_lower_binop();
+    test_lower_branch();
+    test_lower_call();
+    test_sort_helpers();
+    test_str_join();
+    test_escape_str();
+    test_lower_alloca();
+    test_pir_all_levels();
+    test_bool_to_str();
+
+    print("\nSH-9: All tests passed!\n");
+    return 0;
+}
