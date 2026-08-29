@@ -562,6 +562,10 @@ impl ElfEmitter {
             "orl"  => self.encode_alu(0x08, operands, 4)?,
             "xorl" => self.encode_alu(0x30, operands, 4)?,
             "andb" => self.encode_alu_8bit(0x20, operands)?,
+            "orb"  => self.encode_alu_8bit(0x08, operands)?,
+            "xorb" => self.encode_alu_8bit(0x30, operands)?,
+            "addb" => self.encode_alu_8bit(0x00, operands)?,
+            "subb" => self.encode_alu_8bit(0x28, operands)?,
 
             "imulq" => {
                 // imulq %src, %dst → REX.W 0F AF /r

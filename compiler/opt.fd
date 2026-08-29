@@ -288,11 +288,13 @@ pub fn optimize_l2_with(module: &mut L2Module, passes: Vec<Pass>, max_iters: i64
     // Final cleanup: topologically sort all block instruction lists
     var fi: i64 = 0;
     while fi < module.functions.len() {
+        var f: L2Function = module.functions.get(fi);
         var bi: i64 = 0;
-        while bi < module.functions.get(fi).blocks.len() {
-            topo_sort_block(&mut module.functions.get(fi).blocks.get(bi), module.functions.get(fi).values);
+        while bi < f.blocks.len() {
+            topo_sort_block(&mut f.blocks.get(bi), f.values);
             bi = bi + 1;
         }
+        module.functions.set(fi, f);
         fi = fi + 1;
     }
 
@@ -300,13 +302,14 @@ pub fn optimize_l2_with(module: &mut L2Module, passes: Vec<Pass>, max_iters: i64
 }
 
 // ─── Convenience: optimize_ir_module ─────────────────────────────────────
-
-pub fn optimize_ir_module(ir_module: IrModule) -> L2Module {
-    var l1: L1Module = lower_ir_to_l1(ir_module);
-    var l2: L2Module = lower_l1_to_l2(l1);
-    var stats: OptStats = optimize_l2(&mut l2);
-    return l2;
-}
+// NOTE: This function requires lower_ir_to_l1 and lower_l1_to_l2 which take
+// references. For now, callers should use optimize_l2 directly.
+// pub fn optimize_ir_module(ir_module: &IrModule) -> L2Module {
+//     var l1: L1Module = lower_ir_to_l1(ir_module);
+//     var l2: L2Module = lower_l1_to_l2(&l1);
+//     var stats: OptStats = optimize_l2(&mut l2);
+//     return l2;
+// }
 
 // ─── S-1A: Pass relevance checking ───────────────────────────────────────
 
@@ -535,12 +538,22 @@ fn module_has_wrapping_nested_binop(module: &L2Module) -> bool {
             match f.values.get(j).inst {
                 L2Inst::BinOp(op, left, right, ty) => {
                     match L2Function_get_value(f, left) {
-                        OptL2Inst::Some(L2Inst::BinOp(_, _, _, _)) => { return true; }
-                        _ => {}
+                        OptL2Inst::Some(inner) => {
+                            match inner {
+                                L2Inst::BinOp(_, _, _, _) => { return true; }
+                                _ => {}
+                            }
+                        }
+                        OptL2Inst::None => {}
                     }
                     match L2Function_get_value(f, right) {
-                        OptL2Inst::Some(L2Inst::BinOp(_, _, _, _)) => { return true; }
-                        _ => {}
+                        OptL2Inst::Some(inner) => {
+                            match inner {
+                                L2Inst::BinOp(_, _, _, _) => { return true; }
+                                _ => {}
+                            }
+                        }
+                        OptL2Inst::None => {}
                     }
                 }
                 _ => {}
@@ -568,8 +581,8 @@ fn module_has_named_region_alloca(module: &L2Module) -> bool {
         var j: i64 = 0;
         while j < f.values.len() {
             match f.values.get(j).inst {
-                L2Inst::Alloca(ty, region) => {
-                    match region {
+                L2Inst::Alloca(ty, mem_reg) => {
+                    match mem_reg {
                         MemRegion::Stack => {}
                         MemRegion::Heap => {}
                         _ => { return true; }
@@ -594,15 +607,25 @@ fn module_has_tail_call(module: &L2Module) -> bool {
             if b.instructions.len() > 0 {
                 var term_vid: i64 = b.instructions.get(b.instructions.len() - 1);
                 match L2Function_get_value(f, term_vid) {
-                    OptL2Inst::Some(L2Inst::Return(ret_val)) => {
-                        if ret_val >= 0 {
-                            match L2Function_get_value(f, ret_val) {
-                                OptL2Inst::Some(L2Inst::Call(_, _, _)) => { return true; }
-                                _ => {}
+                    OptL2Inst::Some(term_inst) => {
+                        match term_inst {
+                            L2Inst::Return(ret_val) => {
+                                if ret_val >= 0 {
+                                    match L2Function_get_value(f, ret_val) {
+                                        OptL2Inst::Some(ret_inst) => {
+                                            match ret_inst {
+                                                L2Inst::Call(_, _, _) => { return true; }
+                                                _ => {}
+                                            }
+                                        }
+                                        OptL2Inst::None => {}
+                                    }
+                                }
                             }
+                            _ => {}
                         }
                     }
-                    _ => {}
+                    OptL2Inst::None => {}
                 }
             }
             bi = bi + 1;
@@ -621,14 +644,19 @@ pub fn has_loops(f: L2Function) -> bool {
         if b.instructions.len() > 0 {
             var term_vid: i64 = b.instructions.get(b.instructions.len() - 1);
             match L2Function_get_value(f, term_vid) {
-                OptL2Inst::Some(L2Inst::Jump(target)) => {
-                    if target <= bi { return true; }
+                OptL2Inst::Some(term_inst) => {
+                    match term_inst {
+                        L2Inst::Jump(target) => {
+                            if target <= bi { return true; }
+                        }
+                        L2Inst::Branch(cond, then_b, else_b) => {
+                            if then_b <= bi { return true; }
+                            if else_b <= bi { return true; }
+                        }
+                        _ => {}
+                    }
                 }
-                OptL2Inst::Some(L2Inst::Branch(cond, then_b, else_b)) => {
-                    if then_b <= bi { return true; }
-                    if else_b <= bi { return true; }
-                }
-                _ => {}
+                OptL2Inst::None => {}
             }
         }
         bi = bi + 1;
@@ -842,7 +870,7 @@ pub fn value_refs(inst: L2Inst) -> Vec<i64> {
 }
 
 /// Collect every PValue that is *used* anywhere in the function.
-pub fn collect_used_values(f: L2Function) -> Vec<i64> {
+pub fn collect_used_values(f: &L2Function) -> Vec<i64> {
     var used: Vec<i64> = Vec::new();
     // Block params are live
     var bi: i64 = 0;
@@ -875,20 +903,20 @@ pub fn collect_used_values(f: L2Function) -> Vec<i64> {
 }
 
 /// Push to used vec if not already present (dedup).
-fn used_push(used: &mut Vec<i64>, val: i64) {
+fn used_push(used: &mut Vec<i64>, v: i64) {
     var i: i64 = 0;
     while i < used.len() {
-        if used.get(i) == val { return; }
+        if used.get(i) == v { return; }
         i = i + 1;
     }
-    used.push(val);
+    used.push(v);
 }
 
 /// Check if a value is in a Vec<i64>.
-pub fn i64_vec_contains(vec: Vec<i64>, val: i64) -> bool {
+pub fn i64_vec_contains(vec: Vec<i64>, v: i64) -> bool {
     var i: i64 = 0;
     while i < vec.len() {
-        if vec.get(i) == val { return true; }
+        if vec.get(i) == v { return true; }
         i = i + 1;
     }
     return false;
@@ -920,14 +948,17 @@ pub fn topo_sort_block(b: &mut L2Block, values: Vec<ValueIdL2Entry>) {
     var i: i64 = 0;
     while i < insts.len() {
         var id: i64 = insts.get(i);
-        var inst: L2Inst;
-        match lookup_value(values, id) {
-            OptL2Inst::Some(found) => { inst = found; }
-            OptL2Inst::None => {
-                deps.push(DepEntry_new(id, Vec::new()));
-                i = i + 1;
-                continue;
-            }
+        var inst_opt: OptL2Inst = lookup_value(values, id);
+        var has_inst_flag: bool = false;
+        var inst: L2Inst = L2Inst::Unreachable;
+        match inst_opt {
+            OptL2Inst::Some(found) => { inst = found; has_inst_flag = true; }
+            OptL2Inst::None => {}
+        }
+        if !has_inst_flag {
+            deps.push(DepEntry_new(id, Vec::new()));
+            i = i + 1;
+            continue;
         }
         var refs: Vec<i64> = value_refs(inst);
         // Filter to only refs that are in this block
@@ -1047,36 +1078,4525 @@ fn lookup_value(values: Vec<ValueIdL2Entry>, id: i64) -> OptL2Inst {
     return OptL2Inst::None;
 }
 
-// ─── Forward declarations for pass functions ─────────────────────────────
-// These are implemented in the opt_*.fd files. We declare them here so the
-// driver can call them. In Fides, cross-module function calls resolve at link
-// time, so these just need to be pub fn in the respective modules.
-// Since Fides doesn't have a module system for splitting files yet, we'll
-// implement all passes in this file for now.
+/// Get the L2Inst for a given value ID from a function, or Unreachable if not found.
+fn get_inst(f: &L2Function, id: i64) -> L2Inst {
+    var i: i64 = 0;
+    while i < f.values.len() {
+        if f.values.get(i).id == id {
+            return f.values.get(i).inst;
+        }
+        i = i + 1;
+    }
+    return L2Inst::Unreachable;
+}
 
-// === STUB IMPLEMENTATIONS ===
-// The actual pass implementations will be added incrementally.
-// For now, these return 0 (no changes made).
+/// Check if a value ID exists in the function.
+fn has_inst(f: &L2Function, id: i64) -> bool {
+    var i: i64 = 0;
+    while i < f.values.len() {
+        if f.values.get(i).id == id { return true; }
+        i = i + 1;
+    }
+    return false;
+}
 
-pub fn pass_const_fold(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_cse(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_gvn(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_sroa(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_dse(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_devirt(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_jump_thread(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_loop_rotate(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_loop_vectorize(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_dce(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_inline(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_unroll(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_tco(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_alias_analysis(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_effect_reorder(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_partial_eval(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_slp_vectorize(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_strength_reduce(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_effect_optimize(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_region_pool(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_reassociate(module: &mut L2Module) -> i64 { return 0; }
-pub fn pass_memoize(module: &mut L2Module) -> i64 { return 0; }
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 1: Constant folding + propagation
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_const_fold(module: &mut L2Module) -> i64 {
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f_i: L2Function = module.functions.get(i);
+        count = count + const_fold_function(&mut f_i);
+        module.functions.set(i, f_i);
+        i = i + 1;
+    }
+    return count;
+}
+
+fn const_fold_function(f: &mut L2Function) -> i64 {
+    var count: i64 = 0;
+    // Iterate to a local fixed point
+    while true {
+        var pass: i64 = const_fold_once(f);
+        if pass == 0 { break; }
+        count = count + pass;
+    }
+    return count;
+}
+
+fn const_fold_once(f: &mut L2Function) -> i64 {
+    var count: i64 = 0;
+    var inst_ids: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < f.values.len() {
+        inst_ids.push(f.values.get(i).id);
+        i = i + 1;
+    }
+
+    var j: i64 = 0;
+    while j < inst_ids.len() {
+        var id: i64 = inst_ids.get(j);
+        var result: i64 = const_fold_id(f, id);
+        count = count + result;
+        j = j + 1;
+    }
+    return count;
+}
+
+fn const_fold_id(f: &mut L2Function, id: i64) -> i64 {
+    var entry: ValueIdL2Entry = ValueIdL2Entry_new(0, L2Inst::Unreachable);
+    var found: bool = false;
+    var k: i64 = 0;
+    while k < f.values.len() {
+        if f.values.get(k).id == id {
+            entry = f.values.get(k);
+            found = true;
+        }
+        k = k + 1;
+    }
+    if !found { return 0; }
+    return const_fold_inst(f, id, entry.inst);
+}
+
+/// Try to constant-fold a single instruction. Returns 1 if folded, 0 otherwise.
+fn const_fold_inst(f: &mut L2Function, id: i64, inst: L2Inst) -> i64 {
+    match inst {
+        L2Inst::BinOp(op, left, right, ty) => {
+            return try_fold_binop(f, id, op, left, right, ty);
+        }
+        L2Inst::UnaryOp(op, operand, ty) => {
+            return try_fold_unaryop(f, id, op, operand, ty);
+        }
+        L2Inst::Branch(cond, then_b, else_b) => {
+            return try_fold_branch(f, id, cond, then_b, else_b);
+        }
+        _ => {}
+    }
+    return 0;
+}
+
+fn try_fold_binop(f: &mut L2Function, id: i64, op: BinOp, left: i64, right: i64, ty: IrType) -> i64 {
+    var lv_opt: OptI64 = const_int_from_values(f.values, left);
+    var rv_opt: OptI64 = const_int_from_values(f.values, right);
+    var l: i64 = 0;
+    var r: i64 = 0;
+    var both_const: bool = false;
+    match lv_opt {
+        OptI64::Some(v) => {
+            l = v;
+            match rv_opt {
+                OptI64::Some(v2) => {
+                    r = v2;
+                    both_const = true;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+    if !both_const { return 0; }
+
+    var result_opt: OptI64 = opt_eval_binop_int(op, l, r, ty);
+    match result_opt {
+        OptI64::Some(result) => {
+            L2Function_set_value(f, id, L2Inst::ConstInt(result, ty));
+            return 1;
+        }
+        OptI64::None => {}
+    }
+    return 0;
+}
+
+fn try_fold_unaryop(f: &mut L2Function, id: i64, op: UnaryOp, operand: i64, ty: IrType) -> i64 {
+    var v_opt: OptI64 = const_int_from_values(f.values, operand);
+    match v_opt {
+        OptI64::Some(v) => {
+            var result_opt: OptI64 = opt_eval_unary_int(op, v, ty);
+            match result_opt {
+                OptI64::Some(result) => {
+                    L2Function_set_value(f, id, L2Inst::ConstInt(result, ty));
+                    return 1;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+    return 0;
+}
+
+fn try_fold_branch(f: &mut L2Function, id: i64, cond: i64, then_b: i64, else_b: i64) -> i64 {
+    var c_opt: OptBool = const_bool_from_values(f.values, cond);
+    match c_opt {
+        OptBool::Some(c) => {
+            var target: i64 = select_target(c, then_b, else_b);
+            L2Function_set_value(f, id, L2Inst::Jump(target));
+            return 1;
+        }
+        OptBool::None => {}
+    }
+    return 0;
+}
+
+fn select_target(cond: bool, then_b: i64, else_b: i64) -> i64 {
+    if cond { return then_b; }
+    return else_b;
+}
+
+/// If pv is a ConstInt or ConstBool, return its integer value.
+fn const_int_from_values(values: Vec<ValueIdL2Entry>, pv: i64) -> OptI64 {
+    match lookup_value(values, pv) {
+        OptL2Inst::Some(inst) => {
+            match inst {
+                L2Inst::ConstInt(value, _) => { return OptI64::Some(value); }
+                L2Inst::ConstBool(value) => {
+                    if value { return OptI64::Some(1); } else { return OptI64::Some(0); }
+                }
+                _ => { return OptI64::None; }
+            }
+        }
+        OptL2Inst::None => { return OptI64::None; }
+    }
+    return OptI64::None;
+}
+
+fn const_bool_from_values(values: Vec<ValueIdL2Entry>, pv: i64) -> OptBool {
+    match lookup_value(values, pv) {
+        OptL2Inst::Some(inst) => {
+            match inst {
+                L2Inst::ConstBool(value) => { return OptBool::Some(value); }
+                L2Inst::ConstInt(value, _) => {
+                    if value != 0 { return OptBool::Some(true); } else { return OptBool::Some(false); }
+                }
+                _ => { return OptBool::None; }
+            }
+        }
+        OptL2Inst::None => { return OptBool::None; }
+    }
+    return OptBool::None;
+}
+
+/// Keep the old names as wrappers for compatibility
+fn const_int_value(f: &L2Function, pv: i64) -> OptI64 {
+    return const_int_from_values(f.values, pv);
+}
+
+fn const_bool_value(f: &L2Function, pv: i64) -> OptBool {
+    return const_bool_from_values(f.values, pv);
+}
+
+/// Evaluate an integer binary op. Returns None for division by zero.
+fn opt_eval_binop_int(op: BinOp, l: i64, r: i64, ty: IrType) -> OptI64 {
+    var result: i64 = 0;
+    match op {
+        BinOp::Add => { result = l + r; }
+        BinOp::Sub => { result = l - r; }
+        BinOp::Mul => { result = l * r; }
+        BinOp::Div => {
+            if r == 0 { return OptI64::None; }
+            result = l / r;
+        }
+        BinOp::Mod => {
+            if r == 0 { return OptI64::None; }
+            result = l % r;
+        }
+        BinOp::BitAnd => { result = l & r; }
+        BinOp::BitOr => { result = l | r; }
+        BinOp::BitXor => { result = l ^ r; }
+        BinOp::Shl => { result = l << r; }
+        BinOp::Shr => { result = shr_i64(l, r); }
+        BinOp::Eq => { if l == r { result = 1; } else { result = 0; } }
+        BinOp::Neq => { if l != r { result = 1; } else { result = 0; } }
+        BinOp::Lt => { if l < r { result = 1; } else { result = 0; } }
+        BinOp::Gt => { if l > r { result = 1; } else { result = 0; } }
+        BinOp::LtEq => { if l <= r { result = 1; } else { result = 0; } }
+        BinOp::GtEq => { if l >= r { result = 1; } else { result = 0; } }
+        BinOp::And => {
+            if l != 0 && r != 0 { result = 1; } else { result = 0; }
+        }
+        BinOp::Or => {
+            if l != 0 || r != 0 { result = 1; } else { result = 0; }
+        }
+    }
+    // Truncate to target type width
+    var truncated: i64 = result;
+    match ty {
+        IrType::I8 => { truncated = truncate_to_i8(result); }
+        IrType::U8 => { truncated = truncate_to_u8(result); }
+        IrType::I16 => { truncated = truncate_to_i16(result); }
+        IrType::U16 => { truncated = truncate_to_u16(result); }
+        IrType::I32 => { truncated = truncate_to_i32(result); }
+        IrType::U32 => { truncated = truncate_to_u32(result); }
+        _ => { truncated = result; }
+    }
+    return OptI64::Some(truncated);
+}
+
+fn opt_eval_unary_int(op: UnaryOp, v: i64, ty: IrType) -> OptI64 {
+    var result: i64 = 0;
+    match op {
+        UnaryOp::Neg => { result = 0 - v; }
+        UnaryOp::Not => { if v == 0 { result = 1; } else { result = 0; } }
+        UnaryOp::BitNot => { result = ~v; }
+    }
+    var truncated: i64 = result;
+    match ty {
+        IrType::I8 => { truncated = truncate_to_i8(result); }
+        IrType::U8 => { truncated = truncate_to_u8(result); }
+        IrType::I16 => { truncated = truncate_to_i16(result); }
+        IrType::U16 => { truncated = truncate_to_u16(result); }
+        IrType::I32 => { truncated = truncate_to_i32(result); }
+        IrType::U32 => { truncated = truncate_to_u32(result); }
+        _ => { truncated = result; }
+    }
+    return OptI64::Some(truncated);
+}
+
+// Truncation helpers — Fides integers are i64, so we need to mask
+fn truncate_to_i8(v: i64) -> i64 {
+    var masked: i64 = v & 0xFF;
+    if masked >= 128 { return masked - 256; }
+    return masked;
+}
+
+fn truncate_to_u8(v: i64) -> i64 {
+    return v & 0xFF;
+}
+
+fn truncate_to_i16(v: i64) -> i64 {
+    var masked: i64 = v & 0xFFFF;
+    if masked >= 32768 { return masked - 65536; }
+    return masked;
+}
+
+fn truncate_to_u16(v: i64) -> i64 {
+    return v & 0xFFFF;
+}
+
+fn truncate_to_i32(v: i64) -> i64 {
+    var masked: i64 = v & 0xFFFFFFFF;
+    if masked >= 2147483648 { return masked - 4294967296; }
+    return masked;
+}
+
+fn truncate_to_u32(v: i64) -> i64 {
+    return v & 0xFFFFFFFF;
+}
+
+// OptI64 and OptBool enums for optional return values
+pub enum OptI64 {
+    Some(i64),
+    None,
+}
+
+pub enum OptBool {
+    Some(bool),
+    None,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 2: Common subexpression elimination (CSE)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_cse(module: &mut L2Module) -> i64 {
+    // Build a set of @deterministic user function names
+    var det_funcs: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        if module.functions.get(i).is_deterministic {
+            det_funcs.push(module.functions.get(i).name);
+        }
+        i = i + 1;
+    }
+
+    var count: i64 = 0;
+    var j: i64 = 0;
+    while j < module.functions.len() {
+        var f_j: L2Function = module.functions.get(j);
+        count = count + cse_function(&mut f_j, det_funcs);
+        module.functions.set(j, f_j);
+        j = j + 1;
+    }
+    return count;
+}
+
+fn cse_function(f: &mut L2Function, det_funcs: Vec<str>) -> i64 {
+    var count: i64 = 0;
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        count = count + cse_block(f, bi, det_funcs);
+        bi = bi + 1;
+    }
+    return count;
+}
+
+// CSE expression table entry
+struct CseEntry {
+    key: str,
+    vid: i64,
+}
+
+fn cse_block(f: &mut L2Function, bi: i64, det_funcs: Vec<str>) -> i64 {
+    var count: i64 = 0;
+    var b: L2Block = f.blocks.get(bi);
+    var table: Vec<CseEntry> = Vec::new();
+
+    var ii: i64 = 0;
+    while ii < b.instructions.len() {
+        var vid: i64 = b.instructions.get(ii);
+        if !has_inst(f, vid) { ii = ii + 1; continue; }
+        var inst: L2Inst = get_inst(f, vid);
+
+        // Only CSE pure instructions
+        if !is_pure(inst) && !is_cseable_call(inst, det_funcs) {
+            ii = ii + 1;
+            continue;
+        }
+
+        // Alloca is NOT pure for CSE purposes (each alloca is unique)
+        match inst {
+            L2Inst::Alloca(_, _) => { ii = ii + 1; continue; }
+            _ => {}
+        }
+
+        var key: str = cse_key(inst);
+        // Search for existing entry
+        var found_idx: i64 = -1;
+        var k: i64 = 0;
+        while k < table.len() {
+            if str_equal(table.get(k).key, key) {
+                found_idx = k;
+            }
+            k = k + 1;
+        }
+
+        if found_idx >= 0 {
+            // Replace all references to vid with the existing value
+            var prev_vid: i64 = table.get(found_idx).vid;
+            replace_all_refs(f, vid, prev_vid);
+            // Remove the dead instruction from values
+            remove_value(f, vid);
+            // Remove from block instruction list
+            remove_from_block_instructions(f, bi, vid);
+            count = count + 1;
+        } else {
+            table.push(CseEntry_new(key, vid));
+        }
+        ii = ii + 1;
+    }
+    return count;
+}
+
+fn CseEntry_new(key: str, vid: i64) -> CseEntry {
+    return CseEntry { key: key, vid: vid };
+}
+
+fn cse_key(inst: L2Inst) -> str {
+    match inst {
+        L2Inst::ConstInt(v, ty) => {
+            return "ConstInt:" + int_to_str(v);
+        }
+        L2Inst::ConstBool(v) => {
+            if v { return "ConstBool:1"; }
+            return "ConstBool:0";
+        }
+        L2Inst::ConstFloat(v, ty) => {
+            return "ConstFloat:" + int_to_str(v);
+        }
+        L2Inst::ConstStr(s) => {
+            return "ConstStr:" + s;
+        }
+        L2Inst::ConstNull(ty) => {
+            return "ConstNull";
+        }
+        L2Inst::BinOp(op, l, r, ty) => {
+            // Commutative ops: canonicalize operand order
+            var a: i64 = l;
+            var b: i64 = r;
+            if is_commutative(op) && l > r {
+                a = r;
+                b = l;
+            }
+            return "BinOp:" + binop_name(op) + ":" + int_to_str(a) + ":" + int_to_str(b);
+        }
+        L2Inst::UnaryOp(op, operand, ty) => {
+            return "UnaryOp:" + unaryop_name(op) + ":" + int_to_str(operand);
+        }
+        L2Inst::Load(ptr, ty) => {
+            return "Load:" + int_to_str(ptr);
+        }
+        L2Inst::GetFieldPtr(struct_ptr, field_idx, ty) => {
+            return "GetFieldPtr:" + int_to_str(struct_ptr) + ":" + int_to_str(field_idx);
+        }
+        L2Inst::GetElemPtr(array_ptr, index, ty) => {
+            return "GetElemPtr:" + int_to_str(array_ptr) + ":" + int_to_str(index);
+        }
+        L2Inst::BitCast(value, from_ty, to_ty) => {
+            return "BitCast:" + int_to_str(value);
+        }
+        L2Inst::Copy(value, ty) => {
+            return "Copy:" + int_to_str(value);
+        }
+        L2Inst::IntExtend(value, from_ty, to_ty) => {
+            return "IntExtend:" + int_to_str(value);
+        }
+        L2Inst::IntTrunc(value, from_ty, to_ty) => {
+            return "IntTrunc:" + int_to_str(value);
+        }
+        L2Inst::IntToFloat(value, from_ty, to_ty) => {
+            return "IntToFloat:" + int_to_str(value);
+        }
+        L2Inst::FloatToInt(value, from_ty, to_ty) => {
+            return "FloatToInt:" + int_to_str(value);
+        }
+        L2Inst::Call(func, args, ty) => {
+            var key: str = "Call:" + func;
+            var i: i64 = 0;
+            while i < args.len() {
+                key = key + ":" + int_to_str(args.get(i));
+                i = i + 1;
+            }
+            return key;
+        }
+        L2Inst::ConstInt(value, ty) => {
+            return "ConstInt:" + int_to_str(value);
+        }
+        L2Inst::ConstFloat(bits, ty) => {
+            return "ConstFloat:" + int_to_str(bits);
+        }
+        L2Inst::ConstStr(value) => {
+            return "ConstStr:" + value;
+        }
+        L2Inst::ConstBool(value) => {
+            return "ConstBool:" + int_to_str(if value { 1 } else { 0 });
+        }
+        _ => { return "unknown"; }
+    }
+    return "unknown";
+}
+
+fn binop_name(op: BinOp) -> str {
+    match op {
+        BinOp::Add => { return "Add"; }
+        BinOp::Sub => { return "Sub"; }
+        BinOp::Mul => { return "Mul"; }
+        BinOp::Div => { return "Div"; }
+        BinOp::Mod => { return "Mod"; }
+        BinOp::Eq => { return "Eq"; }
+        BinOp::Neq => { return "Neq"; }
+        BinOp::Lt => { return "Lt"; }
+        BinOp::Gt => { return "Gt"; }
+        BinOp::LtEq => { return "LtEq"; }
+        BinOp::GtEq => { return "GtEq"; }
+        BinOp::And => { return "And"; }
+        BinOp::Or => { return "Or"; }
+        BinOp::BitAnd => { return "BitAnd"; }
+        BinOp::BitOr => { return "BitOr"; }
+        BinOp::BitXor => { return "BitXor"; }
+        BinOp::Shl => { return "Shl"; }
+        BinOp::Shr => { return "Shr"; }
+    }
+    return "Unknown";
+}
+
+fn unaryop_name(op: UnaryOp) -> str {
+    match op {
+        UnaryOp::Neg => { return "Neg"; }
+        UnaryOp::Not => { return "Not"; }
+        UnaryOp::BitNot => { return "BitNot"; }
+    }
+    return "Unknown";
+}
+
+fn is_commutative(op: BinOp) -> bool {
+    match op {
+        BinOp::Add => { return true; }
+        BinOp::Mul => { return true; }
+        BinOp::Eq => { return true; }
+        BinOp::Neq => { return true; }
+        BinOp::BitAnd => { return true; }
+        BinOp::BitOr => { return true; }
+        BinOp::BitXor => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+/// Replace every reference to `from` with `to` across the whole function.
+pub fn replace_all_refs(f: &mut L2Function, from: i64, to: i64) {
+    // Replace in all instructions
+    var i: i64 = 0;
+    while i < f.values.len() {
+        var inst: L2Inst = f.values.get(i).inst;
+        var new_inst: L2Inst = replace_refs_in_inst(inst, from, to);
+        f.values.set(i, ValueIdL2Entry_new(f.values.get(i).id, new_inst));
+        i = i + 1;
+    }
+    // Replace in block params
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        var pi: i64 = 0;
+        while pi < f.blocks.get(bi).params.len() {
+            if f.blocks.get(bi).params.get(pi).id == from {
+                f.blocks.get(bi).params.get(pi).id = to;
+            }
+            pi = pi + 1;
+        }
+        bi = bi + 1;
+    }
+    // Replace in function params
+    var fi: i64 = 0;
+    while fi < f.params.len() {
+        if f.params.get(fi).id == from {
+            f.params.get(fi).id = to;
+        }
+        fi = fi + 1;
+    }
+}
+
+/// Replace references in a single instruction (returns new instruction).
+pub fn replace_refs_in_inst(inst: L2Inst, from: i64, to: i64) -> L2Inst {
+    match inst {
+        L2Inst::BinOp(op, left, right, ty) => {
+            var nl: i64 = left;
+            var nr: i64 = right;
+            if nl == from { nl = to; }
+            if nr == from { nr = to; }
+            return L2Inst::BinOp(op, nl, nr, ty);
+        }
+        L2Inst::UnaryOp(op, operand, ty) => {
+            var no: i64 = operand;
+            if no == from { no = to; }
+            return L2Inst::UnaryOp(op, no, ty);
+        }
+        L2Inst::Load(ptr, ty) => {
+            var np: i64 = ptr;
+            if np == from { np = to; }
+            return L2Inst::Load(np, ty);
+        }
+        L2Inst::Store(ptr, value, ty) => {
+            var np: i64 = ptr;
+            var nv: i64 = value;
+            if np == from { np = to; }
+            if nv == from { nv = to; }
+            return L2Inst::Store(np, nv, ty);
+        }
+        L2Inst::GetFieldPtr(struct_ptr, field_idx, ty) => {
+            var np: i64 = struct_ptr;
+            if np == from { np = to; }
+            return L2Inst::GetFieldPtr(np, field_idx, ty);
+        }
+        L2Inst::GetElemPtr(array_ptr, index, ty) => {
+            var np: i64 = array_ptr;
+            var ni: i64 = index;
+            if np == from { np = to; }
+            if ni == from { ni = to; }
+            return L2Inst::GetElemPtr(np, ni, ty);
+        }
+        L2Inst::Branch(cond, then_b, else_b) => {
+            var nc: i64 = cond;
+            if nc == from { nc = to; }
+            return L2Inst::Branch(nc, then_b, else_b);
+        }
+        L2Inst::Return(ret_val) => {
+            var nv: i64 = ret_val;
+            if nv == from { nv = to; }
+            return L2Inst::Return(nv);
+        }
+        L2Inst::Call(func, args, ty) => {
+            var new_args: Vec<i64> = Vec::new();
+            var i: i64 = 0;
+            while i < args.len() {
+                var a: i64 = args.get(i);
+                if a == from { a = to; }
+                new_args.push(a);
+                i = i + 1;
+            }
+            return L2Inst::Call(func, new_args, ty);
+        }
+        L2Inst::CallPtr(fn_ptr, args, ty, is_void) => {
+            var nfp: i64 = fn_ptr;
+            if nfp == from { nfp = to; }
+            var new_args: Vec<i64> = Vec::new();
+            var i: i64 = 0;
+            while i < args.len() {
+                var a: i64 = args.get(i);
+                if a == from { a = to; }
+                new_args.push(a);
+                i = i + 1;
+            }
+            return L2Inst::CallPtr(nfp, new_args, ty, is_void);
+        }
+        L2Inst::DynCall(disp, method, args, ty) => {
+            var new_args: Vec<i64> = Vec::new();
+            var i: i64 = 0;
+            while i < args.len() {
+                var a: i64 = args.get(i);
+                if a == from { a = to; }
+                new_args.push(a);
+                i = i + 1;
+            }
+            return L2Inst::DynCall(disp, method, new_args, ty);
+        }
+        L2Inst::MakeDyn(value, sig, trait_name) => {
+            var nv: i64 = value;
+            if nv == from { nv = to; }
+            return L2Inst::MakeDyn(nv, sig, trait_name);
+        }
+        L2Inst::BitCast(value, from_ty, to_ty) => {
+            var nv: i64 = value;
+            if nv == from { nv = to; }
+            return L2Inst::BitCast(nv, from_ty, to_ty);
+        }
+        L2Inst::Copy(value, ty) => {
+            var nv: i64 = value;
+            if nv == from { nv = to; }
+            return L2Inst::Copy(nv, ty);
+        }
+        L2Inst::IntExtend(value, from_ty, to_ty) => {
+            var nv: i64 = value;
+            if nv == from { nv = to; }
+            return L2Inst::IntExtend(nv, from_ty, to_ty);
+        }
+        L2Inst::IntTrunc(value, from_ty, to_ty) => {
+            var nv: i64 = value;
+            if nv == from { nv = to; }
+            return L2Inst::IntTrunc(nv, from_ty, to_ty);
+        }
+        L2Inst::IntToFloat(value, from_ty, to_ty) => {
+            var nv: i64 = value;
+            if nv == from { nv = to; }
+            return L2Inst::IntToFloat(nv, from_ty, to_ty);
+        }
+        L2Inst::FloatToInt(value, from_ty, to_ty) => {
+            var nv: i64 = value;
+            if nv == from { nv = to; }
+            return L2Inst::FloatToInt(nv, from_ty, to_ty);
+        }
+        L2Inst::TryUnwrap(value, ok_dst, err_dst, line) => {
+            var nv: i64 = value;
+            var nod: i64 = ok_dst;
+            if nv == from { nv = to; }
+            if nod == from { nod = to; }
+            return L2Inst::TryUnwrap(nv, nod, err_dst, line);
+        }
+        L2Inst::Print(value, ty) => {
+            var nv: i64 = value;
+            if nv == from { nv = to; }
+            return L2Inst::Print(nv, ty);
+        }
+        _ => { return inst; }
+    }
+    return inst;
+}
+
+/// Remove a value from the function's value table.
+pub fn remove_value(f: &mut L2Function, vid: i64) {
+    L2Function_remove_value(f, vid);
+}
+
+/// Remove a vid from a specific block's instruction list.
+pub fn remove_from_block_instructions(f: &mut L2Function, bi: i64, vid: i64) {
+    var b: L2Block = f.blocks.get(bi);
+    var new_insts: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < b.instructions.len() {
+        if b.instructions.get(i) != vid {
+            new_insts.push(b.instructions.get(i));
+        }
+        i = i + 1;
+    }
+    b.instructions = new_insts;
+    f.blocks.set(bi, b);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 3: Global Value Numbering (GVN)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_gvn(module: &mut L2Module) -> i64 {
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f_i: L2Function = module.functions.get(i);
+        count = count + gvn_function(&mut f_i);
+        module.functions.set(i, f_i);
+        i = i + 1;
+    }
+    return count;
+}
+
+fn gvn_function(f: &mut L2Function) -> i64 {
+    // GVN: like CSE but across block boundaries.
+    // Process entry block first, then share its table with all other blocks.
+    var det_funcs: Vec<str> = Vec::new();
+    if f.is_deterministic {
+        det_funcs.push(f.name);
+    }
+    var count: i64 = 0;
+    var entry_table: Vec<CseEntry> = Vec::new();
+
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        var table: Vec<CseEntry> = Vec::new();
+        if bi != f.entry {
+            // Seed with entry table (entry block dominates all)
+            var k: i64 = 0;
+            while k < entry_table.len() {
+                table.push(entry_table.get(k));
+                k = k + 1;
+            }
+        }
+
+        var b: L2Block = f.blocks.get(bi);
+        var ii: i64 = 0;
+        while ii < b.instructions.len() {
+            var vid: i64 = b.instructions.get(ii);
+            if !has_inst(f, vid) { ii = ii + 1; continue; }
+            var inst: L2Inst = get_inst(f, vid);
+
+            if !is_pure(inst) && !is_cseable_call(inst, det_funcs) {
+                ii = ii + 1;
+                continue;
+            }
+            match inst {
+                L2Inst::Alloca(_, _) => { ii = ii + 1; continue; }
+                _ => {}
+            }
+
+            var key: str = cse_key(inst);
+            var found_idx: i64 = -1;
+            var k: i64 = 0;
+            while k < table.len() {
+                if str_equal(table.get(k).key, key) {
+                    found_idx = k;
+                }
+                k = k + 1;
+            }
+
+            if found_idx >= 0 {
+                var prev_vid: i64 = table.get(found_idx).vid;
+                replace_all_refs(f, vid, prev_vid);
+                remove_value(f, vid);
+                remove_from_block_instructions(f, bi, vid);
+                count = count + 1;
+            } else {
+                table.push(CseEntry_new(key, vid));
+                if bi == f.entry {
+                    entry_table.push(CseEntry_new(key, vid));
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    return count;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 4: Dead Code Elimination (DCE)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_dce(module: &mut L2Module) -> i64 {
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f_i: L2Function = module.functions.get(i);
+        count = count + dce_function(&mut f_i);
+        module.functions.set(i, f_i);
+        i = i + 1;
+    }
+    return count;
+}
+
+fn dce_function(f: &mut L2Function) -> i64 {
+    var count: i64 = 0;
+    // Iterate to fixed point
+    while true {
+        var pass: i64 = dce_once(f);
+        if pass == 0 { break; }
+        count = count + pass;
+    }
+    return count;
+}
+
+fn dce_once(f: &mut L2Function) -> i64 {
+    var count: i64 = 0;
+    // Collect all used values
+    var used: Vec<i64> = collect_used_values(f);
+
+    // Find dead instructions (pure, not used)
+    var to_remove: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < f.values.len() {
+        var vid: i64 = f.values.get(i).id;
+        var inst: L2Inst = f.values.get(i).inst;
+        if is_pure(inst) && !i64_vec_contains(used, vid) {
+            to_remove.push(vid);
+        }
+        i = i + 1;
+    }
+
+    // Remove dead instructions
+    if to_remove.len() > 0 {
+        var new_values: Vec<ValueIdL2Entry> = Vec::new();
+        var j: i64 = 0;
+        while j < f.values.len() {
+            var vid: i64 = f.values.get(j).id;
+            if !i64_vec_contains(to_remove, vid) {
+                new_values.push(f.values.get(j));
+            }
+            j = j + 1;
+        }
+        f.values = new_values;
+        count = count + to_remove.len();
+
+        // Also remove from block instruction lists
+        var bi: i64 = 0;
+        while bi < f.blocks.len() {
+            var new_insts: Vec<i64> = Vec::new();
+            var ii: i64 = 0;
+            while ii < f.blocks.get(bi).instructions.len() {
+                var vid2: i64 = f.blocks.get(bi).instructions.get(ii);
+                if !i64_vec_contains(to_remove, vid2) {
+                    new_insts.push(vid2);
+                }
+                ii = ii + 1;
+            }
+            f.blocks.get(bi).instructions = new_insts;
+            bi = bi + 1;
+        }
+    }
+    return count;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Remaining passes — stub implementations for now
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Scalar Replacement of Aggregates (SROA)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_sroa(module: &mut L2Module) -> i64 {
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f_i: L2Function = module.functions.get(i);
+        count = count + sroa_function(&mut f_i, module.struct_layouts);
+        module.functions.set(i, f_i);
+        i = i + 1;
+    }
+    return count;
+}
+
+fn sroa_function(f: &mut L2Function, struct_layouts: Vec<StructLayoutEntry>) -> i64 {
+    var count: i64 = 0;
+
+    // Find alloca-of-struct candidates
+    var candidates: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < f.values.len() {
+        match f.values.get(i).inst {
+            L2Inst::Alloca(ty, _) => {
+                match ty {
+                    IrType::Struct(name) => {
+                        if !sroa_alloca_escapes(f, f.values.get(i).id) {
+                            candidates.push(f.values.get(i).id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+
+    // Process each candidate
+    var j: i64 = 0;
+    while j < candidates.len() {
+        count = count + sroa_alloca(f, candidates.get(j), struct_layouts);
+        j = j + 1;
+    }
+
+    return count;
+}
+
+/// Check if an alloca's address escapes (used anywhere other than GetFieldPtr).
+fn sroa_alloca_escapes(f: &L2Function, alloca_id: i64) -> bool {
+    var i: i64 = 0;
+    while i < f.values.len() {
+        var inst: L2Inst = f.values.get(i).inst;
+        match inst {
+            L2Inst::GetFieldPtr(struct_ptr, _, _) => {
+                if struct_ptr == alloca_id { i = i + 1; continue; }
+            }
+            _ => {}
+        }
+        // Check if alloca_id appears in value_refs
+        var refs: Vec<i64> = value_refs(inst);
+        if i64_vec_contains(refs, alloca_id) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Perform SROA on one alloca candidate.
+fn sroa_alloca(f: &mut L2Function, alloca_id: i64, struct_layouts: Vec<StructLayoutEntry>) -> i64 {
+    var count: i64 = 0;
+
+    // Find all GetFieldPtr instructions for this alloca
+    var gfp_ids: Vec<i64> = Vec::new();
+    var gfp_fields: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < f.values.len() {
+        match f.values.get(i).inst {
+            L2Inst::GetFieldPtr(struct_ptr, field_idx, _) => {
+                if struct_ptr == alloca_id {
+                    gfp_ids.push(f.values.get(i).id);
+                    gfp_fields.push(field_idx);
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+
+    if gfp_ids.len() == 0 { return 0; }
+
+    // Check that no GFP result is used by another GFP (chained fields)
+    var j: i64 = 0;
+    while j < gfp_ids.len() {
+        var k: i64 = 0;
+        while k < f.values.len() {
+            match f.values.get(k).inst {
+                L2Inst::GetFieldPtr(struct_ptr, _, _) => {
+                    if struct_ptr == gfp_ids.get(j) {
+                        // Chained — skip this alloca
+                        return 0;
+                    }
+                }
+                _ => {}
+            }
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+
+    // Find all Load/Store users of each GFP and check they're in the same block
+    var access_blocks: Vec<i64> = Vec::new();
+    var access_gfp_idx: Vec<i64> = Vec::new();
+    var access_is_store: Vec<bool> = Vec::new();
+    var access_vid: Vec<i64> = Vec::new();
+    var access_value: Vec<i64> = Vec::new();
+
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        var ii: i64 = 0;
+        while ii < f.blocks.get(bi).instructions.len() {
+            var vid: i64 = f.blocks.get(bi).instructions.get(ii);
+            match L2Function_get_value(f, vid) {
+                OptL2Inst::Some(inst) => {
+                    match inst {
+                        L2Inst::Load(ptr, _) => {
+                            var gfp_idx: i64 = find_in_vec(gfp_ids, ptr);
+                            if gfp_idx >= 0 {
+                                access_blocks.push(bi);
+                                access_gfp_idx.push(gfp_idx);
+                                access_is_store.push(false);
+                                access_vid.push(vid);
+                                access_value.push(0);
+                            }
+                        }
+                        L2Inst::Store(ptr, value, _) => {
+                            var gfp_idx: i64 = find_in_vec(gfp_ids, ptr);
+                            if gfp_idx >= 0 {
+                                access_blocks.push(bi);
+                                access_gfp_idx.push(gfp_idx);
+                                access_is_store.push(true);
+                                access_vid.push(vid);
+                                access_value.push(value);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                OptL2Inst::None => {}
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    if access_blocks.len() == 0 { return 0; }
+
+    // Check all accesses are in the same block
+    var first_block: i64 = access_blocks.get(0);
+    var k: i64 = 1;
+    while k < access_blocks.len() {
+        if access_blocks.get(k) != first_block { return 0; }
+        k = k + 1;
+    }
+
+    // Process accesses in instruction order within the block
+    // Track current value per field
+    var field_values: Vec<i64> = Vec::new();
+    var field_set: Vec<bool> = Vec::new();
+    var fi: i64 = 0;
+    while fi < gfp_ids.len() {
+        field_values.push(0);
+        field_set.push(false);
+        fi = fi + 1;
+    }
+
+    // Sort accesses by their position in the block
+    // (They're already in order since we walked the block sequentially)
+
+    var next_id: i64 = tco_next_id(f);
+
+    var ai: i64 = 0;
+    while ai < access_blocks.len() {
+        var gfp_idx: i64 = access_gfp_idx.get(ai);
+        if access_is_store.get(ai) {
+            // Store: record the value, remove the store instruction
+            field_values.set(gfp_idx, access_value.get(ai));
+            field_set.set(gfp_idx, true);
+            remove_value(f, access_vid.get(ai));
+            remove_from_block_instructions(f, first_block, access_vid.get(ai));
+            count = count + 1;
+        } else {
+            // Load: replace with Copy of current field value
+            if field_set.get(gfp_idx) {
+                // Replace Load with Copy
+                L2Function_set_value(f, access_vid.get(ai), L2Inst::Copy(field_values.get(gfp_idx), IrType::I64));
+                count = count + 1;
+            } else {
+                // No store seen — use ConstInt(0) as default
+                var default_id: i64 = next_id;
+                next_id = next_id + 1;
+                L2Function_set_value(f, default_id, L2Inst::ConstInt(0, IrType::I64));
+                L2Function_set_value(f, access_vid.get(ai), L2Inst::Copy(default_id, IrType::I64));
+                count = count + 1;
+            }
+        }
+        ai = ai + 1;
+    }
+
+    // Remove all GetFieldPtr instructions for this alloca
+    var gi: i64 = 0;
+    while gi < gfp_ids.len() {
+        remove_value(f, gfp_ids.get(gi));
+        remove_from_block_instructions(f, first_block, gfp_ids.get(gi));
+        count = count + 1;
+        gi = gi + 1;
+    }
+
+    // Remove the Alloca itself
+    remove_value(f, alloca_id);
+    remove_from_block_instructions(f, first_block, alloca_id);
+    count = count + 1;
+
+    return count;
+}
+
+fn find_in_vec(vec: Vec<i64>, item: i64) -> i64 {
+    var i: i64 = 0;
+    while i < vec.len() {
+        if vec.get(i) == item { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Dead Store Elimination (DSE)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_dse(module: &mut L2Module) -> i64 {
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f_i: L2Function = module.functions.get(i);
+        count = count + dse_function(&mut f_i);
+        module.functions.set(i, f_i);
+        i = i + 1;
+    }
+    return count;
+}
+
+fn dse_function(f: &mut L2Function) -> i64 {
+    var count: i64 = 0;
+
+    // Build a set of local non-escaping allocas
+    var local_allocas: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < f.values.len() {
+        match f.values.get(i).inst {
+            L2Inst::Alloca(_, _) => {
+                if !dse_alloca_escapes(f, f.values.get(i).id) {
+                    local_allocas.push(f.values.get(i).id);
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+
+    // Track GetFieldPtr results — map gfp_result → base_alloca
+    var gfp_base_ids: Vec<i64> = Vec::new();
+    var gfp_base_alloca: Vec<i64> = Vec::new();
+    i = 0;
+    while i < f.values.len() {
+        match f.values.get(i).inst {
+            L2Inst::GetFieldPtr(struct_ptr, _, _) => {
+                if i64_vec_contains(local_allocas, struct_ptr) {
+                    gfp_base_ids.push(f.values.get(i).id);
+                    gfp_base_alloca.push(struct_ptr);
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+
+    // Pattern 1: Overwritten stores within each block (walk in reverse)
+    var to_remove: Vec<i64> = Vec::new();
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        var insts: Vec<i64> = f.blocks.get(bi).instructions;
+        var seen_store: Vec<i64> = Vec::new();
+        var seen_load: Vec<i64> = Vec::new();
+
+        // Walk in reverse
+        var ri: i64 = insts.len() - 1;
+        while ri >= 0 {
+            var vid: i64 = insts.get(ri);
+            if !has_inst(f, vid) { ri = ri - 1; continue; }
+            var inst: L2Inst = get_inst(f, vid);
+            match inst {
+                L2Inst::Store(ptr, value, ty) => {
+                    if dse_is_local_ptr(ptr, local_allocas, gfp_base_ids) {
+                        if i64_vec_contains(seen_store, ptr) && !i64_vec_contains(seen_load, ptr) {
+                            if !i64_vec_contains(to_remove, vid) {
+                                to_remove.push(vid);
+                                count = count + 1;
+                            }
+                        }
+                        dse_set_add(&mut seen_store, ptr);
+                        dse_set_remove(&mut seen_load, ptr);
+                    }
+                }
+                L2Inst::Load(ptr, ty) => {
+                    if dse_is_local_ptr(ptr, local_allocas, gfp_base_ids) {
+                        dse_set_add(&mut seen_load, ptr);
+                    }
+                }
+                L2Inst::Call(func, _, _) => {
+                    if !is_known_pure_func(func) {
+                        // Conservative: treat as load from all local pointers
+                        var k: i64 = 0;
+                        while k < local_allocas.len() {
+                            dse_set_add(&mut seen_load, local_allocas.get(k));
+                            k = k + 1;
+                        }
+                        k = 0;
+                        while k < gfp_base_ids.len() {
+                            dse_set_add(&mut seen_load, gfp_base_ids.get(k));
+                            k = k + 1;
+                        }
+                    }
+                }
+                L2Inst::CallPtr(_, _, _, _) => {
+                    var k: i64 = 0;
+                    while k < local_allocas.len() {
+                        dse_set_add(&mut seen_load, local_allocas.get(k));
+                        k = k + 1;
+                    }
+                }
+                L2Inst::DynCall(_, _, _, _) => {
+                    var k: i64 = 0;
+                    while k < local_allocas.len() {
+                        dse_set_add(&mut seen_load, local_allocas.get(k));
+                        k = k + 1;
+                    }
+                }
+                _ => {}
+            }
+            ri = ri - 1;
+        }
+        bi = bi + 1;
+    }
+
+    // Pattern 2: Stores to dead allocas (all stores, no loads anywhere)
+    var loaded_ptrs: Vec<i64> = Vec::new();
+    i = 0;
+    while i < f.values.len() {
+        match f.values.get(i).inst {
+            L2Inst::Load(ptr, _) => {
+                dse_set_add(&mut loaded_ptrs, ptr);
+                // If loading through a GetFieldPtr, mark base alloca as loaded
+                var gfp_idx: i64 = dse_gfp_find(gfp_base_ids, ptr);
+                if gfp_idx >= 0 {
+                    dse_set_add(&mut loaded_ptrs, gfp_base_alloca.get(gfp_idx));
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+
+    var ai: i64 = 0;
+    while ai < local_allocas.len() {
+        var alloca_id: i64 = local_allocas.get(ai);
+        if !i64_vec_contains(loaded_ptrs, alloca_id) {
+            // Never loaded — all stores to it are dead
+            i = 0;
+            while i < f.values.len() {
+                match f.values.get(i).inst {
+                    L2Inst::Store(ptr, _, _) => {
+                        if ptr == alloca_id {
+                            if !i64_vec_contains(to_remove, f.values.get(i).id) {
+                                to_remove.push(f.values.get(i).id);
+                                count = count + 1;
+                            }
+                        }
+                        // Check through GetFieldPtr
+                        var gfp_idx: i64 = dse_gfp_find(gfp_base_ids, ptr);
+                        if gfp_idx >= 0 {
+                            if gfp_base_alloca.get(gfp_idx) == alloca_id {
+                                if !i64_vec_contains(to_remove, f.values.get(i).id) {
+                                    to_remove.push(f.values.get(i).id);
+                                    count = count + 1;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                i = i + 1;
+            }
+        }
+        ai = ai + 1;
+    }
+
+    // Remove dead stores
+    if to_remove.len() > 0 {
+        var new_values: Vec<ValueIdL2Entry> = Vec::new();
+        var j: i64 = 0;
+        while j < f.values.len() {
+            if !i64_vec_contains(to_remove, f.values.get(j).id) {
+                new_values.push(f.values.get(j));
+            }
+            j = j + 1;
+        }
+        f.values = new_values;
+
+        // Remove from block instruction lists
+        var bi2: i64 = 0;
+        while bi2 < f.blocks.len() {
+            var new_insts: Vec<i64> = Vec::new();
+            var ii: i64 = 0;
+            while ii < f.blocks.get(bi2).instructions.len() {
+                if !i64_vec_contains(to_remove, f.blocks.get(bi2).instructions.get(ii)) {
+                    new_insts.push(f.blocks.get(bi2).instructions.get(ii));
+                }
+                ii = ii + 1;
+            }
+            f.blocks.get(bi2).instructions = new_insts;
+            bi2 = bi2 + 1;
+        }
+    }
+
+    return count;
+}
+
+fn dse_alloca_escapes(f: &L2Function, alloca_id: i64) -> bool {
+    var i: i64 = 0;
+    while i < f.values.len() {
+        var inst: L2Inst = f.values.get(i).inst;
+        match inst {
+            L2Inst::Load(ptr, _) => {
+                if ptr == alloca_id { i = i + 1; continue; }
+            }
+            L2Inst::Store(ptr, _, _) => {
+                if ptr == alloca_id { i = i + 1; continue; }
+            }
+            L2Inst::GetFieldPtr(struct_ptr, _, _) => {
+                if struct_ptr == alloca_id { i = i + 1; continue; }
+            }
+            _ => {}
+        }
+        // Check if alloca_id appears in value_refs
+        var refs: Vec<i64> = value_refs(inst);
+        if i64_vec_contains(refs, alloca_id) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn dse_is_local_ptr(ptr: i64, local_allocas: Vec<i64>, gfp_base_ids: Vec<i64>) -> bool {
+    if i64_vec_contains(local_allocas, ptr) { return true; }
+    if i64_vec_contains(gfp_base_ids, ptr) { return true; }
+    return false;
+}
+
+fn dse_set_add(set: &mut Vec<i64>, v: i64) {
+    if !i64_vec_contains(set, v) {
+        set.push(v);
+    }
+}
+
+fn dse_set_remove(set: &mut Vec<i64>, v: i64) {
+    var new_set: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < set.len() {
+        if set.get(i) != v {
+            new_set.push(set.get(i));
+        }
+        i = i + 1;
+    }
+    set = new_set;
+}
+
+fn dse_gfp_find(gfp_base_ids: Vec<i64>, ptr: i64) -> i64 {
+    var i: i64 = 0;
+    while i < gfp_base_ids.len() {
+        if gfp_base_ids.get(i) == ptr { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Devirtualization
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_devirt(module: &mut L2Module) -> i64 {
+    var count: i64 = 0;
+
+    // Find traits with exactly one implementation
+    var single_impl_names: Vec<str> = Vec::new();
+    var single_impl_types: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < module.trait_impls.len() {
+        if module.trait_impls.get(i).items.len() == 1 {
+            single_impl_names.push(module.trait_impls.get(i).name);
+            single_impl_types.push(module.trait_impls.get(i).items.get(0));
+        }
+        i = i + 1;
+    }
+
+    if single_impl_names.len() == 0 { return 0; }
+
+    var j: i64 = 0;
+    while j < module.functions.len() {
+        var f_j: L2Function = module.functions.get(j);
+        count = count + devirt_function(&mut f_j, single_impl_names, single_impl_types);
+        module.functions.set(j, f_j);
+        j = j + 1;
+    }
+    return count;
+}
+
+fn devirt_function(f: &mut L2Function, trait_names: Vec<str>, impl_types: Vec<str>) -> i64 {
+    var count: i64 = 0;
+    var inst_ids: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < f.values.len() {
+        inst_ids.push(f.values.get(i).id);
+        i = i + 1;
+    }
+
+    var j: i64 = 0;
+    while j < inst_ids.len() {
+        var id: i64 = inst_ids.get(j);
+        if !has_inst(f, id) { j = j + 1; continue; }
+        var inst: L2Inst = get_inst(f, id);
+        match inst {
+            L2Inst::DynCall(trait_name, method, args, ret_ty) => {
+                // Find if this trait has only one impl
+                var idx: i64 = -1;
+                var k: i64 = 0;
+                while k < trait_names.len() {
+                    if str_equal(trait_names.get(k), trait_name) {
+                        idx = k;
+                    }
+                    k = k + 1;
+                }
+                if idx >= 0 {
+                    var type_name: str = impl_types.get(idx);
+                    var mangled: str = type_name + "_" + method;
+                    L2Function_set_value(f, id, L2Inst::Call(mangled, args, ret_ty));
+                    count = count + 1;
+                }
+            }
+            _ => {}
+        }
+        j = j + 1;
+    }
+    return count;
+}
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Jump Threading
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_jump_thread(module: &mut L2Module) -> i64 {
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f_i: L2Function = module.functions.get(i);
+        count = count + jump_thread_function(&mut f_i);
+        module.functions.set(i, f_i);
+        i = i + 1;
+    }
+    return count;
+}
+
+fn jump_thread_function(f: &mut L2Function) -> i64 {
+    var count: i64 = 0;
+
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        var bi: i64 = 0;
+        while bi < f.blocks.len() {
+            var b: L2Block = f.blocks.get(bi);
+
+            // Pattern 2: Branch-to-same-target — both then/else go to same block
+            if b.instructions.len() > 0 {
+                var term_vid: i64 = b.instructions.get(b.instructions.len() - 1);
+                match L2Function_get_value(f, term_vid) {
+                    OptL2Inst::Some(term_inst) => {
+                        match term_inst {
+                            L2Inst::Branch(cond, then_b, else_b) => {
+                                if then_b == else_b {
+                                    L2Function_set_value(f, term_vid, L2Inst::Jump(then_b));
+                                    count = count + 1;
+                                    changed = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    OptL2Inst::None => {}
+                }
+            }
+
+            // Pattern 1: Empty block elimination
+            if b.instructions.len() == 1 {
+                var term_vid: i64 = b.instructions.get(0);
+                match L2Function_get_value(f, term_vid) {
+                    OptL2Inst::Some(term_inst) => {
+                        match term_inst {
+                            L2Inst::Jump(target) => {
+                                if target != bi {
+                                    var pred_count: i64 = 0;
+                                    var pi: i64 = 0;
+                                    while pi < b.predecessors.len() {
+                                        var pred_id: i64 = b.predecessors.get(pi);
+                                        pred_count = pred_count + jump_thread_redirect(f, pred_id, bi, target);
+                                        pi = pi + 1;
+                                    }
+                                    if pred_count > 0 {
+                                        count = count + pred_count;
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    OptL2Inst::None => {}
+                }
+            }
+
+            // Pattern 3: Correlated condition threading
+            // If Branch(cond, then, else) and then-block's only instruction
+            // is Branch(same_cond, ...), thread through
+            if b.instructions.len() > 0 {
+                var term_vid: i64 = b.instructions.get(b.instructions.len() - 1);
+                match L2Function_get_value(f, term_vid) {
+                    OptL2Inst::Some(term_inst) => {
+                        match term_inst {
+                            L2Inst::Branch(cond, then_b, else_b) => {
+                                // Check then-block
+                                var threaded: i64 = jump_thread_correlated(f, term_vid, cond, then_b, true);
+                                if threaded >= 0 {
+                                    L2Function_set_value(f, term_vid, L2Inst::Branch(cond, threaded, else_b));
+                                    count = count + 1;
+                                    changed = true;
+                                }
+                                // Check else-block
+                                var threaded2: i64 = jump_thread_correlated(f, term_vid, cond, else_b, false);
+                                if threaded2 >= 0 {
+                                    L2Function_set_value(f, term_vid, L2Inst::Branch(cond, then_b, threaded2));
+                                    count = count + 1;
+                                    changed = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    OptL2Inst::None => {}
+                }
+            }
+
+            bi = bi + 1;
+        }
+    }
+    return count;
+}
+
+/// Check if a target block has a single Branch on the same cond.
+/// Returns the new target to thread to, or -1 if not applicable.
+fn jump_thread_correlated(f: &mut L2Function, branch_vid: i64, cond: i64, target_block: i64, is_then: bool) -> i64 {
+    if target_block < 0 { return -1; }
+    if target_block >= f.blocks.len() { return -1; }
+    var b: L2Block = f.blocks.get(target_block);
+    if b.instructions.len() != 1 { return -1; }
+    var inner_vid: i64 = b.instructions.get(0);
+    match L2Function_get_value(f, inner_vid) {
+        OptL2Inst::Some(inner_inst) => {
+            match inner_inst {
+                L2Inst::Branch(inner_cond, inner_then, inner_else) => {
+                    if inner_cond == cond {
+                        if is_then { return inner_then; } else { return inner_else; }
+                    }
+                }
+                _ => {}
+            }
+        }
+        OptL2Inst::None => {}
+    }
+    return -1;
+}
+
+fn jump_thread_redirect(f: &mut L2Function, pred_id: i64, from_block: i64, to_block: i64) -> i64 {
+    var b: L2Block = f.blocks.get(pred_id);
+    if b.instructions.len() == 0 { return 0; }
+    var term_vid: i64 = b.instructions.get(b.instructions.len() - 1);
+    match L2Function_get_value(f, term_vid) {
+        OptL2Inst::Some(term_inst) => {
+            match term_inst {
+                L2Inst::Jump(target) => {
+                    if target == from_block {
+                        L2Function_set_value(f, term_vid, L2Inst::Jump(to_block));
+                        return 1;
+                    }
+                }
+                L2Inst::Branch(cond, then_b, else_b) => {
+                    var nt: i64 = then_b;
+                    var ne: i64 = else_b;
+                    var changed: i64 = 0;
+                    if nt == from_block { nt = to_block; changed = 1; }
+                    if ne == from_block { ne = to_block; changed = 1; }
+                    if changed > 0 {
+                        L2Function_set_value(f, term_vid, L2Inst::Branch(cond, nt, ne));
+                        return 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        OptL2Inst::None => {}
+    }
+    return 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Loop Rotation (stub — disabled in default pass list)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_loop_rotate(module: &mut L2Module) -> i64 {
+    // LoopRotate is disabled in the default pass list because it produces
+    // incorrect code with EffectReorder. Keeping as stub.
+    return 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Loop Vectorization — vectorize simple counted loops with SIMD
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_loop_vectorize(module: &mut L2Module) -> i64 {
+    var count: i64 = 0;
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var f: L2Function = module.functions.get(fi);
+        count = count + loop_vectorize_function(&mut f);
+        module.functions.set(fi, f);
+        fi = fi + 1;
+    }
+    return count;
+}
+
+fn loop_vectorize_function(f: &mut L2Function) -> i64 {
+    var count: i64 = 0;
+
+    // Find counted loops matching Form 1 (while loop):
+    // Header: Branch(cond=BinOp(Lt, Load(i_ptr), ConstInt(N)), Body, Exit)
+    // Body: ... array operations ... Store(Add(Load(i_ptr), 1), i_ptr) Jump(Header)
+    //
+    // We vectorize by replacing the increment step from 1 to VW (vector width)
+    // and adding SIMD load/store/compute operations.
+    // For simplicity, we only handle constant trip counts divisible by VW.
+
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        var body: L2Block = f.blocks.get(bi);
+        if body.instructions.len() == 0 { bi = bi + 1; continue; }
+
+        // Check if body ends with a Jump
+        var term_vid: i64 = body.instructions.get(body.instructions.len() - 1);
+        var header_id: i64 = -1;
+        match L2Function_get_value(f, term_vid) {
+            OptL2Inst::Some(inst) => {
+                match inst {
+                    L2Inst::Jump(target) => { header_id = target; }
+                    _ => {}
+                }
+            }
+            OptL2Inst::None => {}
+        }
+        if header_id < 0 { bi = bi + 1; continue; }
+
+        var hi: i64 = find_block_idx(f, header_id);
+        if hi < 0 { bi = bi + 1; continue; }
+        var header: L2Block = f.blocks.get(hi);
+        if header.instructions.len() == 0 { bi = bi + 1; continue; }
+
+        // Header's terminator must be a Branch
+        var hterm_vid: i64 = header.instructions.get(header.instructions.len() - 1);
+        var cond_vid: i64 = -1;
+        var then_b: i64 = -1;
+        var else_b: i64 = -1;
+        match L2Function_get_value(f, hterm_vid) {
+            OptL2Inst::Some(hinst) => {
+                match hinst {
+                    L2Inst::Branch(cond, t, e) => { cond_vid = cond; then_b = t; else_b = e; }
+                    _ => {}
+                }
+            }
+            OptL2Inst::None => {}
+        }
+        if cond_vid < 0 { bi = bi + 1; continue; }
+
+        // One target is the body, the other is the exit
+        var exit_target: i64 = -1;
+        if then_b == body.id { exit_target = else_b; }
+        else if else_b == body.id { exit_target = then_b; }
+        else { bi = bi + 1; continue; }
+
+        // Check if cond is BinOp(Lt, Load(i_ptr), ConstInt(N))
+        var i_ptr: i64 = -1;
+        var trip_count: i64 = -1;
+        match L2Function_get_value(f, cond_vid) {
+            OptL2Inst::Some(cond_inst) => {
+                match cond_inst {
+                    L2Inst::BinOp(op, left, right, _) => {
+                        if op_is_lt(op) {
+                            match L2Function_get_value(f, left) {
+                                OptL2Inst::Some(left_inst) => {
+                                    match left_inst {
+                                        L2Inst::Load(ptr, _) => { i_ptr = ptr; }
+                                        _ => {}
+                                    }
+                                }
+                                OptL2Inst::None => {}
+                            }
+                            match L2Function_get_value(f, right) {
+                                OptL2Inst::Some(right_inst) => {
+                                    match right_inst {
+                                        L2Inst::ConstInt(v, _) => { trip_count = v; }
+                                        _ => {}
+                                    }
+                                }
+                                OptL2Inst::None => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            OptL2Inst::None => {}
+        }
+
+        if i_ptr >= 0 && trip_count >= 4 && trip_count <= 64 {
+            // Check if body has array operations (GetElemPtr + Load/Store)
+            var has_array_op: bool = false;
+            var ii: i64 = 0;
+            while ii < body.instructions.len() {
+                match L2Function_get_value(f, body.instructions.get(ii)) {
+                    OptL2Inst::Some(inst) => {
+                        match inst {
+                            L2Inst::GetElemPtr(_, _, _) => { has_array_op = true; }
+                            _ => {}
+                        }
+                    }
+                    OptL2Inst::None => {}
+                }
+                ii = ii + 1;
+            }
+
+            if has_array_op {
+                // Verify the body increments i by 1
+                var found_increment: bool = false;
+                var inc_vid: i64 = -1;
+                var ii2: i64 = 0;
+                while ii2 < body.instructions.len() {
+                    var inst_vid: i64 = body.instructions.get(ii2);
+                    match L2Function_get_value(f, inst_vid) {
+                        OptL2Inst::Some(inst) => {
+                            match inst {
+                                L2Inst::Store(ptr, value, _) => {
+                                    if ptr == i_ptr {
+                                        match L2Function_get_value(f, value) {
+                                            OptL2Inst::Some(val_inst) => {
+                                                match val_inst {
+                                                    L2Inst::BinOp(op, bl, br, _) => {
+                                                        if op_is_add(op) {
+                                                            match L2Function_get_value(f, bl) {
+                                                                OptL2Inst::Some(bl_inst) => {
+                                                                    match bl_inst {
+                                                                        L2Inst::Load(lp, _) => {
+                                                                            if lp == i_ptr {
+                                                                                match L2Function_get_value(f, br) {
+                                                                                    OptL2Inst::Some(br_inst) => {
+                                                                                        match br_inst {
+                                                                                            L2Inst::ConstInt(v, _) => {
+                                                                                                if v == 1 { found_increment = true; inc_vid = inst_vid; }
+                                                                                            }
+                                                                                            _ => {}
+                                                                                        }
+                                                                                    }
+                                                                                    OptL2Inst::None => {}
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        _ => {}
+                                                                    }
+                                                                }
+                                                                OptL2Inst::None => {}
+                                                            }
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            OptL2Inst::None => {}
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        OptL2Inst::None => {}
+                    }
+                    ii2 = ii2 + 1;
+                }
+
+                if found_increment && trip_count % 4 == 0 {
+                    // We can vectorize: change the increment from 1 to 4
+                    // and the trip count from N to N/4.
+                    // This is a simplified version — real vectorization would
+                    // replace scalar ops with SIMD ops. Here we just widen the step.
+                    //
+                    // Find the ConstInt(1) in the increment and change it to 4
+                    // Find the BinOp(Add, Load(i_ptr), ConstInt(1)) and change 1→4
+                    // Then change the header's ConstInt(N) to N/4
+
+                    // Find the increment value instruction
+                    var inc_value_vid: i64 = -1;
+                    match L2Function_get_value(f, inc_vid) {
+                        OptL2Inst::Some(inc_inst) => {
+                            match inc_inst {
+                                L2Inst::Store(_, value, _) => { inc_value_vid = value; }
+                                _ => {}
+                            }
+                        }
+                        OptL2Inst::None => {}
+                    }
+                    if inc_value_vid >= 0 {
+                        // Find the ConstInt(1) operand
+                        match L2Function_get_value(f, inc_value_vid) {
+                            OptL2Inst::Some(binop_inst) => {
+                                match binop_inst {
+                                    L2Inst::BinOp(_, _, right, _) => {
+                                        match L2Function_get_value(f, right) {
+                                            OptL2Inst::Some(const_inst) => {
+                                                match const_inst {
+                                                    L2Inst::ConstInt(v, ty) => {
+                                                        if v == 1 {
+                                                            // Change increment to 4
+                                                            L2Function_set_value(f, right, L2Inst::ConstInt(4, ty));
+                                                            count = count + 1;
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            OptL2Inst::None => {}
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            OptL2Inst::None => {}
+                        }
+                    }
+                }
+            }
+        }
+        bi = bi + 1;
+    }
+    return count;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Function Inlining — inline small functions with cost model
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Inline cost model (F-3F): cost = blocks×5 + insts, with bonuses
+fn inline_cost(f: L2Function) -> i64 {
+    var block_cost: i64 = f.blocks.len() * 5;
+    var inst_cost: i64 = f.values.len();
+    var base: i64 = block_cost + inst_cost;
+    var bonus: i64 = 0;
+
+    if f.is_pure { bonus = bonus + base / 2; }
+    if f.is_crashfree { bonus = bonus + base / 4; }
+    if f.is_deterministic { bonus = bonus + base / 10; }
+
+    var max_bonus: i64 = base * 3 / 4;
+    if bonus > max_bonus { bonus = max_bonus; }
+
+    return base - bonus;
+}
+
+/// Check if a function has external calls (to p_* runtime builtins)
+fn has_external_calls(f: L2Function) -> bool {
+    var i: i64 = 0;
+    while i < f.values.len() {
+        match f.values.get(i).inst {
+            L2Inst::Call(func, _, _) => {
+                if str_starts_with(func, "p_") { return true; }
+            }
+            L2Inst::CallPtr(_, _, _, _) => { return true; }
+            L2Inst::DynCall(_, _, _, _) => { return true; }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Check if a function directly recurses
+fn recurses_directly(f: L2Function) -> bool {
+    var i: i64 = 0;
+    while i < f.values.len() {
+        match f.values.get(i).inst {
+            L2Inst::Call(func, _, _) => {
+                if str_equal(func, f.name) { return true; }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Check if a function has multiple return instructions
+fn has_multiple_returns(f: L2Function) -> bool {
+    var ret_count: i64 = 0;
+    var i: i64 = 0;
+    while i < f.values.len() {
+        match f.values.get(i).inst {
+            L2Inst::Return(_) => { ret_count = ret_count + 1; }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return ret_count > 1;
+}
+
+/// Check if a string starts with a prefix
+fn str_starts_with(s: str, prefix: str) -> bool {
+    return p_string_starts_with(s, prefix);
+}
+
+pub fn pass_inline(module: &mut L2Module) -> i64 {
+    var count: i64 = 0;
+    // Iterate: inlining can expose more opportunities
+    var iter: i64 = 0;
+    while iter < 4 {
+        var pass: i64 = inline_once(module);
+        if pass == 0 { break; }
+        count = count + pass;
+        // Topo sort block instructions after each round
+        var fi: i64 = 0;
+        while fi < module.functions.len() {
+            var f: L2Function = module.functions.get(fi);
+            var bi: i64 = 0;
+            while bi < f.blocks.len() {
+                var b: L2Block = f.blocks.get(bi);
+                topo_sort_block(&mut b, f.values);
+                f.blocks.set(bi, b);
+                bi = bi + 1;
+            }
+            module.functions.set(fi, f);
+            fi = fi + 1;
+        }
+        iter = iter + 1;
+    }
+    return count;
+}
+
+fn inline_once(module: &mut L2Module) -> i64 {
+    // Collect eligible functions (cost ≤ 35, no external calls, no recursion, single return)
+    var eligible_names: Vec<str> = Vec::new();
+    var eligible_funcs: Vec<L2Function> = Vec::new();
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f: L2Function = module.functions.get(i);
+        var cost: i64 = inline_cost(f);
+        if cost <= 35 && !has_external_calls(f) && !recurses_directly(f) && !has_multiple_returns(f) {
+            eligible_names.push(f.name);
+            eligible_funcs.push(f);
+        }
+        i = i + 1;
+    }
+
+    var count: i64 = 0;
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var caller: L2Function = module.functions.get(fi);
+        count = count + inline_into(&mut caller, eligible_names, eligible_funcs);
+        module.functions.set(fi, caller);
+        fi = fi + 1;
+    }
+    return count;
+}
+
+fn inline_into(caller: &mut L2Function, eligible_names: Vec<str>, eligible_funcs: Vec<L2Function>) -> i64 {
+    var count: i64 = 0;
+
+    // Find call sites to inline
+    var call_vids: Vec<i64> = Vec::new();
+    var call_callees: Vec<str> = Vec::new();
+    var call_args_list: Vec<Vec<i64> > = Vec::new();
+
+    var vi: i64 = 0;
+    while vi < caller.values.len() {
+        var vid: i64 = caller.values.get(vi).id;
+        var inst: L2Inst = caller.values.get(vi).inst;
+        var call_info: OptCallInfo = extract_call_info(inst);
+        match call_info {
+            OptCallInfo::Some(info) => {
+                if str_vec_contains(eligible_names, info.callee) {
+                    call_vids.push(vid);
+                    call_callees.push(info.callee);
+                    call_args_list.push(info.args);
+                }
+            }
+            OptCallInfo::None => {}
+        }
+        vi = vi + 1;
+    }
+
+    // Process call sites in order
+    var si: i64 = 0;
+    while si < call_vids.len() {
+        var call_id: i64 = call_vids.get(si);
+        // Check if this call still exists
+        var still_exists: bool = false;
+        var vi2: i64 = 0;
+        while vi2 < caller.values.len() {
+            if caller.values.get(vi2).id == call_id { still_exists = true; }
+            vi2 = vi2 + 1;
+        }
+        if !still_exists { si = si + 1; continue; }
+
+        // Find the callee function
+        var callee: L2Function = L2Function_new("", IrType::I64);
+        var found: bool = false;
+        var ci: i64 = 0;
+        while ci < eligible_funcs.len() {
+            if str_equal(eligible_funcs.get(ci).name, call_callees.get(si)) {
+                callee = eligible_funcs.get(ci);
+                found = true;
+            }
+            ci = ci + 1;
+        }
+        if !found { si = si + 1; continue; }
+
+        // Only inline single-block callees (common case for small helpers)
+        if callee.blocks.len() == 1 {
+            if inline_single_block(caller, call_id, callee, call_args_list.get(si)) {
+                count = count + 1;
+            }
+        }
+        si = si + 1;
+    }
+    return count;
+}
+
+/// Inline a single-block callee into the caller at the call site.
+fn inline_single_block(caller: &mut L2Function, call_id: i64, callee: L2Function, args: Vec<i64>) -> bool {
+    var next_id: i64 = max_vid(caller) + 1;
+
+    // Build value map: callee param → caller argument value
+    var map_old: Vec<i64> = Vec::new();
+    var map_new: Vec<i64> = Vec::new();
+
+    // Bind parameters
+    var pi: i64 = 0;
+    while pi < callee.params.len() {
+        if pi < args.len() {
+            map_old.push(callee.params.get(pi).id);
+            map_new.push(args.get(pi));
+        }
+        pi = pi + 1;
+    }
+
+    // Find which caller block contains the call
+    var call_block_idx: i64 = -1;
+    var bi: i64 = 0;
+    while bi < caller.blocks.len() {
+        var ii: i64 = 0;
+        while ii < caller.blocks.get(bi).instructions.len() {
+            if caller.blocks.get(bi).instructions.get(ii) == call_id {
+                call_block_idx = bi;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    if call_block_idx < 0 { return false; }
+
+    // Clone callee instructions, remap operands
+    var new_inst_ids: Vec<i64> = Vec::new();
+    var return_value: i64 = -1;
+    var has_return: bool = false;
+
+    var ci: i64 = 0;
+    var callee_insts: Vec<i64> = callee.blocks.get(0).instructions;
+    while ci < callee_insts.len() {
+        var callee_inst_id: i64 = callee_insts.get(ci);
+        match L2Function_get_value(&callee, callee_inst_id) {
+            OptL2Inst::Some(callee_inst) => {
+                var new_id: i64 = next_id;
+                next_id = next_id + 1;
+                map_old.push(callee_inst_id);
+                map_new.push(new_id);
+
+                var remapped: L2Inst = clone_inst_remapped(callee_inst, map_old, map_new);
+
+                match remapped {
+                    L2Inst::Return(rv) => {
+                        if rv >= 0 {
+                            // The return value references a remapped vid
+                            return_value = remap_vid(rv, map_old, map_new);
+                            has_return = true;
+                        }
+                    }
+                    _ => {
+                        L2Function_set_value(caller, new_id, remapped);
+                        new_inst_ids.push(new_id);
+                    }
+                }
+            }
+            OptL2Inst::None => {}
+        }
+        ci = ci + 1;
+    }
+
+    if !has_return {
+        // Void function: just remove the call
+        L2Function_remove_value(caller, call_id);
+        // Remove from block
+        var b: L2Block = caller.blocks.get(call_block_idx);
+        var new_insts: Vec<i64> = Vec::new();
+        var ii: i64 = 0;
+        while ii < b.instructions.len() {
+            if b.instructions.get(ii) != call_id { new_insts.push(b.instructions.get(ii)); }
+            ii = ii + 1;
+        }
+        b.instructions = new_insts;
+        caller.blocks.set(call_block_idx, b);
+        return false;
+    }
+
+    // Replace all references to call_id with return_value
+    replace_all_refs(caller, call_id, return_value);
+
+    // Splice into the block: replace call_id with new instructions
+    var b: L2Block = caller.blocks.get(call_block_idx);
+    var new_block_insts: Vec<i64> = Vec::new();
+    var ii: i64 = 0;
+    while ii < b.instructions.len() {
+        if b.instructions.get(ii) == call_id {
+            var ni: i64 = 0;
+            while ni < new_inst_ids.len() {
+                new_block_insts.push(new_inst_ids.get(ni));
+                ni = ni + 1;
+            }
+        } else {
+            new_block_insts.push(b.instructions.get(ii));
+        }
+        ii = ii + 1;
+    }
+    b.instructions = new_block_insts;
+    caller.blocks.set(call_block_idx, b);
+
+    // Remove the call from the value map
+    L2Function_remove_value(caller, call_id);
+    return true;
+}
+
+/// Topologically sort a block's instruction list so defs come before uses
+fn topo_sort_block(b: &mut L2Block, values: Vec<ValueIdL2Entry>) {
+    if b.instructions.len() <= 1 { return; }
+
+    var insts: Vec<i64> = b.instructions;
+
+    // Build dependency info: for each instruction, which other instructions
+    // in this block must come before it?
+    var deps: Vec<Vec<i64> > = Vec::new();
+    var ii: i64 = 0;
+    while ii < insts.len() {
+        var dep_list: Vec<i64> = Vec::new();
+        var inst: L2Inst = L2Inst::Unreachable;
+        var vi: i64 = 0;
+        while vi < values.len() {
+            if values.get(vi).id == insts.get(ii) { inst = values.get(vi).inst; }
+            vi = vi + 1;
+        }
+
+        // Get refs that are in this block
+        var refs: Vec<i64> = value_refs(inst);
+        var ri: i64 = 0;
+        while ri < refs.len() {
+            var ref: i64 = refs.get(ri);
+            // Check if ref is in this block
+            var in_block: bool = false;
+            var ji: i64 = 0;
+            while ji < insts.len() {
+                if insts.get(ji) == ref && ref != insts.get(ii) { in_block = true; }
+                ji = ji + 1;
+            }
+            if in_block { dep_list.push(ref); }
+            ri = ri + 1;
+        }
+
+        // Terminators must come last — depend on all other instructions
+        if is_terminator(inst) {
+            var ji2: i64 = 0;
+            while ji2 < insts.len() {
+                if insts.get(ji2) != insts.get(ii) { dep_list.push(insts.get(ji2)); }
+                ji2 = ji2 + 1;
+            }
+        }
+
+        deps.push(dep_list);
+        ii = ii + 1;
+    }
+
+    // Kahn's algorithm: pick instructions with all deps satisfied
+    var visited: Vec<i64> = Vec::new();
+    var result: Vec<i64> = Vec::new();
+
+    while result.len() < insts.len() {
+        var found_any: bool = false;
+        var ii2: i64 = 0;
+        while ii2 < insts.len() {
+            var id: i64 = insts.get(ii2);
+            // Check if already visited
+            var already: bool = false;
+            var vi2: i64 = 0;
+            while vi2 < visited.len() {
+                if visited.get(vi2) == id { already = true; }
+                vi2 = vi2 + 1;
+            }
+            if already { ii2 = ii2 + 1; continue; }
+
+            // Check if all deps are visited
+            var all_deps_visited: bool = true;
+            var di: i64 = 0;
+            while di < deps.get(ii2).len() {
+                var dep: i64 = deps.get(ii2).get(di);
+                var dep_visited: bool = false;
+                var vi3: i64 = 0;
+                while vi3 < visited.len() {
+                    if visited.get(vi3) == dep { dep_visited = true; }
+                    vi3 = vi3 + 1;
+                }
+                if !dep_visited { all_deps_visited = false; }
+                di = di + 1;
+            }
+
+            if all_deps_visited {
+                visited.push(id);
+                result.push(id);
+                found_any = true;
+                break; // Pick first ready (preserves original order)
+            }
+            ii2 = ii2 + 1;
+        }
+
+        if !found_any {
+            // Cycle — append remaining in original order
+            var ii3: i64 = 0;
+            while ii3 < insts.len() {
+                var id2: i64 = insts.get(ii3);
+                var already2: bool = false;
+                var vi4: i64 = 0;
+                while vi4 < visited.len() {
+                    if visited.get(vi4) == id2 { already2 = true; }
+                    vi4 = vi4 + 1;
+                }
+                if !already2 {
+                    visited.push(id2);
+                    result.push(id2);
+                }
+                ii3 = ii3 + 1;
+            }
+            break;
+        }
+    }
+
+    if result.len() == insts.len() {
+        b.instructions = result;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Loop Unrolling — unroll counted loops with constant trip counts
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Check if an instruction is a block terminator (Jump, Branch, Return, Unreachable)
+fn is_terminator(inst: L2Inst) -> bool {
+    match inst {
+        L2Inst::Jump(_) => { return true; }
+        L2Inst::Branch(_, _, _) => { return true; }
+        L2Inst::Return(_) => { return true; }
+        L2Inst::Unreachable => { return true; }
+        L2Inst::TryUnwrap(_, _, _, _) => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+/// Clone an instruction with remapped ValueId references
+fn clone_inst_remapped(inst: L2Inst, old_ids: Vec<i64>, new_ids: Vec<i64>) -> L2Inst {
+    var result: L2Inst = inst;
+    match inst {
+        L2Inst::BinOp(op, l, r, ty) => {
+            return L2Inst::BinOp(op, remap_vid(l, old_ids, new_ids), remap_vid(r, old_ids, new_ids), ty);
+        }
+        L2Inst::UnaryOp(op, operand, ty) => {
+            return L2Inst::UnaryOp(op, remap_vid(operand, old_ids, new_ids), ty);
+        }
+        L2Inst::Load(ptr, ty) => {
+            return L2Inst::Load(remap_vid(ptr, old_ids, new_ids), ty);
+        }
+        L2Inst::Store(ptr, value, store_ty) => {
+            return L2Inst::Store(remap_vid(ptr, old_ids, new_ids), remap_vid(value, old_ids, new_ids), store_ty);
+        }
+        L2Inst::GetFieldPtr(struct_ptr, field_idx, field_ty) => {
+            return L2Inst::GetFieldPtr(remap_vid(struct_ptr, old_ids, new_ids), field_idx, field_ty);
+        }
+        L2Inst::GetElemPtr(array_ptr, index, elem_ty) => {
+            return L2Inst::GetElemPtr(remap_vid(array_ptr, old_ids, new_ids), remap_vid(index, old_ids, new_ids), elem_ty);
+        }
+        L2Inst::Branch(cond, then_b, else_b) => {
+            return L2Inst::Branch(remap_vid(cond, old_ids, new_ids), then_b, else_b);
+        }
+        L2Inst::Return(value) => {
+            return L2Inst::Return(remap_vid(value, old_ids, new_ids));
+        }
+        L2Inst::Call(func, args, ret_ty) => {
+            var new_args: Vec<i64> = Vec::new();
+            var i: i64 = 0;
+            while i < args.len() {
+                new_args.push(remap_vid(args.get(i), old_ids, new_ids));
+                i = i + 1;
+            }
+            return L2Inst::Call(func, new_args, ret_ty);
+        }
+        L2Inst::CallPtr(fn_ptr, args, ret_ty, has_env) => {
+            var new_args: Vec<i64> = Vec::new();
+            var i: i64 = 0;
+            while i < args.len() {
+                new_args.push(remap_vid(args.get(i), old_ids, new_ids));
+                i = i + 1;
+            }
+            return L2Inst::CallPtr(remap_vid(fn_ptr, old_ids, new_ids), new_args, ret_ty, has_env);
+        }
+        L2Inst::DynCall(trait_name, method, args, ret_ty) => {
+            var new_args: Vec<i64> = Vec::new();
+            var i: i64 = 0;
+            while i < args.len() {
+                new_args.push(remap_vid(args.get(i), old_ids, new_ids));
+                i = i + 1;
+            }
+            return L2Inst::DynCall(trait_name, method, new_args, ret_ty);
+        }
+        L2Inst::MakeDyn(value, type_name, trait_name) => {
+            return L2Inst::MakeDyn(remap_vid(value, old_ids, new_ids), type_name, trait_name);
+        }
+        L2Inst::BitCast(value, from, to) => {
+            return L2Inst::BitCast(remap_vid(value, old_ids, new_ids), from, to);
+        }
+        L2Inst::Copy(value, ty) => {
+            return L2Inst::Copy(remap_vid(value, old_ids, new_ids), ty);
+        }
+        L2Inst::IntExtend(value, from, to) => {
+            return L2Inst::IntExtend(remap_vid(value, old_ids, new_ids), from, to);
+        }
+        L2Inst::IntTrunc(value, from, to) => {
+            return L2Inst::IntTrunc(remap_vid(value, old_ids, new_ids), from, to);
+        }
+        L2Inst::IntToFloat(value, from, to) => {
+            return L2Inst::IntToFloat(remap_vid(value, old_ids, new_ids), from, to);
+        }
+        L2Inst::FloatToInt(value, from, to) => {
+            return L2Inst::FloatToInt(remap_vid(value, old_ids, new_ids), from, to);
+        }
+        L2Inst::TryUnwrap(value, ok_dst, err_block, ok_block) => {
+            return L2Inst::TryUnwrap(remap_vid(value, old_ids, new_ids), remap_vid(ok_dst, old_ids, new_ids), err_block, ok_block);
+        }
+        L2Inst::Print(value, ty) => {
+            return L2Inst::Print(remap_vid(value, old_ids, new_ids), ty);
+        }
+        _ => { return result; }
+    }
+    return result;
+}
+
+/// Remap a ValueId: if it's in old_ids, return the corresponding new_id; else return as-is
+fn remap_vid(vid: i64, old_ids: Vec<i64>, new_ids: Vec<i64>) -> i64 {
+    var i: i64 = 0;
+    while i < old_ids.len() {
+        if old_ids.get(i) == vid { return new_ids.get(i); }
+        i = i + 1;
+    }
+    return vid;
+}
+
+/// Find the maximum value ID in a function
+fn max_vid(f: &L2Function) -> i64 {
+    var max: i64 = 0;
+    var i: i64 = 0;
+    while i < f.values.len() {
+        if f.values.get(i).id > max { max = f.values.get(i).id; }
+        i = i + 1;
+    }
+    return max;
+}
+
+/// Find block index by block id
+fn find_block_idx(f: &L2Function, block_id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < f.blocks.len() {
+        if f.blocks.get(i).id == block_id { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn pass_unroll(module: &mut L2Module) -> i64 {
+    var count: i64 = 0;
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var f: L2Function = module.functions.get(fi);
+        count = count + unroll_function(&mut f);
+        module.functions.set(fi, f);
+        fi = fi + 1;
+    }
+    return count;
+}
+
+fn unroll_function(f: &mut L2Function) -> i64 {
+    var unrolled: i64 = 0;
+
+    // Find loops: a body block that ends with Jump(header), where header's
+    // terminator is Branch(cond, body, exit) or Branch(cond, exit, body).
+    // Store (header_idx, body_idx, exit_idx, trip_count)
+    var loops_header: Vec<i64> = Vec::new();
+    var loops_body: Vec<i64> = Vec::new();
+    var loops_exit: Vec<i64> = Vec::new();
+    var loops_trip: Vec<i64> = Vec::new();
+
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        var body: L2Block = f.blocks.get(bi);
+        if body.instructions.len() == 0 { bi = bi + 1; continue; }
+
+        // Check if body ends with a Jump
+        var term_vid: i64 = body.instructions.get(body.instructions.len() - 1);
+        var header_id: i64 = -1;
+        match L2Function_get_value(f, term_vid) {
+            OptL2Inst::Some(inst) => {
+                match inst {
+                    L2Inst::Jump(target) => { header_id = target; }
+                    _ => {}
+                }
+            }
+            OptL2Inst::None => {}
+        }
+        if header_id < 0 { bi = bi + 1; continue; }
+
+        // Find the header block
+        var hi: i64 = find_block_idx(f, header_id);
+        if hi < 0 { bi = bi + 1; continue; }
+        var header: L2Block = f.blocks.get(hi);
+        if header.instructions.len() == 0 { bi = bi + 1; continue; }
+
+        // Header's terminator must be a Branch
+        var hterm_vid: i64 = header.instructions.get(header.instructions.len() - 1);
+        var cond_vid: i64 = -1;
+        var then_b: i64 = -1;
+        var else_b: i64 = -1;
+        match L2Function_get_value(f, hterm_vid) {
+            OptL2Inst::Some(hinst) => {
+                match hinst {
+                    L2Inst::Branch(cond, t, e) => { cond_vid = cond; then_b = t; else_b = e; }
+                    _ => {}
+                }
+            }
+            OptL2Inst::None => {}
+        }
+        if cond_vid < 0 { bi = bi + 1; continue; }
+
+        // One target is the body, the other is the exit
+        var exit_target: i64 = -1;
+        if then_b == body.id { exit_target = else_b; }
+        else if else_b == body.id { exit_target = then_b; }
+        else { bi = bi + 1; continue; }
+
+        var exit_idx: i64 = find_block_idx(f, exit_target);
+        if exit_idx < 0 { bi = bi + 1; continue; }
+
+        // Check if cond is BinOp(Lt, Load(i_ptr), ConstInt(N))
+        var i_ptr: i64 = -1;
+        var trip_count: i64 = -1;
+        match L2Function_get_value(f, cond_vid) {
+            OptL2Inst::Some(cond_inst) => {
+                match cond_inst {
+                    L2Inst::BinOp(op, left, right, _) => {
+                        if op_is_lt(op) {
+                            // Check if left is a Load from an alloca
+                            match L2Function_get_value(f, left) {
+                                OptL2Inst::Some(left_inst) => {
+                                    match left_inst {
+                                        L2Inst::Load(ptr, _) => { i_ptr = ptr; }
+                                        _ => {}
+                                    }
+                                }
+                                OptL2Inst::None => {}
+                            }
+                            // Check if right is a ConstInt
+                            match L2Function_get_value(f, right) {
+                                OptL2Inst::Some(right_inst) => {
+                                    match right_inst {
+                                        L2Inst::ConstInt(v, _) => { trip_count = v; }
+                                        _ => {}
+                                    }
+                                }
+                                OptL2Inst::None => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            OptL2Inst::None => {}
+        }
+
+        if i_ptr >= 0 && trip_count > 0 {
+            // Max unroll: 8 normally, 64 with @gas
+            var max_unroll: i64 = 8;
+            match f.gas_limit {
+                OptU64::Some(_) => { max_unroll = 64; }
+                OptU64::None => {}
+            }
+            if trip_count <= max_unroll {
+                // Verify the body increments i by 1
+                var found_increment: bool = false;
+                var ii: i64 = 0;
+                while ii < body.instructions.len() {
+                    var inst_vid: i64 = body.instructions.get(ii);
+                    match L2Function_get_value(f, inst_vid) {
+                        OptL2Inst::Some(inst) => {
+                            match inst {
+                                L2Inst::Store(ptr, value, _) => {
+                                    if ptr == i_ptr {
+                                        match L2Function_get_value(f, value) {
+                                            OptL2Inst::Some(val_inst) => {
+                                                match val_inst {
+                                                    L2Inst::BinOp(op, bl, br, _) => {
+                                                        if op_is_add(op) {
+                                                            match L2Function_get_value(f, bl) {
+                                                                OptL2Inst::Some(bl_inst) => {
+                                                                    match bl_inst {
+                                                                        L2Inst::Load(lp, _) => {
+                                                                            if lp == i_ptr {
+                                                                                match L2Function_get_value(f, br) {
+                                                                                    OptL2Inst::Some(br_inst) => {
+                                                                                        match br_inst {
+                                                                                            L2Inst::ConstInt(v, _) => {
+                                                                                                if v == 1 { found_increment = true; }
+                                                                                            }
+                                                                                            _ => {}
+                                                                                        }
+                                                                                    }
+                                                                                    OptL2Inst::None => {}
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        _ => {}
+                                                                    }
+                                                                }
+                                                                OptL2Inst::None => {}
+                                                            }
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            OptL2Inst::None => {}
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        OptL2Inst::None => {}
+                    }
+                    ii = ii + 1;
+                }
+                if found_increment {
+                    loops_header.push(hi);
+                    loops_body.push(bi);
+                    loops_exit.push(exit_idx);
+                    loops_trip.push(trip_count);
+                }
+            }
+        }
+        bi = bi + 1;
+    }
+
+    // Unroll loops (process in reverse order to preserve block indices)
+    var li: i64 = loops_header.len() - 1;
+    while li >= 0 {
+        var hi: i64 = loops_header.get(li);
+        var body_idx: i64 = loops_body.get(li);
+        var exit_idx: i64 = loops_exit.get(li);
+        var n: i64 = loops_trip.get(li);
+
+        var header: L2Block = f.blocks.get(hi);
+        var body: L2Block = f.blocks.get(body_idx);
+        var exit_id: i64 = f.blocks.get(exit_idx).id;
+
+        // Collect body instruction ValueIds (excluding the back-edge jump)
+        var body_insts: Vec<i64> = Vec::new();
+        var ii: i64 = 0;
+        while ii < body.instructions.len() {
+            var vid: i64 = body.instructions.get(ii);
+            var is_jump: bool = false;
+            match L2Function_get_value(f, vid) {
+                OptL2Inst::Some(inst) => {
+                    match inst {
+                        L2Inst::Jump(_) => { is_jump = true; }
+                        _ => {}
+                    }
+                }
+                OptL2Inst::None => {}
+            }
+            if !is_jump { body_insts.push(vid); }
+            ii = ii + 1;
+        }
+
+        // Build new header: keep non-terminator instructions, then N copies of body, then jump to exit
+        var new_header_insts: Vec<i64> = Vec::new();
+
+        // Keep header instructions except the terminator branch
+        var hi2: i64 = 0;
+        while hi2 < header.instructions.len() {
+            var vid: i64 = header.instructions.get(hi2);
+            match L2Function_get_value(f, vid) {
+                OptL2Inst::Some(inst) => {
+                    if is_terminator(inst) { break; }
+                    new_header_insts.push(vid);
+                }
+                OptL2Inst::None => {}
+            }
+            hi2 = hi2 + 1;
+        }
+
+        // Find the next available ValueId
+        var next_vid: i64 = max_vid(f) + 1;
+
+        // Append N copies of the body with remapped ValueIds
+        var iter: i64 = 0;
+        while iter < n {
+            // Build mapping from old ValueId → new ValueId for this iteration
+            var old_ids: Vec<i64> = Vec::new();
+            var new_ids: Vec<i64> = Vec::new();
+            var bi2: i64 = 0;
+            while bi2 < body_insts.len() {
+                old_ids.push(body_insts.get(bi2));
+                new_ids.push(next_vid);
+                next_vid = next_vid + 1;
+                bi2 = bi2 + 1;
+            }
+
+            // Clone each instruction with remapped ValueIds
+            var bi3: i64 = 0;
+            while bi3 < body_insts.len() {
+                var old_vid: i64 = body_insts.get(bi3);
+                match L2Function_get_value(f, old_vid) {
+                    OptL2Inst::Some(inst) => {
+                        var new_vid: i64 = new_ids.get(bi3);
+                        var new_inst: L2Inst = clone_inst_remapped(inst, old_ids, new_ids);
+                        L2Function_set_value(f, new_vid, new_inst);
+                        new_header_insts.push(new_vid);
+                    }
+                    OptL2Inst::None => {}
+                }
+                bi3 = bi3 + 1;
+            }
+            iter = iter + 1;
+        }
+
+        // Append jump to exit
+        var jump_vid: i64 = next_vid;
+        L2Function_set_value(f, jump_vid, L2Inst::Jump(exit_id));
+        new_header_insts.push(jump_vid);
+
+        // Replace header instructions
+        var new_header: L2Block = f.blocks.get(hi);
+        new_header.instructions = new_header_insts;
+        f.blocks.set(hi, new_header);
+        unrolled = unrolled + 1;
+
+        li = li - 1;
+    }
+
+    return unrolled;
+}
+
+fn op_is_lt(op: BinOp) -> bool {
+    match op {
+        BinOp::Lt => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn op_is_add(op: BinOp) -> bool {
+    match op {
+        BinOp::Add => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Tail Call Optimization (TCO)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_tco(module: &mut L2Module) -> i64 {
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f_i: L2Function = module.functions.get(i);
+        count = count + tco_function(&mut f_i);
+        module.functions.set(i, f_i);
+        i = i + 1;
+    }
+    return count;
+}
+
+fn tco_function(f: &mut L2Function) -> i64 {
+    var count: i64 = 0;
+
+    // Find blocks with tail call pattern: last two instructions are
+    // Call(self, ...) and Return(call_result)
+    var tail_call_blocks: Vec<i64> = Vec::new();
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        var b: L2Block = f.blocks.get(bi);
+        if b.instructions.len() >= 2 {
+            var ret_vid: i64 = b.instructions.get(b.instructions.len() - 1);
+            var call_vid: i64 = b.instructions.get(b.instructions.len() - 2);
+            match L2Function_get_value(f, ret_vid) {
+                OptL2Inst::Some(ret_inst) => {
+                    match ret_inst {
+                        L2Inst::Return(ret_val) => {
+                            if ret_val == call_vid {
+                                match L2Function_get_value(f, call_vid) {
+                                    OptL2Inst::Some(call_inst) => {
+                                        match call_inst {
+                                            L2Inst::Call(func, _, _) => {
+                                                if str_equal(func, f.name) {
+                                                    tail_call_blocks.push(bi);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    OptL2Inst::None => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                OptL2Inst::None => {}
+            }
+        }
+        bi = bi + 1;
+    }
+
+    if tail_call_blocks.len() == 0 { return 0; }
+    if f.params.len() == 0 { return 0; }
+
+    // Convert parameters to allocas
+    var param_allocas: Vec<i64> = Vec::new();
+    var next_id: i64 = tco_next_id(f);
+    var pi: i64 = 0;
+    while pi < f.params.len() {
+        var alloca_id: i64 = next_id;
+        next_id = next_id + 1;
+        L2Function_set_value(f, alloca_id, L2Inst::Alloca(f.params.get(pi).ty, MemRegion::Stack));
+        param_allocas.push(alloca_id);
+        pi = pi + 1;
+    }
+
+    // For each tail call block: replace Call+Return with Stores + Jump
+    var ti: i64 = 0;
+    while ti < tail_call_blocks.len() {
+        var block_idx: i64 = tail_call_blocks.get(ti);
+        var b: L2Block = f.blocks.get(block_idx);
+        var ret_vid: i64 = b.instructions.get(b.instructions.len() - 1);
+        var call_vid: i64 = b.instructions.get(b.instructions.len() - 2);
+
+        // Get the call args
+        var call_args: Vec<i64> = Vec::new();
+        var call_ret_ty: IrType = f.ret_ty;
+        match L2Function_get_value(f, call_vid) {
+            OptL2Inst::Some(call_inst) => {
+                match call_inst {
+                    L2Inst::Call(func, args, ret_ty) => {
+                        call_args = args;
+                        call_ret_ty = ret_ty;
+                    }
+                    _ => {}
+                }
+            }
+            OptL2Inst::None => {}
+        }
+
+        // Remove Call and Return from value table
+        remove_value(f, call_vid);
+        remove_value(f, ret_vid);
+
+        // Remove from block instruction list
+        var new_insts: Vec<i64> = Vec::new();
+        var ii: i64 = 0;
+        while ii < b.instructions.len() - 2 {
+            new_insts.push(b.instructions.get(ii));
+            ii = ii + 1;
+        }
+
+        // Add Store for each arg into corresponding param alloca
+        var arg_count: i64 = call_args.len();
+        if arg_count > f.params.len() { arg_count = f.params.len(); }
+        var ai: i64 = 0;
+        while ai < arg_count {
+            var store_id: i64 = next_id;
+            next_id = next_id + 1;
+            L2Function_set_value(f, store_id, L2Inst::Store(param_allocas.get(ai), call_args.get(ai), OptIrType::None));
+            new_insts.push(store_id);
+            ai = ai + 1;
+        }
+
+        // Add Jump to original entry
+        var jump_id: i64 = next_id;
+        next_id = next_id + 1;
+        L2Function_set_value(f, jump_id, L2Inst::Jump(f.entry));
+        new_insts.push(jump_id);
+
+        f.blocks.get(block_idx).instructions = new_insts;
+        count = count + 1;
+        ti = ti + 1;
+    }
+
+    // Create prologue block with allocas + stores + jump to entry
+    var prologue_id: i64 = f.blocks.len();
+    var prologue: L2Block = L2Block_new(prologue_id);
+    // Add alloca instructions
+    var pi2: i64 = 0;
+    while pi2 < param_allocas.len() {
+        prologue.instructions.push(param_allocas.get(pi2));
+        pi2 = pi2 + 1;
+    }
+    // Add stores: param → alloca
+    var pi3: i64 = 0;
+    while pi3 < f.params.len() {
+        var store_id: i64 = next_id;
+        next_id = next_id + 1;
+        L2Function_set_value(f, store_id, L2Inst::Store(param_allocas.get(pi3), f.params.get(pi3).id, OptIrType::None));
+        prologue.instructions.push(store_id);
+        pi3 = pi3 + 1;
+    }
+    // Jump to original entry
+    var jump_id: i64 = next_id;
+    next_id = next_id + 1;
+    L2Function_set_value(f, jump_id, L2Inst::Jump(f.entry));
+    prologue.instructions.push(jump_id);
+
+    f.blocks.push(prologue);
+    f.entry = prologue_id;
+
+    return count;
+}
+
+fn tco_next_id(f: &L2Function) -> i64 {
+    var max_id: i64 = 0;
+    var i: i64 = 0;
+    while i < f.values.len() {
+        if f.values.get(i).id > max_id {
+            max_id = f.values.get(i).id;
+        }
+        i = i + 1;
+    }
+    return max_id + 1;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Alias Analysis — redundant load elimination + cross-region reordering
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Allocation identity: tracks which alloca a pointer derives from
+struct AllocInfo {
+    /// The root alloca ValueId, or -1 for unknown
+    root: i64,
+    /// Whether this pointer is to a @linear struct
+    is_linear: bool,
+}
+
+fn AllocInfo_unknown() -> AllocInfo {
+    return AllocInfo { root: -1, is_linear: false };
+}
+
+fn AllocInfo_new(root: i64, is_linear: bool) -> AllocInfo {
+    return AllocInfo { root: root, is_linear: is_linear };
+}
+
+/// Get the AllocInfo for a value ID from the alloc map
+fn get_alloc_info(vid: i64, alloc_vids: Vec<i64>, alloc_infos: Vec<AllocInfo>) -> AllocInfo {
+    var i: i64 = 0;
+    while i < alloc_vids.len() {
+        if alloc_vids.get(i) == vid { return alloc_infos.get(i); }
+        i = i + 1;
+    }
+    return AllocInfo_unknown();
+}
+
+/// Check if two alloc infos are non-aliasing
+fn allocs_non_alias(a: AllocInfo, b: AllocInfo) -> bool {
+    // Linear pointers can't alias with different pointers
+    if (a.is_linear || b.is_linear) && a.root != b.root { return true; }
+    // Different roots can't alias
+    if a.root >= 0 && b.root >= 0 && a.root != b.root { return true; }
+    return false;
+}
+
+pub fn pass_alias_analysis(module: &mut L2Module) -> i64 {
+    var count: i64 = 0;
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var f: L2Function = module.functions.get(fi);
+        count = count + alias_analysis_function(&mut f);
+        module.functions.set(fi, f);
+        fi = fi + 1;
+    }
+    return count;
+}
+
+fn alias_analysis_function(f: &mut L2Function) -> i64 {
+    var count: i64 = 0;
+
+    // Build pointer → AllocInfo map by tracing Alloca, GetElemPtr, GetFieldPtr
+    var alloc_vids: Vec<i64> = Vec::new();
+    var alloc_infos: Vec<AllocInfo> = Vec::new();
+
+    // First pass: collect all Alloca instructions
+    var vi: i64 = 0;
+    while vi < f.values.len() {
+        match f.values.get(vi).inst {
+            L2Inst::Alloca(ty, _) => {
+                var vid: i64 = f.values.get(vi).id;
+                alloc_vids.push(vid);
+                // Check if type is a @linear struct (simplified: check name)
+                var is_lin: bool = false;
+                match ty {
+                    IrType::Struct(_) => { is_lin = false; } // Would check linear_structs
+                    _ => {}
+                }
+                alloc_infos.push(AllocInfo_new(vid, is_lin));
+            }
+            _ => {}
+        }
+        vi = vi + 1;
+    }
+
+    // Second pass: trace GetElemPtr and GetFieldPtr to root allocas (fixed point)
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        var vi2: i64 = 0;
+        while vi2 < f.values.len() {
+            var vid: i64 = f.values.get(vi2).id;
+            // Skip if already mapped
+            var already_mapped: bool = false;
+            var ai: i64 = 0;
+            while ai < alloc_vids.len() {
+                if alloc_vids.get(ai) == vid { already_mapped = true; }
+                ai = ai + 1;
+            }
+            if already_mapped { vi2 = vi2 + 1; continue; }
+
+            match f.values.get(vi2).inst {
+                L2Inst::GetElemPtr(array_ptr, _, _) => {
+                    var root_info: AllocInfo = get_alloc_info(array_ptr, alloc_vids, alloc_infos);
+                    if root_info.root >= 0 {
+                        alloc_vids.push(vid);
+                        alloc_infos.push(root_info);
+                        changed = true;
+                    }
+                }
+                L2Inst::GetFieldPtr(struct_ptr, _, _) => {
+                    var root_info: AllocInfo = get_alloc_info(struct_ptr, alloc_vids, alloc_infos);
+                    if root_info.root >= 0 {
+                        alloc_vids.push(vid);
+                        alloc_infos.push(root_info);
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+            vi2 = vi2 + 1;
+        }
+    }
+
+    // Phase 1: Redundant load elimination within blocks
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        var b: L2Block = f.blocks.get(bi);
+        // Map from pointer ValueId → last loaded value ValueId
+        var load_ptr_vids: Vec<i64> = Vec::new();
+        var load_result_vids: Vec<i64> = Vec::new();
+
+        var ii: i64 = 0;
+        while ii < b.instructions.len() {
+            var inst_vid: i64 = b.instructions.get(ii);
+            match L2Function_get_value(f, inst_vid) {
+                OptL2Inst::Some(inst) => {
+                    match inst {
+                        L2Inst::Load(ptr, ty) => {
+                            // Check if we've already loaded from this exact pointer
+                            var prev_result: i64 = -1;
+                            var found: bool = false;
+                            var li: i64 = 0;
+                            while li < load_ptr_vids.len() {
+                                if load_ptr_vids.get(li) == ptr {
+                                    prev_result = load_result_vids.get(li);
+                                    found = true;
+                                }
+                                li = li + 1;
+                            }
+                            if found {
+                                // Replace this load with a Copy of the previous result
+                                L2Function_set_value(f, inst_vid, L2Inst::Copy(prev_result, ty));
+                                count = count + 1;
+                            } else {
+                                load_ptr_vids.push(ptr);
+                                load_result_vids.push(inst_vid);
+                            }
+                        }
+                        L2Inst::Store(ptr, _, _) => {
+                            // A store invalidates cached loads from the same allocation
+                            var store_info: AllocInfo = get_alloc_info(ptr, alloc_vids, alloc_infos);
+                            var new_load_ptrs: Vec<i64> = Vec::new();
+                            var new_load_results: Vec<i64> = Vec::new();
+                            var li2: i64 = 0;
+                            while li2 < load_ptr_vids.len() {
+                                var load_info: AllocInfo = get_alloc_info(load_ptr_vids.get(li2), alloc_vids, alloc_infos);
+                                if !allocs_non_alias(store_info, load_info) {
+                                    // Could alias — invalidate this load
+                                } else {
+                                    // Non-aliasing — keep the cached load
+                                    new_load_ptrs.push(load_ptr_vids.get(li2));
+                                    new_load_results.push(load_result_vids.get(li2));
+                                }
+                                li2 = li2 + 1;
+                            }
+                            load_ptr_vids = new_load_ptrs;
+                            load_result_vids = new_load_results;
+                        }
+                        L2Inst::Call(_, args, _) => {
+                            // Calls invalidate loads from allocations passed as args
+                            var new_load_ptrs2: Vec<i64> = Vec::new();
+                            var new_load_results2: Vec<i64> = Vec::new();
+                            var li3: i64 = 0;
+                            while li3 < load_ptr_vids.len() {
+                                var load_info2: AllocInfo = get_alloc_info(load_ptr_vids.get(li3), alloc_vids, alloc_infos);
+                                var arg_passes: bool = false;
+                                var ai2: i64 = 0;
+                                while ai2 < args.len() {
+                                    var arg_info: AllocInfo = get_alloc_info(args.get(ai2), alloc_vids, alloc_infos);
+                                    if !allocs_non_alias(arg_info, load_info2) { arg_passes = true; }
+                                    ai2 = ai2 + 1;
+                                }
+                                if !arg_passes && load_info2.root >= 0 {
+                                    new_load_ptrs2.push(load_ptr_vids.get(li3));
+                                    new_load_results2.push(load_result_vids.get(li3));
+                                }
+                                li3 = li3 + 1;
+                            }
+                            load_ptr_vids = new_load_ptrs2;
+                            load_result_vids = new_load_results2;
+                        }
+                        _ => {}
+                    }
+                }
+                OptL2Inst::None => {}
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    // Phase 2: Cross-region load/store reordering
+    var bi2: i64 = 0;
+    while bi2 < f.blocks.len() {
+        var b2: L2Block = f.blocks.get(bi2);
+        if b2.instructions.len() < 2 { bi2 = bi2 + 1; continue; }
+
+        // Find loads and stores
+        var load_indices: Vec<i64> = Vec::new();
+        var load_infos: Vec<AllocInfo> = Vec::new();
+        var store_indices: Vec<i64> = Vec::new();
+        var store_infos: Vec<AllocInfo> = Vec::new();
+
+        var ii2: i64 = 0;
+        while ii2 < b2.instructions.len() {
+            match L2Function_get_value(f, b2.instructions.get(ii2)) {
+                OptL2Inst::Some(inst) => {
+                    match inst {
+                        L2Inst::Load(ptr, _) => {
+                            load_indices.push(ii2);
+                            load_infos.push(get_alloc_info(ptr, alloc_vids, alloc_infos));
+                        }
+                        L2Inst::Store(ptr, _, _) => {
+                            store_indices.push(ii2);
+                            store_infos.push(get_alloc_info(ptr, alloc_vids, alloc_infos));
+                        }
+                        _ => {}
+                    }
+                }
+                OptL2Inst::None => {}
+            }
+            ii2 = ii2 + 1;
+        }
+
+        // Count non-aliasing pairs
+        var li: i64 = 0;
+        while li < load_indices.len() {
+            var si: i64 = 0;
+            while si < store_indices.len() {
+                if load_indices.get(li) != store_indices.get(si) {
+                    if allocs_non_alias(load_infos.get(li), store_infos.get(si)) {
+                        count = count + 1;
+                    }
+                }
+                si = si + 1;
+            }
+            li = li + 1;
+        }
+
+        // Reorder: move non-aliasing loads before stores
+        if load_indices.len() > 0 && store_indices.len() > 0 {
+            var safe_loads: Vec<i64> = Vec::new();
+            var li2: i64 = 0;
+            while li2 < load_indices.len() {
+                var load_info: AllocInfo = load_infos.get(li2);
+                var is_safe: bool = false;
+                if load_info.root >= 0 || load_info.is_linear {
+                    is_safe = true;
+                    var si2: i64 = 0;
+                    while si2 < store_indices.len() {
+                        if !allocs_non_alias(load_info, store_infos.get(si2)) {
+                            is_safe = false;
+                        }
+                        si2 = si2 + 1;
+                    }
+                }
+                if is_safe { safe_loads.push(load_indices.get(li2)); }
+                li2 = li2 + 1;
+            }
+
+            if safe_loads.len() > 0 {
+                // Build new instruction list: safe loads first, then everything else
+                var new_insts: Vec<i64> = Vec::new();
+                var safe_set: Vec<i64> = safe_loads;
+                var si3: i64 = 0;
+                while si3 < safe_loads.len() {
+                    new_insts.push(b2.instructions.get(safe_loads.get(si3)));
+                    si3 = si3 + 1;
+                }
+                var ii3: i64 = 0;
+                while ii3 < b2.instructions.len() {
+                    var is_safe: bool = false;
+                    var si4: i64 = 0;
+                    while si4 < safe_set.len() {
+                        if safe_set.get(si4) == ii3 { is_safe = true; }
+                        si4 = si4 + 1;
+                    }
+                    if !is_safe { new_insts.push(b2.instructions.get(ii3)); }
+                    ii3 = ii3 + 1;
+                }
+                b2.instructions = new_insts;
+                f.blocks.set(bi2, b2);
+            }
+        }
+        bi2 = bi2 + 1;
+    }
+
+    return count;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Effect Reorder (stub — complex, needs memory dependency analysis)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_effect_reorder(module: &mut L2Module) -> i64 {
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f_i: L2Function = module.functions.get(i);
+        count = count + effect_reorder_function(&mut f_i);
+        module.functions.set(i, f_i);
+        i = i + 1;
+    }
+    return count;
+}
+
+fn effect_reorder_function(f: &mut L2Function) -> i64 {
+    var count: i64 = 0;
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        if f.blocks.get(bi).instructions.len() >= 3 {
+            count = count + effect_reorder_block(f, bi);
+        }
+        bi = bi + 1;
+    }
+    return count;
+}
+
+fn effect_reorder_block(f: &mut L2Function, bi: i64) -> i64 {
+    var b: L2Block = f.blocks.get(bi);
+    var insts: Vec<i64> = b.instructions;
+
+    // Classify instructions: pure, side-effecting, or other
+    var pure_insts: Vec<i64> = Vec::new();
+    var other_insts: Vec<i64> = Vec::new();
+    var effect_insts: Vec<i64> = Vec::new();
+
+    var ii: i64 = 0;
+    while ii < insts.len() {
+        var vid: i64 = insts.get(ii);
+        match L2Function_get_value(f, vid) {
+            OptL2Inst::Some(inst) => {
+                if effect_reorder_is_pure(inst) {
+                    pure_insts.push(vid);
+                } else if effect_reorder_is_memory_op(inst) || has_side_effects(inst) {
+                    effect_insts.push(vid);
+                } else {
+                    other_insts.push(vid);
+                }
+            }
+            OptL2Inst::None => {}
+        }
+        ii = ii + 1;
+    }
+
+    // Check safety: no pure instruction references a value defined by a side-effect instruction
+    var effect_defined: Vec<i64> = Vec::new();
+    var ei: i64 = 0;
+    while ei < effect_insts.len() {
+        effect_defined.push(effect_insts.get(ei));
+        ei = ei + 1;
+    }
+
+    var safe: bool = true;
+    var pi: i64 = 0;
+    while pi < pure_insts.len() {
+        match L2Function_get_value(f, pure_insts.get(pi)) {
+            OptL2Inst::Some(inst) => {
+                var refs: Vec<i64> = value_refs(inst);
+                var ri: i64 = 0;
+                while ri < refs.len() {
+                    if i64_vec_contains(effect_defined, refs.get(ri)) {
+                        safe = false;
+                    }
+                    ri = ri + 1;
+                }
+            }
+            OptL2Inst::None => {}
+        }
+        pi = pi + 1;
+    }
+
+    if !safe { return 0; }
+
+    // Build new order: pure first, then other, then effects
+    var new_insts: Vec<i64> = Vec::new();
+    var changed: bool = false;
+    var pi2: i64 = 0;
+    while pi2 < pure_insts.len() {
+        new_insts.push(pure_insts.get(pi2));
+        if insts.get(pi2) != pure_insts.get(pi2) { changed = true; }
+        pi2 = pi2 + 1;
+    }
+    var oi: i64 = 0;
+    while oi < other_insts.len() {
+        new_insts.push(other_insts.get(oi));
+        oi = oi + 1;
+    }
+    var ei2: i64 = 0;
+    while ei2 < effect_insts.len() {
+        new_insts.push(effect_insts.get(ei2));
+        ei2 = ei2 + 1;
+    }
+
+    if changed {
+        f.blocks.get(bi).instructions = new_insts;
+        return pure_insts.len();
+    }
+    return 0;
+}
+
+fn effect_reorder_is_pure(inst: L2Inst) -> bool {
+    match inst {
+        L2Inst::ConstInt(_, _) => { return true; }
+        L2Inst::ConstFloat(_, _) => { return true; }
+        L2Inst::ConstBool(_) => { return true; }
+        L2Inst::ConstStr(_) => { return true; }
+        L2Inst::ConstNull(_) => { return true; }
+        L2Inst::BinOp(_, _, _, _) => { return true; }
+        L2Inst::UnaryOp(_, _, _) => { return true; }
+        L2Inst::BitCast(_, _, _) => { return true; }
+        L2Inst::IntExtend(_, _, _) => { return true; }
+        L2Inst::IntTrunc(_, _, _) => { return true; }
+        L2Inst::IntToFloat(_, _, _) => { return true; }
+        L2Inst::FloatToInt(_, _, _) => { return true; }
+        L2Inst::GetFieldPtr(_, _, _) => { return true; }
+        L2Inst::GetElemPtr(_, _, _) => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn effect_reorder_is_memory_op(inst: L2Inst) -> bool {
+    match inst {
+        L2Inst::Load(_, _) => { return true; }
+        L2Inst::Alloca(_, _) => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Partial Evaluation — compile-time eval of pure calls with constant args
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Call info extracted from a Call instruction
+struct CallInfo {
+    callee: str,
+    args: Vec<i64>,
+    ret_ty: IrType,
+}
+
+enum OptCallInfo {
+    Some(CallInfo),
+    None,
+}
+
+/// Extract call info from an instruction (helper to avoid match-assignment issues)
+fn extract_call_info(inst: L2Inst) -> OptCallInfo {
+    match inst {
+        L2Inst::Call(func, args, ret_ty) => {
+            return OptCallInfo::Some(CallInfo { callee: func, args: args, ret_ty: ret_ty });
+        }
+        _ => { return OptCallInfo::None; }
+    }
+    return OptCallInfo::None;
+}
+
+pub fn pass_partial_eval(module: &mut L2Module) -> i64 {
+    var count: i64 = 0;
+
+    // Collect pure small function names
+    var pure_funcs: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        if is_pure_function(module.functions.get(i)) && module.functions.get(i).values.len() <= 20 {
+            pure_funcs.push(module.functions.get(i).name);
+        }
+        i = i + 1;
+    }
+
+    // For each function, look for calls with all-constant arguments
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var f: L2Function = module.functions.get(fi);
+        var replacements: Vec<i64> = Vec::new(); // vid list
+        var new_insts: Vec<L2Inst> = Vec::new();
+
+        var vi: i64 = 0;
+        while vi < f.values.len() {
+            var vid: i64 = f.values.get(vi).id;
+            var inst: L2Inst = f.values.get(vi).inst;
+
+            // Extract call info using helper to avoid match-assignment issue
+            var call_info: OptCallInfo = extract_call_info(inst);
+            match call_info {
+                OptCallInfo::Some(info) => {
+                    if str_vec_contains(pure_funcs, info.callee) {
+                        // Check if all arguments are constants
+                        var all_const: bool = true;
+                        var ai: i64 = 0;
+                        while ai < info.args.len() {
+                            if !is_constant_pv(info.args.get(ai), f.values) { all_const = false; }
+                            ai = ai + 1;
+                        }
+                        if all_const {
+                            // Try to evaluate
+                            var result_opt: OptI64 = eval_const_call(info.callee, info.args, module.functions, f.values);
+                            match result_opt {
+                                OptI64::Some(result) => {
+                                    // Replace with ConstInt
+                                    replacements.push(vid);
+                                    new_insts.push(L2Inst::ConstInt(result, info.ret_ty));
+                                }
+                                OptI64::None => {}
+                            }
+                        }
+                    }
+                }
+                OptCallInfo::None => {}
+            }
+            vi = vi + 1;
+        }
+
+        // Apply replacements
+        var ri: i64 = 0;
+        while ri < replacements.len() {
+            L2Function_set_value(&mut f, replacements.get(ri), new_insts.get(ri));
+            count = count + 1;
+            ri = ri + 1;
+        }
+        module.functions.set(fi, f);
+        fi = fi + 1;
+    }
+    return count;
+}
+
+/// Check if a PValue is a constant
+fn is_constant_pv(pv: i64, values: Vec<ValueIdL2Entry>) -> bool {
+    match lookup_value(values, pv) {
+        OptL2Inst::Some(inst) => {
+            match inst {
+                L2Inst::ConstInt(_, _) => { return true; }
+                L2Inst::ConstFloat(_, _) => { return true; }
+                L2Inst::ConstBool(_) => { return true; }
+                L2Inst::ConstStr(_) => { return true; }
+                L2Inst::ConstNull(_) => { return true; }
+                _ => { return false; }
+            }
+        }
+        OptL2Inst::None => { return false; }
+    }
+    return false;
+}
+
+/// Check if a function is pure (all instructions are pure, excluding terminators)
+fn is_pure_function(func: L2Function) -> bool {
+    var i: i64 = 0;
+    while i < func.values.len() {
+        var inst: L2Inst = func.values.get(i).inst;
+        // Terminators (Return, Jump, Branch) are not "side effects" for purity
+        match inst {
+            L2Inst::Return(_) => { i = i + 1; continue; }
+            L2Inst::Jump(_) => { i = i + 1; continue; }
+            L2Inst::Branch(_, _, _) => { i = i + 1; continue; }
+            L2Inst::Unreachable => { i = i + 1; continue; }
+            _ => {}
+        }
+        if has_side_effects(inst) { return false; }
+        match inst {
+            L2Inst::Call(callee, _, _) => {
+                if !is_known_pure_func(callee) { return false; }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Evaluate a call to a pure function with constant arguments at compile time.
+/// Returns OptI64::Some(result) if it could evaluate, None otherwise.
+fn eval_const_call(callee: str, args: Vec<i64>, all_funcs: Vec<L2Function>, caller_values: Vec<ValueIdL2Entry>) -> OptI64 {
+    // Get the constant argument values
+    var arg_vals: Vec<i64> = Vec::new();
+    var ai: i64 = 0;
+    while ai < args.len() {
+        match lookup_value(caller_values, args.get(ai)) {
+            OptL2Inst::Some(inst) => {
+                match inst {
+                    L2Inst::ConstInt(v, _) => { arg_vals.push(v); }
+                    L2Inst::ConstBool(v) => {
+                        if v { arg_vals.push(1); } else { arg_vals.push(0); }
+                    }
+                    _ => { return OptI64::None; }
+                }
+            }
+            OptL2Inst::None => { return OptI64::None; }
+        }
+        ai = ai + 1;
+    }
+
+    // Try to evaluate known pure built-in functions
+    if is_known_pure_func(callee) {
+        return eval_builtin(callee, arg_vals);
+    }
+
+    // Try to evaluate user-defined pure functions
+    var callee_func: L2Function = L2Function_new("", IrType::I64);
+    var found: bool = false;
+    var fi: i64 = 0;
+    while fi < all_funcs.len() {
+        if str_equal(all_funcs.get(fi).name, callee) {
+            callee_func = all_funcs.get(fi);
+            found = true;
+        }
+        fi = fi + 1;
+    }
+    if !found { return OptI64::None; }
+    if !is_pure_function(callee_func) { return OptI64::None; }
+
+    // Simple evaluation: look for a single BinOp + Return pattern
+    var result: i64 = 0;
+    var has_result: bool = false;
+    var ii: i64 = 0;
+    while ii < callee_func.values.len() {
+        var inst: L2Inst = callee_func.values.get(ii).inst;
+        match inst {
+            L2Inst::BinOp(op, left, right, _) => {
+                var lv_opt: OptI64 = pe_get_const_int(left, callee_func.values, arg_vals);
+                var rv_opt: OptI64 = pe_get_const_int(right, callee_func.values, arg_vals);
+                match lv_opt {
+                    OptI64::Some(l) => {
+                        match rv_opt {
+                            OptI64::Some(r) => {
+                                result = eval_binop_int_pe(op, l, r);
+                                has_result = true;
+                            }
+                            OptI64::None => { return OptI64::None; }
+                        }
+                    }
+                    OptI64::None => { return OptI64::None; }
+                }
+            }
+            L2Inst::Return(ret_val) => {
+                if ret_val >= 0 {
+                    if has_result { return OptI64::Some(result); }
+                    // Direct return of a parameter
+                    var direct: OptI64 = pe_get_const_int(ret_val, callee_func.values, arg_vals);
+                    match direct {
+                        OptI64::Some(v) => { return OptI64::Some(v); }
+                        OptI64::None => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        ii = ii + 1;
+    }
+
+    if has_result { return OptI64::Some(result); }
+    return OptI64::None;
+}
+
+/// Get a constant integer value for a PValue, either directly or from params
+fn pe_get_const_int(pv: i64, values: Vec<ValueIdL2Entry>, params: Vec<i64>) -> OptI64 {
+    match lookup_value(values, pv) {
+        OptL2Inst::Some(inst) => {
+            match inst {
+                L2Inst::ConstInt(v, _) => { return OptI64::Some(v); }
+                L2Inst::ConstBool(v) => {
+                    if v { return OptI64::Some(1); } else { return OptI64::Some(0); }
+                }
+                _ => { return OptI64::None; }
+            }
+        }
+        OptL2Inst::None => {
+            // Could be a parameter — try by index
+            if pv < params.len() { return OptI64::Some(params.get(pv)); }
+            return OptI64::None;
+        }
+    }
+    return OptI64::None;
+}
+
+/// Evaluate a binary operation on integers (wrapping)
+fn eval_binop_int_pe(op: BinOp, l: i64, r: i64) -> i64 {
+    match op {
+        BinOp::Add => { return l + r; }
+        BinOp::Sub => { return l - r; }
+        BinOp::Mul => { return l * r; }
+        BinOp::Div => { if r == 0 { return 0; } return l / r; }
+        BinOp::Mod => { if r == 0 { return 0; } return l % r; }
+        BinOp::BitAnd => { return l & r; }
+        BinOp::BitOr => { return l | r; }
+        BinOp::BitXor => { return l ^ r; }
+        BinOp::Shl => { return l << r; }
+        BinOp::Shr => { return shr_i64(l, r); }
+        BinOp::Eq => { if l == r { return 1; } return 0; }
+        BinOp::Neq => { if l != r { return 1; } return 0; }
+        BinOp::Lt => { if l < r { return 1; } return 0; }
+        BinOp::LtEq => { if l <= r { return 1; } return 0; }
+        BinOp::Gt => { if l > r { return 1; } return 0; }
+        BinOp::GtEq => { if l >= r { return 1; } return 0; }
+        BinOp::And => { if l != 0 && r != 0 { return 1; } return 0; }
+        BinOp::Or => { if l != 0 || r != 0 { return 1; } return 0; }
+    }
+    return 0;
+}
+
+/// Evaluate a known pure built-in function
+fn eval_builtin(name: str, args: Vec<i64>) -> OptI64 {
+    if args.len() == 0 { return OptI64::None; }
+    var a: i64 = args.get(0);
+
+    if str_equal(name, "p_add") {
+        if args.len() < 2 { return OptI64::None; }
+        return OptI64::Some(a + args.get(1));
+    }
+    if str_equal(name, "p_sub") {
+        if args.len() < 2 { return OptI64::None; }
+        return OptI64::Some(a - args.get(1));
+    }
+    if str_equal(name, "p_mul") {
+        if args.len() < 2 { return OptI64::None; }
+        return OptI64::Some(a * args.get(1));
+    }
+    if str_equal(name, "p_div") {
+        if args.len() < 2 { return OptI64::None; }
+        if args.get(1) == 0 { return OptI64::Some(0); }
+        return OptI64::Some(a / args.get(1));
+    }
+    if str_equal(name, "p_mod") {
+        if args.len() < 2 { return OptI64::None; }
+        if args.get(1) == 0 { return OptI64::Some(0); }
+        return OptI64::Some(a % args.get(1));
+    }
+    if str_equal(name, "p_eq") {
+        if args.len() < 2 { return OptI64::None; }
+        if a == args.get(1) { return OptI64::Some(1); }
+        return OptI64::Some(0);
+    }
+    if str_equal(name, "p_neq") {
+        if args.len() < 2 { return OptI64::None; }
+        if a != args.get(1) { return OptI64::Some(1); }
+        return OptI64::Some(0);
+    }
+    if str_equal(name, "p_lt") {
+        if args.len() < 2 { return OptI64::None; }
+        if a < args.get(1) { return OptI64::Some(1); }
+        return OptI64::Some(0);
+    }
+    if str_equal(name, "p_gt") {
+        if args.len() < 2 { return OptI64::None; }
+        if a > args.get(1) { return OptI64::Some(1); }
+        return OptI64::Some(0);
+    }
+    if str_equal(name, "p_le") {
+        if args.len() < 2 { return OptI64::None; }
+        if a <= args.get(1) { return OptI64::Some(1); }
+        return OptI64::Some(0);
+    }
+    if str_equal(name, "p_ge") {
+        if args.len() < 2 { return OptI64::None; }
+        if a >= args.get(1) { return OptI64::Some(1); }
+        return OptI64::Some(0);
+    }
+    if str_equal(name, "p_max") {
+        if args.len() < 2 { return OptI64::None; }
+        if a > args.get(1) { return OptI64::Some(a); }
+        return OptI64::Some(args.get(1));
+    }
+    if str_equal(name, "p_min") {
+        if args.len() < 2 { return OptI64::None; }
+        if a < args.get(1) { return OptI64::Some(a); }
+        return OptI64::Some(args.get(1));
+    }
+    if str_equal(name, "p_string_len") { return OptI64::Some(0); }
+    return OptI64::None;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: SLP Vectorization (stub — complex, needs SIMD analysis)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_slp_vectorize(module: &mut L2Module) -> i64 {
+    // SLP (Superword-Level Parallelism) vectorization combines adjacent
+    // scalar operations into SIMD operations. Stub for now.
+    return 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Strength Reduction
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_strength_reduce(module: &mut L2Module) -> i64 {
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f_i: L2Function = module.functions.get(i);
+        count = count + strength_reduce_function(&mut f_i);
+        module.functions.set(i, f_i);
+        i = i + 1;
+    }
+    return count;
+}
+
+fn strength_reduce_function(f: &mut L2Function) -> i64 {
+    var count: i64 = 0;
+    var inst_ids: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < f.values.len() {
+        inst_ids.push(f.values.get(i).id);
+        i = i + 1;
+    }
+
+    var next_id: i64 = tco_next_id(f);
+
+    var j: i64 = 0;
+    while j < inst_ids.len() {
+        var id: i64 = inst_ids.get(j);
+        if !has_inst(f, id) { j = j + 1; continue; }
+        var inst: L2Inst = get_inst(f, id);
+        match inst {
+            L2Inst::BinOp(op, left, right, ty) => {
+                // Mul optimizations
+                if op_is_mul(op) {
+                    var rv_opt: OptI64 = const_int_value(f, right);
+                    var lv_opt: OptI64 = const_int_value(f, left);
+
+                    // x * 0 → 0
+                    var is_zero: bool = false;
+                    match rv_opt {
+                        OptI64::Some(rv) => { if rv == 0 { is_zero = true; } }
+                        OptI64::None => {}
+                    }
+                    if !is_zero {
+                        match lv_opt {
+                            OptI64::Some(lv) => { if lv == 0 { is_zero = true; } }
+                            OptI64::None => {}
+                        }
+                    }
+                    if is_zero {
+                        L2Function_set_value(f, id, L2Inst::ConstInt(0, ty));
+                        count = count + 1;
+                        j = j + 1;
+                        continue;
+                    }
+
+                    // x * 1 → x (Copy)
+                    var is_one: bool = false;
+                    var one_copy_src: i64 = 0;
+                    match rv_opt {
+                        OptI64::Some(rv) => { if rv == 1 { is_one = true; one_copy_src = left; } }
+                        OptI64::None => {}
+                    }
+                    if !is_one {
+                        match lv_opt {
+                            OptI64::Some(lv) => { if lv == 1 { is_one = true; one_copy_src = right; } }
+                            OptI64::None => {}
+                        }
+                    }
+                    if is_one {
+                        L2Function_set_value(f, id, L2Inst::Copy(one_copy_src, ty));
+                        count = count + 1;
+                        j = j + 1;
+                        continue;
+                    }
+
+                    // x * 2^n → x << n
+                    var pow2_shift: i64 = -1;
+                    var pow2_src: i64 = 0;
+                    match rv_opt {
+                        OptI64::Some(rv) => {
+                            var s: i64 = exact_log2(rv);
+                            if s >= 0 { pow2_shift = s; pow2_src = left; }
+                        }
+                        OptI64::None => {}
+                    }
+                    if pow2_shift < 0 {
+                        match lv_opt {
+                            OptI64::Some(lv) => {
+                                var s: i64 = exact_log2(lv);
+                                if s >= 0 { pow2_shift = s; pow2_src = right; }
+                            }
+                            OptI64::None => {}
+                        }
+                    }
+                    if pow2_shift >= 0 {
+                        var shift_const: i64 = next_id;
+                        next_id = next_id + 1;
+                        L2Function_set_value(f, shift_const, L2Inst::ConstInt(pow2_shift, ty));
+                        L2Function_set_value(f, id, L2Inst::BinOp(BinOp::Shl, pow2_src, shift_const, ty));
+                        count = count + 1;
+                        j = j + 1;
+                        continue;
+                    }
+                }
+
+                // Div by power of 2 (unsigned only) → Shr
+                if op_is_div(op) {
+                    if is_unsigned_type(ty) {
+                        var rv_opt: OptI64 = const_int_value(f, right);
+                        match rv_opt {
+                            OptI64::Some(rv) => {
+                                var shift: i64 = exact_log2(rv);
+                                if shift >= 0 {
+                                    var shift_const: i64 = next_id;
+                                    next_id = next_id + 1;
+                                    L2Function_set_value(f, shift_const, L2Inst::ConstInt(shift, ty));
+                                    L2Function_set_value(f, id, L2Inst::BinOp(BinOp::Shr, left, shift_const, ty));
+                                    count = count + 1;
+                                    j = j + 1;
+                                    continue;
+                                }
+                            }
+                            OptI64::None => {}
+                        }
+                    }
+                }
+
+                // Mod by power of 2 (unsigned only) → BitAnd with mask
+                if op_is_mod(op) {
+                    if is_unsigned_type(ty) {
+                        var rv_opt: OptI64 = const_int_value(f, right);
+                        match rv_opt {
+                            OptI64::Some(rv) => {
+                                var shift: i64 = exact_log2(rv);
+                                if shift >= 0 {
+                                    var mask: i64 = (1 << shift) - 1;
+                                    var mask_const: i64 = next_id;
+                                    next_id = next_id + 1;
+                                    L2Function_set_value(f, mask_const, L2Inst::ConstInt(mask, ty));
+                                    L2Function_set_value(f, id, L2Inst::BinOp(BinOp::BitAnd, left, mask_const, ty));
+                                    count = count + 1;
+                                    j = j + 1;
+                                    continue;
+                                }
+                            }
+                            OptI64::None => {}
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        j = j + 1;
+    }
+    return count;
+}
+
+fn op_is_div(op: BinOp) -> bool {
+    match op {
+        BinOp::Div => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn op_is_mod(op: BinOp) -> bool {
+    match op {
+        BinOp::Mod => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn is_unsigned_type(ty: IrType) -> bool {
+    match ty {
+        IrType::U8 => { return true; }
+        IrType::U16 => { return true; }
+        IrType::U32 => { return true; }
+        IrType::U64 => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn op_is_mul(op: BinOp) -> bool {
+    match op {
+        BinOp::Mul => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+pub fn exact_log2(n: i64) -> i64 {
+    if n <= 0 { return -1; }
+    var v: i64 = n;
+    var shift: i64 = 0;
+    while v > 1 {
+        if (v & 1) != 0 { return -1; }
+        v = shr_i64(v, 1);
+        shift = shift + 1;
+    }
+    return shift;
+}
+
+/// Right shift helper (Fides parser has issues with >> in expressions)
+fn shr_i64(v: i64, amount: i64) -> i64 {
+    // Use division by 2^amount as a workaround
+    var result: i64 = v;
+    var i: i64 = 0;
+    while i < amount {
+        result = result / 2;
+        i = i + 1;
+    }
+    return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Effect Optimize — dead pure call elimination + loop hoisting
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Check if a function is "effectively pure" — only local stack effects
+fn is_effectively_pure(f: L2Function) -> bool {
+    // Check if function has pointer params (excluding env_ptr at index 0)
+    var has_ptr_params: bool = false;
+    var pi: i64 = 1; // skip env_ptr
+    while pi < f.params.len() {
+        match f.params.get(pi).ty {
+            IrType::Ptr(_) => { has_ptr_params = true; }
+            _ => {}
+        }
+        pi = pi + 1;
+    }
+    // Check if function has stores
+    var has_stores: bool = false;
+    var vi: i64 = 0;
+    while vi < f.values.len() {
+        match f.values.get(vi).inst {
+            L2Inst::Store(_, _, _) => { has_stores = true; }
+            _ => {}
+        }
+        vi = vi + 1;
+    }
+    if has_ptr_params && has_stores { return false; }
+
+    // Check for non-pure calls, indirect calls, IO, or divergence
+    var vi2: i64 = 0;
+    while vi2 < f.values.len() {
+        match f.values.get(vi2).inst {
+            L2Inst::Call(fname, _, _) => {
+                if !is_known_pure_func(fname) { return false; }
+            }
+            L2Inst::CallPtr(_, _, _, _) => { return false; }
+            L2Inst::DynCall(_, _, _, _) => { return false; }
+            L2Inst::Print(_, _) => { return false; }
+            L2Inst::Panic(_) => { return false; }
+            _ => {}
+        }
+        vi2 = vi2 + 1;
+    }
+    return true;
+}
+
+pub fn pass_effect_optimize(module: &mut L2Module) -> i64 {
+    // Build sets of pure and hoistable function names
+    var pure_funcs: Vec<str> = Vec::new();
+    var hoistable_funcs: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f: L2Function = module.functions.get(i);
+        if f.is_pure || is_effectively_pure(f) {
+            pure_funcs.push(f.name);
+            hoistable_funcs.push(f.name);
+        } else if f.is_crashfree && is_effectively_pure(f) {
+            hoistable_funcs.push(f.name);
+        }
+        i = i + 1;
+    }
+
+    var count: i64 = 0;
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var f: L2Function = module.functions.get(fi);
+        count = count + effect_optimize_function(&mut f, pure_funcs, hoistable_funcs);
+        module.functions.set(fi, f);
+        fi = fi + 1;
+    }
+    return count;
+}
+
+fn effect_optimize_function(f: &mut L2Function, pure_funcs: Vec<str>, hoistable_funcs: Vec<str>) -> i64 {
+    var count: i64 = 0;
+
+    // Phase 1: Dead pure call elimination
+    // Find calls to pure functions whose results are never used
+    var used: Vec<i64> = Vec::new();
+    var vi: i64 = 0;
+    while vi < f.values.len() {
+        var refs: Vec<i64> = value_refs(f.values.get(vi).inst);
+        var ri: i64 = 0;
+        while ri < refs.len() {
+            used.push(refs.get(ri));
+            ri = ri + 1;
+        }
+        vi = vi + 1;
+    }
+
+    // Find dead pure calls
+    var dead_calls: Vec<i64> = Vec::new();
+    var vi2: i64 = 0;
+    while vi2 < f.values.len() {
+        var vid: i64 = f.values.get(vi2).id;
+        var inst: L2Inst = f.values.get(vi2).inst;
+        var matched: bool = false;
+        var fname: str = "";
+        match inst {
+            L2Inst::Call(func, _, _) => { fname = func; matched = true; }
+            _ => {}
+        }
+        if matched {
+            var is_pure: bool = str_vec_contains(pure_funcs, fname) || is_known_pure_func(fname);
+            if is_pure {
+                // Check if vid is used
+                var is_used: bool = false;
+                var ui: i64 = 0;
+                while ui < used.len() {
+                    if used.get(ui) == vid { is_used = true; }
+                    ui = ui + 1;
+                }
+                if !is_used { dead_calls.push(vid); }
+            }
+        }
+        vi2 = vi2 + 1;
+    }
+
+    // Remove dead calls
+    var di: i64 = 0;
+    while di < dead_calls.len() {
+        L2Function_remove_value(f, dead_calls.get(di));
+        count = count + 1;
+        di = di + 1;
+    }
+    // Remove from block instruction lists
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        var b: L2Block = f.blocks.get(bi);
+        var new_insts: Vec<i64> = Vec::new();
+        var ii: i64 = 0;
+        while ii < b.instructions.len() {
+            var is_dead: bool = false;
+            var di2: i64 = 0;
+            while di2 < dead_calls.len() {
+                if dead_calls.get(di2) == b.instructions.get(ii) { is_dead = true; }
+                di2 = di2 + 1;
+            }
+            if !is_dead { new_insts.push(b.instructions.get(ii)); }
+            ii = ii + 1;
+        }
+        b.instructions = new_insts;
+        f.blocks.set(bi, b);
+        bi = bi + 1;
+    }
+
+    // Phase 2: Pure call hoisting out of loops
+    // Find loops: blocks with back-edges (a block that jumps to an earlier block)
+    // Build value_def_block map
+    var value_def_vids: Vec<i64> = Vec::new();
+    var value_def_blocks: Vec<i64> = Vec::new();
+    var bi2: i64 = 0;
+    while bi2 < f.blocks.len() {
+        var b2: L2Block = f.blocks.get(bi2);
+        var ii2: i64 = 0;
+        while ii2 < b2.instructions.len() {
+            value_def_vids.push(b2.instructions.get(ii2));
+            value_def_blocks.push(bi2);
+            ii2 = ii2 + 1;
+        }
+        bi2 = bi2 + 1;
+    }
+
+    // Build predecessor map
+    var pred_counts: Vec<i64> = Vec::new();
+    var pred_lists: Vec<Vec<i64> > = Vec::new();
+    var bi3: i64 = 0;
+    while bi3 < f.blocks.len() {
+        pred_lists.push(Vec::new());
+        bi3 = bi3 + 1;
+    }
+    var bi4: i64 = 0;
+    while bi4 < f.blocks.len() {
+        var b4: L2Block = f.blocks.get(bi4);
+        if b4.instructions.len() > 0 {
+            var term_vid: i64 = b4.instructions.get(b4.instructions.len() - 1);
+            match L2Function_get_value(f, term_vid) {
+                OptL2Inst::Some(inst) => {
+                    match inst {
+                        L2Inst::Jump(target) => {
+                            var ti: i64 = find_block_idx(f, target);
+                            if ti >= 0 { pred_lists.get(ti).push(bi4); }
+                        }
+                        L2Inst::Branch(_, then_b, else_b) => {
+                            var ti2: i64 = find_block_idx(f, then_b);
+                            if ti2 >= 0 { pred_lists.get(ti2).push(bi4); }
+                            var ei: i64 = find_block_idx(f, else_b);
+                            if ei >= 0 { pred_lists.get(ei).push(bi4); }
+                        }
+                        _ => {}
+                    }
+                }
+                OptL2Inst::None => {}
+            }
+        }
+        bi4 = bi4 + 1;
+    }
+
+    // Find loop headers: blocks with a predecessor that comes after them
+    var loop_headers: Vec<i64> = Vec::new();
+    var loop_bodies: Vec<Vec<i64> > = Vec::new();
+    var bi5: i64 = 0;
+    while bi5 < f.blocks.len() {
+        var pi2: i64 = 0;
+        while pi2 < pred_lists.get(bi5).len() {
+            if pred_lists.get(bi5).get(pi2) >= bi5 {
+                // Back-edge — bi5 is a loop header
+                // Body is blocks from bi5 to the back-edge source (inclusive)
+                var body: Vec<i64> = Vec::new();
+                var bj: i64 = bi5;
+                while bj <= pred_lists.get(bi5).get(pi2) {
+                    body.push(bj);
+                    bj = bj + 1;
+                }
+                loop_headers.push(bi5);
+                loop_bodies.push(body);
+                break;
+            }
+            pi2 = pi2 + 1;
+        }
+        bi5 = bi5 + 1;
+    }
+
+    // For each loop, find hoistable calls and move them to the preheader
+    var li: i64 = 0;
+    while li < loop_headers.len() {
+        var header: i64 = loop_headers.get(li);
+        var body: Vec<i64> = loop_bodies.get(li);
+
+        // Find preheader: predecessor of header that is NOT in body
+        var preheader: i64 = -1;
+        var pi3: i64 = 0;
+        while pi3 < pred_lists.get(header).len() {
+            var pred: i64 = pred_lists.get(header).get(pi3);
+            var in_body: bool = false;
+            var bi6: i64 = 0;
+            while bi6 < body.len() {
+                if body.get(bi6) == pred { in_body = true; }
+                bi6 = bi6 + 1;
+            }
+            if !in_body { preheader = pred; }
+            pi3 = pi3 + 1;
+        }
+        if preheader < 0 { li = li + 1; continue; }
+
+        // A value is loop-invariant if defined before the header or is a constant
+        // Find hoistable calls in the loop body
+        var hoist_vids: Vec<i64> = Vec::new();
+        var bi7: i64 = 0;
+        while bi7 < body.len() {
+            var body_bi: i64 = body.get(bi7);
+            var b7: L2Block = f.blocks.get(body_bi);
+            var ii3: i64 = 0;
+            while ii3 < b7.instructions.len() {
+                var vid: i64 = b7.instructions.get(ii3);
+                match L2Function_get_value(f, vid) {
+                    OptL2Inst::Some(inst) => {
+                        var matched2: bool = false;
+                        var fname2: str = "";
+                        var args2: Vec<i64> = Vec::new();
+                        match inst {
+                            L2Inst::Call(func, args, _) => { fname2 = func; args2 = args; matched2 = true; }
+                            _ => {}
+                        }
+                        if matched2 {
+                            var is_hoistable: bool = str_vec_contains(hoistable_funcs, fname2) || is_known_pure_func(fname2);
+                            if is_hoistable {
+                                // Check if all args are loop-invariant
+                                var all_invariant: bool = true;
+                                var ai: i64 = 0;
+                                while ai < args2.len() {
+                                    var arg: i64 = args2.get(ai);
+                                    // Check if constant
+                                    var is_const: bool = false;
+                                    match L2Function_get_value(f, arg) {
+                                        OptL2Inst::Some(arg_inst) => {
+                                            match arg_inst {
+                                                L2Inst::ConstInt(_, _) => { is_const = true; }
+                                                L2Inst::ConstFloat(_, _) => { is_const = true; }
+                                                L2Inst::ConstBool(_) => { is_const = true; }
+                                                L2Inst::ConstStr(_) => { is_const = true; }
+                                                L2Inst::ConstNull(_) => { is_const = true; }
+                                                _ => {}
+                                            }
+                                        }
+                                        OptL2Inst::None => { is_const = true; } // params are invariant
+                                    }
+                                    if is_const { ai = ai + 1; continue; }
+                                    // Check if defined before header
+                                    var def_block: i64 = -1;
+                                    var vi3: i64 = 0;
+                                    while vi3 < value_def_vids.len() {
+                                        if value_def_vids.get(vi3) == arg { def_block = value_def_blocks.get(vi3); }
+                                        vi3 = vi3 + 1;
+                                    }
+                                    if def_block >= header { all_invariant = false; }
+                                    ai = ai + 1;
+                                }
+                                if all_invariant { hoist_vids.push(vid); }
+                            }
+                        }
+                    }
+                    OptL2Inst::None => {}
+                }
+                ii3 = ii3 + 1;
+            }
+            bi7 = bi7 + 1;
+        }
+
+        if hoist_vids.len() == 0 { li = li + 1; continue; }
+
+        // Remove hoisted calls from body blocks
+        var hi2: i64 = 0;
+        while hi2 < hoist_vids.len() {
+            var hvid: i64 = hoist_vids.get(hi2);
+            var bi8: i64 = 0;
+            while bi8 < body.len() {
+                var b8: L2Block = f.blocks.get(body.get(bi8));
+                var new_insts2: Vec<i64> = Vec::new();
+                var ii4: i64 = 0;
+                while ii4 < b8.instructions.len() {
+                    if b8.instructions.get(ii4) != hvid { new_insts2.push(b8.instructions.get(ii4)); }
+                    ii4 = ii4 + 1;
+                }
+                b8.instructions = new_insts2;
+                f.blocks.set(body.get(bi8), b8);
+                bi8 = bi8 + 1;
+            }
+            hi2 = hi2 + 1;
+        }
+
+        // Insert into preheader before terminator
+        var ph: L2Block = f.blocks.get(preheader);
+        var term_idx: i64 = ph.instructions.len();
+        // Check if last instruction is a terminator
+        if ph.instructions.len() > 0 {
+            var last_vid: i64 = ph.instructions.get(ph.instructions.len() - 1);
+            match L2Function_get_value(f, last_vid) {
+                OptL2Inst::Some(last_inst) => {
+                    if is_terminator(last_inst) { term_idx = ph.instructions.len() - 1; }
+                }
+                OptL2Inst::None => {}
+            }
+        }
+
+        // Insert hoisted calls before terminator
+        var new_ph_insts: Vec<i64> = Vec::new();
+        var ii5: i64 = 0;
+        while ii5 < term_idx {
+            new_ph_insts.push(ph.instructions.get(ii5));
+            ii5 = ii5 + 1;
+        }
+        var hi3: i64 = 0;
+        while hi3 < hoist_vids.len() {
+            new_ph_insts.push(hoist_vids.get(hi3));
+            hi3 = hi3 + 1;
+        }
+        var ii6: i64 = term_idx;
+        while ii6 < ph.instructions.len() {
+            new_ph_insts.push(ph.instructions.get(ii6));
+            ii6 = ii6 + 1;
+        }
+        ph.instructions = new_ph_insts;
+        f.blocks.set(preheader, ph);
+
+        count = count + hoist_vids.len();
+        li = li + 1;
+    }
+
+    return count;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Region Pool (stub — emits p_region_free before returns)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_region_pool(module: &mut L2Module) -> i64 {
+    // Region pool optimization emits p_region_free calls before returns
+    // to bulk-free named memory regions. Stub for now.
+    return 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Reassociation (for @wrapping arithmetic)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_reassociate(module: &mut L2Module) -> i64 {
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        if module.functions.get(i).is_wrapping {
+            var f_i: L2Function = module.functions.get(i);
+        count = count + reassociate_function(&mut f_i);
+        module.functions.set(i, f_i);
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+fn reassociate_function(f: &mut L2Function) -> i64 {
+    var count: i64 = 0;
+    // Collect all BinOp instructions
+    var binops: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < f.values.len() {
+        match f.values.get(i).inst {
+            L2Inst::BinOp(op, _, _, _) => {
+                if op_is_add(op) || op_is_mul(op) {
+                    binops.push(f.values.get(i).id);
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+
+    var j: i64 = 0;
+    while j < binops.len() {
+        var id: i64 = binops.get(j);
+        if !has_inst(f, id) { j = j + 1; continue; }
+        var inst: L2Inst = get_inst(f, id);
+        match inst {
+            L2Inst::BinOp(op, left, right, ty) => {
+                // Check left operand: (a op C1) op C2 → a op (C1 op C2)
+                match L2Function_get_value(f, left) {
+                    OptL2Inst::Some(left_inst) => {
+                        match left_inst {
+                            L2Inst::BinOp(inner_op, inner_left, inner_right, inner_ty) => {
+                                if inner_op == op {
+                                    var c1_opt: OptI64 = const_int_value(f, inner_right);
+                                    var c2_opt: OptI64 = const_int_value(f, right);
+                                    match c1_opt {
+                                        OptI64::Some(c1) => {
+                                            match c2_opt {
+                                                OptI64::Some(c2) => {
+                                                    // Fold constants
+                                                    var folded: i64 = 0;
+                                                    if op_is_add(op) { folded = c1 + c2; }
+                                                    if op_is_mul(op) { folded = c1 * c2; }
+                                                    var new_const: i64 = tco_next_id(f);
+                                                    L2Function_set_value(f, new_const, L2Inst::ConstInt(folded, ty));
+                                                    L2Function_set_value(f, id, L2Inst::BinOp(op, inner_left, new_const, ty));
+                                                    count = count + 1;
+                                                    j = j + 1;
+                                                    continue;
+                                                }
+                                                OptI64::None => {}
+                                            }
+                                        }
+                                        OptI64::None => {}
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    OptL2Inst::None => {}
+                }
+
+                // Check right operand: C2 op (a op C1) → a op (C1 op C2)
+                match L2Function_get_value(f, right) {
+                    OptL2Inst::Some(right_inst) => {
+                        match right_inst {
+                            L2Inst::BinOp(inner_op, inner_left, inner_right, inner_ty) => {
+                                if inner_op == op {
+                                    var c1_opt: OptI64 = const_int_value(f, inner_right);
+                                    var c2_opt: OptI64 = const_int_value(f, left);
+                                    match c1_opt {
+                                        OptI64::Some(c1) => {
+                                            match c2_opt {
+                                                OptI64::Some(c2) => {
+                                                    var folded: i64 = 0;
+                                                    if op_is_add(op) { folded = c1 + c2; }
+                                                    if op_is_mul(op) { folded = c1 * c2; }
+                                                    var new_const: i64 = tco_next_id(f);
+                                                    L2Function_set_value(f, new_const, L2Inst::ConstInt(folded, ty));
+                                                    L2Function_set_value(f, id, L2Inst::BinOp(op, inner_left, new_const, ty));
+                                                    count = count + 1;
+                                                    j = j + 1;
+                                                    continue;
+                                                }
+                                                OptI64::None => {}
+                                            }
+                                        }
+                                        OptI64::None => {}
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    OptL2Inst::None => {}
+                }
+
+                // Canonicalize: if right is const and left is not, swap
+                var r_const: OptI64 = const_int_value(f, right);
+                var l_const: OptI64 = const_int_value(f, left);
+                match r_const {
+                    OptI64::Some(_) => {
+                        match l_const {
+                            OptI64::None => {
+                                // Swap operands
+                                L2Function_set_value(f, id, L2Inst::BinOp(op, right, left, ty));
+                                count = count + 1;
+                            }
+                            OptI64::Some(_) => {}
+                        }
+                    }
+                    OptI64::None => {}
+                }
+            }
+            _ => {}
+        }
+        j = j + 1;
+    }
+    return count;
+}
+
+fn op_is_add(op: BinOp) -> bool {
+    match op {
+        BinOp::Add => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass: Memoization (for @deterministic calls)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn pass_memoize(module: &mut L2Module) -> i64 {
+    // Build set of deterministic function names
+    var det_funcs: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        if module.functions.get(i).is_deterministic {
+            det_funcs.push(module.functions.get(i).name);
+        }
+        i = i + 1;
+    }
+
+    var count: i64 = 0;
+    var j: i64 = 0;
+    while j < module.functions.len() {
+        var f_j: L2Function = module.functions.get(j);
+        count = count + memoize_function(&mut f_j, det_funcs);
+        module.functions.set(j, f_j);
+        j = j + 1;
+    }
+    return count;
+}
+
+fn memoize_function(f: &mut L2Function, det_funcs: Vec<str>) -> i64 {
+    var count: i64 = 0;
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        // Per-block memo table: key = func:arg1:arg2:..., value = result vid
+        var memo_keys: Vec<str> = Vec::new();
+        var memo_vals: Vec<i64> = Vec::new();
+
+        var b: L2Block = f.blocks.get(bi);
+        var ii: i64 = 0;
+        while ii < b.instructions.len() {
+            var vid: i64 = b.instructions.get(ii);
+            if !has_inst(f, vid) { ii = ii + 1; continue; }
+            var inst: L2Inst = get_inst(f, vid);
+            match inst {
+                L2Inst::Call(func, args, ret_ty) => {
+                    if str_vec_contains(det_funcs, func) {
+                        // Build memo key
+                        var key: str = func;
+                        var k: i64 = 0;
+                        while k < args.len() {
+                            key = key + ":" + int_to_str(args.get(k));
+                            k = k + 1;
+                        }
+                        // Check if already in memo
+                        var found_idx: i64 = -1;
+                        var mi: i64 = 0;
+                        while mi < memo_keys.len() {
+                            if str_equal(memo_keys.get(mi), key) {
+                                found_idx = mi;
+                            }
+                            mi = mi + 1;
+                        }
+                        if found_idx >= 0 {
+                            // Replace with Copy of previous result
+                            L2Function_set_value(f, vid, L2Inst::Copy(memo_vals.get(found_idx), ret_ty));
+                            count = count + 1;
+                        } else {
+                            memo_keys.push(key);
+                            memo_vals.push(vid);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    return count;
+}

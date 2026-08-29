@@ -1,0 +1,938 @@
+// SH-8.5: Test for compiler::opt module (rewritten from opt.rs)
+// Tests Pass enum, OptStats, pass_const_fold, pass_cse, pass_gvn, pass_dce,
+// pass_dse, pass_devirt, pass_jump_thread, pass_tco, pass_strength_reduce,
+// pass_reassociate, pass_memoize, pass_effect_reorder, and shared helpers.
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::pir;
+use compiler::opt;
+
+fn assert_eq(actual: str, expected: str, label: str) -> void {
+    if actual != expected {
+        print("FAIL: ");
+        print(label);
+        print(" — expected '");
+        print(expected);
+        print("', got '");
+        print(actual);
+        print("'\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_eq_i64(actual: i64, expected: i64, label: str) -> void {
+    if actual != expected {
+        print("FAIL: ");
+        print(label);
+        print(" — expected ");
+        print(int_to_str(expected));
+        print(", got ");
+        print(int_to_str(actual));
+        print("\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_true(b: bool, label: str) -> void {
+    if !b {
+        print("FAIL: ");
+        print(label);
+        print(" — expected true\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_false(b: bool, label: str) -> void {
+    if b {
+        print("FAIL: ");
+        print(label);
+        print(" — expected false\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+// ── Test 1: Pass enum and Pass_name ──
+fn test_pass_name() -> void {
+    print("Test 1: Pass_name...\n");
+    assert_eq(Pass_name(Pass::ConstFold), "const-fold", "ConstFold name");
+    assert_eq(Pass_name(Pass::Cse), "cse", "Cse name");
+    assert_eq(Pass_name(Pass::Dce), "dce", "Dce name");
+    assert_eq(Pass_name(Pass::Inline), "inline", "Inline name");
+    assert_eq(Pass_name(Pass::Unroll), "unroll", "Unroll name");
+    assert_eq(Pass_name(Pass::Tco), "tco", "Tco name");
+    assert_eq(Pass_name(Pass::Gvn), "gvn", "Gvn name");
+    assert_eq(Pass_name(Pass::Sroa), "sroa", "Sroa name");
+    assert_eq(Pass_name(Pass::Dse), "dse", "Dse name");
+    assert_eq(Pass_name(Pass::Devirt), "devirt", "Devirt name");
+    assert_eq(Pass_name(Pass::JumpThread), "jump-thread", "JumpThread name");
+    assert_eq(Pass_name(Pass::StrengthReduce), "strength-reduce", "StrengthReduce name");
+    assert_eq(Pass_name(Pass::Reassociate), "reassociate", "Reassociate name");
+    assert_eq(Pass_name(Pass::Memoize), "memoize", "Memoize name");
+    assert_eq(Pass_name(Pass::EffectReorder), "effect-reorder", "EffectReorder name");
+}
+
+// ── Test 2: Pass_parse ──
+fn test_pass_parse() -> void {
+    print("Test 2: Pass_parse...\n");
+    match Pass_parse("const-fold") {
+        OptPass::Some(p) => { assert_eq(Pass_name(p), "const-fold", "parse const-fold"); }
+        OptPass::None => { p_panic("FAIL: parse const-fold returned None"); }
+    }
+    match Pass_parse("cse") {
+        OptPass::Some(p) => { assert_eq(Pass_name(p), "cse", "parse cse"); }
+        OptPass::None => { p_panic("FAIL: parse cse returned None"); }
+    }
+    match Pass_parse("dce") {
+        OptPass::Some(p) => { assert_eq(Pass_name(p), "dce", "parse dce"); }
+        OptPass::None => { p_panic("FAIL: parse dce returned None"); }
+    }
+    match Pass_parse("inline") {
+        OptPass::Some(p) => { assert_eq(Pass_name(p), "inline", "parse inline"); }
+        OptPass::None => { p_panic("FAIL: parse inline returned None"); }
+    }
+    match Pass_parse("unknown-pass") {
+        OptPass::Some(_) => { p_panic("FAIL: parse unknown-pass should return None"); }
+        OptPass::None => { print("  OK: parse unknown-pass (None)\n"); }
+    }
+}
+
+// ── Test 3: OptStats ──
+fn test_opt_stats() -> void {
+    print("Test 3: OptStats...\n");
+    var stats: OptStats = OptStats_new();
+    assert_eq_i64(OptStats_total(stats), 0, "empty stats total");
+    stats.const_fold = 5;
+    stats.cse = 3;
+    stats.dce = 2;
+    assert_eq_i64(OptStats_total(stats), 10, "stats total after additions");
+    stats.iterations = 4;
+    assert_eq_i64(stats.iterations, 4, "stats iterations");
+}
+
+// ── Test 4: Pass_all returns default pass list ──
+fn test_pass_all() -> void {
+    print("Test 4: Pass_all...\n");
+    var passes: Vec<Pass> = Pass_all();
+    assert_true(passes.len() > 0, "Pass_all returns non-empty list");
+    // Should include ConstFold
+    var has_const_fold: bool = false;
+    var i: i64 = 0;
+    while i < passes.len() {
+        match passes.get(i) {
+            Pass::ConstFold => { has_const_fold = true; }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    assert_true(has_const_fold, "Pass_all includes ConstFold");
+}
+
+// ── Test 5: is_known_pure_func ──
+fn test_is_known_pure_func() -> void {
+    print("Test 5: is_known_pure_func...\n");
+    assert_true(is_known_pure_func("p_add"), "p_add is pure");
+    assert_true(is_known_pure_func("p_sub"), "p_sub is pure");
+    assert_true(is_known_pure_func("p_mul"), "p_mul is pure");
+    assert_true(is_known_pure_func("p_eq"), "p_eq is pure");
+    assert_true(is_known_pure_func("p_string_len"), "p_string_len is pure");
+    assert_true(is_known_pure_func("p_vec_len"), "p_vec_len is pure");
+    assert_false(is_known_pure_func("p_print"), "p_print is not pure");
+    assert_false(is_known_pure_func("p_panic"), "p_panic is not pure");
+    assert_false(is_known_pure_func("unknown_func"), "unknown_func is not pure");
+}
+
+// ── Test 6: has_side_effects ──
+fn test_has_side_effects() -> void {
+    print("Test 6: has_side_effects...\n");
+    assert_true(has_side_effects(L2Inst::Store(0, 1, OptIrType::None)), "Store has side effects");
+    assert_true(has_side_effects(L2Inst::Print(0, IrType::I64)), "Print has side effects");
+    assert_true(has_side_effects(L2Inst::Panic("err")), "Panic has side effects");
+    assert_true(has_side_effects(L2Inst::Return(0)), "Return has side effects");
+    assert_true(has_side_effects(L2Inst::Jump(0)), "Jump has side effects");
+    assert_true(has_side_effects(L2Inst::Branch(0, 1, 2)), "Branch has side effects");
+    assert_true(has_side_effects(L2Inst::Unreachable), "Unreachable has side effects");
+    assert_false(has_side_effects(L2Inst::ConstInt(42, IrType::I64)), "ConstInt no side effects");
+    assert_false(has_side_effects(L2Inst::BinOp(BinOp::Add, 0, 1, IrType::I64)), "BinOp no side effects");
+    assert_false(has_side_effects(L2Inst::Alloca(IrType::I64, MemRegion::Stack)), "Alloca no side effects");
+    // Call to pure function — no side effects
+    assert_false(has_side_effects(L2Inst::Call("p_add", Vec::new(), IrType::I64)), "Call p_add no side effects");
+    // Call to non-pure function — has side effects
+    assert_true(has_side_effects(L2Inst::Call("p_print", Vec::new(), IrType::Void)), "Call p_print has side effects");
+}
+
+// ── Test 7: is_pure ──
+fn test_is_pure() -> void {
+    print("Test 7: is_pure...\n");
+    assert_true(is_pure(L2Inst::ConstInt(42, IrType::I64)), "ConstInt is pure");
+    assert_true(is_pure(L2Inst::ConstBool(true)), "ConstBool is pure");
+    assert_true(is_pure(L2Inst::BinOp(BinOp::Add, 0, 1, IrType::I64)), "BinOp is pure");
+    assert_true(is_pure(L2Inst::UnaryOp(UnaryOp::Neg, 0, IrType::I64)), "UnaryOp is pure");
+    assert_true(is_pure(L2Inst::GetFieldPtr(0, 0, IrType::I64)), "GetFieldPtr is pure");
+    assert_true(is_pure(L2Inst::BitCast(0, IrType::I64, IrType::I64)), "BitCast is pure");
+    assert_false(is_pure(L2Inst::Store(0, 1, OptIrType::None)), "Store is not pure");
+    assert_false(is_pure(L2Inst::Alloca(IrType::I64, MemRegion::Stack)), "Alloca is not pure");
+    assert_false(is_pure(L2Inst::Load(0, IrType::I64)), "Load is not pure");
+}
+
+// ── Test 8: value_refs ──
+fn test_value_refs() -> void {
+    print("Test 8: value_refs...\n");
+    var refs: Vec<i64> = value_refs(L2Inst::BinOp(BinOp::Add, 5, 10, IrType::I64));
+    assert_eq_i64(refs.len(), 2, "BinOp refs count");
+    assert_eq_i64(refs.get(0), 5, "BinOp ref[0]");
+    assert_eq_i64(refs.get(1), 10, "BinOp ref[1]");
+
+    var refs2: Vec<i64> = value_refs(L2Inst::ConstInt(42, IrType::I64));
+    assert_eq_i64(refs2.len(), 0, "ConstInt refs count");
+
+    var refs3: Vec<i64> = value_refs(L2Inst::UnaryOp(UnaryOp::Neg, 7, IrType::I64));
+    assert_eq_i64(refs3.len(), 1, "UnaryOp refs count");
+    assert_eq_i64(refs3.get(0), 7, "UnaryOp ref[0]");
+
+    var refs4: Vec<i64> = value_refs(L2Inst::Store(3, 6, OptIrType::None));
+    assert_eq_i64(refs4.len(), 2, "Store refs count");
+    assert_eq_i64(refs4.get(0), 3, "Store ref[0] (ptr)");
+    assert_eq_i64(refs4.get(1), 6, "Store ref[1] (value)");
+
+    var refs5: Vec<i64> = value_refs(L2Inst::Return(8));
+    assert_eq_i64(refs5.len(), 1, "Return refs count");
+    assert_eq_i64(refs5.get(0), 8, "Return ref[0]");
+
+    var refs6: Vec<i64> = value_refs(L2Inst::Return(-1));
+    assert_eq_i64(refs6.len(), 0, "Return(-1) refs count (void)");
+}
+
+// ── Test 9: i64_vec_contains ──
+fn test_i64_vec_contains() -> void {
+    print("Test 9: i64_vec_contains...\n");
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(3);
+    v.push(5);
+    v.push(7);
+    assert_true(i64_vec_contains(v, 3), "contains 3");
+    assert_true(i64_vec_contains(v, 7), "contains 7");
+    assert_false(i64_vec_contains(v, 4), "not contains 4");
+    assert_false(i64_vec_contains(v, 0), "not contains 0");
+}
+
+// ── Test 10: str_vec_contains ──
+fn test_str_vec_contains() -> void {
+    print("Test 10: str_vec_contains...\n");
+    var v: Vec<str> = Vec::new();
+    v.push("foo");
+    v.push("bar");
+    v.push("baz");
+    assert_true(str_vec_contains(v, "foo"), "contains foo");
+    assert_true(str_vec_contains(v, "bar"), "contains bar");
+    assert_false(str_vec_contains(v, "qux"), "not contains qux");
+}
+
+// ── Test 11: exact_log2 ──
+fn test_exact_log2() -> void {
+    print("Test 11: exact_log2...\n");
+    assert_eq_i64(exact_log2(1), 0, "log2(1) = 0");
+    assert_eq_i64(exact_log2(2), 1, "log2(2) = 1");
+    assert_eq_i64(exact_log2(4), 2, "log2(4) = 2");
+    assert_eq_i64(exact_log2(8), 3, "log2(8) = 3");
+    assert_eq_i64(exact_log2(16), 4, "log2(16) = 4");
+    assert_eq_i64(exact_log2(256), 8, "log2(256) = 8");
+    assert_eq_i64(exact_log2(3), -1, "log2(3) = -1 (not power of 2)");
+    assert_eq_i64(exact_log2(0), -1, "log2(0) = -1");
+    assert_eq_i64(exact_log2(-4), -1, "log2(-4) = -1");
+}
+
+// ── Test 12: pass_const_fold on simple module ──
+fn test_pass_const_fold() -> void {
+    print("Test 12: pass_const_fold...\n");
+    var module: L2Module = L2Module_new();
+    var f: L2Function = L2Function_new("test_func", IrType::I64);
+
+    // Create: v0 = ConstInt(3), v1 = ConstInt(4), v2 = BinOp(Add, v0, v1)
+    L2Function_set_value(&mut f, 0, L2Inst::ConstInt(3, IrType::I64));
+    L2Function_set_value(&mut f, 1, L2Inst::ConstInt(4, IrType::I64));
+    L2Function_set_value(&mut f, 2, L2Inst::BinOp(BinOp::Add, 0, 1, IrType::I64));
+    L2Function_set_value(&mut f, 3, L2Inst::Return(2));
+
+    var b: L2Block = L2Block_new(0);
+    b.instructions.push(0);
+    b.instructions.push(1);
+    b.instructions.push(2);
+    b.instructions.push(3);
+    f.blocks.push(b);
+    f.entry = 0;
+
+    module.functions.push(f);
+
+    var count: i64 = pass_const_fold(&mut module);
+    assert_eq_i64(count, 1, "const_fold count");
+
+    // v2 should now be ConstInt(7)
+    match L2Function_get_value(&module.functions.get(0), 2) {
+        OptL2Inst::Some(inst) => {
+            match inst {
+                L2Inst::ConstInt(v, _) => { assert_eq_i64(v, 7, "folded BinOp(3+4) = 7"); }
+                _ => { p_panic("FAIL: v2 should be ConstInt after folding"); }
+            }
+        }
+        OptL2Inst::None => { p_panic("FAIL: v2 not found"); }
+    }
+}
+
+// ── Test 13: pass_const_fold with branch folding ──
+fn test_const_fold_branch() -> void {
+    print("Test 13: const_fold branch...\n");
+    var module: L2Module = L2Module_new();
+    var f: L2Function = L2Function_new("test_branch", IrType::Void);
+
+    // v0 = ConstBool(true), v1 = Branch(v0, 1, 2)
+    L2Function_set_value(&mut f, 0, L2Inst::ConstBool(true));
+    L2Function_set_value(&mut f, 1, L2Inst::Branch(0, 1, 2));
+
+    var b: L2Block = L2Block_new(0);
+    b.instructions.push(0);
+    b.instructions.push(1);
+    f.blocks.push(b);
+    f.entry = 0;
+
+    module.functions.push(f);
+
+    var count: i64 = pass_const_fold(&mut module);
+    assert_eq_i64(count, 1, "branch fold count");
+
+    // v1 should now be Jump(1) (since cond is true → then target)
+    match L2Function_get_value(&module.functions.get(0), 1) {
+        OptL2Inst::Some(inst) => {
+            match inst {
+                L2Inst::Jump(target) => { assert_eq_i64(target, 1, "folded branch → jump to then"); }
+                _ => { p_panic("FAIL: v1 should be Jump after folding"); }
+            }
+        }
+        OptL2Inst::None => { p_panic("FAIL: v1 not found"); }
+    }
+}
+
+// ── Test 14: pass_dce removes unused pure instructions ──
+fn test_pass_dce() -> void {
+    print("Test 14: pass_dce...\n");
+    var module: L2Module = L2Module_new();
+    var f: L2Function = L2Function_new("test_dce", IrType::I64);
+
+    // v0 = ConstInt(42), v1 = ConstInt(99) (unused), v2 = Return(v0)
+    L2Function_set_value(&mut f, 0, L2Inst::ConstInt(42, IrType::I64));
+    L2Function_set_value(&mut f, 1, L2Inst::ConstInt(99, IrType::I64));
+    L2Function_set_value(&mut f, 2, L2Inst::Return(0));
+
+    var b: L2Block = L2Block_new(0);
+    b.instructions.push(0);
+    b.instructions.push(1);
+    b.instructions.push(2);
+    f.blocks.push(b);
+    f.entry = 0;
+
+    module.functions.push(f);
+
+    var count: i64 = pass_dce(&mut module);
+    assert_true(count >= 1, "dce removes at least 1 instruction");
+
+    // v1 should be removed
+    match L2Function_get_value(&module.functions.get(0), 1) {
+        OptL2Inst::Some(_) => { p_panic("FAIL: v1 should be removed by DCE"); }
+        OptL2Inst::None => { print("  OK: v1 removed by DCE\n"); }
+    }
+}
+
+// ── Test 15: pass_strength_reduce ──
+fn test_pass_strength_reduce() -> void {
+    print("Test 15: pass_strength_reduce...\n");
+    var module: L2Module = L2Module_new();
+    var f: L2Function = L2Function_new("test_sr", IrType::I64);
+
+    // v0 = ConstInt(8), v1 = ConstInt(3), v2 = BinOp(Mul, v0, v1)
+    // 8 is 2^3, so Mul should become Shl
+    L2Function_set_value(&mut f, 0, L2Inst::ConstInt(8, IrType::I64));
+    L2Function_set_value(&mut f, 1, L2Inst::ConstInt(3, IrType::I64));
+    L2Function_set_value(&mut f, 2, L2Inst::BinOp(BinOp::Mul, 0, 1, IrType::I64));
+    L2Function_set_value(&mut f, 3, L2Inst::Return(2));
+
+    var b: L2Block = L2Block_new(0);
+    b.instructions.push(0);
+    b.instructions.push(1);
+    b.instructions.push(2);
+    b.instructions.push(3);
+    f.blocks.push(b);
+    f.entry = 0;
+
+    module.functions.push(f);
+
+    var count: i64 = pass_strength_reduce(&mut module);
+    assert_true(count >= 1, "strength_reduce converts at least 1 mul");
+
+    // v2 should now be Shl
+    match L2Function_get_value(&module.functions.get(0), 2) {
+        OptL2Inst::Some(inst) => {
+            match inst {
+                L2Inst::BinOp(op, _, _, _) => {
+                    match op {
+                        BinOp::Shl => { print("  OK: Mul(8,3) → Shl\n"); }
+                        _ => { p_panic("FAIL: v2 should be Shl after strength reduction"); }
+                    }
+                }
+                _ => { p_panic("FAIL: v2 should be BinOp after strength reduction"); }
+            }
+        }
+        OptL2Inst::None => { p_panic("FAIL: v2 not found"); }
+    }
+}
+
+// ── Test 16: pass_cse eliminates duplicate computation ──
+fn test_pass_cse() -> void {
+    print("Test 16: pass_cse...\n");
+    var module: L2Module = L2Module_new();
+    var f: L2Function = L2Function_new("test_cse", IrType::I64);
+
+    // v0 = ConstInt(3), v1 = ConstInt(4)
+    // v2 = BinOp(Add, v0, v1)
+    // v3 = BinOp(Add, v0, v1)  ← duplicate of v2
+    // v4 = Return(v2)
+    L2Function_set_value(&mut f, 0, L2Inst::ConstInt(3, IrType::I64));
+    L2Function_set_value(&mut f, 1, L2Inst::ConstInt(4, IrType::I64));
+    L2Function_set_value(&mut f, 2, L2Inst::BinOp(BinOp::Add, 0, 1, IrType::I64));
+    L2Function_set_value(&mut f, 3, L2Inst::BinOp(BinOp::Add, 0, 1, IrType::I64));
+    L2Function_set_value(&mut f, 4, L2Inst::Return(2));
+
+    var b: L2Block = L2Block_new(0);
+    b.instructions.push(0);
+    b.instructions.push(1);
+    b.instructions.push(2);
+    b.instructions.push(3);
+    b.instructions.push(4);
+    f.blocks.push(b);
+    f.entry = 0;
+
+    module.functions.push(f);
+
+    var count: i64 = pass_cse(&mut module);
+    assert_true(count >= 1, "cse eliminates at least 1 duplicate");
+
+    // v3 should be replaced (either removed or turned into a Copy of v2)
+    match L2Function_get_value(&module.functions.get(0), 3) {
+        OptL2Inst::Some(inst) => {
+            match inst {
+                L2Inst::Copy(src, _) => { assert_eq_i64(src, 2, "cse replaces v3 with Copy(v2)"); }
+                _ => { p_panic("FAIL: v3 should be Copy or removed by CSE"); }
+            }
+        }
+        OptL2Inst::None => { print("  OK: v3 removed by CSE\n"); }
+    }
+}
+
+// ── Test 17: optimize_l2 on empty module ──
+fn test_optimize_l2_empty() -> void {
+    print("Test 17: optimize_l2 empty module...\n");
+    var module: L2Module = L2Module_new();
+    var stats: OptStats = optimize_l2(&mut module);
+    assert_eq_i64(OptStats_total(stats), 0, "empty module no changes");
+    assert_eq_i64(stats.iterations, 1, "empty module 1 iteration");
+}
+
+// ── Test 18: pass_reassociate on wrapping function ──
+fn test_pass_reassociate() -> void {
+    print("Test 18: pass_reassociate...\n");
+    var module: L2Module = L2Module_new();
+    var f: L2Function = L2Function_new("test_reassoc", IrType::I64);
+    f.is_wrapping = true;
+
+    // v0 = ConstInt(2), v1 = ConstInt(3), v2 = ConstInt(4)
+    // v3 = BinOp(Add, v0, v1)  → (2 + 3)
+    // v4 = BinOp(Add, v3, v2)  → ((2+3) + 4) → should fold to (2 + 7)
+    L2Function_set_value(&mut f, 0, L2Inst::ConstInt(2, IrType::I64));
+    L2Function_set_value(&mut f, 1, L2Inst::ConstInt(3, IrType::I64));
+    L2Function_set_value(&mut f, 2, L2Inst::ConstInt(4, IrType::I64));
+    L2Function_set_value(&mut f, 3, L2Inst::BinOp(BinOp::Add, 0, 1, IrType::I64));
+    L2Function_set_value(&mut f, 4, L2Inst::BinOp(BinOp::Add, 3, 2, IrType::I64));
+    L2Function_set_value(&mut f, 5, L2Inst::Return(4));
+
+    var b: L2Block = L2Block_new(0);
+    b.instructions.push(0);
+    b.instructions.push(1);
+    b.instructions.push(2);
+    b.instructions.push(3);
+    b.instructions.push(4);
+    b.instructions.push(5);
+    f.blocks.push(b);
+    f.entry = 0;
+
+    module.functions.push(f);
+
+    var count: i64 = pass_reassociate(&mut module);
+    assert_true(count >= 1, "reassociate folds at least 1 constant");
+}
+
+// ── Test 19: pass_memoize on deterministic function ──
+fn test_pass_memoize() -> void {
+    print("Test 19: pass_memoize...\n");
+    var module: L2Module = L2Module_new();
+
+    // Create a deterministic function "det_fn"
+    var det_f: L2Function = L2Function_new("det_fn", IrType::I64);
+    det_f.is_deterministic = true;
+    L2Function_set_value(&mut det_f, 0, L2Inst::ConstInt(42, IrType::I64));
+    L2Function_set_value(&mut det_f, 1, L2Inst::Return(0));
+    var det_b: L2Block = L2Block_new(0);
+    det_b.instructions.push(0);
+    det_b.instructions.push(1);
+    det_f.blocks.push(det_b);
+    det_f.entry = 0;
+    module.functions.push(det_f);
+
+    // Create a caller that calls det_fn twice with same args
+    var caller: L2Function = L2Function_new("caller", IrType::I64);
+    L2Function_set_value(&mut caller, 0, L2Inst::ConstInt(1, IrType::I64));
+    var args1: Vec<i64> = Vec::new();
+    args1.push(0);
+    L2Function_set_value(&mut caller, 1, L2Inst::Call("det_fn", args1, IrType::I64));
+    var args2: Vec<i64> = Vec::new();
+    args2.push(0);
+    L2Function_set_value(&mut caller, 2, L2Inst::Call("det_fn", args2, IrType::I64));
+    L2Function_set_value(&mut caller, 3, L2Inst::Return(1));
+
+    var cb: L2Block = L2Block_new(0);
+    cb.instructions.push(0);
+    cb.instructions.push(1);
+    cb.instructions.push(2);
+    cb.instructions.push(3);
+    caller.blocks.push(cb);
+    caller.entry = 0;
+    module.functions.push(caller);
+
+    var count: i64 = pass_memoize(&mut module);
+    assert_true(count >= 1, "memoize replaces at least 1 duplicate call");
+}
+
+// ── Test 20: pass_devirt with single impl ──
+fn test_pass_devirt() -> void {
+    print("Test 20: pass_devirt...\n");
+    var module: L2Module = L2Module_new();
+
+    // Add a trait with single impl
+    var types: Vec<str> = Vec::new();
+    types.push("Point");
+    module.trait_impls.push(StringVecStr_new("Display", types));
+
+    var f: L2Function = L2Function_new("test_devirt", IrType::I64);
+    // v0 = DynCall("Display", "fmt", [1], I64)
+    var args: Vec<i64> = Vec::new();
+    args.push(1);
+    L2Function_set_value(&mut f, 0, L2Inst::DynCall("Display", "fmt", args, IrType::I64));
+    L2Function_set_value(&mut f, 1, L2Inst::Return(0));
+
+    var b: L2Block = L2Block_new(0);
+    b.instructions.push(0);
+    b.instructions.push(1);
+    f.blocks.push(b);
+    f.entry = 0;
+    module.functions.push(f);
+
+    var count: i64 = pass_devirt(&mut module);
+    assert_eq_i64(count, 1, "devirt converts 1 DynCall");
+
+    // v0 should now be Call("Point_fmt", ...)
+    match L2Function_get_value(&module.functions.get(0), 0) {
+        OptL2Inst::Some(inst) => {
+            match inst {
+                L2Inst::Call(func, _, _) => { assert_eq(func, "Point_fmt", "devirt mangled name"); }
+                _ => { p_panic("FAIL: v0 should be Call after devirt"); }
+            }
+        }
+        OptL2Inst::None => { p_panic("FAIL: v0 not found"); }
+    }
+}
+
+// ── Test 21: pass_partial_eval ──
+fn test_pass_partial_eval() {
+    print("Test 21: pass_partial_eval...\n");
+    // Create a module with a pure function and a call with constant args
+    var module: L2Module = L2Module_new();
+
+    // Pure function: add(a, b) -> a + b
+    var callee: L2Function = L2Function_new("my_add", IrType::I64);
+    callee.is_pure = true;
+    // params: 0 = a, 1 = b
+    callee.params.push(ValueIdType_new(0, IrType::I64));
+    callee.params.push(ValueIdType_new(1, IrType::I64));
+
+    var blk: L2Block = L2Block_new(0);
+    // v2 = BinOp(Add, 0, 1)  -- a + b
+    L2Function_set_value(&mut callee, 2, L2Inst::BinOp(BinOp::Add, 0, 1, IrType::I64));
+    blk.instructions.push(2);
+    // v3 = Return(v2)
+    L2Function_set_value(&mut callee, 3, L2Inst::Return(2));
+    blk.instructions.push(3);
+    callee.blocks.push(blk);
+    module.functions.push(callee);
+
+    // Caller: calls my_add(3, 4) with constant args
+    var caller: L2Function = L2Function_new("caller", IrType::I64);
+    var blk2: L2Block = L2Block_new(0);
+    // v0 = ConstInt(3)
+    L2Function_set_value(&mut caller, 0, L2Inst::ConstInt(3, IrType::I64));
+    blk2.instructions.push(0);
+    // v1 = ConstInt(4)
+    L2Function_set_value(&mut caller, 1, L2Inst::ConstInt(4, IrType::I64));
+    blk2.instructions.push(1);
+    // v2 = Call("my_add", [0, 1], I64)
+    var args: Vec<i64> = Vec::new();
+    args.push(0);
+    args.push(1);
+    L2Function_set_value(&mut caller, 2, L2Inst::Call("my_add", args, IrType::I64));
+    blk2.instructions.push(2);
+    // v3 = Return(v2)
+    L2Function_set_value(&mut caller, 3, L2Inst::Return(2));
+    blk2.instructions.push(3);
+    caller.blocks.push(blk2);
+    module.functions.push(caller);
+
+    var count: i64 = pass_partial_eval(&mut module);
+    assert_true(count >= 1, "partial_eval folds at least 1 call");
+
+    // The call (v2) should now be a ConstInt(7)
+    match L2Function_get_value(&module.functions.get(1), 2) {
+        OptL2Inst::Some(inst) => {
+            match inst {
+                L2Inst::ConstInt(v, _) => { assert_eq_i64(v, 7, "partial_eval folds my_add(3,4) = 7"); }
+                _ => { p_panic("FAIL: v2 should be ConstInt(7) after partial_eval"); }
+            }
+        }
+        OptL2Inst::None => { p_panic("FAIL: v2 not found"); }
+    }
+}
+
+// ── Test 22: pass_inline ──
+fn test_pass_inline() {
+    print("Test 22: pass_inline...\n");
+    var module: L2Module = L2Module_new();
+
+    // Small function: double(x) -> x * 2
+    var callee: L2Function = L2Function_new("double", IrType::I64);
+    callee.is_pure = true;
+    callee.params.push(ValueIdType_new(0, IrType::I64));
+    var blk: L2Block = L2Block_new(0);
+    // v1 = ConstInt(2)
+    L2Function_set_value(&mut callee, 1, L2Inst::ConstInt(2, IrType::I64));
+    blk.instructions.push(1);
+    // v2 = BinOp(Mul, 0, 1)  -- x * 2
+    L2Function_set_value(&mut callee, 2, L2Inst::BinOp(BinOp::Mul, 0, 1, IrType::I64));
+    blk.instructions.push(2);
+    // v3 = Return(v2)
+    L2Function_set_value(&mut callee, 3, L2Inst::Return(2));
+    blk.instructions.push(3);
+    callee.blocks.push(blk);
+    module.functions.push(callee);
+
+    // Caller: calls double(5)
+    var caller: L2Function = L2Function_new("caller", IrType::I64);
+    var blk2: L2Block = L2Block_new(0);
+    // v0 = ConstInt(5)
+    L2Function_set_value(&mut caller, 0, L2Inst::ConstInt(5, IrType::I64));
+    blk2.instructions.push(0);
+    // v1 = Call("double", [0], I64)
+    var args: Vec<i64> = Vec::new();
+    args.push(0);
+    L2Function_set_value(&mut caller, 1, L2Inst::Call("double", args, IrType::I64));
+    blk2.instructions.push(1);
+    // v2 = Return(v1)
+    L2Function_set_value(&mut caller, 2, L2Inst::Return(1));
+    blk2.instructions.push(2);
+    caller.blocks.push(blk2);
+    module.functions.push(caller);
+
+    var count: i64 = pass_inline(&mut module);
+    assert_true(count >= 1, "inline inlines at least 1 call");
+
+    // The call (v1) should be gone — replaced by inlined instructions
+    match L2Function_get_value(&module.functions.get(1), 1) {
+        OptL2Inst::Some(_) => { p_panic("FAIL: v1 (call) should be removed by inline"); }
+        OptL2Inst::None => { print("  OK: call removed by inline\n"); }
+    }
+}
+
+// ── Test 23: pass_unroll ──
+fn test_pass_unroll() {
+    print("Test 23: pass_unroll...\n");
+    var module: L2Module = L2Module_new();
+    var f: L2Function = L2Function_new("loop_test", IrType::I64);
+
+    // Create a simple counted loop:
+    // Block 0 (header): Branch(Lt(Load(1), ConstInt(3)), 1, 2)
+    // Block 1 (body): Store(Add(Load(1), 1), 1) Jump(0)
+    // Block 2 (exit): Return(0)
+
+    // v0 = Alloca(I64)  -- loop counter
+    L2Function_set_value(&mut f, 0, L2Inst::Alloca(IrType::I64, MemRegion::Stack));
+    // v1 = ConstInt(0)  -- initial value
+    L2Function_set_value(&mut f, 1, L2Inst::ConstInt(0, IrType::I64));
+    // v2 = Store(0, 1)  -- i = 0
+    L2Function_set_value(&mut f, 2, L2Inst::Store(0, 1, IrType::I64));
+
+    // v3 = Load(0)  -- load i
+    L2Function_set_value(&mut f, 3, L2Inst::Load(0, IrType::I64));
+    // v4 = ConstInt(3)  -- trip count
+    L2Function_set_value(&mut f, 4, L2Inst::ConstInt(3, IrType::I64));
+    // v5 = BinOp(Lt, 3, 4)  -- i < 3
+    L2Function_set_value(&mut f, 5, L2Inst::BinOp(BinOp::Lt, 3, 4, IrType::I64));
+    // v6 = Branch(5, 1, 2)  -- if i < 3 goto body(1) else exit(2)
+    L2Function_set_value(&mut f, 6, L2Inst::Branch(5, 1, 2));
+
+    var header: L2Block = L2Block_new(0);
+    header.instructions.push(0);
+    header.instructions.push(1);
+    header.instructions.push(2);
+    header.instructions.push(3);
+    header.instructions.push(4);
+    header.instructions.push(5);
+    header.instructions.push(6);
+    f.blocks.push(header);
+
+    // Body block (id=1):
+    // v7 = Load(0)  -- load i
+    L2Function_set_value(&mut f, 7, L2Inst::Load(0, IrType::I64));
+    // v8 = ConstInt(1)
+    L2Function_set_value(&mut f, 8, L2Inst::ConstInt(1, IrType::I64));
+    // v9 = BinOp(Add, 7, 8)  -- i + 1
+    L2Function_set_value(&mut f, 9, L2Inst::BinOp(BinOp::Add, 7, 8, IrType::I64));
+    // v10 = Store(0, 9)  -- i = i + 1
+    L2Function_set_value(&mut f, 10, L2Inst::Store(0, 9, IrType::I64));
+    // v11 = Jump(0)  -- back to header
+    L2Function_set_value(&mut f, 11, L2Inst::Jump(0));
+
+    var body: L2Block = L2Block_new(1);
+    body.instructions.push(7);
+    body.instructions.push(8);
+    body.instructions.push(9);
+    body.instructions.push(10);
+    body.instructions.push(11);
+    f.blocks.push(body);
+
+    // Exit block (id=2):
+    // v12 = Return(0)  -- return 0 (or whatever)
+    L2Function_set_value(&mut f, 12, L2Inst::Return(0));
+    var exit: L2Block = L2Block_new(2);
+    exit.instructions.push(12);
+    f.blocks.push(exit);
+
+    module.functions.push(f);
+
+    var count: i64 = pass_unroll(&mut module);
+    assert_true(count >= 1, "unroll unrolls at least 1 loop");
+}
+
+// ── Test 24: pass_alias_analysis ──
+fn test_pass_alias_analysis() {
+    print("Test 24: pass_alias_analysis...\n");
+    var module: L2Module = L2Module_new();
+    var f: L2Function = L2Function_new("alias_test", IrType::I64);
+
+    // Create two allocas and redundant loads from the first
+    // v0 = Alloca(I64)
+    L2Function_set_value(&mut f, 0, L2Inst::Alloca(IrType::I64, MemRegion::Stack));
+    // v1 = Alloca(I64)
+    L2Function_set_value(&mut f, 1, L2Inst::Alloca(IrType::I64, MemRegion::Stack));
+
+    // v2 = Store(0, 42)  -- store to v0
+    L2Function_set_value(&mut f, 2, L2Inst::Store(0, L2Inst::ConstInt(42, IrType::I64), IrType::I64));
+    // v3 = Load(0)  -- first load from v0
+    L2Function_set_value(&mut f, 3, L2Inst::Load(0, IrType::I64));
+    // v4 = Store(1, 99)  -- store to v1 (different alloca)
+    L2Function_set_value(&mut f, 4, L2Inst::Store(1, L2Inst::ConstInt(99, IrType::I64), IrType::I64));
+    // v5 = Load(0)  -- second load from v0 (redundant — v0 not modified by store to v1)
+    L2Function_set_value(&mut f, 5, L2Inst::Load(0, IrType::I64));
+    // v6 = Return(5)
+    L2Function_set_value(&mut f, 6, L2Inst::Return(5));
+
+    var blk: L2Block = L2Block_new(0);
+    blk.instructions.push(0);
+    blk.instructions.push(1);
+    blk.instructions.push(2);
+    blk.instructions.push(3);
+    blk.instructions.push(4);
+    blk.instructions.push(5);
+    blk.instructions.push(6);
+    f.blocks.push(blk);
+    module.functions.push(f);
+
+    var count: i64 = pass_alias_analysis(&mut module);
+    // Should eliminate the redundant load (v5) since store to v1 can't alias v0
+    assert_true(count >= 1, "alias_analysis eliminates at least 1 redundant load");
+
+    // v5 should now be a Copy of v3
+    match L2Function_get_value(&module.functions.get(0), 5) {
+        OptL2Inst::Some(inst) => {
+            match inst {
+                L2Inst::Copy(src, _) => { assert_eq_i64(src, 3, "alias_analysis replaces v5 with Copy(v3)"); }
+                _ => { p_panic("FAIL: v5 should be Copy(v3) after alias_analysis"); }
+            }
+        }
+        OptL2Inst::None => { p_panic("FAIL: v5 not found"); }
+    }
+}
+
+// ── Test 25: pass_effect_optimize ──
+fn test_pass_effect_optimize() {
+    print("Test 25: pass_effect_optimize...\n");
+    var module: L2Module = L2Module_new();
+
+    // Pure function whose result is unused — should be eliminated
+    var f: L2Function = L2Function_new("test_eff", IrType::I64);
+    var blk: L2Block = L2Block_new(0);
+
+    // v0 = ConstInt(10)
+    L2Function_set_value(&mut f, 0, L2Inst::ConstInt(10, IrType::I64));
+    blk.instructions.push(0);
+
+    // v1 = Call("p_add", [0, 0], I64) — pure call, result unused
+    var args: Vec<i64> = Vec::new();
+    args.push(0);
+    args.push(0);
+    L2Function_set_value(&mut f, 1, L2Inst::Call("p_add", args, IrType::I64));
+    blk.instructions.push(1);
+
+    // v2 = Return(0) — returns v0, not v1
+    L2Function_set_value(&mut f, 2, L2Inst::Return(0));
+    blk.instructions.push(2);
+
+    f.blocks.push(blk);
+    module.functions.push(f);
+
+    var count: i64 = pass_effect_optimize(&mut module);
+    assert_true(count >= 1, "effect_optimize eliminates at least 1 dead pure call");
+
+    // v1 (the dead call) should be removed
+    match L2Function_get_value(&module.functions.get(0), 1) {
+        OptL2Inst::Some(_) => { p_panic("FAIL: v1 (dead call) should be removed"); }
+        OptL2Inst::None => { print("  OK: dead pure call removed\n"); }
+    }
+}
+
+// ── Test 26: pass_loop_vectorize ──
+fn test_pass_loop_vectorize() {
+    print("Test 26: pass_loop_vectorize...\n");
+    var module: L2Module = L2Module_new();
+    var f: L2Function = L2Function_new("vec_test", IrType::I64);
+
+    // Create a counted loop with trip count 8 (divisible by 4)
+    // v0 = Alloca(I64) -- loop counter
+    L2Function_set_value(&mut f, 0, L2Inst::Alloca(IrType::I64, MemRegion::Stack));
+    // v1 = ConstInt(0)
+    L2Function_set_value(&mut f, 1, L2Inst::ConstInt(0, IrType::I64));
+    // v2 = Store(0, 1) -- i = 0
+    L2Function_set_value(&mut f, 2, L2Inst::Store(0, 1, IrType::I64));
+
+    // v3 = Load(0)
+    L2Function_set_value(&mut f, 3, L2Inst::Load(0, IrType::I64));
+    // v4 = ConstInt(8) -- trip count
+    L2Function_set_value(&mut f, 4, L2Inst::ConstInt(8, IrType::I64));
+    // v5 = BinOp(Lt, 3, 4)
+    L2Function_set_value(&mut f, 5, L2Inst::BinOp(BinOp::Lt, 3, 4, IrType::I64));
+    // v6 = Branch(5, 1, 2)
+    L2Function_set_value(&mut f, 6, L2Inst::Branch(5, 1, 2));
+
+    var header: L2Block = L2Block_new(0);
+    header.instructions.push(0);
+    header.instructions.push(1);
+    header.instructions.push(2);
+    header.instructions.push(3);
+    header.instructions.push(4);
+    header.instructions.push(5);
+    header.instructions.push(6);
+    f.blocks.push(header);
+
+    // Body block (id=1) with array op + increment
+    // v7 = Load(0)
+    L2Function_set_value(&mut f, 7, L2Inst::Load(0, IrType::I64));
+    // v8 = GetElemPtr(some_array, 7, I64) -- array access
+    L2Function_set_value(&mut f, 8, L2Inst::GetElemPtr(0, 7, IrType::I64));
+    // v9 = Load(8) -- load from array
+    L2Function_set_value(&mut f, 9, L2Inst::Load(8, IrType::I64));
+    // v10 = ConstInt(1)
+    L2Function_set_value(&mut f, 10, L2Inst::ConstInt(1, IrType::I64));
+    // v11 = BinOp(Add, 7, 10) -- i + 1
+    L2Function_set_value(&mut f, 11, L2Inst::BinOp(BinOp::Add, 7, 10, IrType::I64));
+    // v12 = Store(0, 11) -- i = i + 1
+    L2Function_set_value(&mut f, 12, L2Inst::Store(0, 11, IrType::I64));
+    // v13 = Jump(0)
+    L2Function_set_value(&mut f, 13, L2Inst::Jump(0));
+
+    var body: L2Block = L2Block_new(1);
+    body.instructions.push(7);
+    body.instructions.push(8);
+    body.instructions.push(9);
+    body.instructions.push(10);
+    body.instructions.push(11);
+    body.instructions.push(12);
+    body.instructions.push(13);
+    f.blocks.push(body);
+
+    // Exit block (id=2):
+    // v14 = Return(0)
+    L2Function_set_value(&mut f, 14, L2Inst::Return(0));
+    var exit: L2Block = L2Block_new(2);
+    exit.instructions.push(14);
+    f.blocks.push(exit);
+
+    module.functions.push(f);
+
+    var count: i64 = pass_loop_vectorize(&mut module);
+    // Should vectorize: change increment from 1 to 4
+    assert_true(count >= 1, "loop_vectorize widens at least 1 loop step");
+}
+
+// ── Main ──
+fn main() -> i64 {
+    print("=== compiler::opt tests ===\n\n");
+
+    test_pass_name();
+    test_pass_parse();
+    test_opt_stats();
+    test_pass_all();
+    test_is_known_pure_func();
+    test_has_side_effects();
+    test_is_pure();
+    test_value_refs();
+    test_i64_vec_contains();
+    test_str_vec_contains();
+    test_exact_log2();
+    test_pass_const_fold();
+    test_const_fold_branch();
+    test_pass_dce();
+    test_pass_strength_reduce();
+    test_pass_cse();
+    test_optimize_l2_empty();
+    test_pass_reassociate();
+    test_pass_memoize();
+    test_pass_devirt();
+    test_pass_partial_eval();
+    test_pass_inline();
+    test_pass_unroll();
+    test_pass_alias_analysis();
+    test_pass_effect_optimize();
+    test_pass_loop_vectorize();
+
+    print("\n=== All opt tests passed ===\n");
+    return 0;
+}
