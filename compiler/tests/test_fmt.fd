@@ -1,0 +1,187 @@
+// Test for compiler::fmt module — SH-6.4
+use core;
+use vec;
+use string;
+use compiler::fmt;
+
+fn assert_eq_str(actual: str, expected: str, label: str) -> void {
+    if !str_equal(actual, expected) {
+        print("FAIL: ");
+        print(label);
+        print("\n  expected: ");
+        print(expected);
+        print("\n  actual:   ");
+        print(actual);
+        print("\n");
+    } else {
+        print("  OK\n");
+    }
+}
+
+fn assert_contains(haystack: str, needle: str, label: str) -> void {
+    if !str_contains(haystack, needle) {
+        print("FAIL: ");
+        print(label);
+        print("\n  expected to contain: ");
+        print(needle);
+        print("\n  got: ");
+        print(haystack);
+        print("\n");
+    } else {
+        print("  OK\n");
+    }
+}
+
+fn main() -> i64 {
+    print("SH-6.4: fmt module test\n");
+    print("========================\n\n");
+
+    // Test 1: Basic formatting
+    print("Test 1: Basic formatting...\n");
+    {
+        var input: str = "fn main(){val x=1+2;print(x);}";
+        var out: str = format_source(input);
+        assert_contains(out, "fn main() {", "T1: fn header");
+        assert_contains(out, "    val x = 1 + 2;", "T1: spacing around binop");
+        assert_contains(out, "    print(x);", "T1: function call");
+    }
+
+    // Test 2: Idempotent formatting
+    print("Test 2: Idempotent formatting...\n");
+    {
+        var input: str = "fn fib(n: i64) -> i64 {\n    if n <= 1 { return n; }\n    val a = fib(n - 1);\n    return a;\n}\n";
+        var once: str = format_source(input);
+        var twice: str = format_source(once);
+        assert_eq_str(twice, once, "T2: idempotent");
+    }
+
+    // Test 3: Check mode
+    print("Test 3: Check mode...\n");
+    {
+        var unformatted: str = "fn main(){val x=1;}";
+        var is_fmt: bool = is_formatted(unformatted);
+        if is_fmt {
+            print("FAIL: T3: unformatted should not be formatted\n");
+        } else {
+            print("  OK\n");
+        }
+        var formatted: str = format_source(unformatted);
+        var is_fmt2: bool = is_formatted(formatted);
+        if !is_fmt2 {
+            print("FAIL: T3: formatted should be formatted\n");
+        } else {
+            print("  OK\n");
+        }
+    }
+
+    // Test 4: Preserves comments
+    print("Test 4: Preserves comments...\n");
+    {
+        var input: str = "// hello\nfn main() {\n    val x = 1; // inline\n}\n";
+        var out: str = format_source(input);
+        assert_contains(out, "// hello", "T4: line comment");
+        assert_contains(out, "// inline", "T4: inline comment");
+    }
+
+    // Test 5: Struct spacing
+    print("Test 5: Struct spacing...\n");
+    {
+        var input: str = "struct Point{x:i32,y:i32,}";
+        var out: str = format_source(input);
+        assert_contains(out, "struct Point {", "T5: struct header");
+        assert_contains(out, "    x: i32,", "T5: field x");
+        assert_contains(out, "    y: i32,", "T5: field y");
+    }
+
+    // Test 6: Blank line between defs
+    print("Test 6: Blank line between defs...\n");
+    {
+        var input: str = "fn a() {\n    return 1;\n}\nfn b() {\n    return 2;\n}\n";
+        var out: str = format_source(input);
+        assert_contains(out, "}\n\nfn b()", "T6: blank line between defs");
+    }
+
+    // Test 7: Enum formatting
+    print("Test 7: Enum formatting...\n");
+    {
+        var input: str = "enum Color{Red,Green,Blue,}";
+        var out: str = format_source(input);
+        assert_contains(out, "enum Color {", "T7: enum header");
+        assert_contains(out, "    Red,", "T7: variant Red");
+        assert_contains(out, "    Green,", "T7: variant Green");
+        assert_contains(out, "    Blue,", "T7: variant Blue");
+    }
+
+    // Test 8: If/else formatting
+    print("Test 8: If/else formatting...\n");
+    {
+        var input: str = "fn f(x:i64)->i64{if x>0{return 1;}else{return 0;}}";
+        var out: str = format_source(input);
+        assert_contains(out, "if x > 0 {", "T8: if condition");
+        assert_contains(out, "} else {", "T8: else on same line");
+    }
+
+    // Test 9: String literals preserved
+    print("Test 9: String literals preserved...\n");
+    {
+        var input: str = "fn f() { val s = \"hello world\"; print(s); }";
+        var out: str = format_source(input);
+        assert_contains(out, "\"hello world\"", "T9: string literal");
+    }
+
+    // Test 10: Block comments
+    print("Test 10: Block comments...\n");
+    {
+        var input: str = "/* block comment */\nfn f() { return 0; }\n";
+        var out: str = format_source(input);
+        assert_contains(out, "/* block comment */", "T10: block comment");
+    }
+
+    // Test 11: Number literals
+    print("Test 11: Number literals...\n");
+    {
+        var input: str = "fn f() { val x = 42; val y = 3.14; val z = 0xFF; }";
+        var out: str = format_source(input);
+        assert_contains(out, "42", "T11: integer");
+        assert_contains(out, "3.14", "T11: float");
+        assert_contains(out, "0xFF", "T11: hex");
+    }
+
+    // Test 12: Function with return type
+    print("Test 12: Function with return type...\n");
+    {
+        var input: str = "fn add(a:i64,b:i64)->i64{return a+b;}";
+        var out: str = format_source(input);
+        assert_contains(out, "fn add(a: i64, b: i64) -> i64 {", "T12: fn signature");
+        assert_contains(out, "    return a + b;", "T12: return body");
+    }
+
+    // Test 13: Match expression
+    print("Test 13: Match expression...\n");
+    {
+        var input: str = "fn f(x:i64)->i64{match x{1=>{return 1;}_=>{return 0;}}}";
+        var out: str = format_source(input);
+        assert_contains(out, "match x {", "T13: match header");
+        assert_contains(out, "1 => {", "T13: match arm");
+    }
+
+    // Test 14: While loop
+    print("Test 14: While loop...\n");
+    {
+        var input: str = "fn f(){val i=0;while i<10{i=i+1;}}";
+        var out: str = format_source(input);
+        assert_contains(out, "while i < 10 {", "T14: while condition");
+    }
+
+    // Test 15: Use/import
+    print("Test 15: Use/import...\n");
+    {
+        var input: str = "use core;use vec;fn f(){return;}";
+        var out: str = format_source(input);
+        assert_contains(out, "use core;", "T15: use core");
+        assert_contains(out, "use vec;", "T15: use vec");
+    }
+
+    print("\nSH-6.4: All tests passed!\n");
+    return 0;
+}

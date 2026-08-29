@@ -6,6 +6,7 @@ pub mod borrowck;
 pub mod codegen;
 pub mod codegen_c;
 pub mod compiler;
+pub mod flat_ast;
 pub mod comptime;
 pub mod cparser;
 pub mod diag;

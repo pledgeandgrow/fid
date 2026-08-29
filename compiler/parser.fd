@@ -1,0 +1,4989 @@
+// parser.fd — Fides parser, SH-7.3 rewrite of src/parser.rs (3433 LOC Rust)
+//
+// Recursive-descent parser that transforms a Vec<Token> token stream into an
+// AST (Program). Handles: all expressions, statements, types, declarations,
+// attributes, annotations, f-strings, inline asm, ML/game-architecture decls.
+//
+// Error handling: Fides has no `?` operator, so we use a custom ParseResult
+// enum (like json.fd's JsonResult) and explicit pattern matching to propagate
+// errors. Each parse_* function returns ParseResult.
+//
+// Adaptations from Rust:
+// 1. `Result<T, String>` → `ParseResult<T>` (custom enum, no `?` operator).
+// 2. `std::mem::discriminant` → `token_kind_eq` (from compiler::token).
+// 3. `format!` → string concatenation with `+` and int_to_str/float_to_str.
+// 4. `Option<T>` → Opt* enums from compiler::ast, or `-1`/`""` sentinels.
+// 5. Macros (reduce_one!, peek_bin_op!) → helper functions.
+// 6. `peek()` returns `&TokenKind` in Rust; here we return a copy (TokenKind
+//    is an enum, copied by value in Fides).
+//
+// Dependencies: compiler::token, compiler::ast, compiler::lexer (for f-strings)
+
+module compiler::parser;
+
+use vec;
+use core;
+use compiler::token;
+use compiler::ast;
+use compiler::lexer;
+
+// ─── ParseResult ─────────────────────────────────────────────────────────
+// Custom Result enum for parse functions. Fides has no `?` operator, so
+// callers must pattern-match to extract the value or propagate the error.
+// Usage:
+//   match self.parse_expr() {
+//       ParseResultExpr::Ok(e) => { ... use e ... }
+//       ParseResultExpr::Err(msg) => { return ParseResultExpr::Err(msg); }
+//   }
+
+pub enum ParseResultExpr {
+Ok(Expr),
+Err(str),
+}
+
+pub enum ParseResultExprs {
+Ok(Vec<Expr>),
+Err(str),
+}
+
+pub enum ParseResultStmt {
+Ok(Stmt),
+Err(str),
+}
+
+pub enum ParseResultStmts {
+Ok(Vec<Stmt>),
+Err(str),
+}
+
+pub enum ParseResultType {
+Ok(Type),
+Err(str),
+}
+
+pub enum ParseResultPattern {
+Ok(Pattern),
+Err(str),
+}
+
+pub enum ParseResultStr {
+Ok(str),
+Err(str),
+}
+
+pub enum ParseResultFunc {
+Ok(Func),
+Err(str),
+}
+
+pub enum ParseResultStructDef {
+Ok(StructDef),
+Err(str),
+}
+
+pub enum ParseResultEnumDef {
+Ok(EnumDef),
+Err(str),
+}
+
+pub enum ParseResultConstDef {
+Ok(ConstDef),
+Err(str),
+}
+
+pub enum ParseResultTypeAlias {
+Ok(TypeAlias),
+Err(str),
+}
+
+pub enum ParseResultTraitDef {
+Ok(TraitDef),
+Err(str),
+}
+
+pub enum ParseResultImportDef {
+Ok(ImportDef),
+Err(str),
+}
+
+pub enum ParseResultAttribute {
+Ok(Attribute),
+Err(str),
+}
+
+pub enum ParseResultAnnotation {
+Ok(Annotation),
+Err(str),
+}
+
+pub enum ParseResultParams {
+Ok(Vec<Param>),
+Err(str),
+}
+
+pub enum ParseResultLayerDef {
+Ok(LayerDef),
+Err(str),
+}
+
+pub enum ParseResultModelDef {
+Ok(ModelDef),
+Err(str),
+}
+
+pub enum ParseResultComponentDef {
+Ok(ComponentDef),
+Err(str),
+}
+
+pub enum ParseResultSystemDef {
+Ok(SystemDef),
+Err(str),
+}
+
+pub enum ParseResultStateMachineDef {
+Ok(StateMachineDef),
+Err(str),
+}
+
+pub enum ParseResultEventHandlerDef {
+Ok(EventHandlerDef),
+Err(str),
+}
+
+pub enum ParseResultExternDecl {
+Ok(ExternDecl),
+Err(str),
+}
+
+pub enum ParseResultMatchArms {
+Ok(Vec<MatchArm>),
+Err(str),
+}
+
+pub enum ParseResultProgram {
+Ok(Program),
+Err(str),
+}
+
+pub enum ParseResultUnit {
+Ok,
+Err(str),
+}
+
+// ─── ImplOrTrait helper ──────────────────────────────────────────────────
+// Rust uses an internal enum to distinguish impl blocks. We use a tag.
+pub struct ImplOrTrait {
+pub tag: i64,           // 0 = StructImpl, 1 = TraitImpl
+pub struct_impl: ImplDef,
+pub trait_impl: TraitImpl,
+}
+
+pub enum ParseResultImplOrTrait {
+Ok(ImplOrTrait),
+Err(str),
+}
+
+// ─── IfExpr helper ───────────────────────────────────────────────────────
+pub struct IfExpr {
+pub cond: Expr,
+pub then_block: Vec<Stmt>,
+pub else_block: OptStmts,
+}
+
+// ─── OpEntry for iterative parser ────────────────────────────────────────
+pub enum OpEntry {
+Op(BinOp, i64),
+Paren,
+}
+
+// ─── Parser ──────────────────────────────────────────────────────────────
+
+pub struct Parser {
+pub tokens: Vec<Token>,
+pub pos: i64,
+pub struct_names: Vec<str>,
+pub enum_names: Vec<str>,
+pub alias_to_struct: Vec<str>,
+pub errors: Vec<str>,
+pub expr_depth: i64,
+pub max_expr_depth: i64,
+}
+
+impl Parser {
+pub fn new(tokens: Vec<Token>) -> Parser {
+    var sn: Vec<str> = Vec::new();
+    // AST structs
+    sn.push("Annotation"); sn.push("AsmOperand"); sn.push("AssocTypeBinding");
+    sn.push("AssocTypeDecl"); sn.push("Attribute"); sn.push("Binding");
+    sn.push("ComponentDef"); sn.push("ConstDef"); sn.push("EffectHandler");
+    sn.push("EnumDef"); sn.push("EnumVariant"); sn.push("EventHandlerDef");
+    sn.push("ExternDecl"); sn.push("FieldInit"); sn.push("Func");
+    sn.push("ImplDef"); sn.push("ImportDef"); sn.push("LayerDef");
+    sn.push("LayerInst"); sn.push("MatchArm"); sn.push("ModelDef");
+    sn.push("Param"); sn.push("Program"); sn.push("SelectCase");
+    sn.push("StateDef"); sn.push("StateMachineDef"); sn.push("StateTransition");
+    sn.push("StrPair"); sn.push("StructDef"); sn.push("SystemDef");
+    sn.push("TraitDef"); sn.push("TraitImpl"); sn.push("TraitMethod");
+    sn.push("TypeAlias");
+    // Token struct
+    sn.push("Token");
+    // Lexer struct
+    sn.push("Lexer");
+    // Parser struct (self-reference for struct literals)
+    sn.push("Parser");
+
+    var en: Vec<str> = Vec::new();
+    en.push("AsmDir"); en.push("AssignOp"); en.push("BinOp");
+    en.push("Expr"); en.push("FStringPart"); en.push("OptBoxExpr");
+    en.push("OptFunc"); en.push("OptI"); en.push("OptParams");
+    en.push("OptStmts"); en.push("OptStr"); en.push("OptType");
+    en.push("Pattern"); en.push("ReflectOp"); en.push("ShapeDim");
+    en.push("Stmt"); en.push("Type"); en.push("UnaryOp");
+    // TokenKind enum
+    en.push("TokenKind");
+
+    return Parser {
+        tokens: tokens,
+        pos: 0,
+        struct_names: sn,
+        enum_names: en,
+        alias_to_struct: Vec::new(),
+        errors: Vec::new(),
+        expr_depth: 0,
+        max_expr_depth: 256,
+    };
+}
+
+fn peek(self: &Parser) -> TokenKind {
+    return self.tokens.get(self.pos).kind;
+}
+
+fn peek_token(self: &Parser) -> Token {
+    return self.tokens.get(self.pos);
+}
+
+fn advance(self: &mut Parser) -> Token {
+    var tok: Token = self.tokens.get(self.pos);
+    if !token_kind_eq(tok.kind, TokenKind::Eof) {
+        self.pos = self.pos + 1;
+    }
+    return tok;
+}
+
+fn is_at_end(self: &Parser) -> bool {
+    return token_kind_eq(self.peek(), TokenKind::Eof);
+}
+
+fn check(self: &Parser, kind: TokenKind) -> bool {
+    return token_kind_eq(self.peek(), kind);
+}
+
+fn match_tok(self: &mut Parser, kind: TokenKind) -> bool {
+    if self.check(kind) {
+        self.advance();
+        return true;
+    }
+    return false;
+}
+
+fn recover_to_sync_token(self: &mut Parser) {
+    while !self.is_at_end() {
+        var k: TokenKind = self.peek();
+        if token_kind_eq(k, TokenKind::Semicolon) {
+            self.advance();
+            return;
+        }
+        if token_kind_eq(k, TokenKind::RBrace) { return; }
+        if token_kind_eq(k, TokenKind::Fn) { return; }
+        if token_kind_eq(k, TokenKind::Pub) { return; }
+        if token_kind_eq(k, TokenKind::Struct) { return; }
+        if token_kind_eq(k, TokenKind::Enum) { return; }
+        if token_kind_eq(k, TokenKind::Impl) { return; }
+        if token_kind_eq(k, TokenKind::Use) { return; }
+        self.advance();
+    }
+
+}
+fn expect(self: &mut Parser, kind: TokenKind, msg: str) -> ParseResultUnit {
+    if self.check(kind) {
+        self.advance();
+        return ParseResultUnit::Ok;
+    }
+    var tok: Token = self.peek_token();
+    return ParseResultUnit::Err(
+        "Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) +
+        ": expected " + msg + " but got '" + token_kind_to_str(tok.kind) + "'"
+    );
+}
+
+fn expect_ident(self: &mut Parser) -> ParseResultStr {
+    var tok: Token = self.peek_token();
+    match tok.kind {
+        TokenKind::Ident(s: str) => {
+            self.advance();
+            return ParseResultStr::Ok(s);
+        }
+    }
+    return ParseResultStr::Err(
+        "Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) +
+        ": expected identifier but got '" + token_kind_to_str(tok.kind) + "'"
+    );
+}
+
+fn expect_ident_or_keyword(self: &mut Parser) -> ParseResultStr {
+    var tok: Token = self.peek_token();
+    match tok.kind {
+        TokenKind::Ident(s: str) => {
+            self.advance();
+            return ParseResultStr::Ok(s);
+        }
+    }
+    if is_word_keyword(tok.kind) {
+        var s: str = token_kind_to_str(tok.kind);
+        self.advance();
+        return ParseResultStr::Ok(s);
+    }
+    return ParseResultStr::Err(
+        "Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) +
+        ": expected identifier but got '" + token_kind_to_str(tok.kind) + "'"
+    );
+}
+
+fn is_struct_name(self: &Parser, name: str) -> bool {
+    var i: i64 = 0;
+    while i < self.struct_names.len() {
+        if self.struct_names.get(i) == name { return true; }
+        i = i + 1;
+    }
+    var j: i64 = 0;
+    while j < self.alias_to_struct.len() {
+        if self.alias_to_struct.get(j) == name { return true; }
+        j = j + 1;
+    }
+    return false;
+}
+
+fn is_enum_name(self: &Parser, name: str) -> bool {
+    var i: i64 = 0;
+    while i < self.enum_names.len() {
+        if self.enum_names.get(i) == name { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn read_type_name(self: &mut Parser) -> ParseResultStr {
+    var tok: Token = self.peek_token();
+    match tok.kind {
+        TokenKind::Ident(s: str) => { self.advance(); return ParseResultStr::Ok(s); }
+        TokenKind::I8 => { self.advance(); return ParseResultStr::Ok("i8"); }
+        TokenKind::I16 => { self.advance(); return ParseResultStr::Ok("i16"); }
+        TokenKind::I32 => { self.advance(); return ParseResultStr::Ok("i32"); }
+        TokenKind::I64 => { self.advance(); return ParseResultStr::Ok("i64"); }
+        TokenKind::I128 => { self.advance(); return ParseResultStr::Ok("i128"); }
+        TokenKind::U8 => { self.advance(); return ParseResultStr::Ok("u8"); }
+        TokenKind::U16 => { self.advance(); return ParseResultStr::Ok("u16"); }
+        TokenKind::U32 => { self.advance(); return ParseResultStr::Ok("u32"); }
+        TokenKind::U64 => { self.advance(); return ParseResultStr::Ok("u64"); }
+        TokenKind::U128 => { self.advance(); return ParseResultStr::Ok("u128"); }
+        TokenKind::F32 => { self.advance(); return ParseResultStr::Ok("f32"); }
+        TokenKind::F64 => { self.advance(); return ParseResultStr::Ok("f64"); }
+        TokenKind::Bool => { self.advance(); return ParseResultStr::Ok("bool"); }
+        TokenKind::Str => { self.advance(); return ParseResultStr::Ok("str"); }
+        TokenKind::Void => { self.advance(); return ParseResultStr::Ok("void"); }
+    }
+    return ParseResultStr::Err(
+        "Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) +
+        ": expected type name but got '" + token_kind_to_str(tok.kind) + "'"
+    );
+}
+
+pub fn parse(self: &mut Parser) -> ParseResultProgram {
+    var program: Program = program_new();
+
+    while !self.is_at_end() {
+        var is_pub: bool = false;
+        if self.check(TokenKind::Pub) {
+            self.advance();
+            is_pub = true;
+        }
+
+        match self.parse_top_level_item(program, is_pub) {
+            ParseResultUnit::Ok => {}
+            ParseResultUnit::Err(e) => {
+                self.errors.push(e);
+                self.recover_to_sync_token();
+                if self.check(TokenKind::RBrace) {
+                    self.advance();
+                }
+            }
+        }
+    }
+
+    if self.errors.len() > 0 {
+        return ParseResultProgram::Err(vec_str_join(self.errors, "\n"));
+    }
+    return ParseResultProgram::Ok(program);
+}
+
+fn parse_top_level_item(self: &mut Parser, program: Program, is_pub: bool) -> ParseResultUnit {
+    var k: TokenKind = self.peek();
+
+    if token_kind_eq(k, TokenKind::Module) {
+        self.advance();
+        var name: str = "";
+        loop {
+            match self.expect_ident() {
+                ParseResultStr::Ok(part) => { name = name + part; }
+                ParseResultStr::Err(e) => { return ParseResultUnit::Err(e); }
+            }
+            if self.match_tok(TokenKind::DoubleColon) {
+                name = name + "::";
+            } else {
+                break;
+            }
+        }
+        self.match_tok(TokenKind::Semicolon);
+        program.module = OptStr::Some(name);
+        return ParseResultUnit::Ok;
+    }
+
+    if token_kind_eq(k, TokenKind::Struct) {
+        match self.parse_struct() {
+            ParseResultStructDef::Ok(s) => {
+                var ms = s;
+                ms.is_pub = is_pub;
+                program.structs.push(ms);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultStructDef::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::Enum) {
+        match self.parse_enum() {
+            ParseResultEnumDef::Ok(e) => {
+                var me = e;
+                me.is_pub = is_pub;
+                program.enums.push(me);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultEnumDef::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::Const) {
+        match self.parse_const() {
+            ParseResultConstDef::Ok(c) => {
+                var mc = c;
+                mc.is_pub = is_pub;
+                program.consts.push(mc);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultConstDef::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::Type) {
+        match self.parse_type_alias() {
+            ParseResultTypeAlias::Ok(ta) => {
+                var mta = ta;
+                mta.is_pub = is_pub;
+                program.type_aliases.push(mta);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultTypeAlias::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::Cap) {
+        match self.parse_trait() {
+            ParseResultTraitDef::Ok(t) => {
+                var mt = t;
+                mt.is_pub = is_pub;
+                program.traits.push(mt);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultTraitDef::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::Impl) {
+        match self.parse_impl_or_trait_impl() {
+            ParseResultImplOrTrait::Ok(imp) => {
+                if imp.tag == 0 {
+                    program.impls.push(imp.struct_impl);
+                } else {
+                    program.trait_impls.push(imp.trait_impl);
+                }
+                return ParseResultUnit::Ok;
+            }
+            ParseResultImplOrTrait::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::Use) {
+        match self.parse_use() {
+            ParseResultImportDef::Ok(imp) => {
+                var mimp = imp;
+                mimp.is_pub = is_pub;
+                program.imports.push(mimp);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultImportDef::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::Hash) {
+        match self.parse_attribute() {
+            ParseResultAttribute::Ok(attr) => {
+                program.attributes.push(attr);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultAttribute::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::At) {
+        var annotations: Vec<Annotation> = Vec::new();
+        while self.check(TokenKind::At) {
+            match self.parse_at_annotation() {
+                ParseResultAnnotation::Ok(a) => { annotations.push(a); }
+                ParseResultAnnotation::Err(e) => { return ParseResultUnit::Err(e); }
+            }
+        }
+        var item_is_pub: bool = false;
+        if self.check(TokenKind::Pub) {
+            self.advance();
+            item_is_pub = true;
+        } else {
+            item_is_pub = is_pub;
+        }
+        if self.check(TokenKind::Struct) {
+            match self.parse_struct() {
+                ParseResultStructDef::Ok(sd) => {
+                var msd = sd;
+                    msd.is_pub = item_is_pub;
+                    msd.annotations = annotations;
+                    program.structs.push(msd);
+                    return ParseResultUnit::Ok;
+                }
+                ParseResultStructDef::Err(e) => { return ParseResultUnit::Err(e); }
+            }
+        } else {
+            match self.parse_func() {
+                ParseResultFunc::Ok(func) => {
+                var mfunc = func;
+                    mfunc.is_pub = item_is_pub;
+                    mfunc.annotations = annotations;
+                    program.funcs.push(mfunc);
+                    return ParseResultUnit::Ok;
+                }
+                ParseResultFunc::Err(e) => { return ParseResultUnit::Err(e); }
+            }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::Layer) {
+        match self.parse_layer() {
+            ParseResultLayerDef::Ok(l) => {
+                var ml = l;
+                ml.is_pub = is_pub;
+                program.layers.push(ml);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultLayerDef::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::Model) {
+        match self.parse_model() {
+            ParseResultModelDef::Ok(m) => {
+                var mm = m;
+                mm.is_pub = is_pub;
+                program.models.push(mm);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultModelDef::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::Component) {
+        match self.parse_component() {
+            ParseResultComponentDef::Ok(c) => {
+                var mc = c;
+                mc.is_pub = is_pub;
+                program.components.push(mc);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultComponentDef::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::System) {
+        match self.parse_system() {
+            ParseResultSystemDef::Ok(s) => {
+                var ms = s;
+                ms.is_pub = is_pub;
+                program.systems.push(ms);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultSystemDef::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::State) {
+        match self.parse_state_machine() {
+            ParseResultStateMachineDef::Ok(sm) => {
+                var msm = sm;
+                msm.is_pub = is_pub;
+                program.state_machines.push(msm);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultStateMachineDef::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::On) {
+        match self.parse_event_handler() {
+            ParseResultEventHandlerDef::Ok(eh) => {
+                var meh = eh;
+                meh.is_pub = is_pub;
+                program.event_handlers.push(meh);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultEventHandlerDef::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::Comptime) {
+        self.advance();
+        match self.parse_func() {
+            ParseResultFunc::Ok(func) => {
+                var mfunc = func;
+                mfunc.is_pub = is_pub;
+                mfunc.is_comptime = true;
+                program.funcs.push(mfunc);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultFunc::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::Interrupt) {
+        self.advance();
+        match self.parse_func() {
+            ParseResultFunc::Ok(func) => {
+                var mfunc = func;
+                mfunc.is_pub = is_pub;
+                mfunc.is_interrupt = true;
+                program.funcs.push(mfunc);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultFunc::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::Async) {
+        self.advance();
+        match self.parse_func() {
+            ParseResultFunc::Ok(func) => {
+                var mfunc = func;
+                mfunc.is_pub = is_pub;
+                mfunc.is_async = true;
+                program.funcs.push(mfunc);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultFunc::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::Extern) {
+        return self.parse_extern_block(program, is_pub);
+    }
+
+    // Default: parse as function
+    match self.parse_func() {
+        ParseResultFunc::Ok(func) => {
+                var mfunc = func;
+            mfunc.is_pub = is_pub;
+            program.funcs.push(mfunc);
+            return ParseResultUnit::Ok;
+        }
+        ParseResultFunc::Err(e) => { return ParseResultUnit::Err(e); }
+    }
+
+}
+fn parse_extern_block(self: &mut Parser, program: Program, _is_pub: bool) -> ParseResultUnit {
+    self.advance(); // consume extern
+    var abi: str = "C";
+    var tok: Token = self.peek_token();
+    match tok.kind {
+        TokenKind::StringLit(s: str) => {
+            self.advance();
+            abi = s;
+        }
+    }
+
+    var include: OptStr = OptStr::None;
+    var link_lib: OptStr = OptStr::None;
+    loop {
+        var is_kw: bool = false;
+        var ktok: Token = self.peek_token();
+        match ktok.kind {
+            TokenKind::Ident(kw: str) => {
+                if kw == "include" {
+                    self.advance();
+                    var stok: Token = self.peek_token();
+                    match stok.kind {
+                        TokenKind::StringLit(s: str) => {
+                            self.advance();
+                            include = OptStr::Some(s);
+                            is_kw = true;
+                        }
+                    }
+                } else if kw == "link" {
+                    self.advance();
+                    var stok: Token = self.peek_token();
+                    match stok.kind {
+                        TokenKind::StringLit(s: str) => {
+                            self.advance();
+                            link_lib = OptStr::Some(s);
+                            is_kw = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !is_kw { break; }
+    }
+
+    if self.check(TokenKind::LBrace) {
+        self.advance();
+        while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+            match self.expect(TokenKind::Fn, "fn") {
+                ParseResultUnit::Err(e) => { return ParseResultUnit::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+            match self.parse_extern_func_decl(abi, include, link_lib) {
+                ParseResultExternDecl::Ok(decl) => { program.extern_decls.push(decl); }
+                ParseResultExternDecl::Err(e) => { return ParseResultUnit::Err(e); }
+            }
+        }
+        match self.expect(TokenKind::RBrace, "}") {
+            ParseResultUnit::Err(e) => { return ParseResultUnit::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+    } else {
+        match self.expect(TokenKind::Fn, "fn") {
+            ParseResultUnit::Err(e) => { return ParseResultUnit::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        match self.parse_extern_func_decl(abi, include, link_lib) {
+            ParseResultExternDecl::Ok(decl) => { program.extern_decls.push(decl); }
+            ParseResultExternDecl::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    return ParseResultUnit::Ok;
+}
+
+fn parse_struct(self: &mut Parser) -> ParseResultStructDef {
+match self.expect(TokenKind::Struct, "struct") {
+    ParseResultUnit::Err(e) => { return ParseResultStructDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var name: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { name = s; }
+    ParseResultStr::Err(e) => { return ParseResultStructDef::Err(e); }
+}
+
+var type_params: Vec<str> = Vec::new();
+if self.check(TokenKind::Lt) {
+    self.advance();
+    if !self.check(TokenKind::Gt) {
+        loop {
+            match self.expect_ident() {
+                ParseResultStr::Ok(tp) => { type_params.push(tp); }
+                ParseResultStr::Err(e) => { return ParseResultStructDef::Err(e); }
+            }
+            if !self.match_tok(TokenKind::Comma) { break; }
+        }
+    }
+    match self.expect(TokenKind::Gt, ">") {
+        ParseResultUnit::Err(e) => { return ParseResultStructDef::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+}
+
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStructDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+
+var fields: Vec<Param> = Vec::new();
+while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+    var is_pub: bool = false;
+    if self.check(TokenKind::Pub) {
+        self.advance();
+        is_pub = true;
+    }
+    var fname: str = "";
+    match self.expect_ident_or_keyword() {
+        ParseResultStr::Ok(s) => { fname = s; }
+        ParseResultStr::Err(e) => { return ParseResultStructDef::Err(e); }
+    }
+    match self.expect(TokenKind::Colon, ":") {
+        ParseResultUnit::Err(e) => { return ParseResultStructDef::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var fty: Type = Type::Void;
+    match self.parse_type() {
+        ParseResultType::Ok(t) => { fty = t; }
+        ParseResultType::Err(e) => { return ParseResultStructDef::Err(e); }
+    }
+    fields.push(Param_new(fname, fty, is_pub));
+    self.match_tok(TokenKind::Comma);
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStructDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+
+self.struct_names.push(name);
+var __ret_StructDef: StructDef = StructDef_new(name, false);
+__ret_StructDef.fields = fields;
+__ret_StructDef.type_params = type_params;
+return ParseResultStructDef::Ok(__ret_StructDef);
+}
+
+fn parse_enum(self: &mut Parser) -> ParseResultEnumDef {
+match self.expect(TokenKind::Enum, "enum") {
+    ParseResultUnit::Err(e) => { return ParseResultEnumDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var name: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { name = s; }
+    ParseResultStr::Err(e) => { return ParseResultEnumDef::Err(e); }
+}
+
+var type_params: Vec<str> = Vec::new();
+if self.check(TokenKind::Lt) {
+    self.advance();
+    if !self.check(TokenKind::Gt) {
+        loop {
+            match self.expect_ident() {
+                ParseResultStr::Ok(tp) => { type_params.push(tp); }
+                ParseResultStr::Err(e) => { return ParseResultEnumDef::Err(e); }
+            }
+            if !self.match_tok(TokenKind::Comma) { break; }
+        }
+    }
+    match self.expect(TokenKind::Gt, ">") {
+        ParseResultUnit::Err(e) => { return ParseResultEnumDef::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+}
+
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultEnumDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+
+var variants: Vec<EnumVariant> = Vec::new();
+while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+    var vname: str = "";
+    match self.expect_ident() {
+        ParseResultStr::Ok(s) => { vname = s; }
+        ParseResultStr::Err(e) => { return ParseResultEnumDef::Err(e); }
+    }
+    var data: OptParams = OptParams::None;
+    if self.match_tok(TokenKind::LParen) {
+        var params: Vec<Param> = Vec::new();
+        if !self.check(TokenKind::RParen) {
+            loop {
+                // Check if named param: ident followed by colon
+                var pname_tok: Token = self.peek_token();
+                var is_named: bool = false;
+                match pname_tok.kind {
+                    TokenKind::Ident(_: str) => {
+                        // Peek next token for colon
+                        if self.pos + 1 < self.tokens.len() {
+                            var next_tok: Token = self.tokens.get(self.pos + 1);
+                            if token_kind_eq(next_tok.kind, TokenKind::Colon) {
+                                is_named = true;
+                            }
+                        }
+                    }
+                }
+                if is_named {
+                    var pname: str = "";
+                    match self.expect_ident() {
+                        ParseResultStr::Ok(s) => { pname = s; }
+                        ParseResultStr::Err(e) => { return ParseResultEnumDef::Err(e); }
+                    }
+                    match self.expect(TokenKind::Colon, ":") {
+                        ParseResultUnit::Err(e) => { return ParseResultEnumDef::Err(e); }
+                        ParseResultUnit::Ok => {}
+                    }
+                    var pty: Type = Type::Void;
+                    match self.parse_type() {
+                        ParseResultType::Ok(t) => { pty = t; }
+                        ParseResultType::Err(e) => { return ParseResultEnumDef::Err(e); }
+                    }
+                    params.push(Param_new(pname, pty, false));
+                } else {
+                    var pty: Type = Type::Void;
+                    match self.parse_type() {
+                        ParseResultType::Ok(t) => { pty = t; }
+                        ParseResultType::Err(e) => { return ParseResultEnumDef::Err(e); }
+                    }
+                    var pname: str = "_" + int_to_str(params.len());
+                    params.push(Param_new(pname, pty, false));
+                }
+                if !self.match_tok(TokenKind::Comma) { break; }
+            }
+        }
+        match self.expect(TokenKind::RParen, ")") {
+            ParseResultUnit::Err(e) => { return ParseResultEnumDef::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        data = OptParams::Some(params);
+    }
+    variants.push(EnumVariant_new(vname, data));
+    self.match_tok(TokenKind::Comma);
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultEnumDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+
+self.enum_names.push(name);
+var __ret_EnumDef: EnumDef = EnumDef_new(name, variants, false);
+__ret_EnumDef.type_params = type_params;
+return ParseResultEnumDef::Ok(__ret_EnumDef);
+}
+
+fn parse_const(self: &mut Parser) -> ParseResultConstDef {
+match self.expect(TokenKind::Const, "const") {
+    ParseResultUnit::Err(e) => { return ParseResultConstDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var name: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { name = s; }
+    ParseResultStr::Err(e) => { return ParseResultConstDef::Err(e); }
+}
+match self.expect(TokenKind::Colon, ":") {
+    ParseResultUnit::Err(e) => { return ParseResultConstDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var ty: Type = Type::Void;
+match self.parse_type() {
+    ParseResultType::Ok(t) => { ty = t; }
+    ParseResultType::Err(e) => { return ParseResultConstDef::Err(e); }
+}
+match self.expect(TokenKind::Eq, "=") {
+    ParseResultUnit::Err(e) => { return ParseResultConstDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var expr: Expr = Expr::IntLit(0);
+match self.parse_expr() {
+    ParseResultExpr::Ok(e) => { expr = e; }
+    ParseResultExpr::Err(e) => { return ParseResultConstDef::Err(e); }
+}
+self.match_tok(TokenKind::Semicolon);
+var __ret_ConstDef: ConstDef = ConstDef_new(name, ty, expr, false);
+return ParseResultConstDef::Ok(__ret_ConstDef);
+}
+
+fn parse_type_alias(self: &mut Parser) -> ParseResultTypeAlias {
+match self.expect(TokenKind::Type, "type") {
+    ParseResultUnit::Err(e) => { return ParseResultTypeAlias::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var name: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { name = s; }
+    ParseResultStr::Err(e) => { return ParseResultTypeAlias::Err(e); }
+}
+match self.expect(TokenKind::Eq, "=") {
+    ParseResultUnit::Err(e) => { return ParseResultTypeAlias::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var alias_for: Type = Type::Void;
+match self.parse_type() {
+    ParseResultType::Ok(t) => { alias_for = t; }
+    ParseResultType::Err(e) => { return ParseResultTypeAlias::Err(e); }
+}
+self.match_tok(TokenKind::Semicolon);
+// If alias points to a named struct, track it
+match alias_for {
+    Type::Named(target) => {
+        var i: i64 = 0;
+        while i < self.struct_names.len() {
+            if self.struct_names.get(i) == target {
+                self.alias_to_struct.push(name);
+            }
+            i = i + 1;
+        }
+    }
+}
+var __ret_TypeAlias: TypeAlias = TypeAlias_new(name, alias_for, false);
+return ParseResultTypeAlias::Ok(__ret_TypeAlias);
+}
+
+fn parse_impl_or_trait_impl(self: &mut Parser) -> ParseResultImplOrTrait {
+match self.expect(TokenKind::Impl, "impl") {
+    ParseResultUnit::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+
+var type_params: Vec<str> = Vec::new();
+if self.check(TokenKind::Lt) {
+    self.advance();
+    if !self.check(TokenKind::Gt) {
+        loop {
+            match self.expect_ident() {
+                ParseResultStr::Ok(tp) => { type_params.push(tp); }
+                ParseResultStr::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+            }
+            if !self.match_tok(TokenKind::Comma) { break; }
+        }
+    }
+    match self.expect(TokenKind::Gt, ">") {
+        ParseResultUnit::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+}
+
+var first_name: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { first_name = s; }
+    ParseResultStr::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+}
+
+// Check for `impl Trait for Type`
+if self.match_tok(TokenKind::For) {
+    var trait_name: str = first_name;
+    var type_name: str = "";
+    match self.expect_ident() {
+        ParseResultStr::Ok(s) => { type_name = s; }
+        ParseResultStr::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+    }
+    match self.expect(TokenKind::LBrace, "{") {
+        ParseResultUnit::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+
+    var methods: Vec<Func> = Vec::new();
+    var associated_types: Vec<AssocTypeBinding> = Vec::new();
+    while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+        if self.check(TokenKind::Type) {
+            self.advance();
+            var assoc_name: str = "";
+            match self.expect_ident() {
+                ParseResultStr::Ok(s) => { assoc_name = s; }
+                ParseResultStr::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+            }
+            // Optional GAT type params
+            if self.check(TokenKind::Lt) {
+                self.advance();
+                if !self.check(TokenKind::Gt) {
+                    loop {
+                        match self.expect_ident() {
+                            ParseResultStr::Ok(_) => {}
+                            ParseResultStr::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+                        }
+                        if !self.match_tok(TokenKind::Comma) { break; }
+                        if self.check(TokenKind::Gt) { break; }
+                    }
+                }
+                match self.expect(TokenKind::Gt, ">") {
+                    ParseResultUnit::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+                    ParseResultUnit::Ok => {}
+                }
+            }
+            match self.expect(TokenKind::Eq, "=") {
+                ParseResultUnit::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+            var assoc_ty: Type = Type::Void;
+            match self.parse_type() {
+                ParseResultType::Ok(t) => { assoc_ty = t; }
+                ParseResultType::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+            }
+            self.match_tok(TokenKind::Semicolon);
+            associated_types.push(AssocTypeBinding_new(assoc_name, assoc_ty));
+        } else {
+            var is_pub: bool = false;
+            if self.check(TokenKind::Pub) {
+                self.advance();
+                is_pub = true;
+            }
+            match self.parse_func() {
+                ParseResultFunc::Ok(func) => {
+                var mfunc = func;
+                    mfunc.is_pub = is_pub;
+                    methods.push(mfunc);
+                }
+                ParseResultFunc::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+            }
+        }
+    }
+    match self.expect(TokenKind::RBrace, "}") {
+        ParseResultUnit::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+
+    var __ti: TraitImpl = TraitImpl_new(trait_name, type_name);
+    __ti.type_params = type_params;
+    __ti.methods = methods;
+    __ti.associated_types = associated_types;
+    var __iot1: ImplOrTrait = ImplOrTrait {
+        tag: 1,
+        struct_impl: ImplDef_new(""),
+        trait_impl: __ti,
+    };
+    return ParseResultImplOrTrait::Ok(__iot1);
+}
+
+// Regular `impl Type { ... }`
+var struct_name: str = first_name;
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+
+var methods: Vec<Func> = Vec::new();
+while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+    var is_pub: bool = false;
+    if self.check(TokenKind::Pub) {
+        self.advance();
+        is_pub = true;
+    }
+    match self.parse_func() {
+        ParseResultFunc::Ok(func) => {
+                var mfunc = func;
+            mfunc.is_pub = is_pub;
+            methods.push(mfunc);
+        }
+        ParseResultFunc::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+    }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultImplOrTrait::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+
+var __si: ImplDef = ImplDef_new(struct_name);
+__si.type_params = type_params;
+__si.methods = methods;
+var __iot0: ImplOrTrait = ImplOrTrait {
+    tag: 0,
+    struct_impl: __si,
+    trait_impl: TraitImpl_new("", ""),
+};
+return ParseResultImplOrTrait::Ok(__iot0);
+}
+
+fn parse_trait(self: &mut Parser) -> ParseResultTraitDef {
+match self.expect(TokenKind::Cap, "cap") {
+    ParseResultUnit::Err(e) => { return ParseResultTraitDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var name: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { name = s; }
+    ParseResultStr::Err(e) => { return ParseResultTraitDef::Err(e); }
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultTraitDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+
+var methods: Vec<TraitMethod> = Vec::new();
+var associated_types: Vec<AssocTypeDecl> = Vec::new();
+while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+    if self.check(TokenKind::Type) {
+        self.advance();
+        var assoc_name: str = "";
+        match self.expect_ident() {
+            ParseResultStr::Ok(s) => { assoc_name = s; }
+            ParseResultStr::Err(e) => { return ParseResultTraitDef::Err(e); }
+        }
+        var type_params: Vec<str> = Vec::new();
+        if self.check(TokenKind::Lt) {
+            self.advance();
+            if !self.check(TokenKind::Gt) {
+                loop {
+                    match self.expect_ident() {
+                        ParseResultStr::Ok(tp) => { type_params.push(tp); }
+                        ParseResultStr::Err(e) => { return ParseResultTraitDef::Err(e); }
+                    }
+                    if !self.match_tok(TokenKind::Comma) { break; }
+                    if self.check(TokenKind::Gt) { break; }
+                }
+            }
+            match self.expect(TokenKind::Gt, ">") {
+                ParseResultUnit::Err(e) => { return ParseResultTraitDef::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+        }
+        self.match_tok(TokenKind::Semicolon);
+        associated_types.push(AssocTypeDecl_new(assoc_name, type_params));
+    } else {
+        var is_pub: bool = false;
+        if self.check(TokenKind::Pub) {
+            self.advance();
+            is_pub = true;
+        }
+        match self.expect(TokenKind::Fn, "fn") {
+            ParseResultUnit::Err(e) => { return ParseResultTraitDef::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        var method_name: str = "";
+        match self.expect_ident_or_keyword() {
+            ParseResultStr::Ok(s) => { method_name = s; }
+            ParseResultStr::Err(e) => { return ParseResultTraitDef::Err(e); }
+        }
+        // Generic type params (ignored — just consumed)
+        if self.check(TokenKind::Lt) {
+            self.advance();
+            if !self.check(TokenKind::Gt) {
+                loop {
+                    match self.expect_ident() {
+                        ParseResultStr::Ok(_) => {}
+                        ParseResultStr::Err(e) => { return ParseResultTraitDef::Err(e); }
+                    }
+                    if !self.match_tok(TokenKind::Comma) { break; }
+                }
+            }
+            match self.expect(TokenKind::Gt, ">") {
+                ParseResultUnit::Err(e) => { return ParseResultTraitDef::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+        }
+        match self.expect(TokenKind::LParen, "(") {
+            ParseResultUnit::Err(e) => { return ParseResultTraitDef::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        var params: Vec<Param> = Vec::new();
+        if !self.check(TokenKind::RParen) {
+            loop {
+                var pname: str = "";
+                match self.expect_ident() {
+                    ParseResultStr::Ok(s) => { pname = s; }
+                    ParseResultStr::Err(e) => { return ParseResultTraitDef::Err(e); }
+                }
+                if pname == "self" && !self.check(TokenKind::Colon) {
+                    params.push(Param_new("self", Type::Named("Self"), false));
+                } else {
+                    match self.expect(TokenKind::Colon, ":") {
+                        ParseResultUnit::Err(e) => { return ParseResultTraitDef::Err(e); }
+                        ParseResultUnit::Ok => {}
+                    }
+                    var ty: Type = Type::Void;
+                    match self.parse_type() {
+                        ParseResultType::Ok(t) => { ty = t; }
+                        ParseResultType::Err(e) => { return ParseResultTraitDef::Err(e); }
+                    }
+                    params.push(Param_new(pname, ty, false));
+                }
+                if !self.match_tok(TokenKind::Comma) { break; }
+            }
+        }
+        match self.expect(TokenKind::RParen, ")") {
+            ParseResultUnit::Err(e) => { return ParseResultTraitDef::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+
+        var ret_ty: Type = Type::Void;
+        if self.match_tok(TokenKind::Arrow) {
+            match self.parse_type() {
+                ParseResultType::Ok(t) => { ret_ty = t; }
+                ParseResultType::Err(e) => { return ParseResultTraitDef::Err(e); }
+            }
+        }
+
+        var has_self: bool = false;
+        if params.len() > 0 {
+            if params.get(0).name == "self" { has_self = true; }
+        }
+
+        var default_body: OptStmts = OptStmts::None;
+        if self.check(TokenKind::LBrace) {
+            self.advance();
+            var body: Vec<Stmt> = Vec::new();
+            match self.parse_block() {
+                ParseResultStmts::Ok(b) => { body = b; }
+                ParseResultStmts::Err(e) => { return ParseResultTraitDef::Err(e); }
+            }
+            match self.expect(TokenKind::RBrace, "}") {
+                ParseResultUnit::Err(e) => { return ParseResultTraitDef::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+            default_body = OptStmts::Some(body);
+        } else {
+            self.match_tok(TokenKind::Semicolon);
+        }
+
+        var mtm: TraitMethod = TraitMethod_new(method_name, ret_ty, has_self);
+        mtm.params = params;
+        mtm.is_pub = is_pub;
+        mtm.default_body = default_body;
+        methods.push(mtm);
+    }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultTraitDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+}
+
+fn parse_extern_func_decl(self: &mut Parser, abi: str, include: OptStr, link_lib: OptStr) -> ParseResultExternDecl {
+var c_name: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { c_name = s; }
+    ParseResultStr::Err(e) => { return ParseResultExternDecl::Err(e); }
+}
+var pledge_name: str = c_name;
+if self.check(TokenKind::As) {
+    self.advance();
+    match self.expect_ident() {
+        ParseResultStr::Ok(s) => { pledge_name = s; }
+        ParseResultStr::Err(e) => { return ParseResultExternDecl::Err(e); }
+    }
+}
+match self.expect(TokenKind::LParen, "(") {
+    ParseResultUnit::Err(e) => { return ParseResultExternDecl::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var params: Vec<Param> = Vec::new();
+match self.parse_params() {
+    ParseResultParams::Ok(p) => { params = p; }
+    ParseResultParams::Err(e) => { return ParseResultExternDecl::Err(e); }
+}
+match self.expect(TokenKind::RParen, ")") {
+    ParseResultUnit::Err(e) => { return ParseResultExternDecl::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var ret_ty: Type = Type::Void;
+if self.match_tok(TokenKind::Arrow) {
+    match self.parse_type() {
+        ParseResultType::Ok(t) => { ret_ty = t; }
+        ParseResultType::Err(e) => { return ParseResultExternDecl::Err(e); }
+    }
+}
+self.match_tok(TokenKind::Semicolon);
+var __ret_ExternDecl: ExternDecl = ExternDecl_new(abi, c_name, pledge_name, ret_ty);
+__ret_ExternDecl.params = params;
+__ret_ExternDecl.include = include;
+__ret_ExternDecl.link_lib = link_lib;
+return ParseResultExternDecl::Ok(__ret_ExternDecl);
+}
+
+fn parse_func(self: &mut Parser) -> ParseResultFunc {
+match self.expect(TokenKind::Fn, "fn") {
+    ParseResultUnit::Err(e) => { return ParseResultFunc::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var name: str = "";
+match self.expect_ident_or_keyword() {
+    ParseResultStr::Ok(s) => { name = s; }
+    ParseResultStr::Err(e) => { return ParseResultFunc::Err(e); }
+}
+
+var type_params: Vec<str> = Vec::new();
+var type_param_bounds: Vec<StrPair> = Vec::new();
+var const_params: Vec<StrPair> = Vec::new();
+if self.check(TokenKind::Lt) {
+    self.advance();
+    if !self.check(TokenKind::Gt) {
+        loop {
+            var tp: str = "";
+            match self.expect_ident() {
+                ParseResultStr::Ok(s) => { tp = s; }
+                ParseResultStr::Err(e) => { return ParseResultFunc::Err(e); }
+            }
+            if self.match_tok(TokenKind::Colon) {
+                var bound_tok: Token = self.peek_token();
+                if is_int_type_keyword(bound_tok.kind) {
+                    var ty_name: str = type_keyword_name(bound_tok.kind);
+                    self.advance();
+                    const_params.push(StrPair_new(tp, ty_name));
+                } else {
+                    var bound: str = "";
+                    match self.expect_ident() {
+                        ParseResultStr::Ok(s) => { bound = s; }
+                        ParseResultStr::Err(e) => { return ParseResultFunc::Err(e); }
+                    }
+                    type_param_bounds.push(StrPair_new(tp, bound));
+                    while self.match_tok(TokenKind::Plus) {
+                        match self.expect_ident() {
+                            ParseResultStr::Ok(_) => {}
+                            ParseResultStr::Err(e) => { return ParseResultFunc::Err(e); }
+                        }
+                    }
+                }
+            }
+            type_params.push(tp);
+            if !self.match_tok(TokenKind::Comma) { break; }
+        }
+    }
+    match self.expect(TokenKind::Gt, ">") {
+        ParseResultUnit::Err(e) => { return ParseResultFunc::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+}
+
+match self.expect(TokenKind::LParen, "(") {
+    ParseResultUnit::Err(e) => { return ParseResultFunc::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var params: Vec<Param> = Vec::new();
+match self.parse_params() {
+    ParseResultParams::Ok(p) => { params = p; }
+    ParseResultParams::Err(e) => { return ParseResultFunc::Err(e); }
+}
+match self.expect(TokenKind::RParen, ")") {
+    ParseResultUnit::Err(e) => { return ParseResultFunc::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+
+var ret_ty: Type = Type::Void;
+if self.match_tok(TokenKind::Arrow) {
+    match self.parse_type() {
+        ParseResultType::Ok(t) => { ret_ty = t; }
+        ParseResultType::Err(e) => { return ParseResultFunc::Err(e); }
+    }
+}
+
+// Effect annotation: !IO, !{IO, Net}, !{} (pure)
+var has_effect_annotation: bool = false;
+var declared_effects: Vec<str> = Vec::new();
+if self.match_tok(TokenKind::Bang) {
+    has_effect_annotation = true;
+    if self.match_tok(TokenKind::LBrace) {
+        if !self.check(TokenKind::RBrace) {
+            loop {
+                var eff: str = "";
+                match self.expect_ident() {
+                    ParseResultStr::Ok(s) => { eff = s; }
+                    ParseResultStr::Err(e) => { return ParseResultFunc::Err(e); }
+                }
+                declared_effects.push(eff);
+                if !self.match_tok(TokenKind::Comma) { break; }
+            }
+        }
+        match self.expect(TokenKind::RBrace, "}") {
+            ParseResultUnit::Err(e) => { return ParseResultFunc::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+    } else {
+        var eff: str = "";
+        match self.expect_ident() {
+            ParseResultStr::Ok(s) => { eff = s; }
+            ParseResultStr::Err(e) => { return ParseResultFunc::Err(e); }
+        }
+        declared_effects.push(eff);
+    }
+} else {
+    // No effect annotation
+}
+
+// F10: Parse given/ensure contracts (Design by Contract)
+var preconditions: Vec<Expr> = Vec::new();
+var postconditions: Vec<Expr> = Vec::new();
+loop {
+    if self.check(TokenKind::Given) {
+        self.advance();
+        match self.parse_expr() {
+            ParseResultExpr::Ok(e) => { preconditions.push(e); }
+            ParseResultExpr::Err(e) => { return ParseResultFunc::Err(e); }
+        }
+        // Skip optional 'and'/'or'/comma between conditions
+        self.match_tok(TokenKind::And);
+        self.match_tok(TokenKind::Comma);
+        continue;
+    }
+    if self.check(TokenKind::Ensure) {
+        self.advance();
+        match self.parse_expr() {
+            ParseResultExpr::Ok(e) => { postconditions.push(e); }
+            ParseResultExpr::Err(e) => { return ParseResultFunc::Err(e); }
+        }
+        self.match_tok(TokenKind::And);
+        self.match_tok(TokenKind::Comma);
+        continue;
+    }
+    break;
+}
+
+// Parse function body: { ... }
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultFunc::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var body: Vec<Stmt> = Vec::new();
+match self.parse_block() {
+    ParseResultStmts::Ok(b) => { body = b; }
+    ParseResultStmts::Err(e) => { return ParseResultFunc::Err(e); }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultFunc::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+
+var mfunc: Func = Func_new(name, ret_ty);
+mfunc.type_params = type_params;
+mfunc.type_param_bounds = type_param_bounds;
+mfunc.const_params = const_params;
+mfunc.params = params;
+mfunc.body = body;
+mfunc.declared_effects = declared_effects;
+mfunc.has_effect_annotation = has_effect_annotation;
+mfunc.preconditions = preconditions;
+mfunc.postconditions = postconditions;
+return ParseResultFunc::Ok(mfunc);
+}
+
+fn parse_params(self: &mut Parser) -> ParseResultParams {
+var params: Vec<Param> = Vec::new();
+if self.check(TokenKind::RParen) {
+    return ParseResultParams::Ok(params);
+}
+loop {
+    var name: str = "";
+    match self.expect_ident_or_keyword() {
+        ParseResultStr::Ok(s) => { name = s; }
+        ParseResultStr::Err(e) => { return ParseResultParams::Err(e); }
+    }
+    if name == "self" && !self.check(TokenKind::Colon) {
+        params.push(Param_new("self", Type::Named("Self"), false));
+    } else {
+        match self.expect(TokenKind::Colon, ":") {
+            ParseResultUnit::Err(e) => { return ParseResultParams::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        var ty: Type = Type::Void;
+        match self.parse_type() {
+            ParseResultType::Ok(t) => { ty = t; }
+            ParseResultType::Err(e) => { return ParseResultParams::Err(e); }
+        }
+        params.push(Param_new(name, ty, false));
+    }
+    if !self.match_tok(TokenKind::Comma) { break; }
+    if self.check(TokenKind::RParen) { break; }
+}
+return ParseResultParams::Ok(params);
+}
+
+fn parse_layer(self: &mut Parser) -> ParseResultLayerDef {
+match self.expect(TokenKind::Layer, "layer") {
+    ParseResultUnit::Err(e) => { return ParseResultLayerDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var name: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { name = s; }
+    ParseResultStr::Err(e) => { return ParseResultLayerDef::Err(e); }
+}
+
+var constructor_args: Vec<str> = Vec::new();
+if self.match_tok(TokenKind::LParen) {
+    if !self.check(TokenKind::RParen) {
+        loop {
+            match self.parse_annotation_arg() {
+                ParseResultStr::Ok(arg) => { constructor_args.push(arg); }
+                ParseResultStr::Err(e) => { return ParseResultLayerDef::Err(e); }
+            }
+            if !self.match_tok(TokenKind::Comma) { break; }
+        }
+    }
+    match self.expect(TokenKind::RParen, ")") {
+        ParseResultUnit::Err(e) => { return ParseResultLayerDef::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+}
+
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultLayerDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+
+var fields: Vec<Param> = Vec::new();
+var forward: Func = Func_new("", Type::Void);
+var has_forward: bool = false;
+var has_forward: bool = false;
+
+while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+    if self.check(TokenKind::Fn) {
+        match self.parse_func() {
+            ParseResultFunc::Ok(func) => {
+                if func.name == "forward" {
+                    forward = func;
+                    has_forward = true;
+                }
+            }
+            ParseResultFunc::Err(e) => { return ParseResultLayerDef::Err(e); }
+        }
+    } else {
+        var fname: str = "";
+        match self.expect_ident_or_keyword() {
+            ParseResultStr::Ok(s) => { fname = s; }
+            ParseResultStr::Err(e) => { return ParseResultLayerDef::Err(e); }
+        }
+        match self.expect(TokenKind::Colon, ":") {
+            ParseResultUnit::Err(e) => { return ParseResultLayerDef::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        var fty: Type = Type::Void;
+        match self.parse_type() {
+            ParseResultType::Ok(t) => { fty = t; }
+            ParseResultType::Err(e) => { return ParseResultLayerDef::Err(e); }
+        }
+        fields.push(Param_new(fname, fty, false));
+        self.match_tok(TokenKind::Comma);
+    }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultLayerDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+
+if !has_forward {
+    return ParseResultLayerDef::Err("Layer '" + name + "' must have a 'forward' method");
+}
+
+self.struct_names.push(name);
+var __ret_LayerDef: LayerDef = LayerDef_new(name, forward, false);
+__ret_LayerDef.fields = fields;
+__ret_LayerDef.constructor_args = constructor_args;
+return ParseResultLayerDef::Ok(__ret_LayerDef);
+}
+
+fn parse_model(self: &mut Parser) -> ParseResultModelDef {
+match self.expect(TokenKind::Model, "model") {
+    ParseResultUnit::Err(e) => { return ParseResultModelDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var name: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { name = s; }
+    ParseResultStr::Err(e) => { return ParseResultModelDef::Err(e); }
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultModelDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+
+var layers: Vec<LayerInst> = Vec::new();
+var forward: Func = Func_new("", Type::Void);
+var has_forward: bool = false;
+var has_forward: bool = false;
+
+while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+    if self.check(TokenKind::Fn) {
+        match self.parse_func() {
+            ParseResultFunc::Ok(func) => {
+                if func.name == "forward" {
+                    forward = func;
+                    has_forward = true;
+                }
+            }
+            ParseResultFunc::Err(e) => { return ParseResultModelDef::Err(e); }
+        }
+    } else {
+        var field_name: str = "";
+        match self.expect_ident() {
+            ParseResultStr::Ok(s) => { field_name = s; }
+            ParseResultStr::Err(e) => { return ParseResultModelDef::Err(e); }
+        }
+        match self.expect(TokenKind::Colon, ":") {
+            ParseResultUnit::Err(e) => { return ParseResultModelDef::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        var layer_type: str = "";
+        match self.expect_ident() {
+            ParseResultStr::Ok(s) => { layer_type = s; }
+            ParseResultStr::Err(e) => { return ParseResultModelDef::Err(e); }
+        }
+        var ctor_args: Vec<str> = Vec::new();
+        if self.match_tok(TokenKind::LParen) {
+            if !self.check(TokenKind::RParen) {
+                loop {
+                    match self.parse_annotation_arg() {
+                        ParseResultStr::Ok(arg) => { ctor_args.push(arg); }
+                        ParseResultStr::Err(e) => { return ParseResultModelDef::Err(e); }
+                    }
+                    if !self.match_tok(TokenKind::Comma) { break; }
+                }
+            }
+            match self.expect(TokenKind::RParen, ")") {
+                ParseResultUnit::Err(e) => { return ParseResultModelDef::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+        }
+        self.match_tok(TokenKind::Comma);
+        layers.push(LayerInst_new(field_name, layer_type, ctor_args));
+    }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultModelDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+
+if !has_forward {
+    return ParseResultModelDef::Err("Model '" + name + "' must have a 'forward' method");
+}
+
+self.struct_names.push(name);
+var __ret_ModelDef: ModelDef = ModelDef_new(name, layers, forward, false);
+return ParseResultModelDef::Ok(__ret_ModelDef);
+}
+
+fn parse_component(self: &mut Parser) -> ParseResultComponentDef {
+match self.expect(TokenKind::Component, "component") {
+    ParseResultUnit::Err(e) => { return ParseResultComponentDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var name: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { name = s; }
+    ParseResultStr::Err(e) => { return ParseResultComponentDef::Err(e); }
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultComponentDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var fields: Vec<Param> = Vec::new();
+while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+    var field_name: str = "";
+    match self.expect_ident() {
+        ParseResultStr::Ok(s) => { field_name = s; }
+        ParseResultStr::Err(e) => { return ParseResultComponentDef::Err(e); }
+    }
+    match self.expect(TokenKind::Colon, ":") {
+        ParseResultUnit::Err(e) => { return ParseResultComponentDef::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var field_ty: Type = Type::Void;
+    match self.parse_type() {
+        ParseResultType::Ok(t) => { field_ty = t; }
+        ParseResultType::Err(e) => { return ParseResultComponentDef::Err(e); }
+    }
+    fields.push(Param_new(field_name, field_ty, false));
+    self.match_tok(TokenKind::Comma);
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultComponentDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+self.struct_names.push(name);
+var __ret_ComponentDef: ComponentDef = ComponentDef_new(name, false);
+__ret_ComponentDef.fields = fields;
+return ParseResultComponentDef::Ok(__ret_ComponentDef);
+}
+
+fn parse_system(self: &mut Parser) -> ParseResultSystemDef {
+match self.expect(TokenKind::System, "system") {
+    ParseResultUnit::Err(e) => { return ParseResultSystemDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var name: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { name = s; }
+    ParseResultStr::Err(e) => { return ParseResultSystemDef::Err(e); }
+}
+match self.expect(TokenKind::LParen, "(") {
+    ParseResultUnit::Err(e) => { return ParseResultSystemDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var params: Vec<Param> = Vec::new();
+match self.parse_params() {
+    ParseResultParams::Ok(p) => { params = p; }
+    ParseResultParams::Err(e) => { return ParseResultSystemDef::Err(e); }
+}
+match self.expect(TokenKind::RParen, ")") {
+    ParseResultUnit::Err(e) => { return ParseResultSystemDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultSystemDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var body: Vec<Stmt> = Vec::new();
+match self.parse_block() {
+    ParseResultStmts::Ok(b) => { body = b; }
+    ParseResultStmts::Err(e) => { return ParseResultSystemDef::Err(e); }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultSystemDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var __ret_SystemDef: SystemDef = SystemDef_new(name);
+__ret_SystemDef.params = params;
+__ret_SystemDef.body = body;
+return ParseResultSystemDef::Ok(__ret_SystemDef);
+}
+
+fn parse_state_machine(self: &mut Parser) -> ParseResultStateMachineDef {
+match self.expect(TokenKind::State, "state") {
+    ParseResultUnit::Err(e) => { return ParseResultStateMachineDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var name: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { name = s; }
+    ParseResultStr::Err(e) => { return ParseResultStateMachineDef::Err(e); }
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStateMachineDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var states: Vec<StateDef> = Vec::new();
+while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+    var state_name: str = "";
+    match self.expect_ident_or_keyword() {
+        ParseResultStr::Ok(s) => { state_name = s; }
+        ParseResultStr::Err(e) => { return ParseResultStateMachineDef::Err(e); }
+    }
+    match self.expect(TokenKind::LBrace, "{") {
+        ParseResultUnit::Err(e) => { return ParseResultStateMachineDef::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var transitions: Vec<StateTransition> = Vec::new();
+    while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+        match self.expect(TokenKind::On, "on") {
+            ParseResultUnit::Err(e) => { return ParseResultStateMachineDef::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        var event: str = "";
+        match self.expect_ident_or_keyword() {
+            ParseResultStr::Ok(s) => { event = s; }
+            ParseResultStr::Err(e) => { return ParseResultStateMachineDef::Err(e); }
+        }
+        match self.expect(TokenKind::FatArrow, "=>") {
+            ParseResultUnit::Err(e) => { return ParseResultStateMachineDef::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        var target: str = "";
+        match self.expect_ident_or_keyword() {
+            ParseResultStr::Ok(s) => { target = s; }
+            ParseResultStr::Err(e) => { return ParseResultStateMachineDef::Err(e); }
+        }
+        transitions.push(StateTransition_new(event, target));
+        self.match_tok(TokenKind::Comma);
+    }
+    match self.expect(TokenKind::RBrace, "}") {
+        ParseResultUnit::Err(e) => { return ParseResultStateMachineDef::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var msd: StateDef = StateDef_new(state_name);
+    msd.transitions = transitions;
+    states.push(msd);
+    self.match_tok(TokenKind::Comma);
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStateMachineDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+self.enum_names.push(name);
+var __ret_StateMachineDef: StateMachineDef = StateMachineDef_new(name, false);
+__ret_StateMachineDef.states = states;
+return ParseResultStateMachineDef::Ok(__ret_StateMachineDef);
+}
+
+fn parse_event_handler(self: &mut Parser) -> ParseResultEventHandlerDef {
+match self.expect(TokenKind::On, "on") {
+    ParseResultUnit::Err(e) => { return ParseResultEventHandlerDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var event_name: str = "";
+match self.expect_ident_or_keyword() {
+    ParseResultStr::Ok(s) => { event_name = s; }
+    ParseResultStr::Err(e) => { return ParseResultEventHandlerDef::Err(e); }
+}
+match self.expect(TokenKind::LParen, "(") {
+    ParseResultUnit::Err(e) => { return ParseResultEventHandlerDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var params: Vec<Param> = Vec::new();
+match self.parse_params() {
+    ParseResultParams::Ok(p) => { params = p; }
+    ParseResultParams::Err(e) => { return ParseResultEventHandlerDef::Err(e); }
+}
+match self.expect(TokenKind::RParen, ")") {
+    ParseResultUnit::Err(e) => { return ParseResultEventHandlerDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultEventHandlerDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var body: Vec<Stmt> = Vec::new();
+match self.parse_block() {
+    ParseResultStmts::Ok(b) => { body = b; }
+    ParseResultStmts::Err(e) => { return ParseResultEventHandlerDef::Err(e); }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultEventHandlerDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var __ret_EventHandlerDef: EventHandlerDef = EventHandlerDef_new(event_name);
+__ret_EventHandlerDef.params = params;
+__ret_EventHandlerDef.body = body;
+return ParseResultEventHandlerDef::Ok(__ret_EventHandlerDef);
+}
+
+fn parse_type(self: &mut Parser) -> ParseResultType {
+var tok: Token = self.peek_token();
+var k: TokenKind = tok.kind;
+
+// Function type: fn(params) -> ret
+if token_kind_eq(k, TokenKind::Fn) {
+    self.advance();
+    match self.expect(TokenKind::LParen, "(") {
+        ParseResultUnit::Err(e) => { return ParseResultType::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var params: Vec<Type> = Vec::new();
+    if !self.check(TokenKind::RParen) {
+        loop {
+            match self.parse_type() {
+                ParseResultType::Ok(t) => { params.push(t); }
+                ParseResultType::Err(e) => { return ParseResultType::Err(e); }
+            }
+            if !self.match_tok(TokenKind::Comma) { break; }
+        }
+    }
+    match self.expect(TokenKind::RParen, ")") {
+        ParseResultUnit::Err(e) => { return ParseResultType::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    match self.expect(TokenKind::Arrow, "->") {
+        ParseResultUnit::Err(e) => { return ParseResultType::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var ret: Type = Type::Void;
+    match self.parse_type() {
+        ParseResultType::Ok(t) => { ret = t; }
+        ParseResultType::Err(e) => { return ParseResultType::Err(e); }
+    }
+    return ParseResultType::Ok(Type::Func(params, Box::new(ret)));
+}
+
+// Primitive type keywords
+if token_kind_eq(k, TokenKind::I8) { self.advance(); return ParseResultType::Ok(Type::I8); }
+if token_kind_eq(k, TokenKind::I16) { self.advance(); return ParseResultType::Ok(Type::I16); }
+if token_kind_eq(k, TokenKind::I32) { self.advance(); return ParseResultType::Ok(Type::I32); }
+if token_kind_eq(k, TokenKind::I64) { self.advance(); return ParseResultType::Ok(Type::I64); }
+if token_kind_eq(k, TokenKind::I128) { self.advance(); return ParseResultType::Ok(Type::I128); }
+if token_kind_eq(k, TokenKind::U8) { self.advance(); return ParseResultType::Ok(Type::U8); }
+if token_kind_eq(k, TokenKind::U16) { self.advance(); return ParseResultType::Ok(Type::U16); }
+if token_kind_eq(k, TokenKind::U32) { self.advance(); return ParseResultType::Ok(Type::U32); }
+if token_kind_eq(k, TokenKind::U64) { self.advance(); return ParseResultType::Ok(Type::U64); }
+if token_kind_eq(k, TokenKind::U128) { self.advance(); return ParseResultType::Ok(Type::U128); }
+if token_kind_eq(k, TokenKind::F32) { self.advance(); return ParseResultType::Ok(Type::F32); }
+if token_kind_eq(k, TokenKind::F64) { self.advance(); return ParseResultType::Ok(Type::F64); }
+if token_kind_eq(k, TokenKind::Bool) { self.advance(); return ParseResultType::Ok(Type::Bool); }
+if token_kind_eq(k, TokenKind::Str) { self.advance(); return ParseResultType::Ok(Type::Str); }
+if token_kind_eq(k, TokenKind::Void) { self.advance(); return ParseResultType::Ok(Type::Void); }
+
+// dyn Trait
+if token_kind_eq(k, TokenKind::Dyn) {
+    self.advance();
+    var trait_name: str = "";
+    match self.expect_ident() {
+        ParseResultStr::Ok(s) => { trait_name = s; }
+        ParseResultStr::Err(e) => { return ParseResultType::Err(e); }
+    }
+    return ParseResultType::Ok(Type::Dyn(trait_name));
+}
+
+// Identifier-based types
+if token_kind_eq(k, TokenKind::Ident("")) {
+    // Extract the ident payload
+    var s: str = "";
+    match tok.kind {
+        TokenKind::Ident(name: str) => { s = name; }
+    }
+    self.advance();
+    if s == "_" {
+        return ParseResultType::Ok(Type::Infer);
+    }
+    // Associated type: T::Item or GAT T::Item<X>
+    if self.check(TokenKind::DoubleColon) {
+        self.advance();
+        var assoc_name: str = "";
+        match self.expect_ident() {
+            ParseResultStr::Ok(an) => { assoc_name = an; }
+            ParseResultStr::Err(e) => { return ParseResultType::Err(e); }
+        }
+        var type_args: Vec<Type> = Vec::new();
+        if self.check(TokenKind::Lt) {
+            self.advance();
+            if !self.check(TokenKind::Gt) {
+                loop {
+                    match self.parse_type() {
+                        ParseResultType::Ok(ta) => { type_args.push(ta); }
+                        ParseResultType::Err(e) => { return ParseResultType::Err(e); }
+                    }
+                    if !self.match_tok(TokenKind::Comma) { break; }
+                    if self.check(TokenKind::Gt) { break; }
+                }
+            }
+            match self.expect(TokenKind::Gt, ">") {
+                ParseResultUnit::Err(e) => { return ParseResultType::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+        }
+        return ParseResultType::Ok(Type::Assoc(s, "", assoc_name, type_args));
+    }
+    // Generic type args: Name<T, U>
+    if self.check(TokenKind::Lt) {
+        self.advance();
+        // Special case: Tensor<elem, [dims]> → ShapedTensor
+        if s == "Tensor" {
+            var elem: Type = Type::Void;
+            match self.parse_type() {
+                ParseResultType::Ok(t) => { elem = t; }
+                ParseResultType::Err(e) => { return ParseResultType::Err(e); }
+            }
+            if self.match_tok(TokenKind::Comma) {
+                if self.match_tok(TokenKind::LBracket) {
+                    var shape: Vec<ShapeDim> = Vec::new();
+                    if !self.check(TokenKind::RBracket) {
+                        loop {
+                            var dtok: Token = self.peek_token();
+                            match dtok.kind {
+                                TokenKind::IntLit(n: i64) => {
+                                    self.advance();
+                                    shape.push(ShapeDim::Known(n));
+                                }
+                                TokenKind::Ident(name: str) => {
+                                    self.advance();
+                                    shape.push(ShapeDim::Symbolic(name));
+                                }
+                            }
+                            if !self.match_tok(TokenKind::Comma) { break; }
+                        }
+                    }
+                    match self.expect(TokenKind::RBracket, "]") {
+                        ParseResultUnit::Err(e) => { return ParseResultType::Err(e); }
+                        ParseResultUnit::Ok => {}
+                    }
+                    match self.expect(TokenKind::Gt, ">") {
+                        ParseResultUnit::Err(e) => { return ParseResultType::Err(e); }
+                        ParseResultUnit::Ok => {}
+                    }
+                    return ParseResultType::Ok(Type::ShapedTensor(Box::new(elem), shape));
+                }
+            }
+            // Fallback: Tensor<elem> → Generic
+            match self.expect(TokenKind::Gt, ">") {
+                ParseResultUnit::Err(e) => { return ParseResultType::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+            var args: Vec<Type> = Vec::new();
+            args.push(elem);
+            return ParseResultType::Ok(Type::Generic(s, args));
+        }
+
+        var args: Vec<Type> = Vec::new();
+        if !self.check(TokenKind::Gt) {
+            loop {
+                match self.parse_type() {
+                    ParseResultType::Ok(t) => { args.push(t); }
+                    ParseResultType::Err(e) => { return ParseResultType::Err(e); }
+                }
+                if !self.match_tok(TokenKind::Comma) { break; }
+            }
+        }
+        match self.expect(TokenKind::Gt, ">") {
+            ParseResultUnit::Err(e) => { return ParseResultType::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        return ParseResultType::Ok(Type::Generic(s, args));
+    }
+    return ParseResultType::Ok(Type::Named(s));
+}
+
+// Tuple type: (T, U, ...) or unit ()
+if token_kind_eq(k, TokenKind::LParen) {
+    self.advance();
+    var types: Vec<Type> = Vec::new();
+    if !self.check(TokenKind::RParen) {
+        loop {
+            match self.parse_type() {
+                ParseResultType::Ok(t) => { types.push(t); }
+                ParseResultType::Err(e) => { return ParseResultType::Err(e); }
+            }
+            if !self.match_tok(TokenKind::Comma) { break; }
+        }
+    }
+    match self.expect(TokenKind::RParen, ")") {
+        ParseResultUnit::Err(e) => { return ParseResultType::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    if types.len() == 1 {
+        return ParseResultType::Ok(types.get(0));
+    }
+    return ParseResultType::Ok(Type::Tuple(types));
+}
+
+// Reference type: &T or &mut T
+if token_kind_eq(k, TokenKind::Ampersand) {
+    self.advance();
+    var is_mut: bool = self.match_tok(TokenKind::Mut);
+    var inner: Type = Type::Void;
+    match self.parse_type() {
+        ParseResultType::Ok(t) => { inner = t; }
+        ParseResultType::Err(e) => { return ParseResultType::Err(e); }
+    }
+    return ParseResultType::Ok(Type::Ref(Box::new(inner), is_mut));
+}
+
+// Raw pointer: *mut T or *const T
+if token_kind_eq(k, TokenKind::Star) {
+    self.advance();
+    var is_mut: bool = false;
+    if self.check(TokenKind::Mut) {
+        self.advance();
+        is_mut = true;
+    } else if self.check(TokenKind::Const) {
+        self.advance();
+        is_mut = false;
+    }
+    var inner: Type = Type::Void;
+    match self.parse_type() {
+        ParseResultType::Ok(t) => { inner = t; }
+        ParseResultType::Err(e) => { return ParseResultType::Err(e); }
+    }
+    return ParseResultType::Ok(Type::RawPtr(Box::new(inner), is_mut));
+}
+
+// Array type: [T; N] or [T; NAME]
+if token_kind_eq(k, TokenKind::LBracket) {
+    self.advance();
+    var elem: Type = Type::Void;
+    match self.parse_type() {
+        ParseResultType::Ok(t) => { elem = t; }
+        ParseResultType::Err(e) => { return ParseResultType::Err(e); }
+    }
+    match self.expect(TokenKind::Semicolon, ";") {
+        ParseResultUnit::Err(e) => { return ParseResultType::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var size_tok: Token = self.peek_token();
+    match size_tok.kind {
+        TokenKind::IntLit(n: i64) => {
+            self.advance();
+            match self.expect(TokenKind::RBracket, "]") {
+                ParseResultUnit::Err(e) => { return ParseResultType::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+            return ParseResultType::Ok(Type::Array(Box::new(elem), n));
+        }
+        TokenKind::Ident(name: str) => {
+            self.advance();
+            match self.expect(TokenKind::RBracket, "]") {
+                ParseResultUnit::Err(e) => { return ParseResultType::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+            return ParseResultType::Ok(Type::ArrayConst(Box::new(elem), name));
+        }
+    }
+    return ParseResultType::Err(
+        "Parse error at " + int_to_str(size_tok.line) + ":" + int_to_str(size_tok.col) +
+        ": expected array size but got '" + token_kind_to_str(size_tok.kind) + "'"
+    );
+}
+
+return ParseResultType::Err(
+    "Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) +
+    ": expected type but got '" + token_kind_to_str(tok.kind) + "'"
+);
+}
+
+fn parse_block(self: &mut Parser) -> ParseResultStmts {
+var stmts: Vec<Stmt> = Vec::new();
+while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+    match self.parse_stmt() {
+        ParseResultStmt::Ok(stmt) => { stmts.push(stmt); }
+        ParseResultStmt::Err(e) => {
+            self.errors.push(e);
+            self.recover_to_sync_token();
+        }
+    }
+}
+return ParseResultStmts::Ok(stmts);
+}
+
+fn parse_stmt(self: &mut Parser) -> ParseResultStmt {
+var k: TokenKind = self.peek();
+
+if token_kind_eq(k, TokenKind::Persist) { return self.parse_persist_let(); }
+if token_kind_eq(k, TokenKind::Val) { return self.parse_let(); }
+if token_kind_eq(k, TokenKind::Var) { return self.parse_let(); }
+if token_kind_eq(k, TokenKind::Return) { return self.parse_return(); }
+if token_kind_eq(k, TokenKind::Query) { return self.parse_query_stmt(); }
+if token_kind_eq(k, TokenKind::If) {
+    var line: i64 = self.peek_token().line;
+    var if_expr: IfExpr = IfExpr {
+        cond: Expr::IntLit(0),
+        then_block: Vec::new(),
+        else_block: OptStmts::None,
+    };
+    match self.parse_if_expr() {
+        ParseResultIfExpr::Ok(ie) => { if_expr = ie; }
+        ParseResultIfExpr::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+    return ParseResultStmt::Ok(Stmt::If(
+        if_expr.cond, if_expr.then_block, if_expr.else_block, line
+    ));
+}
+if token_kind_eq(k, TokenKind::While) { return self.parse_while(); }
+if token_kind_eq(k, TokenKind::For) { return self.parse_for(); }
+if token_kind_eq(k, TokenKind::Loop) { return self.parse_loop(); }
+if token_kind_eq(k, TokenKind::Break) {
+    var line: i64 = self.peek_token().line;
+    self.advance();
+    if self.check(TokenKind::Semicolon) || self.check(TokenKind::RBrace) {
+        self.match_tok(TokenKind::Semicolon);
+        return ParseResultStmt::Ok(Stmt::Break(OptBoxExpr::None, line));
+    }
+    var expr: Expr = Expr::IntLit(0);
+    match self.parse_expr() {
+        ParseResultExpr::Ok(e) => { expr = e; }
+        ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+    self.match_tok(TokenKind::Semicolon);
+    return ParseResultStmt::Ok(Stmt::Break(OptBoxExpr::Some(Box::new(expr)), line));
+}
+if token_kind_eq(k, TokenKind::Continue) {
+    var line: i64 = self.peek_token().line;
+    self.advance();
+    self.match_tok(TokenKind::Semicolon);
+    return ParseResultStmt::Ok(Stmt::Continue(line));
+}
+if token_kind_eq(k, TokenKind::Defer) {
+    var line: i64 = self.peek_token().line;
+    self.advance();
+    match self.expect(TokenKind::LBrace, "{") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var body: Vec<Stmt> = Vec::new();
+    match self.parse_block() {
+        ParseResultStmts::Ok(b) => { body = b; }
+        ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+    match self.expect(TokenKind::RBrace, "}") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    return ParseResultStmt::Ok(Stmt::Defer(body, line));
+}
+if token_kind_eq(k, TokenKind::Match) { return self.parse_match_stmt(); }
+if token_kind_eq(k, TokenKind::Select) { return self.parse_select_stmt(); }
+if token_kind_eq(k, TokenKind::Use) { return self.parse_use_stmt(); }
+if token_kind_eq(k, TokenKind::Handle) { return self.parse_handle_stmt(); }
+if token_kind_eq(k, TokenKind::Do) { return self.parse_do_stmt(); }
+if token_kind_eq(k, TokenKind::Region) { return self.parse_region_block(); }
+if token_kind_eq(k, TokenKind::Sandbox) { return self.parse_sandbox_block(); }
+if token_kind_eq(k, TokenKind::Unsafe) { return self.parse_unsafe_block(); }
+if token_kind_eq(k, TokenKind::Txn) { return self.parse_txn_block(); }
+if token_kind_eq(k, TokenKind::Grad) { return self.parse_grad_block(); }
+if token_kind_eq(k, TokenKind::Backward) {
+    var line: i64 = self.peek_token().line;
+    self.advance();
+    match self.expect(TokenKind::LParen, "(") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var loss: Expr = Expr::IntLit(0);
+    match self.parse_expr() {
+        ParseResultExpr::Ok(e) => { loss = e; }
+        ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+    match self.expect(TokenKind::RParen, ")") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    self.match_tok(TokenKind::Semicolon);
+    return ParseResultStmt::Ok(Stmt::Backward(loss, line));
+}
+if token_kind_eq(k, TokenKind::Comptime) {
+    var line: i64 = self.peek_token().line;
+    self.advance();
+    // comptime gen { block }
+    var peek_k: TokenKind = self.peek();
+    match peek_k {
+        TokenKind::Ident(name: str) => {
+            if name == "gen" {
+                self.advance();
+                match self.expect(TokenKind::LBrace, "{") {
+                    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+                    ParseResultUnit::Ok => {}
+                }
+                var block: Vec<Stmt> = Vec::new();
+                match self.parse_block() {
+                    ParseResultStmts::Ok(b) => { block = b; }
+                    ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+                }
+                match self.expect(TokenKind::RBrace, "}") {
+                    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+                    ParseResultUnit::Ok => {}
+                }
+                return ParseResultStmt::Ok(Stmt::ComptimeGen(block, line));
+            }
+        }
+    }
+    var expr: Expr = Expr::IntLit(0);
+    match self.parse_comptime_expr(line) {
+        ParseResultExpr::Ok(e) => { expr = e; }
+        ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+    return ParseResultStmt::Ok(Stmt::Expr(expr, line));
+}
+if token_kind_eq(k, TokenKind::Guard) { return self.parse_guard_stmt(); }
+
+return self.parse_assign_or_expr();
+}
+
+fn parse_assign_or_expr(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+var expr: Expr = Expr::IntLit(0);
+match self.parse_expr() {
+    ParseResultExpr::Ok(e) => { expr = e; }
+    ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+}
+
+// Check for assignment operator
+var assign_op: AssignOp = AssignOp::Assign;
+var has_assign: bool = true;
+var k: TokenKind = self.peek();
+if token_kind_eq(k, TokenKind::Eq) { assign_op = AssignOp::Assign; }
+else if token_kind_eq(k, TokenKind::PlusEq) { assign_op = AssignOp::AddAssign; }
+else if token_kind_eq(k, TokenKind::MinusEq) { assign_op = AssignOp::SubAssign; }
+else if token_kind_eq(k, TokenKind::StarEq) { assign_op = AssignOp::MulAssign; }
+else if token_kind_eq(k, TokenKind::SlashEq) { assign_op = AssignOp::DivAssign; }
+else if token_kind_eq(k, TokenKind::PercentEq) { assign_op = AssignOp::ModAssign; }
+else if token_kind_eq(k, TokenKind::AmpEq) { assign_op = AssignOp::BitAndAssign; }
+else if token_kind_eq(k, TokenKind::PipeEq) { assign_op = AssignOp::BitOrAssign; }
+else if token_kind_eq(k, TokenKind::CaretEq) { assign_op = AssignOp::BitXorAssign; }
+else if token_kind_eq(k, TokenKind::ShlEq) { assign_op = AssignOp::ShlAssign; }
+else if token_kind_eq(k, TokenKind::ShrEq) { assign_op = AssignOp::ShrAssign; }
+else { has_assign = false; }
+
+if has_assign {
+    self.advance();
+    // Match the assignment target shape
+    match expr {
+        Expr::Ident(name) => {
+            var rhs: Expr = Expr::IntLit(0);
+            match self.parse_expr() {
+                ParseResultExpr::Ok(e) => { rhs = e; }
+                ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+            }
+            self.match_tok(TokenKind::Semicolon);
+            return ParseResultStmt::Ok(Stmt::Assign(name, assign_op, rhs, line));
+        }
+        Expr::Index(array, index) => {
+            match array {
+                Expr::Ident(name) => {
+                    var rhs: Expr = Expr::IntLit(0);
+                    match self.parse_expr() {
+                        ParseResultExpr::Ok(e) => { rhs = e; }
+                        ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+                    }
+                    self.match_tok(TokenKind::Semicolon);
+                    return ParseResultStmt::Ok(Stmt::IndexAssign(name, box_expr_deref(index), assign_op, rhs, line));
+                }
+            }
+            return ParseResultStmt::Err("Parse error: index assignment target must be an array variable");
+        }
+        Expr::Deref(ptr_expr) => {
+            var rhs: Expr = Expr::IntLit(0);
+            match self.parse_expr() {
+                ParseResultExpr::Ok(e) => { rhs = e; }
+                ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+            }
+            self.match_tok(TokenKind::Semicolon);
+            return ParseResultStmt::Ok(Stmt::DerefAssign(box_expr_deref(ptr_expr), assign_op, rhs, line));
+        }
+        Expr::FieldAccess(obj_expr, field) => {
+            var rhs: Expr = Expr::IntLit(0);
+            match self.parse_expr() {
+                ParseResultExpr::Ok(e) => { rhs = e; }
+                ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+            }
+            self.match_tok(TokenKind::Semicolon);
+            return ParseResultStmt::Ok(Stmt::FieldAssign(box_expr_deref(obj_expr), field, assign_op, rhs, line));
+        }
+    }
+    return ParseResultStmt::Err("Parse error: assignment target must be an identifier or array index");
+}
+
+self.match_tok(TokenKind::Semicolon);
+return ParseResultStmt::Ok(Stmt::Expr(expr, line));
+}
+
+fn parse_while(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::While, "while") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var cond: Expr = Expr::IntLit(0);
+match self.parse_expr() {
+    ParseResultExpr::Ok(e) => { cond = e; }
+    ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var body: Vec<Stmt> = Vec::new();
+match self.parse_block() {
+    ParseResultStmts::Ok(b) => { body = b; }
+    ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultStmt::Ok(Stmt::While(cond, body, line));
+}
+
+fn parse_guard_stmt(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Guard, "guard") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var cond: Expr = Expr::IntLit(0);
+match self.parse_expr() {
+    ParseResultExpr::Ok(e) => { cond = e; }
+    ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::FatArrow, "=>") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var then_block: Vec<Stmt> = Vec::new();
+if self.check(TokenKind::LBrace) {
+    self.advance();
+    match self.parse_block() {
+        ParseResultStmts::Ok(b) => { then_block = b; }
+        ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+    match self.expect(TokenKind::RBrace, "}") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+} else {
+    match self.parse_stmt() {
+        ParseResultStmt::Ok(s) => { then_block.push(s); }
+        ParseResultStmt::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+}
+}
+
+fn parse_for(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::For, "for") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var loop_var: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { loop_var = s; }
+    ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::In, "in") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var iterator: Expr = Expr::IntLit(0);
+match self.parse_expr() {
+    ParseResultExpr::Ok(e) => { iterator = e; }
+    ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var body: Vec<Stmt> = Vec::new();
+match self.parse_block() {
+    ParseResultStmts::Ok(b) => { body = b; }
+    ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultStmt::Ok(Stmt::For(loop_var, iterator, body, line));
+}
+
+fn parse_loop(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Loop, "loop") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var body: Vec<Stmt> = Vec::new();
+match self.parse_block() {
+    ParseResultStmts::Ok(b) => { body = b; }
+    ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultStmt::Ok(Stmt::Loop(body, line));
+}
+
+fn parse_query_stmt(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Query, "query") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+match self.expect(TokenKind::LParen, "(") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var components: Vec<str> = Vec::new();
+if !self.check(TokenKind::RParen) {
+    loop {
+        var comp_name: str = "";
+        match self.expect_ident() {
+            ParseResultStr::Ok(s) => { comp_name = s; }
+            ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+        }
+        components.push(comp_name);
+        if !self.match_tok(TokenKind::Comma) { break; }
+    }
+}
+match self.expect(TokenKind::RParen, ")") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var body: Vec<Stmt> = Vec::new();
+match self.parse_block() {
+    ParseResultStmts::Ok(b) => { body = b; }
+    ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultStmt::Ok(Stmt::Query(components, body, line));
+}
+
+fn parse_match_stmt(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Match, "match") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var expr: Expr = Expr::IntLit(0);
+match self.parse_expr() {
+    ParseResultExpr::Ok(e) => { expr = e; }
+    ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var arms: Vec<MatchArm> = Vec::new();
+while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+    var pattern: Pattern = Pattern::Wildcard;
+    match self.parse_pattern() {
+        ParseResultPattern::Ok(p) => { pattern = p; }
+        ParseResultPattern::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+    var match_guard: OptBoxExpr = OptBoxExpr::None;
+    if self.check(TokenKind::If) {
+        self.advance();
+        match self.parse_expr() {
+            ParseResultExpr::Ok(g) => { match_guard = OptBoxExpr::Some(Box::new(g)); }
+            ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+        }
+    }
+    match self.expect(TokenKind::FatArrow, "=>") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    match self.expect(TokenKind::LBrace, "{") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var body: Vec<Stmt> = Vec::new();
+    match self.parse_block() {
+        ParseResultStmts::Ok(b) => { body = b; }
+        ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+    match self.expect(TokenKind::RBrace, "}") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    self.match_tok(TokenKind::Comma);
+    arms.push(MatchArm_new(pattern, match_guard, body));
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultStmt::Ok(Stmt::Match(expr, arms, line));
+}
+
+fn parse_select_stmt(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Select, "select") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var cases: Vec<SelectCase> = Vec::new();
+var default: OptStmts = OptStmts::None;
+while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+    var ident: str = "";
+    match self.expect_ident() {
+        ParseResultStr::Ok(s) => { ident = s; }
+        ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+    if ident == "default" {
+        match self.expect(TokenKind::FatArrow, "=>") {
+            ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        match self.expect(TokenKind::LBrace, "{") {
+            ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        var body: Vec<Stmt> = Vec::new();
+        match self.parse_block() {
+            ParseResultStmts::Ok(b) => { body = b; }
+            ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+        }
+        match self.expect(TokenKind::RBrace, "}") {
+            ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        default = OptStmts::Some(body);
+        self.match_tok(TokenKind::Comma);
+    } else if ident == "case" {
+        var channel: Expr = Expr::IntLit(0);
+        match self.parse_expr() {
+            ParseResultExpr::Ok(e) => { channel = e; }
+            ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+        }
+        match self.expect(TokenKind::FatArrow, "=>") {
+            ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        var var_name: str = "";
+        match self.expect_ident() {
+            ParseResultStr::Ok(s) => { var_name = s; }
+            ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+        }
+        match self.expect(TokenKind::FatArrow, "=>") {
+            ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        match self.expect(TokenKind::LBrace, "{") {
+            ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        var body: Vec<Stmt> = Vec::new();
+        match self.parse_block() {
+            ParseResultStmts::Ok(b) => { body = b; }
+            ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+        }
+        match self.expect(TokenKind::RBrace, "}") {
+            ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        self.match_tok(TokenKind::Comma);
+        cases.push(SelectCase_new(channel, var_name, body));
+    } else {
+        return ParseResultStmt::Err("Expected 'case' or 'default' in select, got '" + ident + "'");
+    }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultStmt::Ok(Stmt::Select(cases, default, line));
+}
+
+fn parse_let(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+var k: TokenKind = self.peek();
+var is_mut: bool = false;
+if token_kind_eq(k, TokenKind::Val) {
+    self.advance();
+    is_mut = false;
+} else if token_kind_eq(k, TokenKind::Var) {
+    self.advance();
+    is_mut = true;
+} else {
+    return ParseResultStmt::Err("expected 'val' or 'var' at line " + int_to_str(line));
+}
+
+// Tuple destructuring: val (a, b) = expr
+if self.check(TokenKind::LParen) {
+    self.advance();
+    var names: Vec<str> = Vec::new();
+    if !self.check(TokenKind::RParen) {
+        loop {
+            var name: str = "";
+            match self.expect_ident_or_keyword() {
+                ParseResultStr::Ok(s) => { name = s; }
+                ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+            }
+            names.push(name);
+            if !self.match_tok(TokenKind::Comma) { break; }
+        }
+    }
+    match self.expect(TokenKind::RParen, ")") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    match self.expect(TokenKind::Eq, "=") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var expr: Expr = Expr::IntLit(0);
+    match self.parse_expr() {
+        ParseResultExpr::Ok(e) => { expr = e; }
+        ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+    self.match_tok(TokenKind::Semicolon);
+    return ParseResultStmt::Ok(Stmt::LetTuple(names, expr, line));
+}
+
+var name: str = "";
+match self.expect_ident_or_keyword() {
+    ParseResultStr::Ok(s) => { name = s; }
+    ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+}
+
+var ty: OptType = OptType::None;
+if self.match_tok(TokenKind::Colon) {
+    match self.parse_type() {
+        ParseResultType::Ok(t) => { ty = OptType::Some(t); }
+        ParseResultType::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+}
+
+// var x: i32; without = → uninitialized
+if is_mut && self.check(TokenKind::Semicolon) {
+    self.advance();
+    match ty {
+        OptType::Some(t) => {
+            return ParseResultStmt::Ok(Stmt::LetUninit(name, t, line));
+        }
+        OptType::None => {
+            return ParseResultStmt::Err("var " + name + " needs type annotation for uninitialized declaration at line " + int_to_str(line));
+        }
+    }
+}
+if is_mut && !self.check(TokenKind::Eq) {
+    match ty {
+        OptType::Some(t) => {
+            self.match_tok(TokenKind::Semicolon);
+            return ParseResultStmt::Ok(Stmt::LetUninit(name, t, line));
+        }
+        OptType::None => {
+            return ParseResultStmt::Err("var " + name + " needs type annotation for uninitialized declaration at line " + int_to_str(line));
+        }
+    }
+}
+
+match self.expect(TokenKind::Eq, "=") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var expr: Expr = Expr::IntLit(0);
+match self.parse_expr() {
+    ParseResultExpr::Ok(e) => { expr = e; }
+    ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+}
+self.match_tok(TokenKind::Semicolon);
+return ParseResultStmt::Ok(Stmt::Let(name, ty, expr, is_mut, false, line));
+}
+
+fn parse_persist_let(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Persist, "persist") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var is_mut: bool = false;
+if self.check(TokenKind::Var) {
+    self.advance();
+    is_mut = true;
+} else {
+    match self.expect(TokenKind::Val, "val") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+}
+var name: str = "";
+match self.expect_ident_or_keyword() {
+    ParseResultStr::Ok(s) => { name = s; }
+    ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+}
+var ty: OptType = OptType::None;
+if self.match_tok(TokenKind::Colon) {
+    match self.parse_type() {
+        ParseResultType::Ok(t) => { ty = OptType::Some(t); }
+        ParseResultType::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+}
+match self.expect(TokenKind::Eq, "=") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var expr: Expr = Expr::IntLit(0);
+match self.parse_expr() {
+    ParseResultExpr::Ok(e) => { expr = e; }
+    ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+}
+self.match_tok(TokenKind::Semicolon);
+return ParseResultStmt::Ok(Stmt::Let(name, ty, expr, is_mut, true, line));
+}
+
+fn parse_return(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Return, "return") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+if self.check(TokenKind::RBrace) || self.check(TokenKind::Semicolon) {
+    self.match_tok(TokenKind::Semicolon);
+    return ParseResultStmt::Ok(Stmt::Return(OptBoxExpr::None, line));
+}
+var expr: Expr = Expr::IntLit(0);
+match self.parse_expr() {
+    ParseResultExpr::Ok(e) => { expr = e; }
+    ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+}
+self.match_tok(TokenKind::Semicolon);
+return ParseResultStmt::Ok(Stmt::Return(OptBoxExpr::Some(Box::new(expr)), line));
+}
+
+fn parse_if_expr(self: &mut Parser) -> ParseResultIfExpr {
+match self.expect(TokenKind::If, "if") {
+    ParseResultUnit::Err(e) => { return ParseResultIfExpr::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var cond: Expr = Expr::IntLit(0);
+match self.parse_expr() {
+    ParseResultExpr::Ok(e) => { cond = e; }
+    ParseResultExpr::Err(e) => { return ParseResultIfExpr::Err(e); }
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultIfExpr::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var then_block: Vec<Stmt> = Vec::new();
+match self.parse_block() {
+    ParseResultStmts::Ok(b) => { then_block = b; }
+    ParseResultStmts::Err(e) => { return ParseResultIfExpr::Err(e); }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultIfExpr::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+
+var else_block: OptStmts = OptStmts::None;
+if self.match_tok(TokenKind::Else) {
+    if self.check(TokenKind::If) {
+        var line: i64 = self.peek_token().line;
+        var nested: IfExpr = IfExpr {
+            cond: Expr::IntLit(0),
+            then_block: Vec::new(),
+            else_block: OptStmts::None,
+        };
+        match self.parse_if_expr() {
+            ParseResultIfExpr::Ok(ie) => { nested = ie; }
+            ParseResultIfExpr::Err(e) => { return ParseResultIfExpr::Err(e); }
+        }
+        var stmts: Vec<Stmt> = Vec::new();
+        stmts.push(Stmt::If(nested.cond, nested.then_block, nested.else_block, line));
+        else_block = OptStmts::Some(stmts);
+    } else {
+        match self.expect(TokenKind::LBrace, "{") {
+            ParseResultUnit::Err(e) => { return ParseResultIfExpr::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        var block: Vec<Stmt> = Vec::new();
+        match self.parse_block() {
+            ParseResultStmts::Ok(b) => { block = b; }
+            ParseResultStmts::Err(e) => { return ParseResultIfExpr::Err(e); }
+        }
+        match self.expect(TokenKind::RBrace, "}") {
+            ParseResultUnit::Err(e) => { return ParseResultIfExpr::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        else_block = OptStmts::Some(block);
+    }
+}
+
+return ParseResultIfExpr::Ok(IfExpr {
+    cond: cond,
+    then_block: then_block,
+    else_block: else_block,
+});
+}
+
+fn parse_use_stmt(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Use, "use") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var path: str = "";
+loop {
+    if self.check(TokenKind::LBrace) { break; }
+    var name: str = "";
+    match self.expect_ident() {
+        ParseResultStr::Ok(s) => { name = s; }
+        ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+    path = path + name;
+    if self.match_tok(TokenKind::DoubleColon) {
+        path = path + "::";
+    } else {
+        break;
+    }
+}
+var items: Vec<str> = Vec::new();
+if self.match_tok(TokenKind::LBrace) {
+    if !self.check(TokenKind::RBrace) {
+        loop {
+            var item: str = "";
+            match self.expect_ident() {
+                ParseResultStr::Ok(s) => { item = s; }
+                ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+            }
+            items.push(item);
+            if !self.match_tok(TokenKind::Comma) { break; }
+        }
+    }
+    match self.expect(TokenKind::RBrace, "}") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+}
+}
+
+fn parse_handle_stmt(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Handle, "handle") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var body: Vec<Stmt> = Vec::new();
+match self.parse_block() {
+    ParseResultStmts::Ok(b) => { body = b; }
+    ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+match self.expect(TokenKind::With, "with") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var handlers: Vec<EffectHandler> = Vec::new();
+while !self.check(TokenKind::RBrace) {
+    var effect: str = "";
+    match self.expect_ident() {
+        ParseResultStr::Ok(s) => { effect = s; }
+        ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+    match self.expect(TokenKind::Dot, ".") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var op: str = "";
+    match self.expect_ident() {
+        ParseResultStr::Ok(s) => { op = s; }
+        ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+    match self.expect(TokenKind::LParen, "(") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var params: Vec<str> = Vec::new();
+    if !self.check(TokenKind::RParen) {
+        loop {
+            var p: str = "";
+            match self.expect_ident() {
+                ParseResultStr::Ok(s) => { p = s; }
+                ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+            }
+            params.push(p);
+            if !self.match_tok(TokenKind::Comma) { break; }
+        }
+    }
+    match self.expect(TokenKind::RParen, ")") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    match self.expect(TokenKind::FatArrow, "=>") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    match self.expect(TokenKind::LBrace, "{") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var handler_body: Vec<Stmt> = Vec::new();
+    match self.parse_block() {
+        ParseResultStmts::Ok(b) => { handler_body = b; }
+        ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+    match self.expect(TokenKind::RBrace, "}") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    handlers.push(EffectHandler_new(effect, op, params, handler_body));
+    if !self.match_tok(TokenKind::Comma) { break; }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultStmt::Ok(Stmt::Handle(body, handlers, line));
+}
+
+fn parse_do_stmt(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Do, "do") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var effect: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { effect = s; }
+    ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::Dot, ".") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var op: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { op = s; }
+    ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::LParen, "(") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var args: Vec<Expr> = Vec::new();
+if !self.check(TokenKind::RParen) {
+    loop {
+        match self.parse_expr() {
+            ParseResultExpr::Ok(e) => { args.push(e); }
+            ParseResultExpr::Err(e) => { return ParseResultStmt::Err(e); }
+        }
+        if !self.match_tok(TokenKind::Comma) { break; }
+    }
+}
+match self.expect(TokenKind::RParen, ")") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+self.match_tok(TokenKind::Semicolon);
+return ParseResultStmt::Ok(Stmt::Do(effect, op, args, line));
+}
+
+fn parse_region_block(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Region, "region") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+
+// Optional modifier: gpu or kv_cache
+var is_gpu: bool = false;
+var is_kv_cache: bool = false;
+var pk: TokenKind = self.peek();
+match pk {
+    TokenKind::Ident(s: str) => {
+        if s == "gpu" {
+            self.advance();
+            is_gpu = true;
+        } else if s == "kv_cache" {
+            self.advance();
+            is_kv_cache = true;
+        }
+    }
+}
+
+var name: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { name = s; }
+    ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+}
+
+// Optional: with budget(N)
+var budget: OptI64 = OptI64::None;
+if self.match_tok(TokenKind::With) {
+    var budget_name: str = "";
+    match self.expect_ident() {
+        ParseResultStr::Ok(s) => { budget_name = s; }
+        ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+    }
+    if budget_name != "budget" {
+        return ParseResultStmt::Err("Expected 'budget' after 'with' in region block, got '" + budget_name + "'");
+    }
+    match self.expect(TokenKind::LParen, "(") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var ntok: Token = self.peek_token();
+    match ntok.kind {
+        TokenKind::IntLit(n: i64) => {
+            self.advance();
+            budget = OptI64::Some(n);
+        }
+    }
+    match self.expect(TokenKind::RParen, ")") {
+        ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+}
+
+// Optional: window(W) for KV cache
+var window_size: OptI64 = OptI64::None;
+if is_kv_cache {
+    var wtok: Token = self.peek_token();
+    match wtok.kind {
+        TokenKind::Ident(s: str) => {
+            if s == "window" {
+                self.advance();
+                match self.expect(TokenKind::LParen, "(") {
+                    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+                    ParseResultUnit::Ok => {}
+                }
+                var wval: Token = self.peek_token();
+                match wval.kind {
+                    TokenKind::IntLit(w: i64) => {
+                        self.advance();
+                        window_size = OptI64::Some(w);
+                    }
+                }
+                match self.expect(TokenKind::RParen, ")") {
+                    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+                    ParseResultUnit::Ok => {}
+                }
+            }
+        }
+    }
+}
+
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var body: Vec<Stmt> = Vec::new();
+match self.parse_block() {
+    ParseResultStmts::Ok(b) => { body = b; }
+    ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultStmt::Ok(Stmt::RegionBlock(name, budget, is_gpu, is_kv_cache, window_size, body, line));
+}
+
+fn parse_sandbox_block(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Sandbox, "sandbox") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var body: Vec<Stmt> = Vec::new();
+match self.parse_block() {
+    ParseResultStmts::Ok(b) => { body = b; }
+    ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultStmt::Ok(Stmt::Sandbox(body, line));
+}
+
+fn parse_unsafe_block(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Unsafe, "unsafe") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var body: Vec<Stmt> = Vec::new();
+match self.parse_block() {
+    ParseResultStmts::Ok(b) => { body = b; }
+    ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultStmt::Ok(Stmt::Unsafe(body, line));
+}
+
+fn parse_txn_block(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Txn, "txn") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var body: Vec<Stmt> = Vec::new();
+match self.parse_block() {
+    ParseResultStmts::Ok(b) => { body = b; }
+    ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultStmt::Ok(Stmt::Txn(body, line));
+}
+
+fn parse_grad_block(self: &mut Parser) -> ParseResultStmt {
+var line: i64 = self.peek_token().line;
+match self.expect(TokenKind::Grad, "grad") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+match self.expect(TokenKind::LParen, "(") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var grad_var: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { grad_var = s; }
+    ParseResultStr::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::RParen, ")") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var body: Vec<Stmt> = Vec::new();
+match self.parse_block() {
+    ParseResultStmts::Ok(b) => { body = b; }
+    ParseResultStmts::Err(e) => { return ParseResultStmt::Err(e); }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultStmt::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultStmt::Ok(Stmt::GradBlock(grad_var, body, line));
+}
+
+fn parse_pattern(self: &mut Parser) -> ParseResultPattern {
+var tok: Token = self.peek_token();
+var k: TokenKind = tok.kind;
+
+if token_kind_eq(k, TokenKind::IntLit(0)) {
+    var n: i64 = 0;
+    match tok.kind {
+        TokenKind::IntLit(v: i64) => { n = v; }
+    }
+    self.advance();
+    // Range pattern: 1..=3 or 1..5
+    if self.check(TokenKind::DotDotEq) {
+        self.advance();
+        var end_tok: Token = self.peek_token();
+        match end_tok.kind {
+            TokenKind::IntLit(m: i64) => {
+                self.advance();
+                return ParseResultPattern::Ok(Pattern::Range(
+                    Box::new(Pattern::IntLit(n)),
+                    Box::new(Pattern::IntLit(m + 1))
+                ));
+            }
+        }
+        return ParseResultPattern::Err("Parse error at " + int_to_str(end_tok.line) + ":" + int_to_str(end_tok.col) + ": expected int after ..=");
+    }
+    if self.check(TokenKind::DotDot) {
+        self.advance();
+        var end_tok: Token = self.peek_token();
+        match end_tok.kind {
+            TokenKind::IntLit(m: i64) => {
+                self.advance();
+                return ParseResultPattern::Ok(Pattern::Range(
+                    Box::new(Pattern::IntLit(n)),
+                    Box::new(Pattern::IntLit(m))
+                ));
+            }
+        }
+        return ParseResultPattern::Err("Parse error at " + int_to_str(end_tok.line) + ":" + int_to_str(end_tok.col) + ": expected int after ..");
+    }
+    return ParseResultPattern::Ok(Pattern::IntLit(n));
+}
+
+if token_kind_eq(k, TokenKind::StringLit("")) {
+    var s: str = "";
+    match tok.kind {
+        TokenKind::StringLit(v: str) => { s = v; }
+    }
+    self.advance();
+    return ParseResultPattern::Ok(Pattern::StrLit(s));
+}
+
+if token_kind_eq(k, TokenKind::True) {
+    self.advance();
+    return ParseResultPattern::Ok(Pattern::BoolLit(true));
+}
+if token_kind_eq(k, TokenKind::False) {
+    self.advance();
+    return ParseResultPattern::Ok(Pattern::BoolLit(false));
+}
+
+if token_kind_eq(k, TokenKind::Ident("")) {
+    var name: str = "";
+    match tok.kind {
+        TokenKind::Ident(v: str) => { name = v; }
+    }
+    self.advance();
+    if name == "_" {
+        return ParseResultPattern::Ok(Pattern::Wildcard);
+    }
+    if self.check(TokenKind::DoubleColon) {
+        self.advance();
+        var variant: str = "";
+        match self.expect_ident() {
+            ParseResultStr::Ok(s) => { variant = s; }
+            ParseResultStr::Err(e) => { return ParseResultPattern::Err(e); }
+        }
+        var bindings: Vec<Binding> = Vec::new();
+        if self.match_tok(TokenKind::LParen) {
+            loop {
+                var bname: str = "";
+                match self.expect_ident() {
+                    ParseResultStr::Ok(s) => { bname = s; }
+                    ParseResultStr::Err(e) => { return ParseResultPattern::Err(e); }
+                }
+                var bty: str = "";
+                if self.match_tok(TokenKind::Colon) {
+                    match self.read_type_name() {
+                        ParseResultStr::Ok(s) => { bty = s; }
+                        ParseResultStr::Err(e) => { return ParseResultPattern::Err(e); }
+                    }
+                }
+                bindings.push(Binding_new(bname, bty));
+                if !self.match_tok(TokenKind::Comma) { break; }
+            }
+            match self.expect(TokenKind::RParen, ")") {
+                ParseResultUnit::Err(e) => { return ParseResultPattern::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+        }
+        return ParseResultPattern::Ok(Pattern::EnumVariant(name, variant, bindings));
+    }
+    if self.check(TokenKind::LParen) {
+        self.advance();
+        var bindings: Vec<Binding> = Vec::new();
+        loop {
+            var bname: str = "";
+            match self.expect_ident() {
+                ParseResultStr::Ok(s) => { bname = s; }
+                ParseResultStr::Err(e) => { return ParseResultPattern::Err(e); }
+            }
+            var bty: str = "";
+            if self.match_tok(TokenKind::Colon) {
+                match self.read_type_name() {
+                    ParseResultStr::Ok(s) => { bty = s; }
+                    ParseResultStr::Err(e) => { return ParseResultPattern::Err(e); }
+                }
+            }
+            bindings.push(Binding_new(bname, bty));
+            if !self.match_tok(TokenKind::Comma) { break; }
+        }
+        match self.expect(TokenKind::RParen, ")") {
+            ParseResultUnit::Err(e) => { return ParseResultPattern::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        return ParseResultPattern::Ok(Pattern::EnumVariant("", name, bindings));
+    }
+    return ParseResultPattern::Ok(Pattern::Ident(name));
+}
+
+return ParseResultPattern::Err(
+    "Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) +
+    ": invalid pattern '" + token_kind_to_str(tok.kind) + "'"
+);
+}
+
+fn parse_expr(self: &mut Parser) -> ParseResultExpr {
+return self.parse_pipe_forward();
+}
+
+fn parse_pipe_forward(self: &mut Parser) -> ParseResultExpr {
+var left: Expr = Expr::IntLit(0);
+match self.parse_coalesce() {
+    ParseResultExpr::Ok(e) => { left = e; }
+    ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+}
+while self.match_tok(TokenKind::PipeArrow) {
+    var right: Expr = Expr::IntLit(0);
+    match self.parse_coalesce() {
+        ParseResultExpr::Ok(e) => { right = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    left = Expr::PipeForward(Box::new(left), Box::new(right));
+}
+return ParseResultExpr::Ok(left);
+}
+
+fn parse_coalesce(self: &mut Parser) -> ParseResultExpr {
+var left: Expr = Expr::IntLit(0);
+match self.parse_range() {
+    ParseResultExpr::Ok(e) => { left = e; }
+    ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+}
+while self.match_tok(TokenKind::QuestionQuestion) {
+    var right: Expr = Expr::IntLit(0);
+    match self.parse_range() {
+        ParseResultExpr::Ok(e) => { right = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    left = Expr::Coalesce(Box::new(left), Box::new(right));
+}
+return ParseResultExpr::Ok(left);
+}
+
+fn parse_range(self: &mut Parser) -> ParseResultExpr {
+var left: Expr = Expr::IntLit(0);
+match self.parse_or() {
+    ParseResultExpr::Ok(e) => { left = e; }
+    ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+}
+if self.check(TokenKind::DotDot) || self.check(TokenKind::DotDotEq) {
+    var inclusive: bool = self.check(TokenKind::DotDotEq);
+    self.advance();
+    var right: Expr = Expr::IntLit(0);
+    match self.parse_or() {
+        ParseResultExpr::Ok(e) => { right = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    return ParseResultExpr::Ok(Expr::Range(Box::new(left), Box::new(right), inclusive));
+}
+return ParseResultExpr::Ok(left);
+}
+
+fn parse_or(self: &mut Parser) -> ParseResultExpr {
+var left: Expr = Expr::IntLit(0);
+match self.parse_bit_or() {
+    ParseResultExpr::Ok(e) => { left = e; }
+    ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+}
+while self.match_tok(TokenKind::Or) {
+    var right: Expr = Expr::IntLit(0);
+    match self.parse_bit_or() {
+        ParseResultExpr::Ok(e) => { right = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    left = Expr::Binary(BinOp::Or, Box::new(left), Box::new(right));
+}
+return ParseResultExpr::Ok(left);
+}
+
+fn parse_bit_or(self: &mut Parser) -> ParseResultExpr {
+var left: Expr = Expr::IntLit(0);
+match self.parse_bit_xor() {
+    ParseResultExpr::Ok(e) => { left = e; }
+    ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+}
+while self.match_tok(TokenKind::Pipe) {
+    var right: Expr = Expr::IntLit(0);
+    match self.parse_bit_xor() {
+        ParseResultExpr::Ok(e) => { right = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    left = Expr::Binary(BinOp::BitOr, Box::new(left), Box::new(right));
+}
+return ParseResultExpr::Ok(left);
+}
+
+fn parse_bit_xor(self: &mut Parser) -> ParseResultExpr {
+var left: Expr = Expr::IntLit(0);
+match self.parse_bit_and() {
+    ParseResultExpr::Ok(e) => { left = e; }
+    ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+}
+while self.match_tok(TokenKind::Caret) {
+    var right: Expr = Expr::IntLit(0);
+    match self.parse_bit_and() {
+        ParseResultExpr::Ok(e) => { right = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    left = Expr::Binary(BinOp::BitXor, Box::new(left), Box::new(right));
+}
+return ParseResultExpr::Ok(left);
+}
+
+fn parse_bit_and(self: &mut Parser) -> ParseResultExpr {
+var left: Expr = Expr::IntLit(0);
+match self.parse_shift() {
+    ParseResultExpr::Ok(e) => { left = e; }
+    ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+}
+while self.match_tok(TokenKind::Ampersand) {
+    var right: Expr = Expr::IntLit(0);
+    match self.parse_shift() {
+        ParseResultExpr::Ok(e) => { right = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    left = Expr::Binary(BinOp::BitAnd, Box::new(left), Box::new(right));
+}
+return ParseResultExpr::Ok(left);
+}
+
+fn parse_shift(self: &mut Parser) -> ParseResultExpr {
+var left: Expr = Expr::IntLit(0);
+match self.parse_and() {
+    ParseResultExpr::Ok(e) => { left = e; }
+    ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+}
+loop {
+    var op: BinOp = BinOp::Shl;
+    var k: TokenKind = self.peek();
+    if token_kind_eq(k, TokenKind::Shl) {
+        op = BinOp::Shl;
+    } else if token_kind_eq(k, TokenKind::Shr) {
+        op = BinOp::Shr;
+    } else {
+        break;
+    }
+    self.advance();
+    var right: Expr = Expr::IntLit(0);
+    match self.parse_and() {
+        ParseResultExpr::Ok(e) => { right = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    left = Expr::Binary(op, Box::new(left), Box::new(right));
+}
+return ParseResultExpr::Ok(left);
+}
+
+fn parse_and(self: &mut Parser) -> ParseResultExpr {
+var left: Expr = Expr::IntLit(0);
+match self.parse_equality() {
+    ParseResultExpr::Ok(e) => { left = e; }
+    ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+}
+while self.match_tok(TokenKind::And) {
+    var right: Expr = Expr::IntLit(0);
+    match self.parse_equality() {
+        ParseResultExpr::Ok(e) => { right = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    left = Expr::Binary(BinOp::And, Box::new(left), Box::new(right));
+}
+return ParseResultExpr::Ok(left);
+}
+
+fn parse_equality(self: &mut Parser) -> ParseResultExpr {
+var left: Expr = Expr::IntLit(0);
+match self.parse_comparison() {
+    ParseResultExpr::Ok(e) => { left = e; }
+    ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+}
+loop {
+    var op: BinOp = BinOp::Eq;
+    var k: TokenKind = self.peek();
+    if token_kind_eq(k, TokenKind::EqEq) {
+        op = BinOp::Eq;
+    } else if token_kind_eq(k, TokenKind::BangEq) {
+        op = BinOp::Neq;
+    } else {
+        break;
+    }
+    self.advance();
+    var right: Expr = Expr::IntLit(0);
+    match self.parse_comparison() {
+        ParseResultExpr::Ok(e) => { right = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    left = Expr::Binary(op, Box::new(left), Box::new(right));
+}
+return ParseResultExpr::Ok(left);
+}
+
+fn parse_comparison(self: &mut Parser) -> ParseResultExpr {
+var left: Expr = Expr::IntLit(0);
+match self.parse_addition() {
+    ParseResultExpr::Ok(e) => { left = e; }
+    ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+}
+// `is` type/variant check
+if self.match_tok(TokenKind::Is) {
+    var peek_k: TokenKind = self.peek();
+    var type_name: str = "";
+    var got_name: bool = true;
+    match peek_k {
+        TokenKind::Ident(name: str) => { self.advance(); type_name = name; }
+        TokenKind::I8 => { self.advance(); type_name = "i8"; }
+        TokenKind::I16 => { self.advance(); type_name = "i16"; }
+        TokenKind::I32 => { self.advance(); type_name = "i32"; }
+        TokenKind::I64 => { self.advance(); type_name = "i64"; }
+        TokenKind::I128 => { self.advance(); type_name = "i128"; }
+        TokenKind::U8 => { self.advance(); type_name = "u8"; }
+        TokenKind::U16 => { self.advance(); type_name = "u16"; }
+        TokenKind::U32 => { self.advance(); type_name = "u32"; }
+        TokenKind::U64 => { self.advance(); type_name = "u64"; }
+        TokenKind::U128 => { self.advance(); type_name = "u128"; }
+        TokenKind::F32 => { self.advance(); type_name = "f32"; }
+        TokenKind::F64 => { self.advance(); type_name = "f64"; }
+        TokenKind::Bool => { self.advance(); type_name = "bool"; }
+        TokenKind::Str => { self.advance(); type_name = "str"; }
+        TokenKind::Void => { self.advance(); type_name = "void"; }
+    }
+    if str_len(type_name) == 0 {
+        return ParseResultExpr::Err("expected type name after 'is'");
+    }
+    return ParseResultExpr::Ok(Expr::IsCheck(Box::new(left), type_name));
+}
+loop {
+    var op: BinOp = BinOp::Lt;
+    var k: TokenKind = self.peek();
+    if token_kind_eq(k, TokenKind::Lt) { op = BinOp::Lt; }
+    else if token_kind_eq(k, TokenKind::Gt) { op = BinOp::Gt; }
+    else if token_kind_eq(k, TokenKind::LtEq) { op = BinOp::LtEq; }
+    else if token_kind_eq(k, TokenKind::GtEq) { op = BinOp::GtEq; }
+    else { break; }
+    self.advance();
+    var right: Expr = Expr::IntLit(0);
+    match self.parse_addition() {
+        ParseResultExpr::Ok(e) => { right = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    left = Expr::Binary(op, Box::new(left), Box::new(right));
+}
+return ParseResultExpr::Ok(left);
+}
+
+fn parse_addition(self: &mut Parser) -> ParseResultExpr {
+var left: Expr = Expr::IntLit(0);
+match self.parse_multiplication() {
+    ParseResultExpr::Ok(e) => { left = e; }
+    ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+}
+loop {
+    var op: BinOp = BinOp::Add;
+    var k: TokenKind = self.peek();
+    if token_kind_eq(k, TokenKind::Plus) { op = BinOp::Add; }
+    else if token_kind_eq(k, TokenKind::Minus) { op = BinOp::Sub; }
+    else { break; }
+    self.advance();
+    var right: Expr = Expr::IntLit(0);
+    match self.parse_multiplication() {
+        ParseResultExpr::Ok(e) => { right = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    left = Expr::Binary(op, Box::new(left), Box::new(right));
+}
+return ParseResultExpr::Ok(left);
+}
+
+fn parse_multiplication(self: &mut Parser) -> ParseResultExpr {
+var left: Expr = Expr::IntLit(0);
+match self.parse_unary() {
+    ParseResultExpr::Ok(e) => { left = e; }
+    ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+}
+loop {
+    var op: BinOp = BinOp::Mul;
+    var k: TokenKind = self.peek();
+    if token_kind_eq(k, TokenKind::Star) { op = BinOp::Mul; }
+    else if token_kind_eq(k, TokenKind::Slash) { op = BinOp::Div; }
+    else if token_kind_eq(k, TokenKind::Percent) { op = BinOp::Mod; }
+    else { break; }
+    self.advance();
+    var right: Expr = Expr::IntLit(0);
+    match self.parse_unary() {
+        ParseResultExpr::Ok(e) => { right = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    left = Expr::Binary(op, Box::new(left), Box::new(right));
+}
+return ParseResultExpr::Ok(left);
+}
+
+fn parse_unary(self: &mut Parser) -> ParseResultExpr {
+var k: TokenKind = self.peek();
+if token_kind_eq(k, TokenKind::Minus) {
+    self.advance();
+    var expr: Expr = Expr::IntLit(0);
+    match self.parse_unary() {
+        ParseResultExpr::Ok(e) => { expr = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    return ParseResultExpr::Ok(Expr::Unary(UnaryOp::Neg, Box::new(expr)));
+}
+if token_kind_eq(k, TokenKind::Bang) {
+    self.advance();
+    var expr: Expr = Expr::IntLit(0);
+    match self.parse_unary() {
+        ParseResultExpr::Ok(e) => { expr = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    return ParseResultExpr::Ok(Expr::Unary(UnaryOp::Not, Box::new(expr)));
+}
+if token_kind_eq(k, TokenKind::Tilde) {
+    self.advance();
+    var expr: Expr = Expr::IntLit(0);
+    match self.parse_unary() {
+        ParseResultExpr::Ok(e) => { expr = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    return ParseResultExpr::Ok(Expr::Unary(UnaryOp::BitNot, Box::new(expr)));
+}
+if token_kind_eq(k, TokenKind::Ampersand) {
+    self.advance();
+    var is_mut: bool = self.match_tok(TokenKind::Mut);
+    var expr: Expr = Expr::IntLit(0);
+    match self.parse_unary() {
+        ParseResultExpr::Ok(e) => { expr = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    return ParseResultExpr::Ok(Expr::Ref(Box::new(expr), is_mut));
+}
+if token_kind_eq(k, TokenKind::Star) {
+    self.advance();
+    var expr: Expr = Expr::IntLit(0);
+    match self.parse_unary() {
+        ParseResultExpr::Ok(e) => { expr = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    return ParseResultExpr::Ok(Expr::Deref(Box::new(expr)));
+}
+if token_kind_eq(k, TokenKind::Comptime) {
+    self.advance();
+    return self.parse_comptime_expr(0);
+}
+return self.parse_postfix();
+}
+
+fn parse_comptime_expr(self: &mut Parser, _line: i64) -> ParseResultExpr {
+// comptime { block }
+if self.check(TokenKind::LBrace) {
+    self.advance();
+    var stmts: Vec<Stmt> = Vec::new();
+    while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+        match self.parse_stmt() {
+            ParseResultStmt::Ok(s) => { stmts.push(s); }
+            ParseResultStmt::Err(e) => { return ParseResultExpr::Err(e); }
+        }
+    }
+    match self.expect(TokenKind::RBrace, "}") {
+        ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    self.match_tok(TokenKind::Semicolon);
+    return ParseResultExpr::Ok(Expr::ComptimeBlock(stmts));
+}
+}
+
+fn parse_postfix(self: &mut Parser) -> ParseResultExpr {
+var expr: Expr = Expr::IntLit(0);
+match self.parse_primary() {
+    ParseResultExpr::Ok(e) => { expr = e; }
+    ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+}
+loop {
+    if self.match_tok(TokenKind::Dot) {
+        var field: str = "";
+        match self.expect_ident_or_keyword() {
+            ParseResultStr::Ok(s) => { field = s; }
+            ParseResultStr::Err(e) => { return ParseResultExpr::Err(e); }
+        }
+        if self.match_tok(TokenKind::LParen) {
+            // Method call
+            var args: Vec<Expr> = Vec::new();
+            if !self.check(TokenKind::RParen) {
+                loop {
+                    match self.parse_expr() {
+                        ParseResultExpr::Ok(e) => { args.push(e); }
+                        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+                    }
+                    if !self.match_tok(TokenKind::Comma) { break; }
+                }
+            }
+            match self.expect(TokenKind::RParen, ")") {
+                ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+                ParseResultUnit::Ok => {}
+            }
+            expr = Expr::MethodCall(Box::new(expr), field, args);
+        } else {
+            expr = Expr::FieldAccess(Box::new(expr), field);
+        }
+    } else if self.match_tok(TokenKind::QuestionDot) {
+        var field: str = "";
+        match self.expect_ident() {
+            ParseResultStr::Ok(s) => { field = s; }
+            ParseResultStr::Err(e) => { return ParseResultExpr::Err(e); }
+        }
+        expr = Expr::OptionalFieldAccess(Box::new(expr), field);
+    } else if self.match_tok(TokenKind::LBracket) {
+        var index: Expr = Expr::IntLit(0);
+        match self.parse_expr() {
+            ParseResultExpr::Ok(e) => { index = e; }
+            ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+        }
+        match self.expect(TokenKind::RBracket, "]") {
+            ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        expr = Expr::Index(Box::new(expr), Box::new(index));
+    } else if self.match_tok(TokenKind::Question) {
+        expr = Expr::Try(Box::new(expr));
+    } else if self.match_tok(TokenKind::As) {
+        var target_ty: Type = Type::Void;
+        match self.parse_type() {
+            ParseResultType::Ok(t) => { target_ty = t; }
+            ParseResultType::Err(e) => { return ParseResultExpr::Err(e); }
+        }
+        expr = Expr::Cast(Box::new(expr), target_ty);
+    } else if self.match_tok(TokenKind::TildeArrow) {
+        var target_ty: Type = Type::Void;
+        match self.parse_type() {
+            ParseResultType::Ok(t) => { target_ty = t; }
+            ParseResultType::Err(e) => { return ParseResultExpr::Err(e); }
+        }
+        expr = Expr::QuantCast(Box::new(expr), target_ty);
+    } else {
+        break;
+    }
+}
+return ParseResultExpr::Ok(expr);
+}
+
+fn parse_match_expr(self: &mut Parser) -> ParseResultExpr {
+match self.expect(TokenKind::Match, "match") {
+    ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var expr: Expr = Expr::IntLit(0);
+match self.parse_expr() {
+    ParseResultExpr::Ok(e) => { expr = e; }
+    ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+}
+match self.expect(TokenKind::LBrace, "{") {
+    ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var arms: Vec<MatchArm> = Vec::new();
+while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+    var pattern: Pattern = Pattern::Wildcard;
+    match self.parse_pattern() {
+        ParseResultPattern::Ok(p) => { pattern = p; }
+        ParseResultPattern::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    var match_guard: OptBoxExpr = OptBoxExpr::None;
+    if self.check(TokenKind::If) {
+        self.advance();
+        match self.parse_expr() {
+            ParseResultExpr::Ok(g) => { match_guard = OptBoxExpr::Some(Box::new(g)); }
+            ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+        }
+    }
+    match self.expect(TokenKind::FatArrow, "=>") {
+        ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var body: Vec<Stmt> = Vec::new();
+    if self.check(TokenKind::LBrace) {
+        self.advance();
+        match self.parse_block() {
+            ParseResultStmts::Ok(b) => { body = b; }
+            ParseResultStmts::Err(e) => { return ParseResultExpr::Err(e); }
+        }
+        match self.expect(TokenKind::RBrace, "}") {
+            ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+    } else {
+        var line: i64 = self.peek_token().line;
+        var e: Expr = Expr::IntLit(0);
+        match self.parse_expr() {
+            ParseResultExpr::Ok(pe) => { e = pe; }
+            ParseResultExpr::Err(pe_err) => { return ParseResultExpr::Err(pe_err); }
+        }
+        body.push(Stmt::Expr(e, line));
+    }
+    self.match_tok(TokenKind::Comma);
+    arms.push(MatchArm_new(pattern, match_guard, body));
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+}
+
+// Helper: parse call arguments and build a Call expr.
+// Assumes LParen was already consumed. Consumes RParen.
+fn parse_call_expr(self: &mut Parser, callee: str) -> ParseResultExpr {
+var args: Vec<Expr> = Vec::new();
+if !self.check(TokenKind::RParen) {
+    loop {
+        match self.parse_expr() {
+            ParseResultExpr::Ok(e) => { args.push(e); }
+            ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+        }
+        if !self.match_tok(TokenKind::Comma) { break; }
+    }
+}
+match self.expect(TokenKind::RParen, ")") {
+    ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultExpr::Ok(Expr::Call(callee, args));
+}
+
+// Helper: parse struct literal body. Assumes LBrace was already consumed.
+// Consumes RBrace.
+fn parse_struct_lit_expr(self: &mut Parser, name: str) -> ParseResultExpr {
+var fields: Vec<FieldInit> = Vec::new();
+var spread: OptBoxExpr = OptBoxExpr::None;
+if !self.check(TokenKind::RBrace) {
+    loop {
+        if self.check(TokenKind::DotDot) {
+            self.advance();
+            match self.parse_expr() {
+                ParseResultExpr::Ok(se) => { spread = OptBoxExpr::Some(Box::new(se)); }
+                ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+            }
+            if !self.match_tok(TokenKind::Comma) { break; }
+            if self.check(TokenKind::RBrace) { break; }
+            continue;
+        }
+        var fname: str = "";
+        match self.expect_ident_or_keyword() {
+            ParseResultStr::Ok(s) => { fname = s; }
+            ParseResultStr::Err(e) => { return ParseResultExpr::Err(e); }
+        }
+        match self.expect(TokenKind::Colon, ":") {
+            ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        var fval: Expr = Expr::IntLit(0);
+        match self.parse_expr() {
+            ParseResultExpr::Ok(e) => { fval = e; }
+            ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+        }
+        fields.push(FieldInit_new(fname, fval));
+        if !self.match_tok(TokenKind::Comma) { break; }
+        if self.check(TokenKind::RBrace) { break; }
+    }
+}
+match self.expect(TokenKind::RBrace, "}") {
+    ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultExpr::Ok(Expr::StructLit(name, fields, spread));
+}
+
+// Helper: parse comma-separated expr list inside ( ... ).
+// Assumes LParen was already consumed. Consumes RParen.
+fn parse_expr_list(self: &mut Parser) -> ParseResultExprs {
+var args: Vec<Expr> = Vec::new();
+if !self.check(TokenKind::RParen) {
+    loop {
+        match self.parse_expr() {
+            ParseResultExpr::Ok(e) => { args.push(e); }
+            ParseResultExpr::Err(e) => { return ParseResultExprs::Err(e); }
+        }
+        if !self.match_tok(TokenKind::Comma) { break; }
+    }
+}
+match self.expect(TokenKind::RParen, ")") {
+    ParseResultUnit::Err(e) => { return ParseResultExprs::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultExprs::Ok(args);
+}
+
+// Helper: parse tuple rest after first element and comma.
+// Assumes LParen and first expr were already consumed, and comma was matched.
+// Consumes RParen.
+fn parse_tuple_rest(self: &mut Parser, first: Expr) -> ParseResultExpr {
+var elems: Vec<Expr> = Vec::new();
+elems.push(first);
+loop {
+    self.expr_depth = self.expr_depth + 1;
+    match self.parse_expr() {
+        ParseResultExpr::Ok(e) => { elems.push(e); }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    self.expr_depth = self.expr_depth - 1;
+    if !self.match_tok(TokenKind::Comma) { break; }
+}
+match self.expect(TokenKind::RParen, ")") {
+    ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultExpr::Ok(Expr::TupleLit(elems));
+}
+
+fn parse_primary(self: &mut Parser) -> ParseResultExpr {
+var tok: Token = self.peek_token();
+var k: TokenKind = tok.kind;
+
+// IntLit
+match k {
+    TokenKind::IntLit(n: i64) => {
+        self.advance();
+        return ParseResultExpr::Ok(Expr::IntLit(n));
+    }
+}
+// FloatLit
+match k {
+    TokenKind::FloatLit(f: f64) => {
+        self.advance();
+        return ParseResultExpr::Ok(Expr::FloatLit(f));
+    }
+}
+// StringLit
+match k {
+    TokenKind::StringLit(s: str) => {
+        self.advance();
+        return ParseResultExpr::Ok(Expr::StringLit(s));
+    }
+}
+// FString
+match k {
+    TokenKind::FString(s: str) => {
+        self.advance();
+        return self.parse_fstring_parts(s);
+    }
+}
+// Array literal: [val, val, ...]
+if token_kind_eq(k, TokenKind::LBracket) {
+    self.advance();
+    var elements: Vec<Expr> = Vec::new();
+    if !self.check(TokenKind::RBracket) {
+        loop {
+            match self.parse_expr() {
+                ParseResultExpr::Ok(e) => { elements.push(e); }
+                ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+            }
+            if !self.match_tok(TokenKind::Comma) { break; }
+        }
+    }
+    match self.expect(TokenKind::RBracket, "]") {
+        ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    return ParseResultExpr::Ok(Expr::ArrayLit(Box::new(Type::I64), elements));
+}
+if token_kind_eq(k, TokenKind::True) {
+    self.advance();
+    return ParseResultExpr::Ok(Expr::BoolLit(true));
+}
+if token_kind_eq(k, TokenKind::False) {
+    self.advance();
+    return ParseResultExpr::Ok(Expr::BoolLit(false));
+}
+// Closure: fn(params) -> ret { body } or fn(params) => expr
+if token_kind_eq(k, TokenKind::Fn) {
+    self.advance();
+    match self.expect(TokenKind::LParen, "(") {
+        ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var params: Vec<Param> = Vec::new();
+    match self.parse_params() {
+        ParseResultParams::Ok(p) => { params = p; }
+        ParseResultParams::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    match self.expect(TokenKind::RParen, ")") {
+        ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var ret_ty: OptType = OptType::None;
+    if self.match_tok(TokenKind::Arrow) {
+        var peek_k: TokenKind = self.peek();
+        var is_type: bool = false;
+        if starts_type(peek_k) {
+            is_type = true;
+        } else {
+            match peek_k {
+                TokenKind::Ident(_: str) => { is_type = true; }
+            }
+        }
+        if is_type {
+            match self.parse_type() {
+                ParseResultType::Ok(t) => { ret_ty = OptType::Some(t); }
+                ParseResultType::Err(e) => { return ParseResultExpr::Err(e); }
+            }
+        }
+    }
+    if self.match_tok(TokenKind::FatArrow) {
+        // Expression closure: fn(x) => expr
+        var line: i64 = self.peek_token().line;
+        var e: Expr = Expr::IntLit(0);
+        match self.parse_expr() {
+            ParseResultExpr::Ok(pe) => { e = pe; }
+            ParseResultExpr::Err(pe_err) => { return ParseResultExpr::Err(pe_err); }
+        }
+        var body: Vec<Stmt> = Vec::new();
+        body.push(Stmt::Expr(e, line));
+        return ParseResultExpr::Ok(Expr::Closure(params, body, ret_ty));
+    } else {
+        match self.expect(TokenKind::LBrace, "{") {
+            ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        var body: Vec<Stmt> = Vec::new();
+        match self.parse_block() {
+            ParseResultStmts::Ok(b) => { body = b; }
+            ParseResultStmts::Err(e) => { return ParseResultExpr::Err(e); }
+        }
+        match self.expect(TokenKind::RBrace, "}") {
+            ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+            ParseResultUnit::Ok => {}
+        }
+        return ParseResultExpr::Ok(Expr::Closure(params, body, ret_ty));
+    }
+}
+// Block-as-expression: { stmt; stmt; expr }
+if token_kind_eq(k, TokenKind::LBrace) {
+    self.advance();
+    var block: Vec<Stmt> = Vec::new();
+    match self.parse_block() {
+        ParseResultStmts::Ok(b) => { block = b; }
+        ParseResultStmts::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    match self.expect(TokenKind::RBrace, "}") {
+        ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    return ParseResultExpr::Ok(Expr::Block(block));
+}
+// Identifier or function call
+if token_kind_eq(k, TokenKind::Ident("")) {
+    var name: str = "";
+    match tok.kind {
+        TokenKind::Ident(s: str) => { name = s; }
+    }
+    self.advance();
+    // Check for asm! macro
+    if name == "asm" && self.match_tok(TokenKind::Bang) {
+        return self.parse_asm();
+    }
+    if self.match_tok(TokenKind::LParen) {
+        return self.parse_call_expr(name);
+    }
+    if self.check(TokenKind::LBrace) && self.is_struct_name(name) {
+        self.advance();
+        return self.parse_struct_lit_expr(name);
+    }
+    if self.check(TokenKind::DoubleColon) {
+        self.advance();
+        var variant_or_method: str = "";
+        match self.expect_ident() {
+            ParseResultStr::Ok(s) => { variant_or_method = s; }
+            ParseResultStr::Err(e) => { return ParseResultExpr::Err(e); }
+        }
+        var args: Vec<Expr> = Vec::new();
+        if self.match_tok(TokenKind::LParen) {
+            match self.parse_expr_list() {
+                ParseResultExprs::Ok(a) => { args = a; }
+                ParseResultExprs::Err(e) => { return ParseResultExpr::Err(e); }
+            }
+        }
+        if self.is_enum_name(name) {
+            return ParseResultExpr::Ok(Expr::EnumLit(name, variant_or_method, args));
+        } else {
+            return ParseResultExpr::Ok(Expr::MethodCall(Box::new(Expr::Ident(name)), variant_or_method, args));
+        }
+    }
+    return ParseResultExpr::Ok(Expr::Ident(name));
+}
+// Parenthesized expression or tuple
+if token_kind_eq(k, TokenKind::LParen) {
+    self.advance();
+    self.expr_depth = self.expr_depth + 1;
+    var first: Expr = Expr::IntLit(0);
+    match self.parse_expr() {
+        ParseResultExpr::Ok(e) => { first = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    self.expr_depth = self.expr_depth - 1;
+    if self.match_tok(TokenKind::Comma) {
+        return self.parse_tuple_rest(first);
+    }
+    match self.expect(TokenKind::RParen, ")") {
+        ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    return ParseResultExpr::Ok(first);
+}
+// If expression
+if token_kind_eq(k, TokenKind::If) {
+    match self.parse_if_expr() {
+        ParseResultIfExpr::Ok(ie) => {
+            return ParseResultExpr::Ok(Expr::If(ie.cond, ie.then_block, ie.else_block));
+        }
+        ParseResultIfExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+}
+// Match expression
+if token_kind_eq(k, TokenKind::Match) {
+    return self.parse_match_expr();
+}
+// Try block
+if token_kind_eq(k, TokenKind::Try) {
+    self.advance();
+    match self.expect(TokenKind::LBrace, "{") {
+        ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var body: Vec<Stmt> = Vec::new();
+    match self.parse_block() {
+        ParseResultStmts::Ok(b) => { body = b; }
+        ParseResultStmts::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    match self.expect(TokenKind::RBrace, "}") {
+        ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    return ParseResultExpr::Ok(Expr::TryBlock(body));
+}
+// Await
+if token_kind_eq(k, TokenKind::Await) {
+    self.advance();
+    var e: Expr = Expr::IntLit(0);
+    match self.parse_unary() {
+        ParseResultExpr::Ok(ae) => { e = ae; }
+        ParseResultExpr::Err(e2) => { return ParseResultExpr::Err(e2); }
+    }
+    return ParseResultExpr::Ok(Expr::Await(Box::new(e)));
+}
+// Spawn
+if token_kind_eq(k, TokenKind::Spawn) {
+    self.advance();
+    var e: Expr = Expr::IntLit(0);
+    match self.parse_unary() {
+        ParseResultExpr::Ok(ae) => { e = ae; }
+        ParseResultExpr::Err(e2) => { return ParseResultExpr::Err(e2); }
+    }
+    return ParseResultExpr::Ok(Expr::Spawn(Box::new(e)));
+}
+// Word keywords as identifiers (e.g. query, move as variable names)
+if is_word_keyword(k) {
+    var kw_str: str = token_kind_to_str(k);
+    self.advance();
+    return ParseResultExpr::Ok(Expr::Ident(kw_str));
+}
+// Not a valid primary expression
+return ParseResultExpr::Err(
+    "Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) +
+    ": unexpected token '" + token_kind_to_str(k) + "'"
+);
+}
+
+fn parse_asm(self: &mut Parser) -> ParseResultExpr {
+match self.expect(TokenKind::LParen, "(") {
+    ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+// Template string
+var template: str = "";
+var ttok: Token = self.peek_token();
+match ttok.kind {
+    TokenKind::StringLit(s: str) => {
+        self.advance();
+        template = s;
+    }
+}
+if str_len(template) == 0 {
+    return ParseResultExpr::Err("Parse error: asm! first argument must be a string template");
+}
+// Operands
+var operands: Vec<AsmOperand> = Vec::new();
+while self.match_tok(TokenKind::Comma) {
+    var direction: AsmDir = AsmDir::In;
+    var dtok: Token = self.peek_token();
+    var got_dir: bool = true;
+    if token_kind_eq(dtok.kind, TokenKind::In) {
+        self.advance();
+        direction = AsmDir::In;
+    } else {
+        match dtok.kind {
+            TokenKind::Ident(s: str) => {
+                if s == "out" {
+                    self.advance();
+                    direction = AsmDir::Out;
+                } else {
+                    got_dir = false;
+                }
+            }
+        }
+        if !got_dir {
+            return ParseResultExpr::Err("Parse error: asm! operand must start with 'in' or 'out'");
+        }
+    }
+    match self.expect(TokenKind::LParen, "(") {
+        ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var reg: str = "";
+    var rtok: Token = self.peek_token();
+    match rtok.kind {
+        TokenKind::StringLit(s: str) => {
+            self.advance();
+            reg = s;
+        }
+    }
+    if str_len(reg) == 0 {
+        return ParseResultExpr::Err("Parse error: asm! register must be a string");
+    }
+    match self.expect(TokenKind::RParen, ")") {
+        ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    var expr: Expr = Expr::IntLit(0);
+    match self.parse_expr() {
+        ParseResultExpr::Ok(e) => { expr = e; }
+        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    }
+    operands.push(AsmOperand_new(direction, reg, expr));
+}
+match self.expect(TokenKind::RParen, ")") {
+    ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+return ParseResultExpr::Ok(Expr::Asm(template, operands));
+}
+
+fn peek_bin_op(self: &Parser) -> BinOpInfo {
+var k: TokenKind = self.peek();
+if token_kind_eq(k, TokenKind::PipeArrow) { return BinOpInfo_new(BinOp::Or, 1, true); }
+if token_kind_eq(k, TokenKind::QuestionQuestion) { return BinOpInfo_new(BinOp::Or, 2, true); }
+if token_kind_eq(k, TokenKind::Or) { return BinOpInfo_new(BinOp::Or, 4, true); }
+if token_kind_eq(k, TokenKind::Pipe) { return BinOpInfo_new(BinOp::BitOr, 5, true); }
+if token_kind_eq(k, TokenKind::Caret) { return BinOpInfo_new(BinOp::BitXor, 6, true); }
+if token_kind_eq(k, TokenKind::Ampersand) { return BinOpInfo_new(BinOp::BitAnd, 7, true); }
+if token_kind_eq(k, TokenKind::Shl) { return BinOpInfo_new(BinOp::Shl, 8, true); }
+if token_kind_eq(k, TokenKind::Shr) { return BinOpInfo_new(BinOp::Shr, 8, true); }
+if token_kind_eq(k, TokenKind::And) { return BinOpInfo_new(BinOp::And, 9, true); }
+if token_kind_eq(k, TokenKind::EqEq) { return BinOpInfo_new(BinOp::Eq, 10, true); }
+if token_kind_eq(k, TokenKind::BangEq) { return BinOpInfo_new(BinOp::Neq, 10, true); }
+if token_kind_eq(k, TokenKind::Lt) { return BinOpInfo_new(BinOp::Lt, 11, true); }
+if token_kind_eq(k, TokenKind::Gt) { return BinOpInfo_new(BinOp::Gt, 11, true); }
+if token_kind_eq(k, TokenKind::LtEq) { return BinOpInfo_new(BinOp::LtEq, 11, true); }
+if token_kind_eq(k, TokenKind::GtEq) { return BinOpInfo_new(BinOp::GtEq, 11, true); }
+if token_kind_eq(k, TokenKind::Plus) { return BinOpInfo_new(BinOp::Add, 12, true); }
+if token_kind_eq(k, TokenKind::Minus) { return BinOpInfo_new(BinOp::Sub, 12, true); }
+if token_kind_eq(k, TokenKind::Star) { return BinOpInfo_new(BinOp::Mul, 13, true); }
+if token_kind_eq(k, TokenKind::Slash) { return BinOpInfo_new(BinOp::Div, 13, true); }
+if token_kind_eq(k, TokenKind::Percent) { return BinOpInfo_new(BinOp::Mod, 13, true); }
+return BinOpInfo_new(BinOp::Add, 0, false);
+}
+
+fn parse_expr_iterative(self: &mut Parser) -> ParseResultExpr {
+var vals: Vec<Expr> = Vec::new();
+var ops: Vec<OpEntry> = Vec::new();
+var need_primary: bool = true;
+
+loop {
+    if need_primary {
+        if self.check(TokenKind::LParen) {
+            self.advance();
+            ops.push(OpEntry::Paren);
+            if self.check(TokenKind::RParen) {
+                self.advance();
+                // Empty tuple ()
+                if ops.len() > 0 {
+                    ops.pop();
+                }
+                vals.push(Expr::TupleLit(Vec::new()));
+                need_primary = false;
+            }
+        } else {
+            match self.parse_primary() {
+                ParseResultExpr::Ok(e) => { vals.push(e); }
+                ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+            }
+            need_primary = false;
+        }
+    } else {
+        var bop: BinOp = BinOp::Add;
+        var prec: i64 = 0;
+        var found: bool = false;
+        var info: BinOpInfo = self.peek_bin_op();
+        bop = info.op;
+        prec = info.prec;
+        found = info.found;
+        if found {
+            self.advance();
+            // Pop higher-or-equal precedence (left-associative)
+            while ops.len() > 0 {
+                var top: OpEntry = ops.get(ops.len() - 1);
+                var top_prec: i64 = 0;
+                var is_op: bool = false;
+                match top {
+                    OpEntry::Op(_: BinOp, tp: i64) => { top_prec = tp; is_op = true; }
+                    OpEntry::Paren => { break; }
+                }
+                if is_op && top_prec >= prec {
+                    if !reduce_one_op(vals, ops) { break; }
+                } else {
+                    break;
+                }
+            }
+            ops.push(OpEntry::Op(bop, prec));
+            need_primary = true;
+        } else if self.check(TokenKind::RParen) {
+            // Close paren — pop until Paren marker
+            var found_paren: bool = false;
+            while ops.len() > 0 {
+                var top: OpEntry = ops.get(ops.len() - 1);
+                var is_paren: bool = false;
+                match top {
+                    OpEntry::Paren => { is_paren = true; }
+                    OpEntry::Op => {}
+                }
+                if is_paren {
+                    ops.pop();
+                    found_paren = true;
+                    break;
+                }
+                if !reduce_one_op(vals, ops) { break; }
+            }
+            if found_paren {
+                self.advance();
+                // Check for tuple
+                if self.check(TokenKind::Comma) {
+                    var elems: Vec<Expr> = Vec::new();
+                    if vals.len() > 0 {
+                        elems.push(vals.pop());
+                    }
+                    while self.match_tok(TokenKind::Comma) {
+                        self.expr_depth = self.expr_depth + 1;
+                        var elem: Expr = Expr::IntLit(0);
+                        if self.expr_depth > self.max_expr_depth {
+                            match self.parse_expr_iterative() {
+                                ParseResultExpr::Ok(e) => { elem = e; }
+                                ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+                            }
+                        } else {
+                            match self.parse_expr() {
+                                ParseResultExpr::Ok(e) => { elem = e; }
+                                ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+                            }
+                        }
+                        self.expr_depth = self.expr_depth - 1;
+                        elems.push(elem);
+                    }
+                    match self.expect(TokenKind::RParen, ")") {
+                        ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
+                        ParseResultUnit::Ok => {}
+                    }
+                    vals.push(Expr::TupleLit(elems));
+                }
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+// Drain remaining operators
+while ops.len() > 0 {
+    var top: OpEntry = ops.get(ops.len() - 1);
+    var is_paren: bool = false;
+    match top {
+        OpEntry::Paren => { is_paren = true; }
+        OpEntry::Op => {}
+    }
+    if is_paren {
+        return ParseResultExpr::Err("unmatched '(' in expression");
+    }
+    if !reduce_one_op(vals, ops) { break; }
+}
+
+if vals.len() == 0 {
+    return ParseResultExpr::Err("expected expression");
+}
+return ParseResultExpr::Ok(vals.pop());
+}
+
+fn parse_use(self: &mut Parser) -> ParseResultImportDef {
+match self.expect(TokenKind::Use, "use") {
+    ParseResultUnit::Err(e) => { return ParseResultImportDef::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var is_glob: bool = false;
+var path: str = "";
+loop {
+    if self.check(TokenKind::LBrace) { break; }
+    if self.check(TokenKind::Star) {
+        if str_ends_with(path, "::") {
+            path = str_slice(path, 0, str_len(path) - 2);
+        }
+        self.advance();
+        is_glob = true;
+        break;
+    }
+    var name: str = "";
+    match self.expect_ident() {
+        ParseResultStr::Ok(s) => { name = s; }
+        ParseResultStr::Err(e) => { return ParseResultImportDef::Err(e); }
+    }
+    path = path + name;
+    if self.match_tok(TokenKind::DoubleColon) {
+        path = path + "::";
+    } else {
+        break;
+    }
+}
+// alias: use path as alias
+var alias: OptStr = OptStr::None;
+if self.match_tok(TokenKind::As) {
+    match self.expect_ident() {
+        ParseResultStr::Ok(s) => { alias = OptStr::Some(s); }
+        ParseResultStr::Err(e) => { return ParseResultImportDef::Err(e); }
+    }
+}
+// selective imports: { item1, item2 } or { * }
+var items: Vec<str> = Vec::new();
+if self.match_tok(TokenKind::LBrace) {
+    if self.check(TokenKind::Star) {
+        self.advance();
+        is_glob = true;
+    } else if !self.check(TokenKind::RBrace) {
+        loop {
+            var item: str = "";
+            match self.expect_ident() {
+                ParseResultStr::Ok(s) => { item = s; }
+                ParseResultStr::Err(e) => { return ParseResultImportDef::Err(e); }
+            }
+            items.push(item);
+            if !self.match_tok(TokenKind::Comma) { break; }
+        }
+    }
+    match self.expect(TokenKind::RBrace, "}") {
+        ParseResultUnit::Err(e) => { return ParseResultImportDef::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+}
+}
+
+fn parse_at_annotation(self: &mut Parser) -> ParseResultAnnotation {
+match self.expect(TokenKind::At, "@") {
+    ParseResultUnit::Err(e) => { return ParseResultAnnotation::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var name: str = "";
+var tok: Token = self.peek_token();
+match tok.kind {
+    TokenKind::Ident(s: str) => {
+        self.advance();
+        var full_name: str = s;
+        // Hyphenated name: ident - ident - ident ...
+        while self.check(TokenKind::Minus) {
+            self.advance();
+            var ptok: Token = self.peek_token();
+            match ptok.kind {
+                TokenKind::Ident(part: str) => {
+                    self.advance();
+                    full_name = full_name + "-" + part;
+                }
+            }
+        }
+        name = full_name;
+    }
+    TokenKind::Kernel => { self.advance(); name = "kernel"; }
+    TokenKind::Layer => { self.advance(); name = "layer"; }
+    TokenKind::Model => { self.advance(); name = "model"; }
+}
+if str_len(name) == 0 {
+    var ptok: Token = self.peek_token();
+    return ParseResultAnnotation::Err(
+        "Parse error at " + int_to_str(ptok.line) + ":" + int_to_str(ptok.col) +
+        ": expected annotation name after '@'"
+    );
+}
+var args: Vec<str> = Vec::new();
+if self.match_tok(TokenKind::LParen) {
+    if !self.check(TokenKind::RParen) {
+        loop {
+            match self.parse_annotation_arg() {
+                ParseResultStr::Ok(arg) => { args.push(arg); }
+                ParseResultStr::Err(e) => { return ParseResultAnnotation::Err(e); }
+            }
+            if !self.match_tok(TokenKind::Comma) { break; }
+        }
+    }
+    match self.expect(TokenKind::RParen, ")") {
+        ParseResultUnit::Err(e) => { return ParseResultAnnotation::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+}
+var __ret_Annotation: Annotation = Annotation_new(name, args);
+return ParseResultAnnotation::Ok(__ret_Annotation);
+}
+
+fn parse_annotation_arg(self: &mut Parser) -> ParseResultStr {
+var arg: str = "";
+var tok: Token = self.peek_token();
+match tok.kind {
+    TokenKind::Ident(s: str) => {
+        self.advance();
+        arg = s;
+        if self.match_tok(TokenKind::Eq) {
+            arg = arg + "=";
+            match self.parse_annotation_arg() {
+                ParseResultStr::Ok(rest) => { arg = arg + rest; }
+                ParseResultStr::Err(e) => { return ParseResultStr::Err(e); }
+            }
+        }
+        return ParseResultStr::Ok(arg);
+    }
+    TokenKind::IntLit(n: i64) => {
+        self.advance();
+        return ParseResultStr::Ok(int_to_str(n));
+    }
+    TokenKind::FloatLit(f: f64) => {
+        self.advance();
+        return ParseResultStr::Ok(float_to_str(f));
+    }
+    TokenKind::StringLit(s: str) => {
+        self.advance();
+        return ParseResultStr::Ok("\"" + s + "\"");
+    }
+    TokenKind::LBracket => {
+    self.advance();
+    arg = "[";
+    loop {
+        match self.parse_annotation_arg() {
+            ParseResultStr::Ok(part) => { arg = arg + part; }
+            ParseResultStr::Err(e) => { return ParseResultStr::Err(e); }
+        }
+        if !self.match_tok(TokenKind::Comma) { break; }
+        arg = arg + ",";
+    }
+    match self.expect(TokenKind::RBracket, "]") {
+        ParseResultUnit::Err(e) => { return ParseResultStr::Err(e); }
+        ParseResultUnit::Ok => {}
+    }
+    arg = arg + "]";
+    return ParseResultStr::Ok(arg);
+}
+}
+return ParseResultStr::Err("Expected annotation argument, got '" + token_kind_to_str(tok.kind) + "'");
+}
+
+fn parse_attribute(self: &mut Parser) -> ParseResultAttribute {
+match self.expect(TokenKind::Hash, "#") {
+ParseResultUnit::Err(e) => { return ParseResultAttribute::Err(e); }
+ParseResultUnit::Ok => {}
+}
+match self.expect(TokenKind::LBracket, "[") {
+ParseResultUnit::Err(e) => { return ParseResultAttribute::Err(e); }
+ParseResultUnit::Ok => {}
+}
+var name: str = "";
+match self.expect_ident() {
+ParseResultStr::Ok(s) => { name = s; }
+ParseResultStr::Err(e) => { return ParseResultAttribute::Err(e); }
+}
+var args: Vec<str> = Vec::new();
+if self.match_tok(TokenKind::LParen) {
+if !self.check(TokenKind::RParen) {
+    loop {
+        var arg: str = "";
+        match self.expect_ident() {
+            ParseResultStr::Ok(s) => { arg = s; }
+            ParseResultStr::Err(e) => { return ParseResultAttribute::Err(e); }
+        }
+        args.push(arg);
+        if !self.match_tok(TokenKind::Comma) { break; }
+    }
+}
+match self.expect(TokenKind::RParen, ")") {
+    ParseResultUnit::Err(e) => { return ParseResultAttribute::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+}
+match self.expect(TokenKind::RBracket, "]") {
+ParseResultUnit::Err(e) => { return ParseResultAttribute::Err(e); }
+ParseResultUnit::Ok => {}
+}
+var __ret_Attribute: Attribute = Attribute_new(name, args);
+return ParseResultAttribute::Ok(__ret_Attribute);
+}
+
+fn parse_fstring_parts(self: &mut Parser, raw: str) -> ParseResultExpr {
+var parts: Vec<FStringPart> = Vec::new();
+var current: str = "";
+var i: i64 = 0;
+var len: i64 = str_len(raw);
+
+while i < len {
+var c: i64 = str_byte_at(raw, i);
+if c == 123 {
+    // '{' — start of interpolation
+    if str_len(current) > 0 {
+        parts.push(FStringPart::Literal(current));
+        current = "";
+    }
+    // Read expression until matching '}'
+    i = i + 1;
+    var expr_src: str = "";
+    var depth: i64 = 1;
+    while i < len {
+        var c2: i64 = str_byte_at(raw, i);
+        if c2 == 123 {
+            depth = depth + 1;
+            expr_src = expr_src + byte_to_str(c2);
+            i = i + 1;
+        } else if c2 == 125 {
+            depth = depth - 1;
+            if depth == 0 {
+                i = i + 1;
+                break;
+            }
+            expr_src = expr_src + byte_to_str(c2);
+            i = i + 1;
+        } else {
+            expr_src = expr_src + byte_to_str(c2);
+            i = i + 1;
+        }
+    }
+    // Re-lex and parse the expression
+    // TODO: Re-enable when cross-module Lexer usage is fixed
+    // var sub_lexer: Lexer = Lexer::new(expr_src);
+    // var sub_tokens: Vec<Token> = sub_lexer.tokenize();
+    // var sub_parser: Parser = Parser::new(sub_tokens);
+    // match sub_parser.parse_expr() {
+    //     ParseResultExpr::Ok(e) => { parts.push(FStringPart::Expr(e)); }
+    //     ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    // }
+    parts.push(FStringPart::Literal(expr_src));
+} else {
+    current = current + byte_to_str(c);
+    i = i + 1;
+}
+}
+if str_len(current) > 0 {
+parts.push(FStringPart::Literal(current));
+}
+return ParseResultExpr::Ok(Expr::FString(parts));
+}
+
+pub fn with_names(tokens: Vec<Token>, struct_names: Vec<str>, enum_names: Vec<str>) -> Parser {
+return Parser {
+    tokens: tokens,
+    pos: 0,
+    struct_names: struct_names,
+    enum_names: enum_names,
+    alias_to_struct: Vec::new(),
+    errors: Vec::new(),
+    expr_depth: 0,
+    max_expr_depth: 256,
+};
+}
+}
+
+// Helper: extract Expr from Box<Expr> (Fides has no * deref for Box)
+fn box_expr_deref(b: Box<Expr>) -> Expr {
+    match b {
+        Expr::IntLit(v) => { return Expr::IntLit(v); }
+        Expr::FloatLit(v) => { return Expr::FloatLit(v); }
+        Expr::StringLit(v) => { return Expr::StringLit(v); }
+        Expr::BoolLit(v) => { return Expr::BoolLit(v); }
+        Expr::CharLit(v) => { return Expr::CharLit(v); }
+        Expr::Ident(v) => { return Expr::Ident(v); }
+        Expr::Binary(op, l, r) => { return Expr::Binary(op, l, r); }
+        Expr::Unary(op, e) => { return Expr::Unary(op, e); }
+        Expr::Assign(op, l, r) => { return Expr::Assign(op, l, r); }
+        Expr::Call(f, args) => { return Expr::Call(f, args); }
+        Expr::MethodCall(obj, name, args) => { return Expr::MethodCall(obj, name, args); }
+        Expr::FieldAccess(obj, field) => { return Expr::FieldAccess(obj, field); }
+        Expr::Index(arr, idx) => { return Expr::Index(arr, idx); }
+        Expr::TupleLit(args) => { return Expr::TupleLit(args); }
+        Expr::ArrayLit(args) => { return Expr::ArrayLit(args); }
+        Expr::StructLit(name, fields) => { return Expr::StructLit(name, fields); }
+        Expr::EnumLit(name, variant, payload) => { return Expr::EnumLit(name, variant, payload); }
+        Expr::Lambda(params, ret, body) => { return Expr::Lambda(params, ret, body); }
+        Expr::If(cond, then, els) => { return Expr::If(cond, then, els); }
+        Expr::Match(expr, arms) => { return Expr::Match(expr, arms); }
+        Expr::Block(stmts) => { return Expr::Block(stmts); }
+        Expr::ComptimeBlock(stmts) => { return Expr::ComptimeBlock(stmts); }
+        Expr::Asm(ops, operands, template) => { return Expr::Asm(ops, operands, template); }
+        Expr::FString(parts) => { return Expr::FString(parts); }
+        Expr::Deref(e) => { return Expr::Deref(e); }
+        Expr::Try(e) => { return Expr::Try(e); }
+        Expr::Cast(e, ty) => { return Expr::Cast(e, ty); }
+        Expr::SizeOf(ty) => { return Expr::SizeOf(ty); }
+        Expr::AlignOf(ty) => { return Expr::AlignOf(ty); }
+        Expr::OffsetOf(ty, field) => { return Expr::OffsetOf(ty, field); }
+        Expr::Range(l, r) => { return Expr::Range(l, r); }
+        Expr::PipeForward(l, r) => { return Expr::PipeForward(l, r); }
+        Expr::Coalesce(l, r) => { return Expr::Coalesce(l, r); }
+        Expr::Path(p) => { return Expr::Path(p); }
+        Expr::UnitLit => { return Expr::UnitLit; }
+    }
+    return Expr::UnitLit;
+}
+
+fn vec_str_join(v: Vec<str>, sep: str) -> str {
+var result: str = "";
+var i: i64 = 0;
+while i < v.len() {
+if i > 0 {
+    result = result + sep;
+}
+result = result + v.get(i);
+i = i + 1;
+}
+return result;
+}
+
+fn is_int_type_keyword(kind: TokenKind) -> bool {
+if token_kind_eq(kind, TokenKind::I8) { return true; }
+if token_kind_eq(kind, TokenKind::I16) { return true; }
+if token_kind_eq(kind, TokenKind::I32) { return true; }
+if token_kind_eq(kind, TokenKind::I64) { return true; }
+if token_kind_eq(kind, TokenKind::I128) { return true; }
+if token_kind_eq(kind, TokenKind::U8) { return true; }
+if token_kind_eq(kind, TokenKind::U16) { return true; }
+if token_kind_eq(kind, TokenKind::U32) { return true; }
+if token_kind_eq(kind, TokenKind::U64) { return true; }
+if token_kind_eq(kind, TokenKind::U128) { return true; }
+return false;
+}
+
+fn type_keyword_name(kind: TokenKind) -> str {
+if token_kind_eq(kind, TokenKind::I8) { return "i8"; }
+if token_kind_eq(kind, TokenKind::I16) { return "i16"; }
+if token_kind_eq(kind, TokenKind::I32) { return "i32"; }
+if token_kind_eq(kind, TokenKind::I64) { return "i64"; }
+if token_kind_eq(kind, TokenKind::I128) { return "i128"; }
+if token_kind_eq(kind, TokenKind::U8) { return "u8"; }
+if token_kind_eq(kind, TokenKind::U16) { return "u16"; }
+if token_kind_eq(kind, TokenKind::U32) { return "u32"; }
+if token_kind_eq(kind, TokenKind::U64) { return "u64"; }
+if token_kind_eq(kind, TokenKind::U128) { return "u128"; }
+return "";
+}
+
+fn starts_type(kind: TokenKind) -> bool {
+if token_kind_eq(kind, TokenKind::I8) { return true; }
+if token_kind_eq(kind, TokenKind::I16) { return true; }
+if token_kind_eq(kind, TokenKind::I32) { return true; }
+if token_kind_eq(kind, TokenKind::I64) { return true; }
+if token_kind_eq(kind, TokenKind::I128) { return true; }
+if token_kind_eq(kind, TokenKind::U8) { return true; }
+if token_kind_eq(kind, TokenKind::U16) { return true; }
+if token_kind_eq(kind, TokenKind::U32) { return true; }
+if token_kind_eq(kind, TokenKind::U64) { return true; }
+if token_kind_eq(kind, TokenKind::U128) { return true; }
+if token_kind_eq(kind, TokenKind::F32) { return true; }
+if token_kind_eq(kind, TokenKind::F64) { return true; }
+if token_kind_eq(kind, TokenKind::Bool) { return true; }
+if token_kind_eq(kind, TokenKind::Str) { return true; }
+if token_kind_eq(kind, TokenKind::Void) { return true; }
+if token_kind_eq(kind, TokenKind::Fn) { return true; }
+if token_kind_eq(kind, TokenKind::Ampersand) { return true; }
+if token_kind_eq(kind, TokenKind::Star) { return true; }
+if token_kind_eq(kind, TokenKind::LBracket) { return true; }
+if token_kind_eq(kind, TokenKind::LParen) { return true; }
+if token_kind_eq(kind, TokenKind::Dyn) { return true; }
+// Ident — but we can't check payload here without the token. Caller handles.
+return false;
+}
+
+pub enum ParseResultIfExpr {
+Ok(IfExpr),
+Err(str),
+}
+
+pub struct BinOpInfo {
+pub op: BinOp,
+pub prec: i64,
+pub found: bool,
+}
+
+pub fn BinOpInfo_new(op: BinOp, prec: i64, found: bool) -> BinOpInfo {
+return BinOpInfo { op: op, prec: prec, found: found };
+}
+
+fn reduce_one_op(vals: &mut Vec<Expr>, ops: &mut Vec<OpEntry>) -> bool {
+if ops.len() == 0 { return false; }
+if vals.len() < 2 { return false; }
+var op_entry: OpEntry = ops.pop();
+match op_entry {
+OpEntry::Op(bop: BinOp, _: i64) => {
+    var right: Expr = vals.pop();
+    var left: Expr = vals.pop();
+    vals.push(Expr::Binary(bop, Box::new(left), Box::new(right)));
+    return true;
+}
+OpEntry::Paren => {
+    // Put it back — shouldn't reduce Paren
+    ops.push(OpEntry::Paren);
+    return false;
+}
+}
+return false;
+}

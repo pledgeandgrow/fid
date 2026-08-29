@@ -1,0 +1,306 @@
+// test_lexer_harness.fd — Test harness for compiler/lexer.fd
+// Reads a file given as argv[1], tokenizes it, prints tokens in dump-tokens format.
+// Usage: fidesc run test_lexer_harness.fd -- tests/hello.fd
+//
+// Output format matches `fidesc dump-tokens`:
+//   format!("  {:>4}:{:<3} {:?}", t.line, t.col, t.kind)
+//   e.g. "     3:1   Fn"
+//
+// NOTE: import order matters! compiler::lexer must be listed BEFORE
+// compiler::token so that token is popped first from the LIFO import
+// stack, loaded first, and TokenKind is registered before lexer.fd is parsed.
+
+use core;
+use vec;
+use compiler::lexer;
+use compiler::token;
+
+// ─── Debug formatting for TokenKind ───────────────────────────────────────
+// Matches Rust's `{:?}` (Debug) format, which is what dump-tokens uses.
+// Word keywords → variant name (Fn, Val, ...)
+// IntLit(n)     → IntLit(n)
+// FloatLit(f)   → FloatLit(f)       (with trailing .0 for whole numbers)
+// StringLit(s)  → StringLit("s")
+// FString(s)    → FString("s")
+// Ident(s)      → Ident("s")
+// Eof           → Eof
+// All others    → variant name (Plus, Eq, I64, ...)
+
+fn token_kind_debug(kind: TokenKind) -> str {
+    match kind {
+        // ── Word keywords (Debug = variant name, capitalized) ──
+        TokenKind::Fn => { return "Fn"; }
+        TokenKind::Val => { return "Val"; }
+        TokenKind::Var => { return "Var"; }
+        TokenKind::Mut => { return "Mut"; }
+        TokenKind::Const => { return "Const"; }
+        TokenKind::Given => { return "Given"; }
+        TokenKind::Ensure => { return "Ensure"; }
+        TokenKind::Cap => { return "Cap"; }
+        TokenKind::Type => { return "Type"; }
+        TokenKind::Return => { return "Return"; }
+        TokenKind::If => { return "If"; }
+        TokenKind::Else => { return "Else"; }
+        TokenKind::Match => { return "Match"; }
+        TokenKind::Select => { return "Select"; }
+        TokenKind::Struct => { return "Struct"; }
+        TokenKind::Enum => { return "Enum"; }
+        TokenKind::Impl => { return "Impl"; }
+        TokenKind::Pub => { return "Pub"; }
+        TokenKind::Use => { return "Use"; }
+        TokenKind::Module => { return "Module"; }
+        TokenKind::With => { return "With"; }
+        TokenKind::Async => { return "Async"; }
+        TokenKind::Await => { return "Await"; }
+        TokenKind::Comptime => { return "Comptime"; }
+        TokenKind::Defer => { return "Defer"; }
+        TokenKind::Spawn => { return "Spawn"; }
+        TokenKind::Move => { return "Move"; }
+        TokenKind::Static => { return "Static"; }
+        TokenKind::Try => { return "Try"; }
+        TokenKind::In => { return "In"; }
+        TokenKind::As => { return "As"; }
+        TokenKind::Dyn => { return "Dyn"; }
+        TokenKind::Where => { return "Where"; }
+        TokenKind::Region => { return "Region"; }
+        TokenKind::Sandbox => { return "Sandbox"; }
+        TokenKind::Unsafe => { return "Unsafe"; }
+        TokenKind::Txn => { return "Txn"; }
+        TokenKind::Persist => { return "Persist"; }
+        TokenKind::For => { return "For"; }
+        TokenKind::While => { return "While"; }
+        TokenKind::Loop => { return "Loop"; }
+        TokenKind::Break => { return "Break"; }
+        TokenKind::Continue => { return "Continue"; }
+        TokenKind::Handle => { return "Handle"; }
+        TokenKind::Do => { return "Do"; }
+        TokenKind::Interrupt => { return "Interrupt"; }
+        TokenKind::Extern => { return "Extern"; }
+        TokenKind::Guard => { return "Guard"; }
+        TokenKind::Is => { return "Is"; }
+        TokenKind::True => { return "True"; }
+        TokenKind::False => { return "False"; }
+        TokenKind::Layer => { return "Layer"; }
+        TokenKind::Model => { return "Model"; }
+        TokenKind::Grad => { return "Grad"; }
+        TokenKind::Backward => { return "Backward"; }
+        TokenKind::Kernel => { return "Kernel"; }
+        TokenKind::Component => { return "Component"; }
+        TokenKind::System => { return "System"; }
+        TokenKind::Query => { return "Query"; }
+        TokenKind::State => { return "State"; }
+        TokenKind::On => { return "On"; }
+
+        // ── Literals (with payload) ──
+        TokenKind::IntLit(n: i64) => { return "IntLit(" + int_to_str(n) + ")"; }
+        TokenKind::FloatLit(f: f64) => { return "FloatLit(" + float_debug(f) + ")"; }
+        TokenKind::StringLit(s: str) => { return "StringLit(\"" + str_escape(s) + "\")"; }
+        TokenKind::FString(s: str) => { return "FString(\"" + str_escape(s) + "\")"; }
+        TokenKind::Ident(s: str) => { return "Ident(\"" + s + "\")"; }
+        TokenKind::Eof => { return "Eof"; }
+
+        // ── Type keywords (Debug = variant name) ──
+        TokenKind::I8 => { return "I8"; }
+        TokenKind::I16 => { return "I16"; }
+        TokenKind::I32 => { return "I32"; }
+        TokenKind::I64 => { return "I64"; }
+        TokenKind::I128 => { return "I128"; }
+        TokenKind::U8 => { return "U8"; }
+        TokenKind::U16 => { return "U16"; }
+        TokenKind::U32 => { return "U32"; }
+        TokenKind::U64 => { return "U64"; }
+        TokenKind::U128 => { return "U128"; }
+        TokenKind::F32 => { return "F32"; }
+        TokenKind::F64 => { return "F64"; }
+        TokenKind::Bool => { return "Bool"; }
+        TokenKind::Str => { return "Str"; }
+        TokenKind::Void => { return "Void"; }
+
+        // ── Operators (Debug = variant name) ──
+        TokenKind::Plus => { return "Plus"; }
+        TokenKind::Minus => { return "Minus"; }
+        TokenKind::Star => { return "Star"; }
+        TokenKind::Slash => { return "Slash"; }
+        TokenKind::Percent => { return "Percent"; }
+        TokenKind::Eq => { return "Eq"; }
+        TokenKind::EqEq => { return "EqEq"; }
+        TokenKind::BangEq => { return "BangEq"; }
+        TokenKind::Lt => { return "Lt"; }
+        TokenKind::Gt => { return "Gt"; }
+        TokenKind::LtEq => { return "LtEq"; }
+        TokenKind::GtEq => { return "GtEq"; }
+        TokenKind::Bang => { return "Bang"; }
+        TokenKind::And => { return "And"; }
+        TokenKind::Ampersand => { return "Ampersand"; }
+        TokenKind::Or => { return "Or"; }
+        TokenKind::Pipe => { return "Pipe"; }
+        TokenKind::PipeArrow => { return "PipeArrow"; }
+        TokenKind::Caret => { return "Caret"; }
+        TokenKind::Tilde => { return "Tilde"; }
+        TokenKind::Shl => { return "Shl"; }
+        TokenKind::Shr => { return "Shr"; }
+        TokenKind::DotDot => { return "DotDot"; }
+        TokenKind::DotDotEq => { return "DotDotEq"; }
+        TokenKind::TildeArrow => { return "TildeArrow"; }
+
+        // ── Compound assignment ──
+        TokenKind::PlusEq => { return "PlusEq"; }
+        TokenKind::MinusEq => { return "MinusEq"; }
+        TokenKind::StarEq => { return "StarEq"; }
+        TokenKind::SlashEq => { return "SlashEq"; }
+        TokenKind::PercentEq => { return "PercentEq"; }
+        TokenKind::AmpEq => { return "AmpEq"; }
+        TokenKind::PipeEq => { return "PipeEq"; }
+        TokenKind::CaretEq => { return "CaretEq"; }
+        TokenKind::ShlEq => { return "ShlEq"; }
+        TokenKind::ShrEq => { return "ShrEq"; }
+
+        // ── Punctuation ──
+        TokenKind::Arrow => { return "Arrow"; }
+        TokenKind::FatArrow => { return "FatArrow"; }
+        TokenKind::Dot => { return "Dot"; }
+        TokenKind::Comma => { return "Comma"; }
+        TokenKind::Colon => { return "Colon"; }
+        TokenKind::Semicolon => { return "Semicolon"; }
+        TokenKind::DoubleColon => { return "DoubleColon"; }
+        TokenKind::Question => { return "Question"; }
+        TokenKind::QuestionQuestion => { return "QuestionQuestion"; }
+        TokenKind::QuestionDot => { return "QuestionDot"; }
+        TokenKind::Hash => { return "Hash"; }
+        TokenKind::At => { return "At"; }
+        TokenKind::LBracket => { return "LBracket"; }
+        TokenKind::RBracket => { return "RBracket"; }
+        TokenKind::LParen => { return "LParen"; }
+        TokenKind::RParen => { return "RParen"; }
+        TokenKind::LBrace => { return "LBrace"; }
+        TokenKind::RBrace => { return "RBrace"; }
+    }
+}
+
+/// Escape a string like Rust's `{:?}` for strings:
+/// \n → \\n, \t → \\t, \r → \\r, \\ → \\\\, " → \\", \0 → \\0
+fn str_escape(s: str) -> str {
+    var result: str = "";
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        var b: i64 = str_byte_at(s, i);
+        if b == 10 { result = str_concat(result, "\\n"); }       // \n
+        else if b == 9 { result = str_concat(result, "\\t"); }   // \t
+        else if b == 13 { result = str_concat(result, "\\r"); }  // \r
+        else if b == 92 { result = str_concat(result, "\\\\"); } // backslash
+        else if b == 34 { result = str_concat(result, "\\\""); } // "
+        else if b == 0 { result = str_concat(result, "\\0"); }   // NUL
+        else { result = str_concat(result, byte_to_str(b)); }
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Format a float like Rust's Debug: whole numbers get trailing ".0".
+fn float_debug(f: f64) -> str {
+    var s: str = float_to_str(f);
+    // If the string doesn't contain '.', append ".0"
+    var i: i64 = 0;
+    var has_dot: bool = false;
+    while i < str_len(s) {
+        if str_byte_at(s, i) == 46 {
+            has_dot = true;
+            break;
+        }
+        i = i + 1;
+    }
+    if !has_dot {
+        s = str_concat(s, ".0");
+    }
+    return s;
+}
+
+/// Right-align a number in `width` characters (pad with leading spaces).
+fn pad_right(n: i64, width: i64) -> str {
+    var s: str = int_to_str(n);
+    var slen: i64 = str_len(s);
+    while slen < width {
+        s = str_concat(" ", s);
+        slen = slen + 1;
+    }
+    return s;
+}
+
+/// Left-align a number in `width` characters (pad with trailing spaces).
+fn pad_left(n: i64, width: i64) -> str {
+    var s: str = int_to_str(n);
+    var slen: i64 = str_len(s);
+    while slen < width {
+        s = str_concat(s, " ");
+        slen = slen + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    // p_argv uses std::env::args() directly.
+    // Two invocation modes:
+    //   Interpreter: fidesc run harness.fd -- <file.fd>  (file is after "--")
+    //   Native:      ./harness <file.fd>                  (file is argv[1])
+    var argc: i64 = p_argc();
+    var path: str = "";
+    var i: i64 = 0;
+    var found_sep: bool = false;
+    while i < argc {
+        var a: str = p_argv(i);
+        if a == "--" {
+            found_sep = true;
+            if i + 1 < argc {
+                path = p_argv(i + 1);
+            }
+            break;
+        }
+        i = i + 1;
+    }
+    // Native mode: no "--" separator, take argv[1] directly
+    if !found_sep && str_len(path) == 0 && argc >= 2 {
+        path = p_argv(1);
+    }
+    if str_len(path) == 0 {
+        print("usage: fidesc run test_lexer_harness.fd -- <file.fd>\n");
+        print("   or: ./test_lexer_harness <file.fd>\n");
+        return 1;
+    }
+    var source: str = p_file_read(path);
+    if str_len(source) == 0 {
+        print("error: could not read file or empty file: ");
+        print(path);
+        print("\n");
+        return 1;
+    }
+
+    var lex: Lexer = Lexer::new(source);
+    var tokens: Vec<Token> = lex.tokenize();
+
+    // Print errors if any
+    i = 0;
+    while i < lex.errors.len() {
+        print(lex.errors.get(i));
+        print("\n");
+        i = i + 1;
+    }
+
+    // Print tokens in dump-tokens format:
+    // format!("  {:>4}:{:<3} {:?}", t.line, t.col, t.kind)
+    i = 0;
+    while i < tokens.len() {
+        var tok = tokens.get(i);
+        // "  " + right-align(line, 4) + ":" + left-align(col, 3) + " " + debug_kind
+        print("  ");
+        print(pad_right(tok.line, 4));
+        print(":");
+        print(pad_left(tok.col, 3));
+        print(" ");
+        print(token_kind_debug(tok.kind));
+        print("\n");
+        i = i + 1;
+    }
+
+    return 0;
+}

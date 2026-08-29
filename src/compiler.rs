@@ -282,13 +282,10 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
                 // Fallback: stdlib/ directory (for json, http, db, etc.)
                 std::path::Path::new("stdlib").join(format!("{}.fd", path_str)),
                 std::path::Path::new("stdlib").join(format!("{}/mod.fd", path_str)),
-                // Fallback: compiler/ directory at project root (for self-hosted
-                // compiler modules: token, diag, json, fmt — SH-6 leaf modules)
-                project_root.join("compiler").join(format!("{}.fd", path_str)),
-                project_root.join("compiler").join(format!("{}/mod.fd", path_str)),
-                // Also try stdlib/ at project root (when CWD isn't the project root)
-                project_root.join("stdlib").join(format!("{}.fd", path_str)),
-                project_root.join("stdlib").join(format!("{}/mod.fd", path_str)),
+                // Fallback: project root (handles compiler::json → compiler/json.fd,
+                // stdlib::vec → stdlib/vec.fd, etc. when CWD or base_dir is a subdir)
+                project_root.join(format!("{}.fd", path_str)),
+                project_root.join(format!("{}/mod.fd", path_str)),
             ];
 
             let mut found = None;
@@ -303,7 +300,67 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
                 let module_source = std::fs::read_to_string(&file_path)
                     .map_err(|e| vec![format!("Error reading '{}': {}", file_path.display(), e)])?;
 
-                // Parse the imported module with known names
+                // Pre-scan: tokenize and extract just the imports, so we can
+                // load this module's dependencies BEFORE parsing it fully.
+                // This ensures that types from dependency modules (e.g.
+                // TokenKind from compiler::token) are in struct_names/
+                // enum_names when we parse this module (e.g. compiler::lexer).
+                let mut pre_lex = Lexer::new(&module_source);
+                let pre_toks = pre_lex.tokenize();
+                let (pre_imports, pre_struct_names, pre_enum_names): (Vec<String>, Vec<String>, Vec<String>) = {
+                    let mut pre_parser = Parser::with_names(
+                        pre_toks,
+                        struct_names.clone(),
+                        enum_names.clone(),
+                    );
+                    // parse() collects imports; we also extract type names
+                    // defined in this module so they're available during the
+                    // full parse (e.g. ParseResultIfExpr in parser.fd).
+                    if let Ok(pre_prog) = pre_parser.parse() {
+                        let imports = pre_prog.imports.iter().map(|i| i.path.clone()).collect();
+                        let snames = pre_prog.structs.iter().map(|s| s.name.clone()).collect();
+                        let enames = pre_prog.enums.iter().map(|e| e.name.clone()).collect();
+                        (imports, snames, enames)
+                    } else {
+                        (Vec::new(), Vec::new(), Vec::new())
+                    }
+                };
+
+                // Add this module's own type names to the name sets so they're
+                // available during the full parse (for struct/enum literal
+                // recognition within the module itself).
+                for sn in &pre_struct_names {
+                    if !struct_names.contains(sn) {
+                        struct_names.push(sn.clone());
+                    }
+                }
+                for en in &pre_enum_names {
+                    if !enum_names.contains(en) {
+                        enum_names.push(en.clone());
+                    }
+                }
+
+                // Check if any dependencies are not yet loaded.
+                // If so, defer this module: push it back onto the stack AFTER
+                // its unloaded deps, so deps get processed first. The module
+                // will be re-popped later when all deps are loaded.
+                let unloaded_deps: Vec<String> = pre_imports.iter()
+                    .filter(|d| !loaded_module_names.contains(*d) && **d != "core")
+                    .cloned()
+                    .collect();
+                if !unloaded_deps.is_empty() {
+                    // Push this module back first, then push deps on top (LIFO)
+                    imports_to_process.push(import_path.clone());
+                    for dep in &unloaded_deps {
+                        if !loaded_module_names.contains(dep) {
+                            imports_to_process.push(dep.clone());
+                        }
+                    }
+                    continue;
+                }
+
+                // All dependencies are loaded — parse the module with the
+                // full name set (including types from all dependencies).
                 let mut lex = Lexer::new(&module_source);
                 let toks = lex.tokenize();
                 let mut p = Parser::with_names(toks, struct_names.clone(), enum_names.clone());
@@ -312,7 +369,8 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
                 let module_name = imported.module.clone()
                     .unwrap_or_else(|| import_path.clone());
 
-                // Mark as loaded
+                // Mark as loaded (import_path was already marked during pre-scan,
+                // but module_name might differ — e.g. "compiler::lexer" vs "lexer")
                 loaded_module_names.insert(import_path.clone());
                 loaded_module_names.insert(module_name.clone());
 
@@ -320,7 +378,8 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
                 struct_names.extend(imported.structs.iter().map(|s| s.name.clone()));
                 enum_names.extend(imported.enums.iter().map(|e| e.name.clone()));
 
-                // Add transitive imports from this module
+                // Add transitive imports from this module (in case pre-scan missed
+                // any — e.g. if the pre-scan parse failed but the full parse succeeds)
                 for trans_import in &imported.imports {
                     if !loaded_module_names.contains(&trans_import.path) {
                         imports_to_process.push(trans_import.path.clone());
@@ -1082,6 +1141,31 @@ pub fn parse_to_ast(source: &str) -> Result<String, String> {
     let user = parser.parse()?;
     let program = merge_programs(stdlib, user);
     Ok(format!("{:#?}", program))
+}
+
+/// Parse source WITHOUT merging stdlib — for self-host parser differential testing.
+/// Uses stdlib name hints for the parser but outputs only the user's AST.
+pub fn parse_to_ast_raw(source: &str) -> Result<String, String> {
+    let stdlib = parse_source(STDLIB_CORE).map_err(|e| e.join("\n"))?;
+    let struct_names: Vec<String> = stdlib.structs.iter().map(|s| s.name.clone()).collect();
+    let enum_names: Vec<String> = stdlib.enums.iter().map(|e| e.name.clone()).collect();
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize();
+    let mut parser = Parser::with_names(tokens, struct_names, enum_names);
+    let user = parser.parse()?;
+    Ok(format!("{:#?}", user))
+}
+
+/// Parse source WITHOUT merging stdlib, output in flat format for differential testing.
+pub fn parse_to_ast_flat_raw(source: &str) -> Result<String, String> {
+    let stdlib = parse_source(STDLIB_CORE).map_err(|e| e.join("\n"))?;
+    let struct_names: Vec<String> = stdlib.structs.iter().map(|s| s.name.clone()).collect();
+    let enum_names: Vec<String> = stdlib.enums.iter().map(|e| e.name.clone()).collect();
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize();
+    let mut parser = Parser::with_names(tokens, struct_names, enum_names);
+    let user = parser.parse()?;
+    Ok(crate::flat_ast::program_flat(&user))
 }
 
 /// Get diagnostics (errors) for a source file — used by LSP.

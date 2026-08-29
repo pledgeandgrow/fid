@@ -2689,7 +2689,8 @@ impl Interpreter {
             "p_vec_pop" => {
                 let vec_val = self.lookup_vec_value(args.first());
                 if let Some(Value::Vec(arr)) = vec_val {
-                    if let Some(v) = arr.borrow_mut().pop() {
+                    let popped = arr.borrow_mut().pop();
+                    if let Some(v) = popped {
                         let addr = if let Some(Value::Int(a)) = args.first() { *a as u64 } else { 0 };
                         if addr > 0 {
                             let len = arr.borrow().len() as i64;

@@ -1,0 +1,1371 @@
+// test_parser_harness.fd — Test harness for compiler/parser.fd
+// Reads a file given as argv[1], tokenizes and parses it, prints AST in flat format.
+// Usage: fidesc run test_parser_harness.fd -- <file.fd>
+//    or: ./test_parser_harness <file.fd>
+//
+// Output format matches `fidesc dump-ast-flat`:
+//   - 2 spaces per depth level
+//   - Node type first, then fields (strings double-quoted, numbers bare, bools as true/false)
+//   - Children on subsequent lines, indented
+
+use core;
+use vec;
+use string;
+use compiler::lexer;
+use compiler::token;
+use compiler::ast;
+use compiler::parser;
+
+// ─── String helpers ───────────────────────────────────────────────────────
+
+fn str_escape(s: str) -> str {
+    var result: str = "";
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        var b: i64 = str_byte_at(s, i);
+        if b == 10 { result = str_concat(result, "\\n"); }
+        else if b == 9 { result = str_concat(result, "\\t"); }
+        else if b == 13 { result = str_concat(result, "\\r"); }
+        else if b == 92 { result = str_concat(result, "\\\\"); }
+        else if b == 34 { result = str_concat(result, "\\\""); }
+        else if b == 0 { result = str_concat(result, "\\0"); }
+        else { result = str_concat(result, byte_to_str(b)); }
+        i = i + 1;
+    }
+    return result;
+}
+
+fn bool_str(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn indent(depth: i64) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < depth {
+        s = str_concat(s, "  ");
+        i = i + 1;
+    }
+    return s;
+}
+
+// ─── BinOp / UnaryOp / AssignOp flat ──────────────────────────────────────
+
+fn binop_flat(op: BinOp) -> str {
+    match op {
+        BinOp::Add => { return "Add"; }
+        BinOp::Sub => { return "Sub"; }
+        BinOp::Mul => { return "Mul"; }
+        BinOp::Div => { return "Div"; }
+        BinOp::Mod => { return "Mod"; }
+        BinOp::Eq => { return "Eq"; }
+        BinOp::Neq => { return "Neq"; }
+        BinOp::Lt => { return "Lt"; }
+        BinOp::Gt => { return "Gt"; }
+        BinOp::LtEq => { return "LtEq"; }
+        BinOp::GtEq => { return "GtEq"; }
+        BinOp::And => { return "And"; }
+        BinOp::Or => { return "Or"; }
+        BinOp::BitAnd => { return "BitAnd"; }
+        BinOp::BitOr => { return "BitOr"; }
+        BinOp::BitXor => { return "BitXor"; }
+        BinOp::Shl => { return "Shl"; }
+        BinOp::Shr => { return "Shr"; }
+    }
+    return "Unknown";
+}
+
+fn unaryop_flat(op: UnaryOp) -> str {
+    match op {
+        UnaryOp::Neg => { return "Neg"; }
+        UnaryOp::Not => { return "Not"; }
+        UnaryOp::BitNot => { return "BitNot"; }
+    }
+    return "Unknown";
+}
+
+fn assignop_flat(op: AssignOp) -> str {
+    match op {
+        AssignOp::Assign => { return "Assign"; }
+        AssignOp::AddAssign => { return "AddAssign"; }
+        AssignOp::SubAssign => { return "SubAssign"; }
+        AssignOp::MulAssign => { return "MulAssign"; }
+        AssignOp::DivAssign => { return "DivAssign"; }
+        AssignOp::ModAssign => { return "ModAssign"; }
+        AssignOp::BitAndAssign => { return "BitAndAssign"; }
+        AssignOp::BitOrAssign => { return "BitOrAssign"; }
+        AssignOp::BitXorAssign => { return "BitXorAssign"; }
+        AssignOp::ShlAssign => { return "ShlAssign"; }
+        AssignOp::ShrAssign => { return "ShrAssign"; }
+    }
+    return "Unknown";
+}
+
+// ─── Type flat ────────────────────────────────────────────────────────────
+
+fn box_type_flat(b: Box<Type>, depth: i64) -> str {
+    var ind: str = indent(depth);
+    match b {
+        Type::I8 => { return str_concat(ind, "I8"); }
+        Type::I16 => { return str_concat(ind, "I16"); }
+        Type::I32 => { return str_concat(ind, "I32"); }
+        Type::I64 => { return str_concat(ind, "I64"); }
+        Type::I128 => { return str_concat(ind, "I128"); }
+        Type::U8 => { return str_concat(ind, "U8"); }
+        Type::U16 => { return str_concat(ind, "U16"); }
+        Type::U32 => { return str_concat(ind, "U32"); }
+        Type::U64 => { return str_concat(ind, "U64"); }
+        Type::U128 => { return str_concat(ind, "U128"); }
+        Type::F32 => { return str_concat(ind, "F32"); }
+        Type::F64 => { return str_concat(ind, "F64"); }
+        Type::Bool => { return str_concat(ind, "Bool"); }
+        Type::Str => { return str_concat(ind, "Str"); }
+        Type::Void => { return str_concat(ind, "Void"); }
+        Type::Never => { return str_concat(ind, "Never"); }
+        Type::Infer => { return str_concat(ind, "Infer"); }
+        Type::Named(n) => {
+            return str_concat(str_concat(str_concat(ind, "Named \""), str_escape(n)), "\"");
+        }
+        Type::Array(elem, size) => {
+            var s: str = str_concat(str_concat(str_concat(ind, "Array "), int_to_str(size)), "\n");
+            s = str_concat(s, box_type_flat(elem, depth + 1));
+            return s;
+        }
+        Type::ArrayConst(elem, size_param) => {
+            var s: str = str_concat(str_concat(str_concat(str_concat(ind, "ArrayConst \""), str_escape(size_param)), "\""), "\n");
+            s = str_concat(s, box_type_flat(elem, depth + 1));
+            return s;
+        }
+        Type::Ref(inner, is_mut) => {
+            var s: str = str_concat(str_concat(str_concat(ind, "Ref "), bool_str(is_mut)), "\n");
+            s = str_concat(s, box_type_flat(inner, depth + 1));
+            return s;
+        }
+        Type::RawPtr(inner, is_mut) => {
+            var s: str = str_concat(str_concat(str_concat(ind, "RawPtr "), bool_str(is_mut)), "\n");
+            s = str_concat(s, box_type_flat(inner, depth + 1));
+            return s;
+        }
+        Type::Generic(name, args) => {
+            var s: str = str_concat(str_concat(str_concat(str_concat(ind, "Generic \""), str_escape(name)), "\""), "\n");
+            var i: i64 = 0;
+            while i < args.len() {
+                s = str_concat(s, box_type_flat(Box::new(args.get(i)), depth + 1));
+                s = str_concat(s, "\n");
+                i = i + 1;
+            }
+            if str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Type::Tuple(types) => {
+            var s: str = str_concat(ind, "Tuple\n");
+            var i: i64 = 0;
+            while i < types.len() {
+                s = str_concat(s, box_type_flat(Box::new(types.get(i)), depth + 1));
+                s = str_concat(s, "\n");
+                i = i + 1;
+            }
+            if str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Type::Func(params, ret) => {
+            var s: str = str_concat(ind, "Func\n");
+            var i: i64 = 0;
+            while i < params.len() {
+                s = str_concat(s, box_type_flat(Box::new(params.get(i)), depth + 1));
+                s = str_concat(s, "\n");
+                i = i + 1;
+            }
+            s = str_concat(s, box_type_flat(ret, depth + 1));
+            return s;
+        }
+        Type::Assoc(tn, an, tn2, args) => {
+            var s: str = ind + "Assoc \"" + str_escape(tn) + "\" \"" + str_escape(an) + "\" \"" + str_escape(tn2) + "\"\n";
+            var i: i64 = 0;
+            while i < args.len() {
+                s = str_concat(s, box_type_flat(Box::new(args.get(i)), depth + 1));
+                s = str_concat(s, "\n");
+                i = i + 1;
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Type::Dyn(name) => {
+            return str_concat(str_concat(str_concat(ind, "Dyn \""), str_escape(name)), "\"");
+        }
+        Type::ShapedTensor(elem, shape) => {
+            var s: str = str_concat(ind, "ShapedTensor\n");
+            s = str_concat(s, box_type_flat(elem, depth + 1));
+            s = str_concat(s, "\n");
+            var i: i64 = 0;
+            while i < shape.len() {
+                var d: ShapeDim = shape.get(i);
+                match d {
+                    ShapeDim::Known(n) => {
+                        s = str_concat(str_concat(str_concat(indent(depth + 1), "Known "), int_to_str(n)), "\n");
+                    }
+                    ShapeDim::Symbolic(n) => {
+                        s = str_concat(str_concat(str_concat(str_concat(indent(depth + 1), "Symbolic \""), str_escape(n)), "\""), "\n");
+                    }
+                }
+                i = i + 1;
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+    }
+    return str_concat(ind, "UnknownType");
+}
+
+fn type_flat(t: Type, depth: i64) -> str {
+    return box_type_flat(Box::new(t), depth);
+}
+
+// ─── Pattern flat ─────────────────────────────────────────────────────────
+
+fn box_pattern_flat(b: Box<Pattern>, depth: i64) -> str {
+    var ind: str = indent(depth);
+    match b {
+        Pattern::Wildcard => { return str_concat(ind, "Wildcard"); }
+        Pattern::IntLit(n) => {
+            return str_concat(str_concat(ind, "IntLit "), int_to_str(n));
+        }
+        Pattern::BoolLit(b2) => {
+            return str_concat(str_concat(ind, "BoolLit "), bool_str(b2));
+        }
+        Pattern::Ident(s) => {
+            return str_concat(str_concat(str_concat(ind, "Ident \""), str_escape(s)), "\"");
+        }
+        Pattern::StrLit(s) => {
+            return str_concat(str_concat(str_concat(ind, "StrLit \""), str_escape(s)), "\"");
+        }
+        Pattern::EnumVariant(en, variant, bindings) => {
+            var s: str = ind + "EnumVariant \"" + str_escape(en) + "\" \"" + str_escape(variant) + "\"\n";
+            var i: i64 = 0;
+            while i < bindings.len() {
+                var bind: Binding = bindings.get(i);
+                s = s + indent(depth + 1) + "Binding \"" + str_escape(bind.name) + "\" \"" + str_escape(bind.ty) + "\"\n";
+                i = i + 1;
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Pattern::Range(start, end) => {
+            var s: str = str_concat(ind, "Range\n");
+            s = str_concat(s, box_pattern_flat(start, depth + 1));
+            s = str_concat(s, "\n");
+            s = str_concat(s, box_pattern_flat(end, depth + 1));
+            return s;
+        }
+    }
+    return str_concat(ind, "UnknownPattern");
+}
+
+// ─── Expr flat ────────────────────────────────────────────────────────────
+
+fn box_expr_flat(b: Box<Expr>, depth: i64) -> str {
+    var ind: str = indent(depth);
+    match b {
+        Expr::IntLit(n) => {
+            return str_concat(str_concat(ind, "IntLit "), int_to_str(n));
+        }
+        Expr::FloatLit(f) => {
+            return str_concat(str_concat(ind, "FloatLit "), float_to_str(f));
+        }
+        Expr::StringLit(s) => {
+            return str_concat(str_concat(str_concat(ind, "StringLit \""), str_escape(s)), "\"");
+        }
+        Expr::BoolLit(b2) => {
+            return str_concat(str_concat(ind, "BoolLit "), bool_str(b2));
+        }
+        Expr::Ident(s) => {
+            return str_concat(str_concat(str_concat(ind, "Ident \""), str_escape(s)), "\"");
+        }
+        Expr::Binary(op, left, right) => {
+            var s: str = str_concat(str_concat(str_concat(ind, "Binary "), binop_flat(op)), "\n");
+            s = str_concat(s, box_expr_flat(left, depth + 1));
+            s = str_concat(s, "\n");
+            s = str_concat(s, box_expr_flat(right, depth + 1));
+            return s;
+        }
+        Expr::Unary(op, expr) => {
+            var s: str = str_concat(str_concat(str_concat(ind, "Unary "), unaryop_flat(op)), "\n");
+            s = str_concat(s, box_expr_flat(expr, depth + 1));
+            return s;
+        }
+        Expr::Call(callee, args) => {
+            var s: str = str_concat(str_concat(str_concat(ind, "Call \""), str_escape(callee)), "\"\n");
+            var i: i64 = 0;
+            while i < args.len() {
+                s = str_concat(s, box_expr_flat(Box::new(args.get(i)), depth + 1));
+                s = str_concat(s, "\n");
+                i = i + 1;
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::FieldAccess(expr, field) => {
+            var s: str = str_concat(str_concat(str_concat(ind, "FieldAccess \""), str_escape(field)), "\"\n");
+            s = str_concat(s, box_expr_flat(expr, depth + 1));
+            return s;
+        }
+        Expr::OptionalFieldAccess(expr, field) => {
+            var s: str = str_concat(str_concat(str_concat(ind, "OptionalFieldAccess \""), str_escape(field)), "\"\n");
+            s = str_concat(s, box_expr_flat(expr, depth + 1));
+            return s;
+        }
+        Expr::StructLit(name, fields, spread) => {
+            var s: str = str_concat(str_concat(str_concat(ind, "StructLit \""), str_escape(name)), "\"\n");
+            var i: i64 = 0;
+            while i < fields.len() {
+                var fi: FieldInit = fields.get(i);
+                s = s + indent(depth + 1) + "FieldInit \"" + str_escape(fi.name) + "\"\n";
+                s = str_concat(s, box_expr_flat(Box::new(fi.value), depth + 2));
+                s = str_concat(s, "\n");
+                i = i + 1;
+            }
+            match spread {
+                OptBoxExpr::Some(e) => {
+                    s = str_concat(s, str_concat(indent(depth + 1), "Spread\n"));
+                    s = str_concat(s, box_expr_flat(e, depth + 2));
+                    s = str_concat(s, "\n");
+                }
+                OptBoxExpr::None => {}
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::If(cond, then_block, else_block) => {
+            var s: str = str_concat(ind, "If\n");
+            s = str_concat(s, box_expr_flat(cond, depth + 1));
+            s = str_concat(s, "\n");
+            s = str_concat(s, str_concat(indent(depth + 1), "Then\n"));
+            var i: i64 = 0;
+            while i < then_block.len() {
+                s = str_concat(s, stmt_flat(then_block.get(i), depth + 2));
+                s = str_concat(s, "\n");
+                i = i + 1;
+            }
+            match else_block {
+                OptStmts::Some(stmts) => {
+                    s = str_concat(s, str_concat(indent(depth + 1), "Else\n"));
+                    var j: i64 = 0;
+                    while j < stmts.len() {
+                        s = str_concat(s, stmt_flat(stmts.get(j), depth + 2));
+                        s = str_concat(s, "\n");
+                        j = j + 1;
+                    }
+                }
+                OptStmts::None => {
+                    s = str_concat(s, str_concat(indent(depth + 1), "ElseNone\n"));
+                }
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::Range(start, end, inclusive) => {
+            var s: str = str_concat(str_concat(str_concat(ind, "Range "), bool_str(inclusive)), "\n");
+            s = str_concat(s, box_expr_flat(start, depth + 1));
+            s = str_concat(s, "\n");
+            s = str_concat(s, box_expr_flat(end, depth + 1));
+            return s;
+        }
+        Expr::Block(stmts) => {
+            var s: str = str_concat(ind, "Block\n");
+            var i: i64 = 0;
+            while i < stmts.len() {
+                s = str_concat(s, stmt_flat(stmts.get(i), depth + 1));
+                s = str_concat(s, "\n");
+                i = i + 1;
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::MethodCall(receiver, method, args) => {
+            var s: str = str_concat(str_concat(str_concat(ind, "MethodCall \""), str_escape(method)), "\"\n");
+            s = str_concat(s, box_expr_flat(receiver, depth + 1));
+            s = str_concat(s, "\n");
+            var i: i64 = 0;
+            while i < args.len() {
+                s = str_concat(s, box_expr_flat(Box::new(args.get(i)), depth + 1));
+                s = str_concat(s, "\n");
+                i = i + 1;
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::ArrayLit(elem_type, elements) => {
+            var s: str = str_concat(ind, "ArrayLit\n");
+            s = str_concat(s, box_type_flat(elem_type, depth + 1));
+            s = str_concat(s, "\n");
+            var i: i64 = 0;
+            while i < elements.len() {
+                s = str_concat(s, box_expr_flat(Box::new(elements.get(i)), depth + 1));
+                s = str_concat(s, "\n");
+                i = i + 1;
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::Index(array, index) => {
+            var s: str = str_concat(ind, "Index\n");
+            s = str_concat(s, box_expr_flat(array, depth + 1));
+            s = str_concat(s, "\n");
+            s = str_concat(s, box_expr_flat(index, depth + 1));
+            return s;
+        }
+        Expr::FString(parts) => {
+            var s: str = str_concat(ind, "FString\n");
+            var i: i64 = 0;
+            while i < parts.len() {
+                var p: FStringPart = parts.get(i);
+                match p {
+                    FStringPart::Literal(lit) => {
+                        s = s + indent(depth + 1) + "Literal \"" + str_escape(lit) + "\"\n";
+                    }
+                    FStringPart::Expr(e) => {
+                        s = str_concat(s, str_concat(indent(depth + 1), "ExprPart\n"));
+                        s = str_concat(s, box_expr_flat(Box::new(e), depth + 2));
+                        s = str_concat(s, "\n");
+                    }
+                }
+                i = i + 1;
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::Match(expr, arms) => {
+            var s: str = str_concat(ind, "Match\n");
+            s = str_concat(s, box_expr_flat(expr, depth + 1));
+            s = str_concat(s, "\n");
+            var i: i64 = 0;
+            while i < arms.len() {
+                var arm: MatchArm = arms.get(i);
+                s = str_concat(s, str_concat(indent(depth + 1), "MatchArm\n"));
+                s = str_concat(s, box_pattern_flat(Box::new(arm.pattern), depth + 2));
+                s = str_concat(s, "\n");
+                match arm.guard {
+                    OptBoxExpr::Some(g) => {
+                        s = str_concat(s, str_concat(indent(depth + 2), "Guard\n"));
+                        s = str_concat(s, box_expr_flat(g, depth + 3));
+                        s = str_concat(s, "\n");
+                    }
+                    OptBoxExpr::None => {
+                        s = str_concat(s, str_concat(indent(depth + 2), "GuardNone\n"));
+                    }
+                }
+                var j: i64 = 0;
+                while j < arm.body.len() {
+                    s = str_concat(s, stmt_flat(arm.body.get(j), depth + 2));
+                    s = str_concat(s, "\n");
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::EnumLit(en, variant, args) => {
+            var s: str = ind + "EnumLit \"" + str_escape(en) + "\" \"" + str_escape(variant) + "\"\n";
+            var i: i64 = 0;
+            while i < args.len() {
+                s = str_concat(s, box_expr_flat(Box::new(args.get(i)), depth + 1));
+                s = str_concat(s, "\n");
+                i = i + 1;
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::Ref(expr, is_mut) => {
+            var s: str = str_concat(str_concat(str_concat(ind, "Ref "), bool_str(is_mut)), "\n");
+            s = str_concat(s, box_expr_flat(expr, depth + 1));
+            return s;
+        }
+        Expr::Deref(expr) => {
+            var s: str = str_concat(ind, "Deref\n");
+            s = str_concat(s, box_expr_flat(expr, depth + 1));
+            return s;
+        }
+        Expr::StrConcat(left, right) => {
+            var s: str = str_concat(ind, "StrConcat\n");
+            s = str_concat(s, box_expr_flat(left, depth + 1));
+            s = str_concat(s, "\n");
+            s = str_concat(s, box_expr_flat(right, depth + 1));
+            return s;
+        }
+        Expr::Try(expr) => {
+            var s: str = str_concat(ind, "Try\n");
+            s = str_concat(s, box_expr_flat(expr, depth + 1));
+            return s;
+        }
+        Expr::Coalesce(expr, default) => {
+            var s: str = str_concat(ind, "Coalesce\n");
+            s = str_concat(s, box_expr_flat(expr, depth + 1));
+            s = str_concat(s, "\n");
+            s = str_concat(s, box_expr_flat(default, depth + 1));
+            return s;
+        }
+        Expr::IsCheck(expr, type_name) => {
+            var s: str = str_concat(str_concat(str_concat(ind, "IsCheck \""), str_escape(type_name)), "\"\n");
+            s = str_concat(s, box_expr_flat(expr, depth + 1));
+            return s;
+        }
+        Expr::TryBlock(body) => {
+            var s: str = str_concat(ind, "TryBlock\n");
+            var i: i64 = 0;
+            while i < body.len() {
+                s = str_concat(s, stmt_flat(body.get(i), depth + 1));
+                s = str_concat(s, "\n");
+                i = i + 1;
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::TupleLit(exprs) => {
+            var s: str = str_concat(ind, "TupleLit\n");
+            var i: i64 = 0;
+            while i < exprs.len() {
+                s = str_concat(s, box_expr_flat(Box::new(exprs.get(i)), depth + 1));
+                s = str_concat(s, "\n");
+                i = i + 1;
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::Closure(params, body, ret_ty) => {
+            var s: str = str_concat(ind, "Closure\n");
+            var i: i64 = 0;
+            while i < params.len() {
+                s = str_concat(s, param_flat(params.get(i), depth + 1));
+                s = str_concat(s, "\n");
+                i = i + 1;
+            }
+            match ret_ty {
+                OptType::Some(t) => {
+                    s = str_concat(s, str_concat(indent(depth + 1), "RetTy\n"));
+                    s = str_concat(s, type_flat(t, depth + 2));
+                    s = str_concat(s, "\n");
+                }
+                OptType::None => {
+                    s = str_concat(s, str_concat(indent(depth + 1), "RetTyNone\n"));
+                }
+            }
+            var j: i64 = 0;
+            while j < body.len() {
+                s = str_concat(s, stmt_flat(body.get(j), depth + 1));
+                s = str_concat(s, "\n");
+                j = j + 1;
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::Cast(expr, target_ty) => {
+            var s: str = str_concat(ind, "Cast\n");
+            s = str_concat(s, box_expr_flat(expr, depth + 1));
+            s = str_concat(s, "\n");
+            s = str_concat(s, type_flat(target_ty, depth + 1));
+            return s;
+        }
+        Expr::Asm(template, operands) => {
+            var s: str = str_concat(str_concat(str_concat(ind, "Asm \""), str_escape(template)), "\"\n");
+            var i: i64 = 0;
+            while i < operands.len() {
+                var op: AsmOperand = operands.get(i);
+                var dir: str = "";
+                match op.direction {
+                    AsmDir::In => { dir = "In"; }
+                    AsmDir::Out => { dir = "Out"; }
+                }
+                s = s + indent(depth + 1) + "AsmOperand " + dir + " \"" + str_escape(op.reg) + "\"\n";
+                s = str_concat(s, box_expr_flat(Box::new(op.expr), depth + 2));
+                s = str_concat(s, "\n");
+                i = i + 1;
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::Comptime(inner) => {
+            var s: str = str_concat(ind, "Comptime\n");
+            s = str_concat(s, box_expr_flat(inner, depth + 1));
+            return s;
+        }
+        Expr::ComptimeBlock(stmts) => {
+            var s: str = str_concat(ind, "ComptimeBlock\n");
+            var i: i64 = 0;
+            while i < stmts.len() {
+                s = str_concat(s, stmt_flat(stmts.get(i), depth + 1));
+                s = str_concat(s, "\n");
+                i = i + 1;
+            }
+            if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::ComptimeReflect(op, ty) => {
+            var op_str: str = "";
+            match op {
+                ReflectOp::TypeName => { op_str = "TypeName"; }
+                ReflectOp::IsStruct => { op_str = "IsStruct"; }
+                ReflectOp::IsEnum => { op_str = "IsEnum"; }
+                ReflectOp::FieldCount => { op_str = "FieldCount"; }
+                ReflectOp::FieldNames => { op_str = "FieldNames"; }
+                ReflectOp::FieldTypes => { op_str = "FieldTypes"; }
+                ReflectOp::EnumVariants => { op_str = "EnumVariants"; }
+            }
+            var s: str = str_concat(str_concat(str_concat(ind, "ComptimeReflect "), op_str), "\n");
+            s = str_concat(s, type_flat(ty, depth + 1));
+            return s;
+        }
+        Expr::PipeForward(left, right) => {
+            var s: str = str_concat(ind, "PipeForward\n");
+            s = str_concat(s, box_expr_flat(left, depth + 1));
+            s = str_concat(s, "\n");
+            s = str_concat(s, box_expr_flat(right, depth + 1));
+            return s;
+        }
+        Expr::QuantCast(expr, target_ty) => {
+            var s: str = str_concat(ind, "QuantCast\n");
+            s = str_concat(s, box_expr_flat(expr, depth + 1));
+            s = str_concat(s, "\n");
+            s = str_concat(s, type_flat(target_ty, depth + 1));
+            return s;
+        }
+        Expr::Await(expr) => {
+            var s: str = str_concat(ind, "Await\n");
+            s = str_concat(s, box_expr_flat(expr, depth + 1));
+            return s;
+        }
+        Expr::Spawn(expr) => {
+            var s: str = str_concat(ind, "Spawn\n");
+            s = str_concat(s, box_expr_flat(expr, depth + 1));
+            return s;
+        }
+    }
+    return str_concat(ind, "UnknownExpr");
+}
+
+// ─── Stmt flat ────────────────────────────────────────────────────────────
+
+fn stmt_flat(s: Stmt, depth: i64) -> str {
+    var ind: str = indent(depth);
+    match s {
+        Stmt::Let(name, ty, expr, is_mut, is_persist, line) => {
+            var out: str = ind + "Let \"" + str_escape(name) + "\" " + bool_str(is_mut) + " " + bool_str(is_persist) + " " + int_to_str(line) + "\n";
+            match ty {
+                OptType::Some(t) => { out = str_concat(out, type_flat(t, depth + 1)); }
+                OptType::None => { out = str_concat(out, str_concat(indent(depth + 1), "None")); }
+            }
+            out = str_concat(out, "\n");
+            out = str_concat(out, box_expr_flat(Box::new(expr), depth + 1));
+            return out;
+        }
+        Stmt::LetTuple(names, expr, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "LetTuple "), int_to_str(line)), "\n");
+            var i: i64 = 0;
+            while i < names.len() {
+                out = out + indent(depth + 1) + "\"" + str_escape(names.get(i)) + "\"\n";
+                i = i + 1;
+            }
+            out = str_concat(out, box_expr_flat(Box::new(expr), depth + 1));
+            return out;
+        }
+        Stmt::LetUninit(name, ty, line) => {
+            var out: str = ind + "LetUninit \"" + str_escape(name) + "\" " + int_to_str(line) + "\n";
+            out = str_concat(out, type_flat(ty, depth + 1));
+            return out;
+        }
+        Stmt::Assign(target, op, expr, line) => {
+            var out: str = ind + "Assign \"" + str_escape(target) + "\" " + assignop_flat(op) + " " + int_to_str(line) + "\n";
+            out = str_concat(out, box_expr_flat(Box::new(expr), depth + 1));
+            return out;
+        }
+        Stmt::IndexAssign(array, index, op, expr, line) => {
+            var out: str = ind + "IndexAssign \"" + str_escape(array) + "\" " + assignop_flat(op) + " " + int_to_str(line) + "\n";
+            out = str_concat(out, box_expr_flat(Box::new(index), depth + 1));
+            out = str_concat(out, "\n");
+            out = str_concat(out, box_expr_flat(Box::new(expr), depth + 1));
+            return out;
+        }
+        Stmt::DerefAssign(ptr_expr, op, expr, line) => {
+            var out: str = str_concat(str_concat(str_concat(str_concat(ind, "DerefAssign "), assignop_flat(op)), " "), int_to_str(line));
+            out = str_concat(out, "\n");
+            out = str_concat(out, box_expr_flat(Box::new(ptr_expr), depth + 1));
+            out = str_concat(out, "\n");
+            out = str_concat(out, box_expr_flat(Box::new(expr), depth + 1));
+            return out;
+        }
+        Stmt::FieldAssign(object, field, op, expr, line) => {
+            var out: str = ind + "FieldAssign \"" + str_escape(field) + "\" " + assignop_flat(op) + " " + int_to_str(line) + "\n";
+            out = str_concat(out, box_expr_flat(Box::new(object), depth + 1));
+            out = str_concat(out, "\n");
+            out = str_concat(out, box_expr_flat(Box::new(expr), depth + 1));
+            return out;
+        }
+        Stmt::Expr(expr, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "Expr "), int_to_str(line)), "\n");
+            out = str_concat(out, box_expr_flat(Box::new(expr), depth + 1));
+            return out;
+        }
+        Stmt::Return(expr, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "Return "), int_to_str(line)), "\n");
+            match expr {
+                OptBoxExpr::Some(e) => { out = str_concat(out, box_expr_flat(e, depth + 1)); }
+                OptBoxExpr::None => { out = str_concat(out, str_concat(indent(depth + 1), "None")); }
+            }
+            return out;
+        }
+        Stmt::If(cond, then_block, else_block, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "If "), int_to_str(line)), "\n");
+            out = str_concat(out, box_expr_flat(Box::new(cond), depth + 1));
+            out = str_concat(out, "\n");
+            out = str_concat(out, str_concat(indent(depth + 1), "Then\n"));
+            var i: i64 = 0;
+            while i < then_block.len() {
+                out = str_concat(out, stmt_flat(then_block.get(i), depth + 2));
+                out = str_concat(out, "\n");
+                i = i + 1;
+            }
+            match else_block {
+                OptStmts::Some(stmts) => {
+                    out = str_concat(out, str_concat(indent(depth + 1), "Else\n"));
+                    var j: i64 = 0;
+                    while j < stmts.len() {
+                        out = str_concat(out, stmt_flat(stmts.get(j), depth + 2));
+                        out = str_concat(out, "\n");
+                        j = j + 1;
+                    }
+                }
+                OptStmts::None => {
+                    out = str_concat(out, str_concat(indent(depth + 1), "ElseNone\n"));
+                }
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::While(cond, body, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "While "), int_to_str(line)), "\n");
+            out = str_concat(out, box_expr_flat(Box::new(cond), depth + 1));
+            out = str_concat(out, "\n");
+            var i: i64 = 0;
+            while i < body.len() {
+                out = str_concat(out, stmt_flat(body.get(i), depth + 1));
+                out = str_concat(out, "\n");
+                i = i + 1;
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::For(v, iterator, body, line) => {
+            var out: str = ind + "For \"" + str_escape(v) + "\" " + int_to_str(line) + "\n";
+            out = str_concat(out, box_expr_flat(Box::new(iterator), depth + 1));
+            out = str_concat(out, "\n");
+            var i: i64 = 0;
+            while i < body.len() {
+                out = str_concat(out, stmt_flat(body.get(i), depth + 1));
+                out = str_concat(out, "\n");
+                i = i + 1;
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Loop(body, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "Loop "), int_to_str(line)), "\n");
+            var i: i64 = 0;
+            while i < body.len() {
+                out = str_concat(out, stmt_flat(body.get(i), depth + 1));
+                out = str_concat(out, "\n");
+                i = i + 1;
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Break(expr, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "Break "), int_to_str(line)), "\n");
+            match expr {
+                OptBoxExpr::Some(e) => { out = str_concat(out, box_expr_flat(e, depth + 1)); }
+                OptBoxExpr::None => { out = str_concat(out, str_concat(indent(depth + 1), "None")); }
+            }
+            return out;
+        }
+        Stmt::Continue(line) => {
+            return str_concat(str_concat(str_concat(ind, "Continue "), int_to_str(line)), "");
+        }
+        Stmt::Defer(body, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "Defer "), int_to_str(line)), "\n");
+            var i: i64 = 0;
+            while i < body.len() {
+                out = str_concat(out, stmt_flat(body.get(i), depth + 1));
+                out = str_concat(out, "\n");
+                i = i + 1;
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Match(expr, arms, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "Match "), int_to_str(line)), "\n");
+            out = str_concat(out, box_expr_flat(Box::new(expr), depth + 1));
+            out = str_concat(out, "\n");
+            var i: i64 = 0;
+            while i < arms.len() {
+                var arm: MatchArm = arms.get(i);
+                out = str_concat(out, str_concat(indent(depth + 1), "MatchArm\n"));
+                out = str_concat(out, box_pattern_flat(Box::new(arm.pattern), depth + 2));
+                out = str_concat(out, "\n");
+                match arm.guard {
+                    OptBoxExpr::Some(g) => {
+                        out = str_concat(out, str_concat(indent(depth + 2), "Guard\n"));
+                        out = str_concat(out, box_expr_flat(g, depth + 3));
+                        out = str_concat(out, "\n");
+                    }
+                    OptBoxExpr::None => {
+                        out = str_concat(out, str_concat(indent(depth + 2), "GuardNone\n"));
+                    }
+                }
+                var j: i64 = 0;
+                while j < arm.body.len() {
+                    out = str_concat(out, stmt_flat(arm.body.get(j), depth + 2));
+                    out = str_concat(out, "\n");
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Use(path, items, line) => {
+            var out: str = ind + "Use \"" + str_escape(path) + "\" " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < items.len() {
+                out = out + indent(depth + 1) + "\"" + str_escape(items.get(i)) + "\"\n";
+                i = i + 1;
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Handle(body, handlers, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "Handle "), int_to_str(line)), "\n");
+            var i: i64 = 0;
+            while i < body.len() {
+                out = str_concat(out, stmt_flat(body.get(i), depth + 1));
+                out = str_concat(out, "\n");
+                i = i + 1;
+            }
+            var j: i64 = 0;
+            while j < handlers.len() {
+                var h: EffectHandler = handlers.get(j);
+                out = out + indent(depth + 1) + "EffectHandler \"" + str_escape(h.effect) + "\" \"" + str_escape(h.op) + "\"\n";
+                var k: i64 = 0;
+                while k < h.params.len() {
+                    out = out + indent(depth + 2) + "\"" + str_escape(h.params.get(k)) + "\"\n";
+                    k = k + 1;
+                }
+                var m: i64 = 0;
+                while m < h.body.len() {
+                    out = str_concat(out, stmt_flat(h.body.get(m), depth + 2));
+                    out = str_concat(out, "\n");
+                    m = m + 1;
+                }
+                j = j + 1;
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Do(effect, op, args, line) => {
+            var out: str = ind + "Do \"" + str_escape(effect) + "\" \"" + str_escape(op) + "\" " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < args.len() {
+                out = str_concat(out, box_expr_flat(Box::new(args.get(i)), depth + 1));
+                out = str_concat(out, "\n");
+                i = i + 1;
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::RegionBlock(name, budget, is_gpu, is_kv_cache, window_size, body, line) => {
+            var budget_s: str = "None";
+            match budget {
+                OptI64::Some(n) => { budget_s = int_to_str(n); }
+                OptI64::None => {}
+            }
+            var ws_s: str = "None";
+            match window_size {
+                OptI64::Some(n) => { ws_s = int_to_str(n); }
+                OptI64::None => {}
+            }
+            var out: str = ind + "RegionBlock \"" + str_escape(name) + "\" " + budget_s + " " + bool_str(is_gpu) + " " + bool_str(is_kv_cache) + " " + ws_s + " " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < body.len() {
+                out = str_concat(out, stmt_flat(body.get(i), depth + 1));
+                out = str_concat(out, "\n");
+                i = i + 1;
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Sandbox(body, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "Sandbox "), int_to_str(line)), "\n");
+            var i: i64 = 0;
+            while i < body.len() {
+                out = str_concat(out, stmt_flat(body.get(i), depth + 1));
+                out = str_concat(out, "\n");
+                i = i + 1;
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Unsafe(body, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "Unsafe "), int_to_str(line)), "\n");
+            var i: i64 = 0;
+            while i < body.len() {
+                out = str_concat(out, stmt_flat(body.get(i), depth + 1));
+                out = str_concat(out, "\n");
+                i = i + 1;
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Txn(body, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "Txn "), int_to_str(line)), "\n");
+            var i: i64 = 0;
+            while i < body.len() {
+                out = str_concat(out, stmt_flat(body.get(i), depth + 1));
+                out = str_concat(out, "\n");
+                i = i + 1;
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::ComptimeGen(block, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "ComptimeGen "), int_to_str(line)), "\n");
+            var i: i64 = 0;
+            while i < block.len() {
+                out = str_concat(out, stmt_flat(block.get(i), depth + 1));
+                out = str_concat(out, "\n");
+                i = i + 1;
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::GradBlock(v, body, line) => {
+            var out: str = ind + "GradBlock \"" + str_escape(v) + "\" " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < body.len() {
+                out = str_concat(out, stmt_flat(body.get(i), depth + 1));
+                out = str_concat(out, "\n");
+                i = i + 1;
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Backward(loss, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "Backward "), int_to_str(line)), "\n");
+            out = str_concat(out, box_expr_flat(Box::new(loss), depth + 1));
+            return out;
+        }
+        Stmt::Query(components, body, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "Query "), int_to_str(line)), "\n");
+            var i: i64 = 0;
+            while i < components.len() {
+                out = out + indent(depth + 1) + "\"" + str_escape(components.get(i)) + "\"\n";
+                i = i + 1;
+            }
+            var j: i64 = 0;
+            while j < body.len() {
+                out = str_concat(out, stmt_flat(body.get(j), depth + 1));
+                out = str_concat(out, "\n");
+                j = j + 1;
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Select(cases, default, line) => {
+            var out: str = str_concat(str_concat(str_concat(ind, "Select "), int_to_str(line)), "\n");
+            var i: i64 = 0;
+            while i < cases.len() {
+                var c: SelectCase = cases.get(i);
+                out = out + indent(depth + 1) + "SelectCase \"" + str_escape(c.var_name) + "\"\n";
+                out = str_concat(out, box_expr_flat(Box::new(c.channel), depth + 2));
+                out = str_concat(out, "\n");
+                var j: i64 = 0;
+                while j < c.body.len() {
+                    out = str_concat(out, stmt_flat(c.body.get(j), depth + 2));
+                    out = str_concat(out, "\n");
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+            match default {
+                OptStmts::Some(stmts) => {
+                    out = str_concat(out, str_concat(indent(depth + 1), "Default\n"));
+                    var k: i64 = 0;
+                    while k < stmts.len() {
+                        out = str_concat(out, stmt_flat(stmts.get(k), depth + 2));
+                        out = str_concat(out, "\n");
+                        k = k + 1;
+                    }
+                }
+                OptStmts::None => {
+                    out = str_concat(out, str_concat(indent(depth + 1), "DefaultNone\n"));
+                }
+            }
+            if str_len(out) > 0 && str_byte_at(out, str_len(out) - 1) == 10 {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+    }
+    return str_concat(ind, "UnknownStmt");
+}
+
+// ─── Param flat ───────────────────────────────────────────────────────────
+
+fn param_flat(p: Param, depth: i64) -> str {
+    var ind: str = indent(depth);
+    var s: str = ind + "Param \"" + str_escape(p.name) + "\" " + bool_str(p.is_pub) + " " + int_to_str(p.annotations.len()) + "\n";
+    s = str_concat(s, type_flat(p.ty, depth + 1));
+    return s;
+}
+
+// ─── Func flat ────────────────────────────────────────────────────────────
+
+fn func_flat(f: Func, depth: i64) -> str {
+    var ind: str = indent(depth);
+    var s: str = ind + "Func \"" + str_escape(f.name) + "\" " + bool_str(f.is_pub) + " " + bool_str(f.is_comptime) + " " + bool_str(f.is_async) + " " + bool_str(f.is_interrupt) + " " + bool_str(f.has_effect_annotation) + "\n";
+    s = s + indent(depth + 1) + "TypeParams " + int_to_str(f.type_params.len()) + "\n";
+    var i: i64 = 0;
+    while i < f.type_params.len() {
+        s = s + indent(depth + 2) + "\"" + str_escape(f.type_params.get(i)) + "\"\n";
+        i = i + 1;
+    }
+    i = 0;
+    while i < f.params.len() {
+        s = str_concat(s, param_flat(f.params.get(i), depth + 1));
+        s = str_concat(s, "\n");
+        i = i + 1;
+    }
+    s = str_concat(s, type_flat(f.ret_ty, depth + 1));
+    s = str_concat(s, "\n");
+    i = 0;
+    while i < f.body.len() {
+        s = str_concat(s, stmt_flat(f.body.get(i), depth + 1));
+        s = str_concat(s, "\n");
+        i = i + 1;
+    }
+    if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+        s = str_slice(s, 0, str_len(s) - 1);
+    }
+    return s;
+}
+
+// ─── Program flat ─────────────────────────────────────────────────────────
+
+fn program_flat(p: Program) -> str {
+    var s: str = "Program\n";
+    match p.module {
+        OptStr::Some(m) => { s = s + "  Module \"" + str_escape(m) + "\"\n"; }
+        OptStr::None => { s = str_concat(s, "  ModuleNone\n"); }
+    }
+    var i: i64 = 0;
+    while i < p.funcs.len() {
+        s = str_concat(s, func_flat(p.funcs.get(i), 1));
+        s = str_concat(s, "\n");
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.structs.len() {
+        var st: StructDef = p.structs.get(i);
+        s = s + "  Struct \"" + str_escape(st.name) + "\" " + bool_str(st.is_pub) + " " + int_to_str(st.fields.len()) + "\n";
+        var j: i64 = 0;
+        while j < st.fields.len() {
+            s = str_concat(s, param_flat(st.fields.get(j), 2));
+            s = str_concat(s, "\n");
+            j = j + 1;
+        }
+        if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+            s = str_slice(s, 0, str_len(s) - 1);
+        }
+        s = str_concat(s, "\n");
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.enums.len() {
+        var e: EnumDef = p.enums.get(i);
+        s = s + "  Enum \"" + str_escape(e.name) + "\" " + bool_str(e.is_pub) + " " + int_to_str(e.variants.len()) + "\n";
+        var j: i64 = 0;
+        while j < e.variants.len() {
+            var v: EnumVariant = e.variants.get(j);
+            match v.data {
+                OptParams::Some(params) => {
+                    s = s + "    Variant \"" + str_escape(v.name) + "\" " + int_to_str(params.len()) + "\n";
+                    var k: i64 = 0;
+                    while k < params.len() {
+                        s = str_concat(s, param_flat(params.get(k), 3));
+                        s = str_concat(s, "\n");
+                        k = k + 1;
+                    }
+                    if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+                        s = str_slice(s, 0, str_len(s) - 1);
+                    }
+                }
+                OptParams::None => {
+                    s = s + "    Variant \"" + str_escape(v.name) + "\"\n";
+                }
+            }
+            j = j + 1;
+        }
+        s = str_concat(s, "\n");
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.consts.len() {
+        var c: ConstDef = p.consts.get(i);
+        s = s + "  Const \"" + str_escape(c.name) + "\" " + bool_str(c.is_pub) + "\n";
+        s = str_concat(s, type_flat(c.ty, 2));
+        s = str_concat(s, "\n");
+        s = str_concat(s, box_expr_flat(Box::new(c.expr), 2));
+        s = str_concat(s, "\n");
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.type_aliases.len() {
+        var ta: TypeAlias = p.type_aliases.get(i);
+        s = s + "  TypeAlias \"" + str_escape(ta.name) + "\" " + bool_str(ta.is_pub) + "\n";
+        s = str_concat(s, type_flat(ta.alias_for, 2));
+        s = str_concat(s, "\n");
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.impls.len() {
+        var im: ImplDef = p.impls.get(i);
+        s = s + "  Impl \"" + str_escape(im.struct_name) + "\" " + int_to_str(im.methods.len()) + "\n";
+        var j: i64 = 0;
+        while j < im.methods.len() {
+            s = str_concat(s, func_flat(im.methods.get(j), 2));
+            s = str_concat(s, "\n");
+            j = j + 1;
+        }
+        if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+            s = str_slice(s, 0, str_len(s) - 1);
+        }
+        s = str_concat(s, "\n");
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.imports.len() {
+        var im: ImportDef = p.imports.get(i);
+        var has_ver: str = "false";
+        match im.version {
+            OptStr::Some(_) => { has_ver = "true"; }
+            OptStr::None => {}
+        }
+        s = s + "  Import \"" + str_escape(im.path) + "\" " + bool_str(im.is_pub) + " " + bool_str(im.is_glob) + " " + int_to_str(im.items.len()) + " " + int_to_str(im.capabilities.len()) + " " + has_ver + "\n";
+        var j: i64 = 0;
+        while j < im.items.len() {
+            s = s + "    \"" + str_escape(im.items.get(j)) + "\"\n";
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.attributes.len() {
+        var a: Attribute = p.attributes.get(i);
+        s = s + "  Attribute \"" + str_escape(a.name) + "\"\n";
+        var j: i64 = 0;
+        while j < a.args.len() {
+            s = s + "    \"" + str_escape(a.args.get(j)) + "\"\n";
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.traits.len() {
+        var t: TraitDef = p.traits.get(i);
+        s = s + "  Trait \"" + str_escape(t.name) + "\" " + bool_str(t.is_pub) + "\n";
+        var j: i64 = 0;
+        while j < t.methods.len() {
+            var m: TraitMethod = t.methods.get(j);
+            s = s + "    TraitMethod \"" + str_escape(m.name) + "\" " + bool_str(m.has_self) + " " + bool_str(m.is_pub) + "\n";
+            var k: i64 = 0;
+            while k < m.params.len() {
+                s = str_concat(s, param_flat(m.params.get(k), 3));
+                s = str_concat(s, "\n");
+                k = k + 1;
+            }
+            s = str_concat(s, type_flat(m.ret_ty, 3));
+            s = str_concat(s, "\n");
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.trait_impls.len() {
+        var ti: TraitImpl = p.trait_impls.get(i);
+        s = s + "  TraitImpl \"" + str_escape(ti.trait_name) + "\" \"" + str_escape(ti.type_name) + "\" " + int_to_str(ti.methods.len()) + "\n";
+        var j: i64 = 0;
+        while j < ti.methods.len() {
+            s = str_concat(s, func_flat(ti.methods.get(j), 2));
+            s = str_concat(s, "\n");
+            j = j + 1;
+        }
+        if str_len(s) > 0 && str_byte_at(s, str_len(s) - 1) == 10 {
+            s = str_slice(s, 0, str_len(s) - 1);
+        }
+        s = str_concat(s, "\n");
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.extern_decls.len() {
+        var ed: ExternDecl = p.extern_decls.get(i);
+        s = s + "  Extern \"" + str_escape(ed.abi) + "\" \"" + str_escape(ed.c_name) + "\" \"" + str_escape(ed.pledge_name) + "\"\n";
+        var j: i64 = 0;
+        while j < ed.params.len() {
+            s = str_concat(s, param_flat(ed.params.get(j), 2));
+            s = str_concat(s, "\n");
+            j = j + 1;
+        }
+        s = str_concat(s, type_flat(ed.ret_ty, 2));
+        s = str_concat(s, "\n");
+        i = i + 1;
+    }
+    s = s + "  Layers " + int_to_str(p.layers.len()) + "\n";
+    s = s + "  Models " + int_to_str(p.models.len()) + "\n";
+    s = s + "  Components " + int_to_str(p.components.len()) + "\n";
+    s = s + "  Systems " + int_to_str(p.systems.len()) + "\n";
+    s = s + "  StateMachines " + int_to_str(p.state_machines.len()) + "\n";
+    s = s + "  EventHandlers " + int_to_str(p.event_handlers.len());
+    return s;
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────
+
+fn main() -> i64 {
+    var argc: i64 = p_argc();
+    var path: str = "";
+    var i: i64 = 0;
+    var found_sep: bool = false;
+    while i < argc {
+        var a: str = p_argv(i);
+        if a == "--" {
+            found_sep = true;
+            if i + 1 < argc {
+                path = p_argv(i + 1);
+            }
+            break;
+        }
+        i = i + 1;
+    }
+    if !found_sep && str_len(path) == 0 && argc >= 2 {
+        path = p_argv(1);
+    }
+    if str_len(path) == 0 {
+        print("usage: fidesc run test_parser_harness.fd -- <file.fd>\n");
+        print("   or: ./test_parser_harness <file.fd>\n");
+        return 1;
+    }
+    var source: str = p_file_read(path);
+    if str_len(source) == 0 {
+        print("error: could not read file or empty file: ");
+        print(path);
+        print("\n");
+        return 1;
+    }
+
+    // Tokenize
+    var lex: Lexer = Lexer::new(source);
+    var tokens: Vec<Token> = lex.tokenize();
+
+    // Print lexer errors if any
+    i = 0;
+    while i < lex.errors.len() {
+        print(lex.errors.get(i));
+        print("\n");
+        i = i + 1;
+    }
+
+    // Parse
+    var parser: Parser = Parser::new(tokens);
+    match parser.parse() {
+        ParseResultProgram::Ok(program) => {
+            print(program_flat(program));
+            print("\n");
+        }
+        ParseResultProgram::Err(e) => {
+            print("Parse error: ");
+            print(e);
+            print("\n");
+            return 1;
+        }
+    }
+    return 0;
+}

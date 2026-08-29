@@ -1302,6 +1302,20 @@ fn sroa_alloca(
         }
     }
 
+    // Check for chained GetFieldPtr — if any GFP result is used by another GFP,
+    // SROA can't safely eliminate the alloca because removing the inner GFP
+    // would leave the outer GFP with a dangling reference. This happens when
+    // a struct field is itself a struct (e.g., enum field in a struct).
+    let gfp_ids: std::collections::HashSet<PValue> = gfp_pairs.iter().map(|(id, _, _)| *id).collect();
+    for (_, inst) in &f.values {
+        if let L2Inst::GetFieldPtr { struct_ptr, .. } = inst {
+            if gfp_ids.contains(struct_ptr) {
+                // Chained GFP detected — skip SROA for this alloca.
+                return 0;
+            }
+        }
+    }
+
     // For each GetFieldPtr, find the Load or Store that uses its result.
     // We need to process these in block order to track field values correctly.
     // Collect (block_id, instruction_order, gfp_id, field_index, field_ty, usage)

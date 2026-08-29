@@ -1366,6 +1366,18 @@ fn lower_l2_inst_to_l3(
         }
     };
 
+    // Helper to materialize an operand for a VALUE (not a pointer).
+    // For alloca results, this uses the vreg (which holds the slot address)
+    // instead of the slot itself. Without this, storing an alloca result
+    // (e.g. a struct sret pointer) to another variable would store the
+    // slot's CONTENTS instead of the slot's ADDRESS.
+    let materialize_value = |pv: PValue,
+              next: &mut u32,
+              vreg_of: &mut HashMap<PValue, VReg>,
+              operand: &mut dyn FnMut(PValue, &mut u32, &mut HashMap<PValue, VReg>) -> Operand| {
+        operand(pv, next, vreg_of)
+    };
+
     match inst {
         L2Inst::ConstInt { value, ty } => L3Inst::Mov {
             dst,
@@ -1423,7 +1435,7 @@ fn lower_l2_inst_to_l3(
         },
         L2Inst::Store { ptr, value, store_ty } => L3Inst::Store {
             ptr: materialize(*ptr, next, vreg_of, operand),
-            val: materialize(*value, next, vreg_of, operand),
+            val: materialize_value(*value, next, vreg_of, operand),
             ty: store_ty.clone().unwrap_or(PirType::I64),
         },
         L2Inst::GetFieldPtr { struct_ptr, field_index, field_ty } => {

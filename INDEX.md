@@ -69,7 +69,7 @@ and `AGENTS.md` first when working on the compiler.
 ### Other
 | File | Description |
 |------|-------------|
-| [fides-logo.svg](fides-logo.svg) | Project logo (SVG). |
+| [fid-logo.svg](fid-logo.svg) | Project logo (SVG). |
 
 ---
 

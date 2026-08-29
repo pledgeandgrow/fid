@@ -560,6 +560,48 @@ fn main() {
                 }
             }
         }
+        "dump-ast-raw" => {
+            if args.len() < 3 {
+                eprintln!("Usage: fidesc dump-ast-raw <file.fd>");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+            match compiler::parse_to_ast_raw(&source) {
+                Ok(ast) => println!("{}", ast),
+                Err(e) => {
+                    eprintln!("{}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        "dump-ast-flat" => {
+            if args.len() < 3 {
+                eprintln!("Usage: fidesc dump-ast-flat <file.fd>");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+            match compiler::parse_to_ast_flat_raw(&source) {
+                Ok(ast) => println!("{}", ast),
+                Err(e) => {
+                    eprintln!("{}", e);
+                    process::exit(1);
+                }
+            }
+        }
         "dump-ir" => {
             if args.len() < 3 {
                 eprintln!("Usage: fidesc dump-ir <file.fd>");
@@ -962,6 +1004,7 @@ fn main() {
                             .arg("-fstack-protector-strong")  // stack canaries
                             .arg("-fPIE")                     // position-independent code
                             .arg("-fno-strict-overflow")      // don't assume no overflow
+                            .arg("-fno-strict-aliasing")      // generated code type-puns via pointer casts
                             .arg("-o").arg(&output).arg(&c_path);
                         // Linker security flags
                         cmd.arg("-pie")                     // position-independent executable
@@ -2200,7 +2243,7 @@ fn main() {
                             process::exit(1);
                         }
                         let cc_status = std::process::Command::new("gcc")
-                            .args(["-O2", "-w", "-o", tmp_bin, c_file, "-lm", "-lpthread"])
+                            .args(["-O2", "-fno-strict-aliasing", "-w", "-o", tmp_bin, c_file, "-lm", "-lpthread"])
                             .stdout(std::process::Stdio::null())
                             .stderr(std::process::Stdio::null())
                             .status();

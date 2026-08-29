@@ -358,13 +358,40 @@ impl Lowerer {
 
         // Compute enum layouts first (structs may contain enum fields and need
         // to know enum sizes for correct field offsets).
-        for e in &program.enums {
-            self.compute_enum_layout(e);
+        // Enum variants may contain other enum types, so we iterate to a
+        // fixpoint: keep recomputing until no layout size changes. This handles
+        // dependency cycles and ordering issues (e.g. ParseResultExpr contains
+        // Expr, but Expr may be processed after ParseResultExpr in iteration order).
+        let mut changed = true;
+        let mut iterations = 0;
+        while changed && iterations < 10 {
+            changed = false;
+            for e in &program.enums {
+                let old_size = self.module.get_struct(&e.name).map(|l| l.size).unwrap_or(0);
+                self.compute_enum_layout(e);
+                let new_size = self.module.get_struct(&e.name).map(|l| l.size).unwrap_or(0);
+                if new_size != old_size {
+                    changed = true;
+                }
+            }
+            iterations += 1;
         }
 
         // Compute struct layouts (after enums so enum field sizes are known)
-        for s in &program.structs {
-            self.compute_struct_layout(s);
+        // Also iterate to fixpoint for structs that contain other structs.
+        changed = true;
+        iterations = 0;
+        while changed && iterations < 10 {
+            changed = false;
+            for s in &program.structs {
+                let old_size = self.module.get_struct(&s.name).map(|l| l.size).unwrap_or(0);
+                self.compute_struct_layout(s);
+                let new_size = self.module.get_struct(&s.name).map(|l| l.size).unwrap_or(0);
+                if new_size != old_size {
+                    changed = true;
+                }
+            }
+            iterations += 1;
         }
 
         // Register runtime/external functions
@@ -473,22 +500,43 @@ impl Lowerer {
     /// Enums are laid out as: tag (i64) at offset 0, then data fields at 8-byte intervals.
     /// Size = (1 + max_variant_arity) * 8, aligned to 8.
     fn compute_enum_layout(&mut self, def: &EnumDef) {
-        let mut max_fields = 0usize;
+        // Compute the max payload size across all variants.
+        // Each field in a variant gets at least 8 bytes, but enum-typed
+        // fields need (1 + max_payload_of_that_enum) * 8 bytes, because
+        // nested enums are stored inline as (tag, data0, data1, ...).
+        let mut max_payload_size: u64 = 0;
         for variant in &def.variants {
             if let Some(data) = &variant.data {
-                max_fields = max_fields.max(data.len());
+                let mut variant_size: u64 = 0;
+                for field_ty in data {
+                    let ir_ty = self.lower_type(&field_ty.ty);
+                    let field_size = if let IrType::Struct(ref name) = ir_ty {
+                        if let Some(layout) = self.module.get_struct(name) {
+                            layout.size
+                        } else {
+                            8
+                        }
+                    } else {
+                        8
+                    };
+                    variant_size += field_size;
+                }
+                max_payload_size = max_payload_size.max(variant_size);
             }
         }
+
+        // Round up to a multiple of 8 and count how many 8-byte slots we need.
+        let payload_slots = ((max_payload_size + 7) / 8) as usize;
 
         let mut fields = Vec::new();
         // Field 0: tag
         fields.push(("__tag".to_string(), IrType::I64, 0u32));
         // Fields 1..max: data slots (all 8 bytes, enough for i64/f64/ptr)
-        for i in 0..max_fields {
+        for i in 0..payload_slots {
             fields.push((format!("__data{}", i), IrType::I64, ((i + 1) * 8) as u32));
         }
 
-        let size = ((1 + max_fields) * 8) as u64;
+        let size = ((1 + payload_slots) * 8) as u64;
         let layout = StructLayout {
             name: def.name.clone(),
             fields,
@@ -4356,16 +4404,54 @@ impl Lowerer {
                 });
                 self.emit_inst(Inst::Store { ptr: tag_ptr, value: tag_val, store_ty: None });
 
-                // Store data fields starting at field 1
-                for (i, arg_expr) in args.iter().enumerate() {
+                // Store data fields starting at field 1.
+                // Enum-typed fields occupy multiple 8-byte slots, so we need
+                // to compute the correct field index based on the accumulated
+                // size of previous fields.
+                let mut field_idx: u32 = 1;
+                for arg_expr in args.iter() {
                     let arg_val = self.lower_expr(arg_expr);
                     let arg_ty = self.get_value_type(arg_val);
-                    let field_ptr = self.emit_inst(Inst::GetFieldPtr {
-                        struct_ptr: ptr,
-                        field_index: (i + 1) as u32,
-                        field_ty: arg_ty.clone(),
-                    });
-                    self.emit_inst(Inst::Store { ptr: field_ptr, value: arg_val, store_ty: None });
+                    // Determine how many 8-byte slots this field occupies.
+                    let field_slots = if let IrType::Struct(ref name) = arg_ty {
+                        if let Some(layout) = self.module.get_struct(name) {
+                            ((layout.size + 7) / 8) as u32
+                        } else {
+                            1
+                        }
+                    } else {
+                        1
+                    };
+                    // Store the value at the current field index.
+                    // If it's an enum (multi-slot), we store the whole thing
+                    // by copying from the value's alloca, field by field.
+                    if field_slots == 1 {
+                        let field_ptr = self.emit_inst(Inst::GetFieldPtr {
+                            struct_ptr: ptr,
+                            field_index: field_idx,
+                            field_ty: arg_ty.clone(),
+                        });
+                        self.emit_inst(Inst::Store { ptr: field_ptr, value: arg_val, store_ty: None });
+                    } else {
+                        // Enum-typed field: copy each sub-slot.
+                        // arg_val is a pointer to the enum (alloca or temporary).
+                        // We copy tag + payload slots into the variant's slots.
+                        for sub_i in 0..field_slots {
+                            let src_ptr = self.emit_inst(Inst::GetFieldPtr {
+                                struct_ptr: arg_val,
+                                field_index: sub_i,
+                                field_ty: IrType::I64,
+                            });
+                            let slot_val = self.emit_inst(Inst::Load { ptr: src_ptr, ty: IrType::I64 });
+                            let dst_ptr = self.emit_inst(Inst::GetFieldPtr {
+                                struct_ptr: ptr,
+                                field_index: field_idx + sub_i,
+                                field_ty: IrType::I64,
+                            });
+                            self.emit_inst(Inst::Store { ptr: dst_ptr, value: slot_val, store_ty: None });
+                        }
+                    }
+                    field_idx += field_slots;
                 }
 
                 ptr

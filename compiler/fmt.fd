@@ -1,0 +1,1109 @@
+// fmt.fd — Fides code formatter (SH-6.4 rewrite of fmt.rs)
+//
+// A token-based pretty-printer (like early gofmt). It reads Fides source,
+// tokenizes it (preserving comments, which the main lexer drops), and
+// re-prints with consistent formatting:
+//   - 4 spaces indentation
+//   - Normalized spacing around binary operators
+//   - Space after commas
+//   - No trailing whitespace
+//   - Single blank line between top-level definitions
+//   - Opening brace on same line; closing brace on its own line
+//   - Comments aligned with their code
+
+module compiler::fmt;
+
+use core;
+use vec;
+use string;
+
+// ─── Formatter Token ──────────────────────────────────────────────────
+
+/// A formatter token. Unlike the compiler's Token, this preserves comments
+/// and string/number/identifier *text* so we can reprint faithfully.
+pub enum FTok {
+    Word(str),         // keywords and identifiers (literal text)
+    Number(str),       // integer / float literal text
+    Str(str),          // string literal including surrounding quotes
+    FStr(str),         // f-string literal including leading 'f'
+    LineComment(str),  // line comment including leading //
+    BlockComment(str), // block comment including delimiters
+    Punct(str),        // punctuation / operators
+    BlankLines(i64),   // blank-line separator count
+    Eof,               // end of file sentinel
+}
+
+// ─── Character classification helpers ─────────────────────────────────
+
+fn is_alpha_or_underscore(b: i64) -> bool {
+    return char_is_alpha(b) || b == 95;
+}
+
+fn is_alnum_or_underscore(b: i64) -> bool {
+    return char_is_alpha(b) || char_is_digit(b) || b == 95;
+}
+
+// ─── Multi-char punctuation table ─────────────────────────────────────
+
+/// Check if a multi-char punct starting at position `pos` in `src` matches.
+/// Returns the length of the match (0 = no match).
+fn try_multi_punct(src: str, pos: i64, len: i64) -> i64 {
+    // Try longest first: 3-char operators
+    if pos + 3 <= len {
+        var s3: str = str_slice(src, pos, pos + 3);
+        if str_equal(s3, "..=") { return 3; }
+        if str_equal(s3, "<<=") { return 3; }
+        if str_equal(s3, ">>=") { return 3; }
+    }
+    // 2-char operators
+    if pos + 2 <= len {
+        var s2: str = str_slice(src, pos, pos + 2);
+        if str_equal(s2, "|>") { return 2; }
+        if str_equal(s2, "??") { return 2; }
+        if str_equal(s2, "?.") { return 2; }
+        if str_equal(s2, "~>") { return 2; }
+        if str_equal(s2, "::") { return 2; }
+        if str_equal(s2, "->") { return 2; }
+        if str_equal(s2, "=>") { return 2; }
+        if str_equal(s2, "==") { return 2; }
+        if str_equal(s2, "!=") { return 2; }
+        if str_equal(s2, "<=") { return 2; }
+        if str_equal(s2, ">=") { return 2; }
+        if str_equal(s2, "&&") { return 2; }
+        if str_equal(s2, "||") { return 2; }
+        if str_equal(s2, "<<") { return 2; }
+        if str_equal(s2, ">>") { return 2; }
+        if str_equal(s2, "+=") { return 2; }
+        if str_equal(s2, "-=") { return 2; }
+        if str_equal(s2, "*=") { return 2; }
+        if str_equal(s2, "/=") { return 2; }
+        if str_equal(s2, "%=") { return 2; }
+        if str_equal(s2, "&=") { return 2; }
+        if str_equal(s2, "|=") { return 2; }
+        if str_equal(s2, "^=") { return 2; }
+    }
+    return 0;
+}
+
+/// Check if a byte is a single-char punctuation.
+fn is_single_punct(b: i64) -> bool {
+    // + - * / % = < > ! & | ^ ~ . , : ; ? @ # ( ) [ ] { }
+    if b == 43 { return true; }  // +
+    if b == 45 { return true; }  // -
+    if b == 42 { return true; }  // *
+    if b == 47 { return true; }  // /
+    if b == 37 { return true; }  // %
+    if b == 61 { return true; }  // =
+    if b == 60 { return true; }  // <
+    if b == 62 { return true; }  // >
+    if b == 33 { return true; }  // !
+    if b == 38 { return true; }  // &
+    if b == 124 { return true; } // |
+    if b == 94 { return true; }  // ^
+    if b == 126 { return true; } // ~
+    if b == 46 { return true; }  // .
+    if b == 44 { return true; }  // ,
+    if b == 58 { return true; }  // :
+    if b == 59 { return true; }  // ;
+    if b == 63 { return true; }  // ?
+    if b == 64 { return true; }  // @
+    if b == 35 { return true; }  // #
+    if b == 40 { return true; }  // (
+    if b == 41 { return true; }  // )
+    if b == 91 { return true; }  // [
+    if b == 93 { return true; }  // ]
+    if b == 123 { return true; } // {
+    if b == 125 { return true; } // }
+    return false;
+}
+
+// ─── Tokenizer ────────────────────────────────────────────────────────
+
+/// Tokenize Fides source into formatter tokens (preserving comments & strings).
+pub fn fmt_tokenize(src: str) -> Vec<FTok> {
+    var tokens: Vec<FTok> = Vec::new();
+    var len: i64 = str_len(src);
+    var i: i64 = 0;
+    var blank_count: i64 = 0;
+    var saw_newline: bool = false;
+
+    while i < len {
+        var c: i64 = str_byte_at(src, i);
+
+        // Whitespace — track newlines for blank-line preservation
+        if char_is_whitespace(c) {
+            if c == 10 {
+                if saw_newline {
+                    blank_count = blank_count + 1;
+                }
+                saw_newline = true;
+            }
+            i = i + 1;
+            continue;
+        }
+
+        // If we accumulated blank lines before this token, emit a marker
+        if blank_count > 0 {
+            tokens.push(FTok::BlankLines(blank_count));
+            blank_count = 0;
+        }
+        saw_newline = false;
+
+        // Line comment: //
+        if c == 47 && i + 1 < len && str_byte_at(src, i + 1) == 47 {
+            var start: i64 = i;
+            i = i + 2;
+            while i < len && str_byte_at(src, i) != 10 {
+                i = i + 1;
+            }
+            var text: str = str_slice(src, start, i);
+            text = str_trim_end(text);
+            tokens.push(FTok::LineComment(text));
+            continue;
+        }
+
+        // Block comment: /* ... */
+        if c == 47 && i + 1 < len && str_byte_at(src, i + 1) == 42 {
+            var start: i64 = i;
+            i = i + 2;
+            while i + 1 < len {
+                if str_byte_at(src, i) == 42 && str_byte_at(src, i + 1) == 47 {
+                    break;
+                }
+                i = i + 1;
+            }
+            if i + 1 < len {
+                i = i + 2;
+            } else {
+                i = len;
+            }
+            var text: str = str_slice(src, start, i);
+            text = str_trim_end(text);
+            tokens.push(FTok::BlockComment(text));
+            continue;
+        }
+
+        // f-string: f"..."
+        if c == 102 && i + 1 < len && str_byte_at(src, i + 1) == 34 {
+            var start: i64 = i;
+            i = i + 2;
+            while i < len && str_byte_at(src, i) != 34 {
+                if str_byte_at(src, i) == 92 && i + 1 < len {
+                    i = i + 2;
+                } else {
+                    i = i + 1;
+                }
+            }
+            if i < len {
+                i = i + 1;
+            }
+            var text: str = str_slice(src, start, i);
+            tokens.push(FTok::FStr(text));
+            continue;
+        }
+
+        // String literal: "..."
+        if c == 34 {
+            var start: i64 = i;
+            i = i + 1;
+            while i < len && str_byte_at(src, i) != 34 {
+                if str_byte_at(src, i) == 92 && i + 1 < len {
+                    i = i + 2;
+                } else {
+                    i = i + 1;
+                }
+            }
+            if i < len {
+                i = i + 1;
+            }
+            var text: str = str_slice(src, start, i);
+            tokens.push(FTok::Str(text));
+            continue;
+        }
+
+        // Number literal (int / float / hex / bin / oct with underscores)
+        if char_is_digit(c) {
+            var start: i64 = i;
+            // Optional hex/bin/oct prefix
+            if c == 48 && i + 1 < len {
+                var next: i64 = str_byte_at(src, i + 1);
+                if next == 120 || next == 88 || next == 98 || next == 66 || next == 111 || next == 79 {
+                    i = i + 2;
+                    while i < len {
+                        var ch: i64 = str_byte_at(src, i);
+                        if char_is_alpha(ch) || char_is_digit(ch) || ch == 95 {
+                            i = i + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    while i < len {
+                        var ch: i64 = str_byte_at(src, i);
+                        if char_is_digit(ch) || ch == 95 {
+                            i = i + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    // fractional part
+                    if i < len && str_byte_at(src, i) == 46 && i + 1 < len && char_is_digit(str_byte_at(src, i + 1)) {
+                        i = i + 1;
+                        while i < len {
+                            var ch: i64 = str_byte_at(src, i);
+                            if char_is_digit(ch) || ch == 95 {
+                                i = i + 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                while i < len {
+                    var ch: i64 = str_byte_at(src, i);
+                    if char_is_digit(ch) || ch == 95 {
+                        i = i + 1;
+                    } else {
+                        break;
+                    }
+                }
+                // fractional part
+                if i < len && str_byte_at(src, i) == 46 && i + 1 < len && char_is_digit(str_byte_at(src, i + 1)) {
+                    i = i + 1;
+                    while i < len {
+                        var ch: i64 = str_byte_at(src, i);
+                        if char_is_digit(ch) || ch == 95 {
+                            i = i + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            var text: str = str_slice(src, start, i);
+            tokens.push(FTok::Number(text));
+            continue;
+        }
+
+        // Identifier / keyword
+        if is_alpha_or_underscore(c) {
+            var start: i64 = i;
+            while i < len {
+                var ch: i64 = str_byte_at(src, i);
+                if is_alnum_or_underscore(ch) {
+                    i = i + 1;
+                } else {
+                    break;
+                }
+            }
+            var text: str = str_slice(src, start, i);
+            tokens.push(FTok::Word(text));
+            continue;
+        }
+
+        // Multi-char punctuation (greedy, longest first)
+        var plen: i64 = try_multi_punct(src, i, len);
+        if plen > 0 {
+            var text: str = str_slice(src, i, i + plen);
+            tokens.push(FTok::Punct(text));
+            i = i + plen;
+            continue;
+        }
+
+        // Single-char punctuation
+        if is_single_punct(c) {
+            tokens.push(FTok::Punct(char_to_str(c)));
+            i = i + 1;
+            continue;
+        }
+
+        // Unknown character — keep it as a single-char word
+        tokens.push(FTok::Word(char_to_str(c)));
+        i = i + 1;
+    }
+
+    tokens.push(FTok::Eof);
+    return tokens;
+}
+
+// ─── Token text ───────────────────────────────────────────────────────
+
+/// Render a formatter token to its source text.
+pub fn ftok_text(t: FTok) -> str {
+    match t {
+        FTok::Word(s) => { return str_concat(s, ""); }
+        FTok::Number(s) => { return str_concat(s, ""); }
+        FTok::Str(s) => { return str_concat(s, ""); }
+        FTok::FStr(s) => { return str_concat(s, ""); }
+        FTok::LineComment(s) => { return str_concat(s, ""); }
+        FTok::BlockComment(s) => { return str_concat(s, ""); }
+        FTok::Punct(s) => { return str_concat(s, ""); }
+        FTok::BlankLines(_) => { return ""; }
+        FTok::Eof => { return ""; }
+    }
+}
+
+// ─── Operator classification ──────────────────────────────────────────
+
+/// Binary operators that get spaces around them.
+fn is_binop(p: str) -> bool {
+    if str_equal(p, "+") { return true; }
+    if str_equal(p, "-") { return true; }
+    if str_equal(p, "*") { return true; }
+    if str_equal(p, "/") { return true; }
+    if str_equal(p, "%") { return true; }
+    if str_equal(p, "==") { return true; }
+    if str_equal(p, "!=") { return true; }
+    if str_equal(p, "<=") { return true; }
+    if str_equal(p, ">=") { return true; }
+    if str_equal(p, "<") { return true; }
+    if str_equal(p, ">") { return true; }
+    if str_equal(p, "&&") { return true; }
+    if str_equal(p, "||") { return true; }
+    if str_equal(p, "<<") { return true; }
+    if str_equal(p, ">>") { return true; }
+    if str_equal(p, "&") { return true; }
+    if str_equal(p, "|") { return true; }
+    if str_equal(p, "^") { return true; }
+    return false;
+}
+
+/// Assignment operators that get spaces around them.
+fn is_assignop(p: str) -> bool {
+    if str_equal(p, "=") { return true; }
+    if str_equal(p, "+=") { return true; }
+    if str_equal(p, "-=") { return true; }
+    if str_equal(p, "*=") { return true; }
+    if str_equal(p, "/=") { return true; }
+    if str_equal(p, "%=") { return true; }
+    if str_equal(p, "&=") { return true; }
+    if str_equal(p, "|=") { return true; }
+    if str_equal(p, "^=") { return true; }
+    if str_equal(p, "<<=") { return true; }
+    if str_equal(p, ">>=") { return true; }
+    return false;
+}
+
+/// `->` and `=>` and `~>` get spaces around them.
+fn is_arrow(p: str) -> bool {
+    if str_equal(p, "->") { return true; }
+    if str_equal(p, "=>") { return true; }
+    if str_equal(p, "~>") { return true; }
+    return false;
+}
+
+/// Keywords that begin a top-level definition (for blank-line spacing).
+fn is_def_kw(w: str) -> bool {
+    if str_equal(w, "fn") { return true; }
+    if str_equal(w, "val") { return true; }
+    if str_equal(w, "var") { return true; }
+    if str_equal(w, "const") { return true; }
+    if str_equal(w, "struct") { return true; }
+    if str_equal(w, "enum") { return true; }
+    if str_equal(w, "impl") { return true; }
+    if str_equal(w, "cap") { return true; }
+    if str_equal(w, "type") { return true; }
+    if str_equal(w, "use") { return true; }
+    if str_equal(w, "module") { return true; }
+    if str_equal(w, "extern") { return true; }
+    if str_equal(w, "component") { return true; }
+    if str_equal(w, "system") { return true; }
+    if str_equal(w, "state_machine") { return true; }
+    if str_equal(w, "on") { return true; }
+    if str_equal(w, "layer") { return true; }
+    if str_equal(w, "model") { return true; }
+    return false;
+}
+
+/// Keywords that are followed by a condition/expression then `{`.
+fn is_cond_kw(w: str) -> bool {
+    if str_equal(w, "if") { return true; }
+    if str_equal(w, "while") { return true; }
+    if str_equal(w, "for") { return true; }
+    if str_equal(w, "match") { return true; }
+    if str_equal(w, "query") { return true; }
+    if str_equal(w, "guard") { return true; }
+    return false;
+}
+
+/// Is this word a type keyword?
+fn is_type_word(w: str) -> bool {
+    if str_equal(w, "i8") { return true; }
+    if str_equal(w, "i16") { return true; }
+    if str_equal(w, "i32") { return true; }
+    if str_equal(w, "i64") { return true; }
+    if str_equal(w, "i128") { return true; }
+    if str_equal(w, "u8") { return true; }
+    if str_equal(w, "u16") { return true; }
+    if str_equal(w, "u32") { return true; }
+    if str_equal(w, "u64") { return true; }
+    if str_equal(w, "u128") { return true; }
+    if str_equal(w, "f32") { return true; }
+    if str_equal(w, "f64") { return true; }
+    if str_equal(w, "bool") { return true; }
+    if str_equal(w, "str") { return true; }
+    if str_equal(w, "void") { return true; }
+    return false;
+}
+
+fn is_cond_or_match_kw(s: str) -> bool {
+    if str_equal(s, "if") { return true; }
+    if str_equal(s, "while") { return true; }
+    if str_equal(s, "for") { return true; }
+    if str_equal(s, "match") { return true; }
+    if str_equal(s, "query") { return true; }
+    if str_equal(s, "guard") { return true; }
+    if str_equal(s, "return") { return true; }
+    return false;
+}
+
+// ─── Token helpers ────────────────────────────────────────────────────
+
+/// Check if a token is "significant" (not a comment, not EOF, not BlankLines).
+fn is_significant(t: FTok) -> bool {
+    match t {
+        FTok::LineComment(_) => { return false; }
+        FTok::BlockComment(_) => { return false; }
+        FTok::BlankLines(_) => { return false; }
+        FTok::Eof => { return false; }
+        _ => { return true; }
+    }
+}
+
+/// Check if a string looks like a word (starts with alpha or _).
+fn is_word_text(s: str) -> bool {
+    if str_len(s) == 0 { return false; }
+    var b: i64 = str_byte_at(s, 0);
+    return char_is_alpha(b) || b == 95;
+}
+
+/// Check if a string looks like a number (starts with digit).
+fn is_number_text(s: str) -> bool {
+    if str_len(s) == 0 { return false; }
+    return char_is_digit(str_byte_at(s, 0));
+}
+
+/// Find the index of the significant token immediately before `idx`.
+fn prev_significant_index(tokens: Vec<FTok>, idx: i64) -> i64 {
+    if idx == 0 { return -1; }
+    var i: i64 = idx;
+    while i > 0 {
+        i = i - 1;
+        if is_significant(tokens.get(i)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/// Get the significant token immediately before index `idx`.
+fn prev_significant_at(tokens: Vec<FTok>, idx: i64) -> FTok {
+    var pi: i64 = prev_significant_index(tokens, idx);
+    if pi < 0 { return FTok::Eof; }
+    return tokens.get(pi);
+}
+
+/// Get the significant token immediately after index `idx`.
+fn next_significant(tokens: Vec<FTok>, idx: i64) -> FTok {
+    var i: i64 = idx;
+    var n: i64 = tokens.len();
+    while i < n {
+        if is_significant(tokens.get(i)) {
+            return tokens.get(i);
+        }
+        i = i + 1;
+    }
+    return FTok::Eof;
+}
+
+/// Check if the next significant token after `idx` is the given punct.
+fn next_significant_is(tokens: Vec<FTok>, idx: i64, punct: str) -> bool {
+    var nxt: FTok = next_significant(tokens, idx);
+    match nxt {
+        FTok::Punct(p) => { return str_equal(p, punct); }
+        _ => { return false; }
+    }
+}
+
+/// Get the significant token before the previous one (two steps back).
+fn prev_significant_before(tokens: Vec<FTok>, idx: i64) -> FTok {
+    var found_first: bool = false;
+    var i: i64 = idx;
+    while i > 0 {
+        i = i - 1;
+        if is_significant(tokens.get(i)) {
+            if found_first {
+                return tokens.get(i);
+            }
+            found_first = true;
+        }
+    }
+    return FTok::Eof;
+}
+
+/// Determine if a `{` at position `idx` opens a definition body (struct/enum/
+/// impl/cap/etc.) where `,` should produce newlines between fields.
+fn is_def_body_brace_at(tokens: Vec<FTok>, idx: i64) -> bool {
+    var prev1: FTok = prev_significant_at(tokens, idx);
+    match prev1 {
+        FTok::Word(w) => {
+            if str_equal(w, "struct") { return true; }
+            if str_equal(w, "enum") { return true; }
+            if str_equal(w, "extern") { return true; }
+            // Check the token before the word
+            var prev1_idx: i64 = prev_significant_index(tokens, idx);
+            if prev1_idx >= 0 {
+                var prev2: FTok = prev_significant_at(tokens, prev1_idx);
+                match prev2 {
+                    FTok::Word(w2) => {
+                        if str_equal(w2, "struct") { return true; }
+                        if str_equal(w2, "enum") { return true; }
+                        if str_equal(w2, "impl") { return true; }
+                        if str_equal(w2, "cap") { return true; }
+                        if str_equal(w2, "component") { return true; }
+                        if str_equal(w2, "state_machine") { return true; }
+                        if str_equal(w2, "state") { return true; }
+                        if str_equal(w2, "extern") { return true; }
+                        return false;
+                    }
+                    _ => { return false; }
+                }
+            }
+            return false;
+        }
+        _ => { return false; }
+    }
+}
+
+/// Check if `<` at position `idx` is a generic bracket (type parameters) vs
+/// a comparison operator.
+fn is_generic_open(tokens: Vec<FTok>, idx: i64) -> bool {
+    var prev: FTok = prev_significant_at(tokens, idx);
+    var nxt: FTok = next_significant(tokens, idx + 1);
+    match prev {
+        FTok::Word(p) => {
+            if is_cond_or_match_kw(p) { return false; }
+            if is_type_word(p) { return false; }
+            match nxt {
+                FTok::Word(_) => { return true; }
+                FTok::Punct(gp) => {
+                    if str_equal(gp, ">") { return true; }
+                    return false;
+                }
+                _ => { return false; }
+            }
+        }
+        _ => { return false; }
+    }
+}
+
+// ─── Spacing decision ─────────────────────────────────────────────────
+
+/// Decide whether a space is needed between `prev` and `cur`.
+fn need_space(prev: str, cur: FTok, tokens: Vec<FTok>, idx: i64) -> bool {
+    if str_len(prev) == 0 {
+        return false; // beginning of file/line — no leading space
+    }
+
+    var cur_text: str = ftok_text(cur);
+
+    // No space right after an opening bracket/paren
+    if str_equal(prev, "(") { return false; }
+    if str_equal(prev, "[") { return false; }
+    if str_equal(prev, "{") { return false; }
+
+    // No space right before a closing bracket/paren/brace or comma/semicolon
+    if str_equal(cur_text, ")") { return false; }
+    if str_equal(cur_text, "]") { return false; }
+    if str_equal(cur_text, "}") { return false; }
+    if str_equal(cur_text, ",") { return false; }
+    if str_equal(cur_text, ";") { return false; }
+
+    // No space before . :: ?. .. ..=
+    if str_equal(cur_text, ".") { return false; }
+    if str_equal(cur_text, "::") { return false; }
+    if str_equal(cur_text, "?.") { return false; }
+    if str_equal(cur_text, "..") { return false; }
+    if str_equal(cur_text, "..=") { return false; }
+
+    // No space after . :: ?. @ # .. ..=
+    if str_equal(prev, ".") { return false; }
+    if str_equal(prev, "::") { return false; }
+    if str_equal(prev, "?.") { return false; }
+    if str_equal(prev, "@") { return false; }
+    if str_equal(prev, "#") { return false; }
+    if str_equal(prev, "..") { return false; }
+    if str_equal(prev, "..=") { return false; }
+
+    // No space between a word and ( (function call) or [ (index)
+    if is_word_text(prev) {
+        if str_equal(cur_text, "(") {
+            if is_cond_or_match_kw(prev) { return true; }
+            return false;
+        }
+        if str_equal(cur_text, "[") {
+            return false;
+        }
+    }
+
+    // No space between ) and ( (chained call)
+    if str_equal(prev, ")") && str_equal(cur_text, "(") {
+        return false;
+    }
+
+    // : — space after, but not before
+    if str_equal(prev, ":") { return true; }
+    if str_equal(cur_text, ":") { return false; }
+
+    // -> => ~> — spaces around
+    if is_arrow(prev) { return true; }
+    if is_arrow(cur_text) { return true; }
+
+    // Binary operators — spaces around
+    if is_binop(cur_text) { return true; }
+    if is_binop(prev) { return true; }
+
+    // Assignment operators — spaces around
+    if is_assignop(cur_text) { return true; }
+    if is_assignop(prev) { return true; }
+
+    // @ annotation prefix — space before
+    if str_equal(cur_text, "@") { return true; }
+
+    // Comma — space after
+    if str_equal(prev, ",") { return true; }
+    if str_equal(cur_text, ",") { return false; }
+
+    // ; — space after
+    if str_equal(prev, ";") { return true; }
+
+    // ! as prefix unary — no space after
+    if str_equal(prev, "!") && is_word_text(cur_text) { return false; }
+
+    // ~ as prefix unary — no space after
+    if str_equal(prev, "~") && is_word_text(cur_text) { return false; }
+
+    // & as prefix (reference) — no space after when followed by word
+    if str_equal(prev, "&") {
+        if is_word_text(cur_text) {
+            // Single &x — no space (prefix reference, not binary AND)
+            return false;
+        }
+        if str_equal(cur_text, "&") {
+            return false; // && is handled by binop above
+        }
+    }
+
+    // * as prefix (deref) — no space after when followed by word
+    if str_equal(prev, "*") && is_word_text(cur_text) { return false; }
+
+    // - as prefix unary (negative number) — no space after when followed by number
+    if str_equal(prev, "-") && is_number_text(cur_text) {
+        var before: FTok = prev_significant_before(tokens, idx);
+        var bt: str = ftok_text(before);
+        if str_equal(bt, "(") { return false; }
+        if str_equal(bt, ",") { return false; }
+        if str_equal(bt, "=") { return false; }
+        if str_equal(bt, "==") { return false; }
+        if str_equal(bt, "!=") { return false; }
+        if str_equal(bt, "<") { return false; }
+        if str_equal(bt, ">") { return false; }
+        if str_equal(bt, "<=") { return false; }
+        if str_equal(bt, ">=") { return false; }
+        if str_equal(bt, "+") { return false; }
+        if str_equal(bt, "-") { return false; }
+        if str_equal(bt, "*") { return false; }
+        if str_equal(bt, "/") { return false; }
+        if str_equal(bt, "%") { return false; }
+        if str_equal(bt, "&&") { return false; }
+        if str_equal(bt, "||") { return false; }
+        if str_equal(bt, "!") { return false; }
+        if str_equal(bt, "=>") { return false; }
+        if str_equal(bt, "->") { return false; }
+        if str_equal(bt, "[") { return false; }
+        if str_equal(bt, "{") { return false; }
+        if str_equal(bt, ":") { return false; }
+        if str_equal(bt, ";") { return false; }
+        if str_equal(bt, "return") { return false; }
+        if str_equal(before, FTok::Eof) { return false; }
+    }
+
+    // Two words — space between
+    if is_word_text(prev) && is_word_text(cur_text) { return true; }
+
+    // Word followed by { — space
+    if is_word_text(prev) && str_equal(cur_text, "{") { return true; }
+
+    // Number/string followed by { — space
+    if is_number_text(prev) && str_equal(cur_text, "{") { return true; }
+    if str_starts_with(prev, "\"") && str_equal(cur_text, "{") { return true; }
+    if str_starts_with(prev, "f") && str_equal(cur_text, "{") { return true; }
+
+    // ) followed by { — space
+    if str_equal(prev, ")") && str_equal(cur_text, "{") { return true; }
+
+    // ] followed by { — space
+    if str_equal(prev, "]") && str_equal(cur_text, "{") { return true; }
+
+    // Word followed by # — space
+    if is_word_text(prev) && str_equal(cur_text, "#") { return true; }
+
+    // } followed by a word — space
+    if str_equal(prev, "}") && is_word_text(cur_text) { return true; }
+
+    // Default: if both are punctuation, no space
+    if !is_word_text(prev) && !is_word_text(cur_text) {
+        return false;
+    }
+
+    // Word after punctuation — space
+    if !is_word_text(prev) && is_word_text(cur_text) {
+        return true;
+    }
+
+    // Punctuation after word — space (default)
+    if is_word_text(prev) && !is_word_text(cur_text) {
+        return true;
+    }
+
+    return true;
+}
+
+// ─── Printer ──────────────────────────────────────────────────────────
+
+/// Format Fides source code. Returns the formatted string.
+pub fn format_source(src: str) -> str {
+    var tokens: Vec<FTok> = fmt_tokenize(src);
+    var sb: StringBuilder = StringBuilder::new();
+    var indent: i64 = 0;
+    var at_line_start: bool = true;
+    var pending_blanks: i64 = 0;
+    var prev_sig: str = "";
+    var just_closed_top_level: bool = false;
+    var brace_depth: i64 = 0;
+    var paren_depth: i64 = 0;
+    var brace_is_def_body: Vec<bool> = Vec::new();
+    var generic_depth: i64 = 0;
+
+    var idx: i64 = 0;
+    var n: i64 = tokens.len();
+
+    while idx < n {
+        var tok: FTok = tokens.get(idx);
+
+        match tok {
+            FTok::Eof => { break; }
+            FTok::BlankLines(count) => {
+                if count > pending_blanks {
+                    pending_blanks = count;
+                }
+                if pending_blanks > 1 {
+                    pending_blanks = 1;
+                }
+                idx = idx + 1;
+                continue;
+            }
+            FTok::LineComment(text) => {
+                just_closed_top_level = false;
+                // Flush blanks
+                if pending_blanks > 0 {
+                    var b: i64 = 0;
+                    while b < pending_blanks {
+                        // Trim trailing whitespace
+                        sb.append_str("\n");
+                        b = b + 1;
+                    }
+                    pending_blanks = 0;
+                    at_line_start = true;
+                }
+                if at_line_start {
+                    // Indent
+                    var k: i64 = 0;
+                    while k < indent * 4 {
+                        sb.append_str(" ");
+                        k = k + 1;
+                    }
+                } else {
+                    // Trailing comment — two spaces before it
+                    sb.append_str("  ");
+                }
+                sb.append_str(text);
+                // Newline
+                sb.append_str("\n");
+                at_line_start = true;
+                idx = idx + 1;
+                continue;
+            }
+            FTok::BlockComment(text) => {
+                // Flush blanks
+                if pending_blanks > 0 {
+                    var b: i64 = 0;
+                    while b < pending_blanks {
+                        sb.append_str("\n");
+                        b = b + 1;
+                    }
+                    pending_blanks = 0;
+                    at_line_start = true;
+                }
+                if at_line_start {
+                    var k: i64 = 0;
+                    while k < indent * 4 {
+                        sb.append_str(" ");
+                        k = k + 1;
+                    }
+                }
+                sb.append_str(text);
+                at_line_start = false;
+                idx = idx + 1;
+                continue;
+            }
+            _ => {} // Significant tokens — handled below
+        }
+
+        // ── Significant tokens ──
+        var text: str = ftok_text(tok);
+
+        // For closing braces, de-indent before writing
+        var is_close_brace: bool = false;
+        match tok {
+            FTok::Punct(p) => {
+                if str_equal(p, "}") {
+                    is_close_brace = true;
+                }
+            }
+            _ => {}
+        }
+
+        if is_close_brace {
+            if brace_depth > 0 {
+                brace_depth = brace_depth - 1;
+            }
+            if brace_depth < 0 {
+                indent = 0;
+            } else {
+                indent = brace_depth;
+            }
+            // Pop def-body stack
+            if brace_is_def_body.len() > 0 {
+                brace_is_def_body.pop();
+            }
+            // Ensure } is on its own line
+            if !at_line_start {
+                sb.append_str("\n");
+                at_line_start = true;
+            }
+        }
+
+        // Track generic brackets
+        var cur_is_generic_open: bool = false;
+        match tok {
+            FTok::Punct(p) => {
+                if str_equal(p, "<") {
+                    if is_generic_open(tokens, idx) {
+                        cur_is_generic_open = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        var cur_is_generic_close: bool = false;
+        match tok {
+            FTok::Punct(p) => {
+                if str_equal(p, ">") {
+                    if generic_depth > 0 {
+                        cur_is_generic_close = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if cur_is_generic_open {
+            generic_depth = generic_depth + 1;
+        }
+
+        // Decide whether we need a space before this token
+        var need_space_before: bool = false;
+        if !at_line_start {
+            need_space_before = need_space(prev_sig, tok, tokens, idx);
+        }
+
+        // Inside generic brackets, only space after : and ,
+        if generic_depth > 0 {
+            need_space_before = false;
+            if str_equal(prev_sig, ":") { need_space_before = true; }
+            if str_equal(prev_sig, ",") { need_space_before = true; }
+        }
+        if cur_is_generic_open {
+            need_space_before = false;
+        }
+        if cur_is_generic_close {
+            need_space_before = false;
+            if generic_depth > 0 {
+                generic_depth = generic_depth - 1;
+            }
+        }
+        // After generic close >, no space before ( (function params)
+        if str_equal(prev_sig, ">") {
+            match tok {
+                FTok::Punct(p) => {
+                    if str_equal(p, "(") {
+                        need_space_before = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Blank line handling: if this is a top-level def keyword
+        var is_def: bool = false;
+        match tok {
+            FTok::Word(w) => {
+                if is_def_kw(w) { is_def = true; }
+            }
+            _ => {}
+        }
+
+        if brace_depth == 0 && is_def {
+            if sb.len() > 0 && pending_blanks == 0 {
+                if just_closed_top_level && at_line_start {
+                    pending_blanks = 1;
+                }
+            }
+            just_closed_top_level = false;
+        }
+
+        // Flush blanks
+        if pending_blanks > 0 {
+            var b: i64 = 0;
+            while b < pending_blanks {
+                sb.append_str("\n");
+                b = b + 1;
+            }
+            pending_blanks = 0;
+            at_line_start = true;
+        }
+
+        // Write indentation at line start
+        if at_line_start {
+            var k: i64 = 0;
+            while k < indent * 4 {
+                sb.append_str(" ");
+                k = k + 1;
+            }
+            at_line_start = false;
+        }
+
+        // Write space before if needed
+        if need_space_before {
+            sb.append_str(" ");
+        }
+
+        // Write the token text
+        sb.append_str(text);
+
+        // Update prev_sig
+        prev_sig = text;
+
+        // Update brace tracking and newline decisions
+        match tok {
+            FTok::Punct(p) => {
+                if str_equal(p, "{") {
+                    brace_depth = brace_depth + 1;
+                    var is_def_body: bool = is_def_body_brace_at(tokens, idx);
+                    brace_is_def_body.push(is_def_body);
+                    // Opening brace: newline after (unless next is })
+                    if !next_significant_is(tokens, idx + 1, "}") {
+                        indent = brace_depth;
+                        sb.append_str("\n");
+                        at_line_start = true;
+                    }
+                } else if str_equal(p, "}") {
+                    // Closing brace — check what follows
+                    var nxt: FTok = next_significant(tokens, idx + 1);
+                    var stay_on_line: bool = false;
+                    match nxt {
+                        FTok::Punct(np) => {
+                            if str_equal(np, ",") { stay_on_line = true; }
+                            if str_equal(np, ";") { stay_on_line = true; }
+                            if str_equal(np, ")") { stay_on_line = true; }
+                            if str_equal(np, "]") { stay_on_line = true; }
+                            if str_equal(np, "=>") {
+                                sb.append_str(" ");
+                                stay_on_line = true;
+                            }
+                        }
+                        FTok::Word(w) => {
+                            if str_equal(w, "else") { stay_on_line = true; }
+                            if str_equal(w, "while") { stay_on_line = true; }
+                            if str_equal(w, "catch") { stay_on_line = true; }
+                        }
+                        _ => {}
+                    }
+                    if !stay_on_line {
+                        if brace_depth <= 0 {
+                            just_closed_top_level = true;
+                        }
+                        sb.append_str("\n");
+                        at_line_start = true;
+                    } else {
+                        at_line_start = false;
+                    }
+                } else if str_equal(p, ";") {
+                    // Semicolon: newline after (statement boundary), unless inside
+                    // for-loop header parens (paren_depth > 0).
+                    if brace_depth > 0 && paren_depth == 0 {
+                        sb.append_str("\n");
+                        at_line_start = true;
+                    }
+                } else if str_equal(p, ",") {
+                    // Comma: newline if inside def body (struct/enum fields) and
+                    // not inside parens/brackets, else just space.
+                    var in_def_body: bool = false;
+                    if brace_is_def_body.len() > 0 {
+                        in_def_body = brace_is_def_body.get(brace_is_def_body.len() - 1);
+                    }
+                    if in_def_body && brace_depth > 0 && paren_depth == 0 {
+                        if !next_significant_is(tokens, idx + 1, "}") {
+                            sb.append_str("\n");
+                            at_line_start = true;
+                        }
+                    }
+                } else if str_equal(p, "(") {
+                    paren_depth = paren_depth + 1;
+                } else if str_equal(p, ")") {
+                    if paren_depth > 0 {
+                        paren_depth = paren_depth - 1;
+                    }
+                } else if str_equal(p, "[") {
+                    paren_depth = paren_depth + 1;
+                } else if str_equal(p, "]") {
+                    if paren_depth > 0 {
+                        paren_depth = paren_depth - 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        idx = idx + 1;
+    }
+
+    // Ensure file ends with newline
+    var result: str = sb.to_str();
+    if str_len(result) > 0 {
+        var last: i64 = str_byte_at(result, str_len(result) - 1);
+        if last != 10 {
+            result = str_concat(result, "\n");
+        }
+    }
+    return result;
+}
+
+/// Check if source is already formatted. Returns true if formatting would
+/// NOT change it.
+pub fn is_formatted(src: str) -> bool {
+    return str_equal(format_source(src), src);
+}

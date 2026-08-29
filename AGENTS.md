@@ -24,6 +24,13 @@ cargo build
 # Quick build check (no tests)
 ./verify.sh --quick
 
+# Self-host verification (compiler/tests/*.fd on 3 backends)
+# Separate from verify.sh: verify.sh → tests/ (Rust compiler in src/)
+# verify-selfhost.sh → compiler/tests/ (self-hosted Fides components in compiler/)
+./verify-selfhost.sh
+./verify-selfhost.sh --save
+./verify-selfhost.sh --list
+
 # Generate golden files for intermediate compiler stages
 ./scripts/gen_golden.sh
 
@@ -106,20 +113,21 @@ cargo build
 ./target/release/veil <file.fd> [--format text|html] [--output <dir>]
 ```
 
-## Current Baseline (as of Aug 28, 2026)
+## Current Baseline (as of Aug 29, 2026)
 
 ```
 Unit tests:   265/265 passed  (All passing — cargo test --lib)
 Harness:      8/8 passed      (All passing — all 3 self-host blockers pass on all backends)
-Interpreter:  165/165 normal  (+ 36 expected-fail, + 0 skip, + 0 known-fail)
-C Codegen:    165/165 matched (0 skip — all tests pass on C codegen)
-PE Emitter:   165/165 valid   (0 known-fail — all pass)
-Total .fd:    218 test files  (195 in root; 23 in subdirs: capability/effects/regions/safety)
-Skip list:    1 test          (bench_stringbuilder.fd — timing-dependent benchmark, not correctness)
+Interpreter:  167/167 normal  (+ 36 expected-fail, + 0 skip, + 0 known-fail)
+C Codegen:    167/167 matched (0 skip — all tests pass on C codegen)
+PE Emitter:   167/167 valid   (0 known-fail — all pass)
+Total .fd:    222 test files  (195 in tests/; 4 in compiler/tests/; 23 in subdirs: capability/effects/regions/safety)
+Skip list:    1 test          (bench_stringbuilder — timing benchmark)
 Expected-fail: 36 tests       (tests that verify compiler error detection — failing is correct)
 Known-fail:   0 tests         (all previously known-fail tests now pass on all 3 backends)
 Source:       54 .rs files, ~86,200 LOC
 Stdlib:       69 .fd modules, 17,541 LOC
+Self-host:    10 .fd modules, 18,329 LOC (token, diag, json, fmt, ast, lexer, parser, ir, typechecker, lower — all compile)
 Docs:         21 docs/ + 4 root = 25 .md files
 Binaries:     4 (fidesc, pacte, scribe, veil)
 Warnings:     136 (dead code in pe.rs/opt.rs/debugger.rs/wasm.rs/fmt.rs — future feature stubs)
@@ -188,13 +196,13 @@ touching them.
    These should be removed before committing but are safe to leave during
    active debugging.
 
-3. **PIR L2 GetFieldPtr offset** (`pir.rs` line ~1240): `offset: *field_index * 8`
-   uses `field_index * 8` as the byte offset. This is **correct by design** —
-   `compute_struct_layout()` in `lower.rs` deliberately assigns every field an
-   8-byte slot (uniform representation), so `field_index * 8` always matches the
-   real offset in `StructLayout`. This is not a bug; it's a design choice. If
-   struct layouts are ever changed to use packed/sized fields, this code must be
-   updated to look up real offsets from `struct_layouts` (as `codegen_c.rs` does).
+3. **PIR L2 GetFieldPtr offset** (`pir.rs`): Previously used `field_index * 8`
+   as the byte offset, which was correct when all struct fields were 8 bytes.
+   **Fixed (SH-6.1):** Now looks up real offsets from `struct_layouts` using a
+   `value_types` map built during L2→L3 lowering. This was necessary because
+   enum-typed struct fields need `(1 + max_payload) * 8` bytes, not 8.
+   `compute_struct_layout()` in `lower.rs` now uses enum sizes for enum-typed
+   fields, and the PIR L2→L3 lowering looks up the real offset.
 
 4. **Native codegen bugs** (not optimizer-related): All previously failing
    native ELF64 tests (`test_collections`, `test_db`, `test_match_range`,

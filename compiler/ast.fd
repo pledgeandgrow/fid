@@ -1,0 +1,936 @@
+// ast.fd — AST types for the Fides compiler
+// Rewritten from src/ast.rs (936 LOC Rust)
+//
+// This module defines the abstract syntax tree types used by the parser,
+// typechecker, lowerer, and codegen. All enums use tuple-style variants
+// (Fides does not support struct-style enum variants). Recursive types use
+// Box<T> indirection (verified by tests/test_recursive_box.fd). Option fields
+// use purpose-specific Opt* enums because the builtin Option<T> is i64-sized
+// and cannot hold non-i64 payloads (see json.fd's JsonResult pattern).
+//
+// Type mappings from Rust:
+//   String -> str      usize -> i64      u64 -> i64
+//   Box<T> -> Box<T>   Vec<T> -> Vec<T>  Option<T> -> Opt* enum
+//   Vec<(A,B)> -> Vec<PairStruct>
+
+module compiler::ast;
+
+use core;
+use vec;
+use string;
+
+// ─── Pair / tuple helper structs ─────────────────────────────────────────
+// Fides Vec holds a single element type, so Rust's Vec<(A, B)> is represented
+// as Vec<StructPair>.
+
+pub struct StrPair {
+    pub a: str,
+    pub b: str,
+}
+
+pub struct FieldInit {
+    pub name: str,
+    pub value: Expr,
+}
+
+pub struct Binding {
+    pub name: str,
+    pub ty: str,
+}
+
+pub struct AssocTypeDecl {
+    pub name: str,
+    pub type_params: Vec<str>,
+}
+
+pub struct AssocTypeBinding {
+    pub name: str,
+    pub ty: Type,
+}
+
+pub struct LayerInst {
+    pub field: str,
+    pub layer_type: str,
+    pub args: Vec<str>,
+}
+
+// ─── Optional-value enums ─────────────────────────────────────────────────
+// The builtin Option<T> has i64-sized payload slots, so it cannot hold
+// non-i64 values. These purpose-specific enums have correctly-sized layouts.
+
+pub enum OptBoxExpr {
+    Some(Box<Expr>),
+    None,
+}
+
+pub enum OptStmts {
+    Some(Vec<Stmt>),
+    None,
+}
+
+pub enum OptType {
+    Some(Type),
+    None,
+}
+
+pub enum OptI64 {
+    Some(i64),
+    None,
+}
+
+pub enum OptParams {
+    Some(Vec<Param>),
+    None,
+}
+
+pub enum OptStr {
+    Some(str),
+    None,
+}
+
+pub enum OptFunc {
+    Some(Func),
+    None,
+}
+
+// ─── Type ─────────────────────────────────────────────────────────────────
+
+pub enum ShapeDim {
+    Known(i64),
+    Symbolic(str),
+}
+
+pub enum Type {
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    F32,
+    F64,
+    Bool,
+    Str,
+    Void,
+    Never,
+    Infer,
+    Named(str),
+    Array(Box<Type>, i64),
+    ArrayConst(Box<Type>, str),
+    Ref(Box<Type>, bool),
+    RawPtr(Box<Type>, bool),
+    Generic(str, Vec<Type>),
+    Tuple(Vec<Type>),
+    Func(Vec<Type>, Box<Type>),
+    Assoc(str, str, str, Vec<Type>),
+    Dyn(str),
+    ShapedTensor(Box<Type>, Vec<ShapeDim>),
+}
+
+// ─── Operators ────────────────────────────────────────────────────────────
+
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Eq,
+    Neq,
+    Lt,
+    Gt,
+    LtEq,
+    GtEq,
+    And,
+    Or,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+}
+
+pub enum UnaryOp {
+    Neg,
+    Not,
+    BitNot,
+}
+
+pub enum AssignOp {
+    Assign,
+    AddAssign,
+    SubAssign,
+    MulAssign,
+    DivAssign,
+    ModAssign,
+    BitAndAssign,
+    BitOrAssign,
+    BitXorAssign,
+    ShlAssign,
+    ShrAssign,
+}
+
+// ─── Expressions ──────────────────────────────────────────────────────────
+
+pub enum FStringPart {
+    Literal(str),
+    Expr(Expr),
+}
+
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub guard: OptBoxExpr,
+    pub body: Vec<Stmt>,
+}
+
+pub enum ReflectOp {
+    TypeName,
+    IsStruct,
+    IsEnum,
+    FieldCount,
+    FieldNames,
+    FieldTypes,
+    EnumVariants,
+}
+
+pub enum AsmDir {
+    In,
+    Out,
+}
+
+pub struct AsmOperand {
+    pub direction: AsmDir,
+    pub reg: str,
+    pub expr: Expr,
+}
+
+pub enum Expr {
+    IntLit(i64),
+    FloatLit(f64),
+    StringLit(str),
+    BoolLit(bool),
+    Ident(str),
+    Binary(BinOp, Box<Expr>, Box<Expr>),
+    Unary(UnaryOp, Box<Expr>),
+    Call(str, Vec<Expr>),
+    FieldAccess(Box<Expr>, str),
+    OptionalFieldAccess(Box<Expr>, str),
+    StructLit(str, Vec<FieldInit>, OptBoxExpr),
+    If(Box<Expr>, Vec<Stmt>, OptStmts),
+    Range(Box<Expr>, Box<Expr>, bool),
+    Block(Vec<Stmt>),
+    MethodCall(Box<Expr>, str, Vec<Expr>),
+    ArrayLit(Box<Type>, Vec<Expr>),
+    Index(Box<Expr>, Box<Expr>),
+    FString(Vec<FStringPart>),
+    Match(Box<Expr>, Vec<MatchArm>),
+    EnumLit(str, str, Vec<Expr>),
+    Ref(Box<Expr>, bool),
+    Deref(Box<Expr>),
+    StrConcat(Box<Expr>, Box<Expr>),
+    Try(Box<Expr>),
+    Coalesce(Box<Expr>, Box<Expr>),
+    IsCheck(Box<Expr>, str),
+    TryBlock(Vec<Stmt>),
+    TupleLit(Vec<Expr>),
+    Closure(Vec<Param>, Vec<Stmt>, OptType),
+    Cast(Box<Expr>, Type),
+    Asm(str, Vec<AsmOperand>),
+    Comptime(Box<Expr>),
+    ComptimeBlock(Vec<Stmt>),
+    ComptimeReflect(ReflectOp, Type),
+    PipeForward(Box<Expr>, Box<Expr>),
+    QuantCast(Box<Expr>, Type),
+    Await(Box<Expr>),
+    Spawn(Box<Expr>),
+}
+
+// ─── Patterns ─────────────────────────────────────────────────────────────
+
+pub enum Pattern {
+    Wildcard,
+    IntLit(i64),
+    BoolLit(bool),
+    Ident(str),
+    EnumVariant(str, str, Vec<Binding>),
+    StrLit(str),
+    Range(Box<Pattern>, Box<Pattern>),
+}
+
+// ─── Statements ───────────────────────────────────────────────────────────
+
+pub struct SelectCase {
+    pub channel: Expr,
+    pub var_name: str,
+    pub body: Vec<Stmt>,
+}
+
+pub struct EffectHandler {
+    pub effect: str,
+    pub op: str,
+    pub params: Vec<str>,
+    pub body: Vec<Stmt>,
+}
+
+pub enum Stmt {
+    Let(str, OptType, Expr, bool, bool, i64),
+    LetTuple(Vec<str>, Expr, i64),
+    LetUninit(str, Type, i64),
+    Assign(str, AssignOp, Expr, i64),
+    IndexAssign(str, Expr, AssignOp, Expr, i64),
+    DerefAssign(Expr, AssignOp, Expr, i64),
+    FieldAssign(Expr, str, AssignOp, Expr, i64),
+    Expr(Expr, i64),
+    Return(OptBoxExpr, i64),
+    If(Expr, Vec<Stmt>, OptStmts, i64),
+    While(Expr, Vec<Stmt>, i64),
+    For(str, Expr, Vec<Stmt>, i64),
+    Loop(Vec<Stmt>, i64),
+    Break(OptBoxExpr, i64),
+    Continue(i64),
+    Defer(Vec<Stmt>, i64),
+    Match(Expr, Vec<MatchArm>, i64),
+    Use(str, Vec<str>, i64),
+    Handle(Vec<Stmt>, Vec<EffectHandler>, i64),
+    Do(str, str, Vec<Expr>, i64),
+    RegionBlock(str, OptI64, bool, bool, OptI64, Vec<Stmt>, i64),
+    Sandbox(Vec<Stmt>, i64),
+    Unsafe(Vec<Stmt>, i64),
+    Txn(Vec<Stmt>, i64),
+    ComptimeGen(Vec<Stmt>, i64),
+    GradBlock(str, Vec<Stmt>, i64),
+    Backward(Expr, i64),
+    Query(Vec<str>, Vec<Stmt>, i64),
+    Select(Vec<SelectCase>, OptStmts, i64),
+}
+
+// ─── Declarations ─────────────────────────────────────────────────────────
+
+pub struct Param {
+    pub name: str,
+    pub ty: Type,
+    pub is_pub: bool,
+    pub annotations: Vec<Annotation>,
+}
+
+pub struct Annotation {
+    pub name: str,
+    pub args: Vec<str>,
+}
+
+pub struct Func {
+    pub name: str,
+    pub type_params: Vec<str>,
+    pub type_param_bounds: Vec<StrPair>,
+    pub const_params: Vec<StrPair>,
+    pub params: Vec<Param>,
+    pub ret_ty: Type,
+    pub body: Vec<Stmt>,
+    pub is_pub: bool,
+    pub is_comptime: bool,
+    pub declared_effects: Vec<str>,
+    pub has_effect_annotation: bool,
+    pub is_interrupt: bool,
+    pub annotations: Vec<Annotation>,
+    pub preconditions: Vec<Expr>,
+    pub postconditions: Vec<Expr>,
+    pub is_async: bool,
+}
+
+pub struct StructDef {
+    pub name: str,
+    pub fields: Vec<Param>,
+    pub is_pub: bool,
+    pub annotations: Vec<Annotation>,
+    pub type_params: Vec<str>,
+}
+
+pub struct EnumVariant {
+    pub name: str,
+    pub data: OptParams,
+}
+
+pub struct EnumDef {
+    pub name: str,
+    pub variants: Vec<EnumVariant>,
+    pub is_pub: bool,
+    pub type_params: Vec<str>,
+}
+
+pub struct ConstDef {
+    pub name: str,
+    pub ty: Type,
+    pub expr: Expr,
+    pub is_pub: bool,
+}
+
+pub struct TypeAlias {
+    pub name: str,
+    pub alias_for: Type,
+    pub is_pub: bool,
+}
+
+pub struct ImplDef {
+    pub struct_name: str,
+    pub type_params: Vec<str>,
+    pub methods: Vec<Func>,
+}
+
+pub struct TraitMethod {
+    pub name: str,
+    pub params: Vec<Param>,
+    pub ret_ty: Type,
+    pub has_self: bool,
+    pub is_pub: bool,
+    pub default_body: OptStmts,
+}
+
+pub struct TraitDef {
+    pub name: str,
+    pub methods: Vec<TraitMethod>,
+    pub associated_types: Vec<AssocTypeDecl>,
+    pub is_pub: bool,
+}
+
+pub struct TraitImpl {
+    pub trait_name: str,
+    pub type_name: str,
+    pub type_params: Vec<str>,
+    pub methods: Vec<Func>,
+    pub associated_types: Vec<AssocTypeBinding>,
+}
+
+pub struct ImportDef {
+    pub path: str,
+    pub items: Vec<str>,
+    pub capabilities: Vec<str>,
+    pub version: OptStr,
+    pub alias: OptStr,
+    pub is_pub: bool,
+    pub is_glob: bool,
+}
+
+pub struct Attribute {
+    pub name: str,
+    pub args: Vec<str>,
+}
+
+pub struct ExternDecl {
+    pub abi: str,
+    pub c_name: str,
+    pub pledge_name: str,
+    pub params: Vec<Param>,
+    pub ret_ty: Type,
+    pub include: OptStr,
+    pub link_lib: OptStr,
+}
+
+// ─── ML / Game architecture declarations ──────────────────────────────────
+
+pub struct LayerDef {
+    pub name: str,
+    pub fields: Vec<Param>,
+    pub constructor_args: Vec<str>,
+    pub forward: Func,
+    pub is_pub: bool,
+}
+
+pub struct ModelDef {
+    pub name: str,
+    pub layers: Vec<LayerInst>,
+    pub forward: Func,
+    pub is_pub: bool,
+}
+
+pub struct ComponentDef {
+    pub name: str,
+    pub fields: Vec<Param>,
+    pub is_pub: bool,
+}
+
+pub struct SystemDef {
+    pub name: str,
+    pub params: Vec<Param>,
+    pub body: Vec<Stmt>,
+    pub is_pub: bool,
+}
+
+pub struct StateTransition {
+    pub event: str,
+    pub target: str,
+}
+
+pub struct StateDef {
+    pub name: str,
+    pub transitions: Vec<StateTransition>,
+}
+
+pub struct StateMachineDef {
+    pub name: str,
+    pub states: Vec<StateDef>,
+    pub is_pub: bool,
+}
+
+pub struct EventHandlerDef {
+    pub event_name: str,
+    pub params: Vec<Param>,
+    pub body: Vec<Stmt>,
+    pub is_pub: bool,
+}
+
+// ─── Program ──────────────────────────────────────────────────────────────
+
+pub struct Program {
+    pub module: OptStr,
+    pub funcs: Vec<Func>,
+    pub structs: Vec<StructDef>,
+    pub enums: Vec<EnumDef>,
+    pub consts: Vec<ConstDef>,
+    pub type_aliases: Vec<TypeAlias>,
+    pub impls: Vec<ImplDef>,
+    pub imports: Vec<ImportDef>,
+    pub attributes: Vec<Attribute>,
+    pub traits: Vec<TraitDef>,
+    pub trait_impls: Vec<TraitImpl>,
+    pub extern_decls: Vec<ExternDecl>,
+    pub layers: Vec<LayerDef>,
+    pub models: Vec<ModelDef>,
+    pub components: Vec<ComponentDef>,
+    pub systems: Vec<SystemDef>,
+    pub state_machines: Vec<StateMachineDef>,
+    pub event_handlers: Vec<EventHandlerDef>,
+}
+
+// ─── Program constructor ──────────────────────────────────────────────────
+
+pub fn program_new() -> Program {
+    return Program {
+        module: OptStr::None,
+        funcs: Vec::new(),
+        structs: Vec::new(),
+        enums: Vec::new(),
+        consts: Vec::new(),
+        type_aliases: Vec::new(),
+        impls: Vec::new(),
+        imports: Vec::new(),
+        attributes: Vec::new(),
+        traits: Vec::new(),
+        trait_impls: Vec::new(),
+        extern_decls: Vec::new(),
+        layers: Vec::new(),
+        models: Vec::new(),
+        components: Vec::new(),
+        systems: Vec::new(),
+        state_machines: Vec::new(),
+        event_handlers: Vec::new(),
+    };
+}
+
+// ─── Stmt::line() helper ──────────────────────────────────────────────────
+
+pub fn stmt_line(s: Stmt) -> i64 {
+    match s {
+        Stmt::Let(_, _, _, _, _, line) => { return line; }
+        Stmt::LetTuple(_, _, line) => { return line; }
+        Stmt::LetUninit(_, _, line) => { return line; }
+        Stmt::Assign(_, _, _, line) => { return line; }
+        Stmt::IndexAssign(_, _, _, _, line) => { return line; }
+        Stmt::DerefAssign(_, _, _, line) => { return line; }
+        Stmt::FieldAssign(_, _, _, _, line) => { return line; }
+        Stmt::Expr(_, line) => { return line; }
+        Stmt::Return(_, line) => { return line; }
+        Stmt::If(_, _, _, line) => { return line; }
+        Stmt::While(_, _, line) => { return line; }
+        Stmt::For(_, _, _, line) => { return line; }
+        Stmt::Loop(_, line) => { return line; }
+        Stmt::Break(_, line) => { return line; }
+        Stmt::Continue(line) => { return line; }
+        Stmt::Defer(_, line) => { return line; }
+        Stmt::Match(_, _, line) => { return line; }
+        Stmt::Use(_, _, line) => { return line; }
+        Stmt::Handle(_, _, line) => { return line; }
+        Stmt::Do(_, _, _, line) => { return line; }
+        Stmt::RegionBlock(_, _, _, _, _, _, line) => { return line; }
+        Stmt::Sandbox(_, line) => { return line; }
+        Stmt::Unsafe(_, line) => { return line; }
+        Stmt::Txn(_, line) => { return line; }
+        Stmt::ComptimeGen(_, line) => { return line; }
+        Stmt::GradBlock(_, _, line) => { return line; }
+        Stmt::Backward(_, line) => { return line; }
+        Stmt::Query(_, _, line) => { return line; }
+        Stmt::Select(_, _, line) => { return line; }
+    }
+}
+
+// ─── Display: shape_dim_to_str ────────────────────────────────────────────
+
+pub fn shape_dim_to_str(d: ShapeDim) -> str {
+    match d {
+        ShapeDim::Known(n) => { return int_to_str(n); }
+        ShapeDim::Symbolic(s) => { return s; }
+    }
+}
+
+// ─── Display: type_to_str ─────────────────────────────────────────────────
+// Matches Rust's impl Display for Type.
+// Note: Fides does not auto-deref Box<T> when passing to a function expecting
+// T, so recursive calls on Box<Type> payloads go through box_type_to_str,
+// which matches on the boxed value (match auto-derefs Box).
+
+pub fn box_type_to_str(b: Box<Type>) -> str {
+    match b {
+        Type::I8 => { return "i8"; }
+        Type::I16 => { return "i16"; }
+        Type::I32 => { return "i32"; }
+        Type::I64 => { return "i64"; }
+        Type::I128 => { return "i128"; }
+        Type::U8 => { return "u8"; }
+        Type::U16 => { return "u16"; }
+        Type::U32 => { return "u32"; }
+        Type::U64 => { return "u64"; }
+        Type::U128 => { return "u128"; }
+        Type::F32 => { return "f32"; }
+        Type::F64 => { return "f64"; }
+        Type::Bool => { return "bool"; }
+        Type::Str => { return "str"; }
+        Type::Void => { return "void"; }
+        Type::Never => { return "never"; }
+        Type::Infer => { return "_"; }
+        Type::Named(s) => { return s; }
+        Type::Array(elem, size) => {
+            return "[" + box_type_to_str(elem) + "; " + int_to_str(size) + "]";
+        }
+        Type::ArrayConst(elem, size_param) => {
+            return "[" + box_type_to_str(elem) + "; " + size_param + "]";
+        }
+        Type::Ref(inner, is_mut) => {
+            if is_mut {
+                return "&mut " + box_type_to_str(inner);
+            } else {
+                return "&" + box_type_to_str(inner);
+            }
+        }
+        Type::RawPtr(inner, is_mut) => {
+            if is_mut {
+                return "*mut " + box_type_to_str(inner);
+            } else {
+                return "*const " + box_type_to_str(inner);
+            }
+        }
+        Type::Generic(name, args) => {
+            var result = name + "<";
+            var i: i64 = 0;
+            while i < args.len() {
+                if i > 0 {
+                    result = result + ", ";
+                }
+                result = result + type_to_str(args.get(i));
+                i = i + 1;
+            }
+            result = result + ">";
+            return result;
+        }
+        Type::Tuple(types) => {
+            var result = "(";
+            var i: i64 = 0;
+            while i < types.len() {
+                if i > 0 {
+                    result = result + ", ";
+                }
+                result = result + type_to_str(types.get(i));
+                i = i + 1;
+            }
+            result = result + ")";
+            return result;
+        }
+        Type::Func(params, ret) => {
+            var result = "fn(";
+            var i: i64 = 0;
+            while i < params.len() {
+                if i > 0 {
+                    result = result + ", ";
+                }
+                result = result + type_to_str(params.get(i));
+                i = i + 1;
+            }
+            result = result + ") -> " + box_type_to_str(ret);
+            return result;
+        }
+        Type::Assoc(tp, trait_name, name, args) => {
+            if args.len() == 0 {
+                return tp + "::" + name + "(" + trait_name + ")";
+            } else {
+                var args_str = "";
+                var i: i64 = 0;
+                while i < args.len() {
+                    if i > 0 {
+                        args_str = args_str + ", ";
+                    }
+                    args_str = args_str + type_to_str(args.get(i));
+                    i = i + 1;
+                }
+                return tp + "::" + name + "<" + args_str + ">(" + trait_name + ")";
+            }
+        }
+        Type::Dyn(name) => {
+            return "dyn " + name;
+        }
+        Type::ShapedTensor(elem, shape) => {
+            var result = "Tensor<" + box_type_to_str(elem);
+            if shape.len() > 0 {
+                result = result + ", [";
+                var i: i64 = 0;
+                while i < shape.len() {
+                    if i > 0 {
+                        result = result + ", ";
+                    }
+                    result = result + shape_dim_to_str(shape.get(i));
+                    i = i + 1;
+                }
+                result = result + "]";
+            }
+            result = result + ">";
+            return result;
+        }
+    }
+}
+
+pub fn type_to_str(t: Type) -> str {
+    // Delegate to box_type_to_str by boxing — avoids duplicating the match.
+    // (Box::new copies the value; Type is a flat enum so this is cheap.)
+    return box_type_to_str(Box::new(t));
+}
+
+// ─── Constructor functions ────────────────────────────────────────────────
+// The Fides parser only recognizes struct names defined in the current file
+// (or pre-populated from stdlib/already-loaded imports). Struct literals from
+// imported modules fail to parse on the first pass. These constructors allow
+// test files (and the future self-hosted parser) to build AST nodes without
+// using struct-literal syntax for imported types.
+
+pub fn FieldInit_new(name: str, value: Expr) -> FieldInit {
+    return FieldInit { name: name, value: value };
+}
+
+pub fn StrPair_new(a: str, b: str) -> StrPair {
+    return StrPair { a: a, b: b };
+}
+
+pub fn Binding_new(name: str, ty: str) -> Binding {
+    return Binding { name: name, ty: ty };
+}
+
+pub fn AssocTypeDecl_new(name: str, type_params: Vec<str>) -> AssocTypeDecl {
+    return AssocTypeDecl { name: name, type_params: type_params };
+}
+
+pub fn AssocTypeBinding_new(name: str, ty: Type) -> AssocTypeBinding {
+    return AssocTypeBinding { name: name, ty: ty };
+}
+
+pub fn LayerInst_new(field: str, layer_type: str, args: Vec<str>) -> LayerInst {
+    return LayerInst { field: field, layer_type: layer_type, args: args };
+}
+
+pub fn Param_new(name: str, ty: Type, is_pub: bool) -> Param {
+    return Param { name: name, ty: ty, is_pub: is_pub, annotations: Vec::new() };
+}
+
+pub fn Annotation_new(name: str, args: Vec<str>) -> Annotation {
+    return Annotation { name: name, args: args };
+}
+
+pub fn MatchArm_new(pattern: Pattern, guard: OptBoxExpr, body: Vec<Stmt>) -> MatchArm {
+    return MatchArm { pattern: pattern, guard: guard, body: body };
+}
+
+pub fn AsmOperand_new(direction: AsmDir, reg: str, expr: Expr) -> AsmOperand {
+    return AsmOperand { direction: direction, reg: reg, expr: expr };
+}
+
+pub fn SelectCase_new(channel: Expr, var_name: str, body: Vec<Stmt>) -> SelectCase {
+    return SelectCase { channel: channel, var_name: var_name, body: body };
+}
+
+pub fn EffectHandler_new(effect: str, op: str, params: Vec<str>, body: Vec<Stmt>) -> EffectHandler {
+    return EffectHandler { effect: effect, op: op, params: params, body: body };
+}
+
+pub fn EnumVariant_new(name: str, data: OptParams) -> EnumVariant {
+    return EnumVariant { name: name, data: data };
+}
+
+pub fn Func_new(name: str, ret_ty: Type) -> Func {
+    return Func {
+        name: name,
+        type_params: Vec::new(),
+        type_param_bounds: Vec::new(),
+        const_params: Vec::new(),
+        params: Vec::new(),
+        ret_ty: ret_ty,
+        body: Vec::new(),
+        is_pub: false,
+        is_comptime: false,
+        declared_effects: Vec::new(),
+        has_effect_annotation: false,
+        is_interrupt: false,
+        annotations: Vec::new(),
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+        is_async: false,
+    };
+}
+
+pub fn StructDef_new(name: str, is_pub: bool) -> StructDef {
+    return StructDef {
+        name: name,
+        fields: Vec::new(),
+        is_pub: is_pub,
+        annotations: Vec::new(),
+        type_params: Vec::new(),
+    };
+}
+
+pub fn EnumDef_new(name: str, variants: Vec<EnumVariant>, is_pub: bool) -> EnumDef {
+    return EnumDef {
+        name: name,
+        variants: variants,
+        is_pub: is_pub,
+        type_params: Vec::new(),
+    };
+}
+
+pub fn ConstDef_new(name: str, ty: Type, expr: Expr, is_pub: bool) -> ConstDef {
+    return ConstDef { name: name, ty: ty, expr: expr, is_pub: is_pub };
+}
+
+pub fn TypeAlias_new(name: str, alias_for: Type, is_pub: bool) -> TypeAlias {
+    return TypeAlias { name: name, alias_for: alias_for, is_pub: is_pub };
+}
+
+pub fn ImplDef_new(struct_name: str) -> ImplDef {
+    return ImplDef {
+        struct_name: struct_name,
+        type_params: Vec::new(),
+        methods: Vec::new(),
+    };
+}
+
+pub fn TraitMethod_new(name: str, ret_ty: Type, has_self: bool) -> TraitMethod {
+    return TraitMethod {
+        name: name,
+        params: Vec::new(),
+        ret_ty: ret_ty,
+        has_self: has_self,
+        is_pub: true,
+        default_body: OptStmts::None,
+    };
+}
+
+pub fn TraitDef_new(name: str, methods: Vec<TraitMethod>) -> TraitDef {
+    return TraitDef {
+        name: name,
+        methods: methods,
+        associated_types: Vec::new(),
+        is_pub: true,
+    };
+}
+
+pub fn TraitImpl_new(trait_name: str, type_name: str) -> TraitImpl {
+    return TraitImpl {
+        trait_name: trait_name,
+        type_name: type_name,
+        type_params: Vec::new(),
+        methods: Vec::new(),
+        associated_types: Vec::new(),
+    };
+}
+
+pub fn ImportDef_new(path: str, is_glob: bool) -> ImportDef {
+    return ImportDef {
+        path: path,
+        items: Vec::new(),
+        capabilities: Vec::new(),
+        version: OptStr::None,
+        alias: OptStr::None,
+        is_pub: false,
+        is_glob: is_glob,
+    };
+}
+
+pub fn Attribute_new(name: str, args: Vec<str>) -> Attribute {
+    return Attribute { name: name, args: args };
+}
+
+pub fn ExternDecl_new(abi: str, c_name: str, pledge_name: str, ret_ty: Type) -> ExternDecl {
+    return ExternDecl {
+        abi: abi,
+        c_name: c_name,
+        pledge_name: pledge_name,
+        params: Vec::new(),
+        ret_ty: ret_ty,
+        include: OptStr::None,
+        link_lib: OptStr::None,
+    };
+}
+
+pub fn LayerDef_new(name: str, forward: Func, is_pub: bool) -> LayerDef {
+    return LayerDef {
+        name: name,
+        fields: Vec::new(),
+        constructor_args: Vec::new(),
+        forward: forward,
+        is_pub: is_pub,
+    };
+}
+
+pub fn ModelDef_new(name: str, layers: Vec<LayerInst>, forward: Func, is_pub: bool) -> ModelDef {
+    return ModelDef {
+        name: name,
+        layers: layers,
+        forward: forward,
+        is_pub: is_pub,
+    };
+}
+
+pub fn ComponentDef_new(name: str, is_pub: bool) -> ComponentDef {
+    return ComponentDef { name: name, fields: Vec::new(), is_pub: is_pub };
+}
+
+pub fn SystemDef_new(name: str) -> SystemDef {
+    return SystemDef {
+        name: name,
+        params: Vec::new(),
+        body: Vec::new(),
+        is_pub: false,
+    };
+}
+
+pub fn StateMachineDef_new(name: str, is_pub: bool) -> StateMachineDef {
+    return StateMachineDef {
+        name: name,
+        states: Vec::new(),
+        is_pub: is_pub,
+    };
+}
+
+pub fn StateDef_new(name: str) -> StateDef {
+    return StateDef { name: name, transitions: Vec::new() };
+}
+
+pub fn StateTransition_new(event: str, target: str) -> StateTransition {
+    return StateTransition { event: event, target: target };
+}
+
+pub fn EventHandlerDef_new(event_name: str) -> EventHandlerDef {
+    return EventHandlerDef {
+        event_name: event_name,
+        params: Vec::new(),
+        body: Vec::new(),
+        is_pub: false,
+    };
+}

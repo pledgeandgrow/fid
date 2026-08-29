@@ -1,5 +1,172 @@
 # Fides Language Changelog
 
+## Middle-End Self-Host Rewrite Progress — SH-8.1/8.2/8.3 (August 29, 2026)
+
+### Summary
+
+Three of five SH-8 (middle-end) modules now compile to native executables:
+`ir.fd` (DONE + tested), `typechecker.fd` (COMPILES), and `lower.fd`
+(COMPILES). All 10 self-host compiler modules now compile — 18,329 LOC
+Fides total. Differential testing against the Rust counterparts is the
+next step.
+
+### SH-8.1 — `ir.fd` (DONE + tested)
+
+**Rust:** `src/ir.rs` (1761 LOC) → **Fides:** `compiler/ir.fd` (2325 LOC)
+**Native binary:** 152KB
+
+All 25 tests pass on interpreter, C codegen, and PE emitter. Tests cover
+IrType to_str/size/align/classification, EffectSet, Region, Inst
+result_type/effects/kind_name/is_terminator/value_refs, lower_type (all
+AST type variants), IrFunction construction/emit/bind/lookup/new_block,
+IrModule construction/structs/externs/intern/verify, BorrowKind,
+ir_type_eq, ir_type_is_compatible_with, IrModule_to_str.
+
+Key adaptations: `box_ir_type_*` helper functions for `Box<IrType>`
+auto-unboxing in match patterns; `get_mut` → get + modify + set pattern
+for Vec mutations; integer cast syntax (`as_i8`, `as_i16`, `as_i32`).
+
+### SH-8.2 — `typechecker.fd` (COMPILES — native build)
+
+**Rust:** `src/typechecker.rs` (7431 LOC — largest module) → **Fides:**
+`compiler/typechecker.fd` (4813 LOC)
+**Native binary:** 296KB
+
+The typechecker handles type inference, region checking, effect checking,
+capability checking, safety annotation verification, trait resolution,
+generic instantiation, linear type checking, and @send/@sync checks.
+
+Key adaptations:
+1. `Vec<Vec<T>>` nested generics → type aliases (`ScopeStack`,
+   `LinearVarStack`, `StrStack`) — Fides can't parse `>>` in nested generics
+2. `get_mut` → get + modify + set pattern (7 occurrences)
+3. `Box<Type>`/`Box<Expr>` → `box_type_unbox()`/`box_expr_unbox()` helpers
+4. `var` keyword conflict in `Stmt::For(var, ...)` → renamed to `var_name`
+5. `OptU64` → `OptI64` (matching `Stmt::RegionBlock` signature)
+6. `FStringPart::Str` → `FStringPart::Literal` (corrected to match AST)
+7. `Vec::new()` type inference workaround (typed local variables)
+8. Fixed 4 loop counter bugs (`tii = ti + 1` → `tii = tii + 1`)
+
+**Status:** Compiles to native. Differential testing not yet run.
+
+### SH-8.3 — `lower.fd` (COMPILES — native build)
+
+**Rust:** `src/lower.rs` (6198 LOC) → **Fides:** `compiler/lower.fd` (1547 LOC)
+**Native binary:** 250KB
+
+The lowerer transforms AST → IR: 19 `lower_*` functions handling
+expressions, statements, functions, closures, match, loops, with drop
+calls, region begin/end, and effect tracking.
+
+Key adaptations: HashMap → Vec-based maps, HashSet → Vec with contains(),
+Box<Type>/Box<Expr> → box_* helpers, Option::map/and_then → explicit match,
+Vec::iter().map().collect() → explicit while loops.
+
+**Status:** Compiles to native. Differential testing not yet run.
+
+### Self-Host Module Status (updated)
+
+| Module | Rust LOC | Fides LOC | Native binary | Status |
+|--------|----------|-----------|---------------|--------|
+| `token.fd` | 261 | 554 | — | DONE — builds + tests pass |
+| `diag.fd` | 463 | 659 | — | DONE — builds + tests pass |
+| `json.fd` | 289 | 666 | — | DONE — builds + tests pass |
+| `fmt.fd` | 1165 | 1109 | 90KB | DONE — builds + tests pass |
+| `ast.fd` | 936 | 936 | — | DONE — builds + tests pass |
+| `lexer.fd` | 589 | 731 | 106KB | TESTED (interpreter) — C codegen pending |
+| `parser.fd` | 3433 | 4989 | 384KB | COMPILES (native) — diff testing pending |
+| `ir.fd` | 1761 | 2325 | 152KB | DONE — builds + 25 tests pass |
+| `typechecker.fd` | 7431 | 4813 | 296KB | COMPILES (native) — diff testing pending |
+| `lower.fd` | 6198 | 1547 | 250KB | COMPILES (native) — diff testing pending |
+| **Total** | **22,526** | **18,329** | | **10/10 modules compile** |
+
+### Remaining SH-8 Modules
+
+| Module | Rust LOC | Status |
+|--------|----------|--------|
+| `mono.rs` | 1475 | NOT STARTED |
+| `borrowck.rs` | 1221 | NOT STARTED |
+
+---
+
+## Parser Self-Host Rewrite Complete — SH-7.3 (August 29, 2026)
+
+### Summary
+
+Completed the rewrite of `src/parser.rs` (3433 LOC Rust) as
+`compiler/parser.fd` (4989 LOC Fides). This is the largest self-hosting
+module rewritten to date. The parser compiles to a 384KB native executable
+via `fidesc build` (zero external tools). All SH-6 leaf modules (token,
+diag, json, fmt) are also confirmed done and building.
+
+### New Files
+
+- **`compiler/parser.fd`** (4989 LOC) — Full recursive-descent parser
+  rewritten from `src/parser.rs` (3433 LOC). 91 functions (87 Parser methods
+  + 4 free functions). Handles all expressions, statements, types,
+  declarations, attributes, annotations, f-strings, inline asm, and
+  ML/game-architecture declarations.
+
+### Key Adaptations from Rust to Fides
+
+1. **`Result<T, String>` → `ParseResult<T>`** — Custom enum with `Ok(T)` /
+   `Err(str)` variants (Fides has no `?` operator). Each `parse_*` function
+   uses explicit pattern matching to propagate errors.
+2. **`mut` bindings in match arms** — Fides doesn't support `Ok(mut x)`;
+   refactored to `Ok(x) => { var x = x; ... }`.
+3. **Struct literals in function calls** — Used constructor functions
+   (e.g., `Func_new`, `StructDef_new`) instead of inline struct literals
+   for imported types (Fides parser doesn't recognize struct names from
+   other modules in struct literals inside `push()`/`return`).
+4. **Keyword conflicts** — `var` → `loop_var`/`grad_var`, `guard` →
+   `match_guard` (both are Fides keywords).
+5. **Tuple returns** — Replaced `(BinOp, i64, bool)` with `BinOpInfo` struct
+   (Fides has no storable tuple type).
+6. **`Box<Expr>` dereferencing** — Fides doesn't support `*` on `Box<T>`.
+   Used `match` auto-deref and a `box_expr_deref` helper function.
+7. **`IfExpr.cond`** — Changed from `Box<Expr>` to `Expr` (always unboxed
+   immediately).
+8. **Cross-module import conflict** — `use compiler::lexer` breaks
+   `TokenKind` resolution from `compiler::token` (Fides compiler bug).
+   Lexer import disabled with TODO; f-string sub-lexing temporarily falls
+   back to literal string parts.
+
+### Parser Struct Initialization
+
+`Parser::new` and `Parser::with_names` pre-populate `struct_names` and
+`enum_names` with all known AST types (from `ast.fd`, `lexer.fd`,
+`token.fd`) so `is_struct_name` and `is_enum_name` correctly identify them.
+
+### Self-Host Module Status
+
+| Module | Rust LOC | Fides LOC | Status |
+|--------|----------|-----------|--------|
+| `token.fd` | 261 | 554 | DONE — builds + tests pass |
+| `diag.fd` | 412 | 659 | DONE — builds + tests pass |
+| `json.fd` | 580 | 666 | DONE — builds + tests pass |
+| `fmt.fd` | 890 | 1102 | DONE — builds + tests pass |
+| `ast.fd` | 936 | 936 | DONE — builds + tests pass |
+| `lexer.fd` | 589 | 697 | TESTED (interpreter) — C codegen pending enum-in-Vec fix |
+| `parser.fd` | 3433 | 4989 | COMPILES (native build) — differential testing pending |
+| **Total** | **7101** | **9315** | **7/7 modules rewritten** |
+
+### Known Limitations
+
+- `compiler::lexer` import disabled in `parser.fd` due to cross-module type
+  resolution conflict (Fides compiler bug: importing lexer breaks
+  `TokenKind` from token module).
+- F-string expression interpolation falls back to literal string parts
+  (sub-lexing disabled with the lexer import).
+- Differential testing against `parser.rs` not yet run — needs integration
+  into the `diff-test` pipeline.
+
+### verify-selfhost.sh Updates
+
+- PE emitter backend now uses `fidesc run --backend pe` instead of
+  `fidesc build` + running the binary directly (standalone PE-emitted
+  binaries segfault on complex tests when stdout is redirected —
+  pre-existing PE emitter limitation; in-process execution is reliable).
+
 ## Debugging Infrastructure + Stdlib Gaps Complete (August 28, 2026)
 
 ### Summary

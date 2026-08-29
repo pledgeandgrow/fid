@@ -1,0 +1,731 @@
+// lexer.fd — Fides lexer, SH-7.1 rewrite of src/lexer.rs (589 LOC Rust)
+//
+// Takes a source string and produces a Vec<Token> token stream.
+// Handles: identifiers, keywords, numbers (dec/hex/bin/oct/float), strings,
+// f-strings, raw strings (r"...", r#"..."#), operators, comments (line/block).
+// Tracks line/column for error messages and collects lex errors in a Vec.
+//
+// Scanning model: byte-based via str_byte_at. Column counting is UTF-8-aware
+// (a multi-byte code point counts as one column, matching Rust's Vec<char>
+// lexer). As of the current test corpus all non-ASCII appears only in line
+// comments, so byte/char col tracking coincide; the UTF-8 handling is a
+// safety net for future string-literal content.
+//
+// Dependencies: compiler::token (TokenKind, Token, token_new)
+
+module compiler::lexer;
+
+use vec;
+use core;
+use compiler::token;
+
+// ─── Lexer ────────────────────────────────────────────────────────────────
+
+pub struct Lexer {
+    pub source: str,
+    pub pos: i64,
+    pub line: i64,
+    pub col: i64,
+    /// Collected error messages (instead of printing directly).
+    pub errors: Vec,
+}
+
+impl Lexer {
+    pub fn new(source: str) -> Lexer {
+        return Lexer {
+            source: source,
+            pos: 0,
+            line: 1,
+            col: 1,
+            errors: Vec::new(),
+        };
+    }
+
+    /// Tokenize the entire source. Returns Vec<Token> ending with an Eof token.
+    pub fn tokenize(self: &mut Lexer) -> Vec<Token> {
+        var tokens: Vec<Token> = Vec::new();
+
+        while self.pos < str_len(self.source) {
+            var c: i64 = self.peek();
+
+            if lex_is_whitespace(c) {
+                self.advance();
+            } else if c == 47 && self.peek_at(1) == 47 {
+                // "//" line comment
+                self.skip_line_comment();
+            } else if c == 47 && self.peek_at(1) == 42 {
+                // "/*" block comment
+                self.skip_block_comment();
+            } else if c == 102 && self.peek_at(1) == 34 {
+                // f"..." f-string
+                tokens.push(self.read_fstring());
+            } else if c == 114 && (self.peek_at(1) == 34 || self.peek_at(1) == 35) {
+                // r"..." or r#"..."# raw string
+                tokens.push(self.read_raw_string());
+            } else if lex_is_alpha(c) || c == 95 {
+                // 'a'..'z' | 'A'..'Z' | '_'
+                tokens.push(self.read_identifier_or_keyword());
+            } else if lex_is_digit(c) {
+                tokens.push(self.read_number());
+            } else if c == 34 {
+                // '"'
+                tokens.push(self.read_string());
+            } else {
+                tokens.push(self.read_operator());
+            }
+        }
+
+        tokens.push(token_new(TokenKind::Eof, self.line, self.col));
+        return tokens;
+    }
+
+    /// Peek the current byte, or 0 (NUL) at EOF.
+    fn peek(self: &Lexer) -> i64 {
+        if self.pos >= str_len(self.source) {
+            return 0;
+        }
+        return str_byte_at(self.source, self.pos);
+    }
+
+    /// Peek the byte at `offset` past the current position, or -1 if out of
+    /// bounds. (Rust returns Option<char>; we use -1 as the "None" sentinel.
+    /// Callers compare against specific byte values, never against 0, since 0
+    /// is a valid NUL byte — using -1 avoids a false match at EOF.)
+    fn peek_at(self: &Lexer, offset: i64) -> i64 {
+        var idx: i64 = self.pos + offset;
+        if idx >= str_len(self.source) {
+            return -1;
+        }
+        return str_byte_at(self.source, idx);
+    }
+
+    /// Consume and return the current byte, advancing position and updating
+    /// line/col. Multi-byte UTF-8 sequences count as a single column.
+    fn advance(self: &mut Lexer) -> i64 {
+        var c: i64 = self.peek();
+        self.pos = self.pos + 1;
+        if c == 10 {
+            // '\n'
+            self.line = self.line + 1;
+            self.col = 1;
+        } else if c < 128 {
+            // ASCII (excluding newline, handled above)
+            self.col = self.col + 1;
+        } else {
+            // UTF-8 multi-byte sequence: count as one column.
+            // Skip continuation bytes (0b10xxxxxx == 0x80..0xBF).
+            self.col = self.col + 1;
+            while self.pos < str_len(self.source) {
+                var nb: i64 = str_byte_at(self.source, self.pos);
+                if nb >= 128 && nb < 192 {
+                    // continuation byte 0x80..0xBF
+                    self.pos = self.pos + 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        return c;
+    }
+
+    /// Read the UTF-8 character at the current position as a string,
+    /// advancing past all its bytes. Unlike `byte_to_str(advance())`,
+    /// this captures multi-byte sequences (e.g. em-dash — is 3 bytes).
+    fn read_utf8(self: &mut Lexer) -> str {
+        var c: i64 = self.peek();
+        if c < 128 {
+            // ASCII — single byte
+            return byte_to_str(self.advance());
+        }
+        // Multi-byte UTF-8: determine sequence length from the start byte.
+        //   0xC0..0xDF → 2 bytes
+        //   0xE0..0xEF → 3 bytes
+        //   0xF0..0xF7 → 4 bytes
+        var seqlen: i64 = 2;
+        if c >= 240 { seqlen = 4; }
+        else if c >= 224 { seqlen = 3; }
+        // Capture all bytes of the sequence
+        var s: str = "";
+        var i: i64 = 0;
+        while i < seqlen && self.pos < str_len(self.source) {
+            s = str_concat(s, byte_to_str(str_byte_at(self.source, self.pos)));
+            self.pos = self.pos + 1;
+            i = i + 1;
+        }
+        // Update column (one column per character, regardless of byte count)
+        if c == 10 {
+            self.line = self.line + 1;
+            self.col = 1;
+        } else {
+            self.col = self.col + 1;
+        }
+        return s;
+    }
+
+    fn skip_line_comment(self: &mut Lexer) {
+        while self.pos < str_len(self.source) && self.peek() != 10 {
+            self.advance();
+        }
+    }
+
+    fn skip_block_comment(self: &mut Lexer) {
+        self.advance(); // consume '/'
+        self.advance(); // consume '*'
+        while self.pos < str_len(self.source) {
+            if self.peek() == 42 && self.peek_at(1) == 47 {
+                // "*/"
+                self.advance();
+                self.advance();
+                return;
+            }
+            self.advance();
+        }
+    }
+
+    fn read_identifier_or_keyword(self: &mut Lexer) -> Token {
+        var line: i64 = self.line;
+        var col: i64 = self.col;
+        var s: str = "";
+
+        while self.pos < str_len(self.source) {
+            var c: i64 = self.peek();
+            if lex_is_alphanumeric(c) || c == 95 {
+                s = str_concat(s, byte_to_str(c));
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        var kind: TokenKind = keyword_or_ident(s);
+        return token_new(kind, line, col);
+    }
+
+    fn read_number(self: &mut Lexer) -> Token {
+        var line: i64 = self.line;
+        var col: i64 = self.col;
+        var s: str = "";
+
+        // Hex / binary / octal prefixes
+        if self.peek() == 48 {
+            // '0'
+            var next: i64 = self.peek_at(1);
+            if next == 120 || next == 88 {
+                // 0x / 0X
+                s = str_concat(s, byte_to_str(self.advance())); // 0
+                s = str_concat(s, byte_to_str(self.advance())); // x
+                while self.pos < str_len(self.source) && lex_is_hexdigit(self.peek()) {
+                    s = str_concat(s, byte_to_str(self.advance()));
+                }
+                var val: i64 = str_parse_hex(str_slice(s, 2, str_len(s)));
+                return token_new(TokenKind::IntLit(val), line, col);
+            }
+            if next == 98 || next == 66 {
+                // 0b / 0B
+                s = str_concat(s, byte_to_str(self.advance())); // 0
+                s = str_concat(s, byte_to_str(self.advance())); // b
+                while self.pos < str_len(self.source) && (self.peek() == 48 || self.peek() == 49) {
+                    s = str_concat(s, byte_to_str(self.advance()));
+                }
+                var val: i64 = parse_radix(str_slice(s, 2, str_len(s)), 2);
+                return token_new(TokenKind::IntLit(val), line, col);
+            }
+            if next == 111 || next == 79 {
+                // 0o / 0O
+                s = str_concat(s, byte_to_str(self.advance())); // 0
+                s = str_concat(s, byte_to_str(self.advance())); // o
+                while self.pos < str_len(self.source) && self.peek() >= 48 && self.peek() <= 55 {
+                    s = str_concat(s, byte_to_str(self.advance()));
+                }
+                var val: i64 = parse_radix(str_slice(s, 2, str_len(s)), 8);
+                return token_new(TokenKind::IntLit(val), line, col);
+            }
+        }
+
+        // Decimal integer part (with optional '_' separators)
+        while self.pos < str_len(self.source) && (lex_is_digit(self.peek()) || self.peek() == 95) {
+            if self.peek() != 95 {
+                s = str_concat(s, byte_to_str(self.peek()));
+            }
+            self.advance();
+        }
+
+        // Float: fractional part
+        if self.peek() == 46 && lex_is_digit(self.peek_at(1)) {
+            // '.' followed by digit
+            s = str_concat(s, byte_to_str(self.advance())); // '.'
+            while self.pos < str_len(self.source) && (lex_is_digit(self.peek()) || self.peek() == 95) {
+                if self.peek() != 95 {
+                    s = str_concat(s, byte_to_str(self.peek()));
+                }
+                self.advance();
+            }
+            // Optional exponent e[+-]?digits
+            if self.peek() == 101 || self.peek() == 69 {
+                // 'e' / 'E'
+                s = str_concat(s, byte_to_str(self.advance()));
+                if self.peek() == 43 || self.peek() == 45 {
+                    // '+' / '-'
+                    s = str_concat(s, byte_to_str(self.advance()));
+                }
+                while self.pos < str_len(self.source) && lex_is_digit(self.peek()) {
+                    s = str_concat(s, byte_to_str(self.advance()));
+                }
+            }
+            var val: f64 = str_parse_float(s);
+            return token_new(TokenKind::FloatLit(val), line, col);
+        }
+
+        var val: i64 = str_parse_int(s);
+        return token_new(TokenKind::IntLit(val), line, col);
+    }
+
+    fn read_fstring(self: &mut Lexer) -> Token {
+        var line: i64 = self.line;
+        var col: i64 = self.col;
+        self.advance(); // consume 'f'
+        self.advance(); // consume opening '"'
+
+        var s: str = "";
+        while self.pos < str_len(self.source) && self.peek() != 34 {
+            var c: i64 = self.peek();
+            if c == 92 {
+                // '\'
+                self.advance();
+                var esc: i64 = self.advance();
+                if esc == 110 { s = str_concat(s, "\n"); }       // n
+                else if esc == 116 { s = str_concat(s, "\t"); }  // t
+                else if esc == 114 { s = str_concat(s, "\r"); }  // r
+                else if esc == 92 { s = str_concat(s, "\\"); }   // backslash
+                else if esc == 34 { s = str_concat(s, "\""); }   // '"'
+                else if esc == 48 { s = str_concat(s, byte_to_str(0)); } // NUL
+                else {
+                    self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc)));
+                    s = str_concat(s, byte_to_str(esc));
+                }
+            } else if c == 123 {
+                // '{' — expression interpolation {expr}
+                self.advance(); // consume '{'
+                s = str_concat(s, "{");
+                var depth: i64 = 1;
+                while self.pos < str_len(self.source) && depth > 0 {
+                    var c2: i64 = self.peek();
+                    if c2 == 123 {
+                        depth = depth + 1;
+                        s = str_concat(s, byte_to_str(self.advance()));
+                    } else if c2 == 125 {
+                        // '}'
+                        depth = depth - 1;
+                        if depth == 0 {
+                            self.advance(); // consume '}'
+                            s = str_concat(s, "}");
+                            break;
+                        }
+                        s = str_concat(s, self.read_utf8());
+                    } else {
+                        s = str_concat(s, self.read_utf8());
+                    }
+                }
+            } else {
+                s = str_concat(s, self.read_utf8());
+            }
+        }
+
+        if self.pos < str_len(self.source) {
+            self.advance(); // consume closing '"'
+        } else {
+            self.errors.push(lex_error(line, col, "unterminated f-string"));
+        }
+
+        return token_new(TokenKind::FString(s), line, col);
+    }
+
+    fn read_string(self: &mut Lexer) -> Token {
+        var line: i64 = self.line;
+        var col: i64 = self.col;
+        self.advance(); // consume opening '"'
+
+        var s: str = "";
+        while self.pos < str_len(self.source) && self.peek() != 34 {
+            var c: i64 = self.peek();
+            if c == 92 {
+                // '\'
+                self.advance();
+                var esc: i64 = self.advance();
+                if esc == 110 { s = str_concat(s, "\n"); }       // n
+                else if esc == 116 { s = str_concat(s, "\t"); }  // t
+                else if esc == 114 { s = str_concat(s, "\r"); }  // r
+                else if esc == 92 { s = str_concat(s, "\\"); }   // backslash
+                else if esc == 34 { s = str_concat(s, "\""); }   // '"'
+                else if esc == 48 { s = str_concat(s, byte_to_str(0)); } // NUL
+                else {
+                    self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc)));
+                    s = str_concat(s, byte_to_str(esc));
+                }
+            } else {
+                s = str_concat(s, self.read_utf8());
+            }
+        }
+
+        if self.pos < str_len(self.source) {
+            self.advance(); // consume closing '"'
+        } else {
+            self.errors.push(lex_error(line, col, "unterminated string"));
+        }
+
+        return token_new(TokenKind::StringLit(s), line, col);
+    }
+
+    /// Read a raw string: r"..." or r#"..."# (with N hash signs).
+    /// No escape sequences are processed — content is taken literally.
+    /// The closing delimiter is '"' followed by the same number of '#'.
+    fn read_raw_string(self: &mut Lexer) -> Token {
+        var line: i64 = self.line;
+        var col: i64 = self.col;
+        self.advance(); // consume 'r'
+
+        // Count '#' signs (0 or more)
+        var hash_count: i64 = 0;
+        while self.peek() == 35 {
+            self.advance();
+            hash_count = hash_count + 1;
+        }
+
+        // Expect opening '"'
+        if self.peek() != 34 {
+            self.errors.push(lex_error(line, col, "expected '\"' after r" + repeat_char(35, hash_count)));
+            return token_new(TokenKind::StringLit(""), line, col);
+        }
+        self.advance(); // consume opening '"'
+
+        var s: str = "";
+        // Read until we find '"' followed by exactly hash_count '#' signs
+        while self.pos < str_len(self.source) {
+            if self.peek() == 34 {
+                // Check if this is the closing delimiter
+                var matched: bool = true;
+                var i: i64 = 0;
+                while i < hash_count {
+                    if self.peek_at(1 + i) != 35 {
+                        matched = false;
+                        break;
+                    }
+                    i = i + 1;
+                }
+                if matched {
+                    self.advance(); // consume '"'
+                    var j: i64 = 0;
+                    while j < hash_count {
+                        self.advance(); // consume each '#'
+                        j = j + 1;
+                    }
+                    return token_new(TokenKind::StringLit(s), line, col);
+                }
+            }
+            s = str_concat(s, self.read_utf8());
+        }
+
+        self.errors.push(lex_error(line, col, "unterminated raw string"));
+        return token_new(TokenKind::StringLit(s), line, col);
+    }
+
+    fn read_operator(self: &mut Lexer) -> Token {
+        var line: i64 = self.line;
+        var col: i64 = self.col;
+        var c: i64 = self.advance();
+
+        var kind: TokenKind = TokenKind::Eof;
+
+        if c == 43 {
+            // '+'
+            if self.peek() == 61 { self.advance(); kind = TokenKind::PlusEq; }
+            else { kind = TokenKind::Plus; }
+        } else if c == 45 {
+            // '-'
+            if self.peek() == 62 { self.advance(); kind = TokenKind::Arrow; }       // '->'
+            else if self.peek() == 61 { self.advance(); kind = TokenKind::MinusEq; } // '-='
+            else { kind = TokenKind::Minus; }
+        } else if c == 42 {
+            // '*'
+            if self.peek() == 61 { self.advance(); kind = TokenKind::StarEq; }
+            else { kind = TokenKind::Star; }
+        } else if c == 47 {
+            // '/'
+            if self.peek() == 61 { self.advance(); kind = TokenKind::SlashEq; }
+            else { kind = TokenKind::Slash; }
+        } else if c == 37 {
+            // '%'
+            if self.peek() == 61 { self.advance(); kind = TokenKind::PercentEq; }
+            else { kind = TokenKind::Percent; }
+        } else if c == 61 {
+            // '='
+            if self.peek() == 61 { self.advance(); kind = TokenKind::EqEq; }        // '=='
+            else if self.peek() == 62 { self.advance(); kind = TokenKind::FatArrow; } // '=>'
+            else { kind = TokenKind::Eq; }
+        } else if c == 33 {
+            // '!'
+            if self.peek() == 61 { self.advance(); kind = TokenKind::BangEq; }
+            else { kind = TokenKind::Bang; }
+        } else if c == 60 {
+            // '<'
+            if self.peek() == 61 { self.advance(); kind = TokenKind::LtEq; }       // '<='
+            else if self.peek() == 60 {
+                self.advance(); // consume second '<'
+                if self.peek() == 61 { self.advance(); kind = TokenKind::ShlEq; }  // '<<='
+                else { kind = TokenKind::Shl; }                                    // '<<'
+            } else { kind = TokenKind::Lt; }
+        } else if c == 62 {
+            // '>'
+            if self.peek() == 61 { self.advance(); kind = TokenKind::GtEq; }       // '>='
+            else if self.peek() == 62 {
+                self.advance(); // consume second '>'
+                if self.peek() == 61 { self.advance(); kind = TokenKind::ShrEq; }  // '>>='
+                else { kind = TokenKind::Shr; }                                    // '>>'
+            } else { kind = TokenKind::Gt; }
+        } else if c == 38 {
+            // '&'
+            if self.peek() == 38 { self.advance(); kind = TokenKind::And; }        // '&&'
+            else if self.peek() == 61 { self.advance(); kind = TokenKind::AmpEq; } // '&='
+            else { kind = TokenKind::Ampersand; }
+        } else if c == 124 {
+            // '|'
+            if self.peek() == 124 { self.advance(); kind = TokenKind::Or; }         // '||'
+            else if self.peek() == 62 { self.advance(); kind = TokenKind::PipeArrow; } // '|>'
+            else if self.peek() == 61 { self.advance(); kind = TokenKind::PipeEq; } // '|='
+            else { kind = TokenKind::Pipe; }
+        } else if c == 94 {
+            // '^'
+            if self.peek() == 61 { self.advance(); kind = TokenKind::CaretEq; }
+            else { kind = TokenKind::Caret; }
+        } else if c == 126 {
+            // '~'
+            if self.peek() == 62 { self.advance(); kind = TokenKind::TildeArrow; } // '~>'
+            else { kind = TokenKind::Tilde; }
+        } else if c == 46 {
+            // '.'
+            if self.peek() == 46 {
+                self.advance(); // consume second '.'
+                if self.peek() == 61 { self.advance(); kind = TokenKind::DotDotEq; } // '..='
+                else { kind = TokenKind::DotDot; }                                  // '..'
+            } else { kind = TokenKind::Dot; }
+        } else if c == 35 {
+            // '#'
+            kind = TokenKind::Hash;
+        } else if c == 64 {
+            // '@'
+            kind = TokenKind::At;
+        } else if c == 44 {
+            // ','
+            kind = TokenKind::Comma;
+        } else if c == 58 {
+            // ':'
+            if self.peek() == 58 { self.advance(); kind = TokenKind::DoubleColon; }
+            else { kind = TokenKind::Colon; }
+        } else if c == 59 {
+            // ';'
+            kind = TokenKind::Semicolon;
+        } else if c == 63 {
+            // '?'
+            if self.peek() == 63 { self.advance(); kind = TokenKind::QuestionQuestion; } // '??'
+            else if self.peek() == 46 { self.advance(); kind = TokenKind::QuestionDot; } // '?.'
+            else { kind = TokenKind::Question; }
+        } else if c == 40 {
+            // '('
+            kind = TokenKind::LParen;
+        } else if c == 41 {
+            // ')'
+            kind = TokenKind::RParen;
+        } else if c == 123 {
+            // '{'
+            kind = TokenKind::LBrace;
+        } else if c == 125 {
+            // '}'
+            kind = TokenKind::RBrace;
+        } else if c == 91 {
+            // '['
+            kind = TokenKind::LBracket;
+        } else if c == 93 {
+            // ']'
+            kind = TokenKind::RBracket;
+        } else {
+            self.errors.push(lex_error(line, col, "unexpected character '" + byte_to_str(c) + "'"));
+            kind = TokenKind::Eof;
+        }
+
+        return token_new(kind, line, col);
+    }
+}
+
+// ─── Keyword table ────────────────────────────────────────────────────────
+// Maps an identifier string to its TokenKind, or TokenKind::Ident(s) if it
+// is not a reserved word. Mirrors the `match s.as_str()` block in lexer.rs.
+// Note: "q8" and "q4" are aliases for I8 (quantized 8/4-bit, stored in i8).
+
+pub fn keyword_or_ident(s: str) -> TokenKind {
+    // ── Keywords ──
+    if str_equal(s, "fn") { return TokenKind::Fn; }
+    if str_equal(s, "val") { return TokenKind::Val; }
+    if str_equal(s, "var") { return TokenKind::Var; }
+    if str_equal(s, "mut") { return TokenKind::Mut; }
+    if str_equal(s, "const") { return TokenKind::Const; }
+    if str_equal(s, "given") { return TokenKind::Given; }
+    if str_equal(s, "ensure") { return TokenKind::Ensure; }
+    if str_equal(s, "cap") { return TokenKind::Cap; }
+    if str_equal(s, "type") { return TokenKind::Type; }
+    if str_equal(s, "return") { return TokenKind::Return; }
+    if str_equal(s, "if") { return TokenKind::If; }
+    if str_equal(s, "else") { return TokenKind::Else; }
+    if str_equal(s, "match") { return TokenKind::Match; }
+    if str_equal(s, "select") { return TokenKind::Select; }
+    if str_equal(s, "struct") { return TokenKind::Struct; }
+    if str_equal(s, "enum") { return TokenKind::Enum; }
+    if str_equal(s, "impl") { return TokenKind::Impl; }
+    if str_equal(s, "pub") { return TokenKind::Pub; }
+    if str_equal(s, "use") { return TokenKind::Use; }
+    if str_equal(s, "module") { return TokenKind::Module; }
+    if str_equal(s, "with") { return TokenKind::With; }
+    if str_equal(s, "async") { return TokenKind::Async; }
+    if str_equal(s, "await") { return TokenKind::Await; }
+    if str_equal(s, "comptime") { return TokenKind::Comptime; }
+    if str_equal(s, "defer") { return TokenKind::Defer; }
+    if str_equal(s, "spawn") { return TokenKind::Spawn; }
+    if str_equal(s, "move") { return TokenKind::Move; }
+    if str_equal(s, "static") { return TokenKind::Static; }
+    if str_equal(s, "try") { return TokenKind::Try; }
+    if str_equal(s, "in") { return TokenKind::In; }
+    if str_equal(s, "as") { return TokenKind::As; }
+    if str_equal(s, "dyn") { return TokenKind::Dyn; }
+    if str_equal(s, "where") { return TokenKind::Where; }
+    if str_equal(s, "region") { return TokenKind::Region; }
+    if str_equal(s, "sandbox") { return TokenKind::Sandbox; }
+    if str_equal(s, "unsafe") { return TokenKind::Unsafe; }
+    if str_equal(s, "txn") { return TokenKind::Txn; }
+    if str_equal(s, "persist") { return TokenKind::Persist; }
+    if str_equal(s, "for") { return TokenKind::For; }
+    if str_equal(s, "while") { return TokenKind::While; }
+    if str_equal(s, "loop") { return TokenKind::Loop; }
+    if str_equal(s, "break") { return TokenKind::Break; }
+    if str_equal(s, "continue") { return TokenKind::Continue; }
+    if str_equal(s, "handle") { return TokenKind::Handle; }
+    if str_equal(s, "do") { return TokenKind::Do; }
+    if str_equal(s, "interrupt") { return TokenKind::Interrupt; }
+    if str_equal(s, "extern") { return TokenKind::Extern; }
+    if str_equal(s, "guard") { return TokenKind::Guard; }
+    if str_equal(s, "is") { return TokenKind::Is; }
+    if str_equal(s, "true") { return TokenKind::True; }
+    if str_equal(s, "false") { return TokenKind::False; }
+
+    // ── ML keywords ──
+    if str_equal(s, "layer") { return TokenKind::Layer; }
+    if str_equal(s, "model") { return TokenKind::Model; }
+    if str_equal(s, "grad") { return TokenKind::Grad; }
+    if str_equal(s, "backward") { return TokenKind::Backward; }
+    if str_equal(s, "kernel") { return TokenKind::Kernel; }
+
+    // ── Game architecture keywords ──
+    if str_equal(s, "component") { return TokenKind::Component; }
+    if str_equal(s, "system") { return TokenKind::System; }
+    if str_equal(s, "query") { return TokenKind::Query; }
+    if str_equal(s, "state") { return TokenKind::State; }
+    if str_equal(s, "on") { return TokenKind::On; }
+
+    // ── Type keywords ──
+    // q8/q4 are aliases for I8 (quantized 8/4-bit, stored in i8)
+    if str_equal(s, "q8") { return TokenKind::I8; }
+    if str_equal(s, "q4") { return TokenKind::I8; }
+    if str_equal(s, "i8") { return TokenKind::I8; }
+    if str_equal(s, "i16") { return TokenKind::I16; }
+    if str_equal(s, "i32") { return TokenKind::I32; }
+    if str_equal(s, "i64") { return TokenKind::I64; }
+    if str_equal(s, "i128") { return TokenKind::I128; }
+    if str_equal(s, "u8") { return TokenKind::U8; }
+    if str_equal(s, "u16") { return TokenKind::U16; }
+    if str_equal(s, "u32") { return TokenKind::U32; }
+    if str_equal(s, "u64") { return TokenKind::U64; }
+    if str_equal(s, "u128") { return TokenKind::U128; }
+    if str_equal(s, "f32") { return TokenKind::F32; }
+    if str_equal(s, "f64") { return TokenKind::F64; }
+    if str_equal(s, "bool") { return TokenKind::Bool; }
+    if str_equal(s, "str") { return TokenKind::Str; }
+    if str_equal(s, "void") { return TokenKind::Void; }
+
+    return TokenKind::Ident(s);
+}
+
+// ─── Character classification helpers ─────────────────────────────────────
+// These mirror Rust's char::is_* predicates over ASCII byte values.
+
+fn lex_is_whitespace(c: i64) -> bool {
+    // space, \t, \n, \r, \x0c (form feed), \x0b (vertical tab)
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 12 || c == 11;
+}
+
+fn lex_is_alpha(c: i64) -> bool {
+    // 'a'..'z' | 'A'..'Z'  (Rust's is_alphabetic covers all Unicode; the lexer
+    // only ever sees ASCII identifiers, so ASCII suffices.)
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90);
+}
+
+fn lex_is_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn lex_is_alphanumeric(c: i64) -> bool {
+    return lex_is_alpha(c) || lex_is_digit(c);
+}
+
+fn lex_is_hexdigit(c: i64) -> bool {
+    return (c >= 48 && c <= 57)   // '0'..'9'
+        || (c >= 65 && c <= 70)   // 'A'..'F'
+        || (c >= 97 && c <= 102); // 'a'..'f'
+}
+
+// ─── Number parsing helpers ───────────────────────────────────────────────
+
+/// Parse `s` as an integer in the given radix (2, 8, 10, 16). Returns 0 on
+/// any non-digit. Used for binary/octal literals (str_parse_hex handles 16).
+fn parse_radix(s: str, radix: i64) -> i64 {
+    var result: i64 = 0;
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        var b: i64 = str_byte_at(s, i);
+        var digit: i64 = -1;
+        if b >= 48 && b <= 57 {
+            digit = b - 48;
+        } else if b >= 65 && b <= 90 {
+            digit = b - 55;
+        } else if b >= 97 && b <= 122 {
+            digit = b - 87;
+        } else {
+            break;
+        }
+        if digit >= radix {
+            break;
+        }
+        result = result * radix + digit;
+        i = i + 1;
+    }
+    return result;
+}
+
+// ─── String helpers ───────────────────────────────────────────────────────
+
+/// Build a string by repeating `ch` (given as a byte) `count` times.
+/// Used for the "r###" prefix in raw-string error messages.
+fn repeat_char(ch: i64, count: i64) -> str {
+    var result: str = "";
+    var i: i64 = 0;
+    while i < count {
+        result = str_concat(result, byte_to_str(ch));
+        i = i + 1;
+    }
+    return result;
+}
+
+// ─── Error formatting ─────────────────────────────────────────────────────
+// Matches Rust's `format!("Error:{}:{}: {}", line, col, msg)`.
+
+fn lex_error(line: i64, col: i64, msg: str) -> str {
+    return "Error:" + int_to_str(line) + ":" + int_to_str(col) + ": " + msg;
+}

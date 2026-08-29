@@ -1,0 +1,604 @@
+// SH-8.1: Test for compiler::ir module (rewritten from ir.rs)
+// Tests all IrType variants, Inst variants, IrFunction, IrModule,
+// lower_type, EffectSet, Region, verification, and IR printing.
+//
+// Note: tests are split into separate functions to keep the C codegen
+// main_entry function small enough to avoid stack overflow.
+use core;
+use compiler::ir;
+use compiler::ast;
+
+fn assert_eq(actual: str, expected: str, label: str) -> void {
+    if actual != expected {
+        print("FAIL: ");
+        print(label);
+        print(" — expected '");
+        print(expected);
+        print("', got '");
+        print(actual);
+        print("'\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_eq_i64(actual: i64, expected: i64, label: str) -> void {
+    if actual != expected {
+        print("FAIL: ");
+        print(label);
+        print(" — expected ");
+        print(int_to_str(expected));
+        print(", got ");
+        print(int_to_str(actual));
+        print("\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_true(b: bool, label: str) -> void {
+    if !b {
+        print("FAIL: ");
+        print(label);
+        print(" — expected true\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_false(b: bool, label: str) -> void {
+    if b {
+        print("FAIL: ");
+        print(label);
+        print(" — expected false\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+// ── Test 1: IrType to_str ──
+fn test_ir_type_to_str() -> void {
+    print("Test 1: IrType to_str...\n");
+    assert_eq(ir_type_to_str(IrType::I8), "i8", "I8");
+    assert_eq(ir_type_to_str(IrType::I16), "i16", "I16");
+    assert_eq(ir_type_to_str(IrType::I32), "i32", "I32");
+    assert_eq(ir_type_to_str(IrType::I64), "i64", "I64");
+    assert_eq(ir_type_to_str(IrType::U8), "u8", "U8");
+    assert_eq(ir_type_to_str(IrType::U16), "u16", "U16");
+    assert_eq(ir_type_to_str(IrType::U32), "u32", "U32");
+    assert_eq(ir_type_to_str(IrType::U64), "u64", "U64");
+    assert_eq(ir_type_to_str(IrType::F32), "f32", "F32");
+    assert_eq(ir_type_to_str(IrType::F64), "f64", "F64");
+    assert_eq(ir_type_to_str(IrType::Bool), "bool", "Bool");
+    assert_eq(ir_type_to_str(IrType::Void), "void", "Void");
+    assert_eq(ir_type_to_str(IrType::Never), "never", "Never");
+    assert_eq(ir_type_to_str(IrType::Ptr(Box::new(IrType::U8))), "*u8", "Ptr U8");
+    assert_eq(ir_type_to_str(IrType::Struct("Point")), "struct.Point", "Struct");
+    assert_eq(ir_type_to_str(IrType::Opaque("Vec")), "opaque.Vec", "Opaque");
+    assert_eq(ir_type_to_str(IrType::Array(Box::new(IrType::I64), 10)), "[i64; 10]", "Array");
+}
+
+// ── Test 2: IrType size/align ──
+fn test_ir_type_size_align() -> void {
+    print("Test 2: IrType size/align...\n");
+    assert_eq_i64(ir_type_size(IrType::I8), 1, "I8 size");
+    assert_eq_i64(ir_type_size(IrType::I16), 2, "I16 size");
+    assert_eq_i64(ir_type_size(IrType::I32), 4, "I32 size");
+    assert_eq_i64(ir_type_size(IrType::I64), 8, "I64 size");
+    assert_eq_i64(ir_type_size(IrType::F64), 8, "F64 size");
+    assert_eq_i64(ir_type_size(IrType::Bool), 1, "Bool size");
+    assert_eq_i64(ir_type_size(IrType::Ptr(Box::new(IrType::I64))), 8, "Ptr size");
+    assert_eq_i64(ir_type_size(IrType::Void), 0, "Void size");
+    assert_eq_i64(ir_type_size(IrType::Array(Box::new(IrType::I32), 4)), 16, "Array size");
+    assert_eq_i64(ir_type_align(IrType::I8), 1, "I8 align");
+    assert_eq_i64(ir_type_align(IrType::I32), 4, "I32 align");
+    assert_eq_i64(ir_type_align(IrType::I64), 8, "I64 align");
+    assert_eq_i64(ir_type_align(IrType::Struct("Foo")), 8, "Struct align");
+}
+
+// ── Test 3: IrType classification ──
+fn test_ir_type_class() -> void {
+    print("Test 3: IrType classification...\n");
+    assert_true(ir_type_is_int(IrType::I64), "I64 is_int");
+    assert_true(ir_type_is_int(IrType::Bool), "Bool is_int");
+    assert_false(ir_type_is_int(IrType::F64), "F64 not is_int");
+    assert_true(ir_type_is_float(IrType::F64), "F64 is_float");
+    assert_false(ir_type_is_float(IrType::I64), "I64 not is_float");
+    assert_true(ir_type_is_ptr(IrType::Ptr(Box::new(IrType::I64))), "Ptr is_ptr");
+    assert_true(ir_type_is_ptr_like(IrType::Opaque("Vec")), "Opaque is_ptr_like");
+    assert_true(ir_type_is_ptr_like(IrType::Generic("Vec", Vec::new())), "Generic is_ptr_like");
+    assert_true(ir_type_is_signed(IrType::I64), "I64 is_signed");
+    assert_false(ir_type_is_signed(IrType::U64), "U64 not is_signed");
+    assert_true(ir_type_is_unsigned(IrType::U64), "U64 is_unsigned");
+    assert_true(ir_type_is_numeric(IrType::I64), "I64 is_numeric");
+    assert_true(ir_type_is_numeric(IrType::F64), "F64 is_numeric");
+    assert_true(ir_type_is_scalar(IrType::I64), "I64 is_scalar");
+    assert_true(ir_type_is_scalar(IrType::Bool), "Bool is_scalar");
+    assert_true(ir_type_is_aggregate(IrType::Struct("Foo")), "Struct is_aggregate");
+    assert_true(ir_type_is_aggregate(IrType::Array(Box::new(IrType::I64), 10)), "Array is_aggregate");
+    assert_true(ir_type_is_never(IrType::Never), "Never is_never");
+    assert_true(ir_type_is_void(IrType::Void), "Void is_void");
+}
+
+// ── Test 4: IrType opaque/generic helpers ──
+fn test_ir_type_helpers() -> void {
+    print("Test 4: IrType opaque/generic helpers...\n");
+    assert_true(ir_type_is_opaque_named(IrType::Opaque("Vec"), "Vec"), "Opaque named Vec");
+    assert_true(ir_type_is_opaque_named(IrType::Generic("Vec", Vec::new()), "Vec"), "Generic named Vec");
+    assert_false(ir_type_is_opaque_named(IrType::I64, "Vec"), "I64 not named Vec");
+
+    var vec_args: Vec<IrType> = Vec::new();
+    vec_args.push(IrType::I64);
+    var vec_ty: IrType = IrType::Generic("Vec", vec_args);
+    match ir_type_generic_elem(vec_ty) {
+        OptIrType::Some(t) => { assert_true(ir_type_is_int(t), "Vec elem is int"); }
+        OptIrType::None => { p_panic("FAIL: Vec elem should be Some"); }
+    }
+
+    match ir_type_bit_width(IrType::I8) {
+        OptU64::Some(w) => { assert_eq_i64(w, 8, "I8 bit_width"); }
+        OptU64::None => { p_panic("FAIL: I8 bit_width should be Some"); }
+    }
+    match ir_type_bit_width(IrType::I64) {
+        OptU64::Some(w) => { assert_eq_i64(w, 64, "I64 bit_width"); }
+        OptU64::None => { p_panic("FAIL: I64 bit_width should be Some"); }
+    }
+    match ir_type_bit_width(IrType::F64) {
+        OptU64::Some(w) => { assert_eq_i64(w, 64, "F64 bit_width"); }
+        OptU64::None => { p_panic("FAIL: F64 bit_width should be Some"); }
+    }
+}
+
+// ── Test 5: Effect and EffectSet ──
+fn test_effects() -> void {
+    print("Test 5: Effect and EffectSet...\n");
+    assert_eq(effect_to_str(Effect::Alloc), "alloc", "Alloc str");
+    assert_eq(effect_to_str(Effect::IO), "io", "IO str");
+    assert_eq(effect_to_str(Effect::Read), "read", "Read str");
+    assert_eq(effect_to_str(Effect::Write), "write", "Write str");
+    assert_eq(effect_to_str(Effect::Diverge), "diverge", "Diverge str");
+    assert_eq(effect_to_str(Effect::Diff), "diff", "Diff str");
+
+    var es: EffectSet = EffectSet_new();
+    assert_true(EffectSet_is_pure(&es), "empty is pure");
+    EffectSet_add(&mut es, Effect::IO);
+    EffectSet_add(&mut es, Effect::Write);
+    assert_false(EffectSet_is_pure(&es), "IO+Write not pure");
+    assert_true(EffectSet_contains(&es, Effect::IO), "contains IO");
+    assert_true(EffectSet_contains(&es, Effect::Write), "contains Write");
+    assert_false(EffectSet_contains(&es, Effect::Alloc), "not contains Alloc");
+    assert_true(EffectSet_has_side_effects(&es), "has side effects");
+
+    var es2: EffectSet = EffectSet_new();
+    EffectSet_add(&mut es2, Effect::Read);
+    assert_true(EffectSet_is_read_only(&es2), "read-only");
+    assert_false(EffectSet_has_side_effects(&es2), "read not side effect");
+
+    var es3: EffectSet = EffectSet_new();
+    EffectSet_add_all(&mut es3, &es);
+    assert_true(EffectSet_contains(&es3, Effect::IO), "add_all IO");
+    assert_true(EffectSet_contains(&es3, Effect::Write), "add_all Write");
+
+    var es4: EffectSet = EffectSet_new();
+    assert_eq(EffectSet_to_str(&es4), "pure", "pure str");
+}
+
+// ── Test 6: Region ──
+fn test_region() -> void {
+    print("Test 6: Region...\n");
+    assert_eq(region_to_str(Region::Stack), "stack", "Stack");
+    assert_eq(region_to_str(Region::Heap), "heap", "Heap");
+    assert_eq(region_to_str(Region::Static), "static", "Static");
+    assert_true(region_eq(Region::Stack, Region::Stack), "Stack eq");
+    assert_false(region_eq(Region::Stack, Region::Heap), "Stack!=Heap");
+}
+
+// ── Test 7: Inst result_type ──
+fn test_inst_result_type() -> void {
+    print("Test 7: Inst result_type...\n");
+    assert_eq(ir_type_to_str(inst_result_type(Inst::ConstInt(42, IrType::I64))), "i64", "ConstInt type");
+    assert_eq(ir_type_to_str(inst_result_type(Inst::ConstBool(true))), "bool", "ConstBool type");
+    assert_eq(ir_type_to_str(inst_result_type(Inst::ConstStr("hello"))), "*u8", "ConstStr type");
+    assert_eq(ir_type_to_str(inst_result_type(Inst::BinOp(BinOp::Add, 0, 1, IrType::I64))), "i64", "BinOp type");
+    assert_eq(ir_type_to_str(inst_result_type(Inst::Alloca(IrType::I64, Region::Stack))), "*i64", "Alloca type");
+    assert_eq(ir_type_to_str(inst_result_type(Inst::Load(0, IrType::I32))), "i32", "Load type");
+    assert_eq(ir_type_to_str(inst_result_type(Inst::Store(0, 1, OptIrType::None))), "void", "Store type");
+    assert_eq(ir_type_to_str(inst_result_type(Inst::Jump(1))), "void", "Jump type");
+    assert_eq(ir_type_to_str(inst_result_type(Inst::Return(OptValueId::None))), "void", "Return type");
+    assert_eq(ir_type_to_str(inst_result_type(Inst::Unreachable)), "void", "Unreachable type");
+    assert_eq(ir_type_to_str(inst_result_type(Inst::Call("foo", Vec::new(), IrType::I64, EffectSet_new()))), "i64", "Call type");
+    assert_eq(ir_type_to_str(inst_result_type(Inst::Panic("oops"))), "never", "Panic type");
+    assert_eq(ir_type_to_str(inst_result_type(Inst::GetFieldPtr(0, 0, IrType::I64))), "*i64", "GetFieldPtr type");
+    assert_eq(ir_type_to_str(inst_result_type(Inst::GetElemPtr(0, 1, IrType::I32))), "*i32", "GetElemPtr type");
+}
+
+// ── Test 8: Inst effects ──
+fn test_inst_effects() -> void {
+    print("Test 8: Inst effects...\n");
+    var al: Inst = Inst::Alloca(IrType::I64, Region::Stack);
+    var al_eff: EffectSet = inst_effects(&al);
+    assert_true(EffectSet_contains(&al_eff, Effect::Alloc), "Alloca has Alloc");
+
+    var ld: Inst = Inst::Load(0, IrType::I64);
+    var ld_eff: EffectSet = inst_effects(&ld);
+    assert_true(EffectSet_contains(&ld_eff, Effect::Read), "Load has Read");
+
+    var st: Inst = Inst::Store(0, 1, OptIrType::None);
+    var st_eff: EffectSet = inst_effects(&st);
+    assert_true(EffectSet_contains(&st_eff, Effect::Write), "Store has Write");
+
+    var pr: Inst = Inst::Print(0, IrType::I64);
+    var pr_eff: EffectSet = inst_effects(&pr);
+    assert_true(EffectSet_contains(&pr_eff, Effect::IO), "Print has IO");
+
+    var pn: Inst = Inst::Panic("oops");
+    var pn_eff: EffectSet = inst_effects(&pn);
+    assert_true(EffectSet_contains(&pn_eff, Effect::Diverge), "Panic has Diverge");
+
+    var ci: Inst = Inst::ConstInt(42, IrType::I64);
+    var ci_eff: EffectSet = inst_effects(&ci);
+    assert_true(EffectSet_is_pure(&ci_eff), "ConstInt is pure");
+}
+
+// ── Test 9: Inst kind_name ──
+fn test_inst_kind_name() -> void {
+    print("Test 9: Inst kind_name...\n");
+    assert_eq(inst_kind_name(Inst::ConstInt(0, IrType::I64)), "ConstInt", "ConstInt");
+    assert_eq(inst_kind_name(Inst::ConstBool(true)), "ConstBool", "ConstBool");
+    assert_eq(inst_kind_name(Inst::BinOp(BinOp::Add, 0, 1, IrType::I64)), "BinOp", "BinOp");
+    assert_eq(inst_kind_name(Inst::Alloca(IrType::I64, Region::Stack)), "Alloca", "Alloca");
+    assert_eq(inst_kind_name(Inst::Load(0, IrType::I64)), "Load", "Load");
+    assert_eq(inst_kind_name(Inst::Store(0, 1, OptIrType::None)), "Store", "Store");
+    assert_eq(inst_kind_name(Inst::Jump(0)), "Jump", "Jump");
+    assert_eq(inst_kind_name(Inst::Return(OptValueId::None)), "Return", "Return");
+    assert_eq(inst_kind_name(Inst::Unreachable), "Unreachable", "Unreachable");
+    assert_eq(inst_kind_name(Inst::Call("f", Vec::new(), IrType::I64, EffectSet_new())), "Call", "Call");
+    assert_eq(inst_kind_name(Inst::Panic("x")), "Panic", "Panic");
+    assert_eq(inst_kind_name(Inst::TxnBegin), "TxnBegin", "TxnBegin");
+    assert_eq(inst_kind_name(Inst::TxnEnd), "TxnEnd", "TxnEnd");
+    assert_eq(inst_kind_name(Inst::GradEnd), "GradEnd", "GradEnd");
+}
+
+// ── Test 10: Inst is_terminator ──
+fn test_inst_terminator() -> void {
+    print("Test 10: Inst is_terminator...\n");
+    assert_true(inst_is_terminator(Inst::Jump(0)), "Jump is term");
+    assert_true(inst_is_terminator(Inst::Branch(0, 1, 2)), "Branch is term");
+    assert_true(inst_is_terminator(Inst::Return(OptValueId::None)), "Return is term");
+    assert_true(inst_is_terminator(Inst::Unreachable), "Unreachable is term");
+    assert_true(inst_is_terminator(Inst::Panic("x")), "Panic is term");
+    assert_false(inst_is_terminator(Inst::ConstInt(0, IrType::I64)), "ConstInt not term");
+    assert_false(inst_is_terminator(Inst::Load(0, IrType::I64)), "Load not term");
+}
+
+// ── Test 11: Inst value_refs ──
+fn test_inst_value_refs() -> void {
+    print("Test 11: Inst value_refs...\n");
+    assert_eq_i64(inst_value_refs(Inst::ConstInt(42, IrType::I64)).len(), 0, "ConstInt refs");
+
+    var bo: Inst = Inst::BinOp(BinOp::Add, 5, 10, IrType::I64);
+    var bo_refs: Vec<i64> = inst_value_refs(bo);
+    assert_eq_i64(bo_refs.len(), 2, "BinOp refs count");
+    assert_eq_i64(bo_refs.get(0), 5, "BinOp left");
+    assert_eq_i64(bo_refs.get(1), 10, "BinOp right");
+
+    var ld: Inst = Inst::Load(7, IrType::I64);
+    var ld_refs: Vec<i64> = inst_value_refs(ld);
+    assert_eq_i64(ld_refs.len(), 1, "Load refs count");
+    assert_eq_i64(ld_refs.get(0), 7, "Load ptr");
+
+    var st: Inst = Inst::Store(3, 8, OptIrType::None);
+    var st_refs: Vec<i64> = inst_value_refs(st);
+    assert_eq_i64(st_refs.len(), 2, "Store refs count");
+    assert_eq_i64(st_refs.get(0), 3, "Store ptr");
+    assert_eq_i64(st_refs.get(1), 8, "Store value");
+
+    var br: Inst = Inst::Branch(2, 1, 3);
+    var br_refs: Vec<i64> = inst_value_refs(br);
+    assert_eq_i64(br_refs.len(), 1, "Branch refs count");
+    assert_eq_i64(br_refs.get(0), 2, "Branch cond");
+}
+
+// ── Test 12: lower_type ──
+fn test_lower_type() -> void {
+    print("Test 12: lower_type...\n");
+    assert_eq(ir_type_to_str(lower_type(Type::I64)), "i64", "I64");
+    assert_eq(ir_type_to_str(lower_type(Type::F64)), "f64", "F64");
+    assert_eq(ir_type_to_str(lower_type(Type::Bool)), "bool", "Bool");
+    assert_eq(ir_type_to_str(lower_type(Type::Str)), "*u8", "Str");
+    assert_eq(ir_type_to_str(lower_type(Type::Void)), "void", "Void");
+    assert_eq(ir_type_to_str(lower_type(Type::I128)), "i64", "I128→I64");
+    assert_eq(ir_type_to_str(lower_type(Type::U128)), "u64", "U128→U64");
+    assert_eq(ir_type_to_str(lower_type(Type::Named("Vec"))), "opaque.Vec", "Named Vec");
+    assert_eq(ir_type_to_str(lower_type(Type::Named("HashMap"))), "opaque.HashMap", "Named HashMap");
+    assert_eq(ir_type_to_str(lower_type(Type::Named("Point"))), "struct.Point", "Named Point");
+    assert_eq(ir_type_to_str(lower_type(Type::Infer)), "i64", "Infer→I64");
+    assert_eq(ir_type_to_str(lower_type(Type::Never)), "void", "Never→Void");
+    assert_eq(ir_type_to_str(lower_type(Type::Dyn("Display"))), "opaque.dyn:Display", "Dyn");
+    assert_eq(ir_type_to_str(lower_type(Type::ShapedTensor(Box::new(Type::F64), Vec::new()))), "opaque.Tensor", "ShapedTensor");
+
+    var arr_ty: IrType = lower_type(Type::Array(Box::new(Type::I32), 4));
+    assert_eq(ir_type_to_str(arr_ty), "[i32; 4]", "Array");
+
+    var ref_ty: IrType = lower_type(Type::Ref(Box::new(Type::I64), false));
+    assert_eq(ir_type_to_str(ref_ty), "*i64", "Ref");
+
+    var ptr_ty: IrType = lower_type(Type::RawPtr(Box::new(Type::U8), false));
+    assert_eq(ir_type_to_str(ptr_ty), "*u8", "RawPtr");
+
+    var gen_args: Vec<Type> = Vec::new();
+    gen_args.push(Type::I64);
+    var gen_ty: IrType = lower_type(Type::Generic("Vec", gen_args));
+    assert_eq(ir_type_to_str(gen_ty), "generic.Vec<i64>", "Generic Vec<i64>");
+
+    var fut_args: Vec<Type> = Vec::new();
+    fut_args.push(Type::I64);
+    var fut_ty: IrType = lower_type(Type::Generic("Future", fut_args));
+    assert_eq(ir_type_to_str(fut_ty), "i64", "Future→I64");
+
+    var tup_ty: IrType = lower_type(Type::Tuple(Vec::new()));
+    assert_eq(ir_type_to_str(tup_ty), "opaque.tuple", "Tuple");
+
+    var func_ty: IrType = lower_type(Type::Func(Vec::new(), Box::new(Type::I64)));
+    assert_eq(ir_type_to_str(func_ty), "opaque.func", "Func");
+
+    var assoc_ty: IrType = lower_type(Type::Assoc("T", "Foo", "bar", Vec::new()));
+    assert_eq(ir_type_to_str(assoc_ty), "i64", "Assoc→I64");
+}
+
+// ── Test 13: IrFunction construction ──
+fn test_ir_function() -> void {
+    print("Test 13: IrFunction construction...\n");
+    var func: IrFunction = IrFunction_new("test_fn", IrType::I64);
+    assert_eq(func.name, "test_fn", "name");
+    assert_eq_i64(func.next_value, 0, "next_value starts at 0");
+    assert_eq_i64(func.next_block, 1, "next_block starts at 1");
+    assert_eq_i64(func.entry, 0, "entry is 0");
+    assert_eq_i64(func.blocks.len(), 1, "1 block (entry)");
+    assert_eq(ir_type_to_str(func.ret_ty), "i64", "ret_ty");
+
+    var v0: i64 = IrFunction_emit(&mut func, Inst::ConstInt(42, IrType::I64));
+    assert_eq_i64(v0, 0, "first value id");
+    assert_eq_i64(func.next_value, 1, "next_value after emit");
+
+    var v1: i64 = IrFunction_emit(&mut func, Inst::ConstInt(10, IrType::I64));
+    assert_eq_i64(v1, 1, "second value id");
+
+    var v2: i64 = IrFunction_emit(&mut func, Inst::BinOp(BinOp::Add, v0, v1, IrType::I64));
+    assert_eq_i64(v2, 2, "third value id");
+
+    var v3: i64 = IrFunction_emit(&mut func, Inst::Return(OptValueId::Some(v2)));
+    assert_eq_i64(v3, 3, "return value id");
+
+    var blk: BasicBlock = func.blocks.get(0);
+    assert_eq_i64(blk.instructions.len(), 4, "4 instructions in entry");
+
+    match IrFunction_get_inst(&func, v2) {
+        OptInst::Some(inst) => { assert_eq(inst_kind_name(inst), "BinOp", "get_inst BinOp"); }
+        OptInst::None => { p_panic("FAIL: get_inst should find BinOp"); }
+    }
+    match IrFunction_get_meta(&func, v0) {
+        OptValueMeta::Some(meta) => { assert_eq(ir_type_to_str(meta.ty), "i64", "get_meta type"); }
+        OptValueMeta::None => { p_panic("FAIL: get_meta should find v0"); }
+    }
+
+    IrFunction_bind_local(&mut func, "x", v0);
+    match IrFunction_lookup_local(&func, "x") {
+        OptValueId::Some(id) => { assert_eq_i64(id, 0, "lookup x"); }
+        OptValueId::None => { p_panic("FAIL: lookup x should find"); }
+    }
+    match IrFunction_lookup_local(&func, "y") {
+        OptValueId::Some(_) => { p_panic("FAIL: lookup y should not find"); }
+        OptValueId::None => { print("  OK: lookup y (not found)\n"); }
+    }
+
+    var bb1: i64 = IrFunction_new_block(&mut func);
+    assert_eq_i64(bb1, 1, "second block id");
+    assert_eq_i64(func.next_block, 2, "next_block after new_block");
+    assert_eq_i64(func.blocks.len(), 2, "2 blocks");
+    var param: i64 = IrFunction_add_block_param(&mut func, bb1, IrType::I64);
+    assert_true(param >= 0, "block param id");
+    var blk1: BasicBlock = func.blocks.get(1);
+    assert_eq_i64(blk1.params.len(), 1, "1 param in bb1");
+}
+
+// ── Test 14-16: IrModule construction ──
+fn test_ir_module() -> void {
+    print("Test 14-16: IrModule construction...\n");
+    var mod_: IrModule = IrModule_new();
+    assert_eq_i64(mod_.functions.len(), 0, "no functions");
+    assert_eq_i64(mod_.struct_layouts.len(), 0, "no structs");
+
+    var layout: StructLayout = StructLayout_new("Point");
+    layout.size = 16;
+    layout.align = 8;
+    layout.fields.push(StringIrTypeOffset_new("x", IrType::I64, 0));
+    layout.fields.push(StringIrTypeOffset_new("y", IrType::I64, 8));
+    IrModule_add_struct(&mut mod_, layout);
+
+    match IrModule_get_struct(&mod_, "Point") {
+        OptStructLayout::Some(l) => {
+            assert_eq_i64(l.size, 16, "struct size");
+            assert_eq_i64(l.fields.len(), 2, "struct fields");
+        }
+        OptStructLayout::None => { p_panic("FAIL: get_struct Point"); }
+    }
+    match IrModule_get_struct(&mod_, "Missing") {
+        OptStructLayout::Some(_) => { p_panic("FAIL: get_struct Missing should be None"); }
+        OptStructLayout::None => { print("  OK: get_struct Missing (not found)\n"); }
+    }
+
+    assert_eq_i64(IrModule_type_size(&mod_, IrType::Struct("Point")), 16, "struct type_size");
+    assert_eq_i64(IrModule_type_size(&mod_, IrType::I64), 8, "i64 type_size");
+    assert_eq_i64(IrModule_type_align(&mod_, IrType::Struct("Point")), 8, "struct type_align");
+
+    var s1: str = IrModule_intern_string(&mut mod_, "hello");
+    var s2: str = IrModule_intern_string(&mut mod_, "world");
+    var s3: str = IrModule_intern_string(&mut mod_, "hello");
+    assert_true(str_equal(s1, s3), "intern dedup");
+    assert_false(str_equal(s1, s2), "intern different");
+
+    var params: Vec<IrType> = Vec::new();
+    params.push(IrType::I64);
+    IrModule_add_extern(&mut mod_, "p_print", params, IrType::Void);
+    assert_eq_i64(mod_.extern_functions.len(), 1, "1 extern");
+
+    var fn4: IrFunction = IrFunction_new("main", IrType::I64);
+    IrModule_add_function(&mut mod_, fn4);
+    assert_eq_i64(mod_.functions.len(), 1, "1 function");
+    match IrModule_get_function(&mod_, "main") {
+        OptIrFunction::Some(f) => { assert_eq(f.name, "main", "get_function name"); }
+        OptIrFunction::None => { p_panic("FAIL: get_function main"); }
+    }
+}
+
+// ── Test 17-18: Verification ──
+fn test_verify() -> void {
+    print("Test 17-18: IrModule verification...\n");
+    var mod2: IrModule = IrModule_new();
+    var vfn: IrFunction = IrFunction_new("valid_fn", IrType::I64);
+    var vv0: i64 = IrFunction_emit(&mut vfn, Inst::ConstInt(42, IrType::I64));
+    var vv1: i64 = IrFunction_emit(&mut vfn, Inst::Return(OptValueId::Some(vv0)));
+    IrModule_add_function(&mut mod2, vfn);
+    var result: VerificationResult = IrModule_verify(&mod2);
+    assert_true(VerificationResult_is_valid(&result), "valid function passes");
+    assert_eq_i64(result.errors.len(), 0, "no errors for valid fn");
+
+    var mod3: IrModule = IrModule_new();
+    var nfn: IrFunction = IrFunction_new("no_term", IrType::I64);
+    var nv0: i64 = IrFunction_emit(&mut nfn, Inst::ConstInt(1, IrType::I64));
+    IrModule_add_function(&mut mod3, nfn);
+    var result2: VerificationResult = IrModule_verify(&mod3);
+    assert_false(VerificationResult_is_valid(&result2), "missing terminator fails");
+    assert_true(result2.errors.len() > 0, "has errors");
+}
+
+// ── Test 19-21: BorrowKind, IDs, parse_effect ──
+fn test_misc() -> void {
+    print("Test 19-21: BorrowKind, IDs, parse_effect...\n");
+    assert_true(borrow_kind_eq(BorrowKind::None, BorrowKind::None), "None eq");
+    assert_true(borrow_kind_eq(BorrowKind::Shared, BorrowKind::Shared), "Shared eq");
+    assert_true(borrow_kind_eq(BorrowKind::Mut, BorrowKind::Mut), "Mut eq");
+    assert_false(borrow_kind_eq(BorrowKind::Shared, BorrowKind::Mut), "Shared!=Mut");
+
+    assert_eq(value_id_to_str(0), "%0", "value 0");
+    assert_eq(value_id_to_str(42), "%42", "value 42");
+    assert_eq(block_id_to_str(0), "bb0", "block 0");
+    assert_eq(block_id_to_str(3), "bb3", "block 3");
+
+    match EffectSet_parse_effect("alloc") {
+        OptU64::Some(_) => { print("  OK: parse alloc\n"); }
+        OptU64::None => { p_panic("FAIL: parse alloc"); }
+    }
+    match EffectSet_parse_effect("io") {
+        OptU64::Some(_) => { print("  OK: parse io\n"); }
+        OptU64::None => { p_panic("FAIL: parse io"); }
+    }
+    match EffectSet_parse_effect("unknown") {
+        OptU64::Some(_) => { p_panic("FAIL: parse unknown should fail"); }
+        OptU64::None => { print("  OK: parse unknown (not found)\n"); }
+    }
+}
+
+// ── Test 22: ir_type_eq ──
+fn test_type_eq() -> void {
+    print("Test 22: ir_type_eq...\n");
+    assert_true(ir_type_eq(IrType::I64, IrType::I64), "I64 eq");
+    assert_false(ir_type_eq(IrType::I64, IrType::I32), "I64!=I32");
+    assert_true(ir_type_eq(IrType::Bool, IrType::Bool), "Bool eq");
+    assert_true(ir_type_eq(IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))), "Ptr eq");
+    assert_false(ir_type_eq(IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::I64))), "Ptr!=Ptr diff");
+    assert_true(ir_type_eq(IrType::Struct("Foo"), IrType::Struct("Foo")), "Struct eq");
+    assert_false(ir_type_eq(IrType::Struct("Foo"), IrType::Struct("Bar")), "Struct!=Struct");
+}
+
+// ── Test 23: ir_type_is_compatible_with ──
+fn test_compat() -> void {
+    print("Test 23: ir_type_is_compatible_with...\n");
+    assert_true(ir_type_is_compatible_with(IrType::I64, IrType::I64), "I64 compat");
+    assert_true(ir_type_is_compatible_with(IrType::Opaque("Vec"), IrType::Generic("Vec", Vec::new())), "Opaque/Generic compat");
+    assert_true(ir_type_is_compatible_with(IrType::Generic("Vec", Vec::new()), IrType::Opaque("Vec")), "Generic/Opaque compat");
+    assert_true(ir_type_is_compatible_with(IrType::Ptr(Box::new(IrType::I64)), IrType::Opaque("Foo")), "Ptr/Opaque compat");
+    assert_false(ir_type_is_compatible_with(IrType::I64, IrType::F64), "I64/F64 not compat");
+}
+
+// ── Test 24: collection helpers ──
+fn test_collections() -> void {
+    print("Test 24: collection helpers...\n");
+    var cvec_args: Vec<IrType> = Vec::new();
+    cvec_args.push(IrType::I64);
+    var cvec_ty: IrType = IrType::Generic("Vec", cvec_args);
+    match ir_type_collection_elem(cvec_ty) {
+        OptIrType::Some(t) => { assert_true(ir_type_is_int(t), "Vec elem is int"); }
+        OptIrType::None => { p_panic("FAIL: Vec elem should be Some"); }
+    }
+
+    var map_args: Vec<IrType> = Vec::new();
+    map_args.push(IrType::Str);
+    map_args.push(IrType::I64);
+    var map_ty: IrType = IrType::Generic("HashMap", map_args);
+    match ir_type_map_key_type(map_ty) {
+        OptIrType::Some(_) => { print("  OK: map key type\n"); }
+        OptIrType::None => { p_panic("FAIL: map key should be Some"); }
+    }
+}
+
+// ── Test 25: Full IR module to_str ──
+fn test_module_to_str() -> void {
+    print("Test 25: IrModule to_str...\n");
+    var mod5: IrModule = IrModule_new();
+    var layout5: StructLayout = StructLayout_new("Point");
+    layout5.size = 16;
+    layout5.align = 8;
+    layout5.fields.push(StringIrTypeOffset_new("x", IrType::I64, 0));
+    IrModule_add_struct(&mut mod5, layout5);
+
+    var func5: IrFunction = IrFunction_new("add", IrType::I64);
+    var f5v0: i64 = IrFunction_emit(&mut func5, Inst::ConstInt(1, IrType::I64));
+    var f5v1: i64 = IrFunction_emit(&mut func5, Inst::ConstInt(2, IrType::I64));
+    var f5v2: i64 = IrFunction_emit(&mut func5, Inst::BinOp(BinOp::Add, f5v0, f5v1, IrType::I64));
+    var f5v3: i64 = IrFunction_emit(&mut func5, Inst::Return(OptValueId::Some(f5v2)));
+    IrModule_add_function(&mut mod5, func5);
+
+    var ir_str: str = IrModule_to_str(&mod5);
+    assert_true(str_contains(ir_str, "struct Point"), "has struct Point");
+    assert_true(str_contains(ir_str, "fn add"), "has fn add");
+    assert_true(str_contains(ir_str, "bb0"), "has bb0");
+}
+
+fn main() -> i64 {
+    print("SH-8.1: IR module test\n");
+    print("========================\n\n");
+
+    test_ir_type_to_str();
+    test_ir_type_size_align();
+    test_ir_type_class();
+    test_ir_type_helpers();
+    test_effects();
+    test_region();
+    test_inst_result_type();
+    test_inst_effects();
+    test_inst_kind_name();
+    test_inst_terminator();
+    test_inst_value_refs();
+    test_lower_type();
+    test_ir_function();
+    test_ir_module();
+    test_verify();
+    test_misc();
+    test_type_eq();
+    test_compat();
+    test_collections();
+    test_module_to_str();
+
+    print("\nSH-8.1: All tests passed!\n");
+    return 0;
+}
