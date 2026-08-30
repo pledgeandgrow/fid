@@ -127,7 +127,7 @@ Expected-fail: 36 tests       (tests that verify compiler error detection — fa
 Known-fail:   0 tests         (all previously known-fail tests now pass on all 3 backends)
 Source:       54 .rs files, ~86,200 LOC
 Stdlib:       69 .fd modules, 17,541 LOC
-Self-host:    10 .fd modules, 18,329 LOC (token, diag, json, fmt, ast, lexer, parser, ir, typechecker, lower — all compile)
+Self-host:    15 .fd modules, 37,584 LOC (token, diag, json, fmt, ast, lexer, parser, ir, typechecker, lower, mono, borrowck, pir, opt, codegen_c, compiler — all compile + pass tests; opt.fd has 23/23 passes fully implemented with 30 tests; 23/23 self-host tests pass on all 3 backends)
 Docs:         21 docs/ + 4 root = 25 .md files
 Binaries:     4 (fidesc, pacte, scribe, veil)
 Warnings:     136 (dead code in pe.rs/opt.rs/debugger.rs/wasm.rs/fmt.rs — future feature stubs)

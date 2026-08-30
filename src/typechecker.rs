@@ -88,6 +88,10 @@ pub struct TypeChecker {
     item_modules: HashMap<String, String>,
     /// Track visibility of each item ("func_name" → true if pub)
     item_visibility: HashMap<String, bool>,
+    /// Track functions defined in each module (module_name → set of function names)
+    /// Used to allow each module to access its own private functions even when
+    /// another module registered the same name first.
+    module_functions: HashMap<String, HashSet<String>>,
     /// Field-level visibility: (struct_name, field_name) → is_pub
     /// Private fields are only accessible from within their defining module.
     field_visibility: HashMap<(String, String), bool>,
@@ -188,6 +192,7 @@ impl TypeChecker {
             trait_impl_assoc_bindings: HashMap::new(),
             item_modules: HashMap::new(),
             item_visibility: HashMap::new(),
+            module_functions: HashMap::new(),
             field_visibility: HashMap::new(),
             struct_modules: HashMap::new(),
             current_module: String::new(),
@@ -707,6 +712,9 @@ impl TypeChecker {
 
         for func in &program.funcs {
             let param_types: Vec<Type> = func.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
+            // Track function in this module's function set
+            self.module_functions.entry(module.to_string()).or_insert_with(HashSet::new).insert(func.name.clone());
+            // Always overwrite — last module wins (user module overrides stdlib)
             self.funcs.insert(func.name.clone(), (param_types, self.resolve_type(&func.ret_ty)));
             self.item_modules.insert(func.name.clone(), module.to_string());
             self.item_visibility.insert(func.name.clone(), func.is_pub);
@@ -2988,6 +2996,14 @@ impl TypeChecker {
             if item_module != self.current_module {
                 let is_pub = self.item_visibility.get(name).copied().unwrap_or(false);
                 if !is_pub {
+                    // Check if this function is defined in the current module
+                    // (each module can have its own private copy)
+                    let current_module_funcs = self.module_functions.get(&self.current_module);
+                    if let Some(funcs) = current_module_funcs {
+                        if funcs.contains(name) {
+                            return;  // Allow access to own module's private function
+                        }
+                    }
                     self.errors.push(format!(
                         "Visibility error: '{}' is private to module '{}' (not accessible from '{}')",
                         name, item_module, self.current_module
@@ -5853,7 +5869,22 @@ impl TypeChecker {
                     ty.clone()
                 }
             }
+            Type::Ref { inner, is_mut } => {
+                Type::Ref { inner: Box::new(self.resolve_type(inner)), is_mut: *is_mut }
+            }
+            Type::RawPtr { inner, is_mut } => {
+                Type::RawPtr { inner: Box::new(self.resolve_type(inner)), is_mut: *is_mut }
+            }
+            Type::Array { elem, size } => {
+                Type::Array { elem: Box::new(self.resolve_type(elem)), size: *size }
+            }
             Type::ArrayConst { .. } => ty.clone(),
+            Type::Generic { name, args } => {
+                Type::Generic {
+                    name: name.clone(),
+                    args: args.iter().map(|a| self.resolve_type(a)).collect(),
+                }
+            }
             other => other.clone(),
         }
     }

@@ -2712,13 +2712,389 @@ fn jump_thread_redirect(f: &mut L2Function, pred_id: i64, from_block: i64, to_bl
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Pass: Loop Rotation (stub — disabled in default pass list)
+// Pass: Loop Rotation
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn pass_loop_rotate(module: &mut L2Module) -> i64 {
-    // LoopRotate is disabled in the default pass list because it produces
-    // incorrect code with EffectReorder. Keeping as stub.
-    return 0;
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f_i: L2Function = module.functions.get(i);
+        count = count + loop_rotate_function(&mut f_i);
+        module.functions.set(i, f_i);
+        i = i + 1;
+    }
+    return count;
+}
+
+fn loop_rotate_function(f: &mut L2Function) -> i64 {
+    var count: i64 = 0;
+
+    // Find loop patterns: Header → Branch(cond, Body, Exit); Body → Jump(Header)
+    // We need:
+    //   - Header's terminator is Branch(cond, Body, Exit)
+    //   - Body's terminator is Jump(Header)
+    //   - Body has only one successor (Header)
+    //   - Header has exactly 2 predecessors: the preheader and Body
+
+    var rot_headers: Vec<i64> = Vec::new();
+    var rot_bodies: Vec<i64> = Vec::new();
+    var rot_exits: Vec<i64> = Vec::new();
+
+    var hi: i64 = 0;
+    while hi < f.blocks.len() {
+        var header: L2Block = f.blocks.get(hi);
+        if header.instructions.len() == 0 { hi = hi + 1; continue; }
+
+        // Header's terminator must be a Branch
+        var hterm_vid: i64 = header.instructions.get(header.instructions.len() - 1);
+        var cond_vid: i64 = -1;
+        var body_id: i64 = -1;
+        var exit_id: i64 = -1;
+
+        match L2Function_get_value(f, hterm_vid) {
+            OptL2Inst::Some(hinst) => {
+                match hinst {
+                    L2Inst::Branch(cond, then_b, else_b) => {
+                        cond_vid = cond;
+                        // One target must be a body that jumps back to header
+                        if then_b == f.blocks.get(hi).id {
+                            body_id = else_b;
+                            exit_id = then_b;
+                        } else if else_b == f.blocks.get(hi).id {
+                            body_id = then_b;
+                            exit_id = else_b;
+                        } else if then_b != else_b {
+                            // Check which target jumps back to header
+                            var then_jumps: bool = block_jumps_to(f, then_b, f.blocks.get(hi).id);
+                            var else_jumps: bool = block_jumps_to(f, else_b, f.blocks.get(hi).id);
+                            if then_jumps && !else_jumps {
+                                body_id = then_b;
+                                exit_id = else_b;
+                            } else if else_jumps && !then_jumps {
+                                body_id = else_b;
+                                exit_id = then_b;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            OptL2Inst::None => {}
+        }
+
+        if body_id < 0 { hi = hi + 1; continue; }
+
+        // The body must jump back to the header
+        if !block_jumps_to(f, body_id, f.blocks.get(hi).id) { hi = hi + 1; continue; }
+
+        // The body must have exactly one successor (the header)
+        if !block_has_single_successor(f, body_id, f.blocks.get(hi).id) { hi = hi + 1; continue; }
+
+        // The header must have exactly 2 predecessors: preheader + body
+        if count_predecessors(f, f.blocks.get(hi).id) != 2 { hi = hi + 1; continue; }
+
+        // Don't rotate if the condition references values defined in the body
+        if cond_refs_body(f, cond_vid, f.blocks.get(hi).id, body_id) { hi = hi + 1; continue; }
+
+        rot_headers.push(f.blocks.get(hi).id);
+        rot_bodies.push(body_id);
+        rot_exits.push(exit_id);
+        hi = hi + 1;
+    }
+
+    // Apply rotations
+    var ri: i64 = 0;
+    while ri < rot_headers.len() {
+        count = count + rotate_loop(f, rot_headers.get(ri), rot_bodies.get(ri), rot_exits.get(ri));
+        ri = ri + 1;
+    }
+
+    return count;
+}
+
+/// Check if a block's terminator is a Jump to target_id.
+fn block_jumps_to(f: &L2Function, block_id: i64, target_id: i64) -> bool {
+    var bi: i64 = find_block_idx(f, block_id);
+    if bi < 0 { return false; }
+    var block: L2Block = f.blocks.get(bi);
+    if block.instructions.len() == 0 { return false; }
+    var tv: i64 = block.instructions.get(block.instructions.len() - 1);
+    match L2Function_get_value(f, tv) {
+        OptL2Inst::Some(inst) => {
+            match inst {
+                L2Inst::Jump(target) => { return target == target_id; }
+                _ => { return false; }
+            }
+        }
+        OptL2Inst::None => { return false; }
+    }
+    return false;
+}
+
+/// Count how many blocks jump/branch to target_id.
+fn count_predecessors(f: &L2Function, target_id: i64) -> i64 {
+    var count: i64 = 0;
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        var block: L2Block = f.blocks.get(bi);
+        if block.instructions.len() > 0 {
+            var tv: i64 = block.instructions.get(block.instructions.len() - 1);
+            match L2Function_get_value(f, tv) {
+                OptL2Inst::Some(inst) => {
+                    match inst {
+                        L2Inst::Jump(target) => {
+                            if target == target_id { count = count + 1; }
+                        }
+                        L2Inst::Branch(_, then_b, else_b) => {
+                            if then_b == target_id { count = count + 1; }
+                            if else_b == target_id && then_b != else_b { count = count + 1; }
+                        }
+                        _ => {}
+                    }
+                }
+                OptL2Inst::None => {}
+            }
+        }
+        bi = bi + 1;
+    }
+    return count;
+}
+
+/// Check if a block has exactly one successor, and it's expected.
+fn block_has_single_successor(f: &L2Function, block_id: i64, expected: i64) -> bool {
+    var bi: i64 = find_block_idx(f, block_id);
+    if bi < 0 { return false; }
+    var block: L2Block = f.blocks.get(bi);
+    if block.instructions.len() == 0 { return false; }
+    var tv: i64 = block.instructions.get(block.instructions.len() - 1);
+    match L2Function_get_value(f, tv) {
+        OptL2Inst::Some(inst) => {
+            match inst {
+                L2Inst::Jump(target) => { return target == expected; }
+                L2Inst::Branch(_, then_b, else_b) => { return then_b == expected && else_b == expected; }
+                _ => { return false; }
+            }
+        }
+        OptL2Inst::None => { return false; }
+    }
+    return false;
+}
+
+/// Check if the condition value references any value defined in the body block.
+fn cond_refs_body(f: &L2Function, cond: i64, header_id: i64, body_id: i64) -> bool {
+    var header_bi: i64 = find_block_idx(f, header_id);
+    var body_bi: i64 = find_block_idx(f, body_id);
+    if body_bi < 0 { return true; }  // conservative
+
+    // Collect header and body instruction IDs
+    var header_insts: Vec<i64> = f.blocks.get(header_bi).instructions;
+    var body_insts: Vec<i64> = f.blocks.get(body_bi).instructions;
+
+    // Walk the condition's dependency chain
+    var visited: Vec<i64> = Vec::new();
+    var stack: Vec<i64> = Vec::new();
+    stack.push(cond);
+
+    while stack.len() > 0 {
+        var v: i64 = stack.pop();
+        if i64_vec_contains(visited, v) { continue; }
+        visited.push(v);
+
+        // If v is defined in the body, we can't rotate
+        if i64_vec_contains(body_insts, v) { return true; }
+
+        // Only recurse into header instructions (they're fine — recomputed)
+        if i64_vec_contains(header_insts, v) {
+            match L2Function_get_value(f, v) {
+                OptL2Inst::Some(inst) => {
+                    var refs: Vec<i64> = value_refs(inst);
+                    var ri: i64 = 0;
+                    while ri < refs.len() {
+                        if !i64_vec_contains(visited, refs.get(ri)) {
+                            stack.push(refs.get(ri));
+                        }
+                        ri = ri + 1;
+                    }
+                }
+                OptL2Inst::None => {}
+            }
+        }
+    }
+    return false;
+}
+
+/// Perform the actual loop rotation.
+fn rotate_loop(f: &mut L2Function, header_id: i64, body_id: i64, exit_id: i64) -> i64 {
+    var hi: i64 = find_block_idx(f, header_id);
+    var bi: i64 = find_block_idx(f, body_id);
+    if hi < 0 || bi < 0 { return 0; }
+
+    // Get the header's condition and branch instruction
+    var header: L2Block = f.blocks.get(hi);
+    if header.instructions.len() == 0 { return 0; }
+    var hterm_vid: i64 = header.instructions.get(header.instructions.len() - 1);
+
+    var cond_vid: i64 = -1;
+    match L2Function_get_value(f, hterm_vid) {
+        OptL2Inst::Some(inst) => {
+            match inst {
+                L2Inst::Branch(cond, _, _) => { cond_vid = cond; }
+                _ => { return 0; }
+            }
+        }
+        OptL2Inst::None => { return 0; }
+    }
+    if cond_vid < 0 { return 0; }
+
+    // Collect header instructions that compute the condition (everything except the branch)
+    var header_cond_insts: Vec<i64> = Vec::new();
+    var hci: i64 = 0;
+    while hci < header.instructions.len() - 1 {
+        header_cond_insts.push(header.instructions.get(hci));
+        hci = hci + 1;
+    }
+
+    // Collect body instructions (excluding the back-edge jump)
+    var body: L2Block = f.blocks.get(bi);
+    var body_insts: Vec<i64> = Vec::new();
+    var bii: i64 = 0;
+    while bii < body.instructions.len() {
+        var is_jump: bool = false;
+        match L2Function_get_value(f, body.instructions.get(bii)) {
+            OptL2Inst::Some(inst) => {
+                match inst {
+                    L2Inst::Jump(_) => { is_jump = true; }
+                    _ => {}
+                }
+            }
+            OptL2Inst::None => {}
+        }
+        if !is_jump {
+            body_insts.push(body.instructions.get(bii));
+        }
+        bii = bii + 1;
+    }
+
+    // Create the rotated block
+    var new_block_id: i64 = max_block_id(f) + 1;
+    var next_id: i64 = max_vid(f) + 1;
+
+    // Assign fresh ValueIds for the duplicated header condition instructions
+    var id_map_old: Vec<i64> = Vec::new();
+    var id_map_new: Vec<i64> = Vec::new();
+    hci = 0;
+    while hci < header_cond_insts.len() {
+        id_map_old.push(header_cond_insts.get(hci));
+        id_map_new.push(next_id);
+        next_id = next_id + 1;
+        hci = hci + 1;
+    }
+
+    // Also clone body instructions with fresh ValueIds
+    var body_id_map_old: Vec<i64> = Vec::new();
+    var body_id_map_new: Vec<i64> = Vec::new();
+    bii = 0;
+    while bii < body_insts.len() {
+        body_id_map_old.push(body_insts.get(bii));
+        body_id_map_new.push(next_id);
+        next_id = next_id + 1;
+        bii = bii + 1;
+    }
+
+    // Merge maps: body instructions can reference both header values (remapped
+    // to cloned header values) and body values (remapped to cloned body values)
+    var full_map_old: Vec<i64> = id_map_old;
+    var full_map_new: Vec<i64> = id_map_new;
+    var mi: i64 = 0;
+    while mi < body_id_map_old.len() {
+        full_map_old.push(body_id_map_old.get(mi));
+        full_map_new.push(body_id_map_new.get(mi));
+        mi = mi + 1;
+    }
+
+    var rotated_insts: Vec<i64> = Vec::new();
+
+    // Clone body instructions with fresh ValueIds
+    bii = 0;
+    while bii < body_insts.len() {
+        var orig_vid: i64 = body_insts.get(bii);
+        match L2Function_get_value(f, orig_vid) {
+            OptL2Inst::Some(inst) => {
+                var new_vid: i64 = body_id_map_new.get(bii);
+                var new_inst: L2Inst = clone_inst_remapped(inst, full_map_old, full_map_new);
+                L2Function_set_value(f, new_vid, new_inst);
+                rotated_insts.push(new_vid);
+            }
+            OptL2Inst::None => {}
+        }
+        bii = bii + 1;
+    }
+
+    // Clone header condition instructions with fresh ValueIds
+    hci = 0;
+    while hci < header_cond_insts.len() {
+        var orig_vid: i64 = header_cond_insts.get(hci);
+        match L2Function_get_value(f, orig_vid) {
+            OptL2Inst::Some(inst) => {
+                var new_vid: i64 = id_map_new.get(hci);
+                var new_inst: L2Inst = clone_inst_remapped(inst, id_map_old, id_map_new);
+                L2Function_set_value(f, new_vid, new_inst);
+                rotated_insts.push(new_vid);
+            }
+            OptL2Inst::None => {}
+        }
+        hci = hci + 1;
+    }
+
+    // Create the new branch: br cond2, Rotated, Exit
+    var new_cond: i64 = remap_vid(cond_vid, id_map_old, id_map_new);
+    if new_cond == cond_vid {
+        // cond_vid wasn't in header_cond_insts — use it directly
+        new_cond = cond_vid;
+    }
+    var new_branch_vid: i64 = next_id;
+    next_id = next_id + 1;
+    L2Function_set_value(f, new_branch_vid, L2Inst::Branch(new_cond, new_block_id, exit_id));
+    rotated_insts.push(new_branch_vid);
+
+    // Add the rotated block
+    var rotated_block: L2Block = L2Block_new(new_block_id);
+    rotated_block.instructions = rotated_insts;
+    rotated_block.predecessors.push(header_id);
+    rotated_block.predecessors.push(new_block_id);
+    f.blocks.push(rotated_block);
+
+    // Redirect the header's branch to jump to Rotated instead of Body
+    match L2Function_get_value(f, hterm_vid) {
+        OptL2Inst::Some(inst) => {
+            match inst {
+                L2Inst::Branch(cond, then_b, else_b) => {
+                    if then_b == body_id {
+                        L2Function_set_value(f, hterm_vid, L2Inst::Branch(cond, new_block_id, else_b));
+                    } else if else_b == body_id {
+                        L2Function_set_value(f, hterm_vid, L2Inst::Branch(cond, then_b, new_block_id));
+                    }
+                }
+                _ => {}
+            }
+        }
+        OptL2Inst::None => {}
+    }
+
+    // The old body block is now unreachable — will be cleaned up by DCE
+    return 1;
+}
+
+/// Find the maximum block ID in a function
+fn max_block_id(f: &L2Function) -> i64 {
+    var max: i64 = 0;
+    var i: i64 = 0;
+    while i < f.blocks.len() {
+        if f.blocks.get(i).id > max { max = f.blocks.get(i).id; }
+        i = i + 1;
+    }
+    return max;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4768,13 +5144,313 @@ fn eval_builtin(name: str, args: Vec<i64>) -> OptI64 {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Pass: SLP Vectorization (stub — complex, needs SIMD analysis)
+// Pass: SLP Vectorization (Superword-Level Parallelism)
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn pass_slp_vectorize(module: &mut L2Module) -> i64 {
-    // SLP (Superword-Level Parallelism) vectorization combines adjacent
-    // scalar operations into SIMD operations. Stub for now.
-    return 0;
+    var count: i64 = 0;
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var f: L2Function = module.functions.get(fi);
+        count = count + slp_vectorize_function(&mut f);
+        module.functions.set(fi, f);
+        fi = fi + 1;
+    }
+    return count;
+}
+
+fn slp_vectorize_function(f: &mut L2Function) -> i64 {
+    var count: i64 = 0;
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        count = count + slp_vectorize_block(f, bi);
+        bi = bi + 1;
+    }
+    return count;
+}
+
+fn slp_vectorize_block(f: &mut L2Function, bi: i64) -> i64 {
+    var count: i64 = 0;
+    var block: L2Block = f.blocks.get(bi);
+    var insts: Vec<i64> = block.instructions;
+    var next_id: i64 = max_vid(f) + 1;
+
+    // Collect (gep_vid, array_ptr, index_value, load_vid) tuples for F64 loads.
+    var f64_load_geps: Vec<i64> = Vec::new();
+    var f64_load_arrs: Vec<i64> = Vec::new();
+    var f64_load_idxs: Vec<i64> = Vec::new();
+    var f64_load_vids: Vec<i64> = Vec::new();
+
+    var ii: i64 = 0;
+    while ii < insts.len() {
+        match L2Function_get_value(f, insts.get(ii)) {
+            OptL2Inst::Some(inst) => {
+                match inst {
+                    L2Inst::Load(ptr, ty) => {
+                        match ty {
+                            IrType::F64 => {
+                                match L2Function_get_value(f, ptr) {
+                                    OptL2Inst::Some(gep_inst) => {
+                                        match gep_inst {
+                                            L2Inst::GetElemPtr(array_ptr, index, _) => {
+                                                match L2Function_get_value(f, index) {
+                                                    OptL2Inst::Some(idx_inst) => {
+                                                        match idx_inst {
+                                                            L2Inst::ConstInt(idx_val, _) => {
+                                                                f64_load_geps.push(ptr);
+                                                                f64_load_arrs.push(array_ptr);
+                                                                f64_load_idxs.push(idx_val);
+                                                                f64_load_vids.push(insts.get(ii));
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                    OptL2Inst::None => {}
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    OptL2Inst::None => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            OptL2Inst::None => {}
+        }
+        ii = ii + 1;
+    }
+
+    // Find pairs of consecutive loads from the same array
+    var pair_is: Vec<i64> = Vec::new();
+    var pair_js: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < f64_load_idxs.len() {
+        var j: i64 = i + 1;
+        while j < f64_load_idxs.len() {
+            if f64_load_arrs.get(i) == f64_load_arrs.get(j) && f64_load_idxs.get(j) == f64_load_idxs.get(i) + 1 {
+                pair_is.push(i);
+                pair_js.push(j);
+                break;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    if pair_is.len() == 0 { return 0; }
+
+    // For each load pair, create a p_simd_load call
+    var load_to_simd_keys: Vec<i64> = Vec::new();
+    var load_to_simd_vals: Vec<i64> = Vec::new();
+
+    var pi: i64 = 0;
+    while pi < pair_is.len() {
+        var i_idx: i64 = pair_is.get(pi);
+        var j_idx: i64 = pair_js.get(pi);
+        var gep_i: i64 = f64_load_geps.get(i_idx);
+        var load_i: i64 = f64_load_vids.get(i_idx);
+        var load_j: i64 = f64_load_vids.get(j_idx);
+
+        var simd_load_vid: i64 = next_id;
+        next_id = next_id + 1;
+        L2Function_set_value(f, simd_load_vid, L2Inst::Call("p_simd_load", c_vec1_i64(gep_i), IrType::F64));
+
+        load_to_simd_keys.push(load_i);
+        load_to_simd_vals.push(simd_load_vid);
+        load_to_simd_keys.push(load_j);
+        load_to_simd_vals.push(simd_load_vid);
+        count = count + 1;
+        pi = pi + 1;
+    }
+
+    // Find pairs of BinOps that use the paired loads and replace with p_simd_*
+    // Collect F64 BinOps
+    var binop_vids: Vec<i64> = Vec::new();
+    var binop_ops: Vec<BinOp> = Vec::new();
+    var binop_lefts: Vec<i64> = Vec::new();
+    var binop_rights: Vec<i64> = Vec::new();
+
+    ii = 0;
+    while ii < insts.len() {
+        match L2Function_get_value(f, insts.get(ii)) {
+            OptL2Inst::Some(inst) => {
+                match inst {
+                    L2Inst::BinOp(op, left, right, ty) => {
+                        match ty {
+                            IrType::F64 => {
+                                binop_vids.push(insts.get(ii));
+                                binop_ops.push(op);
+                                binop_lefts.push(left);
+                                binop_rights.push(right);
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            OptL2Inst::None => {}
+        }
+        ii = ii + 1;
+    }
+
+    var binop_to_simd_keys: Vec<i64> = Vec::new();
+    var binop_to_simd_vals: Vec<i64> = Vec::new();
+
+    i = 0;
+    while i < binop_vids.len() {
+        var j: i64 = i + 1;
+        while j < binop_vids.len() {
+            if binop_eq(binop_ops.get(i), binop_ops.get(j)) {
+                var li_simd: i64 = slp_lookup(load_to_simd_keys, load_to_simd_vals, binop_lefts.get(i));
+                var lj_simd: i64 = slp_lookup(load_to_simd_keys, load_to_simd_vals, binop_lefts.get(j));
+                var ri_simd: i64 = slp_lookup(load_to_simd_keys, load_to_simd_vals, binop_rights.get(i));
+                var rj_simd: i64 = slp_lookup(load_to_simd_keys, load_to_simd_vals, binop_rights.get(j));
+                if li_simd >= 0 && lj_simd >= 0 && ri_simd >= 0 && rj_simd >= 0 {
+                    if li_simd == lj_simd && ri_simd == rj_simd {
+                        var simd_name: str = slp_binop_to_simd(binop_ops.get(i));
+                        if str_len(simd_name) > 0 {
+                            var simd_vid: i64 = next_id;
+                            next_id = next_id + 1;
+                            var simd_args: Vec<i64> = Vec::new();
+                            simd_args.push(li_simd);
+                            simd_args.push(ri_simd);
+                            L2Function_set_value(f, simd_vid, L2Inst::Call(simd_name, simd_args, IrType::F64));
+                            binop_to_simd_keys.push(binop_vids.get(i));
+                            binop_to_simd_vals.push(simd_vid);
+                            binop_to_simd_keys.push(binop_vids.get(j));
+                            binop_to_simd_vals.push(simd_vid);
+                            count = count + 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    // Find pairs of Stores to consecutive array elements and replace with p_simd_store
+    var f64_store_geps: Vec<i64> = Vec::new();
+    var f64_store_arrs: Vec<i64> = Vec::new();
+    var f64_store_idxs: Vec<i64> = Vec::new();
+    var f64_store_vals: Vec<i64> = Vec::new();
+
+    ii = 0;
+    while ii < insts.len() {
+        match L2Function_get_value(f, insts.get(ii)) {
+            OptL2Inst::Some(inst) => {
+                match inst {
+                    L2Inst::Store(ptr, value, _) => {
+                        match L2Function_get_value(f, ptr) {
+                            OptL2Inst::Some(gep_inst) => {
+                                match gep_inst {
+                                    L2Inst::GetElemPtr(array_ptr, index, _) => {
+                                        match L2Function_get_value(f, index) {
+                                            OptL2Inst::Some(idx_inst) => {
+                                                match idx_inst {
+                                                    L2Inst::ConstInt(idx_val, _) => {
+                                                        f64_store_geps.push(ptr);
+                                                        f64_store_arrs.push(array_ptr);
+                                                        f64_store_idxs.push(idx_val);
+                                                        f64_store_vals.push(value);
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            OptL2Inst::None => {}
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            OptL2Inst::None => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            OptL2Inst::None => {}
+        }
+        ii = ii + 1;
+    }
+
+    i = 0;
+    while i < f64_store_idxs.len() {
+        var j: i64 = i + 1;
+        while j < f64_store_idxs.len() {
+            if f64_store_arrs.get(i) == f64_store_arrs.get(j) && f64_store_idxs.get(j) == f64_store_idxs.get(i) + 1 {
+                var vi_simd: i64 = slp_lookup(binop_to_simd_keys, binop_to_simd_vals, f64_store_vals.get(i));
+                var vj_simd: i64 = slp_lookup(binop_to_simd_keys, binop_to_simd_vals, f64_store_vals.get(j));
+                if vi_simd >= 0 && vj_simd >= 0 && vi_simd == vj_simd {
+                    var simd_store_vid: i64 = next_id;
+                    next_id = next_id + 1;
+                    var store_args: Vec<i64> = Vec::new();
+                    store_args.push(f64_store_geps.get(i));
+                    store_args.push(vi_simd);
+                    L2Function_set_value(f, simd_store_vid, L2Inst::Call("p_simd_store", store_args, IrType::Void));
+                    count = count + 1;
+                    break;
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return count;
+}
+
+/// Look up a key in a parallel key/val array. Returns -1 if not found.
+fn slp_lookup(keys: Vec<i64>, vals: Vec<i64>, key: i64) -> i64 {
+    var i: i64 = 0;
+    while i < keys.len() {
+        if keys.get(i) == key { return vals.get(i); }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Map a BinOp to its SIMD function name. Returns "" if not supported.
+fn slp_binop_to_simd(op: BinOp) -> str {
+    match op {
+        BinOp::Add => { return "p_simd_add"; }
+        BinOp::Sub => { return "p_simd_sub"; }
+        BinOp::Mul => { return "p_simd_mul"; }
+        BinOp::Div => { return "p_simd_div"; }
+    }
+    return "";
+}
+
+/// Check if two BinOps are equal.
+fn binop_eq(a: BinOp, b: BinOp) -> bool {
+    match a {
+        BinOp::Add => { match b { BinOp::Add => { return true; }, _ => { return false; } } }
+        BinOp::Sub => { match b { BinOp::Sub => { return true; }, _ => { return false; } } }
+        BinOp::Mul => { match b { BinOp::Mul => { return true; }, _ => { return false; } } }
+        BinOp::Div => { match b { BinOp::Div => { return true; }, _ => { return false; } } }
+        BinOp::Mod => { match b { BinOp::Mod => { return true; }, _ => { return false; } } }
+        BinOp::Eq => { match b { BinOp::Eq => { return true; }, _ => { return false; } } }
+        BinOp::Ne => { match b { BinOp::Ne => { return true; }, _ => { return false; } } }
+        BinOp::Lt => { match b { BinOp::Lt => { return true; }, _ => { return false; } } }
+        BinOp::Le => { match b { BinOp::Le => { return true; }, _ => { return false; } } }
+        BinOp::Gt => { match b { BinOp::Gt => { return true; }, _ => { return false; } } }
+        BinOp::Ge => { match b { BinOp::Ge => { return true; }, _ => { return false; } } }
+        BinOp::And => { match b { BinOp::And => { return true; }, _ => { return false; } } }
+        BinOp::Or => { match b { BinOp::Or => { return true; }, _ => { return false; } } }
+        BinOp::BitAnd => { match b { BinOp::BitAnd => { return true; }, _ => { return false; } } }
+        BinOp::BitOr => { match b { BinOp::BitOr => { return true; }, _ => { return false; } } }
+        BinOp::BitXor => { match b { BinOp::BitXor => { return true; }, _ => { return false; } } }
+        BinOp::Shl => { match b { BinOp::Shl => { return true; }, _ => { return false; } } }
+        BinOp::Shr => { match b { BinOp::Shr => { return true; }, _ => { return false; } } }
+    }
+    return false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5092,24 +5768,21 @@ fn effect_optimize_function(f: &mut L2Function, pure_funcs: Vec<str>, hoistable_
     while vi2 < f.values.len() {
         var vid: i64 = f.values.get(vi2).id;
         var inst: L2Inst = f.values.get(vi2).inst;
-        var matched: bool = false;
-        var fname: str = "";
         match inst {
-            L2Inst::Call(func, _, _) => { fname = func; matched = true; }
-            _ => {}
-        }
-        if matched {
-            var is_pure: bool = str_vec_contains(pure_funcs, fname) || is_known_pure_func(fname);
-            if is_pure {
-                // Check if vid is used
-                var is_used: bool = false;
-                var ui: i64 = 0;
-                while ui < used.len() {
-                    if used.get(ui) == vid { is_used = true; }
-                    ui = ui + 1;
+            L2Inst::Call(fname, _, _) => {
+                var is_pure: bool = str_vec_contains(pure_funcs, fname) || is_known_pure_func(fname);
+                if is_pure {
+                    // Check if vid is used
+                    var is_used: bool = false;
+                    var ui: i64 = 0;
+                    while ui < used.len() {
+                        if used.get(ui) == vid { is_used = true; }
+                        ui = ui + 1;
+                    }
+                    if !is_used { dead_calls.push(vid); }
                 }
-                if !is_used { dead_calls.push(vid); }
             }
+            _ => {}
         }
         vi2 = vi2 + 1;
     }
@@ -5369,13 +6042,250 @@ fn effect_optimize_function(f: &mut L2Function, pure_funcs: Vec<str>, hoistable_
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Pass: Region Pool (stub — emits p_region_free before returns)
+// Pass: Region Pool (I-1C — emit p_region_free before returns)
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn pass_region_pool(module: &mut L2Module) -> i64 {
-    // Region pool optimization emits p_region_free calls before returns
-    // to bulk-free named memory regions. Stub for now.
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f_i: L2Function = module.functions.get(i);
+        count = count + region_pool_function(&mut f_i, module.struct_layouts);
+        module.functions.set(i, f_i);
+        i = i + 1;
+    }
+    return count;
+}
+
+fn region_pool_function(f: &mut L2Function, struct_layouts: Vec<StructLayoutEntry>) -> i64 {
+    // Collect all Alloca instructions with MemRegion::Named, grouped by region name.
+    // Format: (region_name, Vec<(vid, size)>)
+    var region_names: Vec<str> = Vec::new();
+    var region_allocs: Vec<I64PairList> = Vec::new();  // per region: list of (vid, size)
+
+    var vi: i64 = 0;
+    while vi < f.values.len() {
+        match f.values.get(vi).inst {
+            L2Inst::Alloca(ty, mem_region) => {
+                match mem_region {
+                    MemRegion::Named(name) => {
+                        var size: i64 = region_pool_type_size(ty, struct_layouts);
+                        if size < 1 { size = 1; }
+                        // Find or create region entry
+                        var found: bool = false;
+                        var ri: i64 = 0;
+                        while ri < region_names.len() {
+                            if str_equal(region_names.get(ri), name) {
+                                region_allocs.get(ri).items.push(I64Pair_new(f.values.get(vi).id, size));
+                                found = true;
+                            }
+                            ri = ri + 1;
+                        }
+                        if !found {
+                            region_names.push(name);
+                            var new_list: I64PairList = I64PairList_new();
+                            new_list.items.push(I64Pair_new(f.values.get(vi).id, size));
+                            region_allocs.push(new_list);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        vi = vi + 1;
+    }
+
+    if region_names.len() == 0 { return 0; }
+
+    var count: i64 = 0;
+    var next_vid: i64 = max_vid(f) + 1;
+
+    // Only pool-allocate regions that are too large for the stack (> 4KB).
+    var STACK_LIMIT: i64 = 4096;
+
+    var ri2: i64 = 0;
+    while ri2 < region_names.len() {
+        var allocs: I64PairList = region_allocs.get(ri2);
+        if allocs.items.len() < 2 { ri2 = ri2 + 1; continue; }
+
+        // Compute total pool size (8-byte aligned slots)
+        var total_size: i64 = 0;
+        var offsets: I64PairList = I64PairList_new();
+        var ai: i64 = 0;
+        while ai < allocs.items.len() {
+            var sz: i64 = allocs.items.get(ai).val;
+            var aligned: i64 = (sz + 7) & ~7;
+            offsets.items.push(I64Pair_new(allocs.items.get(ai).key, total_size));
+            total_size = total_size + aligned;
+            ai = ai + 1;
+        }
+
+        // Skip if the region fits on the stack — stack allocation is free
+        if total_size <= STACK_LIMIT { ri2 = ri2 + 1; continue; }
+
+        // Create the pool allocation: %pool = call p_alloc(total_size)
+        var size_vid: i64 = next_vid;
+        next_vid = next_vid + 1;
+        var pool_vid: i64 = next_vid;
+        next_vid = next_vid + 1;
+
+        L2Function_set_value(f, size_vid, L2Inst::ConstInt(total_size, IrType::I64));
+        L2Function_set_value(f, pool_vid, L2Inst::Call("p_alloc", c_vec1_i64(size_vid), IrType::Ptr(Box::new(IrType::I64))));
+
+        // Insert the pool call + size const at the start of the entry block
+        var entry_idx: i64 = find_block_idx(f, f.entry);
+        if entry_idx < 0 { entry_idx = 0; }
+        f.blocks.get(entry_idx).instructions = vec_insert_front2(
+            f.blocks.get(entry_idx).instructions, size_vid, pool_vid
+        );
+
+        // Replace each Alloca with: %addr = BinOp(Add, %pool, offset_const)
+        var oi: i64 = 0;
+        while oi < offsets.items.len() {
+            var orig_vid: i64 = offsets.items.get(oi).key;
+            var offset: i64 = offsets.items.get(oi).val;
+            var offset_vid: i64 = next_vid;
+            next_vid = next_vid + 1;
+
+            L2Function_set_value(f, offset_vid, L2Inst::ConstInt(offset, IrType::I64));
+            L2Function_set_value(f, orig_vid, L2Inst::BinOp(BinOp::Add, pool_vid, offset_vid, IrType::Ptr(Box::new(IrType::I64))));
+
+            // Insert the offset const before the BinOp in the block
+            var bi: i64 = 0;
+            while bi < f.blocks.len() {
+                var pos: i64 = vec_find_i64(f.blocks.get(bi).instructions, orig_vid);
+                if pos >= 0 {
+                    f.blocks.get(bi).instructions = vec_insert_at(f.blocks.get(bi).instructions, pos, offset_vid);
+                    break;
+                }
+                bi = bi + 1;
+            }
+            count = count + 1;
+            oi = oi + 1;
+        }
+
+        // I-1C: Region Bulk Free — emit p_region_free(pool_vid) before every
+        // Return instruction in the function.
+        var free_vid: i64 = next_vid;
+        next_vid = next_vid + 1;
+        L2Function_set_value(f, free_vid, L2Inst::Call("p_region_free", c_vec1_i64(pool_vid), IrType::Void));
+
+        // Insert p_region_free before every Return instruction
+        var bi2: i64 = 0;
+        while bi2 < f.blocks.len() {
+            var ret_pos: i64 = vec_find_ret(f, f.blocks.get(bi2).instructions);
+            if ret_pos >= 0 {
+                f.blocks.get(bi2).instructions = vec_insert_at(f.blocks.get(bi2).instructions, ret_pos, free_vid);
+            }
+            bi2 = bi2 + 1;
+        }
+
+        ri2 = ri2 + 1;
+    }
+
+    return count;
+}
+
+/// Compute the size of an IrType, using struct layouts from the module.
+fn region_pool_type_size(ty: IrType, struct_layouts: Vec<StructLayoutEntry>) -> i64 {
+    match ty {
+        IrType::Struct(name) => {
+            var i: i64 = 0;
+            while i < struct_layouts.len() {
+                if str_equal(struct_layouts.get(i).name, name) {
+                    return struct_layouts.get(i).layout.size;
+                }
+                i = i + 1;
+            }
+            return 0;
+        }
+        _ => { return ir_type_size(ty); }
+    }
     return 0;
+}
+
+// ─── Helpers for region_pool ─────────────────────────────────────────────
+
+struct I64Pair {
+    key: i64,
+    val: i64,
+}
+
+fn I64Pair_new(key: i64, val: i64) -> I64Pair {
+    return I64Pair { key: key, val: val };
+}
+
+/// Wrapper for Vec<I64Pair> to avoid Vec<Vec<...>> parse issues
+struct I64PairList {
+    items: Vec<I64Pair>,
+}
+
+fn I64PairList_new() -> I64PairList {
+    return I64PairList { items: Vec::new() };
+}
+
+// Vec<I64Pair> is used directly (no type alias needed)
+
+/// Create a Vec with one i64 element.
+fn c_vec1_i64(v: i64) -> Vec<i64> {
+    var result: Vec<i64> = Vec::new();
+    result.push(v);
+    return result;
+}
+
+/// Insert an element at a specific position in a Vec.
+fn vec_insert_at(v: Vec<i64>, pos: i64, elem: i64) -> Vec<i64> {
+    var result: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        if i == pos { result.push(elem); }
+        result.push(v.get(i));
+        i = i + 1;
+    }
+    if pos >= v.len() { result.push(elem); }
+    return result;
+}
+
+/// Insert two elements at the front of a Vec.
+fn vec_insert_front2(v: Vec<i64>, elem1: i64, elem2: i64) -> Vec<i64> {
+    var result: Vec<i64> = Vec::new();
+    result.push(elem1);
+    result.push(elem2);
+    var i: i64 = 0;
+    while i < v.len() {
+        result.push(v.get(i));
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Find the position of a value in a Vec.
+fn vec_find_i64(v: Vec<i64>, target: i64) -> i64 {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == target { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Find the position of the first Return instruction in a block's instruction list.
+fn vec_find_ret(f: &L2Function, insts: Vec<i64>) -> i64 {
+    var i: i64 = 0;
+    while i < insts.len() {
+        match L2Function_get_value(f, insts.get(i)) {
+            OptL2Inst::Some(inst) => {
+                match inst {
+                    L2Inst::Return(_) => { return i; }
+                    _ => {}
+                }
+            }
+            OptL2Inst::None => {}
+        }
+        i = i + 1;
+    }
+    return -1;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

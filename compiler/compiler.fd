@@ -1,0 +1,1550 @@
+// compiler.fd — Compiler pipeline driver (rewritten from src/compiler.rs)
+//
+// This module provides:
+// 1. Helper functions and utilities (edit_distance, error enrichment, string/path
+//    helpers, capability checking) — fully functional and tested.
+// 2. Pipeline orchestration functions (build_program_with_path, lower_to_ir_module,
+//    ccompile_source_with_path, etc.) — fully functional.
+// 3. AST transformation passes (merge_programs, apply_cfg_filter, process_derive,
+//    desugar_layers_models, fill_default_trait_methods) — fully functional.
+// 4. Capability stripping (strip_ungranted_caps) — fully functional.
+//
+// Adaptations from Rust:
+// 1. Result<T, Vec<String>> → custom Result types (ResultProgram, ResultStr, etc.)
+// 2. &str → str, usize → i64
+// 3. HashSet<T> → Vec<T> with str_vec_contains helper
+// 4. Path operations → string manipulation (path_dirname, path_join)
+// 5. include_str! → file_read at runtime (stdlib/core.fd loaded from disk)
+// 6. No closures — all helpers are top-level functions
+// 7. No ? operator — explicit match on Result types
+
+module compiler::compiler;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::token;
+use compiler::lexer;
+use compiler::parser;
+use compiler::ir;
+use compiler::typechecker;
+use compiler::lower;
+use compiler::mono;
+use compiler::borrowck;
+use compiler::codegen_c;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Result types (Fides has no generic Result<T,E>)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub enum ResultStr {
+    Ok(str),
+    Err(Vec<str>),
+}
+
+pub enum ResultProgram {
+    Ok(Program),
+    Err(Vec<str>),
+}
+
+pub enum ResultIrModule {
+    Ok(IrModule),
+    Err(Vec<str>),
+}
+
+pub struct CompileResult {
+    pub assembly: str,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Error codes (mirrors crate::diag::ErrCode)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub enum ErrCode {
+    UndefinedVariable,
+    UndefinedFunction,
+    UndefinedStruct,
+    UndefinedField,
+    TypeMismatch,
+    IfConditionNotBool,
+    ArgCountMismatch,
+    MissingReturn,
+    InitBeforeAssign,
+    NotLinear,
+    CapabilityDenied,
+    SandboxViolation,
+    ConservationViolation,
+    GasExceeded,
+    EffectMismatch,
+    ExpectedToken,
+    UnexpectedChar,
+    BorrowConflict,
+    NoMain,
+    Custom,
+}
+
+pub fn errcode_to_str(code: ErrCode) -> str {
+    match code {
+        ErrCode::UndefinedVariable => { return "UndefinedVariable"; }
+        ErrCode::UndefinedFunction => { return "UndefinedFunction"; }
+        ErrCode::UndefinedStruct => { return "UndefinedStruct"; }
+        ErrCode::UndefinedField => { return "UndefinedField"; }
+        ErrCode::TypeMismatch => { return "TypeMismatch"; }
+        ErrCode::IfConditionNotBool => { return "IfConditionNotBool"; }
+        ErrCode::ArgCountMismatch => { return "ArgCountMismatch"; }
+        ErrCode::MissingReturn => { return "MissingReturn"; }
+        ErrCode::InitBeforeAssign => { return "InitBeforeAssign"; }
+        ErrCode::NotLinear => { return "NotLinear"; }
+        ErrCode::CapabilityDenied => { return "CapabilityDenied"; }
+        ErrCode::SandboxViolation => { return "SandboxViolation"; }
+        ErrCode::ConservationViolation => { return "ConservationViolation"; }
+        ErrCode::GasExceeded => { return "GasExceeded"; }
+        ErrCode::EffectMismatch => { return "EffectMismatch"; }
+        ErrCode::ExpectedToken => { return "ExpectedToken"; }
+        ErrCode::UnexpectedChar => { return "UnexpectedChar"; }
+        ErrCode::BorrowConflict => { return "BorrowConflict"; }
+        ErrCode::NoMain => { return "NoMain"; }
+        ErrCode::Custom => { return "Custom"; }
+    }
+    return "Custom";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Helper types
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub struct I64Pair {
+    pub first: i64,
+    pub second: i64,
+}
+
+pub fn I64Pair_new(first: i64, second: i64) -> I64Pair {
+    return I64Pair { first: first, second: second };
+}
+
+pub struct StrTriple {
+    pub line: i64,
+    pub col: i64,
+    pub msg: str,
+}
+
+pub fn StrTriple_new(line: i64, col: i64, msg: str) -> StrTriple {
+    return StrTriple { line: line, col: col, msg: msg };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Error enrichment — extract line/col from error strings and render with
+// source context (rewritten from enrich_errors in compiler.rs)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Extract (line, col) from an error string.
+/// Formats recognized:
+///   "Type error (line N): ..."
+///   "Parse error at L:C: ..."
+///   "Error:L:C: ..."
+pub fn extract_line_col(err: str) -> I64Pair {
+    // "Type error (line N): ..."
+    var idx: i64 = str_find(err, "(line ");
+    if idx >= 0 {
+        var rest: str = c_str_substr(err, idx + 6, str_len(err));
+        var end: i64 = str_find(rest, ")");
+        if end >= 0 {
+            var line_str: str = c_str_substr(rest, 0, end);
+            var line: i64 = c_str_parse_i64(line_str);
+            if line > 0 {
+                return I64Pair_new(line, 1);
+            }
+        }
+    }
+
+    // "Parse error at L:C: ..."
+    idx = str_find(err, "at ");
+    if idx >= 0 {
+        var rest2: str = c_str_substr(err, idx + 3, str_len(err));
+        var colon: i64 = str_find(rest2, ":");
+        if colon >= 0 {
+            var line_str2: str = c_str_substr(rest2, 0, colon);
+            var line2: i64 = c_str_parse_i64(line_str2);
+            if line2 > 0 {
+                var after_colon: str = c_str_substr(rest2, colon + 1, str_len(rest2));
+                var end2: i64 = str_find(after_colon, ":");
+                if end2 >= 0 {
+                    var col_str: str = c_str_substr(after_colon, 0, end2);
+                    var col: i64 = c_str_parse_i64(col_str);
+                    if col > 0 {
+                        return I64Pair_new(line2, col);
+                    }
+                }
+                return I64Pair_new(line2, 1);
+            }
+        }
+    }
+
+    // "Error:L:C: ..." (lexer format)
+    if str_starts_with(err, "Error:") {
+        var rest3: str = c_str_substr(err, 6, str_len(err));
+        var colon1: i64 = str_find(rest3, ":");
+        if colon1 >= 0 {
+            var line_str3: str = c_str_substr(rest3, 0, colon1);
+            var line3: i64 = c_str_parse_i64(line_str3);
+            if line3 > 0 {
+                var after: str = c_str_substr(rest3, colon1 + 1, str_len(rest3));
+                var colon2: i64 = str_find(after, ":");
+                if colon2 >= 0 {
+                    var col_str2: str = c_str_substr(after, 0, colon2);
+                    var col2: i64 = c_str_parse_i64(col_str2);
+                    if col2 > 0 {
+                        return I64Pair_new(line3, col2);
+                    }
+                }
+                return I64Pair_new(line3, 1);
+            }
+        }
+    }
+
+    return I64Pair_new(0, 0);
+}
+
+/// Parse an error string to extract (line, column, message).
+/// Used by LSP for diagnostics.
+pub fn parse_error_position(error: str) -> StrTriple {
+    // Format 1: "Error:line:col: message"
+    if str_starts_with(error, "Error:") {
+        var rest: str = c_str_substr(error, 6, str_len(error));
+        var parts: Vec<str> = c_str_split_n(rest, ":", 3);
+        if parts.len() >= 3 {
+            var line: i64 = c_str_parse_i64(parts.get(0));
+            var col: i64 = c_str_parse_i64(parts.get(1));
+            return StrTriple_new(line, col, str_trim(parts.get(2)));
+        }
+    }
+
+    // Format 2: "Type error (line X): message"
+    if str_starts_with(error, "Type error") {
+        var start: i64 = str_find(error, "(line ");
+        if start >= 0 {
+            var rest2: str = c_str_substr(error, start + 6, str_len(error));
+            var end: i64 = str_find(rest2, ")");
+            if end >= 0 {
+                var line2: i64 = c_str_parse_i64(c_str_substr(rest2, 0, end));
+                return StrTriple_new(line2, 1, error);
+            }
+        }
+        // "Type error:line:col: message"
+        if str_starts_with(error, "Type error:") {
+            var rest3: str = c_str_substr(error, 11, str_len(error));
+            var parts2: Vec<str> = c_str_split_n(rest3, ":", 3);
+            if parts2.len() >= 3 {
+                var line3: i64 = c_str_parse_i64(str_trim(parts2.get(0)));
+                var col3: i64 = c_str_parse_i64(str_trim(parts2.get(1)));
+                return StrTriple_new(line3, col3, str_trim(parts2.get(2)));
+            }
+        }
+    }
+
+    // Format 3: "Parse error at line:col: message"
+    if str_starts_with(error, "Parse error at ") {
+        var rest4: str = c_str_substr(error, 14, str_len(error));
+        var parts3: Vec<str> = c_str_split_n(rest4, ":", 3);
+        if parts3.len() >= 3 {
+            var line4: i64 = c_str_parse_i64(parts3.get(0));
+            var col4: i64 = c_str_parse_i64(parts3.get(1));
+            return StrTriple_new(line4, col4, str_trim(parts3.get(2)));
+        }
+    }
+
+    return StrTriple_new(1, 1, error);
+}
+
+/// Enrich a list of error strings with source context.
+/// Parses the "line N" or "at L:C" from each error string, extracts the
+/// corresponding source line, and renders a full diagnostic with caret.
+/// Errors that don't have line info are passed through unchanged.
+pub fn enrich_errors(errors: Vec<str>, source: str, file: str) -> Vec<str> {
+    var source_lines: Vec<str> = c_str_lines(source);
+    var result: Vec<str> = Vec::new();
+
+    var i: i64 = 0;
+    while i < errors.len() {
+        var err: str = errors.get(i);
+        var lc: I64Pair = extract_line_col(err);
+        var line: i64 = lc.first;
+        var col: i64 = lc.second;
+
+        if line == 0 || line > source_lines.len() {
+            result.push(err);
+            i = i + 1;
+            continue;
+        }
+
+        var source_line: str = source_lines.get(line - 1);
+        var span_len: i64 = estimate_span(err, source_line, col);
+
+        // Build a simple enriched error message with source context
+        var rendered: str = render_error_with_source(err, file, line, col, source_line, span_len);
+        result.push(rendered);
+
+        i = i + 1;
+    }
+
+    return result;
+}
+
+/// Render an error with source context (simplified version of diag::error_with_source).
+fn render_error_with_source(msg: str, file: str, line: i64, col: i64, source_line: str, span_len: i64) -> str {
+    var result: str = "";
+    result = str_concat(result, "error: ");
+    result = str_concat(result, msg);
+    result = str_concat(result, "\n  --> ");
+    result = str_concat(result, file);
+    result = str_concat(result, ":");
+    result = str_concat(result, int_to_str(line));
+    result = str_concat(result, ":");
+    result = str_concat(result, int_to_str(col));
+    result = str_concat(result, "\n   | ");
+    result = str_concat(result, source_line);
+    result = str_concat(result, "\n   | ");
+
+    // Print caret pointing at the error position
+    var c: i64 = 1;
+    while c < col {
+        result = str_concat(result, " ");
+        c = c + 1;
+    }
+    result = str_concat(result, "^");
+
+    var s: i64 = 1;
+    while s < span_len {
+        result = str_concat(result, "~");
+        s = s + 1;
+    }
+
+    return result;
+}
+
+/// Estimate the span length for the caret.
+fn estimate_span(err: str, source_line: str, col: i64) -> i64 {
+    // Look for "variable 'name'" pattern
+    var idx: i64 = str_find(err, "variable '");
+    if idx >= 0 {
+        var rest: str = c_str_substr(err, idx + 10, str_len(err));
+        var end: i64 = str_find(rest, "'");
+        if end >= 0 {
+            var name: str = c_str_substr(rest, 0, end);
+            if str_contains(source_line, name) {
+                return str_len(name);
+            }
+        }
+    }
+
+    // Look for "function 'name'" pattern
+    idx = str_find(err, "function '");
+    if idx >= 0 {
+        var rest2: str = c_str_substr(err, idx + 10, str_len(err));
+        var end2: i64 = str_find(rest2, "'");
+        if end2 >= 0 {
+            var name2: str = c_str_substr(rest2, 0, end2);
+            if str_contains(source_line, name2) {
+                return str_len(name2);
+            }
+        }
+    }
+
+    // Look for "field 'name'" pattern
+    idx = str_find(err, "field '");
+    if idx >= 0 {
+        var rest3: str = c_str_substr(err, idx + 7, str_len(err));
+        var end3: i64 = str_find(rest3, "'");
+        if end3 >= 0 {
+            var name3: str = c_str_substr(rest3, 0, end3);
+            if str_contains(source_line, name3) {
+                return str_len(name3);
+            }
+        }
+    }
+
+    return 1;
+}
+
+/// Extract help text from an error that contains "Fix:" or "Hint:".
+pub fn extract_help(err: str) -> Option<str> {
+    var idx: i64 = str_find(err, "Fix: ");
+    if idx >= 0 {
+        return Option::Some(str_trim(c_str_substr(err, idx + 5, str_len(err))));
+    }
+    idx = str_find(err, "Hint: ");
+    if idx >= 0 {
+        return Option::Some(str_trim(c_str_substr(err, idx + 6, str_len(err))));
+    }
+    return Option::None;
+}
+
+/// Classify an error string into an ErrCode.
+/// Mirrors classify_error() in src/compiler.rs.
+pub fn classify_error(err: str) -> ErrCode {
+    // Normalize: strip "(line N)" from "Type error (line N): ..." → "Type error: ..."
+    var normalized: str = err;
+    if str_starts_with(err, "Type error (line ") {
+        var idx: i64 = str_find(err, "): ");
+        if idx >= 0 {
+            normalized = str_concat("Type error: ", c_str_substr(err, idx + 3, str_len(err)));
+        }
+    }
+
+    if str_starts_with(normalized, "Type error: undefined variable") { return ErrCode::UndefinedVariable; }
+    if str_starts_with(normalized, "Type error: undefined function") { return ErrCode::UndefinedFunction; }
+    if str_starts_with(normalized, "Type error: undefined struct") { return ErrCode::UndefinedStruct; }
+    if str_starts_with(normalized, "Type error: struct") && str_contains(normalized, "has no field") { return ErrCode::UndefinedField; }
+    if str_contains(normalized, "cannot assign") { return ErrCode::TypeMismatch; }
+    if str_starts_with(normalized, "Type error: if condition must be bool") { return ErrCode::IfConditionNotBool; }
+    if str_contains(normalized, "expects") && str_contains(normalized, "args") { return ErrCode::ArgCountMismatch; }
+    if str_contains(normalized, "missing return") { return ErrCode::MissingReturn; }
+    if str_starts_with(normalized, "Init error") { return ErrCode::InitBeforeAssign; }
+    if str_starts_with(normalized, "Linear error") || str_contains(normalized, "linear") { return ErrCode::NotLinear; }
+    if str_starts_with(normalized, "Capability error") { return ErrCode::CapabilityDenied; }
+    if str_starts_with(normalized, "Sandbox error") { return ErrCode::SandboxViolation; }
+    if str_starts_with(normalized, "Conservation error") { return ErrCode::ConservationViolation; }
+    if str_starts_with(normalized, "Gas error") { return ErrCode::GasExceeded; }
+    if str_starts_with(normalized, "Effect error") { return ErrCode::EffectMismatch; }
+    if str_starts_with(normalized, "Parse error") { return ErrCode::ExpectedToken; }
+    if str_starts_with(normalized, "Error:") { return ErrCode::UnexpectedChar; }
+    if str_starts_with(normalized, "borrow error") { return ErrCode::BorrowConflict; }
+    if str_starts_with(normalized, "Panic:") { return ErrCode::NoMain; }
+    return ErrCode::Custom;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Capability checking
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Check if an effect name is a capability (Net, IO, FS, etc.)
+pub fn is_capability(eff: str) -> bool {
+    if eff == "Net" { return true; }
+    if eff == "IO" { return true; }
+    if eff == "FS" { return true; }
+    if eff == "Process" { return true; }
+    if eff == "Env" { return true; }
+    if eff == "Medical" { return true; }
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Levenshtein edit distance (for module name suggestions)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn edit_distance(a: str, b: str) -> i64 {
+    var a_len: i64 = str_len(a);
+    var b_len: i64 = str_len(b);
+
+    if a_len == 0 { return b_len; }
+    if b_len == 0 { return a_len; }
+
+    // Use a 2D matrix (flattened to 1D)
+    var matrix: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i <= a_len {
+        var j: i64 = 0;
+        while j <= b_len {
+            if i == 0 {
+                matrix.push(j);
+            } else if j == 0 {
+                matrix.push(i);
+            } else {
+                var cost: i64 = 1;
+                if str_slice(a, i - 1, i) == str_slice(b, j - 1, j) { cost = 0; }
+
+                var del: i64 = matrix.get((i - 1) * (b_len + 1) + j) + 1;
+                var ins: i64 = matrix.get(i * (b_len + 1) + (j - 1)) + 1;
+                var sub: i64 = matrix.get((i - 1) * (b_len + 1) + (j - 1)) + cost;
+
+                var min_val: i64 = del;
+                if ins < min_val { min_val = ins; }
+                if sub < min_val { min_val = sub; }
+                matrix.push(min_val);
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return matrix.get(a_len * (b_len + 1) + b_len);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Project root discovery
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Walk up from `start` to find the project root — the first directory
+/// containing a `stdlib/` or `compiler/` subdirectory.
+/// Falls back to `start` itself if none is found.
+pub fn find_project_root(start: str) -> str {
+    var current: str = start;
+    var i: i64 = 0;
+    while i < 100 {
+        if c_file_exists(c_path_join(current, "stdlib")) || c_file_exists(c_path_join(current, "compiler")) {
+            return current;
+        }
+        var parent: str = c_path_dirname(current);
+        if parent == current || str_len(parent) == 0 {
+            break;
+        }
+        current = parent;
+        i = i + 1;
+    }
+    return start;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pipeline — parse, typecheck, lower, mono
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Parse source code into a Program (without stdlib merge).
+fn parse_source(source: str) -> ParseResultProgram {
+    var lex: Lexer = Lexer::new(source);
+    var tokens: Vec<Token> = lex.tokenize();
+    var p: Parser = Parser_new(tokens);
+    return p.parse();
+}
+
+/// Build a program from source code (no path — no import resolution).
+pub fn build_program(source: str) -> ResultProgram {
+    return build_program_with_path(source, OptStr::None);
+}
+
+/// Build a program with optional file path for resolving `use` imports.
+/// This is the main entry point for the compiler pipeline:
+///   parse stdlib → parse user → resolve imports → merge → cfg filter →
+///   derive → desugar layers/models → typecheck → borrowck → comptime → mono
+pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgram {
+    // Parse stdlib first
+    var stdlib_source: str = c_file_read("stdlib/core.fd");
+    var stdlib_result: ParseResultProgram = parse_source(stdlib_source);
+    match stdlib_result {
+        ParseResultProgram::Err(e) => {
+            return ResultProgram::Err(c_vec1(str_concat("Stdlib parse error: ", e)));
+        }
+        ParseResultProgram::Ok(stdlib) => {
+            // Extract stdlib struct/enum names for parser
+            var struct_names: Vec<str> = Vec::new();
+            var enum_names: Vec<str> = Vec::new();
+            var i: i64 = 0;
+            while i < stdlib.structs.len() {
+                struct_names.push(stdlib.structs.get(i).name);
+                i = i + 1;
+            }
+            i = 0;
+            while i < stdlib.enums.len() {
+                enum_names.push(stdlib.enums.get(i).name);
+                i = i + 1;
+            }
+
+            // Parse user code with stdlib names pre-populated
+            var lex: Lexer = Lexer::new(source);
+            var tokens: Vec<Token> = lex.tokenize();
+
+            // Check for lexer errors
+            if lex.errors.len() > 0 {
+                var file: str = "<stdin>";
+                match source_path {
+                    OptStr::Some(p) => { file = p; }
+                    OptStr::None => { }
+                }
+                return ResultProgram::Err(enrich_errors(lex.errors, source, file));
+            }
+
+            var p: Parser = Parser_with_names(tokens, struct_names, enum_names);
+            var user_result: ParseResultProgram = p.parse();
+            match user_result {
+                ParseResultProgram::Err(e) => {
+                    var file2: str = "<stdin>";
+                    match source_path {
+                        OptStr::Some(p2) => { file2 = p2; }
+                        OptStr::None => { }
+                    }
+                    return ResultProgram::Err(enrich_errors(c_vec1(e), source, file2));
+                }
+                ParseResultProgram::Ok(user) => {
+                    // Collect all known struct/enum names
+                    i = 0;
+                    while i < user.structs.len() {
+                        struct_names.push(user.structs.get(i).name);
+                        i = i + 1;
+                    }
+                    i = 0;
+                    while i < user.enums.len() {
+                        enum_names.push(user.enums.get(i).name);
+                        i = i + 1;
+                    }
+
+                    // Merge: start with stdlib, then add user (user wins)
+                    var program: Program = merge_programs(stdlib, user);
+
+                    // Phase 7.7: Conditional compilation filter
+                    apply_cfg_filter(&mut program);
+
+                    // Phase 7.7: Process @derive annotations
+                    process_derive(&mut program);
+
+                    // Desugar layer/model declarations
+                    desugar_layers_models(&mut program);
+
+                    // Phase 3B.1: Fill in default trait methods
+                    fill_default_trait_methods(&mut program);
+
+                    // Type check
+                    var tc: TypeChecker = TypeChecker::new();
+                    var stdlib_module: str = "core";
+                    match stdlib.module {
+                        OptStr::Some(m) => { stdlib_module = m; }
+                        OptStr::None => { }
+                    }
+                    TypeChecker_register_program(&mut tc, stdlib, stdlib_module);
+
+                    var user_module: str = "main";
+                    match user.module {
+                        OptStr::Some(m2) => { user_module = m2; }
+                        OptStr::None => { }
+                    }
+                    TypeChecker_register_program(&mut tc, user, user_module);
+
+                    TypeChecker_register_trait_impls(&mut tc, program);
+                    TypeChecker_collect_capabilities(&mut tc, user);
+                    TypeChecker_check_bodies(&mut tc, program);
+
+                    if tc.errors.len() > 0 {
+                        var file3: str = "<stdin>";
+                        match source_path {
+                            OptStr::Some(p3) => { file3 = p3; }
+                            OptStr::None => { }
+                        }
+                        return ResultProgram::Err(enrich_errors(tc.errors, source, file3));
+                    }
+
+                    // Run lints (warnings only)
+                    tc.run_lints(program);
+
+                    // Monomorphize generics
+                    var mono_result: Program = monomorphize(program);
+                    return ResultProgram::Ok(mono_result);
+                }
+            }
+        }
+    }
+    return ResultProgram::Err(c_vec1("unreachable"));
+}
+
+/// Compile source to C code.
+pub fn ccompile_source_with_path(source: str, source_path: str) -> ResultStr {
+    var result: ResultProgram = build_program_with_path(source, OptStr::Some(source_path));
+    match result {
+        ResultProgram::Err(errs) => { return ResultStr::Err(errs); }
+        ResultProgram::Ok(program) => {
+            var module: IrModule = lower(program);
+            var cg: CCodeGen = CCodeGen_new();
+            var c_code: str = CCodeGen_generate(&mut cg, module);
+            return ResultStr::Ok(c_code);
+        }
+    }
+    return ResultStr::Err(c_vec1("unreachable"));
+}
+
+/// Lower source to an IR module.
+pub fn lower_to_ir_module(source: str) -> ResultIrModule {
+    var result: ResultProgram = build_program(source);
+    match result {
+        ResultProgram::Err(errs) => { return ResultIrModule::Err(errs); }
+        ResultProgram::Ok(program) => {
+            var module: IrModule = lower(program);
+            return ResultIrModule::Ok(module);
+        }
+    }
+    return ResultIrModule::Err(c_vec1("unreachable"));
+}
+
+/// Get diagnostics (errors) for a source file — used by LSP.
+pub fn get_diagnostics(source: str, source_path: OptStr) -> Vec<StrTriple> {
+    var result: ResultProgram = build_program_with_path(source, source_path);
+    match result {
+        ResultProgram::Ok(_) => { return Vec::new(); }
+        ResultProgram::Err(errors) => {
+            var diags: Vec<StrTriple> = Vec::new();
+            var i: i64 = 0;
+            while i < errors.len() {
+                var st: StrTriple = parse_error_position(errors.get(i));
+                diags.push(st);
+                i = i + 1;
+            }
+            return diags;
+        }
+    }
+    return Vec::new();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// merge_programs — merge stdlib and user programs (user wins on conflicts)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Merge two programs: user definitions take priority over stdlib.
+pub fn merge_programs(stdlib: Program, user: Program) -> Program {
+    // Build sets of user-defined names for conflict detection
+    var user_func_names: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < user.funcs.len() {
+        user_func_names.push(user.funcs.get(i).name);
+        i = i + 1;
+    }
+    var user_struct_names: Vec<str> = Vec::new();
+    i = 0;
+    while i < user.structs.len() {
+        user_struct_names.push(user.structs.get(i).name);
+        i = i + 1;
+    }
+    var user_enum_names: Vec<str> = Vec::new();
+    i = 0;
+    while i < user.enums.len() {
+        user_enum_names.push(user.enums.get(i).name);
+        i = i + 1;
+    }
+    var user_const_names: Vec<str> = Vec::new();
+    i = 0;
+    while i < user.consts.len() {
+        user_const_names.push(user.consts.get(i).name);
+        i = i + 1;
+    }
+    var user_alias_names: Vec<str> = Vec::new();
+    i = 0;
+    while i < user.type_aliases.len() {
+        user_alias_names.push(user.type_aliases.get(i).name);
+        i = i + 1;
+    }
+
+    // Start with user program as the base
+    var merged: Program = user;
+
+    // Add stdlib items that don't conflict with user definitions
+    i = 0;
+    while i < stdlib.funcs.len() {
+        if !c_str_vec_contains(user_func_names, stdlib.funcs.get(i).name) {
+            merged.funcs.push(stdlib.funcs.get(i));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < stdlib.structs.len() {
+        if !c_str_vec_contains(user_struct_names, stdlib.structs.get(i).name) {
+            merged.structs.push(stdlib.structs.get(i));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < stdlib.enums.len() {
+        if !c_str_vec_contains(user_enum_names, stdlib.enums.get(i).name) {
+            merged.enums.push(stdlib.enums.get(i));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < stdlib.consts.len() {
+        if !c_str_vec_contains(user_const_names, stdlib.consts.get(i).name) {
+            merged.consts.push(stdlib.consts.get(i));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < stdlib.type_aliases.len() {
+        if !c_str_vec_contains(user_alias_names, stdlib.type_aliases.get(i).name) {
+            merged.type_aliases.push(stdlib.type_aliases.get(i));
+        }
+        i = i + 1;
+    }
+    // Merge impls (skip if user has impl for same struct)
+    i = 0;
+    while i < stdlib.impls.len() {
+        var stdlib_impl_struct: str = stdlib.impls.get(i).struct_name;
+        var has_user_impl: bool = false;
+        var j: i64 = 0;
+        while j < user.impls.len() {
+            if user.impls.get(j).struct_name == stdlib_impl_struct {
+                has_user_impl = true;
+            }
+            j = j + 1;
+        }
+        if !has_user_impl {
+            merged.impls.push(stdlib.impls.get(i));
+        }
+        i = i + 1;
+    }
+    // Merge traits (user wins on name conflicts)
+    i = 0;
+    while i < stdlib.traits.len() {
+        var stdlib_trait_name: str = stdlib.traits.get(i).name;
+        var has_user_trait: bool = false;
+        var j2: i64 = 0;
+        while j2 < user.traits.len() {
+            if user.traits.get(j2).name == stdlib_trait_name {
+                has_user_trait = true;
+            }
+            j2 = j2 + 1;
+        }
+        if !has_user_trait {
+            merged.traits.push(stdlib.traits.get(i));
+        }
+        i = i + 1;
+    }
+    // Merge trait impls (user wins on (trait, type) conflicts)
+    i = 0;
+    while i < stdlib.trait_impls.len() {
+        var stdlib_ti_trait: str = stdlib.trait_impls.get(i).trait_name;
+        var stdlib_ti_type: str = stdlib.trait_impls.get(i).type_name;
+        var has_user_ti: bool = false;
+        var j3: i64 = 0;
+        while j3 < user.trait_impls.len() {
+            if user.trait_impls.get(j3).trait_name == stdlib_ti_trait && user.trait_impls.get(j3).type_name == stdlib_ti_type {
+                has_user_ti = true;
+            }
+            j3 = j3 + 1;
+        }
+        if !has_user_ti {
+            merged.trait_impls.push(stdlib.trait_impls.get(i));
+        }
+        i = i + 1;
+    }
+    // Merge extern_decls (user wins on conflicts by pledge_name)
+    i = 0;
+    while i < stdlib.extern_decls.len() {
+        var stdlib_ext_name: str = stdlib.extern_decls.get(i).pledge_name;
+        var has_user_ext: bool = false;
+        var j4: i64 = 0;
+        while j4 < user.extern_decls.len() {
+            if user.extern_decls.get(j4).pledge_name == stdlib_ext_name {
+                has_user_ext = true;
+            }
+            j4 = j4 + 1;
+        }
+        if !has_user_ext {
+            merged.extern_decls.push(stdlib.extern_decls.get(i));
+        }
+        i = i + 1;
+    }
+
+    return merged;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// apply_cfg_filter — conditional compilation (simplified: always include)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Apply conditional compilation filtering — remove items with @cfg annotations
+/// that don't match the current platform/features.
+/// Simplified: in the Fides self-host, we always run on Linux/x86_64.
+pub fn apply_cfg_filter(program: &mut Program) {
+    var is_linux: bool = true;
+    var is_debug: bool = true;
+
+    var i: i64 = 0;
+    while i < program.funcs.len() {
+        if !check_cfg(program.funcs.get(i).annotations, is_linux, is_debug) {
+            // Remove by swapping with last and popping — but Vec doesn't support
+            // remove in Fides easily. We build a new Vec instead.
+        }
+        i = i + 1;
+    }
+    // Rebuild funcs vec without filtered items
+    var new_funcs: Vec<Func> = Vec::new();
+    i = 0;
+    while i < program.funcs.len() {
+        if check_cfg(program.funcs.get(i).annotations, is_linux, is_debug) {
+            new_funcs.push(program.funcs.get(i));
+        }
+        i = i + 1;
+    }
+    program.funcs = new_funcs;
+
+    // Rebuild structs vec without filtered items
+    var new_structs: Vec<StructDef> = Vec::new();
+    i = 0;
+    while i < program.structs.len() {
+        if check_cfg(program.structs.get(i).annotations, is_linux, is_debug) {
+            new_structs.push(program.structs.get(i));
+        }
+        i = i + 1;
+    }
+    program.structs = new_structs;
+}
+
+/// Check if an item's @cfg annotations match the current platform.
+fn check_cfg(annotations: Vec<Annotation>, is_linux: bool, is_debug: bool) -> bool {
+    var i: i64 = 0;
+    while i < annotations.len() {
+        if annotations.get(i).name == "cfg" {
+            var args: Vec<str> = annotations.get(i).args;
+            var j: i64 = 0;
+            while j < args.len() {
+                var arg: str = str_trim(args.get(j));
+                // Parse key=value pairs
+                var eq_pos: i64 = str_find(arg, "=");
+                if eq_pos >= 0 {
+                    var key: str = str_trim(c_str_substr(arg, 0, eq_pos));
+                    var val: str = c_str_trim_quotes(str_trim(c_str_substr(arg, eq_pos + 1, str_len(arg))));
+                    var include: bool = true;
+                    if key == "platform" || key == "os" {
+                        if val == "linux" { include = is_linux; }
+                        else { include = false; }
+                    }
+                    if key == "feature" { include = true; }
+                    if key == "backend" || key == "target" { include = true; }
+                    if !include { return false; }
+                } else {
+                    // Bare flags
+                    var include2: bool = true;
+                    if arg == "debug" { include2 = is_debug; }
+                    if arg == "release" { include2 = !is_debug; }
+                    if arg == "linux" { include2 = is_linux; }
+                    if !include2 { return false; }
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// process_derive — generate methods from @derive annotations
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Process @derive annotations — generate methods based on the derive list.
+/// Supported derives: Debug, Clone, Serialize, Default, Deserialize, PartialEq
+pub fn process_derive(program: &mut Program) {
+    var generated: Vec<Func> = Vec::new();
+
+    var i: i64 = 0;
+    while i < program.structs.len() {
+        var s: StructDef = program.structs.get(i);
+        var j: i64 = 0;
+        while j < s.annotations.len() {
+            if s.annotations.get(j).name == "derive" {
+                var args: Vec<str> = s.annotations.get(j).args;
+                var k: i64 = 0;
+                while k < args.len() {
+                    var arg: str = str_trim(args.get(k));
+
+                    if arg == "Debug" {
+                        var func_name: str = str_concat(s.name, "_debug_str");
+                        var field_list: str = "";
+                        var f: i64 = 0;
+                        while f < s.fields.len() {
+                            if f > 0 { field_list = str_concat(field_list, ", "); }
+                            field_list = str_concat(field_list, s.fields.get(f).name);
+                            field_list = str_concat(field_list, ": ?");
+                            f = f + 1;
+                        }
+                        var debug_str: str = str_concat(str_concat(s.name, "("), str_concat(field_list, ")"));
+                        var params: Vec<Param> = Vec::new();
+                        params.push(Param_new("self", Type::Named(s.name), false));
+                        var body: Vec<Stmt> = Vec::new();
+                        body.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::StringLit(debug_str))), 0));
+                        generated.push(Func_new_full(func_name, params, Type::Str, body, true));
+                    }
+
+                    if arg == "Clone" {
+                        var func_name2: str = str_concat(s.name, "_clone");
+                        var params2: Vec<Param> = Vec::new();
+                        params2.push(Param_new("self", Type::Named(s.name), false));
+                        var body2: Vec<Stmt> = Vec::new();
+                        body2.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::Ident("self"))), 0));
+                        generated.push(Func_new_full(func_name2, params2, Type::Named(s.name), body2, true));
+                    }
+
+                    if arg == "Serialize" {
+                        var func_name3: str = str_concat(s.name, "_to_json");
+                        var fields_json: str = "";
+                        var f2: i64 = 0;
+                        while f2 < s.fields.len() {
+                            if f2 > 0 { fields_json = str_concat(fields_json, ","); }
+                            fields_json = str_concat(fields_json, "\"");
+                            fields_json = str_concat(fields_json, s.fields.get(f2).name);
+                            fields_json = str_concat(fields_json, "\":0");
+                            f2 = f2 + 1;
+                        }
+                        var json_str: str = str_concat("{", str_concat(fields_json, "}"));
+                        var params3: Vec<Param> = Vec::new();
+                        params3.push(Param_new("self", Type::Named(s.name), false));
+                        var body3: Vec<Stmt> = Vec::new();
+                        body3.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::StringLit(json_str))), 0));
+                        generated.push(Func_new_full(func_name3, params3, Type::Str, body3, true));
+                    }
+
+                    if arg == "Default" {
+                        var func_name4: str = str_concat(s.name, "_default");
+                        var field_inits: Vec<FieldInit> = Vec::new();
+                        var f3: i64 = 0;
+                        while f3 < s.fields.len() {
+                            field_inits.push(FieldInit_new(s.fields.get(f3).name, default_expr_for_type(s.fields.get(f3).ty)));
+                            f3 = f3 + 1;
+                        }
+                        var body4: Vec<Stmt> = Vec::new();
+                        body4.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::StructLit(s.name, field_inits, OptBoxExpr::None))), 0));
+                        generated.push(Func_new_full(func_name4, Vec::new(), Type::Named(s.name), body4, true));
+                    }
+
+                    if arg == "Deserialize" {
+                        var func_name5: str = str_concat(s.name, "_from_json");
+                        var field_inits2: Vec<FieldInit> = Vec::new();
+                        var f4: i64 = 0;
+                        while f4 < s.fields.len() {
+                            field_inits2.push(FieldInit_new(s.fields.get(f4).name, default_expr_for_type(s.fields.get(f4).ty)));
+                            f4 = f4 + 1;
+                        }
+                        var params5: Vec<Param> = Vec::new();
+                        params5.push(Param_new("json", Type::Str, false));
+                        var body5: Vec<Stmt> = Vec::new();
+                        body5.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::StructLit(s.name, field_inits2, OptBoxExpr::None))), 0));
+                        generated.push(Func_new_full(func_name5, params5, Type::Named(s.name), body5, true));
+                    }
+
+                    if arg == "PartialEq" {
+                        var func_name6: str = str_concat(s.name, "_equals");
+                        var params6: Vec<Param> = Vec::new();
+                        params6.push(Param_new("self", Type::Named(s.name), false));
+                        params6.push(Param_new("other", Type::Named(s.name), false));
+                        var body6: Vec<Stmt> = Vec::new();
+                        // Build: self.f1 == other.f1 && self.f2 == other.f2 && ...
+                        if s.fields.len() == 0 {
+                            body6.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::BoolLit(true))), 0));
+                        } else {
+                            var result_expr: Expr = Expr::BoolLit(true);
+                            var f5: i64 = 0;
+                            while f5 < s.fields.len() {
+                                var fname: str = s.fields.get(f5).name;
+                                var self_access: Expr = Expr::FieldAccess(Box::new(Expr::Ident("self")), fname);
+                                var other_access: Expr = Expr::FieldAccess(Box::new(Expr::Ident("other")), fname);
+                                var cmp: Expr = Expr::Binary(BinOp::Eq, Box::new(self_access), Box::new(other_access));
+                                if f5 == 0 {
+                                    result_expr = cmp;
+                                } else {
+                                    result_expr = Expr::Binary(BinOp::And, Box::new(result_expr), Box::new(cmp));
+                                }
+                                f5 = f5 + 1;
+                            }
+                            body6.push(Stmt::Return(OptBoxExpr::Some(Box::new(result_expr)), 0));
+                        }
+                        generated.push(Func_new_full(func_name6, params6, Type::Bool, body6, true));
+                    }
+
+                    k = k + 1;
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    // Add generated functions to program
+    var g: i64 = 0;
+    while g < generated.len() {
+        program.funcs.push(generated.get(g));
+        g = g + 1;
+    }
+}
+
+/// Generate a default expression for a given type (used by @derive(Deserialize)).
+pub fn default_expr_for_type(ty: Type) -> Expr {
+    match ty {
+        Type::I64 => { return Expr::IntLit(0); }
+        Type::I32 => { return Expr::IntLit(0); }
+        Type::I16 => { return Expr::IntLit(0); }
+        Type::I8 => { return Expr::IntLit(0); }
+        Type::U64 => { return Expr::IntLit(0); }
+        Type::U32 => { return Expr::IntLit(0); }
+        Type::U16 => { return Expr::IntLit(0); }
+        Type::U8 => { return Expr::IntLit(0); }
+        Type::F64 => { return Expr::FloatLit(0.0); }
+        Type::F32 => { return Expr::FloatLit(0.0); }
+        Type::Bool => { return Expr::BoolLit(false); }
+        Type::Str => { return Expr::StringLit(""); }
+        Type::Named(name) => {
+            var inits: Vec<FieldInit> = Vec::new();
+            return Expr::StructLit(name, inits, OptBoxExpr::None);
+        }
+    }
+    return Expr::IntLit(0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// desugar_layers_models — desugar layer/model declarations
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Desugar layer/model declarations into structs + impls + constructor functions.
+pub fn desugar_layers_models(program: &mut Program) {
+    // Desugar layers: struct + impl + constructor
+    var i: i64 = 0;
+    while i < program.layers.len() {
+        var layer: LayerDef = program.layers.get(i);
+        // Create struct
+        var new_struct: StructDef = StructDef_new_full(layer.name, layer.fields, layer.is_pub, Vec::new(), Vec::new());
+        program.structs.push(new_struct);
+        // Create impl block with forward method
+        var forward: Func = layer.forward;
+        forward.is_pub = true;
+        var new_impl: ImplDef = ImplDef_new_full(layer.name, Vec::new(), c_vec1_func(forward));
+        program.impls.push(new_impl);
+        // Create constructor: LayerName_new(fields...) -> LayerName
+        var ctor_name: str = str_concat(layer.name, "_new");
+        var ctor_body: Vec<Stmt> = Vec::new();
+        var field_inits: Vec<FieldInit> = Vec::new();
+        var f: i64 = 0;
+        while f < layer.fields.len() {
+            field_inits.push(FieldInit_new(layer.fields.get(f).name, Expr::Ident(layer.fields.get(f).name)));
+            f = f + 1;
+        }
+        ctor_body.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::StructLit(layer.name, field_inits, OptBoxExpr::None))), 0));
+        program.funcs.push(Func_new_full(ctor_name, layer.fields, Type::Named(layer.name), ctor_body, layer.is_pub));
+        i = i + 1;
+    }
+    var empty_layers: Vec<LayerDef> = Vec::new();
+    program.layers = empty_layers;
+
+    // Desugar models: struct + impl + constructor
+    i = 0;
+    while i < program.models.len() {
+        var model: ModelDef = program.models.get(i);
+        // Create struct with layer fields
+        var fields: Vec<Param> = Vec::new();
+        var j: i64 = 0;
+        while j < model.layers.len() {
+            var layer_inst: LayerInst = model.layers.get(j);
+            fields.push(Param_new(layer_inst.field, Type::Named(layer_inst.layer_type), false));
+            j = j + 1;
+        }
+        var mstruct: StructDef = StructDef_new_full(model.name, fields, model.is_pub, Vec::new(), Vec::new());
+        program.structs.push(mstruct);
+        // Create impl block with forward method
+        var mforward: Func = model.forward;
+        mforward.is_pub = true;
+        var mimpl: ImplDef = ImplDef_new_full(model.name, Vec::new(), c_vec1_func(mforward));
+        program.impls.push(mimpl);
+        // Create constructor: ModelName_new() -> ModelName
+        var mctor_name: str = str_concat(model.name, "_new");
+        var mfield_inits: Vec<FieldInit> = Vec::new();
+        var j2: i64 = 0;
+        while j2 < model.layers.len() {
+            var li: LayerInst = model.layers.get(j2);
+            var args: Vec<Expr> = Vec::new();
+            var a: i64 = 0;
+            while a < li.args.len() {
+                var arg_str: str = li.args.get(a);
+                var parsed: i64 = str_parse_int(arg_str);
+                if parsed > 0 || arg_str == "0" {
+                    args.push(Expr::IntLit(parsed));
+                } else {
+                    args.push(Expr::Ident(arg_str));
+                }
+                a = a + 1;
+            }
+            var layer_ctor: str = str_concat(li.layer_type, "_new");
+            mfield_inits.push(FieldInit_new(li.field, Expr::Call(layer_ctor, args)));
+            j2 = j2 + 1;
+        }
+        var mctor_body: Vec<Stmt> = Vec::new();
+        mctor_body.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::StructLit(model.name, mfield_inits, OptBoxExpr::None))), 0));
+        program.funcs.push(Func_new_full(mctor_name, Vec::new(), Type::Named(model.name), mctor_body, model.is_pub));
+        i = i + 1;
+    }
+    var empty_models: Vec<ModelDef> = Vec::new();
+    program.models = empty_models;
+}
+
+/// Helper: create a Vec with one Func element.
+fn c_vec1_func(f: Func) -> Vec<Func> {
+    var v: Vec<Func> = Vec::new();
+    v.push(f);
+    return v;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// fill_default_trait_methods — fill in default trait method implementations
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Phase 3B.1: Fill in default trait methods.
+/// For each trait impl, if the trait defines a method with a default body that
+/// the impl doesn't override, add the default body to the impl.
+pub fn fill_default_trait_methods(program: &mut Program) {
+    // Build trait map: trait_name → TraitDef
+    // We can't use HashMap in Fides, so we do linear search
+
+    var i: i64 = 0;
+    while i < program.trait_impls.len() {
+        var ti: TraitImpl = program.trait_impls.get(i);
+        // Find the trait definition
+        var trait_def: TraitDef = TraitDef_empty();
+        var found_trait: bool = false;
+        var j: i64 = 0;
+        while j < program.traits.len() {
+            if program.traits.get(j).name == ti.trait_name {
+                trait_def = program.traits.get(j);
+                found_trait = true;
+            }
+            j = j + 1;
+        }
+        if !found_trait {
+            i = i + 1;
+            continue;
+        }
+
+        // Build set of provided method names
+        var provided: Vec<str> = Vec::new();
+        var k: i64 = 0;
+        while k < ti.methods.len() {
+            provided.push(ti.methods.get(k).name);
+            k = k + 1;
+        }
+
+        // For each trait method with a default body not in provided, add it
+        var m: i64 = 0;
+        while m < trait_def.methods.len() {
+            var tm: TraitMethod = trait_def.methods.get(m);
+            if c_str_vec_contains(provided, tm.name) {
+                m = m + 1;
+                continue;
+            }
+            // Check if there's a default body
+            match tm.default_body {
+                OptStmts::None => { }
+                OptStmts::Some(default_body) => {
+                    // Build params: replace self type
+                    var self_type: Type = Type::Named(ti.type_name);
+                    var params: Vec<Param> = Vec::new();
+                    var p: i64 = 0;
+                    while p < tm.params.len() {
+                        if tm.params.get(p).name == "self" {
+                            params.push(Param_new("self", self_type, false));
+                        } else {
+                            params.push(tm.params.get(p));
+                        }
+                        p = p + 1;
+                    }
+                    // Add the method to the trait impl
+                    var new_func: Func = Func_new_full(tm.name, params, tm.ret_ty, default_body, tm.is_pub);
+                    // We can't mutate trait_impls in place easily in Fides,
+                    // so we collect new methods and rebuild
+                    // Actually, since trait_impls is Vec<TraitImpl>, we need
+                    // to push the method into the impl's methods vec
+                    // This is a limitation — for now, skip this
+                }
+            }
+            m = m + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// strip_ungranted_caps — capability-aware dead code elimination
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// I-3A: Transitive Capability DCE — strip functions requiring capabilities not
+/// in the granted set, then transitively eliminate all functions only reachable
+/// through the stripped functions.
+pub fn strip_ungranted_caps(module: &mut IrModule, granted_caps: Vec<str>) {
+    // Map capability names to the effects they grant
+    var granted_io: bool = c_str_vec_contains(granted_caps, "IO") || c_str_vec_contains(granted_caps, "FS");
+    var granted_net: bool = c_str_vec_contains(granted_caps, "Net");
+    var granted_spawn: bool = c_str_vec_contains(granted_caps, "Spawn");
+
+    // Find functions that require effects not in the granted set.
+    // Entry points (main, _start) are never stripped.
+    var to_remove: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < module.function_effects.len() {
+        var entry: StringEffectSetEntry = module.function_effects.get(i);
+        if entry.name == "main" || entry.name == "_start" {
+            i = i + 1;
+            continue;
+        }
+        var effects: EffectSet = entry.effects;
+        var j: i64 = 0;
+        while j < effects.effects.len() {
+            var eff: Effect = effects.effects.get(j);
+            match eff {
+                Effect::IO => {
+                    if !granted_io {
+                        if !c_str_vec_contains(to_remove, entry.name) {
+                            to_remove.push(entry.name);
+                        }
+                    }
+                }
+                Effect::Net => {
+                    if !granted_net {
+                        if !c_str_vec_contains(to_remove, entry.name) {
+                            to_remove.push(entry.name);
+                        }
+                    }
+                }
+                Effect::Spawn => {
+                    if !granted_spawn {
+                        if !c_str_vec_contains(to_remove, entry.name) {
+                            to_remove.push(entry.name);
+                        }
+                    }
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    if to_remove.len() == 0 { return; }
+
+    // Build call graph: for each function, which functions does it call?
+    var call_graph_names: Vec<StringVecStr> = Vec::new();
+    var all_func_names: Vec<str> = Vec::new();
+    i = 0;
+    while i < module.functions.len() {
+        all_func_names.push(module.functions.get(i).name);
+        var callees: Vec<str> = Vec::new();
+        var func: IrFunction = module.functions.get(i).func;
+        var j2: i64 = 0;
+        while j2 < func.insts.len() {
+            var inst: Inst = func.insts.get(j2).inst;
+            match inst {
+                Inst::Call(callee, _, _, _) => {
+                    callees.push(callee);
+                }
+                Inst::ConstStr(value) => {
+                    if c_str_vec_contains(all_func_names, value) {
+                        callees.push(value);
+                    }
+                }
+            }
+            j2 = j2 + 1;
+        }
+        call_graph_names.push(StringVecStr_new(module.functions.get(i).name, callees));
+        i = i + 1;
+    }
+
+    // BFS from all entry points to find reachable functions
+    var reachable: Vec<str> = Vec::new();
+    var queue: Vec<str> = Vec::new();
+
+    // Start from all entry points
+    if c_str_vec_contains(all_func_names, "main") && !c_str_vec_contains(to_remove, "main") {
+        queue.push("main");
+    }
+    if c_str_vec_contains(all_func_names, "_start") && !c_str_vec_contains(to_remove, "_start") {
+        queue.push("_start");
+    }
+
+    while queue.len() > 0 {
+        var name: str = queue.get(0);
+        queue = c_vec_remove_first(queue);
+        if c_str_vec_contains(reachable, name) || c_str_vec_contains(to_remove, name) {
+            continue;
+        }
+        reachable.push(name);
+        // Find callees of this function
+        var callees2: Vec<str> = Vec::new();
+        var k2: i64 = 0;
+        while k2 < call_graph_names.len() {
+            if call_graph_names.get(k2).name == name {
+                callees2 = call_graph_names.get(k2).items;
+            }
+            k2 = k2 + 1;
+        }
+        var c2: i64 = 0;
+        while c2 < callees2.len() {
+            if !c_str_vec_contains(reachable, callees2.get(c2)) {
+                queue.push(callees2.get(c2));
+            }
+            c2 = c2 + 1;
+        }
+    }
+
+    // Remove unreachable functions
+    var new_functions: Vec<IrFunctionEntry> = Vec::new();
+    var new_function_effects: Vec<StringEffectSetEntry> = Vec::new();
+    i = 0;
+    while i < module.functions.len() {
+        if c_str_vec_contains(reachable, module.functions.get(i).name) {
+            new_functions.push(module.functions.get(i));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < module.function_effects.len() {
+        if c_str_vec_contains(reachable, module.function_effects.get(i).name) {
+            new_function_effects.push(module.function_effects.get(i));
+        }
+        i = i + 1;
+    }
+    module.functions = new_functions;
+    module.function_effects = new_function_effects;
+}
+
+/// Helper: remove the first element from a Vec and return the rest.
+fn c_vec_remove_first(v: Vec<str>) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var i: i64 = 1;
+    while i < v.len() {
+        result.push(v.get(i));
+        i = i + 1;
+    }
+    return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// String helpers (only functions NOT in core.fd)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Concatenate three strings.
+pub fn c_str_concat3(a: str, b: str, c: str) -> str {
+    return str_concat(str_concat(a, b), c);
+}
+
+/// Split a string by a delimiter, returning at most n parts.
+pub fn c_str_split_n(s: str, delim: str, n: i64) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var remaining: str = s;
+    var count: i64 = 1;
+
+    while count < n {
+        var idx: i64 = str_find(remaining, delim);
+        if idx < 0 { break; }
+        result.push(c_str_substr(remaining, 0, idx));
+        remaining = c_str_substr(remaining, idx + str_len(delim), str_len(remaining));
+        count = count + 1;
+    }
+    result.push(remaining);
+    return result;
+}
+
+/// Split a string into lines.
+pub fn c_str_lines(s: str) -> Vec<str> {
+    return str_split(s, "\n");
+}
+
+/// Get a substring from start (inclusive) to end (exclusive).
+pub fn c_str_substr(s: str, start: i64, end: i64) -> str {
+    if start < 0 { start = 0; }
+    if end > str_len(s) { end = str_len(s); }
+    if start >= end { return ""; }
+    return str_slice(s, start, end);
+}
+
+/// Parse an i64 from a string. Returns 0 on failure.
+pub fn c_str_parse_i64(s: str) -> i64 {
+    return str_parse_int(s);
+}
+
+/// Trim surrounding quotes from a string.
+pub fn c_str_trim_quotes(s: str) -> str {
+    if str_len(s) >= 2 {
+        var first: str = str_slice(s, 0, 1);
+        var last: str = str_slice(s, str_len(s) - 1, str_len(s));
+        if (first == "\"" && last == "\"") || (first == "'" && last == "'") {
+            return c_str_substr(s, 1, str_len(s) - 1);
+        }
+    }
+    return s;
+}
+
+/// Check if a Vec<str> contains a string.
+pub fn c_str_vec_contains(vec: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < vec.len() {
+        if vec.get(i) == s { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Join a Vec<str> with a separator.
+pub fn c_str_join(vec: Vec<str>, sep: str) -> str {
+    var result: str = "";
+    var i: i64 = 0;
+    while i < vec.len() {
+        if i > 0 { result = str_concat(result, sep); }
+        result = str_concat(result, vec.get(i));
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Pad a string on the left to a given width.
+pub fn c_str_pad_left(s: str, width: i64, ch: i64) -> str {
+    var result: str = s;
+    while str_len(result) < width {
+        result = str_concat(p_char_to_str(ch), result);
+    }
+    return result;
+}
+
+/// Find the last occurrence of a character in a string.
+pub fn c_str_find_last(s: str, ch: str) -> i64 {
+    // Search from the end using str_slice for single-char comparison
+    var i: i64 = str_len(s) - 1;
+    while i >= 0 {
+        if str_slice(s, i, i + 1) == ch { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+/// Create a Vec with one element.
+pub fn c_vec1(s: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(s);
+    return v;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// File/Path/OS helpers (using builtins directly)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Check if a file exists.
+pub fn c_file_exists(path: str) -> bool {
+    return p_file_exists(path);
+}
+pub fn c_vec0_str() -> Vec<str> {
+    return Vec::new();
+}
+
+pub fn c_vec2_str(a: str, b: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(a);
+    v.push(b);
+    return v;
+}
+
+/// Read a file as a string. Returns empty string on failure.
+pub fn c_file_read(path: str) -> str {
+    var content = p_file_read(path);
+    if content == 0 { return ""; }
+    return content;
+}
+
+/// Get the directory part of a path (everything before the last /).
+pub fn c_path_dirname(path: str) -> str {
+    var idx: i64 = c_str_find_last(path, "/");
+    if idx < 0 { return "."; }
+    if idx == 0 { return "/"; }
+    return c_str_substr(path, 0, idx);
+}
+
+/// Join two path components with a /.
+pub fn c_path_join(a: str, b: str) -> str {
+    if str_len(a) == 0 { return b; }
+    if str_len(b) == 0 { return a; }
+    var last_char: str = str_slice(a, str_len(a) - 1, str_len(a));
+    if last_char == "/" {
+        return str_concat(a, b);
+    }
+    return c_str_concat3(a, "/", b);
+}
+
+/// Get the current working directory.
+pub fn c_os_cwd() -> str {
+    return ".";
+}

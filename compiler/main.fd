@@ -1,0 +1,108 @@
+// main.fd — CLI entry point for the self-hosted Fides compiler.
+//
+// This is a minimal main that supports the `ccompile` command,
+// which is all we need for the C codegen bootstrap.
+//
+// Usage: fides-c ccompile <file.fd> -o <output>
+
+module compiler::main;
+
+use core;
+use vec;
+use string;
+use compiler::compiler;
+
+pub fn main() -> i64 {
+    var n: i64 = p_argc();
+    
+    if n < 2 {
+        print("Usage: fides-c ccompile <file.fd> -o <output>\n");
+        return 1;
+    }
+    
+    var command: str = p_argv(1);
+    
+    if str_equal(command, "ccompile") {
+        return cmd_ccompile(n);
+    }
+    
+    print("Unknown command: ");
+    print(command);
+    print("\n");
+    print("Available commands: ccompile\n");
+    return 1;
+}
+
+fn cmd_ccompile(n: i64) -> i64 {
+    // Parse: ccompile <file.fd> -o <output>
+    if n < 3 {
+        print("Usage: fides-c ccompile <file.fd> -o <output>\n");
+        return 1;
+    }
+    
+    var input: str = p_argv(2);
+    var output: str = "a.out";
+    
+    // Look for -o flag
+    var i: i64 = 3;
+    while i < n {
+        var arg: str = p_argv(i);
+        if str_equal(arg, "-o") {
+            if i + 1 < n {
+                output = p_argv(i + 1);
+            }
+        }
+        i = i + 1;
+    }
+    
+    // Read the source file
+    print("DBG: reading file\n");
+    var source: str = c_file_read(input);
+    print("DBG: file read, len=");
+    print(int_to_str(str_len(source)));
+    print("\n");
+    if str_len(source) == 0 {
+        print("Error: could not read file: ");
+        print(input);
+        print("\n");
+        return 1;
+    }
+    
+    // Compile to C
+    print("DBG: compiling\n");
+    var result: ResultStr = ccompile_source_with_path(source, input);
+    print("DBG: compile done\n");
+    match result {
+        ResultStr::Ok(c_code) => {
+            // Write C to temp file
+            var c_file: str = output + ".c";
+            p_file_write(c_file, c_code);
+            
+            // Run gcc to compile the C code
+            var gcc_cmd: str = "gcc -O2 -Wno-int-conversion -Wno-incompatible-pointer-types -fstack-protector-strong -fPIE -pie -Wl,-z,relro,-z,now -o ";
+            gcc_cmd = gcc_cmd + output + " " + c_file;
+            var ret: i64 = p_system(gcc_cmd);
+            
+            if ret != 0 {
+                print("gcc failed\n");
+                return 1;
+            }
+            
+            print("Built native executable: ");
+            print(output);
+            print("\n");
+            return 0;
+        }
+        ResultStr::Err(errs) => {
+            print("Compilation errors:\n");
+            var ei: i64 = 0;
+            while ei < errs.len() {
+                print(errs.get(ei));
+                print("\n");
+                ei = ei + 1;
+            }
+            return 1;
+        }
+    }
+    return 1;
+}

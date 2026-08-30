@@ -996,6 +996,11 @@ fn main() {
                         }
                         let mut cmd = process::Command::new(&cc);
                         cmd.arg("-O2")
+                            // Fides FFI uses i64 for all handle types (FILE*, DIR*, etc.)
+                            // and struct pointers are passed as int64_t values.
+                            // Safe on x86-64 where pointers are 8 bytes.
+                            .arg("-Wno-int-conversion")
+                            .arg("-Wno-incompatible-pointer-types")
                             // Security hardening flags — defense in depth
                             // even though Fides prevents most exploits at compile time.
                             // -D_FORTIFY_SOURCE=2 requires _GNU_SOURCE or optimization,

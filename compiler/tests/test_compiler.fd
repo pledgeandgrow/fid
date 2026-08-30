@@ -1,0 +1,616 @@
+// test_compiler.fd — Tests for the compiler pipeline driver module
+//
+// Tests the helper functions and utilities in compiler.fd:
+//   - edit_distance (Levenshtein)
+//   - extract_line_col / parse_error_position
+//   - enrich_errors
+//   - str_split_n, str_trim_quotes, str_find_last
+//   - path_join, path_dirname
+//   - str_vec_contains, str_join, str_pad_left
+//   - is_capability
+//   - extract_help
+//
+// The full pipeline (build_program_with_path) can't be tested yet because
+// the imported compiler modules (opt, codegen_c, etc.) have pre-existing
+// visibility conflicts that prevent cross-module compilation.
+
+module test_compiler;
+
+use core;
+use vec;
+use string;
+use compiler::compiler;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test harness — assert macros (p_panic on failure, like test_opt.fd)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn assert_eq_i64(actual: i64, expected: i64, label: str) -> void {
+    if actual != expected {
+        print("FAIL: ");
+        print(label);
+        print(" — expected ");
+        print(p_to_str(expected));
+        print(", got ");
+        print(p_to_str(actual));
+        print("\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_eq_str(actual: str, expected: str, label: str) -> void {
+    if actual != expected {
+        print("FAIL: ");
+        print(label);
+        print(" — expected \"");
+        print(expected);
+        print("\", got \"");
+        print(actual);
+        print("\"\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_true(b: bool, label: str) -> void {
+    if !b {
+        print("FAIL: ");
+        print(label);
+        print(" — expected true\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+fn assert_false(b: bool, label: str) -> void {
+    if b {
+        print("FAIL: ");
+        print(label);
+        print(" — expected false\n");
+        p_panic("test failed");
+    }
+    print("  OK: ");
+    print(label);
+    print("\n");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for edit_distance (Levenshtein)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_edit_distance() {
+    print("--- edit_distance ---\n");
+    assert_eq_i64(edit_distance("hello", "hello"), 0, "identical strings");
+    assert_eq_i64(edit_distance("", "abc"), 3, "empty to abc");
+    assert_eq_i64(edit_distance("abc", ""), 3, "abc to empty");
+    assert_eq_i64(edit_distance("cat", "bat"), 1, "cat to bat (1 sub)");
+    assert_eq_i64(edit_distance("abc", "abcd"), 1, "abc to abcd (1 ins)");
+    assert_eq_i64(edit_distance("abcd", "abc"), 1, "abcd to abc (1 del)");
+    assert_eq_i64(edit_distance("abc", "xyz"), 3, "abc to xyz (3 subs)");
+    assert_eq_i64(edit_distance("", ""), 0, "both empty");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for parse_error_position
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_parse_error_position() {
+    print("--- parse_error_position ---\n");
+    var t1: StrTriple = parse_error_position("Error:10:5: unexpected token");
+    assert_eq_i64(t1.line, 10, "lexer format line");
+    assert_eq_i64(t1.col, 5, "lexer format col");
+    assert_eq_str(t1.msg, "unexpected token", "lexer format msg");
+
+    var t2: StrTriple = parse_error_position("Type error (line 42): undefined variable");
+    assert_eq_i64(t2.line, 42, "type error format line");
+
+    var t3: StrTriple = parse_error_position("Parse error at 15:3: expected fn");
+    assert_eq_i64(t3.line, 15, "parse error format line");
+    assert_eq_i64(t3.col, 3, "parse error format col");
+    assert_eq_str(t3.msg, "expected fn", "parse error format msg");
+
+    var t4: StrTriple = parse_error_position("some random error message");
+    assert_eq_i64(t4.line, 1, "unknown format line (default 1)");
+    assert_eq_i64(t4.col, 1, "unknown format col (default 1)");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for is_capability
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_is_capability() {
+    print("--- is_capability ---\n");
+    assert_true(is_capability("Net"), "Net");
+    assert_true(is_capability("IO"), "IO");
+    assert_true(is_capability("FS"), "FS");
+    assert_true(is_capability("Process"), "Process");
+    assert_true(is_capability("Env"), "Env");
+    assert_true(is_capability("Medical"), "Medical");
+    assert_false(is_capability("Hello"), "Hello (not a capability)");
+    assert_false(is_capability(""), "empty string");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for str_split_n
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_str_split_n() {
+    print("--- str_split_n ---\n");
+    var parts1: Vec<str> = c_str_split_n("a:b:c", ":", 3);
+    assert_eq_i64(parts1.len(), 3, "3 parts count");
+    assert_eq_str(parts1.get(0), "a", "part 0");
+    assert_eq_str(parts1.get(1), "b", "part 1");
+    assert_eq_str(parts1.get(2), "c", "part 2");
+
+    var parts2: Vec<str> = c_str_split_n("a:b:c:d", ":", 2);
+    assert_eq_i64(parts2.len(), 2, "2 parts count");
+    assert_eq_str(parts2.get(0), "a", "limited part 0");
+    assert_eq_str(parts2.get(1), "b:c:d", "limited part 1 (remainder)");
+
+    var parts3: Vec<str> = c_str_split_n("abc", ":", 3);
+    assert_eq_i64(parts3.len(), 1, "no delim (1 part)");
+    assert_eq_str(parts3.get(0), "abc", "no delim part 0");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for str_trim_quotes
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_str_trim_quotes() {
+    print("--- str_trim_quotes ---\n");
+    assert_eq_str(c_str_trim_quotes("\"hello\""), "hello", "double quotes");
+    assert_eq_str(c_str_trim_quotes("'hello'"), "hello", "single quotes");
+    assert_eq_str(c_str_trim_quotes("hello"), "hello", "no quotes");
+    assert_eq_str(c_str_trim_quotes("\""), "\"", "one char (no trim)");
+    assert_eq_str(c_str_trim_quotes(""), "", "empty");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for str_find_last
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_str_find_last() {
+    print("--- str_find_last ---\n");
+    assert_eq_i64(c_str_find_last("hello/world/test", "/"), 11, "basic");
+    assert_eq_i64(c_str_find_last("hello", "/"), -1, "not found");
+    assert_eq_i64(c_str_find_last("a", "a"), 0, "single char");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for path_join
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_path_join() {
+    print("--- path_join ---\n");
+    assert_eq_str(c_path_join("foo", "bar"), "foo/bar", "basic");
+    assert_eq_str(c_path_join("foo/", "bar"), "foo/bar", "trailing slash");
+    assert_eq_str(c_path_join("", "bar"), "bar", "empty a");
+    assert_eq_str(c_path_join("foo", ""), "foo", "empty b");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for path_dirname
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_path_dirname() {
+    print("--- path_dirname ---\n");
+    assert_eq_str(c_path_dirname("foo/bar/baz.fd"), "foo/bar", "basic");
+    assert_eq_str(c_path_dirname("baz.fd"), ".", "no slash");
+    assert_eq_str(c_path_dirname("/foo"), "/", "root");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for str_vec_contains
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_str_vec_contains() {
+    print("--- str_vec_contains ---\n");
+    var v1: Vec<str> = Vec::new();
+    v1.push("apple");
+    v1.push("banana");
+    v1.push("cherry");
+    assert_true(c_str_vec_contains(v1, "banana"), "found");
+    assert_false(c_str_vec_contains(v1, "grape"), "not found");
+
+    var v2: Vec<str> = Vec::new();
+    assert_false(c_str_vec_contains(v2, "anything"), "empty vec");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for str_join
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_str_join() {
+    print("--- str_join ---\n");
+    var v1: Vec<str> = Vec::new();
+    v1.push("a");
+    v1.push("b");
+    v1.push("c");
+    assert_eq_str(c_str_join(v1, ", "), "a, b, c", "basic");
+
+    var v2: Vec<str> = Vec::new();
+    v2.push("only");
+    assert_eq_str(c_str_join(v2, ", "), "only", "single element");
+
+    var v3: Vec<str> = Vec::new();
+    assert_eq_str(c_str_join(v3, ", "), "", "empty vec");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for str_pad_left
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_str_pad_left() {
+    print("--- str_pad_left ---\n");
+    assert_eq_str(c_str_pad_left("42", 5, 32), "   42", "basic");
+    assert_eq_str(c_str_pad_left("hello", 3, 32), "hello", "already long");
+    assert_eq_str(c_str_pad_left("abc", 3, 32), "abc", "exact length");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for I64Pair and StrTriple
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_helper_types() {
+    print("--- helper types ---\n");
+    var p: I64Pair = I64Pair_new(10, 20);
+    assert_eq_i64(p.first, 10, "I64Pair first");
+    assert_eq_i64(p.second, 20, "I64Pair second");
+
+    var t: StrTriple = StrTriple_new(5, 10, "test message");
+    assert_eq_i64(t.line, 5, "StrTriple line");
+    assert_eq_i64(t.col, 10, "StrTriple col");
+    assert_eq_str(t.msg, "test message", "StrTriple msg");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for extract_line_col
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_extract_line_col() {
+    print("--- extract_line_col ---\n");
+    var lc1: I64Pair = extract_line_col("Type error (line 25): something");
+    assert_eq_i64(lc1.first, 25, "type error line");
+
+    var lc2: I64Pair = extract_line_col("Parse error at 10:5: something");
+    assert_eq_i64(lc2.first, 10, "parse error line");
+    assert_eq_i64(lc2.second, 5, "parse error col");
+
+    var lc3: I64Pair = extract_line_col("Error:3:7: something");
+    assert_eq_i64(lc3.first, 3, "lexer error line");
+    assert_eq_i64(lc3.second, 7, "lexer error col");
+
+    var lc4: I64Pair = extract_line_col("just a message with no line info");
+    assert_eq_i64(lc4.first, 0, "no line (returns 0)");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for enrich_errors
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_enrich_errors() {
+    print("--- enrich_errors ---\n");
+    var source: str = "fn main() {\n    let x = 1;\n}\n";
+    var errors1: Vec<str> = Vec::new();
+    errors1.push("Type error (line 2): undefined variable 'x'");
+    var enriched1: Vec<str> = enrich_errors(errors1, source, "test.fd");
+    assert_eq_i64(enriched1.len(), 1, "with line info count");
+    assert_true(str_contains(enriched1.get(0), "test.fd"), "contains filename");
+
+    var errors2: Vec<str> = Vec::new();
+    errors2.push("some error without line info");
+    var enriched2: Vec<str> = enrich_errors(errors2, source, "test.fd");
+    assert_eq_i64(enriched2.len(), 1, "no line info count");
+    assert_eq_str(enriched2.get(0), "some error without line info", "passthrough");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for extract_help
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_extract_help() {
+    print("--- extract_help ---\n");
+    assert_true(extract_help("Error: something. Fix: do this instead").is_some(), "Fix");
+    assert_true(extract_help("Error: something. Hint: try this").is_some(), "Hint");
+    assert_true(extract_help("Error: something with no help").is_none(), "none");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for str_substr
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_str_substr() {
+    print("--- str_substr ---\n");
+    assert_eq_str(c_str_substr("hello world", 0, 5), "hello", "basic");
+    assert_eq_str(c_str_substr("hello world", 6, 11), "world", "middle");
+    assert_eq_str(c_str_substr("abc", 0, 100), "abc", "out of bounds end");
+    assert_eq_str(c_str_substr("abc", -1, 2), "ab", "negative start");
+    assert_eq_str(c_str_substr("abc", 1, 1), "", "empty range");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for str_lines
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_str_lines() {
+    print("--- str_lines ---\n");
+    var lines1: Vec<str> = c_str_lines("line1\nline2\nline3");
+    assert_eq_i64(lines1.len(), 3, "3 lines count");
+    assert_eq_str(lines1.get(0), "line1", "line 0");
+    assert_eq_str(lines1.get(1), "line2", "line 1");
+    assert_eq_str(lines1.get(2), "line3", "line 2");
+
+    var lines2: Vec<str> = c_str_lines("");
+    assert_eq_i64(lines2.len(), 1, "empty (1 element)");
+
+    var lines3: Vec<str> = c_str_lines("only line");
+    assert_eq_i64(lines3.len(), 1, "single line");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for str_concat3
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_str_concat3() {
+    print("--- str_concat3 ---\n");
+    assert_eq_str(c_str_concat3("foo", "bar", "baz"), "foobarbaz", "basic");
+    assert_eq_str(c_str_concat3("", "", ""), "", "all empty");
+    assert_eq_str(c_str_concat3("a", "", "b"), "ab", "partial empty");
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for classify_error
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_classify_error() {
+    print("--- classify_error ---\n");
+
+    var e1: ErrCode = classify_error("Type error (line 5): undefined variable 'foo'");
+    match e1 {
+        ErrCode::UndefinedVariable => { print("  OK: undefined variable\n"); }
+        _ => { print("  FAIL: expected UndefinedVariable\n"); assert(false); }
+    }
+
+    var e2: ErrCode = classify_error("Type error (line 10): undefined function 'bar'");
+    match e2 {
+        ErrCode::UndefinedFunction => { print("  OK: undefined function\n"); }
+        _ => { print("  FAIL: expected UndefinedFunction\n"); assert(false); }
+    }
+
+    var e3: ErrCode = classify_error("Parse error at 5:10: expected ';' but got 'Ident'");
+    match e3 {
+        ErrCode::ExpectedToken => { print("  OK: parse error -> ExpectedToken\n"); }
+        _ => { print("  FAIL: expected ExpectedToken\n"); assert(false); }
+    }
+
+    var e4: ErrCode = classify_error("Capability error: Net not granted");
+    match e4 {
+        ErrCode::CapabilityDenied => { print("  OK: capability denied\n"); }
+        _ => { print("  FAIL: expected CapabilityDenied\n"); assert(false); }
+    }
+
+    var e5: ErrCode = classify_error("Some unknown error");
+    match e5 {
+        ErrCode::Custom => { print("  OK: unknown -> Custom\n"); }
+        _ => { print("  FAIL: expected Custom\n"); assert(false); }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for errcode_to_str
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_errcode_to_str() {
+    print("--- errcode_to_str ---\n");
+
+    assert(str_equal(errcode_to_str(ErrCode::UndefinedVariable), "UndefinedVariable"));
+    print("  OK: UndefinedVariable\n");
+
+    assert(str_equal(errcode_to_str(ErrCode::TypeMismatch), "TypeMismatch"));
+    print("  OK: TypeMismatch\n");
+
+    assert(str_equal(errcode_to_str(ErrCode::Custom), "Custom"));
+    print("  OK: Custom\n");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for merge_programs
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_merge_programs() {
+    print("--- merge_programs ---\n");
+
+    // Create a minimal stdlib program with one function
+    var stdlib: Program = program_new();
+    var std_func: Func = Func_new("std_print", Type::Void);
+    std_func.is_pub = true;
+    stdlib.funcs.push(std_func);
+
+    // Create a user program with one function and one that conflicts
+    var user: Program = program_new();
+    var user_func: Func = Func_new("my_func", Type::Void);
+    user.funcs.push(user_func);
+    // User also defines std_print (overrides stdlib)
+    var user_std: Func = Func_new("std_print", Type::I64);
+    user.funcs.push(user_std);
+
+    var merged: Program = merge_programs(stdlib, user);
+
+    // Should have 2 functions: my_func and std_print (user version)
+    assert(merged.funcs.len() == 2);
+    print("  OK: merged has 2 functions\n");
+
+    // Check that user's std_print (ret I64) overrode stdlib's (ret Void)
+    var found_user_std: bool = false;
+    var i: i64 = 0;
+    while i < merged.funcs.len() {
+        if str_equal(merged.funcs.get(i).name, "std_print") {
+            match merged.funcs.get(i).ret_ty {
+                Type::I64 => { found_user_std = true; }
+                _ => { }
+            }
+        }
+        i = i + 1;
+    }
+    assert(found_user_std);
+    print("  OK: user std_print overrode stdlib\n");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for apply_cfg_filter
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_apply_cfg_filter() {
+    print("--- apply_cfg_filter ---\n");
+
+    // Create a program with functions, some with @cfg annotations
+    var program: Program = program_new();
+    var func1: Func = Func_new("always_present", Type::Void);
+    program.funcs.push(func1);
+
+    // apply_cfg_filter should not remove functions without @cfg
+    apply_cfg_filter(&mut program);
+    assert(program.funcs.len() == 1);
+    print("  OK: function without @cfg preserved\n");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for process_derive
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_process_derive() {
+    print("--- process_derive ---\n");
+
+    // Create a program with a struct that has @derive(Debug, Clone)
+    var program: Program = program_new();
+    var s: StructDef = StructDef_new("MyStruct", true);
+    s.fields.push(Param_new("x", Type::I64, true));
+    s.fields.push(Param_new("y", Type::Str, true));
+    s.annotations.push(Annotation_new("derive", c_vec2_str("Debug", "Clone")));
+    program.structs.push(s);
+
+    process_derive(&mut program);
+
+    // Should have generated MyStruct_debug_str and MyStruct_clone
+    var found_debug: bool = false;
+    var found_clone: bool = false;
+    var i: i64 = 0;
+    while i < program.funcs.len() {
+        if str_equal(program.funcs.get(i).name, "MyStruct_debug_str") { found_debug = true; }
+        if str_equal(program.funcs.get(i).name, "MyStruct_clone") { found_clone = true; }
+        i = i + 1;
+    }
+    assert(found_debug);
+    print("  OK: generated debug_str\n");
+    assert(found_clone);
+    print("  OK: generated clone\n");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for default_expr_for_type
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_default_expr_for_type() {
+    print("--- default_expr_for_type ---\n");
+
+    var e1: Expr = default_expr_for_type(Type::I64);
+    match e1 {
+        Expr::IntLit(v) => { assert(v == 0); print("  OK: i64 -> 0\n"); }
+        _ => { print("  FAIL: expected IntLit\n"); assert(false); }
+    }
+
+    var e2: Expr = default_expr_for_type(Type::Bool);
+    match e2 {
+        Expr::BoolLit(v) => { assert(v == false); print("  OK: bool -> false\n"); }
+        _ => { print("  FAIL: expected BoolLit\n"); assert(false); }
+    }
+
+    var e3: Expr = default_expr_for_type(Type::Str);
+    match e3 {
+        Expr::StringLit(v) => { assert(str_equal(v, "")); print("  OK: str -> empty\n"); }
+        _ => { print("  FAIL: expected StringLit\n"); assert(false); }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests for strip_ungranted_caps
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn test_strip_ungranted_caps() {
+    print("--- strip_ungranted_caps ---\n");
+
+    // Create an IR module with main + a function that uses Net effect
+    var module: IrModule = IrModule_new();
+
+    // Add main function (should never be stripped)
+    var main_func: IrFunction = IrFunction_new("main", IrType::I64);
+    module.functions.push(IrFunctionEntry_new("main", main_func));
+    module.function_effects.push(StringEffectSetEntry_new("main", EffectSet_new()));
+
+    // Add a net function (should be stripped if Net not granted)
+    var net_func: IrFunction = IrFunction_new("fetch_url", IrType::I64);
+    module.functions.push(IrFunctionEntry_new("fetch_url", net_func));
+    var net_effects: EffectSet = EffectSet_new();
+    EffectSet_add(&mut net_effects, Effect::Net);
+    module.function_effects.push(StringEffectSetEntry_new("fetch_url", net_effects));
+
+    // Strip without Net cap — fetch_url should be removed
+    strip_ungranted_caps(&mut module, c_vec0_str());
+
+    var has_main: bool = false;
+    var has_fetch: bool = false;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        if str_equal(module.functions.get(i).name, "main") { has_main = true; }
+        if str_equal(module.functions.get(i).name, "fetch_url") { has_fetch = true; }
+        i = i + 1;
+    }
+    assert(has_main);
+    print("  OK: main preserved\n");
+    assert(!has_fetch);
+    print("  OK: fetch_url stripped (no Net cap)\n");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Main — run all tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn main() {
+    print("=== test_compiler.fd ===\n\n");
+
+    test_edit_distance();
+    test_parse_error_position();
+    test_is_capability();
+    test_str_split_n();
+    test_str_trim_quotes();
+    test_str_find_last();
+    test_path_join();
+    test_path_dirname();
+    test_str_vec_contains();
+    test_str_join();
+    test_str_pad_left();
+    test_helper_types();
+    test_extract_line_col();
+    test_enrich_errors();
+    test_extract_help();
+    test_str_substr();
+    test_str_lines();
+    test_str_concat3();
+    test_classify_error();
+    test_errcode_to_str();
+    test_merge_programs();
+    test_apply_cfg_filter();
+    test_process_derive();
+    test_default_expr_for_type();
+    test_strip_ungranted_caps();
+
+    print("\n=== All tests passed! ===\n");
+}

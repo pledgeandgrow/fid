@@ -1240,6 +1240,12 @@ impl Lowerer {
             Type::ArrayConst { elem, size_param } => {
                 Type::ArrayConst { elem: Box::new(self.resolve_type(elem)), size_param: size_param.clone() }
             }
+            Type::Generic { name, args } => {
+                Type::Generic {
+                    name: name.clone(),
+                    args: args.iter().map(|a| self.resolve_type(a)).collect(),
+                }
+            }
             other => other.clone(),
         }
     }

@@ -902,6 +902,200 @@ fn test_pass_loop_vectorize() {
     assert_true(count >= 1, "loop_vectorize widens at least 1 loop step");
 }
 
+// ── Test 27: pass_effect_reorder ──
+fn test_pass_effect_reorder() {
+    print("Test 27: pass_effect_reorder...\n");
+    var module: L2Module = L2Module_new();
+    var f: L2Function = L2Function_new("reorder_test", IrType::I64);
+
+    // Create a block with pure instructions after side-effecting ones:
+    // v0 = Store(ptr, val) -- side-effecting
+    // v1 = ConstInt(42)    -- pure (can be hoisted)
+    // v2 = ConstInt(10)    -- pure (can be hoisted)
+    // v3 = BinOp(Add, 1, 2) -- pure
+    // v4 = Return(3)
+    L2Function_set_value(&mut f, 0, L2Inst::Store(100, 200, IrType::I64));
+    L2Function_set_value(&mut f, 1, L2Inst::ConstInt(42, IrType::I64));
+    L2Function_set_value(&mut f, 2, L2Inst::ConstInt(10, IrType::I64));
+    L2Function_set_value(&mut f, 3, L2Inst::BinOp(BinOp::Add, 1, 2, IrType::I64));
+    L2Function_set_value(&mut f, 4, L2Inst::Return(3));
+
+    var block: L2Block = L2Block_new(0);
+    block.instructions.push(0);
+    block.instructions.push(1);
+    block.instructions.push(2);
+    block.instructions.push(3);
+    block.instructions.push(4);
+    f.blocks.push(block);
+    f.entry = 0;
+    module.functions.push(f);
+
+    var count: i64 = pass_effect_reorder(&mut module);
+    // Should reorder: pure instructions (v1, v2, v3) moved before store (v0)
+    assert_true(count >= 1, "effect_reorder hoists at least 1 pure instruction");
+
+    // Verify pure instructions are now before the store
+    var insts: Vec<i64> = module.functions.get(0).blocks.get(0).instructions;
+    var store_pos: i64 = -1;
+    var first_pure_pos: i64 = -1;
+    var i: i64 = 0;
+    while i < insts.len() {
+        if insts.get(i) == 0 {
+            store_pos = i;
+        }
+        if insts.get(i) == 1 && first_pure_pos < 0 {
+            first_pure_pos = i;
+        }
+        i = i + 1;
+    }
+    if first_pure_pos < store_pos {
+        print("  OK: pure instructions hoisted before store\n");
+    } else {
+        p_panic("FAIL: pure instructions not hoisted before store");
+    }
+}
+
+// ── Test 28: pass_region_pool ──
+fn test_pass_region_pool() {
+    print("Test 28: pass_region_pool...\n");
+    var module: L2Module = L2Module_new();
+    var f: L2Function = L2Function_new("region_test", IrType::I64);
+
+    // Create two large allocas in the same named region (> 4KB total)
+    // v0 = Alloca(I64, Named("r1")) -- 8 bytes
+    // v1 = Alloca(I64, Named("r1")) -- 8 bytes
+    // ... need > 4096 total, so use many allocas
+    // Actually, with only 2 allocas of 8 bytes each = 16 bytes < 4096
+    // So this test should return 0 (no pooling for small regions)
+    L2Function_set_value(&mut f, 0, L2Inst::Alloca(IrType::I64, MemRegion::Named("r1")));
+    L2Function_set_value(&mut f, 1, L2Inst::Alloca(IrType::I64, MemRegion::Named("r1")));
+    L2Function_set_value(&mut f, 2, L2Inst::Return(0));
+
+    var block: L2Block = L2Block_new(0);
+    block.instructions.push(0);
+    block.instructions.push(1);
+    block.instructions.push(2);
+    f.blocks.push(block);
+    f.entry = 0;
+    module.functions.push(f);
+
+    var count: i64 = pass_region_pool(&mut module);
+    // Small region (16 bytes) should NOT be pooled (< 4096 threshold)
+    assert_eq_i64(count, 0, "region_pool skips small regions");
+    print("  OK: small region not pooled\n");
+}
+
+// ── Test 29: pass_slp_vectorize ──
+fn test_pass_slp_vectorize() {
+    print("Test 29: pass_slp_vectorize...\n");
+    var module: L2Module = L2Module_new();
+    var f: L2Function = L2Function_new("slp_test", IrType::Void);
+
+    // Create a block with two adjacent F64 loads from consecutive indices:
+    // v0 = ConstInt(0)             -- index 0
+    // v1 = GetElemPtr(arr, 0, F64) -- gep for index 0
+    // v2 = Load(1, F64)            -- load arr[0]
+    // v3 = ConstInt(1)             -- index 1
+    // v4 = GetElemPtr(arr, 3, F64) -- gep for index 1
+    // v5 = Load(4, F64)            -- load arr[1]
+    // v6 = Return(-1)
+    L2Function_set_value(&mut f, 0, L2Inst::ConstInt(0, IrType::I64));
+    L2Function_set_value(&mut f, 1, L2Inst::GetElemPtr(100, 0, IrType::F64));  // arr=100, idx_vid=0
+    L2Function_set_value(&mut f, 2, L2Inst::Load(1, IrType::F64));
+    L2Function_set_value(&mut f, 3, L2Inst::ConstInt(1, IrType::I64));
+    L2Function_set_value(&mut f, 4, L2Inst::GetElemPtr(100, 3, IrType::F64));  // arr=100, idx_vid=3 (consecutive: 0+1=1)
+    L2Function_set_value(&mut f, 5, L2Inst::Load(4, IrType::F64));
+    L2Function_set_value(&mut f, 6, L2Inst::Return(-1));
+
+    var block: L2Block = L2Block_new(0);
+    block.instructions.push(0);
+    block.instructions.push(1);
+    block.instructions.push(2);
+    block.instructions.push(3);
+    block.instructions.push(4);
+    block.instructions.push(5);
+    block.instructions.push(6);
+    f.blocks.push(block);
+    f.entry = 0;
+    module.functions.push(f);
+
+    var count: i64 = pass_slp_vectorize(&mut module);
+    // Should find the consecutive load pair and create a p_simd_load
+    assert_true(count >= 1, "slp_vectorize finds at least 1 consecutive load pair");
+    print("  OK: SLP vectorization detected consecutive loads\n");
+}
+
+// ── Test 30: pass_loop_rotate ──
+fn test_pass_loop_rotate() {
+    print("Test 30: pass_loop_rotate...\n");
+    var module: L2Module = L2Module_new();
+    var f: L2Function = L2Function_new("rotate_test", IrType::I64);
+
+    // Create a simple while loop with a preheader:
+    // Preheader (id=0): Jump(Header)
+    // Header (id=1): Branch(cond, Body, Exit)
+    // Body (id=2): ... instructions ... Jump(Header)
+    // Exit (id=3): Return
+
+    // Preheader: v0 = Jump(1)
+    L2Function_set_value(&mut f, 0, L2Inst::Jump(1));
+    var preheader: L2Block = L2Block_new(0);
+    preheader.instructions.push(0);
+    f.blocks.push(preheader);
+
+    // Header (id=1):
+    // v1 = Load(100, I64) -- load counter (ptr=100)
+    L2Function_set_value(&mut f, 1, L2Inst::Load(100, IrType::I64));
+    // v2 = ConstInt(10) -- trip count
+    L2Function_set_value(&mut f, 2, L2Inst::ConstInt(10, IrType::I64));
+    // v3 = BinOp(Lt, 1, 2) -- cond = counter < 10
+    L2Function_set_value(&mut f, 3, L2Inst::BinOp(BinOp::Lt, 1, 2, IrType::I64));
+    // v4 = Branch(3, 2, 3) -- if cond goto Body(2) else Exit(3)
+    L2Function_set_value(&mut f, 4, L2Inst::Branch(3, 2, 3));
+
+    var header: L2Block = L2Block_new(1);
+    header.instructions.push(1);
+    header.instructions.push(2);
+    header.instructions.push(3);
+    header.instructions.push(4);
+    f.blocks.push(header);
+
+    // Body (id=2): increment counter and jump back
+    // v5 = ConstInt(1)
+    L2Function_set_value(&mut f, 5, L2Inst::ConstInt(1, IrType::I64));
+    // v6 = BinOp(Add, 1, 5) -- counter + 1
+    L2Function_set_value(&mut f, 6, L2Inst::BinOp(BinOp::Add, 1, 5, IrType::I64));
+    // v7 = Store(100, 6) -- store counter
+    L2Function_set_value(&mut f, 7, L2Inst::Store(100, 6, IrType::I64));
+    // v8 = Jump(1) -- back to header
+    L2Function_set_value(&mut f, 8, L2Inst::Jump(1));
+
+    var body: L2Block = L2Block_new(2);
+    body.instructions.push(5);
+    body.instructions.push(6);
+    body.instructions.push(7);
+    body.instructions.push(8);
+    f.blocks.push(body);
+
+    // Exit (id=3): return
+    // v9 = Return(0)
+    L2Function_set_value(&mut f, 9, L2Inst::Return(0));
+    var exit: L2Block = L2Block_new(3);
+    exit.instructions.push(9);
+    f.blocks.push(exit);
+
+    f.entry = 0;
+    module.functions.push(f);
+
+    var count: i64 = pass_loop_rotate(&mut module);
+    // Should rotate the loop (create a new rotated block)
+    assert_eq_i64(count, 1, "loop_rotate rotates 1 loop");
+
+    // Verify a new block was added (original had 4 blocks, now should have 5)
+    assert_eq_i64(module.functions.get(0).blocks.len(), 5, "rotated block added");
+    print("  OK: loop rotated successfully\n");
+}
+
 // ── Main ──
 fn main() -> i64 {
     print("=== compiler::opt tests ===\n\n");
@@ -932,6 +1126,10 @@ fn main() -> i64 {
     test_pass_alias_analysis();
     test_pass_effect_optimize();
     test_pass_loop_vectorize();
+    test_pass_effect_reorder();
+    test_pass_region_pool();
+    test_pass_slp_vectorize();
+    test_pass_loop_rotate();
 
     print("\n=== All opt tests passed ===\n");
     return 0;
