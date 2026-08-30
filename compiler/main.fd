@@ -78,9 +78,11 @@ fn cmd_ccompile(n: i64) -> i64 {
             var c_file: str = output + ".c";
             p_file_write(c_file, c_code);
             
-            // Run gcc to compile the C code
-            var gcc_cmd: str = "gcc -O2 -Wno-int-conversion -Wno-incompatible-pointer-types -fstack-protector-strong -fPIE -pie -Wl,-z,relro,-z,now -o ";
-            gcc_cmd = gcc_cmd + output + " " + c_file;
+            // Run tcc to compile the C code (0.25s vs 2s for gcc -O0 -w)
+            // tcc needs a stub stdatomic.h — create it if missing
+            p_file_write("/tmp/stdatomic.h", "// tcc stub\n#include <stdint.h>\ntypedef int64_t atomic_int_least64_t;\ntypedef int atomic_int;\nstatic inline void atomic_init(volatile int64_t* p, int64_t v) { *p = v; }\nstatic inline int64_t atomic_load(volatile int64_t* p) { return *p; }\nstatic inline void atomic_store(volatile int64_t* p, int64_t v) { *p = v; }\nstatic inline int atomic_compare_exchange_strong(volatile int64_t* p, int64_t* expected, int64_t desired) { if (*p == *expected) { *p = desired; return 1; } *expected = *p; return 0; }\nstatic inline int64_t atomic_fetch_add(volatile int64_t* p, int64_t v) { int64_t old = *p; *p += v; return old; }\nstatic inline int64_t atomic_fetch_sub(volatile int64_t* p, int64_t v) { int64_t old = *p; *p -= v; return old; }\n");
+            var gcc_cmd: str = "tcc -w -I/tmp -o ";
+            gcc_cmd = gcc_cmd + output + " " + c_file + " -lm";
             var ret: i64 = p_system(gcc_cmd);
             
             if ret != 0 {
