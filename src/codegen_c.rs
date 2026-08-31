@@ -673,6 +673,7 @@ impl CCodeGen {
         wln!(self, "#include <stdio.h>");
         wln!(self, "#include <stdlib.h>");
         wln!(self, "#include <string.h>");
+        wln!(self, "#include <alloca.h>");
         wln!(self, "#include <stdint.h>");
         wln!(self, "#include <stdbool.h>");
         wln!(self, "#include <ctype.h>");
@@ -1394,9 +1395,10 @@ impl CCodeGen {
                 };
                 // Ensure at least 1 byte to avoid malloc(0) undefined behavior
                 let size = if size == 0 { 8 } else { size };
-                // Use calloc to zero-initialize memory, preventing uninitialized
-                // variable bugs when code paths skip the initialization store.
-                wln!(self, "    {} = calloc(1, {});", dst, size);
+                // Use alloca() for stack allocation instead of calloc() for heap.
+                // This is dramatically faster — no syscall, no malloc overhead.
+                wln!(self, "    {} = alloca({});", dst, size);
+                wln!(self, "    memset({}, 0, {});", dst, size);
             }
             Inst::Load { ptr, ty } => {
                 let p = self.val_name(*ptr);

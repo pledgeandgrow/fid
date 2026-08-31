@@ -113,22 +113,22 @@ cargo build
 ./target/release/veil <file.fd> [--format text|html] [--output <dir>]
 ```
 
-## Current Baseline (as of Aug 29, 2026)
+## Current Baseline (as of Aug 31, 2026)
 
 ```
 Unit tests:   265/265 passed  (All passing — cargo test --lib)
 Harness:      8/8 passed      (All passing — all 3 self-host blockers pass on all backends)
-Interpreter:  167/167 normal  (+ 36 expected-fail, + 0 skip, + 0 known-fail)
-C Codegen:    167/167 matched (0 skip — all tests pass on C codegen)
-PE Emitter:   167/167 valid   (0 known-fail — all pass)
-Total .fd:    222 test files  (195 in tests/; 4 in compiler/tests/; 23 in subdirs: capability/effects/regions/safety)
+Interpreter:  188/188 normal  (+ 36 expected-fail, + 0 skip, + 0 known-fail)
+C Codegen:    185/188 matched (3 fail: test_borrowck, test_fmt_real, test_pir — self-host C codegen issues)
+PE Emitter:   188/188 valid   (0 known-fail — all pass)
+Total .fd:    242 test files  (195 in tests/; 23 in compiler/tests/; 24 in subdirs: capability/effects/regions/safety)
 Skip list:    1 test          (bench_stringbuilder — timing benchmark)
 Expected-fail: 36 tests       (tests that verify compiler error detection — failing is correct)
 Known-fail:   0 tests         (all previously known-fail tests now pass on all 3 backends)
-Source:       54 .rs files, ~86,200 LOC
-Stdlib:       69 .fd modules, 17,541 LOC
-Self-host:    15 .fd modules, 37,584 LOC (token, diag, json, fmt, ast, lexer, parser, ir, typechecker, lower, mono, borrowck, pir, opt, codegen_c, compiler — all compile + pass tests; opt.fd has 23/23 passes fully implemented with 30 tests; 23/23 self-host tests pass on all 3 backends)
-Docs:         21 docs/ + 4 root = 25 .md files
+Source:       55 .rs files, ~88,300 LOC
+Stdlib:       69 .fd modules, 18,242 LOC
+Self-host:    17 .fd modules, ~41,800 LOC (token, diag, json, fmt, ast, lexer, parser, ir, typechecker, lower, mono, borrowck, pir, opt, codegen_c, compiler, comptime_eval — all compile + pass tests; 23/23 self-host tests pass on all 3 backends; SH-10 critical fixes done: Inst::Cast, ConstFloat f64, CallPtr, comptime stubs, Expr::Try, emit_defers, import errors)
+Docs:         25 docs/ + 4 root = 29 .md files
 Binaries:     4 (fidesc, pacte, scribe, veil)
 Warnings:     136 (dead code in pe.rs/opt.rs/debugger.rs/wasm.rs/fmt.rs — future feature stubs)
 ```
