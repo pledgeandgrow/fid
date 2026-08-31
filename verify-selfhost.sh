@@ -5,6 +5,7 @@
 #   ./verify-selfhost.sh              Run all compiler/tests/*.fd on 3 backends, diff vs baseline
 #   ./verify-selfhost.sh --save       Run all tests, save results as new baseline
 #   ./verify-selfhost.sh --quick      Build only (no tests)
+#   ./verify-selfhost.sh --verbose    Show test output (always shown on failure)
 #   ./verify-selfhost.sh --list       List all self-host test files
 #   ./verify-selfhost.sh --help       Show this help
 #
@@ -35,6 +36,16 @@ TEST_DIR="compiler/tests"
 BASELINE_DIR="compiler/tests/baseline"
 BASELINE_FILE="$BASELINE_DIR/test_results.txt"
 
+# Temp file for capturing test output (shown on failure)
+TMP_OUT=$(mktemp)
+trap 'rm -f "$TMP_OUT"' EXIT
+
+# --verbose: show output even for passing tests
+VERBOSE=0
+for arg in "$@"; do
+    [[ "$arg" == "--verbose" ]] && VERBOSE=1
+done
+
 # --- Help ---
 if [[ "$1" == "--help" || "$1" == "-h" ]]; then
     cat <<'EOF'
@@ -44,6 +55,7 @@ Commands:
   (default)  Build release + run all compiler/tests/*.fd on 3 backends, diff vs baseline
   --save     Build release + run all tests, save results as new baseline
   --quick    Build release only (no tests)
+  --verbose  Show test output even for passing tests (always shown on failure)
   --list     List all self-host test files
   --help     This help message
 
@@ -137,12 +149,16 @@ echo -e "${YELLOW}=== Interpreter ===${NC}"
 OUTPUT="${OUTPUT}=== Interpreter ===\n"
 for f in "${TEST_FILES[@]}"; do
     name=$(basename "$f")
-    if $FIDESC run "$f" > /dev/null 2>&1; then
+    if $FIDESC run "$f" > "$TMP_OUT" 2>&1; then
         echo -e "  ${GREEN}PASS${NC} $name"
+        [[ $VERBOSE -eq 1 ]] && sed 's/^/    /' "$TMP_OUT" | head -20
         OUTPUT="${OUTPUT}${name}: PASS\n"
         INT_PASS=$((INT_PASS + 1))
     else
         echo -e "  ${RED}FAIL${NC} $name"
+        echo -e "  ${RED}--- output (head) ---${NC}"
+        sed 's/^/  /' "$TMP_OUT" | head -40
+        echo -e "  ${RED}--- end ---${NC}"
         OUTPUT="${OUTPUT}${name}: FAIL\n"
         INT_FAIL=$((INT_FAIL + 1))
     fi
@@ -159,12 +175,16 @@ echo -e "${YELLOW}=== C Codegen ===${NC}"
 OUTPUT="${OUTPUT}\n=== C Codegen ===\n"
 for f in "${TEST_FILES[@]}"; do
     name=$(basename "$f")
-    if $FIDESC run "$f" --backend c > /dev/null 2>&1; then
+    if $FIDESC run "$f" --backend c > "$TMP_OUT" 2>&1; then
         echo -e "  ${GREEN}PASS${NC} $name"
+        [[ $VERBOSE -eq 1 ]] && sed 's/^/    /' "$TMP_OUT" | head -20
         OUTPUT="${OUTPUT}${name}: PASS\n"
         C_PASS=$((C_PASS + 1))
     else
         echo -e "  ${RED}FAIL${NC} $name"
+        echo -e "  ${RED}--- output (head) ---${NC}"
+        sed 's/^/  /' "$TMP_OUT" | head -40
+        echo -e "  ${RED}--- end ---${NC}"
         OUTPUT="${OUTPUT}${name}: FAIL\n"
         C_FAIL=$((C_FAIL + 1))
     fi
@@ -180,12 +200,16 @@ echo -e "${YELLOW}=== PE Emitter ===${NC}"
 OUTPUT="${OUTPUT}\n=== PE Emitter ===\n"
 for f in "${TEST_FILES[@]}"; do
     name=$(basename "$f")
-    if $FIDESC run "$f" --backend pe > /dev/null 2>&1; then
+    if $FIDESC run "$f" --backend pe > "$TMP_OUT" 2>&1; then
         echo -e "  ${GREEN}PASS${NC} $name"
+        [[ $VERBOSE -eq 1 ]] && sed 's/^/    /' "$TMP_OUT" | head -20
         OUTPUT="${OUTPUT}${name}: PASS\n"
         PE_PASS=$((PE_PASS + 1))
     else
         echo -e "  ${RED}FAIL${NC} $name"
+        echo -e "  ${RED}--- output (head) ---${NC}"
+        sed 's/^/  /' "$TMP_OUT" | head -40
+        echo -e "  ${RED}--- end ---${NC}"
         OUTPUT="${OUTPUT}${name}: FAIL\n"
         PE_FAIL=$((PE_FAIL + 1))
     fi

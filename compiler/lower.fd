@@ -267,7 +267,7 @@ pub enum OptStringLower {
 pub fn c_str_vec_contains(vec: Vec<str>, s: str) -> bool {
     var i: i64 = 0;
     while i < vec.len() {
-        if vec.get(i) == s { return true; }
+        if str_equal(vec.get(i), s) { return true; }
         i = i + 1;
     }
     return false;
@@ -631,6 +631,20 @@ pub fn Lowerer_is_async_func(self: &Lowerer, name: str) -> bool {
     return false;
 }
 
+// Check if a function is an extern (declared, not defined).
+pub fn Lowerer_is_extern_func(self: &Lowerer, name: str) -> bool {
+    var i: i64 = 0;
+    while i < self.module.extern_functions.len() {
+        if str_equal(self.module.extern_functions.get(i).name, name) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn lower_str_starts_with(s: str, prefix: str) -> bool {
+    return p_string_starts_with(s, prefix);
+}
+
 pub fn Lowerer_lookup_param_type(self: &Lowerer, name: str) -> OptType {
     var i: i64 = 0;
     while i < self.current_func_param_types.len() {
@@ -704,6 +718,15 @@ pub fn Lowerer_insert_vec_alloca(self: &mut Lowerer, id: i64) {
 }
 
 // ─── Emit helpers ─────────────────────────────────────────────────────────
+
+/// Check if a function name is a user-defined function (not a runtime builtin).
+/// User functions get __env as first argument; runtime functions (p_*, __ecs_*) don't.
+pub fn Lowerer_is_user_func(self: &Lowerer, name: str) -> bool {
+    match IrModule_get_function(&self.module, name) {
+        OptIrFunction::Some(_) => { return true; }
+        OptIrFunction::None => { return false; }
+    }
+}
 
 pub fn Lowerer_emit_inst(self: &mut Lowerer, inst: Inst) -> i64 {
     return IrFunction_emit(&mut self.current_func, inst);
@@ -2119,14 +2142,12 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
             var idx_val: i64 = Lowerer_lower_expr(self, index);
             var arr_ty: IrType = Lowerer_get_value_type(self, arr_val);
 
-            // Vec indexing — call Vec_set / Vec_get
+            // Vec indexing — call Vec_set / Vec_get (runtime funcs, no __env)
             if ir_type_is_opaque_named(arr_ty, "Vec") {
-                var dummy_env: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
                 match op {
                     AssignOp::Assign => {
                         var val: i64 = Lowerer_lower_expr(self, expr);
                         var args: Vec<i64> = Vec::new();
-                        args.push(dummy_env);
                         args.push(arr_val);
                         args.push(idx_val);
                         args.push(val);
@@ -2135,14 +2156,12 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
                     _ => {
                         // Compound: Vec_get, binop, Vec_set
                         var get_args: Vec<i64> = Vec::new();
-                        get_args.push(dummy_env);
                         get_args.push(arr_val);
                         get_args.push(idx_val);
                         var current: i64 = Lowerer_emit_inst(self, Inst::Call("Vec_get", get_args, IrType::I64, EffectSet_new()));
                         var rhs: i64 = Lowerer_lower_expr(self, expr);
                         var new_val: i64 = Lowerer_lower_compound_assign(self, op, current, rhs);
                         var set_args: Vec<i64> = Vec::new();
-                        set_args.push(dummy_env);
                         set_args.push(arr_val);
                         set_args.push(idx_val);
                         set_args.push(new_val);
@@ -2445,9 +2464,7 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
 
             // String equality: str == str → p_str_equal
             if (binop_eq(op, BinOp::Eq) || binop_eq(op, BinOp::Neq)) && ir_type_eq(left_ir_ty, ptr_u8()) && ir_type_eq(right_ir_ty, ptr_u8()) {
-                var dummy_env: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
                 var args: Vec<i64> = Vec::new();
-                args.push(dummy_env);
                 args.push(left_val);
                 args.push(right_val);
                 var eq_val: i64 = Lowerer_emit_inst(self, Inst::Call("p_str_equal", args, IrType::Bool, EffectSet_new()));
@@ -2506,7 +2523,7 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             // Runtime functions (p_*, __ecs_*) and externs don't take __env.
             var call_args: Vec<i64> = Vec::new();
             var is_user_func: bool = Lowerer_is_user_func(self, callee);
-            var is_runtime: bool = !is_user_func && (str_starts_with(callee, "p_") || str_starts_with(callee, "__ecs_"));
+            var is_runtime: bool = !is_user_func && (lower_str_starts_with(callee, "p_") || lower_str_starts_with(callee, "__ecs_"));
             if is_user_func && !is_runtime {
                 call_args.push(Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64)));  // __env
             }
@@ -2565,9 +2582,13 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                 ret_ty = Lowerer_lookup_func_ret_ty_ir(self, method);
             }
 
-            // Build call args: __env, receiver, args...
+            // Build call args: __env (for user funcs only), receiver, args...
             var call_args: Vec<i64> = Vec::new();
-            call_args.push(Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64)));  // __env
+            var mangled_is_user: bool = Lowerer_is_user_func(self, mangled_name);
+            var mangled_is_extern: bool = Lowerer_is_extern_func(self, mangled_name);
+            if mangled_is_user && !mangled_is_extern {
+                call_args.push(Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64)));  // __env
+            }
             call_args.push(recv_val);
             ai = 0;
             while ai < arg_vals.len() {
@@ -3315,7 +3336,11 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                     }
                     var ret_ty: IrType = Lowerer_lookup_func_ret_ty_ir(self, callee);
                     var call_args: Vec<i64> = Vec::new();
-                    call_args.push(Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64)));  // __env
+                    var pipe_is_user: bool = Lowerer_is_user_func(self, callee);
+                    var pipe_is_extern: bool = Lowerer_is_extern_func(self, callee);
+                    if pipe_is_user && !pipe_is_extern {
+                        call_args.push(Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64)));  // __env
+                    }
                     i = 0;
                     while i < arg_vals.len() {
                         call_args.push(arg_vals.get(i));
@@ -3714,9 +3739,7 @@ pub fn Lowerer_lower_for(self: &mut Lowerer, loop_var: str, iterator: Expr, body
             }
             // Check if HashMap — get keys as Vec
             if ir_type_is_opaque_named(iter_ty, "HashMap") {
-                var dummy_env: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
                 var args: Vec<i64> = Vec::new();
-                args.push(dummy_env);
                 args.push(iter_val);
                 var keys_vec: i64 = Lowerer_emit_inst(self, Inst::Call("HashMap_keys", args, opaque_ty("Vec"), EffectSet_new()));
                 Lowerer_lower_for_vec(self, loop_var, keys_vec, body);

@@ -1461,8 +1461,16 @@ impl CCodeGen {
                     IrType::U64 => {
                         wln!(self, "    *(uint64_t*){} = (uint64_t){};", p, v);
                     }
+                    IrType::Struct(name) => {
+                        // Struct store: copy the full struct content, not just
+                        // 8 bytes. The value is a pointer to the struct (structs
+                        // are passed by pointer in Fides). Use memcpy to copy
+                        // the struct's full size from the source pointer.
+                        let size = self.struct_layouts.get(name).map(|l| l.size).unwrap_or(8);
+                        wln!(self, "    memcpy({}, {}, {});", p, v, size);
+                    }
                     _ => {
-                        // I64, Void, Never, Struct, Array — store as int64_t
+                        // I64, Void, Never, Array — store as int64_t
                         wln!(self, "    *(int64_t*){} = (int64_t){};", p, v);
                     }
                 }

@@ -282,6 +282,12 @@ pub struct Interpreter {
     /// Call stack — list of function names for stack traces on panic.
     /// Pushed on run_function entry, popped on return/panic.
     call_stack: Vec<String>,
+    /// Parallel to call_stack — source line of the call site for each frame.
+    /// None for the entry frame (main) or internal runtime calls.
+    call_site_lines: Vec<Option<usize>>,
+    /// Set by execute_inst before calling run_function for a user function,
+    /// so run_function can record the call-site source line. Consumed on push.
+    pending_call_site: Option<usize>,
     /// Stack trace captured at the point of panic (before unwinding).
     /// None if no panic has occurred or the trace was already consumed.
     panic_stack_trace: Option<String>,
@@ -473,6 +479,8 @@ impl Interpreter {
             wrapping_funcs: HashSet::new(),
             current_func_name: String::new(),
             call_stack: Vec::new(),
+            call_site_lines: Vec::new(),
+            pending_call_site: None,
             panic_stack_trace: None,
             interp_unsafe_depth: 0,
             futures: Vec::new(),
@@ -858,12 +866,18 @@ impl Interpreter {
             return String::new();
         }
         let mut out = String::from("stack trace:\n");
-        // Print from most recent (top) to outermost (bottom)
+        // Print from most recent (top) to outermost (bottom).
+        // call_site_lines is parallel to call_stack — zip from the end.
+        let sites_rev: Vec<&Option<usize>> = self.call_site_lines.iter().rev().collect();
         for (i, name) in self.call_stack.iter().rev().enumerate() {
+            let suffix = match sites_rev.get(i).and_then(|l| **l) {
+                Some(l) => format!(" at line {}", l),
+                None => String::new(),
+            };
             if i == 0 {
-                out.push_str(&format!("    → {}\n", name));
+                out.push_str(&format!("    → {}{}\n", name, suffix));
             } else {
-                out.push_str(&format!("    ↳ called from {}\n", name));
+                out.push_str(&format!("    ↳ called from {}{}\n", name, suffix));
             }
         }
         out
@@ -904,6 +918,7 @@ impl Interpreter {
         let saved_func_name = self.current_func_name.clone();
         self.current_func_name = func.name.clone();
         self.call_stack.push(func.name.clone());
+        self.call_site_lines.push(self.pending_call_site.take());
         // Save region_stack depth — restore on exit so early returns inside
         // region blocks don't corrupt the stack for subsequent calls.
         let saved_region_depth = self.region_stack.len();
@@ -922,6 +937,7 @@ impl Interpreter {
             self.region_stack.truncate(saved_region_depth);
             self.current_func_name = saved_func_name;
             self.call_stack.pop();
+            self.call_site_lines.pop();
             record_profile!();
             return $result;
         }}}
@@ -1051,6 +1067,19 @@ impl Interpreter {
                             let trace = self.format_call_stack();
                             self.panic_stack_trace = Some(trace);
                         }
+                        // Append the source line of the panicking instruction so
+                        // users know exactly which line of their .fd code blew up,
+                        // without needing manual debug prints. Skipped if the
+                        // message already includes a location (e.g. Unreachable,
+                        // Unknown function) to avoid duplication.
+                        let msg = if !msg.contains(" at line ") {
+                            match func.values.get(&inst_id).and_then(|m| m.source_line) {
+                                Some(line) => format!("{} at line {}", msg, line),
+                                None => msg,
+                            }
+                        } else {
+                            msg
+                        };
                         // Transaction rollback: if we're inside a txn block,
                         // restore the most recent snapshot before propagating.
                         if let Some((mem_snap, opaque_snap)) = self.txn_snapshots.pop() {
@@ -1495,6 +1524,7 @@ impl Interpreter {
 
                 // Check if it's a user function
                 if let Some(callee) = self.module.functions.get(name).cloned() {
+                    self.pending_call_site = func.values.get(&inst_id).and_then(|m| m.source_line);
                     return match self.run_function(&callee, &arg_vals) {
                         RunResult::Return(v) => ExecOutcome::Value(v),
                         RunResult::Panic(msg) => ExecOutcome::Panic(msg),
@@ -1550,6 +1580,7 @@ impl Interpreter {
 
                 // Check if it's a user function
                 if let Some(callee) = self.module.functions.get(&fn_name).cloned() {
+                    self.pending_call_site = func.values.get(&inst_id).and_then(|m| m.source_line);
                     let mut all_args = arg_vals;
                     // Only prepend env_ptr if function expects it (has more params than call args)
                     if callee.params.len() > all_args.len() {
@@ -1606,6 +1637,7 @@ impl Interpreter {
                 let mangled = format!("{}_{}", type_name, method);
 
                 if let Some(callee) = self.module.functions.get(&mangled).cloned() {
+                    self.pending_call_site = func.values.get(&inst_id).and_then(|m| m.source_line);
                     if callee.params.len() > all_args.len() {
                         all_args.insert(0, Value::Int(0));
                     }
