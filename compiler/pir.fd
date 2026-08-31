@@ -92,7 +92,7 @@ pub fn CapSet_to_str(self: &CapSet) -> str {
 pub enum L1Inst {
     // ─── Constants ───
     ConstInt(i64, IrType),
-    ConstFloat(i64, IrType),    // bits stored as i64
+    ConstFloat(f64, IrType),    // f64 value stored directly
     ConstBool(bool),
     ConstStr(str),
     ConstNull(IrType),
@@ -440,9 +440,7 @@ pub fn mem_region_eq(a: MemRegion, b: MemRegion) -> bool {
 pub enum L2Inst {
     // ─── Constants ───
     ConstInt(i64, IrType),
-    ConstFloat(i64, IrType),
-    ConstBool(bool),
-    ConstStr(str),
+    ConstFloat(f64, IrType),
     ConstNull(IrType),
 
     // ─── Arithmetic ───
@@ -885,6 +883,7 @@ pub struct L3Module {
     pub trait_impls: Vec<StringVecStr>,
     pub pure_functions: Vec<str>,       // HashSet → Vec
     pub no_alloc_functions: Vec<str>,   // HashSet → Vec
+    pub wrapping_functions: Vec<str>,   // F65: @wrapping functions — codegen skips overflow checks
 }
 
 pub fn L3Module_new() -> L3Module {
@@ -897,6 +896,7 @@ pub fn L3Module_new() -> L3Module {
         trait_impls: Vec::new(),
         pure_functions: Vec::new(),
         no_alloc_functions: Vec::new(),
+        wrapping_functions: Vec::new(),
     };
 }
 
@@ -915,6 +915,17 @@ pub fn L3Module_has_no_alloc(self: &L3Module, name: str) -> bool {
     var i: i64 = 0;
     while i < self.no_alloc_functions.len() {
         if str_equal(self.no_alloc_functions.get(i), name) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn L3Module_has_wrapping(self: &L3Module, name: str) -> bool {
+    var i: i64 = 0;
+    while i < self.wrapping_functions.len() {
+        if str_equal(self.wrapping_functions.get(i), name) {
             return true;
         }
         i = i + 1;
@@ -1020,7 +1031,7 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
 
         match inst {
             Inst::ConstInt(value, ty) => { l1_inst = L1Inst::ConstInt(value, ty); }
-            Inst::ConstFloat(bits, ty) => { l1_inst = L1Inst::ConstFloat(bits, ty); }
+            Inst::ConstFloat(value, ty) => { l1_inst = L1Inst::ConstFloat(value, ty); }
             Inst::ConstBool(value) => { l1_inst = L1Inst::ConstBool(value); }
             Inst::ConstStr(value) => { l1_inst = L1Inst::ConstStr(value); }
             Inst::ConstNull(ty) => { l1_inst = L1Inst::ConstNull(ty); }
@@ -1318,7 +1329,7 @@ fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
         var l2_inst: L2Inst = L2Inst::Unreachable;
         match inst {
             L1Inst::ConstInt(value, ty) => { l2_inst = L2Inst::ConstInt(value, ty); }
-            L1Inst::ConstFloat(bits, ty) => { l2_inst = L2Inst::ConstFloat(bits, ty); }
+            L1Inst::ConstFloat(value, ty) => { l2_inst = L2Inst::ConstFloat(value, ty); }
             L1Inst::ConstBool(value) => { l2_inst = L2Inst::ConstBool(value); }
             L1Inst::ConstStr(value) => { l2_inst = L2Inst::ConstStr(value); }
             L1Inst::ConstNull(ty) => { l2_inst = L2Inst::ConstNull(ty); }
@@ -1488,6 +1499,10 @@ pub fn lower_l2_to_l3(l2: &L2Module, module: &IrModule) -> L3Module {
         // I-2D: Populate no-alloc function set
         if l2.functions.get(i).is_no_alloc || l2.functions.get(i).is_medical {
             l3.no_alloc_functions.push(l2.functions.get(i).name);
+        }
+        // F65: Populate wrapping function set — codegen skips overflow checks
+        if l2.functions.get(i).is_wrapping {
+            l3.wrapping_functions.push(l2.functions.get(i).name);
         }
         i = i + 1;
     }
@@ -1812,8 +1827,8 @@ fn lower_l2_inst_to_l3(
             }
             return L3Inst::Mov(dst, Operand::ImmI(imm_val));
         }
-        L2Inst::ConstFloat(bits, _) => {
-            return L3Inst::Mov(dst, Operand::ImmF(bits));
+        L2Inst::ConstFloat(value, _) => {
+            return L3Inst::Mov(dst, Operand::ImmF(value));
         }
         L2Inst::ConstBool(value) => {
             var v: i64 = 0;
@@ -2134,7 +2149,7 @@ fn print_l1_block(b: L1Block, f: &L1Function) -> str {
 pub fn fmt_l1_inst(i: L1Inst) -> str {
     match i {
         L1Inst::ConstInt(value, ty) => { return "const " + ir_type_to_str(ty) + " " + int_to_str(value); }
-        L1Inst::ConstFloat(bits, ty) => { return "const " + ir_type_to_str(ty) + " #f:" + int_to_str(bits); }
+        L1Inst::ConstFloat(value, ty) => { return "const " + ir_type_to_str(ty) + " #f:" + float_to_str(value); }
         L1Inst::ConstBool(value) => { return "const bool " + bool_to_str(value); }
         L1Inst::ConstStr(value) => { return "const str \"" + escape_str(value) + "\""; }
         L1Inst::ConstNull(ty) => { return "const " + ir_type_to_str(ty) + " null"; }
@@ -2255,7 +2270,7 @@ fn print_l2_block(b: L2Block, f: &L2Function) -> str {
 pub fn fmt_l2_inst(i: L2Inst) -> str {
     match i {
         L2Inst::ConstInt(value, ty) => { return "const " + ir_type_to_str(ty) + " " + int_to_str(value); }
-        L2Inst::ConstFloat(bits, ty) => { return "const " + ir_type_to_str(ty) + " #f:" + int_to_str(bits); }
+        L2Inst::ConstFloat(value, ty) => { return "const " + ir_type_to_str(ty) + " #f:" + float_to_str(value); }
         L2Inst::ConstBool(value) => { return "const bool " + bool_to_str(value); }
         L2Inst::ConstStr(value) => { return "const str \"" + escape_str(value) + "\""; }
         L2Inst::ConstNull(ty) => { return "const " + ir_type_to_str(ty) + " null"; }

@@ -1204,6 +1204,23 @@ pub fn TypeChecker_check_bodies(self: &mut TypeChecker, program: Program) {
     TypeChecker_verify_declared_effects(self, program);
     // Verify safety annotations (simplified — just check @deterministic)
     TypeChecker_verify_deterministic(self, program);
+    // Additional verification passes (stubs — permissive, don't reject)
+    // These are not needed for self-hosting since the compiler's own code
+    // doesn't use these annotations.
+    TypeChecker_verify_conserve(self, program);
+    TypeChecker_verify_gas(self, program);
+    TypeChecker_verify_safety_annotations(self, program);
+    TypeChecker_verify_constant_time(self, program);
+    TypeChecker_verify_realtime(self, program);
+    TypeChecker_verify_differentiable(self, program);
+    TypeChecker_verify_quantized(self, program);
+    TypeChecker_verify_checkpoint(self, program);
+    TypeChecker_verify_dp(self, program);
+    TypeChecker_verify_shard(self, program);
+    TypeChecker_verify_adapter(self, program);
+    TypeChecker_verify_tainted(self, program);
+    TypeChecker_verify_contracts(self, program);
+    TypeChecker_verify_allocator_params(self, program);
     // Mark all functions as capability-verified before checking
     var fi: i64 = 0;
     while fi < program.funcs.len() {
@@ -1356,6 +1373,67 @@ pub fn TypeChecker_verify_deterministic(self: &mut TypeChecker, program: Program
         }
         fi = fi + 1;
     }
+}
+
+// ─── Verification stubs (permissive — don't reject code) ──────────────────
+// These are placeholder implementations for advanced annotation verification.
+// They are no-ops, ensuring the self-hosted compiler can compile code that
+// uses these annotations without false rejections.
+
+pub fn TypeChecker_verify_conserve(self: &mut TypeChecker, program: Program) {
+    // @conserve: energy conservation — stub (no enforcement)
+}
+
+pub fn TypeChecker_verify_gas(self: &mut TypeChecker, program: Program) {
+    // @gas(N): gas cost analysis — stub (no enforcement)
+}
+
+pub fn TypeChecker_verify_safety_annotations(self: &mut TypeChecker, program: Program) {
+    // @safety-critical: safety-critical annotation — stub (no enforcement)
+}
+
+pub fn TypeChecker_verify_constant_time(self: &mut TypeChecker, program: Program) {
+    // @constant_time: constant-time execution — stub (no enforcement)
+}
+
+pub fn TypeChecker_verify_realtime(self: &mut TypeChecker, program: Program) {
+    // @realtime: real-time deadline — stub (no enforcement)
+}
+
+pub fn TypeChecker_verify_differentiable(self: &mut TypeChecker, program: Program) {
+    // @differentiable: autodiff compatibility — stub (no enforcement)
+}
+
+pub fn TypeChecker_verify_quantized(self: &mut TypeChecker, program: Program) {
+    // @quantized: quantization annotation — stub (no enforcement)
+}
+
+pub fn TypeChecker_verify_checkpoint(self: &mut TypeChecker, program: Program) {
+    // @checkpoint: gradient checkpointing — stub (no enforcement)
+}
+
+pub fn TypeChecker_verify_dp(self: &mut TypeChecker, program: Program) {
+    // @dp: differential privacy — stub (no enforcement)
+}
+
+pub fn TypeChecker_verify_shard(self: &mut TypeChecker, program: Program) {
+    // @shard: tensor parallelism — stub (no enforcement)
+}
+
+pub fn TypeChecker_verify_adapter(self: &mut TypeChecker, program: Program) {
+    // @adapter: adapter pattern — stub (no enforcement)
+}
+
+pub fn TypeChecker_verify_tainted(self: &mut TypeChecker, program: Program) {
+    // @tainted: taint tracking — stub (no enforcement)
+}
+
+pub fn TypeChecker_verify_contracts(self: &mut TypeChecker, program: Program) {
+    // given/ensure contracts — stub (no enforcement)
+}
+
+pub fn TypeChecker_verify_allocator_params(self: &mut TypeChecker, program: Program) {
+    // @allocator: custom allocator params — stub (no enforcement)
 }
 
 // ─── check_func ──────────────────────────────────────────────────────────
@@ -1994,7 +2072,16 @@ pub fn TypeChecker_check_capability(self: &mut TypeChecker, cap: str, context: s
     if self.sandbox_depth > 0 {
         self.errors.push("Sandbox error: '" + context + "' requires '" + cap + "' capability — all capabilities are revoked inside sandbox");
         match self.current_func_name {
-            OptString::Some(fname) => { str_vec_remove(&mut self.cap_verified, fname); }
+            OptString::Some(fname) => {
+                var ci: i64 = 0;
+                while ci < self.cap_verified.len() {
+                    if self.cap_verified.get(ci) == fname {
+                        self.cap_verified.remove(ci);
+                        ci = self.cap_verified.len();
+                    }
+                    ci = ci + 1;
+                }
+            }
             OptString::None => {}
         }
         return;
@@ -2003,7 +2090,16 @@ pub fn TypeChecker_check_capability(self: &mut TypeChecker, cap: str, context: s
     if self.strict_caps && !str_vec_contains(self.granted_caps, cap) {
         self.errors.push("Capability error: '" + context + "' requires '" + cap + "' capability (not granted to module '" + self.current_module + "')");
         match self.current_func_name {
-            OptString::Some(fname) => { str_vec_remove(&mut self.cap_verified, fname); }
+            OptString::Some(fname) => {
+                var ci2: i64 = 0;
+                while ci2 < self.cap_verified.len() {
+                    if self.cap_verified.get(ci2) == fname {
+                        self.cap_verified.remove(ci2);
+                        ci2 = self.cap_verified.len();
+                    }
+                    ci2 = ci2 + 1;
+                }
+            }
             OptString::None => {}
         }
     }
@@ -2171,13 +2267,14 @@ pub fn TypeChecker_consume_var(self: &mut TypeChecker, name: str, line: i64) {
 pub fn TypeChecker_consume_linear_in_expr(self: &mut TypeChecker, expr: Expr, line: i64) {
     match expr {
         Expr::Ident(name) => {
-            match TypeChecker_lookup(self, name) {
+            var lk: OptType = TypeChecker_lookup(self, name);
+            match lk {
                 OptType::Some(ty) => {
                     if TypeChecker_is_linear_type(self, ty) {
                         TypeChecker_consume_var(self, name, line);
                     }
                 }
-                OptType::None => {}
+                OptType::None => { }
             }
         }
         Expr::Binary(_, left, right) => {
@@ -2370,8 +2467,8 @@ pub fn TypeChecker_check_stmt(self: &mut TypeChecker, stmt: Stmt) {
             if !type_eq(cond_ty, Type::Bool) && !type_eq(cond_ty, Type::I32) && !type_eq(cond_ty, Type::I64) {
                 self.errors.push("Type error (line " + int_to_str(self.current_line) + "): if condition must be bool, got " + type_to_str(cond_ty));
             }
-            var consumed_before: Vec<str> = self.consumed_vars;
-            var uninit_before: Vec<str> = self.uninit_vars;
+            var consumed_before: Vec<str> = self.consumed_vars.clone();
+            var uninit_before: Vec<str> = self.uninit_vars.clone();
             TypeChecker_push_scope(self);
             var si: i64 = 0;
             while si < then_block.len() {
@@ -2379,8 +2476,8 @@ pub fn TypeChecker_check_stmt(self: &mut TypeChecker, stmt: Stmt) {
                 si = si + 1;
             }
             TypeChecker_pop_scope(self);
-            var consumed_after_then: Vec<str> = self.consumed_vars;
-            var uninit_after_then: Vec<str> = self.uninit_vars;
+            var consumed_after_then: Vec<str> = self.consumed_vars.clone();
+            var uninit_after_then: Vec<str> = self.uninit_vars.clone();
             // Restore to before-then state for else branch
             self.consumed_vars = consumed_before;
             self.uninit_vars = uninit_before;
@@ -2407,7 +2504,7 @@ pub fn TypeChecker_check_stmt(self: &mut TypeChecker, stmt: Stmt) {
             }
             self.consumed_vars = merged;
             // Merge: union of uninit_vars (uninit in either branch)
-            var merged_uninit: Vec<str> = uninit_after_then;
+            var merged_uninit: Vec<str> = uninit_after_then.clone();
             var ui: i64 = 0;
             while ui < self.uninit_vars.len() {
                 if !str_vec_contains(merged_uninit, self.uninit_vars.get(ui)) {
@@ -2420,7 +2517,15 @@ pub fn TypeChecker_check_stmt(self: &mut TypeChecker, stmt: Stmt) {
         Stmt::Assign(target, _, expr, line) => {
             TypeChecker_check_expr(self, expr);
             TypeChecker_consume_linear_in_expr(self, expr, line);
-            str_vec_remove(&mut self.uninit_vars, target);
+            // Inline str_vec_remove to avoid &mut self.field issues
+            var ri: i64 = 0;
+            while ri < self.uninit_vars.len() {
+                if self.uninit_vars.get(ri) == target {
+                    self.uninit_vars.remove(ri);
+                    ri = self.uninit_vars.len();
+                }
+                ri = ri + 1;
+            }
             // Check target exists
             match TypeChecker_lookup(self, target) {
                 OptType::Some(ty) => {
@@ -2429,7 +2534,14 @@ pub fn TypeChecker_check_stmt(self: &mut TypeChecker, stmt: Stmt) {
                         self.errors.push("Linear type error (line " + int_to_str(line) + "): cannot reassign '" + target + "' — the old value would be silently destroyed");
                     }
                     if TypeChecker_is_linear_type(self, ty) {
-                        str_vec_remove(&mut self.consumed_vars, target);
+                        var ci: i64 = 0;
+                        while ci < self.consumed_vars.len() {
+                            if self.consumed_vars.get(ci) == target {
+                                self.consumed_vars.remove(ci);
+                                ci = self.consumed_vars.len();
+                            }
+                            ci = ci + 1;
+                        }
                     }
                 }
                 OptType::None => {
@@ -2459,7 +2571,7 @@ pub fn TypeChecker_check_stmt(self: &mut TypeChecker, stmt: Stmt) {
             // Unwrap references
             var effective_ty: Type = obj_ty;
             match obj_ty {
-                Type::Ref(inner, _) => { effective_ty = inner; }
+                Type::Ref(inner, _) => { effective_ty = box_type_unbox(inner); }
                 _ => { effective_ty = obj_ty; }
             }
             match effective_ty {
@@ -3027,6 +3139,21 @@ pub fn TypeChecker_check_expr_with_hint(self: &mut TypeChecker, expr: Expr, hint
                 }
                 return Type::I64;
             }
+            // Check if callee is a local variable with function type (closure call)
+            match TypeChecker_lookup(self, callee) {
+                OptType::Some(var_ty) => {
+                    match var_ty {
+                        Type::Func(params, ret) => {
+                            if params.len() != arg_types.len() {
+                                self.errors.push("Type error: function variable '" + callee + "' expects " + int_to_str(params.len()) + " args, got " + int_to_str(arg_types.len()));
+                            }
+                            return box_type_unbox(ret);
+                        }
+                        _ => {}
+                    }
+                }
+                OptType::None => {}
+            }
             self.errors.push("Type error (line " + int_to_str(self.current_line) + "): undefined function '" + callee + "'");
             return Type::Never;
         }
@@ -3035,7 +3162,7 @@ pub fn TypeChecker_check_expr_with_hint(self: &mut TypeChecker, expr: Expr, hint
             // Unwrap references
             var effective_ty: Type = obj_ty;
             match obj_ty {
-                Type::Ref(inner, _) => { effective_ty = inner; }
+                Type::Ref(inner, _) => { effective_ty = box_type_unbox(inner); }
                 _ => { effective_ty = obj_ty; }
             }
             match effective_ty {
@@ -3220,8 +3347,8 @@ pub fn TypeChecker_check_expr_with_hint(self: &mut TypeChecker, expr: Expr, hint
                 self.errors.push("Type error: array index must be numeric, got " + type_to_str(idx_ty));
             }
             match arr_ty {
-                Type::Array(elem, _) => { return elem; }
-                Type::ArrayConst(elem, _) => { return elem; }
+                Type::Array(elem, _) => { return box_type_unbox(elem); }
+                Type::ArrayConst(elem, _) => { return box_type_unbox(elem); }
                 Type::Generic(name, args) => {
                     if name == "Vec" {
                         if args.len() > 0 { return args.get(0); }
@@ -3297,8 +3424,8 @@ pub fn TypeChecker_check_expr_with_hint(self: &mut TypeChecker, expr: Expr, hint
         Expr::Deref(e) => {
             var ty: Type = TypeChecker_check_expr(self, box_expr_unbox(e));
             match ty {
-                Type::Ref(inner, _) => { return inner; }
-                Type::RawPtr(inner, _) => { return inner; }
+                Type::Ref(inner, _) => { var t: Type = box_type_unbox(inner); return t; }
+                Type::RawPtr(inner, _) => { var t: Type = box_type_unbox(inner); return t; }
                 _ => {
                     self.errors.push("Type error: cannot dereference non-reference type " + type_to_str(ty));
                     return Type::Never;
@@ -3602,7 +3729,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
         _ => {}
     }
     // Check receiver type and dispatch method
-    var recv_ty_raw: Type = TypeChecker_check_expr(self, box_expr_unbox(receiver));
+    var recv_ty_raw: Type = TypeChecker_check_expr(self, receiver);
     var arg_types: Vec<Type> = Vec::new();
     var ai: i64 = 0;
     while ai < args.len() {
@@ -3612,7 +3739,7 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
     // Auto-deref &T / &mut T
     var recv_ty: Type = recv_ty_raw;
     match recv_ty_raw {
-        Type::Ref(inner, _) => { recv_ty = inner; }
+        Type::Ref(inner, _) => { recv_ty = box_type_unbox(inner); }
         _ => { recv_ty = recv_ty_raw; }
     }
     // Builtin Vec methods
@@ -3737,6 +3864,75 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                 self.errors.push("Type error: no method '" + method + "' on String");
                 return Type::Never;
             }
+            // Named("Vec") without generic args — treat as Vec<i64>
+            if n == "Vec" {
+                var elem_ty: Type = Type::I64;
+                if method == "push" { return Type::Void; }
+                if method == "pop" { return elem_ty; }
+                if method == "len" { return Type::I64; }
+                if method == "is_empty" { return Type::Bool; }
+                if method == "get" { return elem_ty; }
+                if method == "set" { return Type::Void; }
+                if method == "clear" { return Type::Void; }
+                if method == "capacity" { return Type::I64; }
+                if method == "insert" { return Type::Void; }
+                if method == "remove" { return elem_ty; }
+                if method == "contains" { return Type::Bool; }
+                if method == "reverse" { return Type::Void; }
+                if method == "first" { return elem_ty; }
+                if method == "last" { return elem_ty; }
+                if method == "extend" { return Type::Void; }
+                if method == "truncate" { return Type::Void; }
+                if method == "sort" { return Type::Void; }
+                if method == "clone" {
+                    var clone_args: Vec<Type> = Vec::new();
+                    clone_args.push(elem_ty);
+                    return Type::Generic("Vec", clone_args);
+                }
+                if method == "map" {
+                    var map_args: Vec<Type> = Vec::new();
+                    map_args.push(elem_ty);
+                    return Type::Generic("Vec", map_args);
+                }
+                if method == "filter" {
+                    var filter_args: Vec<Type> = Vec::new();
+                    filter_args.push(elem_ty);
+                    return Type::Generic("Vec", filter_args);
+                }
+                if method == "for_each" { return Type::Void; }
+                if method == "fold" { return Type::I64; }
+                if method == "any" { return Type::Bool; }
+                if method == "all" { return Type::Bool; }
+                if method == "find" { return Type::I64; }
+                if method == "position" { return Type::I64; }
+                self.errors.push("Type error: no method '" + method + "' on Vec");
+                return Type::Never;
+            }
+            // Named("HashMap") without generic args — treat as HashMap<str, i64>
+            if n == "HashMap" {
+                var key_ty: Type = Type::Str;
+                var val_ty: Type = Type::I64;
+                if method == "insert" { return Type::Void; }
+                if method == "get" { return val_ty; }
+                if method == "contains" { return Type::Bool; }
+                if method == "remove" { return Type::Void; }
+                if method == "len" { return Type::I64; }
+                if method == "is_empty" { return Type::Bool; }
+                if method == "clear" { return Type::Void; }
+                if method == "get_or" { return val_ty; }
+                if method == "keys" {
+                    var keys_args: Vec<Type> = Vec::new();
+                    keys_args.push(key_ty);
+                    return Type::Generic("Vec", keys_args);
+                }
+                if method == "values" {
+                    var values_args: Vec<Type> = Vec::new();
+                    values_args.push(val_ty);
+                    return Type::Generic("Vec", values_args);
+                }
+                self.errors.push("Type error: no method '" + method + "' on HashMap");
+                return Type::Never;
+            }
         }
         _ => {}
     }
@@ -3762,8 +3958,57 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
     // Auto-deref for method lookup
     var effective_recv_ty: Type = recv_ty;
     match recv_ty {
-        Type::Ref(inner, _) => { effective_recv_ty = inner; }
+        Type::Ref(inner, _) => { effective_recv_ty = box_type_unbox(inner); }
         _ => { effective_recv_ty = recv_ty; }
+    }
+    // Handle Type::Named("Vec") — Vec without type params (same as Generic("Vec", [I64]))
+    match effective_recv_ty {
+        Type::Named(n) => {
+            if n == "Vec" {
+                var elem_ty: Type = Type::I64;
+                if method == "push" { return Type::Void; }
+                if method == "pop" { return elem_ty; }
+                if method == "len" { return Type::I64; }
+                if method == "is_empty" { return Type::Bool; }
+                if method == "get" { return elem_ty; }
+                if method == "set" { return Type::Void; }
+                if method == "clear" { return Type::Void; }
+                if method == "capacity" { return Type::I64; }
+                if method == "insert" { return Type::Void; }
+                if method == "remove" { return elem_ty; }
+                if method == "contains" { return Type::Bool; }
+                if method == "reverse" { return Type::Void; }
+                if method == "first" { return elem_ty; }
+                if method == "last" { return elem_ty; }
+                if method == "extend" { return Type::Void; }
+                if method == "truncate" { return Type::Void; }
+                if method == "sort" { return Type::Void; }
+                if method == "for_each" { return Type::Void; }
+                if method == "fold" { return Type::I64; }
+                if method == "any" { return Type::Bool; }
+                if method == "all" { return Type::Bool; }
+                if method == "find" { return Type::I64; }
+                if method == "position" { return Type::I64; }
+                if method == "clone" {
+                    var clone_args: Vec<Type> = Vec::new();
+                    clone_args.push(elem_ty);
+                    return Type::Generic("Vec", clone_args);
+                }
+                if method == "map" {
+                    var map_args: Vec<Type> = Vec::new();
+                    map_args.push(elem_ty);
+                    return Type::Generic("Vec", map_args);
+                }
+                if method == "filter" {
+                    var filter_args: Vec<Type> = Vec::new();
+                    filter_args.push(elem_ty);
+                    return Type::Generic("Vec", filter_args);
+                }
+                self.errors.push("Type error: no method '" + method + "' on Vec");
+                return Type::Never;
+            }
+        }
+        _ => {}
     }
     match effective_recv_ty {
         Type::Named(struct_name) => {
@@ -3987,34 +4232,34 @@ pub fn TypeChecker_scan_expr_for_effects(self: &TypeChecker, expr: Expr, effects
         Expr::Call(callee, args) => {
             // Map builtin calls to effects
             if callee == "print" || callee == "println" || callee == "print_int" || callee == "print_float" || callee == "print_str" {
-                if !str_vec_contains(effects, "IO") { effects.push("IO"); }
+                if !str_vec_contains_ref(effects, "IO") { effects.push("IO"); }
             }
             if callee == "read_file" || callee == "write_file" || callee == "file_open" || callee == "file_read" || callee == "file_write" {
-                if !str_vec_contains(effects, "FS") { effects.push("FS"); }
+                if !str_vec_contains_ref(effects, "FS") { effects.push("FS"); }
             }
             if callee == "http_get" || callee == "http_post" || callee == "socket_connect" || callee == "socket_send" || callee == "socket_recv" {
-                if !str_vec_contains(effects, "Net") { effects.push("Net"); }
+                if !str_vec_contains_ref(effects, "Net") { effects.push("Net"); }
             }
             if callee == "spawn" || callee == "exec" || callee == "system" || callee == "p_thread_spawn" {
-                if !str_vec_contains(effects, "Spawn") { effects.push("Spawn"); }
+                if !str_vec_contains_ref(effects, "Spawn") { effects.push("Spawn"); }
             }
             // Check p_* builtins
             if str_starts_with(callee, "p_") {
                 if callee == "p_vec_new" || callee == "p_vec_push" || callee == "p_hashmap_new" || callee == "p_alloc" {
-                    if !str_vec_contains(effects, "Alloc") { effects.push("Alloc"); }
+                    if !str_vec_contains_ref(effects, "Alloc") { effects.push("Alloc"); }
                 }
                 if callee == "p_panic" || callee == "p_unreachable" {
-                    if !str_vec_contains(effects, "Diverge") { effects.push("Diverge"); }
+                    if !str_vec_contains_ref(effects, "Diverge") { effects.push("Diverge"); }
                 }
                 if callee == "p_print" || callee == "p_println" || callee == "p_print_int" || callee == "p_print_float" || callee == "p_print_str" {
-                    if !str_vec_contains(effects, "IO") { effects.push("IO"); }
-                    if !str_vec_contains(effects, "Read") { effects.push("Read"); }
+                    if !str_vec_contains_ref(effects, "IO") { effects.push("IO"); }
+                    if !str_vec_contains_ref(effects, "Read") { effects.push("Read"); }
                 }
                 if callee == "p_vec_get" || callee == "p_hashmap_get" || callee == "p_string_contains" {
-                    if !str_vec_contains(effects, "Read") { effects.push("Read"); }
+                    if !str_vec_contains_ref(effects, "Read") { effects.push("Read"); }
                 }
                 if callee == "p_vec_set" || callee == "p_hashmap_insert" || callee == "p_string_replace" {
-                    if !str_vec_contains(effects, "Write") { effects.push("Write"); }
+                    if !str_vec_contains_ref(effects, "Write") { effects.push("Write"); }
                 }
             }
             // Check user-defined function effects
@@ -4024,7 +4269,7 @@ pub fn TypeChecker_scan_expr_for_effects(self: &TypeChecker, expr: Expr, effects
                     var func_effs: Vec<str> = self.func_effects.get(fi).val;
                     var ei: i64 = 0;
                     while ei < func_effs.len() {
-                        if !str_vec_contains(effects, func_effs.get(ei)) {
+                        if !str_vec_contains_ref(effects, func_effs.get(ei)) {
                             effects.push(func_effs.get(ei));
                         }
                         ei = ei + 1;
@@ -4136,8 +4381,8 @@ pub fn TypeChecker_scan_expr_for_effects(self: &TypeChecker, expr: Expr, effects
         Expr::Closure(_, body, _) => { TypeChecker_scan_stmts_for_effects(self, body, effects); }
         Expr::Cast(e, _) => { TypeChecker_scan_expr_for_effects(self, box_expr_unbox(e), effects); }
         Expr::Asm(_, operands) => {
-            if !str_vec_contains(effects, "Read") { effects.push("Read"); }
-            if !str_vec_contains(effects, "Write") { effects.push("Write"); }
+            if !str_vec_contains_ref(effects, "Read") { effects.push("Read"); }
+            if !str_vec_contains_ref(effects, "Write") { effects.push("Write"); }
             var i: i64 = 0;
             while i < operands.len() {
                 TypeChecker_scan_expr_for_effects(self, operands.get(i).expr, effects);
@@ -4154,7 +4399,7 @@ pub fn TypeChecker_scan_expr_for_effects(self: &TypeChecker, expr: Expr, effects
         Expr::QuantCast(e, _) => { TypeChecker_scan_expr_for_effects(self, box_expr_unbox(e), effects); }
         Expr::Await(e) => { TypeChecker_scan_expr_for_effects(self, box_expr_unbox(e), effects); }
         Expr::Spawn(e) => {
-            if !str_vec_contains(effects, "Spawn") { effects.push("Spawn"); }
+            if !str_vec_contains_ref(effects, "Spawn") { effects.push("Spawn"); }
             TypeChecker_scan_expr_for_effects(self, box_expr_unbox(e), effects);
         }
     }
@@ -4303,7 +4548,7 @@ pub fn TypeChecker_collect_called_funcs_expr(self: &TypeChecker, expr: Expr, cal
         }
         Expr::Unary(_, e) => { TypeChecker_collect_called_funcs_expr(self, box_expr_unbox(e), called); }
         Expr::Call(callee, args) => {
-            if !str_vec_contains(called, callee) { called.push(callee); }
+            if !str_vec_contains_ref(called, callee) { called.push(callee); }
             var i: i64 = 0;
             while i < args.len() {
                 TypeChecker_collect_called_funcs_expr(self, args.get(i), called);

@@ -27,7 +27,7 @@ use crate::pir::{
     CastKind, L3Block, L3Function, L3Inst, L3Module, Operand, PBlock, VReg,
 };
 use crate::regalloc::{allocate_module, Allocation, Location, ModuleAllocation, PhysReg};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Public API
@@ -71,6 +71,13 @@ struct X64CodeGen {
     trait_methods: HashMap<String, Vec<String>>,
     /// Vtables to emit in .rodata: label → list of function names.
     vtables: Vec<(String, Vec<String>)>,
+    /// Set of @wrapping function names — overflow checks skipped for these.
+    wrapping_functions: HashSet<String>,
+    /// Counter for unique panic label generation (overflow, div-zero, etc.).
+    panic_label_counter: u32,
+    /// Panic stubs to emit at end of current function.
+    /// Each entry: (label, panic_message_string)
+    pending_panic_stubs: Vec<(String, String)>,
 }
 
 impl X64CodeGen {
@@ -85,6 +92,9 @@ impl X64CodeGen {
             current_func: String::new(),
             trait_methods: HashMap::new(),
             vtables: Vec::new(),
+            wrapping_functions: HashSet::new(),
+            panic_label_counter: 0,
+            pending_panic_stubs: Vec::new(),
         }
     }
 
@@ -97,9 +107,63 @@ impl X64CodeGen {
         self.output.push('\n');
     }
 
+    /// Returns true if the current function is @wrapping (F65) — overflow
+    /// checks should be skipped.
+    fn is_wrapping_func(&self) -> bool {
+        self.wrapping_functions.contains(&self.current_func)
+    }
+
+    /// Allocate a unique panic label and queue a panic stub for end-of-function emission.
+    /// Returns the label to jump to on check failure.
+    fn alloc_panic_label(&mut self, message: &str) -> String {
+        let n = self.panic_label_counter;
+        self.panic_label_counter += 1;
+        let label = format!(".L{}_panic{}", self.current_func, n);
+        self.pending_panic_stubs.push((label.clone(), message.to_string()));
+        label
+    }
+
+    /// Emit a division-by-zero check for the divisor operand `b`.
+    /// Tests the value in-place (no register moves) and jumps to a panic
+    /// stub if zero. Division by zero always panics, even in @wrapping functions.
+    fn gen_divzero_check(&mut self, b: &Operand) {
+        match b {
+            Operand::ImmI(v) => {
+                if *v == 0 {
+                    let lbl = self.alloc_panic_label("Division by zero");
+                    self.wl(&format!("    jmp {}", lbl));
+                }
+            }
+            Operand::VReg(vr) => {
+                let b_loc = self.operand_loc(*vr);
+                match b_loc {
+                    Some(Location::Reg(r)) => {
+                        self.wl(&format!("    testq %{}, %{}", r.name(), r.name()));
+                    }
+                    Some(Location::Spill(off)) => {
+                        self.wl(&format!("    cmpq $0, -{}(%rbp)", off));
+                    }
+                    Some(Location::Remat(c)) => {
+                        if c == 0 {
+                            let lbl = self.alloc_panic_label("Division by zero");
+                            self.wl(&format!("    jmp {}", lbl));
+                        }
+                        return;
+                    }
+                    None => return,
+                }
+                let lbl = self.alloc_panic_label("Division by zero");
+                self.wl(&format!("    jz {}", lbl));
+            }
+            _ => {}
+        }
+    }
+
     fn gen_module(&mut self, module: &L3Module) {
         // Copy trait method info for vtable dispatch.
         self.trait_methods = module.trait_methods.clone();
+        // Copy wrapping function set for overflow check suppression (F65).
+        self.wrapping_functions = module.wrapping_functions.clone();
 
         // Collect string constants.
         // Note: module.string_constants maps (content → label).
@@ -162,16 +226,6 @@ impl X64CodeGen {
         let alloc = self.allocs.func_allocations.get(&f.name).cloned();
         self.current_alloc = alloc.clone();
 
-        // Debug: dump allocations for Vec_get
-        if f.name == "Vec_get" {
-            if let Some(ref a) = alloc {
-                eprintln!("=== Vec_get allocations ===");
-                for (vr, loc) in &a.vreg_to_loc {
-                    eprintln!("  v{} -> {:?}", vr.0, loc);
-                }
-            }
-        }
-
         // Pre-compute block labels.
         self.block_labels.clear();
         for b in &f.blocks {
@@ -180,6 +234,8 @@ impl X64CodeGen {
         }
 
         let frame_size = f.frame_size + alloc.as_ref().map(|a| a.spill_size as u64).unwrap_or(0);
+        // Reserve 8 bytes for the stack canary (stored at -8(%rbp)).
+        let frame_size_with_canary = frame_size + 8;
         // Align frame to 16 bytes.
         // Issue 20: If the number of callee-saved registers is odd, add 8 bytes
         // of padding so that RSP stays 16-byte aligned after pushing them.
@@ -188,7 +244,7 @@ impl X64CodeGen {
         // Adding 8 to the frame makes it 16n-8-8*(odd) = 16-aligned.
         let callee_count = alloc.as_ref().map(|a| a.used_callee_saved.len()).unwrap_or(0);
         let pad = if callee_count % 2 == 1 { 8 } else { 0 };
-        let aligned_frame = (frame_size + 15) & !15;
+        let aligned_frame = (frame_size_with_canary + 15) & !15;
         let aligned_frame = aligned_frame + pad;
 
         self.wl("");
@@ -202,6 +258,24 @@ impl X64CodeGen {
         if aligned_frame > 0 {
             self.wl(&format!("    subq ${}, %rsp", aligned_frame));
         }
+
+        // Stack canary: derive a per-frame canary from the return address.
+        // Store at -8(%rbp), verify in epilogue. Detects stack buffer overflows
+        // that overwrite the saved return address. Uses a compile-time XOR key
+        // (no writable global memory needed — works with read-only ELF layout).
+        // RAX is a scratch register (not yet live at function entry).
+        self.wl("    movq 8(%rbp), %rax");
+        self.wl("    xorq $0x5DEADBEEFCAFEBABE, %rax");
+        self.wl("    movq %rax, -8(%rbp)");
+
+        // Recursion guard: check stack pointer against a conservative limit.
+        // Linux x86-64 stacks typically start near 0x7FFF_FFFF_F000 and grow down.
+        // A limit of 0x7F00_0000_0000 allows ~8MB of stack — enough for normal
+        // recursion but catches infinite recursion before the OS kills us with
+        // SIGSEGV. This gives a clear panic message instead of a raw segfault.
+        self.wl("    cmpq $0x7F0000000000, %rsp");
+        let rec_panic = self.alloc_panic_label("Stack overflow: recursion depth exceeded (stack pointer below limit)");
+        self.wl(&format!("    jle {}", rec_panic));
         // Save callee-saved registers.
         if let Some(ref a) = alloc {
             for &r in &a.used_callee_saved {
@@ -288,12 +362,36 @@ impl X64CodeGen {
         // ─── Epilogue (fallthrough return) ───
         self.gen_epilogue(&alloc);
 
+        // ─── Panic stubs ───
+        // Emit panic blocks for overflow/div-zero/recursion checks in this function.
+        let stubs: Vec<(String, String)> = self.pending_panic_stubs.drain(..).collect();
+        for (label, msg) in &stubs {
+            self.wl(&format!("{}:", label));
+            let str_label = self.alloc_string(msg);
+            self.wl(&format!("    leaq {}(%rip), %rdi", str_label));
+            self.wl("    call p_panic");
+            self.wl("    ud2");
+        }
+
         self.wl(&format!("    .size {}, .-{}", f.name, f.name));
     }
 
     fn gen_epilogue(&mut self, alloc: &Option<Allocation>) {
         let label = format!(".L{}_epilogue", self.current_func);
         self.wl(&format!("{}:", label));
+
+        // Stack canary: verify the canary before restoring registers.
+        // Recompute canary from return address and compare with stored value.
+        // RAX and RCX are scratch registers at this point (return value is
+        // already in RAX from the Ret instruction, but we save/restore it).
+        self.wl("    movq %rax, %rcx");       // save return value
+        self.wl("    movq -8(%rbp), %rax");   // load stored canary
+        self.wl("    movq 8(%rbp), %rdx");    // load return address
+        self.wl("    xorq $0x5DEADBEEFCAFEBABE, %rdx"); // recompute canary
+        self.wl("    cmpq %rax, %rdx");       // compare
+        let canary_fail = self.alloc_panic_label("Stack smashing detected (canary mismatch)");
+        self.wl(&format!("    jne {}", canary_fail));
+        self.wl("    movq %rcx, %rax");       // restore return value
 
         // Restore callee-saved registers (in reverse order).
         if let Some(ref a) = alloc {
@@ -647,21 +745,37 @@ impl X64CodeGen {
         match op {
             BinOp::Add => {
                 self.gen_operand_apply_binop("addq", b, dst_reg);
+                // F64: Integer overflow check — panic on signed overflow
+                // (unless this is a @wrapping function).
+                if !self.is_wrapping_func() {
+                    let lbl = self.alloc_panic_label("Integer overflow on addition");
+                    self.wl(&format!("    jo {}", lbl));
+                }
             }
             BinOp::Sub => {
                 self.gen_operand_apply_binop("subq", b, dst_reg);
+                if !self.is_wrapping_func() {
+                    let lbl = self.alloc_panic_label("Integer overflow on subtraction");
+                    self.wl(&format!("    jo {}", lbl));
+                }
             }
             BinOp::Mul => {
                 // imulq reg, reg — but we need the operand in a register.
                 let tmp = self.scratch_reg(dst_reg);
                 self.gen_operand_to_reg(b, tmp);
                 self.wl(&format!("    imulq %{}, %{}", tmp.name(), dst_reg.name()));
+                if !self.is_wrapping_func() {
+                    let lbl = self.alloc_panic_label("Integer overflow on multiplication");
+                    self.wl(&format!("    jo {}", lbl));
+                }
             }
             BinOp::Div => {
                 // idivq: dividend in RDX:RAX, divisor in operand.
                 // Move dividend to RAX, sign-extend to RDX, then divide.
                 // IMPORTANT: cqto clobbers RDX, so the divisor must NOT be in RDX.
                 // If it is, move it to RCX first.
+                // Div-by-zero check (always on, even in @wrapping).
+                self.gen_divzero_check(b);
                 if dst_reg != PhysReg::Rax {
                     self.wl(&format!("    movq %{}, %rax", dst_reg.name()));
                 }
@@ -720,6 +834,8 @@ impl X64CodeGen {
             }
             BinOp::Mod => {
                 // Same as Div but result is in RDX.
+                // Mod-by-zero check (always on, even in @wrapping).
+                self.gen_divzero_check(b);
                 if dst_reg != PhysReg::Rax {
                     self.wl(&format!("    movq %{}, %rax", dst_reg.name()));
                 }

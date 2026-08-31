@@ -20,6 +20,27 @@ macro_rules! wln {
     }};
 }
 
+/// Check if a function name is an internal helper that should not be
+/// registered for thread spawning. This includes:
+/// - Functions starting with `p_` (runtime builtins)
+/// - Small helper/utility functions that are never spawned as threads
+/// Note: `__`-prefixed functions are NOT excluded here — some (like
+/// `__par_sum_worker`) are spawned via p_thread_spawn.
+fn is_internal_function(name: &str) -> bool {
+    name.starts_with("p_")
+        || name.starts_with("box_")
+        || name.starts_with("type_")
+        || name.starts_with("stmt_")
+        || name.starts_with("expr_")
+        || name.starts_with("opt_")
+        || name.starts_with("str_")
+        || name.starts_with("int_")
+        || name.starts_with("char_")
+        || name.starts_with("map_")
+        || name.starts_with("vec_")
+        || name.starts_with("c_")
+}
+
 pub struct CCodeGen {
     out: String,
     /// Map from ValueId to C variable name
@@ -998,9 +1019,9 @@ impl CCodeGen {
         wln!(self, "void p_print_newline(void);");
         wln!(self, "void p_panic(const char* msg);");
         wln!(self, "// Call stack for panic traces");
-        wln!(self, "static const char* p_call_stack[256];");
+        wln!(self, "static const char* p_call_stack[2048];");
         wln!(self, "static int p_call_stack_depth = 0;");
-        wln!(self, "void p_call_stack_push(const char* name) {{ if (p_call_stack_depth < 256) p_call_stack[p_call_stack_depth++] = name; }}");
+        wln!(self, "void p_call_stack_push(const char* name) {{ if (p_call_stack_depth < 2048) p_call_stack[p_call_stack_depth++] = name; }}");
         wln!(self, "void p_call_stack_pop(void) {{ if (p_call_stack_depth > 0) p_call_stack_depth--; }}");
         wln!(self, "void* p_malloc(int64_t size);");
         wln!(self, "void p_free(void* ptr);");
@@ -1131,8 +1152,33 @@ impl CCodeGen {
         wln!(self, "// ─── Struct definitions ───");
         for (name, layout) in &module.struct_layouts {
             wln!(self, "struct {}_s {{", name);
-            for (i, (_fname, field_ty, _offset)) in layout.fields.iter().enumerate() {
-                wln!(self, "    {} field_{};", Self::c_type(field_ty), i);
+            for (i, (_fname, field_ty, offset)) in layout.fields.iter().enumerate() {
+                // Calculate field size from offsets: next field's offset (or
+                // total struct size for the last field) minus this field's offset.
+                let field_size: u64 = if i + 1 < layout.fields.len() {
+                    layout.fields[i + 1].2 as u64 - *offset as u64
+                } else {
+                    layout.size - *offset as u64
+                };
+                if field_size > 8 {
+                    // Enum-typed fields are stored inline with their full size
+                    // (e.g. OptString is 16 bytes, Type is 40 bytes).
+                    // Emit as an int64_t array to match the lowerer's layout.
+                    let slots = field_size / 8;
+                    wln!(self, "    int64_t field_{}[{}];", i, slots);
+                } else {
+                    // All non-enum fields get exactly 8 bytes in the lowerer's
+                    // uniform representation. Use int64_t for bool fields
+                    // (which C would make 1 byte, causing layout mismatch).
+                    match field_ty {
+                        IrType::Bool => {
+                            wln!(self, "    int64_t field_{};", i);
+                        }
+                        _ => {
+                            wln!(self, "    {} field_{};", Self::c_type(field_ty), i);
+                        }
+                    }
+                }
             }
             wln!(self, "};");
             wln!(self, "");
@@ -1160,11 +1206,15 @@ impl CCodeGen {
         if module.functions.contains_key("main") {
             wln!(self, "// ─── C entry point ───");
             wln!(self, "int main(int argc, char** argv) {");
+            wln!(self, "    setvbuf(stdout, NULL, _IONBF, 0);");
+            wln!(self, "    setvbuf(stderr, NULL, _IONBF, 0);");
             wln!(self, "    __p_argc = argc; __p_argv = argv;");
-            // Register all Fides functions for thread spawning (Phase 8A)
+            // Register functions for p_thread_spawn lookup.
+            // Skip internal/helper functions that are never spawned as threads
+            // to avoid overflowing the registration table.
             wln!(self, "    // Register functions for p_thread_spawn lookup");
             for (name, _) in &module.functions {
-                if name != "main" {
+                if name != "main" && !is_internal_function(name) {
                     let c_name = self.sanitize_c_name(name);
                     wln!(self, "    p_thread_register(\"{}\", (int64_t(*)()){});", name, c_name);
                 }
@@ -2299,10 +2349,10 @@ impl CCodeGen {
         // Thread entry point — calls a Fides function by name with i64 args.
         // The function lookup uses a simple dispatch table generated below.
         wln!(self, "typedef struct { const char* name; int64_t (*fn)(); } p_thread_entry_t;");
-        wln!(self, "static p_thread_entry_t p_thread_entries[256];");
+        wln!(self, "static p_thread_entry_t p_thread_entries[2048];");
         wln!(self, "static int p_thread_entry_count = 0;");
         wln!(self, "void p_thread_register(const char* name, int64_t (*fn)()) {");
-        wln!(self, "    if (p_thread_entry_count < 256) {");
+        wln!(self, "    if (p_thread_entry_count < 2048) {");
         wln!(self, "        p_thread_entries[p_thread_entry_count].name = name;");
         wln!(self, "        p_thread_entries[p_thread_entry_count].fn = fn;");
         wln!(self, "        p_thread_entry_count++;");

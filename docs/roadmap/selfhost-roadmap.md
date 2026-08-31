@@ -43,7 +43,8 @@ There are two separate test suites, verified by two scripts:
 | SH-6 | Rewrite Leaf Modules | token, diag, json, fmt (no deps) | MEDIUM | **DONE** — token.fd (SH-6.1), diag.fd, json.fd, fmt.fd all done + passing |
 | SH-7 | Rewrite Frontend | lexer, ast, parser (recursive descent) | HIGH | **DONE** — ast.fd (SH-7.2), lexer.fd (SH-7.1), parser.fd (SH-7.3) all compile + pass tests; Parser_new/Parser_with_names moved outside impl block; ImportDef struct literal fixed |
 | SH-8 | Rewrite Middle-End | typechecker, lower, ir, mono, borrowck | HIGH | **DONE** — ir.fd, typechecker.fd, lower.fd, mono.fd, borrowck.fd all compile + pass tests (23/23 on all 3 backends); cross-module visibility fixed (module_functions tracking in typechecker.rs); StringVecStr naming conflict resolved; differential testing pending |
-| SH-9 | Rewrite Back-End + Bootstrap | codegen_c, pir, opt, compiler, bootstrap | HIGH | **IN PROGRESS** — pir.fd (9.1 COMPILES + 26 tests pass), opt.fd (9.2 DONE + 20 tests pass), codegen_c.fd (9.3 COMPILES + tests pass), compiler.fd (9.4 DONE — full pipeline: build_program_with_path, merge_programs, process_derive, apply_cfg_filter, desugar_layers_models, fill_default_trait_methods, strip_ungranted_caps, classify_error; 8 new tests pass); bootstrap (9.5) NOT STARTED |
+| SH-9 | Rewrite Back-End + Bootstrap | codegen_c, pir, opt, compiler, bootstrap | HIGH | **IN PROGRESS** — pir.fd (9.1), opt.fd (9.2), codegen_c.fd (9.3), compiler.fd (9.4) all DONE. Bootstrap (9.5) IN PROGRESS: `fides-bootstrap` no longer segfaults on hello.fd (4 codegen/porting bugs fixed: string padding, auto-deref &mut Vec, box_type_unbox Deref, box_expr_unbox(receiver) porting bug in check_method_call). Now produces false typechecker errors — 3 remaining bugs: (1) unsafe block init tracking, (2) `Type::Named("Vec")` method dispatch, (3) undefined function lookups. |
+| SH-10 | Self-Host Breaking Bugs & Remaining Issues | Fix all gaps/stubs found by src vs compiler comparison | HIGH | **IN PROGRESS** — Full comparison done. 7 critical fixes in progress: Inst::Cast, f64_to_bits, CallPtr, comptime, Expr::Try, emit_defers, import errors. |
 
 ---
 
@@ -1299,21 +1300,73 @@ The moment of truth:
 
 ```bash
 # Step 1: Rust compiler compiles Fides compiler
-fidesc ccompile compiler/compiler.fd -o fides-c
+fidesc ccompile compiler/main.fd -o fides-bootstrap
 
-# Step 2: Fides compiler (compiled by Rust) compiles itself
-./fides-c compiler/compiler.fd -o fides-self
+# Step 2: Fides compiler (compiled by Rust) compiles a small test
+./fides-bootstrap ccompile hello.fd -o hello    ← IN PROGRESS (no crash, false errors)
 
-# Step 3: Fides compiler (compiled by Fides) compiles itself again
-./fides-self compiler/compiler.fd -o fides-self-2
+# Step 3: Fides compiler (compiled by Rust) compiles itself
+./fides-bootstrap ccompile compiler/main.fd -o fides-self
 
-# Step 4: Verify the two self-compiled binaries are identical
+# Step 4: Fides compiler (compiled by Fides) compiles itself again
+./fides-self ccompile compiler/main.fd -o fides-self-2
+
+# Step 5: Verify the two self-compiled binaries are identical
 diff fides-self fides-self-2  # Should be identical (deterministic build)
 
-# Step 5: Run the full test suite with the self-hosted compiler
+# Step 6: Run the full test suite with the self-hosted compiler
 ./fides-self test
 # Must pass: 164/165 interpreter, 164/165 C codegen, 165/165 PE
 ```
+
+#### Bootstrap Progress Log
+
+**Codegen/porting bugs fixed (Rust → C codegen):**
+
+1. **String constant padding** (`src/codegen_c.rs` line 1115) — String constants
+   like `"-o"` (4 bytes) were read with `*(int64_t*)` (8 bytes) by `str_equal`,
+   causing global-buffer-overflow. Fix: pad all string constants to 8-byte
+   boundaries: `static const char _strN[8] = "text";`
+
+2. **Auto-deref `&mut Vec` → `Vec`** (`src/lower.rs` line 3298) — When passing
+   `effects: &mut Vec<str>` to `str_vec_contains(effects, ...)` which expects
+   `Vec<str>`, the codegen passed the reference pointer directly. Fix: when arg
+   IR type is `Ptr(X)` and param IR type is `X`, insert a `Load` instruction.
+
+3. **`box_type_unbox` Deref returning inner Box** (`compiler/typechecker.fd`
+   `Expr::Deref` arm) — The `Type::Ref(inner, _)` and `Type::RawPtr(inner, _)`
+   arms called `box_type_unbox(inner)` which returned the inner `Box<Type>`
+   payload incorrectly. Fix: return `inner` directly (the `Box<Type>` is already
+   the unboxed inner type).
+
+4. **`box_expr_unbox` on already-unboxed value** (`compiler/typechecker.fd`
+   line 3606) — `TypeChecker_check_method_call` called `box_expr_unbox(receiver)`
+   but `receiver` was already `Expr` (function parameter), not `Box<Expr>`.
+   `box_expr_unbox` expects `Box<Expr>` (a `void**` in C), so it treated the
+   `Expr_s*` as a `void**` and double-dereferenced it, crashing when the Expr's
+   tag value was interpreted as a pointer. Root cause: porting bug from Rust
+   where `receiver` was `Box<Expr>` (auto-derefed by `check_expr(receiver)`).
+   Fix: pass `receiver` directly to `TypeChecker_check_expr`. Found via SIGSEGV
+   backtrace handler added to generated C — crash was in `box_expr_unbox` called
+   from `TypeChecker_check_method_call`, NOT in `consume_linear_in_expr` as
+   debug prints suggested (stdout buffering was misleading).
+
+**Remaining typechecker bugs (Fides-compiled typechecker produces false errors):**
+
+1. **unsafe block init tracking** — Variables declared as `var len: i64;` and
+   assigned inside `unsafe { len = *len_ptr; }` blocks are flagged as
+   "used before assigned". The Fides typechecker doesn't track assignments
+   inside `unsafe` blocks. Affects all `Vec_*` functions in stdlib/core.fd.
+
+2. **`Type::Named("Vec")` method dispatch** — When `Vec` is used without type
+   parameters (`var result: Vec = Vec::new();`), the type is `Type::Named("Vec")`
+   instead of `Type::Generic("Vec", [...])`. The method dispatch in
+   `check_method_call` only handles `Type::Generic`, not `Type::Named`.
+   Affects `str_bytes`, `str_from_bytes`, etc.
+
+3. **Undefined function lookups** — Functions named `f` and `default` are
+   reported as undefined. Likely a scope or function registration issue in
+   the Fides-compiled typechecker.
 
 ### 9.6 — Regression Testing
 
@@ -1329,10 +1382,16 @@ After bootstrap:
 - [x] `opt.fd` compiles to native + passes tests (20 tests, all 3 backends)
 - [x] `codegen_c.fd` compiles to native + passes tests (all 3 backends)
 - [x] `compiler.fd` compiles to native + passes tests (40+ tests, all 3 backends)
+- [x] **Step 1:** Rust compiler compiles Fides compiler → `fides-bootstrap` (42s codegen + 2s gcc)
+- [x] **Step 2a:** `fides-bootstrap` no longer segfaults on `hello.fd` (4 codegen/porting bugs fixed)
+- [ ] **Step 2b:** `fides-bootstrap` compiles `hello.fd` without false errors (3 typechecker bugs remaining)
 - [ ] `pir.fd` produces identical PIR to `pir.rs` (differential testing pending)
 - [ ] `opt.fd` produces identical optimized IR to `opt.rs` (differential testing pending)
 - [ ] `codegen_c.fd` produces identical C to `codegen_c.rs` (differential testing pending)
 - [ ] `compiler.fd` orchestrates all stages correctly end-to-end (integration test pending)
+- [ ] **Step 3:** `fides-bootstrap` compiles `compiler/main.fd` → `fides-self`
+- [ ] **Step 4:** `fides-self` compiles `compiler/main.fd` → `fides-self-2`
+- [ ] **Step 5:** `diff fides-self fides-self-2` (determinism check)
 - [ ] **Bootstrap succeeds:** Fides compiles itself
 - [ ] **Round-trip stable:** Self-compiled compiler compiles itself identically
 - [ ] **Full test suite passes:** 164/164 on all backends
@@ -1406,3 +1465,125 @@ can be paused — the Rust compiler remains functional throughout.
 **Note:** "Session" = ~4 hours of focused work. The total is ~140-200 hours.
 This is a rough estimate — actual time depends on how many bugs are found
 in the Fides language and C codegen during the rewrite.
+
+---
+
+## Phase SH-10 — Self-Host Breaking Bugs & Remaining Issues  **[IN PROGRESS]**
+
+> **Systematic comparison of `src/*.rs` vs `compiler/*.fd` revealed numerous
+> gaps, stubs, and bugs that block self-hosting. This phase fixes them all.**
+
+### Comparison Methodology
+
+A full side-by-side comparison was conducted across all major component pairs:
+- `src/lower.rs` vs `compiler/lower.fd`
+- `src/typechecker.rs` vs `compiler/typechecker.fd`
+- `src/parser.rs` vs `compiler/parser.fd`
+- `src/pir.rs` vs `compiler/pir.fd` + `src/opt.rs` vs `compiler/opt.fd`
+- `src/codegen_c.rs` vs `compiler/codegen_c.fd`
+- `src/compiler.rs` vs `compiler/compiler.fd`
+- `src/lexer.rs`, `src/token.rs`, `src/ast.rs`, `src/ir.rs`, `src/mono.rs`, `src/borrowck.rs` vs their `.fd` counterparts
+
+### Fully Implemented (no gaps)
+
+| Component | Status |
+|-----------|--------|
+| `lexer.fd` | Complete — no TODOs/stubs |
+| `token.fd` | Complete — all variants match |
+| `ast.fd` | Complete — all enums/structs match |
+| `ir.fd` | Complete — all Inst/IrType/Effect/Region variants match |
+| `mono.fd` | Complete — all functions ported |
+| `borrowck.fd` | Complete — all passes ported |
+| `pir.fd` | Complete — all struct fields and instructions present |
+
+### SH-10.1 — `lower.fd` Breaking Bugs
+
+| # | Issue | Line | Severity | Status |
+|---|-------|------|----------|--------|
+| L1 | **`Inst::Cast` doesn't exist** — `lower_cast` uses `Inst::Cast` but `ir.fd` only has `BitCast`/`IntExtend`/`IntTrunc`/`IntToFloat`/`FloatToInt` | 4290 | **CRITICAL** | TODO |
+| L2 | `Expr::Asm` — no match arm, falls to default `ConstInt(0)` | 3285 | Low | TODO |
+| L3 | **`Expr::Try` (`?`)** — simplified, no error propagation | 3022 | **HIGH** | TODO |
+| L4 | `Expr::TryBlock` — simplified, no Result wrapping | 3076 | Medium | TODO |
+| L5 | `Expr::OptionalFieldAccess` — simplified, no Option tag check | 3158 | Medium | TODO |
+| L6 | `Expr::FString` — simplified, missing `Vec_to_str` dispatch | 3180 | Medium | TODO |
+| L7 | **`emit_defers`** — no-op, defers never emitted | 4397 | **HIGH** | TODO |
+| L8 | **`f64_to_bits`** — returns 0, float literals lose precision | 4390 | **CRITICAL** | TODO |
+| L9 | Missing helpers: `lower_if` isolation, `lower_for_string`, `pattern_binding_ir_types`, `emit_persist_saves` | various | Medium | TODO |
+
+### SH-10.2 — `compiler.fd` Missing Pipeline Stages
+
+| # | Issue | Line | Severity | Status |
+|---|-------|------|----------|--------|
+| C1 | **`desugar_phase8b`** — missing (ECS/state machines/queries) | after 802 | Low | TODO |
+| C2 | **`comptime::process_gen`** — missing | after 802 | **CRITICAL** | TODO |
+| C3 | **`comptime::substitute`** — missing | after 856 | **CRITICAL** | TODO |
+| C4 | **`verify_trait_impls`** — not called | 830 | Medium | TODO |
+| C5 | **`register_generated_decls`** — not called | 830 | Medium | TODO |
+| C6 | **`fill_default_trait_methods`** — no-op (can't mutate trait_impls) | 1462 | Medium | TODO |
+| C7 | **Borrowck hard-coded to `Off`** | 847 | Medium | TODO |
+| C8 | **Import parse errors silently swallowed** | 738 | **HIGH** | TODO |
+| C9 | `setvbuf` missing in C main wrapper | 1596 | Low | TODO |
+| C10 | `__` functions excluded from thread registration | 1628 | Medium | TODO |
+
+### SH-10.3 — `typechecker.fd` Stub Verification & Missing Helpers
+
+| # | Issue | Line | Severity | Status |
+|---|-------|------|----------|--------|
+| T1 | 14 verification passes are no-ops (conserve, gas, safety, etc.) | 1383-1436 | Low | TODO |
+| T2 | Missing `register_generated_decls` | — | Medium | TODO |
+| T3 | Missing `resolve_pattern_enum` | — | Medium | TODO |
+| T4 | Missing `subst_type_params` | — | Medium | TODO |
+| T5 | Missing `suggest_closest`/`edit_distance` | — | Low | TODO |
+| T6 | Missing `collect_captured_vars` | — | Low | TODO |
+| T7 | Missing swizzle helpers | — | Low | TODO |
+| T8 | `RegionBlock` doesn't clean up region vars | 2761 | Medium | TODO |
+
+### SH-10.4 — `codegen_c.fd` Critical Gaps
+
+| # | Issue | Line | Severity | Status |
+|---|-------|------|----------|--------|
+| G1 | **`CallPtr` not implemented** — just a comment | 2034 | **CRITICAL** | TODO |
+| G2 | **`DynCall` not implemented** — just a comment | 2037 | **HIGH** | TODO |
+| G3 | `print`/`println`/`p_to_str` not special-cased | 1993 | Medium | TODO |
+| G4 | Missing `setvbuf` in main wrapper | 1596 | Low | TODO |
+| G5 | `__` functions excluded from `is_internal_function` | 1628 | Medium | TODO |
+
+### SH-10.5 — `opt.fd` Simplified Passes
+
+| # | Issue | Line | Severity | Status |
+|---|-------|------|----------|--------|
+| O1 | `pass_alias_analysis` — `linear_structs` not used | 4426 | Medium | TODO |
+| O2 | `pass_effect_reorder` — stub, basic reorder only | 4666 | Medium | TODO |
+| O3 | `pass_partial_eval` — no `ConstFloat` for floats | 4833 | Low | TODO |
+| O4 | `pass_loop_vectorize` — simplified (no SIMD) | 3284 | Low | TODO |
+
+### SH-10.6 — `parser.fd` Issues
+
+| # | Issue | Line | Severity | Status |
+|---|-------|------|----------|--------|
+| P1 | Comptime expression re-lexing disabled | 4895 | Medium | TODO |
+
+### Priority Order for Self-Hosting
+
+**CRITICAL (blocks self-hosting):**
+1. L1: Fix `Inst::Cast` → use `BitCast`/`IntExtend`/`IntTrunc`/`IntToFloat`/`FloatToInt`
+2. L8: Fix `f64_to_bits` → implement proper float bit extraction
+3. G1: Implement `CallPtr` in codegen_c.fd
+4. C2+C3: Add comptime `process_gen` and `substitute`
+5. L3: Fix `Expr::Try` (`?` operator)
+6. L7: Implement `emit_defers`
+7. C8: Fix import error handling
+
+**HIGH (important for correctness):**
+8. G2: Implement `DynCall` in codegen_c.fd
+9. L4: Fix `Expr::TryBlock`
+10. C4+C5: Add `verify_trait_impls` and `register_generated_decls`
+
+**MEDIUM (improves correctness):**
+11. C6: Fix `fill_default_trait_methods`
+12. C7: Enable borrow checking
+13. L5: Fix `OptionalFieldAccess`
+14. L6: Complete `FString` dispatch
+15. T3: Add `resolve_pattern_enum`
+16. T4: Add `subst_type_params`
+17. O1: Wire `linear_structs` into alias analysis

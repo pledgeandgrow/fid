@@ -2562,6 +2562,21 @@ impl Interpreter {
                 let f = s.parse::<f64>().unwrap_or(0.0);
                 ExecOutcome::Value(Value::Float(f))
             }
+            "p_f64_to_bits" => {
+                let f = match args.first() {
+                    Some(Value::Float(fv)) => *fv,
+                    Some(Value::Int(i)) => *i as f64,
+                    _ => 0.0,
+                };
+                ExecOutcome::Value(Value::Int(f.to_bits() as i64))
+            }
+            "p_f64_from_bits" => {
+                let bits = match args.first() {
+                    Some(Value::Int(i)) => *i as u64,
+                    _ => 0u64,
+                };
+                ExecOutcome::Value(Value::Float(f64::from_bits(bits)))
+            }
             "p_bool_to_str" => {
                 let s = match args.first() {
                     Some(Value::Bool(b)) => b.to_string(),

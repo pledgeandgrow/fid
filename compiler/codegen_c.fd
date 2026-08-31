@@ -96,6 +96,8 @@ pub struct CCodeGen {
     pub fn_ret_types: Vec<FnRetTypeEntry>,
     // Set of user-defined extern function names (FFI)
     pub extern_func_names: Vec<str>,
+    // Struct layouts for GetFieldPtr offset lookup
+    pub struct_layouts: Vec<StructLayoutEntry>,
 }
 
 pub fn CCodeGen_new() -> CCodeGen {
@@ -112,6 +114,7 @@ pub fn CCodeGen_new() -> CCodeGen {
         user_fn_param_types: Vec::new(),
         fn_ret_types: Vec::new(),
         extern_func_names: Vec::new(),
+        struct_layouts: Vec::new(),
     };
     CCodeGen_insert_runtime_sigs(&mut cg);
     return cg;
@@ -1359,9 +1362,9 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "void p_print_newline(void);");
     wln(self, "void p_panic(const char* msg);");
     wln(self, "// Call stack for panic traces");
-    wln(self, "static const char* p_call_stack[256];");
+    wln(self, "static const char* p_call_stack[2048];");
     wln(self, "static int p_call_stack_depth = 0;");
-    wln(self, "void p_call_stack_push(const char* name) { if (p_call_stack_depth < 256) p_call_stack[p_call_stack_depth++] = name; }");
+    wln(self, "void p_call_stack_push(const char* name) { if (p_call_stack_depth < 2048) p_call_stack[p_call_stack_depth++] = name; }");
     wln(self, "void p_call_stack_pop(void) { if (p_call_stack_depth > 0) p_call_stack_depth--; }");
     wln(self, "void* p_malloc(int64_t size);");
     wln(self, "void p_free(void* ptr);");
@@ -1525,7 +1528,33 @@ fn emit_struct_defs(self: &mut CCodeGen, module: IrModule) -> void {
         var i: i64 = 0;
         while i < layout.fields.len() {
             var field: StringIrTypeOffset = layout.fields.get(i);
-            wln(self, "    " + c_type(field.ty) + " field_" + int_to_str(i) + ";");
+            // Calculate field size from offsets: next field's offset (or
+            // total struct size for the last field) minus this field's offset.
+            var field_size: i64 = 0;
+            if i + 1 < layout.fields.len() {
+                field_size = layout.fields.get(i + 1).offset - field.offset;
+            } else {
+                field_size = layout.size - field.offset;
+            }
+            if field_size > 8 {
+                // Enum-typed fields are stored inline with their full size
+                // (e.g. OptString is 16 bytes, Type is 40 bytes).
+                // Emit as an int64_t array to match the lowerer's layout.
+                var slots: i64 = field_size / 8;
+                wln(self, "    int64_t field_" + int_to_str(i) + "[" + int_to_str(slots) + "];");
+            } else {
+                // All non-enum fields get exactly 8 bytes in the lowerer's
+                // uniform representation. Use int64_t for bool fields
+                // (which C would make 1 byte, causing layout mismatch).
+                match field.ty {
+                    IrType::Bool => {
+                        wln(self, "    int64_t field_" + int_to_str(i) + ";");
+                    }
+                    _ => {
+                        wln(self, "    " + c_type(field.ty) + " field_" + int_to_str(i) + ";");
+                    }
+                }
+            }
             i = i + 1;
         }
         wln(self, "};");
@@ -1570,7 +1599,7 @@ fn emit_main_wrapper(self: &mut CCodeGen, module: IrModule) -> void {
         var f: i64 = 0;
         while f < module.functions.len() {
             var entry: IrFunctionEntry = module.functions.get(f);
-            if !str_equal(entry.name, "main") {
+            if !str_equal(entry.name, "main") && !is_internal_function(entry.name) {
                 var c_name: str = sanitize_c_name(self, entry.name);
                 wln(self, "    p_thread_register(\"" + entry.name + "\", (int64_t(*)())" + c_name + ");");
             }
@@ -1591,6 +1620,23 @@ fn has_main(module: IrModule) -> bool {
         }
         f = f + 1;
     }
+    return false;
+}
+
+fn is_internal_function(name: str) -> bool {
+    if str_starts_with(name, "p_") { return true; }
+    if str_starts_with(name, "__") { return true; }
+    if str_starts_with(name, "box_") { return true; }
+    if str_starts_with(name, "type_") { return true; }
+    if str_starts_with(name, "stmt_") { return true; }
+    if str_starts_with(name, "expr_") { return true; }
+    if str_starts_with(name, "opt_") { return true; }
+    if str_starts_with(name, "str_") { return true; }
+    if str_starts_with(name, "int_") { return true; }
+    if str_starts_with(name, "char_") { return true; }
+    if str_starts_with(name, "map_") { return true; }
+    if str_starts_with(name, "vec_") { return true; }
+    if str_starts_with(name, "c_") { return true; }
     return false;
 }
 
@@ -1618,6 +1664,21 @@ fn val_name(self: &CCodeGen, id: i64) -> str {
         OptStr::Some(name) => { return name; }
         OptStr::None => { return "v" + int_to_str(id); }
     }
+}
+
+fn lookup_field_offset(self: &CCodeGen, struct_name: str, field_index: i64, default_offset: i64) -> i64 {
+    var i: i64 = 0;
+    while i < self.struct_layouts.len() {
+        if self.struct_layouts.get(i).name == struct_name {
+            var layout: StructLayout = self.struct_layouts.get(i).layout;
+            if field_index < layout.fields.len() {
+                return layout.fields.get(field_index).offset;
+            }
+            return default_offset;
+        }
+        i = i + 1;
+    }
+    return default_offset;
 }
 
 fn value_ty_for_id(func: IrFunction, id: i64) -> IrType {
@@ -1770,20 +1831,13 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
         Inst::ConstInt(value, _) => {
             wln(self, "    " + dst + " = " + int_to_str(value) + "LL;");
         }
-        Inst::ConstFloat(bits, ty) => {
-            var size: str;
-            var union_ty: str;
-            var suffix: str;
+        Inst::ConstFloat(value, ty) => {
+            // value is an f64; emit it directly as a C float literal
             if ty == IrType::F32 {
-                size = "32";
-                union_ty = "float";
-                suffix = "U";
+                wln(self, "    " + dst + " = (float)" + float_to_str(value) + ";");
             } else {
-                size = "64";
-                union_ty = "double";
-                suffix = "ULL";
+                wln(self, "    " + dst + " = (double)" + float_to_str(value) + ";");
             }
-            wln(self, "    " + dst + " = ((union { uint" + size + "_t u; " + union_ty + " f; }){ .u = " + int_to_str(bits) + suffix + " }).f;");
         }
         Inst::ConstBool(value) => {
             if value {
@@ -1872,7 +1926,24 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
         }
         Inst::GetFieldPtr(struct_ptr, field_index, _) => {
             var s: str = val_name(self, struct_ptr);
+            // Look up the actual field offset from the struct layout.
+            // Falls back to field_index * 8 if the struct can't be determined.
+            var ptr_ty: IrType = value_ty_for_id(func, struct_ptr);
             var offset: i64 = field_index * 8;
+            match ptr_ty {
+                IrType::Ptr(inner) => {
+                    match box_ir_type_unbox(inner) {
+                        IrType::Struct(sn) => {
+                            offset = lookup_field_offset(self, sn, field_index, offset);
+                        }
+                        _ => {}
+                    }
+                }
+                IrType::Struct(sn) => {
+                    offset = lookup_field_offset(self, sn, field_index, offset);
+                }
+                _ => {}
+            }
             wln(self, "    " + dst + " = (char*)" + s + " + " + int_to_str(offset) + ";");
         }
         Inst::GetElemPtr(array_ptr, index, elem_ty) => {
@@ -1953,8 +2024,170 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                 wln(self, "    " + dst + " = " + c_fname + "(" + arg_strs + ");");
             }
         }
-        Inst::CallPtr(_, _, _, _, _) => {
-            wln(self, "    // CallPtr not implemented in C backend");
+        Inst::CallPtr(fn_ptr, args, ret_ty, _, has_env) => {
+            var fp: str = val_name(self, fn_ptr);
+            // Closures in Fides use string-based dispatch: the closure
+            // struct's field 0 is a char* pointing to the function name.
+            // We generate an inline if/else chain that compares the name
+            // and calls the appropriate C function.
+
+            // Build arg name strings
+            var arg_strs: Vec<str> = Vec::new();
+            var ai: i64 = 0;
+            while ai < args.len() {
+                arg_strs.push(val_name(self, args.get(ai)));
+                ai = ai + 1;
+            }
+
+            // Find candidate functions: user functions whose param count
+            // matches args.len() + 1 (the +1 is for the ctx/env param)
+            // AND whose return type matches the CallPtr's ret_ty.
+            var expected_param_count: i64 = args.len() + 1;
+            var candidates: Vec<str> = Vec::new();
+            var ci: i64 = 0;
+            while ci < self.user_functions.len() {
+                var name: str = self.user_functions.get(ci);
+                var is_user: bool = false;
+                var ui: i64 = 0;
+                while ui < self.user_functions.len() {
+                    if str_equal(self.user_functions.get(ui), name) { is_user = true; }
+                    ui = ui + 1;
+                }
+                if is_user {
+                    var pts_opt: OptVecIrType = fn_param_types_get(self, name);
+                    match pts_opt {
+                        OptVecIrType::Some(pts) => {
+                            if pts.len() == expected_param_count {
+                                var rt_opt: OptIrType = fn_ret_types_get(self, name);
+                                match rt_opt {
+                                    OptIrType::Some(rt) => {
+                                        var c_rt: str = c_ret_type(rt);
+                                        var c_expected: str = c_ret_type(ret_ty);
+                                        if str_equal(c_rt, c_expected) {
+                                            candidates.push(name);
+                                        }
+                                    }
+                                    OptIrType::None => {}
+                                }
+                            }
+                        }
+                        OptVecIrType::None => {}
+                    }
+                }
+                ci = ci + 1;
+            }
+
+            // Build the dispatch block
+            wln(self, "    {");
+            wln(self, "        if (!" + fp + ") abort();");
+            wln(self, "        char* _fn_name = *(char**)" + fp + ";");
+            wln(self, "        if (!_fn_name) abort();");
+            var first: bool = true;
+            var cand_i: i64 = 0;
+            while cand_i < candidates.len() {
+                var fname: str = candidates.get(cand_i);
+                var c_fname: str = sanitize_c_name(self, fname);
+                var pts_opt: OptVecIrType = fn_param_types_get(self, fname);
+                var fn_ret: IrType = ret_ty;
+                match fn_ret_types_get(self, fname) {
+                    OptIrType::Some(rt) => { fn_ret = rt; }
+                    OptIrType::None => {}
+                }
+
+                // Build call args
+                var call_args: Vec<str> = Vec::new();
+                // Arg 0: env pointer or 0
+                if has_env {
+                    call_args.push("(void*)" + fp);
+                } else {
+                    call_args.push("(void*)0");
+                }
+                // Args 1..N: the explicit CallPtr args, cast to match
+                var arg_i: i64 = 0;
+                while arg_i < arg_strs.len() {
+                    var param_idx: i64 = arg_i + 1;
+                    var cast: str = "int64_t";
+                    match pts_opt {
+                        OptVecIrType::Some(pts) => {
+                            if param_idx < pts.len() {
+                                cast = c_type(pts.get(param_idx));
+                            }
+                        }
+                        OptVecIrType::None => {}
+                    }
+                    var arg: str = arg_strs.get(arg_i);
+                    if str_equal(cast, "void*") || str_starts_with(cast, "struct ") {
+                        call_args.push("(void*)" + arg);
+                    } else if str_equal(cast, "double") {
+                        call_args.push("(double)" + arg);
+                    } else if str_equal(cast, "float") {
+                        call_args.push("(float)" + arg);
+                    } else if str_equal(cast, "bool") {
+                        call_args.push("(bool)" + arg);
+                    } else if str_contains(cast, "[") {
+                        call_args.push("(void*)" + arg);
+                    } else {
+                        call_args.push("(" + cast + ")" + arg);
+                    }
+                    arg_i = arg_i + 1;
+                }
+
+                // Join call args
+                var call_expr: str = c_fname + "(";
+                var j: i64 = 0;
+                while j < call_args.len() {
+                    if j > 0 { call_expr = call_expr + ", "; }
+                    call_expr = call_expr + call_args.get(j);
+                    j = j + 1;
+                }
+                call_expr = call_expr + ")";
+
+                if first {
+                    wln(self, "        if (strcmp(_fn_name, \"" + fname + "\") == 0) {");
+                    first = false;
+                } else {
+                    wln(self, "        } else if (strcmp(_fn_name, \"" + fname + "\") == 0) {");
+                }
+
+                if ir_type_eq(fn_ret, IrType::Void) || ir_type_eq(fn_ret, IrType::Never) {
+                    wln(self, "            " + call_expr + ";");
+                } else if is_aggregate_ret(fn_ret) {
+                    wln(self, "            " + call_expr + ";");
+                } else {
+                    wln(self, "            " + dst + " = " + call_expr + ";");
+                }
+                cand_i = cand_i + 1;
+            }
+            if first {
+                // No candidates found — fall back to direct function pointer call
+                var args_cast: Vec<str> = Vec::new();
+                var ai2: i64 = 0;
+                while ai2 < args.len() {
+                    args_cast.push("(void*)" + val_name(self, args.get(ai2)));
+                    ai2 = ai2 + 1;
+                }
+                var args_joined: str = "";
+                var j2: i64 = 0;
+                while j2 < args_cast.len() {
+                    if j2 > 0 { args_joined = args_joined + ", "; }
+                    args_joined = args_joined + args_cast.get(j2);
+                    j2 = j2 + 1;
+                }
+                var full_args: str;
+                if has_env {
+                    full_args = "(void*)" + fp + ", " + args_joined;
+                } else {
+                    full_args = args_joined;
+                }
+                if ir_type_eq(ret_ty, IrType::Void) || ir_type_eq(ret_ty, IrType::Never) {
+                    wln(self, "        ((void(*)(void*))" + fp + ")(" + full_args + ");");
+                } else {
+                    wln(self, "        " + dst + " = (int64_t)((int64_t(*)(void*))" + fp + ")(" + full_args + ");");
+                }
+            } else {
+                wln(self, "        } else { abort(); }");
+            }
+            wln(self, "    }");
         }
         Inst::DynCall(_, _, _, _, _) => {
             wln(self, "    // DynCall not implemented in C backend");
@@ -2067,6 +2300,14 @@ pub fn CCodeGen_generate(self: &mut CCodeGen, module: IrModule) -> str {
     CCodeGen_insert_runtime_sigs(self);
     while self.user_functions.len() > 0 { self.user_functions.pop(); }
     while self.user_fn_param_types.len() > 0 { self.user_fn_param_types.pop(); }
+
+    // Copy struct layouts for GetFieldPtr offset lookup
+    while self.struct_layouts.len() > 0 { self.struct_layouts.pop(); }
+    var sli: i64 = 0;
+    while sli < module.struct_layouts.len() {
+        self.struct_layouts.push(module.struct_layouts.get(sli));
+        sli = sli + 1;
+    }
 
     var f: i64 = 0;
     while f < module.functions.len() {
@@ -2367,10 +2608,10 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     // Thread entry point — calls a Fides function by name with i64 args.
     // The function lookup uses a simple dispatch table generated below.
     wln(self, "typedef struct { const char* name; int64_t (*fn)(); } p_thread_entry_t;");
-    wln(self, "static p_thread_entry_t p_thread_entries[256];");
+    wln(self, "static p_thread_entry_t p_thread_entries[2048];");
     wln(self, "static int p_thread_entry_count = 0;");
     wln(self, "void p_thread_register(const char* name, int64_t (*fn)()) {");
-    wln(self, "    if (p_thread_entry_count < 256) {");
+    wln(self, "    if (p_thread_entry_count < 2048) {");
     wln(self, "        p_thread_entries[p_thread_entry_count].name = name;");
     wln(self, "        p_thread_entries[p_thread_entry_count].fn = fn;");
     wln(self, "        p_thread_entry_count++;");

@@ -1297,6 +1297,21 @@ impl Lowerer {
         variant: &str,
         bindings: &[(String, String)],
     ) -> Vec<IrType> {
+        self.pattern_binding_ast_types(enum_name, variant, bindings)
+            .iter()
+            .map(|t| Self::word_repr(self.lower_type(t)))
+            .collect()
+    }
+
+    /// Like `pattern_binding_ir_types` but returns the AST types, which
+    /// we need to register in `var_ast_types` so that `infer_expr_type`
+    /// can recover generic element types (e.g. `Vec<FieldInit>`).
+    fn pattern_binding_ast_types(
+        &self,
+        enum_name: &str,
+        variant: &str,
+        bindings: &[(String, String)],
+    ) -> Vec<Type> {
         let payload: Vec<Type> = self.lookup_pattern_enum(enum_name, variant)
             .and_then(|def| def.variants.iter().find(|v| v.name == variant))
             .and_then(|v| v.data.as_ref())
@@ -1304,16 +1319,10 @@ impl Lowerer {
             .unwrap_or_default();
 
         bindings.iter().enumerate().map(|(i, (_, annot))| {
-            // A payload declared as the enum's own type param carries no
-            // layout information — prefer the pattern's annotation instead.
             let declared = payload.get(i).filter(|t| !self.is_opaque_type_param(t));
-            let ty = match declared {
-                Some(t) => Some(t.clone()),
-                None => self.ast_type_from_name(annot),
-            };
-            match ty {
-                Some(t) => Self::word_repr(self.lower_type(&t)),
-                None => IrType::I64,
+            match declared {
+                Some(t) => t.clone(),
+                None => self.ast_type_from_name(annot).unwrap_or(Type::I64),
             }
         }).collect()
     }
@@ -2828,6 +2837,7 @@ impl Lowerer {
                     let saved_var_ast_types = self.var_ast_types.clone();
                     let saved_locals = self.current_func.as_ref().map(|f| f.locals.clone());
                     let binding_tys = self.pattern_binding_ir_types(enum_name, variant, bindings);
+                    let binding_ast_tys = self.pattern_binding_ast_types(enum_name, variant, bindings);
                     for (i, (binding, _ty_name)) in bindings.iter().enumerate() {
                         let field_ty = binding_tys.get(i).cloned().unwrap_or(IrType::I64);
                         let field_ptr = self.emit_inst(Inst::GetFieldPtr {
@@ -2841,6 +2851,11 @@ impl Lowerer {
                         self.allocas.remove(binding);
                         if let Some(ref mut f) = self.current_func {
                             f.bind_local(binding, field_val);
+                        }
+                        // Register AST type so infer_expr_type can recover
+                        // generic element types (e.g. Vec<FieldInit>).
+                        if let Some(ast_ty) = binding_ast_tys.get(i) {
+                            self.var_ast_types.insert(binding.clone(), ast_ty.clone());
                         }
                     }
                     // If there's a guard, evaluate it and branch
@@ -2987,6 +3002,7 @@ impl Lowerer {
                     let saved_var_ast_types = self.var_ast_types.clone();
                     let saved_locals = self.current_func.as_ref().map(|f| f.locals.clone());
                     let binding_tys = self.pattern_binding_ir_types(enum_name, variant, bindings);
+                    let binding_ast_tys = self.pattern_binding_ast_types(enum_name, variant, bindings);
                     for (i, (binding, _ty_name)) in bindings.iter().enumerate() {
                         let field_ty = binding_tys.get(i).cloned().unwrap_or(IrType::I64);
                         let field_ptr = self.emit_inst(Inst::GetFieldPtr { struct_ptr: match_val, field_index: (i + 1) as u32, field_ty: field_ty.clone() });
@@ -2994,6 +3010,11 @@ impl Lowerer {
                         self.allocas.remove(binding);
                         if let Some(ref mut f) = self.current_func {
                             f.bind_local(binding, field_val);
+                        }
+                        // Register AST type so infer_expr_type can recover
+                        // generic element types (e.g. Vec<FieldInit>).
+                        if let Some(ast_ty) = binding_ast_tys.get(i) {
+                            self.var_ast_types.insert(binding.clone(), ast_ty.clone());
                         }
                     }
                     // If there's a guard, evaluate it and branch
@@ -3876,9 +3897,6 @@ impl Lowerer {
                 } else {
                     method.clone()
                 };
-                if method == "map" || method == "filter" || method == "fold" {
-                    eprintln!("DEBUG METHOD: method={}, struct_name={:?}, mangled={}, impl_methods_has={}", method, struct_name, mangled_name, self.impl_methods.contains_key(&(struct_name.clone().unwrap_or_default(), method.clone())));
-                }
                 // Look up return type from the impl method
                 let ret_ty = if let Some(ref sn) = struct_name {
                     if let Some(meth) = self.impl_methods.get(&(sn.clone(), method.clone())) {
@@ -3939,7 +3957,7 @@ impl Lowerer {
                 // Look up the struct layout to find the field index and type
                 // We need to determine the struct type from the value metadata
                 let struct_ty = self.get_value_type(struct_ptr);
-                let struct_name = match &struct_ty {
+                let mut struct_name = match &struct_ty {
                     IrType::Ptr(inner) => match inner.as_ref() {
                         IrType::Struct(name) => Some(name.clone()),
                         _ => None,
@@ -3947,6 +3965,19 @@ impl Lowerer {
                     IrType::Struct(name) => Some(name.clone()),
                     _ => None,
                 };
+                // Fallback: try infer_expr_type if get_value_type didn't find a struct
+                // (needed when struct_ptr comes from Vec_get which returns I64)
+                if struct_name.is_none() {
+                    let inferred_ty = self.infer_expr_type(expr);
+                    struct_name = match &inferred_ty {
+                        IrType::Ptr(inner) => match inner.as_ref() {
+                            IrType::Struct(name) => Some(name.clone()),
+                            _ => None,
+                        },
+                        IrType::Struct(name) => Some(name.clone()),
+                        _ => None,
+                    };
+                }
 
                 // Swizzle access for vec types (Phase 8A)
                 if let Some(ref sn) = struct_name {
@@ -3957,7 +3988,6 @@ impl Lowerer {
                         }
                     }
                 }
-
                 if let Some(name) = struct_name {
                     if let Some(layout) = self.module.get_struct(&name).cloned() {
                         if let Some((idx, (_, field_ty, _))) = layout.fields.iter()
@@ -6002,15 +6032,29 @@ impl Lowerer {
                     }
                     return IrType::I64;
                 }
-                // Check local binding — type is the value's type
+                // Check local binding — type is the value's type.
+                // But if the value type is I64 or Opaque (e.g. enum data slots
+                // are all I64, or Vec is Opaque), fall through to AST type
+                // checks which may have richer generic type info.
                 if let Some(val) = self.current_func.as_ref().and_then(|f| f.lookup_local(name)) {
                     if let Some(meta) = self.current_func.as_ref().and_then(|f| f.values.get(&val)) {
-                        return meta.ty.clone();
+                        if !matches!(meta.ty, IrType::I64 | IrType::Opaque(_)) {
+                            return meta.ty.clone();
+                        }
                     }
                 }
                 // Check constant
                 if let Some(const_expr) = self.constants.get(name) {
                     return self.infer_expr_type(const_expr);
+                }
+                // Check AST type (e.g. for function parameters with generic types like Vec<T>)
+                if let Some(ast_ty) = self.var_ast_types.get(name) {
+                    let ir_ty = self.lower_type(ast_ty);
+                    return ir_ty;
+                }
+                // Check parameter AST types (for Vec element type inference)
+                if let Some(ast_ty) = self.current_func_param_types.get(name) {
+                    return self.lower_type(ast_ty);
                 }
                 IrType::I64
             }

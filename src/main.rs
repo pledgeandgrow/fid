@@ -1394,11 +1394,22 @@ fn main() {
                 let c_ok = if c_compile.as_ref().map(|o| o.status.success()).unwrap_or(false) {
                     if let Ok(c_out) = process::Command::new(&c_exe).output() {
                         let c_stdout = String::from_utf8_lossy(&c_out.stdout).to_string();
-                        c_stdout == interp_stdout
+                        let match_result = c_stdout == interp_stdout;
+                        if !match_result && name == "test_borrowck" {
+                            eprintln!("  [DEBUG] test_borrowck: c_stdout={:?} interp_stdout={:?} match={}", c_stdout, interp_stdout, match_result);
+                        }
+                        match_result
                     } else {
+                        if name == "test_borrowck" {
+                            eprintln!("  [DEBUG] test_borrowck: failed to run exe");
+                        }
                         false
                     }
                 } else {
+                    if name == "test_borrowck" {
+                        let cc = c_compile.as_ref().map(|o| String::from_utf8_lossy(&o.stderr).to_string()).unwrap_or_default();
+                        eprintln!("  [DEBUG] test_borrowck: ccompile failed, stderr={}", cc);
+                    }
                     false
                 };
                 let _ = fs::remove_file(&c_exe);

@@ -1605,31 +1605,9 @@ pub fn build_executable_with_lto(source: &str, source_path: &str, target: &str, 
 
     let l3 = pir::lower_l2_to_l3(&l2, &module);
 
-    // DEBUG: dump p_str_copy_n L3 PIR
-    for f in &l3.functions {
-        if f.name == "p_str_copy_n" {
-            eprintln!("=== BUILD p_str_copy_n L3 ===\n{}", pir::format_l3(&l3));
-        }
-    }
-
     match target {
         "x86-64" | "x64" => {
             let asm = crate::codegen_x64::generate_asm(&l3);
-            // DEBUG: dump p_str_copy_n assembly
-            if let Some(idx) = asm.find("p_str_copy_n:") {
-                let end = asm[idx..].find("\n\n").map(|e| idx + e).unwrap_or(idx + 800);
-                eprintln!("=== BUILD p_str_copy_n asm ===\n{}", &asm[idx..end]);
-            }
-            // DEBUG: dump String_from assembly
-            if let Some(idx) = asm.find("String_from:") {
-                let end = asm[idx..].find("\n\n").map(|e| idx + e).unwrap_or(idx + 800);
-                eprintln!("=== BUILD String_from asm ===\n{}", &asm[idx..end]);
-            }
-            // DEBUG: dump p_str_length assembly
-            if let Some(idx) = asm.find("p_str_length:") {
-                let end = asm[idx..].find("\n\n").map(|e| idx + e).unwrap_or(idx + 800);
-                eprintln!("=== BUILD p_str_length asm ===\n{}", &asm[idx..end]);
-            }
             // Always run peephole optimization on the generated assembly —
             // this catches redundant moves, zero idioms, dead stores, etc.
             // These are safe local transformations that don't affect semantics.

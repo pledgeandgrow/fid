@@ -515,7 +515,7 @@ pub fn build_program(source: str) -> ResultProgram {
 /// Build a program with optional file path for resolving `use` imports.
 /// This is the main entry point for the compiler pipeline:
 ///   parse stdlib → parse user → resolve imports → merge → cfg filter →
-///   derive → desugar layers/models → typecheck → borrowck → comptime → mono
+///   derive → desugar layers/models → comptime → typecheck → borrowck → mono
 pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgram {
     // Parse stdlib first
     var stdlib_source: str = c_file_read("stdlib/core.fd");
@@ -552,7 +552,6 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                 }
                 return ResultProgram::Err(enrich_errors(lex.errors, source, file));
             }
-
             var p: Parser = Parser_with_names(tokens, struct_names, enum_names);
             var user_result: ParseResultProgram = p.parse();
             match user_result {
@@ -577,8 +576,233 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                         i = i + 1;
                     }
 
-                    // Merge: start with stdlib, then add user (user wins)
-                    var program: Program = merge_programs(stdlib, user);
+                    // ── Resolve use imports from disk ──────────────────────────
+                    // When source_path is provided, load `use foo::bar;` imports
+                    // from disk, handling transitive dependencies.
+                    var imported_modules: Vec<Program> = Vec::new();
+                    var imported_module_names: Vec<str> = Vec::new();
+                    var loaded_module_names: Vec<str> = Vec::new();
+                    var has_source_path: bool = false;
+                    var base_dir: str = ".";
+                    match source_path {
+                        OptStr::Some(sp) => {
+                            has_source_path = true;
+                            base_dir = c_path_dirname(sp);
+                        }
+                        OptStr::None => { }
+                    }
+
+                    if has_source_path {
+                        // Collect imports to process (LIFO — reversed so earlier
+                        // imports are processed first via pop())
+                        var imports_to_process: Vec<str> = Vec::new();
+                        var ui: i64 = user.imports.len() - 1;
+                        while ui >= 0 {
+                            imports_to_process.push(user.imports.get(ui).path);
+                            ui = ui - 1;
+                        }
+
+                        var project_root: str = find_project_root(base_dir);
+
+                        while imports_to_process.len() > 0 {
+                            var import_path: str = imports_to_process.get(imports_to_process.len() - 1);
+                            imports_to_process.pop();
+
+                            // Skip "core" — auto-included
+                            if str_equal(import_path, "core") { continue; }
+                            // Skip already-loaded
+                            if c_str_vec_contains(loaded_module_names, import_path) { continue; }
+
+                            // Try candidate paths
+                            var path_str: str = str_replace(import_path, "::", "/");
+                            var candidates: Vec<str> = Vec::new();
+                            candidates.push(c_path_join(base_dir, str_concat(path_str, ".fd")));
+                            candidates.push(c_path_join(base_dir, c_path_join(path_str, "mod.fd")));
+                            candidates.push(c_path_join("stdlib", str_concat(path_str, ".fd")));
+                            candidates.push(c_path_join("stdlib", c_path_join(path_str, "mod.fd")));
+                            candidates.push(c_path_join(project_root, str_concat(path_str, ".fd")));
+                            candidates.push(c_path_join(project_root, c_path_join(path_str, "mod.fd")));
+
+                            var found_path: str = "";
+                            var found: bool = false;
+                            var ci: i64 = 0;
+                            while ci < candidates.len() {
+                                if c_file_exists(candidates.get(ci)) {
+                                    found_path = candidates.get(ci);
+                                    found = true;
+                                    break;
+                                }
+                                ci = ci + 1;
+                            }
+
+                            if found {
+                                var module_source: str = c_file_read(found_path);
+
+                                // Pre-scan: parse to extract imports and type names
+                                var pre_lex: Lexer = Lexer::new(module_source);
+                                var pre_toks: Vec<Token> = pre_lex.tokenize();
+                                var pre_parser: Parser = Parser_with_names(pre_toks, struct_names, enum_names);
+                                var pre_result: ParseResultProgram = pre_parser.parse();
+
+                                match pre_result {
+                                    ParseResultProgram::Ok(pre_prog) => {
+                                        // Add this module's type names to name sets
+                                        var si: i64 = 0;
+                                        while si < pre_prog.structs.len() {
+                                            var sn: str = pre_prog.structs.get(si).name;
+                                            if !c_str_vec_contains(struct_names, sn) {
+                                                struct_names.push(sn);
+                                            }
+                                            si = si + 1;
+                                        }
+                                        var ei: i64 = 0;
+                                        while ei < pre_prog.enums.len() {
+                                            var en: str = pre_prog.enums.get(ei).name;
+                                            if !c_str_vec_contains(enum_names, en) {
+                                                enum_names.push(en);
+                                            }
+                                            ei = ei + 1;
+                                        }
+
+                                        // Check for unloaded transitive deps
+                                        var unloaded_deps: Vec<str> = Vec::new();
+                                        var di: i64 = 0;
+                                        while di < pre_prog.imports.len() {
+                                            var dep: str = pre_prog.imports.get(di).path;
+                                            if !str_equal(dep, "core") && !c_str_vec_contains(loaded_module_names, dep) {
+                                                unloaded_deps.push(dep);
+                                            }
+                                            di = di + 1;
+                                        }
+
+                                        if unloaded_deps.len() > 0 {
+                                            // Defer: push this module back, then push deps
+                                            imports_to_process.push(import_path);
+                                            var di2: i64 = 0;
+                                            while di2 < unloaded_deps.len() {
+                                                if !c_str_vec_contains(loaded_module_names, unloaded_deps.get(di2)) {
+                                                    imports_to_process.push(unloaded_deps.get(di2));
+                                                }
+                                                di2 = di2 + 1;
+                                            }
+                                            continue;
+                                        }
+
+                                        // All deps loaded — full parse with all names
+                                        var lex2: Lexer = Lexer::new(module_source);
+                                        var toks2: Vec<Token> = lex2.tokenize();
+                                        var p2: Parser = Parser_with_names(toks2, struct_names, enum_names);
+                                        var full_result: ParseResultProgram = p2.parse();
+
+                                        match full_result {
+                                            ParseResultProgram::Ok(imported) => {
+                                                var mod_name: str = import_path;
+                                                match imported.module {
+                                                    OptStr::Some(mn) => { mod_name = mn; }
+                                                    OptStr::None => { }
+                                                }
+                                                loaded_module_names.push(import_path);
+                                                loaded_module_names.push(mod_name);
+
+                                                // Extract names for future imports
+                                                var si2: i64 = 0;
+                                                while si2 < imported.structs.len() {
+                                                    var sn2: str = imported.structs.get(si2).name;
+                                                    if !c_str_vec_contains(struct_names, sn2) {
+                                                        struct_names.push(sn2);
+                                                    }
+                                                    si2 = si2 + 1;
+                                                }
+                                                var ei2: i64 = 0;
+                                                while ei2 < imported.enums.len() {
+                                                    var en2: str = imported.enums.get(ei2).name;
+                                                    if !c_str_vec_contains(enum_names, en2) {
+                                                        enum_names.push(en2);
+                                                    }
+                                                    ei2 = ei2 + 1;
+                                                }
+
+                                                // Add transitive imports
+                                                var ti: i64 = 0;
+                                                while ti < imported.imports.len() {
+                                                    var tpath: str = imported.imports.get(ti).path;
+                                                    if !c_str_vec_contains(loaded_module_names, tpath) {
+                                                        imports_to_process.push(tpath);
+                                                    }
+                                                    ti = ti + 1;
+                                                }
+
+                                                imported_modules.push(imported);
+                                                imported_module_names.push(mod_name);
+                                            }
+                                            ParseResultProgram::Err(errs) => {
+                                                // Full parse failed — return error (do not silently skip)
+                                                var err_msg: str = "Import error: failed to parse module '" + import_path + "'";
+                                                if errs.len() > 0 {
+                                                    err_msg = err_msg + ": " + errs.get(0);
+                                                }
+                                                return ResultProgram::Err(c_vec1(err_msg));
+                                            }
+                                        }
+                                    }
+                                    ParseResultProgram::Err(_) => {
+                                        // Pre-scan failed — try full parse directly
+                                        var lex2: Lexer = Lexer::new(module_source);
+                                        var toks2: Vec<Token> = lex2.tokenize();
+                                        var p2: Parser = Parser_with_names(toks2, struct_names, enum_names);
+                                        var full_result: ParseResultProgram = p2.parse();
+                                        match full_result {
+                                            ParseResultProgram::Ok(imported) => {
+                                                var mod_name: str = import_path;
+                                                match imported.module {
+                                                    OptStr::Some(mn) => { mod_name = mn; }
+                                                    OptStr::None => { }
+                                                }
+                                                loaded_module_names.push(import_path);
+                                                loaded_module_names.push(mod_name);
+                                                imported_modules.push(imported);
+                                                imported_module_names.push(mod_name);
+                                            }
+                                            ParseResultProgram::Err(errs2) => {
+                                                // Full parse also failed — return error
+                                                var err_msg: str = "Import error: failed to parse module '" + import_path + "'";
+                                                if errs2.len() > 0 {
+                                                    err_msg = err_msg + ": " + errs2.get(0);
+                                                }
+                                                return ResultProgram::Err(c_vec1(err_msg));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Import not found — return error
+                                return ResultProgram::Err(c_vec1(str_concat("Import error: could not resolve module '", str_concat(import_path, "'"))));
+                            }
+                        }
+
+                        // Re-parse user code with full name set (including imported types)
+                        var reparser: Parser = Parser_with_names(tokens, struct_names, enum_names);
+                        var reparse_result: ParseResultProgram = reparser.parse();
+                        match reparse_result {
+                            ParseResultProgram::Ok(reparsed) => {
+                                user = reparsed;
+                            }
+                            ParseResultProgram::Err(_) => { }
+                        }
+                    }
+
+                    // Merge: start with stdlib, then imported modules, then user
+                    var program: Program = stdlib;
+
+                    // Merge imported modules
+                    var mi: i64 = 0;
+                    while mi < imported_modules.len() {
+                        program = merge_programs(program, imported_modules.get(mi));
+                        mi = mi + 1;
+                    }
+
+                    // Merge user (highest priority)
+                    program = merge_programs(program, user);
 
                     // Phase 7.7: Conditional compilation filter
                     apply_cfg_filter(&mut program);
@@ -589,10 +813,13 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                     // Desugar layer/model declarations
                     desugar_layers_models(&mut program);
 
+                    // Comptime: process gen blocks (before typechecking so generated code is visible)
+                    program = process_gen(program);
+
                     // Phase 3B.1: Fill in default trait methods
                     fill_default_trait_methods(&mut program);
 
-                    // Type check
+                    // Type check — register each module with its own name
                     var tc: TypeChecker = TypeChecker::new();
                     var stdlib_module: str = "core";
                     match stdlib.module {
@@ -600,6 +827,13 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                         OptStr::None => { }
                     }
                     TypeChecker_register_program(&mut tc, stdlib, stdlib_module);
+
+                    // Register imported modules
+                    var mi2: i64 = 0;
+                    while mi2 < imported_modules.len() {
+                        TypeChecker_register_program(&mut tc, imported_modules.get(mi2), imported_module_names.get(mi2));
+                        mi2 = mi2 + 1;
+                    }
 
                     var user_module: str = "main";
                     match user.module {
@@ -623,6 +857,21 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
 
                     // Run lints (warnings only)
                     tc.run_lints(program);
+
+                    // Borrow check
+                    var bc: BorrowChecker = BorrowChecker_new(BorrowckMode::Off);
+                    check(&mut bc, program);
+                    if bc.errors.len() > 0 {
+                        var file4: str = "<stdin>";
+                        match source_path {
+                            OptStr::Some(p4) => { file4 = p4; }
+                            OptStr::None => { }
+                        }
+                        return ResultProgram::Err(enrich_errors(bc.errors, source, file4));
+                    }
+
+                    // Comptime: substitute comptime expressions with their values
+                    program = substitute(&program);
 
                     // Monomorphize generics
                     var mono_result: Program = monomorphize(program);

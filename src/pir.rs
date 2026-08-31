@@ -650,6 +650,9 @@ pub struct L3Module {
     /// Set of @no-alloc function names (I-2D: effect-aware regalloc).
     /// Calls to these functions don't clobber allocator state registers.
     pub no_alloc_functions: HashSet<String>,
+    /// Set of @wrapping function names (F65) — wrap-around arithmetic.
+    /// Codegen skips overflow checks for these functions.
+    pub wrapping_functions: HashSet<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1175,6 +1178,10 @@ pub fn lower_l2_to_l3(l2: &L2Module, module: &IrModule) -> L3Module {
         // I-2D: Populate no-alloc function set for effect-aware regalloc.
         if f.is_no_alloc || f.is_medical {
             l3.no_alloc_functions.insert(f.name.clone());
+        }
+        // F65: Populate wrapping function set — codegen skips overflow checks.
+        if f.is_wrapping {
+            l3.wrapping_functions.insert(f.name.clone());
         }
     }
     l3.functions = l2.functions.iter().map(|f| lower_func_l2_to_l3(f, module)).collect();
