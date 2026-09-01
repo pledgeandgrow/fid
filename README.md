@@ -760,8 +760,6 @@ p-lang/
 │   ├── neural_network.fd    # Neural network example
 │   ├── riscv_blink.fd       # RISC-V LED blink (embedded)
 │   └── rpi_led_blink.fd     # Raspberry Pi LED blink (embedded)
-├── benches/
-│   └── bench_main.rs       # Performance benchmarks
 └── docs/                   # 4 subdirectories: reference, guides, meta, roadmap
     ├── reference/          # 7 core reference docs
     │   ├── architecture.md # Compiler architecture and pipeline
