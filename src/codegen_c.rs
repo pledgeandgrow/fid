@@ -458,6 +458,9 @@ impl CCodeGen {
             ("p_malloc", &[I64]),
             ("p_alloc", &[I64]),
             ("p_free", &[p()]),
+            ("p_malloc_persistent", &[I64]),
+            ("p_arena_save", &[]),
+            ("p_arena_restore", &[I64]),
             ("p_region_free", &[p()]),
             ("p_panic", &[p()]),
             ("println", &[p(), p()]),
@@ -616,7 +619,7 @@ impl CCodeGen {
             "p_vec_reverse", "p_vec_sort", "p_vec_truncate", "p_vec_extend",
             "p_map_insert", "p_map_remove", "p_map_clear",
             "p_print", "p_print_str", "p_print_int", "p_print_bool",
-            "p_print_float", "p_print_newline", "p_free", "p_region_free", "p_panic",
+            "p_print_float", "p_print_newline", "p_free", "p_arena_restore", "p_region_free", "p_panic",
             "p_socket_close",
             "p_cli", "p_sti", "p_cr3_write", "p_invlpg", "p_page_map", "p_page_unmap",
             "p_phys_write64",
@@ -673,7 +676,9 @@ impl CCodeGen {
         wln!(self, "#include <stdio.h>");
         wln!(self, "#include <stdlib.h>");
         wln!(self, "#include <string.h>");
+        wln!(self, "#ifndef _WIN32");
         wln!(self, "#include <alloca.h>");
+        wln!(self, "#endif");
         wln!(self, "#include <stdint.h>");
         wln!(self, "#include <stdbool.h>");
         wln!(self, "#include <ctype.h>");
@@ -2105,7 +2110,7 @@ impl CCodeGen {
         wln!(self, "");
         // Vec runtime
         wln!(self, "PVec* p_vec_new(void) {{");
-        wln!(self, "    PVec* v = (PVec*)malloc(sizeof(PVec));");
+        wln!(self, "    PVec* v = (PVec*)p_malloc(sizeof(PVec));");
         wln!(self, "    v->data = NULL; v->len = 0; v->cap = 0;");
         wln!(self, "    return v;");
         wln!(self, "}}");
@@ -2114,7 +2119,9 @@ impl CCodeGen {
         wln!(self, "    if (!v) return;");
         wln!(self, "    if (v->len >= v->cap) {{");
         wln!(self, "        v->cap = v->cap == 0 ? 8 : v->cap * 2;");
-        wln!(self, "        v->data = (void**)realloc(v->data, v->cap * sizeof(void*));");
+        wln!(self, "        void** new_data = (void**)p_malloc(v->cap * (int64_t)sizeof(void*));");
+        wln!(self, "        if (v->data && v->len > 0) {{ memcpy(new_data, v->data, v->len * sizeof(void*)); }}");
+        wln!(self, "        v->data = new_data;");
         wln!(self, "    }}");
         wln!(self, "    v->data[v->len++] = val;");
         wln!(self, "}}");
@@ -2140,7 +2147,7 @@ impl CCodeGen {
         wln!(self, "");
         // Map runtime (simple linear probe)
         wln!(self, "PMap* p_map_new(void) {{");
-        wln!(self, "    PMap* m = (PMap*)malloc(sizeof(PMap));");
+        wln!(self, "    PMap* m = (PMap*)p_malloc(sizeof(PMap));");
         wln!(self, "    m->keys = NULL; m->vals = NULL; m->len = 0; m->cap = 0;");
         wln!(self, "    return m;");
         wln!(self, "}}");
@@ -2152,10 +2159,13 @@ impl CCodeGen {
         wln!(self, "    }}");
         wln!(self, "    if (m->len >= m->cap) {{");
         wln!(self, "        m->cap = m->cap == 0 ? 8 : m->cap * 2;");
-        wln!(self, "        m->keys = (char**)realloc(m->keys, m->cap * sizeof(char*));");
-        wln!(self, "        m->vals = (int64_t*)realloc(m->vals, m->cap * sizeof(int64_t));");
+        wln!(self, "        char** new_keys = (char**)p_malloc(m->cap * (int64_t)sizeof(char*));");
+        wln!(self, "        int64_t* new_vals = (int64_t*)p_malloc(m->cap * (int64_t)sizeof(int64_t));");
+        wln!(self, "        if (m->keys && m->len > 0) {{ memcpy(new_keys, m->keys, m->len * sizeof(char*)); memcpy(new_vals, m->vals, m->len * sizeof(int64_t)); }}");
+        wln!(self, "        m->keys = new_keys;");
+        wln!(self, "        m->vals = new_vals;");
         wln!(self, "    }}");
-        wln!(self, "    m->keys[m->len] = strdup(key);");
+        wln!(self, "    {{ size_t klen = strlen(key); char* kcopy = (char*)p_malloc((int64_t)(klen + 1)); memcpy(kcopy, key, klen + 1); m->keys[m->len] = kcopy; }}");
         wln!(self, "    m->vals[m->len] = val;");
         wln!(self, "    m->len++;");
         wln!(self, "}}");
@@ -2238,14 +2248,14 @@ impl CCodeGen {
         wln!(self, "}}");
         wln!(self, "");
         wln!(self, "char* p_to_str(int64_t val) {{");
-        wln!(self, "    char* buf = (char*)malloc(32);");
+        wln!(self, "    char* buf = (char*)p_malloc(32);");
         wln!(self, "    snprintf(buf, 32, \"%lld\", (long long)val);");
         wln!(self, "    return buf;");
         wln!(self, "}}");
         wln!(self, "");
         wln!(self, "char* p_str_concat(const char* a, const char* b) {{");
         wln!(self, "    size_t len = strlen(a) + strlen(b);");
-        wln!(self, "    char* result = (char*)malloc(len + 1);");
+        wln!(self, "    char* result = (char*)p_malloc((int64_t)(len + 1));");
         wln!(self, "    strcpy(result, a);");
         wln!(self, "    strcat(result, b);");
         wln!(self, "    return result;");
@@ -2270,8 +2280,37 @@ impl CCodeGen {
         wln!(self, "    }}");
         wln!(self, "    abort();");
         wln!(self, "}}");
-        wln!(self, "void* p_malloc(int64_t size) { if (size < 0) return NULL; return malloc((size_t)size); }");
-        wln!(self, "void p_free(void* ptr) { free(ptr); }");
+        wln!(self, "void* p_malloc(int64_t size) {{");
+        wln!(self, "    if (size < 0) return NULL;");
+        wln!(self, "    size_t sz = (size_t)size;");
+        wln!(self, "    sz = (sz + 7) & ~((size_t)7);");
+        wln!(self, "    if (!__p_arena_base) {{ __p_arena_base = (char*)malloc(64*1024*1024); __p_arena_end = __p_arena_base + 64*1024*1024; __p_arena_ptr = __p_arena_base; }}");
+        wln!(self, "    if (__p_arena_ptr + sz > __p_arena_end) {{");
+        wln!(self, "        size_t used = (size_t)(__p_arena_ptr - __p_arena_base);");
+        wln!(self, "        size_t cur_cap = (size_t)(__p_arena_end - __p_arena_base);");
+        wln!(self, "        size_t new_cap = cur_cap * 2;");
+        wln!(self, "        if (new_cap < used + sz + 1048576) new_cap = used + sz + 1048576;");
+        wln!(self, "        char* new_base = (char*)malloc(new_cap);");
+        wln!(self, "        if (!new_base) return NULL;");
+        wln!(self, "        memcpy(new_base, __p_arena_base, used);");
+        wln!(self, "        free(__p_arena_base);");
+        wln!(self, "        __p_arena_base = new_base;");
+        wln!(self, "        __p_arena_end = new_base + new_cap;");
+        wln!(self, "        __p_arena_ptr = new_base + used;");
+        wln!(self, "    }}");
+        wln!(self, "    void* result = __p_arena_ptr;");
+        wln!(self, "    __p_arena_ptr += sz;");
+        wln!(self, "    return result;");
+        wln!(self, "}}");
+        wln!(self, "void* p_malloc_persistent(int64_t size) { if (size < 0) return NULL; return malloc((size_t)size); }");
+        wln!(self, "void p_free(void* ptr) { /* arena memory — no individual frees */ }");
+        wln!(self, "static char* __p_arena_base = NULL;");
+        wln!(self, "static char* __p_arena_end = NULL;");
+        wln!(self, "static char* __p_arena_ptr = NULL;");
+        wln!(self, "int64_t p_arena_save(void) { return (int64_t)(__p_arena_ptr - __p_arena_base); }");
+        wln!(self, "void p_arena_restore(int64_t mark) {{");
+        wln!(self, "    if (__p_arena_base && mark >= 0) {{ __p_arena_ptr = __p_arena_base + (size_t)mark; }}");
+        wln!(self, "}}");
         // File I/O builtins
         wln!(self, "char* p_file_read(const char* path) {{");
         wln!(self, "    FILE* f = fopen(path, \"rb\");");

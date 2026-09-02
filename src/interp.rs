@@ -4573,8 +4573,15 @@ impl Interpreter {
                             .status();
                         match status {
                             Ok(s) => {
-                                use std::os::unix::process::ExitStatusExt;
-                                return ExecOutcome::Value(Value::Int(s.code().unwrap_or(s.signal().unwrap_or(0)) as i64));
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::process::ExitStatusExt;
+                                    return ExecOutcome::Value(Value::Int(s.code().unwrap_or(s.signal().unwrap_or(0)) as i64));
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    return ExecOutcome::Value(Value::Int(s.code().unwrap_or(0) as i64));
+                                }
                             }
                             Err(_) => return ExecOutcome::Value(Value::Int(-1)),
                         }

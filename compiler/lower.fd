@@ -570,11 +570,80 @@ pub fn Lowerer_lookup_enum(self: &Lowerer, name: str) -> OptEnumDef {
     return OptEnumDef::None;
 }
 
-pub fn Lowerer_lookup_alloca(self: &Lowerer, name: str) -> OptValueId {
+/// Look up the EnumDef a variant pattern refers to. `enum_name` may be
+/// empty for shorthand patterns like `Some(x)`, in which case we search
+/// all enums for a variant with that name.
+pub fn Lowerer_lookup_pattern_enum(self: &Lowerer, enum_name: str, variant: str) -> OptEnumDef {
+    if str_len(enum_name) > 0 {
+        match Lowerer_lookup_enum(self, enum_name) {
+            OptEnumDef::Some(def) => { return OptEnumDef::Some(def); }
+            OptEnumDef::None => {}
+        }
+    }
     var i: i64 = 0;
-    while i < self.allocas.len() {
-        if str_equal(self.allocas.get(i).key, name) { return OptValueId::Some(self.allocas.get(i).val); }
+    while i < self.enums.len() {
+        var def: EnumDef = self.enums.get(i).val;
+        var vi: i64 = 0;
+        while vi < def.variants.len() {
+            if str_equal(def.variants.get(vi).name, variant) {
+                return OptEnumDef::Some(def);
+            }
+            vi = vi + 1;
+        }
         i = i + 1;
+    }
+    return OptEnumDef::None;
+}
+
+/// IR types for the values bound by an enum-variant pattern.
+/// Payload slots are one machine word wide, so aggregates (structs, enums,
+/// Vec, ...) are stored as pointers. Returning the pointer type here — not
+/// a bare I64 — is what lets field access and method calls on the binding
+/// resolve, since the lowerer keys those off the value's IR type.
+pub fn Lowerer_pattern_binding_ir_types(self: &Lowerer, enum_name: str, variant: str, bindings: Vec<Binding>) -> Vec<IrType> {
+    var payload_tys: Vec<Type> = Vec::new();
+    match Lowerer_lookup_pattern_enum(self, enum_name, variant) {
+        OptEnumDef::Some(def) => {
+            var vi: i64 = 0;
+            while vi < def.variants.len() {
+                if str_equal(def.variants.get(vi).name, variant) {
+                    match def.variants.get(vi).data {
+                        OptParams::Some(params) => {
+                            var pi: i64 = 0;
+                            while pi < params.len() {
+                                payload_tys.push(params.get(pi).ty);
+                                pi = pi + 1;
+                            }
+                        }
+                        OptParams::None => {}
+                    }
+                    break;
+                }
+                vi = vi + 1;
+            }
+        }
+        OptEnumDef::None => {}
+    }
+    var result: Vec<IrType> = Vec::new();
+    var bi: i64 = 0;
+    while bi < bindings.len() {
+        var binding: Binding = bindings.get(bi);
+        var ir_ty: IrType = IrType::I64;
+        if bi < payload_tys.len() {
+            ir_ty = word_repr(Lowerer_lower_type(self, payload_tys.get(bi)));
+        }
+        result.push(ir_ty);
+        bi = bi + 1;
+    }
+    return result;
+}
+
+pub fn Lowerer_lookup_alloca(self: &Lowerer, name: str) -> OptValueId {
+    // Search from the end so shadowed variables find the most recent binding.
+    var i: i64 = self.allocas.len() - 1;
+    while i >= 0 {
+        if str_equal(self.allocas.get(i).key, name) { return OptValueId::Some(self.allocas.get(i).val); }
+        i = i - 1;
     }
     return OptValueId::None;
 }
@@ -589,10 +658,11 @@ pub fn Lowerer_lookup_alloca_type(self: &Lowerer, id: i64) -> OptIrType {
 }
 
 pub fn Lowerer_lookup_var_ast_type(self: &Lowerer, name: str) -> OptType {
-    var i: i64 = 0;
-    while i < self.var_ast_types.len() {
+    // Search from the end so shadowed variables find the most recent binding.
+    var i: i64 = self.var_ast_types.len() - 1;
+    while i >= 0 {
         if str_equal(self.var_ast_types.get(i).key, name) { return OptType::Some(self.var_ast_types.get(i).val); }
-        i = i + 1;
+        i = i - 1;
     }
     return OptType::None;
 }
@@ -3134,11 +3204,16 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
 
                         // In the arm block: bind payload fields
                         Lowerer_set_current_block(self, arm_block);
+                        var binding_tys: Vec<IrType> = Lowerer_pattern_binding_ir_types(self, enum_name, variant, bindings);
                         var bi: i64 = 0;
                         while bi < bindings.len() {
                             var binding: Binding = bindings.get(bi);
-                            var field_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(match_val, bi + 1, IrType::I64));
-                            var field_val: i64 = Lowerer_emit_inst(self, Inst::Load(field_ptr, IrType::I64));
+                            var field_ty: IrType = IrType::I64;
+                            if bi < binding_tys.len() {
+                                field_ty = binding_tys.get(bi);
+                            }
+                            var field_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(match_val, bi + 1, field_ty));
+                            var field_val: i64 = Lowerer_emit_inst(self, Inst::Load(field_ptr, field_ty));
                             Lowerer_bind_local(self, binding.name, field_val);
                             bi = bi + 1;
                         }
@@ -4140,11 +4215,16 @@ pub fn Lowerer_lower_match(self: &mut Lowerer, expr: Expr, arms: Vec<MatchArm>) 
 
                 // In arm block: bind payload fields
                 Lowerer_set_current_block(self, arm_block);
+                var binding_tys: Vec<IrType> = Lowerer_pattern_binding_ir_types(self, enum_name, variant, bindings);
                 var bi: i64 = 0;
                 while bi < bindings.len() {
                     var binding: Binding = bindings.get(bi);
-                    var field_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(match_val, bi + 1, IrType::I64));
-                    var field_val: i64 = Lowerer_emit_inst(self, Inst::Load(field_ptr, IrType::I64));
+                    var field_ty: IrType = IrType::I64;
+                    if bi < binding_tys.len() {
+                        field_ty = binding_tys.get(bi);
+                    }
+                    var field_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(match_val, bi + 1, field_ty));
+                    var field_val: i64 = Lowerer_emit_inst(self, Inst::Load(field_ptr, field_ty));
                     Lowerer_bind_local(self, binding.name, field_val);
                     bi = bi + 1;
                 }
