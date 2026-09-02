@@ -2,24 +2,42 @@
 
 > Single source of truth for "what are we doing right now."
 > Read this first every session. Updated after every milestone change.
-> Last updated: Feb 9, 2026.
+> Last updated: Feb 10, 2026.
 
-## Where We Stopped (Feb 9 — pick up here)
+## Where We Stopped (Feb 10 — pick up here)
 
-**Self-hosted compiler builds into `release/` but crashes on use. Safety hardening done.**
+**Crash fixed. Self-hosted compiler runs to completion but has a lowerer bug
+in enum variant extraction that causes parse errors.**
 
 ### What works:
-1. **Build pipeline complete** — `compiler/*.fd` (18 modules, 39.5K LOC) compiles to C via the Rust compiler, then links to `release/fides-c.exe` (7.9MB) via tcc
+1. **Build pipeline complete** — `compiler/*.fd` (18 modules, 39.5K LOC) compiles to C via the Rust compiler, then links to `release/fides-c.exe` via tcc
 2. **All 18 self-host modules compile + pass tests** (23/23 on tests/compiler/ via interpreter + PE)
 3. **Arena allocator** (chunk-based, never invalidates pointers) in both `src/codegen_c.rs` and `compiler/codegen_c.fd`
-4. **Windows compatibility** — tcc builds work with ws2_32.def linking, PE stack patched to 256MB
-5. **Test reorganization** — `compiler/tests/` moved to `tests/compiler/`, root stray files cleaned up
-6. **Build dirs clean**: `target/` (Rust), `release/` (self-hosted), no more `target2/`
-7. **Safety hardening (SH-12 DONE)** — C codegen recursion limit (p_max_recursion=10000), p_malloc OOM detection (abort on alloc failure), interpreter --max-steps flag (infinite loop prevention), test runner step limit (50M), Windows path fixes (temp dir), tcc auto-detection
-8. **Interpreter opaque_values bug fixed** — stale Value::Str entries cleared on non-opaque Store, fixing string loss during SRET operations
+4. **Windows compatibility** — tcc builds work with ws2_32.def linking, PE stack patched to 256MB, 16MB thread stack wrapper
+5. **Safety hardening (SH-12 DONE)** — recursion limit, OOM abort, crash handlers, all ported to both Rust and Fides codegen
+6. **Progressive stage reporting** — `p_eprint_str` calls in `compiler.fd` and `main.fd` print each stage to stderr
+7. **SRET calling convention** — Fides lowerer now correctly handles struct returns via out-parameter convention for both regular calls and method calls
+8. **Enum layout computation** — Fides lowerer now computes enum payload sizes from actual field sizes, with iterative fixpoint for nested types
+9. **Lexer optimization** — Cached `src_len` to avoid O(n) `str_len` on every peek; `str_slice` instead of char-by-char `str_concat` for identifiers/numbers
 
 ### Current blocker:
-`release/fides-c.exe` crashes with `STATUS_ACCESS_VIOLATION` (0xC0000005) when compiling any `.fd` file. The crash occurs in `Lexer_tokenize` at stdlib position ~69845 (around `byte_to_str` in `stdlib/core.fd`). This is a pre-existing bug — it crashes even with `p_malloc` reverted to plain `malloc`.
+The self-hosted compiler runs to completion but reports parse errors when
+parsing `stdlib/core.fd`:
+```
+Parse error: assignment target must be an identifier or array index at line 298 col 15
+```
+This occurs at `*p0 = 0;` — a dereference assignment. The `Expr::Deref`
+variant is not matched because the `Expr` value is truncated to 8 bytes
+during enum variant extraction.
+
+**Root cause:** When matching `ParseResultExpr::Ok(e) => { left = e; }`,
+the Fides lowerer emits `Inst::Load` which only reads 8 bytes for
+struct-typed fields (because `c_type(Struct(_))` is a pointer type in C).
+The full `Expr` (80 bytes) is truncated to just the tag field.
+
+**Fix already done in Rust lowerer:** `load_enum_field()` helper in
+`src/lower.rs` (line 246) allocates a buffer and uses `Inst::Store`
+(which emits `memcpy` for structs) to copy the full inline struct data.
 
 ### Build commands:
 ```
@@ -31,12 +49,11 @@ tcc -O2 -w -o release\fides-c.exe release\fides-c.c C:\tcc\lib\ws2_32.def  # →
 Or just: `.\build-selfhost.ps1`
 
 ### Next steps:
-1. **Fix the Lexer_tokenize crash** at stdlib position ~69845
-   - Investigate if it's a tcc codegen bug (try gcc/clang)
-   - Add targeted debug prints to narrow down the exact failing operation
-   - Check if `alloca` in tcc is causing stack exhaustion in deep recursion
-2. **Once crash is fixed**: verify the bootstrap fixpoint (stage2.c == stage1.c)
-3. **Run full test suite** through the self-hosted compiler
+1. **Port `load_enum_field()` to `compiler/lower.fd`** — allocate buffer + use `Store` (memcpy) for struct-typed enum variant fields instead of `Load`
+2. **Apply at both enum match extraction sites** in `compiler/lower.fd`
+3. **Ensure `Inst::Store` in `compiler/codegen_c.fd` emits `memcpy` for struct types** (like the Rust codegen does)
+4. **Once parse errors are fixed**: verify the bootstrap fixpoint (stage2.c == stage3.c)
+5. **Run full test suite** through the self-hosted compiler
 
 ## Self-Host Module Status
 

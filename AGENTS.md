@@ -132,7 +132,7 @@ Source:       52 .rs files, 82,778 LOC
 Stdlib:       69 .fd modules, 16,069 LOC
 Self-host:    18 .fd modules, 39,502 LOC (token, diag, json, fmt, ast, lexer, parser, ir, typechecker, lower, mono, borrowck, pir, opt, codegen_c, compiler, comptime_eval, main — all compile + pass tests)
 Bootstrap:    release/fides-c.exe builds (7.9MB) but crashes with STATUS_ACCESS_VIOLATION on use (pre-existing lexer bug at stdlib pos ~69845)
-Safety:       SH-12 DONE — C codegen recursion limit, p_malloc OOM abort, --max-steps, test runner step limit, Windows path fixes, tcc auto-detection
+Safety:       SH-12 DONE — C codegen recursion limit, p_malloc OOM abort, --max-steps/--max-memory/--timeout, test runner step limit, Windows path fixes, tcc auto-detection, crash handlers (VEH+SIGSEGV), all ported to Rust + Fides codegen
 Docs:         24 docs/ + 4 root = 28 .md files
 Binaries:     4 (fidesc, pacte, scribe, veil)
 ```

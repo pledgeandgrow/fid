@@ -1426,6 +1426,19 @@ impl Interpreter {
                 // handlers below (Value::Str, Value::Vec, etc.) will re-insert
                 // a fresh entry as needed.
                 self.opaque_values.remove(&addr);
+                // Struct store: copy the full struct data from source to dest.
+                // This handles the case where a struct is stored inline in an
+                // enum variant and needs to be copied to a new buffer (e.g.,
+                // match arm bindings). The value is a pointer to the source
+                // struct data, and store_ty tells us the struct type.
+                if let IrType::Struct(_) = &store_ty {
+                    let size = self.module.type_size(&store_ty) as usize;
+                    if let Some(Value::Ptr(src_addr)) = values.get(value) {
+                        let src_bytes = self.memory.load(*src_addr, size);
+                        self.memory.store(addr, &src_bytes);
+                        return ExecOutcome::Continue;
+                    }
+                }
                 match values.get(value) {
                     Some(Value::Int(v)) => {
                         match store_ty {

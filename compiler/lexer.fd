@@ -23,6 +23,7 @@ use compiler::token;
 
 pub struct Lexer {
     pub source: str,
+    pub src_len: i64,  // Cached length — avoids O(n) str_len on every peek()
     pub pos: i64,
     pub line: i64,
     pub col: i64,
@@ -34,6 +35,7 @@ impl Lexer {
     pub fn new(source: str) -> Lexer {
         return Lexer {
             source: source,
+            src_len: str_len(source),
             pos: 0,
             line: 1,
             col: 1,
@@ -45,7 +47,7 @@ impl Lexer {
     pub fn tokenize(self: &mut Lexer) -> Vec<Token> {
         var tokens: Vec<Token> = Vec::new();
 
-        while self.pos < str_len(self.source) {
+        while self.pos < self.src_len {
             var c: i64 = self.peek();
 
             if lex_is_whitespace(c) {
@@ -81,7 +83,7 @@ impl Lexer {
 
     /// Peek the current byte, or 0 (NUL) at EOF.
     fn peek(self: &Lexer) -> i64 {
-        if self.pos >= str_len(self.source) {
+        if self.pos >= self.src_len {
             return 0;
         }
         return str_byte_at(self.source, self.pos);
@@ -93,7 +95,7 @@ impl Lexer {
     /// is a valid NUL byte — using -1 avoids a false match at EOF.)
     fn peek_at(self: &Lexer, offset: i64) -> i64 {
         var idx: i64 = self.pos + offset;
-        if idx >= str_len(self.source) {
+        if idx >= self.src_len {
             return -1;
         }
         return str_byte_at(self.source, idx);
@@ -115,7 +117,7 @@ impl Lexer {
             // UTF-8 multi-byte sequence: count as one column.
             // Skip continuation bytes (0b10xxxxxx == 0x80..0xBF).
             self.col = self.col + 1;
-            while self.pos < str_len(self.source) {
+            while self.pos < self.src_len {
                 var nb: i64 = str_byte_at(self.source, self.pos);
                 if nb >= 128 && nb < 192 {
                     // continuation byte 0x80..0xBF
@@ -147,7 +149,7 @@ impl Lexer {
         // Capture all bytes of the sequence
         var s: str = "";
         var i: i64 = 0;
-        while i < seqlen && self.pos < str_len(self.source) {
+        while i < seqlen && self.pos < self.src_len {
             s = str_concat(s, byte_to_str(str_byte_at(self.source, self.pos)));
             self.pos = self.pos + 1;
             i = i + 1;
@@ -163,7 +165,7 @@ impl Lexer {
     }
 
     fn skip_line_comment(self: &mut Lexer) {
-        while self.pos < str_len(self.source) && self.peek() != 10 {
+        while self.pos < self.src_len && self.peek() != 10 {
             self.advance();
         }
     }
@@ -171,7 +173,7 @@ impl Lexer {
     fn skip_block_comment(self: &mut Lexer) {
         self.advance(); // consume '/'
         self.advance(); // consume '*'
-        while self.pos < str_len(self.source) {
+        while self.pos < self.src_len {
             if self.peek() == 42 && self.peek_at(1) == 47 {
                 // "*/"
                 self.advance();
@@ -185,18 +187,20 @@ impl Lexer {
     fn read_identifier_or_keyword(self: &mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
-        var s: str = "";
+        var start_pos: i64 = self.pos;
 
-        while self.pos < str_len(self.source) {
+        while self.pos < self.src_len {
             var c: i64 = self.peek();
             if lex_is_alphanumeric(c) || c == 95 {
-                s = str_concat(s, byte_to_str(c));
                 self.advance();
             } else {
                 break;
             }
         }
 
+        // Extract the identifier directly from the source string
+        // instead of building it char-by-char with str_concat (O(n²)).
+        var s: str = str_slice(self.source, start_pos, self.pos);
         var kind: TokenKind = keyword_or_ident(s);
         return token_new(kind, line, col);
     }
@@ -204,7 +208,7 @@ impl Lexer {
     fn read_number(self: &mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
-        var s: str = "";
+        var start_pos: i64 = self.pos;
 
         // Hex / binary / octal prefixes
         if self.peek() == 48 {
@@ -212,72 +216,80 @@ impl Lexer {
             var next: i64 = self.peek_at(1);
             if next == 120 || next == 88 {
                 // 0x / 0X
-                s = str_concat(s, byte_to_str(self.advance())); // 0
-                s = str_concat(s, byte_to_str(self.advance())); // x
-                while self.pos < str_len(self.source) && lex_is_hexdigit(self.peek()) {
-                    s = str_concat(s, byte_to_str(self.advance()));
+                self.advance(); // 0
+                self.advance(); // x
+                while self.pos < self.src_len && lex_is_hexdigit(self.peek()) {
+                    self.advance();
                 }
+                var s: str = str_slice(self.source, start_pos, self.pos);
                 var val: i64 = str_parse_hex(str_slice(s, 2, str_len(s)));
                 return token_new(TokenKind::IntLit(val), line, col);
             }
             if next == 98 || next == 66 {
                 // 0b / 0B
-                s = str_concat(s, byte_to_str(self.advance())); // 0
-                s = str_concat(s, byte_to_str(self.advance())); // b
-                while self.pos < str_len(self.source) && (self.peek() == 48 || self.peek() == 49) {
-                    s = str_concat(s, byte_to_str(self.advance()));
+                self.advance(); // 0
+                self.advance(); // b
+                while self.pos < self.src_len && (self.peek() == 48 || self.peek() == 49) {
+                    self.advance();
                 }
+                var s: str = str_slice(self.source, start_pos, self.pos);
                 var val: i64 = parse_radix(str_slice(s, 2, str_len(s)), 2);
                 return token_new(TokenKind::IntLit(val), line, col);
             }
             if next == 111 || next == 79 {
                 // 0o / 0O
-                s = str_concat(s, byte_to_str(self.advance())); // 0
-                s = str_concat(s, byte_to_str(self.advance())); // o
-                while self.pos < str_len(self.source) && self.peek() >= 48 && self.peek() <= 55 {
-                    s = str_concat(s, byte_to_str(self.advance()));
+                self.advance(); // 0
+                self.advance(); // o
+                while self.pos < self.src_len && self.peek() >= 48 && self.peek() <= 55 {
+                    self.advance();
                 }
+                var s: str = str_slice(self.source, start_pos, self.pos);
                 var val: i64 = parse_radix(str_slice(s, 2, str_len(s)), 8);
                 return token_new(TokenKind::IntLit(val), line, col);
             }
         }
 
         // Decimal integer part (with optional '_' separators)
-        while self.pos < str_len(self.source) && (lex_is_digit(self.peek()) || self.peek() == 95) {
-            if self.peek() != 95 {
-                s = str_concat(s, byte_to_str(self.peek()));
-            }
+        while self.pos < self.src_len && (lex_is_digit(self.peek()) || self.peek() == 95) {
             self.advance();
         }
 
         // Float: fractional part
         if self.peek() == 46 && lex_is_digit(self.peek_at(1)) {
             // '.' followed by digit
-            s = str_concat(s, byte_to_str(self.advance())); // '.'
-            while self.pos < str_len(self.source) && (lex_is_digit(self.peek()) || self.peek() == 95) {
-                if self.peek() != 95 {
-                    s = str_concat(s, byte_to_str(self.peek()));
-                }
+            self.advance(); // '.'
+            while self.pos < self.src_len && (lex_is_digit(self.peek()) || self.peek() == 95) {
                 self.advance();
             }
             // Optional exponent e[+-]?digits
             if self.peek() == 101 || self.peek() == 69 {
                 // 'e' / 'E'
-                s = str_concat(s, byte_to_str(self.advance()));
+                self.advance();
                 if self.peek() == 43 || self.peek() == 45 {
                     // '+' / '-'
-                    s = str_concat(s, byte_to_str(self.advance()));
+                    self.advance();
                 }
-                while self.pos < str_len(self.source) && lex_is_digit(self.peek()) {
-                    s = str_concat(s, byte_to_str(self.advance()));
+                while self.pos < self.src_len && lex_is_digit(self.peek()) {
+                    self.advance();
                 }
             }
+            // Build string without underscores
+            var raw: str = str_slice(self.source, start_pos, self.pos);
+            var s: str = str_filter_underscores(raw);
             var val: f64 = str_parse_float(s);
             return token_new(TokenKind::FloatLit(val), line, col);
         }
 
+        // Build string without underscores
+        var raw: str = str_slice(self.source, start_pos, self.pos);
+        var s: str = str_filter_underscores(raw);
         var val: i64 = str_parse_int(s);
         return token_new(TokenKind::IntLit(val), line, col);
+    }
+
+    /// Remove underscore separators from a numeric string (e.g. "1_000" → "1000")
+    fn str_filter_underscores(s: str) -> str {
+        var result: str = "";
     }
 
     fn read_fstring(self: &mut Lexer) -> Token {
@@ -287,7 +299,7 @@ impl Lexer {
         self.advance(); // consume opening '"'
 
         var s: str = "";
-        while self.pos < str_len(self.source) && self.peek() != 34 {
+        while self.pos < self.src_len && self.peek() != 34 {
             var c: i64 = self.peek();
             if c == 92 {
                 // '\'
@@ -308,7 +320,7 @@ impl Lexer {
                 self.advance(); // consume '{'
                 s = str_concat(s, "{");
                 var depth: i64 = 1;
-                while self.pos < str_len(self.source) && depth > 0 {
+                while self.pos < self.src_len && depth > 0 {
                     var c2: i64 = self.peek();
                     if c2 == 123 {
                         depth = depth + 1;
@@ -331,7 +343,7 @@ impl Lexer {
             }
         }
 
-        if self.pos < str_len(self.source) {
+        if self.pos < self.src_len {
             self.advance(); // consume closing '"'
         } else {
             self.errors.push(lex_error(line, col, "unterminated f-string"));
@@ -346,7 +358,7 @@ impl Lexer {
         self.advance(); // consume opening '"'
 
         var s: str = "";
-        while self.pos < str_len(self.source) && self.peek() != 34 {
+        while self.pos < self.src_len && self.peek() != 34 {
             var c: i64 = self.peek();
             if c == 92 {
                 // '\'
@@ -367,7 +379,7 @@ impl Lexer {
             }
         }
 
-        if self.pos < str_len(self.source) {
+        if self.pos < self.src_len {
             self.advance(); // consume closing '"'
         } else {
             self.errors.push(lex_error(line, col, "unterminated string"));
@@ -400,7 +412,7 @@ impl Lexer {
 
         var s: str = "";
         // Read until we find '"' followed by exactly hash_count '#' signs
-        while self.pos < str_len(self.source) {
+        while self.pos < self.src_len {
             if self.peek() == 34 {
                 // Check if this is the closing delimiter
                 var matched: bool = true;
@@ -554,6 +566,20 @@ impl Lexer {
 
         return token_new(kind, line, col);
     }
+}
+
+/// Remove underscore separators from a numeric string (e.g. "1_000" → "1000")
+fn str_filter_underscores(s: str) -> str {
+    var result: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c != 95 {
+            result = str_concat(result, byte_to_str(c));
+        }
+        i = i + 1;
+    }
+    return result;
 }
 
 // ─── Keyword table ────────────────────────────────────────────────────────

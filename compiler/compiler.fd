@@ -522,17 +522,22 @@ pub fn build_program(source: str) -> ResultProgram {
 ///   derive → desugar layers/models → comptime → typecheck → borrowck → mono
 pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgram {
     // Parse stdlib first
+    p_eprint_str("[build] Reading stdlib/core.fd...\n");
     var stdlib_raw: str = p_file_read("stdlib/core.fd");
     if stdlib_raw == 0 {
+        p_eprint_str("[build] FAILED: stdlib/core.fd not found\n");
         return ResultProgram::Err(c_vec1("Stdlib not found: stdlib/core.fd (CWD must be project root)"));
     }
     var stdlib_source: str = stdlib_raw;
+    p_eprint_str("[build] Lexing + parsing stdlib...\n");
     var stdlib_result: ParseResultProgram = parse_source(stdlib_source);
     match stdlib_result {
         ParseResultProgram::Err(e) => {
+            p_eprint_str("[build] FAILED: stdlib parse error\n");
             return ResultProgram::Err(c_vec1(str_concat("Stdlib parse error: ", e)));
         }
         ParseResultProgram::Ok(stdlib) => {
+            p_eprint_str("[build] Stdlib parsed ok. Extracting names...\n");
             // Extract stdlib struct/enum names for parser
             var struct_names: Vec<str> = Vec::new();
             var enum_names: Vec<str> = Vec::new();
@@ -548,11 +553,14 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
             }
 
             // Parse user code with stdlib names pre-populated
+            p_eprint_str("[build] Lexing user code...\n");
             var lex: Lexer = Lexer::new(source);
             var tokens: Vec<Token> = lex.tokenize();
+            p_eprint_str("[build] User code lexed. Checking errors...\n");
 
             // Check for lexer errors
             if lex.errors.len() > 0 {
+                p_eprint_str("[build] FAILED: lexer errors\n");
                 var file: str = "<stdin>";
                 match source_path {
                     OptStr::Some(p) => { file = p; }
@@ -560,6 +568,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                 }
                 return ResultProgram::Err(enrich_errors(lex.errors, source, file));
             }
+            p_eprint_str("[build] Parsing user code...\n");
             var p: Parser = Parser_with_names(tokens, struct_names, enum_names);
             var user_result: ParseResultProgram = p.parse();
             match user_result {
@@ -823,6 +832,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                     // Phase 3B.1: Fill in default trait methods
                     fill_default_trait_methods(&mut program);
 
+                    p_eprint_str("[build] Type checking...\n");
                     // Type check — register each module with its own name
                     var tc: TypeChecker = TypeChecker::new();
                     var stdlib_module: str = "core";
@@ -851,6 +861,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                     TypeChecker_check_bodies(&mut tc, program);
 
                     if tc.errors.len() > 0 {
+                        p_eprint_str("[build] FAILED: type errors\n");
                         var file3: str = "<stdin>";
                         match source_path {
                             OptStr::Some(p3) => { file3 = p3; }
@@ -858,6 +869,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                         }
                         return ResultProgram::Err(enrich_errors(tc.errors, source, file3));
                     }
+                    p_eprint_str("[build] Type check ok. Borrow checking...\n");
 
                     // Run lints (warnings only)
                     tc.run_lints(program);
@@ -877,8 +889,10 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                     // Comptime: substitute comptime expressions with their values
                     program = substitute(program);
 
+                    p_eprint_str("[build] Monomorphizing...\n");
                     // Monomorphize generics
                     var mono_result: Program = monomorphize(program);
+                    p_eprint_str("[build] Done. Program built successfully.\n");
                     return ResultProgram::Ok(mono_result);
                 }
             }
@@ -889,15 +903,20 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
 
 /// Compile source to C code.
 pub fn ccompile_source_with_path(source: str, source_path: str) -> ResultStr {
+    p_eprint_str("[ccompile] Building program...\n");
     var result: ResultProgram = build_program_with_path(source, OptStr::Some(source_path));
     match result {
         ResultProgram::Err(errs) => {
+            p_eprint_str("[ccompile] Building program FAILED\n");
             return ResultStr::Err(errs);
         }
         ResultProgram::Ok(program) => {
+            p_eprint_str("[ccompile] Lowering to IR...\n");
             var module: IrModule = lower(program);
+            p_eprint_str("[ccompile] Generating C code...\n");
             var cg: CCodeGen = CCodeGen_new();
             var c_code: str = CCodeGen_generate(&mut cg, module);
+            p_eprint_str("[ccompile] C codegen done.\n");
             return ResultStr::Ok(c_code);
         }
     }

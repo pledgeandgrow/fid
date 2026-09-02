@@ -2266,7 +2266,7 @@ impl TypeChecker {
             "p_malloc", "p_free", "p_realloc",
             "p_vec_new", "p_vec_push", "p_vec_resize",
             "p_hashmap_new", "p_hashmap_insert",
-            "p_print", "p_print_int", "p_print_str", "p_print_nl",
+            "p_print", "p_print_int", "p_print_str", "p_eprint_str", "p_print_nl",
             "print", "println", "print_int", "print_str", "print_nl",
             "p_file_read", "p_file_write",
             "p_socket_listen", "p_socket_accept", "p_socket_read", "p_socket_write",
@@ -2407,7 +2407,7 @@ impl TypeChecker {
             "p_socket_connect", "p_socket_close",
             "p_net_connect", "p_net_listen", "p_net_accept",
             "p_fs_read_async", "p_fs_write_async",
-            "p_print", "p_print_int", "p_print_str", "p_print_nl",
+            "p_print", "p_print_int", "p_print_str", "p_eprint_str", "p_print_nl",
             "print", "println", "print_str", "print_nl", "print_int",
             "p_db_open", "p_db_query", "p_db_exec",
             "p_sleep", "p_usleep",
@@ -2904,7 +2904,7 @@ impl TypeChecker {
                 // Direct effect mapping for built-in functions
                 match callee.as_str() {
                     "print" | "println" | "print_int" | "print_float" | "print_str"
-                    | "p_print_str" | "p_print_int" | "p_println_str" | "p_println_int"
+                    | "p_print_str" | "p_eprint_str" | "p_print_int" | "p_println_str" | "p_println_int"
                     | "p_fs_read" | "p_fs_write" => {
                         effects.insert("IO".to_string());
                     }

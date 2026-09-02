@@ -2387,8 +2387,10 @@ else { has_assign = false; }
 if has_assign {
     self.advance();
     // Match the assignment target shape
+    p_eprint_str("[DEBUG] parse_assign: has_assign=true, matching expr\n");
     match expr {
         Expr::Ident(name) => {
+            p_eprint_str("[DEBUG] parse_assign: matched Ident\n");
             var rhs: Expr = Expr::IntLit(0);
             match self.parse_expr() {
                 ParseResultExpr::Ok(e) => { rhs = e; }
@@ -2412,6 +2414,7 @@ if has_assign {
             return ParseResultStmt::Err("Parse error: index assignment target must be an array variable");
         }
         Expr::Deref(ptr_expr) => {
+            p_eprint_str("[DEBUG] parse_assign: matched Deref\n");
             var rhs: Expr = Expr::IntLit(0);
             match self.parse_expr() {
                 ParseResultExpr::Ok(e) => { rhs = e; }
@@ -2430,7 +2433,10 @@ if has_assign {
             return ParseResultStmt::Ok(Stmt::FieldAssign(box_expr_deref(obj_expr), field, assign_op, rhs, line));
         }
     }
-    return ParseResultStmt::Err("Parse error: assignment target must be an identifier or array index");
+    var err_tok: Token = self.peek_token();
+    var err_msg: str = "Parse error: assignment target must be an identifier or array index at line ";
+    err_msg = err_msg + int_to_str(err_tok.line) + " col " + int_to_str(err_tok.col);
+    return ParseResultStmt::Err(err_msg);
 }
 
 self.match_tok(TokenKind::Semicolon);
@@ -3751,7 +3757,9 @@ match self.parse_unary() {
 loop {
     var op: BinOp = BinOp::Mul;
     var k: TokenKind = self.peek();
-    if token_kind_eq(k, TokenKind::Star) { op = BinOp::Mul; }
+    if token_kind_eq(k, TokenKind::Star) {
+        op = BinOp::Mul;
+    }
     else if token_kind_eq(k, TokenKind::Slash) { op = BinOp::Div; }
     else if token_kind_eq(k, TokenKind::Percent) { op = BinOp::Mod; }
     else { break; }
@@ -3806,12 +3814,14 @@ if token_kind_eq(k, TokenKind::Ampersand) {
     return ParseResultExpr::Ok(Expr::Ref(Box::new(expr), is_mut));
 }
 if token_kind_eq(k, TokenKind::Star) {
+    p_eprint_str("[DEBUG] parse_unary: Star (deref) detected\n");
     self.advance();
     var expr: Expr = Expr::IntLit(0);
     match self.parse_unary() {
         ParseResultExpr::Ok(e) => { expr = e; }
         ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
     }
+    p_eprint_str("[DEBUG] parse_unary: returning Deref\n");
     return ParseResultExpr::Ok(Expr::Deref(Box::new(expr)));
 }
 if token_kind_eq(k, TokenKind::Comptime) {

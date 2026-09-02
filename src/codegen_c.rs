@@ -451,6 +451,7 @@ impl CCodeGen {
             ("p_str_concat", &[p(), p()]),
             ("p_print", &[I64]),
             ("p_print_str", &[p()]),
+            ("p_eprint_str", &[p()]),
             ("p_print_int", &[I64]),
             ("p_print_bool", &[Bool]),
             ("p_print_float", &[F64]),
@@ -618,7 +619,7 @@ impl CCodeGen {
             "p_vec_push", "p_vec_clear", "p_vec_insert", "p_vec_set",
             "p_vec_reverse", "p_vec_sort", "p_vec_truncate", "p_vec_extend",
             "p_map_insert", "p_map_remove", "p_map_clear",
-            "p_print", "p_print_str", "p_print_int", "p_print_bool",
+            "p_print", "p_print_str", "p_eprint_str", "p_print_int", "p_print_bool",
             "p_print_float", "p_print_newline", "p_free", "p_arena_restore", "p_region_free", "p_panic",
             "p_socket_close",
             "p_cli", "p_sti", "p_cr3_write", "p_invlpg", "p_page_map", "p_page_unmap",
@@ -1023,6 +1024,7 @@ impl CCodeGen {
         wln!(self, "void p_print_bool(bool val);");
         wln!(self, "void p_print_float(double val);");
         wln!(self, "void p_print_newline(void);");
+        wln!(self, "void p_eprint_str(const char* s);");
         wln!(self, "void p_panic(const char* msg);");
         wln!(self, "// Call stack for panic traces + recursion limit");
         wln!(self, "static const char* p_call_stack[2048];");
@@ -1257,7 +1259,9 @@ impl CCodeGen {
             wln!(self, "    _exit(128 + sig);");
             wln!(self, "}}");
             wln!(self, "#endif");
-            wln!(self, "int main(int argc, char** argv) {");
+            // Windows: wrap main in a thread with 16MB stack to prevent stack overflow
+            // when processing large files (the self-hosted compiler needs >1MB stack)
+            wln!(self, "int real_main(int argc, char** argv) {{");
             wln!(self, "#ifdef _WIN32");
             wln!(self, "    SetUnhandledExceptionFilter(__p_crash_handler);");
             wln!(self, "#else");
@@ -1281,7 +1285,27 @@ impl CCodeGen {
             }
             wln!(self, "    int64_t result = main_entry(NULL);");
             wln!(self, "    return (int)result;");
-            wln!(self, "}");
+            wln!(self, "}}");
+            wln!(self, "");
+            // Windows stack wrapper: run real_main in a thread with 16MB stack
+            wln!(self, "#ifdef _WIN32");
+            wln!(self, "typedef struct {{ int argc; char** argv; }} __p_main_args;");
+            wln!(self, "static DWORD WINAPI __p_thread_main_wrapper(LPVOID arg) {{");
+            wln!(self, "    __p_main_args* a = (__p_main_args*)arg;");
+            wln!(self, "    return (DWORD)real_main(a->argc, a->argv);");
+            wln!(self, "}}");
+            wln!(self, "int main(int argc, char** argv) {{");
+            wln!(self, "    __p_main_args args = {{ argc, argv }};");
+            wln!(self, "    HANDLE h = CreateThread(NULL, 16*1024*1024, __p_thread_main_wrapper, &args, 0, NULL);");
+            wln!(self, "    if (!h) return 1;");
+            wln!(self, "    WaitForSingleObject(h, INFINITE);");
+            wln!(self, "    DWORD exitCode = 0;");
+            wln!(self, "    GetExitCodeThread(h, &exitCode);");
+            wln!(self, "    return (int)exitCode;");
+            wln!(self, "}}");
+            wln!(self, "#else");
+            wln!(self, "int main(int argc, char** argv) {{ return real_main(argc, argv); }}");
+            wln!(self, "#endif");
             wln!(self, "");
         }
     }
@@ -2317,6 +2341,7 @@ impl CCodeGen {
         wln!(self, "");
         wln!(self, "void p_print(int64_t val) { printf(\"%lld\", (long long)val); }");
         wln!(self, "void p_print_str(const char* s) { printf(\"%s\", s); }");
+        wln!(self, "void p_eprint_str(const char* s) { fprintf(stderr, \"%s\", s); fflush(stderr); }");
         wln!(self, "void p_print_int(int64_t val) { printf(\"%lld\", (long long)val); }");
         wln!(self, "void p_print_bool(bool val) { printf(\"%s\", val ? \"true\" : \"false\"); }");
         wln!(self, "void p_print_float(double val) {{ char* _s = p_to_str_float(val); printf(\"%s\", _s); free(_s); }}");

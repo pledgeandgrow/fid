@@ -51,8 +51,8 @@ tcc -O2 -w -o release/fides-c.exe release/fides-c.c      → release/fides-c.exe
 | SH-8 | Rewrite Middle-End | typechecker, lower, ir, mono, borrowck | HIGH | **DONE** |
 | SH-9 | Rewrite Back-End + Bootstrap | codegen_c, pir, opt, compiler, bootstrap | HIGH | **IN PROGRESS** — all 18 modules DONE (39.5K LOC), `release/fides-c.exe` builds (7.9MB via tcc) but crashes with STATUS_ACCESS_VIOLATION in Lexer_tokenize at stdlib pos ~69845 |
 | SH-10 | Self-Host Breaking Bugs & Remaining Issues | Fix all gaps/stubs found by src vs compiler comparison | HIGH | **IN PROGRESS** — 7 critical fixes DONE, 23/23 self-host tests pass |
-| SH-11 | Bootstrap Crash Fix & Codegen Sync | Fix STATUS_ACCESS_VIOLATION crash + sync Fides codegen with Rust codegen changes | CRITICAL | **NOT STARTED** |
-| SH-12 | Safety & Crash Prevention | Runtime limits, OOM detection, step limits, recursion limits in C codegen | MEDIUM | **DONE** — C codegen recursion limit, p_malloc OOM detection, interpreter --max-steps, test runner step limit, Windows path fixes, tcc auto-detection |
+| SH-11 | Bootstrap Crash Fix & Codegen Sync | Fix STATUS_ACCESS_VIOLATION crash + sync Fides codegen with Rust codegen changes | CRITICAL | **IN PROGRESS** — BC1+CS1+CS2+CS3 done, crash now inside Lexer_tokenize |
+| SH-12 | Safety & Crash Prevention | Runtime limits, OOM detection, step limits, recursion limits, signal handlers, memory limits, timeout | MEDIUM | **DONE** — C codegen recursion limit (p_max_recursion=10000), p_malloc OOM abort, interpreter --max-steps/--max-memory/--timeout, test runner step limit (50M), Windows path fixes, tcc auto-detection, crash handlers (Windows VEH + Linux SIGSEGV/SIGBUS/SIGABRT/SIGFPE), all ported to both Rust and Fides codegen |
 
 ---
 
@@ -1598,97 +1598,156 @@ A full side-by-side comparison was conducted across all major component pairs:
 
 ---
 
-## Phase SH-11 — Bootstrap Crash Fix & Codegen Sync **[NOT STARTED]**
+## Phase SH-11 — Bootstrap Crash Fix & Codegen Sync **[IN PROGRESS]**
 
-> **The self-hosted compiler builds but crashes on use. This is the single
-> blocker preventing self-hosting.**
+> **The crash is fixed. The self-hosted compiler now runs to completion but
+> reports parse errors due to a lowerer bug in enum variant extraction.**
 
 ### Goal
-Fix the `STATUS_ACCESS_VIOLATION` crash in `release/fides-c.exe` so it can
-compile `.fd` files, then sync the Fides codegen with recent Rust codegen
-changes that were never ported.
+Fix the `STATUS_ACCESS_VIOLATION` crash in `release/fides-c.exe`, add
+progressive stage reporting, then fix the lowerer bugs that prevent correct
+parsing of `stdlib/core.fd`.
 
-### SH-11.1 — Fix the Bootstrap Crash
+### SH-11.1 — Fix the Bootstrap Crash **[DONE]**
 
 **Symptom:** `release/fides-c.exe ccompile hello.fd` crashes with
-`STATUS_ACCESS_VIOLATION` (0xC0000005) before reaching `Lexer_tokenize`.
+`STATUS_ACCESS_VIOLATION` (0xC0000005) inside `Lexer_tokenize`.
 
-**Debug findings:**
-- `main()` entered ✓
-- `cmd_ccompile()` entered ✓
-- User file read successfully ✓
-- `ccompile_source_with_path()` entered ✓
-- `Lexer_tokenize()` NEVER reached ✗ — crash happens before lexing
+**Root cause:** Combination of NULL file reads, unbounded recursion, OOM from
+malloc failures, and insufficient stack size on Windows.
 
-**Call chain where crash occurs:**
-```
-ccompile_source_with_path(source, source_path)
-  → build_program_with_path(source, OptStr::Some(source_path))
-    → c_file_read("stdlib/core.fd")        ← could return NULL?
-    → parse_source(stdlib_source)           ← if NULL, crashes here
-      → Lexer::new(source)
-        → lex.tokenize()                    ← never reached
-```
+**Fixes applied:**
 
-**Likely causes (in priority order):**
+| # | Fix | File | Status |
+|---|-----|------|--------|
+| BC1 | NULL check after `p_file_read("stdlib/core.fd")` | `compiler/compiler.fd` | **DONE** |
+| CS1 | Port recursion limit (`p_max_recursion = 10000` + abort) | `compiler/codegen_c.fd` | **DONE** |
+| CS2 | Port OOM abort (all `p_malloc` failures abort with message) | `compiler/codegen_c.fd` | **DONE** |
+| CS3 | Crash handler (vectored exception on Windows, signal on Linux) | `compiler/codegen_c.fd` + `src/codegen_c.rs` | **DONE** |
+| CS4 | Windows 16MB stack wrapper (`real_main` in thread) | `src/codegen_c.rs` | **DONE** (user added) |
+| LP1+LP2 | lower.rs save/restore for if/else + match arms | `src/lower.rs` | **Already present** |
 
-| # | Cause | Evidence | Fix |
-|---|-------|----------|-----|
-| BC1 | **`c_file_read` returns NULL** — stdlib/core.fd not found relative to CWD. The self-hosted compiler reads `"stdlib/core.fd"` as a relative path. If CWD is wrong, `p_file_read` returns NULL, then `str_len(NULL)` crashes. | Crash is before Lexer_tokenize; `build_program_with_path` reads stdlib before anything else | Add NULL check after `c_file_read("stdlib/core.fd")` in `compiler.fd` — return error if file not found |
-| BC2 | **Stack frame too large** — `build_program_with_path` has ~200+ local variables in generated C, each with `alloca(8)` + `memset`. Total stack per frame could be ~4KB+. With deep call chains, 256MB stack may not be enough. | `cmd_ccompile` alone has 228 local variables; `build_program_with_path` is similar | Reduce local variable count or use heap allocation for large frame |
-| BC3 | **Missing recursion limit in Fides codegen** — `compiler/codegen_c.fd` line 1370 has old simple `p_call_stack_push` without recursion limit. Rust codegen has `p_max_recursion = 10000` with abort. If the compiler enters infinite recursion, it silently overflows the stack instead of aborting with a message. | `src/codegen_c.rs` lines 1027-1043 vs `compiler/codegen_c.fd` line 1370 | Port recursion limit to Fides codegen |
-| BC4 | **NULL return from p_malloc** — Fides codegen returns NULL on OOM. Rust codegen aborts with message. If arena allocation fails, NULL propagates and crashes downstream. | `compiler/codegen_c.fd` lines 2558-2565 vs `src/codegen_c.rs` lines 2313-2321 | Port OOM abort to Fides codegen |
+### SH-11.2 — Progressive Stage Reporting **[DONE]**
 
-### SH-11.2 — Sync Fides Codegen with Rust Codegen
+Added `p_eprint_str` calls to `compiler/compiler.fd` and `compiler/main.fd`
+so each compilation stage prints to stderr. This eliminates guesswork when
+debugging crashes — the last line shows exactly which stage failed.
 
-The Rust codegen (`src/codegen_c.rs`) has several changes that were NEVER
-ported to the Fides codegen (`compiler/codegen_c.fd`). These must be synced
-for the self-hosted compiler to produce correct output.
+**Files modified:**
+- `compiler/compiler.fd` — stage prints in `build_program_with_path` and `ccompile_source_with_path`
+- `compiler/main.fd` — stage prints in `cmd_ccompile`
+
+### SH-11.3 — Sync Fides Codegen with Rust Codegen
 
 | # | Change | Rust (src/codegen_c.rs) | Fides (compiler/codegen_c.fd) | Status |
 |---|--------|-------------------------|-------------------------------|--------|
-| CS1 | **Recursion limit** | `p_max_recursion = 10000` + abort on exceed + `p_set_max_recursion()` | Old simple push, no limit | **DONE in Rust** — needs port to Fides codegen |
-| CS2 | **OOM abort in p_malloc** | `abort()` with `fprintf` on all malloc failures | Returns NULL | **DONE in Rust** — needs port to Fides codegen |
-| CS3 | **`wln!` macro `{{` replacement** | `$s.out.push_str(&$fmt.replace("{{", "{").replace("}}", "}"))` | `wln(self, "...")` — no replacement needed (uses single braces) | **OK** (different approach, both correct) |
-| CS4 | **TCC detection in ccompile** | Detects tcc, skips hardening flags, skips `-lm` on Windows | Always uses `tcc -w` in `main.fd` | **OK** (main.fd already targets tcc) |
-| CS5 | **PE stack patching** | Not in codegen (done externally) | Not in codegen (done externally) | **OK** |
+| CS1 | **Recursion limit** | `p_max_recursion = 10000` + abort + `p_set_max_recursion()` | Ported | **DONE** |
+| CS2 | **OOM abort in p_malloc** | `abort()` with `fprintf` on all malloc failures | Ported | **DONE** |
+| CS3 | **Crash handler** | Vectored exception (Win) + signal handler (Linux) | Ported | **DONE** |
+| CS4 | **Windows stack wrapper** | `real_main` in 16MB thread | Not needed (PE patching) | **OK** |
+| CS5 | **`wln!` macro `{{` replacement** | `$s.out.push_str(&$fmt.replace("{{", "{"))` | `wln(self, "...")` — no replacement needed | **OK** |
+| CS6 | **TCC detection in ccompile** | Detects tcc, skips hardening flags | `main.fd` already targets tcc | **OK** |
+| CS7 | **PE stack patching** | Not in codegen (done externally) | Not in codegen (done externally) | **OK** |
 
-### SH-11.3 — Port Recent `lower.fd` Changes to Rust `lower.rs`
-
-The user added truncate-based variable binding save/restore in `compiler/lower.fd`
-for if/else blocks and match arms. This prevents arm-local bindings from leaking
-across branches. The Rust `src/lower.rs` does NOT have this change.
+### SH-11.4 — lower.fd vs lower.rs Sync
 
 | # | Change | Fides (compiler/lower.fd) | Rust (src/lower.rs) | Status |
 |---|--------|---------------------------|---------------------|--------|
-| LP1 | **If/else save/restore** | Lines 2157-2176: save `allocas/alloca_types/var_ast_types/locals` lengths, truncate after then block, truncate after else block | Not present | **MISSING in Rust** |
-| LP2 | **Match arm save/restore** | Lines 3141-3266, 4175-4302: same truncate pattern for match arms | Not present | **MISSING in Rust** |
-| LP3 | **Closure save comment** | Lines 3476-3480: clarifies that lower_func assigns NEW Vecs (pointer-copy save works) | Not present | **MISSING in Rust** |
+| LP1 | **If/else save/restore** | Uses `truncate` (reference semantics) | Uses `.clone()` (owned semantics) | **EQUIVALENT** |
+| LP2 | **Match arm save/restore** | Uses `truncate` | Uses `.clone()` | **EQUIVALENT** |
 
-**Risk:** If the Fides lower produces different IR than the Rust lower (because
-of these changes), the self-hosted compiler will produce different C output
-than the Rust compiler. This breaks the fixpoint check (stage2.c != stage1.c).
+### SH-11.5 — SRET Calling Convention Fixes **[DONE]**
 
-### SH-11.4 — Port Recent `interp.rs` Changes
+> **The Fides lowerer was not using the SRET (struct return via hidden
+> out-parameter) calling convention for function calls that return struct
+> types. This caused struct return values to be silently discarded.**
 
-The user added `self.opaque_values.remove(&addr)` before store operations in
-`src/interp.rs` (line ~1364). This clears stale opaque_values entries so a
-subsequent Load doesn't return an old Value::Str/Vec/Map. This is a Rust-only
-change that affects the interpreter (reference oracle). No Fides equivalent
-needed (Fides doesn't have an interpreter), but it may change test baselines.
+**Root cause:** The Fides lowerer's `Expr::Call` and `Expr::MethodCall`
+lowering paths emitted `Inst::Call` with the struct return type directly,
+instead of allocating an SRET buffer, prepending the pointer as the first
+argument, and setting the return type to `Void`.
 
-### SH-11.5 — Rebuild Build Infrastructure
+**Fixes applied:**
+
+| # | Fix | File | Status |
+|---|-----|------|--------|
+| SR1 | SRET for regular function calls (`Expr::Call`) | `compiler/lower.fd` | **DONE** |
+| SR2 | SRET for method calls (`Expr::MethodCall` on receiver) | `compiler/lower.fd` | **DONE** |
+| SR3 | Pre-register impl method signatures in IR module | `compiler/lower.fd` | **DONE** |
+| SR4 | Pre-register trait impl method signatures in IR module | `compiler/lower.fd` | **DONE** |
+
+**Verification:** Generated C code now shows correct SRET calls:
+```c
+v12 = alloca(80); memset(v12, 0, 80);
+Parser_parse_unary(v12, (void*)v13, v2);  // v12 = SRET pointer
+```
+
+### SH-11.6 — Enum Layout Computation Fix **[DONE]**
+
+> **The Fides lowerer computed enum layouts based on the NUMBER of variant
+> fields, not the SIZE of each field. This caused enums containing large
+> types (like `Expr`) to have undersized layouts, truncating data during
+> SRET copies.**
+
+**Root cause:** `Lowerer_make_enum_layout` used `max_fields` (count of
+variant fields) and always allocated 8 bytes per field. But enum variants
+can contain struct/enum-typed fields that are much larger than 8 bytes.
+For example, `ParseResultExpr::Ok(Expr)` needs 80 bytes for the `Expr`
+payload, but the old layout only allocated 8 bytes.
+
+**Fixes applied:**
+
+| # | Fix | File | Status |
+|---|-----|------|--------|
+| EL1 | Compute payload size from actual field sizes (struct lookup) | `compiler/lower.fd` | **DONE** |
+| EL2 | Iterative fixpoint computation for nested enum/struct layouts | `compiler/lower.fd` | **DONE** |
+
+**Rust reference:** `src/lower.rs` `compute_enum_layout()` (lines 518-563)
+already uses this approach — payload slots computed from actual field sizes,
+with iterative fixpoint for nested types.
+
+### SH-11.7 — Enum Variant Extraction Bug **[IN PROGRESS]**
+
+> **The Fides lowerer loads enum variant payloads as a single 8-byte value,
+> even when the payload is a large struct/enum. This truncates the data.**
+
+**Symptom:** Parser reports `Parse error: assignment target must be an
+identifier or array index at line 298 col 15` for `*p0 = 0;` in
+`stdlib/core.fd`. The `Expr::Deref` variant is not matched because the
+`Expr` value is truncated to 8 bytes during enum variant extraction.
+
+**Root cause:** When matching `ParseResultExpr::Ok(e) => { left = e; }`,
+the lowerer emits `Inst::Load` with the field type. For struct-typed
+fields, `c_type(Struct(_))` returns a pointer type in the C codegen, so
+`Load` only reads 8 bytes (a pointer), not the full struct data.
+
+**Fix in Rust lowerer (already done by user):** Added `load_enum_field()`
+helper in `src/lower.rs` (line 246) that allocates a buffer and uses
+`Inst::Store` (which emits `memcpy` for struct types) to copy the full
+inline struct data. Applied at both enum match sites (lines 2873, 3034).
+
+**Fix needed in Fides lowerer:** Port `load_enum_field()` to
+`compiler/lower.fd` and apply it at the enum match extraction sites.
+
+| # | Fix | File | Status |
+|---|-----|------|--------|
+| EV1 | Port `load_enum_field()` helper to Fides lowerer | `compiler/lower.fd` | **TODO** |
+| EV2 | Apply at enum match binding sites (both match paths) | `compiler/lower.fd` | **TODO** |
+| EV3 | Also fix `Inst::Store` in Fides codegen to emit `memcpy` for structs | `compiler/codegen_c.fd` | **TODO** |
+| EV4 | Also fix `Inst::Store` in Fides interpreter for struct types | `compiler/interp.fd` (if exists) | **TODO** |
+
+### SH-11.8 — Rebuild Build Infrastructure
 
 | # | Task | Status |
 |---|------|--------|
-| BI1 | Create `build-selfhost.ps1` (was deleted) | **MISSING** |
+| BI1 | Create `build-selfhost.ps1` | **DONE** |
 | BI2 | Document build pipeline in AGENTS.md | **DONE** |
 | BI3 | Ensure `release/` is the canonical output dir | **DONE** |
 | BI4 | Remove `target2/` references and prevent recreation | **DONE** |
 
-### SH-11.6 — Verify Fixpoint
+### SH-11.9 — Verify Fixpoint
 
-Once the crash is fixed and codegen is synced:
+Once all lowerer bugs are fixed:
 
 1. `release/fides-c.exe ccompile hello.fd` → produces correct C ✓
 2. `release/fides-c.exe ccompile compiler/main.fd -o release/stage2` → stage2.c ✓
@@ -1700,17 +1759,21 @@ Once the crash is fixed and codegen is synced:
 ### Priority Order for SH-11
 
 **CRITICAL (blocks everything):**
-1. BC1: Add NULL check after `c_file_read("stdlib/core.fd")` in compiler.fd
-2. BC3: Port recursion limit to Fides codegen (CS1)
-3. BC4: Port OOM abort to Fides codegen (CS2)
+1. ~~BC1: NULL check~~ → **DONE**
+2. ~~CS1: Recursion limit~~ → **DONE**
+3. ~~CS2: OOM abort~~ → **DONE**
+4. ~~CS3: Crash handler~~ → **DONE**
+5. ~~CS4: Windows stack wrapper~~ → **DONE**
+6. ~~SH-11.2: Progressive stage reporting~~ → **DONE**
+7. ~~SH-11.5: SRET calling convention~~ → **DONE**
+8. ~~SH-11.6: Enum layout computation~~ → **DONE**
+9. **SH-11.7: Enum variant extraction** — port `load_enum_field()` to Fides lowerer
 
 **HIGH (needed for fixpoint):**
-4. LP1+LP2: Port lower.fd truncate changes to Rust lower.rs (or revert in Fides)
-5. BI1: Recreate build-selfhost.ps1
+10. SH-11.9: Run fixpoint verification
 
 **MEDIUM (correctness):**
-6. BC2: Investigate stack frame size if crash persists after BC1
-7. SH-11.6: Run fixpoint verification
+11. Sync any remaining codegen differences found during fixpoint testing
 
 ---
 
@@ -1829,15 +1892,82 @@ doesn't exist on Windows.
 | Region-based memory (bulk free) | Lower + interp | I-1C |
 | Binary hardening (canaries, PIE, RELRO) | C codegen | Phase 10B |
 
+### SH-12.7 — Compilation Timeout  **[DONE]**
+
+**File:** `src/main.rs` (lines 57-99)
+
+Added `--timeout N` global flag (N = seconds). Spawns a watcher thread that
+sleeps N seconds then kills the process with exit code 124 (same as GNU `timeout`).
+Works with all commands: `run`, `ccompile`, `build`, `emit`, `test`, etc.
+
+```bash
+fidesc run program.fd --timeout 30       # Kill after 30 seconds
+fidesc ccompile big.fd -o out.exe --timeout 120  # Kill compilation after 2 min
+fidesc test --timeout 600                # Kill test suite after 10 min
+```
+
+**Prevents:** Hanging compilation or execution from wasting time.
+
+### SH-12.8 — Interpreter Memory Limit  **[DONE]**
+
+**Files:** `src/interp.rs`, `src/compiler.rs`, `src/main.rs`
+
+Added `--max-memory N` CLI flag (N = MB, default 0 = unlimited). The interpreter
+tracks total bytes allocated in simulated memory and panics with a clear message
+when the limit is exceeded.
+
+```bash
+fidesc run program.fd --max-memory 512   # Limit to 512MB
+```
+
+```
+Panic: Memory limit exceeded: 536870912 bytes allocated (limit: 536870912 bytes).
+Increase with --max-memory or reduce memory usage.
+```
+
+**Prevents:** OOM kills by the OS — the interpreter panics gracefully instead.
+
+### SH-12.9 — Crash Signal Handlers  **[DONE]**
+
+**Files:** `src/codegen_c.rs`, `compiler/codegen_c.fd`
+
+Added crash handlers to generated C programs that print the call stack before
+crashing:
+
+- **Windows:** Vectored Exception Handler (VEH) for `EXCEPTION_ACCESS_VIOLATION`
+  and `EXCEPTION_STACK_OVERFLOW` — prints faulting address + call stack
+- **Linux:** Signal handlers for `SIGSEGV`, `SIGBUS`, `SIGABRT`, `SIGFPE` —
+  prints signal name + call stack, then `_exit(128+sig)`
+
+Both ported to the Fides codegen (`compiler/codegen_c.fd`) so the self-hosted
+compiler also produces crash-safe binaries.
+
+**Prevents:** Silent segfaults — now you get a call stack trace on crash.
+
+### What Fides Already Had (reinforced by SH-12)
+
+| Mechanism | Where | Since |
+|-----------|-------|-------|
+| Integer overflow checks (always on) | Interpreter | F64 |
+| Array bounds checks | Interpreter | F62 |
+| Division by zero → panic | Interpreter | F64 |
+| Recursion depth limit (interpreter) | `--max-recursion` | SH-1.4 |
+| `@gas(N)` compile-time gas budget | Typechecker + IR | Phase 12 |
+| `@no-recursion` annotation | Typechecker | Phase 12 |
+| `@no-alloc` annotation | Typechecker | Phase 12 |
+| `@crashfree` annotation | Typechecker | Phase 12 |
+| Region-based memory (bulk free) | Lower + interp | I-1C |
+| Binary hardening (canaries, PIE, RELRO) | C codegen | Phase 10B |
+
 ### Future Safety Work (Not Yet Started)
 
 | # | Feature | Priority | Description |
 |---|---------|----------|-------------|
-| FS1 | **Port SH-12.1+12.2 to Fides codegen** | HIGH | `compiler/codegen_c.fd` still has old simple `p_call_stack_push` and NULL-returning `p_malloc`. Must port the recursion limit and OOM abort. |
-| FS2 | **Compilation timeout** | MEDIUM | Add a wall-clock timeout to `fidesc ccompile` and `fidesc build` so a hanging compilation phase (parser, typechecker, lower) is killed after N seconds. Use `SetTimer` on Windows / `alarm()` on Linux. |
-| FS3 | **Memory limit for interpreter** | MEDIUM | Track total bytes allocated in `interp.rs` and panic when exceeding a configurable limit (`--max-memory N`). Prevents OOM kills. |
+| ~~FS1~~ | ~~Port SH-12.1+12.2 to Fides codegen~~ | ~~HIGH~~ | **DONE** — recursion limit + OOM abort ported to `compiler/codegen_c.fd` |
+| ~~FS2~~ | ~~Compilation timeout~~ | ~~MEDIUM~~ | **DONE** — `--timeout N` global flag (SH-12.7) |
+| ~~FS3~~ | ~~Memory limit for interpreter~~ | ~~MEDIUM~~ | **DONE** — `--max-memory N` flag (SH-12.8) |
+| ~~FS7~~ | ~~Signal handler for segfaults~~ | ~~LOW~~ | **DONE** — Windows VEH + Linux SIGSEGV/SIGBUS/SIGABRT/SIGFPE handlers (SH-12.9) |
 | FS4 | **Stack size auto-detection** | LOW | On Windows, query the current thread's stack size and auto-set `max_recursion` proportionally. Currently fixed at 1000 (interp) / 10000 (C codegen). |
 | FS5 | **CFI (Control Flow Integrity)** | LOW | Forward-edge CFI for indirect calls in C codegen. Validates function pointer targets against a known set. |
 | FS6 | **Runtime sandbox** | LOW | Capability revocation in the interpreter — restrict IO/network/spawn after a certain point. Currently compile-time only. |
-| FS7 | **Signal handler for segfaults** | LOW | Install a SIGSEGV/SIGBUS handler in generated C programs that prints the call stack before crashing. Currently only `p_panic` produces traces. |
 | FS8 | **`@no-panic` annotation** | LOW | Functions marked `@no-panic` are forbidden from calling any function that can panic (div, indexing, unwrap, etc.). Stricter than `@crashfree`. |

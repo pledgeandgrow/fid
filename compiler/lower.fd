@@ -362,7 +362,7 @@ pub fn runtime_effects(name: str) -> OptEffectSet {
         return OptEffectSet::Some(effects);
     }
     // IO functions
-    if str_starts_with(name, "p_print") || name == "p_panic" || str_starts_with(name, "p_write") {
+    if str_starts_with(name, "p_print") || str_starts_with(name, "p_eprint") || name == "p_panic" || str_starts_with(name, "p_write") {
         EffectSet_add(&mut effects, Effect::IO);
         return OptEffectSet::Some(effects);
     }
@@ -1139,28 +1139,51 @@ pub fn Lowerer_compute_enum_layout(self: &mut Lowerer, def: EnumDef) {
 }
 
 pub fn Lowerer_make_enum_layout(self: &Lowerer, def: EnumDef) -> StructLayout {
-    var max_fields: i64 = 0;
+    // Compute the max payload size across all variants.
+    // Each field in a variant gets at least 8 bytes, but struct/enum-typed
+    // fields need their full size (looked up from the module's struct layouts).
+    var max_payload_size: i64 = 0;
     var i: i64 = 0;
     while i < def.variants.len() {
         var variant: EnumVariant = def.variants.get(i);
         match variant.data {
             OptParams::Some(data) => {
-                if data.len() > max_fields { max_fields = data.len(); }
+                var variant_size: i64 = 0;
+                var fi: i64 = 0;
+                while fi < data.len() {
+                    var ir_ty: IrType = Lowerer_lower_type(self, data.get(fi).ty);
+                    var field_size: i64 = 8;
+                    match ir_ty {
+                        IrType::Struct(sname) => {
+                            match IrModule_get_struct(&self.module, sname) {
+                                OptStructLayout::Some(layout) => { field_size = layout.size; }
+                                OptStructLayout::None => { field_size = 8; }
+                            }
+                        }
+                        _ => { field_size = 8; }
+                    }
+                    variant_size = variant_size + field_size;
+                    fi = fi + 1;
+                }
+                if variant_size > max_payload_size { max_payload_size = variant_size; }
             }
             OptParams::None => {}
         }
         i = i + 1;
     }
 
+    // Round up to a multiple of 8 and count how many 8-byte slots we need.
+    var payload_slots: i64 = (max_payload_size + 7) / 8;
+
     var fields: Vec<StringIrTypeOffset> = Vec::new();
     fields.push(StringIrTypeOffset_new("__tag", IrType::I64, 0));
     var j: i64 = 0;
-    while j < max_fields {
+    while j < payload_slots {
         fields.push(StringIrTypeOffset_new("__data" + int_to_str(j), IrType::I64, (j + 1) * 8));
         j = j + 1;
     }
 
-    var size: i64 = (1 + max_fields) * 8;
+    var size: i64 = (1 + payload_slots) * 8;
     var layout: StructLayout = StructLayout_new(def.name);
     layout.size = size;
     layout.align = 8;
@@ -1174,6 +1197,7 @@ pub fn Lowerer_register_runtime(self: &mut Lowerer) {
     // Print/panic
     Lowerer_add_extern_1(self, "p_print_int", IrType::I64, IrType::Void);
     Lowerer_add_extern_1(self, "p_print_str", ptr_u8(), IrType::Void);
+    Lowerer_add_extern_1(self, "p_eprint_str", ptr_u8(), IrType::Void);
     Lowerer_add_extern_1(self, "p_print_bool", IrType::Bool, IrType::Void);
     Lowerer_add_extern_1(self, "p_print_float", IrType::F64, IrType::Void);
     Lowerer_add_extern_0(self, "p_print_newline", IrType::Void);
@@ -1515,6 +1539,11 @@ pub fn Lowerer_lower_program(self: &mut Lowerer, program: Program) -> IrModule {
             var method: Func = imp.methods.get(j);
             Lowerer_insert_impl_method(self, imp.struct_name, method.name, method);
             Lowerer_insert_func_ret_type(self, method.name, method.ret_ty);
+            // Pre-register mangled name in IR module so calls can look up return type
+            var mangled_name: str = imp.struct_name + "_" + method.name;
+            var mangled_ret_ty: IrType = Lowerer_lower_type(self, method.ret_ty);
+            var ir_func: IrFunction = IrFunction_new(mangled_name, mangled_ret_ty);
+            IrModule_add_function(&mut self.module, ir_func);
             j = j + 1;
         }
         i = i + 1;
@@ -1529,6 +1558,11 @@ pub fn Lowerer_lower_program(self: &mut Lowerer, program: Program) -> IrModule {
             var method: Func = ti.methods.get(j);
             Lowerer_insert_impl_method(self, ti.type_name, method.name, method);
             Lowerer_insert_func_ret_type(self, method.name, method.ret_ty);
+            // Pre-register mangled name in IR module so calls can look up return type
+            var ti_mangled_name: str = ti.type_name + "_" + method.name;
+            var ti_mangled_ret_ty: IrType = Lowerer_lower_type(self, method.ret_ty);
+            var ti_ir_func: IrFunction = IrFunction_new(ti_mangled_name, ti_mangled_ret_ty);
+            IrModule_add_function(&mut self.module, ti_ir_func);
             j = j + 1;
         }
         i = i + 1;
@@ -1570,18 +1604,48 @@ pub fn Lowerer_lower_program(self: &mut Lowerer, program: Program) -> IrModule {
         i = i + 1;
     }
 
-    // Compute enum layouts first
-    i = 0;
-    while i < program.enums.len() {
-        Lowerer_compute_enum_layout(self, program.enums.get(i));
-        i = i + 1;
-    }
-
-    // Compute struct layouts
-    i = 0;
-    while i < program.structs.len() {
-        Lowerer_compute_struct_layout(self, program.structs.get(i));
-        i = i + 1;
+    // Compute enum and struct layouts iteratively to a fixpoint.
+    // Enums may contain structs, and structs may contain enums.
+    // We interleave both passes until no size changes.
+    var changed: bool = true;
+    var iterations: i64 = 0;
+    while changed && iterations < 20 {
+        changed = false;
+        i = 0;
+        while i < program.enums.len() {
+            var e: EnumDef = program.enums.get(i);
+            var old_size: i64 = 0;
+            match IrModule_get_struct(&self.module, e.name) {
+                OptStructLayout::Some(old_layout) => { old_size = old_layout.size; }
+                OptStructLayout::None => { old_size = 0; }
+            }
+            Lowerer_compute_enum_layout(self, e);
+            var new_size: i64 = 0;
+            match IrModule_get_struct(&self.module, e.name) {
+                OptStructLayout::Some(new_layout) => { new_size = new_layout.size; }
+                OptStructLayout::None => { new_size = 0; }
+            }
+            if new_size != old_size { changed = true; }
+            i = i + 1;
+        }
+        i = 0;
+        while i < program.structs.len() {
+            var s: StructDef = program.structs.get(i);
+            var old_size: i64 = 0;
+            match IrModule_get_struct(&self.module, s.name) {
+                OptStructLayout::Some(old_layout) => { old_size = old_layout.size; }
+                OptStructLayout::None => { old_size = 0; }
+            }
+            Lowerer_compute_struct_layout(self, s);
+            var new_size: i64 = 0;
+            match IrModule_get_struct(&self.module, s.name) {
+                OptStructLayout::Some(new_layout) => { new_size = new_layout.size; }
+                OptStructLayout::None => { new_size = 0; }
+            }
+            if new_size != old_size { changed = true; }
+            i = i + 1;
+        }
+        iterations = iterations + 1;
     }
 
     // Register runtime
@@ -2697,6 +2761,26 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                 return Lowerer_emit_inst(self, Inst::Call("p_future_ready", wrap_args, IrType::I64, EffectSet_new()));
             }
 
+            // Handle struct return via SRET (out-parameter calling convention).
+            // Struct-returning functions have a hidden first parameter (pointer
+            // to the result struct) and return void. The caller allocates space
+            // for the result, passes the pointer, and returns it as the call result.
+            match ret_ty {
+                IrType::Struct(sname) => {
+                    var sret_ptr: i64 = Lowerer_emit_inst(self, Inst::Alloca(IrType::Struct(sname), Lowerer_current_region(self)));
+                    var sret_args: Vec<i64> = Vec::new();
+                    sret_args.push(sret_ptr);
+                    var si: i64 = 0;
+                    while si < call_args.len() {
+                        sret_args.push(call_args.get(si));
+                        si = si + 1;
+                    }
+                    Lowerer_emit_inst(self, Inst::Call(callee, sret_args, IrType::Void, eff));
+                    return sret_ptr;
+                }
+                _ => {}
+            }
+
             return Lowerer_emit_inst(self, Inst::Call(callee, call_args, ret_ty, eff));
         }
         Expr::MethodCall(receiver, method, args) => {
@@ -2836,10 +2920,94 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                 ai = ai + 1;
             }
 
+            // Box struct elements before pushing/inserting into Vec.
+            // The Vec runtime stores elements as i64 (8-byte slots).
+            // For struct elements (>8 bytes), we must heap-allocate the struct
+            // and store the pointer in the Vec. Otherwise the stack-allocated
+            // SRET buffer becomes a dangling pointer when the calling function
+            // returns, causing corrupted data when reading from the Vec later.
+            if str_equal(method, "push") || str_equal(method, "insert") {
+                // Determine the Vec element type from the receiver type
+                var vec_elem_ty: IrType = IrType::I64;
+                var found_elem: bool = false;
+                match recv_ty {
+                    IrType::Generic(gname, gargs) => {
+                        if str_equal(gname, "Vec") && gargs.len() > 0 {
+                            vec_elem_ty = gargs.get(0);
+                            found_elem = true;
+                        }
+                    }
+                    IrType::Opaque(oname) => {
+                        if str_equal(oname, "Vec") {
+                            // Try AST type for generic info
+                            match box_expr_unbox(receiver) {
+                                Expr::Ident(vname) => {
+                                    match Lowerer_lookup_var_ast_type(self, vname) {
+                                        OptType::Some(at) => {
+                                            match at {
+                                                Type::Generic(an, aargs) => {
+                                                    if str_equal(an, "Vec") && aargs.len() > 0 {
+                                                        vec_elem_ty = Lowerer_lower_type(self, aargs.get(0));
+                                                        found_elem = true;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        OptType::None => {}
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if found_elem {
+                    match vec_elem_ty {
+                        IrType::Struct(_) => {
+                            // call_args = [__env?, recv, value] for push
+                            // call_args = [__env?, recv, index, value] for insert
+                            // Find the value argument (last arg)
+                            var val_idx: i64 = call_args.len() - 1;
+                            var val: i64 = call_args.get(val_idx);
+                            // Use IrModule_type_size to look up struct layout size.
+                            // ir_type_size returns 0 for structs, which would cause
+                            // p_malloc(0) and memcpy(_, _, 0) — not copying the struct.
+                            var size: i64 = IrModule_type_size(&self.module, vec_elem_ty);
+                            if size <= 0 { size = 8; }  // fallback for unknown structs
+                            var size_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(size, IrType::I64));
+                            var heap_ptr: i64 = Lowerer_emit_inst(self, Inst::Call("p_malloc", c_vec1_i64(size_val), IrType::Ptr(Box::new(vec_elem_ty)), EffectSet_new()));
+                            Lowerer_emit_inst(self, Inst::Store(heap_ptr, val, OptIrType::None));
+                            // Replace the value in call_args with the heap pointer
+                            call_args.set(val_idx, heap_ptr);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             var eff: EffectSet = EffectSet_new();
             match runtime_effects(mangled_name) {
                 OptEffectSet::Some(e) => { eff = e; }
                 OptEffectSet::None => {}
+            }
+
+            // Handle struct return via SRET (out-parameter calling convention).
+            match ret_ty {
+                IrType::Struct(sname) => {
+                    var sret_ptr: i64 = Lowerer_emit_inst(self, Inst::Alloca(IrType::Struct(sname), Lowerer_current_region(self)));
+                    var sret_args: Vec<i64> = Vec::new();
+                    sret_args.push(sret_ptr);
+                    var si: i64 = 0;
+                    while si < call_args.len() {
+                        sret_args.push(call_args.get(si));
+                        si = si + 1;
+                    }
+                    Lowerer_emit_inst(self, Inst::Call(mangled_name, sret_args, IrType::Void, eff));
+                    return sret_ptr;
+                }
+                _ => {}
             }
 
             return Lowerer_emit_inst(self, Inst::Call(mangled_name, call_args, ret_ty, eff));

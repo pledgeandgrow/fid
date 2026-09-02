@@ -42,8 +42,8 @@ fn runtime_effects(name: &str) -> Option<EffectSet> {
         effects.add(Effect::Alloc);
         return Some(effects);
     }
-    // IO functions (print, panic, etc.)
-    if name.starts_with("p_print") || name == "p_panic" || name.starts_with("p_write") {
+    // IO functions (print, eprint, panic, etc.)
+    if name.starts_with("p_print") || name.starts_with("p_eprint") || name == "p_panic" || name.starts_with("p_write") {
         effects.add(Effect::IO);
         return Some(effects);
     }
@@ -241,6 +241,33 @@ impl Lowerer {
         self.region_stack.last()
             .map(|name| Region::Named(name.clone()))
             .unwrap_or(Region::Stack)
+    }
+
+    /// Load a field from an enum variant's inline storage.
+    ///
+    /// When the field type is a struct (enum), the data is stored inline
+    /// within the parent enum. A plain `Inst::Load` with a struct type only
+    /// reads 8 bytes (a pointer) in the C codegen, because `c_type(Struct(_))`
+    /// returns a pointer type. To correctly extract the full struct, we
+    /// allocate a new buffer and use `Inst::Store` (which emits a `memcpy`
+    /// for struct types in the codegen) to copy the inline data.
+    ///
+    /// For non-struct types, a regular `Inst::Load` is used.
+    fn load_enum_field(&mut self, field_ptr: ValueId, field_ty: &IrType) -> ValueId {
+        if let IrType::Struct(_) = field_ty {
+            let buf = self.emit_inst(Inst::Alloca {
+                ty: field_ty.clone(),
+                region: self.current_region(),
+            });
+            self.emit_inst(Inst::Store {
+                ptr: buf,
+                value: field_ptr,
+                store_ty: Some(field_ty.clone()),
+            });
+            buf
+        } else {
+            self.emit_inst(Inst::Load { ptr: field_ptr, ty: field_ty.clone() })
+        }
     }
 
     pub fn new() -> Self {
@@ -539,6 +566,7 @@ impl Lowerer {
     fn register_runtime(&mut self) {
         self.module.add_extern("p_print_int", vec![IrType::I64], IrType::Void);
         self.module.add_extern("p_print_str", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Void);
+        self.module.add_extern("p_eprint_str", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Void);
         self.module.add_extern("p_print_bool", vec![IrType::Bool], IrType::Void);
         self.module.add_extern("p_print_float", vec![IrType::F64], IrType::Void);
         self.module.add_extern("p_print_newline", vec![], IrType::Void);
@@ -2845,7 +2873,7 @@ impl Lowerer {
                             field_index: (i + 1) as u32,
                             field_ty: field_ty.clone(),
                         });
-                        let field_val = self.emit_inst(Inst::Load { ptr: field_ptr, ty: field_ty });
+                        let field_val = self.load_enum_field(field_ptr, &field_ty);
                         // Remove any stale alloca binding for this name so that
                         // the local binding (via bind_local) is used instead.
                         self.allocas.remove(binding);
@@ -3006,7 +3034,7 @@ impl Lowerer {
                     for (i, (binding, _ty_name)) in bindings.iter().enumerate() {
                         let field_ty = binding_tys.get(i).cloned().unwrap_or(IrType::I64);
                         let field_ptr = self.emit_inst(Inst::GetFieldPtr { struct_ptr: match_val, field_index: (i + 1) as u32, field_ty: field_ty.clone() });
-                        let field_val = self.emit_inst(Inst::Load { ptr: field_ptr, ty: field_ty });
+                        let field_val = self.load_enum_field(field_ptr, &field_ty);
                         self.allocas.remove(binding);
                         if let Some(ref mut f) = self.current_func {
                             f.bind_local(binding, field_val);
@@ -3734,7 +3762,70 @@ impl Lowerer {
                         let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                         runtime_args.insert(0, dummy_env);
                         // Element type from Generic args, default to I64
-                        let elem_ty = recv_ty.generic_elem().cloned().unwrap_or(IrType::I64);
+                        let mut elem_ty = recv_ty.generic_elem().cloned().unwrap_or(IrType::I64);
+                        // Fallback: if recv_ty is Opaque("Vec") (from Vec::new()),
+                        // generic_elem() returns None. Try looking up the AST type
+                        // from var_ast_types to recover the element type.
+                        if matches!(elem_ty, IrType::I64) && effective_ty.is_opaque_named("Vec") {
+                            if let Expr::Ident(var_name) = receiver.as_ref() {
+                                if let Some(ast_ty) = self.var_ast_types.get(var_name) {
+                                    if let Type::Generic { name, args } = ast_ty {
+                                        if name == "Vec" && !args.is_empty() {
+                                            elem_ty = self.lower_type(&args[0]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Box struct elements before pushing/inserting into Vec.
+                        // The Vec runtime stores elements as i64 (8-byte slots).
+                        // For struct elements (which are >8 bytes), we must heap-allocate
+                        // the struct and store the pointer in the Vec. Otherwise the
+                        // stack-allocated SRET buffer would become a dangling pointer
+                        // when the calling function returns.
+                        if matches!(elem_ty, IrType::Struct(_)) {
+                            match method.as_str() {
+                                "push" => {
+                                    // runtime_args = [dummy_env, vec, value]
+                                    // Box the value at index 2
+                                    let val = runtime_args[2];
+                                    let size = self.module.type_size(&elem_ty);
+                                    let size_val = self.emit_inst(Inst::ConstInt { value: size as i64, ty: IrType::I64 });
+                                    let heap_ptr = self.emit_inst(Inst::Call {
+                                        func: "p_malloc".to_string(),
+                                        args: vec![size_val],
+                                        ret_ty: IrType::Ptr(Box::new(elem_ty.clone())),
+                                        effects: {
+                                            let mut e = EffectSet::new();
+                                            e.add(Effect::Alloc);
+                                            e
+                                        },
+                                    });
+                                    self.emit_inst(Inst::Store { ptr: heap_ptr, value: val, store_ty: None });
+                                    runtime_args[2] = heap_ptr;
+                                }
+                                "insert" => {
+                                    // runtime_args = [dummy_env, vec, index, value]
+                                    // Box the value at index 3
+                                    let val = runtime_args[3];
+                                    let size = self.module.type_size(&elem_ty);
+                                    let size_val = self.emit_inst(Inst::ConstInt { value: size as i64, ty: IrType::I64 });
+                                    let heap_ptr = self.emit_inst(Inst::Call {
+                                        func: "p_malloc".to_string(),
+                                        args: vec![size_val],
+                                        ret_ty: IrType::Ptr(Box::new(elem_ty.clone())),
+                                        effects: {
+                                            let mut e = EffectSet::new();
+                                            e.add(Effect::Alloc);
+                                            e
+                                        },
+                                    });
+                                    self.emit_inst(Inst::Store { ptr: heap_ptr, value: val, store_ty: None });
+                                    runtime_args[3] = heap_ptr;
+                                }
+                                _ => {}
+                            }
+                        }
                         // Vec_get/pop/first/last/remove return a pointer when
                         // the element is a struct (the runtime stores structs
                         // by reference). Wrap it so field access works.
