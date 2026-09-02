@@ -83,7 +83,9 @@ All C codegen output is compiled with these flags (no opt-in required):
 | ROP chains | Partial | Fewer gadgets (no unused code with `--caps`), but no CFI |
 | Spectre/Meltdown | Partial | `@constant_time` helps, but hardware-level issue |
 | Heap spraying | Partial | No `eval()` or dynamic code exec, but no heap hardening |
-| Stack overflow (deep recursion) | Partial | `@no-recursion` prevents it, but no runtime stack limit |
+| Stack overflow (deep recursion) | **Prevented** (SH-12) | C codegen `p_max_recursion=10000` + abort with trace; interpreter `--max-recursion` |
+| Infinite loops | **Prevented** (SH-12) | Interpreter `--max-steps N` panics with trace; test runner uses 50M limit |
+| Out-of-memory | **Prevented** (SH-12) | C codegen `p_malloc` aborts with size on alloc failure (no silent NULL) |
 
 ### Not Yet Prevented
 

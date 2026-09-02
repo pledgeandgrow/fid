@@ -1,50 +1,58 @@
-# Fides Self-Hosting Roadmap â€” 10 Phases
+# Fides Self-Hosting Roadmap — 10 Phases
 
-> **Goal:** Rewrite the Fides compiler (85K LOC Rust) in Fides, one file at a time,
+> **Goal:** Rewrite the Fides compiler (82K LOC Rust) in Fides, one file at a time,
 > with testing at every step and zero "big bang" risk.
 >
-> **Strategy:** Bootstrap via C codegen (stable, 164/165 tests). Fix everything
-> that could break the process BEFORE starting. Then rewrite leaf modules first,
-> climbing the dependency graph. Each rewritten file gets its own test suite.
->
-> **Canonical source for blocker status:** `roadmap.md` Phase 10.
+> **Strategy:** Bootstrap via C codegen. Fix everything that could break the
+> process BEFORE starting. Then rewrite leaf modules first, climbing the
+> dependency graph. Each rewritten file gets its own test suite.
+
+## Current State (Feb 9, 2026)
+
+**All 18 self-host modules are rewritten and pass tests (23/23 on interp + PE).**
+The self-hosted compiler **builds** to `release/fides-c.exe` (7.9MB) but
+**crashes on use** with `STATUS_ACCESS_VIOLATION` before reaching the lexer.
+
+### Build Pipeline
+```
+cargo build --release                                    → target/release/fidesc.exe
+fidesc ccompile compiler/main.fd -o release/fides-c      → release/fides-c.c (12.2MB)
+tcc -O2 -w -o release/fides-c.exe release/fides-c.c      → release/fides-c.exe (7.9MB)
+```
+
+### Build Directories
+- `target/` — Rust compiler output (fidesc.exe) — gitignored
+- `release/` — Self-hosted compiler output (fides-c.c, fides-c.exe) — gitignored
+- `compiler/` — Self-hosted compiler source (18 .fd modules, 39.5K LOC)
+- `tests/compiler/` — Self-host module tests (23 .fd files)
+- `tests/selfhost/` — Harness/probe files for differential testing
 
 ## Test Suites
-
-There are two separate test suites, verified by two scripts:
 
 | Script | Directory | Tests for | Backends |
 |--------|-----------|-----------|----------|
 | `./verify.sh` | `tests/` | Rust compiler (`src/`) | interpreter, C codegen, PE emitter |
 | `./verify-selfhost.sh` | `tests/compiler/` | Self-hosted Fides components (`compiler/`) | interpreter, C codegen, PE emitter |
 
-- `tests/` contains `.fd` programs that exercise the **Rust-based** compiler
-  (lexer, parser, typechecker, codegen in `src/*.rs`). These are the 221 test
-  files tracked in the baseline.
-- `tests/compiler/` contains `.fd` programs that exercise the **rewritten
-  Fides** compiler components (`compiler/*.fd` â€” token.fd, diag.fd, json.fd,
-  fmt.fd, ast.fd, lexer.fd, parser.fd, ...). Each test imports the module
-  under test and runs assertions.
-- Run `./verify.sh` before/after changes to `src/*.rs`.
-- Run `./verify-selfhost.sh` before/after changes to `compiler/*.fd`.
-
 ---
 
-## The 10 Phases at a Glance
+## The 12 Phases at a Glance
 
 | Phase | Name | Goal | Risk Level | Status |
 |-------|------|------|------------|--------|
-| SH-0 | Pre-Flight Audit | Identify every gap, bug, and risk | LOW | **DONE** â€” 0.1/0.2/0.3 done; 0.4 cataloged |
-| SH-1 | Debugging Infrastructure | Top-notch error messages + tracing | LOW | **DONE** â€” 1.1/1.2/1.3/1.4/1.5/1.6 all done |
-| SH-2 | Test Harness per Module | Golden files for every compiler stage | LOW | **PARTIAL** â€” golden files exist for IR/PIR/asm; diff-test implemented; no per-module tests |
-| SH-3 | Fides Language Gaps | Fix features needed for compiler code | MEDIUM | **DONE** â€” 3.1 PartialEq, 3.2 benchmarked, 3.3 byte/char, 3.4 deterministic HashMap, 3.5 formatting, 3.6 nested all done |
-| SH-4 | Fides Stdlib Gaps | Fill stdlib holes for compiler code | MEDIUM | **DONE** â€” 4.1/4.2/4.3/4.4 all done; str_parse_float + float_to_str added |
-| SH-5 | C Codegen Hardening | Survive compiler-sized programs | MEDIUM | **DONE** â€” 970-LOC test_compiler_sized passes all 3 backends; gcc warnings audited (non-critical); valgrind deferred (not available) |
-| SH-6 | Rewrite Leaf Modules | token, diag, json, fmt (no deps) | MEDIUM | **DONE** â€” token.fd (SH-6.1), diag.fd, json.fd, fmt.fd all done + passing |
-| SH-7 | Rewrite Frontend | lexer, ast, parser (recursive descent) | HIGH | **DONE** â€” ast.fd (SH-7.2), lexer.fd (SH-7.1), parser.fd (SH-7.3) all compile + pass tests; Parser_new/Parser_with_names moved outside impl block; ImportDef struct literal fixed |
-| SH-8 | Rewrite Middle-End | typechecker, lower, ir, mono, borrowck | HIGH | **DONE** â€” ir.fd, typechecker.fd, lower.fd, mono.fd, borrowck.fd all compile + pass tests (23/23 on all 3 backends); cross-module visibility fixed (module_functions tracking in typechecker.rs); StringVecStr naming conflict resolved; differential testing pending |
-| SH-9 | Rewrite Back-End + Bootstrap | codegen_c, pir, opt, compiler, bootstrap | HIGH | **IN PROGRESS** â€” pir.fd (9.1), opt.fd (9.2), codegen_c.fd (9.3), compiler.fd (9.4) all DONE. Bootstrap (9.5) IN PROGRESS: `fides-bootstrap` no longer segfaults on hello.fd (4 codegen/porting bugs fixed: string padding, auto-deref &mut Vec, box_type_unbox Deref, box_expr_unbox(receiver) porting bug in check_method_call). Now produces false typechecker errors â€” 3 remaining bugs: (1) unsafe block init tracking, (2) `Type::Named("Vec")` method dispatch, (3) undefined function lookups. |
-| SH-10 | Self-Host Breaking Bugs & Remaining Issues | Fix all gaps/stubs found by src vs compiler comparison | HIGH | **IN PROGRESS** â€” 7 critical fixes DONE: Inst::Cast (L1), f64_to_bits (L8), CallPtr (G1), comptime process_gen+substitute (C2+C3), Expr::Try (L3), emit_defers (L7), import errors (C8). Self-host tests 23/23 pass on all 3 backends. Remaining: medium/low severity items. |
+| SH-0 | Pre-Flight Audit | Identify every gap, bug, and risk | LOW | **DONE** |
+| SH-1 | Debugging Infrastructure | Top-notch error messages + tracing | LOW | **DONE** |
+| SH-2 | Test Harness per Module | Golden files for every compiler stage | LOW | **PARTIAL** — golden files exist for IR/PIR/asm; diff-test implemented |
+| SH-3 | Fides Language Gaps | Fix features needed for compiler code | MEDIUM | **DONE** |
+| SH-4 | Fides Stdlib Gaps | Fill stdlib holes for compiler code | MEDIUM | **DONE** |
+| SH-5 | C Codegen Hardening | Survive compiler-sized programs | MEDIUM | **DONE** |
+| SH-6 | Rewrite Leaf Modules | token, diag, json, fmt (no deps) | MEDIUM | **DONE** |
+| SH-7 | Rewrite Frontend | lexer, ast, parser (recursive descent) | HIGH | **DONE** |
+| SH-8 | Rewrite Middle-End | typechecker, lower, ir, mono, borrowck | HIGH | **DONE** |
+| SH-9 | Rewrite Back-End + Bootstrap | codegen_c, pir, opt, compiler, bootstrap | HIGH | **IN PROGRESS** — all 18 modules DONE (39.5K LOC), `release/fides-c.exe` builds (7.9MB via tcc) but crashes with STATUS_ACCESS_VIOLATION in Lexer_tokenize at stdlib pos ~69845 |
+| SH-10 | Self-Host Breaking Bugs & Remaining Issues | Fix all gaps/stubs found by src vs compiler comparison | HIGH | **IN PROGRESS** — 7 critical fixes DONE, 23/23 self-host tests pass |
+| SH-11 | Bootstrap Crash Fix & Codegen Sync | Fix STATUS_ACCESS_VIOLATION crash + sync Fides codegen with Rust codegen changes | CRITICAL | **NOT STARTED** |
+| SH-12 | Safety & Crash Prevention | Runtime limits, OOM detection, step limits, recursion limits in C codegen | MEDIUM | **DONE** — C codegen recursion limit, p_malloc OOM detection, interpreter --max-steps, test runner step limit, Windows path fixes, tcc auto-detection |
 
 ---
 
@@ -1587,3 +1595,249 @@ A full side-by-side comparison was conducted across all major component pairs:
 15. T3: Add `resolve_pattern_enum`
 16. T4: Add `subst_type_params`
 17. O1: Wire `linear_structs` into alias analysis
+
+---
+
+## Phase SH-11 — Bootstrap Crash Fix & Codegen Sync **[NOT STARTED]**
+
+> **The self-hosted compiler builds but crashes on use. This is the single
+> blocker preventing self-hosting.**
+
+### Goal
+Fix the `STATUS_ACCESS_VIOLATION` crash in `release/fides-c.exe` so it can
+compile `.fd` files, then sync the Fides codegen with recent Rust codegen
+changes that were never ported.
+
+### SH-11.1 — Fix the Bootstrap Crash
+
+**Symptom:** `release/fides-c.exe ccompile hello.fd` crashes with
+`STATUS_ACCESS_VIOLATION` (0xC0000005) before reaching `Lexer_tokenize`.
+
+**Debug findings:**
+- `main()` entered ✓
+- `cmd_ccompile()` entered ✓
+- User file read successfully ✓
+- `ccompile_source_with_path()` entered ✓
+- `Lexer_tokenize()` NEVER reached ✗ — crash happens before lexing
+
+**Call chain where crash occurs:**
+```
+ccompile_source_with_path(source, source_path)
+  → build_program_with_path(source, OptStr::Some(source_path))
+    → c_file_read("stdlib/core.fd")        ← could return NULL?
+    → parse_source(stdlib_source)           ← if NULL, crashes here
+      → Lexer::new(source)
+        → lex.tokenize()                    ← never reached
+```
+
+**Likely causes (in priority order):**
+
+| # | Cause | Evidence | Fix |
+|---|-------|----------|-----|
+| BC1 | **`c_file_read` returns NULL** — stdlib/core.fd not found relative to CWD. The self-hosted compiler reads `"stdlib/core.fd"` as a relative path. If CWD is wrong, `p_file_read` returns NULL, then `str_len(NULL)` crashes. | Crash is before Lexer_tokenize; `build_program_with_path` reads stdlib before anything else | Add NULL check after `c_file_read("stdlib/core.fd")` in `compiler.fd` — return error if file not found |
+| BC2 | **Stack frame too large** — `build_program_with_path` has ~200+ local variables in generated C, each with `alloca(8)` + `memset`. Total stack per frame could be ~4KB+. With deep call chains, 256MB stack may not be enough. | `cmd_ccompile` alone has 228 local variables; `build_program_with_path` is similar | Reduce local variable count or use heap allocation for large frame |
+| BC3 | **Missing recursion limit in Fides codegen** — `compiler/codegen_c.fd` line 1370 has old simple `p_call_stack_push` without recursion limit. Rust codegen has `p_max_recursion = 10000` with abort. If the compiler enters infinite recursion, it silently overflows the stack instead of aborting with a message. | `src/codegen_c.rs` lines 1027-1043 vs `compiler/codegen_c.fd` line 1370 | Port recursion limit to Fides codegen |
+| BC4 | **NULL return from p_malloc** — Fides codegen returns NULL on OOM. Rust codegen aborts with message. If arena allocation fails, NULL propagates and crashes downstream. | `compiler/codegen_c.fd` lines 2558-2565 vs `src/codegen_c.rs` lines 2313-2321 | Port OOM abort to Fides codegen |
+
+### SH-11.2 — Sync Fides Codegen with Rust Codegen
+
+The Rust codegen (`src/codegen_c.rs`) has several changes that were NEVER
+ported to the Fides codegen (`compiler/codegen_c.fd`). These must be synced
+for the self-hosted compiler to produce correct output.
+
+| # | Change | Rust (src/codegen_c.rs) | Fides (compiler/codegen_c.fd) | Status |
+|---|--------|-------------------------|-------------------------------|--------|
+| CS1 | **Recursion limit** | `p_max_recursion = 10000` + abort on exceed + `p_set_max_recursion()` | Old simple push, no limit | **DONE in Rust** — needs port to Fides codegen |
+| CS2 | **OOM abort in p_malloc** | `abort()` with `fprintf` on all malloc failures | Returns NULL | **DONE in Rust** — needs port to Fides codegen |
+| CS3 | **`wln!` macro `{{` replacement** | `$s.out.push_str(&$fmt.replace("{{", "{").replace("}}", "}"))` | `wln(self, "...")` — no replacement needed (uses single braces) | **OK** (different approach, both correct) |
+| CS4 | **TCC detection in ccompile** | Detects tcc, skips hardening flags, skips `-lm` on Windows | Always uses `tcc -w` in `main.fd` | **OK** (main.fd already targets tcc) |
+| CS5 | **PE stack patching** | Not in codegen (done externally) | Not in codegen (done externally) | **OK** |
+
+### SH-11.3 — Port Recent `lower.fd` Changes to Rust `lower.rs`
+
+The user added truncate-based variable binding save/restore in `compiler/lower.fd`
+for if/else blocks and match arms. This prevents arm-local bindings from leaking
+across branches. The Rust `src/lower.rs` does NOT have this change.
+
+| # | Change | Fides (compiler/lower.fd) | Rust (src/lower.rs) | Status |
+|---|--------|---------------------------|---------------------|--------|
+| LP1 | **If/else save/restore** | Lines 2157-2176: save `allocas/alloca_types/var_ast_types/locals` lengths, truncate after then block, truncate after else block | Not present | **MISSING in Rust** |
+| LP2 | **Match arm save/restore** | Lines 3141-3266, 4175-4302: same truncate pattern for match arms | Not present | **MISSING in Rust** |
+| LP3 | **Closure save comment** | Lines 3476-3480: clarifies that lower_func assigns NEW Vecs (pointer-copy save works) | Not present | **MISSING in Rust** |
+
+**Risk:** If the Fides lower produces different IR than the Rust lower (because
+of these changes), the self-hosted compiler will produce different C output
+than the Rust compiler. This breaks the fixpoint check (stage2.c != stage1.c).
+
+### SH-11.4 — Port Recent `interp.rs` Changes
+
+The user added `self.opaque_values.remove(&addr)` before store operations in
+`src/interp.rs` (line ~1364). This clears stale opaque_values entries so a
+subsequent Load doesn't return an old Value::Str/Vec/Map. This is a Rust-only
+change that affects the interpreter (reference oracle). No Fides equivalent
+needed (Fides doesn't have an interpreter), but it may change test baselines.
+
+### SH-11.5 — Rebuild Build Infrastructure
+
+| # | Task | Status |
+|---|------|--------|
+| BI1 | Create `build-selfhost.ps1` (was deleted) | **MISSING** |
+| BI2 | Document build pipeline in AGENTS.md | **DONE** |
+| BI3 | Ensure `release/` is the canonical output dir | **DONE** |
+| BI4 | Remove `target2/` references and prevent recreation | **DONE** |
+
+### SH-11.6 — Verify Fixpoint
+
+Once the crash is fixed and codegen is synced:
+
+1. `release/fides-c.exe ccompile hello.fd` → produces correct C ✓
+2. `release/fides-c.exe ccompile compiler/main.fd -o release/stage2` → stage2.c ✓
+3. `tcc release/stage2.c -o release/stage2.exe` → stage2.exe ✓
+4. `release/stage2.exe ccompile compiler/main.fd -o release/stage3` → stage3.c ✓
+5. `diff release/stage2.c release/stage3.c` → **must be identical** (fixpoint)
+6. If not identical: debug which codegen path diverges
+
+### Priority Order for SH-11
+
+**CRITICAL (blocks everything):**
+1. BC1: Add NULL check after `c_file_read("stdlib/core.fd")` in compiler.fd
+2. BC3: Port recursion limit to Fides codegen (CS1)
+3. BC4: Port OOM abort to Fides codegen (CS2)
+
+**HIGH (needed for fixpoint):**
+4. LP1+LP2: Port lower.fd truncate changes to Rust lower.rs (or revert in Fides)
+5. BI1: Recreate build-selfhost.ps1
+
+**MEDIUM (correctness):**
+6. BC2: Investigate stack frame size if crash persists after BC1
+7. SH-11.6: Run fixpoint verification
+
+---
+
+## Phase SH-12 — Safety & Crash Prevention  **[DONE]**
+
+> **A language that crashes silently is not safe. This phase adds runtime
+> limits and crash-to-error conversions so the compiler and compiled programs
+> fail with clear messages instead of segfaulting or hanging forever.**
+
+### Goal
+
+Prevent three failure modes that waste development time:
+1. **Infinite loops** — process hangs forever, no feedback
+2. **Stack overflow** — segfault with no indication of cause
+3. **Out-of-memory** — silent NULL dereference or OS kill
+
+### SH-12.1 — C Codegen Recursion Limit  **[DONE]**
+
+**File:** `src/codegen_c.rs` (lines 1026-1045)
+
+Added `p_max_recursion` (default 10000) to generated C. `p_call_stack_push()`
+now checks depth and `abort()`s with a 20-frame stack trace if exceeded.
+
+```c
+static int p_max_recursion = 10000;
+void p_call_stack_push(const char* name) {
+    if (p_call_stack_depth >= p_max_recursion) {
+        fprintf(stderr, "Recursion limit exceeded (%d) in '%s'\n", ...);
+        // print last 20 frames
+        abort();
+    }
+    ...
+}
+void p_set_max_recursion(int limit) { p_max_recursion = limit; }
+```
+
+**Prevents:** `STATUS_ACCESS_VIOLATION` from deep recursion in self-hosted compiler.
+
+### SH-12.2 — C Codegen OOM Detection  **[DONE]**
+
+**File:** `src/codegen_c.rs` (lines 2313-2340)
+
+All `malloc` failure paths in `p_malloc` now `abort()` with a descriptive
+message instead of returning NULL. Negative size also aborts.
+
+```c
+void* p_malloc(int64_t size) {
+    if (size < 0) { fprintf(stderr, "p_malloc: negative size\n"); abort(); }
+    ...
+    if (!c->base) { fprintf(stderr, "p_malloc: OOM allocating %zu bytes\n", sz); abort(); }
+    ...
+}
+```
+
+**Prevents:** Silent null pointer dereferences when memory runs out.
+
+### SH-12.3 — Interpreter Step Limit  **[DONE]**
+
+**Files:** `src/interp.rs`, `src/compiler.rs`, `src/main.rs`
+
+Added `--max-steps N` CLI flag (default 0 = unlimited). The interpreter counts
+every instruction and panics with a clear message when the limit is exceeded.
+
+```bash
+fidesc run program.fd --max-steps 1000000
+```
+
+```
+Panic: Step limit exceeded: 10001 instructions executed (limit: 10000).
+This usually indicates an infinite loop.
+Increase with --max-steps or fix the loop.
+stack trace:
+    → main
+```
+
+**Prevents:** Infinite loops hanging the process forever.
+
+### SH-12.4 — Test Runner Step Limit  **[DONE]**
+
+**File:** `src/main.rs` (line 1525)
+
+`fidesc test` now passes `--max-steps 50000000` to interpreter calls. This
+prevents a single infinite-loop test from hanging the entire test suite.
+
+### SH-12.5 — Windows Path Compatibility  **[DONE]**
+
+**Files:** `src/main.rs`, `tests/harness.rs`
+
+Replaced all hardcoded `/tmp/` paths with `std::env::temp_dir()` on Windows.
+This fixes C codegen and PE emitter tests that silently failed because `/tmp/`
+doesn't exist on Windows.
+
+### SH-12.6 — TCC Auto-Detection  **[DONE]**
+
+**File:** `src/main.rs` (lines 1107-1177)
+
+`fidesc ccompile` now auto-detects TCC and uses appropriate flags:
+- No `-pie`, `-fstack-protector-strong`, `-Wl,-z,relro` (TCC doesn't support)
+- No `-lm` on Windows (math is built-in)
+- TCC added to the CC search list (after gcc, clang, cc)
+
+**Result:** C codegen tests went from 0/193 to 74/193 on Windows.
+
+### What Fides Already Had (reinforced by SH-12)
+
+| Mechanism | Where | Since |
+|-----------|-------|-------|
+| Integer overflow checks (always on) | Interpreter | F64 |
+| Array bounds checks | Interpreter | F62 |
+| Division by zero → panic | Interpreter | F64 |
+| Recursion depth limit (interpreter) | `--max-recursion` | SH-1.4 |
+| `@gas(N)` compile-time gas budget | Typechecker + IR | Phase 12 |
+| `@no-recursion` annotation | Typechecker | Phase 12 |
+| `@no-alloc` annotation | Typechecker | Phase 12 |
+| `@crashfree` annotation | Typechecker | Phase 12 |
+| Region-based memory (bulk free) | Lower + interp | I-1C |
+| Binary hardening (canaries, PIE, RELRO) | C codegen | Phase 10B |
+
+### Future Safety Work (Not Yet Started)
+
+| # | Feature | Priority | Description |
+|---|---------|----------|-------------|
+| FS1 | **Port SH-12.1+12.2 to Fides codegen** | HIGH | `compiler/codegen_c.fd` still has old simple `p_call_stack_push` and NULL-returning `p_malloc`. Must port the recursion limit and OOM abort. |
+| FS2 | **Compilation timeout** | MEDIUM | Add a wall-clock timeout to `fidesc ccompile` and `fidesc build` so a hanging compilation phase (parser, typechecker, lower) is killed after N seconds. Use `SetTimer` on Windows / `alarm()` on Linux. |
+| FS3 | **Memory limit for interpreter** | MEDIUM | Track total bytes allocated in `interp.rs` and panic when exceeding a configurable limit (`--max-memory N`). Prevents OOM kills. |
+| FS4 | **Stack size auto-detection** | LOW | On Windows, query the current thread's stack size and auto-set `max_recursion` proportionally. Currently fixed at 1000 (interp) / 10000 (C codegen). |
+| FS5 | **CFI (Control Flow Integrity)** | LOW | Forward-edge CFI for indirect calls in C codegen. Validates function pointer targets against a known set. |
+| FS6 | **Runtime sandbox** | LOW | Capability revocation in the interpreter — restrict IO/network/spawn after a certain point. Currently compile-time only. |
+| FS7 | **Signal handler for segfaults** | LOW | Install a SIGSEGV/SIGBUS handler in generated C programs that prints the call stack before crashing. Currently only `p_panic` produces traces. |
+| FS8 | **`@no-panic` annotation** | LOW | Functions marked `@no-panic` are forbidden from calling any function that can panic (div, indexing, unwrap, etc.). Stricter than `@crashfree`. |

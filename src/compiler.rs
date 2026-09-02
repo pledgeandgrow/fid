@@ -1431,6 +1431,16 @@ pub fn interpret_source_with_options(source: &str, source_path: &str, verbose: b
 
 /// Interpret with --trace flag (SH-1.2). Prints per-stage timing to stderr.
 pub fn interpret_source_traced(source: &str, source_path: &str, verbose: bool, release: bool, max_recursion: usize, trace: bool) -> Result<(RunResult, Option<String>), Vec<String>> {
+    interpret_source_traced_full(source, source_path, verbose, release, max_recursion, 0, trace)
+}
+
+/// Full version with max_steps support.
+pub fn interpret_source_traced_full(source: &str, source_path: &str, verbose: bool, release: bool, max_recursion: usize, max_steps: u64, trace: bool) -> Result<(RunResult, Option<String>), Vec<String>> {
+    interpret_source_traced_full2(source, source_path, verbose, release, max_recursion, max_steps, 0, trace)
+}
+
+/// Full version with max_steps and max_memory support.
+pub fn interpret_source_traced_full2(source: &str, source_path: &str, verbose: bool, release: bool, max_recursion: usize, max_steps: u64, max_memory: u64, trace: bool) -> Result<(RunResult, Option<String>), Vec<String>> {
     use std::time::Instant;
 
     let t0 = Instant::now();
@@ -1446,7 +1456,7 @@ pub fn interpret_source_traced(source: &str, source_path: &str, verbose: bool, r
 
     // Interpret
     let t4 = Instant::now();
-    let result = interp::interpret_with_options(module, verbose, release, max_recursion);
+    let result = interp::interpret_with_options_full2(module, verbose, release, max_recursion, max_steps, max_memory);
     let t5 = Instant::now();
     if trace { eprintln!("[trace] Interpreter: {:.2}ms", t5.duration_since(t4).as_secs_f64() * 1000.0); }
 

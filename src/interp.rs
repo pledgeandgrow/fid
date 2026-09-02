@@ -152,6 +152,11 @@ impl Memory {
         addr
     }
 
+    /// Total bytes allocated so far (for memory limit checks).
+    pub fn allocated_bytes(&self) -> u64 {
+        self.next_alloc
+    }
+
     pub fn store(&mut self, addr: u64, bytes: &[u8]) {
         let start = addr as usize;
         let end = start + bytes.len();
@@ -378,6 +383,15 @@ pub struct Interpreter {
     /// message (SH-1.4). Prevents stack overflow segfaults from infinite
     /// recursion or very deep nesting. Default: 1000.
     max_recursion: usize,
+    /// Maximum number of instructions to execute before panicking with a
+    /// "step limit exceeded" message. 0 = unlimited. Prevents infinite loops
+    /// from hanging the process forever.
+    max_steps: u64,
+    /// Current instruction count (incremented per instruction executed)
+    step_count: u64,
+    /// Maximum memory in bytes the interpreter can allocate before panicking
+    /// with a "memory limit exceeded" message. 0 = unlimited.
+    max_memory: u64,
 }
 
 /// ML3: A tape entry for reverse-mode autodiff
@@ -516,6 +530,9 @@ impl Interpreter {
             tp_world_size: 1,
             checkpoint_mode: false,
             max_recursion: 1000,
+            max_steps: 0, // 0 = unlimited (set via --max-steps)
+            step_count: 0,
+            max_memory: 0, // 0 = unlimited (set via --max-memory)
         };
         // Pre-allocate string constants
         interp.init_strings();
@@ -576,6 +593,18 @@ impl Interpreter {
     /// segfaulting from stack overflow.
     pub fn set_max_recursion(&mut self, depth: usize) {
         self.max_recursion = depth;
+    }
+
+    /// Set the maximum number of instructions to execute before panicking.
+    /// 0 = unlimited. Prevents infinite loops from hanging the process.
+    pub fn set_max_steps(&mut self, steps: u64) {
+        self.max_steps = steps;
+    }
+
+    /// Set the maximum memory (in bytes) the interpreter can allocate.
+    /// 0 = unlimited. Prevents OOM kills by panicking with a clear message.
+    pub fn set_max_memory(&mut self, bytes: u64) {
+        self.max_memory = bytes;
     }
 
     /// Enable profiling mode — tracks per-function call count and time.
@@ -1008,6 +1037,21 @@ impl Interpreter {
                     None => continue,
                 };
 
+                // Step limit check — prevents infinite loops from hanging forever.
+                // Only active when max_steps > 0 (set via --max-steps).
+                if self.max_steps > 0 {
+                    self.step_count += 1;
+                    if self.step_count > self.max_steps {
+                        self.panic_stack_trace = Some(self.format_call_stack());
+                        cleanup_and_return!(RunResult::Panic(format!(
+                            "Step limit exceeded: {} instructions executed (limit: {}).\n\
+                             This usually indicates an infinite loop.\n\
+                             Increase with --max-steps or fix the loop.",
+                            self.step_count, self.max_steps
+                        )));
+                    }
+                }
+
                 if self.verbose {
                     eprintln!("    {} = {:?}", inst_id, inst);
                 }
@@ -1211,6 +1255,18 @@ impl Interpreter {
             // ─── Memory ───
             Inst::Alloca { ty, .. } => {
                 let size = self.module.type_size(ty);
+                // Memory limit check — prevents OOM kills by panicking with a clear message.
+                if self.max_memory > 0 {
+                    let current = self.memory.allocated_bytes();
+                    if current + size.max(1) as u64 > self.max_memory {
+                        self.panic_stack_trace = Some(self.format_call_stack());
+                        return ExecOutcome::Panic(format!(
+                            "Memory limit exceeded: {} bytes allocated (limit: {} bytes).\n\
+                             Increase with --max-memory or reduce memory usage.",
+                            current + size.max(1) as u64, self.max_memory
+                        ));
+                    }
+                }
                 let addr = self.memory.alloc(size.max(1));
                 // Track array bounds for bounds checking
                 if let IrType::Array(_, arr_size) = ty {
@@ -5832,9 +5888,20 @@ pub fn interpret(module: IrModule, verbose: bool, release: bool) -> (RunResult, 
     interpret_with_options(module, verbose, release, 1000)
 }
 
-/// Interpret with configurable options (SH-1.4: max_recursion).
+/// Interpret with configurable options (SH-1.4: max_recursion, --max-steps).
 /// max_recursion of 0 means unlimited (no depth check).
+/// max_steps of 0 means unlimited (no step count check).
 pub fn interpret_with_options(module: IrModule, verbose: bool, release: bool, max_recursion: usize) -> (RunResult, Option<String>) {
+    interpret_with_options_full(module, verbose, release, max_recursion, 0)
+}
+
+/// Full version with max_steps and max_memory support.
+pub fn interpret_with_options_full(module: IrModule, verbose: bool, release: bool, max_recursion: usize, max_steps: u64) -> (RunResult, Option<String>) {
+    interpret_with_options_full2(module, verbose, release, max_recursion, max_steps, 0)
+}
+
+/// Full version with max_steps and max_memory support.
+pub fn interpret_with_options_full2(module: IrModule, verbose: bool, release: bool, max_recursion: usize, max_steps: u64, max_memory: u64) -> (RunResult, Option<String>) {
     let mut interp = Interpreter::new(module);
     if verbose {
         interp.verbose = true;
@@ -5847,6 +5914,12 @@ pub fn interpret_with_options(module: IrModule, verbose: bool, release: bool, ma
     } else {
         // 0 = unlimited: set to usize::MAX so the check never triggers
         interp.max_recursion = usize::MAX;
+    }
+    if max_steps > 0 {
+        interp.max_steps = max_steps;
+    }
+    if max_memory > 0 {
+        interp.max_memory = max_memory;
     }
     let result = interp.run();
     let trace = interp.take_panic_stack_trace();

@@ -31,6 +31,12 @@ cargo build
 ./verify-selfhost.sh --save
 ./verify-selfhost.sh --list
 
+# Build the self-hosted compiler into release/ (Windows PowerShell)
+.\build-selfhost.ps1              # Build release/fides-c.exe
+.\build-selfhost.ps1 -Bootstrap   # Build + test self-compilation (fixpoint check)
+.\build-selfhost.ps1 -Test <file> # Build + test on a .fd file
+.\build-selfhost.ps1 -Clean       # Clean release/ and rebuild
+
 # Generate golden files for intermediate compiler stages
 ./scripts/gen_golden.sh
 
@@ -113,25 +119,28 @@ cargo build
 ./target/release/veil <file.fd> [--format text|html] [--output <dir>]
 ```
 
-## Current Baseline (as of Aug 31, 2026)
+## Current Baseline (as of Feb 9, 2026)
 
 ```
-Unit tests:   265/265 passed  (All passing — cargo test --lib)
-Harness:      8/8 passed      (All passing — all 3 self-host blockers pass on all backends)
-Interpreter:  188/188 normal  (+ 36 expected-fail, + 0 skip, + 0 known-fail)
-C Codegen:    185/188 matched (3 fail: test_borrowck, test_fmt_real, test_pir — self-host C codegen issues)
-PE Emitter:   188/188 valid   (0 known-fail — all pass)
-Total .fd:    242 test files  (195 in tests/; 23 in tests/compiler/; 24 in subdirs: capability/effects/regions/safety)
-Skip list:    1 test          (bench_stringbuilder — timing benchmark)
-Expected-fail: 36 tests       (tests that verify compiler error detection — failing is correct)
-Known-fail:   0 tests         (all previously known-fail tests now pass on all 3 backends)
-Source:       55 .rs files, ~88,300 LOC
-Stdlib:       69 .fd modules, 18,242 LOC
-Self-host:    17 .fd modules, ~41,800 LOC (token, diag, json, fmt, ast, lexer, parser, ir, typechecker, lower, mono, borrowck, pir, opt, codegen_c, compiler, comptime_eval — all compile + pass tests; 23/23 self-host tests pass on all 3 backends; SH-10 critical fixes done: Inst::Cast, ConstFloat f64, CallPtr, comptime stubs, Expr::Try, emit_defers, import errors)
-Docs:         25 docs/ + 4 root = 29 .md files
+Unit tests:   263/265 passed  (2 failing — recent lower.fd changes)
+Interpreter:  191/194 normal
+C Codegen:    74/194 matched   (tcc integration + Windows path fixes)
+PE Emitter:   193/194 valid
+Total .fd:    230 test files  (207 in tests/; 23 in tests/compiler/)
+Self-host:    23/23 pass on interp + PE (tests/compiler/)
+Source:       52 .rs files, 82,778 LOC
+Stdlib:       69 .fd modules, 16,069 LOC
+Self-host:    18 .fd modules, 39,502 LOC (token, diag, json, fmt, ast, lexer, parser, ir, typechecker, lower, mono, borrowck, pir, opt, codegen_c, compiler, comptime_eval, main — all compile + pass tests)
+Bootstrap:    release/fides-c.exe builds (7.9MB) but crashes with STATUS_ACCESS_VIOLATION on use (pre-existing lexer bug at stdlib pos ~69845)
+Safety:       SH-12 DONE — C codegen recursion limit, p_malloc OOM abort, --max-steps, test runner step limit, Windows path fixes, tcc auto-detection
+Docs:         24 docs/ + 4 root = 28 .md files
 Binaries:     4 (fidesc, pacte, scribe, veil)
-Warnings:     136 (dead code in pe.rs/opt.rs/debugger.rs/wasm.rs/fmt.rs — future feature stubs)
 ```
+
+**Build directories:**
+- `target/` — Rust compiler output (`fidesc.exe`) — gitignored
+- `release/` — Self-hosted compiler output (`fides-c.c`, `fides-c.exe`) — gitignored
+- Build script: `.\build-selfhost.ps1` (Windows) or `./bootstrap-fast.sh` (Linux)
 
 **Changelog:** See `docs/reference/changelog.md` for the full history of
 features and fixes. (Previously duplicated here — removed to avoid maintaining

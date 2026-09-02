@@ -2153,11 +2153,29 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
             var else_block_id: i64 = Lowerer_new_block(self);
             var merge_block_id: i64 = Lowerer_new_block(self);
             Lowerer_emit_terminator(self, Inst::Branch(cond_val, then_block_id, else_block_id));
+
+            // Save variable binding lengths so then/else-local bindings
+            // don't leak across branches or into the merge block.
+            // Fides Vec is a reference type (PVec*), so we use truncate-based
+            // save/restore instead of pointer-copy assignment.
+            var saved_allocas_len: i64 = self.allocas.len();
+            var saved_alloca_types_len: i64 = self.alloca_types.len();
+            var saved_var_ast_types_len: i64 = self.var_ast_types.len();
+            var saved_locals_len: i64 = self.current_func.locals.len();
+
+            // Then block
             Lowerer_set_current_block(self, then_block_id);
             Lowerer_lower_stmts(self, then_block);
             if !Lowerer_current_block_has_terminator(self) {
                 Lowerer_emit_terminator(self, Inst::Jump(merge_block_id));
             }
+            // Restore for else block
+            self.allocas.truncate(saved_allocas_len);
+            self.alloca_types.truncate(saved_alloca_types_len);
+            self.var_ast_types.truncate(saved_var_ast_types_len);
+            self.current_func.locals.truncate(saved_locals_len);
+
+            // Else block
             Lowerer_set_current_block(self, else_block_id);
             match else_block {
                 OptStmts::Some(else_stmts) => { Lowerer_lower_stmts(self, else_stmts); }
@@ -2166,6 +2184,12 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
             if !Lowerer_current_block_has_terminator(self) {
                 Lowerer_emit_terminator(self, Inst::Jump(merge_block_id));
             }
+            // Restore for merge block
+            self.allocas.truncate(saved_allocas_len);
+            self.alloca_types.truncate(saved_alloca_types_len);
+            self.var_ast_types.truncate(saved_var_ast_types_len);
+            self.current_func.locals.truncate(saved_locals_len);
+
             Lowerer_set_current_block(self, merge_block_id);
         }
         Stmt::While(cond, body, _line) => {
@@ -2952,6 +2976,12 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
 
             Lowerer_emit_terminator(self, Inst::Branch(cond_val, then_block_id, else_block_id));
 
+            // Save variable binding lengths so then/else-local bindings don't leak
+            var saved_allocas_len: i64 = self.allocas.len();
+            var saved_alloca_types_len: i64 = self.alloca_types.len();
+            var saved_var_ast_types_len: i64 = self.var_ast_types.len();
+            var saved_locals_len: i64 = self.current_func.locals.len();
+
             // Then block
             Lowerer_set_current_block(self, then_block_id);
             var then_result: i64 = 0;
@@ -2966,6 +2996,11 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             if !Lowerer_current_block_has_terminator(self) {
                 Lowerer_emit_terminator(self, Inst::Jump(merge_block_id));
             }
+            // Restore for else block
+            self.allocas.truncate(saved_allocas_len);
+            self.alloca_types.truncate(saved_alloca_types_len);
+            self.var_ast_types.truncate(saved_var_ast_types_len);
+            self.current_func.locals.truncate(saved_locals_len);
 
             // Else block
             Lowerer_set_current_block(self, else_block_id);
@@ -2986,6 +3021,11 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             if !Lowerer_current_block_has_terminator(self) {
                 Lowerer_emit_terminator(self, Inst::Jump(merge_block_id));
             }
+            // Restore for merge block
+            self.allocas.truncate(saved_allocas_len);
+            self.alloca_types.truncate(saved_alloca_types_len);
+            self.var_ast_types.truncate(saved_var_ast_types_len);
+            self.current_func.locals.truncate(saved_locals_len);
 
             // Merge block — add block params for the result
             Lowerer_set_current_block(self, merge_block_id);
@@ -3117,6 +3157,12 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                 var arm_block: i64 = Lowerer_new_block(self);
                 var next_block: i64 = Lowerer_new_block(self);
 
+                // Save variable binding lengths so arm-local bindings don't leak
+                var saved_allocas_len: i64 = self.allocas.len();
+                var saved_alloca_types_len: i64 = self.alloca_types.len();
+                var saved_var_ast_types_len: i64 = self.var_ast_types.len();
+                var saved_locals_len: i64 = self.current_func.locals.len();
+
                 // Check pattern
                 match arm.pattern {
                     Pattern::Wildcard => {
@@ -3231,6 +3277,11 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                         if !Lowerer_current_block_has_terminator(self) {
                             Lowerer_emit_terminator(self, Inst::Jump(merge_block));
                         }
+                        // Restore variable bindings (truncate arm-local additions)
+                        self.allocas.truncate(saved_allocas_len);
+                        self.alloca_types.truncate(saved_alloca_types_len);
+                        self.var_ast_types.truncate(saved_var_ast_types_len);
+                        self.current_func.locals.truncate(saved_locals_len);
                         Lowerer_set_current_block(self, next_block);
                         i = i + 1;
                         continue;
@@ -3251,6 +3302,11 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                 if !Lowerer_current_block_has_terminator(self) {
                     Lowerer_emit_terminator(self, Inst::Jump(merge_block));
                 }
+                // Restore variable bindings (truncate arm-local additions)
+                self.allocas.truncate(saved_allocas_len);
+                self.alloca_types.truncate(saved_alloca_types_len);
+                self.var_ast_types.truncate(saved_var_ast_types_len);
+                self.current_func.locals.truncate(saved_locals_len);
 
                 Lowerer_set_current_block(self, next_block);
                 i = i + 1;
@@ -3436,6 +3492,10 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             var closure_func: Func = Func_new_full(closure_name, params, inferred_ret_ty, body, false);
 
             // Save current function context
+            // Note: Lowerer_lower_func assigns NEW Vecs to self.allocas etc.
+            // (it doesn't mutate in place), so pointer-copy save/restore works
+            // here. But we need to save self.current_func because lower_func
+            // replaces it with the closure's function and moves it to the module.
             var saved_func: IrFunction = self.current_func;
             var saved_has_func: bool = self.has_current_func;
             var saved_allocas: Vec<StringValueIdEntry> = self.allocas;
@@ -4131,6 +4191,15 @@ pub fn Lowerer_lower_match(self: &mut Lowerer, expr: Expr, arms: Vec<MatchArm>) 
         var arm_block: i64 = Lowerer_new_block(self);
         var next_block: i64 = Lowerer_new_block(self);
 
+        // Save variable binding lengths so arm-local bindings don't leak
+        // into other arms or code after the match. Fides Vec is a reference
+        // type (PVec*), so we use truncate-based save/restore instead of
+        // pointer-copy assignment.
+        var saved_allocas_len: i64 = self.allocas.len();
+        var saved_alloca_types_len: i64 = self.alloca_types.len();
+        var saved_var_ast_types_len: i64 = self.var_ast_types.len();
+        var saved_locals_len: i64 = self.current_func.locals.len();
+
         match arm.pattern {
             Pattern::Wildcard => {
                 Lowerer_emit_terminator(self, Inst::Jump(arm_block));
@@ -4232,6 +4301,11 @@ pub fn Lowerer_lower_match(self: &mut Lowerer, expr: Expr, arms: Vec<MatchArm>) 
                 if !Lowerer_current_block_has_terminator(self) {
                     Lowerer_emit_terminator(self, Inst::Jump(merge_block));
                 }
+                // Restore variable bindings (truncate arm-local additions)
+                self.allocas.truncate(saved_allocas_len);
+                self.alloca_types.truncate(saved_alloca_types_len);
+                self.var_ast_types.truncate(saved_var_ast_types_len);
+                self.current_func.locals.truncate(saved_locals_len);
                 Lowerer_set_current_block(self, next_block);
                 i = i + 1;
                 continue;
@@ -4244,6 +4318,11 @@ pub fn Lowerer_lower_match(self: &mut Lowerer, expr: Expr, arms: Vec<MatchArm>) 
         if !Lowerer_current_block_has_terminator(self) {
             Lowerer_emit_terminator(self, Inst::Jump(merge_block));
         }
+        // Restore variable bindings (truncate arm-local additions)
+        self.allocas.truncate(saved_allocas_len);
+        self.alloca_types.truncate(saved_alloca_types_len);
+        self.var_ast_types.truncate(saved_var_ast_types_len);
+        self.current_func.locals.truncate(saved_locals_len);
 
         Lowerer_set_current_block(self, next_block);
         i = i + 1;

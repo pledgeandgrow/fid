@@ -312,8 +312,12 @@ fn pe_emitter_all_tests() {
     let tests = discover_tests();
     assert!(!tests.is_empty(), "No .fd test files found in tests/");
 
-    let tmp = PathBuf::from("/tmp/pledge_pe_tests");
-    let _ = fs::create_dir(&tmp);
+    let tmp = if cfg!(windows) {
+        std::env::temp_dir().join("pledge_pe_tests")
+    } else {
+        PathBuf::from("/tmp/pledge_pe_tests")
+    };
+    let _ = fs::create_dir_all(&tmp);
 
     let mut passed = 0;
     let mut failed = 0;
@@ -357,8 +361,14 @@ fn c_codegen_matches_interpreter() {
     let tests = discover_tests();
     assert!(!tests.is_empty(), "No .fd test files found in tests/");
 
-    let tmp = PathBuf::from("/tmp/pledge_c_tests");
-    let _ = fs::create_dir(&tmp);
+    // Use a platform-appropriate temp directory for C codegen test artifacts.
+    // On Windows, /tmp doesn't exist — use the local temp dir or a project-local dir.
+    let tmp = if cfg!(windows) {
+        std::env::temp_dir().join("pledge_c_tests")
+    } else {
+        PathBuf::from("/tmp/pledge_c_tests")
+    };
+    let _ = fs::create_dir_all(&tmp);
 
     let mut matched = 0;
     let mut compile_failed = 0;

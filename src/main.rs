@@ -58,7 +58,9 @@ fn main() {
     // Default is "on" (borrow checking always active unless explicitly disabled).
     // Can appear anywhere in the args.
     // We also filter these flags out of args so command-specific parsing isn't confused.
+    // Also parse --timeout N (wall-clock timeout in seconds; kills process after N seconds).
     let mut filtered_args: Vec<String> = Vec::new();
+    let mut timeout_secs: u64 = 0;
     for a in &args {
         if let Some(val) = a.strip_prefix("--borrowck=") {
             match fidesc::borrowck::BorrowckMode::parse(val) {
@@ -68,9 +70,42 @@ fn main() {
                     process::exit(1);
                 }
             }
+        } else if a == "--timeout" {
+            // Handled below — skip adding to filtered_args
+        } else if let Some(t) = a.strip_prefix("--timeout=") {
+            match t.parse::<u64>() {
+                Ok(secs) => timeout_secs = secs,
+                Err(_) => {
+                    eprintln!("Invalid --timeout value '{}'. Use seconds (e.g. --timeout 30).", t);
+                    process::exit(1);
+                }
+            }
+        } else if let Some(t) = filtered_args.last().and_then(|s| {
+            if s == "--timeout" { Some(s.as_str()) } else { None }
+        }) {
+            // Previous arg was "--timeout", this is the value
+            match a.parse::<u64>() {
+                Ok(secs) => timeout_secs = secs,
+                Err(_) => {
+                    eprintln!("Invalid --timeout value '{}'. Use seconds (e.g. --timeout 30).", a);
+                    process::exit(1);
+                }
+            }
+            // Remove the "--timeout" we already added
+            filtered_args.pop();
         } else {
             filtered_args.push(a.clone());
         }
+    }
+
+    // If --timeout N was specified, spawn a watcher thread that kills the process
+    // after N seconds. This prevents hanging compilation or execution.
+    if timeout_secs > 0 {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
+            eprintln!("\nTimeout: process exceeded {} seconds. Killing.", timeout_secs);
+            process::exit(124); // 124 = timeout exit code (like GNU `timeout`)
+        });
     }
     let args: Vec<String> = filtered_args;
 
@@ -353,7 +388,7 @@ fn main() {
 
         "run" => {
             if args.len() < 3 {
-                eprintln!("Usage: fidesc run <file.fd> [-v] [--release] [--post-mortem] [--max-recursion N] [--trace]");
+                eprintln!("Usage: fidesc run <file.fd> [-v] [--release] [--post-mortem] [--max-recursion N] [--max-steps N] [--max-memory N] [--timeout N] [--trace]");
                 process::exit(1);
             }
             let input = &args[2];
@@ -366,6 +401,17 @@ fn main() {
                 .and_then(|i| args.get(i + 1))
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(1000);
+            // --max-steps N (default 0 = unlimited). Prevents infinite loops.
+            let max_steps = args.iter().position(|a| a == "--max-steps")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            // --max-memory N (in MB, default 0 = unlimited). Prevents OOM kills.
+            let max_memory = args.iter().position(|a| a == "--max-memory")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|mb| mb * 1024 * 1024) // Convert MB to bytes
+                .unwrap_or(0);
             let source = match fs::read_to_string(input) {
                 Ok(s) => s,
                 Err(e) => {
@@ -416,7 +462,7 @@ fn main() {
                 }
             }
 
-            match compiler::interpret_source_traced(&source, input, verbose, release, max_recursion, trace) {
+            match compiler::interpret_source_traced_full2(&source, input, verbose, release, max_recursion, max_steps, max_memory, trace) {
                 Ok((result, trace)) => {
                     match result {
                         RunResult::Return(val) => {
@@ -1105,7 +1151,7 @@ fn main() {
                         }
                     } else {
                         std::env::var("CC").unwrap_or_else(|_| {
-                            for c in &["gcc", "clang", "cc"] {
+                            for c in &["gcc", "clang", "cc", "tcc"] {
                                 if process::Command::new(c).arg("--version").output().is_ok() {
                                     return c.to_string();
                                 }
@@ -1138,7 +1184,7 @@ fn main() {
                                 .output()
                         }
                     } else {
-                        // gcc/clang: -O2 + security hardening flags -o output c_path
+                        // gcc/clang/tcc: -O2 + security hardening flags -o output c_path
                         // Extract link libraries from the C source (extern "C" link "m")
                         let mut link_libs: Vec<String> = vec!["-lm".to_string()];
                         for line in c_code.lines() {
@@ -1149,30 +1195,50 @@ fn main() {
                                 }
                             }
                         }
+                        // Detect TCC — it doesn't support many gcc hardening flags
+                        let is_tcc = cc == "tcc" || cc.ends_with("tcc.exe")
+                            || process::Command::new(&cc).arg("-v").output()
+                                .map(|o| String::from_utf8_lossy(&o.stderr).contains("tcc"))
+                                .unwrap_or(false);
                         let mut cmd = process::Command::new(&cc);
-                        cmd.arg("-O2")
-                            // Fides FFI uses i64 for all handle types (FILE*, DIR*, etc.)
-                            // and struct pointers are passed as int64_t values.
-                            // Safe on x86-64 where pointers are 8 bytes.
-                            .arg("-Wno-int-conversion")
-                            .arg("-Wno-incompatible-pointer-types")
-                            // Security hardening flags — defense in depth
-                            // even though Fides prevents most exploits at compile time.
-                            // -D_FORTIFY_SOURCE=2 requires _GNU_SOURCE or optimization,
-                            // and some generated C code triggers fortify false positives,
-                            // so we use -U_FORTIFY_SOURCE to disable it for generated code.
-                            .arg("-fstack-protector-strong")  // stack canaries
-                            .arg("-fPIE")                     // position-independent code
-                            .arg("-fno-strict-overflow")      // don't assume no overflow
-                            .arg("-fno-strict-aliasing")      // generated code type-puns via pointer casts
-                            .arg("-o").arg(&output).arg(&c_path);
-                        // Linker security flags
-                        cmd.arg("-pie")                     // position-independent executable
-                            .arg("-Wl,-z,relro")             // read-only relocations
-                            .arg("-Wl,-z,now")               // bind now (full RELRO)
-                            .arg("-Wl,-z,noexecstack");      // non-executable stack
-                        for lib in &link_libs {
-                            cmd.arg(lib);
+                        if is_tcc {
+                            // TCC: minimal flags — it doesn't support -fstack-protector,
+                            // -fPIE, -pie, -Wl,-z,relro, etc.
+                            cmd.arg("-O2")
+                                .arg("-Wno-int-conversion")
+                                .arg("-o").arg(&output).arg(&c_path);
+                            // TCC on Windows: math is built-in (no -lm needed).
+                            // Only add -l for libs explicitly marked in PLINK comments.
+                            for lib in &link_libs {
+                                if lib != "-lm" {
+                                    cmd.arg(lib);
+                                }
+                            }
+                        } else {
+                            cmd.arg("-O2")
+                                // Fides FFI uses i64 for all handle types (FILE*, DIR*, etc.)
+                                // and struct pointers are passed as int64_t values.
+                                // Safe on x86-64 where pointers are 8 bytes.
+                                .arg("-Wno-int-conversion")
+                                .arg("-Wno-incompatible-pointer-types")
+                                // Security hardening flags — defense in depth
+                                // even though Fides prevents most exploits at compile time.
+                                // -D_FORTIFY_SOURCE=2 requires _GNU_SOURCE or optimization,
+                                // and some generated C code triggers fortify false positives,
+                                // so we use -U_FORTIFY_SOURCE to disable it for generated code.
+                                .arg("-fstack-protector-strong")  // stack canaries
+                                .arg("-fPIE")                     // position-independent code
+                                .arg("-fno-strict-overflow")      // don't assume no overflow
+                                .arg("-fno-strict-aliasing")      // generated code type-puns via pointer casts
+                                .arg("-o").arg(&output).arg(&c_path);
+                            // Linker security flags
+                            cmd.arg("-pie")                     // position-independent executable
+                                .arg("-Wl,-z,relro")             // read-only relocations
+                                .arg("-Wl,-z,now")               // bind now (full RELRO)
+                                .arg("-Wl,-z,noexecstack");      // non-executable stack
+                            for lib in &link_libs {
+                                cmd.arg(lib);
+                            }
                         }
                         cmd.output()
                     };
@@ -1497,8 +1563,9 @@ fn main() {
 
                 // Interpreter — a test "passes" if it doesn't panic.
                 // The exit code may be non-zero (e.g. `ret 42` exits with 42).
+                // Use --max-steps to prevent infinite loops from hanging the test suite.
                 let interp_out = process::Command::new(&current_exe)
-                    .args(["run", test_file])
+                    .args(["run", test_file, "--max-steps", "50000000"])
                     .output();
                 let interp_ok = interp_out
                     .as_ref()
@@ -1540,8 +1607,12 @@ fn main() {
                     }
                 }
 
-                // C codegen
-                let c_exe = format!("/tmp/{}_test_c.exe", name);
+                // C codegen — use a platform-appropriate temp path
+                let c_exe = if cfg!(windows) {
+                    format!("{}\\{}_test_c.exe", std::env::temp_dir().to_string_lossy(), name)
+                } else {
+                    format!("/tmp/{}_test_c.exe", name)
+                };
                 let _ = fs::remove_file(&c_exe);
                 let c_compile = process::Command::new(&current_exe)
                     .args(["ccompile", test_file, "-o", &c_exe])
@@ -1593,8 +1664,12 @@ fn main() {
                     }
                 }
 
-                // PE emitter
-                let pe_exe = format!("/tmp/{}_test_pe.exe", name);
+                // PE emitter — use a platform-appropriate temp path
+                let pe_exe = if cfg!(windows) {
+                    format!("{}\\{}_test_pe.exe", std::env::temp_dir().to_string_lossy(), name)
+                } else {
+                    format!("/tmp/{}_test_pe.exe", name)
+                };
                 let _ = fs::remove_file(&pe_exe);
                 let pe_out = process::Command::new(&current_exe)
                     .args(["emit", test_file, "-o", &pe_exe])
@@ -2404,17 +2479,29 @@ fn main() {
 
             if use_ccompile {
                 // Compile to native binary, then run it N times
-                let tmp_bin = "/tmp/fidesc_bench_bin";
+                let tmp_bin = if cfg!(windows) {
+                    format!("{}\\fidesc_bench_bin.exe", std::env::temp_dir().to_string_lossy())
+                } else {
+                    "/tmp/fidesc_bench_bin".to_string()
+                };
                 match compiler::ccompile_source_with_path(&source, input) {
                     Ok(c_code) => {
-                        // Write C code and compile with gcc
-                        let c_file = "/tmp/fidesc_bench.c";
-                        if let Err(e) = fs::write(c_file, &c_code) {
+                        // Write C code and compile with available C compiler
+                        let c_file = if cfg!(windows) {
+                            format!("{}\\fidesc_bench.c", std::env::temp_dir().to_string_lossy())
+                        } else {
+                            "/tmp/fidesc_bench.c".to_string()
+                        };
+                        if let Err(e) = fs::write(&c_file, &c_code) {
                             eprintln!("Error writing C file: {}", e);
                             process::exit(1);
                         }
-                        let cc_status = std::process::Command::new("gcc")
-                            .args(["-O2", "-fno-strict-aliasing", "-w", "-o", tmp_bin, c_file, "-lm", "-lpthread"])
+                        // Find available C compiler (tcc on Windows, gcc on Linux)
+                        let cc = std::env::var("CC").unwrap_or_else(|_| {
+                            if cfg!(windows) { "tcc".to_string() } else { "gcc".to_string() }
+                        });
+                        let cc_status = std::process::Command::new(&cc)
+                            .args(["-O2", "-fno-strict-aliasing", "-w", "-o", &tmp_bin, &c_file])
                             .stdout(std::process::Stdio::null())
                             .stderr(std::process::Stdio::null())
                             .status();
@@ -2435,7 +2522,7 @@ fn main() {
                 let mut times: Vec<f64> = Vec::with_capacity(n);
                 for _ in 0..n {
                     let start = std::time::Instant::now();
-                    let status = std::process::Command::new(tmp_bin)
+                    let status = std::process::Command::new(&tmp_bin)
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
                         .status();

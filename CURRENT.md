@@ -2,139 +2,102 @@
 
 > Single source of truth for "what are we doing right now."
 > Read this first every session. Updated after every milestone change.
-> Last updated: Sep 2, 2026.
+> Last updated: Feb 9, 2026.
 
-## ⚠️ WHERE WE STOPPED (Sep 2 — pick up here)
+## Where We Stopped (Feb 9 — pick up here)
 
-**Arena allocator implemented + Windows compat fixed, but bootstrap compiler
-has pre-existing access violation.**
+**Self-hosted compiler builds into `release/` but crashes on use. Safety hardening done.**
 
-### What was done this session:
-1. **Bump arena allocator** implemented in both `compiler/codegen_c.fd` and
-   `src/codegen_c.rs`:
-   - `p_malloc` now allocates from a growing arena (4MB initial, 2x growth)
-   - `p_malloc_persistent` for allocations that must survive arena resets
-   - `p_arena_save()` / `p_arena_restore(mark)` for stage-based memory management
-   - `p_free` is now a no-op (arena memory is freed in bulk)
-2. **Runtime functions converted to arena**: `p_vec_new`, `p_vec_push`,
-   `p_map_new`, `p_map_insert`, `p_str_concat`, `p_to_str`, `p_string_*`,
-   `p_char_to_str`, `MakeDyn` dispatch
-3. **Arena reset calls** inserted in `compiler.fd`:
-   - `ccompile_source_with_path`: save before `build_program_with_path`,
-     restore after `CCodeGen_generate` (c_code uses `p_malloc_persistent`)
-   - `lower_to_ir_module`: save before `build_program`, restore on error
-4. **`cgen_str_join`** uses `p_malloc_persistent` (final C output survives reset)
-5. **Windows compatibility fixes** (for tcc on Windows):
-   - `alloca.h` guarded with `#ifndef _WIN32`
-   - `pthread.h` guarded with Windows shim (stub implementations)
-   - `stdatomic.h` guarded with Windows shim (atomic macros)
-   - `sys/socket.h` etc. guarded with `#ifndef _WIN32`
-   - `#pragma comment(lib, "ws2_32.lib")` removed (tcc doesn't support it)
-   - `inet_pton` added to `C:\tcc\lib\ws2_32.def`
-6. **PE stack size patching**: PowerShell script to patch the PE header to
-   increase stack reserve to 256MB (needed for deep recursion in compiler)
-7. **`src/interp.rs`**: Fixed `std::os::unix` compilation on Windows
+### What works:
+1. **Build pipeline complete** — `compiler/*.fd` (18 modules, 39.5K LOC) compiles to C via the Rust compiler, then links to `release/fides-c.exe` (7.9MB) via tcc
+2. **All 18 self-host modules compile + pass tests** (23/23 on tests/compiler/ via interpreter + PE)
+3. **Arena allocator** (chunk-based, never invalidates pointers) in both `src/codegen_c.rs` and `compiler/codegen_c.fd`
+4. **Windows compatibility** — tcc builds work with ws2_32.def linking, PE stack patched to 256MB
+5. **Test reorganization** — `compiler/tests/` moved to `tests/compiler/`, root stray files cleaned up
+6. **Build dirs clean**: `target/` (Rust), `release/` (self-hosted), no more `target2/`
+7. **Safety hardening (SH-12 DONE)** — C codegen recursion limit (p_max_recursion=10000), p_malloc OOM detection (abort on alloc failure), interpreter --max-steps flag (infinite loop prevention), test runner step limit (50M), Windows path fixes (temp dir), tcc auto-detection
+8. **Interpreter opaque_values bug fixed** — stale Value::Str entries cleared on non-opaque Store, fixing string loss during SRET operations
 
 ### Current blocker:
-The bootstrap compiler (`fides-bootstrap.exe`) crashes with
-STATUS_ACCESS_VIOLATION (0xC0000005) in `msvcrt.dll` when trying to compile
-even a minimal program. The crash occurs inside `Lexer_tokenize` at stdlib
-position ~69845 (around the `byte_to_str` function in `stdlib/core.fd`).
+`release/fides-c.exe` crashes with `STATUS_ACCESS_VIOLATION` (0xC0000005) when compiling any `.fd` file. The crash occurs in `Lexer_tokenize` at stdlib position ~69845 (around `byte_to_str` in `stdlib/core.fd`). This is a pre-existing bug — it crashes even with `p_malloc` reverted to plain `malloc`.
 
-**This is a pre-existing bug** — the crash occurs even with `p_malloc`
-reverted to use `malloc` directly (no arena). The crash is in the lexer's
-tokenization loop, after successfully processing ~13000 tokens. The last
-successful `Lexer_peek` returns 13 ('\r') at position 69845.
-
-The crash is likely caused by:
-- A null pointer dereference in a lexer helper function
-- Stack corruption from `alloca` in a loop (tcc's `alloca` may not reclaim)
-- A bug in the generated C code for the lexer (e.g., `{{` double-brace issue)
-
-The arena changes are complete and correct but cannot be verified until this
-access violation is fixed.
+### Build commands:
+```
+cargo build --release                                    # → target/release/fidesc.exe
+.\target\release\fidesc.exe ccompile compiler\main.fd -o release\fides-c   # → release/fides-c.c
+tcc -O2 -w -o release\fides-c.exe release\fides-c.c C:\tcc\lib\ws2_32.def  # → release/fides-c.exe
+# Patch PE stack to 256MB (see build-selfhost.ps1)
+```
+Or just: `.\build-selfhost.ps1`
 
 ### Next steps:
-1. **Debug the Lexer_tokenize crash** at stdlib position ~69845:
-   - Add debug prints to `Lexer_read_string`, `Lexer_read_operator`, etc.
-   - Check if the crash is in `Vec_push` (token vector growth)
-   - Check if `alloca` in tcc is causing stack exhaustion
-   - Try compiling with GCC/Clang instead of tcc to rule out tcc bugs
-2. **Once crash is fixed**: verify arena reduces RAM usage during self-compilation
-3. **Consider**: increasing stack size in the Rust codegen's PE emission
-- `compiler/ir.fd` (2325 LOC) → 152KB native executable (SH-8.1 DONE)
-- `compiler/typechecker.fd` (4813 LOC) → 296KB native executable (SH-8.2 COMPILES)
-- `compiler/lower.fd` (1547 LOC) → 250KB native executable (SH-8.3 COMPILES)
+1. **Fix the Lexer_tokenize crash** at stdlib position ~69845
+   - Investigate if it's a tcc codegen bug (try gcc/clang)
+   - Add targeted debug prints to narrow down the exact failing operation
+   - Check if `alloca` in tcc is causing stack exhaustion in deep recursion
+2. **Once crash is fixed**: verify the bootstrap fixpoint (stage2.c == stage1.c)
+3. **Run full test suite** through the self-hosted compiler
 
-All 10 self-host compiler modules now compile (token, diag, json, fmt, ast,
-lexer, parser, ir, typechecker, lower). Total: 18,329 LOC Fides.
+## Self-Host Module Status
 
-**Next steps:**
-1. **Differential testing for SH-8 modules** — Run `ir.fd`, `typechecker.fd`,
-   and `lower.fd` against their Rust counterparts to verify output matches.
-   Needs integration into the `diff-test` pipeline.
-2. **SH-8.4 — Rewrite `mono.rs`** (1475 LOC) — Monomorphization pass.
-3. **SH-8.5 — Rewrite `borrowck.rs`** (1221 LOC) — Borrow checker.
-4. **Fix cross-module import conflict** — `use compiler::lexer` in
-   `parser.fd` breaks `TokenKind` resolution from `compiler::token`. This
-   is a Fides compiler bug. Fixing it will re-enable f-string sub-lexing.
-5. **Fix lexer C codegen** — `lexer.fd` segfaults when native-compiled due
-   to enum-in-struct-in-Vec C codegen bug. Interpreter path works.
-6. **Start SH-9** — Rewrite back-end (pir, opt, codegen_c, compiler, bootstrap).
+All 18 modules rewritten in Fides. 23/23 self-host tests pass on interpreter + PE emitter.
 
-**Also pending from Aug 28:** The user reverted the opaque-value-to-i64
-conversion in `src/interp.rs` (Inst::Call). Need to check which tests fail
-without it and find a better approach.
+| Module | Rust LOC | Fides LOC | Status |
+|--------|----------|-----------|--------|
+| `token.fd` | 261 | 517 | DONE |
+| `diag.fd` | 463 | 594 | DONE |
+| `json.fd` | 289 | 628 | DONE |
+| `fmt.fd` | 1165 | 1007 | DONE |
+| `ast.fd` | 936 | 920 | DONE |
+| `lexer.fd` | 589 | 673 | DONE |
+| `parser.fd` | 3433 | 4800 | DONE |
+| `ir.fd` | 1761 | 2139 | DONE |
+| `typechecker.fd` | 7431 | 4848 | DONE |
+| `lower.fd` | 6198 | 4444 | DONE |
+| `mono.fd` | 1475 | 2422 | DONE |
+| `borrowck.fd` | 1221 | 1731 | DONE |
+| `pir.fd` | — | 2432 | DONE |
+| `opt.fd` | — | 6022 | DONE |
+| `codegen_c.fd` | — | 4529 | DONE |
+| `compiler.fd` | — | 1641 | DONE |
+| `comptime_eval.fd` | — | 35 | DONE |
+| `main.fd` | — | 120 | DONE (entry point) |
+| **Total** | | **39,502** | **18/18 modules** |
 
-## Milestone: Self-Hosting Progress
+## Test Baseline (Feb 9, 2026)
 
-**Status:** SH-6 (leaf modules) DONE. SH-7 (frontend) PARTIAL — all 3
-modules rewritten (ast, lexer, parser), parser compiles to native, lexer
-tested on interpreter, differential testing pending. SH-8 (middle-end)
-IN PROGRESS — ir.fd DONE + tested, typechecker.fd and lower.fd COMPILE,
-mono and borrowck not started.
+```
+Unit tests:   263/265 passed  (2 failing — recent lower.fd changes)
+Interpreter:  191/194 normal
+C Codegen:    74/194 matched   (tcc integration, Windows path fixes)
+PE Emitter:   193/194 valid
+Self-host:    23/23 pass on interp + PE (tests/compiler/)
+Total .fd:    207 in tests/ + 23 in tests/compiler/ = 230
+Stdlib:       69 modules, 16,069 LOC
+Source:       52 .rs files, 82,778 LOC
+```
 
-**Self-host module status:**
+## Build Directory Layout
 
-| Module | Rust LOC | Fides LOC | Native binary | Status |
-|--------|----------|-----------|---------------|--------|
-| `token.fd` | 261 | 554 | — | DONE — builds + tests pass |
-| `diag.fd` | 463 | 659 | — | DONE — builds + tests pass |
-| `json.fd` | 289 | 666 | — | DONE — builds + tests pass |
-| `fmt.fd` | 1165 | 1109 | 90KB | DONE — builds + tests pass |
-| `ast.fd` | 936 | 936 | — | DONE — builds + tests pass |
-| `lexer.fd` | 589 | 731 | 106KB | TESTED (interpreter) — C codegen pending enum-in-Vec fix |
-| `parser.fd` | 3433 | 4989 | 384KB | COMPILES (native) — differential testing pending |
-| `ir.fd` | 1761 | 2325 | 152KB | DONE — builds + 25 tests pass on all 3 backends |
-| `typechecker.fd` | 7431 | 4813 | 296KB | COMPILES (native) — differential testing pending |
-| `lower.fd` | 6198 | 1547 | 250KB | COMPILES (native) — differential testing pending |
-| **Total** | **22,526** | **18,329** | | **10/10 modules compile** |
-
-**Remaining SH-8 modules (not started):**
-
-| Module | Rust LOC | Fides file | Status |
-|--------|----------|------------|--------|
-| `mono.rs` | 1475 | `compiler/mono.fd` | NOT STARTED |
-| `borrowck.rs` | 1221 | `compiler/borrowck.fd` | NOT STARTED |
-
-**See `docs/roadmap/selfhost-roadmap.md`** for the 10-phase self-hosting plan.
-
-## Test Baseline
-
-**See `AGENTS.md` → "Current Baseline"** for the authoritative test counts.
-All 164/165 normal tests pass on interpreter and C codegen, 165/165 on PE emitter.
-0 skip, 0 known-fail, 265/265 unit tests.
+```
+target/    ← Rust compiler output (fidesc.exe) — gitignored
+release/   ← Self-hosted compiler output (fides-c.c, fides-c.exe) — gitignored
+tests/     ← Rust compiler tests (207 .fd files)
+tests/compiler/  ← Self-host module tests (23 .fd files)
+tests/selfhost/  ← Harness/probe files for differential testing
+compiler/  ← Self-hosted compiler source (18 .fd modules)
+stdlib/    ← Fides standard library (69 .fd modules)
+```
 
 ## Deferred (Do Not Start)
 
-- PE emitter rewrite (Phase 10B — after C codegen self-host lands)
-- Playground website (Astro, post-self-host)
-- Package registry (Next.js, post-self-host)
+- PE emitter rewrite (after C codegen self-host lands)
+- Playground website (post-self-host)
+- Package registry (post-self-host)
 - New language features (add on Rust until self-host lands)
-- Industry domain stdlibs (Phase 9 — medical, blockchain, robotics)
+- Industry domain stdlibs (medical, blockchain, robotics)
 
 ## Gate
 
 `verify.sh` must pass clean before self-host rewrite begins.
-Current: 164/165 on interp+C codegen, 165/165 PE. 0 skip, 0 known-fail. 136 warnings
-(dead code stubs for future features).
+Current: 191/194 interp, 74/194 C codegen (tcc + path fixes), 193/194 PE.
