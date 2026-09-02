@@ -1,8 +1,8 @@
 #!/bin/bash
-# verify-selfhost.sh — Self-hosting compiler component verification
+# verify-selfhost.sh â€” Self-hosting compiler component verification
 #
 # Usage:
-#   ./verify-selfhost.sh              Run all compiler/tests/*.fd on 3 backends, diff vs baseline
+#   ./verify-selfhost.sh              Run all tests/compiler/*.fd on 3 backends, diff vs baseline
 #   ./verify-selfhost.sh --save       Run all tests, save results as new baseline
 #   ./verify-selfhost.sh --quick      Build only (no tests)
 #   ./verify-selfhost.sh --verbose    Show test output (always shown on failure)
@@ -10,14 +10,14 @@
 #   ./verify-selfhost.sh --help       Show this help
 #
 # This script is separate from verify.sh:
-#   verify.sh            → tests/        (tests for the Rust compiler in src/)
-#   verify-selfhost.sh   → compiler/tests/ (tests for self-hosted Fides components in compiler/)
+#   verify.sh            â†’ tests/          (tests for the Rust compiler in src/)
+#   verify-selfhost.sh   â†’ tests/compiler/ (tests for self-hosted Fides components in compiler/)
 #
 # The self-host tests verify that Fides modules rewritten from Rust (token.fd,
 # diag.fd, json.fd, fmt.fd, ast.fd, lexer.fd, parser.fd, ...) produce correct
 # output on all 3 backends: interpreter, C codegen, and PE emitter.
 #
-# Each test file in compiler/tests/ is a standalone Fides program that imports
+# Each test file in tests/compiler/ is a standalone Fides program that imports
 # the module under test and runs assertions. A test passes if it exits 0 and
 # prints "All tests passed!" (or similar success message).
 
@@ -32,8 +32,8 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 FIDESC="./target/release/fidesc"
-TEST_DIR="compiler/tests"
-BASELINE_DIR="compiler/tests/baseline"
+TEST_DIR="tests/compiler"
+BASELINE_DIR="tests/compiler/baseline"
 BASELINE_FILE="$BASELINE_DIR/test_results.txt"
 
 # Temp file for capturing test output (shown on failure)
@@ -49,21 +49,21 @@ done
 # --- Help ---
 if [[ "$1" == "--help" || "$1" == "-h" ]]; then
     cat <<'EOF'
-verify-selfhost.sh — Self-hosting compiler component verification
+verify-selfhost.sh â€” Self-hosting compiler component verification
 
 Commands:
-  (default)  Build release + run all compiler/tests/*.fd on 3 backends, diff vs baseline
+  (default)  Build release + run all tests/compiler/*.fd on 3 backends, diff vs baseline
   --save     Build release + run all tests, save results as new baseline
   --quick    Build release only (no tests)
   --verbose  Show test output even for passing tests (always shown on failure)
   --list     List all self-host test files
   --help     This help message
 
-Baseline is stored in compiler/tests/baseline/test_results.txt
+Baseline is stored in tests/compiler/baseline/test_results.txt
 
 Test suites:
-  verify.sh            → tests/          (Rust compiler in src/)
-  verify-selfhost.sh   → compiler/tests/ (self-hosted Fides components in compiler/)
+  verify.sh            â†’ tests/          (Rust compiler in src/)
+  verify-selfhost.sh   â†’ tests/compiler/ (self-hosted Fides components in compiler/)
 
 Backends tested:
   1. Interpreter   (fidesc run)
@@ -271,7 +271,7 @@ echo "$CURRENT_SUMMARY"
 echo ""
 
 if [[ "$CURRENT_FAILS" == "$BASELINE_FAILS" ]]; then
-    echo -e "${GREEN}✓ No regressions — same failures as baseline${NC}"
+    echo -e "${GREEN}âœ“ No regressions â€” same failures as baseline${NC}"
     exit 0
 else
     # Show new failures (in current but not baseline)
@@ -299,10 +299,10 @@ else
         echo -e "${RED}REGRESSIONS (new failures):${NC}"
         echo -e "$NEW_FAILS"
         echo ""
-        echo -e "${RED}⚠  Regressions detected! Fix these before saving a new baseline.${NC}"
+        echo -e "${RED}âš   Regressions detected! Fix these before saving a new baseline.${NC}"
         exit 1
     else
-        echo -e "${GREEN}✓ No regressions — some tests fixed!${NC}"
+        echo -e "${GREEN}âœ“ No regressions â€” some tests fixed!${NC}"
         echo -e "${YELLOW}Run ./verify-selfhost.sh --save to update the baseline.${NC}"
         exit 0
     fi

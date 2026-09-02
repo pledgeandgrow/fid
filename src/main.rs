@@ -687,19 +687,31 @@ fn main() {
                 }
             }
         }
-        // SH-2: diff-test — differential testing against golden files.
-        // Usage: fidesc diff-test <file.fd> --stage <tokens|ast|ir|pir1|pir2|pir3|c|output>
-        // Compares current output to golden file in tests/golden/<name>/<name>.<ext>
+        // SH-2: diff-test — differential testing: Rust compiler vs Fides compiler.
+        // Default mode: runs the Rust compiler stage and the Fides harness, compares output.
+        // Golden mode (--golden): compares Rust compiler output to golden file.
+        //
+        // Usage: fidesc diff-test <file.fd> --stage <stage> [--golden] [--update]
+        // Stages: tokens, ast, ir, pir1, pir2, pir3, c, output
+        //
+        // Stage → Fides harness mapping (selfhost mode):
+        //   tokens → tests/selfhost/test_lexer_harness.fd
+        //   ast    → tests/selfhost/test_parser_harness.fd  (uses dump-ast-flat format)
+        //   ir     → tests/selfhost/test_lower_harness.fd
+        //   output → fidesc run <file.fd> (both sides use the Rust interpreter)
         "diff-test" => {
             if args.len() < 3 {
-                eprintln!("Usage: fidesc diff-test <file.fd> --stage <stage>");
+                eprintln!("Usage: fidesc diff-test <file.fd> --stage <stage> [--golden] [--update]");
                 eprintln!("Stages: tokens, ast, ir, pir1, pir2, pir3, c, output");
-                eprintln!("Optional: --update  (overwrite golden file with current output)");
+                eprintln!("Default: compare Rust compiler vs Fides harness output");
+                eprintln!("  --golden  compare Rust output to golden file (old behavior)");
+                eprintln!("  --update  overwrite golden file with current Rust output");
                 process::exit(1);
             }
             let input = &args[2];
             let mut stage: Option<&str> = None;
             let mut update_golden = false;
+            let mut use_golden = false;
             let mut i = 3;
             while i < args.len() {
                 match args[i].as_str() {
@@ -711,6 +723,9 @@ fn main() {
                     }
                     "--update" => {
                         update_golden = true;
+                    }
+                    "--golden" => {
+                        use_golden = true;
                     }
                     _ => {}
                 }
@@ -733,21 +748,29 @@ fn main() {
                 }
             };
 
-            let test_name = std::path::Path::new(input)
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let golden_dir = format!("tests/golden/{}", test_name);
-            let (golden_ext, current_output): (&str, String) = match stage {
-                "tokens" => ("tokens", {
+            // ── Rust compiler output ──────────────────────────────────────────
+            // For selfhost mode, the `ast` stage uses flat format to match the
+            // parser harness. For golden mode, it uses S-expr format (old behavior).
+            let rust_output: String = match stage {
+                "tokens" => {
                     let mut s = String::new();
                     for tok in compiler::lex(&source) {
                         s.push_str(&format!("{}\n", tok));
                     }
                     s
-                }),
-                "ast" => ("ast", {
+                }
+                "ast" if !use_golden => {
+                    // Selfhost mode: use flat format to match parser harness
+                    match compiler::parse_to_ast_flat_raw(&source) {
+                        Ok(ast) => format!("{}\n", ast),
+                        Err(e) => {
+                            eprintln!("Rust parse error: {}", e);
+                            process::exit(1);
+                        }
+                    }
+                }
+                "ast" => {
+                    // Golden mode: S-expr format (old behavior)
                     match compiler::parse_to_ast(&source) {
                         Ok(ast) => format!("{}\n", ast),
                         Err(e) => {
@@ -755,8 +778,8 @@ fn main() {
                             process::exit(1);
                         }
                     }
-                }),
-                "ir" => ("ir", {
+                }
+                "ir" => {
                     match compiler::lower_to_ir(&source) {
                         Ok(ir) => format!("{}\n", ir),
                         Err(errors) => {
@@ -764,14 +787,9 @@ fn main() {
                             process::exit(1);
                         }
                     }
-                }),
+                }
                 "pir1" | "pir2" | "pir3" => {
                     let level_num: u32 = stage[3..].parse().unwrap_or(0);
-                    let ext_str: &'static str = match level_num {
-                        1 => "pir_l1",
-                        2 => "pir_l2",
-                        _ => "pir_l3",
-                    };
                     let out = match compiler::lower_to_ir_module(&source) {
                         Ok(module) => {
                             let l1 = pir::lower_ir_to_l1(&module);
@@ -792,9 +810,9 @@ fn main() {
                             process::exit(1);
                         }
                     };
-                    (ext_str, format!("{}\n", out))
+                    format!("{}\n", out)
                 }
-                "c" => ("c", {
+                "c" => {
                     match compiler::ccompile_source_traced(&source, input, false) {
                         Ok(c_code) => format!("{}\n", c_code),
                         Err(errors) => {
@@ -802,9 +820,8 @@ fn main() {
                             process::exit(1);
                         }
                     }
-                }),
-                "output" => ("out", {
-                    // Capture stdout by running the program as a subprocess
+                }
+                "output" => {
                     let current_exe = std::env::current_exe().unwrap_or_default();
                     let out = process::Command::new(&current_exe)
                         .args(["run", input])
@@ -816,79 +833,217 @@ fn main() {
                             process::exit(1);
                         }
                     }
-                }),
+                }
                 _ => {
                     eprintln!("Unknown stage: '{}'", stage);
                     eprintln!("Stages: tokens, ast, ir, pir1, pir2, pir3, c, output");
                     process::exit(1);
                 }
             };
-            let golden_path = format!("{}/{}.{}", golden_dir, test_name, golden_ext);
 
-            if update_golden {
-                std::fs::create_dir_all(&golden_dir).ok();
-                std::fs::write(&golden_path, &current_output).ok();
-                println!("Updated golden file: {}", golden_path);
+            // ── Golden mode (old behavior) ────────────────────────────────────
+            if use_golden {
+                let test_name = std::path::Path::new(input)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let golden_dir = format!("tests/golden/{}", test_name);
+                let golden_ext = match stage {
+                    "tokens" => "tokens",
+                    "ast" => "ast",
+                    "ir" => "ir",
+                    "pir1" => "pir_l1",
+                    "pir2" => "pir_l2",
+                    "pir3" => "pir_l3",
+                    "c" => "c",
+                    "output" => "out",
+                    _ => "txt",
+                };
+                let golden_path = format!("{}/{}.{}", golden_dir, test_name, golden_ext);
+
+                if update_golden {
+                    std::fs::create_dir_all(&golden_dir).ok();
+                    std::fs::write(&golden_path, &rust_output).ok();
+                    println!("Updated golden file: {}", golden_path);
+                    return;
+                }
+
+                let golden = match fs::read_to_string(&golden_path) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        eprintln!("No golden file: {}", golden_path);
+                        eprintln!("Run: fidesc diff-test {} --stage {} --golden --update", input, stage);
+                        process::exit(2);
+                    }
+                };
+
+                let normalize_sort = |s: &str| -> String {
+                    let mut lines: Vec<&str> = s.lines().filter(|l| !l.is_empty()).collect();
+                    lines.sort();
+                    lines.join("\n")
+                };
+                let needs_sort = matches!(stage, "ir" | "pir1" | "pir2" | "pir3" | "c");
+                let (norm_current, norm_golden) = if needs_sort {
+                    (normalize_sort(&rust_output), normalize_sort(&golden))
+                } else {
+                    (rust_output.clone(), golden.clone())
+                };
+
+                if norm_current == norm_golden {
+                    println!("{}: {} matches golden ✅", input, stage);
+                } else {
+                    println!("{}: {} DIFFERS from golden ❌", input, stage);
+                    println!();
+                    let diff: Vec<String> = norm_current
+                        .lines()
+                        .zip(norm_golden.lines())
+                        .enumerate()
+                        .filter_map(|(i, (c, g))| {
+                            if c != g {
+                                Some(format!("  line {}: - {} | + {}", i + 1, g, c))
+                            } else {
+                                None
+                            }
+                        })
+                        .take(20)
+                        .collect();
+                    if diff.is_empty() {
+                        let cur_lines: Vec<&str> = norm_current.lines().collect();
+                        let gold_lines: Vec<&str> = norm_golden.lines().collect();
+                        println!("  Line count differs: golden={} vs current={}", gold_lines.len(), cur_lines.len());
+                        let max = cur_lines.len().max(gold_lines.len());
+                        for i in (cur_lines.len().min(gold_lines.len()))..max.min(cur_lines.len().min(gold_lines.len()) + 20) {
+                            let c = cur_lines.get(i).copied().unwrap_or("<missing>");
+                            let g = gold_lines.get(i).copied().unwrap_or("<missing>");
+                            if c != g {
+                                println!("  line {}: - {} | + {}", i + 1, g, c);
+                            }
+                        }
+                    } else {
+                        for d in diff {
+                            println!("{}", d);
+                        }
+                    }
+                    process::exit(1);
+                }
                 return;
             }
 
-            let golden = match fs::read_to_string(&golden_path) {
-                Ok(s) => s,
-                Err(_) => {
-                    eprintln!("No golden file: {}", golden_path);
-                    eprintln!("Run: fidesc diff-test {} --stage {} --update", input, stage);
-                    process::exit(2);
+            // ── Selfhost mode (default): Rust vs Fides harness ────────────────
+            // Map stage to Fides harness file
+            let harness_path: &str = match stage {
+                "tokens" => "tests/selfhost/test_lexer_harness.fd",
+                "ast" => "tests/selfhost/test_parser_harness.fd",
+                "ir" => "tests/selfhost/test_lower_harness.fd",
+                "output" => {
+                    // For output stage, both sides use the Rust interpreter — no harness needed
+                    // The Rust output is already captured above. Compare to itself (trivially passes).
+                    println!("{}: output stage — both sides use Rust interpreter ✅ (trivial)", input);
+                    return;
+                }
+                _ => {
+                    eprintln!("No Fides harness for stage '{}'", stage);
+                    eprintln!("Available selfhost stages: tokens, ast, ir");
+                    eprintln!("Use --golden for golden-file comparison of other stages");
+                    process::exit(1);
                 }
             };
 
-            // Normalize: sort lines for stages with non-deterministic ordering
+            // Check harness file exists
+            if !std::path::Path::new(harness_path).exists() {
+                eprintln!("Harness file not found: {}", harness_path);
+                eprintln!("Create it or use --golden for golden-file comparison");
+                process::exit(1);
+            }
+
+            // Run Fides harness: fidesc run <harness.fd> -- <file.fd>
+            let current_exe = std::env::current_exe().unwrap_or_default();
+            let fides_result = process::Command::new(&current_exe)
+                .args(["run", harness_path, "--", input])
+                .output();
+
+            let fides_output = match fides_result {
+                Ok(o) => {
+                    if !o.status.success() {
+                        eprintln!("Fides harness failed (exit {:?}):", o.status);
+                        eprintln!("stderr: {}", String::from_utf8_lossy(&o.stderr));
+                        // Still use stdout for comparison — harness may print partial output before failing
+                        String::from_utf8_lossy(&o.stdout).to_string()
+                    } else {
+                        String::from_utf8_lossy(&o.stdout).to_string()
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to run Fides harness: {}", e);
+                    process::exit(1);
+                }
+            };
+
+            // Compare Rust output vs Fides output
             let normalize_sort = |s: &str| -> String {
                 let mut lines: Vec<&str> = s.lines().filter(|l| !l.is_empty()).collect();
                 lines.sort();
                 lines.join("\n")
             };
             let needs_sort = matches!(stage, "ir" | "pir1" | "pir2" | "pir3" | "c");
-
-            let (norm_current, norm_golden) = if needs_sort {
-                (normalize_sort(&current_output), normalize_sort(&golden))
+            let (norm_rust, norm_fides) = if needs_sort {
+                (normalize_sort(&rust_output), normalize_sort(&fides_output))
             } else {
-                (current_output.clone(), golden.clone())
+                (rust_output.clone(), fides_output.clone())
             };
 
-            if norm_current == norm_golden {
-                println!("{}: {} matches golden ✅", input, stage);
+            if norm_rust == norm_fides {
+                println!("{}: {} Rust==Fides ✅", input, stage);
             } else {
-                println!("{}: {} DIFFERS from golden ❌", input, stage);
+                println!("{}: {} Rust≠Fides ❌", input, stage);
                 println!();
-                let diff: Vec<String> = norm_current
-                    .lines()
-                    .zip(norm_golden.lines())
-                    .enumerate()
-                    .filter_map(|(i, (c, g))| {
-                        if c != g {
-                            Some(format!("  line {}: - {} | + {}", i + 1, g, c))
-                        } else {
-                            None
-                        }
-                    })
-                    .take(20)
-                    .collect();
-                if diff.is_empty() {
-                    // Length mismatch
-                    let cur_lines: Vec<&str> = norm_current.lines().collect();
-                    let gold_lines: Vec<&str> = norm_golden.lines().collect();
-                    println!("  Line count differs: golden={} vs current={}", gold_lines.len(), cur_lines.len());
-                    let max = cur_lines.len().max(gold_lines.len());
-                    for i in (cur_lines.len().min(gold_lines.len()))..max.min(cur_lines.len().min(gold_lines.len()) + 20) {
-                        let c = cur_lines.get(i).copied().unwrap_or("<missing>");
-                        let g = gold_lines.get(i).copied().unwrap_or("<missing>");
-                        if c != g {
-                            println!("  line {}: - {} | + {}", i + 1, g, c);
-                        }
+                // Show first differences with context
+                let rust_lines: Vec<&str> = norm_rust.lines().collect();
+                let fides_lines: Vec<&str> = norm_fides.lines().collect();
+                println!("  Rust lines: {}, Fides lines: {}", rust_lines.len(), fides_lines.len());
+                println!();
+
+                // Find first differing line
+                let min_len = rust_lines.len().min(fides_lines.len());
+                let mut first_diff = None;
+                for i in 0..min_len {
+                    if rust_lines[i] != fides_lines[i] {
+                        first_diff = Some(i);
+                        break;
                     }
-                } else {
-                    for d in diff {
-                        println!("{}", d);
+                }
+                if first_diff.is_none() && rust_lines.len() != fides_lines.len() {
+                    first_diff = Some(min_len);
+                }
+
+                match first_diff {
+                    Some(idx) => {
+                        let start = idx.saturating_sub(3);
+                        let end = (idx + 5).min(rust_lines.len().max(fides_lines.len()));
+                        println!("  First difference at line {}:", idx + 1);
+                        println!();
+                        for i in start..end {
+                            let r = rust_lines.get(i).copied().unwrap_or("<missing>");
+                            let f = fides_lines.get(i).copied().unwrap_or("<missing>");
+                            if r == f {
+                                println!("    {:>4} | {}", i + 1, r);
+                            } else {
+                                println!("  R {:>4} | {}", i + 1, r);
+                                println!("  F {:>4} | {}", i + 1, f);
+                            }
+                        }
+                        // Count total differences
+                        let diffs: usize = rust_lines.iter()
+                            .zip(fides_lines.iter())
+                            .filter(|(a, b)| a != b)
+                            .count();
+                        let len_diff = (rust_lines.len() as isize - fides_lines.len() as isize).unsigned_abs();
+                        println!();
+                        println!("  Total: {} differing lines, {} length difference", diffs, len_diff);
+                    }
+                    None => {
+                        println!("  Outputs are identical after normalization but differ in raw form (trailing whitespace?)");
                     }
                 }
                 process::exit(1);
@@ -1258,8 +1413,8 @@ fn main() {
                     }
                 }
             }
-            // Also scan compiler/tests/ — self-hosted compiler module tests (SH-6)
-            if let Ok(entries) = fs::read_dir("compiler/tests") {
+            // Also scan tests/compiler/ — self-hosted compiler module tests (SH-6)
+            if let Ok(entries) = fs::read_dir("tests/compiler") {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.extension().map_or(false, |e| e == "fd") {
@@ -2546,7 +2701,7 @@ fn print_usage() {
     eprintln!("  fidesc dump-ir     <file.fd>              Show IR (dump-* alias)");
     eprintln!("  fidesc dump-pir    <file.fd> [1|2|3|all]  Show PIR (dump-* alias)");
     eprintln!("  fidesc dump-c      <file.fd>              Show generated C source");
-    eprintln!("  fidesc diff-test <file.fd> --stage <s>    Compare output to golden file");
+    eprintln!("  fidesc diff-test <file.fd> --stage <s>    Compare Rust vs Fides output (or --golden)");
     eprintln!("           [--update]                       Update golden file with current output");
     eprintln!("  fidesc version                           Show version");
     eprintln!("  fidesc watch   <file.fd> [--interval <ms>] [--run]  Hot reload: recompile on change");

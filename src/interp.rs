@@ -1364,6 +1364,12 @@ impl Interpreter {
                     }
                     return ExecOutcome::Continue;
                 }
+                // Non-opaque store: clear any stale opaque_values entry so that
+                // a subsequent Load doesn't return an old Value::Str/Vec/Map
+                // that was previously stored at this address. The specific
+                // handlers below (Value::Str, Value::Vec, etc.) will re-insert
+                // a fresh entry as needed.
+                self.opaque_values.remove(&addr);
                 match values.get(value) {
                     Some(Value::Int(v)) => {
                         match store_ty {

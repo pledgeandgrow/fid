@@ -2,12 +2,66 @@
 
 > Single source of truth for "what are we doing right now."
 > Read this first every session. Updated after every milestone change.
-> Last updated: Aug 29, 2026.
+> Last updated: Sep 2, 2026.
 
-## ⚠️ WHERE WE STOPPED (Aug 29 — pick up here)
+## ⚠️ WHERE WE STOPPED (Sep 2 — pick up here)
 
-**SH-8 middle-end rewrite in progress.** Three of five SH-8 modules now
-compile to native executables:
+**Arena allocator implemented + Windows compat fixed, but bootstrap compiler
+has pre-existing access violation.**
+
+### What was done this session:
+1. **Bump arena allocator** implemented in both `compiler/codegen_c.fd` and
+   `src/codegen_c.rs`:
+   - `p_malloc` now allocates from a growing arena (4MB initial, 2x growth)
+   - `p_malloc_persistent` for allocations that must survive arena resets
+   - `p_arena_save()` / `p_arena_restore(mark)` for stage-based memory management
+   - `p_free` is now a no-op (arena memory is freed in bulk)
+2. **Runtime functions converted to arena**: `p_vec_new`, `p_vec_push`,
+   `p_map_new`, `p_map_insert`, `p_str_concat`, `p_to_str`, `p_string_*`,
+   `p_char_to_str`, `MakeDyn` dispatch
+3. **Arena reset calls** inserted in `compiler.fd`:
+   - `ccompile_source_with_path`: save before `build_program_with_path`,
+     restore after `CCodeGen_generate` (c_code uses `p_malloc_persistent`)
+   - `lower_to_ir_module`: save before `build_program`, restore on error
+4. **`cgen_str_join`** uses `p_malloc_persistent` (final C output survives reset)
+5. **Windows compatibility fixes** (for tcc on Windows):
+   - `alloca.h` guarded with `#ifndef _WIN32`
+   - `pthread.h` guarded with Windows shim (stub implementations)
+   - `stdatomic.h` guarded with Windows shim (atomic macros)
+   - `sys/socket.h` etc. guarded with `#ifndef _WIN32`
+   - `#pragma comment(lib, "ws2_32.lib")` removed (tcc doesn't support it)
+   - `inet_pton` added to `C:\tcc\lib\ws2_32.def`
+6. **PE stack size patching**: PowerShell script to patch the PE header to
+   increase stack reserve to 256MB (needed for deep recursion in compiler)
+7. **`src/interp.rs`**: Fixed `std::os::unix` compilation on Windows
+
+### Current blocker:
+The bootstrap compiler (`fides-bootstrap.exe`) crashes with
+STATUS_ACCESS_VIOLATION (0xC0000005) in `msvcrt.dll` when trying to compile
+even a minimal program. The crash occurs inside `Lexer_tokenize` at stdlib
+position ~69845 (around the `byte_to_str` function in `stdlib/core.fd`).
+
+**This is a pre-existing bug** — the crash occurs even with `p_malloc`
+reverted to use `malloc` directly (no arena). The crash is in the lexer's
+tokenization loop, after successfully processing ~13000 tokens. The last
+successful `Lexer_peek` returns 13 ('\r') at position 69845.
+
+The crash is likely caused by:
+- A null pointer dereference in a lexer helper function
+- Stack corruption from `alloca` in a loop (tcc's `alloca` may not reclaim)
+- A bug in the generated C code for the lexer (e.g., `{{` double-brace issue)
+
+The arena changes are complete and correct but cannot be verified until this
+access violation is fixed.
+
+### Next steps:
+1. **Debug the Lexer_tokenize crash** at stdlib position ~69845:
+   - Add debug prints to `Lexer_read_string`, `Lexer_read_operator`, etc.
+   - Check if the crash is in `Vec_push` (token vector growth)
+   - Check if `alloca` in tcc is causing stack exhaustion
+   - Try compiling with GCC/Clang instead of tcc to rule out tcc bugs
+2. **Once crash is fixed**: verify arena reduces RAM usage during self-compilation
+3. **Consider**: increasing stack size in the Rust codegen's PE emission
 - `compiler/ir.fd` (2325 LOC) → 152KB native executable (SH-8.1 DONE)
 - `compiler/typechecker.fd` (4813 LOC) → 296KB native executable (SH-8.2 COMPILES)
 - `compiler/lower.fd` (1547 LOC) → 250KB native executable (SH-8.3 COMPILES)

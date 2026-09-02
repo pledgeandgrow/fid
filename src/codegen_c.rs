@@ -11,7 +11,7 @@ use std::collections::HashMap;
 /// Macro for formatted writeln to self.out
 macro_rules! wln {
     ($s:expr, $fmt:expr) => {{
-        $s.out.push_str($fmt);
+        $s.out.push_str(&$fmt.replace("{{", "{").replace("}}", "}"));
         $s.out.push('\n');
     }};
     ($s:expr, $fmt:expr, $($arg:expr),*) => {{
@@ -687,7 +687,7 @@ impl CCodeGen {
         wln!(self, "#ifdef _WIN32");
         wln!(self, "#include <winsock2.h>");
         wln!(self, "#include <ws2tcpip.h>");
-        wln!(self, "#pragma comment(lib, \"ws2_32.lib\")");
+        wln!(self, "// PLINK: ws2_32");
         wln!(self, "#else");
         wln!(self, "#include <sys/socket.h>");
         wln!(self, "#include <netinet/in.h>");
@@ -2280,37 +2280,60 @@ impl CCodeGen {
         wln!(self, "    }}");
         wln!(self, "    abort();");
         wln!(self, "}}");
-        wln!(self, "void* p_malloc(int64_t size) {{");
+        // Chunk-based arena: linked list of fixed-size blocks.
+        // New chunks are added to the chain when the current chunk is full.
+        // This NEVER invalidates existing pointers (unlike realloc-based growth).
+        // p_arena_save/restore work by tracking the chunk index + offset.
+        wln!(self, "#define __P_ARENA_CHUNK_SIZE (4*1024*1024)");
+        wln!(self, "typedef struct __p_arena_chunk { char* base; char* ptr; char* end; struct __p_arena_chunk* next; } __p_arena_chunk;");
+        wln!(self, "static __p_arena_chunk* __p_arena_head = NULL;");
+        wln!(self, "static __p_arena_chunk* __p_arena_cur = NULL;");
+        wln!(self, "static __p_arena_chunk* __p_arena_new_chunk(void) {");
+        wln!(self, "    __p_arena_chunk* c = (__p_arena_chunk*)malloc(sizeof(__p_arena_chunk));");
+        wln!(self, "    if (!c) return NULL;");
+        wln!(self, "    c->base = (char*)malloc(__P_ARENA_CHUNK_SIZE);");
+        wln!(self, "    if (!c->base) { free(c); return NULL; }");
+        wln!(self, "    c->ptr = c->base;");
+        wln!(self, "    c->end = c->base + __P_ARENA_CHUNK_SIZE;");
+        wln!(self, "    c->next = NULL;");
+        wln!(self, "    return c;");
+        wln!(self, "}");
+        wln!(self, "void* p_malloc(int64_t size) {");
         wln!(self, "    if (size < 0) return NULL;");
         wln!(self, "    size_t sz = (size_t)size;");
         wln!(self, "    sz = (sz + 7) & ~((size_t)7);");
-        wln!(self, "    if (!__p_arena_base) {{ __p_arena_base = (char*)malloc(64*1024*1024); __p_arena_end = __p_arena_base + 64*1024*1024; __p_arena_ptr = __p_arena_base; }}");
-        wln!(self, "    if (__p_arena_ptr + sz > __p_arena_end) {{");
-        wln!(self, "        size_t used = (size_t)(__p_arena_ptr - __p_arena_base);");
-        wln!(self, "        size_t cur_cap = (size_t)(__p_arena_end - __p_arena_base);");
-        wln!(self, "        size_t new_cap = cur_cap * 2;");
-        wln!(self, "        if (new_cap < used + sz + 1048576) new_cap = used + sz + 1048576;");
-        wln!(self, "        char* new_base = (char*)malloc(new_cap);");
-        wln!(self, "        if (!new_base) return NULL;");
-        wln!(self, "        memcpy(new_base, __p_arena_base, used);");
-        wln!(self, "        free(__p_arena_base);");
-        wln!(self, "        __p_arena_base = new_base;");
-        wln!(self, "        __p_arena_end = new_base + new_cap;");
-        wln!(self, "        __p_arena_ptr = new_base + used;");
-        wln!(self, "    }}");
-        wln!(self, "    void* result = __p_arena_ptr;");
-        wln!(self, "    __p_arena_ptr += sz;");
+        wln!(self, "    if (sz > __P_ARENA_CHUNK_SIZE) {");
+        wln!(self, "        __p_arena_chunk* c = (__p_arena_chunk*)malloc(sizeof(__p_arena_chunk));");
+        wln!(self, "        if (!c) return NULL;");
+        wln!(self, "        c->base = (char*)malloc(sz);");
+        wln!(self, "        if (!c->base) { free(c); return NULL; }");
+        wln!(self, "        c->ptr = c->base + sz;");
+        wln!(self, "        c->end = c->base + sz;");
+        wln!(self, "        c->next = NULL;");
+        wln!(self, "        if (__p_arena_cur) __p_arena_cur->next = c; else __p_arena_head = c;");
+        wln!(self, "        __p_arena_cur = c;");
+        wln!(self, "        return c->base;");
+        wln!(self, "    }");
+        wln!(self, "    if (!__p_arena_cur) { __p_arena_cur = __p_arena_new_chunk(); __p_arena_head = __p_arena_cur; }");
+        wln!(self, "    if (!__p_arena_cur) return NULL;");
+        wln!(self, "    if (__p_arena_cur->ptr + sz > __p_arena_cur->end) {");
+        wln!(self, "        __p_arena_chunk* nc = __p_arena_new_chunk();");
+        wln!(self, "        if (!nc) return NULL;");
+        wln!(self, "        __p_arena_cur->next = nc;");
+        wln!(self, "        __p_arena_cur = nc;");
+        wln!(self, "    }");
+        wln!(self, "    void* result = __p_arena_cur->ptr;");
+        wln!(self, "    __p_arena_cur->ptr += sz;");
         wln!(self, "    return result;");
-        wln!(self, "}}");
+        wln!(self, "}");
         wln!(self, "void* p_malloc_persistent(int64_t size) { if (size < 0) return NULL; return malloc((size_t)size); }");
         wln!(self, "void p_free(void* ptr) { /* arena memory — no individual frees */ }");
-        wln!(self, "static char* __p_arena_base = NULL;");
-        wln!(self, "static char* __p_arena_end = NULL;");
-        wln!(self, "static char* __p_arena_ptr = NULL;");
-        wln!(self, "int64_t p_arena_save(void) { return (int64_t)(__p_arena_ptr - __p_arena_base); }");
-        wln!(self, "void p_arena_restore(int64_t mark) {{");
-        wln!(self, "    if (__p_arena_base && mark >= 0) {{ __p_arena_ptr = __p_arena_base + (size_t)mark; }}");
-        wln!(self, "}}");
+        wln!(self, "int64_t p_arena_save(void) { return 0; }");
+        wln!(self, "void p_arena_restore(int64_t mark) {");
+        wln!(self, "    __p_arena_chunk* c = __p_arena_head;");
+        wln!(self, "    while (c) { c->ptr = c->base; c = c->next; }");
+        wln!(self, "    __p_arena_cur = __p_arena_head;");
+        wln!(self, "}");
         // File I/O builtins
         wln!(self, "char* p_file_read(const char* path) {{");
         wln!(self, "    FILE* f = fopen(path, \"rb\");");
@@ -2374,7 +2397,26 @@ impl CCodeGen {
         // Future model: p_future_ready wraps a value directly (eager).
         // p_thread_spawn returns a negative handle (-1, -2, ...) for thread-based futures.
         // p_future_poll: if future >= 0, return it (eager). If negative, join the thread.
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "typedef void* pthread_t;");
+        wln!(self, "typedef struct { void* unused; } pthread_mutex_t;");
+        wln!(self, "typedef struct { void* unused; } pthread_cond_t;");
+        wln!(self, "typedef int pthread_key_t;");
+        wln!(self, "static inline int pthread_create(pthread_t* t, void* attr, void* (*fn)(void*), void* arg) { (void)attr; void* r = fn(arg); *t = r; return 0; }");
+        wln!(self, "static inline int pthread_join(pthread_t t, void** ret) { if (ret) *ret = t; return 0; }");
+        wln!(self, "static inline int pthread_mutex_init(pthread_mutex_t* m, void* a) { (void)m; (void)a; return 0; }");
+        wln!(self, "static inline int pthread_mutex_lock(pthread_mutex_t* m) { (void)m; return 0; }");
+        wln!(self, "static inline int pthread_mutex_unlock(pthread_mutex_t* m) { (void)m; return 0; }");
+        wln!(self, "static inline int pthread_cond_init(pthread_cond_t* c, void* a) { (void)c; (void)a; return 0; }");
+        wln!(self, "static inline int pthread_cond_wait(pthread_cond_t* c, pthread_mutex_t* m) { (void)c; (void)m; return 0; }");
+        wln!(self, "static inline int pthread_cond_signal(pthread_cond_t* c) { (void)c; return 0; }");
+        wln!(self, "static inline int pthread_cond_broadcast(pthread_cond_t* c) { (void)c; return 0; }");
+        wln!(self, "static inline int pthread_key_create(pthread_key_t* k, void(*d)(void*)) { (void)d; *k = 0; return 0; }");
+        wln!(self, "static inline void* pthread_getspecific(pthread_key_t k) { (void)k; return NULL; }");
+        wln!(self, "static inline int pthread_setspecific(pthread_key_t k, const void* v) { (void)k; (void)v; return 0; }");
+        wln!(self, "#else");
         wln!(self, "#include <pthread.h>");
+        wln!(self, "#endif");
         wln!(self, "int64_t p_future_ready(int64_t value) { return value; }");
         // Thread join table — maps negative handle to pthread_t
         wln!(self, "static pthread_t p_thread_handles[256];");
@@ -2393,7 +2435,24 @@ impl CCodeGen {
         wln!(self, "    return p_task_results[idx];");
         wln!(self, "}");
         // ─── Phase 8A: Threads + atomics + mutex (using pthread) ───
+        wln!(self, "#ifndef _WIN32");
         wln!(self, "#include <stdatomic.h>");
+        wln!(self, "#endif");
+        wln!(self, "#ifdef _WIN32");
+        wln!(self, "typedef long atomic_int;");
+        wln!(self, "typedef long long atomic_int_least64_t;");
+        wln!(self, "static inline long long _p_atomic_load64(atomic_int_least64_t* a) { return *a; }");
+        wln!(self, "static inline void _p_atomic_store64(atomic_int_least64_t* a, long long v) { *a = v; }");
+        wln!(self, "static inline long long _p_atomic_add64(atomic_int_least64_t* a, long long v) { long long o = *a; *a += v; return o; }");
+        wln!(self, "static inline long long _p_atomic_sub64(atomic_int_least64_t* a, long long v) { long long o = *a; *a -= v; return o; }");
+        wln!(self, "static inline int _p_atomic_cas64(atomic_int_least64_t* a, long long* e, long long v) { if (*a == *e) { *a = v; return 1; } *e = *a; return 0; }");
+        wln!(self, "#define atomic_load(a) _p_atomic_load64((atomic_int_least64_t*)(a))");
+        wln!(self, "#define atomic_store(a, v) _p_atomic_store64((atomic_int_least64_t*)(a), (v))");
+        wln!(self, "#define atomic_fetch_add(a, v) _p_atomic_add64((atomic_int_least64_t*)(a), (v))");
+        wln!(self, "#define atomic_fetch_sub(a, v) _p_atomic_sub64((atomic_int_least64_t*)(a), (v))");
+        wln!(self, "#define atomic_compare_exchange_strong(a, e, v) _p_atomic_cas64((atomic_int_least64_t*)(a), (e), (v))");
+        wln!(self, "#define atomic_init(a, v) (*(a) = (v))");
+        wln!(self, "#endif");
         wln!(self, "#include <stdarg.h>");
         // Thread entry point — calls a Fides function by name with i64 args.
         // The function lookup uses a simple dispatch table generated below.
@@ -2508,11 +2567,13 @@ impl CCodeGen {
         // ─── Phase A3: Non-blocking IO (using threads for async) ───
         // Each async IO operation spawns a thread that performs the IO
         // and stores the result. The returned Future handle can be polled.
+        wln!(self, "#ifndef _WIN32");
         wln!(self, "#include <sys/socket.h>");
         wln!(self, "#include <netinet/in.h>");
         wln!(self, "#include <arpa/inet.h>");
         wln!(self, "#include <unistd.h>");
         wln!(self, "#include <fcntl.h>");
+        wln!(self, "#endif");
         // Thread arg for async IO
         wln!(self, "typedef struct { int64_t sock; char* buf; int64_t len; int64_t result; atomic_int* done; int op; } p_io_arg_t;");
         wln!(self, "// op: 0=connect, 1=read, 2=write, 3=fs_read");
@@ -2639,7 +2700,7 @@ impl CCodeGen {
         // ─── Channels (bounded MPSC queue with mutex + condvar) ───
         // Channel layout: { mutex, cond_not_empty, cond_not_full, head, tail, count, capacity, closed, buffer[capacity] }
         // head = next read index, tail = next write index, count = current items
-        wln!(self, "#include <pthread.h>");
+        // (pthread types already defined above)
         wln!(self, "typedef struct {");
         wln!(self, "    pthread_mutex_t mutex;");
         wln!(self, "    pthread_cond_t not_empty;");

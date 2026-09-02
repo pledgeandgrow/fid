@@ -24,9 +24,9 @@ cargo build
 # Quick build check (no tests)
 ./verify.sh --quick
 
-# Self-host verification (compiler/tests/*.fd on 3 backends)
+# Self-host verification (tests/compiler/*.fd on 3 backends)
 # Separate from verify.sh: verify.sh → tests/ (Rust compiler in src/)
-# verify-selfhost.sh → compiler/tests/ (self-hosted Fides components in compiler/)
+# verify-selfhost.sh → tests/compiler/ (self-hosted Fides components in compiler/)
 ./verify-selfhost.sh
 ./verify-selfhost.sh --save
 ./verify-selfhost.sh --list
@@ -121,7 +121,7 @@ Harness:      8/8 passed      (All passing — all 3 self-host blockers pass on 
 Interpreter:  188/188 normal  (+ 36 expected-fail, + 0 skip, + 0 known-fail)
 C Codegen:    185/188 matched (3 fail: test_borrowck, test_fmt_real, test_pir — self-host C codegen issues)
 PE Emitter:   188/188 valid   (0 known-fail — all pass)
-Total .fd:    242 test files  (195 in tests/; 23 in compiler/tests/; 24 in subdirs: capability/effects/regions/safety)
+Total .fd:    242 test files  (195 in tests/; 23 in tests/compiler/; 24 in subdirs: capability/effects/regions/safety)
 Skip list:    1 test          (bench_stringbuilder — timing benchmark)
 Expected-fail: 36 tests       (tests that verify compiler error detection — failing is correct)
 Known-fail:   0 tests         (all previously known-fail tests now pass on all 3 backends)
