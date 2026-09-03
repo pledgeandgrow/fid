@@ -1495,7 +1495,7 @@ impl CCodeGen {
                     }
                 }
             }
-            Inst::Store { ptr, value, .. } => {
+            Inst::Store { ptr, value, store_ty: explicit_store_ty } => {
                 let p = self.val_name(*ptr);
                 let v = self.val_name(*value);
                 // Type-aware store: use the pointer's pointee type (if
@@ -1510,8 +1510,12 @@ impl CCodeGen {
                     _ => None,
                 });
                 let val_ty = func.values.get(value).map(|m| m.ty.clone());
-                // Prefer the pointer's pointee type; fall back to value type
-                let store_ty = ptr_ty.or(val_ty).unwrap_or(IrType::I64);
+                // Prefer the explicit store_ty (from the instruction), then
+                // the pointer's pointee type, then the value type.
+                let store_ty = explicit_store_ty.clone()
+                    .or(ptr_ty)
+                    .or(val_ty)
+                    .unwrap_or(IrType::I64);
                 match &store_ty {
                     IrType::Ptr(_) | IrType::Opaque(_) | IrType::Generic(_, _) => {
                         wln!(self, "    *(void**){} = (void*){};", p, v);

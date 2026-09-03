@@ -4,13 +4,13 @@
 > Read this first every session. Updated after every milestone change.
 > Last updated: Feb 10, 2026.
 
-## Where We Stopped (Feb 10 — pick up here)
+## Where We Stopped (Sep 3 — pick up here)
 
-**Crash fixed. Self-hosted compiler runs to completion but has a lowerer bug
-in enum variant extraction that causes parse errors.**
+**Enum variant extraction blocker RESOLVED. Self-hosted compiler now parses
+stdlib/core.fd successfully. New crash in check_cfg (separate bug).**
 
 ### What works:
-1. **Build pipeline complete** — `compiler/*.fd` (18 modules, 39.5K LOC) compiles to C via the Rust compiler, then links to `release/fides-c.exe` via tcc
+1. **Build pipeline complete** — `compiler/*.fd` (18 modules, 39.5K LOC) compiles to C via the Rust compiler, then links to `fides-c-tcc.exe` via tcc
 2. **All 18 self-host modules compile + pass tests** (23/23 on tests/compiler/ via interpreter + PE)
 3. **Arena allocator** (chunk-based, never invalidates pointers) in both `src/codegen_c.rs` and `compiler/codegen_c.fd`
 4. **Windows compatibility** — tcc builds work with ws2_32.def linking, PE stack patched to 256MB, 16MB thread stack wrapper
@@ -19,25 +19,34 @@ in enum variant extraction that causes parse errors.**
 7. **SRET calling convention** — Fides lowerer now correctly handles struct returns via out-parameter convention for both regular calls and method calls
 8. **Enum layout computation** — Fides lowerer now computes enum payload sizes from actual field sizes, with iterative fixpoint for nested types
 9. **Lexer optimization** — Cached `src_len` to avoid O(n) `str_len` on every peek; `str_slice` instead of char-by-char `str_concat` for identifiers/numbers
+10. **Enum variant extraction FIXED** — `load_enum_field()` ported to `compiler/lower.fd`, `Inst::Store` in `compiler/codegen_c.fd` now emits `memcpy` for `IrType::Struct(_)`
 
 ### Current blocker:
-The self-hosted compiler runs to completion but reports parse errors when
-parsing `stdlib/core.fd`:
-```
-Parse error: assignment target must be an identifier or array index at line 298 col 15
-```
-This occurs at `*p0 = 0;` — a dereference assignment. The `Expr::Deref`
-variant is not matched because the `Expr` value is truncated to 8 bytes
-during enum variant extraction.
+The self-hosted compiler now parses `stdlib/core.fd` successfully (the
+`*p0 = 0;` deref assignment parse error is gone), but crashes with
+`STATUS_ACCESS_VIOLATION` at address 0x11 in `check_cfg` / `apply_cfg_filter`:
 
-**Root cause:** When matching `ParseResultExpr::Ok(e) => { left = e; }`,
-the Fides lowerer emits `Inst::Load` which only reads 8 bytes for
-struct-typed fields (because `c_type(Struct(_))` is a pointer type in C).
-The full `Expr` (80 bytes) is truncated to just the tag field.
+```
+[build] Stdlib parsed ok. Extracting names...
+[build] Lexing user code...
+[build] User code lexed. Checking errors...
+[build] Parsing user code...
+=== CRASH: 0xC0000005 ===
+Access violation at address 0x11
+Call stack depth: 6
+  [0] main
+  [1] cmd_ccompile
+  [2] ccompile_source_with_path
+  [3] build_program_with_path
+  [4] apply_cfg_filter
+  [5] check_cfg
+```
 
-**Fix already done in Rust lowerer:** `load_enum_field()` helper in
-`src/lower.rs` (line 246) allocates a buffer and uses `Inst::Store`
-(which emits `memcpy` for structs) to copy the full inline struct data.
+This is likely the "Vec of structs requires heap allocation" issue (known-bugs.md
+gotcha 3.8). `apply_cfg_filter` builds new Vecs by pushing `Func`/`StructDef`
+structs from `program.funcs.get(i)` — these are large structs containing
+pointers (Vec<Param>, Vec<Stmt>, etc.) that may dangle when stack frames are
+reused.
 
 ### Build commands:
 ```
@@ -49,11 +58,9 @@ tcc -O2 -w -o release\fides-c.exe release\fides-c.c C:\tcc\lib\ws2_32.def  # →
 Or just: `.\build-selfhost.ps1`
 
 ### Next steps:
-1. **Port `load_enum_field()` to `compiler/lower.fd`** — allocate buffer + use `Store` (memcpy) for struct-typed enum variant fields instead of `Load`
-2. **Apply at both enum match extraction sites** in `compiler/lower.fd`
-3. **Ensure `Inst::Store` in `compiler/codegen_c.fd` emits `memcpy` for struct types** (like the Rust codegen does)
-4. **Once parse errors are fixed**: verify the bootstrap fixpoint (stage2.c == stage3.c)
-5. **Run full test suite** through the self-hosted compiler
+1. **Fix the `apply_cfg_filter` crash** — likely needs heap allocation for structs pushed into Vecs (gotcha 3.8), or the `check_cfg` function is dereferencing a null pointer in `annotations.get(i).name` or `.args`
+2. **Once that crash is fixed**: verify the bootstrap fixpoint (stage2.c == stage3.c)
+3. **Run full test suite** through the self-hosted compiler
 
 ## Self-Host Module Status
 

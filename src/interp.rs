@@ -1355,7 +1355,7 @@ impl Interpreter {
                 ExecOutcome::Value(v)
             }
 
-            Inst::Store { ptr, value, .. } => {
+            Inst::Store { ptr, value, store_ty: explicit_store_ty } => {
                 let addr = match values.get(ptr) {
                     Some(Value::Ptr(a)) => *a,
                     _ => 0,
@@ -1363,6 +1363,18 @@ impl Interpreter {
                 // UAF detection: check if this address was freed
                 if self.debug_mode && self.freed_addresses.contains(&addr) {
                     panic!("Use-after-free: storing to address 0x{:x} that was freed (region ended)", addr);
+                }
+                // If the instruction has an explicit store_ty of Struct(_),
+                // this is an inline struct copy (e.g. EnumLit storing a
+                // struct-typed field inline). Copy the full struct data from
+                // the source pointer to the destination.
+                if let Some(IrType::Struct(_)) = &explicit_store_ty {
+                    let size = self.module.type_size(explicit_store_ty.as_ref().unwrap()) as usize;
+                    if let Some(Value::Ptr(src_addr)) = values.get(value) {
+                        let src_bytes = self.memory.load(*src_addr, size);
+                        self.memory.store(addr, &src_bytes);
+                        return ExecOutcome::Continue;
+                    }
                 }
                 // Check if this is an opaque-typed alloca — if so, always use side-table
                 let ptr_meta_ty = func.values.get(ptr).map(|m| &m.ty);
@@ -2562,6 +2574,26 @@ impl Interpreter {
                             print!("{}", String::from_utf8_lossy(&bytes));
                         }
                         _ => print!("{:?}", v),
+                    }
+                }
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_eprint_str" => {
+                if let Some(v) = args.first() {
+                    match v {
+                        Value::Str(s) => eprint!("{}", s),
+                        Value::Ptr(addr) => {
+                            let mut bytes = Vec::new();
+                            let mut offset = *addr;
+                            loop {
+                                let b = self.memory.load(offset, 1);
+                                if b[0] == 0 { break; }
+                                bytes.push(b[0]);
+                                offset += 1;
+                            }
+                            eprint!("{}", String::from_utf8_lossy(&bytes));
+                        }
+                        _ => eprint!("{:?}", v),
                     }
                 }
                 ExecOutcome::Value(Value::Void)

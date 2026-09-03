@@ -243,6 +243,21 @@ impl Lowerer {
             .unwrap_or(Region::Stack)
     }
 
+    /// Compute the number of 8-byte slots a field occupies in an enum layout.
+    /// Struct/enum types use their full layout size (rounded up to 8);
+    /// all other types use 1 slot.
+    fn enum_field_slots(&self, ty: &IrType) -> u32 {
+        if let IrType::Struct(ref name) = ty {
+            if let Some(layout) = self.module.get_struct(name) {
+                ((layout.size + 7) / 8) as u32
+            } else {
+                1
+            }
+        } else {
+            1
+        }
+    }
+
     /// Load a field from an enum variant's inline storage.
     ///
     /// When the field type is a struct (enum), the data is stored inline
@@ -1313,10 +1328,13 @@ impl Lowerer {
 
     /// IR types for the values bound by an enum-variant pattern.
     ///
-    /// Payload slots are one machine word wide, so aggregates (structs, enums,
-    /// Vec, ...) are stored as pointers. Returning the pointer type here — not
-    /// a bare I64 — is what lets field access and method calls on the binding
-    /// resolve, since the lowerer keys those off the value's IR type.
+    /// Enum-typed fields (structs/enums declared directly, not Box/Ptr) are
+    /// stored INLINE in the parent enum (per `compute_enum_layout`). Returning
+    /// `Struct(name)` for these lets `load_enum_field` copy the full inline
+    /// data via alloca+memcpy.
+    ///
+    /// Box/Ptr/Vec/str fields are one machine word wide (a pointer) and pass
+    /// through `word_repr` unchanged.
     ///
     /// Falls back to the pattern's explicit annotation, then I64.
     fn pattern_binding_ir_types(
@@ -1327,7 +1345,16 @@ impl Lowerer {
     ) -> Vec<IrType> {
         self.pattern_binding_ast_types(enum_name, variant, bindings)
             .iter()
-            .map(|t| Self::word_repr(self.lower_type(t)))
+            .map(|t| {
+                let ir_ty = self.lower_type(t);
+                // Keep struct/enum types as-is so load_enum_field copies the
+                // full inline data. Box<T> lowers to Ptr(Struct(T)) which is
+                // already a word — word_repr leaves it unchanged.
+                match ir_ty {
+                    IrType::Struct(_) => ir_ty,
+                    other => Self::word_repr(other),
+                }
+            })
             .collect()
     }
 
@@ -2866,11 +2893,14 @@ impl Lowerer {
                     let saved_locals = self.current_func.as_ref().map(|f| f.locals.clone());
                     let binding_tys = self.pattern_binding_ir_types(enum_name, variant, bindings);
                     let binding_ast_tys = self.pattern_binding_ast_types(enum_name, variant, bindings);
+                    // Compute field indices: struct-typed fields occupy multiple
+                    // slots (inline storage), so we accumulate the offset.
+                    let mut field_idx: u32 = 1;
                     for (i, (binding, _ty_name)) in bindings.iter().enumerate() {
                         let field_ty = binding_tys.get(i).cloned().unwrap_or(IrType::I64);
                         let field_ptr = self.emit_inst(Inst::GetFieldPtr {
                             struct_ptr: match_val,
-                            field_index: (i + 1) as u32,
+                            field_index: field_idx,
                             field_ty: field_ty.clone(),
                         });
                         let field_val = self.load_enum_field(field_ptr, &field_ty);
@@ -2885,6 +2915,8 @@ impl Lowerer {
                         if let Some(ast_ty) = binding_ast_tys.get(i) {
                             self.var_ast_types.insert(binding.clone(), ast_ty.clone());
                         }
+                        // Advance field_idx by the number of slots this field occupies
+                        field_idx += self.enum_field_slots(&field_ty);
                     }
                     // If there's a guard, evaluate it and branch
                     if let Some(guard_expr) = &arm.guard {
@@ -3031,9 +3063,10 @@ impl Lowerer {
                     let saved_locals = self.current_func.as_ref().map(|f| f.locals.clone());
                     let binding_tys = self.pattern_binding_ir_types(enum_name, variant, bindings);
                     let binding_ast_tys = self.pattern_binding_ast_types(enum_name, variant, bindings);
+                    let mut field_idx: u32 = 1;
                     for (i, (binding, _ty_name)) in bindings.iter().enumerate() {
                         let field_ty = binding_tys.get(i).cloned().unwrap_or(IrType::I64);
-                        let field_ptr = self.emit_inst(Inst::GetFieldPtr { struct_ptr: match_val, field_index: (i + 1) as u32, field_ty: field_ty.clone() });
+                        let field_ptr = self.emit_inst(Inst::GetFieldPtr { struct_ptr: match_val, field_index: field_idx, field_ty: field_ty.clone() });
                         let field_val = self.load_enum_field(field_ptr, &field_ty);
                         self.allocas.remove(binding);
                         if let Some(ref mut f) = self.current_func {
@@ -3044,6 +3077,7 @@ impl Lowerer {
                         if let Some(ast_ty) = binding_ast_tys.get(i) {
                             self.var_ast_types.insert(binding.clone(), ast_ty.clone());
                         }
+                        field_idx += self.enum_field_slots(&field_ty);
                     }
                     // If there's a guard, evaluate it and branch
                     if let Some(guard_expr) = &arm.guard {
@@ -3503,8 +3537,27 @@ impl Lowerer {
                         // Box::new(x) = malloc(sizeof(x)), store x, return ptr
                         let val = self.lower_expr(&args[0]);
                         let val_ty = self.get_value_type(val);
-                        let size = self.module.type_size(&val_ty);
-                        let size_val = self.emit_inst(Inst::ConstInt { value: size as i64, ty: IrType::I64 });
+                        // For struct/enum types, the value is a pointer to an
+                        // alloca (enums are passed by pointer). We need to:
+                        // 1. Allocate the full struct size (not just 8 bytes)
+                        // 2. Use Store with store_ty=Struct to emit memcpy
+                        // This prevents dangling pointers when the creating
+                        // function returns and the alloca is freed.
+                        let (alloc_size, store_ty) = match &val_ty {
+                            IrType::Ptr(inner) if inner.is_aggregate() => {
+                                // val is a pointer to a struct/enum alloca
+                                let struct_ty = inner.as_ref().clone();
+                                let size = self.module.type_size(&struct_ty);
+                                (size, Some(struct_ty))
+                            }
+                            _ => {
+                                let size = self.module.type_size(&val_ty);
+                                (size, None)
+                            }
+                        };
+                        // Ensure at least 1 byte to avoid malloc(0)
+                        let alloc_size = if alloc_size == 0 { 8 } else { alloc_size };
+                        let size_val = self.emit_inst(Inst::ConstInt { value: alloc_size as i64, ty: IrType::I64 });
                         let typed_ptr_ty = IrType::Ptr(Box::new(val_ty.clone()));
                         let ptr = self.emit_inst(Inst::Call {
                             func: "p_malloc".to_string(),
@@ -3516,8 +3569,11 @@ impl Lowerer {
                                 e
                             },
                         });
-                        // Store the value at the heap address
-                        self.emit_inst(Inst::Store { ptr, value: val, store_ty: None });
+                        // Store the value at the heap address.
+                        // For struct types, store_ty=Some(Struct(_)) causes
+                        // the C codegen to emit memcpy, copying the full
+                        // struct data from the alloca to the heap.
+                        self.emit_inst(Inst::Store { ptr, value: val, store_ty });
                         return ptr;
                     }
                     // Rc::new(x) — allocate [refcount:i64 | value:T], return ptr to value
@@ -3789,7 +3845,8 @@ impl Lowerer {
                                     // runtime_args = [dummy_env, vec, value]
                                     // Box the value at index 2
                                     let val = runtime_args[2];
-                                    let size = self.module.type_size(&elem_ty);
+                                    let mut size = self.module.type_size(&elem_ty);
+                                    if size == 0 { size = 8; }  // fallback for unknown structs
                                     let size_val = self.emit_inst(Inst::ConstInt { value: size as i64, ty: IrType::I64 });
                                     let heap_ptr = self.emit_inst(Inst::Call {
                                         func: "p_malloc".to_string(),
@@ -3801,14 +3858,18 @@ impl Lowerer {
                                             e
                                         },
                                     });
-                                    self.emit_inst(Inst::Store { ptr: heap_ptr, value: val, store_ty: None });
+                                    // Use store_ty: Some(elem_ty) so the codegen
+                                    // emits memcpy for the full struct, not just
+                                    // an 8-byte pointer store.
+                                    self.emit_inst(Inst::Store { ptr: heap_ptr, value: val, store_ty: Some(elem_ty.clone()) });
                                     runtime_args[2] = heap_ptr;
                                 }
                                 "insert" => {
                                     // runtime_args = [dummy_env, vec, index, value]
                                     // Box the value at index 3
                                     let val = runtime_args[3];
-                                    let size = self.module.type_size(&elem_ty);
+                                    let mut size = self.module.type_size(&elem_ty);
+                                    if size == 0 { size = 8; }  // fallback for unknown structs
                                     let size_val = self.emit_inst(Inst::ConstInt { value: size as i64, ty: IrType::I64 });
                                     let heap_ptr = self.emit_inst(Inst::Call {
                                         func: "p_malloc".to_string(),
@@ -3820,7 +3881,7 @@ impl Lowerer {
                                             e
                                         },
                                     });
-                                    self.emit_inst(Inst::Store { ptr: heap_ptr, value: val, store_ty: None });
+                                    self.emit_inst(Inst::Store { ptr: heap_ptr, value: val, store_ty: Some(elem_ty.clone()) });
                                     runtime_args[3] = heap_ptr;
                                 }
                                 _ => {}
@@ -4623,48 +4684,84 @@ impl Lowerer {
                 // Enum-typed fields occupy multiple 8-byte slots, so we need
                 // to compute the correct field index based on the accumulated
                 // size of previous fields.
+                //
+                // CRITICAL: struct/enum-typed fields (e.g. BinOp in Expr::Binary)
+                // must be stored INLINE (copied from the arg's alloca into the
+                // parent enum's data slots). Storing a pointer to the arg's
+                // alloca creates a dangling pointer when the creating function
+                // returns (especially in C codegen where alloca is stack-based).
+                //
+                // Box<T> fields are already pointers (Ptr(Struct(T))) and stay
+                // as pointers — this is correct because Box is an explicit
+                // indirection.
+                //
+                // To distinguish: we look at the DECLARED field type from the
+                // enum definition. If it's a struct/enum (Type::Named that
+                // resolves to a struct), store inline. If it's Box/Ptr/Vec/etc,
+                // store the pointer.
+                let declared_field_tys: Vec<Type> = self.enums.get(enum_name)
+                    .and_then(|def| def.variants.iter().find(|v| v.name == *variant))
+                    .and_then(|v| v.data.as_ref())
+                    .map(|params| params.iter().map(|p| p.ty.clone()).collect())
+                    .unwrap_or_default();
+
                 let mut field_idx: u32 = 1;
-                for arg_expr in args.iter() {
+                for (i, arg_expr) in args.iter().enumerate() {
                     let arg_val = self.lower_expr(arg_expr);
                     let arg_ty = self.get_value_type(arg_val);
+
+                    // Check the declared field type to determine if this field
+                    // should be stored inline (struct/enum) or as a pointer
+                    // (Box/Ptr/Vec/str/etc).
+                    let declared_ty = declared_field_tys.get(i);
+                    let declared_ir_ty = declared_ty.map(|t| self.lower_type(t));
+                    let is_inline_struct = declared_ir_ty.as_ref()
+                        .map(|t| matches!(t, IrType::Struct(_)))
+                        .unwrap_or(false);
+
                     // Determine how many 8-byte slots this field occupies.
-                    let field_slots = if let IrType::Struct(ref name) = arg_ty {
-                        if let Some(layout) = self.module.get_struct(name) {
-                            ((layout.size + 7) / 8) as u32
-                        } else {
-                            1
-                        }
+                    let field_slots = if is_inline_struct {
+                        if let IrType::Struct(ref name) = declared_ir_ty.as_ref().unwrap() {
+                            if let Some(layout) = self.module.get_struct(name) {
+                                ((layout.size + 7) / 8) as u32
+                            } else { 1 }
+                        } else { 1 }
                     } else {
                         1
                     };
-                    // Store the value at the current field index.
-                    // If it's an enum (multi-slot), we store the whole thing
-                    // by copying from the value's alloca, field by field.
-                    if field_slots == 1 {
+
+                    if is_inline_struct {
+                        // Struct/enum-typed field: copy data inline from the
+                        // arg's alloca into the parent enum's data slots.
+                        // This avoids dangling pointers when the creating
+                        // function returns (C codegen uses stack alloca).
+                        // arg_val is a pointer to the struct (alloca or temporary).
+                        // We use a single memcpy (Inst::Store with store_ty) to
+                        // copy the full struct data into the enum's inline slots.
+                        let dst_ptr = self.emit_inst(Inst::GetFieldPtr {
+                            struct_ptr: ptr,
+                            field_index: field_idx,
+                            field_ty: IrType::I64,
+                        });
+                        let struct_name = if let IrType::Struct(ref name) = declared_ir_ty.as_ref().unwrap() {
+                            name.clone()
+                        } else {
+                            String::new()
+                        };
+                        self.emit_inst(Inst::Store {
+                            ptr: dst_ptr,
+                            value: arg_val,
+                            store_ty: Some(IrType::Struct(struct_name)),
+                        });
+                    } else {
+                        // Non-struct field (Box/Ptr/Vec/str/scalar): store the
+                        // value (which is already a pointer or scalar) directly.
                         let field_ptr = self.emit_inst(Inst::GetFieldPtr {
                             struct_ptr: ptr,
                             field_index: field_idx,
                             field_ty: arg_ty.clone(),
                         });
                         self.emit_inst(Inst::Store { ptr: field_ptr, value: arg_val, store_ty: None });
-                    } else {
-                        // Enum-typed field: copy each sub-slot.
-                        // arg_val is a pointer to the enum (alloca or temporary).
-                        // We copy tag + payload slots into the variant's slots.
-                        for sub_i in 0..field_slots {
-                            let src_ptr = self.emit_inst(Inst::GetFieldPtr {
-                                struct_ptr: arg_val,
-                                field_index: sub_i,
-                                field_ty: IrType::I64,
-                            });
-                            let slot_val = self.emit_inst(Inst::Load { ptr: src_ptr, ty: IrType::I64 });
-                            let dst_ptr = self.emit_inst(Inst::GetFieldPtr {
-                                struct_ptr: ptr,
-                                field_index: field_idx + sub_i,
-                                field_ty: IrType::I64,
-                            });
-                            self.emit_inst(Inst::Store { ptr: dst_ptr, value: slot_val, store_ty: None });
-                        }
                     }
                     field_idx += field_slots;
                 }

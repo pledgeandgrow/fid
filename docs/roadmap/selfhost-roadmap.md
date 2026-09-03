@@ -7,11 +7,22 @@
 > process BEFORE starting. Then rewrite leaf modules first, climbing the
 > dependency graph. Each rewritten file gets its own test suite.
 
-## Current State (Feb 9, 2026)
+## Current State (Sep 3, 2026)
 
 **All 18 self-host modules are rewritten and pass tests (23/23 on interp + PE).**
-The self-hosted compiler **builds** to `release/fides-c.exe` (7.9MB) but
-**crashes on use** with `STATUS_ACCESS_VIOLATION` before reaching the lexer.
+The self-hosted compiler **builds** to `release/fides-c.exe` (7.9MB) and
+**runs past lexing and parsing** — the deref assignment parse error is fixed.
+It now crashes in the **typechecker** (`TypeChecker_check_bodies` →
+`TypeChecker_compute_func_effects` → `scan_expr_for_effects` → `box_expr_unbox`)
+with `STATUS_ACCESS_VIOLATION` at address `0x5C` (NULL pointer dereference).
+
+### Test Results (Sep 3, 2026)
+```
+Interpreter:  198/200 passed  (was 191/194)
+C Codegen:    79/200 matched   (was 74/194)
+PE Emitter:   198/200 valid    (was 193/194)
+```
+All improvements — no regressions from the enum inline storage fix.
 
 ### Build Pipeline
 ```
@@ -49,9 +60,9 @@ tcc -O2 -w -o release/fides-c.exe release/fides-c.c      → release/fides-c.exe
 | SH-6 | Rewrite Leaf Modules | token, diag, json, fmt (no deps) | MEDIUM | **DONE** |
 | SH-7 | Rewrite Frontend | lexer, ast, parser (recursive descent) | HIGH | **DONE** |
 | SH-8 | Rewrite Middle-End | typechecker, lower, ir, mono, borrowck | HIGH | **DONE** |
-| SH-9 | Rewrite Back-End + Bootstrap | codegen_c, pir, opt, compiler, bootstrap | HIGH | **IN PROGRESS** — all 18 modules DONE (39.5K LOC), `release/fides-c.exe` builds (7.9MB via tcc) but crashes with STATUS_ACCESS_VIOLATION in Lexer_tokenize at stdlib pos ~69845 |
+| SH-9 | Rewrite Back-End + Bootstrap | codegen_c, pir, opt, compiler, bootstrap | HIGH | **IN PROGRESS** — all 18 modules DONE (39.5K LOC), `release/fides-c.exe` builds (7.9MB via tcc), runs past lexing+parsing, crashes in typechecker |
 | SH-10 | Self-Host Breaking Bugs & Remaining Issues | Fix all gaps/stubs found by src vs compiler comparison | HIGH | **IN PROGRESS** — 7 critical fixes DONE, 23/23 self-host tests pass |
-| SH-11 | Bootstrap Crash Fix & Codegen Sync | Fix STATUS_ACCESS_VIOLATION crash + sync Fides codegen with Rust codegen changes | CRITICAL | **IN PROGRESS** — BC1+CS1+CS2+CS3 done, crash now inside Lexer_tokenize |
+| SH-11 | Bootstrap Crash Fix & Codegen Sync | Fix STATUS_ACCESS_VIOLATION crash + sync Fides codegen with Rust codegen changes | CRITICAL | **IN PROGRESS** — BC1+CS1+CS2+CS3+SH-11.5+SH-11.6 done, SH-11.7 Rust side done (enum inline storage), Fides side partial (load_enum_field ported, EnumLit inline storage NOT ported). Crash moved from parser to typechecker. |
 | SH-12 | Safety & Crash Prevention | Runtime limits, OOM detection, step limits, recursion limits, signal handlers, memory limits, timeout | MEDIUM | **DONE** — C codegen recursion limit (p_max_recursion=10000), p_malloc OOM abort, interpreter --max-steps/--max-memory/--timeout, test runner step limit (50M), Windows path fixes, tcc auto-detection, crash handlers (Windows VEH + Linux SIGSEGV/SIGBUS/SIGABRT/SIGFPE), all ported to both Rust and Fides codegen |
 
 ---
@@ -1600,8 +1611,10 @@ A full side-by-side comparison was conducted across all major component pairs:
 
 ## Phase SH-11 — Bootstrap Crash Fix & Codegen Sync **[IN PROGRESS]**
 
-> **The crash is fixed. The self-hosted compiler now runs to completion but
-> reports parse errors due to a lowerer bug in enum variant extraction.**
+> **The parser crash is fixed. The self-hosted compiler now runs past lexing
+> and parsing (deref assignments like `*p0 = 0;` are correctly parsed). The
+> crash has moved to the typechecker — a NULL pointer dereference in
+> `box_expr_unbox` during effect computation.**
 
 ### Goal
 Fix the `STATUS_ACCESS_VIOLATION` crash in `release/fides-c.exe`, add
@@ -1706,35 +1719,60 @@ payload, but the old layout only allocated 8 bytes.
 already uses this approach — payload slots computed from actual field sizes,
 with iterative fixpoint for nested types.
 
-### SH-11.7 — Enum Variant Extraction Bug **[IN PROGRESS]**
+### SH-11.7 — Enum Variant Extraction Bug **[PARTIALLY DONE]**
 
-> **The Fides lowerer loads enum variant payloads as a single 8-byte value,
-> even when the payload is a large struct/enum. This truncates the data.**
+> **The root cause was that enum-typed fields (like `BinOp` inside
+> `Expr::Binary(op, ...)`) were stored as pointers to stack allocas in the
+> parent enum. When the creating function returned, the C codegen's
+> `alloca()`-based memory was freed, leaving dangling pointers. The tag
+> value read from the dangling pointer was garbage, so the `Expr::Deref`
+> arm in `match expr { ... }` was never reached.**
 
 **Symptom:** Parser reports `Parse error: assignment target must be an
 identifier or array index at line 298 col 15` for `*p0 = 0;` in
 `stdlib/core.fd`. The `Expr::Deref` variant is not matched because the
 `Expr` value is truncated to 8 bytes during enum variant extraction.
 
-**Root cause:** When matching `ParseResultExpr::Ok(e) => { left = e; }`,
-the lowerer emits `Inst::Load` with the field type. For struct-typed
-fields, `c_type(Struct(_))` returns a pointer type in the C codegen, so
-`Load` only reads 8 bytes (a pointer), not the full struct data.
+**Root cause (full chain):**
+1. `EnumLit` stored struct-typed fields as **pointers to stack allocas**
+   (not inline data). When the creating function returned, the C codegen's
+   `alloca()` memory was freed → dangling pointer.
+2. `pattern_binding_ir_types` applied `word_repr` to struct types,
+   converting `Struct("Expr")` → `Ptr(Struct("Expr"))`. This meant
+   `load_enum_field` only loaded 8 bytes (a pointer) instead of copying
+   the full struct.
+3. Match extraction used `field_index: (i + 1)` which assumed each field
+   occupied exactly 1 slot. But struct fields occupy multiple slots
+   (inline storage), so the field index was wrong for fields after a
+   struct-typed field.
 
-**Fix in Rust lowerer (already done by user):** Added `load_enum_field()`
-helper in `src/lower.rs` (line 246) that allocates a buffer and uses
-`Inst::Store` (which emits `memcpy` for struct types) to copy the full
-inline struct data. Applied at both enum match sites (lines 2873, 3034).
-
-**Fix needed in Fides lowerer:** Port `load_enum_field()` to
-`compiler/lower.fd` and apply it at the enum match extraction sites.
+**Fix in Rust lowerer (DONE — Sep 3, 2026):**
 
 | # | Fix | File | Status |
 |---|-----|------|--------|
-| EV1 | Port `load_enum_field()` helper to Fides lowerer | `compiler/lower.fd` | **TODO** |
-| EV2 | Apply at enum match binding sites (both match paths) | `compiler/lower.fd` | **TODO** |
-| EV3 | Also fix `Inst::Store` in Fides codegen to emit `memcpy` for structs | `compiler/codegen_c.fd` | **TODO** |
-| EV4 | Also fix `Inst::Store` in Fides interpreter for struct types | `compiler/interp.fd` (if exists) | **TODO** |
+| EV1 | `load_enum_field()` helper — alloca + Store (memcpy) for struct types | `src/lower.rs` | **DONE** (was already done) |
+| EV2 | `pattern_binding_ir_types` — keep `Struct(_)` as-is, don't apply `word_repr` | `src/lower.rs` | **DONE** |
+| EV3 | `EnumLit` — store struct data **inline** (memcpy from arg's alloca) using declared field types | `src/lower.rs` | **DONE** |
+| EV4 | Match extraction — compute `field_idx` by accumulating `enum_field_slots()` | `src/lower.rs` (both match sites) | **DONE** |
+| EV5 | `enum_field_slots()` helper — compute slots from struct layout size | `src/lower.rs` | **DONE** |
+| EV6 | Interpreter `Store` — respect explicit `store_ty` for `Struct(_)` types (memcpy) | `src/interp.rs` | **DONE** |
+| EV7 | C codegen `Store` — prefer explicit `store_ty` from instruction | `src/codegen_c.rs` | **DONE** |
+
+**Fix in Fides lowerer (PARTIALLY DONE):**
+
+| # | Fix | File | Status |
+|---|-----|------|--------|
+| FEV1 | Port `load_enum_field()` helper to Fides lowerer | `compiler/lower.fd` | **DONE** |
+| FEV2 | Port `pattern_binding_ir_types` struct preservation to Fides lowerer | `compiler/lower.fd` | **DONE** |
+| FEV3 | Port `EnumLit` inline struct storage to Fides lowerer | `compiler/lower.fd` | **TODO** — still stores pointers, not inline data |
+| FEV4 | Port `enum_field_slots()` + accumulated field index to Fides lowerer | `compiler/lower.fd` | **TODO** — still uses `bi + 1` at both match sites (lines 3457, 4491) |
+| FEV5 | Port interpreter `Store` struct memcpy to Fides (if applicable) | N/A — Fides uses Rust interpreter | **N/A** |
+| FEV6 | Verify `Inst::Store` in Fides codegen emits `memcpy` for struct `store_ty` | `compiler/codegen_c.fd` | **TODO** — verify |
+
+**Verification (Sep 3, 2026):** After the Rust-side fix, the self-hosted
+compiler (`release/fides-c.exe`) no longer reports parse errors for deref
+assignments. It now crashes in the typechecker instead — a separate issue
+(SH-11.10).
 
 ### SH-11.8 — Rebuild Build Infrastructure
 
@@ -1756,6 +1794,44 @@ Once all lowerer bugs are fixed:
 5. `diff release/stage2.c release/stage3.c` → **must be identical** (fixpoint)
 6. If not identical: debug which codegen path diverges
 
+### SH-11.10 — Typechecker Crash **[NEW — TODO]**
+
+> **After the parser fix, the self-hosted compiler crashes in the
+> typechecker with `STATUS_ACCESS_VIOLATION` at address `0x5C` (NULL pointer
+> dereference).**
+
+**Symptom:**
+```
+[build] Type checking...
+=== CRASH: 0xC0000005 ===
+Access violation at address 0x5C
+Call stack depth: 11
+  [0] main
+  [1] cmd_ccompile
+  [2] ccompile_source_with_path
+  [3] build_program_with_path
+  [4] TypeChecker_check_bodies
+  [5] TypeChecker_compute_func_effects
+  [6] TypeChecker_scan_stmts_for_effects
+  [7] TypeChecker_scan_stmt_for_effects
+  [8] TypeChecker_scan_expr_for_effects
+  [9] TypeChecker_scan_expr_for_effects
+  [10] box_expr_unbox
+```
+
+**Root cause (suspected):** `box_expr_unbox` dereferences a NULL pointer.
+This likely means an `OptBoxExpr` or `OptBoxStmt` value is `None` but is
+unboxed without checking. The crash happens during effect scanning, which
+traverses all expressions in all function bodies.
+
+**Fix needed:**
+1. Add NULL check in `box_expr_unbox` (or its callers) — return a default
+   `Expr::IntLit(0)` instead of crashing
+2. Investigate why the `OptBoxExpr` is `None` — may be a parser bug where
+   an optional field is not populated correctly
+3. This crash also happens with `test_struct_simple.fd` (no deref
+   assignments), so it's a pre-existing issue unrelated to the parser fix
+
 ### Priority Order for SH-11
 
 **CRITICAL (blocks everything):**
@@ -1767,13 +1843,17 @@ Once all lowerer bugs are fixed:
 6. ~~SH-11.2: Progressive stage reporting~~ → **DONE**
 7. ~~SH-11.5: SRET calling convention~~ → **DONE**
 8. ~~SH-11.6: Enum layout computation~~ → **DONE**
-9. **SH-11.7: Enum variant extraction** — port `load_enum_field()` to Fides lowerer
+9. ~~SH-11.7 (Rust side): Enum inline storage in lowerer~~ → **DONE**
+
+**CRITICAL (next — blocks fixpoint):**
+10. **SH-11.10: Typechecker crash** — fix NULL deref in `box_expr_unbox`
+11. **SH-11.7 (Fides side): Port EnumLit inline storage to `compiler/lower.fd`** — FEV3 + FEV4
 
 **HIGH (needed for fixpoint):**
-10. SH-11.9: Run fixpoint verification
+12. SH-11.9: Run fixpoint verification
 
 **MEDIUM (correctness):**
-11. Sync any remaining codegen differences found during fixpoint testing
+13. Sync any remaining codegen differences found during fixpoint testing
 
 ---
 

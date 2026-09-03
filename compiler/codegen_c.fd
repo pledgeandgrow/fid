@@ -1958,34 +1958,76 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                 wln(self, "    " + dst + " = *(" + c_type(ty) + "*)" + p + ";");
             }
         }
-        Inst::Store(ptr, value, _) => {
+        Inst::Store(ptr, value, store_ty) => {
             var p: str = val_name(self, ptr);
             var v: str = val_name(self, value);
-            var val_ty: IrType = value_ty_for_id(func, value);
-            if is_ptr_type(val_ty) {
-                wln(self, "    *(void**)" + p + " = (void*)" + v + ";");
-            } else if val_ty == IrType::F64 {
-                wln(self, "    *(double*)" + p + " = " + v + ";");
-            } else if val_ty == IrType::F32 {
-                wln(self, "    *(float*)" + p + " = " + v + ";");
-            } else if val_ty == IrType::Bool {
-                wln(self, "    *(bool*)" + p + " = " + v + ";");
-            } else if val_ty == IrType::I8 {
-                wln(self, "    *(int8_t*)" + p + " = (int8_t)" + v + ";");
-            } else if val_ty == IrType::I16 {
-                wln(self, "    *(int16_t*)" + p + " = (int16_t)" + v + ";");
-            } else if val_ty == IrType::I32 {
-                wln(self, "    *(int32_t*)" + p + " = (int32_t)" + v + ";");
-            } else if val_ty == IrType::U8 {
-                wln(self, "    *(uint8_t*)" + p + " = (uint8_t)" + v + ";");
-            } else if val_ty == IrType::U16 {
-                wln(self, "    *(uint16_t*)" + p + " = (uint16_t)" + v + ";");
-            } else if val_ty == IrType::U32 {
-                wln(self, "    *(uint32_t*)" + p + " = (uint32_t)" + v + ";");
-            } else if val_ty == IrType::U64 {
-                wln(self, "    *(uint64_t*)" + p + " = (uint64_t)" + v + ";");
-            } else {
-                wln(self, "    *(int64_t*)" + p + " = (int64_t)" + v + ";");
+            // Determine the effective store type, matching the Rust codegen:
+            // 1. If store_ty is explicitly set (e.g. by load_enum_field), use it
+            // 2. If the pointer has a Ptr(Struct(_)) type, use the pointee type
+            // 3. Fall back to the value's type
+            var effective_ty: IrType = value_ty_for_id(func, value);
+            match store_ty {
+                OptIrType::Some(ty) => { effective_ty = ty; }
+                OptIrType::None => {
+                    // Check if the pointer's pointee type is a struct
+                    var ptr_meta_ty: IrType = value_ty_for_id(func, ptr);
+                    match ptr_meta_ty {
+                        IrType::Ptr(inner) => {
+                            match box_ir_type_unbox(inner) {
+                                IrType::Struct(_) => { effective_ty = box_ir_type_unbox(inner); }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Struct store: copy the full struct content via memcpy, not just
+            // 8 bytes. The value is a pointer to the source struct data, and
+            // the destination is a pointer to the target buffer. This is
+            // critical for load_enum_field to correctly extract inline enum
+            // payloads (e.g. Expr from ParseResultExpr::Ok(e)).
+            match effective_ty {
+                IrType::Struct(sname) => {
+                    var size: i64 = 8;
+                    var si: i64 = 0;
+                    while si < self.struct_layouts.len() {
+                        if self.struct_layouts.get(si).name == sname {
+                            size = self.struct_layouts.get(si).layout.size;
+                            break;
+                        }
+                        si = si + 1;
+                    }
+                    wln(self, "    memcpy(" + p + ", " + v + ", " + int_to_str(size) + ");");
+                }
+                _ => {
+                    var val_ty: IrType = effective_ty;
+                    if is_ptr_type(val_ty) {
+                        wln(self, "    *(void**)" + p + " = (void*)" + v + ";");
+                    } else if val_ty == IrType::F64 {
+                        wln(self, "    *(double*)" + p + " = " + v + ";");
+                    } else if val_ty == IrType::F32 {
+                        wln(self, "    *(float*)" + p + " = " + v + ";");
+                    } else if val_ty == IrType::Bool {
+                        wln(self, "    *(bool*)" + p + " = " + v + ";");
+                    } else if val_ty == IrType::I8 {
+                        wln(self, "    *(int8_t*)" + p + " = (int8_t)" + v + ";");
+                    } else if val_ty == IrType::I16 {
+                        wln(self, "    *(int16_t*)" + p + " = (int16_t)" + v + ";");
+                    } else if val_ty == IrType::I32 {
+                        wln(self, "    *(int32_t*)" + p + " = (int32_t)" + v + ";");
+                    } else if val_ty == IrType::U8 {
+                        wln(self, "    *(uint8_t*)" + p + " = (uint8_t)" + v + ";");
+                    } else if val_ty == IrType::U16 {
+                        wln(self, "    *(uint16_t*)" + p + " = (uint16_t)" + v + ";");
+                    } else if val_ty == IrType::U32 {
+                        wln(self, "    *(uint32_t*)" + p + " = (uint32_t)" + v + ";");
+                    } else if val_ty == IrType::U64 {
+                        wln(self, "    *(uint64_t*)" + p + " = (uint64_t)" + v + ";");
+                    } else {
+                        wln(self, "    *(int64_t*)" + p + " = (int64_t)" + v + ";");
+                    }
+                }
             }
         }
         Inst::GetFieldPtr(struct_ptr, field_index, _) => {
