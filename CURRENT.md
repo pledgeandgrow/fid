@@ -233,16 +233,45 @@ match field_ty {
 
 **Result:** `tests/hello.fd` compiles end-to-end and produces correct output.
 
-### Test Results (Sep 3, after Rust lowerer fixes)
+### Test Results (Sep 3, after CRLF normalization fix)
 
 ```
 Interpreter:  201/203 passed  (2 pre-existing fails: test_cfg, test_deref_assign)
-C Codegen:    82/203 matched
+C Codegen:    188/203 matched  (was 82 — CRLF fix gained 106 tests)
 PE Emitter:   201/203 valid
 ```
 
 The 2 interpreter failures are pre-existing (test_cfg has a Linux-only fn,
 test_deref_assign has no main function). Not regressions.
+
+**CRLF fix:** The test harness now normalizes `\r\n` → `\n` before comparing
+C codegen output against interpreter output. On Windows, `printf("\n")` produces
+`\r\n` (CRLF) while the interpreter produces `\n` (LF). This caused 106 false
+failures. Fix is in `src/main.rs` line 1622-1626.
+
+**Remaining 15 C codegen failures:**
+
+| Test | Category | Root Cause |
+|------|----------|------------|
+| test_cfg | COMPILE_FAIL | `@cfg(linux)` — test bug, Linux-only fn on Windows |
+| test_deref_assign | COMPILE_FAIL | No `main()` — test bug |
+| test_fmt_real | COMPILE_FAIL | tcc limitation (likely float formatting) |
+| test_deep_nesting | COMPILE_FAIL | tcc limitation (deep recursion?) |
+| test_lower | REAL_DIFF | Pre-existing `ptr_u8` bug (`*u8` vs `*i8`) |
+| test_banking | REAL_DIFF | Float precision: `1432569` vs `126000` |
+| test_error_chain | REAL_DIFF | `100/5 = 0` vs `100/5 = 20` — int division bug |
+| test_http | REAL_DIFF | Extra blank line after HTTP status |
+| test_new_features | REAL_DIFF | C binary crashes — real codegen bug |
+| test_phase8b | REAL_DIFF | C binary crashes mid-output — real codegen bug |
+| test_rc_arc | REAL_DIFF | C binary crashes — Rc/Arc runtime bug |
+| test_regression_collections | REAL_DIFF | Missing struct formatting output |
+| test_vec_math | REAL_DIFF | Float precision: `...475` vs `...476` |
+| test_parallel | LEN_DIFF | Threading output differs (timing) |
+| test_parallel_concurrent | LEN_DIFF | Threading output differs (timing) |
+
+Of these 15: 4 are test bugs, 3 are float/precision, 2 are threading, 6 are
+real codegen bugs (test_lower, test_error_chain, test_new_features,
+test_phase8b, test_rc_arc, test_regression_collections).
 
 ### Crash Progression (Sep 3)
 

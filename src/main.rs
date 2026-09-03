@@ -1620,15 +1620,14 @@ fn main() {
                 let c_ok = if c_compile.as_ref().map(|o| o.status.success()).unwrap_or(false) {
                     if let Ok(c_out) = process::Command::new(&c_exe).output() {
                         let c_stdout = String::from_utf8_lossy(&c_out.stdout).to_string();
-                        let match_result = c_stdout == interp_stdout;
-                        if !match_result && name == "test_borrowck" {
-                            eprintln!("  [DEBUG] test_borrowck: c_stdout={:?} interp_stdout={:?} match={}", c_stdout, interp_stdout, match_result);
-                        }
+                        // Normalize CRLF → LF: the C binary uses printf("\n")
+                        // which on Windows produces \r\n, while the interpreter
+                        // produces \n. Normalize both sides before comparing.
+                        let c_norm = c_stdout.replace("\r\n", "\n");
+                        let i_norm = interp_stdout.replace("\r\n", "\n");
+                        let match_result = c_norm == i_norm;
                         match_result
                     } else {
-                        if name == "test_borrowck" {
-                            eprintln!("  [DEBUG] test_borrowck: failed to run exe");
-                        }
                         false
                     }
                 } else {

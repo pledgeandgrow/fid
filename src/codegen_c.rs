@@ -1287,22 +1287,10 @@ impl CCodeGen {
             wln!(self, "    return (int)result;");
             wln!(self, "}}");
             wln!(self, "");
-            // Windows stack wrapper: run real_main in a thread with 16MB stack
+            // Windows: just call real_main directly.
+            // Stack size is set via PE header patching (build-selfhost.ps1).
             wln!(self, "#ifdef _WIN32");
-            wln!(self, "typedef struct {{ int argc; char** argv; }} __p_main_args;");
-            wln!(self, "static DWORD WINAPI __p_thread_main_wrapper(LPVOID arg) {{");
-            wln!(self, "    __p_main_args* a = (__p_main_args*)arg;");
-            wln!(self, "    return (DWORD)real_main(a->argc, a->argv);");
-            wln!(self, "}}");
-            wln!(self, "int main(int argc, char** argv) {{");
-            wln!(self, "    __p_main_args args = {{ argc, argv }};");
-            wln!(self, "    HANDLE h = CreateThread(NULL, 16*1024*1024, __p_thread_main_wrapper, &args, 0, NULL);");
-            wln!(self, "    if (!h) return 1;");
-            wln!(self, "    WaitForSingleObject(h, INFINITE);");
-            wln!(self, "    DWORD exitCode = 0;");
-            wln!(self, "    GetExitCodeThread(h, &exitCode);");
-            wln!(self, "    return (int)exitCode;");
-            wln!(self, "}}");
+            wln!(self, "int main(int argc, char** argv) {{ return real_main(argc, argv); }}");
             wln!(self, "#else");
             wln!(self, "int main(int argc, char** argv) {{ return real_main(argc, argv); }}");
             wln!(self, "#endif");
