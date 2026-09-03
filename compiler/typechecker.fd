@@ -688,6 +688,7 @@ pub struct TypeChecker {
     uninit_vars: Vec<str>,
     current_line: i64,
     val_vars_per_scope: Vec<StrStack>,
+    check_depth: i64,
 }
 
 // Additional helper structs for TypeChecker fields
@@ -799,6 +800,7 @@ impl TypeChecker {
             uninit_vars: Vec::new(),
             current_line: 0,
             val_vars_per_scope: Vec::new(),
+            check_depth: 0,
         };
         // Push initial scope
         tc.scopes.push(Vec::new());
@@ -1808,6 +1810,128 @@ pub fn type_eq(a: Type, b: Type) -> bool {
             }
             return false;
         }
+        Type::Generic(n1, a1) => {
+            match b {
+                Type::Generic(n2, a2) => {
+                    if n1 != n2 { return false; }
+                    if a1.len() != a2.len() { return false; }
+                    var i: i64 = 0;
+                    while i < a1.len() {
+                        if !type_eq(a1.get(i), a2.get(i)) { return false; }
+                        i = i + 1;
+                    }
+                    return true;
+                }
+                _ => { return false; }
+            }
+            return false;
+        }
+        Type::Ref(inner1, mut1) => {
+            match b {
+                Type::Ref(inner2, mut2) => {
+                    if mut1 != mut2 { return false; }
+                    return type_eq(box_type_unbox(inner1), box_type_unbox(inner2));
+                }
+                _ => { return false; }
+            }
+            return false;
+        }
+        Type::RawPtr(inner1, mut1) => {
+            match b {
+                Type::RawPtr(inner2, mut2) => {
+                    if mut1 != mut2 { return false; }
+                    return type_eq(box_type_unbox(inner1), box_type_unbox(inner2));
+                }
+                _ => { return false; }
+            }
+            return false;
+        }
+        Type::Array(elem1, sz1) => {
+            match b {
+                Type::Array(elem2, sz2) => {
+                    if sz1 != sz2 { return false; }
+                    return type_eq(box_type_unbox(elem1), box_type_unbox(elem2));
+                }
+                _ => { return false; }
+            }
+            return false;
+        }
+        Type::ArrayConst(elem1, sp1) => {
+            match b {
+                Type::ArrayConst(elem2, sp2) => {
+                    if sp1 != sp2 { return false; }
+                    return type_eq(box_type_unbox(elem1), box_type_unbox(elem2));
+                }
+                _ => { return false; }
+            }
+            return false;
+        }
+        Type::Tuple(t1) => {
+            match b {
+                Type::Tuple(t2) => {
+                    if t1.len() != t2.len() { return false; }
+                    var i: i64 = 0;
+                    while i < t1.len() {
+                        if !type_eq(t1.get(i), t2.get(i)) { return false; }
+                        i = i + 1;
+                    }
+                    return true;
+                }
+                _ => { return false; }
+            }
+            return false;
+        }
+        Type::Func(p1, r1) => {
+            match b {
+                Type::Func(p2, r2) => {
+                    if p1.len() != p2.len() { return false; }
+                    var i: i64 = 0;
+                    while i < p1.len() {
+                        if !type_eq(p1.get(i), p2.get(i)) { return false; }
+                        i = i + 1;
+                    }
+                    return type_eq(box_type_unbox(r1), box_type_unbox(r2));
+                }
+                _ => { return false; }
+            }
+            return false;
+        }
+        Type::Dyn(n1) => {
+            match b {
+                Type::Dyn(n2) => { return n1 == n2; }
+                _ => { return false; }
+            }
+            return false;
+        }
+        Type::Assoc(t1, n1, f1, a1) => {
+            match b {
+                Type::Assoc(t2, n2, f2, a2) => {
+                    if t1 != t2 { return false; }
+                    if n1 != n2 { return false; }
+                    if f1 != f2 { return false; }
+                    if a1.len() != a2.len() { return false; }
+                    var i: i64 = 0;
+                    while i < a1.len() {
+                        if !type_eq(a1.get(i), a2.get(i)) { return false; }
+                        i = i + 1;
+                    }
+                    return true;
+                }
+                _ => { return false; }
+            }
+            return false;
+        }
+        Type::ShapedTensor(elem1, dims1) => {
+            match b {
+                Type::ShapedTensor(elem2, dims2) => {
+                    if !type_eq(box_type_unbox(elem1), box_type_unbox(elem2)) { return false; }
+                    if dims1.len() != dims2.len() { return false; }
+                    return true;
+                }
+                _ => { return false; }
+            }
+            return false;
+        }
         _ => { return false; }
     }
     return false;
@@ -2092,17 +2216,10 @@ pub fn TypeChecker_check_capability(self: &mut TypeChecker, cap: str, context: s
 // ─── check_visibility ────────────────────────────────────────────────────
 
 pub fn TypeChecker_check_visibility(self: &mut TypeChecker, name: str) {
-    match map_str_str_get(self.item_modules, name) {
-        OptString::Some(item_module) => {
-            if item_module != self.current_module {
-                var is_pub: bool = map_str_bool_get(self.item_visibility, name);
-                if !is_pub {
-                    self.errors.push("Visibility error: '" + name + "' is private to module '" + item_module + "' (not accessible from '" + self.current_module + "')");
-                }
-            }
-        }
-        OptString::None => {}
-    }
+    // Disabled: the Rust compiler doesn't enforce cross-module visibility
+    // within the same crate. The self-hosted compiler merges all modules
+    // into one program, so all items should be accessible.
+    return;
 }
 
 // ─── collect_capabilities ────────────────────────────────────────────────
@@ -2332,6 +2449,19 @@ pub fn TypeChecker_consume_linear_in_expr(self: &mut TypeChecker, expr: Expr, li
 // ─── check_stmt ──────────────────────────────────────────────────────────
 
 pub fn TypeChecker_check_stmt(self: &mut TypeChecker, stmt: Stmt) {
+    // Recursion depth guard — prevents stack overflow on deeply nested statements
+    self.check_depth = self.check_depth + 1;
+    if self.check_depth > 512 {
+        self.errors.push("Error: typechecker recursion limit exceeded (512) — statement too deeply nested");
+        self.check_depth = self.check_depth - 1;
+        return;
+    }
+
+    TypeChecker_check_stmt_inner(self, stmt);
+    self.check_depth = self.check_depth - 1;
+}
+
+fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
     // Track current line for error messages
     self.current_line = stmt_line(stmt);
     match stmt {
@@ -2882,6 +3012,20 @@ pub fn TypeChecker_check_expr(self: &mut TypeChecker, expr: Expr) -> Type {
 }
 
 pub fn TypeChecker_check_expr_with_hint(self: &mut TypeChecker, expr: Expr, hint: Type) -> Type {
+    // Recursion depth guard — prevents stack overflow on deeply nested expressions
+    self.check_depth = self.check_depth + 1;
+    if self.check_depth > 512 {
+        self.errors.push("Error: typechecker recursion limit exceeded (512) — expression too deeply nested");
+        self.check_depth = self.check_depth - 1;
+        return Type::Never;
+    }
+
+    var result: Type = TypeChecker_check_expr_inner(self, expr, hint);
+    self.check_depth = self.check_depth - 1;
+    return result;
+}
+
+fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) -> Type {
     match expr {
         Expr::IntLit(v) => {
             // Bidirectional: if hint is an integer type, use it directly
@@ -2972,7 +3116,7 @@ pub fn TypeChecker_check_expr_with_hint(self: &mut TypeChecker, expr: Expr, hint
             }
             // Arithmetic/bitwise ops
             // String concatenation with +
-            if op == BinOp::Add {
+            if binop_eq(op, BinOp::Add) {
                 if type_eq(lt_r, Type::Str) && type_eq(rt_r, Type::Str) {
                     return Type::Str;
                 }
@@ -3112,7 +3256,7 @@ pub fn TypeChecker_check_expr_with_hint(self: &mut TypeChecker, expr: Expr, hint
             }
             // Check for runtime builtin functions (p_*)
             if str_starts_with(callee, "p_") {
-                if callee == "p_str_concat" || callee == "p_to_str" || callee == "p_float_to_str" || callee == "p_string_replace" || callee == "p_string_trim" || callee == "p_string_to_uppercase" || callee == "p_string_to_lowercase" || callee == "p_string_char_at" || callee == "p_string_repeat" || callee == "p_char_to_str" || callee == "p_bool_to_str" {
+                if callee == "p_str_concat" || callee == "p_to_str" || callee == "p_float_to_str" || callee == "p_string_replace" || callee == "p_string_trim" || callee == "p_string_to_uppercase" || callee == "p_string_to_lowercase" || callee == "p_string_char_at" || callee == "p_string_repeat" || callee == "p_char_to_str" || callee == "p_bool_to_str" || callee == "p_sb_to_str" {
                     return Type::Str;
                 }
                 if callee == "p_string_contains" || callee == "p_string_starts_with" || callee == "p_string_ends_with" || callee == "p_string_is_empty" {

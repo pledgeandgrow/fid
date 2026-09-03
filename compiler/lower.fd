@@ -873,6 +873,11 @@ pub fn Lowerer_is_user_func(self: &Lowerer, name: str) -> bool {
     }
 }
 
+/// Check if a function exists in the module (user functions only).
+pub fn Lowerer_has_function(self: &Lowerer, name: str) -> bool {
+    return Lowerer_is_user_func(self, name);
+}
+
 pub fn Lowerer_is_struct(self: &Lowerer, name: str) -> bool {
     var i: i64 = 0;
     while i < self.structs.len() {
@@ -1020,6 +1025,25 @@ pub fn Lowerer_resolve_type(self: &Lowerer, ty: Type) -> Type {
 pub fn Lowerer_lower_type(self: &Lowerer, ty: Type) -> IrType {
     var resolved: Type = Lowerer_resolve_type(self, ty);
     return lower_type(resolved);
+}
+
+/// Like lower_type, but converts enum types (e.g. Result<T,E>, Option<T>)
+/// from Generic("Result", ...) to Struct("Result") so that SRET calling
+/// convention treats them as aggregate types.
+/// Used only at function signature boundaries (return type + call sites).
+pub fn Lowerer_lower_type_sret(self: &Lowerer, ty: Type) -> IrType {
+    var ir_ty: IrType = Lowerer_lower_type(self, ty);
+    match ir_ty {
+        IrType::Generic(name, _args) => {
+            var resolved_name: str = Lowerer_resolve_struct_name(self, name);
+            match Lowerer_lookup_enum(self, resolved_name) {
+                OptEnumDef::Some(_def) => { return IrType::Struct(resolved_name); }
+                OptEnumDef::None => {}
+            }
+        }
+        _ => {}
+    }
+    return ir_ty;
 }
 
 pub fn Lowerer_resolve_struct_name(self: &Lowerer, name: str) -> str {
@@ -1271,6 +1295,10 @@ pub fn Lowerer_register_runtime(self: &mut Lowerer) {
 
     // String conversions
     Lowerer_add_extern_2(self, "p_str_concat", ptr_u8(), ptr_u8(), ptr_u8());
+    // Mutable string builder (avoids O(n^2) memory from string concat)
+    Lowerer_add_extern_0(self, "p_sb_new", IrType::I64);
+    Lowerer_add_extern_2(self, "p_sb_append", IrType::I64, ptr_u8(), IrType::Void);
+    Lowerer_add_extern_1(self, "p_sb_to_str", IrType::I64, ptr_u8());  // (sb_ptr) -> str
     Lowerer_add_extern_1(self, "p_to_str", IrType::I64, ptr_u8());
     Lowerer_add_extern_1(self, "p_char_to_str", IrType::I64, ptr_u8());
     Lowerer_add_extern_1(self, "p_float_to_str", IrType::F64, ptr_u8());
@@ -1716,7 +1744,7 @@ pub fn Lowerer_lower_program(self: &mut Lowerer, program: Program) -> IrModule {
     i = 0;
     while i < program.funcs.len() {
         var func: Func = program.funcs.get(i);
-        var ret_ty: IrType = Lowerer_lower_type(self, func.ret_ty);
+        var ret_ty: IrType = Lowerer_lower_type_sret(self, func.ret_ty);
         var ir_func: IrFunction = IrFunction_new(func.name, ret_ty);
         IrModule_add_function(&mut self.module, ir_func);
         Lowerer_insert_func_ret_type(self, func.name, func.ret_ty);
@@ -1833,7 +1861,7 @@ pub enum OptAnnotation {
 // ─── Lower function ───────────────────────────────────────────────────────
 
 pub fn Lowerer_lower_func(self: &mut Lowerer, func: Func) {
-    var ret_ty: IrType = Lowerer_lower_type(self, func.ret_ty);
+    var ret_ty: IrType = Lowerer_lower_type_sret(self, func.ret_ty);
     var ir_func: IrFunction = IrFunction_new(func.name, ret_ty);
     ir_func.is_interrupt = func.is_interrupt;
     ir_func.is_wrapping = has_annotation(func.annotations, "wrapping");
@@ -2126,7 +2154,19 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
                 OptType::Some(t) => {
                     var declared_ir: IrType = Lowerer_lower_type(self, t);
                     if ir_type_is_aggregate(declared_ir) && ir_type_is_ptr(val_ty) {
-                        ir_ty = val_ty;
+                        // Gap 1 fix: If the pointer points to the same struct type,
+                        // use the struct type (inline storage). Otherwise (e.g.
+                        // Vec_get returning *Struct), use the pointer type.
+                        match val_ty {
+                            IrType::Ptr(inner) => {
+                                if ir_type_eq(box_ir_type_unbox(inner), declared_ir) {
+                                    ir_ty = declared_ir;
+                                } else {
+                                    ir_ty = val_ty;
+                                }
+                            }
+                            _ => { ir_ty = val_ty; }
+                        }
                     } else {
                         ir_ty = declared_ir;
                     }
@@ -2142,7 +2182,15 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
                 var _s: i64 = Lowerer_emit_inst(self, Inst::Store(alloca, loaded, OptIrType::None));
                 self.current_func.persist_vars.push(StringValueId_new(name, alloca));
             } else {
-                var _s: i64 = Lowerer_emit_inst(self, Inst::Store(alloca, val, OptIrType::None));
+                // Gap 2 fix: For struct-typed alloca, use store_ty to emit memcpy
+                // (full struct copy). Without this, only 8 bytes (the pointer)
+                // are copied, truncating the struct data.
+                var store_ty: OptIrType = OptIrType::None;
+                match ir_ty {
+                    IrType::Struct(_) => { store_ty = OptIrType::Some(ir_ty); }
+                    _ => {}
+                }
+                var _s: i64 = Lowerer_emit_inst(self, Inst::Store(alloca, val, store_ty));
             }
 
             Lowerer_insert_alloca(self, name, alloca);
@@ -2744,6 +2792,26 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                         OptIrType::Some(t) => { load_ty = t; }
                         OptIrType::None => { load_ty = IrType::I64; }
                     }
+                    // Gap 3 fix: If the alloca holds a struct pointer (SRET case),
+                    // load the pointer.
+                    match load_ty {
+                        IrType::Ptr(inner) => {
+                            match box_ir_type_unbox(inner) {
+                                IrType::Struct(_) => {
+                                    return Lowerer_emit_inst(self, Inst::Load(alloca, load_ty));
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                    // Gap 3 fix: If the alloca holds an inline struct, return
+                    // the alloca pointer directly — the alloca IS the struct
+                    // data, so the pointer to it is the struct value.
+                    match load_ty {
+                        IrType::Struct(_) => { return alloca; }
+                        _ => {}
+                    }
                     return Lowerer_emit_inst(self, Inst::Load(alloca, load_ty));
                 }
                 OptValueId::None => {}
@@ -2783,7 +2851,9 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
 
             // String equality: str == str → p_str_equal
             if (binop_eq(op, BinOp::Eq) || binop_eq(op, BinOp::Neq)) && ir_type_eq(left_ir_ty, ptr_u8()) && ir_type_eq(right_ir_ty, ptr_u8()) {
+                var dummy_env_eq: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
                 var args: Vec<i64> = Vec::new();
+                args.push(dummy_env_eq);
                 args.push(left_val);
                 args.push(right_val);
                 var eq_val: i64 = Lowerer_emit_inst(self, Inst::Call("p_str_equal", args, IrType::Bool, EffectSet_new()));
@@ -3050,6 +3120,12 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                         IrType::Struct(struct_name2) => {
                             mangled_name = struct_name2 + "_" + method;
                         }
+                        IrType::Opaque(type_name2) => {
+                            mangled_name = type_name2 + "_" + method;
+                        }
+                        IrType::Generic(gen_name2, _) => {
+                            mangled_name = gen_name2 + "_" + method;
+                        }
                         _ => {}
                     }
                 }
@@ -3060,7 +3136,53 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                 IrType::Generic(gen_name, _) => {
                     mangled_name = gen_name + "_" + method;
                 }
-                _ => {}
+                _ => {
+                    // Fallback: check AST type of receiver variable.
+                    // Vec/HashMap/String values may be typed as I64 at the IR
+                    // level, so we need to check the AST type to determine
+                    // the correct type name for mangling.
+                    match box_expr_unbox(receiver) {
+                        Expr::Ident(var_name) => {
+                            match Lowerer_lookup_var_ast_type(self, var_name) {
+                                OptType::Some(ast_ty) => {
+                                    var resolved: Type = Lowerer_resolve_type(self, ast_ty);
+                                    // Unwrap &mut / & references
+                                    match resolved {
+                                        Type::Ref(inner_ref, _) => {
+                                            resolved = box_type_unbox(inner_ref);
+                                        }
+                                        _ => {}
+                                    }
+                                    match resolved {
+                                        Type::Generic(gname, _) => {
+                                            mangled_name = gname + "_" + method;
+                                        }
+                                        Type::Named(nname) => {
+                                            mangled_name = nname + "_" + method;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                OptType::None => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Fallback: if mangled_name is still just the method name (no prefix),
+            // try common collection type prefixes. This handles cases where the
+            // receiver is a field access (e.g., self.errors.len()) and the AST
+            // type lookup above didn't find the type.
+            if str_equal(mangled_name, method) {
+                if Lowerer_has_function(self, "Vec_" + method) {
+                    mangled_name = "Vec_" + method;
+                } else if Lowerer_has_function(self, "HashMap_" + method) {
+                    mangled_name = "HashMap_" + method;
+                } else if Lowerer_has_function(self, "String_" + method) {
+                    mangled_name = "String_" + method;
+                }
             }
 
             // Determine return type
@@ -3371,7 +3493,17 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                 }
 
                 var field_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(alloca, field_idx, field_ty));
-                var _s: i64 = Lowerer_emit_inst(self, Inst::Store(field_ptr, field_val, OptIrType::None));
+                // Gap 4 fix: For struct-typed fields, use emit_struct_copy
+                // to copy the full struct data via memcpy. Without this, only
+                // 8 bytes (the pointer) are copied, truncating struct fields.
+                match field_ty {
+                    IrType::Struct(field_struct_name) => {
+                        Lowerer_emit_struct_copy(self, field_val, field_ptr, field_struct_name);
+                    }
+                    _ => {
+                        var _s: i64 = Lowerer_emit_inst(self, Inst::Store(field_ptr, field_val, OptIrType::None));
+                    }
+                }
                 fi = fi + 1;
             }
 
@@ -3487,17 +3619,62 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             return start_val;
         }
         Expr::Ref(e, is_mut) => {
-            // Take a reference — for alloca variables, return the alloca pointer
+            // Take a reference — for alloca variables, return the alloca pointer.
+            // For SRET struct allocas, load the stored struct pointer (avoid
+            // double indirection). For all other expressions, create an alloca,
+            // store the value, and return the pointer.
             match box_expr_unbox(e) {
                 Expr::Ident(name) => {
                     match Lowerer_lookup_alloca(self, name) {
-                        OptValueId::Some(alloca) => { return alloca; }
+                        OptValueId::Some(alloca) => {
+                            // If the variable holds a pointer to a struct (SRET return),
+                            // the alloca stores the struct pointer. &var should return
+                            // the struct pointer (loaded from alloca), not the alloca
+                            // address — otherwise we get an extra level of indirection.
+                            match Lowerer_lookup_alloca_type(self, alloca) {
+                                OptIrType::Some(alloca_ty) => {
+                                    match alloca_ty {
+                                        IrType::Ptr(inner) => {
+                                            match box_ir_type_unbox(inner) {
+                                                IrType::Struct(_) => {
+                                                    return Lowerer_emit_inst(self, Inst::Load(alloca, alloca_ty));
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                OptIrType::None => {}
+                            }
+                            return alloca;
+                        }
                         OptValueId::None => {}
                     }
                 }
                 _ => {}
             }
-            return Lowerer_lower_expr(self, box_expr_unbox(e));
+            // Otherwise: lower the expression, alloca, store, return pointer.
+            var val: i64 = Lowerer_lower_expr(self, box_expr_unbox(e));
+            var val_ty: IrType = Lowerer_get_value_type(self, val);
+            // If the expression already evaluates to a pointer to a struct
+            // (e.g. from a FieldAccess on a &mut parameter), the value IS
+            // the pointer to the struct storage. &mut of this should return
+            // it directly — wrapping it in another alloca creates a double
+            // indirection (**struct instead of *struct) that breaks field
+            // access through the mutable reference.
+            match val_ty {
+                IrType::Ptr(inner) => {
+                    match box_ir_type_unbox(inner) {
+                        IrType::Struct(_) => { return val; }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            var ptr: i64 = Lowerer_emit_inst(self, Inst::Alloca(val_ty, Lowerer_current_region(self)));
+            Lowerer_emit_inst(self, Inst::Store(ptr, val, OptIrType::None));
+            return ptr;
         }
         Expr::Deref(e) => {
             var ptr_val: i64 = Lowerer_lower_expr(self, box_expr_unbox(e));
@@ -3648,7 +3825,9 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                     }
                     Pattern::StrLit(s) => {
                         var const_str: i64 = Lowerer_emit_inst(self, Inst::ConstStr(s));
+                        var dummy_env_se: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
                         var str_eq_args: Vec<i64> = Vec::new();
+                        str_eq_args.push(dummy_env_se);
                         str_eq_args.push(match_val);
                         str_eq_args.push(const_str);
                         var cmp_val: i64 = Lowerer_emit_inst(self, Inst::Call("p_str_equal", str_eq_args, IrType::Bool, EffectSet_new()));
@@ -4702,7 +4881,9 @@ pub fn Lowerer_lower_match(self: &mut Lowerer, expr: Expr, arms: Vec<MatchArm>) 
             }
             Pattern::StrLit(s) => {
                 var const_str: i64 = Lowerer_emit_inst(self, Inst::ConstStr(s));
+                var dummy_env_se2: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
                 var str_eq_args: Vec<i64> = Vec::new();
+                str_eq_args.push(dummy_env_se2);
                 str_eq_args.push(match_val);
                 str_eq_args.push(const_str);
                 var cmp_val: i64 = Lowerer_emit_inst(self, Inst::Call("p_str_equal", str_eq_args, IrType::Bool, EffectSet_new()));

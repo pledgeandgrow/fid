@@ -124,8 +124,9 @@ output: `Hello, Fides!50y is big`
 
 ### 2.5 Fides lowerer gaps (blocks self-compilation, not hello.fd)
 
-The Rust lowerer has 4 fixes the Fides lowerer is missing. These don't block
-`fides-c.exe` (built by Rust compiler), but they block `stage1.exe` (built by
+The Rust lowerer (in `src/lower.rs`) has 5 fixes the Fides lowerer (in
+`compiler/lower.fd`) is missing. These don't block `fides-c.exe` (built by
+the bootstrap compiler), but they block `stage1.exe` (built by
 `fides-c.exe` using the Fides lowerer).
 
 | Gap | Description | Fides line | Rust line |
@@ -134,9 +135,42 @@ The Rust lowerer has 4 fixes the Fides lowerer is missing. These don't block
 | 2 | Stmt::Let store_ty — use `Some(Struct(_))` for struct alloca | ~2145 | 1567-1577 |
 | 3 | Expr::Ident struct alloca — return alloca pointer directly | ~2686 | 3244-3249 |
 | 4 | StructLit field store — use `emit_struct_copy` for struct fields | ~3245 | 4377-4378 |
+| 5 | SRET for enum returns — `lower_type_sret()` converts enum Generic → Struct | TODO | 1296-1316 (NEW) |
 
 See `docs/roadmap/selfhost-roadmap.md` "Fides Lowerer Gaps" section for
 code examples and fix instructions.
+
+### 2.6 Dangling SRET alloca for enum returns — FIXED in Rust lowerer (session 2)
+
+**Symptom:** `test_error_chain` produced `100/5 = 0` instead of `20`. The
+`divide` function returns `Result<i64, i64>`, but the C codegen treated this
+as `void*` (pointer), not a struct. The function allocas the Result on its
+stack and returns the pointer, which dangles when the function returns.
+
+**Root cause:** `IrType::Generic("Result", [I64, I64])` was not recognized as
+an aggregate type for SRET purposes. The SRET check only matched
+`IrType::Struct(_)`. Enums are laid out as structs (tag + data slots) in
+`compute_enum_layout()`, but the IR type remained `Generic`.
+
+**Fix (Rust lowerer only — session 2):** Added `lower_type_sret()` method to
+`src/lower.rs` that converts enum `Generic` types to `Struct` types at
+function signature boundaries (return type + call sites). This triggers the
+existing SRET calling convention. Used at:
+- Function pre-registration (line ~434)
+- Function definition return type (line ~959)
+
+**Not yet ported to Fides lowerer** — `compiler/lower.fd` still uses
+`Generic` for enum return types. This is Gap 5.
+
+### 2.7 Windows `\r\n` doubling in C output — FIXED (session 2)
+
+**Symptom:** `test_http` produced extra blank lines after HTTP status. The
+HTTP response string contains `\r\n` (CRLF), but Windows `printf` translates
+`\n` → `\r\n`, creating `\r\r\n` (doubled carriage returns).
+
+**Fix:** Added `_setmode(_fileno(stdout), _O_BINARY)` and
+`_setmode(_fileno(stderr), _O_BINARY)` in `real_main()` in `src/codegen_c.rs`.
+Also added `#include <io.h>` and `#include <fcntl.h>` for Windows builds.
 
 ---
 

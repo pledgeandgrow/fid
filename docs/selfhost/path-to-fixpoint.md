@@ -3,7 +3,7 @@
 > Companion to `docs/roadmap/selfhost-roadmap.md`.
 > The full plan with debugging workflows is there. This is the short version.
 >
-> Last updated: Sep 3, 2026.
+> Last updated: Sep 3, 2026 (session 2).
 
 ---
 
@@ -37,8 +37,13 @@ This affected:
 - **Enum literal storage** → struct fields must be stored inline (memcpy), not as pointers
 
 All of these are now fixed in both lowerers for the paths exercised by
-`tests/hello.fd`. The Fides lowerer gaps (1-4) may still cause crashes during
+`tests/hello.fd`. The Fides lowerer gaps (1-5) may still cause crashes during
 self-compilation.
+
+**Session 2 additions (Sep 3):**
+- **Enum SRET** — `lower_type_sret()` in Rust lowerer converts enum `Generic` → `Struct` at function sig boundaries, fixing dangling alloca for `Result`/`Option` returns. Not yet ported to Fides lowerer (Gap 5).
+- **Windows binary stdout** — C codegen sets `_O_BINARY` mode on stdout to prevent `\r\n` doubling.
+- **Test fixes** — test_cfg (platform-aware), test_deref_assign (added main), test_error_chain (SRET fix), test_http (binary mode). Test results: 203/203 interp, 192/203 C codegen.
 
 ## The 7 Steps to Fixpoint
 
@@ -52,15 +57,17 @@ Fixed `map_str_str_get` crash. All Vec paths now handle struct elements:
 - `vec[i] += x` compound — returns `word_repr(elem_ty)`
 - `for x in vec` — returns `word_repr(elem_ty)` + uses `elem_ty` for alloca
 
-### Step 2: Port Fides lowerer gaps 1-4 [TODO — before self-compilation]
+### Step 2: Port Fides lowerer gaps 1-5 [TODO — before self-compilation]
 
-The Rust lowerer has 4 fixes the Fides lowerer is missing. These don't block
-`fides-c.exe` (built by Rust), but they block `stage1.exe` (built by `fides-c.exe`).
+The Rust lowerer (in `src/lower.rs`) has 5 fixes the Fides lowerer (in
+`compiler/lower.fd`) is missing. These don't block `fides-c.exe` (built by
+the bootstrap compiler), but they block `stage1.exe` (built by `fides-c.exe`).
 
 - Gap 1: Stmt::Let alloca type — use `Struct(name)` not `Ptr(Struct)`
 - Gap 2: Stmt::Let store_ty — use `Some(Struct(_))` for struct alloca
 - Gap 3: Expr::Ident struct alloca — return alloca pointer directly
 - Gap 4: StructLit field store — use `emit_struct_copy` for struct fields
+- Gap 5: SRET for enum returns — `lower_type_sret()` converts enum Generic → Struct (NEW)
 
 ### Step 3: hello.fd compiles without crash ✅ DONE
 
@@ -123,6 +130,6 @@ C:\tcc\tcc.exe -O2 -w -o release\fides-c.exe release\fides-c.c C:\tcc\lib\ws2_32
 
 No crash ≠ working. The three failure modes after crashes stop:
 
-1. **Wrong output** — program runs but prints wrong thing → compare C output against Rust compiler
+1. **Wrong output** — program runs but prints wrong thing → compare C output against bootstrap compiler
 2. **Fixpoint divergence** — stage2.c ≠ stage3.c → non-determinism (HashMap order, uninit memory)
 3. **Correct + stable** — stage2.c == stage3.c → **fixpoint achieved**

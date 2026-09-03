@@ -72,7 +72,9 @@ pub fn FnRetTypeEntry_new(key: str, ty: IrType) -> FnRetTypeEntry {
 // ─── CCodeGen struct ──────────────────────────────────────────────────────
 
 pub struct CCodeGen {
-    // Accumulated C output
+    // Accumulated C output — uses p_sb (mutable string builder) to avoid
+    // O(n^2) memory blowup from string concatenation.
+    pub sb: i64,
     pub out: str,
     // Map from ValueId to C variable name
     pub value_names: Vec<ValueNameEntry>,
@@ -102,6 +104,7 @@ pub struct CCodeGen {
 
 pub fn CCodeGen_new() -> CCodeGen {
     var cg: CCodeGen = CCodeGen {
+        sb: p_sb_new(),
         out: "",
         value_names: Vec::new(),
         string_consts: Vec::new(),
@@ -124,7 +127,9 @@ pub fn CCodeGen_new() -> CCodeGen {
 // Replaces the Rust wln! macro. All appends end with a newline.
 
 fn wln(self: &mut CCodeGen, s: str) -> void {
-    self.out = self.out + s + "\n";
+    // Use mutable string builder to avoid O(n^2) memory blowup.
+    p_sb_append(self.sb, s);
+    p_sb_append(self.sb, "\n");
 }
 
 // ─── C type helpers ───────────────────────────────────────────────────────
@@ -313,6 +318,7 @@ fn sanitize_c_name(self: &CCodeGen, name: str) -> str {
     if str_equal(name, "min") { return "p_min"; }
     if str_equal(name, "div") { return "p_div"; }
     if str_equal(name, "exit") { return "p_exit"; }
+    if str_equal(name, "remove") { return "p_remove_user"; }
     if str_equal(name, "printf") { return "p_printf"; }
     if str_equal(name, "malloc") { return "p_malloc_user"; }
     if str_equal(name, "free") { return "p_free_user"; }
@@ -658,6 +664,12 @@ fn CCodeGen_insert_runtime_sigs(self: &mut CCodeGen) -> void {
     fn_param_types_set(self, "p_bool_to_str", t1(IrType::Bool));
     fn_param_types_set(self, "p_vec_to_str", t1(ptr_u8()));
     fn_param_types_set(self, "p_str_concat", t2(ptr_u8(), ptr_u8()));
+    fn_param_types_set(self, "p_str_equal", t3(IrType::I64, IrType::I64, IrType::I64));
+    fn_param_types_set(self, "p_str_join_n", t1(ptr_u8()));
+    // String builder
+    fn_param_types_set(self, "p_sb_new", t0());
+    fn_param_types_set(self, "p_sb_append", t2(IrType::I64, ptr_u8()));
+    fn_param_types_set(self, "p_sb_to_str", t1(IrType::I64));
 
     // Print family
     fn_param_types_set(self, "p_print", t1(IrType::I64));
@@ -673,6 +685,9 @@ fn CCodeGen_insert_runtime_sigs(self: &mut CCodeGen) -> void {
     fn_param_types_set(self, "p_free", t1(ptr_u8()));
     fn_param_types_set(self, "p_region_free", t1(ptr_u8()));
     fn_param_types_set(self, "p_panic", t1(ptr_u8()));
+    fn_param_types_set(self, "p_malloc_persistent", t1(IrType::I64));
+    fn_param_types_set(self, "p_arena_save", t0());
+    fn_param_types_set(self, "p_arena_restore", t1(IrType::I64));
     fn_param_types_set(self, "println", t2(ptr_u8(), ptr_u8()));
 
     // Kernel / system
@@ -851,6 +866,7 @@ fn CCodeGen_insert_runtime_sigs(self: &mut CCodeGen) -> void {
     void_rets.push("p_print_newline");
     void_rets.push("p_free");
     void_rets.push("p_region_free");
+    void_rets.push("p_arena_restore");
     void_rets.push("p_panic");
     void_rets.push("p_socket_close");
     void_rets.push("p_cli");
@@ -1357,6 +1373,10 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "char* p_bool_to_str(bool val);");
     wln(self, "char* p_vec_to_str(PVec* v);");
     wln(self, "char* p_str_concat(const char* a, const char* b);");
+    wln(self, "char* p_str_join_n(PVec* parts);");
+    wln(self, "int64_t p_sb_new(void);");
+    wln(self, "void p_sb_append(int64_t sb, const char* s);");
+    wln(self, "char* p_sb_to_str(int64_t sb);");
     wln(self, "void p_print(int64_t val);");
     wln(self, "void p_print_str(const char* s);");
     wln(self, "void p_print_int(int64_t val);");
@@ -1383,6 +1403,7 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "void p_call_stack_pop(void) { if (p_call_stack_depth > 0) p_call_stack_depth--; }");
     wln(self, "void p_set_max_recursion(int limit) { p_max_recursion = limit; }");
     wln(self, "void* p_malloc(int64_t size);");
+    wln(self, "void* p_malloc_persistent(int64_t size);");
     wln(self, "void p_free(void* ptr);");
     wln(self, "char* p_file_read(const char* path);");
     wln(self, "int64_t p_file_write(const char* path, const char* content);");
@@ -1902,8 +1923,15 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
             wln(self, "    " + dst + " = " + int_to_str(value) + "LL;");
         }
         Inst::ConstFloat(value, ty) => {
-            // value is an f64; emit it directly as a C float literal
-            if ty == IrType::F32 {
+            // Emit float constant as a C literal.
+            // Note: float_to_str produces "nan"/"inf"/"-inf" for special values,
+            // which are valid C99 literals. For normal values, decimal notation
+            // is sufficient. The Rust codegen uses a union compound literal to
+            // preserve exact IEEE 754 bit patterns (NaN payloads, -0.0), but
+            // the Fides ConstFloat stores f64 directly (not bits), so we can't
+            // do that without a float_to_bits runtime function.
+            // TODO: Add p_float_to_bits to runtime for exact bit preservation.
+            if ir_type_eq(ty, IrType::F32) {
                 wln(self, "    " + dst + " = (float)" + float_to_str(value) + ";");
             } else {
                 wln(self, "    " + dst + " = (double)" + float_to_str(value) + ";");
@@ -2014,25 +2042,25 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                     var val_ty: IrType = effective_ty;
                     if is_ptr_type(val_ty) {
                         wln(self, "    *(void**)" + p + " = (void*)" + v + ";");
-                    } else if val_ty == IrType::F64 {
+                    } else if ir_type_eq(val_ty, IrType::F64) {
                         wln(self, "    *(double*)" + p + " = " + v + ";");
-                    } else if val_ty == IrType::F32 {
+                    } else if ir_type_eq(val_ty, IrType::F32) {
                         wln(self, "    *(float*)" + p + " = " + v + ";");
-                    } else if val_ty == IrType::Bool {
+                    } else if ir_type_eq(val_ty, IrType::Bool) {
                         wln(self, "    *(bool*)" + p + " = " + v + ";");
-                    } else if val_ty == IrType::I8 {
+                    } else if ir_type_eq(val_ty, IrType::I8) {
                         wln(self, "    *(int8_t*)" + p + " = (int8_t)" + v + ";");
-                    } else if val_ty == IrType::I16 {
+                    } else if ir_type_eq(val_ty, IrType::I16) {
                         wln(self, "    *(int16_t*)" + p + " = (int16_t)" + v + ";");
-                    } else if val_ty == IrType::I32 {
+                    } else if ir_type_eq(val_ty, IrType::I32) {
                         wln(self, "    *(int32_t*)" + p + " = (int32_t)" + v + ";");
-                    } else if val_ty == IrType::U8 {
+                    } else if ir_type_eq(val_ty, IrType::U8) {
                         wln(self, "    *(uint8_t*)" + p + " = (uint8_t)" + v + ";");
-                    } else if val_ty == IrType::U16 {
+                    } else if ir_type_eq(val_ty, IrType::U16) {
                         wln(self, "    *(uint16_t*)" + p + " = (uint16_t)" + v + ";");
-                    } else if val_ty == IrType::U32 {
+                    } else if ir_type_eq(val_ty, IrType::U32) {
                         wln(self, "    *(uint32_t*)" + p + " = (uint32_t)" + v + ";");
-                    } else if val_ty == IrType::U64 {
+                    } else if ir_type_eq(val_ty, IrType::U64) {
                         wln(self, "    *(uint64_t*)" + p + " = (uint64_t)" + v + ";");
                     } else {
                         wln(self, "    *(int64_t*)" + p + " = (int64_t)" + v + ";");
@@ -2101,6 +2129,147 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
         }
         Inst::Call(fname, args, ret_ty, _) => {
             var c_fname: str = sanitize_c_name(self, fname);
+
+            // Special-case: print is polymorphic — dispatch based on arg type
+            if str_equal(fname, "print") && args.len() > 0 {
+                var arg_val: i64 = args.get(0);
+                var arg_ty: IrType = value_ty_for_id(func, arg_val);
+                var arg_str: str = val_name(self, arg_val);
+                match arg_ty {
+                    IrType::Opaque(oname) => {
+                        if str_equal(oname, "any") {
+                            wln(self, "    p_print_int((int64_t)" + arg_str + ");");
+                        } else if str_equal(oname, "Vec") {
+                            wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + arg_str + "); p_print_str(_s); }");
+                        } else if str_equal(oname, "HashMap") {
+                            wln(self, "    { char* _s = p_to_str_map((PMap*)" + arg_str + "); p_print_str(_s); free(_s); }");
+                        } else if str_equal(oname, "Tensor") {
+                            wln(self, "    { char* _s = p_tensor_to_str((PTensor*)" + arg_str + "); p_print_str(_s); free(_s); }");
+                        } else {
+                            wln(self, "    p_print_str(" + arg_str + ");");
+                        }
+                    }
+                    IrType::Generic(gname, _) => {
+                        if str_equal(gname, "Vec") {
+                            wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + arg_str + "); p_print_str(_s); }");
+                        } else if str_equal(gname, "HashMap") {
+                            wln(self, "    { char* _s = p_to_str_map((PMap*)" + arg_str + "); p_print_str(_s); free(_s); }");
+                        } else {
+                            wln(self, "    p_print_int((int64_t)" + arg_str + ");");
+                        }
+                    }
+                    IrType::Ptr(_) => {
+                        wln(self, "    p_print_str(" + arg_str + ");");
+                    }
+                    IrType::F64 => {
+                        wln(self, "    p_print_float(" + arg_str + ");");
+                    }
+                    IrType::Bool => {
+                        wln(self, "    p_print_bool(" + arg_str + ");");
+                    }
+                    _ => {
+                        wln(self, "    p_print_int((int64_t)" + arg_str + ");");
+                    }
+                }
+                if !is_void_or_never(ret_ty) {
+                    wln(self, "    " + dst + " = 0;");
+                }
+                return;
+            }
+
+            // Special-case: println is polymorphic — dispatch on value (2nd arg)
+            if str_equal(fname, "println") && args.len() >= 2 {
+                var arg_val: i64 = args.get(1);
+                var arg_ty: IrType = value_ty_for_id(func, arg_val);
+                var arg_str: str = val_name(self, arg_val);
+                match arg_ty {
+                    IrType::Opaque(oname) => {
+                        if str_equal(oname, "any") {
+                            wln(self, "    p_print_int((int64_t)" + arg_str + ");");
+                        } else if str_equal(oname, "Vec") {
+                            wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + arg_str + "); p_print_str(_s); }");
+                        } else if str_equal(oname, "HashMap") {
+                            wln(self, "    { char* _s = p_to_str_map((PMap*)" + arg_str + "); p_print_str(_s); free(_s); }");
+                        } else if str_equal(oname, "Tensor") {
+                            wln(self, "    { char* _s = p_tensor_to_str((PTensor*)" + arg_str + "); p_print_str(_s); free(_s); }");
+                        } else {
+                            wln(self, "    p_print_str(" + arg_str + ");");
+                        }
+                    }
+                    IrType::Generic(gname, _) => {
+                        if str_equal(gname, "Vec") {
+                            wln(self, "    { char* _s = (char*)Vec_to_str(0, (int64_t)" + arg_str + "); p_print_str(_s); }");
+                        } else if str_equal(gname, "HashMap") {
+                            wln(self, "    { char* _s = p_to_str_map((PMap*)" + arg_str + "); p_print_str(_s); free(_s); }");
+                        } else {
+                            wln(self, "    p_print_int((int64_t)" + arg_str + ");");
+                        }
+                    }
+                    IrType::Ptr(_) => {
+                        wln(self, "    p_print_str(" + arg_str + ");");
+                    }
+                    IrType::F64 => {
+                        wln(self, "    p_print_float(" + arg_str + ");");
+                    }
+                    IrType::Bool => {
+                        wln(self, "    p_print_bool(" + arg_str + ");");
+                    }
+                    _ => {
+                        wln(self, "    p_print_int((int64_t)" + arg_str + ");");
+                    }
+                }
+                wln(self, "    p_print_newline();");
+                if !is_void_or_never(ret_ty) {
+                    wln(self, "    " + dst + " = 0;");
+                }
+                return;
+            }
+
+            // Special-case: p_to_str is polymorphic — dispatch based on arg type
+            if str_equal(fname, "p_to_str") && args.len() > 0 {
+                var arg_val: i64 = args.get(0);
+                var arg_ty: IrType = value_ty_for_id(func, arg_val);
+                var arg_str: str = val_name(self, arg_val);
+                match arg_ty {
+                    IrType::F64 => {
+                        wln(self, "    " + dst + " = (void*)p_to_str_float(" + arg_str + ");");
+                    }
+                    IrType::F32 => {
+                        wln(self, "    " + dst + " = (void*)p_to_str_float(" + arg_str + ");");
+                    }
+                    IrType::Opaque(oname) => {
+                        if str_equal(oname, "Vec") {
+                            wln(self, "    " + dst + " = (void*)Vec_to_str(0, (int64_t)" + arg_str + ");");
+                        } else if str_equal(oname, "HashMap") {
+                            wln(self, "    " + dst + " = (void*)p_to_str_map((PMap*)" + arg_str + ");");
+                        } else if str_equal(oname, "Tensor") {
+                            wln(self, "    " + dst + " = (void*)p_tensor_to_str((PTensor*)" + arg_str + ");");
+                        } else {
+                            wln(self, "    " + dst + " = (void*)p_to_str_str((char*)" + arg_str + ");");
+                        }
+                    }
+                    IrType::Generic(gname, _) => {
+                        if str_equal(gname, "Vec") {
+                            wln(self, "    " + dst + " = (void*)Vec_to_str(0, (int64_t)" + arg_str + ");");
+                        } else if str_equal(gname, "HashMap") {
+                            wln(self, "    " + dst + " = (void*)p_to_str_map((PMap*)" + arg_str + ");");
+                        } else {
+                            wln(self, "    " + dst + " = (void*)p_to_str((int64_t)" + arg_str + ");");
+                        }
+                    }
+                    IrType::Bool => {
+                        wln(self, "    " + dst + " = (void*)p_to_str_bool(" + arg_str + ");");
+                    }
+                    IrType::Ptr(_) => {
+                        wln(self, "    " + dst + " = (void*)p_to_str_str((char*)" + arg_str + ");");
+                    }
+                    _ => {
+                        wln(self, "    " + dst + " = (void*)p_to_str((int64_t)" + arg_str + ");");
+                    }
+                }
+                return;
+            }
+
             var param_types: OptVecIrType = fn_param_types_get(self, fname);
             var arg_strs: str = "";
             var i: i64 = 0;
@@ -2451,6 +2620,8 @@ pub fn CCodeGen_generate(self: &mut CCodeGen, module: IrModule) -> str {
 
     emit_main_wrapper(self, module);
     emit_runtime_impl(self);
+    // Convert the string builder to the final output string
+    self.out = p_sb_to_str(self.sb);
     return self.out;
 }
 
@@ -2624,6 +2795,54 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    char* result = (char*)p_malloc((int64_t)(len + 1));");
     wln(self, "    strcpy(result, a);");
     wln(self, "    strcat(result, b);");
+    wln(self, "    return result;");
+    wln(self, "}");
+    wln(self, "");
+    // Efficient join: calculates total length first, allocates once, copies.
+    // parts is a Vec<str> (PVec of char* pointers).
+    wln(self, "char* p_str_join_n(PVec* parts) {");
+    wln(self, "    size_t total = 1; /* null terminator */");
+    wln(self, "    for (int64_t i = 0; i < parts->len; i++) {");
+    wln(self, "        total += strlen((char*)parts->data[i]);");
+    wln(self, "    }");
+    wln(self, "    char* result = (char*)p_malloc((int64_t)total);");
+    wln(self, "    result[0] = 0;");
+    wln(self, "    for (int64_t i = 0; i < parts->len; i++) {");
+    wln(self, "        strcat(result, (char*)parts->data[i]);");
+    wln(self, "    }");
+    wln(self, "    return result;");
+    wln(self, "}");
+    wln(self, "");
+    // Mutable string builder — avoids O(n^2) memory from repeated str_concat.
+    // Uses realloc-based growth (via p_malloc_persistent) so old buffers are freed.
+    wln(self, "typedef struct { char* buf; int64_t len; int64_t cap; } PStrBuilder;");
+    wln(self, "int64_t p_sb_new(void) {");
+    wln(self, "    PStrBuilder* sb = (PStrBuilder*)p_malloc_persistent(sizeof(PStrBuilder));");
+    wln(self, "    sb->cap = 4096;");
+    wln(self, "    sb->len = 0;");
+    wln(self, "    sb->buf = (char*)p_malloc_persistent(sb->cap);");
+    wln(self, "    sb->buf[0] = 0;");
+    wln(self, "    return (int64_t)sb;");
+    wln(self, "}");
+    wln(self, "void p_sb_append(int64_t sbv, const char* s) {");
+    wln(self, "    PStrBuilder* sb = (PStrBuilder*)sbv;");
+    wln(self, "    int64_t slen = (int64_t)strlen(s);");
+    wln(self, "    if (sb->len + slen + 1 > sb->cap) {");
+    wln(self, "        while (sb->len + slen + 1 > sb->cap) sb->cap *= 2;");
+    wln(self, "        char* nb = (char*)p_malloc_persistent(sb->cap);");
+    wln(self, "        memcpy(nb, sb->buf, sb->len);");
+    wln(self, "        nb[sb->len] = 0;");
+    wln(self, "        sb->buf = nb; /* old buffer leaked in persistent pool — acceptable */");
+    wln(self, "    }");
+    wln(self, "    memcpy(sb->buf + sb->len, s, slen);");
+    wln(self, "    sb->len += slen;");
+    wln(self, "    sb->buf[sb->len] = 0;");
+    wln(self, "}");
+    wln(self, "char* p_sb_to_str(int64_t sbv) {");
+    wln(self, "    PStrBuilder* sb = (PStrBuilder*)sbv;");
+    wln(self, "    char* result = (char*)p_malloc(sb->len + 1);");
+    wln(self, "    memcpy(result, sb->buf, sb->len);");
+    wln(self, "    result[sb->len] = 0;");
     wln(self, "    return result;");
     wln(self, "}");
     wln(self, "");

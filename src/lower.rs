@@ -431,7 +431,7 @@ impl Lowerer {
         // Pre-register all function signatures so calls can look up return types
         // before the function body is lowered
         for func in &program.funcs {
-            let ret_ty = self.lower_type(&func.ret_ty);
+            let ret_ty = self.lower_type_sret(&func.ret_ty);
             let ir_func = IrFunction::new(func.name.clone(), ret_ty);
             self.module.functions.insert(func.name.clone(), ir_func);
             // Store AST return type for tuple element type lookup
@@ -591,6 +591,18 @@ impl Lowerer {
         self.module.add_extern("p_free", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Void);
         self.module.add_extern("p_str_concat",
             vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))],
+            IrType::Ptr(Box::new(IrType::U8)));
+        // Mutable string builder — avoids O(n^2) memory from string concat
+        self.module.add_extern("p_sb_new", vec![], IrType::I64);
+        self.module.add_extern("p_sb_append",
+            vec![IrType::I64, IrType::Ptr(Box::new(IrType::U8))],
+            IrType::Void);
+        self.module.add_extern("p_sb_to_str",
+            vec![IrType::I64],
+            IrType::Ptr(Box::new(IrType::U8)));
+        // Efficient string join (allocates once, copies all parts)
+        self.module.add_extern("p_str_join_n",
+            vec![IrType::Ptr(Box::new(IrType::U8))],
             IrType::Ptr(Box::new(IrType::U8)));
         self.module.add_extern("p_to_str",
             vec![IrType::I64],
@@ -956,7 +968,7 @@ impl Lowerer {
 
     /// Lower a single function
     fn lower_func(&mut self, func: &Func) {
-        let ret_ty = self.lower_type(&func.ret_ty);
+        let ret_ty = self.lower_type_sret(&func.ret_ty);
         let mut ir_func = IrFunction::new(func.name.clone(), ret_ty.clone());
         ir_func.is_interrupt = func.is_interrupt;
         // F65: @wrapping annotation — use wrap-around arithmetic instead of checked
@@ -1297,6 +1309,21 @@ impl Lowerer {
     fn lower_type(&self, ty: &Type) -> IrType {
         let resolved = self.resolve_type(ty);
         crate::ir::lower_type(&resolved)
+    }
+
+    /// Like lower_type, but converts enum types (e.g. Result<T,E>, Option<T>)
+    /// from Generic("Result", ...) to Struct("Result") so that SRET calling
+    /// convention and codegen treat them as aggregate types.
+    /// Used only at function signature boundaries (return type + call sites).
+    fn lower_type_sret(&self, ty: &Type) -> IrType {
+        let ir_ty = self.lower_type(ty);
+        if let IrType::Generic(ref name, _) = ir_ty {
+            let resolved_name = self.resolve_struct_name(name);
+            if self.enums.contains_key(&resolved_name) {
+                return IrType::Struct(resolved_name);
+            }
+        }
+        ir_ty
     }
 
     /// Resolve a type name (possibly an alias) to its underlying struct name

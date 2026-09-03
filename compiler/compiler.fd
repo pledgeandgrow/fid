@@ -570,7 +570,9 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
             }
             p_eprint_str("[build] Parsing user code...\n");
             var p: Parser = Parser_with_names(tokens, struct_names, enum_names);
+            p_eprint_str("[build] Parser created. Calling parse()...\n");
             var user_result: ParseResultProgram = p.parse();
+            p_eprint_str("[build] Parse done.\n");
             match user_result {
                 ParseResultProgram::Err(e) => {
                     var file2: str = "<stdin>";
@@ -610,23 +612,38 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                     }
 
                     if has_source_path {
+                        p_eprint_str("[build] Resolving imports...\n");
                         // Collect imports to process (LIFO — reversed so earlier
                         // imports are processed first via pop())
                         var imports_to_process: Vec<str> = Vec::new();
                         var ui: i64 = user.imports.len() - 1;
+                        p_eprint_str("[build] user.imports.len() = ");
+                        p_eprint_str(int_to_str(user.imports.len()));
+                        p_eprint_str("\n");
                         while ui >= 0 {
                             imports_to_process.push(user.imports.get(ui).path);
                             ui = ui - 1;
                         }
+
+                        // Track modules that are currently deferred (waiting for deps).
+                        // If a module is deferred again while already in this set,
+                        // it means there's a cyclic import — report an error.
+                        var currently_deferred: Vec<str> = Vec::new();
 
                         var project_root: str = find_project_root(base_dir);
 
                         while imports_to_process.len() > 0 {
                             var import_path: str = imports_to_process.get(imports_to_process.len() - 1);
                             imports_to_process.pop();
+                            p_eprint_str("[build] Processing import: ");
+                            p_eprint_str(import_path);
+                            p_eprint_str("\n");
 
                             // Skip "core" — auto-included
                             if str_equal(import_path, "core") { continue; }
+
+                            // Skip already-loaded modules
+                            if c_str_vec_contains(loaded_module_names, import_path) { continue; }
                             // Skip already-loaded
                             if c_str_vec_contains(loaded_module_names, import_path) { continue; }
 
@@ -693,7 +710,16 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                         }
 
                                         if unloaded_deps.len() > 0 {
+                                            // Cycle detection: if this module is already deferred,
+                                            // it means we're in a cyclic import chain.
+                                            if c_str_vec_contains(currently_deferred, import_path) {
+                                                p_eprint_str("[build] WARNING: cyclic import detected involving '");
+                                                p_eprint_str(import_path);
+                                                p_eprint_str("' — skipping\n");
+                                                continue;
+                                            }
                                             // Defer: push this module back, then push deps
+                                            currently_deferred.push(import_path);
                                             imports_to_process.push(import_path);
                                             var di2: i64 = 0;
                                             while di2 < unloaded_deps.len() {
@@ -720,6 +746,16 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                                 }
                                                 loaded_module_names.push(import_path);
                                                 loaded_module_names.push(mod_name);
+
+                                                // Clear from deferred set — successfully loaded
+                                                var deferred_idx: i64 = 0;
+                                                while deferred_idx < currently_deferred.len() {
+                                                    if str_equal(currently_deferred.get(deferred_idx), import_path) {
+                                                        currently_deferred.remove(deferred_idx);
+                                                        break;
+                                                    }
+                                                    deferred_idx = deferred_idx + 1;
+                                                }
 
                                                 // Extract names for future imports
                                                 var si2: i64 = 0;

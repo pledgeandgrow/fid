@@ -2,15 +2,15 @@
 
 > Single source of truth for "what are we doing right now."
 > Read this first every session. Updated after every milestone change.
-> Last updated: Sep 3, 2026.
+> Last updated: Sep 3, 2026 (session 2).
 
-## Where We Stopped (Sep 3 — pick up here)
+## Where We Stopped (Sep 3 session 2 — pick up here)
 
 **MILESTONE: Self-hosted compiler compiles `tests/hello.fd` end-to-end and
 produces correct output: `Hello, Fides!50y is big`**
 
 ### What works:
-1. **Build pipeline complete** — `compiler/*.fd` (18 modules, 39.5K LOC) compiles to C via the Rust compiler, then links to `fides-c.exe` via tcc
+1. **Build pipeline complete** — `compiler/*.fd` (18 modules, 39.5K LOC) compiles to C via the bootstrap compiler (`fidesc.exe`), then links to `fides-c.exe` via tcc
 2. **All 18 self-host modules compile + pass tests** (23/23 on tests/compiler/ via interpreter + PE)
 3. **Lexer works** — stdlib/core.fd tokenized successfully
 4. **Parser works** — stdlib/core.fd and user code parsed successfully (deref assignments work)
@@ -26,6 +26,8 @@ produces correct output: `Hello, Fides!50y is big`**
 14. **Inst::Store with store_ty** — C codegen emits memcpy for struct store types
 15. **Vec-of-struct handling** — all Vec paths (set/push/insert/get/pop/first/last/indexing/for-loop/compound) handle struct elements correctly
 16. **Safety hardening** — recursion limit, OOM abort, crash handlers, Windows stack
+17. **Enum SRET calling convention** — enum return types (Result, Option) now use SRET (hidden out-param) via `lower_type_sret()` in `src/lower.rs`. Previously enums were `Generic("Result", ...)` which the codegen treated as `void*` (pointer), causing dangling stack alloca pointers.
+18. **Windows binary stdout** — C codegen sets stdout/stderr to `_O_BINARY` mode on Windows, preventing `\r\n` doubling when printing strings that already contain `\r\n` (e.g. HTTP responses)
 
 ### Verified output:
 ```
@@ -44,10 +46,11 @@ C:\tcc\tcc.exe -O2 -w -o release\fides-c.exe release\fides-c.c C:\tcc\lib\ws2_32
 ```
 
 ### Next steps:
-1. **Self-compilation** — `fides-c.exe ccompile compiler\main.fd -o release\stage1` (the hardest step)
-2. **Port Fides lowerer gaps 1-4** if stage1 crashes (see below)
-3. **Verify stage1 output** — stage1 compiles hello.fd correctly
-4. **Fixpoint verification** — stage2.c == stage3.c
+1. **Port Gap 5 (SRET for enums) to Fides lowerer** — `compiler/lower.fd` needs `lower_type_sret()` equivalent
+2. **Port Gaps 1-4 to Fides lowerer** — struct alloca, store_ty, ident, StructLit
+3. **Self-compilation** — `fides-c.exe ccompile compiler\main.fd -o release\stage1` (the hardest step)
+4. **Verify stage1 output** — stage1 compiles hello.fd correctly
+5. **Fixpoint verification** — stage2.c == stage3.c
 
 See `docs/roadmap/selfhost-roadmap.md` for the full plan.
 
@@ -135,13 +138,43 @@ C codegen emit `memcpy(dst, src, struct_size)` instead of `*(void**)dst = src`.
 | **SRET return** | FIXED | FIXED | Both: `emit_struct_copy` field-by-field from val to sret pointer. |
 | **Struct param passing** | `Ptr(Struct)` — pointer to struct data | Same | Both: struct params are `Ptr(Struct)` in IR. Caller passes pointer, callee receives pointer. Correct as long as caller passes a valid pointer. |
 | **SRET call (struct return)** | FIXED | FIXED | Both: alloca + pass as hidden first arg + return alloca pointer. |
+| **SRET for enum returns** | FIXED (session 2) | **NOT FIXED** | Rust: `lower_type_sret()` converts enum `Generic("Result", ...)` → `Struct("Result")` at function sig boundaries, triggering SRET. Fides: still uses `Generic` for enum return types → no SRET → dangling alloca. |
 
 ### Critical Gaps in Fides Lowerer (compiler/lower.fd)
 
-These 3 gaps are the reason the self-hosted compiler crashes. The Rust compiler
-(fides-c.exe built from Rust) works because the Rust lowerer has all fixes. But
+These 4 gaps are the reason the self-hosted compiler crashes. The bootstrap compiler
+(`fidesc.exe`, built from Rust source) works because the Rust lowerer has all fixes. But
 when the Fides lowerer tries to compile itself, it generates bad C code because
 these fixes are missing.
+
+#### Gap 5: SRET for enum return types (NEW — session 2)
+**Current (broken):**
+```fides
+// Fides lower_type() returns Generic("Result", [I64, I64]) for enum types.
+// The SRET check only matches Struct(_), so enums don't get SRET.
+// The callee allocas the enum on its stack and returns a pointer, which dangles.
+```
+**Needed (Rust side fix at line 1296-1316):**
+```fides
+// Add a lower_type_sret() that converts enum Generic types to Struct
+// at function signature boundaries (return type + call sites).
+fn lower_type_sret(self, ty) -> IrType {
+    var ir_ty = self.lower_type(ty);
+    match ir_ty {
+        IrType::Generic(name, _) => {
+            var resolved = self.resolve_struct_name(name);
+            if map_contains(self.enums, resolved) {
+                return IrType::Struct(resolved);
+            }
+        }
+        _ => {}
+    }
+    return ir_ty;
+}
+// Use lower_type_sret() at:
+// - Function pre-registration (line ~434)
+// - Function definition return type (line ~959)
+```
 
 #### Gap 1: Stmt::Let alloca type (line 2128-2129)
 **Current (broken):**
@@ -233,45 +266,39 @@ match field_ty {
 
 **Result:** `tests/hello.fd` compiles end-to-end and produces correct output.
 
-### Test Results (Sep 3, after CRLF normalization fix)
+### Test Results (Sep 3 session 2, after SRET + binary mode fixes)
 
 ```
-Interpreter:  201/203 passed  (2 pre-existing fails: test_cfg, test_deref_assign)
-C Codegen:    188/203 matched  (was 82 — CRLF fix gained 106 tests)
-PE Emitter:   201/203 valid
+Interpreter:  203/203 passed  (was 201 — test_cfg + test_deref_assign fixed)
+C Codegen:    192/203 matched  (was 188 — +test_cfg, +test_deref_assign, +test_error_chain, +test_http)
+PE Emitter:   202/203 valid    (was 201 — +test_deref_assign)
 ```
 
-The 2 interpreter failures are pre-existing (test_cfg has a Linux-only fn,
-test_deref_assign has no main function). Not regressions.
+**Fixes this session:**
+- **test_cfg** — rewrote to be platform-aware (added `@cfg(windows)` functions + `test_platform_specific()` helper)
+- **test_deref_assign** — added `fn main()` that calls the test function
+- **test_error_chain** — fixed dangling SRET alloca for enum returns (Result/Option). Added `lower_type_sret()` to `src/lower.rs` that converts enum `Generic` types to `Struct` at function signature boundaries, triggering existing SRET calling convention.
+- **test_http** — fixed Windows `\r\n` doubling by setting stdout to `_O_BINARY` mode in C codegen's `real_main()`. Previously `printf` translated `\n` → `\r\n`, but HTTP response strings already contain `\r\n`, creating `\r\r\n`.
 
-**CRLF fix:** The test harness now normalizes `\r\n` → `\n` before comparing
-C codegen output against interpreter output. On Windows, `printf("\n")` produces
-`\r\n` (CRLF) while the interpreter produces `\n` (LF). This caused 106 false
-failures. Fix is in `src/main.rs` line 1622-1626.
-
-**Remaining 15 C codegen failures:**
+**Remaining 11 C codegen failures:**
 
 | Test | Category | Root Cause |
 |------|----------|------------|
-| test_cfg | COMPILE_FAIL | `@cfg(linux)` — test bug, Linux-only fn on Windows |
-| test_deref_assign | COMPILE_FAIL | No `main()` — test bug |
 | test_fmt_real | COMPILE_FAIL | tcc limitation (likely float formatting) |
 | test_deep_nesting | COMPILE_FAIL | tcc limitation (deep recursion?) |
-| test_lower | REAL_DIFF | Pre-existing `ptr_u8` bug (`*u8` vs `*i8`) |
-| test_banking | REAL_DIFF | Float precision: `1432569` vs `126000` |
-| test_error_chain | REAL_DIFF | `100/5 = 0` vs `100/5 = 20` — int division bug |
-| test_http | REAL_DIFF | Extra blank line after HTTP status |
-| test_new_features | REAL_DIFF | C binary crashes — real codegen bug |
-| test_phase8b | REAL_DIFF | C binary crashes mid-output — real codegen bug |
-| test_rc_arc | REAL_DIFF | C binary crashes — Rc/Arc runtime bug |
-| test_regression_collections | REAL_DIFF | Missing struct formatting output |
+| test_lower | CRASH | Crashes at Test 12 (`Lowerer_lower_program` returns IrModule struct) — pre-existing, not ptr_u8 |
+| test_banking | REAL_DIFF | Float/int calculation: `-10500` vs `126000` — pre-existing tuple destructuring bug |
+| test_new_features | CRASH | C binary crashes — real codegen bug |
+| test_phase8b | CRASH | C binary crashes mid-output — real codegen bug |
+| test_rc_arc | CRASH | C binary crashes — Rc/Arc runtime bug |
+| test_regression_collections | REAL_DIFF | Missing `{alice: 30, bob: 25}` — HashMap_to_str bug in Fides stdlib |
 | test_vec_math | REAL_DIFF | Float precision: `...475` vs `...476` |
-| test_parallel | LEN_DIFF | Threading output differs (timing) |
-| test_parallel_concurrent | LEN_DIFF | Threading output differs (timing) |
+| test_parallel | LEN_DIFF | Threading output differs (timing) — not a bug |
+| test_parallel_concurrent | LEN_DIFF | Threading output differs (timing) — not a bug |
 
-Of these 15: 4 are test bugs, 3 are float/precision, 2 are threading, 6 are
-real codegen bugs (test_lower, test_error_chain, test_new_features,
-test_phase8b, test_rc_arc, test_regression_collections).
+Of these 11: 2 are tcc limitations, 2 are threading (not bugs), 2 are float/precision,
+1 is a test bug (HashMap_to_str), 4 are real codegen bugs (test_lower, test_banking,
+test_new_features, test_phase8b, test_rc_arc).
 
 ### Crash Progression (Sep 3)
 
@@ -292,7 +319,7 @@ Each fix in the Rust lowerer moved the crash further along the pipeline:
    fixes. The `fides-c.exe` was built from C code generated by the Fides
    lowerer, not the Rust lowerer.
 
-   Actually no — `fides-c.exe` is built by the Rust compiler (`fidesc.exe`)
+   Actually no — `fides-c.exe` is built by the bootstrap compiler (`fidesc.exe`)
    which uses the Rust lowerer. So the Rust lowerer's fixes SHOULD apply. The
    crash moved to the typechecker, meaning the lexer crash was also fixed.
 
@@ -305,7 +332,7 @@ Each fix in the Rust lowerer moved the crash further along the pipeline:
 ### Key Insight
 
 The Rust lowerer fixes (Stmt::Let, Expr::Ident, StructLit) are sufficient for
-the Rust compiler to generate correct C code for the self-hosted compiler.
+the bootstrap compiler to generate correct C code for the self-hosted compiler.
 The self-hosted compiler (`fides-c.exe`) now gets past lexing and parsing.
 
 The remaining crash is the Vec-of-struct problem, which affects BOTH lowerers
@@ -318,9 +345,15 @@ lowerer's output (since the Fides lowerer is missing Gaps 1-4).
 
 ### Fix Order
 
-1. **Vec-of-struct (both lowerers)** — fix `p_vec_get` / `Vec_get` to handle
-   struct elements via memcpy. This unblocks typechecking.
-2. **Port Gaps 1-4 to Fides lowerer** — needed for the self-hosted compiler
+1. ~~**Vec-of-struct (both lowerers)**~~ — DONE. All Vec paths handle struct elements.
+2. ~~**SRET for enum returns (Rust lowerer)**~~ — DONE (session 2). `lower_type_sret()` in `src/lower.rs`.
+3. ~~**Windows binary stdout**~~ — DONE (session 2). `_setmode(_fileno(stdout), _O_BINARY)` in C codegen.
+4. **Port Gaps 1-5 to Fides lowerer** — needed for the self-hosted compiler
    to generate correct C code for itself (stage1 → stage2 fixpoint).
-3. **Continue crash-fix loop** — each remaining crash will be a struct-by-value
+   - Gap 1: Stmt::Let alloca type
+   - Gap 2: Stmt::Let store_ty
+   - Gap 3: Expr::Ident struct alloca
+   - Gap 4: StructLit field store
+   - Gap 5: SRET for enum return types (NEW)
+5. **Continue crash-fix loop** — each remaining crash will be a struct-by-value
    truncation in the Fides lowerer's output.

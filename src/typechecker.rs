@@ -4843,7 +4843,7 @@ impl TypeChecker {
                         | "p_string_replace" | "p_string_trim"
                         | "p_string_to_uppercase" | "p_string_to_lowercase"
                         | "p_string_char_at" | "p_string_repeat"
-                        | "p_char_to_str" => {
+                        | "p_char_to_str" | "p_sb_to_str" => {
                             return Type::Str;
                         }
                         "p_bool_to_str" => {

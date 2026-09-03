@@ -3,50 +3,100 @@
 > **Goal:** The Fides compiler compiles itself, producing identical output
 > across generations (bootstrap fixpoint).
 >
-> **Last updated:** Sep 3, 2026
+> **Last updated:** Sep 9, 2026 (session 3)
 
 ---
 
-## Current State (Sep 3, 2026)
+## Current State (Sep 9, 2026)
 
-### MILESTONE: Self-hosted compiler compiles hello.fd correctly
+### MILESTONE: Self-hosted compiler self-compiles through C codegen
 
 ```
-.\release\fides-c.exe ccompile tests\hello.fd -o release\hello_test
-C:\tcc\tcc.exe -O2 -w -o release\hello_test.exe release\hello_test.c C:\tcc\lib\ws2_32.def
-.\release\hello_test.exe
-→ Hello, Fides!50y is big    ✅ CORRECT
+.\release\fides-c.exe ccompile compiler\main.fd -o release\stage1
+→ [build] Type check ok. Borrow checking...
+→ [build] Monomorphizing...
+→ [build] Done. Program built successfully.
+→ [ccompile] Lowering to IR...
+→ [ccompile] Generating C code...
+→ [ccompile] C codegen done.
+→ [main] C code generated. Writing to file...
+→ [main] C file written. Running tcc...
+→ release/stage1.c:5871: error: incompatible types for redefinition of 'Vec_new'
 ```
 
-The self-hosted compiler (`fides-c.exe`, built from `compiler/*.fd` via the
-Rust compiler + tcc) can now:
+The self-hosted compiler (`fides-c.exe`) now passes **ALL pipeline stages**
+when self-compiling `compiler/main.fd` (39.5K LOC, 18 modules):
+
 1. Lex `stdlib/core.fd` ✅
 2. Parse `stdlib/core.fd` ✅
 3. Lex + parse user code ✅
-4. Type check ✅
-5. Borrow check ✅
-6. Monomorphize ✅
-7. Lower to IR ✅
-8. Generate C code ✅
-9. Output compiles with tcc ✅
-10. Output runs and prints correct result ✅
+4. Resolve all imports (compiler::compiler, ast, token, lexer, parser, ir,
+   typechecker, lower, mono, borrowck, codegen_c, etc.) ✅
+5. Type check ✅
+6. Borrow check ✅
+7. Monomorphize ✅
+8. Lower to IR ✅
+9. Generate C code ✅ (via string builder — no OOM)
+10. Write C file ✅ (~400K lines, ~13MB)
+11. tcc link ❌ — **duplicate `Vec_new` definitions with incompatible signatures**
 
-**Next step:** Self-compilation — `fides-c.exe ccompile compiler/main.fd`
+**Current blocker:** tcc reports `incompatible types for redefinition of 'Vec_new'`.
+The generated C has two `Vec_new` definitions:
+- `void* Vec_new(void* v0)` (line 87183) — the real implementation with `__env` param
+- `int64_t Vec_new()` (line 389832) — a stub from pre-registration with no params
+
+The stub comes from `Lowerer_lower_program` pre-registering function signatures
+(line 1744) with `IrModule_add_function`, which pushes a new entry. Then
+`Lowerer_lower_func` replaces it via `IrModule_replace_function_named`. But if
+the name doesn't match exactly (e.g. due to string corruption or merge_programs
+duplicates), both entries survive → tcc sees two definitions.
+
+**Fix needed:** Ensure `IrModule_add_function` deduplicates by name, or change
+pre-registration to use `IrModule_replace_function` instead of `add_function`.
+
+### Session 3 discoveries
+
+Two critical infrastructure fixes were discovered and applied:
+
+1. **PE stack patching (256MB)** — tcc-linked binaries have a small default
+   stack (1MB). The self-hosted compiler needs a large stack for deep recursion
+   (parser, typechecker on 39.5K LOC). Without patching, intermittent
+   `STATUS_ACCESS_VIOLATION` crashes occur during stdlib parsing. Fix: patch
+   the PE header's `SizeOfStackReserve` to 256MB and `SizeOfStackCommit` to
+   16MB after tcc links.
+
+2. **String builder for C codegen (`p_sb_*`)** — the `wln()` function in
+   `codegen_c.fd` was doing `self.out = self.out + s + "\n"`, which is O(n²)
+   in memory due to arena allocation (old strings never freed). For 400K lines
+   of generated C, this caused `p_malloc: OOM — failed to allocate new arena
+   chunk`. Fix: added `p_sb_new`/`p_sb_append`/`p_sb_to_str` runtime functions
+   that use `malloc`+`realloc` for efficient mutable string building. The
+   `wln()` function now appends to a string builder instead of concatenating.
 
 ### What works
 
 - All 18 self-host modules rewritten in Fides (39.5K LOC)
 - All 23 self-host module tests pass on interpreter + PE emitter
-- `release/fides-c.exe` builds via tcc (8.5MB)
+- `release/fides-c.exe` builds via tcc (8.5MB) with PE stack patched to 256MB
 - Full pipeline works end-to-end on `tests/hello.fd`
 - Output is correct: `Hello, Fides!50y is big`
+- **Self-compilation passes all pipeline stages through C codegen + file write**
+- String builder (`p_sb_*`) eliminates OOM during C codegen
+- All 12 lowerer/codegen gaps ported (Gaps 1-12, except Gap 12 deferred)
 
 ### Build commands
 
 ```bash
-cargo build --release                                         # Rust compiler
-.\target\release\fidesc.exe ccompile compiler\main.fd -o release\fides-c   # Generate C
+cargo build --release                                         # Bootstrap compiler (Rust)
+.\target\release\fidesc.exe ccompile compiler\main.fd -o release\fides-c   # Generate C (self-host)
 C:\tcc\tcc.exe -O2 -w -o release\fides-c.exe release\fides-c.c C:\tcc\lib\ws2_32.def  # Link
+# Patch PE stack to 256MB (REQUIRED — without this, intermittent crashes)
+$bytes = [System.IO.File]::ReadAllBytes("release\fides-c.exe")
+$peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+$stackOffset = $peOffset + 0x18 + 0x48
+[Array]::Copy([BitConverter]::GetBytes([int64]268435456), 0, $bytes, $stackOffset, 8)
+[Array]::Copy([BitConverter]::GetBytes([int64]16777216), 0, $bytes, $stackOffset + 8, 8)
+[System.IO.File]::WriteAllBytes("release\fides-c.exe", $bytes)
 .\release\fides-c.exe ccompile tests\hello.fd -o release\hello_test        # Test
 ```
 
@@ -94,10 +144,10 @@ This means:
 | `maybe_deref_box` simplified | No-op (Box pointer already points to struct data) | DONE | DONE |
 | `apply_cfg_filter` no-op | Skips CFG filtering (not needed for self-host) | N/A | DONE |
 | `compute_func_effects` no-op | Skips effect inference (not needed for bootstrap) | N/A | DONE |
-| Stmt::Let alloca type | Uses `Struct(name)` for alloca when declared type matches | DONE | **TODO (Gap 1)** |
-| Stmt::Let store_ty | Uses `Some(Struct(_))` for struct-typed alloca store | DONE | **TODO (Gap 2)** |
-| Expr::Ident struct alloca | Returns alloca pointer directly for `Struct(_)` typed alloca | DONE | **TODO (Gap 3)** |
-| StructLit field store | Uses `emit_struct_copy` for `Struct(_)` fields | DONE | **TODO (Gap 4)** |
+| Stmt::Let alloca type | Uses `Struct(name)` for alloca when declared type matches | DONE | DONE (Gap 1) |
+| Stmt::Let store_ty | Uses `Some(Struct(_))` for struct-typed alloca store | DONE | DONE (Gap 2) |
+| Expr::Ident struct alloca | Returns alloca pointer directly for `Struct(_)` typed alloca | DONE | DONE (Gap 3) |
+| StructLit field store | Uses `emit_struct_copy` for `Struct(_)` fields | DONE | DONE (Gap 4) |
 | Vec element type from `&mut`/`&` | Unwraps reference types to get Vec element type | DONE | DONE |
 | Vec::set method boxing | Boxes struct before `Vec_set` (method call path) | DONE | DONE |
 | Vec::get method return type | Uses `word_repr(elem_ty)` for `Vec_get` return | DONE | DONE |
@@ -105,14 +155,37 @@ This means:
 | `vec[i]` indexing return type | Uses `word_repr(elem_ty)` for `p_vec_get` return | DONE | DONE |
 | `vec[i] += x` compound return type | Uses `word_repr(elem_ty)` for `Vec_get` return | DONE | DONE |
 | `for x in vec` element type | Uses `word_repr(elem_ty)` for `p_vec_get` return + `elem_ty` alloca | DONE | DONE |
+| **SRET for enum returns** | `lower_type_sret()` converts enum `Generic` → `Struct` at sig boundaries | DONE (session 2) | DONE (Gap 5, session 3) |
+| **PE stack patching (256MB)** | Patches PE header `SizeOfStackReserve` after tcc link | N/A (Rust uses thread wrapper) | DONE (session 3) |
+| **String builder (`p_sb_*`)** | Mutable string builder for C codegen — avoids O(n²) memory | DONE (session 3) | DONE (session 3) |
+| **Windows binary stdout** | `_setmode(_fileno(stdout), _O_BINARY)` prevents `\r\n` doubling | DONE (session 2) | N/A (codegen_c.rs only) |
 
 ### What's still broken
 
-**Nothing blocks `tests/hello.fd` anymore.** The full pipeline works end-to-end.
+**`tests/hello.fd` works end-to-end.** Self-compilation passes all pipeline
+stages through C codegen and file writing, but tcc fails to link the output
+due to duplicate function definitions.
 
-**Next blocker:** Self-compilation (`fides-c.exe ccompile compiler/main.fd`).
-The Fides lowerer gaps (1-4) may cause crashes when `stage1.exe` tries to
-compile itself. These must be ported before the fixpoint test.
+**Test results (session 2):**
+```
+Interpreter:  203/203 passed
+C Codegen:    192/203 matched  (11 remaining: 2 tcc, 2 threading, 2 float, 5 real bugs)
+PE Emitter:   202/203 valid
+```
+
+**Current blocker:** tcc linking of `stage1.c` fails:
+```
+release/stage1.c:5871: error: incompatible types for redefinition of 'Vec_new'
+```
+
+The generated C has duplicate `Vec_new` definitions — a stub from
+pre-registration (`int64_t Vec_new()`) and the real implementation
+(`void* Vec_new(void* v0)`). The `IrModule_add_function` in the pre-registration
+step (line 1744) doesn't deduplicate, so when `Lowerer_lower_func` adds the
+real implementation, both entries survive in `module.functions`.
+
+All 12 lowerer/codegen gaps have been ported (Gaps 1-11 done, Gap 12 deferred).
+See "Phase 1b" below for the full gap list.
 
 ---
 
@@ -126,69 +199,211 @@ produce correct output.
 
 ### Phase 1b: Port Fides lowerer gaps (before self-compilation)
 
-The Rust lowerer has 4 fixes the Fides lowerer is missing. These don't block
-`fides-c.exe` (built by Rust compiler with all fixes), but they block
-`stage1.exe` (built by `fides-c.exe` using the Fides lowerer).
+A full audit of the compiler source (39.5K LOC, 18 modules) compared the Fides
+lowerer/codegen/typechecker against the Rust ones. The audit found **12 gaps**
+that will block self-compilation. Gaps 1-5 were already known; Gaps 6-12 are
+newly identified.
 
-| Gap | Description | SH-# | Priority |
-|-----|-------------|------|----------|
-| 1 | Stmt::Let alloca type — use `Struct(name)` not `Ptr(Struct)` | SH-11.12 | HIGH |
-| 2 | Stmt::Let store_ty — use `Some(Struct(_))` for struct alloca | SH-11.13 | HIGH |
-| 3 | Expr::Ident struct alloca — return alloca pointer directly | SH-11.14 | HIGH |
-| 4 | StructLit field store — use `emit_struct_copy` for struct fields | SH-11.15 | HIGH |
+#### Critical gaps (will crash immediately)
 
-These don't block `fides-c.exe` (built by Rust compiler with all fixes), but
-they block `stage1.exe` (built by `fides-c.exe` using the Fides lowerer).
+| Gap | Description | SH-# | Risk | Source uses |
+|-----|-------------|------|------|-------------|
+| 1 | Stmt::Let alloca type — use `Struct(name)` not `Ptr(Struct)` | SH-11.12 | CRITICAL | ~400 struct returns |
+| 2 | Stmt::Let store_ty — use `Some(Struct(_))` for struct alloca | SH-11.13 | CRITICAL | ~400 struct returns |
+| 3 | Expr::Ident struct alloca — return alloca pointer directly | SH-11.14 | CRITICAL | ~400 struct returns |
+| 4 | StructLit field store — use `emit_struct_copy` for struct fields | SH-11.15 | CRITICAL | struct literals |
+| 5 | SRET for enum returns — `lower_type_sret()` converts enum Generic → Struct | SH-11.16 | CRITICAL | Result/Option returns |
+| 6 | **`&mut` of non-alloca expr** — create alloca+store, return pointer | SH-11.17 | **CRITICAL** | **580 `&mut` uses** |
 
-### Phase 2: Self-compilation (stage1) [NEXT]
+**Gap 6 is the #1 blocker.** The Fides lowerer's `Expr::Ref` only handles
+`Expr::Ident` that's in `allocas`. For everything else (function parameters,
+inline values), it returns the value itself instead of a pointer to it — an
+immediate `STATUS_ACCESS_VIOLATION`. The Rust lowerer creates an alloca,
+stores the value, and returns the pointer (`src/lower.rs:4901-4971`).
+
+#### High gaps (may crash or produce wrong output)
+
+| Gap | Description | SH-# | Risk | Source uses |
+|-----|-------------|------|------|-------------|
+| 7 | **Cyclic import detection** — `compiler.fd` import resolver has no "in-progress" set | SH-11.18 | HIGH | 18 modules |
+| 8 | **`infer_from_pair` missing `Type::Generic`** — `mono.fd` can't infer `T` from `Vec<T>` | SH-11.19 | HIGH | Vec<T> everywhere |
+| 9 | **Typechecker recursion limit** — no stack depth guard (parser has 256) | SH-11.20 | HIGH | deep nesting |
+
+**Gap 7:** `compiler/compiler.fd:697-707` re-pushes modules with unloaded deps
+but doesn't track "in-progress" modules. Cyclic `use` imports → infinite loop → OOM.
+
+**Gap 8:** `compiler/mono.fd:1392-1465` doesn't recurse into `Type::Generic`
+when inferring type parameters. `fn foo<T>(v: Vec<T>)` called with `Vec<i64>`
+won't bind `T`. Generic functions may not be instantiated or get `I32` fallback.
+
+**Gap 9:** `compiler/typechecker.fd` has no recursion depth limit. Deeply
+nested code can stack overflow. Parser has `max_expr_depth: 256`.
+
+#### Medium gaps (may cause fixpoint divergence)
+
+| Gap | Description | SH-# | Risk | Source uses |
+|-----|-------------|------|------|-------------|
+| 10 | **Polymorphic `print`/`println` dispatch** — Fides codegen missing special cases | SH-11.21 | MEDIUM | debug prints |
+| 11 | **Missing runtime sigs** — `p_malloc_persistent`, `p_arena_save`, `p_arena_restore` | SH-11.22 | MEDIUM | arena alloc |
+| 12 | **Float constant bit-pattern** — Fides emits `(double)str` not union literal | SH-11.23 | MEDIUM | float constants |
+
+**Gap 10:** `compiler/codegen_c.fd:2102-2142` doesn't special-case `print`/
+`println`/`p_to_str` for `Vec`, `HashMap`, `f64`, `bool` types. Rust codegen
+does (`src/codegen_c.rs:1643-1776`). Low risk for self-compilation (compiler
+mostly prints strings) but would cause fixpoint divergence.
+
+**Gap 11:** `compiler/codegen_c.fd:594-919` doesn't register
+`p_malloc_persistent`/`p_arena_save`/`p_arena_restore` in runtime sig tables.
+
+**Gap 12:** `compiler/codegen_c.fd:1904-1910` emits float constants as
+`(double)float_to_str(...)` which doesn't preserve NaN/Inf/−0.0. Rust uses
+a `union` compound literal.
+
+#### Not needed for compiler source (confirmed by audit)
+
+| Pattern | Count in source | Why not needed |
+|---------|----------------|----------------|
+| Closures / lambda captures | 0 | No `fn` closures in compiler source |
+| `?` operator | 0 | All `?` are inside C string literals |
+| `for x in vec` loops | 0 | Uses `while i < vec.len()` + `vec.get(i)` |
+| Match as expression | 0 | All 1,594 `match` are statements |
+| Generic function definitions | 0 | All generics are stdlib (`Vec<T>`, etc.) |
+| `DynCall` / trait objects | 0 | No `dyn` in compiler source |
+| `CallPtr` with struct return | 0 | Comparators return `i64`/`bool` |
+| HashMap with struct values | 0 | Uses `Vec`-based maps (`map_str_str_get`) |
+| `ShapedTensor` type equality | 0 | No tensors in compiler source |
+
+#### Fix order
+
+1. **Gap 6** (`&mut` of non-alloca) — 580 uses, #1 blocker
+2. **Gaps 1-5** (struct alloca/store_ty/ident/StructLit/SRET) — ~400 struct returns
+3. **Gap 8** (`infer_from_pair` Generic) — needed for Vec<T> monomorphization
+4. **Gap 7** (cyclic imports) — needed for 18-module compilation
+5. **Gap 9** (typechecker recursion limit) — safety net
+6. **Gaps 10-12** (codegen polish) — needed for fixpoint, not for first compile
+
+### Phase 2: Self-compilation (stage1) [IN PROGRESS]
 
 ```bash
 .\release\fides-c.exe ccompile compiler\main.fd -o release\stage1
 C:\tcc\tcc.exe -O2 -w -o release\stage1.exe release\stage1.c C:\tcc\lib\ws2_32.def
 ```
 
-This is the critical test: can the self-hosted compiler compile itself?
-If it crashes, the crash will be in the lowerer or codegen (the parts that
-were not exercised by `tests/hello.fd`).
+The self-hosted compiler now self-compiles through ALL pipeline stages:
+parsing, import resolution, typechecking, borrow checking, monomorphization,
+IR lowering, C codegen, and file writing. The generated C is ~400K lines (~13MB).
 
-**Expected crashes by pipeline stage:**
+**tcc fails to link** due to duplicate function definitions:
 
-| Stage | Status | Expected crashes | Pattern |
-|-------|--------|-----------------|---------|
-| Lexer | DONE | 0 | — |
-| Parser | DONE | 0 | — |
-| TypeChecker | DONE | 0 | — |
-| Lowerer | Not tested | 1-3 | Gaps 1-4, IrType struct returns |
-| CCodeGen | Not tested | 1-2 | String building, struct layout |
-| **Total remaining** | | **1-5** | |
+| Stage | Status | Crashes | Pattern |
+|-------|--------|---------|---------|
+| Lexer | ✅ PASS | 0 | — |
+| Parser | ✅ PASS | 0 | — |
+| Import resolution | ✅ PASS | 0 | 18 modules loaded |
+| TypeChecker | ✅ PASS | 0 | — |
+| Borrow checker | ✅ PASS | 0 | — |
+| Monomorphizer | ✅ PASS | 0 | — |
+| Lowerer | ✅ PASS | 0 | Gaps 1-5 ported |
+| CCodeGen | ✅ PASS | 0 | String builder fixes OOM |
+| File write | ✅ PASS | 0 | ~13MB C file |
+| tcc link | ❌ FAIL | 1 | Duplicate `Vec_new` definitions |
+| **Total remaining** | | **1** | |
 
-**Current crash to fix:** None — `tests/hello.fd` works end-to-end.
+**Current crash to fix:** `Vec_new` redefinition — duplicate function entries
+in `module.functions` from pre-registration + lowering.
 
-**Next step:** Self-compilation (`fides-c.exe ccompile compiler/main.fd`).
+**Fix:** Change `IrModule_add_function` to deduplicate by name, or change
+pre-registration to use `IrModule_replace_function`.
 
-### Phase 2: Self-hosted compiler compiles itself (stage1) [NEXT]
+### Pre-fixpoint cleanup (after stage1 works, before fixpoint verification)
+
+Two issues found by audit that don't block self-compilation but must be
+addressed before fixpoint verification:
+
+#### Debug print cleanup (SH-11.27)
+
+38 `p_eprint_str` debug calls in `compiler.fd` (31) and `main.fd` (7).
+These write to stderr, so they won't break C output comparison, but they
+produce noisy output during stage1/stage2 runs. Gate behind a debug flag:
+
+```
+compiler.fd:  [build] Reading stdlib/core.fd...  (line 525)
+compiler.fd:  [build] Lexing + parsing stdlib...  (line 532)
+compiler.fd:  [build] Type checking...            (line 871)
+compiler.fd:  [build] Monomorphizing...           (line 928)
+compiler.fd:  [ccompile] Building program...      (line 942)
+main.fd:      [main] Reading source file: ...     (line 74)
+main.fd:      [main] Source read ok. Compiling... (line 85)
+... (38 total)
+```
+
+#### `==` on enums compares pointers, not tags (SH-11.28)
+
+`==` on enum-typed values is fundamentally broken in Fides — it compares
+**pointer addresses** (alloca slots), not variant tags or payloads. This is
+because:
+1. Enum values are stack-allocated structs (`alloca` + tag + payload)
+2. `==` lowers to `Inst::BinOp(BinOp::Eq, ptr_a, ptr_b, Bool)`
+3. C codegen emits `ptr_a == ptr_b` (pointer comparison)
+
+**Current status:** The compiler source has **0 direct `==` on enum values**.
+All enum comparisons use manually-written `*_eq` helpers that do tag-based
+comparison via `match`:
+
+| Helper | Location | Compares |
+|--------|----------|----------|
+| `ir_type_eq` | `ir.fd:485` | Tag + name string |
+| `type_eq` | `typechecker.fd:1787` | Tag + recursive structure |
+| `binop_eq` | `ast.fd:157` | Tag only |
+| `unaryop_eq` | `ast.fd:181` | Tag only |
+| `token_kind_eq` | `token.fd:552` | Tag only |
+| `effect_eq` | `ir.fd:772` | Tag only |
+| `region_eq` | `ir.fd:896` | Tag only |
+| `borrow_kind_eq` | `ir.fd:920` | Tag only |
+| `region_ref_eq` | `pir.fd:157` | Tag only |
+| `mem_region_eq` | `pir.fd:425` | Tag only |
+| `pir_level_eq` | `pir.fd:2032` | Tag only |
+
+**Missing helpers (not currently needed):** `expr_eq`, `stmt_eq`, `token_eq`
+
+**Risk:** If anyone writes `x == SomeEnum::Variant` in the compiler source,
+it will silently miscompile. The typechecker doesn't reject `==` on enum types.
+This is a latent language bug, not a self-compilation blocker.
+
+### Phase 2: Self-hosted compiler compiles itself (stage1) [IN PROGRESS]
 
 ```bash
 .\release\fides-c.exe ccompile compiler\main.fd -o release\stage1
-# Should produce release/stage1.c (~13MB)
+# Produces release/stage1.c (~13MB, ~400K lines) — ALL pipeline stages pass
 C:\tcc\tcc.exe -O2 -w -o release\stage1.exe release\stage1.c C:\tcc\lib\ws2_32.def
+# FAILS: incompatible types for redefinition of 'Vec_new'
 ```
 
-This is the hardest phase. The compiler source is 39.5K LOC across 18 modules.
-The Fides lowerer gaps (1-4) may cause crashes here. Expected issues:
+The compiler source is 39.5K LOC across 18 modules. All pipeline stages
+now pass. The only remaining issue is a tcc linking error from duplicate
+function definitions in the generated C.
 
-- **Fides lowerer gaps 1-4** — struct alloca, store_ty, ident, StructLit
-- **HashMap operations** — iteration order, bucket management with struct values
-- **Deep recursion** — parser and typechecker on large inputs
-- **Large Vec operations** — growing, resizing with struct elements
-- **String building** — concatenation, formatting with many intermediate values
+**Issues found and fixed in this phase:**
+- **PE stack exhaustion** — tcc default stack (1MB) too small → intermittent
+  `STATUS_ACCESS_VIOLATION` during stdlib parsing. Fixed by patching PE header
+  to 256MB reserve / 16MB commit.
+- **C codegen OOM** — `wln()` string concatenation is O(n²) in arena memory.
+  For 400K lines of C output, arena exhausted (`p_malloc: OOM`). Fixed by
+  adding `p_sb_new`/`p_sb_append`/`p_sb_to_str` mutable string builder runtime
+  functions that use `malloc`+`realloc` instead of arena allocation.
 
-**Debugging approach for this phase:**
-1. The crash stack trace shows which function crashed
-2. Find the function in `release/fides-c.c` (the generated C)
-3. Add `fprintf(stderr, ...)` debug prints to trace parameter values
-4. Rebuild with tcc, run, identify the bad parameter
-5. Fix in `compiler/*.fd`, rebuild from Rust, repeat
+**Remaining issue:**
+- **Duplicate `Vec_new` definitions** — `IrModule_add_function` (pre-registration)
+  pushes a stub entry; `IrModule_replace_function_named` (lowering) replaces
+  the first match but doesn't remove duplicates. If `merge_programs` creates
+  duplicate entries, both survive → tcc sees two definitions with different
+  signatures → link error.
+
+**Debugging approach:**
+1. Check `module.functions` for duplicate names after `merge_programs`
+2. Either deduplicate in `IrModule_add_function`, or use `replace_function`
+   for pre-registration
+3. Verify no other functions have the same duplicate pattern
 
 ### Phase 3: Verify stage1 produces correct output
 
@@ -199,14 +414,14 @@ C:\tcc\tcc.exe -O2 -w -o release\hello_s1.exe release\hello_s1.c C:\tcc\lib\ws2_
 .\release\hello_s1.exe
 # Expected: Hello, Fides!50y is big
 
-# Compare stage1's C output against the Rust compiler's C output
+# Compare stage1's C output against the bootstrap compiler's C output
 .\target\release\fidesc.exe ccompile tests\hello.fd -o release\hello_rust
 diff release\hello_s1.c release\hello_rust.c
 # Should be identical (or equivalent)
 ```
 
 **If they differ:** The self-hosted compiler generates slightly different C
-than the Rust compiler. This is not necessarily wrong (different variable
+than the bootstrap compiler. This is not necessarily wrong (different variable
 names, different ordering) but must be verified as semantically equivalent.
 
 ### Phase 4: Verify the fixpoint
@@ -254,14 +469,16 @@ and fixpoint divergence.
 
 ### Milestones and what they prove
 
-| Milestone | What it proves | Probability after crashes stop |
-|-----------|---------------|-------------------------------|
-| No crash on hello.fd | Compiler pipeline runs end-to-end | ~60% |
-| tcc compiles the output | Generated C is syntactically valid | ~50% |
-| hello.exe prints correct output | Codegen is correct for simple programs | ~40% |
-| No crash on compiler/main.fd | Compiler handles 39.5K LOC | ~20% |
-| stage1 output matches Rust compiler | Codegen is correct for complex programs | ~10% |
-| stage2.c == stage3.c | Compiler is stable across generations | ~5% |
+| Milestone | What it proves | Status |
+|-----------|---------------|--------|
+| No crash on hello.fd | Compiler pipeline runs end-to-end | ✅ DONE |
+| tcc compiles the output | Generated C is syntactically valid | ✅ DONE |
+| hello.exe prints correct output | Codegen is correct for simple programs | ✅ DONE |
+| No crash on compiler/main.fd (all stages) | Compiler handles 39.5K LOC | ✅ DONE |
+| tcc links stage1.c | Generated C has no duplicate definitions | ❌ CURRENT BLOCKER |
+| stage1.exe runs and produces correct output | Self-compiled codegen is correct | BLOCKED |
+| stage1 output matches bootstrap compiler | Codegen is correct for complex programs | BLOCKED |
+| stage2.c == stage3.c | Compiler is stable across generations | BLOCKED |
 
 These probabilities are for "works on first try after crashes stop." Each
 failure mode is debuggable — the probabilities just reflect that there will
@@ -285,7 +502,7 @@ be more work after the crashes are fixed.
 
 ### When output is wrong (no crash)
 
-1. **Compare against Rust compiler output:**
+1. **Compare against bootstrap compiler output:**
    ```bash
    .\target\release\fidesc.exe ccompile tests\hello.fd -o release\hello_rust
    .\release\fides-c.exe ccompile tests\hello.fd -o release\hello_self
@@ -391,26 +608,26 @@ confirmed stable.
 
 ---
 
-## Fides Lowerer Gaps (compiler/lower.fd)
+## Fides Lowerer Gaps (compiler/lower.fd) — ALL PORTED
 
-The Rust lowerer (`src/lower.rs`) has 4 fixes that the Fides lowerer
-(`compiler/lower.fd`) is missing. These don't block `fides-c.exe` (built
-by the Rust compiler with all fixes — it correctly compiles `tests/hello.fd`),
-but they WILL cause crashes when `stage1.exe` tries to compile itself.
+The Rust lowerer (`src/lower.rs`) had 5 fixes that the Fides lowerer
+(`compiler/lower.fd`) was missing. **All 5 gaps have been ported (session 3).**
+These didn't block `fides-c.exe` (built by the bootstrap compiler with all
+fixes), but they would have crashed `stage1.exe` (built by `fides-c.exe`
+using the Fides lowerer).
 
-The pattern: `fides-c.exe` is built by the Rust compiler, so it has the
-Rust lowerer's fixes. It can compile `compiler/*.fd` correctly. But the
-resulting `stage1.exe` uses the Fides lowerer, which is missing these fixes.
-So `stage1.exe` will generate bad C code for itself.
+The pattern: `fides-c.exe` is built by the bootstrap compiler, so it has the
+bootstrap lowerer's fixes. It can compile `compiler/*.fd` correctly. But the
+resulting `stage1.exe` uses the Fides lowerer, which now has all the fixes.
 
-### Gap 1: Stmt::Let alloca type (Fides line ~2128)
+### Gap 1: Stmt::Let alloca type (Fides line ~2128) — ✅ PORTED
 
 When a `let` binding has a declared struct type and the value is a pointer to
 that struct, the Fides lowerer uses `Ptr(Struct)` (8 bytes) for the alloca.
 The Rust lowerer uses `Struct(name)` (full size) when the pointer points to
 the same struct type.
 
-**Fides (broken):**
+**Fides (fixed, session 3):**
 ```fides
 if ir_type_is_aggregate(declared_ir) && ir_type_is_ptr(val_ty) {
     ir_ty = val_ty;  // Ptr(Struct) — only 8 bytes!
@@ -427,7 +644,7 @@ if d.is_aggregate() && v.is_ptr() {
 }
 ```
 
-### Gap 2: Stmt::Let store_ty (Fides line ~2145)
+### Gap 2: Stmt::Let store_ty (Fides line ~2145) — ✅ PORTED
 
 The Fides lowerer stores the let value with `OptIrType::None`, which only
 copies 8 bytes. The Rust lowerer uses `Some(Struct(name))` for struct-typed
@@ -447,7 +664,7 @@ let store_ty = match &ir_ty {
 self.emit_inst(Inst::Store { ptr: alloca, value: val, store_ty });
 ```
 
-### Gap 3: Expr::Ident struct alloca (Fides line ~2686)
+### Gap 3: Expr::Ident struct alloca (Fides line ~2686) — ✅ PORTED
 
 When loading a struct-typed alloca, the Fides lowerer does `Inst::Load(alloca,
 Struct)` which reads 8 bytes (the tag/pointer). The Rust lowerer returns the
@@ -467,7 +684,7 @@ if matches!(&load_ty, IrType::Struct(_)) {
 return self.emit_inst(Inst::Load { ptr: *alloca, ty: load_ty });
 ```
 
-### Gap 4: StructLit field store (Fides line ~3245)
+### Gap 4: StructLit field store (Fides line ~3245) — ✅ PORTED
 
 The Fides lowerer stores struct fields with `OptIrType::None`, truncating
 struct-typed fields to 8 bytes. The Rust lowerer uses `emit_struct_copy` for
@@ -486,6 +703,145 @@ if let IrType::Struct(ref field_struct_name) = field_ty {
     self.emit_inst(Inst::Store { ptr: field_ptr, value: field_val, store_ty: None });
 }
 ```
+
+### Gap 5: SRET for enum return types — ✅ PORTED (session 3)
+
+The Fides lowerer keeps enum types as `Generic("Result", [I64, I64])` in the IR.
+The SRET check only matches `IrType::Struct(_)`, so enum-returning functions
+don't get the hidden SRET out-parameter. The callee allocas the enum on its
+stack and returns a pointer, which dangles when the function returns.
+
+**Fides (broken):**
+```fides
+// lower_type() returns Generic("Result", [I64, I64]) for enum types
+// is_struct_ret check: matches!(ret_ty, IrType::Struct(_)) → false for Generic
+// → no SRET parameter added → callee returns dangling stack pointer
+```
+
+**Rust (fixed, line 1296-1316):**
+```rust
+fn lower_type_sret(&self, ty: &Type) -> IrType {
+    let ir_ty = self.lower_type(ty);
+    if let IrType::Generic(ref name, _) = ir_ty {
+        let resolved_name = self.resolve_struct_name(name);
+        if self.enums.contains_key(&resolved_name) {
+            return IrType::Struct(resolved_name);
+        }
+    }
+    ir_ty
+}
+// Used at:
+// - Function pre-registration (line ~434): lower_type_sret(&func.ret_ty)
+// - Function definition (line ~959): lower_type_sret(&func.ret_ty)
+// Call sites use lookup_func_ret_ty() which returns the pre-registered Struct type
+```
+
+### Gap 6: `&mut` of non-alloca expressions (NEW — #1 BLOCKER, 580 uses)
+
+The Fides lowerer's `Expr::Ref` only handles `Expr::Ident` that's in `allocas`.
+For everything else (function parameters, inline values, field accesses), it
+**returns the value itself instead of a pointer to it** — an immediate crash.
+
+**Fides (broken, `compiler/lower.fd:3508-3519`):**
+```fides
+Expr::Ref(e, is_mut) => {
+    match box_expr_unbox(e) {
+        Expr::Ident(name) => {
+            match Lowerer_lookup_alloca(self, name) { ... }
+        }
+        _ => { return Lowerer_lower_expr(self, box_expr_unbox(e)); }  // ← BUG
+    }
+}
+```
+
+**Rust (fixed, `src/lower.rs:4901-4971`):**
+```rust
+Expr::Ref(e, is_mut) => {
+    match e.as_ref() {
+        Expr::Ident(name) => {
+            // Handle alloca'd vars, SRET struct allocas, etc.
+        }
+        _ => {
+            // Create alloca, store value, return pointer
+            let val = self.lower_expr(e);
+            let ty = self.get_value_type(val);
+            let alloca = self.emit_inst(Inst::Alloca { ty: ty.clone(), region });
+            self.emit_inst(Inst::Store { ptr: alloca, value: val, store_ty: None });
+            return alloca;
+        }
+    }
+}
+```
+
+**Impact:** 580 `&mut` references in the compiler source. Every `&mut some_param`
+or `&mut some_expr` will crash. This is the **#1 blocker** for self-compilation.
+
+### Gap 7: Cyclic import detection (NEW — HIGH)
+
+`compiler/compiler.fd:697-707` re-pushes modules with unloaded deps but doesn't
+track "in-progress" modules. If 18 modules have cyclic `use` imports, it will
+re-push modules forever → OOM or hang.
+
+**Fix:** Add a `currently_loading` set. If a module is already in the set when
+re-encountered, report an import-cycle error instead of re-pushing.
+
+### Gap 8: `infer_from_pair` missing `Type::Generic` (NEW — HIGH)
+
+`compiler/mono.fd:1392-1465` doesn't recurse into `Type::Generic` when inferring
+type parameters. So `fn foo<T>(v: Vec<T>)` called with `Vec<i64>` won't bind `T`.
+
+**Fides (broken, `compiler/mono.fd:1392-1465`):**
+```fides
+pub fn infer_from_pair(param: Type, arg: Type, ...) {
+    match param {
+        Type::Named(name) => { ... }   // only bare T
+        Type::Array(elem, _) => { ... }
+        Type::Ref(inner, _) => { ... }
+        Type::Tuple(types) => { ... }
+        // Type::Generic is MISSING — falls through to _ => {}
+    }
+}
+```
+
+**Fix:** Add `Type::Generic(name, args)` case that recurses into each generic
+argument, matching `args.get(i)` against `param_args.get(i)`.
+
+**Impact:** Generic functions taking `Vec<T>` may not be instantiated or get
+`I32` fallback → undefined symbols or wrong code.
+
+### Gap 9: Typechecker recursion limit (NEW — HIGH)
+
+`compiler/typechecker.fd` has no stack depth guard. The parser has
+`max_expr_depth: 256`, but the typechecker recurses without limit on
+`check_expr`, `check_stmt`, `resolve_type`, `type_eq`, etc.
+
+**Fix:** Add a `max_check_depth: i64` field to `TypeChecker`, increment on
+entry to `check_expr`/`check_stmt`, bail out with error if exceeded.
+
+### Gap 10: Polymorphic print dispatch in codegen (NEW — MEDIUM)
+
+`compiler/codegen_c.fd:2102-2142` doesn't special-case `print`/`println`/
+`p_to_str` for `Vec`, `HashMap`, `f64`, `bool` types. Rust codegen does
+(`src/codegen_c.rs:1643-1776`).
+
+**Impact:** Low risk for self-compilation (compiler mostly prints strings)
+but would cause fixpoint divergence if the compiler prints any non-string type.
+
+### Gap 11: Missing runtime signatures (NEW — MEDIUM)
+
+`compiler/codegen_c.fd:594-919` doesn't register `p_malloc_persistent`,
+`p_arena_save`, `p_arena_restore` in `fn_param_types`/`fn_ret_types`.
+
+**Fix:** Add entries to `CCodeGen_insert_runtime_sigs` and emit forward
+prototypes in `emit_runtime_types`.
+
+### Gap 12: Float constant bit-pattern (NEW — MEDIUM)
+
+`compiler/codegen_c.fd:1904-1910` emits `ConstFloat` as
+`(double)float_to_str(...)`, which doesn't preserve NaN/Inf/−0.0. Rust uses
+a `union` compound literal to re-interpret IEEE 754 bits.
+
+**Fix:** Use `union { double d; uint64_t u; }` compound literal like Rust.
 
 ### Additional Store(..., None) sites that MAY need fixes
 
@@ -507,14 +863,14 @@ The Rust lowerer has the same `store_ty: None` calls at corresponding sites.
 They haven't been fixed because the current compiler source doesn't hit them
 with struct values. But the self-hosted compiler source might.
 
-### Fix Order
+### Fix Order — ALL GAPS PORTED (session 3)
 
-1. **Vec-of-struct (both lowerers)** — fix `p_vec_push`/`p_vec_get` to handle
-   struct elements via heap allocation. This unblocks typechecking.
-2. **Port Gaps 1-4 to Fides lowerer** — needed for `stage1.exe` to generate
-   correct C code for itself (fixpoint).
-3. **Check additional Store sites** — if crashes occur after Gaps 1-4 are
-   ported, check the "Additional" table above.
+1. ~~**Vec-of-struct (both lowerers)**~~ — ✅ DONE
+2. ~~**Port Gaps 1-5 to Fides lowerer**~~ — ✅ DONE (session 3)
+3. ~~**Port Gaps 6-11 to Fides lowerer/codegen**~~ — ✅ DONE (sessions 2-3)
+4. **Fix duplicate function definitions** — ❌ CURRENT BLOCKER (SH-11.25c)
+5. **Check additional Store sites** — TODO after stage1 links
+6. ~~**Gap 12 (float bit-pattern)**~~ — DEFERRED (no NaN/Inf in compiler source)
 
 ---
 
@@ -561,8 +917,8 @@ interpreter + PE emitter.
 | SH-7 | Rewrite Frontend | DONE |
 | SH-8 | Rewrite Middle-End | DONE |
 | SH-9 | Rewrite Back-End | DONE |
-| SH-10 | Self-Host Breaking Bugs | IN PROGRESS |
-| SH-11 | Bootstrap Crash Fix | IN PROGRESS |
+| SH-10 | Self-Host Breaking Bugs | DONE |
+| SH-11 | Bootstrap Crash Fix | IN PROGRESS (all stages pass, tcc link fails) |
 | SH-12 | Safety & Crash Prevention | DONE |
 
 ### SH-11 sub-tasks
@@ -586,13 +942,26 @@ interpreter + PE emitter.
 | SH-11.11d | `vec[i]` indexing return type | DONE (both lowerers) |
 | SH-11.11e | `vec[i] += x` compound return type | DONE (both lowerers) |
 | SH-11.11f | `for x in vec` element type | DONE (both lowerers) |
-| SH-11.12 | Port Gap 1: Stmt::Let alloca type to Fides | TODO — needed for fixpoint |
-| SH-11.13 | Port Gap 2: Stmt::Let store_ty to Fides | TODO — needed for fixpoint |
-| SH-11.14 | Port Gap 3: Expr::Ident struct alloca to Fides | TODO — needed for fixpoint |
-| SH-11.15 | Port Gap 4: StructLit field store to Fides | TODO — needed for fixpoint |
-| SH-11.16 | Check additional Store(..., None) sites | TODO — after Gaps 1-4 are ported |
-| SH-11.17 | Self-compilation (fides-c → stage1) | **NEXT** — test compiler/main.fd |
-| SH-11.18 | stage1 produces correct output | BLOCKED — after SH-11.17 |
+| SH-11.12 | Port Gap 1: Stmt::Let alloca type to Fides | DONE — uses `declared_ir` (struct) when ptr points to same struct |
+| SH-11.13 | Port Gap 2: Stmt::Let store_ty to Fides | DONE — `store_ty=Some(ir_ty)` for struct-typed alloca |
+| SH-11.14 | Port Gap 3: Expr::Ident struct alloca to Fides | DONE — loads SRET ptr, returns alloca directly for inline struct |
+| SH-11.15 | Port Gap 4: StructLit field store to Fides | DONE — `emit_struct_copy` for struct-typed fields |
+| SH-11.16 | Port Gap 5: SRET for enum returns to Fides | DONE — `lower_type_sret()` converts enum Generic → Struct |
+| SH-11.17 | Port Gap 6: `&mut` of non-alloca expr to Fides | DONE — alloca+store for non-alloca, SRET load, Ptr(Struct) passthrough |
+| SH-11.18 | Port Gap 7: Cyclic import detection in compiler.fd | DONE — `currently_deferred` set detects cycles |
+| SH-11.19 | Port Gap 8: `infer_from_pair` Generic case in mono.fd | DONE — recurses into `Type::Generic` args |
+| SH-11.20 | Port Gap 9: Typechecker recursion limit | DONE — `check_depth` field, limit 512 |
+| SH-11.21 | Port Gap 10: Polymorphic print dispatch in codegen_c.fd | DONE — print/println/p_to_str dispatch by arg type |
+| SH-11.22 | Port Gap 11: Missing runtime sigs in codegen_c.fd | DONE — p_malloc_persistent, p_arena_save, p_arena_restore |
+| SH-11.23 | Port Gap 12: Float constant bit-pattern in codegen_c.fd | DEFERRED — needs p_float_to_bits runtime fn; low risk (no NaN/Inf in compiler source) |
+| SH-11.24 | Check additional Store(..., None) sites | TODO — after stage1 links |
+| SH-11.25 | Self-compilation (fides-c → stage1) | **IN PROGRESS** — all pipeline stages pass, tcc link fails on duplicate Vec_new |
+| SH-11.25a | PE stack patching (256MB) | DONE (session 3) — required for tcc-linked binaries |
+| SH-11.25b | String builder for C codegen (`p_sb_*`) | DONE (session 3) — fixes OOM during C codegen of 39.5K LOC |
+| SH-11.25c | Fix duplicate function definitions (Vec_new) | **CURRENT BLOCKER** — IrModule_add_function doesn't deduplicate |
+| SH-11.26 | stage1 produces correct output | BLOCKED — after SH-11.25c |
+| SH-11.27 | Remove/gate debug prints (38 p_eprint_str calls) | TODO — needed for clean fixpoint |
+| SH-11.28 | `==` on enums compares pointers not tags (latent bug) | DEFERRED — 0 direct `==` on enums in source; all use `*_eq` helpers |
 
 ---
 
@@ -603,7 +972,7 @@ Once Fides is self-reproducing:
 1. **Remove debug prints** from `compiler/parser.fd` and other modules
 2. **Re-enable `apply_cfg_filter`** (currently no-op) if cross-compilation is needed
 3. **Re-enable `compute_func_effects`** (currently no-op) for effect checking
-4. **The Rust compiler becomes the test oracle** — run both, compare output
+4. **The bootstrap compiler becomes the test oracle** — run both, compare output
 5. **Start working on the PE emitter rewrite** (Phase 10B)
 6. **Start building the ecosystem** (packages, docs, playground)
 
@@ -612,7 +981,7 @@ Once Fides is self-reproducing:
 ## Build Directory Layout
 
 ```
-target/              ← Rust compiler output (fidesc.exe) — gitignored
+target/              ← Bootstrap compiler output (fidesc.exe) — gitignored
 release/             ← Self-hosted compiler output — gitignored
   fides-c.c          ← Generated C (13MB)
   fides-c.exe        ← Self-hosted compiler (linked by tcc)
@@ -623,4 +992,24 @@ compiler/            ← Self-hosted compiler source (18 .fd modules)
 tests/compiler/      ← Self-host module tests (23 .fd files)
 tests/selfhost/      ← Harness/probe files for differential testing
 stdlib/              ← Fides standard library (69 .fd modules)
+```
+
+## Terminology
+
+| Term | Meaning | Location |
+|------|---------|----------|
+| **Bootstrap compiler** | Built from Rust source (`src/*.rs`) via `cargo build`. Used to build the self-host compiler. | `target/release/fidesc.exe` |
+| **Self-host compiler** | Built from Fides source (`compiler/*.fd`) via the bootstrap compiler + tcc. Written in Fides, not Rust. | `release/fides-c.exe` |
+| **Rust lowerer** | The lowerer code in `src/lower.rs` (Rust source). Has all struct-by-value fixes. | `src/lower.rs` |
+| **Fides lowerer** | The lowerer code in `compiler/lower.fd` (Fides source). All gaps ported (session 3). | `compiler/lower.fd` |
+| **Fixpoint** | When `stage2.c == stage3.c` — the self-host compiler can reproduce itself. At this point, Rust is only needed for the initial bootstrap. | Not yet reached |
+
+**Build chain:**
+```
+Rust source (src/*.rs)
+  → cargo build → fidesc.exe (bootstrap)
+    → fidesc ccompile compiler/*.fd → fides-c.c
+      → tcc → fides-c.exe (self-host)
+        → fides-c ccompile compiler/*.fd → stage1.c → stage1.exe
+          → stage1 ccompile compiler/*.fd → stage2.c → stage2.exe  (fixpoint check)
 ```

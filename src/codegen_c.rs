@@ -211,6 +211,7 @@ impl CCodeGen {
             "min" => "p_min",
             "div" => "p_div",
             "exit" => "p_exit",
+            "remove" => "p_remove_user",
             "printf" => "p_printf",
             "malloc" => "p_malloc_user",
             "free" => "p_free_user",
@@ -449,6 +450,10 @@ impl CCodeGen {
             ("p_bool_to_str", &[Bool]),
             ("p_vec_to_str", &[p()]),
             ("p_str_concat", &[p(), p()]),
+            ("p_str_join_n", &[p()]),
+            ("p_sb_new", &[]),
+            ("p_sb_append", &[p(), p()]),
+            ("p_sb_to_str", &[p()]),
             ("p_print", &[I64]),
             ("p_print_str", &[p()]),
             ("p_eprint_str", &[p()]),
@@ -641,6 +646,10 @@ impl CCodeGen {
         self.fn_ret_types.insert("p_map_keys".to_string(), IrType::I64);
         self.fn_ret_types.insert("p_map_values".to_string(), IrType::I64);
         self.fn_ret_types.insert("p_string_split".to_string(), IrType::I64);
+        // String builder functions
+        self.fn_ret_types.insert("p_sb_new".to_string(), IrType::I64);
+        self.fn_ret_types.insert("p_sb_to_str".to_string(), IrType::Ptr(Box::new(IrType::U8)));
+        self.fn_ret_types.insert("p_str_join_n".to_string(), IrType::Ptr(Box::new(IrType::U8)));
         // Phase 10B: SIMD functions now return i64 (Fides Vec pointer)
         for name in &["p_simd_add", "p_simd_sub", "p_simd_mul", "p_simd_div", "p_simd_scale", "p_simd_from_vec"] {
             self.fn_ret_types.insert(name.to_string(), IrType::I64);
@@ -688,6 +697,8 @@ impl CCodeGen {
         wln!(self, "#ifdef _WIN32");
         wln!(self, "#include <winsock2.h>");
         wln!(self, "#include <ws2tcpip.h>");
+        wln!(self, "#include <io.h>");
+        wln!(self, "#include <fcntl.h>");
         wln!(self, "// PLINK: ws2_32");
         wln!(self, "#else");
         wln!(self, "#include <sys/socket.h>");
@@ -1018,6 +1029,10 @@ impl CCodeGen {
         wln!(self, "char* p_bool_to_str(bool val);");
         wln!(self, "char* p_vec_to_str(PVec* v);");
         wln!(self, "char* p_str_concat(const char* a, const char* b);");
+        wln!(self, "char* p_str_join_n(PVec* parts);");
+        wln!(self, "void* p_sb_new(void);");
+        wln!(self, "void p_sb_append(void* sb, const char* s);");
+        wln!(self, "const char* p_sb_to_str(void* sb);");
         wln!(self, "void p_print(int64_t val);");
         wln!(self, "void p_print_str(const char* s);");
         wln!(self, "void p_print_int(int64_t val);");
@@ -1272,6 +1287,14 @@ impl CCodeGen {
             wln!(self, "#endif");
             wln!(self, "    setvbuf(stdout, NULL, _IONBF, 0);");
             wln!(self, "    setvbuf(stderr, NULL, _IONBF, 0);");
+            // On Windows, set stdout/stderr to binary mode so that printf
+            // doesn't translate \n to \r\n. This ensures output matches
+            // the interpreter exactly (important for strings containing \r\n
+            // like HTTP responses, where text-mode would double the \r).
+            wln!(self, "#ifdef _WIN32");
+            wln!(self, "    _setmode(_fileno(stdout), _O_BINARY);");
+            wln!(self, "    _setmode(_fileno(stderr), _O_BINARY);");
+            wln!(self, "#endif");
             wln!(self, "    __p_argc = argc; __p_argv = argv;");
             // Register functions for p_thread_spawn lookup.
             // Skip internal/helper functions that are never spawned as threads
@@ -2328,6 +2351,53 @@ impl CCodeGen {
         wln!(self, "    char* result = (char*)p_malloc((int64_t)(len + 1));");
         wln!(self, "    strcpy(result, a);");
         wln!(self, "    strcat(result, b);");
+        wln!(self, "    return result;");
+        wln!(self, "}}");
+        wln!(self, "");
+        // Efficient join: calculates total length first, allocates once, copies.
+        wln!(self, "char* p_str_join_n(PVec* parts) {{");
+        wln!(self, "    size_t total = 1;");
+        wln!(self, "    for (int64_t i = 0; i < parts->len; i++) {{");
+        wln!(self, "        total += strlen((char*)parts->data[i]);");
+        wln!(self, "    }}");
+        wln!(self, "    char* result = (char*)p_malloc((int64_t)total);");
+        wln!(self, "    result[0] = 0;");
+        wln!(self, "    for (int64_t i = 0; i < parts->len; i++) {{");
+        wln!(self, "        strcat(result, (char*)parts->data[i]);");
+        wln!(self, "    }}");
+        wln!(self, "    return result;");
+        wln!(self, "}}");
+        wln!(self, "");
+        // Mutable string builder — uses malloc (not arena) for efficient appending.
+        // Avoids the quadratic memory blowup from p_str_concat in long sequences.
+        wln!(self, "typedef struct {{ char* buf; int64_t len; int64_t cap; }} p_sb;");
+        wln!(self, "void* p_sb_new(void) {{");
+        wln!(self, "    p_sb* sb = (p_sb*)malloc(sizeof(p_sb));");
+        wln!(self, "    sb->cap = 4096;");
+        wln!(self, "    sb->len = 0;");
+        wln!(self, "    sb->buf = (char*)malloc(sb->cap);");
+        wln!(self, "    sb->buf[0] = 0;");
+        wln!(self, "    return sb;");
+        wln!(self, "}}");
+        wln!(self, "void p_sb_append(void* vsb, const char* s) {{");
+        wln!(self, "    p_sb* sb = (p_sb*)vsb;");
+        wln!(self, "    size_t slen = strlen(s);");
+        wln!(self, "    if (sb->len + (int64_t)slen + 1 > sb->cap) {{");
+        wln!(self, "        while (sb->len + (int64_t)slen + 1 > sb->cap) sb->cap *= 2;");
+        wln!(self, "        sb->buf = (char*)realloc(sb->buf, sb->cap);");
+        wln!(self, "    }}");
+        wln!(self, "    memcpy(sb->buf + sb->len, s, slen);");
+        wln!(self, "    sb->len += (int64_t)slen;");
+        wln!(self, "    sb->buf[sb->len] = 0;");
+        wln!(self, "}}");
+        wln!(self, "const char* p_sb_to_str(void* vsb) {{");
+        wln!(self, "    p_sb* sb = (p_sb*)vsb;");
+        wln!(self, "    size_t len = (size_t)sb->len;");
+        wln!(self, "    char* result = (char*)p_malloc((int64_t)(len + 1));");
+        wln!(self, "    memcpy(result, sb->buf, len);");
+        wln!(self, "    result[len] = 0;");
+        wln!(self, "    free(sb->buf);");
+        wln!(self, "    free(sb);");
         wln!(self, "    return result;");
         wln!(self, "}}");
         wln!(self, "");
