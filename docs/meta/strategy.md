@@ -56,18 +56,39 @@
 **Anti-pattern:** Functions that silently perform IO.
 **Anti-pattern:** Implicit error propagation (exceptions).
 
-## 5. One Way to Do Things
+## 5. One Way to Do Things (with a safe escape hatch)
 
-**Rule:** Don't provide multiple mechanisms for the same thing.
+**Rule:** Don't provide multiple mechanisms for the same thing — but when
+the primary mechanism can't cover a real pattern, provide a *safe* fallback,
+not an *unsafe* one.
 
 - One metaprogramming system (comptime, not macros + templates + generics)
 - One error handling system (Result + ?, not exceptions + Option + Result)
 - One concurrency model (effect handlers, not async/await + threads + channels)
-- One memory model (regions, not borrow checking + reference counting + GC)
+- **One default memory model (regions)**, with RC as the safe escape hatch for
+  shared ownership. The borrow checker is opt-in (`--borrowck=on`), not a
+  co-equal memory model.
+
+**Memory model hierarchy (Path B — decided Sep 2026):**
+
+| Model | Role | When to use | Cost |
+|-------|------|-------------|------|
+| **Regions** | Default | Scoped data, bulk allocation, predictable lifetime | Zero runtime cost |
+| **References** (`&`/`&mut`) | Always available | Passing borrowed data, no ownership transfer | Zero runtime cost (unchecked by default) |
+| **Borrow checker** | Opt-in (`--borrowck=on`) | When you want compile-time aliasing safety | Zero runtime cost, opt-in complexity |
+| **RC** (`Rc<T>`/`Arc<T>`) | Safe escape hatch | Shared ownership, graphs, caches, callbacks, dynamic lifetime | Runtime refcount cost |
+| **`unsafe`** | Framework-only | Raw pointers, inline asm — never in user code | N/A |
+
+**The key insight:** RC replaces `unsafe` as the fallback for patterns that
+regions can't express. A language with regions + RC never needs `unsafe` for
+memory safety. Without RC, every graph, cache, or observer pattern forces the
+user into `unsafe` — which violates the vision.
 
 **Anti-pattern:** Rust's two macro systems.
 **Anti-pattern:** C++'s templates + constexpr + preprocessor.
 **Anti-pattern:** Python's list comprehensions + map/filter + for loops.
+**Anti-pattern:** Using RC where regions would suffice (lint: warn).
+**Anti-pattern:** Using `unsafe` in user code where RC would work.
 
 ## 6. Composition Over Inheritance
 

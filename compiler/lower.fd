@@ -548,6 +548,21 @@ pub fn Lowerer_load_enum_field(self: &mut Lowerer, field_ptr: i64, field_ty: IrT
     }
 }
 
+/// If `val` is a Box<T> (Ptr(Ptr(Struct(..))) or Generic("Box", [Struct(..)])),
+/// load through it once so enum/struct pattern matching sees the inner struct
+/// pointer directly. Otherwise return `val` unchanged.
+///
+/// NOTE: Box::new stores the struct data directly in the heap allocation (via
+/// memcpy), so the Box pointer already points to the struct data. This function
+/// is a no-op — the match code can read the tag/fields directly from the Box
+/// pointer.
+pub fn Lowerer_maybe_deref_box(self: &mut Lowerer, val: i64) -> i64 {
+    // Box::new copies the full struct data into the heap allocation via
+    // memcpy, so the Box pointer already points to the struct data.
+    // No dereference needed — return val unchanged.
+    return val;
+}
+
 /// Compute the number of 8-byte slots a field occupies in an enum layout.
 /// Struct/enum types use their full layout size (rounded up to 8);
 /// all other types use 1 slot.
@@ -2202,7 +2217,21 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
                     var val: i64 = Lowerer_lower_expr(self, expr);
                     match op {
                         AssignOp::Assign => {
-                            var _s: i64 = Lowerer_emit_inst(self, Inst::Store(alloca, val, OptIrType::None));
+                            // For struct-typed variables, use store_ty to
+                            // emit memcpy (full struct copy). Without this,
+                            // only 8 bytes (the pointer) are copied.
+                            var val_ty: IrType = Lowerer_get_value_type(self, val);
+                            var store_ty: OptIrType = OptIrType::None;
+                            match val_ty {
+                                IrType::Ptr(inner) => {
+                                    var inner_ty: IrType = box_ir_type_unbox(inner);
+                                    if ir_type_is_aggregate(inner_ty) {
+                                        store_ty = OptIrType::Some(inner_ty);
+                                    }
+                                }
+                                _ => {}
+                            }
+                            var _s: i64 = Lowerer_emit_inst(self, Inst::Store(alloca, val, store_ty));
                         }
                         _ => {
                             // Compound assignment: load current, apply op, store
@@ -2852,10 +2881,39 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                     if str_equal(name, "Box") && str_equal(method, "new") {
                         var val: i64 = Lowerer_lower_expr(self, args.get(0));
                         var val_ty: IrType = Lowerer_get_value_type(self, val);
-                        var size: i64 = ir_type_size(val_ty);
-                        var size_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(size, IrType::I64));
+                        // For struct/enum types, the value is a pointer to an
+                        // alloca (enums are passed by pointer). We need to:
+                        // 1. Allocate the full struct size (not just 8 bytes)
+                        // 2. Use Store with store_ty=Struct to emit memcpy
+                        // This prevents dangling pointers when the creating
+                        // function returns and the alloca is freed.
+                        var alloc_size: i64 = 8;
+                        var store_ty: OptIrType = OptIrType::None;
+                        match val_ty {
+                            IrType::Ptr(inner) => {
+                                var inner_ty: IrType = box_ir_type_unbox(inner);
+                                if ir_type_is_aggregate(inner_ty) {
+                                    alloc_size = IrModule_type_size(&self.module, inner_ty);
+                                    store_ty = OptIrType::Some(inner_ty);
+                                } else {
+                                    alloc_size = ir_type_size(val_ty);
+                                }
+                            }
+                            _ => {
+                                alloc_size = ir_type_size(val_ty);
+                            }
+                        }
+                        // Ensure at least 1 byte to avoid malloc(0)
+                        if alloc_size == 0 { alloc_size = 8; }
+                        var size_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(alloc_size, IrType::I64));
                         var ptr_ty: IrType = IrType::Ptr(Box::new(val_ty));
-                        return Lowerer_emit_inst(self, Inst::Call("p_malloc", c_vec1_i64(size_val), ptr_ty, EffectSet_new()));
+                        var ptr: i64 = Lowerer_emit_inst(self, Inst::Call("p_malloc", c_vec1_i64(size_val), ptr_ty, EffectSet_new()));
+                        // Store the value at the heap address.
+                        // For struct types, store_ty=Some(Struct(_)) causes
+                        // the C codegen to emit memcpy, copying the full
+                        // struct data from the alloca to the heap.
+                        Lowerer_emit_inst(self, Inst::Store(ptr, val, store_ty));
+                        return ptr;
                     }
                     // Struct associated function call: mangle as StructName_method
                     if Lowerer_is_struct(self, name) {
@@ -2972,11 +3030,17 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             // and store the pointer in the Vec. Otherwise the stack-allocated
             // SRET buffer becomes a dangling pointer when the calling function
             // returns, causing corrupted data when reading from the Vec later.
-            if str_equal(method, "push") || str_equal(method, "insert") {
+            if str_equal(method, "push") || str_equal(method, "insert") || str_equal(method, "set") {
                 // Determine the Vec element type from the receiver type
                 var vec_elem_ty: IrType = IrType::I64;
                 var found_elem: bool = false;
+                // Unwrap Ptr(..) — &mut Vec<T> lowers to Ptr(Opaque("Vec"))
+                var effective_recv_ty: IrType = recv_ty;
                 match recv_ty {
+                    IrType::Ptr(inner) => { effective_recv_ty = box_ir_type_unbox(inner); }
+                    _ => {}
+                }
+                match effective_recv_ty {
                     IrType::Generic(gname, gargs) => {
                         if str_equal(gname, "Vec") && gargs.len() > 0 {
                             vec_elem_ty = gargs.get(0);
@@ -2990,7 +3054,13 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                                 Expr::Ident(vname) => {
                                     match Lowerer_lookup_var_ast_type(self, vname) {
                                         OptType::Some(at) => {
+                                            // Unwrap &mut / & references to get the inner type
+                                            var inner_ty: Type = at;
                                             match at {
+                                                Type::Ref(inner, _) => { inner_ty = box_type_unbox(inner); }
+                                                _ => {}
+                                            }
+                                            match inner_ty {
                                                 Type::Generic(an, aargs) => {
                                                     if str_equal(an, "Vec") && aargs.len() > 0 {
                                                         vec_elem_ty = Lowerer_lower_type(self, aargs.get(0));
@@ -3030,6 +3100,31 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
                             Lowerer_emit_inst(self, Inst::Store(heap_ptr, val, OptIrType::Some(vec_elem_ty)));
                             // Replace the value in call_args with the heap pointer
                             call_args.set(val_idx, heap_ptr);
+                        }
+                        _ => {}
+                    }
+                } else {
+                    // Fallback: check the value's IR type directly. If it's
+                    // Ptr(Struct(..)) (from SRET), box it. This handles cases
+                    // where the receiver is a field access (self.vec.push(..))
+                    // and the AST type lookup fails.
+                    var val_idx2: i64 = call_args.len() - 1;
+                    var val2: i64 = call_args.get(val_idx2);
+                    var val2_ty: IrType = Lowerer_get_value_type(self, val2);
+                    match val2_ty {
+                        IrType::Ptr(inner2) => {
+                            match box_ir_type_unbox(inner2) {
+                                IrType::Struct(sname) => {
+                                    var struct_ty: IrType = IrType::Struct(sname);
+                                    var size2: i64 = IrModule_type_size(&self.module, struct_ty);
+                                    if size2 <= 0 { size2 = 8; }
+                                    var size_val2: i64 = Lowerer_emit_inst(self, Inst::ConstInt(size2, IrType::I64));
+                                    var heap_ptr2: i64 = Lowerer_emit_inst(self, Inst::Call("p_malloc", c_vec1_i64(size_val2), IrType::Ptr(Box::new(struct_ty)), EffectSet_new()));
+                                    Lowerer_emit_inst(self, Inst::Store(heap_ptr2, val2, OptIrType::Some(struct_ty)));
+                                    call_args.set(val_idx2, heap_ptr2);
+                                }
+                                _ => {}
+                            }
                         }
                         _ => {}
                     }

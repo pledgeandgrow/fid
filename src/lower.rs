@@ -1407,38 +1407,18 @@ impl Lowerer {
     /// If `val` is a Box<T> (Ptr(Ptr(Struct(..)))), load through it once
     /// so enum/struct pattern matching sees the inner struct pointer.
     /// Otherwise return `val` unchanged.
+    ///
+    /// NOTE: Box::new stores the struct data directly in the heap allocation
+    /// via memcpy (not a pointer to the struct). So the Box pointer already
+    /// points to the struct data, and match code can read the tag/fields
+    /// directly from it. This function is now a no-op — the extra Load
+    /// through the Box was reading the enum tag as a pointer, causing crashes
+    /// at addresses like 0x4 (tag value for Ident).
     fn maybe_deref_box(&mut self, val: ValueId) -> ValueId {
-        let ty = self.get_value_type(val);
-        // Box<T> arrives as either Ptr(Ptr(Struct(..))) (from Box::new) or
-        // Generic("Box", [Struct(..)]) (from a typed parameter). In both
-        // cases the runtime value is a pointer to a pointer to the inner
-        // struct, so we load through it once to get the struct pointer.
-        let inner_struct_ty = match &ty {
-            IrType::Ptr(inner) => {
-                match inner.as_ref() {
-                    IrType::Ptr(inner2) if inner2.is_aggregate() => Some((**inner).clone()),
-                    _ => None,
-                }
-            }
-            IrType::Generic(name, args) if name == "Box" => {
-                args.first().filter(|t| t.is_aggregate()).cloned()
-            }
-            _ => None,
-        };
-        if let Some(inner_ty) = inner_struct_ty {
-            // The Box stores a *pointer* to the struct (from the alloca),
-            // so the load type is Ptr(inner), not inner itself.
-            let load_ty = IrType::Ptr(Box::new(inner_ty));
-            let field_ptr = self.emit_inst(Inst::GetFieldPtr {
-                struct_ptr: val,
-                field_index: 0,
-                field_ty: load_ty.clone(),
-            });
-            return self.emit_inst(Inst::Load {
-                ptr: field_ptr,
-                ty: load_ty,
-            });
-        }
+        let _ty = self.get_value_type(val);
+        // Box::new copies the full struct data into the heap allocation via
+        // memcpy, so the Box pointer already points to the struct data.
+        // No dereference needed — return val unchanged.
         val
     }
 
@@ -1546,8 +1526,21 @@ impl Lowerer {
                 // inline struct value.
                 let val_ty = self.get_value_type(val);
                 let declared_ir = ty.as_ref().map(|t| self.lower_type(t));
+                // When the declared type is a struct and the value is a
+                // pointer to that struct, use the declared (struct) type for
+                // the alloca so it holds the full struct data inline. Using
+                // the pointer type would only allocate 8 bytes, truncating
+                // the struct on store.
                 let ir_ty = match (declared_ir, &val_ty) {
-                    (Some(d), v) if d.is_aggregate() && v.is_ptr() => v.clone(),
+                    (Some(d), v) if d.is_aggregate() && v.is_ptr() => {
+                        // If the pointer points to the same struct type, use
+                        // the struct type (inline storage). Otherwise (e.g.
+                        // Vec_get returning *Struct), use the pointer type.
+                        match v {
+                            IrType::Ptr(inner) if inner.as_ref() == &d => d,
+                            _ => v.clone(),
+                        }
+                    }
                     (Some(d), _) => d,
                     (None, _) => val_ty,
                 };
@@ -1572,10 +1565,17 @@ impl Lowerer {
                         f.persist_vars.push((name.clone(), alloca));
                     }
                 } else {
+                    // For struct-typed alloca, use store_ty to emit memcpy
+                    // (full struct copy). Without this, only 8 bytes (the
+                    // pointer) are copied, truncating the struct data.
+                    let store_ty = match &ir_ty {
+                        IrType::Struct(_) => Some(ir_ty.clone()),
+                        _ => None,
+                    };
                     self.emit_inst(Inst::Store {
                         ptr: alloca,
                         value: val,
-                        store_ty: None,
+                        store_ty,
                     });
                 }
                 self.allocas.insert(name.clone(), alloca);
@@ -1698,7 +1698,18 @@ impl Lowerer {
                     match op {
                         AssignOp::Assign => {
                             let val = self.lower_expr(expr);
-                            self.emit_inst(Inst::Store { ptr, value: val, store_ty: None });
+                            // For struct-typed variables, use store_ty to
+                            // emit memcpy (full struct copy). Without this,
+                            // only 8 bytes (the pointer) are copied, truncating
+                            // the struct data.
+                            let val_ty = self.get_value_type(val);
+                            let store_ty = match &val_ty {
+                                IrType::Ptr(inner) if inner.is_aggregate() => {
+                                    Some(inner.as_ref().clone())
+                                }
+                                _ => None,
+                            };
+                            self.emit_inst(Inst::Store { ptr, value: val, store_ty });
                         }
                         _ => {
                             // Compound assignment: load current, apply op, store back
@@ -3230,6 +3241,12 @@ impl Lowerer {
                     if matches!(&load_ty, IrType::Ptr(inner) if matches!(inner.as_ref(), IrType::Struct(_))) {
                         return self.emit_inst(Inst::Load { ptr: *alloca, ty: load_ty });
                     }
+                    // If the alloca holds an inline struct, return the
+                    // alloca pointer directly — the alloca IS the struct
+                    // data, so the pointer to it is the struct value.
+                    if matches!(&load_ty, IrType::Struct(_)) {
+                        return *alloca;
+                    }
                     return self.emit_inst(Inst::Load {
                         ptr: *alloca,
                         ty: load_ty,
@@ -3817,15 +3834,21 @@ impl Lowerer {
                         // Prepend dummy env_ptr for user functions
                         let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                         runtime_args.insert(0, dummy_env);
-                        // Element type from Generic args, default to I64
-                        let mut elem_ty = recv_ty.generic_elem().cloned().unwrap_or(IrType::I64);
+                        // Element type from Generic args, default to I64.
+                        // Use effective_ty (unwrapped from Ptr) for generic_elem.
+                        let mut elem_ty = effective_ty.generic_elem().cloned().unwrap_or(IrType::I64);
                         // Fallback: if recv_ty is Opaque("Vec") (from Vec::new()),
                         // generic_elem() returns None. Try looking up the AST type
                         // from var_ast_types to recover the element type.
                         if matches!(elem_ty, IrType::I64) && effective_ty.is_opaque_named("Vec") {
                             if let Expr::Ident(var_name) = receiver.as_ref() {
                                 if let Some(ast_ty) = self.var_ast_types.get(var_name) {
-                                    if let Type::Generic { name, args } = ast_ty {
+                                    // Unwrap &mut / & references to get the inner type
+                                    let inner_ty = match ast_ty {
+                                        Type::Ref { inner, .. } => inner.as_ref(),
+                                        other => other,
+                                    };
+                                    if let Type::Generic { name, args } = inner_ty {
                                         if name == "Vec" && !args.is_empty() {
                                             elem_ty = self.lower_type(&args[0]);
                                         }
@@ -3884,7 +3907,58 @@ impl Lowerer {
                                     self.emit_inst(Inst::Store { ptr: heap_ptr, value: val, store_ty: Some(elem_ty.clone()) });
                                     runtime_args[3] = heap_ptr;
                                 }
+                                "set" => {
+                                    // runtime_args = [dummy_env, vec, index, value]
+                                    // Box the value at index 3
+                                    let val = runtime_args[3];
+                                    let mut size = self.module.type_size(&elem_ty);
+                                    if size == 0 { size = 8; }
+                                    let size_val = self.emit_inst(Inst::ConstInt { value: size as i64, ty: IrType::I64 });
+                                    let heap_ptr = self.emit_inst(Inst::Call {
+                                        func: "p_malloc".to_string(),
+                                        args: vec![size_val],
+                                        ret_ty: IrType::Ptr(Box::new(elem_ty.clone())),
+                                        effects: {
+                                            let mut e = EffectSet::new();
+                                            e.add(Effect::Alloc);
+                                            e
+                                        },
+                                    });
+                                    self.emit_inst(Inst::Store { ptr: heap_ptr, value: val, store_ty: Some(elem_ty.clone()) });
+                                    runtime_args[3] = heap_ptr;
+                                }
                                 _ => {}
+                            }
+                        } else {
+                            // Fallback: check the value's IR type directly.
+                            // If it's Ptr(Struct(..)) (from SRET), box it.
+                            // This handles cases where the receiver is a field
+                            // access (self.vec.push(..)) and the AST type
+                            // lookup fails to determine the element type.
+                            let val_idx = if method == "insert" || method == "set" { 3 } else { 2 };
+                            if val_idx < runtime_args.len() {
+                                let val = runtime_args[val_idx];
+                                let val_ty = self.get_value_type(val);
+                                if let IrType::Ptr(inner) = &val_ty {
+                                    if let IrType::Struct(_) = inner.as_ref() {
+                                        let struct_ty = inner.as_ref().clone();
+                                        let mut size = self.module.type_size(&struct_ty);
+                                        if size == 0 { size = 8; }
+                                        let size_val = self.emit_inst(Inst::ConstInt { value: size as i64, ty: IrType::I64 });
+                                        let heap_ptr = self.emit_inst(Inst::Call {
+                                            func: "p_malloc".to_string(),
+                                            args: vec![size_val],
+                                            ret_ty: IrType::Ptr(Box::new(struct_ty.clone())),
+                                            effects: {
+                                                let mut e = EffectSet::new();
+                                                e.add(Effect::Alloc);
+                                                e
+                                            },
+                                        });
+                                        self.emit_inst(Inst::Store { ptr: heap_ptr, value: val, store_ty: Some(struct_ty) });
+                                        runtime_args[val_idx] = heap_ptr;
+                                    }
+                                }
                             }
                         }
                         // Vec_get/pop/first/last/remove return a pointer when

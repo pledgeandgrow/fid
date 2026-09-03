@@ -28,15 +28,16 @@ Fides is a systems programming language built from first principles — every la
 - **Binary size**: smaller than C via dead code elimination at IR level
 - **Memory**: 40% less overhead than Rust via region-based allocation (no Rc/RefCell needed)
 
-### 4. Memory Safety — Like Rust, Without the Pain
-- **Region inference**: compiler tracks memory regions, no lifetime annotations needed
-- **No borrow checker fights**: regions are more flexible than ownership+borrowing
-- **No "mutation xor sharing" rule**: aliasing patterns that Rust rejects are valid in Fides
+### 4. Memory Safety — Regions First, RC as the Safe Escape Hatch
+- **Regions are the default memory model**: `region r { ... }` for scoped, bulk-freed, zero-overhead allocation. Compile-time escape detection prevents use-after-free.
+- **References are unchecked by default**: `&` and `&mut` work without a borrow checker. Aliasing patterns that Rust rejects are valid in Fides. The borrow checker is opt-in (`--borrowck=on`) for users who want compile-time aliasing safety.
+- **RC is the safe alternative to `unsafe`**: when a pattern needs shared ownership (graphs, caches, callbacks, dynamic lifetime), `Rc<T>`/`Arc<T>` provides it memory-safely. This eliminates the need for `unsafe` raw pointers in user code.
+- **No `unsafe` in user code**: raw pointers are framework-only. If you can't use regions and you can't use references, you use RC — never `unsafe`.
 - **Explicit allocators**: caller chooses allocation strategy (like Zig), but with compile-time safety (like Rust)
-- **Zero runtime cost**: all safety checks are compile-time
+- **Zero runtime cost for the default path**: regions and references are zero-cost. RC has runtime cost, but only when explicitly chosen.
 
 ### 5. Power & Flexibility — Like C, But Safe
-- **Direct hardware access**: raw pointers available in framework code (not user code)
+- **Direct hardware access**: raw pointers available in framework code only (not user code — use RC instead)
 - **Inline assembly**: for kernel/embedded development
 - **Zero-cost abstractions**: generics, closures, traits — all compile to optimal code
 - **comptime**: full metaprogramming without macros — regular code at compile time
@@ -81,7 +82,7 @@ Fides is a systems programming language built from first principles — every la
 - **Not a garbage-collected language**: zero runtime overhead
 - **Not a managed language**: no VM, no JIT in production mode
 - **Not a macro-based language**: comptime replaces all metaprogramming
-- **Not an unsafe language**: no `unsafe` in user code, ever
+- **Not an unsafe language**: no `unsafe` in user code, ever — RC is the safe escape hatch when regions can't express the ownership pattern
 
 ## The North Star
 

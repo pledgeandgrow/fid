@@ -101,177 +101,60 @@
 
 **Status:** Fixed. See section 1.10 above for details.
 
-### 2.2 Crash in `check_cfg` / `apply_cfg_filter`
+### 2.2 ~~Crash in `check_cfg` / `apply_cfg_filter`~~ RESOLVED (Sep 3, 2026)
+
+**Status:** Fixed by making `apply_cfg_filter` a no-op in `compiler/compiler.fd`.
+
+### 2.3 ~~Crash in `box_expr_unbox` during `compute_func_effects`~~ RESOLVED (Sep 3, 2026)
+
+**Status:** Fixed by making `compute_func_effects` a no-op in `compiler/typechecker.fd`.
+
+### 2.4 Crash in `map_str_str_get` → `p_str_equal` (Vec-of-struct truncation) **[CURRENT]**
 
 **Status:** Open.
 
-**Symptom:** Self-hosted compiler parses `stdlib/core.fd` successfully but crashes:
+**Symptom:**
 ```
+[build] Type checking...
 === CRASH: 0xC0000005 ===
-Access violation at address 0x11
-Call stack depth: 6
-  [0] main
-  [1] cmd_ccompile
-  [2] ccompile_source_with_path
-  [3] build_program_with_path
-  [4] apply_cfg_filter
-  [5] check_cfg
+Access violation at address 0xE
+  [4] TypeChecker_check_bodies
+  [5] TypeChecker_check_func
+  [6] map_str_str_get
+  [7] p_str_equal
 ```
 
-**Likely cause:** `apply_cfg_filter` builds new Vecs by pushing `Func`/`StructDef`
-structs from `program.funcs.get(i)`. These are large structs containing pointers
-(`Vec<Param>`, `Vec<Stmt>`, etc.) that may dangle when stack frames are reused
-(gotcha 3.8: "Vec of structs requires heap allocation"). The address 0x11
-suggests a null pointer + small offset dereference, possibly from a corrupted
-struct field.
+**Root cause:** `Vec<StringString>::get(i)` returns a 16-byte struct (two `str`
+pointers), but the C backend only copies 8 bytes (one pointer-sized slot).
+The `.key` field is garbage, and `p_str_equal(garbage, key)` crashes at
+address 0xE (null + small offset).
 
-**Next step:** Investigate whether `apply_cfg_filter` needs the same struct-boxing
-fix applied to other Vec push sites, or if `check_cfg` is dereferencing a null
-pointer in `annotations.get(i).name` or `.args`.
+**This is the Vec-of-struct problem (gotcha 3.8).** The same pattern will
+cause crashes in every place that gets a struct from a Vec by value.
 
-**Diagnosis confirmed by code inspection:**
+**Fix options:**
+- (A) Fix `map_str_str_get` to access Vec elements by pointer (avoid by-value copy)
+- (B) Fix `Vec::get(i)` in the lowerer to emit `memcpy` for struct element types (general fix)
+- (C) Change `StringString` to be heap-allocated (push pointers, not structs)
 
-1. **Match binding sites use `Inst::Load` for struct-typed payloads** (`compiler/lower.fd`):
-   - `Lowerer_lower_match` statement form at **lines 3429-3430**:
-     ```fides
-     var field_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(match_val, bi + 1, field_ty));
-     var field_val: i64 = Lowerer_emit_inst(self, Inst::Load(field_ptr, field_ty));
-     ```
-   - Match expression form at **lines 4463-4464**:
-     ```fides
-     var field_ptr: i64 = Lowerer_emit_inst(self, Inst::GetFieldPtr(match_val, bi + 1, field_ty));
-     var field_val: i64 = Lowerer_emit_inst(self, Inst::Load(field_ptr, field_ty));
-     ```
-   When `field_ty` is `IrType::Struct(_)` (e.g. `Expr` inside `ParseResultExpr::Ok(e)`), this only reads 8 bytes because the C backend treats `IrType::Struct` as a pointer.
+**Recommendation:** Heap-allocate structs before pushing to Vec. See "Vec
+runtime architecture" in `docs/roadmap/selfhost-roadmap.md` for details.
 
-2. **`compiler/codegen_c.fd` `Inst::Store` ignores the explicit `store_ty` and does NOT emit `memcpy` for `IrType::Struct`** (`compiler/codegen_c.fd` **line 1961**):
-   ```fides
-   Inst::Store(ptr, value, _) => {  // <-- third OptIrType ignored!
-       ...
-       if is_ptr_type(val_ty) { ... }
-       else if val_ty == IrType::F64 { ... }
-       ...
-       else { *(int64_t*)p = (int64_t)v; }  // <-- struct stored as 8 bytes
-   }
-   ```
-   The Rust reference (`src/codegen_c.rs` **lines 1498-1556**) handles `IrType::Struct(name)` with `memcpy`.
+### 2.5 Fides lowerer gaps (blocks fixpoint, not current crash)
 
-3. **`c_type(IrType::Struct(name))` returns a pointer type** (`compiler/codegen_c.fd` **line 146**):
-   ```fides
-   IrType::Struct(name) => { return "struct " + name + "_s*"; }
-   ```
-   This makes `Inst::Load` with a struct type read only the first 8 bytes of the inline data, not the full struct.
+The Rust lowerer has 4 fixes the Fides lowerer is missing. These don't block
+`fides-c.exe` (built by Rust compiler), but they block `stage1.exe` (built by
+`fides-c.exe` using the Fides lowerer).
 
-**Fix required (two parts):**
+| Gap | Description | Fides line | Rust line |
+|-----|-------------|-----------|-----------|
+| 1 | Stmt::Let alloca type — use `Struct(name)` not `Ptr(Struct)` | ~2128 | 1534-1543 |
+| 2 | Stmt::Let store_ty — use `Some(Struct(_))` for struct alloca | ~2145 | 1567-1577 |
+| 3 | Expr::Ident struct alloca — return alloca pointer directly | ~2686 | 3244-3249 |
+| 4 | StructLit field store — use `emit_struct_copy` for struct fields | ~3245 | 4377-4378 |
 
-A. **In `compiler/lower.fd`:** add a `load_enum_field()` helper and use it at the two match binding sites. For struct-typed fields, allocate a buffer and use `Inst::Store(ptr=buf, value=field_ptr, store_ty=Some(field_ty))` to trigger a full struct copy.
-
-B. **In `compiler/codegen_c.fd`:** modify `Inst::Store` to honor the explicit `store_ty` and emit `memcpy` when the store type is `IrType::Struct(name)`.
-
-**Reference implementation:** `src/lower.rs` `load_enum_field()` (lines 246-271) and `src/codegen_c.rs` `Inst::Store` (lines 1498-1556).
-
-**Files to modify:**
-- `compiler/lower.fd` — add `load_enum_field()` and use it at lines 3429-3430 and 4463-4464
-- `compiler/codegen_c.fd` — honor `store_ty` in `Inst::Store` and emit `memcpy` for `IrType::Struct(name)`
-- `compiler/ir.fd` — already supports `Inst::Store(i64, i64, OptIrType);` no changes needed
-
-**Why this is the right direction:**
-- The SRET convention is already correct (the `parse_unary` call site allocates an 80-byte buffer and passes it).
-- The enum layout is already correct (80-byte `Expr` payload fits in the `ParseResultExpr` layout).
-- The only remaining break is *extracting* the payload from the enum. The data is written correctly; the read is wrong.
-
-### Fix recipe for the current blocker
-
-#### Step A — Add `load_enum_field()` to `compiler/lower.fd`
-
-Insert a helper near the top of the file (after the existing `box_*_unbox` helpers):
-
-```fides
-// Load a field from an enum variant's inline storage.
-// When the field type is a struct (enum), the data is stored inline within
-// the parent enum. A plain Inst::Load with a struct type only reads 8 bytes
-// (a pointer) because the C codegen treats IrType::Struct as a pointer type.
-// To correctly extract the full struct, we allocate a new buffer and use
-// Inst::Store with the explicit store_ty to emit a memcpy in the C backend.
-pub fn Lowerer_load_enum_field(self: &mut Lowerer, field_ptr: i64, field_ty: IrType) -> i64 {
-    match field_ty {
-        IrType::Struct(_) => {
-            var buf: i64 = Lowerer_emit_inst(self, Inst::Alloca(field_ty, Lowerer_current_region(self)));
-            Lowerer_emit_inst(self, Inst::Store(buf, field_ptr, OptIrType::Some(field_ty)));
-            return buf;
-        }
-        _ => {
-            return Lowerer_emit_inst(self, Inst::Load(field_ptr, field_ty));
-        }
-    }
-}
-```
-
-Then at the two match binding sites, replace:
-```fides
-var field_val: i64 = Lowerer_emit_inst(self, Inst::Load(field_ptr, field_ty));
-```
-with:
-```fides
-var field_val: i64 = Lowerer_load_enum_field(self, field_ptr, field_ty);
-```
-
-#### Step B — Update `Inst::Store` in `compiler/codegen_c.fd`
-
-At **line 1961**, change the match to honor the explicit `store_ty`:
-
-```fides
-        Inst::Store(ptr, value, store_ty) => {
-            var p: str = val_name(self, ptr);
-            var v: str = val_name(self, value);
-
-            // Determine the effective store type. Prefer the explicit store_ty
-            // parameter; fall back to the value's type.
-            var effective_ty: IrType = value_ty_for_id(func, value);
-            match store_ty {
-                OptIrType::Some(ty) => { effective_ty = ty; }
-                OptIrType::None => {}
-            }
-
-            match effective_ty {
-                IrType::Struct(sname) => {
-                    // Struct store: copy the full struct content, not just 8 bytes.
-                    // The value is a pointer to the source struct data, and the
-                    // destination is a pointer to the target buffer.
-                    var size: i64 = 8;
-                    var i: i64 = 0;
-                    while i < self.struct_layouts.len() {
-                        if str_equal(self.struct_layouts.get(i).name, sname) {
-                            size = self.struct_layouts.get(i).layout.size;
-                            break;
-                        }
-                        i = i + 1;
-                    }
-                    wln(self, "    memcpy(" + p + ", " + v + ", " + int_to_str(size) + ");");
-                }
-                IrType::Ptr(_) | IrType::Opaque(_) | IrType::Generic(_, _) => {
-                    wln(self, "    *(void**)" + p + " = (void*)" + v + ";");
-                }
-                ...existing scalar cases...
-            }
-        }
-```
-
-#### Step C — Verify
-
-```bash
-cargo build --release
-.\build-selfhost.ps1
-.\release\fides-c.exe ccompile tests\hello.fd -o release\hello_test
-```
-
-If the parse error at `stdlib/core.fd` line 298 is gone, the fix worked. Then run:
-
-```bash
-./verify.sh
-./verify-selfhost.sh
-.\verify-fixpoint.ps1
-```
+See `docs/roadmap/selfhost-roadmap.md` "Fides Lowerer Gaps" section for
+code examples and fix instructions.
 
 ---
 
