@@ -6,39 +6,34 @@
 
 ## Where We Stopped (Sep 3 — pick up here)
 
-**Self-hosted compiler lexes + parses stdlib/core.fd and user code successfully.
-Crashes in TypeChecker during `map_str_str_get` → `p_str_equal` (Vec-of-struct
-truncation).**
+**MILESTONE: Self-hosted compiler compiles `tests/hello.fd` end-to-end and
+produces correct output: `Hello, Fides!50y is big`**
 
 ### What works:
 1. **Build pipeline complete** — `compiler/*.fd` (18 modules, 39.5K LOC) compiles to C via the Rust compiler, then links to `fides-c.exe` via tcc
 2. **All 18 self-host modules compile + pass tests** (23/23 on tests/compiler/ via interpreter + PE)
 3. **Lexer works** — stdlib/core.fd tokenized successfully
 4. **Parser works** — stdlib/core.fd and user code parsed successfully (deref assignments work)
-5. **SRET calling convention** — struct-returning functions use hidden out-parameter
-6. **Enum layout** — payload sizes computed from actual field sizes with fixpoint iteration
-7. **Enum inline storage** — struct-typed enum fields stored inline via memcpy
-8. **Enum variant extraction** — `load_enum_field()` copies full struct data
-9. **Inst::Store with store_ty** — C codegen emits memcpy for struct store types
-10. **Safety hardening** — recursion limit, OOM abort, crash handlers, Windows stack
+5. **TypeChecker works** — hello.fd type checks ok
+6. **Borrow checker works** — hello.fd borrow checks ok
+7. **Monomorphizer works** — hello.fd monomorphized ok
+8. **Lowerer works** — hello.fd lowered to IR
+9. **C codegen works** — hello.fd → C code (534KB) → tcc → correct output
+10. **SRET calling convention** — struct-returning functions use hidden out-parameter
+11. **Enum layout** — payload sizes computed from actual field sizes with fixpoint iteration
+12. **Enum inline storage** — struct-typed enum fields stored inline via memcpy
+13. **Enum variant extraction** — `load_enum_field()` copies full struct data
+14. **Inst::Store with store_ty** — C codegen emits memcpy for struct store types
+15. **Vec-of-struct handling** — all Vec paths (set/push/insert/get/pop/first/last/indexing/for-loop/compound) handle struct elements correctly
+16. **Safety hardening** — recursion limit, OOM abort, crash handlers, Windows stack
 
-### Current crash:
+### Verified output:
 ```
-[build] Type checking...
-=== CRASH: 0xC0000005 ===
-Access violation at address 0xE
-  [4] TypeChecker_check_bodies
-  [5] TypeChecker_check_func
-  [6] map_str_str_get
-  [7] p_str_equal
+.\release\fides-c.exe ccompile tests\hello.fd -o release\hello_test
+C:\tcc\tcc.exe -O2 -w -o release\hello_test.exe release\hello_test.c C:\tcc\lib\ws2_32.def
+.\release\hello_test.exe
+→ Hello, Fides!50y is big    ✅ CORRECT
 ```
-
-**Root cause:** `Vec<StringString>::get(i)` returns a 16-byte struct (two `str`
-pointers), but the C backend only copies 8 bytes. The `.key` field is garbage,
-and `p_str_equal(garbage, key)` crashes.
-
-**This is the Vec-of-struct problem (gotcha 3.8).** The same pattern will
-cause crashes in every place that gets a struct from a Vec by value.
 
 ### Build commands:
 ```
@@ -49,11 +44,10 @@ C:\tcc\tcc.exe -O2 -w -o release\fides-c.exe release\fides-c.c C:\tcc\lib\ws2_32
 ```
 
 ### Next steps:
-1. **Fix the Vec-of-struct truncation** — make `Vec::get(i)` emit memcpy for struct element types (the general fix), or fix `map_str_str_get` specifically
-2. **Continue the crash-fix loop** — each crash is the same root cause (struct-by-value only copies 8 bytes)
-3. **Once no crashes:** verify hello.fd output is correct
-4. **Once hello.fd works:** self-compilation (stage1)
-5. **Once stage1 works:** fixpoint verification (stage2.c == stage3.c)
+1. **Self-compilation** — `fides-c.exe ccompile compiler\main.fd -o release\stage1` (the hardest step)
+2. **Port Fides lowerer gaps 1-4** if stage1 crashes (see below)
+3. **Verify stage1 output** — stage1 compiles hello.fd correctly
+4. **Fixpoint verification** — stage2.c == stage3.c
 
 See `docs/roadmap/selfhost-roadmap.md` for the full plan.
 
@@ -220,32 +214,24 @@ match field_ty {
 }
 ```
 
-### Vec-of-Struct Problem (affects BOTH lowerers)
+### Vec-of-Struct Problem — RESOLVED (Sep 3, 2026)
 
-**This is the current crash.** `map_str_str_get` calls `Vec::get(i)` to get a
-`StringString` struct (16 bytes: two `str` pointers). But `p_vec_get` returns
-`I64` (8 bytes). Only the first field (`.key`) is returned; `.value` is garbage.
+**Was the previous crash.** `map_str_str_get` called `Vec::get(i)` to get a
+`StringString` struct (16 bytes: two `str` pointers). But `p_vec_get` returned
+`I64` (8 bytes). Only the first field (`.key`) was returned; `.value` was garbage.
 
-**Vec::set / Vec::get struct handling status:**
+**All Vec paths now handle struct elements correctly:**
 
 | Path | Rust | Fides |
 |------|------|-------|
-| `vec.set(i, struct)` method | ✓ | ✓ |
-| `vec[i] = struct` indexing | ✗ | ✗ |
-| `vec.get(i)` method (struct) | ✓ | ✓ |
-| `vec[i]` indexing (struct) | ✓ | ✗ (hardcoded I64) |
-| `for x in vec` (struct) | ✓ | ✗ (hardcoded I64) |
-| `vec[i] += x` compound (struct) | ✗ | ✗ |
+| `vec.set(i, struct)` method | ✓ DONE | ✓ DONE |
+| `vec[i] = struct` indexing | ✓ DONE | ✓ DONE |
+| `vec.get(i)` method (struct) | ✓ DONE | ✓ DONE |
+| `vec[i]` indexing (struct) | ✓ DONE | ✓ DONE |
+| `for x in vec` (struct) | ✓ DONE | ✓ DONE |
+| `vec[i] += x` compound (struct) | ✓ DONE | ✓ DONE |
 
-**Fixes needed:**
-
-In BOTH lowerers:
-1. `vec[i] = struct` indexing — box the struct before `Vec_set`
-2. `vec[i] += x` compound — use `word_repr(elem_ty)` for `Vec_get` return
-
-In Fides lowerer only:
-3. `vec[i]` indexing — use `word_repr(elem_ty)` instead of `I64` (line 3229)
-4. `for x in vec` — use `word_repr(elem_ty)` instead of `I64` (line 4518)
+**Result:** `tests/hello.fd` compiles end-to-end and produces correct output.
 
 ### Test Results (Sep 3, after Rust lowerer fixes)
 
@@ -281,9 +267,11 @@ Each fix in the Rust lowerer moved the crash further along the pipeline:
    which uses the Rust lowerer. So the Rust lowerer's fixes SHOULD apply. The
    crash moved to the typechecker, meaning the lexer crash was also fixed.
 
-3. **Current crash:** `TypeChecker_check_func` → `map_str_str_get` →
-   `p_str_equal` at address 0xE. This is the Vec-of-struct truncation:
-   `Vec<StringString>::get(i)` returns only 8 bytes of the 16-byte struct.
+3. **~~Current crash~~ RESOLVED:** `TypeChecker_check_func` → `map_str_str_get` →
+   `p_str_equal` at address 0xE. Was the Vec-of-struct truncation:
+   `Vec<StringString>::get(i)` returned only 8 bytes of the 16-byte struct.
+   Fixed by boxing structs before Vec push and using `word_repr(elem_ty)` for
+   Vec_get return types. `tests/hello.fd` now compiles end-to-end.
 
 ### Key Insight
 

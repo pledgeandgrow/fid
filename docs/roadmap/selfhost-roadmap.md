@@ -9,38 +9,37 @@
 
 ## Current State (Sep 3, 2026)
 
+### MILESTONE: Self-hosted compiler compiles hello.fd correctly
+
+```
+.\release\fides-c.exe ccompile tests\hello.fd -o release\hello_test
+C:\tcc\tcc.exe -O2 -w -o release\hello_test.exe release\hello_test.c C:\tcc\lib\ws2_32.def
+.\release\hello_test.exe
+→ Hello, Fides!50y is big    ✅ CORRECT
+```
+
+The self-hosted compiler (`fides-c.exe`, built from `compiler/*.fd` via the
+Rust compiler + tcc) can now:
+1. Lex `stdlib/core.fd` ✅
+2. Parse `stdlib/core.fd` ✅
+3. Lex + parse user code ✅
+4. Type check ✅
+5. Borrow check ✅
+6. Monomorphize ✅
+7. Lower to IR ✅
+8. Generate C code ✅
+9. Output compiles with tcc ✅
+10. Output runs and prints correct result ✅
+
+**Next step:** Self-compilation — `fides-c.exe ccompile compiler/main.fd`
+
 ### What works
 
 - All 18 self-host modules rewritten in Fides (39.5K LOC)
 - All 23 self-host module tests pass on interpreter + PE emitter
 - `release/fides-c.exe` builds via tcc (8.5MB)
-- The self-hosted compiler **lexes** stdlib/core.fd successfully
-- The self-hosted compiler **parses** stdlib/core.fd successfully
-- The self-hosted compiler **parses** user code (tests/hello.fd) successfully
-- Type checking starts but crashes
-
-### Current crash
-
-```
-[build] Stdlib parsed ok. Extracting names...
-[build] Lexing user code...
-[build] User code lexed. Checking errors...
-[build] Parsing user code...
-[build] Type checking...
-=== CRASH: 0xC0000005 ===
-Access violation at address 0xE
-Call stack depth: 8
-  [0] main
-  [1] cmd_ccompile
-  [2] ccompile_source_with_path
-  [3] build_program_with_path
-  [4] TypeChecker_check_bodies
-  [5] TypeChecker_check_func
-  [6] map_str_str_get
-  [7] p_str_equal
-```
-
-**Pipeline progress:** Lexer OK → Parser OK → TypeChecker CRASHES
+- Full pipeline works end-to-end on `tests/hello.fd`
+- Output is correct: `Hello, Fides!50y is big`
 
 ### Build commands
 
@@ -100,70 +99,36 @@ This means:
 | Expr::Ident struct alloca | Returns alloca pointer directly for `Struct(_)` typed alloca | DONE | **TODO (Gap 3)** |
 | StructLit field store | Uses `emit_struct_copy` for `Struct(_)` fields | DONE | **TODO (Gap 4)** |
 | Vec element type from `&mut`/`&` | Unwraps reference types to get Vec element type | DONE | DONE |
-| Vec-of-struct push/get | Heap-allocates structs before pushing to Vec | **TODO** | **TODO** |
+| Vec::set method boxing | Boxes struct before `Vec_set` (method call path) | DONE | DONE |
+| Vec::get method return type | Uses `word_repr(elem_ty)` for `Vec_get` return | DONE | DONE |
+| `vec[i] = struct` indexing boxing | Boxes struct before `Vec_set` (indexing path) | DONE | DONE |
+| `vec[i]` indexing return type | Uses `word_repr(elem_ty)` for `p_vec_get` return | DONE | DONE |
+| `vec[i] += x` compound return type | Uses `word_repr(elem_ty)` for `Vec_get` return | DONE | DONE |
+| `for x in vec` element type | Uses `word_repr(elem_ty)` for `p_vec_get` return + `elem_ty` alloca | DONE | DONE |
 
 ### What's still broken
 
-The current crash (`map_str_str_get` → `p_str_equal`) is the **Vec-of-struct**
-problem. `Vec<StringString>::get(i)` returns a `StringString` struct (16 bytes:
-two `str` pointers), but the C backend only copies 8 bytes. The `.key` field
-is garbage, and `p_str_equal(garbage, key)` crashes at address 0xE.
+**Nothing blocks `tests/hello.fd` anymore.** The full pipeline works end-to-end.
 
-**After fixing Vec-of-struct**, the Fides lowerer gaps (1-4) will cause
-crashes when `stage1.exe` tries to compile itself. These must be ported
-before the fixpoint test.
+**Next blocker:** Self-compilation (`fides-c.exe ccompile compiler/main.fd`).
+The Fides lowerer gaps (1-4) may cause crashes when `stage1.exe` tries to
+compile itself. These must be ported before the fixpoint test.
 
 ---
 
 ## The Path to Fixpoint
 
-### Phase 1: Fix remaining struct-by-value crashes [CURRENT]
+### Phase 1: Fix struct-by-value crashes ✅ DONE
 
-The same root cause (struct-by-value only copies 8 bytes) will cause crashes
-in every pipeline stage that handles structs. The crash will move forward
-through the pipeline as each one is fixed.
+All struct-by-value crashes in the self-hosted compiler pipeline are fixed.
+The self-hosted compiler can now compile `tests/hello.fd` end-to-end and
+produce correct output.
 
-**Approach:** Iterative crash-and-fix loop.
+### Phase 1b: Port Fides lowerer gaps (before self-compilation)
 
-1. Run the self-hosted compiler on `tests/hello.fd`
-2. Read the crash stack trace
-3. Identify the function and the struct being truncated
-4. Fix in `compiler/*.fd` (the self-hosted source)
-5. Rebuild: `cargo build --release && fidesc ccompile compiler\main.fd -o release\fides-c && tcc ...`
-6. Run again, find the next crash
-7. Repeat
-
-**Expected crashes by pipeline stage:**
-
-| Stage | Status | Expected crashes | Pattern |
-|-------|--------|-----------------|---------|
-| Lexer | DONE | 0 (fixed) | — |
-| Parser | DONE | 0 (fixed) | — |
-| TypeChecker | CRASHES | 2-5 | Vec-of-struct, HashMap ops, Type enum handling |
-| Lowerer | Not reached | 1-3 | IrType struct returns, enum layout |
-| CCodeGen | Not reached | 1-2 | String building, struct layout |
-| **Total remaining** | | **4-10** | |
-
-**Current crash to fix:** `map_str_str_get` in `compiler/typechecker.fd` —
-`Vec<StringString>::get(i)` truncates the 16-byte struct to 8 bytes.
-
-**Fix options:**
-- (A) Change `map_str_str_get` to iterate by index and access fields through
-  the Vec's internal pointer (avoiding the by-value copy)
-- (B) Fix `Vec::get` for struct element types to emit `memcpy` (the general
-  fix — benefits all Vec-of-struct uses)
-- (C) Change `StringString` to be heap-allocated (push pointers, not structs)
-
-**Recommendation:** Heap-allocate structs before pushing (see "Vec runtime
-architecture" in the Known Bugs section). Both lowerers need this fix.
-This is SH-11.11.
-
-### Phase 1b: Port Fides lowerer gaps (after Vec-of-struct fix)
-
-Once the Vec-of-struct crash is fixed, the typechecker should work. But
-when `stage1.exe` tries to compile itself, the Fides lowerer's missing
-fixes (Gaps 1-4) will cause crashes. These must be ported before the
-fixpoint test.
+The Rust lowerer has 4 fixes the Fides lowerer is missing. These don't block
+`fides-c.exe` (built by Rust compiler with all fixes), but they block
+`stage1.exe` (built by `fides-c.exe` using the Fides lowerer).
 
 | Gap | Description | SH-# | Priority |
 |-----|-------------|------|----------|
@@ -175,44 +140,33 @@ fixpoint test.
 These don't block `fides-c.exe` (built by Rust compiler with all fixes), but
 they block `stage1.exe` (built by `fides-c.exe` using the Fides lowerer).
 
-### Phase 2: Self-hosted compiler compiles hello.fd
-
-Once all crashes are fixed:
+### Phase 2: Self-compilation (stage1) [NEXT]
 
 ```bash
-.\release\fides-c.exe ccompile tests\hello.fd -o release\hello_test
-# Should produce release/hello_test.c without crashing
+.\release\fides-c.exe ccompile compiler\main.fd -o release\stage1
+C:\tcc\tcc.exe -O2 -w -o release\stage1.exe release\stage1.c C:\tcc\lib\ws2_32.def
 ```
 
-**This is not yet success.** No crash means the compiler ran to completion,
-but the output could still be:
-- Empty file
-- Syntactically invalid C (tcc won't compile it)
-- Valid C but wrong output (prints garbage instead of "Hello, Fides!")
+This is the critical test: can the self-hosted compiler compile itself?
+If it crashes, the crash will be in the lowerer or codegen (the parts that
+were not exercised by `tests/hello.fd`).
 
-### Phase 3: Verify hello.fd output is correct
+**Expected crashes by pipeline stage:**
 
-```bash
-C:\tcc\tcc.exe -O2 -w -o release\hello_test.exe release\hello_test.c
-.\release\hello_test.exe
-# Expected: Hello, Fides!50y is big
-```
+| Stage | Status | Expected crashes | Pattern |
+|-------|--------|-----------------|---------|
+| Lexer | DONE | 0 | — |
+| Parser | DONE | 0 | — |
+| TypeChecker | DONE | 0 | — |
+| Lowerer | Not tested | 1-3 | Gaps 1-4, IrType struct returns |
+| CCodeGen | Not tested | 1-2 | String building, struct layout |
+| **Total remaining** | | **1-5** | |
 
-**If tcc fails:** The generated C is syntactically invalid. Debug the codegen
-path that produced the bad C.
+**Current crash to fix:** None — `tests/hello.fd` works end-to-end.
 
-**If output is wrong:** The generated C compiles but produces wrong results.
-Compare `release/hello_test.c` against the Rust compiler's output:
-```bash
-.\target\release\fidesc.exe ccompile tests\hello.fd -o release\hello_rust
-diff release\hello_test.c release\hello_rust.c
-```
-The diff shows exactly which codegen path is wrong.
+**Next step:** Self-compilation (`fides-c.exe ccompile compiler/main.fd`).
 
-**If output is correct:** First real milestone. The self-hosted compiler
-correctly compiles a simple program.
-
-### Phase 4: Self-hosted compiler compiles itself (stage1)
+### Phase 2: Self-hosted compiler compiles itself (stage1) [NEXT]
 
 ```bash
 .\release\fides-c.exe ccompile compiler\main.fd -o release\stage1
@@ -221,8 +175,9 @@ C:\tcc\tcc.exe -O2 -w -o release\stage1.exe release\stage1.c C:\tcc\lib\ws2_32.d
 ```
 
 This is the hardest phase. The compiler source is 39.5K LOC across 18 modules.
-Expect 10-30 more crashes of the same struct-by-value pattern, plus:
+The Fides lowerer gaps (1-4) may cause crashes here. Expected issues:
 
+- **Fides lowerer gaps 1-4** — struct alloca, store_ty, ident, StructLit
 - **HashMap operations** — iteration order, bucket management with struct values
 - **Deep recursion** — parser and typechecker on large inputs
 - **Large Vec operations** — growing, resizing with struct elements
@@ -235,16 +190,17 @@ Expect 10-30 more crashes of the same struct-by-value pattern, plus:
 4. Rebuild with tcc, run, identify the bad parameter
 5. Fix in `compiler/*.fd`, rebuild from Rust, repeat
 
-### Phase 5: Verify stage1 produces correct output
+### Phase 3: Verify stage1 produces correct output
 
 ```bash
 # stage1 compiles hello.fd
 .\release\stage1.exe ccompile tests\hello.fd -o release\hello_s1
-C:\tcc\tcc.exe -O2 -w -o release\hello_s1.exe release\hello_s1.c
+C:\tcc\tcc.exe -O2 -w -o release\hello_s1.exe release\hello_s1.c C:\tcc\lib\ws2_32.def
 .\release\hello_s1.exe
 # Expected: Hello, Fides!50y is big
 
 # Compare stage1's C output against the Rust compiler's C output
+.\target\release\fidesc.exe ccompile tests\hello.fd -o release\hello_rust
 diff release\hello_s1.c release\hello_rust.c
 # Should be identical (or equivalent)
 ```
@@ -253,7 +209,7 @@ diff release\hello_s1.c release\hello_rust.c
 than the Rust compiler. This is not necessarily wrong (different variable
 names, different ordering) but must be verified as semantically equivalent.
 
-### Phase 6: Verify the fixpoint
+### Phase 4: Verify the fixpoint
 
 The fixpoint test: the compiler compiles itself, and the output is stable
 across generations.
@@ -391,41 +347,25 @@ incomplete data.
 
 This is consistent with how `Box<T>` already works.
 
-### The Vec-of-struct problem (gotcha 3.8) — CURRENT CRASH
+### The Vec-of-struct problem (gotcha 3.8) — RESOLVED
 
-**This is the current crash.** `map_str_str_get` calls `Vec::get(i)` to get a
-`StringString` struct (16 bytes: two `str` pointers). But `p_vec_get` returns
-8 bytes. The `.key` field is garbage, and `p_str_equal(garbage, key)` crashes.
+**Was the previous crash.** `map_str_str_get` called `Vec::get(i)` to get a
+`StringString` struct (16 bytes: two `str` pointers). But `p_vec_get` returned
+8 bytes. The `.key` field was garbage, and `p_str_equal(garbage, key)` crashed.
 
-**Vec::set / Vec::get struct handling status:**
+**All Vec paths now handle struct elements correctly:**
 
 | Path | Rust lowerer | Fides lowerer |
 |------|-------------|---------------|
-| `vec.set(i, struct)` method | ✓ HANDLED (boxes value) | ✓ HANDLED (boxes value) |
-| `vec[i] = struct` indexing | ✗ NOT HANDLED (calls Vec_set directly) | ✗ NOT HANDLED (calls Vec_set directly) |
-| `vec.get(i)` method (struct elem) | ✓ HANDLED (returns `word_repr(elem_ty)`) | ✓ HANDLED (returns `elem_ty` = `Struct(_)`) |
-| `vec[i]` indexing (struct elem) | ✓ HANDLED (returns `word_repr(elem_ty)`) | ✗ NOT HANDLED (returns hardcoded `I64`) |
-| `for x in vec` (struct elem) | ✓ HANDLED (returns `word_repr(elem_ty)`) | ✗ NOT HANDLED (returns hardcoded `I64`) |
-| `vec[i] += x` compound (struct elem) | ✗ NOT HANDLED (returns `I64`) | ✗ NOT HANDLED (returns `I64`) |
+| `vec.set(i, struct)` method | ✓ DONE | ✓ DONE |
+| `vec[i] = struct` indexing | ✓ DONE | ✓ DONE |
+| `vec.get(i)` method (struct elem) | ✓ DONE | ✓ DONE |
+| `vec[i]` indexing (struct elem) | ✓ DONE | ✓ DONE |
+| `for x in vec` (struct elem) | ✓ DONE | ✓ DONE |
+| `vec[i] += x` compound (struct elem) | ✓ DONE | ✓ DONE |
 
-**Fixes needed:**
-
-In BOTH lowerers:
-1. `vec[i] = struct` indexing — box the struct before `Vec_set` (same as push/insert/set method)
-2. `vec[i] += x` compound — use `word_repr(elem_ty)` for `Vec_get` return type
-
-In Fides lowerer only:
-3. `vec[i]` indexing — use `word_repr(elem_ty)` instead of `IrType::I64` for `p_vec_get` return (line 3229)
-4. `for x in vec` — use `word_repr(elem_ty)` instead of `IrType::I64` for `p_vec_get` return (line 4518)
-
-**Affected sites in the compiler source:**
-- `map_str_str_get` in `compiler/typechecker.fd` — `Vec<StringString>::get(i)` (method call — HANDLED)
-- `map_str_str_set` in `compiler/typechecker.fd` — `Vec<StringString>::get(i)` (method call — HANDLED)
-- `map_fieldvis_get` in `compiler/typechecker.fd` — `Vec<FieldVisEntry>::get(i)` (method call — HANDLED)
-- Any `for x in vec` loop where `x` is a struct type (NOT HANDLED in Fides)
-- Any `vec[i]` indexing where the element is a struct type (NOT HANDLED in Fides)
-
-**Fix:** See "Vec runtime architecture" above. Heap-allocate structs before
+**Fix:** Heap-allocate structs before pushing to Vec. See "Vec runtime
+architecture" above for details.
 pushing. Both lowerers need this fix.
 
 ### The enum variant extraction problem (gotcha 3.4)
@@ -454,10 +394,9 @@ confirmed stable.
 ## Fides Lowerer Gaps (compiler/lower.fd)
 
 The Rust lowerer (`src/lower.rs`) has 4 fixes that the Fides lowerer
-(`compiler/lower.fd`) is missing. These don't cause crashes yet (the
-self-hosted compiler crashes before reaching the codegen stage), but they
-WILL cause crashes once the Vec-of-struct problem is fixed and the
-typechecker starts working.
+(`compiler/lower.fd`) is missing. These don't block `fides-c.exe` (built
+by the Rust compiler with all fixes — it correctly compiles `tests/hello.fd`),
+but they WILL cause crashes when `stage1.exe` tries to compile itself.
 
 The pattern: `fides-c.exe` is built by the Rust compiler, so it has the
 Rust lowerer's fixes. It can compile `compiler/*.fd` correctly. But the
@@ -562,7 +501,7 @@ because they may not be hit with struct values in the current compiler source:
 | 3349 | TupleLit element | LOW | Tuples are arrays of i64 |
 | 3881 | ArrayLit element | MEDIUM | Array of structs |
 | 4432 | for loop array element | MEDIUM | Array of structs |
-| 4488 | for loop Vec element | **HIGH** | Vec-of-struct (current crash) |
+| 4488 | for loop Vec element | **HIGH** | Vec-of-struct (now fixed) |
 
 The Rust lowerer has the same `store_ty: None` calls at corresponding sites.
 They haven't been fixed because the current compiler source doesn't hit them
@@ -638,14 +577,22 @@ interpreter + PE emitter.
 | SH-11.6 | Enum layout from field sizes | DONE |
 | SH-11.7 | Enum inline storage + extraction | DONE (both Rust + Fides) |
 | SH-11.8 | Build infrastructure | DONE |
-| SH-11.9 | Fixpoint verification | BLOCKED (crashes not yet fixed) |
+| SH-11.9 | Fixpoint verification | BLOCKED (self-compilation not yet tested) |
 | SH-11.10 | Typechecker crash (box_expr_unbox) | DONE (compute_func_effects is no-op) |
-| SH-11.11 | Vec-of-struct truncation (both lowerers) | **CURRENT** — map_str_str_get crash |
+| SH-11.11 | Vec-of-struct truncation (both lowerers) | DONE — all Vec paths fixed |
+| SH-11.11a | Vec::set/push/insert method boxing | DONE (both lowerers) |
+| SH-11.11b | Vec::get/pop/first/last method return type | DONE (both lowerers) |
+| SH-11.11c | `vec[i] = struct` indexing boxing | DONE (both lowerers) |
+| SH-11.11d | `vec[i]` indexing return type | DONE (both lowerers) |
+| SH-11.11e | `vec[i] += x` compound return type | DONE (both lowerers) |
+| SH-11.11f | `for x in vec` element type | DONE (both lowerers) |
 | SH-11.12 | Port Gap 1: Stmt::Let alloca type to Fides | TODO — needed for fixpoint |
 | SH-11.13 | Port Gap 2: Stmt::Let store_ty to Fides | TODO — needed for fixpoint |
 | SH-11.14 | Port Gap 3: Expr::Ident struct alloca to Fides | TODO — needed for fixpoint |
 | SH-11.15 | Port Gap 4: StructLit field store to Fides | TODO — needed for fixpoint |
 | SH-11.16 | Check additional Store(..., None) sites | TODO — after Gaps 1-4 are ported |
+| SH-11.17 | Self-compilation (fides-c → stage1) | **NEXT** — test compiler/main.fd |
+| SH-11.18 | stage1 produces correct output | BLOCKED — after SH-11.17 |
 
 ---
 

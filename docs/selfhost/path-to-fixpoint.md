@@ -12,32 +12,47 @@
 ```
 ✅ Lexer — works (stdlib/core.fd tokenized)
 ✅ Parser — works (stdlib + user code parsed)
-❌ TypeChecker — crashes in map_str_str_get (Vec-of-struct truncation)
-⬜ Lowerer — not reached yet
-⬜ CCodeGen — not reached yet
+✅ TypeChecker — works (hello.fd type checks ok)
+✅ Lowerer — works (hello.fd lowered to IR)
+✅ CCodeGen — works (hello.fd → C code → tcc → correct output)
+⬜ Self-compilation — NOT TESTED (fides-c.exe ccompile compiler/main.fd)
+⬜ Fixpoint — NOT TESTED
 ```
 
-## The One Root Cause
+**MILESTONE:** `tests/hello.fd` compiles end-to-end and produces correct output:
+```
+Hello, Fides!50y is big
+```
 
-Almost every crash is the same bug: **the C backend treats structs as
+## The One Root Cause (now fixed for hello.fd)
+
+Almost every crash was the same bug: **the C backend treats structs as
 pointers (`struct Foo_s*`), so struct-by-value operations only copy 8 bytes
 instead of the full struct.**
 
-This affects:
+This affected:
 - **Vec::get(i)** on a Vec of structs → only 8 bytes copied → garbage fields
 - **Function returns** → needs SRET (hidden out-param) → missing if not pre-registered
 - **Enum variant extraction** → `Inst::Load` with `Struct` type reads 8 bytes
 - **Enum literal storage** → struct fields must be stored inline (memcpy), not as pointers
 
+All of these are now fixed in both lowerers for the paths exercised by
+`tests/hello.fd`. The Fides lowerer gaps (1-4) may still cause crashes during
+self-compilation.
+
 ## The 7 Steps to Fixpoint
 
-### Step 1: Fix Vec-of-struct truncation [CURRENT]
+### Step 1: Fix Vec-of-struct truncation ✅ DONE
 
-Fix `map_str_str_get` crash. The Vec runtime (`p_vec_push`/`p_vec_get`) stores
-single 8-byte pointers. For struct elements >8 bytes, only the first 8 bytes
-are stored. Fix: heap-allocate structs before pushing. Both lowerers need this.
+Fixed `map_str_str_get` crash. All Vec paths now handle struct elements:
+- `vec.set/push/insert` method — boxes struct before `Vec_set`
+- `vec.get/pop/first/last` method — returns `word_repr(elem_ty)`
+- `vec[i] = struct` indexing — boxes struct before `Vec_set`
+- `vec[i]` indexing — returns `word_repr(elem_ty)`
+- `vec[i] += x` compound — returns `word_repr(elem_ty)`
+- `for x in vec` — returns `word_repr(elem_ty)` + uses `elem_ty` for alloca
 
-### Step 2: Port Fides lowerer gaps 1-4
+### Step 2: Port Fides lowerer gaps 1-4 [TODO — before self-compilation]
 
 The Rust lowerer has 4 fixes the Fides lowerer is missing. These don't block
 `fides-c.exe` (built by Rust), but they block `stage1.exe` (built by `fides-c.exe`).
@@ -47,30 +62,39 @@ The Rust lowerer has 4 fixes the Fides lowerer is missing. These don't block
 - Gap 3: Expr::Ident struct alloca — return alloca pointer directly
 - Gap 4: StructLit field store — use `emit_struct_copy` for struct fields
 
-### Step 3: Fix remaining crashes (iterative)
-
-Run → crash → read stack → fix → rebuild → repeat.
-Expected: 4-10 more crashes, all the same struct-by-value root cause.
-
-### Step 4: hello.fd compiles without crash
+### Step 3: hello.fd compiles without crash ✅ DONE
 
 ```bash
 .\release\fides-c.exe ccompile tests\hello.fd -o release\hello_test
+# ✅ Produces release/hello_test.c (534KB)
 ```
 
-### Step 5: hello.fd output is correct
+### Step 4: hello.fd output is correct ✅ DONE
 
 ```bash
-C:\tcc\tcc.exe -O2 -w -o release\hello_test.exe release\hello_test.c
+C:\tcc\tcc.exe -O2 -w -o release\hello_test.exe release\hello_test.c C:\tcc\lib\ws2_32.def
 .\release\hello_test.exe
-# Expected: Hello, Fides!50y is big
+# ✅ Output: Hello, Fides!50y is big
 ```
 
-### Step 6: Self-compilation (stage1)
+### Step 5: Self-compilation (stage1) [NEXT]
 
 ```bash
 .\release\fides-c.exe ccompile compiler\main.fd -o release\stage1
 C:\tcc\tcc.exe -O2 -w -o release\stage1.exe release\stage1.c C:\tcc\lib\ws2_32.def
+```
+
+This is the hardest step. The compiler source is 39.5K LOC across 18 modules.
+May crash due to Fides lowerer gaps 1-4 or other struct-by-value issues not
+exercised by `tests/hello.fd`.
+
+### Step 6: stage1 produces correct output
+
+```bash
+.\release\stage1.exe ccompile tests\hello.fd -o release\hello_s1
+C:\tcc\tcc.exe -O2 -w -o release\hello_s1.exe release\hello_s1.c C:\tcc\lib\ws2_32.def
+.\release\hello_s1.exe
+# Expected: Hello, Fides!50y is big
 ```
 
 ### Step 7: Fixpoint

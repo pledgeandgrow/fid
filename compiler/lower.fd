@@ -2402,13 +2402,61 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
 
             // Vec indexing — call Vec_set / Vec_get (runtime funcs, no __env)
             if ir_type_is_opaque_named(arr_ty, "Vec") {
+                // Determine Vec element type for struct boxing
+                var vec_elem_ty: IrType = IrType::I64;
+                match arr_ty {
+                    IrType::Generic(gname, gargs) => {
+                        if str_equal(gname, "Vec") && gargs.len() > 0 {
+                            vec_elem_ty = gargs.get(0);
+                        }
+                    }
+                    IrType::Opaque(_) => {
+                        // Try AST type for generic info
+                        match box_expr_unbox(array_name) {
+                            Expr::Ident(vname) => {
+                                match Lowerer_lookup_var_ast_type(self, vname) {
+                                    OptType::Some(at) => {
+                                        var inner_ty: Type = at;
+                                        match at {
+                                            Type::Ref(inner, _) => { inner_ty = box_type_unbox(inner); }
+                                            _ => {}
+                                        }
+                                        match inner_ty {
+                                            Type::Generic(an, aargs) => {
+                                                if str_equal(an, "Vec") && aargs.len() > 0 {
+                                                    vec_elem_ty = Lowerer_lower_type(self, aargs.get(0));
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    OptType::None => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
                 match op {
                     AssignOp::Assign => {
-                        var val: i64 = Lowerer_lower_expr(self, expr);
+                        var set_val: i64 = Lowerer_lower_expr(self, expr);
+                        // Box struct values before Vec_set (same as push/insert/set)
+                        match vec_elem_ty {
+                            IrType::Struct(_) => {
+                                var size: i64 = IrModule_type_size(&self.module, vec_elem_ty);
+                                if size <= 0 { size = 8; }
+                                var size_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(size, IrType::I64));
+                                var heap_ptr: i64 = Lowerer_emit_inst(self, Inst::Call("p_malloc", c_vec1_i64(size_val), IrType::Ptr(Box::new(vec_elem_ty)), EffectSet_new()));
+                                Lowerer_emit_inst(self, Inst::Store(heap_ptr, set_val, OptIrType::Some(vec_elem_ty)));
+                                set_val = heap_ptr;
+                            }
+                            _ => {}
+                        }
                         var args: Vec<i64> = Vec::new();
                         args.push(arr_val);
                         args.push(idx_val);
-                        args.push(val);
+                        args.push(set_val);
                         var _c: i64 = Lowerer_emit_inst(self, Inst::Call("Vec_set", args, IrType::Void, EffectSet_new()));
                     }
                     _ => {
@@ -2416,9 +2464,22 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
                         var get_args: Vec<i64> = Vec::new();
                         get_args.push(arr_val);
                         get_args.push(idx_val);
-                        var current: i64 = Lowerer_emit_inst(self, Inst::Call("Vec_get", get_args, IrType::I64, EffectSet_new()));
+                        var get_ret_ty: IrType = word_repr(vec_elem_ty);
+                        var current: i64 = Lowerer_emit_inst(self, Inst::Call("Vec_get", get_args, get_ret_ty, EffectSet_new()));
                         var rhs: i64 = Lowerer_lower_expr(self, expr);
                         var new_val: i64 = Lowerer_lower_compound_assign(self, op, current, rhs);
+                        // Box struct values before Vec_set
+                        match vec_elem_ty {
+                            IrType::Struct(_) => {
+                                var size: i64 = IrModule_type_size(&self.module, vec_elem_ty);
+                                if size <= 0 { size = 8; }
+                                var size_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(size, IrType::I64));
+                                var heap_ptr: i64 = Lowerer_emit_inst(self, Inst::Call("p_malloc", c_vec1_i64(size_val), IrType::Ptr(Box::new(vec_elem_ty)), EffectSet_new()));
+                                Lowerer_emit_inst(self, Inst::Store(heap_ptr, new_val, OptIrType::Some(vec_elem_ty)));
+                                new_val = heap_ptr;
+                            }
+                            _ => {}
+                        }
                         var set_args: Vec<i64> = Vec::new();
                         set_args.push(arr_val);
                         set_args.push(idx_val);
@@ -3223,10 +3284,47 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
 
             // Vec indexing: Vec_get(vec, idx)
             if ir_type_is_opaque_named(arr_ty, "Vec") || ir_type_eq(arr_ty, IrType::I64) {
+                // Determine element type for correct return type (word_repr for structs)
+                var vec_elem_ty: IrType = IrType::I64;
+                match arr_ty {
+                    IrType::Generic(gname, gargs) => {
+                        if str_equal(gname, "Vec") && gargs.len() > 0 {
+                            vec_elem_ty = gargs.get(0);
+                        }
+                    }
+                    IrType::Opaque(_) => {
+                        // Try AST type for generic info
+                        match box_expr_unbox(arr) {
+                            Expr::Ident(vname) => {
+                                match Lowerer_lookup_var_ast_type(self, vname) {
+                                    OptType::Some(at) => {
+                                        var inner_ty: Type = at;
+                                        match at {
+                                            Type::Ref(inner, _) => { inner_ty = box_type_unbox(inner); }
+                                            _ => {}
+                                        }
+                                        match inner_ty {
+                                            Type::Generic(an, aargs) => {
+                                                if str_equal(an, "Vec") && aargs.len() > 0 {
+                                                    vec_elem_ty = Lowerer_lower_type(self, aargs.get(0));
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    OptType::None => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
                 var args: Vec<i64> = Vec::new();
                 args.push(arr_val);
                 args.push(idx_val);
-                return Lowerer_emit_inst(self, Inst::Call("p_vec_get", args, IrType::I64, EffectSet_new()));
+                var ret_ty: IrType = word_repr(vec_elem_ty);
+                return Lowerer_emit_inst(self, Inst::Call("p_vec_get", args, ret_ty, EffectSet_new()));
             }
 
             // Array indexing: GetElemPtr + Load
@@ -4480,9 +4578,21 @@ pub fn Lowerer_lower_for(self: &mut Lowerer, loop_var: str, iterator: Expr, body
 }
 
 pub fn Lowerer_lower_for_vec(self: &mut Lowerer, loop_var: str, vec_val: i64, body: Vec<Stmt>) {
+    // Determine element type from Vec value type
+    var vec_ty: IrType = Lowerer_get_value_type(self, vec_val);
+    var elem_ty: IrType = IrType::I64;
+    match vec_ty {
+        IrType::Generic(gname, gargs) => {
+            if str_equal(gname, "Vec") && gargs.len() > 0 {
+                elem_ty = gargs.get(0);
+            }
+        }
+        _ => {}
+    }
+
     // Create alloca for loop variable
-    var var_alloca: i64 = Lowerer_emit_inst(self, Inst::Alloca(IrType::I64, Lowerer_current_region(self)));
-    Lowerer_insert_alloca_type(self, var_alloca, IrType::I64);
+    var var_alloca: i64 = Lowerer_emit_inst(self, Inst::Alloca(elem_ty, Lowerer_current_region(self)));
+    Lowerer_insert_alloca_type(self, var_alloca, elem_ty);
     Lowerer_insert_alloca(self, loop_var, var_alloca);
     Lowerer_bind_local(self, loop_var, var_alloca);
 
@@ -4511,11 +4621,12 @@ pub fn Lowerer_lower_for_vec(self: &mut Lowerer, loop_var: str, vec_val: i64, bo
     Lowerer_set_current_block(self, body_block);
     self.loop_stack.push(LoopContext_new(cond_block, exit_block, OptValueId::None));
 
-    // Load element: Vec_get(vec, i)
+    // Load element: Vec_get(vec, i) — use word_repr for struct elements
     var get_args: Vec<i64> = Vec::new();
     get_args.push(vec_val);
     get_args.push(idx_val);
-    var elem_val: i64 = Lowerer_emit_inst(self, Inst::Call("p_vec_get", get_args, IrType::I64, EffectSet_new()));
+    var get_ret_ty: IrType = word_repr(elem_ty);
+    var elem_val: i64 = Lowerer_emit_inst(self, Inst::Call("p_vec_get", get_args, get_ret_ty, EffectSet_new()));
     var _s2: i64 = Lowerer_emit_inst(self, Inst::Store(var_alloca, elem_val, OptIrType::None));
 
     Lowerer_lower_stmts(self, body);

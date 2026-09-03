@@ -1769,6 +1769,26 @@ impl Lowerer {
                     let dummy_env = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                     if *op == AssignOp::Assign {
                         let val = self.lower_expr(expr);
+                        // Box struct values before Vec_set (same as push/insert/set method)
+                        let val = if matches!(elem_ty, IrType::Struct(_)) {
+                            let mut size = self.module.type_size(&elem_ty);
+                            if size == 0 { size = 8; }
+                            let size_val = self.emit_inst(Inst::ConstInt { value: size as i64, ty: IrType::I64 });
+                            let heap_ptr = self.emit_inst(Inst::Call {
+                                func: "p_malloc".to_string(),
+                                args: vec![size_val],
+                                ret_ty: IrType::Ptr(Box::new(elem_ty.clone())),
+                                effects: {
+                                    let mut e = EffectSet::new();
+                                    e.add(Effect::Alloc);
+                                    e
+                                },
+                            });
+                            self.emit_inst(Inst::Store { ptr: heap_ptr, value: val, store_ty: Some(elem_ty.clone()) });
+                            heap_ptr
+                        } else {
+                            val
+                        };
                         self.emit_inst(Inst::Call {
                             func: "Vec_set".to_string(),
                             args: vec![dummy_env, arr_val, idx_val, val],
@@ -1805,6 +1825,26 @@ impl Lowerer {
                             right: rhs,
                             ty: elem_ty.clone(),
                         });
+                        // Box struct values before Vec_set
+                        let new_val = if matches!(elem_ty, IrType::Struct(_)) {
+                            let mut size = self.module.type_size(&elem_ty);
+                            if size == 0 { size = 8; }
+                            let size_val = self.emit_inst(Inst::ConstInt { value: size as i64, ty: IrType::I64 });
+                            let heap_ptr = self.emit_inst(Inst::Call {
+                                func: "p_malloc".to_string(),
+                                args: vec![size_val],
+                                ret_ty: IrType::Ptr(Box::new(elem_ty.clone())),
+                                effects: {
+                                    let mut e = EffectSet::new();
+                                    e.add(Effect::Alloc);
+                                    e
+                                },
+                            });
+                            self.emit_inst(Inst::Store { ptr: heap_ptr, value: new_val, store_ty: Some(elem_ty.clone()) });
+                            heap_ptr
+                        } else {
+                            new_val
+                        };
                         let dummy_env3 = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
                         self.emit_inst(Inst::Call {
                             func: "Vec_set".to_string(),

@@ -109,38 +109,20 @@
 
 **Status:** Fixed by making `compute_func_effects` a no-op in `compiler/typechecker.fd`.
 
-### 2.4 Crash in `map_str_str_get` → `p_str_equal` (Vec-of-struct truncation) **[CURRENT]**
+### 2.4 ~~Crash in `map_str_str_get` → `p_str_equal` (Vec-of-struct truncation)~~ RESOLVED (Sep 3, 2026)
 
-**Status:** Open.
+**Status:** Fixed. All Vec paths now handle struct elements correctly:
+- `vec.set/push/insert` method — boxes struct before `Vec_set`
+- `vec.get/pop/first/last` method — returns `word_repr(elem_ty)`
+- `vec[i] = struct` indexing — boxes struct before `Vec_set`
+- `vec[i]` indexing — returns `word_repr(elem_ty)`
+- `vec[i] += x` compound — returns `word_repr(elem_ty)`
+- `for x in vec` — returns `word_repr(elem_ty)` + uses `elem_ty` for alloca
 
-**Symptom:**
-```
-[build] Type checking...
-=== CRASH: 0xC0000005 ===
-Access violation at address 0xE
-  [4] TypeChecker_check_bodies
-  [5] TypeChecker_check_func
-  [6] map_str_str_get
-  [7] p_str_equal
-```
+**Result:** `tests/hello.fd` now compiles end-to-end and produces correct
+output: `Hello, Fides!50y is big`
 
-**Root cause:** `Vec<StringString>::get(i)` returns a 16-byte struct (two `str`
-pointers), but the C backend only copies 8 bytes (one pointer-sized slot).
-The `.key` field is garbage, and `p_str_equal(garbage, key)` crashes at
-address 0xE (null + small offset).
-
-**This is the Vec-of-struct problem (gotcha 3.8).** The same pattern will
-cause crashes in every place that gets a struct from a Vec by value.
-
-**Fix options:**
-- (A) Fix `map_str_str_get` to access Vec elements by pointer (avoid by-value copy)
-- (B) Fix `Vec::get(i)` in the lowerer to emit `memcpy` for struct element types (general fix)
-- (C) Change `StringString` to be heap-allocated (push pointers, not structs)
-
-**Recommendation:** Heap-allocate structs before pushing to Vec. See "Vec
-runtime architecture" in `docs/roadmap/selfhost-roadmap.md` for details.
-
-### 2.5 Fides lowerer gaps (blocks fixpoint, not current crash)
+### 2.5 Fides lowerer gaps (blocks self-compilation, not hello.fd)
 
 The Rust lowerer has 4 fixes the Fides lowerer is missing. These don't block
 `fides-c.exe` (built by Rust compiler), but they block `stage1.exe` (built by
