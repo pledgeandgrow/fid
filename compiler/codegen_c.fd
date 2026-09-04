@@ -678,6 +678,8 @@ fn CCodeGen_insert_runtime_sigs(self: &mut CCodeGen) -> void {
     fn_param_types_set(self, "p_print_bool", t1(IrType::Bool));
     fn_param_types_set(self, "p_print_float", t1(IrType::F64));
     fn_param_types_set(self, "p_print_newline", t0());
+    fn_param_types_set(self, "p_eprint_str", t1(ptr_u8()));
+    fn_param_types_set(self, "p_flush_stdout", t0());
 
     // Memory / panic
     fn_param_types_set(self, "p_malloc", t1(IrType::I64));
@@ -798,6 +800,7 @@ fn CCodeGen_insert_runtime_sigs(self: &mut CCodeGen) -> void {
     fn_param_types_set(self, "p_file_size", t1(ptr_u8()));
     fn_param_types_set(self, "p_read_line", t0());
     fn_param_types_set(self, "p_read_stdin", t1(IrType::I64));
+    fn_param_types_set(self, "p_stdin_eof", t0());
     fn_param_types_set(self, "p_clock_now", t0());
     fn_param_types_set(self, "p_clock_now_us", t0());
     fn_param_types_set(self, "p_clock_now_ms", t0());
@@ -1390,6 +1393,7 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "void p_print_float(double val);");
     wln(self, "void p_print_newline(void);");
     wln(self, "void p_eprint_str(const char* s);");
+    wln(self, "void p_flush_stdout(void);");
     wln(self, "void p_panic(const char* msg);");
     wln(self, "// Call stack for panic traces + recursion limit");
     wln(self, "static const char* p_call_stack[2048];");
@@ -1419,6 +1423,7 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_file_delete(const char* path);");
     wln(self, "char* p_read_line(void);");
     wln(self, "char* p_read_stdin(int64_t n);");
+    wln(self, "int64_t p_stdin_eof(void);");
     wln(self, "int64_t p_file_size(const char* path);");
     wln(self, "char* p_getenv(const char* name);");
     wln(self, "static int __p_argc = 0;");
@@ -2891,6 +2896,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "void p_print(int64_t val) { printf(\"%lld\", (long long)val); }");
     wln(self, "void p_print_str(const char* s) { printf(\"%s\", s); }");
     wln(self, "void p_eprint_str(const char* s) { fprintf(stderr, \"%s\", s); fflush(stderr); }");
+    wln(self, "void p_flush_stdout(void) { fflush(stdout); }");
     wln(self, "void p_print_int(int64_t val) { printf(\"%lld\", (long long)val); }");
     wln(self, "void p_print_bool(bool val) { printf(\"%s\", val ? \"true\" : \"false\"); }");
     wln(self, "void p_print_float(double val) { char* _s = p_to_str_float(val); printf(\"%s\", _s); free(_s); }");
@@ -3002,6 +3008,8 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    while (len > 0 && (__p_line_buf[len-1] == '\\n' || __p_line_buf[len-1] == '\\r')) { __p_line_buf[--len] = 0; }");
     wln(self, "    return __p_line_buf;");
     wln(self, "}");
+    // Check if stdin is at EOF — used by LSP server to detect client disconnect.
+    wln(self, "int64_t p_stdin_eof(void) { return (int64_t)feof(stdin); }");
     // Read exactly n bytes from stdin — used by LSP protocol.
     // Returns malloc'd string (nul-terminated). Returns NULL on EOF/error.
     wln(self, "char* p_read_stdin(int64_t n) {");

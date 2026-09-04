@@ -1,0 +1,1082 @@
+// lsp.fd — LSP (Language Server Protocol) server for Fides.
+//
+// Implements JSON-RPC 2.0 over stdio:
+//   - initialize / shutdown / exit
+//   - textDocument/didOpen / didChange / didClose
+//   - textDocument/publishDiagnostics
+//   - textDocument/completion
+//   - textDocument/hover
+//   - textDocument/definition
+//   - textDocument/rename
+//
+// Ported from src/lsp.rs (996 lines Rust → ~700 lines Fides).
+// Uses compiler/json.fd for JSON parsing/serialization.
+// Uses compiler/compiler.fd for diagnostics and program building.
+
+module compiler::lsp;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::json;
+use compiler::compiler;
+
+// ─── Document tracking ──────────────────────────────────────────────────
+
+pub struct DocEntry {
+    pub uri: str,
+    pub text: str,
+}
+
+pub fn DocEntry_new(uri: str, text: str) -> DocEntry {
+    return DocEntry { uri: uri, text: text };
+}
+
+// ─── LSP Server ─────────────────────────────────────────────────────────
+
+/// Run the LSP server over stdio. Returns exit code.
+pub fn lsp_run() -> i64 {
+    var documents: Vec<DocEntry> = Vec::new();
+
+    // Main message loop
+    loop {
+        // Read Content-Length header
+        var content_length: i64 = 0;
+        var got_any_header: bool = false;
+        loop {
+            var line: str = p_read_line();
+            // Check for EOF (p_read_line returns NULL → "" in Fides)
+            if str_len(line) == 0 {
+                if p_stdin_eof() != 0 {
+                    // Client disconnected — exit gracefully
+                    return 0;
+                }
+                break; // End of headers
+            }
+            got_any_header = true;
+            var trimmed: str = str_trim(line);
+            if str_len(trimmed) == 0 {
+                break; // End of headers
+            }
+            // Parse "Content-Length: N"
+            if str_starts_with(trimmed, "Content-Length:") {
+                var rest: str = str_trim(str_slice(trimmed, 15, str_len(trimmed)));
+                content_length = str_parse_int(rest);
+            }
+        }
+
+        if content_length <= 0 {
+            if !got_any_header {
+                // No headers read and no content — likely EOF
+                return 0;
+            }
+            continue;
+        }
+
+        // Read body (exactly content_length bytes)
+        var body: str = p_read_stdin(content_length);
+        if str_len(body) == 0 {
+            continue;
+        }
+
+        // Parse JSON-RPC message
+        var parse_result: JsonResult = json_parse(body);
+        match parse_result {
+            JsonResult::Err(_) => { continue; }
+            JsonResult::Ok(msg) => {
+                var method: str = json_get_str(msg, "method");
+                var id: Json = json_get(msg, "id");
+                var params: Json = json_get(msg, "params");
+
+                if str_equal(method, "initialize") {
+                    handle_initialize(id);
+                } else if str_equal(method, "initialized") {
+                    // No response needed
+                } else if str_equal(method, "shutdown") {
+                    send_response(id, Json::Null);
+                } else if str_equal(method, "exit") {
+                    return 0;
+                } else if str_equal(method, "textDocument/didOpen") {
+                    var text_doc: Json = json_get(params, "textDocument");
+                    var uri: str = json_get_str(text_doc, "uri");
+                    var text: str = json_get_str(text_doc, "text");
+                    doc_set(documents, uri, text);
+                    publish_diagnostics(uri, text);
+                } else if str_equal(method, "textDocument/didChange") {
+                    var text_doc: Json = json_get(params, "textDocument");
+                    var uri: str = json_get_str(text_doc, "uri");
+                    var changes: Json = json_get(params, "contentChanges");
+                    match changes {
+                        Json::Arr(arr) => {
+                            if arr.len() > 0 {
+                                var first: Json = arr.get(0);
+                                var text: str = json_get_str(first, "text");
+                                doc_set(documents, uri, text);
+                                publish_diagnostics(uri, text);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if str_equal(method, "textDocument/didClose") {
+                    var text_doc: Json = json_get(params, "textDocument");
+                    var uri: str = json_get_str(text_doc, "uri");
+                    doc_remove(documents, uri);
+                } else if str_equal(method, "textDocument/completion") {
+                    var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
+                    var line: i64 = json_get_int(json_get(params, "position"), "line");
+                    var character: i64 = json_get_int(json_get(params, "position"), "character");
+                    var text: str = doc_get(documents, uri);
+                    var result: Json = handle_completion(text, line, character);
+                    send_response(id, result);
+                } else if str_equal(method, "textDocument/hover") {
+                    var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
+                    var line: i64 = json_get_int(json_get(params, "position"), "line");
+                    var character: i64 = json_get_int(json_get(params, "position"), "character");
+                    var text: str = doc_get(documents, uri);
+                    var result: Json = handle_hover(text, line, character);
+                    send_response(id, result);
+                } else if str_equal(method, "textDocument/definition") {
+                    var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
+                    var line: i64 = json_get_int(json_get(params, "position"), "line");
+                    var character: i64 = json_get_int(json_get(params, "position"), "character");
+                    var text: str = doc_get(documents, uri);
+                    var result: Json = handle_definition(text, uri, line, character);
+                    send_response(id, result);
+                } else if str_equal(method, "textDocument/rename") {
+                    var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
+                    var line: i64 = json_get_int(json_get(params, "position"), "line");
+                    var character: i64 = json_get_int(json_get(params, "position"), "character");
+                    var new_name: str = json_get_str(params, "newName");
+                    var text: str = doc_get(documents, uri);
+                    var result: Json = handle_rename(text, uri, line, character, new_name);
+                    send_response(id, result);
+                } else {
+                    // Unknown method — if it has an id, return error
+                    match id {
+                        Json::Null => {}
+                        _ => {
+                            var error_obj: JsonObject = JsonObject::new();
+                            error_obj.insert("code", Json::Num(-32601.0));
+                            error_obj.insert("message", Json::Str("Method not found: " + method));
+                            send_error(id, Json::Obj(error_obj));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// ─── JSON helpers ───────────────────────────────────────────────────────
+
+/// Get a field from a Json object. Returns Json::Null if not found or not an object.
+fn json_get(v: Json, key: str) -> Json {
+    match v {
+        Json::Obj(obj) => { return obj.get(key); }
+        _ => { return Json::Null; }
+    }
+}
+
+/// Get a string field from a Json object. Returns "" if not found.
+fn json_get_str(v: Json, key: str) -> str {
+    match v {
+        Json::Obj(obj) => {
+            var val: Json = obj.get(key);
+            match val {
+                Json::Str(s) => { return s; }
+                _ => { return ""; }
+            }
+        }
+        _ => { return ""; }
+    }
+}
+
+/// Get an integer field from a Json object. Returns 0 if not found.
+fn json_get_int(v: Json, key: str) -> i64 {
+    match v {
+        Json::Obj(obj) => {
+            var val: Json = obj.get(key);
+            match val {
+                Json::Num(n) => { return n as i64; }
+                _ => { return 0; }
+            }
+        }
+        _ => { return 0; }
+    }
+}
+
+// ─── Document management helpers ────────────────────────────────────────
+
+fn doc_set(documents: Vec<DocEntry>, uri: str, text: str) -> void {
+    var i: i64 = 0;
+    while i < documents.len() {
+        if str_equal(documents.get(i).uri, uri) {
+            documents.set(i, DocEntry_new(uri, text));
+            return;
+        }
+        i = i + 1;
+    }
+    documents.push(DocEntry_new(uri, text));
+}
+
+fn doc_get(documents: Vec<DocEntry>, uri: str) -> str {
+    var i: i64 = 0;
+    while i < documents.len() {
+        if str_equal(documents.get(i).uri, uri) {
+            return documents.get(i).text;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn doc_remove(documents: Vec<DocEntry>, uri: str) -> void {
+    var i: i64 = 0;
+    while i < documents.len() {
+        if str_equal(documents.get(i).uri, uri) {
+            documents.remove(i);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+// ─── LSP message sending ────────────────────────────────────────────────
+
+fn handle_initialize(id: Json) -> void {
+    var caps: JsonObject = JsonObject::new();
+    caps.insert("textDocumentSync", Json::Num(1.0)); // Full sync
+    var diag_provider: JsonObject = JsonObject::new();
+    caps.insert("diagnosticProvider", Json::Obj(diag_provider));
+    var completion_provider: JsonObject = JsonObject::new();
+    var trigger_chars: Vec<Json> = Vec::new();
+    trigger_chars.push(Json::Str("."));
+    completion_provider.insert("triggerCharacters", Json::Arr(trigger_chars));
+    completion_provider.insert("resolveProvider", Json::Bool(false));
+    caps.insert("completionProvider", Json::Obj(completion_provider));
+    caps.insert("hoverProvider", Json::Bool(true));
+    caps.insert("definitionProvider", Json::Bool(true));
+    caps.insert("renameProvider", Json::Bool(true));
+
+    var server_info: JsonObject = JsonObject::new();
+    server_info.insert("name", Json::Str("fides-lsp"));
+    server_info.insert("version", Json::Str("0.1.0"));
+
+    var result: JsonObject = JsonObject::new();
+    result.insert("capabilities", Json::Obj(caps));
+    result.insert("serverInfo", Json::Obj(server_info));
+    send_response(id, Json::Obj(result));
+}
+
+fn send_response(id: Json, result: Json) -> void {
+    var response: JsonObject = JsonObject::new();
+    response.insert("jsonrpc", Json::Str("2.0"));
+    response.insert("id", id);
+    response.insert("result", result);
+    send_notification(Json::Obj(response));
+}
+
+fn send_error(id: Json, error: Json) -> void {
+    var response: JsonObject = JsonObject::new();
+    response.insert("jsonrpc", Json::Str("2.0"));
+    response.insert("id", id);
+    response.insert("error", error);
+    send_notification(Json::Obj(response));
+}
+
+fn send_notification(msg: Json) -> void {
+    var json_str: str = json_dump(msg, false);
+    var output: str = "Content-Length: " + int_to_str(str_len(json_str)) + "\r\n\r\n" + json_str;
+    p_print_str(output);
+    p_flush_stdout();
+}
+
+// ─── Diagnostics ────────────────────────────────────────────────────────
+
+fn publish_diagnostics(uri: str, text: str) -> void {
+    // Determine source path from URI
+    var source_path: OptStr = OptStr::None;
+    if str_starts_with(uri, "file://") {
+        source_path = OptStr::Some(str_slice(uri, 7, str_len(uri)));
+    }
+
+    var diags: Vec<StrTriple> = get_diagnostics(text, source_path);
+
+    var diag_array: Vec<Json> = Vec::new();
+    var i: i64 = 0;
+    while i < diags.len() {
+        var d: StrTriple = diags.get(i);
+        var range: JsonObject = JsonObject::new();
+        var start: JsonObject = JsonObject::new();
+        start.insert("line", Json::Num((d.line - 1) as f64));
+        start.insert("character", Json::Num((d.col - 1) as f64));
+        var end: JsonObject = JsonObject::new();
+        end.insert("line", Json::Num((d.line - 1) as f64));
+        end.insert("character", Json::Num(d.col as f64));
+        range.insert("start", Json::Obj(start));
+        range.insert("end", Json::Obj(end));
+
+        var diag_obj: JsonObject = JsonObject::new();
+        diag_obj.insert("range", Json::Obj(range));
+        diag_obj.insert("severity", Json::Num(1.0)); // Error
+        diag_obj.insert("message", Json::Str(d.msg));
+        diag_obj.insert("source", Json::Str("fides"));
+        diag_array.push(Json::Obj(diag_obj));
+        i = i + 1;
+    }
+
+    var params: JsonObject = JsonObject::new();
+    params.insert("uri", Json::Str(uri));
+    params.insert("diagnostics", Json::Arr(diag_array));
+
+    var notification: JsonObject = JsonObject::new();
+    notification.insert("jsonrpc", Json::Str("2.0"));
+    notification.insert("method", Json::Str("textDocument/publishDiagnostics"));
+    notification.insert("params", Json::Obj(params));
+    send_notification(Json::Obj(notification));
+}
+
+// ─── Completion / Hover / Goto-Definition ───────────────────────────────
+
+/// Fides keywords for completion.
+fn build_keywords() -> Vec<str> {
+    var keywords: Vec<str> = Vec::new();
+    keywords.push("fn");
+    keywords.push("val");
+    keywords.push("var");
+    keywords.push("const");
+    keywords.push("type");
+    keywords.push("pub");
+    keywords.push("struct");
+    keywords.push("enum");
+    keywords.push("impl");
+    keywords.push("cap");
+    keywords.push("if");
+    keywords.push("else");
+    keywords.push("while");
+    keywords.push("for");
+    keywords.push("in");
+    keywords.push("loop");
+    keywords.push("break");
+    keywords.push("continue");
+    keywords.push("return");
+    keywords.push("match");
+    keywords.push("use");
+    keywords.push("region");
+    keywords.push("sandbox");
+    keywords.push("unsafe");
+    keywords.push("txn");
+    keywords.push("do");
+    keywords.push("handle");
+    keywords.push("with");
+    keywords.push("await");
+    keywords.push("async");
+    keywords.push("comptime");
+    return keywords;
+}
+
+/// Check if a byte is a valid identifier character.
+fn is_ident_char(c: i64) -> bool {
+    // a-z, A-Z, 0-9, _
+    if c == 95 { return true; } // _
+    if c >= 48 && c <= 57 { return true; } // 0-9
+    if c >= 65 && c <= 90 { return true; } // A-Z
+    if c >= 97 && c <= 122 { return true; } // a-z
+    return false;
+}
+
+/// Split text into lines by \n.
+fn split_lines(text: str) -> Vec<str> {
+    return str_split(text, "\n");
+}
+
+/// Extract the word at a given (0-based line, 0-based character) position.
+fn word_at_position(text: str, line: i64, character: i64) -> str {
+    var lines: Vec<str> = split_lines(text);
+    if line >= lines.len() {
+        return "";
+    }
+    var line_str: str = lines.get(line);
+    var line_len: i64 = str_len(line_str);
+    if line_len == 0 {
+        return "";
+    }
+    // Clamp character to valid range
+    var pos: i64 = character;
+    if pos > line_len { pos = line_len; }
+    // If at end of line or current char is not ident, step back
+    var start: i64 = pos;
+    var end: i64 = pos;
+    if pos == line_len || !is_ident_char(str_byte_at(line_str, pos)) {
+        if pos > 0 && is_ident_char(str_byte_at(line_str, pos - 1)) {
+            end = pos;
+            start = pos;
+            while start > 0 && is_ident_char(str_byte_at(line_str, start - 1)) {
+                start = start - 1;
+            }
+            return str_slice(line_str, start, end);
+        }
+        return "";
+    }
+    // Cursor is on an ident char — expand both directions
+    while start > 0 && is_ident_char(str_byte_at(line_str, start - 1)) {
+        start = start - 1;
+    }
+    while end < line_len && is_ident_char(str_byte_at(line_str, end)) {
+        end = end + 1;
+    }
+    return str_slice(line_str, start, end);
+}
+
+/// Check if cursor is immediately after a '.' (dot-access).
+/// Returns the identifier before the dot, or "" if not.
+fn ident_before_dot(text: str, line: i64, character: i64) -> str {
+    var lines: Vec<str> = split_lines(text);
+    if line >= lines.len() {
+        return "";
+    }
+    var line_str: str = lines.get(line);
+    var line_len: i64 = str_len(line_str);
+    if line_len == 0 {
+        return "";
+    }
+    var pos: i64 = character;
+    if pos > line_len { pos = line_len; }
+    if pos == 0 {
+        return "";
+    }
+    // The character right before cursor should be '.'
+    if str_byte_at(line_str, pos - 1) != 46 { // '.'
+        return "";
+    }
+    // Find identifier before the dot
+    var end: i64 = pos - 1; // position of '.'
+    if end == 0 {
+        return "";
+    }
+    var start: i64 = end - 1;
+    // Skip whitespace before the dot
+    while start > 0 {
+        var c: i64 = str_byte_at(line_str, start);
+        if c != 32 && c != 9 { break; }
+        start = start - 1;
+    }
+    if !is_ident_char(str_byte_at(line_str, start)) {
+        return "";
+    }
+    end = start + 1;
+    while start > 0 && is_ident_char(str_byte_at(line_str, start - 1)) {
+        start = start - 1;
+    }
+    return str_slice(line_str, start, end);
+}
+
+/// Build a CompletionItem JSON object.
+fn completion_item(label: str, kind: i64, detail: str) -> Json {
+    var obj: JsonObject = JsonObject::new();
+    obj.insert("label", Json::Str(label));
+    obj.insert("kind", Json::Num(kind as f64));
+    obj.insert("detail", Json::Str(detail));
+    return Json::Obj(obj);
+}
+
+/// Handle textDocument/completion.
+fn handle_completion(text: str, line: i64, character: i64) -> Json {
+    // Build program to get symbol info
+    var result: ResultProgram = build_program_with_path(text, OptStr::None);
+    var program: Program;
+    var has_program: bool = false;
+    match result {
+        ResultProgram::Ok(p) => { program = p; has_program = true; }
+        ResultProgram::Err(_) => { has_program = false; }
+    }
+
+    var items: Vec<Json> = Vec::new();
+
+    // Check if we're after a dot (method/field completion)
+    var receiver: str = ident_before_dot(text, line, character);
+    if str_len(receiver) > 0 {
+        if has_program {
+            // Return methods from impls matching the receiver type
+            var i: i64 = 0;
+            while i < program.impls.len() {
+                var impl_def: ImplDef = program.impls.get(i);
+                if str_equal(impl_def.struct_name, receiver) {
+                    var j: i64 = 0;
+                    while j < impl_def.methods.len() {
+                        var m: Func = impl_def.methods.get(j);
+                        var detail: str = "fn " + m.name + "(" + params_to_str(m.params) + ") -> " + type_to_str(m.ret_ty);
+                        items.push(completion_item(m.name, 2, detail)); // 2 = Method
+                        j = j + 1;
+                    }
+                }
+                i = i + 1;
+            }
+            // Return struct fields if receiver is a known struct
+            i = 0;
+            while i < program.structs.len() {
+                var s: StructDef = program.structs.get(i);
+                if str_equal(s.name, receiver) {
+                    var j: i64 = 0;
+                    while j < s.fields.len() {
+                        var f: Param = s.fields.get(j);
+                        items.push(completion_item(f.name, 5, f.name + ": " + type_to_str(f.ty))); // 5 = Field
+                        j = j + 1;
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        return Json::Arr(items);
+    }
+
+    // Global completions: keywords, functions, structs, enums, consts
+    var keywords: Vec<str> = build_keywords();
+    var i: i64 = 0;
+    while i < keywords.len() {
+        items.push(completion_item(keywords.get(i), 14, "keyword")); // 14 = Keyword
+        i = i + 1;
+    }
+
+    if has_program {
+        // Functions
+        i = 0;
+        while i < program.funcs.len() {
+            var f: Func = program.funcs.get(i);
+            var detail: str = "fn " + f.name + "(" + params_to_str(f.params) + ") -> " + type_to_str(f.ret_ty);
+            items.push(completion_item(f.name, 3, detail)); // 3 = Function
+            i = i + 1;
+        }
+        // Structs
+        i = 0;
+        while i < program.structs.len() {
+            var s: StructDef = program.structs.get(i);
+            var field_strs: str = "";
+            var j: i64 = 0;
+            while j < s.fields.len() {
+                if j > 0 { field_strs = field_strs + ", "; }
+                field_strs = field_strs + s.fields.get(j).name + ": " + type_to_str(s.fields.get(j).ty);
+                j = j + 1;
+            }
+            items.push(completion_item(s.name, 22, "struct " + s.name + " { " + field_strs + " }")); // 22 = Struct
+            i = i + 1;
+        }
+        // Enums
+        i = 0;
+        while i < program.enums.len() {
+            items.push(completion_item(program.enums.get(i).name, 20, "enum")); // 20 = Enum
+            i = i + 1;
+        }
+        // Constants
+        i = 0;
+        while i < program.consts.len() {
+            var c: ConstDef = program.consts.get(i);
+            items.push(completion_item(c.name, 21, "const " + c.name + ": " + type_to_str(c.ty))); // 21 = Constant
+            i = i + 1;
+        }
+        // Type aliases
+        i = 0;
+        while i < program.type_aliases.len() {
+            var ta: TypeAlias = program.type_aliases.get(i);
+            items.push(completion_item(ta.name, 9, "type " + ta.name + " = " + type_to_str(ta.alias_for))); // 9 = Class
+            i = i + 1;
+        }
+        // Traits
+        i = 0;
+        while i < program.traits.len() {
+            items.push(completion_item(program.traits.get(i).name, 8, "trait")); // 8 = Interface
+            i = i + 1;
+        }
+    }
+
+    return Json::Arr(items);
+}
+
+/// Handle textDocument/hover.
+fn handle_hover(text: str, line: i64, character: i64) -> Json {
+    var word: str = word_at_position(text, line, character);
+    if str_len(word) == 0 {
+        return Json::Null;
+    }
+
+    var result: ResultProgram = build_program_with_path(text, OptStr::None);
+    var program: Program;
+    var has_program: bool = false;
+    match result {
+        ResultProgram::Ok(p) => { program = p; has_program = true; }
+        ResultProgram::Err(_) => { has_program = false; }
+    }
+
+    if !has_program {
+        return Json::Null;
+    }
+
+    var content: str = "";
+
+    // Check functions
+    var found: bool = false;
+    var i: i64 = 0;
+    while i < program.funcs.len() {
+        if str_equal(program.funcs.get(i).name, word) {
+            var f: Func = program.funcs.get(i);
+            content = "**fn " + word + "(" + params_to_str(f.params) + ") -> " + type_to_str(f.ret_ty) + "**";
+            found = true;
+            break;
+        }
+        i = i + 1;
+    }
+
+    // Check structs
+    if !found {
+        i = 0;
+        while i < program.structs.len() {
+            if str_equal(program.structs.get(i).name, word) {
+                var s: StructDef = program.structs.get(i);
+                var field_strs: str = "";
+                var j: i64 = 0;
+                while j < s.fields.len() {
+                    if j > 0 { field_strs = field_strs + ", "; }
+                    field_strs = field_strs + s.fields.get(j).name + ": " + type_to_str(s.fields.get(j).ty);
+                    j = j + 1;
+                }
+                content = "**struct " + word + "**\n\n{ " + field_strs + " }";
+                found = true;
+                break;
+            }
+            i = i + 1;
+        }
+    }
+
+    // Check enums
+    if !found {
+        i = 0;
+        while i < program.enums.len() {
+            if str_equal(program.enums.get(i).name, word) {
+                content = "**enum " + word + "**";
+                found = true;
+                break;
+            }
+            i = i + 1;
+        }
+    }
+
+    // Check consts
+    if !found {
+        i = 0;
+        while i < program.consts.len() {
+            if str_equal(program.consts.get(i).name, word) {
+                content = "**const " + word + "**: " + type_to_str(program.consts.get(i).ty);
+                found = true;
+                break;
+            }
+            i = i + 1;
+        }
+    }
+
+    // Check type aliases
+    if !found {
+        i = 0;
+        while i < program.type_aliases.len() {
+            if str_equal(program.type_aliases.get(i).name, word) {
+                content = "**type " + word + "** = " + type_to_str(program.type_aliases.get(i).alias_for);
+                found = true;
+                break;
+            }
+            i = i + 1;
+        }
+    }
+
+    // Check traits
+    if !found {
+        i = 0;
+        while i < program.traits.len() {
+            if str_equal(program.traits.get(i).name, word) {
+                content = "**trait " + word + "**";
+                found = true;
+                break;
+            }
+            i = i + 1;
+        }
+    }
+
+    // Check methods in impls
+    if !found {
+        i = 0;
+        while i < program.impls.len() {
+            var impl_def: ImplDef = program.impls.get(i);
+            var j: i64 = 0;
+            while j < impl_def.methods.len() {
+                if str_equal(impl_def.methods.get(j).name, word) {
+                    var m: Func = impl_def.methods.get(j);
+                    content = "**method " + impl_def.struct_name + "::" + word + "(" + params_to_str(m.params) + ") -> " + type_to_str(m.ret_ty) + "**";
+                    found = true;
+                    break;
+                }
+                j = j + 1;
+            }
+            if found { break; }
+            i = i + 1;
+        }
+    }
+
+    if !found {
+        return Json::Null;
+    }
+
+    var contents: JsonObject = JsonObject::new();
+    contents.insert("kind", Json::Str("markdown"));
+    contents.insert("value", Json::Str(content));
+    var hover: JsonObject = JsonObject::new();
+    hover.insert("contents", Json::Obj(contents));
+    return Json::Obj(hover);
+}
+
+/// Handle textDocument/definition.
+fn handle_definition(text: str, uri: str, line: i64, character: i64) -> Json {
+    var word: str = word_at_position(text, line, character);
+    if str_len(word) == 0 {
+        return Json::Null;
+    }
+
+    var result: ResultProgram = build_program_with_path(text, OptStr::None);
+    var program: Program;
+    var has_program: bool = false;
+    match result {
+        ResultProgram::Ok(p) => { program = p; has_program = true; }
+        ResultProgram::Err(_) => { has_program = false; }
+    }
+
+    if !has_program {
+        return Json::Null;
+    }
+
+    // Determine what kind of symbol we're looking for
+    var is_func: bool = false;
+    var is_struct: bool = false;
+    var is_enum: bool = false;
+    var is_const: bool = false;
+    var is_trait: bool = false;
+
+    var i: i64 = 0;
+    while i < program.funcs.len() {
+        if str_equal(program.funcs.get(i).name, word) { is_func = true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.structs.len() {
+        if str_equal(program.structs.get(i).name, word) { is_struct = true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.enums.len() {
+        if str_equal(program.enums.get(i).name, word) { is_enum = true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.consts.len() {
+        if str_equal(program.consts.get(i).name, word) { is_const = true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.traits.len() {
+        if str_equal(program.traits.get(i).name, word) { is_trait = true; }
+        i = i + 1;
+    }
+
+    // Check if it's a method name
+    var is_method: bool = false;
+    i = 0;
+    while i < program.impls.len() {
+        var j: i64 = 0;
+        while j < program.impls.get(i).methods.len() {
+            if str_equal(program.impls.get(i).methods.get(j).name, word) {
+                is_method = true;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    if !is_func && !is_struct && !is_enum && !is_const && !is_trait && !is_method {
+        return Json::Null;
+    }
+
+    // Search for the definition in the source text
+    var def_result: OptI64Pair = find_definition(text, word, is_func);
+    match def_result {
+        OptI64Pair::Some(def_line, def_col) => {
+            return location_json(uri, def_line, def_col, word);
+        }
+        OptI64Pair::None => { return Json::Null; }
+    }
+}
+
+/// Handle textDocument/rename.
+fn handle_rename(text: str, uri: str, line: i64, character: i64, new_name: str) -> Json {
+    var word: str = word_at_position(text, line, character);
+    if str_len(word) == 0 {
+        return Json::Null;
+    }
+
+    var result: ResultProgram = build_program_with_path(text, OptStr::None);
+    var program: Program;
+    var has_program: bool = false;
+    match result {
+        ResultProgram::Ok(p) => { program = p; has_program = true; }
+        ResultProgram::Err(_) => { has_program = false; }
+    }
+
+    if !has_program {
+        return Json::Null;
+    }
+
+    // Determine if the word is a known symbol
+    var is_known: bool = false;
+    var i: i64 = 0;
+    while i < program.funcs.len() {
+        if str_equal(program.funcs.get(i).name, word) { is_known = true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.structs.len() {
+        if str_equal(program.structs.get(i).name, word) { is_known = true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.enums.len() {
+        if str_equal(program.enums.get(i).name, word) { is_known = true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.consts.len() {
+        if str_equal(program.consts.get(i).name, word) { is_known = true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.traits.len() {
+        if str_equal(program.traits.get(i).name, word) { is_known = true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.impls.len() {
+        var j: i64 = 0;
+        while j < program.impls.get(i).methods.len() {
+            if str_equal(program.impls.get(i).methods.get(j).name, word) { is_known = true; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    if !is_known {
+        return Json::Null;
+    }
+
+    // Find all occurrences
+    var edits: Vec<I64Triple> = find_all_occurrences(text, word);
+    if edits.len() == 0 {
+        return Json::Null;
+    }
+
+    var edit_objects: Vec<Json> = Vec::new();
+    i = 0;
+    while i < edits.len() {
+        var e: I64Triple = edits.get(i);
+        var range: JsonObject = JsonObject::new();
+        var start: JsonObject = JsonObject::new();
+        start.insert("line", Json::Num(e.a as f64));
+        start.insert("character", Json::Num(e.b as f64));
+        var end: JsonObject = JsonObject::new();
+        end.insert("line", Json::Num(e.a as f64));
+        end.insert("character", Json::Num((e.b + e.c) as f64));
+        range.insert("start", Json::Obj(start));
+        range.insert("end", Json::Obj(end));
+
+        var edit_obj: JsonObject = JsonObject::new();
+        edit_obj.insert("range", Json::Obj(range));
+        edit_obj.insert("newText", Json::Str(new_name));
+        edit_objects.push(Json::Obj(edit_obj));
+        i = i + 1;
+    }
+
+    var changes: JsonObject = JsonObject::new();
+    changes.insert(uri, Json::Arr(edit_objects));
+    var result_obj: JsonObject = JsonObject::new();
+    result_obj.insert("changes", Json::Obj(changes));
+    return Json::Obj(result_obj);
+}
+
+// ─── Source search helpers ──────────────────────────────────────────────
+
+/// Optional pair of i64 values (for find_definition result).
+pub enum OptI64Pair {
+    Some(i64, i64),
+    None,
+}
+
+/// Triple of i64 values (for find_all_occurrences).
+pub struct I64Triple {
+    pub a: i64,
+    pub b: i64,
+    pub c: i64,
+}
+
+pub fn I64Triple_new(a: i64, b: i64, c: i64) -> I64Triple {
+    return I64Triple { a: a, b: b, c: c };
+}
+
+/// Find all whole-word occurrences of `name` in the source text.
+/// Returns Vec of (line, column, length).
+fn find_all_occurrences(text: str, name: str) -> Vec<I64Triple> {
+    var results: Vec<I64Triple> = Vec::new();
+    var name_len: i64 = str_len(name);
+    if name_len == 0 {
+        return results;
+    }
+    var lines: Vec<str> = split_lines(text);
+    var line_idx: i64 = 0;
+    while line_idx < lines.len() {
+        var line_str: str = lines.get(line_idx);
+        var line_len: i64 = str_len(line_str);
+        var i: i64 = 0;
+        while i + name_len <= line_len {
+            var slice: str = str_slice(line_str, i, i + name_len);
+            if str_equal(slice, name) {
+                // Check word boundary before
+                var ok_before: bool = i == 0;
+                if i > 0 {
+                    ok_before = !is_ident_char(str_byte_at(line_str, i - 1));
+                }
+                // Check word boundary after
+                var ok_after: bool = (i + name_len) == line_len;
+                if (i + name_len) < line_len {
+                    ok_after = !is_ident_char(str_byte_at(line_str, i + name_len));
+                }
+                if ok_before && ok_after {
+                    results.push(I64Triple_new(line_idx, i, name_len));
+                }
+            }
+            i = i + 1;
+        }
+        line_idx = line_idx + 1;
+    }
+    return results;
+}
+
+/// Search source text for a definition of the given symbol name.
+/// Returns (0-based line, 0-based column) if found.
+fn find_definition(text: str, name: str, is_func: bool) -> OptI64Pair {
+    var lines: Vec<str> = split_lines(text);
+    var line_idx: i64 = 0;
+    while line_idx < lines.len() {
+        var line_str: str = lines.get(line_idx);
+        if is_func {
+            // Look for: fn name, val name, pub fn name, pub val name
+            var pos: i64 = find_word_after(line_str, "fn ", name);
+            if pos >= 0 { return OptI64Pair::Some(line_idx, pos); }
+            pos = find_word_after(line_str, "val ", name);
+            if pos >= 0 { return OptI64Pair::Some(line_idx, pos); }
+            pos = find_word_after(line_str, "pub fn ", name);
+            if pos >= 0 { return OptI64Pair::Some(line_idx, pos); }
+            pos = find_word_after(line_str, "pub val ", name);
+            if pos >= 0 { return OptI64Pair::Some(line_idx, pos); }
+        } else {
+            // Look for: struct, enum, const, type, cap, pub variants
+            var keywords: Vec<str> = Vec::new();
+            keywords.push("struct ");
+            keywords.push("enum ");
+            keywords.push("const ");
+            keywords.push("type ");
+            keywords.push("cap ");
+            keywords.push("pub struct ");
+            keywords.push("pub enum ");
+            keywords.push("pub const ");
+            keywords.push("pub type ");
+            keywords.push("pub cap ");
+            var ki: i64 = 0;
+            while ki < keywords.len() {
+                var pos: i64 = find_word_after(line_str, keywords.get(ki), name);
+                if pos >= 0 { return OptI64Pair::Some(line_idx, pos); }
+                ki = ki + 1;
+            }
+        }
+        line_idx = line_idx + 1;
+    }
+    return OptI64Pair::None;
+}
+
+/// Check if `line` contains `keyword` followed by `name` (as a whole word).
+/// Returns the 0-based column of `name` if found, or -1 if not.
+fn find_word_after(line: str, keyword: str, name: str) -> i64 {
+    var line_len: i64 = str_len(line);
+    var kw_len: i64 = str_len(keyword);
+    var name_len: i64 = str_len(name);
+    var search_from: i64 = 0;
+    loop {
+        var kw_pos: i64 = str_find(str_slice(line, search_from, line_len), keyword);
+        if kw_pos < 0 { return -1; }
+        var abs_pos: i64 = search_from + kw_pos;
+        // Check word boundary before keyword
+        if abs_pos > 0 {
+            if is_ident_char(str_byte_at(line, abs_pos - 1)) {
+                search_from = abs_pos + 1;
+                continue;
+            }
+        }
+        // Find name after keyword
+        var after_kw: i64 = abs_pos + kw_len;
+        var idx: i64 = after_kw;
+        // Skip whitespace
+        while idx < line_len {
+            var c: i64 = str_byte_at(line, idx);
+            if c != 32 && c != 9 { break; }
+            idx = idx + 1;
+        }
+        // Check if next word matches name
+        if idx + name_len <= line_len {
+            var candidate: str = str_slice(line, idx, idx + name_len);
+            if str_equal(candidate, name) {
+                // Ensure word boundary after
+                var after: i64 = idx + name_len;
+                if after >= line_len || !is_ident_char(str_byte_at(line, after)) {
+                    return idx;
+                }
+            }
+        }
+        search_from = abs_pos + 1;
+    }
+    return -1;
+}
+
+/// Build a Location JSON object for goto-definition.
+fn location_json(uri: str, line: i64, col: i64, word: str) -> Json {
+    var word_len: i64 = str_len(word);
+    var range: JsonObject = JsonObject::new();
+    var start: JsonObject = JsonObject::new();
+    start.insert("line", Json::Num(line as f64));
+    start.insert("character", Json::Num(col as f64));
+    var end: JsonObject = JsonObject::new();
+    end.insert("line", Json::Num(line as f64));
+    end.insert("character", Json::Num((col + word_len) as f64));
+    range.insert("start", Json::Obj(start));
+    range.insert("end", Json::Obj(end));
+    var loc: JsonObject = JsonObject::new();
+    loc.insert("uri", Json::Str(uri));
+    loc.insert("range", Json::Obj(range));
+    return Json::Obj(loc);
+}
+
+// ─── Utility ────────────────────────────────────────────────────────────
+
+/// Format function parameters as a comma-separated string.
+fn params_to_str(params: Vec<Param>) -> str {
+    var result: str = "";
+    var i: i64 = 0;
+    while i < params.len() {
+        if i > 0 { result = result + ", "; }
+        result = result + params.get(i).name + ": " + type_to_str(params.get(i).ty);
+        i = i + 1;
+    }
+    return result;
+}
