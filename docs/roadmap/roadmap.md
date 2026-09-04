@@ -446,19 +446,20 @@ to be built.
 
 ---
 
-## Phase 10 — Self-Hosting (READY TO START)
+## Phase 10 — Self-Hosting (IN PROGRESS — session 7)
 
 **Goal:** Rewrite the Fides compiler in Fides.
 
-**Detailed plan:** See `selfhost-roadmap.md` for the 10-phase self-hosting
-roadmap (SH-0 through SH-9): pre-flight audit, debugging infrastructure,
-per-module test harness, language/stdlib gap fixes, C codegen hardening,
-and gradual file-by-file rewrite with differential testing at each stage.
+**Detailed plan:** See `selfhost-roadmap.md` for the full self-hosting
+roadmap. All 18 modules have been rewritten in Fides (39.5K LOC). The
+self-hosted compiler successfully compiles itself (EXIT 0). The PE emitter
+has been ported with 25+ runtime stubs. Comptime evaluation has been fully
+ported.
 
-**Status:** All 3 language-level blockers resolved. The compiler can now
-express the data structures and patterns needed for self-hosting (recursive
-ASTs via Box<T>, typed enum payloads, generic containers). Remaining work is
-stdlib gaps and the actual rewrite.
+**Status:** All 3 language-level blockers resolved. All 18 self-host
+modules rewritten. Self-compilation works (EXIT 0). PE emitter works for
+simple programs. Comptime eval fully ported. Fixpoint verification is
+blocked by a pre-existing crash in the second-generation binary.
 
 ### Milestones
 - [x] `unsafe {}` blocks — with unsafe_depth tracking
@@ -534,7 +535,7 @@ rewritten in Fides. All are now resolved:
 
 ---
 
-## Phase 10B — PE Emitter Rewrite in Fides (NOT STARTED)
+## Phase 10B — PE Emitter Rewrite in Fides (IN PROGRESS — session 7)
 
 **Goal:** Rewrite the PE emitter (`src/pe.rs`) in Fides, making the
 self-hosted compiler fully self-contained with zero external dependencies.

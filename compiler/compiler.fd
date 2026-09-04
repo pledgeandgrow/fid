@@ -34,6 +34,8 @@ use compiler::mono;
 use compiler::borrowck;
 use compiler::codegen_c;
 use compiler::comptime_eval;
+use compiler::pe;
+use compiler::inc;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Result types (Fides has no generic Result<T,E>)
@@ -114,6 +116,56 @@ pub fn errcode_to_str(code: ErrCode) -> str {
 // ═══════════════════════════════════════════════════════════════════════════
 // Helper types
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// Cache entry: file path → source content (avoids re-reading from disk)
+pub struct PathContent {
+    pub path: str,
+    pub content: str,
+}
+
+pub fn PathContent_new(path: str, content: str) -> PathContent {
+    return PathContent { path: path, content: content };
+}
+
+/// Cache entry: file path → tokens (avoids re-lexing)
+pub struct PathTokens {
+    pub path: str,
+    pub tokens: Vec<Token>,
+}
+
+pub fn PathTokens_new(path: str, tokens: Vec<Token>) -> PathTokens {
+    return PathTokens { path: path, tokens: tokens };
+}
+
+/// Cached file read — returns cached content if available, otherwise reads from disk.
+fn cached_file_read(cache: &mut Vec<PathContent>, path: str) -> str {
+    var i: i64 = 0;
+    while i < cache.len() {
+        if str_equal(cache.get(i).path, path) {
+            return cache.get(i).content;
+        }
+        i = i + 1;
+    }
+    var content: str = c_file_read(path);
+    cache.push(PathContent_new(path, content));
+    return content;
+}
+
+/// Cached lex — returns cached tokens if available, otherwise lexes.
+fn cached_lex(token_cache: &mut Vec<PathTokens>, content_cache: &mut Vec<PathContent>, path: str) -> Vec<Token> {
+    var i: i64 = 0;
+    while i < token_cache.len() {
+        if str_equal(token_cache.get(i).path, path) {
+            return token_cache.get(i).tokens;
+        }
+        i = i + 1;
+    }
+    var source: str = cached_file_read(content_cache, path);
+    var lex: Lexer = Lexer::new(source);
+    var toks: Vec<Token> = lex.tokenize();
+    token_cache.push(PathTokens_new(path, toks));
+    return toks;
+}
 
 pub struct I64Pair {
     pub first: i64,
@@ -521,6 +573,7 @@ pub fn build_program(source: str) -> ResultProgram {
 ///   parse stdlib → parse user → resolve imports → merge → cfg filter →
 ///   derive → desugar layers/models → comptime → typecheck → borrowck → mono
 pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgram {
+    var t0: i64 = p_clock_now_ms();
     // Parse stdlib first
     p_eprint_str("[build] Reading stdlib/core.fd...\n");
     var stdlib_raw: str = p_file_read("stdlib/core.fd");
@@ -530,7 +583,12 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
     }
     var stdlib_source: str = stdlib_raw;
     p_eprint_str("[build] Lexing + parsing stdlib...\n");
+    var t1: i64 = p_clock_now_ms();
     var stdlib_result: ParseResultProgram = parse_source(stdlib_source);
+    var t2: i64 = p_clock_now_ms();
+    p_eprint_str("[prof] stdlib parse: ");
+    p_eprint_str(int_to_str(t2 - t1));
+    p_eprint_str("ms\n");
     match stdlib_result {
         ParseResultProgram::Err(e) => {
             p_eprint_str("[build] FAILED: stdlib parse error\n");
@@ -554,8 +612,13 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
 
             // Parse user code with stdlib names pre-populated
             p_eprint_str("[build] Lexing user code...\n");
+            var t3: i64 = p_clock_now_ms();
             var lex: Lexer = Lexer::new(source);
             var tokens: Vec<Token> = lex.tokenize();
+            var t4: i64 = p_clock_now_ms();
+            p_eprint_str("[prof] user lex: ");
+            p_eprint_str(int_to_str(t4 - t3));
+            p_eprint_str("ms\n");
             p_eprint_str("[build] User code lexed. Checking errors...\n");
 
             // Check for lexer errors
@@ -569,9 +632,14 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                 return ResultProgram::Err(enrich_errors(lex.errors, source, file));
             }
             p_eprint_str("[build] Parsing user code...\n");
+            var t5: i64 = p_clock_now_ms();
             var p: Parser = Parser_with_names(tokens, struct_names, enum_names);
             p_eprint_str("[build] Parser created. Calling parse()...\n");
             var user_result: ParseResultProgram = p.parse();
+            var t6: i64 = p_clock_now_ms();
+            p_eprint_str("[prof] user parse: ");
+            p_eprint_str(int_to_str(t6 - t5));
+            p_eprint_str("ms\n");
             p_eprint_str("[build] Parse done.\n");
             match user_result {
                 ParseResultProgram::Err(e) => {
@@ -598,9 +666,20 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                     // ── Resolve use imports from disk ──────────────────────────
                     // When source_path is provided, load `use foo::bar;` imports
                     // from disk, handling transitive dependencies.
+                    //
+                    // OPTIMIZATION (session 4): file content and tokens are cached
+                    // by path to avoid re-reading and re-lexing deferred modules.
+                    // Previously each module was read+lexed 2-3 times; now once.
                     var imported_modules: Vec<Program> = Vec::new();
                     var imported_module_names: Vec<str> = Vec::new();
                     var loaded_module_names: Vec<str> = Vec::new();
+                    // O(1) membership set for loaded modules — avoids O(n) linear
+                    // search in c_str_vec_contains during import resolution.
+                    var loaded_module_set: i64 = HashMap_new();
+                    var struct_name_set: i64 = HashMap_new();
+                    var enum_name_set: i64 = HashMap_new();
+                    var content_cache: Vec<PathContent> = Vec::new();
+                    var token_cache: Vec<PathTokens> = Vec::new();
                     var has_source_path: bool = false;
                     var base_dir: str = ".";
                     match source_path {
@@ -642,10 +721,8 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                             // Skip "core" — auto-included
                             if str_equal(import_path, "core") { continue; }
 
-                            // Skip already-loaded modules
-                            if c_str_vec_contains(loaded_module_names, import_path) { continue; }
-                            // Skip already-loaded
-                            if c_str_vec_contains(loaded_module_names, import_path) { continue; }
+                            // Skip already-loaded modules — O(1) HashMap lookup
+                            if HashMap_get(loaded_module_set, import_path) != 0 { continue; }
 
                             // Try candidate paths
                             var path_str: str = str_replace(import_path, "::", "/");
@@ -670,11 +747,11 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                             }
 
                             if found {
-                                var module_source: str = c_file_read(found_path);
+                                // OPTIMIZATION: use cached file read + cached lex
+                                var module_source: str = cached_file_read(&mut content_cache, found_path);
+                                var pre_toks: Vec<Token> = cached_lex(&mut token_cache, &mut content_cache, found_path);
 
                                 // Pre-scan: parse to extract imports and type names
-                                var pre_lex: Lexer = Lexer::new(module_source);
-                                var pre_toks: Vec<Token> = pre_lex.tokenize();
                                 var pre_parser: Parser = Parser_with_names(pre_toks, struct_names, enum_names);
                                 var pre_result: ParseResultProgram = pre_parser.parse();
 
@@ -684,16 +761,18 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                         var si: i64 = 0;
                                         while si < pre_prog.structs.len() {
                                             var sn: str = pre_prog.structs.get(si).name;
-                                            if !c_str_vec_contains(struct_names, sn) {
+                                            if HashMap_get(struct_name_set, sn) == 0 {
                                                 struct_names.push(sn);
+                                                HashMap_insert(struct_name_set, sn, 1);
                                             }
                                             si = si + 1;
                                         }
                                         var ei: i64 = 0;
                                         while ei < pre_prog.enums.len() {
                                             var en: str = pre_prog.enums.get(ei).name;
-                                            if !c_str_vec_contains(enum_names, en) {
+                                            if HashMap_get(enum_name_set, en) == 0 {
                                                 enum_names.push(en);
+                                                HashMap_insert(enum_name_set, en, 1);
                                             }
                                             ei = ei + 1;
                                         }
@@ -703,7 +782,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                         var di: i64 = 0;
                                         while di < pre_prog.imports.len() {
                                             var dep: str = pre_prog.imports.get(di).path;
-                                            if !str_equal(dep, "core") && !c_str_vec_contains(loaded_module_names, dep) {
+                                            if !str_equal(dep, "core") && HashMap_get(loaded_module_set, dep) == 0 {
                                                 unloaded_deps.push(dep);
                                             }
                                             di = di + 1;
@@ -723,7 +802,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                             imports_to_process.push(import_path);
                                             var di2: i64 = 0;
                                             while di2 < unloaded_deps.len() {
-                                                if !c_str_vec_contains(loaded_module_names, unloaded_deps.get(di2)) {
+                                                if HashMap_get(loaded_module_set, unloaded_deps.get(di2)) == 0 {
                                                     imports_to_process.push(unloaded_deps.get(di2));
                                                 }
                                                 di2 = di2 + 1;
@@ -732,9 +811,9 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                         }
 
                                         // All deps loaded — full parse with all names
-                                        var lex2: Lexer = Lexer::new(module_source);
-                                        var toks2: Vec<Token> = lex2.tokenize();
-                                        var p2: Parser = Parser_with_names(toks2, struct_names, enum_names);
+                                        // OPTIMIZATION: reuse cached tokens (pre_toks) — tokens
+                                        // don't depend on name sets, only parsing does.
+                                        var p2: Parser = Parser_with_names(pre_toks, struct_names, enum_names);
                                         var full_result: ParseResultProgram = p2.parse();
 
                                         match full_result {
@@ -746,6 +825,8 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                                 }
                                                 loaded_module_names.push(import_path);
                                                 loaded_module_names.push(mod_name);
+                                                HashMap_insert(loaded_module_set, import_path, 1);
+                                                HashMap_insert(loaded_module_set, mod_name, 1);
 
                                                 // Clear from deferred set — successfully loaded
                                                 var deferred_idx: i64 = 0;
@@ -761,16 +842,18 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                                 var si2: i64 = 0;
                                                 while si2 < imported.structs.len() {
                                                     var sn2: str = imported.structs.get(si2).name;
-                                                    if !c_str_vec_contains(struct_names, sn2) {
+                                                    if HashMap_get(struct_name_set, sn2) == 0 {
                                                         struct_names.push(sn2);
+                                                        HashMap_insert(struct_name_set, sn2, 1);
                                                     }
                                                     si2 = si2 + 1;
                                                 }
                                                 var ei2: i64 = 0;
                                                 while ei2 < imported.enums.len() {
                                                     var en2: str = imported.enums.get(ei2).name;
-                                                    if !c_str_vec_contains(enum_names, en2) {
+                                                    if HashMap_get(enum_name_set, en2) == 0 {
                                                         enum_names.push(en2);
+                                                        HashMap_insert(enum_name_set, en2, 1);
                                                     }
                                                     ei2 = ei2 + 1;
                                                 }
@@ -779,7 +862,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                                 var ti: i64 = 0;
                                                 while ti < imported.imports.len() {
                                                     var tpath: str = imported.imports.get(ti).path;
-                                                    if !c_str_vec_contains(loaded_module_names, tpath) {
+                                                    if HashMap_get(loaded_module_set, tpath) == 0 {
                                                         imports_to_process.push(tpath);
                                                     }
                                                     ti = ti + 1;
@@ -798,9 +881,8 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                     }
                                     ParseResultProgram::Err(_) => {
                                         // Pre-scan failed — try full parse directly
-                                        var lex2: Lexer = Lexer::new(module_source);
-                                        var toks2: Vec<Token> = lex2.tokenize();
-                                        var p2: Parser = Parser_with_names(toks2, struct_names, enum_names);
+                                        // OPTIMIZATION: reuse cached tokens
+                                        var p2: Parser = Parser_with_names(pre_toks, struct_names, enum_names);
                                         var full_result: ParseResultProgram = p2.parse();
                                         match full_result {
                                             ParseResultProgram::Ok(imported) => {
@@ -811,6 +893,8 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                                 }
                                                 loaded_module_names.push(import_path);
                                                 loaded_module_names.push(mod_name);
+                                                HashMap_insert(loaded_module_set, import_path, 1);
+                                                HashMap_insert(loaded_module_set, mod_name, 1);
                                                 imported_modules.push(imported);
                                                 imported_module_names.push(mod_name);
                                             }
@@ -869,6 +953,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                     fill_default_trait_methods(&mut program);
 
                     p_eprint_str("[build] Type checking...\n");
+                    var t_tc: i64 = p_clock_now_ms();
                     // Type check — register each module with its own name
                     var tc: TypeChecker = TypeChecker::new();
                     var stdlib_module: str = "core";
@@ -906,6 +991,10 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                         return ResultProgram::Err(enrich_errors(tc.errors, source, file3));
                     }
                     p_eprint_str("[build] Type check ok. Borrow checking...\n");
+                    var t_bc: i64 = p_clock_now_ms();
+                    p_eprint_str("[prof] typecheck: ");
+                    p_eprint_str(int_to_str(t_bc - t_tc));
+                    p_eprint_str("ms\n");
 
                     // Run lints (warnings only)
                     tc.run_lints(program);
@@ -926,9 +1015,20 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                     program = substitute(program);
 
                     p_eprint_str("[build] Monomorphizing...\n");
+                    var t_mono: i64 = p_clock_now_ms();
+                    p_eprint_str("[prof] borrowck: ");
+                    p_eprint_str(int_to_str(t_mono - t_bc));
+                    p_eprint_str("ms\n");
                     // Monomorphize generics
                     var mono_result: Program = monomorphize(program);
+                    var t_mono_end: i64 = p_clock_now_ms();
+                    p_eprint_str("[prof] mono: ");
+                    p_eprint_str(int_to_str(t_mono_end - t_mono));
+                    p_eprint_str("ms\n");
                     p_eprint_str("[build] Done. Program built successfully.\n");
+                    p_eprint_str("[prof] total build: ");
+                    p_eprint_str(int_to_str(t_mono_end - t0));
+                    p_eprint_str("ms\n");
                     return ResultProgram::Ok(mono_result);
                 }
             }
@@ -939,6 +1039,23 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
 
 /// Compile source to C code.
 pub fn ccompile_source_with_path(source: str, source_path: str) -> ResultStr {
+    // Check incremental cache — skip full pipeline if source is unchanged
+    var src_hash: i64 = hash_source(source);
+    match global_cache_get(source_path, src_hash) {
+        OptIrModule::Some(cached_module) => {
+            p_eprint_str("[ccompile] Cache HIT — skipping parse/typecheck/lower/optimize\n");
+            var t_codegen: i64 = p_clock_now_ms();
+            var cg: CCodeGen = CCodeGen_new();
+            var c_code: str = CCodeGen_generate(&mut cg, cached_module);
+            var t_cg_end: i64 = p_clock_now_ms();
+            p_eprint_str("[prof] codegen (cached): ");
+            p_eprint_str(int_to_str(t_cg_end - t_codegen));
+            p_eprint_str("ms\n");
+            return ResultStr::Ok(c_code);
+        }
+        OptIrModule::None => {}
+    }
+
     p_eprint_str("[ccompile] Building program...\n");
     var result: ResultProgram = build_program_with_path(source, OptStr::Some(source_path));
     match result {
@@ -948,10 +1065,30 @@ pub fn ccompile_source_with_path(source: str, source_path: str) -> ResultStr {
         }
         ResultProgram::Ok(program) => {
             p_eprint_str("[ccompile] Lowering to IR...\n");
+            var t_lower: i64 = p_clock_now_ms();
             var module: IrModule = lower(program);
+            var t_opt: i64 = p_clock_now_ms();
+            p_eprint_str("[prof] lower: ");
+            p_eprint_str(int_to_str(t_opt - t_lower));
+            p_eprint_str("ms\n");
+            // IR-level optimization: constant folding + dead function elimination
+            p_eprint_str("[ccompile] Optimizing IR...\n");
+            var opt_count: i64 = IrModule_optimize(&mut module);
+            var t_codegen: i64 = p_clock_now_ms();
+            p_eprint_str("[prof] optimize: ");
+            p_eprint_str(int_to_str(t_codegen - t_opt));
+            p_eprint_str("ms (");
+            p_eprint_str(int_to_str(opt_count));
+            p_eprint_str(" folds+removes)\n");
+            // Store in incremental cache for future invocations
+            global_cache_store(source_path, src_hash, module);
             p_eprint_str("[ccompile] Generating C code...\n");
             var cg: CCodeGen = CCodeGen_new();
             var c_code: str = CCodeGen_generate(&mut cg, module);
+            var t_cg_end: i64 = p_clock_now_ms();
+            p_eprint_str("[prof] codegen: ");
+            p_eprint_str(int_to_str(t_cg_end - t_codegen));
+            p_eprint_str("ms\n");
             p_eprint_str("[ccompile] C codegen done.\n");
             return ResultStr::Ok(c_code);
         }
@@ -1738,6 +1875,20 @@ pub fn c_str_vec_contains(vec: Vec<str>, s: str) -> bool {
     var i: i64 = 0;
     while i < vec.len() {
         if str_equal(vec.get(i), s) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Fast contains check using pointer equality (==) instead of str_equal.
+/// Only safe to use when all strings in the vec AND the search string are
+/// interned (i.e., produced by Lexer_intern or from the same str_slice).
+/// This is O(n) but each comparison is a single i64 == instead of a
+/// function call + byte-by-byte comparison.
+pub fn c_str_vec_contains_ptr(vec: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < vec.len() {
+        if vec.get(i) == s { return true; }
         i = i + 1;
     }
     return false;

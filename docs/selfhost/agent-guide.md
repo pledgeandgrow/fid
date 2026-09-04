@@ -50,11 +50,15 @@ These files can break the entire compiler or silently corrupt output:
 | `compiler/lower.fd` | SRET, enum layout, match, try, defer, effects, calling conventions |
 | `compiler/ir.fd` | Core IR types; changes ripple to all backends |
 | `compiler/codegen_c.fd` | ABI, struct copy, SRET, C type mapping |
+| `compiler/pe.fd` | PE emitter — x86-64 instruction encoding, ModRM/SIB bytes, REX prefixes, PE file format. Off-by-one = corrupt .exe. Must mirror `src/pe.rs`. |
+| `compiler/peephole.fd` | 9 peephole passes — a wrong transform silently corrupts all output. Must mirror `src/peephole.rs`. (session 8, not yet integrated) |
+| `compiler/regalloc.fd` | Linear scan register allocator — any change affects EVERY function. Must mirror `src/regalloc.rs`. (session 8, not yet integrated) |
+| `compiler/codegen_x64.fd` | PIR L3 → x86-64 instruction encoding, ModRM/SIB bytes, REX prefixes, ABI rules. Must mirror `src/codegen_x64.rs`. (session 8, not yet integrated) |
 | `compiler/parser.fd` | Recursive descent; subtle parse changes |
 | `compiler/ast.fd` | Canonical AST; if you add/remove variants, update `lower.fd` `box_*_unbox` and `codegen_c.fd` |
 | `compiler/compiler.fd` | Pipeline driver; import resolution is fragile |
 
-For the Rust reference compiler, also treat `src/lower.rs`, `src/codegen_c.rs`, `src/pir.rs`, `src/regalloc.rs`, and `src/peephole.rs` as high-risk.
+For the Rust reference compiler, also treat `src/lower.rs`, `src/codegen_c.rs`, `src/pir.rs`, `src/regalloc.rs`, `src/peephole.rs`, `src/codegen_x64.rs`, and `src/pe.rs` as high-risk.
 
 ---
 
@@ -88,6 +92,10 @@ If you are fixing a bug, write a failing test or run the existing one:
 # For the self-hosted compiler, rebuild and run
 .\build-selfhost.ps1
 .\release\fides-c.exe run tests/<name>.fd
+
+# For the PE emitter (native codegen, no tcc)
+.\release\fides-c.exe build tests/hello_pe.fd -o release/hello_pe.exe
+.\release\hello_pe.exe
 ```
 
 ### Step 4: Run the full suites
@@ -145,6 +153,24 @@ Check:
 - `box_expr_unbox` matches the canonical `ast.fd` `Expr` enum.
 - SRET is used for `ParseResult*` returns.
 - Enum variant extraction is not truncating payloads.
+
+### If the crash is in the PE emitter (`pe.fd`)
+
+Check:
+- **ModRM byte encoding** — `mod=3` for register-register ops, `mod=0` for
+  memory. A wrong `mod` field generates a memory store instead of a register
+  load (or vice versa). Compare with `src/pe.rs`.
+- **Call targets** — verify rip-relative call offsets resolve to the correct
+  function labels. Use PowerShell to read the PE bytes and decode `E8` (CALL)
+  instructions.
+- **Missing statements** — the Fides compiler silently drops statements in
+  long functions. If a function call is missing from the generated C, split
+  the source function into smaller helpers.
+- **Print type dispatch** — `Inst::Print` must dispatch by IR type (Ptr→str,
+  F64→float, Bool→bool, default→int). Calling `p_print_int` with a string
+  pointer crashes.
+- **Binary output** — `p_file_write` truncates at null bytes. PE files must
+  be hex-encoded and decoded via PowerShell.
 
 ---
 
@@ -240,9 +266,10 @@ If you discover new information about the self-hosted compiler, update these
 files:
 
 - `CURRENT.md` — current focus and blocker
-- `docs/roadmap/selfhost-roadmap.md` — phase status and known tasks
+- `docs/roadmap/selfhost-roadmap.md` — phase status and known tasks (SH-13 for PE emitter)
 - `docs/selfhost/known-bugs.md` — new bugs or gotchas
 - `docs/selfhost/calling-conventions.md` — new low-level conventions
+- `docs/selfhost/architecture.md` — new modules or pipeline changes
 
 Do **not** create new files for every small note. Prefer appending to the
 existing files in `docs/selfhost/`.

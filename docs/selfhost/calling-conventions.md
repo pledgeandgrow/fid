@@ -437,3 +437,77 @@ foo(result, (void*)0, 42);
 - Non-pointer → struct pointer cast to `(void*)` (for SRET calls).
 
 Always verify the cast is safe. A missing cast causes C compiler warnings or incorrect code.
+
+---
+
+## 12. PE Emitter Calling Conventions (session 5)
+
+The PE emitter (`compiler/pe.fd`) generates x86-64 machine code directly,
+bypassing C entirely. It uses the Windows x64 calling convention:
+
+### Register usage
+
+| Register | Role |
+|----------|------|
+| RCX | 1st argument |
+| RDX | 2nd argument |
+| R8 | 3rd argument |
+| R9 | 4th argument |
+| RAX | Return value |
+| RSP | Stack pointer (16-byte aligned before calls) |
+| RBP | Frame pointer (base for local variables) |
+
+### Stack frame layout
+
+```
+[higher addresses]
+  saved RBP          ← RBP points here
+  local var (-8)     ← [rbp - 8]
+  local var (-16)    ← [rbp - 16]
+  local var (-24)    ← [rbp - 24]
+  ...
+  shadow space (32)  ← for WinAPI calls
+[lower addresses]    ← RSP points here
+```
+
+### Function prologue/epilogue
+
+```asm
+; prologue
+push rbp
+mov rbp, rsp
+sub rsp, <frame_size>
+
+; epilogue
+mov rsp, rbp
+pop rbp
+ret
+```
+
+### Windows API calls
+
+The PE emitter imports `GetStdHandle`, `WriteFile`, and `ExitProcess` via
+the Import Address Table (IAT). Calls use `call [rip + offset]` (rip-relative
+addressing). Shadow space (32 bytes) is allocated on the stack before each
+call and freed after.
+
+### Runtime stubs
+
+The PE emitter generates these runtime stubs inline:
+- `p_print_str` — strlen loop + GetStdHandle(-11) + WriteFile to stdout
+- `p_print_int` — itoa + WriteFile
+- `p_print_float` — dtoa + WriteFile
+- `p_print_bool` — "true"/"false" + WriteFile
+- `p_panic` — ExitProcess(1)
+
+### String literals
+
+String literals are stored in the `.rdata` section. They are accessed via
+rip-relative `lea` instructions. The `PeCodeGen` struct maintains a list of
+string constants and their offsets.
+
+### Binary output
+
+PE files are binary data containing null bytes. Since `p_file_write` truncates
+at null bytes, the PE emitter hex-encodes the binary data and writes it as a
+hex string. PowerShell then decodes the hex file to binary.

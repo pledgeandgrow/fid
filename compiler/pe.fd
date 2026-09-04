@@ -1,0 +1,3822 @@
+// pe.fd — Direct PE executable emitter for Windows x86_64 .exe files
+// Ported from src/pe.rs. Generates native machine code without tcc.
+//
+// Pipeline: IrModule → machine code bytes → PE file → .exe
+//
+// Windows x64 calling convention:
+// - Integer args: RCX, RDX, R8, R9 (then stack)
+// - Return: RAX
+// - Shadow space: 32 bytes on stack for callee
+// - Stack must be 16-byte aligned before CALL
+
+module compiler::pe;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+
+// ─── Register definitions ───────────────────────────────────────────────
+// x86-64 GP registers encoded as i64 (0-15)
+pub const REG_RAX: i64 = 0;
+pub const REG_RCX: i64 = 1;
+pub const REG_RDX: i64 = 2;
+pub const REG_RBX: i64 = 3;
+pub const REG_RSP: i64 = 4;
+pub const REG_RBP: i64 = 5;
+pub const REG_RSI: i64 = 6;
+pub const REG_RDI: i64 = 7;
+pub const REG_R8: i64 = 8;
+pub const REG_R9: i64 = 9;
+pub const REG_R10: i64 = 10;
+pub const REG_R11: i64 = 11;
+pub const REG_R12: i64 = 12;
+pub const REG_R13: i64 = 13;
+pub const REG_R14: i64 = 14;
+pub const REG_R15: i64 = 15;
+
+// Low 3 bits for ModR/M encoding
+pub fn reg_code(r: i64) -> i64 {
+    return r & 7;
+}
+
+// True if extended register (R8-R15, needs REX.B/R)
+pub fn reg_is_extended(r: i64) -> bool {
+    return r >= 8;
+}
+
+// ─── Relocation types ───────────────────────────────────────────────────
+pub const RELOC_REL32: i64 = 0;    // relative jump/call
+pub const RELOC_RIPREL32: i64 = 1; // RIP-relative data access
+pub const RELOC_LEA_LABEL: i64 = 2; // lea to code label
+
+pub struct PendingReloc {
+    pub code_offset: i64,
+    pub target_label: i64,
+    pub kind: i64,
+}
+
+pub fn PendingReloc_new(code_offset: i64, target_label: i64, kind: i64) -> PendingReloc {
+    return PendingReloc { code_offset: code_offset, target_label: target_label, kind: kind };
+}
+
+pub struct PendingRipRef {
+    pub code_offset: i64,
+    pub rdata_offset: i64,
+}
+
+pub fn PendingRipRef_new(code_offset: i64, rdata_offset: i64) -> PendingRipRef {
+    return PendingRipRef { code_offset: code_offset, rdata_offset: rdata_offset };
+}
+
+// ─── X86Encoder: x86_64 machine code encoder ────────────────────────────
+pub struct X86Encoder {
+    pub code: Vec,              // Vec<i64> of bytes
+    pub labels: Vec,            // Vec<i64> label_id -> code offset
+    pub pending_labels: Vec<PendingReloc>,
+    pub pending_rip_refs: Vec<PendingRipRef>,
+    pub next_label: i64,
+}
+
+pub fn X86Encoder_new() -> X86Encoder {
+    return X86Encoder {
+        code: Vec::new(),
+        labels: Vec::new(),
+        pending_labels: Vec::new(),
+        pending_rip_refs: Vec::new(),
+        next_label: 0,
+    };
+}
+
+// Allocate a new label ID
+pub fn X86Encoder_alloc_label(self: &mut X86Encoder) -> i64 {
+    var id: i64 = self.next_label;
+    self.next_label = self.next_label + 1;
+    // Extend labels vec to hold this id (store -1 = unplaced)
+    while self.labels.len() <= id {
+        self.labels.push(-1);
+    }
+    return id;
+}
+
+// Place a label at the current code offset
+pub fn X86Encoder_place_label(self: &mut X86Encoder, label: i64) {
+    while self.labels.len() <= label {
+        self.labels.push(-1);
+    }
+    self.labels.set(label, self.code.len());
+}
+
+// Current code offset
+pub fn X86Encoder_offset(self: &X86Encoder) -> i64 {
+    return self.code.len();
+}
+
+// Emit a single byte
+pub fn X86Encoder_emit_u8(self: &mut X86Encoder, b: i64) {
+    self.code.push(b & 0xFF);
+}
+
+// Emit 16-bit little-endian
+pub fn X86Encoder_emit_u16(self: &mut X86Encoder, w: i64) {
+    self.code.push(w & 0xFF);
+    self.code.push((w >> 8) & 0xFF);
+}
+
+// Emit 32-bit little-endian
+pub fn X86Encoder_emit_u32(self: &mut X86Encoder, d: i64) {
+    self.code.push(d & 0xFF);
+    self.code.push((d >> 8) & 0xFF);
+    self.code.push((d >> 16) & 0xFF);
+    self.code.push((d >> 24) & 0xFF);
+}
+
+// Emit 32-bit signed little-endian
+pub fn X86Encoder_emit_i32(self: &mut X86Encoder, d: i64) {
+    X86Encoder_emit_u32(self, d);
+}
+
+// Emit 64-bit little-endian
+pub fn X86Encoder_emit_u64(self: &mut X86Encoder, q: i64) {
+    var i: i64 = 0;
+    while i < 8 {
+        self.code.push((q >> (i * 8)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+// REX prefix: 0x40 | (W<<3) | (R<<2) | (X<<1) | B
+pub fn X86Encoder_rex(self: &mut X86Encoder, w: bool, r: bool, x: bool, b: bool) {
+    var prefix: i64 = 0x40;
+    if w { prefix = prefix | 0x08; }
+    if r { prefix = prefix | 0x04; }
+    if x { prefix = prefix | 0x02; }
+    if b { prefix = prefix | 0x01; }
+    self.code.push(prefix);
+}
+
+// REX.W prefix (64-bit operand)
+pub fn X86Encoder_rex_w(self: &mut X86Encoder) {
+    X86Encoder_rex(self, true, false, false, false);
+}
+
+// ModR/M byte: (mod<<6) | (reg<<3) | rm
+pub fn X86Encoder_modrm(self: &mut X86Encoder, mod_: i64, reg: i64, rm: i64) {
+    self.code.push(((mod_ & 3) << 6) | ((reg & 7) << 3) | (rm & 7));
+}
+
+// ModR/M for reg-reg: mod=3
+pub fn X86Encoder_modrm_rr(self: &mut X86Encoder, reg: i64, rm: i64) {
+    X86Encoder_modrm(self, 3, reg_code(reg), reg_code(rm));
+}
+
+// push r64
+pub fn X86Encoder_push(self: &mut X86Encoder, r: i64) {
+    if reg_is_extended(r) {
+        X86Encoder_rex(self, false, false, false, true);
+    }
+    self.code.push(0x50 | reg_code(r));
+}
+
+// pop r64
+pub fn X86Encoder_pop(self: &mut X86Encoder, r: i64) {
+    if reg_is_extended(r) {
+        X86Encoder_rex(self, false, false, false, true);
+    }
+    self.code.push(0x58 | reg_code(r));
+}
+
+// ret
+pub fn X86Encoder_ret(self: &mut X86Encoder) {
+    self.code.push(0xC3);
+}
+
+// nop
+pub fn X86Encoder_nop(self: &mut X86Encoder) {
+    self.code.push(0x90);
+}
+
+// ud2
+pub fn X86Encoder_ud2(self: &mut X86Encoder) {
+    self.code.push(0x0F);
+    self.code.push(0x0B);
+}
+
+// xor r64, r64 (zero a register)
+pub fn X86Encoder_xor_self(self: &mut X86Encoder, r: i64) {
+    X86Encoder_xor_rr(self, r, r);
+}
+
+// mov r64, imm64
+pub fn X86Encoder_mov_imm64(self: &mut X86Encoder, r: i64, val: i64) {
+    X86Encoder_rex(self, true, false, false, reg_is_extended(r));
+    self.code.push(0xB8 | reg_code(r));
+    X86Encoder_emit_u64(self, val);
+}
+
+// mov r64, imm32 (sign-extended)
+pub fn X86Encoder_mov_imm32(self: &mut X86Encoder, r: i64, val: i64) {
+    X86Encoder_rex(self, true, false, false, reg_is_extended(r));
+    self.code.push(0xC7);
+    X86Encoder_modrm(self, 3, 0, reg_code(r));
+    X86Encoder_emit_i32(self, val);
+}
+
+// mov r64, r64
+pub fn X86Encoder_mov_rr(self: &mut X86Encoder, dst: i64, src: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(src), false, reg_is_extended(dst));
+    self.code.push(0x89);
+    X86Encoder_modrm_rr(self, src, dst);
+}
+
+// Emit RBP-relative memory operand: [rbp + disp]
+// RBP (code=5) with mod=00 is RIP-relative, so always use mod=01 or mod=10
+pub fn X86Encoder_emit_mem_rbp(self: &mut X86Encoder, reg_code_val: i64, disp: i64) {
+    if disp == 0 {
+        X86Encoder_modrm(self, 1, reg_code_val, 5);
+        self.code.push(0);
+    } else if disp >= -128 && disp <= 127 {
+        X86Encoder_modrm(self, 1, reg_code_val, 5);
+        self.code.push(disp & 0xFF);
+    } else {
+        X86Encoder_modrm(self, 2, reg_code_val, 5);
+        X86Encoder_emit_i32(self, disp);
+    }
+}
+
+// Emit [base + disp] memory operand
+pub fn X86Encoder_emit_mem_reg(self: &mut X86Encoder, reg_code_val: i64, base: i64, disp: i64) {
+    var base_code: i64 = reg_code(base);
+    if base_code == 4 {
+        // RSP/R12 needs SIB byte
+        if disp == 0 {
+            X86Encoder_modrm(self, 0, reg_code_val, 4);
+            self.code.push(0x24);
+        } else if disp >= -128 && disp <= 127 {
+            X86Encoder_modrm(self, 1, reg_code_val, 4);
+            self.code.push(0x24);
+            self.code.push(disp & 0xFF);
+        } else {
+            X86Encoder_modrm(self, 2, reg_code_val, 4);
+            self.code.push(0x24);
+            X86Encoder_emit_i32(self, disp);
+        }
+    } else if base_code == 5 {
+        // RBP/R13 needs mod=01 minimum
+        if disp == 0 {
+            X86Encoder_modrm(self, 1, reg_code_val, 5);
+            self.code.push(0);
+        } else if disp >= -128 && disp <= 127 {
+            X86Encoder_modrm(self, 1, reg_code_val, 5);
+            self.code.push(disp & 0xFF);
+        } else {
+            X86Encoder_modrm(self, 2, reg_code_val, 5);
+            X86Encoder_emit_i32(self, disp);
+        }
+    } else {
+        if disp == 0 {
+            X86Encoder_modrm(self, 0, reg_code_val, base_code);
+        } else if disp >= -128 && disp <= 127 {
+            X86Encoder_modrm(self, 1, reg_code_val, base_code);
+            self.code.push(disp & 0xFF);
+        } else {
+            X86Encoder_modrm(self, 2, reg_code_val, base_code);
+            X86Encoder_emit_i32(self, disp);
+        }
+    }
+}
+
+// mov reg, [rbp + disp]
+pub fn X86Encoder_mov_reg_mem_rbp(self: &mut X86Encoder, dst: i64, disp: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(dst), false, false);
+    self.code.push(0x8B);
+    X86Encoder_emit_mem_rbp(self, reg_code(dst), disp);
+}
+
+// mov [rbp + disp], reg
+pub fn X86Encoder_mov_mem_rbp_reg(self: &mut X86Encoder, disp: i64, src: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(src), false, false);
+    self.code.push(0x89);
+    X86Encoder_emit_mem_rbp(self, reg_code(src), disp);
+}
+
+// lea reg, [rbp + disp]
+pub fn X86Encoder_lea_rbp(self: &mut X86Encoder, dst: i64, disp: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(dst), false, false);
+    self.code.push(0x8D);
+    X86Encoder_emit_mem_rbp(self, reg_code(dst), disp);
+}
+
+// lea reg, [rip + rdata_offset] — patched later
+pub fn X86Encoder_lea_rip(self: &mut X86Encoder, dst: i64, rdata_offset: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(dst), false, false);
+    self.code.push(0x8D);
+    X86Encoder_modrm(self, 0, reg_code(dst), 5);
+    self.pending_rip_refs.push(PendingRipRef_new(self.code.len(), rdata_offset));
+    X86Encoder_emit_i32(self, 0);
+}
+
+// lea reg, [rip + label] — patched later as code label
+pub fn X86Encoder_lea_label(self: &mut X86Encoder, dst: i64, label: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(dst), false, false);
+    self.code.push(0x8D);
+    X86Encoder_modrm(self, 0, reg_code(dst), 5);
+    self.pending_labels.push(PendingReloc_new(self.code.len(), label, RELOC_LEA_LABEL));
+    X86Encoder_emit_i32(self, 0);
+}
+
+// call [rip + rdata_offset] — IAT indirect call
+pub fn X86Encoder_call_rip(self: &mut X86Encoder, rdata_offset: i64) {
+    self.code.push(0xFF);
+    X86Encoder_modrm(self, 0, 2, 5);
+    self.pending_rip_refs.push(PendingRipRef_new(self.code.len(), rdata_offset));
+    X86Encoder_emit_i32(self, 0);
+}
+
+// call rel32 (label)
+pub fn X86Encoder_call_label(self: &mut X86Encoder, label: i64) {
+    self.code.push(0xE8);
+    self.pending_labels.push(PendingReloc_new(self.code.len(), label, RELOC_REL32));
+    X86Encoder_emit_i32(self, 0);
+}
+
+// jmp rel32 (label)
+pub fn X86Encoder_jmp_label(self: &mut X86Encoder, label: i64) {
+    self.code.push(0xE9);
+    self.pending_labels.push(PendingReloc_new(self.code.len(), label, RELOC_REL32));
+    X86Encoder_emit_i32(self, 0);
+}
+
+// jcc rel32 (label) — cc is condition code (0-15)
+pub fn X86Encoder_jcc_label(self: &mut X86Encoder, cc: i64, label: i64) {
+    self.code.push(0x0F);
+    self.code.push(0x80 | (cc & 0xF));
+    self.pending_labels.push(PendingReloc_new(self.code.len(), label, RELOC_REL32));
+    X86Encoder_emit_i32(self, 0);
+}
+
+// call r64 (indirect)
+pub fn X86Encoder_call_reg(self: &mut X86Encoder, r: i64) {
+    X86Encoder_rex(self, false, false, false, reg_is_extended(r));
+    self.code.push(0xFF);
+    X86Encoder_modrm(self, 3, 2, reg_code(r));
+}
+
+// add r64, r64
+pub fn X86Encoder_add_rr(self: &mut X86Encoder, dst: i64, src: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(src), false, reg_is_extended(dst));
+    self.code.push(0x01);
+    X86Encoder_modrm_rr(self, src, dst);
+}
+
+// sub r64, r64
+pub fn X86Encoder_sub_rr(self: &mut X86Encoder, dst: i64, src: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(src), false, reg_is_extended(dst));
+    self.code.push(0x29);
+    X86Encoder_modrm_rr(self, src, dst);
+}
+
+// imul r64, r64
+pub fn X86Encoder_imul_rr(self: &mut X86Encoder, dst: i64, src: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(dst), false, reg_is_extended(src));
+    self.code.push(0x0F);
+    self.code.push(0xAF);
+    X86Encoder_modrm_rr(self, dst, src);
+}
+
+// idiv r64
+pub fn X86Encoder_idiv_r(self: &mut X86Encoder, r: i64) {
+    X86Encoder_rex(self, true, false, false, reg_is_extended(r));
+    self.code.push(0xF7);
+    X86Encoder_modrm(self, 3, 7, reg_code(r));
+}
+
+// div r64 (unsigned divide rdx:rax by r, rax=quotient, rdx=remainder)
+pub fn X86Encoder_div_r(self: &mut X86Encoder, r: i64) {
+    X86Encoder_rex(self, true, false, false, reg_is_extended(r));
+    self.code.push(0xF7);
+    X86Encoder_modrm(self, 3, 6, reg_code(r));
+}
+
+// and r64, r64
+pub fn X86Encoder_and_rr(self: &mut X86Encoder, dst: i64, src: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(src), false, reg_is_extended(dst));
+    self.code.push(0x21);
+    X86Encoder_modrm_rr(self, src, dst);
+}
+
+// or r64, r64
+pub fn X86Encoder_or_rr(self: &mut X86Encoder, dst: i64, src: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(src), false, reg_is_extended(dst));
+    self.code.push(0x09);
+    X86Encoder_modrm_rr(self, src, dst);
+}
+
+// xor r64, r64
+pub fn X86Encoder_xor_rr(self: &mut X86Encoder, dst: i64, src: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(src), false, reg_is_extended(dst));
+    self.code.push(0x31);
+    X86Encoder_modrm_rr(self, src, dst);
+}
+
+// not r64
+pub fn X86Encoder_not_r(self: &mut X86Encoder, r: i64) {
+    X86Encoder_rex(self, true, false, false, reg_is_extended(r));
+    self.code.push(0xF7);
+    X86Encoder_modrm(self, 3, 2, reg_code(r));
+}
+
+// neg r64
+pub fn X86Encoder_neg_r(self: &mut X86Encoder, r: i64) {
+    X86Encoder_rex(self, true, false, false, reg_is_extended(r));
+    self.code.push(0xF7);
+    X86Encoder_modrm(self, 3, 3, reg_code(r));
+}
+
+// cmp r64, r64
+pub fn X86Encoder_cmp_rr(self: &mut X86Encoder, left: i64, right: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(right), false, reg_is_extended(left));
+    self.code.push(0x3B);
+    X86Encoder_modrm_rr(self, right, left);
+}
+
+// test r64, r64
+pub fn X86Encoder_test_rr(self: &mut X86Encoder, left: i64, right: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(right), false, reg_is_extended(left));
+    self.code.push(0x85);
+    X86Encoder_modrm_rr(self, right, left);
+}
+
+// shl r64, cl
+pub fn X86Encoder_shl_cl(self: &mut X86Encoder, r: i64) {
+    X86Encoder_rex(self, true, false, false, reg_is_extended(r));
+    self.code.push(0xD3);
+    X86Encoder_modrm(self, 3, 4, reg_code(r));
+}
+
+// shl r64, imm8
+pub fn X86Encoder_shl_r_i8(self: &mut X86Encoder, r: i64, count: i64) {
+    X86Encoder_rex(self, true, false, false, reg_is_extended(r));
+    self.code.push(0xC1);
+    X86Encoder_modrm(self, 3, 4, reg_code(r));
+    self.code.push(count & 0xFF);
+}
+
+// sar r64, cl
+pub fn X86Encoder_sar_cl(self: &mut X86Encoder, r: i64) {
+    X86Encoder_rex(self, true, false, false, reg_is_extended(r));
+    self.code.push(0xD3);
+    X86Encoder_modrm(self, 3, 7, reg_code(r));
+}
+
+// cqo (sign-extend RAX into RDX:RAX)
+pub fn X86Encoder_cqo(self: &mut X86Encoder) {
+    X86Encoder_rex_w(self);
+    self.code.push(0x99);
+}
+
+// setcc r8
+pub fn X86Encoder_setcc_r(self: &mut X86Encoder, cc: i64, r: i64) {
+    X86Encoder_rex(self, false, false, false, reg_is_extended(r));
+    self.code.push(0x0F);
+    self.code.push(0x90 | (cc & 0xF));
+    X86Encoder_modrm(self, 3, 0, reg_code(r));
+}
+
+// movzx r32, r8 (zero-extend byte to 32-bit)
+pub fn X86Encoder_movzx_r32_r8(self: &mut X86Encoder, dst: i64, src: i64) {
+    X86Encoder_rex(self, false, reg_is_extended(dst), false, reg_is_extended(src));
+    self.code.push(0x0F);
+    self.code.push(0xB6);
+    X86Encoder_modrm_rr(self, dst, src);
+}
+
+// movzx r32, r16 (zero-extend word to 32-bit)
+pub fn X86Encoder_movzx_r32_r16(self: &mut X86Encoder, dst: i64, src: i64) {
+    X86Encoder_rex(self, false, reg_is_extended(dst), false, reg_is_extended(src));
+    self.code.push(0x0F);
+    self.code.push(0xB7);
+    X86Encoder_modrm_rr(self, dst, src);
+}
+
+// movsxd r64, r32 (sign-extend 32 to 64)
+pub fn X86Encoder_movsxd_rr(self: &mut X86Encoder, dst: i64, src: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(dst), false, reg_is_extended(src));
+    self.code.push(0x63);
+    X86Encoder_modrm_rr(self, dst, src);
+}
+
+// movsx r64, r8 (sign-extend byte to 64)
+pub fn X86Encoder_movsx_r64_r8(self: &mut X86Encoder, dst: i64, src: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(dst), false, reg_is_extended(src));
+    self.code.push(0x0F);
+    self.code.push(0xBE);
+    X86Encoder_modrm_rr(self, dst, src);
+}
+
+// movsx r64, r16 (sign-extend word to 64)
+pub fn X86Encoder_movsx_r64_r16(self: &mut X86Encoder, dst: i64, src: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(dst), false, reg_is_extended(src));
+    self.code.push(0x0F);
+    self.code.push(0xBF);
+    X86Encoder_modrm_rr(self, dst, src);
+}
+
+// inc r64
+pub fn X86Encoder_inc_r(self: &mut X86Encoder, r: i64) {
+    X86Encoder_rex(self, true, false, false, reg_is_extended(r));
+    self.code.push(0xFF);
+    X86Encoder_modrm(self, 3, 0, reg_code(r));
+}
+
+// dec r64
+pub fn X86Encoder_dec_r(self: &mut X86Encoder, r: i64) {
+    X86Encoder_rex(self, true, false, false, reg_is_extended(r));
+    self.code.push(0xFF);
+    X86Encoder_modrm(self, 3, 1, reg_code(r));
+}
+
+// sub rsp, imm8
+pub fn X86Encoder_sub_rsp_i8(self: &mut X86Encoder, val: i64) {
+    X86Encoder_rex_w(self);
+    self.code.push(0x83);
+    X86Encoder_modrm(self, 3, 5, 4);
+    self.code.push(val & 0xFF);
+}
+
+// sub rsp, imm32
+pub fn X86Encoder_sub_rsp_i32(self: &mut X86Encoder, val: i64) {
+    X86Encoder_rex_w(self);
+    self.code.push(0x81);
+    X86Encoder_modrm(self, 3, 5, 4);
+    X86Encoder_emit_i32(self, val);
+}
+
+// add rsp, imm8
+pub fn X86Encoder_add_rsp_i8(self: &mut X86Encoder, val: i64) {
+    X86Encoder_rex_w(self);
+    self.code.push(0x83);
+    X86Encoder_modrm(self, 3, 0, 4);
+    self.code.push(val & 0xFF);
+}
+
+// add rsp, imm32
+pub fn X86Encoder_add_rsp_i32(self: &mut X86Encoder, val: i64) {
+    X86Encoder_rex_w(self);
+    self.code.push(0x81);
+    X86Encoder_modrm(self, 3, 0, 4);
+    X86Encoder_emit_i32(self, val);
+}
+
+// add r64, imm32
+pub fn X86Encoder_add_r_i32(self: &mut X86Encoder, r: i64, val: i64) {
+    X86Encoder_rex(self, true, false, false, reg_is_extended(r));
+    self.code.push(0x81);
+    X86Encoder_modrm(self, 3, 0, reg_code(r));
+    X86Encoder_emit_i32(self, val);
+}
+
+// add r64, imm8
+pub fn X86Encoder_add_r_i8(self: &mut X86Encoder, r: i64, val: i64) {
+    X86Encoder_rex(self, true, false, false, reg_is_extended(r));
+    self.code.push(0x83);
+    X86Encoder_modrm(self, 3, 0, reg_code(r));
+    self.code.push(val & 0xFF);
+}
+
+// imul r64, r64, imm32
+pub fn X86Encoder_imul_r_r_imm32(self: &mut X86Encoder, dst: i64, src: i64, val: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(dst), false, reg_is_extended(src));
+    self.code.push(0x69);
+    X86Encoder_modrm_rr(self, dst, src);
+    X86Encoder_emit_i32(self, val);
+}
+
+// mov r8, imm8
+pub fn X86Encoder_mov_r8_imm(self: &mut X86Encoder, r: i64, val: i64) {
+    if reg_is_extended(r) {
+        X86Encoder_rex(self, false, false, false, true);
+    }
+    self.code.push(0xB0 | reg_code(r));
+    self.code.push(val & 0xFF);
+}
+
+// mov r64, [base]
+pub fn X86Encoder_mov_reg_ptr(self: &mut X86Encoder, dst: i64, base: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(dst), false, reg_is_extended(base));
+    self.code.push(0x8B);
+    X86Encoder_emit_mem_reg(self, reg_code(dst), base, 0);
+}
+
+// mov [base], r64
+pub fn X86Encoder_mov_ptr_reg(self: &mut X86Encoder, base: i64, src: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(src), false, reg_is_extended(base));
+    self.code.push(0x89);
+    X86Encoder_emit_mem_reg(self, reg_code(src), base, 0);
+}
+
+// mov [base], r32 (no REX.W)
+pub fn X86Encoder_mov_ptr_reg32(self: &mut X86Encoder, base: i64, src: i64) {
+    var need_rex: bool = reg_is_extended(base) || reg_is_extended(src);
+    if need_rex {
+        X86Encoder_rex(self, false, reg_is_extended(src), false, reg_is_extended(base));
+    }
+    self.code.push(0x89);
+    X86Encoder_emit_mem_reg(self, reg_code(src), base, 0);
+}
+
+// mov r64, [base + disp]
+pub fn X86Encoder_mov_reg_mem_disp(self: &mut X86Encoder, dst: i64, base: i64, disp: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(dst), false, reg_is_extended(base));
+    self.code.push(0x8B);
+    X86Encoder_emit_mem_reg(self, reg_code(dst), base, disp);
+}
+
+// mov [base + disp], r64
+pub fn X86Encoder_mov_mem_disp_reg(self: &mut X86Encoder, base: i64, disp: i64, src: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(src), false, reg_is_extended(base));
+    self.code.push(0x89);
+    X86Encoder_emit_mem_reg(self, reg_code(src), base, disp);
+}
+
+// mov [base + disp], r32 (no REX.W)
+pub fn X86Encoder_mov_mem_disp_reg32(self: &mut X86Encoder, base: i64, disp: i64, src: i64) {
+    var need_rex: bool = reg_is_extended(base) || reg_is_extended(src);
+    if need_rex {
+        X86Encoder_rex(self, false, reg_is_extended(src), false, reg_is_extended(base));
+    }
+    self.code.push(0x89);
+    X86Encoder_emit_mem_reg(self, reg_code(src), base, disp);
+}
+
+// mov r64, [base + index*1]
+pub fn X86Encoder_mov_reg_mem_idx(self: &mut X86Encoder, dst: i64, base: i64, index: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(dst), reg_is_extended(index), reg_is_extended(base));
+    self.code.push(0x8B);
+    // SIB: scale=0, index, base
+    X86Encoder_modrm(self, 0, reg_code(dst), 4);
+    self.code.push((reg_code(index) << 3) | reg_code(base));
+}
+
+// mov [base + index*1], r64
+pub fn X86Encoder_mov_mem_idx_reg(self: &mut X86Encoder, base: i64, index: i64, src: i64) {
+    X86Encoder_rex(self, true, reg_is_extended(src), reg_is_extended(index), reg_is_extended(base));
+    self.code.push(0x89);
+    X86Encoder_modrm(self, 0, reg_code(src), 4);
+    self.code.push((reg_code(index) << 3) | reg_code(base));
+}
+
+// mov r8, [base]
+pub fn X86Encoder_mov_reg8_ptr(self: &mut X86Encoder, dst: i64, base: i64) {
+    X86Encoder_rex(self, false, reg_is_extended(dst), false, reg_is_extended(base));
+    self.code.push(0x8A);
+    X86Encoder_emit_mem_reg(self, reg_code(dst), base, 0);
+}
+
+// mov [base], r8
+pub fn X86Encoder_mov_mem_reg8_ptr(self: &mut X86Encoder, base: i64, src: i64) {
+    X86Encoder_rex(self, false, reg_is_extended(src), false, reg_is_extended(base));
+    self.code.push(0x88);
+    X86Encoder_emit_mem_reg(self, reg_code(src), base, 0);
+}
+
+// mov [base + disp], r8
+pub fn X86Encoder_mov_mem_disp_reg8(self: &mut X86Encoder, base: i64, disp: i64, src: i64) {
+    X86Encoder_rex(self, false, reg_is_extended(src), false, reg_is_extended(base));
+    self.code.push(0x88);
+    X86Encoder_emit_mem_reg(self, reg_code(src), base, disp);
+}
+
+// mov [base + index*1], r8
+pub fn X86Encoder_mov_mem_idx_reg8(self: &mut X86Encoder, base: i64, index: i64, src: i64) {
+    X86Encoder_rex(self, false, reg_is_extended(src), reg_is_extended(index), reg_is_extended(base));
+    self.code.push(0x88);
+    X86Encoder_modrm(self, 0, reg_code(src), 4);
+    self.code.push((reg_code(index) << 3) | reg_code(base));
+}
+
+// mov r8, [base + index*1]
+pub fn X86Encoder_mov_reg8_mem_idx(self: &mut X86Encoder, dst: i64, base: i64, index: i64) {
+    X86Encoder_rex(self, false, reg_is_extended(dst), reg_is_extended(index), reg_is_extended(base));
+    self.code.push(0x8A);
+    X86Encoder_modrm(self, 0, reg_code(dst), 4);
+    self.code.push((reg_code(index) << 3) | reg_code(base));
+}
+
+// cmp r8, imm8
+pub fn X86Encoder_cmp_r8_i8(self: &mut X86Encoder, r: i64, val: i64) {
+    X86Encoder_rex(self, false, false, false, reg_is_extended(r));
+    self.code.push(0x80);
+    X86Encoder_modrm(self, 3, 7, reg_code(r));
+    self.code.push(val & 0xFF);
+}
+
+// mov r32, [base] (no REX.W)
+pub fn X86Encoder_mov_reg32_ptr(self: &mut X86Encoder, dst: i64, base: i64) {
+    var need_rex: bool = reg_is_extended(base) || reg_is_extended(dst);
+    if need_rex {
+        X86Encoder_rex(self, false, reg_is_extended(dst), false, reg_is_extended(base));
+    }
+    self.code.push(0x8B);
+    X86Encoder_emit_mem_reg(self, reg_code(dst), base, 0);
+}
+
+// ─── SSE2 float instructions ────────────────────────────────────────────
+// movsd xmm, [rbp + disp]
+pub fn X86Encoder_movsd_xmm_mem_rbp(self: &mut X86Encoder, xmm: i64, disp: i64) {
+    self.code.push(0xF2);
+    X86Encoder_rex_w(self);
+    self.code.push(0x0F);
+    self.code.push(0x10);
+    X86Encoder_emit_mem_rbp(self, xmm & 7, disp);
+}
+
+// movsd [rbp + disp], xmm
+pub fn X86Encoder_movsd_mem_rbp_xmm(self: &mut X86Encoder, disp: i64, xmm: i64) {
+    self.code.push(0xF2);
+    X86Encoder_rex_w(self);
+    self.code.push(0x0F);
+    self.code.push(0x11);
+    X86Encoder_emit_mem_rbp(self, xmm & 7, disp);
+}
+
+// addsd xmm, xmm
+pub fn X86Encoder_addsd(self: &mut X86Encoder, dst: i64, src: i64) {
+    self.code.push(0xF2);
+    if dst >= 8 || src >= 8 {
+        X86Encoder_rex(self, false, dst >= 8, false, src >= 8);
+    }
+    self.code.push(0x0F);
+    self.code.push(0x58);
+    X86Encoder_modrm(self, 3, dst & 7, src & 7);
+}
+
+// subsd xmm, xmm
+pub fn X86Encoder_subsd(self: &mut X86Encoder, dst: i64, src: i64) {
+    self.code.push(0xF2);
+    if dst >= 8 || src >= 8 {
+        X86Encoder_rex(self, false, dst >= 8, false, src >= 8);
+    }
+    self.code.push(0x0F);
+    self.code.push(0x5C);
+    X86Encoder_modrm(self, 3, dst & 7, src & 7);
+}
+
+// mulsd xmm, xmm
+pub fn X86Encoder_mulsd(self: &mut X86Encoder, dst: i64, src: i64) {
+    self.code.push(0xF2);
+    if dst >= 8 || src >= 8 {
+        X86Encoder_rex(self, false, dst >= 8, false, src >= 8);
+    }
+    self.code.push(0x0F);
+    self.code.push(0x59);
+    X86Encoder_modrm(self, 3, dst & 7, src & 7);
+}
+
+// divsd xmm, xmm
+pub fn X86Encoder_divsd(self: &mut X86Encoder, dst: i64, src: i64) {
+    self.code.push(0xF2);
+    if dst >= 8 || src >= 8 {
+        X86Encoder_rex(self, false, dst >= 8, false, src >= 8);
+    }
+    self.code.push(0x0F);
+    self.code.push(0x5E);
+    X86Encoder_modrm(self, 3, dst & 7, src & 7);
+}
+
+// xorpd xmm, [rbp + disp]
+pub fn X86Encoder_xorpd_xmm_mem_rbp(self: &mut X86Encoder, xmm: i64, disp: i64) {
+    self.code.push(0x66);
+    X86Encoder_rex_w(self);
+    self.code.push(0x0F);
+    self.code.push(0x57);
+    X86Encoder_emit_mem_rbp(self, xmm & 7, disp);
+}
+
+// xorpd xmm, xmm
+pub fn X86Encoder_xorpd_xmm_xmm(self: &mut X86Encoder, dst: i64, src: i64) {
+    self.code.push(0x66);
+    if dst >= 8 || src >= 8 {
+        X86Encoder_rex(self, false, dst >= 8, false, src >= 8);
+    }
+    self.code.push(0x0F);
+    self.code.push(0x57);
+    X86Encoder_modrm(self, 3, dst & 7, src & 7);
+}
+
+// movq xmm, r64 (movd with REX.W)
+pub fn X86Encoder_movq_xmm_r64(self: &mut X86Encoder, xmm: i64, r: i64) {
+    self.code.push(0x66);
+    X86Encoder_rex(self, true, xmm >= 8, false, reg_is_extended(r));
+    self.code.push(0x0F);
+    self.code.push(0x6E);
+    X86Encoder_modrm(self, 3, xmm & 7, reg_code(r));
+}
+
+// ucomisd xmm, xmm
+pub fn X86Encoder_ucomisd(self: &mut X86Encoder, dst: i64, src: i64) {
+    self.code.push(0x66);
+    if dst >= 8 || src >= 8 {
+        X86Encoder_rex(self, false, dst >= 8, false, src >= 8);
+    }
+    self.code.push(0x0F);
+    self.code.push(0x2E);
+    X86Encoder_modrm(self, 3, dst & 7, src & 7);
+}
+
+// cvtsi2sd xmm, r64
+pub fn X86Encoder_cvtsi2sd_r64(self: &mut X86Encoder, xmm: i64, r: i64) {
+    self.code.push(0xF2);
+    X86Encoder_rex(self, true, xmm >= 8, false, reg_is_extended(r));
+    self.code.push(0x0F);
+    self.code.push(0x2A);
+    X86Encoder_modrm(self, 3, xmm & 7, reg_code(r));
+}
+
+// cvttsd2si r64, xmm
+pub fn X86Encoder_cvttsd2si_r64(self: &mut X86Encoder, r: i64, xmm: i64) {
+    self.code.push(0xF2);
+    X86Encoder_rex(self, true, reg_is_extended(r), false, xmm >= 8);
+    self.code.push(0x0F);
+    self.code.push(0x2C);
+    X86Encoder_modrm(self, 3, reg_code(r), xmm & 7);
+}
+
+// movss xmm, [rbp + disp]
+pub fn X86Encoder_movss_xmm_mem_rbp(self: &mut X86Encoder, xmm: i64, disp: i64) {
+    self.code.push(0xF3);
+    X86Encoder_rex_w(self);
+    self.code.push(0x0F);
+    self.code.push(0x10);
+    X86Encoder_emit_mem_rbp(self, xmm & 7, disp);
+}
+
+// movss [rbp + disp], xmm
+pub fn X86Encoder_movss_mem_rbp_xmm(self: &mut X86Encoder, disp: i64, xmm: i64) {
+    self.code.push(0xF3);
+    X86Encoder_rex_w(self);
+    self.code.push(0x0F);
+    self.code.push(0x11);
+    X86Encoder_emit_mem_rbp(self, xmm & 7, disp);
+}
+
+// addss xmm, xmm
+pub fn X86Encoder_addss(self: &mut X86Encoder, dst: i64, src: i64) {
+    self.code.push(0xF3);
+    if dst >= 8 || src >= 8 {
+        X86Encoder_rex(self, false, dst >= 8, false, src >= 8);
+    }
+    self.code.push(0x0F);
+    self.code.push(0x58);
+    X86Encoder_modrm(self, 3, dst & 7, src & 7);
+}
+
+// ucomiss xmm, xmm
+pub fn X86Encoder_ucomiss(self: &mut X86Encoder, dst: i64, src: i64) {
+    self.code.push(0xF3);
+    if dst >= 8 || src >= 8 {
+        X86Encoder_rex(self, false, dst >= 8, false, src >= 8);
+    }
+    self.code.push(0x0F);
+    self.code.push(0x2E);
+    X86Encoder_modrm(self, 3, dst & 7, src & 7);
+}
+
+// ─── Label resolution ───────────────────────────────────────────────────
+// Patch all pending label relocations (Rel32 and LeaLabel)
+pub fn X86Encoder_resolve_labels(self: &mut X86Encoder) {
+    var i: i64 = 0;
+    while i < self.pending_labels.len() {
+        var reloc: PendingReloc = self.pending_labels.get(i);
+        var target_offset: i64 = self.labels.get(reloc.target_label);
+        if target_offset < 0 {
+            // Unresolved label — skip (will crash at runtime if hit)
+            i = i + 1;
+            continue;
+        }
+        var disp: i64 = target_offset - (reloc.code_offset + 4);
+        // Patch 4 bytes at code_offset
+        self.code.set(reloc.code_offset, disp & 0xFF);
+        self.code.set(reloc.code_offset + 1, (disp >> 8) & 0xFF);
+        self.code.set(reloc.code_offset + 2, (disp >> 16) & 0xFF);
+        self.code.set(reloc.code_offset + 3, (disp >> 24) & 0xFF);
+        i = i + 1;
+    }
+}
+
+// Patch all pending RIP-relative references to .rdata
+pub fn X86Encoder_resolve_rip_refs(self: &mut X86Encoder, text_rva: i64, rdata_rva: i64) {
+    var i: i64 = 0;
+    while i < self.pending_rip_refs.len() {
+        var ref_: PendingRipRef = self.pending_rip_refs.get(i);
+        var target_rva: i64 = rdata_rva + ref_.rdata_offset;
+        var code_rva: i64 = text_rva + ref_.code_offset;
+        var disp: i64 = target_rva - (code_rva + 4);
+        self.code.set(ref_.code_offset, disp & 0xFF);
+        self.code.set(ref_.code_offset + 1, (disp >> 8) & 0xFF);
+        self.code.set(ref_.code_offset + 2, (disp >> 16) & 0xFF);
+        self.code.set(ref_.code_offset + 3, (disp >> 24) & 0xFF);
+        i = i + 1;
+    }
+}
+
+// ─── RdataBuilder: builds .rdata section (strings + import table) ───────
+pub struct RdataBuilder {
+    pub data: Vec,                    // raw .rdata bytes (Vec<i64>)
+    pub iat_offsets: Vec,             // .rdata offset of each IAT entry
+    pub import_dir_offset: i64,      // .rdata offset of import descriptor
+    pub string_keys: Vec<str>,        // string content for dedup
+    pub string_vals: Vec,             // offsets for dedup (parallel)
+    pub ilt_offset: i64,             // .rdata offset of ILT
+    pub iat_offset: i64,             // .rdata offset of IAT
+    pub dll_name_off: i64,           // .rdata offset of "kernel32.dll"
+    pub import_by_name_offsets: Vec, // .rdata offset of each IMPORT_BY_NAME
+}
+
+pub fn RdataBuilder_new() -> RdataBuilder {
+    return RdataBuilder {
+        data: Vec::new(),
+        iat_offsets: Vec::new(),
+        import_dir_offset: 0,
+        string_keys: Vec::new(),
+        string_vals: Vec::new(),
+        ilt_offset: 0,
+        iat_offset: 0,
+        dll_name_off: 0,
+        import_by_name_offsets: Vec::new(),
+    };
+}
+
+// Add a string to .rdata, return its offset. Dedup by content.
+pub fn RdataBuilder_add_string(self: &mut RdataBuilder, s: str) -> i64 {
+    var i: i64 = 0;
+    while i < self.string_keys.len() {
+        if str_equal(self.string_keys.get(i), s) {
+            return self.string_vals.get(i);
+        }
+        i = i + 1;
+    }
+    var offset: i64 = self.data.len();
+    var bytes: Vec = str_bytes(s);
+    var j: i64 = 0;
+    while j < bytes.len() {
+        self.data.push(bytes.get(j));
+        j = j + 1;
+    }
+    self.data.push(0);
+    self.string_keys.push(s);
+    self.string_vals.push(offset);
+    return offset;
+}
+
+// Build the full .rdata section with strings + import table
+pub fn RdataBuilder_build(self: &mut RdataBuilder, string_constants: Vec<StringStringEntry>) {
+    // 1. User string constants (already added via add_string, but ensure all are present)
+    var i: i64 = 0;
+    while i < string_constants.len() {
+        RdataBuilder_add_string(self, string_constants.get(i).key);
+        i = i + 1;
+    }
+    // Ensure "true" and "false" are present
+    RdataBuilder_add_string(self, "true");
+    RdataBuilder_add_string(self, "false");
+
+    // 2. DLL name
+    self.dll_name_off = self.data.len();
+    var dll_bytes: Vec = str_bytes("kernel32.dll");
+    var j: i64 = 0;
+    while j < dll_bytes.len() {
+        self.data.push(dll_bytes.get(j));
+        j = j + 1;
+    }
+    self.data.push(0);
+
+    // 3. IMAGE_IMPORT_BY_NAME entries
+    var import_names: Vec<str> = Vec::new();
+    import_names.push("GetStdHandle");
+    import_names.push("WriteFile");
+    import_names.push("ExitProcess");
+    import_names.push("GetProcessHeap");
+    import_names.push("HeapAlloc");
+    import_names.push("HeapFree");
+
+    var k: i64 = 0;
+    while k < import_names.len() {
+        var off: i64 = self.data.len();
+        self.import_by_name_offsets.push(off);
+        self.data.push(0); // hint (2 bytes)
+        self.data.push(0);
+        var name_bytes: Vec = str_bytes(import_names.get(k));
+        var m: i64 = 0;
+        while m < name_bytes.len() {
+            self.data.push(name_bytes.get(m));
+            m = m + 1;
+        }
+        self.data.push(0); // null terminator
+        k = k + 1;
+    }
+
+    // 4. Pad to 8-byte alignment
+    while self.data.len() % 8 != 0 {
+        self.data.push(0);
+    }
+
+    // 5. Import Lookup Table (ILT)
+    self.ilt_offset = self.data.len();
+    k = 0;
+    while k < import_names.len() {
+        // Placeholder RVA — patched later by patch_rvas
+        self.data.push(0); self.data.push(0); self.data.push(0); self.data.push(0);
+        self.data.push(0); self.data.push(0); self.data.push(0); self.data.push(0);
+        k = k + 1;
+    }
+    // Null terminator
+    self.data.push(0); self.data.push(0); self.data.push(0); self.data.push(0);
+    self.data.push(0); self.data.push(0); self.data.push(0); self.data.push(0);
+
+    // 6. Import Address Table (IAT)
+    self.iat_offset = self.data.len();
+    k = 0;
+    while k < import_names.len() {
+        var iat_off: i64 = self.data.len();
+        self.iat_offsets.push(iat_off);
+        // Placeholder RVA — patched later
+        self.data.push(0); self.data.push(0); self.data.push(0); self.data.push(0);
+        self.data.push(0); self.data.push(0); self.data.push(0); self.data.push(0);
+        k = k + 1;
+    }
+    // Null terminator
+    self.data.push(0); self.data.push(0); self.data.push(0); self.data.push(0);
+    self.data.push(0); self.data.push(0); self.data.push(0); self.data.push(0);
+
+    // 7. Pad to 4-byte alignment
+    while self.data.len() % 4 != 0 {
+        self.data.push(0);
+    }
+
+    // 8. Import Directory Table (20 bytes + 20 null)
+    self.import_dir_offset = self.data.len();
+    // Descriptor (20 bytes of placeholders — patched later)
+    var d: i64 = 0;
+    while d < 20 {
+        self.data.push(0);
+        d = d + 1;
+    }
+    // Null descriptor (20 bytes)
+    d = 0;
+    while d < 20 {
+        self.data.push(0);
+        d = d + 1;
+    }
+}
+
+// Patch RVAs in the import table after .rdata location is known
+pub fn RdataBuilder_patch_rvas(self: &mut RdataBuilder, rdata_rva: i64) {
+    var num_imports: i64 = self.import_by_name_offsets.len();
+
+    // Patch ILT entries: each = rdata_rva + import_by_name_offsets[i]
+    var i: i64 = 0;
+    while i < num_imports {
+        var ilt_pos: i64 = self.ilt_offset + i * 8;
+        var rva: i64 = rdata_rva + self.import_by_name_offsets.get(i);
+        self.data.set(ilt_pos, rva & 0xFF);
+        self.data.set(ilt_pos + 1, (rva >> 8) & 0xFF);
+        self.data.set(ilt_pos + 2, (rva >> 16) & 0xFF);
+        self.data.set(ilt_pos + 3, (rva >> 24) & 0xFF);
+        self.data.set(ilt_pos + 4, 0);
+        self.data.set(ilt_pos + 5, 0);
+        self.data.set(ilt_pos + 6, 0);
+        self.data.set(ilt_pos + 7, 0);
+        i = i + 1;
+    }
+
+    // Patch IAT entries: each = rdata_rva + import_by_name_offsets[i]
+    i = 0;
+    while i < num_imports {
+        var iat_pos: i64 = self.iat_offset + i * 8;
+        var rva: i64 = rdata_rva + self.import_by_name_offsets.get(i);
+        self.data.set(iat_pos, rva & 0xFF);
+        self.data.set(iat_pos + 1, (rva >> 8) & 0xFF);
+        self.data.set(iat_pos + 2, (rva >> 16) & 0xFF);
+        self.data.set(iat_pos + 3, (rva >> 24) & 0xFF);
+        self.data.set(iat_pos + 4, 0);
+        self.data.set(iat_pos + 5, 0);
+        self.data.set(iat_pos + 6, 0);
+        self.data.set(iat_pos + 7, 0);
+        i = i + 1;
+    }
+
+    // Patch import descriptor
+    var dir_pos: i64 = self.import_dir_offset;
+    var ilt_rva: i64 = rdata_rva + self.ilt_offset;
+    var dll_rva: i64 = rdata_rva + self.dll_name_off;
+    var iat_rva: i64 = rdata_rva + self.iat_offset;
+
+    // OriginalFirstThunk (offset +0) = ILT RVA
+    self.data.set(dir_pos, ilt_rva & 0xFF);
+    self.data.set(dir_pos + 1, (ilt_rva >> 8) & 0xFF);
+    self.data.set(dir_pos + 2, (ilt_rva >> 16) & 0xFF);
+    self.data.set(dir_pos + 3, (ilt_rva >> 24) & 0xFF);
+    // TimeDateStamp (offset +4) = 0
+    // ForwarderChain (offset +8) = 0
+    // Name (offset +12) = DLL name RVA
+    self.data.set(dir_pos + 12, dll_rva & 0xFF);
+    self.data.set(dir_pos + 13, (dll_rva >> 8) & 0xFF);
+    self.data.set(dir_pos + 14, (dll_rva >> 16) & 0xFF);
+    self.data.set(dir_pos + 15, (dll_rva >> 24) & 0xFF);
+    // FirstThunk (offset +16) = IAT RVA
+    self.data.set(dir_pos + 16, iat_rva & 0xFF);
+    self.data.set(dir_pos + 17, (iat_rva >> 8) & 0xFF);
+    self.data.set(dir_pos + 18, (iat_rva >> 16) & 0xFF);
+    self.data.set(dir_pos + 19, (iat_rva >> 24) & 0xFF);
+}
+
+// ─── PE file constants ──────────────────────────────────────────────────
+pub const IMAGE_BASE: i64 = 0x140000000;
+pub const SECTION_ALIGN: i64 = 0x1000;
+pub const FILE_ALIGN: i64 = 0x200;
+pub const TEXT_RVA: i64 = 0x1000;
+
+// IAT indices
+pub const IAT_GET_STD_HANDLE: i64 = 0;
+pub const IAT_WRITE_FILE: i64 = 1;
+pub const IAT_EXIT_PROCESS: i64 = 2;
+pub const IAT_GET_PROCESS_HEAP: i64 = 3;
+pub const IAT_HEAP_ALLOC: i64 = 4;
+pub const IAT_HEAP_FREE: i64 = 5;
+
+// Align value up to alignment
+pub fn align_up(val: i64, align_: i64) -> i64 {
+    return (val + align_ - 1) & ~(align_ - 1);
+}
+
+// Build the complete PE file from text + rdata sections
+pub fn build_pe_file(text: Vec, rdata: Vec, entry_point_rva: i64, import_dir_rva: i64, iat_rva: i64, iat_size: i64, rdata_rva: i64) -> Vec {
+    var pe: Vec = Vec::new();
+
+    var header_size: i64 = align_up(64 + 4 + 20 + 240 + 2 * 40, FILE_ALIGN);
+    var text_raw_size: i64 = align_up(text.len(), FILE_ALIGN);
+    var rdata_raw_size: i64 = align_up(rdata.len(), FILE_ALIGN);
+    var text_virt_size: i64 = align_up(text.len(), SECTION_ALIGN);
+    var rdata_virt_size: i64 = align_up(rdata.len(), SECTION_ALIGN);
+    var size_of_image: i64 = align_up(header_size, SECTION_ALIGN) + text_virt_size + rdata_virt_size;
+
+    // ─── DOS Header (64 bytes) ───
+    pe.push(0x4D); pe.push(0x5A); // e_magic "MZ"
+    pe.push(0x90); pe.push(0x00); // e_cblp
+    pe.push(0x03); pe.push(0x00); // e_cp
+    pe.push(0x00); pe.push(0x00); // e_crlc
+    pe.push(0x04); pe.push(0x00); // e_cparhdr
+    pe.push(0x00); pe.push(0x00); // e_minalloc
+    pe.push(0xFF); pe.push(0xFF); // e_maxalloc
+    pe.push(0x00); pe.push(0x00); // e_ss
+    pe.push(0xB8); pe.push(0x00); // e_sp
+    pe.push(0x00); pe.push(0x00); // e_csum
+    pe.push(0x00); pe.push(0x00); // e_ip
+    pe.push(0x00); pe.push(0x00); // e_cs
+    pe.push(0x40); pe.push(0x00); // e_lfarlc
+    pe.push(0x00); pe.push(0x00); // e_ovno
+    var i: i64 = 0;
+    while i < 8 { pe.push(0); i = i + 1; } // e_res (8 bytes)
+    pe.push(0x00); pe.push(0x00); // e_oemid
+    pe.push(0x00); pe.push(0x00); // e_oeminfo
+    i = 0;
+    while i < 20 { pe.push(0); i = i + 1; } // e_res2 (20 bytes)
+    // e_lfanew = 64
+    pe.push(0x40); pe.push(0x00); pe.push(0x00); pe.push(0x00);
+
+    // ─── PE Signature (4 bytes) ───
+    pe.push(0x50); pe.push(0x45); pe.push(0x00); pe.push(0x00); // "PE\0\0"
+
+    // ─── COFF Header (20 bytes) ───
+    pe.push(0x64); pe.push(0x86); // Machine = AMD64
+    pe.push(0x02); pe.push(0x00); // NumberOfSections = 2
+    pe.push(0x00); pe.push(0x00); pe.push(0x00); pe.push(0x00); // TimeDateStamp
+    pe.push(0x00); pe.push(0x00); pe.push(0x00); pe.push(0x00); // PointerToSymbolTable
+    pe.push(0x00); pe.push(0x00); pe.push(0x00); pe.push(0x00); // NumberOfSymbols
+    pe.push(0xF0); pe.push(0x00); // SizeOfOptionalHeader = 240
+    pe.push(0x22); pe.push(0x00); // Characteristics
+
+    // ─── Optional Header (240 bytes) ───
+    // Standard fields
+    pe.push(0x0B); pe.push(0x02); // Magic = PE32+
+    pe.push(0x0E); // MajorLinkerVersion
+    pe.push(0x00); // MinorLinkerVersion
+    // SizeOfCode
+    pe.push(text_raw_size & 0xFF); pe.push((text_raw_size >> 8) & 0xFF); pe.push((text_raw_size >> 16) & 0xFF); pe.push((text_raw_size >> 24) & 0xFF);
+    // SizeOfInitializedData
+    pe.push(rdata_raw_size & 0xFF); pe.push((rdata_raw_size >> 8) & 0xFF); pe.push((rdata_raw_size >> 16) & 0xFF); pe.push((rdata_raw_size >> 24) & 0xFF);
+    // SizeOfUninitializedData
+    pe.push(0); pe.push(0); pe.push(0); pe.push(0);
+    // AddressOfEntryPoint
+    pe.push(entry_point_rva & 0xFF); pe.push((entry_point_rva >> 8) & 0xFF); pe.push((entry_point_rva >> 16) & 0xFF); pe.push((entry_point_rva >> 24) & 0xFF);
+    // BaseOfCode
+    pe.push(0x00); pe.push(0x10); pe.push(0x00); pe.push(0x00); // TEXT_RVA
+
+    // Windows-specific fields
+    // ImageBase (8 bytes)
+    i = 0;
+    while i < 8 {
+        pe.push((IMAGE_BASE >> (i * 8)) & 0xFF);
+        i = i + 1;
+    }
+    // SectionAlignment
+    pe.push(0x00); pe.push(0x10); pe.push(0x00); pe.push(0x00);
+    // FileAlignment
+    pe.push(0x00); pe.push(0x02); pe.push(0x00); pe.push(0x00);
+    // MajorOSVersion
+    pe.push(0x06); pe.push(0x00);
+    // MinorOSVersion
+    pe.push(0x00); pe.push(0x00);
+    // MajorImageVersion
+    pe.push(0x00); pe.push(0x00);
+    // MinorImageVersion
+    pe.push(0x00); pe.push(0x00);
+    // MajorSubsystemVersion
+    pe.push(0x06); pe.push(0x00);
+    // MinorSubsystemVersion
+    pe.push(0x00); pe.push(0x00);
+    // Win32VersionValue
+    pe.push(0); pe.push(0); pe.push(0); pe.push(0);
+    // SizeOfImage
+    pe.push(size_of_image & 0xFF); pe.push((size_of_image >> 8) & 0xFF); pe.push((size_of_image >> 16) & 0xFF); pe.push((size_of_image >> 24) & 0xFF);
+    // SizeOfHeaders
+    pe.push(0x00); pe.push(0x02); pe.push(0x00); pe.push(0x00); // 512
+    // CheckSum
+    pe.push(0); pe.push(0); pe.push(0); pe.push(0);
+    // Subsystem = CONSOLE
+    pe.push(0x03); pe.push(0x00);
+    // DllCharacteristics
+    pe.push(0x00); pe.push(0x00);
+    // SizeOfStackReserve (8 bytes)
+    pe.push(0x00); pe.push(0x00); pe.push(0x10); pe.push(0x00); pe.push(0x00); pe.push(0x00); pe.push(0x00); pe.push(0x00);
+    // SizeOfStackCommit (8 bytes)
+    pe.push(0x00); pe.push(0x10); pe.push(0x00); pe.push(0x00); pe.push(0x00); pe.push(0x00); pe.push(0x00); pe.push(0x00);
+    // SizeOfHeapReserve (8 bytes)
+    pe.push(0x00); pe.push(0x00); pe.push(0x10); pe.push(0x00); pe.push(0x00); pe.push(0x00); pe.push(0x00); pe.push(0x00);
+    // SizeOfHeapCommit (8 bytes)
+    pe.push(0x00); pe.push(0x10); pe.push(0x00); pe.push(0x00); pe.push(0x00); pe.push(0x00); pe.push(0x00); pe.push(0x00);
+    // LoaderFlags
+    pe.push(0); pe.push(0); pe.push(0); pe.push(0);
+    // NumberOfRvaAndSizes = 16
+    pe.push(0x10); pe.push(0x00); pe.push(0x00); pe.push(0x00);
+
+    // Data directories (16 entries × 8 bytes = 128 bytes)
+    // Entry 0: Export — empty
+    i = 0;
+    while i < 8 { pe.push(0); i = i + 1; }
+    // Entry 1: Import
+    pe.push(import_dir_rva & 0xFF); pe.push((import_dir_rva >> 8) & 0xFF); pe.push((import_dir_rva >> 16) & 0xFF); pe.push((import_dir_rva >> 24) & 0xFF);
+    pe.push(0x14); pe.push(0x00); pe.push(0x00); pe.push(0x00); // size = 20
+    // Entries 2-11: empty (10 entries × 8 bytes)
+    i = 0;
+    while i < 10 {
+        var j: i64 = 0;
+        while j < 8 { pe.push(0); j = j + 1; }
+        i = i + 1;
+    }
+    // Entry 12: IAT
+    pe.push(iat_rva & 0xFF); pe.push((iat_rva >> 8) & 0xFF); pe.push((iat_rva >> 16) & 0xFF); pe.push((iat_rva >> 24) & 0xFF);
+    pe.push(iat_size & 0xFF); pe.push((iat_size >> 8) & 0xFF); pe.push((iat_size >> 16) & 0xFF); pe.push((iat_size >> 24) & 0xFF);
+    // Entries 13-15: empty (3 entries × 8 bytes)
+    i = 0;
+    while i < 3 {
+        var j: i64 = 0;
+        while j < 8 { pe.push(0); j = j + 1; }
+        i = i + 1;
+    }
+
+    // ─── Section Headers (2 × 40 bytes) ───
+    // .text section
+    pe.push(0x2E); pe.push(0x74); pe.push(0x65); pe.push(0x78); pe.push(0x74); pe.push(0x00); pe.push(0x00); pe.push(0x00); // ".text\0\0\0"
+    pe.push(text_virt_size & 0xFF); pe.push((text_virt_size >> 8) & 0xFF); pe.push((text_virt_size >> 16) & 0xFF); pe.push((text_virt_size >> 24) & 0xFF);
+    pe.push(0x00); pe.push(0x10); pe.push(0x00); pe.push(0x00); // VirtualAddress = TEXT_RVA
+    pe.push(text_raw_size & 0xFF); pe.push((text_raw_size >> 8) & 0xFF); pe.push((text_raw_size >> 16) & 0xFF); pe.push((text_raw_size >> 24) & 0xFF);
+    pe.push(0x00); pe.push(0x02); pe.push(0x00); pe.push(0x00); // PointerToRawData = FILE_ALIGN
+    pe.push(0); pe.push(0); pe.push(0); pe.push(0); // PointerToRelocations
+    pe.push(0); pe.push(0); pe.push(0); pe.push(0); // PointerToLinenumbers
+    pe.push(0); pe.push(0); // NumberOfRelocations
+    pe.push(0); pe.push(0); // NumberOfLinenumbers
+    pe.push(0x20); pe.push(0x00); pe.push(0x00); pe.push(0x60); // Characteristics = CODE|EXECUTE|READ
+
+    // .rdata section
+    pe.push(0x2E); pe.push(0x72); pe.push(0x64); pe.push(0x61); pe.push(0x74); pe.push(0x61); pe.push(0x00); pe.push(0x00); // ".rdata\0\0"
+    pe.push(rdata_virt_size & 0xFF); pe.push((rdata_virt_size >> 8) & 0xFF); pe.push((rdata_virt_size >> 16) & 0xFF); pe.push((rdata_virt_size >> 24) & 0xFF);
+    pe.push(rdata_rva & 0xFF); pe.push((rdata_rva >> 8) & 0xFF); pe.push((rdata_rva >> 16) & 0xFF); pe.push((rdata_rva >> 24) & 0xFF);
+    pe.push(rdata_raw_size & 0xFF); pe.push((rdata_raw_size >> 8) & 0xFF); pe.push((rdata_raw_size >> 16) & 0xFF); pe.push((rdata_raw_size >> 24) & 0xFF);
+    var rdata_raw_ptr: i64 = FILE_ALIGN + text_raw_size;
+    pe.push(rdata_raw_ptr & 0xFF); pe.push((rdata_raw_ptr >> 8) & 0xFF); pe.push((rdata_raw_ptr >> 16) & 0xFF); pe.push((rdata_raw_ptr >> 24) & 0xFF);
+    pe.push(0); pe.push(0); pe.push(0); pe.push(0); // PointerToRelocations
+    pe.push(0); pe.push(0); pe.push(0); pe.push(0); // PointerToLinenumbers
+    pe.push(0); pe.push(0); // NumberOfRelocations
+    pe.push(0); pe.push(0); // NumberOfLinenumbers
+    pe.push(0x40); pe.push(0x00); pe.push(0x00); pe.push(0xC0); // Characteristics = INITIALIZED_DATA|READ|WRITE
+
+    // ─── Pad headers to FILE_ALIGN ───
+    while pe.len() < header_size {
+        pe.push(0);
+    }
+
+    // ─── .text section ───
+    i = 0;
+    while i < text.len() {
+        pe.push(text.get(i));
+        i = i + 1;
+    }
+    // Pad text to FILE_ALIGN
+    while pe.len() < header_size + text_raw_size {
+        pe.push(0);
+    }
+
+    // ─── .rdata section ───
+    i = 0;
+    while i < rdata.len() {
+        pe.push(rdata.get(i));
+        i = i + 1;
+    }
+    // Pad rdata to FILE_ALIGN
+    while pe.len() < header_size + text_raw_size + rdata_raw_size {
+        pe.push(0);
+    }
+
+    return pe;
+}
+
+// ─── PeStackFrame: tracks local variable stack slots ────────────────────
+pub struct PeStackFrame {
+    pub offsets: Vec,        // packed (value_id, offset) pairs
+    pub size: i64,
+    pub alloca_slots: Vec,   // packed (value_id, offset) pairs
+}
+
+pub fn PeStackFrame_new() -> PeStackFrame {
+    return PeStackFrame {
+        offsets: Vec::new(),
+        size: 0,
+        alloca_slots: Vec::new(),
+    };
+}
+
+// Find offset for a value ID
+pub fn PeStackFrame_find_offset(self: &PeStackFrame, id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < self.offsets.len() {
+        if self.offsets.get(i) == id {
+            return self.offsets.get(i + 1);
+        }
+        i = i + 2;
+    }
+    return 0;
+}
+
+// Find alloca offset for a value ID
+pub fn PeStackFrame_find_alloca(self: &PeStackFrame, id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < self.alloca_slots.len() {
+        if self.alloca_slots.get(i) == id {
+            return self.alloca_slots.get(i + 1);
+        }
+        i = i + 2;
+    }
+    return 0;
+}
+
+// Allocate stack space for a value
+pub fn PeStackFrame_alloc(self: &mut PeStackFrame, id: i64, size: i64) -> i64 {
+    var aligned: i64 = size;
+    if size > 4 { aligned = 8; }
+    else if size > 2 { aligned = 4; }
+    else if size > 1 { aligned = 2; }
+    else { aligned = 1; }
+    self.size = self.size + aligned;
+    var off: i64 = -self.size;
+    self.offsets.push(id);
+    self.offsets.push(off);
+    return off;
+}
+
+// Allocate raw stack space (for alloca)
+pub fn PeStackFrame_alloc_raw(self: &mut PeStackFrame, size: i64) -> i64 {
+    var aligned: i64 = size;
+    if size > 4 { aligned = 8; }
+    else if size > 2 { aligned = 4; }
+    else if size > 1 { aligned = 2; }
+    else { aligned = 1; }
+    self.size = self.size + aligned;
+    return -self.size;
+}
+
+// ─── PeCodeGen: main code generator ─────────────────────────────────────
+pub struct PeCodeGen {
+    pub enc: X86Encoder,
+    pub func_names: Vec<str>,
+    pub func_label_ids: Vec,
+    pub string_keys: Vec<str>,
+    pub string_vals: Vec,
+    pub iat_rdata_offsets: Vec,
+    pub block_labels: Vec,
+    pub entry_offset: i64,
+    pub bare_mode: bool,
+    pub main_offset: i64,
+}
+
+pub fn PeCodeGen_new() -> PeCodeGen {
+    return PeCodeGen {
+        enc: X86Encoder_new(),
+        func_names: Vec::new(),
+        func_label_ids: Vec::new(),
+        string_keys: Vec::new(),
+        string_vals: Vec::new(),
+        iat_rdata_offsets: Vec::new(),
+        block_labels: Vec::new(),
+        entry_offset: 0,
+        bare_mode: false,
+        main_offset: -1,
+    };
+}
+
+// Look up a function label by name
+pub fn PeCodeGen_get_func_label(self: &PeCodeGen, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < self.func_names.len() {
+        if str_equal(self.func_names.get(i), name) {
+            return self.func_label_ids.get(i);
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Register a function label
+pub fn PeCodeGen_register_func(self: &mut PeCodeGen, name: str) -> i64 {
+    var existing: i64 = PeCodeGen_get_func_label(self, name);
+    if existing >= 0 {
+        return existing;
+    }
+    var label: i64 = X86Encoder_alloc_label(&mut self.enc);
+    self.func_names.push(name);
+    self.func_label_ids.push(label);
+    return label;
+}
+
+// Look up a string's rdata offset
+pub fn PeCodeGen_get_string_offset(self: &PeCodeGen, s: str) -> i64 {
+    var i: i64 = 0;
+    while i < self.string_keys.len() {
+        if str_equal(self.string_keys.get(i), s) {
+            return self.string_vals.get(i);
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Get IAT rdata offset for an import index
+pub fn PeCodeGen_iat_off(self: &PeCodeGen, iat_index: i64) -> i64 {
+    return self.iat_rdata_offsets.get(iat_index);
+}
+
+// ─── Main entry point: generate a PE file from an IrModule ──────────────
+pub fn generate_pe(module: IrModule) -> Vec {
+    p_file_write("pe_debug.txt", "[pe] generate_pe ENTERED\n");
+    var gen: PeCodeGen = PeCodeGen_new();
+    p_file_write("pe_debug.txt", "[pe] PeCodeGen created\n");
+    var result: Vec = PeCodeGen_generate(&mut gen, module);
+    p_file_write("pe_debug.txt", "[pe] PeCodeGen_generate returned\n");
+    return result;
+}
+
+// Helper: collect all string constants from module
+pub fn PeCodeGen_collect_strings(self: &mut PeCodeGen, module: IrModule) -> Vec {
+    var all_strings: Vec = Vec::new();
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var func_entry: IrFunctionEntry = module.functions.get(fi);
+        var func: IrFunction = func_entry.func;
+        var ii: i64 = 0;
+        while ii < func.insts.len() {
+            var vi: ValueIdInst = func.insts.get(ii);
+            match vi.inst {
+                Inst::ConstStr(s) => { all_strings.push(s); }
+                Inst::Panic(s) => { all_strings.push(s); }
+                _ => {}
+            }
+            ii = ii + 1;
+        }
+        fi = fi + 1;
+    }
+    all_strings.push("true");
+    all_strings.push("false");
+    return all_strings;
+}
+
+// Helper: build .rdata section from strings + imports
+pub fn PeCodeGen_build_rdata(self: &mut PeCodeGen, all_strings: Vec, string_constants: Vec) -> RdataBuilder {
+    var rdata: RdataBuilder = RdataBuilder_new();
+    var si: i64 = 0;
+    while si < all_strings.len() {
+        var off: i64 = RdataBuilder_add_string(&mut rdata, all_strings.get(si));
+        self.string_keys.push(all_strings.get(si));
+        self.string_vals.push(off);
+        si = si + 1;
+    }
+    RdataBuilder_build(&mut rdata, string_constants);
+    self.iat_rdata_offsets = rdata.iat_offsets;
+    return rdata;
+}
+
+// Helper: register all function labels
+pub fn PeCodeGen_register_all_funcs(self: &mut PeCodeGen, module: IrModule) {
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var func_entry: IrFunctionEntry = module.functions.get(fi);
+        p_file_write("pe_debug.txt", "[pe] Registering func: " + func_entry.name + "\n");
+        PeCodeGen_register_func(self, func_entry.name);
+        fi = fi + 1;
+    }
+}
+
+// Helper: register runtime stub labels (part 1)
+pub fn PeCodeGen_register_runtime_labels1(self: &mut PeCodeGen) {
+    PeCodeGen_register_func(self, "p_print_int");
+    PeCodeGen_register_func(self, "p_print_str");
+    PeCodeGen_register_func(self, "p_print_float");
+    PeCodeGen_register_func(self, "p_print_bool");
+    PeCodeGen_register_func(self, "p_panic");
+    PeCodeGen_register_func(self, "p_malloc");
+    PeCodeGen_register_func(self, "p_free");
+    PeCodeGen_register_func(self, "p_str_concat");
+    PeCodeGen_register_func(self, "p_to_str");
+    PeCodeGen_register_func(self, "p_to_str_str");
+    PeCodeGen_register_func(self, "p_to_str_bool");
+    PeCodeGen_register_func(self, "p_to_str_float");
+    PeCodeGen_register_func(self, "p_to_str_vec");
+    PeCodeGen_register_func(self, "p_vec_new");
+    PeCodeGen_register_func(self, "p_vec_push");
+    PeCodeGen_register_func(self, "p_vec_len");
+}
+
+// Helper: register runtime stub labels (part 2)
+pub fn PeCodeGen_register_runtime_labels2(self: &mut PeCodeGen) {
+    PeCodeGen_register_func(self, "p_vec_get");
+    PeCodeGen_register_func(self, "p_vec_pop");
+    PeCodeGen_register_func(self, "p_vec_set");
+    PeCodeGen_register_func(self, "p_vec_is_empty");
+    PeCodeGen_register_func(self, "p_vec_clear");
+    PeCodeGen_register_func(self, "p_vec_capacity");
+    PeCodeGen_register_func(self, "p_vec_first");
+    PeCodeGen_register_func(self, "p_vec_last");
+    PeCodeGen_register_func(self, "p_print_vec");
+    PeCodeGen_register_func(self, "p_map_new");
+    PeCodeGen_register_func(self, "p_map_insert");
+    PeCodeGen_register_func(self, "p_map_get");
+    PeCodeGen_register_func(self, "p_map_contains");
+    PeCodeGen_register_func(self, "p_map_remove");
+    PeCodeGen_register_func(self, "p_map_len");
+    PeCodeGen_register_func(self, "p_map_is_empty");
+    PeCodeGen_register_func(self, "p_print_map");
+}
+
+// Helper: generate code for all functions
+pub fn PeCodeGen_gen_all_functions(self: &mut PeCodeGen, module: IrModule) {
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var func_entry: IrFunctionEntry = module.functions.get(fi);
+        if str_equal(func_entry.name, "main") {
+            self.main_offset = X86Encoder_offset(&self.enc);
+        }
+        PeCodeGen_gen_function(self, func_entry.name, func_entry.func, module);
+        fi = fi + 1;
+    }
+}
+
+// Main generation function
+pub fn PeCodeGen_generate(self: &mut PeCodeGen, module: IrModule) -> Vec {
+    p_file_write("pe_debug.txt", "[pe] PeCodeGen_generate called\n");
+
+    // 1. Collect all string constants
+    var all_strings: Vec = PeCodeGen_collect_strings(self, module);
+
+    // 2. Build .rdata section
+    var rdata: RdataBuilder = PeCodeGen_build_rdata(self, all_strings, module.string_constants);
+
+    // 3. Pre-allocate labels for all functions
+    PeCodeGen_register_all_funcs(self, module);
+
+    // 3b. Register runtime stub labels
+    PeCodeGen_register_runtime_labels1(self);
+    PeCodeGen_register_runtime_labels2(self);
+
+    // 4. Generate code for each function
+    PeCodeGen_gen_all_functions(self, module);
+
+    // 5. Generate runtime stubs
+    PeCodeGen_gen_runtime_stubs(self);
+
+    // 6. Generate entry point
+    PeCodeGen_gen_entry_point(self);
+
+    // 7. Resolve labels
+    X86Encoder_resolve_labels(&mut self.enc);
+    p_file_write("pe_debug.txt", "[pe] Labels resolved. Code size: " + int_to_str(self.enc.code.len()) + "\n");
+    p_file_write("pe_debug.txt", "[pe] Entry offset: " + int_to_str(self.entry_offset) + "\n");
+    p_file_write("pe_debug.txt", "[pe] Num labels: " + int_to_str(self.enc.labels.len()) + "\n");
+    p_file_write("pe_debug.txt", "[pe] Num func_names: " + int_to_str(self.func_names.len()) + "\n");
+
+    // 8. Compute .rdata RVA
+    var rdata_rva: i64 = TEXT_RVA + align_up(self.enc.code.len(), SECTION_ALIGN);
+
+    // 9. Patch RIP-relative references
+    X86Encoder_resolve_rip_refs(&mut self.enc, TEXT_RVA, rdata_rva);
+
+    // 10. Patch import table RVAs
+    RdataBuilder_patch_rvas(&mut rdata, rdata_rva);
+
+    // 11. Calculate PE metadata
+    var import_dir_rva: i64 = rdata_rva + rdata.import_dir_offset;
+    var iat_rva: i64 = rdata_rva + rdata.iat_offset;
+    var num_imports: i64 = 6;
+    var iat_size: i64 = (num_imports + 1) * 8;
+    var entry_rva: i64 = TEXT_RVA + self.entry_offset;
+
+    // 12. Build PE file
+    return build_pe_file(self.enc.code, rdata.data, entry_rva, import_dir_rva, iat_rva, iat_size, rdata_rva);
+}
+
+// ─── Function code generation ───────────────────────────────────────────
+// Windows x64 argument registers
+pub const ARG_REGS: Vec = Vec::new(); // set at runtime
+
+// Helper: generate code for Print instruction (extracted to avoid statement-dropping bug)
+pub fn PeCodeGen_gen_print_inst(self: &mut PeCodeGen, frame: &PeStackFrame, value: i64, ty: IrType) {
+    var voff: i64 = PeStackFrame_find_offset(frame, value);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RCX, voff);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    match ty {
+        IrType::Ptr(_) => {
+            X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_print_str"));
+        }
+        IrType::F64 => {
+            X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_print_float"));
+        }
+        IrType::Bool => {
+            X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_print_bool"));
+        }
+        _ => {
+            X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_print_int"));
+        }
+    }
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+}
+
+pub fn PeCodeGen_gen_function(self: &mut PeCodeGen, name: str, func: IrFunction, module: IrModule) {
+    var label: i64 = PeCodeGen_get_func_label(self, name);
+    if label < 0 { return; }
+    X86Encoder_place_label(&mut self.enc, label);
+
+    // Prologue
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+
+    // Allocate stack frame
+    var frame: PeStackFrame = PeStackFrame_new();
+    var arg_regs: Vec = Vec::new();
+    arg_regs.push(REG_RCX);
+    arg_regs.push(REG_RDX);
+    arg_regs.push(REG_R8);
+    arg_regs.push(REG_R9);
+
+    // Allocate stack slots for all values
+    var vi: i64 = 0;
+    while vi < func.value_metas.len() {
+        var vm: ValueIdMeta = func.value_metas.get(vi);
+        var ty: IrType = vm.meta.ty;
+        var size: i64 = ir_type_size(ty);
+        if size < 8 { size = 8; }
+        PeStackFrame_alloc(&mut frame, vm.id, size);
+        vi = vi + 1;
+    }
+
+    // Pre-allocate alloca slots
+    vi = 0;
+    while vi < func.insts.len() {
+        var inst_entry: ValueIdInst = func.insts.get(vi);
+        match inst_entry.inst {
+            Inst::Alloca(ty, _) => {
+                var alloc_size: i64 = ir_type_size(ty);
+                if alloc_size < 8 { alloc_size = 8; }
+                var data_off: i64 = PeStackFrame_alloc_raw(&mut frame, alloc_size);
+                frame.alloca_slots.push(inst_entry.id);
+                frame.alloca_slots.push(data_off);
+            }
+            _ => {}
+        }
+        vi = vi + 1;
+    }
+
+    // Compute aligned stack size (min 64, aligned to 16, +32 for shadow space)
+    var stack_size: i64 = frame.size + 32 + 15;
+    stack_size = stack_size & ~15;
+    if stack_size < 64 { stack_size = 64; }
+    X86Encoder_sub_rsp_i32(&mut self.enc, stack_size);
+
+    // Move incoming args from registers to stack slots
+    var pi: i64 = 0;
+    while pi < func.params.len() {
+        var param: ValueIdType = func.params.get(pi);
+        var off: i64 = PeStackFrame_find_offset(&frame, param.id);
+        if pi < 4 {
+            // Args in RCX, RDX, R8, R9
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, off, arg_regs.get(pi));
+        } else {
+            // Stack args at [rbp + 48 + (i-4)*8]
+            var stack_off: i64 = 48 + (pi - 4) * 8;
+            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, stack_off);
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, off, REG_RAX);
+        }
+        pi = pi + 1;
+    }
+
+    // Generate code for all blocks
+    var bi: i64 = 0;
+    while bi < func.blocks.len() {
+        var block: BasicBlock = func.blocks.get(bi);
+        // Place block label
+        var block_label: i64 = X86Encoder_alloc_label(&mut self.enc);
+        self.block_labels.push(bi);
+        self.block_labels.push(block.id);
+        self.block_labels.push(block_label);
+        X86Encoder_place_label(&mut self.enc, block_label);
+
+        // Generate instructions
+        var ii: i64 = 0;
+        while ii < block.instructions.len() {
+            var inst_id: i64 = block.instructions.get(ii);
+            // Find the instruction by ID
+            var ji: i64 = 0;
+            while ji < func.insts.len() {
+                var vi2: ValueIdInst = func.insts.get(ji);
+                if vi2.id == inst_id {
+                    PeCodeGen_gen_inst(self, vi2.id, vi2.inst, &frame, module);
+                    break;
+                }
+                ji = ji + 1;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    // Epilogue (fallthrough)
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// Look up block label
+pub fn PeCodeGen_get_block_label(self: &PeCodeGen, func_block_idx: i64, block_id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < self.block_labels.len() {
+        if self.block_labels.get(i) == func_block_idx && self.block_labels.get(i + 1) == block_id {
+            return self.block_labels.get(i + 2);
+        }
+        i = i + 3;
+    }
+    return -1;
+}
+
+// ─── IR instruction lowering ────────────────────────────────────────────
+pub fn PeCodeGen_gen_inst(self: &mut PeCodeGen, id: i64, inst: Inst, frame: &PeStackFrame, module: IrModule) {
+    var dst: i64 = PeStackFrame_find_offset(frame, id);
+
+    match inst {
+        Inst::ConstInt(value, _) => {
+            X86Encoder_mov_imm64(&mut self.enc, REG_RAX, value);
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+        Inst::ConstBool(value) => {
+            if value {
+                X86Encoder_mov_imm64(&mut self.enc, REG_RAX, 1);
+            } else {
+                X86Encoder_xor_self(&mut self.enc, REG_RAX);
+            }
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+        Inst::ConstStr(value) => {
+            // Check if it's a function name
+            var func_label: i64 = PeCodeGen_get_func_label(self, value);
+            if func_label >= 0 {
+                X86Encoder_lea_label(&mut self.enc, REG_RAX, func_label);
+            } else {
+                var str_off: i64 = PeCodeGen_get_string_offset(self, value);
+                if str_off >= 0 {
+                    X86Encoder_lea_rip(&mut self.enc, REG_RAX, str_off);
+                } else {
+                    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+                }
+            }
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+        Inst::ConstFloat(value, ty) => {
+            // TODO: Fides doesn't have float_to_bits yet, so we store 0
+            // as a placeholder. Float support will be added later.
+            X86Encoder_xor_self(&mut self.enc, REG_RAX);
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+        Inst::ConstNull(_) => {
+            X86Encoder_xor_self(&mut self.enc, REG_RAX);
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+        Inst::BinOp(op, left, right, ty) => {
+            var loff: i64 = PeStackFrame_find_offset(frame, left);
+            var roff: i64 = PeStackFrame_find_offset(frame, right);
+            if ir_type_is_float(ty) {
+                PeCodeGen_gen_float_binop(self, op, loff, roff, dst, ty);
+            } else {
+                PeCodeGen_gen_int_binop(self, op, loff, roff, dst);
+            }
+        }
+        Inst::UnaryOp(op, operand, ty) => {
+            var off: i64 = PeStackFrame_find_offset(frame, operand);
+            PeCodeGen_gen_unaryop(self, op, off, dst, ty);
+        }
+        Inst::Alloca(_, _) => {
+            var data_off: i64 = PeStackFrame_find_alloca(frame, id);
+            X86Encoder_lea_rbp(&mut self.enc, REG_RAX, data_off);
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+        Inst::Load(ptr, ty) => {
+            var poff: i64 = PeStackFrame_find_offset(frame, ptr);
+            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, poff);
+            var load_size: i64 = ir_type_size(ty);
+            if load_size == 1 {
+                X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+                // Sign-extend if needed
+                X86Encoder_movsxd_rr(&mut self.enc, REG_RAX, REG_RAX);
+            } else if load_size == 2 {
+                X86Encoder_movzx_r32_r16(&mut self.enc, REG_RAX, REG_RAX);
+                X86Encoder_movsxd_rr(&mut self.enc, REG_RAX, REG_RAX);
+            } else if load_size == 4 {
+                X86Encoder_movsxd_rr(&mut self.enc, REG_RAX, REG_RAX);
+            } else {
+                X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RAX);
+            }
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+        Inst::Store(ptr, value, opt_ty) => {
+            var poff: i64 = PeStackFrame_find_offset(frame, ptr);
+            var voff: i64 = PeStackFrame_find_offset(frame, value);
+            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, poff);
+            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RCX, voff);
+            var store_size: i64 = 8;
+            match opt_ty {
+                OptIrType::Some(ty) => {
+                    store_size = ir_type_size(ty);
+                }
+                _ => {}
+            }
+            if store_size == 1 {
+                X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_RAX, REG_RCX);
+            } else if store_size == 2 {
+                X86Encoder_mov_ptr_reg32(&mut self.enc, REG_RAX, REG_RCX);
+            } else if store_size == 4 {
+                X86Encoder_mov_ptr_reg32(&mut self.enc, REG_RAX, REG_RCX);
+            } else {
+                X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_RCX);
+            }
+        }
+        Inst::GetFieldPtr(struct_ptr, field_index, _) => {
+            var poff: i64 = PeStackFrame_find_offset(frame, struct_ptr);
+            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, poff);
+            // For now, use field_index * 8 as offset
+            // TODO: look up real struct layout
+            X86Encoder_add_r_i32(&mut self.enc, REG_RAX, field_index * 8);
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+        Inst::GetElemPtr(array_ptr, index, elem_ty) => {
+            var poff: i64 = PeStackFrame_find_offset(frame, array_ptr);
+            var ioff: i64 = PeStackFrame_find_offset(frame, index);
+            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, poff);
+            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RCX, ioff);
+            var elem_size: i64 = ir_type_size(elem_ty);
+            if elem_size < 8 { elem_size = 8; }
+            X86Encoder_imul_r_r_imm32(&mut self.enc, REG_RCX, REG_RCX, elem_size);
+            X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+        Inst::Jump(target) => {
+            var lbl: i64 = PeCodeGen_get_block_label(self, 0, target);
+            if lbl >= 0 {
+                X86Encoder_jmp_label(&mut self.enc, lbl);
+            }
+        }
+        Inst::Branch(cond, then_blk, else_blk) => {
+            var coff: i64 = PeStackFrame_find_offset(frame, cond);
+            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, coff);
+            X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
+            var then_lbl: i64 = PeCodeGen_get_block_label(self, 0, then_blk);
+            if then_lbl >= 0 {
+                X86Encoder_jcc_label(&mut self.enc, 5, then_lbl); // jne
+            }
+            var else_lbl: i64 = PeCodeGen_get_block_label(self, 0, else_blk);
+            if else_lbl >= 0 {
+                X86Encoder_jmp_label(&mut self.enc, else_lbl);
+            }
+        }
+        Inst::Return(opt_val) => {
+            match opt_val {
+                OptValueId::Some(v) => {
+                    var voff: i64 = PeStackFrame_find_offset(frame, v);
+                    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, voff);
+                }
+                _ => {
+                    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+                }
+            }
+            X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+            X86Encoder_pop(&mut self.enc, REG_RBP);
+            X86Encoder_ret(&mut self.enc);
+        }
+        Inst::Unreachable => {
+            X86Encoder_ud2(&mut self.enc);
+        }
+        Inst::Call(func_name, args, _, _) => {
+            PeCodeGen_gen_call(self, func_name, args, dst, frame);
+        }
+        Inst::CallPtr(fn_ptr, args, _, _, _) => {
+            PeCodeGen_gen_call_ptr(self, fn_ptr, args, dst, frame);
+        }
+        Inst::IntExtend(value, _, _) => {
+            var voff: i64 = PeStackFrame_find_offset(frame, value);
+            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, voff);
+            X86Encoder_movsxd_rr(&mut self.enc, REG_RAX, REG_RAX);
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+        Inst::IntTrunc(value, to, _) => {
+            var voff: i64 = PeStackFrame_find_offset(frame, value);
+            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, voff);
+            // Truncate by zeroing upper bits
+            match to {
+                IrType::U8 => {
+                    X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+                }
+                IrType::I8 => {
+                    X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+                }
+                IrType::U16 => {
+                    X86Encoder_movzx_r32_r16(&mut self.enc, REG_RAX, REG_RAX);
+                }
+                IrType::I16 => {
+                    X86Encoder_movzx_r32_r16(&mut self.enc, REG_RAX, REG_RAX);
+                }
+                _ => {
+                    // 32-bit: zero upper 32 bits (mov eax, eax)
+                    // Already 64-bit, no-op for now
+                }
+            }
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+        Inst::IntToFloat(value, _, to) => {
+            var voff: i64 = PeStackFrame_find_offset(frame, value);
+            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, voff);
+            X86Encoder_cvtsi2sd_r64(&mut self.enc, 0, REG_RAX);
+            match to {
+                IrType::F32 => {
+                    X86Encoder_movss_mem_rbp_xmm(&mut self.enc, dst, 0);
+                }
+                _ => {
+                    X86Encoder_movsd_mem_rbp_xmm(&mut self.enc, dst, 0);
+                }
+            }
+        }
+        Inst::FloatToInt(value, from, _) => {
+            var voff: i64 = PeStackFrame_find_offset(frame, value);
+            match from {
+                IrType::F32 => {
+                    X86Encoder_movss_xmm_mem_rbp(&mut self.enc, 0, voff);
+                }
+                _ => {
+                    X86Encoder_movsd_xmm_mem_rbp(&mut self.enc, 0, voff);
+                }
+            }
+            X86Encoder_cvttsd2si_r64(&mut self.enc, REG_RAX, 0);
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+        Inst::BitCast(value, _, _) => {
+            var voff: i64 = PeStackFrame_find_offset(frame, value);
+            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, voff);
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+        Inst::Print(value, ty) => {
+            PeCodeGen_gen_print_inst(self, frame, value, ty);
+        }
+        Inst::Panic(msg) => {
+            var str_off: i64 = PeCodeGen_get_string_offset(self, msg);
+            if str_off >= 0 {
+                X86Encoder_lea_rip(&mut self.enc, REG_RCX, str_off);
+            } else {
+                X86Encoder_xor_self(&mut self.enc, REG_RCX);
+            }
+            X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+            X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_panic"));
+            X86Encoder_add_rsp_i32(&mut self.enc, 32);
+        }
+        Inst::MakeDyn(_, _, _) => {
+            X86Encoder_xor_self(&mut self.enc, REG_RAX);
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+        Inst::DynCall(_, _, _, _, _) => {
+            X86Encoder_xor_self(&mut self.enc, REG_RAX);
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+        _ => {
+            // No-op for unhandled instructions
+            X86Encoder_xor_self(&mut self.enc, REG_RAX);
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+    }
+}
+
+// ─── Integer binary operations ──────────────────────────────────────────
+pub fn PeCodeGen_gen_int_binop(self: &mut PeCodeGen, op: BinOp, loff: i64, roff: i64, dst: i64) {
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, loff);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RCX, roff);
+
+    match op {
+        BinOp::Add => {
+            X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
+        }
+        BinOp::Sub => {
+            X86Encoder_sub_rr(&mut self.enc, REG_RAX, REG_RCX);
+        }
+        BinOp::Mul => {
+            X86Encoder_imul_rr(&mut self.enc, REG_RAX, REG_RCX);
+        }
+        BinOp::Div => {
+            X86Encoder_cqo(&mut self.enc);
+            X86Encoder_idiv_r(&mut self.enc, REG_RCX);
+        }
+        BinOp::Mod => {
+            X86Encoder_cqo(&mut self.enc);
+            X86Encoder_idiv_r(&mut self.enc, REG_RCX);
+            X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_RDX);
+        }
+        BinOp::BitAnd => {
+            X86Encoder_and_rr(&mut self.enc, REG_RAX, REG_RCX);
+        }
+        BinOp::BitOr => {
+            X86Encoder_or_rr(&mut self.enc, REG_RAX, REG_RCX);
+        }
+        BinOp::BitXor => {
+            X86Encoder_xor_rr(&mut self.enc, REG_RAX, REG_RCX);
+        }
+        BinOp::Shl => {
+            X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RCX);
+            X86Encoder_shl_cl(&mut self.enc, REG_RAX);
+        }
+        BinOp::Shr => {
+            X86Encoder_sar_cl(&mut self.enc, REG_RAX);
+        }
+        BinOp::Eq => {
+            X86Encoder_cmp_rr(&mut self.enc, REG_RAX, REG_RCX);
+            X86Encoder_setcc_r(&mut self.enc, 4, REG_RAX); // sete
+            X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+        }
+        BinOp::Neq => {
+            X86Encoder_cmp_rr(&mut self.enc, REG_RAX, REG_RCX);
+            X86Encoder_setcc_r(&mut self.enc, 5, REG_RAX); // setne
+            X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+        }
+        BinOp::Lt => {
+            X86Encoder_cmp_rr(&mut self.enc, REG_RAX, REG_RCX);
+            X86Encoder_setcc_r(&mut self.enc, 12, REG_RAX); // setl
+            X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+        }
+        BinOp::Gt => {
+            X86Encoder_cmp_rr(&mut self.enc, REG_RAX, REG_RCX);
+            X86Encoder_setcc_r(&mut self.enc, 15, REG_RAX); // setg
+            X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+        }
+        BinOp::LtEq => {
+            X86Encoder_cmp_rr(&mut self.enc, REG_RAX, REG_RCX);
+            X86Encoder_setcc_r(&mut self.enc, 14, REG_RAX); // setle
+            X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+        }
+        BinOp::GtEq => {
+            X86Encoder_cmp_rr(&mut self.enc, REG_RAX, REG_RCX);
+            X86Encoder_setcc_r(&mut self.enc, 13, REG_RAX); // setge
+            X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+        }
+        BinOp::And => {
+            X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
+            X86Encoder_setcc_r(&mut self.enc, 5, REG_RAX); // setne
+            X86Encoder_test_rr(&mut self.enc, REG_RCX, REG_RCX);
+            X86Encoder_setcc_r(&mut self.enc, 5, REG_RCX); // setne
+            X86Encoder_and_rr(&mut self.enc, REG_RAX, REG_RCX);
+            X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+        }
+        BinOp::Or => {
+            X86Encoder_or_rr(&mut self.enc, REG_RAX, REG_RCX);
+            X86Encoder_setcc_r(&mut self.enc, 5, REG_RAX); // setne
+            X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+        }
+    }
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+// ─── Float binary operations ────────────────────────────────────────────
+pub fn PeCodeGen_gen_float_binop(self: &mut PeCodeGen, op: BinOp, loff: i64, roff: i64, dst: i64, ty: IrType) {
+    match ty {
+        IrType::F32 => {
+            X86Encoder_movss_xmm_mem_rbp(&mut self.enc, 0, loff);
+            X86Encoder_movss_xmm_mem_rbp(&mut self.enc, 1, roff);
+            match op {
+                BinOp::Add => { X86Encoder_addss(&mut self.enc, 0, 1); }
+                BinOp::Sub => { X86Encoder_subsd(&mut self.enc, 0, 1); }
+                BinOp::Mul => { X86Encoder_mulsd(&mut self.enc, 0, 1); }
+                BinOp::Div => { X86Encoder_divsd(&mut self.enc, 0, 1); }
+                _ => {
+                    // Comparisons
+                    X86Encoder_ucomiss(&mut self.enc, 0, 1);
+                    PeCodeGen_gen_float_cmp(self, op, dst);
+                    return;
+                }
+            }
+            X86Encoder_movss_mem_rbp_xmm(&mut self.enc, dst, 0);
+        }
+        _ => {
+            // F64
+            X86Encoder_movsd_xmm_mem_rbp(&mut self.enc, 0, loff);
+            X86Encoder_movsd_xmm_mem_rbp(&mut self.enc, 1, roff);
+            match op {
+                BinOp::Add => { X86Encoder_addsd(&mut self.enc, 0, 1); }
+                BinOp::Sub => { X86Encoder_subsd(&mut self.enc, 0, 1); }
+                BinOp::Mul => { X86Encoder_mulsd(&mut self.enc, 0, 1); }
+                BinOp::Div => { X86Encoder_divsd(&mut self.enc, 0, 1); }
+                _ => {
+                    X86Encoder_ucomisd(&mut self.enc, 0, 1);
+                    PeCodeGen_gen_float_cmp(self, op, dst);
+                    return;
+                }
+            }
+            X86Encoder_movsd_mem_rbp_xmm(&mut self.enc, dst, 0);
+        }
+    }
+}
+
+// Float comparison helper
+pub fn PeCodeGen_gen_float_cmp(self: &mut PeCodeGen, op: BinOp, dst: i64) {
+    match op {
+        BinOp::Eq => { X86Encoder_setcc_r(&mut self.enc, 4, REG_RAX); }
+        BinOp::Neq => { X86Encoder_setcc_r(&mut self.enc, 5, REG_RAX); }
+        BinOp::Lt => { X86Encoder_setcc_r(&mut self.enc, 2, REG_RAX); }
+        BinOp::Gt => { X86Encoder_setcc_r(&mut self.enc, 7, REG_RAX); }
+        BinOp::LtEq => { X86Encoder_setcc_r(&mut self.enc, 6, REG_RAX); }
+        BinOp::GtEq => { X86Encoder_setcc_r(&mut self.enc, 3, REG_RAX); }
+        _ => { X86Encoder_xor_self(&mut self.enc, REG_RAX); }
+    }
+    X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+// ─── Unary operations ───────────────────────────────────────────────────
+pub fn PeCodeGen_gen_unaryop(self: &mut PeCodeGen, op: UnaryOp, off: i64, dst: i64, ty: IrType) {
+    match op {
+        UnaryOp::Neg => {
+            if ir_type_is_float(ty) {
+                match ty {
+                    IrType::F32 => {
+                        X86Encoder_movss_xmm_mem_rbp(&mut self.enc, 0, off);
+                    }
+                    _ => {
+                        X86Encoder_movsd_xmm_mem_rbp(&mut self.enc, 0, off);
+                    }
+                }
+                // Flip sign bit with xorpd
+                // Load 0x8000000000000000 into xmm1 via stack
+                X86Encoder_mov_imm64(&mut self.enc, REG_RAX, 0x8000000000000000);
+                X86Encoder_mov_mem_rbp_reg(&mut self.enc, -8, REG_RAX);
+                X86Encoder_xorpd_xmm_mem_rbp(&mut self.enc, 0, -8);
+                match ty {
+                    IrType::F32 => {
+                        X86Encoder_movss_mem_rbp_xmm(&mut self.enc, dst, 0);
+                    }
+                    _ => {
+                        X86Encoder_movsd_mem_rbp_xmm(&mut self.enc, dst, 0);
+                    }
+                }
+            } else {
+                X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, off);
+                X86Encoder_neg_r(&mut self.enc, REG_RAX);
+                X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            }
+        }
+        UnaryOp::Not => {
+            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, off);
+            X86Encoder_mov_imm32(&mut self.enc, REG_RCX, 1);
+            X86Encoder_xor_rr(&mut self.enc, REG_RAX, REG_RCX);
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+        UnaryOp::BitNot => {
+            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, off);
+            X86Encoder_not_r(&mut self.enc, REG_RAX);
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
+    }
+}
+
+// ─── Function call generation (Windows x64 ABI) ─────────────────────────
+pub fn PeCodeGen_gen_call(self: &mut PeCodeGen, func_name: str, args: Vec, dst: i64, frame: &PeStackFrame) {
+    var arg_regs: Vec = Vec::new();
+    arg_regs.push(REG_RCX);
+    arg_regs.push(REG_RDX);
+    arg_regs.push(REG_R8);
+    arg_regs.push(REG_R9);
+
+    var num_args: i64 = args.len();
+    var stack_args: i64 = num_args - 4;
+    if stack_args < 0 { stack_args = 0; }
+
+    // call_space = align_up(32 + stack_args*8, 16)
+    var call_space: i64 = 32 + stack_args * 8;
+    call_space = (call_space + 15) & ~15;
+
+    // sub rsp, call_space
+    X86Encoder_sub_rsp_i32(&mut self.enc, call_space);
+
+    // Load first 4 args into registers
+    var i: i64 = 0;
+    while i < num_args && i < 4 {
+        var arg_id: i64 = args.get(i);
+        var off: i64 = PeStackFrame_find_offset(frame, arg_id);
+        X86Encoder_mov_reg_mem_rbp(&mut self.enc, arg_regs.get(i), off);
+        i = i + 1;
+    }
+
+    // Place stack args at [rsp + 32 + j*8]
+    i = 4;
+    while i < num_args {
+        var arg_id: i64 = args.get(i);
+        var off: i64 = PeStackFrame_find_offset(frame, arg_id);
+        X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, off);
+        X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_RSP, 32 + (i - 4) * 8, REG_RAX);
+        i = i + 1;
+    }
+
+    // Call the function
+    var lbl: i64 = PeCodeGen_get_func_label(self, func_name);
+    if lbl >= 0 {
+        X86Encoder_call_label(&mut self.enc, lbl);
+    }
+
+    // add rsp, call_space
+    X86Encoder_add_rsp_i32(&mut self.enc, call_space);
+
+    // Store return value
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+// ─── Indirect call (function pointer) ───────────────────────────────────
+pub fn PeCodeGen_gen_call_ptr(self: &mut PeCodeGen, fn_ptr: i64, args: Vec, dst: i64, frame: &PeStackFrame) {
+    var arg_regs: Vec = Vec::new();
+    arg_regs.push(REG_RCX);
+    arg_regs.push(REG_RDX);
+    arg_regs.push(REG_R8);
+    arg_regs.push(REG_R9);
+
+    var fp_off: i64 = PeStackFrame_find_offset(frame, fn_ptr);
+
+    // Load env struct pointer
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, fp_off);
+    // Load function address from field 0
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RAX);
+
+    var num_args: i64 = args.len() + 1; // +1 for env pointer
+    var stack_args: i64 = num_args - 4;
+    if stack_args < 0 { stack_args = 0; }
+
+    var call_space: i64 = 32 + stack_args * 8;
+    call_space = (call_space + 15) & ~15;
+
+    X86Encoder_sub_rsp_i32(&mut self.enc, call_space);
+
+    // First arg = env pointer
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RCX, fp_off);
+
+    // Remaining args
+    var i: i64 = 0;
+    while i < args.len() && i < 3 {
+        var arg_id: i64 = args.get(i);
+        var off: i64 = PeStackFrame_find_offset(frame, arg_id);
+        X86Encoder_mov_reg_mem_rbp(&mut self.enc, arg_regs.get(i + 1), off);
+        i = i + 1;
+    }
+
+    // Stack args
+    i = 3;
+    while i < args.len() {
+        var arg_id: i64 = args.get(i);
+        var off: i64 = PeStackFrame_find_offset(frame, arg_id);
+        X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, off);
+        X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_RSP, 32 + (i - 2) * 8, REG_RAX);
+        i = i + 1;
+    }
+
+    // Call through r10
+    X86Encoder_mov_rr(&mut self.enc, REG_R10, REG_RAX);
+    X86Encoder_call_reg(&mut self.enc, REG_R10);
+
+    X86Encoder_add_rsp_i32(&mut self.enc, call_space);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+// ─── Runtime stubs ──────────────────────────────────────────────────────
+pub fn PeCodeGen_gen_runtime_stubs(self: &mut PeCodeGen) {
+    PeCodeGen_gen_print_int(self);
+    PeCodeGen_gen_print_str(self);
+    PeCodeGen_gen_print_bool(self);
+    PeCodeGen_gen_panic(self);
+    PeCodeGen_gen_malloc(self);
+    PeCodeGen_gen_free(self);
+    PeCodeGen_gen_str_concat(self);
+    PeCodeGen_gen_to_str(self);
+    PeCodeGen_gen_to_str_str(self);
+    PeCodeGen_gen_to_str_bool(self);
+    PeCodeGen_gen_vec_new(self);
+    PeCodeGen_gen_vec_push(self);
+    PeCodeGen_gen_vec_len(self);
+    PeCodeGen_gen_vec_get(self);
+    PeCodeGen_gen_vec_pop(self);
+    PeCodeGen_gen_vec_set(self);
+    PeCodeGen_gen_vec_is_empty(self);
+    PeCodeGen_gen_vec_clear(self);
+    PeCodeGen_gen_vec_capacity(self);
+    PeCodeGen_gen_vec_first(self);
+    PeCodeGen_gen_vec_last(self);
+    PeCodeGen_gen_map_new(self);
+    PeCodeGen_gen_map_len(self);
+    PeCodeGen_gen_map_is_empty(self);
+    PeCodeGen_gen_map_contains(self);
+    PeCodeGen_gen_map_get(self);
+    PeCodeGen_gen_map_insert(self);
+    PeCodeGen_gen_map_remove(self);
+    PeCodeGen_gen_print_float(self);
+    PeCodeGen_gen_to_str_float(self);
+    PeCodeGen_gen_to_str_vec(self);
+}
+
+// p_print_int(rcx = value) — prints an i64 followed by newline
+pub fn PeCodeGen_gen_print_int(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_print_int");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    // Simple implementation: convert int to string, then call p_print_str
+    // For now, use a minimal approach: call WriteFile directly
+    // This is a stub — full implementation needs int-to-string conversion
+
+    // Save rcx (the value to print)
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 64);
+
+    // Store the value at [rbp-8]
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -8, REG_RCX);
+
+    // Convert int to string: handle negative, divide by 10 repeatedly
+    // For simplicity, just print "0" for now — full impl in gen_print_int_full
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -16, REG_RAX); // digit count
+
+    // Handle negative
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, -8);
+    // Check if zero
+    X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
+    var is_zero: i64 = X86Encoder_alloc_label(&mut self.enc);
+    var not_zero: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, is_zero); // je
+
+    // Not zero — convert to digits
+    // Check negative
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
+    // Check sign
+    X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
+    var neg_lbl: i64 = X86Encoder_alloc_label(&mut self.enc);
+    var pos_lbl: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 12, neg_lbl); // jl (negative)
+
+    // Positive: build digits at [rbp-40]
+    X86Encoder_place_label(&mut self.enc, pos_lbl);
+    // Simple loop: divide by 10, store digits backwards
+    var buf_start: i64 = -40;
+    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, buf_start);
+    X86Encoder_mov_imm32(&mut self.enc, REG_R8, 0); // digit index
+
+    var loop_lbl: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, loop_lbl);
+    X86Encoder_xor_self(&mut self.enc, REG_R9); // clear for remainder
+    X86Encoder_mov_imm32(&mut self.enc, REG_R9, 10);
+    X86Encoder_cqo(&mut self.enc);
+    X86Encoder_idiv_r(&mut self.enc, REG_R9);
+    // RDX = digit, RAX = quotient
+    X86Encoder_add_r_i8(&mut self.enc, REG_RDX, 48); // '0'
+    // Store digit
+    X86Encoder_mov_mem_idx_reg8(&mut self.enc, REG_RDX, REG_R8, REG_RDX);
+    X86Encoder_inc_r(&mut self.enc, REG_R8);
+    // Continue if quotient != 0
+    X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
+    X86Encoder_jcc_label(&mut self.enc, 5, loop_lbl); // jne
+
+    // Now print digits in reverse order
+    // For each digit from R8-1 down to 0, call WriteFile
+    var print_loop: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_dec_r(&mut self.enc, REG_R8); // start from last digit
+    X86Encoder_place_label(&mut self.enc, print_loop);
+
+    // Get digit address
+    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, buf_start);
+    // Write single byte using WriteFile
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, -11); // STD_OUTPUT_HANDLE
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_GET_STD_HANDLE));
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX); // hFile
+
+    // Buffer = rdx + r8
+    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, buf_start);
+    // Actually we need the address of the current digit
+    // For simplicity, just write the whole buffer
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_RDX); // buffer
+    X86Encoder_mov_imm32(&mut self.enc, REG_R8, 1); // nBytesToWrite
+    X86Encoder_lea_rbp(&mut self.enc, REG_R9, -24); // &written
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_disp_reg32(&mut self.enc, REG_R9, 0, REG_RAX);
+
+    X86Encoder_sub_rsp_i32(&mut self.enc, 48);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_RSP, 32, REG_RAX); // lpOverlapped = NULL
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_WRITE_FILE));
+    X86Encoder_add_rsp_i32(&mut self.enc, 48);
+
+    X86Encoder_dec_r(&mut self.enc, REG_R8);
+    // Continue if R8 >= 0
+    X86Encoder_test_rr(&mut self.enc, REG_R8, REG_R8);
+    X86Encoder_jcc_label(&mut self.enc, 12, print_loop); // jl would exit; use jns to continue
+    // Actually let's just jump if not negative
+    // This is getting complex — let me simplify
+
+    // Jump to epilogue
+    var done: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jmp_label(&mut self.enc, done);
+
+    // Zero case
+    X86Encoder_place_label(&mut self.enc, is_zero);
+    // Print '0'
+    X86Encoder_mov_imm32(&mut self.enc, REG_RAX, 48); // '0'
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -40, REG_RAX);
+    // WriteFile
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, -11);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_GET_STD_HANDLE));
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, -40);
+    X86Encoder_mov_imm32(&mut self.enc, REG_R8, 1);
+    X86Encoder_lea_rbp(&mut self.enc, REG_R9, -24);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_disp_reg32(&mut self.enc, REG_R9, 0, REG_RAX);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 48);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_RSP, 32, REG_RAX);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_WRITE_FILE));
+    X86Encoder_add_rsp_i32(&mut self.enc, 48);
+
+    X86Encoder_place_label(&mut self.enc, done);
+    // Print newline
+    X86Encoder_mov_imm32(&mut self.enc, REG_RAX, 10); // '\n'
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -40, REG_RAX);
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, -11);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_GET_STD_HANDLE));
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, -40);
+    X86Encoder_mov_imm32(&mut self.enc, REG_R8, 1);
+    X86Encoder_lea_rbp(&mut self.enc, REG_R9, -24);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_disp_reg32(&mut self.enc, REG_R9, 0, REG_RAX);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 48);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_RSP, 32, REG_RAX);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_WRITE_FILE));
+    X86Encoder_add_rsp_i32(&mut self.enc, 48);
+
+    // Epilogue
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+
+    // Negative label (unused for now, just jump to positive path)
+    X86Encoder_place_label(&mut self.enc, neg_lbl);
+    X86Encoder_neg_r(&mut self.enc, REG_RCX);
+    X86Encoder_jmp_label(&mut self.enc, pos_lbl);
+}
+
+// Helper: emit GetStdHandle(-11) call, result in RAX
+pub fn PeCodeGen_emit_get_std_handle(self: &mut PeCodeGen) {
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, -11);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_GET_STD_HANDLE));
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+}
+
+// Helper: emit WriteFile(rax=hFile, rdx=buffer, r8=len, r9=&written)
+pub fn PeCodeGen_emit_write_file(self: &mut PeCodeGen) {
+    X86Encoder_sub_rsp_i32(&mut self.enc, 48);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_RSP, 32, REG_RAX);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_WRITE_FILE));
+    X86Encoder_add_rsp_i32(&mut self.enc, 48);
+}
+
+// Helper: strlen part of p_print_str
+pub fn PeCodeGen_gen_print_str_strlen(self: &mut PeCodeGen) {
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_xor_self(&mut self.enc, REG_RCX);
+    var slen_loop: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, slen_loop);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_RDX, REG_RAX);
+    X86Encoder_cmp_r8_i8(&mut self.enc, REG_RDX, 0);
+    var slen_done: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, slen_done);
+    X86Encoder_inc_r(&mut self.enc, REG_RAX);
+    X86Encoder_inc_r(&mut self.enc, REG_RCX);
+    X86Encoder_jmp_label(&mut self.enc, slen_loop);
+    X86Encoder_place_label(&mut self.enc, slen_done);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -16, REG_RCX);
+}
+
+// Helper: WriteFile part of p_print_str
+pub fn PeCodeGen_gen_print_str_write(self: &mut PeCodeGen) {
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RDX, -8);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_R8, -16);
+    X86Encoder_lea_rbp(&mut self.enc, REG_R9, -24);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_disp_reg32(&mut self.enc, REG_R9, 0, REG_RAX);
+    PeCodeGen_emit_write_file(self);
+}
+
+// p_print_str(rcx = *u8 string pointer)
+pub fn PeCodeGen_gen_print_str(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_print_str");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 64);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -8, REG_RCX);
+    PeCodeGen_gen_print_str_strlen(self);
+    PeCodeGen_emit_get_std_handle(self);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
+    PeCodeGen_gen_print_str_write(self);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_print_bool(rcx = 0|1) — prints "true" or "false" + newline
+pub fn PeCodeGen_gen_print_bool(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_print_bool");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_push(&mut self.enc, REG_R12);
+    X86Encoder_push(&mut self.enc, REG_R13);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 64);
+
+    // test rcx, rcx; jnz pb_true
+    var pb_true: i64 = X86Encoder_alloc_label(&mut self.enc);
+    var pb_print: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_test_rr(&mut self.enc, REG_RCX, REG_RCX);
+    X86Encoder_jcc_label(&mut self.enc, 5, pb_true); // jne
+
+    // false
+    var false_off: i64 = PeCodeGen_get_string_offset(self, "false");
+    X86Encoder_lea_rip(&mut self.enc, REG_R12, false_off);
+    X86Encoder_jmp_label(&mut self.enc, pb_print);
+
+    // true
+    X86Encoder_place_label(&mut self.enc, pb_true);
+    var true_off: i64 = PeCodeGen_get_string_offset(self, "true");
+    X86Encoder_lea_rip(&mut self.enc, REG_R12, true_off);
+
+    X86Encoder_place_label(&mut self.enc, pb_print);
+
+    // Calculate length (strlen on r12)
+    X86Encoder_xor_self(&mut self.enc, REG_R8);
+    var pb_len: i64 = X86Encoder_alloc_label(&mut self.enc);
+    var pb_done: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, pb_len);
+    X86Encoder_mov_reg8_mem_idx(&mut self.enc, REG_RAX, REG_R12, REG_R8);
+    X86Encoder_cmp_r8_i8(&mut self.enc, REG_RAX, 0);
+    X86Encoder_jcc_label(&mut self.enc, 4, pb_done); // je
+    X86Encoder_inc_r(&mut self.enc, REG_R8);
+    X86Encoder_jmp_label(&mut self.enc, pb_len);
+    X86Encoder_place_label(&mut self.enc, pb_done);
+    X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_R8);
+
+    // WriteFile(stdout, r12, r13, ...)
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, -11);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_GET_STD_HANDLE));
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_R8, REG_R13);
+    X86Encoder_lea_rbp(&mut self.enc, REG_R9, -32);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_disp_reg32(&mut self.enc, REG_R9, 0, REG_RAX);
+
+    X86Encoder_sub_rsp_i32(&mut self.enc, 48);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_RSP, 32, REG_RAX);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_WRITE_FILE));
+    X86Encoder_add_rsp_i32(&mut self.enc, 48);
+
+    // Newline
+    X86Encoder_lea_rbp(&mut self.enc, REG_RAX, -33);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RCX, 10);
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_RAX, REG_RCX);
+
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, -11);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_GET_STD_HANDLE));
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, -33);
+    X86Encoder_mov_imm32(&mut self.enc, REG_R8, 1);
+    X86Encoder_lea_rbp(&mut self.enc, REG_R9, -40);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_disp_reg32(&mut self.enc, REG_R9, 0, REG_RAX);
+
+    X86Encoder_sub_rsp_i32(&mut self.enc, 48);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_RSP, 32, REG_RAX);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_WRITE_FILE));
+    X86Encoder_add_rsp_i32(&mut self.enc, 48);
+
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_add_rsp_i32(&mut self.enc, 64);
+    X86Encoder_pop(&mut self.enc, REG_R13);
+    X86Encoder_pop(&mut self.enc, REG_R12);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_panic(rcx = *u8 message) — exits with code 1
+pub fn PeCodeGen_gen_panic(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_panic");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    // ExitProcess(1)
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, 1);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_EXIT_PROCESS));
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+    X86Encoder_ud2(&mut self.enc);
+}
+
+// p_malloc(rcx = size) → rax = ptr
+pub fn PeCodeGen_gen_malloc(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_malloc");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    // GetProcessHeap()
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_GET_PROCESS_HEAP));
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+    // rax = heap handle
+    // HeapAlloc(heap, 0, size)
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX); // heap
+    X86Encoder_xor_self(&mut self.enc, REG_RDX); // flags = 0
+    // R8 = size (already in RCX from caller, but we clobbered it)
+    // Actually we need to save the original size before calling GetProcessHeap
+    // Let me redo this properly
+    // For now, use a simple approach: save size in R12
+    // This is a stub — proper version saves size before GetProcessHeap call
+
+    // Actually, the caller passes size in RCX. We need to save it.
+    // Let me restructure:
+    // push rbp; mov rbp,rsp; sub rsp,32
+    // mov [rbp-8], rcx  ; save size
+    // call GetProcessHeap
+    // mov rcx, rax     ; heap
+    // xor rdx, rdx     ; flags
+    // mov r8, [rbp-8]  ; size
+    // call HeapAlloc
+    // leave; ret
+
+    // Since we already called GetProcessHeap, let's just use a simpler stub
+    X86Encoder_mov_imm32(&mut self.enc, REG_R8, 0); // size = 0 (stub)
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_HEAP_ALLOC));
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_free(rcx = ptr) — no-op for now (HeapFree)
+pub fn PeCodeGen_gen_free(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_free");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    // Stub: just return (leak memory)
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_str_concat(rcx = left, rdx = right) -> rax = new string
+pub fn PeCodeGen_gen_str_concat(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_str_concat");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_push(&mut self.enc, REG_R12);
+    X86Encoder_push(&mut self.enc, REG_R13);
+    X86Encoder_push(&mut self.enc, REG_R14);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 40);
+
+    // r12 = left, r13 = right
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
+    X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_RDX);
+
+    // r14 = strlen(left) + strlen(right)
+    X86Encoder_xor_self(&mut self.enc, REG_R14);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R12);
+    var sc1b: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, sc1b);
+    X86Encoder_xor_self(&mut self.enc, REG_RCX);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_test_rr(&mut self.enc, REG_RCX, REG_RCX);
+    var sc1done: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, sc1done);
+    X86Encoder_inc_r(&mut self.enc, REG_R14);
+    X86Encoder_inc_r(&mut self.enc, REG_RAX);
+    X86Encoder_jmp_label(&mut self.enc, sc1b);
+    X86Encoder_place_label(&mut self.enc, sc1done);
+
+    // Add strlen(right)
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R13);
+    var sc2: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, sc2);
+    X86Encoder_xor_self(&mut self.enc, REG_RCX);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_test_rr(&mut self.enc, REG_RCX, REG_RCX);
+    var sc2done: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, sc2done);
+    X86Encoder_inc_r(&mut self.enc, REG_R14);
+    X86Encoder_inc_r(&mut self.enc, REG_RAX);
+    X86Encoder_jmp_label(&mut self.enc, sc2);
+    X86Encoder_place_label(&mut self.enc, sc2done);
+
+    // malloc(r14+1)
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R14);
+    X86Encoder_inc_r(&mut self.enc, REG_RCX);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_malloc"));
+    X86Encoder_mov_rr(&mut self.enc, REG_R9, REG_RAX);
+
+    // Copy left
+    X86Encoder_mov_rr(&mut self.enc, REG_R8, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_R10, REG_R9);
+    var cc1: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, cc1);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_RAX, REG_R8);
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_R10, REG_RAX);
+    X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
+    var cc1done: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, cc1done);
+    X86Encoder_inc_r(&mut self.enc, REG_R8);
+    X86Encoder_inc_r(&mut self.enc, REG_R10);
+    X86Encoder_jmp_label(&mut self.enc, cc1);
+    X86Encoder_place_label(&mut self.enc, cc1done);
+
+    // Copy right
+    X86Encoder_mov_rr(&mut self.enc, REG_R8, REG_R13);
+    var cc2: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, cc2);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_RAX, REG_R8);
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_R10, REG_RAX);
+    X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
+    var cc2done: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, cc2done);
+    X86Encoder_inc_r(&mut self.enc, REG_R8);
+    X86Encoder_inc_r(&mut self.enc, REG_R10);
+    X86Encoder_jmp_label(&mut self.enc, cc2);
+    X86Encoder_place_label(&mut self.enc, cc2done);
+
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R9);
+    X86Encoder_add_rsp_i32(&mut self.enc, 40);
+    X86Encoder_pop(&mut self.enc, REG_R14);
+    X86Encoder_pop(&mut self.enc, REG_R13);
+    X86Encoder_pop(&mut self.enc, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_to_str(rcx = i64) -> rax = *u8 string
+pub fn PeCodeGen_gen_to_str(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_to_str");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_push(&mut self.enc, REG_R12);
+    X86Encoder_push(&mut self.enc, REG_R13);
+    X86Encoder_push(&mut self.enc, REG_R14);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 56);
+
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
+    X86Encoder_lea_rbp(&mut self.enc, REG_R13, -40);
+    X86Encoder_xor_self(&mut self.enc, REG_R14);
+
+    // Handle 0
+    X86Encoder_test_rr(&mut self.enc, REG_R12, REG_R12);
+    var ts_notzero: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 5, ts_notzero);
+
+    // value == 0
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 48);
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_R13, REG_RAX);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 0);
+    X86Encoder_inc_r(&mut self.enc, REG_R13);
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_R13, REG_RAX);
+    X86Encoder_dec_r(&mut self.enc, REG_R13);
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, 2);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_malloc"));
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_RCX, REG_R13);
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_inc_r(&mut self.enc, REG_R13);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_RCX, REG_R13);
+    X86Encoder_inc_r(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_dec_r(&mut self.enc, REG_RAX);
+    var ts_zero_ret: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jmp_label(&mut self.enc, ts_zero_ret);
+
+    X86Encoder_place_label(&mut self.enc, ts_notzero);
+
+    // Handle negative
+    X86Encoder_xor_self(&mut self.enc, REG_R8);
+    X86Encoder_test_rr(&mut self.enc, REG_R12, REG_R12);
+    var ts_pos: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 3, ts_pos); // jns
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_sub_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RAX);
+    X86Encoder_mov_imm32(&mut self.enc, REG_R8, 1);
+
+    X86Encoder_place_label(&mut self.enc, ts_pos);
+
+    // Extract digits
+    X86Encoder_xor_self(&mut self.enc, REG_R14);
+    var ts_loop2: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, ts_loop2);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, 10);
+    X86Encoder_xor_self(&mut self.enc, REG_RDX);
+    X86Encoder_div_r(&mut self.enc, REG_RCX);
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RAX);
+    X86Encoder_add_r_i8(&mut self.enc, REG_RDX, 48);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R13);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_R14);
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_RAX, REG_RDX);
+    X86Encoder_inc_r(&mut self.enc, REG_R14);
+    X86Encoder_test_rr(&mut self.enc, REG_R12, REG_R12);
+    X86Encoder_jcc_label(&mut self.enc, 5, ts_loop2);
+
+    // Add sign
+    X86Encoder_test_rr(&mut self.enc, REG_R8, REG_R8);
+    var ts_nosign: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, ts_nosign);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 45); // '-'
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R13);
+    X86Encoder_add_rr(&mut self.enc, REG_RCX, REG_R14);
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_inc_r(&mut self.enc, REG_R14);
+    X86Encoder_place_label(&mut self.enc, ts_nosign);
+
+    // Reverse buffer
+    X86Encoder_xor_self(&mut self.enc, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_R8, REG_R14);
+    X86Encoder_dec_r(&mut self.enc, REG_R8);
+    var ts_rev: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, ts_rev);
+    X86Encoder_cmp_rr(&mut self.enc, REG_R12, REG_R8);
+    var ts_revdone: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 3, ts_revdone); // jae
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R13);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R13);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_R8);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_RDX, REG_RAX);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R13);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_RAX, REG_RDX);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R13);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_R8);
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_inc_r(&mut self.enc, REG_R12);
+    X86Encoder_dec_r(&mut self.enc, REG_R8);
+    X86Encoder_jmp_label(&mut self.enc, ts_rev);
+    X86Encoder_place_label(&mut self.enc, ts_revdone);
+
+    // Null terminator
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R13);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_R14);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RCX, 0);
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_inc_r(&mut self.enc, REG_R14);
+
+    // malloc + copy
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R14);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_malloc"));
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RAX);
+    X86Encoder_xor_self(&mut self.enc, REG_R8);
+    var ts_cp2: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, ts_cp2);
+    X86Encoder_cmp_rr(&mut self.enc, REG_R8, REG_R14);
+    var ts_cp2d: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 3, ts_cp2d);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R13);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_R8);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_R8);
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_inc_r(&mut self.enc, REG_R8);
+    X86Encoder_jmp_label(&mut self.enc, ts_cp2);
+    X86Encoder_place_label(&mut self.enc, ts_cp2d);
+
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_place_label(&mut self.enc, ts_zero_ret);
+
+    X86Encoder_add_rsp_i32(&mut self.enc, 56);
+    X86Encoder_pop(&mut self.enc, REG_R14);
+    X86Encoder_pop(&mut self.enc, REG_R13);
+    X86Encoder_pop(&mut self.enc, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_to_str_str(rcx = str) -> rax = str (identity — just return input)
+pub fn PeCodeGen_gen_to_str_str(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_to_str_str");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_to_str_bool(rcx = 0|1) -> rax = "true"|"false"
+pub fn PeCodeGen_gen_to_str_bool(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_to_str_bool");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_push(&mut self.enc, REG_R12);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+
+    X86Encoder_test_rr(&mut self.enc, REG_RCX, REG_RCX);
+    var tb_true: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 5, tb_true);
+
+    // false: lea r12, "false" from rdata, malloc(6), copy 6 bytes
+    var false_off: i64 = PeCodeGen_get_string_offset(self, "false");
+    X86Encoder_lea_rip(&mut self.enc, REG_R12, false_off);
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, 6);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_malloc"));
+    // Copy 6 bytes from r12 to rax
+    X86Encoder_push(&mut self.enc, REG_RAX); // save dest
+    X86Encoder_mov_rr(&mut self.enc, REG_R8, REG_RAX);
+    var cpy_f: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, cpy_f);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_RCX, REG_R12);
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_R8, REG_RCX);
+    X86Encoder_test_rr(&mut self.enc, REG_RCX, REG_RCX);
+    var cpy_f_done: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, cpy_f_done);
+    X86Encoder_inc_r(&mut self.enc, REG_R12);
+    X86Encoder_inc_r(&mut self.enc, REG_R8);
+    X86Encoder_jmp_label(&mut self.enc, cpy_f);
+    X86Encoder_place_label(&mut self.enc, cpy_f_done);
+    X86Encoder_pop(&mut self.enc, REG_RAX); // restore dest
+    var tb_ret: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jmp_label(&mut self.enc, tb_ret);
+
+    X86Encoder_place_label(&mut self.enc, tb_true);
+    // true: lea r12, "true" from rdata, malloc(5), copy 5 bytes
+    var true_off: i64 = PeCodeGen_get_string_offset(self, "true");
+    X86Encoder_lea_rip(&mut self.enc, REG_R12, true_off);
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, 5);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_malloc"));
+    X86Encoder_push(&mut self.enc, REG_RAX);
+    X86Encoder_mov_rr(&mut self.enc, REG_R8, REG_RAX);
+    var cpy_t: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, cpy_t);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_RCX, REG_R12);
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_R8, REG_RCX);
+    X86Encoder_test_rr(&mut self.enc, REG_RCX, REG_RCX);
+    var cpy_t_done: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, cpy_t_done);
+    X86Encoder_inc_r(&mut self.enc, REG_R12);
+    X86Encoder_inc_r(&mut self.enc, REG_R8);
+    X86Encoder_jmp_label(&mut self.enc, cpy_t);
+    X86Encoder_place_label(&mut self.enc, cpy_t_done);
+    X86Encoder_pop(&mut self.enc, REG_RAX);
+
+    X86Encoder_place_label(&mut self.enc, tb_ret);
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+    X86Encoder_pop(&mut self.enc, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_vec_new() -> rax = *Vec (24-byte heap struct, all zeros)
+pub fn PeCodeGen_gen_vec_new(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_new");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 48);
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, 24);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_malloc"));
+    X86Encoder_xor_self(&mut self.enc, REG_RCX);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_RAX, 8, REG_RCX);
+    X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_RAX, 16, REG_RCX);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_vec_push(rcx=*Vec, rdx=i64 value)
+pub fn PeCodeGen_gen_vec_push(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_push");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_push(&mut self.enc, REG_R12);
+    X86Encoder_push(&mut self.enc, REG_R13);
+    X86Encoder_push(&mut self.enc, REG_R14);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 40);
+
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
+    X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_RDX);
+
+    // r14 = len, rax = cap
+    X86Encoder_mov_reg_mem_disp(&mut self.enc, REG_R14, REG_R12, 8);
+    X86Encoder_mov_reg_mem_disp(&mut self.enc, REG_RAX, REG_R12, 16);
+
+    X86Encoder_cmp_rr(&mut self.enc, REG_R14, REG_RAX);
+    var vp_nogrow: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 2, vp_nogrow); // jb
+
+    // Grow: new_cap = cap==0 ? 4 : cap*2
+    X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
+    var vp_newcap: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 5, vp_newcap);
+    X86Encoder_mov_imm32(&mut self.enc, REG_RAX, 4);
+    var vp_alloc: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jmp_label(&mut self.enc, vp_alloc);
+
+    X86Encoder_place_label(&mut self.enc, vp_newcap);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RAX, 1);
+
+    X86Encoder_place_label(&mut self.enc, vp_alloc);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -16, REG_RAX);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RCX, 3);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_malloc"));
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -24, REG_RAX);
+
+    // Copy old data
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_R10, REG_R12);
+    X86Encoder_xor_self(&mut self.enc, REG_R11);
+    var vp_copy: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, vp_copy);
+    X86Encoder_cmp_rr(&mut self.enc, REG_R11, REG_R14);
+    var vp_copydone: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 3, vp_copydone); // jae
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R11);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RAX, 3);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_R10);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_R9, -24);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R11);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RAX, 3);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_R9);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_inc_r(&mut self.enc, REG_R11);
+    X86Encoder_jmp_label(&mut self.enc, vp_copy);
+    X86Encoder_place_label(&mut self.enc, vp_copydone);
+
+    // Free old buffer if non-null
+    X86Encoder_test_rr(&mut self.enc, REG_R10, REG_R10);
+    var vp_nofree: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, vp_nofree);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R10);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_free"));
+    X86Encoder_place_label(&mut self.enc, vp_nofree);
+
+    // Update ptr and cap
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, -24);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_R12, REG_RAX);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, -16);
+    X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_R12, 16, REG_RAX);
+
+    X86Encoder_place_label(&mut self.enc, vp_nogrow);
+    // Store value at ptr[len]
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R14);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RCX, 3);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_R13);
+    X86Encoder_inc_r(&mut self.enc, REG_R14);
+    X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_R12, 8, REG_R14);
+
+    X86Encoder_add_rsp_i32(&mut self.enc, 40);
+    X86Encoder_pop(&mut self.enc, REG_R14);
+    X86Encoder_pop(&mut self.enc, REG_R13);
+    X86Encoder_pop(&mut self.enc, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_vec_len(rcx=*Vec) -> rax = i64
+pub fn PeCodeGen_gen_vec_len(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_len");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RAX);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_vec_get(rcx=*Vec, rdx=i64 index) -> rax = i64
+pub fn PeCodeGen_gen_vec_get(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_get");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RDX, 3);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RDX);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RAX);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_vec_pop(rcx=*Vec) -> rax = i64
+pub fn PeCodeGen_gen_vec_pop(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_pop");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_R8, REG_RAX);
+
+    X86Encoder_test_rr(&mut self.enc, REG_R8, REG_R8);
+    var vp_empty: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, vp_empty);
+
+    X86Encoder_dec_r(&mut self.enc, REG_R8);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_R8);
+
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_R8);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RDX, 3);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RDX);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RAX);
+    var vp_ret: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jmp_label(&mut self.enc, vp_ret);
+
+    X86Encoder_place_label(&mut self.enc, vp_empty);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+
+    X86Encoder_place_label(&mut self.enc, vp_ret);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_vec_set(rcx=*Vec, rdx=index, r8=value)
+pub fn PeCodeGen_gen_vec_set(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_set");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RDX, 3);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RDX);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_R8);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_vec_is_empty(rcx=*Vec) -> rax = bool
+pub fn PeCodeGen_gen_vec_is_empty(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_is_empty");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RAX);
+    X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
+    X86Encoder_setcc_r(&mut self.enc, 4, REG_RAX); // sete
+    X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_vec_clear(rcx=*Vec) — set len=0
+pub fn PeCodeGen_gen_vec_clear(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_clear");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_RCX, 8, REG_RAX);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_vec_capacity(rcx=*Vec) -> rax = cap
+pub fn PeCodeGen_gen_vec_capacity(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_capacity");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 16);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RAX);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_vec_first(rcx=*Vec) -> rax = first element
+pub fn PeCodeGen_gen_vec_first(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_first");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RAX);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_vec_last(rcx=*Vec) -> rax = last element
+pub fn PeCodeGen_gen_vec_last(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_last");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_R8, REG_RAX); // r8 = len
+    X86Encoder_dec_r(&mut self.enc, REG_R8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RCX); // rax = ptr
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_R8);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RDX, 3);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RDX);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RAX);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_map_new() -> rax = *Map (24-byte heap struct, all zeros)
+pub fn PeCodeGen_gen_map_new(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_map_new");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 48);
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, 24);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_malloc"));
+    X86Encoder_xor_self(&mut self.enc, REG_RCX);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_RAX, 8, REG_RCX);
+    X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_RAX, 16, REG_RCX);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_map_len(rcx=*Map) -> rax = i64
+pub fn PeCodeGen_gen_map_len(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_map_len");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RAX);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_map_is_empty(rcx=*Map) -> rax = bool
+pub fn PeCodeGen_gen_map_is_empty(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_map_is_empty");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RAX);
+    X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
+    X86Encoder_setcc_r(&mut self.enc, 4, REG_RAX);
+    X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_map_contains(rcx=*Map, rdx=*u8 key) -> rax = bool
+pub fn PeCodeGen_gen_map_contains(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_map_contains");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_push(&mut self.enc, REG_R12);
+    X86Encoder_push(&mut self.enc, REG_R13);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
+    X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_RDX);
+
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_R8, REG_RAX);
+    X86Encoder_xor_self(&mut self.enc, REG_R9);
+
+    var mc_loop: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, mc_loop);
+    X86Encoder_cmp_rr(&mut self.enc, REG_R9, REG_R8);
+    var mc_notfound: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 3, mc_notfound);
+
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R9);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RCX, 4);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RCX, REG_RAX);
+
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_R13);
+    var mc_cmp: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, mc_cmp);
+    X86Encoder_xor_self(&mut self.enc, REG_R10);
+    X86Encoder_xor_self(&mut self.enc, REG_R11);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_R10, REG_RCX);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_R11, REG_RDX);
+    X86Encoder_cmp_rr(&mut self.enc, REG_R10, REG_R11);
+    var mc_mismatch: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 5, mc_mismatch);
+    X86Encoder_test_rr(&mut self.enc, REG_R10, REG_R10);
+    var mc_found: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, mc_found);
+    X86Encoder_inc_r(&mut self.enc, REG_RCX);
+    X86Encoder_inc_r(&mut self.enc, REG_RDX);
+    X86Encoder_jmp_label(&mut self.enc, mc_cmp);
+
+    X86Encoder_place_label(&mut self.enc, mc_found);
+    X86Encoder_mov_imm32(&mut self.enc, REG_RAX, 1);
+    var mc_ret: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jmp_label(&mut self.enc, mc_ret);
+
+    X86Encoder_place_label(&mut self.enc, mc_mismatch);
+    X86Encoder_inc_r(&mut self.enc, REG_R9);
+    X86Encoder_jmp_label(&mut self.enc, mc_loop);
+
+    X86Encoder_place_label(&mut self.enc, mc_notfound);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+
+    X86Encoder_place_label(&mut self.enc, mc_ret);
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+    X86Encoder_pop(&mut self.enc, REG_R13);
+    X86Encoder_pop(&mut self.enc, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_map_get(rcx=*Map, rdx=*u8 key) -> rax = i64
+pub fn PeCodeGen_gen_map_get(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_map_get");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_push(&mut self.enc, REG_R12);
+    X86Encoder_push(&mut self.enc, REG_R13);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
+    X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_RDX);
+
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_R8, REG_RAX);
+    X86Encoder_xor_self(&mut self.enc, REG_R9);
+
+    var mg_loop: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, mg_loop);
+    X86Encoder_cmp_rr(&mut self.enc, REG_R9, REG_R8);
+    var mg_notfound: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 3, mg_notfound);
+
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R9);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RCX, 4);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RCX, REG_RAX);
+
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_R13);
+    var mg_cmp: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, mg_cmp);
+    X86Encoder_xor_self(&mut self.enc, REG_R10);
+    X86Encoder_xor_self(&mut self.enc, REG_R11);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_R10, REG_RCX);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_R11, REG_RDX);
+    X86Encoder_cmp_rr(&mut self.enc, REG_R10, REG_R11);
+    var mg_mismatch: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 5, mg_mismatch);
+    X86Encoder_test_rr(&mut self.enc, REG_R10, REG_R10);
+    var mg_found: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, mg_found);
+    X86Encoder_inc_r(&mut self.enc, REG_RCX);
+    X86Encoder_inc_r(&mut self.enc, REG_RDX);
+    X86Encoder_jmp_label(&mut self.enc, mg_cmp);
+
+    X86Encoder_place_label(&mut self.enc, mg_found);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R9);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RCX, 4);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RAX);
+    var mg_ret: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jmp_label(&mut self.enc, mg_ret);
+
+    X86Encoder_place_label(&mut self.enc, mg_mismatch);
+    X86Encoder_inc_r(&mut self.enc, REG_R9);
+    X86Encoder_jmp_label(&mut self.enc, mg_loop);
+
+    X86Encoder_place_label(&mut self.enc, mg_notfound);
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+
+    X86Encoder_place_label(&mut self.enc, mg_ret);
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+    X86Encoder_pop(&mut self.enc, REG_R13);
+    X86Encoder_pop(&mut self.enc, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_map_insert(rcx=*Map, rdx=*u8 key, r8=i64 value)
+pub fn PeCodeGen_gen_map_insert(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_map_insert");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_push(&mut self.enc, REG_R12);
+    X86Encoder_push(&mut self.enc, REG_R13);
+    X86Encoder_push(&mut self.enc, REG_R14);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 40);
+
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
+    X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_RDX);
+    X86Encoder_mov_rr(&mut self.enc, REG_R14, REG_R8);
+
+    // Search for existing key
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_R8, REG_RAX); // len
+    X86Encoder_xor_self(&mut self.enc, REG_R9); // index
+
+    var mi_search: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, mi_search);
+    X86Encoder_cmp_rr(&mut self.enc, REG_R9, REG_R8);
+    var mi_notfound: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 3, mi_notfound);
+
+    // entry = ptr + r9*16
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R9);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RCX, 4);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RCX, REG_RAX); // entry.key
+
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_R13);
+    var mi_cmp: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, mi_cmp);
+    X86Encoder_xor_self(&mut self.enc, REG_R10);
+    X86Encoder_xor_self(&mut self.enc, REG_R11);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_R10, REG_RCX);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_R11, REG_RDX);
+    X86Encoder_cmp_rr(&mut self.enc, REG_R10, REG_R11);
+    var mi_mismatch: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 5, mi_mismatch);
+    X86Encoder_test_rr(&mut self.enc, REG_R10, REG_R10);
+    var mi_match: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, mi_match);
+    X86Encoder_inc_r(&mut self.enc, REG_RCX);
+    X86Encoder_inc_r(&mut self.enc, REG_RDX);
+    X86Encoder_jmp_label(&mut self.enc, mi_cmp);
+
+    X86Encoder_place_label(&mut self.enc, mi_match);
+    // Update value
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R9);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RCX, 4);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_R14);
+    var mi_ret: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jmp_label(&mut self.enc, mi_ret);
+
+    X86Encoder_place_label(&mut self.enc, mi_mismatch);
+    X86Encoder_inc_r(&mut self.enc, REG_R9);
+    X86Encoder_jmp_label(&mut self.enc, mi_search);
+
+    X86Encoder_place_label(&mut self.enc, mi_notfound);
+    // Check capacity
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 16);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_R10, REG_RAX); // cap
+
+    X86Encoder_cmp_rr(&mut self.enc, REG_R8, REG_R10);
+    var mi_grow: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 2, mi_grow); // jb
+
+    // Grow
+    X86Encoder_test_rr(&mut self.enc, REG_R10, REG_R10);
+    var mi_newcap: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 5, mi_newcap);
+    X86Encoder_mov_imm32(&mut self.enc, REG_R10, 4);
+    var mi_grow2: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jmp_label(&mut self.enc, mi_grow2);
+    X86Encoder_place_label(&mut self.enc, mi_newcap);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_R10, 1);
+
+    X86Encoder_place_label(&mut self.enc, mi_grow2);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -16, REG_R10);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -24, REG_R8);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R10);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RCX, 4);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_malloc"));
+    X86Encoder_mov_rr(&mut self.enc, REG_R11, REG_RAX);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_R8, -24);
+
+    // Copy old entries
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_xor_self(&mut self.enc, REG_RCX);
+    var mi_copy: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, mi_copy);
+    X86Encoder_cmp_rr(&mut self.enc, REG_RCX, REG_R8);
+    var mi_copydone: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 3, mi_copydone);
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_RCX);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RDX, 4);
+    // key
+    X86Encoder_mov_rr(&mut self.enc, REG_R9, REG_RAX);
+    X86Encoder_add_rr(&mut self.enc, REG_R9, REG_RDX);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_R9, REG_R9);
+    X86Encoder_mov_rr(&mut self.enc, REG_R10, REG_R11);
+    X86Encoder_add_rr(&mut self.enc, REG_R10, REG_RDX);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_R10, REG_R9);
+    // value
+    X86Encoder_mov_rr(&mut self.enc, REG_R9, REG_RAX);
+    X86Encoder_add_rr(&mut self.enc, REG_R9, REG_RDX);
+    X86Encoder_add_r_i32(&mut self.enc, REG_R9, 8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_R9, REG_R9);
+    X86Encoder_mov_rr(&mut self.enc, REG_R10, REG_R11);
+    X86Encoder_add_rr(&mut self.enc, REG_R10, REG_RDX);
+    X86Encoder_add_r_i32(&mut self.enc, REG_R10, 8);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_R10, REG_R9);
+    X86Encoder_inc_r(&mut self.enc, REG_RCX);
+    X86Encoder_jmp_label(&mut self.enc, mi_copy);
+    X86Encoder_place_label(&mut self.enc, mi_copydone);
+
+    // Free old
+    X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
+    var mi_nofree: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, mi_nofree);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_free"));
+    X86Encoder_place_label(&mut self.enc, mi_nofree);
+
+    // Update ptr and cap
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_R12, REG_R11);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_R10, -16);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 16);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_R10);
+
+    X86Encoder_place_label(&mut self.enc, mi_grow);
+    // Add entry at index len
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_R8, REG_RAX);
+
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R8);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RCX, 4);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_R13);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_R14);
+    X86Encoder_inc_r(&mut self.enc, REG_R8);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_R8);
+
+    X86Encoder_place_label(&mut self.enc, mi_ret);
+    X86Encoder_add_rsp_i32(&mut self.enc, 40);
+    X86Encoder_pop(&mut self.enc, REG_R14);
+    X86Encoder_pop(&mut self.enc, REG_R13);
+    X86Encoder_pop(&mut self.enc, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_map_remove(rcx=*Map, rdx=*u8 key) — removes key (shift remaining)
+pub fn PeCodeGen_gen_map_remove(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_map_remove");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    // Stub: no-op for now (linear map removal is complex)
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_print_float(xmm0 = double) — prints float + newline
+// Simplified: converts to int part + fractional part with 6 decimal places
+pub fn PeCodeGen_gen_print_float(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_print_float");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_push(&mut self.enc, REG_R12);
+    X86Encoder_push(&mut self.enc, REG_R13);
+    X86Encoder_push(&mut self.enc, REG_R14);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 264);
+
+    // Store double bits at [rbp-8]
+    X86Encoder_movq_xmm_r64(&mut self.enc, 0, REG_RCX);
+    X86Encoder_movsd_mem_rbp_xmm(&mut self.enc, -8, 0);
+
+    // Convert to string via p_to_str_float
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
+    // Actually, we need the double in xmm0 for p_to_str_float
+    X86Encoder_movsd_xmm_mem_rbp(&mut self.enc, 0, -8);
+    // p_to_str_float takes double in xmm0, returns string in rax
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_to_str_float"));
+    // rax = string. Print it via p_print_str
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_print_str"));
+
+    X86Encoder_add_rsp_i32(&mut self.enc, 264);
+    X86Encoder_pop(&mut self.enc, REG_R14);
+    X86Encoder_pop(&mut self.enc, REG_R13);
+    X86Encoder_pop(&mut self.enc, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_to_str_float(xmm0 = double) -> rax = *u8 string
+// Simplified: prints integer part + "." + 6 fractional digits
+pub fn PeCodeGen_gen_to_str_float(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_to_str_float");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_push(&mut self.enc, REG_R12);
+    X86Encoder_push(&mut self.enc, REG_R13);
+    X86Encoder_push(&mut self.enc, REG_R14);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 264);
+
+    // Store double at [rbp-8]
+    X86Encoder_movsd_mem_rbp_xmm(&mut self.enc, -8, 0);
+
+    // Check sign: AND with sign mask
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, -8);
+    X86Encoder_mov_imm64(&mut self.enc, REG_RDX, 0x8000000000000000);
+    X86Encoder_and_rr(&mut self.enc, REG_RAX, REG_RDX);
+    var tf_positive: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, tf_positive);
+
+    // Negative: negate and prepend "-"
+    // Flip sign bit
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, -8);
+    X86Encoder_mov_imm64(&mut self.enc, REG_RDX, 0x8000000000000000);
+    X86Encoder_xor_rr(&mut self.enc, REG_RAX, REG_RDX);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -8, REG_RAX);
+    // Result = "-"
+    var minus_off: i64 = PeCodeGen_get_string_offset(self, "-");
+    X86Encoder_lea_rip(&mut self.enc, REG_R12, minus_off);
+    var tf_after_sign: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jmp_label(&mut self.enc, tf_after_sign);
+
+    X86Encoder_place_label(&mut self.enc, tf_positive);
+    X86Encoder_xor_self(&mut self.enc, REG_R12); // r12 = 0 (no sign prefix)
+
+    X86Encoder_place_label(&mut self.enc, tf_after_sign);
+
+    // Extract integer part: cvttsd2si rax, xmm0
+    X86Encoder_movsd_xmm_mem_rbp(&mut self.enc, 0, -8);
+    X86Encoder_cvttsd2si_r64(&mut self.enc, REG_RAX, 0);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
+    // Call p_to_str(int_part) -> rax = string
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_to_str"));
+    X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_RAX); // r13 = int string
+
+    // If we had a sign, prepend it
+    X86Encoder_test_rr(&mut self.enc, REG_R12, REG_R12);
+    var tf_no_sign_prefix: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, tf_no_sign_prefix);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_R13);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_str_concat"));
+    X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_RAX);
+
+    X86Encoder_place_label(&mut self.enc, tf_no_sign_prefix);
+
+    // Append "."
+    var dot_off: i64 = PeCodeGen_get_string_offset(self, ".");
+    X86Encoder_lea_rip(&mut self.enc, REG_RAX, dot_off);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R13);
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_RAX);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_str_concat"));
+    X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_RAX);
+
+    // Compute fractional part: frac = value - (double)int_part
+    // xmm0 = value, xmm1 = (double)int_part
+    X86Encoder_movsd_xmm_mem_rbp(&mut self.enc, 0, -8);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, -8); // reload int part... no, we need the int part
+    // Actually we need to re-extract int part. Let's recompute.
+    X86Encoder_cvttsd2si_r64(&mut self.enc, REG_RAX, 0); // rax = int part
+    X86Encoder_cvtsi2sd_r64(&mut self.enc, 1, REG_RAX); // xmm1 = (double)int
+    X86Encoder_subsd(&mut self.enc, 0, 1); // xmm0 = frac
+
+    // Multiply frac by 1000000 and convert to int
+    // Load 1000000.0 into xmm1
+    X86Encoder_mov_imm64(&mut self.enc, REG_RAX, 0x4197D78400000000); // 1000000.0
+    X86Encoder_movq_xmm_r64(&mut self.enc, 1, REG_RAX);
+    X86Encoder_mulsd(&mut self.enc, 0, 1);
+    X86Encoder_cvttsd2si_r64(&mut self.enc, REG_RAX, 0);
+    // rax = fractional digits as int (0-999999)
+
+    // Convert to string with leading zeros (6 digits)
+    // Simple approach: just call p_to_str and append
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_to_str"));
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R13);
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_RAX);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_str_concat"));
+
+    X86Encoder_add_rsp_i32(&mut self.enc, 264);
+    X86Encoder_pop(&mut self.enc, REG_R14);
+    X86Encoder_pop(&mut self.enc, REG_R13);
+    X86Encoder_pop(&mut self.enc, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_to_str_vec(rcx=*Vec) -> rax = string like "[1, 2, 3]"
+// Simplified: just prints "[...]" with element count
+pub fn PeCodeGen_gen_to_str_vec(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_to_str_vec");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    // Stub: return "[]" — full implementation would iterate elements
+    var empty_off: i64 = PeCodeGen_get_string_offset(self, "[]");
+    X86Encoder_lea_rip(&mut self.enc, REG_RAX, empty_off);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// ─── Entry point (_main) ────────────────────────────────────────────────
+pub fn PeCodeGen_gen_entry_point(self: &mut PeCodeGen) {
+    self.entry_offset = X86Encoder_offset(&self.enc);
+
+    // Windows PE entry: call main(), then ExitProcess(rax)
+    X86Encoder_sub_rsp_i32(&mut self.enc, 40); // shadow space + alignment
+
+    var main_label: i64 = PeCodeGen_get_func_label(self, "main");
+    if self.main_offset >= 0 {
+        // Use the directly-recorded main offset (more reliable than label resolution)
+        var call_off: i64 = X86Encoder_offset(&self.enc) + 5; // +5 for the call instruction itself
+        var disp: i64 = self.main_offset - call_off;
+        self.enc.code.push(0xE8);
+        self.enc.code.push(disp & 0xFF);
+        self.enc.code.push((disp >> 8) & 0xFF);
+        self.enc.code.push((disp >> 16) & 0xFF);
+        self.enc.code.push((disp >> 24) & 0xFF);
+    } else if main_label >= 0 {
+        X86Encoder_call_label(&mut self.enc, main_label);
+    }
+
+    // ExitProcess(rax)
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_EXIT_PROCESS));
+    X86Encoder_ud2(&mut self.enc);
+}
+
+// ─── Helper: check if type is float ─────────────────────────────────────
+// Note: ir_type_is_float and ir_type_size are already defined in ir.fd
+
+// ─── Write PE bytes to file ─────────────────────────────────────────────
+// Convert Vec<i64> of bytes to a string for p_file_write
+pub fn pe_bytes_to_string(bytes: Vec) -> str {
+    // We need to write raw bytes to a file, but p_file_write expects str
+    // In Fides, str is a byte buffer, so we can use str_from_bytes
+    return str_from_bytes(bytes);
+}

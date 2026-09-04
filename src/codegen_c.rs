@@ -1063,6 +1063,8 @@ impl CCodeGen {
         // File I/O builtins
         wln!(self, "char* p_file_read(const char* path);");
         wln!(self, "int64_t p_file_write(const char* path, const char* content);");
+        wln!(self, "int64_t p_file_write_bin(const char* path, const char* data, int64_t len);");
+        wln!(self, "int64_t p_file_write_vec(const char* path, PVec* v);");
         wln!(self, "bool p_file_exists(const char* path);");
         wln!(self, "int64_t p_file_append(const char* path, const char* content);");
         wln!(self, "int64_t p_file_delete(const char* path);");
@@ -1083,6 +1085,7 @@ impl CCodeGen {
         wln!(self, "int64_t p_clock_now_ms(void);");
         // Regex builtin
         wln!(self, "bool p_regex_match(const char* s, const char* pattern);");
+        wln!(self, "const char* p_intern_str(const char* s);");
         // Async/await runtime (Phase 7.6)
         wln!(self, "int64_t p_future_ready(int64_t value);");
         wln!(self, "int64_t p_future_poll(int64_t future);");
@@ -2492,6 +2495,17 @@ impl CCodeGen {
         wln!(self, "    if (!f) return -1;");
         wln!(self, "    fputs(content, f); fclose(f); return 0;");
         wln!(self, "}}");
+        wln!(self, "int64_t p_file_write_bin(const char* path, const char* data, int64_t len) {{");
+        wln!(self, "    FILE* f = fopen(path, \"wb\");");
+        wln!(self, "    if (!f) return -1;");
+        wln!(self, "    fwrite(data, 1, (size_t)len, f); fclose(f); return 0;");
+        wln!(self, "}}");
+        wln!(self, "int64_t p_file_write_vec(const char* path, PVec* v) {{");
+        wln!(self, "    FILE* f = fopen(path, \"wb\");");
+        wln!(self, "    if (!f) return -1;");
+        wln!(self, "    if (v) {{ fwrite(v->data, 1, (size_t)(v->len * sizeof(void*)), f); }}");
+        wln!(self, "    fclose(f); return 0;");
+        wln!(self, "}}");
         wln!(self, "bool p_file_exists(const char* path) {{ FILE* f = fopen(path, \"rb\"); if (f) {{ fclose(f); return true; }} return false; }}");
         wln!(self, "int64_t p_file_append(const char* path, const char* content) {{");
         wln!(self, "    FILE* f = fopen(path, \"ab\");");
@@ -2533,6 +2547,45 @@ impl CCodeGen {
         wln!(self, "    }}");
         wln!(self, "    while (pi < p_len && pattern[pi] == '*') pi++;");
         wln!(self, "    return pi == p_len;");
+        wln!(self, "}}");
+        // ── Global string interner ──────────────────────────────────────────
+        wln!(self, "static char** __p_intern_table = NULL;");
+        wln!(self, "static int64_t __p_intern_cap = 0;");
+        wln!(self, "static int64_t __p_intern_count = 0;");
+        wln!(self, "static int64_t __p_intern_hash(const char* s) {{");
+        wln!(self, "    int64_t h = 1469598103934665603ULL;");
+        wln!(self, "    while (*s) {{ h ^= (unsigned char)*s; h *= 1099511628211ULL; s++; }}");
+        wln!(self, "    return h;");
+        wln!(self, "}}");
+        wln!(self, "static void __p_intern_grow(void) {{");
+        wln!(self, "    int64_t new_cap = __p_intern_cap == 0 ? 4096 : __p_intern_cap * 2;");
+        wln!(self, "    char** new_table = (char**)calloc(new_cap, sizeof(char*));");
+        wln!(self, "    if (!new_table) {{ fprintf(stderr, \"p_intern: OOM\\n\"); abort(); }}");
+        wln!(self, "    for (int64_t i = 0; i < __p_intern_cap; i++) {{");
+        wln!(self, "        if (__p_intern_table[i]) {{");
+        wln!(self, "            int64_t h = __p_intern_hash(__p_intern_table[i]) & (new_cap - 1);");
+        wln!(self, "            while (new_table[h]) h = (h + 1) & (new_cap - 1);");
+        wln!(self, "            new_table[h] = __p_intern_table[i];");
+        wln!(self, "        }}");
+        wln!(self, "    }}");
+        wln!(self, "    free(__p_intern_table);");
+        wln!(self, "    __p_intern_table = new_table;");
+        wln!(self, "    __p_intern_cap = new_cap;");
+        wln!(self, "}}");
+        wln!(self, "const char* p_intern_str(const char* s) {{");
+        wln!(self, "    if (!s) return NULL;");
+        wln!(self, "    if (__p_intern_count * 2 >= __p_intern_cap) __p_intern_grow();");
+        wln!(self, "    int64_t mask = __p_intern_cap - 1;");
+        wln!(self, "    int64_t h = __p_intern_hash(s) & mask;");
+        wln!(self, "    while (__p_intern_table[h]) {{");
+        wln!(self, "        if (strcmp(__p_intern_table[h], s) == 0) {{");
+        wln!(self, "            return __p_intern_table[h];");
+        wln!(self, "        }}");
+        wln!(self, "        h = (h + 1) & mask;");
+        wln!(self, "    }}");
+        wln!(self, "    __p_intern_table[h] = (char*)s;");
+        wln!(self, "    __p_intern_count++;");
+        wln!(self, "    return s;");
         wln!(self, "}}");
         // Async/await runtime (Phase 7.6 + 8A)
         // Future model: p_future_ready wraps a value directly (eager).

@@ -1086,6 +1086,38 @@ pub fn Lowerer_is_opaque_type_param(self: &Lowerer, ty: Type) -> bool {
     return false;
 }
 
+// Auto-deref helper: for &mut Vec<T> / &mut HashMap<K,V> / &mut String,
+// the receiver is Ptr(Opaque("Vec")) — a pointer to the Vec pointer.
+// Vec_len/Vec_get/Vec_push expect the Vec pointer directly, so we
+// must Load the actual value from the reference before passing it.
+// Returns the dereferenced value if needed, or the original value otherwise.
+pub fn Lowerer_auto_deref_recv(self: &mut Lowerer, recv_val: i64, recv_ty: IrType) -> i64 {
+    match recv_ty {
+        IrType::Ptr(inner) => {
+            var inner_ty: IrType = box_ir_type_unbox(inner);
+            var is_collection: bool = false;
+            match inner_ty {
+                IrType::Opaque(oname) => {
+                    if str_equal(oname, "Vec") || str_equal(oname, "HashMap") || str_equal(oname, "String") {
+                        is_collection = true;
+                    }
+                }
+                IrType::Generic(gname, _) => {
+                    if str_equal(gname, "Vec") || str_equal(gname, "HashMap") || str_equal(gname, "String") {
+                        is_collection = true;
+                    }
+                }
+                _ => {}
+            }
+            if is_collection {
+                return Lowerer_emit_inst(self, Inst::Load(recv_val, inner_ty));
+            }
+        }
+        _ => {}
+    }
+    return recv_val;
+}
+
 pub fn word_repr(ty: IrType) -> IrType {
     match ty {
         IrType::Struct(_) => { return IrType::Ptr(Box::new(ty)); }
@@ -1423,10 +1455,17 @@ pub fn Lowerer_register_runtime(self: &mut Lowerer) {
     // File I/O
     Lowerer_add_extern_1(self, "p_file_read", ptr_u8(), ptr_u8());
     Lowerer_add_extern_2(self, "p_file_write", ptr_u8(), ptr_u8(), IrType::I64);
+    Lowerer_add_extern_2(self, "p_file_write_vec", ptr_u8(), vec_i64_ty, IrType::I64);
     Lowerer_add_extern_1(self, "p_file_exists", ptr_u8(), IrType::Bool);
     Lowerer_add_extern_2(self, "p_file_append", ptr_u8(), ptr_u8(), IrType::I64);
     Lowerer_add_extern_1(self, "p_file_delete", ptr_u8(), IrType::I64);
     Lowerer_add_extern_1(self, "p_file_size", ptr_u8(), IrType::I64);
+
+    // Timing
+    Lowerer_add_extern_0(self, "p_clock_now", IrType::I64);
+    Lowerer_add_extern_0(self, "p_clock_now_us", IrType::I64);
+    Lowerer_add_extern_0(self, "p_clock_now_ms", IrType::I64);
+    Lowerer_add_extern_1(self, "p_intern_str", ptr_u8(), ptr_u8());
 
     // Database
     var db_ty: IrType = opaque_ty("Database");
@@ -1476,6 +1515,9 @@ pub fn Lowerer_register_runtime(self: &mut Lowerer) {
 
     // Regex
     Lowerer_add_extern_2(self, "p_regex_match", ptr_u8(), ptr_u8(), IrType::Bool);
+
+    // String interner
+    Lowerer_add_extern_1(self, "p_intern_str", ptr_u8(), ptr_u8());
 
     // Async/await
     Lowerer_add_extern_1(self, "p_future_ready", IrType::I64, IrType::I64);
@@ -2749,6 +2791,339 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
 
 // ─── Stubs for functions implemented in later parts ───────────────────────
 
+// MethodCall lowering extracted into a separate function to avoid the
+// statement-dropping bug in long functions. Lowerer_lower_expr is ~16K lines
+// of generated C, and statements in the MethodCall branch were being dropped.
+pub fn Lowerer_lower_method_call(self: &mut Lowerer, receiver: Box<Expr>, method: str, args: Vec<Expr>) -> i64 {
+    // Check for associated function calls: Vec::new(), HashMap::new(), String::from()
+    match box_expr_unbox(receiver) {
+        Expr::Ident(name) => {
+            if str_equal(name, "Vec") && str_equal(method, "new") {
+                var dummy_env: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+                return Lowerer_emit_inst(self, Inst::Call("Vec_new", c_vec1_i64(dummy_env), IrType::Opaque("Vec"), EffectSet_new()));
+            }
+            if str_equal(name, "HashMap") && str_equal(method, "new") {
+                var dummy_env2: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+                return Lowerer_emit_inst(self, Inst::Call("HashMap_new", c_vec1_i64(dummy_env2), IrType::Opaque("HashMap"), EffectSet_new()));
+            }
+            if str_equal(name, "String") && str_equal(method, "from") {
+                var arg0: i64 = Lowerer_lower_expr(self, args.get(0));
+                var dummy_env3: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+                var sargs: Vec<i64> = Vec::new();
+                sargs.push(dummy_env3);
+                sargs.push(arg0);
+                return Lowerer_emit_inst(self, Inst::Call("String_from", sargs, IrType::Opaque("String"), EffectSet_new()));
+            }
+            if str_equal(name, "Box") && str_equal(method, "new") {
+                return Lowerer_lower_box_new(self, args.get(0));
+            }
+            // Struct associated function call: mangle as StructName_method
+            if Lowerer_is_struct(self, name) {
+                return Lowerer_lower_assoc_call(self, name, method, args);
+            }
+            // Check if name is a known enum — treat as EnumLit
+            match Lowerer_lookup_enum(self, name) {
+                OptEnumDef::Some(_) => {
+                    return Lowerer_lower_expr(self, Expr::EnumLit(name, method, args));
+                }
+                OptEnumDef::None => {}
+            }
+        }
+        _ => {}
+    }
+
+    // Lower receiver
+    var recv_val: i64 = Lowerer_lower_expr(self, box_expr_unbox(receiver));
+    var recv_ty: IrType = Lowerer_get_value_type(self, recv_val);
+
+    // Lower arguments
+    var arg_vals: Vec<i64> = Vec::new();
+    var ai: i64 = 0;
+    while ai < args.len() {
+        arg_vals.push(Lowerer_lower_expr(self, args.get(ai)));
+        ai = ai + 1;
+    }
+
+    // Determine mangled method name
+    var mangled_name: str = Lowerer_mangle_method(self, method, recv_ty, receiver);
+
+    // Fallback: if mangled_name is still just the method name, try common prefixes
+    if str_equal(mangled_name, method) {
+        if Lowerer_has_function(self, "Vec_" + method) {
+            mangled_name = "Vec_" + method;
+        } else if Lowerer_has_function(self, "HashMap_" + method) {
+            mangled_name = "HashMap_" + method;
+        } else if Lowerer_has_function(self, "String_" + method) {
+            mangled_name = "String_" + method;
+        }
+    }
+
+    // Determine return type
+    var ret_ty: IrType = Lowerer_lookup_func_ret_ty_ir(self, mangled_name);
+    if ir_type_eq(ret_ty, IrType::I64) {
+        ret_ty = Lowerer_lookup_func_ret_ty_ir(self, method);
+    }
+
+    // Build call args
+    var call_args: Vec<i64> = Vec::new();
+    var mangled_is_extern: bool = Lowerer_is_extern_func(self, mangled_name);
+    var mangled_is_runtime: bool = str_starts_with(mangled_name, "p_") || str_starts_with(mangled_name, "__ecs_");
+    if !mangled_is_extern && !mangled_is_runtime && !str_equal(mangled_name, "print") {
+        call_args.push(Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64)));
+    }
+    // Auto-deref: for &mut Vec<T> etc, load the actual Vec pointer
+    var effective_recv_val: i64 = Lowerer_auto_deref_recv(self, recv_val, recv_ty);
+    call_args.push(effective_recv_val);
+    ai = 0;
+    while ai < arg_vals.len() {
+        call_args.push(arg_vals.get(ai));
+        ai = ai + 1;
+    }
+
+    // Box struct elements before pushing/inserting into Vec
+    if str_equal(method, "push") || str_equal(method, "insert") || str_equal(method, "set") {
+        Lowerer_box_vec_element(self, call_args, recv_ty, receiver);
+    }
+
+    var eff: EffectSet = EffectSet_new();
+    match runtime_effects(mangled_name) {
+        OptEffectSet::Some(e) => { eff = e; }
+        OptEffectSet::None => {}
+    }
+
+    // Handle struct return via SRET
+    match ret_ty {
+        IrType::Struct(sname) => {
+            var sret_ptr: i64 = Lowerer_emit_inst(self, Inst::Alloca(IrType::Struct(sname), Lowerer_current_region(self)));
+            var sret_args: Vec<i64> = Vec::new();
+            sret_args.push(sret_ptr);
+            var si: i64 = 0;
+            while si < call_args.len() {
+                sret_args.push(call_args.get(si));
+                si = si + 1;
+            }
+            Lowerer_emit_inst(self, Inst::Call(mangled_name, sret_args, IrType::Void, eff));
+            return sret_ptr;
+        }
+        _ => {}
+    }
+
+    return Lowerer_emit_inst(self, Inst::Call(mangled_name, call_args, ret_ty, eff));
+}
+
+// Helper: Box::new(x) lowering
+pub fn Lowerer_lower_box_new(self: &mut Lowerer, arg_expr: Expr) -> i64 {
+    var val: i64 = Lowerer_lower_expr(self, arg_expr);
+    var val_ty: IrType = Lowerer_get_value_type(self, val);
+    var alloc_size: i64 = 8;
+    var store_ty: OptIrType = OptIrType::None;
+    match val_ty {
+        IrType::Ptr(inner) => {
+            var inner_ty: IrType = box_ir_type_unbox(inner);
+            if ir_type_is_aggregate(inner_ty) {
+                alloc_size = IrModule_type_size(&self.module, inner_ty);
+                store_ty = OptIrType::Some(inner_ty);
+            } else {
+                alloc_size = ir_type_size(val_ty);
+            }
+        }
+        _ => {
+            alloc_size = ir_type_size(val_ty);
+        }
+    }
+    if alloc_size == 0 { alloc_size = 8; }
+    var size_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(alloc_size, IrType::I64));
+    var ptr_ty: IrType = IrType::Ptr(Box::new(val_ty));
+    var ptr: i64 = Lowerer_emit_inst(self, Inst::Call("p_malloc", c_vec1_i64(size_val), ptr_ty, EffectSet_new()));
+    Lowerer_emit_inst(self, Inst::Store(ptr, val, store_ty));
+    return ptr;
+}
+
+// Helper: associated function call (StructName::method)
+pub fn Lowerer_lower_assoc_call(self: &mut Lowerer, struct_name: str, method: str, args: Vec<Expr>) -> i64 {
+    var mangled: str = struct_name + "_" + method;
+    var all_args: Vec<i64> = Vec::new();
+    var si: i64 = 0;
+    while si < args.len() {
+        all_args.push(Lowerer_lower_expr(self, args.get(si)));
+        si = si + 1;
+    }
+    var sret_ty: IrType = Lowerer_lookup_func_ret_ty_ir(self, mangled);
+    var seff: EffectSet = EffectSet_new();
+    match runtime_effects(mangled) {
+        OptEffectSet::Some(e) => { seff = e; }
+        OptEffectSet::None => {}
+    }
+    match sret_ty {
+        IrType::Struct(sname) => {
+            var sret_ptr: i64 = Lowerer_emit_inst(self, Inst::Alloca(IrType::Struct(sname), Lowerer_current_region(self)));
+            var sret_args: Vec<i64> = Vec::new();
+            sret_args.push(sret_ptr);
+            if Lowerer_is_user_func(self, mangled) && !Lowerer_is_extern_func(self, mangled) {
+                var dummy_env4: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+                sret_args.push(dummy_env4);
+            }
+            si = 0;
+            while si < all_args.len() {
+                sret_args.push(all_args.get(si));
+                si = si + 1;
+            }
+            Lowerer_emit_inst(self, Inst::Call(mangled, sret_args, IrType::Void, seff));
+            return sret_ptr;
+        }
+        _ => {
+            if Lowerer_is_user_func(self, mangled) && !Lowerer_is_extern_func(self, mangled) {
+                var dummy_env4: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
+                all_args.insert(0, dummy_env4);
+            }
+            return Lowerer_emit_inst(self, Inst::Call(mangled, all_args, sret_ty, seff));
+        }
+    }
+}
+
+// Helper: mangle method name based on receiver type
+pub fn Lowerer_mangle_method(self: &mut Lowerer, method: str, recv_ty: IrType, receiver: Box<Expr>) -> str {
+    var mangled_name: str = method;
+    match recv_ty {
+        IrType::Struct(struct_name) => {
+            mangled_name = struct_name + "_" + method;
+        }
+        IrType::Ptr(inner) => {
+            match box_ir_type_unbox(inner) {
+                IrType::Struct(struct_name2) => {
+                    mangled_name = struct_name2 + "_" + method;
+                }
+                IrType::Opaque(type_name2) => {
+                    mangled_name = type_name2 + "_" + method;
+                }
+                IrType::Generic(gen_name2, _) => {
+                    mangled_name = gen_name2 + "_" + method;
+                }
+                _ => {}
+            }
+        }
+        IrType::Opaque(type_name) => {
+            mangled_name = type_name + "_" + method;
+        }
+        IrType::Generic(gen_name, _) => {
+            mangled_name = gen_name + "_" + method;
+        }
+        _ => {
+            match box_expr_unbox(receiver) {
+                Expr::Ident(var_name) => {
+                    match Lowerer_lookup_var_ast_type(self, var_name) {
+                        OptType::Some(ast_ty) => {
+                            var resolved: Type = Lowerer_resolve_type(self, ast_ty);
+                            match resolved {
+                                Type::Ref(inner_ref, _) => {
+                                    resolved = box_type_unbox(inner_ref);
+                                }
+                                _ => {}
+                            }
+                            match resolved {
+                                Type::Generic(gname, _) => {
+                                    mangled_name = gname + "_" + method;
+                                }
+                                Type::Named(nname) => {
+                                    mangled_name = nname + "_" + method;
+                                }
+                                _ => {}
+                            }
+                        }
+                        OptType::None => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    return mangled_name;
+}
+
+// Helper: box struct elements before Vec push/insert/set
+pub fn Lowerer_box_vec_element(self: &mut Lowerer, call_args: Vec<i64>, recv_ty: IrType, receiver: Box<Expr>) {
+    var vec_elem_ty: IrType = IrType::I64;
+    var found_elem: bool = false;
+    var effective_recv_ty: IrType = recv_ty;
+    match recv_ty {
+        IrType::Ptr(inner) => { effective_recv_ty = box_ir_type_unbox(inner); }
+        _ => {}
+    }
+    match effective_recv_ty {
+        IrType::Generic(gname, gargs) => {
+            if str_equal(gname, "Vec") && gargs.len() > 0 {
+                vec_elem_ty = gargs.get(0);
+                found_elem = true;
+            }
+        }
+        IrType::Opaque(oname) => {
+            if str_equal(oname, "Vec") {
+                match box_expr_unbox(receiver) {
+                    Expr::Ident(vname) => {
+                        match Lowerer_lookup_var_ast_type(self, vname) {
+                            OptType::Some(at) => {
+                                var inner_ty: Type = at;
+                                match at {
+                                    Type::Ref(inner, _) => { inner_ty = box_type_unbox(inner); }
+                                    _ => {}
+                                }
+                                match inner_ty {
+                                    Type::Generic(an, aargs) => {
+                                        if str_equal(an, "Vec") && aargs.len() > 0 {
+                                            vec_elem_ty = Lowerer_lower_type(self, aargs.get(0));
+                                            found_elem = true;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            OptType::None => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    if found_elem {
+        match vec_elem_ty {
+            IrType::Struct(_) => {
+                Lowerer_box_struct_arg(self, call_args, vec_elem_ty);
+            }
+            _ => {}
+        }
+    } else {
+        // Fallback: check the value's IR type directly
+        var val_idx2: i64 = call_args.len() - 1;
+        var val2: i64 = call_args.get(val_idx2);
+        var val2_ty: IrType = Lowerer_get_value_type(self, val2);
+        match val2_ty {
+            IrType::Ptr(inner2) => {
+                match box_ir_type_unbox(inner2) {
+                    IrType::Struct(sname) => {
+                        Lowerer_box_struct_arg(self, call_args, IrType::Struct(sname));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// Helper: box a struct value at the last index of call_args
+pub fn Lowerer_box_struct_arg(self: &mut Lowerer, call_args: Vec<i64>, struct_ty: IrType) {
+    var val_idx: i64 = call_args.len() - 1;
+    var val: i64 = call_args.get(val_idx);
+    var size: i64 = IrModule_type_size(&self.module, struct_ty);
+    if size <= 0 { size = 8; }
+    var size_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(size, IrType::I64));
+    var heap_ptr: i64 = Lowerer_emit_inst(self, Inst::Call("p_malloc", c_vec1_i64(size_val), IrType::Ptr(Box::new(struct_ty)), EffectSet_new()));
+    Lowerer_emit_inst(self, Inst::Store(heap_ptr, val, OptIrType::Some(struct_ty)));
+    call_args.set(val_idx, heap_ptr);
+}
+
 pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
     match expr {
         Expr::IntLit(n) => {
@@ -2990,354 +3365,7 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             return Lowerer_emit_inst(self, Inst::Call(callee, call_args, ret_ty, eff));
         }
         Expr::MethodCall(receiver, method, args) => {
-            // Check for associated function calls: Vec::new(), HashMap::new(), String::from()
-            match box_expr_unbox(receiver) {
-                Expr::Ident(name) => {
-                    if str_equal(name, "Vec") && str_equal(method, "new") {
-                        var dummy_env: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
-                        return Lowerer_emit_inst(self, Inst::Call("Vec_new", c_vec1_i64(dummy_env), IrType::Opaque("Vec"), EffectSet_new()));
-                    }
-                    if str_equal(name, "HashMap") && str_equal(method, "new") {
-                        var dummy_env2: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
-                        return Lowerer_emit_inst(self, Inst::Call("HashMap_new", c_vec1_i64(dummy_env2), IrType::Opaque("HashMap"), EffectSet_new()));
-                    }
-                    if str_equal(name, "String") && str_equal(method, "from") {
-                        var arg0: i64 = Lowerer_lower_expr(self, args.get(0));
-                        var dummy_env3: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
-                        var sargs: Vec<i64> = Vec::new();
-                        sargs.push(dummy_env3);
-                        sargs.push(arg0);
-                        return Lowerer_emit_inst(self, Inst::Call("String_from", sargs, IrType::Opaque("String"), EffectSet_new()));
-                    }
-                    if str_equal(name, "Box") && str_equal(method, "new") {
-                        var val: i64 = Lowerer_lower_expr(self, args.get(0));
-                        var val_ty: IrType = Lowerer_get_value_type(self, val);
-                        // For struct/enum types, the value is a pointer to an
-                        // alloca (enums are passed by pointer). We need to:
-                        // 1. Allocate the full struct size (not just 8 bytes)
-                        // 2. Use Store with store_ty=Struct to emit memcpy
-                        // This prevents dangling pointers when the creating
-                        // function returns and the alloca is freed.
-                        var alloc_size: i64 = 8;
-                        var store_ty: OptIrType = OptIrType::None;
-                        match val_ty {
-                            IrType::Ptr(inner) => {
-                                var inner_ty: IrType = box_ir_type_unbox(inner);
-                                if ir_type_is_aggregate(inner_ty) {
-                                    alloc_size = IrModule_type_size(&self.module, inner_ty);
-                                    store_ty = OptIrType::Some(inner_ty);
-                                } else {
-                                    alloc_size = ir_type_size(val_ty);
-                                }
-                            }
-                            _ => {
-                                alloc_size = ir_type_size(val_ty);
-                            }
-                        }
-                        // Ensure at least 1 byte to avoid malloc(0)
-                        if alloc_size == 0 { alloc_size = 8; }
-                        var size_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(alloc_size, IrType::I64));
-                        var ptr_ty: IrType = IrType::Ptr(Box::new(val_ty));
-                        var ptr: i64 = Lowerer_emit_inst(self, Inst::Call("p_malloc", c_vec1_i64(size_val), ptr_ty, EffectSet_new()));
-                        // Store the value at the heap address.
-                        // For struct types, store_ty=Some(Struct(_)) causes
-                        // the C codegen to emit memcpy, copying the full
-                        // struct data from the alloca to the heap.
-                        Lowerer_emit_inst(self, Inst::Store(ptr, val, store_ty));
-                        return ptr;
-                    }
-                    // Struct associated function call: mangle as StructName_method
-                    if Lowerer_is_struct(self, name) {
-                        var mangled: str = name + "_" + method;
-                        var all_args: Vec<i64> = Vec::new();
-                        var si: i64 = 0;
-                        while si < args.len() {
-                            all_args.push(Lowerer_lower_expr(self, args.get(si)));
-                            si = si + 1;
-                        }
-                        var sret_ty: IrType = Lowerer_lookup_func_ret_ty_ir(self, mangled);
-                        var seff: EffectSet = EffectSet_new();
-                        match runtime_effects(mangled) {
-                            OptEffectSet::Some(e) => { seff = e; }
-                            OptEffectSet::None => {}
-                        }
-                        // Handle struct return with SRET
-                        match sret_ty {
-                            IrType::Struct(sname) => {
-                                var sret_ptr: i64 = Lowerer_emit_inst(self, Inst::Alloca(IrType::Struct(sname), Lowerer_current_region(self)));
-                                var sret_args: Vec<i64> = Vec::new();
-                                sret_args.push(sret_ptr);
-                                // Prepend dummy env_ptr for user functions
-                                if Lowerer_is_user_func(self, mangled) && !Lowerer_is_extern_func(self, mangled) {
-                                    var dummy_env4: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
-                                    sret_args.push(dummy_env4);
-                                }
-                                si = 0;
-                                while si < all_args.len() {
-                                    sret_args.push(all_args.get(si));
-                                    si = si + 1;
-                                }
-                                Lowerer_emit_inst(self, Inst::Call(mangled, sret_args, IrType::Void, seff));
-                                return sret_ptr;
-                            }
-                            _ => {
-                                // Non-struct return
-                                if Lowerer_is_user_func(self, mangled) && !Lowerer_is_extern_func(self, mangled) {
-                                    var dummy_env4: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
-                                    all_args.insert(0, dummy_env4);
-                                }
-                                return Lowerer_emit_inst(self, Inst::Call(mangled, all_args, sret_ty, seff));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-
-            // Lower receiver
-            var recv_val: i64 = Lowerer_lower_expr(self, box_expr_unbox(receiver));
-            var recv_ty: IrType = Lowerer_get_value_type(self, recv_val);
-
-            // Lower arguments
-            var arg_vals: Vec<i64> = Vec::new();
-            var ai: i64 = 0;
-            while ai < args.len() {
-                arg_vals.push(Lowerer_lower_expr(self, args.get(ai)));
-                ai = ai + 1;
-            }
-
-            // Determine mangled method name
-            // For struct methods: {StructName}_{method}
-            // For Vec/HashMap/String methods: {TypeName}_{method}
-            // For Opaque types (structs passed as pointers): {TypeName}_{method}
-            var mangled_name: str = method;
-            match recv_ty {
-                IrType::Struct(struct_name) => {
-                    mangled_name = struct_name + "_" + method;
-                }
-                IrType::Ptr(inner) => {
-                    match box_ir_type_unbox(inner) {
-                        IrType::Struct(struct_name2) => {
-                            mangled_name = struct_name2 + "_" + method;
-                        }
-                        IrType::Opaque(type_name2) => {
-                            mangled_name = type_name2 + "_" + method;
-                        }
-                        IrType::Generic(gen_name2, _) => {
-                            mangled_name = gen_name2 + "_" + method;
-                        }
-                        _ => {}
-                    }
-                }
-                IrType::Opaque(type_name) => {
-                    // Vec, HashMap, String, and user structs are Opaque
-                    mangled_name = type_name + "_" + method;
-                }
-                IrType::Generic(gen_name, _) => {
-                    mangled_name = gen_name + "_" + method;
-                }
-                _ => {
-                    // Fallback: check AST type of receiver variable.
-                    // Vec/HashMap/String values may be typed as I64 at the IR
-                    // level, so we need to check the AST type to determine
-                    // the correct type name for mangling.
-                    match box_expr_unbox(receiver) {
-                        Expr::Ident(var_name) => {
-                            match Lowerer_lookup_var_ast_type(self, var_name) {
-                                OptType::Some(ast_ty) => {
-                                    var resolved: Type = Lowerer_resolve_type(self, ast_ty);
-                                    // Unwrap &mut / & references
-                                    match resolved {
-                                        Type::Ref(inner_ref, _) => {
-                                            resolved = box_type_unbox(inner_ref);
-                                        }
-                                        _ => {}
-                                    }
-                                    match resolved {
-                                        Type::Generic(gname, _) => {
-                                            mangled_name = gname + "_" + method;
-                                        }
-                                        Type::Named(nname) => {
-                                            mangled_name = nname + "_" + method;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                OptType::None => {}
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // Fallback: if mangled_name is still just the method name (no prefix),
-            // try common collection type prefixes. This handles cases where the
-            // receiver is a field access (e.g., self.errors.len()) and the AST
-            // type lookup above didn't find the type.
-            if str_equal(mangled_name, method) {
-                if Lowerer_has_function(self, "Vec_" + method) {
-                    mangled_name = "Vec_" + method;
-                } else if Lowerer_has_function(self, "HashMap_" + method) {
-                    mangled_name = "HashMap_" + method;
-                } else if Lowerer_has_function(self, "String_" + method) {
-                    mangled_name = "String_" + method;
-                }
-            }
-
-            // Determine return type
-            var ret_ty: IrType = Lowerer_lookup_func_ret_ty_ir(self, mangled_name);
-            if ir_type_eq(ret_ty, IrType::I64) {
-                // Try unmangled name
-                ret_ty = Lowerer_lookup_func_ret_ty_ir(self, method);
-            }
-
-            // Build call args: __env (for user funcs only), receiver, args...
-            // Add __env if the function is NOT extern, NOT runtime (p_/__ecs_), and NOT print
-            var call_args: Vec<i64> = Vec::new();
-            var mangled_is_extern: bool = Lowerer_is_extern_func(self, mangled_name);
-            var mangled_is_runtime: bool = str_starts_with(mangled_name, "p_") || str_starts_with(mangled_name, "__ecs_");
-            if !mangled_is_extern && !mangled_is_runtime && !str_equal(mangled_name, "print") {
-                call_args.push(Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64)));  // __env
-            }
-            call_args.push(recv_val);
-            ai = 0;
-            while ai < arg_vals.len() {
-                call_args.push(arg_vals.get(ai));
-                ai = ai + 1;
-            }
-
-            // Box struct elements before pushing/inserting into Vec.
-            // The Vec runtime stores elements as i64 (8-byte slots).
-            // For struct elements (>8 bytes), we must heap-allocate the struct
-            // and store the pointer in the Vec. Otherwise the stack-allocated
-            // SRET buffer becomes a dangling pointer when the calling function
-            // returns, causing corrupted data when reading from the Vec later.
-            if str_equal(method, "push") || str_equal(method, "insert") || str_equal(method, "set") {
-                // Determine the Vec element type from the receiver type
-                var vec_elem_ty: IrType = IrType::I64;
-                var found_elem: bool = false;
-                // Unwrap Ptr(..) — &mut Vec<T> lowers to Ptr(Opaque("Vec"))
-                var effective_recv_ty: IrType = recv_ty;
-                match recv_ty {
-                    IrType::Ptr(inner) => { effective_recv_ty = box_ir_type_unbox(inner); }
-                    _ => {}
-                }
-                match effective_recv_ty {
-                    IrType::Generic(gname, gargs) => {
-                        if str_equal(gname, "Vec") && gargs.len() > 0 {
-                            vec_elem_ty = gargs.get(0);
-                            found_elem = true;
-                        }
-                    }
-                    IrType::Opaque(oname) => {
-                        if str_equal(oname, "Vec") {
-                            // Try AST type for generic info
-                            match box_expr_unbox(receiver) {
-                                Expr::Ident(vname) => {
-                                    match Lowerer_lookup_var_ast_type(self, vname) {
-                                        OptType::Some(at) => {
-                                            // Unwrap &mut / & references to get the inner type
-                                            var inner_ty: Type = at;
-                                            match at {
-                                                Type::Ref(inner, _) => { inner_ty = box_type_unbox(inner); }
-                                                _ => {}
-                                            }
-                                            match inner_ty {
-                                                Type::Generic(an, aargs) => {
-                                                    if str_equal(an, "Vec") && aargs.len() > 0 {
-                                                        vec_elem_ty = Lowerer_lower_type(self, aargs.get(0));
-                                                        found_elem = true;
-                                                    }
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                        OptType::None => {}
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                if found_elem {
-                    match vec_elem_ty {
-                        IrType::Struct(_) => {
-                            // call_args = [__env?, recv, value] for push
-                            // call_args = [__env?, recv, index, value] for insert
-                            // Find the value argument (last arg)
-                            var val_idx: i64 = call_args.len() - 1;
-                            var val: i64 = call_args.get(val_idx);
-                            // Use IrModule_type_size to look up struct layout size.
-                            // ir_type_size returns 0 for structs, which would cause
-                            // p_malloc(0) and memcpy(_, _, 0) — not copying the struct.
-                            var size: i64 = IrModule_type_size(&self.module, vec_elem_ty);
-                            if size <= 0 { size = 8; }  // fallback for unknown structs
-                            var size_val: i64 = Lowerer_emit_inst(self, Inst::ConstInt(size, IrType::I64));
-                            var heap_ptr: i64 = Lowerer_emit_inst(self, Inst::Call("p_malloc", c_vec1_i64(size_val), IrType::Ptr(Box::new(vec_elem_ty)), EffectSet_new()));
-                            // Use store_ty: Some(vec_elem_ty) so the codegen
-                            // emits memcpy for the full struct, not just
-                            // an 8-byte pointer store.
-                            Lowerer_emit_inst(self, Inst::Store(heap_ptr, val, OptIrType::Some(vec_elem_ty)));
-                            // Replace the value in call_args with the heap pointer
-                            call_args.set(val_idx, heap_ptr);
-                        }
-                        _ => {}
-                    }
-                } else {
-                    // Fallback: check the value's IR type directly. If it's
-                    // Ptr(Struct(..)) (from SRET), box it. This handles cases
-                    // where the receiver is a field access (self.vec.push(..))
-                    // and the AST type lookup fails.
-                    var val_idx2: i64 = call_args.len() - 1;
-                    var val2: i64 = call_args.get(val_idx2);
-                    var val2_ty: IrType = Lowerer_get_value_type(self, val2);
-                    match val2_ty {
-                        IrType::Ptr(inner2) => {
-                            match box_ir_type_unbox(inner2) {
-                                IrType::Struct(sname) => {
-                                    var struct_ty: IrType = IrType::Struct(sname);
-                                    var size2: i64 = IrModule_type_size(&self.module, struct_ty);
-                                    if size2 <= 0 { size2 = 8; }
-                                    var size_val2: i64 = Lowerer_emit_inst(self, Inst::ConstInt(size2, IrType::I64));
-                                    var heap_ptr2: i64 = Lowerer_emit_inst(self, Inst::Call("p_malloc", c_vec1_i64(size_val2), IrType::Ptr(Box::new(struct_ty)), EffectSet_new()));
-                                    Lowerer_emit_inst(self, Inst::Store(heap_ptr2, val2, OptIrType::Some(struct_ty)));
-                                    call_args.set(val_idx2, heap_ptr2);
-                                }
-                                _ => {}
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            var eff: EffectSet = EffectSet_new();
-            match runtime_effects(mangled_name) {
-                OptEffectSet::Some(e) => { eff = e; }
-                OptEffectSet::None => {}
-            }
-
-            // Handle struct return via SRET (out-parameter calling convention).
-            match ret_ty {
-                IrType::Struct(sname) => {
-                    var sret_ptr: i64 = Lowerer_emit_inst(self, Inst::Alloca(IrType::Struct(sname), Lowerer_current_region(self)));
-                    var sret_args: Vec<i64> = Vec::new();
-                    sret_args.push(sret_ptr);
-                    var si: i64 = 0;
-                    while si < call_args.len() {
-                        sret_args.push(call_args.get(si));
-                        si = si + 1;
-                    }
-                    Lowerer_emit_inst(self, Inst::Call(mangled_name, sret_args, IrType::Void, eff));
-                    return sret_ptr;
-                }
-                _ => {}
-            }
-
-            return Lowerer_emit_inst(self, Inst::Call(mangled_name, call_args, ret_ty, eff));
+            return Lowerer_lower_method_call(self, receiver, method, args);
         }
         Expr::FieldAccess(obj, field) => {
             var obj_expr: Expr = box_expr_unbox(obj);
@@ -3963,7 +3991,7 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             }
 
             if !Lowerer_current_block_has_terminator(self) {
-                Lowerer_emit_terminator(self, Inst::Unreachable);
+                Lowerer_emit_terminator(self, Inst::Jump(merge_block));
             }
 
             Lowerer_set_current_block(self, merge_block);
@@ -4998,9 +5026,9 @@ pub fn Lowerer_lower_match(self: &mut Lowerer, expr: Expr, arms: Vec<MatchArm>) 
         i = i + 1;
     }
 
-    // No arm matched — jump to merge (or unreachable)
+    // No arm matched — jump to merge
     if !Lowerer_current_block_has_terminator(self) {
-        Lowerer_emit_terminator(self, Inst::Unreachable);
+        Lowerer_emit_terminator(self, Inst::Jump(merge_block));
     }
 
     Lowerer_set_current_block(self, merge_block);
@@ -5239,6 +5267,11 @@ pub fn Lowerer_infer_expr_type(self: &Lowerer, expr: Expr) -> IrType {
                     if name == "Vec" && method == "new" { return IrType::Opaque("Vec"); }
                     if name == "HashMap" && method == "new" { return IrType::Opaque("HashMap"); }
                     if name == "String" && method == "from" { return IrType::Opaque("String"); }
+                    // Check if it's an enum constructor
+                    match Lowerer_lookup_enum(self, name) {
+                        OptEnumDef::Some(_) => { return IrType::Struct(name); }
+                        OptEnumDef::None => {}
+                    }
                 }
                 _ => {}
             }

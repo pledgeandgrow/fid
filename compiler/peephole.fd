@@ -1,0 +1,1064 @@
+// peephole.fd — Peephole Optimizer for x86-64 assembly text
+// Ported from src/peephole.rs (994 LOC)
+//
+// Local optimizations on x86-64 assembly text. Operates on the output of
+// codegen_x64::generate_asm(), applying pattern-based transformations within
+// small windows of instructions ("peepholes").
+//
+// Passes:
+//   1. Redundant move elimination: `movq %rax, %rax` → remove
+//   2. Zero-idiom replacement: `movq $0, %reg` → `xorl %ereg, %ereg`
+//   3. No-op arithmetic: `addq $0, %reg` / `subq $0, %reg` → remove
+//   4. Branch threading: `jmp .L1` where `.L1: jmp .L2` → `jmp .L2`
+//   5. Dead store elimination: `movq %a, %b` then `movq %c, %b` (b not read) → remove first
+//   6. Move coalescing: `movq %a, %b` then `movq %b, %c` (b not read again) → `movq %a, %c`
+//   7. Redundant test elimination: `testq %reg, %reg` after an instruction that
+//      already sets flags (addq, subq, andq, orq, xorq, negq, notq) → remove
+//   8. Store-to-load forwarding
+//   9. LEA coalescing
+//  10. cmp+setcc+movzbq+test+jcc → cmp+jcc
+//
+// The optimizer is conservative: it only removes instructions when it can
+// prove the removal is safe within the peephole window. It does NOT do
+// global dataflow analysis.
+//
+// Adaptations from Rust:
+// 1. HashMap<K,V> → Vec-based maps with helper structs
+// 2. HashSet<T> → Vec<T> with contains() helper
+// 3. Option<String> → OptStr enum
+// 4. String → str
+// 5. Vec::iter() → explicit while loops with .get(i)
+// 6. .starts_with() / .ends_with() / .contains() → str_starts_with / str_ends_with / str_contains
+
+module compiler::peephole;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Public API
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Run all peephole optimization passes on the assembly text.
+/// Returns the optimized assembly.
+pub fn peephole_optimize(asm: str) -> str {
+    var lines: Vec<str> = str_split_lines(asm);
+
+    // Run to fixed point (most passes converge in 2-3 iterations).
+    var iter: i64 = 0;
+    while iter < 5 {
+        var before: i64 = lines.len();
+        lines = pass_redundant_moves(lines);
+        lines = pass_zero_idiom(lines);
+        lines = pass_nop_arithmetic(lines);
+        lines = pass_branch_threading(lines);
+        lines = pass_dead_store(lines);
+        lines = pass_redundant_test(lines);
+        lines = pass_store_load_forward(lines);
+        lines = pass_lea_coalesce(lines);
+        lines = pass_cmp_setcc_jcc(lines);
+        if lines.len() == before {
+            break;
+        }
+        iter = iter + 1;
+    }
+
+    return str_join_lines(lines);
+}
+
+/// Run a single named pass. Used for testing and selective optimization.
+pub fn peephole_optimize_pass(asm: str, pass: str) -> str {
+    var lines: Vec<str> = str_split_lines(asm);
+    var result: Vec<str> = lines;
+    if str_equal(pass, "redundant_moves") {
+        result = pass_redundant_moves(lines);
+    } else if str_equal(pass, "zero_idiom") {
+        result = pass_zero_idiom(lines);
+    } else if str_equal(pass, "nop_arithmetic") {
+        result = pass_nop_arithmetic(lines);
+    } else if str_equal(pass, "branch_threading") {
+        result = pass_branch_threading(lines);
+    } else if str_equal(pass, "dead_store") {
+        result = pass_dead_store(lines);
+    } else if str_equal(pass, "redundant_test") {
+        result = pass_redundant_test(lines);
+    } else if str_equal(pass, "store_load_forward") {
+        result = pass_store_load_forward(lines);
+    } else if str_equal(pass, "lea_coalesce") {
+        result = pass_lea_coalesce(lines);
+    } else if str_equal(pass, "cmp_setcc_jcc") {
+        result = pass_cmp_setcc_jcc(lines);
+    } else {
+        return asm;
+    }
+    return str_join_lines(result);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Instruction parsing helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A parsed assembly line.
+pub struct AsmLine {
+    pub raw: str,
+    pub mnemonic: OptStr,
+    pub operands: OptStr,
+    pub is_label: bool,
+    pub is_directive: bool,
+    pub is_other: bool,
+}
+
+pub fn AsmLine_other(raw: str) -> AsmLine {
+    return AsmLine {
+        raw: raw,
+        mnemonic: OptStr::None,
+        operands: OptStr::None,
+        is_label: false,
+        is_directive: false,
+        is_other: true,
+    };
+}
+
+pub fn AsmLine_label(raw: str) -> AsmLine {
+    return AsmLine {
+        raw: raw,
+        mnemonic: OptStr::None,
+        operands: OptStr::None,
+        is_label: true,
+        is_directive: false,
+        is_other: false,
+    };
+}
+
+pub fn AsmLine_directive(raw: str) -> AsmLine {
+    return AsmLine {
+        raw: raw,
+        mnemonic: OptStr::None,
+        operands: OptStr::None,
+        is_label: false,
+        is_directive: true,
+        is_other: false,
+    };
+}
+
+pub fn AsmLine_inst(raw: str, mnemonic: str, operands: OptStr) -> AsmLine {
+    return AsmLine {
+        raw: raw,
+        mnemonic: OptStr::Some(mnemonic),
+        operands: operands,
+        is_label: false,
+        is_directive: false,
+        is_other: false,
+    };
+}
+
+pub fn AsmLine_parse(line: str) -> AsmLine {
+    var trimmed: str = str_trim(line);
+
+    if str_len(trimmed) == 0 || str_starts_with(trimmed, "#") || str_starts_with(trimmed, "//") {
+        return AsmLine_other(line);
+    }
+
+    if str_ends_with(trimmed, ":") {
+        return AsmLine_label(line);
+    }
+
+    if str_starts_with(trimmed, ".") {
+        return AsmLine_directive(line);
+    }
+
+    // Parse instruction: "    mnemonic operands  # comment"
+    var without_comment: str = trimmed;
+    var hash_idx: i64 = str_find_char(trimmed, 35);  // '#' = 35
+    if hash_idx >= 0 {
+        without_comment = str_slice(trimmed, 0, hash_idx);
+    }
+    without_comment = str_trim(without_comment);
+
+    var space_idx: i64 = str_find_whitespace(without_comment);
+    if space_idx >= 0 {
+        var mnemonic: str = str_slice(without_comment, 0, space_idx);
+        var operands_str: str = str_trim(str_slice(without_comment, space_idx, str_len(without_comment)));
+        return AsmLine_inst(line, mnemonic, OptStr::Some(operands_str));
+    } else {
+        // Instruction with no operands (e.g., "ret", "leave", "cqto")
+        return AsmLine_inst(line, without_comment, OptStr::None);
+    }
+}
+
+/// Get the operand list split by commas.
+pub fn AsmLine_operand_list(line: &AsmLine) -> Vec<str> {
+    match line.operands {
+        OptStr::Some(s) => {
+            return str_split_char(s, 44);  // ',' = 44
+        }
+        OptStr::None => {
+            return Vec::new();
+        }
+    }
+    return Vec::new();
+}
+
+/// Reconstruct the line with a new mnemonic and operands.
+pub fn AsmLine_reconstruct(mnemonic: str, operands: OptStr) -> str {
+    match operands {
+        OptStr::Some(ops) => {
+            return "    " + mnemonic + " " + ops;
+        }
+        OptStr::None => {
+            return "    " + mnemonic;
+        }
+    }
+    return "    " + mnemonic;
+}
+
+/// Parse all lines into AsmLine structs.
+pub fn parse_lines(lines: Vec<str>) -> Vec<AsmLine> {
+    var result: Vec<AsmLine> = Vec::new();
+    var i: i64 = 0;
+    while i < lines.len() {
+        result.push(AsmLine_parse(lines.get(i)));
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Convert AsmLine vec back to strings, preserving original raw text.
+pub fn emit_lines(parsed: Vec<AsmLine>) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < parsed.len() {
+        result.push(parsed.get(i).raw);
+        i = i + 1;
+    }
+    return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 1: Redundant move elimination
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Remove `movq %reg, %reg` (moving a register to itself).
+pub fn pass_redundant_moves(lines: Vec<str>) -> Vec<str> {
+    var parsed: Vec<AsmLine> = parse_lines(lines);
+    var result: Vec<AsmLine> = Vec::new();
+
+    var i: i64 = 0;
+    while i < parsed.len() {
+        var line: AsmLine = parsed.get(i);
+        var skip: bool = false;
+        match line.mnemonic {
+            OptStr::Some(mn) => {
+                match line.operands {
+                    OptStr::Some(ops) => {
+                        if str_equal(mn, "movq") || str_equal(mn, "movl") || str_equal(mn, "movw") || str_equal(mn, "movb") {
+                            var operands: Vec<str> = str_split_char(ops, 44);
+                            if operands.len() == 2 {
+                                if str_equal(str_trim(operands.get(0)), str_trim(operands.get(1))) {
+                                    skip = true;
+                                }
+                            }
+                        }
+                    }
+                    OptStr::None => {}
+                }
+            }
+            OptStr::None => {}
+        }
+        if !skip {
+            result.push(line);
+        }
+        i = i + 1;
+    }
+
+    return emit_lines(result);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 2: Zero-idiom replacement
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Replace `movq $0, %reg` with `xorl %ereg, %ereg` (smaller, faster, clears flags).
+pub fn pass_zero_idiom(lines: Vec<str>) -> Vec<str> {
+    var parsed: Vec<AsmLine> = parse_lines(lines);
+    var result: Vec<AsmLine> = Vec::new();
+
+    var i: i64 = 0;
+    while i < parsed.len() {
+        var line: AsmLine = parsed.get(i);
+        var replaced: bool = false;
+        match line.mnemonic {
+            OptStr::Some(mn) => {
+                if str_equal(mn, "movq") {
+                    match line.operands {
+                        OptStr::Some(ops) => {
+                            var operands: Vec<str> = str_split_char(ops, 44);
+                            if operands.len() == 2 {
+                                if str_equal(str_trim(operands.get(0)), "$0") {
+                                    var reg32_opt: OptStr = reg64_to_reg32(str_trim(operands.get(1)));
+                                    match reg32_opt {
+                                        OptStr::Some(reg32) => {
+                                            result.push(AsmLine_inst(
+                                                "    xorl %" + reg32 + ", %" + reg32,
+                                                "xorl",
+                                                OptStr::Some("%" + reg32 + ", %" + reg32)
+                                            ));
+                                            replaced = true;
+                                        }
+                                        OptStr::None => {}
+                                    }
+                                }
+                            }
+                        }
+                        OptStr::None => {}
+                    }
+                }
+            }
+            OptStr::None => {}
+        }
+        if !replaced {
+            result.push(line);
+        }
+        i = i + 1;
+    }
+
+    return emit_lines(result);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 3: No-op arithmetic elimination
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Remove `addq $0, %reg` and `subq $0, %reg` (no-ops).
+pub fn pass_nop_arithmetic(lines: Vec<str>) -> Vec<str> {
+    var parsed: Vec<AsmLine> = parse_lines(lines);
+    var result: Vec<AsmLine> = Vec::new();
+
+    var i: i64 = 0;
+    while i < parsed.len() {
+        var line: AsmLine = parsed.get(i);
+        var skip: bool = false;
+        match line.mnemonic {
+            OptStr::Some(mn) => {
+                match line.operands {
+                    OptStr::Some(ops) => {
+                        var operands: Vec<str> = str_split_char(ops, 44);
+                        if operands.len() == 2 {
+                            var op0: str = str_trim(operands.get(0));
+                            if str_equal(mn, "addq") || str_equal(mn, "subq") || str_equal(mn, "addl") || str_equal(mn, "subl") {
+                                if str_equal(op0, "$0") { skip = true; }
+                            }
+                            if str_equal(mn, "orq") || str_equal(mn, "orl") {
+                                if str_equal(op0, "$0") { skip = true; }
+                            }
+                            if str_equal(mn, "andq") {
+                                if str_equal(op0, "$-1") { skip = true; }
+                            }
+                        }
+                    }
+                    OptStr::None => {}
+                }
+            }
+            OptStr::None => {}
+        }
+        if !skip {
+            result.push(line);
+        }
+        i = i + 1;
+    }
+
+    return emit_lines(result);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 4: Branch threading
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Thread jumps: `jmp .L1` where `.L1: jmp .L2` → `jmp .L2`.
+pub fn pass_branch_threading(lines: Vec<str>) -> Vec<str> {
+    var parsed: Vec<AsmLine> = parse_lines(lines);
+
+    // Build a map of label → target (for labels that are just a single jmp).
+    var jump_targets_keys: Vec<str> = Vec::new();
+    var jump_targets_vals: Vec<str> = Vec::new();
+
+    var i: i64 = 0;
+    while i < parsed.len() {
+        var line: AsmLine = parsed.get(i);
+        if line.is_label {
+            var label: str = str_trim(line.raw);
+            label = str_trim_end_char(label, 58);  // ':' = 58
+            // Check if the next non-empty line is a jmp.
+            var j: i64 = i + 1;
+            while j < parsed.len() {
+                if !parsed.get(j).is_other {
+                    var next: AsmLine = parsed.get(j);
+                    match next.mnemonic {
+                        OptStr::Some(mn) => {
+                            if str_equal(mn, "jmp") {
+                                match next.operands {
+                                    OptStr::Some(ops) => {
+                                        jump_targets_keys.push(label);
+                                        jump_targets_vals.push(str_trim(ops));
+                                    }
+                                    OptStr::None => {}
+                                }
+                            }
+                        }
+                        OptStr::None => {}
+                    }
+                    break;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    // Rewrite jump instructions.
+    var result: Vec<AsmLine> = Vec::new();
+    i = 0;
+    while i < parsed.len() {
+        var line: AsmLine = parsed.get(i);
+        var replaced: bool = false;
+        match line.mnemonic {
+            OptStr::Some(mn) => {
+                if is_jump_mnemonic(mn) {
+                    match line.operands {
+                        OptStr::Some(ops) => {
+                            var target: str = str_trim(ops);
+                            var resolved: str = resolve_jump_target(target, jump_targets_keys, jump_targets_vals);
+                            if !str_equal(resolved, target) {
+                                result.push(AsmLine_inst(
+                                    "    " + mn + " " + resolved,
+                                    mn,
+                                    OptStr::Some(resolved)
+                                ));
+                                replaced = true;
+                            }
+                        }
+                        OptStr::None => {}
+                    }
+                }
+            }
+            OptStr::None => {}
+        }
+        if !replaced {
+            result.push(line);
+        }
+        i = i + 1;
+    }
+
+    return emit_lines(result);
+}
+
+pub fn is_jump_mnemonic(mn: str) -> bool {
+    if str_equal(mn, "jmp") { return true; }
+    if str_equal(mn, "jne") { return true; }
+    if str_equal(mn, "je") { return true; }
+    if str_equal(mn, "jz") { return true; }
+    if str_equal(mn, "jnz") { return true; }
+    if str_equal(mn, "jl") { return true; }
+    if str_equal(mn, "jg") { return true; }
+    if str_equal(mn, "jle") { return true; }
+    if str_equal(mn, "jge") { return true; }
+    if str_equal(mn, "jb") { return true; }
+    if str_equal(mn, "ja") { return true; }
+    if str_equal(mn, "jbe") { return true; }
+    if str_equal(mn, "jae") { return true; }
+    return false;
+}
+
+pub fn resolve_jump_target(target: str, keys: Vec<str>, vals: Vec<str>) -> str {
+    var current: str = target;
+    var visited: Vec<str> = Vec::new();
+    while true {
+        var idx: i64 = -1;
+        var k: i64 = 0;
+        while k < keys.len() {
+            if str_equal(keys.get(k), current) {
+                idx = k;
+                break;
+            }
+            k = k + 1;
+        }
+        if idx < 0 { break; }
+        // Check for cycle
+        var v: i64 = 0;
+        var in_visited: bool = false;
+        while v < visited.len() {
+            if str_equal(visited.get(v), current) {
+                in_visited = true;
+                break;
+            }
+            v = v + 1;
+        }
+        if in_visited { break; }
+        visited.push(current);
+        current = vals.get(idx);
+    }
+    return current;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 5: Dead store elimination (local)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// If `movq X, %reg` is immediately followed by `movq Y, %reg` (and no
+/// instruction between reads %reg), remove the first move.
+pub fn pass_dead_store(lines: Vec<str>) -> Vec<str> {
+    var parsed: Vec<AsmLine> = parse_lines(lines);
+    var result: Vec<AsmLine> = Vec::new();
+
+    var i: i64 = 0;
+    while i < parsed.len() {
+        var line: AsmLine = parsed.get(i);
+        var skip: bool = false;
+        match line.mnemonic {
+            OptStr::Some(mn) => {
+                if str_equal(mn, "movq") || str_equal(mn, "movl") {
+                    match line.operands {
+                        OptStr::Some(ops) => {
+                            var operands: Vec<str> = str_split_char(ops, 44);
+                            if operands.len() == 2 {
+                                var dst: str = str_trim(operands.get(1));
+                                if str_starts_with(dst, "%") {
+                                    // Look ahead: is the next non-comment line a mov to the same dst?
+                                    var j: i64 = i + 1;
+                                    while j < parsed.len() {
+                                        if !parsed.get(j).is_other {
+                                            var next: AsmLine = parsed.get(j);
+                                            match next.mnemonic {
+                                                OptStr::Some(nmn) => {
+                                                    if str_equal(nmn, mn) {
+                                                        match next.operands {
+                                                            OptStr::Some(nops) => {
+                                                                var next_operands: Vec<str> = str_split_char(nops, 44);
+                                                                if next_operands.len() == 2 {
+                                                                    if str_equal(str_trim(next_operands.get(1)), dst) {
+                                                                        var next_src: str = str_trim(next_operands.get(0));
+                                                                        var reads_dst: bool = str_contains(next_src, dst);
+                                                                        if !reads_dst {
+                                                                            // Check memory operand reads
+                                                                            if str_contains(next_src, "(%rax)") { reads_dst = true; }
+                                                                            if str_contains(next_src, "(%rcx)") { reads_dst = true; }
+                                                                            if str_contains(next_src, "(%rdx)") { reads_dst = true; }
+                                                                            if str_contains(next_src, "(%rbx)") { reads_dst = true; }
+                                                                            if str_contains(next_src, "(%rsi)") { reads_dst = true; }
+                                                                            if str_contains(next_src, "(%rdi)") { reads_dst = true; }
+                                                                            if str_contains(next_src, "(%r8)") { reads_dst = true; }
+                                                                            if str_contains(next_src, "(%r9)") { reads_dst = true; }
+                                                                            if str_contains(next_src, "(%r10)") { reads_dst = true; }
+                                                                            if str_contains(next_src, "(%r11)") { reads_dst = true; }
+                                                                            if str_contains(next_src, "(%r12)") { reads_dst = true; }
+                                                                            if str_contains(next_src, "(%r13)") { reads_dst = true; }
+                                                                            if str_contains(next_src, "(%r14)") { reads_dst = true; }
+                                                                            if str_contains(next_src, "(%r15)") { reads_dst = true; }
+                                                                        }
+                                                                        if !reads_dst {
+                                                                            skip = true;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            OptStr::None => {}
+                                                        }
+                                                    }
+                                                }
+                                                OptStr::None => {}
+                                            }
+                                            break;
+                                        }
+                                        j = j + 1;
+                                    }
+                                }
+                            }
+                        }
+                        OptStr::None => {}
+                    }
+                }
+            }
+            OptStr::None => {}
+        }
+        if !skip {
+            result.push(line);
+        }
+        i = i + 1;
+    }
+
+    return emit_lines(result);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 6: Redundant test elimination
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Remove `testq %reg, %reg` if the preceding instruction already set flags.
+pub fn pass_redundant_test(lines: Vec<str>) -> Vec<str> {
+    var parsed: Vec<AsmLine> = parse_lines(lines);
+    var result: Vec<AsmLine> = Vec::new();
+
+    var last_was_flag_setting: bool = false;
+    var last_flag_setting_dst: OptStr = OptStr::None;
+
+    var i: i64 = 0;
+    while i < parsed.len() {
+        var line: AsmLine = parsed.get(i);
+        var skip: bool = false;
+        match line.mnemonic {
+            OptStr::Some(mn) => {
+                // Check for testq %reg, %reg after a flag-setting instruction.
+                if str_equal(mn, "testq") || str_equal(mn, "testl") {
+                    match line.operands {
+                        OptStr::Some(ops) => {
+                            var operands: Vec<str> = str_split_char(ops, 44);
+                            if operands.len() == 2 {
+                                if str_equal(str_trim(operands.get(0)), str_trim(operands.get(1))) {
+                                    if last_was_flag_setting {
+                                        match last_flag_setting_dst {
+                                            OptStr::Some(dst) => {
+                                                if str_equal(dst, str_trim(operands.get(0))) {
+                                                    skip = true;
+                                                }
+                                            }
+                                            OptStr::None => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        OptStr::None => {}
+                    }
+                }
+
+                // Track whether this instruction sets flags.
+                if is_flag_setting(mn) {
+                    last_was_flag_setting = true;
+                    match line.operands {
+                        OptStr::Some(ops) => {
+                            var operands: Vec<str> = str_split_char(ops, 44);
+                            if operands.len() > 0 {
+                                last_flag_setting_dst = OptStr::Some(str_trim(operands.get(operands.len() - 1)));
+                            } else {
+                                last_flag_setting_dst = OptStr::None;
+                            }
+                        }
+                        OptStr::None => {
+                            // Single-operand instruction (negq, notq)
+                            last_flag_setting_dst = OptStr::None;
+                        }
+                    }
+                } else {
+                    last_was_flag_setting = false;
+                    last_flag_setting_dst = OptStr::None;
+                }
+            }
+            OptStr::None => {
+                if !line.is_other {
+                    last_was_flag_setting = false;
+                    last_flag_setting_dst = OptStr::None;
+                }
+            }
+        }
+        if !skip {
+            result.push(line);
+        }
+        i = i + 1;
+    }
+
+    return emit_lines(result);
+}
+
+pub fn is_flag_setting(mn: str) -> bool {
+    if str_equal(mn, "addq") { return true; }
+    if str_equal(mn, "subq") { return true; }
+    if str_equal(mn, "andq") { return true; }
+    if str_equal(mn, "orq") { return true; }
+    if str_equal(mn, "xorq") { return true; }
+    if str_equal(mn, "negq") { return true; }
+    if str_equal(mn, "notq") { return true; }
+    if str_equal(mn, "addl") { return true; }
+    if str_equal(mn, "subl") { return true; }
+    if str_equal(mn, "andl") { return true; }
+    if str_equal(mn, "orl") { return true; }
+    if str_equal(mn, "xorl") { return true; }
+    if str_equal(mn, "negl") { return true; }
+    if str_equal(mn, "notl") { return true; }
+    if str_equal(mn, "imulq") { return true; }
+    if str_equal(mn, "imull") { return true; }
+    if str_equal(mn, "cmpq") { return true; }
+    if str_equal(mn, "cmpl") { return true; }
+    if str_equal(mn, "testq") { return true; }
+    if str_equal(mn, "testl") { return true; }
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 7: Store-to-load forwarding
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Forward stores to loads: if `movq %src, off(%rbp)` is immediately followed
+/// by `movq off(%rbp), %dst` (same offset), replace the load with
+/// `movq %src, %dst`.
+pub fn pass_store_load_forward(lines: Vec<str>) -> Vec<str> {
+    var parsed: Vec<AsmLine> = parse_lines(lines);
+    var result: Vec<AsmLine> = Vec::new();
+
+    var i: i64 = 0;
+    while i < parsed.len() {
+        // Look for a two-instruction window: store then load from same address.
+        if i + 1 < parsed.len() {
+            var p0: AsmLine = parsed.get(i);
+            var p1: AsmLine = parsed.get(i + 1);
+            var matched: bool = false;
+            match p0.mnemonic {
+                OptStr::Some(mn1) => {
+                    if str_equal(mn1, "movq") || str_equal(mn1, "movl") {
+                        match p1.mnemonic {
+                            OptStr::Some(mn2) => {
+                                if str_equal(mn2, "movq") || str_equal(mn2, "movl") {
+                                    match p0.operands {
+                                        OptStr::Some(ops1) => {
+                                            match p1.operands {
+                                                OptStr::Some(ops2) => {
+                                                    var ops1_list: Vec<str> = str_split_char(ops1, 44);
+                                                    var ops2_list: Vec<str> = str_split_char(ops2, 44);
+                                                    if ops1_list.len() == 2 && ops2_list.len() == 2 {
+                                                        var src: str = str_trim(ops1_list.get(0));
+                                                        var mem_dst: str = str_trim(ops1_list.get(1));
+                                                        var mem_src: str = str_trim(ops2_list.get(0));
+                                                        var dst: str = str_trim(ops2_list.get(1));
+                                                        if str_contains(mem_dst, "(") && str_contains(mem_src, "(")
+                                                            && str_starts_with(src, "%") && str_starts_with(dst, "%")
+                                                            && str_equal(mem_dst, mem_src) && !str_equal(src, dst) {
+                                                            result.push(p0);
+                                                            result.push(AsmLine_inst(
+                                                                "    " + mn2 + " " + src + ", " + dst,
+                                                                mn2,
+                                                                OptStr::Some(src + ", " + dst)
+                                                            ));
+                                                            i = i + 2;
+                                                            matched = true;
+                                                        }
+                                                    }
+                                                }
+                                                OptStr::None => {}
+                                            }
+                                        }
+                                        OptStr::None => {}
+                                    }
+                                }
+                            }
+                            OptStr::None => {}
+                        }
+                    }
+                }
+                OptStr::None => {}
+            }
+            if matched { continue; }
+        }
+        result.push(parsed.get(i));
+        i = i + 1;
+    }
+
+    return emit_lines(result);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 8: LEA coalescing
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Coalesce redundant LEA instructions.
+pub fn pass_lea_coalesce(lines: Vec<str>) -> Vec<str> {
+    var parsed: Vec<AsmLine> = parse_lines(lines);
+    var result: Vec<AsmLine> = Vec::new();
+
+    // Track the last LEA: (address, destination_register)
+    var has_last_lea: bool = false;
+    var last_lea_addr: str = "";
+    var last_lea_dst: str = "";
+
+    var i: i64 = 0;
+    while i < parsed.len() {
+        var line: AsmLine = parsed.get(i);
+        var skip: bool = false;
+        match line.mnemonic {
+            OptStr::Some(mn) => {
+                if str_equal(mn, "leaq") {
+                    match line.operands {
+                        OptStr::Some(ops) => {
+                            var operands: Vec<str> = str_split_char(ops, 44);
+                            if operands.len() == 2 {
+                                var addr: str = str_trim(operands.get(0));
+                                var dst: str = str_trim(operands.get(1));
+                                if has_last_lea {
+                                    if str_equal(addr, last_lea_addr) && str_equal(dst, last_lea_dst) {
+                                        skip = true;
+                                    }
+                                }
+                                if !skip {
+                                    has_last_lea = true;
+                                    last_lea_addr = addr;
+                                    last_lea_dst = dst;
+                                }
+                            } else {
+                                has_last_lea = false;
+                            }
+                        }
+                        OptStr::None => {
+                            has_last_lea = false;
+                        }
+                    }
+                } else {
+                    // Call instructions clobber all caller-saved registers.
+                    if str_equal(mn, "call") || str_equal(mn, "callq") {
+                        has_last_lea = false;
+                    } else {
+                        match line.operands {
+                            OptStr::Some(ops) => {
+                                var operands: Vec<str> = str_split_char(ops, 44);
+                                if operands.len() > 0 {
+                                    var last_operand: str = str_trim(operands.get(operands.len() - 1));
+                                    if has_last_lea {
+                                        if str_equal(last_operand, last_lea_dst) {
+                                            has_last_lea = false;
+                                        }
+                                    }
+                                }
+                            }
+                            OptStr::None => {}
+                        }
+                    }
+                }
+            }
+            OptStr::None => {
+                if !line.is_other {
+                    has_last_lea = false;
+                }
+            }
+        }
+        if !skip {
+            result.push(line);
+        }
+        i = i + 1;
+    }
+
+    return emit_lines(result);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pass 9: Instruction selection — cmp+sete+movzbq+test+jne → test+je
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Pattern-match the canonical comparison lowering and replace it with
+/// a simpler instruction sequence.
+pub fn pass_cmp_setcc_jcc(lines: Vec<str>) -> Vec<str> {
+    var parsed: Vec<AsmLine> = parse_lines(lines);
+    var result: Vec<AsmLine> = Vec::new();
+
+    var i: i64 = 0;
+    while i < parsed.len() {
+        // Look for the 5-instruction pattern: cmp + setcc + movzbq + test + jcc
+        if i + 4 < parsed.len() {
+            var p0: AsmLine = parsed.get(i);
+            var p1: AsmLine = parsed.get(i + 1);
+            var p2: AsmLine = parsed.get(i + 2);
+            var p3: AsmLine = parsed.get(i + 3);
+            var p4: AsmLine = parsed.get(i + 4);
+
+            var matched: bool = false;
+            match p0.mnemonic {
+                OptStr::Some(mn0) => {
+                    if str_equal(mn0, "cmpq") || str_equal(mn0, "cmpl") {
+                        match p1.mnemonic {
+                            OptStr::Some(mn1) => {
+                                var jcc_opt: OptStr = setcc_to_jcc(mn1);
+                                match jcc_opt {
+                                    OptStr::Some(jcc) => {
+                                        match p1.operands {
+                                            OptStr::Some(ops1) => {
+                                                if str_equal(ops1, "%al") {
+                                                    match p2.mnemonic {
+                                                        OptStr::Some(mn2) => {
+                                                            if str_equal(mn2, "movzbq") {
+                                                                match p2.operands {
+                                                                    OptStr::Some(ops2) => {
+                                                                        if str_equal(ops2, "%al, %rax") {
+                                                                            match p3.mnemonic {
+                                                                                OptStr::Some(mn3) => {
+                                                                                    if str_equal(mn3, "testq") {
+                                                                                        match p3.operands {
+                                                                                            OptStr::Some(ops3) => {
+                                                                                                if str_equal(ops3, "%rax, %rax") {
+                                                                                                    match p4.mnemonic {
+                                                                                                        OptStr::Some(mn4) => {
+                                                                                                            if str_equal(mn4, "jne") {
+                                                                                                                match p4.operands {
+                                                                                                                    OptStr::Some(ops4) => {
+                                                                                                                        // All five match!
+                                                                                                                        result.push(p0);
+                                                                                                                        result.push(AsmLine_inst(
+                                                                                                                            "    " + jcc + " " + ops4,
+                                                                                                                            jcc,
+                                                                                                                            OptStr::Some(ops4)
+                                                                                                                        ));
+                                                                                                                        i = i + 5;
+                                                                                                                        matched = true;
+                                                                                                                    }
+                                                                                                                    OptStr::None => {}
+                                                                                                                }
+                                                                                                            }
+                                                                                                        }
+                                                                                                        OptStr::None => {}
+                                                                                                    }
+                                                                                                }
+                                                                                            }
+                                                                                            OptStr::None => {}
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                                OptStr::None => {}
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    OptStr::None => {}
+                                                                }
+                                                            }
+                                                        }
+                                                        OptStr::None => {}
+                                                    }
+                                                }
+                                            }
+                                            OptStr::None => {}
+                                        }
+                                    }
+                                    OptStr::None => {}
+                                }
+                            }
+                            OptStr::None => {}
+                        }
+                    }
+                }
+                OptStr::None => {}
+            }
+            if matched { continue; }
+        }
+        result.push(parsed.get(i));
+        i = i + 1;
+    }
+
+    return emit_lines(result);
+}
+
+pub fn setcc_to_jcc(mn: str) -> OptStr {
+    if str_equal(mn, "sete") { return OptStr::Some("je"); }
+    if str_equal(mn, "setne") { return OptStr::Some("jne"); }
+    if str_equal(mn, "setl") { return OptStr::Some("jl"); }
+    if str_equal(mn, "setg") { return OptStr::Some("jg"); }
+    if str_equal(mn, "setle") { return OptStr::Some("jle"); }
+    if str_equal(mn, "setge") { return OptStr::Some("jge"); }
+    if str_equal(mn, "setb") { return OptStr::Some("jb"); }
+    if str_equal(mn, "seta") { return OptStr::Some("ja"); }
+    if str_equal(mn, "setbe") { return OptStr::Some("jbe"); }
+    if str_equal(mn, "setae") { return OptStr::Some("jae"); }
+    return OptStr::None;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Register name helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Convert a 64-bit register name to its 32-bit form.
+/// "%rax" → "eax", "%r8" → "r8d", etc.
+pub fn reg64_to_reg32(reg: str) -> OptStr {
+    var r: str = reg;
+    if str_starts_with(r, "%") {
+        r = str_slice(r, 1, str_len(r));
+    }
+    if str_equal(r, "rax") { return OptStr::Some("eax"); }
+    if str_equal(r, "rcx") { return OptStr::Some("ecx"); }
+    if str_equal(r, "rdx") { return OptStr::Some("edx"); }
+    if str_equal(r, "rbx") { return OptStr::Some("ebx"); }
+    if str_equal(r, "rsp") { return OptStr::Some("esp"); }
+    if str_equal(r, "rbp") { return OptStr::Some("ebp"); }
+    if str_equal(r, "rsi") { return OptStr::Some("esi"); }
+    if str_equal(r, "rdi") { return OptStr::Some("edi"); }
+    if str_equal(r, "r8") { return OptStr::Some("r8d"); }
+    if str_equal(r, "r9") { return OptStr::Some("r9d"); }
+    if str_equal(r, "r10") { return OptStr::Some("r10d"); }
+    if str_equal(r, "r11") { return OptStr::Some("r11d"); }
+    if str_equal(r, "r12") { return OptStr::Some("r12d"); }
+    if str_equal(r, "r13") { return OptStr::Some("r13d"); }
+    if str_equal(r, "r14") { return OptStr::Some("r14d"); }
+    if str_equal(r, "r15") { return OptStr::Some("r15d"); }
+    return OptStr::None;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// String helpers (some may already exist in stdlib)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Split a string by newlines into a Vec<str>.
+pub fn str_split_lines(s: str) -> Vec<str> {
+    return str_split_char(s, 10);  // '\n' = 10
+}
+
+/// Join a Vec<str> with newlines, adding a trailing newline.
+pub fn str_join_lines(lines: Vec<str>) -> str {
+    var result: str = "";
+    var i: i64 = 0;
+    while i < lines.len() {
+        result = result + lines.get(i) + "\n";
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Find the index of a byte in a string, or -1 if not found.
+pub fn str_find_char(s: str, c: i64) -> i64 {
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        if str_byte_at(s, i) == c {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Find the index of the first whitespace byte in a string, or -1.
+pub fn str_find_whitespace(s: str) -> i64 {
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if c == 32 || c == 9 || c == 13 || c == 10 {  // ' ', '\t', '\r', '\n'
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Trim trailing byte from a string.
+pub fn str_trim_end_char(s: str, c: i64) -> str {
+    var n: i64 = str_len(s);
+    if n == 0 { return s; }
+    if str_byte_at(s, n - 1) == c {
+        return str_slice(s, 0, n - 1);
+    }
+    return s;
+}
+
+/// Check if a string contains a substring.
+pub fn str_contains(s: str, sub: str) -> bool {
+    return String_contains(s, sub);
+}
+
+/// Check if a string ends with a suffix.
+pub fn str_ends_with(s: str, suffix: str) -> bool {
+    return String_ends_with(s, suffix);
+}

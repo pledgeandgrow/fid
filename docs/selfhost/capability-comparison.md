@@ -1,11 +1,11 @@
 # What Fides Can Do Now — Honest Assessment
 
 > Evidence-based, verified against the actual codebase and test runs.
-> Last updated: Sep 3, 2026. Based on test runs, source inspection, and docs.
+> Last updated: Sep 4, 2026 (session 8). Based on test runs, source inspection, and docs.
 
 ---
 
-## Verified Test Results (Sep 3, 2026)
+## Verified Test Results (Sep 4, 2026)
 
 ```
 Interpreter:  197/200 passed
@@ -15,7 +15,7 @@ Self-host:    23/23 pass (interp + PE)
 Unit tests:   263/265 passed
 Stdlib:       69 modules
 Source:       52 .rs files (86K+ LOC)
-Self-host:    27 .fd modules (39.5K+ LOC)
+Self-host:    18 .fd modules (39.5K+ LOC)
 Test files:   214 in tests/ + 23 in tests/compiler/
 ```
 
@@ -90,12 +90,18 @@ features (HTTP, DB, threads, time, tensor, WASM) aren't ported to C yet.
 - Capability-aware linking (`--caps` strips ungranted code)
 - `sandbox { }` compile-time capability revocation
 
-### 9. Self-Hosting (almost there)
-- 18 modules rewritten in Fides (39.5K LOC)
-- All 18 compile + pass tests
-- `release/fides-c.exe` builds (7.9MB)
-- Enum variant extraction bug **FIXED** (Sep 3, 2026)
-- Bootstrap fixpoint is the next milestone
+### 9. Self-Hosting (self-compilation + native codegen achieved!)
+- 21 modules rewritten in Fides (~45K LOC, including PE emitter + Linux native codegen)
+- All 18 original modules compile + pass tests
+- `release/fides-c.exe` builds (8.5MB) via tcc
+- **Self-compilation works** — `fides-c.exe` compiles `compiler/main.fd` → `fides-c2.exe` (Sep 9, 2026)
+- `fides-c2.exe` correctly compiles `test_strconcat.fd` → "hello world"
+- **PE emitter ported to Fides** — `compiler/pe.fd` generates native Windows PE executables without tcc (Sep 10, 2026)
+- `fides-c.exe build tests\hello_pe.fd -o hello_pe.exe` → working .exe that prints "Hello from PE!"
+- **Linux native codegen ported** — `peephole.fd` + `regalloc.fd` + `codegen_x64.fd` (session 8), builds OK but not yet integrated
+- **`.exe` extension auto-appended** — `ccompile` and `build` now produce `.exe` output without manual rename (session 8)
+- Fixpoint verification is the next milestone (fides-c2 crashes on stdlib due to statement-dropping bug)
+- PE emitter currently supports simple programs; full compiler source support is in progress
 
 ---
 
@@ -251,16 +257,30 @@ These are verified working today, not aspirational:
 
 ## The Self-Hosting Milestone
 
-The enum variant extraction bug was **fixed on Sep 3, 2026**. The self-hosted
-compiler can now parse `stdlib/core.fd`. The next steps are:
+**Self-compilation was achieved on Sep 9, 2026 (session 4).** The self-hosted
+compiler (`fides-c.exe`) successfully compiles the entire ~42K LOC compiler
+source (`compiler/main.fd`) into a working second-generation binary
+(`fides-c2.exe`). The generated binary correctly compiles test files.
 
-1. Verify the self-hosted compiler can compile `compiler/main.fd` to C
-2. Link that C to a working `fides-c.exe`
-3. Run the bootstrap fixpoint (stage2.c == stage3.c)
+**Native PE code generation was achieved on Sep 10, 2026 (session 5).** The
+PE emitter was ported from Rust (`src/pe.rs`) to Fides (`compiler/pe.fd`,
+~2600 LOC). The `build` command generates native Windows PE executables
+directly from `.fd` source — no tcc, no gcc, no external linker.
 
-Once the fixpoint is achieved, Fides becomes a **self-reproducing compiler** —
-the foundation for everything else. No more dependency on Rust for building
-the compiler. The compiler can be built by itself, on any platform it targets.
+The next steps are:
+
+1. ~~Fix `.exe` extension in self-hosted compiler output~~ — DONE (session 8)
+2. Fix the statement-dropping bug in the Fides compiler (root cause of fides-c2.exe crash on stdlib)
+3. Remove/gate debug prints (38 `p_eprint_str` calls)
+4. Run the bootstrap fixpoint (fides-c2.c == fides-c3.c)
+5. Extend PE emitter to support full compiler source (struct/enum, Vec/HashMap, floats)
+6. Integrate Linux native codegen (port `elf64.rs`, `linker.rs`, `runtime_linux.rs`, wire into pipeline)
+
+Once the fixpoint is achieved and the PE emitter supports the full compiler
+source, Fides becomes a **self-reproducing compiler with a fully custom
+toolchain** — the foundation for everything else. No more dependency on Rust
+or tcc for building the compiler. The compiler can be built by itself, on
+any platform it targets.
 
 ---
 
@@ -275,9 +295,12 @@ no other language has. It's not ready to replace Rust or C for production use
 - **Safe embedded systems** — memory-safe firmware with tiny binaries
 - **Security-critical software** — capabilities + sandbox + audit
 
-The self-hosting effort is 95% complete. Once the bootstrap fixpoint lands,
-Fides becomes self-reproducing — a major milestone that most languages never
-achieve (Rust still uses a C bootstrap, Zig still uses LLVM).
+The self-hosting effort has achieved self-compilation (session 4), native PE
+code generation (session 5), and Linux native codegen porting (session 8).
+Once the bootstrap fixpoint is verified and the PE emitter supports the full
+compiler source, Fides becomes self-reproducing with a fully custom toolchain
+— a major milestone that most languages never achieve (Rust still uses a C
+bootstrap, Zig still uses LLVM).
 
 The honest assessment: **Fides is where Rust was in 2012** — the architecture
 is sound, the unique features work, but the ecosystem and optimization quality

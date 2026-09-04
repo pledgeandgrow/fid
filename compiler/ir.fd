@@ -28,6 +28,16 @@ use vec;
 use string;
 use compiler::ast;
 
+// ─── Local helper: Vec<str> contains ─────────────────────────────────────
+fn ir_c_str_vec_contains(vec: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < vec.len() {
+        if str_equal(vec.get(i), s) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
 // ─── Helper structs for Vec<(A, B)> fields ──────────────────────────────
 
 pub struct ValueIdType {
@@ -145,6 +155,11 @@ pub enum OptStructLayout {
 
 pub enum OptIrFunction {
     Some(IrFunction),
+    None,
+}
+
+pub enum OptIrModule {
+    Some(IrModule),
     None,
 }
 
@@ -1619,6 +1634,15 @@ pub fn IrModule_new() -> IrModule {
 }
 
 pub fn IrModule_add_struct(self: &mut IrModule, layout: StructLayout) {
+    // Replace existing entry if present (fixpoint loop recomputes layouts)
+    var i: i64 = 0;
+    while i < self.struct_layouts.len() {
+        if str_equal(self.struct_layouts.get(i).name, layout.name) {
+            self.struct_layouts.set(i, StructLayoutEntry_new(layout.name, layout));
+            return;
+        }
+        i = i + 1;
+    }
     self.struct_layouts.push(StructLayoutEntry_new(layout.name, layout));
 }
 
@@ -1867,7 +1891,112 @@ pub fn IrModule_optimize(self: &mut IrModule) -> i64 {
         self.functions.set(i, entry);
         i = i + 1;
     }
+    // Dead function elimination
+    total = total + IrModule_dead_function_elimination(self);
     return total;
+}
+
+/// Remove functions that are never called (except `main` and `p_*` runtime stubs).
+/// This reduces the size of the generated C code significantly.
+pub fn IrModule_dead_function_elimination(self: &mut IrModule) -> i64 {
+    if self.functions.len() <= 1 { return 0; }
+
+    // Collect all function names
+    var all_names: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < self.functions.len() {
+        all_names.push(self.functions.get(i).name);
+        i = i + 1;
+    }
+
+    // Mark reachable functions starting from main
+    var reachable: Vec<str> = Vec::new();
+    var worklist: Vec<str> = Vec::new();
+
+    // Start with main and all p_* runtime functions (they may be called from C runtime)
+    i = 0;
+    while i < all_names.len() {
+        var name: str = all_names.get(i);
+        if str_equal(name, "main") || str_equal(name, "main_entry") || (str_len(name) >= 2 && str_byte_at(name, 0) == 112 && str_byte_at(name, 1) == 95) {
+            reachable.push(name);
+            worklist.push(name);
+        }
+        i = i + 1;
+    }
+
+    // Also keep functions registered as extern (they may be called from outside)
+    i = 0;
+    while i < self.extern_functions.len() {
+        var ename: str = self.extern_functions.get(i).name;
+        if !ir_c_str_vec_contains(reachable, ename) {
+            reachable.push(ename);
+            worklist.push(ename);
+        }
+        i = i + 1;
+    }
+
+    // BFS: for each reachable function, find all Call targets
+    while worklist.len() > 0 {
+        var fname: str = worklist.get(worklist.len() - 1);
+        worklist.pop();
+
+        match IrModule_get_function(self, fname) {
+            OptIrFunction::Some(func) => {
+                // Scan all instructions for Call targets
+                var bi: i64 = 0;
+                while bi < func.blocks.len() {
+                    var block: BasicBlock = func.blocks.get(bi);
+                    var ii: i64 = 0;
+                    while ii < block.instructions.len() {
+                        var inst_id: i64 = block.instructions.get(ii);
+                        match IrFunction_get_inst(&func, inst_id) {
+                            OptInst::Some(inst) => {
+                                match inst {
+                                    Inst::Call(target, _, _, _) => {
+                                        if !ir_c_str_vec_contains(reachable, target) {
+                                            // Check if the target exists in this module
+                                            match IrModule_get_function(self, target) {
+                                                OptIrFunction::Some(_) => {
+                                                    reachable.push(target);
+                                                    worklist.push(target);
+                                                }
+                                                OptIrFunction::None => {}
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            OptInst::None => {}
+                        }
+                        ii = ii + 1;
+                    }
+                    bi = bi + 1;
+                }
+            }
+            OptIrFunction::None => {}
+        }
+    }
+
+    // Remove unreachable functions
+    var removed: i64 = 0;
+    var new_functions: Vec<IrFunctionEntry> = Vec::new();
+    i = 0;
+    while i < self.functions.len() {
+        var entry: IrFunctionEntry = self.functions.get(i);
+        if ir_c_str_vec_contains(reachable, entry.name) {
+            new_functions.push(entry);
+        } else {
+            removed = removed + 1;
+        }
+        i = i + 1;
+    }
+
+    if removed > 0 {
+        self.functions = new_functions;
+    }
+
+    return removed;
 }
 
 fn IrFunction_constant_fold(self: &mut IrFunction) -> i64 {

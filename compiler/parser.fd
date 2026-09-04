@@ -204,6 +204,8 @@ pub tokens: Vec<Token>,
 pub pos: i64,
 pub struct_names: Vec<str>,
 pub enum_names: Vec<str>,
+pub struct_name_set: i64,  // HashMap for O(1) lookup
+pub enum_name_set: i64,    // HashMap for O(1) lookup
 pub alias_to_struct: Vec<str>,
 pub errors: Vec<str>,
 pub expr_depth: i64,
@@ -242,11 +244,27 @@ pub fn Parser_new(tokens: Vec<Token>) -> Parser {
     // TokenKind enum
     en.push("TokenKind");
 
+    // Build HashMaps for O(1) name lookup (string interning)
+    var sn_set: i64 = HashMap_new();
+    var si: i64 = 0;
+    while si < sn.len() {
+        HashMap_insert(sn_set, sn.get(si), 1);
+        si = si + 1;
+    }
+    var en_set: i64 = HashMap_new();
+    var ei: i64 = 0;
+    while ei < en.len() {
+        HashMap_insert(en_set, en.get(ei), 1);
+        ei = ei + 1;
+    }
+
     return Parser {
         tokens: tokens,
         pos: 0,
         struct_names: sn,
         enum_names: en,
+        struct_name_set: sn_set,
+        enum_name_set: en_set,
         alias_to_struct: Vec::new(),
         errors: Vec::new(),
         expr_depth: 0,
@@ -351,11 +369,9 @@ fn expect_ident_or_keyword(self: &mut Parser) -> ParseResultStr {
 }
 
 fn is_struct_name(self: &Parser, name: str) -> bool {
-    var i: i64 = 0;
-    while i < self.struct_names.len() {
-        if str_equal(self.struct_names.get(i), name) { return true; }
-        i = i + 1;
-    }
+    // O(1) HashMap lookup (string interning optimization)
+    if HashMap_get(self.struct_name_set, name) != 0 { return true; }
+    // Check aliases (small list, linear scan is fine)
     var j: i64 = 0;
     while j < self.alias_to_struct.len() {
         if str_equal(self.alias_to_struct.get(j), name) { return true; }
@@ -365,11 +381,8 @@ fn is_struct_name(self: &Parser, name: str) -> bool {
 }
 
 fn is_enum_name(self: &Parser, name: str) -> bool {
-    var i: i64 = 0;
-    while i < self.enum_names.len() {
-        if str_equal(self.enum_names.get(i), name) { return true; }
-        i = i + 1;
-    }
+    // O(1) HashMap lookup (string interning optimization)
+    if HashMap_get(self.enum_name_set, name) != 0 { return true; }
     return false;
 }
 
@@ -853,6 +866,7 @@ match self.expect(TokenKind::RBrace, "}") {
 }
 
 self.struct_names.push(name);
+HashMap_insert(self.struct_name_set, name, 1);
 var __ret_StructDef: StructDef = StructDef_new(name, false);
 __ret_StructDef.fields = fields;
 __ret_StructDef.type_params = type_params;
@@ -962,6 +976,7 @@ match self.expect(TokenKind::RBrace, "}") {
 }
 
 self.enum_names.push(name);
+HashMap_insert(self.enum_name_set, name, 1);
 var __ret_EnumDef: EnumDef = EnumDef_new(name, variants, false);
 __ret_EnumDef.type_params = type_params;
 return ParseResultEnumDef::Ok(__ret_EnumDef);
@@ -1663,6 +1678,7 @@ if !has_forward {
 }
 
 self.struct_names.push(name);
+HashMap_insert(self.struct_name_set, name, 1);
 var __ret_LayerDef: LayerDef = LayerDef_new(name, forward, false);
 __ret_LayerDef.fields = fields;
 __ret_LayerDef.constructor_args = constructor_args;
@@ -1745,6 +1761,7 @@ if !has_forward {
 }
 
 self.struct_names.push(name);
+HashMap_insert(self.struct_name_set, name, 1);
 var __ret_ModelDef: ModelDef = ModelDef_new(name, layers, forward, false);
 return ParseResultModelDef::Ok(__ret_ModelDef);
 }
@@ -1787,6 +1804,7 @@ match self.expect(TokenKind::RBrace, "}") {
     ParseResultUnit::Ok => {}
 }
 self.struct_names.push(name);
+HashMap_insert(self.struct_name_set, name, 1);
 var __ret_ComponentDef: ComponentDef = ComponentDef_new(name, false);
 __ret_ComponentDef.fields = fields;
 return ParseResultComponentDef::Ok(__ret_ComponentDef);
@@ -1896,6 +1914,7 @@ match self.expect(TokenKind::RBrace, "}") {
     ParseResultUnit::Ok => {}
 }
 self.enum_names.push(name);
+HashMap_insert(self.enum_name_set, name, 1);
 var __ret_StateMachineDef: StateMachineDef = StateMachineDef_new(name, false);
 __ret_StateMachineDef.states = states;
 return ParseResultStateMachineDef::Ok(__ret_StateMachineDef);
@@ -4885,16 +4904,31 @@ return ParseResultExpr::Ok(Expr::FString(parts));
 }  // close impl Parser block
 
 pub fn Parser_with_names(tokens: Vec<Token>, struct_names: Vec<str>, enum_names: Vec<str>) -> Parser {
-return Parser {
-    tokens: tokens,
-    pos: 0,
-    struct_names: struct_names,
-    enum_names: enum_names,
-    alias_to_struct: Vec::new(),
-    errors: Vec::new(),
-    expr_depth: 0,
-    max_expr_depth: 256,
-};
+    // Build HashMaps for O(1) name lookup (string interning)
+    var sn_set: i64 = HashMap_new();
+    var si: i64 = 0;
+    while si < struct_names.len() {
+        HashMap_insert(sn_set, struct_names.get(si), 1);
+        si = si + 1;
+    }
+    var en_set: i64 = HashMap_new();
+    var ei: i64 = 0;
+    while ei < enum_names.len() {
+        HashMap_insert(en_set, enum_names.get(ei), 1);
+        ei = ei + 1;
+    }
+    return Parser {
+        tokens: tokens,
+        pos: 0,
+        struct_names: struct_names,
+        enum_names: enum_names,
+        struct_name_set: sn_set,
+        enum_name_set: en_set,
+        alias_to_struct: Vec::new(),
+        errors: Vec::new(),
+        expr_depth: 0,
+        max_expr_depth: 256,
+    };
 }
 
 // Helper: extract Expr from Box<Expr> (Fides has no * deref for Box)

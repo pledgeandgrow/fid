@@ -766,6 +766,8 @@ impl Lowerer {
         // p_file_append(path: *u8, content: *u8) -> i64  — append content to file
         self.module.add_extern("p_file_read", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Ptr(Box::new(IrType::U8)));
         self.module.add_extern("p_file_write", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
+        self.module.add_extern("p_file_write_bin", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8)), IrType::I64], IrType::I64);
+        self.module.add_extern("p_file_write_vec", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
         self.module.add_extern("p_file_exists", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Bool);
         self.module.add_extern("p_file_append", vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))], IrType::I64);
         // p_file_delete(path: *u8) -> i64  — delete a file, returns 0 on success
@@ -836,6 +838,12 @@ impl Lowerer {
         self.module.add_extern("p_regex_match",
             vec![IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::U8))],
             IrType::Bool);
+
+        // ─── Global string interner ───
+        // p_intern_str(s: *u8) -> *u8  — interns s globally, returns canonical pointer
+        self.module.add_extern("p_intern_str",
+            vec![IrType::Ptr(Box::new(IrType::U8))],
+            IrType::Ptr(Box::new(IrType::U8)));
 
         // ─── Phase 7.6: Async/await runtime ───
         // p_future_ready(value: i64) -> i64  — wrap a value in a ready Future

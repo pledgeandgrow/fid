@@ -1,7 +1,7 @@
 # Vision Analysis — Are We on the Right Path?
 
 > An honest assessment of where Fides is, where it's going, and what the
-> self-hosting effort needs to succeed. Written Sep 3, 2026.
+> self-hosting effort needs to succeed. Updated Sep 4, 2026 (session 8).
 
 ---
 
@@ -44,16 +44,22 @@ The North Star: one language for OS kernels, web servers, robots, AI, microcontr
 | All 18 modules | Compile + pass tests | 23/23 on interp + PE |
 | Build pipeline | Works | `fides-c.exe` builds via tcc |
 | SRET | Works | Struct returns via out-parameter |
-| Enum layout | Works (with caveat) | Payload sizes computed from field sizes |
-| Bootstrap fixpoint | **NOT YET** | Blocked by enum variant extraction bug |
+| Enum layout | Works | Payload sizes computed from field sizes |
+| Self-compilation | **✅ WORKS** | `fides-c.exe` → `fides-c2.exe` (session 4) |
+| PE emitter | **✅ WORKS** | `fides-c.exe build` → native .exe without tcc (session 5) |
+| Comptime eval | **✅ FULL PORT** | process_gen, substitute, I-5A, I-5D, reflection (session 7) |
+| PE runtime stubs | **✅ 25+ stubs** | print, string, vec, map, float, bool (session 7) |
+| Linux native codegen | **✅ PORTED** | peephole.fd + regalloc.fd + codegen_x64.fd (session 8, not yet integrated) |
+| `.exe` extension | **✅ FIXED** | Auto-appended in ccompile + build commands (session 8) |
+| Bootstrap fixpoint | **NOT YET VERIFIED** | fides-c2 crashes on stdlib (statement-dropping bug); need to fix + verify |
 
 ### What doesn't work yet
 
-1. **Self-hosted compiler can't parse `stdlib/core.fd`** — enum variant extraction truncates struct payloads
-2. **Bootstrap fixpoint not achieved** — can't verify the compiler reproduces itself
-3. **PE emitter not rewritten in Fides** — deferred until C codegen bootstrap lands
-4. **`box_expr_unbox` in `compiler/lower.fd` is out of sync** with `ast.fd`
-5. **Fides lowerer `EnumLit` doesn't do multi-slot copy** — loses struct data on construction
+1. **fides-c2.exe crashes on stdlib** — second-generation compiler crashes while lexing `stdlib/core.fd`. Root cause: the **statement-dropping bug** (the Fides compiler silently drops statements in long functions; the second-generation binary has missing instructions baked in)
+2. **Bootstrap fixpoint not verified** — can't yet confirm stage2.c == stage3.c
+3. **Debug prints** — 38 `p_eprint_str` calls need gating behind a debug flag
+4. **PE emitter limited to simple programs** — needs struct/enum, float arithmetic, many-arg calls for full compiler source
+5. **Linux native codegen not integrated** — peephole.fd, regalloc.fd, codegen_x64.fd are ported but not wired into the pipeline (requires elf64.rs, linker.rs, runtime_linux.rs porting)
 
 ---
 
@@ -73,11 +79,12 @@ The self-hosting approach is correct:
 
 ### Yes — the current blocker is the right one to focus on
 
-The enum variant extraction bug is the **last** codegen bug between us and the bootstrap fixpoint. Once it's fixed:
-1. The self-hosted compiler can parse `stdlib/core.fd`
-2. It can compile `compiler/main.fd` to C
-3. We can verify the fixpoint (stage2.c == stage3.c)
-4. We have a self-reproducing compiler
+The self-hosted compiler now compiles itself (session 4). The remaining
+blocker is that fides-c2.exe (the second generation) crashes on stdlib.
+Once that's fixed:
+1. We can verify the fixpoint (fides-c2.c == fides-c3.c)
+2. We have a self-reproducing compiler
+3. Rust is only needed for the initial bootstrap
 
 ### The direction change is correct
 
@@ -97,37 +104,26 @@ The user's change to `pattern_binding_ir_types` (using `word_repr` for all types
 
 ## What Needs to Happen
 
-### Immediate (to unblock bootstrap)
+### Immediate (to unblock fixpoint verification)
 
-1. **Complete the pointer-based enum approach [D1]:**
-   - `src/lower.rs` `compute_enum_layout`: 8 bytes per field (not struct size)
-   - `src/lower.rs` `EnumLit`: store struct args as pointers (single slot)
-   - `src/lower.rs` `load_enum_field`: remove or simplify
-   - `compiler/lower.fd` `Lowerer_make_enum_layout`: 8 bytes per field
-   - `compiler/lower.fd` `EnumLit`: store struct args as pointers
-   - `compiler/lower.fd` match extraction: already uses `Load` — no change needed
-
-2. **Rebuild and test:**
-   - `cargo build --release`
-   - `.\build-selfhost.ps1`
-   - `.\release\fides-c.exe ccompile tests\hello.fd -o release\hello_test`
-   - If that works: `.\release\fides-c.exe ccompile stdlib\core.fd`
-   - If that works: run the bootstrap fixpoint
-
-3. **Sync `box_expr_unbox`** in `compiler/lower.fd` with `ast.fd`
+1. ~~**Fix `.exe` extension** in self-hosted compiler output (Windows)~~ — DONE (session 8)
+2. **Fix the statement-dropping bug** in the Fides compiler — root cause of fides-c2.exe crash on stdlib (the compiler silently drops statements in long functions, baking missing instructions into the second-generation binary)
+3. **Remove/gate debug prints** — 38 `p_eprint_str` calls
+4. **Run the fixpoint test:** `diff fides-c2.exe.c fides-c3.exe.c`
 
 ### Near-term (after bootstrap)
 
-4. **Run the full test suite** through the self-hosted compiler
-5. **Verify the fixpoint** (stage2.c == stage3.c)
-6. **Fix any remaining codegen differences** found during fixpoint testing
+5. **Run the full test suite** through the self-hosted compiler
+6. **Verify the fixpoint** (stage2.c == stage3.c)
+7. **Fix any remaining codegen differences** found during fixpoint testing
+8. **Extend PE emitter to full compiler source** — add struct/enum, Vec/HashMap, float arithmetic support
 
 ### Long-term (post-bootstrap)
 
-7. **Rewrite PE emitter in Fides** (Phase 10B)
-8. **Industry domain stdlibs** (Phase 9)
-9. **Playground website** (post-self-host)
-10. **Package registry** (post-self-host)
+9. **Port codegen_x64.fd + peephole.fd + elf64.fd** for Linux native codegen
+10. **Industry domain stdlibs** (Phase 9)
+11. **Playground website** (post-self-host)
+12. **Package registry** (post-self-host)
 
 ---
 
@@ -191,9 +187,9 @@ The user's change to `pattern_binding_ir_types` (using `word_repr` for all types
 
 | Vision pillar | What's missing | Priority |
 |---------------|----------------|----------|
-| Self-hosting | Bootstrap fixpoint | **CRITICAL** — blocks everything |
+| Self-hosting | Fixpoint verification + PE emitter for full compiler | **CRITICAL** — self-compilation + PE emitter work, need fixpoint + full native codegen |
 | Performance | AVX2/SSE2 codegen, graph-coloring regalloc | Medium |
-| Platform | DWARF debug info | Low |
+| Platform | DWARF debug info, Linux native codegen (elf64.fd port) | Low |
 | Innovation | Industry domain stdlibs (medical, blockchain, robotics) | Low (post-bootstrap) |
 | Adoption | Playground website, package registry | Low (post-bootstrap) |
 | Ergonomics | Hot reload, green threads | Medium |
@@ -216,6 +212,18 @@ The user's change to `pattern_binding_ir_types` (using `word_repr` for all types
 
 ## Conclusion
 
-**Yes, we are on the right path.** The vision is ambitious but the architecture is sound. The self-hosting effort is 95% complete — all 18 modules are rewritten and pass tests. The only remaining blocker is the enum variant extraction bug, which the pointer-based approach [D1] will fix cleanly.
+**Yes, we are on the right path.** The vision is ambitious but the architecture
+is sound. The self-hosting effort has achieved self-compilation (session 4),
+native PE code generation (session 5), and Linux native codegen porting
+(session 8) — `fides-c.exe` compiles the entire ~45K LOC compiler to a working
+second-generation binary, the PE emitter generates native Windows executables
+without tcc, and the Linux native codegen backend is ported (pending
+integration). The remaining work is verifying the fixpoint (stage2.c ==
+stage3.c), which requires fixing the statement-dropping bug (root cause of the
+fides-c2.exe stdlib crash), and extending the PE emitter to support the full
+compiler source.
 
-Once the bootstrap fixpoint is achieved, Fides becomes a self-reproducing compiler — the foundation for everything else in the vision.
+Once the bootstrap fixpoint is achieved and the PE emitter supports the full
+compiler source, Fides becomes a **self-reproducing compiler with a fully
+custom toolchain** — no LLVM, no gcc, no tcc, no external linker. The
+foundation for everything else in the vision.

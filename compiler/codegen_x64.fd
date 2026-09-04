@@ -1,0 +1,1937 @@
+// codegen_x64.fd — x86-64 Code Generator (Phase 4C)
+// Ported from src/codegen_x64.rs (~2081 LOC)
+//
+// Instruction selector that consumes PIR L3 + a register allocation and
+// produces x86-64 assembly (AT&T syntax, System V AMD64 ABI).
+//
+// Pipeline: L3Module → (regalloc) → [code selector] → x86-64 asm string
+//
+// Calling convention: System V AMD64
+//   - Args: RDI, RSI, RDX, RCX, R8, R9 (first 6 integer/pointer)
+//   - Return: RAX
+//   - Callee-saved: RBX, R12-R15 (preserved across calls)
+//   - Stack 16-byte aligned at call sites
+//
+// Adaptations from Rust:
+// 1. HashMap<K,V> → Vec-based maps with helper structs
+// 2. HashSet<T> → Vec<T> with contains() helper
+// 3. Option<T> → Opt* enums
+// 4. String → str
+// 5. PhysReg enum → i64 constants (from regalloc.fd)
+// 6. format! → string concatenation
+
+module compiler::codegen_x64;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::pir;
+use compiler::regalloc;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Public API
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Generate x86-64 assembly for an entire L3 module.
+/// Returns a string of AT&T-syntax assembly suitable for `gcc -c` or `as`.
+pub fn generate_asm(module: L3Module) -> str {
+    var allocs: ModuleAllocation = allocate_module(module);
+    var gen: X64CodeGen = X64CodeGen_new(allocs);
+    X64CodeGen_gen_module(gen, module);
+    return gen.output;
+}
+
+/// Generate x86-64 assembly with per-function allocation info (for debugging).
+pub fn generate_asm_with_allocs(module: L3Module, allocs: ModuleAllocation) -> str {
+    var gen: X64CodeGen = X64CodeGen_new(allocs);
+    X64CodeGen_gen_module(gen, module);
+    return gen.output;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Code generator state
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// String label entry: label → content
+pub struct StringLabelEntry {
+    pub label: str,
+    pub content: str,
+}
+
+pub fn StringLabelEntry_new(label: str, content: str) -> StringLabelEntry {
+    return StringLabelEntry { label: label, content: content };
+}
+
+/// Block label entry: (func_name, block_id) → label
+pub struct BlockLabelEntry {
+    pub func: str,
+    pub block_id: i64,
+    pub label: str,
+}
+
+pub fn BlockLabelEntry_new(func: str, block_id: i64, label: str) -> BlockLabelEntry {
+    return BlockLabelEntry { func: func, block_id: block_id, label: label };
+}
+
+/// Vtable entry: label → list of function names
+pub struct VtableEntry {
+    pub label: str,
+    pub methods: Vec<str>,
+}
+
+pub fn VtableEntry_new(label: str, methods: Vec<str>) -> VtableEntry {
+    return VtableEntry { label: label, methods: methods };
+}
+
+/// Pending panic stub: (label, message)
+pub struct PanicStub {
+    pub label: str,
+    pub message: str,
+}
+
+pub fn PanicStub_new(label: str, message: str) -> PanicStub {
+    return PanicStub { label: label, message: message };
+}
+
+/// The x86-64 code generator.
+pub struct X64CodeGen {
+    pub output: str,
+    pub allocs: ModuleAllocation,
+    pub current_alloc: OptAllocation,
+    pub strings: Vec<StringLabelEntry>,
+    pub string_counter: i64,
+    pub block_labels: Vec<BlockLabelEntry>,
+    pub current_func: str,
+    pub trait_methods: Vec<StringVecStr>,
+    pub vtables: Vec<VtableEntry>,
+    pub wrapping_functions: Vec<str>,
+    pub panic_label_counter: i64,
+    pub pending_panic_stubs: Vec<PanicStub>,
+}
+
+pub fn X64CodeGen_new(allocs: ModuleAllocation) -> X64CodeGen {
+    return X64CodeGen {
+        output: "",
+        allocs: allocs,
+        current_alloc: OptAllocation::None,
+        strings: Vec::new(),
+        string_counter: 0,
+        block_labels: Vec::new(),
+        current_func: "",
+        trait_methods: Vec::new(),
+        vtables: Vec::new(),
+        wrapping_functions: Vec::new(),
+        panic_label_counter: 0,
+        pending_panic_stubs: Vec::new(),
+    };
+}
+
+// ─── Output helpers ──────────────────────────────────────────────────────
+
+/// Append a string (no newline).
+pub fn X64CodeGen_w(self: &mut X64CodeGen, s: str) {
+    self.output = self.output + s;
+}
+
+/// Append a string with a trailing newline.
+pub fn X64CodeGen_wl(self: &mut X64CodeGen, s: str) {
+    self.output = self.output + s + "\n";
+}
+
+/// Returns true if the current function is @wrapping (F65) — overflow
+/// checks should be skipped.
+pub fn X64CodeGen_is_wrapping_func(self: &X64CodeGen) -> bool {
+    var i: i64 = 0;
+    while i < self.wrapping_functions.len() {
+        if str_equal(self.wrapping_functions.get(i), self.current_func) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Allocate a unique panic label and queue a panic stub for end-of-function emission.
+/// Returns the label to jump to on check failure.
+pub fn X64CodeGen_alloc_panic_label(self: &mut X64CodeGen, message: str) -> str {
+    var n: i64 = self.panic_label_counter;
+    self.panic_label_counter = self.panic_label_counter + 1;
+    var label: str = ".L" + self.current_func + "_panic" + int_to_str(n);
+    self.pending_panic_stubs.push(PanicStub_new(label, message));
+    return label;
+}
+
+/// Allocate a string constant and return its label.
+pub fn X64CodeGen_alloc_string(self: &mut X64CodeGen, s: str) -> str {
+    // Check if we already have this exact string.
+    var i: i64 = 0;
+    while i < self.strings.len() {
+        if str_equal(self.strings.get(i).content, s) {
+            return self.strings.get(i).label;
+        }
+        i = i + 1;
+    }
+    var label: str = ".str_" + int_to_str(self.string_counter);
+    self.string_counter = self.string_counter + 1;
+    self.strings.push(StringLabelEntry_new(label, s));
+    return label;
+}
+
+/// Allocate a float constant and return its label.
+pub fn X64CodeGen_alloc_float_const(self: &mut X64CodeGen, bits: i64) -> str {
+    var label: str = ".flt_" + int_to_str(self.string_counter);
+    self.string_counter = self.string_counter + 1;
+    // Store the bits as a .quad in the data section.
+    // We encode it with a prefix so the emitter knows it's a float.
+    self.strings.push(StringLabelEntry_new(label, "__float_bits:" + int_to_str(bits)));
+    return label;
+}
+
+// ─── Location helpers ────────────────────────────────────────────────────
+
+/// Get the location of a VReg from the current function's allocation.
+pub fn X64CodeGen_dst_loc(self: &X64CodeGen, vreg: VReg) -> OptLocation {
+    match self.current_alloc {
+        OptAllocation::Some(a) => {
+            return OptLocation::Some(Allocation_loc(a, vreg.id));
+        }
+        OptAllocation::None => {
+            return OptLocation::None;
+        }
+    }
+    return OptLocation::None;
+}
+
+/// Get the physical register holding an operand (if it's a VReg in a reg).
+pub fn X64CodeGen_operand_reg(self: &X64CodeGen, op: Operand) -> OptI64 {
+    match op {
+        Operand::VReg(vr) => {
+            match X64CodeGen_dst_loc(self, vr) {
+                OptLocation::Some(loc) => {
+                    match loc {
+                        Location::Reg(r) => { return OptI64::Some(r); }
+                        _ => { return OptI64::None; }
+                    }
+                }
+                OptLocation::None => { return OptI64::None; }
+            }
+        }
+        _ => { return OptI64::None; }
+    }
+    return OptI64::None;
+}
+
+/// String representation of a VReg's current location.
+pub fn X64CodeGen_vreg_str(self: &X64CodeGen, vreg: VReg) -> str {
+    match X64CodeGen_dst_loc(self, vreg) {
+        OptLocation::Some(loc) => {
+            match loc {
+                Location::Reg(r) => { return "%" + physreg_name(r); }
+                Location::Spill(off) => { return "-" + int_to_str(off) + "(%rbp)"; }
+                Location::Remat(c) => { return "$" + int_to_str(c); }
+            }
+        }
+        OptLocation::None => { return "%v" + int_to_str(vreg.id); }
+    }
+    return "%v" + int_to_str(vreg.id);
+}
+
+/// Pick a scratch register that doesn't conflict with `dst`.
+pub fn X64CodeGen_scratch_reg(dst: i64) -> i64 {
+    if dst != REG_RCX {
+        return REG_RCX;
+    }
+    if dst != REG_RDX {
+        return REG_RDX;
+    }
+    return REG_R10;
+}
+
+/// Block label lookup.
+pub fn X64CodeGen_block_label(self: &X64CodeGen, block_id: i64) -> str {
+    var i: i64 = 0;
+    while i < self.block_labels.len() {
+        var entry: BlockLabelEntry = self.block_labels.get(i);
+        if str_equal(entry.func, self.current_func) && entry.block_id == block_id {
+            return entry.label;
+        }
+        i = i + 1;
+    }
+    return ".L" + self.current_func + "_bb" + int_to_str(block_id);
+}
+
+/// Epilogue label for the current function.
+pub fn X64CodeGen_epilogue_label(self: &X64CodeGen) -> str {
+    return ".L" + self.current_func + "_epilogue";
+}
+
+// ─── Optional types ──────────────────────────────────────────────────────
+
+pub enum OptLocation {
+    Some(Location),
+    None,
+}
+
+// ─── Module generation ───────────────────────────────────────────────────
+
+/// Generate assembly for an entire L3 module.
+pub fn X64CodeGen_gen_module(self: &mut X64CodeGen, module: L3Module) {
+    // Copy trait method info for vtable dispatch.
+    self.trait_methods = module.trait_methods;
+    // Copy wrapping function set for overflow check suppression (F65).
+    self.wrapping_functions = module.wrapping_functions;
+
+    // Collect string constants from the module.
+    var i: i64 = 0;
+    while i < module.string_constants.len() {
+        var entry: StringStringEntry = module.string_constants.get(i);
+        self.strings.push(StringLabelEntry_new(entry.val, entry.key));
+        // Update string_counter to avoid label collisions.
+        var label: str = entry.val;
+        if str_starts_with(label, ".str_") {
+            var num_str: str = str_slice(label, 5, str_len(label));
+            var n: i64 = str_parse_int(num_str);
+            if n >= self.string_counter {
+                self.string_counter = n + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    // .text section
+    X64CodeGen_wl(self, "    .text");
+
+    // Generate each function.
+    i = 0;
+    while i < module.functions.len() {
+        X64CodeGen_gen_function(self, module.functions.get(i), module);
+        i = i + 1;
+    }
+
+    // Emit string constants after codegen (so all are collected).
+    X64CodeGen_wl(self, "");
+    X64CodeGen_wl(self, "    .section .rodata");
+    X64CodeGen_wl(self, "    .align 8");
+
+    // Collect strings into a copy for iteration (avoid borrow issues).
+    var strings_copy: Vec<StringLabelEntry> = self.strings;
+    i = 0;
+    while i < strings_copy.len() {
+        var entry: StringLabelEntry = strings_copy.get(i);
+        if str_starts_with(entry.content, "__float_bits:") {
+            // Float constant — emit as .quad with the raw bits.
+            var bits_str: str = str_slice(entry.content, 13, str_len(entry.content));
+            var bits: i64 = str_parse_int(bits_str);
+            X64CodeGen_wl(self, entry.label + ": .quad " + int_to_str(bits));
+        } else {
+            X64CodeGen_wl(self, entry.label + ": .asciz \"" + escape_str(entry.content) + "\"");
+        }
+        i = i + 1;
+    }
+
+    // Emit vtables after string constants.
+    var vtables_copy: Vec<VtableEntry> = self.vtables;
+    i = 0;
+    while i < vtables_copy.len() {
+        var vt: VtableEntry = vtables_copy.get(i);
+        X64CodeGen_wl(self, vt.label + ":");
+        var j: i64 = 0;
+        while j < vt.methods.len() {
+            X64CodeGen_wl(self, "    .quad " + vt.methods.get(j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    // Declare externs.
+    X64CodeGen_wl(self, "");
+    X64CodeGen_wl(self, "    # External runtime functions (linked from C runtime)");
+    i = 0;
+    while i < module.extern_functions.len() {
+        X64CodeGen_wl(self, "    .globl " + module.extern_functions.get(i).name);
+        i = i + 1;
+    }
+}
+
+// ─── Function generation ─────────────────────────────────────────────────
+
+/// Generate code for a single function.
+pub fn X64CodeGen_gen_function(self: &mut X64CodeGen, f: L3Function, module: L3Module) {
+    self.current_func = f.name;
+
+    // Get this function's allocation.
+    var alloc_opt: OptAllocation = ModuleAllocation_get(self.allocs, f.name);
+    self.current_alloc = alloc_opt;
+
+    // Pre-compute block labels.
+    var new_block_labels: Vec<BlockLabelEntry> = Vec::new();
+    self.block_labels = new_block_labels;
+    var i: i64 = 0;
+    while i < f.blocks.len() {
+        var block: L3Block = f.blocks.get(i);
+        var label: str = ".L" + f.name + "_bb" + int_to_str(block.id);
+        self.block_labels.push(BlockLabelEntry_new(f.name, block.id, label));
+        i = i + 1;
+    }
+
+    // Compute frame size.
+    var spill_size: i64 = 0;
+    match alloc_opt {
+        OptAllocation::Some(a) => { spill_size = a.spill_size; }
+        OptAllocation::None => {}
+    }
+    var frame_size: i64 = f.frame_size + spill_size;
+    // Reserve 8 bytes for the stack canary (stored at -8(%rbp)).
+    var frame_size_with_canary: i64 = frame_size + 8;
+    // Align frame to 16 bytes.
+    var callee_count: i64 = 0;
+    match alloc_opt {
+        OptAllocation::Some(a) => { callee_count = a.used_callee_saved.len(); }
+        OptAllocation::None => {}
+    }
+    var pad: i64 = 0;
+    if callee_count % 2 == 1 { pad = 8; }
+    var aligned_frame: i64 = (frame_size_with_canary + 15) & (~15);
+    aligned_frame = aligned_frame + pad;
+
+    X64CodeGen_wl(self, "");
+    X64CodeGen_wl(self, "    .globl " + f.name);
+    X64CodeGen_wl(self, "    .type " + f.name + ", @function");
+    X64CodeGen_wl(self, f.name + ":");
+
+    // ─── Prologue ───
+    X64CodeGen_wl(self, "    pushq %rbp");
+    X64CodeGen_wl(self, "    movq %rsp, %rbp");
+    if aligned_frame > 0 {
+        X64CodeGen_wl(self, "    subq $" + int_to_str(aligned_frame) + ", %rsp");
+    }
+
+    // Stack canary: derive a per-frame canary from the return address.
+    X64CodeGen_wl(self, "    movq 8(%rbp), %rax");
+    X64CodeGen_wl(self, "    xorq $0x5DEADBEEFCAFEBABE, %rax");
+    X64CodeGen_wl(self, "    movq %rax, -8(%rbp)");
+
+    // Recursion guard.
+    X64CodeGen_wl(self, "    cmpq $0x7F0000000000, %rsp");
+    var rec_panic: str = X64CodeGen_alloc_panic_label(self, "Stack overflow: recursion depth exceeded");
+    X64CodeGen_wl(self, "    jle " + rec_panic);
+
+    // Save callee-saved registers.
+    match alloc_opt {
+        OptAllocation::Some(a) => {
+            var j: i64 = 0;
+            while j < a.used_callee_saved.len() {
+                X64CodeGen_wl(self, "    pushq %" + physreg_name(a.used_callee_saved.get(j)));
+                j = j + 1;
+            }
+        }
+        OptAllocation::None => {}
+    }
+
+    // Move argument registers to their assigned locations.
+    X64CodeGen_gen_prologue_args(self, f, module, alloc_opt);
+
+    // ─── Body ───
+    i = 0;
+    while i < f.blocks.len() {
+        X64CodeGen_gen_block(self, f.blocks.get(i), module);
+        i = i + 1;
+    }
+
+    // ─── Epilogue (fallthrough return) ───
+    X64CodeGen_gen_epilogue(self, alloc_opt);
+
+    // ─── Panic stubs ───
+    var stubs: Vec<PanicStub> = self.pending_panic_stubs;
+    var empty_stubs: Vec<PanicStub> = Vec::new();
+    self.pending_panic_stubs = empty_stubs;
+    i = 0;
+    while i < stubs.len() {
+        var stub: PanicStub = stubs.get(i);
+        X64CodeGen_wl(self, stub.label + ":");
+        var str_label: str = X64CodeGen_alloc_string(self, stub.message);
+        X64CodeGen_wl(self, "    leaq " + str_label + "(%rip), %rdi");
+        X64CodeGen_wl(self, "    call p_panic");
+        X64CodeGen_wl(self, "    ud2");
+        i = i + 1;
+    }
+
+    X64CodeGen_wl(self, "    .size " + f.name + ", .-" + f.name);
+}
+
+/// Move argument registers to their assigned locations.
+pub fn X64CodeGen_gen_prologue_args(self: &mut X64CodeGen, f: L3Function, module: L3Module, alloc_opt: OptAllocation) {
+    var arg_regs: Vec<i64> = physreg_arg_regs();
+    var int_idx: i64 = 0;
+    var i: i64 = 0;
+    while i < f.params.len() {
+        var param: VRegIrType = f.params.get(i);
+        if int_idx < arg_regs.len() {
+            var arg_reg: i64 = arg_regs.get(int_idx);
+            match alloc_opt {
+                OptAllocation::Some(a) => {
+                    var loc: Location = Allocation_loc(a, param.vreg.id);
+                    match loc {
+                        Location::Reg(r) => {
+                            if r != arg_reg {
+                                X64CodeGen_wl(self, "    movq %" + physreg_name(arg_reg) + ", %" + physreg_name(r));
+                            }
+                        }
+                        Location::Spill(offset) => {
+                            X64CodeGen_wl(self, "    movq %" + physreg_name(arg_reg) + ", -" + int_to_str(offset) + "(%rbp)");
+                        }
+                        Location::Remat(_) => {
+                            // Function params are never Remat.
+                        }
+                    }
+                }
+                OptAllocation::None => {}
+            }
+            int_idx = int_idx + 1;
+        }
+        i = i + 1;
+    }
+}
+
+/// Generate the function epilogue.
+pub fn X64CodeGen_gen_epilogue(self: &mut X64CodeGen, alloc_opt: OptAllocation) {
+    var label: str = X64CodeGen_epilogue_label(self);
+    X64CodeGen_wl(self, label + ":");
+
+    // Stack canary verification.
+    X64CodeGen_wl(self, "    movq %rax, %rcx");
+    X64CodeGen_wl(self, "    movq -8(%rbp), %rax");
+    X64CodeGen_wl(self, "    movq 8(%rbp), %rdx");
+    X64CodeGen_wl(self, "    xorq $0x5DEADBEEFCAFEBABE, %rdx");
+    X64CodeGen_wl(self, "    cmpq %rax, %rdx");
+    var canary_fail: str = X64CodeGen_alloc_panic_label(self, "Stack smashing detected (canary mismatch)");
+    X64CodeGen_wl(self, "    jne " + canary_fail);
+    X64CodeGen_wl(self, "    movq %rcx, %rax");
+
+    // Restore callee-saved registers (in reverse order).
+    match alloc_opt {
+        OptAllocation::Some(a) => {
+            var j: i64 = a.used_callee_saved.len() - 1;
+            while j >= 0 {
+                X64CodeGen_wl(self, "    popq %" + physreg_name(a.used_callee_saved.get(j)));
+                j = j - 1;
+            }
+        }
+        OptAllocation::None => {}
+    }
+
+    X64CodeGen_wl(self, "    leave");
+    X64CodeGen_wl(self, "    ret");
+}
+
+// ─── Block and instruction generation ────────────────────────────────────
+
+/// Generate code for a single basic block.
+pub fn X64CodeGen_gen_block(self: &mut X64CodeGen, block: L3Block, module: L3Module) {
+    X64CodeGen_wl(self, X64CodeGen_block_label(self, block.id) + ":");
+    var i: i64 = 0;
+    while i < block.instructions.len() {
+        X64CodeGen_gen_inst(self, block.instructions.get(i), module);
+        i = i + 1;
+    }
+}
+
+/// Generate code for a single L3 instruction.
+pub fn X64CodeGen_gen_inst(self: &mut X64CodeGen, inst: L3Inst, module: L3Module) {
+    match inst {
+        L3Inst::Mov(dst, src) => { X64CodeGen_gen_mov(self, dst, src); }
+        L3Inst::AddrOfSlot(dst, slot) => { X64CodeGen_gen_addr_of_slot(self, dst, slot); }
+        L3Inst::Bin(op, dst, a, b, ty) => { X64CodeGen_gen_bin(self, op, dst, a, b, ty); }
+        L3Inst::Unary(op, dst, src, ty) => { X64CodeGen_gen_unary(self, op, dst, src, ty); }
+        L3Inst::StackAlloc(dst, bytes, _) => { X64CodeGen_gen_stack_alloc(self, dst, bytes); }
+        L3Inst::Load(dst, ptr, ty) => { X64CodeGen_gen_load(self, dst, ptr, ty); }
+        L3Inst::Store(ptr, value, ty) => { X64CodeGen_gen_store(self, ptr, value, ty); }
+        L3Inst::FieldAddr(dst, base, offset, _) => { X64CodeGen_gen_field_addr(self, dst, base, offset); }
+        L3Inst::ElemAddr(dst, base, index, elem_ty) => { X64CodeGen_gen_elem_addr(self, dst, base, index, elem_ty); }
+        L3Inst::Jmp(target) => {
+            X64CodeGen_wl(self, "    jmp " + X64CodeGen_block_label(self, target));
+        }
+        L3Inst::Br(cond, then_b, else_b) => {
+            X64CodeGen_gen_branch(self, cond, then_b, else_b);
+        }
+        L3Inst::Ret(value) => { X64CodeGen_gen_ret(self, value); }
+        L3Inst::Unreachable => { X64CodeGen_wl(self, "    ud2"); }
+        L3Inst::Call(dst, target, args, ret_ty) => {
+            X64CodeGen_gen_call_abi(self, dst, target, args, ret_ty, module);
+        }
+        L3Inst::CallPtr(dst, fn_ptr, args, _, has_env) => {
+            X64CodeGen_gen_call_ptr(self, dst, fn_ptr, args, has_env);
+        }
+        L3Inst::DynCall(dst, trait_name, method, args, _) => {
+            X64CodeGen_gen_dyn_call(self, dst, trait_name, method, args);
+        }
+        L3Inst::MakeDyn(dst, value, type_name, trait_name) => {
+            X64CodeGen_gen_make_dyn(self, dst, value, type_name, trait_name);
+        }
+        L3Inst::Cast(dst, src, _, _, kind) => { X64CodeGen_gen_cast(self, dst, src, kind); }
+        L3Inst::TryUnwrap(value, ok_dst, ok_block, err_block) => {
+            X64CodeGen_gen_try_unwrap(self, value, ok_dst, ok_block, err_block);
+        }
+        L3Inst::Print(value, ty) => { X64CodeGen_gen_print(self, value, ty); }
+        L3Inst::Panic(message) => { X64CodeGen_gen_panic(self, message); }
+    }
+}
+
+// ─── Simple instruction generators ───────────────────────────────────────
+
+/// Generate a Mov instruction.
+pub fn X64CodeGen_gen_mov(self: &mut X64CodeGen, dst: VReg, src: Operand) {
+    var dst_loc_opt: OptLocation = X64CodeGen_dst_loc(self, dst);
+    match dst_loc_opt {
+        OptLocation::Some(dst_loc) => {
+            match dst_loc {
+                Location::Reg(dr) => {
+                    // Special case: Mov from Slot should load the VALUE, not the address.
+                    match src {
+                        Operand::Slot(slot) => {
+                            X64CodeGen_wl(self, "    movq -" + int_to_str(slot.offset) + "(%rbp), %" + physreg_name(dr));
+                        }
+                        _ => { X64CodeGen_gen_operand_to_reg(self, src, dr); }
+                    }
+                }
+                Location::Spill(off) => {
+                    match src {
+                        Operand::Slot(slot) => {
+                            X64CodeGen_wl(self, "    movq -" + int_to_str(slot.offset) + "(%rbp), %rax");
+                            X64CodeGen_wl(self, "    movq %rax, -" + int_to_str(off) + "(%rbp)");
+                        }
+                        _ => { X64CodeGen_gen_operand_to_mem(self, src, off); }
+                    }
+                }
+                Location::Remat(_) => {
+                    // F-1A: dst is a rematerializable constant. The defining
+                    // Mov is a no-op — the constant is reloaded at each use site.
+                }
+            }
+        }
+        OptLocation::None => {
+            X64CodeGen_wl(self, "    # Mov: dst " + vreg_to_str(dst) + " unallocated");
+        }
+    }
+}
+
+/// Generate an AddrOfSlot instruction (leaq -slot(%rbp), %reg).
+pub fn X64CodeGen_gen_addr_of_slot(self: &mut X64CodeGen, dst: VReg, slot: Slot) {
+    var dst_loc_opt: OptLocation = X64CodeGen_dst_loc(self, dst);
+    match dst_loc_opt {
+        OptLocation::Some(dst_loc) => {
+            match dst_loc {
+                Location::Reg(dr) => {
+                    X64CodeGen_wl(self, "    leaq -" + int_to_str(slot.offset) + "(%rbp), %" + physreg_name(dr));
+                }
+                Location::Spill(off) => {
+                    X64CodeGen_wl(self, "    leaq -" + int_to_str(slot.offset) + "(%rbp), %rax");
+                    X64CodeGen_wl(self, "    movq %rax, -" + int_to_str(off) + "(%rbp)");
+                }
+                Location::Remat(_) => {
+                    // AddrOfSlot dst is never Remat.
+                }
+            }
+        }
+        OptLocation::None => {
+            X64CodeGen_wl(self, "    leaq -" + int_to_str(slot.offset) + "(%rbp), %rax");
+        }
+    }
+}
+
+/// Generate a StackAlloc instruction.
+pub fn X64CodeGen_gen_stack_alloc(self: &mut X64CodeGen, dst: VReg, bytes: i64) {
+    X64CodeGen_wl(self, "    # StackAlloc: " + int_to_str(bytes) + " bytes -> " + vreg_to_str(dst));
+    var dst_loc_opt: OptLocation = X64CodeGen_dst_loc(self, dst);
+    match dst_loc_opt {
+        OptLocation::Some(dst_loc) => {
+            match dst_loc {
+                Location::Reg(r) => {
+                    X64CodeGen_wl(self, "    xorq %" + physreg_name(r) + ", %" + physreg_name(r));
+                }
+                Location::Spill(off) => {
+                    X64CodeGen_wl(self, "    # spilled to -" + int_to_str(off) + "(%rbp)");
+                }
+                Location::Remat(_) => {}
+            }
+        }
+        OptLocation::None => {}
+    }
+}
+
+/// Generate a Ret instruction.
+pub fn X64CodeGen_gen_ret(self: &mut X64CodeGen, value: OptOperand) {
+    match value {
+        OptOperand::Some(v) => {
+            X64CodeGen_gen_operand_to_reg(self, v, REG_RAX);
+        }
+        OptOperand::None => {}
+    }
+    X64CodeGen_wl(self, "    jmp " + X64CodeGen_epilogue_label(self));
+}
+
+/// Generate a Print instruction.
+pub fn X64CodeGen_gen_print(self: &mut X64CodeGen, value: Operand, ty: IrType) {
+    var func_name: str = print_func_for_type(ty);
+    X64CodeGen_gen_operand_to_reg(self, value, REG_RDI);
+    X64CodeGen_wl(self, "    call " + func_name);
+}
+
+/// Generate a Panic instruction.
+pub fn X64CodeGen_gen_panic(self: &mut X64CodeGen, message: str) {
+    X64CodeGen_wl(self, "    # Panic: \"" + message + "\"");
+    var label: str = X64CodeGen_alloc_string(self, message);
+    X64CodeGen_wl(self, "    leaq " + label + "(%rip), %rdi");
+    X64CodeGen_wl(self, "    call p_panic");
+    X64CodeGen_wl(self, "    ud2");
+}
+
+/// Determine the print function name for a given IR type.
+pub fn print_func_for_type(ty: IrType) -> str {
+    match ty {
+        IrType::I64 => { return "p_print_int"; }
+        IrType::I32 => { return "p_print_int"; }
+        IrType::I16 => { return "p_print_int"; }
+        IrType::I8 => { return "p_print_int"; }
+        IrType::U64 => { return "p_print_int"; }
+        IrType::U32 => { return "p_print_int"; }
+        IrType::U16 => { return "p_print_int"; }
+        IrType::U8 => { return "p_print_int"; }
+        IrType::F64 => { return "p_print_float"; }
+        IrType::F32 => { return "p_print_float"; }
+        IrType::Bool => { return "p_print_bool"; }
+        _ => { return "p_print_str"; }
+    }
+    return "p_print_str";
+}
+
+// ─── Operand loading helpers ─────────────────────────────────────────────
+
+/// Load an operand into a physical register.
+pub fn X64CodeGen_gen_operand_to_reg(self: &mut X64CodeGen, op: Operand, reg: i64) {
+    var reg_name: str = physreg_name(reg);
+    match op {
+        Operand::ImmI(v) => {
+            X64CodeGen_wl(self, "    movq $" + int_to_str(v) + ", %" + reg_name);
+        }
+        Operand::ImmF(bits) => {
+            var label: str = X64CodeGen_alloc_float_const(self, bits);
+            X64CodeGen_wl(self, "    movsd " + label + "(%rip), %xmm0");
+            X64CodeGen_wl(self, "    movq %xmm0, %rax");
+            if reg != REG_RAX {
+                X64CodeGen_wl(self, "    movq %rax, %" + reg_name);
+            }
+        }
+        Operand::ImmStr(s) => {
+            var label: str = X64CodeGen_alloc_string(self, s);
+            X64CodeGen_wl(self, "    leaq " + label + "(%rip), %" + reg_name);
+        }
+        Operand::ImmFunc(name) => {
+            X64CodeGen_wl(self, "    leaq " + name + "(%rip), %" + reg_name);
+        }
+        Operand::ImmNull => {
+            X64CodeGen_wl(self, "    xorq %" + reg_name + ", %" + reg_name);
+        }
+        Operand::VReg(vr) => {
+            var loc_opt: OptLocation = X64CodeGen_dst_loc(self, vr);
+            match loc_opt {
+                OptLocation::Some(loc) => {
+                    match loc {
+                        Location::Reg(r) => {
+                            if r != reg {
+                                X64CodeGen_wl(self, "    movq %" + physreg_name(r) + ", %" + reg_name);
+                            }
+                        }
+                        Location::Spill(off) => {
+                            X64CodeGen_wl(self, "    movq -" + int_to_str(off) + "(%rbp), %" + reg_name);
+                        }
+                        Location::Remat(c) => {
+                            X64CodeGen_wl(self, "    movq $" + int_to_str(c) + ", %" + reg_name);
+                        }
+                    }
+                }
+                OptLocation::None => {
+                    X64CodeGen_wl(self, "    # operand " + vreg_to_str(vr) + " unallocated");
+                }
+            }
+        }
+        Operand::Slot(slot) => {
+            X64CodeGen_wl(self, "    leaq -" + int_to_str(slot.offset) + "(%rbp), %" + reg_name);
+        }
+    }
+}
+
+/// Store an operand to a memory location (stack slot at offset from RBP).
+pub fn X64CodeGen_gen_operand_to_mem(self: &mut X64CodeGen, op: Operand, offset: i64) {
+    match op {
+        Operand::ImmI(v) => {
+            X64CodeGen_wl(self, "    movq $" + int_to_str(v) + ", -" + int_to_str(offset) + "(%rbp)");
+        }
+        Operand::ImmNull => {
+            X64CodeGen_wl(self, "    movq $0, -" + int_to_str(offset) + "(%rbp)");
+        }
+        Operand::VReg(vr) => {
+            var loc_opt: OptLocation = X64CodeGen_dst_loc(self, vr);
+            match loc_opt {
+                OptLocation::Some(loc) => {
+                    match loc {
+                        Location::Reg(r) => {
+                            X64CodeGen_wl(self, "    movq %" + physreg_name(r) + ", -" + int_to_str(offset) + "(%rbp)");
+                        }
+                        Location::Spill(src_off) => {
+                            X64CodeGen_wl(self, "    movq -" + int_to_str(src_off) + "(%rbp), %rax");
+                            X64CodeGen_wl(self, "    movq %rax, -" + int_to_str(offset) + "(%rbp)");
+                        }
+                        Location::Remat(c) => {
+                            X64CodeGen_wl(self, "    movq $" + int_to_str(c) + ", -" + int_to_str(offset) + "(%rbp)");
+                        }
+                    }
+                }
+                OptLocation::None => {}
+            }
+        }
+        Operand::ImmStr(s) => {
+            var label: str = X64CodeGen_alloc_string(self, s);
+            X64CodeGen_wl(self, "    leaq " + label + "(%rip), %rax");
+            X64CodeGen_wl(self, "    movq %rax, -" + int_to_str(offset) + "(%rbp)");
+        }
+        Operand::ImmFunc(name) => {
+            X64CodeGen_wl(self, "    leaq " + name + "(%rip), %rax");
+            X64CodeGen_wl(self, "    movq %rax, -" + int_to_str(offset) + "(%rbp)");
+        }
+        Operand::ImmF(_) => {
+            X64CodeGen_wl(self, "    movq $0, -" + int_to_str(offset) + "(%rbp)");
+        }
+        Operand::Slot(slot) => {
+            X64CodeGen_wl(self, "    leaq -" + int_to_str(slot.offset) + "(%rbp), %rax");
+            X64CodeGen_wl(self, "    movq %rax, -" + int_to_str(offset) + "(%rbp)");
+        }
+    }
+}
+
+/// Apply a binary op instruction (addq, subq, andq, orq, xorq) with
+/// the given operand as the source.
+pub fn X64CodeGen_gen_operand_apply_binop(self: &mut X64CodeGen, op: str, b: Operand, dst_reg: i64) {
+    var dst_name: str = physreg_name(dst_reg);
+    match b {
+        Operand::ImmI(v) => {
+            X64CodeGen_wl(self, "    " + op + " $" + int_to_str(v) + ", %" + dst_name);
+        }
+        Operand::VReg(vr) => {
+            var loc_opt: OptLocation = X64CodeGen_dst_loc(self, vr);
+            match loc_opt {
+                OptLocation::Some(loc) => {
+                    match loc {
+                        Location::Reg(r) => {
+                            X64CodeGen_wl(self, "    " + op + " %" + physreg_name(r) + ", %" + dst_name);
+                        }
+                        Location::Spill(off) => {
+                            X64CodeGen_wl(self, "    " + op + " -" + int_to_str(off) + "(%rbp), %" + dst_name);
+                        }
+                        Location::Remat(c) => {
+                            X64CodeGen_wl(self, "    " + op + " $" + int_to_str(c) + ", %" + dst_name);
+                        }
+                    }
+                }
+                OptLocation::None => {}
+            }
+        }
+        _ => {
+            var tmp: i64 = X64CodeGen_scratch_reg(dst_reg);
+            X64CodeGen_gen_operand_to_reg(self, b, tmp);
+            X64CodeGen_wl(self, "    " + op + " %" + physreg_name(tmp) + ", %" + dst_name);
+        }
+    }
+}
+
+/// Generate a shift instruction (shlq, shrq) with the shift count from `b`.
+pub fn X64CodeGen_gen_shift(self: &mut X64CodeGen, op: str, b: Operand, dst_reg: i64) {
+    var dst_name: str = physreg_name(dst_reg);
+    match b {
+        Operand::ImmI(v) => {
+            X64CodeGen_wl(self, "    " + op + " $" + int_to_str(v) + ", %" + dst_name);
+        }
+        _ => {
+            // x86 shifts require the count in CL.
+            X64CodeGen_gen_operand_to_reg(self, b, REG_RCX);
+            X64CodeGen_wl(self, "    " + op + " %cl, %" + dst_name);
+        }
+    }
+}
+
+// ─── Binary operation generation ─────────────────────────────────────────
+
+/// Generate a binary operation instruction.
+pub fn X64CodeGen_gen_bin(self: &mut X64CodeGen, op: BinOp, dst: VReg, a: Operand, b: Operand, ty: IrType) {
+    var dst_loc_opt: OptLocation = X64CodeGen_dst_loc(self, dst);
+    var dst_reg: i64 = REG_RAX;
+    var need_spill_reload: bool = false;
+    match dst_loc_opt {
+        OptLocation::Some(dst_loc) => {
+            match dst_loc {
+                Location::Reg(r) => { dst_reg = r; need_spill_reload = false; }
+                _ => { dst_reg = REG_RAX; need_spill_reload = true; }
+            }
+        }
+        OptLocation::None => { dst_reg = REG_RAX; need_spill_reload = true; }
+    }
+
+    // Load `a` into dst_reg.
+    X64CodeGen_gen_operand_to_reg(self, a, dst_reg);
+
+    // Float operations: use SSE2 instructions.
+    if ir_type_is_float(ty) {
+        X64CodeGen_gen_bin_float(self, op, dst, a, b, dst_reg, need_spill_reload, dst_loc_opt);
+        return;
+    }
+
+    // Integer operations.
+    if binop_eq(op, BinOp::Add) {
+        X64CodeGen_gen_operand_apply_binop(self, "addq", b, dst_reg);
+        if !X64CodeGen_is_wrapping_func(self) {
+            var lbl: str = X64CodeGen_alloc_panic_label(self, "Integer overflow on addition");
+            X64CodeGen_wl(self, "    jo " + lbl);
+        }
+    } else if binop_eq(op, BinOp::Sub) {
+        X64CodeGen_gen_operand_apply_binop(self, "subq", b, dst_reg);
+        if !X64CodeGen_is_wrapping_func(self) {
+            var lbl: str = X64CodeGen_alloc_panic_label(self, "Integer overflow on subtraction");
+            X64CodeGen_wl(self, "    jo " + lbl);
+        }
+    } else if binop_eq(op, BinOp::Mul) {
+        var tmp: i64 = X64CodeGen_scratch_reg(dst_reg);
+        X64CodeGen_gen_operand_to_reg(self, b, tmp);
+        X64CodeGen_wl(self, "    imulq %" + physreg_name(tmp) + ", %" + physreg_name(dst_reg));
+        if !X64CodeGen_is_wrapping_func(self) {
+            var lbl: str = X64CodeGen_alloc_panic_label(self, "Integer overflow on multiplication");
+            X64CodeGen_wl(self, "    jo " + lbl);
+        }
+    } else if binop_eq(op, BinOp::Div) {
+        X64CodeGen_gen_div(self, dst_reg, b);
+    } else if binop_eq(op, BinOp::Mod) {
+        X64CodeGen_gen_mod(self, dst_reg, b);
+    } else if binop_eq(op, BinOp::BitAnd) {
+        X64CodeGen_gen_operand_apply_binop(self, "andq", b, dst_reg);
+    } else if binop_eq(op, BinOp::BitOr) {
+        X64CodeGen_gen_operand_apply_binop(self, "orq", b, dst_reg);
+    } else if binop_eq(op, BinOp::BitXor) {
+        X64CodeGen_gen_operand_apply_binop(self, "xorq", b, dst_reg);
+    } else if binop_eq(op, BinOp::Shl) {
+        X64CodeGen_gen_shift(self, "shlq", b, dst_reg);
+    } else if binop_eq(op, BinOp::Shr) {
+        X64CodeGen_gen_shift(self, "shrq", b, dst_reg);
+    } else {
+        // Comparisons: Eq, Neq, Lt, Gt, LtEq, GtEq, And, Or
+        X64CodeGen_gen_comparison(self, op, b, dst_reg);
+    }
+
+    // If dst was spilled, store the result back.
+    if need_spill_reload {
+        match dst_loc_opt {
+            OptLocation::Some(dst_loc) => {
+                match dst_loc {
+                    Location::Spill(off) => {
+                        X64CodeGen_wl(self, "    movq %" + physreg_name(dst_reg) + ", -" + int_to_str(off) + "(%rbp)");
+                    }
+                    _ => {}
+                }
+            }
+            OptLocation::None => {}
+        }
+    }
+}
+
+/// Generate float binary operations (SSE2).
+pub fn X64CodeGen_gen_bin_float(self: &mut X64CodeGen, op: BinOp, dst: VReg, a: Operand, b: Operand, dst_reg: i64, need_spill_reload: bool, dst_loc_opt: OptLocation) {
+    if binop_eq(op, BinOp::Add) || binop_eq(op, BinOp::Sub) || binop_eq(op, BinOp::Mul) || binop_eq(op, BinOp::Div) {
+        X64CodeGen_wl(self, "    movq %" + physreg_name(dst_reg) + ", %xmm0");
+        var tmp: i64 = X64CodeGen_scratch_reg(dst_reg);
+        X64CodeGen_gen_operand_to_reg(self, b, tmp);
+        X64CodeGen_wl(self, "    movq %" + physreg_name(tmp) + ", %xmm1");
+        var sse_op: str = "addsd";
+        if binop_eq(op, BinOp::Add) { sse_op = "addsd"; }
+        if binop_eq(op, BinOp::Sub) { sse_op = "subsd"; }
+        if binop_eq(op, BinOp::Mul) { sse_op = "mulsd"; }
+        if binop_eq(op, BinOp::Div) { sse_op = "divsd"; }
+        X64CodeGen_wl(self, "    " + sse_op + " %xmm1, %xmm0");
+        X64CodeGen_wl(self, "    movq %xmm0, %" + physreg_name(dst_reg));
+    } else {
+        // Comparison ops on floats.
+        X64CodeGen_gen_comparison(self, op, b, dst_reg);
+    }
+
+    if need_spill_reload {
+        match dst_loc_opt {
+            OptLocation::Some(dst_loc) => {
+                match dst_loc {
+                    Location::Spill(off) => {
+                        X64CodeGen_wl(self, "    movq %" + physreg_name(dst_reg) + ", -" + int_to_str(off) + "(%rbp)");
+                    }
+                    _ => {}
+                }
+            }
+            OptLocation::None => {}
+        }
+    }
+}
+
+/// Generate integer division (idivq).
+pub fn X64CodeGen_gen_div(self: &mut X64CodeGen, dst_reg: i64, b: Operand) {
+    // Div-by-zero check (always on, even in @wrapping).
+    X64CodeGen_gen_divzero_check(self, b);
+    if dst_reg != REG_RAX {
+        X64CodeGen_wl(self, "    movq %" + physreg_name(dst_reg) + ", %rax");
+    }
+    X64CodeGen_gen_idiv(self, b);
+    // Result is in RAX; move to dst if needed.
+    if dst_reg != REG_RAX {
+        X64CodeGen_wl(self, "    movq %rax, %" + physreg_name(dst_reg));
+    }
+}
+
+/// Generate integer modulo (idivq, result in RDX).
+pub fn X64CodeGen_gen_mod(self: &mut X64CodeGen, dst_reg: i64, b: Operand) {
+    X64CodeGen_gen_divzero_check(self, b);
+    if dst_reg != REG_RAX {
+        X64CodeGen_wl(self, "    movq %" + physreg_name(dst_reg) + ", %rax");
+    }
+    X64CodeGen_gen_idiv(self, b);
+    // Result is in RDX; move to dst.
+    X64CodeGen_wl(self, "    movq %rdx, %" + physreg_name(dst_reg));
+}
+
+/// Generate the idivq instruction with the divisor from operand `b`.
+pub fn X64CodeGen_gen_idiv(self: &mut X64CodeGen, b: Operand) {
+    match b {
+        Operand::ImmI(v) => {
+            X64CodeGen_wl(self, "    cqto");
+            X64CodeGen_wl(self, "    movq $" + int_to_str(v) + ", %rcx");
+            X64CodeGen_wl(self, "    idivq %rcx");
+        }
+        Operand::VReg(vr) => {
+            var loc_opt: OptLocation = X64CodeGen_dst_loc(self, vr);
+            match loc_opt {
+                OptLocation::Some(loc) => {
+                    match loc {
+                        Location::Reg(r) => {
+                            if r == REG_RDX {
+                                X64CodeGen_wl(self, "    movq %rdx, %rcx");
+                                X64CodeGen_wl(self, "    cqto");
+                                X64CodeGen_wl(self, "    idivq %rcx");
+                            } else {
+                                X64CodeGen_wl(self, "    cqto");
+                                X64CodeGen_wl(self, "    idivq %" + physreg_name(r));
+                            }
+                        }
+                        Location::Spill(off) => {
+                            X64CodeGen_wl(self, "    cqto");
+                            X64CodeGen_wl(self, "    idivq -" + int_to_str(off) + "(%rbp)");
+                        }
+                        Location::Remat(c) => {
+                            X64CodeGen_wl(self, "    cqto");
+                            X64CodeGen_wl(self, "    movq $" + int_to_str(c) + ", %rcx");
+                            X64CodeGen_wl(self, "    idivq %rcx");
+                        }
+                    }
+                }
+                OptLocation::None => {
+                    X64CodeGen_wl(self, "    cqto");
+                    X64CodeGen_wl(self, "    idivq %rcx");
+                }
+            }
+        }
+        _ => {
+            var tmp: i64 = X64CodeGen_scratch_reg(dst_reg_placeholder());
+            X64CodeGen_gen_operand_to_reg(self, b, tmp);
+            if tmp == REG_RDX {
+                X64CodeGen_wl(self, "    movq %rdx, %rcx");
+                X64CodeGen_wl(self, "    cqto");
+                X64CodeGen_wl(self, "    idivq %rcx");
+            } else {
+                X64CodeGen_wl(self, "    cqto");
+                X64CodeGen_wl(self, "    idivq %" + physreg_name(tmp));
+            }
+        }
+    }
+}
+
+/// Placeholder for when we don't have a dst_reg in context.
+pub fn dst_reg_placeholder() -> i64 {
+    return REG_RAX;
+}
+
+/// Emit a division-by-zero check for the divisor operand `b`.
+pub fn X64CodeGen_gen_divzero_check(self: &mut X64CodeGen, b: Operand) {
+    match b {
+        Operand::ImmI(v) => {
+            if v == 0 {
+                var lbl: str = X64CodeGen_alloc_panic_label(self, "Division by zero");
+                X64CodeGen_wl(self, "    jmp " + lbl);
+            }
+        }
+        Operand::VReg(vr) => {
+            var loc_opt: OptLocation = X64CodeGen_dst_loc(self, vr);
+            match loc_opt {
+                OptLocation::Some(loc) => {
+                    match loc {
+                        Location::Reg(r) => {
+                            X64CodeGen_wl(self, "    testq %" + physreg_name(r) + ", %" + physreg_name(r));
+                        }
+                        Location::Spill(off) => {
+                            X64CodeGen_wl(self, "    cmpq $0, -" + int_to_str(off) + "(%rbp)");
+                        }
+                        Location::Remat(c) => {
+                            if c == 0 {
+                                var lbl: str = X64CodeGen_alloc_panic_label(self, "Division by zero");
+                                X64CodeGen_wl(self, "    jmp " + lbl);
+                            }
+                            return;
+                        }
+                    }
+                }
+                OptLocation::None => { return; }
+            }
+            var lbl: str = X64CodeGen_alloc_panic_label(self, "Division by zero");
+            X64CodeGen_wl(self, "    jz " + lbl);
+        }
+        _ => {}
+    }
+}
+
+// ─── Comparison generation ───────────────────────────────────────────────
+
+/// Generate a comparison: set dst to 0 or 1 based on the comparison.
+pub fn X64CodeGen_gen_comparison(self: &mut X64CodeGen, op: BinOp, b: Operand, dst_reg: i64) {
+    var dst_name: str = physreg_name(dst_reg);
+
+    // Handle logical And/Or separately — they don't use cmpq.
+    if binop_eq(op, BinOp::And) {
+        var tmp: i64 = X64CodeGen_scratch_reg(dst_reg);
+        X64CodeGen_gen_operand_to_reg(self, b, tmp);
+        X64CodeGen_wl(self, "    testq %" + dst_name + ", %" + dst_name);
+        X64CodeGen_wl(self, "    setne %al");
+        X64CodeGen_wl(self, "    testq %" + physreg_name(tmp) + ", %" + physreg_name(tmp));
+        X64CodeGen_wl(self, "    setne %cl");
+        X64CodeGen_wl(self, "    andb %cl, %al");
+        X64CodeGen_wl(self, "    movzbq %al, %" + dst_name);
+        return;
+    }
+    if binop_eq(op, BinOp::Or) {
+        var tmp: i64 = X64CodeGen_scratch_reg(dst_reg);
+        X64CodeGen_gen_operand_to_reg(self, b, tmp);
+        X64CodeGen_wl(self, "    testq %" + dst_name + ", %" + dst_name);
+        X64CodeGen_wl(self, "    setne %al");
+        X64CodeGen_wl(self, "    testq %" + physreg_name(tmp) + ", %" + physreg_name(tmp));
+        X64CodeGen_wl(self, "    setne %cl");
+        X64CodeGen_wl(self, "    orb %cl, %al");
+        X64CodeGen_wl(self, "    movzbq %al, %" + dst_name);
+        return;
+    }
+
+    // Compare dst_reg with b.
+    match b {
+        Operand::ImmI(v) => {
+            X64CodeGen_wl(self, "    cmpq $" + int_to_str(v) + ", %" + dst_name);
+        }
+        Operand::VReg(vr) => {
+            var loc_opt: OptLocation = X64CodeGen_dst_loc(self, vr);
+            match loc_opt {
+                OptLocation::Some(loc) => {
+                    match loc {
+                        Location::Reg(r) => {
+                            X64CodeGen_wl(self, "    cmpq %" + physreg_name(r) + ", %" + dst_name);
+                        }
+                        Location::Spill(off) => {
+                            X64CodeGen_wl(self, "    cmpq -" + int_to_str(off) + "(%rbp), %" + dst_name);
+                        }
+                        Location::Remat(c) => {
+                            X64CodeGen_wl(self, "    cmpq $" + int_to_str(c) + ", %" + dst_name);
+                        }
+                    }
+                }
+                OptLocation::None => {}
+            }
+        }
+        _ => {
+            var tmp: i64 = X64CodeGen_scratch_reg(dst_reg);
+            X64CodeGen_gen_operand_to_reg(self, b, tmp);
+            X64CodeGen_wl(self, "    cmpq %" + physreg_name(tmp) + ", %" + dst_name);
+        }
+    }
+
+    var setcc: str = "sete";
+    if binop_eq(op, BinOp::Eq) { setcc = "sete"; }
+    if binop_eq(op, BinOp::Neq) { setcc = "setne"; }
+    if binop_eq(op, BinOp::Lt) { setcc = "setl"; }
+    if binop_eq(op, BinOp::Gt) { setcc = "setg"; }
+    if binop_eq(op, BinOp::LtEq) { setcc = "setle"; }
+    if binop_eq(op, BinOp::GtEq) { setcc = "setge"; }
+
+    X64CodeGen_wl(self, "    " + setcc + " %al");
+    X64CodeGen_wl(self, "    movzbq %al, %" + dst_name);
+}
+
+// ─── Unary operation generation ──────────────────────────────────────────
+
+/// Generate a unary operation instruction.
+pub fn X64CodeGen_gen_unary(self: &mut X64CodeGen, op: UnaryOp, dst: VReg, src: Operand, ty: IrType) {
+    var dst_loc_opt: OptLocation = X64CodeGen_dst_loc(self, dst);
+    var dst_reg: i64 = REG_RAX;
+    match dst_loc_opt {
+        OptLocation::Some(dst_loc) => {
+            match dst_loc {
+                Location::Reg(r) => { dst_reg = r; }
+                _ => { dst_reg = REG_RAX; }
+            }
+        }
+        OptLocation::None => { dst_reg = REG_RAX; }
+    }
+
+    X64CodeGen_gen_operand_to_reg(self, src, dst_reg);
+
+    if unaryop_eq(op, UnaryOp::Neg) {
+        if ir_type_is_float(ty) {
+            X64CodeGen_wl(self, "    movq %" + physreg_name(dst_reg) + ", %rax");
+            X64CodeGen_wl(self, "    movq $0x8000000000000000, %rcx");
+            X64CodeGen_wl(self, "    xorq %rcx, %rax");
+            if dst_reg != REG_RAX {
+                X64CodeGen_wl(self, "    movq %rax, %" + physreg_name(dst_reg));
+            }
+        } else {
+            X64CodeGen_wl(self, "    negq %" + physreg_name(dst_reg));
+        }
+    } else if unaryop_eq(op, UnaryOp::Not) {
+        X64CodeGen_wl(self, "    testq %" + physreg_name(dst_reg) + ", %" + physreg_name(dst_reg));
+        X64CodeGen_wl(self, "    sete %al");
+        X64CodeGen_wl(self, "    movzbq %al, %rax");
+        if dst_reg != REG_RAX {
+            X64CodeGen_wl(self, "    movq %rax, %" + physreg_name(dst_reg));
+        }
+    } else if unaryop_eq(op, UnaryOp::BitNot) {
+        X64CodeGen_wl(self, "    notq %" + physreg_name(dst_reg));
+    }
+
+    // Spill back if needed.
+    match dst_loc_opt {
+        OptLocation::Some(dst_loc) => {
+            match dst_loc {
+                Location::Spill(off) => {
+                    X64CodeGen_wl(self, "    movq %" + physreg_name(dst_reg) + ", -" + int_to_str(off) + "(%rbp)");
+                }
+                _ => {}
+            }
+        }
+        OptLocation::None => {}
+    }
+}
+
+// ─── Branch generation ───────────────────────────────────────────────────
+
+/// Generate a conditional branch.
+pub fn X64CodeGen_gen_branch(self: &mut X64CodeGen, cond: Operand, then_b: i64, else_b: i64) {
+    X64CodeGen_gen_operand_to_reg(self, cond, REG_RAX);
+    X64CodeGen_wl(self, "    testq %rax, %rax");
+    X64CodeGen_wl(self, "    jne " + X64CodeGen_block_label(self, then_b));
+    X64CodeGen_wl(self, "    jmp " + X64CodeGen_block_label(self, else_b));
+}
+
+// ─── Memory operations ───────────────────────────────────────────────────
+
+/// Generate a typed load instruction.
+pub fn X64CodeGen_gen_load(self: &mut X64CodeGen, dst: VReg, ptr: Operand, ty: IrType) {
+    var dst_loc_opt: OptLocation = X64CodeGen_dst_loc(self, dst);
+    var size: i64 = ir_type_size(ty);
+    var load_op: str = "movq";
+    if size == 1 { load_op = "movzbq"; }
+    if size == 2 { load_op = "movzwq"; }
+    if size == 4 { load_op = "movslq"; }
+
+    // If the pointer is a stack slot, load directly.
+    match ptr {
+        Operand::Slot(slot) => {
+            var mem: str = "-" + int_to_str(slot.offset) + "(%rbp)";
+            match dst_loc_opt {
+                OptLocation::Some(dst_loc) => {
+                    match dst_loc {
+                        Location::Reg(dr) => {
+                            X64CodeGen_wl(self, "    " + load_op + " " + mem + ", %" + physreg_name(dr));
+                        }
+                        Location::Spill(off) => {
+                            X64CodeGen_wl(self, "    " + load_op + " " + mem + ", %rax");
+                            X64CodeGen_wl(self, "    movq %rax, -" + int_to_str(off) + "(%rbp)");
+                        }
+                        Location::Remat(_) => {}
+                    }
+                }
+                OptLocation::None => {}
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    // Load the pointer into a scratch register.
+    var ptr_reg_opt: OptI64 = X64CodeGen_operand_reg(self, ptr);
+    var ptr_reg: i64 = REG_RAX;
+    match ptr_reg_opt {
+        OptI64::Some(r) => { ptr_reg = r; }
+        OptI64::None => {
+            X64CodeGen_gen_operand_to_reg(self, ptr, REG_RAX);
+            ptr_reg = REG_RAX;
+        }
+    }
+
+    match dst_loc_opt {
+        OptLocation::Some(dst_loc) => {
+            match dst_loc {
+                Location::Reg(dr) => {
+                    if dr != ptr_reg {
+                        X64CodeGen_wl(self, "    " + load_op + " (%" + physreg_name(ptr_reg) + "), %" + physreg_name(dr));
+                    } else {
+                        // dst and ptr are the same register — use RAX as temp.
+                        X64CodeGen_wl(self, "    " + load_op + " (%" + physreg_name(ptr_reg) + "), %rax");
+                        X64CodeGen_wl(self, "    movq %rax, %" + physreg_name(dr));
+                    }
+                }
+                Location::Spill(off) => {
+                    X64CodeGen_wl(self, "    " + load_op + " (%" + physreg_name(ptr_reg) + "), %rax");
+                    X64CodeGen_wl(self, "    movq %rax, -" + int_to_str(off) + "(%rbp)");
+                }
+                Location::Remat(_) => {}
+            }
+        }
+        OptLocation::None => {}
+    }
+}
+
+/// Generate a typed store instruction.
+pub fn X64CodeGen_gen_store(self: &mut X64CodeGen, ptr: Operand, value: Operand, ty: IrType) {
+    var size: i64 = ir_type_size(ty);
+    var store_op: str = "movq";
+    if size == 1 { store_op = "movb"; }
+    if size == 2 { store_op = "movw"; }
+    if size == 4 { store_op = "movl"; }
+
+    // If the pointer is a stack slot, store directly.
+    match ptr {
+        Operand::Slot(slot) => {
+            var mem: str = "-" + int_to_str(slot.offset) + "(%rbp)";
+            X64CodeGen_gen_operand_to_reg(self, value, REG_RAX);
+            if size < 8 {
+                var sub_reg: str = sub_reg_name(REG_RAX, size);
+                X64CodeGen_wl(self, "    " + store_op + " " + sub_reg + ", " + mem);
+            } else {
+                X64CodeGen_wl(self, "    " + store_op + " %rax, " + mem);
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    // Load value into RAX.
+    X64CodeGen_gen_operand_to_reg(self, value, REG_RAX);
+
+    // Get pointer into a register.
+    var ptr_reg_opt: OptI64 = X64CodeGen_operand_reg(self, ptr);
+    var ptr_reg: i64 = REG_RCX;
+    match ptr_reg_opt {
+        OptI64::Some(r) => { ptr_reg = r; }
+        OptI64::None => {
+            X64CodeGen_gen_operand_to_reg(self, ptr, REG_RCX);
+            ptr_reg = REG_RCX;
+        }
+    }
+
+    if size < 8 {
+        var sub_reg: str = sub_reg_name(REG_RAX, size);
+        X64CodeGen_wl(self, "    " + store_op + " " + sub_reg + ", (%" + physreg_name(ptr_reg) + ")");
+    } else {
+        X64CodeGen_wl(self, "    " + store_op + " %rax, (%" + physreg_name(ptr_reg) + ")");
+    }
+}
+
+/// Generate a field address (leaq offset(%base), %dst).
+pub fn X64CodeGen_gen_field_addr(self: &mut X64CodeGen, dst: VReg, base: Operand, offset: i64) {
+    var dst_loc_opt: OptLocation = X64CodeGen_dst_loc(self, dst);
+    var dst_reg: i64 = REG_RAX;
+    match dst_loc_opt {
+        OptLocation::Some(dst_loc) => {
+            match dst_loc {
+                Location::Reg(r) => { dst_reg = r; }
+                _ => { dst_reg = REG_RAX; }
+            }
+        }
+        OptLocation::None => { dst_reg = REG_RAX; }
+    }
+
+    if offset == 0 {
+        X64CodeGen_gen_operand_to_reg(self, base, dst_reg);
+    } else {
+        match base {
+            Operand::Slot(slot) => {
+                X64CodeGen_wl(self, "    leaq -" + int_to_str(slot.offset) + "(%rbp), %" + physreg_name(dst_reg));
+                if offset > 0 {
+                    X64CodeGen_wl(self, "    addq $" + int_to_str(offset) + ", %" + physreg_name(dst_reg));
+                }
+            }
+            _ => {
+                X64CodeGen_gen_operand_to_reg(self, base, dst_reg);
+                X64CodeGen_wl(self, "    leaq " + int_to_str(offset) + "(%" + physreg_name(dst_reg) + "), %" + physreg_name(dst_reg));
+            }
+        }
+    }
+
+    // Spill back if needed.
+    match dst_loc_opt {
+        OptLocation::Some(dst_loc) => {
+            match dst_loc {
+                Location::Spill(off) => {
+                    X64CodeGen_wl(self, "    movq %" + physreg_name(dst_reg) + ", -" + int_to_str(off) + "(%rbp)");
+                }
+                _ => {}
+            }
+        }
+        OptLocation::None => {}
+    }
+}
+
+/// Generate an element address (leaq (base, index, scale), %dst).
+pub fn X64CodeGen_gen_elem_addr(self: &mut X64CodeGen, dst: VReg, base: Operand, index: Operand, elem_ty: IrType) {
+    var dst_loc_opt: OptLocation = X64CodeGen_dst_loc(self, dst);
+    var dst_reg: i64 = REG_RAX;
+    match dst_loc_opt {
+        OptLocation::Some(dst_loc) => {
+            match dst_loc {
+                Location::Reg(r) => { dst_reg = r; }
+                _ => { dst_reg = REG_RAX; }
+            }
+        }
+        OptLocation::None => { dst_reg = REG_RAX; }
+    }
+
+    var elem_size: i64 = ir_type_size(elem_ty);
+    if elem_size < 1 { elem_size = 1; }
+
+    // Load base into dst_reg.
+    X64CodeGen_gen_operand_to_reg(self, base, dst_reg);
+    // Load index into a scratch register.
+    var index_reg: i64 = X64CodeGen_scratch_reg(dst_reg);
+    X64CodeGen_gen_operand_to_reg(self, index, index_reg);
+
+    // leaq (dst, index, scale), dst
+    X64CodeGen_wl(self, "    leaq (%" + physreg_name(dst_reg) + ",%" + physreg_name(index_reg) + "," + int_to_str(elem_size) + "), %" + physreg_name(dst_reg));
+
+    // Spill back if needed.
+    match dst_loc_opt {
+        OptLocation::Some(dst_loc) => {
+            match dst_loc {
+                Location::Spill(off) => {
+                    X64CodeGen_wl(self, "    movq %" + physreg_name(dst_reg) + ", -" + int_to_str(off) + "(%rbp)");
+                }
+                _ => {}
+            }
+        }
+        OptLocation::None => {}
+    }
+}
+
+// ─── Call generation ─────────────────────────────────────────────────────
+
+/// Generate an ABI-compliant call instruction.
+pub fn X64CodeGen_gen_call_abi(self: &mut X64CodeGen, dst: OptVReg, target: str, args: Vec<Operand>, ret_ty: IrType, module: L3Module) {
+    // SIMD intrinsics.
+    if X64CodeGen_handle_simd_intrinsic(self, dst, target, args) {
+        return;
+    }
+
+    var arg_regs: Vec<i64> = physreg_arg_regs();
+    var stack_args: Vec<Operand> = Vec::new();
+
+    // Place each argument in a register or on the stack.
+    var i: i64 = 0;
+    while i < args.len() {
+        if i < arg_regs.len() {
+            X64CodeGen_gen_operand_to_reg(self, args.get(i), arg_regs.get(i));
+        } else {
+            stack_args.push(args.get(i));
+        }
+        i = i + 1;
+    }
+
+    // Push stack args (in reverse order for System V ABI).
+    i = stack_args.len() - 1;
+    while i >= 0 {
+        X64CodeGen_gen_operand_to_reg(self, stack_args.get(i), REG_RAX);
+        X64CodeGen_wl(self, "    pushq %rax");
+        i = i - 1;
+    }
+
+    // Align stack to 16 bytes before call.
+    var extra_pushed: i64 = stack_args.len();
+    var needs_align: bool = extra_pushed % 2 != 0;
+    if needs_align {
+        X64CodeGen_wl(self, "    subq $8, %rsp");
+    }
+
+    X64CodeGen_wl(self, "    call " + target);
+
+    if needs_align {
+        X64CodeGen_wl(self, "    addq $8, %rsp");
+    }
+    if extra_pushed > 0 {
+        X64CodeGen_wl(self, "    addq $" + int_to_str(extra_pushed * 8) + ", %rsp");
+    }
+
+    // Move result to dst.
+    match dst {
+        OptVReg::Some(d) => {
+            var loc_opt: OptLocation = X64CodeGen_dst_loc(self, d);
+            match loc_opt {
+                OptLocation::Some(loc) => {
+                    match loc {
+                        Location::Reg(r) => {
+                            if r != REG_RAX {
+                                X64CodeGen_wl(self, "    movq %rax, %" + physreg_name(r));
+                            }
+                        }
+                        Location::Spill(off) => {
+                            X64CodeGen_wl(self, "    movq %rax, -" + int_to_str(off) + "(%rbp)");
+                        }
+                        Location::Remat(_) => {}
+                    }
+                }
+                OptLocation::None => {}
+            }
+        }
+        OptVReg::None => {}
+    }
+}
+
+/// Generate an indirect call through a function pointer.
+pub fn X64CodeGen_gen_call_ptr(self: &mut X64CodeGen, dst: OptVReg, fn_ptr: Operand, args: Vec<Operand>, has_env: bool) {
+    // Load function pointer into R11.
+    X64CodeGen_gen_operand_to_reg(self, fn_ptr, REG_R11);
+    if has_env {
+        X64CodeGen_wl(self, "    movq (%r11), %r11");
+    }
+
+    var arg_regs: Vec<i64> = physreg_arg_regs();
+    var arg_start: i64 = 0;
+    if has_env {
+        // Pass env pointer in %rdi.
+        X64CodeGen_gen_operand_to_reg(self, fn_ptr, REG_RDI);
+        arg_start = 1;
+    }
+
+    var i: i64 = 0;
+    while i < args.len() {
+        var reg_idx: i64 = i + arg_start;
+        if reg_idx < arg_regs.len() {
+            X64CodeGen_gen_operand_to_reg(self, args.get(i), arg_regs.get(reg_idx));
+        }
+        i = i + 1;
+    }
+
+    X64CodeGen_wl(self, "    call *%r11");
+
+    // Move result to dst.
+    match dst {
+        OptVReg::Some(d) => {
+            var loc_opt: OptLocation = X64CodeGen_dst_loc(self, d);
+            match loc_opt {
+                OptLocation::Some(loc) => {
+                    match loc {
+                        Location::Reg(r) => {
+                            if r != REG_RAX {
+                                X64CodeGen_wl(self, "    movq %rax, %" + physreg_name(r));
+                            }
+                        }
+                        Location::Spill(off) => {
+                            X64CodeGen_wl(self, "    movq %rax, -" + int_to_str(off) + "(%rbp)");
+                        }
+                        Location::Remat(_) => {}
+                    }
+                }
+                OptLocation::None => {}
+            }
+        }
+        OptVReg::None => {}
+    }
+}
+
+/// Generate a dynamic dispatch call (trait object vtable).
+pub fn X64CodeGen_gen_dyn_call(self: &mut X64CodeGen, dst: OptVReg, trait_name: str, method: str, args: Vec<Operand>) {
+    X64CodeGen_wl(self, "    # DynCall: " + trait_name + "." + method);
+
+    // Find the method index in the trait's method list.
+    var method_idx: i64 = 0;
+    var i: i64 = 0;
+    while i < self.trait_methods.len() {
+        if str_equal(self.trait_methods.get(i).name, trait_name) {
+            var methods: Vec<str> = self.trait_methods.get(i).items;
+            var j: i64 = 0;
+            while j < methods.len() {
+                if str_equal(methods.get(j), method) {
+                    method_idx = j;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    // Load the trait object pointer into rax.
+    if args.len() > 0 {
+        X64CodeGen_gen_operand_to_reg(self, args.get(0), REG_RAX);
+    }
+    X64CodeGen_wl(self, "    movq (%rax), %rdi    # data → rdi");
+    X64CodeGen_wl(self, "    movq 8(%rax), %r11   # vtable → r11");
+    X64CodeGen_wl(self, "    call *" + int_to_str(method_idx * 8) + "(%r11)");
+
+    match dst {
+        OptVReg::Some(d) => {
+            var loc_opt: OptLocation = X64CodeGen_dst_loc(self, d);
+            match loc_opt {
+                OptLocation::Some(loc) => {
+                    match loc {
+                        Location::Reg(r) => {
+                            if r != REG_RAX {
+                                X64CodeGen_wl(self, "    movq %rax, %" + physreg_name(r));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                OptLocation::None => {}
+            }
+        }
+        OptVReg::None => {}
+    }
+}
+
+/// Generate a MakeDyn instruction (create a trait object).
+pub fn X64CodeGen_gen_make_dyn(self: &mut X64CodeGen, dst: VReg, value: Operand, type_name: str, trait_name: str) {
+    X64CodeGen_wl(self, "    # MakeDyn: " + type_name + " as dyn " + trait_name);
+
+    var vtable_label: str = ".vtable_" + type_name + "_" + trait_name;
+    var vtable_exists: bool = false;
+    var i: i64 = 0;
+    while i < self.vtables.len() {
+        if str_equal(self.vtables.get(i).label, vtable_label) {
+            vtable_exists = true;
+        }
+        i = i + 1;
+    }
+    if !vtable_exists {
+        var methods: Vec<str> = Vec::new();
+        i = 0;
+        while i < self.trait_methods.len() {
+            if str_equal(self.trait_methods.get(i).name, trait_name) {
+                var trait_methods: Vec<str> = self.trait_methods.get(i).items;
+                var j: i64 = 0;
+                while j < trait_methods.len() {
+                    methods.push(type_name + "_" + trait_methods.get(j));
+                    j = j + 1;
+                }
+            }
+            i = i + 1;
+        }
+        self.vtables.push(VtableEntry_new(vtable_label, methods));
+    }
+
+    X64CodeGen_wl(self, "    movq $16, %rdi");
+    X64CodeGen_wl(self, "    call p_malloc");
+    X64CodeGen_gen_operand_to_reg(self, value, REG_RCX);
+    X64CodeGen_wl(self, "    movq %rcx, (%rax)");
+    X64CodeGen_wl(self, "    leaq " + vtable_label + "(%rip), %rcx");
+    X64CodeGen_wl(self, "    movq %rcx, 8(%rax)");
+
+    var dst_loc_opt: OptLocation = X64CodeGen_dst_loc(self, dst);
+    match dst_loc_opt {
+        OptLocation::Some(dst_loc) => {
+            match dst_loc {
+                Location::Reg(r) => {
+                    if r != REG_RAX {
+                        X64CodeGen_wl(self, "    movq %rax, %" + physreg_name(r));
+                    }
+                }
+                Location::Spill(off) => {
+                    X64CodeGen_wl(self, "    movq %rax, -" + int_to_str(off) + "(%rbp)");
+                }
+                Location::Remat(_) => {}
+            }
+        }
+        OptLocation::None => {}
+    }
+}
+
+/// Generate a Cast instruction.
+pub fn X64CodeGen_gen_cast(self: &mut X64CodeGen, dst: VReg, src: Operand, kind: CastKind) {
+    var dst_loc_opt: OptLocation = X64CodeGen_dst_loc(self, dst);
+    var dst_reg: i64 = REG_RAX;
+    match dst_loc_opt {
+        OptLocation::Some(dst_loc) => {
+            match dst_loc {
+                Location::Reg(r) => { dst_reg = r; }
+                _ => { dst_reg = REG_RAX; }
+            }
+        }
+        OptLocation::None => { dst_reg = REG_RAX; }
+    }
+
+    X64CodeGen_gen_operand_to_reg(self, src, dst_reg);
+
+    if cast_kind_eq(kind, CastKind::BitCast) {
+        // No-op for same-size types.
+    } else if cast_kind_eq(kind, CastKind::IntExtend) {
+        X64CodeGen_wl(self, "    movslq %e" + physreg_name(dst_reg) + ", %" + physreg_name(dst_reg));
+    } else if cast_kind_eq(kind, CastKind::IntTrunc) {
+        X64CodeGen_wl(self, "    movl %e" + physreg_name(dst_reg) + ", %e" + physreg_name(dst_reg));
+    } else if cast_kind_eq(kind, CastKind::IntToFloat) {
+        X64CodeGen_wl(self, "    cvtsi2sdq %" + physreg_name(dst_reg) + ", %xmm0");
+        X64CodeGen_wl(self, "    movsd %xmm0, -8(%rbp)");
+        X64CodeGen_wl(self, "    movq -8(%rbp), %rax");
+        if dst_reg != REG_RAX {
+            X64CodeGen_wl(self, "    movq %rax, %" + physreg_name(dst_reg));
+        }
+    } else if cast_kind_eq(kind, CastKind::FloatToInt) {
+        X64CodeGen_wl(self, "    movq %rax, -8(%rbp)");
+        X64CodeGen_wl(self, "    movsd -8(%rbp), %xmm0");
+        X64CodeGen_wl(self, "    cvttsd2siq %xmm0, %" + physreg_name(dst_reg));
+    }
+
+    match dst_loc_opt {
+        OptLocation::Some(dst_loc) => {
+            match dst_loc {
+                Location::Spill(off) => {
+                    X64CodeGen_wl(self, "    movq %" + physreg_name(dst_reg) + ", -" + int_to_str(off) + "(%rbp)");
+                }
+                _ => {}
+            }
+        }
+        OptLocation::None => {}
+    }
+}
+
+/// Generate a TryUnwrap instruction.
+pub fn X64CodeGen_gen_try_unwrap(self: &mut X64CodeGen, value: Operand, ok_dst: VReg, ok_block: i64, err_block: i64) {
+    X64CodeGen_wl(self, "    # TryUnwrap: " + operand_to_str(value) + " -> " + vreg_to_str(ok_dst));
+    X64CodeGen_gen_operand_to_reg(self, value, REG_RAX);
+    X64CodeGen_wl(self, "    movq (%rax), %rcx");
+    X64CodeGen_wl(self, "    testq %rcx, %rcx");
+    X64CodeGen_wl(self, "    jnz " + X64CodeGen_block_label(self, err_block));
+    // Ok path: load the data (offset 8) into ok_dst.
+    X64CodeGen_wl(self, "    movq 8(%rax), %rax");
+    var dst_loc_opt: OptLocation = X64CodeGen_dst_loc(self, ok_dst);
+    match dst_loc_opt {
+        OptLocation::Some(dst_loc) => {
+            match dst_loc {
+                Location::Reg(r) => {
+                    if r != REG_RAX {
+                        X64CodeGen_wl(self, "    movq %rax, %" + physreg_name(r));
+                    }
+                }
+                _ => {}
+            }
+        }
+        OptLocation::None => {}
+    }
+    X64CodeGen_wl(self, "    jmp " + X64CodeGen_block_label(self, ok_block));
+}
+
+// ─── SIMD helpers ────────────────────────────────────────────────────────
+
+/// Handle SIMD intrinsic calls. Returns true if the call was handled.
+pub fn X64CodeGen_handle_simd_intrinsic(self: &mut X64CodeGen, dst: OptVReg, target: str, args: Vec<Operand>) -> bool {
+    if str_equal(target, "p_simd_add") && args.len() == 2 {
+        X64CodeGen_gen_operand_to_xmm(self, args.get(0), REG_XMM0);
+        X64CodeGen_gen_operand_to_xmm(self, args.get(1), REG_XMM1);
+        X64CodeGen_wl(self, "    addpd %xmm1, %xmm0");
+        X64CodeGen_store_xmm_to_dst(self, dst);
+        return true;
+    }
+    if str_equal(target, "p_simd_sub") && args.len() == 2 {
+        X64CodeGen_gen_operand_to_xmm(self, args.get(0), REG_XMM0);
+        X64CodeGen_gen_operand_to_xmm(self, args.get(1), REG_XMM1);
+        X64CodeGen_wl(self, "    subpd %xmm1, %xmm0");
+        X64CodeGen_store_xmm_to_dst(self, dst);
+        return true;
+    }
+    if str_equal(target, "p_simd_mul") && args.len() == 2 {
+        X64CodeGen_gen_operand_to_xmm(self, args.get(0), REG_XMM0);
+        X64CodeGen_gen_operand_to_xmm(self, args.get(1), REG_XMM1);
+        X64CodeGen_wl(self, "    mulpd %xmm1, %xmm0");
+        X64CodeGen_store_xmm_to_dst(self, dst);
+        return true;
+    }
+    if str_equal(target, "p_simd_div") && args.len() == 2 {
+        X64CodeGen_gen_operand_to_xmm(self, args.get(0), REG_XMM0);
+        X64CodeGen_gen_operand_to_xmm(self, args.get(1), REG_XMM1);
+        X64CodeGen_wl(self, "    divpd %xmm1, %xmm0");
+        X64CodeGen_store_xmm_to_dst(self, dst);
+        return true;
+    }
+    if str_equal(target, "p_simd_load") && args.len() == 1 {
+        X64CodeGen_gen_operand_to_reg(self, args.get(0), REG_RAX);
+        X64CodeGen_wl(self, "    movupd (%rax), %xmm0");
+        X64CodeGen_store_xmm_to_dst(self, dst);
+        return true;
+    }
+    if str_equal(target, "p_simd_store") && args.len() == 2 {
+        X64CodeGen_gen_operand_to_reg(self, args.get(0), REG_RAX);
+        X64CodeGen_gen_operand_to_xmm(self, args.get(1), REG_XMM0);
+        X64CodeGen_wl(self, "    movupd %xmm0, (%rax)");
+        return true;
+    }
+    return false;
+}
+
+/// Store XMM0 result to dst vreg.
+pub fn X64CodeGen_store_xmm_to_dst(self: &mut X64CodeGen, dst: OptVReg) {
+    match dst {
+        OptVReg::Some(d) => {
+            var loc_opt: OptLocation = X64CodeGen_dst_loc(self, d);
+            match loc_opt {
+                OptLocation::Some(loc) => {
+                    match loc {
+                        Location::Reg(r) => {
+                            X64CodeGen_wl(self, "    movq %xmm0, %" + physreg_name(r));
+                        }
+                        Location::Spill(off) => {
+                            X64CodeGen_wl(self, "    movsd %xmm0, -" + int_to_str(off) + "(%rbp)");
+                        }
+                        Location::Remat(_) => {}
+                    }
+                }
+                OptLocation::None => {}
+            }
+        }
+        OptVReg::None => {}
+    }
+}
+
+/// Load an operand into an XMM register (for SIMD operations).
+pub fn X64CodeGen_gen_operand_to_xmm(self: &mut X64CodeGen, op: Operand, reg: i64) {
+    var xmm_name: str = physreg_name(reg);
+    match op {
+        Operand::ImmF(bits) => {
+            var label: str = X64CodeGen_alloc_float_const(self, bits);
+            X64CodeGen_wl(self, "    movsd " + label + "(%rip), %" + xmm_name);
+        }
+        Operand::VReg(vr) => {
+            var loc_opt: OptLocation = X64CodeGen_dst_loc(self, vr);
+            match loc_opt {
+                OptLocation::Some(loc) => {
+                    match loc {
+                        Location::Reg(r) => {
+                            X64CodeGen_wl(self, "    movq %" + physreg_name(r) + ", %" + xmm_name);
+                        }
+                        Location::Spill(off) => {
+                            X64CodeGen_wl(self, "    movapd -" + int_to_str(off) + "(%rbp), %" + xmm_name);
+                        }
+                        Location::Remat(c) => {
+                            X64CodeGen_wl(self, "    movq $" + int_to_str(c) + ", %rax");
+                            X64CodeGen_wl(self, "    movq %rax, %" + xmm_name);
+                        }
+                    }
+                }
+                OptLocation::None => {
+                    X64CodeGen_wl(self, "    # operand " + vreg_to_str(vr) + " unallocated for XMM");
+                }
+            }
+        }
+        Operand::Slot(slot) => {
+            X64CodeGen_wl(self, "    movapd -" + int_to_str(slot.offset) + "(%rbp), %" + xmm_name);
+        }
+        _ => {
+            X64CodeGen_gen_operand_to_reg(self, op, REG_RAX);
+            X64CodeGen_wl(self, "    movq %rax, %" + xmm_name);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Helper functions
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// x86-64 sub-register names for 1/2/4-byte accesses.
+pub fn sub_reg_name(reg: i64, size: i64) -> str {
+    if size == 1 {
+        if reg == REG_RAX { return "%al"; }
+        if reg == REG_RCX { return "%cl"; }
+        if reg == REG_RDX { return "%dl"; }
+        if reg == REG_RBX { return "%bl"; }
+        if reg == REG_RSI { return "%sil"; }
+        if reg == REG_RDI { return "%dil"; }
+        if reg == REG_R8 { return "%r8b"; }
+        if reg == REG_R9 { return "%r9b"; }
+        if reg == REG_R10 { return "%r10b"; }
+        if reg == REG_R11 { return "%r11b"; }
+        if reg == REG_R12 { return "%r12b"; }
+        if reg == REG_R13 { return "%r13b"; }
+        if reg == REG_R14 { return "%r14b"; }
+        if reg == REG_R15 { return "%r15b"; }
+        return "%al";
+    }
+    if size == 2 {
+        if reg == REG_RAX { return "%ax"; }
+        if reg == REG_RCX { return "%cx"; }
+        if reg == REG_RDX { return "%dx"; }
+        if reg == REG_RBX { return "%bx"; }
+        if reg == REG_RSI { return "%si"; }
+        if reg == REG_RDI { return "%di"; }
+        if reg == REG_R8 { return "%r8w"; }
+        if reg == REG_R9 { return "%r9w"; }
+        return "%ax";
+    }
+    // 4-byte
+    if reg == REG_RAX { return "%eax"; }
+    if reg == REG_RCX { return "%ecx"; }
+    if reg == REG_RDX { return "%edx"; }
+    if reg == REG_RBX { return "%ebx"; }
+    if reg == REG_RSI { return "%esi"; }
+    if reg == REG_RDI { return "%edi"; }
+    if reg == REG_R8 { return "%r8d"; }
+    if reg == REG_R9 { return "%r9d"; }
+    return "%eax";
+}
+
+/// Escape a string for assembly output.
+pub fn escape_str(s: str) -> str {
+    var result: str = "";
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if c == 92 {  // backslash
+            result = result + "\\\\";
+        } else if c == 34 {  // double quote
+            result = result + "\\\"";
+        } else if c == 10 {  // newline
+            result = result + "\\n";
+        } else if c == 9 {  // tab
+            result = result + "\\t";
+        } else if c == 13 {  // carriage return
+            result = result + "\\r";
+        } else {
+            result = result + char_to_str(c);
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Compare two CastKind values.
+pub fn cast_kind_eq(a: CastKind, b: CastKind) -> bool {
+    match a {
+        CastKind::BitCast => { match b { CastKind::BitCast => { return true; }, _ => { return false; } } }
+        CastKind::IntExtend => { match b { CastKind::IntExtend => { return true; }, _ => { return false; } } }
+        CastKind::IntTrunc => { match b { CastKind::IntTrunc => { return true; }, _ => { return false; } } }
+        CastKind::IntToFloat => { match b { CastKind::IntToFloat => { return true; }, _ => { return false; } } }
+        CastKind::FloatToInt => { match b { CastKind::FloatToInt => { return true; }, _ => { return false; } } }
+    }
+    return false;
+}
+

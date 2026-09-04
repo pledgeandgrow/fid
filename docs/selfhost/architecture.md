@@ -14,21 +14,32 @@ main.fd
        ├─ lower.fd ──► ir.fd
        ├─ mono.fd ──► ast.fd
        ├─ pir.fd / opt.fd ──► ir.fd
-       └─ codegen_c.fd ──► ir.fd  ──► C source
+       ├─ codegen_c.fd ──► ir.fd  ──► C source ──► tcc ──► .exe
+       ├─ pe.fd ──► ir.fd  ──► x86-64 machine code + PE file ──► .exe (no tcc!)
+       └─ [Linux backend — ported but NOT yet integrated]
+            ├─ peephole.fd ──► L3Module (9 optimization passes)
+            ├─ regalloc.fd ──► L3Module (linear scan register allocator)
+            └─ codegen_x64.fd ──► L3Module ──► x86-64 AT&T asm ──► ELF64 (future)
 ```
 
 `compiler.fd` is the central hub. `ast.fd`, `ir.fd`, and `token.fd` are the
 shared data-definition leaves that almost everything else consumes.
+
+The `ccompile` command uses `codegen_c.fd` (C codegen + tcc). The `build`
+command uses `pe.fd` (native PE emitter, no tcc). The Linux native backend
+(`peephole.fd` + `regalloc.fd` + `codegen_x64.fd`) is ported but not yet
+wired into the pipeline — integration requires porting `elf64.rs`,
+`linker.rs`, and `runtime_linux.rs` first.
 
 ---
 
 ## `compiler/main.fd` — CLI entry point
 
 - **Module:** `compiler::main`
-- **Purpose:** Minimal command-line front-end. Currently supports `ccompile` for the C-codegen bootstrap.
-- **Key functions:** `main()` dispatches commands; `cmd_ccompile()` parses CLI args and invokes the compiler pipeline.
-- **Imports:** `core`, `vec`, `string`, `compiler::compiler`
-- **Notes:** Top-level executable; no other compiler module imports it.
+- **Purpose:** Minimal command-line front-end. Supports `ccompile` (C codegen + tcc) and `build` (native PE emitter, no tcc).
+- **Key functions:** `main()` dispatches commands; `cmd_ccompile()` parses CLI args and invokes the C codegen pipeline; `cmd_build()` invokes the PE emitter pipeline.
+- **Imports:** `core`, `vec`, `string`, `compiler::compiler`, `compiler::pe`
+- **Notes:** Top-level executable; no other compiler module imports it. The `build` command was added in session 5.
 
 ## `compiler/compiler.fd` — Pipeline driver
 
@@ -272,6 +283,135 @@ Fides lowerer needs the same.
 
 ---
 
+## `compiler/pe.fd` — PE emitter (native x86-64 + PE file writer)
+
+- **Module:** `compiler::pe`
+- **Purpose:** Self-contained x86-64 code generator + Windows PE file writer.
+  Translates `IrModule` directly into machine code and emits a valid PE
+  executable — no tcc, no gcc, no external linker needed.
+- **Key types:** `X86Encoder` (instruction encoder), `PeCodeGen` (IR → codegen),
+  `PeStackFrame` (stack frame management), `PeFuncEntry`, `PeImportEntry`
+- **Key functions:** `X86Encoder_*` (instruction encoding), `PeCodeGen_new()`,
+  `PeCodeGen_generate()` (main entry), `PeCodeGen_gen_print_str()`,
+  `PeCodeGen_gen_print_int()`, `PeCodeGen_gen_panic()`,
+  `PeCodeGen_emit_entry_point()`, `PeCodeGen_write_pe_file()`
+- **Imports:** `core`, `vec`, `string`, `compiler::ast`, `compiler::ir`
+- **Imported by:** `main.fd` (via `build` command)
+- **Ported from:** `src/pe.rs` (5704 lines Rust → ~2600 lines Fides, session 5)
+
+### Key responsibilities
+
+- Encode x86-64 instructions: REX prefixes, ModRM/SIB bytes, immediates,
+  rip-relative addressing for calls and string literals.
+- Generate PE file format: DOS header, PE header, section table, .text
+  section (code), .rdata section (string literals + import table), IAT.
+- Import Windows API functions: `GetStdHandle`, `WriteFile`, `ExitProcess`.
+- Generate runtime stubs: `p_print_str` (strlen + WriteFile to stdout),
+  `p_print_int` (itoa + WriteFile), `p_print_float`, `p_print_bool`,
+  `p_panic` (ExitProcess with error code).
+- Manage stack frames: prologue (`push rbp; mov rbp, rsp; sub rsp, N`),
+  epilogue (`mov rsp, rbp; pop rbp; ret`), local variable access via
+  `[rbp - offset]`.
+- Label resolution: function labels, jump labels (for control flow),
+  call targets resolved via rip-relative addressing.
+
+### Current capabilities (session 7)
+
+| Feature | Status |
+|---------|--------|
+| PE header + section layout | ✅ |
+| Import table (IAT) | ✅ |
+| Entry point → main | ✅ |
+| Function prologues/epilogues | ✅ |
+| Stack frame management | ✅ |
+| Print stubs (str/int/float/bool) | ✅ |
+| Panic stub | ✅ |
+| String literals (.rdata) | ✅ |
+| Basic arithmetic | ✅ |
+| Local variables | ✅ |
+| Control flow (if/while/loop) | ✅ |
+| String concat (p_str_concat) | ✅ |
+| Int→string (p_to_str) | ✅ |
+| Bool→string (p_to_str_bool) | ✅ |
+| Float→string (p_to_str_float) | ✅ (simplified) |
+| Vec runtime (new/push/len/get/pop/set/...) | ✅ |
+| HashMap runtime (new/insert/get/contains/...) | ✅ |
+| Full struct/enum support | ⏳ TODO |
+| Float arithmetic (xmm ops) | ⏳ TODO |
+| Many-arg calls (>4 args) | ⏳ TODO |
+| Full compiler source | ⏳ TODO |
+
+### Known issues
+
+- **`p_file_write` truncates at null bytes** — binary PE data is hex-encoded
+  and decoded via PowerShell.
+- **Fides compiler statement-dropping bug** — long functions in `pe.fd` may
+  lose statements. Worked around by splitting into smaller helpers.
+- **`src/pe.rs` and `compiler/pe.fd` must stay in sync** — if one changes,
+  the other needs the same change.
+
+---
+
+## `compiler/peephole.fd` — Peephole optimizer (Linux backend, NOT yet integrated)
+
+- **Module:** `compiler::peephole`
+- **Purpose:** 9 peephole optimization passes that run on L3 (post-regalloc)
+  x86-64 instructions. Always enabled in the Rust `build` command.
+- **Key types:** `PeepholeOptimizer`, `PeepInst`, `PeepOperand`
+- **Key functions:** `PeepholeOptimizer_new()`, `PeepholeOptimizer_optimize()`,
+  9 passes: redundant move elimination, zero idioms, dead store elimination,
+  constant folding, branch folding, lea-to-add, strength reduction, address
+  mode folding, jump threading
+- **Imports:** `core`, `vec`, `compiler::pir` (for L3 types)
+- **Ported from:** `src/peephole.rs` (903 lines Rust → 985 lines Fides, session 8)
+- **Status:** Builds OK with bootstrap compiler. NOT yet wired into
+  `compiler.fd`/`main.fd`. Integration requires the full Linux backend
+  (`elf64.fd`, `linker.fd`, `runtime_linux.fd`).
+
+---
+
+## `compiler/regalloc.fd` — Linear scan register allocator (Linux backend, NOT yet integrated)
+
+- **Module:** `compiler::regalloc`
+- **Purpose:** Converts virtual registers in L3 IR to physical x86-64
+  registers. Handles spill slots and constant rematerialization
+  (`Location::Remat`).
+- **Key types:** `ModuleAllocation`, `FuncAllocation`, `LiveInterval`,
+  `Location` (Reg/Spill/Remat), `PhysReg` constants
+- **Key functions:** `allocate_module()`, `allocate_function()`,
+  `linear_scan()`, `spill()`, `rematerialize()`
+- **Imports:** `core`, `vec`, `compiler::pir` (for L3 types)
+- **Ported from:** `src/regalloc.rs` (1096 lines Rust → 1086 lines Fides, session 8)
+- **Status:** Builds OK with bootstrap compiler. NOT yet wired into
+  `compiler.fd`/`main.fd`.
+- **Note:** `val` is a reserved keyword in Fides — all `val` variables in the
+  Rust source were renamed to `value` during porting (see known-bugs.md §1.26).
+
+---
+
+## `compiler/codegen_x64.fd` — PIR L3 → x86-64 assembly (Linux backend, NOT yet integrated)
+
+- **Module:** `compiler::codegen_x64`
+- **Purpose:** Generates AT&T-syntax x86-64 assembly from PIR L3 modules.
+  Uses the System V AMD64 ABI (RDI, RSI, RDX, RCX, R8, R9 for arguments).
+  Output is suitable for `gcc -c` or `as`.
+- **Key types:** `X64CodeGen`, `Operand` (Slot/Reg/Imm/Label/Const),
+  `BlockLabelEntry`, `PanicStub`, `StringConstEntry`
+- **Key functions:** `generate_asm()` (main entry), `X64CodeGen_gen_module()`,
+  `X64CodeGen_gen_function()`, `X64CodeGen_gen_inst()`,
+  `X64CodeGen_gen_call_abi()`, `X64CodeGen_gen_call_ptr()`,
+  `X64CodeGen_gen_load()`, `X64CodeGen_gen_store()`
+- **Imports:** `core`, `vec`, `string`, `compiler::pir`, `compiler::regalloc`
+- **Ported from:** `src/codegen_x64.rs` (1923 lines Rust → 1780 lines Fides, session 8)
+- **Status:** Builds OK with bootstrap compiler. NOT yet wired into
+  `compiler.fd`/`main.fd`. Integration requires `elf64.fd` (object file
+  emitter) + `linker.fd` + `runtime_linux.fd`.
+- **Note:** `x86.rs` (1377 lines) is dead code and was NOT ported — see
+  known-bugs.md §1.29. The actual Windows backend is `pe.rs`/`pe.fd`, which
+  is self-contained and does not use this file.
+
+---
+
 ## `compiler/pir.fd` — Multi-level PIR (L1→L2→L3)
 
 - **Module:** `compiler::pir`
@@ -338,11 +478,31 @@ Fides lowerer needs the same.
 
 ---
 
-## `compiler/comptime_eval.fd` — Compile-time evaluation stubs
+## `compiler/comptime_eval.fd` — Compile-time evaluation engine
 
 - **Module:** `compiler::comptime_eval`
-- **Purpose:** Placeholder for `comptime <expr>` / `comptime gen { }` evaluation.
-- **Key functions:** `process_gen()`, `substitute()` — both currently pass through unchanged.
+- **Purpose:** Full comptime evaluation engine — evaluates `comptime <expr>`,
+  `comptime gen { }` blocks, aggressive comptime (I-5A), and loop unrolling
+  (I-5D). Injects generated functions/structs into the program and substitutes
+  comptime expressions with their evaluated values.
+- **Key functions:**
+  - `process_gen()` — evaluates `comptime gen` blocks, parses result as Fides
+    source, injects generated functions/structs
+  - `substitute()` — recursively substitutes `comptime` expressions with
+    evaluated values (8 iterations for fixpoint)
+  - `evaluate()` / `evaluate_with_env()` / `evaluate_block()` — full AST
+    interpreter (binary ops, unary ops, calls, if/else, blocks, for loops,
+    string concat, f-strings, identifiers, comptime functions)
+  - `evaluate_reflect()` — reflection: `TypeName`, `IsStruct`, `IsEnum`,
+    `FieldCount`, `FieldNames`, `FieldTypes`, `EnumVariants`
+  - `box_expr_unbox()` / `box_expr_new()` — boxing helpers (local to this
+    module)
+- **ComptimeEnv:** Uses parallel Vecs (no HashMap at compile time)
+- **I-5A:** Auto-evaluates calls to `comptime fn` functions when all
+  arguments are literals (no explicit `comptime` wrapper needed)
+- **I-5D:** Unrolls `for` loops with literal bounds (≤16 iterations, ≤16
+  body stmts) at AST level; eliminates dead `if` branches with literal
+  conditions
 - **Imports:** `core`, `vec`, `compiler::ast`
 - **Imported by:** `compiler.fd`
 

@@ -1,0 +1,1259 @@
+// flat_ast.fd — Flat AST serialization for self-host parser differential testing.
+// Ported from src/flat_ast.rs (755 LOC Rust).
+//
+// Produces a simple line-based format that's easy to implement in Fides.
+// Format:
+//   - 2 spaces per depth level
+//   - Node type first, then fields (strings double-quoted, numbers bare, bools as true/false)
+//   - Children on subsequent lines, indented
+//   - Vecs: each element on its own line
+//   - Option: "None" or the value inline/children
+
+module compiler::flat_ast;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+
+// ─── Helper functions ──────────────────────────────────────────────────────
+
+fn esc(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c == 10 {        // \n
+            out = str_concat(out, "\\n");
+        } else if c == 13 { // \r
+            out = str_concat(out, "\\r");
+        } else if c == 9 {  // \t
+            out = str_concat(out, "\\t");
+        } else if c == 92 { // backslash
+            out = str_concat(out, "\\\\");
+        } else if c == 34 { // double quote
+            out = str_concat(out, "\\\"");
+        } else if c == 0 {  // null
+            out = str_concat(out, "\\0");
+        } else if c >= 33 && c <= 126 {
+            out = str_concat(out, char_to_str(c));
+        } else {
+            // Non-printable: \u{XX}
+            out = str_concat(out, "\\u{");
+            out = str_concat(out, int_to_hex(c));
+            out = str_concat(out, "}");
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn indent(depth: i64) -> str {
+    return str_repeat("  ", depth);
+}
+
+fn bool_str(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn int_to_hex(n: i64) -> str {
+    var hex: str = "0123456789abcdef";
+    if n < 0 {
+        // For negative, just use the low byte
+        n = n & 0xFF;
+    }
+    if n < 16 {
+        return char_to_str(str_byte_at(hex, n));
+    }
+    var out: str = "";
+    var v: i64 = n;
+    while v > 0 {
+        var d: i64 = v & 0xF;
+        out = str_concat(char_to_str(str_byte_at(hex, d)), out);
+        v = v >> 4;
+    }
+    return out;
+}
+
+// ─── Type serialization ────────────────────────────────────────────────────
+
+pub fn type_flat(t: Type, depth: i64) -> str {
+    var ind: str = indent(depth);
+    match t {
+        Type::I8 => { return str_concat(ind, "I8"); }
+        Type::I16 => { return str_concat(ind, "I16"); }
+        Type::I32 => { return str_concat(ind, "I32"); }
+        Type::I64 => { return str_concat(ind, "I64"); }
+        Type::I128 => { return str_concat(ind, "I128"); }
+        Type::U8 => { return str_concat(ind, "U8"); }
+        Type::U16 => { return str_concat(ind, "U16"); }
+        Type::U32 => { return str_concat(ind, "U32"); }
+        Type::U64 => { return str_concat(ind, "U64"); }
+        Type::U128 => { return str_concat(ind, "U128"); }
+        Type::F32 => { return str_concat(ind, "F32"); }
+        Type::F64 => { return str_concat(ind, "F64"); }
+        Type::Bool => { return str_concat(ind, "Bool"); }
+        Type::Str => { return str_concat(ind, "Str"); }
+        Type::Void => { return str_concat(ind, "Void"); }
+        Type::Never => { return str_concat(ind, "Never"); }
+        Type::Infer => { return str_concat(ind, "Infer"); }
+        Type::Named(n) => {
+            return ind + "Named \"" + esc(n) + "\"";
+        }
+        Type::Array(elem, size) => {
+            var s: str = ind + "Array " + int_to_str(size) + "\n";
+            s = s + type_flat(*elem, depth + 1);
+            return s;
+        }
+        Type::ArrayConst(elem, size_param) => {
+            var s: str = ind + "ArrayConst \"" + esc(size_param) + "\"\n";
+            s = s + type_flat(*elem, depth + 1);
+            return s;
+        }
+        Type::Ref(inner, is_mut) => {
+            var s: str = ind + "Ref " + bool_str(is_mut) + "\n";
+            s = s + type_flat(*inner, depth + 1);
+            return s;
+        }
+        Type::RawPtr(inner, is_mut) => {
+            var s: str = ind + "RawPtr " + bool_str(is_mut) + "\n";
+            s = s + type_flat(*inner, depth + 1);
+            return s;
+        }
+        Type::Generic(name, args) => {
+            var s: str = ind + "Generic \"" + esc(name) + "\"\n";
+            var i: i64 = 0;
+            while i < args.len() {
+                s = s + type_flat(args.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Type::Tuple(types) => {
+            var s: str = ind + "Tuple\n";
+            var i: i64 = 0;
+            while i < types.len() {
+                s = s + type_flat(types.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Type::Func(params, ret) => {
+            var s: str = ind + "Func\n";
+            var i: i64 = 0;
+            while i < params.len() {
+                s = s + type_flat(params.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            s = s + type_flat(*ret, depth + 1);
+            return s;
+        }
+        Type::Assoc(trait_name, assoc_name, type_name, args) => {
+            var s: str = ind + "Assoc \"" + esc(trait_name) + "\" \"" + esc(assoc_name) + "\" \"" + esc(type_name) + "\"\n";
+            var i: i64 = 0;
+            while i < args.len() {
+                s = s + type_flat(args.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Type::Dyn(name) => {
+            return ind + "Dyn \"" + esc(name) + "\"";
+        }
+        Type::ShapedTensor(elem, shape) => {
+            var s: str = ind + "ShapedTensor\n";
+            s = s + type_flat(*elem, depth + 1) + "\n";
+            var i: i64 = 0;
+            while i < shape.len() {
+                var d: ShapeDim = shape.get(i);
+                match d {
+                    ShapeDim::Known(n) => {
+                        s = s + indent(depth + 1) + "Known " + int_to_str(n) + "\n";
+                    }
+                    ShapeDim::Symbolic(n) => {
+                        s = s + indent(depth + 1) + "Symbolic \"" + esc(n) + "\"\n";
+                    }
+                }
+                i = i + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+    }
+    return "";
+}
+
+// ─── Operator serialization ────────────────────────────────────────────────
+
+pub fn binop_flat(op: BinOp) -> str {
+    match op {
+        BinOp::Add => { return "Add"; }
+        BinOp::Sub => { return "Sub"; }
+        BinOp::Mul => { return "Mul"; }
+        BinOp::Div => { return "Div"; }
+        BinOp::Mod => { return "Mod"; }
+        BinOp::Eq => { return "Eq"; }
+        BinOp::Neq => { return "Neq"; }
+        BinOp::Lt => { return "Lt"; }
+        BinOp::Gt => { return "Gt"; }
+        BinOp::LtEq => { return "LtEq"; }
+        BinOp::GtEq => { return "GtEq"; }
+        BinOp::And => { return "And"; }
+        BinOp::Or => { return "Or"; }
+        BinOp::BitAnd => { return "BitAnd"; }
+        BinOp::BitOr => { return "BitOr"; }
+        BinOp::BitXor => { return "BitXor"; }
+        BinOp::Shl => { return "Shl"; }
+        BinOp::Shr => { return "Shr"; }
+    }
+    return "";
+}
+
+pub fn unaryop_flat(op: UnaryOp) -> str {
+    match op {
+        UnaryOp::Neg => { return "Neg"; }
+        UnaryOp::Not => { return "Not"; }
+        UnaryOp::BitNot => { return "BitNot"; }
+    }
+    return "";
+}
+
+pub fn assignop_flat(op: AssignOp) -> str {
+    match op {
+        AssignOp::Assign => { return "Assign"; }
+        AssignOp::AddAssign => { return "AddAssign"; }
+        AssignOp::SubAssign => { return "SubAssign"; }
+        AssignOp::MulAssign => { return "MulAssign"; }
+        AssignOp::DivAssign => { return "DivAssign"; }
+        AssignOp::ModAssign => { return "ModAssign"; }
+        AssignOp::BitAndAssign => { return "BitAndAssign"; }
+        AssignOp::BitOrAssign => { return "BitOrAssign"; }
+        AssignOp::BitXorAssign => { return "BitXorAssign"; }
+        AssignOp::ShlAssign => { return "ShlAssign"; }
+        AssignOp::ShrAssign => { return "ShrAssign"; }
+    }
+    return "";
+}
+
+// ─── Pattern serialization ─────────────────────────────────────────────────
+
+pub fn pattern_flat(p: Pattern, depth: i64) -> str {
+    var ind: str = indent(depth);
+    match p {
+        Pattern::Wildcard => { return str_concat(ind, "Wildcard"); }
+        Pattern::IntLit(n) => { return ind + "IntLit " + int_to_str(n); }
+        Pattern::BoolLit(b) => { return ind + "BoolLit " + bool_str(b); }
+        Pattern::Ident(s) => { return ind + "Ident \"" + esc(s) + "\""; }
+        Pattern::StrLit(s) => { return ind + "StrLit \"" + esc(s) + "\""; }
+        Pattern::EnumVariant(enum_name, variant, bindings) => {
+            var s: str = ind + "EnumVariant \"" + esc(enum_name) + "\" \"" + esc(variant) + "\"\n";
+            var i: i64 = 0;
+            while i < bindings.len() {
+                var b: Binding = bindings.get(i);
+                s = s + indent(depth + 1) + "Binding \"" + esc(b.name) + "\" \"" + esc(b.ty) + "\"\n";
+                i = i + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Pattern::Range(start, end) => {
+            var s: str = ind + "Range\n";
+            s = s + pattern_flat(*start, depth + 1) + "\n";
+            s = s + pattern_flat(*end, depth + 1);
+            return s;
+        }
+    }
+    return "";
+}
+
+// ─── Expression serialization ──────────────────────────────────────────────
+
+pub fn expr_flat(e: Expr, depth: i64) -> str {
+    var ind: str = indent(depth);
+    match e {
+        Expr::IntLit(n) => { return ind + "IntLit " + int_to_str(n); }
+        Expr::FloatLit(f) => { return ind + "FloatLit " + float_to_str(f); }
+        Expr::StringLit(s) => { return ind + "StringLit \"" + esc(s) + "\""; }
+        Expr::BoolLit(b) => { return ind + "BoolLit " + bool_str(b); }
+        Expr::Ident(s) => { return ind + "Ident \"" + esc(s) + "\""; }
+        Expr::Binary(op, left, right) => {
+            var s: str = ind + "Binary " + binop_flat(op) + "\n";
+            s = s + expr_flat(*left, depth + 1) + "\n";
+            s = s + expr_flat(*right, depth + 1);
+            return s;
+        }
+        Expr::Unary(op, expr) => {
+            var s: str = ind + "Unary " + unaryop_flat(op) + "\n";
+            s = s + expr_flat(*expr, depth + 1);
+            return s;
+        }
+        Expr::Call(callee, args) => {
+            var s: str = ind + "Call \"" + esc(callee) + "\"\n";
+            var i: i64 = 0;
+            while i < args.len() {
+                s = s + expr_flat(args.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::FieldAccess(expr, field) => {
+            var s: str = ind + "FieldAccess \"" + esc(field) + "\"\n";
+            s = s + expr_flat(*expr, depth + 1);
+            return s;
+        }
+        Expr::OptionalFieldAccess(expr, field) => {
+            var s: str = ind + "OptionalFieldAccess \"" + esc(field) + "\"\n";
+            s = s + expr_flat(*expr, depth + 1);
+            return s;
+        }
+        Expr::StructLit(name, fields, spread) => {
+            var s: str = ind + "StructLit \"" + esc(name) + "\"\n";
+            var i: i64 = 0;
+            while i < fields.len() {
+                var fi: FieldInit = fields.get(i);
+                s = s + indent(depth + 1) + "FieldInit \"" + esc(fi.name) + "\"\n";
+                s = s + expr_flat(fi.value, depth + 2) + "\n";
+                i = i + 1;
+            }
+            match spread {
+                OptBoxExpr::Some(e) => {
+                    s = s + indent(depth + 1) + "Spread\n";
+                    s = s + expr_flat(*e, depth + 2) + "\n";
+                }
+                OptBoxExpr::None => {}
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::If(cond, then_block, else_block) => {
+            var s: str = ind + "If\n";
+            s = s + expr_flat(cond, depth + 1) + "\n";
+            s = s + indent(depth + 1) + "Then\n";
+            var i: i64 = 0;
+            while i < then_block.len() {
+                s = s + stmt_flat(then_block.get(i), depth + 2) + "\n";
+                i = i + 1;
+            }
+            match else_block {
+                OptStmts::Some(stmts) => {
+                    s = s + indent(depth + 1) + "Else\n";
+                    var j: i64 = 0;
+                    while j < stmts.len() {
+                        s = s + stmt_flat(stmts.get(j), depth + 2) + "\n";
+                        j = j + 1;
+                    }
+                }
+                OptStmts::None => {
+                    s = s + indent(depth + 1) + "ElseNone\n";
+                }
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::Range(start, end, inclusive) => {
+            var s: str = ind + "Range " + bool_str(inclusive) + "\n";
+            s = s + expr_flat(*start, depth + 1) + "\n";
+            s = s + expr_flat(*end, depth + 1);
+            return s;
+        }
+        Expr::Block(stmts) => {
+            var s: str = ind + "Block\n";
+            var i: i64 = 0;
+            while i < stmts.len() {
+                s = s + stmt_flat(stmts.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::MethodCall(receiver, method, args) => {
+            var s: str = ind + "MethodCall \"" + esc(method) + "\"\n";
+            s = s + expr_flat(*receiver, depth + 1) + "\n";
+            var i: i64 = 0;
+            while i < args.len() {
+                s = s + expr_flat(args.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::ArrayLit(elem_type, elements) => {
+            var s: str = ind + "ArrayLit\n";
+            s = s + type_flat(*elem_type, depth + 1) + "\n";
+            var i: i64 = 0;
+            while i < elements.len() {
+                s = s + expr_flat(elements.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::Index(array, index) => {
+            var s: str = ind + "Index\n";
+            s = s + expr_flat(*array, depth + 1) + "\n";
+            s = s + expr_flat(*index, depth + 1);
+            return s;
+        }
+        Expr::FString(parts) => {
+            var s: str = ind + "FString\n";
+            var i: i64 = 0;
+            while i < parts.len() {
+                var p: FStringPart = parts.get(i);
+                match p {
+                    FStringPart::Literal(lit) => {
+                        s = s + indent(depth + 1) + "Literal \"" + esc(lit) + "\"\n";
+                    }
+                    FStringPart::Expr(e) => {
+                        s = s + indent(depth + 1) + "ExprPart\n";
+                        s = s + expr_flat(e, depth + 2) + "\n";
+                    }
+                }
+                i = i + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::Match(expr, arms) => {
+            var s: str = ind + "Match\n";
+            s = s + expr_flat(*expr, depth + 1) + "\n";
+            var i: i64 = 0;
+            while i < arms.len() {
+                var arm: MatchArm = arms.get(i);
+                s = s + indent(depth + 1) + "MatchArm\n";
+                s = s + pattern_flat(arm.pattern, depth + 2) + "\n";
+                match arm.guard {
+                    OptBoxExpr::Some(g) => {
+                        s = s + indent(depth + 2) + "Guard\n";
+                        s = s + expr_flat(*g, depth + 3) + "\n";
+                    }
+                    OptBoxExpr::None => {
+                        s = s + indent(depth + 2) + "GuardNone\n";
+                    }
+                }
+                var j: i64 = 0;
+                while j < arm.body.len() {
+                    s = s + stmt_flat(arm.body.get(j), depth + 2) + "\n";
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::EnumLit(enum_name, variant, args) => {
+            var s: str = ind + "EnumLit \"" + esc(enum_name) + "\" \"" + esc(variant) + "\"\n";
+            var i: i64 = 0;
+            while i < args.len() {
+                s = s + expr_flat(args.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::Ref(expr, is_mut) => {
+            var s: str = ind + "Ref " + bool_str(is_mut) + "\n";
+            s = s + expr_flat(*expr, depth + 1);
+            return s;
+        }
+        Expr::Deref(expr) => {
+            var s: str = ind + "Deref\n";
+            s = s + expr_flat(*expr, depth + 1);
+            return s;
+        }
+        Expr::StrConcat(left, right) => {
+            var s: str = ind + "StrConcat\n";
+            s = s + expr_flat(*left, depth + 1) + "\n";
+            s = s + expr_flat(*right, depth + 1);
+            return s;
+        }
+        Expr::Try(expr) => {
+            var s: str = ind + "Try\n";
+            s = s + expr_flat(*expr, depth + 1);
+            return s;
+        }
+        Expr::Coalesce(expr, default) => {
+            var s: str = ind + "Coalesce\n";
+            s = s + expr_flat(*expr, depth + 1) + "\n";
+            s = s + expr_flat(*default, depth + 1);
+            return s;
+        }
+        Expr::IsCheck(expr, type_name) => {
+            var s: str = ind + "IsCheck \"" + esc(type_name) + "\"\n";
+            s = s + expr_flat(*expr, depth + 1);
+            return s;
+        }
+        Expr::TryBlock(body) => {
+            var s: str = ind + "TryBlock\n";
+            var i: i64 = 0;
+            while i < body.len() {
+                s = s + stmt_flat(body.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::TupleLit(exprs) => {
+            var s: str = ind + "TupleLit\n";
+            var i: i64 = 0;
+            while i < exprs.len() {
+                s = s + expr_flat(exprs.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::Closure(params, body, ret_ty) => {
+            var s: str = ind + "Closure\n";
+            var i: i64 = 0;
+            while i < params.len() {
+                s = s + param_flat(params.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            match ret_ty {
+                OptType::Some(t) => {
+                    s = s + indent(depth + 1) + "RetTy\n";
+                    s = s + type_flat(t, depth + 2) + "\n";
+                }
+                OptType::None => {
+                    s = s + indent(depth + 1) + "RetTyNone\n";
+                }
+            }
+            var j: i64 = 0;
+            while j < body.len() {
+                s = s + stmt_flat(body.get(j), depth + 1) + "\n";
+                j = j + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::Cast(expr, target_ty) => {
+            var s: str = ind + "Cast\n";
+            s = s + expr_flat(*expr, depth + 1) + "\n";
+            s = s + type_flat(target_ty, depth + 1);
+            return s;
+        }
+        Expr::Asm(template, operands) => {
+            var s: str = ind + "Asm \"" + esc(template) + "\"\n";
+            var i: i64 = 0;
+            while i < operands.len() {
+                var op: AsmOperand = operands.get(i);
+                var dir: str = "";
+                match op.direction {
+                    AsmDir::In => { dir = "In"; }
+                    AsmDir::Out => { dir = "Out"; }
+                }
+                s = s + indent(depth + 1) + "AsmOperand " + dir + " \"" + esc(op.reg) + "\"\n";
+                s = s + expr_flat(op.expr, depth + 2) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::Comptime(inner) => {
+            var s: str = ind + "Comptime\n";
+            s = s + expr_flat(*inner, depth + 1);
+            return s;
+        }
+        Expr::ComptimeBlock(stmts) => {
+            var s: str = ind + "ComptimeBlock\n";
+            var i: i64 = 0;
+            while i < stmts.len() {
+                s = s + stmt_flat(stmts.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(s, "\n") {
+                s = str_slice(s, 0, str_len(s) - 1);
+            }
+            return s;
+        }
+        Expr::ComptimeReflect(op, ty) => {
+            var op_str: str = "";
+            match op {
+                ReflectOp::TypeName => { op_str = "TypeName"; }
+                ReflectOp::IsStruct => { op_str = "IsStruct"; }
+                ReflectOp::IsEnum => { op_str = "IsEnum"; }
+                ReflectOp::FieldCount => { op_str = "FieldCount"; }
+                ReflectOp::FieldNames => { op_str = "FieldNames"; }
+                ReflectOp::FieldTypes => { op_str = "FieldTypes"; }
+                ReflectOp::EnumVariants => { op_str = "EnumVariants"; }
+            }
+            var s: str = ind + "ComptimeReflect " + op_str + "\n";
+            s = s + type_flat(ty, depth + 1);
+            return s;
+        }
+        Expr::PipeForward(left, right) => {
+            var s: str = ind + "PipeForward\n";
+            s = s + expr_flat(*left, depth + 1) + "\n";
+            s = s + expr_flat(*right, depth + 1);
+            return s;
+        }
+        Expr::QuantCast(expr, target_ty) => {
+            var s: str = ind + "QuantCast\n";
+            s = s + expr_flat(*expr, depth + 1) + "\n";
+            s = s + type_flat(target_ty, depth + 1);
+            return s;
+        }
+        Expr::Await(expr) => {
+            var s: str = ind + "Await\n";
+            s = s + expr_flat(*expr, depth + 1);
+            return s;
+        }
+        Expr::Spawn(expr) => {
+            var s: str = ind + "Spawn\n";
+            s = s + expr_flat(*expr, depth + 1);
+            return s;
+        }
+    }
+    return "";
+}
+
+// ─── Statement serialization ───────────────────────────────────────────────
+
+pub fn stmt_flat(s: Stmt, depth: i64) -> str {
+    var ind: str = indent(depth);
+    match s {
+        Stmt::Let(name, ty, expr, is_mut, is_persist, line) => {
+            var out: str = ind + "Let \"" + esc(name) + "\" " + bool_str(is_mut) + " " + bool_str(is_persist) + " " + int_to_str(line) + "\n";
+            match ty {
+                OptType::Some(t) => {
+                    out = out + type_flat(t, depth + 1);
+                }
+                OptType::None => {
+                    out = out + indent(depth + 1) + "None";
+                }
+            }
+            out = out + "\n";
+            out = out + expr_flat(expr, depth + 1);
+            return out;
+        }
+        Stmt::LetTuple(names, expr, line) => {
+            var out: str = ind + "LetTuple " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < names.len() {
+                out = out + indent(depth + 1) + "\"" + esc(names.get(i)) + "\"\n";
+                i = i + 1;
+            }
+            out = out + expr_flat(expr, depth + 1);
+            return out;
+        }
+        Stmt::LetUninit(name, ty, line) => {
+            var out: str = ind + "LetUninit \"" + esc(name) + "\" " + int_to_str(line) + "\n";
+            out = out + type_flat(ty, depth + 1);
+            return out;
+        }
+        Stmt::Assign(target, op, expr, line) => {
+            var out: str = ind + "Assign \"" + esc(target) + "\" " + assignop_flat(op) + " " + int_to_str(line) + "\n";
+            out = out + expr_flat(expr, depth + 1);
+            return out;
+        }
+        Stmt::IndexAssign(array, index, op, expr, line) => {
+            var out: str = ind + "IndexAssign \"" + esc(array) + "\" " + assignop_flat(op) + " " + int_to_str(line) + "\n";
+            out = out + expr_flat(index, depth + 1) + "\n";
+            out = out + expr_flat(expr, depth + 1);
+            return out;
+        }
+        Stmt::DerefAssign(ptr_expr, op, expr, line) => {
+            var out: str = ind + "DerefAssign " + assignop_flat(op) + " " + int_to_str(line) + "\n";
+            out = out + expr_flat(ptr_expr, depth + 1) + "\n";
+            out = out + expr_flat(expr, depth + 1);
+            return out;
+        }
+        Stmt::FieldAssign(object, field, op, expr, line) => {
+            var out: str = ind + "FieldAssign \"" + esc(field) + "\" " + assignop_flat(op) + " " + int_to_str(line) + "\n";
+            out = out + expr_flat(object, depth + 1) + "\n";
+            out = out + expr_flat(expr, depth + 1);
+            return out;
+        }
+        Stmt::Expr(expr, line) => {
+            var out: str = ind + "Expr " + int_to_str(line) + "\n";
+            out = out + expr_flat(expr, depth + 1);
+            return out;
+        }
+        Stmt::Return(expr, line) => {
+            var out: str = ind + "Return " + int_to_str(line) + "\n";
+            match expr {
+                OptBoxExpr::Some(e) => {
+                    out = out + expr_flat(*e, depth + 1);
+                }
+                OptBoxExpr::None => {
+                    out = out + indent(depth + 1) + "None";
+                }
+            }
+            return out;
+        }
+        Stmt::If(cond, then_block, else_block, line) => {
+            var out: str = ind + "If " + int_to_str(line) + "\n";
+            out = out + expr_flat(cond, depth + 1) + "\n";
+            out = out + indent(depth + 1) + "Then\n";
+            var i: i64 = 0;
+            while i < then_block.len() {
+                out = out + stmt_flat(then_block.get(i), depth + 2) + "\n";
+                i = i + 1;
+            }
+            match else_block {
+                OptStmts::Some(stmts) => {
+                    out = out + indent(depth + 1) + "Else\n";
+                    var j: i64 = 0;
+                    while j < stmts.len() {
+                        out = out + stmt_flat(stmts.get(j), depth + 2) + "\n";
+                        j = j + 1;
+                    }
+                }
+                OptStmts::None => {
+                    out = out + indent(depth + 1) + "ElseNone\n";
+                }
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::While(cond, body, line) => {
+            var out: str = ind + "While " + int_to_str(line) + "\n";
+            out = out + expr_flat(cond, depth + 1) + "\n";
+            var i: i64 = 0;
+            while i < body.len() {
+                out = out + stmt_flat(body.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::For(var_name, iterator, body, line) => {
+            var out: str = ind + "For \"" + esc(var_name) + "\" " + int_to_str(line) + "\n";
+            out = out + expr_flat(iterator, depth + 1) + "\n";
+            var i: i64 = 0;
+            while i < body.len() {
+                out = out + stmt_flat(body.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Loop(body, line) => {
+            var out: str = ind + "Loop " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < body.len() {
+                out = out + stmt_flat(body.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Break(expr, line) => {
+            var out: str = ind + "Break " + int_to_str(line) + "\n";
+            match expr {
+                OptBoxExpr::Some(e) => {
+                    out = out + expr_flat(*e, depth + 1);
+                }
+                OptBoxExpr::None => {
+                    out = out + indent(depth + 1) + "None";
+                }
+            }
+            return out;
+        }
+        Stmt::Continue(line) => {
+            return ind + "Continue " + int_to_str(line);
+        }
+        Stmt::Defer(body, line) => {
+            var out: str = ind + "Defer " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < body.len() {
+                out = out + stmt_flat(body.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Match(expr, arms, line) => {
+            var out: str = ind + "Match " + int_to_str(line) + "\n";
+            out = out + expr_flat(expr, depth + 1) + "\n";
+            var i: i64 = 0;
+            while i < arms.len() {
+                var arm: MatchArm = arms.get(i);
+                out = out + indent(depth + 1) + "MatchArm\n";
+                out = out + pattern_flat(arm.pattern, depth + 2) + "\n";
+                match arm.guard {
+                    OptBoxExpr::Some(g) => {
+                        out = out + indent(depth + 2) + "Guard\n";
+                        out = out + expr_flat(*g, depth + 3) + "\n";
+                    }
+                    OptBoxExpr::None => {
+                        out = out + indent(depth + 2) + "GuardNone\n";
+                    }
+                }
+                var j: i64 = 0;
+                while j < arm.body.len() {
+                    out = out + stmt_flat(arm.body.get(j), depth + 2) + "\n";
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Use(path, items, line) => {
+            var out: str = ind + "Use \"" + esc(path) + "\" " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < items.len() {
+                out = out + indent(depth + 1) + "\"" + esc(items.get(i)) + "\"\n";
+                i = i + 1;
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Handle(body, handlers, line) => {
+            var out: str = ind + "Handle " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < body.len() {
+                out = out + stmt_flat(body.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            var j: i64 = 0;
+            while j < handlers.len() {
+                var h: EffectHandler = handlers.get(j);
+                out = out + indent(depth + 1) + "EffectHandler \"" + esc(h.effect) + "\" \"" + esc(h.op) + "\"\n";
+                var k: i64 = 0;
+                while k < h.params.len() {
+                    out = out + indent(depth + 2) + "\"" + esc(h.params.get(k)) + "\"\n";
+                    k = k + 1;
+                }
+                var m: i64 = 0;
+                while m < h.body.len() {
+                    out = out + stmt_flat(h.body.get(m), depth + 2) + "\n";
+                    m = m + 1;
+                }
+                j = j + 1;
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Do(effect, op, args, line) => {
+            var out: str = ind + "Do \"" + esc(effect) + "\" \"" + esc(op) + "\" " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < args.len() {
+                out = out + expr_flat(args.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::RegionBlock(name, budget, is_gpu, is_kv_cache, window_size, body, line) => {
+            var budget_str: str = "None";
+            match budget {
+                OptI64::Some(n) => { budget_str = int_to_str(n); }
+                OptI64::None => {}
+            }
+            var ws_str: str = "None";
+            match window_size {
+                OptI64::Some(n) => { ws_str = int_to_str(n); }
+                OptI64::None => {}
+            }
+            var out: str = ind + "RegionBlock \"" + esc(name) + "\" " + budget_str + " " + bool_str(is_gpu) + " " + bool_str(is_kv_cache) + " " + ws_str + " " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < body.len() {
+                out = out + stmt_flat(body.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Sandbox(body, line) => {
+            var out: str = ind + "Sandbox " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < body.len() {
+                out = out + stmt_flat(body.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Unsafe(body, line) => {
+            var out: str = ind + "Unsafe " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < body.len() {
+                out = out + stmt_flat(body.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Txn(body, line) => {
+            var out: str = ind + "Txn " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < body.len() {
+                out = out + stmt_flat(body.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::ComptimeGen(block, line) => {
+            var out: str = ind + "ComptimeGen " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < block.len() {
+                out = out + stmt_flat(block.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::GradBlock(var_name, body, line) => {
+            var out: str = ind + "GradBlock \"" + esc(var_name) + "\" " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < body.len() {
+                out = out + stmt_flat(body.get(i), depth + 1) + "\n";
+                i = i + 1;
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Backward(loss, line) => {
+            var out: str = ind + "Backward " + int_to_str(line) + "\n";
+            out = out + expr_flat(loss, depth + 1);
+            return out;
+        }
+        Stmt::Query(components, body, line) => {
+            var out: str = ind + "Query " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < components.len() {
+                out = out + indent(depth + 1) + "\"" + esc(components.get(i)) + "\"\n";
+                i = i + 1;
+            }
+            var j: i64 = 0;
+            while j < body.len() {
+                out = out + stmt_flat(body.get(j), depth + 1) + "\n";
+                j = j + 1;
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+        Stmt::Select(cases, default, line) => {
+            var out: str = ind + "Select " + int_to_str(line) + "\n";
+            var i: i64 = 0;
+            while i < cases.len() {
+                var c: SelectCase = cases.get(i);
+                out = out + indent(depth + 1) + "SelectCase \"" + esc(c.var_name) + "\"\n";
+                out = out + expr_flat(c.channel, depth + 2) + "\n";
+                var j: i64 = 0;
+                while j < c.body.len() {
+                    out = out + stmt_flat(c.body.get(j), depth + 2) + "\n";
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+            match default {
+                OptStmts::Some(stmts) => {
+                    out = out + indent(depth + 1) + "Default\n";
+                    var k: i64 = 0;
+                    while k < stmts.len() {
+                        out = out + stmt_flat(stmts.get(k), depth + 2) + "\n";
+                        k = k + 1;
+                    }
+                }
+                OptStmts::None => {
+                    out = out + indent(depth + 1) + "DefaultNone\n";
+                }
+            }
+            if str_ends_with(out, "\n") {
+                out = str_slice(out, 0, str_len(out) - 1);
+            }
+            return out;
+        }
+    }
+    return "";
+}
+
+// ─── Param / Annotation / Func serialization ───────────────────────────────
+
+pub fn param_flat(p: Param, depth: i64) -> str {
+    var ind: str = indent(depth);
+    var s: str = ind + "Param \"" + esc(p.name) + "\" " + bool_str(p.is_pub) + " " + int_to_str(p.annotations.len()) + "\n";
+    s = s + type_flat(p.ty, depth + 1);
+    return s;
+}
+
+pub fn annotation_flat(a: Annotation, depth: i64) -> str {
+    var ind: str = indent(depth);
+    var s: str = ind + "Annotation \"" + esc(a.name) + "\"\n";
+    var i: i64 = 0;
+    while i < a.args.len() {
+        s = s + indent(depth + 1) + "\"" + esc(a.args.get(i)) + "\"\n";
+        i = i + 1;
+    }
+    if str_ends_with(s, "\n") {
+        s = str_slice(s, 0, str_len(s) - 1);
+    }
+    return s;
+}
+
+pub fn func_flat(f: Func, depth: i64) -> str {
+    var ind: str = indent(depth);
+    var s: str = ind + "Func \"" + esc(f.name) + "\" " + bool_str(f.is_pub) + " " + bool_str(f.is_comptime) + " " + bool_str(f.is_async) + " " + bool_str(f.is_interrupt) + " " + bool_str(f.has_effect_annotation) + "\n";
+    s = s + indent(depth + 1) + "TypeParams " + int_to_str(f.type_params.len()) + "\n";
+    var i: i64 = 0;
+    while i < f.type_params.len() {
+        s = s + indent(depth + 2) + "\"" + esc(f.type_params.get(i)) + "\"\n";
+        i = i + 1;
+    }
+    var j: i64 = 0;
+    while j < f.params.len() {
+        s = s + param_flat(f.params.get(j), depth + 1) + "\n";
+        j = j + 1;
+    }
+    s = s + type_flat(f.ret_ty, depth + 1) + "\n";
+    var k: i64 = 0;
+    while k < f.body.len() {
+        s = s + stmt_flat(f.body.get(k), depth + 1) + "\n";
+        k = k + 1;
+    }
+    if str_ends_with(s, "\n") {
+        s = str_slice(s, 0, str_len(s) - 1);
+    }
+    return s;
+}
+
+// ─── Program serialization (main entry point) ──────────────────────────────
+
+pub fn program_flat(p: Program) -> str {
+    var s: str = "Program\n";
+    match p.module {
+        OptStr::Some(m) => {
+            s = s + "  Module \"" + esc(m) + "\"\n";
+        }
+        OptStr::None => {
+            s = s + "  ModuleNone\n";
+        }
+    }
+    var i: i64 = 0;
+    while i < p.funcs.len() {
+        s = s + func_flat(p.funcs.get(i), 1) + "\n";
+        i = i + 1;
+    }
+    var j: i64 = 0;
+    while j < p.structs.len() {
+        var st: StructDef = p.structs.get(j);
+        s = s + "  Struct \"" + esc(st.name) + "\" " + bool_str(st.is_pub) + " " + int_to_str(st.fields.len()) + "\n";
+        var k: i64 = 0;
+        while k < st.fields.len() {
+            s = s + param_flat(st.fields.get(k), 2) + "\n";
+            k = k + 1;
+        }
+        if str_ends_with(s, "\n") {
+            s = str_slice(s, 0, str_len(s) - 1);
+        }
+        s = s + "\n";
+        j = j + 1;
+    }
+    var e: i64 = 0;
+    while e < p.enums.len() {
+        var ed: EnumDef = p.enums.get(e);
+        s = s + "  Enum \"" + esc(ed.name) + "\" " + bool_str(ed.is_pub) + " " + int_to_str(ed.variants.len()) + "\n";
+        var v: i64 = 0;
+        while v < ed.variants.len() {
+            var var: EnumVariant = ed.variants.get(v);
+            match var.data {
+                OptParams::Some(params) => {
+                    s = s + "    Variant \"" + esc(var.name) + "\" " + int_to_str(params.len()) + "\n";
+                    var w: i64 = 0;
+                    while w < params.len() {
+                        s = s + param_flat(params.get(w), 3) + "\n";
+                        w = w + 1;
+                    }
+                    if str_ends_with(s, "\n") {
+                        s = str_slice(s, 0, str_len(s) - 1);
+                    }
+                }
+                OptParams::None => {
+                    s = s + "    Variant \"" + esc(var.name) + "\"\n";
+                }
+            }
+            v = v + 1;
+        }
+        s = s + "\n";
+        e = e + 1;
+    }
+    var c: i64 = 0;
+    while c < p.consts.len() {
+        var cd: ConstDef = p.consts.get(c);
+        s = s + "  Const \"" + esc(cd.name) + "\" " + bool_str(cd.is_pub) + "\n";
+        s = s + type_flat(cd.ty, 2) + "\n";
+        s = s + expr_flat(cd.expr, 2) + "\n";
+        c = c + 1;
+    }
+    var ta: i64 = 0;
+    while ta < p.type_aliases.len() {
+        var tad: TypeAlias = p.type_aliases.get(ta);
+        s = s + "  TypeAlias \"" + esc(tad.name) + "\" " + bool_str(tad.is_pub) + "\n";
+        s = s + type_flat(tad.alias_for, 2) + "\n";
+        ta = ta + 1;
+    }
+    var im: i64 = 0;
+    while im < p.impls.len() {
+        var imd: ImplDef = p.impls.get(im);
+        s = s + "  Impl \"" + esc(imd.struct_name) + "\" " + int_to_str(imd.methods.len()) + "\n";
+        var m: i64 = 0;
+        while m < imd.methods.len() {
+            s = s + func_flat(imd.methods.get(m), 2) + "\n";
+            m = m + 1;
+        }
+        if str_ends_with(s, "\n") {
+            s = str_slice(s, 0, str_len(s) - 1);
+        }
+        s = s + "\n";
+        im = im + 1;
+    }
+    var imp: i64 = 0;
+    while imp < p.imports.len() {
+        var id: ImportDef = p.imports.get(imp);
+        var has_version: str = "false";
+        match id.version {
+            OptStr::Some(_) => { has_version = "true"; }
+            OptStr::None => {}
+        }
+        s = s + "  Import \"" + esc(id.path) + "\" " + bool_str(id.is_pub) + " " + bool_str(id.is_glob) + " " + int_to_str(id.items.len()) + " " + int_to_str(id.capabilities.len()) + " " + has_version + "\n";
+        var item: i64 = 0;
+        while item < id.items.len() {
+            s = s + "    \"" + esc(id.items.get(item)) + "\"\n";
+            item = item + 1;
+        }
+        imp = imp + 1;
+    }
+    var attr: i64 = 0;
+    while attr < p.attributes.len() {
+        var ad: Attribute = p.attributes.get(attr);
+        s = s + "  Attribute \"" + esc(ad.name) + "\"\n";
+        var arg: i64 = 0;
+        while arg < ad.args.len() {
+            s = s + "    \"" + esc(ad.args.get(arg)) + "\"\n";
+            arg = arg + 1;
+        }
+        attr = attr + 1;
+    }
+    var tr: i64 = 0;
+    while tr < p.traits.len() {
+        var td: TraitDef = p.traits.get(tr);
+        s = s + "  Trait \"" + esc(td.name) + "\" " + bool_str(td.is_pub) + "\n";
+        var tm: i64 = 0;
+        while tm < td.methods.len() {
+            var tmd: TraitMethod = td.methods.get(tm);
+            s = s + "    TraitMethod \"" + esc(tmd.name) + "\" " + bool_str(tmd.has_self) + " " + bool_str(tmd.is_pub) + "\n";
+            var tp: i64 = 0;
+            while tp < tmd.params.len() {
+                s = s + param_flat(tmd.params.get(tp), 3) + "\n";
+                tp = tp + 1;
+            }
+            s = s + type_flat(tmd.ret_ty, 3) + "\n";
+            tm = tm + 1;
+        }
+        tr = tr + 1;
+    }
+    var ti: i64 = 0;
+    while ti < p.trait_impls.len() {
+        var tid: TraitImpl = p.trait_impls.get(ti);
+        s = s + "  TraitImpl \"" + esc(tid.trait_name) + "\" \"" + esc(tid.type_name) + "\" " + int_to_str(tid.methods.len()) + "\n";
+        var tm: i64 = 0;
+        while tm < tid.methods.len() {
+            s = s + func_flat(tid.methods.get(tm), 2) + "\n";
+            tm = tm + 1;
+        }
+        if str_ends_with(s, "\n") {
+            s = str_slice(s, 0, str_len(s) - 1);
+        }
+        s = s + "\n";
+        ti = ti + 1;
+    }
+    var ed: i64 = 0;
+    while ed < p.extern_decls.len() {
+        var edd: ExternDecl = p.extern_decls.get(ed);
+        s = s + "  Extern \"" + esc(edd.abi) + "\" \"" + esc(edd.c_name) + "\" \"" + esc(edd.pledge_name) + "\"\n";
+        var ep: i64 = 0;
+        while ep < edd.params.len() {
+            s = s + param_flat(edd.params.get(ep), 2) + "\n";
+            ep = ep + 1;
+        }
+        s = s + type_flat(edd.ret_ty, 2) + "\n";
+        ed = ed + 1;
+    }
+    s = s + "  Layers " + int_to_str(p.layers.len()) + "\n";
+    s = s + "  Models " + int_to_str(p.models.len()) + "\n";
+    s = s + "  Components " + int_to_str(p.components.len()) + "\n";
+    s = s + "  Systems " + int_to_str(p.systems.len()) + "\n";
+    s = s + "  StateMachines " + int_to_str(p.state_machines.len()) + "\n";
+    s = s + "  EventHandlers " + int_to_str(p.event_handlers.len()) + "\n";
+    if str_ends_with(s, "\n") {
+        s = str_slice(s, 0, str_len(s) - 1);
+    }
+    return s;
+}

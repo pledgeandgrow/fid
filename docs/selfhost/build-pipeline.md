@@ -23,15 +23,18 @@ cargo build
 ### Step 2: Compile the self-hosted compiler to C
 
 ```bash
-.\target\release\fidesc.exe ccompile compiler\main.fd -o release\fides-c
+.\target\release\fidesc.exe ccompile compiler\main.fd -o release\fides-c.exe
 ```
 
-Produces `release/fides-c.c`.
+Produces `release/fides-c.c` (the `.exe` suffix is replaced with `.c` for
+the C source path, matching the bootstrap compiler behavior). Both the
+bootstrap compiler (`fidesc.exe`) and the self-hosted compiler (`fides-c.exe`)
+now auto-append `.exe` to output names (session 8).
 
 ### Step 3: Compile the C to an executable with tcc
 
 ```bash
-tcc -O2 -w -o release\fides-c.exe release\fides-c.c C:\tcc\lib\ws2_32.def
+tcc -O2 -w -o release\fides-c.exe release\fides-c.c -lws2_32
 ```
 
 **Why tcc?** It is fast, produces small binaries, and is what the bootstrap
@@ -39,8 +42,8 @@ pipeline currently targets. The Fides compiler can also target gcc/clang
 when using the Rust host (`fidesc build`), but the self-hosted `main.fd`
 currently hard-codes tcc.
 
-**Why `ws2_32.def`?** The runtime uses Windows sockets for some networking
-primitives. Linking `ws2_32.def` satisfies those imports.
+**Why `-lws2_32`?** The runtime uses Windows sockets for some networking
+primitives. Linking `ws2_32` satisfies those imports.
 
 ### Step 4: Patch the PE stack to 256 MB
 
@@ -67,6 +70,51 @@ $c = Get-Content build-selfhost.ps1 -Raw; Invoke-Expression $c
 
 **Note:** `build-selfhost.ps1` was previously missing but has been recreated.
 It performs all four steps in order.
+
+---
+
+## 1b. PE Emitter Pipeline (NEW — session 5)
+
+The self-hosted compiler now has a `build` command that generates native
+Windows PE executables **directly from `.fd` source** — no tcc, no gcc, no
+external linker. This uses the PE emitter ported in session 5
+(`compiler/pe.fd`).
+
+### Build a PE executable
+
+```bash
+.\release\fides-c.exe build tests\hello_pe.fd -o release\hello_pe.exe
+.\release\hello_pe.exe
+# → Hello from PE!
+```
+
+### How it works
+
+1. The `build` command in `main.fd` compiles the `.fd` source through the
+   normal pipeline (lex, parse, typecheck, lower, mono).
+2. Instead of generating C and invoking tcc, it calls `PeCodeGen` from
+   `compiler/pe.fd` to generate x86-64 machine code + PE file format.
+3. The PE bytes are hex-encoded (because `p_file_write` truncates at null
+   bytes) and written to a `.hex` file.
+4. PowerShell decodes the hex file to binary and writes the `.exe`.
+
+### Current limitations
+
+The PE emitter currently supports:
+- ✅ PE header generation, import table (GetStdHandle, WriteFile, ExitProcess)
+- ✅ Entry point → main, function prologues/epilogues, stack frames
+- ✅ `p_print_str`, `p_print_int`, `p_print_float`, `p_print_bool`, `p_panic`
+- ✅ String literals (.rdata section)
+- ✅ Basic arithmetic, local variables, control flow
+
+The PE emitter does NOT yet support:
+- ⏳ Full struct/enum support (memcpy, SRET)
+- ⏳ Vec/HashMap runtime
+- ⏳ Float arithmetic operations
+- ⏳ Many-arg function calls (>4 args)
+- ⏳ Full compiler source compilation
+
+See SH-13 sub-tasks in `docs/roadmap/selfhost-roadmap.md` for the full list.
 
 ---
 
@@ -101,11 +149,22 @@ the Rust compiler's C output, the fixpoint will diverge.
 
 ### Current status
 
-Not yet achieved. The current blocker is the enum variant extraction bug
-(see `calling-conventions.md`). Once fixed, the fixpoint can be run with:
+**Self-compilation works (session 4).** `fides-c.exe` successfully compiles
+`compiler/main.fd` → `fides-c2.exe`. **PE emitter works (session 5).**
+`fides-c.exe build tests\hello_pe.fd` → working `.exe` without tcc.
+**Linux native codegen ported (session 8)** — `peephole.fd`, `regalloc.fd`,
+`codegen_x64.fd` build OK but are not yet integrated. **`.exe` extension
+auto-appended (session 8)** — no more manual `Copy-Item` needed.
+
+The fixpoint is not yet verified — fides-c2.exe crashes on stdlib due to the
+statement-dropping bug (root cause confirmed session 8). Once that's fixed:
 
 ```bash
-.\verify-fixpoint.ps1
+# fides-c2 (self-compiled) compiles the compiler → fides-c3
+.\release\fides-c2.exe ccompile compiler\main.fd -o release\fides-c3.exe
+# Compare
+diff release\fides-c2.exe.c release\fides-c3.exe.c
+# Must be identical
 ```
 
 ---
@@ -258,7 +317,7 @@ Probe tests for self-hosting behavior:
 ```
 p-lang/
 ├── compiler/           # Self-hosted Fides compiler modules (*.fd)
-│   ├── main.fd         # CLI entry point
+│   ├── main.fd         # CLI entry point (ccompile + build commands)
 │   ├── compiler.fd     # Pipeline driver
 │   ├── token.fd
 │   ├── lexer.fd
@@ -272,10 +331,14 @@ p-lang/
 │   ├── mono.fd
 │   ├── borrowck.fd
 │   ├── codegen_c.fd
+│   ├── pe.fd           # PE emitter — native x86-64 + PE file writer (session 5, stubs session 7)
+│   ├── peephole.fd     # Peephole optimizer — 9 passes (session 8, not yet integrated)
+│   ├── regalloc.fd     # Linear scan register allocator (session 8, not yet integrated)
+│   ├── codegen_x64.fd  # PIR L3 → x86-64 AT&T asm, Linux (session 8, not yet integrated)
 │   ├── fmt.fd
 │   ├── diag.fd
 │   ├── json.fd
-│   └── comptime_eval.fd
+│   └── comptime_eval.fd  # Comptime eval — full port (session 7)
 ├── docs/selfhost/      # This documentation
 ├── release/            # Self-hosted build artifacts (ignored by git, except .gitkeep)
 ├── src/                # Rust reference compiler

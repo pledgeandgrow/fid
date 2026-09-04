@@ -878,4 +878,9 @@ Run all tests: `cargo test --test harness`
 ## Roadmap
 
 See `docs/roadmap/roadmap.md` for the full phase status and milestones.
-See `docs/roadmap/selfhost-roadmap.md` for the 10-phase self-hosting plan.
+See `docs/roadmap/selfhost-roadmap.md` for the self-hosting plan.
+
+**Self-hosting status (session 7):** All 18 modules rewritten in Fides (39.5K LOC).
+Self-compilation works (EXIT 0). PE emitter ported with 25+ runtime stubs.
+Comptime evaluation fully ported (process_gen, substitute, I-5A, I-5D, reflection).
+Fixpoint verification is blocked by a pre-existing crash in the second-generation binary.

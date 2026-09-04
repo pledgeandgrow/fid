@@ -796,6 +796,12 @@ fn CCodeGen_insert_runtime_sigs(self: &mut CCodeGen) -> void {
     fn_param_types_set(self, "p_file_append", t2(ptr_u8(), ptr_u8()));
     fn_param_types_set(self, "p_file_delete", t1(ptr_u8()));
     fn_param_types_set(self, "p_file_size", t1(ptr_u8()));
+    fn_param_types_set(self, "p_read_line", t0());
+    fn_param_types_set(self, "p_read_stdin", t1(IrType::I64));
+    fn_param_types_set(self, "p_clock_now", t0());
+    fn_param_types_set(self, "p_clock_now_us", t0());
+    fn_param_types_set(self, "p_clock_now_ms", t0());
+    fn_param_types_set(self, "p_intern_str", t1(ptr_u8()));
 
     // Varargs (fixed prefix only)
     fn_param_types_set(self, "p_thread_spawn", t2(ptr_u8(), IrType::I64));
@@ -1407,9 +1413,12 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "void p_free(void* ptr);");
     wln(self, "char* p_file_read(const char* path);");
     wln(self, "int64_t p_file_write(const char* path, const char* content);");
+    wln(self, "int64_t p_file_write_vec(const char* path, PVec* v);");
     wln(self, "bool p_file_exists(const char* path);");
     wln(self, "int64_t p_file_append(const char* path, const char* content);");
     wln(self, "int64_t p_file_delete(const char* path);");
+    wln(self, "char* p_read_line(void);");
+    wln(self, "char* p_read_stdin(int64_t n);");
     wln(self, "int64_t p_file_size(const char* path);");
     wln(self, "char* p_getenv(const char* name);");
     wln(self, "static int __p_argc = 0;");
@@ -1422,6 +1431,7 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_clock_now_us(void);");
     wln(self, "int64_t p_clock_now_ms(void);");
     wln(self, "bool p_regex_match(const char* s, const char* pattern);");
+    wln(self, "const char* p_intern_str(const char* s);");
     wln(self, "int64_t p_future_ready(int64_t value);");
     wln(self, "int64_t p_future_poll(int64_t future);");
     wln(self, "int64_t p_thread_spawn(const char* func_name, int64_t num_args, ...);");
@@ -1980,7 +1990,25 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
             wln(self, "    " + dst + " = " + uop + o + ";");
         }
         Inst::Alloca(ty, _) => {
-            var size: i64 = ir_type_size(ty);
+            // For struct types, look up the actual size from struct_layouts.
+            // ir_type_size() returns 0 for structs because it doesn't have
+            // access to the module. Without this lookup, alloca only
+            // allocates 8 bytes (the fallback), causing buffer overflows
+            // when memcpy copies the full struct data.
+            var size: i64 = 0;
+            match ty {
+                IrType::Struct(sname) => {
+                    var si: i64 = 0;
+                    while si < self.struct_layouts.len() {
+                        if self.struct_layouts.get(si).name == sname {
+                            size = self.struct_layouts.get(si).layout.size;
+                            break;
+                        }
+                        si = si + 1;
+                    }
+                }
+                _ => { size = ir_type_size(ty); }
+            }
             if size == 0 { size = 8; }
             // Use alloca() for stack allocation instead of calloc() for heap.
             // This is dramatically faster — no syscall, no malloc overhead.
@@ -2620,6 +2648,7 @@ pub fn CCodeGen_generate(self: &mut CCodeGen, module: IrModule) -> str {
 
     emit_main_wrapper(self, module);
     emit_runtime_impl(self);
+    emit_file_write_bin_impl(self);
     // Convert the string builder to the final output string
     self.out = p_sb_to_str(self.sb);
     return self.out;
@@ -2635,7 +2664,20 @@ fn extract_param_types(params: Vec<ValueIdType>) -> Vec<IrType> {
     return v;
 }
 
+fn emit_file_write_bin_impl(self: &mut CCodeGen) -> void {
+    wln(self, "int64_t p_file_write_vec(const char* path, PVec* v) {");
+    wln(self, "    FILE* f = fopen(path, \"wb\");");
+    wln(self, "    if (!f) return -1;");
+    wln(self, "    for (int64_t i = 0; i < v->len; i++) {");
+    wln(self, "        unsigned char b = (unsigned char)(int64_t)v->data[i];");
+    wln(self, "        fwrite(&b, 1, 1, f);");
+    wln(self, "    }");
+    wln(self, "    fclose(f); return 0;");
+    wln(self, "}");
+}
+
 fn emit_runtime_impl(self: &mut CCodeGen) -> void {
+    // Rest of runtime implementation
     wln(self, "");
     wln(self, "// ─── Runtime implementation ───");
     wln(self, "");
@@ -2936,6 +2978,11 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    if (!f) return -1;");
     wln(self, "    fputs(content, f); fclose(f); return 0;");
     wln(self, "}");
+    wln(self, "int64_t p_file_write_bin(const char* path, const char* data, int64_t len) {");
+    wln(self, "    FILE* f = fopen(path, \"wb\");");
+    wln(self, "    if (!f) return -1;");
+    wln(self, "    fwrite(data, 1, (size_t)len, f); fclose(f); return 0;");
+    wln(self, "}");
     wln(self, "bool p_file_exists(const char* path) { FILE* f = fopen(path, \"rb\"); if (f) { fclose(f); return true; } return false; }");
     wln(self, "int64_t p_file_append(const char* path, const char* content) {");
     wln(self, "    FILE* f = fopen(path, \"ab\");");
@@ -2944,6 +2991,31 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "}");
     wln(self, "int64_t p_file_delete(const char* path) { return remove(path) == 0 ? 0 : -1; }");
     wln(self, "int64_t p_file_size(const char* path) { FILE* f = fopen(path, \"rb\"); if (!f) return -1; fseek(f, 0, SEEK_END); int64_t sz = ftell(f); fclose(f); return sz < 0 ? -1 : sz; }");
+    // Read a line from stdin — returns malloc'd string (caller must not free,
+    // arena-managed). Returns NULL on EOF. Strips trailing \n and \r\n.
+    wln(self, "char* p_read_line(void) {");
+    wln(self, "    static char* __p_line_buf = NULL;");
+    wln(self, "    static int __p_line_cap = 0;");
+    wln(self, "    if (!__p_line_buf) { __p_line_cap = 4096; __p_line_buf = (char*)p_malloc_persistent(__p_line_cap); }");
+    wln(self, "    if (!fgets(__p_line_buf, __p_line_cap, stdin)) return NULL;");
+    wln(self, "    int len = (int)strlen(__p_line_buf);");
+    wln(self, "    while (len > 0 && (__p_line_buf[len-1] == '\\n' || __p_line_buf[len-1] == '\\r')) { __p_line_buf[--len] = 0; }");
+    wln(self, "    return __p_line_buf;");
+    wln(self, "}");
+    // Read exactly n bytes from stdin — used by LSP protocol.
+    // Returns malloc'd string (nul-terminated). Returns NULL on EOF/error.
+    wln(self, "char* p_read_stdin(int64_t n) {");
+    wln(self, "    char* buf = (char*)p_malloc_persistent(n + 1);");
+    wln(self, "    if (!buf) return NULL;");
+    wln(self, "    int64_t total = 0;");
+    wln(self, "    while (total < n) {");
+    wln(self, "        int64_t rd = (int64_t)fread(buf + total, 1, (size_t)(n - total), stdin);");
+    wln(self, "        if (rd <= 0) { if (total == 0) return NULL; break; }");
+    wln(self, "        total += rd;");
+    wln(self, "    }");
+    wln(self, "    buf[total] = 0;");
+    wln(self, "    return buf;");
+    wln(self, "}");
     // Environment variable builtins
     wln(self, "char* p_getenv(const char* name) { return getenv(name); }");
     // Command-line argument builtins — globals declared in emit_runtime_types
@@ -2977,6 +3049,48 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    }");
     wln(self, "    while (pi < p_len && pattern[pi] == '*') pi++;");
     wln(self, "    return pi == p_len;");
+    wln(self, "}");
+    // ── Global string interner ──────────────────────────────────────────────
+    // Interns strings so identical content → same pointer. Enables == (pointer
+    // equality) instead of p_str_equal (byte-by-byte) in hot paths.
+    // Uses a simple open-addressing hash table with linear probing.
+    wln(self, "static char** __p_intern_table = NULL;");
+    wln(self, "static int64_t __p_intern_cap = 0;");
+    wln(self, "static int64_t __p_intern_count = 0;");
+    wln(self, "static int64_t __p_intern_hash(const char* s) {");
+    wln(self, "    int64_t h = 1469598103934665603ULL;");
+    wln(self, "    while (*s) { h ^= (unsigned char)*s; h *= 1099511628211ULL; s++; }");
+    wln(self, "    return h;");
+    wln(self, "}");
+    wln(self, "static void __p_intern_grow(void) {");
+    wln(self, "    int64_t new_cap = __p_intern_cap == 0 ? 4096 : __p_intern_cap * 2;");
+    wln(self, "    char** new_table = (char**)calloc(new_cap, sizeof(char*));");
+    wln(self, "    if (!new_table) { fprintf(stderr, \"p_intern: OOM\\n\"); abort(); }");
+    wln(self, "    for (int64_t i = 0; i < __p_intern_cap; i++) {");
+    wln(self, "        if (__p_intern_table[i]) {");
+    wln(self, "            int64_t h = __p_intern_hash(__p_intern_table[i]) & (new_cap - 1);");
+    wln(self, "            while (new_table[h]) h = (h + 1) & (new_cap - 1);");
+    wln(self, "            new_table[h] = __p_intern_table[i];");
+    wln(self, "        }");
+    wln(self, "    }");
+    wln(self, "    free(__p_intern_table);");
+    wln(self, "    __p_intern_table = new_table;");
+    wln(self, "    __p_intern_cap = new_cap;");
+    wln(self, "}");
+    wln(self, "const char* p_intern_str(const char* s) {");
+    wln(self, "    if (!s) return NULL;");
+    wln(self, "    if (__p_intern_count * 2 >= __p_intern_cap) __p_intern_grow();");
+    wln(self, "    int64_t mask = __p_intern_cap - 1;");
+    wln(self, "    int64_t h = __p_intern_hash(s) & mask;");
+    wln(self, "    while (__p_intern_table[h]) {");
+    wln(self, "        if (strcmp(__p_intern_table[h], s) == 0) {");
+    wln(self, "            return __p_intern_table[h];");
+    wln(self, "        }");
+    wln(self, "        h = (h + 1) & mask;");
+    wln(self, "    }");
+    wln(self, "    __p_intern_table[h] = (char*)s;");
+    wln(self, "    __p_intern_count++;");
+    wln(self, "    return s;");
     wln(self, "}");
     // Async/await runtime (Phase 7.6 + 8A)
     // Future model: p_future_ready wraps a value directly (eager).
