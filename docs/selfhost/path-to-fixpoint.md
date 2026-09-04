@@ -3,7 +3,7 @@
 > Companion to `docs/roadmap/selfhost-roadmap.md`.
 > The full plan with debugging workflows is there. This is the short version.
 >
-> Last updated: Sep 4, 2026 (session 8).
+> Last updated: Sep 4, 2026 (session 9).
 
 ---
 
@@ -24,9 +24,33 @@
 ✅ peephole.fd — PORTED (985 lines, from src/peephole.rs 903 lines)
 ✅ regalloc.fd — PORTED (1086 lines, from src/regalloc.rs 1096 lines)
 ✅ codegen_x64.fd — PORTED (1780 lines, from src/codegen_x64.rs 1923 lines)
+✅ lsp.fd — PORTED (1084 lines, from src/lsp.rs 996 lines) — JSON-RPC over stdio
 ⬜ Fixpoint — NOT YET VERIFIED (fides-c2 crashes on stdlib lexing)
 ⬜ Native codegen integration — ported but not wired into compiler pipeline
+⬜ LSP integration — ported but blocked by pre-existing parse error in codegen_c.fd
 ```
+
+**MILESTONE (session 9):** LSP server ported to Fides:
+```
+compiler/lsp.fd (1084 lines) — full LSP server ported from src/lsp.rs (996 lines)
+  - JSON-RPC 2.0 over stdio (Content-Length framing)
+  - initialize / shutdown / exit
+  - textDocument/didOpen / didChange / didClose
+  - textDocument/publishDiagnostics (via get_diagnostics)
+  - textDocument/completion (keywords + symbols + dot-access methods/fields)
+  - textDocument/hover (function/struct/enum/const/type/trait/method signatures)
+  - textDocument/definition (source search for fn/struct/enum/const/type/cap)
+  - textDocument/rename (whole-word occurrence search + WorkspaceEdit)
+Runtime support added to codegen_c.fd:
+  - p_read_line (stdin line read, NULL on EOF)
+  - p_read_stdin (exact N-byte read for LSP body)
+  - p_stdin_eof (feof check for client disconnect)
+  - p_flush_stdout (fflush for immediate message delivery)
+'lsp' command added to compiler/main.fd → lsp_run()
+```
+Note: LSP module parses correctly in isolation (`fidesc dump-ast compiler/lsp.fd`
+succeeds). Full self-hosted build is blocked by a pre-existing parse error at
+codegen_c.fd:973 (unrelated to LSP — reproduces with prior commit's files).
 
 **MILESTONE (session 8):** Linux native codegen backend ported:
 ```
@@ -144,7 +168,7 @@ Three bugs were fixed to make self-compile succeed (EXIT 0):
    `loaded_module_names`, `struct_names`, `enum_names` with O(1) `HashMap_get`
    lookups. Import resolution dropped from ~238s to negligible.
 
-### Step 7: Fixpoint ⏳ NEXT (blocked by statement-dropping bug)
+### Step 7: Fixpoint ⏳ NEXT (blocked by statement-dropping bug + parse error)
 
 ```bash
 # fides-c2 (self-compiled) compiles the compiler → fides-c3
@@ -160,12 +184,19 @@ diff release\fides-c2_test.exe.c release\fides-c3.exe.c
    in known-bugs.md): the Fides compiler silently drops statements in long
    functions. The second-generation compiler has this bug baked into its
    generated C code, so it crashes on complex inputs.
-2. **Debug prints** — 38 `p_eprint_str` calls produce noisy stderr output
+2. **Pre-existing parse error at codegen_c.fd:973** — `fidesc ccompile
+   compiler/main.fd` fails with "expected identifier but got 'var'" when
+   resolving imports. This blocks rebuilding fides-c.exe with current code.
+   Reproduces with prior commit's files (not caused by session 9 LSP work).
+3. **Debug prints** — 38 `p_eprint_str` calls produce noisy stderr output
 
 **Resolved blockers:**
 - ~~`.exe` extension~~ — FIXED (session 8). `ensure_exe_extension()` in
   `compiler/main.fd` now appends `.exe` to output names in both `ccompile`
   and `build` commands. No more manual `Copy-Item` needed.
+- ~~LSP port~~ — DONE (session 9). `compiler/lsp.fd` (1084 lines) implements
+  JSON-RPC over stdio with diagnostics, completion, hover, definition, rename.
+  `lsp` command added to `main.fd`. Runtime I/O functions added to `codegen_c.fd`.
 
 ### Step 8: Native codegen integration (future)
 
@@ -210,5 +241,6 @@ No crash ≠ working. The three failure modes after crashes stop:
 3. **Correct + stable** — stage2.c == stage3.c → **fixpoint achieved**
 
 We're at stage 1 (self-compilation works, EXIT 0, output is correct for simple
-files) + PE emitter works for simple programs. The fixpoint check (stage 2-3)
-is next, blocked by the fides-c2 stdlib crash.
+files) + PE emitter works for simple programs + LSP ported. The fixpoint check
+(stage 2-3) is next, blocked by the fides-c2 stdlib crash and a pre-existing
+parse error in codegen_c.fd that blocks rebuilding the bootstrap compiler.

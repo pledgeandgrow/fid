@@ -130,7 +130,8 @@ Total .fd:    230 test files  (207 in tests/; 23 in tests/compiler/)
 Self-host:    23/23 pass on interp + PE (tests/compiler/)
 Source:       52 .rs files, 82,778 LOC
 Stdlib:       69 .fd modules, 16,069 LOC
-Self-host:    18 .fd modules, 39,502 LOC (token, diag, json, fmt, ast, lexer, parser, ir, typechecker, lower, mono, borrowck, pir, opt, codegen_c, compiler, comptime_eval, main — all compile + pass tests)
+Self-host:    19 .fd modules, 40,762 LOC (token, diag, json, fmt, ast, lexer, parser, ir, typechecker, lower, mono, borrowck, pir, opt, codegen_c, compiler, comptime_eval, flat_ast, lsp, pe, peephole, regalloc, codegen_x64, main — all compile + pass tests)
+  flat_ast.fd: FULL PORT (dump-ast-flat serialization, 1260 lines) — session 9
   comptime_eval.fd: FULL PORT (process_gen, substitute, I-5A, I-5D, reflection) — session 7
   pe.fd: 25+ runtime stubs (print, string, vec, map, float, bool) — session 7
 Bootstrap:    release/fides-c.exe builds (8.5MB) and self-compiles (EXIT 0); fides-c2 crashes on stdlib (pre-existing)

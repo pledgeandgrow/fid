@@ -1285,12 +1285,94 @@ pub fn TypeChecker_check_bodies(self: &mut TypeChecker, program: Program) {
     }
 }
 
+// Helper: set func_effects entry (insert or update)
+fn TypeChecker_set_func_effects(self: &mut TypeChecker, name: str, effects: Vec<str>) {
+    var i: i64 = 0;
+    while i < self.func_effects.len() {
+        if self.func_effects.get(i).key == name {
+            var entry: StringVecStrTc = self.func_effects.get(i);
+            entry.val = effects;
+            self.func_effects.set(i, entry);
+            return;
+        }
+        i = i + 1;
+    }
+    self.func_effects.push(StringVecStrTc_new(name, effects));
+}
+
+// Helper: get func_effects entry (returns empty Vec if not found)
+fn TypeChecker_get_func_effects(self: &TypeChecker, name: str) -> Vec<str> {
+    var i: i64 = 0;
+    while i < self.func_effects.len() {
+        if self.func_effects.get(i).key == name {
+            return self.func_effects.get(i).val;
+        }
+        i = i + 1;
+    }
+    return Vec::new();
+}
+
 pub fn TypeChecker_compute_func_effects(self: &mut TypeChecker, program: Program) {
-    // NO-OP: Effect inference is skipped for bootstrap. Functions without
-    // explicit effect annotations will have no inferred effects, which is
-    // conservative but safe. The scan_expr_for_effects function crashes
-    // because Expr-by-value passing truncates the enum in the C backend.
-    // This will be re-enabled after the Expr-by-value issue is fixed.
+    // First pass: collect direct effects (print calls, allocations, etc.)
+    // Store results in a temporary list, then insert into func_effects.
+    var names: Vec<str> = Vec::new();
+    var bodies: Vec<StmtList> = Vec::new();
+
+    var fi: i64 = 0;
+    while fi < program.funcs.len() {
+        var func: Func = program.funcs.get(fi);
+        names.push(func.name);
+        bodies.push(func.body);
+        fi = fi + 1;
+    }
+    var impi: i64 = 0;
+    while impi < program.impls.len() {
+        var imp: ImplDef = program.impls.get(impi);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            names.push(imp.methods.get(mi).name);
+            bodies.push(imp.methods.get(mi).body);
+            mi = mi + 1;
+        }
+        impi = impi + 1;
+    }
+
+    // Insert initial effects into func_effects
+    var ri: i64 = 0;
+    while ri < names.len() {
+        var effects: Vec<str> = Vec::new();
+        TypeChecker_scan_stmts_for_effects(self, bodies.get(ri), &mut effects);
+        TypeChecker_set_func_effects(self, names.get(ri), effects);
+        ri = ri + 1;
+    }
+
+    // Fixpoint iteration: propagate transitive effects through call graph
+    // (if A calls B and B has IO, then A has IO too)
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        var ri2: i64 = 0;
+        while ri2 < names.len() {
+            var new_effects: Vec<str> = Vec::new();
+            TypeChecker_scan_stmts_for_effects(self, bodies.get(ri2), &mut new_effects);
+            // Check if new_effects has any effect not already in func_effects for this name
+            var existing: Vec<str> = TypeChecker_get_func_effects(self, names.get(ri2));
+            var has_new: bool = false;
+            var ni: i64 = 0;
+            while ni < new_effects.len() {
+                if !str_vec_contains(existing, new_effects.get(ni)) {
+                    has_new = true;
+                    ni = new_effects.len();
+                }
+                ni = ni + 1;
+            }
+            if has_new {
+                TypeChecker_set_func_effects(self, names.get(ri2), new_effects);
+                changed = true;
+            }
+            ri2 = ri2 + 1;
+        }
+    }
 }
 
 pub fn TypeChecker_verify_declared_effects(self: &mut TypeChecker, program: Program) {
@@ -1601,6 +1683,83 @@ pub fn TypeChecker_resolve_type(self: &TypeChecker, ty: Type) -> Type {
             }
             return ty;
         }
+        Type::Ref(inner, is_mut) => {
+            return Type::Ref(Box::new(TypeChecker_resolve_type(self, box_type_unbox(inner))), is_mut);
+        }
+        Type::RawPtr(inner, is_mut) => {
+            return Type::RawPtr(Box::new(TypeChecker_resolve_type(self, box_type_unbox(inner))), is_mut);
+        }
+        Type::Array(elem, size) => {
+            return Type::Array(Box::new(TypeChecker_resolve_type(self, box_type_unbox(elem))), size);
+        }
+        Type::ArrayConst(elem, size_param) => {
+            return Type::ArrayConst(Box::new(TypeChecker_resolve_type(self, box_type_unbox(elem))), size_param);
+        }
+        Type::Generic(name, args) => {
+            var new_args: Vec<Type> = Vec::new();
+            var i: i64 = 0;
+            while i < args.len() {
+                new_args.push(TypeChecker_resolve_type(self, args.get(i)));
+                i = i + 1;
+            }
+            return Type::Generic(name, new_args);
+        }
+        Type::Tuple(types) => {
+            var new_types: Vec<Type> = Vec::new();
+            var i: i64 = 0;
+            while i < types.len() {
+                new_types.push(TypeChecker_resolve_type(self, types.get(i)));
+                i = i + 1;
+            }
+            return Type::Tuple(new_types);
+        }
+        _ => { return ty; }
+    }
+    return ty;
+}
+
+pub fn TypeChecker_subst_type_params(ty: Type, subst: Vec<StringType>) -> Type {
+    match ty {
+        Type::Named(name) => {
+            var i: i64 = 0;
+            while i < subst.len() {
+                if subst.get(i).key == name {
+                    return subst.get(i).val;
+                }
+                i = i + 1;
+            }
+            return ty;
+        }
+        Type::Array(elem, size) => {
+            return Type::Array(Box::new(TypeChecker_subst_type_params(box_type_unbox(elem), subst)), size);
+        }
+        Type::ArrayConst(elem, size_param) => {
+            return Type::ArrayConst(Box::new(TypeChecker_subst_type_params(box_type_unbox(elem), subst)), size_param);
+        }
+        Type::Ref(inner, is_mut) => {
+            return Type::Ref(Box::new(TypeChecker_subst_type_params(box_type_unbox(inner), subst)), is_mut);
+        }
+        Type::RawPtr(inner, is_mut) => {
+            return Type::RawPtr(Box::new(TypeChecker_subst_type_params(box_type_unbox(inner), subst)), is_mut);
+        }
+        Type::Generic(name, args) => {
+            var new_args: Vec<Type> = Vec::new();
+            var i: i64 = 0;
+            while i < args.len() {
+                new_args.push(TypeChecker_subst_type_params(args.get(i), subst));
+                i = i + 1;
+            }
+            return Type::Generic(name, new_args);
+        }
+        Type::Tuple(types) => {
+            var new_types: Vec<Type> = Vec::new();
+            var i: i64 = 0;
+            while i < types.len() {
+                new_types.push(TypeChecker_subst_type_params(types.get(i), subst));
+                i = i + 1;
+            }
+            return Type::Tuple(new_types);
+        }
         _ => { return ty; }
     }
     return ty;
@@ -1643,6 +1802,28 @@ pub fn TypeChecker_resolve_self_type(self: &TypeChecker, ty: Type) -> Type {
                 i = i + 1;
             }
             return Type::Tuple(new_types);
+        }
+        _ => { return ty; }
+    }
+    return ty;
+}
+
+pub fn TypeChecker_resolve_assoc_in_type(self: &TypeChecker, ty: Type, type_param: str, trait_name: str) -> Type {
+    match ty {
+        Type::Named(name) => {
+            // Check if this name is an associated type of the trait
+            match map_str_vecstr_get(self.trait_assoc_types, trait_name) {
+                OptVecStr::Some(assoc_types) => {
+                    if str_vec_contains(assoc_types, name) {
+                        return Type::Assoc(type_param, trait_name, name, Vec::new());
+                    }
+                }
+                OptVecStr::None => {}
+            }
+            return ty;
+        }
+        Type::Assoc(_, _, name, args) => {
+            return Type::Assoc(type_param, trait_name, name, args);
         }
         _ => { return ty; }
     }
@@ -2216,10 +2397,19 @@ pub fn TypeChecker_check_capability(self: &mut TypeChecker, cap: str, context: s
 // ─── check_visibility ────────────────────────────────────────────────────
 
 pub fn TypeChecker_check_visibility(self: &mut TypeChecker, name: str) {
-    // Disabled: the Rust compiler doesn't enforce cross-module visibility
-    // within the same crate. The self-hosted compiler merges all modules
-    // into one program, so all items should be accessible.
-    return;
+    // Check if the item is defined in a different module
+    match map_str_str_get(self.item_modules, name) {
+        OptString::Some(item_module) => {
+            if item_module != self.current_module {
+                // Cross-module access: check if item is pub
+                var is_pub: bool = map_str_bool_get(self.item_visibility, name);
+                if !is_pub {
+                    self.errors.push("Visibility error: '" + name + "' is private to module '" + item_module + "' (not accessible from '" + self.current_module + "')");
+                }
+            }
+        }
+        OptString::None => {}
+    }
 }
 
 // ─── collect_capabilities ────────────────────────────────────────────────
@@ -4216,6 +4406,75 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
         }
     }
     return Type::Never;
+}
+
+// ─── resolve_pattern_enum ─────────────────────────────────────────────────
+
+pub fn TypeChecker_resolve_pattern_enum(self: &TypeChecker, match_ty: Type, enum_name: str, variant: str) -> OptString {
+    // If enum_name is non-empty, try resolving it directly
+    if enum_name != "" {
+        var resolved: str = TypeChecker_resolve_struct_name(self, enum_name);
+        // Check if resolved name is a known enum
+        var ei: i64 = 0;
+        while ei < self.enum_variants.len() {
+            if self.enum_variants.get(ei).key == resolved {
+                return OptString::Some(resolved);
+            }
+            ei = ei + 1;
+        }
+        // Check original name
+        ei = 0;
+        while ei < self.enum_variants.len() {
+            if self.enum_variants.get(ei).key == enum_name {
+                return OptString::Some(enum_name);
+            }
+            ei = ei + 1;
+        }
+    }
+    // Try to infer from the scrutinee type
+    var from_scrutinee: OptString = OptString::None;
+    match match_ty {
+        Type::Named(n) => { from_scrutinee = OptString::Some(n); }
+        Type::Generic(n, _) => { from_scrutinee = OptString::Some(n); }
+        _ => {}
+    }
+    match from_scrutinee {
+        OptString::Some(n) => {
+            var resolved: str = TypeChecker_resolve_struct_name(self, n);
+            var ei: i64 = 0;
+            while ei < self.enum_variants.len() {
+                if self.enum_variants.get(ei).key == resolved {
+                    return OptString::Some(resolved);
+                }
+                ei = ei + 1;
+            }
+        }
+        OptString::None => {}
+    }
+    // Last resort: a variant name unique across all enums
+    var found: OptString = OptString::None;
+    var ei: i64 = 0;
+    while ei < self.enum_variants.len() {
+        var variants: Vec<EnumVariantEntry> = self.enum_variants.get(ei).val;
+        var vi: i64 = 0;
+        while vi < variants.len() {
+            if variants.get(vi).name == variant {
+                match found {
+                    OptString::Some(_) => {
+                        // Ambiguous — more than one enum has this variant
+                        return OptString::None;
+                    }
+                    OptString::None => {
+                        found = OptString::Some(self.enum_variants.get(ei).key);
+                    }
+                }
+                vi = variants.len();
+            }
+            vi = vi + 1;
+        }
+        ei = ei + 1;
+    }
+    return found;
 }
 
 // ─── pattern_binding_types ───────────────────────────────────────────────

@@ -1,7 +1,7 @@
 # What Fides Can Do Now — Honest Assessment
 
 > Evidence-based, verified against the actual codebase and test runs.
-> Last updated: Sep 4, 2026 (session 8). Based on test runs, source inspection, and docs.
+> Last updated: Sep 4, 2026 (session 9). Based on test runs, source inspection, and docs.
 
 ---
 
@@ -91,7 +91,7 @@ features (HTTP, DB, threads, time, tensor, WASM) aren't ported to C yet.
 - `sandbox { }` compile-time capability revocation
 
 ### 9. Self-Hosting (self-compilation + native codegen achieved!)
-- 21 modules rewritten in Fides (~45K LOC, including PE emitter + Linux native codegen)
+- 22 modules rewritten in Fides (~46K LOC, including PE emitter + Linux native codegen + LSP)
 - All 18 original modules compile + pass tests
 - `release/fides-c.exe` builds (8.5MB) via tcc
 - **Self-compilation works** — `fides-c.exe` compiles `compiler/main.fd` → `fides-c2.exe` (Sep 9, 2026)
@@ -99,8 +99,9 @@ features (HTTP, DB, threads, time, tensor, WASM) aren't ported to C yet.
 - **PE emitter ported to Fides** — `compiler/pe.fd` generates native Windows PE executables without tcc (Sep 10, 2026)
 - `fides-c.exe build tests\hello_pe.fd -o hello_pe.exe` → working .exe that prints "Hello from PE!"
 - **Linux native codegen ported** — `peephole.fd` + `regalloc.fd` + `codegen_x64.fd` (session 8), builds OK but not yet integrated
+- **LSP server ported to Fides** — `compiler/lsp.fd` (1084 lines) — JSON-RPC over stdio, diagnostics, completion, hover, definition, rename (session 9)
 - **`.exe` extension auto-appended** — `ccompile` and `build` now produce `.exe` output without manual rename (session 8)
-- Fixpoint verification is the next milestone (fides-c2 crashes on stdlib due to statement-dropping bug)
+- Fixpoint verification is the next milestone (blocked by statement-dropping bug + pre-existing parse error in codegen_c.fd)
 - PE emitter currently supports simple programs; full compiler source support is in progress
 
 ---

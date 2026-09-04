@@ -18,7 +18,8 @@
 | `calling-conventions.md` | SRET, enum layout, struct copy, Box semantics, Vec handling — the low-level machinery | 6 |
 | `build-pipeline.md` | How to build, test, bootstrap, and verify the self-hosted compiler (including PE emitter `build` command) | 7 |
 | `known-bugs.md` | Known bugs, gotchas, and things that have been fixed (do not re-introduce) | 8 |
-| `agent-guide.md` | Best practices and rules for agents working on the compiler | 9 |
+| `port-gap-analysis.md` | Rust vs Fides module comparison — what's missing in each port | 9 |
+| `agent-guide.md` | Best practices and rules for agents working on the compiler | 10 |
 
 > **Note:** `calling-conventions.md` and `known-bugs.md` contain some outdated
 > content about the inline + memcpy approach for enum payloads. The current
@@ -48,14 +49,18 @@ tcc -O2 -w -o release\fides-c.exe release\fides-c.c -lws2_32
 # → Hello from PE!
 ```
 
-## Current Status (Sep 4, 2026 — session 8)
+## Current Status (Sep 4, 2026 — session 9)
 
 - **🎉 Self-compilation works!** — `fides-c.exe` compiles `compiler/main.fd` → `fides-c2.exe`
 - **🎉 PE emitter ported to Fides!** — `compiler/pe.fd` generates native Windows PE executables without tcc
 - **🎉 comptime_eval.fd fully ported!** — process_gen, substitute, I-5A aggressive comptime, I-5D loop unrolling, reflection
 - **🎉 Linux native codegen ported!** — `peephole.fd` + `regalloc.fd` + `codegen_x64.fd` (session 8), builds OK, not yet integrated
+- **🎉 LSP server ported to Fides!** — `compiler/lsp.fd` (1084 lines) — JSON-RPC over stdio, diagnostics, completion, hover, definition, rename (session 9)
+- **🎉 flat_ast.fd ported!** — `compiler/flat_ast.fd` (1260 lines) — flat AST serialization for `dump-ast-flat` command (session 9)
+- **Box<T> unbox helpers centralized** — `box_expr_unbox`, `box_type_unbox`, `box_pattern_unbox` now in `ast.fd` (session 9)
 - **`.exe` extension auto-appended** — `ccompile` and `build` now produce `.exe` output without manual rename (session 8)
 - **`build` command** — `fides-c.exe build tests/hello_pe.fd -o hello_pe.exe` → working .exe
+- **`lsp` command** — `fides-c.exe lsp` starts the LSP server (session 9)
 - **PE runtime stubs** — 25+ stubs (print, string, vec, map, float, bool) for native PE executables
 - **All pipeline stages pass** during self-compilation (lex, parse, typecheck, borrowck, mono, lower, C codegen, tcc link)
 - **SRET fixed** — struct returns via out-parameter convention now work
@@ -66,11 +71,14 @@ tcc -O2 -w -o release\fides-c.exe release\fides-c.c -lws2_32
 
 ### Remaining steps to fixpoint:
 1. ~~Fix `.exe` extension in self-hosted compiler output~~ — DONE (session 8)
-2. Fix the statement-dropping bug in the Fides compiler (root cause of fides-c2.exe crash on stdlib/core.fd)
-3. Remove/gate 38 debug `p_eprint_str` calls
-4. Verify `fides-c2.c == fides-c3.c` (the fixpoint check)
-5. Extend PE emitter to support full compiler source (struct/enum, Vec/HashMap, floats)
-6. Integrate Linux native codegen (port `elf64.rs`, `linker.rs`, `runtime_linux.rs`, wire into pipeline)
+2. ~~Port LSP server to Fides~~ — DONE (session 9)
+3. **Fix pre-existing parse error at codegen_c.fd:973** — blocks rebuilding fides-c.exe with current code (NEW blocker, session 9)
+4. Fix the statement-dropping bug in the Fides compiler (root cause of fides-c2.exe crash on stdlib/core.fd)
+5. Remove/gate 38 debug `p_eprint_str` calls
+6. Verify `fides-c2.c == fides-c3.c` (the fixpoint check)
+7. Extend PE emitter to support full compiler source (struct/enum, Vec/HashMap, floats)
+8. Integrate Linux native codegen (port `elf64.rs`, `linker.rs`, `runtime_linux.rs`, wire into pipeline)
+9. ~~Assess debugger.rs porting feasibility~~ — **ASSESSED (session 9): NOT feasible without porting interp.rs (5782 LOC, 251 runtime handlers, closures for debug hooks). Skip — debugger is a dev tool, not needed for self-hosting.**
 
 See `CURRENT.md` in the repo root for the latest state.
 

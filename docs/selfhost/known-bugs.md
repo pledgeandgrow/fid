@@ -2,7 +2,7 @@
 
 > Things that have broken before and how to avoid re-introducing them.
 >
-> Last updated: Sep 4, 2026 (session 8).
+> Last updated: Sep 4, 2026 (session 9).
 
 ---
 
@@ -474,6 +474,31 @@ should be gated on a platform check rather than always appending `.exe`.
 noisy stderr output. These should be gated behind a debug flag before
 fixpoint verification (they won't break C output comparison since they
 go to stderr, but they make output noisy).
+
+### 2.11 Pre-existing parse error at codegen_c.fd:973 (NEW — session 9)
+
+**Symptom:** `fidesc ccompile compiler/main.fd -o release/fides-c_test.exe`
+fails with:
+```
+error: Parse error at 973:34: expected identifier but got 'var'
+Parse error at 974:9: expected fn but got 'Pattern'
+```
+
+**Root cause:** Unknown. The error occurs during import resolution when
+building `compiler/main.fd` (which imports `compiler/codegen_c.fd` among
+others). The line/column 973:34 points into the merged source (stdlib +
+imports + user code), not the raw file. The error reproduces with the
+prior commit's `codegen_c.fd` and `main.fd` (verified by checking out
+commit `53df63b`), so it is **NOT caused by session 9 LSP work**.
+
+**Impact:** Blocks rebuilding `fides-c.exe` with current code. The existing
+`release/fides-c.exe` (built before this bug appeared) still works. This
+must be fixed before the fixpoint check can be attempted with current code.
+
+**Investigation needed:**
+- Determine which file/module in the merge produces line 973
+- Check if a recent stdlib change introduced a construct the parser can't handle
+- Try building individual compiler modules to isolate which import triggers it
 
 ---
 

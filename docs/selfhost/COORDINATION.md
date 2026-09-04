@@ -5,7 +5,7 @@
 > and what architectural decisions have been made. Without this, parallel
 > agents will conflict and undo each other's work.
 >
-> **Last updated:** Sep 4, 2026 (session 8)
+> **Last updated:** Sep 4, 2026 (session 9)
 
 ---
 
@@ -236,11 +236,150 @@ already present.
 this should be gated on a platform check rather than always appending
 `.exe`.
 
+### [D9] LSP server ported to Fides — Sep 4, 2026 (session 9)
+
+**Decision:** The LSP server (`src/lsp.rs`, 996 LOC) has been ported to
+Fides as `compiler/lsp.fd` (1084 lines). The `lsp` command has been
+added to `compiler/main.fd`, dispatching to `lsp_run()`.
+
+**What was ported:**
+- JSON-RPC 2.0 over stdio with Content-Length header framing
+- `initialize` / `shutdown` / `exit` lifecycle
+- `textDocument/didOpen` / `didChange` / `didClose` — document tracking
+- `textDocument/publishDiagnostics` — via `get_diagnostics()` from `compiler.fd`
+- `textDocument/completion` — keywords + functions + structs + enums +
+  consts + type aliases + traits + dot-access methods/fields
+- `textDocument/hover` — function/struct/enum/const/type/trait/method signatures
+- `textDocument/definition` — source text search for definition location
+- `textDocument/rename` — whole-word occurrence search + WorkspaceEdit
+
+**Runtime I/O functions added to `compiler/codegen_c.fd`:**
+- `p_read_line` — read a line from stdin (NULL on EOF)
+- `p_read_stdin(n)` — read exactly N bytes from stdin (for LSP body)
+- `p_stdin_eof` — feof check (detect client disconnect)
+- `p_flush_stdout` — fflush(stdout) for immediate message delivery
+
+**Status:** Module parses correctly in isolation. Full self-hosted build
+blocked by pre-existing parse error at codegen_c.fd:973 (bug #2.11, not
+caused by LSP work). The `lsp` command and `lsp_run()` entry point are
+wired into `main.fd`.
+
+---
+
+### [D10] flat_ast.fd ported + Box<T> unbox helpers centralized — Sep 4, 2026 (session 9)
+
+**Decision:** `src/flat_ast.rs` (755 LOC) has been ported to Fides as
+`compiler/flat_ast.fd` (1260 lines). This module provides flat AST
+serialization for the `dump-ast-flat` command and self-host parser
+differential testing.
+
+**Box<T> unbox helpers centralized in ast.fd:**
+- Added `pub fn box_expr_unbox`, `box_type_unbox`, `box_pattern_unbox` to
+  `compiler/ast.fd`
+- These were previously duplicated across 6+ modules (typechecker.fd,
+  comptime_eval.fd, parser.fd, lower.fd, ir.fd, codegen_c.fd)
+- Now available as shared public functions from `ast.fd`
+
+**Key finding: Box<T> deref gap**
+- `Box<T>` is `Generic("Box", [T])` in Fides — not a pointer type
+- `*` (Deref) only works on `Type::Ref` and `Type::RawPtr`
+- Workaround: `box_*_unbox()` helpers (match on all variants, return unboxed)
+- Proper fix: `Deref` trait system (future work)
+
+**interp.rs NOT ported:**
+- The self-hosted compiler doesn't need an interpreter
+- `run` command uses C compilation + tcc
+- Comptime evaluation handled by `comptime_eval.fd` (AST-level)
+- `interp.rs` (5782 lines) has features not needed for self-hosting
+
+**Status:** `flat_ast.fd` builds successfully. `ast.fd` changes verified —
+all 22/23 self-host tests still pass (1 pre-existing failure in
+`test_codegen_c.fd` due to missing `p_sb_new` runtime function).
+
 ---
 
 ## Key Findings
 
 > Discoveries that affect the direction. Add new findings at the top.
+
+### [F9] debugger.rs porting assessment — NOT feasible without interp.rs — Sep 4, 2026 (session 9)
+
+**Assessment:** Porting `src/debugger.rs` (914 LOC) to Fides is **not
+feasible** as a standalone task because it has a hard dependency on the
+interpreter (`src/interp.rs`, 5782 LOC).
+
+**Dependency chain:**
+```
+debugger.rs (914 LOC)
+  └─ imports from interp.rs:
+     ├─ Interpreter (struct with 50+ fields)
+     ├─ RunResult (enum: Return/Pause/Panic)
+     ├─ DebugAction (enum: Continue/Pause/InjectReturn/InjectPanic)
+     ├─ Value (enum: Int/Float/Bool/Str/Ptr/Void/Vec/Map/Dyn/Tensor/Json/...)
+     └─ TraceEntry (struct: func_name, block_id, inst_id, source_line, value_repr)
+  └─ uses:
+     ├─ Interpreter::new(module) — constructs interpreter from IrModule
+     ├─ interp.set_debug_hook(closure) — installs callback before each instruction
+     ├─ interp.run() — executes main function
+     └─ closure receives (func_name, block, source_line, inst_id, values, func)
+```
+
+**What interp.rs contains (5782 LOC):**
+- `Value` enum (14 variants, 130 LOC) — runtime values
+- `Memory` struct (110 LOC) — simulated heap with byte addressing
+- `Interpreter` struct (155 LOC, 50+ fields) — execution state
+- `Interpreter::new()` (65 LOC) — initialization
+- `Interpreter::run()` (10 LOC) — entry point
+- `run_function()` (225 LOC) — function call dispatch + block iteration
+- `execute_inst()` (888 LOC) — IR instruction evaluator (all Inst variants)
+- `call_runtime()` (3247 LOC) — 251 runtime function handlers (p_print_*, p_vec_*,
+  p_map_*, p_malloc, p_tensor_*, p_json_*, p_db_*, p_chan_*, p_mutex_*, p_tls_*,
+  p_future_*, p_spawn, p_autograd_*, p_dp_*, p_quant_*, p_kv_cache_*, etc.)
+- `eval_binop()` (186 LOC), `eval_unaryop()` (26 LOC), `cast_value()` (13 LOC)
+- Autograd tape, tensor ops, futures, threads, channels, ECS, databases,
+  DP noise, TP simulation, KV cache, quantization
+
+**Why it's not needed for self-hosting:**
+1. The self-hosted compiler's `run` command uses C compilation + tcc, not
+   the interpreter
+2. Comptime evaluation is handled by `comptime_eval.fd` (AST-level
+   interpreter, already ported)
+3. The `debug` and `replay` commands are developer tools, not required
+   for bootstrap fixpoint
+4. The self-hosted compiler's `main.fd` has no `debug`/`replay` commands
+
+**What would be needed to port it:**
+1. Port `interp.rs` (5782 LOC) → `compiler/interp.fd` — massive effort,
+   ~8000+ LOC Fides. Would need:
+   - `Value` enum with all 14 variants
+   - `Memory` struct with byte-level load/store
+   - `Interpreter` struct with 50+ fields
+   - `execute_inst()` — all IR instruction handling
+   - `call_runtime()` — all 251 runtime function handlers
+   - Closures for debug hooks (Fides has no closures — would need a
+     different mechanism, e.g. function pointers or a callback struct)
+2. Port `debugger.rs` (914 LOC) → `compiler/debugger.fd`
+3. Add `debug`/`replay` commands to `main.fd`
+
+**Estimated effort:** 8000+ LOC Fides for interp.fd + 1200 LOC for
+debugger.fd = ~9200 LOC total. Multiple sessions.
+
+**Recommendation:** **Skip for now.** The debugger is a developer
+convenience tool, not a self-hosting requirement. Port it only if:
+- The self-hosted compiler needs interactive debugging capability
+- Or if a future `run` command redesign switches from C compilation to
+  a native interpreter (unlikely — C compilation is faster)
+
+### [F8] Pre-existing parse error blocks self-hosted rebuild — Sep 4, 2026 (session 9)
+
+`fidesc ccompile compiler/main.fd` fails with "Parse error at 973:34:
+expected identifier but got 'var'" during import resolution. This error
+reproduces with the prior commit's files (verified by checking out commit
+`53df63b`), so it is NOT caused by session 9 LSP work. The line/column
+points into the merged source (stdlib + imports + user code), not any
+individual file. The existing `release/fides-c.exe` (built before this
+bug appeared) still works. **This must be fixed before the fixpoint check
+can be attempted with current code.** See bug #2.11 in known-bugs.md.
 
 ### [F7] Statement-dropping bug is the root cause of fides-c2 crash — Sep 4, 2026 (session 8)
 
@@ -373,7 +512,9 @@ Before touching any file:
 | `compiler/regalloc.fd` | Fides register allocator — must mirror `src/regalloc.rs` | This file |
 | `src/codegen_x64.rs` | Rust x86-64 codegen (Linux, AT&T syntax) | This file |
 | `compiler/codegen_x64.fd` | Fides x86-64 codegen — must mirror `src/codegen_x64.rs` | This file |
-| `compiler/main.fd` | CLI entry point — `.exe` extension, command dispatch | This file |
+| `src/lsp.rs` | Rust LSP server — JSON-RPC over stdio | This file |
+| `compiler/lsp.fd` | Fides LSP server — must mirror `src/lsp.rs` | This file |
+| `compiler/main.fd` | CLI entry point — `.exe` extension, command dispatch, `lsp` command | This file |
 | `compiler/ast.fd` | Canonical AST — changes require updating `box_*_unbox` everywhere | This file |
 | `CURRENT.md` | Current status — update after every milestone | Session that completes a milestone |
 

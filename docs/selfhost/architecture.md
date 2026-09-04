@@ -6,30 +6,33 @@
 
 ```
 main.fd
-  └─ compiler.fd
-       ├─ lexer.fd  ──► parser.fd  ──► ast.fd
-       ├─ typechecker.fd ──► ast.fd
-       ├─ borrowck.fd ──► ast.fd
-       ├─ comptime_eval.fd ──► ast.fd
-       ├─ lower.fd ──► ir.fd
-       ├─ mono.fd ──► ast.fd
-       ├─ pir.fd / opt.fd ──► ir.fd
-       ├─ codegen_c.fd ──► ir.fd  ──► C source ──► tcc ──► .exe
-       ├─ pe.fd ──► ir.fd  ──► x86-64 machine code + PE file ──► .exe (no tcc!)
-       └─ [Linux backend — ported but NOT yet integrated]
-            ├─ peephole.fd ──► L3Module (9 optimization passes)
-            ├─ regalloc.fd ──► L3Module (linear scan register allocator)
-            └─ codegen_x64.fd ──► L3Module ──► x86-64 AT&T asm ──► ELF64 (future)
+  ├─ compiler.fd
+  │    ├─ lexer.fd  ──► parser.fd  ──► ast.fd
+  │    ├─ typechecker.fd ──► ast.fd
+  │    ├─ borrowck.fd ──► ast.fd
+  │    ├─ comptime_eval.fd ──► ast.fd
+  │    ├─ flat_ast.fd ──► ast.fd (dump-ast-flat serialization)
+  │    ├─ lower.fd ──► ir.fd
+  │    ├─ mono.fd ──► ast.fd
+  │    ├─ pir.fd / opt.fd ──► ir.fd
+  │    ├─ codegen_c.fd ──► ir.fd  ──► C source ──► tcc ──► .exe
+  │    ├─ pe.fd ──► ir.fd  ──► x86-64 machine code + PE file ──► .exe (no tcc!)
+  │    └─ [Linux backend — ported but NOT yet integrated]
+  │         ├─ peephole.fd ──► L3Module (9 optimization passes)
+  │         ├─ regalloc.fd ──► L3Module (linear scan register allocator)
+  │         └─ codegen_x64.fd ──► L3Module ──► x86-64 AT&T asm ──► ELF64 (future)
+  └─ lsp.fd ──► compiler.fd (get_diagnostics) + json.fd ──► JSON-RPC over stdio
 ```
 
 `compiler.fd` is the central hub. `ast.fd`, `ir.fd`, and `token.fd` are the
 shared data-definition leaves that almost everything else consumes.
 
 The `ccompile` command uses `codegen_c.fd` (C codegen + tcc). The `build`
-command uses `pe.fd` (native PE emitter, no tcc). The Linux native backend
-(`peephole.fd` + `regalloc.fd` + `codegen_x64.fd`) is ported but not yet
-wired into the pipeline — integration requires porting `elf64.rs`,
-`linker.rs`, and `runtime_linux.rs` first.
+command uses `pe.fd` (native PE emitter, no tcc). The `lsp` command uses
+`lsp.fd` (JSON-RPC over stdio, diagnostics via `compiler.fd`). The Linux
+native backend (`peephole.fd` + `regalloc.fd` + `codegen_x64.fd`) is ported
+but not yet wired into the pipeline — integration requires porting
+`elf64.rs`, `linker.rs`, and `runtime_linux.rs` first.
 
 ---
 
@@ -412,6 +415,38 @@ Fides lowerer needs the same.
 
 ---
 
+## `compiler/lsp.fd` — LSP server (JSON-RPC over stdio)
+
+- **Module:** `compiler::lsp`
+- **Purpose:** Language Server Protocol implementation for editor integration.
+  Reads JSON-RPC 2.0 messages from stdin (Content-Length framing), dispatches
+  to handlers, writes responses/notifications to stdout.
+- **Key types:** `DocEntry` (uri + text), `OptI64Pair` (definition search
+  result), `I64Triple` (occurrence line/col/length)
+- **Key functions:** `lsp_run()` (main message loop), `handle_initialize()`,
+  `handle_completion()`, `handle_hover()`, `handle_definition()`,
+  `handle_rename()`, `publish_diagnostics()`, `send_notification()`,
+  `send_response()`, `send_error()`
+- **Imports:** `core`, `vec`, `string`, `compiler::ast`, `compiler::json`,
+  `compiler::compiler`
+- **Ported from:** `src/lsp.rs` (996 lines Rust → 1084 lines Fides, session 9)
+- **Runtime dependencies (added to `codegen_c.fd`):** `p_read_line`,
+  `p_read_stdin(n)`, `p_stdin_eof`, `p_flush_stdout`
+- **Status:** Module parses correctly in isolation. `lsp` command wired into
+  `main.fd`. Full self-hosted build blocked by pre-existing parse error at
+  codegen_c.fd:973 (bug #2.11, not LSP-related).
+- **Features:**
+  - `initialize` / `shutdown` / `exit` lifecycle
+  - `textDocument/didOpen` / `didChange` / `didClose` — document tracking
+  - `textDocument/publishDiagnostics` — via `get_diagnostics()` from `compiler.fd`
+  - `textDocument/completion` — keywords + functions + structs + enums +
+    consts + type aliases + traits + dot-access methods/fields
+  - `textDocument/hover` — function/struct/enum/const/type/trait/method signatures
+  - `textDocument/definition` — source text search for definition location
+  - `textDocument/rename` — whole-word occurrence search + WorkspaceEdit
+
+---
+
 ## `compiler/pir.fd` — Multi-level PIR (L1→L2→L3)
 
 - **Module:** `compiler::pir`
@@ -505,6 +540,30 @@ Fides lowerer needs the same.
   conditions
 - **Imports:** `core`, `vec`, `compiler::ast`
 - **Imported by:** `compiler.fd`
+
+---
+
+## `compiler/flat_ast.fd` — Flat AST serialization
+
+- **Module:** `compiler::flat_ast`
+- **Purpose:** Produces a line-based serialization of the AST for
+  `dump-ast-flat` command and self-host parser differential testing.
+  Format: 2-space indent per depth, node type first, then fields
+  (strings double-quoted, numbers bare, bools as true/false).
+- **Key functions:**
+  - `program_flat(p: Program) -> str` — main entry point, serializes entire program
+  - `func_flat(f: Func, depth) -> str` — serializes a function with params, body
+  - `expr_flat(e: Expr, depth) -> str` — serializes all 39 Expr variants
+  - `stmt_flat(s: Stmt, depth) -> str` — serializes all 28 Stmt variants
+  - `type_flat(t: Type, depth) -> str` — serializes all 29 Type variants
+  - `pattern_flat(p: Pattern, depth) -> str` — serializes all 7 Pattern variants
+  - `esc(s: str) -> str` — escapes strings for output (\\n, \\r, \\t, \\", \\\\, \\u{XX})
+- **Box<T> handling:** Uses `box_expr_unbox()`, `box_type_unbox()`,
+  `box_pattern_unbox()` from `ast.fd` to unbox `Box<Expr>`/`Box<Type>`/
+  `Box<Pattern>` fields for recursive calls (Fides has no `*` deref for `Box<T>`)
+- **Imports:** `core`, `vec`, `string`, `compiler::ast`
+- **Imported by:** Not yet integrated into `compiler.fd` (standalone module)
+- **Ported from:** `src/flat_ast.rs` (755 LOC Rust → 1260 LOC Fides)
 
 ---
 

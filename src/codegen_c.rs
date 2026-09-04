@@ -1040,6 +1040,10 @@ impl CCodeGen {
         wln!(self, "void p_print_float(double val);");
         wln!(self, "void p_print_newline(void);");
         wln!(self, "void p_eprint_str(const char* s);");
+        wln!(self, "void p_flush_stdout(void);");
+        wln!(self, "int64_t p_stdin_eof(void);");
+        wln!(self, "char* p_read_line(void);");
+        wln!(self, "char* p_read_stdin(int64_t n);");
         wln!(self, "void p_panic(const char* msg);");
         wln!(self, "// Call stack for panic traces + recursion limit");
         wln!(self, "static const char* p_call_stack[2048];");
@@ -1468,7 +1472,11 @@ impl CCodeGen {
                 };
                 // If the result type is a pointer/opaque, cast back from int64_t
                 let result_is_ptr = is_ptr(Some(ty));
-                if result_is_ptr {
+                // Float modulo: C doesn't support % on doubles, use fmod()
+                let is_float_mod = matches!(op, BinOp::Mod) && matches!(ty, IrType::F64);
+                if is_float_mod {
+                    wln!(self, "    {} = fmod({}, {});", dst, l, r);
+                } else if result_is_ptr {
                     wln!(self, "    {} = (void*)(intptr_t)({} {} {});", dst, l, cop, r);
                 } else {
                     wln!(self, "    {} = {} {} {};", dst, l, cop, r);
@@ -2407,6 +2415,28 @@ impl CCodeGen {
         wln!(self, "void p_print(int64_t val) { printf(\"%lld\", (long long)val); }");
         wln!(self, "void p_print_str(const char* s) { printf(\"%s\", s); }");
         wln!(self, "void p_eprint_str(const char* s) { fprintf(stderr, \"%s\", s); fflush(stderr); }");
+        wln!(self, "void p_flush_stdout(void) { fflush(stdout); }");
+        wln!(self, "int64_t p_stdin_eof(void) { return (int64_t)feof(stdin); }");
+        wln!(self, "char* p_read_line(void) {");
+        wln!(self, "    static char buf[65536];");
+        wln!(self, "    if (fgets(buf, sizeof(buf), stdin) == NULL) return NULL;");
+        wln!(self, "    size_t len = strlen(buf);");
+        wln!(self, "    if (len > 0 && buf[len-1] == '\\n') buf[len-1] = '\\0';");
+        wln!(self, "    return buf;");
+        wln!(self, "}");
+        wln!(self, "char* p_read_stdin(int64_t n) {");
+        wln!(self, "    char* buf = (char*)malloc(n + 1);");
+        wln!(self, "    if (!buf) return NULL;");
+        wln!(self, "    int64_t read = 0;");
+        wln!(self, "    while (read < n) {");
+        wln!(self, "        int c = fgetc(stdin);");
+        wln!(self, "        if (c == EOF) break;");
+        wln!(self, "        buf[read] = (char)c;");
+        wln!(self, "        read++;");
+        wln!(self, "    }");
+        wln!(self, "    buf[read] = '\\0';");
+        wln!(self, "    return buf;");
+        wln!(self, "}");
         wln!(self, "void p_print_int(int64_t val) { printf(\"%lld\", (long long)val); }");
         wln!(self, "void p_print_bool(bool val) { printf(\"%s\", val ? \"true\" : \"false\"); }");
         wln!(self, "void p_print_float(double val) {{ char* _s = p_to_str_float(val); printf(\"%s\", _s); free(_s); }}");

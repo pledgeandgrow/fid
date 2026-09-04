@@ -1787,156 +1787,292 @@ pub fn PeCodeGen_get_block_label(self: &PeCodeGen, func_block_idx: i64, block_id
 }
 
 // ─── IR instruction lowering ────────────────────────────────────────────
+// Split into helper functions to avoid the statement-dropping bug (bug 1.19).
+// Each helper handles one match arm, keeping PeCodeGen_gen_inst short.
+
+fn PeCodeGen_gen_inst_const_int(self: &mut PeCodeGen, dst: i64, value: i64) {
+    X86Encoder_mov_imm64(&mut self.enc, REG_RAX, value);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+fn PeCodeGen_gen_inst_const_bool(self: &mut PeCodeGen, dst: i64, value: bool) {
+    if value {
+        X86Encoder_mov_imm64(&mut self.enc, REG_RAX, 1);
+    } else {
+        X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    }
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+fn PeCodeGen_gen_inst_const_str(self: &mut PeCodeGen, dst: i64, value: str) {
+    var func_label: i64 = PeCodeGen_get_func_label(self, value);
+    if func_label >= 0 {
+        X86Encoder_lea_label(&mut self.enc, REG_RAX, func_label);
+    } else {
+        var str_off: i64 = PeCodeGen_get_string_offset(self, value);
+        if str_off >= 0 {
+            X86Encoder_lea_rip(&mut self.enc, REG_RAX, str_off);
+        } else {
+            X86Encoder_xor_self(&mut self.enc, REG_RAX);
+        }
+    }
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+fn PeCodeGen_gen_inst_const_float(self: &mut PeCodeGen, dst: i64) {
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+fn PeCodeGen_gen_inst_const_null(self: &mut PeCodeGen, dst: i64) {
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+fn PeCodeGen_gen_inst_binop(self: &mut PeCodeGen, dst: i64, op: BinOp, left: i64, right: i64, ty: IrType, frame: &PeStackFrame) {
+    var loff: i64 = PeStackFrame_find_offset(frame, left);
+    var roff: i64 = PeStackFrame_find_offset(frame, right);
+    if ir_type_is_float(ty) {
+        PeCodeGen_gen_float_binop(self, op, loff, roff, dst, ty);
+    } else {
+        PeCodeGen_gen_int_binop(self, op, loff, roff, dst);
+    }
+}
+
+fn PeCodeGen_gen_inst_unaryop(self: &mut PeCodeGen, dst: i64, op: UnaryOp, operand: i64, ty: IrType, frame: &PeStackFrame) {
+    var off: i64 = PeStackFrame_find_offset(frame, operand);
+    PeCodeGen_gen_unaryop(self, op, off, dst, ty);
+}
+
+fn PeCodeGen_gen_inst_alloca(self: &mut PeCodeGen, dst: i64, id: i64, frame: &PeStackFrame) {
+    var data_off: i64 = PeStackFrame_find_alloca(frame, id);
+    X86Encoder_lea_rbp(&mut self.enc, REG_RAX, data_off);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+fn PeCodeGen_gen_inst_load(self: &mut PeCodeGen, dst: i64, ptr: i64, ty: IrType, frame: &PeStackFrame) {
+    var poff: i64 = PeStackFrame_find_offset(frame, ptr);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, poff);
+    var load_size: i64 = ir_type_size(ty);
+    if load_size == 1 {
+        X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+        X86Encoder_movsxd_rr(&mut self.enc, REG_RAX, REG_RAX);
+    } else if load_size == 2 {
+        X86Encoder_movzx_r32_r16(&mut self.enc, REG_RAX, REG_RAX);
+        X86Encoder_movsxd_rr(&mut self.enc, REG_RAX, REG_RAX);
+    } else if load_size == 4 {
+        X86Encoder_movsxd_rr(&mut self.enc, REG_RAX, REG_RAX);
+    } else {
+        X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RAX);
+    }
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+fn PeCodeGen_gen_inst_store(self: &mut PeCodeGen, ptr: i64, value: i64, opt_ty: OptIrType, frame: &PeStackFrame) {
+    var poff: i64 = PeStackFrame_find_offset(frame, ptr);
+    var voff: i64 = PeStackFrame_find_offset(frame, value);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, poff);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RCX, voff);
+    var store_size: i64 = 8;
+    match opt_ty {
+        OptIrType::Some(ty) => {
+            store_size = ir_type_size(ty);
+        }
+        _ => {}
+    }
+    if store_size == 1 {
+        X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_RAX, REG_RCX);
+    } else if store_size == 2 {
+        X86Encoder_mov_ptr_reg32(&mut self.enc, REG_RAX, REG_RCX);
+    } else if store_size == 4 {
+        X86Encoder_mov_ptr_reg32(&mut self.enc, REG_RAX, REG_RCX);
+    } else {
+        X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_RCX);
+    }
+}
+
+fn PeCodeGen_gen_inst_get_field_ptr(self: &mut PeCodeGen, dst: i64, struct_ptr: i64, field_index: i64, frame: &PeStackFrame) {
+    var poff: i64 = PeStackFrame_find_offset(frame, struct_ptr);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, poff);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, field_index * 8);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+fn PeCodeGen_gen_inst_get_elem_ptr(self: &mut PeCodeGen, dst: i64, array_ptr: i64, index: i64, elem_ty: IrType, frame: &PeStackFrame) {
+    var poff: i64 = PeStackFrame_find_offset(frame, array_ptr);
+    var ioff: i64 = PeStackFrame_find_offset(frame, index);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, poff);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RCX, ioff);
+    var elem_size: i64 = ir_type_size(elem_ty);
+    if elem_size < 8 { elem_size = 8; }
+    X86Encoder_imul_r_r_imm32(&mut self.enc, REG_RCX, REG_RCX, elem_size);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+fn PeCodeGen_gen_inst_jump(self: &mut PeCodeGen, target: i64) {
+    var lbl: i64 = PeCodeGen_get_block_label(self, 0, target);
+    if lbl >= 0 {
+        X86Encoder_jmp_label(&mut self.enc, lbl);
+    }
+}
+
+fn PeCodeGen_gen_inst_branch(self: &mut PeCodeGen, cond: i64, then_blk: i64, else_blk: i64, frame: &PeStackFrame) {
+    var coff: i64 = PeStackFrame_find_offset(frame, cond);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, coff);
+    X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
+    var then_lbl: i64 = PeCodeGen_get_block_label(self, 0, then_blk);
+    if then_lbl >= 0 {
+        X86Encoder_jcc_label(&mut self.enc, 5, then_lbl);
+    }
+    var else_lbl: i64 = PeCodeGen_get_block_label(self, 0, else_blk);
+    if else_lbl >= 0 {
+        X86Encoder_jmp_label(&mut self.enc, else_lbl);
+    }
+}
+
+fn PeCodeGen_gen_inst_return(self: &mut PeCodeGen, opt_val: OptValueId, frame: &PeStackFrame) {
+    match opt_val {
+        OptValueId::Some(v) => {
+            var voff: i64 = PeStackFrame_find_offset(frame, v);
+            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, voff);
+        }
+        _ => {
+            X86Encoder_xor_self(&mut self.enc, REG_RAX);
+        }
+    }
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+fn PeCodeGen_gen_inst_int_extend(self: &mut PeCodeGen, dst: i64, value: i64, frame: &PeStackFrame) {
+    var voff: i64 = PeStackFrame_find_offset(frame, value);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, voff);
+    X86Encoder_movsxd_rr(&mut self.enc, REG_RAX, REG_RAX);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+fn PeCodeGen_gen_inst_int_trunc(self: &mut PeCodeGen, dst: i64, value: i64, to: IrType, frame: &PeStackFrame) {
+    var voff: i64 = PeStackFrame_find_offset(frame, value);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, voff);
+    match to {
+        IrType::U8 => {
+            X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+        }
+        IrType::I8 => {
+            X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
+        }
+        IrType::U16 => {
+            X86Encoder_movzx_r32_r16(&mut self.enc, REG_RAX, REG_RAX);
+        }
+        IrType::I16 => {
+            X86Encoder_movzx_r32_r16(&mut self.enc, REG_RAX, REG_RAX);
+        }
+        _ => {}
+    }
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+fn PeCodeGen_gen_inst_int_to_float(self: &mut PeCodeGen, dst: i64, value: i64, to: IrType, frame: &PeStackFrame) {
+    var voff: i64 = PeStackFrame_find_offset(frame, value);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, voff);
+    X86Encoder_cvtsi2sd_r64(&mut self.enc, 0, REG_RAX);
+    match to {
+        IrType::F32 => {
+            X86Encoder_movss_mem_rbp_xmm(&mut self.enc, dst, 0);
+        }
+        _ => {
+            X86Encoder_movsd_mem_rbp_xmm(&mut self.enc, dst, 0);
+        }
+    }
+}
+
+fn PeCodeGen_gen_inst_float_to_int(self: &mut PeCodeGen, dst: i64, value: i64, from: IrType, frame: &PeStackFrame) {
+    var voff: i64 = PeStackFrame_find_offset(frame, value);
+    match from {
+        IrType::F32 => {
+            X86Encoder_movss_xmm_mem_rbp(&mut self.enc, 0, voff);
+        }
+        _ => {
+            X86Encoder_movsd_xmm_mem_rbp(&mut self.enc, 0, voff);
+        }
+    }
+    X86Encoder_cvttsd2si_r64(&mut self.enc, REG_RAX, 0);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+fn PeCodeGen_gen_inst_bitcast(self: &mut PeCodeGen, dst: i64, value: i64, frame: &PeStackFrame) {
+    var voff: i64 = PeStackFrame_find_offset(frame, value);
+    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, voff);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
+fn PeCodeGen_gen_inst_panic(self: &mut PeCodeGen, msg: str) {
+    var str_off: i64 = PeCodeGen_get_string_offset(self, msg);
+    if str_off >= 0 {
+        X86Encoder_lea_rip(&mut self.enc, REG_RCX, str_off);
+    } else {
+        X86Encoder_xor_self(&mut self.enc, REG_RCX);
+    }
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_panic"));
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+}
+
+fn PeCodeGen_gen_inst_default(self: &mut PeCodeGen, dst: i64) {
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+}
+
 pub fn PeCodeGen_gen_inst(self: &mut PeCodeGen, id: i64, inst: Inst, frame: &PeStackFrame, module: IrModule) {
     var dst: i64 = PeStackFrame_find_offset(frame, id);
 
     match inst {
         Inst::ConstInt(value, _) => {
-            X86Encoder_mov_imm64(&mut self.enc, REG_RAX, value);
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            PeCodeGen_gen_inst_const_int(self, dst, value);
         }
         Inst::ConstBool(value) => {
-            if value {
-                X86Encoder_mov_imm64(&mut self.enc, REG_RAX, 1);
-            } else {
-                X86Encoder_xor_self(&mut self.enc, REG_RAX);
-            }
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            PeCodeGen_gen_inst_const_bool(self, dst, value);
         }
         Inst::ConstStr(value) => {
-            // Check if it's a function name
-            var func_label: i64 = PeCodeGen_get_func_label(self, value);
-            if func_label >= 0 {
-                X86Encoder_lea_label(&mut self.enc, REG_RAX, func_label);
-            } else {
-                var str_off: i64 = PeCodeGen_get_string_offset(self, value);
-                if str_off >= 0 {
-                    X86Encoder_lea_rip(&mut self.enc, REG_RAX, str_off);
-                } else {
-                    X86Encoder_xor_self(&mut self.enc, REG_RAX);
-                }
-            }
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            PeCodeGen_gen_inst_const_str(self, dst, value);
         }
-        Inst::ConstFloat(value, ty) => {
-            // TODO: Fides doesn't have float_to_bits yet, so we store 0
-            // as a placeholder. Float support will be added later.
-            X86Encoder_xor_self(&mut self.enc, REG_RAX);
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        Inst::ConstFloat(_, _) => {
+            PeCodeGen_gen_inst_const_float(self, dst);
         }
         Inst::ConstNull(_) => {
-            X86Encoder_xor_self(&mut self.enc, REG_RAX);
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            PeCodeGen_gen_inst_const_null(self, dst);
         }
         Inst::BinOp(op, left, right, ty) => {
-            var loff: i64 = PeStackFrame_find_offset(frame, left);
-            var roff: i64 = PeStackFrame_find_offset(frame, right);
-            if ir_type_is_float(ty) {
-                PeCodeGen_gen_float_binop(self, op, loff, roff, dst, ty);
-            } else {
-                PeCodeGen_gen_int_binop(self, op, loff, roff, dst);
-            }
+            PeCodeGen_gen_inst_binop(self, dst, op, left, right, ty, frame);
         }
         Inst::UnaryOp(op, operand, ty) => {
-            var off: i64 = PeStackFrame_find_offset(frame, operand);
-            PeCodeGen_gen_unaryop(self, op, off, dst, ty);
+            PeCodeGen_gen_inst_unaryop(self, dst, op, operand, ty, frame);
         }
         Inst::Alloca(_, _) => {
-            var data_off: i64 = PeStackFrame_find_alloca(frame, id);
-            X86Encoder_lea_rbp(&mut self.enc, REG_RAX, data_off);
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            PeCodeGen_gen_inst_alloca(self, dst, id, frame);
         }
         Inst::Load(ptr, ty) => {
-            var poff: i64 = PeStackFrame_find_offset(frame, ptr);
-            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, poff);
-            var load_size: i64 = ir_type_size(ty);
-            if load_size == 1 {
-                X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
-                // Sign-extend if needed
-                X86Encoder_movsxd_rr(&mut self.enc, REG_RAX, REG_RAX);
-            } else if load_size == 2 {
-                X86Encoder_movzx_r32_r16(&mut self.enc, REG_RAX, REG_RAX);
-                X86Encoder_movsxd_rr(&mut self.enc, REG_RAX, REG_RAX);
-            } else if load_size == 4 {
-                X86Encoder_movsxd_rr(&mut self.enc, REG_RAX, REG_RAX);
-            } else {
-                X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RAX);
-            }
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            PeCodeGen_gen_inst_load(self, dst, ptr, ty, frame);
         }
         Inst::Store(ptr, value, opt_ty) => {
-            var poff: i64 = PeStackFrame_find_offset(frame, ptr);
-            var voff: i64 = PeStackFrame_find_offset(frame, value);
-            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, poff);
-            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RCX, voff);
-            var store_size: i64 = 8;
-            match opt_ty {
-                OptIrType::Some(ty) => {
-                    store_size = ir_type_size(ty);
-                }
-                _ => {}
-            }
-            if store_size == 1 {
-                X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_RAX, REG_RCX);
-            } else if store_size == 2 {
-                X86Encoder_mov_ptr_reg32(&mut self.enc, REG_RAX, REG_RCX);
-            } else if store_size == 4 {
-                X86Encoder_mov_ptr_reg32(&mut self.enc, REG_RAX, REG_RCX);
-            } else {
-                X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_RCX);
-            }
+            PeCodeGen_gen_inst_store(self, ptr, value, opt_ty, frame);
         }
         Inst::GetFieldPtr(struct_ptr, field_index, _) => {
-            var poff: i64 = PeStackFrame_find_offset(frame, struct_ptr);
-            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, poff);
-            // For now, use field_index * 8 as offset
-            // TODO: look up real struct layout
-            X86Encoder_add_r_i32(&mut self.enc, REG_RAX, field_index * 8);
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            PeCodeGen_gen_inst_get_field_ptr(self, dst, struct_ptr, field_index, frame);
         }
         Inst::GetElemPtr(array_ptr, index, elem_ty) => {
-            var poff: i64 = PeStackFrame_find_offset(frame, array_ptr);
-            var ioff: i64 = PeStackFrame_find_offset(frame, index);
-            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, poff);
-            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RCX, ioff);
-            var elem_size: i64 = ir_type_size(elem_ty);
-            if elem_size < 8 { elem_size = 8; }
-            X86Encoder_imul_r_r_imm32(&mut self.enc, REG_RCX, REG_RCX, elem_size);
-            X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            PeCodeGen_gen_inst_get_elem_ptr(self, dst, array_ptr, index, elem_ty, frame);
         }
         Inst::Jump(target) => {
-            var lbl: i64 = PeCodeGen_get_block_label(self, 0, target);
-            if lbl >= 0 {
-                X86Encoder_jmp_label(&mut self.enc, lbl);
-            }
+            PeCodeGen_gen_inst_jump(self, target);
         }
         Inst::Branch(cond, then_blk, else_blk) => {
-            var coff: i64 = PeStackFrame_find_offset(frame, cond);
-            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, coff);
-            X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
-            var then_lbl: i64 = PeCodeGen_get_block_label(self, 0, then_blk);
-            if then_lbl >= 0 {
-                X86Encoder_jcc_label(&mut self.enc, 5, then_lbl); // jne
-            }
-            var else_lbl: i64 = PeCodeGen_get_block_label(self, 0, else_blk);
-            if else_lbl >= 0 {
-                X86Encoder_jmp_label(&mut self.enc, else_lbl);
-            }
+            PeCodeGen_gen_inst_branch(self, cond, then_blk, else_blk, frame);
         }
         Inst::Return(opt_val) => {
-            match opt_val {
-                OptValueId::Some(v) => {
-                    var voff: i64 = PeStackFrame_find_offset(frame, v);
-                    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, voff);
-                }
-                _ => {
-                    X86Encoder_xor_self(&mut self.enc, REG_RAX);
-                }
-            }
-            X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
-            X86Encoder_pop(&mut self.enc, REG_RBP);
-            X86Encoder_ret(&mut self.enc);
+            PeCodeGen_gen_inst_return(self, opt_val, frame);
         }
         Inst::Unreachable => {
             X86Encoder_ud2(&mut self.enc);
@@ -1948,92 +2084,34 @@ pub fn PeCodeGen_gen_inst(self: &mut PeCodeGen, id: i64, inst: Inst, frame: &PeS
             PeCodeGen_gen_call_ptr(self, fn_ptr, args, dst, frame);
         }
         Inst::IntExtend(value, _, _) => {
-            var voff: i64 = PeStackFrame_find_offset(frame, value);
-            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, voff);
-            X86Encoder_movsxd_rr(&mut self.enc, REG_RAX, REG_RAX);
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            PeCodeGen_gen_inst_int_extend(self, dst, value, frame);
         }
         Inst::IntTrunc(value, to, _) => {
-            var voff: i64 = PeStackFrame_find_offset(frame, value);
-            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, voff);
-            // Truncate by zeroing upper bits
-            match to {
-                IrType::U8 => {
-                    X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
-                }
-                IrType::I8 => {
-                    X86Encoder_movzx_r32_r8(&mut self.enc, REG_RAX, REG_RAX);
-                }
-                IrType::U16 => {
-                    X86Encoder_movzx_r32_r16(&mut self.enc, REG_RAX, REG_RAX);
-                }
-                IrType::I16 => {
-                    X86Encoder_movzx_r32_r16(&mut self.enc, REG_RAX, REG_RAX);
-                }
-                _ => {
-                    // 32-bit: zero upper 32 bits (mov eax, eax)
-                    // Already 64-bit, no-op for now
-                }
-            }
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            PeCodeGen_gen_inst_int_trunc(self, dst, value, to, frame);
         }
         Inst::IntToFloat(value, _, to) => {
-            var voff: i64 = PeStackFrame_find_offset(frame, value);
-            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, voff);
-            X86Encoder_cvtsi2sd_r64(&mut self.enc, 0, REG_RAX);
-            match to {
-                IrType::F32 => {
-                    X86Encoder_movss_mem_rbp_xmm(&mut self.enc, dst, 0);
-                }
-                _ => {
-                    X86Encoder_movsd_mem_rbp_xmm(&mut self.enc, dst, 0);
-                }
-            }
+            PeCodeGen_gen_inst_int_to_float(self, dst, value, to, frame);
         }
         Inst::FloatToInt(value, from, _) => {
-            var voff: i64 = PeStackFrame_find_offset(frame, value);
-            match from {
-                IrType::F32 => {
-                    X86Encoder_movss_xmm_mem_rbp(&mut self.enc, 0, voff);
-                }
-                _ => {
-                    X86Encoder_movsd_xmm_mem_rbp(&mut self.enc, 0, voff);
-                }
-            }
-            X86Encoder_cvttsd2si_r64(&mut self.enc, REG_RAX, 0);
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            PeCodeGen_gen_inst_float_to_int(self, dst, value, from, frame);
         }
         Inst::BitCast(value, _, _) => {
-            var voff: i64 = PeStackFrame_find_offset(frame, value);
-            X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, voff);
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            PeCodeGen_gen_inst_bitcast(self, dst, value, frame);
         }
         Inst::Print(value, ty) => {
             PeCodeGen_gen_print_inst(self, frame, value, ty);
         }
         Inst::Panic(msg) => {
-            var str_off: i64 = PeCodeGen_get_string_offset(self, msg);
-            if str_off >= 0 {
-                X86Encoder_lea_rip(&mut self.enc, REG_RCX, str_off);
-            } else {
-                X86Encoder_xor_self(&mut self.enc, REG_RCX);
-            }
-            X86Encoder_sub_rsp_i32(&mut self.enc, 32);
-            X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_panic"));
-            X86Encoder_add_rsp_i32(&mut self.enc, 32);
+            PeCodeGen_gen_inst_panic(self, msg);
         }
         Inst::MakeDyn(_, _, _) => {
-            X86Encoder_xor_self(&mut self.enc, REG_RAX);
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            PeCodeGen_gen_inst_default(self, dst);
         }
         Inst::DynCall(_, _, _, _, _) => {
-            X86Encoder_xor_self(&mut self.enc, REG_RAX);
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            PeCodeGen_gen_inst_default(self, dst);
         }
         _ => {
-            // No-op for unhandled instructions
-            X86Encoder_xor_self(&mut self.enc, REG_RAX);
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            PeCodeGen_gen_inst_default(self, dst);
         }
     }
 }
@@ -2367,87 +2445,76 @@ pub fn PeCodeGen_gen_runtime_stubs(self: &mut PeCodeGen) {
 }
 
 // p_print_int(rcx = value) — prints an i64 followed by newline
+// Writes digits backwards from buffer end, handles negatives, single WriteFile.
 pub fn PeCodeGen_gen_print_int(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_print_int");
     X86Encoder_place_label(&mut self.enc, lbl);
-    // Simple implementation: convert int to string, then call p_print_str
-    // For now, use a minimal approach: call WriteFile directly
-    // This is a stub — full implementation needs int-to-string conversion
-
-    // Save rcx (the value to print)
     X86Encoder_push(&mut self.enc, REG_RBP);
     X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
-    X86Encoder_sub_rsp_i32(&mut self.enc, 64);
+    X86Encoder_push(&mut self.enc, REG_R12);
+    X86Encoder_push(&mut self.enc, REG_R13);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 80);
 
-    // Store the value at [rbp-8]
-    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -8, REG_RCX);
+    // rax = value, r12 = original value (for sign check later)
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
 
-    // Convert int to string: handle negative, divide by 10 repeatedly
-    // For simplicity, just print "0" for now — full impl in gen_print_int_full
-    X86Encoder_xor_self(&mut self.enc, REG_RAX);
-    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -16, REG_RAX); // digit count
+    // r8 = buffer end pointer (end of local space at [rbp-24])
+    X86Encoder_lea_rbp(&mut self.enc, REG_R8, -24);
+    // Save buffer end in r13 for length calculation later
+    X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_R8);
 
-    // Handle negative
-    X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, -8);
-    // Check if zero
-    X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
-    var is_zero: i64 = X86Encoder_alloc_label(&mut self.enc);
-    var not_zero: i64 = X86Encoder_alloc_label(&mut self.enc);
-    X86Encoder_jcc_label(&mut self.enc, 4, is_zero); // je
+    // mov byte [r8], 10 (newline) — use rdx as temp
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RDX, 10);
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_R8, REG_RDX);
 
-    // Not zero — convert to digits
-    // Check negative
-    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
-    // Check sign
-    X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
-    var neg_lbl: i64 = X86Encoder_alloc_label(&mut self.enc);
-    var pos_lbl: i64 = X86Encoder_alloc_label(&mut self.enc);
-    X86Encoder_jcc_label(&mut self.enc, 12, neg_lbl); // jl (negative)
-
-    // Positive: build digits at [rbp-40]
-    X86Encoder_place_label(&mut self.enc, pos_lbl);
-    // Simple loop: divide by 10, store digits backwards
-    var buf_start: i64 = -40;
-    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, buf_start);
-    X86Encoder_mov_imm32(&mut self.enc, REG_R8, 0); // digit index
-
-    var loop_lbl: i64 = X86Encoder_alloc_label(&mut self.enc);
-    X86Encoder_place_label(&mut self.enc, loop_lbl);
-    X86Encoder_xor_self(&mut self.enc, REG_R9); // clear for remainder
+    // r9 = 10 (divisor)
     X86Encoder_mov_imm32(&mut self.enc, REG_R9, 10);
-    X86Encoder_cqo(&mut self.enc);
-    X86Encoder_idiv_r(&mut self.enc, REG_R9);
-    // RDX = digit, RAX = quotient
-    X86Encoder_add_r_i8(&mut self.enc, REG_RDX, 48); // '0'
-    // Store digit
-    X86Encoder_mov_mem_idx_reg8(&mut self.enc, REG_RDX, REG_R8, REG_RDX);
-    X86Encoder_inc_r(&mut self.enc, REG_R8);
-    // Continue if quotient != 0
+
+    // test rax, rax; jns pi_pos; neg rax
     X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
-    X86Encoder_jcc_label(&mut self.enc, 5, loop_lbl); // jne
+    var pi_pos: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 9, pi_pos); // jns
+    X86Encoder_neg_r(&mut self.enc, REG_RAX);
+    X86Encoder_place_label(&mut self.enc, pi_pos);
 
-    // Now print digits in reverse order
-    // For each digit from R8-1 down to 0, call WriteFile
-    var print_loop: i64 = X86Encoder_alloc_label(&mut self.enc);
-    X86Encoder_dec_r(&mut self.enc, REG_R8); // start from last digit
-    X86Encoder_place_label(&mut self.enc, print_loop);
+    // pi_loop: dec r8; xor rdx,rdx; div r9; add dl,'0'; mov [r8],dl; test rax,rax; jnz pi_loop
+    var pi_loop: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, pi_loop);
+    X86Encoder_dec_r(&mut self.enc, REG_R8);
+    X86Encoder_xor_self(&mut self.enc, REG_RDX);
+    X86Encoder_div_r(&mut self.enc, REG_R9); // unsigned div
+    X86Encoder_add_r_i8(&mut self.enc, REG_RDX, 48); // '0'
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_R8, REG_RDX);
+    X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
+    X86Encoder_jcc_label(&mut self.enc, 5, pi_loop); // jnz
 
-    // Get digit address
-    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, buf_start);
-    // Write single byte using WriteFile
-    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, -11); // STD_OUTPUT_HANDLE
+    // Check if original value (r12) was negative; if so prepend '-'
+    var pi_no_neg: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_test_rr(&mut self.enc, REG_R12, REG_R12);
+    X86Encoder_jcc_label(&mut self.enc, 9, pi_no_neg); // jns — skip if non-negative
+    X86Encoder_dec_r(&mut self.enc, REG_R8);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RDX, 45); // '-'
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_R8, REG_RDX);
+    X86Encoder_place_label(&mut self.enc, pi_no_neg);
+
+    // GetStdHandle(-11)
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, -11);
     X86Encoder_sub_rsp_i32(&mut self.enc, 32);
     X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_GET_STD_HANDLE));
     X86Encoder_add_rsp_i32(&mut self.enc, 32);
-    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX); // hFile
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RAX); // handle
 
-    // Buffer = rdx + r8
-    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, buf_start);
-    // Actually we need the address of the current digit
-    // For simplicity, just write the whole buffer
-    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_RDX); // buffer
-    X86Encoder_mov_imm32(&mut self.enc, REG_R8, 1); // nBytesToWrite
-    X86Encoder_lea_rbp(&mut self.enc, REG_R9, -24); // &written
+    // length = r13 - r8 + 1
+    X86Encoder_mov_rr(&mut self.enc, REG_R9, REG_R13);
+    X86Encoder_sub_rr(&mut self.enc, REG_R9, REG_R8);
+    X86Encoder_add_r_i8(&mut self.enc, REG_R9, 1);
+
+    // WriteFile(handle, r8, len, &written, NULL)
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R12); // handle
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_R8);  // buffer
+    X86Encoder_mov_rr(&mut self.enc, REG_R8, REG_R9);   // length
+    X86Encoder_lea_rbp(&mut self.enc, REG_R9, -32);     // &written
     X86Encoder_xor_self(&mut self.enc, REG_RAX);
     X86Encoder_mov_mem_disp_reg32(&mut self.enc, REG_R9, 0, REG_RAX);
 
@@ -2457,68 +2524,13 @@ pub fn PeCodeGen_gen_print_int(self: &mut PeCodeGen) {
     X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_WRITE_FILE));
     X86Encoder_add_rsp_i32(&mut self.enc, 48);
 
-    X86Encoder_dec_r(&mut self.enc, REG_R8);
-    // Continue if R8 >= 0
-    X86Encoder_test_rr(&mut self.enc, REG_R8, REG_R8);
-    X86Encoder_jcc_label(&mut self.enc, 12, print_loop); // jl would exit; use jns to continue
-    // Actually let's just jump if not negative
-    // This is getting complex — let me simplify
-
-    // Jump to epilogue
-    var done: i64 = X86Encoder_alloc_label(&mut self.enc);
-    X86Encoder_jmp_label(&mut self.enc, done);
-
-    // Zero case
-    X86Encoder_place_label(&mut self.enc, is_zero);
-    // Print '0'
-    X86Encoder_mov_imm32(&mut self.enc, REG_RAX, 48); // '0'
-    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -40, REG_RAX);
-    // WriteFile
-    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, -11);
-    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
-    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_GET_STD_HANDLE));
-    X86Encoder_add_rsp_i32(&mut self.enc, 32);
-    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
-    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, -40);
-    X86Encoder_mov_imm32(&mut self.enc, REG_R8, 1);
-    X86Encoder_lea_rbp(&mut self.enc, REG_R9, -24);
+    // return 0
     X86Encoder_xor_self(&mut self.enc, REG_RAX);
-    X86Encoder_mov_mem_disp_reg32(&mut self.enc, REG_R9, 0, REG_RAX);
-    X86Encoder_sub_rsp_i32(&mut self.enc, 48);
-    X86Encoder_xor_self(&mut self.enc, REG_RAX);
-    X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_RSP, 32, REG_RAX);
-    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_WRITE_FILE));
-    X86Encoder_add_rsp_i32(&mut self.enc, 48);
-
-    X86Encoder_place_label(&mut self.enc, done);
-    // Print newline
-    X86Encoder_mov_imm32(&mut self.enc, REG_RAX, 10); // '\n'
-    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -40, REG_RAX);
-    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, -11);
-    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
-    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_GET_STD_HANDLE));
-    X86Encoder_add_rsp_i32(&mut self.enc, 32);
-    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
-    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, -40);
-    X86Encoder_mov_imm32(&mut self.enc, REG_R8, 1);
-    X86Encoder_lea_rbp(&mut self.enc, REG_R9, -24);
-    X86Encoder_xor_self(&mut self.enc, REG_RAX);
-    X86Encoder_mov_mem_disp_reg32(&mut self.enc, REG_R9, 0, REG_RAX);
-    X86Encoder_sub_rsp_i32(&mut self.enc, 48);
-    X86Encoder_xor_self(&mut self.enc, REG_RAX);
-    X86Encoder_mov_mem_disp_reg(&mut self.enc, REG_RSP, 32, REG_RAX);
-    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_WRITE_FILE));
-    X86Encoder_add_rsp_i32(&mut self.enc, 48);
-
-    // Epilogue
-    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_add_rsp_i32(&mut self.enc, 80);
+    X86Encoder_pop(&mut self.enc, REG_R13);
+    X86Encoder_pop(&mut self.enc, REG_R12);
     X86Encoder_pop(&mut self.enc, REG_RBP);
     X86Encoder_ret(&mut self.enc);
-
-    // Negative label (unused for now, just jump to positive path)
-    X86Encoder_place_label(&mut self.enc, neg_lbl);
-    X86Encoder_neg_r(&mut self.enc, REG_RCX);
-    X86Encoder_jmp_label(&mut self.enc, pos_lbl);
 }
 
 // Helper: emit GetStdHandle(-11) call, result in RAX
@@ -2689,44 +2701,69 @@ pub fn PeCodeGen_gen_panic(self: &mut PeCodeGen) {
 pub fn PeCodeGen_gen_malloc(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_malloc");
     X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_push(&mut self.enc, REG_R12);
+    X86Encoder_push(&mut self.enc, REG_R13);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 48);
+
+    // Save size in r12 before GetProcessHeap clobbers RCX
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
+
     // GetProcessHeap()
     X86Encoder_sub_rsp_i32(&mut self.enc, 32);
     X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_GET_PROCESS_HEAP));
     X86Encoder_add_rsp_i32(&mut self.enc, 32);
-    // rax = heap handle
+    X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_RAX); // r13 = heap handle
+
     // HeapAlloc(heap, 0, size)
-    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX); // heap
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R13); // heap
     X86Encoder_xor_self(&mut self.enc, REG_RDX); // flags = 0
-    // R8 = size (already in RCX from caller, but we clobbered it)
-    // Actually we need to save the original size before calling GetProcessHeap
-    // Let me redo this properly
-    // For now, use a simple approach: save size in R12
-    // This is a stub — proper version saves size before GetProcessHeap call
-
-    // Actually, the caller passes size in RCX. We need to save it.
-    // Let me restructure:
-    // push rbp; mov rbp,rsp; sub rsp,32
-    // mov [rbp-8], rcx  ; save size
-    // call GetProcessHeap
-    // mov rcx, rax     ; heap
-    // xor rdx, rdx     ; flags
-    // mov r8, [rbp-8]  ; size
-    // call HeapAlloc
-    // leave; ret
-
-    // Since we already called GetProcessHeap, let's just use a simpler stub
-    X86Encoder_mov_imm32(&mut self.enc, REG_R8, 0); // size = 0 (stub)
+    X86Encoder_mov_rr(&mut self.enc, REG_R8, REG_R12); // size (saved)
     X86Encoder_sub_rsp_i32(&mut self.enc, 32);
     X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_HEAP_ALLOC));
     X86Encoder_add_rsp_i32(&mut self.enc, 32);
+
+    X86Encoder_add_rsp_i32(&mut self.enc, 48);
+    X86Encoder_pop(&mut self.enc, REG_R13);
+    X86Encoder_pop(&mut self.enc, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_free(rcx = ptr) — no-op for now (HeapFree)
+// p_free(rcx = ptr) — HeapFree the pointer
 pub fn PeCodeGen_gen_free(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_free");
     X86Encoder_place_label(&mut self.enc, lbl);
-    // Stub: just return (leak memory)
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_push(&mut self.enc, REG_R12);
+    X86Encoder_push(&mut self.enc, REG_R13);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 48);
+
+    // Save ptr in r12
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
+
+    // GetProcessHeap()
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_GET_PROCESS_HEAP));
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+    X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_RAX); // r13 = heap handle
+
+    // HeapFree(heap, 0, ptr)
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R13); // heap
+    X86Encoder_xor_self(&mut self.enc, REG_RDX); // flags = 0
+    X86Encoder_mov_rr(&mut self.enc, REG_R8, REG_R12); // ptr (saved)
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_HEAP_FREE));
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+
+    X86Encoder_add_rsp_i32(&mut self.enc, 48);
+    X86Encoder_pop(&mut self.enc, REG_R13);
+    X86Encoder_pop(&mut self.enc, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
     X86Encoder_ret(&mut self.enc);
 }
 
@@ -3629,11 +3666,106 @@ pub fn PeCodeGen_gen_map_insert(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_map_remove(rcx=*Map, rdx=*u8 key) — removes key (shift remaining)
+// p_map_remove(rcx=*Map, rdx=*u8 key) — removes key (shift remaining entries left)
 pub fn PeCodeGen_gen_map_remove(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_map_remove");
     X86Encoder_place_label(&mut self.enc, lbl);
-    // Stub: no-op for now (linear map removal is complex)
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_push(&mut self.enc, REG_R12);
+    X86Encoder_push(&mut self.enc, REG_R13);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX); // map
+    X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_RDX); // key
+
+    // r8 = len = [r12 + 8]
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_R8, REG_RAX);
+    X86Encoder_xor_self(&mut self.enc, REG_R9); // index = 0
+
+    var mr_loop: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, mr_loop);
+    X86Encoder_cmp_rr(&mut self.enc, REG_R9, REG_R8);
+    var mr_done: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 3, mr_done); // jae — done
+
+    // Get entry key: ptr = [r12], entry = ptr + r9*16, key = [entry]
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R9);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RCX, 4);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RCX, REG_RAX); // rcx = entry key ptr
+
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_R13); // rdx = search key
+    var mr_cmp: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, mr_cmp);
+    X86Encoder_xor_self(&mut self.enc, REG_R10);
+    X86Encoder_xor_self(&mut self.enc, REG_R11);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_R10, REG_RCX);
+    X86Encoder_mov_reg8_ptr(&mut self.enc, REG_R11, REG_RDX);
+    X86Encoder_cmp_rr(&mut self.enc, REG_R10, REG_R11);
+    var mr_mismatch: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 5, mr_mismatch); // jne
+    X86Encoder_test_rr(&mut self.enc, REG_R10, REG_R10);
+    var mr_found: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, mr_found); // jz — null terminator, match
+    X86Encoder_inc_r(&mut self.enc, REG_RCX);
+    X86Encoder_inc_r(&mut self.enc, REG_RDX);
+    X86Encoder_jmp_label(&mut self.enc, mr_cmp);
+
+    X86Encoder_place_label(&mut self.enc, mr_found);
+    // Shift remaining entries left by 1
+    // r10 = i = found index, r8 = len
+    X86Encoder_mov_rr(&mut self.enc, REG_R10, REG_R9); // i = found index
+    var mr_shift: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, mr_shift);
+    // if i >= len-1, done shifting
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R8);
+    X86Encoder_dec_r(&mut self.enc, REG_RAX);
+    X86Encoder_cmp_rr(&mut self.enc, REG_R10, REG_RAX);
+    var mr_shift_done: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 3, mr_shift_done); // jae — done
+
+    // Copy entry[i+1] to entry[i]
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R10);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RCX, 4);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX); // rax = &entry[i]
+    // entry[i+1] key
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_RAX);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RDX, 16);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RDX, REG_RDX);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_RDX);
+    // entry[i+1] value
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_RAX);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RDX, 24); // entry[i].value + 16 = entry[i+1].value
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RDX, REG_RDX);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_RDX);
+
+    X86Encoder_inc_r(&mut self.enc, REG_R10);
+    X86Encoder_jmp_label(&mut self.enc, mr_shift);
+    X86Encoder_place_label(&mut self.enc, mr_shift_done);
+
+    // len--
+    X86Encoder_dec_r(&mut self.enc, REG_R8);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_ptr_reg(&mut self.enc, REG_RAX, REG_R8);
+    X86Encoder_jmp_label(&mut self.enc, mr_done);
+
+    X86Encoder_place_label(&mut self.enc, mr_mismatch);
+    X86Encoder_inc_r(&mut self.enc, REG_R9);
+    X86Encoder_jmp_label(&mut self.enc, mr_loop);
+
+    X86Encoder_place_label(&mut self.enc, mr_done);
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+    X86Encoder_pop(&mut self.enc, REG_R13);
+    X86Encoder_pop(&mut self.enc, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
     X86Encoder_ret(&mut self.enc);
 }
 
@@ -3754,13 +3886,37 @@ pub fn PeCodeGen_gen_to_str_float(self: &mut PeCodeGen) {
     X86Encoder_mulsd(&mut self.enc, 0, 1);
     X86Encoder_cvttsd2si_r64(&mut self.enc, REG_RAX, 0);
     // rax = fractional digits as int (0-999999)
+    // Save frac int in r14
+    X86Encoder_mov_rr(&mut self.enc, REG_R14, REG_RAX);
 
-    // Convert to string with leading zeros (6 digits)
-    // Simple approach: just call p_to_str and append
-    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
-    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_to_str"));
+    // Build 6-digit zero-padded string on stack at [rbp-48..rbp-42]
+    // Write digits backwards from [rbp-42] (position 5) down to [rbp-48] (position 0)
+    // r14 = remaining value, r8 = digit position (5 down to 0)
+    X86Encoder_mov_imm32(&mut self.enc, REG_R8, 6); // count = 6
+    var tf_frac_loop: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, tf_frac_loop);
+    X86Encoder_dec_r(&mut self.enc, REG_R8); // position from 5 down to 0
+    // digit = r14 % 10
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R14);
+    X86Encoder_xor_self(&mut self.enc, REG_RDX);
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, 10);
+    X86Encoder_div_r(&mut self.enc, REG_RCX); // rax = quotient, rdx = remainder
+    X86Encoder_mov_rr(&mut self.enc, REG_R14, REG_RAX); // r14 = quotient
+    // Store digit char at [rbp-48 + r8]
+    X86Encoder_add_r_i8(&mut self.enc, REG_RDX, 48); // '0'
+    X86Encoder_lea_rbp(&mut self.enc, REG_R9, -48);
+    X86Encoder_mov_mem_idx_reg8(&mut self.enc, REG_R9, REG_R8, REG_RDX);
+    // Continue if r8 > 0
+    X86Encoder_test_rr(&mut self.enc, REG_R8, REG_R8);
+    X86Encoder_jcc_label(&mut self.enc, 5, tf_frac_loop); // jnz
+
+    // Null-terminate at [rbp-42]
+    X86Encoder_xor_self(&mut self.enc, REG_RAX);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -42, REG_RAX);
+
+    // Append the 6-digit fractional string to result
     X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R13);
-    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_RAX);
+    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, -48);
     X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_str_concat"));
 
     X86Encoder_add_rsp_i32(&mut self.enc, 264);
@@ -3773,13 +3929,315 @@ pub fn PeCodeGen_gen_to_str_float(self: &mut PeCodeGen) {
 }
 
 // p_to_str_vec(rcx=*Vec) -> rax = string like "[1, 2, 3]"
-// Simplified: just prints "[...]" with element count
+// Iterates elements, converts each to string, joins with ", "
 pub fn PeCodeGen_gen_to_str_vec(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_to_str_vec");
     X86Encoder_place_label(&mut self.enc, lbl);
-    // Stub: return "[]" — full implementation would iterate elements
-    var empty_off: i64 = PeCodeGen_get_string_offset(self, "[]");
-    X86Encoder_lea_rip(&mut self.enc, REG_RAX, empty_off);
+    // Prologue: push rbp + 4 callee-saved = 5 pushes = 40 bytes
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_push(&mut self.enc, REG_R12); // vec ptr
+    X86Encoder_push(&mut self.enc, REG_R13); // element index
+    X86Encoder_push(&mut self.enc, REG_R14); // len
+    X86Encoder_push(&mut self.enc, REG_R15); // result string
+    X86Encoder_sub_rsp_i32(&mut self.enc, 40); // 32 shadow + 8 align
+
+    // r12 = vec ptr
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
+
+    // Start with "[" — malloc 2 bytes, store '[', '\0'
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, 2);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_malloc"));
+    X86Encoder_mov_rr(&mut self.enc, REG_R15, REG_RAX); // r15 = result
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RCX, 91); // '['
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_R15, REG_RCX);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RCX, 0);
+    X86Encoder_mov_mem_disp_reg8(&mut self.enc, REG_R15, 1, REG_RCX);
+
+    // r13 = 0 (index), r14 = len = [r12 + 8]
+    X86Encoder_xor_self(&mut self.enc, REG_R13);
+    X86Encoder_mov_reg_mem_disp(&mut self.enc, REG_R14, REG_R12, 8);
+
+    // Loop: for each element
+    var tv_loop: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, tv_loop);
+    X86Encoder_cmp_rr(&mut self.enc, REG_R13, REG_R14);
+    var tv_done: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 3, tv_done); // jae — done
+
+    // If index > 0, append ", "
+    X86Encoder_test_rr(&mut self.enc, REG_R13, REG_R13);
+    var tv_first: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, tv_first); // jz — first element, skip comma
+    // Build ", \0" on stack at [rbp-16]
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 44); // ','
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -16, REG_RAX);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 32); // ' '
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -15, REG_RAX);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 0);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -14, REG_RAX);
+    // r15 = p_str_concat(r15, &[rbp-16])
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R15);
+    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, -16);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_str_concat"));
+    X86Encoder_mov_rr(&mut self.enc, REG_R15, REG_RAX);
+    X86Encoder_place_label(&mut self.enc, tv_first);
+
+    // Get element: buf = [r12], element = buf[r13*8]
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_R12); // rax = buf ptr
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R13);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RCX, 3);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RCX, REG_RAX); // rcx = element value (i64)
+
+    // Call p_to_str(element) -> rax = string
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_to_str"));
+
+    // Append to result: r15 = p_str_concat(r15, rax)
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R15);
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_RAX);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_str_concat"));
+    X86Encoder_mov_rr(&mut self.enc, REG_R15, REG_RAX);
+
+    // inc r13, loop
+    X86Encoder_inc_r(&mut self.enc, REG_R13);
+    X86Encoder_jmp_label(&mut self.enc, tv_loop);
+
+    X86Encoder_place_label(&mut self.enc, tv_done);
+    // Append "]" — build "]\0" on stack at [rbp-16]
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 93); // ']'
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -16, REG_RAX);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 0);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -15, REG_RAX);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R15);
+    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, -16);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_str_concat"));
+    // rax = result
+
+    // Epilogue
+    X86Encoder_add_rsp_i32(&mut self.enc, 40);
+    X86Encoder_pop(&mut self.enc, REG_R15);
+    X86Encoder_pop(&mut self.enc, REG_R14);
+    X86Encoder_pop(&mut self.enc, REG_R13);
+    X86Encoder_pop(&mut self.enc, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_print_vec(rcx=*Vec) — prints [1, 2, 3] with newline
+pub fn PeCodeGen_gen_print_vec(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_print_vec");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_push(&mut self.enc, REG_R12);
+    X86Encoder_push(&mut self.enc, REG_R13);
+    X86Encoder_push(&mut self.enc, REG_R14);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 56);
+
+    // r12 = vec ptr, r13 = len, r14 = index
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
+
+    // Print '['
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 91); // '['
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -40, REG_RAX);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 0);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -39, REG_RAX);
+    X86Encoder_lea_rbp(&mut self.enc, REG_RCX, -40);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_print_str"));
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+
+    // r13 = len = [r12 + 8]
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_R13, REG_RAX);
+    X86Encoder_xor_self(&mut self.enc, REG_R14); // index = 0
+
+    var pv_loop: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, pv_loop);
+    X86Encoder_cmp_rr(&mut self.enc, REG_R14, REG_R13);
+    var pv_done: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 3, pv_done); // jae — done
+
+    // if index > 0, print ", "
+    X86Encoder_test_rr(&mut self.enc, REG_R14, REG_R14);
+    var pv_nosep: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, pv_nosep); // jz — first element, no separator
+    // Print ", "
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 44); // ','
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -40, REG_RAX);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 32); // ' '
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -39, REG_RAX);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 0);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -38, REG_RAX);
+    X86Encoder_lea_rbp(&mut self.enc, REG_RCX, -40);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_print_str"));
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+    X86Encoder_place_label(&mut self.enc, pv_nosep);
+
+    // Get element: ptr[index]
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_R12); // rax = data ptr
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R14);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RCX, 3);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RAX); // rax = element value
+
+    // Print element as int
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_print_int"));
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+
+    X86Encoder_inc_r(&mut self.enc, REG_R14);
+    X86Encoder_jmp_label(&mut self.enc, pv_loop);
+    X86Encoder_place_label(&mut self.enc, pv_done);
+
+    // Print ']'
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 93); // ']'
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -40, REG_RAX);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 0);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -39, REG_RAX);
+    X86Encoder_lea_rbp(&mut self.enc, REG_RCX, -40);
+    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_print_str"));
+    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+
+    X86Encoder_add_rsp_i32(&mut self.enc, 56);
+    X86Encoder_pop(&mut self.enc, REG_R14);
+    X86Encoder_pop(&mut self.enc, REG_R13);
+    X86Encoder_pop(&mut self.enc, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_print_map(rcx=*Map) — prints {key: value, ...} with newline
+pub fn PeCodeGen_gen_print_map(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_print_map");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    // Prologue: push rbp + 4 callee-saved = 5 pushes = 40 bytes
+    X86Encoder_push(&mut self.enc, REG_RBP);
+    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+    X86Encoder_push(&mut self.enc, REG_R12); // map
+    X86Encoder_push(&mut self.enc, REG_R13); // len
+    X86Encoder_push(&mut self.enc, REG_R14); // index
+    X86Encoder_push(&mut self.enc, REG_R15); // result string
+    X86Encoder_sub_rsp_i32(&mut self.enc, 40); // 32 shadow + 8 align
+
+    // r12 = map
+    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
+
+    // Start with "{" — malloc 2 bytes, store '{', '\0'
+    X86Encoder_mov_imm32(&mut self.enc, REG_RCX, 2);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_malloc"));
+    X86Encoder_mov_rr(&mut self.enc, REG_R15, REG_RAX); // r15 = result
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RCX, 123); // '{'
+    X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_R15, REG_RCX);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RCX, 0);
+    X86Encoder_mov_mem_disp_reg8(&mut self.enc, REG_R15, 1, REG_RCX);
+
+    // r13 = len = [r12 + 8], r14 = 0
+    X86Encoder_xor_self(&mut self.enc, REG_R14);
+    X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_R13, REG_RAX);
+
+    var pm_loop: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_place_label(&mut self.enc, pm_loop);
+    X86Encoder_cmp_rr(&mut self.enc, REG_R14, REG_R13);
+    var pm_done: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 3, pm_done); // jae — done
+
+    // If index > 0, append ", "
+    X86Encoder_test_rr(&mut self.enc, REG_R14, REG_R14);
+    var pm_first: i64 = X86Encoder_alloc_label(&mut self.enc);
+    X86Encoder_jcc_label(&mut self.enc, 4, pm_first); // jz — first element, skip comma
+    // Build ", \0" on stack at [rbp-16]
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 44); // ','
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -16, REG_RAX);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 32); // ' '
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -15, REG_RAX);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 0);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -14, REG_RAX);
+    // r15 = p_str_concat(r15, &[rbp-16])
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R15);
+    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, -16);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_str_concat"));
+    X86Encoder_mov_rr(&mut self.enc, REG_R15, REG_RAX);
+    X86Encoder_place_label(&mut self.enc, pm_first);
+
+    // Get key: entry = ptr + r14*16, key = [entry]
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R14);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RCX, 4);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RCX, REG_RAX); // rcx = key ptr
+
+    // r15 = p_str_concat(r15, key)
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_RCX); // rdx = key
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R15); // rcx = result so far
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_str_concat"));
+    X86Encoder_mov_rr(&mut self.enc, REG_R15, REG_RAX);
+
+    // Append ": "
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 58); // ':'
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -16, REG_RAX);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 32); // ' '
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -15, REG_RAX);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 0);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -14, REG_RAX);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R15);
+    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, -16);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_str_concat"));
+    X86Encoder_mov_rr(&mut self.enc, REG_R15, REG_RAX);
+
+    // Get value: entry+8
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R14);
+    X86Encoder_shl_r_i8(&mut self.enc, REG_RCX, 4);
+    X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
+    X86Encoder_add_r_i32(&mut self.enc, REG_RAX, 8);
+    X86Encoder_mov_reg_ptr(&mut self.enc, REG_RCX, REG_RAX); // rcx = value (i64)
+
+    // Call p_to_str(value) -> rax = string
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_to_str"));
+
+    // r15 = p_str_concat(r15, rax)
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R15);
+    X86Encoder_mov_rr(&mut self.enc, REG_RDX, REG_RAX);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_str_concat"));
+    X86Encoder_mov_rr(&mut self.enc, REG_R15, REG_RAX);
+
+    // inc r14, loop
+    X86Encoder_inc_r(&mut self.enc, REG_R14);
+    X86Encoder_jmp_label(&mut self.enc, pm_loop);
+
+    X86Encoder_place_label(&mut self.enc, pm_done);
+    // Append "}" — build "}\0" on stack at [rbp-16]
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 125); // '}'
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -16, REG_RAX);
+    X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 0);
+    X86Encoder_mov_mem_rbp_reg(&mut self.enc, -15, REG_RAX);
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R15);
+    X86Encoder_lea_rbp(&mut self.enc, REG_RDX, -16);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_str_concat"));
+    // rax = final string
+
+    // Print the string (p_print_str adds newline)
+    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
+    X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_print_str"));
+
+    // Epilogue
+    X86Encoder_add_rsp_i32(&mut self.enc, 40);
+    X86Encoder_pop(&mut self.enc, REG_R15);
+    X86Encoder_pop(&mut self.enc, REG_R14);
+    X86Encoder_pop(&mut self.enc, REG_R13);
+    X86Encoder_pop(&mut self.enc, REG_R12);
+    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+    X86Encoder_pop(&mut self.enc, REG_RBP);
     X86Encoder_ret(&mut self.enc);
 }
 

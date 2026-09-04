@@ -3,11 +3,50 @@
 > **Goal:** The Fides compiler compiles itself, producing identical output
 > across generations (bootstrap fixpoint).
 >
-> **Last updated:** Sep 4, 2026 (session 8)
+> **Last updated:** Sep 4, 2026 (session 9)
 
 ---
 
 ## Current State (Sep 4, 2026)
+
+### Session 9 — flat_ast.fd ported + Box<T> unbox helpers in ast.fd
+
+1. **`compiler/flat_ast.fd`** (1260 lines, from `src/flat_ast.rs` 755 lines) —
+   Flat AST serialization for `dump-ast-flat` command and self-host parser
+   differential testing. Produces a line-based format with 2-space indent per
+   depth level. Serializes all AST node types: Type (29 variants), Expr (39
+   variants), Stmt (28 variants), Pattern (7 variants), Func, Param, Program.
+   Builds successfully.
+
+2. **`compiler/ast.fd`** — Added `pub fn box_expr_unbox`, `box_type_unbox`,
+   `box_pattern_unbox` as shared unbox helpers. These convert `Box<T>` back to
+   `T` for function calls, since Fides has no `*` deref operator for `Box<T>`
+   (it's `Generic("Box", [T])`, not a pointer type). Previously duplicated
+   across 6+ modules; now centralized in `ast.fd` for reuse.
+
+3. **`interp.rs` NOT ported** — Analysis revealed the self-hosted compiler
+   doesn't need an interpreter. Its `run` command uses C compilation + tcc,
+   and comptime evaluation is handled by `comptime_eval.fd` (AST-level
+   interpreter). The 5782-line `interp.rs` (with autograd, tensors, futures,
+   threads, channels, ECS, databases, etc.) is not needed for self-hosting.
+
+**Key finding: Box<T> deref gap in Fides**
+- `Box<T>` is parsed as `Generic("Box", [T])` — a named generic type, not a pointer
+- The `*` (Deref) operator only works on `Type::Ref` and `Type::RawPtr`
+- `Box::new(x)` returns `Type::Ref<T>` but the type annotation `Box<T>` is `Generic`
+- Match patterns auto-unbox `Box<T>` (runtime value is a pointer), but extracted
+  fields are still `Box<T>` — requiring manual `box_*_unbox()` helper calls
+- Proper fix would be a `Deref` trait system (future work)
+
+**debugger.rs assessment (NOT ported):**
+- `src/debugger.rs` (914 LOC) has a hard dependency on `src/interp.rs` (5782 LOC)
+- `interp.rs` contains: Value enum (14 variants), Memory struct, Interpreter
+  struct (50+ fields), `execute_inst()` (888 LOC), `call_runtime()` (3247 LOC,
+  251 runtime handlers), autograd, tensors, futures, threads, channels, ECS,
+  databases, DP, TP, KV cache, quantization
+- Fides has no closures — the debug hook mechanism would need redesign
+- The self-hosted compiler doesn't need an interpreter (uses C compilation + tcc)
+- **Verdict: Skip. Not needed for self-hosting. ~9200 LOC effort.**
 
 ### Session 8 — Linux native codegen backend ported (peephole + regalloc + codegen_x64)
 
