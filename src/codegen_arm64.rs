@@ -129,6 +129,12 @@ impl Arm64CodeGen {
                 let d = vreg_to_reg(dst);
                 self.emit(&format!("    add {}, fp, #-{}", d, slot.0));
             }
+            L3Inst::GlobalAddr { dst, name, .. } => {
+                let d = vreg_to_reg(dst);
+                // ARM64: adrp + add for RIP-relative symbol (simplified)
+                self.emit(&format!("    // global addr {}", name));
+                self.emit(&format!("    mov {}, #0", d));
+            }
             L3Inst::Mov { dst, src } => {
                 let d = vreg_to_reg(dst);
                 match src {

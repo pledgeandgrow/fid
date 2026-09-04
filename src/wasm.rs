@@ -566,6 +566,12 @@ impl WasmCodeGen {
                 if dst_has_value { self.emit_set_value(out, id, func); }
             }
 
+            Inst::GlobalAddr { .. } => {
+                // WASM doesn't have a direct global address concept; emit 0 as stub
+                self.emit_const_i64(out, 0);
+                if dst_has_value { self.emit_set_value(out, id, func); }
+            }
+
             // ─── Arithmetic ───
             Inst::BinOp { op, left, right, ty } => {
                 self.emit_value(out, *left, func);

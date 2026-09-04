@@ -3,7 +3,7 @@
 > Companion to `docs/roadmap/selfhost-roadmap.md`.
 > The full plan with debugging workflows is there. This is the short version.
 >
-> Last updated: Sep 4, 2026 (session 9).
+> Last updated: Sep 5, 2026 (session 11 — var feature + full static analysis).
 
 ---
 
@@ -25,9 +25,14 @@
 ✅ regalloc.fd — PORTED (1086 lines, from src/regalloc.rs 1096 lines)
 ✅ codegen_x64.fd — PORTED (1780 lines, from src/codegen_x64.rs 1923 lines)
 ✅ lsp.fd — PORTED (1084 lines, from src/lsp.rs 996 lines) — JSON-RPC over stdio
+✅ Module-level `var`/`pub var` — IMPLEMENTED in Rust compiler (session 11)
+✅ Full static analysis of all 24 compiler/*.fd files — COMPLETED (session 11)
 ⬜ Fixpoint — NOT YET VERIFIED (fides-c2 crashes on stdlib lexing)
 ⬜ Native codegen integration — ported but not wired into compiler pipeline
 ⬜ LSP integration — ported but blocked by pre-existing parse error in codegen_c.fd
+⬜ Mirror var feature to compiler/*.fd — NOT YET DONE (Rust-only so far)
+⬜ Fix P0 bugs in parser.fd and lexer.fd — IDENTIFIED but not yet fixed
+⬜ Fix inc.fd global_cache_* using var feature — IDENTIFIED but not yet done
 ```
 
 **MILESTONE (session 9):** LSP server ported to Fides:
@@ -189,6 +194,20 @@ diff release\fides-c2_test.exe.c release\fides-c3.exe.c
    resolving imports. This blocks rebuilding fides-c.exe with current code.
    Reproduces with prior commit's files (not caused by session 9 LSP work).
 3. **Debug prints** — 38 `p_eprint_str` calls produce noisy stderr output
+4. **P0 bugs in parser.fd and lexer.fd** (session 11 static analysis):
+   - `lexer.fd:291` — duplicate empty `str_filter_underscores` stub
+   - `parser.fd` — `box_expr_deref` references 8 non-existent `Expr` variants
+   - `parser.fd` — missing `return` in 4 parse functions
+   - `parser.fd` — duplicate `var has_forward` in `parse_layer`/`parse_model`
+   - `parser.fd:4684` — `parse_use` version-pin always returns Err
+   These must be fixed before the self-hosted compiler can compile its own
+   parser and lexer modules correctly.
+5. **`var` feature not yet mirrored to `compiler/*.fd`** — the Rust compiler
+   now supports module-level `var`/`pub var`, but the Fides self-hosted
+   compiler files (`ast.fd`, `parser.fd`, `typechecker.fd`, `lower.fd`,
+   `codegen_c.fd`, `pe.fd`, `ir.fd`, etc.) have not yet been updated to
+   parse, type-check, lower, and emit globals. This blocks using `var` in
+   `inc.fd` to implement the global cache.
 
 **Resolved blockers:**
 - ~~`.exe` extension~~ — FIXED (session 8). `ensure_exe_extension()` in
@@ -241,6 +260,8 @@ No crash ≠ working. The three failure modes after crashes stop:
 3. **Correct + stable** — stage2.c == stage3.c → **fixpoint achieved**
 
 We're at stage 1 (self-compilation works, EXIT 0, output is correct for simple
-files) + PE emitter works for simple programs + LSP ported. The fixpoint check
-(stage 2-3) is next, blocked by the fides-c2 stdlib crash and a pre-existing
-parse error in codegen_c.fd that blocks rebuilding the bootstrap compiler.
+files) + PE emitter works for simple programs + LSP ported + var feature
+implemented in Rust compiler + full static analysis completed. The fixpoint
+check (stage 2-3) is next, blocked by the fides-c2 stdlib crash, a pre-existing
+parse error in codegen_c.fd, and 5 P0 bugs in parser.fd/lexer.fd identified by
+the session 11 static analysis.

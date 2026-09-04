@@ -786,6 +786,7 @@ pub fn monomorphize(program: &Program) -> Program {
         enums: program.enums.clone(),
         funcs: new_funcs,
         consts: program.consts.clone(),
+        globals: program.globals.clone(),
         type_aliases: program.type_aliases.clone(),
         impls: new_impls,
         imports: program.imports.clone(),

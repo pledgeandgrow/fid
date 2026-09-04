@@ -100,6 +100,8 @@ pub enum L1Inst {
     ConstBool { value: bool },
     ConstStr { value: String },
     ConstNull { ty: PirType },
+    /// Get address of a module-level mutable global variable
+    GlobalAddr { name: String, ty: PirType },
 
     // ─── Arithmetic (pure) ───
     BinOp { op: BinOp, left: PValue, right: PValue, ty: PirType },
@@ -214,6 +216,7 @@ impl L1Inst {
             L1Inst::ConstBool { .. } => "ConstBool",
             L1Inst::ConstStr { .. } => "ConstStr",
             L1Inst::ConstNull { .. } => "ConstNull",
+            L1Inst::GlobalAddr { .. } => "GlobalAddr",
             L1Inst::BinOp { .. } => "BinOp",
             L1Inst::UnaryOp { .. } => "UnaryOp",
             L1Inst::NewRegion { .. } => "NewRegion",
@@ -334,6 +337,7 @@ pub enum L2Inst {
     ConstBool { value: bool },
     ConstStr { value: String },
     ConstNull { ty: PirType },
+    GlobalAddr { name: String, ty: PirType },
 
     BinOp { op: BinOp, left: PValue, right: PValue, ty: PirType },
     UnaryOp { op: UnaryOp, operand: PValue, ty: PirType },
@@ -385,6 +389,7 @@ impl L2Inst {
             L2Inst::ConstBool { .. } => "ConstBool",
             L2Inst::ConstStr { .. } => "ConstStr",
             L2Inst::ConstNull { .. } => "ConstNull",
+            L2Inst::GlobalAddr { .. } => "GlobalAddr",
             L2Inst::BinOp { .. } => "BinOp",
             L2Inst::UnaryOp { .. } => "UnaryOp",
             L2Inst::Alloca { .. } => "Alloca",
@@ -536,6 +541,8 @@ pub enum L3Inst {
     /// Unlike `Mov { src: Slot }` which loads the VALUE at the slot,
     /// this materializes the ADDRESS of the slot (leaq).
     AddrOfSlot { dst: VReg, slot: Slot },
+    /// `dst = &global` (address-of module-level mutable global).
+    GlobalAddr { dst: VReg, name: String, ty: PirType },
     /// `dst = src1 op src2`.
     Bin { op: BinOp, dst: VReg, a: Operand, b: Operand, ty: PirType },
     /// `dst = op src`.
@@ -737,6 +744,7 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
             Inst::ConstBool { value } => L1Inst::ConstBool { value: *value },
             Inst::ConstStr { value } => L1Inst::ConstStr { value: value.clone() },
             Inst::ConstNull { ty } => L1Inst::ConstNull { ty: ty.clone() },
+            Inst::GlobalAddr { name, ty } => L1Inst::GlobalAddr { name: name.clone(), ty: ty.clone() },
 
             Inst::BinOp { op, left, right, ty } => L1Inst::BinOp {
                 op: op.clone(),
@@ -1009,6 +1017,7 @@ fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
             L1Inst::ConstBool { value } => L2Inst::ConstBool { value: *value },
             L1Inst::ConstStr { value } => L2Inst::ConstStr { value: value.clone() },
             L1Inst::ConstNull { ty } => L2Inst::ConstNull { ty: ty.clone() },
+            L1Inst::GlobalAddr { name, ty } => L2Inst::GlobalAddr { name: name.clone(), ty: ty.clone() },
 
             L1Inst::BinOp { op, left, right, ty } => L2Inst::BinOp {
                 op: op.clone(),
@@ -1406,6 +1415,7 @@ fn lower_l2_inst_to_l3(
             }
         }
         L2Inst::ConstNull { .. } => L3Inst::Mov { dst, src: Operand::ImmNull },
+        L2Inst::GlobalAddr { name, ty } => L3Inst::GlobalAddr { dst, name: name.clone(), ty: ty.clone() },
 
         L2Inst::BinOp { op, left, right, ty } => L3Inst::Bin {
             op: op.clone(),
@@ -1725,6 +1735,7 @@ fn fmt_l1_inst(i: &L1Inst) -> String {
         ConstBool { value } => format!("const bool {}", value),
         ConstStr { value } => format!("const str \"{}\"", escape(value)),
         ConstNull { ty } => format!("const {} null", ty),
+        GlobalAddr { name, ty } => format!("globaladdr {} {}", ty, name),
         BinOp { op, left, right, ty } => format!("binop {:?} {} {}, {} -> {}", op, ty, left, right, ty),
         UnaryOp { op, operand, ty } => format!("unop {:?} {} {} -> {}", op, ty, operand, ty),
         NewRegion { name } => format!("new_region \"{}\"", name),
@@ -1842,6 +1853,7 @@ fn fmt_l2_inst(i: &L2Inst) -> String {
         ConstBool { value } => format!("const bool {}", value),
         ConstStr { value } => format!("const str \"{}\"", escape(value)),
         ConstNull { ty } => format!("const {} null", ty),
+        GlobalAddr { name, ty } => format!("globaladdr {} {}", ty, name),
         BinOp { op, left, right, ty } => format!("binop {:?} {}, {} -> {}", op, left, right, ty),
         UnaryOp { op, operand, ty } => format!("unop {:?} {} -> {}", op, operand, ty),
         Alloca { ty, region } => format!("alloca {} {}", region, ty),
@@ -1932,6 +1944,7 @@ fn fmt_l3_inst(i: &L3Inst) -> String {
     match i {
         Mov { dst, src } => format!("{} = {}", dst, src),
         AddrOfSlot { dst, slot } => format!("{} = addrof {}", dst, slot),
+        GlobalAddr { dst, name, .. } => format!("{} = globaladdr {}", dst, name),
         Bin { op, dst, a, b, ty } => format!("{} = {:?} {}, {}  ; {}", dst, op, a, b, ty),
         Unary { op, dst, src, ty } => format!("{} = {:?} {}  ; {}", dst, op, src, ty),
         StackAlloc { dst, bytes, region } => format!("{} = stackalloc {} {}", dst, region, bytes),

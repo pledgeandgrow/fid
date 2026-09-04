@@ -452,6 +452,24 @@ impl X64CodeGen {
                 }
             }
 
+            L3Inst::GlobalAddr { dst, name, .. } => {
+                // Materialize the address of a module-level global (leaq symbol(%rip), %reg).
+                let sym = format!("_g_{}", name);
+                let dst_loc = self.dst_loc(*dst);
+                match dst_loc {
+                    Some(Location::Reg(dr)) => {
+                        self.wl(&format!("    leaq {}(%rip), %{}", sym, dr.name()));
+                    }
+                    Some(Location::Spill(off)) => {
+                        self.wl(&format!("    leaq {}(%rip), %rax", sym));
+                        self.wl(&format!("    movq %rax, -{}(%rbp)", off));
+                    }
+                    _ => {
+                        self.wl(&format!("    leaq {}(%rip), %rax", sym));
+                    }
+                }
+            }
+
             L3Inst::Bin { op, dst, a, b, ty } => {
                 self.gen_bin(op.clone(), *dst, a, b, ty);
             }

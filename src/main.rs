@@ -162,7 +162,7 @@ fn main() {
             let raw_target = args.iter().position(|a| a == "--target")
                 .and_then(|i| args.get(i + 1))
                 .map(|s| s.as_str())
-                .unwrap_or("x86-64");
+                .unwrap_or(if cfg!(windows) { "x86-64-windows" } else { "x86-64" });
             // Parse target triple: "arch-os" format (e.g., "arm64-linux", "riscv64-linux")
             // If no OS specified, default to linux
             let target = parse_target_triple(raw_target);

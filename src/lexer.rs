@@ -231,9 +231,37 @@ impl Lexer {
                 }
                 self.advance();
             }
+            // Scientific notation: e[+/-]digits
+            if self.peek() == 'e' || self.peek() == 'E' {
+                s.push(self.advance());
+                if self.peek() == '+' || self.peek() == '-' {
+                    s.push(self.advance());
+                }
+                while self.pos < self.source.len() && (self.peek().is_ascii_digit() || self.peek() == '_') {
+                    if self.peek() != '_' {
+                        s.push(self.peek());
+                    }
+                    self.advance();
+                }
+            }
             let val: f64 = s.parse().unwrap();
             Token::new(TokenKind::FloatLit(val), line, col)
         } else {
+            // Integer with optional scientific notation (e.g. 1e308)
+            if self.peek() == 'e' || self.peek() == 'E' {
+                s.push(self.advance());
+                if self.peek() == '+' || self.peek() == '-' {
+                    s.push(self.advance());
+                }
+                while self.pos < self.source.len() && (self.peek().is_ascii_digit() || self.peek() == '_') {
+                    if self.peek() != '_' {
+                        s.push(self.peek());
+                    }
+                    self.advance();
+                }
+                let val: f64 = s.parse().unwrap();
+                return Token::new(TokenKind::FloatLit(val), line, col);
+            }
             let val: i64 = s.parse().unwrap();
             Token::new(TokenKind::IntLit(val), line, col)
         }

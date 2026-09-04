@@ -223,6 +223,23 @@ touching them.
    details). The `--opt` flag produces identical output to non-opt for all
    tests except 3 closure tests that are broken in both paths.
 
+## NEVER DO THESE (Hard Rules)
+
+1. **NEVER run `git stash`, `git checkout -- .`, `git reset --hard`, or any
+   command that discards/hides uncommitted work.** This destroys the user's
+   in-progress changes. To compare against a baseline, use `git diff` or a
+   separate worktree (`git worktree add`). If you need to test "before" state,
+   ask the user — do not touch the working tree.
+
+2. **NEVER force-push, rewrite history, or delete branches** without explicit
+   user confirmation for that specific action.
+
+3. **NEVER run destructive shell commands** (`rm -rf`, `truncate`, bulk
+   deletes) without describing exactly what will happen and waiting for
+   approval.
+
+These rules apply to ALL sessions and agents. No exceptions.
+
 ## Coding Conventions
 
 1. **Codegen output**: use the `wln!` macro for formatted output in

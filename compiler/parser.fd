@@ -91,6 +91,11 @@ Ok(ConstDef),
 Err(str),
 }
 
+pub enum ParseResultGlobalVar {
+Ok(GlobalVar),
+Err(str),
+}
+
 pub enum ParseResultTypeAlias {
 Ok(TypeAlias),
 Err(str),
@@ -495,6 +500,18 @@ fn parse_top_level_item(self: &mut Parser, program: Program, is_pub: bool) -> Pa
                 return ParseResultUnit::Ok;
             }
             ParseResultConstDef::Err(e) => { return ParseResultUnit::Err(e); }
+        }
+    }
+
+    if token_kind_eq(k, TokenKind::Var) {
+        match self.parse_global_var() {
+            ParseResultGlobalVar::Ok(g) => {
+                var mg = g;
+                mg.is_pub = is_pub;
+                program.globals.push(mg);
+                return ParseResultUnit::Ok;
+            }
+            ParseResultGlobalVar::Err(e) => { return ParseResultUnit::Err(e); }
         }
     }
 
@@ -1013,6 +1030,58 @@ match self.parse_expr() {
 self.match_tok(TokenKind::Semicolon);
 var __ret_ConstDef: ConstDef = ConstDef_new(name, ty, expr, false);
 return ParseResultConstDef::Ok(__ret_ConstDef);
+}
+
+// Parse a module-level mutable global variable:
+// `var name: Type = expr;` or `var name: Type;` (zero-initialized)
+fn parse_global_var(self: &mut Parser) -> ParseResultGlobalVar {
+match self.expect(TokenKind::Var, "var") {
+    ParseResultUnit::Err(e) => { return ParseResultGlobalVar::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var name: str = "";
+match self.expect_ident() {
+    ParseResultStr::Ok(s) => { name = s; }
+    ParseResultStr::Err(e) => { return ParseResultGlobalVar::Err(e); }
+}
+match self.expect(TokenKind::Colon, ":") {
+    ParseResultUnit::Err(e) => { return ParseResultGlobalVar::Err(e); }
+    ParseResultUnit::Ok => {}
+}
+var ty: Type = Type::Void;
+match self.parse_type() {
+    ParseResultType::Ok(t) => { ty = t; }
+    ParseResultType::Err(e) => { return ParseResultGlobalVar::Err(e); }
+}
+// Initializer is optional — defaults to zero-value of the type
+var init: Expr = Expr::IntLit(0);
+if self.check(TokenKind::Eq) {
+    self.advance();
+    match self.parse_expr() {
+        ParseResultExpr::Ok(e) => { init = e; }
+        ParseResultExpr::Err(e) => { return ParseResultGlobalVar::Err(e); }
+    }
+} else {
+    // Zero-initializer: pick a sensible default per type
+    match ty {
+        Type::I64 => { init = Expr::IntLit(0); }
+        Type::I32 => { init = Expr::IntLit(0); }
+        Type::I16 => { init = Expr::IntLit(0); }
+        Type::I8 => { init = Expr::IntLit(0); }
+        Type::U64 => { init = Expr::IntLit(0); }
+        Type::U32 => { init = Expr::IntLit(0); }
+        Type::U16 => { init = Expr::IntLit(0); }
+        Type::U8 => { init = Expr::IntLit(0); }
+        Type::Bool => { init = Expr::IntLit(0); }
+        Type::F64 => { init = Expr::FloatLit(0.0); }
+        Type::F32 => { init = Expr::FloatLit(0.0); }
+        Type::Str => { init = Expr::StringLit(""); }
+        _ => { init = Expr::IntLit(0); }
+    }
+}
+self.match_tok(TokenKind::Semicolon);
+var __ret_GlobalVar: GlobalVar = GlobalVar_new(name, ty, init, false);
+return ParseResultGlobalVar::Ok(__ret_GlobalVar);
 }
 
 fn parse_type_alias(self: &mut Parser) -> ParseResultTypeAlias {

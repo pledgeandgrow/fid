@@ -566,6 +566,7 @@ fn value_refs(inst: &L2Inst) -> Vec<PValue> {
         | L2Inst::ConstBool { .. }
         | L2Inst::ConstStr { .. }
         | L2Inst::ConstNull { .. }
+        | L2Inst::GlobalAddr { .. }
         | L2Inst::Jump { .. }
         | L2Inst::Unreachable
         | L2Inst::Panic { .. } => Vec::new(),
@@ -4181,6 +4182,7 @@ fn clone_inst_remapped(inst: &L2Inst, map: &std::collections::HashMap<PValue, PV
         L2Inst::ConstBool { value } => L2Inst::ConstBool { value: *value },
         L2Inst::ConstStr { value } => L2Inst::ConstStr { value: value.clone() },
         L2Inst::ConstNull { ty } => L2Inst::ConstNull { ty: ty.clone() },
+        L2Inst::GlobalAddr { name, ty } => L2Inst::GlobalAddr { name: name.clone(), ty: ty.clone() },
         L2Inst::BinOp { op, left, right, ty } => L2Inst::BinOp { op: op.clone(), left: r(left), right: r(right), ty: ty.clone() },
         L2Inst::UnaryOp { op, operand, ty } => L2Inst::UnaryOp { op: op.clone(), operand: r(operand), ty: ty.clone() },
         L2Inst::Alloca { ty, region } => L2Inst::Alloca { ty: ty.clone(), region: region.clone() },

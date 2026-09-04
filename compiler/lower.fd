@@ -1682,6 +1682,15 @@ pub fn Lowerer_lower_program(self: &mut Lowerer, program: Program) -> IrModule {
         i = i + 1;
     }
 
+    // Register module-level mutable globals
+    i = 0;
+    while i < program.globals.len() {
+        var g: GlobalVar = program.globals.get(i);
+        var ir_ty: IrType = Lowerer_lower_type(self, g.ty);
+        self.module.globals.push(GlobalEntry_new(g.name, ir_ty, g.init));
+        i = i + 1;
+    }
+
     // Register type aliases
     i = 0;
     while i < program.type_aliases.len() {
@@ -2610,6 +2619,27 @@ pub fn Lowerer_lower_stmt(self: &mut Lowerer, stmt: Stmt) {
             }
         }
         Stmt::Assign(name, op, expr, _line) => {
+            // Check if target is a module-level mutable global
+            match IrModule_get_global(&self.module, name) {
+                OptGlobalLookup::Some(ir_ty, _init) => {
+                    var addr: i64 = Lowerer_emit_inst(self, Inst::GlobalAddr(name, ir_ty));
+                    match op {
+                        AssignOp::Assign => {
+                            var val: i64 = Lowerer_lower_expr(self, expr);
+                            var _s: i64 = Lowerer_emit_inst(self, Inst::Store(addr, val, OptIrType::None));
+                        }
+                        _ => {
+                            // Compound assignment: load current, apply op, store
+                            var current: i64 = Lowerer_emit_inst(self, Inst::Load(addr, ir_ty));
+                            var rhs: i64 = Lowerer_lower_expr(self, expr);
+                            var new_val: i64 = Lowerer_lower_compound_assign(self, op, current, rhs);
+                            var _s2: i64 = Lowerer_emit_inst(self, Inst::Store(addr, new_val, OptIrType::None));
+                        }
+                    }
+                    return;
+                }
+                OptGlobalLookup::None => {}
+            }
             // Look up alloca for mutable variable
             match Lowerer_lookup_alloca(self, name) {
                 OptValueId::Some(alloca) => {
@@ -4058,6 +4088,15 @@ pub fn Lowerer_lower_expr(self: &mut Lowerer, expr: Expr) -> i64 {
             match Lowerer_lookup_constant(self, name) {
                 OptExpr::Some(const_expr) => { return Lowerer_lower_expr(self, const_expr); }
                 OptExpr::None => {}
+            }
+
+            // Check if module-level mutable global
+            match IrModule_get_global(&self.module, name) {
+                OptGlobalLookup::Some(ir_ty, _init) => {
+                    var addr: i64 = Lowerer_emit_inst(self, Inst::GlobalAddr(name, ir_ty));
+                    return Lowerer_emit_inst(self, Inst::Load(addr, ir_ty));
+                }
+                OptGlobalLookup::None => {}
             }
 
             // Unknown — emit zero
@@ -5704,6 +5743,11 @@ pub fn Lowerer_infer_expr_type(self: &Lowerer, expr: Expr) -> IrType {
             }
             // Fall back to AST type (e.g. for function parameters)
             match Lowerer_lookup_var_ast_type(self, name) {
+                OptType::Some(ast_ty) => { return Lowerer_lower_type(self, ast_ty); }
+                OptType::None => {}
+            }
+            // Check parameter AST types (for f64 params, Vec element type inference, etc.)
+            match Lowerer_lookup_param_type(self, name) {
                 OptType::Some(ast_ty) => { return Lowerer_lower_type(self, ast_ty); }
                 OptType::None => {}
             }

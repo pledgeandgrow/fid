@@ -44,6 +44,23 @@ but not yet wired into the pipeline — integration requires porting
 - **Imports:** `core`, `vec`, `string`, `compiler::compiler`, `compiler::pe`
 - **Notes:** Top-level executable; no other compiler module imports it. The `build` command was added in session 5.
 
+### Known issues (session 11 analysis)
+
+- **`--borrowck` off-by-one** — line 71: `str_substring_from(garg, 12)` for
+  `--borrowck=` (11-char prefix) drops the first value character. **P1.**
+- **`g_borrowck` parsed but not passed through** — read from CLI but only
+  printed, not forwarded to the compiler pipeline. **P1.**
+- **`cmd_lint` is a stub** — line 1009: always prints "No lint warnings."
+- **`cmd_run` has no interpreter backend** — line 547: compiles to C and
+  executes the binary; `--max-recursion`, `--max-steps`, `--max-memory`,
+  `--trace` are parsed but not wired.
+- **`cmd_test` missing backends** — line 666: only C codegen + PE compile;
+  no interpreter backend, no PE run check.
+- **`cmd_build` unimplemented flags** — `--no-opt`, `--lto`, `--caps`,
+  non-x86-64 `--target` are parsed but not implemented.
+- **`read_source_or_error` silent failure** — returns `""` for unreadable
+  files, indistinguishable from empty source.
+
 ## `compiler/compiler.fd` — Pipeline driver
 
 - **Module:** `compiler::compiler`
@@ -70,6 +87,20 @@ but not yet wired into the pipeline — integration requires porting
 10. Pipeline continues: cfg → derive → desugar → comptime → typecheck → borrowck → mono.
 
 **Critical rule:** there is no standalone `parse_import` helper. Import loading and parsing are all inline inside `build_program_with_path`. Refactor with extreme care.
+
+### Known issues (session 11 analysis)
+
+- **`--borrowck` not wired** — `BorrowChecker_new(BorrowckMode::Off)` is
+  hardcoded at line 1006 (TODO at 1003). The CLI flag is parsed in `main.fd`
+  but never reaches the pipeline.
+- **`apply_cfg_filter` is a no-op** — line 1295: `// No-op — include all items.`
+- **`fill_default_trait_methods` incomplete** — line 1597: creates default
+  method functions but never pushes them into `program.trait_impls`.
+- **`c_file_read` suspicious comparison** — line 1960: compares `str` result
+  to integer `0` (`if content == 0`), which likely never matches.
+- **`c_os_cwd` hardcoded** — line 1985: always returns `"."`.
+- **`inc.fd` global cache is a no-op** — `global_cache_get`/`global_cache_store`
+  are stubs (see `inc.fd` section). Now fixable with the `var` feature.
 
 ---
 
@@ -98,6 +129,12 @@ but not yet wired into the pipeline — integration requires porting
 - Identifiers and numbers are extracted with `str_slice(self.source, start, end)` to avoid O(n²) `str_concat`.
 - UTF-8 multi-byte sequences are counted as one column; continuation bytes are skipped by `advance()`.
 - `read_utf8()` extracts 2/3/4 byte sequences and returns a `Str` token.
+
+### Known issues (session 11 analysis)
+
+- **Duplicate `str_filter_underscores`** — empty stub at line 291 shadows the
+  real implementation at lines 572-583. Numeric literals with underscores
+  (e.g. `1_000_000`) will not have underscores stripped. **P0 — must fix.**
 
 ---
 
@@ -188,6 +225,27 @@ must use the `ast.fd` canonical enums; `lower.fd` needs to be reconciled to them
 - `match_tok(k)` consumes `k` if it is the current token and returns `true`.
 - `expect(k, msg)` reports a parse error if the current token is not `k`.
 
+### Known issues (session 11 analysis)
+
+- **`box_expr_deref` out-of-sync with `ast.fd`** — references 8 non-existent
+  `Expr` variants (`CharLit`, `Assign`, `Lambda`, `SizeOf`, `AlignOf`,
+  `OffsetOf`, `Path`, `UnitLit`) and uses wrong arities for `ArrayLit` (1 arg
+  vs 2 in ast.fd) and `Range` (2 args vs 3 in ast.fd). **P0 — will fail to
+  compile.**
+- **Missing `return` statements** — `parse_guard_stmt` (line 2521),
+  `parse_use_stmt` (line 3024), `parse_match_expr` (line 4002), and
+  `parse_comptime_expr` (line 3848) fall off the end without returning a
+  `ParseResult*`. **P0.**
+- **Duplicate `var has_forward`** — declared twice in `parse_layer`
+  (lines 1637-1639) and `parse_model` (lines 1704-1706). **P0.**
+- **`parse_use` version-pin always errors** — lines 4684-4695: even when a
+  valid version string is found, the function returns `Err`. **P1.**
+- **`parse_fstring_parts` is a stub** — line 4847: f-string interpolation is
+  extracted as raw text, not parsed. **P2.**
+- **Non-exhaustive `match` patterns** — several helper functions
+  (`expect_ident`, `read_type_name`, `parse_type` extraction, `parse_pattern`
+  extraction) may need `_ => {}` default arms. **P1.**
+
 ---
 
 ## `compiler/typechecker.fd` — Type, effect, region, capability, and safety check
@@ -198,6 +256,20 @@ must use the `ast.fd` canonical enums; `lower.fd` needs to be reconciled to them
 - **Key functions:** `TypeChecker_register_program()`, `TypeChecker_check_bodies()`, `TypeChecker_compute_func_effects()`, `TypeChecker_verify_*` family
 - **Imports:** `core`, `vec`, `string`, `compiler::ast`
 - **Imported by:** `compiler.fd`
+
+### Known issues (session 11 analysis)
+
+- **13 empty safety verification stubs** — lines 1451-1505: `verify_conserve`,
+  `verify_gas`, `verify_safety_annotations`, `verify_constant_time`,
+  `verify_realtime`, `verify_differentiable`, `verify_quantized`,
+  `verify_checkpoint`, `verify_dp`, `verify_shard`, `verify_adapter`,
+  `verify_tainted`, `verify_contracts`, `verify_allocator_params` are all
+  no-ops. Safety annotations are accepted but not enforced. **P2** (not needed
+  for bootstrap, but dangerous for production use).
+- **`type_size` returns 8 for most composites** — line 2317: coarse sizing
+  for ref, raw-pointer, and many composite types regardless of actual layout.
+- **`verify_deterministic` is partial** — line 1407: rejects IO/Net/Spawn/
+  Diverge and floating-point ops but does not reject randomness or time.
 
 ---
 
@@ -264,6 +336,23 @@ which only copies 8 bytes. This truncates the payload. The Rust lowerer has
 `load_enum_field()` (buffer + `Store` which emits `memcpy`) to fix this. The
 Fides lowerer needs the same.
 
+### Known issues (session 11 analysis)
+
+- **`f64_to_bits` always returns 0** — line 6005: stub function, breaks
+  float bitcast operations. **P1.**
+- **`lower_type` narrows I128/U128 to I64/U64** — lines 1767, 1772, 1833,
+  1838: 128-bit integers silently truncated to 64-bit. **P1.**
+- **`runtime_effects` is a hardcoded whitelist** — lines 358-446: any `p_*`
+  function not in the list returns `None` and is treated as pure, risking the
+  optimizer deleting side-effecting calls. **P1.**
+- **`Lowerer_infer_expr_ast_type` falls back to I64** — line 6155: simplified
+  inference returns `Type::I64` for most expression forms, making closure
+  return type inference unreliable. **P2.**
+- **`box_expr_unbox` enumerates out-of-sync variants** — references
+  `Lambda`, `Throw`, `TryUnwrap`, `Assign`, `CompoundAssign`, `ConstExpr`,
+  `ComptimeGen`, `QuantCast`, `Await`, `Spawn` which do not exist in
+  `ast.fd`. (Already noted in the warning above.)
+
 ---
 
 ## `compiler/codegen_c.fd` — C99 code generator
@@ -283,6 +372,16 @@ Fides lowerer needs the same.
 - Emit `Inst::Store` as `memcpy` for struct-typed values (this is essential for SRET copy correctness).
 - Cast pointer args to `void*` / `int64_t` as needed.
 - Sanitize Fides function names that collide with C keywords.
+
+### Known issues (session 11 analysis)
+
+- **`DynCall` not implemented** — line 2523: emits only a comment
+  `// DynCall not implemented in C backend`, leaving the destination variable
+  uninitialized. **P1.**
+- **`TryUnwrap` not implemented** — line 2555: emits only a comment, same
+  issue. **P1.**
+- **`ConstFloat` TODO** — line 1948: casts through `(float)`/`(double)`
+  instead of exact bit preservation. Needs `p_float_to_bits` runtime helper.
 
 ---
 
@@ -352,6 +451,18 @@ Fides lowerer needs the same.
   lose statements. Worked around by splitting into smaller helpers.
 - **`src/pe.rs` and `compiler/pe.fd` must stay in sync** — if one changes,
   the other needs the same change.
+
+### Known issues (session 11 analysis)
+
+- **20+ runtime stubs return wrong values** — `p_vec_insert`, `p_vec_remove`,
+  `p_vec_reverse`, `p_vec_extend`, `p_vec_sort` all return 0 (`xor rax; ret`).
+  `p_string_contains`, `p_string_starts_with`, `p_string_ends_with` return
+  `true`. `p_string_split` returns empty Vec. `p_string_find`/`rfind` return
+  0. `p_string_replace`/`to_uppercase`/`to_lowercase`/`trim`/`repeat` return
+  input unchanged. `p_map_keys`/`values`/`clone` return empty. **P1** — any
+  test using these via the PE backend will see wrong behavior.
+- **Missing REX prefixes** — `X86Encoder` does not emit REX for all 8-bit/
+  16-bit partial register operations. **P2.**
 
 ---
 
@@ -456,6 +567,12 @@ Fides lowerer needs the same.
 - **Imports:** `core`, `vec`, `string`, `compiler::ast`, `compiler::ir`
 - **Imported by:** `opt.fd`
 
+### Known issues (session 11 analysis)
+
+- **`str_substring` is a stub** — line 2681: returns the original string `s`,
+  ignoring `start` and `len` parameters. Semantically wrong if any caller
+  uses it. **P1.**
+
 ---
 
 ## `compiler/opt.fd` — PIR L2 optimizer
@@ -467,6 +584,18 @@ Fides lowerer needs the same.
 - **Imports:** `core`, `vec`, `string`, `compiler::ast`, `compiler::ir`, `compiler::pir`
 - **Imported by:** part of the broader build pipeline
 
+### Known issues (session 11 analysis)
+
+- **`is_lto_mode()` hardcoded false** — line 221: always returns `false`,
+  LTO detection is broken (LTO is inferred from `max_iters` in the driver
+  instead).
+- **`cse_key` unreachable duplicate arms** — lines 1649-1660: duplicate
+  `ConstInt`/`ConstFloat`/`ConstStr`/`ConstBool` arms after a catch-all `_`
+  are dead code.
+- **`effect_reorder_block` changed detection bug** — line 5926: compares
+  `insts.get(pi2)` vs `pure_insts.get(pi2)` but `pi2` iterates over
+  `pure_insts`, not `insts`, making the position check meaningless.
+
 ---
 
 ## `compiler/mono.fd` — Monomorphization
@@ -477,6 +606,18 @@ Fides lowerer needs the same.
 - **Key functions:** `subst_get()`, `subst_set()`, `generic_funcs_get()`, `trait_assoc_get()`
 - **Imports:** `core`, `vec`, `string`, `compiler::ast`
 - **Imported by:** `compiler.fd`
+
+### Known issues (session 11 analysis)
+
+- **`subst_gat_type_args` always uses args.get(0)** — line 649: for
+  single-character uppercase generic parameters, always uses the first type
+  argument regardless of parameter index. Mis-substitutes any generic with
+  more than one type parameter. **P1.**
+- **`resolve_assoc_types` falls back to I64** — lines 711, 751, 789:
+  unresolved associated types silently become `Type::I64` instead of
+  producing an error. **P2.**
+- **`infer_expr_type` is crude** — line 2565: returns `Type::I64` for many
+  unhandled expression forms. **P2.**
 
 ---
 
@@ -513,6 +654,32 @@ Fides lowerer needs the same.
 
 ---
 
+## `compiler/inc.fd` — Incremental compilation cache
+
+- **Module:** `compiler::inc`
+- **Purpose:** Source-hash-based incremental compilation cache. Stores
+  `IrModule` results keyed by source path + hash to avoid recompiling
+  unchanged modules.
+- **Key types:** `IncCacheEntry`, `IncrementalCache`, `OptIrModule`
+- **Key functions:** `hash_source()`, `hash_str()` (FNV-1a 64-bit),
+  `IncrementalCache_new()`, `IncrementalCache_get()`,
+  `IncrementalCache_store()`, `global_cache_store()`, `global_cache_get()`,
+  `global_cache_clear()`
+- **Imports:** `core`, `vec`, `string`, `compiler::ir`
+- **Imported by:** `compiler.fd`
+
+### Known issues (session 11 analysis)
+
+- **`global_cache_*` are all no-ops** — lines 134-145:
+  `global_cache_store` does nothing, `global_cache_get` always returns
+  `OptIrModule::None`, `global_cache_clear` does nothing. The file comments
+  say these will be replaced "when Fides supports module-level mutable
+  state." **Now fixable** — the `var` feature was implemented in the Rust
+  compiler in session 11. The Fides `inc.fd` can now use `var` to implement
+  a real global cache. **P1.**
+
+---
+
 ## `compiler/comptime_eval.fd` — Compile-time evaluation engine
 
 - **Module:** `compiler::comptime_eval`
@@ -540,6 +707,20 @@ Fides lowerer needs the same.
   conditions
 - **Imports:** `core`, `vec`, `compiler::ast`
 - **Imported by:** `compiler.fd`
+
+### Known issues (session 11 analysis)
+
+- **Return re-wrap omissions** — `substitute_expr` and `replace_ident_in_*`
+  skip `Stmt::Return` and `OptBoxExpr` re-wrapping (comments say "Can't
+  re-wrap into Box easily; skip for now"). Comptime expressions inside
+  `return` statements are not substituted or evaluated. **P1.**
+- **`aggressive_comptime_expr` limited recursion** — only recurses into
+  `Binary`, `Unary`, `Call`, `MethodCall`; other expressions (If, Match,
+  ArrayLit, StructLit) are not traversed for nested comptime calls. **P2.**
+- **`evaluate` falls through to `IntLit(0)`** — line 1077: unsupported
+  expression forms silently become 0. **P2.**
+- **`box_expr_unbox` defaults to `IntLit(0)`** — line 64: unhandled `Box<Expr>`
+  variants silently become zero. **P2.**
 
 ---
 

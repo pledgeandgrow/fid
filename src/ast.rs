@@ -732,6 +732,15 @@ pub struct ConstDef {
     pub is_pub: bool,
 }
 
+/// A module-level mutable global variable: `var g_x: i64 = 0;` or `pub var g_x: i64 = 0;`
+#[derive(Debug, Clone)]
+pub struct GlobalVar {
+    pub name: String,
+    pub ty: Type,
+    pub init: Expr,
+    pub is_pub: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct TypeAlias {
     pub name: String,
@@ -807,6 +816,8 @@ pub struct Program {
     pub structs: Vec<StructDef>,
     pub enums: Vec<EnumDef>,
     pub consts: Vec<ConstDef>,
+    /// Module-level mutable global variables: `var g_x: i64 = 0;`
+    pub globals: Vec<GlobalVar>,
     pub type_aliases: Vec<TypeAlias>,
     pub impls: Vec<ImplDef>,
     pub imports: Vec<ImportDef>,

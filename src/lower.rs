@@ -339,6 +339,12 @@ impl Lowerer {
             self.constants.insert(c.name.clone(), c.expr.clone());
         }
 
+        // Register module-level mutable globals
+        for g in &program.globals {
+            let ir_ty = self.lower_type(&g.ty);
+            self.module.globals.insert(g.name.clone(), (ir_ty, g.init.clone()));
+        }
+
         // Register type aliases
         for ta in &program.type_aliases {
             self.type_aliases.insert(ta.name.clone(), ta.alias_for.clone());
@@ -1725,6 +1731,23 @@ impl Lowerer {
             }
 
             Stmt::Assign { target, op, expr, line: _ } => {
+                // Check if target is a module-level mutable global
+                if let Some((ir_ty, _init)) = self.module.globals.get(target).cloned() {
+                    let addr = self.emit_inst(Inst::GlobalAddr { name: target.clone(), ty: ir_ty.clone() });
+                    match op {
+                        AssignOp::Assign => {
+                            let val = self.lower_expr(expr);
+                            self.emit_inst(Inst::Store { ptr: addr, value: val, store_ty: None });
+                        }
+                        _ => {
+                            let current = self.emit_inst(Inst::Load { ptr: addr, ty: ir_ty.clone() });
+                            let rhs = self.lower_expr(expr);
+                            let new_val = self.lower_compound_assign(op, current, rhs);
+                            self.emit_inst(Inst::Store { ptr: addr, value: new_val, store_ty: None });
+                        }
+                    }
+                    return;
+                }
                 // Check if target is a mutable variable with an alloca
                 let alloca = self.allocas.get(target).copied();
                 
@@ -3334,6 +3357,11 @@ impl Lowerer {
                 // Check if it's a constant (pc)
                 if let Some(const_expr) = self.constants.get(name).cloned() {
                     return self.lower_expr(&const_expr);
+                }
+                // Check if it's a module-level mutable global
+                if let Some((ir_ty, _init)) = self.module.globals.get(name).cloned() {
+                    let addr = self.emit_inst(Inst::GlobalAddr { name: name.clone(), ty: ir_ty.clone() });
+                    return self.emit_inst(Inst::Load { ptr: addr, ty: ir_ty });
                 }
                 // Check if it's a known function name — emit as env struct with fn addr
                 if self.module.functions.contains_key(name) || self.module.extern_functions.contains_key(name) {
@@ -6383,6 +6411,10 @@ impl Lowerer {
                 // Check constant
                 if let Some(const_expr) = self.constants.get(name) {
                     return self.infer_expr_type(const_expr);
+                }
+                // Check module-level mutable global
+                if let Some((ir_ty, _init)) = self.module.globals.get(name) {
+                    return ir_ty.clone();
                 }
                 // Check AST type (e.g. for function parameters with generic types like Vec<T>)
                 if let Some(ast_ty) = self.var_ast_types.get(name) {

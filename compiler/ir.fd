@@ -998,6 +998,11 @@ pub enum Inst {
     ConstStr(str),
     ConstNull(IrType),
 
+    // ─── Globals ───
+    // Get the address of a module-level mutable global variable.
+    // Returns a pointer that can be used with Load/Store.
+    GlobalAddr(str, IrType),
+
     // ─── Arithmetic ───
     BinOp(BinOp, i64, i64, IrType),
     UnaryOp(UnaryOp, i64, IrType),
@@ -1065,6 +1070,7 @@ pub fn inst_result_type(inst: Inst) -> IrType {
         Inst::ConstBool(_) => { return IrType::Bool; }
         Inst::ConstStr(_) => { return IrType::Ptr(Box::new(IrType::U8)); }
         Inst::ConstNull(ty) => { return ty; }
+        Inst::GlobalAddr(_, ty) => { return IrType::Ptr(Box::new(ty)); }
         Inst::BinOp(_, _, _, ty) => { return ty; }
         Inst::UnaryOp(_, _, ty) => { return ty; }
         Inst::Alloca(ty, _) => { return IrType::Ptr(Box::new(ty)); }
@@ -1151,6 +1157,7 @@ pub fn inst_kind_name(inst: &Inst) -> str {
         Inst::ConstBool(_) => { return "ConstBool"; }
         Inst::ConstStr(_) => { return "ConstStr"; }
         Inst::ConstNull(_) => { return "ConstNull"; }
+        Inst::GlobalAddr(_, _) => { return "GlobalAddr"; }
         Inst::BinOp(_, _, _, _) => { return "BinOp"; }
         Inst::UnaryOp(_, _, _) => { return "UnaryOp"; }
         Inst::Alloca(_, _) => { return "Alloca"; }
@@ -1210,6 +1217,7 @@ pub fn inst_value_refs(inst: &Inst) -> Vec<i64> {
         Inst::ConstBool(_) => {}
         Inst::ConstStr(_) => {}
         Inst::ConstNull(_) => {}
+        Inst::GlobalAddr(_, _) => {}
         Inst::Alloca(_, _) => {}
         Inst::Unreachable => {}
         Inst::Panic(_) => {}
@@ -1581,6 +1589,8 @@ pub struct IrModule {
     pub trait_methods: Vec<StringVecStr>,
     pub trait_impls: Vec<StringVecStr>,
     pub linear_structs: Vec<str>,
+    // Module-level mutable global variables: maps name → (type, initializer expr)
+    pub globals: Vec<GlobalEntry>,
 }
 
 pub struct IrFunctionEntry {
@@ -1619,6 +1629,35 @@ pub fn StringEffectSetEntry_new(name: str, effects: EffectSet) -> StringEffectSe
     return StringEffectSetEntry { name: name, effects: effects };
 }
 
+// Global variable entry: name → (type, initializer expression)
+pub struct GlobalEntry {
+    pub name: str,
+    pub ty: IrType,
+    pub init: Expr,
+}
+
+pub fn GlobalEntry_new(name: str, ty: IrType, init: Expr) -> GlobalEntry {
+    return GlobalEntry { name: name, ty: ty, init: init };
+}
+
+// Lookup a global by name. Returns OptIrType::Some(ty) if found, None otherwise.
+pub fn IrModule_get_global(self: &IrModule, name: str) -> OptGlobalLookup {
+    var i: i64 = 0;
+    while i < self.globals.len() {
+        var entry: GlobalEntry = self.globals.get(i);
+        if str_equal(entry.name, name) {
+            return OptGlobalLookup::Some(entry.ty, entry.init);
+        }
+        i = i + 1;
+    }
+    return OptGlobalLookup::None;
+}
+
+pub enum OptGlobalLookup {
+    Some(IrType, Expr),
+    None,
+}
+
 pub fn IrModule_new() -> IrModule {
     return IrModule {
         functions: Vec::new(),
@@ -1630,6 +1669,7 @@ pub fn IrModule_new() -> IrModule {
         trait_methods: Vec::new(),
         trait_impls: Vec::new(),
         linear_structs: Vec::new(),
+        globals: Vec::new(),
     };
 }
 

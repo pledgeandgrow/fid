@@ -245,6 +245,8 @@ pub struct Interpreter {
     memory: Memory,
     /// String constant addresses — maps string content to memory address
     string_addrs: HashMap<String, u64>,
+    /// Module-level mutable global variables: maps name → memory address
+    global_addrs: HashMap<String, u64>,
     /// Opaque values (Vec, HashMap) stored by alloca address —
     /// these can't be serialized to the byte-addressed memory
     opaque_values: HashMap<u64, Value>,
@@ -479,6 +481,7 @@ impl Interpreter {
             module,
             memory: Memory::new(),
             string_addrs: HashMap::new(),
+            global_addrs: HashMap::new(),
             opaque_values: HashMap::new(),
             vec_side_table: HashMap::new(),
             kv_caches: Vec::new(),
@@ -536,7 +539,53 @@ impl Interpreter {
         };
         // Pre-allocate string constants
         interp.init_strings();
+        // Initialize module-level mutable globals
+        interp.init_globals();
         interp
+    }
+
+    /// Allocate memory for module-level mutable global variables and store
+    /// their initial values. Each global gets an 8-byte slot in simulated memory.
+    fn init_globals(&mut self) {
+        // Use a fixed base address for globals (well above stack/heap)
+        let mut addr: u64 = 0x00400000;
+        for (name, (ty, init_expr)) in &self.module.globals {
+            self.global_addrs.insert(name.clone(), addr);
+            let init_val = self.eval_global_init(init_expr, ty);
+            match &init_val {
+                Value::Int(v) => { self.memory.store_i64(addr, *v); }
+                Value::Float(v) => { self.memory.store_f64(addr, *v); }
+                Value::Bool(v) => { self.memory.store_bool(addr, *v); }
+                Value::Ptr(v) => { self.memory.store_i64(addr, *v as i64); }
+                Value::Str(s) => {
+                    // Allocate string in memory, store pointer
+                    let str_addr = self.memory.alloc(s.len() as u64 + 1);
+                    self.memory.store(str_addr, s.as_bytes());
+                    self.memory.store(str_addr + s.len() as u64, &[0]);
+                    self.opaque_values.insert(str_addr, init_val.clone());
+                    self.memory.store_i64(addr, str_addr as i64);
+                }
+                _ => { self.memory.store_i64(addr, 0); }
+            }
+            addr += 8;
+        }
+    }
+
+    /// Evaluate a global initializer expression to a Value.
+    fn eval_global_init(&self, expr: &crate::ast::Expr, ty: &IrType) -> Value {
+        use crate::ast::Expr;
+        match expr {
+            Expr::IntLit(v) => {
+                match ty {
+                    IrType::Bool => Value::Bool(*v != 0),
+                    _ => Value::Int(*v),
+                }
+            }
+            Expr::FloatLit(v) => Value::Float(*v),
+            Expr::BoolLit(b) => Value::Bool(*b),
+            Expr::StringLit(s) => Value::Str(CompactString::from(s.as_str())),
+            _ => Value::Int(0),
+        }
     }
 
     pub fn verbose(mut self) -> Self {
@@ -1199,6 +1248,12 @@ impl Interpreter {
 
             Inst::ConstNull { .. } => {
                 ExecOutcome::Value(Value::Ptr(0))
+            }
+
+            Inst::GlobalAddr { name, .. } => {
+                // Return the memory address of the global variable
+                let addr = self.global_addrs.get(name).copied().unwrap_or(0);
+                ExecOutcome::Value(Value::Ptr(addr))
             }
 
             // ─── Arithmetic ───

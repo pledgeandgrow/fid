@@ -49,7 +49,7 @@ tcc -O2 -w -o release\fides-c.exe release\fides-c.c -lws2_32
 # → Hello from PE!
 ```
 
-## Current Status (Sep 4, 2026 — session 9)
+## Current Status (Sep 5, 2026 — session 11)
 
 - **🎉 Self-compilation works!** — `fides-c.exe` compiles `compiler/main.fd` → `fides-c2.exe`
 - **🎉 PE emitter ported to Fides!** — `compiler/pe.fd` generates native Windows PE executables without tcc
@@ -57,6 +57,8 @@ tcc -O2 -w -o release\fides-c.exe release\fides-c.c -lws2_32
 - **🎉 Linux native codegen ported!** — `peephole.fd` + `regalloc.fd` + `codegen_x64.fd` (session 8), builds OK, not yet integrated
 - **🎉 LSP server ported to Fides!** — `compiler/lsp.fd` (1084 lines) — JSON-RPC over stdio, diagnostics, completion, hover, definition, rename (session 9)
 - **🎉 flat_ast.fd ported!** — `compiler/flat_ast.fd` (1260 lines) — flat AST serialization for `dump-ast-flat` command (session 9)
+- **🎉 Module-level `var`/`pub var` implemented!** — Rust compiler now supports mutable globals across all backends (interp, C, PE, WASM, ARM64, RISC-V). `test_globals.fd` passes on interp, C, and PE. (session 11)
+- **🎉 Full static analysis of all 24 `compiler/*.fd` files completed!** — Every module analyzed for stubs, bugs, and gaps. 5 P0 and 17 P1 issues identified. (session 11)
 - **Box<T> unbox helpers centralized** — `box_expr_unbox`, `box_type_unbox`, `box_pattern_unbox` now in `ast.fd` (session 9)
 - **`.exe` extension auto-appended** — `ccompile` and `build` now produce `.exe` output without manual rename (session 8)
 - **`build` command** — `fides-c.exe build tests/hello_pe.fd -o hello_pe.exe` → working .exe
@@ -66,19 +68,27 @@ tcc -O2 -w -o release\fides-c.exe release\fides-c.c -lws2_32
 - **SRET fixed** — struct returns via out-parameter convention now work
 - **Enum `==` fixed** — all enum comparisons use `*_eq()` helper functions
 - **String builder** — `p_sb_*` eliminates O(n²) memory in C codegen
-- **23/23 self-host tests pass** on interpreter + PE emitter
+- **22/23 self-host tests pass** on all 3 backends (1 pre-existing failure: test_codegen_c.fd)
 - **Bootstrap fixpoint not yet verified** — fides-c2.exe crashes on stdlib (statement-dropping bug); need to fix and verify stage2.c == stage3.c
 
 ### Remaining steps to fixpoint:
 1. ~~Fix `.exe` extension in self-hosted compiler output~~ — DONE (session 8)
 2. ~~Port LSP server to Fides~~ — DONE (session 9)
-3. **Fix pre-existing parse error at codegen_c.fd:973** — blocks rebuilding fides-c.exe with current code (NEW blocker, session 9)
+3. **Fix pre-existing parse error at codegen_c.fd:973** — blocks rebuilding fides-c.exe with current code
 4. Fix the statement-dropping bug in the Fides compiler (root cause of fides-c2.exe crash on stdlib/core.fd)
-5. Remove/gate 38 debug `p_eprint_str` calls
-6. Verify `fides-c2.c == fides-c3.c` (the fixpoint check)
-7. Extend PE emitter to support full compiler source (struct/enum, Vec/HashMap, floats)
-8. Integrate Linux native codegen (port `elf64.rs`, `linker.rs`, `runtime_linux.rs`, wire into pipeline)
-9. ~~Assess debugger.rs porting feasibility~~ — **ASSESSED (session 9): NOT feasible without porting interp.rs (5782 LOC, 251 runtime handlers, closures for debug hooks). Skip — debugger is a dev tool, not needed for self-hosting.**
+5. **Fix 5 P0 bugs in parser.fd and lexer.fd** (session 11 analysis):
+   - `lexer.fd:291` — remove duplicate empty `str_filter_underscores` stub
+   - `parser.fd` — rewrite `box_expr_deref` to match actual `ast.fd` Expr enum
+   - `parser.fd` — add missing `return` in 4 parse functions
+   - `parser.fd` — remove duplicate `var has_forward` in `parse_layer`/`parse_model`
+   - `parser.fd:4684` — fix `parse_use` version-pin to only error on missing string
+6. **Mirror `var` feature to `compiler/*.fd` files** — Rust compiler has it, Fides self-hosted compiler does not yet
+7. **Fix `inc.fd` global_cache_* using `var` feature** — now possible since Rust compiler supports `var`
+8. Remove/gate 38 debug `p_eprint_str` calls
+9. Verify `fides-c2.c == fides-c3.c` (the fixpoint check)
+10. Extend PE emitter to support full compiler source (struct/enum, Vec/HashMap, floats)
+11. Integrate Linux native codegen (port `elf64.rs`, `linker.rs`, `runtime_linux.rs`, wire into pipeline)
+12. ~~Assess debugger.rs porting feasibility~~ — **ASSESSED (session 9): NOT feasible without porting interp.rs (5782 LOC, 251 runtime handlers, closures for debug hooks). Skip — debugger is a dev tool, not needed for self-hosting.**
 
 See `CURRENT.md` in the repo root for the latest state.
 

@@ -107,6 +107,11 @@ impl Parser {
                     c.is_pub = is_pub;
                     program.consts.push(c);
                 }
+                TokenKind::Var => {
+                    let mut g = self.parse_global_var()?;
+                    g.is_pub = is_pub;
+                    program.globals.push(g);
+                }
                 TokenKind::Type => {
                     let mut ta = self.parse_type_alias()?;
                     ta.is_pub = is_pub;
@@ -762,6 +767,31 @@ impl Parser {
         let expr = self.parse_expr()?;
         self.match_tok(TokenKind::Semicolon);
         Ok(ConstDef { name, ty, expr, is_pub: false })
+    }
+
+    /// Parse a module-level mutable global variable:
+    /// `var name: Type = expr;` or `var name: Type;` (zero-initialized)
+    fn parse_global_var(&mut self) -> Result<GlobalVar, String> {
+        self.expect(TokenKind::Var, "var")?;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::Colon, ":")?;
+        let ty = self.parse_type()?;
+        // Initializer is optional — defaults to zero-value of the type
+        let init = if self.check(&TokenKind::Eq) {
+            self.advance();
+            self.parse_expr()?
+        } else {
+            // Zero-initializer: pick a sensible default per type
+            match &ty {
+                Type::I64 | Type::I32 | Type::I16 | Type::I8 | Type::U64
+                | Type::U32 | Type::U16 | Type::U8 | Type::Bool => Expr::IntLit(0),
+                Type::F64 | Type::F32 => Expr::FloatLit(0.0),
+                Type::Str => Expr::StringLit(String::new()),
+                _ => Expr::IntLit(0), // generic zero for pointers/structs
+            }
+        };
+        self.match_tok(TokenKind::Semicolon);
+        Ok(GlobalVar { name, ty, init, is_pub: false })
     }
 
     fn parse_type_alias(&mut self) -> Result<TypeAlias, String> {

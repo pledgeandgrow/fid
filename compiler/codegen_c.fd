@@ -1625,6 +1625,46 @@ fn emit_struct_defs(self: &mut CCodeGen, module: IrModule) -> void {
     }
 }
 
+// ─── Module-level mutable globals ──────────────────────────────────────────
+
+fn global_c_name(name: str) -> str {
+    return "_g_" + name;
+}
+
+fn gen_global_init_expr(expr: Expr) -> str {
+    match expr {
+        Expr::IntLit(v) => { return int_to_str(v) + "LL"; }
+        Expr::FloatLit(f) => {
+            if f != f { return "NAN"; }
+            if f > 1.7976931348623157e308 { return "INFINITY"; }
+            if f < -1.7976931348623157e308 { return "-INFINITY"; }
+            return float_to_str(f);
+        }
+        Expr::BoolLit(b) => {
+            if b { return "true"; }
+            return "false";
+        }
+        Expr::StringLit(s) => { return "\"" + escape_c_string(s) + "\""; }
+        _ => { return "0"; }
+    }
+    return "0";
+}
+
+fn emit_globals(self: &mut CCodeGen, module: IrModule) -> void {
+    if module.globals.len() == 0 { return; }
+    wln(self, "// ─── Module-level mutable globals ───");
+    var gi: i64 = 0;
+    while gi < module.globals.len() {
+        var entry: GlobalEntry = module.globals.get(gi);
+        var c_ty: str = c_type(entry.ty);
+        var c_name: str = global_c_name(entry.name);
+        var init_str: str = gen_global_init_expr(entry.init);
+        wln(self, "static " + c_ty + " " + c_name + " = " + init_str + ";");
+        gi = gi + 1;
+    }
+    wln(self, "");
+}
+
 fn emit_prototypes(self: &mut CCodeGen, module: IrModule) -> void {
     wln(self, "// ─── Function prototypes ───");
     wln(self, "void p_thread_register(const char* name, int64_t (*fn)());");
@@ -1972,6 +2012,9 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
         }
         Inst::ConstNull(_) => {
             wln(self, "    " + dst + " = NULL;");
+        }
+        Inst::GlobalAddr(name, _) => {
+            wln(self, "    " + dst + " = (int64_t)&" + global_c_name(name) + ";");
         }
         Inst::BinOp(op, left, right, ty) => {
             var l_raw: str = val_name(self, left);
@@ -2655,6 +2698,7 @@ pub fn CCodeGen_generate(self: &mut CCodeGen, module: IrModule) -> str {
     emit_runtime_types(self);
     emit_string_consts(self, module);
     emit_struct_defs(self, module);
+    emit_globals(self, module);
     emit_prototypes(self, module);
 
     f = 0;

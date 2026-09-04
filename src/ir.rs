@@ -526,6 +526,14 @@ pub enum Inst {
         ty: IrType,
     },
 
+    // ─── Globals ───
+    /// Get the address of a module-level mutable global variable.
+    /// Returns a pointer that can be used with Load/Store.
+    GlobalAddr {
+        name: String,
+        ty: IrType,
+    },
+
     // ─── Arithmetic ───
     /// Binary operation on two values
     BinOp {
@@ -768,6 +776,7 @@ impl Inst {
             Inst::ConstBool { .. } => IrType::Bool,
             Inst::ConstStr { .. } => IrType::Ptr(Box::new(IrType::U8)),
             Inst::ConstNull { ty, .. } => ty.clone(),
+            Inst::GlobalAddr { ty, .. } => IrType::Ptr(Box::new(ty.clone())),
             Inst::BinOp { ty, .. } => ty.clone(),
             Inst::UnaryOp { ty, .. } => ty.clone(),
             Inst::Alloca { ty, .. } => IrType::Ptr(Box::new(ty.clone())),
@@ -852,6 +861,7 @@ impl Inst {
             Inst::ConstBool { .. } => "ConstBool",
             Inst::ConstStr { .. } => "ConstStr",
             Inst::ConstNull { .. } => "ConstNull",
+            Inst::GlobalAddr { .. } => "GlobalAddr",
             Inst::BinOp { .. } => "BinOp",
             Inst::UnaryOp { .. } => "UnaryOp",
             Inst::Alloca { .. } => "Alloca",
@@ -910,6 +920,7 @@ impl Inst {
             | Inst::ConstBool { .. }
             | Inst::ConstStr { .. }
             | Inst::ConstNull { .. }
+            | Inst::GlobalAddr { .. }
             | Inst::Alloca { .. }
             | Inst::Unreachable
             | Inst::Panic { .. } => Vec::new(),
@@ -1223,6 +1234,8 @@ pub struct IrModule {
     pub struct_layouts: HashMap<String, StructLayout>,
     /// Global string constants — maps string content to a label
     pub string_constants: HashMap<String, String>,
+    /// Module-level mutable global variables: maps name → (type, initializer expr)
+    pub globals: HashMap<String, (IrType, crate::ast::Expr)>,
     /// Function signatures for external/runtime functions
     pub extern_functions: HashMap<String, (Vec<IrType>, IrType)>,
     /// Effects of each function (computed from function body)
@@ -1247,6 +1260,7 @@ impl IrModule {
             functions: HashMap::new(),
             struct_layouts: HashMap::new(),
             string_constants: HashMap::new(),
+            globals: HashMap::new(),
             extern_functions: HashMap::new(),
             function_effects: HashMap::new(),
             extern_decls: Vec::new(),

@@ -647,6 +647,7 @@ pub struct TypeChecker {
     enum_variants: Vec<StringEnumVariants>,          // enum_name → variants
     enum_type_params: Vec<StringVecString>,          // enum_name → type params
     consts: Vec<StringType>,                         // const_name → Type
+    globals: Vec<StringType>,                         // global_name → Type (module-level mutable globals)
     type_aliases: Vec<StringType>,                   // alias_name → Type
     methods: Vec<StringMethodMap>,                   // struct_name → method map
     current_type_params: Vec<str>,                   // current function's type params
@@ -761,6 +762,7 @@ impl TypeChecker {
             enum_variants: Vec::new(),
             enum_type_params: Vec::new(),
             consts: Vec::new(),
+            globals: Vec::new(),
             type_aliases: Vec::new(),
             methods: Vec::new(),
             current_type_params: Vec::new(),
@@ -908,6 +910,16 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
         map_str_str_set(&mut self.item_modules, c.name, module);
         map_str_bool_set(&mut self.item_visibility, c.name, c.is_pub);
         ci = ci + 1;
+    }
+
+    // Register module-level mutable globals
+    var gi: i64 = 0;
+    while gi < program.globals.len() {
+        var g: GlobalVar = program.globals.get(gi);
+        map_str_type_set(&mut self.globals, g.name, g.ty);
+        map_str_str_set(&mut self.item_modules, g.name, module);
+        map_str_bool_set(&mut self.item_visibility, g.name, g.is_pub);
+        gi = gi + 1;
     }
 
     // Register type aliases
@@ -2849,7 +2861,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                     }
                 }
                 OptType::None => {
-                    if !map_str_type_contains(self.consts, target) {
+                    if !map_str_type_contains(self.consts, target) && !map_str_type_contains(self.globals, target) {
                         self.errors.push("Type error: cannot assign to undefined variable '" + target + "'");
                     }
                 }
@@ -3251,6 +3263,14 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                 OptType::None => {}
             }
             match map_str_type_get(self.consts, name) {
+                OptType::Some(ty) => {
+                    TypeChecker_check_visibility(self, name);
+                    return ty;
+                }
+                OptType::None => {}
+            }
+            // Check module-level mutable globals
+            match map_str_type_get(self.globals, name) {
                 OptType::Some(ty) => {
                     TypeChecker_check_visibility(self, name);
                     return ty;

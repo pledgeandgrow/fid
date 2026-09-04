@@ -72,6 +72,8 @@ pub struct TypeChecker {
     /// Enum name → declared type parameters (e.g. ["T"] for Option<T>).
     enum_type_params: HashMap<String, Vec<String>>,
     consts: HashMap<String, Type>,
+    /// Module-level mutable global variables: name → type
+    globals: HashMap<String, Type>,
     type_aliases: HashMap<String, Type>,
     methods: HashMap<String, HashMap<String, (Vec<Type>, Type, bool, bool)>>,
     /// Current function's type parameters (treated as valid types)
@@ -183,6 +185,7 @@ impl TypeChecker {
             enum_variants: HashMap::new(),
             enum_type_params: HashMap::new(),
             consts: HashMap::new(),
+            globals: HashMap::new(),
             type_aliases: HashMap::new(),
             methods: HashMap::new(),
             current_type_params: HashSet::new(),
@@ -702,6 +705,12 @@ impl TypeChecker {
             self.consts.insert(c.name.clone(), c.ty.clone());
             self.item_modules.insert(c.name.clone(), module.to_string());
             self.item_visibility.insert(c.name.clone(), c.is_pub);
+        }
+
+        for g in &program.globals {
+            self.globals.insert(g.name.clone(), g.ty.clone());
+            self.item_modules.insert(g.name.clone(), module.to_string());
+            self.item_visibility.insert(g.name.clone(), g.is_pub);
         }
 
         for ta in &program.type_aliases {
@@ -3746,7 +3755,7 @@ impl TypeChecker {
                     ));
                 }
                 // Check target exists
-                if self.lookup(target).is_none() && !self.consts.contains_key(target) {
+                if self.lookup(target).is_none() && !self.consts.contains_key(target) && !self.globals.contains_key(target) {
                     // Check if it was in a freed region (use-after-free)
                     if let Some(region) = self.var_regions.get(target) {
                         if self.freed_regions.contains(region) {
@@ -4318,6 +4327,11 @@ impl TypeChecker {
                     return ty.clone();
                 }
                 if let Some(ty) = self.consts.get(name).cloned() {
+                    self.check_visibility(name);
+                    return ty;
+                }
+                // Check module-level mutable globals
+                if let Some(ty) = self.globals.get(name).cloned() {
                     self.check_visibility(name);
                     return ty;
                 }

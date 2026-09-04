@@ -292,6 +292,11 @@ impl X86CodeGen {
                 wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
             }
 
+            Inst::GlobalAddr { name, .. } => {
+                wln!(self, "    lea rax, [rip + _g_{}]", name);
+                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+            }
+
             // ─── Arithmetic ───
             Inst::BinOp { op, left, right, ty } => {
                 let loff = frame.offset(*left);

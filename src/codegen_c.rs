@@ -364,6 +364,9 @@ impl CCodeGen {
         // Emit string constants
         self.emit_string_consts(module);
 
+        // Emit module-level mutable globals
+        self.emit_globals(module);
+
         // Emit struct definitions
         self.emit_struct_defs(module);
 
@@ -1190,6 +1193,48 @@ impl CCodeGen {
         wln!(self, "");
     }
 
+    /// Emit module-level mutable global variables as C file-scope variables.
+    fn emit_globals(&mut self, module: &IrModule) {
+        if module.globals.is_empty() { return; }
+        wln!(self, "// ─── Module-level mutable globals ───");
+        for (name, (ty, init)) in &module.globals {
+            let c_ty = Self::c_type(ty);
+            let c_name = Self::global_c_name(name);
+            // Emit as a static global with initializer
+            let init_str = self.gen_global_init_expr(init, ty);
+            wln!(self, "static {} {} = {};", c_ty, c_name, init_str);
+        }
+        wln!(self, "");
+    }
+
+    /// Mangle a global name for C emission (avoid collisions with functions/locals)
+    fn global_c_name(name: &str) -> String {
+        format!("_g_{}", name)
+    }
+
+    /// Generate a C expression for a global initializer.
+    fn gen_global_init_expr(&self, expr: &crate::ast::Expr, ty: &IrType) -> String {
+        use crate::ast::Expr;
+        match expr {
+            Expr::IntLit(v) => format!("{}LL", v),
+            Expr::FloatLit(v) => {
+                if v.is_nan() { "NAN".to_string() }
+                else if v.is_infinite() { if *v > 0.0 { "INFINITY".to_string() } else { "-INFINITY".to_string() } }
+                else { format!("{}", v) }
+            }
+            Expr::BoolLit(b) => if *b { "true".to_string() } else { "false".to_string() },
+            Expr::StringLit(s) => {
+                let escaped = Self::escape_c_string(s);
+                format!("\"{}\"", escaped)
+            }
+            _ => {
+                // For complex initializers, emit 0 (will be initialized at runtime if needed)
+                let _ = ty;
+                "0".to_string()
+            }
+        }
+    }
+
     fn emit_struct_defs(&mut self, module: &IrModule) {
         wln!(self, "// ─── Struct definitions ───");
         for (name, layout) in &module.struct_layouts {
@@ -1436,6 +1481,10 @@ impl CCodeGen {
             }
             Inst::ConstNull { .. } => {
                 wln!(self, "    {} = NULL;", dst);
+            }
+            Inst::GlobalAddr { name, .. } => {
+                // Take the address of the C global variable
+                wln!(self, "    {} = (int64_t)&{};", dst, Self::global_c_name(name));
             }
             Inst::BinOp { op, left, right, ty } => {
                 let l_raw = self.val_name(*left);

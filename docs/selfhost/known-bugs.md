@@ -2,7 +2,7 @@
 
 > Things that have broken before and how to avoid re-introducing them.
 >
-> Last updated: Sep 4, 2026 (session 9).
+> Last updated: Sep 5, 2026 (session 11).
 
 ---
 
@@ -500,6 +500,440 @@ must be fixed before the fixpoint check can be attempted with current code.
 - Check if a recent stdlib change introduced a construct the parser can't handle
 - Try building individual compiler modules to isolate which import triggers it
 
+### 2.12 `--borrowck` flag parsed but not wired (CURRENT — session 11)
+
+**Symptom:** `--borrowck=on` has no effect. Borrow checking is always `Off`.
+
+**Root cause:** `compiler/main.fd` parses the `--borrowck` flag into a global
+variable, but `compiler/compiler.fd` hardcodes `BorrowckMode::Off` when
+constructing the `BorrowChecker`. The flag value is not passed through the
+compilation pipeline.
+
+**Why it wasn't fixed:** Threading the flag through `build_program_with_path`
+and `ccompile_source_with_path` requires either (a) adding parameters to many
+call sites, or (b) using module-level mutable globals — which Fides didn't
+support until this session. The `var` feature was implemented specifically to
+solve this, but the wiring has not yet been completed.
+
+**Fix path:** Now that `var`/`pub var` is implemented in the Rust compiler,
+mirror it in the Fides compiler (`compiler/*.fd`), then use a module-level
+`pub var g_borrowck_mode: BorrowckMode = BorrowckMode::Off;` in `compiler.fd`
+that `main.fd` sets before calling `build_program_with_path`.
+
+**Impact:** Borrow checker is disabled in self-hosted compiler. No correctness
+impact (borrow checking is opt-in), but `--borrowck=on` silently does nothing.
+
+---
+
+## 2b. Session 11 — Module-Level `var` Feature Bugs & Risks
+
+> The `var`/`pub var` feature was implemented in the Rust compiler this session.
+> It is NOT yet mirrored in the Fides self-hosted compiler (`compiler/*.fd`).
+> Below are all bugs encountered during implementation, plus potential bugs
+> that agents should watch for when debugging crashes or wrong output.
+
+### 2b.1 Typechecker rejected assignments to globals (FIXED)
+
+**Symptom:** `Type error: cannot assign to undefined variable 'g_counter'`
+
+**Root cause:** `src/typechecker.rs` line ~3758 checked
+`self.lookup(target).is_none() && !self.consts.contains_key(target)`
+but did not check `self.globals.contains_key(target)`. Globals were registered
+in `self.globals` but the assignment validator didn't know about them.
+
+**Fix:** Added `&& !self.globals.contains_key(target)` to the condition.
+Also added globals lookup in `check_expr` for `Expr::Ident(name)` (line ~4330).
+
+**Lesson:** When adding a new category of named items (globals, types, etc.),
+update ALL places that check whether a name exists: expression lookup,
+assignment validation, and visibility checks.
+
+### 2b.2 PE emitter: globals stored in .rdata section (WORKING but fragile)
+
+**Symptom:** PE executables with globals crashed or produced wrong values.
+
+**Root cause:** The PE emitter only has `.text` and `.rdata` sections. There is
+no `.data` section. Globals need writable storage.
+
+**Current approach:** Globals are appended to the `.rdata` section, which is
+already marked `READ|WRITE` (0xC0000040) because the IAT needs write access.
+`GlobalAddr` emits `lea_rip` to the global's offset within `.rdata`.
+
+**Risk:** If the `.rdata` section characteristics are ever changed to read-only
+(0x40000040), globals will silently become read-only and writes will crash with
+`STATUS_ACCESS_VIOLATION`. The section flags are set in `build_pe_file()` in
+`src/pe.rs` line ~1705.
+
+**Better fix (future):** Add a proper `.data` section with its own section
+header. This requires changing `NumberOfSections` from 2 to 3, adjusting
+`SizeOfImage`, `SizeOfInitializedData`, and adding a third section header +
+raw data block.
+
+### 2b.3 ARM64/RISCV/WASM backends: GlobalAddr is a stub (KNOWN)
+
+**Symptom:** Globals return 0 on ARM64, RISC-V, and WASM backends.
+
+**Root cause:** These backends emit `mov #0` / `li 0` / `i64.const 0` as
+placeholder stubs for `L3Inst::GlobalAddr` / `Inst::GlobalAddr`. The real
+implementation would need platform-specific RIP-relative addressing:
+- ARM64: `adrp x0, _g_name@PAGE` + `add x0, x0, _g_name@PAGEOFF`
+- RISC-V: `lui x0, %hi(_g_name)` + `addi x0, x0, %lo(_g_name)`
+- WASM: WASM globals or a linear memory offset table
+
+**Impact:** Globals only work on x86-64 (PE, ELF, PIR codegen) and the
+interpreter. If Fides targets ARM64/RISCV/WASM, globals must be properly
+implemented.
+
+### 2b.4 No initialization order guarantee for globals (POTENTIAL)
+
+**Symptom:** A global whose initializer references another global declared
+later in the file gets a zero/garbage value.
+
+**Example:**
+```fides
+pub var g_a: i64 = g_b + 1;  // g_b not initialized yet
+pub var g_b: i64 = 10;
+```
+
+**Root cause:** `init_globals()` in `src/interp.rs` iterates
+`self.module.globals` (a HashMap, unordered) and initializes each global
+independently. The PE emitter appends globals in HashMap iteration order too.
+Neither checks whether an initializer references another global.
+
+**Current behavior:** Non-literal initializer expressions (anything other than
+`IntLit`, `FloatLit`, `BoolLit`, `StringLit`) are silently zero-initialized
+in both the interpreter and PE emitter. So `g_a = g_b + 1` becomes `g_a = 0`.
+
+**Fix needed:** The typechecker should reject forward references to other
+globals in initializer expressions. Alternatively, topologically sort globals
+by their dependencies and initialize in order.
+
+### 2b.5 Optimizer purity analysis broken by globals (POTENTIAL)
+
+**Symptom:** A function that reads a global is treated as `pure` by the
+optimizer. If the global changes between two calls, the optimizer incorrectly
+reuses the first result (CSE/GVN) or deletes the second call (DCE).
+
+**Root cause:** The optimizer's purity analysis is based on function effects
+(`EffectSet`). A function that only reads a global (no IO, no Alloc, no Write
+to memory through a pointer) may be classified as pure. But global reads are
+implicit memory reads not tracked by the current effect system.
+
+**Current status:** Not yet observed in tests because the test suite doesn't
+have functions that read globals and are called multiple times with global
+mutation in between. But this is a latent bug.
+
+**Fix needed:** Either (a) mark any function containing `GlobalAddr` + `Load`
+as having a `Read` effect, or (b) teach the optimizer that `GlobalAddr` is not
+pure (it depends on mutable global state).
+
+### 2b.6 Complex global initializers silently zero-initialized (KNOWN)
+
+**Symptom:** `var g_map: HashMap<str, i64> = HashMap::new();` produces an
+empty/null map, not a working empty map.
+
+**Root cause:** `eval_global_init()` in `src/interp.rs` and the PE emitter's
+initializer code only handle literal expressions (`IntLit`, `FloatLit`,
+`BoolLit`, `StringLit`). All other expressions (function calls, struct
+constructors, etc.) fall through to `_ => Value::Int(0)` or
+`_ => 0i64.to_le_bytes()`.
+
+**Impact:** Globals with non-literal initializers (Vec::new(), HashMap::new(),
+struct constructors) don't work. Only primitive-typed globals with literal
+initializers are fully functional.
+
+**Fix needed:** Evaluate complex initializer expressions at program startup
+(either in a generated `__init_globals` function or by running them in the
+entry point before `main`).
+
+### 2b.7 Interpreter: string globals use opaque_values side-table (FRAGILE)
+
+**Symptom:** String globals may lose their string value if the opaque_values
+entry is overwritten.
+
+**Root cause:** `init_globals()` in `src/interp.rs` allocates string globals
+in memory and stores the pointer in the global slot. The actual `Value::Str`
+is kept in `opaque_values` at the string address. If a subsequent store to
+the same address doesn't clear the `opaque_values` entry, or if the address
+is reused, the string can be lost.
+
+**Status:** Not yet observed in tests. The 0x00400000 base address is far from
+normal allocations, so collisions are unlikely. But this is fragile.
+
+### 2b.8 Self-host regressions after var implementation (CURRENT)
+
+**Symptom:** `verify.sh` shows 16 regressions after implementing `var`:
+- `test_codegen_c` — interp + c codegen
+- `test_lower`, `test_banking`, `test_deep_nesting`, `test_new_features`,
+  `test_parallel`, `test_parallel_concurrent`, `test_phase8b`, `test_rc_arc`,
+  `test_regression_collections`, `test_vec_math` — c codegen only
+- `test_deep_nesting` — pe emit
+- `test_token_full` — all 3 backends
+
+**Root cause (test_token_full):** This is a library module (no `fn main`).
+It was likely already failing before this session — the test count grew from
+180 to 211 between baselines, suggesting many new tests were added.
+
+**Root cause (others):** Unknown — needs investigation. Likely related to
+the `var` changes in `lower.rs` (assignment handling, ident lookup) or
+`typechecker.rs` (globals map). The C codegen-only failures suggest the
+`emit_globals` function or `GlobalAddr` C codegen may interfere with
+existing code paths.
+
+**Investigation steps:**
+1. Run `./scripts/bisect.sh test_codegen_c` to find which layer broke
+2. Check if `emit_globals` emits anything when `module.globals` is empty
+   (it should be a no-op for existing tests)
+3. Check if the `lower.rs` assignment change (global check before alloca check)
+   affects non-global assignments
+4. Run `./target/release/fidesc run tests/test_codegen_c.fd` for the
+   interpreter error message
+
+### 2b.9 `git stash` incident (RESOLVED, process bug)
+
+**Symptom:** Running `git stash` to compare baselines stashed all uncommitted
+work (both agent's and user's changes), and the command was interrupted before
+`git stash pop` could restore.
+
+**Root cause:** Agent ran `git stash` carelessly to check baseline state.
+This is a process error, not a code bug.
+
+**Fix:** `git stash pop` restored all work. Added hard rule to `AGENTS.md`:
+"NEVER run `git stash`, `git checkout -- .`, `git reset --hard`, or any
+command that discards/hides uncommitted work."
+
+**Lesson for all agents:** Use `git diff` or `git worktree add` to compare
+baselines. NEVER touch the working tree.
+
+---
+
+## 2c. Session 11 — Static Analysis Findings (All `compiler/*.fd` Files)
+
+> A comprehensive read-only static analysis was performed on all 24 self-hosted
+> compiler modules. Below are the bugs and issues discovered, organized by
+> priority. Line numbers refer to the `compiler/*.fd` files as they existed
+> at the time of analysis.
+
+### P0 — Critical (prevents compilation)
+
+#### 2c.1 `lexer.fd:291` — Duplicate empty `str_filter_underscores` stub
+
+**Symptom:** Numeric literals with underscores (e.g. `1_000_000`) won't have
+underscores stripped.
+
+**Root cause:** `str_filter_underscores` is defined twice:
+1. Empty stub at line 291: `var result: str = "";` (function body ends immediately)
+2. Real implementation at lines 572-583
+
+Either the file fails to compile (duplicate function) or the empty stub
+shadows the real one.
+
+**Fix:** Remove the empty stub at line 291.
+
+#### 2c.2 `parser.fd` — `box_expr_deref` references non-existent `Expr` variants
+
+**Symptom:** Parser module won't compile.
+
+**Root cause:** `box_expr_deref` (lines 4941-4971) matches `Expr` variants
+that do not exist in `ast.fd`:
+- `CharLit`, `Assign`, `Lambda`, `SizeOf`, `AlignOf`, `OffsetOf`, `Path`,
+  `UnitLit` — none of these are in the `Expr` enum
+- `ArrayLit(args)` — uses 1 field, but `ast.fd` defines `ArrayLit(Box<Type>, Vec<Expr>)` (2 fields)
+- `Range(l, r)` — uses 2 fields, but `ast.fd` defines `Range(Box<Expr>, Box<Expr>, bool)` (3 fields)
+
+**Fix:** Rewrite `box_expr_deref` to match the actual `ast.fd` `Expr` enum
+variants and arities.
+
+#### 2c.3 `parser.fd` — Missing `return` statements in 4 parse functions
+
+**Symptom:** Functions fall off the end without returning a `ParseResult*`.
+
+**Affected functions:**
+- `parse_guard_stmt` (ends at line 2521)
+- `parse_use_stmt` (ends at line 3024)
+- `parse_match_expr` (ends at line 4002)
+- `parse_comptime_expr` (line 3848 — only returns for `comptime { ... }`)
+
+**Fix:** Add appropriate `return` statements at the end of each function.
+
+#### 2c.4 `parser.fd` — Duplicate `var has_forward` in `parse_layer` and `parse_model`
+
+**Symptom:** Duplicate variable declaration error.
+
+**Root cause:** `var has_forward: bool = false;` is declared twice in:
+- `parse_layer` (lines 1637-1639)
+- `parse_model` (lines 1704-1706)
+
+**Fix:** Remove the duplicate declaration.
+
+#### 2c.5 `parser.fd:4684` — `parse_use` version-pin always returns Err
+
+**Symptom:** `use foo = "1.0.0";` always produces a parse error.
+
+**Root cause:** Lines 4684-4695: even when a valid version string is found
+(`TokenKind::StringLit(s)`), the function immediately returns
+`ParseResultImportDef::Err(...)`.
+
+**Fix:** Only return `Err` when no valid string token is found.
+
+### P1 — Important (correctness or feature gaps)
+
+#### 2c.6 `compiler.fd:1006` — `--borrowck` hardcoded to Off
+
+Already documented as bug 2.12 above. The `var` feature now makes this fixable.
+
+#### 2c.7 `main.fd:71` — `--borrowck=` off-by-one in substring extraction
+
+**Symptom:** `--borrowck=off` is parsed as `ff` instead of `off`.
+
+**Root cause:** `str_substring_from(garg, 12)` for an 11-character prefix
+(`--borrowck=`) drops the first value character if strings are 0-indexed.
+
+**Fix:** Use index 11 instead of 12.
+
+#### 2c.8 `inc.fd:134-145` — `global_cache_*` are no-ops
+
+Already documented in architecture.md. Now fixable with the `var` feature
+implemented in the Rust compiler. The Fides `inc.fd` can use `var` to
+implement a real global cache once the `var` feature is mirrored to the
+Fides self-hosted compiler.
+
+#### 2c.9 `lower.fd:6005` — `f64_to_bits` always returns 0
+
+**Symptom:** Float bitcast operations produce 0.
+
+**Root cause:** `f64_to_bits(f: f64) -> i64` is a stub: `return 0;`
+
+**Fix:** Implement proper IEEE 754 bit conversion.
+
+#### 2c.10 `lower.fd:1767` — `lower_type` narrows I128/U128 to I64/U64
+
+**Symptom:** 128-bit integer types silently become 64-bit in IR.
+
+**Root cause:** `lower_type` maps `I128` → `I64` and `U128` → `U64` at lines
+1767, 1772, 1833, 1838.
+
+**Fix:** Add `IrType::I128`/`U128` support or reject 128-bit types with an error.
+
+#### 2c.11 `opt.fd:221` — `is_lto_mode()` hardcoded false
+
+**Symptom:** LTO mode detection always returns false.
+
+**Root cause:** `is_lto_mode() -> bool { return false; }`
+
+**Fix:** Read from a module-level flag (now possible with `var` feature).
+
+#### 2c.12 `opt.fd:1649-1660` — `cse_key` unreachable duplicate arms
+
+**Symptom:** Dead code (not a correctness issue, but confusing).
+
+**Root cause:** Duplicate `ConstInt`/`ConstFloat`/`ConstStr`/`ConstBool` arms
+appear after a catch-all `_` arm.
+
+**Fix:** Remove the duplicate arms.
+
+#### 2c.13 `pir.fd:2681` — `str_substring` returns original string
+
+**Symptom:** Any caller of `str_substring` gets the full string instead of a
+substring.
+
+**Root cause:** `str_substring(s, start, len) -> str { return s; }` — ignores
+`start` and `len`.
+
+**Fix:** Implement actual substring extraction, or remove if unused.
+
+#### 2c.14 `codegen_c.fd:2523,2555` — `DynCall` and `TryUnwrap` not implemented
+
+**Symptom:** C codegen for `DynCall` and `TryUnwrap` emits only a comment,
+leaving the destination variable uninitialized.
+
+**Root cause:**
+```fides
+Inst::DynCall(_, _, _, _, _) => {
+    wln(self, "    // DynCall not implemented in C backend");
+}
+Inst::TryUnwrap(_, _, _, _) => {
+    wln(self, "    // TryUnwrap not implemented in C backend");
+}
+```
+
+**Fix:** Implement proper C codegen for these instructions.
+
+#### 2c.15 `pe.fd` — 20+ runtime stubs return wrong values
+
+**Symptom:** PE executables that use these runtime functions produce wrong
+results.
+
+**Affected stubs:**
+- `p_vec_insert`, `p_vec_remove`, `p_vec_reverse`, `p_vec_extend`,
+  `p_vec_sort` — all return 0 (`xor rax; ret`)
+- `p_string_contains`, `p_string_starts_with`, `p_string_ends_with` —
+  return `true`
+- `p_string_split` — returns empty Vec
+- `p_string_find`, `p_string_rfind` — return 0
+- `p_string_replace`, `p_string_to_uppercase`, `p_string_to_lowercase`,
+  `p_string_trim`, `p_string_repeat` — return input unchanged
+- `p_map_keys`, `p_map_values`, `p_map_clone` — return empty
+
+**Fix:** Implement proper runtime functions for each.
+
+#### 2c.16 `mono.fd:649` — `subst_gat_type_args` always uses args.get(0)
+
+**Symptom:** Generics with more than one type parameter are mis-substituted.
+
+**Root cause:** For single-character uppercase generic parameters, the function
+always uses `args.get(0)` instead of the correct parameter index.
+
+**Fix:** Use the correct parameter index based on the generic parameter name.
+
+#### 2c.17 `comptime_eval.fd` — Return re-wrap omissions
+
+**Symptom:** Comptime expressions inside `return` statements are not
+substituted or evaluated.
+
+**Root cause:** `substitute_expr` and `replace_ident_in_*` skip `Stmt::Return`
+and `OptBoxExpr` re-wrapping. Comments say "Can't re-wrap into Box easily;
+skip for now."
+
+**Fix:** Implement proper Box re-wrapping for Return statements.
+
+### P2 — Lower priority (not blocking bootstrap)
+
+#### 2c.18 `typechecker.fd:1451-1505` — 13 safety verification stubs
+
+All 13 `verify_*` functions for safety annotations (`@conserve`, `@gas`,
+`@constant_time`, `@realtime`, `@differentiable`, `@quantized`, `@checkpoint`,
+`@dp`, `@shard`, `@adapter`, `@tainted`, `@contracts`, `@allocator_params`)
+are empty no-ops. Safety annotations are accepted but not enforced. Not
+needed for bootstrap, but dangerous for production use.
+
+#### 2c.19 `parser.fd:4847` — `parse_fstring_parts` is a stub
+
+F-string interpolation is extracted as raw text, not parsed. The `Lexer::new`
+call is commented out with "TODO: Re-enable when cross-module Lexer usage is
+fixed."
+
+#### 2c.20 `comptime_eval.fd` — `aggressive_comptime_expr` limited recursion
+
+Only recurses into `Binary`, `Unary`, `Call`, `MethodCall`. Other expressions
+(`If`, `Match`, `ArrayLit`, `StructLit`) are not traversed for nested comptime
+calls.
+
+#### 2c.21 `lower.fd:6155` — `infer_expr_ast_type` falls back to I64
+
+Simplified inference returns `Type::I64` for most expression forms, making
+closure return type inference unreliable for non-trivial closures.
+
+#### 2c.22 `compiler.fd:1295` — `apply_cfg_filter` is a no-op
+
+Explicit no-op: `// No-op — include all items.` CFG filtering is not
+implemented.
+
+#### 2c.23 `compiler.fd:1597` — `fill_default_trait_methods` incomplete
+
+Creates default method functions but never pushes them into
+`program.trait_impls`.
+
 ---
 
 ## 3. Gotchas
@@ -613,3 +1047,21 @@ Also high-risk in Rust reference compiler:
 | Import not found | Import path resolution order | `compiler.fd` `build_program_with_path()` |
 | Missing statements in generated C | Fides compiler statement-dropping bug (long functions) | Split the source function into smaller helpers |
 | PE file truncated/corrupt | `p_file_write` truncates at null bytes | Use hex encoding + external decode |
+| Global variable always 0 | Non-literal initializer (Vec::new, HashMap::new, struct ctor) | `interp.rs:eval_global_init` / `pe.rs` initializer — only handles literals |
+| Global variable crashes on write (PE) | `.rdata` section changed to read-only | `pe.rs:build_pe_file` section characteristics — must be 0xC0000040 (READ\|WRITE) |
+| Global variable wrong on ARM64/RISCV/WASM | Backend stubs GlobalAddr as 0 | `codegen_arm64.rs`, `codegen_riscv.rs`, `wasm.rs` — need real RIP-relative addressing |
+| `--borrowck=on` has no effect | Flag not wired through pipeline | `compiler.fd` hardcodes `BorrowckMode::Off`; see bug 2.12 |
+| Optimizer deletes/reuses global-reading calls | Function reading global treated as pure | Effect system doesn't track global reads; see bug 2b.5 |
+| `cannot assign to undefined variable` for global | Typechecker missing globals check | `typechecker.rs` assignment validation — see bug 2b.1 |
+| Numeric literal with underscores not stripped | Duplicate `str_filter_underscores` stub | `lexer.fd:291` — see bug 2c.1 |
+| Parser fails to compile | `box_expr_deref` references non-existent Expr variants | `parser.fd:4941` — see bug 2c.2 |
+| Parse function returns nothing | Missing `return` at end of function | `parser.fd` — see bug 2c.3 |
+| Duplicate variable error | `var has_forward` declared twice | `parser.fd:1637,1704` — see bug 2c.4 |
+| `use foo = "1.0.0"` always errors | `parse_use` returns Err even on valid version | `parser.fd:4684` — see bug 2c.5 |
+| `--borrowck=off` parsed as `ff` | Off-by-one in substring extraction | `main.fd:71` — see bug 2c.7 |
+| Float bitcast returns 0 | `f64_to_bits` is a stub | `lower.fd:6005` — see bug 2c.9 |
+| 128-bit integers truncated to 64-bit | `lower_type` narrows I128/U128 | `lower.fd:1767` — see bug 2c.10 |
+| PE: vec_insert/remove/sort return 0 | Runtime stubs are `xor rax; ret` | `pe.fd` — see bug 2c.15 |
+| PE: string_contains returns true | Runtime stub returns true always | `pe.fd` — see bug 2c.15 |
+| Generic with >1 type param mis-substituted | `subst_gat_type_args` always uses args.get(0) | `mono.fd:649` — see bug 2c.16 |
+| Comptime in `return` not evaluated | Return re-wrap omitted in substitute | `comptime_eval.fd` — see bug 2c.17 |

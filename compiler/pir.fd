@@ -97,6 +97,9 @@ pub enum L1Inst {
     ConstStr(str),
     ConstNull(IrType),
 
+    // ─── Globals ───
+    GlobalAddr(str, IrType),
+
     // ─── Arithmetic (pure) ───
     BinOp(BinOp, i64, i64, IrType),
     UnaryOp(UnaryOp, i64, IrType),
@@ -214,6 +217,7 @@ pub fn l1inst_kind_name(inst: &L1Inst) -> str {
         L1Inst::ConstBool(_) => { return "ConstBool"; }
         L1Inst::ConstStr(_) => { return "ConstStr"; }
         L1Inst::ConstNull(_) => { return "ConstNull"; }
+        L1Inst::GlobalAddr(_, _) => { return "GlobalAddr"; }
         L1Inst::BinOp(_, _, _, _) => { return "BinOp"; }
         L1Inst::UnaryOp(_, _, _) => { return "UnaryOp"; }
         L1Inst::NewRegion(_) => { return "NewRegion"; }
@@ -445,6 +449,9 @@ pub enum L2Inst {
     ConstStr(str),
     ConstNull(IrType),
 
+    // ─── Globals ───
+    GlobalAddr(str, IrType),
+
     // ─── Arithmetic ───
     BinOp(BinOp, i64, i64, IrType),
     UnaryOp(UnaryOp, i64, IrType),
@@ -501,6 +508,7 @@ pub fn l2inst_kind_name(inst: &L2Inst) -> str {
         L2Inst::ConstBool(_) => { return "ConstBool"; }
         L2Inst::ConstStr(_) => { return "ConstStr"; }
         L2Inst::ConstNull(_) => { return "ConstNull"; }
+        L2Inst::GlobalAddr(_, _) => { return "GlobalAddr"; }
         L2Inst::BinOp(_, _, _, _) => { return "BinOp"; }
         L2Inst::UnaryOp(_, _, _) => { return "UnaryOp"; }
         L2Inst::Alloca(_, _) => { return "Alloca"; }
@@ -765,6 +773,8 @@ pub enum L3Inst {
     Mov(VReg, Operand),
     // dst = &slot (address-of stack slot — for Alloca)
     AddrOfSlot(VReg, Slot),
+    // dst = &global (address-of module-level mutable global)
+    GlobalAddr(VReg, str, IrType),
     // dst = a op b
     Bin(BinOp, VReg, Operand, Operand, IrType),
     // dst = op src
@@ -1039,6 +1049,7 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
             Inst::ConstBool(value) => { l1_inst = L1Inst::ConstBool(value); }
             Inst::ConstStr(value) => { l1_inst = L1Inst::ConstStr(value); }
             Inst::ConstNull(ty) => { l1_inst = L1Inst::ConstNull(ty); }
+            Inst::GlobalAddr(name, ty) => { l1_inst = L1Inst::GlobalAddr(name, ty); }
 
             Inst::BinOp(op, left, right, ty) => { l1_inst = L1Inst::BinOp(op, left, right, ty); }
             Inst::UnaryOp(op, operand, ty) => { l1_inst = L1Inst::UnaryOp(op, operand, ty); }
@@ -1337,6 +1348,7 @@ fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
             L1Inst::ConstBool(value) => { l2_inst = L2Inst::ConstBool(value); }
             L1Inst::ConstStr(value) => { l2_inst = L2Inst::ConstStr(value); }
             L1Inst::ConstNull(ty) => { l2_inst = L2Inst::ConstNull(ty); }
+            L1Inst::GlobalAddr(name, ty) => { l2_inst = L2Inst::GlobalAddr(name, ty); }
 
             L1Inst::BinOp(op, left, right, ty) => { l2_inst = L2Inst::BinOp(op, left, right, ty); }
             L1Inst::UnaryOp(op, operand, ty) => { l2_inst = L2Inst::UnaryOp(op, operand, ty); }
@@ -1693,6 +1705,7 @@ fn lower_func_l2_to_l3(f: &L2Function, module: &IrModule) -> L3Function {
             L2Inst::ConstInt(_, t) => { ty = t; }
             L2Inst::ConstFloat(_, t) => { ty = t; }
             L2Inst::ConstNull(t) => { ty = t; }
+            L2Inst::GlobalAddr(_, t) => { ty = IrType::Ptr(Box::new(t)); }
             _ => { ty = IrType::I64; }
         }
         value_types_set(&mut value_types, pv, ty);
@@ -1847,6 +1860,9 @@ fn lower_l2_inst_to_l3(
         }
         L2Inst::ConstNull(_) => {
             return L3Inst::Mov(dst, Operand::ImmNull);
+        }
+        L2Inst::GlobalAddr(name, ty) => {
+            return L3Inst::GlobalAddr(dst, name, ty);
         }
 
         L2Inst::BinOp(op, left, right, ty) => {
@@ -2157,6 +2173,7 @@ pub fn fmt_l1_inst(i: L1Inst) -> str {
         L1Inst::ConstBool(value) => { return "const bool " + bool_to_str(value); }
         L1Inst::ConstStr(value) => { return "const str \"" + escape_str(value) + "\""; }
         L1Inst::ConstNull(ty) => { return "const " + ir_type_to_str(ty) + " null"; }
+        L1Inst::GlobalAddr(name, ty) => { return "globaladdr " + ir_type_to_str(ty) + " " + name; }
         L1Inst::BinOp(op, left, right, ty) => { return "binop " + binop_debug_str(op) + " " + ir_type_to_str(ty) + " " + value_id_to_str(left) + ", " + value_id_to_str(right) + " -> " + ir_type_to_str(ty); }
         L1Inst::UnaryOp(op, operand, ty) => { return "unop " + unaryop_debug_str(op) + " " + ir_type_to_str(ty) + " " + value_id_to_str(operand) + " -> " + ir_type_to_str(ty); }
         L1Inst::NewRegion(name) => { return "new_region \"" + name + "\""; }
@@ -2278,6 +2295,7 @@ pub fn fmt_l2_inst(i: L2Inst) -> str {
         L2Inst::ConstBool(value) => { return "const bool " + bool_to_str(value); }
         L2Inst::ConstStr(value) => { return "const str \"" + escape_str(value) + "\""; }
         L2Inst::ConstNull(ty) => { return "const " + ir_type_to_str(ty) + " null"; }
+        L2Inst::GlobalAddr(name, ty) => { return "globaladdr " + ir_type_to_str(ty) + " " + name; }
         L2Inst::BinOp(op, left, right, ty) => { return "binop " + binop_debug_str(op) + " " + value_id_to_str(left) + ", " + value_id_to_str(right) + " -> " + ir_type_to_str(ty); }
         L2Inst::UnaryOp(op, operand, ty) => { return "unop " + unaryop_debug_str(op) + " " + value_id_to_str(operand) + " -> " + ir_type_to_str(ty); }
         L2Inst::Alloca(ty, reg) => { return "alloca " + mem_region_to_str(reg) + " " + ir_type_to_str(ty); }
@@ -2390,6 +2408,7 @@ pub fn fmt_l3_inst(i: L3Inst) -> str {
     match i {
         L3Inst::Mov(dst, src) => { return vreg_to_str(dst) + " = " + operand_to_str(src); }
         L3Inst::AddrOfSlot(dst, slot) => { return vreg_to_str(dst) + " = addrof " + slot_to_str(slot); }
+        L3Inst::GlobalAddr(dst, name, _) => { return vreg_to_str(dst) + " = globaladdr " + name; }
         L3Inst::Bin(op, dst, a, b, ty) => { return vreg_to_str(dst) + " = " + binop_debug_str(op) + " " + operand_to_str(a) + ", " + operand_to_str(b) + "  ; " + ir_type_to_str(ty); }
         L3Inst::Unary(op, dst, src, ty) => { return vreg_to_str(dst) + " = " + unaryop_debug_str(op) + " " + operand_to_str(src) + "  ; " + ir_type_to_str(ty); }
         L3Inst::StackAlloc(dst, bytes, reg) => { return vreg_to_str(dst) + " = stackalloc " + mem_region_to_str(reg) + " " + int_to_str(bytes); }

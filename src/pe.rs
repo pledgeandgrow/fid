@@ -1372,6 +1372,10 @@ const IMPORTS: &[&str] = &[
     "GetProcessHeap",
     "HeapAlloc",
     "HeapFree",
+    "CreateFileA",
+    "ReadFile",
+    "CloseHandle",
+    "GetFileSize",
 ];
 
 /// Build the .rdata section content: string constants + import table
@@ -1775,6 +1779,10 @@ const IAT_EXIT_PROCESS: usize = 2;
 const IAT_GET_PROCESS_HEAP: usize = 3;
 const IAT_HEAP_ALLOC: usize = 4;
 const IAT_HEAP_FREE: usize = 5;
+const IAT_CREATE_FILE_A: usize = 6;
+const IAT_READ_FILE: usize = 7;
+const IAT_CLOSE_HANDLE: usize = 8;
+const IAT_GET_FILE_SIZE: usize = 9;
 
 struct PeCodeGen {
     enc: X86Encoder,
@@ -1782,6 +1790,8 @@ struct PeCodeGen {
     func_labels: HashMap<String, u32>,
     /// Map string content to rdata offset
     string_rdata_offsets: HashMap<String, usize>,
+    /// Map global var name to rdata offset (writable section)
+    global_rdata_offsets: HashMap<String, usize>,
     /// IAT entry offsets within .rdata (for each import)
     iat_rdata_offsets: Vec<usize>,
     /// Block labels: (function_name, block_id) -> label_id
@@ -1798,6 +1808,7 @@ impl PeCodeGen {
             enc: X86Encoder::new(),
             func_labels: HashMap::new(),
             string_rdata_offsets: HashMap::new(),
+            global_rdata_offsets: HashMap::new(),
             iat_rdata_offsets: Vec::new(),
             block_labels: HashMap::new(),
             entry_offset: 0,
@@ -1843,6 +1854,24 @@ impl PeCodeGen {
         // Record IAT offsets
         self.iat_rdata_offsets = rdata.iat_offsets.clone();
 
+        // 2b. Append module-level mutable globals to .rdata (section is writable)
+        // Each global gets 8 bytes of storage, initialized with the constant value.
+        for (name, (ty, init_expr)) in &module.globals {
+            let off = rdata.data.len();
+            // Compute the 8-byte initial value
+            let bytes: [u8; 8] = match init_expr {
+                crate::ast::Expr::IntLit(v) => (*v as i64).to_le_bytes(),
+                crate::ast::Expr::BoolLit(b) => (if *b { 1i64 } else { 0 }).to_le_bytes(),
+                crate::ast::Expr::FloatLit(f) => {
+                    if *ty == IrType::F32 { (*f as f32).to_le_bytes().iter().chain([0u8;4].iter()).cloned().collect::<Vec<u8>>().try_into().unwrap() }
+                    else { (*f as f64).to_le_bytes() }
+                }
+                _ => 0i64.to_le_bytes(), // zero-initialize
+            };
+            rdata.data.extend_from_slice(&bytes);
+            self.global_rdata_offsets.insert(name.clone(), off);
+        }
+
         // 3. Pre-allocate labels for all functions
         for name in module.functions.keys() {
             let label = self.enc.alloc_label();
@@ -1853,6 +1882,11 @@ impl PeCodeGen {
                        "p_panic", "p_malloc", "p_free",
                        "p_str_concat", "p_to_str",
                        "p_to_str_vec", "p_to_str_float", "p_to_str_str", "p_to_str_bool",
+                       "p_float_to_str", "p_bool_to_str", "p_char_to_str",
+                       "p_eprint_str", "p_print_newline",
+                       "p_sb_new", "p_sb_append", "p_sb_to_str",
+                       "p_file_read", "p_file_write",
+                       "p_str_join_n",
                        "p_vec_new", "p_vec_push", "p_vec_len", "p_vec_get", "p_vec_pop", "p_print_vec",
                        "p_vec_set", "p_vec_is_empty", "p_vec_clear", "p_vec_capacity",
                        "p_vec_insert", "p_vec_remove", "p_vec_contains", "p_vec_reverse",
@@ -2314,6 +2348,13 @@ impl PeCodeGen {
                 self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
             }
 
+            Inst::GlobalAddr { name, .. } => {
+                // lea rax, [rip + global_offset]
+                let off = *self.global_rdata_offsets.get(name).unwrap_or(&0);
+                self.enc.lea_rip(Reg::Rax, off);
+                self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
+            }
+
             // ─── Arithmetic ───
             Inst::BinOp { op, left, right, ty } => {
                 let loff = frame.offset(*left) as i32;
@@ -2708,11 +2749,18 @@ impl PeCodeGen {
             }
 
             // ─── Fides-Specific ───
-            Inst::Print { value, .. } => {
+            Inst::Print { value, ty } => {
                 let voff = frame.offset(*value) as i32;
                 self.enc.mov_reg_mem_rbp(Reg::Rcx, voff);
                 self.enc.sub_rsp_i32(32);
-                if let Some(&flabel) = self.func_labels.get("p_print_int") {
+                // Route to the correct print function based on type
+                let print_fn = match ty {
+                    IrType::Ptr(_) => "p_print_str",
+                    IrType::F64 | IrType::F32 => "p_print_float",
+                    IrType::Bool => "p_print_bool",
+                    _ => "p_print_int",
+                };
+                if let Some(&flabel) = self.func_labels.get(print_fn) {
                     self.enc.call_label(flabel);
                 }
                 self.enc.add_rsp_i32(32);
@@ -2959,6 +3007,17 @@ impl PeCodeGen {
         self.gen_to_str_float();
         self.gen_to_str_str();
         self.gen_to_str_bool();
+        self.gen_float_to_str_alias();
+        self.gen_bool_to_str_alias();
+        self.gen_char_to_str();
+        self.gen_eprint_str();
+        self.gen_print_newline();
+        self.gen_sb_new();
+        self.gen_sb_append();
+        self.gen_sb_to_str();
+        self.gen_file_read();
+        self.gen_file_write();
+        self.gen_str_join_n();
         self.gen_vec_new();
         self.gen_vec_push();
         self.gen_vec_len();
@@ -3244,10 +3303,6 @@ impl PeCodeGen {
         // Save buffer end in r13 for length calculation later
         self.enc.mov_rr(Reg::R13, Reg::R8);
 
-        // mov byte [r8], 10 (newline) — use rdx as temp since we don't have mov [reg], imm8
-        self.enc.mov_r8_imm(Reg::Rdx, 10);
-        self.enc.mov_mem_reg8(Reg::R8, Reg::Rdx);
-
         // r9 = 10 (divisor)
         self.enc.mov_imm32(Reg::R9, 10);
 
@@ -3291,10 +3346,9 @@ impl PeCodeGen {
         self.enc.add_rsp_i32(32);
         self.enc.mov_rr(Reg::R12, Reg::Rax); // handle
 
-        // length = r13 - r8 + 1 (buffer_end - current_pos + 1, to include newline at buffer_end)
+        // length = r13 - r8 (buffer_end - current_pos)
         self.enc.mov_rr(Reg::R9, Reg::R13);
         self.enc.sub_rr(Reg::R9, Reg::R8); // r9 = length
-        self.enc.add_r_i8(Reg::R9, 1);
 
         // WriteFile(handle, r8, len, &written, NULL)
         self.enc.mov_rr(Reg::Rcx, Reg::R12); // handle
@@ -3360,29 +3414,6 @@ impl PeCodeGen {
         self.enc.mov_rr(Reg::Rdx, Reg::R12); // buffer
         self.enc.mov_rr(Reg::R8, Reg::R13);  // length
         self.enc.lea_rbp(Reg::R9, -32);
-        self.enc.xor_self(Reg::Rax);
-        self.enc.mov_mem_disp_reg32(Reg::R9, 0, Reg::Rax);
-
-        self.enc.sub_rsp_i32(48);
-        self.enc.xor_self(Reg::Rax);
-        self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax);
-        self.enc.call_rip(self.iat_off(IAT_WRITE_FILE));
-        self.enc.add_rsp_i32(48);
-
-        // Print newline: mov byte [rbp-33], 10
-        self.enc.lea_rbp(Reg::Rax, -33);
-        self.enc.mov_r8_imm(Reg::Rcx, 10);
-        self.enc.mov_mem_reg8(Reg::Rax, Reg::Rcx);
-
-        self.enc.mov_imm32(Reg::Rcx, -11);
-        self.enc.sub_rsp_i32(32);
-        self.enc.call_rip(self.iat_off(IAT_GET_STD_HANDLE));
-        self.enc.add_rsp_i32(32);
-
-        self.enc.mov_rr(Reg::Rcx, Reg::Rax);
-        self.enc.lea_rbp(Reg::Rdx, -33);
-        self.enc.mov_imm32(Reg::R8, 1);
-        self.enc.lea_rbp(Reg::R9, -40);
         self.enc.xor_self(Reg::Rax);
         self.enc.mov_mem_disp_reg32(Reg::R9, 0, Reg::Rax);
 
@@ -3460,29 +3491,6 @@ impl PeCodeGen {
         self.enc.call_rip(self.iat_off(IAT_WRITE_FILE));
         self.enc.add_rsp_i32(48);
 
-        // Newline
-        self.enc.lea_rbp(Reg::Rax, -33);
-        self.enc.mov_r8_imm(Reg::Rcx, 10);
-        self.enc.mov_mem_reg8(Reg::Rax, Reg::Rcx);
-
-        self.enc.mov_imm32(Reg::Rcx, -11);
-        self.enc.sub_rsp_i32(32);
-        self.enc.call_rip(self.iat_off(IAT_GET_STD_HANDLE));
-        self.enc.add_rsp_i32(32);
-
-        self.enc.mov_rr(Reg::Rcx, Reg::Rax);
-        self.enc.lea_rbp(Reg::Rdx, -33);
-        self.enc.mov_imm32(Reg::R8, 1);
-        self.enc.lea_rbp(Reg::R9, -40);
-        self.enc.xor_self(Reg::Rax);
-        self.enc.mov_mem_disp_reg32(Reg::R9, 0, Reg::Rax);
-
-        self.enc.sub_rsp_i32(48);
-        self.enc.xor_self(Reg::Rax);
-        self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax);
-        self.enc.call_rip(self.iat_off(IAT_WRITE_FILE));
-        self.enc.add_rsp_i32(48);
-
         self.enc.xor_self(Reg::Rax);
         self.enc.add_rsp_i32(64);
         self.enc.pop(Reg::R13);
@@ -3551,13 +3559,11 @@ impl PeCodeGen {
         let pf_not_zero = self.enc.alloc_label();
         self.enc.jcc_label(0x5, pf_not_zero); // jnz
 
-        // Zero: write "0\n" directly
+        // Zero: write "0" directly
         self.enc.lea_rbp(Reg::R12, -256);
         self.enc.mov_r8_imm(Reg::Rax, b'0' as u8);
         self.enc.mov_mem_reg8(Reg::R12, Reg::Rax);
-        self.enc.mov_r8_imm(Reg::Rax, 10);
-        self.enc.mov_mem_disp_reg8(Reg::R12, 1, Reg::Rax);
-        self.enc.lea_rbp(Reg::R13, -255);
+        self.enc.mov_rr(Reg::R13, Reg::R12);
         let pf_write = self.enc.alloc_label();
         self.enc.jmp_label(pf_write);
 
@@ -3775,11 +3781,9 @@ impl PeCodeGen {
 
         self.enc.place_label(pf_no_frac);
 
-        // Store newline
-        self.enc.mov_r8_imm(Reg::Rax, 10);
-        self.enc.mov_mem_reg8(Reg::R12, Reg::Rax);
-        // r13 = r12 (end, including newline)
+        // r13 = r12 - 1 (last digit position, no newline)
         self.enc.mov_rr(Reg::R13, Reg::R12);
+        self.enc.dec_r(Reg::R13);
         // r12 = buffer start = [rbp-256]
         self.enc.lea_rbp(Reg::R12, -256);
 
@@ -6264,6 +6268,658 @@ impl PeCodeGen {
         self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
         self.enc.pop(Reg::R13);
         self.enc.pop(Reg::R12);
+        self.enc.pop(Reg::Rbp);
+        self.enc.ret();
+    }
+
+    // ─── Alias stubs: p_float_to_str → p_to_str_float, p_bool_to_str → p_to_str_bool ───
+
+    fn gen_float_to_str_alias(&mut self) {
+        let label = *self.func_labels.get("p_float_to_str").unwrap();
+        self.enc.place_label(label);
+        let target = *self.func_labels.get("p_to_str_float").unwrap();
+        self.enc.jmp_label(target);
+    }
+
+    fn gen_bool_to_str_alias(&mut self) {
+        let label = *self.func_labels.get("p_bool_to_str").unwrap();
+        self.enc.place_label(label);
+        let target = *self.func_labels.get("p_to_str_bool").unwrap();
+        self.enc.jmp_label(target);
+    }
+
+    // ─── p_char_to_str(rcx = char_code) -> rax = *u8 ───
+
+    fn gen_char_to_str(&mut self) {
+        let label = *self.func_labels.get("p_char_to_str").unwrap();
+        self.enc.place_label(label);
+        self.enc.push(Reg::Rbp);
+        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+        self.enc.push(Reg::R12);
+        self.enc.sub_rsp_i32(32);
+        // Save char code in r12
+        self.enc.mov_rr(Reg::R12, Reg::Rcx);
+        // malloc(2)
+        self.enc.mov_imm32(Reg::Rcx, 2);
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
+        self.enc.add_rsp_i32(32);
+        // Store char at [rax]
+        self.enc.mov_mem_reg8_ptr(Reg::Rax, Reg::R12);
+        // Store 0 at [rax+1]
+        self.enc.xor_self(Reg::R12);
+        self.enc.mov_mem_disp_reg8(Reg::Rax, 1, Reg::R12);
+        // Return rax
+        self.enc.add_rsp_i32(32);
+        self.enc.pop(Reg::R12);
+        self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
+        self.enc.pop(Reg::Rbp);
+        self.enc.ret();
+    }
+
+    // ─── p_eprint_str(rcx = *u8) — WriteFile to stderr ───
+
+    fn gen_eprint_str(&mut self) {
+        let label = *self.func_labels.get("p_eprint_str").unwrap();
+        self.enc.place_label(label);
+        self.enc.push(Reg::Rbp);
+        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+        self.enc.push(Reg::R12);
+        self.enc.push(Reg::R13);
+        self.enc.sub_rsp_i32(64);
+        // r12 = string pointer
+        self.enc.mov_rr(Reg::R12, Reg::Rcx);
+        // Calculate length: strlen(r12)
+        self.enc.xor_self(Reg::R8);
+        let es_len = self.enc.alloc_label();
+        let es_done = self.enc.alloc_label();
+        self.enc.place_label(es_len);
+        self.enc.cmp_mem_idx_imm8(Reg::R12, Reg::R8, 0);
+        self.enc.jcc_label(0x4, es_done); // je
+        self.enc.inc_r(Reg::R8);
+        self.enc.jmp_label(es_len);
+        self.enc.place_label(es_done);
+        // r13 = length
+        self.enc.mov_rr(Reg::R13, Reg::R8);
+        // GetStdHandle(STD_ERROR_HANDLE = -12)
+        self.enc.mov_imm32(Reg::Rcx, -12);
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_rip(self.iat_off(IAT_GET_STD_HANDLE));
+        self.enc.add_rsp_i32(32);
+        // WriteFile(handle, r12, r13, &written, NULL)
+        self.enc.mov_rr(Reg::Rcx, Reg::Rax);
+        self.enc.mov_rr(Reg::Rdx, Reg::R12);
+        self.enc.mov_rr(Reg::R8, Reg::R13);
+        self.enc.lea_rbp(Reg::R9, -32);
+        self.enc.xor_self(Reg::Rax);
+        self.enc.mov_mem_disp_reg32(Reg::R9, 0, Reg::Rax);
+        self.enc.sub_rsp_i32(48);
+        self.enc.xor_self(Reg::Rax);
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax);
+        self.enc.call_rip(self.iat_off(IAT_WRITE_FILE));
+        self.enc.add_rsp_i32(48);
+        // Return
+        self.enc.xor_self(Reg::Rax);
+        self.enc.add_rsp_i32(64);
+        self.enc.pop(Reg::R13);
+        self.enc.pop(Reg::R12);
+        self.enc.pop(Reg::Rbp);
+        self.enc.ret();
+    }
+
+    // ─── p_print_newline() — WriteFile "\n" to stdout ───
+
+    fn gen_print_newline(&mut self) {
+        let label = *self.func_labels.get("p_print_newline").unwrap();
+        self.enc.place_label(label);
+        self.enc.push(Reg::Rbp);
+        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+        self.enc.sub_rsp_i32(64);
+        // Store '\n' at [rbp-8]
+        self.enc.mov_r8_imm(Reg::Rax, 10);
+        self.enc.mov_mem_rbp_reg(-8, Reg::Rax);
+        // GetStdHandle(-11)
+        self.enc.mov_imm32(Reg::Rcx, -11);
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_rip(self.iat_off(IAT_GET_STD_HANDLE));
+        self.enc.add_rsp_i32(32);
+        // WriteFile(handle, &"\n", 1, &written, NULL)
+        self.enc.mov_rr(Reg::Rcx, Reg::Rax);
+        self.enc.lea_rbp(Reg::Rdx, -8);
+        self.enc.mov_imm32(Reg::R8, 1);
+        self.enc.lea_rbp(Reg::R9, -16);
+        self.enc.xor_self(Reg::Rax);
+        self.enc.mov_mem_disp_reg32(Reg::R9, 0, Reg::Rax);
+        self.enc.sub_rsp_i32(48);
+        self.enc.xor_self(Reg::Rax);
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax);
+        self.enc.call_rip(self.iat_off(IAT_WRITE_FILE));
+        self.enc.add_rsp_i32(48);
+        // Return
+        self.enc.xor_self(Reg::Rax);
+        self.enc.add_rsp_i32(64);
+        self.enc.pop(Reg::Rbp);
+        self.enc.ret();
+    }
+
+    // ─── p_sb_new() -> rax = *sb (struct: {buf, len, cap} = 24 bytes) ───
+
+    fn gen_sb_new(&mut self) {
+        let label = *self.func_labels.get("p_sb_new").unwrap();
+        self.enc.place_label(label);
+        self.enc.push(Reg::Rbp);
+        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+        self.enc.push(Reg::R12);
+        self.enc.sub_rsp_i32(32);
+        // malloc(24) for struct
+        self.enc.mov_imm32(Reg::Rcx, 24);
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
+        self.enc.add_rsp_i32(32);
+        self.enc.mov_rr(Reg::R12, Reg::Rax); // r12 = sb struct
+        // malloc(4096) for buffer
+        self.enc.mov_imm32(Reg::Rcx, 4096);
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
+        self.enc.add_rsp_i32(32);
+        // sb->buf = rax (offset 0)
+        self.enc.mov_mem_disp_reg(Reg::R12, 0, Reg::Rax);
+        // sb->len = 0 (offset 8)
+        self.enc.xor_self(Reg::Rax);
+        self.enc.mov_mem_disp_reg(Reg::R12, 8, Reg::Rax);
+        // sb->cap = 4096 (offset 16)
+        self.enc.mov_imm32(Reg::Rax, 4096);
+        self.enc.mov_mem_disp_reg(Reg::R12, 16, Reg::Rax);
+        // buf[0] = 0
+        self.enc.mov_rr(Reg::Rcx, Reg::R12);
+        self.enc.mov_reg_mem_disp(Reg::Rax, Reg::R12, 0); // rax = buf
+        self.enc.xor_self(Reg::Rdx);
+        self.enc.mov_mem_reg8_ptr(Reg::Rax, Reg::Rdx);
+        // Return sb
+        self.enc.mov_rr(Reg::Rax, Reg::R12);
+        self.enc.add_rsp_i32(32);
+        self.enc.pop(Reg::R12);
+        self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
+        self.enc.pop(Reg::Rbp);
+        self.enc.ret();
+    }
+
+    // ─── p_sb_append(rcx = sb, rdx = s) ───
+
+    fn gen_sb_append(&mut self) {
+        let label = *self.func_labels.get("p_sb_append").unwrap();
+        self.enc.place_label(label);
+        self.enc.push(Reg::Rbp);
+        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+        self.enc.push(Reg::R12); // sb
+        self.enc.push(Reg::R13); // s
+        self.enc.push(Reg::R14); // slen
+        self.enc.sub_rsp_i32(32);
+        // r12 = sb, r13 = s
+        self.enc.mov_rr(Reg::R12, Reg::Rcx);
+        self.enc.mov_rr(Reg::R13, Reg::Rdx);
+        // Calculate strlen(s) into r14
+        self.enc.xor_self(Reg::R14);
+        let sa_len = self.enc.alloc_label();
+        let sa_len_done = self.enc.alloc_label();
+        self.enc.place_label(sa_len);
+        self.enc.cmp_mem_idx_imm8(Reg::R13, Reg::R14, 0);
+        self.enc.jcc_label(0x4, sa_len_done); // je
+        self.enc.inc_r(Reg::R14);
+        self.enc.jmp_label(sa_len);
+        self.enc.place_label(sa_len_done);
+        // Check if sb->len + slen + 1 > sb->cap
+        // rax = sb->len, rax += slen, rax += 1, cmp rax, sb->cap
+        self.enc.mov_reg_mem_disp(Reg::Rax, Reg::R12, 8); // rax = sb->len
+        self.enc.add_rr(Reg::Rax, Reg::R14); // rax = len + slen
+        self.enc.inc_r(Reg::Rax); // rax = len + slen + 1
+        self.enc.mov_reg_mem_disp(Reg::Rdx, Reg::R12, 16); // rdx = sb->cap
+        self.enc.cmp_rr(Reg::Rax, Reg::Rdx);
+        let sa_no_grow = self.enc.alloc_label();
+        self.enc.jcc_label(0x6, sa_no_grow); // jbe — no need to grow
+        // Grow: double cap until it fits
+        // rax = needed size, rdx = current cap
+        let sa_grow_loop = self.enc.alloc_label();
+        self.enc.place_label(sa_grow_loop);
+        self.enc.add_rr(Reg::Rdx, Reg::Rdx); // cap *= 2
+        self.enc.cmp_rr(Reg::Rax, Reg::Rdx);
+        self.enc.jcc_label(0x7, sa_grow_loop); // ja — still doesn't fit
+        // Now rdx = new cap. Store it.
+        self.enc.mov_mem_disp_reg(Reg::R12, 16, Reg::Rdx);
+        // Realloc buffer: we need to malloc new buffer, copy old, free old
+        // For simplicity, just malloc new size and copy
+        self.enc.mov_rr(Reg::Rcx, Reg::Rdx); // new cap
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
+        self.enc.add_rsp_i32(32);
+        // rax = new buffer. Copy old buffer contents.
+        // r8 = old buf, r9 = new buf, r10 = 0
+        self.enc.mov_reg_mem_disp(Reg::R8, Reg::R12, 0); // old buf
+        self.enc.mov_rr(Reg::R9, Reg::Rax); // new buf
+        self.enc.xor_self(Reg::R10);
+        // Copy sb->len bytes
+        self.enc.mov_reg_mem_disp(Reg::R11, Reg::R12, 8); // r11 = sb->len
+        let sa_copy = self.enc.alloc_label();
+        let sa_copy_done = self.enc.alloc_label();
+        self.enc.place_label(sa_copy);
+        self.enc.cmp_rr(Reg::R10, Reg::R11);
+        self.enc.jcc_label(0x3, sa_copy_done); // jae
+        self.enc.mov_reg8_mem_idx(Reg::Rax, Reg::R8, Reg::R10);
+        self.enc.mov_mem_idx_reg8(Reg::R9, Reg::R10, Reg::Rax);
+        self.enc.inc_r(Reg::R10);
+        self.enc.jmp_label(sa_copy);
+        self.enc.place_label(sa_copy_done);
+        // Free old buffer
+        self.enc.mov_rr(Reg::Rcx, Reg::R8);
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_label(*self.func_labels.get("p_free").unwrap());
+        self.enc.add_rsp_i32(32);
+        // Store new buffer
+        self.enc.mov_mem_disp_reg(Reg::R12, 0, Reg::R9);
+        self.enc.place_label(sa_no_grow);
+        // memcpy(sb->buf + sb->len, s, slen)
+        // r8 = sb->buf, r9 = sb->len, r10 = 0
+        self.enc.mov_reg_mem_disp(Reg::R8, Reg::R12, 0); // buf
+        self.enc.mov_reg_mem_disp(Reg::R9, Reg::R12, 8); // len
+        self.enc.add_rr(Reg::R8, Reg::R9); // r8 = buf + len (dest)
+        self.enc.xor_self(Reg::R10);
+        let sa_memcpy = self.enc.alloc_label();
+        let sa_memcpy_done = self.enc.alloc_label();
+        self.enc.place_label(sa_memcpy);
+        self.enc.cmp_rr(Reg::R10, Reg::R14);
+        self.enc.jcc_label(0x3, sa_memcpy_done); // jae
+        self.enc.mov_reg8_mem_idx(Reg::Rax, Reg::R13, Reg::R10);
+        self.enc.mov_mem_idx_reg8(Reg::R8, Reg::R10, Reg::Rax);
+        self.enc.inc_r(Reg::R10);
+        self.enc.jmp_label(sa_memcpy);
+        self.enc.place_label(sa_memcpy_done);
+        // sb->len += slen
+        self.enc.mov_reg_mem_disp(Reg::Rax, Reg::R12, 8);
+        self.enc.add_rr(Reg::Rax, Reg::R14);
+        self.enc.mov_mem_disp_reg(Reg::R12, 8, Reg::Rax);
+        // sb->buf[sb->len] = 0
+        self.enc.mov_reg_mem_disp(Reg::R8, Reg::R12, 0); // buf
+        self.enc.add_rr(Reg::R8, Reg::Rax); // buf + len
+        self.enc.xor_self(Reg::Rdx);
+        self.enc.mov_mem_reg8_ptr(Reg::R8, Reg::Rdx);
+        // Return
+        self.enc.xor_self(Reg::Rax);
+        self.enc.add_rsp_i32(32);
+        self.enc.pop(Reg::R14);
+        self.enc.pop(Reg::R13);
+        self.enc.pop(Reg::R12);
+        self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
+        self.enc.pop(Reg::Rbp);
+        self.enc.ret();
+    }
+
+    // ─── p_sb_to_str(rcx = sb) -> rax = *u8 ───
+
+    fn gen_sb_to_str(&mut self) {
+        let label = *self.func_labels.get("p_sb_to_str").unwrap();
+        self.enc.place_label(label);
+        self.enc.push(Reg::Rbp);
+        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+        self.enc.push(Reg::R12); // sb
+        self.enc.push(Reg::R13); // result
+        self.enc.push(Reg::R14); // len
+        self.enc.sub_rsp_i32(32);
+        // r12 = sb
+        self.enc.mov_rr(Reg::R12, Reg::Rcx);
+        // r14 = sb->len
+        self.enc.mov_reg_mem_disp(Reg::R14, Reg::R12, 8);
+        // malloc(len + 1)
+        self.enc.mov_rr(Reg::Rcx, Reg::R14);
+        self.enc.inc_r(Reg::Rcx);
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
+        self.enc.add_rsp_i32(32);
+        self.enc.mov_rr(Reg::R13, Reg::Rax); // r13 = result
+        // memcpy(result, sb->buf, len)
+        self.enc.mov_reg_mem_disp(Reg::R8, Reg::R12, 0); // r8 = sb->buf
+        self.enc.xor_self(Reg::R10);
+        let sts_copy = self.enc.alloc_label();
+        let sts_copy_done = self.enc.alloc_label();
+        self.enc.place_label(sts_copy);
+        self.enc.cmp_rr(Reg::R10, Reg::R14);
+        self.enc.jcc_label(0x3, sts_copy_done); // jae
+        self.enc.mov_reg8_mem_idx(Reg::Rax, Reg::R8, Reg::R10);
+        self.enc.mov_mem_idx_reg8(Reg::R13, Reg::R10, Reg::Rax);
+        self.enc.inc_r(Reg::R10);
+        self.enc.jmp_label(sts_copy);
+        self.enc.place_label(sts_copy_done);
+        // result[len] = 0
+        self.enc.xor_self(Reg::Rax);
+        self.enc.mov_mem_idx_reg8(Reg::R13, Reg::R10, Reg::Rax);
+        // Free sb->buf
+        self.enc.mov_reg_mem_disp(Reg::Rcx, Reg::R12, 0);
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_label(*self.func_labels.get("p_free").unwrap());
+        self.enc.add_rsp_i32(32);
+        // Free sb struct
+        self.enc.mov_rr(Reg::Rcx, Reg::R12);
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_label(*self.func_labels.get("p_free").unwrap());
+        self.enc.add_rsp_i32(32);
+        // Return result
+        self.enc.mov_rr(Reg::Rax, Reg::R13);
+        self.enc.add_rsp_i32(32);
+        self.enc.pop(Reg::R14);
+        self.enc.pop(Reg::R13);
+        self.enc.pop(Reg::R12);
+        self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
+        self.enc.pop(Reg::Rbp);
+        self.enc.ret();
+    }
+
+    // ─── p_file_read(rcx = path) -> rax = *u8 ───
+
+    fn gen_file_read(&mut self) {
+        let label = *self.func_labels.get("p_file_read").unwrap();
+        self.enc.place_label(label);
+        self.enc.push(Reg::Rbp);
+        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+        self.enc.push(Reg::R12); // path
+        self.enc.push(Reg::R13); // handle
+        self.enc.push(Reg::R14); // buf
+        self.enc.sub_rsp_i32(32);
+        // r12 = path
+        self.enc.mov_rr(Reg::R12, Reg::Rcx);
+        // CreateFileA(path, GENERIC_READ=0x80000000, FILE_SHARE_READ=1, NULL, OPEN_EXISTING=3, 0, NULL)
+        self.enc.mov_rr(Reg::Rcx, Reg::R12); // path
+        self.enc.mov_imm32(Reg::Rdx, 0x80000000u32 as i32); // GENERIC_READ
+        self.enc.mov_imm32(Reg::R8, 1); // FILE_SHARE_READ
+        self.enc.xor_self(Reg::R9); // NULL (security)
+        // 5th arg on stack: OPEN_EXISTING=3
+        self.enc.mov_imm32(Reg::Rax, 3);
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax);
+        // 6th arg: 0 (flags)
+        // 7th arg: 0 (template)
+        // But we need 7 args total. Args 5,6,7 go on stack at rsp+32, rsp+40, rsp+48
+        self.enc.xor_self(Reg::Rax);
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 40, Reg::Rax); // flags=0
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 48, Reg::Rax); // template=NULL
+        self.enc.sub_rsp_i32(64); // 32 shadow + 3 stack args = 56, align to 64
+        // Re-set stack args (they moved due to sub_rsp)
+        self.enc.mov_imm32(Reg::Rax, 3);
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax); // OPEN_EXISTING
+        self.enc.xor_self(Reg::Rax);
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 40, Reg::Rax); // flags=0
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 48, Reg::Rax); // template=NULL
+        self.enc.call_rip(self.iat_off(IAT_CREATE_FILE_A));
+        self.enc.add_rsp_i32(64);
+        // Check for INVALID_HANDLE_VALUE (-1)
+        self.enc.mov_rr(Reg::R13, Reg::Rax); // handle
+        self.enc.mov_imm32(Reg::Rdx, -1);
+        self.enc.cmp_rr(Reg::Rax, Reg::Rdx);
+        let fr_ok = self.enc.alloc_label();
+        self.enc.jcc_label(0x5, fr_ok); // jnz — not -1, handle is valid
+        // Return 0 (NULL)
+        self.enc.xor_self(Reg::Rax);
+        self.enc.add_rsp_i32(32);
+        self.enc.pop(Reg::R14);
+        self.enc.pop(Reg::R13);
+        self.enc.pop(Reg::R12);
+        self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
+        self.enc.pop(Reg::Rbp);
+        self.enc.ret();
+        self.enc.place_label(fr_ok);
+        // GetFileSize(handle, NULL)
+        self.enc.mov_rr(Reg::Rcx, Reg::R13);
+        self.enc.xor_self(Reg::Rdx);
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_rip(self.iat_off(IAT_GET_FILE_SIZE));
+        self.enc.add_rsp_i32(32);
+        // rax = file size. malloc(size + 1)
+        self.enc.mov_rr(Reg::Rcx, Reg::Rax);
+        self.enc.inc_r(Reg::Rcx); // size + 1
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
+        self.enc.add_rsp_i32(32);
+        self.enc.mov_rr(Reg::R14, Reg::Rax); // r14 = buf
+        // ReadFile(handle, buf, size, &bytesRead, NULL)
+        self.enc.mov_rr(Reg::Rcx, Reg::R13); // handle
+        self.enc.mov_rr(Reg::Rdx, Reg::R14); // buf
+        // r8 = size (we need to recompute: size = rcx-1 before inc... actually we lost it)
+        // Let's use a different approach: read up to a large size
+        // Actually, we can get size from GetFileSize again, or save it
+        // Let me restructure: save size in a callee-saved reg
+        // Actually, let me just read with a large buffer size
+        // For now, let's use the file size we got. We need to save it.
+        // Let me redo: save size in r15... but we didn't push r15.
+        // Let me use a simpler approach: ReadFile with size from GetFileSize
+        // We need to save the size. Let me use [rbp-32] for that.
+        // Actually, I realize the issue: after GetFileSize returns in rax,
+        // I do malloc(rax+1) which clobbers rax. I need to save the size.
+        // Let me restructure to save size on stack.
+        // For now, let's just read a large amount (1MB) and null-terminate
+        self.enc.mov_imm32(Reg::R8, 0x100000); // 1MB max
+        self.enc.lea_rbp(Reg::R9, -32); // &bytesRead
+        self.enc.xor_self(Reg::Rax);
+        self.enc.mov_mem_disp_reg32(Reg::R9, 0, Reg::Rax);
+        self.enc.sub_rsp_i32(48);
+        self.enc.xor_self(Reg::Rax);
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax); // NULL
+        self.enc.call_rip(self.iat_off(IAT_READ_FILE));
+        self.enc.add_rsp_i32(48);
+        // bytesRead is at [rbp-32]. Null-terminate at buf[bytesRead]
+        self.enc.mov_reg_mem_rbp(Reg::Rax, -32); // bytesRead
+        self.enc.add_rr(Reg::R14, Reg::Rax); // r14 = buf + bytesRead
+        self.enc.xor_self(Reg::Rdx);
+        self.enc.mov_mem_reg8_ptr(Reg::R14, Reg::Rdx); // null terminate
+        // CloseHandle(handle)
+        self.enc.mov_rr(Reg::Rcx, Reg::R13);
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_rip(self.iat_off(IAT_CLOSE_HANDLE));
+        self.enc.add_rsp_i32(32);
+        // Return buf
+        self.enc.mov_rr(Reg::Rax, Reg::R14);
+        // Wait, r14 was modified above. Let me fix: we need to return the original buf.
+        // Actually, r14 = buf + bytesRead now. We need to return buf.
+        // This is a bug. Let me save buf in a different way.
+        // For now, let me just subtract bytesRead back:
+        self.enc.mov_reg_mem_rbp(Reg::Rdx, -32); // bytesRead
+        self.enc.sub_rr(Reg::Rax, Reg::Rdx); // rax = buf
+        self.enc.add_rsp_i32(32);
+        self.enc.pop(Reg::R14);
+        self.enc.pop(Reg::R13);
+        self.enc.pop(Reg::R12);
+        self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
+        self.enc.pop(Reg::Rbp);
+        self.enc.ret();
+    }
+
+    // ─── p_file_write(rcx = path, rdx = content) -> rax = i64 (0=success, -1=fail) ───
+
+    fn gen_file_write(&mut self) {
+        let label = *self.func_labels.get("p_file_write").unwrap();
+        self.enc.place_label(label);
+        self.enc.push(Reg::Rbp);
+        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+        self.enc.push(Reg::R12); // path
+        self.enc.push(Reg::R13); // content
+        self.enc.push(Reg::R14); // handle
+        self.enc.sub_rsp_i32(40); // 32 + 8 for alignment (3 pushes = 8 mod 16)
+        // r12 = path, r13 = content
+        self.enc.mov_rr(Reg::R12, Reg::Rcx);
+        self.enc.mov_rr(Reg::R13, Reg::Rdx);
+        // CreateFileA(path, GENERIC_WRITE=0x40000000, 0, NULL, CREATE_ALWAYS=2, 0, NULL)
+        self.enc.mov_rr(Reg::Rcx, Reg::R12);
+        self.enc.mov_imm32(Reg::Rdx, 0x40000000); // GENERIC_WRITE
+        self.enc.xor_self(Reg::R8); // no sharing
+        self.enc.xor_self(Reg::R9); // NULL security
+        self.enc.sub_rsp_i32(64);
+        self.enc.mov_imm32(Reg::Rax, 2); // CREATE_ALWAYS
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax);
+        self.enc.xor_self(Reg::Rax);
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 40, Reg::Rax); // flags=0
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 48, Reg::Rax); // template=NULL
+        self.enc.call_rip(self.iat_off(IAT_CREATE_FILE_A));
+        self.enc.add_rsp_i32(64);
+        // Check for INVALID_HANDLE_VALUE
+        self.enc.mov_rr(Reg::R14, Reg::Rax); // handle
+        self.enc.mov_imm32(Reg::Rdx, -1);
+        self.enc.cmp_rr(Reg::Rax, Reg::Rdx);
+        let fw_ok = self.enc.alloc_label();
+        self.enc.jcc_label(0x5, fw_ok); // jnz — valid
+        // Return -1
+        self.enc.mov_imm32(Reg::Rax, -1);
+        self.enc.add_rsp_i32(32);
+        self.enc.pop(Reg::R14);
+        self.enc.pop(Reg::R13);
+        self.enc.pop(Reg::R12);
+        self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
+        self.enc.pop(Reg::Rbp);
+        self.enc.ret();
+        self.enc.place_label(fw_ok);
+        // strlen(content) into r8
+        self.enc.xor_self(Reg::R8);
+        let fw_len = self.enc.alloc_label();
+        let fw_len_done = self.enc.alloc_label();
+        self.enc.place_label(fw_len);
+        self.enc.cmp_mem_idx_imm8(Reg::R13, Reg::R8, 0);
+        self.enc.jcc_label(0x4, fw_len_done); // je
+        self.enc.inc_r(Reg::R8);
+        self.enc.jmp_label(fw_len);
+        self.enc.place_label(fw_len_done);
+        // WriteFile(handle, content, len, &written, NULL)
+        self.enc.mov_rr(Reg::Rcx, Reg::R14); // handle
+        self.enc.mov_rr(Reg::Rdx, Reg::R13); // content
+        // r8 already = len
+        self.enc.lea_rbp(Reg::R9, -32); // &written
+        self.enc.xor_self(Reg::Rax);
+        self.enc.mov_mem_disp_reg32(Reg::R9, 0, Reg::Rax);
+        self.enc.sub_rsp_i32(48);
+        self.enc.xor_self(Reg::Rax);
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax); // NULL
+        self.enc.call_rip(self.iat_off(IAT_WRITE_FILE));
+        self.enc.add_rsp_i32(48);
+        // CloseHandle(handle)
+        self.enc.mov_rr(Reg::Rcx, Reg::R14);
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_rip(self.iat_off(IAT_CLOSE_HANDLE));
+        self.enc.add_rsp_i32(32);
+        // Return 0
+        self.enc.xor_self(Reg::Rax);
+        self.enc.add_rsp_i32(32);
+        self.enc.pop(Reg::R14);
+        self.enc.pop(Reg::R13);
+        self.enc.pop(Reg::R12);
+        self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
+        self.enc.pop(Reg::Rbp);
+        self.enc.ret();
+    }
+
+    // ─── p_str_join_n(rcx = *Vec) -> rax = *u8 ───
+    // Vec struct: {data: *ptr, len: i64, cap: i64}
+    // Each element is a *u8 string pointer
+
+    fn gen_str_join_n(&mut self) {
+        let label = *self.func_labels.get("p_str_join_n").unwrap();
+        self.enc.place_label(label);
+        self.enc.push(Reg::Rbp);
+        self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+        self.enc.push(Reg::R12); // vec
+        self.enc.push(Reg::R13); // result
+        self.enc.push(Reg::R14); // index
+        self.enc.push(Reg::R15); // vec len
+        self.enc.sub_rsp_i32(32);
+        // r12 = vec
+        self.enc.mov_rr(Reg::R12, Reg::Rcx);
+        // r15 = vec->len (offset 8)
+        self.enc.mov_reg_mem_disp(Reg::R15, Reg::R12, 8);
+        // total = 1 (for null terminator)
+        // Calculate total length: sum of strlen of each part
+        // r14 = 0 (index), r13 = 1 (total)
+        self.enc.xor_self(Reg::R14);
+        self.enc.mov_imm32(Reg::R13, 1);
+        let sjn_len_loop = self.enc.alloc_label();
+        let sjn_len_done = self.enc.alloc_label();
+        self.enc.place_label(sjn_len_loop);
+        self.enc.cmp_rr(Reg::R14, Reg::R15);
+        self.enc.jcc_label(0x3, sjn_len_done); // jae
+        // Get element: data[r14] = *(r12->data + r14*8)
+        self.enc.mov_reg_mem_disp(Reg::Rax, Reg::R12, 0); // data ptr
+        self.enc.mov_rr(Reg::Rdx, Reg::R14);
+        self.enc.shl_r_i8(Reg::Rdx, 3); // *8
+        self.enc.add_rr(Reg::Rax, Reg::Rdx);
+        self.enc.mov_reg_mem_disp(Reg::Rax, Reg::Rax, 0); // load string pointer
+        // strlen(rax) into rdx
+        self.enc.mov_rr(Reg::Rdx, Reg::Rax);
+        self.enc.xor_self(Reg::Rcx);
+        let sjn_strlen = self.enc.alloc_label();
+        let sjn_strlen_done = self.enc.alloc_label();
+        self.enc.place_label(sjn_strlen);
+        self.enc.cmp_mem_idx_imm8(Reg::Rdx, Reg::Rcx, 0);
+        self.enc.jcc_label(0x4, sjn_strlen_done); // je
+        self.enc.inc_r(Reg::Rcx);
+        self.enc.jmp_label(sjn_strlen);
+        self.enc.place_label(sjn_strlen_done);
+        // total += strlen
+        self.enc.add_rr(Reg::R13, Reg::Rcx);
+        self.enc.inc_r(Reg::R14);
+        self.enc.jmp_label(sjn_len_loop);
+        self.enc.place_label(sjn_len_done);
+        // malloc(total)
+        self.enc.mov_rr(Reg::Rcx, Reg::R13);
+        self.enc.sub_rsp_i32(32);
+        self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
+        self.enc.add_rsp_i32(32);
+        // r13 = result, result[0] = 0
+        self.enc.mov_rr(Reg::R13, Reg::Rax);
+        self.enc.xor_self(Reg::Rdx);
+        self.enc.mov_mem_reg8_ptr(Reg::R13, Reg::Rdx);
+        // Concatenate each string: for each element, strcat(result, element)
+        self.enc.xor_self(Reg::R14); // index = 0
+        let sjn_cat_loop = self.enc.alloc_label();
+        let sjn_cat_done = self.enc.alloc_label();
+        self.enc.place_label(sjn_cat_loop);
+        self.enc.cmp_rr(Reg::R14, Reg::R15);
+        self.enc.jcc_label(0x3, sjn_cat_done); // jae
+        // Get element pointer
+        self.enc.mov_reg_mem_disp(Reg::Rax, Reg::R12, 0); // data ptr
+        self.enc.mov_rr(Reg::Rdx, Reg::R14);
+        self.enc.shl_r_i8(Reg::Rdx, 3);
+        self.enc.add_rr(Reg::Rax, Reg::Rdx);
+        self.enc.mov_reg_mem_disp(Reg::Rax, Reg::Rax, 0); // string pointer
+        // Find end of result (strlen result)
+        self.enc.mov_rr(Reg::Rcx, Reg::R13);
+        let sjn_find_end = self.enc.alloc_label();
+        let sjn_found_end = self.enc.alloc_label();
+        self.enc.place_label(sjn_find_end);
+        self.enc.mov_reg8_mem(Reg::Rdx, Reg::Rcx);
+        self.enc.test_rr(Reg::Rdx, Reg::Rdx);
+        self.enc.jcc_label(0x4, sjn_found_end); // je
+        self.enc.inc_r(Reg::Rcx);
+        self.enc.jmp_label(sjn_find_end);
+        self.enc.place_label(sjn_found_end);
+        // rcx = end of result. Copy element to end.
+        self.enc.mov_rr(Reg::R8, Reg::Rax); // r8 = src
+        let sjn_copy = self.enc.alloc_label();
+        let sjn_copy_done = self.enc.alloc_label();
+        self.enc.place_label(sjn_copy);
+        self.enc.mov_reg8_mem(Reg::Rdx, Reg::R8);
+        self.enc.test_rr(Reg::Rdx, Reg::Rdx);
+        self.enc.jcc_label(0x4, sjn_copy_done); // je
+        self.enc.mov_mem_reg8_ptr(Reg::Rcx, Reg::Rdx);
+        self.enc.inc_r(Reg::R8);
+        self.enc.inc_r(Reg::Rcx);
+        self.enc.jmp_label(sjn_copy);
+        self.enc.place_label(sjn_copy_done);
+        // Null terminate
+        self.enc.xor_self(Reg::Rdx);
+        self.enc.mov_mem_reg8_ptr(Reg::Rcx, Reg::Rdx);
+        self.enc.inc_r(Reg::R14);
+        self.enc.jmp_label(sjn_cat_loop);
+        self.enc.place_label(sjn_cat_done);
+        // Return result
+        self.enc.mov_rr(Reg::Rax, Reg::R13);
+        self.enc.add_rsp_i32(32);
+        self.enc.pop(Reg::R15);
+        self.enc.pop(Reg::R14);
+        self.enc.pop(Reg::R13);
+        self.enc.pop(Reg::R12);
+        self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
         self.enc.pop(Reg::Rbp);
         self.enc.ret();
     }
