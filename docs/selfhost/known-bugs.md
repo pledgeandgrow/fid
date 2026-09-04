@@ -425,7 +425,7 @@ Ported to Fides lowerer as Gap 5.
 
 ### 2.7 ~~Windows `\r\n` doubling in C output~~ RESOLVED (session 2)
 
-### 2.8 fides-c2.exe crashes on stdlib (CURRENT — session 6, root cause confirmed session 8)
+### 2.8 fides-c2.exe crashes on stdlib (PARTIALLY RESOLVED — session 12)
 
 **Symptom:** `fides-c2_test.exe` (the second-generation compiler, built by
 `fides-c.exe`) crashes with `STATUS_ACCESS_VIOLATION` (exit code -1073741819)
@@ -438,13 +438,37 @@ from the generated C code. The resulting `fides-c2_test.exe` has missing
 instructions baked into its binary, causing it to crash on complex inputs
 like `stdlib/core.fd` (16K LOC).
 
-**Status:** The workaround (splitting long functions into smaller helpers)
-was applied to `pe.fd` in session 5, but the bug affects ALL long functions
-in the compiler source. The real fix is to find and fix the statement-dropping
-bug in the Fides compiler itself (in `lower.rs` or `codegen_c.rs`).
+**Session 12 progress:**
+1. Split `keyword_or_ident_core` (51 if-statements, 933 C vars) into 5
+   smaller functions (`_a` through `_e`, ~195 vars each) — fixed lexer crash.
+2. Added scientific notation parsing to Rust lexer (`1.7976931348623157e308`
+   in `codegen_c.fd`).
+3. Made private lexer helper functions `pub` (`lex_is_digit`, `lex_is_hexdigit`,
+   `parse_radix`, `repeat_char`, `lex_error`, `str_filter_underscores`,
+   `lex_is_alpha`, `lex_is_whitespace`, `lex_is_alphanumeric`) — fixed
+   visibility errors in self-hosted module system.
+4. Increased TCC stack reserve to 128MB (`-Wl,-stack,134217728`) — fixed
+   stack overflow in large functions (Parser_parse_stmt uses ~37KB/frame).
+5. Added `-lws2_32` for socket function linking.
 
-**Impact:** Blocks fixpoint verification. We need fides-c2 to compile the
-compiler to produce fides-c3, then compare C output.
+**Result:** fides-c.exe (first-generation self-hosted compiler) now successfully
+compiles `compiler/main.fd` and produces correct C code (exit 0, 36MB output).
+The C code compiles with TCC to produce fides-c2_new.exe.
+
+**Remaining issue:** fides-c2_new.exe (second-generation) crashes with
+`STATUS_ACCESS_VIOLATION` (0xC0000005) at address 0x0 (null pointer deref)
+in `TypeChecker_compute_func_effects`. The self-hosted compiler generates
+~300 fewer functions and ~55K fewer lines than the Rust compiler. The
+`TypeChecker_compute_func_effects` function has 352 body differences (extra
+`Vec_get`/`Vec_push`/`p_malloc` calls in self-hosted version). The extra
+code includes `Vec_get` calls that can return NULL, followed by dereferences
+without null checks.
+
+**Next steps:** Compare IR generation between Rust compiler (`src/lower.rs`,
+`src/typechecker.rs`) and self-hosted compiler (`compiler/lower.fd`,
+`compiler/typechecker.fd`) for `compute_func_effects` to find why the
+self-hosted compiler generates extra IR. The bug is likely in the lowerer
+or type checker, not in the C codegen.
 
 ### 2.9 ~~`.exe` extension missing in self-hosted compiler output~~ RESOLVED (session 8)
 
@@ -999,6 +1023,15 @@ functions (likely a buffer overflow or index tracking issue). If you see
 missing function calls or instructions in generated C code, check if the
 source function is too long. **Workaround:** split long functions into
 smaller helper functions (each <~30 statements).
+
+**Session 12 update:** The root cause of the bootstrap crash was NOT
+statement-dropping but rather **stack overflow**. The self-hosted compiler's
+large functions (e.g. `Parser_parse_stmt` with 4672 C local variables =
+~37KB per stack frame) overflow the default 1MB Windows stack during
+recursive descent parsing. Fix: compile with TCC flag
+`-Wl,-stack,134217728` (128MB stack reserve). The `keyword_or_ident_core`
+splitting was still necessary to reduce per-function variable count, but
+the stack size increase was the primary fix.
 
 ### 3.14 `p_file_write` truncates at null bytes
 

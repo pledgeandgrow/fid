@@ -347,6 +347,11 @@ pub enum OptType {
     None,
 }
 
+pub enum OptStmtList {
+    Some(StmtList),
+    None,
+}
+
 // ─── Vec lookup helpers ──────────────────────────────────────────────────
 
 pub fn str_vec_contains(v: Vec<str>, s: str) -> bool {
@@ -479,9 +484,9 @@ fn map_str_bool_set(m: &mut Vec<StringBool>, key: str, val: bool) {
     var i: i64 = 0;
     while i < m.len() {
         if m.get(i).key == key {
-            var entry: StringBool = m.get(i);
-            entry.val = val;
-            m.set(i, entry);
+            // First registration wins — don't overwrite.
+            // This ensures the first module to define a function
+            // determines its visibility.
             return;
         }
         i = i + 1;
@@ -506,9 +511,9 @@ fn map_str_str_set(m: &mut Vec<StringString>, key: str, val: str) {
     var i: i64 = 0;
     while i < m.len() {
         if m.get(i).key == key {
-            var entry: StringString = m.get(i);
-            entry.val = val;
-            m.set(i, entry);
+            // First registration wins — don't overwrite.
+            // This ensures the first module to define a function
+            // is considered its owner for visibility checks.
             return;
         }
         i = i + 1;
@@ -1326,15 +1331,16 @@ fn TypeChecker_get_func_effects(self: &TypeChecker, name: str) -> Vec<str> {
 
 pub fn TypeChecker_compute_func_effects(self: &mut TypeChecker, program: Program) {
     // First pass: collect direct effects (print calls, allocations, etc.)
-    // Store results in a temporary list, then insert into func_effects.
+    // Store only names (not bodies) to avoid boxing Vec<Stmt> into a Vec.
     var names: Vec<str> = Vec::new();
-    var bodies: Vec<StmtList> = Vec::new();
 
     var fi: i64 = 0;
     while fi < program.funcs.len() {
         var func: Func = program.funcs.get(fi);
         names.push(func.name);
-        bodies.push(func.body);
+        var effects: Vec<str> = Vec::new();
+        TypeChecker_scan_stmts_for_effects(self, func.body, &mut effects);
+        TypeChecker_set_func_effects(self, func.name, effects);
         fi = fi + 1;
     }
     var impi: i64 = 0;
@@ -1342,49 +1348,79 @@ pub fn TypeChecker_compute_func_effects(self: &mut TypeChecker, program: Program
         var imp: ImplDef = program.impls.get(impi);
         var mi: i64 = 0;
         while mi < imp.methods.len() {
-            names.push(imp.methods.get(mi).name);
-            bodies.push(imp.methods.get(mi).body);
+            var method: Func = imp.methods.get(mi);
+            names.push(method.name);
+            var effects: Vec<str> = Vec::new();
+            TypeChecker_scan_stmts_for_effects(self, method.body, &mut effects);
+            TypeChecker_set_func_effects(self, method.name, effects);
             mi = mi + 1;
         }
         impi = impi + 1;
     }
 
-    // Insert initial effects into func_effects
-    var ri: i64 = 0;
-    while ri < names.len() {
-        var effects: Vec<str> = Vec::new();
-        TypeChecker_scan_stmts_for_effects(self, bodies.get(ri), &mut effects);
-        TypeChecker_set_func_effects(self, names.get(ri), effects);
-        ri = ri + 1;
-    }
-
     // Fixpoint iteration: propagate transitive effects through call graph
     // (if A calls B and B has IO, then A has IO too)
+    // Look up bodies by name from program, matching the Rust compiler.
     var changed: bool = true;
     while changed {
         changed = false;
         var ri2: i64 = 0;
         while ri2 < names.len() {
-            var new_effects: Vec<str> = Vec::new();
-            TypeChecker_scan_stmts_for_effects(self, bodies.get(ri2), &mut new_effects);
-            // Check if new_effects has any effect not already in func_effects for this name
-            var existing: Vec<str> = TypeChecker_get_func_effects(self, names.get(ri2));
-            var has_new: bool = false;
-            var ni: i64 = 0;
-            while ni < new_effects.len() {
-                if !str_vec_contains(existing, new_effects.get(ni)) {
-                    has_new = true;
-                    ni = new_effects.len();
+            var fname: str = names.get(ri2);
+            // Find the body for this name
+            var body_opt: OptStmtList = TypeChecker_find_body(self, program, fname);
+            match body_opt {
+                OptStmtList::Some(body) => {
+                    var new_effects: Vec<str> = Vec::new();
+                    TypeChecker_scan_stmts_for_effects(self, body, &mut new_effects);
+                    // Check if new_effects has any effect not already in func_effects for this name
+                    var existing: Vec<str> = TypeChecker_get_func_effects(self, fname);
+                    var has_new: bool = false;
+                    var ni: i64 = 0;
+                    while ni < new_effects.len() {
+                        if !str_vec_contains(existing, new_effects.get(ni)) {
+                            has_new = true;
+                            ni = new_effects.len();
+                        }
+                        ni = ni + 1;
+                    }
+                    if has_new {
+                        TypeChecker_set_func_effects(self, fname, new_effects);
+                        changed = true;
+                    }
                 }
-                ni = ni + 1;
-            }
-            if has_new {
-                TypeChecker_set_func_effects(self, names.get(ri2), new_effects);
-                changed = true;
+                OptStmtList::None => {}
             }
             ri2 = ri2 + 1;
         }
     }
+}
+
+/// Find the StmtList body for a function by name, searching funcs then impls.
+/// Matches the Rust compiler's `program.funcs.iter().find()` + `program.impls` lookup.
+pub fn TypeChecker_find_body(self: &mut TypeChecker, program: Program, name: str) -> OptStmtList {
+    var fi: i64 = 0;
+    while fi < program.funcs.len() {
+        var func: Func = program.funcs.get(fi);
+        if str_equal(func.name, name) {
+            return OptStmtList::Some(func.body);
+        }
+        fi = fi + 1;
+    }
+    var impi: i64 = 0;
+    while impi < program.impls.len() {
+        var imp: ImplDef = program.impls.get(impi);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            var method: Func = imp.methods.get(mi);
+            if str_equal(method.name, name) {
+                return OptStmtList::Some(method.body);
+            }
+            mi = mi + 1;
+        }
+        impi = impi + 1;
+    }
+    return OptStmtList::None;
 }
 
 pub fn TypeChecker_verify_declared_effects(self: &mut TypeChecker, program: Program) {

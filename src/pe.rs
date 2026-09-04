@@ -892,25 +892,44 @@ impl X86Encoder {
         self.rex(false, src.is_extended(), index.is_extended(), base.is_extended());
         self.emit_u8(0x88);
         // Use SIB: mod=00, reg=src, rm=100 (SIB follows)
-        self.modrm(0b00, src.code(), 4);
-        // SIB: scale=0, index=index, base=base
-        self.emit_u8((0 << 6) | (index.code() << 3) | base.code());
+        // But if base is RBP/R13 (code 5), mod=00 means [disp32 + index], not [base + index].
+        // Use mod=01 with 0 displacement instead.
+        if base.code() == 5 {
+            self.modrm(0b01, src.code(), 4);
+            self.emit_u8((0 << 6) | (index.code() << 3) | base.code());
+            self.emit_u8(0); // disp8 = 0
+        } else {
+            self.modrm(0b00, src.code(), 4);
+            self.emit_u8((0 << 6) | (index.code() << 3) | base.code());
+        }
     }
 
     /// mov r8, [reg + reg] (byte load with index)
     fn mov_reg8_mem_idx(&mut self, dst: Reg, base: Reg, index: Reg) {
         self.rex(false, dst.is_extended(), index.is_extended(), base.is_extended());
         self.emit_u8(0x8A);
-        self.modrm(0b00, dst.code(), 4);
-        self.emit_u8((0 << 6) | (index.code() << 3) | base.code());
+        if base.code() == 5 {
+            self.modrm(0b01, dst.code(), 4);
+            self.emit_u8((0 << 6) | (index.code() << 3) | base.code());
+            self.emit_u8(0); // disp8 = 0
+        } else {
+            self.modrm(0b00, dst.code(), 4);
+            self.emit_u8((0 << 6) | (index.code() << 3) | base.code());
+        }
     }
 
     /// cmp byte [reg + reg], imm8
     fn cmp_mem_idx_imm8(&mut self, base: Reg, index: Reg, val: u8) {
         self.rex(false, false, index.is_extended(), base.is_extended());
         self.emit_u8(0x80);
-        self.modrm(0b00, 7, 4); // /7 = cmp, rm=100 (SIB)
-        self.emit_u8((0 << 6) | (index.code() << 3) | base.code());
+        if base.code() == 5 {
+            self.modrm(0b01, 7, 4); // /7 = cmp, rm=100 (SIB), mod=01 for RBP/R13
+            self.emit_u8((0 << 6) | (index.code() << 3) | base.code());
+            self.emit_u8(0); // disp8 = 0
+        } else {
+            self.modrm(0b00, 7, 4); // /7 = cmp, rm=100 (SIB)
+            self.emit_u8((0 << 6) | (index.code() << 3) | base.code());
+        }
         self.emit_u8(val);
     }
 
@@ -1061,16 +1080,28 @@ impl X86Encoder {
     fn mov_reg_mem_idx(&mut self, dst: Reg, base: Reg, index: Reg) {
         self.rex(true, dst.is_extended(), index.is_extended(), base.is_extended());
         self.emit_u8(0x8B);
-        self.modrm(0b00, dst.code(), 4); // SIB
-        self.emit_u8((0 << 6) | (index.code() << 3) | base.code());
+        if base.code() == 5 {
+            self.modrm(0b01, dst.code(), 4); // SIB with disp8=0 for RBP/R13
+            self.emit_u8((0 << 6) | (index.code() << 3) | base.code());
+            self.emit_u8(0);
+        } else {
+            self.modrm(0b00, dst.code(), 4); // SIB
+            self.emit_u8((0 << 6) | (index.code() << 3) | base.code());
+        }
     }
 
     /// mov [reg + reg*1], r64 (store with index, 64-bit)
     fn mov_mem_idx_reg(&mut self, base: Reg, index: Reg, src: Reg) {
         self.rex(true, src.is_extended(), index.is_extended(), base.is_extended());
         self.emit_u8(0x89);
-        self.modrm(0b00, src.code(), 4); // SIB
-        self.emit_u8((0 << 6) | (index.code() << 3) | base.code());
+        if base.code() == 5 {
+            self.modrm(0b01, src.code(), 4); // SIB with disp8=0 for RBP/R13
+            self.emit_u8((0 << 6) | (index.code() << 3) | base.code());
+            self.emit_u8(0);
+        } else {
+            self.modrm(0b00, src.code(), 4); // SIB
+            self.emit_u8((0 << 6) | (index.code() << 3) | base.code());
+        }
     }
 
     /// mov rax, [reg + disp32] (load through pointer with displacement)
@@ -6296,7 +6327,7 @@ impl PeCodeGen {
         self.enc.push(Reg::Rbp);
         self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
         self.enc.push(Reg::R12);
-        self.enc.sub_rsp_i32(32);
+        self.enc.sub_rsp_i32(40); // 32 + 8 for alignment (1 push = 8 mod 16)
         // Save char code in r12
         self.enc.mov_rr(Reg::R12, Reg::Rcx);
         // malloc(2)
@@ -6310,7 +6341,7 @@ impl PeCodeGen {
         self.enc.xor_self(Reg::R12);
         self.enc.mov_mem_disp_reg8(Reg::Rax, 1, Reg::R12);
         // Return rax
-        self.enc.add_rsp_i32(32);
+        self.enc.add_rsp_i32(40);
         self.enc.pop(Reg::R12);
         self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
         self.enc.pop(Reg::Rbp);
@@ -6410,7 +6441,7 @@ impl PeCodeGen {
         self.enc.push(Reg::Rbp);
         self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
         self.enc.push(Reg::R12);
-        self.enc.sub_rsp_i32(32);
+        self.enc.sub_rsp_i32(40); // 32 + 8 for alignment (1 push = 8 mod 16)
         // malloc(24) for struct
         self.enc.mov_imm32(Reg::Rcx, 24);
         self.enc.sub_rsp_i32(32);
@@ -6437,7 +6468,7 @@ impl PeCodeGen {
         self.enc.mov_mem_reg8_ptr(Reg::Rax, Reg::Rdx);
         // Return sb
         self.enc.mov_rr(Reg::Rax, Reg::R12);
-        self.enc.add_rsp_i32(32);
+        self.enc.add_rsp_i32(40);
         self.enc.pop(Reg::R12);
         self.enc.mov_rr(Reg::Rsp, Reg::Rbp);
         self.enc.pop(Reg::Rbp);
@@ -6454,7 +6485,7 @@ impl PeCodeGen {
         self.enc.push(Reg::R12); // sb
         self.enc.push(Reg::R13); // s
         self.enc.push(Reg::R14); // slen
-        self.enc.sub_rsp_i32(32);
+        self.enc.sub_rsp_i32(40); // 32 + 8 for alignment (3 pushes = 8 mod 16)
         // r12 = sb, r13 = s
         self.enc.mov_rr(Reg::R12, Reg::Rcx);
         self.enc.mov_rr(Reg::R13, Reg::Rdx);
@@ -6544,7 +6575,7 @@ impl PeCodeGen {
         self.enc.mov_mem_reg8_ptr(Reg::R8, Reg::Rdx);
         // Return
         self.enc.xor_self(Reg::Rax);
-        self.enc.add_rsp_i32(32);
+        self.enc.add_rsp_i32(40);
         self.enc.pop(Reg::R14);
         self.enc.pop(Reg::R13);
         self.enc.pop(Reg::R12);
@@ -6563,7 +6594,7 @@ impl PeCodeGen {
         self.enc.push(Reg::R12); // sb
         self.enc.push(Reg::R13); // result
         self.enc.push(Reg::R14); // len
-        self.enc.sub_rsp_i32(32);
+        self.enc.sub_rsp_i32(40); // 32 + 8 for alignment (3 pushes = 8 mod 16)
         // r12 = sb
         self.enc.mov_rr(Reg::R12, Reg::Rcx);
         // r14 = sb->len
@@ -6603,7 +6634,7 @@ impl PeCodeGen {
         self.enc.add_rsp_i32(32);
         // Return result
         self.enc.mov_rr(Reg::Rax, Reg::R13);
-        self.enc.add_rsp_i32(32);
+        self.enc.add_rsp_i32(40);
         self.enc.pop(Reg::R14);
         self.enc.pop(Reg::R13);
         self.enc.pop(Reg::R12);
@@ -6622,7 +6653,7 @@ impl PeCodeGen {
         self.enc.push(Reg::R12); // path
         self.enc.push(Reg::R13); // handle
         self.enc.push(Reg::R14); // buf
-        self.enc.sub_rsp_i32(32);
+        self.enc.sub_rsp_i32(40); // 32 + 8 for alignment (3 pushes = 8 mod 16)
         // r12 = path
         self.enc.mov_rr(Reg::R12, Reg::Rcx);
         // CreateFileA(path, GENERIC_READ=0x80000000, FILE_SHARE_READ=1, NULL, OPEN_EXISTING=3, 0, NULL)
@@ -6630,17 +6661,9 @@ impl PeCodeGen {
         self.enc.mov_imm32(Reg::Rdx, 0x80000000u32 as i32); // GENERIC_READ
         self.enc.mov_imm32(Reg::R8, 1); // FILE_SHARE_READ
         self.enc.xor_self(Reg::R9); // NULL (security)
-        // 5th arg on stack: OPEN_EXISTING=3
-        self.enc.mov_imm32(Reg::Rax, 3);
-        self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax);
-        // 6th arg: 0 (flags)
-        // 7th arg: 0 (template)
-        // But we need 7 args total. Args 5,6,7 go on stack at rsp+32, rsp+40, rsp+48
-        self.enc.xor_self(Reg::Rax);
-        self.enc.mov_mem_disp_reg(Reg::Rsp, 40, Reg::Rax); // flags=0
-        self.enc.mov_mem_disp_reg(Reg::Rsp, 48, Reg::Rax); // template=NULL
+        // Allocate shadow space + stack args (5th, 6th, 7th params)
         self.enc.sub_rsp_i32(64); // 32 shadow + 3 stack args = 56, align to 64
-        // Re-set stack args (they moved due to sub_rsp)
+        // Set stack args at rsp+32, rsp+40, rsp+48
         self.enc.mov_imm32(Reg::Rax, 3);
         self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax); // OPEN_EXISTING
         self.enc.xor_self(Reg::Rax);
@@ -6656,7 +6679,7 @@ impl PeCodeGen {
         self.enc.jcc_label(0x5, fr_ok); // jnz — not -1, handle is valid
         // Return 0 (NULL)
         self.enc.xor_self(Reg::Rax);
-        self.enc.add_rsp_i32(32);
+        self.enc.add_rsp_i32(40);
         self.enc.pop(Reg::R14);
         self.enc.pop(Reg::R13);
         self.enc.pop(Reg::R12);
@@ -6664,42 +6687,22 @@ impl PeCodeGen {
         self.enc.pop(Reg::Rbp);
         self.enc.ret();
         self.enc.place_label(fr_ok);
-        // GetFileSize(handle, NULL)
-        self.enc.mov_rr(Reg::Rcx, Reg::R13);
-        self.enc.xor_self(Reg::Rdx);
-        self.enc.sub_rsp_i32(32);
-        self.enc.call_rip(self.iat_off(IAT_GET_FILE_SIZE));
-        self.enc.add_rsp_i32(32);
-        // rax = file size. malloc(size + 1)
-        self.enc.mov_rr(Reg::Rcx, Reg::Rax);
-        self.enc.inc_r(Reg::Rcx); // size + 1
+        // Allocate 1MB buffer for reading
+        self.enc.mov_imm32(Reg::Rcx, 0x100000); // 1MB
         self.enc.sub_rsp_i32(32);
         self.enc.call_label(*self.func_labels.get("p_malloc").unwrap());
         self.enc.add_rsp_i32(32);
         self.enc.mov_rr(Reg::R14, Reg::Rax); // r14 = buf
-        // ReadFile(handle, buf, size, &bytesRead, NULL)
+        // ReadFile(handle, buf, 1MB, &bytesRead, NULL)
         self.enc.mov_rr(Reg::Rcx, Reg::R13); // handle
         self.enc.mov_rr(Reg::Rdx, Reg::R14); // buf
-        // r8 = size (we need to recompute: size = rcx-1 before inc... actually we lost it)
-        // Let's use a different approach: read up to a large size
-        // Actually, we can get size from GetFileSize again, or save it
-        // Let me restructure: save size in a callee-saved reg
-        // Actually, let me just read with a large buffer size
-        // For now, let's use the file size we got. We need to save it.
-        // Let me redo: save size in r15... but we didn't push r15.
-        // Let me use a simpler approach: ReadFile with size from GetFileSize
-        // We need to save the size. Let me use [rbp-32] for that.
-        // Actually, I realize the issue: after GetFileSize returns in rax,
-        // I do malloc(rax+1) which clobbers rax. I need to save the size.
-        // Let me restructure to save size on stack.
-        // For now, let's just read a large amount (1MB) and null-terminate
         self.enc.mov_imm32(Reg::R8, 0x100000); // 1MB max
         self.enc.lea_rbp(Reg::R9, -32); // &bytesRead
         self.enc.xor_self(Reg::Rax);
-        self.enc.mov_mem_disp_reg32(Reg::R9, 0, Reg::Rax);
+        self.enc.mov_mem_disp_reg32(Reg::R9, 0, Reg::Rax); // zero bytesRead
         self.enc.sub_rsp_i32(48);
         self.enc.xor_self(Reg::Rax);
-        self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax); // NULL
+        self.enc.mov_mem_disp_reg(Reg::Rsp, 32, Reg::Rax); // NULL (lpOverlapped)
         self.enc.call_rip(self.iat_off(IAT_READ_FILE));
         self.enc.add_rsp_i32(48);
         // bytesRead is at [rbp-32]. Null-terminate at buf[bytesRead]
@@ -6712,15 +6715,11 @@ impl PeCodeGen {
         self.enc.sub_rsp_i32(32);
         self.enc.call_rip(self.iat_off(IAT_CLOSE_HANDLE));
         self.enc.add_rsp_i32(32);
-        // Return buf
+        // Return buf (r14 = buf + bytesRead, subtract bytesRead back)
         self.enc.mov_rr(Reg::Rax, Reg::R14);
-        // Wait, r14 was modified above. Let me fix: we need to return the original buf.
-        // Actually, r14 = buf + bytesRead now. We need to return buf.
-        // This is a bug. Let me save buf in a different way.
-        // For now, let me just subtract bytesRead back:
         self.enc.mov_reg_mem_rbp(Reg::Rdx, -32); // bytesRead
         self.enc.sub_rr(Reg::Rax, Reg::Rdx); // rax = buf
-        self.enc.add_rsp_i32(32);
+        self.enc.add_rsp_i32(40);
         self.enc.pop(Reg::R14);
         self.enc.pop(Reg::R13);
         self.enc.pop(Reg::R12);
@@ -6764,7 +6763,7 @@ impl PeCodeGen {
         self.enc.jcc_label(0x5, fw_ok); // jnz — valid
         // Return -1
         self.enc.mov_imm32(Reg::Rax, -1);
-        self.enc.add_rsp_i32(32);
+        self.enc.add_rsp_i32(40);
         self.enc.pop(Reg::R14);
         self.enc.pop(Reg::R13);
         self.enc.pop(Reg::R12);
@@ -6801,7 +6800,7 @@ impl PeCodeGen {
         self.enc.add_rsp_i32(32);
         // Return 0
         self.enc.xor_self(Reg::Rax);
-        self.enc.add_rsp_i32(32);
+        self.enc.add_rsp_i32(40);
         self.enc.pop(Reg::R14);
         self.enc.pop(Reg::R13);
         self.enc.pop(Reg::R12);

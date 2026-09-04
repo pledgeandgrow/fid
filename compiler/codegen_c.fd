@@ -591,7 +591,7 @@ fn t4(a: IrType, b: IrType, c: IrType, d: IrType) -> Vec<IrType> {
     return v;
 }
 
-fn ptr_u8() -> IrType {
+pub fn ptr_u8() -> IrType {
     return IrType::Ptr(Box::new(IrType::U8));
 }
 
@@ -2395,7 +2395,31 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                     wln(self, "    " + dst + " = 0;");
                 }
             } else {
-                wln(self, "    " + dst + " = " + c_fname + "(" + arg_strs + ");");
+                if is_void_or_never(ret_ty) {
+                    wln(self, "    " + c_fname + "(" + arg_strs + ");");
+                } else {
+                    // Match Rust codegen: add return type cast based on dst type
+                    var dst_ty: IrType = value_ty_for_id(func, id);
+                    var dst_is_ptr: bool = is_ptr_type(dst_ty);
+                    var callee_returns_int: bool = str_equal(callee_c_ret, "int64_t") || str_equal(callee_c_ret, "int32_t") || str_equal(callee_c_ret, "int16_t") || str_equal(callee_c_ret, "int8_t");
+                    var cast: str = "(int64_t)";
+                    match dst_ty {
+                        IrType::Ptr(_) => {
+                            if dst_is_ptr && callee_returns_int { cast = "(void*)"; } else { cast = ""; }
+                        }
+                        IrType::Opaque(_) => {
+                            if dst_is_ptr && callee_returns_int { cast = "(void*)"; } else { cast = ""; }
+                        }
+                        IrType::Generic(_, _) => {
+                            if dst_is_ptr && callee_returns_int { cast = "(void*)"; } else { cast = ""; }
+                        }
+                        IrType::F64 => { cast = "(double)"; }
+                        IrType::F32 => { cast = "(float)"; }
+                        IrType::Bool => { cast = "(bool)"; }
+                        _ => { cast = "(int64_t)"; }
+                    }
+                    wln(self, "    " + dst + " = " + cast + c_fname + "(" + arg_strs + ");");
+                }
             }
         }
         Inst::CallPtr(fn_ptr, args, ret_ty, _, has_env) => {
