@@ -619,6 +619,13 @@ impl Lowerer {
         self.module.add_extern("p_float_to_str",
             vec![IrType::F64],
             IrType::Ptr(Box::new(IrType::U8)));
+        // B5: Float bit-pattern conversion for ConstFloat codegen
+        self.module.add_extern("p_f64_to_bits",
+            vec![IrType::F64],
+            IrType::I64);
+        self.module.add_extern("p_f32_to_bits",
+            vec![IrType::F32],
+            IrType::I64);
         // p_str_to_float(s: *u8) -> f64 — parse a string as f64
         self.module.add_extern("p_str_to_float",
             vec![IrType::Ptr(Box::new(IrType::U8))],

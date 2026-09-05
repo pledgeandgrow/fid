@@ -1,7 +1,7 @@
 # Vision Analysis — Are We on the Right Path?
 
 > An honest assessment of where Fides is, where it's going, and what the
-> self-hosting effort needs to succeed. Updated Sep 4, 2026 (session 8).
+> self-hosting effort needs to succeed. Updated Sep 5, 2026 (session 14).
 
 ---
 
@@ -29,7 +29,7 @@ The North Star: one language for OS kernels, web servers, robots, AI, microcontr
 
 | Area | Status | Evidence |
 |------|--------|----------|
-| Language features | Phases 1-8 complete | 164/165 tests pass on interp+C, 165/165 on PE |
+| Language features | Phases 1-8 complete | 209/211 on interp, 198/211 on C, 209/211 on PE |
 | Cross-compilation | Done | x86-64, ARM64, RISC-V, Windows |
 | Optimizer | 23 passes, mostly complete | SLP, loop-vec, LTO, inline, DCE, etc. |
 | AI/ML | Complete | Tensor ops, autograd, KV cache, quantization, DP |
@@ -41,25 +41,31 @@ The North Star: one language for OS kernels, web servers, robots, AI, microcontr
 
 | Area | Status | Evidence |
 |------|--------|----------|
-| All 18 modules | Compile + pass tests | 23/23 on interp + PE |
+| All 25 modules | Compile + pass tests | 23/23 on interp + PE |
 | Build pipeline | Works | `fides-c.exe` builds via tcc |
 | SRET | Works | Struct returns via out-parameter |
-| Enum layout | Works | Payload sizes computed from field sizes |
+| Enum layout | Works | Pointer-based payload approach (D1) |
 | Self-compilation | **✅ WORKS** | `fides-c.exe` → `fides-c2.exe` (session 4) |
 | PE emitter | **✅ WORKS** | `fides-c.exe build` → native .exe without tcc (session 5) |
 | Comptime eval | **✅ FULL PORT** | process_gen, substitute, I-5A, I-5D, reflection (session 7) |
 | PE runtime stubs | **✅ 25+ stubs** | print, string, vec, map, float, bool (session 7) |
 | Linux native codegen | **✅ PORTED** | peephole.fd + regalloc.fd + codegen_x64.fd (session 8, not yet integrated) |
 | `.exe` extension | **✅ FIXED** | Auto-appended in ccompile + build commands (session 8) |
-| Bootstrap fixpoint | **NOT YET VERIFIED** | fides-c2 crashes on stdlib (statement-dropping bug); need to fix + verify |
+| Category B parity | **✅ RESOLVED** | B5 fixed, B6/B7/B8 at parity (session 14) |
+| Float bit-patterns | **✅ PRESERVED** | p_f64_to_bits/p_f32_to_bits + union literals (session 14) |
+| Bootstrap fixpoint | **NOT YET VERIFIED** | fides-c2 crashes in TypeChecker_lookup (Category A); need to fix + verify |
 
 ### What doesn't work yet
 
-1. **fides-c2.exe crashes on stdlib** — second-generation compiler crashes while lexing `stdlib/core.fd`. Root cause: the **statement-dropping bug** (the Fides compiler silently drops statements in long functions; the second-generation binary has missing instructions baked in)
+1. **fides-c2.exe crashes during typecheck** — second-generation compiler crashes
+   in `TypeChecker_lookup` (null pointer from `Vec_get` on empty scopes). This is
+   a Category A crash blocker. (Session 12 found the earlier crash was primarily
+   stack overflow, now fixed via TCC stack patch.)
 2. **Bootstrap fixpoint not verified** — can't yet confirm stage2.c == stage3.c
 3. **Debug prints** — 38 `p_eprint_str` calls need gating behind a debug flag
 4. **PE emitter limited to simple programs** — needs struct/enum, float arithmetic, many-arg calls for full compiler source
 5. **Linux native codegen not integrated** — peephole.fd, regalloc.fd, codegen_x64.fd are ported but not wired into the pipeline (requires elf64.rs, linker.rs, runtime_linux.rs porting)
+6. **`var` feature not mirrored** — Rust compiler supports module-level `var`/`pub var` but self-hosted compiler files don't yet parse/typecheck/lower/emit globals
 
 ---
 
@@ -70,7 +76,7 @@ The North Star: one language for OS kernels, web servers, robots, AI, microcontr
 The vision calls for a custom toolchain with no LLVM dependency. We have that:
 - Custom lexer, parser, typechecker, IR, optimizer, codegen, linker
 - Cross-compilation to 4 targets with zero external tools
-- 86K LOC Rust → 39.5K LOC Fides (the self-host is more compact)
+- 84K LOC Rust → 57K LOC Fides (the self-host is more compact)
 
 The self-hosting approach is correct:
 - Rewrite leaf modules first, climb the dependency graph
@@ -107,9 +113,11 @@ The user's change to `pattern_binding_ir_types` (using `word_repr` for all types
 ### Immediate (to unblock fixpoint verification)
 
 1. ~~**Fix `.exe` extension** in self-hosted compiler output (Windows)~~ — DONE (session 8)
-2. **Fix the statement-dropping bug** in the Fides compiler — root cause of fides-c2.exe crash on stdlib (the compiler silently drops statements in long functions, baking missing instructions into the second-generation binary)
-3. **Remove/gate debug prints** — 38 `p_eprint_str` calls
-4. **Run the fixpoint test:** `diff fides-c2.exe.c fides-c3.exe.c`
+2. ~~**Category B codegen parity gaps**~~ — DONE (session 14: B5 fixed, B6/B7/B8 at parity)
+3. **Fix Category A crash blockers** — TypeChecker_lookup null deref, statement-dropping bug
+4. **Mirror `var` feature to `compiler/*.fd`** — needed for inc.fd global cache
+5. **Remove/gate debug prints** — 38 `p_eprint_str` calls
+6. **Run the fixpoint test:** `diff fides-c2.exe.c fides-c3.exe.c`
 
 ### Near-term (after bootstrap)
 

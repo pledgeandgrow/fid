@@ -450,6 +450,8 @@ impl CCodeGen {
             ("p_to_str_float", &[F64]),
             ("p_to_str_map", &[p()]),
             ("p_float_to_str", &[F64]),
+            ("p_f64_to_bits", &[F64]),
+            ("p_f32_to_bits", &[F32]),
             ("p_bool_to_str", &[Bool]),
             ("p_vec_to_str", &[p()]),
             ("p_str_concat", &[p(), p()]),
@@ -1028,6 +1030,8 @@ impl CCodeGen {
         wln!(self, "char* p_to_str_float(double val);");
         wln!(self, "char* p_to_str_map(PMap* m);");
         wln!(self, "char* p_float_to_str(double val);");
+        wln!(self, "int64_t p_f64_to_bits(double val);");
+        wln!(self, "int64_t p_f32_to_bits(float val);");
         wln!(self, "double p_str_to_float(const char* s);");
         wln!(self, "char* p_bool_to_str(bool val);");
         wln!(self, "char* p_vec_to_str(PVec* v);");
@@ -3313,6 +3317,9 @@ impl CCodeGen {
         wln!(self, "char* p_vec_to_str(PVec* v) {{ return p_to_str_vec(v); }}");
         // SH-4.1: String to float parsing
         wln!(self, "double p_str_to_float(const char* s) {{ if (!s) return 0.0; return atof(s); }}");
+        // Float bit-pattern conversion (B5: preserve NaN/Inf/-0.0 in ConstFloat)
+        wln!(self, "int64_t p_f64_to_bits(double val) {{ union {{ double d; int64_t i; }} u; u.d = val; return u.i; }}");
+        wln!(self, "int64_t p_f32_to_bits(float val) {{ union {{ float f; int32_t i; }} u; u.f = val; return (int64_t)u.i; }}");
 
         // ─── Socket builtins (native HTTP server, Phase 5D) ───
         wln!(self, "");

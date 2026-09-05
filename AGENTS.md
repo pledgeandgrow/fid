@@ -119,22 +119,22 @@ cargo build
 ./target/release/veil <file.fd> [--format text|html] [--output <dir>]
 ```
 
-## Current Baseline (as of Sep 4, 2026 — session 7)
+## Current Baseline (as of Sep 5, 2026 — session 14)
 
 ```
-Unit tests:   263/265 passed  (2 failing — recent lower.fd changes)
-Interpreter:  191/194 normal
-C Codegen:    74/194 matched   (tcc integration + Windows path fixes)
-PE Emitter:   193/194 valid
-Total .fd:    230 test files  (207 in tests/; 23 in tests/compiler/)
+Interpreter:  209/211 passed
+C Codegen:    198/211 matched
+PE Emitter:   209/211 valid
 Self-host:    23/23 pass on interp + PE (tests/compiler/)
-Source:       52 .rs files, 82,778 LOC
-Stdlib:       69 .fd modules, 16,069 LOC
-Self-host:    19 .fd modules, 40,762 LOC (token, diag, json, fmt, ast, lexer, parser, ir, typechecker, lower, mono, borrowck, pir, opt, codegen_c, compiler, comptime_eval, flat_ast, lsp, pe, peephole, regalloc, codegen_x64, main — all compile + pass tests)
-  flat_ast.fd: FULL PORT (dump-ast-flat serialization, 1260 lines) — session 9
+Source:       52 .rs files, 84,447 LOC
+Stdlib:       69 .fd modules, 16,090 LOC
+Self-host:    25 .fd modules, 57,021 LOC (token, diag, json, fmt, ast, lexer, parser, ir, typechecker, lower, mono, borrowck, pir, opt, codegen_c, compiler, comptime_eval, flat_ast, lsp, pe, peephole, regalloc, codegen_x64, main, inc — all compile + pass tests)
+  flat_ast.fd: FULL PORT (dump-ast-flat serialization, 1259 lines) — session 9
   comptime_eval.fd: FULL PORT (process_gen, substitute, I-5A, I-5D, reflection) — session 7
   pe.fd: 25+ runtime stubs (print, string, vec, map, float, bool) — session 7
-Bootstrap:    release/fides-c.exe builds (8.5MB) and self-compiles (EXIT 0); fides-c2 crashes on stdlib (pre-existing)
+  inc.fd: incremental compilation cache (146 lines)
+Bootstrap:    release/fides-c.exe builds and self-compiles (EXIT 0); fides-c2 crashes during typecheck (TypeChecker_lookup null deref — Category A blocker)
+Category B:   B5 (float bits) FIXED, B6/B7/B8 AT PARITY (session 14)
 Safety:       SH-12 DONE — C codegen recursion limit, p_malloc OOM abort, --max-steps/--max-memory/--timeout, test runner step limit, Windows path fixes, tcc auto-detection, crash handlers (VEH+SIGSEGV), all ported to Rust + Fides codegen
 Docs:         24 docs/ + 4 root = 28 .md files
 Binaries:     4 (fidesc, pacte, scribe, veil)

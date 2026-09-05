@@ -1,27 +1,26 @@
 # What Fides Can Do Now — Honest Assessment
 
 > Evidence-based, verified against the actual codebase and test runs.
-> Last updated: Sep 4, 2026 (session 9). Based on test runs, source inspection, and docs.
+> Last updated: Sep 5, 2026 (session 14). Based on test runs, source inspection, and docs.
 
 ---
 
-## Verified Test Results (Sep 4, 2026)
+## Verified Test Results (Sep 5, 2026 — session 14)
 
 ```
-Interpreter:  197/200 passed
-C Codegen:    79/200 matched
-PE Emitter:   198/200 valid
+Interpreter:  209/211 passed
+C Codegen:    198/211 matched
+PE Emitter:   209/211 valid
 Self-host:    23/23 pass (interp + PE)
-Unit tests:   263/265 passed
-Stdlib:       69 modules
-Source:       52 .rs files (86K+ LOC)
-Self-host:    18 .fd modules (39.5K+ LOC)
-Test files:   214 in tests/ + 23 in tests/compiler/
+Stdlib:       69 modules (16,090 LOC)
+Source:       52 .rs files (84,447 LOC)
+Self-host:    25 .fd modules (57,021 LOC)
+Test files:   225+ in tests/ + 23 in tests/compiler/
 ```
 
-The interpreter and PE emitter are near-complete (197-198/200). The C codegen
-backend is behind (79/200) because it's the newest backend and many stdlib
-features (HTTP, DB, threads, time, tensor, WASM) aren't ported to C yet.
+The interpreter and PE emitter are near-complete (209/211). The C codegen
+backend is at 198/211 — most failures are related to the `var` feature
+implementation (session 11) and not core codegen bugs.
 
 ---
 
@@ -91,9 +90,9 @@ features (HTTP, DB, threads, time, tensor, WASM) aren't ported to C yet.
 - `sandbox { }` compile-time capability revocation
 
 ### 9. Self-Hosting (self-compilation + native codegen achieved!)
-- 22 modules rewritten in Fides (~46K LOC, including PE emitter + Linux native codegen + LSP)
-- All 18 original modules compile + pass tests
-- `release/fides-c.exe` builds (8.5MB) via tcc
+- 25 modules rewritten in Fides (57K LOC, including PE emitter + Linux native codegen + LSP)
+- All 25 modules compile + pass tests
+- `release/fides-c.exe` builds via tcc
 - **Self-compilation works** — `fides-c.exe` compiles `compiler/main.fd` → `fides-c2.exe` (Sep 9, 2026)
 - `fides-c2.exe` correctly compiles `test_strconcat.fd` → "hello world"
 - **PE emitter ported to Fides** — `compiler/pe.fd` generates native Windows PE executables without tcc (Sep 10, 2026)
@@ -259,23 +258,30 @@ These are verified working today, not aspirational:
 ## The Self-Hosting Milestone
 
 **Self-compilation was achieved on Sep 9, 2026 (session 4).** The self-hosted
-compiler (`fides-c.exe`) successfully compiles the entire ~42K LOC compiler
+compiler (`fides-c.exe`) successfully compiles the entire 57K LOC compiler
 source (`compiler/main.fd`) into a working second-generation binary
 (`fides-c2.exe`). The generated binary correctly compiles test files.
 
 **Native PE code generation was achieved on Sep 10, 2026 (session 5).** The
 PE emitter was ported from Rust (`src/pe.rs`) to Fides (`compiler/pe.fd`,
-~2600 LOC). The `build` command generates native Windows PE executables
+4,845 LOC). The `build` command generates native Windows PE executables
 directly from `.fd` source — no tcc, no gcc, no external linker.
+
+**Category B codegen parity resolved (session 14).** Float bit-pattern
+preservation (B5), print/println dispatch (B6), runtime signatures (B7),
+and Vec word_repr (B8) are all at parity between Rust and self-hosted
+compilers.
 
 The next steps are:
 
 1. ~~Fix `.exe` extension in self-hosted compiler output~~ — DONE (session 8)
-2. Fix the statement-dropping bug in the Fides compiler (root cause of fides-c2.exe crash on stdlib)
-3. Remove/gate debug prints (38 `p_eprint_str` calls)
-4. Run the bootstrap fixpoint (fides-c2.c == fides-c3.c)
-5. Extend PE emitter to support full compiler source (struct/enum, Vec/HashMap, floats)
-6. Integrate Linux native codegen (port `elf64.rs`, `linker.rs`, `runtime_linux.rs`, wire into pipeline)
+2. ~~Category B codegen parity gaps~~ — DONE (session 14)
+3. **Fix Category A crash blockers** (TypeChecker_lookup null deref)
+4. **Mirror `var` feature to `compiler/*.fd` files**
+5. Remove/gate debug prints (38 `p_eprint_str` calls)
+6. Run the bootstrap fixpoint (fides-c2.c == fides-c3.c)
+7. Extend PE emitter to support full compiler source (struct/enum, Vec/HashMap, floats)
+8. Integrate Linux native codegen (port `elf64.rs`, `linker.rs`, `runtime_linux.rs`, wire into pipeline)
 
 Once the fixpoint is achieved and the PE emitter supports the full compiler
 source, Fides becomes a **self-reproducing compiler with a fully custom

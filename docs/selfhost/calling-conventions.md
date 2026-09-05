@@ -3,6 +3,12 @@
 > This is the most important file for agents working on codegen. The
 > SRET convention, enum layout, struct copy, and value semantics must stay
 > in sync across `lower.fd`, `codegen_c.fd`, and the runtime.
+>
+> **Last updated:** Sep 5, 2026 (session 14)
+>
+> **Important:** Sections 3 and 5 were updated in session 14 to reflect the
+> **pointer-based enum payload approach** (COORDINATION.md [D1]). The old
+> inline-struct + `memcpy` approach has been superseded.
 
 ---
 
@@ -106,23 +112,25 @@ of `fname(&result, ...)`.
 
 ## 3. Enum Layout
 
-### `Lowerer_make_enum_layout`
+> **Updated session 14:** The pointer-based approach (COORDINATION.md [D1])
+> is now the canonical direction. Each payload field gets exactly 8 bytes
+> (a pointer), regardless of the field's actual type.
 
-1. Compute the maximum payload size across all variants.
-2. Each field is at least 8 bytes.
-3. Struct/enum-typed fields use the full layout size.
-4. Round `max_payload_size` up to an 8-byte multiple and count slots.
-5. Layout is:
-   - `__tag` at offset 0
-   - `__data0` at offset 8
-   - `__data1` at offset 16
+### `Lowerer_make_enum_layout` (pointer-based approach)
+
+1. Compute the maximum number of fields across all variants (`max_variant_arity`).
+2. Every field gets exactly 8 bytes (a pointer/word).
+3. Layout is:
+   - `__tag` at offset 0 (i64)
+   - `__data0` at offset 8 (i64 — pointer to field 0's data)
+   - `__data1` at offset 16 (i64 — pointer to field 1's data)
    - ...
 
 ```fides
 pub fn Lowerer_make_enum_layout(self: &Lowerer, def: EnumDef) -> StructLayout {
-    var max_payload_size: i64 = 0;
-    ... for each variant, sum field sizes ...
-    var payload_slots: i64 = (max_payload_size + 7) / 8;
+    var max_arity: i64 = 0;
+    ... for each variant, count fields, track max ...
+    var payload_slots: i64 = max_arity;
     var fields: Vec<StringIrTypeOffset> = Vec::new();
     fields.push(StringIrTypeOffset_new("__tag", IrType::I64, 0));
     var j: i64 = 0;
@@ -134,10 +142,23 @@ pub fn Lowerer_make_enum_layout(self: &Lowerer, def: EnumDef) -> StructLayout {
 }
 ```
 
+### Why pointer-based?
+
+The C backend treats `IrType::Struct(_)` as `void*` (a pointer type). A plain
+`Inst::Load` with a struct type reads only 8 bytes — the pointer. Storing
+inline struct data would require `memcpy` via `Inst::Store` with explicit
+`store_ty`, which is complex and error-prone. With the pointer-based approach:
+
+- Every payload slot is 8 bytes.
+- `Inst::Load` reads the 8-byte pointer.
+- Field access works through the pointer.
+- No `load_enum_field` workaround needed.
+
 ### Iterative fixpoint
 
 Because enums can contain structs and structs can contain enums, layouts are
-computed in a loop (up to 20 iterations) until no size changes.
+computed in a loop (up to 20 iterations) until no size changes. With the
+pointer-based approach, this is simpler since all payload slots are 8 bytes.
 
 ### Example: `ParseResultExpr`
 
@@ -148,13 +169,18 @@ pub enum ParseResultExpr {
 }
 ```
 
-- `Ok(Expr)` needs `sizeof(Expr)` bytes for the payload.
-- `Err(str)` needs 8 bytes (the `str` pointer).
-- `max_payload_size = max(sizeof(Expr), 8)`.
-- If `Expr` is 80 bytes, `payload_slots = 10` and total size = `11 * 8 = 88` bytes.
+- `Ok(Expr)` has 1 field → 1 payload slot.
+- `Err(str)` has 1 field → 1 payload slot.
+- `max_arity = 1`, `payload_slots = 1`.
+- Total size = `(1 + 1) * 8 = 16` bytes.
+- `__tag` at offset 0, `__data0` at offset 8 (pointer to `Expr` or `str`).
 
-If the layout only allocated 1 slot (the old bug), `sizeof(ParseResultExpr) = 16`,
-so SRET copy would only copy 16 bytes, truncating the `Expr` data.
+### Previous approach [REVERSED]
+
+The old inline-struct approach computed `max_payload_size` by summing field
+sizes and allocated `payload_slots = (max_payload_size + 7) / 8` slots. This
+required `load_enum_field()` + `memcpy` for extraction and caused truncation
+bugs. It has been reversed in favor of the pointer-based approach.
 
 ---
 
@@ -194,7 +220,10 @@ Current Rust `codegen_c.rs` does this. The Fides `codegen_c.fd` must too.
 
 ---
 
-## 5. Enum Variant Extraction — The Current Blocker
+## 5. Enum Variant Extraction — Pointer-Based (session 14)
+
+> **Updated session 14:** Under the pointer-based approach, this is no
+> longer a blocker. The old `load_enum_field()` workaround is not needed.
 
 ### What `ParseResultExpr::Ok(e) => { ... }` means
 
@@ -205,46 +234,28 @@ When the lowerer matches an enum variant, it does:
 3. Load the field: `field_val = Load(field_ptr, field_ty)`.
 4. Bind `field_val` to the pattern name.
 
-### The bug
+### Why it works now
 
-When `field_ty` is `IrType::Struct(_)`:
-- `Load(field_ptr, field_ty)` in the C backend only reads 8 bytes.
-- But the actual data at `field_ptr` is a full struct (e.g. `Expr` is 80 bytes).
-- Result: the binding gets only the first 8 bytes (the struct's tag), not the full struct.
+With the pointer-based enum layout, every payload slot stores an 8-byte
+pointer. `Inst::Load` reads exactly 8 bytes — the pointer to the field's
+data. This is correct for all field types:
 
-### The fix in Rust
+- **Primitive fields** (i64, str, bool, f64): the slot stores the value
+  directly (8 bytes is sufficient).
+- **Struct/enum fields**: the slot stores a pointer to the heap-allocated
+  struct/enum data. `Load` reads the pointer, and subsequent field access
+  works through the pointer.
 
-```rust
-fn load_enum_field(&mut self, field_ptr: ValueId, field_ty: &IrType) -> ValueId {
-    if let IrType::Struct(_) = field_ty {
-        let buf = self.emit_inst(Inst::Alloca {
-            ty: field_ty.clone(),
-            region: self.current_region(),
-        });
-        self.emit_inst(Inst::Store {
-            ptr: buf,
-            value: field_ptr,
-            store_ty: Some(field_ty.clone()),
-        });
-        buf
-    } else {
-        self.emit_inst(Inst::Load { ptr: field_ptr, ty: field_ty.clone() })
-    }
-}
-```
+No `load_enum_field()` or `memcpy` is needed. The extraction is a simple
+`Inst::Load` in all cases.
 
-What it does:
-1. If the field is a struct, allocate a buffer of the full struct size.
-2. Use `Inst::Store` with `store_ty: Some(field_ty)` to copy the inline data from `field_ptr` into `buf`.
-3. The C backend, seeing `store_ty: Some(Struct(_))`, emits `memcpy`.
-4. Return `buf` (a pointer to the full data).
-5. If the field is not a struct, just do a normal `Load`.
+### Previous approach [REVERSED]
 
-### Where to apply it in `compiler/lower.fd`
-
-Two match binding sites need `load_enum_field` instead of `Load`:
-1. `Lowerer_lower_match` around `GetFieldPtr(match_val, bi + 1, field_ty)` → `Load(field_ptr, field_ty)`.
-2. The other match lowering path that binds enum payload fields.
+The old inline-struct approach stored struct data inline in enum payload
+slots. `Inst::Load` with `IrType::Struct(_)` only read 8 bytes, truncating
+the struct. The Rust lowerer had `load_enum_field()` (alloca + `Store` with
+`store_ty: Some(field_ty)` → `memcpy`) to work around this. This is no
+longer needed under the pointer-based approach.
 
 ### Why `Inst::Store` must support `memcpy`
 
@@ -511,3 +522,55 @@ string constants and their offsets.
 PE files are binary data containing null bytes. Since `p_file_write` truncates
 at null bytes, the PE emitter hex-encodes the binary data and writes it as a
 hex string. PowerShell then decodes the hex file to binary.
+
+---
+
+## 13. Float Constant Bit-Pattern Preservation (session 14 — B5 fix)
+
+### The problem
+
+IEEE-754 floating-point values have special bit patterns that cannot be
+preserved by decimal literal emission:
+- **NaN** — multiple payload variants (quiet vs signaling)
+- **Infinity** — `+inf` / `-inf`
+- **Negative zero** — `-0.0` has a distinct bit pattern from `0.0`
+
+The old `ConstFloat` handler in `compiler/codegen_c.fd` emitted decimal
+literals (`3.14`, `nan`, `inf`), which lost exact bit patterns.
+
+### The fix
+
+`ConstFloat` now stores the raw `u64`/`u32` bit pattern and emits a C
+union compound literal to reinterpret the bits as a float:
+
+```c
+// f64
+((union { uint64_t u; double f; }){ .u = 0x7FF8000000000000ULL }).f
+// f32
+((union { uint32_t u; float f; }){ .u = 0x7FC00000U }).f
+```
+
+### Runtime functions
+
+Two C runtime functions were added to both `src/codegen_c.rs` and
+`compiler/codegen_c.fd`:
+
+```c
+uint64_t p_f64_to_bits(double f);
+uint32_t p_f32_to_bits(float f);
+```
+
+These are registered as externs in both `src/lower.rs` and
+`compiler/lower.fd` (`Lowerer_register_runtime`). The Fides `lower.fd`
+implements `f64_to_bits` / `f32_to_bits` by calling these externs.
+
+### What this preserves
+
+- NaN payloads (quiet NaN `0x7FF8...`, signaling NaN `0x7FF4...`)
+- `+inf` (`0x7FF0000000000000`), `-inf` (`0xFFF0000000000000`)
+- `-0.0` (`0x8000000000000000`)
+- All normal/subnormal values
+
+This is critical for bootstrap fixpoint: if the Rust compiler and the
+self-hosted compiler emit different bit patterns for the same float
+constant, the fixpoint will diverge.

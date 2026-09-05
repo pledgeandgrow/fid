@@ -49,16 +49,20 @@ tcc -O2 -w -o release\fides-c.exe release\fides-c.c -lws2_32
 # → Hello from PE!
 ```
 
-## Current Status (Sep 5, 2026 — session 11)
+## Current Status (Sep 5, 2026 — session 14)
 
 - **🎉 Self-compilation works!** — `fides-c.exe` compiles `compiler/main.fd` → `fides-c2.exe`
-- **🎉 PE emitter ported to Fides!** — `compiler/pe.fd` generates native Windows PE executables without tcc
+- **🎉 PE emitter ported to Fides!** — `compiler/pe.fd` (4,845 lines) generates native Windows PE executables without tcc
 - **🎉 comptime_eval.fd fully ported!** — process_gen, substitute, I-5A aggressive comptime, I-5D loop unrolling, reflection
 - **🎉 Linux native codegen ported!** — `peephole.fd` + `regalloc.fd` + `codegen_x64.fd` (session 8), builds OK, not yet integrated
-- **🎉 LSP server ported to Fides!** — `compiler/lsp.fd` (1084 lines) — JSON-RPC over stdio, diagnostics, completion, hover, definition, rename (session 9)
-- **🎉 flat_ast.fd ported!** — `compiler/flat_ast.fd` (1260 lines) — flat AST serialization for `dump-ast-flat` command (session 9)
+- **🎉 LSP server ported to Fides!** — `compiler/lsp.fd` (1,082 lines) — JSON-RPC over stdio, diagnostics, completion, hover, definition, rename (session 9)
+- **🎉 flat_ast.fd ported!** — `compiler/flat_ast.fd` (1,259 lines) — flat AST serialization for `dump-ast-flat` command (session 9)
 - **🎉 Module-level `var`/`pub var` implemented!** — Rust compiler now supports mutable globals across all backends (interp, C, PE, WASM, ARM64, RISC-V). `test_globals.fd` passes on interp, C, and PE. (session 11)
-- **🎉 Full static analysis of all 24 `compiler/*.fd` files completed!** — Every module analyzed for stubs, bugs, and gaps. 5 P0 and 17 P1 issues identified. (session 11)
+- **🎉 Category B codegen parity gaps resolved!** (session 14):
+  - B5 (float bit-pattern) — **FIXED**: `p_f64_to_bits`/`p_f32_to_bits` runtime + union compound literals in ConstFloat codegen
+  - B6 (print/println dispatch) — **AT PARITY**: all type cases (Vec/HashMap/Tensor/F64/Bool/Ptr) match Rust
+  - B7 (runtime sigs) — **AT PARITY**: `p_malloc_persistent`/`p_arena_save`/`p_arena_restore` registered
+  - B8 (Vec word_repr) — **AT PARITY**: `lower_method_call` uses `word_repr(elem_ty)`; `infer_expr_type` matches Rust by design
 - **Box<T> unbox helpers centralized** — `box_expr_unbox`, `box_type_unbox`, `box_pattern_unbox` now in `ast.fd` (session 9)
 - **`.exe` extension auto-appended** — `ccompile` and `build` now produce `.exe` output without manual rename (session 8)
 - **`build` command** — `fides-c.exe build tests/hello_pe.fd -o hello_pe.exe` → working .exe
@@ -68,29 +72,56 @@ tcc -O2 -w -o release\fides-c.exe release\fides-c.c -lws2_32
 - **SRET fixed** — struct returns via out-parameter convention now work
 - **Enum `==` fixed** — all enum comparisons use `*_eq()` helper functions
 - **String builder** — `p_sb_*` eliminates O(n²) memory in C codegen
-- **22/23 self-host tests pass** on all 3 backends (1 pre-existing failure: test_codegen_c.fd)
-- **Bootstrap fixpoint not yet verified** — fides-c2.exe crashes on stdlib (statement-dropping bug); need to fix and verify stage2.c == stage3.c
+- **23/23 self-host tests pass** on interp + PE (tests/compiler/)
+- **Bootstrap fixpoint not yet verified** — fides-c2.exe crashes during type checking (TypeChecker_lookup null deref); need to fix Category A crash blockers and verify stage2.c == stage3.c
+
+### Codebase size (session 14)
+| Component | Files | LOC |
+|-----------|-------|-----|
+| Self-hosted compiler (`compiler/*.fd`) | 25 | 57,021 |
+| Rust compiler (`src/*.rs`) | 52 | 84,447 |
+| Stdlib (`stdlib/*.fd`) | 69 | 16,090 |
+| Test files (`tests/*.fd` + `tests/compiler/*.fd`) | 225 + 23 | — |
+
+### Test results (session 14)
+| Backend | Result |
+|---------|--------|
+| Interpreter | 209/211 passed |
+| C Codegen | 198/211 matched |
+| PE Emitter | 209/211 valid |
+| Self-host (tests/compiler/) | 23/23 pass on interp + PE |
+
+Pre-existing failures (documented in known-bugs.md §2b.8): test_codegen_c, test_lower, test_banking, test_deep_nesting, test_new_features, test_parallel, test_parallel_concurrent, test_phase8b, test_rc_arc, test_regression_collections, test_vec_math, test_token_full, test_fmt_real — all related to the `var` feature implementation (session 11).
 
 ### Remaining steps to fixpoint:
 1. ~~Fix `.exe` extension in self-hosted compiler output~~ — DONE (session 8)
 2. ~~Port LSP server to Fides~~ — DONE (session 9)
-3. **Fix pre-existing parse error at codegen_c.fd:973** — blocks rebuilding fides-c.exe with current code
-4. Fix the statement-dropping bug in the Fides compiler (root cause of fides-c2.exe crash on stdlib/core.fd)
-5. **Fix 5 P0 bugs in parser.fd and lexer.fd** (session 11 analysis):
-   - `lexer.fd:291` — remove duplicate empty `str_filter_underscores` stub
-   - `parser.fd` — rewrite `box_expr_deref` to match actual `ast.fd` Expr enum
-   - `parser.fd` — add missing `return` in 4 parse functions
-   - `parser.fd` — remove duplicate `var has_forward` in `parse_layer`/`parse_model`
-   - `parser.fd:4684` — fix `parse_use` version-pin to only error on missing string
+3. ~~Category B codegen parity gaps~~ — DONE (session 14: B5 fixed, B6/B7/B8 at parity)
+4. **Fix Category A crash blockers** (current: TypeChecker_lookup null deref):
+   - A1: TypeChecker scope lookup null safety — add null checks after Vec_get
+   - A2: TypeChecker_register_program missing fields
+   - A3: TypeChecker `check` return type — collect errors like Rust
+   - A4: Statement-dropping bug (root cause or workaround)
+   - A5: Type alias cross-module visibility
+5. **Fix remaining Category B gaps** (B1-B4, B9-B10 — low priority, not used by compiler source):
+   - B1: `generate_c` entry point
+   - B2: DynCall/TryUnwrap stubs
+   - B3: Allocator builtins stubs
+   - B4: Bare-metal builtins stubs
+   - B9: Async/await lowering
+   - B10: Closure lowering
 6. **Mirror `var` feature to `compiler/*.fd` files** — Rust compiler has it, Fides self-hosted compiler does not yet
 7. **Fix `inc.fd` global_cache_* using `var` feature** — now possible since Rust compiler supports `var`
-8. Remove/gate 38 debug `p_eprint_str` calls
+8. **Fix Category E fixpoint stability risks**:
+   - E1: Sort HashMap keys before output
+   - E2: Zero-initialize all allocas
+   - E6: Gate 38 debug `p_eprint_str` calls behind flag
 9. Verify `fides-c2.c == fides-c3.c` (the fixpoint check)
 10. Extend PE emitter to support full compiler source (struct/enum, Vec/HashMap, floats)
 11. Integrate Linux native codegen (port `elf64.rs`, `linker.rs`, `runtime_linux.rs`, wire into pipeline)
-12. ~~Assess debugger.rs porting feasibility~~ — **ASSESSED (session 9): NOT feasible without porting interp.rs (5782 LOC, 251 runtime handlers, closures for debug hooks). Skip — debugger is a dev tool, not needed for self-hosting.**
+12. ~~Assess debugger.rs porting feasibility~~ — **ASSESSED (session 9): NOT feasible without porting interp.rs (5,834 LOC, 251 runtime handlers, closures for debug hooks). Skip — debugger is a dev tool, not needed for self-hosting.**
 
-See `CURRENT.md` in the repo root for the latest state.
+See `docs/roadmap/selfhost-roadmap.md` for the comprehensive gap analysis (Categories A–F) and `docs/selfhost/known-bugs.md` for the full bug history.
 
 ## For Parallel Sessions
 

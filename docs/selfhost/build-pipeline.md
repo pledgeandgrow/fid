@@ -1,6 +1,8 @@
 # Fides Self-Hosted Compiler — Build, Test, and Bootstrap Pipeline
 
 > How to build, test, and verify the self-hosted compiler.
+>
+> **Last updated:** Sep 5, 2026 (session 14)
 
 ---
 
@@ -73,7 +75,7 @@ It performs all four steps in order.
 
 ---
 
-## 1b. PE Emitter Pipeline (NEW — session 5)
+## 1b. PE Emitter Pipeline (session 5+)
 
 The self-hosted compiler now has a `build` command that generates native
 Windows PE executables **directly from `.fd` source** — no tcc, no gcc, no
@@ -106,13 +108,16 @@ The PE emitter currently supports:
 - ✅ `p_print_str`, `p_print_int`, `p_print_float`, `p_print_bool`, `p_panic`
 - ✅ String literals (.rdata section)
 - ✅ Basic arithmetic, local variables, control flow
+- ✅ String concat (`p_str_concat`), int/bool/float→string
+- ✅ Vec runtime (new/push/len/get/pop/set/first/last/...)
+- ✅ HashMap runtime (new/insert/get/contains/...)
 
 The PE emitter does NOT yet support:
 - ⏳ Full struct/enum support (memcpy, SRET)
-- ⏳ Vec/HashMap runtime
-- ⏳ Float arithmetic operations
+- ⏳ Float arithmetic operations (xmm ops)
 - ⏳ Many-arg function calls (>4 args)
 - ⏳ Full compiler source compilation
+- ⏳ 20+ runtime stubs return placeholder values (see architecture.md pe.fd section)
 
 See SH-13 sub-tasks in `docs/roadmap/selfhost-roadmap.md` for the full list.
 
@@ -147,7 +152,7 @@ It catches "compiles but wrong output" bugs that assertion tests miss. If
 the self-hosted compiler generates C that is functionally different from
 the Rust compiler's C output, the fixpoint will diverge.
 
-### Current status
+### Current status (session 14)
 
 **Self-compilation works (session 4).** `fides-c.exe` successfully compiles
 `compiler/main.fd` → `fides-c2.exe`. **PE emitter works (session 5).**
@@ -155,9 +160,12 @@ the Rust compiler's C output, the fixpoint will diverge.
 **Linux native codegen ported (session 8)** — `peephole.fd`, `regalloc.fd`,
 `codegen_x64.fd` build OK but are not yet integrated. **`.exe` extension
 auto-appended (session 8)** — no more manual `Copy-Item` needed.
+**Category B codegen parity resolved (session 14)** — B5 (float bits) fixed,
+B6/B7/B8 verified at parity.
 
-The fixpoint is not yet verified — fides-c2.exe crashes on stdlib due to the
-statement-dropping bug (root cause confirmed session 8). Once that's fixed:
+The fixpoint is not yet verified — `fides-c2.exe` crashes during type
+checking of `stdlib/core.fd` (TypeChecker_lookup null deref — Category A
+blocker). Once that's fixed:
 
 ```bash
 # fides-c2 (self-compiled) compiles the compiler → fides-c3
@@ -316,43 +324,46 @@ Probe tests for self-hosting behavior:
 
 ```
 p-lang/
-├── compiler/           # Self-hosted Fides compiler modules (*.fd)
-│   ├── main.fd         # CLI entry point (ccompile + build commands)
-│   ├── compiler.fd     # Pipeline driver
-│   ├── token.fd
-│   ├── lexer.fd
-│   ├── ast.fd
-│   ├── parser.fd
-│   ├── typechecker.fd
-│   ├── lower.fd
-│   ├── ir.fd
-│   ├── pir.fd
-│   ├── opt.fd
-│   ├── mono.fd
-│   ├── borrowck.fd
-│   ├── codegen_c.fd
-│   ├── pe.fd           # PE emitter — native x86-64 + PE file writer (session 5, stubs session 7)
-│   ├── peephole.fd     # Peephole optimizer — 9 passes (session 8, not yet integrated)
-│   ├── regalloc.fd     # Linear scan register allocator (session 8, not yet integrated)
-│   ├── codegen_x64.fd  # PIR L3 → x86-64 AT&T asm, Linux (session 8, not yet integrated)
-│   ├── fmt.fd
-│   ├── diag.fd
-│   ├── json.fd
-│   └── comptime_eval.fd  # Comptime eval — full port (session 7)
-├── docs/selfhost/      # This documentation
-├── release/            # Self-hosted build artifacts (ignored by git, except .gitkeep)
-├── src/                # Rust reference compiler
-├── stdlib/             # Fides standard library (69 .fd modules)
-├── tests/              # Language tests
-├── tests/compiler/     # Self-host module tests
-├── tests/selfhost/     # Bootstrap probe tests
-├── target/             # Rust build artifacts
-├── verify.sh           # Full Rust compiler verification
-├── verify-selfhost.sh  # Self-host verification
-├── verify-fixpoint.ps1 # Bootstrap fixpoint (Windows)
+├── compiler/             # Self-hosted Fides compiler modules (25 .fd files, 57,021 LOC)
+│   ├── main.fd           # CLI entry point (ccompile + build + lsp + test + fmt + ...)
+│   ├── compiler.fd       # Pipeline driver
+│   ├── token.fd          # Token kinds (133 variants)
+│   ├── lexer.fd          # Tokenizer
+│   ├── ast.fd            # AST types + Box<T> unbox helpers
+│   ├── parser.fd         # Recursive-descent parser
+│   ├── typechecker.fd    # Type/effect/region/capability/safety checker
+│   ├── lower.fd          # AST → SSA IR lowering
+│   ├── ir.fd             # IR types, instructions, modules
+│   ├── pir.fd            # Multi-level PIR (L1→L2→L3)
+│   ├── opt.fd            # PIR L2 optimizer (20+ passes)
+│   ├── mono.fd           # Monomorphization
+│   ├── borrowck.fd       # Borrow checker
+│   ├── codegen_c.fd      # C99 code generator + runtime
+│   ├── pe.fd             # PE emitter — native x86-64 + PE file writer (session 5)
+│   ├── peephole.fd       # Peephole optimizer — 9 passes (session 8, not yet integrated)
+│   ├── regalloc.fd       # Linear scan register allocator (session 8, not yet integrated)
+│   ├── codegen_x64.fd    # PIR L3 → x86-64 AT&T asm, Linux (session 8, not yet integrated)
+│   ├── comptime_eval.fd  # Comptime eval — full port (session 7)
+│   ├── flat_ast.fd       # Flat AST serialization (session 9)
+│   ├── lsp.fd            # LSP server — JSON-RPC over stdio (session 9)
+│   ├── fmt.fd            # Source formatter
+│   ├── diag.fd           # Structured diagnostics
+│   ├── json.fd           # JSON parser/serializer
+│   └── inc.fd            # Incremental compilation cache
+├── docs/selfhost/        # This documentation (13 .md files)
+├── release/              # Self-hosted build artifacts (gitignored)
+├── src/                  # Rust reference compiler (52 .rs files, 84,447 LOC)
+├── stdlib/               # Fides standard library (69 .fd modules, 16,090 LOC)
+├── tests/                # Language tests (225+ .fd files)
+├── tests/compiler/       # Self-host module tests (23 .fd files)
+├── tests/selfhost/       # Bootstrap probe tests
+├── target/               # Rust build artifacts
+├── verify.sh             # Full Rust compiler verification
+├── verify-selfhost.sh    # Self-host verification
+├── verify-fixpoint.ps1   # Bootstrap fixpoint (Windows)
 ├── verify-stdout-diff.ps1
 ├── verify-stage-diff.ps1
-└── build-selfhost.ps1  # Build the self-hosted compiler (Windows)
+└── build-selfhost.ps1    # Build the self-hosted compiler (Windows)
 ```
 
 ---

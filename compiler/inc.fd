@@ -124,23 +124,43 @@ pub fn IncrementalCache_is_empty(self: &IncrementalCache) -> bool {
     return self.entries.len() == 0;
 }
 
-// ─── Global cache (stub — Fides doesn't support module-level var) ────────
-// Fides doesn't support module-level mutable state, so the global cache
-// is currently a no-op. The IncrementalCache struct above is available for
-// local use by callers that create an instance. When Fides adds module-level
-// var support, these stubs can be replaced with real global cache logic.
+// ─── Global cache (module-level var) ─────────────────────────────────────
+// Fides now supports module-level `var`/`pub var`, so the global cache
+// uses a module-level mutable variable to persist across calls within
+// a single process. This enables incremental compilation — on a cache
+// hit, parsing, typechecking, and IR lowering are all skipped.
+//
+// NOTE: The C backend emits struct-typed globals as zero-initialized
+// pointers (it can't call IncrementalCache_new() in a static initializer).
+// So we use lazy initialization: on first access, if the cache is empty,
+// we initialize it. This matches the Rust compiler's OnceLock approach.
 
-/// Store in the global cache. (Currently a no-op.)
+pub var g_cache: IncrementalCache = IncrementalCache_new();
+var g_cache_init: bool = false;
+
+/// Ensure the global cache is initialized (lazy init for C backend).
+fn ensure_cache_init() -> void {
+    if !g_cache_init {
+        g_cache = IncrementalCache_new();
+        g_cache_init = true;
+    }
+}
+
+/// Store an IrModule in the global cache.
 pub fn global_cache_store(source_path: str, source_hash: i64, module: IrModule) {
-    // No-op: module-level mutable state not supported in Fides yet.
+    ensure_cache_init();
+    IncrementalCache_store(&mut g_cache, source_path, source_hash, module);
 }
 
-/// Look up in the global cache. (Currently always returns None.)
+/// Look up a cached IrModule by source path + hash.
+/// Returns OptIrModule::Some(module) on hit, OptIrModule::None on miss.
 pub fn global_cache_get(source_path: str, source_hash: i64) -> OptIrModule {
-    return OptIrModule::None;
+    ensure_cache_init();
+    return IncrementalCache_get(&g_cache, source_path, source_hash);
 }
 
-/// Clear the global cache. (Currently a no-op.)
+/// Clear the global cache.
 pub fn global_cache_clear() {
-    // No-op.
+    ensure_cache_init();
+    IncrementalCache_clear(&mut g_cache);
 }

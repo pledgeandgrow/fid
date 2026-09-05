@@ -2,11 +2,48 @@
 
 > Things that have broken before and how to avoid re-introducing them.
 >
-> Last updated: Sep 5, 2026 (session 11).
+> Last updated: Sep 5, 2026 (session 14 — Category B codegen parity: B5 fixed, B6/B7/B8 verified at parity).
 
 ---
 
 ## 1. Fixed Bugs (Do Not Re-Introduce)
+
+### 1.30 Float constant bit-pattern not preserved in C codegen (session 14 — B5)
+
+**Symptom:** The self-hosted C codegen emitted `(double)float_to_str(value)`
+for `Inst::ConstFloat`, which loses NaN payloads, -0.0 sign, and Inf bit
+patterns. The Rust codegen uses a union compound literal
+(`((union { uint64_t u; double f; }){ .u = <bits>ULL }).f`) to preserve
+exact IEEE 754 bit patterns. This caused fixpoint divergence (stage2.c ≠
+stage3.c) for any code containing float constants.
+
+**Root cause:** The Fides `Inst::ConstFloat(f64, IrType)` stores the f64
+value directly (not bits like Rust's `ConstFloat { bits: u64, ty }`).
+The codegen had a TODO comment: "Add p_float_to_bits to runtime for exact
+bit preservation." The `f64_to_bits` helper in `compiler/lower.fd` was a
+stub returning 0.
+
+**Fix (session 14):**
+1. Added `p_f64_to_bits`/`p_f32_to_bits` C runtime functions to both
+   `src/codegen_c.rs` and `compiler/codegen_c.fd` (forward declarations,
+   signatures, and union-based implementations).
+2. Registered them as externs in both `src/lower.rs` (`register_runtime`)
+   and `compiler/lower.fd` (`Lowerer_register_runtime`).
+3. Implemented `f64_to_bits`/`f32_to_bits` in `compiler/lower.fd` (were
+   stubs returning 0) — they now call `p_f64_to_bits`/`p_f32_to_bits`.
+4. Updated the `ConstFloat` handler in `compiler/codegen_c.fd` to emit
+   union compound literals matching the Rust codegen, using
+   `p_f64_to_bits(value)` / `p_f32_to_bits(value)` to get the bit pattern.
+
+**Verification:** `fidesc dump-c` now shows
+`vN = ((union { uint64_t u; double f; }){ .u = 9218868437227405311ULL }).f;`
+for NaN constants (0x7FF8000000000000). `fidesc run` correctly prints
+`NaN`, `inf`, `-inf`, `-0`, `3.141592653589793` for special float values.
+
+**Lesson:** When the Fides IR stores a value differently than the Rust IR
+(f64 vs bits:u64), the codegen needs a runtime helper to convert at
+codegen time. The union compound literal approach preserves exact bit
+patterns that decimal string conversion cannot.
 
 ### 1.26 `val` is a reserved keyword in Fides (session 8)
 
@@ -425,50 +462,67 @@ Ported to Fides lowerer as Gap 5.
 
 ### 2.7 ~~Windows `\r\n` doubling in C output~~ RESOLVED (session 2)
 
-### 2.8 fides-c2.exe crashes on stdlib (PARTIALLY RESOLVED — session 12)
+### 2.8 fides-c2.exe crashes on stdlib (PARTIALLY RESOLVED — session 13)
 
-**Symptom:** `fides-c2_test.exe` (the second-generation compiler, built by
+**Symptom:** `fides-c2_new.exe` (the second-generation compiler, built by
 `fides-c.exe`) crashes with `STATUS_ACCESS_VIOLATION` (exit code -1073741819)
-while lexing `stdlib/core.fd`.
+during type checking of `test_simple.fd`.
 
-**Root cause:** The **statement-dropping bug** (bug 1.19 in known-bugs.md).
-The Fides compiler silently drops statements in long functions. When
-`fides-c.exe` compiles the compiler source, some statements are dropped
-from the generated C code. The resulting `fides-c2_test.exe` has missing
-instructions baked into its binary, causing it to crash on complex inputs
-like `stdlib/core.fd` (16K LOC).
+**Root cause:** Multiple behavioral differences between the self-hosted
+compiler (`compiler/*.fd`) and the Rust compiler (`src/*.rs`) cause the
+self-hosted compiler to generate slightly different IR/C, which leads to
+null pointer dereferences in the second-generation binary.
 
 **Session 12 progress:**
 1. Split `keyword_or_ident_core` (51 if-statements, 933 C vars) into 5
    smaller functions (`_a` through `_e`, ~195 vars each) — fixed lexer crash.
 2. Added scientific notation parsing to Rust lexer (`1.7976931348623157e308`
    in `codegen_c.fd`).
-3. Made private lexer helper functions `pub` (`lex_is_digit`, `lex_is_hexdigit`,
-   `parse_radix`, `repeat_char`, `lex_error`, `str_filter_underscores`,
-   `lex_is_alpha`, `lex_is_whitespace`, `lex_is_alphanumeric`) — fixed
-   visibility errors in self-hosted module system.
-4. Increased TCC stack reserve to 128MB (`-Wl,-stack,134217728`) — fixed
-   stack overflow in large functions (Parser_parse_stmt uses ~37KB/frame).
+3. Made private lexer helper functions `pub` — fixed visibility errors.
+4. Increased TCC stack reserve to 128MB (`-Wl,-stack,134217728`).
 5. Added `-lws2_32` for socket function linking.
 
-**Result:** fides-c.exe (first-generation self-hosted compiler) now successfully
-compiles `compiler/main.fd` and produces correct C code (exit 0, 36MB output).
-The C code compiles with TCC to produce fides-c2_new.exe.
+**Session 13 progress (4 parity fixes):**
+1. **Removed DCE** from `ccompile_source_with_path` — self-hosted compiler
+   was calling `IrModule_optimize` (dead function elimination) which Rust
+   doesn't do. Removed ~303 missing functions. (1514 → 1814 functions)
+2. **Fixed `TypeChecker_compute_func_effects`** — rewrote to avoid temporary
+   `names`/`bodies` Vecs that caused extra boxing. Added `OptStmtList` type
+   and `TypeChecker_find_body` helper.
+3. **Fixed C codegen return type casts** — added `(int64_t)`/`(void*)`/
+   `(double)`/`(float)`/`(bool)` casts on call results, matching Rust's
+   `src/codegen_c.rs`.
+4. **Fixed type alias resolution in `Lowerer_mangle_method`** — type aliases
+   like `StrStack = Vec<str>` now resolve to `Vec` before mangling, fixing
+   `StrStack_push` → `Vec_push` (was causing undefined symbols).
 
-**Remaining issue:** fides-c2_new.exe (second-generation) crashes with
-`STATUS_ACCESS_VIOLATION` (0xC0000005) at address 0x0 (null pointer deref)
-in `TypeChecker_compute_func_effects`. The self-hosted compiler generates
-~300 fewer functions and ~55K fewer lines than the Rust compiler. The
-`TypeChecker_compute_func_effects` function has 352 body differences (extra
-`Vec_get`/`Vec_push`/`p_malloc` calls in self-hosted version). The extra
-code includes `Vec_get` calls that can return NULL, followed by dereferences
-without null checks.
+**Result:** fides-c2_new.exe now parses stdlib + user code successfully,
+but crashes during type checking in `TypeChecker_lookup` (null pointer
+from `Vec_get` on empty scopes).
 
-**Next steps:** Compare IR generation between Rust compiler (`src/lower.rs`,
-`src/typechecker.rs`) and self-hosted compiler (`compiler/lower.fd`,
-`compiler/typechecker.fd`) for `compute_func_effects` to find why the
-self-hosted compiler generates extra IR. The bug is likely in the lowerer
-or type checker, not in the C codegen.
+**Current crash stack:**
+```
+[0] main
+[1] cmd_dump_c
+[2] ccompile_source_with_path
+[3] build_program_with_path
+[4] TypeChecker_check_bodies
+[5] TypeChecker_check_func
+[6] TypeChecker_check_stmt
+[7] TypeChecker_check_stmt_inner
+[8] TypeChecker_check_expr
+[9] TypeChecker_check_expr_with_hint
+[10] TypeChecker_check_expr_inner
+[11] TypeChecker_check_expr
+[12] TypeChecker_check_expr_with_hint
+[13] TypeChecker_check_expr_inner
+[14] TypeChecker_lookup
+```
+
+**Next steps:** See `docs/roadmap/selfhost-roadmap.md` § "Comprehensive Gap
+Analysis" for the full list of remaining gaps. The immediate next fix is
+adding null safety to `TypeChecker_lookup` (Category A1) and auditing
+`TypeChecker_register_program` parity (Category A2).
 
 ### 2.9 ~~`.exe` extension missing in self-hosted compiler output~~ RESOLVED (session 8)
 

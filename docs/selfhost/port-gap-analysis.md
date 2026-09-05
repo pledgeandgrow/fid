@@ -3,7 +3,9 @@
 > Systematic comparison of every ported module's Rust source vs Fides port.
 > Identifies incomplete ports — functionality present in Rust but missing in Fides.
 >
-> Last updated: Sep 5, 2026 (session 11 — post Tier 1-3 porting + var feature + full static analysis).
+> Last updated: Sep 5, 2026 (session 14 — Category B codegen parity resolved).
+> Line counts are current as of session 14. Source line numbers in detailed
+> sections below may be from session 11 and are approximate.
 
 ---
 
@@ -11,38 +13,38 @@
 
 | Module | Rust LOC | Fides LOC | LOC Ratio | Completion | Status |
 |--------|----------|-----------|-----------|------------|--------|
-| main | 2787 | 1292 | 0.46 | **60%** | PARTIAL — global flags added, ~10 more commands ported |
-| pe | 5704 | 3822 | 0.67 | **75%** | PARTIAL — Tier 1 bugs fixed, string runtime + vec/map helpers ported |
-| typechecker | 7150 | 5230 | 0.73 | **70%** | PARTIAL — resolve_type recursion, generics, compute_func_effects done |
-| lower | 6422 | 5791 | 0.90 | **95%** | OK — typed captures, pattern_binding_ast_types, SRET, swizzle fixed |
-| opt | 7515 | 7129 | 0.95 | **95%** | OK — dominator infra, devirt, GVN/alias_analysis upgraded |
-| compiler | 2141 | 1817 | 0.85 | **90%** | OK — pipeline orchestration complete |
-| inc | 146 | 145 | 0.99 | **80%** | PARTIAL — global_cache_* are no-ops (fixable with var feature) |
-| codegen_x64 | 1923 | 1780 | 0.93 | **90%** | OK — not yet integrated |
-| fmt | 1068 | 1007 | 0.94 | **95%** | OK |
-| regalloc | 1096 | 1086 | 0.99 | **98%** | OK |
-| peephole | 903 | 985 | 1.09 | **98%** | OK |
-| lsp | 916 | 995 | 1.09 | **95%** | OK |
-| codegen_c | 4550 | 4975 | 1.09 | **95%** | OK |
-| ast | 894 | 1012 | 1.13 | **98%** | OK |
-| pir | 2036 | 2434 | 1.20 | **95%** | OK |
-| comptime_eval | 1299 | 1559 | 1.20 | **90%** | OK |
-| lexer | 554 | 791 | 1.43 | **90%** | PARTIAL — duplicate str_filter_underscores stub |
-| ir | 1613 | 2267 | 1.41 | **98%** | OK |
-| diag | 412 | 594 | 1.44 | **98%** | OK |
-| parser | 3246 | 5076 | 1.56 | **85%** | PARTIAL — box_expr_deref out-of-sync, missing returns, duplicate vars |
-| borrowck | 1158 | 1830 | 1.58 | **95%** | OK |
-| flat_ast | 741 | 1234 | 1.67 | **95%** | OK |
-| mono | 1421 | 2568 | 1.81 | **90%** | PARTIAL — subst_gat_type_args bug, crude infer_expr_type |
-| token | 250 | 517 | 2.07 | **100%** | OK |
-| json | 273 | 628 | 2.30 | **100%** | OK |
+| main | 2,787 | 1,388 | 0.50 | **60%** | PARTIAL — global flags added, ~10 more commands ported |
+| pe | 6,345 | 4,845 | 0.76 | **75%** | PARTIAL — Tier 1 bugs fixed, string runtime + vec/map helpers ported |
+| typechecker | 7,163 | 5,521 | 0.77 | **70%** | PARTIAL — resolve_type recursion, generics, compute_func_effects done |
+| lower | 6,460 | 6,420 | 0.99 | **95%** | OK — B5 float bits fixed, recursive generic arg resolution (session 14) |
+| opt | 7,517 | 7,695 | 1.02 | **95%** | OK — dominator infra, devirt, GVN/alias_analysis upgraded |
+| compiler | 2,141 | 1,994 | 0.93 | **90%** | OK — pipeline orchestration complete |
+| inc | 146 | 146 | 1.00 | **80%** | PARTIAL — global_cache_* are no-ops (fixable with var feature) |
+| codegen_x64 | 1,940 | 1,942 | 1.00 | **90%** | OK — not yet integrated |
+| fmt | 1,068 | 1,109 | 1.04 | **95%** | OK |
+| regalloc | 1,088 | 1,181 | 1.09 | **98%** | OK |
+| peephole | 903 | 1,064 | 1.18 | **98%** | OK |
+| lsp | 916 | 1,082 | 1.18 | **95%** | OK |
+| codegen_c | 4,632 | 5,204 | 1.12 | **95%** | OK — B5 float bits + union literals (session 14) |
+| ast | 904 | 1,144 | 1.27 | **98%** | OK — Box<T> unbox helpers centralized (session 9) |
+| pir | 2,049 | 2,704 | 1.32 | **95%** | OK |
+| comptime_eval | 1,299 | 1,615 | 1.24 | **90%** | OK |
+| lexer | 582 | 832 | 1.43 | **90%** | PARTIAL — duplicate str_filter_underscores stub |
+| ir | 1,626 | 2,524 | 1.55 | **98%** | OK |
+| diag | 412 | 659 | 1.60 | **98%** | OK |
+| parser | 3,275 | 5,145 | 1.57 | **85%** | PARTIAL — box_expr_deref out-of-sync, missing returns, duplicate vars |
+| borrowck | 1,158 | 1,830 | 1.58 | **95%** | OK |
+| flat_ast | 741 | 1,259 | 1.70 | **95%** | OK |
+| mono | 1,422 | 2,569 | 1.81 | **90%** | PARTIAL — subst_gat_type_args bug, crude infer_expr_type |
+| token | 250 | 554 | 2.22 | **100%** | OK |
+| json | 273 | 666 | 2.44 | **100%** | OK |
 
 **Legend:** OK = no significant gaps. PARTIAL = some features missing but functional.
 MAJOR GAPS = significant functionality missing, may affect correctness.
 
-**Overall self-host port completion: ~82%** (weighted by importance; down from 85%
-due to session 11 static analysis revealing previously-undocumented bugs in
-parser.fd, lexer.fd, mono.fd, and inc.fd)
+**Overall self-host port completion: ~85%** (weighted by importance; up from
+~82% in session 11 due to session 14 Category B codegen parity fixes in
+lower.fd and codegen_c.fd).
 
 ---
 

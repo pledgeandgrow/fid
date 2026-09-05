@@ -1,6 +1,16 @@
 # Fides Self-Hosted Compiler — Architecture
 
 > File-by-file breakdown of the self-hosted compiler modules in `compiler/`.
+>
+> **Last updated:** Sep 5, 2026 (session 14 — Category B codegen parity resolved)
+>
+> **Note on line numbers:** Source line numbers in "Known issues (session 11
+> analysis)" sections were accurate as of session 11 but may have shifted in
+> sessions 12–14. Treat them as approximate guides, not exact references.
+> Re-verify with `grep` before editing based on these numbers.
+>
+> **Module count:** 25 `.fd` files in `compiler/` (57,021 LOC total).
+> The "18 modules" count in older session notes is obsolete.
 
 ## The Pipeline (Simplified)
 
@@ -15,13 +25,16 @@ main.fd
   │    ├─ lower.fd ──► ir.fd
   │    ├─ mono.fd ──► ast.fd
   │    ├─ pir.fd / opt.fd ──► ir.fd
+  │    ├─ inc.fd ──► ir.fd (incremental compilation cache)
   │    ├─ codegen_c.fd ──► ir.fd  ──► C source ──► tcc ──► .exe
   │    ├─ pe.fd ──► ir.fd  ──► x86-64 machine code + PE file ──► .exe (no tcc!)
   │    └─ [Linux backend — ported but NOT yet integrated]
   │         ├─ peephole.fd ──► L3Module (9 optimization passes)
   │         ├─ regalloc.fd ──► L3Module (linear scan register allocator)
   │         └─ codegen_x64.fd ──► L3Module ──► x86-64 AT&T asm ──► ELF64 (future)
-  └─ lsp.fd ──► compiler.fd (get_diagnostics) + json.fd ──► JSON-RPC over stdio
+  ├─ lsp.fd ──► compiler.fd (get_diagnostics) + json.fd ──► JSON-RPC over stdio
+  ├─ fmt.fd ──► source formatter
+  └─ diag.fd ──► structured diagnostics
 ```
 
 `compiler.fd` is the central hub. `ast.fd`, `ir.fd`, and `token.fd` are the
@@ -332,22 +345,32 @@ Fides has no `Option` combinators.
 ### Currently known issue
 
 Enum variant extraction for struct-typed payloads uses a plain `Inst::Load`,
-which only copies 8 bytes. This truncates the payload. The Rust lowerer has
-`load_enum_field()` (buffer + `Store` which emits `memcpy`) to fix this. The
-Fides lowerer needs the same.
+which only copies 8 bytes. Under the pointer-based enum payload approach
+(COORDINATION.md [D1]), this is correct — each payload slot is an 8-byte
+pointer. The old `load_enum_field()` workaround is no longer needed.
 
-### Known issues (session 11 analysis)
+### Session 14 changes (Category B)
 
-- **`f64_to_bits` always returns 0** — line 6005: stub function, breaks
-  float bitcast operations. **P1.**
-- **`lower_type` narrows I128/U128 to I64/U64** — lines 1767, 1772, 1833,
-  1838: 128-bit integers silently truncated to 64-bit. **P1.**
-- **`runtime_effects` is a hardcoded whitelist** — lines 358-446: any `p_*`
-  function not in the list returns `None` and is treated as pure, risking the
-  optimizer deleting side-effecting calls. **P1.**
-- **`Lowerer_infer_expr_ast_type` falls back to I64** — line 6155: simplified
-  inference returns `Type::I64` for most expression forms, making closure
-  return type inference unreliable. **P2.**
+- **`f64_to_bits` / `f32_to_bits` implemented** — were stubs returning 0;
+  now call `p_f64_to_bits` / `p_f32_to_bits` runtime functions. Used by
+  `ConstFloat` codegen to preserve NaN/Inf/-0.0 bit patterns.
+- **`Lowerer_resolve_type` recursively resolves generic type arguments** —
+  `Type::Generic(name, args)` now resolves each arg via `Lowerer_resolve_type`
+  before returning. This fixes nested generic type alias expansion.
+- **`p_f64_to_bits` / `p_f32_to_bits` externs registered** in
+  `Lowerer_register_runtime`.
+
+### Known issues (session 11 analysis — line numbers approximate)
+
+- **~~`f64_to_bits` always returns 0~~** — **FIXED (session 14)**.
+- **`lower_type` narrows I128/U128 to I64/U64** — 128-bit integers silently
+  truncated to 64-bit. **P1.**
+- **`runtime_effects` is a hardcoded whitelist** — any `p_*` function not in
+  the list returns `None` and is treated as pure, risking the optimizer
+  deleting side-effecting calls. **P1.**
+- **`Lowerer_infer_expr_ast_type` falls back to I64** — simplified inference
+  returns `Type::I64` for most expression forms, making closure return type
+  inference unreliable. **P2.**
 - **`box_expr_unbox` enumerates out-of-sync variants** — references
   `Lambda`, `Throw`, `TryUnwrap`, `Assign`, `CompoundAssign`, `ConstExpr`,
   `ComptimeGen`, `QuantCast`, `Await`, `Spawn` which do not exist in
@@ -373,15 +396,24 @@ Fides lowerer needs the same.
 - Cast pointer args to `void*` / `int64_t` as needed.
 - Sanitize Fides function names that collide with C keywords.
 
-### Known issues (session 11 analysis)
+### Session 14 changes (Category B)
 
-- **`DynCall` not implemented** — line 2523: emits only a comment
+- **`ConstFloat` now preserves exact bit patterns** — emits union compound
+  literals (`((union { uint64_t u; double f; }){ .u = <bits>ULL }).f`) instead
+  of decimal casts. NaN/Inf/-0.0 are now bit-exact. Added `p_f64_to_bits` and
+  `p_f32_to_bits` C runtime functions (decls + implementations).
+- **Polymorphic print/println dispatch verified at parity** with Rust codegen
+  (Vec/HashMap/Tensor/F64/Bool/Ptr/Generic/any/default cases all match).
+
+### Known issues (session 11 analysis — line numbers approximate)
+
+- **`DynCall` not implemented** — emits only a comment
   `// DynCall not implemented in C backend`, leaving the destination variable
-  uninitialized. **P1.**
-- **`TryUnwrap` not implemented** — line 2555: emits only a comment, same
-  issue. **P1.**
-- **`ConstFloat` TODO** — line 1948: casts through `(float)`/`(double)`
-  instead of exact bit preservation. Needs `p_float_to_bits` runtime helper.
+  uninitialized. **P1.** (Category B2)
+- **`TryUnwrap` not implemented** — emits only a comment, same
+  issue. **P1.** (Category B2)
+- **~~`ConstFloat` TODO~~** — **FIXED (session 14)**. Now uses union compound
+  literals with `p_f64_to_bits`/`p_f32_to_bits` for exact bit preservation.
 
 ---
 
@@ -399,7 +431,7 @@ Fides lowerer needs the same.
   `PeCodeGen_emit_entry_point()`, `PeCodeGen_write_pe_file()`
 - **Imports:** `core`, `vec`, `string`, `compiler::ast`, `compiler::ir`
 - **Imported by:** `main.fd` (via `build` command)
-- **Ported from:** `src/pe.rs` (5704 lines Rust → ~2600 lines Fides, session 5)
+- **Ported from:** `src/pe.rs` (6,345 lines Rust → 4,845 lines Fides, session 5)
 
 ### Key responsibilities
 
@@ -417,7 +449,7 @@ Fides lowerer needs the same.
 - Label resolution: function labels, jump labels (for control flow),
   call targets resolved via rip-relative addressing.
 
-### Current capabilities (session 7)
+### Current capabilities (session 14)
 
 | Feature | Status |
 |---------|--------|
@@ -477,7 +509,7 @@ Fides lowerer needs the same.
   constant folding, branch folding, lea-to-add, strength reduction, address
   mode folding, jump threading
 - **Imports:** `core`, `vec`, `compiler::pir` (for L3 types)
-- **Ported from:** `src/peephole.rs` (903 lines Rust → 985 lines Fides, session 8)
+- **Ported from:** `src/peephole.rs` (903 lines Rust → 1,064 lines Fides, session 8)
 - **Status:** Builds OK with bootstrap compiler. NOT yet wired into
   `compiler.fd`/`main.fd`. Integration requires the full Linux backend
   (`elf64.fd`, `linker.fd`, `runtime_linux.fd`).
@@ -495,7 +527,7 @@ Fides lowerer needs the same.
 - **Key functions:** `allocate_module()`, `allocate_function()`,
   `linear_scan()`, `spill()`, `rematerialize()`
 - **Imports:** `core`, `vec`, `compiler::pir` (for L3 types)
-- **Ported from:** `src/regalloc.rs` (1096 lines Rust → 1086 lines Fides, session 8)
+- **Ported from:** `src/regalloc.rs` (1,088 lines Rust → 1,181 lines Fides, session 8)
 - **Status:** Builds OK with bootstrap compiler. NOT yet wired into
   `compiler.fd`/`main.fd`.
 - **Note:** `val` is a reserved keyword in Fides — all `val` variables in the
@@ -516,7 +548,7 @@ Fides lowerer needs the same.
   `X64CodeGen_gen_call_abi()`, `X64CodeGen_gen_call_ptr()`,
   `X64CodeGen_gen_load()`, `X64CodeGen_gen_store()`
 - **Imports:** `core`, `vec`, `string`, `compiler::pir`, `compiler::regalloc`
-- **Ported from:** `src/codegen_x64.rs` (1923 lines Rust → 1780 lines Fides, session 8)
+- **Ported from:** `src/codegen_x64.rs` (1,940 lines Rust → 1,942 lines Fides, session 8)
 - **Status:** Builds OK with bootstrap compiler. NOT yet wired into
   `compiler.fd`/`main.fd`. Integration requires `elf64.fd` (object file
   emitter) + `linker.fd` + `runtime_linux.fd`.
@@ -540,7 +572,7 @@ Fides lowerer needs the same.
   `send_response()`, `send_error()`
 - **Imports:** `core`, `vec`, `string`, `compiler::ast`, `compiler::json`,
   `compiler::compiler`
-- **Ported from:** `src/lsp.rs` (996 lines Rust → 1084 lines Fides, session 9)
+- **Ported from:** `src/lsp.rs` (916 lines Rust → 1,082 lines Fides, session 9)
 - **Runtime dependencies (added to `codegen_c.fd`):** `p_read_line`,
   `p_read_stdin(n)`, `p_stdin_eof`, `p_flush_stdout`
 - **Status:** Module parses correctly in isolation. `lsp` command wired into
@@ -697,8 +729,8 @@ Fides lowerer needs the same.
     string concat, f-strings, identifiers, comptime functions)
   - `evaluate_reflect()` — reflection: `TypeName`, `IsStruct`, `IsEnum`,
     `FieldCount`, `FieldNames`, `FieldTypes`, `EnumVariants`
-  - `box_expr_unbox()` / `box_expr_new()` — boxing helpers (local to this
-    module)
+  - `box_expr_unbox()` / `box_expr_new()` — boxing helpers (`box_expr_unbox`
+    is centralized in `ast.fd` per [D10]; `box_expr_new` is local)
 - **ComptimeEnv:** Uses parallel Vecs (no HashMap at compile time)
 - **I-5A:** Auto-evaluates calls to `comptime fn` functions when all
   arguments are literals (no explicit `comptime` wrapper needed)
@@ -744,7 +776,7 @@ Fides lowerer needs the same.
   `Box<Pattern>` fields for recursive calls (Fides has no `*` deref for `Box<T>`)
 - **Imports:** `core`, `vec`, `string`, `compiler::ast`
 - **Imported by:** Not yet integrated into `compiler.fd` (standalone module)
-- **Ported from:** `src/flat_ast.rs` (755 LOC Rust → 1260 LOC Fides)
+- **Ported from:** `src/flat_ast.rs` (741 LOC Rust → 1,259 LOC Fides)
 
 ---
 

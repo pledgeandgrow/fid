@@ -3,7 +3,302 @@
 > **Goal:** The Fides compiler compiles itself, producing identical output
 > across generations (bootstrap fixpoint).
 >
-> **Last updated:** Sep 4, 2026 (session 9)
+> **Last updated:** Sep 5, 2026 (session 14 — Category B codegen parity: B5 fixed, B6/B7/B8 verified at parity)
+
+---
+
+## Current State (Sep 9, 2026 — Session 13)
+
+### Where we are now
+
+```
+✅ fides-c.exe (first-generation) — builds, runs, produces correct C (exit 0, ~39MB)
+✅ fides-c2.c compiles with TCC — no undefined symbols, 1815 functions
+✅ fides-c2_new.exe (second-generation) — parses stdlib + user code
+⬜ fides-c2_new.exe — crashes during type checking (TypeChecker_lookup null deref)
+⬜ Fixpoint — NOT YET ACHIEVED
+```
+
+### Session 13 progress (this session)
+
+Four parity fixes were applied to bring the self-hosted compiler closer to
+the Rust compiler's behavior:
+
+1. **Removed DCE from self-hosted `ccompile_source_with_path`** — The
+   self-hosted compiler called `IrModule_optimize` (dead function elimination)
+   which the Rust compiler doesn't do. This was removing ~303 functions.
+   **Result:** 1514 → 1814 functions (matching Rust's 1813).
+
+2. **Fixed `TypeChecker_compute_func_effects`** — The self-hosted version
+   built temporary `names`/`bodies` Vecs causing extra `p_malloc`/`memcpy`
+   for boxing `Vec<Stmt>`. Rewrote to iterate directly, matching Rust.
+   Added `OptStmtList` type and `TypeChecker_find_body` helper.
+
+3. **Fixed C codegen return type casts** — The self-hosted C codegen didn't
+   add return type casts (`(int64_t)`, `(void*)`, `(double)`, etc.) on
+   function call results. Added matching Rust's `src/codegen_c.rs` behavior.
+
+4. **Fixed type alias resolution in `Lowerer_mangle_method`** — Type aliases
+   like `StrStack = Vec<str>` weren't being resolved to `Vec` before mangling
+   method names, causing `StrStack_push` instead of `Vec_push` (undefined
+   symbols). Added builtin collection name checks after
+   `Lowerer_resolve_type_alias_name`.
+
+**Current crash:** `fides-c2_new.exe` crashes in `TypeChecker_lookup` during
+type checking of `test_simple.fd`. The crash is a null pointer dereference
+from `Vec_get` returning NULL (empty Vec) and being dereferenced without a
+null check. This is the same class of bug as the previous
+`TypeChecker_compute_func_effects` crash — the self-hosted compiler generates
+slightly different IR than the Rust compiler, and the difference causes a
+null pointer path.
+
+---
+
+## Comprehensive Gap Analysis: Rust vs Self-Hosted Compiler
+
+> Full audit of what the Rust compiler (`src/*.rs`) has that the self-hosted
+> compiler (`compiler/*.fd`) is missing or has different. Organized by
+> priority for achieving fixpoint.
+
+### Category A: Immediate Crash Blockers (MUST FIX for fixpoint)
+
+These are behavioral differences that cause the second-generation compiler
+to crash. Each one moves the crash further along the pipeline.
+
+| # | Gap | Rust file | Fides file | Impact |
+|---|-----|-----------|------------|--------|
+| A1 | **TypeChecker scope lookup null safety** — `Vec_get` on empty scopes returns NULL, dereferenced without check | `src/typechecker.rs:1707` | `compiler/typechecker.fd:1707` | Current crash |
+| A2 | **TypeChecker_register_program missing fields** — Rust registers `item_modules`, `item_visibility`, `field_visibility`, `linear_structs`, `send_structs`, `sync_structs`; Fides may miss some | `src/typechecker.rs:661` | `compiler/typechecker.fd` | Missing type info → wrong lookups |
+| A3 | **TypeChecker `check` return type** — Rust returns `Result<(), Vec<String>>` (errors collected); Fides returns `bool` (errors lost) | `src/typechecker.rs:232` | `compiler/typechecker.fd:819` | Silent error swallowing |
+| A4 | **Statement-dropping bug** — Fides compiler silently drops statements in long functions (known bug 1.19). Still latent in generated C. | N/A (Rust doesn't have this) | All `compiler/*.fd` | Missing instructions in fides-c2 |
+| A5 | **Type alias cross-module visibility** — Type aliases from imported modules may not be fully visible in all lookup contexts | `src/compiler.rs:1390` | `compiler/compiler.fd:1212` | Wrong method mangling |
+
+### Category B: Code Generation Parity Gaps (MUST FIX for fixpoint)
+
+These cause the self-hosted compiler to generate different C than the Rust
+compiler. Even if the C is semantically equivalent, differences prevent
+fixpoint (stage2.c ≠ stage3.c).
+
+| # | Gap | Rust file | Fides file | Impact | Status |
+|---|-----|-----------|------------|--------|--------|
+| B1 | **`generate_c` entry point missing** — Rust has a top-level `generate_c` function; Fides only has `CCodeGen_generate` | `src/codegen_c.rs:4702` | `compiler/codegen_c.fd:2697` | Different call path | Open |
+| B2 | **DynCall/TryUnwrap stubs** — C codegen emits comments instead of code | `src/codegen_c.rs` | `compiler/codegen_c.fd:2591,2623` | Not used by compiler source, but stubs differ | Open |
+| B3 | **Allocator builtins stubs** — Simplified stubs vs full implementations | `src/codegen_c.rs` | `compiler/codegen_c.fd:3608` | Different runtime behavior | Open |
+| B4 | **Bare-metal builtins stubs** — Stubbed in Fides | `src/codegen_c.rs` | `compiler/codegen_c.fd:3928` | Not used by compiler source | Open |
+| B5 | **Float constant bit-pattern** — Fides emits `(double)str` not union literal (Gap 12 from Phase 1b) | `src/codegen_c.rs:1904` | `compiler/codegen_c.fd:1904` | NaN/Inf/−0.0 not preserved | **FIXED (session 14)** |
+| B6 | **Polymorphic print/println dispatch** — Fides missing special cases for Vec/HashMap/f64/bool (Gap 10) | `src/codegen_c.rs:1643` | `compiler/codegen_c.fd:2102` | Fixpoint divergence | **AT PARITY** (already implemented) |
+| B7 | **Missing runtime sigs** — `p_malloc_persistent`, `p_arena_save`, `p_arena_restore` not registered (Gap 11) | `src/codegen_c.rs:594` | `compiler/codegen_c.fd:594` | Wrong calling convention | **AT PARITY** (already registered) |
+| B8 | **Vec method return type `word_repr`** — Self-hosted lowerer's type inference function returns `elem_ty` not `word_repr(elem_ty)` for Vec::get/pop/first/last/remove in the Generic branch | `src/lower.rs:4076` | `compiler/lower.fd:5837` | Missing Ptr(Struct) cast → wrong C type | **AT PARITY** (already fixed in lower_method_call; infer_expr_type matches Rust by design) |
+| B9 | **Async/await lowering** — Rust has 6 async + 5 await references; Fides has minimal support | `src/lower.rs` | `compiler/lower.fd` | Not used by compiler source | Open |
+| B10 | **Closure lowering** — Rust has 12 closure references; Fides has 7 | `src/lower.rs` | `compiler/lower.fd` | Not used by compiler source | Open |
+
+**Session 14 — Category B parity work (Sep 5, 2026):**
+
+- **B5 FIXED:** Added `p_f64_to_bits`/`p_f32_to_bits` C runtime functions to
+  both `src/codegen_c.rs` and `compiler/codegen_c.fd` (forward declarations,
+  signatures, and implementations). Registered them as externs in both
+  `src/lower.rs` and `compiler/lower.fd`. Updated the `ConstFloat` handler in
+  `compiler/codegen_c.fd` to emit union compound literals
+  (`((union { uint64_t u; double f; }){ .u = <bits>ULL }).f`) matching the
+  Rust codegen, instead of `(double)float_to_str(value)`. This preserves NaN
+  payloads, -0.0, and Inf bit patterns. Implemented `f64_to_bits`/`f32_to_bits`
+  helpers in `compiler/lower.fd` (were stubs returning 0). Verified: NaN
+  (0x7FF8000000000000) is now correctly preserved in generated C.
+
+- **B6 AT PARITY:** Verified via side-by-side comparison that
+  `compiler/codegen_c.fd` handles all the same type dispatch cases as
+  `src/codegen_c.rs` for `print` and `println`: Vec (Vec_to_str), HashMap
+  (p_to_str_map), Tensor (p_tensor_to_str), F64 (p_print_float), Bool
+  (p_print_bool), Ptr/Opaque (p_print_str), Generic (p_print_int), any
+  (p_print_int), default (p_print_int). No changes needed.
+
+- **B7 AT PARITY:** Verified that `p_malloc_persistent`, `p_arena_save`, and
+  `p_arena_restore` are registered in `compiler/codegen_c.fd` with matching
+  parameter types. No changes needed.
+
+- **B8 AT PARITY:** Verified that `compiler/lower.fd`'s
+  `Lowerer_lower_method_call` uses `word_repr(vec_elem_ty)` for
+  get/pop/first/last/remove (matching Rust's `lower_method_call`). The
+  `infer_expr_type` path returns raw `elem_ty` (not `word_repr`) in both
+  compilers — this is intentional parity, not a gap. No changes needed.
+
+### Category C: Pipeline Feature Gaps (NICE TO HAVE, not needed for fixpoint)
+
+These are features the Rust compiler has that the self-hosted compiler
+doesn't. They are NOT needed for self-hosting because the compiler source
+doesn't use them, but they limit the self-hosted compiler's capabilities.
+
+| # | Gap | Rust file | Fides file | Impact |
+|---|-----|-----------|------------|--------|
+| C1 | **Interpretation** — `interpret_source*` functions (14 variants) | `src/compiler.rs:1283-1470` | Missing | No `run` command in self-hosted |
+| C2 | **Native build** — `build_source`, `build_source_with_path`, `build_executable*` | `src/compiler.rs:1486-1567` | Partial (PE only) | Limited `build` command |
+| C3 | **WASM compilation** — `compile_to_wasm` | `src/compiler.rs:1548` | Missing | No WASM target |
+| C4 | **Bare-metal emission** — `emit_bare`, `emit_boot` | `src/compiler.rs:1712,1738` | Missing | No bare-metal target |
+| C5 | **LSP program building** — `build_program_for_lsp` | `src/compiler.rs:1198` | Missing | LSP uses different path |
+| C6 | **Linting** — `lint_source` | `src/compiler.rs:1299` | Missing | No `lint` command |
+| C7 | **Flat binary / boot binary** — `generate_flat_binary`, `generate_boot_binary` | `src/pe.rs:6940,6986` | Missing | No flat/boot PE output |
+| C8 | **Borrowck mode control** — `set_mode`/`get_mode` | `src/borrowck.rs:32,37` | Missing | `--borrowck` flag not wired |
+| C9 | **Full `compile` entry point** — Unified compile function | `src/compiler.rs:1096` | Missing | Self-hosted uses `ccompile_source_with_path` only |
+
+### Category D: Safety/Effect Verification Gaps (NOT needed for fixpoint)
+
+The Rust compiler has 12+ `verify_*` functions for capability annotations
+(`@differentiable`, `@quantized`, `@checkpoint`, `@dp`, `@shard`, `@adapter`,
+`@conserve`, `@gas`, `@constant_time`, `@realtime`, `@tainted`, contracts).
+The self-hosted compiler has permissive stubs for all of these. This is fine
+for self-hosting — the compiler source doesn't use these annotations.
+
+| # | Gap | Status |
+|---|-----|--------|
+| D1 | `verify_differentiable` | Stubbed (permissive) |
+| D2 | `verify_quantized` | Stubbed |
+| D3 | `verify_checkpoint` | Stubbed |
+| D4 | `verify_dp` | Stubbed |
+| D5 | `verify_shard` | Stubbed |
+| D6 | `verify_adapter` | Stubbed |
+| D7 | `verify_conserve` | Stubbed |
+| D8 | `verify_gas` | Stubbed |
+| D9 | `verify_constant_time` | Stubbed |
+| D10 | `verify_realtime` | Stubbed |
+| D11 | `verify_tainted` | Stubbed |
+| D12 | `verify_contracts` (given/ensure) | Stubbed |
+| D13 | `cap_verified_functions` | Missing |
+| D14 | `register_generated_decls` | Missing |
+| D15 | `get_linear_structs`/`get_funcs`/`get_structs`/etc. | Missing (getter methods) |
+
+### Category E: Fixpoint Stability Risks (MUST VERIFY after crashes stop)
+
+Even after all crashes are fixed, the fixpoint may not be stable due to
+non-determinism. These issues cause stage2.c ≠ stage3.c.
+
+| # | Risk | Cause | Fix |
+|---|------|-------|-----|
+| E1 | **HashMap iteration order** | HashMap uses hash function with random seed | Sort keys before output |
+| E2 | **Uninitialized memory** | Allocas not zero-initialized | Zero-initialize all allocas |
+| E3 | **Pointer addresses in output** | Different addresses each run | Don't print pointers |
+| E4 | **Float formatting** | Platform-dependent printf | Use deterministic formatting |
+| E5 | **Statement dropping** | Long functions lose statements | Split long functions or fix the bug |
+| E6 | **Debug prints** | 38 `p_eprint_str` calls | Gate behind debug flag |
+| E7 | **Enum `==` comparison** | Compares pointers not tags | Use `*_eq()` helpers (already done in compiler source) |
+
+### Category F: Language Features Missing from Fides (NOT needed for fixpoint)
+
+These are language features that exist in the Rust compiler's Fides
+implementation but are incomplete in the Fides self-hosted compiler. They
+don't block fixpoint because the compiler source doesn't use them.
+
+| # | Feature | Status | Needed for? |
+|---|---------|--------|-------------|
+| F1 | **Async/await** | Minimal lowering | Not used by compiler source |
+| F2 | **Closures** | Thinner support | Not used by compiler source (0 closures) |
+| F3 | **Traits/associated types** | Less complete (11 vs 20 refs) | Limited use in compiler source |
+| F4 | **DynCall** | C backend stub | Not used by compiler source |
+| F5 | **TryUnwrap** | C backend stub | Not used by compiler source |
+| F6 | **Module-level `var`/`pub var`** | Rust-only (not mirrored to .fd) | Would help with `--borrowck` wiring |
+| F7 | **f-strings** | May be incomplete in self-hosted lexer | Used in compiler source — verify |
+| F8 | **Raw strings** | May be incomplete in self-hosted lexer | Not used by compiler source |
+
+---
+
+## Goals to Achieve Fixpoint
+
+### Phase 5: Fix remaining crash blockers (CURRENT)
+
+**Goal:** `fides-c2_new.exe dump-c test_simple.fd` exits 0.
+
+| Goal | Description | Priority | Effort |
+|------|-------------|----------|--------|
+| G5.1 | Fix TypeChecker_lookup null safety — add null checks after Vec_get | CRITICAL | Small |
+| G5.2 | Audit TypeChecker_register_program parity — ensure all fields registered | CRITICAL | Medium |
+| G5.3 | Fix TypeChecker `check` return type — collect errors like Rust | HIGH | Medium |
+| G5.4 | Fix statement-dropping bug (root cause) — investigate lowerer/codegen | HIGH | Large |
+| G5.5 | Verify type alias visibility across all lookup contexts | HIGH | Small |
+| G5.6 | Compare generated C function-by-function for remaining differences | ONGOING | Medium |
+
+### Phase 6: Code generation parity
+
+**Goal:** `fides-c2.c` is byte-identical to `fides-c.c` (after normalization).
+
+| Goal | Description | Priority | Effort | Status |
+|------|-------------|----------|--------|--------|
+| G6.1 | Fix Vec method return type `word_repr` in lowerer type inference | HIGH | Small | **DONE** (session 14 — at parity) |
+| G6.2 | Fix float constant bit-pattern (Gap 12) — use union literal | MEDIUM | Small | **DONE** (session 14 — B5 fixed) |
+| G6.3 | Fix polymorphic print/println dispatch (Gap 10) | MEDIUM | Medium | **DONE** (session 14 — at parity) |
+| G6.4 | Register missing runtime sigs (Gap 11) | MEDIUM | Small | **DONE** (session 14 — at parity) |
+| G6.5 | Add `generate_c` entry point matching Rust | LOW | Small | Open |
+| G6.6 | Implement DynCall/TryUnwrap in C codegen | LOW | Medium | Open |
+| G6.7 | Implement allocator/bare-metal builtins | LOW | Medium | Open |
+
+### Phase 7: Fixpoint verification
+
+**Goal:** `diff release/fides-c2.c release/fides-c3.c` is empty.
+
+| Goal | Description | Priority | Effort |
+|------|-------------|----------|--------|
+| G7.1 | Gate debug prints behind flag | HIGH | Small |
+| G7.2 | Sort HashMap keys before output | HIGH | Medium |
+| G7.3 | Zero-initialize all allocas | HIGH | Small |
+| G7.4 | Verify no pointer addresses in output | MEDIUM | Small |
+| G7.5 | Verify float formatting is deterministic | MEDIUM | Small |
+| G7.6 | Run full fixpoint check: stage2 → stage3 → diff | FINAL | Small |
+
+### Phase 8: Self-hosted compiler feature expansion (POST-fixpoint)
+
+**Goal:** Self-hosted compiler matches Rust compiler's full feature set.
+
+| Goal | Description | Priority | Effort |
+|------|-------------|----------|--------|
+| G8.1 | Mirror `var`/`pub var` to `compiler/*.fd` | MEDIUM | Medium |
+| G8.2 | Wire `--borrowck` flag through pipeline | MEDIUM | Small |
+| G8.3 | Port interpretation (`interpret_source*`) | LOW | Large |
+| G8.4 | Port native build (`build_source*`, `build_executable*`) | LOW | Large |
+| G8.5 | Port WASM compilation | LOW | Large |
+| G8.6 | Port bare-metal emission | LOW | Medium |
+| G8.7 | Port linting | LOW | Small |
+| G8.8 | Port full `compile` entry point | LOW | Medium |
+| G8.9 | Implement safety/effect verification (`verify_*`) | LOW | Large |
+| G8.10 | Port flat/boot binary emission | LOW | Medium |
+| G8.11 | Complete async/await lowering | LOW | Large |
+| G8.12 | Complete closure support | LOW | Medium |
+| G8.13 | Complete trait resolution | LOW | Medium |
+
+---
+
+## Is Fixpoint Achievable?
+
+**Yes.** The path is clear:
+
+1. **The crash chain is finite.** Each fix moves the crash to the next
+   difference. We've already moved from "crashes on stdlib lexing" →
+   "crashes in compute_func_effects" → "crashes in TypeChecker_lookup".
+   Each step is a concrete, debuggable difference between .rs and .fd.
+
+2. **The compiler source is finite.** It's 57K LOC across 25 modules.
+   The number of behavioral differences between the Rust and self-hosted
+   implementations is bounded. We've already found and fixed 4 major ones.
+
+3. **The remaining crashes are all the same class.** They're all null
+   pointer dereferences from Vec_get returning NULL on empty/small Vecs,
+   caused by the self-hosted compiler generating slightly different IR
+   that doesn't initialize or populate Vecs the same way as Rust.
+
+4. **Code generation parity is measurable.** We can diff the generated C
+   function-by-function to find remaining differences. The normalization
+   (variable numbering, block labels) is already working.
+
+5. **Fixpoint stability is well-understood.** The main risks (HashMap
+   order, uninit memory, pointer addresses) are known and have known fixes.
+
+**Estimated remaining work:**
+- Phase 5 (crash fixes): 5-10 more bug fixes of the same class
+- Phase 6 (codegen parity): 5-7 specific fixes
+- Phase 7 (fixpoint verification): 3-5 stability fixes
+- Total: ~15-20 more targeted fixes
+
+**The statement-dropping bug (A4) is the biggest risk.** If it can't be
+fixed at the root, the workaround (splitting long functions) is tedious but
+proven. The compiler source has already been partially split
+(`keyword_or_ident_core` → 5 helpers).
 
 ---
 
@@ -331,7 +626,7 @@ Two critical infrastructure fixes were discovered and applied:
 
 ### What works
 
-- All 18 self-host modules rewritten in Fides (39.5K LOC)
+- All 25 self-host modules rewritten in Fides (57K LOC)
 - All 23 self-host module tests pass on interpreter + PE emitter
 - `comptime_eval.fd` fully ported (process_gen, substitute, I-5A, I-5D, reflection)
 - `pe.fd` has 25+ runtime stubs (print, string, vec, map, float, bool)
@@ -473,7 +768,7 @@ produce correct output.
 
 ### Phase 1b: Port Fides lowerer gaps (before self-compilation)
 
-A full audit of the compiler source (39.5K LOC, 18 modules) compared the Fides
+A full audit of the compiler source (57K LOC, 25 modules) compared the Fides
 lowerer/codegen/typechecker against the Rust ones. The audit found **12 gaps**
 that will block self-compilation. Gaps 1-5 were already known; Gaps 6-12 are
 newly identified.
@@ -650,7 +945,7 @@ This is a latent language bug, not a self-compilation blocker.
 → Built native executable: release\fides-c2.exe
 ```
 
-The compiler source is 39.5K LOC across 18 modules. **All pipeline stages
+The compiler source is 57K LOC across 25 modules. **All pipeline stages
 pass and tcc successfully links the output into a working binary.**
 
 **Issues found and fixed in this phase:**
@@ -741,7 +1036,7 @@ and fixpoint divergence.
 | No crash on hello.fd | Compiler pipeline runs end-to-end | ✅ DONE |
 | tcc compiles the output | Generated C is syntactically valid | ✅ DONE |
 | hello.exe prints correct output | Codegen is correct for simple programs | ✅ DONE |
-| No crash on compiler/main.fd (all stages) | Compiler handles 39.5K LOC | ✅ DONE |
+| No crash on compiler/main.fd (all stages) | Compiler handles 57K LOC | ✅ DONE |
 | tcc links stage1.c | Generated C has no duplicate definitions | ✅ DONE |
 | stage1.exe runs and produces correct output | Self-compiled codegen is correct | ✅ DONE (test_strconcat.fd works) |
 | stage1 output matches bootstrap compiler | Codegen is correct for complex programs | ⏳ NEXT |
@@ -1147,31 +1442,37 @@ with struct values. But the self-hosted compiler source might.
 
 ## Self-Host Module Status
 
-All 18 modules rewritten in Fides. 23/23 self-host tests pass on
+All 25 modules rewritten in Fides (57,021 LOC). 23/23 self-host tests pass on
 interpreter + PE emitter.
 
 | Module | Fides LOC | Status |
 |--------|-----------|--------|
-| `token.fd` | 517 | DONE |
-| `diag.fd` | 594 | DONE |
-| `json.fd` | 628 | DONE |
-| `fmt.fd` | 1007 | DONE |
-| `ast.fd` | 920 | DONE |
-| `lexer.fd` | 673 | DONE |
-| `parser.fd` | 4800 | DONE |
-| `ir.fd` | 2139 | DONE |
-| `typechecker.fd` | 4848 | DONE (compute_func_effects is no-op) |
-| `lower.fd` | 4444 | DONE |
-| `mono.fd` | 2422 | DONE |
-| `borrowck.fd` | 1731 | DONE |
-| `pir.fd` | 2432 | DONE |
-| `opt.fd` | 6022 | DONE |
-| `codegen_c.fd` | 4529 | DONE |
-| `pe.fd` | ~2600 | DONE (PE emitter — native x86-64 + PE file writer) |
-| `compiler.fd` | 1641 | DONE (apply_cfg_filter is no-op) |
-| `comptime_eval.fd` | 35 | DONE |
-| `main.fd` | 120 | DONE (entry point — supports `ccompile` + `build`) |
-| **Total** | **~42,100** | **19/19 modules** |
+| `token.fd` | 554 | DONE |
+| `diag.fd` | 659 | DONE |
+| `json.fd` | 666 | DONE |
+| `fmt.fd` | 1,109 | DONE |
+| `ast.fd` | 1,144 | DONE |
+| `lexer.fd` | 832 | DONE |
+| `parser.fd` | 5,145 | DONE |
+| `ir.fd` | 2,524 | DONE |
+| `typechecker.fd` | 5,521 | DONE |
+| `lower.fd` | 6,420 | DONE (B5 float bits + recursive generic arg resolution — session 14) |
+| `mono.fd` | 2,569 | DONE |
+| `borrowck.fd` | 1,830 | DONE |
+| `pir.fd` | 2,704 | DONE |
+| `opt.fd` | 7,695 | DONE |
+| `codegen_c.fd` | 5,204 | DONE (B5 union compound literals — session 14) |
+| `pe.fd` | 4,845 | DONE (PE emitter — native x86-64 + PE file writer) |
+| `compiler.fd` | 1,994 | DONE |
+| `comptime_eval.fd` | 1,615 | DONE (full port — process_gen, substitute, I-5A, I-5D) |
+| `main.fd` | 1,388 | DONE (ccompile + build + lsp + test + fmt + ...) |
+| `peephole.fd` | 1,064 | DONE (Linux backend, not yet integrated) |
+| `regalloc.fd` | 1,181 | DONE (Linux backend, not yet integrated) |
+| `codegen_x64.fd` | 1,942 | DONE (Linux backend, not yet integrated) |
+| `lsp.fd` | 1,082 | DONE (JSON-RPC over stdio) |
+| `flat_ast.fd` | 1,259 | DONE (flat AST serialization) |
+| `inc.fd` | 146 | DONE (global_cache_* are no-ops — fixable with var feature) |
+| **Total** | **57,021** | **25/25 modules** |
 
 ---
 
@@ -1333,7 +1634,7 @@ release/             ← Self-hosted compiler output — gitignored
   stage1.c / .exe    ← First self-compiled generation
   stage2.c / .exe    ← Second generation (for fixpoint test)
   stage3.c / .exe    ← Third generation (must equal stage2)
-compiler/            ← Self-hosted compiler source (18 .fd modules)
+compiler/            ← Self-hosted compiler source (25 .fd modules, 57K LOC)
 tests/compiler/      ← Self-host module tests (23 .fd files)
 tests/selfhost/      ← Harness/probe files for differential testing
 stdlib/              ← Fides standard library (69 .fd modules)

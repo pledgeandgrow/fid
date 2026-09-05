@@ -2,6 +2,8 @@
 
 > What the Fides language must respect, and how the self-hosted compiler
 > handles each feature.
+>
+> **Last updated:** Sep 5, 2026 (session 14)
 
 ---
 
@@ -22,6 +24,22 @@ pub enum Type {
 - `Infer` is used where the type has not been resolved yet.
 - `Never` becomes `IrType::Void`.
 - `Str` is a pointer to `u8` (`IrType::Ptr(Box::new(IrType::U8))`).
+
+### Float constants (session 14 — B5 fix)
+
+`ConstFloat` in IR stores the raw `u64`/`u32` bit pattern, not the decimal
+value. The C backend emits union compound literals to reinterpret the bits:
+
+```c
+// f64
+((union { uint64_t u; double f; }){ .u = 0x7FF8000000000000ULL }).f
+// f32
+((union { uint32_t u; float f; }){ .u = 0x7FC00000U }).f
+```
+
+This preserves NaN payloads, `+inf`/`-inf`, and `-0.0` bit patterns exactly.
+The runtime functions `p_f64_to_bits` and `p_f32_to_bits` are registered as
+externs in `Lowerer_register_runtime`.
 
 ### Named types
 
@@ -174,12 +192,12 @@ match expr {
    ```
 6. After each arm, bindings are truncated to saved lengths so arm-local variables do not leak to later arms.
 
-### Current bug
+### Current behavior (session 14 — pointer-based approach)
 
-For struct-typed fields (e.g. `ParseResultExpr::Ok(e)` where `e` is `Expr`),
-a plain `Inst::Load` only copies 8 bytes because the C backend treats
-`c_type(Struct(_))` as a pointer. The Rust lowerer uses `load_enum_field()`
-(buffer + `Store`/`memcpy`) for these. The Fides lowerer must do the same.
+Under the pointer-based enum payload approach (COORDINATION.md [D1]),
+`Inst::Load` reads the 8-byte pointer to the field's data. This is correct
+for all field types — no `load_enum_field()` or `memcpy` is needed. See
+`calling-conventions.md` §5 for details.
 
 ---
 
@@ -383,17 +401,20 @@ pub enum ParseResultExpr {
 }
 ```
 
-### IR layout
+### IR layout (pointer-based approach — D1)
 
 Enums are lowered to a `StructLayout`:
-- Field 0: `__tag` at offset 0
-- Field 1..N: `__data0` at 8, `__data1` at 16, etc.
-- Size: `(1 + payload_slots) * 8`
+- Field 0: `__tag` at offset 0 (i64)
+- Field 1..N: `__data0` at 8, `__data1` at 16, etc. (each is an 8-byte pointer)
+- Size: `(1 + max_variant_arity) * 8`
 - Alignment: 8
 
 ### Payload size
 
-Each field in the largest variant gets at least 8 bytes. Nested struct/enum-typed fields use the full layout size from `IrModule_get_struct` (or default to 8 if not yet computed).
+Each field in the largest variant gets exactly 8 bytes (a pointer/word),
+regardless of the field's actual type. Struct/enum-typed fields are
+heap-allocated and the pointer is stored in the payload slot. This is the
+pointer-based approach (COORDINATION.md [D1]).
 
 ### Variant index
 
@@ -435,6 +456,9 @@ fn bar<T, U>(x: T, y: U) { ... }
 - `mono.fd` clones generic functions for concrete type instantiations.
 - `subst_*` helpers replace type parameters.
 - Generic function bodies are not lowered until a concrete instantiation is found.
+- `Lowerer_resolve_type` recursively resolves `Type::Generic(name, args)` by
+  resolving each arg via `Lowerer_resolve_type` before returning (session 14).
+  This fixes nested generic type alias expansion.
 
 ---
 

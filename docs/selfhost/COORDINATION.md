@@ -5,7 +5,7 @@
 > and what architectural decisions have been made. Without this, parallel
 > agents will conflict and undo each other's work.
 >
-> **Last updated:** Sep 4, 2026 (session 9)
+> **Last updated:** Sep 5, 2026 (session 14 — Category B codegen parity: B5 fixed, B6/B7/B8 verified at parity)
 
 ---
 
@@ -298,6 +298,47 @@ all 22/23 self-host tests still pass (1 pre-existing failure in
 
 ---
 
+### [D11] Category B codegen parity gaps resolved — Sep 5, 2026 (session 14)
+
+**Decision:** The Category B code generation parity gaps between the Rust
+compiler and the self-hosted compiler have been resolved:
+
+- **B5 (Float constant bit-pattern) — FIXED:** Added `p_f64_to_bits`/
+  `p_f32_to_bits` C runtime functions to both `src/codegen_c.rs` and
+  `compiler/codegen_c.fd`. Registered as externs in both `src/lower.rs`
+  and `compiler/lower.fd`. Updated `ConstFloat` handler in
+  `compiler/codegen_c.fd` to emit union compound literals
+  (`((union { uint64_t u; double f; }){ .u = <bits>ULL }).f`) matching
+  the Rust codegen. Implemented `f64_to_bits`/`f32_to_bits` in
+  `compiler/lower.fd` (were stubs returning 0). NaN/Inf/-0.0 bit patterns
+  are now preserved.
+
+- **B6 (Polymorphic print/println dispatch) — AT PARITY:** Verified via
+  side-by-side comparison. All type cases (Vec, HashMap, Tensor, F64, Bool,
+  Ptr/Opaque, Generic, any, default) match between Rust and Fides codegen.
+  No changes needed.
+
+- **B7 (Missing runtime sigs) — AT PARITY:** `p_malloc_persistent`,
+  `p_arena_save`, `p_arena_restore` are registered in `compiler/codegen_c.fd`
+  with matching parameter types. No changes needed.
+
+- **B8 (Vec method word_repr) — AT PARITY:** `Lowerer_lower_method_call`
+  in `compiler/lower.fd` uses `word_repr(vec_elem_ty)` for
+  get/pop/first/last/remove, matching Rust. The `infer_expr_type` path
+  returns raw `elem_ty` in both compilers — this is intentional parity
+  by design. No changes needed.
+
+**Files changed:**
+- `src/codegen_c.rs` — added `p_f64_to_bits`/`p_f32_to_bits` (sigs, decls, impls)
+- `src/lower.rs` — registered `p_f64_to_bits`/`p_f32_to_bits` externs
+- `compiler/codegen_c.fd` — added runtime functions + updated ConstFloat handler
+- `compiler/lower.fd` — registered externs + implemented `f64_to_bits`/`f32_to_bits`
+
+**Remaining Category B gaps (B1-B4, B9-B10):** Low priority — not used by
+the compiler source. See `docs/roadmap/selfhost-roadmap.md` Category B table.
+
+---
+
 ## Key Findings
 
 > Discoveries that affect the direction. Add new findings at the top.
@@ -370,31 +411,35 @@ convenience tool, not a self-hosting requirement. Port it only if:
 - Or if a future `run` command redesign switches from C compilation to
   a native interpreter (unlikely — C compilation is faster)
 
-### [F8] Pre-existing parse error blocks self-hosted rebuild — Sep 4, 2026 (session 9)
+### [F8] Pre-existing parse error blocks self-hosted rebuild — UPDATED Sep 5, 2026 (session 14)
 
-`fidesc ccompile compiler/main.fd` fails with "Parse error at 973:34:
-expected identifier but got 'var'" during import resolution. This error
-reproduces with the prior commit's files (verified by checking out commit
-`53df63b`), so it is NOT caused by session 9 LSP work. The line/column
-points into the merged source (stdlib + imports + user code), not any
-individual file. The existing `release/fides-c.exe` (built before this
-bug appeared) still works. **This must be fixed before the fixpoint check
-can be attempted with current code.** See bug #2.11 in known-bugs.md.
+The original parse error at `codegen_c.fd:973` ("expected identifier but got
+'var'") was resolved in earlier sessions. The current self-hosted build
+pipeline (`build-selfhost.ps1`) builds `fides-c.exe` successfully.
 
-### [F7] Statement-dropping bug is the root cause of fides-c2 crash — Sep 4, 2026 (session 8)
+**Current blocker (session 13/14):** `fides-c2_new.exe` (the second-generation
+compiler) crashes during type checking of `stdlib/core.fd` in
+`TypeChecker_lookup` — null pointer returned from `Vec_get` on an empty
+scope. This is a Category A crash blocker. See roadmap Category A table and
+known-bugs.md §2.8.
+
+### [F7] Statement-dropping bug and fides-c2 crash — UPDATED Sep 5, 2026 (session 12)
 
 The `STATUS_ACCESS_VIOLATION` crash in `fides-c2_test.exe` while lexing
-`stdlib/core.fd` has been traced to the **statement-dropping bug** (bug 1.19
-in known-bugs.md). The Fides compiler silently drops statements in long
-functions. When `fides-c.exe` compiles the compiler source, some statements
-are dropped from the generated C code. The resulting `fides-c2_test.exe` has
-missing instructions baked into its binary, causing it to crash on complex
-inputs like `stdlib/core.fd` (16K LOC).
+`stdlib/core.fd` was initially attributed to the **statement-dropping bug**
+(bug 1.19 in known-bugs.md). Session 12 investigation found the primary
+cause was **stack overflow** — the TCC-linked binary had a 1MB default stack,
+insufficient for deep recursion on 39.5K LOC. Fix: increased TCC stack
+reserve to 128MB (`-Wl,-stack,134217728`) and split `keyword_or_ident_core`
+(51 if-statements, 933 C vars) into 5 smaller functions.
 
-The workaround (splitting long functions into smaller helpers) was applied
-to `pe.fd` in session 5, but the bug affects ALL long functions in the
-compiler source. The real fix is to find and fix the statement-dropping bug
-in the Fides compiler itself (in `src/lower.rs` or `src/codegen_c.rs`).
+The statement-dropping bug (1.19) is still latent and affects long
+functions, but is no longer considered the primary crash cause. The
+workaround (splitting long functions into smaller helpers) remains valid.
+
+**Current crash (session 13/14):** `fides-c2_new.exe` crashes during type
+checking in `TypeChecker_lookup` (null pointer from `Vec_get` on empty
+scopes). This is a Category A crash blocker — see roadmap Category A table.
 
 ### [F6] Linux native codegen ported to Fides — Sep 4, 2026 (session 8)
 
