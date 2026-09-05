@@ -1,9 +1,11 @@
 # Fides Language Syntax Specification
 
 **Version:** 0.5.0
-**Status:** Phase 4D — Direct PE/ELF64 emitters (x86_64) + MASM backend + C codegen backend + WASM/SPIR-V backends + multi-arch assembly (x86-64/ARM64/RISC-V) + IR interpreter + PIR pipeline (L1/L2/L3)
+**Status:** Phase 4D — Direct PE/ELF64 emitters (x86_64) + MASM backend + C codegen backend + WASM/SPIR-V backends + multi-arch assembly (x86-64/ARM64/RISC-V) + IR interpreter + PIR pipeline (L1/L2/L3) + **self-hosted compiler with bootstrap fixpoint**
 
 > **Implementation Status:** This document is the full language specification. Not all features are implemented yet — sections marked with implementation status (✅ working / ⚠️ partial / ❌ parsed-only or planned). See `features.md` for the authoritative feature matrix and `docs/architecture.md` for the compiler pipeline.
+>
+> **Self-hosting status (session 15):** The Fides compiler is self-hosted. 25 modules (61K LOC) rewritten from Rust to Fides. Bootstrap fixpoint achieved: `fides-c2.c == fides-c3.c` (SHA256-identical, 701,100 lines).
 
 ## 1. Design Philosophy
 
@@ -61,25 +63,29 @@ Fides is a systems programming language designed for safety, clarity, and modern
 ### 2.1 Keywords
 
 ```
-fn          val          const          mut         pub         struct
-enum        cap         impl        use         match       type
-if          else        for         while       loop
-return         break       continue    async       await
-comptime    in          as          where       region
-spawn       defer       move        static      try
-handle      do          interrupt   extern      dyn         module
-with
+fn          val          var          const        mut         pub
+struct      enum         cap          impl         use         match
+type        if           else         for          while       loop
+return      break        continue     async        await
+comptime    in           as           where        region
+spawn       defer        move         static       try
+handle      do           interrupt    extern       dyn         module
+with        unsafe       sandbox      txn          persist
+given       ensure       guard        is           select
+layer       model        grad         backward     kernel
+component   system       query        state        on
 true        false
 ```
 
 **Note:** `none`, `some`, `ok`, `err` are NOT keywords — they are enum variant names from the standard library (`Option` and `Result`). They are listed here for reference only and are not in the keyword block above.
 
-**Keyword reference** (from `src/token.rs`):
+**Keyword reference** (from `src/lexer.rs`):
 
 | Keyword | Purpose |
 |---------|---------|
 | `fn` | Function declaration (named, anonymous, async, comptime) |
-| `val` | Variable declaration (`var` for mutable) |
+| `val` | Immutable variable declaration |
+| `var` | Mutable variable declaration |
 | `const` | Compile-time constant |
 | `cap` | Capability / trait declaration |
 | `type` | Type alias |
@@ -96,6 +102,16 @@ true        false
 | `spawn` | Spawn concurrent task (✅ implemented — OS thread model) |
 | `async` / `await` | Async functions (✅ implemented — eager evaluation, OS thread model; state machine transform pending) |
 | `try` | Try blocks for error handling |
+| `unsafe` | Unsafe block (skip bounds checks — framework/stdlib use only) |
+| `sandbox` | Sandbox block (restricted execution context) |
+| `txn` | Atomic transaction block with rollback on failure |
+| `persist` | Persistent variable annotation |
+| `given` / `ensure` | Design by Contract — preconditions/postconditions |
+| `guard` | Guard clause |
+| `is` | Type check operator |
+| `select` | Channel select statement |
+| `layer` / `model` / `grad` / `backward` | ML/deep learning primitives |
+| `kernel` / `component` / `system` / `query` / `state` / `on` | Domain-specific declarations |
 
 ### 2.2 Operators
 
@@ -1521,7 +1537,7 @@ fn test_config_debug() {
 }
 
 pub fn main() -> Result<(), LoadError> {
-    val config = load_config("pacte.toml")?;
+    val config = load_config("ark.toml")?;
 
     println(f"Loaded: {config.name} v{config.version}");
     println(f"Settings: {config.settings.len()} entries");
@@ -2227,8 +2243,9 @@ find . -name "*.fd" -exec sed -i \
 
 **Step 4: All tests pass** — VERIFIED
 - 265 unit tests pass
-- 8 harness tests pass
-- 164/165 normal tests pass on interpreter + C codegen, 165/165 on PE emitter
+- 209/211 interpreter tests pass, 198/211 C codegen matched, 209/211 PE valid
+- 23/23 self-host tests pass
+- Bootstrap fixpoint achieved (session 15)
 
 **Step 5: Documentation updated** — DONE
 - `docs/reference/syntax.md` — all examples updated

@@ -1298,31 +1298,98 @@ pub fn Lowerer_make_struct_layout(self: &Lowerer, def: StructDef) -> StructLayou
     var fields: Vec<StringIrTypeOffset> = Vec::new();
     var offset: i64 = 0;
 
+    // Check for @repr(C) annotation
+    var repr_c: bool = false;
+    var ai: i64 = 0;
+    while ai < def.annotations.len() {
+        var ann: Annotation = def.annotations.get(ai);
+        if str_equal(ann.name, "repr") {
+            var bi: i64 = 0;
+            while bi < ann.args.len() {
+                if str_equal(ann.args.get(bi), "C") {
+                    repr_c = true;
+                }
+                bi = bi + 1;
+            }
+        }
+        ai = ai + 1;
+    }
+
+    var max_align: i64 = 8;
+    if repr_c {
+        max_align = 1;
+    }
+
     var i: i64 = 0;
     while i < def.fields.len() {
         var field: Param = def.fields.get(i);
         var ir_ty: IrType = Lowerer_lower_type(self, field.ty);
-        var field_size: i64 = 8;
-        match ir_ty {
-            IrType::Struct(name) => {
-                match IrModule_get_struct(&self.module, name) {
-                    OptStructLayout::Some(layout) => { field_size = layout.size; }
-                    OptStructLayout::None => { field_size = 8; }
+
+        if repr_c {
+            // C-compatible layout: use natural type sizes and alignment
+            var field_size: i64 = 8;
+            var field_align: i64 = 8;
+            match ir_ty {
+                IrType::I8 => { field_size = 1; field_align = 1; }
+                IrType::U8 => { field_size = 1; field_align = 1; }
+                IrType::Bool => { field_size = 1; field_align = 1; }
+                IrType::I16 => { field_size = 2; field_align = 2; }
+                IrType::U16 => { field_size = 2; field_align = 2; }
+                IrType::I32 => { field_size = 4; field_align = 4; }
+                IrType::U32 => { field_size = 4; field_align = 4; }
+                IrType::F32 => { field_size = 4; field_align = 4; }
+                IrType::I64 => { field_size = 8; field_align = 8; }
+                IrType::U64 => { field_size = 8; field_align = 8; }
+                IrType::F64 => { field_size = 8; field_align = 8; }
+                IrType::Ptr(_) => { field_size = 8; field_align = 8; }
+                IrType::Struct(name) => {
+                    match IrModule_get_struct(&self.module, name) {
+                        OptStructLayout::Some(layout) => {
+                            field_size = layout.size;
+                            field_align = layout.align;
+                        }
+                        OptStructLayout::None => { field_size = 8; field_align = 8; }
+                    }
                 }
+                _ => { field_size = 8; field_align = 8; }
             }
-            _ => { field_size = 8; }
+            // Align offset to field's natural alignment
+            offset = (offset + field_align - 1) & (0 - field_align);
+            fields.push(StringIrTypeOffset_new(field.name, ir_ty, offset));
+            offset = offset + field_size;
+            if field_align > max_align {
+                max_align = field_align;
+            }
+        } else {
+            // Default Fides layout: uniform 8-byte slots
+            var field_size: i64 = 8;
+            match ir_ty {
+                IrType::Struct(name) => {
+                    match IrModule_get_struct(&self.module, name) {
+                        OptStructLayout::Some(layout) => { field_size = layout.size; }
+                        OptStructLayout::None => { field_size = 8; }
+                    }
+                }
+                _ => { field_size = 8; }
+            }
+            fields.push(StringIrTypeOffset_new(field.name, ir_ty, offset));
+            offset = offset + field_size;
         }
-        fields.push(StringIrTypeOffset_new(field.name, ir_ty, offset));
-        offset = offset + field_size;
         i = i + 1;
     }
 
-    var size: i64 = (offset + 7) & (0 - 8);
+    // Align struct size to its alignment
+    var size: i64 = (offset + max_align - 1) & (0 - max_align);
 
     var layout: StructLayout = StructLayout_new(struct_name);
     layout.size = size;
-    layout.align = 8;
+    if repr_c {
+        layout.align = max_align;
+    } else {
+        layout.align = 8;
+    }
     layout.fields = fields;
+    layout.repr_c = repr_c;
     return layout;
 }
 
@@ -5150,8 +5217,10 @@ pub fn Lowerer_make_fn_env(self: &mut Lowerer, fn_name: str, captures: Vec<Strin
     malloc_args.push(size_val);
     var env_ptr: i64 = Lowerer_emit_inst(self, Inst::Call("p_malloc", malloc_args, IrType::Ptr(Box::new(IrType::U8)), EffectSet_new()));
 
-    // Store function name at field 0
-    var fn_name_val: i64 = Lowerer_emit_inst(self, Inst::ConstStr(fn_name));
+    // Store function reference at field 0
+    // ConstFnRef stores the function name; PE emitter resolves it to a code address,
+    // interpreter/C codegen treat it as a string for name-based lookup.
+    var fn_name_val: i64 = Lowerer_emit_inst(self, Inst::ConstFnRef(fn_name));
     var zero_idx: i64 = Lowerer_emit_inst(self, Inst::ConstInt(0, IrType::I64));
     var field0: i64 = Lowerer_emit_inst(self, Inst::GetElemPtr(env_ptr, zero_idx, IrType::I64));
     var _s: i64 = Lowerer_emit_inst(self, Inst::Store(field0, fn_name_val, OptIrType::None));

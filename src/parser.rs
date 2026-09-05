@@ -112,6 +112,14 @@ impl Parser {
                     g.is_pub = is_pub;
                     program.globals.push(g);
                 }
+                TokenKind::Static => {
+                    // `static` is treated as a module-level mutable global,
+                    // same as `var`. In bare-metal mode, these are placed in
+                    // a fixed .data section for kernel development.
+                    let mut g = self.parse_global_var()?;
+                    g.is_pub = is_pub;
+                    program.globals.push(g);
+                }
                 TokenKind::Type => {
                     let mut ta = self.parse_type_alias()?;
                     ta.is_pub = is_pub;
@@ -772,7 +780,10 @@ impl Parser {
     /// Parse a module-level mutable global variable:
     /// `var name: Type = expr;` or `var name: Type;` (zero-initialized)
     fn parse_global_var(&mut self) -> Result<GlobalVar, String> {
-        self.expect(TokenKind::Var, "var")?;
+        // Accept either `var` or `static` keyword (static is an alias for var)
+        if !self.match_tok(TokenKind::Var) {
+            self.expect(TokenKind::Static, "var or static")?;
+        }
         let name = self.expect_ident()?;
         self.expect(TokenKind::Colon, ":")?;
         let ty = self.parse_type()?;

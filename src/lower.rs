@@ -111,6 +111,24 @@ fn runtime_effects(name: &str) -> Option<EffectSet> {
         effects.add(Effect::IO);
         return Some(effects);
     }
+    // Bare-metal hardware operations (all have side effects)
+    if matches!(name,
+        "p_cli" | "p_sti" | "p_hlt" | "p_lidt" | "p_idt_set_entry"
+        | "p_lgdt" | "p_gdt_set_entry"
+        | "p_outb" | "p_serial_init" | "p_serial_write"
+        | "p_cr0_write" | "p_cr3_write" | "p_cr4_write" | "p_invlpg"
+        | "p_page_map" | "p_page_unmap" | "p_phys_write64"
+    ) {
+        effects.add(Effect::Write);
+        effects.add(Effect::IO);
+        return Some(effects);
+    }
+    if matches!(name, "p_inb" | "p_serial_read" | "p_serial_ready"
+        | "p_cr0_read" | "p_cr3_read" | "p_cr4_read" | "p_phys_read64"
+    ) {
+        effects.add(Effect::IO);
+        return Some(effects);
+    }
     None
 }
 
@@ -497,40 +515,78 @@ impl Lowerer {
     /// Compute the memory layout for a struct.
     /// All fields are stored as 8-byte slots to match the native codegen
     /// (which uses `field_index * 8` as the byte offset for each field).
+    /// With @repr(C), fields use natural C-compatible sizes and alignment.
     fn compute_struct_layout(&mut self, def: &StructDef) {
+        // Check for @repr(C) annotation
+        let repr_c = def.annotations.iter().any(|a| {
+            a.name == "repr" && a.args.iter().any(|arg| arg == "C")
+        });
+
         let mut fields = Vec::new();
         let mut offset: u64 = 0;
+        let mut max_align: u64 = if repr_c { 1 } else { 8 };
 
         for field in &def.fields {
             let ir_ty = self.lower_type(&field.ty);
-            // Every field gets at least an 8-byte slot (uniform representation).
-            // Enum-typed fields need more space: (1 + max_payload) * 8 bytes,
-            // because enums are stored inline as (tag, data0, data1, ...).
-            // Without this, the enum's payload overlaps with the next struct field.
-            let field_size = if let IrType::Struct(ref name) = ir_ty {
-                if let Some(layout) = self.module.get_struct(name) {
-                    layout.size
-                } else {
-                    8
+
+            if repr_c {
+                // C-compatible layout: use natural type sizes and alignment
+                let (field_size, field_align) = self.c_type_size_align(&ir_ty);
+                // Align offset to field's natural alignment
+                offset = (offset + field_align - 1) & !(field_align - 1);
+                fields.push((field.name.clone(), ir_ty.clone(), offset as u32));
+                offset += field_size;
+                if field_align > max_align {
+                    max_align = field_align;
                 }
             } else {
-                8
-            };
-            fields.push((field.name.clone(), ir_ty.clone(), offset as u32));
-            offset += field_size;
+                // Uniform 8-byte slot layout (default Fides layout)
+                let field_size = if let IrType::Struct(ref name) = ir_ty {
+                    if let Some(layout) = self.module.get_struct(name) {
+                        layout.size
+                    } else {
+                        8
+                    }
+                } else {
+                    8
+                };
+                fields.push((field.name.clone(), ir_ty.clone(), offset as u32));
+                offset += field_size;
+            }
         }
 
-        // Align to 8 bytes (all structs are 8-byte aligned in the native codegen).
-        let size = (offset + 7) & !7;
+        // Align struct size to its alignment
+        let size = (offset + max_align - 1) & !(max_align - 1);
 
         let layout = StructLayout {
             name: def.name.clone(),
             fields,
             size,
-            align: 8,
+            align: if repr_c { max_align } else { 8 },
+            repr_c,
         };
 
         self.module.add_struct(layout);
+    }
+
+    /// Get C-compatible size and alignment for an IR type.
+    /// Used by @repr(C) struct layout.
+    fn c_type_size_align(&self, ty: &IrType) -> (u64, u64) {
+        match ty {
+            IrType::I8 | IrType::U8 | IrType::Bool => (1, 1),
+            IrType::I16 | IrType::U16 => (2, 2),
+            IrType::I32 | IrType::U32 | IrType::F32 => (4, 4),
+            IrType::I64 | IrType::U64 | IrType::F64 => (8, 8),
+            IrType::Ptr(_) => (8, 8),
+            IrType::Struct(name) => {
+                if let Some(layout) = self.module.get_struct(name) {
+                    (layout.size, layout.align)
+                } else {
+                    (8, 8)
+                }
+            }
+            _ => (8, 8), // default: pointer-sized
+        }
     }
 
     /// Compute layout for an enum type.
@@ -579,6 +635,7 @@ impl Lowerer {
             fields,
             size,
             align: 8,
+            repr_c: false,
         };
         self.module.add_struct(layout);
     }
@@ -806,7 +863,7 @@ impl Lowerer {
         self.module.add_extern("p_cli", vec![], IrType::Void);           // disable interrupts
         self.module.add_extern("p_sti", vec![], IrType::Void);           // enable interrupts
         self.module.add_extern("p_lidt", vec![IrType::Ptr(Box::new(IrType::U8))], IrType::Void); // load IDT
-        self.module.add_extern("p_idt_set_entry", vec![IrType::I64, IrType::I64], IrType::Void); // set IDT entry
+        self.module.add_extern("p_idt_set_entry", vec![IrType::I64, IrType::I64, IrType::I64, IrType::I64], IrType::Void); // set IDT entry (idt_ptr, vector, handler, flags)
         self.module.add_extern("p_hlt", vec![], IrType::Void);           // halt CPU
         self.module.add_extern("p_inb", vec![IrType::I64], IrType::I64);  // port I/O: read byte
         self.module.add_extern("p_outb", vec![IrType::I64, IrType::I64], IrType::Void); // port I/O: write byte
@@ -823,6 +880,16 @@ impl Lowerer {
         self.module.add_extern("p_page_unmap", vec![IrType::I64, IrType::I64], IrType::Void); // unmap vaddr
         self.module.add_extern("p_phys_read64", vec![IrType::I64], IrType::I64); // read 8 bytes from physical addr
         self.module.add_extern("p_phys_write64", vec![IrType::I64, IrType::I64], IrType::Void); // write 8 bytes to physical addr
+
+        // ─── Phase 5A.5: GDT builtins (bare-metal) ───
+        self.module.add_extern("p_lgdt", vec![IrType::I64], IrType::Void); // load GDT
+        self.module.add_extern("p_gdt_set_entry", vec![IrType::I64, IrType::I64, IrType::I64, IrType::I64, IrType::I64], IrType::Void); // set GDT entry
+
+        // ─── Phase 5A.6: Serial port builtins (bare-metal) ───
+        self.module.add_extern("p_serial_init", vec![], IrType::Void);           // init COM1
+        self.module.add_extern("p_serial_write", vec![IrType::I64], IrType::Void); // write byte to COM1
+        self.module.add_extern("p_serial_read", vec![], IrType::I64);            // read byte from COM1
+        self.module.add_extern("p_serial_ready", vec![], IrType::I64);           // check if data available
 
         // ─── Environment variable builtins ───
         // p_getenv(name: *u8) -> *u8  — get environment variable value (null if not set)
@@ -5414,6 +5481,7 @@ impl Lowerer {
                     fields,
                     size,
                     align: 8,
+                    repr_c: false,
                 });
                 let ptr = self.emit_inst(Inst::Alloca {
                     ty: tuple_ty.clone(),
@@ -6202,8 +6270,10 @@ impl Lowerer {
             },
         });
 
-        // Store function address at field 0
-        let fn_name_val = self.emit_inst(Inst::ConstStr { value: fn_name.to_string() });
+        // Store function reference at field 0
+        // ConstFnRef stores the function name; PE emitter resolves it to a code address,
+        // interpreter/C codegen treat it as a string for name-based lookup.
+        let fn_name_val = self.emit_inst(Inst::ConstFnRef { name: fn_name.to_string() });
         let zero_idx = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
         let field0 = self.emit_inst(Inst::GetElemPtr {
             array_ptr: env_ptr,

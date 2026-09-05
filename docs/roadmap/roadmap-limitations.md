@@ -211,7 +211,7 @@ Phase L1: Pipeline Integration          ← Close claimed-vs-actual gap
 Phase L2: Cross-Platform Native         ← Linux, macOS, cross-compilation
 Phase L3: Concurrency Without Coloring  ← Effect handlers, green threads, data race safety
 Phase L4: Comprehensive Stdlib          ← net, fs, io, time, json, regex, crypto, http
-Phase L5: Package Manager & Build       ← pacte.toml, registry, lockfiles
+Phase L5: Package Manager & Build       ← ark.toml, registry, lockfiles
 Phase L6: Seamless FFI & C Interop      ← extern "C", auto-bindings, transpiler
 Phase L7: Developer Tooling             ← LSP, debugger, profiler, formatter, linter
 Phase L8: Type System Completeness      ← Named args, reflection, specialization, verification
@@ -604,8 +604,8 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 
 ### Milestones
 
-#### L5A — Project File (`pacte.toml`)
-- [x] `pacte.toml` — project manifest (name, version, edition, dependencies, targets) — IMPLEMENTED by pacte
+#### L5A — Project File (`ark.toml`)
+- [x] `ark.toml` — project manifest (name, version, edition, dependencies, targets) — IMPLEMENTED by ark
 - [ ] `[package]` section: name, version, authors, edition, description, license
 - [ ] `[dependencies]` section: package = "version" or package = { version = "...", features = [...] }
 - [ ] `[dev-dependencies]` section: test-only dependencies
@@ -614,7 +614,7 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [ ] **Not built:** This is new
 
 #### L5B — Build System (`fides build`)
-- [ ] `fidesc build` — compile project (reads `pacte.toml`, compiles all targets)
+- [ ] `fidesc build` — compile project (reads `ark.toml`, compiles all targets)
 - [ ] `fides build --release` — optimized build (enables PIR optimizer, LTO)
 - [ ] `fides build --target <triple>` — cross-compile
 - [ ] `fides run` — build and run main binary
@@ -625,8 +625,8 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [ ] **Already built:** `linker.rs::IncrementalLinker` (caches by content hash), `fidesc build` command
 - [ ] **Not redoing:** Incremental linker — wrapping in project-aware build system
 
-#### L5C — Package Manager (`pacte add/remove/publish`)
-- [x] `pacte add <package>` — add dependency to `pacte.toml`, download — IMPLEMENTED (path/git deps)
+#### L5C — Package Manager (`ark add/remove/publish`)
+- [x] `ark add <package>` — add dependency to `ark.toml`, download — IMPLEMENTED (path/git deps)
 - [ ] `fides remove <package>` — remove dependency
 - [ ] `fides update` — update dependencies within version constraints
 - [ ] `fides publish` — publish package to registry
@@ -650,15 +650,15 @@ Fides's effect system is the foundation — effect handlers can replace async/aw
 - [ ] **Design principle:** Capabilities — downloaded packages can't access IO/FS/Net unless explicitly granted
 
 #### L5F — Workspaces
-- [ ] `[workspace]` in `pacte.toml` — multi-package projects
+- [ ] `[workspace]` in `ark.toml` — multi-package projects
 - [ ] Shared dependencies across workspace members
 - [ ] `fides build` from workspace root builds all members
 - [ ] Path dependencies for local development
 - [ ] **Not built:** This is new
 
 ### Exit Criteria
-- [x] `pacte init myproject` creates a new project with `pacte.toml` — IMPLEMENTED
-- [x] `pacte add http --git <url>` downloads and integrates the `http` package — IMPLEMENTED (git deps)
+- [x] `ark init myproject` creates a new project with `ark.toml` — IMPLEMENTED
+- [x] `ark add http --git <url>` downloads and integrates the `http` package — IMPLEMENTED (git deps)
 - [ ] `fides build` compiles the project with incremental builds
 - [ ] `fides publish` publishes to the Fides registry
 - [ ] Lockfiles ensure reproducible builds

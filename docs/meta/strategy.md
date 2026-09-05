@@ -307,7 +307,7 @@ make it another D, Crystal, or V — technically good, commercially irrelevant.*
 
 The project has built an impressive amount of working compiler infrastructure
 (86,742 LOC, 51 source files, 164/165 C codegen parity (164/165 interp, 165/165 PE) across 3 backends, 69 stdlib
-modules, 6 backends, 4 binaries: fidesc/pacte/scribe/veil). But it's spreading into too many domains (games,
+modules, 6 backends, 4 binaries: fidesc/ark/scribe/veil). But it's spreading into too many domains (games,
 blockchain, robotics, medical, serverless) before it has proven it can do the
 basics better than existing languages.
 
@@ -471,7 +471,7 @@ a platform, you need a killer framework."**
 
 Current state:
 - 0 users (not released)
-- 0 packages (pacte package manager implemented, registry pending)
+- 0 packages (ark package manager implemented, registry pending)
 - 0 real projects written in Fides
 - No LSP, no formatter, no debugger
 - No documentation for users (only internal docs)
@@ -794,7 +794,7 @@ Based on the history.md lessons and current state:
    → C backend stays as fallback (like Zig)
 
 8. 🟢 Start ecosystem (Phase 11 basics)
-   → LSP server (oracle/fidesc lsp), formatter (forge/fidesc fmt), package manager (pacte), doc generator (scribe), coverage (veil)
+   → LSP server (oracle/fidesc lsp), formatter (forge/fidesc fmt), package manager (ark), doc generator (scribe), coverage (veil)
    → These are what make a language usable
 
 9. ⏸ DEFER Phase 8 (Game Development)

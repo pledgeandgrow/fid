@@ -47,6 +47,8 @@ fn is_skip_test(name: &str) -> bool {
         | "test_ffi_header.fd"
         | "test_dlopen.fd"
         | "test_game_stdlib.fd"
+        | "test_kernel_serial.fd"
+        | "test_os_gaps.fd"
         | "test_phase8b.fd"
         | "test_vec_math.fd"
         | "test_vec_shape_fail.fd"

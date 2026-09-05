@@ -14,7 +14,7 @@
 cargo build --release
 ```
 
-Produces `target/release/fidesc.exe` and `target/release/pacte.exe`, etc.
+Produces `target/release/fidesc.exe` and `target/release/ark.exe`, etc.
 
 For faster iteration (but slower execution):
 

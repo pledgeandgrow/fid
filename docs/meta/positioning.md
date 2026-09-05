@@ -293,12 +293,12 @@ Advocacy (people recommend Fides to others)
 | Safety | 9/10 | 10/10 | Regions + capabilities + effects + sandbox + borrow checker all enforced at compile time. No data race prevention yet. Binary hardening (stack canaries, PIE, RELRO, NX stack). |
 | Flexibility | 8/10 | 10/10 | Inline assembly (x86 only), bare metal, comptime, FFI, dynamic loading, conditional compilation, cross-compilation (ARM64, RISC-V, Windows) — all working. No C++ interop. |
 | Compilation | 10/10 | 10/10 | Custom IR, no LLVM, integrated linker, sub-second for small projects |
-| Ecosystem | 2/10 | 8/10 | Package manager (pacte) implemented, no crates registry yet, doc generator (scribe) implemented, 69 stdlib modules. Rust has 100k+ crates. C has everything. |
+| Ecosystem | 2/10 | 8/10 | Package manager (ark) implemented, no crates registry yet, doc generator (scribe) implemented, 69 stdlib modules. Rust has 100k+ crates. C has everything. |
 | Metaprogramming | 8/10 | 10/10 | comptime is powerful: `@derive(Debug/Clone/Serialize/Deserialize)`, `comptime gen { }`, reflection. No procedural macros. |
 | Concurrency | 6/10 | 10/10 | OS threads (`spawn`), bounded MPSC channels, executor runtime, async IO, `select` statement. No data race prevention, no atomics, no green threads. |
 | Developer velocity | 9/10 | 10/10 | Hot reload + persist + watch --diff + LSP (completion/hover/goto-def) + formatter + linter + bench + stack traces. No debugger, no profiler. |
 | Security | 9/10 | 10/10 | sandbox + cap-aware linking + @constant_time + @tainted + binary hardening — compile-time, zero runtime cost. Best-in-class. |
-| Tooling | 6/10 | 8/10 | LSP (diagnostics + completion + hover + goto-def), formatter, linter, bench, stack traces. Debugger (probe/fidesc debug) implemented, profiler (pulse/fidesc bench) partial, doc generator (scribe) implemented, package manager (pacte) implemented, coverage tool (veil) implemented. Rust has cargo + rust-analyzer + rustfmt + clippy + rustdoc. |
+| Tooling | 6/10 | 8/10 | LSP (diagnostics + completion + hover + goto-def), formatter, linter, bench, stack traces. Debugger (probe/fidesc debug) implemented, profiler (pulse/fidesc bench) partial, doc generator (scribe) implemented, package manager (ark) implemented, coverage tool (veil) implemented. Rust has cargo + rust-analyzer + rustfmt + clippy + rustdoc. |
 | Community | 1/10 | 7/10 | Independent, no corporate backing. Rust has Mozilla/AWS/Google. Zig has Zig Foundation. |
 
 > **Current state (verified Aug 2026):**
@@ -321,7 +321,7 @@ Advocacy (people recommend Fides to others)
 > - ✅ **69 stdlib modules** — core, vec, math, channel, sync, ecs, events, parallel, db, http, json, file, time, and more
 > - ✅ **Binary hardening** — All C codegen output compiled with stack canaries, PIE/ASLR, full RELRO, NX stack
 > - ✅ **Security annotations** — `@constant_time` (side-channel defense), `@tainted` (injection defense)
-> - ⚠️ **Package manager (pacte)** — path/git deps implemented, registry pending
+> - ⚠️ **Package manager (ark)** — path/git deps implemented, registry pending
 > - ❌ **No debugger** — no DWARF debug info, no breakpoint support
 > - ✅ **Cross-compilation** — `build --target arm64-linux`, `--target riscv64-linux`, `--target x86-64-windows` all produce valid executables with zero external tools
 > - ❌ **No green threads** — concurrency uses OS threads, not lightweight coroutines
@@ -582,7 +582,7 @@ the coldest of cold starts.
 | 10x easier concurrency than Rust | **Plausible** | Effect handlers + channels + select are simpler than Rust's async/Send/Sync/Pin. No "async coloring" of functions. But Fides lacks data race prevention (Send/Sync). |
 | 10x smaller binaries than C | **Plausible** | Dead code elimination at IR level, no libc, `--caps` stripping. But C with `-Os` and manual stripping can get close. |
 | 10x safer than Rust | **Not plausible** | Rust's borrow checker is proven at scale (Firefox, Linux kernel). Fides's regions are unproven in production. Both are memory-safe. |
-| 10x better DX than Rust | **Plausible for iteration** | Hot reload + fast compilation + LSP + formatter + linter. But Rust has mature registry — Fides has pacte (package manager), scribe (doc generator), veil (coverage), probe (debugger) implemented, but no registry yet. |
+| 10x better DX than Rust | **Plausible for iteration** | Hot reload + fast compilation + LSP + formatter + linter. But Rust has mature registry — Fides has ark (package manager), scribe (doc generator), veil (coverage), probe (debugger) implemented, but no registry yet. |
 
 **The "100x" is about compilation speed and iteration, not runtime performance
 or overall developer experience.** Fides compiles fast and hot-reloads, but
@@ -1255,7 +1255,7 @@ a runtime and GC while Fides is bare-metal with manual region management.
 | Select | ✅ Built-in | ✅ `select { case ... }` |
 | Race detector | ✅ Built-in (`go test -race`) | ❌ Not yet |
 | Backwards compat | ✅ Go 1.x promise (no breaking changes) | ❌ No stability promise yet |
-| Module system | ✅ Go modules (versioned, reproducible) | ⚠️ Package manager (pacte) — path/git deps done, registry pending |
+| Module system | ✅ Go modules (versioned, reproducible) | ⚠️ Package manager (ark) — path/git deps done, registry pending |
 
 ### Where Fides Beats Go
 
@@ -1666,7 +1666,7 @@ uses floating point. That's something C++ and Java cannot do.
 | Loss | Severity | Mitigation |
 |------|----------|------------|
 | AWS Lambda/GCP Cloud Run native support | 🔴 Critical | Fides compiles to WASM — works with any WASM-compatible platform |
-| npm/pip/crates ecosystem | � Significant | Fides stdlib + pacte package manager (Phase 13.4). Start with core libraries |
+| npm/pip/crates ecosystem | � Significant | Fides stdlib + ark package manager (Phase 13.4). Start with core libraries |
 | Node.js event loop | 🟡 For I/O-heavy code | Fides's effect system + native threads. Different model but capable |
 | Existing DevOps tooling | 🟡 Significant | Fides's build system (Phase 11) handles compilation. CI/CD via CLI |
 

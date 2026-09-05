@@ -3405,8 +3405,8 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
                     return Type::Bool;
                 }
                 UnaryOp::BitNot => {
-                    if !TypeChecker_is_numeric(self, ty) {
-                        self.errors.push("Type error: cannot bitwise negate " + type_to_str(ty));
+                    if !TypeChecker_is_integer(self, ty) {
+                        self.errors.push("Type error: cannot bitwise negate " + type_to_str(ty) + " (expected integer type)");
                     }
                     return ty;
                 }
@@ -3426,6 +3426,9 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             }
             if callee == "spawn" || callee == "exec" || callee == "system" || callee == "p_thread_spawn" {
                 TypeChecker_check_capability(self, "Spawn", callee + "()");
+            }
+            if callee == "p_malloc" || callee == "p_free" || callee == "p_malloc_persistent" || callee == "p_arena_save" || callee == "p_arena_restore" {
+                TypeChecker_check_capability(self, "Alloc", callee + "()");
             }
             // GPU kernel builtins
             if callee == "thread_id" || callee == "workgroup_size" || callee == "workgroup_id" || callee == "num_workgroups" {
@@ -3516,7 +3519,10 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             // Check if callee is a local variable with function type (closure call)
             match TypeChecker_lookup(self, callee) {
                 OptType::Some(var_ty) => {
-                    match var_ty {
+                    // Resolve type aliases before checking for Func type
+                    // (e.g. type InterruptHandler = fn() -> void)
+                    var resolved_ty: Type = TypeChecker_resolve_type(self, var_ty);
+                    match resolved_ty {
                         Type::Func(params, ret) => {
                             if params.len() != arg_types.len() {
                                 self.errors.push("Type error: function variable '" + callee + "' expects " + int_to_str(params.len()) + " args, got " + int_to_str(arg_types.len()));

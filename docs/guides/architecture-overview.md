@@ -397,7 +397,7 @@ Native Binary / WASM / SPIR-V / C Source / Running Code
 - Vec/Mat math types: vec2/3/4, mat4, quat with operator overloading + swizzle access
 - Incremental compilation: in-memory cache (`src/inc.rs`), shared across LSP/watch/test harness
 - Profiler (`fidesc profile`), linter (`fidesc lint`), benchmark (`fidesc bench`), formatter (`fidesc fmt`)
-- Package manager (`pacte`), doc generator (`scribe`), coverage tool (`veil`)
+- Package manager (`ark`), doc generator (`scribe`), coverage tool (`veil`)
 - Interactive debugger (`fidesc debug`), native debugger (`fidesc autopsy`)
 - No external dependencies for primary paths: no LLVM, no libc (in Fides binaries), no external assembler, no external linker
 

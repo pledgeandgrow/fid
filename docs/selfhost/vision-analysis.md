@@ -35,7 +35,7 @@ The North Star: one language for OS kernels, web servers, robots, AI, microcontr
 | AI/ML | Complete | Tensor ops, autograd, KV cache, quantization, DP |
 | Safety | Complete | Regions, effects, capabilities, borrow checker, @medical |
 | Industry stdlibs | Partial | banking.fd, medical.fd, clinical.fd, ecu.fd, can.fd, arinc.fd |
-| Tooling | In progress | LSP, formatter, linter, bench, profile, debugger, pacte, scribe, veil |
+| Tooling | In progress | LSP, formatter, linter, bench, profile, debugger, ark, scribe, veil |
 
 ### What works (self-hosted compiler — `compiler/`)
 
@@ -181,7 +181,7 @@ The user's change to `pattern_binding_ir_types` (using `word_repr` for all types
 - LSP (completion, hover, definition)
 - Formatter, linter
 - Debugger (interactive, record/replay, post-mortem, native)
-- Package manager (pacte)
+- Package manager (ark)
 - Doc generator (scribe)
 - Coverage tool (veil)
 

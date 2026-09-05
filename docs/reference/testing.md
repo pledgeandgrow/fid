@@ -1,6 +1,6 @@
 # TEST.md — Fides Test Results
 
-*Last updated: Aug 28, 2026 — verified against actual test runs (265/265 unit tests via cargo test --lib, 8/8 harness tests, 164/165 interpreter, 164/165 C codegen, 165/165 PE, 215 .fd test files, cross-compilation to ARM64/RISC-V/Windows. 1 user-added test_compiler_sized fails on interp+C codegen — unrelated to compiler infrastructure. Skip/known-fail lists cleaned: all previously skipped/known-fail tests now pass.)
+*Last updated: Sep 5, 2026 (session 15 — bootstrap fixpoint achieved). Verified against actual test runs (265/265 unit tests, 209/211 interpreter, 198/211 C codegen matched, 209/211 PE valid, 23/23 self-host tests, 225+ .fd test files, cross-compilation to ARM64/RISC-V/Windows. Bootstrap fixpoint: fides-c2.c == fides-c3.c, SHA256-identical, 701,100 lines.)
 
 ## Legend
 
@@ -37,8 +37,9 @@
 
 ## Interpreter (`fidesc run`)
 
-All 164/165 normal test files pass through the interpreter. The 1 failure
-(test_compiler_sized) is a user-added test unrelated to compiler infrastructure.
+All 209/211 normal test files pass through the interpreter. The 2 failures
+are pre-existing gaps documented in known-bugs.md (associated with the `var`
+feature and other edge cases).
 
 | Test File | Status | Output / Exit Code |
 |-----------|--------|--------|
@@ -152,7 +153,7 @@ All 165 normal test files produce valid PE32+ executables. Verified: MZ/PE signa
 
 ## C Codegen (`fidesc ccompile`)
 
-Portable C code generation, compiled with gcc/clang. **164/165 normal tests produce output matching the interpreter** (1 fail: test_compiler_sized, user-added). Phase 10B: Vec/HashMap/String migrated to Fides stdlib. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack.
+Portable C code generation, compiled with gcc/clang. **198/211 normal tests produce output matching the interpreter** (session 15 baseline). Phase 10B: Vec/HashMap/String migrated to Fides stdlib. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack.
 
 | Test File | Status | Notes |
 |-----------|--------|-------|
@@ -330,7 +331,7 @@ this writing: 195 in root + 23 in subdirs).  Tests are sorted alphabetically by 
 | Pass criterion | No panic on stderr; exit code may be non-zero |
 | What it exercises | AST → IR → tree-walking interpreter |
 | Run by | `fidesc test` (built-in) |
-| Current score | 164/165 normal (1 fail: test_compiler_sized) |
+| Current score | 209/211 normal (session 15 baseline) |
 
 The interpreter is the reference implementation.  A test "passes" if the
 interpreter does not panic or emit a compilation error.  Non-zero exit codes
@@ -344,7 +345,7 @@ interpreter does not panic or emit a compilation error.  Non-zero exit codes
 | Pass criterion | stdout matches interpreter stdout exactly |
 | What it exercises | AST → IR → C source transpilation → external gcc |
 | Run by | `fidesc test` (built-in) |
-| Current score | 164/165 normal (1 fail: test_compiler_sized. Phase 10B: Vec/HashMap/String migrated to Fides stdlib. Binary hardening enabled.) |
+| Current score | 198/211 normal (session 15 baseline. Phase 10B: Vec/HashMap/String migrated to Fides stdlib. Binary hardening enabled.) |
 
 C codegen transpiles the Fides IR to C source code and compiles it with the
 system C compiler (gcc/clang).  A test "passes" only if the executable's
@@ -438,9 +439,9 @@ echo "=== Results: $pass pass, $fail fail ==="
 
 | Batch | Backend | Score | Notes |
 |-------|---------|-------|-------|
-| 1 | Interpreter | 164/165 normal | 1 fail: test_compiler_sized (user-added) |
-| 2 | C Codegen | 164/165 normal | 1 fail: test_compiler_sized. Phase 10B: Vec/HashMap/String migrated to Fides stdlib. Binary hardening enabled. |
-| 3 | PE Emitter | 165/165 normal | All normal tests pass |
+| 1 | Interpreter | 209/211 normal | Session 15 baseline |
+| 2 | C Codegen | 198/211 normal | Session 15 baseline. Phase 10B: Vec/HashMap/String migrated to Fides stdlib. Binary hardening enabled. |
+| 3 | PE Emitter | 209/211 normal | Session 15 baseline |
 | 4 | Native x86-64 | All tested programs match | test_collections, test_db, test_matrix_mul all FIXED |
 
 ## Important Notes

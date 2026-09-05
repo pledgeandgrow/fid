@@ -8,7 +8,7 @@
 
 | Tool             | Rust             | Go            | Python     | Fides       |
 |------------------|------------------|---------------|------------|-------------|
-| Package manager  | Cargo            | go mod        | pip        | **pacte**   |
+| Package manager  | Cargo            | go mod        | pip        | **ark**   |
 | Formatter        | rustfmt          | gofmt         | black      | **forge**   |
 | Linter           | clippy           | staticcheck   | pylint     | **sentinel**|
 | LSP / IDE        | rust-analyzer    | gopls         | Pylance    | **oracle**  |
@@ -22,31 +22,36 @@
 
 ## Name Rationale
 
-### pacte — Package Manager
+### ark -- Package Manager
 
-A **pacte** is French for "pact" — a formal agreement or covenant. When you
-add a dependency, you're making a pact to trust that code. The name reflects
-the contractual nature of Fides — every import is a pact of trust, tracked
-and auditable. Package manifests are `pacte.toml`, lock files are `pacte.lock`,
-and modules install to `pacte_modules/`.
+An **ark** is a vessel that carries and protects precious things. In Fides,
+the ark carries **pacts** — binding agreements of trust from the community.
+When you add a dependency, you load a pact into your ark. The metaphor
+parallels Rust's Cargo + Crates: ark is the vessel (like cargo), pacts are
+the packages (like crates). Package manifests are `ark.toml`, lock files are
+`ark.lock`, and modules install to `ark_modules/`.
 
-**Status: ✅ Implemented** — The package manager is available as the `pacte`
-binary (see `src/pacte.rs`). Supports path dependencies (files and directories),
-git dependencies (clone with `--depth 1`, branch/tag support), lock file
-generation with resolved commit hashes, and a custom TOML parser (zero external
-dependencies). Registry support (pacte.dev) is planned for the future.
+**Status: ✅ Implemented (Rust + self-hosted)** — Two implementations:
+- **Rust ark** (`src/ark.rs`, `src/bin/ark.rs`) — the bootstrap version
+- **Self-hosted ark** (`compiler/ark.fd`) — written in Fides, compiled by
+  the self-hosted compiler (`fides-c3.exe dump-c compiler/ark.fd`)
+
+Supports path dependencies (files and directories), git dependencies (clone
+with `--depth 1`, branch/tag support), lock file generation, and a custom
+TOML parser (zero external dependencies). Registry support (ark.dev) is
+planned for the future.
 
 ```
-pacte init [name]              # create pacte.toml
-pacte add <dep> --path <path>  # add path dependency
-pacte add <dep> --git <url>    # add git dependency
-pacte install                  # install all deps to pacte_modules/
-pacte list                     # list dependencies
-pacte remove <dep>             # remove dependency
-pacte lock                     # generate pacte.lock
-pacte update [dep]             # update dependencies
-pacte search <query>           # search registry (future)
-pacte publish                  # publish to registry (future)
+ark init [name]              # create ark.toml
+ark add <dep> --path <path>  # add path dependency
+ark add <dep> --git <url>    # add git dependency
+ark install                  # install all deps to ark_modules/
+ark list                     # list dependencies
+ark remove <dep>             # remove dependency
+ark lock                     # generate ark.lock
+ark update [dep]             # update dependencies
+ark search <query>           # search registry (future)
+ark publish                  # publish to registry (future)
 ```
 
 ### forge — Formatter
@@ -245,7 +250,7 @@ fidesc audit <file.fd>        # verify IR correctness
 ## Design Principles
 
 1. **One word, lowercase, no prefix.** No `fides-fmt`, no `fidesc-lint`.
-   The tools stand on their own — `pacte`, `scribe`, `veil`. This is
+   The tools stand on their own — `ark`, `scribe`, `veil`. This is
    the Go tradition (`go`, `gofmt`, `delve`) not the Rust tradition
    (`rustc`, `rustfmt`, `rust-analyzer`).
 
@@ -253,7 +258,7 @@ fidesc audit <file.fd>        # verify IR correctness
    formal verification — the core identity of Fides. A developer who
    knows Fides's philosophy can guess the tool names.
 
-3. **No abbreviations.** `pacte` not `pct`, `sentinel` not `sntl`.
+3. **No abbreviations.** `ark` not `pct`, `sentinel` not `sntl`.
    Full words are searchable, memorable, and unambiguous.
 
 4. **Verb-friendly.** Each name works as both a noun ("run the sentinel")
@@ -262,7 +267,7 @@ fidesc audit <file.fd>        # verify IR correctness
 
 5. **Distinct from the compiler.** The compiler is `fidesc`. The tools
    are separate words — they're separate programs with separate concerns.
-   `fidesc` compiles; `pacte` manages packages; `scribe` documents;
+   `fidesc` compiles; `ark` manages packages; `scribe` documents;
    `veil` covers.
 
 ---
@@ -271,7 +276,7 @@ fidesc audit <file.fd>        # verify IR correctness
 
 | Tool     | Status       | Notes |
 |----------|--------------|-------|
-| pacte    | ✅ Implemented | Package manager — path/git deps, pacte.toml, pacte.lock, pacte_modules/ (registry pending) |
+| ark    | ✅ Implemented | Package manager — path/git deps, ark.toml, ark.lock, ark_modules/ (registry pending) |
 | forge    | ✅ Implemented (as `fidesc fmt`) | Code formatter — canonical formatting for Fides syntax |
 | sentinel | ✅ Implemented (as `fidesc lint`) | Linter — unused functions, unused imports |
 | oracle   | ✅ Implemented (as `fidesc lsp`) | LSP server — JSON-RPC, diagnostics, hover, goto-def, completion, references |
@@ -285,7 +290,7 @@ fidesc audit <file.fd>        # verify IR correctness
 
 > The compiler (`fidesc`) already has `run`, `build`, `emit`, `ccompile`,
 > `test`, `repl`, `ir`, `pir`, `ast`, `tokens`, `codegen`, `gpu`, `watch`,
-> `replay`, `sourcemap` commands. The standalone tools (`pacte`, `scribe`,
+> `replay`, `sourcemap` commands. The standalone tools (`ark`, `scribe`,
 > `veil`) are separate binaries built from the same codebase. Others
 > (`forge`, `sentinel`, `oracle`, `probe`, `pulse`, `trial`) are currently
 > `fidesc` subcommands and will eventually become standalone programs.

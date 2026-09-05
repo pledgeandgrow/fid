@@ -109,7 +109,7 @@ The **`build` command** uses the full PIR pipeline (L1→L2→L3 → codegen →
 | Formatter (`fmt.rs`) | Source code formatter | `fmt` |
 | Linter (`compiler.rs`) | Unused function/import detection | `lint` |
 | Benchmark (`main.rs`) | Timing statistics over N runs (interpreter or C native) | `bench` |
-| Package manager (`pacte.rs`) | Dependency management, lock files, install | `pacte` |
+| Package manager (`ark.rs`) | Dependency management, lock files, install | `ark` |
 | Doc generator (`scribe.rs`) | HTML/Markdown docs from .fd source | `scribe` |
 | Coverage tool (`veil.rs`) | Function/line/instruction coverage reporting | `veil` |
 

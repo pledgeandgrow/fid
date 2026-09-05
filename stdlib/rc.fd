@@ -1,0 +1,109 @@
+// Fides Rc/Arc standard library
+//
+// Reference-counted shared ownership.
+//
+// Rc -- single-threaded reference counting (non-atomic)
+// Arc -- atomic reference counting (thread-safe)
+//
+// Both use the p_rc_incr/p_rc_decr and p_atomic_* runtime primitives.
+// The counted value is stored as an i64 (opaque pointer or integer).
+//
+// Usage:
+//   use rc;
+//   var r = rc_new(42);
+//   var r2 = rc_clone(r);
+//   print(rc_get(r));    // 42
+//   print(rc_count(r));  // 2
+//   rc_drop(r);          // refcount: 1
+//   rc_drop(r2);         // refcount: 0 -> freed
+//
+//   var a = arc_new(100);
+//   var a2 = arc_clone(a);
+//   print(arc_get(a));    // 100
+//   print(arc_count(a));  // 2
+//   arc_drop(a2);
+//   arc_drop(a);
+
+module rc;
+
+use core;
+
+// --- Rc (single-threaded) ---
+
+/// Rc -- single-threaded reference counted pointer.
+/// count_addr points to the reference count (i64) on the heap.
+/// value is the wrapped value (i64 / opaque pointer).
+pub struct Rc {
+    count_addr: i64,
+    value: i64,
+}
+
+/// Create a new Rc wrapping a value.
+pub fn rc_new(val: i64) -> Rc {
+    var count_addr: i64 = p_shared_alloc(8);
+    p_atomic_store(count_addr, 1);
+    return Rc { count_addr: count_addr, value: val };
+}
+
+/// Clone an Rc -- increments the refcount and returns a copy.
+pub fn rc_clone(r: Rc) -> Rc {
+    p_atomic_add(r.count_addr, 1);
+    return Rc { count_addr: r.count_addr, value: r.value };
+}
+
+/// Get the wrapped value without affecting the refcount.
+pub fn rc_get(r: Rc) -> i64 {
+    return r.value;
+}
+
+/// Get the current refcount.
+pub fn rc_count(r: Rc) -> i64 {
+    return p_atomic_load(r.count_addr);
+}
+
+/// Drop an Rc -- decrements the refcount. When it hits 0, frees the counter.
+pub fn rc_drop(r: Rc) -> void {
+    var old: i64 = p_atomic_sub(r.count_addr, 1);
+    if old <= 1 {
+        p_free(r.count_addr);
+    }
+}
+
+// --- Arc (atomic, thread-safe) ---
+
+/// Arc -- atomically reference counted pointer (thread-safe).
+pub struct Arc {
+    count_addr: i64,
+    value: i64,
+}
+
+/// Create a new Arc wrapping a value.
+pub fn arc_new(val: i64) -> Arc {
+    var count_addr: i64 = p_shared_alloc(8);
+    p_atomic_store(count_addr, 1);
+    return Arc { count_addr: count_addr, value: val };
+}
+
+/// Clone an Arc -- atomically increments the refcount.
+pub fn arc_clone(a: Arc) -> Arc {
+    p_atomic_add(a.count_addr, 1);
+    return Arc { count_addr: a.count_addr, value: a.value };
+}
+
+/// Get the wrapped value without affecting the refcount.
+pub fn arc_get(a: Arc) -> i64 {
+    return a.value;
+}
+
+/// Get the current refcount (atomic load).
+pub fn arc_count(a: Arc) -> i64 {
+    return p_atomic_load(a.count_addr);
+}
+
+/// Drop an Arc -- atomically decrements the refcount. When it hits 0, frees.
+pub fn arc_drop(a: Arc) -> void {
+    var old: i64 = p_atomic_sub(a.count_addr, 1);
+    if old <= 1 {
+        p_free(a.count_addr);
+    }
+}

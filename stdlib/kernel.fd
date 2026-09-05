@@ -1,0 +1,273 @@
+// stdlib/kernel.fd — Bare-metal OS development helpers
+//
+// Provides structs and helper functions for:
+// - GDT (Global Descriptor Table) setup
+// - IDT (Interrupt Descriptor Table) setup
+// - Page table management (4-level paging)
+// - Serial port I/O (COM1)
+// - Interrupt control (cli/sti/hlt)
+//
+// These are thin wrappers around the p_* bare-metal builtins.
+// They only work in --bare or --boot mode (no OS, no stdlib).
+
+// ─── GDT (Global Descriptor Table) ─────────────────────────────────────────
+
+// GDT descriptor: 2-byte limit + 8-byte base address (10 bytes total)
+struct GdtDescriptor {
+    limit: i16,
+    base: i64,
+}
+
+// GDT entry flags (access byte)
+const GDT_CODE: i64 = 0x9A;       // Present | ring 0 | code | executable | readable
+const GDT_DATA: i64 = 0x92;       // Present | ring 0 | data | writable
+const GDT_TSS:  i64 = 0x89;       // Present | ring 0 | TSS
+
+// GDT entry flags (granularity byte, shifted left 8)
+const GDT_GRAN_4K: i64 = 0x0C00;  // 4KB granularity, 32-bit protected mode
+
+// Initialize a flat GDT with null + code + data segments.
+// gdt_ptr: pointer to a 24-byte buffer (3 entries x 8 bytes)
+pub fn gdt_init_flat(gdt_ptr: i64) {
+    // Entry 0: null descriptor
+    p_gdt_set_entry(gdt_ptr, 0, 0, 0, 0);
+    // Entry 1: kernel code segment (base=0, limit=0xFFFFF, flags=0x9A | 0x0C00)
+    p_gdt_set_entry(gdt_ptr, 1, 0, 0xFFFFF, GDT_CODE | GDT_GRAN_4K);
+    // Entry 2: kernel data segment (base=0, limit=0xFFFFF, flags=0x92 | 0x0C00)
+    p_gdt_set_entry(gdt_ptr, 2, 0, 0xFFFFF, GDT_DATA | GDT_GRAN_4K);
+}
+
+// Load the GDT and reload segment registers.
+// gdt_ptr: pointer to GDT entries, num_entries: number of entries
+pub fn gdt_load(gdt_ptr: i64, num_entries: i64) {
+    // Build the GDT descriptor on the stack
+    // limit = num_entries * 8 - 1
+    val limit = num_entries * 8 - 1;
+    // We need to write a 10-byte struct: [limit: u16][base: u64]
+    // Use inline asm to construct and load it
+    asm!("lgdt [rax]",
+        in("rax") gdt_ptr,
+    );
+    // Reload segment registers
+    // mov ax, 0x10 (data segment selector)
+    // mov ds, ax; mov es, ax; mov fs, ax; mov gs, ax; mov ss, ax
+    asm!("mov $0, 0x10", out("eax") 0);
+    asm!("mov ds, ax");
+    asm!("mov es, ax");
+    asm!("mov fs, ax");
+    asm!("mov gs, ax");
+    asm!("mov ss, ax");
+    // Far jump to reload CS: jmp 0x08:<next_label>
+    // This is tricky in inline asm; user may need to do it manually
+}
+
+// ─── IDT (Interrupt Descriptor Table) ──────────────────────────────────────
+
+// IDT descriptor: 2-byte limit + 8-byte base address (10 bytes total)
+struct IdtDescriptor {
+    limit: i16,
+    base: i64,
+}
+
+// IDT entry flags
+const IDT_PRESENT: i64 = 0x80;    // Present bit
+const IDT_INTERRUPT: i64 = 0x0E;  // Interrupt gate
+const IDT_TRAP: i64 = 0x0F;       // Trap gate
+
+// Set an interrupt handler for a given vector.
+// idt_ptr: pointer to IDT entries (256 entries x 16 bytes = 4096 bytes)
+// vector: interrupt vector number (0-255)
+// handler: address of the interrupt handler function
+pub fn idt_set_handler(idt_ptr: i64, vector: i64, handler: i64) {
+    p_idt_set_entry(idt_ptr, vector, handler, IDT_PRESENT | IDT_INTERRUPT);
+}
+
+// Load the IDT.
+// idt_ptr: pointer to IDT entries, num_entries: number of entries
+pub fn idt_load(idt_ptr: i64, num_entries: i64) {
+    val limit = num_entries * 16 - 1;
+    // Build descriptor and lidt
+    // User should call p_lidt with a pointer to a 10-byte descriptor
+    // For simplicity, we use inline asm
+    asm!("lidt [rax]",
+        in("rax") idt_ptr,
+    );
+}
+
+// ─── Paging (4-level page tables) ──────────────────────────────────────────
+
+// Page table entry flags
+const PAGE_PRESENT: i64 = 1;      // Present bit
+const PAGE_WRITABLE: i64 = 2;     // Read/write
+const PAGE_USER: i64 = 4;         // User-accessible
+const PAGE_WRITE_THROUGH: i64 = 8; // Write-through caching
+const PAGE_CACHE_DISABLE: i64 = 16; // Cache disabled
+const PAGE_ACCESSED: i64 = 32;    // Accessed
+const PAGE_DIRTY: i64 = 64;       // Dirty
+const PAGE_HUGE: i64 = 128;       // Huge page (2MB at PD level)
+const PAGE_GLOBAL: i64 = 256;     // Global page
+const PAGE_NX: i64 = 0x8000000000000000; // No-execute (bit 63)
+
+// Default kernel page flags: present + writable
+const PAGE_KERNEL: i64 = PAGE_PRESENT | PAGE_WRITABLE;
+
+// Map a virtual page to a physical page.
+// pml4: PML4 table base address (must be 4KB-aligned)
+// virt: virtual address to map (will be page-aligned)
+// phys: physical address to map to (will be page-aligned)
+pub fn page_map(pml4: i64, virt: i64, phys: i64) {
+    p_page_map(pml4, virt, phys, PAGE_KERNEL);
+}
+
+// Map a virtual page with custom flags.
+pub fn page_map_flags(pml4: i64, virt: i64, phys: i64, flags: i64) {
+    p_page_map(pml4, virt, phys, flags);
+}
+
+// Unmap a virtual page.
+pub fn page_unmap(pml4: i64, virt: i64) {
+    p_page_unmap(pml4, virt);
+}
+
+// Identity-map a range of pages (virt == phys).
+// pml4: PML4 base, start: starting address, num_pages: number of 4KB pages
+pub fn page_identity_map_range(pml4: i64, start: i64, num_pages: i64) {
+    var i = 0;
+    while i < num_pages {
+        val addr = start + i * 4096;
+        p_page_map(pml4, addr, addr, PAGE_KERNEL);
+        i += 1;
+    }
+}
+
+// ─── Serial Port (COM1) ────────────────────────────────────────────────────
+
+const COM1_PORT: i64 = 0x3F8;
+
+// Initialize COM1 serial port (115200 baud, 8N1)
+pub fn serial_init() {
+    p_serial_init();
+}
+
+// Write a single byte to COM1
+pub fn serial_putc(c: i64) {
+    p_serial_write(c);
+}
+
+// Write a null-terminated string to COM1
+// str_ptr: pointer to string data (null-terminated)
+pub fn serial_puts(str_ptr: i64) {
+    var ptr = str_ptr;
+    while true {
+        val c = p_phys_read64(ptr);
+        if c == 0 {
+            break;
+        }
+        p_serial_write(c & 0xFF);
+        ptr += 1;
+    }
+}
+
+// Write a string to COM1 (Fides string type)
+pub fn serial_print(s: str) {
+    var i = 0;
+    val len = p_str_length(s);
+    while i < len {
+        val c = p_str_byte_at(s, i);
+        p_serial_write(c);
+        i += 1;
+    }
+}
+
+// Write an integer as decimal to COM1
+pub fn serial_print_int(n: i64) {
+    if n == 0 {
+        p_serial_write(48); // '0'
+        return;
+    }
+    var num = n;
+    if num < 0 {
+        p_serial_write(45); // '-'
+        num = -num;
+    }
+    // Extract digits in reverse
+    var digits = Vec::new();
+    while num > 0 {
+        digits.push(num % 10 + 48); // '0' = 48
+        num = num / 10;
+    }
+    // Print in correct order
+    var i = digits.len() - 1;
+    while i >= 0 {
+        p_serial_write(digits.get(i));
+        i -= 1;
+    }
+}
+
+// Check if serial data is available to read
+pub fn serial_available() -> bool {
+    return p_serial_ready() != 0;
+}
+
+// Read a byte from COM1 (blocks until data available)
+pub fn serial_getc() -> i64 {
+    return p_serial_read();
+}
+
+// ─── Interrupt Control ─────────────────────────────────────────────────────
+
+// Disable interrupts
+pub fn cli() {
+    p_cli();
+}
+
+// Enable interrupts
+pub fn sti() {
+    p_sti();
+}
+
+// Halt the CPU (wait for next interrupt)
+pub fn hlt() {
+    p_hlt();
+}
+
+// Halt and catch fire — infinite loop with hlt
+pub fn halt_forever() {
+    while true {
+        p_hlt();
+    }
+}
+
+// ─── I/O Port Access ───────────────────────────────────────────────────────
+
+// Read a byte from an I/O port
+pub fn inb(port: i64) -> i64 {
+    return p_inb(port);
+}
+
+// Write a byte to an I/O port
+pub fn outb(port: i64, val: i64) {
+    p_outb(port, val);
+}
+
+// ─── Physical Memory Access ────────────────────────────────────────────────
+
+// Read 8 bytes from a physical address
+pub fn phys_read64(addr: i64) -> i64 {
+    return p_phys_read64(addr);
+}
+
+// Write 8 bytes to a physical address
+pub fn phys_write64(addr: i64, val: i64) {
+    p_phys_write64(addr, val);
+}
+
+// ─── CPU Register Access ───────────────────────────────────────────────────
+
+pub fn cr0_read() -> i64 { return p_cr0_read(); }
+pub fn cr0_write(val: i64) { p_cr0_write(val); }
+pub fn cr3_read() -> i64 { return p_cr3_read(); }
+pub fn cr3_write(val: i64) { p_cr3_write(val); }
+pub fn cr4_read() -> i64 { return p_cr4_read(); }
+pub fn cr4_write(val: i64) { p_cr4_write(val); }
+pub fn invlpg(addr: i64) { p_invlpg(addr); }

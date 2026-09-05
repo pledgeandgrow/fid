@@ -1,6 +1,11 @@
 # Fides Language — Vision
 
 > Build the last programming language the world needs.
+>
+> **Status (Sep 5, 2026 — session 15):** Bootstrap fixpoint achieved. The
+> Fides compiler is self-hosted (25 modules, 61K LOC) and reproduces
+> byte-identical output across generations (`fides-c2.c == fides-c3.c`,
+> SHA256-identical, 701,100 lines). Three generations verified end-to-end.
 
 ## Mission
 

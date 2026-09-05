@@ -1246,6 +1246,11 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Str(CompactString::from(value.as_str())))
             }
 
+            Inst::ConstFnRef { name } => {
+                // Function reference — treated as a string for name-based lookup
+                ExecOutcome::Value(Value::Str(CompactString::from(name.as_str())))
+            }
+
             Inst::ConstNull { .. } => {
                 ExecOutcome::Value(Value::Ptr(0))
             }
@@ -4666,6 +4671,34 @@ impl Interpreter {
             "p_phys_write64" => {
                 // Write 8 bytes to physical address — simulated
                 ExecOutcome::Value(Value::Void)
+            }
+
+            // ─── Phase 5A.5: GDT management (bare-metal) ───
+            "p_lgdt" => {
+                // Load GDT register — simulated
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_gdt_set_entry" => {
+                // Set GDT entry: (gdt_ptr, index, base, limit, flags) — simulated
+                ExecOutcome::Value(Value::Void)
+            }
+
+            // ─── Phase 5A.6: Serial port I/O (bare-metal) ───
+            "p_serial_init" => {
+                // Initialize COM1 serial port — simulated
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_serial_write" => {
+                // Write one byte to COM1 — simulated
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_serial_read" => {
+                // Read one byte from COM1 — simulated, returns 0
+                ExecOutcome::Value(Value::Int(0))
+            }
+            "p_serial_ready" => {
+                // Check if data is available — simulated, returns false
+                ExecOutcome::Value(Value::Int(0))
             }
 
             // ─── Phase 2A.8: Allocator builtins ───

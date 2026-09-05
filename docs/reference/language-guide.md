@@ -810,27 +810,37 @@ Fides has 69 stdlib modules (~18,200 LOC). Key modules:
 
 ## 10. Self-Hosting
 
-Fides is being self-hosted — the compiler is being rewritten from Rust
-(`src/*.rs`, ~88K LOC) into Fides (`compiler/*.fd`, ~42K LOC).
+**The Fides compiler is self-hosted.** The compiler has been rewritten from
+Rust (`src/*.rs`, ~91K LOC) into Fides (`compiler/*.fd`, ~61K LOC) and
+achieves a **bootstrap fixpoint**: the self-hosted compiler reproduces
+byte-identical output across generations.
 
-### Current State
+### Current State (session 15)
 
-- **17 active modules** in `compiler/`:
+- **25 modules** in `compiler/`:
   `token`, `diag`, `json`, `fmt`, `ast`, `lexer`, `parser`, `ir`,
   `typechecker`, `lower`, `mono`, `borrowck`, `pir`, `opt`, `codegen_c`,
-  `compiler`, `comptime_eval`
+  `compiler`, `comptime_eval`, `flat_ast`, `lsp`, `pe`, `peephole`,
+  `regalloc`, `codegen_x64`, `main`, `inc`
 - **23/23 self-host tests pass** on all 3 backends (interpreter, C codegen,
   PE emitter)
-- **SH-10 critical fixes complete:** All 7 blocking bugs fixed (Inst::Cast,
-  ConstFloat, CallPtr, comptime stubs, Expr::Try, emit_defers, import errors)
+- **Bootstrap fixpoint achieved** (session 15):
+  - Rust → c1 (706K lines) → c2 (701K lines) → c3 (701K lines)
+  - **fides-c2.c == fides-c3.c** (SHA256-identical, 0 diffs / 701,100 lines)
+  - Three generations verified, all run test_simple.fd correctly
 
 ### Bootstrap Strategy
 
-The bootstrap uses the C codegen path:
-1. Rust compiler (`fidesc`) compiles `compiler/*.fd` to C source
-2. C source is compiled with `gcc` to produce a native `fides-bootstrap`
-3. `fides-bootstrap` is used to compile Fides programs
-4. Eventually `fides-bootstrap` compiles itself (full bootstrap)
+The bootstrap uses the C codegen path with TCC:
+1. Rust compiler (`fidesc`) compiles `compiler/*.fd` → C source (706K lines)
+2. C source compiled with TCC → `fides-c.exe` (first-generation)
+3. `fides-c.exe` compiles `compiler/*.fd` → C source (701K lines)
+4. C source compiled with TCC → `fides-c2.exe` (second-generation)
+5. `fides-c2.exe` compiles `compiler/*.fd` → C source (701K lines)
+6. **Step 5 output == Step 3 output** → bootstrap fixpoint verified
+
+A 256MB stack wrapper is required because TCC's default 4KB PE stack
+reserve is insufficient for the compiler's deep recursion.
 
 ### Key Adaptations (Rust → Fides)
 
@@ -847,15 +857,16 @@ The bootstrap uses the C codegen path:
 | `mem::replace`/`swap` | Manual temp variables |
 | `derive(Debug, Clone)` | `@derive(Debug, Clone)` |
 | `?` operator | Explicit `match` propagation |
+| `==` on enums | Manual `*_eq()` helper functions (tag-based comparison) |
+| `==` on strings | Lowered to `p_str_equal` by the compiler automatically |
 
-### Remaining Work
+### Remaining Work (post-fixpoint)
 
-- **SH-9 bootstrap:** 3 remaining bugs (unsafe block init, Vec method
-  dispatch, undefined function lookups)
-- **SH-10 medium items:** DynCall codegen, TryBlock, trait impl verification,
-  borrowck enablement, OptionalFieldAccess, FString dispatch
-- **Differential testing:** Compare self-hosted compiler output against Rust
-  compiler output for all test programs
+- **Rust vs self-hosted parity gap**: c1=706K vs c2=701K lines (~5K difference)
+- **Debug prints**: 287 `p_eprint_str` calls (go to stderr, don't affect fixpoint)
+- **Mirror `var` feature to `compiler/*.fd`**: Rust supports module-level `var`/`pub var`
+- **PE emitter full compiler support**: struct/enum, floats, many-arg calls
+- **Linux native codegen integration**: port `elf64.rs`, `linker.rs`, `runtime_linux.rs`
 
 ---
 

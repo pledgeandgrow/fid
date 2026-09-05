@@ -1504,6 +1504,7 @@ pub fn PeCodeGen_collect_strings(self: &mut PeCodeGen, module: IrModule) -> Vec 
             var vi: ValueIdInst = func.insts.get(ii);
             match vi.inst {
                 Inst::ConstStr(s) => { all_strings.push(s); }
+                Inst::ConstFnRef(s) => { all_strings.push(s); }
                 Inst::Panic(s) => { all_strings.push(s); }
                 _ => {}
             }
@@ -2128,6 +2129,15 @@ pub fn PeCodeGen_gen_inst(self: &mut PeCodeGen, id: i64, inst: Inst, frame: &PeS
         Inst::ConstStr(value) => {
             PeCodeGen_gen_inst_const_str(self, dst, value);
         }
+        Inst::ConstFnRef(name) => {
+            var func_label: i64 = PeCodeGen_get_func_label(self, name);
+            if func_label >= 0 {
+                X86Encoder_lea_label(&mut self.enc, REG_RAX, func_label);
+            } else {
+                X86Encoder_xor_self(&mut self.enc, REG_RAX);
+            }
+            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+        }
         Inst::ConstFloat(_, _) => {
             PeCodeGen_gen_inst_const_float(self, dst);
         }
@@ -2450,6 +2460,10 @@ pub fn PeCodeGen_gen_call(self: &mut PeCodeGen, func_name: str, args: Vec, dst: 
     var lbl: i64 = PeCodeGen_get_func_label(self, func_name);
     if lbl >= 0 {
         X86Encoder_call_label(&mut self.enc, lbl);
+    } else {
+        // Unresolved function: emit ud2 (trap) instead of silently skipping.
+        // This prevents malformed output when externs are unavailable.
+        X86Encoder_ud2(&mut self.enc);
     }
 
     // add rsp, call_space

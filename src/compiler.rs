@@ -2154,6 +2154,13 @@ fn strip_ungranted_caps(module: &mut IrModule, granted_caps: &[String]) {
                         callees.push(value.clone());
                     }
                 }
+                Inst::ConstFnRef { name } => {
+                    // Function reference — address taken
+                    if known_functions.contains(name) {
+                        address_taken.insert(name.clone());
+                        callees.push(name.clone());
+                    }
+                }
                 Inst::CallPtr { .. } | Inst::DynCall { .. } => {
                     // Indirect call — can't determine target statically.
                     // We conservatively keep all address-taken functions.

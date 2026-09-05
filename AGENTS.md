@@ -2,8 +2,38 @@
 
 > This file gives AI assistants (and humans) the context needed to work on the
 > Fides compiler safely. Read this before making changes.
+>
+> **Fides is self-hosted and independent.** The primary compiler is in
+> `compiler/*.fd` (26 modules, 61,885 LOC). The Rust source in `src/*.rs` is
+> the bootstrap reference, used only when `compiler/*.fd` changes. For everyday
+> work (writing programs, adding stdlib, adding tests, building tools), use
+> `release/fides-c3.exe` directly — no Rust build needed.
 
 ## Build & Test Commands
+
+### Self-hosted compiler (everyday work)
+
+```bash
+# The self-hosted compiler is already built in release/fides-c3.exe
+# Use it directly for compiling Fides programs:
+
+# Compile a Fides program to C, then to a native executable
+.\release\fides-c3.exe ccompile tests/hello.fd -o hello.exe
+
+# Run a Fides file in the IR interpreter
+.\release\fides-c3.exe run tests/hello.fd
+
+# Dump C code (for inspection)
+.\release\fides-c3.exe dump-c tests/hello.fd > hello.c
+
+# Run the LSP server
+.\release\fides-c3.exe lsp
+
+# Format a file
+.\release\fides-c3.exe fmt tests/hello.fd
+```
+
+### Rust bootstrap compiler (only when changing compiler/*.fd)
 
 ```bash
 # Build (release — what verify.sh uses)
@@ -119,35 +149,41 @@ cargo build
 ./target/release/veil <file.fd> [--format text|html] [--output <dir>]
 ```
 
-## Current Baseline (as of Sep 5, 2026 — session 15)
+## Current Baseline (post-fixpoint — Fides is self-hosted and independent)
 
 ```
-Interpreter:  209/211 passed
-C Codegen:    198/211 matched
-PE Emitter:   209/211 valid
-Self-host:    23/23 pass on interp + PE (tests/compiler/)
-Bootstrap:    3 generations verified (gen1→gen2→gen3, all run test_simple.fd)
-Source:       52 .rs files, 91,038 LOC
-Stdlib:       69 .fd modules, 16,090 LOC
-Self-host:    25 .fd modules, 61,145 LOC (token, diag, json, fmt, ast, lexer, parser, ir, typechecker, lower, mono, borrowck, pir, opt, codegen_c, compiler, comptime_eval, flat_ast, lsp, pe, peephole, regalloc, codegen_x64, main, inc — all compile + pass tests)
-  flat_ast.fd: FULL PORT (dump-ast-flat serialization, 1259 lines) — session 9
-  comptime_eval.fd: FULL PORT (process_gen, substitute, I-5A, I-5D, reflection) — session 7
-  pe.fd: 25+ runtime stubs (print, string, vec, map, float, bool) — session 7
-  inc.fd: incremental compilation cache (166 lines)
-Bootstrap:    release/fides-c.exe self-compiles → fides-c2_new.exe → fides-c3.exe (3 generations, all work)
-Fixpoint:     ACHIEVED — fides-c2.c == fides-c3.c (0 diffs / 701,100 lines, byte-identical)
-Category A:   RESOLVED (session 15: TCC 4KB stack → 256MB stack wrapper; type_eq str_equal fix; large match split; non-ASCII → ASCII)
-Category B:   B5 (float bits) FIXED, B6/B7/B8 AT PARITY (session 14)
-Category E:   RESOLVED — c2==c3 proves no non-determinism (session 15)
-Safety:       SH-12 DONE — C codegen recursion limit, p_malloc OOM abort, --max-steps/--max-memory/--timeout, test runner step limit, Windows path fixes, tcc auto-detection, crash handlers (VEH+SIGSEGV), all ported to Rust + Fides codegen
-Docs:         24 docs/ + 4 root = 28 .md files
-Binaries:     4 (fidesc, ark, scribe, veil)
+SELF-HOSTED COMPILER (primary):
+  compiler/*.fd:  26 modules, 61,885 LOC — THE COMPILER
+  Fixpoint:       fides-c2.c == fides-c3.c (0 diffs / 701,158 lines, byte-identical)
+  Bootstrap:      3 generations verified (Rust → c1 → c2 → c3, all work)
+  Use:            release/fides-c3.exe for everyday work
+
+RUST BOOTSTRAP (reference only):
+  src/*.rs:       52 files, 91,038 LOC — bootstrap reference
+  Used when:      compiler/*.fd changes (regenerate C1, verify fixpoint)
+
+TESTS:
+  Interpreter:    209/211 passed
+  C Codegen:      198/211 matched
+  PE Emitter:     209/211 valid
+  Self-host:      23/23 pass on interp + PE (tests/compiler/)
+
+STDLIB:
+  stdlib/*.fd:    70 modules, 18,242 LOC (including rc.fd, kernel.fd)
+
+RECENT IMPROVEMENTS:
+  Sandbox:        Alloc capability enforced (p_malloc/p_free blocked in sandbox)
+  Rc/Arc:         stdlib/rc.fd — reference counting (rc_new, rc_clone, rc_drop, etc.)
+  @repr(C):       C-compatible struct layout for hardware/FFI/kernel
+  Kernel:         stdlib/kernel.fd — OS kernel primitives started
+
+Binaries:     4 (fidesc, ark, scribe, veil) — fidesc is bootstrap only
 ```
 
 **Build directories:**
-- `target/` — Rust compiler output (`fidesc.exe`) — gitignored
-- `release/` — Self-hosted compiler output (`fides-c.c`, `fides-c.exe`) — gitignored
-- Build script: `.\build-selfhost.ps1` (Windows) or `./bootstrap-fast.sh` (Linux)
+- `target/` — Rust bootstrap compiler output (`fidesc.exe`) — gitignored
+- `release/` — Self-hosted compiler output (`fides-c3.exe`, generated C) — gitignored
+- `compiler/` — Self-hosted compiler source (26 `.fd` modules) — THE PRIMARY COMPILER
 
 **Changelog:** See `docs/reference/changelog.md` for the full history of
 features and fixes. (Previously duplicated here — removed to avoid maintaining

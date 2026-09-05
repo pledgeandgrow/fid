@@ -78,7 +78,7 @@ implementation (session 11) and not core codegen bugs.
 - Benchmarking (`fidesc bench`)
 - Stack traces on panic
 - C header parser → Fides FFI bindings
-- Package manager (pacte — path/git deps, no registry yet)
+- Package manager (ark -- path/git deps, no registry yet)
 - Doc generator (scribe)
 - Coverage tool (veil)
 
@@ -102,6 +102,7 @@ implementation (session 11) and not core codegen bugs.
 - **`.exe` extension auto-appended** — `ccompile` and `build` now produce `.exe` output without manual rename (session 8)
 - **🎉 BOOTSTRAP FIXPOINT ACHIEVED** — fides-c2.c == fides-c3.c (SHA256-identical, 701,100 lines, session 15)
 - **Three generations verified** — Rust → c1 → c2 → c3, all run test_simple.fd correctly (session 15)
+- **Package manager ported to Fides** — `compiler/ark.fd` (740 lines) — self-hosted ark, compiled by fides-c3 (session 15)
 - PE emitter currently supports simple programs; full compiler source support is in progress
 
 ---

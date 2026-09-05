@@ -1,6 +1,6 @@
 # Fides Language — Feature Status
 
-*Last updated: Aug 28, 2026 — verified against actual source code and test runs.
+*Last updated: Sep 5, 2026 (session 15 — bootstrap fixpoint achieved). Verified against actual source code and test runs.
 See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 *See `docs/reference/syntax.md` for full language syntax reference.*
 *See `docs/roadmap/security-roadmap.md` for security annotation details.*
@@ -24,7 +24,7 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | IR Interpreter (interp.rs) | ✅ | Runs IR directly via `fidesc run` |
 | PE Emitter (pe.rs) | ✅ | Generates native x64 PE executables + flat binary (bare-metal mode) |
 | ELF64 Emitter (elf64.rs) | ✅ | Generates native ELF64 executables on Linux (zero external tools) + relocatable objects |
-| C Codegen (codegen_c.rs) | ✅ | Generates C code, 164/165 normal tests match interpreter output (1 user-added test_compiler_sized fails — unrelated). Phase 10B: Print calls Fides Vec_to_str/HashMap_to_str for formatting. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic via p_call_stack. Rc/Arc runtime via p_rc_incr/p_rc_decr. Drop trait: compiler-inserted drop calls. Negative size checks on p_malloc/p_shared_alloc/p_allocator_alloc. ftell failure check on p_file_read/p_file_size. |
+| C Codegen (codegen_c.rs) | ✅ | Generates C code, 198/211 tests match interpreter output. Phase 10B: Print calls Fides Vec_to_str/HashMap_to_str for formatting. Binary hardening: stack canaries, PIE/ASLR, RELRO, NX stack. Stack traces on panic via p_call_stack. Rc/Arc runtime via p_rc_incr/p_rc_decr. Drop trait: compiler-inserted drop calls. Negative size checks on p_malloc/p_shared_alloc/p_allocator_alloc. ftell failure check on p_file_read/p_file_size. |
 | PIR (pir.rs) | ✅ | PIR L1/L2/L3, `fidesc pir` command |
 | Optimizer (opt.rs) | ✅ | 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. 22 in default pass list. Enabled by default in `build` (use `--no-opt` to disable). `--lto` for aggressive inlining. |
 | Peephole (peephole.rs) | ✅ | 9 passes, always on in `build` command: redundant moves, zero idiom, nop arithmetic, branch threading, dead store, redundant test, store-to-load forwarding, LEA coalescing, cmp+setcc+jcc instruction selection |
@@ -735,10 +735,10 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 | Parser | 100% | — | — |
 | Type Checker | 100% | — | — |
 | IR Lowering | 100% | — | — |
-| Interpreter | 164/165 normal | — | 1 fail: test_compiler_sized (user-added) |
-| PE Emitter | 165/165 normal | — | All normal tests pass. |
+| Interpreter | 209/211 normal | — | Session 15 baseline |
+| PE Emitter | 209/211 normal | — | Session 15 baseline |
 | ELF64 Emitter | ✅ | — | Working executables on Linux (zero external tools) |
-| C Codegen | 164/165 normal | — | 1 fail: test_compiler_sized. Binary hardening enabled. |
+| C Codegen | 198/211 normal | — | Session 15 baseline. Binary hardening enabled. |
 | Multi-arch Codegen | ✅ | — | x86-64, ARM64, RISC-V assembly all work |
 | Cross-compilation (ARM64) | ✅ | — | `build --target arm64-linux` → AArch64 ELF64 (27KB) |
 | Cross-compilation (RISC-V) | ✅ | — | `build --target riscv64-linux` → RISC-V ELF64 (29KB) |
@@ -764,5 +764,19 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 ### Test Coverage
 
 **See `AGENTS.md` → "Current Baseline"** for authoritative test counts.
-(164/165 on interpreter + C codegen, 165/165 PE, 265/265 unit tests, 215 .fd
-test files, 69 stdlib modules, 51 source files, 4 binaries.)
+(209/211 on interpreter, 198/211 C codegen, 209/211 PE, 265/265 unit tests,
+225+ .fd test files, 69 stdlib modules, 52 source files, 4 binaries.)
+
+### Self-Hosting (session 15)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Self-compilation | ✅ | `fides-c.exe` compiles `compiler/main.fd` → `fides-c2.exe` (EXIT 0) |
+| Bootstrap fixpoint | ✅ | `fides-c2.c` == `fides-c3.c` (SHA256-identical, 701,100 lines) |
+| Three generations | ✅ | Rust → c1 → c2 → c3, all run test_simple.fd correctly |
+| Self-host modules | ✅ | 25 `.fd` modules, 61,145 LOC |
+| Self-host tests | ✅ | 23/23 pass on interpreter + PE |
+| PE emitter (self-hosted) | ✅ | `compiler/pe.fd` generates native Windows PE executables |
+| LSP server (self-hosted) | ✅ | `compiler/lsp.fd` (1,082 lines) — JSON-RPC over stdio |
+| Linux native codegen (self-hosted) | ⚠️ | `peephole.fd` + `regalloc.fd` + `codegen_x64.fd` ported but not integrated |
+| Module-level `var` in self-hosted | ❌ | Rust compiler supports it, self-hosted compiler does not yet |

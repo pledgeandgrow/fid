@@ -487,6 +487,12 @@ impl CCodeGen {
             ("p_page_unmap", &[I64, I64]),
             ("p_phys_read64", &[I64]),
             ("p_phys_write64", &[I64, I64]),
+            ("p_lgdt", &[I64]),
+            ("p_gdt_set_entry", &[I64, I64, I64, I64, I64]),
+            ("p_serial_init", &[]),
+            ("p_serial_write", &[I64]),
+            ("p_serial_read", &[]),
+            ("p_serial_ready", &[]),
             ("p_simd_add", &[I64, I64]),
             ("p_simd_sub", &[I64, I64]),
             ("p_simd_mul", &[I64, I64]),
@@ -633,7 +639,8 @@ impl CCodeGen {
             "p_print_float", "p_print_newline", "p_free", "p_arena_restore", "p_region_free", "p_panic",
             "p_socket_close",
             "p_cli", "p_sti", "p_cr3_write", "p_invlpg", "p_page_map", "p_page_unmap",
-            "p_phys_write64",
+            "p_phys_write64", "p_lgdt", "p_gdt_set_entry",
+            "p_serial_init", "p_serial_write",
             "p_tensor_set",
             "p_json_set", "p_json_set_int", "p_json_set_float", "p_json_set_bool",
             "p_json_append", "p_json_append_int", "p_json_append_float",
@@ -887,6 +894,12 @@ impl CCodeGen {
         wln!(self, "void p_page_unmap(int64_t cr3, int64_t virt);");
         wln!(self, "int64_t p_phys_read64(int64_t addr);");
         wln!(self, "void p_phys_write64(int64_t addr, int64_t val);");
+        wln!(self, "void p_lgdt(int64_t gdt_desc);");
+        wln!(self, "void p_gdt_set_entry(int64_t gdt_ptr, int64_t index, int64_t base, int64_t limit, int64_t flags);");
+        wln!(self, "void p_serial_init(void);");
+        wln!(self, "void p_serial_write(int64_t c);");
+        wln!(self, "int64_t p_serial_read(void);");
+        wln!(self, "int64_t p_serial_ready(void);");
         // SIMD builtins (Phase 5C) — elementwise double4 operations on Fides Vec
         wln!(self, "int64_t p_simd_add(int64_t a, int64_t b);");
         wln!(self, "int64_t p_simd_sub(int64_t a, int64_t b);");
@@ -1191,6 +1204,15 @@ impl CCodeGen {
                             self.string_consts.insert(value.clone(), name);
                         }
                     }
+                    if let Some(Inst::ConstFnRef { name }) = func.instructions.get(&inst_id) {
+                        if !self.string_consts.contains_key(name) {
+                            let cname = format!("_str{}", idx);
+                            idx += 1;
+                            let escaped = Self::escape_c_string(name);
+                            wln!(self, "static const char {}[] = \"{}\";", cname, escaped);
+                            self.string_consts.insert(name.clone(), cname);
+                        }
+                    }
                 }
             }
         }
@@ -1242,31 +1264,53 @@ impl CCodeGen {
     fn emit_struct_defs(&mut self, module: &IrModule) {
         wln!(self, "// ─── Struct definitions ───");
         for (name, layout) in &module.struct_layouts {
-            wln!(self, "struct {}_s {{", name);
-            for (i, (_fname, field_ty, offset)) in layout.fields.iter().enumerate() {
-                // Calculate field size from offsets: next field's offset (or
-                // total struct size for the last field) minus this field's offset.
-                let field_size: u64 = if i + 1 < layout.fields.len() {
-                    layout.fields[i + 1].2 as u64 - *offset as u64
-                } else {
-                    layout.size - *offset as u64
-                };
-                if field_size > 8 {
-                    // Enum-typed fields are stored inline with their full size
-                    // (e.g. OptString is 16 bytes, Type is 40 bytes).
-                    // Emit as an int64_t array to match the lowerer's layout.
-                    let slots = field_size / 8;
-                    wln!(self, "    int64_t field_{}[{}];", i, slots);
-                } else {
-                    // All non-enum fields get exactly 8 bytes in the lowerer's
-                    // uniform representation. Use int64_t for bool fields
-                    // (which C would make 1 byte, causing layout mismatch).
-                    match field_ty {
-                        IrType::Bool => {
-                            wln!(self, "    int64_t field_{};", i);
-                        }
-                        _ => {
-                            wln!(self, "    {} field_{};", Self::c_type(field_ty), i);
+            if layout.repr_c {
+                // @repr(C) struct: emit with natural C types and explicit padding
+                wln!(self, "struct {}_s {{", name);
+                let mut prev_offset: u64 = 0;
+                for (i, (_fname, field_ty, offset)) in layout.fields.iter().enumerate() {
+                    // Emit padding bytes if needed to match the layout
+                    if *offset as u64 > prev_offset {
+                        let pad = *offset as u64 - prev_offset;
+                        wln!(self, "    char _pad_{}[{}];", i, pad);
+                    }
+                    wln!(self, "    {} field_{};", Self::c_type(field_ty), i);
+                    // Calculate field size
+                    let field_size: u64 = if i + 1 < layout.fields.len() {
+                        layout.fields[i + 1].2 as u64 - *offset as u64
+                    } else {
+                        layout.size - *offset as u64
+                    };
+                    prev_offset = *offset as u64 + field_size;
+                }
+                // Final padding to reach struct size
+                if layout.size > prev_offset {
+                    wln!(self, "    char _pad_end[{}];", layout.size - prev_offset);
+                }
+                wln!(self, "}} __attribute__((aligned({})));", layout.align);
+                wln!(self, "");
+                // Skip the default closing below — already emitted
+                continue;
+            } else {
+                // Default Fides layout: uniform 8-byte slots
+                wln!(self, "struct {}_s {{", name);
+                for (i, (_fname, field_ty, offset)) in layout.fields.iter().enumerate() {
+                    let field_size: u64 = if i + 1 < layout.fields.len() {
+                        layout.fields[i + 1].2 as u64 - *offset as u64
+                    } else {
+                        layout.size - *offset as u64
+                    };
+                    if field_size > 8 {
+                        let slots = field_size / 8;
+                        wln!(self, "    int64_t field_{}[{}];", i, slots);
+                    } else {
+                        match field_ty {
+                            IrType::Bool => {
+                                wln!(self, "    int64_t field_{};", i);
+                            }
+                            _ => {
+                                wln!(self, "    {} field_{};", Self::c_type(field_ty), i);
+                            }
                         }
                     }
                 }
@@ -1482,6 +1526,14 @@ impl CCodeGen {
                     format!("\"{}\"", escaped)
                 });
                 wln!(self, "    {} = {};", dst, const_name);
+            }
+            Inst::ConstFnRef { name } => {
+                // Function reference — emit the function name as a string for name-based lookup
+                let const_name = self.string_consts.get(name).cloned().unwrap_or_else(|| {
+                    let escaped = Self::escape_c_string(name);
+                    format!("\"{}\"", escaped)
+                });
+                wln!(self, "    {} = (int64_t){};", dst, const_name);
             }
             Inst::ConstNull { .. } => {
                 wln!(self, "    {} = NULL;", dst);
@@ -3433,6 +3485,12 @@ impl CCodeGen {
         wln!(self, "static int64_t _phys_mem[65536];");
         wln!(self, "int64_t p_phys_read64(int64_t addr) {{ return _phys_mem[(addr/8) & 65535]; }}");
         wln!(self, "void p_phys_write64(int64_t addr, int64_t val) {{ _phys_mem[(addr/8) & 65535] = val; }}");
+        wln!(self, "void p_lgdt(int64_t gdt_desc) {{ (void)gdt_desc; }}");
+        wln!(self, "void p_gdt_set_entry(int64_t gdt_ptr, int64_t index, int64_t base, int64_t limit, int64_t flags) {{ (void)gdt_ptr; (void)index; (void)base; (void)limit; (void)flags; }}");
+        wln!(self, "void p_serial_init(void) {{}}");
+        wln!(self, "void p_serial_write(int64_t c) {{ (void)c; }}");
+        wln!(self, "int64_t p_serial_read(void) {{ return 0; }}");
+        wln!(self, "int64_t p_serial_ready(void) {{ return 0; }}");
 
         // ─── SIMD builtins (Phase 5C) — operate on Vec<f64> ───
         wln!(self, "");

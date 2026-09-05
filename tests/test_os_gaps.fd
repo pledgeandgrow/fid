@@ -1,0 +1,107 @@
+// Test: Language gaps for OS development — session 15
+// Tests: bit operators, static variables, function pointers, extern, @repr(C)
+// This program runs on the interpreter (simulated bare-metal builtins).
+
+// ─── Extern declarations (bare-metal builtins) ───
+extern fn p_serial_init();
+extern fn p_serial_write(c: i64);
+extern fn p_cli();
+extern fn p_sti();
+extern fn p_hlt();
+extern fn p_idt_set_entry(idt: i64, vec: i64, handler: i64, flags: i64);
+extern fn p_page_map(pml4: i64, virt: i64, phys: i64, flags: i64);
+
+// ─── Static variables (module-level globals) ───
+static kernel_idt: i64 = 0;
+static kernel_pml4: i64 = 0;
+static boot_count: i64 = 0;
+
+// ─── @repr(C) struct for hardware compatibility ───
+@repr(C)
+struct IDTEntry {
+    offset_low: u16,
+    selector: u16,
+    ist: u8,
+    type_attr: u8,
+    offset_mid: u16,
+    offset_high: u32,
+}
+
+@repr(C)
+struct GDTDescriptor {
+    limit: u16,
+    base: u64,
+}
+
+// ─── Bit manipulation constants ───
+const PAGE_PRESENT: i64 = 1;
+const PAGE_WRITABLE: i64 = 2;
+const PAGE_USER: i64 = 4;
+const IDT_PRESENT: i64 = 0x80;
+const IDT_INTERRUPT: i64 = 0x0E;
+
+// ─── Function pointer test ───
+fn handler_timer() {
+    boot_count += 1;
+}
+
+fn handler_keyboard() {
+    boot_count += 1;
+}
+
+// Type for interrupt handlers (Fides uses `fn` for function types)
+type InterruptHandler = fn() -> void;
+
+// ─── Main test ───
+fn main() {
+    // 1. Bit operators
+    val flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+    val is_writable = (flags & PAGE_WRITABLE) != 0;
+    val is_user = (flags & PAGE_USER) != 0;
+    val shifted = 1 << 12;  // 4096
+    val shifted_back = shifted >> 4;  // 256
+    val xored = flags ^ PAGE_USER;    // remove user bit
+    val notted = ~0;                   // -1 (all bits set)
+
+    // Verify bit ops
+    if flags != 7 { return 1; }       // 1|2|4 = 7
+    if !is_writable { return 2; }
+    if !is_user { return 3; }
+    if shifted != 4096 { return 4; }
+    if shifted_back != 256 { return 5; }
+    if xored != 3 { return 6; }       // 7 ^ 4 = 3
+    if notted != -1 { return 7; }
+
+    // 2. Static variables
+    if boot_count != 0 { return 10; }
+    boot_count = 42;
+    if boot_count != 42 { return 11; }
+
+    // 3. Function pointers
+    val handler: InterruptHandler = handler_timer;
+    handler();  // Call via function pointer
+    if boot_count != 43 { return 12; }
+
+    // 4. @repr(C) struct
+    val entry = IDTEntry { offset_low: 0, selector: 0x08, ist: 0, type_attr: 0x8E, offset_mid: 0, offset_high: 0 };
+    if entry.selector != 0x08 { return 20; }
+    if entry.type_attr != 0x8E { return 21; }
+
+    // 5. Extern calls (simulated in interpreter)
+    p_serial_init();
+    p_cli();
+    p_sti();
+    p_hlt();
+    p_idt_set_entry(0, 32, 0, IDT_PRESENT | IDT_INTERRUPT);
+    p_page_map(0, 0, 0, flags);
+
+    // 6. Bit manipulation on hardware constants
+    val idt_flags = IDT_PRESENT | IDT_INTERRUPT;  // 0x8E
+    if idt_flags != 0x8E { return 30; }
+
+    val page_flags = PAGE_PRESENT | PAGE_WRITABLE;
+    if page_flags != 3 { return 31; }
+
+    // All tests passed
+    return 0;
+}

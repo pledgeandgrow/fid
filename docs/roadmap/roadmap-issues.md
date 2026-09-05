@@ -2386,10 +2386,10 @@ compiler. The test: "Can a user build this in Fides itself?" → Yes.
 | **@crypto-approved (F91)** | features-roadmap.md | "Only vetted algorithms" — this is a lint rule or stdlib choice, not a compiler annotation. Ship stdlib/crypto.fd with only approved algorithms. |
 | **@csprng (F89)** | features-roadmap.md | "Only cryptographically secure random" — stdlib/crypto.fd provides `crypto_random()`. Don't add an annotation. |
 | **@nonce-unique (F92)** | features-roadmap.md | "Verifies nonce never reused" — can't prove at compile time without tracking all nonce state across runs. This is a runtime check in stdlib/crypto.fd. |
-| **@audited-dependency (F81)** | features-roadmap.md | "Dependency must have @audit trail" — this is a package manager (pacte) feature, not a language annotation. |
-| **@pinned (F79)** | features-roadmap.md | "Dependency pinned with content hash" — pacte.lock already does this. Package manager feature. |
+| **@audited-dependency (F81)** | features-roadmap.md | "Dependency must have @audit trail" — this is a package manager (ark) feature, not a language annotation. |
+| **@pinned (F79)** | features-roadmap.md | "Dependency pinned with content hash" — ark.lock already does this. Package manager feature. |
 | **@sandbox-import (F80)** | features-roadmap.md | "Imported modules sandboxed by default" — capabilities already do this. Just don't pass capabilities to imported modules. Stdlib pattern. |
-| **S10: stdlib/consensus.fd** | features-roadmap.md | PoW, PoS, PBFT, Raft — this is a huge library, not a stdlib module. Should be a pacte package. |
+| **S10: stdlib/consensus.fd** | features-roadmap.md | PoW, PoS, PBFT, Raft — this is a huge library, not a stdlib module. Should be a ark package. |
 | **S11: stdlib/storage.fd** | features-roadmap.md | Merkle trees, KV storage — package, not stdlib. |
 | **S16: stdlib/ota.fd** | features-roadmap.md | OTA protocol — package, not stdlib. |
 | **S18: stdlib/wasm_api.fd** | features-roadmap.md | WASM browser bindings — package, not stdlib. |

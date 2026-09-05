@@ -2,50 +2,73 @@
 
 > Single source of truth for "what are we doing right now."
 > Read this first every session. Updated after every milestone change.
-> Last updated: Sep 5, 2026 (session 15 — **BOOTSTRAP FIXPOINT ACHIEVED**).
+> Last updated: Post-fixpoint — **Fides is self-hosted and independent.**
 
-## Where We Stopped (Sep 5 session 15 — pick up here)
+## Current direction: Fides is independent
+
+The bootstrap fixpoint is achieved. The self-hosted compiler (`compiler/*.fd`,
+26 modules, 61,885 LOC) compiles itself to byte-identical C across generations.
+**The Rust compiler is no longer the primary development path.**
+
+### What this means
+
+- **Everyday work uses `release/fides-c3.exe`** — writing programs, adding
+  stdlib modules, adding tests, building tools (ark, scribe, veil).
+- **The Rust compiler (`src/*.rs`) is the bootstrap reference only** — used
+  when `compiler/*.fd` changes and the bootstrap chain must be regenerated.
+- **No need to compare to Rust or C anymore** — Fides is its own language
+  with its own compiler. The fixpoint proves the compiler is stable.
+- **New features go into `compiler/*.fd` first** when they don't require
+  new language constructs. When they do, add to Rust first, then port.
+
+### When you DO need the Rust compiler
+
+| Task | Use Rust compiler? |
+|------|-------------------|
+| Writing Fides programs | No — use `fides-c3.exe` |
+| Adding stdlib modules | No — use `fides-c3.exe` |
+| Adding tests | No — use `fides-c3.exe` |
+| Building tools (ark, etc.) | No — use `fides-c3.exe` |
+| Changing `compiler/*.fd` | Yes — regenerate C1, verify fixpoint |
+| Adding new language features | Yes — add to Rust first, then port to Fides |
+
+## Where We Stopped — pick up here
 
 ### MILESTONE: BOOTSTRAP FIXPOINT ACHIEVED — fides-c2.c == fides-c3.c
 
 The self-hosted compiler compiles itself to **byte-for-byte identical**
-output across generations (SHA256-identical, 701,100 lines each). This is
+output across generations (701,158 lines each, 0 diffs). This is
 the ultimate goal of self-hosting.
 
 **Bootstrap chain verified:**
 ```
 Rust compiler → fides-c.c  (706,318 lines) → fides-c.exe
-fides-c.exe   → fides-c2.c (701,100 lines) → fides-c2.exe
-fides-c2.exe  → fides-c3.c (701,100 lines) → fides-c3.exe  ← IDENTICAL to c2
+fides-c.exe   → fides-c2.c (701,158 lines) → fides-c2.exe
+fides-c2.exe  → fides-c3.c (701,158 lines) → fides-c3.exe  ← IDENTICAL to c2
 fides-c3.exe  → compiles test_simple.fd correctly (EXIT 0)
 ```
 
-**Four bugs were fixed in session 15:**
-1. **TCC 4KB stack overflow** (bug 1.33) — TCC's default stack was 4KB.
-   Fixed with `-Wl,-stack,268435456` (256MB).
-2. **type_eq pointer == on strings** (bug 1.34) — Replaced `==` with
-   `str_equal` in `type_eq` for `Type::Named`, `Type::Generic`,
-   `Type::Dyn`, `Type::Assoc`.
-3. **Large match expression codegen** (bug 1.35) — Split `subst_expr`
-   and `subst_stmt` in `mono.fd` into helper functions. Also split
-   `substitute_expr` in `comptime_eval.fd`.
-4. **Non-ASCII characters in compiler source** (bug 1.36) — Replaced
-   Unicode characters (em-dash, arrows, box-drawing) with ASCII
-   equivalents in all 25 `compiler/*.fd` files.
+**Recent improvements (post-fixpoint):**
+1. **Sandbox allocation enforcement** — `sandbox { }` blocks now reject
+   `p_malloc`/`p_free`/`p_malloc_persistent`/`p_arena_save`/`p_arena_restore`
+   at compile time. 5 capabilities now enforced: IO, FS, Net, Spawn, Alloc.
+2. **Rc<T> / Arc<T> stdlib** — `stdlib/rc.fd` adds reference counting with
+   `rc_new`, `rc_clone`, `rc_drop`, `rc_get`, `rc_count` (and Arc equivalents).
+3. **@repr(C) struct layout** — C-compatible struct layout for hardware
+   registers, FFI, and OS kernel development.
+4. **Kernel stdlib started** — `stdlib/kernel.fd` for OS kernel primitives.
 
 **What's NOT yet done (post-fixpoint goals):**
-1. **Rust vs self-hosted parity** — c1=706K lines vs c2=701K lines (~5K
-   line difference). Does NOT block the self-hosted fixpoint but means
-   the Rust and self-hosted compilers produce slightly different C.
-2. **Debug prints** — 287 `p_eprint_str` calls in compiler source (go to
-   stderr, don't affect C output or fixpoint). Gate behind a flag.
+1. **PE emitter as primary backend** — Make `compiler/pe.fd` the primary
+   backend for direct native code generation (skip C + TCC).
+2. **Fides-specific optimizations** — Effect-based DCE, linear type elision,
+   region allocation elimination, bounds check elimination in PE backend.
 3. **Full test suite through self-hosted compiler** — Run all tests/
-   through fides-c2/fides-c3 and compare against Rust compiler results.
-4. **Import optimization** — Lightweight token scan for `use` imports.
-5. **Comptime substitution optimization** — Beyond the initial split.
-6. **HashMap-backed typechecker scopes** — Performance improvement.
-7. **Category C/D pipeline features** — Interpretation, native build,
-   WASM, safety verification — not needed for fixpoint.
+   through fides-c3 and compare against Rust compiler results.
+4. **OS kernel development** — `stdlib/kernel.fd` for GDT, IDT, paging,
+   scheduler, syscalls. Bare-metal compilation via PE emitter.
+5. **Cross-compilation from self-hosted compiler** — ARM64, RISC-V backends
+   in `compiler/*.fd` (currently only in `src/*.rs`).
 
 Three major pieces of work completed in session 7:
 
@@ -149,7 +172,7 @@ See `docs/roadmap/selfhost-roadmap.md` for the full plan.
 
 ## Self-Host Module Status
 
-All 18 modules rewritten in Fides. 23/23 self-host tests pass on interpreter + PE.
+All 26 modules rewritten in Fides. Bootstrap fixpoint achieved. 23/23 self-host tests pass.
 
 | Module | LOC | Status |
 |--------|-----|--------|
@@ -161,25 +184,31 @@ All 18 modules rewritten in Fides. 23/23 self-host tests pass on interpreter + P
 | lexer.fd | 673 | DONE |
 | parser.fd | 4800 | DONE |
 | ir.fd | 2139 | DONE |
-| typechecker.fd | 4848 | DONE (effects no-op) |
+| typechecker.fd | 4848 | DONE (sandbox alloc enforcement added) |
 | lower.fd | 4444 | DONE |
 | mono.fd | 2422 | DONE |
 | borrowck.fd | 1731 | DONE |
 | pir.fd | 2432 | DONE |
 | opt.fd | 6022 | DONE |
 | codegen_c.fd | 4529 | DONE |
-| compiler.fd | 1641 | DONE (cfg no-op) |
-| comptime_eval.fd | ~1500 | DONE (full port, session 7) |
+| codegen_x64.fd | — | DONE |
+| pe.fd | — | DONE |
+| peephole.fd | — | DONE |
+| regalloc.fd | — | DONE |
+| compiler.fd | 1641 | DONE |
+| comptime_eval.fd | 1500 | DONE |
+| flat_ast.fd | 1259 | DONE |
+| lsp.fd | — | DONE |
+| inc.fd | 146 | DONE |
 | main.fd | 120 | DONE |
-| **Total** | **39,502** | **18/18** |
+| ark.fd | — | DONE (self-hosted package manager) |
+| **Total** | **61,885** | **26/26 — fixpoint verified** |
 
 ## Deferred (Do Not Start)
 
-- PE emitter rewrite (after C codegen self-host lands)
-- Playground website (post-self-host)
-- Package registry (post-self-host)
-- New language features (add on Rust until self-host lands)
-- Industry domain stdlibs (medical, blockchain, robotics)
+- Playground website (needs hosting)
+- Package registry (needs infrastructure)
+- Industry domain stdlibs (medical, blockchain, robotics) — add as needed
 
 ---
 

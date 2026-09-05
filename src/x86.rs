@@ -275,6 +275,12 @@ impl X86CodeGen {
                 }
             }
 
+            Inst::ConstFnRef { name } => {
+                // Function reference — emit function address
+                wln!(self, "    lea rax, {}", name);
+                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+            }
+
             Inst::ConstFloat { bits, ty } => {
                 if *ty == IrType::F32 {
                     let val = *bits as u32;

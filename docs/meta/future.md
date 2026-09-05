@@ -373,7 +373,7 @@ the language-level safety (regions, bounds, @crashfree, @medical, @audit) is alr
 in the roadmap (Phases 7.5 and 9B). These tools support the *process* side of medical
 device compliance (IEC 62304, FDA cybersecurity guidance).
 
-### SBOM Generator (`pacte sbom`) — Depends on package manager
+### SBOM Generator (`ark sbom`) — Depends on package manager
 
 - Scan Fides import graph, generate Software Bill of Materials
 - List all dependencies: stdlib modules, FFI libraries, transitive imports
@@ -382,9 +382,9 @@ device compliance (IEC 62304, FDA cybersecurity guidance).
 - Output format: SPDX or CycloneDX (industry-standard SBOM formats)
 
 **Why this is extra, not roadmap:** An SBOM is only meaningful with versioned,
-registered packages. Fides has pacte package manager (Phase 13.4). SBOM generation is now a natural companion feature.
+registered packages. Fides has ark package manager (Phase 13.4). SBOM generation is now a natural companion feature.
 
-### CVE Checker (`pacte audit`) — Depends on SBOM + package registry
+### CVE Checker (`ark audit`) — Depends on SBOM + package registry
 
 - Check dependencies against known vulnerability databases (NVD, OSV)
 - Flag CVEs in SOUP (Software of Unknown Provenance) components
@@ -469,7 +469,7 @@ Based on how languages actually grow communities:
    safety + bare metal in one language)
 2. **Good docs** — people can learn Fides in an afternoon
 3. **LSP support** — IDE autocomplete, go-to-definition, error highlighting
-4. **Package manager** — `pacte add <dep>` just works
+4. **Package manager** — `ark add <dep>` just works
 5. **Real projects** — at least one notable project written in Fides
 
 Transpilers are nice marketing but historically don't drive adoption.

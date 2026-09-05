@@ -743,6 +743,7 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
             Inst::ConstFloat { bits, ty } => L1Inst::ConstFloat { bits: *bits, ty: ty.clone() },
             Inst::ConstBool { value } => L1Inst::ConstBool { value: *value },
             Inst::ConstStr { value } => L1Inst::ConstStr { value: value.clone() },
+            Inst::ConstFnRef { name } => L1Inst::ConstStr { value: name.clone() },
             Inst::ConstNull { ty } => L1Inst::ConstNull { ty: ty.clone() },
             Inst::GlobalAddr { name, ty } => L1Inst::GlobalAddr { name: name.clone(), ty: ty.clone() },
 

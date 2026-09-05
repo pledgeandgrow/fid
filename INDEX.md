@@ -3,9 +3,13 @@
 > Navigation hub for the Fides compiler. Every file in the project, grouped by
 > directory, with a one-line description. Use this to find anything fast.
 >
-> **Stats:** 51 `.rs` source files (86,742 LOC) · 69 stdlib modules (18,242 LOC) · 215 `.fd`
-> test files · 33 .md docs · 4 examples · 3 scripts · 3 benchmarks · 4 binaries (fidesc, pacte, scribe, veil).
-> Cross-compilation: ARM64, RISC-V, Windows — zero external tools.
+> **Fides is self-hosted.** The primary compiler is in `compiler/*.fd` (26 modules, 61,885 LOC).
+> The Rust source in `src/*.rs` is the bootstrap reference implementation, used only when
+> changing compiler internals. For everyday work, use `release/fides-c3.exe`.
+>
+> **Stats:** 26 self-hosted `.fd` compiler modules (61,885 LOC) · 52 `.rs` bootstrap files (84,447 LOC) ·
+> 70 stdlib modules (18,242 LOC) · 215+ `.fd` test files · 38 .md docs · 4 examples · 4 binaries.
+> Bootstrap fixpoint: `fides-c2.c == fides-c3.c` (701,158 lines, 0 diffs).
 
 ---
 
@@ -13,7 +17,8 @@
 
 - [Documentation (docs/)](#documentation-docs)
 - [Root Files](#root-files)
-- [Source — Compiler Core (src/)](#source--compiler-core-src)
+- [Self-Hosted Compiler (compiler/) — PRIMARY](#self-hosted-compiler-compiler--primary)
+- [Source — Compiler Core (src/) — BOOTSTRAP REFERENCE](#source--compiler-core-src--bootstrap-reference)
 - [Source — Backends & Codegen (src/)](#source--backends--codegen-src)
 - [Source — Object Formats & Linking (src/)](#source--object-formats--linking-src)
 - [Source — Advanced / Experimental (src/)](#source--advanced--experimental-src)
@@ -37,7 +42,7 @@ and `AGENTS.md` first when working on the compiler.
 | [reference/architecture.md](reference/architecture.md) | Compiler pipeline, data flow, source file map. **Start here.** |
 | [reference/syntax.md](reference/syntax.md) | Full language syntax specification (current `fn`/`val`/`var`/`const`/`return`/`type` syntax — migration from old `pf`/`pv`/`pc`/`ret`/`ty` is complete). |
 | [reference/features.md](reference/features.md) | Feature status — verified against actual test runs. |
-| [reference/tool.md](reference/tool.md) | Development tools (fidesc, pacte, scribe, veil). |
+| [reference/tool.md](reference/tool.md) | Development tools (fidesc, ark, scribe, veil). |
 | [reference/testing.md](reference/testing.md) | Current test results across all backends + test batch specifications. |
 | [reference/changelog.md](reference/changelog.md) | Per-phase change history (newest first). |
 | [reference/vision.md](reference/vision.md) | The overarching vision — "the last language the world needs." |
@@ -86,7 +91,52 @@ and `AGENTS.md` first when working on the compiler.
 
 ---
 
-## Source — Compiler Core (src/)
+## Self-Hosted Compiler (compiler/) — PRIMARY
+
+> **This is the primary compiler.** 26 Fides modules (61,885 LOC) that compile
+> themselves to byte-identical C across generations (bootstrap fixpoint).
+> Use `release/fides-c3.exe` for everyday work. The Rust source in `src/` is
+> the bootstrap reference only.
+
+| File | LOC | Description |
+|------|----:|-------------|
+| [main.fd](../compiler/main.fd) | 120 | CLI entry point (23 commands: compile, run, dump-c, test, fmt, lsp, etc.) |
+| [token.fd](../compiler/token.fd) | 517 | Token kind definitions |
+| [lexer.fd](../compiler/lexer.fd) | 673 | Tokenizer: source text → tokens |
+| [parser.fd](../compiler/parser.fd) | 4800 | Recursive descent parser: tokens → AST |
+| [ast.fd](../compiler/ast.fd) | 920 | AST node definitions: Expr, Stmt, Func, StructDef, EnumDef, etc. |
+| [typechecker.fd](../compiler/typechecker.fd) | 4848 | Type checking + capability + effect + region + sandbox enforcement |
+| [borrowck.fd](../compiler/borrowck.fd) | 1731 | Borrow checker (NLL, field-wise, two-phase, off/warn/on modes) |
+| [mono.fd](../compiler/mono.fd) | 2422 | Generic monomorphization |
+| [ir.fd](../compiler/ir.fd) | 2139 | SSA IR definitions |
+| [lower.fd](../compiler/lower.fd) | 4444 | AST → SSA IR lowering |
+| [pir.fd](../compiler/pir.fd) | 2432 | PIR (Fides Intermediate Representation) — L1/L2/L3 |
+| [opt.fd](../compiler/opt.fd) | 6022 | PIR optimizer (23 passes) |
+| [peephole.fd](../compiler/peephole.fd) | — | Peephole optimizer |
+| [regalloc.fd](../compiler/regalloc.fd) | — | Linear scan register allocator |
+| [codegen_c.fd](../compiler/codegen_c.fd) | 4529 | C codegen backend (IR → .c) |
+| [codegen_x64.fd](../compiler/codegen_x64.fd) | — | x86-64 native codegen |
+| [pe.fd](../compiler/pe.fd) | — | PE emitter (direct native .exe, no external tools) |
+| [comptime_eval.fd](../compiler/comptime_eval.fd) | 1500 | Compile-time evaluation engine |
+| [compiler.fd](../compiler/compiler.fd) | 1641 | Pipeline orchestration |
+| [flat_ast.fd](../compiler/flat_ast.fd) | 1259 | Flat AST serialization |
+| [diag.fd](../compiler/diag.fd) | 594 | Diagnostics with error codes |
+| [fmt.fd](../compiler/fmt.fd) | 1007 | Source code formatter |
+| [json.fd](../compiler/json.fd) | 628 | JSON parser/serializer |
+| [lsp.fd](../compiler/lsp.fd) | — | Language Server Protocol (completion, hover, definition, rename) |
+| [inc.fd](../compiler/inc.fd) | 146 | Incremental compilation cache |
+| [ark.fd](../compiler/ark.fd) | — | Self-hosted Ark package manager |
+| **Total** | **61,885** | **26/26 modules — bootstrap fixpoint achieved** |
+
+---
+
+## Source — Compiler Core (src/) — BOOTSTRAP REFERENCE
+
+> **Note:** The Rust source is the bootstrap reference implementation. It is used
+> to generate the first-generation C (`fides-c.c`) from the self-hosted compiler
+> source (`compiler/*.fd`). For everyday work, use `release/fides-c3.exe` directly.
+> The Rust compiler is only needed when `compiler/*.fd` changes and the bootstrap
+> chain must be regenerated.
 
 The front-end and middle-end pipeline: source → tokens → AST → types → IR.
 
@@ -166,11 +216,11 @@ Specialized subsystems: embedded, hot reload, autograd, tensor, debugger, tools.
 | [inc.rs](../src/inc.rs) | 171 | Incremental compilation cache (in-memory, hash-keyed by path+hash+flags). |
 | [debugger.rs](../src/debugger.rs) | 965 | Interactive IR-level debugger (`debug` command): breakpoints, step, locals. |
 | [native_debugger.rs](../src/native_debugger.rs) | 312 | Native ptrace-based debugger (`autopsy` command, Linux only). |
-| [pacte.rs](../src/pacte.rs) | 707 | Package manager library: init, add, install, remove, list, lock, search, publish. |
+| [ark.rs](../src/ark.rs) | 707 | Package manager library: init, add, install, remove, list, lock, search, publish. |
 | [scribe.rs](../src/scribe.rs) | 882 | Documentation generator library: HTML/Markdown from .fd source. |
 | [veil.rs](../src/veil.rs) | 367 | Code coverage tool library: function/line/instruction coverage. |
 | [lib.rs](../src/lib.rs) | 52 | Library crate root — shared by all 4 binaries. |
-| [bin/pacte.rs](../src/bin/pacte.rs) | — | `pacte` binary entry point. |
+| [bin/ark.rs](../src/bin/ark.rs) | — | `ark` binary entry point. |
 | [bin/scribe.rs](../src/bin/scribe.rs) | — | `scribe` binary entry point. |
 | [bin/veil.rs](../src/bin/veil.rs) | — | `veil` binary entry point. |
 

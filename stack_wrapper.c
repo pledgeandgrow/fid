@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
-extern int main(int argc, char** argv);
+extern int real_main(int argc, char** argv);
 
 typedef struct {
     int argc;
@@ -13,7 +13,7 @@ typedef struct {
 
 DWORD WINAPI thread_main(LPVOID param) {
     MainArgs* args = (MainArgs*)param;
-    args->ret = main(args->argc, args->argv);
+    args->ret = real_main(args->argc, args->argv);
     return 0;
 }
 
@@ -24,11 +24,11 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc - 1; i++) argv[i] = argv[i+1];
         argv[argc-1] = NULL;
         argc--;
-        return main(argc, argv);
+        return real_main(argc, argv);
     }
-    // Otherwise, run on a thread with 64MB stack
+    // Otherwise, run on a thread with 256MB stack
     MainArgs args = { argc, argv, 0 };
-    HANDLE h = CreateThread(NULL, 64*1024*1024, thread_main, &args, 0, NULL);
+    HANDLE h = CreateThread(NULL, 256*1024*1024, thread_main, &args, 0, NULL);
     if (!h) {
         fprintf(stderr, "Failed to create thread\n");
         return 1;

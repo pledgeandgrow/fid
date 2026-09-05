@@ -4462,7 +4462,10 @@ impl TypeChecker {
                         Type::Bool
                     }
                     BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
-                        if self.is_numeric(&lt) && self.is_numeric(&rt) {
+                        // Allow bool & bool (treat as logical and/or/xor)
+                        if lt == Type::Bool && rt == Type::Bool && !matches!(op, BinOp::Shl | BinOp::Shr) {
+                            Type::Bool
+                        } else if self.is_numeric(&lt) && self.is_numeric(&rt) {
                             if self.is_integer(&lt) && self.is_integer(&rt) {
                                 // Auto-widen to the wider operand type
                                 Self::wider_type(&lt, &rt)
@@ -4503,9 +4506,9 @@ impl TypeChecker {
                         Type::Bool
                     }
                     UnaryOp::BitNot => {
-                        if !self.is_numeric(&ty) {
+                        if !self.is_integer(&ty) {
                             self.errors
-                                .push(format!("Type error: cannot bitwise negate {}", ty));
+                                .push(format!("Type error: cannot bitwise negate {} (expected integer)", ty));
                         }
                         ty
                     }
@@ -4541,6 +4544,9 @@ impl TypeChecker {
                     }
                     "spawn" | "exec" | "system" | "p_thread_spawn" => {
                         self.check_capability("Spawn", &format!("{}()", callee));
+                    }
+                    "p_malloc" | "p_free" | "p_malloc_persistent" | "p_arena_save" | "p_arena_restore" => {
+                        self.check_capability("Alloc", &format!("{}()", callee));
                     }
                     _ => {}
                 }
@@ -4822,7 +4828,8 @@ impl TypeChecker {
 
                 // Check if callee is a local variable with function type
                 if let Some(var_ty) = self.lookup(callee).cloned() {
-                    if let Type::Func { params, ret } = &var_ty {
+                    let resolved_ty = self.resolve_type(&var_ty);
+                    if let Type::Func { params, ret } = &resolved_ty {
                         if params.len() != arg_types.len() {
                             self.errors.push(format!(
                                 "Type error: function variable '{}' expects {} args, got {}",

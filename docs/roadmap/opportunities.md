@@ -464,7 +464,7 @@ All 3 language-level blockers are resolved; 164/165 tests pass on interp+C codeg
 ### Why not self-host now
 
 1. **Fides is not mature enough.** ~~Missing: full concurrency (spawn), package
-   manager, LSP~~ — spawn, LSP, and package manager (pacte) now exist. Still
+   manager, LSP~~ — spawn, LSP, and package manager (ark) now exist. Still
    missing: effect handler continuations, GPU region support, state machine
    transform for async. Self-hosting into a language missing these features
    means writing them in a language that doesn't have them yet — circular

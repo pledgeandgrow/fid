@@ -25,7 +25,7 @@ Phase 10: Self-Hosting       ← IN PROGRESS — SH-6 through SH-9.4 DONE (all 1
 Phase 10B: PE Emitter Rewrite ← NOT STARTED — rewrite pe.rs in Fides after C codegen bootstrap. Fix Issues 67-69 first, then rewrite PE emitter in Fides, then switch default backend to PE for zero-dependency deployment. C backend stays as fallback.
 Phase 11: Ecosystem          ← IN PROGRESS — LSP (diag+completion+hover+def), formatter, linter, bench, profile
 Phase 12: Security Hardening ← MOSTLY COMPLETE — binary hardening + all safety annotations; CFI + full taint tracking + runtime sandbox remaining
-Phase 13: World Class        ← IN PROGRESS — type inference done, SLP+loop-vec done, @send/@sync done, debugger done, pacte package manager done, scribe doc generator done, veil coverage tool done, green threads remaining
+Phase 13: World Class        ← IN PROGRESS — type inference done, SLP+loop-vec done, @send/@sync done, debugger done, ark package manager done, scribe doc generator done, veil coverage tool done, green threads remaining
 Phase 14: Debugging Tools    ← COMPLETE — interpreter debugger, record/replay, hot-reload, post-mortem, native debugger
 Phase 15: Compete Where We Lose ← NOT STARTED — win in web/data-science/prototyping/games without adding a runtime (arena allocators, comptime frameworks, ergonomic modes)
 ```
@@ -629,7 +629,7 @@ goto-definition. Code formatter, linter, and benchmark command all work.
 ### What's Left
 - [ ] LSP rename — `textDocument/rename` (rename symbol across file)
 - [ ] LSP code actions — quick fixes, refactorings
-- [x] Package manager — `pacte` binary, `pacte.toml` manifest, path + git deps, lock file
+- [x] Package manager — `ark` binary, `ark.toml` manifest, path + git deps, lock file
 - [ ] Profiler — `fidesc profile <file.fd>` (timing per function)
 - [x] Documentation generator — `scribe` binary (HTML/Markdown from `///` comments)
 - [x] Coverage tool — `veil` binary (function/line/instruction coverage, text + HTML reports)
@@ -706,18 +706,18 @@ Rust, Go, and C for real-world projects.
 **Files:** `src/opt.rs`, `src/codegen_x64.rs`
 
 #### 13.4 Package Manager — ✅ DONE (basic, registry pending)
-- `pacte.toml` manifest format — DONE (custom TOML parser, zero deps)
+- `ark.toml` manifest format — DONE (custom TOML parser, zero deps)
 - Path dependencies (files and directories) — DONE
 - Git dependencies (clone with `--depth 1`, branch/tag support) — DONE
-- Lock file (`pacte.lock` with resolved commit hashes) — DONE
+- Lock file (`ark.lock` with resolved commit hashes) — DONE
 - Commands: init, add, install, remove, list, lock, update — DONE
-- Registry (pacte.dev) — NOT DONE (search, publish, version resolution)
+- Registry (ark.dev) — NOT DONE (search, publish, version resolution)
 - Semver dependency resolution — NOT DONE
 - Integration with `fidesc build` (auto-install deps) — NOT DONE
 - Workspace support (multi-package repos) — NOT DONE
 
 **Effort:** Basic version done. Registry: 1-2 months more.
-**Files:** `src/pacte.rs`, `src/bin/pacte.rs`
+**Files:** `src/ark.rs`, `src/bin/ark.rs`
 
 #### 13.5 Data Race Prevention (@sync / @send) — ✅ DONE
 - `@sync` annotation on types (like Rust's `Sync` trait) — DONE
@@ -1039,7 +1039,7 @@ prevent productivity once the ecosystem matures.
 ### Medium-term (2-4 months)
 9. Green threads / goroutine-style concurrency (1-2 months)
 10. Auto-vectorization with variable trip counts (1-2 months)
-11. ✅ Package manager — `pacte` binary with init/add/install/remove/list/lock commands, path + git deps — DONE
+11. ✅ Package manager — `ark` binary with init/add/install/remove/list/lock commands, path + git deps — DONE
 
 ### Long-term (4+ months)
 12. Industry domain modules (Phase 9)

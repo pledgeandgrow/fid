@@ -1,5 +1,93 @@
 # Fides Language Changelog
 
+## Package Manager Ported to Fides — Session 15 (Sep 5, 2026)
+
+### Summary
+
+**The Fides package manager (ark) is now self-hosted.** Written entirely in
+Fides (`compiler/ark.fd`, 740 lines), compiled by the self-hosted compiler
+(`fides-c3.exe dump-c compiler/ark.fd`), and built with TCC into a working
+`ark_selfhost.exe`. The Rust bootstrap version (`src/ark.rs`) was renamed
+from `pacte` to `ark` to match the new branding.
+
+### Branding
+
+The package manager is **ark** and the package unit is **pact** — paralleling
+Rust's Cargo + crates. An ark is a vessel that carries and protects; pacts
+are binding agreements of trust. Manifests are `ark.toml`, lockfiles are
+`ark.lock`, and modules install to `ark_modules/`.
+
+```
+ark init [name]              # create ark.toml
+ark add <dep> --path <path>  # add path dependency
+ark add <dep> --git <url>    # add git dependency
+ark install                  # install all pacts to ark_modules/
+ark list                     # list pacts
+ark remove <dep>             # remove pact
+ark lock                     # generate ark.lock
+ark update [dep]             # update pacts
+```
+
+### Files Changed
+
+- `compiler/ark.fd` — NEW: self-hosted ark written in Fides (740 lines)
+- `src/ark.rs` — renamed from `src/pacte.rs` (Rust bootstrap version)
+- `src/bin/ark.rs` — renamed from `src/bin/pacte.rs` (binary entry point)
+- `Cargo.toml` — `[[bin]]` section: `pacte` → `ark`
+- `src/lib.rs` — `pub mod pacte` → `pub mod ark`
+- 17 docs updated to replace `pacte` references with `ark`
+
+## Bootstrap Fixpoint Achieved — Session 15 (Sep 5, 2026)
+
+### Summary
+
+**The Fides compiler is self-hosted and achieves a bootstrap fixpoint.**
+The self-hosted compiler (26 modules, 61,885 LOC) reproduces byte-identical
+output across generations: `fides-c2.c == fides-c3.c` (SHA256-identical,
+701,100 lines, 19.8MB). Three generations verified end-to-end.
+
+### Bootstrap Chain
+
+```
+Rust compiler (fidesc) → fides-c.c (706K lines) → fides-c.exe
+fides-c.exe → fides-c2.c (701K lines) → fides-c2_new.exe
+fides-c2_new.exe → fides-c3.c (701K lines) → fides-c3.exe
+Result: fides-c2.c == fides-c3.c (byte-identical)
+```
+
+### Key Fixes
+
+1. **TCC 4KB stack overflow** — TCC's default Windows PE stack reserve is
+   ~4KB, far too small for the compiler's deep recursion (parser,
+   typechecker, codegen). Fixed with a Windows thread wrapper providing
+   256MB stack (`CreateThread(NULL, 256*1024*1024, ...)`). This was the
+   root cause of the apparent "TypeChecker_lookup null deref" crash.
+
+2. **`type_eq` string comparison** — `compiler/typechecker.fd` used direct
+   `==` for string comparison in recursive type equality. Changed to
+   `str_equal` for `Type::Named`, `Type::Generic`, `Type::Dyn`, and
+   `Type::Assoc`.
+
+3. **Large match expression codegen** — Split `subst_expr`/`subst_stmt`
+   in `mono.fd` and comptime cases in `comptime_eval.fd` into helper
+   functions to avoid codegen truncation on very large match expressions.
+
+4. **Non-ASCII source normalization** — Replaced all Unicode characters
+   in `compiler/*.fd` with ASCII equivalents to ensure deterministic
+   C codegen output.
+
+### Test Results
+
+```
+Interpreter:  209/211 passed
+C Codegen:    198/211 matched
+PE Emitter:   209/211 valid
+Self-host:    23/23 pass on interp + PE
+Bootstrap:    3 generations verified, fixpoint achieved
+```
+
+---
+
 ## Self-Host Breaking Bug Fixes — SH-10 (August 31, 2026)
 
 ### Summary
@@ -7,7 +95,7 @@
 All 7 critical self-host breaking bugs identified in the systematic `src/*.rs`
 vs `compiler/*.fd` comparison have been fixed. Self-host tests now pass 23/23
 on all 3 backends (interpreter, C codegen, PE emitter). The self-hosted
-compiler has 17 active modules totaling ~41,800 LOC.
+compiler now has 25 active modules totaling 61,145 LOC (as of session 15).
 
 ### SH-10.1 — `lower.fd` Fixes
 
@@ -1262,17 +1350,17 @@ passing on interpreter and C codegen.
 
 ## Tooling Ecosystem Phase (August 2026)
 
-### Package Manager — pacte
+### Package Manager — ark
 
-- **pacte** (`src/pacte.rs` + `src/bin/pacte.rs`): Package manager for Fides.
+- **ark** (`src/ark.rs` + `src/bin/ark.rs`): Package manager for Fides.
   Commands: `init`, `add`, `install`, `remove`, `list`, `lock`, `update`,
-  `search`, `publish`. Manifest: `pacte.toml`. Lock file: `pacte.lock`.
-  Modules installed to `pacte_modules/`.
+  `search`, `publish`. Manifest: `ark.toml`. Lock file: `ark.lock`.
+  Modules installed to `ark_modules/`.
 - **Dependency types**: Path dependencies (local files or directories),
   Git dependencies (clone with `--depth 1`, optional `--branch`/`--tag`),
   Registry dependencies (future — not yet implemented).
 - **Lock file**: Records resolved commit hashes for git deps, canonical
-  paths for path deps. `pacte lock` regenerates from installed modules.
+  paths for path deps. `ark lock` regenerates from installed modules.
 - **Zero external dependencies**: Built-in TOML parser/writer, uses `git`
   CLI for cloning. No Rust crate dependencies added.
 
@@ -1304,7 +1392,7 @@ passing on interpreter and C codegen.
 
 ### Library Target
 
-- Added `[lib]` target to Cargo.toml (`src/lib.rs`) so that `fidesc`, `pacte`,
+- Added `[lib]` target to Cargo.toml (`src/lib.rs`) so that `fidesc`, `ark`,
   `scribe`, and `veil` binaries share the same codebase via `use fidesc::module`
   imports. All 4 binaries built from a single Cargo project.
 

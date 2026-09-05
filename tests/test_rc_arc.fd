@@ -1,74 +1,91 @@
-// Test: Rc/Arc — reference counting smart pointers
+// test_rc_arc.fd -- Test Rc and Arc reference counting
 //
-// Rc<T> = single-threaded reference counting
-// Arc<T> = atomic reference counting (thread-safe)
-//
-// API: Rc::new(x), rc.clone(), rc.drop(), rc.get(), rc.count()
-// Same for Arc.
+// Verifies:
+//   - rc_new creates with refcount 1
+//   - rc_clone increments refcount
+//   - rc_drop decrements refcount
+//   - rc_get returns the wrapped value
+//   - Arc works the same way (atomic)
+//   - Multiple clones and drops work correctly
 
-fn test_rc_basic() -> i64 {
-    // Create an Rc<i64> with value 42
-    val rc = Rc::new(42);
-    // Get the value
-    val value = rc.get();
-    // Refcount should be 1
-    val cnt = rc.count();
-    // Clone — refcount becomes 2
-    val rc2 = rc.clone();
-    val cnt2 = rc.count();
-    // Drop one — refcount back to 1
-    rc2.drop();
-    val cnt3 = rc.count();
-    // Clean up
-    rc.drop();
-    // Return 0 if all checks pass
-    if value == 42 && cnt == 1 && cnt2 == 2 && cnt3 == 1 {
-        return 0;
-    }
-    return 1;
-}
+module test_rc_arc;
 
-fn test_rc_struct() -> i64 {
-    // Rc with a struct value
-    val rc = Rc::new(100);
-    val rc2 = rc.clone();
-    val v1 = rc.get();
-    val v2 = rc2.get();
-    rc2.drop();
-    rc.drop();
-    if v1 == 100 && v2 == 100 {
-        return 0;
-    }
-    return 1;
-}
+use core;
+use rc;
 
-fn test_arc_basic() -> i64 {
-    // Arc<i64> — atomic reference counting
-    val arc = Arc::new(99);
-    val value = arc.get();
-    val cnt = arc.count();
-    val arc2 = arc.clone();
-    val cnt2 = arc.count();
-    arc2.drop();
-    val cnt3 = arc.count();
-    arc.drop();
-    if value == 99 && cnt == 1 && cnt2 == 2 && cnt3 == 1 {
-        return 0;
-    }
-    return 1;
-}
+pub fn main() -> i64 {
+    // --- Test Rc ---
 
-fn main() -> i64 {
-    val r1 = test_rc_basic();
-    val r2 = test_rc_struct();
-    val r3 = test_arc_basic();
-    print(r1);
-    print(r2);
-    print(r3);
-    if r1 == 0 && r2 == 0 && r3 == 0 {
-        print(0);
-    } else {
-        print(1);
+    // Create an Rc wrapping 42
+    var r1 = rc_new(42);
+    if rc_count(r1) != 1 {
+        print("FAIL: rc_count should be 1 after new\n");
+        return 1;
     }
+    if rc_get(r1) != 42 {
+        print("FAIL: rc_get should return 42\n");
+        return 1;
+    }
+
+    // Clone it -- refcount should be 2
+    var r2 = rc_clone(r1);
+    if rc_count(r1) != 2 {
+        print("FAIL: rc_count should be 2 after clone\n");
+        return 1;
+    }
+    if rc_get(r2) != 42 {
+        print("FAIL: rc_get on clone should return 42\n");
+        return 1;
+    }
+
+    // Clone again -- refcount should be 3
+    var r3 = rc_clone(r1);
+    if rc_count(r1) != 3 {
+        print("FAIL: rc_count should be 3 after second clone\n");
+        return 1;
+    }
+
+    // Drop one -- refcount should be 2
+    rc_drop(r3);
+    if rc_count(r1) != 2 {
+        print("FAIL: rc_count should be 2 after drop\n");
+        return 1;
+    }
+
+    // Drop the rest
+    rc_drop(r2);
+    rc_drop(r1);
+
+    // --- Test Arc ---
+
+    var a1 = arc_new(100);
+    if arc_count(a1) != 1 {
+        print("FAIL: arc_count should be 1 after new\n");
+        return 1;
+    }
+    if arc_get(a1) != 100 {
+        print("FAIL: arc_get should return 100\n");
+        return 1;
+    }
+
+    var a2 = arc_clone(a1);
+    if arc_count(a1) != 2 {
+        print("FAIL: arc_count should be 2 after clone\n");
+        return 1;
+    }
+    if arc_get(a2) != 100 {
+        print("FAIL: arc_get on clone should return 100\n");
+        return 1;
+    }
+
+    arc_drop(a2);
+    if arc_count(a1) != 1 {
+        print("FAIL: arc_count should be 1 after drop\n");
+        return 1;
+    }
+
+    arc_drop(a1);
+
+    print("OK\n");
     return 0;
 }

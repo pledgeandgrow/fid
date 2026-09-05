@@ -100,7 +100,7 @@ C:\tcc\tcc.exe release\fides-c_wrapped.c -o release\fides-c.exe -lws2_32
 ### Codebase size (session 15)
 | Component | Files | LOC |
 |-----------|-------|-----|
-| Self-hosted compiler (`compiler/*.fd`) | 25 | 61,145 |
+| Self-hosted compiler (`compiler/*.fd`) | 26 | 61,885 |
 | Rust compiler (`src/*.rs`) | 52 | 91,038 |
 | Stdlib (`stdlib/*.fd`) | 69 | 16,090 |
 | Test files (`tests/*.fd` + `tests/compiler/*.fd`) | 225 + 23 | — |

@@ -521,6 +521,11 @@ pub enum Inst {
     ConstStr {
         value: String,
     },
+    /// Function reference — stores function name, resolved to code address by PE emitter
+    /// Treated like ConstStr by interpreter/C codegen (name-based lookup)
+    ConstFnRef {
+        name: String,
+    },
     /// Null pointer
     ConstNull {
         ty: IrType,
@@ -775,6 +780,7 @@ impl Inst {
             Inst::ConstFloat { ty, .. } => ty.clone(),
             Inst::ConstBool { .. } => IrType::Bool,
             Inst::ConstStr { .. } => IrType::Ptr(Box::new(IrType::U8)),
+            Inst::ConstFnRef { .. } => IrType::I64, // function address
             Inst::ConstNull { ty, .. } => ty.clone(),
             Inst::GlobalAddr { ty, .. } => IrType::Ptr(Box::new(ty.clone())),
             Inst::BinOp { ty, .. } => ty.clone(),
@@ -860,6 +866,7 @@ impl Inst {
             Inst::ConstFloat { .. } => "ConstFloat",
             Inst::ConstBool { .. } => "ConstBool",
             Inst::ConstStr { .. } => "ConstStr",
+            Inst::ConstFnRef { .. } => "ConstFnRef",
             Inst::ConstNull { .. } => "ConstNull",
             Inst::GlobalAddr { .. } => "GlobalAddr",
             Inst::BinOp { .. } => "BinOp",
@@ -919,6 +926,7 @@ impl Inst {
             | Inst::ConstFloat { .. }
             | Inst::ConstBool { .. }
             | Inst::ConstStr { .. }
+            | Inst::ConstFnRef { .. }
             | Inst::ConstNull { .. }
             | Inst::GlobalAddr { .. }
             | Inst::Alloca { .. }
@@ -1175,6 +1183,8 @@ pub struct StructLayout {
     pub fields: Vec<(String, IrType, u32)>,  // (name, type, offset)
     pub size: u64,
     pub align: u64,
+    /// If true, uses C-compatible layout (natural type sizes, not uniform 8-byte slots)
+    pub repr_c: bool,
 }
 
 /// Source map entry — maps an IR value to its source location

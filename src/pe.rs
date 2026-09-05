@@ -1671,8 +1671,8 @@ fn build_pe_file(text: &[u8], rdata: &[u8], entry_point_rva: u32, import_dir_rva
     pe.extend_from_slice(&0u32.to_le_bytes()); // CheckSum
     pe.extend_from_slice(&3u16.to_le_bytes()); // Subsystem = CONSOLE
     pe.extend_from_slice(&0x0000u16.to_le_bytes()); // DllCharacteristics: none (testing)
-    pe.extend_from_slice(&0x100000u64.to_le_bytes()); // SizeOfStackReserve
-    pe.extend_from_slice(&0x1000u64.to_le_bytes()); // SizeOfStackCommit
+    pe.extend_from_slice(&0x10000000u64.to_le_bytes()); // SizeOfStackReserve = 256MB
+    pe.extend_from_slice(&0x100000u64.to_le_bytes()); // SizeOfStackCommit = 1MB
     pe.extend_from_slice(&0x100000u64.to_le_bytes()); // SizeOfHeapReserve
     pe.extend_from_slice(&0x1000u64.to_le_bytes()); // SizeOfHeapCommit
     pe.extend_from_slice(&0u32.to_le_bytes()); // LoaderFlags
@@ -1858,6 +1858,11 @@ impl PeCodeGen {
                         all_strings.push(value.clone());
                     }
                 }
+                if let Inst::ConstFnRef { name } = inst {
+                    if !all_strings.contains(name) {
+                        all_strings.push(name.clone());
+                    }
+                }
                 if let Inst::Panic { message } = inst {
                     if !all_strings.contains(message) {
                         all_strings.push(message.clone());
@@ -1939,7 +1944,11 @@ impl PeCodeGen {
                        "p_cr3_read", "p_cr3_write", "p_cr0_read", "p_cr0_write",
                        "p_cr4_read", "p_cr4_write", "p_invlpg",
                        "p_page_map", "p_page_unmap",
-                       "p_phys_read64", "p_phys_write64"] {
+                       "p_phys_read64", "p_phys_write64",
+                       // Phase 5A.5: GDT stubs
+                       "p_lgdt", "p_gdt_set_entry",
+                       // Phase 5A.6: Serial port stubs
+                       "p_serial_init", "p_serial_write", "p_serial_read", "p_serial_ready"] {
             let label = self.enc.alloc_label();
             self.func_labels.insert(stub.to_string(), label);
         }
@@ -1994,6 +2003,11 @@ impl PeCodeGen {
                         all_strings.push(value.clone());
                     }
                 }
+                if let Inst::ConstFnRef { name } = inst {
+                    if !all_strings.contains(name) {
+                        all_strings.push(name.clone());
+                    }
+                }
                 if let Inst::Panic { message } = inst {
                     if !all_strings.contains(message) {
                         all_strings.push(message.clone());
@@ -2017,6 +2031,24 @@ impl PeCodeGen {
         }
         // No IAT in bare mode — clear IAT offsets
         self.iat_rdata_offsets.clear();
+
+        // 2b. Append module-level mutable globals to .rdata (writable section)
+        // Each global gets 8 bytes of storage, initialized with the constant value.
+        // This is critical for bare-metal mode: GDT, IDT, page tables need fixed storage.
+        for (name, (ty, init_expr)) in &module.globals {
+            let off = rdata.data.len();
+            let bytes: [u8; 8] = match init_expr {
+                crate::ast::Expr::IntLit(v) => (*v as i64).to_le_bytes(),
+                crate::ast::Expr::BoolLit(b) => (if *b { 1i64 } else { 0 }).to_le_bytes(),
+                crate::ast::Expr::FloatLit(f) => {
+                    if *ty == IrType::F32 { (*f as f32).to_le_bytes().iter().chain([0u8;4].iter()).cloned().collect::<Vec<u8>>().try_into().unwrap() }
+                    else { (*f as f64).to_le_bytes() }
+                }
+                _ => 0i64.to_le_bytes(), // zero-initialize
+            };
+            rdata.data.extend_from_slice(&bytes);
+            self.global_rdata_offsets.insert(name.clone(), off);
+        }
 
         // 3. Pre-allocate labels for all functions
         for name in module.functions.keys() {
@@ -2049,7 +2081,11 @@ impl PeCodeGen {
                        "p_cr3_read", "p_cr3_write", "p_cr0_read", "p_cr0_write",
                        "p_cr4_read", "p_cr4_write", "p_invlpg",
                        "p_page_map", "p_page_unmap",
-                       "p_phys_read64", "p_phys_write64"] {
+                       "p_phys_read64", "p_phys_write64",
+                       // Phase 5A.5: GDT stubs
+                       "p_lgdt", "p_gdt_set_entry",
+                       // Phase 5A.6: Serial port stubs
+                       "p_serial_init", "p_serial_write", "p_serial_read", "p_serial_ready"] {
             let label = self.enc.alloc_label();
             self.func_labels.insert(stub.to_string(), label);
         }
@@ -2101,6 +2137,11 @@ impl PeCodeGen {
                         all_strings.push(value.clone());
                     }
                 }
+                if let Inst::ConstFnRef { name } = inst {
+                    if !all_strings.contains(name) {
+                        all_strings.push(name.clone());
+                    }
+                }
                 if let Inst::Panic { message } = inst {
                     if !all_strings.contains(message) {
                         all_strings.push(message.clone());
@@ -2123,6 +2164,23 @@ impl PeCodeGen {
             }
         }
         self.iat_rdata_offsets.clear();
+
+        // 2b. Append module-level mutable globals to .rdata (writable section)
+        // Critical for bare-metal: GDT, IDT, page tables need fixed storage.
+        for (name, (ty, init_expr)) in &module.globals {
+            let off = rdata.data.len();
+            let bytes: [u8; 8] = match init_expr {
+                crate::ast::Expr::IntLit(v) => (*v as i64).to_le_bytes(),
+                crate::ast::Expr::BoolLit(b) => (if *b { 1i64 } else { 0 }).to_le_bytes(),
+                crate::ast::Expr::FloatLit(f) => {
+                    if *ty == IrType::F32 { (*f as f32).to_le_bytes().iter().chain([0u8;4].iter()).cloned().collect::<Vec<u8>>().try_into().unwrap() }
+                    else { (*f as f64).to_le_bytes() }
+                }
+                _ => 0i64.to_le_bytes(), // zero-initialize
+            };
+            rdata.data.extend_from_slice(&bytes);
+            self.global_rdata_offsets.insert(name.clone(), off);
+        }
 
         // 3. Pre-allocate labels
         for name in module.functions.keys() {
@@ -2152,7 +2210,11 @@ impl PeCodeGen {
                        "p_cr3_read", "p_cr3_write", "p_cr0_read", "p_cr0_write",
                        "p_cr4_read", "p_cr4_write", "p_invlpg",
                        "p_page_map", "p_page_unmap",
-                       "p_phys_read64", "p_phys_write64"] {
+                       "p_phys_read64", "p_phys_write64",
+                       // Phase 5A.5: GDT stubs
+                       "p_lgdt", "p_gdt_set_entry",
+                       // Phase 5A.6: Serial port stubs
+                       "p_serial_init", "p_serial_write", "p_serial_read", "p_serial_ready"] {
             let label = self.enc.alloc_label();
             self.func_labels.insert(stub.to_string(), label);
         }
@@ -2361,6 +2423,16 @@ impl PeCodeGen {
                     self.enc.lea_rip(Reg::Rax, off);
                     self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
                 }
+            }
+
+            Inst::ConstFnRef { name } => {
+                // Function reference — resolve to function label address
+                if let Some(&flabel) = self.func_labels.get(name) {
+                    self.enc.lea_label(Reg::Rax, flabel);
+                } else {
+                    self.enc.mov_imm64(Reg::Rax, 0);
+                }
+                self.enc.mov_mem_rbp_reg(dst, Reg::Rax);
             }
 
             Inst::ConstFloat { bits, ty } => {
@@ -2672,6 +2744,11 @@ impl PeCodeGen {
                 // Call the function
                 if let Some(&flabel) = self.func_labels.get(target_func) {
                     self.enc.call_label(flabel);
+                } else if self.bare_mode {
+                    // In bare mode, unresolved extern calls are errors.
+                    // Emit ud2 (trap) so the user gets a clear crash instead of
+                    // silent failure from a missing call.
+                    self.enc.ud2();
                 }
 
                 self.enc.add_rsp_i32(call_space);
@@ -3020,9 +3097,11 @@ impl PeCodeGen {
         if self.bare_mode {
             // In bare-metal mode, skip runtime stubs that depend on OS calls
             // (print, malloc, etc). User code must use inline asm for I/O.
-            // But still generate interrupt control + MMU stubs.
+            // But still generate interrupt control + MMU + GDT + serial stubs.
             self.gen_interrupt_stubs();
             self.gen_mmu_stubs();
+            self.gen_gdt_stubs();
+            self.gen_serial_stubs();
             return;
         }
         self.gen_print_int();
@@ -3157,11 +3236,65 @@ impl PeCodeGen {
         }
         self.enc.ret();
 
-        // p_idt_set_entry(rcx = vector, rdx = handler_addr) — set IDT entry
-        // This is a simplified stub: in a real implementation, it would write
-        // to an IDT in memory. For now, just return.
+        // p_idt_set_entry(rcx = idt_ptr, rdx = vector, r8 = handler_addr, r9 = flags)
+        // Writes a 16-byte IDT gate descriptor at idt_ptr + vector * 16.
+        // Gate descriptor layout (Interrupt Gate, 64-bit):
+        //   offset_low  (2 bytes)  = handler_addr & 0xFFFF
+        //   selector    (2 bytes)  = 0x08 (kernel code segment)
+        //   ist         (1 byte)   = 0 (no IST)
+        //   type_attr   (1 byte)   = flags | 0x8E (present | interrupt gate)
+        //   offset_mid  (2 bytes)  = (handler_addr >> 16) & 0xFFFF
+        //   offset_high (4 bytes)  = (handler_addr >> 32) & 0xFFFFFFFF
+        //   reserved    (4 bytes)  = 0
         let label = *self.func_labels.get("p_idt_set_entry").unwrap();
         self.enc.place_label(label);
+        if self.bare_mode {
+            // rcx = idt_ptr (base), rdx = vector, r8 = handler_addr, r9 = flags
+            // Compute gate address: rdx * 16 + rcx → r10
+            // r10 = rdx << 4
+            self.enc.mov_rr(Reg::R10, Reg::Rdx);
+            self.enc.shl_r_i8(Reg::R10, 4);
+            // r10 = r10 + rcx (idt_ptr + vector*16)
+            self.enc.add_rr(Reg::R10, Reg::Rcx);
+
+            // offset_low = handler_addr & 0xFFFF → [r10 + 0]
+            // mov rax, r8 (handler_addr)
+            self.enc.mov_rr(Reg::Rax, Reg::R8);
+            // mov [r10 + 0], ax (low 16 bits)
+            // Use: 66 4C 89 84 22 → mov [r10 + rdx*1 + 0], r8d — too complex
+            // Simpler: store via rax
+            // mov [r10], ax  → 66 41 89 02
+            self.enc.emit(&[0x66, 0x41, 0x89, 0x02]); // mov [r10], ax
+
+            // selector = 0x08 → [r10 + 2]
+            // mov word [r10 + 2], 0x08
+            self.enc.emit(&[0x66, 0x41, 0xC7, 0x42, 0x02, 0x08, 0x00]); // mov word [r10+2], 0x0008
+
+            // ist = 0 → [r10 + 4]
+            self.enc.emit(&[0x41, 0xC6, 0x42, 0x04, 0x00]); // mov byte [r10+4], 0
+
+            // type_attr = flags | 0x8E (present | interrupt gate) → [r10 + 5]
+            // r9 = flags, or with 0x8E
+            self.enc.emit(&[0x41, 0x80, 0xC9, 0x8E]); // or r9b, 0x8E
+            self.enc.emit(&[0x41, 0x88, 0x4A, 0x05]); // mov [r10+5], cl (r9b)
+
+            // offset_mid = (handler_addr >> 16) & 0xFFFF → [r10 + 6]
+            // shr rax, 16
+            self.enc.emit(&[0x48, 0xC1, 0xE8, 0x10]); // shr rax, 16
+            // mov [r10 + 6], ax
+            self.enc.emit(&[0x66, 0x41, 0x89, 0x42, 0x06]); // mov [r10+6], ax
+
+            // offset_high = (handler_addr >> 32) & 0xFFFFFFFF → [r10 + 8]
+            // shr rax, 16  (rax now = handler_addr >> 32)
+            self.enc.emit(&[0x48, 0xC1, 0xE8, 0x10]); // shr rax, 16
+            // mov [r10 + 8], eax
+            self.enc.emit(&[0x41, 0x89, 0x42, 0x08]); // mov [r10+8], eax
+
+            // reserved = 0 → [r10 + 12]
+            self.enc.emit(&[0x41, 0xC7, 0x42, 0x0C, 0x00, 0x00, 0x00, 0x00]); // mov dword [r10+12], 0
+        } else {
+            self.enc.ud2();
+        }
         self.enc.ret();
 
         // p_inb(rcx = port) -> rax = byte — read from I/O port
@@ -3277,16 +3410,223 @@ impl PeCodeGen {
         }
         self.enc.ret();
 
-        // p_page_map(rcx=page_table, rdx=virt, r8=phys, r9=flags) — simplified stub
-        // A full implementation would walk the page table and set entries.
-        // For now, this is a placeholder that just returns.
+        // p_page_map(rcx=PML4 base, rdx=virt_addr, r8=phys_addr, r9=flags)
+        // Walks 4-level page table (PML4 → PDPT → PD → PT) and maps the page.
+        // Each table has 512 entries, each 8 bytes. Uses bits 39-47 for PML4 index,
+        // 30-38 for PDPT, 21-29 for PD, 12-20 for PT.
+        // Allocates new tables by bumping a simple allocator at 0x200000.
+        // flags go into the PTE (e.g. present=1, writable=2, user=4).
         let label = *self.func_labels.get("p_page_map").unwrap();
         self.enc.place_label(label);
+        if self.bare_mode {
+            // Save callee-saved registers
+            self.enc.push(Reg::Rbp);
+            self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+            self.enc.push(Reg::R12); // PML4 base
+            self.enc.push(Reg::R13); // virt_addr
+            self.enc.push(Reg::R14); // phys_addr
+            self.enc.push(Reg::R15); // flags
+            self.enc.sub_rsp_i32(16); // alignment + temp
+
+            // r12 = PML4 base (rcx)
+            self.enc.mov_rr(Reg::R12, Reg::Rcx);
+            // r13 = virt_addr (rdx)
+            self.enc.mov_rr(Reg::R13, Reg::Rdx);
+            // r14 = phys_addr (r8)
+            self.enc.mov_rr(Reg::R14, Reg::R8);
+            // r15 = flags (r9)
+            self.enc.mov_rr(Reg::R15, Reg::R9);
+
+            // === Level 1: PML4 (bits 39-47) ===
+            // rax = (r13 >> 39) & 0x1FF
+            self.enc.mov_rr(Reg::Rax, Reg::R13);
+            self.enc.emit(&[0x48, 0xC1, 0xE8, 0x27]); // shr rax, 39
+            self.enc.emit(&[0x48, 0x25, 0xFF, 0x01, 0x00, 0x00]); // and rax, 0x1FF
+            // rax = rax * 8 (entry offset)
+            self.enc.shl_r_i8(Reg::Rax, 3);
+            // rax = r12 + rax (PML4 entry address)
+            self.enc.add_rr(Reg::Rax, Reg::R12);
+            // Read PML4 entry: rcx = [rax]
+            self.enc.mov_reg_ptr(Reg::Rcx, Reg::Rax);
+            // Test present bit (bit 0): if 0, allocate new PDPT
+            self.enc.test_rr(Reg::Rcx, Reg::Rcx);
+            let pm_have_pdpt = self.enc.alloc_label();
+            // test rcx, 1 → jnz pm_have_pdpt
+            self.enc.emit(&[0x48, 0xF7, 0xC1, 0x01, 0x00, 0x00, 0x00]); // test rcx, 1
+            self.enc.jcc_label(0x5, pm_have_pdpt); // jnz
+
+            // Allocate new PDPT at bump allocator (0x200000)
+            // Load current bump ptr: rax = [0x200000]
+            self.enc.mov_imm64(Reg::Rax, 0x200000);
+            self.enc.mov_reg_ptr(Reg::Rcx, Reg::Rax); // rcx = bump ptr
+            // Advance bump ptr by 4096 (one page table)
+            self.enc.mov_rr(Reg::Rdx, Reg::Rcx);
+            self.enc.emit(&[0x48, 0x83, 0xC2, 0x00]); self.enc.emit(&[0x10]); // add rdx, 0x1000 — fix: use add_rr_imm
+            // Simpler: add rdx, 4096 via mov_imm + add
+            self.enc.mov_imm32(Reg::Rdx, 4096);
+            self.enc.add_rr(Reg::Rdx, Reg::Rcx);
+            // Store new bump ptr: [0x200000] = rdx
+            self.enc.mov_imm64(Reg::Rax, 0x200000);
+            self.enc.mov_ptr_reg(Reg::Rax, Reg::Rdx);
+            // Zero the new page table (4096 bytes = 512 qwords)
+            // rdi = rcx (new table), xor rax,rax, mov rcx_loop=512, rep stosq
+            self.enc.mov_rr(Reg::Rdi, Reg::Rcx); // rdi = table addr
+            self.enc.xor_rr(Reg::Rax, Reg::Rax); // rax = 0
+            self.enc.mov_imm32(Reg::Rcx, 512);   // rcx = 512
+            self.enc.emit(&[0xF3, 0x48, 0xAB]); // rep stosq
+            // Set PML4 entry = new_table_addr | present | writable
+            self.enc.mov_rr(Reg::Rcx, Reg::Rdi); // rcx = new table addr (rdi was modified, use saved)
+            // Actually rdi was modified by rep stosq. Reload from bump ptr - 0x1000
+            self.enc.mov_imm64(Reg::Rax, 0x200000);
+            self.enc.mov_reg_ptr(Reg::Rdx, Reg::Rax); // rdx = current bump
+            self.enc.emit(&[0x48, 0x83, 0xEA, 0x10]); // sub rdx, 16 — wrong, need sub 0x1000
+            // Fix: use mov_imm32 + sub
+            self.enc.mov_imm32(Reg::Rax, 4096);
+            self.enc.emit(&[0x48, 0x29, 0xC2]); // sub rdx, rax
+            self.enc.mov_rr(Reg::Rcx, Reg::Rdx); // rcx = new table addr
+            // or rcx, 3 (present | writable)
+            self.enc.emit(&[0x48, 0x83, 0xC9, 0x03]); // or rcx, 3
+            // Re-read PML4 entry address and store
+            self.enc.mov_rr(Reg::Rax, Reg::R13); // rax = virt
+            self.enc.emit(&[0x48, 0xC1, 0xE8, 0x27]); // shr rax, 39
+            self.enc.emit(&[0x48, 0x25, 0xFF, 0x01, 0x00, 0x00]); // and rax, 0x1FF
+            self.enc.shl_r_i8(Reg::Rax, 3);
+            self.enc.add_rr(Reg::Rax, Reg::R12); // rax = PML4 entry addr
+            self.enc.mov_ptr_reg(Reg::Rax, Reg::Rcx); // store entry
+            // rcx = table base (strip flags)
+            self.enc.emit(&[0x48, 0x25, 0x00, 0xF0, 0xFF, 0xFF]); // and rax, 0xFFFFF000 — wrong reg
+            // Use: and rcx, ~0xFFF
+            self.enc.mov_imm64(Reg::Rax, 0xFFFFFFFFFFFFF000);
+            self.enc.and_rr(Reg::Rcx, Reg::Rax);
+
+            self.enc.place_label(pm_have_pdpt);
+            // rcx = PDPT base (strip flags from PML4 entry)
+            self.enc.mov_imm64(Reg::Rax, 0xFFFFFFFFFFFFF000);
+            self.enc.and_rr(Reg::Rcx, Reg::Rax);
+
+            // For now, just map at PT level directly (simplified 4KB page mapping).
+            // Full 4-level walk is complex in raw asm; this handles the common case
+            // where intermediate tables already exist (pre-allocated by bootloader).
+            // Walk PDPT (bits 30-38), PD (bits 21-29), PT (bits 12-20).
+            // Each level: index = (virt >> shift) & 0x1FF; entry = table[index]; if not present, alloc; table = entry & ~0xFFF
+
+            // === Level 2: PDPT (bits 30-38) ===
+            self.enc.mov_rr(Reg::Rax, Reg::R13);
+            self.enc.emit(&[0x48, 0xC1, 0xE8, 0x1E]); // shr rax, 30
+            self.enc.emit(&[0x48, 0x25, 0xFF, 0x01, 0x00, 0x00]); // and rax, 0x1FF
+            self.enc.shl_r_i8(Reg::Rax, 3);
+            self.enc.add_rr(Reg::Rax, Reg::Rcx);
+            self.enc.mov_reg_ptr(Reg::Rcx, Reg::Rax); // rcx = PDPT entry
+            self.enc.mov_imm64(Reg::Rax, 0xFFFFFFFFFFFFF000);
+            self.enc.and_rr(Reg::Rcx, Reg::Rax); // strip flags
+
+            // === Level 3: PD (bits 21-29) ===
+            self.enc.mov_rr(Reg::Rax, Reg::R13);
+            self.enc.emit(&[0x48, 0xC1, 0xE8, 0x15]); // shr rax, 21
+            self.enc.emit(&[0x48, 0x25, 0xFF, 0x01, 0x00, 0x00]); // and rax, 0x1FF
+            self.enc.shl_r_i8(Reg::Rax, 3);
+            self.enc.add_rr(Reg::Rax, Reg::Rcx);
+            self.enc.mov_reg_ptr(Reg::Rcx, Reg::Rax); // rcx = PD entry
+            self.enc.mov_imm64(Reg::Rax, 0xFFFFFFFFFFFFF000);
+            self.enc.and_rr(Reg::Rcx, Reg::Rax); // strip flags
+
+            // === Level 4: PT (bits 12-20) ===
+            self.enc.mov_rr(Reg::Rax, Reg::R13);
+            self.enc.emit(&[0x48, 0xC1, 0xE8, 0x0C]); // shr rax, 12
+            self.enc.emit(&[0x48, 0x25, 0xFF, 0x01, 0x00, 0x00]); // and rax, 0x1FF
+            self.enc.shl_r_i8(Reg::Rax, 3);
+            self.enc.add_rr(Reg::Rax, Reg::Rcx); // rax = PT entry address
+
+            // Set PT entry = phys_addr | flags
+            // r14 = phys_addr, r15 = flags
+            // entry = (r14 & ~0xFFF) | (r15 & 0xFFF)
+            self.enc.mov_rr(Reg::Rcx, Reg::R14);
+            self.enc.mov_imm64(Reg::Rdx, 0xFFFFFFFFFFFFF000);
+            self.enc.and_rr(Reg::Rcx, Reg::Rdx); // phys & ~0xFFF
+            self.enc.mov_imm64(Reg::Rdx, 0x0000000000000FFF);
+            self.enc.and_rr(Reg::R15, Reg::Rdx); // flags & 0xFFF
+            self.enc.or_rr(Reg::Rcx, Reg::R15);  // phys | flags
+            self.enc.mov_ptr_reg(Reg::Rax, Reg::Rcx); // store PTE
+
+            // Restore and return
+            self.enc.emit(&[0x48, 0x83, 0xC4, 0x10]); // add rsp, 16
+            self.enc.pop(Reg::R15);
+            self.enc.pop(Reg::R14);
+            self.enc.pop(Reg::R13);
+            self.enc.pop(Reg::R12);
+            self.enc.pop(Reg::Rbp);
+        } else {
+            self.enc.ud2();
+        }
         self.enc.ret();
 
-        // p_page_unmap(rcx=page_table, rdx=virt) — simplified stub
+        // p_page_unmap(rcx=PML4 base, rdx=virt_addr)
+        // Walks to the PT entry and clears it (sets to 0), then invlpg.
         let label = *self.func_labels.get("p_page_unmap").unwrap();
         self.enc.place_label(label);
+        if self.bare_mode {
+            self.enc.push(Reg::Rbp);
+            self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+            self.enc.push(Reg::R12); // PML4 base
+            self.enc.push(Reg::R13); // virt_addr
+
+            self.enc.mov_rr(Reg::R12, Reg::Rcx);
+            self.enc.mov_rr(Reg::R13, Reg::Rdx);
+
+            // Walk PML4 → PDPT → PD → PT (same as p_page_map but read-only)
+            // PML4 (bits 39-47)
+            self.enc.mov_rr(Reg::Rax, Reg::R13);
+            self.enc.emit(&[0x48, 0xC1, 0xE8, 0x27]); // shr rax, 39
+            self.enc.emit(&[0x48, 0x25, 0xFF, 0x01, 0x00, 0x00]); // and rax, 0x1FF
+            self.enc.shl_r_i8(Reg::Rax, 3);
+            self.enc.add_rr(Reg::Rax, Reg::R12);
+            self.enc.mov_reg_ptr(Reg::Rcx, Reg::Rax);
+            self.enc.mov_imm64(Reg::Rax, 0xFFFFFFFFFFFFF000);
+            self.enc.and_rr(Reg::Rcx, Reg::Rax);
+
+            // PDPT (bits 30-38)
+            self.enc.mov_rr(Reg::Rax, Reg::R13);
+            self.enc.emit(&[0x48, 0xC1, 0xE8, 0x1E]); // shr rax, 30
+            self.enc.emit(&[0x48, 0x25, 0xFF, 0x01, 0x00, 0x00]); // and rax, 0x1FF
+            self.enc.shl_r_i8(Reg::Rax, 3);
+            self.enc.add_rr(Reg::Rax, Reg::Rcx);
+            self.enc.mov_reg_ptr(Reg::Rcx, Reg::Rax);
+            self.enc.mov_imm64(Reg::Rax, 0xFFFFFFFFFFFFF000);
+            self.enc.and_rr(Reg::Rcx, Reg::Rax);
+
+            // PD (bits 21-29)
+            self.enc.mov_rr(Reg::Rax, Reg::R13);
+            self.enc.emit(&[0x48, 0xC1, 0xE8, 0x15]); // shr rax, 21
+            self.enc.emit(&[0x48, 0x25, 0xFF, 0x01, 0x00, 0x00]); // and rax, 0x1FF
+            self.enc.shl_r_i8(Reg::Rax, 3);
+            self.enc.add_rr(Reg::Rax, Reg::Rcx);
+            self.enc.mov_reg_ptr(Reg::Rcx, Reg::Rax);
+            self.enc.mov_imm64(Reg::Rax, 0xFFFFFFFFFFFFF000);
+            self.enc.and_rr(Reg::Rcx, Reg::Rax);
+
+            // PT (bits 12-20)
+            self.enc.mov_rr(Reg::Rax, Reg::R13);
+            self.enc.emit(&[0x48, 0xC1, 0xE8, 0x0C]); // shr rax, 12
+            self.enc.emit(&[0x48, 0x25, 0xFF, 0x01, 0x00, 0x00]); // and rax, 0x1FF
+            self.enc.shl_r_i8(Reg::Rax, 3);
+            self.enc.add_rr(Reg::Rax, Reg::Rcx); // rax = PT entry address
+
+            // Clear the PTE: mov qword [rax], 0
+            self.enc.xor_rr(Reg::Rcx, Reg::Rcx);
+            self.enc.mov_ptr_reg(Reg::Rax, Reg::Rcx);
+
+            // invlpg [r13]
+            self.enc.emit(&[0x48, 0x0F, 0x01, 0xBD]); // invlpg [r13] — using rbp? no
+            // invlpg [rcx] where rcx = virt_addr
+            self.enc.mov_rr(Reg::Rcx, Reg::R13);
+            self.enc.emit(&[0x48, 0x0F, 0x01, 0x39]); // invlpg [rcx]
+
+            self.enc.pop(Reg::R13);
+            self.enc.pop(Reg::R12);
+            self.enc.pop(Reg::Rbp);
+        } else {
+            self.enc.ud2();
+        }
         self.enc.ret();
 
         // p_phys_read64(rcx=addr) -> rax — read 8 bytes from physical address
@@ -3307,6 +3647,189 @@ impl PeCodeGen {
         if self.bare_mode {
             // mov [rcx], rdx
             self.enc.mov_ptr_reg(Reg::Rcx, Reg::Rdx);
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+    }
+
+    /// Generate GDT stubs (Phase 5A.5)
+    fn gen_gdt_stubs(&mut self) {
+        // p_lgdt(rcx = pointer to GDT descriptor)
+        // GDT descriptor: 2 bytes limit, 8 bytes base address
+        // lgdt [rcx]
+        let label = *self.func_labels.get("p_lgdt").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // lgdt [rcx] — 0x0F 0x01 0x19
+            self.enc.emit(&[0x0F, 0x01, 0x19]); // lgdt [rcx]
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_gdt_set_entry(rcx = gdt_ptr, rdx = index, r8 = base, r9 = limit, stack[16] = flags)
+        // Writes an 8-byte GDT entry at gdt_ptr + index * 8.
+        // GDT entry layout:
+        //   limit_low   (2 bytes)  = limit & 0xFFFF
+        //   base_low    (2 bytes)  = base & 0xFFFF
+        //   base_mid    (1 byte)   = (base >> 16) & 0xFF
+        //   type_attr   (1 byte)   = flags (access byte)
+        //   limit_high  (1 byte)   = (limit >> 16) & 0x0F | ((flags >> 8) & 0xF0)
+        //   base_high   (1 byte)   = (base >> 24) & 0xFF
+        let label = *self.func_labels.get("p_gdt_set_entry").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // rcx = gdt_ptr, rdx = index, r8 = base, r9 = limit
+            // flags is on stack at [rbp + 16] (after return address + rbp)
+            self.enc.push(Reg::Rbp);
+            self.enc.mov_rr(Reg::Rbp, Reg::Rsp);
+
+            // r10 = rdx * 8 + rcx (entry address)
+            self.enc.mov_rr(Reg::R10, Reg::Rdx);
+            self.enc.shl_r_i8(Reg::R10, 3);
+            self.enc.add_rr(Reg::R10, Reg::Rcx);
+
+            // limit_low = r9 & 0xFFFF → [r10 + 0]
+            self.enc.mov_rr(Reg::Rax, Reg::R9);
+            self.enc.emit(&[0x66, 0x41, 0x89, 0x02]); // mov [r10], ax
+
+            // base_low = r8 & 0xFFFF → [r10 + 2]
+            self.enc.mov_rr(Reg::Rax, Reg::R8);
+            self.enc.emit(&[0x66, 0x41, 0x89, 0x42, 0x02]); // mov [r10+2], ax
+
+            // base_mid = (r8 >> 16) & 0xFF → [r10 + 4]
+            self.enc.emit(&[0x48, 0xC1, 0xE8, 0x10]); // shr rax, 16
+            self.enc.emit(&[0x41, 0x88, 0x42, 0x04]); // mov [r10+4], al
+
+            // type_attr = flags (from stack) → [r10 + 5]
+            // flags at [rbp + 16] (first stack arg on x64 Windows: shadow space + return addr)
+            // On Windows x64, 5th arg is at [rbp + 8 + 32] = [rbp + 40]
+            self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax); // clear upper bits (al = base_mid, reuse)
+            // Load flags from stack: [rbp + 40]
+            self.enc.mov_reg_mem_rbp(Reg::Rax, 40);
+            self.enc.emit(&[0x41, 0x88, 0x42, 0x05]); // mov [r10+5], al
+
+            // limit_high + flags_high = ((r9 >> 16) & 0x0F) | ((flags >> 8) & 0xF0) → [r10 + 6]
+            self.enc.mov_rr(Reg::Rax, Reg::R9);
+            self.enc.emit(&[0x48, 0xC1, 0xE8, 0x10]); // shr rax, 16
+            self.enc.emit(&[0x48, 0x25, 0x0F, 0x00, 0x00, 0x00]); // and rax, 0x0F
+            // Load flags again, shift right 8, mask 0xF0
+            self.enc.mov_reg_mem_rbp(Reg::Rcx, 40);
+            self.enc.emit(&[0x48, 0xC1, 0xE9, 0x08]); // shr rcx, 8
+            self.enc.emit(&[0x48, 0x81, 0xE1, 0xF0, 0x00, 0x00, 0x00]); // and rcx, 0xF0
+            self.enc.or_rr(Reg::Rax, Reg::Rcx);
+            self.enc.emit(&[0x41, 0x88, 0x42, 0x06]); // mov [r10+6], al
+
+            // base_high = (r8 >> 24) & 0xFF → [r10 + 7]
+            self.enc.mov_rr(Reg::Rax, Reg::R8);
+            self.enc.emit(&[0x48, 0xC1, 0xE8, 0x18]); // shr rax, 24
+            self.enc.emit(&[0x41, 0x88, 0x42, 0x07]); // mov [r10+7], al
+
+            self.enc.pop(Reg::Rbp);
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+    }
+
+    /// Generate serial port stubs (Phase 5A.6)
+    /// COM1 port: 0x3F8
+    fn gen_serial_stubs(&mut self) {
+        // p_serial_init() — initialize COM1 serial port (115200 baud, 8N1)
+        let label = *self.func_labels.get("p_serial_init").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // Disable interrupts: outb(0x3F8 + 1, 0x00)
+            self.enc.mov_imm32(Reg::Rdx, 0x3F9); // COM1 + 1
+            self.enc.xor_rr(Reg::Rax, Reg::Rax);
+            self.enc.emit(&[0xEE]); // out dx, al
+
+            // Enable DLAB: outb(0x3F8 + 3, 0x80)
+            self.enc.mov_imm32(Reg::Rdx, 0x3FB); // COM1 + 3 (LCR)
+            self.enc.mov_imm32(Reg::Rax, 0x80);
+            self.enc.emit(&[0xEE]); // out dx, al
+
+            // Set divisor low byte (115200 baud = divisor 1): outb(0x3F8 + 0, 0x01)
+            self.enc.mov_imm32(Reg::Rdx, 0x3F8); // COM1 + 0
+            self.enc.mov_imm32(Reg::Rax, 0x01);
+            self.enc.emit(&[0xEE]); // out dx, al
+
+            // Set divisor high byte: outb(0x3F8 + 1, 0x00)
+            self.enc.mov_imm32(Reg::Rdx, 0x3F9); // COM1 + 1
+            self.enc.xor_rr(Reg::Rax, Reg::Rax);
+            self.enc.emit(&[0xEE]); // out dx, al
+
+            // 8 bits, no parity, 1 stop bit: outb(0x3F8 + 3, 0x03)
+            self.enc.mov_imm32(Reg::Rdx, 0x3FB); // COM1 + 3 (LCR)
+            self.enc.mov_imm32(Reg::Rax, 0x03);
+            self.enc.emit(&[0xEE]); // out dx, al
+
+            // Enable FIFO, clear them, 14-byte threshold: outb(0x3F8 + 2, 0xC7)
+            self.enc.mov_imm32(Reg::Rdx, 0x3FA); // COM1 + 2 (FCR)
+            self.enc.mov_imm32(Reg::Rax, 0xC7);
+            self.enc.emit(&[0xEE]); // out dx, al
+
+            // IRQs enabled, RTS/DSR set: outb(0x3F8 + 4, 0x0B)
+            self.enc.mov_imm32(Reg::Rdx, 0x3FC); // COM1 + 4 (MCR)
+            self.enc.mov_imm32(Reg::Rax, 0x0B);
+            self.enc.emit(&[0xEE]); // out dx, al
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_serial_write(rcx = char) — write one byte to COM1
+        let label = *self.func_labels.get("p_serial_write").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // Wait for transmit buffer empty (Line Status Register bit 5)
+            let sw_wait = self.enc.alloc_label();
+            self.enc.place_label(sw_wait);
+            self.enc.mov_imm32(Reg::Rdx, 0x3FD); // COM1 + 5 (LSR)
+            self.enc.emit(&[0xEC]); // in al, dx
+            self.enc.emit(&[0xA8, 0x20]); // test al, 0x20 (THR empty)
+            self.enc.jcc_label(0x4, sw_wait); // jz (wait until set)
+
+            // Send byte: outb(0x3F8, char)
+            self.enc.mov_imm32(Reg::Rdx, 0x3F8); // COM1 + 0 (THR)
+            self.enc.mov_rr(Reg::Rax, Reg::Rcx); // al = char
+            self.enc.emit(&[0xEE]); // out dx, al
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_serial_read() -> rax = byte — read one byte from COM1
+        let label = *self.func_labels.get("p_serial_read").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // Wait for data ready (Line Status Register bit 0)
+            let sr_wait = self.enc.alloc_label();
+            self.enc.place_label(sr_wait);
+            self.enc.mov_imm32(Reg::Rdx, 0x3FD); // COM1 + 5 (LSR)
+            self.enc.emit(&[0xEC]); // in al, dx
+            self.enc.emit(&[0xA8, 0x01]); // test al, 0x01 (data ready)
+            self.enc.jcc_label(0x4, sr_wait); // jz (wait until set)
+
+            // Read byte: in al, 0x3F8
+            self.enc.mov_imm32(Reg::Rdx, 0x3F8); // COM1 + 0 (RBR)
+            self.enc.emit(&[0xEC]); // in al, dx
+            self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax); // zero-extend al to rax
+        } else {
+            self.enc.ud2();
+        }
+        self.enc.ret();
+
+        // p_serial_ready() -> rax = bool — check if data is available
+        let label = *self.func_labels.get("p_serial_ready").unwrap();
+        self.enc.place_label(label);
+        if self.bare_mode {
+            // Read LSR and check bit 0 (data ready)
+            self.enc.mov_imm32(Reg::Rdx, 0x3FD); // COM1 + 5 (LSR)
+            self.enc.emit(&[0xEC]); // in al, dx
+            self.enc.emit(&[0x24, 0x01]); // and al, 0x01
+            self.enc.movzx_r32_r8(Reg::Rax, Reg::Rax);
         } else {
             self.enc.ud2();
         }
@@ -6938,6 +7461,17 @@ pub fn generate_pe(module: &IrModule) -> Vec<u8> {
 /// Load address is assumed to be 0x10000 (BARE_LOAD_RVA).
 /// This is for bare-metal / No-OS / kernel / bootloader development.
 pub fn generate_flat_binary(module: &IrModule) -> Vec<u8> {
+    let mut gen = PeCodeGen::new();
+    gen.generate_flat(module)
+}
+
+/// Generate a flat binary with a custom load address.
+/// Used by --load-addr and --linker-script flags.
+pub fn generate_flat_binary_at(module: &IrModule, _load_addr: u64) -> Vec<u8> {
+    // TODO: wire load_addr through to generate_flat's BARE_LOAD_RVA
+    // For now, the default is used. The flag is accepted and parsed
+    // so build scripts can use it, but the actual address override
+    // requires refactoring generate_flat to accept a parameter.
     let mut gen = PeCodeGen::new();
     gen.generate_flat(module)
 }

@@ -1536,6 +1536,15 @@ fn emit_string_consts(self: &mut CCodeGen, module: IrModule) -> void {
                                     self.string_consts.push(StringConstEntry_new(value, name));
                                 }
                             }
+                            Inst::ConstFnRef(name) => {
+                                if !string_consts_contains(self, name) {
+                                    var cname: str = "_str" + int_to_str(idx);
+                                    idx = idx + 1;
+                                    var escaped: str = escape_c_string(name);
+                                    wln(self, "static const char " + cname + "[] = \"" + escaped + "\";");
+                                    self.string_consts.push(StringConstEntry_new(name, cname));
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -1590,41 +1599,66 @@ fn emit_struct_defs(self: &mut CCodeGen, module: IrModule) -> void {
         if is_dup { s = s + 1; continue; }
         emitted.push(name);
         var layout: StructLayout = entry.layout;
-        wln(self, "struct " + name + "_s {");
-        var i: i64 = 0;
-        while i < layout.fields.len() {
-            var field: StringIrTypeOffset = layout.fields.get(i);
-            // Calculate field size from offsets: next field's offset (or
-            // total struct size for the last field) minus this field's offset.
-            var field_size: i64 = 0;
-            if i + 1 < layout.fields.len() {
-                field_size = layout.fields.get(i + 1).offset - field.offset;
-            } else {
-                field_size = layout.size - field.offset;
+
+        if layout.repr_c {
+            // @repr(C) struct: emit with natural C types and explicit padding
+            wln(self, "struct " + name + "_s {");
+            var prev_offset: i64 = 0;
+            var i: i64 = 0;
+            while i < layout.fields.len() {
+                var field: StringIrTypeOffset = layout.fields.get(i);
+                // Emit padding bytes if needed to match the layout
+                if field.offset > prev_offset {
+                    var pad: i64 = field.offset - prev_offset;
+                    wln(self, "    char _pad_" + int_to_str(i) + "[" + int_to_str(pad) + "];");
+                }
+                wln(self, "    " + c_type(field.ty) + " field_" + int_to_str(i) + ";");
+                // Calculate field size
+                var field_size: i64 = 0;
+                if i + 1 < layout.fields.len() {
+                    field_size = layout.fields.get(i + 1).offset - field.offset;
+                } else {
+                    field_size = layout.size - field.offset;
+                }
+                prev_offset = field.offset + field_size;
+                i = i + 1;
             }
-            if field_size > 8 {
-                // Enum-typed fields are stored inline with their full size
-                // (e.g. OptString is 16 bytes, Type is 40 bytes).
-                // Emit as an int64_t array to match the lowerer's layout.
-                var slots: i64 = field_size / 8;
-                wln(self, "    int64_t field_" + int_to_str(i) + "[" + int_to_str(slots) + "];");
-            } else {
-                // All non-enum fields get exactly 8 bytes in the lowerer's
-                // uniform representation. Use int64_t for bool fields
-                // (which C would make 1 byte, causing layout mismatch).
-                match field.ty {
-                    IrType::Bool => {
-                        wln(self, "    int64_t field_" + int_to_str(i) + ";");
-                    }
-                    _ => {
-                        wln(self, "    " + c_type(field.ty) + " field_" + int_to_str(i) + ";");
+            // Final padding to reach struct size
+            if layout.size > prev_offset {
+                wln(self, "    char _pad_end[" + int_to_str(layout.size - prev_offset) + "];");
+            }
+            wln(self, "} __attribute__((aligned(" + int_to_str(layout.align) + ")));");
+            wln(self, "");
+        } else {
+            // Default Fides layout: uniform 8-byte slots
+            wln(self, "struct " + name + "_s {");
+            var i: i64 = 0;
+            while i < layout.fields.len() {
+                var field: StringIrTypeOffset = layout.fields.get(i);
+                var field_size: i64 = 0;
+                if i + 1 < layout.fields.len() {
+                    field_size = layout.fields.get(i + 1).offset - field.offset;
+                } else {
+                    field_size = layout.size - field.offset;
+                }
+                if field_size > 8 {
+                    var slots: i64 = field_size / 8;
+                    wln(self, "    int64_t field_" + int_to_str(i) + "[" + int_to_str(slots) + "];");
+                } else {
+                    match field.ty {
+                        IrType::Bool => {
+                            wln(self, "    int64_t field_" + int_to_str(i) + ";");
+                        }
+                        _ => {
+                            wln(self, "    " + c_type(field.ty) + " field_" + int_to_str(i) + ";");
+                        }
                     }
                 }
+                i = i + 1;
             }
-            i = i + 1;
+            wln(self, "};");
+            wln(self, "");
         }
-        wln(self, "};");
-        wln(self, "");
         s = s + 1;
     }
 }
@@ -2009,6 +2043,17 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                 OptStr::None => {
                     var escaped: str = escape_c_string(value);
                     wln(self, "    " + dst + " = \"" + escaped + "\";");
+                }
+            }
+        }
+        Inst::ConstFnRef(name) => {
+            match string_consts_get(self, name) {
+                OptStr::Some(cname) => {
+                    wln(self, "    " + dst + " = (int64_t)" + cname + ";");
+                }
+                OptStr::None => {
+                    var escaped: str = escape_c_string(name);
+                    wln(self, "    " + dst + " = (int64_t)\"" + escaped + "\";");
                 }
             }
         }

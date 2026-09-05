@@ -561,6 +561,12 @@ impl WasmCodeGen {
                 self.emit_const_i64(out, addr as i64);
                 if dst_has_value { self.emit_set_value(out, id, func); }
             }
+            Inst::ConstFnRef { name } => {
+                // Function reference — use string address for name-based lookup
+                let addr = self.string_addrs.get(name).copied().unwrap_or(0);
+                self.emit_const_i64(out, addr as i64);
+                if dst_has_value { self.emit_set_value(out, id, func); }
+            }
             Inst::ConstNull { .. } => {
                 self.emit_const_i64(out, 0);
                 if dst_has_value { self.emit_set_value(out, id, func); }
@@ -1004,6 +1010,9 @@ impl WasmCodeGen {
             for (_, inst) in &func.instructions {
                 if let Inst::ConstStr { value } = inst {
                     self.intern_string(value);
+                }
+                if let Inst::ConstFnRef { name } = inst {
+                    self.intern_string(name);
                 }
                 if let Inst::Panic { message } = inst {
                     self.intern_string(message);

@@ -3,6 +3,9 @@
 > **What this is:** A practical reference for anyone working on the self-hosting
 > effort. Explains the process, how Fides differs from Rust/C, what limitations
 > to expect, and how to avoid common pitfalls during bootstrap.
+>
+> **Status (Sep 5, 2026 - session 15):** Bootstrap fixpoint achieved.
+> `fides-c2.c == fides-c3.c` (SHA256-identical, 701,100 lines).
 
 ## Table of Contents
 
@@ -24,22 +27,23 @@ Self-hosting means the Fides compiler is written in Fides. The bootstrap
 process proves this works:
 
 ```
-Step 1: Rust compiler (fidesc) compiles Fides compiler â†’ fides-c
-Step 2: fides-c compiles the Fides compiler â†’ fides-self
-Step 3: fides-self compiles the Fides compiler â†’ fides-self-2
-Step 4: diff fides-self fides-self-2  (must be identical â€” deterministic)
-Step 5: fides-self passes the full test suite
+Step 1: Rust compiler (fidesc) compiles Fides compiler -> fides-c
+Step 2: fides-c compiles the Fides compiler -> fides-c2
+Step 3: fides-c2 compiles the Fides compiler -> fides-c3
+Step 4: diff fides-c2.c fides-c3.c  (must be identical -- deterministic)
+Step 5: fides-c3 passes the full test suite
 ```
 
-If step 4 produces identical binaries, the compiler is **round-trip stable** â€”
-it can compile itself forever without drift.
+If step 4 produces identical output, the compiler is **round-trip stable** --
+it can compile itself forever without drift. **This was achieved in session 15:
+fides-c2.c == fides-c3.c (SHA256-identical, 701,100 lines).**
 
 ## 2. The Strategy: C Codegen Bootstrap
 
 The Fides compiler has three backends:
-- **Interpreter** â€” runs IR directly (slow, reference implementation)
-- **C codegen** â€” translates IR â†’ C source, hands off to gcc/clang
-- **Native (PE/ELF)** â€” translates IR â†’ raw x86-64 machine code (no external tools)
+- **Interpreter** -- runs IR directly (slow, reference implementation)
+- **C codegen** -- translates IR -> C source, hands off to gcc/clang
+- **Native (PE/ELF)** -- translates IR -> raw x86-64 machine code (no external tools)
 
 We bootstrap via **C codegen** because:
 - It's the most stable (167/167 tests pass)
@@ -55,19 +59,20 @@ the gcc dependency entirely.
 
 ```
 source (.fd)
-  â†’ lexer        (tokenize)
-  â†’ parser       (build AST)
-  â†’ typechecker  (type inference, region/effect/capability checks)
-  â†’ lower        (AST â†’ SSA IR)
-  â†’ mono         (monomorphize generics)
-  â†’ borrowck     (borrow checking)
-  â†’ pir          (IR â†’ PIR L1/L2/L3 transforms)
-  â†’ opt          (23 optimization passes on PIR)
-  â†’ codegen_c    (PIR â†’ C source code)
-  â†’ gcc/clang    (C â†’ native binary)
+  -> lexer        (tokenize)
+  -> parser       (build AST)
+  -> typechecker  (type inference, region/effect/capability checks)
+  -> lower        (AST -> SSA IR)
+  -> mono         (monomorphize generics)
+  -> borrowck     (borrow checking)
+  -> pir          (IR -> PIR L1/L2/L3 transforms)
+  -> opt          (23 optimization passes on PIR)
+  -> codegen_c    (PIR -> C source code)
+  -> gcc/clang    (C -> native binary)
 ```
 
-All 16 files in this pipeline have been rewritten in Fides (see section 9).
+All 25 files in this pipeline have been rewritten in Fides (see section 9).
+The bootstrap fixpoint is achieved: `fides-c2.c == fides-c3.c`.
 
 ## 3. How Fides Differs from Rust
 
@@ -75,25 +80,25 @@ These differences shaped every rewrite. Understanding them is essential.
 
 ### 3.1 Structs Passed by Value
 
-**Rust:** `fn process(&module: &IrModule)` â€” passes a pointer, O(1).
-**Fides:** `fn process(self: &mut CCodeGen, module: IrModule)` â€” copies the entire struct.
+**Rust:** `fn process(&module: &IrModule)` -- passes a pointer, O(1).
+**Fides:** `fn process(self: &mut CCodeGen, module: IrModule)` -- copies the entire struct.
 
 Every function that takes a large struct (IrModule, IrFunction, AstModule)
 copies all its Vecs, strings, and nested data. This is the biggest performance
 difference.
 
 **Impact:** The self-hosted compiler will be significantly slower than the
-Rust compiler. For bootstrap, this is acceptable â€” correctness matters more
+Rust compiler. For bootstrap, this is acceptable -- correctness matters more
 than speed. The workaround is "get-modify-set": read the struct, modify a
 local copy, write it back.
 
 **Future fix:** Add reference types (`&T`) to Fides for large struct passing.
 
-### 3.2 No Real HashMap â€” Vec-Based Lookup
+### 3.2 No Real HashMap -- Vec-Based Lookup
 
-**Rust:** `HashMap<String, V>` â€” O(1) lookup via hash table.
-**Fides:** `HashMap` is i64â†’i64 only. String-keyed maps use `Vec<Entry>` with
-linear search â€” O(n).
+**Rust:** `HashMap<String, V>` -- O(1) lookup via hash table.
+**Fides:** `HashMap` is i64->i64 only. String-keyed maps use `Vec<Entry>` with
+linear search -- O(n).
 
 Every type lookup, function signature lookup, and variable resolution in the
 typechecker is a linear scan. For a compiler processing thousands of items,
@@ -104,9 +109,9 @@ will be slow. Acceptable for bootstrap.
 
 **Future fix:** Add generic HashMap to Fides stdlib (string-keyed, hash-based).
 
-### 3.3 No Lazy Iterators â€” Eager Intermediate Vecs
+### 3.3 No Lazy Iterators -- Eager Intermediate Vecs
 
-**Rust:** `vec.iter().map(|x| ...).filter(|x| ...).collect()` â€” lazy, zero
+**Rust:** `vec.iter().map(|x| ...).filter(|x| ...).collect()` -- lazy, zero
 intermediate allocations.
 **Fides:** Explicit while loops, each step produces a new Vec.
 
@@ -173,25 +178,25 @@ match x {
 
 ### 3.8 `val` is a Keyword
 
-**Rust:** `let val = 42;` â€” fine.
+**Rust:** `let val = 42;` -- fine.
 **Fides:** `val` is a keyword (used for value declarations). Must rename to
 `v`, `ret_val`, `value`, etc.
 
 ### 3.9 `region` is a Keyword
 
-**Rust:** `let region = ...` â€” fine.
+**Rust:** `let region = ...` -- fine.
 **Fides:** `region` is a keyword (region-based memory management). Must rename
 to `mem_region` or similar.
 
 ### 3.10 `>>` Parsing Issues
 
-**Rust:** `Vec<Vec<i64>>` â€” fine.
+**Rust:** `Vec<Vec<i64>>` -- fine.
 **Fides:** `>>` can be misinterpreted. Must write `Vec<Vec<i64> >` with a
 space. Also use `shr_i64()` helper instead of `>>` operator in expressions.
 
 ### 3.11 No `derive(PartialEq)`
 
-**Rust:** `#[derive(PartialEq)]` â€” auto-generates equality comparison.
+**Rust:** `#[derive(PartialEq)]` -- auto-generates equality comparison.
 **Fides:** `@derive(Debug, Clone)` exists but no `PartialEq`. Must write
 manual `equals()` functions.
 
@@ -199,7 +204,7 @@ manual `equals()` functions.
 
 **Rust:** `.clone()` does a deep copy.
 **Fides:** Clone returns `self` (shallow). But since structs are passed by
-value anyway, this is usually fine â€” the copy semantics handle it.
+value anyway, this is usually fine -- the copy semantics handle it.
 
 ### 3.13 String Concatenation Allocates
 
@@ -210,10 +215,10 @@ concatenation (building C source code), which is slow.
 
 ### 3.14 No `as` Casts for Enums
 
-**Rust:** `x as u64` â€” numeric cast.
+**Rust:** `x as u64` -- numeric cast.
 **Fides:** Must use explicit cast functions or match patterns.
 
-### 3.15 `Option<T>` â†’ Custom Opt Enums
+### 3.15 `Option<T>` -> Custom Opt Enums
 
 **Rust:** `Option<T>` is built-in and generic.
 **Fides:** `Option<T>` exists but for each concrete type used in the compiler,
@@ -238,7 +243,7 @@ b = tmp;
 
 ## 4. How Fides Differs from C
 
-The C codegen translates Fides IR â†’ C99. Understanding the mapping helps
+The C codegen translates Fides IR -> C99. Understanding the mapping helps
 debug codegen issues.
 
 ### 4.1 All Values Are 8 Bytes
@@ -380,8 +385,8 @@ Don't jump to compiling the full compiler. Build up:
 3. Compile `json.fd` (small, no deps)
 4. Compile `ast.fd` (medium, has deps)
 5. Compile `ir.fd` (large)
-6. Compile `typechecker.fd` (huge â€” 4800 lines)
-7. Compile `codegen_c.fd` (huge â€” 4700 lines)
+6. Compile `typechecker.fd` (huge -- 4800 lines)
+7. Compile `codegen_c.fd` (huge -- 4700 lines)
 8. Compile `compiler.fd` (the driver)
 9. Compile all together (full bootstrap)
 
@@ -412,13 +417,13 @@ Fix all differences. This is the most important step.
 
 ### Phase 2: Create Missing Tests
 
-- `tests/compiler/test_typechecker.fd` â€” the only rewritten module without a test
+- `tests/compiler/test_typechecker.fd` -- the only rewritten module without a test
 
 ### Phase 3: Incremental Bootstrap
 
 ```
-hello.fd â†’ token.fd â†’ json.fd â†’ ast.fd â†’ ir.fd â†’ 
-typechecker.fd â†’ codegen_c.fd â†’ compiler.fd â†’ FULL BOOTSTRAP
+hello.fd -> token.fd -> json.fd -> ast.fd -> ir.fd -> 
+typechecker.fd -> codegen_c.fd -> compiler.fd -> FULL BOOTSTRAP
 ```
 
 ### Phase 4: Round-Trip Stability
@@ -441,15 +446,15 @@ diff fides-self fides-self-2  # must be identical
 
 | Failure | Symptom | Where to Look |
 |---------|---------|---------------|
-| Visibility error | "private to module X" | typechecker â€” module resolution |
-| Missing function | "unknown function foo" | lower or mono â€” function registration |
-| Wrong type | "type mismatch" | typechecker â€” type inference |
-| Infinite loop | Hangs | parser or typechecker â€” recursion |
-| Crash/abort | Segfault | codegen_c â€” pointer casting |
+| Visibility error | "private to module X" | typechecker -- module resolution |
+| Missing function | "unknown function foo" | lower or mono -- function registration |
+| Wrong type | "type mismatch" | typechecker -- type inference |
+| Infinite loop | Hangs | parser or typechecker -- recursion |
+| Crash/abort | Segfault | codegen_c -- pointer casting |
 | Non-determinism | Step 3 differs from step 2 | Any module using Vec-based maps |
-| Out of memory | OOM | Struct-by-value copying â€” reduce struct size |
-| Recursion limit | "max recursion depth" | parser/typechecker â€” increase --max-recursion |
-| C compilation error | gcc error | codegen_c â€” invalid C output |
+| Out of memory | OOM | Struct-by-value copying -- reduce struct size |
+| Recursion limit | "max recursion depth" | parser/typechecker -- increase --max-recursion |
+| C compilation error | gcc error | codegen_c -- invalid C output |
 | Wrong output | Test fails | Trace: which stage produces wrong output? |
 
 ### Debugging Strategy
@@ -461,7 +466,7 @@ diff fides-self fides-self-2  # must be identical
 
 ## 9. Files: Rewritten and Remaining
 
-### Rewritten (16 files â€” the core pipeline)
+### Rewritten (25 files -- the full compiler, session 15)
 
 | File | LOC | Status | Test |
 |------|-----|--------|------|
@@ -471,36 +476,42 @@ diff fides-self fides-self-2  # must be identical
 | `fmt.fd` | ~500 | Done | test_fmt_*.fd |
 | `ast.fd` | ~1200 | Done | (via parser/lower tests) |
 | `lexer.fd` | ~600 | Done | (via parser tests) |
-| `parser.fd` | ~3000 | Done | (via lower tests) |
+| `parser.fd` | ~5145 | Done | (via lower tests) |
 | `ir.fd` | ~1600 | Done | test_ir.fd |
-| `typechecker.fd` | ~4800 | Done (builds) | **no test file yet** |
-| `lower.fd` | ~3500 | Done | test_lower.fd |
+| `typechecker.fd` | ~5521 | Done (builds) | **no test file yet** |
+| `lower.fd` | ~6420 | Done | test_lower.fd |
 | `mono.fd` | ~2500 | Done | test_mono.fd |
 | `borrowck.fd` | ~1800 | Done | test_borrowck.fd |
 | `pir.fd` | ~2700 | Done | test_pir.fd |
-| `opt.fd` | ~3500 | Done | test_opt.fd |
-| `codegen_c.fd` | ~4700 | Done | test_codegen_c.fd |
+| `opt.fd` | ~7695 | Done | test_opt.fd |
+| `codegen_c.fd` | ~5202 | Done | test_codegen_c.fd |
 | `compiler.fd` | ~565 | Done | test_compiler.fd |
+| `comptime_eval.fd` | ~2000 | Done | (via compiler tests) |
+| `flat_ast.fd` | ~1259 | Done | (via dump-ast-flat) |
+| `lsp.fd` | ~1082 | Done | (manual LSP test) |
+| `pe.fd` | ~1500 | Done | (via PE emitter tests) |
+| `peephole.fd` | ~1064 | Done (not integrated) | -- |
+| `regalloc.fd` | ~1181 | Done (not integrated) | -- |
+| `codegen_x64.fd` | ~1942 | Done (not integrated) | -- |
+| `main.fd` | ~800 | Done | (bootstrap) |
+| `inc.fd` | ~146 | Done | (incremental cache) |
 
-### Not Rewritten (36 files â€” not needed for C codegen bootstrap)
+**Total: 25 files, 61,145 LOC. Bootstrap fixpoint achieved (session 15).**
 
-**Native backends (would eliminate gcc dependency):**
-- `codegen_x64`, `regalloc`, `peephole`, `linker`, `runtime_linux`
+### Not Rewritten (not needed for C codegen bootstrap)
+
+**Native backends (would eliminate gcc/tcc dependency):**
+- `elf64`, `linker`, `runtime_linux` (Linux ELF64 pipeline)
 
 **Binary format emitters:**
-- `elf64`, `pe`, `coff`, `macho`
+- `coff`, `macho` (PE is ported as `pe.fd`)
 
 **Other architecture backends:**
 - `codegen_arm64`, `codegen_riscv`, `runtime_arm64`, `runtime_riscv`,
   `arm64_enc`, `riscv_enc`, `x86`
 
 **Interpreter:**
-- `interp` (~4400 LOC â€” the reference oracle)
-
-**Tooling:**
-- `main` (CLI dispatch), `comptime`, `debugger`, `native_debugger`, `lsp`,
-  `hotreload`, `cparser`, `pacte`, `scribe`, `veil`, `inc`, `embedded`,
-  `flat_ast`, `lib`
+- `interp` (~4400 LOC -- the reference oracle)
 
 **Other backends:**
 - `wasm`, `gpu`, `codegen` (dispatch)
@@ -508,36 +519,37 @@ diff fides-self fides-self-2  # must be identical
 **Runtime libraries:**
 - `tensor`, `autograd`
 
-### Rewriting Priority (Post-Bootstrap)
+### Post-Fixpoint Priority
 
-1. `main` â€” CLI entry point (needed for self-hosted compiler to be usable)
-2. `codegen_x64` + `regalloc` + `peephole` + `elf64` + `linker` + `runtime_linux` â€” eliminate gcc dependency
-3. `interp` â€” self-hosted interpreter
-4. Tooling (`lsp`, `debugger`, `pacte`, etc.) â€” as needed
+1. **Mirror `var` feature to `compiler/*.fd`** -- Rust supports module-level `var`/`pub var`
+2. **Integrate Linux native codegen** -- `peephole.fd` + `regalloc.fd` + `codegen_x64.fd` are ported, need `elf64`/`linker`/`runtime_linux`
+3. **Close Rust vs self-hosted parity gap** -- c1=706K vs c2=701K lines (~5K difference)
+4. **Gate debug prints** -- 287 `p_eprint_str` calls (cleanup, doesn't affect fixpoint)
+5. **PE emitter full compiler support** -- struct/enum, floats, many-arg calls
 
 ---
 
-## Quick Reference: Fides â†’ Rust Adaptation Checklist
+## Quick Reference: Fides -> Rust Adaptation Checklist
 
 When rewriting a Rust file to Fides, check:
 
-- [ ] `HashMap<K,V>` â†’ `Vec<Entry>` with linear search helper
-- [ ] `HashSet<T>` â†’ `Vec<T>` with `vec_contains_*` helper
-- [ ] `&T` references â†’ pass by value (copy the struct)
-- [ ] `&mut T` â†’ `self: &mut Struct` or get-modify-set pattern
-- [ ] `Option<T>` â†’ custom `Opt*` enum per type
-- [ ] `Box<T>` â†’ `box_*_unbox()` helper for recursive types
-- [ ] `format!` / `println!` â†’ string concatenation + `int_to_str`
-- [ ] `.iter().map().filter().collect()` â†’ explicit while loops
-- [ ] `continue` â†’ `if/else` wrapping
-- [ ] `if/else` in match arms â†’ helper functions
-- [ ] Nested enum patterns â†’ flattened matches
-- [ ] `val` variable â†’ rename to `v` or `value`
-- [ ] `region` variable â†’ rename to `mem_region`
-- [ ] `Vec<Vec<T>>` â†’ `Vec<Vec<T> >` (space between brackets)
-- [ ] `>>` operator â†’ `shr_i64()` helper
-- [ ] `derive(PartialEq)` â†’ manual `equals()` function
-- [ ] `mem::replace` / `mem::swap` â†’ manual temp variables
-- [ ] `usize` / `u32` / `u64` â†’ `i64`
-- [ ] `char` â†’ `i64` (codepoint)
-- [ ] `String::from_utf8` / `as_bytes` â†’ manual byteâ†”str conversion
+- [ ] `HashMap<K,V>` -> `Vec<Entry>` with linear search helper
+- [ ] `HashSet<T>` -> `Vec<T>` with `vec_contains_*` helper
+- [ ] `&T` references -> pass by value (copy the struct)
+- [ ] `&mut T` -> `self: &mut Struct` or get-modify-set pattern
+- [ ] `Option<T>` -> custom `Opt*` enum per type
+- [ ] `Box<T>` -> `box_*_unbox()` helper for recursive types
+- [ ] `format!` / `println!` -> string concatenation + `int_to_str`
+- [ ] `.iter().map().filter().collect()` -> explicit while loops
+- [ ] `continue` -> `if/else` wrapping
+- [ ] `if/else` in match arms -> helper functions
+- [ ] Nested enum patterns -> flattened matches
+- [ ] `val` variable -> rename to `v` or `value`
+- [ ] `region` variable -> rename to `mem_region`
+- [ ] `Vec<Vec<T>>` -> `Vec<Vec<T> >` (space between brackets)
+- [ ] `>>` operator -> `shr_i64()` helper
+- [ ] `derive(PartialEq)` -> manual `equals()` function
+- [ ] `mem::replace` / `mem::swap` -> manual temp variables
+- [ ] `usize` / `u32` / `u64` -> `i64`
+- [ ] `char` -> `i64` (codepoint)
+- [ ] `String::from_utf8` / `as_bytes` -> manual byte->str conversion
