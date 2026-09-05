@@ -4,7 +4,7 @@
 > to executable binary, covering the type system, memory model, effect system,
 > and compilation pipeline.**
 
-*Last updated: Aug 31, 2026*
+*Last updated: Sep 5, 2026 (session 15 — bootstrap fixpoint achieved)*
 
 ## Table of Contents
 
@@ -37,7 +37,7 @@ WebAssembly, and includes a built-in interpreter.
 | Capability security | Compile-time capability grants | None | None |
 | Dependency model | Self-contained (no libc, no LLVM) | External (crates, LLVM) | External (libc) |
 | Codegen | Direct machine code emission | Via LLVM | Via gcc/clang |
-| Self-hosting | In progress (17 modules, ~41.8K LOC) | Yes | Yes |
+| Self-hosting | ✅ Achieved (25 modules, 61K LOC, bootstrap fixpoint verified) | Yes | Yes |
 
 ### Design Philosophy
 

@@ -1,22 +1,22 @@
-// compiler.fd — Compiler pipeline driver (rewritten from src/compiler.rs)
+// compiler.fd -- Compiler pipeline driver (rewritten from src/compiler.rs)
 //
 // This module provides:
 // 1. Helper functions and utilities (edit_distance, error enrichment, string/path
-//    helpers, capability checking) — fully functional and tested.
+//    helpers, capability checking) -- fully functional and tested.
 // 2. Pipeline orchestration functions (build_program_with_path, lower_to_ir_module,
-//    ccompile_source_with_path, etc.) — fully functional.
+//    ccompile_source_with_path, etc.) -- fully functional.
 // 3. AST transformation passes (merge_programs, apply_cfg_filter, process_derive,
-//    desugar_layers_models, fill_default_trait_methods) — fully functional.
-// 4. Capability stripping (strip_ungranted_caps) — fully functional.
+//    desugar_layers_models, fill_default_trait_methods) -- fully functional.
+// 4. Capability stripping (strip_ungranted_caps) -- fully functional.
 //
 // Adaptations from Rust:
-// 1. Result<T, Vec<String>> → custom Result types (ResultProgram, ResultStr, etc.)
-// 2. &str → str, usize → i64
-// 3. HashSet<T> → Vec<T> with str_vec_contains helper
-// 4. Path operations → string manipulation (path_dirname, path_join)
-// 5. include_str! → file_read at runtime (stdlib/core.fd loaded from disk)
-// 6. No closures — all helpers are top-level functions
-// 7. No ? operator — explicit match on Result types
+// 1. Result<T, Vec<String>> -> custom Result types (ResultProgram, ResultStr, etc.)
+// 2. &str -> str, usize -> i64
+// 3. HashSet<T> -> Vec<T> with str_vec_contains helper
+// 4. Path operations -> string manipulation (path_dirname, path_join)
+// 5. include_str! -> file_read at runtime (stdlib/core.fd loaded from disk)
+// 6. No closures -- all helpers are top-level functions
+// 7. No ? operator -- explicit match on Result types
 
 module compiler::compiler;
 
@@ -37,9 +37,9 @@ use compiler::comptime_eval;
 use compiler::pe;
 use compiler::inc;
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Result types (Fides has no generic Result<T,E>)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub enum ResultStr {
     Ok(str),
@@ -60,9 +60,9 @@ pub struct CompileResult {
     pub assembly: str,
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Error codes (mirrors crate::diag::ErrCode)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub enum ErrCode {
     UndefinedVariable,
@@ -113,11 +113,11 @@ pub fn errcode_to_str(code: ErrCode) -> str {
     return "Custom";
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Helper types
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
-/// Cache entry: file path → source content (avoids re-reading from disk)
+/// Cache entry: file path -> source content (avoids re-reading from disk)
 pub struct PathContent {
     pub path: str,
     pub content: str,
@@ -127,7 +127,7 @@ pub fn PathContent_new(path: str, content: str) -> PathContent {
     return PathContent { path: path, content: content };
 }
 
-/// Cache entry: file path → tokens (avoids re-lexing)
+/// Cache entry: file path -> tokens (avoids re-lexing)
 pub struct PathTokens {
     pub path: str,
     pub tokens: Vec<Token>,
@@ -137,7 +137,7 @@ pub fn PathTokens_new(path: str, tokens: Vec<Token>) -> PathTokens {
     return PathTokens { path: path, tokens: tokens };
 }
 
-/// Cached file read — returns cached content if available, otherwise reads from disk.
+/// Cached file read -- returns cached content if available, otherwise reads from disk.
 fn cached_file_read(cache: &mut Vec<PathContent>, path: str) -> str {
     var i: i64 = 0;
     while i < cache.len() {
@@ -151,7 +151,7 @@ fn cached_file_read(cache: &mut Vec<PathContent>, path: str) -> str {
     return content;
 }
 
-/// Cached lex — returns cached tokens if available, otherwise lexes.
+/// Cached lex -- returns cached tokens if available, otherwise lexes.
 fn cached_lex(token_cache: &mut Vec<PathTokens>, content_cache: &mut Vec<PathContent>, path: str) -> Vec<Token> {
     var i: i64 = 0;
     while i < token_cache.len() {
@@ -186,10 +186,10 @@ pub fn StrTriple_new(line: i64, col: i64, msg: str) -> StrTriple {
     return StrTriple { line: line, col: col, msg: msg };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Error enrichment — extract line/col from error strings and render with
+// ===========================================================================
+// Error enrichment -- extract line/col from error strings and render with
 // source context (rewritten from enrich_errors in compiler.rs)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 /// Extract (line, col) from an error string.
 /// Formats recognized:
@@ -436,7 +436,7 @@ pub fn extract_help(err: str) -> Option<str> {
 /// Classify an error string into an ErrCode.
 /// Mirrors classify_error() in src/compiler.rs.
 pub fn classify_error(err: str) -> ErrCode {
-    // Normalize: strip "(line N)" from "Type error (line N): ..." → "Type error: ..."
+    // Normalize: strip "(line N)" from "Type error (line N): ..." -> "Type error: ..."
     var normalized: str = err;
     if str_starts_with(err, "Type error (line ") {
         var idx: i64 = str_find(err, "): ");
@@ -467,9 +467,9 @@ pub fn classify_error(err: str) -> ErrCode {
     return ErrCode::Custom;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Capability checking
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 /// Check if an effect name is a capability (Net, IO, FS, etc.)
 pub fn is_capability(eff: str) -> bool {
@@ -482,9 +482,9 @@ pub fn is_capability(eff: str) -> bool {
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Levenshtein edit distance (for module name suggestions)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub fn edit_distance(a: str, b: str) -> i64 {
     var a_len: i64 = str_len(a);
@@ -524,11 +524,11 @@ pub fn edit_distance(a: str, b: str) -> i64 {
     return matrix.get(a_len * (b_len + 1) + b_len);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Project root discovery
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
-/// Walk up from `start` to find the project root — the first directory
+/// Walk up from `start` to find the project root -- the first directory
 /// containing a `stdlib/` or `compiler/` subdirectory.
 /// Falls back to `start` itself if none is found.
 pub fn find_project_root(start: str) -> str {
@@ -551,9 +551,9 @@ pub fn find_project_root(start: str) -> str {
     return start;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Pipeline — parse, typecheck, lower, mono
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Pipeline -- parse, typecheck, lower, mono
+// ===========================================================================
 
 /// Parse source code into a Program (without stdlib merge).
 fn parse_source(source: str) -> ParseResultProgram {
@@ -563,15 +563,15 @@ fn parse_source(source: str) -> ParseResultProgram {
     return p.parse();
 }
 
-/// Build a program from source code (no path — no import resolution).
+/// Build a program from source code (no path -- no import resolution).
 pub fn build_program(source: str) -> ResultProgram {
     return build_program_with_path(source, OptStr::None);
 }
 
 /// Build a program with optional file path for resolving `use` imports.
 /// This is the main entry point for the compiler pipeline:
-///   parse stdlib → parse user → resolve imports → merge → cfg filter →
-///   derive → desugar layers/models → comptime → typecheck → borrowck → mono
+///   parse stdlib -> parse user -> resolve imports -> merge -> cfg filter ->
+///   derive -> desugar layers/models -> comptime -> typecheck -> borrowck -> mono
 pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgram {
     var t0: i64 = p_clock_now_ms();
     // Parse stdlib first
@@ -663,7 +663,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                         i = i + 1;
                     }
 
-                    // ── Resolve use imports from disk ──────────────────────────
+                    // -- Resolve use imports from disk --------------------------
                     // When source_path is provided, load `use foo::bar;` imports
                     // from disk, handling transitive dependencies.
                     //
@@ -673,7 +673,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                     var imported_modules: Vec<Program> = Vec::new();
                     var imported_module_names: Vec<str> = Vec::new();
                     var loaded_module_names: Vec<str> = Vec::new();
-                    // O(1) membership set for loaded modules — avoids O(n) linear
+                    // O(1) membership set for loaded modules -- avoids O(n) linear
                     // search in c_str_vec_contains during import resolution.
                     var loaded_module_set: i64 = HashMap_new();
                     var struct_name_set: i64 = HashMap_new();
@@ -692,7 +692,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
 
                     if has_source_path {
                         p_eprint_str("[build] Resolving imports...\n");
-                        // Collect imports to process (LIFO — reversed so earlier
+                        // Collect imports to process (LIFO -- reversed so earlier
                         // imports are processed first via pop())
                         var imports_to_process: Vec<str> = Vec::new();
                         var ui: i64 = user.imports.len() - 1;
@@ -706,7 +706,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
 
                         // Track modules that are currently deferred (waiting for deps).
                         // If a module is deferred again while already in this set,
-                        // it means there's a cyclic import — report an error.
+                        // it means there's a cyclic import -- report an error.
                         var currently_deferred: Vec<str> = Vec::new();
 
                         var project_root: str = find_project_root(base_dir);
@@ -718,10 +718,10 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                             p_eprint_str(import_path);
                             p_eprint_str("\n");
 
-                            // Skip "core" — auto-included
+                            // Skip "core" -- auto-included
                             if str_equal(import_path, "core") { continue; }
 
-                            // Skip already-loaded modules — O(1) HashMap lookup
+                            // Skip already-loaded modules -- O(1) HashMap lookup
                             if HashMap_get(loaded_module_set, import_path) != 0 { continue; }
 
                             // Try candidate paths
@@ -794,7 +794,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                             if c_str_vec_contains(currently_deferred, import_path) {
                                                 p_eprint_str("[build] WARNING: cyclic import detected involving '");
                                                 p_eprint_str(import_path);
-                                                p_eprint_str("' — skipping\n");
+                                                p_eprint_str("' -- skipping\n");
                                                 continue;
                                             }
                                             // Defer: push this module back, then push deps
@@ -810,8 +810,8 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                             continue;
                                         }
 
-                                        // All deps loaded — full parse with all names
-                                        // OPTIMIZATION: reuse cached tokens (pre_toks) — tokens
+                                        // All deps loaded -- full parse with all names
+                                        // OPTIMIZATION: reuse cached tokens (pre_toks) -- tokens
                                         // don't depend on name sets, only parsing does.
                                         var p2: Parser = Parser_with_names(pre_toks, struct_names, enum_names);
                                         var full_result: ParseResultProgram = p2.parse();
@@ -828,7 +828,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                                 HashMap_insert(loaded_module_set, import_path, 1);
                                                 HashMap_insert(loaded_module_set, mod_name, 1);
 
-                                                // Clear from deferred set — successfully loaded
+                                                // Clear from deferred set -- successfully loaded
                                                 var deferred_idx: i64 = 0;
                                                 while deferred_idx < currently_deferred.len() {
                                                     if str_equal(currently_deferred.get(deferred_idx), import_path) {
@@ -872,7 +872,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                                 imported_module_names.push(mod_name);
                                             }
                                             ParseResultProgram::Err(errs) => {
-                                                // Full parse failed — return error (do not silently skip)
+                                                // Full parse failed -- return error (do not silently skip)
                                                 var err_msg: str = "Import error: failed to parse module '" + import_path + "'";
                                                 err_msg = err_msg + ": " + errs;
                                                 return ResultProgram::Err(c_vec1(err_msg));
@@ -880,7 +880,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                         }
                                     }
                                     ParseResultProgram::Err(_) => {
-                                        // Pre-scan failed — try full parse directly
+                                        // Pre-scan failed -- try full parse directly
                                         // OPTIMIZATION: reuse cached tokens
                                         var p2: Parser = Parser_with_names(pre_toks, struct_names, enum_names);
                                         var full_result: ParseResultProgram = p2.parse();
@@ -899,7 +899,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                                 imported_module_names.push(mod_name);
                                             }
                                             ParseResultProgram::Err(errs2) => {
-                                                // Full parse also failed — return error
+                                                // Full parse also failed -- return error
                                                 var err_msg: str = "Import error: failed to parse module '" + import_path + "'";
                                                 err_msg = err_msg + ": " + errs2;
                                                 return ResultProgram::Err(c_vec1(err_msg));
@@ -908,7 +908,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
                                     }
                                 }
                             } else {
-                                // Import not found — return error
+                                // Import not found -- return error
                                 return ResultProgram::Err(c_vec1(str_concat("Import error: could not resolve module '", str_concat(import_path, "'"))));
                             }
                         }
@@ -954,7 +954,7 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
 
                     p_eprint_str("[build] Type checking...\n");
                     var t_tc: i64 = p_clock_now_ms();
-                    // Type check — register each module with its own name
+                    // Type check -- register each module with its own name
                     var tc: TypeChecker = TypeChecker::new();
                     var stdlib_module: str = "core";
                     match stdlib.module {
@@ -1042,11 +1042,11 @@ pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgra
 
 /// Compile source to C code.
 pub fn ccompile_source_with_path(source: str, source_path: str) -> ResultStr {
-    // Check incremental cache — skip full pipeline if source is unchanged
+    // Check incremental cache -- skip full pipeline if source is unchanged
     var src_hash: i64 = hash_source(source);
     match global_cache_get(source_path, src_hash) {
         OptIrModule::Some(cached_module) => {
-            p_eprint_str("[ccompile] Cache HIT — skipping parse/typecheck/lower/optimize\n");
+            p_eprint_str("[ccompile] Cache HIT -- skipping parse/typecheck/lower/optimize\n");
             var t_codegen: i64 = p_clock_now_ms();
             var cg: CCodeGen = CCodeGen_new();
             var c_code: str = CCodeGen_generate(&mut cg, cached_module);
@@ -1106,7 +1106,7 @@ pub fn lower_to_ir_module(source: str) -> ResultIrModule {
     return ResultIrModule::Err(c_vec1("unreachable"));
 }
 
-/// Get diagnostics (errors) for a source file — used by LSP.
+/// Get diagnostics (errors) for a source file -- used by LSP.
 pub fn get_diagnostics(source: str, source_path: OptStr) -> Vec<StrTriple> {
     var result: ResultProgram = build_program_with_path(source, source_path);
     match result {
@@ -1125,9 +1125,9 @@ pub fn get_diagnostics(source: str, source_path: OptStr) -> Vec<StrTriple> {
     return Vec::new();
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// merge_programs — merge stdlib and user programs (user wins on conflicts)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// merge_programs -- merge stdlib and user programs (user wins on conflicts)
+// ===========================================================================
 
 /// Merge two programs: user definitions take priority over stdlib.
 pub fn merge_programs(stdlib: Program, user: Program) -> Program {
@@ -1288,11 +1288,11 @@ pub fn merge_programs(stdlib: Program, user: Program) -> Program {
     return merged;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// apply_cfg_filter — conditional compilation (simplified: always include)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// apply_cfg_filter -- conditional compilation (simplified: always include)
+// ===========================================================================
 
-/// Apply conditional compilation filtering — remove items with @cfg annotations
+/// Apply conditional compilation filtering -- remove items with @cfg annotations
 /// that don't match the current platform/features.
 /// NO-OP: The self-hosted compiler includes all items. @cfg filtering is only
 /// needed for cross-compilation, which the self-hosted compiler doesn't do yet.
@@ -1300,7 +1300,7 @@ pub fn merge_programs(stdlib: Program, user: Program) -> Program {
 /// crashed due to the Vec-of-struct push problem (only 8 bytes copied per
 /// struct). Skipping it entirely avoids that crash and is correct for bootstrap.
 pub fn apply_cfg_filter(program: &mut Program) {
-    // No-op — include all items.
+    // No-op -- include all items.
 }
 
 /// Check if an item's @cfg annotations match the current platform.
@@ -1341,11 +1341,11 @@ fn check_cfg(annotations: Vec<Annotation>, is_linux: bool, is_debug: bool) -> bo
     return true;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// process_derive — generate methods from @derive annotations
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// process_derive -- generate methods from @derive annotations
+// ===========================================================================
 
-/// Process @derive annotations — generate methods based on the derive list.
+/// Process @derive annotations -- generate methods based on the derive list.
 /// Supported derives: Debug, Clone, Serialize, Default, Deserialize, PartialEq
 pub fn process_derive(program: &mut Program) {
     var generated: Vec<Func> = Vec::new();
@@ -1503,9 +1503,9 @@ pub fn default_expr_for_type(ty: Type) -> Expr {
     return Expr::IntLit(0);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// desugar_layers_models — desugar layer/model declarations
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// desugar_layers_models -- desugar layer/model declarations
+// ===========================================================================
 
 /// Desugar layer/model declarations into structs + impls + constructor functions.
 pub fn desugar_layers_models(program: &mut Program) {
@@ -1594,15 +1594,15 @@ fn c_vec1_func(f: Func) -> Vec<Func> {
     return v;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// fill_default_trait_methods — fill in default trait method implementations
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// fill_default_trait_methods -- fill in default trait method implementations
+// ===========================================================================
 
 /// Phase 3B.1: Fill in default trait methods.
 /// For each trait impl, if the trait defines a method with a default body that
 /// the impl doesn't override, add the default body to the impl.
 pub fn fill_default_trait_methods(program: &mut Program) {
-    // Build trait map: trait_name → TraitDef
+    // Build trait map: trait_name -> TraitDef
     // We can't use HashMap in Fides, so we do linear search
 
     var i: i64 = 0;
@@ -1662,7 +1662,7 @@ pub fn fill_default_trait_methods(program: &mut Program) {
                     // so we collect new methods and rebuild
                     // Actually, since trait_impls is Vec<TraitImpl>, we need
                     // to push the method into the impl's methods vec
-                    // This is a limitation — for now, skip this
+                    // This is a limitation -- for now, skip this
                 }
             }
             m = m + 1;
@@ -1671,11 +1671,11 @@ pub fn fill_default_trait_methods(program: &mut Program) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// strip_ungranted_caps — capability-aware dead code elimination
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// strip_ungranted_caps -- capability-aware dead code elimination
+// ===========================================================================
 
-/// I-3A: Transitive Capability DCE — strip functions requiring capabilities not
+/// I-3A: Transitive Capability DCE -- strip functions requiring capabilities not
 /// in the granted set, then transitively eliminate all functions only reachable
 /// through the stripped functions.
 pub fn strip_ungranted_caps(module: &mut IrModule, granted_caps: Vec<str>) {
@@ -1824,9 +1824,9 @@ fn c_vec_remove_first(v: Vec<str>) -> Vec<str> {
     return result;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // String helpers (only functions NOT in core.fd)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 /// Concatenate three strings.
 pub fn c_str_concat3(a: str, b: str, c: str) -> str {
@@ -1943,9 +1943,9 @@ pub fn c_vec1(s: str) -> Vec<str> {
     return v;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // File/Path/OS helpers (using builtins directly)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 /// Check if a file exists.
 pub fn c_file_exists(path: str) -> bool {

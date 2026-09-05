@@ -2,11 +2,131 @@
 
 > Things that have broken before and how to avoid re-introducing them.
 >
-> Last updated: Sep 5, 2026 (session 14 — Category B codegen parity: B5 fixed, B6/B7/B8 verified at parity).
+> Last updated: Sep 5, 2026 (session 15 — **BOOTSTRAP FIXPOINT ACHIEVED**: fides-c2.c == fides-c3.c, 0 diffs / 701,100 lines).
 
 ---
 
 ## 1. Fixed Bugs (Do Not Re-Introduce)
+
+### 1.36 Non-ASCII characters in compiler source cause fixpoint divergence (session 15)
+
+**Symptom:** The generated C was behaviorally correct across all 3 generations,
+but `fides-c2.c` ≠ `fides-c3.c` — there were 34 diff lines out of 701,100.
+All 34 diffs were Unicode corruption in comments and string literals (e.g.,
+`// ─── Runtime types ───` appeared as `?????` in gen 2 and as garbled
+multi-byte sequences in gen 3).
+
+**Root cause:** The 25 `compiler/*.fd` source files contained non-ASCII
+characters (box-drawing `─` U+2500, `═` U+2550, arrows `→` U+2192, em-dashes
+`—` U+2014, and their mojibake variants) in comments and string literals.
+The Rust compiler and self-hosted compiler handled these multi-byte UTF-8
+sequences differently in string literals, producing different output.
+
+**Fix (session 15):** Replaced all non-ASCII characters in all 25
+`compiler/*.fd` files with ASCII equivalents:
+- `─` (U+2500) → `-`    (15,245 occurrences)
+- `═` (U+2550) → `=`    (11,678 occurrences)
+- `ΓöÇ` (mojibake for `─`) → `-`  (~2,617 sequences)
+- `—` (U+2014) → `--`   (348 occurrences)
+- `→` (U+2192) → `->`   (210 occurrences)
+- `↔` (U+2194) → `<->`  (2 occurrences)
+- `≤` (U+2264) → `<=`   (6 occurrences)
+- `×` (U+00D7) → `x`    (5 occurrences)
+- Others → appropriate ASCII
+
+**Result:** `fides-c2.c` == `fides-c3.c` (0 diffs out of 701,100 lines).
+**Bootstrap fixpoint achieved.**
+
+**Lesson:** Never use non-ASCII characters in compiler source files. The
+compiler's string literal handling may not be Unicode-safe across
+generations, causing fixpoint divergence. Use ASCII-only comments and
+string literals (`---` instead of `───`, `->` instead of `→`, etc.).
+
+### 1.33 TCC 4KB stack overflow (session 15 — A1 root cause)
+
+**Symptom:** The self-hosted compiler (`fides-c.exe`, `fides-c2_new.exe`)
+crashed with `0xC00000FD` (stack overflow) or `0xC0000005` (access violation)
+during C code generation of large programs (the compiler source itself).
+
+**Root cause:** TCC produces Windows executables with a 4KB default PE stack
+reserve (`SizeOfStackReserve = 0x1000`). The Fides compiler's parser, type
+checker, and C codegen are deeply recursive and use `alloca` extensively.
+4KB is nowhere near enough — the codegen phase alone needs hundreds of MB.
+
+**Previous misdiagnosis:** This was originally diagnosed as a null pointer
+dereference in `TypeChecker_lookup` (Category A1). The actual root cause was
+stack overflow corrupting the stack frame, which manifested as spurious null
+accesses in various functions.
+
+**Fix (session 15):** Instead of patching the PE header (which was fragile
+and sometimes corrupted the executable), wrap the compiler's `main` in a
+Windows thread with a 256MB stack:
+```c
+int fides_main(int argc, char** argv) { /* original main */ }
+DWORD WINAPI thread_main(LPVOID param) {
+    MainArgs* args = (MainArgs*)param;
+    args->ret = fides_main(args->argc, args->argv);
+    return 0;
+}
+int main(int argc, char** argv) {
+    MainArgs args = { argc, argv, 0 };
+    HANDLE h = CreateThread(NULL, 256*1024*1024, thread_main, &args, 0, NULL);
+    WaitForSingleObject(h, INFINITE);
+    return args.ret;
+}
+```
+This is applied as a post-processing step on the generated C file. See
+`build-pipeline.md` § "Stack Wrapper" for the full script.
+
+**Lesson:** TCC's default stack reserve is 4KB, which is absurdly small for
+any non-trivial program. Always use a stack wrapper or PE header patch when
+building Fides compiler output with TCC. The thread-based wrapper is more
+reliable than PE header patching.
+
+### 1.34 type_eq uses pointer == for string comparisons (session 15)
+
+**Symptom:** The self-hosted type checker rejected identical generic type
+assignments with errors like:
+```
+Type error: cannot assign Vec<Param> to field 'params' of type Vec<Param>
+Type error: cannot assign Vec<Stmt> to field 'body' of type Vec<Stmt>
+Type error: cannot assign Vec<StrPair> to field 'const_params' of type Vec<StrPair>
+```
+
+**Root cause:** `type_eq` in `compiler/typechecker.fd` compared string fields
+(type names) using `==`, which in the generated C code compares pointer
+addresses rather than string content. Two `Type::Generic("Vec", ...)` values
+created at different source locations have different string allocations, so
+`n1 == n2` returns false even when both are `"Vec"`.
+
+**Fix (session 15):** Replaced all string `==` comparisons in `type_eq` with
+`str_equal()`:
+- `Type::Named`: `n1 == n2` → `str_equal(n1, n2)`
+- `Type::Generic`: `n1 != n2` → `!str_equal(n1, n2)`
+- `Type::Dyn`: `n1 == n2` → `str_equal(n1, n2)`
+- `Type::Assoc`: `t1 != t2` / `n1 != n2` / `f1 != f2` → `!str_equal(...)`
+
+**Lesson:** In Fides, strings are `char*` pointers. The `==` operator on
+strings compares addresses, not content. Always use `str_equal()` for string
+value comparisons. The Rust reference compiler uses `#[derive(PartialEq)]`
+which does content comparison automatically — the Fides port must explicitly
+call `str_equal`.
+
+### 1.35 Large match expression codegen issues (session 15)
+
+**Symptom:** Very large `match` expressions in `mono.fd` (`subst_expr`,
+`subst_stmt`) and `comptime_eval.fd` (`substitute_expr`) caused codegen
+issues or crashes.
+
+**Fix (session 15):** Split the large match expressions into helper functions:
+- `subst_expr` → delegates remaining arms to `subst_expr_part2`
+- `subst_stmt` → delegates remaining arms to `subst_stmt_part2`
+- `substitute_expr` comptime cases → `substitute_expr_comptime`,
+  `substitute_expr_comptime_block`, `substitute_expr_comptime_reflect`
+
+**Lesson:** When a match expression has too many arms, the generated C function
+becomes very large and can cause stack issues or codegen problems. Splitting
+into helper functions keeps each function manageable.
 
 ### 1.30 Float constant bit-pattern not preserved in C codegen (session 14 — B5)
 
@@ -462,16 +582,18 @@ Ported to Fides lowerer as Gap 5.
 
 ### 2.7 ~~Windows `\r\n` doubling in C output~~ RESOLVED (session 2)
 
-### 2.8 fides-c2.exe crashes on stdlib (PARTIALLY RESOLVED — session 13)
+### 2.8 fides-c2.exe crashes on stdlib (RESOLVED — session 15)
 
 **Symptom:** `fides-c2_new.exe` (the second-generation compiler, built by
 `fides-c.exe`) crashes with `STATUS_ACCESS_VIOLATION` (exit code -1073741819)
 during type checking of `test_simple.fd`.
 
-**Root cause:** Multiple behavioral differences between the self-hosted
-compiler (`compiler/*.fd`) and the Rust compiler (`src/*.rs`) cause the
-self-hosted compiler to generate slightly different IR/C, which leads to
-null pointer dereferences in the second-generation binary.
+**Root cause:** The primary root cause was **TCC's 4KB default PE stack
+reserve** (not 1MB as previously believed). The compiler's deeply recursive
+parser, type checker, and codegen need far more stack. The stack overflow
+corrupted stack frames and manifested as spurious null pointer accesses
+in `TypeChecker_lookup`. A secondary cause was `type_eq` using pointer `==`
+for string comparisons instead of `str_equal`.
 
 **Session 12 progress:**
 1. Split `keyword_or_ident_core` (51 if-statements, 933 C vars) into 5
@@ -496,33 +618,18 @@ null pointer dereferences in the second-generation binary.
    like `StrStack = Vec<str>` now resolve to `Vec` before mangling, fixing
    `StrStack_push` → `Vec_push` (was causing undefined symbols).
 
-**Result:** fides-c2_new.exe now parses stdlib + user code successfully,
-but crashes during type checking in `TypeChecker_lookup` (null pointer
-from `Vec_get` on empty scopes).
+**Session 15 progress (FINAL FIX):**
+1. **TCC 4KB stack overflow** — replaced PE header patching with a Windows
+   thread wrapper providing 256MB stack (`CreateThread(NULL, 256*1024*1024, ...)`).
+2. **type_eq string comparison** — replaced `==` with `str_equal` for
+   `Type::Named`, `Type::Generic`, `Type::Dyn`, and `Type::Assoc`.
+3. **Large match expression codegen** — split `subst_expr`/`subst_stmt` in
+   `mono.fd` and comptime cases in `comptime_eval.fd` into helper functions.
+4. **Non-ASCII characters** — replaced all Unicode chars in compiler source
+   with ASCII equivalents.
 
-**Current crash stack:**
-```
-[0] main
-[1] cmd_dump_c
-[2] ccompile_source_with_path
-[3] build_program_with_path
-[4] TypeChecker_check_bodies
-[5] TypeChecker_check_func
-[6] TypeChecker_check_stmt
-[7] TypeChecker_check_stmt_inner
-[8] TypeChecker_check_expr
-[9] TypeChecker_check_expr_with_hint
-[10] TypeChecker_check_expr_inner
-[11] TypeChecker_check_expr
-[12] TypeChecker_check_expr_with_hint
-[13] TypeChecker_check_expr_inner
-[14] TypeChecker_lookup
-```
-
-**Next steps:** See `docs/roadmap/selfhost-roadmap.md` § "Comprehensive Gap
-Analysis" for the full list of remaining gaps. The immediate next fix is
-adding null safety to `TypeChecker_lookup` (Category A1) and auditing
-`TypeChecker_register_program` parity (Category A2).
+**Result:** **BOOTSTRAP FIXPOINT ACHIEVED.** fides-c2.c == fides-c3.c
+(SHA256-identical, 701,100 lines, 19.8MB). Three generations verified.
 
 ### 2.9 ~~`.exe` extension missing in self-hosted compiler output~~ RESOLVED (session 8)
 

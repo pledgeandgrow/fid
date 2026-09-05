@@ -5,7 +5,7 @@
 > and what architectural decisions have been made. Without this, parallel
 > agents will conflict and undo each other's work.
 >
-> **Last updated:** Sep 5, 2026 (session 14 — Category B codegen parity: B5 fixed, B6/B7/B8 verified at parity)
+> **Last updated:** Sep 5, 2026 (session 15 — **BOOTSTRAP FIXPOINT ACHIEVED**: fides-c2.c == fides-c3.c, 0 diffs / 701,100 lines)
 
 ---
 
@@ -259,10 +259,9 @@ added to `compiler/main.fd`, dispatching to `lsp_run()`.
 - `p_stdin_eof` — feof check (detect client disconnect)
 - `p_flush_stdout` — fflush(stdout) for immediate message delivery
 
-**Status:** Module parses correctly in isolation. Full self-hosted build
-blocked by pre-existing parse error at codegen_c.fd:973 (bug #2.11, not
-caused by LSP work). The `lsp` command and `lsp_run()` entry point are
-wired into `main.fd`.
+**Status:** Module parses correctly. Full self-hosted build works
+(session 15: bootstrap fixpoint achieved). The `lsp` command and
+`lsp_run()` entry point are wired into `main.fd`.
 
 ---
 
@@ -343,6 +342,59 @@ the compiler source. See `docs/roadmap/selfhost-roadmap.md` Category B table.
 
 > Discoveries that affect the direction. Add new findings at the top.
 
+### [F11] BOOTSTRAP FIXPOINT ACHIEVED — Sep 5, 2026 (session 15)
+
+**fides-c2.c == fides-c3.c** (SHA256-identical, 701,100 lines each). The
+self-hosted compiler compiles itself to byte-for-byte identical output
+across generations. This is the ultimate goal of self-hosting.
+
+**Bootstrap chain verified:**
+```
+Rust compiler → fides-c.c (706,318 lines) → fides-c.exe
+fides-c.exe   → fides-c2.c (701,100 lines) → fides-c2.exe
+fides-c2.exe  → fides-c3.c (701,100 lines) → fides-c3.exe  ← IDENTICAL to c2
+fides-c3.exe  → compiles test_simple.fd correctly (EXIT 0)
+```
+
+**Four bugs were fixed in session 15 to achieve this:**
+1. **TCC 4KB stack overflow** (bug 1.33) — TCC's default stack was 4KB,
+   not 1MB as previously believed. Fixed by adding `-Wl,-stack,268435456`
+   (256MB) to the TCC compile command.
+2. **type_eq pointer == on strings** (bug 1.34) — `type_eq` used `==` for
+   string comparison in `Type::Named`, `Type::Generic`, `Type::Dyn`, and
+   `Type::Assoc`. Replaced with `str_equal`.
+3. **Large match expression codegen** (bug 1.35) — `subst_expr` and
+   `subst_stmt` in `mono.fd` had large match expressions that caused
+   codegen issues. Split into helper functions.
+4. **Non-ASCII characters in compiler source** (bug 1.36) — Unicode
+   characters (em-dash, arrows, box-drawing) in comments and string
+   literals caused fixpoint divergence. Replaced with ASCII equivalents.
+
+**What's NOT yet done:**
+- Rust vs self-hosted parity gap (c1=706K lines vs c2=701K lines, ~5K
+  line difference). This does NOT block the self-hosted fixpoint but
+  means the Rust and self-hosted compilers produce slightly different C.
+- 287 `p_eprint_str` debug prints still in compiler source (go to stderr,
+  don't affect C output or fixpoint).
+- Category C/D pipeline features (interpretation, native build, WASM,
+  safety verification) — not needed for fixpoint.
+
+### [F10] Large-function body truncation analysis — RESOLVED Sep 5, 2026 (session 15)
+
+**Initial finding:** Second-generation C output (`stage2.c`) was truncated
+at 361,955 lines (vs 701,100 expected). 1278 of 1881 function bodies were
+missing. Truncation occurred at `void* v3` in `subst_expr` variable
+declarations.
+
+**Resolution:** The truncation was caused by the three bugs above (TCC
+stack overflow, type_eq pointer comparison, large match codegen). After
+fixing all three, the second-generation compiler produces full 701,100-line
+output with 1795 function bodies (105 missing = expected external functions).
+
+The earlier hypothesis of "value_metas Vec corruption" was incorrect —
+the actual cause was the TCC 4KB stack overflow causing silent corruption
+during code generation.
+
 ### [F9] debugger.rs porting assessment — NOT feasible without interp.rs — Sep 4, 2026 (session 9)
 
 **Assessment:** Porting `src/debugger.rs` (914 LOC) to Fides is **not
@@ -411,35 +463,35 @@ convenience tool, not a self-hosting requirement. Port it only if:
 - Or if a future `run` command redesign switches from C compilation to
   a native interpreter (unlikely — C compilation is faster)
 
-### [F8] Pre-existing parse error blocks self-hosted rebuild — UPDATED Sep 5, 2026 (session 14)
+### [F8] Pre-existing parse error blocks self-hosted rebuild — RESOLVED Sep 5, 2026 (session 15)
 
 The original parse error at `codegen_c.fd:973` ("expected identifier but got
-'var'") was resolved in earlier sessions. The current self-hosted build
-pipeline (`build-selfhost.ps1`) builds `fides-c.exe` successfully.
+'var'") was resolved in earlier sessions. The self-hosted build pipeline
+builds `fides-c.exe` successfully.
 
-**Current blocker (session 13/14):** `fides-c2_new.exe` (the second-generation
-compiler) crashes during type checking of `stdlib/core.fd` in
-`TypeChecker_lookup` — null pointer returned from `Vec_get` on an empty
-scope. This is a Category A crash blocker. See roadmap Category A table and
-known-bugs.md §2.8.
+**RESOLVED (session 15):** All Category A crash blockers resolved. The
+"TypeChecker_lookup null deref" was actually a TCC 4KB stack overflow
+(bug 1.33), not a null pointer issue. Fixed by adding
+`-Wl,-stack,268435456` to the TCC compile command. The bootstrap fixpoint
+is now achieved (fides-c2.c == fides-c3.c).
 
-### [F7] Statement-dropping bug and fides-c2 crash — UPDATED Sep 5, 2026 (session 12)
+### [F7] Statement-dropping bug and fides-c2 crash — RESOLVED Sep 5, 2026 (session 15)
 
 The `STATUS_ACCESS_VIOLATION` crash in `fides-c2_test.exe` while lexing
 `stdlib/core.fd` was initially attributed to the **statement-dropping bug**
 (bug 1.19 in known-bugs.md). Session 12 investigation found the primary
-cause was **stack overflow** — the TCC-linked binary had a 1MB default stack,
-insufficient for deep recursion on 39.5K LOC. Fix: increased TCC stack
-reserve to 128MB (`-Wl,-stack,134217728`) and split `keyword_or_ident_core`
-(51 if-statements, 933 C vars) into 5 smaller functions.
+cause was **stack overflow** — the TCC-linked binary had a 4KB default stack
+(not 1MB as previously believed). Fix: increased TCC stack reserve to 256MB
+(`-Wl,-stack,268435456`) and split `keyword_or_ident_core` (51 if-statements,
+933 C vars) into 5 smaller functions.
 
-The statement-dropping bug (1.19) is still latent and affects long
-functions, but is no longer considered the primary crash cause. The
-workaround (splitting long functions into smaller helpers) remains valid.
+The statement-dropping bug (1.19) was also addressed in session 15 by
+splitting `subst_expr` and `subst_stmt` in `mono.fd` into helper functions.
+After all fixes, the second-generation compiler produces full 701,100-line
+output with 1795 function bodies (105 missing = expected external functions).
 
-**Current crash (session 13/14):** `fides-c2_new.exe` crashes during type
-checking in `TypeChecker_lookup` (null pointer from `Vec_get` on empty
-scopes). This is a Category A crash blocker — see roadmap Category A table.
+**RESOLVED (session 15):** Bootstrap fixpoint achieved. No more crashes.
+fides-c2.c == fides-c3.c (SHA256-identical).
 
 ### [F6] Linux native codegen ported to Fides — Sep 4, 2026 (session 8)
 

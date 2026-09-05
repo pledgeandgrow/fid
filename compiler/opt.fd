@@ -1,23 +1,23 @@
-// opt.fd — PIR Optimizer core (rewritten from src/opt.rs, 8129 LOC)
+// opt.fd -- PIR Optimizer core (rewritten from src/opt.rs, 8129 LOC)
 //
 // This is the core module: Pass enum, OptStats, the optimize_l2 driver,
 // and shared helper functions. Individual passes are in:
-//   opt_const.fd  — const-fold, CSE, GVN
-//   opt_dce.fd    — DCE, DSE, SROA
-//   opt_inline.fd — inline, unroll, TCO
-//   opt_loop.fd   — loop-rotate, loop-vec, SLP vectorize
-//   opt_other.fd  — devirt, jump-thread, alias-analysis, effect-reorder,
+//   opt_const.fd  -- const-fold, CSE, GVN
+//   opt_dce.fd    -- DCE, DSE, SROA
+//   opt_inline.fd -- inline, unroll, TCO
+//   opt_loop.fd   -- loop-rotate, loop-vec, SLP vectorize
+//   opt_other.fd  -- devirt, jump-thread, alias-analysis, effect-reorder,
 //                   partial-eval, strength-reduce, reassociate, memoize,
 //                   effect-opt, region-pool
 //
 // Adaptations from Rust:
-// 1. HashMap<K,V> → Vec-based maps with helper structs
-// 2. HashSet<T> → Vec<T> with contains() helper
-// 3. usize → i64, &str → str
-// 4. thread_local! → module-level var (Fides is single-threaded for now)
-// 5. closures/Fn traits → explicit function pointers (not needed — passes are pub fns)
-// 6. parallel_functions → sequential (MIN_PARALLEL_FUNCTIONS=999 means always sequential)
-// 7. Option<T> → Opt* enums or i64 sentinel values
+// 1. HashMap<K,V> -> Vec-based maps with helper structs
+// 2. HashSet<T> -> Vec<T> with contains() helper
+// 3. usize -> i64, &str -> str
+// 4. thread_local! -> module-level var (Fides is single-threaded for now)
+// 5. closures/Fn traits -> explicit function pointers (not needed -- passes are pub fns)
+// 6. parallel_functions -> sequential (MIN_PARALLEL_FUNCTIONS=999 means always sequential)
+// 7. Option<T> -> Opt* enums or i64 sentinel values
 
 module compiler::opt;
 
@@ -28,7 +28,7 @@ use compiler::ast;
 use compiler::ir;
 use compiler::pir;
 
-// ─── Pass enum ───────────────────────────────────────────────────────────
+// --- Pass enum -----------------------------------------------------------
 
 pub enum Pass {
     ConstFold,
@@ -114,7 +114,7 @@ pub fn Pass_parse(s: str) -> OptPass {
     return OptPass::None;
 }
 
-/// The default pass list (LoopRotate is disabled — see comment in Rust source).
+/// The default pass list (LoopRotate is disabled -- see comment in Rust source).
 pub fn Pass_all() -> Vec<Pass> {
     var passes: Vec<Pass> = Vec::new();
     passes.push(Pass::ConstFold);
@@ -132,7 +132,7 @@ pub fn Pass_all() -> Vec<Pass> {
     passes.push(Pass::Dse);
     passes.push(Pass::Devirt);
     passes.push(Pass::JumpThread);
-    // LoopRotate disabled — produces incorrect code with EffectReorder.
+    // LoopRotate disabled -- produces incorrect code with EffectReorder.
     // passes.push(Pass::LoopRotate);
     passes.push(Pass::LoopVectorize);
     passes.push(Pass::EffectOpt);
@@ -141,7 +141,7 @@ pub fn Pass_all() -> Vec<Pass> {
     return passes;
 }
 
-// ─── OptStats ────────────────────────────────────────────────────────────
+// --- OptStats ------------------------------------------------------------
 
 pub struct OptStats {
     pub const_fold: i64,
@@ -205,7 +205,7 @@ pub fn OptStats_total(s: OptStats) -> i64 {
         + s.region_pool + s.reassociate + s.memoize;
 }
 
-// ─── LTO mode ────────────────────────────────────────────────────────────
+// --- LTO mode ------------------------------------------------------------
 // Rust uses thread_local!; Fides doesn't support module-level vars.
 // We use a wrapper struct approach: L2Module could carry an lto flag,
 // but for simplicity we just pass it as a parameter where needed.
@@ -220,11 +220,11 @@ pub fn OptStats_total(s: OptStats) -> i64 {
 
 pub fn is_lto_mode() -> bool {
     // LTO mode is inferred from the caller using larger iteration counts.
-    // This is a simplification — the real check is in opt_inline.fd.
+    // This is a simplification -- the real check is in opt_inline.fd.
     return false;
 }
 
-// ─── Main driver: optimize_l2 ────────────────────────────────────────────
+// --- Main driver: optimize_l2 --------------------------------------------
 
 pub fn optimize_l2(module: &mut L2Module) -> OptStats {
     return optimize_l2_with(module, Pass_all(), 8);
@@ -301,7 +301,7 @@ pub fn optimize_l2_with(module: &mut L2Module, passes: Vec<Pass>, max_iters: i64
     return stats;
 }
 
-// ─── Convenience: optimize_ir_module ─────────────────────────────────────
+// --- Convenience: optimize_ir_module -------------------------------------
 // NOTE: This function requires lower_ir_to_l1 and lower_l1_to_l2 which take
 // references. For now, callers should use optimize_l2 directly.
 // pub fn optimize_ir_module(ir_module: &IrModule) -> L2Module {
@@ -311,7 +311,7 @@ pub fn optimize_l2_with(module: &mut L2Module, passes: Vec<Pass>, max_iters: i64
 //     return l2;
 // }
 
-// ─── S-1A: Pass relevance checking ───────────────────────────────────────
+// --- S-1A: Pass relevance checking ---------------------------------------
 
 pub fn pass_relevant_for_module(module: &L2Module, pass: Pass) -> bool {
     match pass {
@@ -635,7 +635,7 @@ fn module_has_tail_call(module: &L2Module) -> bool {
     return false;
 }
 
-// ─── has_loops: check if a function has back-edges ───────────────────────
+// --- has_loops: check if a function has back-edges -----------------------
 
 pub fn has_loops(f: L2Function) -> bool {
     var bi: i64 = 0;
@@ -664,9 +664,9 @@ pub fn has_loops(f: L2Function) -> bool {
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Shared helpers: side effects, purity, value references
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 /// Does this instruction have observable side effects?
 pub fn has_side_effects(inst: L2Inst) -> bool {
@@ -752,7 +752,7 @@ pub fn is_pure(inst: L2Inst) -> bool {
         L2Inst::IntTrunc(_, _, _) => { return true; }
         L2Inst::IntToFloat(_, _, _) => { return true; }
         L2Inst::FloatToInt(_, _, _) => { return true; }
-        // NOTE: Alloca is NOT pure — each alloca returns a unique memory location.
+        // NOTE: Alloca is NOT pure -- each alloca returns a unique memory location.
         _ => { return false; }
     }
     return false;
@@ -933,7 +933,7 @@ pub fn str_vec_contains(vec: Vec<str>, s: str) -> bool {
     return false;
 }
 
-// ─── Topological sort of block instructions ──────────────────────────────
+// --- Topological sort of block instructions ------------------------------
 
 pub fn topo_sort_block(b: &mut L2Block, values: Vec<ValueIdL2Entry>) {
     var insts: Vec<i64> = b.instructions;
@@ -944,7 +944,7 @@ pub fn topo_sort_block(b: &mut L2Block, values: Vec<ValueIdL2Entry>) {
 
     // Build dependency lists: for each instruction, which other instructions
     // in this block must come before it?
-    // deps: Vec<i64> per instruction — stored as flat Vec<DepEntry>
+    // deps: Vec<i64> per instruction -- stored as flat Vec<DepEntry>
     var deps: Vec<DepEntry> = Vec::new();
     var i: i64 = 0;
     while i < insts.len() {
@@ -971,7 +971,7 @@ pub fn topo_sort_block(b: &mut L2Block, values: Vec<ValueIdL2Entry>) {
             }
             j = j + 1;
         }
-        // Terminators must come last — depend on ALL other instructions
+        // Terminators must come last -- depend on ALL other instructions
         var is_term: bool = false;
         match inst {
             L2Inst::Return(_) => { is_term = true; }
@@ -1033,7 +1033,7 @@ pub fn topo_sort_block(b: &mut L2Block, values: Vec<ValueIdL2Entry>) {
         }
 
         if ready.len() == 0 {
-            // Cycle detected — append remaining in original order
+            // Cycle detected -- append remaining in original order
             var k: i64 = 0;
             while k < insts.len() {
                 if !i64_vec_contains(visited, insts.get(k)) {
@@ -1045,7 +1045,7 @@ pub fn topo_sort_block(b: &mut L2Block, values: Vec<ValueIdL2Entry>) {
             break;
         }
 
-        // Pick the first ready instruction (lowest original position — they're
+        // Pick the first ready instruction (lowest original position -- they're
         // already in original order since we iterated insts in order)
         var id: i64 = ready.get(0);
         visited.push(id);
@@ -1101,9 +1101,9 @@ fn has_inst(f: &L2Function, id: i64) -> bool {
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Pass 1: Constant folding + propagation
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub fn pass_const_fold(module: &mut L2Module) -> i64 {
     var count: i64 = 0;
@@ -1436,7 +1436,7 @@ fn opt_eval_unary_int(op: UnaryOp, v: i64, ty: IrType) -> OptI64 {
     return OptI64::Some(truncated);
 }
 
-// Truncation helpers — Fides integers are i64, so we need to mask
+// Truncation helpers -- Fides integers are i64, so we need to mask
 fn truncate_to_i8(v: i64) -> i64 {
     var masked: i64 = v & 0xFF;
     if masked >= 128 { return masked - 256; }
@@ -1483,9 +1483,9 @@ pub enum OptF64 {
     None,
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Pass 2: Common subexpression elimination (CSE)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub fn pass_cse(module: &mut L2Module) -> i64 {
     // Build a set of @deterministic user function names
@@ -1902,9 +1902,9 @@ pub fn remove_from_block_instructions(f: &mut L2Function, bi: i64, vid: i64) {
     f.blocks.set(bi, b);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Pass 3: Global Value Numbering (GVN)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub fn pass_gvn(module: &mut L2Module) -> i64 {
     var count: i64 = 0;
@@ -1918,7 +1918,7 @@ pub fn pass_gvn(module: &mut L2Module) -> i64 {
     return count;
 }
 
-/// Copy chain tracking: maps vid → canonical source vid (resolved through Copy chains)
+/// Copy chain tracking: maps vid -> canonical source vid (resolved through Copy chains)
 struct CopyEntry {
     vid: i64,
     canonical: i64,
@@ -2072,7 +2072,7 @@ fn gvn_function(f: &mut L2Function) -> i64 {
     }
     var count: i64 = 0;
 
-    // Copy equivalence map: vid → canonical vid (resolved through Copy chains)
+    // Copy equivalence map: vid -> canonical vid (resolved through Copy chains)
     var copy_of: Vec<CopyEntry> = Vec::new();
 
     // Compute dominators for cross-block value availability
@@ -2168,9 +2168,9 @@ fn gvn_function(f: &mut L2Function) -> i64 {
     return count;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Pass 4: Dead Code Elimination (DCE)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub fn pass_dce(module: &mut L2Module) -> i64 {
     var count: i64 = 0;
@@ -2322,13 +2322,13 @@ fn dce_once(f: &mut L2Function) -> i64 {
     return count;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Remaining passes — stub implementations for now
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Remaining passes -- stub implementations for now
+// ===========================================================================
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Pass: Scalar Replacement of Aggregates (SROA)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub fn pass_sroa(module: &mut L2Module) -> i64 {
     var count: i64 = 0;
@@ -2427,7 +2427,7 @@ fn sroa_alloca(f: &mut L2Function, alloca_id: i64, struct_layouts: Vec<StructLay
             match f.values.get(k).inst {
                 L2Inst::GetFieldPtr(struct_ptr, _, _) => {
                     if struct_ptr == gfp_ids.get(j) {
-                        // Chained — skip this alloca
+                        // Chained -- skip this alloca
                         return 0;
                     }
                 }
@@ -2526,7 +2526,7 @@ fn sroa_alloca(f: &mut L2Function, alloca_id: i64, struct_layouts: Vec<StructLay
                 L2Function_set_value(f, access_vid.get(ai), L2Inst::Copy(field_values.get(gfp_idx), IrType::I64));
                 count = count + 1;
             } else {
-                // No store seen — use ConstInt(0) as default
+                // No store seen -- use ConstInt(0) as default
                 var default_id: i64 = next_id;
                 next_id = next_id + 1;
                 L2Function_set_value(f, default_id, L2Inst::ConstInt(0, IrType::I64));
@@ -2563,9 +2563,9 @@ fn find_in_vec(vec: Vec<i64>, item: i64) -> i64 {
     return -1;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Pass: Dead Store Elimination (DSE)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub fn pass_dse(module: &mut L2Module) -> i64 {
     var count: i64 = 0;
@@ -2597,7 +2597,7 @@ fn dse_function(f: &mut L2Function) -> i64 {
         i = i + 1;
     }
 
-    // Track GetFieldPtr results — map gfp_result → base_alloca
+    // Track GetFieldPtr results -- map gfp_result -> base_alloca
     var gfp_base_ids: Vec<i64> = Vec::new();
     var gfp_base_alloca: Vec<i64> = Vec::new();
     i = 0;
@@ -2704,7 +2704,7 @@ fn dse_function(f: &mut L2Function) -> i64 {
     while ai < local_allocas.len() {
         var alloca_id: i64 = local_allocas.get(ai);
         if !i64_vec_contains(loaded_ptrs, alloca_id) {
-            // Never loaded — all stores to it are dead
+            // Never loaded -- all stores to it are dead
             i = 0;
             while i < f.values.len() {
                 match f.values.get(i).inst {
@@ -2824,9 +2824,9 @@ fn dse_gfp_find(gfp_base_ids: Vec<i64>, ptr: i64) -> i64 {
     return -1;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Pass: Devirtualization
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub fn pass_devirt(module: &mut L2Module) -> i64 {
     var count: i64 = 0;
@@ -2860,7 +2860,7 @@ pub fn pass_devirt(module: &mut L2Module) -> i64 {
     var ti: i64 = 0;
     while ti < module.trait_impls.len() {
         if module.trait_impls.get(ti).items.len() <= 1 { ti = ti + 1; continue; }
-        // Find pure impls — check if any function starts with "<Type>_"
+        // Find pure impls -- check if any function starts with "<Type>_"
         var pure_types: Vec<str> = Vec::new();
         var ii: i64 = 0;
         while ii < module.trait_impls.get(ti).items.len() {
@@ -2980,9 +2980,9 @@ fn devirt_sandbox_function(f: &mut L2Function, trait_names: Vec<str>, impl_types
     }
     return count;
 }
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Pass: Jump Threading
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub fn pass_jump_thread(module: &mut L2Module) -> i64 {
     var count: i64 = 0;
@@ -3006,7 +3006,7 @@ fn jump_thread_function(f: &mut L2Function) -> i64 {
         while bi < f.blocks.len() {
             var b: L2Block = f.blocks.get(bi);
 
-            // Pattern 2: Branch-to-same-target — both then/else go to same block
+            // Pattern 2: Branch-to-same-target -- both then/else go to same block
             if b.instructions.len() > 0 {
                 var term_vid: i64 = b.instructions.get(b.instructions.len() - 1);
                 match L2Function_get_value(f, term_vid) {
@@ -3147,9 +3147,9 @@ fn jump_thread_redirect(f: &mut L2Function, pred_id: i64, from_block: i64, to_bl
     return 0;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Pass: Loop Rotation
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub fn pass_loop_rotate(module: &mut L2Module) -> i64 {
     var count: i64 = 0;
@@ -3166,7 +3166,7 @@ pub fn pass_loop_rotate(module: &mut L2Module) -> i64 {
 fn loop_rotate_function(f: &mut L2Function) -> i64 {
     var count: i64 = 0;
 
-    // Find loop patterns: Header → Branch(cond, Body, Exit); Body → Jump(Header)
+    // Find loop patterns: Header -> Branch(cond, Body, Exit); Body -> Jump(Header)
     // We need:
     //   - Header's terminator is Branch(cond, Body, Exit)
     //   - Body's terminator is Jump(Header)
@@ -3340,7 +3340,7 @@ fn cond_refs_body(f: &L2Function, cond: i64, header_id: i64, body_id: i64) -> bo
         // If v is defined in the body, we can't rotate
         if i64_vec_contains(body_insts, v) { return true; }
 
-        // Only recurse into header instructions (they're fine — recomputed)
+        // Only recurse into header instructions (they're fine -- recomputed)
         if i64_vec_contains(header_insts, v) {
             match L2Function_get_value(f, v) {
                 OptL2Inst::Some(inst) => {
@@ -3486,7 +3486,7 @@ fn rotate_loop(f: &mut L2Function, header_id: i64, body_id: i64, exit_id: i64) -
     // Create the new branch: br cond2, Rotated, Exit
     var new_cond: i64 = remap_vid(cond_vid, id_map_old, id_map_new);
     if new_cond == cond_vid {
-        // cond_vid wasn't in header_cond_insts — use it directly
+        // cond_vid wasn't in header_cond_insts -- use it directly
         new_cond = cond_vid;
     }
     var new_branch_vid: i64 = next_id;
@@ -3518,7 +3518,7 @@ fn rotate_loop(f: &mut L2Function, header_id: i64, body_id: i64, exit_id: i64) -
         OptL2Inst::None => {}
     }
 
-    // The old body block is now unreachable — will be cleaned up by DCE
+    // The old body block is now unreachable -- will be cleaned up by DCE
     return 1;
 }
 
@@ -3533,9 +3533,9 @@ fn max_block_id(f: &L2Function) -> i64 {
     return max;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Pass: Loop Vectorization — vectorize simple counted loops with SIMD
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Pass: Loop Vectorization -- vectorize simple counted loops with SIMD
+// ===========================================================================
 
 pub fn pass_loop_vectorize(module: &mut L2Module) -> i64 {
     var count: i64 = 0;
@@ -3717,11 +3717,11 @@ fn loop_vectorize_function(f: &mut L2Function) -> i64 {
                 if found_increment && trip_count % 4 == 0 {
                     // We can vectorize: change the increment from 1 to 4
                     // and the trip count from N to N/4.
-                    // This is a simplified version — real vectorization would
+                    // This is a simplified version -- real vectorization would
                     // replace scalar ops with SIMD ops. Here we just widen the step.
                     //
                     // Find the ConstInt(1) in the increment and change it to 4
-                    // Find the BinOp(Add, Load(i_ptr), ConstInt(1)) and change 1→4
+                    // Find the BinOp(Add, Load(i_ptr), ConstInt(1)) and change 1->4
                     // Then change the header's ConstInt(N) to N/4
 
                     // Find the increment value instruction
@@ -3771,11 +3771,11 @@ fn loop_vectorize_function(f: &mut L2Function) -> i64 {
     return count;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Pass: Function Inlining — inline small functions with cost model
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Pass: Function Inlining -- inline small functions with cost model
+// ===========================================================================
 
-/// Inline cost model (F-3F): cost = blocks×5 + insts, with bonuses
+/// Inline cost model (F-3F): cost = blocksx5 + insts, with bonuses
 fn inline_cost(f: L2Function) -> i64 {
     var block_cost: i64 = f.blocks.len() * 5;
     var inst_cost: i64 = f.values.len();
@@ -3872,8 +3872,8 @@ pub fn pass_inline(module: &mut L2Module) -> i64 {
 
 fn inline_once(module: &mut L2Module) -> i64 {
     // Determine inline limits based on LTO mode
-    // Normal: cost ≤ 35, blocks ≤ 3
-    // LTO: cost ≤ 75, blocks ≤ 6
+    // Normal: cost <= 35, blocks <= 3
+    // LTO: cost <= 75, blocks <= 6
     var max_cost: i64 = 35;
     var max_blocks: i64 = 3;
     if module.lto_enabled {
@@ -3982,11 +3982,11 @@ fn inline_multi_block(caller: &mut L2Function, call_id: i64, callee: L2Function,
     var next_id: i64 = max_vid(caller) + 1;
     var next_block_id: i64 = max_block_id(caller) + 1;
 
-    // Build value map: callee vid → new caller vid
+    // Build value map: callee vid -> new caller vid
     var map_old: Vec<i64> = Vec::new();
     var map_new: Vec<i64> = Vec::new();
 
-    // Build block map: callee block id → new caller block id
+    // Build block map: callee block id -> new caller block id
     var block_map_old: Vec<i64> = Vec::new();
     var block_map_new: Vec<i64> = Vec::new();
 
@@ -4086,7 +4086,7 @@ fn inline_multi_block(caller: &mut L2Function, call_id: i64, callee: L2Function,
     }
 
     if !has_return {
-        // No return found — can't inline safely
+        // No return found -- can't inline safely
         return false;
     }
 
@@ -4181,7 +4181,7 @@ fn clone_inst_remapped_blocks(inst: L2Inst, val_old: &Vec<i64>, val_new: &Vec<i6
 fn inline_single_block(caller: &mut L2Function, call_id: i64, callee: L2Function, args: Vec<i64>) -> bool {
     var next_id: i64 = max_vid(caller) + 1;
 
-    // Build value map: callee param → caller argument value
+    // Build value map: callee param -> caller argument value
     var map_old: Vec<i64> = Vec::new();
     var map_new: Vec<i64> = Vec::new();
 
@@ -4325,7 +4325,7 @@ fn topo_sort_block(b: &mut L2Block, values: Vec<ValueIdL2Entry>) {
             ri = ri + 1;
         }
 
-        // Terminators must come last — depend on all other instructions
+        // Terminators must come last -- depend on all other instructions
         if is_terminator(inst) {
             var ji2: i64 = 0;
             while ji2 < insts.len() {
@@ -4381,7 +4381,7 @@ fn topo_sort_block(b: &mut L2Block, values: Vec<ValueIdL2Entry>) {
         }
 
         if !found_any {
-            // Cycle — append remaining in original order
+            // Cycle -- append remaining in original order
             var ii3: i64 = 0;
             while ii3 < insts.len() {
                 var id2: i64 = insts.get(ii3);
@@ -4406,9 +4406,9 @@ fn topo_sort_block(b: &mut L2Block, values: Vec<ValueIdL2Entry>) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Pass: Loop Unrolling — unroll counted loops with constant trip counts
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Pass: Loop Unrolling -- unroll counted loops with constant trip counts
+// ===========================================================================
 
 /// Check if an instruction is a block terminator (Jump, Branch, Return, Unreachable)
 fn is_terminator(inst: L2Inst) -> bool {
@@ -4777,7 +4777,7 @@ fn unroll_function(f: &mut L2Function) -> i64 {
         // Append N copies of the body with remapped ValueIds
         var iter: i64 = 0;
         while iter < n {
-            // Build mapping from old ValueId → new ValueId for this iteration
+            // Build mapping from old ValueId -> new ValueId for this iteration
             var old_ids: Vec<i64> = Vec::new();
             var new_ids: Vec<i64> = Vec::new();
             var bi2: i64 = 0;
@@ -4839,9 +4839,9 @@ fn op_is_add(op: BinOp) -> bool {
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Pass: Tail Call Optimization (TCO)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub fn pass_tco(module: &mut L2Module) -> i64 {
     var count: i64 = 0;
@@ -5215,7 +5215,7 @@ fn tco_function(f: &mut L2Function) -> i64 {
         prologue.instructions.push(param_allocas.get(pi2));
         pi2 = pi2 + 1;
     }
-    // Add stores: param → alloca
+    // Add stores: param -> alloca
     var pi4: i64 = 0;
     while pi4 < f.params.len() {
         var store_id: i64 = next_id;
@@ -5248,9 +5248,9 @@ fn tco_next_id(f: &L2Function) -> i64 {
     return max_id + 1;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Dominator Infrastructure (ported from src/opt.rs:5140-5276)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 /// Get the successor blocks of an L2 block by examining its terminator.
 /// (Reference: src/opt.rs:5238 block_successors)
@@ -5373,7 +5373,7 @@ fn rpo_dfs(f: &L2Function, block: i64, visited: &mut Vec<i64>, postorder: &mut V
 }
 
 /// Compute dominator tree for a function.
-/// Returns a map from block ID → immediate dominator block ID.
+/// Returns a map from block ID -> immediate dominator block ID.
 /// Uses the iterative algorithm from Cooper, Harvey, Kennedy (2001).
 /// (Reference: src/opt.rs:5140 compute_dominators)
 pub fn compute_dominators(f: &L2Function) -> Vec<I64Pair> {
@@ -5505,9 +5505,9 @@ pub fn dominates(idom: Vec<I64Pair>, a: i64, b: i64) -> bool {
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Pass: Alias Analysis — redundant load elimination + cross-region reordering
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Pass: Alias Analysis -- redundant load elimination + cross-region reordering
+// ===========================================================================
 
 /// Allocation identity: tracks which alloca a pointer derives from
 struct AllocInfo {
@@ -5559,7 +5559,7 @@ pub fn pass_alias_analysis(module: &mut L2Module) -> i64 {
 fn alias_analysis_function(f: &mut L2Function) -> i64 {
     var count: i64 = 0;
 
-    // Build pointer → AllocInfo map by tracing Alloca, GetElemPtr, GetFieldPtr
+    // Build pointer -> AllocInfo map by tracing Alloca, GetElemPtr, GetFieldPtr
     var alloc_vids: Vec<i64> = Vec::new();
     var alloc_infos: Vec<AllocInfo> = Vec::new();
 
@@ -5626,7 +5626,7 @@ fn alias_analysis_function(f: &mut L2Function) -> i64 {
     var bi: i64 = 0;
     while bi < f.blocks.len() {
         var b: L2Block = f.blocks.get(bi);
-        // Map from pointer ValueId → last loaded value ValueId
+        // Map from pointer ValueId -> last loaded value ValueId
         var load_ptr_vids: Vec<i64> = Vec::new();
         var load_result_vids: Vec<i64> = Vec::new();
 
@@ -5666,9 +5666,9 @@ fn alias_analysis_function(f: &mut L2Function) -> i64 {
                             while li2 < load_ptr_vids.len() {
                                 var load_info: AllocInfo = get_alloc_info(load_ptr_vids.get(li2), alloc_vids, alloc_infos);
                                 if !allocs_non_alias(store_info, load_info) {
-                                    // Could alias — invalidate this load
+                                    // Could alias -- invalidate this load
                                 } else {
-                                    // Non-aliasing — keep the cached load
+                                    // Non-aliasing -- keep the cached load
                                     new_load_ptrs.push(load_ptr_vids.get(li2));
                                     new_load_results.push(load_result_vids.get(li2));
                                 }
@@ -5809,9 +5809,9 @@ fn alias_analysis_function(f: &mut L2Function) -> i64 {
     return count;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Pass: Effect Reorder (stub — complex, needs memory dependency analysis)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Pass: Effect Reorder (stub -- complex, needs memory dependency analysis)
+// ===========================================================================
 
 pub fn pass_effect_reorder(module: &mut L2Module) -> i64 {
     var count: i64 = 0;
@@ -5986,9 +5986,9 @@ fn effect_reorder_is_memory_op(inst: L2Inst) -> bool {
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Pass: Partial Evaluation — compile-time eval of pure calls with constant args
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Pass: Partial Evaluation -- compile-time eval of pure calls with constant args
+// ===========================================================================
 
 /// Call info extracted from a Call instruction
 struct CallInfo {
@@ -6222,7 +6222,7 @@ fn pe_get_const_int(pv: i64, values: Vec<ValueIdL2Entry>, params: Vec<i64>) -> O
             }
         }
         OptL2Inst::None => {
-            // Could be a parameter — try by index
+            // Could be a parameter -- try by index
             if pv < params.len() { return OptI64::Some(params.get(pv)); }
             return OptI64::None;
         }
@@ -6326,9 +6326,9 @@ fn eval_builtin(name: str, args: Vec<i64>) -> OptI64 {
     return OptI64::None;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Pass: SLP Vectorization (Superword-Level Parallelism)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub fn pass_slp_vectorize(module: &mut L2Module) -> i64 {
     var count: i64 = 0;
@@ -6636,9 +6636,9 @@ pub fn binop_eq(a: BinOp, b: BinOp) -> bool {
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Pass: Strength Reduction
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub fn pass_strength_reduce(module: &mut L2Module) -> i64 {
     var count: i64 = 0;
@@ -6675,7 +6675,7 @@ fn strength_reduce_function(f: &mut L2Function) -> i64 {
                     var rv_opt: OptI64 = const_int_value(f, right);
                     var lv_opt: OptI64 = const_int_value(f, left);
 
-                    // x * 0 → 0
+                    // x * 0 -> 0
                     var is_zero: bool = false;
                     match rv_opt {
                         OptI64::Some(rv) => { if rv == 0 { is_zero = true; } }
@@ -6694,7 +6694,7 @@ fn strength_reduce_function(f: &mut L2Function) -> i64 {
                         continue;
                     }
 
-                    // x * 1 → x (Copy)
+                    // x * 1 -> x (Copy)
                     var is_one: bool = false;
                     var one_copy_src: i64 = 0;
                     match rv_opt {
@@ -6714,7 +6714,7 @@ fn strength_reduce_function(f: &mut L2Function) -> i64 {
                         continue;
                     }
 
-                    // x * 2^n → x << n
+                    // x * 2^n -> x << n
                     var pow2_shift: i64 = -1;
                     var pow2_src: i64 = 0;
                     match rv_opt {
@@ -6744,7 +6744,7 @@ fn strength_reduce_function(f: &mut L2Function) -> i64 {
                     }
                 }
 
-                // Div by power of 2 (unsigned only) → Shr
+                // Div by power of 2 (unsigned only) -> Shr
                 if op_is_div(op) {
                     if is_unsigned_type(ty) {
                         var rv_opt: OptI64 = const_int_value(f, right);
@@ -6766,7 +6766,7 @@ fn strength_reduce_function(f: &mut L2Function) -> i64 {
                     }
                 }
 
-                // Mod by power of 2 (unsigned only) → BitAnd with mask
+                // Mod by power of 2 (unsigned only) -> BitAnd with mask
                 if op_is_mod(op) {
                     if is_unsigned_type(ty) {
                         var rv_opt: OptI64 = const_int_value(f, right);
@@ -6855,11 +6855,11 @@ fn shr_i64(v: i64, amount: i64) -> i64 {
     return result;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Pass: Effect Optimize — dead pure call elimination + loop hoisting
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Pass: Effect Optimize -- dead pure call elimination + loop hoisting
+// ===========================================================================
 
-/// Check if a function is "effectively pure" — only local stack effects
+/// Check if a function is "effectively pure" -- only local stack effects
 fn is_effectively_pure(f: L2Function) -> bool {
     // Check if function has pointer params (excluding env_ptr at index 0)
     var has_ptr_params: bool = false;
@@ -7058,7 +7058,7 @@ fn effect_optimize_function(f: &mut L2Function, pure_funcs: Vec<str>, hoistable_
         var pi2: i64 = 0;
         while pi2 < pred_lists.get(bi5).len() {
             if pred_lists.get(bi5).get(pi2) >= bi5 {
-                // Back-edge — bi5 is a loop header
+                // Back-edge -- bi5 is a loop header
                 // Body is blocks from bi5 to the back-edge source (inclusive)
                 var body: Vec<i64> = Vec::new();
                 var bj: i64 = bi5;
@@ -7224,9 +7224,9 @@ fn effect_optimize_function(f: &mut L2Function, pure_funcs: Vec<str>, hoistable_
     return count;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Pass: Region Pool (I-1C — emit p_region_free before returns)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Pass: Region Pool (I-1C -- emit p_region_free before returns)
+// ===========================================================================
 
 pub fn pass_region_pool(module: &mut L2Module) -> i64 {
     var count: i64 = 0;
@@ -7304,7 +7304,7 @@ fn region_pool_function(f: &mut L2Function, struct_layouts: Vec<StructLayoutEntr
             ai = ai + 1;
         }
 
-        // Skip if the region fits on the stack — stack allocation is free
+        // Skip if the region fits on the stack -- stack allocation is free
         if total_size <= STACK_LIMIT { ri2 = ri2 + 1; continue; }
 
         // Create the pool allocation: %pool = call p_alloc(total_size)
@@ -7348,7 +7348,7 @@ fn region_pool_function(f: &mut L2Function, struct_layouts: Vec<StructLayoutEntr
             oi = oi + 1;
         }
 
-        // I-1C: Region Bulk Free — emit p_region_free(pool_vid) before every
+        // I-1C: Region Bulk Free -- emit p_region_free(pool_vid) before every
         // Return instruction in the function.
         var free_vid: i64 = next_vid;
         next_vid = next_vid + 1;
@@ -7388,7 +7388,7 @@ fn region_pool_type_size(ty: IrType, struct_layouts: Vec<StructLayoutEntry>) -> 
     return 0;
 }
 
-// ─── Helpers for region_pool ─────────────────────────────────────────────
+// --- Helpers for region_pool ---------------------------------------------
 
 struct I64Pair {
     first: i64,
@@ -7471,9 +7471,9 @@ fn vec_find_ret(f: &L2Function, insts: Vec<i64>) -> i64 {
     return -1;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Pass: Reassociation (for @wrapping arithmetic)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub fn pass_reassociate(module: &mut L2Module) -> i64 {
     var count: i64 = 0;
@@ -7513,7 +7513,7 @@ fn reassociate_function(f: &mut L2Function) -> i64 {
         var inst: L2Inst = get_inst(f, id);
         match inst {
             L2Inst::BinOp(op, left, right, ty) => {
-                // Check left operand: (a op C1) op C2 → a op (C1 op C2)
+                // Check left operand: (a op C1) op C2 -> a op (C1 op C2)
                 match L2Function_get_value(f, left) {
                     OptL2Inst::Some(left_inst) => {
                         match left_inst {
@@ -7549,7 +7549,7 @@ fn reassociate_function(f: &mut L2Function) -> i64 {
                     OptL2Inst::None => {}
                 }
 
-                // Check right operand: C2 op (a op C1) → a op (C1 op C2)
+                // Check right operand: C2 op (a op C1) -> a op (C1 op C2)
                 match L2Function_get_value(f, right) {
                     OptL2Inst::Some(right_inst) => {
                         match right_inst {
@@ -7616,9 +7616,9 @@ fn op_is_add(op: BinOp) -> bool {
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Pass: Memoization (for @deterministic calls)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub fn pass_memoize(module: &mut L2Module) -> i64 {
     // Build set of deterministic function names

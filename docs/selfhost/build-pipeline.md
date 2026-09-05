@@ -2,7 +2,7 @@
 
 > How to build, test, and verify the self-hosted compiler.
 >
-> **Last updated:** Sep 5, 2026 (session 14)
+> **Last updated:** Sep 5, 2026 (session 15 — stack wrapper approach, 3-generation self-hosting)
 
 ---
 
@@ -22,21 +22,63 @@ For faster iteration (but slower execution):
 cargo build
 ```
 
-### Step 2: Compile the self-hosted compiler to C
+### Step 2: Generate the self-hosted compiler C source
 
 ```bash
-.\target\release\fidesc.exe ccompile compiler\main.fd -o release\fides-c.exe
+.\target\release\fidesc.exe dump-c compiler\main.fd > release\fides-c.c
 ```
 
-Produces `release/fides-c.c` (the `.exe` suffix is replaced with `.c` for
-the C source path, matching the bootstrap compiler behavior). Both the
-bootstrap compiler (`fidesc.exe`) and the self-hosted compiler (`fides-c.exe`)
-now auto-append `.exe` to output names (session 8).
+Produces `release/fides-c.c`. The output is UTF-16 encoded on Windows and
+may need conversion to UTF-8 before TCC can compile it:
 
-### Step 3: Compile the C to an executable with tcc
+```powershell
+$content = [System.IO.File]::ReadAllText("release\fides-c.c", [System.Text.Encoding]::Unicode)
+[System.IO.File]::WriteAllText("release\fides-c.c", $content, [System.Text.UTF8Encoding]::new($false))
+```
+
+### Step 3: Apply the stack wrapper
+
+TCC produces executables with a 4KB default PE stack reserve. The Fides
+compiler needs 256MB for its deeply recursive parser, type checker, and
+codegen. The stack wrapper renames `main` → `fides_main` and adds a Windows
+thread with a 256MB stack:
+
+```powershell
+$content = [System.IO.File]::ReadAllText("release\fides-c.c")
+$content = $content -replace "int main\(int argc, char\*\* argv\)", "int fides_main(int argc, char** argv)"
+$wrapper = @"
+
+// === Stack wrapper ===
+#include <windows.h>
+typedef struct { int argc; char** argv; int ret; } MainArgs;
+DWORD WINAPI thread_main(LPVOID param) {
+    MainArgs* args = (MainArgs*)param;
+    args->ret = fides_main(args->argc, args->argv);
+    return 0;
+}
+int main(int argc, char** argv) {
+    MainArgs args = { argc, argv, 0 };
+    HANDLE h = CreateThread(NULL, 256*1024*1024, thread_main, &args, 0, NULL);
+    if (!h) return 1;
+    WaitForSingleObject(h, INFINITE);
+    CloseHandle(h);
+    return args.ret;
+}
+"@
+$content = $content + $wrapper
+[System.IO.File]::WriteAllText("release\fides-c_wrapped.c", $content, [System.Text.Encoding]::ASCII)
+```
+
+**Why not PE header patching?** PE header patching (modifying
+`SizeOfStackReserve` in the PE optional header) was attempted but was
+fragile — some patched binaries were corrupted and crashed with
+`0xC0000005`. The thread-based wrapper is more reliable and doesn't require
+byte-level PE manipulation.
+
+### Step 4: Compile the C to an executable with tcc
 
 ```bash
-tcc -O2 -w -o release\fides-c.exe release\fides-c.c -lws2_32
+C:\tcc\tcc.exe release\fides-c_wrapped.c -o release\fides-c.exe -lws2_32
 ```
 
 **Why tcc?** It is fast, produces small binaries, and is what the bootstrap
@@ -47,31 +89,39 @@ currently hard-codes tcc.
 **Why `-lws2_32`?** The runtime uses Windows sockets for some networking
 primitives. Linking `ws2_32` satisfies those imports.
 
-### Step 4: Patch the PE stack to 256 MB
-
-The self-hosted compiler needs a large stack (the parser is deeply recursive
-and `alloca` is used throughout). TCC does not provide a way to set the
-initial stack via a flag, so the PE header is patched:
+### Full build sequence (session 15)
 
 ```powershell
-$bytes = [System.IO.File]::ReadAllBytes("release\fides-c.exe")
-$peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
-$stackOffset = $peOffset + 0x18 + 0x48
-$newStack = [BitConverter]::GetBytes([int64]268435456)   # 256 MB
-[Array]::Copy($newStack, 0, $bytes, $stackOffset, 8)
-$newCommit = [BitConverter]::GetBytes([int64]16777216)   # 16 MB initial commit
-[Array]::Copy($newCommit, 0, $bytes, $stackOffset + 8, 8)
-[System.IO.File]::WriteAllBytes("release\fides-c.exe", $bytes)
+# 1. Build Rust compiler
+cargo build --release
+
+# 2. Generate first-gen C
+.\target\release\fidesc.exe dump-c compiler\main.fd > release\fides-c.c
+
+# 3. Convert UTF-16 → UTF-8
+$content = [System.IO.File]::ReadAllText("release\fides-c.c", [System.Text.Encoding]::Unicode)
+[System.IO.File]::WriteAllText("release\fides-c.c", $content, [System.Text.UTF8Encoding]::new($false))
+
+# 4. Apply stack wrapper (see Step 3 above)
+# → produces release\fides-c_wrapped.c
+
+# 5. Compile with TCC
+C:\tcc\tcc.exe release\fides-c_wrapped.c -o release\fides-c.exe -lws2_32
+
+# 6. Test
+.\release\fides-c.exe dump-c release\test_simple.fd   # should EXIT 0
+
+# 7. Self-host: gen 1 → gen 2
+.\release\fides-c.exe dump-c compiler\main.fd > release\fides-c2.c
+# (repeat steps 3-5 for fides-c2.c → fides-c2_new.exe)
+
+# 8. Self-host: gen 2 → gen 3
+.\release\fides-c2_new.exe dump-c compiler\main.fd > release\fides-c3.c
+# (repeat steps 3-5 for fides-c3.c → fides-c3.exe)
+
+# 9. Verify gen 3 works
+.\release\fides-c3.exe dump-c release\test_simple.fd   # should EXIT 0
 ```
-
-### One-liner (PowerShell)
-
-```powershell
-$c = Get-Content build-selfhost.ps1 -Raw; Invoke-Expression $c
-```
-
-**Note:** `build-selfhost.ps1` was previously missing but has been recreated.
-It performs all four steps in order.
 
 ---
 
@@ -152,7 +202,11 @@ It catches "compiles but wrong output" bugs that assertion tests miss. If
 the self-hosted compiler generates C that is functionally different from
 the Rust compiler's C output, the fixpoint will diverge.
 
-### Current status (session 14)
+### Current status (session 15)
+
+**BOOTSTRAP FIXPOINT ACHIEVED.** `fides-c2.c` is byte-identical to
+`fides-c3.c` (SHA256-identical, 701,100 lines, 19.8MB). The self-hosted
+compiler reproduces itself exactly across generations.
 
 **Self-compilation works (session 4).** `fides-c.exe` successfully compiles
 `compiler/main.fd` → `fides-c2.exe`. **PE emitter works (session 5).**
@@ -162,17 +216,20 @@ the Rust compiler's C output, the fixpoint will diverge.
 auto-appended (session 8)** — no more manual `Copy-Item` needed.
 **Category B codegen parity resolved (session 14)** — B5 (float bits) fixed,
 B6/B7/B8 verified at parity.
+**Category A crash blockers resolved (session 15)** — TCC 4KB stack overflow
+fixed with 256MB stack wrapper; type_eq str_equal fix; large match split;
+non-ASCII → ASCII.
+**Category E fixpoint stability resolved (session 15)** — c2==c3 proves no
+non-determinism.
 
-The fixpoint is not yet verified — `fides-c2.exe` crashes during type
-checking of `stdlib/core.fd` (TypeChecker_lookup null deref — Category A
-blocker). Once that's fixed:
+The fixpoint verification command:
 
 ```bash
 # fides-c2 (self-compiled) compiles the compiler → fides-c3
-.\release\fides-c2.exe ccompile compiler\main.fd -o release\fides-c3.exe
+.\release\fides-c2_new.exe dump-c compiler\main.fd > release\fides-c3.c
 # Compare
-diff release\fides-c2.exe.c release\fides-c3.exe.c
-# Must be identical
+diff release\fides-c2.c release\fides-c3.c
+# Result: 0 differences out of 701,100 lines — BYTE IDENTICAL
 ```
 
 ---

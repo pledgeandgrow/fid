@@ -1,21 +1,21 @@
-// pir.fd — PIR (Fides Intermediate Representation), rewritten from src/pir.rs
+// pir.fd -- PIR (Fides Intermediate Representation), rewritten from src/pir.rs
 //
 // Multi-level IR pipeline:
-//   AST ──lower.rs──▶ IR (ir.rs) ──pir.rs──▶ PIR L1 ─▶ L2 ─▶ L3
+//   AST --lower.rs--> IR (ir.rs) --pir.rs--> PIR L1 -> L2 -> L3
 //
 // Levels:
-//   L1 — Semantic: named regions, per-call effects, capabilities
-//   L2 — Mid: drops region naming (stack/heap only), keeps SSA + control flow
-//   L3 — Low: virtual registers, stack frame slots, calling-convention lowering
+//   L1 -- Semantic: named regions, per-call effects, capabilities
+//   L2 -- Mid: drops region naming (stack/heap only), keeps SSA + control flow
+//   L3 -- Low: virtual registers, stack frame slots, calling-convention lowering
 //
 // Adaptations from Rust:
-// 1. String → str, usize/u32/u64 → i64
-// 2. HashMap<K,V> → Vec-based maps with helper structs
-// 3. HashSet<T> → Vec<T> with contains check
-// 4. Option<T> → Opt* enums or -1 sentinel for i64
-// 5. struct-style enum variants → tuple-style (Fides convention)
-// 6. impl blocks → free functions
-// 7. Closures → inlined or helper functions with explicit state
+// 1. String -> str, usize/u32/u64 -> i64
+// 2. HashMap<K,V> -> Vec-based maps with helper structs
+// 3. HashSet<T> -> Vec<T> with contains check
+// 4. Option<T> -> Opt* enums or -1 sentinel for i64
+// 5. struct-style enum variants -> tuple-style (Fides convention)
+// 6. impl blocks -> free functions
+// 7. Closures -> inlined or helper functions with explicit state
 
 module compiler::pir;
 
@@ -25,16 +25,16 @@ use string;
 use compiler::ast;
 use compiler::ir;
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Shared PIR types
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 // PIR reuses the existing IR type system.
 // PirType = IrType (used directly)
 // PValue = i64 (ValueId)
 // PBlock = i64 (BlockId)
 
-// ─── CapSet ──────────────────────────────────────────────────────────────
+// --- CapSet --------------------------------------------------------------
 
 pub struct CapSet {
     pub caps: Vec<str>,
@@ -82,52 +82,52 @@ pub fn CapSet_to_str(self: &CapSet) -> str {
     return result;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// PIR Level 1 — Semantic
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// PIR Level 1 -- Semantic
+// ===========================================================================
 
-// L1 instruction set — tuple-style variants (Fides convention).
+// L1 instruction set -- tuple-style variants (Fides convention).
 // Mirrors ir::Inst but makes region, effect, and capability metadata explicit.
 
 pub enum L1Inst {
-    // ─── Constants ───
+    // --- Constants ---
     ConstInt(i64, IrType),
     ConstFloat(f64, IrType),    // f64 value stored directly
     ConstBool(bool),
     ConstStr(str),
     ConstNull(IrType),
 
-    // ─── Globals ───
+    // --- Globals ---
     GlobalAddr(str, IrType),
 
-    // ─── Arithmetic (pure) ───
+    // --- Arithmetic (pure) ---
     BinOp(BinOp, i64, i64, IrType),
     UnaryOp(UnaryOp, i64, IrType),
 
-    // ─── Region lifetime (L1 only) ───
+    // --- Region lifetime (L1 only) ---
     NewRegion(str),
     FreeRegion(i64),
 
-    // ─── Memory (region-annotated) ───
+    // --- Memory (region-annotated) ---
     AllocaIn(RegionRef, IrType),
     Load(i64, IrType, EffectSet),
     Store(i64, i64, OptIrType, EffectSet),
     GetFieldPtr(i64, i64, IrType),
     GetElemPtr(i64, i64, IrType),
 
-    // ─── Control flow ───
+    // --- Control flow ---
     Jump(i64),
     Branch(i64, i64, i64),
     Return(OptValueId),
     Unreachable,
 
-    // ─── Calls (effect + capability + region annotated) ───
+    // --- Calls (effect + capability + region annotated) ---
     Call(str, Vec<i64>, IrType, EffectSet, CapSet, RegionRef),
     CallPtr(i64, Vec<i64>, IrType, EffectSet, CapSet, bool),
     DynCall(str, str, Vec<i64>, IrType, EffectSet),
     MakeDyn(i64, str, str),
 
-    // ─── Conversions (pure) ───
+    // --- Conversions (pure) ---
     BitCast(i64, IrType, IrType),
     Copy(i64, IrType),
     IntExtend(i64, IrType, IrType),
@@ -135,7 +135,7 @@ pub enum L1Inst {
     IntToFloat(i64, IrType, IrType),
     FloatToInt(i64, IrType, IrType),
 
-    // ─── Fides-specific ───
+    // --- Fides-specific ---
     TryUnwrap(i64, i64, i64, i64),
     Print(i64, IrType),
     Panic(str),
@@ -196,7 +196,7 @@ pub fn region_eq(a: Region, b: Region) -> bool {
     return false;
 }
 
-// ─── L1Inst methods ──────────────────────────────────────────────────────
+// --- L1Inst methods ------------------------------------------------------
 
 pub fn l1inst_is_terminator(inst: &L1Inst) -> bool {
     match inst {
@@ -248,7 +248,7 @@ pub fn l1inst_kind_name(inst: &L1Inst) -> str {
     return "Unknown";
 }
 
-// ─── L1 value entry: (instruction, region, effects, source_line) ────────
+// --- L1 value entry: (instruction, region, effects, source_line) --------
 
 pub struct L1ValueEntry {
     pub inst: L1Inst,
@@ -266,7 +266,7 @@ pub fn L1ValueEntry_new(inst: L1Inst, region: RegionRef, effects: EffectSet, sou
     };
 }
 
-// ─── L1 Block ────────────────────────────────────────────────────────────
+// --- L1 Block ------------------------------------------------------------
 
 pub struct L1Block {
     pub id: i64,
@@ -284,22 +284,22 @@ pub fn L1Block_new(id: i64) -> L1Block {
     };
 }
 
-// ─── L1 Function ─────────────────────────────────────────────────────────
+// --- L1 Function ---------------------------------------------------------
 
 pub struct L1Function {
     pub name: str,
     pub params: Vec<ValueIdType>,
     pub ret_ty: IrType,
     pub blocks: Vec<L1Block>,
-    pub values: Vec<ValueIdL1Entry>,    // value id → L1ValueEntry
+    pub values: Vec<ValueIdL1Entry>,    // value id -> L1ValueEntry
     pub effects: EffectSet,
     pub caps: CapSet,
     pub entry: i64,
     pub is_wrapping: bool,
     pub is_deterministic: bool,
     pub is_crashfree: bool,
-    pub sandbox_values: Vec<i64>,       // HashSet → Vec
-    pub linear_values: Vec<i64>,        // HashSet → Vec
+    pub sandbox_values: Vec<i64>,       // HashSet -> Vec
+    pub linear_values: Vec<i64>,        // HashSet -> Vec
     pub borrow_kinds: Vec<ValueIdBorrowKind>,
     pub gas_limit: OptU64,
     pub is_no_alloc: bool,
@@ -378,7 +378,7 @@ pub enum OptL1ValueEntry {
     None,
 }
 
-// ─── L1 Module ───────────────────────────────────────────────────────────
+// --- L1 Module -----------------------------------------------------------
 
 pub struct L1Module {
     pub functions: Vec<L1Function>,
@@ -402,9 +402,9 @@ pub fn L1Module_new() -> L1Module {
     };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// PIR Level 2 — Mid (control flow)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// PIR Level 2 -- Mid (control flow)
+// ===========================================================================
 
 // L2 drops region handles, capability tracking, and per-instruction effect
 // annotations. Regions collapse to a simple MemRegion (Stack/Heap/Static).
@@ -442,40 +442,40 @@ pub fn mem_region_eq(a: MemRegion, b: MemRegion) -> bool {
 }
 
 pub enum L2Inst {
-    // ─── Constants ───
+    // --- Constants ---
     ConstInt(i64, IrType),
     ConstFloat(f64, IrType),
     ConstBool(bool),
     ConstStr(str),
     ConstNull(IrType),
 
-    // ─── Globals ───
+    // --- Globals ---
     GlobalAddr(str, IrType),
 
-    // ─── Arithmetic ───
+    // --- Arithmetic ---
     BinOp(BinOp, i64, i64, IrType),
     UnaryOp(UnaryOp, i64, IrType),
 
-    // ─── Memory ───
+    // --- Memory ---
     Alloca(IrType, MemRegion),
     Load(i64, IrType),
     Store(i64, i64, OptIrType),
     GetFieldPtr(i64, i64, IrType),
     GetElemPtr(i64, i64, IrType),
 
-    // ─── Control flow ───
+    // --- Control flow ---
     Jump(i64),
     Branch(i64, i64, i64),
     Return(i64),  // -1 = void return
     Unreachable,
 
-    // ─── Calls ───
+    // --- Calls ---
     Call(str, Vec<i64>, IrType),
     CallPtr(i64, Vec<i64>, IrType, bool),
     DynCall(str, str, Vec<i64>, IrType),
     MakeDyn(i64, str, str),
 
-    // ─── Conversions ───
+    // --- Conversions ---
     BitCast(i64, IrType, IrType),
     Copy(i64, IrType),
     IntExtend(i64, IrType, IrType),
@@ -483,7 +483,7 @@ pub enum L2Inst {
     IntToFloat(i64, IrType, IrType),
     FloatToInt(i64, IrType, IrType),
 
-    // ─── Fides-specific ───
+    // --- Fides-specific ---
     TryUnwrap(i64, i64, i64, i64),
     Print(i64, IrType),
     Panic(str),
@@ -537,7 +537,7 @@ pub fn l2inst_kind_name(inst: &L2Inst) -> str {
     return "Unknown";
 }
 
-// ─── L2 Block ────────────────────────────────────────────────────────────
+// --- L2 Block ------------------------------------------------------------
 
 pub struct L2Block {
     pub id: i64,
@@ -555,7 +555,7 @@ pub fn L2Block_new(id: i64) -> L2Block {
     };
 }
 
-// ─── L2 Function ─────────────────────────────────────────────────────────
+// --- L2 Function ---------------------------------------------------------
 
 pub struct L2Function {
     pub name: str,
@@ -659,7 +659,7 @@ pub enum OptL2Inst {
     None,
 }
 
-// ─── L2 Module ───────────────────────────────────────────────────────────
+// --- L2 Module -----------------------------------------------------------
 
 pub struct L2Module {
     pub functions: Vec<L2Function>,
@@ -685,11 +685,11 @@ pub fn L2Module_new() -> L2Module {
     };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// PIR Level 3 — Low (machine-near)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// PIR Level 3 -- Low (machine-near)
+// ===========================================================================
 
-// Virtual register — L3 operates on an unbounded virtual register file.
+// Virtual register -- L3 operates on an unbounded virtual register file.
 pub struct VReg {
     pub id: i64,
 }
@@ -706,7 +706,7 @@ pub fn vreg_eq(a: VReg, b: VReg) -> bool {
     return a.id == b.id;
 }
 
-// Stack frame slot — addressed by byte offset from the frame pointer.
+// Stack frame slot -- addressed by byte offset from the frame pointer.
 pub struct Slot {
     pub offset: i64,
 }
@@ -723,7 +723,7 @@ pub fn slot_eq(a: Slot, b: Slot) -> bool {
     return a.offset == b.offset;
 }
 
-// L3 operand — virtual register, stack slot, or immediate.
+// L3 operand -- virtual register, stack slot, or immediate.
 pub enum Operand {
     VReg(VReg),
     Slot(Slot),
@@ -767,11 +767,11 @@ pub fn cast_kind_to_str(k: CastKind) -> str {
     return "bitcast";
 }
 
-// L3 instructions — close to machine code but still target-independent.
+// L3 instructions -- close to machine code but still target-independent.
 pub enum L3Inst {
     // dst = imm (or load immediate)
     Mov(VReg, Operand),
-    // dst = &slot (address-of stack slot — for Alloca)
+    // dst = &slot (address-of stack slot -- for Alloca)
     AddrOfSlot(VReg, Slot),
     // dst = &global (address-of module-level mutable global)
     GlobalAddr(VReg, str, IrType),
@@ -796,7 +796,7 @@ pub enum L3Inst {
     // Return with optional value operand
     Ret(OptOperand),
     Unreachable,
-    // Direct call — result in dst
+    // Direct call -- result in dst
     Call(OptVReg, str, Vec<Operand>, IrType),
     // Indirect call through function pointer
     CallPtr(OptVReg, Operand, Vec<Operand>, IrType, bool),
@@ -825,7 +825,7 @@ pub enum OptVReg {
     None,
 }
 
-// ─── L3 Block ────────────────────────────────────────────────────────────
+// --- L3 Block ------------------------------------------------------------
 
 pub struct L3Block {
     pub id: i64,
@@ -852,7 +852,7 @@ pub fn L3Block_new(id: i64) -> L3Block {
     };
 }
 
-// ─── L3 Function ─────────────────────────────────────────────────────────
+// --- L3 Function ---------------------------------------------------------
 
 pub struct L3Function {
     pub name: str,
@@ -886,7 +886,7 @@ pub fn L3Function_new_vreg(self: &mut L3Function) -> VReg {
     return r;
 }
 
-// ─── L3 Module ───────────────────────────────────────────────────────────
+// --- L3 Module -----------------------------------------------------------
 
 pub struct L3Module {
     pub functions: Vec<L3Function>,
@@ -895,9 +895,9 @@ pub struct L3Module {
     pub extern_functions: Vec<StringVecIrType>,
     pub trait_methods: Vec<StringVecStr>,
     pub trait_impls: Vec<StringVecStr>,
-    pub pure_functions: Vec<str>,       // HashSet → Vec
-    pub no_alloc_functions: Vec<str>,   // HashSet → Vec
-    pub wrapping_functions: Vec<str>,   // F65: @wrapping functions — codegen skips overflow checks
+    pub pure_functions: Vec<str>,       // HashSet -> Vec
+    pub no_alloc_functions: Vec<str>,   // HashSet -> Vec
+    pub wrapping_functions: Vec<str>,   // F65: @wrapping functions -- codegen skips overflow checks
 }
 
 pub fn L3Module_new() -> L3Module {
@@ -947,9 +947,9 @@ pub fn L3Module_has_wrapping(self: &L3Module, name: str) -> bool {
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Lowering: IrModule → PIR Level 1
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Lowering: IrModule -> PIR Level 1
+// ===========================================================================
 
 // Lower an IrModule to PIR Level 1.
 // This is a 1:1 rewrite of every IR instruction into its L1 counterpart,
@@ -996,7 +996,7 @@ fn region_ref_from(reg: Region) -> RegionRef {
     return RegionRef::Builtin(reg);
 }
 
-// Helper: capability set for a call — always empty (Phase 2C elision)
+// Helper: capability set for a call -- always empty (Phase 2C elision)
 fn caps_for_call(func: str) -> CapSet {
     return CapSet_new();
 }
@@ -1107,7 +1107,7 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
             Inst::PersistSave(name, value) => {
                 l1_inst = L1Inst::Copy(0, IrType::I64);
             }
-            // Compile-time markers produce no runtime value — skip them
+            // Compile-time markers produce no runtime value -- skip them
             Inst::TxnBegin => { skip = true; l1_inst = L1Inst::ConstInt(0, IrType::I64); }
             Inst::TxnEnd => { skip = true; l1_inst = L1Inst::ConstInt(0, IrType::I64); }
             Inst::UnsafeBegin => { skip = true; l1_inst = L1Inst::ConstInt(0, IrType::I64); }
@@ -1226,7 +1226,7 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
     };
 }
 
-// ─── Helper structs for region_of map ────────────────────────────────────
+// --- Helper structs for region_of map ------------------------------------
 
 pub struct ValueIdRegionRef {
     pub id: i64,
@@ -1260,9 +1260,9 @@ fn region_of_set(map: &mut Vec<ValueIdRegionRef>, id: i64, reg: RegionRef) {
     map.push(ValueIdRegionRef_new(id, reg));
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Lowering: PIR Level 1 → Level 2
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Lowering: PIR Level 1 -> Level 2
+// ===========================================================================
 
 // Lower L1 to L2: drop region handles, capability tracking, and per-call
 // effect annotations. NewRegion/FreeRegion vanish; AllocaIn becomes Alloca
@@ -1460,7 +1460,7 @@ fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
     };
 }
 
-// ─── RegionRef helpers ───────────────────────────────────────────────────
+// --- RegionRef helpers ---------------------------------------------------
 
 fn region_ref_is_handle(r: RegionRef) -> bool {
     match r {
@@ -1478,7 +1478,7 @@ fn region_ref_handle_value(r: RegionRef) -> i64 {
     return -1;
 }
 
-// ─── Vec<i64> contains helper ────────────────────────────────────────────
+// --- Vec<i64> contains helper --------------------------------------------
 
 fn vec_contains_i64(v: Vec<i64>, value: i64) -> bool {
     var i: i64 = 0;
@@ -1491,9 +1491,9 @@ fn vec_contains_i64(v: Vec<i64>, value: i64) -> bool {
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Lowering: PIR Level 2 → Level 3
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Lowering: PIR Level 2 -> Level 3
+// ===========================================================================
 
 // Lower L2 to L3: introduce virtual registers, compute a stack frame layout,
 // and lower every L2 value into operand/vreg form.
@@ -1516,7 +1516,7 @@ pub fn lower_l2_to_l3(l2: &L2Module, module: &IrModule) -> L3Module {
         if l2.functions.get(i).is_no_alloc || l2.functions.get(i).is_medical {
             l3.no_alloc_functions.push(l2.functions.get(i).name);
         }
-        // F65: Populate wrapping function set — codegen skips overflow checks
+        // F65: Populate wrapping function set -- codegen skips overflow checks
         if l2.functions.get(i).is_wrapping {
             l3.wrapping_functions.push(l2.functions.get(i).name);
         }
@@ -1531,7 +1531,7 @@ pub fn lower_l2_to_l3(l2: &L2Module, module: &IrModule) -> L3Module {
     return l3;
 }
 
-// Helper struct for vreg_of map: PValue → VReg
+// Helper struct for vreg_of map: PValue -> VReg
 pub struct PValueVReg {
     pub pval: i64,
     pub vreg: VReg,
@@ -1541,7 +1541,7 @@ pub fn PValueVReg_new(pval: i64, vreg: VReg) -> PValueVReg {
     return PValueVReg { pval: pval, vreg: vreg };
 }
 
-// Helper struct for slot_of map: PValue → Slot
+// Helper struct for slot_of map: PValue -> Slot
 pub struct PValueSlot {
     pub pval: i64,
     pub slot: Slot,
@@ -1551,7 +1551,7 @@ pub fn PValueSlot_new(pval: i64, slot: Slot) -> PValueSlot {
     return PValueSlot { pval: pval, slot: slot };
 }
 
-// Helper struct for value_types map: PValue → IrType
+// Helper struct for value_types map: PValue -> IrType
 pub struct PValueIrType {
     pub pval: i64,
     pub ty: IrType,
@@ -1648,7 +1648,7 @@ fn materialize_slot(pv: i64, slot_of: Vec<PValueSlot>) -> Operand {
     return Operand::VReg(VReg_new(pv));
 }
 
-// Materialize a PValue as a VALUE (not a pointer) — always uses vreg
+// Materialize a PValue as a VALUE (not a pointer) -- always uses vreg
 fn materialize_vreg(pv: i64) -> Operand {
     return Operand::VReg(VReg_new(pv));
 }
@@ -1656,7 +1656,7 @@ fn materialize_vreg(pv: i64) -> Operand {
 fn lower_func_l2_to_l3(f: &L2Function, module: &IrModule) -> L3Function {
     var value_types: Vec<PValueIrType> = Vec::new();
 
-    // Assign vregs to function params — use VReg_new(pv) directly
+    // Assign vregs to function params -- use VReg_new(pv) directly
     var params: Vec<VRegIrType> = Vec::new();
     var i: i64 = 0;
     while i < f.params.len() {
@@ -1726,7 +1726,7 @@ fn lower_func_l2_to_l3(f: &L2Function, module: &IrModule) -> L3Function {
     var sj: i64 = 0;
     while sj < sorted_pvals.len() {
         var vid: i64 = sorted_pvals.get(sj);
-        // Direct lookup — avoid OptL2Inst enum extraction issues
+        // Direct lookup -- avoid OptL2Inst enum extraction issues
         var vi3: i64 = 0;
         while vi3 < f.values.len() {
             if f.values.get(vi3).id == vid {
@@ -1821,7 +1821,7 @@ fn lower_l2_inst_to_l3(
 ) -> L3Inst {
     var dst: VReg = VReg_new(vid);
 
-    // Look up the L2Inst by value ID — this avoids passing nested enum
+    // Look up the L2Inst by value ID -- this avoids passing nested enum
     // values as function parameters (which can corrupt inner enum fields)
     var local_inst: L2Inst = L2Inst::Unreachable;
     var found: bool = false;
@@ -2023,9 +2023,9 @@ fn lower_l2_inst_to_l3(
     return L3Inst::Unreachable;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Printers
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 pub enum PirLevel {
     L1,
@@ -2063,9 +2063,9 @@ pub fn generate_pir(module: &IrModule, level: PirLevel) -> str {
     var l2: L2Module = lower_l1_to_l2(&l1);
     var l3: L3Module = lower_l2_to_l3(&l2, module);
 
-    var out: str = "; ════════════════════════════════════════════════════════════════\n";
-    out = out + "; PIR — Fides Intermediate Representation\n";
-    out = out + "; ════════════════════════════════════════════════════════════════\n\n";
+    var out: str = "; ================================================================\n";
+    out = out + "; PIR -- Fides Intermediate Representation\n";
+    out = out + "; ================================================================\n\n";
 
     if pir_level_eq(level, PirLevel::L1) || pir_level_eq(level, PirLevel::All) {
         out = out + format_l1(&l1);
@@ -2098,10 +2098,10 @@ pub fn format_l3(m: &L3Module) -> str {
     return print_l3_module(m);
 }
 
-// ─── L1 printer ──────────────────────────────────────────────────────────
+// --- L1 printer ----------------------------------------------------------
 
 fn print_l1_module(m: &L1Module) -> str {
-    var out: str = "; ─── PIR Level 1 — Semantic (regions, effects, capabilities) ───\n";
+    var out: str = "; --- PIR Level 1 -- Semantic (regions, effects, capabilities) ---\n";
     out = out + print_struct_layouts(m.struct_layouts);
     out = out + print_string_constants(m.string_constants);
     out = out + print_externs(m.extern_functions);
@@ -2114,7 +2114,7 @@ fn print_l1_module(m: &L1Module) -> str {
 }
 
 fn print_l1_function(f: &L1Function) -> str {
-    var out: str = "\n; ─── function " + f.name + " ───\n";
+    var out: str = "\n; --- function " + f.name + " ---\n";
     var params: str = fmt_params(f.params);
     out = out + "fn " + f.name + "(" + params + ") -> " + ir_type_to_str(f.ret_ty) + " " + EffectSet_to_str(&f.effects) + " " + CapSet_to_str(&f.caps) + "\n{\n";
     var i: i64 = 0;
@@ -2225,10 +2225,10 @@ pub fn fmt_l1_inst(i: L1Inst) -> str {
     return "unknown";
 }
 
-// ─── L2 printer ──────────────────────────────────────────────────────────
+// --- L2 printer ----------------------------------------------------------
 
 fn print_l2_module(m: &L2Module) -> str {
-    var out: str = "; ─── PIR Level 2 — Mid (control flow, no regions/caps) ───\n";
+    var out: str = "; --- PIR Level 2 -- Mid (control flow, no regions/caps) ---\n";
     out = out + print_struct_layouts(m.struct_layouts);
     out = out + print_string_constants(m.string_constants);
     out = out + print_externs(m.extern_functions);
@@ -2241,7 +2241,7 @@ fn print_l2_module(m: &L2Module) -> str {
 }
 
 fn print_l2_function(f: &L2Function) -> str {
-    var out: str = "\n; ─── function " + f.name + " ───\n";
+    var out: str = "\n; --- function " + f.name + " ---\n";
     var params: str = fmt_params(f.params);
     out = out + "fn " + f.name + "(" + params + ") -> " + ir_type_to_str(f.ret_ty) + "\n{\n";
     var i: i64 = 0;
@@ -2342,10 +2342,10 @@ pub fn fmt_l2_inst(i: L2Inst) -> str {
     return "unknown";
 }
 
-// ─── L3 printer ──────────────────────────────────────────────────────────
+// --- L3 printer ----------------------------------------------------------
 
 fn print_l3_module(m: &L3Module) -> str {
-    var out: str = "; ─── PIR Level 3 — Low (virtual registers, stack frame) ───\n";
+    var out: str = "; --- PIR Level 3 -- Low (virtual registers, stack frame) ---\n";
     out = out + print_struct_layouts(m.struct_layouts);
     out = out + print_string_constants(m.string_constants);
     out = out + print_externs(m.extern_functions);
@@ -2358,7 +2358,7 @@ fn print_l3_module(m: &L3Module) -> str {
 }
 
 fn print_l3_function(f: &L3Function) -> str {
-    var out: str = "\n; ─── function " + f.name + " (frame=" + int_to_str(f.frame_size) + " bytes) ───\n";
+    var out: str = "\n; --- function " + f.name + " (frame=" + int_to_str(f.frame_size) + " bytes) ---\n";
     var params: Vec<str> = Vec::new();
     var i: i64 = 0;
     while i < f.params.len() {
@@ -2465,7 +2465,7 @@ pub fn fmt_l3_inst(i: L3Inst) -> str {
     return "unknown";
 }
 
-// ─── Shared printer helpers ──────────────────────────────────────────────
+// --- Shared printer helpers ----------------------------------------------
 
 fn print_struct_layouts(layouts: Vec<StructLayoutEntry>) -> str {
     if layouts.len() == 0 { return ""; }
@@ -2478,7 +2478,7 @@ fn print_struct_layouts(layouts: Vec<StructLayoutEntry>) -> str {
         i = i + 1;
     }
     names = vec_sort_str(names);
-    var out: str = "; ─── struct layouts ───\n";
+    var out: str = "; --- struct layouts ---\n";
     var j: i64 = 0;
     while j < names.len() {
         var k: i64 = 0;
@@ -2504,7 +2504,7 @@ fn print_struct_layouts(layouts: Vec<StructLayoutEntry>) -> str {
 
 fn print_string_constants(strings: Vec<StringStringEntry>) -> str {
     if strings.len() == 0 { return ""; }
-    var out: str = "; ─── string constants ───\n";
+    var out: str = "; --- string constants ---\n";
     var i: i64 = 0;
     while i < strings.len() {
         out = out + strings.get(i).val + " = \"" + escape_str(strings.get(i).key) + "\"\n";
@@ -2515,7 +2515,7 @@ fn print_string_constants(strings: Vec<StringStringEntry>) -> str {
 
 fn print_externs(externs: Vec<StringVecIrType>) -> str {
     if externs.len() == 0 { return ""; }
-    var out: str = "; ─── extern functions ───\n";
+    var out: str = "; --- extern functions ---\n";
     var i: i64 = 0;
     while i < externs.len() {
         var e: StringVecIrType = externs.get(i);
@@ -2556,7 +2556,7 @@ pub fn bool_to_str(b: bool) -> str {
     return "false";
 }
 
-// ─── BinOp / UnaryOp debug strings ───────────────────────────────────────
+// --- BinOp / UnaryOp debug strings ---------------------------------------
 
 pub fn binop_debug_str(op: BinOp) -> str {
     match op {
@@ -2591,7 +2591,7 @@ pub fn unaryop_debug_str(op: UnaryOp) -> str {
     return "Unknown";
 }
 
-// ─── String join helper ──────────────────────────────────────────────────
+// --- String join helper --------------------------------------------------
 
 pub fn str_join(v: Vec<str>, sep: str) -> str {
     if v.len() == 0 { return ""; }
@@ -2606,9 +2606,9 @@ pub fn str_join(v: Vec<str>, sep: str) -> str {
 
 // Note: str_replace is provided by stdlib/core.fd
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Public accessors for tests / future optimizer passes
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 // Build all three PIR levels from an IrModule.
 pub fn build_all(module: &IrModule) -> PirAllLevels {
@@ -2628,11 +2628,11 @@ pub fn PirAllLevels_new(l1: L1Module, l2: L2Module, l3: L3Module) -> PirAllLevel
     return PirAllLevels { l1: l1, l2: l2, l3: l3 };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Missing helper functions
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
-// Sort Vec<str> — returns a new sorted Vec (Fides &mut doesn't propagate)
+// Sort Vec<str> -- returns a new sorted Vec (Fides &mut doesn't propagate)
 fn vec_sort_str(v: Vec<str>) -> Vec<str> {
     var result: Vec<str> = Vec::new();
     var i: i64 = 0;
@@ -2657,7 +2657,7 @@ fn vec_sort_str(v: Vec<str>) -> Vec<str> {
     return result;
 }
 
-// Sort Vec<i64> — returns a new sorted Vec
+// Sort Vec<i64> -- returns a new sorted Vec
 fn vec_sort_i64(v: Vec<i64>) -> Vec<i64> {
     var result: Vec<i64> = Vec::new();
     var i: i64 = 0;
@@ -2696,7 +2696,7 @@ fn IrModule_has_function(module: &IrModule, name: str) -> bool {
     return false;
 }
 
-// String substring — extract a substring of length `len` starting at `start`
+// String substring -- extract a substring of length `len` starting at `start`
 fn str_substring(s: str, start: i64, len: i64) -> str {
     // Fides str doesn't have direct char indexing; str_replace from core
     // handles the escaping we need. This is a stub for completeness.

@@ -2,7 +2,7 @@
 
 > File-by-file breakdown of the self-hosted compiler modules in `compiler/`.
 >
-> **Last updated:** Sep 5, 2026 (session 14 — Category B codegen parity resolved)
+> **Last updated:** Sep 5, 2026 (session 15 — **BOOTSTRAP FIXPOINT ACHIEVED**: fides-c2.c == fides-c3.c)
 >
 > **Note on line numbers:** Source line numbers in "Known issues (session 11
 > analysis)" sections were accurate as of session 11 but may have shifted in
@@ -575,9 +575,8 @@ pointer. The old `load_enum_field()` workaround is no longer needed.
 - **Ported from:** `src/lsp.rs` (916 lines Rust → 1,082 lines Fides, session 9)
 - **Runtime dependencies (added to `codegen_c.fd`):** `p_read_line`,
   `p_read_stdin(n)`, `p_stdin_eof`, `p_flush_stdout`
-- **Status:** Module parses correctly in isolation. `lsp` command wired into
-  `main.fd`. Full self-hosted build blocked by pre-existing parse error at
-  codegen_c.fd:973 (bug #2.11, not LSP-related).
+- **Status:** Module parses correctly. `lsp` command wired into
+  `main.fd`. Full self-hosted build works (session 15: bootstrap fixpoint achieved).
 - **Features:**
   - `initialize` / `shutdown` / `exit` lifecycle
   - `textDocument/didOpen` / `didChange` / `didClose` — document tracking

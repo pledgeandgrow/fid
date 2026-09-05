@@ -1,4 +1,4 @@
-// lexer.fd — Fides lexer, SH-7.1 rewrite of src/lexer.rs (589 LOC Rust)
+// lexer.fd -- Fides lexer, SH-7.1 rewrite of src/lexer.rs (589 LOC Rust)
 //
 // Takes a source string and produces a Vec<Token> token stream.
 // Handles: identifiers, keywords, numbers (dec/hex/bin/oct/float), strings,
@@ -19,11 +19,11 @@ use vec;
 use core;
 use compiler::token;
 
-// ─── Lexer ────────────────────────────────────────────────────────────────
+// --- Lexer ----------------------------------------------------------------
 
 pub struct Lexer {
     pub source: str,
-    pub src_len: i64,  // Cached length — avoids O(n) str_len on every peek()
+    pub src_len: i64,  // Cached length -- avoids O(n) str_len on every peek()
     pub pos: i64,
     pub line: i64,
     pub col: i64,
@@ -92,7 +92,7 @@ impl Lexer {
     /// Peek the byte at `offset` past the current position, or -1 if out of
     /// bounds. (Rust returns Option<char>; we use -1 as the "None" sentinel.
     /// Callers compare against specific byte values, never against 0, since 0
-    /// is a valid NUL byte — using -1 avoids a false match at EOF.)
+    /// is a valid NUL byte -- using -1 avoids a false match at EOF.)
     fn peek_at(self: &Lexer, offset: i64) -> i64 {
         var idx: i64 = self.pos + offset;
         if idx >= self.src_len {
@@ -132,17 +132,17 @@ impl Lexer {
 
     /// Read the UTF-8 character at the current position as a string,
     /// advancing past all its bytes. Unlike `byte_to_str(advance())`,
-    /// this captures multi-byte sequences (e.g. em-dash — is 3 bytes).
+    /// this captures multi-byte sequences (e.g. em-dash -- is 3 bytes).
     fn read_utf8(self: &mut Lexer) -> str {
         var c: i64 = self.peek();
         if c < 128 {
-            // ASCII — single byte
+            // ASCII -- single byte
             return byte_to_str(self.advance());
         }
         // Multi-byte UTF-8: determine sequence length from the start byte.
-        //   0xC0..0xDF → 2 bytes
-        //   0xE0..0xEF → 3 bytes
-        //   0xF0..0xF7 → 4 bytes
+        //   0xC0..0xDF -> 2 bytes
+        //   0xE0..0xEF -> 3 bytes
+        //   0xF0..0xF7 -> 4 bytes
         var seqlen: i64 = 2;
         if c >= 240 { seqlen = 4; }
         else if c >= 224 { seqlen = 3; }
@@ -199,7 +199,7 @@ impl Lexer {
         }
 
         // Extract the identifier directly from the source string
-        // instead of building it char-by-char with str_concat (O(n²)).
+        // instead of building it char-by-char with str_concat (O(n^2)).
         var s: str = str_slice(self.source, start_pos, self.pos);
         var kind: TokenKind = keyword_or_ident(s);
         return token_new(kind, line, col);
@@ -287,7 +287,7 @@ impl Lexer {
         return token_new(TokenKind::IntLit(val), line, col);
     }
 
-    /// Remove underscore separators from a numeric string (e.g. "1_000" → "1000")
+    /// Remove underscore separators from a numeric string (e.g. "1_000" -> "1000")
     fn str_filter_underscores(s: str) -> str {
         var result: str = "";
     }
@@ -316,7 +316,7 @@ impl Lexer {
                     s = str_concat(s, byte_to_str(esc));
                 }
             } else if c == 123 {
-                // '{' — expression interpolation {expr}
+                // '{' -- expression interpolation {expr}
                 self.advance(); // consume '{'
                 s = str_concat(s, "{");
                 var depth: i64 = 1;
@@ -389,7 +389,7 @@ impl Lexer {
     }
 
     /// Read a raw string: r"..." or r#"..."# (with N hash signs).
-    /// No escape sequences are processed — content is taken literally.
+    /// No escape sequences are processed -- content is taken literally.
     /// The closing delimiter is '"' followed by the same number of '#'.
     fn read_raw_string(self: &mut Lexer) -> Token {
         var line: i64 = self.line;
@@ -568,7 +568,7 @@ impl Lexer {
     }
 }
 
-/// Remove underscore separators from a numeric string (e.g. "1_000" → "1000")
+/// Remove underscore separators from a numeric string (e.g. "1_000" -> "1000")
 pub fn str_filter_underscores(s: str) -> str {
     var result: str = "";
     var i: i64 = 0;
@@ -582,21 +582,21 @@ pub fn str_filter_underscores(s: str) -> str {
     return result;
 }
 
-// ─── Keyword table ────────────────────────────────────────────────────────
+// --- Keyword table --------------------------------------------------------
 // Maps an identifier string to its TokenKind, or TokenKind::Ident(s) if it
 // is not a reserved word. Mirrors the `match s.as_str()` block in lexer.rs.
 // Note: "q8" and "q4" are aliases for I8 (quantized 8/4-bit, stored in i8).
 
 pub fn keyword_or_ident(s: str) -> TokenKind {
-    // Fast path: all keywords are ≤ 10 chars. Skip keyword checks for
-    // longer identifiers — they are definitely identifiers, not keywords.
+    // Fast path: all keywords are <= 10 chars. Skip keyword checks for
+    // longer identifiers -- they are definitely identifiers, not keywords.
     // This avoids ~60 str_equal calls for most identifiers.
     var slen: i64 = str_len(s);
     if slen > 10 {
         return TokenKind::Ident(s);
     }
-    // ── Keywords (split into small groups to keep generated C functions
-    // small enough for TCC to compile without dropping statements) ──
+    // -- Keywords (split into small groups to keep generated C functions
+    // small enough for TCC to compile without dropping statements) --
     var kind: TokenKind = keyword_or_ident_a(s);
     match kind {
         TokenKind::Ident(_) => {
@@ -753,7 +753,7 @@ fn keyword_or_ident_type(s: str) -> TokenKind {
     return TokenKind::Ident(s);
 }
 
-// ─── Character classification helpers ─────────────────────────────────────
+// --- Character classification helpers -------------------------------------
 // These mirror Rust's char::is_* predicates over ASCII byte values.
 
 pub fn lex_is_whitespace(c: i64) -> bool {
@@ -781,7 +781,7 @@ pub fn lex_is_hexdigit(c: i64) -> bool {
         || (c >= 97 && c <= 102); // 'a'..'f'
 }
 
-// ─── Number parsing helpers ───────────────────────────────────────────────
+// --- Number parsing helpers -----------------------------------------------
 
 /// Parse `s` as an integer in the given radix (2, 8, 10, 16). Returns 0 on
 /// any non-digit. Used for binary/octal literals (str_parse_hex handles 16).
@@ -810,7 +810,7 @@ pub fn parse_radix(s: str, radix: i64) -> i64 {
     return result;
 }
 
-// ─── String helpers ───────────────────────────────────────────────────────
+// --- String helpers -------------------------------------------------------
 
 /// Build a string by repeating `ch` (given as a byte) `count` times.
 /// Used for the "r###" prefix in raw-string error messages.
@@ -824,7 +824,7 @@ pub fn repeat_char(ch: i64, count: i64) -> str {
     return result;
 }
 
-// ─── Error formatting ─────────────────────────────────────────────────────
+// --- Error formatting -----------------------------------------------------
 // Matches Rust's `format!("Error:{}:{}: {}", line, col, msg)`.
 
 pub fn lex_error(line: i64, col: i64, msg: str) -> str {

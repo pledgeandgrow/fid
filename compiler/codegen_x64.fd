@@ -1,10 +1,10 @@
-// codegen_x64.fd — x86-64 Code Generator (Phase 4C)
+// codegen_x64.fd -- x86-64 Code Generator (Phase 4C)
 // Ported from src/codegen_x64.rs (~2081 LOC)
 //
 // Instruction selector that consumes PIR L3 + a register allocation and
 // produces x86-64 assembly (AT&T syntax, System V AMD64 ABI).
 //
-// Pipeline: L3Module → (regalloc) → [code selector] → x86-64 asm string
+// Pipeline: L3Module -> (regalloc) -> [code selector] -> x86-64 asm string
 //
 // Calling convention: System V AMD64
 //   - Args: RDI, RSI, RDX, RCX, R8, R9 (first 6 integer/pointer)
@@ -13,12 +13,12 @@
 //   - Stack 16-byte aligned at call sites
 //
 // Adaptations from Rust:
-// 1. HashMap<K,V> → Vec-based maps with helper structs
-// 2. HashSet<T> → Vec<T> with contains() helper
-// 3. Option<T> → Opt* enums
-// 4. String → str
-// 5. PhysReg enum → i64 constants (from regalloc.fd)
-// 6. format! → string concatenation
+// 1. HashMap<K,V> -> Vec-based maps with helper structs
+// 2. HashSet<T> -> Vec<T> with contains() helper
+// 3. Option<T> -> Opt* enums
+// 4. String -> str
+// 5. PhysReg enum -> i64 constants (from regalloc.fd)
+// 6. format! -> string concatenation
 
 module compiler::codegen_x64;
 
@@ -30,9 +30,9 @@ use compiler::ir;
 use compiler::pir;
 use compiler::regalloc;
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Public API
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 /// Generate x86-64 assembly for an entire L3 module.
 /// Returns a string of AT&T-syntax assembly suitable for `gcc -c` or `as`.
@@ -50,11 +50,11 @@ pub fn generate_asm_with_allocs(module: L3Module, allocs: ModuleAllocation) -> s
     return gen.output;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Code generator state
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
-/// String label entry: label → content
+/// String label entry: label -> content
 pub struct StringLabelEntry {
     pub label: str,
     pub content: str,
@@ -64,7 +64,7 @@ pub fn StringLabelEntry_new(label: str, content: str) -> StringLabelEntry {
     return StringLabelEntry { label: label, content: content };
 }
 
-/// Block label entry: (func_name, block_id) → label
+/// Block label entry: (func_name, block_id) -> label
 pub struct BlockLabelEntry {
     pub func: str,
     pub block_id: i64,
@@ -75,7 +75,7 @@ pub fn BlockLabelEntry_new(func: str, block_id: i64, label: str) -> BlockLabelEn
     return BlockLabelEntry { func: func, block_id: block_id, label: label };
 }
 
-/// Vtable entry: label → list of function names
+/// Vtable entry: label -> list of function names
 pub struct VtableEntry {
     pub label: str,
     pub methods: Vec<str>,
@@ -128,7 +128,7 @@ pub fn X64CodeGen_new(allocs: ModuleAllocation) -> X64CodeGen {
     };
 }
 
-// ─── Output helpers ──────────────────────────────────────────────────────
+// --- Output helpers ------------------------------------------------------
 
 /// Append a string (no newline).
 pub fn X64CodeGen_w(self: &mut X64CodeGen, s: str) {
@@ -140,7 +140,7 @@ pub fn X64CodeGen_wl(self: &mut X64CodeGen, s: str) {
     self.output = self.output + s + "\n";
 }
 
-/// Returns true if the current function is @wrapping (F65) — overflow
+/// Returns true if the current function is @wrapping (F65) -- overflow
 /// checks should be skipped.
 pub fn X64CodeGen_is_wrapping_func(self: &X64CodeGen) -> bool {
     var i: i64 = 0;
@@ -189,7 +189,7 @@ pub fn X64CodeGen_alloc_float_const(self: &mut X64CodeGen, bits: i64) -> str {
     return label;
 }
 
-// ─── Location helpers ────────────────────────────────────────────────────
+// --- Location helpers ----------------------------------------------------
 
 /// Get the location of a VReg from the current function's allocation.
 pub fn X64CodeGen_dst_loc(self: &X64CodeGen, vreg: VReg) -> OptLocation {
@@ -267,14 +267,14 @@ pub fn X64CodeGen_epilogue_label(self: &X64CodeGen) -> str {
     return ".L" + self.current_func + "_epilogue";
 }
 
-// ─── Optional types ──────────────────────────────────────────────────────
+// --- Optional types ------------------------------------------------------
 
 pub enum OptLocation {
     Some(Location),
     None,
 }
 
-// ─── Module generation ───────────────────────────────────────────────────
+// --- Module generation ---------------------------------------------------
 
 /// Generate assembly for an entire L3 module.
 pub fn X64CodeGen_gen_module(self: &mut X64CodeGen, module: L3Module) {
@@ -321,7 +321,7 @@ pub fn X64CodeGen_gen_module(self: &mut X64CodeGen, module: L3Module) {
     while i < strings_copy.len() {
         var entry: StringLabelEntry = strings_copy.get(i);
         if str_starts_with(entry.content, "__float_bits:") {
-            // Float constant — emit as .quad with the raw bits.
+            // Float constant -- emit as .quad with the raw bits.
             var bits_str: str = str_slice(entry.content, 13, str_len(entry.content));
             var bits: i64 = str_parse_int(bits_str);
             X64CodeGen_wl(self, entry.label + ": .quad " + int_to_str(bits));
@@ -355,7 +355,7 @@ pub fn X64CodeGen_gen_module(self: &mut X64CodeGen, module: L3Module) {
     }
 }
 
-// ─── Function generation ─────────────────────────────────────────────────
+// --- Function generation -------------------------------------------------
 
 /// Generate code for a single function.
 pub fn X64CodeGen_gen_function(self: &mut X64CodeGen, f: L3Function, module: L3Module) {
@@ -401,7 +401,7 @@ pub fn X64CodeGen_gen_function(self: &mut X64CodeGen, f: L3Function, module: L3M
     X64CodeGen_wl(self, "    .type " + f.name + ", @function");
     X64CodeGen_wl(self, f.name + ":");
 
-    // ─── Prologue ───
+    // --- Prologue ---
     X64CodeGen_wl(self, "    pushq %rbp");
     X64CodeGen_wl(self, "    movq %rsp, %rbp");
     if aligned_frame > 0 {
@@ -433,17 +433,17 @@ pub fn X64CodeGen_gen_function(self: &mut X64CodeGen, f: L3Function, module: L3M
     // Move argument registers to their assigned locations.
     X64CodeGen_gen_prologue_args(self, f, module, alloc_opt);
 
-    // ─── Body ───
+    // --- Body ---
     i = 0;
     while i < f.blocks.len() {
         X64CodeGen_gen_block(self, f.blocks.get(i), module);
         i = i + 1;
     }
 
-    // ─── Epilogue (fallthrough return) ───
+    // --- Epilogue (fallthrough return) ---
     X64CodeGen_gen_epilogue(self, alloc_opt);
 
-    // ─── Panic stubs ───
+    // --- Panic stubs ---
     var stubs: Vec<PanicStub> = self.pending_panic_stubs;
     var empty_stubs: Vec<PanicStub> = Vec::new();
     self.pending_panic_stubs = empty_stubs;
@@ -526,7 +526,7 @@ pub fn X64CodeGen_gen_epilogue(self: &mut X64CodeGen, alloc_opt: OptAllocation) 
     X64CodeGen_wl(self, "    ret");
 }
 
-// ─── Block and instruction generation ────────────────────────────────────
+// --- Block and instruction generation ------------------------------------
 
 /// Generate code for a single basic block.
 pub fn X64CodeGen_gen_block(self: &mut X64CodeGen, block: L3Block, module: L3Module) {
@@ -544,7 +544,7 @@ pub fn X64CodeGen_gen_inst(self: &mut X64CodeGen, inst: L3Inst, module: L3Module
         L3Inst::Mov(dst, src) => { X64CodeGen_gen_mov(self, dst, src); }
         L3Inst::AddrOfSlot(dst, slot) => { X64CodeGen_gen_addr_of_slot(self, dst, slot); }
         L3Inst::GlobalAddr(dst, name, _) => {
-            // Module-level mutable global — emit as zero for now (x64 backend is not the primary target)
+            // Module-level mutable global -- emit as zero for now (x64 backend is not the primary target)
             X64CodeGen_wl(self, "    # globaladdr " + name);
             X64CodeGen_gen_mov(self, dst, Operand::Imm(0));
         }
@@ -584,7 +584,7 @@ pub fn X64CodeGen_gen_inst(self: &mut X64CodeGen, inst: L3Inst, module: L3Module
     }
 }
 
-// ─── Simple instruction generators ───────────────────────────────────────
+// --- Simple instruction generators ---------------------------------------
 
 /// Generate a Mov instruction.
 pub fn X64CodeGen_gen_mov(self: &mut X64CodeGen, dst: VReg, src: Operand) {
@@ -612,7 +612,7 @@ pub fn X64CodeGen_gen_mov(self: &mut X64CodeGen, dst: VReg, src: Operand) {
                 }
                 Location::Remat(_) => {
                     // F-1A: dst is a rematerializable constant. The defining
-                    // Mov is a no-op — the constant is reloaded at each use site.
+                    // Mov is a no-op -- the constant is reloaded at each use site.
                 }
             }
         }
@@ -712,7 +712,7 @@ pub fn print_func_for_type(ty: IrType) -> str {
     return "p_print_str";
 }
 
-// ─── Operand loading helpers ─────────────────────────────────────────────
+// --- Operand loading helpers ---------------------------------------------
 
 /// Load an operand into a physical register.
 pub fn X64CodeGen_gen_operand_to_reg(self: &mut X64CodeGen, op: Operand, reg: i64) {
@@ -866,7 +866,7 @@ pub fn X64CodeGen_gen_shift(self: &mut X64CodeGen, op: str, b: Operand, dst_reg:
     }
 }
 
-// ─── Binary operation generation ─────────────────────────────────────────
+// --- Binary operation generation -----------------------------------------
 
 /// Generate a binary operation instruction.
 pub fn X64CodeGen_gen_bin(self: &mut X64CodeGen, op: BinOp, dst: VReg, a: Operand, b: Operand, ty: IrType) {
@@ -1105,13 +1105,13 @@ pub fn X64CodeGen_gen_divzero_check(self: &mut X64CodeGen, b: Operand) {
     }
 }
 
-// ─── Comparison generation ───────────────────────────────────────────────
+// --- Comparison generation -----------------------------------------------
 
 /// Generate a comparison: set dst to 0 or 1 based on the comparison.
 pub fn X64CodeGen_gen_comparison(self: &mut X64CodeGen, op: BinOp, b: Operand, dst_reg: i64) {
     var dst_name: str = physreg_name(dst_reg);
 
-    // Handle logical And/Or separately — they don't use cmpq.
+    // Handle logical And/Or separately -- they don't use cmpq.
     if binop_eq(op, BinOp::And) {
         var tmp: i64 = X64CodeGen_scratch_reg(dst_reg);
         X64CodeGen_gen_operand_to_reg(self, b, tmp);
@@ -1178,7 +1178,7 @@ pub fn X64CodeGen_gen_comparison(self: &mut X64CodeGen, op: BinOp, b: Operand, d
     X64CodeGen_wl(self, "    movzbq %al, %" + dst_name);
 }
 
-// ─── Unary operation generation ──────────────────────────────────────────
+// --- Unary operation generation ------------------------------------------
 
 /// Generate a unary operation instruction.
 pub fn X64CodeGen_gen_unary(self: &mut X64CodeGen, op: UnaryOp, dst: VReg, src: Operand, ty: IrType) {
@@ -1232,7 +1232,7 @@ pub fn X64CodeGen_gen_unary(self: &mut X64CodeGen, op: UnaryOp, dst: VReg, src: 
     }
 }
 
-// ─── Branch generation ───────────────────────────────────────────────────
+// --- Branch generation ---------------------------------------------------
 
 /// Generate a conditional branch.
 pub fn X64CodeGen_gen_branch(self: &mut X64CodeGen, cond: Operand, then_b: i64, else_b: i64) {
@@ -1242,7 +1242,7 @@ pub fn X64CodeGen_gen_branch(self: &mut X64CodeGen, cond: Operand, then_b: i64, 
     X64CodeGen_wl(self, "    jmp " + X64CodeGen_block_label(self, else_b));
 }
 
-// ─── Memory operations ───────────────────────────────────────────────────
+// --- Memory operations ---------------------------------------------------
 
 /// Generate a typed load instruction.
 pub fn X64CodeGen_gen_load(self: &mut X64CodeGen, dst: VReg, ptr: Operand, ty: IrType) {
@@ -1295,7 +1295,7 @@ pub fn X64CodeGen_gen_load(self: &mut X64CodeGen, dst: VReg, ptr: Operand, ty: I
                     if dr != ptr_reg {
                         X64CodeGen_wl(self, "    " + load_op + " (%" + physreg_name(ptr_reg) + "), %" + physreg_name(dr));
                     } else {
-                        // dst and ptr are the same register — use RAX as temp.
+                        // dst and ptr are the same register -- use RAX as temp.
                         X64CodeGen_wl(self, "    " + load_op + " (%" + physreg_name(ptr_reg) + "), %rax");
                         X64CodeGen_wl(self, "    movq %rax, %" + physreg_name(dr));
                     }
@@ -1442,7 +1442,7 @@ pub fn X64CodeGen_gen_elem_addr(self: &mut X64CodeGen, dst: VReg, base: Operand,
     }
 }
 
-// ─── Call generation ─────────────────────────────────────────────────────
+// --- Call generation -----------------------------------------------------
 
 /// Generate an ABI-compliant call instruction.
 pub fn X64CodeGen_gen_call_abi(self: &mut X64CodeGen, dst: OptVReg, target: str, args: Vec<Operand>, ret_ty: IrType, module: L3Module) {
@@ -1591,8 +1591,8 @@ pub fn X64CodeGen_gen_dyn_call(self: &mut X64CodeGen, dst: OptVReg, trait_name: 
     if args.len() > 0 {
         X64CodeGen_gen_operand_to_reg(self, args.get(0), REG_RAX);
     }
-    X64CodeGen_wl(self, "    movq (%rax), %rdi    # data → rdi");
-    X64CodeGen_wl(self, "    movq 8(%rax), %r11   # vtable → r11");
+    X64CodeGen_wl(self, "    movq (%rax), %rdi    # data -> rdi");
+    X64CodeGen_wl(self, "    movq 8(%rax), %r11   # vtable -> r11");
     X64CodeGen_wl(self, "    call *" + int_to_str(method_idx * 8) + "(%r11)");
 
     match dst {
@@ -1746,7 +1746,7 @@ pub fn X64CodeGen_gen_try_unwrap(self: &mut X64CodeGen, value: Operand, ok_dst: 
     X64CodeGen_wl(self, "    jmp " + X64CodeGen_block_label(self, ok_block));
 }
 
-// ─── SIMD helpers ────────────────────────────────────────────────────────
+// --- SIMD helpers --------------------------------------------------------
 
 /// Handle SIMD intrinsic calls. Returns true if the call was handled.
 pub fn X64CodeGen_handle_simd_intrinsic(self: &mut X64CodeGen, dst: OptVReg, target: str, args: Vec<Operand>) -> bool {
@@ -1857,9 +1857,9 @@ pub fn X64CodeGen_gen_operand_to_xmm(self: &mut X64CodeGen, op: Operand, reg: i6
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Helper functions
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 /// x86-64 sub-register names for 1/2/4-byte accesses.
 pub fn sub_reg_name(reg: i64, size: i64) -> str {

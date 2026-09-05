@@ -1,4 +1,4 @@
-// ir.fd — Fides IR types, rewritten from src/ir.rs (1761 LOC Rust)
+// ir.fd -- Fides IR types, rewritten from src/ir.rs (1761 LOC Rust)
 //
 // This module defines the typed SSA IR used by the Fides compiler:
 // - IrType: IR-level types (simpler than AST types)
@@ -6,13 +6,13 @@
 // - Region: memory region annotations
 // - Inst: IR instructions (~40 variants)
 // - BasicBlock, IrFunction, IrModule: IR structure
-// - lower_type: AST → IR type lowering
+// - lower_type: AST -> IR type lowering
 // - Verification pass
 //
 // Adaptations from Rust:
 // 1. String -> str, usize/u32/u64 -> i64
 // 2. HashMap<K,V> -> Vec-based maps with helper structs (Fides HashMap is
-//    i64→i64 only; Vec+linear search is simpler for type definitions)
+//    i64->i64 only; Vec+linear search is simpler for type definitions)
 // 3. Option<T> for non-i64 -> Opt* enums or -1 sentinel
 // 4. Vec<(A,B)> -> helper structs (ValuePair, StringValuePair, etc.)
 // 5. struct-style enum variants -> tuple-style (Fides convention)
@@ -28,7 +28,7 @@ use vec;
 use string;
 use compiler::ast;
 
-// ─── Local helper: Vec<str> contains ─────────────────────────────────────
+// --- Local helper: Vec<str> contains -------------------------------------
 fn ir_c_str_vec_contains(vec: Vec<str>, s: str) -> bool {
     var i: i64 = 0;
     while i < vec.len() {
@@ -38,7 +38,7 @@ fn ir_c_str_vec_contains(vec: Vec<str>, s: str) -> bool {
     return false;
 }
 
-// ─── Helper structs for Vec<(A, B)> fields ──────────────────────────────
+// --- Helper structs for Vec<(A, B)> fields ------------------------------
 
 pub struct ValueIdType {
     pub id: i64,
@@ -114,7 +114,7 @@ pub fn IrStringValueIdEntry_new(name: str, id: i64) -> IrStringValueIdEntry {
     return IrStringValueIdEntry { name: name, id: id };
 }
 
-// ─── Optional-value enums ────────────────────────────────────────────────
+// --- Optional-value enums ------------------------------------------------
 
 pub enum OptIrType {
     Some(IrType),
@@ -163,7 +163,7 @@ pub enum OptIrModule {
     None,
 }
 
-// ─── IR Types ────────────────────────────────────────────────────────────
+// --- IR Types ------------------------------------------------------------
 
 pub enum IrType {
     I8,
@@ -186,7 +186,7 @@ pub enum IrType {
     Generic(str, Vec<IrType>),
 }
 
-// ─── IrType methods ──────────────────────────────────────────────────────
+// --- IrType methods ------------------------------------------------------
 
 pub fn ir_type_size(t: IrType) -> i64 {
     match t {
@@ -215,7 +215,7 @@ pub fn ir_type_size(t: IrType) -> i64 {
     return 0;
 }
 
-// Box<IrType> variant — Fides auto-unboxes in match patterns.
+// Box<IrType> variant -- Fides auto-unboxes in match patterns.
 pub fn box_ir_type_size(b: Box<IrType>) -> i64 {
     match b {
         IrType::I8 => { return 1; }
@@ -663,7 +663,7 @@ pub fn ir_type_bit_width(t: IrType) -> OptU64 {
     return OptU64::None;
 }
 
-// ─── IrType Display ──────────────────────────────────────────────────────
+// --- IrType Display ------------------------------------------------------
 
 pub fn ir_type_to_str(t: IrType) -> str {
     match t {
@@ -753,7 +753,7 @@ pub fn box_ir_type_to_str(b: Box<IrType>) -> str {
     return "?";
 }
 
-// ─── Effects ─────────────────────────────────────────────────────────────
+// --- Effects -------------------------------------------------------------
 
 pub enum Effect {
     Alloc,
@@ -800,7 +800,7 @@ pub fn effect_eq(a: Effect, b: Effect) -> bool {
     return false;
 }
 
-// ─── EffectSet ───────────────────────────────────────────────────────────
+// --- EffectSet -----------------------------------------------------------
 
 pub struct EffectSet {
     pub effects: Vec<Effect>,
@@ -889,7 +889,7 @@ pub fn EffectSet_to_str(self: &EffectSet) -> str {
     return result;
 }
 
-// ─── Regions ─────────────────────────────────────────────────────────────
+// --- Regions -------------------------------------------------------------
 
 pub enum Region {
     Stack,
@@ -924,7 +924,7 @@ pub fn region_eq(a: Region, b: Region) -> bool {
     return false;
 }
 
-// ─── BorrowKind ──────────────────────────────────────────────────────────
+// --- BorrowKind ----------------------------------------------------------
 
 pub enum BorrowKind {
     None,
@@ -941,7 +941,7 @@ pub fn borrow_kind_eq(a: BorrowKind, b: BorrowKind) -> bool {
     return false;
 }
 
-// ─── SSA Value / Block IDs ───────────────────────────────────────────────
+// --- SSA Value / Block IDs -----------------------------------------------
 
 pub fn value_id_to_str(id: i64) -> str {
     return "%" + int_to_str(id);
@@ -951,7 +951,7 @@ pub fn block_id_to_str(id: i64) -> str {
     return "bb" + int_to_str(id);
 }
 
-// ─── ValueMeta ───────────────────────────────────────────────────────────
+// --- ValueMeta -----------------------------------------------------------
 
 pub struct ValueMeta {
     pub ty: IrType,
@@ -987,81 +987,81 @@ pub fn ValueMeta_with_type(old: ValueMeta, new_ty: IrType) -> ValueMeta {
     };
 }
 
-// ─── Instructions ────────────────────────────────────────────────────────
+// --- Instructions --------------------------------------------------------
 // All struct-style enum variants converted to tuple-style (Fides convention).
 
 pub enum Inst {
-    // ─── Constants ───
+    // --- Constants ---
     ConstInt(i64, IrType),
     ConstFloat(f64, IrType),
     ConstBool(bool),
     ConstStr(str),
     ConstNull(IrType),
 
-    // ─── Globals ───
+    // --- Globals ---
     // Get the address of a module-level mutable global variable.
     // Returns a pointer that can be used with Load/Store.
     GlobalAddr(str, IrType),
 
-    // ─── Arithmetic ───
+    // --- Arithmetic ---
     BinOp(BinOp, i64, i64, IrType),
     UnaryOp(UnaryOp, i64, IrType),
 
-    // ─── Memory ───
+    // --- Memory ---
     Alloca(IrType, Region),
     Load(i64, IrType),
     Store(i64, i64, OptIrType),
     GetFieldPtr(i64, i64, IrType),
     GetElemPtr(i64, i64, IrType),
 
-    // ─── Control Flow ───
+    // --- Control Flow ---
     Jump(i64),
     Branch(i64, i64, i64),
     Return(OptValueId),
     Unreachable,
 
-    // ─── Function Calls ───
+    // --- Function Calls ---
     Call(str, Vec<i64>, IrType, EffectSet),
     CallPtr(i64, Vec<i64>, IrType, EffectSet, bool),
     DynCall(str, str, Vec<i64>, IrType, EffectSet),
     MakeDyn(i64, str, str),
 
-    // ─── Conversions ───
+    // --- Conversions ---
     BitCast(i64, IrType, IrType),
     IntExtend(i64, IrType, IrType),
     IntTrunc(i64, IrType, IrType),
     IntToFloat(i64, IrType, IrType),
     FloatToInt(i64, IrType, IrType),
 
-    // ─── Fides-Specific ───
+    // --- Fides-Specific ---
     TryUnwrap(i64, i64, i64, i64),
     Print(i64, IrType),
     Panic(str),
     Asm(str, Vec<StringValueId>, Vec<StringValueId>, IrType),
 
-    // ─── Region Management ───
+    // --- Region Management ---
     RegionBegin(str, bool, bool, OptU64),
     RegionEnd(str, bool, bool),
 
-    // ─── Persist Variables ───
+    // --- Persist Variables ---
     PersistLoad(str, i64, IrType),
     PersistSave(str, i64),
 
-    // ─── Transaction Blocks ───
+    // --- Transaction Blocks ---
     TxnBegin,
     TxnEnd,
 
-    // ─── Unsafe Blocks ───
+    // --- Unsafe Blocks ---
     UnsafeBegin,
     UnsafeEnd,
 
-    // ─── Autograd ───
+    // --- Autograd ---
     GradBegin(str),
     GradEnd,
     Backward(i64),
 }
 
-// ─── Inst methods ────────────────────────────────────────────────────────
+// --- Inst methods --------------------------------------------------------
 
 pub fn inst_result_type(inst: Inst) -> IrType {
     match inst {
@@ -1311,7 +1311,7 @@ pub fn inst_value_refs(inst: &Inst) -> Vec<i64> {
     return refs;
 }
 
-// ─── BasicBlock ──────────────────────────────────────────────────────────
+// --- BasicBlock ----------------------------------------------------------
 
 pub struct BasicBlock {
     pub id: i64,
@@ -1329,7 +1329,7 @@ pub fn BasicBlock_new(id: i64) -> BasicBlock {
     };
 }
 
-// ─── IrFunction ──────────────────────────────────────────────────────────
+// --- IrFunction ----------------------------------------------------------
 // HashMap<K,V> replaced with Vec-based storage + lookup helpers.
 
 pub struct IrFunction {
@@ -1505,9 +1505,9 @@ pub fn IrFunction_get_meta(self: &IrFunction, id: i64) -> OptValueMeta {
     return OptValueMeta::None;
 }
 
-// ─── Optional Inst / ValueMeta enums ─────────────────────────────────────
+// --- Optional Inst / ValueMeta enums -------------------------------------
 
-// ─── StructLayout ────────────────────────────────────────────────────────
+// --- StructLayout --------------------------------------------------------
 
 pub struct StructLayout {
     pub name: str,
@@ -1525,7 +1525,7 @@ pub fn StructLayout_new(name: str) -> StructLayout {
     };
 }
 
-// ─── SourceMap ───────────────────────────────────────────────────────────
+// --- SourceMap -----------------------------------------------------------
 
 pub struct SourceEntry {
     pub function: str,
@@ -1566,7 +1566,7 @@ pub fn SourceMap_lookup(self: &SourceMap, function: str, value_id: i64) -> OptU6
 pub fn SourceMap_to_str(self: &SourceMap) -> str {
     var out: str = "Source Map:\n";
     out = out + "  Function           Value  Line  Instruction\n";
-    out = out + "  ─────────────────  ─────  ────  ────────────\n";
+    out = out + "  -----------------  -----  ----  ------------\n";
     var i: i64 = 0;
     while i < self.entries.len() {
         var e: SourceEntry = self.entries.get(i);
@@ -1576,7 +1576,7 @@ pub fn SourceMap_to_str(self: &SourceMap) -> str {
     return out;
 }
 
-// ─── IrModule ────────────────────────────────────────────────────────────
+// --- IrModule ------------------------------------------------------------
 // HashMap<K,V> replaced with Vec-based storage + lookup helpers.
 
 pub struct IrModule {
@@ -1589,7 +1589,7 @@ pub struct IrModule {
     pub trait_methods: Vec<StringVecStr>,
     pub trait_impls: Vec<StringVecStr>,
     pub linear_structs: Vec<str>,
-    // Module-level mutable global variables: maps name → (type, initializer expr)
+    // Module-level mutable global variables: maps name -> (type, initializer expr)
     pub globals: Vec<GlobalEntry>,
 }
 
@@ -1629,7 +1629,7 @@ pub fn StringEffectSetEntry_new(name: str, effects: EffectSet) -> StringEffectSe
     return StringEffectSetEntry { name: name, effects: effects };
 }
 
-// Global variable entry: name → (type, initializer expression)
+// Global variable entry: name -> (type, initializer expression)
 pub struct GlobalEntry {
     pub name: str,
     pub ty: IrType,
@@ -1766,7 +1766,7 @@ pub fn IrModule_replace_function(self: &mut IrModule, func: IrFunction) {
         }
         i = i + 1;
     }
-    // Not found — add it
+    // Not found -- add it
     self.functions.push(IrFunctionEntry_new(func.name, func));
 }
 
@@ -1781,7 +1781,7 @@ pub fn IrModule_replace_function_named(self: &mut IrModule, func: IrFunction, na
         }
         i = i + 1;
     }
-    // Not found — add it
+    // Not found -- add it
     self.functions.push(IrFunctionEntry_new(name, func));
 }
 
@@ -1796,7 +1796,7 @@ pub fn IrModule_get_function(self: &IrModule, name: str) -> OptIrFunction {
     return OptIrFunction::None;
 }
 
-// ─── Type Lowering (AST → IR) ────────────────────────────────────────────
+// --- Type Lowering (AST -> IR) --------------------------------------------
 
 pub fn lower_type(ast_ty: Type) -> IrType {
     match ast_ty {
@@ -1920,7 +1920,7 @@ pub fn box_lower_type(b: Box<Type>) -> IrType {
     return IrType::Void;
 }
 
-// ─── Constant Folding ───────────────────────────────────────────────────
+// --- Constant Folding ---------------------------------------------------
 
 pub fn IrModule_optimize(self: &mut IrModule) -> i64 {
     var total: i64 = 0;
@@ -2192,7 +2192,7 @@ fn eval_binop_int(op: BinOp, l: i64, r: i64, ty: IrType) -> OptU64 {
     return OptU64::Some(result);
 }
 
-// ─── IR Verification ─────────────────────────────────────────────────────
+// --- IR Verification -----------------------------------------------------
 
 pub struct VerificationResult {
     pub errors: Vec<str>,
@@ -2363,14 +2363,14 @@ fn vec_contains(v: Vec<i64>, val: i64) -> bool {
     return false;
 }
 
-// ─── IR Printing ─────────────────────────────────────────────────────────
+// --- IR Printing ---------------------------------------------------------
 
 pub fn IrModule_to_str(self: &IrModule) -> str {
     var out: str = "";
 
     // Struct layouts
     if self.struct_layouts.len() > 0 {
-        out = out + "; ─── Struct Layouts ───\n";
+        out = out + "; --- Struct Layouts ---\n";
         var i: i64 = 0;
         while i < self.struct_layouts.len() {
             var layout: StructLayout = self.struct_layouts.get(i).layout;
@@ -2389,7 +2389,7 @@ pub fn IrModule_to_str(self: &IrModule) -> str {
 
     // String constants
     if self.string_constants.len() > 0 {
-        out = out + "; ─── String Constants ───\n";
+        out = out + "; --- String Constants ---\n";
         var i: i64 = 0;
         while i < self.string_constants.len() {
             var e: StringStringEntry = self.string_constants.get(i);
@@ -2401,7 +2401,7 @@ pub fn IrModule_to_str(self: &IrModule) -> str {
 
     // External functions
     if self.extern_functions.len() > 0 {
-        out = out + "; ─── External Functions ───\n";
+        out = out + "; --- External Functions ---\n";
         var i: i64 = 0;
         while i < self.extern_functions.len() {
             var e: StringVecIrType = self.extern_functions.get(i);
@@ -2424,7 +2424,7 @@ pub fn IrModule_to_str(self: &IrModule) -> str {
         var entry: IrFunctionEntry = self.functions.get(i);
         var func: IrFunction = entry.func;
         var name: str = entry.name;
-        out = out + "; ─── Function: " + name + " ───\n";
+        out = out + "; --- Function: " + name + " ---\n";
 
         var param_strs: str = "";
         var j: i64 = 0;
@@ -2494,7 +2494,7 @@ pub fn IrModule_to_str(self: &IrModule) -> str {
     return out;
 }
 
-// ─── SourceMap generation ────────────────────────────────────────────────
+// --- SourceMap generation ------------------------------------------------
 
 pub fn IrModule_source_map(self: &IrModule) -> SourceMap {
     var map: SourceMap = SourceMap_new();

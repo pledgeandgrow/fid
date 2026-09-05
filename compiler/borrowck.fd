@@ -1,4 +1,4 @@
-// borrowck.fd — Borrow checker for Fides, rewritten from src/borrowck.rs (1221 LOC)
+// borrowck.fd -- Borrow checker for Fides, rewritten from src/borrowck.rs (1221 LOC)
 //
 // Runs as a separate pass AFTER typechecking succeeds and BEFORE comptime
 // substitution / monomorphization. Catches three classes of bugs at zero
@@ -17,15 +17,15 @@
 // last use rather than at scope end.
 //
 // Adaptations from Rust:
-// 1. HashMap<K,V> → Vec-based maps with helper structs (Fides HashMap is i64→i64)
-// 2. HashSet<T> → Vec<T> with contains() helper
-// 3. String → str, usize → i64
-// 4. Option<T> → OptStr / custom Opt enums
+// 1. HashMap<K,V> -> Vec-based maps with helper structs (Fides HashMap is i64->i64)
+// 2. HashSet<T> -> Vec<T> with contains() helper
+// 3. String -> str, usize -> i64
+// 4. Option<T> -> OptStr / custom Opt enums
 // 5. Box<Expr> auto-unboxes in match patterns
-// 6. format! → string concatenation with int_to_str
-// 7. .clone() → not needed (Fides values are copied by value)
-// 8. matches! macro → explicit match with _ => false
-// 9. No module-level mutable state → mode passed as parameter / stored in struct
+// 6. format! -> string concatenation with int_to_str
+// 7. .clone() -> not needed (Fides values are copied by value)
+// 8. matches! macro -> explicit match with _ => false
+// 9. No module-level mutable state -> mode passed as parameter / stored in struct
 //
 // Dependencies: compiler::ast
 
@@ -36,10 +36,10 @@ use vec;
 use string;
 use compiler::ast;
 
-// ─── Vec-based map entry structs ──────────────────────────────────────────
+// --- Vec-based map entry structs ------------------------------------------
 // These replace HashMap<String, T> with Vec<Entry> + linear search.
 
-// shared_borrows: var → set of borrowers (Vec<str>)
+// shared_borrows: var -> set of borrowers (Vec<str>)
 pub struct SharedBorrowEntry {
     pub key: str,
     pub borrowers: Vec<str>,
@@ -49,7 +49,7 @@ pub fn SharedBorrowEntry_new(key: str) -> SharedBorrowEntry {
     return SharedBorrowEntry { key: key, borrowers: Vec::new() };
 }
 
-// mut_borrow: var → optional single borrower
+// mut_borrow: var -> optional single borrower
 pub struct MutBorrowEntry {
     pub key: str,
     pub borrower: OptStr,
@@ -59,7 +59,7 @@ pub fn MutBorrowEntry_new(key: str, borrower: OptStr) -> MutBorrowEntry {
     return MutBorrowEntry { key: key, borrower: borrower };
 }
 
-// borrow_of: borrower → (borrowed_var, is_mut)
+// borrow_of: borrower -> (borrowed_var, is_mut)
 pub struct BorrowOfEntry {
     pub borrower: str,
     pub borrowed: str,
@@ -81,7 +81,7 @@ pub fn ReservedMutBorrow_new(path: str, borrower: str, line: i64) -> ReservedMut
     return ReservedMutBorrow { path: path, borrower: borrower, line: line };
 }
 
-// last_use: var → last statement index
+// last_use: var -> last statement index
 pub struct StringI64Entry {
     pub key: str,
     pub val: i64,
@@ -100,7 +100,7 @@ pub fn StringVec_new() -> StringVec {
     return StringVec { items: Vec::new() };
 }
 
-// ─── Box unbox helper ────────────────────────────────────────────────────
+// --- Box unbox helper ----------------------------------------------------
 // Fides match patterns on Box<Expr> auto-unbox for matching, but the extracted
 // fields are still Box<Expr>. This helper converts Box<Expr> back to Expr
 // for passing to functions that expect unboxed values.
@@ -149,7 +149,7 @@ pub fn box_expr_unbox(b: Box<Expr>) -> Expr {
     return Expr::IntLit(0);
 }
 
-// ─── BorrowckMode ─────────────────────────────────────────────────────────
+// --- BorrowckMode ---------------------------------------------------------
 // Borrow checker mode, controlled by --borrowck=off|warn|on.
 // 0 = Off, 1 = Warn, 2 = On. Default is 2 (On).
 
@@ -181,19 +181,19 @@ pub enum OptBorrowckMode {
     None,
 }
 
-// ─── BorrowChecker struct ─────────────────────────────────────────────────
+// --- BorrowChecker struct -------------------------------------------------
 // Holds maps that together encode the borrow state of every variable in the
 // current function.
 
 pub struct BorrowChecker {
-    // var → set of variables currently holding a shared borrow (&x) of it.
+    // var -> set of variables currently holding a shared borrow (&x) of it.
     pub shared_borrows: Vec<SharedBorrowEntry>,
 
-    // var → the single variable currently holding a mutable borrow (&mut x).
+    // var -> the single variable currently holding a mutable borrow (&mut x).
     // OptStr::None means no active mutable borrow.
     pub mut_borrow: Vec<MutBorrowEntry>,
 
-    // borrower → (borrowed_var, is_mut). Used to release a borrow when the
+    // borrower -> (borrowed_var, is_mut). Used to release a borrow when the
     // borrower goes out of scope or is reassigned.
     pub borrow_of: Vec<BorrowOfEntry>,
 
@@ -210,7 +210,7 @@ pub struct BorrowChecker {
     // Counter for synthetic temporary borrower names (e.g. __tmp_ref_0).
     pub temp_counter: i64,
 
-    // Stack of checkpoints — each records temp_counter at the start of a
+    // Stack of checkpoints -- each records temp_counter at the start of a
     // Call/MethodCall. After the call, all temps >= checkpoint are released.
     pub temp_checkpoints: Vec<i64>,
 
@@ -233,7 +233,7 @@ pub struct BorrowChecker {
     // Collected warnings (populated in Warn mode).
     pub warnings: Vec<str>,
 
-    // Active mode — controls whether violations become errors or warnings.
+    // Active mode -- controls whether violations become errors or warnings.
     pub mode: BorrowckMode,
 }
 
@@ -260,11 +260,11 @@ pub fn BorrowChecker_new(mode: BorrowckMode) -> BorrowChecker {
     };
 }
 
-// ─── Check entry points ───────────────────────────────────────────────────
+// --- Check entry points ---------------------------------------------------
 
 // Check an entire program. Walks every function and impl method body.
 pub fn check(self: &mut BorrowChecker, program: Program) -> void {
-    // Skip entirely when borrow checking is off — the full analysis walks
+    // Skip entirely when borrow checking is off -- the full analysis walks
     // every statement with O(n) linear searches and is extremely slow on
     // large programs (e.g. the stdlib). In Off mode, violations are already
     // no-ops, so skipping the walk is safe.
@@ -293,7 +293,7 @@ pub fn check(self: &mut BorrowChecker, program: Program) -> void {
 
 // Check a single function. Resets all borrow state between functions.
 pub fn check_func(self: &mut BorrowChecker, func: Func) -> void {
-    // Reset state — borrows don't cross function boundaries.
+    // Reset state -- borrows don't cross function boundaries.
     self.shared_borrows.clear();
     self.mut_borrow.clear();
     self.borrow_of.clear();
@@ -334,12 +334,12 @@ pub fn check_func(self: &mut BorrowChecker, func: Func) -> void {
         i = i + 1;
     }
 
-    // Pop the function scope — releases any remaining borrows.
+    // Pop the function scope -- releases any remaining borrows.
     pop_scope(self);
     self.current_func = OptStr::None;
 }
 
-// ─── Phase 6: NLL pre-pass ────────────────────────────────────────────────
+// --- Phase 6: NLL pre-pass ------------------------------------------------
 
 // Compute the last statement index that references each variable.
 fn compute_last_use(self: &mut BorrowChecker, body: Vec<Stmt>) -> void {
@@ -357,7 +357,7 @@ fn collect_var_uses_stmt(self: &mut BorrowChecker, stmt: Stmt, idx: i64) -> void
     match stmt {
         Stmt::Let(name, _, expr, _, _, _) => {
             collect_var_uses_expr(self, expr, idx);
-            // Do NOT set last_use for the defined name — a definition is
+            // Do NOT set last_use for the defined name -- a definition is
             // not a "use" in NLL.  The borrow should persist until the
             // borrower is actually READ, not just defined.  If the borrower
             // is never read, the borrow persists until scope end.
@@ -367,10 +367,10 @@ fn collect_var_uses_stmt(self: &mut BorrowChecker, stmt: Stmt, idx: i64) -> void
             // Do NOT set last_use for the defined names (same reasoning).
         }
         Stmt::LetUninit(name, _, _) => {
-            // Do NOT set last_use — the variable is declared but not used.
+            // Do NOT set last_use -- the variable is declared but not used.
         }
         Stmt::Assign(target, _, expr, _) => {
-            // Do NOT set last_use for the target — an assignment is a
+            // Do NOT set last_use for the target -- an assignment is a
             // write, not a read.  Only reads extend the borrow lifetime.
             collect_var_uses_expr(self, expr, idx);
         }
@@ -727,7 +727,7 @@ fn collect_var_uses_expr(self: &mut BorrowChecker, expr: Expr, idx: i64) -> void
     }
 }
 
-// ─── last_use helper ──────────────────────────────────────────────────────
+// --- last_use helper ------------------------------------------------------
 
 // Set the last-use index for a variable. If it already exists, update it.
 fn last_use_set(self: &mut BorrowChecker, name: str, idx: i64) -> void {
@@ -754,10 +754,10 @@ fn last_use_get(self: &BorrowChecker, name: str) -> i64 {
     return -1;
 }
 
-// ─── Phase 6: NLL — release dead borrows ──────────────────────────────────
+// --- Phase 6: NLL -- release dead borrows ----------------------------------
 
 // Release borrows for borrowers whose last use was before the current
-// statement index. This is the core of NLL — borrows end at the borrower's
+// statement index. This is the core of NLL -- borrows end at the borrower's
 // last use, not at scope end.
 fn release_dead_borrows(self: &mut BorrowChecker) -> void {
     var current_idx: i64 = self.stmt_index;
@@ -782,7 +782,7 @@ fn release_dead_borrows(self: &mut BorrowChecker) -> void {
     }
 }
 
-// ─── Scope management ─────────────────────────────────────────────────────
+// --- Scope management -----------------------------------------------------
 
 fn push_scope(self: &mut BorrowChecker) -> void {
     var scope: StringVec = StringVec_new();
@@ -796,7 +796,7 @@ fn pop_scope(self: &mut BorrowChecker) -> void {
         while i < dead.items.len() {
             var name: str = dead.items.get(i);
             release_borrow_by(self, name);
-            // The variable itself is gone — any borrows ON it are stale.
+            // The variable itself is gone -- any borrows ON it are stale.
             shared_borrows_remove(self, name);
             mut_borrow_remove(self, name);
             i = i + 1;
@@ -901,7 +901,7 @@ fn release_shared_temps_since(self: &mut BorrowChecker, checkpoint: i64) -> void
     }
 }
 
-// ─── extract_field_path ───────────────────────────────────────────────────
+// --- extract_field_path ---------------------------------------------------
 
 // Extract a field path from an expression. Returns Some("s.x.y") for s.x.y,
 // Some("s") for s, and None for anything else.
@@ -919,7 +919,7 @@ fn extract_field_path(expr: Expr) -> OptStr {
     }
 }
 
-// ─── Borrow state queries ─────────────────────────────────────────────────
+// --- Borrow state queries -------------------------------------------------
 
 fn has_shared_borrow(self: &BorrowChecker, var: str) -> bool {
     var i: i64 = 0;
@@ -1007,7 +1007,7 @@ fn has_mut_borrow_on_prefix(self: &BorrowChecker, path: str) -> bool {
     return false;
 }
 
-// ─── shared_borrows / mut_borrow map helpers ──────────────────────────────
+// --- shared_borrows / mut_borrow map helpers ------------------------------
 
 fn shared_borrows_remove(self: &mut BorrowChecker, key: str) -> void {
     var i: i64 = 0;
@@ -1116,14 +1116,14 @@ fn borrow_of_add(self: &mut BorrowChecker, borrower: str, borrowed: str, is_mut:
     self.borrow_of.push(BorrowOfEntry_new(borrower, borrowed, is_mut));
 }
 
-// ─── The three rules ──────────────────────────────────────────────────────
+// --- The three rules ------------------------------------------------------
 
 // Rule 1 & 2: creating a borrow. is_mut true = &mut x, false = &x.
 // borrowed_path is a field path like "s" or "s.x" or "s.inner.z".
 fn create_borrow(self: &mut BorrowChecker, borrowed_path: str, borrower: str, is_mut: bool, line: i64) -> void {
     if is_mut {
         // Phase 4: Two-phase borrows. If in reservation phase, don't activate
-        // the &mut yet — just reserve it.
+        // the &mut yet -- just reserve it.
         if self.in_reservation_phase {
             // Check for conflicts with EXISTING active borrows.
             if has_shared_borrow_inclusive(self, borrowed_path)
@@ -1151,7 +1151,7 @@ fn create_borrow(self: &mut BorrowChecker, borrowed_path: str, borrower: str, is
                 }
                 i = i + 1;
             }
-            // Reserve the borrow — don't activate it yet.
+            // Reserve the borrow -- don't activate it yet.
             self.reserved_mut_borrows.push(ReservedMutBorrow_new(borrowed_path, borrower, line));
             borrow_of_add(self, borrower, borrowed_path, is_mut);
             return;
@@ -1217,7 +1217,7 @@ fn check_mutation(self: &mut BorrowChecker, var: str, line: i64) -> void {
     }
 }
 
-// ─── Violation reporting ──────────────────────────────────────────────────
+// --- Violation reporting --------------------------------------------------
 
 fn violation(self: &mut BorrowChecker, line: i64, msg: str) -> void {
     var full: str = "";
@@ -1236,7 +1236,7 @@ fn violation(self: &mut BorrowChecker, line: i64, msg: str) -> void {
     }
 }
 
-// ─── Statement walker ─────────────────────────────────────────────────────
+// --- Statement walker -----------------------------------------------------
 
 fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
     match stmt {
@@ -1260,7 +1260,7 @@ fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
             declare_var(self, name);
         }
         Stmt::Assign(target, _, expr, line) => {
-            // Mutating target — Rule 3.
+            // Mutating target -- Rule 3.
             check_mutation(self, target, line);
             // If target was itself a borrower, release its old borrow BEFORE
             // checking the RHS.
@@ -1271,7 +1271,7 @@ fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
             maybe_record_borrow_from_expr(self, target, expr, line);
         }
         Stmt::IndexAssign(array, index, _, expr, line) => {
-            // Mutating array — Rule 3.
+            // Mutating array -- Rule 3.
             check_mutation(self, array, line);
             check_expr(self, index);
             check_expr(self, expr);
@@ -1520,7 +1520,7 @@ fn check_stmt(self: &mut BorrowChecker, stmt: Stmt) -> void {
     }
 }
 
-// ─── Expression walker ────────────────────────────────────────────────────
+// --- Expression walker ----------------------------------------------------
 
 fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
     match expr {
@@ -1536,7 +1536,7 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
         Expr::Unary(_, e) => { check_expr(self, box_expr_unbox(e)); }
         Expr::Call(_, args) => {
             // Phase 4: Two-phase borrows. Evaluate all arguments in
-            // "reservation" mode — &mut borrows are reserved, not activated.
+            // "reservation" mode -- &mut borrows are reserved, not activated.
             var checkpoint: i64 = self.temp_counter;
             var prev_reservation: bool = self.in_reservation_phase;
             self.in_reservation_phase = true;
@@ -1691,7 +1691,7 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
         }
         Expr::Ref(inner, is_mut) => {
             // Creating a reference. The borrowed variable is the inner
-            // expression — either a simple Ident (&x) or a field path
+            // expression -- either a simple Ident (&x) or a field path
             // (&s.x.y). Field paths allow simultaneous borrows of different
             // fields (e.g. &s.x and &s.y coexist).
             check_expr(self, box_expr_unbox(inner));
@@ -1736,7 +1736,7 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
         Expr::Spawn(e) => { check_expr(self, box_expr_unbox(e)); }
         Expr::Closure(_, body, _) => {
             // Closures capture variables from the enclosing scope. Check the
-            // body in a new scope — captured variables are treated as
+            // body in a new scope -- captured variables are treated as
             // borrowed from the outer scope.
             push_scope(self);
             var b: i64 = 0;
@@ -1746,13 +1746,13 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
             }
             pop_scope(self);
         }
-        // Other expression variants — recurse into children if any.
+        // Other expression variants -- recurse into children if any.
         // Fallback: nothing to do for leaf expressions we haven't matched.
         _ => {}
     }
 }
 
-// ─── maybe_record_borrow_from_expr ────────────────────────────────────────
+// --- maybe_record_borrow_from_expr ----------------------------------------
 
 // If expr is a Ref expression, record the borrow with name as the borrower.
 // Called from Stmt::Let after the variable is declared. This "promotes" the
@@ -1784,7 +1784,7 @@ fn maybe_record_borrow_from_expr(self: &mut BorrowChecker, name: str, expr: Expr
     }
 }
 
-// ─── pattern_bindings ─────────────────────────────────────────────────────
+// --- pattern_bindings -----------------------------------------------------
 
 // Extract variable names bound by a match pattern.
 pub fn pattern_bindings(p: Pattern) -> Vec<str> {
@@ -1810,7 +1810,7 @@ pub fn pattern_bindings(p: Pattern) -> Vec<str> {
     }
 }
 
-// ─── str_to_lower helper ──────────────────────────────────────────────────
+// --- str_to_lower helper --------------------------------------------------
 
 // Convert a string to lowercase (ASCII only).
 pub fn str_to_lower(s: str) -> str {
@@ -1820,7 +1820,7 @@ pub fn str_to_lower(s: str) -> str {
     while i < len {
         var b: i64 = String_byte_at(s, i);
         if b >= 65 && b <= 90 {
-            // 'A' = 65, 'Z' = 90 → add 32 for lowercase
+            // 'A' = 65, 'Z' = 90 -> add 32 for lowercase
             b = b + 32;
         }
         result = result + char_to_str(b);

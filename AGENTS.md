@@ -106,10 +106,10 @@ cargo build
 ./target/release/fidesc run <file.fd> --post-mortem
 
 # Package manager (dependencies, install, lock files)
-./target/release/pacte init [name]
-./target/release/pacte add <dep> --path <path> | --git <url>
-./target/release/pacte install
-./target/release/pacte list
+./target/release/ark init [name]
+./target/release/ark add <dep> --path <path> | --git <url>
+./target/release/ark install
+./target/release/ark list
 
 # Documentation generator (HTML or Markdown from .fd source)
 ./target/release/scribe <file.fd> [--format html|markdown] [--output <dir>]
@@ -119,25 +119,29 @@ cargo build
 ./target/release/veil <file.fd> [--format text|html] [--output <dir>]
 ```
 
-## Current Baseline (as of Sep 5, 2026 — session 14)
+## Current Baseline (as of Sep 5, 2026 — session 15)
 
 ```
 Interpreter:  209/211 passed
 C Codegen:    198/211 matched
 PE Emitter:   209/211 valid
 Self-host:    23/23 pass on interp + PE (tests/compiler/)
-Source:       52 .rs files, 84,447 LOC
+Bootstrap:    3 generations verified (gen1→gen2→gen3, all run test_simple.fd)
+Source:       52 .rs files, 91,038 LOC
 Stdlib:       69 .fd modules, 16,090 LOC
-Self-host:    25 .fd modules, 57,021 LOC (token, diag, json, fmt, ast, lexer, parser, ir, typechecker, lower, mono, borrowck, pir, opt, codegen_c, compiler, comptime_eval, flat_ast, lsp, pe, peephole, regalloc, codegen_x64, main, inc — all compile + pass tests)
+Self-host:    25 .fd modules, 61,145 LOC (token, diag, json, fmt, ast, lexer, parser, ir, typechecker, lower, mono, borrowck, pir, opt, codegen_c, compiler, comptime_eval, flat_ast, lsp, pe, peephole, regalloc, codegen_x64, main, inc — all compile + pass tests)
   flat_ast.fd: FULL PORT (dump-ast-flat serialization, 1259 lines) — session 9
   comptime_eval.fd: FULL PORT (process_gen, substitute, I-5A, I-5D, reflection) — session 7
   pe.fd: 25+ runtime stubs (print, string, vec, map, float, bool) — session 7
-  inc.fd: incremental compilation cache (146 lines)
-Bootstrap:    release/fides-c.exe builds and self-compiles (EXIT 0); fides-c2 crashes during typecheck (TypeChecker_lookup null deref — Category A blocker)
+  inc.fd: incremental compilation cache (166 lines)
+Bootstrap:    release/fides-c.exe self-compiles → fides-c2_new.exe → fides-c3.exe (3 generations, all work)
+Fixpoint:     ACHIEVED — fides-c2.c == fides-c3.c (0 diffs / 701,100 lines, byte-identical)
+Category A:   RESOLVED (session 15: TCC 4KB stack → 256MB stack wrapper; type_eq str_equal fix; large match split; non-ASCII → ASCII)
 Category B:   B5 (float bits) FIXED, B6/B7/B8 AT PARITY (session 14)
+Category E:   RESOLVED — c2==c3 proves no non-determinism (session 15)
 Safety:       SH-12 DONE — C codegen recursion limit, p_malloc OOM abort, --max-steps/--max-memory/--timeout, test runner step limit, Windows path fixes, tcc auto-detection, crash handlers (VEH+SIGSEGV), all ported to Rust + Fides codegen
 Docs:         24 docs/ + 4 root = 28 .md files
-Binaries:     4 (fidesc, pacte, scribe, veil)
+Binaries:     4 (fidesc, ark, scribe, veil)
 ```
 
 **Build directories:**

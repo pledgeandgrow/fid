@@ -1,0 +1,756 @@
+// ark.fd -- Package manager for the Fides programming language
+//
+// ark is the package manager for Fides. It manages pacts (dependencies)
+// through ark.toml manifests and installs them into ark_modules/.
+//
+// Commands:
+//   ark init [name]           Create a new ark.toml in the current directory
+//   ark add <name> [options]  Add a pact (dependency)
+//       --path <path>         Path dependency
+//       --git <url>           Git dependency
+//       --branch <branch>     Git branch
+//       --tag <tag>           Git tag
+//   ark install               Install all pacts from ark.toml
+//   ark remove <name>         Remove a pact
+//   ark list                  List all pacts
+//   ark lock                  Generate ark.lock with resolved versions
+//   ark update [name]         Update pacts
+//   ark search <query>        Search for pacts (future: registry)
+//   ark publish               Publish to registry (future)
+//   ark version               Show version
+//   ark help                  Show help
+
+module compiler::ark;
+
+use core;
+use vec;
+use string;
+
+// --- Constants ---
+
+const MANIFEST_FILE: str = "ark.toml";
+const LOCK_FILE: str = "ark.lock";
+const MODULES_DIR: str = "ark_modules";
+
+// --- Dependency types ---
+
+pub enum DepKind {
+    Path,
+    Git,
+    GitBranch,
+    GitTag,
+    Registry,
+}
+
+pub enum DepSource {
+    Path(str),
+    Git(str),
+    GitBranch(str, str),
+    GitTag(str, str),
+    Registry(str),
+}
+
+pub struct PactEntry {
+    name: str,
+    source: DepSource,
+}
+
+pub struct Manifest {
+    pkg_name: str,
+    pkg_version: str,
+    pkg_edition: str,
+    pacts: Vec<PactEntry>,
+}
+
+// --- Helpers ---
+
+fn strip_quotes(s: str) -> str {
+    var s: str = str_trim(s);
+    var slen: i64 = str_len(s);
+    if slen < 2 { return s; }
+    var first: i64 = str_byte_at(s, 0);
+    var last: i64 = str_byte_at(s, slen - 1);
+    if (first == 34 && last == 34) || (first == 39 && last == 39) {
+        return str_slice(s, 1, slen - 1);
+    }
+    return s;
+}
+
+fn quote(s: str) -> str {
+    // Simple quote -- no escaping needed for typical paths/urls
+    return "\"" + s + "\"";
+}
+
+// --- Minimal TOML parser for ark.toml ---
+// Parses [section] headers and key = value lines.
+// Returns a Vec of (section, key, value) triples.
+
+struct TomlLine {
+    section: str,
+    key: str,
+    value: str,
+}
+
+fn parse_toml(content: str) -> Vec<TomlLine> {
+    var result: Vec<TomlLine> = Vec::new();
+    var current_section: str = "";
+    var lines: Vec<str> = str_split(content, "\n");
+    var i: i64 = 0;
+    while i < lines.len() {
+        var line: str = str_trim(lines[i]);
+        if str_len(line) == 0 {
+            i = i + 1;
+            continue;
+        }
+        // Comment
+        if str_byte_at(line, 0) == 35 {
+            i = i + 1;
+            continue;
+        }
+        // Section header: [name]
+        if str_byte_at(line, 0) == 91 {
+            var slen: i64 = str_len(line);
+            if slen >= 2 && str_byte_at(line, slen - 1) == 93 {
+                current_section = str_trim(str_slice(line, 1, slen - 1));
+            }
+            i = i + 1;
+            continue;
+        }
+        // key = value
+        var eq_pos: i64 = str_find(line, "=");
+        if eq_pos >= 0 {
+            var key: str = str_trim(str_slice(line, 0, eq_pos));
+            var value: str = str_trim(str_slice(line, eq_pos + 1, str_len(line)));
+            result.push(TomlLine_new(current_section, key, value));
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+fn TomlLine_new(section: str, key: str, value: str) -> TomlLine {
+    return TomlLine { section: section, key: key, value: value };
+}
+
+// Parse a dependency value: { path = "..." } or { git = "..." } or "1.0.0"
+fn parse_dependency(val: str) -> DepSource {
+    var v: str = str_trim(val);
+    var vlen: i64 = str_len(v);
+    // Inline table: { path = "..." } or { git = "..." }
+    if vlen >= 2 && str_byte_at(v, 0) == 123 && str_byte_at(v, vlen - 1) == 125 {
+        var inner: str = str_slice(v, 1, vlen - 1);
+        // Parse key = value pairs separated by commas
+        var parts: Vec<str> = str_split(inner, ",");
+        var path_val: str = "";
+        var git_val: str = "";
+        var branch_val: str = "";
+        var tag_val: str = "";
+        var pi: i64 = 0;
+        while pi < parts.len() {
+            var part: str = str_trim(parts[pi]);
+            var eq: i64 = str_find(part, "=");
+            if eq >= 0 {
+                var pk: str = str_trim(str_slice(part, 0, eq));
+                var pv: str = strip_quotes(str_trim(str_slice(part, eq + 1, str_len(part))));
+                if str_equal(pk, "path") { path_val = pv; }
+                if str_equal(pk, "git") { git_val = pv; }
+                if str_equal(pk, "branch") { branch_val = pv; }
+                if str_equal(pk, "tag") { tag_val = pv; }
+            }
+            pi = pi + 1;
+        }
+        if str_len(path_val) > 0 { return DepSource::Path(path_val); }
+        if str_len(git_val) > 0 {
+            if str_len(branch_val) > 0 { return DepSource::GitBranch(git_val, branch_val); }
+            if str_len(tag_val) > 0 { return DepSource::GitTag(git_val, tag_val); }
+            return DepSource::Git(git_val);
+        }
+        return DepSource::Registry("unknown");
+    }
+    // Simple version string
+    return DepSource::Registry(strip_quotes(v));
+}
+
+fn dep_kind_str(d: DepSource) -> str {
+    match d {
+        DepSource::Path(_) => { return "path"; }
+        DepSource::Git(_) => { return "git"; }
+        DepSource::GitBranch(_, _) => { return "git"; }
+        DepSource::GitTag(_, _) => { return "git"; }
+        DepSource::Registry(_) => { return "registry"; }
+    }
+    return "unknown";
+}
+
+fn dep_source_str(d: DepSource) -> str {
+    match d {
+        DepSource::Path(p) => { return p; }
+        DepSource::Git(u) => { return u; }
+        DepSource::GitBranch(u, _) => { return u; }
+        DepSource::GitTag(u, _) => { return u; }
+        DepSource::Registry(v) => { return v; }
+    }
+    return "";
+}
+
+// --- Manifest operations ---
+
+fn Manifest_new(name: str) -> Manifest {
+    return Manifest {
+        pkg_name: name,
+        pkg_version: "0.1.0",
+        pkg_edition: "2026",
+        pacts: Vec::new(),
+    };
+}
+
+fn manifest_load() -> Manifest {
+    var content: str = p_file_read(MANIFEST_FILE);
+    if str_len(content) == 0 {
+        p_eprint_str("Cannot read ");
+        p_eprint_str(MANIFEST_FILE);
+        p_eprint_str(". Run 'ark init' first.\n");
+        return Manifest_new("");
+    }
+    var toml: Vec<TomlLine> = parse_toml(content);
+    var m: Manifest = Manifest_new("");
+    var i: i64 = 0;
+    while i < toml.len() {
+        var entry: TomlLine = toml[i];
+        // [package] section
+        if str_equal(entry.section, "package") {
+            if str_equal(entry.key, "name") { m.pkg_name = strip_quotes(entry.value); }
+            if str_equal(entry.key, "version") { m.pkg_version = strip_quotes(entry.value); }
+            if str_equal(entry.key, "edition") { m.pkg_edition = strip_quotes(entry.value); }
+        }
+        // [dependencies] section -- each key is a pact name
+        if str_equal(entry.section, "dependencies") {
+            var dep: DepSource = parse_dependency(entry.value);
+            m.pacts.push(PactEntry_new(entry.key, dep));
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+fn manifest_save(m: Manifest) -> void {
+    var out: str = "";
+    out = out + "# ark.toml -- Fides package manifest\n";
+    out = out + "# Generated by ark (https://ark.dev)\n\n";
+    out = out + "[package]\n";
+    out = out + "name = " + quote(m.pkg_name) + "\n";
+    out = out + "version = " + quote(m.pkg_version) + "\n";
+    out = out + "edition = " + quote(m.pkg_edition) + "\n";
+    if m.pacts.len() > 0 {
+        out = out + "\n[dependencies]\n";
+        var i: i64 = 0;
+        while i < m.pacts.len() {
+            var p: PactEntry = m.pacts[i];
+            match p.source {
+                DepSource::Path(p_path) => {
+                    out = out + p.name + " = { path = " + quote(p_path) + " }\n";
+                }
+                DepSource::Git(g_url) => {
+                    out = out + p.name + " = { git = " + quote(g_url) + " }\n";
+                }
+                DepSource::GitBranch(g_url, g_branch) => {
+                    out = out + p.name + " = { git = " + quote(g_url) + ", branch = " + quote(g_branch) + " }\n";
+                }
+                DepSource::GitTag(g_url, g_tag) => {
+                    out = out + p.name + " = { git = " + quote(g_url) + ", tag = " + quote(g_tag) + " }\n";
+                }
+                DepSource::Registry(r_ver) => {
+                    out = out + p.name + " = " + quote(r_ver) + "\n";
+                }
+            }
+            i = i + 1;
+        }
+    }
+    p_file_write(MANIFEST_FILE, out);
+}
+
+fn PactEntry_new(name: str, source: DepSource) -> PactEntry {
+    return PactEntry { name: name, source: source };
+}
+
+fn manifest_find_pact(m: Manifest, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < m.pacts.len() {
+        if str_equal(m.pacts[i].name, name) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// --- Lock file ---
+
+struct LockEntry {
+    name: str,
+    source: str,
+    resolved: str,
+    kind: str,
+}
+
+fn lock_save(entries: Vec<LockEntry>) -> void {
+    var out: str = "";
+    out = out + "# ark.lock -- resolved pacts\n";
+    out = out + "# DO NOT EDIT -- generated by ark\n\n";
+    var i: i64 = 0;
+    while i < entries.len() {
+        var e: LockEntry = entries[i];
+        out = out + "[[pact]]\n";
+        out = out + "name = " + quote(e.name) + "\n";
+        out = out + "source = " + quote(e.source) + "\n";
+        out = out + "resolved = " + quote(e.resolved) + "\n";
+        out = out + "kind = " + quote(e.kind) + "\n\n";
+        i = i + 1;
+    }
+    p_file_write(LOCK_FILE, out);
+}
+
+fn LockEntry_new(name: str, source: str, resolved: str, kind: str) -> LockEntry {
+    return LockEntry { name: name, source: source, resolved: resolved, kind: kind };
+}
+
+// --- Commands ---
+
+fn cmd_init(args: Vec<str>) -> i64 {
+    var name: str = "my-project";
+    if args.len() > 0 {
+        name = args[0];
+    }
+    // Check if ark.toml already exists
+    if p_file_exists(MANIFEST_FILE) {
+        p_eprint_str(MANIFEST_FILE);
+        p_eprint_str(" already exists in this directory.\n");
+        return 1;
+    }
+    var m: Manifest = Manifest_new(name);
+    manifest_save(m);
+    print("Created ");
+    print(MANIFEST_FILE);
+    print(" for package '");
+    print(name);
+    print("'\n");
+    print("Edit ");
+    print(MANIFEST_FILE);
+    print(" to add pacts.\n");
+    return 0;
+}
+
+fn cmd_add(args: Vec<str>) -> i64 {
+    if args.len() == 0 {
+        p_eprint_str("Usage: ark add <name> [--path <path> | --git <url> | --branch <branch> | --tag <tag>]\n");
+        return 1;
+    }
+    var dep_name: str = args[0];
+    var path_val: str = "";
+    var git_val: str = "";
+    var branch_val: str = "";
+    var tag_val: str = "";
+    var i: i64 = 1;
+    while i < args.len() {
+        if str_equal(args[i], "--path") || str_equal(args[i], "-p") {
+            if i + 1 < args.len() { path_val = args[i + 1]; i = i + 1; }
+        }
+        if str_equal(args[i], "--git") || str_equal(args[i], "-g") {
+            if i + 1 < args.len() { git_val = args[i + 1]; i = i + 1; }
+        }
+        if str_equal(args[i], "--branch") || str_equal(args[i], "-b") {
+            if i + 1 < args.len() { branch_val = args[i + 1]; i = i + 1; }
+        }
+        if str_equal(args[i], "--tag") || str_equal(args[i], "-t") {
+            if i + 1 < args.len() { tag_val = args[i + 1]; i = i + 1; }
+        }
+        i = i + 1;
+    }
+    var dep: DepSource = DepSource::Registry("");
+    if str_len(path_val) > 0 {
+        dep = DepSource::Path(path_val);
+    } else {
+        if str_len(git_val) > 0 {
+            if str_len(branch_val) > 0 {
+                dep = DepSource::GitBranch(git_val, branch_val);
+            } else {
+                if str_len(tag_val) > 0 {
+                    dep = DepSource::GitTag(git_val, tag_val);
+                } else {
+                    dep = DepSource::Git(git_val);
+                }
+            }
+        } else {
+            // Default: path dependency with dep_name as directory
+            dep = DepSource::Path(dep_name);
+        }
+    }
+    var m: Manifest = manifest_load();
+    if str_len(m.pkg_name) == 0 {
+        return 1;
+    }
+    // Remove existing entry with same name, then add
+    var existing: i64 = manifest_find_pact(m, dep_name);
+    if existing >= 0 {
+        // Remove it (we'll re-add)
+        var new_pacts: Vec<PactEntry> = Vec::new();
+        var j: i64 = 0;
+        while j < m.pacts.len() {
+            if j != existing { new_pacts.push(m.pacts[j]); }
+            j = j + 1;
+        }
+        m.pacts = new_pacts;
+    }
+    m.pacts.push(PactEntry_new(dep_name, dep));
+    manifest_save(m);
+    print("Added pact '");
+    print(dep_name);
+    print("' to ");
+    print(MANIFEST_FILE);
+    print("\n");
+    print("Run 'ark install' to install pacts.\n");
+    return 0;
+}
+
+fn cmd_remove(args: Vec<str>) -> i64 {
+    if args.len() == 0 {
+        p_eprint_str("Usage: ark remove <name>\n");
+        return 1;
+    }
+    var dep_name: str = args[0];
+    var m: Manifest = manifest_load();
+    if str_len(m.pkg_name) == 0 {
+        return 1;
+    }
+    var idx: i64 = manifest_find_pact(m, dep_name);
+    if idx < 0 {
+        p_eprint_str("Pact '");
+        p_eprint_str(dep_name);
+        p_eprint_str("' not found in ");
+        p_eprint_str(MANIFEST_FILE);
+        p_eprint_str("\n");
+        return 1;
+    }
+    var new_pacts: Vec<PactEntry> = Vec::new();
+    var j: i64 = 0;
+    while j < m.pacts.len() {
+        if j != idx { new_pacts.push(m.pacts[j]); }
+        j = j + 1;
+    }
+    m.pacts = new_pacts;
+    manifest_save(m);
+    print("Removed pact '");
+    print(dep_name);
+    print("' from ");
+    print(MANIFEST_FILE);
+    print("\n");
+    return 0;
+}
+
+fn cmd_list(args: Vec<str>) -> i64 {
+    var m: Manifest = manifest_load();
+    if str_len(m.pkg_name) == 0 {
+        return 1;
+    }
+    print(m.pkg_name);
+    print(" v");
+    print(m.pkg_version);
+    print(" (");
+    print(m.pkg_edition);
+    print(")\n\n");
+    if m.pacts.len() == 0 {
+        print("No pacts in ");
+        print(MANIFEST_FILE);
+        print(".\n");
+        return 0;
+    }
+    print("NAME                  TYPE     SOURCE\n");
+    print("------------------------------------------------------------\n");
+    var i: i64 = 0;
+    while i < m.pacts.len() {
+        var p: PactEntry = m.pacts[i];
+        print(p.name);
+        print("  ");
+        print(dep_kind_str(p.source));
+        print("  ");
+        print(dep_source_str(p.source));
+        print("\n");
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn cmd_install(args: Vec<str>) -> i64 {
+    var m: Manifest = manifest_load();
+    if str_len(m.pkg_name) == 0 {
+        return 1;
+    }
+    if m.pacts.len() == 0 {
+        print("No pacts to install.\n");
+        return 0;
+    }
+    // Create ark_modules/ directory
+    p_system("mkdir " + MODULES_DIR + " 2>nul");
+    var lock_entries: Vec<LockEntry> = Vec::new();
+    var installed: i64 = 0;
+    var i: i64 = 0;
+    while i < m.pacts.len() {
+        var p: PactEntry = m.pacts[i];
+        print("Installing ");
+        print(p.name);
+        print("... ");
+        match p.source {
+            DepSource::Path(p_path) => {
+                if p_file_exists(p_path) == false {
+                    print("FAILED\n");
+                    p_eprint_str("Path pact '");
+                    p_eprint_str(p.name);
+                    p_eprint_str("' does not exist: ");
+                    p_eprint_str(p_path);
+                    p_eprint_str("\n");
+                    return 1;
+                }
+                // Copy file or directory
+                var dest: str = MODULES_DIR + "/" + p.name;
+                var content: str = p_file_read(p_path);
+                if str_len(content) > 0 {
+                    p_file_write(dest, content);
+                    lock_entries.push(LockEntry_new(p.name, p_path, p_path, "path"));
+                    print("OK (path)\n");
+                    installed = installed + 1;
+                } else {
+                    // Try directory copy via xcopy (Windows)
+                    var cmd: str = "xcopy /E /I /Y " + p_path + " " + dest + " >nul 2>nul";
+                    p_system(cmd);
+                    lock_entries.push(LockEntry_new(p.name, p_path, p_path, "path"));
+                    print("OK (path/dir)\n");
+                    installed = installed + 1;
+                }
+            }
+            DepSource::Git(g_url) => {
+                var dest: str = MODULES_DIR + "/" + p.name;
+                var cmd: str = "git clone --depth 1 " + g_url + " " + dest;
+                var ret: i64 = p_system(cmd);
+                if ret != 0 {
+                    print("FAILED\n");
+                    p_eprint_str("git clone failed for '");
+                    p_eprint_str(p.name);
+                    p_eprint_str("'\n");
+                    return 1;
+                }
+                lock_entries.push(LockEntry_new(p.name, g_url, "git", "git"));
+                print("OK (git)\n");
+                installed = installed + 1;
+            }
+            DepSource::GitBranch(g_url, g_branch) => {
+                var dest: str = MODULES_DIR + "/" + p.name;
+                var cmd: str = "git clone --depth 1 --branch " + g_branch + " " + g_url + " " + dest;
+                var ret: i64 = p_system(cmd);
+                if ret != 0 {
+                    print("FAILED\n");
+                    p_eprint_str("git clone failed for '");
+                    p_eprint_str(p.name);
+                    p_eprint_str("' (branch=");
+                    p_eprint_str(g_branch);
+                    p_eprint_str(")\n");
+                    return 1;
+                }
+                lock_entries.push(LockEntry_new(p.name, g_url + "#" + g_branch, "git", "git"));
+                print("OK (git/branch=");
+                print(g_branch);
+                print(")\n");
+                installed = installed + 1;
+            }
+            DepSource::GitTag(g_url, g_tag) => {
+                var dest: str = MODULES_DIR + "/" + p.name;
+                var cmd: str = "git clone --depth 1 --branch " + g_tag + " " + g_url + " " + dest;
+                var ret: i64 = p_system(cmd);
+                if ret != 0 {
+                    print("FAILED\n");
+                    p_eprint_str("git clone failed for '");
+                    p_eprint_str(p.name);
+                    p_eprint_str("' (tag=");
+                    p_eprint_str(g_tag);
+                    p_eprint_str(")\n");
+                    return 1;
+                }
+                lock_entries.push(LockEntry_new(p.name, g_url + "#" + g_tag, "git", "git"));
+                print("OK (git/tag=");
+                print(g_tag);
+                print(")\n");
+                installed = installed + 1;
+            }
+            DepSource::Registry(r_ver) => {
+                print("SKIP (registry not yet implemented -- version ");
+                print(r_ver);
+                print(")\n");
+            }
+        }
+        i = i + 1;
+    }
+    lock_save(lock_entries);
+    print("\nInstalled ");
+    print(int_to_str(installed));
+    print(" pact(s) to ");
+    print(MODULES_DIR);
+    print("/\n");
+    return 0;
+}
+
+fn cmd_lock(args: Vec<str>) -> i64 {
+    var m: Manifest = manifest_load();
+    if str_len(m.pkg_name) == 0 {
+        return 1;
+    }
+    var lock_entries: Vec<LockEntry> = Vec::new();
+    var i: i64 = 0;
+    while i < m.pacts.len() {
+        var p: PactEntry = m.pacts[i];
+        var dest: str = MODULES_DIR + "/" + p.name;
+        if p_file_exists(dest) == false {
+            i = i + 1;
+            continue;
+        }
+        match p.source {
+            DepSource::Path(p_path) => {
+                lock_entries.push(LockEntry_new(p.name, p_path, p_path, "path"));
+            }
+            DepSource::Git(g_url) => {
+                lock_entries.push(LockEntry_new(p.name, g_url, "git", "git"));
+            }
+            DepSource::GitBranch(g_url, g_branch) => {
+                lock_entries.push(LockEntry_new(p.name, g_url + "#" + g_branch, "git", "git"));
+            }
+            DepSource::GitTag(g_url, g_tag) => {
+                lock_entries.push(LockEntry_new(p.name, g_url + "#" + g_tag, "git", "git"));
+            }
+            DepSource::Registry(r_ver) => {
+                lock_entries.push(LockEntry_new(p.name, r_ver, r_ver, "registry"));
+            }
+        }
+        i = i + 1;
+    }
+    lock_save(lock_entries);
+    print("Wrote ");
+    print(LOCK_FILE);
+    print(" with ");
+    print(int_to_str(lock_entries.len()));
+    print(" pact(s).\n");
+    return 0;
+}
+
+fn cmd_search(args: Vec<str>) -> i64 {
+    if args.len() == 0 {
+        p_eprint_str("Usage: ark search <query>\n");
+        return 1;
+    }
+    print("Searching for '");
+    print(args[0]);
+    print("'...\n");
+    print("Registry search not yet implemented.\n");
+    print("Future: search ark.dev registry for pacts matching '");
+    print(args[0]);
+    print("'\n");
+    return 0;
+}
+
+fn cmd_publish(args: Vec<str>) -> i64 {
+    print("Publish not yet implemented.\n");
+    print("Future: publish current package to ark.dev registry\n");
+    return 0;
+}
+
+fn cmd_update(args: Vec<str>) -> i64 {
+    if args.len() == 0 {
+        print("Updating all pacts...\n");
+        return cmd_install(Vec::new());
+    }
+    print("Updating '");
+    print(args[0]);
+    print("'...\n");
+    return cmd_install(Vec::new());
+}
+
+fn cmd_version() -> i64 {
+    print("ark 0.1.0 -- Fides package manager\n");
+    print("Load your ark with pacts. Binding agreements of trust.\n");
+    return 0;
+}
+
+fn print_help() -> void {
+    print("ark -- Package manager for Fides\n\n");
+    print("USAGE:\n");
+    print("    ark <command> [options]\n\n");
+    print("COMMANDS:\n");
+    print("    init [name]              Create a new ark.toml in the current directory\n");
+    print("    add <name> [options]     Add a pact (dependency)\n");
+    print("        --path <path>        Path dependency\n");
+    print("        --git <url>          Git dependency\n");
+    print("        --branch <branch>    Git branch\n");
+    print("        --tag <tag>          Git tag\n");
+    print("    install                  Install all pacts from ark.toml\n");
+    print("    remove <name>            Remove a pact\n");
+    print("    list                     List all pacts\n");
+    print("    lock                     Generate ark.lock with resolved versions\n");
+    print("    update [name]            Update pacts\n");
+    print("    search <query>           Search for pacts (future)\n");
+    print("    publish                  Publish to registry (future)\n");
+    print("    version                  Show version\n");
+    print("    help                     Show this help\n\n");
+    print("MANIFEST: ark.toml\n");
+    print("LOCKFILE: ark.lock\n");
+    print("MODULES:  ark_modules/\n\n");
+    print("EXAMPLES:\n");
+    print("    ark init my-app\n");
+    print("    ark add math --path ../stdlib/math\n");
+    print("    ark add mylib --git https://github.com/user/mylib\n");
+    print("    ark add mylib --git https://github.com/user/mylib --branch dev\n");
+    print("    ark install\n");
+    print("    ark list\n");
+}
+
+// --- Entry point ---
+
+pub fn main() -> i64 {
+    var n: i64 = p_argc();
+    var start: i64 = 1;
+    // Support interpreter mode: fidesc run tools/ark.fd -- init my-app
+    var i: i64 = 0;
+    while i < n {
+        if str_equal(p_argv(i), "--") {
+            start = i + 1;
+            break;
+        }
+        i = i + 1;
+    }
+    if start >= n {
+        print_help();
+        return 1;
+    }
+    var command: str = p_argv(start);
+    // Collect remaining args
+    var args: Vec<str> = Vec::new();
+    var j: i64 = start + 1;
+    while j < n {
+        args.push(p_argv(j));
+        j = j + 1;
+    }
+    if str_equal(command, "init") { return cmd_init(args); }
+    if str_equal(command, "add") { return cmd_add(args); }
+    if str_equal(command, "install") || str_equal(command, "i") { return cmd_install(args); }
+    if str_equal(command, "remove") || str_equal(command, "rm") { return cmd_remove(args); }
+    if str_equal(command, "list") || str_equal(command, "ls") { return cmd_list(args); }
+    if str_equal(command, "lock") { return cmd_lock(args); }
+    if str_equal(command, "search") { return cmd_search(args); }
+    if str_equal(command, "publish") { return cmd_publish(args); }
+    if str_equal(command, "update") { return cmd_update(args); }
+    if str_equal(command, "version") || str_equal(command, "--version") || str_equal(command, "-v") {
+        return cmd_version();
+    }
+    if str_equal(command, "help") || str_equal(command, "--help") || str_equal(command, "-h") {
+        print_help();
+        return 0;
+    }
+    p_eprint_str("Unknown command: ");
+    p_eprint_str(command);
+    p_eprint_str("\nRun 'ark help' for usage.\n");
+    return 1;
+}

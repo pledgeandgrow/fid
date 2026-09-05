@@ -4,7 +4,7 @@
 > SRET convention, enum layout, struct copy, and value semantics must stay
 > in sync across `lower.fd`, `codegen_c.fd`, and the runtime.
 >
-> **Last updated:** Sep 5, 2026 (session 14)
+> **Last updated:** Sep 5, 2026 (session 15 — **BOOTSTRAP FIXPOINT ACHIEVED**)
 >
 > **Important:** Sections 3 and 5 were updated in session 14 to reflect the
 > **pointer-based enum payload approach** (COORDINATION.md [D1]). The old

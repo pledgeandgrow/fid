@@ -1,11 +1,11 @@
 # What Fides Can Do Now — Honest Assessment
 
 > Evidence-based, verified against the actual codebase and test runs.
-> Last updated: Sep 5, 2026 (session 14). Based on test runs, source inspection, and docs.
+> Last updated: Sep 5, 2026 (session 15 — **BOOTSTRAP FIXPOINT ACHIEVED**). Based on test runs, source inspection, and docs.
 
 ---
 
-## Verified Test Results (Sep 5, 2026 — session 14)
+## Verified Test Results (Sep 5, 2026 — session 15)
 
 ```
 Interpreter:  209/211 passed
@@ -100,7 +100,8 @@ implementation (session 11) and not core codegen bugs.
 - **Linux native codegen ported** — `peephole.fd` + `regalloc.fd` + `codegen_x64.fd` (session 8), builds OK but not yet integrated
 - **LSP server ported to Fides** — `compiler/lsp.fd` (1084 lines) — JSON-RPC over stdio, diagnostics, completion, hover, definition, rename (session 9)
 - **`.exe` extension auto-appended** — `ccompile` and `build` now produce `.exe` output without manual rename (session 8)
-- Fixpoint verification is the next milestone (blocked by statement-dropping bug + pre-existing parse error in codegen_c.fd)
+- **🎉 BOOTSTRAP FIXPOINT ACHIEVED** — fides-c2.c == fides-c3.c (SHA256-identical, 701,100 lines, session 15)
+- **Three generations verified** — Rust → c1 → c2 → c3, all run test_simple.fd correctly (session 15)
 - PE emitter currently supports simple programs; full compiler source support is in progress
 
 ---
@@ -276,12 +277,13 @@ The next steps are:
 
 1. ~~Fix `.exe` extension in self-hosted compiler output~~ — DONE (session 8)
 2. ~~Category B codegen parity gaps~~ — DONE (session 14)
-3. **Fix Category A crash blockers** (TypeChecker_lookup null deref)
-4. **Mirror `var` feature to `compiler/*.fd` files**
-5. Remove/gate debug prints (38 `p_eprint_str` calls)
-6. Run the bootstrap fixpoint (fides-c2.c == fides-c3.c)
-7. Extend PE emitter to support full compiler source (struct/enum, Vec/HashMap, floats)
-8. Integrate Linux native codegen (port `elf64.rs`, `linker.rs`, `runtime_linux.rs`, wire into pipeline)
+3. ~~Fix Category A crash blockers~~ — DONE (session 15: stack wrapper + type_eq fix + large match split + non-ASCII removal)
+4. ~~Run the bootstrap fixpoint~~ — DONE (session 15: fides-c2.c == fides-c3.c, SHA256-identical, 701,100 lines)
+5. **Mirror `var` feature to `compiler/*.fd` files**
+6. **Gate debug prints** (287 `p_eprint_str` calls — cleanup, doesn't affect fixpoint)
+7. **Close Rust vs self-hosted parity gap** (c1=706K vs c2=701K lines)
+8. Extend PE emitter to support full compiler source (struct/enum, Vec/HashMap, floats)
+9. Integrate Linux native codegen (port `elf64.rs`, `linker.rs`, `runtime_linux.rs`, wire into pipeline)
 
 Once the fixpoint is achieved and the PE emitter supports the full compiler
 source, Fides becomes a **self-reproducing compiler with a fully custom

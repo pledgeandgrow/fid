@@ -1,5 +1,5 @@
 // lib.rs — Library target for fidesc, exposing modules to other binaries
-// (scribe, veil, pacte). The main.rs binary also uses these modules.
+// (scribe, veil, ark). The main.rs binary also uses these modules.
 
 pub mod ast;
 pub mod borrowck;
@@ -48,6 +48,6 @@ pub mod lsp;
 pub mod fmt;
 pub mod debugger;
 pub mod native_debugger;
-pub mod pacte;
+pub mod ark;
 pub mod scribe;
 pub mod veil;

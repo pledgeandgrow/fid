@@ -1,7 +1,7 @@
-// pe.fd — Direct PE executable emitter for Windows x86_64 .exe files
+// pe.fd -- Direct PE executable emitter for Windows x86_64 .exe files
 // Ported from src/pe.rs. Generates native machine code without tcc.
 //
-// Pipeline: IrModule → machine code bytes → PE file → .exe
+// Pipeline: IrModule -> machine code bytes -> PE file -> .exe
 //
 // Windows x64 calling convention:
 // - Integer args: RCX, RDX, R8, R9 (then stack)
@@ -17,7 +17,7 @@ use string;
 use compiler::ast;
 use compiler::ir;
 
-// ─── Register definitions ───────────────────────────────────────────────
+// --- Register definitions -----------------------------------------------
 // x86-64 GP registers encoded as i64 (0-15)
 pub const REG_RAX: i64 = 0;
 pub const REG_RCX: i64 = 1;
@@ -46,7 +46,7 @@ pub fn reg_is_extended(r: i64) -> bool {
     return r >= 8;
 }
 
-// ─── Relocation types ───────────────────────────────────────────────────
+// --- Relocation types ---------------------------------------------------
 pub const RELOC_REL32: i64 = 0;    // relative jump/call
 pub const RELOC_RIPREL32: i64 = 1; // RIP-relative data access
 pub const RELOC_LEA_LABEL: i64 = 2; // lea to code label
@@ -70,7 +70,7 @@ pub fn PendingRipRef_new(code_offset: i64, rdata_offset: i64) -> PendingRipRef {
     return PendingRipRef { code_offset: code_offset, rdata_offset: rdata_offset };
 }
 
-// ─── X86Encoder: x86_64 machine code encoder ────────────────────────────
+// --- X86Encoder: x86_64 machine code encoder ----------------------------
 pub struct X86Encoder {
     pub code: Vec,              // Vec<i64> of bytes
     pub labels: Vec,            // Vec<i64> label_id -> code offset
@@ -308,7 +308,7 @@ pub fn X86Encoder_lea_rbp(self: &mut X86Encoder, dst: i64, disp: i64) {
     X86Encoder_emit_mem_rbp(self, reg_code(dst), disp);
 }
 
-// lea reg, [rip + rdata_offset] — patched later
+// lea reg, [rip + rdata_offset] -- patched later
 pub fn X86Encoder_lea_rip(self: &mut X86Encoder, dst: i64, rdata_offset: i64) {
     X86Encoder_rex(self, true, reg_is_extended(dst), false, false);
     self.code.push(0x8D);
@@ -317,7 +317,7 @@ pub fn X86Encoder_lea_rip(self: &mut X86Encoder, dst: i64, rdata_offset: i64) {
     X86Encoder_emit_i32(self, 0);
 }
 
-// lea reg, [rip + label] — patched later as code label
+// lea reg, [rip + label] -- patched later as code label
 pub fn X86Encoder_lea_label(self: &mut X86Encoder, dst: i64, label: i64) {
     X86Encoder_rex(self, true, reg_is_extended(dst), false, false);
     self.code.push(0x8D);
@@ -326,7 +326,7 @@ pub fn X86Encoder_lea_label(self: &mut X86Encoder, dst: i64, label: i64) {
     X86Encoder_emit_i32(self, 0);
 }
 
-// call [rip + rdata_offset] — IAT indirect call
+// call [rip + rdata_offset] -- IAT indirect call
 pub fn X86Encoder_call_rip(self: &mut X86Encoder, rdata_offset: i64) {
     self.code.push(0xFF);
     X86Encoder_modrm(self, 0, 2, 5);
@@ -348,7 +348,7 @@ pub fn X86Encoder_jmp_label(self: &mut X86Encoder, label: i64) {
     X86Encoder_emit_i32(self, 0);
 }
 
-// jcc rel32 (label) — cc is condition code (0-15)
+// jcc rel32 (label) -- cc is condition code (0-15)
 pub fn X86Encoder_jcc_label(self: &mut X86Encoder, cc: i64, label: i64) {
     self.code.push(0x0F);
     self.code.push(0x80 | (cc & 0xF));
@@ -722,7 +722,7 @@ pub fn X86Encoder_mov_reg32_ptr(self: &mut X86Encoder, dst: i64, base: i64) {
     X86Encoder_emit_mem_reg(self, reg_code(dst), base, 0);
 }
 
-// ─── SSE2 float instructions ────────────────────────────────────────────
+// --- SSE2 float instructions --------------------------------------------
 // movsd xmm, [rbp + disp]
 pub fn X86Encoder_movsd_xmm_mem_rbp(self: &mut X86Encoder, xmm: i64, disp: i64) {
     self.code.push(0xF2);
@@ -883,7 +883,7 @@ pub fn X86Encoder_ucomiss(self: &mut X86Encoder, dst: i64, src: i64) {
     X86Encoder_modrm(self, 3, dst & 7, src & 7);
 }
 
-// ─── Label resolution ───────────────────────────────────────────────────
+// --- Label resolution ---------------------------------------------------
 // Patch all pending label relocations (Rel32 and LeaLabel)
 pub fn X86Encoder_resolve_labels(self: &mut X86Encoder) {
     var i: i64 = 0;
@@ -891,7 +891,7 @@ pub fn X86Encoder_resolve_labels(self: &mut X86Encoder) {
         var reloc: PendingReloc = self.pending_labels.get(i);
         var target_offset: i64 = self.labels.get(reloc.target_label);
         if target_offset < 0 {
-            // Unresolved label — skip (will crash at runtime if hit)
+            // Unresolved label -- skip (will crash at runtime if hit)
             i = i + 1;
             continue;
         }
@@ -921,7 +921,7 @@ pub fn X86Encoder_resolve_rip_refs(self: &mut X86Encoder, text_rva: i64, rdata_r
     }
 }
 
-// ─── RdataBuilder: builds .rdata section (strings + import table) ───────
+// --- RdataBuilder: builds .rdata section (strings + import table) -------
 pub struct RdataBuilder {
     pub data: Vec,                    // raw .rdata bytes (Vec<i64>)
     pub iat_offsets: Vec,             // .rdata offset of each IAT entry
@@ -1026,7 +1026,7 @@ pub fn RdataBuilder_build(self: &mut RdataBuilder, string_constants: Vec<StringS
     self.ilt_offset = self.data.len();
     k = 0;
     while k < import_names.len() {
-        // Placeholder RVA — patched later by patch_rvas
+        // Placeholder RVA -- patched later by patch_rvas
         self.data.push(0); self.data.push(0); self.data.push(0); self.data.push(0);
         self.data.push(0); self.data.push(0); self.data.push(0); self.data.push(0);
         k = k + 1;
@@ -1041,7 +1041,7 @@ pub fn RdataBuilder_build(self: &mut RdataBuilder, string_constants: Vec<StringS
     while k < import_names.len() {
         var iat_off: i64 = self.data.len();
         self.iat_offsets.push(iat_off);
-        // Placeholder RVA — patched later
+        // Placeholder RVA -- patched later
         self.data.push(0); self.data.push(0); self.data.push(0); self.data.push(0);
         self.data.push(0); self.data.push(0); self.data.push(0); self.data.push(0);
         k = k + 1;
@@ -1057,7 +1057,7 @@ pub fn RdataBuilder_build(self: &mut RdataBuilder, string_constants: Vec<StringS
 
     // 8. Import Directory Table (20 bytes + 20 null)
     self.import_dir_offset = self.data.len();
-    // Descriptor (20 bytes of placeholders — patched later)
+    // Descriptor (20 bytes of placeholders -- patched later)
     var d: i64 = 0;
     while d < 20 {
         self.data.push(0);
@@ -1132,7 +1132,7 @@ pub fn RdataBuilder_patch_rvas(self: &mut RdataBuilder, rdata_rva: i64) {
     self.data.set(dir_pos + 19, (iat_rva >> 24) & 0xFF);
 }
 
-// ─── PE file constants ──────────────────────────────────────────────────
+// --- PE file constants --------------------------------------------------
 pub const IMAGE_BASE: i64 = 0x140000000;
 pub const SECTION_ALIGN: i64 = 0x1000;
 pub const FILE_ALIGN: i64 = 0x200;
@@ -1162,7 +1162,7 @@ pub fn build_pe_file(text: Vec, rdata: Vec, entry_point_rva: i64, import_dir_rva
     var rdata_virt_size: i64 = align_up(rdata.len(), SECTION_ALIGN);
     var size_of_image: i64 = align_up(header_size, SECTION_ALIGN) + text_virt_size + rdata_virt_size;
 
-    // ─── DOS Header (64 bytes) ───
+    // --- DOS Header (64 bytes) ---
     pe.push(0x4D); pe.push(0x5A); // e_magic "MZ"
     pe.push(0x90); pe.push(0x00); // e_cblp
     pe.push(0x03); pe.push(0x00); // e_cp
@@ -1186,10 +1186,10 @@ pub fn build_pe_file(text: Vec, rdata: Vec, entry_point_rva: i64, import_dir_rva
     // e_lfanew = 64
     pe.push(0x40); pe.push(0x00); pe.push(0x00); pe.push(0x00);
 
-    // ─── PE Signature (4 bytes) ───
+    // --- PE Signature (4 bytes) ---
     pe.push(0x50); pe.push(0x45); pe.push(0x00); pe.push(0x00); // "PE\0\0"
 
-    // ─── COFF Header (20 bytes) ───
+    // --- COFF Header (20 bytes) ---
     pe.push(0x64); pe.push(0x86); // Machine = AMD64
     pe.push(0x02); pe.push(0x00); // NumberOfSections = 2
     pe.push(0x00); pe.push(0x00); pe.push(0x00); pe.push(0x00); // TimeDateStamp
@@ -1198,7 +1198,7 @@ pub fn build_pe_file(text: Vec, rdata: Vec, entry_point_rva: i64, import_dir_rva
     pe.push(0xF0); pe.push(0x00); // SizeOfOptionalHeader = 240
     pe.push(0x22); pe.push(0x00); // Characteristics
 
-    // ─── Optional Header (240 bytes) ───
+    // --- Optional Header (240 bytes) ---
     // Standard fields
     pe.push(0x0B); pe.push(0x02); // Magic = PE32+
     pe.push(0x0E); // MajorLinkerVersion
@@ -1262,14 +1262,14 @@ pub fn build_pe_file(text: Vec, rdata: Vec, entry_point_rva: i64, import_dir_rva
     // NumberOfRvaAndSizes = 16
     pe.push(0x10); pe.push(0x00); pe.push(0x00); pe.push(0x00);
 
-    // Data directories (16 entries × 8 bytes = 128 bytes)
-    // Entry 0: Export — empty
+    // Data directories (16 entries x 8 bytes = 128 bytes)
+    // Entry 0: Export -- empty
     i = 0;
     while i < 8 { pe.push(0); i = i + 1; }
     // Entry 1: Import
     pe.push(import_dir_rva & 0xFF); pe.push((import_dir_rva >> 8) & 0xFF); pe.push((import_dir_rva >> 16) & 0xFF); pe.push((import_dir_rva >> 24) & 0xFF);
     pe.push(0x14); pe.push(0x00); pe.push(0x00); pe.push(0x00); // size = 20
-    // Entries 2-11: empty (10 entries × 8 bytes)
+    // Entries 2-11: empty (10 entries x 8 bytes)
     i = 0;
     while i < 10 {
         var j: i64 = 0;
@@ -1279,7 +1279,7 @@ pub fn build_pe_file(text: Vec, rdata: Vec, entry_point_rva: i64, import_dir_rva
     // Entry 12: IAT
     pe.push(iat_rva & 0xFF); pe.push((iat_rva >> 8) & 0xFF); pe.push((iat_rva >> 16) & 0xFF); pe.push((iat_rva >> 24) & 0xFF);
     pe.push(iat_size & 0xFF); pe.push((iat_size >> 8) & 0xFF); pe.push((iat_size >> 16) & 0xFF); pe.push((iat_size >> 24) & 0xFF);
-    // Entries 13-15: empty (3 entries × 8 bytes)
+    // Entries 13-15: empty (3 entries x 8 bytes)
     i = 0;
     while i < 3 {
         var j: i64 = 0;
@@ -1287,7 +1287,7 @@ pub fn build_pe_file(text: Vec, rdata: Vec, entry_point_rva: i64, import_dir_rva
         i = i + 1;
     }
 
-    // ─── Section Headers (2 × 40 bytes) ───
+    // --- Section Headers (2 x 40 bytes) ---
     // .text section
     pe.push(0x2E); pe.push(0x74); pe.push(0x65); pe.push(0x78); pe.push(0x74); pe.push(0x00); pe.push(0x00); pe.push(0x00); // ".text\0\0\0"
     pe.push(text_virt_size & 0xFF); pe.push((text_virt_size >> 8) & 0xFF); pe.push((text_virt_size >> 16) & 0xFF); pe.push((text_virt_size >> 24) & 0xFF);
@@ -1313,12 +1313,12 @@ pub fn build_pe_file(text: Vec, rdata: Vec, entry_point_rva: i64, import_dir_rva
     pe.push(0); pe.push(0); // NumberOfLinenumbers
     pe.push(0x40); pe.push(0x00); pe.push(0x00); pe.push(0xC0); // Characteristics = INITIALIZED_DATA|READ|WRITE
 
-    // ─── Pad headers to FILE_ALIGN ───
+    // --- Pad headers to FILE_ALIGN ---
     while pe.len() < header_size {
         pe.push(0);
     }
 
-    // ─── .text section ───
+    // --- .text section ---
     i = 0;
     while i < text.len() {
         pe.push(text.get(i));
@@ -1329,7 +1329,7 @@ pub fn build_pe_file(text: Vec, rdata: Vec, entry_point_rva: i64, import_dir_rva
         pe.push(0);
     }
 
-    // ─── .rdata section ───
+    // --- .rdata section ---
     i = 0;
     while i < rdata.len() {
         pe.push(rdata.get(i));
@@ -1343,7 +1343,7 @@ pub fn build_pe_file(text: Vec, rdata: Vec, entry_point_rva: i64, import_dir_rva
     return pe;
 }
 
-// ─── PeStackFrame: tracks local variable stack slots ────────────────────
+// --- PeStackFrame: tracks local variable stack slots --------------------
 pub struct PeStackFrame {
     pub offsets: Vec,        // packed (value_id, offset) pairs
     pub size: i64,
@@ -1407,7 +1407,7 @@ pub fn PeStackFrame_alloc_raw(self: &mut PeStackFrame, size: i64) -> i64 {
     return -self.size;
 }
 
-// ─── PeCodeGen: main code generator ─────────────────────────────────────
+// --- PeCodeGen: main code generator -------------------------------------
 pub struct PeCodeGen {
     pub enc: X86Encoder,
     pub func_names: Vec<str>,
@@ -1419,7 +1419,7 @@ pub struct PeCodeGen {
     pub entry_offset: i64,
     pub bare_mode: bool,
     pub main_offset: i64,
-    // Module-level mutable globals: name → rdata offset
+    // Module-level mutable globals: name -> rdata offset
     pub global_names: Vec<str>,
     pub global_rdata_offsets: Vec,
 }
@@ -1482,7 +1482,7 @@ pub fn PeCodeGen_iat_off(self: &PeCodeGen, iat_index: i64) -> i64 {
     return self.iat_rdata_offsets.get(iat_index);
 }
 
-// ─── Main entry point: generate a PE file from an IrModule ──────────────
+// --- Main entry point: generate a PE file from an IrModule --------------
 pub fn generate_pe(module: IrModule) -> Vec {
     p_file_write("pe_debug.txt", "[pe] generate_pe ENTERED\n");
     var gen: PeCodeGen = PeCodeGen_new();
@@ -1734,7 +1734,7 @@ pub fn PeCodeGen_generate(self: &mut PeCodeGen, module: IrModule) -> Vec {
     return build_pe_file(self.enc.code, rdata.data, entry_rva, import_dir_rva, iat_rva, iat_size, rdata_rva);
 }
 
-// ─── Function code generation ───────────────────────────────────────────
+// --- Function code generation -------------------------------------------
 // Windows x64 argument registers
 pub const ARG_REGS: Vec = Vec::new(); // set at runtime
 
@@ -1876,7 +1876,7 @@ pub fn PeCodeGen_get_block_label(self: &PeCodeGen, func_block_idx: i64, block_id
     return -1;
 }
 
-// ─── IR instruction lowering ────────────────────────────────────────────
+// --- IR instruction lowering --------------------------------------------
 // Split into helper functions to avoid the statement-dropping bug (bug 1.19).
 // Each helper handles one match arm, keeping PeCodeGen_gen_inst short.
 
@@ -2220,7 +2220,7 @@ pub fn PeCodeGen_gen_inst(self: &mut PeCodeGen, id: i64, inst: Inst, frame: &PeS
     }
 }
 
-// ─── Integer binary operations ──────────────────────────────────────────
+// --- Integer binary operations ------------------------------------------
 pub fn PeCodeGen_gen_int_binop(self: &mut PeCodeGen, op: BinOp, loff: i64, roff: i64, dst: i64) {
     X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RAX, loff);
     X86Encoder_mov_reg_mem_rbp(&mut self.enc, REG_RCX, roff);
@@ -2307,7 +2307,7 @@ pub fn PeCodeGen_gen_int_binop(self: &mut PeCodeGen, op: BinOp, loff: i64, roff:
     X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
 }
 
-// ─── Float binary operations ────────────────────────────────────────────
+// --- Float binary operations --------------------------------------------
 pub fn PeCodeGen_gen_float_binop(self: &mut PeCodeGen, op: BinOp, loff: i64, roff: i64, dst: i64, ty: IrType) {
     match ty {
         IrType::F32 => {
@@ -2362,7 +2362,7 @@ pub fn PeCodeGen_gen_float_cmp(self: &mut PeCodeGen, op: BinOp, dst: i64) {
     X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
 }
 
-// ─── Unary operations ───────────────────────────────────────────────────
+// --- Unary operations ---------------------------------------------------
 pub fn PeCodeGen_gen_unaryop(self: &mut PeCodeGen, op: UnaryOp, off: i64, dst: i64, ty: IrType) {
     match op {
         UnaryOp::Neg => {
@@ -2408,7 +2408,7 @@ pub fn PeCodeGen_gen_unaryop(self: &mut PeCodeGen, op: UnaryOp, off: i64, dst: i
     }
 }
 
-// ─── Function call generation (Windows x64 ABI) ─────────────────────────
+// --- Function call generation (Windows x64 ABI) -------------------------
 pub fn PeCodeGen_gen_call(self: &mut PeCodeGen, func_name: str, args: Vec, dst: i64, frame: &PeStackFrame) {
     var arg_regs: Vec = Vec::new();
     arg_regs.push(REG_RCX);
@@ -2459,7 +2459,7 @@ pub fn PeCodeGen_gen_call(self: &mut PeCodeGen, func_name: str, args: Vec, dst: 
     X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
 }
 
-// ─── Indirect call (function pointer) ───────────────────────────────────
+// --- Indirect call (function pointer) -----------------------------------
 pub fn PeCodeGen_gen_call_ptr(self: &mut PeCodeGen, fn_ptr: i64, args: Vec, dst: i64, frame: &PeStackFrame) {
     var arg_regs: Vec = Vec::new();
     arg_regs.push(REG_RCX);
@@ -2513,7 +2513,7 @@ pub fn PeCodeGen_gen_call_ptr(self: &mut PeCodeGen, fn_ptr: i64, args: Vec, dst:
     X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
 }
 
-// ─── Runtime stubs ──────────────────────────────────────────────────────
+// --- Runtime stubs ------------------------------------------------------
 pub fn PeCodeGen_gen_runtime_stubs(self: &mut PeCodeGen) {
     PeCodeGen_gen_print_int(self);
     PeCodeGen_gen_print_str(self);
@@ -2584,7 +2584,7 @@ pub fn PeCodeGen_gen_runtime_stubs(self: &mut PeCodeGen) {
     PeCodeGen_gen_string_clone(self);
 }
 
-// p_print_int(rcx = value) — prints an i64 followed by newline
+// p_print_int(rcx = value) -- prints an i64 followed by newline
 // Writes digits backwards from buffer end, handles negatives, single WriteFile.
 pub fn PeCodeGen_gen_print_int(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_print_int");
@@ -2628,7 +2628,7 @@ pub fn PeCodeGen_gen_print_int(self: &mut PeCodeGen) {
     // Check if original value (r12) was negative; if so prepend '-'
     var pi_no_neg: i64 = X86Encoder_alloc_label(&mut self.enc);
     X86Encoder_test_rr(&mut self.enc, REG_R12, REG_R12);
-    X86Encoder_jcc_label(&mut self.enc, 9, pi_no_neg); // jns — skip if non-negative
+    X86Encoder_jcc_label(&mut self.enc, 9, pi_no_neg); // jns -- skip if non-negative
     X86Encoder_dec_r(&mut self.enc, REG_R8);
     X86Encoder_mov_r8_imm(&mut self.enc, REG_RDX, 45); // '-'
     X86Encoder_mov_mem_reg8_ptr(&mut self.enc, REG_R8, REG_RDX);
@@ -2729,7 +2729,7 @@ pub fn PeCodeGen_gen_print_str(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_print_bool(rcx = 0|1) — prints "true" or "false" + newline
+// p_print_bool(rcx = 0|1) -- prints "true" or "false" + newline
 pub fn PeCodeGen_gen_print_bool(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_print_bool");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -2797,7 +2797,7 @@ pub fn PeCodeGen_gen_print_bool(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_panic(rcx = *u8 message) — exits with code 1
+// p_panic(rcx = *u8 message) -- exits with code 1
 pub fn PeCodeGen_gen_panic(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_panic");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -2809,7 +2809,7 @@ pub fn PeCodeGen_gen_panic(self: &mut PeCodeGen) {
     X86Encoder_ud2(&mut self.enc);
 }
 
-// p_malloc(rcx = size) → rax = ptr
+// p_malloc(rcx = size) -> rax = ptr
 pub fn PeCodeGen_gen_malloc(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_malloc");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -2844,7 +2844,7 @@ pub fn PeCodeGen_gen_malloc(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_free(rcx = ptr) — HeapFree the pointer
+// p_free(rcx = ptr) -- HeapFree the pointer
 pub fn PeCodeGen_gen_free(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_free");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -3116,7 +3116,7 @@ pub fn PeCodeGen_gen_to_str(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_to_str_str(rcx = str) -> rax = str (identity — just return input)
+// p_to_str_str(rcx = str) -> rax = str (identity -- just return input)
 pub fn PeCodeGen_gen_to_str_str(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_to_str_str");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -3384,7 +3384,7 @@ pub fn PeCodeGen_gen_vec_is_empty(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_vec_clear(rcx=*Vec) — set len=0
+// p_vec_clear(rcx=*Vec) -- set len=0
 pub fn PeCodeGen_gen_vec_clear(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_clear");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -3778,7 +3778,7 @@ pub fn PeCodeGen_gen_map_insert(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_map_remove(rcx=*Map, rdx=*u8 key) — removes key (shift remaining entries left)
+// p_map_remove(rcx=*Map, rdx=*u8 key) -- removes key (shift remaining entries left)
 pub fn PeCodeGen_gen_map_remove(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_map_remove");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -3801,7 +3801,7 @@ pub fn PeCodeGen_gen_map_remove(self: &mut PeCodeGen) {
     X86Encoder_place_label(&mut self.enc, mr_loop);
     X86Encoder_cmp_rr(&mut self.enc, REG_R9, REG_R8);
     var mr_done: i64 = X86Encoder_alloc_label(&mut self.enc);
-    X86Encoder_jcc_label(&mut self.enc, 3, mr_done); // jae — done
+    X86Encoder_jcc_label(&mut self.enc, 3, mr_done); // jae -- done
 
     // Get entry key: ptr = [r12], entry = ptr + r9*16, key = [entry]
     X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_R12);
@@ -3822,7 +3822,7 @@ pub fn PeCodeGen_gen_map_remove(self: &mut PeCodeGen) {
     X86Encoder_jcc_label(&mut self.enc, 5, mr_mismatch); // jne
     X86Encoder_test_rr(&mut self.enc, REG_R10, REG_R10);
     var mr_found: i64 = X86Encoder_alloc_label(&mut self.enc);
-    X86Encoder_jcc_label(&mut self.enc, 4, mr_found); // jz — null terminator, match
+    X86Encoder_jcc_label(&mut self.enc, 4, mr_found); // jz -- null terminator, match
     X86Encoder_inc_r(&mut self.enc, REG_RCX);
     X86Encoder_inc_r(&mut self.enc, REG_RDX);
     X86Encoder_jmp_label(&mut self.enc, mr_cmp);
@@ -3838,7 +3838,7 @@ pub fn PeCodeGen_gen_map_remove(self: &mut PeCodeGen) {
     X86Encoder_dec_r(&mut self.enc, REG_RAX);
     X86Encoder_cmp_rr(&mut self.enc, REG_R10, REG_RAX);
     var mr_shift_done: i64 = X86Encoder_alloc_label(&mut self.enc);
-    X86Encoder_jcc_label(&mut self.enc, 3, mr_shift_done); // jae — done
+    X86Encoder_jcc_label(&mut self.enc, 3, mr_shift_done); // jae -- done
 
     // Copy entry[i+1] to entry[i]
     X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_R12);
@@ -3881,7 +3881,7 @@ pub fn PeCodeGen_gen_map_remove(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_print_float(xmm0 = double) — prints float + newline
+// p_print_float(xmm0 = double) -- prints float + newline
 // Simplified: converts to int part + fractional part with 6 decimal places
 pub fn PeCodeGen_gen_print_float(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_print_float");
@@ -4057,7 +4057,7 @@ pub fn PeCodeGen_gen_to_str_vec(self: &mut PeCodeGen) {
     // r12 = vec ptr
     X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
 
-    // Start with "[" — malloc 2 bytes, store '[', '\0'
+    // Start with "[" -- malloc 2 bytes, store '[', '\0'
     X86Encoder_mov_imm32(&mut self.enc, REG_RCX, 2);
     X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_malloc"));
     X86Encoder_mov_rr(&mut self.enc, REG_R15, REG_RAX); // r15 = result
@@ -4075,12 +4075,12 @@ pub fn PeCodeGen_gen_to_str_vec(self: &mut PeCodeGen) {
     X86Encoder_place_label(&mut self.enc, tv_loop);
     X86Encoder_cmp_rr(&mut self.enc, REG_R13, REG_R14);
     var tv_done: i64 = X86Encoder_alloc_label(&mut self.enc);
-    X86Encoder_jcc_label(&mut self.enc, 3, tv_done); // jae — done
+    X86Encoder_jcc_label(&mut self.enc, 3, tv_done); // jae -- done
 
     // If index > 0, append ", "
     X86Encoder_test_rr(&mut self.enc, REG_R13, REG_R13);
     var tv_first: i64 = X86Encoder_alloc_label(&mut self.enc);
-    X86Encoder_jcc_label(&mut self.enc, 4, tv_first); // jz — first element, skip comma
+    X86Encoder_jcc_label(&mut self.enc, 4, tv_first); // jz -- first element, skip comma
     // Build ", \0" on stack at [rbp-16]
     X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 44); // ','
     X86Encoder_mov_mem_rbp_reg(&mut self.enc, -16, REG_RAX);
@@ -4116,7 +4116,7 @@ pub fn PeCodeGen_gen_to_str_vec(self: &mut PeCodeGen) {
     X86Encoder_jmp_label(&mut self.enc, tv_loop);
 
     X86Encoder_place_label(&mut self.enc, tv_done);
-    // Append "]" — build "]\0" on stack at [rbp-16]
+    // Append "]" -- build "]\0" on stack at [rbp-16]
     X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 93); // ']'
     X86Encoder_mov_mem_rbp_reg(&mut self.enc, -16, REG_RAX);
     X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 0);
@@ -4137,7 +4137,7 @@ pub fn PeCodeGen_gen_to_str_vec(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_print_vec(rcx=*Vec) — prints [1, 2, 3] with newline
+// p_print_vec(rcx=*Vec) -- prints [1, 2, 3] with newline
 pub fn PeCodeGen_gen_print_vec(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_print_vec");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4171,12 +4171,12 @@ pub fn PeCodeGen_gen_print_vec(self: &mut PeCodeGen) {
     X86Encoder_place_label(&mut self.enc, pv_loop);
     X86Encoder_cmp_rr(&mut self.enc, REG_R14, REG_R13);
     var pv_done: i64 = X86Encoder_alloc_label(&mut self.enc);
-    X86Encoder_jcc_label(&mut self.enc, 3, pv_done); // jae — done
+    X86Encoder_jcc_label(&mut self.enc, 3, pv_done); // jae -- done
 
     // if index > 0, print ", "
     X86Encoder_test_rr(&mut self.enc, REG_R14, REG_R14);
     var pv_nosep: i64 = X86Encoder_alloc_label(&mut self.enc);
-    X86Encoder_jcc_label(&mut self.enc, 4, pv_nosep); // jz — first element, no separator
+    X86Encoder_jcc_label(&mut self.enc, 4, pv_nosep); // jz -- first element, no separator
     // Print ", "
     X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 44); // ','
     X86Encoder_mov_mem_rbp_reg(&mut self.enc, -40, REG_RAX);
@@ -4226,7 +4226,7 @@ pub fn PeCodeGen_gen_print_vec(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_print_map(rcx=*Map) — prints {key: value, ...} with newline
+// p_print_map(rcx=*Map) -- prints {key: value, ...} with newline
 pub fn PeCodeGen_gen_print_map(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_print_map");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4242,7 +4242,7 @@ pub fn PeCodeGen_gen_print_map(self: &mut PeCodeGen) {
     // r12 = map
     X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
 
-    // Start with "{" — malloc 2 bytes, store '{', '\0'
+    // Start with "{" -- malloc 2 bytes, store '{', '\0'
     X86Encoder_mov_imm32(&mut self.enc, REG_RCX, 2);
     X86Encoder_call_label(&mut self.enc, PeCodeGen_get_func_label(self, "p_malloc"));
     X86Encoder_mov_rr(&mut self.enc, REG_R15, REG_RAX); // r15 = result
@@ -4261,12 +4261,12 @@ pub fn PeCodeGen_gen_print_map(self: &mut PeCodeGen) {
     X86Encoder_place_label(&mut self.enc, pm_loop);
     X86Encoder_cmp_rr(&mut self.enc, REG_R14, REG_R13);
     var pm_done: i64 = X86Encoder_alloc_label(&mut self.enc);
-    X86Encoder_jcc_label(&mut self.enc, 3, pm_done); // jae — done
+    X86Encoder_jcc_label(&mut self.enc, 3, pm_done); // jae -- done
 
     // If index > 0, append ", "
     X86Encoder_test_rr(&mut self.enc, REG_R14, REG_R14);
     var pm_first: i64 = X86Encoder_alloc_label(&mut self.enc);
-    X86Encoder_jcc_label(&mut self.enc, 4, pm_first); // jz — first element, skip comma
+    X86Encoder_jcc_label(&mut self.enc, 4, pm_first); // jz -- first element, skip comma
     // Build ", \0" on stack at [rbp-16]
     X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 44); // ','
     X86Encoder_mov_mem_rbp_reg(&mut self.enc, -16, REG_RAX);
@@ -4328,7 +4328,7 @@ pub fn PeCodeGen_gen_print_map(self: &mut PeCodeGen) {
     X86Encoder_jmp_label(&mut self.enc, pm_loop);
 
     X86Encoder_place_label(&mut self.enc, pm_done);
-    // Append "}" — build "}\0" on stack at [rbp-16]
+    // Append "}" -- build "}\0" on stack at [rbp-16]
     X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 125); // '}'
     X86Encoder_mov_mem_rbp_reg(&mut self.enc, -16, REG_RAX);
     X86Encoder_mov_r8_imm(&mut self.enc, REG_RAX, 0);
@@ -4353,7 +4353,7 @@ pub fn PeCodeGen_gen_print_map(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// ─── Entry point (_main) ────────────────────────────────────────────────
+// --- Entry point (_main) ------------------------------------------------
 pub fn PeCodeGen_gen_entry_point(self: &mut PeCodeGen) {
     self.entry_offset = X86Encoder_offset(&self.enc);
 
@@ -4380,9 +4380,9 @@ pub fn PeCodeGen_gen_entry_point(self: &mut PeCodeGen) {
     X86Encoder_ud2(&mut self.enc);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Missing vec helper runtime stubs (ported from src/pe.rs)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 // p_vec_contains(rcx=*Vec, rdx=i64 value) -> rax = bool
 pub fn PeCodeGen_gen_vec_contains(self: &mut PeCodeGen) {
@@ -4460,7 +4460,7 @@ pub fn PeCodeGen_gen_vec_clone(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_vec_insert — stub
+// p_vec_insert -- stub
 pub fn PeCodeGen_gen_vec_insert(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_insert");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4468,7 +4468,7 @@ pub fn PeCodeGen_gen_vec_insert(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_vec_remove — stub
+// p_vec_remove -- stub
 pub fn PeCodeGen_gen_vec_remove(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_remove");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4476,7 +4476,7 @@ pub fn PeCodeGen_gen_vec_remove(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_vec_reverse — stub
+// p_vec_reverse -- stub
 pub fn PeCodeGen_gen_vec_reverse(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_reverse");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4484,7 +4484,7 @@ pub fn PeCodeGen_gen_vec_reverse(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_vec_extend — stub
+// p_vec_extend -- stub
 pub fn PeCodeGen_gen_vec_extend(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_extend");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4492,7 +4492,7 @@ pub fn PeCodeGen_gen_vec_extend(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_vec_sort — stub
+// p_vec_sort -- stub
 pub fn PeCodeGen_gen_vec_sort(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_vec_sort");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4500,11 +4500,11 @@ pub fn PeCodeGen_gen_vec_sort(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // Missing map helper runtime stubs
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
-// p_map_clear(rcx=*Map) — set count=0
+// p_map_clear(rcx=*Map) -- set count=0
 pub fn PeCodeGen_gen_map_clear(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_map_clear");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4513,7 +4513,7 @@ pub fn PeCodeGen_gen_map_clear(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_map_keys — stub: returns empty Vec
+// p_map_keys -- stub: returns empty Vec
 pub fn PeCodeGen_gen_map_keys(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_map_keys");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4529,7 +4529,7 @@ pub fn PeCodeGen_gen_map_keys(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_map_values — stub: returns empty Vec
+// p_map_values -- stub: returns empty Vec
 pub fn PeCodeGen_gen_map_values(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_map_values");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4545,7 +4545,7 @@ pub fn PeCodeGen_gen_map_values(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_map_get_or — stub: returns default
+// p_map_get_or -- stub: returns default
 pub fn PeCodeGen_gen_map_get_or(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_map_get_or");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4553,7 +4553,7 @@ pub fn PeCodeGen_gen_map_get_or(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_map_clone — stub: returns empty Map
+// p_map_clone -- stub: returns empty Map
 pub fn PeCodeGen_gen_map_clone(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_map_clone");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4569,11 +4569,11 @@ pub fn PeCodeGen_gen_map_clone(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // String runtime stubs (ported from src/pe.rs)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
-// p_string_from — identity for strings
+// p_string_from -- identity for strings
 pub fn PeCodeGen_gen_string_from(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_from");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4581,7 +4581,7 @@ pub fn PeCodeGen_gen_string_from(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_len — strlen
+// p_string_len -- strlen
 pub fn PeCodeGen_gen_string_len(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_len");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4615,7 +4615,7 @@ pub fn PeCodeGen_gen_string_is_empty(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_push_str — same as p_str_concat
+// p_string_push_str -- same as p_str_concat
 pub fn PeCodeGen_gen_string_push_str(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_push_str");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4623,7 +4623,7 @@ pub fn PeCodeGen_gen_string_push_str(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_slice — pointer offset
+// p_string_slice -- pointer offset
 pub fn PeCodeGen_gen_string_slice(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_slice");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4632,7 +4632,7 @@ pub fn PeCodeGen_gen_string_slice(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_contains — stub: true
+// p_string_contains -- stub: true
 pub fn PeCodeGen_gen_string_contains(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_contains");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4640,7 +4640,7 @@ pub fn PeCodeGen_gen_string_contains(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_starts_with — stub: true
+// p_string_starts_with -- stub: true
 pub fn PeCodeGen_gen_string_starts_with(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_starts_with");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4648,7 +4648,7 @@ pub fn PeCodeGen_gen_string_starts_with(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_ends_with — stub: true
+// p_string_ends_with -- stub: true
 pub fn PeCodeGen_gen_string_ends_with(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_ends_with");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4656,7 +4656,7 @@ pub fn PeCodeGen_gen_string_ends_with(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_trim — stub: returns input
+// p_string_trim -- stub: returns input
 pub fn PeCodeGen_gen_string_trim(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_trim");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4664,7 +4664,7 @@ pub fn PeCodeGen_gen_string_trim(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_split — stub: empty Vec
+// p_string_split -- stub: empty Vec
 pub fn PeCodeGen_gen_string_split(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_split");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4680,7 +4680,7 @@ pub fn PeCodeGen_gen_string_split(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_replace — stub: returns input
+// p_string_replace -- stub: returns input
 pub fn PeCodeGen_gen_string_replace(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_replace");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4688,7 +4688,7 @@ pub fn PeCodeGen_gen_string_replace(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_char_at — pointer offset
+// p_string_char_at -- pointer offset
 pub fn PeCodeGen_gen_string_char_at(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_char_at");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4697,7 +4697,7 @@ pub fn PeCodeGen_gen_string_char_at(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_to_uppercase — stub: returns input
+// p_string_to_uppercase -- stub: returns input
 pub fn PeCodeGen_gen_string_to_uppercase(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_to_uppercase");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4705,7 +4705,7 @@ pub fn PeCodeGen_gen_string_to_uppercase(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_to_lowercase — stub: returns input
+// p_string_to_lowercase -- stub: returns input
 pub fn PeCodeGen_gen_string_to_lowercase(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_to_lowercase");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4713,7 +4713,7 @@ pub fn PeCodeGen_gen_string_to_lowercase(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_parse_int — atoi
+// p_string_parse_int -- atoi
 pub fn PeCodeGen_gen_string_parse_int(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_parse_int");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4741,7 +4741,7 @@ pub fn PeCodeGen_gen_string_parse_int(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_find — stub: 0
+// p_string_find -- stub: 0
 pub fn PeCodeGen_gen_string_find(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_find");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4749,7 +4749,7 @@ pub fn PeCodeGen_gen_string_find(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_rfind — stub: 0
+// p_string_rfind -- stub: 0
 pub fn PeCodeGen_gen_string_rfind(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_rfind");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4757,7 +4757,7 @@ pub fn PeCodeGen_gen_string_rfind(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_repeat — stub: returns input
+// p_string_repeat -- stub: returns input
 pub fn PeCodeGen_gen_string_repeat(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_repeat");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4765,7 +4765,7 @@ pub fn PeCodeGen_gen_string_repeat(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_bytes — same as strlen
+// p_string_bytes -- same as strlen
 pub fn PeCodeGen_gen_string_bytes(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_bytes");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4788,7 +4788,7 @@ pub fn PeCodeGen_gen_string_bytes(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// p_string_clone — copy string
+// p_string_clone -- copy string
 pub fn PeCodeGen_gen_string_clone(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_string_clone");
     X86Encoder_place_label(&mut self.enc, lbl);
@@ -4833,10 +4833,10 @@ pub fn PeCodeGen_gen_string_clone(self: &mut PeCodeGen) {
     X86Encoder_ret(&mut self.enc);
 }
 
-// ─── Helper: check if type is float ─────────────────────────────────────
+// --- Helper: check if type is float -------------------------------------
 // Note: ir_type_is_float and ir_type_size are already defined in ir.fd
 
-// ─── Write PE bytes to file ─────────────────────────────────────────────
+// --- Write PE bytes to file ---------------------------------------------
 // Convert Vec<i64> of bytes to a string for p_file_write
 pub fn pe_bytes_to_string(bytes: Vec) -> str {
     // We need to write raw bytes to a file, but p_file_write expects str

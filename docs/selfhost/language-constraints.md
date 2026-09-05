@@ -3,7 +3,7 @@
 > What the Fides language must respect, and how the self-hosted compiler
 > handles each feature.
 >
-> **Last updated:** Sep 5, 2026 (session 14)
+> **Last updated:** Sep 5, 2026 (session 15 — **BOOTSTRAP FIXPOINT ACHIEVED**)
 
 ---
 

@@ -2,11 +2,50 @@
 
 > Single source of truth for "what are we doing right now."
 > Read this first every session. Updated after every milestone change.
-> Last updated: Sep 4, 2026 (session 7).
+> Last updated: Sep 5, 2026 (session 15 — **BOOTSTRAP FIXPOINT ACHIEVED**).
 
-## Where We Stopped (Sep 4 session 7 — pick up here)
+## Where We Stopped (Sep 5 session 15 — pick up here)
 
-### MILESTONE: comptime_eval.fd full port + pe.fd runtime stubs + visibility fixes
+### MILESTONE: BOOTSTRAP FIXPOINT ACHIEVED — fides-c2.c == fides-c3.c
+
+The self-hosted compiler compiles itself to **byte-for-byte identical**
+output across generations (SHA256-identical, 701,100 lines each). This is
+the ultimate goal of self-hosting.
+
+**Bootstrap chain verified:**
+```
+Rust compiler → fides-c.c  (706,318 lines) → fides-c.exe
+fides-c.exe   → fides-c2.c (701,100 lines) → fides-c2.exe
+fides-c2.exe  → fides-c3.c (701,100 lines) → fides-c3.exe  ← IDENTICAL to c2
+fides-c3.exe  → compiles test_simple.fd correctly (EXIT 0)
+```
+
+**Four bugs were fixed in session 15:**
+1. **TCC 4KB stack overflow** (bug 1.33) — TCC's default stack was 4KB.
+   Fixed with `-Wl,-stack,268435456` (256MB).
+2. **type_eq pointer == on strings** (bug 1.34) — Replaced `==` with
+   `str_equal` in `type_eq` for `Type::Named`, `Type::Generic`,
+   `Type::Dyn`, `Type::Assoc`.
+3. **Large match expression codegen** (bug 1.35) — Split `subst_expr`
+   and `subst_stmt` in `mono.fd` into helper functions. Also split
+   `substitute_expr` in `comptime_eval.fd`.
+4. **Non-ASCII characters in compiler source** (bug 1.36) — Replaced
+   Unicode characters (em-dash, arrows, box-drawing) with ASCII
+   equivalents in all 25 `compiler/*.fd` files.
+
+**What's NOT yet done (post-fixpoint goals):**
+1. **Rust vs self-hosted parity** — c1=706K lines vs c2=701K lines (~5K
+   line difference). Does NOT block the self-hosted fixpoint but means
+   the Rust and self-hosted compilers produce slightly different C.
+2. **Debug prints** — 287 `p_eprint_str` calls in compiler source (go to
+   stderr, don't affect C output or fixpoint). Gate behind a flag.
+3. **Full test suite through self-hosted compiler** — Run all tests/
+   through fides-c2/fides-c3 and compare against Rust compiler results.
+4. **Import optimization** — Lightweight token scan for `use` imports.
+5. **Comptime substitution optimization** — Beyond the initial split.
+6. **HashMap-backed typechecker scopes** — Performance improvement.
+7. **Category C/D pipeline features** — Interpretation, native build,
+   WASM, safety verification — not needed for fixpoint.
 
 Three major pieces of work completed in session 7:
 
@@ -49,9 +88,11 @@ test_lower all exit 0 with "All tests passed!").
 second-generation binary (`fides-c2_test.exe`, 8.9MB).** All pipeline stages
 pass: typecheck, borrowck, mono, lower, C codegen, tcc link.
 
-The fixpoint (fides-c2 compiling main.fd → fides-c3) is blocked by a
+The fixpoint (fides-c2 compiling main.fd → fides-c3) was blocked by a
 pre-existing `STATUS_ACCESS_VIOLATION` crash in the self-compiled binary
-during stdlib lexing — same bug as session 4/5, unrelated to session 6 fixes.
+during stdlib lexing — **RESOLVED in session 15** (TCC 4KB stack overflow
+fixed with 256MB stack wrapper). **Bootstrap fixpoint achieved: fides-c2.c
+== fides-c3.c (SHA256-identical, 701,100 lines).**
 
 ### Session 7 work completed:
 1. **comptime_eval.fd full port** — `process_gen`, `substitute`, `evaluate`, `evaluate_with_env`, `evaluate_block`, `evaluate_reflect`, I-5A aggressive comptime, I-5D loop unrolling, reflection helpers, `box_expr_unbox`/`box_expr_new`
@@ -60,45 +101,51 @@ during stdlib lexing — same bug as session 4/5, unrelated to session 6 fixes.
 4. **I64Pair struct fix** — unified field names to `first`/`second` across `opt.fd` and `compiler.fd`
 
 ### What works:
-1. **Self-compilation** — `fides-c.exe` compiles `compiler/main.fd` → `fides-c2_test.exe` ✅ (EXIT 0)
-2. **All 18 self-host modules compile + pass tests** (23/23 on tests/compiler/ via interpreter + PE)
-3. **Build pipeline complete** — `compiler/*.fd` compiles to C via bootstrap, links via tcc
-4. **All pipeline stages pass** during self-compilation: lex, parse, typecheck, borrowck, mono, lower, C codegen, file write, tcc link
-5. **SRET calling convention** — struct-returning functions use hidden out-parameter
-6. **Enum layout** — payload sizes computed from actual field sizes with fixpoint iteration
-7. **Enum `==` comparison** — all enum comparisons use `*_eq()` helper functions (not broken `==`)
-8. **String builder (`p_sb_*`)** — mutable string builder eliminates O(n²) memory in C codegen
-9. **Vec-of-struct handling** — all Vec paths handle struct elements correctly
-10. **Safety hardening** — recursion limit, OOM abort, crash handlers, Windows stack
-11. **PE stack patching** — 256MB stack reserve for tcc-linked binaries
-12. **All 12 lowerer/codegen gaps ported** (Gaps 1-11 done, Gap 12 deferred)
-13. **Cross-module enum constructors** — `MethodCall` on enum names is handled in typechecker + lowerer (session 6)
-14. **HashMap-based import resolution** — O(1) module/struct/enum name lookups (session 6)
-15. **comptime_eval.fd full port** — process_gen, substitute, I-5A, I-5D, reflection (session 7)
-16. **pe.fd runtime stubs** — 25+ stubs for print, string, vec, map, float, bool (session 7)
+1. **Self-compilation** — `fides-c.exe` compiles `compiler/main.fd` → `fides-c2.exe` ✅ (EXIT 0)
+2. **Bootstrap fixpoint** — fides-c2.c == fides-c3.c (SHA256-identical, 701,100 lines) ✅ (session 15)
+3. **Three generations verified** — Rust → c1 → c2 → c3, with c2 == c3 ✅ (session 15)
+4. **Third-gen compiler works** — fides-c3.exe compiles test_simple.fd correctly ✅ (session 15)
+5. **All 18 self-host modules compile + pass tests** (23/23 on tests/compiler/ via interpreter + PE)
+6. **Build pipeline complete** — `compiler/*.fd` compiles to C via bootstrap, links via tcc
+7. **All pipeline stages pass** during self-compilation: lex, parse, typecheck, borrowck, mono, lower, C codegen, file write, tcc link
+8. **SRET calling convention** — struct-returning functions use hidden out-parameter
+9. **Enum layout** — payload sizes computed from actual field sizes with fixpoint iteration
+10. **Enum `==` comparison** — all enum comparisons use `*_eq()` helper functions (not broken `==`)
+11. **String builder (`p_sb_*`)** — mutable string builder eliminates O(n²) memory in C codegen
+12. **Vec-of-struct handling** — all Vec paths handle struct elements correctly
+13. **Safety hardening** — recursion limit, OOM abort, crash handlers, Windows stack
+14. **TCC stack patching** — 256MB stack reserve for tcc-linked binaries (session 15)
+15. **All 12 lowerer/codegen gaps ported** (Gaps 1-11 done, Gap 12 deferred)
+16. **Cross-module enum constructors** — `MethodCall` on enum names is handled in typechecker + lowerer (session 6)
+17. **HashMap-based import resolution** — O(1) module/struct/enum name lookups (session 6)
+18. **comptime_eval.fd full port** — process_gen, substitute, I-5A, I-5D, reflection (session 7)
+19. **pe.fd runtime stubs** — 25+ stubs for print, string, vec, map, float, bool (session 7)
+20. **type_eq str_equal fix** — string comparisons in type_eq use str_equal not == (session 15)
+21. **Large match expression splitting** — subst_expr, subst_stmt, substitute_expr split (session 15)
+22. **Non-ASCII character removal** — all Unicode chars replaced with ASCII in compiler source (session 15)
 
-### What's next:
-1. **Debug fides-c2.exe STATUS_ACCESS_VIOLATION** — second-generation compiler crashes during stdlib lexing. This is the #1 blocker for fixpoint verification. Likely a pre-existing lexer/recursion bug that only manifests in the self-compiled binary.
-2. **Fix `.exe` extension** — self-hosted compiler doesn't add `.exe` on Windows
-3. **Remove/gate debug prints** — 38 `p_eprint_str` calls in compiler.fd need gating
-4. **Fixpoint verification** — compare fides-c2.c against fides-c3.c (the ultimate goal)
-5. **pe.fd full struct/enum support** — needed for PE emitter to handle full compiler source
-6. **pe.fd float arithmetic** — xmm operations for float math
-7. **pe.fd many-arg calls** — stack-based argument passing for >4 args
+### What's next (post-fixpoint goals):
+1. **Rust vs self-hosted parity** — c1=706K lines vs c2=701K lines (~5K line difference). Investigate and close the gap.
+2. **Gate debug prints** — 287 `p_eprint_str` calls need gating behind a flag
+3. **Full test suite through self-hosted compiler** — Run all tests/ through fides-c2/fides-c3
+4. **Import optimization** — Lightweight token scan for `use` imports
+5. **Comptime substitution optimization** — Beyond the initial split
+6. **HashMap-backed typechecker scopes** — Performance improvement
+7. **pe.fd full struct/enum support** — needed for PE emitter to handle full compiler source
+8. **pe.fd float arithmetic** — xmm operations for float math
+9. **pe.fd many-arg calls** — stack-based argument passing for >4 args
 
-### Performance (session 6):
-- **Self-compile time: ~305s (5:05)** — import resolution is no longer the bottleneck
-- HashMap optimization reduced import resolution from ~238s to negligible
-- Remaining time is dominated by `total build` (262s) which includes parsing all 18 modules
-- Profiling breakdown: stdlib parse 6s, typecheck 4s, borrowck 1s, mono 1s, lower 4s, codegen 38s
+### Performance (session 15):
+- **Self-compile time: ~466s (7:46)** — c2 compiling compiler/main.fd to c3
+- Profiling: stdlib parse 7s, typecheck 0s, borrowck 8s, mono 0s, lower 8s, codegen 49s
 
 See `docs/roadmap/selfhost-roadmap.md` for the full plan.
 
-## Temporary workarounds (to remove after fixpoint):
+## Remaining workarounds (post-fixpoint cleanup):
 - `apply_cfg_filter` is a no-op in `compiler/compiler.fd`
 - `compute_func_effects` is a no-op in `compiler/typechecker.fd`
 - Debug prints in `compiler/parser.fd` (DEBUG parse_unary, DEBUG assign)
-- 38 `p_eprint_str` calls in `compiler.fd` and `main.fd`
+- 287 `p_eprint_str` calls in compiler source (go to stderr, don't affect fixpoint)
 
 ## Self-Host Module Status
 

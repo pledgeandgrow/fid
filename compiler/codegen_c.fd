@@ -1,18 +1,18 @@
-// codegen_c.fd ΓÇö C99 generator from Fides IR, rewritten from src/codegen_c.rs (4241 LOC)
+// codegen_c.fd - C99 generator from Fides IR, rewritten from src/codegen_c.rs (4241 LOC)
 //
 // Strategy: translate IR functions to C functions, with a runtime library
 // implementing p_vec_*, p_map_*, p_string_* in C. This produces portable
 // native binaries via gcc/clang.
 //
 // Adaptations from Rust:
-// 1. HashMap<K,V> ΓåÆ Vec-based maps with helper structs
-// 2. HashSet<T> ΓåÆ Vec<T> with contains() helper
-// 3. format! / wln! macro ΓåÆ direct string concatenation with int_to_str
-// 4. Box<IrType> ΓåÆ box_ir_type_unbox helper
-// 5. matches! macro ΓåÆ explicit match with _ => false
-// 6. Option<T> ΓåÆ Opt* enums
-// 7. String ΓåÆ str, u32/u64 ΓåÆ i64
-// 8. Vec::iter() ΓåÆ explicit while loops with .get(i)
+// 1. HashMap<K,V> - Vec-based maps with helper structs
+// 2. HashSet<T> - Vec<T> with contains() helper
+// 3. format! / wln! macro - direct string concatenation with int_to_str
+// 4. Box<IrType> - box_ir_type_unbox helper
+// 5. matches! macro - explicit match with _ => false
+// 6. Option<T> - Opt* enums
+// 7. String - str, u32/u64 - i64
+// 8. Vec::iter() - explicit while loops with .get(i)
 //
 // Dependencies: compiler::ast, compiler::ir
 
@@ -24,10 +24,10 @@ use string;
 use compiler::ast;
 use compiler::ir;
 
-// ΓöÇΓöÇΓöÇ Vec-based map entry structs ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- Vec-based map entry structs ------------------------------------------
 // Replace HashMap with Vec<Entry> + linear search.
 
-// value_names: ValueId ΓåÆ C variable name
+// value_names: ValueId - C variable name
 pub struct ValueNameEntry {
     pub id: i64,
     pub name: str,
@@ -37,7 +37,7 @@ pub fn ValueNameEntry_new(id: i64, name: str) -> ValueNameEntry {
     return ValueNameEntry { id: id, name: name };
 }
 
-// string_consts: original string ΓåÆ _strN name
+// string_consts: original string - _strN name
 pub struct StringConstEntry {
     pub key: str,
     pub val: str,
@@ -47,7 +47,7 @@ pub fn StringConstEntry_new(key: str, val: str) -> StringConstEntry {
     return StringConstEntry { key: key, val: val };
 }
 
-// fn_param_types: func name ΓåÆ Vec<IrType>
+// fn_param_types: func name - Vec<IrType>
 pub struct FnParamTypesEntry {
     pub key: str,
     pub types: Vec<IrType>,
@@ -58,8 +58,8 @@ pub fn FnParamTypesEntry_new(key: str, types: Vec<IrType>) -> FnParamTypesEntry 
 }
 
 // user_functions / extern_func_names: Vec<str> set
-// user_fn_param_types: func name ΓåÆ Vec<IrType>
-// fn_ret_types: func name ΓåÆ IrType
+// user_fn_param_types: func name - Vec<IrType>
+// fn_ret_types: func name - IrType
 pub struct FnRetTypeEntry {
     pub key: str,
     pub ty: IrType,
@@ -69,10 +69,10 @@ pub fn FnRetTypeEntry_new(key: str, ty: IrType) -> FnRetTypeEntry {
     return FnRetTypeEntry { key: key, ty: ty };
 }
 
-// ΓöÇΓöÇΓöÇ CCodeGen struct ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- CCodeGen struct ------------------------------------------------------
 
 pub struct CCodeGen {
-    // Accumulated C output ΓÇö uses p_sb (mutable string builder) to avoid
+    // Accumulated C output - uses p_sb (mutable string builder) to avoid
     // O(n^2) memory blowup from string concatenation.
     pub sb: i64,
     pub out: str,
@@ -123,7 +123,7 @@ pub fn CCodeGen_new() -> CCodeGen {
     return cg;
 }
 
-// ΓöÇΓöÇΓöÇ Output helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- Output helpers -------------------------------------------------------
 // Replaces the Rust wln! macro. All appends end with a newline.
 
 fn wln(self: &mut CCodeGen, s: str) -> void {
@@ -132,7 +132,7 @@ fn wln(self: &mut CCodeGen, s: str) -> void {
     p_sb_append(self.sb, "\n");
 }
 
-// ΓöÇΓöÇΓöÇ C type helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- C type helpers -------------------------------------------------------
 
 pub fn c_type(ty: IrType) -> str {
     match ty {
@@ -212,7 +212,7 @@ fn is_aggregate_ret(ty: IrType) -> bool {
     }
 }
 
-// C return type for a function ΓÇö aggregate types are `void` because the
+// C return type for a function - aggregate types are `void` because the
 // result is returned via a hidden out-parameter (first function argument).
 fn c_ret_type(ty: IrType) -> str {
     if is_aggregate_ret(ty) {
@@ -275,35 +275,35 @@ fn cast_arg(val: str, from: IrType, to: IrType) -> str {
     var to_is_struct: bool = is_aggregate_ret(to);
     var to_is_int: bool = is_int_type(to);
 
-    // Array params decay to pointers in C ΓÇö cast to element pointer type
+    // Array params decay to pointers in C - cast to element pointer type
     if to_is_array {
         return "(" + c_type(to_array_elem) + "*)" + val;
     }
 
     if !from_is_ptr && to_is_ptr && from_is_float {
-        // float ΓåÆ pointer: use type punning via union
+        // float - pointer: use type punning via union
         return "((union { double d; void* p; }){ .d = " + val + " }).p";
     }
     if !from_is_ptr && !to_is_ptr && from_is_float && to_is_int {
-        // float ΓåÆ int: use type punning via union
+        // float - int: use type punning via union
         return "((union { double d; int64_t i; }){ .d = " + val + " }).i";
     }
     if !from_is_ptr && to_is_ptr {
-        // int ΓåÆ pointer: cast to void*
+        // int - pointer: cast to void*
         return "(void*)" + val;
     }
     if from_is_ptr && !to_is_ptr {
-        // pointer ΓåÆ int: cast to int64_t
+        // pointer - int: cast to int64_t
         return "(int64_t)" + val;
     }
     if !from_is_ptr && !to_is_ptr && to_is_struct {
-        // pointer ΓåÆ struct pointer (out-param): cast to void*
+        // pointer - struct pointer (out-param): cast to void*
         return "(void*)" + val;
     }
     return val;
 }
 
-// ΓöÇΓöÇΓöÇ sanitize_c_name ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- sanitize_c_name ------------------------------------------------------
 // Renames Fides functions that collide with C keywords or C runtime names.
 
 fn sanitize_c_name(self: &CCodeGen, name: str) -> str {
@@ -393,7 +393,7 @@ fn sanitize_c_name(self: &CCodeGen, name: str) -> str {
     return name;
 }
 
-// ΓöÇΓöÇΓöÇ String escaping ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- String escaping ------------------------------------------------------
 
 fn escape_c_string(s: str) -> str {
     var result: str = "";
@@ -424,7 +424,7 @@ fn escape_c_string(s: str) -> str {
     return result;
 }
 
-// ΓöÇΓöÇΓöÇ Value/name helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- Value/name helpers ---------------------------------------------------
 
 fn val_name(self: &CCodeGen, id: i64) -> str {
     var i: i64 = 0;
@@ -449,7 +449,7 @@ fn fresh_temp(self: &mut CCodeGen) -> str {
     return "t" + int_to_str(n);
 }
 
-// ΓöÇΓöÇΓöÇ Vec helper: contains str ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- Vec helper: contains str ---------------------------------------------
 
 fn vec_contains_str(v: Vec<str>, s: str) -> bool {
     var i: i64 = 0;
@@ -462,7 +462,7 @@ fn vec_contains_str(v: Vec<str>, s: str) -> bool {
     return false;
 }
 
-// ΓöÇΓöÇΓöÇ Map helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- Map helpers ----------------------------------------------------------
 
 fn value_names_set(self: &mut CCodeGen, id: i64, name: str) -> void {
     var i: i64 = 0;
@@ -555,7 +555,7 @@ fn fn_ret_types_set(self: &mut CCodeGen, key: str, ty: IrType) -> void {
     self.fn_ret_types.push(FnRetTypeEntry_new(key, ty));
 }
 
-// ΓöÇΓöÇΓöÇ Helpers for building small Vec<IrType> ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- Helpers for building small Vec<IrType> -------------------------------
 
 fn t0() -> Vec<IrType> {
     return Vec::new();
@@ -595,7 +595,7 @@ pub fn ptr_u8() -> IrType {
     return IrType::Ptr(Box::new(IrType::U8));
 }
 
-// ΓöÇΓöÇΓöÇ Runtime builtin parameter signatures ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- Runtime builtin parameter signatures ---------------------------------
 
 fn CCodeGen_insert_runtime_sigs(self: &mut CCodeGen) -> void {
     // Vec builtins
@@ -855,7 +855,7 @@ fn CCodeGen_insert_runtime_sigs(self: &mut CCodeGen) -> void {
     fn_param_types_set(self, "p_qmatmul", t2(ptr_u8(), ptr_u8()));
     fn_param_types_set(self, "p_find_quant_params", t1(ptr_u8()));
 
-    // Runtime function return types ΓÇö most return int64_t or void*,
+    // Runtime function return types - most return int64_t or void*,
     // but some return void (mutating operations).
     var void_rets: Vec<str> = Vec::new();
     void_rets.push("p_vec_push");
@@ -945,7 +945,7 @@ fn CCodeGen_insert_runtime_sigs(self: &mut CCodeGen) -> void {
     fn_ret_types_set(self, "p_dropout", IrType::Opaque("Tensor"));
 }
 
-// ΓöÇΓöÇΓöÇ String helpers for unique collections ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- String helpers for unique collections --------------------------------
 
 fn vec_push_unique(v: &mut Vec<str>, s: str) -> void {
     var i: i64 = 0;
@@ -958,7 +958,7 @@ fn vec_push_unique(v: &mut Vec<str>, s: str) -> void {
     v.push(s);
 }
 
-// ΓöÇΓöÇΓöÇ Header / runtime type emission ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- Header / runtime type emission ---------------------------------------
 
 fn emit_runtime_header(self: &mut CCodeGen) -> void {
     wln(self, "// Auto-generated C code from Fides IR");
@@ -998,7 +998,7 @@ fn emit_runtime_header(self: &mut CCodeGen) -> void {
     wln(self, "");
 }
 
-// ΓöÇΓöÇΓöÇ FFI / extern declarations ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- FFI / extern declarations --------------------------------------------
 
 fn emit_extern_decls(self: &mut CCodeGen, module: IrModule) -> void {
     if module.extern_decls.len() == 0 {
@@ -1017,7 +1017,7 @@ fn emit_extern_decls(self: &mut CCodeGen, module: IrModule) -> void {
                         // System header
                         wln(self, "#include " + inc);
                     } else {
-                        // Local header ΓÇö check if file exists via file_exists helper
+                        // Local header - check if file exists via file_exists helper
                         var clean: str = str_trim_chars(inc, "\"<>");
                         if p_file_exists(clean) {
                             if str_starts_with(inc, "\"") {
@@ -1056,7 +1056,7 @@ fn emit_extern_decls(self: &mut CCodeGen, module: IrModule) -> void {
         ed = ed + 1;
     }
 
-    wln(self, "// ΓöÇΓöÇΓöÇ User-defined extern declarations (FFI) ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- User-defined extern declarations (FFI) ---");
     ed = 0;
     while ed < module.extern_decls.len() {
         var ext: ExternDecl = module.extern_decls.get(ed);
@@ -1206,11 +1206,11 @@ fn c_type_from_ast(ty: Type) -> str {
 }
 
 fn emit_runtime_types(self: &mut CCodeGen) -> void {
-    wln(self, "// ΓöÇΓöÇΓöÇ Runtime types ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- Runtime types ---");
     wln(self, "typedef struct { void** data; int64_t len; int64_t cap; } PVec;");
     wln(self, "typedef struct { char** keys; int64_t* vals; int64_t len; int64_t cap; } PMap;");
     wln(self, "");
-    wln(self, "// ΓöÇΓöÇΓöÇ Runtime function declarations ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- Runtime function declarations ---");
     wln(self, "PVec* p_vec_new(void);");
     wln(self, "void p_vec_push(PVec* v, void* val);");
     wln(self, "void* p_vec_get(PVec* v, int64_t idx);");
@@ -1511,7 +1511,7 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
 }
 
 fn emit_string_consts(self: &mut CCodeGen, module: IrModule) -> void {
-    wln(self, "// ΓöÇΓöÇΓöÇ String constants ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- String constants ---");
     var idx: i64 = 0;
     var f: i64 = 0;
     while f < module.functions.len() {
@@ -1574,7 +1574,7 @@ fn find_inst(insts: Vec<ValueIdInst>, id: i64) -> OptInst {
 }
 
 fn emit_struct_defs(self: &mut CCodeGen, module: IrModule) -> void {
-    wln(self, "// ΓöÇΓöÇΓöÇ Struct definitions ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- Struct definitions ---");
     var emitted: Vec<str> = Vec::new();
     var s: i64 = 0;
     while s < module.struct_layouts.len() {
@@ -1629,7 +1629,7 @@ fn emit_struct_defs(self: &mut CCodeGen, module: IrModule) -> void {
     }
 }
 
-// ΓöÇΓöÇΓöÇ Module-level mutable globals ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- Module-level mutable globals ------------------------------------------
 
 fn global_c_name(name: str) -> str {
     return "_g_" + name;
@@ -1656,7 +1656,7 @@ fn gen_global_init_expr(expr: Expr) -> str {
 
 fn emit_globals(self: &mut CCodeGen, module: IrModule) -> void {
     if module.globals.len() == 0 { return; }
-    wln(self, "// ΓöÇΓöÇΓöÇ Module-level mutable globals ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- Module-level mutable globals ---");
     var gi: i64 = 0;
     while gi < module.globals.len() {
         var entry: GlobalEntry = module.globals.get(gi);
@@ -1670,7 +1670,7 @@ fn emit_globals(self: &mut CCodeGen, module: IrModule) -> void {
 }
 
 fn emit_prototypes(self: &mut CCodeGen, module: IrModule) -> void {
-    wln(self, "// ΓöÇΓöÇΓöÇ Function prototypes ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- Function prototypes ---");
     wln(self, "void p_thread_register(const char* name, int64_t (*fn)());");
     var f: i64 = 0;
     while f < module.functions.len() {
@@ -1698,7 +1698,7 @@ fn emit_prototypes(self: &mut CCodeGen, module: IrModule) -> void {
 
 fn emit_main_wrapper(self: &mut CCodeGen, module: IrModule) -> void {
     if has_main(module) {
-        wln(self, "// ΓöÇΓöÇΓöÇ C entry point ΓöÇΓöÇΓöÇ");
+        wln(self, "// --- C entry point ---");
         // Windows: vectored exception handler to print call stack on crash
         wln(self, "#ifdef _WIN32");
         wln(self, "#include <windows.h>");
@@ -1790,7 +1790,7 @@ fn is_internal_function(name: str) -> bool {
     return false;
 }
 
-// ΓöÇΓöÇΓöÇ Value / name helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- Value / name helpers -------------------------------------------------
 
 fn value_names_clear(self: &mut CCodeGen) -> void {
     while self.value_names.len() > 0 {
@@ -1893,7 +1893,7 @@ fn unaryop_to_str(op: UnaryOp) -> str {
     return "-";
 }
 
-// ΓöÇΓöÇΓöÇ Function / instruction emission ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- Function / instruction emission --------------------------------------
 
 fn gen_function(self: &mut CCodeGen, name: str, func: IrFunction) -> void {
     value_names_clear(self);
@@ -1983,7 +1983,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
         }
         Inst::ConstFloat(value, ty) => {
             // B5: Use a union compound literal to reinterpret the IEEE 754
-            // bits as a float ΓÇö this preserves NaN payloads, -0.0, and Inf
+            // bits as a float - this preserves NaN payloads, -0.0, and Inf
             // bit patterns that are lost when converting to a decimal string.
             // Matches the Rust codegen (src/codegen_c.rs ConstFloat handler).
             if ir_type_eq(ty, IrType::F32) {
@@ -2074,7 +2074,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
             }
             if size == 0 { size = 8; }
             // Use alloca() for stack allocation instead of calloc() for heap.
-            // This is dramatically faster ΓÇö no syscall, no malloc overhead.
+            // This is dramatically faster - no syscall, no malloc overhead.
             // Memory is automatically freed when the function returns.
             wln(self, "    " + dst + " = alloca(" + int_to_str(size) + ");");
             wln(self, "    memset(" + dst + ", 0, " + int_to_str(size) + ");");
@@ -2219,7 +2219,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
         Inst::Call(fname, args, ret_ty, _) => {
             var c_fname: str = sanitize_c_name(self, fname);
 
-            // Special-case: print is polymorphic ΓÇö dispatch based on arg type
+            // Special-case: print is polymorphic - dispatch based on arg type
             if str_equal(fname, "print") && args.len() > 0 {
                 var arg_val: i64 = args.get(0);
                 var arg_ty: IrType = value_ty_for_id(func, arg_val);
@@ -2266,7 +2266,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                 return;
             }
 
-            // Special-case: println is polymorphic ΓÇö dispatch on value (2nd arg)
+            // Special-case: println is polymorphic - dispatch on value (2nd arg)
             if str_equal(fname, "println") && args.len() >= 2 {
                 var arg_val: i64 = args.get(1);
                 var arg_ty: IrType = value_ty_for_id(func, arg_val);
@@ -2314,7 +2314,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                 return;
             }
 
-            // Special-case: p_to_str is polymorphic ΓÇö dispatch based on arg type
+            // Special-case: p_to_str is polymorphic - dispatch based on arg type
             if str_equal(fname, "p_to_str") && args.len() > 0 {
                 var arg_val: i64 = args.get(0);
                 var arg_ty: IrType = value_ty_for_id(func, arg_val);
@@ -2557,7 +2557,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                 cand_i = cand_i + 1;
             }
             if first {
-                // No candidates found ΓÇö fall back to direct function pointer call
+                // No candidates found - fall back to direct function pointer call
                 var args_cast: Vec<str> = Vec::new();
                 var ai2: i64 = 0;
                 while ai2 < args.len() {
@@ -2692,7 +2692,7 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
     }
 }
 
-// ΓöÇΓöÇΓöÇ Module-level generation ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// --- Module-level generation ----------------------------------------------
 
 pub fn CCodeGen_generate(self: &mut CCodeGen, module: IrModule) -> str {
     CCodeGen_insert_runtime_sigs(self);
@@ -2765,7 +2765,7 @@ fn emit_file_write_bin_impl(self: &mut CCodeGen) -> void {
 fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     // Rest of runtime implementation
     wln(self, "");
-    wln(self, "// ΓöÇΓöÇΓöÇ Runtime implementation ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- Runtime implementation ---");
     wln(self, "");
     // Vec runtime
     wln(self, "PVec* p_vec_new(void) {");
@@ -2941,7 +2941,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return result;");
     wln(self, "}");
     wln(self, "");
-    // Mutable string builder ΓÇö avoids O(n^2) memory from repeated str_concat.
+    // Mutable string builder - avoids O(n^2) memory from repeated str_concat.
     // Uses realloc-based growth (via p_malloc_persistent) so old buffers are freed.
     wln(self, "typedef struct { char* buf; int64_t len; int64_t cap; } PStrBuilder;");
     wln(self, "int64_t p_sb_new(void) {");
@@ -2960,7 +2960,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "        char* nb = (char*)p_malloc_persistent(sb->cap);");
     wln(self, "        memcpy(nb, sb->buf, sb->len);");
     wln(self, "        nb[sb->len] = 0;");
-    wln(self, "        sb->buf = nb; /* old buffer leaked in persistent pool ΓÇö acceptable */");
+    wln(self, "        sb->buf = nb; /* old buffer leaked in persistent pool - acceptable */");
     wln(self, "    }");
     wln(self, "    memcpy(sb->buf + sb->len, s, slen);");
     wln(self, "    sb->len += slen;");
@@ -2988,9 +2988,9 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "        fprintf(stderr, \"stack trace:\\n\");");
     wln(self, "        for (int i = p_call_stack_depth - 1; i >= 0; i--) {");
     wln(self, "            if (i == p_call_stack_depth - 1)");
-    wln(self, "                fprintf(stderr, \"    ΓåÆ %s\\n\", p_call_stack[i]);");
+    wln(self, "                fprintf(stderr, \"    - %s\\n\", p_call_stack[i]);");
     wln(self, "            else");
-    wln(self, "                fprintf(stderr, \"    Γå│ called from %s\\n\", p_call_stack[i]);");
+    wln(self, "                fprintf(stderr, \"    -| called from %s\\n\", p_call_stack[i]);");
     wln(self, "        }");
     wln(self, "    }");
     wln(self, "    abort();");
@@ -3029,10 +3029,10 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "        return c->base;");
     wln(self, "    }");
     wln(self, "    if (!__p_arena_cur) { __p_arena_cur = __p_arena_new_chunk(); __p_arena_head = __p_arena_cur; }");
-    wln(self, "    if (!__p_arena_cur) { fprintf(stderr, \"p_malloc: OOM ΓÇö failed to create first arena chunk\\n\"); abort(); }");
+    wln(self, "    if (!__p_arena_cur) { fprintf(stderr, \"p_malloc: OOM - failed to create first arena chunk\\n\"); abort(); }");
     wln(self, "    if (__p_arena_cur->ptr + sz > __p_arena_cur->end) {");
     wln(self, "        __p_arena_chunk* nc = __p_arena_new_chunk();");
-    wln(self, "        if (!nc) { fprintf(stderr, \"p_malloc: OOM ΓÇö failed to allocate new arena chunk\\n\"); abort(); }");
+    wln(self, "        if (!nc) { fprintf(stderr, \"p_malloc: OOM - failed to allocate new arena chunk\\n\"); abort(); }");
     wln(self, "        __p_arena_cur->next = nc;");
     wln(self, "        __p_arena_cur = nc;");
     wln(self, "    }");
@@ -3041,7 +3041,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return result;");
     wln(self, "}");
     wln(self, "void* p_malloc_persistent(int64_t size) { if (size < 0) return NULL; return malloc((size_t)size); }");
-    wln(self, "void p_free(void* ptr) { /* arena memory ΓÇö no individual frees */ }");
+    wln(self, "void p_free(void* ptr) { /* arena memory - no individual frees */ }");
     wln(self, "int64_t p_arena_save(void) { return 0; }");
     wln(self, "void p_arena_restore(int64_t mark) {");
     wln(self, "    __p_arena_chunk* c = __p_arena_head;");
@@ -3078,7 +3078,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "}");
     wln(self, "int64_t p_file_delete(const char* path) { return remove(path) == 0 ? 0 : -1; }");
     wln(self, "int64_t p_file_size(const char* path) { FILE* f = fopen(path, \"rb\"); if (!f) return -1; fseek(f, 0, SEEK_END); int64_t sz = ftell(f); fclose(f); return sz < 0 ? -1 : sz; }");
-    // Read a line from stdin ΓÇö returns malloc'd string (caller must not free,
+    // Read a line from stdin - returns malloc'd string (caller must not free,
     // arena-managed). Returns NULL on EOF. Strips trailing \n and \r\n.
     wln(self, "char* p_read_line(void) {");
     wln(self, "    static char* __p_line_buf = NULL;");
@@ -3089,9 +3089,9 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    while (len > 0 && (__p_line_buf[len-1] == '\\n' || __p_line_buf[len-1] == '\\r')) { __p_line_buf[--len] = 0; }");
     wln(self, "    return __p_line_buf;");
     wln(self, "}");
-    // Check if stdin is at EOF ΓÇö used by LSP server to detect client disconnect.
+    // Check if stdin is at EOF - used by LSP server to detect client disconnect.
     wln(self, "int64_t p_stdin_eof(void) { return (int64_t)feof(stdin); }");
-    // Read exactly n bytes from stdin ΓÇö used by LSP protocol.
+    // Read exactly n bytes from stdin - used by LSP protocol.
     // Returns malloc'd string (nul-terminated). Returns NULL on EOF/error.
     wln(self, "char* p_read_stdin(int64_t n) {");
     wln(self, "    char* buf = (char*)p_malloc_persistent(n + 1);");
@@ -3107,13 +3107,13 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "}");
     // Environment variable builtins
     wln(self, "char* p_getenv(const char* name) { return getenv(name); }");
-    // Command-line argument builtins ΓÇö globals declared in emit_runtime_types
+    // Command-line argument builtins - globals declared in emit_runtime_types
     wln(self, "int64_t p_argc(void) { return (int64_t)__p_argc; }");
     wln(self, "char* p_argv(int64_t index) { if (index < 0 || index >= __p_argc) return NULL; return __p_argv[index]; }");
     // Process control builtins
     wln(self, "int64_t p_system(const char* cmd) { return (int64_t)system(cmd); }");
     wln(self, "void p_exit(int64_t code) { exit((int)code); }");
-    // Wall-clock timing builtins ΓÇö use clock_gettime(CLOCK_REALTIME)
+    // Wall-clock timing builtins - use clock_gettime(CLOCK_REALTIME)
     wln(self, "#if defined(__linux__) || defined(__APPLE__)");
     wln(self, "#include <time.h>");
     wln(self, "int64_t p_clock_now(void) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec; }");
@@ -3125,7 +3125,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_clock_now_us(void) { return (int64_t)time(NULL) * 1000000LL; }");
     wln(self, "int64_t p_clock_now_ms(void) { return (int64_t)time(NULL) * 1000LL; }");
     wln(self, "#endif");
-    // Regex builtin ΓÇö simple wildcard match (? and *)
+    // Regex builtin - simple wildcard match (? and *)
     wln(self, "bool p_regex_match(const char* s, const char* pattern) {");
     wln(self, "    if (!s || !pattern) return false;");
     wln(self, "    int64_t si = 0, pi = 0, s_len = (int64_t)strlen(s), p_len = (int64_t)strlen(pattern);");
@@ -3139,8 +3139,8 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    while (pi < p_len && pattern[pi] == '*') pi++;");
     wln(self, "    return pi == p_len;");
     wln(self, "}");
-    // ΓöÇΓöÇ Global string interner ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-    // Interns strings so identical content ΓåÆ same pointer. Enables == (pointer
+    // -- Global string interner ----------------------------------------------
+    // Interns strings so identical content - same pointer. Enables == (pointer
     // equality) instead of p_str_equal (byte-by-byte) in hot paths.
     // Uses a simple open-addressing hash table with linear probing.
     wln(self, "static char** __p_intern_table = NULL;");
@@ -3206,7 +3206,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "#include <pthread.h>");
     wln(self, "#endif");
     wln(self, "int64_t p_future_ready(int64_t value) { return value; }");
-    // Thread join table ΓÇö maps negative handle to pthread_t
+    // Thread join table - maps negative handle to pthread_t
     wln(self, "static pthread_t p_thread_handles[256];");
     wln(self, "static int p_thread_handle_count = 0;");
     wln(self, "static int64_t p_task_results[256];");
@@ -3222,7 +3222,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    p_thread_handles[idx] = 0;");
     wln(self, "    return p_task_results[idx];");
     wln(self, "}");
-    // ΓöÇΓöÇΓöÇ Phase 8A: Threads + atomics + mutex (using pthread) ΓöÇΓöÇΓöÇ
+    // --- Phase 8A: Threads + atomics + mutex (using pthread) ---
     wln(self, "#ifndef _WIN32");
     wln(self, "#include <stdatomic.h>");
     wln(self, "#endif");
@@ -3242,7 +3242,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "#define atomic_init(a, v) (*(a) = (v))");
     wln(self, "#endif");
     wln(self, "#include <stdarg.h>");
-    // Thread entry point ΓÇö calls a Fides function by name with i64 args.
+    // Thread entry point - calls a Fides function by name with i64 args.
     // The function lookup uses a simple dispatch table generated below.
     wln(self, "typedef struct { const char* name; int64_t (*fn)(); } p_thread_entry_t;");
     wln(self, "static p_thread_entry_t p_thread_entries[2048];");
@@ -3271,7 +3271,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return (void*)(intptr_t)result;");
     wln(self, "}");
     // Phase A1: Executor + non-blocking task poll
-    // Executor: just an ID ΓÇö tasks are tracked via the thread handle table.
+    // Executor: just an ID - tasks are tracked via the thread handle table.
     // Task done flags: maps future handle (negative index) to done flag.
     wln(self, "static atomic_int p_task_done_flags[256];");
     wln(self, "static int p_executor_count = 0;");
@@ -3327,7 +3327,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    }");
     wln(self, "    return count;");
     wln(self, "}");
-    // A2: Non-blocking poll ΓÇö returns PENDING_SENTINEL if task not done
+    // A2: Non-blocking poll - returns PENDING_SENTINEL if task not done
     wln(self, "int64_t p_task_poll_nonblocking(int64_t future) {");
     wln(self, "    if (future >= 0) return future; // eager future");
     wln(self, "    int idx = -(future + 1);");
@@ -3341,7 +3341,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    p_thread_handles[idx] = 0;");
     wln(self, "    return p_task_results[idx];");
     wln(self, "}");
-    // A2: Non-blocking poll all ΓÇö returns count of still-pending tasks
+    // A2: Non-blocking poll all - returns count of still-pending tasks
     wln(self, "int64_t p_executor_poll_all(int64_t exec) {");
     wln(self, "    (void)exec;");
     wln(self, "    int64_t pending = 0;");
@@ -3352,7 +3352,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    }");
     wln(self, "    return pending;");
     wln(self, "}");
-    // ΓöÇΓöÇΓöÇ Phase A3: Non-blocking IO (using threads for async) ΓöÇΓöÇΓöÇ
+    // --- Phase A3: Non-blocking IO (using threads for async) ---
     // Each async IO operation spawns a thread that performs the IO
     // and stores the result. The returned Future handle can be polled.
     wln(self, "#ifndef _WIN32");
@@ -3457,7 +3457,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    p_thread_handles[idx] = tid;");
     wln(self, "    return -(int64_t)(idx + 1);");
     wln(self, "}");
-    // Shared memory ΓÇö simple malloc-based, atomics use C11 stdatomic
+    // Shared memory - simple malloc-based, atomics use C11 stdatomic
     wln(self, "int64_t p_shared_alloc(int64_t size) { if (size < 0) return 0; return (int64_t)(intptr_t)malloc((size_t)size); }");
     wln(self, "int64_t p_atomic_load(int64_t addr) { return atomic_load((atomic_int_least64_t*)(intptr_t)addr); }");
     wln(self, "void p_atomic_store(int64_t addr, int64_t val) { atomic_store((atomic_int_least64_t*)(intptr_t)addr, val); }");
@@ -3473,7 +3473,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    (*rc)--;");
     wln(self, "    if (*rc <= 0) { free((void*)(intptr_t)rc_addr); }");
     wln(self, "}");
-    // Mutex ΓÇö use pthread_mutex_t allocated on heap
+    // Mutex - use pthread_mutex_t allocated on heap
     wln(self, "int64_t p_mutex_init(void) {");
     wln(self, "    pthread_mutex_t* m = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));");
     wln(self, "    pthread_mutex_init(m, NULL);");
@@ -3481,11 +3481,11 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "}");
     wln(self, "void p_mutex_lock(int64_t m) { pthread_mutex_lock((pthread_mutex_t*)(intptr_t)m); }");
     wln(self, "void p_mutex_unlock(int64_t m) { pthread_mutex_unlock((pthread_mutex_t*)(intptr_t)m); }");
-    // ΓöÇΓöÇΓöÇ Thread-local storage (pthread keys) ΓöÇΓöÇΓöÇ
+    // --- Thread-local storage (pthread keys) ---
     wln(self, "int64_t p_tls_create(void) { pthread_key_t key; pthread_key_create(&key, NULL); return (int64_t)key; }");
     wln(self, "int64_t p_tls_get(int64_t key) { return (int64_t)(intptr_t)pthread_getspecific((pthread_key_t)key); }");
     wln(self, "void p_tls_set(int64_t key, int64_t value) { pthread_setspecific((pthread_key_t)key, (void*)(intptr_t)value); }");
-    // ΓöÇΓöÇΓöÇ Channels (bounded MPSC queue with mutex + condvar) ΓöÇΓöÇΓöÇ
+    // --- Channels (bounded MPSC queue with mutex + condvar) ---
     // Channel layout: { mutex, cond_not_empty, cond_not_full, head, tail, count, capacity, closed, buffer[capacity] }
     // head = next read index, tail = next write index, count = current items
     // (pthread types already defined above)
@@ -3500,7 +3500,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    int closed;");
     wln(self, "    int64_t buffer[]; // flexible array member");
     wln(self, "} p_channel_t;");
-    wln(self, "// PENDING_SENTINEL ΓÇö returned by p_chan_try_recv when channel is empty");
+    wln(self, "// PENDING_SENTINEL - returned by p_chan_try_recv when channel is empty");
     wln(self, "#define P_CHAN_PENDING ((int64_t)0x8000000000000001LL)");
     wln(self, "int64_t p_chan_create(int64_t capacity) {");
     wln(self, "    if (capacity < 1) capacity = 1;");
@@ -3586,7 +3586,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    pthread_mutex_unlock(&ch->mutex);");
     wln(self, "    return closed;");
     wln(self, "}");
-    // Dynamic loading builtins (Phase 7.7) ΓÇö simulated to match interpreter
+    // Dynamic loading builtins (Phase 7.7) - simulated to match interpreter
     wln(self, "// Simulated dlopen: returns sequential handles (1, 2, ...) to match interpreter");
     wln(self, "static int64_t dl_handle_counter = 0;");
     wln(self, "int64_t p_dl_open(const char* path) {");
@@ -3605,7 +3605,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    (void)func_ptr; // simulated: return arg unchanged");
     wln(self, "    return arg;");
     wln(self, "}");
-    // Allocator builtins (Phase 2A.8) ΓÇö simplified stubs
+    // Allocator builtins (Phase 2A.8) - simplified stubs
     wln(self, "void* p_allocator_create(void* arg) { (void)arg; return (void*)1; }");
     wln(self, "int64_t p_allocator_alloc(void* alloc, int64_t size) { (void)alloc; if (size < 0) return 0; return (int64_t)(intptr_t)malloc((size_t)size); }");
     wln(self, "void p_allocator_free(void* alloc, int64_t ptr) { (void)alloc; free((void*)(intptr_t)ptr); }");
@@ -3832,9 +3832,9 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_f64_to_bits(double val) { union { double d; int64_t i; } u; u.d = val; return u.i; }");
     wln(self, "int64_t p_f32_to_bits(float val) { union { float f; int32_t i; } u; u.f = val; return (int64_t)u.i; }");
 
-    // ΓöÇΓöÇΓöÇ Socket builtins (native HTTP server, Phase 5D) ΓöÇΓöÇΓöÇ
+    // --- Socket builtins (native HTTP server, Phase 5D) ---
     wln(self, "");
-    wln(self, "// Socket operations ΓÇö native POSIX/Winsock implementation");
+    wln(self, "// Socket operations - native POSIX/Winsock implementation");
     wln(self, "#ifdef _WIN32");
     wln(self, "static int ws_initialized = 0;");
     wln(self, "static void init_winsock(void) {");
@@ -3928,9 +3928,9 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return strdup(buf);");
     wln(self, "}");
 
-    // ΓöÇΓöÇΓöÇ Bare metal builtins (Phase 5A) ΓÇö stubs for C codegen ΓöÇΓöÇΓöÇ
+    // --- Bare metal builtins (Phase 5A) - stubs for C codegen ---
     wln(self, "");
-    wln(self, "// Bare metal stubs ΓÇö no-ops in C codegen (use --bare for real hardware)");
+    wln(self, "// Bare metal stubs - no-ops in C codegen (use --bare for real hardware)");
     wln(self, "void p_cli(void) {}");
     wln(self, "void p_sti(void) {}");
     wln(self, "void p_hlt(void) {}");
@@ -3945,9 +3945,9 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_phys_read64(int64_t addr) { return _phys_mem[(addr/8) & 65535]; }");
     wln(self, "void p_phys_write64(int64_t addr, int64_t val) { _phys_mem[(addr/8) & 65535] = val; }");
 
-    // ΓöÇΓöÇΓöÇ SIMD builtins (Phase 5C) ΓÇö operate on Vec<f64> ΓöÇΓöÇΓöÇ
+    // --- SIMD builtins (Phase 5C) - operate on Vec<f64> ---
     wln(self, "");
-    wln(self, "// SIMD builtins ΓÇö operate on Fides Vec (i64 pointer, f64 stored as i64 bits)");
+    wln(self, "// SIMD builtins - operate on Fides Vec (i64 pointer, f64 stored as i64 bits)");
     wln(self, "// Helper: read double from Fides Vec element (stored as i64 bit pattern)");
     wln(self, "static double _fvec_get_f64(int64_t v, int i) {");
     wln(self, "    int64_t val = (int64_t)p_vec_get((PVec*)v, i);");
@@ -4023,12 +4023,12 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return result;");
     wln(self, "}");
     wln(self, "");
-    wln(self, "// ΓöÇΓöÇΓöÇ Tensor builtins (Phase 5C) ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- Tensor builtins (Phase 5C) ---");
     wln(self, "");
-    wln(self, "// Tensor builtins ΓÇö simple flat array with shape metadata");
+    wln(self, "// Tensor builtins - simple flat array with shape metadata");
     wln(self, "// PTensor typedef already emitted in header section");
     wln(self, "");
-    wln(self, "// ΓöÇΓöÇΓöÇ ML3: Autograd tape data structures (must be before tensor builtins) ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- ML3: Autograd tape data structures (must be before tensor builtins) ---");
     wln(self, "typedef enum { AG_ADD, AG_SUB, AG_MUL, AG_MATMUL, AG_SCALE, AG_RELU, AG_SIGMOID, AG_SUM, AG_MEAN, AG_NEG } AGOpKind;");
     wln(self, "typedef struct {");
     wln(self, "    AGOpKind op;");
@@ -4380,7 +4380,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return result;");
     wln(self, "}");
     wln(self, "");
-    wln(self, "// ΓöÇΓöÇΓöÇ ML3: Autograd tape runtime (functions only ΓÇö data structures defined above) ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- ML3: Autograd tape runtime (functions only - data structures defined above) ---");
     wln(self, "");
     wln(self, "void p_autograd_begin(void) {");
     wln(self, "    ag_mode = 1; ag_tape_len = 0; ag_grad_len = 0;");
@@ -4579,7 +4579,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return r;");
     wln(self, "}");
     wln(self, "");
-    wln(self, "// ΓöÇΓöÇΓöÇ ML9: KV Cache runtime ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- ML9: KV Cache runtime ---");
     wln(self, "");
     wln(self, "typedef struct { int64_t seq_len; PTensor* k_data; PTensor* v_data; } KVLayer;");
     wln(self, "typedef struct { int64_t num_layers; int64_t max_seq_len; int64_t window_size; int64_t head_dim; KVLayer* layers; } KVCache;");
@@ -4657,7 +4657,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "        else c->layers[i].seq_len = 0;");
     wln(self, "    }");
     wln(self, "}");
-    wln(self, "// ΓöÇΓöÇΓöÇ ML10: Quantization runtime ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- ML10: Quantization runtime ---");
     wln(self, "");
     wln(self, "void* p_quantize_q8(void* t, double scale, int64_t zero_point) {");
     wln(self, "    PTensor* pt = (PTensor*)t; if (!pt) return NULL;");
@@ -4697,9 +4697,9 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    char* r = (char*)malloc(64); snprintf(r, 64, \"%.17g,%lld\", scale, (long long)zp); return r;");
     wln(self, "}");
     wln(self, "");
-    wln(self, "// ΓöÇΓöÇΓöÇ JSON builtins (Phase 5D) ΓÇö simple JSON implementation ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- JSON builtins (Phase 5D) - simple JSON implementation ---");
     wln(self, "");
-    wln(self, "// JSON builtins ΓÇö simple key-value store");
+    wln(self, "// JSON builtins - simple key-value store");
     wln(self, "typedef struct { char** keys; char** vals; int64_t len; int64_t cap; int64_t is_array; } PJson;");
     wln(self, "static char* _json_dump_obj(PJson* pj); // forward decl");
     wln(self, "void _json_append(PJson* j, const char* key, const char* val) {");
@@ -4876,7 +4876,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    while (*found == ' ') found++;");
     wln(self, "    // Return the raw JSON value (with quotes for strings, as json::dump would)");
     wln(self, "    if (*found == '\"') {");
-    wln(self, "        // String value ΓÇö return with quotes (handle escaped quotes)");
+    wln(self, "        // String value - return with quotes (handle escaped quotes)");
     wln(self, "        const char* end = found + 1;");
     wln(self, "        while (*end) { if (*end == '\\\\' && end[1]) end += 2; else if (*end == '\"') break; else end++; }");
     wln(self, "        size_t len = end - found + 1; // include closing quote");
@@ -4884,7 +4884,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "        return result;");
     wln(self, "    }");
     wln(self, "    if (*found == '{' || *found == '[') {");
-    wln(self, "        // Nested object/array ΓÇö find matching close brace");
+    wln(self, "        // Nested object/array - find matching close brace");
     wln(self, "        char open = *found; char close = open == '{' ? '}' : ']';");
     wln(self, "        int depth = 1; const char* end = found + 1;");
     wln(self, "        while (*end && depth > 0) {");
@@ -4920,7 +4920,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "        while (*s == ' ' || *s == '\\t') s++;");
     wln(self, "        if (*s == ']' || !*s) return strdup(\"null\");");
     wln(self, "        if (cur == idx) {");
-    wln(self, "            // Found the element ΓÇö extract it");
+    wln(self, "            // Found the element - extract it");
     wln(self, "            if (*s == '\"') {");
     wln(self, "                const char* end = s + 1;");
     wln(self, "                while (*end && *end != '\"') end++;");
@@ -4962,7 +4962,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "}");
     wln(self, "void* p_json_object_get(void* j, const char* key) { return p_json_get(j, key); }");
     wln(self, "");
-    wln(self, "// ΓöÇΓöÇΓöÇ HTTP builtins (Phase 5D) ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- HTTP builtins (Phase 5D) ---");
     wln(self, "");
     wln(self, "int64_t p_http_listen(int64_t port) { return p_socket_listen(port); }");
     wln(self, "char* p_http_recv_request(int64_t fd) { return p_socket_recv_str(fd); }");
@@ -5042,9 +5042,9 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return result;");
     wln(self, "}");
     wln(self, "");
-    wln(self, "// ΓöÇΓöÇΓöÇ DB builtins (Phase 5D) ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- DB builtins (Phase 5D) ---");
     wln(self, "");
-    wln(self, "// DB builtins ΓÇö in-memory key-value store");
+    wln(self, "// DB builtins - in-memory key-value store");
     wln(self, "typedef struct { char** keys; char** vals; int64_t len; int64_t cap; } PDB;");
     wln(self, "void* p_db_connect(const char* conn_str) {");
     wln(self, "    (void)conn_str;");
@@ -5067,7 +5067,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    if (pdb->len >= pdb->cap) { pdb->cap = pdb->cap == 0 ? 8 : pdb->cap * 2; pdb->keys = (char**)realloc(pdb->keys, pdb->cap * sizeof(char*)); pdb->vals = (char**)realloc(pdb->vals, pdb->cap * sizeof(char*)); }");
     wln(self, "    pdb->keys[pdb->len] = strdup(key); pdb->vals[pdb->len] = strdup(val); pdb->len++;");
     wln(self, "}");
-    wln(self, "// ΓöÇΓöÇΓöÇ Memory DB implementation ΓöÇΓöÇΓöÇ");
+    wln(self, "// --- Memory DB implementation ---");
     wln(self, "typedef struct { char** keys; char** vals; int64_t len; int64_t cap; } PMemDB;");
     wln(self, "void* p_db_mem_open(void) {");
     wln(self, "    PMemDB* db = (PMemDB*)calloc(1, sizeof(PMemDB));");
@@ -5172,7 +5172,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "");
     wln(self, "int64_t __ecs_add(const char* comp_name, int64_t entity, void* value) {");
     wln(self, "    EcsComponent* c = p_ecs_get_or_create_component(comp_name);");
-    wln(self, "    // Check if entity already exists ΓÇö update value");
+    wln(self, "    // Check if entity already exists - update value");
     wln(self, "    for (int64_t i = 0; i < c->len; i++) {");
     wln(self, "        if (c->entries[i].entity == entity) { c->entries[i].value = value; return 0; }");
     wln(self, "    }");

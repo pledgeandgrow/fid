@@ -1,7 +1,7 @@
 # Vision Analysis — Are We on the Right Path?
 
 > An honest assessment of where Fides is, where it's going, and what the
-> self-hosting effort needs to succeed. Updated Sep 5, 2026 (session 14).
+> self-hosting effort needs to succeed. Updated Sep 5, 2026 (session 15 — **BOOTSTRAP FIXPOINT ACHIEVED**).
 
 ---
 
@@ -53,19 +53,15 @@ The North Star: one language for OS kernels, web servers, robots, AI, microcontr
 | `.exe` extension | **✅ FIXED** | Auto-appended in ccompile + build commands (session 8) |
 | Category B parity | **✅ RESOLVED** | B5 fixed, B6/B7/B8 at parity (session 14) |
 | Float bit-patterns | **✅ PRESERVED** | p_f64_to_bits/p_f32_to_bits + union literals (session 14) |
-| Bootstrap fixpoint | **NOT YET VERIFIED** | fides-c2 crashes in TypeChecker_lookup (Category A); need to fix + verify |
+| Bootstrap fixpoint | **✅ ACHIEVED** | fides-c2.c == fides-c3.c (SHA256-identical, 701,100 lines, session 15) |
 
 ### What doesn't work yet
 
-1. **fides-c2.exe crashes during typecheck** — second-generation compiler crashes
-   in `TypeChecker_lookup` (null pointer from `Vec_get` on empty scopes). This is
-   a Category A crash blocker. (Session 12 found the earlier crash was primarily
-   stack overflow, now fixed via TCC stack patch.)
-2. **Bootstrap fixpoint not verified** — can't yet confirm stage2.c == stage3.c
-3. **Debug prints** — 38 `p_eprint_str` calls need gating behind a debug flag
-4. **PE emitter limited to simple programs** — needs struct/enum, float arithmetic, many-arg calls for full compiler source
-5. **Linux native codegen not integrated** — peephole.fd, regalloc.fd, codegen_x64.fd are ported but not wired into the pipeline (requires elf64.rs, linker.rs, runtime_linux.rs porting)
-6. **`var` feature not mirrored** — Rust compiler supports module-level `var`/`pub var` but self-hosted compiler files don't yet parse/typecheck/lower/emit globals
+1. **Rust vs self-hosted parity gap** — c1=706K lines vs c2=701K lines (~5K line difference). Does NOT block the self-hosted fixpoint but means the Rust and self-hosted compilers produce slightly different C.
+2. **Debug prints** — 287 `p_eprint_str` calls go to stderr (don't affect C output or fixpoint). Gating behind a flag is a cleanup task.
+3. **PE emitter limited to simple programs** — needs struct/enum, float arithmetic, many-arg calls for full compiler source
+4. **Linux native codegen not integrated** — peephole.fd, regalloc.fd, codegen_x64.fd are ported but not wired into the pipeline (requires elf64.rs, linker.rs, runtime_linux.rs porting)
+5. **`var` feature not mirrored** — Rust compiler supports module-level `var`/`pub var` but self-hosted compiler files don't yet parse/typecheck/lower/emit globals
 
 ---
 
@@ -83,14 +79,13 @@ The self-hosting approach is correct:
 - Test at every step (23/23 self-host tests pass)
 - Bootstrap via C codegen (simplest path to a working binary)
 
-### Yes — the current blocker is the right one to focus on
+### Yes — the bootstrap fixpoint is achieved
 
-The self-hosted compiler now compiles itself (session 4). The remaining
-blocker is that fides-c2.exe (the second generation) crashes on stdlib.
-Once that's fixed:
-1. We can verify the fixpoint (fides-c2.c == fides-c3.c)
-2. We have a self-reproducing compiler
-3. Rust is only needed for the initial bootstrap
+The self-hosted compiler compiles itself (session 4) and reproduces
+byte-identical output across generations (session 15):
+1. ✅ Fixpoint verified: fides-c2.c == fides-c3.c (SHA256-identical, 701,100 lines)
+2. ✅ Self-reproducing compiler — Rust is only needed for the initial bootstrap
+3. ✅ Three generations verified (Rust → c1 → c2 → c3, all work)
 
 ### The direction change is correct
 
@@ -110,14 +105,15 @@ The user's change to `pattern_binding_ir_types` (using `word_repr` for all types
 
 ## What Needs to Happen
 
-### Immediate (to unblock fixpoint verification)
+### Immediate (post-fixpoint cleanup)
 
 1. ~~**Fix `.exe` extension** in self-hosted compiler output (Windows)~~ — DONE (session 8)
 2. ~~**Category B codegen parity gaps**~~ — DONE (session 14: B5 fixed, B6/B7/B8 at parity)
-3. **Fix Category A crash blockers** — TypeChecker_lookup null deref, statement-dropping bug
-4. **Mirror `var` feature to `compiler/*.fd`** — needed for inc.fd global cache
-5. **Remove/gate debug prints** — 38 `p_eprint_str` calls
-6. **Run the fixpoint test:** `diff fides-c2.exe.c fides-c3.exe.c`
+3. ~~**Fix Category A crash blockers**~~ — DONE (session 15: stack wrapper + type_eq fix + large match split + non-ASCII removal)
+4. ~~**Run the fixpoint test**~~ — DONE (session 15: fides-c2.c == fides-c3.c, 0 diffs / 701,100 lines)
+5. **Mirror `var` feature to `compiler/*.fd`** — needed for inc.fd global cache
+6. **Gate debug prints** — 287 `p_eprint_str` calls (cleanup, doesn't affect fixpoint)
+7. **Close Rust vs self-hosted parity gap** — c1=706K vs c2=701K lines
 
 ### Near-term (after bootstrap)
 

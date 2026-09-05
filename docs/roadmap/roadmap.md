@@ -456,10 +456,10 @@ self-hosted compiler successfully compiles itself (EXIT 0). The PE emitter
 has been ported with 25+ runtime stubs. Comptime evaluation has been fully
 ported.
 
-**Status:** All 3 language-level blockers resolved. All 18 self-host
+**Status:** All 3 language-level blockers resolved. All 25 self-host
 modules rewritten. Self-compilation works (EXIT 0). PE emitter works for
-simple programs. Comptime eval fully ported. Fixpoint verification is
-blocked by a pre-existing crash in the second-generation binary.
+simple programs. Comptime eval fully ported. **Bootstrap fixpoint achieved
+(session 15): fides-c2.c == fides-c3.c (SHA256-identical, 701,100 lines).**
 
 ### Milestones
 - [x] `unsafe {}` blocks — with unsafe_depth tracking
