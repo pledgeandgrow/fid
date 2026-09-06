@@ -4465,13 +4465,16 @@ while self.match_tok(TokenKind::Comma) {
                 if s == "out" {
                     self.advance();
                     direction = AsmDir::Out;
+                } else if s == "clobber" {
+                    self.advance();
+                    direction = AsmDir::Clobber;
                 } else {
                     got_dir = false;
                 }
             }
         }
         if !got_dir {
-            return ParseResultExpr::Err("Parse error: asm! operand must start with 'in' or 'out'");
+            return ParseResultExpr::Err("Parse error: asm! operand must start with 'in', 'out', or 'clobber'");
         }
     }
     match self.expect(TokenKind::LParen, "(") {
@@ -4493,10 +4496,13 @@ while self.match_tok(TokenKind::Comma) {
         ParseResultUnit::Err(e) => { return ParseResultExpr::Err(e); }
         ParseResultUnit::Ok => {}
     }
+    // Clobber operands don't have an expression — use IntLit(0) as placeholder
     var expr: Expr = Expr::IntLit(0);
-    match self.parse_expr() {
-        ParseResultExpr::Ok(e) => { expr = e; }
-        ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+    if direction != AsmDir::Clobber {
+        match self.parse_expr() {
+            ParseResultExpr::Ok(e) => { expr = e; }
+            ParseResultExpr::Err(e) => { return ParseResultExpr::Err(e); }
+        }
     }
     operands.push(AsmOperand_new(direction, reg, expr));
 }

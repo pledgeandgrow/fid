@@ -1,0 +1,105 @@
+// Test: Tier 1 kernel features
+use volatile;
+use bitfield;
+use fmt;
+
+@interrupt fn timer_handler() {
+    p_serial_write(0x54);
+}
+
+@panic_handler fn my_panic(msg: str) {
+    p_serial_write(0x50);
+}
+
+fn main() {
+    // Test 1: Volatile wrapper
+    var v: Volatile = Volatile::new(p_alloc(8));
+    v.store(42);
+    val loaded = v.load();
+    print("Volatile store/load: ");
+    print(loaded);
+    print("\n");
+
+    v.store8(65);
+    val b8 = v.load8();
+    print("Volatile 8-bit: ");
+    print(b8);
+    print("\n");
+
+    v.store32(0x12345678);
+    val b32 = v.load32();
+    print("Volatile 32-bit: ");
+    print(b32);
+    print("\n");
+
+    // Test 2: Pointer arithmetic
+    val base: i64 = p_alloc(16);
+    ptr_write_volatile(base, 100);
+    ptr_write_volatile(ptr_add(base, 8), 200);
+    val v0 = ptr_read_volatile(base);
+    val v1 = ptr_read_volatile(ptr_add(base, 8));
+    print("Ptr[0]: ");
+    print(v0);
+    print(" Ptr[1]: ");
+    print(v1);
+    print("\n");
+
+    // Test 3: Bitfield helpers (constants are imported directly)
+    var cr0: i64 = 0;
+    cr0 = set_bit(cr0, CR0_PE);
+    cr0 = set_bit(cr0, CR0_PG);
+    cr0 = set_bit(cr0, CR0_WP);
+
+    val pe = bit(cr0, CR0_PE);
+    val pg = bit(cr0, CR0_PG);
+    val mp = bit(cr0, CR0_MP);
+    print("CR0.PE=");
+    print(pe);
+    print(" CR0.PG=");
+    print(pg);
+    print(" CR0.MP=");
+    print(mp);
+    print("\n");
+
+    // Test multi-bit field get/set
+    var gdt_entry: i64 = 0;
+    gdt_entry = set(gdt_entry, 0, 16, 0xFFFF);
+    gdt_entry = set(gdt_entry, 40, 8, 0x9A);
+    gdt_entry = set(gdt_entry, 48, 4, 0xA);
+
+    val access = get(gdt_entry, 40, 8);
+    print("GDT access: 0x");
+    print(fmt_hex(access));
+    print("\n");
+
+    val limit_low = get(gdt_entry, 0, 16);
+    print("GDT limit: 0x");
+    print(fmt_hex(limit_low));
+    print("\n");
+
+    // Test 4: Page table entry
+    var pte: i64 = 0;
+    pte = set_bit(pte, PTE_PRESENT);
+    pte = set_bit(pte, PTE_WRITABLE);
+    pte = set(pte, 12, 40, 0x10000);
+    val pte_present = bit(pte, PTE_PRESENT);
+    val pte_writable = bit(pte, PTE_WRITABLE);
+    val pte_addr = get(pte, 12, 40);
+    print("PTE: present=");
+    print(pte_present);
+    print(" writable=");
+    print(pte_writable);
+    print(" addr=0x");
+    print(fmt_hex(pte_addr));
+    print("\n");
+
+    if loaded == 42 && b8 == 65 && b32 == 0x12345678 && v0 == 100 && v1 == 200
+       && pe == 1 && pg == 1 && mp == 0 && access == 0x9A && limit_low == 0xFFFF
+       && pte_present == 1 && pte_writable == 1 && pte_addr == 0x10000 {
+        print("All Tier 1 kernel features test passed!\n");
+        return 0;
+    } else {
+        print("Tier 1 test FAILED!\n");
+        return 1;
+    }
+}

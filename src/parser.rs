@@ -3340,6 +3340,7 @@ impl Parser {
             TokenKind::Kernel => { self.advance(); "kernel".to_string() }
             TokenKind::Layer => { self.advance(); "layer".to_string() }
             TokenKind::Model => { self.advance(); "model".to_string() }
+            TokenKind::Interrupt => { self.advance(); "interrupt".to_string() }
             _ => return Err(format!(
                 "Parse error at {}:{}: expected annotation name after '@' but got '{:?}'",
                 self.peek_token().line, self.peek_token().col, self.peek()

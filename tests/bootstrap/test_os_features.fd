@@ -1,0 +1,176 @@
+// tests/test_os_features.fd — Test OS development features
+//
+// Tests: volatile memory access, interrupt handlers, pointer arithmetic,
+// bitfield helpers, and panic handler.
+//
+// Build: fides-c build tests/test_os_features.fd -o release/test_os.efi --uefi
+
+module test_os_features;
+
+use volatile;
+use bitfield;
+
+// ─── 1. Volatile memory access ───────────────────────────────────────────
+// Test Volatile<T> wrapper for MMIO
+
+fn test_volatile() -> i64 {
+    // Create a volatile pointer to a stack variable
+    var stack_val: i64 = 42;
+    var addr: i64 = 0;
+    unsafe { addr = &stack_val as *mut i64 as i64; }
+
+    // Use Volatile wrapper
+    var v: Volatile = Volatile::new(addr);
+    var loaded: i64 = v.load();
+    if loaded != 42 {
+        p_eprint_str("FAIL: volatile load returned ");
+        p_eprint_str(int_to_str(loaded));
+        p_eprint_str(" expected 42\n");
+        return 1;
+    }
+
+    // Volatile store
+    v.store(99);
+    if stack_val != 99 {
+        p_eprint_str("FAIL: volatile store didn't work\n");
+        return 1;
+    }
+
+    // 8-bit volatile access
+    v.store8(65);
+    var b: i64 = v.load8();
+    if b != 65 {
+        p_eprint_str("FAIL: volatile 8-bit access\n");
+        return 1;
+    }
+
+    p_eprint_str("PASS: volatile memory access\n");
+    return 0;
+}
+
+// ─── 2. Interrupt handler ────────────────────────────────────────────────
+// Test @interrupt attribute (compiles, but doesn't actually trigger IRQ)
+
+interrupt fn test_interrupt_handler() {
+    // This should compile with interrupt prologue/epilogue
+    // In a real OS, this would be registered in the IDT
+    p_eprint_str("Interrupt handler called!\n");
+}
+
+fn test_interrupt_compiles() -> i64 {
+    // Just verify the interrupt handler compiles
+    // We can't actually trigger it in a test
+    p_eprint_str("PASS: interrupt handler compiles\n");
+    return 0;
+}
+
+// ─── 3. Raw pointer arithmetic ───────────────────────────────────────────
+fn test_pointer_arithmetic() -> i64 {
+    // Pointer arithmetic using stdlib functions
+    var base: i64 = 0xB8000; // VGA text buffer
+    var offset: i64 = ptr_add(base, 160); // Skip first line (80 chars * 2 bytes)
+
+    if offset != 0xB80A0 {
+        p_eprint_str("FAIL: ptr_add returned ");
+        p_eprint_str(int_to_str(offset));
+        p_eprint_str(" expected 0xB80A0\n");
+        return 1;
+    }
+
+    // ptr_offset is an alias for ptr_add
+    var off2: i64 = ptr_offset(base, 2);
+    if off2 != 0xB8002 {
+        p_eprint_str("FAIL: ptr_offset returned ");
+        p_eprint_str(int_to_str(off2));
+        p_eprint_str(" expected 0xB8002\n");
+        return 1;
+    }
+
+    p_eprint_str("PASS: pointer arithmetic\n");
+    return 0;
+}
+
+// ─── 4. Bitfield helpers ─────────────────────────────────────────────────
+fn test_bitfield() -> i64 {
+    // Test single-bit operations
+    var val: i64 = 0;
+    val = bit_set(val, 0, 1);  // Set bit 0
+    if bit_get(val, 0) != 1 {
+        p_eprint_str("FAIL: bit_set/bit_get bit 0\n");
+        return 1;
+    }
+
+    val = bit_set(val, 31, 1); // Set bit 31 (PG bit in CR0)
+    if bit_get(val, 31) != 1 {
+        p_eprint_str("FAIL: bit_set/bit_get bit 31\n");
+        return 1;
+    }
+
+    // Test CR0 helpers
+    if cr0_pe(val) != 1 {
+        p_eprint_str("FAIL: cr0_pe\n");
+        return 1;
+    }
+    if cr0_pg(val) != 1 {
+        p_eprint_str("FAIL: cr0_pg\n");
+        return 1;
+    }
+
+    // Test multi-bit field
+    var reg: i64 = 0;
+    reg = bits_set(reg, 8, 4, 0xA); // Set bits 8-11 to 0xA
+    if bits_get(reg, 8, 4) != 0xA {
+        p_eprint_str("FAIL: bits_set/bits_get\n");
+        return 1;
+    }
+
+    // Clear a bit
+    val = bit_set(val, 0, 0);
+    if bit_get(val, 0) != 0 {
+        p_eprint_str("FAIL: bit clear\n");
+        return 1;
+    }
+
+    p_eprint_str("PASS: bitfield helpers\n");
+    return 0;
+}
+
+// ─── 5. Panic handler ────────────────────────────────────────────────────
+// In bare-metal mode, this function is called when p_panic is invoked.
+// The user defines a function named "panic_handler" that takes a string.
+
+fn panic_handler(msg: str) {
+    // In a real kernel, this would print to VGA or serial
+    p_eprint_str("KERNEL PANIC: ");
+    p_eprint_str(msg);
+    p_eprint_str("\n");
+    // After returning, the runtime does an infinite hlt loop
+}
+
+fn test_panic_handler_exists() -> i64 {
+    // Just verify the panic handler compiles
+    // We can't actually trigger a panic in a test (it would halt)
+    p_eprint_str("PASS: panic handler compiles\n");
+    return 0;
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────
+fn main() -> i64 {
+    p_eprint_str("=== OS Features Test ===\n");
+
+    var result: i64 = 0;
+
+    result = result | test_volatile();
+    result = result | test_interrupt_compiles();
+    result = result | test_pointer_arithmetic();
+    result = result | test_bitfield();
+    result = result | test_panic_handler_exists();
+
+    if result == 0 {
+        p_eprint_str("=== ALL TESTS PASSED ===\n");
+    } else {
+        p_eprint_str("=== SOME TESTS FAILED ===\n");
+    }
+
+    return result;
+}

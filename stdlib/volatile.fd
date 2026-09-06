@@ -1,0 +1,144 @@
+// stdlib/volatile.fd — Volatile<T> wrapper for MMIO
+//
+// Provides safe volatile memory access that the compiler cannot optimize away.
+// Uses the p_volatile_load/p_volatile_store builtins which emit volatile
+// pointer operations in C codegen and real volatile reads in the PE emitter.
+//
+// Usage:
+//   use volatile;
+//   val reg = Volatile::new(0xB8000);  // MMIO address
+//   val ch = reg.load();                // volatile read
+//   reg.store(65);                      // volatile write
+//
+// For raw pointer arithmetic:
+//   val ptr: i64 = 0xB8000;
+//   val next = ptr_add(ptr, 2);         // ptr + 2 bytes
+//   val val = ptr_read_volatile(ptr);   // volatile load 64-bit
+//   ptr_write_volatile(ptr, 42);        // volatile store 64-bit
+
+module volatile;
+
+// ─── Volatile<T> wrapper ────────────────────────────────────────────────
+//
+// A Volatile<T> wraps a memory address. All reads and writes go through
+// volatile builtins, preventing the compiler from optimizing them away.
+//
+// T is stored as i64 (Fides uses i64 for all values), so Volatile<T>
+// works for any type that fits in 8 bytes.
+
+pub struct Volatile {
+    pub addr: i64,
+}
+
+impl Volatile {
+    // Create a Volatile pointing to the given address
+    pub fn new(addr: i64) -> Volatile {
+        return Volatile { addr: addr };
+    }
+
+    // Volatile load (64-bit)
+    pub fn load(self: Volatile) -> i64 {
+        return p_volatile_load(self.addr);
+    }
+
+    // Volatile store (64-bit)
+    pub fn store(self: Volatile, value: i64) -> void {
+        p_volatile_store(self.addr, value);
+    }
+
+    // Volatile load (8-bit)
+    pub fn load8(self: Volatile) -> i64 {
+        return p_volatile_load8(self.addr);
+    }
+
+    // Volatile store (8-bit)
+    pub fn store8(self: Volatile, value: i64) -> void {
+        p_volatile_store8(self.addr, value);
+    }
+
+    // Volatile load (16-bit)
+    pub fn load16(self: Volatile) -> i64 {
+        return p_volatile_load16(self.addr);
+    }
+
+    // Volatile store (16-bit)
+    pub fn store16(self: Volatile, value: i64) -> void {
+        p_volatile_store16(self.addr, value);
+    }
+
+    // Volatile load (32-bit)
+    pub fn load32(self: Volatile) -> i64 {
+        return p_volatile_load32(self.addr);
+    }
+
+    // Volatile store (32-bit)
+    pub fn store32(self: Volatile, value: i64) -> void {
+        p_volatile_store32(self.addr, value);
+    }
+
+    // Get the raw address
+    pub fn addr_of(self: Volatile) -> i64 {
+        return self.addr;
+    }
+
+    // Offset the pointer by n bytes, returning a new Volatile
+    pub fn offset(self: Volatile, n: i64) -> Volatile {
+        return Volatile { addr: self.addr + n };
+    }
+}
+
+// ─── Raw pointer arithmetic builtins ────────────────────────────────────
+//
+// These operate on raw i64 addresses. In Fides, pointers are i64 values.
+
+// Add a byte offset to a pointer
+pub fn ptr_add(ptr: i64, n: i64) -> i64 {
+    return ptr + n;
+}
+
+// Alias for ptr_add (byte offset)
+pub fn ptr_offset(ptr: i64, n: i64) -> i64 {
+    return ptr + n;
+}
+
+// Volatile read 64-bit from pointer
+pub fn ptr_read_volatile(ptr: i64) -> i64 {
+    return p_volatile_load(ptr);
+}
+
+// Volatile write 64-bit to pointer
+pub fn ptr_write_volatile(ptr: i64, value: i64) -> void {
+    p_volatile_store(ptr, value);
+}
+
+// Volatile read 8-bit from pointer
+pub fn ptr_read_volatile8(ptr: i64) -> i64 {
+    return p_volatile_load8(ptr);
+}
+
+// Volatile write 8-bit to pointer
+pub fn ptr_write_volatile8(ptr: i64, value: i64) -> void {
+    p_volatile_store8(ptr, value);
+}
+
+// Volatile read 32-bit from pointer
+pub fn ptr_read_volatile32(ptr: i64) -> i64 {
+    return p_volatile_load32(ptr);
+}
+
+// Volatile write 32-bit to pointer
+pub fn ptr_write_volatile32(ptr: i64, value: i64) -> void {
+    p_volatile_store32(ptr, value);
+}
+
+// Non-volatile read (for when you want a normal load from a raw address)
+pub fn ptr_read(ptr: i64) -> i64 {
+    var p: *mut i64 = ptr;
+    unsafe { return *p; }
+}
+
+// Non-volatile write
+pub fn ptr_write(ptr: i64, value: i64) -> void {
+    var p: *mut i64 = ptr;
+    unsafe { *p = value; }
+}
