@@ -87,7 +87,7 @@ C:\tcc\tcc.exe release\fides-c_wrapped.c -o release\fides-c.exe -lws2_32
   - B8 (Vec word_repr) — **AT PARITY**: `lower_method_call` uses `word_repr(elem_ty)`; `infer_expr_type` matches Rust by design
 - **Box<T> unbox helpers centralized** — `box_expr_unbox`, `box_type_unbox`, `box_pattern_unbox` now in `ast.fd` (session 9)
 - **`.exe` extension auto-appended** — `ccompile` and `build` now produce `.exe` output without manual rename (session 8)
-- **`build` command** — `fides-c.exe build tests/hello_pe.fd -o hello_pe.exe` → working .exe
+- **`build` command** — `fides-c.exe build tests/bootstrap/hello_pe.fd -o hello_pe.exe` → working .exe
 - **`lsp` command** — `fides-c.exe lsp` starts the LSP server (session 9)
 - **PE runtime stubs** — 25+ stubs (print, string, vec, map, float, bool) for native PE executables
 - **All pipeline stages pass** during self-compilation (lex, parse, typecheck, borrowck, mono, lower, C codegen, tcc link)
@@ -102,7 +102,7 @@ C:\tcc\tcc.exe release\fides-c_wrapped.c -o release\fides-c.exe -lws2_32
 |-----------|-------|-----|
 | Self-hosted compiler (`compiler/*.fd`) | 26 | 61,885 |
 | Rust compiler (`src/*.rs`) | 52 | 91,038 |
-| Stdlib (`stdlib/*.fd`) | 69 | 16,090 |
+| Stdlib (`stdlib/*.fd`) | 70 | 18,529 |
 | Test files (`tests/*.fd` + `tests/compiler/*.fd`) | 225 + 23 | — |
 
 ### Test results (session 15)

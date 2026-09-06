@@ -6,6 +6,8 @@
 > **Implementation Status:** This document is the full language specification. Not all features are implemented yet — sections marked with implementation status (✅ working / ⚠️ partial / ❌ parsed-only or planned). See `features.md` for the authoritative feature matrix and `docs/architecture.md` for the compiler pipeline.
 >
 > **Self-hosting status (session 15):** The Fides compiler is self-hosted. 25 modules (61K LOC) rewritten from Rust to Fides. Bootstrap fixpoint achieved: `fides-c2.c == fides-c3.c` (SHA256-identical, 701,100 lines).
+>
+> **Tier 3 OS features (session 16):** `@cpu_local` per-CPU variables (GS segment), inline asm clobber lists, `--no-std` bare-metal mode, cross-compilation target dispatch, UEFI boot services bindings (`stdlib/uefi.fd`).
 
 ## 1. Design Philosophy
 
@@ -112,6 +114,8 @@ true        false
 | `select` | Channel select statement |
 | `layer` / `model` / `grad` / `backward` | ML/deep learning primitives |
 | `kernel` / `component` / `system` / `query` / `state` / `on` | Domain-specific declarations |
+| `asm!` | Inline assembly with operands and clobbers (✅ implemented — PE backend, 50+ x86 instructions) |
+| `@cpu_local` | Per-CPU variable annotation (GS segment, ✅ implemented) |
 
 ### 2.2 Operators
 

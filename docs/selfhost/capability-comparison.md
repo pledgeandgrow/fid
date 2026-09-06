@@ -1,7 +1,7 @@
 # What Fides Can Do Now — Honest Assessment
 
 > Evidence-based, verified against the actual codebase and test runs.
-> Last updated: Sep 5, 2026 (session 15 — **BOOTSTRAP FIXPOINT ACHIEVED**). Based on test runs, source inspection, and docs.
+> Last updated: Sep 6, 2026 (session 16 — Tier 3 OS features added: @cpu_local, inline asm clobbers, --no-std, UEFI bindings. Bootstrap fixpoint preserved.). Based on test runs, source inspection, and docs.
 
 ---
 
@@ -12,10 +12,10 @@ Interpreter:  209/211 passed
 C Codegen:    198/211 matched
 PE Emitter:   209/211 valid
 Self-host:    23/23 pass (interp + PE)
-Stdlib:       69 modules (16,090 LOC)
+Stdlib:       70 modules (18,529 LOC)
 Source:       52 .rs files (84,447 LOC)
 Self-host:    25 .fd modules (57,021 LOC)
-Test files:   225+ in tests/ + 23 in tests/compiler/
+Test files:   225+ in tests/ + 23 in tests/selfhost/
 ```
 
 The interpreter and PE emitter are near-complete (209/211). The C codegen
@@ -133,7 +133,7 @@ implementation (session 11) and not core codegen bugs.
 | Memory safety | 9/10 | 9/10 | Tie (different approaches) |
 | Safety UX | 6/10 (borrow checker fights) | 8/10 (regions, no fights) | **Fides** |
 | Compilation speed | 2/10 (25-30 min builds) | 10/10 (sub-second) | **Fides** |
-| Ecosystem | 8/10 (100k+ crates) | 2/10 (69 stdlib modules) | Rust |
+| Ecosystem | 8/10 (100k+ crates) | 2/10 (70 stdlib modules) | Rust |
 | Concurrency safety | 9/10 (Send/Sync) | 4/10 (no data race prevention) | Rust |
 | Async | 6/10 ("suffering") | 6/10 (effect handlers) | Tie |
 | Hot reload | ❌ | ✅ | **Fides** |
@@ -229,7 +229,7 @@ These are verified working today, not aspirational:
 - No PGO (profile-guided optimization)
 - No escape analysis
 - Weaker auto-vectorization (constant trips only, no variable-trip)
-- Smaller ecosystem (69 modules vs 100k+ crates)
+- Smaller ecosystem (70 modules vs 100k+ crates)
 - No registry for packages
 
 ### Missing vs Go

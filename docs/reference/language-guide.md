@@ -4,7 +4,7 @@
 > to executable binary, covering the type system, memory model, effect system,
 > and compilation pipeline.**
 
-*Last updated: Sep 5, 2026 (session 15 — bootstrap fixpoint achieved)*
+*Last updated: Sep 6, 2026 (session 16 — Tier 3 OS features: @cpu_local, inline asm clobbers, --no-std, UEFI bindings)*
 
 ## Table of Contents
 
@@ -723,11 +723,120 @@ The runtime (`runtime_linux.rs`, etc.) is hand-encoded x86-64 machine code:
 
 All builtins are prefixed with `p_` to avoid C standard library collisions.
 
+### Inline Assembly
+
+Fides supports inline assembly with input/output operands and clobber lists:
+
+```
+// Basic: zero-operand instructions
+asm!("nop");
+asm!("cli; hlt");
+
+// Input operands: load value into register
+val x = 42;
+asm!("mov rax, rcx", in("rax") x);
+
+// Output operands: store register to variable
+val result = asm!("nop", out("rax") x);
+
+// Clobber lists: tell compiler which registers are destroyed
+asm!("call rax", in("rax") fn_ptr, in("rcx") arg, clobber("rdx"), clobber("r8"));
+
+// Port I/O (kernel/UEFI)
+asm!("out dx, al", in("dx") port, in("al") val);
+```
+
+**Syntax:** `asm!(template, operand1, operand2, ...)`
+- **template**: string of x86 instructions separated by `;` or newlines
+- **in("reg") expr**: load `expr` into register `reg` before executing
+- **out("reg") expr**: store register `reg` to `expr` after executing
+- **clobber("reg")**: save/restore register `reg` around the asm block
+
+The PE backend encodes 50+ x86 instructions directly to machine code,
+including: nop, hlt, cli, sti, mov, xor, add, sub, and, or, push, pop,
+inc, dec, not, neg, shl, shr, sar, in, out, syscall, sysret, swapgs,
+rdmsr, wrmsr, rdtsc, cpuid, iret, iretq, lgdt, lidt, invlpg, call, jmp,
+ret, mfence, sfence, lfence, pause, wbinvd, int, leave, cld, std, ud2.
+
+### Bare-Metal / No-Std Mode
+
+```
+# Compile with zero stdlib dependencies
+fides-c build kernel.fd --bare
+fides-c build kernel.fd --no-std
+fides-c build kernel.fd --no-stdlib
+```
+
+In `--bare`/`--no-std` mode, the compiler:
+1. Skips loading `stdlib/core.fd` entirely
+2. Typechecks the user program alone (no stdlib merge)
+3. Skips import resolution (no stdlib to import from)
+4. Produces output with zero hidden runtime dependencies
+
+This is for kernel/UEFI/bare-metal development where the program must
+not depend on any stdlib functions.
+
+### `@cpu_local` Variables (Per-CPU Data)
+
+For SMP kernel development, `@cpu_local` declares per-CPU storage
+accessed via the GS segment register:
+
+```
+@cpu_local var current_task: i64 = 0;
+@cpu_local var cpu_stack: *mut u8 = 0;
+@cpu_local var cpu_id: i32 = 0;
+
+fn schedule() {
+    // Access uses GS-relative addressing: lea rax, [gs:offset]
+    current_task = pick_next_task();
+}
+```
+
+The GS segment base is set per-CPU via `WRMSR(0xC0000101, base)`.
+Each cpu_local variable gets a unique offset starting at 0x1000
+(0x0000-0x0FFF reserved for per-CPU control block).
+
+### UEFI Boot Services
+
+`stdlib/uefi.fd` provides FFI bindings for UEFI boot services:
+
+```
+use uefi;
+
+fn efi_main(image_handle: i64, system_table: i64) -> i64 {
+    uefi_init(image_handle, system_table);
+    uefi_print("Hello from UEFI!\n");
+    var buf = uefi_allocate_pool(uefi_pool_data, 4096);
+    uefi_clear_screen();
+    uefi_stall(1000000);  // 1 second
+    return EFI_SUCCESS;
+}
+```
+
+Available functions: `uefi_init`, `uefi_get_boot_services`,
+`uefi_get_runtime_services`, `uefi_allocate_pool`, `uefi_free_pool`,
+`uefi_allocate_pages`, `uefi_get_memory_map`, `uefi_exit_boot_services`,
+`uefi_stall`, `uefi_print`, `uefi_clear_screen`.
+
+### Cross-Compilation Targets
+
+```
+fides-c build app.fd --target x86-64        # Native (default)
+fides-c build app.fd --target arm64         # ARM64 (C codegen fallback)
+fides-c build app.fd --target aarch64       # AArch64 (C codegen fallback)
+fides-c build app.fd --target riscv64       # RISC-V 64 (C codegen fallback)
+```
+
+The self-hosted PE emitter currently supports x86-64 only. ARM64 and
+RISC-V targets fall back to C codegen (the IR is target-independent).
+Native ARM64/RISC-V codegen modules for the self-hosted compiler are
+planned but not yet implemented.
+
 ---
 
 ## 9. Standard Library
 
-Fides has 69 stdlib modules (~18,200 LOC). Key modules:
+Fides has 70 stdlib modules (~18,529 LOC). Key modules:
 
 ### Core
 | Module | Description |
@@ -775,6 +884,13 @@ Fides has 69 stdlib modules (~18,200 LOC). Key modules:
 | `clinical` / `medical` | Healthcare data standards |
 | `ecu` / `scada` / `swift` / `arinc` / `can` | Industrial/automotive/aviation protocols |
 | `grid` / `ota` | Grid computing, over-the-air updates |
+
+### OS / Bare-Metal
+| Module | Description |
+|--------|-------------|
+| `kernel` | OS kernel primitives (scheduler, memory, interrupts) |
+| `volatile` | Volatile memory access (p_volatile_load/store) |
+| `uefi` | UEFI boot services bindings (AllocatePool, GetMemoryMap, ExitBootServices, console) |
 
 ### ML & AI
 | Module | Description |

@@ -2,11 +2,33 @@
 
 > Things that have broken before and how to avoid re-introducing them.
 >
-> Last updated: Sep 5, 2026 (session 15 — **BOOTSTRAP FIXPOINT ACHIEVED**: fides-c2.c == fides-c3.c, 0 diffs / 701,100 lines).
+> Last updated: Sep 6, 2026 (session 16 — Tier 3 OS features added: @cpu_local, inline asm clobbers, --no-std, UEFI bindings. Bootstrap fixpoint preserved.).
 
 ---
 
 ## 1. Fixed Bugs (Do Not Re-Introduce)
+
+### 1.37 Accidental `git checkout -- compiler/pe.fd` lost uncommitted work (session 16)
+
+**Symptom:** Running `git checkout -- compiler/pe.fd` to "discard changes"
+destroyed uncommitted UEFI/bare-metal runtime stubs (p_hlt, p_cli, p_sti,
+p_inb, p_outb, p_serial) that had been added to `compiler/pe.fd` in the
+same session. No stash or backup was available.
+
+**Root cause:** Violated AGENTS.md hard rule: "NEVER run `git stash`,
+`git checkout -- .`, `git reset --hard`, or any command that discards/hides
+uncommitted work." The command was run to "clean up" the file but destroyed
+in-progress work.
+
+**Fix (session 16):** Re-added the cpu_local fields, GS helpers, inline asm
+backend, and GlobalAddr cpu_local handling to `compiler/pe.fd`. The UEFI
+bindings were recreated in a separate `stdlib/uefi.fd` module instead of
+in `compiler/pe.fd`. The bare runtime stubs (p_hlt, p_cli, etc.) were NOT
+recovered and need to be re-added in a future session.
+
+**Lesson:** NEVER run `git checkout -- <file>` on files with uncommitted
+changes. If you need to compare against a baseline, use `git diff` or a
+separate worktree. This is documented in AGENTS.md as a hard rule.
 
 ### 1.36 Non-ASCII characters in compiler source cause fixpoint divergence (session 15)
 
@@ -871,7 +893,7 @@ existing code paths.
    (it should be a no-op for existing tests)
 3. Check if the `lower.rs` assignment change (global check before alloca check)
    affects non-global assignments
-4. Run `./target/release/fidesc run tests/test_codegen_c.fd` for the
+4. Run `./target/release/fidesc run tests/bootstrap/test_codegen_c.fd` for the
    interpreter error message
 
 ### 2b.9 `git stash` incident (RESOLVED, process bug)

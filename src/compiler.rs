@@ -185,7 +185,7 @@ const STDLIB_CORE: &str = include_str!("../stdlib/core.fd");
 
 /// Walk up from `start` to find the project root — the first directory
 /// containing a `stdlib/` subdirectory. We require `stdlib/` (not just
-/// `compiler/`) because `tests/compiler/` is a test directory that would
+/// `compiler/`) because `tests/selfhost/` is a test directory that would
 /// falsely match. Falls back to `start` itself if none is found.
 fn find_project_root(start: &Path) -> PathBuf {
     let mut current = start.to_path_buf();
@@ -278,7 +278,7 @@ pub fn build_program_with_path(source: &str, source_path: Option<&str>) -> Resul
             // Try: <base_dir>/<path>.fd  and  <base_dir>/<path>/mod.fd
             let path_str = import_path.replace("::", "/");
             // Walk up from base_dir to find project root (the dir containing stdlib/ or compiler/).
-            // This handles tests in tests/compiler/ whose base_dir is a subdirectory.
+            // This handles tests in tests/selfhost/ whose base_dir is a subdirectory.
             let project_root = find_project_root(base_dir);
             let candidates = [
                 base_dir.join(format!("{}.fd", path_str)),

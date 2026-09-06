@@ -1,6 +1,6 @@
 //! Automated test harness for the Fides compiler.
 //!
-//! Tests three backends against every `.fd` file in the `tests/` directory:
+//! Tests three backends against every `.fd` file in the `tests/bootstrap/` directory:
 //!   1. **Interpreter** (`fidesc run`) — baseline; all tests must pass.
 //!   2. **PE Emitter** (`fidesc emit`) — validates PE structure (cannot
 //!      execute on Linux without Wine).
@@ -97,21 +97,21 @@ fn is_expect_fail_test(name: &str) -> bool {
     )
 }
 
-/// Discover all `.fd` test files in the `tests/` directory.
+/// Discover all `.fd` test files in the `tests/bootstrap/` directory.
 fn discover_tests() -> Vec<PathBuf> {
-    // cargo test runs from the package root, so "tests/" should work.
+    // cargo test runs from the package root, so "tests/bootstrap/" should work.
     // Fall back to a path relative to the test file for robustness.
-    let test_dir = PathBuf::from("tests");
+    let test_dir = PathBuf::from("tests/bootstrap");
     let dir = if test_dir.exists() {
         test_dir
     } else {
         // Fall back: CARGO_MANIFEST_DIR is set by cargo
         let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(manifest).join("tests")
+        PathBuf::from(manifest).join("tests/bootstrap")
     };
 
     let mut tests: Vec<PathBuf> = fs::read_dir(&dir)
-        .expect("Could not open tests/ directory")
+        .expect("Could not open tests/bootstrap/ directory")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().map_or(false, |e| e == "fd"))
@@ -248,7 +248,7 @@ fn run_c_codegen(bin: &Path, test: &Path, tmp: &Path) -> Option<(i32, String)> {
 fn interpreter_all_tests() {
     let bin = ensure_binary();
     let tests = discover_tests();
-    assert!(!tests.is_empty(), "No .fd test files found in tests/");
+    assert!(!tests.is_empty(), "No .fd test files found in tests/bootstrap/");
 
     let mut passed = 0;
     let mut failed = 0;
@@ -312,7 +312,7 @@ fn interpreter_all_tests() {
 fn pe_emitter_all_tests() {
     let bin = ensure_binary();
     let tests = discover_tests();
-    assert!(!tests.is_empty(), "No .fd test files found in tests/");
+    assert!(!tests.is_empty(), "No .fd test files found in tests/bootstrap/");
 
     let tmp = if cfg!(windows) {
         std::env::temp_dir().join("pledge_pe_tests")
@@ -361,7 +361,7 @@ fn pe_emitter_all_tests() {
 fn c_codegen_matches_interpreter() {
     let bin = ensure_binary();
     let tests = discover_tests();
-    assert!(!tests.is_empty(), "No .fd test files found in tests/");
+    assert!(!tests.is_empty(), "No .fd test files found in tests/bootstrap/");
 
     // Use a platform-appropriate temp directory for C codegen test artifacts.
     // On Windows, /tmp doesn't exist — use the local temp dir or a project-local dir.
@@ -442,14 +442,14 @@ fn c_codegen_matches_interpreter() {
 }
 
 /// Golden file test: compare interpreter output against stored golden files.
-/// To regenerate golden files: `fidesc run tests/<test>.fd > tests/golden/<test>.txt`
+/// To regenerate golden files: `fidesc run tests/bootstrap/<test>.fd > tests/bootstrap/golden/<test>.txt`
 #[test]
 fn golden_files_match() {
     let bin = ensure_binary();
     let tests = discover_tests();
-    assert!(!tests.is_empty(), "No .fd test files found in tests/");
+    assert!(!tests.is_empty(), "No .fd test files found in tests/bootstrap/");
 
-    let golden_dir = PathBuf::from("tests/golden");
+    let golden_dir = PathBuf::from("tests/bootstrap/golden");
     if !golden_dir.exists() {
         println!("Golden file directory not found, skipping golden file test.");
         return;
@@ -513,24 +513,24 @@ fn golden_files_match() {
 /// Safety test: verify that bounds checking and overflow detection panic
 /// correctly in debug mode. Fides has checked arithmetic always on (F64) —
 /// overflow panics in both debug and release mode. The escape hatch is
-/// `@wrapping`, not `--release`. Test files live in tests/safety/.
+/// `@wrapping`, not `--release`. Test files live in tests/bootstrap/safety/.
 #[test]
 fn safety_checks_panic_in_debug_mode() {
     let bin = ensure_binary();
-    let safety_dir = PathBuf::from("tests/safety");
+    let safety_dir = PathBuf::from("tests/bootstrap/safety");
     if !safety_dir.exists() {
-        println!("tests/safety/ directory not found, skipping safety test.");
+        println!("tests/bootstrap/safety/ directory not found, skipping safety test.");
         return;
     }
 
     let mut safety_tests: Vec<PathBuf> = fs::read_dir(&safety_dir)
-        .expect("Could not open tests/safety/ directory")
+        .expect("Could not open tests/bootstrap/safety/ directory")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().map_or(false, |e| e == "fd"))
         .collect();
     safety_tests.sort();
-    assert!(!safety_tests.is_empty(), "No .fd safety test files found in tests/safety/");
+    assert!(!safety_tests.is_empty(), "No .fd safety test files found in tests/bootstrap/safety/");
 
     let mut passed = 0;
     let mut failed = 0;
@@ -577,25 +577,25 @@ fn safety_checks_panic_in_debug_mode() {
 }
 
 /// Capability test: verify that capability granting and denial works.
-/// Test files in tests/capability/ are split into "grant" (should succeed)
+/// Test files in tests/bootstrap/capability/ are split into "grant" (should succeed)
 /// and "deny" (should fail with capability error) tests.
 #[test]
 fn capability_security_enforced() {
     let bin = ensure_binary();
-    let cap_dir = PathBuf::from("tests/capability");
+    let cap_dir = PathBuf::from("tests/bootstrap/capability");
     if !cap_dir.exists() {
-        println!("tests/capability/ directory not found, skipping capability test.");
+        println!("tests/bootstrap/capability/ directory not found, skipping capability test.");
         return;
     }
 
     let mut cap_tests: Vec<PathBuf> = fs::read_dir(&cap_dir)
-        .expect("Could not open tests/capability/ directory")
+        .expect("Could not open tests/bootstrap/capability/ directory")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().map_or(false, |e| e == "fd"))
         .collect();
     cap_tests.sort();
-    assert!(!cap_tests.is_empty(), "No .fd capability test files found in tests/capability/");
+    assert!(!cap_tests.is_empty(), "No .fd capability test files found in tests/bootstrap/capability/");
 
     let mut passed = 0;
     let mut failed = 0;
@@ -656,26 +656,26 @@ fn capability_security_enforced() {
 }
 
 /// Effect system test: verify effect annotations, inference, and checking.
-/// Test files in tests/effects/ are split into:
+/// Test files in tests/bootstrap/effects/ are split into:
 /// - "should pass" (correct annotations, pure functions, propagation)
 /// - "should fail" (under-declaration, pure violation)
 #[test]
 fn effect_system_enforced() {
     let bin = ensure_binary();
-    let effect_dir = PathBuf::from("tests/effects");
+    let effect_dir = PathBuf::from("tests/bootstrap/effects");
     if !effect_dir.exists() {
-        println!("tests/effects/ directory not found, skipping effect test.");
+        println!("tests/bootstrap/effects/ directory not found, skipping effect test.");
         return;
     }
 
     let mut effect_tests: Vec<PathBuf> = fs::read_dir(&effect_dir)
-        .expect("Could not open tests/effects/ directory")
+        .expect("Could not open tests/bootstrap/effects/ directory")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().map_or(false, |e| e == "fd"))
         .collect();
     effect_tests.sort();
-    assert!(!effect_tests.is_empty(), "No .fd effect test files found in tests/effects/");
+    assert!(!effect_tests.is_empty(), "No .fd effect test files found in tests/bootstrap/effects/");
 
     let mut passed = 0;
     let mut failed = 0;
@@ -739,20 +739,20 @@ fn effect_system_enforced() {
 #[test]
 fn region_inference_enforced() {
     let bin = ensure_binary();
-    let region_dir = PathBuf::from("tests/regions");
+    let region_dir = PathBuf::from("tests/bootstrap/regions");
     if !region_dir.exists() {
-        println!("tests/regions/ directory not found, skipping region test.");
+        println!("tests/bootstrap/regions/ directory not found, skipping region test.");
         return;
     }
 
     let mut region_tests: Vec<PathBuf> = fs::read_dir(&region_dir)
-        .expect("Could not open tests/regions/ directory")
+        .expect("Could not open tests/bootstrap/regions/ directory")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().map_or(false, |e| e == "fd"))
         .collect();
     region_tests.sort();
-    assert!(!region_tests.is_empty(), "No .fd region test files found in tests/regions/");
+    assert!(!region_tests.is_empty(), "No .fd region test files found in tests/bootstrap/regions/");
 
     let mut passed = 0;
     let mut failed = 0;

@@ -344,8 +344,8 @@ will change the "correct" output for all backends.
 
 - Source code changes
 - Test files (new `.fd` tests)
-- Updated baseline (`tests/baseline/test_results.txt`)
-- Updated golden files (`tests/golden/`)
+- Updated baseline (`tests/bootstrap/baseline/test_results.txt`)
+- Updated golden files (`tests/bootstrap/golden/`)
 
 ### What NOT To Commit
 

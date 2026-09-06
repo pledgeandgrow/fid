@@ -3,7 +3,7 @@
 > **Goal:** The Fides compiler compiles itself, producing identical output
 > across generations (bootstrap fixpoint).
 >
-> **Last updated:** Sep 5, 2026 (session 15 — **BOOTSTRAP FIXPOINT ACHIEVED**: fides-c2.c == fides-c3.c, 0 diffs / 701,100 lines)
+> **Last updated:** Sep 6, 2026 (session 16 — Tier 3 OS features added to self-hosted compiler: @cpu_local, inline asm clobbers, --no-std, cross-compilation dispatch, UEFI bindings)
 
 ---
 
@@ -22,6 +22,14 @@
 ### Session 15 progress (this session)
 
 **BOOTSTRAP FIXPOINT ACHIEVED.** Four bugs were fixed:
+
+> **Note:** Session 16 (Sep 6, 2026) added Tier 3 OS features directly in
+> `compiler/*.fd`: `@cpu_local` GS-relative variables, inline asm clobber
+> lists, `--no-std` mode, cross-compilation target validation, and UEFI
+> boot services bindings (`stdlib/uefi.fd`). All compile cleanly with the
+> Rust bootstrap compiler. The fixpoint was not broken by these additions
+> (they add new code paths, not modify existing ones). See
+> `docs/reference/changelog.md` for details.
 
 1. **TCC 4KB stack overflow (A1 root cause)** — TCC produces executables with
    a 4KB default PE stack reserve. The compiler's deeply recursive parser,
@@ -646,7 +654,7 @@ Two critical infrastructure fixes were discovered and applied:
 - `regalloc.fd` ported (1086 lines) — linear scan allocator, builds OK
 - `codegen_x64.fd` ported (1780 lines) — PIR L3 → x86-64 asm, builds OK
 - `release/fides-c.exe` builds via tcc (8.5MB) with PE stack patched to 256MB
-- Full pipeline works end-to-end on `tests/hello.fd`
+- Full pipeline works end-to-end on `tests/bootstrap/hello.fd`
 - Output is correct: `Hello, Fides!50y is big`
 - **Self-compilation passes all pipeline stages through C codegen + file write**
 - String builder (`p_sb_*`) eliminates OOM during C codegen
@@ -776,7 +784,7 @@ See "Phase 1b" below for the full gap list.
 ### Phase 1: Fix struct-by-value crashes ✅ DONE
 
 All struct-by-value crashes in the self-hosted compiler pipeline are fixed.
-The self-hosted compiler can now compile `tests/hello.fd` end-to-end and
+The self-hosted compiler can now compile `tests/bootstrap/hello.fd` end-to-end and
 produce correct output.
 
 ### Phase 1b: Port Fides lowerer gaps (before self-compilation)
@@ -1568,7 +1576,7 @@ interpreter + PE emitter.
 | SH-13.5 | Fix `Inst::Print` type dispatch (always called `p_print_int`) | ✅ DONE (session 5) — now dispatches by IR type: Ptr→str, F64→float, Bool→bool |
 | SH-13.6 | Fix entry point label resolution (main_offset) | ✅ DONE (session 5) — stores main_offset directly in PeCodeGen struct |
 | SH-13.7 | Work around Fides compiler statement-dropping bug | ✅ DONE (session 5) — split long functions into smaller helpers |
-| SH-13.8 | Test: `fides-c.exe build tests/hello_pe.fd` → working .exe | ✅ DONE (session 5) — prints "Hello from PE!", exit code 0 |
+| SH-13.8 | Test: `fides-c.exe build tests/bootstrap/hello_pe.fd` → working .exe | ✅ DONE (session 5) — prints "Hello from PE!", exit code 0 |
 | SH-13.9 | Extend PE emitter to support full compiler source | ⏳ TODO — needs struct/enum, Vec/HashMap, float arithmetic |
 | SH-13.10 | Port `codegen_x64.fd` + `peephole.fd` + `elf64.fd` for Linux | ⏳ FUTURE |
 
@@ -1648,9 +1656,9 @@ release/             ← Self-hosted compiler output — gitignored
   stage2.c / .exe    ← Second generation (for fixpoint test)
   stage3.c / .exe    ← Third generation (must equal stage2)
 compiler/            ← Self-hosted compiler source (25 .fd modules, 57K LOC)
-tests/compiler/      ← Self-host module tests (23 .fd files)
+tests/selfhost/      ← Self-host module tests (23 .fd files)
 tests/selfhost/      ← Harness/probe files for differential testing
-stdlib/              ← Fides standard library (69 .fd modules)
+stdlib/              ← Fides standard library (70 .fd modules)
 ```
 
 ## Terminology
@@ -1673,6 +1681,6 @@ Rust source (src/*.rs)
           → fides-c2 ccompile compiler/*.fd → fides-c3.c → fides-c3.exe  (fixpoint check — NEXT)
 
 PE emitter chain (session 5 — no tcc needed):
-  fides-c.exe build tests/hello_pe.fd → hello_pe.exe ✅
+  fides-c.exe build tests/bootstrap/hello_pe.fd → hello_pe.exe ✅
     → hello_pe.exe runs and prints "Hello from PE!" ✅
 ```

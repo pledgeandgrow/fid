@@ -568,6 +568,75 @@ pub fn build_program(source: str) -> ResultProgram {
     return build_program_with_path(source, OptStr::None);
 }
 
+/// Build a program in no-stdlib mode (--bare / --no-std).
+/// Skips loading stdlib/core.fd entirely. The user program must define
+/// everything it needs, including any runtime functions.
+/// This is for kernel/UEFI/bare-metal development where the program
+/// must have ZERO hidden runtime dependencies.
+pub fn build_program_no_std(source: str, source_path: OptStr) -> ResultProgram {
+    p_eprint_str("[build] No-stdlib mode: skipping stdlib/core.fd\n");
+    // Parse user code without stdlib names
+    var lex: Lexer = Lexer::new(source);
+    var tokens: Vec<Token> = lex.tokenize();
+    if lex.errors.len() > 0 {
+        var file: str = "<stdin>";
+        match source_path {
+            OptStr::Some(p) => { file = p; }
+            OptStr::None => { }
+        }
+        return ResultProgram::Err(enrich_errors(lex.errors, source, file));
+    }
+    var empty_struct_names: Vec<str> = Vec::new();
+    var empty_enum_names: Vec<str> = Vec::new();
+    var p: Parser = Parser_with_names(tokens, empty_struct_names, empty_enum_names);
+    var user_result: ParseResultProgram = p.parse();
+    match user_result {
+        ParseResultProgram::Err(e) => {
+            var file2: str = "<stdin>";
+            match source_path {
+                OptStr::Some(p2) => { file2 = p2; }
+                OptStr::None => { }
+            }
+            return ResultProgram::Err(enrich_errors(c_vec1(e), source, file2));
+        }
+        ParseResultProgram::Ok(user) => {
+            // In no-std mode, skip stdlib merge and import resolution.
+            // Use the user program directly as the merged program.
+            var program: Program = user;
+            // Apply desugar and default trait methods
+            desugar_layers_models(&mut program);
+            program = process_gen(program);
+            fill_default_trait_methods(&mut program);
+            // Typecheck — register only the user program
+            p_eprint_str("[build] No-std: typechecking (no stdlib)...\n");
+            var tc: TypeChecker = TypeChecker::new();
+            var user_module: str = "main";
+            match user.module {
+                OptStr::Some(m2) => { user_module = m2; }
+                OptStr::None => { }
+            }
+            TypeChecker_register_program(&mut tc, user, user_module);
+            TypeChecker_register_trait_impls(&mut tc, program);
+            TypeChecker_collect_capabilities(&mut tc, user);
+            TypeChecker_check_bodies(&mut tc, program);
+            if tc.errors.len() > 0 {
+                var file3: str = "<stdin>";
+                match source_path {
+                    OptStr::Some(p3) => { file3 = p3; }
+                    OptStr::None => { }
+                }
+                return ResultProgram::Err(enrich_errors(tc.errors, source, file3));
+            }
+            // Borrow check (off by default in no-std mode)
+            var bc: BorrowChecker = BorrowChecker_new(BorrowckMode::Off);
+            // Monomorphize
+            p_eprint_str("[build] No-std: monomorphizing...\n");
+            var mono_result: Program = monomorphize(program);
+            return ResultProgram::Ok(mono_result);
+        }
+    }
+}
+
 /// Build a program with optional file path for resolving `use` imports.
 /// This is the main entry point for the compiler pipeline:
 ///   parse stdlib -> parse user -> resolve imports -> merge -> cfg filter ->

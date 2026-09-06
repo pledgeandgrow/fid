@@ -5626,6 +5626,13 @@ impl Lowerer {
                             let val = self.lower_expr(&op.expr);
                             outputs.push((op.reg.clone(), val));
                         }
+                        crate::ast::AsmDir::Clobber => {
+                            // Clobber operands are passed as inputs with "CL:" prefix
+                            // so the backend can identify and save/restore them.
+                            // The expression is a dummy (const 0).
+                            let val = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I64 });
+                            inputs.push((format!("CL:{}", op.reg), val));
+                        }
                     }
                 }
 

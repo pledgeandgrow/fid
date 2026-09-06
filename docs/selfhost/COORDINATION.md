@@ -5,7 +5,7 @@
 > and what architectural decisions have been made. Without this, parallel
 > agents will conflict and undo each other's work.
 >
-> **Last updated:** Sep 5, 2026 (session 15 — **BOOTSTRAP FIXPOINT ACHIEVED**: fides-c2.c == fides-c3.c, 0 diffs / 701,100 lines)
+> **Last updated:** Sep 6, 2026 (session 16 — Tier 3 OS features added: @cpu_local, inline asm clobbers, --no-std, UEFI bindings. Bootstrap fixpoint preserved.)
 
 ---
 

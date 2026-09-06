@@ -1,5 +1,88 @@
 # Fides Language Changelog
 
+## Tier 3 OS Features — Session 16 (Sep 6, 2026)
+
+### Summary
+
+**Five Tier 3 OS-level features implemented directly in the self-hosted
+compiler (`compiler/*.fd`)**, advancing Fides toward real OS/kernel
+deployment capability. All changes compile cleanly with the Rust bootstrap
+compiler. No new test regressions.
+
+### Features Added
+
+1. **`@cpu_local` variables (per-CPU data via GS segment)**
+   - `PeCodeGen` struct gains `cpu_local_names`, `cpu_local_offsets`,
+     `cur_is_interrupt` fields
+   - GS segment encoder helpers: `X86Encoder_lea_rax_gs`,
+     `X86Encoder_mov_rax_gs`, `X86Encoder_mov_gs_rax`, `X86Encoder_wrmsr`,
+     `X86Encoder_rdmsr`, `X86Encoder_swapgs`
+   - `Inst::GlobalAddr` now emits `lea rax, [gs:offset]` for cpu_local globals
+   - `PeCodeGen_get_cpu_local_offset` for GS-relative offset lookup
+   - Parser support for `@cpu_local var x: i64;` annotations
+
+2. **Inline asm improvements (clobber lists, constraints)**
+   - `AsmDir::Clobber` added to AST (both `compiler/ast.fd` and `src/ast.rs`)
+   - Parser accepts `clobber("reg")` syntax (one register per clobber)
+   - Lowerer passes clobbers as `CL:`-prefixed inputs for backend identification
+   - Full inline asm PE backend: `asm_extract`, `parse_asm_reg`,
+     `is_clobber_reg`, `parse_asm_imm`, `PeCodeGen_emit_asm_line` (50+ x86
+     instructions encoded), `PeCodeGen_emit_asm_template`,
+     `PeCodeGen_gen_inst_asm` with clobber save/restore
+   - `Inst::Asm` case added to `PeCodeGen_gen_inst` match
+   - Syntax: `asm!("out dx, al", in("dx") port, out("al") val, clobber("rcx"))`
+
+3. **No-stdlib mode (`--bare` / `--no-std` / `--no-stdlib`)**
+   - `build_program_no_std()` in `compiler/compiler.fd` — skips
+     `stdlib/core.fd` loading entirely
+   - Wired into `cmd_build` in `compiler/main.fd` — uses no-std path when
+     `--bare`, `--no-std`, or `--no-stdlib` flag is passed
+   - Typechecks user program alone (no stdlib merge), skips import resolution
+   - Kernel output has zero hidden runtime dependencies
+
+4. **Cross-compilation target validation (ARM64, RISC-V)**
+   - `cmd_build` now validates `--target` and emits honest diagnostics
+   - `arm64`/`aarch64`: warns that ARM64 codegen module not yet ported to
+     self-hosted Fides, falls back to C codegen
+   - `riscv64`/`risc-v64`: same diagnostic and fallback
+   - Unknown targets: warns and falls back to C codegen
+   - Does not falsely claim native codegen support
+
+5. **UEFI boot services bindings (`stdlib/uefi.fd`)**
+   - New 287-line stdlib module with UEFI function-pointer-table bindings
+   - EFI status code constants (EFI_SUCCESS, EFI_LOAD_ERROR, etc.)
+   - EFI memory type constants (efi_boot_services_code, efi_conventional_memory)
+   - Boot services function offsets (efi_bs_allocate_pool, efi_bs_exit_boot_services)
+   - Runtime services function offsets
+   - System table offsets (efi_st_boot_services, efi_st_con_out)
+   - `uefi_init()`, `uefi_get_boot_services()`, `uefi_get_runtime_services()`
+   - `uefi_allocate_pool()`, `uefi_free_pool()`, `uefi_allocate_pages()`
+   - `uefi_get_memory_map()`, `uefi_exit_boot_services()`, `uefi_stall()`
+   - `uefi_print()`, `uefi_clear_screen()` (console output)
+   - Volatile memory access via `p_volatile_load`/`p_volatile_store`
+
+### Files Changed
+
+- `compiler/pe.fd` — cpu_local fields, GS helpers, inline asm backend (~350 lines added)
+- `compiler/compiler.fd` — `build_program_no_std()` function (~67 lines added)
+- `compiler/main.fd` — `--no-std`/`--no-stdlib` flags, target validation, bare-mode dispatch
+- `compiler/ast.fd` — `AsmDir::Clobber` variant
+- `compiler/parser.fd` — `clobber(...)` operand parsing
+- `compiler/lower.fd` — clobber lowering with `CL:` prefix
+- `stdlib/uefi.fd` — NEW: UEFI boot services bindings (287 lines)
+- `src/ast.rs` — `AsmDir::Clobber` variant (bootstrap parity)
+- `src/parser.rs` — `clobber(...)` parsing (bootstrap parity)
+- `src/lower.rs` — clobber lowering (bootstrap parity)
+- `src/flat_ast.rs` — `Clobber` in debug output
+- `src/typechecker.rs` — `Clobber` arm in asm typecheck
+
+### Verification
+
+- All modified compiler modules compile cleanly with `target/release/fidesc`
+- `stdlib/uefi.fd` compiles successfully
+- Test suite: 231/242 interpreter, 213/242 C codegen, 233/242 PE emitter
+- No new test failures introduced (all failures are pre-existing)
+
 ## Package Manager Ported to Fides — Session 15 (Sep 5, 2026)
 
 ### Summary
@@ -377,11 +460,11 @@ Known-fail:   0
 
 ### New Tests
 
-- `tests/test_recursion_limit.fd` — verifies depth limit triggers at 10,
+- `tests/bootstrap/test_recursion_limit.fd` — verifies depth limit triggers at 10,
   passes at 0 (unlimited)
-- `tests/test_deep_nesting.fd` — 250+ levels of nested expressions, verifies
+- `tests/bootstrap/test_deep_nesting.fd` — 250+ levels of nested expressions, verifies
   both interpreter and C codegen handle it
-- `tests/test_assert_msg.fd` — tests `assert_msg`/`assert_eq_msg` with
+- `tests/bootstrap/test_assert_msg.fd` — tests `assert_msg`/`assert_eq_msg` with
   f-string formatting
 
 ## Known-Fail Tests Eliminated — 159/159 on All Backends (August 28, 2026)
@@ -1178,7 +1261,7 @@ tests passing on all 3 backends (interpreter, C codegen, PE emitter).
   using byte-addressable heap (`self.memory`).
 - C codegen: `p_rc_incr` / `p_rc_decr` implemented with non-atomic ops (Rc)
   or atomic ops (Arc). `p_atomic_sub` for Arc decrement.
-- Test: `tests/test_rc_arc.fd` — basic refcount lifecycle for both Rc and
+- Test: `tests/bootstrap/test_rc_arc.fd` — basic refcount lifecycle for both Rc and
   Arc, plus struct values.
 
 ### Profiler
@@ -1198,7 +1281,7 @@ tests passing on all 3 backends (interpreter, C codegen, PE emitter).
   `scalar * vec`, `vec / scalar` via compiler-rewritten method calls.
 - **Swizzle access**: `.xyz`, `.rgb`, `.stpq` patterns on vec types.
   Supports 2-4 components, reordering, repetition. Zero runtime cost.
-- Test: `tests/test_vec_math.fd` — bonus pass on interpreter + PE.
+- Test: `tests/bootstrap/test_vec_math.fd` — bonus pass on interpreter + PE.
 
 ### Loop Vectorization Cost Model
 
@@ -1245,7 +1328,7 @@ All stdlib functions needed for self-hosting are now implemented:
 - `p_file_delete(path)` — delete file (interpreter + C codegen)
 - `p_file_size(path)` — file size (interpreter + C codegen)
 
-**Test**: `tests/test_stdlib_selfhost.fd` — 10 tests covering all new functions,
+**Test**: `tests/bootstrap/test_stdlib_selfhost.fd` — 10 tests covering all new functions,
 passing on interpreter and C codegen.
 
 ### Typed Enum Payloads (Blocker 2)
@@ -1259,7 +1342,7 @@ passing on interpreter and C codegen.
   generic args, `resolve_pattern_enum()`, `is_type_param_name()`.
 - Lowerer: added `pattern_binding_ir_types()` so payload `Load` uses the real
   IR type — aggregates as `Ptr(Struct(..))` instead of bare `I64`.
-- Test: `tests/test_enum_payload_types.fd`.
+- Test: `tests/bootstrap/test_enum_payload_types.fd`.
 
 ### Real Generics at Value Level (Blocker 1)
 
@@ -1275,7 +1358,7 @@ passing on interpreter and C codegen.
 - Lowerer: added `let_hint` field threaded through `Stmt::Let`; `Stmt::Let`
   alloca type follows the value's IR type when declared is aggregate but value
   is a pointer.
-- Test: `tests/test_generic_vec_typed.fd`.
+- Test: `tests/bootstrap/test_generic_vec_typed.fd`.
 
 ### Recursive Types via Box<T> (Blocker 3)
 
@@ -1287,7 +1370,7 @@ passing on interpreter and C codegen.
   is a `Box<T>` (either `Ptr(Ptr(Struct(..)))` from `Box::new` or
   `Generic("Box", [Struct(..)])` from a typed parameter), it loads through
   the Box once to get the inner struct pointer before pattern matching.
-- Test: `tests/test_recursive_box.fd` — `(1+2)*(3+4)` = 21 with 7 nodes.
+- Test: `tests/bootstrap/test_recursive_box.fd` — `(1+2)*(3+4)` = 21 with 7 nodes.
 
 ### Test Baseline Update
 
@@ -1796,9 +1879,9 @@ passing on interpreter and C codegen.
 
 ### Tests
 
-- **`tests/test_async.fd`** — Existing test now passes with real Future
+- **`tests/bootstrap/test_async.fd`** — Existing test now passes with real Future
   semantics (was passing with stubbed synchronous execution).
-- **`tests/test_async_fail.fd`** — New expected-fail test: `await` on a
+- **`tests/bootstrap/test_async_fail.fd`** — New expected-fail test: `await` on a
   non-Future value produces a typechecker error.
 
 ### Design Notes
@@ -1825,7 +1908,7 @@ will add true cooperative scheduling where async functions can suspend at
   (e.g., `Option_i64` → `Option`).
 - **stdlib/core.fd updated** — `Option<T>` and `Result<T, E>` now declared with
   type parameters.
-- **Test**: `tests/test_generic_enums.fd` — verifies generic syntax, method
+- **Test**: `tests/bootstrap/test_generic_enums.fd` — verifies generic syntax, method
   calls, and type annotations (`pv x: Option<i64> = Option::Some(42)`).
 
 ### LSP Server
@@ -1901,9 +1984,9 @@ phases complete. Borrow checking is ON by default.
 
 ### Tests
 
-- `tests/test_borrowck.fd` — valid borrow patterns including field-wise,
+- `tests/bootstrap/test_borrowck.fd` — valid borrow patterns including field-wise,
   two-phase, and NLL. 114/114 pass with borrow checking on.
-- `tests/test_borrowck_fail.fd` — borrow violations including double `&mut`
+- `tests/bootstrap/test_borrowck_fail.fd` — borrow violations including double `&mut`
   and NLL violation (mutation while borrow still live). In expected-fail list.
 
 ### Test Count Update
@@ -1974,7 +2057,7 @@ never parsed. Now they are fully integrated into the parser.
 
 ### Test
 
-- `tests/test_async.fd` — basic async function, await, spawn, chained await
+- `tests/bootstrap/test_async.fd` — basic async function, await, spawn, chained await
 
 ### Test Count Update
 
@@ -2051,8 +2134,8 @@ Contract preconditions.
   - `unwrap()` / `p_panic()` — panic = catastrophic failure
   - Missing `@audit` — full logging required for regulatory traceability
   - Calling non-`@medical` functions — transitive safety
-- **Test**: `tests/test_medical.fd` (dose calculation, validation, vitals sum)
-- **Expected-fail**: `tests/test_medical_fail.fd` (all 4 violations caught)
+- **Test**: `tests/bootstrap/test_medical.fd` (dose calculation, validation, vitals sum)
+- **Expected-fail**: `tests/bootstrap/test_medical_fail.fd` (all 4 violations caught)
 
 ### F10: `given`/`ensure` Contracts — Design by Contract
 
@@ -2066,8 +2149,8 @@ Contract preconditions.
   skipped (runtime assertion would be needed)
 - **New keywords**: `given`, `ensure` (tokens + lexer)
 - **New AST fields**: `Func.preconditions`, `Func.postconditions`
-- **Test**: `tests/test_contracts.fd` (sqrt, clamp, safe_divide)
-- **Expected-fail**: `tests/test_contracts_fail.fd` (precondition violations)
+- **Test**: `tests/bootstrap/test_contracts.fd` (sqrt, clamp, safe_divide)
+- **Expected-fail**: `tests/bootstrap/test_contracts_fail.fd` (precondition violations)
 
 ### Test Count Update
 
@@ -2101,7 +2184,7 @@ domains.
   intentional
 - **Implementation**: `IrFunction.is_wrapping` flag, checked in interpreter's
   `eval_binop` via `is_wrapping_func()` helper
-- **Test**: `tests/test_checked_arith.fd` (hash_combine, rotl with @wrapping)
+- **Test**: `tests/bootstrap/test_checked_arith.fd` (hash_combine, rotl with @wrapping)
 
 ### F62: Bounds Checking Lock
 
@@ -2113,7 +2196,7 @@ domains.
   `p_vec_set`, and `ArrayGet` skip bounds checks
 - **Native code**: `UnsafeBegin`/`UnsafeEnd` are no-ops (C/PE don't have
   runtime bounds checks)
-- **Test**: `tests/test_bounds_lock.fd` (safe access + unsafe access)
+- **Test**: `tests/bootstrap/test_bounds_lock.fd` (safe access + unsafe access)
 
 ### F68: Parameterized Queries
 
@@ -2124,8 +2207,8 @@ domains.
   string; `BinOp::Add` on typed strings produces a clear error message
 - **Escape hatch**: use `sql_bind()`, `shell_escape()`, `html_escape()`, etc.
   instead of `+`
-- **Test**: `tests/test_param_queries.fd` (safe construction),
-  `tests/test_param_queries_fail.fd` (expected fail — concat with +)
+- **Test**: `tests/bootstrap/test_param_queries.fd` (safe construction),
+  `tests/bootstrap/test_param_queries_fail.fd` (expected fail — concat with +)
 
 ### Test Count Update
 
@@ -2192,7 +2275,7 @@ Four new features for systems programming and observability.
   `TxnEnd` commits (discards snapshot); panic restores snapshot before propagating
 - **New IR instructions**: `TxnBegin`, `TxnEnd`
 - **Native code**: `TxnBegin`/`TxnEnd` are no-ops (transactions handled at app level)
-- **Test**: `tests/test_txn_rollback.fd` (nested txn, txn with loops)
+- **Test**: `tests/bootstrap/test_txn_rollback.fd` (nested txn, txn with loops)
 
 ### `@audit` Full Trail
 
@@ -2200,7 +2283,7 @@ Four new features for systems programming and observability.
 - **Format**: `[AUDIT] enter func_name(param1=val1, param2=val2)`
 - **Type-aware**: each parameter is printed using its actual IR type (i64, str, etc.)
 - **Exit log**: unchanged — `[AUDIT] exit func_name`
-- **Test**: `tests/test_audit.fd` (updated to show param values)
+- **Test**: `tests/bootstrap/test_audit.fd` (updated to show param values)
 
 ### Raw Pointer Types (`*mut T`, `*const T`)
 
@@ -2212,14 +2295,14 @@ Four new features for systems programming and observability.
 - **Lowering**: `RawPtr` lowers to `IrType::Ptr` (same as references)
 - **New token**: `const` keyword for `*const T` syntax
 - **New AST type**: `Type::RawPtr { inner, is_mut }`
-- **Test**: `tests/test_raw_ptr.fd` (scalar, array element dereference)
+- **Test**: `tests/bootstrap/test_raw_ptr.fd` (scalar, array element dereference)
 
 ### Memo Stdlib Helper (`stdlib/memo.fd`)
 
 - **Design decision**: memoization is a stdlib helper, not a compiler annotation
 - **API**: `Memo::new()`, `Memo::get_or_compute(&cache, key, compute_fn)`, `Memo::size()`
 - **Implementation**: parallel Vecs for keys and values (simple, no hash map needed)
-- **Test**: `tests/test_memo.fd` (fibonacci memoization with cache size tracking)
+- **Test**: `tests/bootstrap/test_memo.fd` (fibonacci memoization with cache size tracking)
 
 ### Test Count Update
 
@@ -2263,8 +2346,8 @@ as a pattern-based static check.
 ### Files Changed
 
 - `src/typechecker.rs`: `verify_crashfree()`, `scan_for_division()`, `scan_for_while_loops()`
-- `tests/test_crashfree.fd`: valid — 4 crashfree functions (arithmetic, for loop, transitive call, const div)
-- `tests/test_crashfree_fail.fd`: expected fail — `@crashfree` function calls `unwrap()`
+- `tests/bootstrap/test_crashfree.fd`: valid — 4 crashfree functions (arithmetic, for loop, transitive call, const div)
+- `tests/bootstrap/test_crashfree_fail.fd`: expected fail — `@crashfree` function calls `unwrap()`
 
 ### Test Results
 
@@ -2357,8 +2440,8 @@ gas model but checked before deployment instead of at runtime.
 
 - `src/typechecker.rs`: `verify_gas()`, `count_gas_cost_stmts/expr()`, `compute_total_gas()`
 - `src/ast.rs`: `Annotation` already supported (no changes needed)
-- `tests/test_gas.fd`: valid — 3 functions with gas budgets (50, 100, 200)
-- `tests/test_gas_fail.fd`: expected fail — `@gas(3)` on 16-cost function
+- `tests/bootstrap/test_gas.fd`: valid — 3 functions with gas budgets (50, 100, 200)
+- `tests/bootstrap/test_gas_fail.fd`: expected fail — `@gas(3)` on 16-cost function
 
 ### Test Results
 
@@ -2434,7 +2517,7 @@ Implemented four features and a cleanup pass that advance both Phase 10A
 - **Files**: `src/token.rs`, `src/lexer.rs`, `src/ast.rs`, `src/parser.rs`,
   `src/typechecker.rs`, `src/lower.rs`, `src/codegen.rs`, `src/mono.rs`,
   `src/comptime.rs`
-- **Test**: `tests/test_unsafe.fd`
+- **Test**: `tests/bootstrap/test_unsafe.fd`
 
 ### Heap allocation builtins (Phase 10A)
 
@@ -2444,7 +2527,7 @@ Implemented four features and a cleanup pass that advance both Phase 10A
 - **All backends already supported**: interpreter (`interp.rs`), C codegen
   (`codegen_c.rs` maps to `malloc`/`free`), and native PE/ELF (`runtime_linux.rs`
   uses `mmap`/`munmap`).
-- **Test**: `tests/test_alloc.fd` — allocates, checks non-null, frees, no crash.
+- **Test**: `tests/bootstrap/test_alloc.fd` — allocates, checks non-null, frees, no crash.
 
 ### `@audit` annotation (F33 — Phase 7.5C)
 
@@ -2453,7 +2536,7 @@ Implemented four features and a cleanup pass that advance both Phase 10A
 - **Implementation**: injected at IR lowering in `src/lower.rs` — works across
   all backends (interpreter, C codegen, PE emitter) since it's at the IR level.
 - **Works on impl methods too**: annotations are preserved through mangling.
-- **Test**: `tests/test_audit.fd` — audited and non-audited functions, verifies
+- **Test**: `tests/bootstrap/test_audit.fd` — audited and non-audited functions, verifies
   entry/exit logs appear only for `@audit` functions.
 - **Future**: full audit trail (timestamps, params, return values, chain-linked
   hash, crypto signing) is still pending — this is the foundation.
@@ -2464,7 +2547,7 @@ Implemented four features and a cleanup pass that advance both Phase 10A
   (default). Private fields are inaccessible from outside their defining module.
 - **Typechecker enforcement**: `field_visibility` map tracks which fields are
   public. Cross-module access to private fields is a compile error.
-- **Test**: `tests/test_field_privacy.fd`, `tests/test_field_privacy_fail.fd`
+- **Test**: `tests/bootstrap/test_field_privacy.fd`, `tests/bootstrap/test_field_privacy_fail.fd`
 - **Files**: `src/ast.rs`, `src/parser.rs`, `src/typechecker.rs`,
   `src/compiler.rs`, `src/lower.rs`, `src/mono.rs`, `src/cparser.rs`,
   `stdlib/privacy.fd`
@@ -2497,7 +2580,7 @@ Implemented four features and a cleanup pass that advance both Phase 10A
 - `src/linker.rs` — removed debug eprintln!s
 - `src/elf64.rs` — removed debug eprintln!s
 - `stdlib/alloc.fd` — new stdlib module
-- `tests/test_unsafe.fd`, `tests/test_alloc.fd`, `tests/test_audit.fd` — new tests
+- `tests/bootstrap/test_unsafe.fd`, `tests/bootstrap/test_alloc.fd`, `tests/bootstrap/test_audit.fd` — new tests
 
 ## Phase 7.5B: Banking Demo — Compile-Time Financial Conservation (August 2026)
 
@@ -2607,7 +2690,7 @@ Together: no creation + no destruction + no duplication = conservation.
 - `src/typechecker.rs` — linear type enforcement, `verify_conserve()`, field privacy
 - `src/compiler.rs` — `annotations` field in generated StructDefs
 - `stdlib/money.fd` — new stdlib module
-- `tests/test_money*.fd` — 3 new test files
+- `tests/bootstrap/test_money*.fd` — 3 new test files
 - `tests/harness.rs`, `src/main.rs` — expected-fail list updates
 
 ## Native Backend: All 4 Remaining Tests Fixed — FULL NATIVE PARITY (August 2026)
@@ -2671,9 +2754,9 @@ results), and blockchain (node agreement).
   `scan_expr_for_floats()`, and `type_contains_float()` helpers
 - `src/main.rs` — added `test_deterministic_fail` to expected-fail list
 - `tests/harness.rs` — added `test_deterministic_fail.fd` to expected-fail list
-- `tests/test_deterministic.fd` — new test: valid @deterministic functions
+- `tests/bootstrap/test_deterministic.fd` — new test: valid @deterministic functions
   (compound_interest, factorial, sum_range — all integer arithmetic)
-- `tests/test_deterministic_fail.fd` — new expected-fail test: exercises all
+- `tests/bootstrap/test_deterministic_fail.fd` — new expected-fail test: exercises all
   3 rejection rules (IO effect, float literal, float parameter)
 
 **Verification:** 87/87 normal tests + 4/4 expected-fail tests pass. No regressions.
@@ -3067,7 +3150,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **Lexer/Parser**: `region` keyword, region block parsing
 - **Typechecker**: region stack tracking, variable-to-region mapping, use-after-free detection, double-free detection, dangling pointer detection, region escape detection
 - **IR**: `Region` enum (Stack, Heap, Static, Named), `RegionRef` in PIR (`NewRegion`, `FreeRegion`, `AllocaIn`)
-- **Tests**: `tests/regions/test_region_basic.fd`, `test_region_nested.fd`, `test_region_escape.fd` (3/3 pass)
+- **Tests**: `tests/bootstrap/regions/test_region_basic.fd`, `test_region_nested.fd`, `test_region_escape.fd` (3/3 pass)
 
 ### Phase 2B — Effect System
 - **IR**: `Effect` enum expanded with `Net`, `Spawn`, `Pure` (in addition to `Alloc`, `IO`, `Diverge`, `Read`, `Write`)
@@ -3116,7 +3199,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **PE codegen**: emits raw x86-64 bytes from asm template (nop, hlt, cli, sti, mfence, sfence, lfence, pause, etc.)
 - **C codegen**: emits `__asm__()` blocks
 - **WASM codegen**: panics (inline asm not supported in WASM)
-- **Test**: `tests/test_asm.fd` — 7 test cases covering nop, multi-instruction, inputs, outputs, in+out, fences, pause
+- **Test**: `tests/bootstrap/test_asm.fd` — 7 test cases covering nop, multi-instruction, inputs, outputs, in+out, fences, pause
 
 ### No-OS / Bare-Metal Mode (`--bare` flag) — 5A.2
 - **`fidesc emit <file.fd> --bare -o output.bin`**: produces a flat binary (no PE headers, no IAT, no OS calls)
@@ -3124,7 +3207,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **`pe::generate_flat_binary`**: generates `[code][padding][rdata]` layout, load address 0x10000
 - **Bare entry point**: calls `main()`, then `hlt; jmp -3` (infinite halt loop) — no `ExitProcess`
 - **Runtime stubs skipped**: no print/malloc/vec stubs (user must use inline asm for I/O)
-- **Test**: `tests/test_bare.fd` — minimal bare-metal program using `asm!("hlt")`
+- **Test**: `tests/bootstrap/test_bare.fd` — minimal bare-metal program using `asm!("hlt")`
 
 ### Interrupt Handler Support — 5A.3
 - **`interrupt pf` keyword**: marks a function as an interrupt handler
@@ -3135,7 +3218,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **Builtins**: `p_cli()`, `p_sti()`, `p_hlt()`, `p_lidt(ptr)`, `p_idt_set_entry(vec, handler)`, `p_inb(port)`, `p_outb(port, val)`
 - **Bare mode**: emits real x86 instructions (cli, sti, hlt, lidt, in/out)
 - **Normal mode**: emits `ud2` (trap) since OS calls are meaningless
-- **Test**: `tests/test_interrupt.fd` — interrupt handler + cli/sti/hlt builtins
+- **Test**: `tests/bootstrap/test_interrupt.fd` — interrupt handler + cli/sti/hlt builtins
 
 ### MMU/Page Table Management — 5A.4
 - **Control register access**: `p_cr0_read()`, `p_cr0_write(val)`, `p_cr3_read()`, `p_cr3_write(val)`, `p_cr4_read()`, `p_cr4_write(val)`
@@ -3143,7 +3226,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **Page mapping**: `p_page_map(page_table, virt, phys, flags)`, `p_page_unmap(page_table, virt)`
 - **Physical memory**: `p_phys_read64(addr)`, `p_phys_write64(addr, val)`
 - **Bare mode**: emits real x86 instructions (mov cr0/cr3/cr4, invlpg)
-- **Test**: `tests/test_mmu.fd` — CR0/CR3/CR4 read, TLB invalidation, page map/unmap
+- **Test**: `tests/bootstrap/test_mmu.fd` — CR0/CR3/CR4 read, TLB invalidation, page map/unmap
 
 ### Boot Code Generation — 5A.5
 - **`fidesc emit <file.fd> --boot -o output.bin`**: produces a Multiboot2-compatible kernel binary
@@ -3151,7 +3234,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **`pe::generate_boot_binary`**: generates `[mb2 header][boot code + main code][padding][rdata]` layout
 - **Boot entry point**: sets up stack at 0x90000, calls `main()`, then halt loop
 - **Load address**: 0x100000 (1MB — typical kernel load address for GRUB)
-- **Test**: `tests/test_boot.fd` — minimal kernel with cli, CR0 read, hlt
+- **Test**: `tests/bootstrap/test_boot.fd` — minimal kernel with cli, CR0 read, hlt
 
 ### Interpreter Fixes (Phase 5C/5D restoration)
 - **Pre-register function signatures**: lowerer now pre-registers all function return types before lowering bodies, fixing type inference for calls to functions defined later in the file
@@ -3221,10 +3304,10 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **C Codegen: 51/59 matched** (test_float pre-existing + new builtins need C stubs)
 
 ### New Test Files
-- `tests/test_tensor.fd` — tensor creation, indexing, matmul, activations, transpose, reshape, JSON
-- `tests/test_simd.fd` — SIMD elementwise ops, dot product, sum, scale
-- `tests/test_shape.fd` — shape assertions (ndim, size, same_shape, matmul_compatible, reshape)
-- `tests/test_parallel.fd` — parallel map, sum, dot, fill, range, parallelizability check
+- `tests/bootstrap/test_tensor.fd` — tensor creation, indexing, matmul, activations, transpose, reshape, JSON
+- `tests/bootstrap/test_simd.fd` — SIMD elementwise ops, dot product, sum, scale
+- `tests/bootstrap/test_shape.fd` — shape assertions (ndim, size, same_shape, matmul_compatible, reshape)
+- `tests/bootstrap/test_parallel.fd` — parallel map, sum, dot, fill, range, parallelizability check
 
 ### New Standard Library Modules
 - `stdlib/tensor.fd` — Tensor standard library
@@ -3259,7 +3342,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - Functional x86-64 implementations for: `p_vec_is_empty`, `p_vec_clear`, `p_vec_first`, `p_vec_last`, `p_vec_contains`, `p_string_is_empty`, `p_string_len`, `p_string_parse_int`, `p_string_clone`, `p_string_starts_with`
 - Simplified stubs (return default values) for complex operations: `insert`, `remove`, `reverse`, `extend`, `sort`, `split`, `replace`, `trim`, `to_uppercase`, `to_lowercase`, `find`, `rfind`, `repeat`
 
-### Tests (`tests/test_collections.fd`)
+### Tests (`tests/bootstrap/test_collections.fd`)
 - Comprehensive test file covering all 49 operations across String, Vec, and HashMap
 - All tests pass in interpreter backend
 
@@ -3398,7 +3481,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **Array literal element type**: Changed from hardcoded `Type::I32` to `Type::I64` to match `IntLit` lowering (which produces `I64` values)
 
 ### Test Files (Batch 7)
-- `tests/features6.fd` — array literals `[1, 2, 3, 4, 5]`, array indexing (read/write), compound assignment on array elements (`arr[2] += 100`), `for` loop over array with sum accumulation
+- `tests/bootstrap/features.fd` — array literals `[1, 2, 3, 4, 5]`, array indexing (read/write), compound assignment on array elements (`arr[2] += 100`), `for` loop over array with sum accumulation
 
 ### Build Status
 - Compiles successfully with warnings (unused variants — expected)
@@ -3481,10 +3564,10 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - **Buffer aliasing in `__fides_str_concat`**: Added `str_concat_tmp` buffer — left string copied to temp first, then to output buffer
 
 ### Test Files (Batch 6)
-- `tests/control_flow.fd` — if/else if/else, for loops with `..` and `..=` ranges
-- `tests/functions.fd` — user-defined functions, recursive `factorial(5)`
-- `tests/strings.fd` — string literals, string variables, f-string interpolation with string and integer expressions
-- `tests/struct_return.fd` — struct return via SRET calling convention, field access on returned structs
+- `tests/bootstrap/control_flow.fd` — if/else if/else, for loops with `..` and `..=` ranges
+- `tests/bootstrap/functions.fd` — user-defined functions, recursive `factorial(5)`
+- `tests/bootstrap/strings.fd` — string literals, string variables, f-string interpolation with string and integer expressions
+- `tests/bootstrap/struct_return.fd` — struct return via SRET calling convention, field access on returned structs
 
 ### Build Status
 - Compiles successfully
@@ -3584,7 +3667,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - Attributes parsed at top level alongside functions, structs, enums
 
 ### Test Files (Batch 4)
-- `tests/features4.fd` — tests for enums, references, string concat, imports, attributes
+- `tests/bootstrap/features.fd` — tests for enums, references, string concat, imports, attributes
 
 ---
 
@@ -3624,7 +3707,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - `gen_expr` for `FloatLit` loads via `adr` + `ldr d0`
 
 ### Test Files (Batch 3)
-- `tests/features3.fd` — tests for arrays, match, f-strings, floats
+- `tests/bootstrap/features.fd` — tests for arrays, match, f-strings, floats
 
 ---
 
@@ -3669,7 +3752,7 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - Underscore separators: `1_000_000`, `0xFF_FF`
 
 ### Test Files (Batch 2)
-- `tests/features2.fd` — tests for ranges, type aliases, block expressions, struct methods
+- `tests/bootstrap/features.fd` — tests for ranges, type aliases, block expressions, struct methods
 
 ---
 
@@ -3818,10 +3901,10 @@ All industries share the same 3 core safety systems (capabilities, effects, regi
 - `docs/syntax-spec.md` — updated with new keywords and syntax
 
 ### Test Files
-- `tests/hello.fd` — updated to new syntax (`pf`, `pv`, semicolons)
-- `tests/struct.fd` — updated to new syntax
-- `tests/arithmetic.fd` — updated to new syntax
-- `tests/features.fd` — new test exercising compound assignment, bitwise ops, while loops, mutable vars, constants
+- `tests/bootstrap/hello.fd` — updated to new syntax (`pf`, `pv`, semicolons)
+- `tests/bootstrap/struct.fd` — updated to new syntax
+- `tests/bootstrap/arithmetic.fd` — updated to new syntax
+- `tests/bootstrap/features.fd` — new test exercising compound assignment, bitwise ops, while loops, mutable vars, constants
 
 ### Build Status
 - Compiles successfully with 5 warnings (all dead code — expected for unused AST fields)

@@ -2,7 +2,7 @@
 
 > How to build, test, and verify the self-hosted compiler.
 >
-> **Last updated:** Sep 5, 2026 (session 15 — stack wrapper approach, 3-generation self-hosting)
+> **Last updated:** Sep 6, 2026 (session 16 — Tier 3 OS features added: @cpu_local, inline asm clobbers, --no-std, UEFI bindings)
 
 ---
 
@@ -263,12 +263,12 @@ Quick build check (no tests):
 ./verify-selfhost.sh
 ```
 
-Runs every `tests/compiler/*.fd` on three backends:
+Runs every `tests/selfhost/*.fd` on three backends:
 - Interpreter (`fidesc run`)
 - C Codegen (`fidesc run --backend c`) — in-process only
 - PE Emitter (`fidesc run --backend pe`) — in-process only
 
-Compares results against `tests/compiler/baseline/test_results.txt`.
+Compares results against `tests/selfhost/baseline/test_results.txt`.
 
 Options:
 
@@ -322,12 +322,12 @@ The main language test suite, run against the Rust compiler's three backends:
 - **PE Emitter** (`run --backend pe`): native x86-64 backend
 
 Subdirectories:
-- `tests/capability/`: capability tests
-- `tests/effects/`: effect system tests
-- `tests/regions/`: region tests
-- `tests/safety/`: expected-fail safety tests (panic on OOB, div by zero, etc.)
+- `tests/bootstrap/capability/`: capability tests
+- `tests/bootstrap/effects/`: effect system tests
+- `tests/bootstrap/regions/`: region tests
+- `tests/bootstrap/safety/`: expected-fail safety tests (panic on OOB, div by zero, etc.)
 
-### `tests/compiler/`
+### `tests/selfhost/`
 
 23 self-host tests for the Fides compiler modules:
 - `test_ast.fd`
@@ -410,9 +410,9 @@ p-lang/
 ├── docs/selfhost/        # This documentation (13 .md files)
 ├── release/              # Self-hosted build artifacts (gitignored)
 ├── src/                  # Rust reference compiler (52 .rs files, 84,447 LOC)
-├── stdlib/               # Fides standard library (69 .fd modules, 16,090 LOC)
+├── stdlib/               # Fides standard library (70 .fd modules, 18,529 LOC)
 ├── tests/                # Language tests (225+ .fd files)
-├── tests/compiler/       # Self-host module tests (23 .fd files)
+├── tests/selfhost/       # Self-host module tests (23 .fd files)
 ├── tests/selfhost/       # Bootstrap probe tests
 ├── target/               # Rust build artifacts
 ├── verify.sh             # Full Rust compiler verification

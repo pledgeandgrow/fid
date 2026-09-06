@@ -27,7 +27,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 FIDESC="./target/release/fidesc"
-BASELINE_DIR="tests/baseline"
+BASELINE_DIR="tests/bootstrap/baseline"
 BASELINE_FILE="$BASELINE_DIR/test_results.txt"
 
 # --- Help ---
@@ -42,8 +42,8 @@ Commands:
   --golden   Regenerate golden files (IR/PIR/asm) for key tests
   --help     This help message
 
-Baseline is stored in tests/baseline/test_results.txt
-Golden files are stored in tests/golden/
+Baseline is stored in tests/bootstrap/baseline/test_results.txt
+Golden files are stored in tests/bootstrap/golden/
 
 Workflow:
   1. Before making changes:    ./verify.sh          (confirm baseline passes)

@@ -148,8 +148,8 @@ always active unless explicitly disabled).
   on the same variable work correctly
 - Fixed `--borrowck=` flag parsing: flags are now filtered from args before
   command-specific parsing, so `fidesc run --borrowck=on file.fd` works
-- Tests: `tests/test_borrowck.fd` (valid patterns),
-  `tests/test_borrowck_fail.fd` (violations, in expected-fail list)
+- Tests: `tests/bootstrap/test_borrowck.fd` (valid patterns),
+  `tests/bootstrap/test_borrowck_fail.fd` (violations, in expected-fail list)
 - All three rules verified:
   - Rule 1: `&mut x` while any borrow active → error
   - Rule 2: `&x` while `&mut x` active → error

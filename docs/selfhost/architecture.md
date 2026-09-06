@@ -2,7 +2,7 @@
 
 > File-by-file breakdown of the self-hosted compiler modules in `compiler/`.
 >
-> **Last updated:** Sep 5, 2026 (session 15 — **BOOTSTRAP FIXPOINT ACHIEVED**: fides-c2.c == fides-c3.c)
+> **Last updated:** Sep 6, 2026 (session 16 — Tier 3 OS features added: @cpu_local, inline asm clobbers, --no-std, UEFI bindings. Bootstrap fixpoint preserved.)
 >
 > **Note on line numbers:** Source line numbers in "Known issues (session 11
 > analysis)" sections were accurate as of session 11 but may have shifted in

@@ -5735,6 +5735,9 @@ impl TypeChecker {
                             self.check_expr(&op.expr);
                             has_out = true;
                         }
+                        crate::ast::AsmDir::Clobber => {
+                            // Clobber operands don't have a real expression
+                        }
                     }
                 }
                 // asm! returns void if no outputs, i64 if there's an output

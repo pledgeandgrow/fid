@@ -12,7 +12,7 @@ The self-hosted compiler generates **native PE executables on Windows** and **C 
 
 **Independent of Rust for everyday work.** The Rust compiler (`src/*.rs`) remains as the bootstrap reference and for adding new language features that require compiler internals changes. For writing programs, adding stdlib modules, adding tests, and building tools — use the self-hosted compiler directly.
 
-**Test results:** 209/211 on interpreter, 198/211 C codegen matched, 209/211 PE emitter valid. 23/23 self-host tests pass. 265/265 unit tests. See `AGENTS.md` → "Current Baseline" for authoritative counts.
+**Test results:** 231/242 on interpreter, 213/242 C codegen matched, 233/242 PE emitter valid. 23/23 self-host tests pass. 265/265 unit tests. See `AGENTS.md` → "Current Baseline" for authoritative counts.
 
 **Phase status:** See `docs/roadmap/roadmap.md` for full phase status. See `docs/roadmap/selfhost-roadmap.md` for the self-hosting plan.
 
@@ -44,6 +44,16 @@ The self-hosted compiler generates **native PE executables on Windows** and **C 
 | `given`/`ensure` contracts | `fn foo(x: i64) -> i64 given x >= 0 { ... }` | Design by Contract — preconditions verified at call sites |
 | `async`/`await`/`spawn` | `async fn foo() -> Future<T> { ... }` | Cooperative concurrency — async functions, await, spawn (Phase 7.6) |
 | Borrow checker | `--borrowck=on` / `--borrowck=warn` | Compile-time aliasing analysis — `&mut` exclusivity, no mutation while borrowed |
+
+### Tier 3 OS Features (New — Session 16)
+
+| Feature | Syntax | Description |
+|---------|--------|-------------|
+| `@cpu_local` variables | `@cpu_local var x: i64;` | Per-CPU data via GS segment (SMP kernel support) |
+| Inline asm clobbers | `asm!("...", clobber("rax"))` | Clobber lists for inline assembly — compiler saves/restores clobbered registers |
+| No-stdlib mode | `--bare` / `--no-std` / `--no-stdlib` | Skips stdlib/core.fd entirely — zero hidden runtime dependencies for kernel/UEFI |
+| Cross-compilation dispatch | `--target arm64` / `--target riscv64` | Target validation with honest diagnostics, C codegen fallback |
+| UEFI boot services | `use uefi;` | `stdlib/uefi.fd` — AllocatePool, FreePool, GetMemoryMap, ExitBootServices, console output |
 
 ### What Works (Verified End-to-End)
 
@@ -203,21 +213,21 @@ The self-hosted compiler generates **native PE executables on Windows** and **C 
 # It was built by the bootstrap chain and is byte-identical across generations
 
 # Compile a Fides program to C, then to a native executable
-.\release\fides-c3.exe ccompile tests/hello.fd -o hello.exe
+.\release\fides-c3.exe ccompile tests/bootstrap/hello.fd -o hello.exe
 
 # Run a Fides file in the IR interpreter
-.\release\fides-c3.exe run tests/hello.fd
+.\release\fides-c3.exe run tests/bootstrap/hello.fd
 
 # Dump C code (for inspection or manual compilation)
-.\release\fides-c3.exe dump-c tests/hello.fd > hello.c
+.\release\fides-c3.exe dump-c tests/bootstrap/hello.fd > hello.c
 
 # View tokens, AST, or IR
-.\release\fides-c3.exe tokens tests/hello.fd
-.\release\fides-c3.exe ast tests/hello.fd
-.\release\fides-c3.exe ir tests/hello.fd
+.\release\fides-c3.exe tokens tests/bootstrap/hello.fd
+.\release\fides-c3.exe ast tests/bootstrap/hello.fd
+.\release\fides-c3.exe ir tests/bootstrap/hello.fd
 
 # Format a Fides source file
-.\release\fides-c3.exe fmt tests/hello.fd
+.\release\fides-c3.exe fmt tests/bootstrap/hello.fd
 
 # Run the LSP server (for editor integration)
 .\release\fides-c3.exe lsp
@@ -233,12 +243,12 @@ cargo build --release
 .\target\release\fidesc.exe dump-c compiler\main.fd > release\fides-c.c
 
 # Build a native ELF64 executable on Linux (zero external tools needed)
-cargo run -- build tests/hello.fd -o hello
+cargo run -- build tests/bootstrap/hello.fd -o hello
 
 # Cross-compile to ARM64, RISC-V, or Windows
-cargo run -- build tests/hello.fd --target arm64-linux -o hello_arm64
-cargo run -- build tests/hello.fd --target riscv64-linux -o hello_riscv
-cargo run -- build tests/hello.fd --target x86-64-windows -o hello.exe
+cargo run -- build tests/bootstrap/hello.fd --target arm64-linux -o hello_arm64
+cargo run -- build tests/bootstrap/hello.fd --target riscv64-linux -o hello_riscv
+cargo run -- build tests/bootstrap/hello.fd --target x86-64-windows -o hello.exe
 
 # Run the test suite (Rust compiler tests)
 cargo run -- test
@@ -699,7 +709,7 @@ p-lang/
 │   ├── main.rs             # CLI entry point (used to generate first-generation C)
 │   ├── ...                 # Mirrors compiler/*.fd in Rust (reference implementation)
 │   └── bin/                # Binary entry points (fidesc, ark, scribe, veil)
-├── stdlib/                 # 70 standard library modules (18,242 LOC)
+├── stdlib/                 # 70 standard library modules (18,529 LOC)
 │   ├── core.fd             # Option, Result, println, assert, max, min, abs, clamp
 │   ├── vec.fd              # Vec<T> with iterator adapters
 │   ├── rc.fd               # Rc<T> / Arc<T> reference counting (NEW)
@@ -750,10 +760,10 @@ p-lang/
 | `test_asm.fd` | Inline assembly (`asm!`) |
 | `test_bare.fd` | Bare-metal mode (no stdlib, `asm!("hlt")`) |
 | `test_capabilities.fd` | Capability grants, denial, transitive |
-| `tests/capability/test_cap_*.fd` | Capability security: grant/deny/propagation (Phase 2C) |
-| `tests/safety/test_*.fd` | Bounds safety: OOB, overflow, div-by-zero, unwrap None (Phase 2D) |
-| `tests/effects/test_effect_*.fd` | Effect system: annotations, inference, checking, handlers (Phase 2B) |
-| `tests/regions/test_region_*.fd` | Region inference: region blocks, escape detection, safety (Phase 2A) |
+| `tests/bootstrap/capability/test_cap_*.fd` | Capability security: grant/deny/propagation (Phase 2C) |
+| `tests/bootstrap/safety/test_*.fd` | Bounds safety: OOB, overflow, div-by-zero, unwrap None (Phase 2D) |
+| `tests/bootstrap/effects/test_effect_*.fd` | Effect system: annotations, inference, checking, handlers (Phase 2B) |
+| `tests/bootstrap/regions/test_region_*.fd` | Region inference: region blocks, escape detection, safety (Phase 2A) |
 | `test_refs_mut.fd` | `&mut` references, dereference |
 | `test_pe_*.fd` | PE emitter specific tests (struct, enum, refs, generics, defer, try) |
 | `test_regression_*.fd` | Regression tests (closures, fstrings, collections) |

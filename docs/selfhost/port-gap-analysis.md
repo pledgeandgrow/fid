@@ -3,7 +3,7 @@
 > Systematic comparison of every ported module's Rust source vs Fides port.
 > Identifies incomplete ports — functionality present in Rust but missing in Fides.
 >
-> Last updated: Sep 5, 2026 (session 15 — **BOOTSTRAP FIXPOINT ACHIEVED**: fides-c2.c == fides-c3.c).
+> Last updated: Sep 6, 2026 (session 16 — Tier 3 OS features added: @cpu_local, inline asm clobbers, --no-std, UEFI bindings. Bootstrap fixpoint preserved.).
 > Line counts are current as of session 15. Source line numbers in detailed
 > sections below may be from session 11 and are approximate.
 
@@ -468,7 +468,7 @@ All 23 optimization passes are present. 17 are complete, 4 are partial, 1 is stu
 - Self-host tests: 22/23 pass on all 3 backends (interp, C codegen, PE emitter)
   - 1 pre-existing failure: test_codegen_c.fd (missing p_sb_new runtime function)
   - 3 new tests now pass: test_compiler.fd, test_opt.fd, test_lower.fd (were failing due to regressions, now fixed)
-- Baseline saved to tests/compiler/baseline/test_results.txt
+- Baseline saved to tests/selfhost/baseline/test_results.txt
 
 ### Module-level `var` feature (session 11)
 - Implemented `var`/`pub var` at module level in the Rust compiler (src/ast.rs,

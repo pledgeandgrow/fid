@@ -894,6 +894,15 @@ impl CCodeGen {
         wln!(self, "void p_page_unmap(int64_t cr3, int64_t virt);");
         wln!(self, "int64_t p_phys_read64(int64_t addr);");
         wln!(self, "void p_phys_write64(int64_t addr, int64_t val);");
+        // Volatile memory access (MMIO) forward declarations
+        wln!(self, "int64_t p_volatile_load(int64_t addr);");
+        wln!(self, "void p_volatile_store(int64_t addr, int64_t val);");
+        wln!(self, "int64_t p_volatile_load8(int64_t addr);");
+        wln!(self, "int64_t p_volatile_load16(int64_t addr);");
+        wln!(self, "int64_t p_volatile_load32(int64_t addr);");
+        wln!(self, "void p_volatile_store8(int64_t addr, int64_t val);");
+        wln!(self, "void p_volatile_store16(int64_t addr, int64_t val);");
+        wln!(self, "void p_volatile_store32(int64_t addr, int64_t val);");
         wln!(self, "void p_lgdt(int64_t gdt_desc);");
         wln!(self, "void p_gdt_set_entry(int64_t gdt_ptr, int64_t index, int64_t base, int64_t limit, int64_t flags);");
         wln!(self, "void p_serial_init(void);");
@@ -2607,6 +2616,9 @@ impl CCodeGen {
         wln!(self, "}");
         wln!(self, "void* p_malloc_persistent(int64_t size) { if (size < 0) return NULL; return malloc((size_t)size); }");
         wln!(self, "void* p_alloc(int64_t size) { return p_malloc(size); }");
+        // Note: p_alloc is also forward-declared as int64_t p_alloc(int64_t) from
+        // the fn_param_types table. TCC treats void* and int64_t as compatible
+        // pointer-sized types, but to be safe we match the forward declaration.
         wln!(self, "void p_free(void* ptr) { /* arena memory — no individual frees */ }");
         wln!(self, "int64_t p_arena_save(void) { return 0; }");
         wln!(self, "void p_arena_restore(int64_t mark) {");

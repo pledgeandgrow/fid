@@ -94,7 +94,7 @@ If you are fixing a bug, write a failing test or run the existing one:
 .\release\fides-c.exe run tests/<name>.fd
 
 # For the PE emitter (native codegen, no tcc)
-.\release\fides-c.exe build tests/hello_pe.fd -o release/hello_pe.exe
+.\release\fides-c.exe build tests/bootstrap/hello_pe.fd -o release/hello_pe.exe
 .\release\hello_pe.exe
 ```
 

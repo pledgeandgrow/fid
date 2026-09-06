@@ -2943,8 +2943,12 @@ impl Parser {
                     self.advance();
                     crate::ast::AsmDir::Out
                 }
+                TokenKind::Ident(s) if s == "clobber" => {
+                    self.advance();
+                    crate::ast::AsmDir::Clobber
+                }
                 _ => return Err(format!(
-                    "Parse error: asm! operand must start with 'in' or 'out', got '{}'",
+                    "Parse error: asm! operand must start with 'in', 'out', or 'clobber', got '{}'",
                     self.peek_token().kind
                 )),
             };
@@ -2963,7 +2967,12 @@ impl Parser {
                 }
             };
             self.expect(TokenKind::RParen, ")")?;
-            let expr = self.parse_expr()?;
+            // Clobber operands don't have an expression — use IntLit(0) as placeholder
+            let expr = if direction == crate::ast::AsmDir::Clobber {
+                crate::ast::Expr::IntLit(0)
+            } else {
+                self.parse_expr()?
+            };
             operands.push(crate::ast::AsmOperand {
                 direction,
                 reg,

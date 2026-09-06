@@ -22,7 +22,7 @@ This section has been **verified by reading source code, running tests, and exec
 
 **Test baseline:** See `roadmap.md` → "Verified Test Baseline" table for current
 test counts (265/265 unit, 8/8 harness, 164/165 interp/C codegen, 165/165 PE, 0 skip,
-0 known-fail, 215 .fd files, 51 .rs files, 69 stdlib modules).
+0 known-fail, 215 .fd files, 51 .rs files, 70 stdlib modules).
 
 ### Feature Verification Matrix (Code-Verified)
 
@@ -311,7 +311,7 @@ Phase L10: Ecosystem & Adoption         ← Spec, book, playground, community, m
 - [x] **VERIFIED:** `gpu.rs` has `generate_spirv` and `generate_ptx` functions
 - [x] **DONE:** CLI command `fidesc gpu <file.fd> --target spirv|ptx -o <output>` works
 - [x] **DONE:** `generate_spirv` and `generate_ptx` are wired into the command
-- [x] **VERIFIED:** `fidesc gpu tests/hello.fd --target spirv -o /tmp/test.spv` produces 340-byte SPIR-V binary
+- [x] **VERIFIED:** `fidesc gpu tests/bootstrap/hello.fd --target spirv -o /tmp/test.spv` produces 340-byte SPIR-V binary
 
 #### L1K — Clean Up Compiler Warnings
 - [x] Address compiler warnings — reduced from 225 to 136 (unused imports, variables, constants removed)
@@ -1543,7 +1543,7 @@ the "Phase 1: Fix the bugs" and "Phase 2: Close language gaps" work.
 
 **Category: Significant engineering (refocus)**
 
-**The observation**: 69 modules, 18,242 LOC. Average: 264 lines per
+**The observation**: 70 modules, 18,529 LOC. Average: 265 lines per
 module. Many are superficial (`regex.fd` is wildcard matching, not real
 regex; `crypto.fd` is 485 lines, not audited cryptography).
 

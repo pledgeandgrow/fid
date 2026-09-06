@@ -41,7 +41,7 @@ if [[ -n "$SINGLE_FILE" ]]; then
     TEST_FILES=("$SINGLE_FILE")
 else
     TEST_FILES=()
-    for f in tests/*.fd tests/compiler/*.fd tests/capability/*.fd tests/effects/*.fd tests/regions/*.fd tests/safety/*.fd; do
+    for f in tests/*.fd tests/selfhost/*.fd tests/bootstrap/capability/*.fd tests/bootstrap/effects/*.fd tests/bootstrap/regions/*.fd tests/bootstrap/safety/*.fd; do
         [[ -f "$f" ]] && TEST_FILES+=("$f")
     done
 fi

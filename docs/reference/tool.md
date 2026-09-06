@@ -124,7 +124,7 @@ effects/regions/capabilities panels, watch variables, and hot-reload.
 
 ```
 fidesc debug <file.fd>         # interactive debugger (current implementation)
-probe run tests/test_borrowck.fd  # (future standalone)
+probe run tests/bootstrap/test_borrowck.fd  # (future standalone)
 probe break main:42
 probe step
 probe inspect v

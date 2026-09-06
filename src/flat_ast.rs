@@ -366,7 +366,7 @@ pub fn expr_flat(e: &Expr, depth: usize) -> String {
         Expr::Asm { template, operands } => {
             let mut s = format!("{}Asm \"{}\"\n", ind, esc(template));
             for op in operands {
-                let dir = match op.direction { AsmDir::In => "In", AsmDir::Out => "Out" };
+                let dir = match op.direction { AsmDir::In => "In", AsmDir::Out => "Out", AsmDir::Clobber => "Clobber" };
                 s.push_str(&format!("{}AsmOperand {} \"{}\"\n", indent(depth + 1), dir, esc(&op.reg)));
                 s.push_str(&expr_flat(&op.expr, depth + 2)); s.push('\n');
             }

@@ -361,7 +361,7 @@ pub fn print_help() {
     println!("    - Instruction coverage: which IR instructions ran");
     println!();
     println!("EXAMPLES:");
-    println!("    veil tests/struct.fd                      # Text report to stdout");
-    println!("    veil tests/struct.fd --format html        # HTML report in coverage/");
-    println!("    veil tests/struct.fd --output reports/    # Custom output directory");
+    println!("    veil tests/bootstrap/struct.fd                      # Text report to stdout");
+    println!("    veil tests/bootstrap/struct.fd --format html        # HTML report in coverage/");
+    println!("    veil tests/bootstrap/struct.fd --output reports/    # Custom output directory");
 }

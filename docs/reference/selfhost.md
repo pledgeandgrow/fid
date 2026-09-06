@@ -4,8 +4,11 @@
 > effort. Explains the process, how Fides differs from Rust/C, what limitations
 > to expect, and how to avoid common pitfalls during bootstrap.
 >
-> **Status (Sep 5, 2026 - session 15):** Bootstrap fixpoint achieved.
+> **Status (Sep 6, 2026 - session 16):** Bootstrap fixpoint achieved.
 > `fides-c2.c == fides-c3.c` (SHA256-identical, 701,100 lines).
+> Tier 3 OS features added in session 16: `@cpu_local` (GS segment),
+> inline asm clobbers, `--no-std` bare-metal mode, cross-compilation
+> target dispatch, UEFI boot services bindings (`stdlib/uefi.fd`).
 
 ## Table of Contents
 
@@ -371,9 +374,9 @@ is the reference implementation. Compare Fides output against it.
 Before attempting bootstrap, verify that each Fides module produces identical
 output to its Rust counterpart:
 ```bash
-fidesc diff-test tests/hello.fd --stage c     # C output
-fidesc diff-test tests/hello.fd --stage ir    # IR output
-fidesc diff-test tests/hello.fd --stage pir3  # PIR output
+fidesc diff-test tests/bootstrap/hello.fd --stage c     # C output
+fidesc diff-test tests/bootstrap/hello.fd --stage ir    # IR output
+fidesc diff-test tests/bootstrap/hello.fd --stage pir3  # PIR output
 ```
 Run across all test files. Fix differences before bootstrap.
 
@@ -417,7 +420,7 @@ Fix all differences. This is the most important step.
 
 ### Phase 2: Create Missing Tests
 
-- `tests/compiler/test_typechecker.fd` -- the only rewritten module without a test
+- `tests/selfhost/test_typechecker.fd` -- the only rewritten module without a test
 
 ### Phase 3: Incremental Bootstrap
 

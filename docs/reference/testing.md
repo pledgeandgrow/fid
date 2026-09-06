@@ -1,6 +1,6 @@
 # TEST.md — Fides Test Results
 
-*Last updated: Sep 5, 2026 (session 15 — bootstrap fixpoint achieved). Verified against actual test runs (265/265 unit tests, 209/211 interpreter, 198/211 C codegen matched, 209/211 PE valid, 23/23 self-host tests, 225+ .fd test files, cross-compilation to ARM64/RISC-V/Windows. Bootstrap fixpoint: fides-c2.c == fides-c3.c, SHA256-identical, 701,100 lines.)
+*Last updated: Sep 6, 2026 (session 16 — Tier 3 OS features added). Verified against actual test runs (265/265 unit tests, 231/242 interpreter, 213/242 C codegen matched, 233/242 PE valid, 23/23 self-host tests, 225+ .fd test files, cross-compilation to ARM64/RISC-V/Windows. Bootstrap fixpoint: fides-c2.c == fides-c3.c, SHA256-identical, 701,100 lines. Tier 3 OS features: @cpu_local, inline asm clobbers, --no-std, UEFI bindings — all compile cleanly, no new test regressions.)
 
 ## Legend
 

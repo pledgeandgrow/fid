@@ -660,23 +660,23 @@ fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
 
 // --- test ----------------------------------------------------------------
 // Reference: src/main.rs:1384
-// Scans tests/ directory for .fd files, compiles and runs each.
+// Scans tests/bootstrap/ directory for .fd files, compiles and runs each.
 // Flags: --fail (expect test to fail)
 // Backends: C codegen (tcc), PE emitter. TODO: interpreter backend.
 fn cmd_test(n: i64, start: i64) -> i64 {
     // --fail: run only expected-fail tests (failing = correct)
     var fail_only: bool = has_flag(n, start, "--fail");
 
-    p_eprint_str("[test] Scanning tests/ directory...\n");
+    p_eprint_str("[test] Scanning tests/bootstrap/ directory...\n");
 
     // Use dir command to list .fd files, redirect to temp file
-    p_system("dir /b tests\\*.fd > _fides_test_list.txt 2>nul");
+    p_system("dir /b tests\\bootstrap\\*.fd > _fides_test_list.txt 2>nul");
     var listing: str = c_file_read("_fides_test_list.txt");
     if str_len(listing) == 0 {
         if fail_only {
-            p_eprint_str("No expected-fail tests found in tests/\n");
+            p_eprint_str("No expected-fail tests found in tests/bootstrap/\n");
         } else {
-            p_eprint_str("No .fd test files found in tests/\n");
+            p_eprint_str("No .fd test files found in tests/bootstrap/\n");
         }
         return 1;
     }
@@ -685,9 +685,9 @@ fn cmd_test(n: i64, start: i64) -> i64 {
     var files: Vec<str> = c_str_lines(listing);
     if files.len() == 0 {
         if fail_only {
-            p_eprint_str("No expected-fail tests found in tests/\n");
+            p_eprint_str("No expected-fail tests found in tests/bootstrap/\n");
         } else {
-            p_eprint_str("No .fd test files found in tests/\n");
+            p_eprint_str("No .fd test files found in tests/bootstrap/\n");
         }
         return 1;
     }
@@ -767,9 +767,9 @@ fn cmd_test(n: i64, start: i64) -> i64 {
 
     if test_files.len() == 0 {
         if fail_only {
-            p_eprint_str("No expected-fail tests found in tests/\n");
+            p_eprint_str("No expected-fail tests found in tests/bootstrap/\n");
         } else {
-            p_eprint_str("No .fd test files found in tests/\n");
+            p_eprint_str("No .fd test files found in tests/bootstrap/\n");
         }
         return 1;
     }
@@ -795,7 +795,7 @@ fn cmd_test(n: i64, start: i64) -> i64 {
     var fi: i64 = 0;
     while fi < test_files.len() {
         var fname: str = test_files.get(fi);
-        var test_path: str = "tests\\" + fname;
+        var test_path: str = "tests\\bootstrap\\" + fname;
         var stem2: str = fname;
         if str_ends_with(stem2, ".fd") {
             stem2 = str_slice(stem2, 0, str_len(stem2) - 3);
@@ -1320,42 +1320,19 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             // TODO: When do_lto is true, use optimize_l2_lto() instead of
             // optimize_l2() for aggressive cross-module inlining.
             p_eprint_str("[build] Generating PE executable...\n");
-            var pe_bytes: Vec = generate_pe(ir_mod);
-            p_eprint_str("[build] PE generated, writing to file...\n");
-
-            // Write PE bytes as hex using C-level string builder (efficient)
-            var sb_ptr: i64 = p_sb_new();
-            var bi: i64 = 0;
-            var hex_chars: str = "0123456789ABCDEF";
-            var total: i64 = pe_bytes.len();
-            while bi < total {
-                var b: i64 = pe_bytes.get(bi);
-                var hi: i64 = (b >> 4) & 0xF;
-                var lo: i64 = b & 0xF;
-                p_sb_append(sb_ptr, p_char_to_str(str_byte_at(hex_chars, hi)));
-                p_sb_append(sb_ptr, p_char_to_str(str_byte_at(hex_chars, lo)));
-                bi = bi + 1;
-                if bi % 10000 == 0 {
-                    p_eprint_str("[build] Hex encoding progress: ");
-                    p_eprint_str(int_to_str(bi));
-                    p_eprint_str(" / ");
-                    p_eprint_str(int_to_str(total));
-                    p_eprint_str("\n");
-                }
-            }
-            p_eprint_str("[build] Hex string built. Writing hex file...\n");
-            var hex_str: str = p_sb_to_str(sb_ptr);
-            var hex_file: str = output + ".hex";
-            p_file_write(hex_file, hex_str);
-            p_eprint_str("[build] Hex file written. Decoding...\n");
-
-            var ps_cmd: str = "powershell -Command \"$hex = Get-Content -Raw '" + hex_file + "'; $bytes = [byte[]]::new($hex.Length / 2); for ($i=0; $i -lt $bytes.Length; $i++) { $bytes[$i] = [Convert]::ToByte($hex.Substring($i*2, 2), 16) }; [System.IO.File]::WriteAllBytes('" + output + "', $bytes)\"";
-            var dec_ret: i64 = p_system(ps_cmd);
-            if dec_ret != 0 {
-                print("Failed to decode PE file\n");
+            // Use C codegen + TCC for the build command.
+            p_eprint_str("[build] Using C codegen...\n");
+            var cgen: CCodeGen = CCodeGen_new();
+            var c_source: str = CCodeGen_generate(&mut cgen, ir_mod);
+            var c_file: str = output + ".c";
+            p_file_write(c_file, c_source);
+            var tcc_cmd: str = "C:\tcc\tcc.exe -o " + output + " " + c_file;
+            var tcc_ret: i64 = p_system(tcc_cmd);
+            if tcc_ret != 0 {
+                print("Error: TCC compilation failed\n");
                 return 1;
             }
-
+            p_eprint_str("[build] Native executable built via C codegen.\n");
             print("Built native executable: ");
             print(output);
             print("\n");
@@ -1381,7 +1358,7 @@ fn print_usage() {
     p_eprint_str("  fides-c pir      <file.fd> [1|2|3|all]    Show PIR (default: L2)\n");
     p_eprint_str("  fides-c opt      <file.fd>                Optimize PIR L2 and show result\n");
     p_eprint_str("  fides-c fmt      <file.fd> [--check]      Format source code\n");
-    p_eprint_str("  fides-c test                             Run all tests in tests/\n");
+    p_eprint_str("  fides-c test                             Run all tests in tests/bootstrap/\n");
     p_eprint_str("  fides-c bench    <file.fd> [-n <count>]   Benchmark: run N times\n");
     p_eprint_str("  fides-c lint     <file.fd>               Run lint checks\n");
     p_eprint_str("  fides-c version                          Show version\n");

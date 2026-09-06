@@ -1422,6 +1422,11 @@ pub struct PeCodeGen {
     // Module-level mutable globals: name -> rdata offset
     pub global_names: Vec<str>,
     pub global_rdata_offsets: Vec,
+    // @cpu_local globals: name -> GS-relative offset (per-CPU storage)
+    pub cpu_local_names: Vec<str>,
+    pub cpu_local_offsets: Vec,
+    // Current function is an interrupt handler (affects return epilogue)
+    pub cur_is_interrupt: bool,
 }
 
 pub fn PeCodeGen_new() -> PeCodeGen {
@@ -1438,6 +1443,9 @@ pub fn PeCodeGen_new() -> PeCodeGen {
         main_offset: -1,
         global_names: Vec::new(),
         global_rdata_offsets: Vec::new(),
+        cpu_local_names: Vec::new(),
+        cpu_local_offsets: Vec::new(),
+        cur_is_interrupt: false,
     };
 }
 
@@ -1452,6 +1460,38 @@ pub fn PeCodeGen_get_func_label(self: &PeCodeGen, name: str) -> i64 {
     }
     return -1;
 }
+
+// Check if a global name is @cpu_local and return its GS-relative offset.
+pub fn PeCodeGen_get_cpu_local_offset(self: &PeCodeGen, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < self.cpu_local_names.len() {
+        if str_equal(self.cpu_local_names.get(i), name) {
+            return self.cpu_local_offsets.get(i);
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ─── GS segment helpers (for @cpu_local per-CPU storage) ──────────────────
+pub fn X86Encoder_mov_rax_gs(self: &mut X86Encoder, offset: i64) {
+    self.code.push(0x65); X86Encoder_rex_w(self);
+    self.code.push(0x8B); self.code.push(0x04); self.code.push(0x25);
+    X86Encoder_emit_i32(self, offset);
+}
+pub fn X86Encoder_mov_gs_rax(self: &mut X86Encoder, offset: i64) {
+    self.code.push(0x65); X86Encoder_rex_w(self);
+    self.code.push(0x89); self.code.push(0x04); self.code.push(0x25);
+    X86Encoder_emit_i32(self, offset);
+}
+pub fn X86Encoder_lea_rax_gs(self: &mut X86Encoder, offset: i64) {
+    self.code.push(0x65); X86Encoder_rex_w(self);
+    self.code.push(0x8D); self.code.push(0x04); self.code.push(0x25);
+    X86Encoder_emit_i32(self, offset);
+}
+pub fn X86Encoder_wrmsr(self: &mut X86Encoder) { self.code.push(0x0F); self.code.push(0x30); }
+pub fn X86Encoder_rdmsr(self: &mut X86Encoder) { self.code.push(0x0F); self.code.push(0x32); }
+pub fn X86Encoder_swapgs(self: &mut X86Encoder) { self.code.push(0x0F); self.code.push(0x01); self.code.push(0xF8); }
 
 // Register a function label
 pub fn PeCodeGen_register_func(self: &mut PeCodeGen, name: str) -> i64 {
@@ -2116,6 +2156,290 @@ fn PeCodeGen_gen_inst_default(self: &mut PeCodeGen, dst: i64) {
     X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
 }
 
+// ─── Inline assembly support ──────────────────────────────────────────────
+fn asm_extract(s: str, start: i64, end: i64) -> str {
+    var result: str = "";
+    var i: i64 = start;
+    while i < end && i < str_len(s) {
+        result = result + byte_to_str(str_byte_at(s, i));
+        i = i + 1;
+    }
+    return result;
+}
+
+fn parse_asm_reg(name: str) -> i64 {
+    if str_equal(name, "rax") { return REG_RAX; }
+    if str_equal(name, "rcx") { return REG_RCX; }
+    if str_equal(name, "rdx") { return REG_RDX; }
+    if str_equal(name, "rbx") { return REG_RBX; }
+    if str_equal(name, "rsp") { return REG_RSP; }
+    if str_equal(name, "rbp") { return REG_RBP; }
+    if str_equal(name, "rsi") { return REG_RSI; }
+    if str_equal(name, "rdi") { return REG_RDI; }
+    if str_equal(name, "r8")  { return REG_R8; }
+    if str_equal(name, "r9")  { return REG_R9; }
+    if str_equal(name, "r10") { return REG_R10; }
+    if str_equal(name, "r11") { return REG_R11; }
+    if str_equal(name, "r12") { return REG_R12; }
+    if str_equal(name, "r13") { return REG_R13; }
+    if str_equal(name, "r14") { return REG_R14; }
+    if str_equal(name, "r15") { return REG_R15; }
+    if str_equal(name, "al")  { return REG_RAX; }
+    if str_equal(name, "cl")  { return REG_RCX; }
+    if str_equal(name, "dl")  { return REG_RDX; }
+    if str_equal(name, "bl")  { return REG_RBX; }
+    if str_equal(name, "ax")  { return REG_RAX; }
+    if str_equal(name, "cx")  { return REG_RCX; }
+    if str_equal(name, "dx")  { return REG_RDX; }
+    if str_equal(name, "bx")  { return REG_RBX; }
+    if str_equal(name, "si")  { return REG_RSI; }
+    if str_equal(name, "di")  { return REG_RDI; }
+    return -1;
+}
+
+fn is_clobber_reg(name: str) -> bool {
+    if str_len(name) < 4 { return false; }
+    // "CL:" = 67, 76, 58
+    if str_byte_at(name, 0) == 67 && str_byte_at(name, 1) == 76 && str_byte_at(name, 2) == 58 { return true; }
+    return false;
+}
+
+fn extract_clobber_reg(name: str) -> str {
+    return asm_extract(name, 3, str_len(name));
+}
+
+fn parse_asm_imm(s: str) -> i64 {
+    var result: i64 = 0;
+    var neg: bool = false;
+    var i: i64 = 0;
+    if str_len(s) == 0 { return 0; }
+    if str_byte_at(s, 0) == 45 { neg = true; i = 1; }  // '-'
+    // 0x prefix: '0'=48, 'x'=120, 'X'=88
+    if i + 1 < str_len(s) && str_byte_at(s, i) == 48 && (str_byte_at(s, i + 1) == 120 || str_byte_at(s, i + 1) == 88) {
+        i = i + 2;
+        while i < str_len(s) {
+            var c: i64 = str_byte_at(s, i);
+            var digit: i64 = 0;
+            if c >= 48 && c <= 57 { digit = c - 48; }
+            else if c >= 97 && c <= 102 { digit = c - 97 + 10; }
+            else if c >= 65 && c <= 70 { digit = c - 65 + 10; }
+            else { break; }
+            result = result * 16 + digit;
+            i = i + 1;
+        }
+    } else {
+        while i < str_len(s) {
+            var c: i64 = str_byte_at(s, i);
+            if c >= 48 && c <= 57 { result = result * 10 + (c - 48); } else { break; }
+            i = i + 1;
+        }
+    }
+    if neg { result = -result; }
+    return result;
+}
+
+fn PeCodeGen_emit_asm_line(self: &mut PeCodeGen, line: str) {
+    // ' '=32, '\t'=9, ','=44
+    var start: i64 = 0;
+    while start < str_len(line) {
+        var c: i64 = str_byte_at(line, start);
+        if c != 32 && c != 9 { break; }
+        start = start + 1;
+    }
+    if start >= str_len(line) { return; }
+    var mn_end: i64 = start;
+    while mn_end < str_len(line) {
+        var c: i64 = str_byte_at(line, mn_end);
+        if c == 32 || c == 9 { break; }
+        mn_end = mn_end + 1;
+    }
+    var mnemonic: str = asm_extract(line, start, mn_end);
+    var ops_start: i64 = mn_end;
+    while ops_start < str_len(line) && (str_byte_at(line, ops_start) == 32 || str_byte_at(line, ops_start) == 9) {
+        ops_start = ops_start + 1;
+    }
+    var operands: Vec<str> = Vec::new();
+    var pos: i64 = ops_start;
+    while pos < str_len(line) {
+        while pos < str_len(line) && str_byte_at(line, pos) == 32 { pos = pos + 1; }
+        if pos >= str_len(line) { break; }
+        var op_start: i64 = pos;
+        while pos < str_len(line) && str_byte_at(line, pos) != 44 { pos = pos + 1; }
+        var op_end: i64 = pos;
+        while op_end > op_start && str_byte_at(line, op_end - 1) == 32 { op_end = op_end - 1; }
+        if op_end > op_start { operands.push(asm_extract(line, op_start, op_end)); }
+        if pos < str_len(line) && str_byte_at(line, pos) == 44 { pos = pos + 1; }
+    }
+    if str_equal(mnemonic, "nop") { self.enc.code.push(0x90); }
+    else if str_equal(mnemonic, "hlt") { self.enc.code.push(0xF4); }
+    else if str_equal(mnemonic, "cli") { self.enc.code.push(0xFA); }
+    else if str_equal(mnemonic, "sti") { self.enc.code.push(0xFB); }
+    else if str_equal(mnemonic, "cld") { self.enc.code.push(0xFC); }
+    else if str_equal(mnemonic, "std") { self.enc.code.push(0xFD); }
+    else if str_equal(mnemonic, "leave") { self.enc.code.push(0xC9); }
+    else if str_equal(mnemonic, "ud2") { self.enc.code.push(0x0F); self.enc.code.push(0x0B); }
+    else if str_equal(mnemonic, "mfence") { self.enc.code.push(0x0F); self.enc.code.push(0xAE); self.enc.code.push(0xF0); }
+    else if str_equal(mnemonic, "sfence") { self.enc.code.push(0x0F); self.enc.code.push(0xAE); self.enc.code.push(0xF8); }
+    else if str_equal(mnemonic, "lfence") { self.enc.code.push(0x0F); self.enc.code.push(0xAE); self.enc.code.push(0xE8); }
+    else if str_equal(mnemonic, "pause") { self.enc.code.push(0xF3); self.enc.code.push(0x90); }
+    else if str_equal(mnemonic, "syscall") { self.enc.code.push(0x0F); self.enc.code.push(0x05); }
+    else if str_equal(mnemonic, "sysret") { self.enc.code.push(0x0F); self.enc.code.push(0x07); }
+    else if str_equal(mnemonic, "sysexit") { self.enc.code.push(0x0F); self.enc.code.push(0x35); }
+    else if str_equal(mnemonic, "swapgs") { X86Encoder_swapgs(&mut self.enc); }
+    else if str_equal(mnemonic, "wbinvd") { self.enc.code.push(0x0F); self.enc.code.push(0x09); }
+    else if str_equal(mnemonic, "cpuid") { self.enc.code.push(0x0F); self.enc.code.push(0xA2); }
+    else if str_equal(mnemonic, "rdtsc") { self.enc.code.push(0x0F); self.enc.code.push(0x31); }
+    else if str_equal(mnemonic, "rdmsr") { X86Encoder_rdmsr(&mut self.enc); }
+    else if str_equal(mnemonic, "wrmsr") { X86Encoder_wrmsr(&mut self.enc); }
+    else if str_equal(mnemonic, "iret") { self.enc.code.push(0xCF); }
+    else if str_equal(mnemonic, "iretq") { X86Encoder_rex_w(&mut self.enc); self.enc.code.push(0xCF); }
+    else if str_equal(mnemonic, "int") {
+        if operands.len() > 0 { self.enc.code.push(0xCD); self.enc.code.push(parse_asm_imm(operands.get(0)) & 0xFF); }
+    }
+    else if str_equal(mnemonic, "in") {
+        if operands.len() >= 2 {
+            if str_equal(operands.get(1), "dx") { self.enc.code.push(0xEC); }
+            else { self.enc.code.push(0xE4); self.enc.code.push(parse_asm_imm(operands.get(1)) & 0xFF); }
+        }
+    }
+    else if str_equal(mnemonic, "out") {
+        if operands.len() >= 2 {
+            if str_equal(operands.get(0), "dx") { self.enc.code.push(0xEE); }
+            else { self.enc.code.push(0xE6); self.enc.code.push(parse_asm_imm(operands.get(0)) & 0xFF); }
+        }
+    }
+    else if str_equal(mnemonic, "mov") {
+        if operands.len() >= 2 {
+            var dst_reg: i64 = parse_asm_reg(operands.get(0));
+            var src_reg: i64 = parse_asm_reg(operands.get(1));
+            if dst_reg >= 0 && src_reg >= 0 {
+                X86Encoder_rex_w(&mut self.enc); self.enc.code.push(0x89);
+                X86Encoder_modrm(&mut self.enc, 3, reg_code(dst_reg), reg_code(src_reg));
+            } else if dst_reg >= 0 && src_reg < 0 {
+                X86Encoder_mov_imm32(&mut self.enc, dst_reg, parse_asm_imm(operands.get(1)));
+            }
+        }
+    }
+    else if str_equal(mnemonic, "xor") {
+        if operands.len() >= 2 {
+            var dr: i64 = parse_asm_reg(operands.get(0)); var sr: i64 = parse_asm_reg(operands.get(1));
+            if dr >= 0 && sr >= 0 { X86Encoder_rex_w(&mut self.enc); self.enc.code.push(0x31); X86Encoder_modrm(&mut self.enc, 3, reg_code(sr), reg_code(dr)); }
+        }
+    }
+    else if str_equal(mnemonic, "add") {
+        if operands.len() >= 2 {
+            var dr: i64 = parse_asm_reg(operands.get(0)); var sr: i64 = parse_asm_reg(operands.get(1));
+            if dr >= 0 && sr >= 0 { X86Encoder_rex_w(&mut self.enc); self.enc.code.push(0x01); X86Encoder_modrm(&mut self.enc, 3, reg_code(sr), reg_code(dr)); }
+        }
+    }
+    else if str_equal(mnemonic, "sub") {
+        if operands.len() >= 2 {
+            var dr: i64 = parse_asm_reg(operands.get(0)); var sr: i64 = parse_asm_reg(operands.get(1));
+            if dr >= 0 && sr >= 0 { X86Encoder_rex_w(&mut self.enc); self.enc.code.push(0x29); X86Encoder_modrm(&mut self.enc, 3, reg_code(sr), reg_code(dr)); }
+        }
+    }
+    else if str_equal(mnemonic, "and") {
+        if operands.len() >= 2 {
+            var dr: i64 = parse_asm_reg(operands.get(0)); var sr: i64 = parse_asm_reg(operands.get(1));
+            if dr >= 0 && sr >= 0 { X86Encoder_rex_w(&mut self.enc); self.enc.code.push(0x21); X86Encoder_modrm(&mut self.enc, 3, reg_code(sr), reg_code(dr)); }
+        }
+    }
+    else if str_equal(mnemonic, "or") {
+        if operands.len() >= 2 {
+            var dr: i64 = parse_asm_reg(operands.get(0)); var sr: i64 = parse_asm_reg(operands.get(1));
+            if dr >= 0 && sr >= 0 { X86Encoder_rex_w(&mut self.enc); self.enc.code.push(0x09); X86Encoder_modrm(&mut self.enc, 3, reg_code(sr), reg_code(dr)); }
+        }
+    }
+    else if str_equal(mnemonic, "push") {
+        if operands.len() >= 1 { var r: i64 = parse_asm_reg(operands.get(0)); if r >= 0 { X86Encoder_push(&mut self.enc, r); } }
+    }
+    else if str_equal(mnemonic, "pop") {
+        if operands.len() >= 1 { var r: i64 = parse_asm_reg(operands.get(0)); if r >= 0 { X86Encoder_pop(&mut self.enc, r); } }
+    }
+    else if str_equal(mnemonic, "inc") {
+        if operands.len() >= 1 { var r: i64 = parse_asm_reg(operands.get(0)); if r >= 0 { X86Encoder_rex_w(&mut self.enc); self.enc.code.push(0xFF); X86Encoder_modrm(&mut self.enc, 3, 0, reg_code(r)); } }
+    }
+    else if str_equal(mnemonic, "dec") {
+        if operands.len() >= 1 { var r: i64 = parse_asm_reg(operands.get(0)); if r >= 0 { X86Encoder_rex_w(&mut self.enc); self.enc.code.push(0xFF); X86Encoder_modrm(&mut self.enc, 3, 1, reg_code(r)); } }
+    }
+    else if str_equal(mnemonic, "not") {
+        if operands.len() >= 1 { var r: i64 = parse_asm_reg(operands.get(0)); if r >= 0 { X86Encoder_rex_w(&mut self.enc); self.enc.code.push(0xF7); X86Encoder_modrm(&mut self.enc, 3, 2, reg_code(r)); } }
+    }
+    else if str_equal(mnemonic, "neg") {
+        if operands.len() >= 1 { var r: i64 = parse_asm_reg(operands.get(0)); if r >= 0 { X86Encoder_rex_w(&mut self.enc); self.enc.code.push(0xF7); X86Encoder_modrm(&mut self.enc, 3, 3, reg_code(r)); } }
+    }
+    else if str_equal(mnemonic, "shl") {
+        if operands.len() >= 2 { var r: i64 = parse_asm_reg(operands.get(0)); if r >= 0 { X86Encoder_rex_w(&mut self.enc); self.enc.code.push(0xC1); X86Encoder_modrm(&mut self.enc, 3, 4, reg_code(r)); self.enc.code.push(parse_asm_imm(operands.get(1)) & 0xFF); } }
+    }
+    else if str_equal(mnemonic, "shr") {
+        if operands.len() >= 2 { var r: i64 = parse_asm_reg(operands.get(0)); if r >= 0 { X86Encoder_rex_w(&mut self.enc); self.enc.code.push(0xC1); X86Encoder_modrm(&mut self.enc, 3, 5, reg_code(r)); self.enc.code.push(parse_asm_imm(operands.get(1)) & 0xFF); } }
+    }
+    else if str_equal(mnemonic, "sar") {
+        if operands.len() >= 2 { var r: i64 = parse_asm_reg(operands.get(0)); if r >= 0 { X86Encoder_rex_w(&mut self.enc); self.enc.code.push(0xC1); X86Encoder_modrm(&mut self.enc, 3, 7, reg_code(r)); self.enc.code.push(parse_asm_imm(operands.get(1)) & 0xFF); } }
+    }
+    else if str_equal(mnemonic, "lgdt") { self.enc.code.push(0x0F); self.enc.code.push(0x01); self.enc.code.push(0x10); }
+    else if str_equal(mnemonic, "lidt") { self.enc.code.push(0x0F); self.enc.code.push(0x01); self.enc.code.push(0x18); }
+    else if str_equal(mnemonic, "invlpg") { self.enc.code.push(0x0F); self.enc.code.push(0x01); self.enc.code.push(0x38); }
+    else if str_equal(mnemonic, "ret") { X86Encoder_ret(&mut self.enc); }
+    else if str_equal(mnemonic, "call") {
+        if operands.len() >= 1 { var r: i64 = parse_asm_reg(operands.get(0)); if r >= 0 { self.enc.code.push(0xFF); X86Encoder_modrm(&mut self.enc, 3, 2, reg_code(r)); } }
+    }
+    else if str_equal(mnemonic, "jmp") {
+        if operands.len() >= 1 { var r: i64 = parse_asm_reg(operands.get(0)); if r >= 0 { self.enc.code.push(0xFF); X86Encoder_modrm(&mut self.enc, 3, 4, reg_code(r)); } }
+    }
+}
+
+fn PeCodeGen_emit_asm_template(self: &mut PeCodeGen, template: str) {
+    // ';' = 59, '\n' = 10
+    var line_start: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(template) {
+        var c: i64 = str_byte_at(template, i);
+        if c == 59 || c == 10 {
+            if i > line_start { PeCodeGen_emit_asm_line(self, asm_extract(template, line_start, i)); }
+            line_start = i + 1;
+        }
+        i = i + 1;
+    }
+    if i > line_start { PeCodeGen_emit_asm_line(self, asm_extract(template, line_start, i)); }
+}
+
+fn PeCodeGen_gen_inst_asm(self: &mut PeCodeGen, dst: i64, template: str, inputs: Vec<StringValueId>, outputs: Vec<StringValueId>, ret_ty: IrType, frame: &PeStackFrame) {
+    var clobber_regs: Vec<i64> = Vec::new();
+    var real_inputs: Vec<StringValueId> = Vec::new();
+    var ii: i64 = 0;
+    while ii < inputs.len() {
+        var pair: StringValueId = inputs.get(ii);
+        if is_clobber_reg(pair.name) {
+            var reg: i64 = parse_asm_reg(extract_clobber_reg(pair.name));
+            if reg >= 0 { clobber_regs.push(reg); }
+        } else { real_inputs.push(pair); }
+        ii = ii + 1;
+    }
+    ii = 0;
+    while ii < real_inputs.len() {
+        var pair: StringValueId = real_inputs.get(ii);
+        var src_off: i64 = PeStackFrame_find_offset(frame, pair.id);
+        var reg: i64 = parse_asm_reg(pair.name);
+        if reg >= 0 { X86Encoder_mov_reg_mem_rbp(&mut self.enc, reg, src_off); }
+        ii = ii + 1;
+    }
+    var ci: i64 = 0;
+    while ci < clobber_regs.len() { X86Encoder_push(&mut self.enc, clobber_regs.get(ci)); ci = ci + 1; }
+    PeCodeGen_emit_asm_template(self, template);
+    var oi: i64 = 0;
+    while oi < outputs.len() {
+        var pair: StringValueId = outputs.get(oi);
+        var out_off: i64 = PeStackFrame_find_offset(frame, pair.id);
+        var reg: i64 = parse_asm_reg(pair.name);
+        if reg >= 0 { X86Encoder_mov_mem_rbp_reg(&mut self.enc, out_off, reg); }
+        oi = oi + 1;
+    }
+    ci = clobber_regs.len() - 1;
+    while ci >= 0 { X86Encoder_pop(&mut self.enc, clobber_regs.get(ci)); ci = ci - 1; }
+    if !(ret_ty == IrType::Void) { X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX); }
+}
+
 pub fn PeCodeGen_gen_inst(self: &mut PeCodeGen, id: i64, inst: Inst, frame: &PeStackFrame, module: IrModule) {
     var dst: i64 = PeStackFrame_find_offset(frame, id);
 
@@ -2145,18 +2469,25 @@ pub fn PeCodeGen_gen_inst(self: &mut PeCodeGen, id: i64, inst: Inst, frame: &PeS
             PeCodeGen_gen_inst_const_null(self, dst);
         }
         Inst::GlobalAddr(name, _) => {
-            // lea rax, [rip + global_offset]
-            var off: i64 = 0;
-            var gi: i64 = 0;
-            while gi < self.global_names.len() {
-                if str_equal(self.global_names.get(gi), name) {
-                    off = self.global_rdata_offsets.get(gi);
-                    gi = self.global_names.len();
+            // Check if this is a @cpu_local global (GS-relative)
+            var gs_off: i64 = PeCodeGen_get_cpu_local_offset(self, name);
+            if gs_off >= 0 {
+                X86Encoder_lea_rax_gs(&mut self.enc, gs_off);
+                X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
+            } else {
+                // lea rax, [rip + global_offset] — normal global
+                var off: i64 = 0;
+                var gi: i64 = 0;
+                while gi < self.global_names.len() {
+                    if str_equal(self.global_names.get(gi), name) {
+                        off = self.global_rdata_offsets.get(gi);
+                        gi = self.global_names.len();
+                    }
+                    gi = gi + 1;
                 }
-                gi = gi + 1;
+                X86Encoder_lea_rip(&mut self.enc, REG_RAX, off);
+                X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
             }
-            X86Encoder_lea_rip(&mut self.enc, REG_RAX, off);
-            X86Encoder_mov_mem_rbp_reg(&mut self.enc, dst, REG_RAX);
         }
         Inst::BinOp(op, left, right, ty) => {
             PeCodeGen_gen_inst_binop(self, dst, op, left, right, ty, frame);
@@ -2217,6 +2548,9 @@ pub fn PeCodeGen_gen_inst(self: &mut PeCodeGen, id: i64, inst: Inst, frame: &PeS
         }
         Inst::Panic(msg) => {
             PeCodeGen_gen_inst_panic(self, msg);
+        }
+        Inst::Asm(template, inputs, outputs, ret_ty) => {
+            PeCodeGen_gen_inst_asm(self, dst, template, inputs, outputs, ret_ty, frame);
         }
         Inst::MakeDyn(_, _, _) => {
             PeCodeGen_gen_inst_default(self, dst);

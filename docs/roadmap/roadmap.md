@@ -28,6 +28,7 @@ Phase 12: Security Hardening ← MOSTLY COMPLETE — binary hardening + all safe
 Phase 13: World Class        ← IN PROGRESS — type inference done, SLP+loop-vec done, @send/@sync done, debugger done, ark package manager done, scribe doc generator done, veil coverage tool done, green threads remaining
 Phase 14: Debugging Tools    ← COMPLETE — interpreter debugger, record/replay, hot-reload, post-mortem, native debugger
 Phase 15: Compete Where We Lose ← NOT STARTED — win in web/data-science/prototyping/games without adding a runtime (arena allocators, comptime frameworks, ergonomic modes)
+Phase 16: Tier 3 OS           ← IN PROGRESS — @cpu_local, inline asm clobbers, --no-std, cross-compilation dispatch, UEFI bindings done; ARM64/RISC-V native codegen + bare runtime stubs remaining
 ```
 
 ### Verified Test Baseline (Aug 2026)
@@ -44,7 +45,7 @@ Phase 15: Compete Where We Lose ← NOT STARTED — win in web/data-science/prot
 | Expected-fail | **35** tests | Correctly fail — error detection tests. |
 | Total `.fd` test files | **218** | 195 in root + 23 in subdirs (capability/effects/regions/safety) |
 | Source files | **51** `.rs` | 86,742 LOC Rust |
-| Stdlib files | **69** `.fd` | 18,242 LOC Fides |
+| Stdlib files | **70** `.fd` | 18,529 LOC Fides |
 
 ### Security Hardening (New — Aug 2026)
 
@@ -487,7 +488,7 @@ rewritten in Fides. All are now resolved:
    resolving payload types with type-param substitution, and
    `pattern_binding_ir_types()` in the lowerer using the real IR type
    (aggregates as `Ptr(Struct(..))` not bare `I64`).
-   Test: `tests/test_enum_payload_types.fd`.
+   Test: `tests/bootstrap/test_enum_payload_types.fd`.
 
 2. **[DONE] Real generics at the value level.** `Vec<T>`, `Option<T>`,
    `Result<T,E>` stored `i64` regardless of `T`. `Vec::new()` always returned
@@ -495,7 +496,7 @@ rewritten in Fides. All are now resolved:
    `val v: Vec<Token> = Vec::new()` picks up the element type, making
    `Vec::get()` return `Ptr(Struct(..))` for struct elements via `word_repr()`,
    and adding `Vec<X>`/`HashMap<X,Y>` compatibility in `types_compatible()`.
-   Test: `tests/test_generic_vec_typed.fd`.
+   Test: `tests/bootstrap/test_generic_vec_typed.fd`.
 
 3. **[DONE] Recursive types.** No true `Box<T>` indirection existed, making
    recursive data structures (ASTs) impossible. Fixed by adding
@@ -503,7 +504,7 @@ rewritten in Fides. All are now resolved:
    `Box<T>` (either `Ptr(Ptr(Struct(..)))` from `Box::new` or
    `Generic("Box", [Struct(..)])` from a typed parameter), it loads through
    the Box once to get the inner struct pointer before pattern matching.
-   Test: `tests/test_recursive_box.fd` — recursive `eval` and `count_nodes`
+   Test: `tests/bootstrap/test_recursive_box.fd` — recursive `eval` and `count_nodes`
    on `(1+2)*(3+4)` = 21 with 7 nodes.
 
 ### What's Left Before Self-Host Can Start
@@ -1088,3 +1089,56 @@ unique features (sandbox, capabilities, hot reload, @conserve, @constant_time,
 binary hardening by default, interactive debugger with hot-reload) that no
 competitor has. After Phase 13, Fides becomes a credible alternative for
 concurrent server programming, systems programming, and embedded development.
+
+---
+
+## Phase 16 — Tier 3 OS Features (IN PROGRESS — session 16)
+
+**Goal:** Real OS/kernel deployment capability — per-CPU data, inline asm
+with clobbers, no-stdlib mode, cross-compilation dispatch, and UEFI boot
+services.
+
+**Status:** Five features implemented directly in the self-hosted compiler
+(`compiler/*.fd`). All compile cleanly with the Rust bootstrap compiler.
+No new test regressions.
+
+### Milestones
+- [x] `@cpu_local` variables — per-CPU data via GS segment
+  - `PeCodeGen` struct: `cpu_local_names`, `cpu_local_offsets`, `cur_is_interrupt`
+  - GS segment encoders: `lea_rax_gs`, `mov_rax_gs`, `mov_gs_rax`, `wrmsr`, `rdmsr`, `swapgs`
+  - `Inst::GlobalAddr` emits `lea rax, [gs:offset]` for cpu_local globals
+  - Parser: `@cpu_local var x: i64;` annotation support
+- [x] Inline asm clobber lists and constraints
+  - `AsmDir::Clobber` in AST (both Rust + Fides)
+  - Parser: `clobber("reg")` syntax (one reg per clobber operand)
+  - Lowerer: clobbers passed as `CL:`-prefixed inputs
+  - PE backend: 50+ x86 instructions encoded, clobber save/restore
+  - `Inst::Asm` case in `PeCodeGen_gen_inst` match
+- [x] No-stdlib mode (`--bare` / `--no-std` / `--no-stdlib`)
+  - `build_program_no_std()` — skips `stdlib/core.fd` entirely
+  - Typechecks user program alone, no stdlib merge, no import resolution
+  - Zero hidden runtime dependencies for kernel/UEFI/bare-metal
+- [x] Cross-compilation target validation
+  - `--target arm64`/`aarch64`/`riscv64` — honest diagnostic + C codegen fallback
+  - Does not falsely claim native codegen support
+- [x] UEFI boot services bindings (`stdlib/uefi.fd`, 287 lines)
+  - EFI status codes, memory types, pool types, timer types
+  - Boot services function offsets (AllocatePool, FreePool, GetMemoryMap,
+    ExitBootServices, Stall, CreateEvent, SetTimer, etc.)
+  - Runtime services function offsets
+  - System table offsets (boot_services, con_in, con_out, runtime_services)
+  - `uefi_init()`, `uefi_get_boot_services()`, `uefi_allocate_pool()`,
+    `uefi_free_pool()`, `uefi_allocate_pages()`, `uefi_get_memory_map()`,
+    `uefi_exit_boot_services()`, `uefi_stall()`, `uefi_print()`,
+    `uefi_clear_screen()`
+  - Volatile memory access via `p_volatile_load`/`p_volatile_store`
+
+### What's Left
+- [ ] ARM64 native codegen module for self-hosted compiler (codegen_arm64.fd)
+- [ ] RISC-V native codegen module for self-hosted compiler (codegen_riscv.fd)
+- [ ] Bare runtime stubs in PE emitter (p_hlt, p_cli, p_sti, p_inb, p_outb, p_serial — lost in session 16 git checkout, need re-add)
+- [ ] UEFI PE32+ emission in self-hosted PE emitter
+- [ ] GS base setup runtime (WRMSR 0xC0000101) stubs
+- [ ] Interrupt handler return epilogue (IRETQ vs RET) in PE emitter
+- [ ] Multiboot2 header generation for `--boot` mode
+- [ ] Real hardware testing (QEMU ARM64, QEMU RISC-V, real UEFI firmware)

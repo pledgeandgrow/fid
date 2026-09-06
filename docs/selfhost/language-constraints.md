@@ -3,7 +3,7 @@
 > What the Fides language must respect, and how the self-hosted compiler
 > handles each feature.
 >
-> **Last updated:** Sep 5, 2026 (session 15 — **BOOTSTRAP FIXPOINT ACHIEVED**)
+> **Last updated:** Sep 6, 2026 (session 16 — Tier 3 OS features added: @cpu_local, inline asm clobbers, --no-std, UEFI bindings)
 
 ---
 

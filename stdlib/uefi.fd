@@ -1,0 +1,287 @@
+// stdlib/uefi.fd — UEFI boot services bindings
+//
+// Provides FFI declarations for UEFI functions, allowing the kernel to
+// use UEFI services before ExitBootServices.
+//
+// Usage:
+//   use core;
+//   use uefi;
+//
+//   fn main() {
+//     // UEFI entry point receives (ImageHandle, SystemTable) in RCX/RDX
+//     // Access boot services via the system table
+//     var bs = uefi_get_boot_services();
+//     var pool = uefi_allocate_pool(bs, uefi_pool_data, 4096);
+//   }
+//
+// UEFI calling convention: same as Microsoft x64 (RCX, RDX, R8, R9)
+// This matches Fides' default calling convention.
+
+module uefi;
+
+use core;
+
+// ─── UEFI status codes ───────────────────────────────────────────────────
+pub const EFI_SUCCESS: i64 = 0;
+pub const EFI_LOAD_ERROR: i64 = 1;
+pub const EFI_INVALID_PARAMETER: i64 = 2;
+pub const EFI_UNSUPPORTED: i64 = 3;
+pub const EFI_BAD_BUFFER_SIZE: i64 = 4;
+pub const EFI_BUFFER_TOO_SMALL: i64 = 5;
+pub const EFI_NOT_READY: i64 = 6;
+pub const EFI_OUT_OF_RESOURCES: i64 = 7;
+pub const EFI_NOT_FOUND: i64 = 14;
+pub const EFI_ACCESS_DENIED: i64 = 15;
+pub const EFI_TIMEOUT: i64 = 18;
+
+// ─── UEFI memory types ───────────────────────────────────────────────────
+pub const efi_reserved_memory: i64 = 0;
+pub const efi_loader_code: i64 = 1;
+pub const efi_loader_data: i64 = 2;
+pub const efi_boot_services_code: i64 = 3;
+pub const efi_boot_services_data: i64 = 4;
+pub const efi_runtime_services_code: i64 = 5;
+pub const efi_runtime_services_data: i64 = 6;
+pub const efi_conventional_memory: i64 = 7;
+pub const efi_unusable_memory: i64 = 8;
+pub const efi_acpi_reclaim_memory: i64 = 9;
+pub const efi_acpi_nvs_memory: i64 = 10;
+pub const efi_memory_mapped_io: i64 = 11;
+pub const efi_memory_mapped_io_port_space: i64 = 12;
+pub const efi_pal_code: i64 = 13;
+pub const efi_persistent_memory: i64 = 14;
+
+// ─── UEFI pool allocation types ──────────────────────────────────────────
+pub const uefi_pool_data: i64 = 0;
+pub const uefi_pool_realloc: i64 = 1;
+pub const uefi_pool_align: i64 = 2;
+
+// ─── UEFI timer delay types ──────────────────────────────────────────────
+pub const efi_timer_relative: i64 = 0;
+pub const efi_timer_periodic: i64 = 1;
+pub const efi_timer_cancel: i64 = 2;
+
+// ─── UEFI structure types (opaque pointers) ──────────────────────────────
+// In UEFI, all structures are accessed via pointers. We use i64 (raw ptr)
+// to represent them since Fides doesn't have struct-pointer arithmetic
+// at the language level yet.
+
+// EFI_HANDLE is an opaque pointer
+pub fn efi_handle_is_valid(h: i64) -> bool {
+    return h != 0;
+}
+
+// ─── UEFI boot services function offsets ─────────────────────────────────
+// The EFI_BOOT_SERVICES table has functions at fixed offsets.
+// These offsets are in bytes from the start of the table.
+// Reference: UEFI Specification 2.10, Table 7.4
+
+// Header (8+8+4+4+4+4 = 32 bytes, padded to 40)
+pub const efi_bs_hdr_size: i64 = 40;
+
+// Boot services function offsets (each is an 8-byte function pointer)
+pub const efi_bs_raise_tpl: i64 = 40;
+pub const efi_bs_restore_tpl: i64 = 48;
+pub const efi_bs_allocate_pages: i64 = 56;
+pub const efi_bs_free_pages: i64 = 64;
+pub const efi_bs_get_memory_map: i64 = 72;
+pub const efi_bs_allocate_pool: i64 = 80;
+pub const efi_bs_free_pool: i64 = 88;
+pub const efi_bs_create_event: i64 = 96;
+pub const efi_bs_set_timer: i64 = 104;
+pub const efi_bs_wait_for_event: i64 = 112;
+pub const efi_bs_signal_event: i64 = 120;
+pub const efi_bs_close_event: i64 = 128;
+pub const efi_bs_check_event: i64 = 136;
+pub const efi_bs_install_protocol_interface: i64 = 144;
+pub const efi_bs_reinstall_protocol_interface: i64 = 152;
+pub const efi_bs_uninstall_protocol_interface: i64 = 160;
+pub const efi_bs_handle_protocol: i64 = 168;
+pub const efi_bs_register_protocol_notify: i64 = 176;
+pub const efi_bs_locate_handle: i64 = 184;
+pub const efi_bs_locate_protocol: i64 = 192;
+pub const efi_bs_install_configuration_table: i64 = 200;
+pub const efi_bs_load_image: i64 = 208;
+pub const efi_bs_start_image: i64 = 216;
+pub const efi_bs_exit: i64 = 224;
+pub const efi_bs_unload_image: i64 = 232;
+pub const efi_bs_exit_boot_services: i64 = 240;
+pub const efi_bs_get_next_monotonic_count: i64 = 248;
+pub const efi_bs_stall: i64 = 256;
+pub const efi_bs_set_watchdog_timer: i64 = 264;
+pub const efi_bs_connect_controller: i64 = 272;
+pub const efi_bs_disconnect_controller: i64 = 280;
+pub const efi_bs_open_protocol: i64 = 288;
+pub const efi_bs_close_protocol: i64 = 296;
+pub const efi_bs_open_protocol_information: i64 = 304;
+pub const efi_bs_protocols_per_handle: i64 = 312;
+pub const efi_bs_locate_handle_buffer: i64 = 320;
+pub const efi_bs_locate_all_handles: i64 = 328;
+pub const efi_bs_copy_mem: i64 = 336;
+pub const efi_bs_set_mem: i64 = 344;
+pub const efi_bs_create_event_ex: i64 = 352;
+
+// ─── UEFI runtime services function offsets ──────────────────────────────
+pub const efi_rs_hdr_size: i64 = 40;
+pub const efi_rs_get_time: i64 = 40;
+pub const efi_rs_set_time: i64 = 48;
+pub const efi_rs_get_wakeup_time: i64 = 56;
+pub const efi_rs_set_wakeup_time: i64 = 64;
+pub const efi_rs_set_virtual_address_map: i64 = 72;
+pub const efi_rs_convert_pointer: i64 = 80;
+pub const efi_rs_get_variable: i64 = 88;
+pub const efi_rs_set_variable: i64 = 96;
+pub const efi_rs_get_next_variable_name: i64 = 104;
+pub const efi_rs_get_next_high_monotonic_count: i64 = 112;
+pub const efi_rs_reset_system: i64 = 120;
+
+// ─── UEFI system table offsets ───────────────────────────────────────────
+// EFI_SYSTEM_TABLE layout (UEFI 2.10, Table 4.3)
+pub const efi_st_hdr_size: i64 = 24;  // Signature(8) + Revision(4) + HeaderSize(4) + CRC32(4) + Reserved(4)
+pub const efi_st_firmware_vendor: i64 = 24;  // ptr
+pub const efi_st_firmware_revision: i64 = 32;  // u32
+pub const efi_st_console_in_handle: i64 = 40;  // EFI_HANDLE
+pub const efi_st_con_in: i64 = 48;  // ptr to SIMPLE_TEXT_INPUT
+pub const efi_st_console_out_handle: i64 = 56;  // EFI_HANDLE
+pub const efi_st_con_out: i64 = 64;  // ptr to SIMPLE_TEXT_OUTPUT
+pub const efi_st_standard_error_handle: i64 = 72;  // EFI_HANDLE
+pub const efi_st_std_err: i64 = 80;  // ptr to SIMPLE_TEXT_OUTPUT
+pub const efi_st_runtime_services: i64 = 88;  // ptr to EFI_RUNTIME_SERVICES
+pub const efi_st_boot_services: i64 = 96;  // ptr to EFI_BOOT_SERVICES
+pub const efi_st_number_of_table_entries: i64 = 104;  // usize
+pub const efi_st_configuration_table: i64 = 112;  // ptr
+
+// ─── UEFI helper functions ───────────────────────────────────────────────
+// These use volatile loads to read function pointers from the UEFI tables.
+
+// Global system table pointer (set by UEFI entry point)
+var g_system_table: i64 = 0;
+var g_image_handle: i64 = 0;
+var g_boot_services: i64 = 0;
+
+// Called by UEFI entry point to save the system table and image handle
+pub fn uefi_init(image_handle: i64, system_table: i64) -> void {
+    g_image_handle = image_handle;
+    g_system_table = system_table;
+    // Read boot services pointer from system table
+    g_boot_services = efi_read_ptr(system_table + efi_st_boot_services);
+}
+
+// Get the boot services pointer
+pub fn uefi_get_boot_services() -> i64 {
+    return g_boot_services;
+}
+
+// Get the runtime services pointer
+pub fn uefi_get_runtime_services() -> i64 {
+    return efi_read_ptr(g_system_table + efi_st_runtime_services);
+}
+
+// Get the console output protocol
+pub fn uefi_get_con_out() -> i64 {
+    return efi_read_ptr(g_system_table + efi_st_con_out);
+}
+
+// Get the console input protocol
+pub fn uefi_get_con_in() -> i64 {
+    return efi_read_ptr(g_system_table + efi_st_con_in);
+}
+
+// ─── Volatile memory access (for reading UEFI table pointers) ────────────
+// These read raw memory at a given address.
+// In bare-metal mode, these map to p_volatile_load (volatile 64-bit load).
+// In hosted mode, they use regular pointer dereference.
+
+pub fn efi_read_ptr(addr: i64) -> i64 {
+    // Use volatile load to prevent optimizer from removing the access
+    return p_volatile_load(addr);
+}
+
+pub fn efi_write_ptr(addr: i64, val: i64) -> void {
+    p_volatile_store(addr, val);
+}
+
+// ─── UEFI boot services wrappers ─────────────────────────────────────────
+// These call function pointers from the boot services table.
+// Each function pointer is at a fixed offset in the EFI_BOOT_SERVICES table.
+
+// AllocatePool(PoolType, Size, Buffer) -> EFI_STATUS
+pub fn uefi_allocate_pool(pool_type: i64, size: i64) -> i64 {
+    var bs: i64 = g_boot_services;
+    if bs == 0 { return 0; }
+    var fn_ptr: i64 = efi_read_ptr(bs + efi_bs_allocate_pool);
+    // Call fn_ptr(pool_type, size, &buffer)
+    // For now, use inline asm to do an indirect call
+    var buffer: i64 = 0;
+    asm!("call rax", in("rax") fn_ptr, in("rcx") pool_type, in("rdx") size, in("r8") buffer, clobber("r9"), clobber("r10"), clobber("r11"));
+    return buffer;
+}
+
+// FreePool(Buffer) -> EFI_STATUS
+pub fn uefi_free_pool(buffer: i64) -> i64 {
+    var bs: i64 = g_boot_services;
+    if bs == 0 { return EFI_INVALID_PARAMETER; }
+    var fn_ptr: i64 = efi_read_ptr(bs + efi_bs_free_pool);
+    asm!("call rax", in("rax") fn_ptr, in("rcx") buffer, clobber("rdx"), clobber("r8"), clobber("r9"), clobber("r10"), clobber("r11"));
+    return 0;
+}
+
+// AllocatePages(AllocateType, MemoryType, Pages, Address) -> EFI_STATUS
+pub fn uefi_allocate_pages(memory_type: i64, pages: i64) -> i64 {
+    var bs: i64 = g_boot_services;
+    if bs == 0 { return 0; }
+    var fn_ptr: i64 = efi_read_ptr(bs + efi_bs_allocate_pages);
+    var address: i64 = 0;
+    asm!("call rax", in("rax") fn_ptr, in("rcx") 0, in("rdx") memory_type, in("r8") pages, in("r9") address, clobber("r10"), clobber("r11"));
+    return address;
+}
+
+// GetMemoryMap(MapSize, Map, MapKey, DescriptorSize, DescriptorVersion) -> EFI_STATUS
+pub fn uefi_get_memory_map(map_size: i64, map: i64) -> i64 {
+    var bs: i64 = g_boot_services;
+    if bs == 0 { return EFI_LOAD_ERROR; }
+    var fn_ptr: i64 = efi_read_ptr(bs + efi_bs_get_memory_map);
+    var map_key: i64 = 0;
+    var desc_size: i64 = 0;
+    var desc_version: i64 = 0;
+    asm!("call rax", in("rax") fn_ptr, in("rcx") map_size, in("rdx") map, in("r8") map_key, in("r9") desc_size, clobber("r10"), clobber("r11"));
+    return 0;
+}
+
+// ExitBootServices(ImageHandle, MapKey) -> EFI_STATUS
+pub fn uefi_exit_boot_services(map_key: i64) -> i64 {
+    var bs: i64 = g_boot_services;
+    if bs == 0 { return EFI_LOAD_ERROR; }
+    var fn_ptr: i64 = efi_read_ptr(bs + efi_bs_exit_boot_services);
+    asm!("call rax", in("rax") fn_ptr, in("rcx") g_image_handle, in("rdx") map_key, clobber("r8"), clobber("r9"), clobber("r10"), clobber("r11"));
+    return 0;
+}
+
+// Stall(Microseconds) -> EFI_STATUS
+pub fn uefi_stall(microseconds: i64) -> void {
+    var bs: i64 = g_boot_services;
+    if bs == 0 { return; }
+    var fn_ptr: i64 = efi_read_ptr(bs + efi_bs_stall);
+    asm!("call rax", in("rax") fn_ptr, in("rcx") microseconds, clobber("rdx"), clobber("r8"), clobber("r9"), clobber("r10"), clobber("r11"));
+    return;
+}
+
+// ─── UEFI console output ─────────────────────────────────────────────────
+// SIMPLE_TEXT_OUTPUT protocol has a OutputString function at offset 8.
+pub fn uefi_print(msg: str) -> void {
+    var con_out: i64 = efi_read_ptr(g_system_table + efi_st_con_out);
+    if con_out == 0 { return; }
+    // OutputString is at offset 8 in SIMPLE_TEXT_OUTPUT
+    var fn_ptr: i64 = efi_read_ptr(con_out + 8);
+    asm!("call rax", in("rax") fn_ptr, in("rcx") con_out, in("rdx") msg, clobber("r8"), clobber("r9"), clobber("r10"), clobber("r11"));
+    return;
+}
+
+// ClearScreen via SIMPLE_TEXT_OUTPUT.ClearScreen at offset 56
+pub fn uefi_clear_screen() -> void {
+    var con_out: i64 = efi_read_ptr(g_system_table + efi_st_con_out);
+    if con_out == 0 { return; }
+    var fn_ptr: i64 = efi_read_ptr(con_out + 56);
+    asm!("call rax", in("rax") fn_ptr, in("rcx") con_out, clobber("rdx"), clobber("r8"), clobber("r9"), clobber("r10"), clobber("r11"));
+    return;
+}

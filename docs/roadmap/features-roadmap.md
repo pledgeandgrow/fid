@@ -226,6 +226,20 @@ D5: fidesc autopsy           ✅ IMPLEMENTED — native code debugger via ptrace
 D6: IR-level debugging        ✅ IMPLEMENTED — ir command shows IR with → marker at current instruction, ir current shows just current instruction
 D7: effects/regions/caps      ✅ IMPLEMENTED — effects panel shows function effects+annotations, regions shows memory regions+stack alloc count, capabilities shows annotations+required capabilities
 
+─── Tier 3 OS Features — Phase 16 (Sep 2026) ───────────────────
+T1: @cpu_local variables      ✅ IMPLEMENTED — per-CPU data via GS segment: PeCodeGen cpu_local_names/offsets, GS encoders (lea_rax_gs, mov_rax_gs, mov_gs_rax, wrmsr, rdmsr, swapgs), Inst::GlobalAddr emits [gs:offset] for cpu_local globals, parser @cpu_local annotation
+T2: asm! clobber lists        ✅ IMPLEMENTED — AsmDir::Clobber in AST, clobber("reg") syntax, lowerer passes CL:-prefixed inputs, PE backend 50+ x86 instructions encoded with clobber save/restore, Inst::Asm in gen_inst match
+T3: --no-std mode             ✅ IMPLEMENTED — build_program_no_std() skips stdlib/core.fd, --bare/--no-std/--no-stdlib flags, zero hidden runtime deps for kernel/UEFI/bare-metal
+T4: Cross-compilation dispatch ✅ IMPLEMENTED — --target arm64/aarch64/riscv64 validation, honest diagnostics, C codegen fallback (does not falsely claim native codegen)
+T5: UEFI boot services        ✅ IMPLEMENTED — stdlib/uefi.fd (287 lines): EFI status/memory/timer constants, boot+runtime service offsets, system table offsets, uefi_init/allocate_pool/free_pool/allocate_pages/get_memory_map/exit_boot_services/stall/print/clear_screen, volatile memory access
+T6: ARM64 native codegen      🔲 PLANNED — codegen_arm64.fd module for self-hosted compiler (Rust bootstrap has src/codegen_arm64.rs)
+T7: RISC-V native codegen     🔲 PLANNED — codegen_riscv.fd module for self-hosted compiler (Rust bootstrap has src/codegen_riscv.rs)
+T8: Bare runtime stubs        🔲 PLANNED — p_hlt, p_cli, p_sti, p_inb, p_outb, p_serial in PE emitter for bare-metal mode
+T9: UEFI PE32+ emission       🔲 PLANNED — self-hosted PE emitter generates UEFI PE32+ EFI applications
+T10: GS base setup            🔲 PLANNED — WRMSR(0xC0000101) runtime stubs for per-CPU GS base initialization
+T11: IRETQ epilogue           🔲 PLANNED — interrupt handler return (IRETQ vs RET) in PE emitter for @interrupt functions
+T12: Multiboot2 header        🔲 PLANNED — --boot mode generates Multiboot2 header for kernel boot
+
 ─── Cut — Redundant, Build with Existing Features ───────────────
 C1: fogofwar                  ❌ CUT — build with tilemap (S1) + query (F18)
 C2: selection                 ❌ CUT — build with query (F18) + formation math
@@ -280,7 +294,7 @@ C15: @validated               ❌ CUT — already covered by given/ensure contra
 
 **Status:** ✅ Implemented
 **Files:** token.rs, lexer.rs, ast.rs, parser.rs, typechecker.rs, lower.rs, mono.rs, comptime.rs, codegen.rs
-**Test:** `tests/test_sandbox.fd` (passes), `tests/test_sandbox_fail.fd` (expected fail)
+**Test:** `tests/bootstrap/test_sandbox.fd` (passes), `tests/bootstrap/test_sandbox_fail.fd` (expected fail)
 **Impact:** High — security
 **Novelty:** Genuinely impossible in Rust/C/Go (no compile-time capability system)
 
@@ -344,7 +358,7 @@ fn main() {
 
 **Status:** ✅ Implemented
 **Files:** token.rs, lexer.rs, ast.rs, parser.rs, ir.rs, lower.rs, interp.rs, pir.rs, codegen_c.rs, pe.rs, wasm.rs
-**Test:** `tests/test_persist.fd` (passes)
+**Test:** `tests/bootstrap/test_persist.fd` (passes)
 **Impact:** High — developer experience
 **Novelty:** No language has scope-level state persistence across hot reloads
 
@@ -405,7 +419,7 @@ fn main() {
 
 **Status:** ✅ Implemented
 **Files:** ast.rs, parser.rs, typechecker.rs, lower.rs, mono.rs
-**Test:** `tests/test_budget.fd` (passes), `tests/test_budget_fail.fd` (expected fail)
+**Test:** `tests/bootstrap/test_budget.fd` (passes), `tests/bootstrap/test_budget_fail.fd` (expected fail)
 **Impact:** High — embedded/safety-critical
 **Novelty:** Genuinely impossible in Rust/Zig (runtime panic only, no compile-time guarantee)
 
@@ -2340,7 +2354,7 @@ All 5 original features (F1–F5) were implemented in a single session. Test res
 **Planned for implementation:**
 - 39 Tier A syntax features (F10, F13, F14, F16–F18, F21, F23–F60) — need compiler support
 - 7 Tier B syntax features (F12, F19, F20) — ergonomic keywords
-- 29 stdlib module slots (S1–S29) — Fides code, no compiler changes (69 actual .fd files as of Aug 2026, 18,242 LOC)
+- 29 stdlib module slots (S1–S29) — Fides code, no compiler changes (70 actual .fd files as of Sep 2026, 18,529 LOC)
 - 15 features cut (C1–C15) — redundant, build with existing features
 
 ---

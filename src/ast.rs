@@ -328,6 +328,7 @@ pub struct AsmOperand {
 pub enum AsmDir {
     In,
     Out,
+    Clobber,
 }
 
 #[derive(Debug, Clone)]

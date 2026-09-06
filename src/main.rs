@@ -916,7 +916,7 @@ fn main() {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
-                let golden_dir = format!("tests/golden/{}", test_name);
+                let golden_dir = format!("tests/bootstrap/golden/{}", test_name);
                 let golden_ext = match stage {
                     "tokens" => "tokens",
                     "ast" => "ast",
@@ -1404,7 +1404,7 @@ fn main() {
         }
 
         "test" => {
-            // Run .fd tests in the tests/ directory against all backends.
+            // Run .fd tests in the tests/bootstrap/ directory against all backends.
             //
             // By default, runs NORMAL tests (expected to pass).
             // Use `fidesc test --fail` to run only expected-fail tests
@@ -1413,7 +1413,7 @@ fn main() {
 
             let current_exe = std::env::current_exe()
                 .unwrap_or_else(|_| std::path::PathBuf::from("fidesc"));
-            let test_dir = "tests";
+            let test_dir = "tests/bootstrap";
 
             // Expected-fail tests: these test compiler error detection.
             // They SHOULD fail to compile/run — failing is the correct behavior.
@@ -1476,7 +1476,7 @@ fn main() {
 
 
             let mut test_files: Vec<String> = Vec::new();
-            // Scan tests/ directory
+            // Scan tests/bootstrap/ directory
             if let Ok(entries) = fs::read_dir(test_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
@@ -1501,8 +1501,8 @@ fn main() {
                     }
                 }
             }
-            // Also scan tests/compiler/ — self-hosted compiler module tests (SH-6)
-            if let Ok(entries) = fs::read_dir("tests/compiler") {
+            // Also scan tests/selfhost/ — self-hosted compiler module tests (SH-6)
+            if let Ok(entries) = fs::read_dir("tests/selfhost") {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.extension().map_or(false, |e| e == "fd") {
@@ -1526,9 +1526,9 @@ fn main() {
 
             if test_files.is_empty() {
                 if fail_only {
-                    eprintln!("No expected-fail tests found in tests/");
+                    eprintln!("No expected-fail tests found in tests/bootstrap/");
                 } else {
-                    eprintln!("No .fd test files found in tests/");
+                    eprintln!("No .fd test files found in tests/bootstrap/");
                 }
                 process::exit(1);
             }

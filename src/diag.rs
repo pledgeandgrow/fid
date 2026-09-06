@@ -165,7 +165,7 @@ pub struct Diag {
     pub code: ErrCode,
     /// Primary message (without "error:" prefix).
     pub message: String,
-    /// Source file path (e.g. "tests/hello.fd" or "<stdin>").
+    /// Source file path (e.g. "tests/bootstrap/hello.fd" or "<stdin>").
     pub file: String,
     /// 1-based line number.
     pub line: usize,
@@ -259,7 +259,7 @@ impl Diag {
             self.message, reset,
         ));
 
-        // Location: --> tests/hello.fd:2:15
+        // Location: --> tests/bootstrap/hello.fd:2:15
         if self.line > 0 {
             out.push_str(&format!(
                 "{}  -->{} {}:{}:{}\n",

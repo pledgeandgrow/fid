@@ -18,19 +18,19 @@
 # Use it directly for compiling Fides programs:
 
 # Compile a Fides program to C, then to a native executable
-.\release\fides-c3.exe ccompile tests/hello.fd -o hello.exe
+.\release\fides-c3.exe ccompile tests/bootstrap/hello.fd -o hello.exe
 
 # Run a Fides file in the IR interpreter
-.\release\fides-c3.exe run tests/hello.fd
+.\release\fides-c3.exe run tests/bootstrap/hello.fd
 
 # Dump C code (for inspection)
-.\release\fides-c3.exe dump-c tests/hello.fd > hello.c
+.\release\fides-c3.exe dump-c tests/bootstrap/hello.fd > hello.c
 
 # Run the LSP server
 .\release\fides-c3.exe lsp
 
 # Format a file
-.\release\fides-c3.exe fmt tests/hello.fd
+.\release\fides-c3.exe fmt tests/bootstrap/hello.fd
 ```
 
 ### Rust bootstrap compiler (only when changing compiler/*.fd)
@@ -54,9 +54,9 @@ cargo build
 # Quick build check (no tests)
 ./verify.sh --quick
 
-# Self-host verification (tests/compiler/*.fd on 3 backends)
-# Separate from verify.sh: verify.sh → tests/ (Rust compiler in src/)
-# verify-selfhost.sh → tests/compiler/ (self-hosted Fides components in compiler/)
+# Self-host verification (tests/selfhost/*.fd on 3 backends)
+# Separate from verify.sh: verify.sh → tests/bootstrap/ (Rust compiler in src/)
+# verify-selfhost.sh → tests/selfhost/ (self-hosted Fides components in compiler/)
 ./verify-selfhost.sh
 ./verify-selfhost.sh --save
 ./verify-selfhost.sh --list
@@ -75,35 +75,35 @@ cargo build
 # Example: ./scripts/bisect.sh strings
 
 # Run a single test through the interpreter
-./target/release/fidesc run tests/<name>.fd
+./target/release/fidesc run tests/bootstrap/<name>.fd
 
 # Show IR for a test
-./target/release/fidesc ir tests/<name>.fd
+./target/release/fidesc ir tests/bootstrap/<name>.fd
 
 # Show PIR (L1/L2/L3) for a test
-./target/release/fidesc pir tests/<name>.fd 3
+./target/release/fidesc pir tests/bootstrap/<name>.fd 3
 
 # Dump intermediate representations (dump-* commands)
-./target/release/fidesc dump-tokens tests/<name>.fd
-./target/release/fidesc dump-ast tests/<name>.fd
-./target/release/fidesc dump-ir tests/<name>.fd
-./target/release/fidesc dump-pir tests/<name>.fd 3
-./target/release/fidesc dump-c tests/<name>.fd
+./target/release/fidesc dump-tokens tests/bootstrap/<name>.fd
+./target/release/fidesc dump-ast tests/bootstrap/<name>.fd
+./target/release/fidesc dump-ir tests/bootstrap/<name>.fd
+./target/release/fidesc dump-pir tests/bootstrap/<name>.fd 3
+./target/release/fidesc dump-c tests/bootstrap/<name>.fd
 
 # Differential testing (compare against golden files)
-./target/release/fidesc diff-test tests/<name>.fd --stage ir
+./target/release/fidesc diff-test tests/bootstrap/<name>.fd --stage ir
 
 # Run with per-stage timing
-./target/release/fidesc run tests/<name>.fd --trace
+./target/release/fidesc run tests/bootstrap/<name>.fd --trace
 
 # Run with recursion depth limit (0 = unlimited)
-./target/release/fidesc run tests/<name>.fd --max-recursion 1000
+./target/release/fidesc run tests/bootstrap/<name>.fd --max-recursion 1000
 
 # Show assembly (x86-64)
-./target/release/fidesc codegen tests/<name>.fd --target x86-64
+./target/release/fidesc codegen tests/bootstrap/<name>.fd --target x86-64
 
 # Show assembly with peephole (what `build` actually uses)
-./target/release/fidesc codegen tests/<name>.fd --target x86-64 --peephole
+./target/release/fidesc codegen tests/bootstrap/<name>.fd --target x86-64 --peephole
 
 # Run the LSP server (for editor integration)
 ./target/release/fidesc lsp
@@ -166,16 +166,21 @@ TESTS:
   Interpreter:    209/211 passed
   C Codegen:      198/211 matched
   PE Emitter:     209/211 valid
-  Self-host:      23/23 pass on interp + PE (tests/compiler/)
+  Self-host:      23/23 pass on interp + PE (tests/selfhost/)
 
 STDLIB:
-  stdlib/*.fd:    70 modules, 18,242 LOC (including rc.fd, kernel.fd)
+  stdlib/*.fd:    70 modules, 18,529 LOC (including rc.fd, kernel.fd, uefi.fd)
 
 RECENT IMPROVEMENTS:
   Sandbox:        Alloc capability enforced (p_malloc/p_free blocked in sandbox)
   Rc/Arc:         stdlib/rc.fd — reference counting (rc_new, rc_clone, rc_drop, etc.)
   @repr(C):       C-compatible struct layout for hardware/FFI/kernel
   Kernel:         stdlib/kernel.fd — OS kernel primitives started
+  @cpu_local:     Per-CPU variables via GS segment (compiler/pe.fd)
+  Inline asm:     Clobber lists, 50+ x86 instructions encoded (compiler/pe.fd)
+  --no-std:       Bare-metal mode skips stdlib/core.fd (compiler/compiler.fd)
+  UEFI:           stdlib/uefi.fd — boot services bindings (AllocatePool, ExitBootServices, etc.)
+  Cross-comp:     --target arm64/riscv64 validation with C codegen fallback
 
 Binaries:     4 (fidesc, ark, scribe, veil) — fidesc is bootstrap only
 ```
@@ -231,7 +236,7 @@ touching them.
 | `src/compiler.rs` | LOW | Pipeline orchestration — changes are visible. Phase 12: `enrich_errors()` post-processes errors with source context + error codes. |
 | `src/diag.rs` | LOW | Diagnostic system — structured error/warning/note/help with error codes, source context, color. Zero external deps. |
 | `src/lsp.rs` | LOW | LSP server — JSON-RPC over stdio, no external deps. |
-| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. 69 stdlib modules: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can. |
+| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. 70 stdlib modules: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, uefi. |
 
 ## Known Bugs (Do Not Re-Introduce)
 
@@ -292,7 +297,7 @@ These rules apply to ALL sessions and agents. No exceptions.
    for PE-emitter-specific tests. Keep the skip list in `tests/harness.rs`
    updated when adding tests for unimplemented features.
 
-4. **Adding a new test**: create `tests/test_<name>.fd`, run `./verify.sh --save`
+4. **Adding a new test**: create `tests/bootstrap/test_<name>.fd`, run `./verify.sh --save`
    to update the baseline. If the test exercises a not-yet-implemented feature,
    add it to `is_skip_test()` in `tests/harness.rs`.
 
