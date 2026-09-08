@@ -1,13 +1,14 @@
-// x86_64 backend — stack machine code generation from Fides IR
+// x86_64 backend — stack machine code generation from Fides IR (Linux port)
 //
 // Strategy: each SSA value lives on the stack. We use RAX as the accumulator.
 // This is simple, correct, and a starting point for register allocation later.
 //
-// Windows x64 calling convention:
-// - Integer args: RCX, RDX, R8, R9 (then stack)
+// Linux System V AMD64 calling convention:
+// - Integer args: RDI, RSI, RDX, RCX, R8, R9 (then stack)
 // - Return: RAX
-// - Shadow space: 32 bytes on stack for callee
+// - No shadow space (unlike Windows x64)
 // - Stack must be 16-byte aligned before CALL
+// - Output is AT&T syntax GAS assembly, consumed by elf64.rs assembler
 
 use crate::ir::*;
 use crate::ast::{BinOp, UnaryOp};
@@ -94,20 +95,11 @@ impl X86CodeGen {
 
     /// Generate assembly for an entire IR module
     pub fn generate(&mut self, module: &IrModule) -> String {
-        // .data section — string constants
+        // .rodata section — string constants
         self.emit_data_section(module);
 
-        // .code section — code
-        wln!(self, ".code");
-        wln!(self, "EXTERN GetStdHandle:PROC");
-        wln!(self, "EXTERN WriteFile:PROC");
-        wln!(self, "EXTERN ExitProcess:PROC");
-        wln!(self, "EXTERN GetProcessHeap:PROC");
-        wln!(self, "EXTERN HeapAlloc:PROC");
-        wln!(self, "EXTERN HeapFree:PROC");
-        wln!(self, "");
-        wln!(self, "PUBLIC main");
-        wln!(self, "PUBLIC _main");
+        // .text section — code
+        wln!(self, ".text");
         wln!(self, "");
 
         // Generate each function
@@ -115,19 +107,17 @@ impl X86CodeGen {
             self.gen_function(name, func, module);
         }
 
-        // Generate runtime stubs (direct Windows API calls)
+        // Generate runtime stubs (Linux syscalls)
         self.gen_runtime_stubs();
 
-        wln!(self, "END");
-
-        // Combine data + text
+        // Combine rodata + text
         format!("{}\n{}", self.data, self.out)
     }
 
-    /// Emit the .data section with string constants (MASM syntax)
+    /// Emit the .rodata section with string constants (GAS AT&T syntax)
     fn emit_data_section(&mut self, module: &IrModule) {
         self.data.clear();
-        self.data.push_str(".data\n");
+        self.data.push_str(".section .rodata\n");
 
         // Collect all string constants from all functions
         for func in module.functions.values() {
@@ -136,20 +126,21 @@ impl X86CodeGen {
                     let label = self.intern_string(value);
                     let _ = vid;
                     let escaped = escape_string(value);
-                    let _ = writeln!(self.data, "{} BYTE \"{}\", 0", label, escaped);
+                    let _ = writeln!(self.data, "{}: .asciz \"{}\"", label, escaped);
                 }
             }
         }
 
         // Boolean string constants
-        let _ = writeln!(self.data, "str_true BYTE \"true\", 0");
-        let _ = writeln!(self.data, "str_false BYTE \"false\", 0");
+        let _ = writeln!(self.data, "str_true: .asciz \"true\"");
+        let _ = writeln!(self.data, "str_false: .asciz \"false\"");
 
-        // String concatenation buffer (static, 4096 bytes)
-        let _ = writeln!(self.data, "str_concat_buf BYTE 4096 DUP(?)");
-        let _ = writeln!(self.data, "str_concat_tmp BYTE 4096 DUP(?)");
+        // String concatenation buffers (static, in .bss)
+        self.data.push_str("\n.section .bss\n");
+        let _ = writeln!(self.data, "str_concat_buf: .skip 4096");
+        let _ = writeln!(self.data, "str_concat_tmp: .skip 4096");
 
-        self.data.push_str("\n");
+        self.data.push_str("\n.text\n");
     }
 
     /// Intern a string and return its label
@@ -168,10 +159,12 @@ impl X86CodeGen {
         let mangled = mangle_name(name);
         // Function prologue
         wln!(self, "");
-        wln!(self, "; ─── Function: {} ───", name);
+        wln!(self, "# ─── Function: {} ───", name);
+        wln!(self, "    .globl {}", mangled);
+        wln!(self, "    .type {}, @function", mangled);
         wln!(self, "{}:", mangled);
-        wln!(self, "    push rbp");
-        wln!(self, "    mov rbp, rsp");
+        wln!(self, "    pushq %rbp");
+        wln!(self, "    movq %rsp, %rbp");
 
         // Allocate stack frame — estimate size from all values
         let mut frame = StackFrame::new();
@@ -190,35 +183,36 @@ impl X86CodeGen {
             }
         }
 
-        // Align stack to 16 bytes and allocate
-        // Add 32 bytes for Windows x64 shadow space used during calls,
-        // so sub rsp,32 before calls doesn't overwrite alloca data at frame bottom
-        let stack_size = ((frame.size + 32 + 15) & !15) as i64;
-        // Reserve at least 64 bytes (32 shadow + 32 minimum frame)
-        let stack_size = stack_size.max(64);
-        wln!(self, "    sub rsp, {}", stack_size);
+        // Align stack to 16 bytes.
+        // System V AMD64: no shadow space needed (unlike Windows x64).
+        // After pushq %rbp, RSP is 16n+8. After subq $N, RSP must be 16-aligned.
+        // So N must be 16n+8 to keep alignment. We round up to (size+8+15)&~15.
+        let stack_size = ((frame.size + 8 + 15) & !15) as i64;
+        // Reserve at least 16 bytes (minimum frame)
+        let stack_size = stack_size.max(16);
+        wln!(self, "    subq ${}, %rsp", stack_size);
 
         // Store parameters from registers to stack
-        // Windows x64: RCX, RDX, R8, R9 for first 4 integer args
-        // 5th+ params are on the stack at [rbp+48], [rbp+56], etc.
-        let arg_regs = ["rcx", "rdx", "r8", "r9"];
+        // System V AMD64: RDI, RSI, RDX, RCX, R8, R9 for first 6 integer args
+        // 7th+ params are on the stack at 16(%rbp), 24(%rbp), etc.
+        let arg_regs = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
         for (i, (vid, _ty)) in func.params.iter().enumerate() {
-            if i < 4 {
+            if i < 6 {
                 let offset = frame.offset(*vid);
-                wln!(self, "    mov [rbp{}], {}", fmt_offset(offset), arg_regs[i]);
+                wln!(self, "    movq {}, {}(%rbp)", arg_regs[i], fmt_offset(offset));
             } else {
-                // 5th param at [rbp+48], 6th at [rbp+56], etc.
-                let stack_offset = 48 + ((i - 4) as i64) * 8;
+                // 7th param at 16(%rbp), 8th at 24(%rbp), etc.
+                let stack_offset = 16 + ((i - 6) as i64) * 8;
                 let offset = frame.offset(*vid);
-                wln!(self, "    mov rax, [rbp{}]", fmt_offset(stack_offset));
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(offset));
+                wln!(self, "    movq {}(%rbp), %rax", stack_offset);
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(offset));
             }
         }
 
         // Generate code for each basic block
         for block in &func.blocks {
             wln!(self, "");
-            wln!(self, "{}_bb_{}:", mangled, block.id.0);
+            wln!(self, ".L{}_bb_{}:", mangled, block.id.0);
 
             for &inst_id in &block.instructions {
                 let inst = func.get_inst(inst_id);
@@ -229,9 +223,10 @@ impl X86CodeGen {
         }
 
         // Function epilogue (in case we fall through)
-        wln!(self, "    mov rsp, rbp");
-        wln!(self, "    pop rbp");
-        wln!(self, "    return");
+        wln!(self, "    movq %rbp, %rsp");
+        wln!(self, "    popq %rbp");
+        wln!(self, "    ret");
+        wln!(self, "    .size {}, .-{}", mangled, mangled);
     }
 
     /// Generate code for a single instruction
@@ -251,56 +246,56 @@ impl X86CodeGen {
             Inst::ConstInt { value, ty } => {
                 let size = module.type_size(ty).max(8);
                 let _ = size;
-                wln!(self, "    mov rax, {}", value);
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    movq ${}, %rax", value);
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
 
             Inst::ConstBool { value } => {
                 let val = if *value { 1 } else { 0 };
-                wln!(self, "    mov rax, {}", val);
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    movq ${}, %rax", val);
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
 
             Inst::ConstStr { value } => {
                 // Check if this is a function name — emit function address
                 if module.functions.contains_key(value) || module.extern_functions.contains_key(value) {
-                    wln!(self, "    lea rax, {}", value);
-                    wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                    wln!(self, "    leaq {}(%rip), %rax", value);
+                    wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
                 } else {
                     let label = self.string_labels.get(value)
                         .cloned()
                         .unwrap_or_else(|| format!("str_unknown"));
-                    wln!(self, "    lea rax, {}", label);
-                    wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                    wln!(self, "    leaq {}(%rip), %rax", label);
+                    wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
                 }
             }
 
             Inst::ConstFnRef { name } => {
                 // Function reference — emit function address
-                wln!(self, "    lea rax, {}", name);
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    leaq {}(%rip), %rax", name);
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
 
             Inst::ConstFloat { bits, ty } => {
                 if *ty == IrType::F32 {
                     let val = *bits as u32;
-                    wln!(self, "    mov dword ptr [rbp{}], {}", fmt_offset(dst), fmt_hex(val));
+                    wln!(self, "    movl ${}, {}(%rbp)", val as i32, fmt_offset(dst));
                 } else {
                     let lo = *bits as u32;
                     let hi = (*bits >> 32) as u32;
-                    wln!(self, "    mov dword ptr [rbp{}], {}", fmt_offset(dst), fmt_hex(lo));
-                    wln!(self, "    mov dword ptr [rbp{}], {}", fmt_offset(dst + 4), fmt_hex(hi));
+                    wln!(self, "    movl ${}, {}(%rbp)", lo as i32, fmt_offset(dst));
+                    wln!(self, "    movl ${}, {}(%rbp)", hi as i32, fmt_offset(dst + 4));
                 }
             }
 
             Inst::ConstNull { .. } => {
-                wln!(self, "    xor rax, rax");
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    xorq %rax, %rax");
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
 
             Inst::GlobalAddr { name, .. } => {
-                wln!(self, "    lea rax, [rip + _g_{}]", name);
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    leaq _g_{}(%rip), %rax", name);
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
 
             // ─── Arithmetic ───
@@ -321,31 +316,33 @@ impl X86CodeGen {
                 match op {
                     UnaryOp::Neg => {
                         if ty.is_float() {
-                            // Float negation: XOR sign bit
-                            wln!(self, "    movq xmm0, qword ptr [rbp{}]", fmt_offset(off));
-                            wln!(self, "    mov rax, 8000000000000000h");
-                            wln!(self, "    mov [rsp], rax");
-                            wln!(self, "    xorpd xmm0, xmmword ptr [rsp]");
+                            // Float negation: XOR sign bit via integer XOR
                             if *ty == IrType::F32 {
-                                wln!(self, "    movss [rbp{}], xmm0", fmt_offset(dst));
+                                wln!(self, "    movl {}(%rbp), %eax", fmt_offset(off));
+                                wln!(self, "    movl $0x80000000, %ecx");
+                                wln!(self, "    xorl %ecx, %eax");
+                                wln!(self, "    movl %eax, {}(%rbp)", fmt_offset(dst));
                             } else {
-                                wln!(self, "    movq qword ptr [rbp{}], xmm0", fmt_offset(dst));
+                                wln!(self, "    movq {}(%rbp), %rax", fmt_offset(off));
+                                wln!(self, "    movq $0x8000000000000000, %rcx");
+                                wln!(self, "    xorq %rcx, %rax");
+                                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
                             }
                         } else {
-                            wln!(self, "    mov rax, [rbp{}]", fmt_offset(off));
-                            wln!(self, "    neg rax");
-                            wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                            wln!(self, "    movq {}(%rbp), %rax", fmt_offset(off));
+                            wln!(self, "    negq %rax");
+                            wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
                         }
                     }
                     UnaryOp::Not => {
-                        wln!(self, "    mov rax, [rbp{}]", fmt_offset(off));
-                        wln!(self, "    xor rax, 1");
-                        wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                        wln!(self, "    movq {}(%rbp), %rax", fmt_offset(off));
+                        wln!(self, "    xorq $1, %rax");
+                        wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
                     }
                     UnaryOp::BitNot => {
-                        wln!(self, "    mov rax, [rbp{}]", fmt_offset(off));
-                        wln!(self, "    not rax");
-                        wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                        wln!(self, "    movq {}(%rbp), %rax", fmt_offset(off));
+                        wln!(self, "    notq %rax");
+                        wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
                     }
                 }
             }
@@ -354,42 +351,42 @@ impl X86CodeGen {
             Inst::Alloca { .. } => {
                 // Use pre-allocated data slot for this alloca
                 let data_offset = *frame.alloca_slots.get(&id.0).unwrap_or(&0);
-                wln!(self, "    lea rax, [rbp{}]", fmt_offset(data_offset));
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    leaq {}(%rbp), %rax", fmt_offset(data_offset));
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
 
             Inst::Load { ptr, ty } => {
                 let poff = frame.offset(*ptr);
                 let size = module.type_size(ty).max(1);
-                wln!(self, "    mov rax, [rbp{}]", fmt_offset(poff));
+                wln!(self, "    movq {}(%rbp), %rax", fmt_offset(poff));
                 match size {
-                    1 => wln!(self, "    movsx rax, byte ptr [rax]"),
-                    2 => wln!(self, "    movsx rax, word ptr [rax]"),
-                    4 => wln!(self, "    movsxd rax, dword ptr [rax]"),
-                    _ => wln!(self, "    mov rax, [rax]"),
+                    1 => wln!(self, "    movsbq (%rax), %rax"),
+                    2 => wln!(self, "    movswq (%rax), %rax"),
+                    4 => wln!(self, "    movslq (%rax), %rax"),
+                    _ => wln!(self, "    movq (%rax), %rax"),
                 }
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
 
             Inst::Store { ptr, value, .. } => {
                 let poff = frame.offset(*ptr);
                 let voff = frame.offset(*value);
-                wln!(self, "    mov rax, [rbp{}]", fmt_offset(poff));
-                wln!(self, "    mov rcx, [rbp{}]", fmt_offset(voff));
+                wln!(self, "    movq {}(%rbp), %rax", fmt_offset(poff));
+                wln!(self, "    movq {}(%rbp), %rcx", fmt_offset(voff));
                 // Use correct store size based on value type
                 let val_ty = func.values.get(value).map(|m| &m.ty);
                 let store_size = val_ty.map(|t| module.type_size(t)).unwrap_or(8);
                 match store_size {
-                    1 => wln!(self, "    mov byte ptr [rax], cl"),
-                    2 => wln!(self, "    mov word ptr [rax], cx"),
-                    4 => wln!(self, "    mov dword ptr [rax], ecx"),
-                    _ => wln!(self, "    mov [rax], rcx"),
+                    1 => wln!(self, "    movb %cl, (%rax)"),
+                    2 => wln!(self, "    movw %cx, (%rax)"),
+                    4 => wln!(self, "    movl %ecx, (%rax)"),
+                    _ => wln!(self, "    movq %rcx, (%rax)"),
                 }
             }
 
             Inst::GetFieldPtr { struct_ptr, field_index, field_ty: _, .. } => {
                 let poff = frame.offset(*struct_ptr);
-                wln!(self, "    mov rax, [rbp{}]", fmt_offset(poff));
+                wln!(self, "    movq {}(%rbp), %rax", fmt_offset(poff));
                 // Look up field offset from struct layout
                 // The struct type is in the struct_ptr's value metadata
                 let offset = if let Some(ptr_meta) = func.values.get(struct_ptr) {
@@ -418,49 +415,49 @@ impl X86CodeGen {
                     *field_index as i64 * 8
                 };
                 if offset > 0 {
-                    wln!(self, "    add rax, {}", offset);
+                    wln!(self, "    addq ${}, %rax", offset);
                 }
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
 
             Inst::GetElemPtr { array_ptr, index, elem_ty } => {
                 let poff = frame.offset(*array_ptr);
                 let ioff = frame.offset(*index);
                 let elem_size = module.type_size(elem_ty).max(8);
-                wln!(self, "    mov rax, [rbp{}]", fmt_offset(poff));
-                wln!(self, "    mov rcx, [rbp{}]", fmt_offset(ioff));
-                wln!(self, "    imul rcx, {}", elem_size);
-                wln!(self, "    add rax, rcx");
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    movq {}(%rbp), %rax", fmt_offset(poff));
+                wln!(self, "    movq {}(%rbp), %rcx", fmt_offset(ioff));
+                wln!(self, "    imulq ${}, %rcx", elem_size);
+                wln!(self, "    addq %rcx, %rax");
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
 
             // ─── Control Flow ───
             Inst::Jump { target } => {
-                wln!(self, "    jmp {}_bb_{}", func_name, target.0);
+                wln!(self, "    jmp .L{}_bb_{}", func_name, target.0);
             }
 
             Inst::Branch { cond, then, else_ } => {
                 let coff = frame.offset(*cond);
-                wln!(self, "    mov rax, [rbp{}]", fmt_offset(coff));
-                wln!(self, "    test rax, rax");
-                wln!(self, "    jnz {}_bb_{}", func_name, then.0);
-                wln!(self, "    jmp {}_bb_{}", func_name, else_.0);
+                wln!(self, "    movq {}(%rbp), %rax", fmt_offset(coff));
+                wln!(self, "    testq %rax, %rax");
+                wln!(self, "    jnz .L{}_bb_{}", func_name, then.0);
+                wln!(self, "    jmp .L{}_bb_{}", func_name, else_.0);
             }
 
             Inst::Return { value } => {
                 if let Some(v) = value {
                     let voff = frame.offset(*v);
-                    wln!(self, "    mov rax, [rbp{}]", fmt_offset(voff));
+                    wln!(self, "    movq {}(%rbp), %rax", fmt_offset(voff));
                 } else {
-                    wln!(self, "    xor rax, rax");
+                    wln!(self, "    xorq %rax, %rax");
                 }
-                wln!(self, "    mov rsp, rbp");
-                wln!(self, "    pop rbp");
-                wln!(self, "    return");
+                wln!(self, "    movq %rbp, %rsp");
+                wln!(self, "    popq %rbp");
+                wln!(self, "    ret");
             }
 
             Inst::Unreachable => {
-                wln!(self, "    ud2  ; unreachable");
+                wln!(self, "    ud2  # unreachable");
             }
 
             // ─── Function Calls ───
@@ -485,29 +482,43 @@ impl X86CodeGen {
                     Box::leak(mangle_name(call_name).into_boxed_str())
                 };
 
-                // Windows x64: RCX, RDX, R8, R9 for first 4 args
-                // 5th+ args go on stack at [rsp+32], [rsp+40], etc. (above shadow space)
-                let arg_regs = ["rcx", "rdx", "r8", "r9"];
-                let stack_args = if args.len() > 4 { args.len() - 4 } else { 0 };
-                // Reserve shadow space (32) + space for stack args, aligned to 16
-                let call_space = ((32 + stack_args * 8 + 15) & !15) as i64;
+                // System V AMD64: RDI, RSI, RDX, RCX, R8, R9 for first 6 args
+                // 7th+ args go on stack at 0(%rsp), 8(%rsp), etc.
+                // No shadow space needed.
+                let arg_regs = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
+                let stack_args = if args.len() > 6 { args.len() - 6 } else { 0 };
+                // Reserve space for stack args, aligned to 16
+                let call_space = ((stack_args * 8 + 15) & !15) as i64;
+                // Load register args first (before adjusting RSP)
                 for (i, arg) in args.iter().enumerate() {
                     let aoff = frame.offset(*arg);
-                    if i < 4 {
-                        wln!(self, "    mov {}, [rbp{}]", arg_regs[i], fmt_offset(aoff));
+                    if i < 6 {
+                        wln!(self, "    movq {}(%rbp), {}", fmt_offset(aoff), arg_regs[i]);
                     }
                 }
-                wln!(self, "    sub rsp, {}  ; shadow space + stack args", call_space);
-                // Place stack args after shadow space
-                for (i, arg) in args.iter().enumerate().skip(4) {
+                if call_space > 0 {
+                    wln!(self, "    subq ${}, %rsp  # stack args", call_space);
+                }
+                // Place stack args (7th+ args)
+                for (i, arg) in args.iter().enumerate().skip(6) {
                     let aoff = frame.offset(*arg);
-                    let stack_pos = 32 + ((i - 4) as i64) * 8;
-                    wln!(self, "    mov rax, [rbp{}]", fmt_offset(aoff));
-                    wln!(self, "    mov [rsp+{}], rax", stack_pos);
+                    let stack_pos = ((i - 6) as i64) * 8;
+                    wln!(self, "    movq {}(%rbp), %rax", fmt_offset(aoff));
+                    wln!(self, "    movq %rax, {}(%rsp)", stack_pos);
+                }
+                // Ensure 16-byte alignment before call
+                // RSP is 16n after prologue. If call_space is not 8mod16, we need padding.
+                if call_space % 16 != 0 {
+                    wln!(self, "    subq $8, %rsp  # alignment");
                 }
                 wln!(self, "    call {}", target_func);
-                wln!(self, "    add rsp, {}  ; cleanup", call_space);
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                if call_space % 16 != 0 {
+                    wln!(self, "    addq $8, %rsp  # alignment cleanup");
+                }
+                if call_space > 0 {
+                    wln!(self, "    addq ${}, %rsp  # cleanup", call_space);
+                }
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
 
             Inst::CallPtr { fn_ptr, args, .. } => {
@@ -515,125 +526,134 @@ impl X86CodeGen {
 
                 // All function pointers are env structs: field 0 = fn addr, fields 1..N = captures
                 // Load function address from field 0
-                wln!(self, "    mov rax, [rbp{}]", fmt_offset(fpoff));
-                wln!(self, "    mov rax, [rax]  ; load fn addr from env struct field 0");
+                wln!(self, "    movq {}(%rbp), %rax", fmt_offset(fpoff));
+                wln!(self, "    movq (%rax), %rax  # load fn addr from env struct field 0");
 
-                // Pass env_ptr as first arg (rcx), shift other args
+                // Pass env_ptr as first arg (rdi), shift other args
                 let total_args = args.len() + 1; // +1 for env_ptr
-                let arg_regs = ["rcx", "rdx", "r8", "r9"];
-                let stack_args = if total_args > 4 { total_args - 4 } else { 0 };
-                let call_space = ((32 + stack_args * 8 + 15) & !15) as i64;
+                let arg_regs = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
+                let stack_args = if total_args > 6 { total_args - 6 } else { 0 };
+                let call_space = ((stack_args * 8 + 15) & !15) as i64;
 
-                wln!(self, "    sub rsp, {}  ; shadow space + stack args", call_space);
+                if call_space > 0 {
+                    wln!(self, "    subq ${}, %rsp  # stack args", call_space);
+                }
 
-                // First arg (rcx) = env_ptr
-                wln!(self, "    mov rcx, [rbp{}]", fmt_offset(fpoff));
+                // First arg (rdi) = env_ptr
+                wln!(self, "    movq {}(%rbp), %rdi", fmt_offset(fpoff));
 
                 // Remaining args shifted by 1
                 for (i, arg) in args.iter().enumerate() {
                     let aoff = frame.offset(*arg);
                     let arg_idx = i + 1; // shifted by 1 for env_ptr
-                    if arg_idx < 4 {
-                        wln!(self, "    mov {}, [rbp{}]", arg_regs[arg_idx], fmt_offset(aoff));
+                    if arg_idx < 6 {
+                        wln!(self, "    movq {}(%rbp), {}", fmt_offset(aoff), arg_regs[arg_idx]);
                     } else {
-                        let stack_pos = 32 + ((arg_idx - 4) as i64) * 8;
-                        wln!(self, "    mov r10, [rbp{}]", fmt_offset(aoff));
-                        wln!(self, "    mov [rsp+{}], r10", stack_pos);
+                        let stack_pos = ((arg_idx - 6) as i64) * 8;
+                        wln!(self, "    movq {}(%rbp), %r10", fmt_offset(aoff));
+                        wln!(self, "    movq %r10, {}(%rsp)", stack_pos);
                     }
                 }
 
+                // Ensure 16-byte alignment before call
+                if call_space % 16 != 0 {
+                    wln!(self, "    subq $8, %rsp  # alignment");
+                }
                 // Save fn addr, call indirectly
-                wln!(self, "    mov r10, rax  ; save fn addr");
-                wln!(self, "    call r10");
-                wln!(self, "    add rsp, {}  ; cleanup", call_space);
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    movq %rax, %r10  # save fn addr");
+                wln!(self, "    call *%r10");
+                if call_space % 16 != 0 {
+                    wln!(self, "    addq $8, %rsp  # alignment cleanup");
+                }
+                if call_space > 0 {
+                    wln!(self, "    addq ${}, %rsp  # cleanup", call_space);
+                }
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
 
             // ─── Conversions ───
             Inst::IntExtend { value, from, to } => {
                 let voff = frame.offset(*value);
-                wln!(self, "    mov rax, [rbp{}]", fmt_offset(voff));
+                wln!(self, "    movq {}(%rbp), %rax", fmt_offset(voff));
                 // Sign-extend based on source type
                 match from {
-                    IrType::I8 => wln!(self, "    movsx rax, al"),
-                    IrType::I16 => wln!(self, "    movsx rax, ax"),
-                    IrType::I32 => wln!(self, "    movsxd rax, eax"),
+                    IrType::I8 => wln!(self, "    movsbq %al, %rax"),
+                    IrType::I16 => wln!(self, "    movswq %ax, %rax"),
+                    IrType::I32 => wln!(self, "    movslq %eax, %rax"),
                     _ => {}
                 }
                 let _ = to;
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
 
             Inst::IntTrunc { value, from, to } => {
                 let voff = frame.offset(*value);
-                wln!(self, "    mov rax, [rbp{}]", fmt_offset(voff));
+                wln!(self, "    movq {}(%rbp), %rax", fmt_offset(voff));
                 // Truncate by masking
                 match to {
-                    IrType::I8 | IrType::U8 => wln!(self, "    movzx eax, al"),
-                    IrType::I16 | IrType::U16 => wln!(self, "    movzx eax, ax"),
-                    IrType::I32 | IrType::U32 => wln!(self, "    mov eax, eax"),
+                    IrType::I8 | IrType::U8 => wln!(self, "    movzbq %al, %rax"),
+                    IrType::I16 | IrType::U16 => wln!(self, "    movzwq %ax, %rax"),
+                    IrType::I32 | IrType::U32 => wln!(self, "    movl %eax, %eax"),
                     _ => {}
                 }
                 let _ = from;
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
 
             Inst::IntToFloat { value, from, to } => {
                 let voff = frame.offset(*value);
-                wln!(self, "    mov rax, [rbp{}]", fmt_offset(voff));
+                wln!(self, "    movq {}(%rbp), %rax", fmt_offset(voff));
                 match from {
-                    IrType::I64 | IrType::U64 => wln!(self, "    cvtsi2sd xmm0, rax"),
-                    _ => wln!(self, "    cvtsi2sd xmm0, eax"),
+                    IrType::I64 | IrType::U64 => wln!(self, "    cvtsi2sdq %rax, %xmm0"),
+                    _ => wln!(self, "    cvtsi2sd %eax, %xmm0"),
                 }
                 if *to == IrType::F32 {
-                    wln!(self, "    movss [rbp{}], xmm0", fmt_offset(dst));
+                    wln!(self, "    movss %xmm0, {}(%rbp)", fmt_offset(dst));
                 } else {
-                    wln!(self, "    movq qword ptr [rbp{}], xmm0", fmt_offset(dst));
+                    wln!(self, "    movsd %xmm0, {}(%rbp)", fmt_offset(dst));
                 }
             }
 
             Inst::FloatToInt { value, from, to } => {
                 let voff = frame.offset(*value);
                 if *from == IrType::F32 {
-                    wln!(self, "    movss xmm0, [rbp{}]", fmt_offset(voff));
+                    wln!(self, "    movss {}(%rbp), %xmm0", fmt_offset(voff));
                 } else {
-                    wln!(self, "    movq xmm0, qword ptr [rbp{}]", fmt_offset(voff));
+                    wln!(self, "    movsd {}(%rbp), %xmm0", fmt_offset(voff));
                 }
-                wln!(self, "    cvttsd2si rax, xmm0");
+                wln!(self, "    cvttsd2siq %xmm0, %rax");
                 let _ = to;
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
 
             Inst::MakeDyn { .. } => {
-                wln!(self, "    xor rax, rax  ; MakeDyn not yet supported");
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    xorq %rax, %rax  # MakeDyn not yet supported");
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
             Inst::DynCall { .. } => {
-                wln!(self, "    xor rax, rax  ; DynCall not yet supported");
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    xorq %rax, %rax  # DynCall not yet supported");
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
             Inst::BitCast { value, .. } => {
                 let voff = frame.offset(*value);
-                wln!(self, "    mov rax, [rbp{}]", fmt_offset(voff));
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    movq {}(%rbp), %rax", fmt_offset(voff));
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
 
             // ─── Fides-Specific ───
             Inst::Print { value, ty } => {
                 let voff = frame.offset(*value);
                 let _ = ty;
-                // Call our print stub
-                wln!(self, "    mov rcx, [rbp{}]", fmt_offset(voff));
-                wln!(self, "    sub rsp, 32");
+                // Call our print stub (System V: arg in %rdi)
+                wln!(self, "    movq {}(%rbp), %rdi", fmt_offset(voff));
                 wln!(self, "    call p_print_int");
-                wln!(self, "    add rsp, 32");
             }
 
             Inst::PersistLoad { default, .. } => {
                 // Just copy default value to destination
                 let doff = frame.offset(*default);
-                wln!(self, "    mov rax, [rbp{}]", fmt_offset(doff));
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    movq {}(%rbp), %rax", fmt_offset(doff));
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
             Inst::PersistSave { .. } => {
                 // No-op
@@ -643,34 +663,32 @@ impl X86CodeGen {
             }
             Inst::Panic { message } => {
                 let label = self.intern_string(message);
-                // Emit the string in data section if not already there
-                if !self.data.contains(&format!("{} BYTE", label)) {
-                    let _ = writeln!(self.data, "{} BYTE \"{}\", 0", label, escape_string(message));
+                // Emit the string in rodata section if not already there
+                if !self.data.contains(&format!("{}: .asciz", label)) {
+                    let _ = writeln!(self.data, "{}: .asciz \"{}\"", label, escape_string(message));
                 }
-                wln!(self, "    lea rcx, {}", label);
-                wln!(self, "    sub rsp, 32");
+                wln!(self, "    leaq {}(%rip), %rdi", label);
                 wln!(self, "    call p_panic");
-                wln!(self, "    add rsp, 32");
             }
 
             Inst::TryUnwrap { .. } => {
                 // Simplified — not fully implemented in backend yet
-                wln!(self, "    ; TODO: TryUnwrap");
+                wln!(self, "    # TODO: TryUnwrap");
             }
             Inst::Asm { .. } => {
-                wln!(self, "    ; asm not yet supported");
-                wln!(self, "    xor rax, rax");
-                wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                wln!(self, "    # asm not yet supported");
+                wln!(self, "    xorq %rax, %rax");
+                wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
             }
             Inst::RegionBegin { .. } => {
-                wln!(self, "    ; region begin (no-op — stack allocation)");
-                wln!(self, "    xor rax, rax");
+                wln!(self, "    # region begin (no-op — stack allocation)");
+                wln!(self, "    xorq %rax, %rax");
             }
             Inst::RegionEnd { .. } => {
-                wln!(self, "    ; region end (no-op)");
+                wln!(self, "    # region end (no-op)");
             }
             Inst::GradBegin { .. } | Inst::GradEnd | Inst::Backward { .. } => {
-                wln!(self, "    ; autodiff marker (no-op)");
+                wln!(self, "    # autodiff marker (no-op)");
             }
         }
     }
@@ -678,753 +696,671 @@ impl X86CodeGen {
     /// Generate integer binary operation
     fn gen_int_binop(&mut self, op: &BinOp, loff: i64, roff: i64, dst: i64, _ty: &IrType) {
         // Load left into RAX, right into RCX
-        wln!(self, "    mov rax, [rbp{}]", fmt_offset(loff));
-        wln!(self, "    mov rcx, [rbp{}]", fmt_offset(roff));
+        wln!(self, "    movq {}(%rbp), %rax", fmt_offset(loff));
+        wln!(self, "    movq {}(%rbp), %rcx", fmt_offset(roff));
 
         match op {
             BinOp::Add => {
-                wln!(self, "    add rax, rcx");
+                wln!(self, "    addq %rcx, %rax");
             }
             BinOp::Sub => {
-                wln!(self, "    sub rax, rcx");
+                wln!(self, "    subq %rcx, %rax");
             }
             BinOp::Mul => {
-                wln!(self, "    imul rax, rcx");
+                wln!(self, "    imulq %rcx, %rax");
             }
             BinOp::Div => {
                 // Sign-extend RAX into RDX:RAX, then idiv
-                wln!(self, "    cqo");
-                wln!(self, "    idiv rcx");
+                wln!(self, "    cqto");
+                wln!(self, "    idivq %rcx");
             }
             BinOp::Mod => {
-                wln!(self, "    cqo");
-                wln!(self, "    idiv rcx");
-                wln!(self, "    mov rax, rdx"); // remainder
+                wln!(self, "    cqto");
+                wln!(self, "    idivq %rcx");
+                wln!(self, "    movq %rdx, %rax"); // remainder
             }
             BinOp::BitAnd => {
-                wln!(self, "    and rax, rcx");
+                wln!(self, "    andq %rcx, %rax");
             }
             BinOp::BitOr => {
-                wln!(self, "    or rax, rcx");
+                wln!(self, "    orq %rcx, %rax");
             }
             BinOp::BitXor => {
-                wln!(self, "    xor rax, rcx");
+                wln!(self, "    xorq %rcx, %rax");
             }
             BinOp::Shl => {
                 // Shift count must be in CL
-                wln!(self, "    shl rax, cl");
+                wln!(self, "    shlq %cl, %rax");
             }
             BinOp::Shr => {
-                wln!(self, "    sar rax, cl");
+                wln!(self, "    sarq %cl, %rax");
             }
             BinOp::Eq => {
-                wln!(self, "    cmp rax, rcx");
-                wln!(self, "    sete al");
-                wln!(self, "    movzx eax, al");
+                wln!(self, "    cmpq %rcx, %rax");
+                wln!(self, "    sete %al");
+                wln!(self, "    movzbq %al, %rax");
             }
             BinOp::Neq => {
-                wln!(self, "    cmp rax, rcx");
-                wln!(self, "    setne al");
-                wln!(self, "    movzx eax, al");
+                wln!(self, "    cmpq %rcx, %rax");
+                wln!(self, "    setne %al");
+                wln!(self, "    movzbq %al, %rax");
             }
             BinOp::Lt => {
-                wln!(self, "    cmp rax, rcx");
-                wln!(self, "    setl al");
-                wln!(self, "    movzx eax, al");
+                wln!(self, "    cmpq %rcx, %rax");
+                wln!(self, "    setl %al");
+                wln!(self, "    movzbq %al, %rax");
             }
             BinOp::Gt => {
-                wln!(self, "    cmp rax, rcx");
-                wln!(self, "    setg al");
-                wln!(self, "    movzx eax, al");
+                wln!(self, "    cmpq %rcx, %rax");
+                wln!(self, "    setg %al");
+                wln!(self, "    movzbq %al, %rax");
             }
             BinOp::LtEq => {
-                wln!(self, "    cmp rax, rcx");
-                wln!(self, "    setle al");
-                wln!(self, "    movzx eax, al");
+                wln!(self, "    cmpq %rcx, %rax");
+                wln!(self, "    setle %al");
+                wln!(self, "    movzbq %al, %rax");
             }
             BinOp::GtEq => {
-                wln!(self, "    cmp rax, rcx");
-                wln!(self, "    setge al");
-                wln!(self, "    movzx eax, al");
+                wln!(self, "    cmpq %rcx, %rax");
+                wln!(self, "    setge %al");
+                wln!(self, "    movzbq %al, %rax");
             }
             BinOp::And => {
-                wln!(self, "    test rax, rax");
-                wln!(self, "    setne al");
-                wln!(self, "    test rcx, rcx");
-                wln!(self, "    setne cl");
-                wln!(self, "    and al, cl");
-                wln!(self, "    movzx eax, al");
+                wln!(self, "    testq %rax, %rax");
+                wln!(self, "    setne %al");
+                wln!(self, "    testq %rcx, %rcx");
+                wln!(self, "    setne %cl");
+                wln!(self, "    andb %cl, %al");
+                wln!(self, "    movzbq %al, %rax");
             }
             BinOp::Or => {
-                wln!(self, "    or rax, rcx");
-                wln!(self, "    setne al");
-                wln!(self, "    movzx eax, al");
+                wln!(self, "    orq %rcx, %rax");
+                wln!(self, "    setne %al");
+                wln!(self, "    movzbq %al, %rax");
             }
         }
 
-        wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+        wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
     }
 
     /// Generate float binary operation
     fn gen_float_binop(&mut self, op: &BinOp, loff: i64, roff: i64, dst: i64, ty: &IrType) {
         if *ty == IrType::F32 {
-            wln!(self, "    movss xmm0, [rbp{}]", fmt_offset(loff));
-            wln!(self, "    movss xmm1, [rbp{}]", fmt_offset(roff));
+            wln!(self, "    movss {}(%rbp), %xmm0", fmt_offset(loff));
+            wln!(self, "    movss {}(%rbp), %xmm1", fmt_offset(roff));
             match op {
-                BinOp::Add => wln!(self, "    addss xmm0, xmm1"),
-                BinOp::Sub => wln!(self, "    subss xmm0, xmm1"),
-                BinOp::Mul => wln!(self, "    mulss xmm0, xmm1"),
-                BinOp::Div => wln!(self, "    divss xmm0, xmm1"),
+                BinOp::Add => wln!(self, "    addss %xmm1, %xmm0"),
+                BinOp::Sub => wln!(self, "    subss %xmm1, %xmm0"),
+                BinOp::Mul => wln!(self, "    mulss %xmm1, %xmm0"),
+                BinOp::Div => wln!(self, "    divss %xmm1, %xmm0"),
                 BinOp::Eq => {
-                    wln!(self, "    ucomiss xmm0, xmm1");
-                    wln!(self, "    sete al");
-                    wln!(self, "    movzx eax, al");
+                    wln!(self, "    ucomiss %xmm1, %xmm0");
+                    wln!(self, "    sete %al");
+                    wln!(self, "    movzbq %al, %rax");
                 }
                 BinOp::Neq => {
-                    wln!(self, "    ucomiss xmm0, xmm1");
-                    wln!(self, "    setne al");
-                    wln!(self, "    movzx eax, al");
+                    wln!(self, "    ucomiss %xmm1, %xmm0");
+                    wln!(self, "    setne %al");
+                    wln!(self, "    movzbq %al, %rax");
                 }
                 BinOp::Lt => {
-                    wln!(self, "    ucomiss xmm0, xmm1");
-                    wln!(self, "    setb al");
-                    wln!(self, "    movzx eax, al");
+                    wln!(self, "    ucomiss %xmm1, %xmm0");
+                    wln!(self, "    setb %al");
+                    wln!(self, "    movzbq %al, %rax");
                 }
                 BinOp::Gt => {
-                    wln!(self, "    ucomiss xmm1, xmm0");
-                    wln!(self, "    setb al");
-                    wln!(self, "    movzx eax, al");
+                    wln!(self, "    ucomiss %xmm0, %xmm1");
+                    wln!(self, "    setb %al");
+                    wln!(self, "    movzbq %al, %rax");
                 }
                 BinOp::LtEq => {
-                    wln!(self, "    ucomiss xmm0, xmm1");
-                    wln!(self, "    setbe al");
-                    wln!(self, "    movzx eax, al");
+                    wln!(self, "    ucomiss %xmm1, %xmm0");
+                    wln!(self, "    setbe %al");
+                    wln!(self, "    movzbq %al, %rax");
                 }
                 BinOp::GtEq => {
-                    wln!(self, "    ucomiss xmm1, xmm0");
-                    wln!(self, "    setbe al");
-                    wln!(self, "    movzx eax, al");
+                    wln!(self, "    ucomiss %xmm0, %xmm1");
+                    wln!(self, "    setbe %al");
+                    wln!(self, "    movzbq %al, %rax");
                 }
                 _ => {}
             }
             // For arithmetic ops, store xmm0; for comparisons, store rax
             match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
-                    wln!(self, "    movss [rbp{}], xmm0", fmt_offset(dst));
+                    wln!(self, "    movss %xmm0, {}(%rbp)", fmt_offset(dst));
                 }
                 _ => {
-                    wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                    wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
                 }
             }
         } else {
             // F64
-            wln!(self, "    movq xmm0, qword ptr [rbp{}]", fmt_offset(loff));
-            wln!(self, "    movq xmm1, qword ptr [rbp{}]", fmt_offset(roff));
+            wln!(self, "    movsd {}(%rbp), %xmm0", fmt_offset(loff));
+            wln!(self, "    movsd {}(%rbp), %xmm1", fmt_offset(roff));
             match op {
-                BinOp::Add => wln!(self, "    addsd xmm0, xmm1"),
-                BinOp::Sub => wln!(self, "    subsd xmm0, xmm1"),
-                BinOp::Mul => wln!(self, "    mulsd xmm0, xmm1"),
-                BinOp::Div => wln!(self, "    divsd xmm0, xmm1"),
+                BinOp::Add => wln!(self, "    addsd %xmm1, %xmm0"),
+                BinOp::Sub => wln!(self, "    subsd %xmm1, %xmm0"),
+                BinOp::Mul => wln!(self, "    mulsd %xmm1, %xmm0"),
+                BinOp::Div => wln!(self, "    divsd %xmm1, %xmm0"),
                 BinOp::Eq => {
-                    wln!(self, "    ucomisd xmm0, xmm1");
-                    wln!(self, "    sete al");
-                    wln!(self, "    movzx eax, al");
+                    wln!(self, "    ucomisd %xmm1, %xmm0");
+                    wln!(self, "    sete %al");
+                    wln!(self, "    movzbq %al, %rax");
                 }
                 BinOp::Neq => {
-                    wln!(self, "    ucomisd xmm0, xmm1");
-                    wln!(self, "    setne al");
-                    wln!(self, "    movzx eax, al");
+                    wln!(self, "    ucomisd %xmm1, %xmm0");
+                    wln!(self, "    setne %al");
+                    wln!(self, "    movzbq %al, %rax");
                 }
                 BinOp::Lt => {
-                    wln!(self, "    ucomisd xmm0, xmm1");
-                    wln!(self, "    setb al");
-                    wln!(self, "    movzx eax, al");
+                    wln!(self, "    ucomisd %xmm1, %xmm0");
+                    wln!(self, "    setb %al");
+                    wln!(self, "    movzbq %al, %rax");
                 }
                 BinOp::Gt => {
-                    wln!(self, "    ucomisd xmm1, xmm0");
-                    wln!(self, "    setb al");
-                    wln!(self, "    movzx eax, al");
+                    wln!(self, "    ucomisd %xmm0, %xmm1");
+                    wln!(self, "    setb %al");
+                    wln!(self, "    movzbq %al, %rax");
                 }
                 BinOp::LtEq => {
-                    wln!(self, "    ucomisd xmm0, xmm1");
-                    wln!(self, "    setbe al");
-                    wln!(self, "    movzx eax, al");
+                    wln!(self, "    ucomisd %xmm1, %xmm0");
+                    wln!(self, "    setbe %al");
+                    wln!(self, "    movzbq %al, %rax");
                 }
                 BinOp::GtEq => {
-                    wln!(self, "    ucomisd xmm1, xmm0");
-                    wln!(self, "    setbe al");
-                    wln!(self, "    movzx eax, al");
+                    wln!(self, "    ucomisd %xmm0, %xmm1");
+                    wln!(self, "    setbe %al");
+                    wln!(self, "    movzbq %al, %rax");
                 }
                 _ => {}
             }
             match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
-                    wln!(self, "    movq qword ptr [rbp{}], xmm0", fmt_offset(dst));
+                    wln!(self, "    movsd %xmm0, {}(%rbp)", fmt_offset(dst));
                 }
                 _ => {
-                    wln!(self, "    mov [rbp{}], rax", fmt_offset(dst));
+                    wln!(self, "    movq %rax, {}(%rbp)", fmt_offset(dst));
                 }
             }
         }
     }
 
-    /// Generate runtime stubs — direct Windows API calls (no C runtime)
+    /// Generate runtime stubs — Linux syscalls (no C runtime)
+    /// System V AMD64 calling convention: args in RDI, RSI, RDX, R10, R8, R9
+    /// Linux syscall numbers: write=1, exit=60, mmap=9, munmap=11
     fn gen_runtime_stubs(&mut self) {
         wln!(self, "");
-        wln!(self, "; ─── Runtime stubs (direct Windows API) ───");
+        wln!(self, "# ─── Runtime stubs (Linux syscalls) ───");
 
-        // p_print_int(rcx = i64 value)
+        // p_print_int(rdi = i64 value)
         // Converts integer to string and writes to stdout + newline
         wln!(self, "p_print_int:");
-        wln!(self, "    push rbp");
-        wln!(self, "    mov rbp, rsp");
-        wln!(self, "    push r12");
-        wln!(self, "    push r13");
-        wln!(self, "    sub rsp, 80  ; buffer + shadow space + alignment");
+        wln!(self, "    pushq %rbp");
+        wln!(self, "    movq %rsp, %rbp");
+        wln!(self, "    pushq %r12");
+        wln!(self, "    pushq %r13");
+        wln!(self, "    subq $80, %rsp  # buffer + alignment");
         wln!(self, "");
-        wln!(self, "    mov rax, rcx  ; value");
-        wln!(self, "    lea r8, [rbp-1]  ; buffer end pointer");
-        wln!(self, "    mov byte ptr [r8], 10  ; newline at end");
-        wln!(self, "    mov r9, 10  ; divisor");
+        wln!(self, "    movq %rdi, %rax  # value");
+        wln!(self, "    leaq -1(%rbp), %r8  # buffer end pointer");
+        wln!(self, "    movb $10, (%r8)  # newline at end");
+        wln!(self, "    movq $10, %r9  # divisor");
         wln!(self, "");
-        wln!(self, "    test rax, rax");
+        wln!(self, "    testq %rax, %rax");
         wln!(self, "    jns pi_pos");
-        wln!(self, "    neg rax");
+        wln!(self, "    negq %rax");
         wln!(self, "pi_pos:");
         wln!(self, "pi_loop:");
-        wln!(self, "    dec r8");
-        wln!(self, "    xor rdx, rdx");
-        wln!(self, "    div r9");
-        wln!(self, "    add dl, '0'");
-        wln!(self, "    mov [r8], dl");
-        wln!(self, "    test rax, rax");
+        wln!(self, "    decq %r8");
+        wln!(self, "    xorq %rdx, %rdx");
+        wln!(self, "    divq %r9");
+        wln!(self, "    addb $48, %dl  # '0'");
+        wln!(self, "    movb %dl, (%r8)");
+        wln!(self, "    testq %rax, %rax");
         wln!(self, "    jnz pi_loop");
         wln!(self, "");
-        wln!(self, "    test rcx, rcx");
+        wln!(self, "    testq %rdi, %rdi");
         wln!(self, "    jns pi_no_neg");
-        wln!(self, "    dec r8");
-        wln!(self, "    mov byte ptr [r8], '-'");
+        wln!(self, "    decq %r8");
+        wln!(self, "    movb $45, (%r8)  # '-'");
         wln!(self, "pi_no_neg:");
         wln!(self, "");
-        wln!(self, "    ; WriteFile(stdout, r8, len, &written, NULL)");
-        wln!(self, "    mov ecx, -11");
-        wln!(self, "    sub rsp, 32");
-        wln!(self, "    call GetStdHandle");
-        wln!(self, "    add rsp, 32");
-        wln!(self, "    mov r12, rax");
-        wln!(self, "    lea r9, [rbp]  ; end (after newline)");
-        wln!(self, "    sub r9, r8  ; length");
-        wln!(self, "    mov rcx, r12");
-        wln!(self, "    mov rdx, r8");
-        wln!(self, "    mov r8, r9");
-        wln!(self, "    lea r9, [rbp-32]");
-        wln!(self, "    mov dword ptr [r9], 0");
-        wln!(self, "    sub rsp, 48  ; shadow space + 5th arg + alignment");
-        wln!(self, "    mov qword ptr [rsp+32], 0  ; lpOverlapped = NULL");
-        wln!(self, "    call WriteFile");
-        wln!(self, "    add rsp, 48");
-        wln!(self, "    xor rax, rax");
-        wln!(self, "    add rsp, 80");
-        wln!(self, "    pop r13");
-        wln!(self, "    pop r12");
-        wln!(self, "    mov rsp, rbp");
-        wln!(self, "    pop rbp");
-        wln!(self, "    return");
+        wln!(self, "    # write(1, r8, len)");
+        wln!(self, "    leaq (%rbp), %r9  # end (after newline)");
+        wln!(self, "    subq %r8, %r9  # length");
+        wln!(self, "    movq $1, %rax  # syscall write");
+        wln!(self, "    movq $1, %rdi  # stdout");
+        wln!(self, "    movq %r8, %rsi  # buffer");
+        wln!(self, "    movq %r9, %rdx  # length");
+        wln!(self, "    syscall");
+        wln!(self, "    xorq %rax, %rax");
+        wln!(self, "    addq $80, %rsp");
+        wln!(self, "    popq %r13");
+        wln!(self, "    popq %r12");
+        wln!(self, "    movq %rbp, %rsp");
+        wln!(self, "    popq %rbp");
+        wln!(self, "    ret");
 
-        // p_print_str(rcx = *u8 pointer to null-terminated string)
+        // p_print_str(rdi = *u8 pointer to null-terminated string)
         wln!(self, "");
         wln!(self, "p_print_str:");
-        wln!(self, "    push rbp");
-        wln!(self, "    mov rbp, rsp");
-        wln!(self, "    push r12");
-        wln!(self, "    push r13");
-        wln!(self, "    sub rsp, 64");
-        wln!(self, "    mov r12, rcx  ; save string pointer");
+        wln!(self, "    pushq %rbp");
+        wln!(self, "    movq %rsp, %rbp");
+        wln!(self, "    pushq %r12");
+        wln!(self, "    pushq %r13");
+        wln!(self, "    subq $32, %rsp");
+        wln!(self, "    movq %rdi, %r12  # save string pointer");
         wln!(self, "");
-        wln!(self, "    ; Calculate string length");
-        wln!(self, "    xor r8, r8");
+        wln!(self, "    # Calculate string length");
+        wln!(self, "    xorq %r8, %r8");
         wln!(self, "ps_len:");
-        wln!(self, "    cmp byte ptr [r12 + r8], 0");
+        wln!(self, "    cmpb $0, (%r12,%r8)");
         wln!(self, "    je ps_done");
-        wln!(self, "    inc r8");
+        wln!(self, "    incq %r8");
         wln!(self, "    jmp ps_len");
         wln!(self, "ps_done:");
-        wln!(self, "    mov r13, r8  ; save length");
+        wln!(self, "    movq %r8, %r13  # save length");
         wln!(self, "");
-        wln!(self, "    ; WriteFile string");
-        wln!(self, "    mov ecx, -11");
-        wln!(self, "    sub rsp, 32");
-        wln!(self, "    call GetStdHandle");
-        wln!(self, "    add rsp, 32");
-        wln!(self, "    mov rcx, rax  ; handle");
-        wln!(self, "    mov rdx, r12  ; buffer");
-        wln!(self, "    mov r8, r13  ; length");
-        wln!(self, "    lea r9, [rbp-32]");
-        wln!(self, "    mov dword ptr [r9], 0");
-        wln!(self, "    sub rsp, 48  ; shadow space + 5th arg + alignment");
-        wln!(self, "    mov qword ptr [rsp+32], 0  ; lpOverlapped = NULL");
-        wln!(self, "    call WriteFile");
-        wln!(self, "    add rsp, 48");
+        wln!(self, "    # write(1, r12, r13)");
+        wln!(self, "    movq $1, %rax  # syscall write");
+        wln!(self, "    movq $1, %rdi  # stdout");
+        wln!(self, "    movq %r12, %rsi  # buffer");
+        wln!(self, "    movq %r13, %rdx  # length");
+        wln!(self, "    syscall");
         wln!(self, "");
-        wln!(self, "    ; Print newline");
-        wln!(self, "    mov byte ptr [rbp-33], 10");
-        wln!(self, "    mov ecx, -11");
-        wln!(self, "    sub rsp, 32");
-        wln!(self, "    call GetStdHandle");
-        wln!(self, "    add rsp, 32");
-        wln!(self, "    mov rcx, rax");
-        wln!(self, "    lea rdx, [rbp-33]");
-        wln!(self, "    mov r8, 1");
-        wln!(self, "    lea r9, [rbp-40]");
-        wln!(self, "    mov dword ptr [r9], 0");
-        wln!(self, "    sub rsp, 48  ; shadow space + 5th arg + alignment");
-        wln!(self, "    mov qword ptr [rsp+32], 0  ; lpOverlapped = NULL");
-        wln!(self, "    call WriteFile");
-        wln!(self, "    add rsp, 48");
-        wln!(self, "    xor rax, rax");
-        wln!(self, "    add rsp, 64");
-        wln!(self, "    pop r13");
-        wln!(self, "    pop r12");
-        wln!(self, "    mov rsp, rbp");
-        wln!(self, "    pop rbp");
-        wln!(self, "    return");
+        wln!(self, "    # Print newline");
+        wln!(self, "    movb $10, -1(%rbp)");
+        wln!(self, "    movq $1, %rax  # syscall write");
+        wln!(self, "    movq $1, %rdi  # stdout");
+        wln!(self, "    leaq -1(%rbp), %rsi  # buffer");
+        wln!(self, "    movq $1, %rdx  # length");
+        wln!(self, "    syscall");
+        wln!(self, "    xorq %rax, %rax");
+        wln!(self, "    addq $32, %rsp");
+        wln!(self, "    popq %r13");
+        wln!(self, "    popq %r12");
+        wln!(self, "    movq %rbp, %rsp");
+        wln!(self, "    popq %rbp");
+        wln!(self, "    ret");
 
-        // p_print_bool(rcx = 0 or 1)
+        // p_print_bool(rdi = 0 or 1)
         wln!(self, "");
         wln!(self, "p_print_bool:");
-        wln!(self, "    push rbp");
-        wln!(self, "    mov rbp, rsp");
-        wln!(self, "    push r12");
-        wln!(self, "    push r13");
-        wln!(self, "    sub rsp, 64");
-        wln!(self, "    test rcx, rcx");
+        wln!(self, "    pushq %rbp");
+        wln!(self, "    movq %rsp, %rbp");
+        wln!(self, "    pushq %r12");
+        wln!(self, "    pushq %r13");
+        wln!(self, "    subq $32, %rsp");
+        wln!(self, "    testq %rdi, %rdi");
         wln!(self, "    jnz pb_true");
-        wln!(self, "    lea r12, str_false");
+        wln!(self, "    leaq str_false(%rip), %r12");
         wln!(self, "    jmp pb_print");
         wln!(self, "pb_true:");
-        wln!(self, "    lea r12, str_true");
+        wln!(self, "    leaq str_true(%rip), %r12");
         wln!(self, "pb_print:");
-        wln!(self, "    xor r8, r8");
+        wln!(self, "    xorq %r8, %r8");
         wln!(self, "pb_len:");
-        wln!(self, "    cmp byte ptr [r12 + r8], 0");
+        wln!(self, "    cmpb $0, (%r12,%r8)");
         wln!(self, "    je pb_done");
-        wln!(self, "    inc r8");
+        wln!(self, "    incq %r8");
         wln!(self, "    jmp pb_len");
         wln!(self, "pb_done:");
-        wln!(self, "    mov r13, r8");
-        wln!(self, "    mov ecx, -11");
-        wln!(self, "    sub rsp, 32");
-        wln!(self, "    call GetStdHandle");
-        wln!(self, "    add rsp, 32");
-        wln!(self, "    mov rcx, rax");
-        wln!(self, "    mov rdx, r12");
-        wln!(self, "    mov r8, r13");
-        wln!(self, "    lea r9, [rbp-32]");
-        wln!(self, "    mov dword ptr [r9], 0");
-        wln!(self, "    sub rsp, 48  ; shadow space + 5th arg + alignment");
-        wln!(self, "    mov qword ptr [rsp+32], 0  ; lpOverlapped = NULL");
-        wln!(self, "    call WriteFile");
-        wln!(self, "    add rsp, 48");
-        wln!(self, "    ; newline");
-        wln!(self, "    mov byte ptr [rbp-33], 10");
-        wln!(self, "    mov ecx, -11");
-        wln!(self, "    sub rsp, 32");
-        wln!(self, "    call GetStdHandle");
-        wln!(self, "    add rsp, 32");
-        wln!(self, "    mov rcx, rax");
-        wln!(self, "    lea rdx, [rbp-33]");
-        wln!(self, "    mov r8, 1");
-        wln!(self, "    lea r9, [rbp-40]");
-        wln!(self, "    mov dword ptr [r9], 0");
-        wln!(self, "    sub rsp, 48  ; shadow space + 5th arg + alignment");
-        wln!(self, "    mov qword ptr [rsp+32], 0  ; lpOverlapped = NULL");
-        wln!(self, "    call WriteFile");
-        wln!(self, "    add rsp, 48");
-        wln!(self, "    xor rax, rax");
-        wln!(self, "    add rsp, 64");
-        wln!(self, "    pop r13");
-        wln!(self, "    pop r12");
-        wln!(self, "    mov rsp, rbp");
-        wln!(self, "    pop rbp");
-        wln!(self, "    return");
+        wln!(self, "    movq %r8, %r13");
+        wln!(self, "    movq $1, %rax  # syscall write");
+        wln!(self, "    movq $1, %rdi  # stdout");
+        wln!(self, "    movq %r12, %rsi");
+        wln!(self, "    movq %r13, %rdx");
+        wln!(self, "    syscall");
+        wln!(self, "    # newline");
+        wln!(self, "    movb $10, -1(%rbp)");
+        wln!(self, "    movq $1, %rax");
+        wln!(self, "    movq $1, %rdi");
+        wln!(self, "    leaq -1(%rbp), %rsi");
+        wln!(self, "    movq $1, %rdx");
+        wln!(self, "    syscall");
+        wln!(self, "    xorq %rax, %rax");
+        wln!(self, "    addq $32, %rsp");
+        wln!(self, "    popq %r13");
+        wln!(self, "    popq %r12");
+        wln!(self, "    movq %rbp, %rsp");
+        wln!(self, "    popq %rbp");
+        wln!(self, "    ret");
 
-        // p_print_float(rcx = f64 bits stored as i64)
+        // p_print_float(rdi = f64 bits stored as i64)
         // Formats as integer.fractional with 6 decimal places
         wln!(self, "");
         wln!(self, "p_print_float:");
-        wln!(self, "    push rbp");
-        wln!(self, "    mov rbp, rsp");
-        wln!(self, "    push r12");
-        wln!(self, "    push r13");
-        wln!(self, "    push r14");
-        wln!(self, "    sub rsp, 152  ; buffer(64) + temp(32) + locals(56), 16-byte aligned");
+        wln!(self, "    pushq %rbp");
+        wln!(self, "    movq %rsp, %rbp");
+        wln!(self, "    pushq %r12");
+        wln!(self, "    pushq %r13");
+        wln!(self, "    pushq %r14");
+        wln!(self, "    subq $152, %rsp  # buffer(64) + temp(32) + locals(56)");
         wln!(self, "");
-        wln!(self, "    ; Save float bits and load as xmm0");
-        wln!(self, "    mov [rbp-72], rcx");
-        wln!(self, "    movq xmm0, qword ptr [rbp-72]");
+        wln!(self, "    # Save float bits and load as xmm0");
+        wln!(self, "    movq %rdi, -72(%rbp)");
+        wln!(self, "    movsd -72(%rbp), %xmm0");
         wln!(self, "");
-        wln!(self, "    ; r12 = buffer pointer, r13 = length");
-        wln!(self, "    lea r12, [rbp-64]");
-        wln!(self, "    xor r13, r13");
+        wln!(self, "    # r12 = buffer pointer, r13 = length");
+        wln!(self, "    leaq -64(%rbp), %r12");
+        wln!(self, "    xorq %r13, %r13");
         wln!(self, "");
-        wln!(self, "    ; Check negative");
-        wln!(self, "    xorpd xmm1, xmm1");
-        wln!(self, "    ucomisd xmm0, xmm1");
+        wln!(self, "    # Check negative");
+        wln!(self, "    xorpd %xmm1, %xmm1");
+        wln!(self, "    ucomisd %xmm1, %xmm0");
         wln!(self, "    jae pf_pos");
-        wln!(self, "    mov byte ptr [r12], '-'");
-        wln!(self, "    inc r12");
-        wln!(self, "    inc r13");
-        wln!(self, "    mov rax, 8000000000000000h");
-        wln!(self, "    mov [rbp-80], rax");
-        wln!(self, "    xorpd xmm0, xmmword ptr [rbp-80]");
+        wln!(self, "    movb $45, (%r12)  # '-'");
+        wln!(self, "    incq %r12");
+        wln!(self, "    incq %r13");
+        wln!(self, "    # Flip sign bit via integer XOR");
+        wln!(self, "    movq $0x8000000000000000, %rax");
+        wln!(self, "    movq %rax, -80(%rbp)");
+        wln!(self, "    movsd -80(%rbp), %xmm2");
+        wln!(self, "    xorpd %xmm2, %xmm0");
         wln!(self, "");
         wln!(self, "pf_pos:");
-        wln!(self, "    ; Save xmm0 (possibly negated)");
-        wln!(self, "    movq qword ptr [rbp-72], xmm0");
+        wln!(self, "    # Save xmm0 (possibly negated)");
+        wln!(self, "    movsd %xmm0, -72(%rbp)");
         wln!(self, "");
-        wln!(self, "    ; Get integer part");
-        wln!(self, "    cvttsd2si rax, xmm0");
-        wln!(self, "    mov r14, rax  ; save integer part");
+        wln!(self, "    # Get integer part");
+        wln!(self, "    cvttsd2siq %xmm0, %rax");
+        wln!(self, "    movq %rax, %r14  # save integer part");
         wln!(self, "");
-        wln!(self, "    ; Handle integer part == 0");
-        wln!(self, "    test rax, rax");
+        wln!(self, "    # Handle integer part == 0");
+        wln!(self, "    testq %rax, %rax");
         wln!(self, "    jnz pf_int_start");
-        wln!(self, "    mov byte ptr [r12], '0'");
-        wln!(self, "    inc r12");
-        wln!(self, "    inc r13");
+        wln!(self, "    movb $48, (%r12)  # '0'");
+        wln!(self, "    incq %r12");
+        wln!(self, "    incq %r13");
         wln!(self, "    jmp pf_dot");
         wln!(self, "");
         wln!(self, "pf_int_start:");
-        wln!(self, "    ; Convert integer to reversed string at [rbp-128]");
-        wln!(self, "    lea r8, [rbp-128]");
-        wln!(self, "    xor r9, r9");
+        wln!(self, "    # Convert integer to reversed string at -128(%rbp)");
+        wln!(self, "    leaq -128(%rbp), %r8");
+        wln!(self, "    xorq %r9, %r9");
         wln!(self, "pf_int_loop:");
-        wln!(self, "    xor rdx, rdx");
-        wln!(self, "    mov rcx, 10");
-        wln!(self, "    div rcx");
-        wln!(self, "    add dl, '0'");
-        wln!(self, "    mov [r8], dl");
-        wln!(self, "    inc r8");
-        wln!(self, "    inc r9");
-        wln!(self, "    test rax, rax");
+        wln!(self, "    xorq %rdx, %rdx");
+        wln!(self, "    movq $10, %rcx");
+        wln!(self, "    divq %rcx");
+        wln!(self, "    addb $48, %dl  # '0'");
+        wln!(self, "    movb %dl, (%r8)");
+        wln!(self, "    incq %r8");
+        wln!(self, "    incq %r9");
+        wln!(self, "    testq %rax, %rax");
         wln!(self, "    jnz pf_int_loop");
         wln!(self, "");
-        wln!(self, "    ; Copy reversed digits to buffer in correct order");
-        wln!(self, "    dec r8");
+        wln!(self, "    # Copy reversed digits to buffer in correct order");
+        wln!(self, "    decq %r8");
         wln!(self, "pf_int_copy:");
-        wln!(self, "    mov al, [r8]");
-        wln!(self, "    mov [r12], al");
-        wln!(self, "    inc r12");
-        wln!(self, "    inc r13");
-        wln!(self, "    dec r8");
-        wln!(self, "    dec r9");
+        wln!(self, "    movb (%r8), %al");
+        wln!(self, "    movb %al, (%r12)");
+        wln!(self, "    incq %r12");
+        wln!(self, "    incq %r13");
+        wln!(self, "    decq %r8");
+        wln!(self, "    decq %r9");
         wln!(self, "    jnz pf_int_copy");
         wln!(self, "");
         wln!(self, "pf_dot:");
-        wln!(self, "    mov byte ptr [r12], '.'");
-        wln!(self, "    inc r12");
-        wln!(self, "    inc r13");
+        wln!(self, "    movb $46, (%r12)  # '.'");
+        wln!(self, "    incq %r12");
+        wln!(self, "    incq %r13");
         wln!(self, "");
-        wln!(self, "    ; Get fractional part: xmm0 = original - integer_part");
-        wln!(self, "    movq xmm0, qword ptr [rbp-72]");
-        wln!(self, "    cvtsi2sd xmm1, r14");
-        wln!(self, "    subsd xmm0, xmm1");
-        wln!(self, "    ; Clamp negative to 0 (FP precision)");
-        wln!(self, "    xorpd xmm1, xmm1");
-        wln!(self, "    ucomisd xmm0, xmm1");
+        wln!(self, "    # Get fractional part: xmm0 = original - integer_part");
+        wln!(self, "    movsd -72(%rbp), %xmm0");
+        wln!(self, "    cvtsi2sdq %r14, %xmm1");
+        wln!(self, "    subsd %xmm1, %xmm0");
+        wln!(self, "    # Clamp negative to 0 (FP precision)");
+        wln!(self, "    xorpd %xmm1, %xmm1");
+        wln!(self, "    ucomisd %xmm1, %xmm0");
         wln!(self, "    jae pf_frac_ok");
-        wln!(self, "    movq xmm0, xmm1");
+        wln!(self, "    movsd %xmm1, %xmm0");
         wln!(self, "pf_frac_ok:");
         wln!(self, "");
-        wln!(self, "    ; Load 1000000.0 constant");
-        wln!(self, "    mov rax, 412E848000000000h");
-        wln!(self, "    mov [rbp-80], rax");
-        wln!(self, "    movq xmm2, qword ptr [rbp-80]  ; xmm2 = 1000000.0");
+        wln!(self, "    # Load 1000000.0 constant");
+        wln!(self, "    movq $0x412E848000000000, %rax");
+        wln!(self, "    movq %rax, -80(%rbp)");
+        wln!(self, "    movsd -80(%rbp), %xmm2  # xmm2 = 1000000.0");
         wln!(self, "");
-        wln!(self, "    ; Multiply fractional part by 1000000");
-        wln!(self, "    mulsd xmm0, xmm2");
+        wln!(self, "    # Multiply fractional part by 1000000");
+        wln!(self, "    mulsd %xmm2, %xmm0");
         wln!(self, "");
-        wln!(self, "    ; Add 0.5 for rounding");
-        wln!(self, "    mov rax, 3FE0000000000000h");
-        wln!(self, "    mov [rbp-80], rax");
-        wln!(self, "    movq xmm1, qword ptr [rbp-80]  ; xmm1 = 0.5");
-        wln!(self, "    addsd xmm0, xmm1");
+        wln!(self, "    # Add 0.5 for rounding");
+        wln!(self, "    movq $0x3FE0000000000000, %rax");
+        wln!(self, "    movq %rax, -80(%rbp)");
+        wln!(self, "    movsd -80(%rbp), %xmm1  # xmm1 = 0.5");
+        wln!(self, "    addsd %xmm1, %xmm0");
         wln!(self, "");
-        wln!(self, "    ; Truncate to integer");
-        wln!(self, "    cvttsd2si rax, xmm0  ; rax = rounded fractional * 10^6");
+        wln!(self, "    # Truncate to integer");
+        wln!(self, "    cvttsd2siq %xmm0, %rax  # rax = rounded fractional * 10^6");
         wln!(self, "");
-        wln!(self, "    ; Extract 6 digits from rax (reversed into temp buffer)");
-        wln!(self, "    lea r8, [rbp-128]");
-        wln!(self, "    mov rcx, 6");
-        wln!(self, "    mov r9, 10");
+        wln!(self, "    # Extract 6 digits from rax (reversed into temp buffer)");
+        wln!(self, "    leaq -128(%rbp), %r8");
+        wln!(self, "    movq $6, %rcx");
+        wln!(self, "    movq $10, %r9");
         wln!(self, "pf_frac_loop:");
-        wln!(self, "    xor rdx, rdx");
-        wln!(self, "    div r9");
-        wln!(self, "    add dl, '0'");
-        wln!(self, "    mov [r8], dl");
-        wln!(self, "    inc r8");
-        wln!(self, "    dec rcx");
+        wln!(self, "    xorq %rdx, %rdx");
+        wln!(self, "    divq %r9");
+        wln!(self, "    addb $48, %dl  # '0'");
+        wln!(self, "    movb %dl, (%r8)");
+        wln!(self, "    incq %r8");
+        wln!(self, "    decq %rcx");
         wln!(self, "    jnz pf_frac_loop");
         wln!(self, "");
-        wln!(self, "    ; Copy digits in reverse order to output buffer");
-        wln!(self, "    dec r8");
-        wln!(self, "    mov rcx, 6");
+        wln!(self, "    # Copy digits in reverse order to output buffer");
+        wln!(self, "    decq %r8");
+        wln!(self, "    movq $6, %rcx");
         wln!(self, "pf_frac_copy:");
-        wln!(self, "    mov al, [r8]");
-        wln!(self, "    mov [r12], al");
-        wln!(self, "    inc r12");
-        wln!(self, "    inc r13");
-        wln!(self, "    dec r8");
-        wln!(self, "    dec rcx");
+        wln!(self, "    movb (%r8), %al");
+        wln!(self, "    movb %al, (%r12)");
+        wln!(self, "    incq %r12");
+        wln!(self, "    incq %r13");
+        wln!(self, "    decq %r8");
+        wln!(self, "    decq %rcx");
         wln!(self, "    jnz pf_frac_copy");
         wln!(self, "");
-        wln!(self, "    ; Add newline");
-        wln!(self, "    mov byte ptr [r12], 10");
-        wln!(self, "    inc r13");
+        wln!(self, "    # Add newline");
+        wln!(self, "    movb $10, (%r12)");
+        wln!(self, "    incq %r13");
         wln!(self, "");
-        wln!(self, "    ; WriteFile(stdout, buffer, length, &written, NULL)");
-        wln!(self, "    mov ecx, -11");
-        wln!(self, "    sub rsp, 32");
-        wln!(self, "    call GetStdHandle");
-        wln!(self, "    add rsp, 32");
-        wln!(self, "    mov rcx, rax  ; handle");
-        wln!(self, "    lea rdx, [rbp-64]  ; buffer");
-        wln!(self, "    mov r8, r13  ; length");
-        wln!(self, "    lea r9, [rbp-32]");
-        wln!(self, "    mov dword ptr [r9], 0");
-        wln!(self, "    sub rsp, 48  ; shadow space + 5th arg + alignment");
-        wln!(self, "    mov qword ptr [rsp+32], 0  ; lpOverlapped = NULL");
-        wln!(self, "    call WriteFile");
-        wln!(self, "    add rsp, 48");
+        wln!(self, "    # write(1, buffer, length)");
+        wln!(self, "    movq $1, %rax  # syscall write");
+        wln!(self, "    movq $1, %rdi  # stdout");
+        wln!(self, "    leaq -64(%rbp), %rsi  # buffer");
+        wln!(self, "    movq %r13, %rdx  # length");
+        wln!(self, "    syscall");
         wln!(self, "");
-        wln!(self, "    xor rax, rax");
-        wln!(self, "    add rsp, 152");
-        wln!(self, "    pop r14");
-        wln!(self, "    pop r13");
-        wln!(self, "    pop r12");
-        wln!(self, "    mov rsp, rbp");
-        wln!(self, "    pop rbp");
-        wln!(self, "    return");
+        wln!(self, "    xorq %rax, %rax");
+        wln!(self, "    addq $152, %rsp");
+        wln!(self, "    popq %r14");
+        wln!(self, "    popq %r13");
+        wln!(self, "    popq %r12");
+        wln!(self, "    movq %rbp, %rsp");
+        wln!(self, "    popq %rbp");
+        wln!(self, "    ret");
 
-        // p_to_str(rcx = i64 value) -> rax = pointer to null-terminated string
-        // Converts an integer to a string in a static buffer
+        // p_to_str(rdi = i64 value) -> rax = pointer to null-terminated string
+        // Converts an integer to a string in a stack buffer
         wln!(self, "");
         wln!(self, "p_to_str:");
-        wln!(self, "    push rbp");
-        wln!(self, "    mov rbp, rsp");
-        wln!(self, "    sub rsp, 64  ; buffer + shadow space");
-        wln!(self, "    lea r8, [rbp-1]  ; buffer end pointer");
-        wln!(self, "    mov byte ptr [r8], 0  ; null terminator");
-        wln!(self, "    mov rax, rcx  ; value");
-        wln!(self, "    mov r9, 10  ; divisor");
-        wln!(self, "    test rax, rax");
+        wln!(self, "    pushq %rbp");
+        wln!(self, "    movq %rsp, %rbp");
+        wln!(self, "    subq $64, %rsp  # buffer");
+        wln!(self, "    leaq -1(%rbp), %r8  # buffer end pointer");
+        wln!(self, "    movb $0, (%r8)  # null terminator");
+        wln!(self, "    movq %rdi, %rax  # value");
+        wln!(self, "    movq $10, %r9  # divisor");
+        wln!(self, "    testq %rax, %rax");
         wln!(self, "    jns ts_pos");
-        wln!(self, "    neg rax");
+        wln!(self, "    negq %rax");
         wln!(self, "ts_pos:");
         wln!(self, "ts_loop:");
-        wln!(self, "    dec r8");
-        wln!(self, "    xor rdx, rdx");
-        wln!(self, "    div r9");
-        wln!(self, "    add dl, '0'");
-        wln!(self, "    mov [r8], dl");
-        wln!(self, "    test rax, rax");
+        wln!(self, "    decq %r8");
+        wln!(self, "    xorq %rdx, %rdx");
+        wln!(self, "    divq %r9");
+        wln!(self, "    addb $48, %dl  # '0'");
+        wln!(self, "    movb %dl, (%r8)");
+        wln!(self, "    testq %rax, %rax");
         wln!(self, "    jnz ts_loop");
-        wln!(self, "    test rcx, rcx");
+        wln!(self, "    testq %rdi, %rdi");
         wln!(self, "    jns ts_no_neg");
-        wln!(self, "    dec r8");
-        wln!(self, "    mov byte ptr [r8], '-'");
+        wln!(self, "    decq %r8");
+        wln!(self, "    movb $45, (%r8)  # '-'");
         wln!(self, "ts_no_neg:");
-        wln!(self, "    ; Handle zero case");
-        wln!(self, "    cmp byte ptr [r8], 0");
+        wln!(self, "    # Handle zero case");
+        wln!(self, "    cmpb $0, (%r8)");
         wln!(self, "    jne ts_done");
-        wln!(self, "    dec r8");
-        wln!(self, "    mov byte ptr [r8], '0'");
+        wln!(self, "    decq %r8");
+        wln!(self, "    movb $48, (%r8)  # '0'");
         wln!(self, "ts_done:");
-        wln!(self, "    lea rax, [r8]  ; return pointer to start of string");
-        wln!(self, "    mov rsp, rbp");
-        wln!(self, "    pop rbp");
-        wln!(self, "    return");
+        wln!(self, "    leaq (%r8), %rax  # return pointer to start of string");
+        wln!(self, "    movq %rbp, %rsp");
+        wln!(self, "    popq %rbp");
+        wln!(self, "    ret");
 
-        // p_str_concat(rcx = left ptr, rdx = right ptr) -> rax = new string ptr
+        // p_str_concat(rdi = left ptr, rsi = right ptr) -> rax = new string ptr
         // Concatenates two null-terminated strings into a static buffer
-        // Uses a large static buffer (simplified — not thread-safe, not heap-allocated)
         wln!(self, "");
         wln!(self, "p_str_concat:");
-        wln!(self, "    push rbp");
-        wln!(self, "    mov rbp, rsp");
-        wln!(self, "    sub rsp, 32  ; shadow space");
-        wln!(self, "    ; Copy left string to temp buffer first (avoid aliasing)");
-        wln!(self, "    mov r8, OFFSET str_concat_tmp  ; temp buffer");
-        wln!(self, "    mov r9, 0  ; index");
+        wln!(self, "    pushq %rbp");
+        wln!(self, "    movq %rsp, %rbp");
+        wln!(self, "    # Save left/right pointers");
+        wln!(self, "    movq %rdi, %rcx  # left");
+        wln!(self, "    movq %rsi, %rdx  # right");
+        wln!(self, "    # Copy left string to temp buffer first (avoid aliasing)");
+        wln!(self, "    leaq str_concat_tmp(%rip), %r8  # temp buffer");
+        wln!(self, "    xorq %r9, %r9  # index");
         wln!(self, "sc_copy:");
-        wln!(self, "    mov al, byte ptr [rcx + r9]");
-        wln!(self, "    mov byte ptr [r8 + r9], al");
-        wln!(self, "    test al, al");
+        wln!(self, "    movb (%rcx,%r9), %al");
+        wln!(self, "    movb %al, (%r8,%r9)");
+        wln!(self, "    testb %al, %al");
         wln!(self, "    jz sc_copy_done");
-        wln!(self, "    inc r9");
+        wln!(self, "    incq %r9");
         wln!(self, "    jmp sc_copy");
         wln!(self, "sc_copy_done:");
-        wln!(self, "    ; Now copy temp (left) to output buffer");
-        wln!(self, "    mov r8, OFFSET str_concat_buf  ; destination");
-        wln!(self, "    mov r11, OFFSET str_concat_tmp  ; source (left)");
-        wln!(self, "    mov rcx, 0  ; index for left");
+        wln!(self, "    # Now copy temp (left) to output buffer");
+        wln!(self, "    leaq str_concat_buf(%rip), %r8  # destination");
+        wln!(self, "    leaq str_concat_tmp(%rip), %r11  # source (left)");
+        wln!(self, "    xorq %rcx, %rcx  # index for left");
         wln!(self, "sc_left:");
-        wln!(self, "    mov al, byte ptr [r11 + rcx]");
-        wln!(self, "    test al, al");
+        wln!(self, "    movb (%r11,%rcx), %al");
+        wln!(self, "    testb %al, %al");
         wln!(self, "    jz sc_right");
-        wln!(self, "    mov byte ptr [r8 + rcx], al");
-        wln!(self, "    inc rcx");
+        wln!(self, "    movb %al, (%r8,%rcx)");
+        wln!(self, "    incq %rcx");
         wln!(self, "    jmp sc_left");
         wln!(self, "sc_right:");
-        wln!(self, "    ; r9 = length of left (rcx), copy right string");
-        wln!(self, "    mov r9, rcx  ; left length");
-        wln!(self, "    mov r10, 0  ; index for right");
+        wln!(self, "    # r9 = length of left (rcx), copy right string");
+        wln!(self, "    movq %rcx, %r9  # left length");
+        wln!(self, "    xorq %r10, %r10  # index for right");
         wln!(self, "sc_right_loop:");
-        wln!(self, "    mov al, byte ptr [rdx + r10]");
-        wln!(self, "    test al, al");
+        wln!(self, "    movb (%rdx,%r10), %al");
+        wln!(self, "    testb %al, %al");
         wln!(self, "    jz sc_end");
-        wln!(self, "    mov byte ptr [r8 + r9], al");
-        wln!(self, "    inc r9");
-        wln!(self, "    inc r10");
+        wln!(self, "    movb %al, (%r8,%r9)");
+        wln!(self, "    incq %r9");
+        wln!(self, "    incq %r10");
         wln!(self, "    jmp sc_right_loop");
         wln!(self, "sc_end:");
-        wln!(self, "    mov byte ptr [r8 + r9], 0  ; null terminate");
-        wln!(self, "    mov rax, OFFSET str_concat_buf  ; return pointer");
-        wln!(self, "    mov rsp, rbp");
-        wln!(self, "    pop rbp");
-        wln!(self, "    return");
+        wln!(self, "    movb $0, (%r8,%r9)  # null terminate");
+        wln!(self, "    leaq str_concat_buf(%rip), %rax  # return pointer");
+        wln!(self, "    movq %rbp, %rsp");
+        wln!(self, "    popq %rbp");
+        wln!(self, "    ret");
 
-        // p_panic(rcx = message pointer)
+        // p_panic(rdi = message pointer)
         wln!(self, "");
         wln!(self, "p_panic:");
-        wln!(self, "    push rbp");
-        wln!(self, "    mov rbp, rsp");
-        wln!(self, "    sub rsp, 64");
+        wln!(self, "    pushq %rbp");
+        wln!(self, "    movq %rsp, %rbp");
+        wln!(self, "    # Save message pointer");
+        wln!(self, "    movq %rdi, %r12  # message");
         wln!(self, "");
-        wln!(self, "    ; Get stdout handle");
-        wln!(self, "    mov ecx, -11  ; STD_OUTPUT_HANDLE");
-        wln!(self, "    sub rsp, 32");
-        wln!(self, "    call GetStdHandle");
-        wln!(self, "    add rsp, 32");
-        wln!(self, "    mov r12, rax");
-        wln!(self, "");
-        wln!(self, "    ; Calculate string length");
-        wln!(self, "    mov rdx, rcx  ; message");
-        wln!(self, "    xor r8, r8  ; length counter");
+        wln!(self, "    # Calculate string length");
+        wln!(self, "    xorq %r8, %r8  # length counter");
         wln!(self, "panic_len:");
-        wln!(self, "    cmp byte ptr [rdx + r8], 0");
+        wln!(self, "    cmpb $0, (%r12,%r8)");
         wln!(self, "    je panic_done");
-        wln!(self, "    inc r8");
+        wln!(self, "    incq %r8");
         wln!(self, "    jmp panic_len");
         wln!(self, "panic_done:");
         wln!(self, "");
-        wln!(self, "    ; WriteFile");
-        wln!(self, "    mov rcx, r12  ; handle");
-        wln!(self, "    ; rdx already = buffer");
-        wln!(self, "    ; r8 already = length");
-        wln!(self, "    lea r9, [rbp-32]");
-        wln!(self, "    mov dword ptr [r9], 0");
-        wln!(self, "    sub rsp, 48  ; shadow space + 5th arg + alignment");
-        wln!(self, "    mov qword ptr [rsp+32], 0  ; lpOverlapped = NULL");
-        wln!(self, "    call WriteFile");
-        wln!(self, "    add rsp, 48");
+        wln!(self, "    # write(2, message, length)  — stderr");
+        wln!(self, "    movq $1, %rax  # syscall write");
+        wln!(self, "    movq $2, %rdi  # stderr");
+        wln!(self, "    movq %r12, %rsi  # buffer");
+        wln!(self, "    movq %r8, %rdx  # length");
+        wln!(self, "    syscall");
         wln!(self, "");
-        wln!(self, "    ; ExitProcess(1)");
-        wln!(self, "    mov ecx, 1");
-        wln!(self, "    sub rsp, 32");
-        wln!(self, "    call ExitProcess");
-        wln!(self, "    add rsp, 32");
-        wln!(self, "    ud2  ; should not reach here");
+        wln!(self, "    # exit(1)");
+        wln!(self, "    movq $60, %rax  # syscall exit");
+        wln!(self, "    movq $1, %rdi  # exit code");
+        wln!(self, "    syscall");
+        wln!(self, "    ud2  # should not reach here");
 
-        // _main — Windows entry point that calls our main
+        // p_malloc(rdi = size) -> rax = ptr
+        // Uses mmap to allocate memory
         wln!(self, "");
-        wln!(self, "; ─── Heap allocation stubs ───");
-
-        // p_malloc(rcx = size) -> rax = ptr
         wln!(self, "p_malloc:");
-        wln!(self, "    push rbp");
-        wln!(self, "    mov rbp, rsp");
-        wln!(self, "    sub rsp, 48  ; shadow space + alignment");
-        wln!(self, "");
-        wln!(self, "    ; Save size in r12");
-        wln!(self, "    mov r12, rcx");
-        wln!(self, "");
-        wln!(self, "    ; GetProcessHeap()");
-        wln!(self, "    sub rsp, 32");
-        wln!(self, "    call GetProcessHeap");
-        wln!(self, "    add rsp, 32");
-        wln!(self, "    mov r13, rax  ; heap handle");
-        wln!(self, "");
-        wln!(self, "    ; HeapAlloc(heap, 0, size)");
-        wln!(self, "    mov rcx, r13  ; heap");
-        wln!(self, "    xor rdx, rdx  ; flags = 0");
-        wln!(self, "    mov r8, r12   ; size");
-        wln!(self, "    sub rsp, 32");
-        wln!(self, "    call HeapAlloc");
-        wln!(self, "    add rsp, 32");
-        wln!(self, "    ; rax = pointer");
-        wln!(self, "    mov rsp, rbp");
-        wln!(self, "    pop rbp");
-        wln!(self, "    return");
+        wln!(self, "    pushq %rbp");
+        wln!(self, "    movq %rsp, %rbp");
+        wln!(self, "    # mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)");
+        wln!(self, "    movq %rdi, %rsi  # size");
+        wln!(self, "    movq $9, %rax  # syscall mmap");
+        wln!(self, "    xorq %rdi, %rdi  # addr = NULL");
+        wln!(self, "    movq $3, %rdx  # prot = PROT_READ|PROT_WRITE");
+        wln!(self, "    movq $0x22, %r10  # flags = MAP_PRIVATE|MAP_ANONYMOUS");
+        wln!(self, "    movq $-1, %r8  # fd = -1");
+        wln!(self, "    xorq %r9, %r9  # offset = 0");
+        wln!(self, "    syscall");
+        wln!(self, "    movq %rbp, %rsp");
+        wln!(self, "    popq %rbp");
+        wln!(self, "    ret");
 
-        // p_free(rcx = ptr) — free heap allocation
+        // p_free(rdi = ptr) — free mmap allocation
+        // Simplified: no-op (OS reclaims on exit). For proper free, need munmap.
         wln!(self, "");
         wln!(self, "p_free:");
-        wln!(self, "    push rbp");
-        wln!(self, "    mov rbp, rsp");
-        wln!(self, "    sub rsp, 48  ; shadow space + alignment");
-        wln!(self, "");
-        wln!(self, "    mov r12, rcx  ; save ptr");
-        wln!(self, "");
-        wln!(self, "    ; GetProcessHeap()");
-        wln!(self, "    sub rsp, 32");
-        wln!(self, "    call GetProcessHeap");
-        wln!(self, "    add rsp, 32");
-        wln!(self, "    mov r13, rax  ; heap handle");
-        wln!(self, "");
-        wln!(self, "    ; HeapFree(heap, 0, ptr)");
-        wln!(self, "    mov rcx, r13  ; heap");
-        wln!(self, "    xor rdx, rdx  ; flags = 0");
-        wln!(self, "    mov r8, r12   ; ptr");
-        wln!(self, "    sub rsp, 32");
-        wln!(self, "    call HeapFree");
-        wln!(self, "    add rsp, 32");
-        wln!(self, "    mov rsp, rbp");
-        wln!(self, "    pop rbp");
-        wln!(self, "    return");
+        wln!(self, "    pushq %rbp");
+        wln!(self, "    movq %rsp, %rbp");
+        wln!(self, "    # munmap(ptr, 0) — simplified, OS reclaims on exit");
+        wln!(self, "    # In production, we'd track allocation sizes");
+        wln!(self, "    movq %rbp, %rsp");
+        wln!(self, "    popq %rbp");
+        wln!(self, "    ret");
 
-        // _main — Windows entry point that calls our main
+        // _start — Linux ELF entry point
+        // At entry, RSP points to argc. Stack is 16-byte aligned.
+        // We call main() then exit with its return value.
         wln!(self, "");
-        wln!(self, "; ─── Windows entry point ───");
-        wln!(self, "_main:");
-        wln!(self, "    sub rsp, 40  ; 32 shadow + 8 align (OS entry: rsp is 8mod16)");
+        wln!(self, "    .globl _start");
+        wln!(self, "    .type _start, @function");
+        wln!(self, "_start:");
+        wln!(self, "    # Align stack to 16 bytes (RSP is already aligned at entry)");
+        wln!(self, "    # Call main()");
         wln!(self, "    call main");
-        wln!(self, "    mov ecx, eax  ; exit code from main");
-        wln!(self, "    call ExitProcess");
-        wln!(self, "    ud2  ; should not reach here");
+        wln!(self, "    # exit(rax) — main's return value");
+        wln!(self, "    movq %rax, %rdi  # exit code from main");
+        wln!(self, "    movq $60, %rax  # syscall exit");
+        wln!(self, "    syscall");
+        wln!(self, "    ud2  # should not reach here");
+        wln!(self, "    .size _start, .-_start");
     }
 
 }
 
-/// Format a stack offset for display (e.g., -8 -> "-8", 0 -> "")
+/// Format a stack offset for AT&T memory operands (e.g., -8 -> "-8", 0 -> "", 48 -> "48")
 fn fmt_offset(offset: i64) -> String {
     if offset == 0 {
         String::new()
-    } else if offset > 0 {
-        format!("+{}", offset)
     } else {
-        format!("-{}", -offset)
+        format!("{}", offset)
     }
 }
 
-/// Format a hex value for MASM (uses h suffix, leading 0 if starts with a-f)
+/// Format a hex value (unused on Linux but kept for compatibility)
 fn fmt_hex(val: u32) -> String {
-    let s = format!("{:x}", val);
-    if s.starts_with(|c: char| c.is_ascii_digit()) {
-        format!("{}h", s)
-    } else {
-        format!("0{}h", s)
-    }
+    format!("0x{:x}", val)
 }
 
 /// Escape a string for assembly output
@@ -1447,11 +1383,11 @@ fn escape_string(s: &str) -> String {
     result
 }
 
-/// Mangle function names to avoid conflicts with x86 mnemonisms and MASM reserved words.
-/// "main" and names starting with "__pledge" are kept as-is.
+/// Mangle function names to avoid conflicts with x86 mnemonics and GAS reserved words.
+/// "main", "_start", and names starting with "__pledge" or "p_" are kept as-is.
 fn mangle_name(name: &str) -> String {
-    // Don't mangle main or runtime stubs
-    if name == "main" || name.starts_with("__pledge") {
+    // Don't mangle main, _start, or runtime stubs
+    if name == "main" || name == "_start" || name.starts_with("__pledge") || name.starts_with("p_") {
         return name.to_string();
     }
     // x86 instruction mnemonics that could conflict

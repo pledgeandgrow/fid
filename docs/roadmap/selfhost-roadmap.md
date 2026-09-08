@@ -3,7 +3,28 @@
 > **Goal:** The Fides compiler compiles itself, producing identical output
 > across generations (bootstrap fixpoint).
 >
-> **Last updated:** Sep 6, 2026 (session 16 — Tier 3 OS features added to self-hosted compiler: @cpu_local, inline asm clobbers, --no-std, cross-compilation dispatch, UEFI bindings)
+> **Last updated:** Sep 7, 2026 (session 18 — ELF64 encoder + interpreter port; critical blockers documented)
+
+---
+
+## Critical Blockers for Self-Hosted Compiler (Sep 7, 2026)
+
+> Full details in `docs/roadmap/roadmap-issues.md` → "Critical Blockers" section.
+
+Two of the four critical blockers are specific to the self-hosted compiler:
+
+1. **CB1: Safety annotations not enforced.** `compiler/typechecker.fd` has
+   stubs (`// stub (no enforcement)`) for `@medical`, `@conserve`, `@gas`,
+   `@dp`, `@shard`, `@constant_time`, `@realtime`, `@tainted`,
+   `@differentiable`, `@quantized`, `@checkpoint`, `@adapter`. Only
+   `@deterministic` has partial enforcement. The Rust bootstrap
+   (`src/typechecker.rs`) has real enforcement. **Fix:** Port enforcement
+   logic from Rust to Fides.
+
+2. **CB4: Parser debug prints + recovery hardening.** `compiler/parser.fd`
+   has error recovery (`recover_to_sync_token`) but also has debug prints
+   (`print("DBG: parse loop done\n")` etc.) that must be removed. Recovery
+   strategies need auditing for parity with `src/parser.rs`.
 
 ---
 

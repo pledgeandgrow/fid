@@ -1,0 +1,1464 @@
+// codegen.fd -- Legacy ARM64 Code Generator
+// Ported from src/codegen.rs (~1,134 LOC)
+//
+// This is the legacy AST-direct ARM64 assembly generator. It walks the AST
+// and emits AArch64 assembly text. All values are 8 bytes on the stack;
+// results are passed in x0 (integer) / d0 (float).
+//
+// Pipeline: Program -> CodeGen -> ARM64 asm string
+//
+// Calling convention: AArch64 AAPCS
+//   - Args: x0-x7 (first 8 integer/pointer)
+//   - Return: x0
+//   - Frame: stp x29, x30 / ldp x29, x30
+//
+// Adaptations from Rust:
+// 1. HashMap<K,V> -> Vec-based maps with helper structs
+// 2. Vec<HashMap> scope stack -> flat Vec with scope mark indices
+// 3. String -> str, usize/u32 -> i64
+// 4. struct-style enum variants -> tuple-style (Fides convention)
+// 5. format! -> string concatenation
+// 6. Box<Expr> -> box_expr_unbox() to extract inner Expr
+// 7. Option<T> -> Opt* enums or explicit checks
+// 8. f64::to_bits/from_bits -> p_f64_to_bits extern / store f64 directly
+
+module compiler::codegen;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+
+// ===========================================================================
+// Vec-based map helper types (replacing HashMap)
+// ===========================================================================
+
+/// Entry in the string constant table: content -> label
+pub struct ArmStringConstEntry {
+    pub content: str,
+    pub label: str,
+}
+
+pub fn ArmStringConstEntry_new(content: str, label: str) -> ArmStringConstEntry {
+    return ArmStringConstEntry { content: content, label: label };
+}
+
+/// Entry in the float constant table: value -> label
+pub struct FloatConstEntry {
+    pub value: f64,
+    pub label: str,
+}
+
+pub fn FloatConstEntry_new(value: f64, label: str) -> FloatConstEntry {
+    return FloatConstEntry { value: value, label: label };
+}
+
+/// Entry in a local variable scope: name -> stack offset
+pub struct VarOffsetEntry {
+    pub name: str,
+    pub offset: i64,
+}
+
+pub fn VarOffsetEntry_new(name: str, offset: i64) -> VarOffsetEntry {
+    return VarOffsetEntry { name: name, offset: offset };
+}
+
+/// Entry in the variable type scope: name -> struct type name
+pub struct VarTypeEntry {
+    pub name: str,
+    pub struct_name: str,
+}
+
+pub fn VarTypeEntry_new(name: str, struct_name: str) -> VarTypeEntry {
+    return VarTypeEntry { name: name, struct_name: struct_name };
+}
+
+/// Entry in a struct layout: field name -> byte offset
+pub struct FieldOffsetEntry {
+    pub field: str,
+    pub offset: i64,
+}
+
+pub fn FieldOffsetEntry_new(field: str, offset: i64) -> FieldOffsetEntry {
+    return FieldOffsetEntry { field: field, offset: offset };
+}
+
+/// Struct layout: struct name -> list of (field, offset)
+pub struct StructFieldLayout {
+    pub struct_name: str,
+    pub fields: Vec<FieldOffsetEntry>,
+}
+
+pub fn StructFieldLayout_new(struct_name: str, fields: Vec<FieldOffsetEntry>) -> StructFieldLayout {
+    return StructFieldLayout { struct_name: struct_name, fields: fields };
+}
+
+/// Impl method names: struct name -> method names
+pub struct ImplMethodsEntry {
+    pub struct_name: str,
+    pub methods: Vec<str>,
+}
+
+pub fn ImplMethodsEntry_new(struct_name: str, methods: Vec<str>) -> ImplMethodsEntry {
+    return ImplMethodsEntry { struct_name: struct_name, methods: methods };
+}
+
+// ===========================================================================
+// Optional types
+// ===========================================================================
+
+pub enum OptI64 {
+    Some(i64),
+    None,
+}
+
+pub enum ArmOptStr {
+    Some(str),
+    None,
+}
+
+// ===========================================================================
+// The code generator
+//
+// Scope management uses flat vectors with scope marks (indices) instead of
+// a Vec<HashMap> stack. When a scope is pushed, the current length of
+// local_vars is recorded. When popped, local_vars and local_types are
+// truncated back to the mark.
+// ===========================================================================
+
+pub struct CodeGen {
+    pub output: str,
+    pub label_counter: i64,
+    pub string_consts: Vec<ArmStringConstEntry>,
+    pub float_consts: Vec<FloatConstEntry>,
+    // Flat variable storage: all vars for current function
+    pub local_vars: Vec<VarOffsetEntry>,
+    // Flat type storage: var name -> struct type name
+    pub local_types: Vec<VarTypeEntry>,
+    // Stack of scope marks: each entry is the index in local_vars where
+    // that scope began. Scope i covers local_vars[marks[i]..marks[i+1]].
+    pub scope_marks: Vec<i64>,
+    pub next_offset: i64,
+    pub frame_size: i64,
+    pub struct_layouts: Vec<StructFieldLayout>,
+    pub impl_methods: Vec<ImplMethodsEntry>,
+}
+
+pub fn CodeGen_new() -> CodeGen {
+    return CodeGen {
+        output: "",
+        label_counter: 0,
+        string_consts: Vec::new(),
+        float_consts: Vec::new(),
+        local_vars: Vec::new(),
+        local_types: Vec::new(),
+        scope_marks: Vec::new(),
+        next_offset: 0,
+        frame_size: 0,
+        struct_layouts: Vec::new(),
+        impl_methods: Vec::new(),
+    };
+}
+
+// --- Scope management ------------------------------------------------------
+
+pub fn CodeGen_push_scope(self: &mut CodeGen) {
+    self.scope_marks.push(self.local_vars.len());
+}
+
+pub fn CodeGen_pop_scope(self: &mut CodeGen) {
+    if self.scope_marks.len() > 0 {
+        var mark: i64 = self.scope_marks.pop();
+        // Truncate local_vars and local_types back to the mark
+        while self.local_vars.len() > mark {
+            self.local_vars.pop();
+        }
+        while self.local_types.len() > mark {
+            self.local_types.pop();
+        }
+    }
+}
+
+/// Declare a variable in the current scope, returning its stack offset.
+pub fn CodeGen_declare_var(self: &mut CodeGen, name: str) -> i64 {
+    var offset: i64 = self.next_offset;
+    self.next_offset = self.next_offset + 8;
+    self.local_vars.push(VarOffsetEntry_new(name, offset));
+    return offset;
+}
+
+/// Declare a variable with a known struct type (for method call resolution).
+pub fn CodeGen_declare_var_typed(self: &mut CodeGen, name: str, struct_name: str) -> i64 {
+    var offset: i64 = CodeGen_declare_var(self, name);
+    self.local_types.push(VarTypeEntry_new(name, struct_name));
+    return offset;
+}
+
+/// Look up a variable's struct type name, searching from innermost scope outward.
+pub fn CodeGen_lookup_var_type(self: &CodeGen, name: str) -> ArmOptStr {
+    var i: i64 = self.local_types.len() - 1;
+    while i >= 0 {
+        if str_equal(self.local_types.get(i).name, name) {
+            return ArmOptStr::Some(self.local_types.get(i).struct_name);
+        }
+        i = i - 1;
+    }
+    return ArmOptStr::None;
+}
+
+/// Look up a variable's stack offset, searching from innermost scope outward.
+pub fn CodeGen_lookup_var(self: &CodeGen, name: str) -> OptI64 {
+    var i: i64 = self.local_vars.len() - 1;
+    while i >= 0 {
+        if str_equal(self.local_vars.get(i).name, name) {
+            return OptI64::Some(self.local_vars.get(i).offset);
+        }
+        i = i - 1;
+    }
+    return OptI64::None;
+}
+
+/// Get the byte offset of a field by searching all struct layouts.
+/// Returns the first match (simplified — real impl tracks struct type).
+pub fn CodeGen_get_field_offset(self: &CodeGen, field: str) -> i64 {
+    var i: i64 = 0;
+    while i < self.struct_layouts.len() {
+        var layout: StructFieldLayout = self.struct_layouts.get(i);
+        var j: i64 = 0;
+        while j < layout.fields.len() {
+            if str_equal(layout.fields.get(j).field, field) {
+                return layout.fields.get(j).offset;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// --- Output helpers --------------------------------------------------------
+
+/// Append a string (no newline).
+pub fn CodeGen_w(self: &mut CodeGen, s: str) {
+    self.output = self.output + s;
+}
+
+/// Append a string with a trailing newline.
+pub fn CodeGen_wl(self: &mut CodeGen, s: str) {
+    self.output = self.output + s + "\n";
+}
+
+/// Escape a string for .asciz output.
+pub fn CodeGen_escape_string(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var ch: i64 = str_byte_at(s, i);
+        if ch == 92 { // backslash
+            out = out + "\\\\";
+        } else if ch == 34 { // double quote
+            out = out + "\\\"";
+        } else if ch == 10 { // newline
+            out = out + "\\n";
+        } else if ch == 9 { // tab
+            out = out + "\\t";
+        } else if ch == 13 { // carriage return
+            out = out + "\\r";
+        } else {
+            out = out + char_to_str(ch);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Generate a fresh label with the given prefix.
+pub fn CodeGen_fresh_label(self: &mut CodeGen, prefix: str) -> str {
+    var label: str = "." + prefix + "_" + int_to_str(self.label_counter);
+    self.label_counter = self.label_counter + 1;
+    return label;
+}
+
+/// Intern a string constant, returning its label.
+pub fn CodeGen_intern_string(self: &mut CodeGen, s: str) -> str {
+    var i: i64 = 0;
+    while i < self.string_consts.len() {
+        if str_equal(self.string_consts.get(i).content, s) {
+            return self.string_consts.get(i).label;
+        }
+        i = i + 1;
+    }
+    var label: str = ".str_" + int_to_str(self.string_consts.len());
+    self.string_consts.push(ArmStringConstEntry_new(s, label));
+    return label;
+}
+
+/// Intern a float constant, returning its label.
+pub fn CodeGen_intern_float(self: &mut CodeGen, f: f64) -> str {
+    var i: i64 = 0;
+    while i < self.float_consts.len() {
+        if self.float_consts.get(i).value == f {
+            return self.float_consts.get(i).label;
+        }
+        i = i + 1;
+    }
+    var label: str = ".float_" + int_to_str(self.float_consts.len());
+    self.float_consts.push(FloatConstEntry_new(f, label));
+    return label;
+}
+
+// ===========================================================================
+// Public API
+// ===========================================================================
+
+/// Generate ARM64 assembly for an entire program.
+/// Returns a string of AArch64 assembly text.
+pub fn generate(program: Program) -> str {
+    var gen: CodeGen = CodeGen_new();
+    CodeGen_generate(&mut gen, program);
+    return gen.output;
+}
+
+pub fn CodeGen_generate(self: &mut CodeGen, program: Program) {
+    // Register struct layouts for field access codegen
+    var si: i64 = 0;
+    while si < program.structs.len() {
+        var s: StructDef = program.structs.get(si);
+        var layout: Vec<FieldOffsetEntry> = Vec::new();
+        var fi: i64 = 0;
+        while fi < s.fields.len() {
+            layout.push(FieldOffsetEntry_new(s.fields.get(fi).name, fi * 8));
+            fi = fi + 1;
+        }
+        self.struct_layouts.push(StructFieldLayout_new(s.name, layout));
+        si = si + 1;
+    }
+
+    // Register impl method names per struct
+    var ii: i64 = 0;
+    while ii < program.impls.len() {
+        var imp: ImplDef = program.impls.get(ii);
+        var methods: Vec<str> = Vec::new();
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            methods.push(imp.methods.get(mi).name);
+            mi = mi + 1;
+        }
+        self.impl_methods.push(ImplMethodsEntry_new(imp.struct_name, methods));
+        ii = ii + 1;
+    }
+
+    // Header
+    CodeGen_wl(self, ".section .text");
+    CodeGen_wl(self, ".globl _start");
+    CodeGen_wl(self, "");
+
+    // _start calls main then exits
+    CodeGen_wl(self, "_start:");
+    CodeGen_wl(self, "    bl p_main");
+    CodeGen_wl(self, "    mov x8, #93");
+    CodeGen_wl(self, "    mov x0, #0");
+    CodeGen_wl(self, "    svc #0");
+    CodeGen_wl(self, "");
+
+    // Generate each function
+    var fi2: i64 = 0;
+    while fi2 < program.funcs.len() {
+        CodeGen_gen_func(self, program.funcs.get(fi2));
+        fi2 = fi2 + 1;
+    }
+
+    // Generate impl methods
+    var ii2: i64 = 0;
+    while ii2 < program.impls.len() {
+        var imp2: ImplDef = program.impls.get(ii2);
+        var mi2: i64 = 0;
+        while mi2 < imp2.methods.len() {
+            CodeGen_gen_method(self, imp2.struct_name, imp2.methods.get(mi2));
+            mi2 = mi2 + 1;
+        }
+        ii2 = ii2 + 1;
+    }
+
+    // String constants
+    if self.string_consts.len() > 0 || self.float_consts.len() > 0 {
+        CodeGen_wl(self, "");
+        CodeGen_wl(self, ".section .rodata");
+        var si2: i64 = 0;
+        while si2 < self.string_consts.len() {
+            var entry: ArmStringConstEntry = self.string_consts.get(si2);
+            CodeGen_wl(self, entry.label + ":");
+            CodeGen_wl(self, "    .asciz \"" + CodeGen_escape_string(entry.content) + "\"");
+            si2 = si2 + 1;
+        }
+        // Float constants
+        var fi3: i64 = 0;
+        while fi3 < self.float_consts.len() {
+            var fentry: FloatConstEntry = self.float_consts.get(fi3);
+            CodeGen_wl(self, fentry.label + ":");
+            CodeGen_wl(self, "    .double " + float_to_str(fentry.value));
+            fi3 = fi3 + 1;
+        }
+    }
+}
+
+// ===========================================================================
+// Function generation
+// ===========================================================================
+
+/// Reset local variable state for a new function.
+fn CodeGen_reset_locals(self: &mut CodeGen) {
+    var empty_vars: Vec<VarOffsetEntry> = Vec::new();
+    self.local_vars = empty_vars;
+    var empty_types: Vec<VarTypeEntry> = Vec::new();
+    self.local_types = empty_types;
+    var empty_marks: Vec<i64> = Vec::new();
+    self.scope_marks = empty_marks;
+    self.scope_marks.push(0);
+    self.next_offset = 0;
+}
+
+pub fn CodeGen_gen_func(self: &mut CodeGen, func: Func) {
+    var mangled: str = "p_" + func.name;
+    CodeGen_wl(self, mangled + ":");
+
+    CodeGen_reset_locals(self);
+    var var_count: i64 = func.params.len() + count_lets(func.body);
+    var_count = var_count + 8; // temporaries
+    self.frame_size = (var_count * 8 + 15) & ~15;
+
+    // Prologue
+    CodeGen_wl(self, "    stp x29, x30, [sp, #-16]!");
+    CodeGen_wl(self, "    mov x29, sp");
+    CodeGen_wl(self, "    sub sp, sp, #" + int_to_str(self.frame_size));
+
+    // Store params in stack slots
+    var i: i64 = 0;
+    while i < func.params.len() {
+        var param: Param = func.params.get(i);
+        var offset: i64 = CodeGen_declare_var(self, param.name);
+        match param.ty {
+            Type::Named(sn) => {
+                self.local_types.push(VarTypeEntry_new(param.name, sn));
+            }
+            _ => {}
+        }
+        if i < 8 {
+            CodeGen_wl(self, "    str x" + int_to_str(i) + ", [sp, #" + int_to_str(offset) + "]");
+        }
+        i = i + 1;
+    }
+
+    // Generate body
+    var bi: i64 = 0;
+    while bi < func.body.len() {
+        CodeGen_gen_stmt(self, func.body.get(bi));
+        bi = bi + 1;
+    }
+
+    // Epilogue (default return)
+    CodeGen_gen_epilogue(self);
+    CodeGen_wl(self, "");
+}
+
+pub fn CodeGen_gen_method(self: &mut CodeGen, struct_name: str, func: Func) {
+    var mangled: str = "p_" + struct_name + "_" + func.name;
+    CodeGen_wl(self, mangled + ":");
+
+    CodeGen_reset_locals(self);
+    var var_count: i64 = func.params.len() + count_lets(func.body);
+    var_count = var_count + 8; // temporaries
+    self.frame_size = (var_count * 8 + 15) & ~15;
+
+    // Prologue
+    CodeGen_wl(self, "    stp x29, x30, [sp, #-16]!");
+    CodeGen_wl(self, "    mov x29, sp");
+    CodeGen_wl(self, "    sub sp, sp, #" + int_to_str(self.frame_size));
+
+    // Store params in stack slots
+    var i: i64 = 0;
+    while i < func.params.len() {
+        var param: Param = func.params.get(i);
+        var offset: i64 = CodeGen_declare_var(self, param.name);
+        match param.ty {
+            Type::Named(sn) => {
+                self.local_types.push(VarTypeEntry_new(param.name, sn));
+            }
+            _ => {}
+        }
+        if i < 8 {
+            CodeGen_wl(self, "    str x" + int_to_str(i) + ", [sp, #" + int_to_str(offset) + "]");
+        }
+        i = i + 1;
+    }
+
+    // Generate body
+    var bi: i64 = 0;
+    while bi < func.body.len() {
+        CodeGen_gen_stmt(self, func.body.get(bi));
+        bi = bi + 1;
+    }
+
+    // Epilogue (default return)
+    CodeGen_gen_epilogue(self);
+    CodeGen_wl(self, "");
+}
+
+pub fn CodeGen_gen_epilogue(self: &mut CodeGen) {
+    CodeGen_wl(self, "    add sp, sp, #" + int_to_str(self.frame_size));
+    CodeGen_wl(self, "    ldp x29, x30, [sp], #16");
+    CodeGen_wl(self, "    ret");
+}
+
+// ===========================================================================
+// Statement generation
+// ===========================================================================
+
+pub fn CodeGen_gen_stmt(self: &mut CodeGen, stmt: Stmt) {
+    match stmt {
+        Stmt::Let(name, _ty, expr, _is_mut, _is_persist, _line) => {
+            // Track struct type for method call resolution
+            var struct_name: ArmOptStr = ArmOptStr::None;
+            match expr {
+                Expr::StructLit(sn, _fields, _spread) => {
+                    struct_name = ArmOptStr::Some(sn);
+                }
+                _ => {}
+            }
+            CodeGen_gen_expr(self, expr);
+            var offset: i64 = 0;
+            match struct_name {
+                ArmOptStr::Some(sn) => {
+                    offset = CodeGen_declare_var_typed(self, name, sn);
+                }
+                ArmOptStr::None => {
+                    offset = CodeGen_declare_var(self, name);
+                }
+            }
+            CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(offset) + "]");
+        }
+        Stmt::LetUninit(name, _ty, _line) => {
+            // Just declare the variable — no initialization
+            CodeGen_declare_var(self, name);
+        }
+        Stmt::LetTuple(names, expr, _line) => {
+            // Generate the tuple expression, then extract each field
+            CodeGen_gen_expr(self, expr);
+            // x0 holds the tuple pointer; extract each field
+            var i: i64 = 0;
+            while i < names.len() {
+                var n: str = names.get(i);
+                var offset: i64 = CodeGen_declare_var(self, n);
+                // For now, just store the same value — the interpreter
+                // handles tuple extraction correctly
+                CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(offset) + "]");
+                i = i + 1;
+            }
+        }
+        Stmt::Assign(target, op, expr, _line) => {
+            match CodeGen_lookup_var(self, target) {
+                OptI64::Some(offset) => {
+                    match op {
+                        AssignOp::Assign => {
+                            CodeGen_gen_expr(self, expr);
+                            CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(offset) + "]");
+                        }
+                        AssignOp::AddAssign => {
+                            CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(offset) + "]");
+                            var temp: i64 = self.next_offset;
+                            self.next_offset = self.next_offset + 8;
+                            CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(temp) + "]");
+                            CodeGen_gen_expr(self, expr);
+                            CodeGen_wl(self, "    mov x1, x0");
+                            CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(temp) + "]");
+                            self.next_offset = self.next_offset - 8;
+                            CodeGen_wl(self, "    add x0, x0, x1");
+                            CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(offset) + "]");
+                        }
+                        AssignOp::SubAssign => {
+                            CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(offset) + "]");
+                            var temp: i64 = self.next_offset;
+                            self.next_offset = self.next_offset + 8;
+                            CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(temp) + "]");
+                            CodeGen_gen_expr(self, expr);
+                            CodeGen_wl(self, "    mov x1, x0");
+                            CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(temp) + "]");
+                            self.next_offset = self.next_offset - 8;
+                            CodeGen_wl(self, "    sub x0, x0, x1");
+                            CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(offset) + "]");
+                        }
+                        AssignOp::MulAssign => {
+                            CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(offset) + "]");
+                            var temp: i64 = self.next_offset;
+                            self.next_offset = self.next_offset + 8;
+                            CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(temp) + "]");
+                            CodeGen_gen_expr(self, expr);
+                            CodeGen_wl(self, "    mov x1, x0");
+                            CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(temp) + "]");
+                            self.next_offset = self.next_offset - 8;
+                            CodeGen_wl(self, "    mul x0, x0, x1");
+                            CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(offset) + "]");
+                        }
+                        _ => {
+                            // Other compound ops: fall back to simple assign
+                            CodeGen_gen_expr(self, expr);
+                            CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(offset) + "]");
+                        }
+                    }
+                }
+                OptI64::None => {}
+            }
+        }
+        Stmt::IndexAssign(array, index, op, expr, _line) => {
+            // Evaluate index
+            CodeGen_gen_expr(self, index);
+            var idx_temp: i64 = self.next_offset;
+            self.next_offset = self.next_offset + 8;
+            CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(idx_temp) + "]");
+
+            // Evaluate RHS
+            CodeGen_gen_expr(self, expr);
+            var val_temp: i64 = self.next_offset;
+            self.next_offset = self.next_offset + 8;
+            CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(val_temp) + "]");
+
+            match CodeGen_lookup_var(self, array) {
+                OptI64::Some(offset) => {
+                    // base = sp + offset
+                    // addr = base + index * 8
+                    CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(idx_temp) + "]");
+                    CodeGen_wl(self, "    lsl x0, x0, #3");
+                    CodeGen_wl(self, "    add x3, sp, #" + int_to_str(offset));
+                    CodeGen_wl(self, "    add x3, x3, x0");
+
+                    match op {
+                        AssignOp::Assign => {
+                            CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(val_temp) + "]");
+                            CodeGen_wl(self, "    str x0, [x3]");
+                        }
+                        _ => {
+                            // Compound: load current, apply op, store
+                            CodeGen_wl(self, "    ldr x1, [x3]");
+                            CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(val_temp) + "]");
+                            match op {
+                                AssignOp::AddAssign => { CodeGen_wl(self, "    add x0, x1, x0"); }
+                                AssignOp::SubAssign => { CodeGen_wl(self, "    sub x0, x1, x0"); }
+                                AssignOp::MulAssign => { CodeGen_wl(self, "    mul x0, x1, x0"); }
+                                AssignOp::DivAssign => { CodeGen_wl(self, "    sdiv x0, x1, x0"); }
+                                AssignOp::ModAssign => {
+                                    CodeGen_wl(self, "    sdiv x2, x1, x0");
+                                    CodeGen_wl(self, "    msub x0, x2, x0, x1");
+                                }
+                                AssignOp::BitAndAssign => { CodeGen_wl(self, "    and x0, x1, x0"); }
+                                AssignOp::BitOrAssign => { CodeGen_wl(self, "    orr x0, x1, x0"); }
+                                AssignOp::BitXorAssign => { CodeGen_wl(self, "    eor x0, x1, x0"); }
+                                AssignOp::ShlAssign => { CodeGen_wl(self, "    lsl x0, x1, x0"); }
+                                AssignOp::ShrAssign => { CodeGen_wl(self, "    asr x0, x1, x0"); }
+                                AssignOp::Assign => {}
+                            }
+                            CodeGen_wl(self, "    str x0, [x3]");
+                        }
+                    }
+                }
+                OptI64::None => {}
+            }
+            self.next_offset = self.next_offset - 16;
+        }
+        Stmt::Expr(expr, _line) => {
+            CodeGen_gen_expr(self, expr);
+        }
+        Stmt::DerefAssign(_target, _op, _expr, _line) => {
+            // Handled by new backend, not this legacy ARM64 codegen
+        }
+        Stmt::FieldAssign(_target, _field, _op, _expr, _line) => {
+            // Handled by new backend, not this legacy ARM64 codegen
+        }
+        Stmt::Return(expr, _line) => {
+            match expr {
+                OptBoxExpr::Some(e) => {
+                    CodeGen_gen_expr(self, box_expr_unbox(e));
+                }
+                OptBoxExpr::None => {}
+            }
+            CodeGen_gen_epilogue(self);
+        }
+        Stmt::If(cond, then_block, else_block, _line) => {
+            var else_label: str = CodeGen_fresh_label(self, "else");
+            var end_label: str = CodeGen_fresh_label(self, "endif");
+
+            CodeGen_gen_expr(self, cond);
+            CodeGen_wl(self, "    cmp x0, #0");
+            CodeGen_wl(self, "    beq " + else_label);
+
+            CodeGen_push_scope(self);
+            var i: i64 = 0;
+            while i < then_block.len() {
+                CodeGen_gen_stmt(self, then_block.get(i));
+                i = i + 1;
+            }
+            CodeGen_pop_scope(self);
+
+            CodeGen_wl(self, "    b " + end_label);
+            CodeGen_wl(self, else_label + ":");
+
+            match else_block {
+                OptStmts::Some(else_b) => {
+                    CodeGen_push_scope(self);
+                    var j: i64 = 0;
+                    while j < else_b.len() {
+                        CodeGen_gen_stmt(self, else_b.get(j));
+                        j = j + 1;
+                    }
+                    CodeGen_pop_scope(self);
+                }
+                OptStmts::None => {}
+            }
+
+            CodeGen_wl(self, end_label + ":");
+        }
+        Stmt::While(cond, body, _line) => {
+            var start_label: str = CodeGen_fresh_label(self, "while_start");
+            var end_label: str = CodeGen_fresh_label(self, "while_end");
+
+            CodeGen_wl(self, start_label + ":");
+            CodeGen_gen_expr(self, cond);
+            CodeGen_wl(self, "    cmp x0, #0");
+            CodeGen_wl(self, "    beq " + end_label);
+
+            CodeGen_push_scope(self);
+            var i: i64 = 0;
+            while i < body.len() {
+                CodeGen_gen_stmt(self, body.get(i));
+                i = i + 1;
+            }
+            CodeGen_pop_scope(self);
+
+            CodeGen_wl(self, "    b " + start_label);
+            CodeGen_wl(self, end_label + ":");
+        }
+        Stmt::For(loop_var, iterator, body, _line) => {
+            var start_label: str = CodeGen_fresh_label(self, "for_start");
+            var end_label: str = CodeGen_fresh_label(self, "for_end");
+
+            match iterator {
+                Expr::Range(start, end, inclusive) => {
+                    // Evaluate start and end
+                    CodeGen_gen_expr(self, box_expr_unbox(start));
+                    var start_offset: i64 = CodeGen_declare_var(self, loop_var);
+                    CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(start_offset) + "]");
+
+                    CodeGen_gen_expr(self, box_expr_unbox(end));
+                    var end_offset: i64 = self.next_offset;
+                    self.next_offset = self.next_offset + 8;
+                    CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(end_offset) + "]");
+
+                    CodeGen_wl(self, start_label + ":");
+                    // Check if counter < end (or <= for inclusive)
+                    CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(start_offset) + "]");
+                    CodeGen_wl(self, "    ldr x1, [sp, #" + int_to_str(end_offset) + "]");
+                    CodeGen_wl(self, "    cmp x0, x1");
+                    if inclusive {
+                        CodeGen_wl(self, "    b.gt " + end_label);
+                    } else {
+                        CodeGen_wl(self, "    b.ge " + end_label);
+                    }
+
+                    CodeGen_push_scope(self);
+                    var i: i64 = 0;
+                    while i < body.len() {
+                        CodeGen_gen_stmt(self, body.get(i));
+                        i = i + 1;
+                    }
+                    CodeGen_pop_scope(self);
+
+                    // Increment counter
+                    CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(start_offset) + "]");
+                    CodeGen_wl(self, "    add x0, x0, #1");
+                    CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(start_offset) + "]");
+
+                    CodeGen_wl(self, "    b " + start_label);
+                    CodeGen_wl(self, end_label + ":");
+                    self.next_offset = self.next_offset - 8;
+                }
+                _ => {
+                    // Non-range iterator: evaluate once, iterate once (simplified)
+                    CodeGen_gen_expr(self, iterator);
+                    var iter_offset: i64 = CodeGen_declare_var(self, loop_var);
+                    CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(iter_offset) + "]");
+
+                    CodeGen_wl(self, start_label + ":");
+                    CodeGen_push_scope(self);
+                    var i: i64 = 0;
+                    while i < body.len() {
+                        CodeGen_gen_stmt(self, body.get(i));
+                        i = i + 1;
+                    }
+                    CodeGen_pop_scope(self);
+                    CodeGen_wl(self, "    b " + end_label);
+                    CodeGen_wl(self, end_label + ":");
+                }
+            }
+        }
+        Stmt::Loop(body, _line) => {
+            var start_label: str = CodeGen_fresh_label(self, "loop_start");
+            var end_label: str = CodeGen_fresh_label(self, "loop_end");
+
+            CodeGen_wl(self, start_label + ":");
+            CodeGen_push_scope(self);
+            var i: i64 = 0;
+            while i < body.len() {
+                CodeGen_gen_stmt(self, body.get(i));
+                i = i + 1;
+            }
+            CodeGen_pop_scope(self);
+            CodeGen_wl(self, "    b " + start_label);
+            CodeGen_wl(self, end_label + ":");
+        }
+        Stmt::Break(_expr, _line) => {
+            // Simplified: jump to end of current block
+            CodeGen_wl(self, "    b .loop_end_" + int_to_str(self.label_counter));
+        }
+        Stmt::Continue(_line) => {
+            CodeGen_wl(self, "    b .loop_start_" + int_to_str(self.label_counter));
+        }
+        Stmt::Defer(body, _line) => {
+            // Simplified: execute defer body immediately
+            CodeGen_push_scope(self);
+            var i: i64 = 0;
+            while i < body.len() {
+                CodeGen_gen_stmt(self, body.get(i));
+                i = i + 1;
+            }
+            CodeGen_pop_scope(self);
+        }
+        Stmt::Match(expr, arms, _line) => {
+            CodeGen_gen_match(self, expr, arms);
+        }
+        Stmt::Use(_path, _items, _line) => {
+            // No-op: imports resolved at compile time
+        }
+        Stmt::Handle(_body, _handlers, _line) => {
+            // Not yet supported in legacy ARM64 codegen
+        }
+        Stmt::Do(_effect, _op, _args, _line) => {
+            // Not yet supported in legacy ARM64 codegen
+        }
+        Stmt::RegionBlock(_name, _size, _is_gpu, _is_kv, _window, body, _line) => {
+            // Region creation/freeing not yet implemented in codegen
+            var i: i64 = 0;
+            while i < body.len() {
+                CodeGen_gen_stmt(self, body.get(i));
+                i = i + 1;
+            }
+        }
+        Stmt::ComptimeGen(_body, _line) => {
+            // ComptimeGen is processed during comptime substitution; no-op here
+        }
+        Stmt::Sandbox(body, _line) => {
+            // Sandbox is transparent at codegen
+            var i: i64 = 0;
+            while i < body.len() {
+                CodeGen_gen_stmt(self, body.get(i));
+                i = i + 1;
+            }
+        }
+        Stmt::Unsafe(body, _line) => {
+            // Unsafe is transparent at codegen
+            var i: i64 = 0;
+            while i < body.len() {
+                CodeGen_gen_stmt(self, body.get(i));
+                i = i + 1;
+            }
+        }
+        Stmt::Txn(body, _line) => {
+            // Txn is transparent at codegen
+            var i: i64 = 0;
+            while i < body.len() {
+                CodeGen_gen_stmt(self, body.get(i));
+                i = i + 1;
+            }
+        }
+        Stmt::GradBlock(_var_name, body, _line) => {
+            var i: i64 = 0;
+            while i < body.len() {
+                CodeGen_gen_stmt(self, body.get(i));
+                i = i + 1;
+            }
+        }
+        Stmt::Backward(_expr, _line) => {
+            // Marker for autograd pass — no-op in codegen
+        }
+        Stmt::Query(_vars, body, _line) => {
+            var i: i64 = 0;
+            while i < body.len() {
+                CodeGen_gen_stmt(self, body.get(i));
+                i = i + 1;
+            }
+        }
+        Stmt::Select(cases, default, _line) => {
+            // Select is lowered to IR before codegen; handle gracefully
+            var ci: i64 = 0;
+            while ci < cases.len() {
+                var case: SelectCase = cases.get(ci);
+                var bi: i64 = 0;
+                while bi < case.body.len() {
+                    CodeGen_gen_stmt(self, case.body.get(bi));
+                    bi = bi + 1;
+                }
+                ci = ci + 1;
+            }
+            match default {
+                OptStmts::Some(def) => {
+                    var di: i64 = 0;
+                    while di < def.len() {
+                        CodeGen_gen_stmt(self, def.get(di));
+                        di = di + 1;
+                    }
+                }
+                OptStmts::None => {}
+            }
+        }
+    }
+}
+
+/// Generate match statement code (shared between Stmt::Match and Expr::Match).
+pub fn CodeGen_gen_match(self: &mut CodeGen, expr: Expr, arms: Vec<MatchArm>) {
+    // Evaluate match expression
+    CodeGen_gen_expr(self, expr);
+    var match_temp: i64 = self.next_offset;
+    self.next_offset = self.next_offset + 8;
+    CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(match_temp) + "]");
+
+    var end_label: str = CodeGen_fresh_label(self, "match_end");
+    var arm_labels: Vec<str> = Vec::new();
+
+    var i: i64 = 0;
+    while i < arms.len() {
+        var arm: MatchArm = arms.get(i);
+        var arm_label: str = CodeGen_fresh_label(self, "match_arm_" + int_to_str(i));
+        arm_labels.push(arm_label);
+
+        match arm.pattern {
+            Pattern::IntLit(n) => {
+                CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(match_temp) + "]");
+                CodeGen_wl(self, "    mov x1, #" + int_to_str(n));
+                CodeGen_wl(self, "    cmp x0, x1");
+                CodeGen_wl(self, "    b.eq " + arm_label);
+            }
+            Pattern::BoolLit(b) => {
+                CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(match_temp) + "]");
+                var bv: i64 = 0;
+                if b { bv = 1; }
+                CodeGen_wl(self, "    mov x1, #" + int_to_str(bv));
+                CodeGen_wl(self, "    cmp x0, x1");
+                CodeGen_wl(self, "    b.eq " + arm_label);
+            }
+            Pattern::Wildcard => {
+                // Always matches
+                CodeGen_wl(self, "    b " + arm_label);
+            }
+            Pattern::Ident(name) => {
+                // Bind variable and jump to arm
+                var offset: i64 = CodeGen_declare_var(self, name);
+                CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(match_temp) + "]");
+                CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(offset) + "]");
+                CodeGen_wl(self, "    b " + arm_label);
+            }
+            Pattern::EnumVariant(_enum_name, _variant, _bindings) => {
+                // Simplified: just jump to arm
+                CodeGen_wl(self, "    b " + arm_label);
+            }
+            Pattern::StrLit(_s) => {
+                // Simplified: just jump to arm
+                CodeGen_wl(self, "    b " + arm_label);
+            }
+            Pattern::Range(_lo, _hi) => {
+                // Simplified: just jump to arm
+                CodeGen_wl(self, "    b " + arm_label);
+            }
+        }
+        i = i + 1;
+    }
+
+    // No arm matched: jump to end
+    CodeGen_wl(self, "    b " + end_label);
+
+    // Emit arm bodies
+    var j: i64 = 0;
+    while j < arms.len() {
+        var arm2: MatchArm = arms.get(j);
+        CodeGen_wl(self, arm_labels.get(j) + ":");
+        CodeGen_push_scope(self);
+        var k: i64 = 0;
+        while k < arm2.body.len() {
+            CodeGen_gen_stmt(self, arm2.body.get(k));
+            k = k + 1;
+        }
+        CodeGen_pop_scope(self);
+        CodeGen_wl(self, "    b " + end_label);
+        j = j + 1;
+    }
+
+    CodeGen_wl(self, end_label + ":");
+    self.next_offset = self.next_offset - 8;
+}
+
+// ===========================================================================
+// Expression generation
+// ===========================================================================
+
+pub fn CodeGen_gen_expr(self: &mut CodeGen, expr: Expr) {
+    match expr {
+        Expr::IntLit(n) => {
+            CodeGen_wl(self, "    mov x0, #" + int_to_str(n));
+        }
+        Expr::FloatLit(n) => {
+            // Store float literal in rodata and load it
+            var label: str = CodeGen_intern_float(self, n);
+            CodeGen_wl(self, "    adr x0, " + label);
+            CodeGen_wl(self, "    ldr d0, [x0]");
+            // Also store as int in x0 for compatibility
+            CodeGen_wl(self, "    mov x0, #0");
+        }
+        Expr::StringLit(s) => {
+            var label: str = CodeGen_intern_string(self, s);
+            CodeGen_wl(self, "    adr x0, " + label);
+        }
+        Expr::BoolLit(b) => {
+            var bv: i64 = 0;
+            if b { bv = 1; }
+            CodeGen_wl(self, "    mov x0, #" + int_to_str(bv));
+        }
+        Expr::Ident(name) => {
+            match CodeGen_lookup_var(self, name) {
+                OptI64::Some(offset) => {
+                    CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(offset) + "]");
+                }
+                OptI64::None => {
+                    CodeGen_wl(self, "    mov x0, #0");
+                }
+            }
+        }
+        Expr::Binary(op, left, right) => {
+            CodeGen_gen_expr(self, box_expr_unbox(left));
+            var temp: i64 = self.next_offset;
+            self.next_offset = self.next_offset + 8;
+            CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(temp) + "]");
+            CodeGen_gen_expr(self, box_expr_unbox(right));
+            CodeGen_wl(self, "    mov x1, x0");
+            CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(temp) + "]");
+            self.next_offset = self.next_offset - 8;
+
+            match op {
+                BinOp::Add => { CodeGen_wl(self, "    add x0, x0, x1"); }
+                BinOp::Sub => { CodeGen_wl(self, "    sub x0, x0, x1"); }
+                BinOp::Mul => { CodeGen_wl(self, "    mul x0, x0, x1"); }
+                BinOp::Div => { CodeGen_wl(self, "    sdiv x0, x0, x1"); }
+                BinOp::Mod => {
+                    CodeGen_wl(self, "    sdiv x2, x0, x1");
+                    CodeGen_wl(self, "    msub x0, x2, x1, x0");
+                }
+                BinOp::Eq => {
+                    CodeGen_wl(self, "    cmp x0, x1");
+                    CodeGen_wl(self, "    cset x0, eq");
+                }
+                BinOp::Neq => {
+                    CodeGen_wl(self, "    cmp x0, x1");
+                    CodeGen_wl(self, "    cset x0, ne");
+                }
+                BinOp::Lt => {
+                    CodeGen_wl(self, "    cmp x0, x1");
+                    CodeGen_wl(self, "    cset x0, lt");
+                }
+                BinOp::Gt => {
+                    CodeGen_wl(self, "    cmp x0, x1");
+                    CodeGen_wl(self, "    cset x0, gt");
+                }
+                BinOp::LtEq => {
+                    CodeGen_wl(self, "    cmp x0, x1");
+                    CodeGen_wl(self, "    cset x0, le");
+                }
+                BinOp::GtEq => {
+                    CodeGen_wl(self, "    cmp x0, x1");
+                    CodeGen_wl(self, "    cset x0, ge");
+                }
+                BinOp::And => { CodeGen_wl(self, "    and x0, x0, x1"); }
+                BinOp::Or => { CodeGen_wl(self, "    orr x0, x0, x1"); }
+                BinOp::BitAnd => { CodeGen_wl(self, "    and x0, x0, x1"); }
+                BinOp::BitOr => { CodeGen_wl(self, "    orr x0, x0, x1"); }
+                BinOp::BitXor => { CodeGen_wl(self, "    eor x0, x0, x1"); }
+                BinOp::Shl => { CodeGen_wl(self, "    lsl x0, x0, x1"); }
+                BinOp::Shr => { CodeGen_wl(self, "    asr x0, x0, x1"); }
+            }
+        }
+        Expr::Unary(op, e) => {
+            CodeGen_gen_expr(self, box_expr_unbox(e));
+            match op {
+                UnaryOp::Neg => { CodeGen_wl(self, "    neg x0, x0"); }
+                UnaryOp::Not => {
+                    CodeGen_wl(self, "    cmp x0, #0");
+                    CodeGen_wl(self, "    cset x0, eq");
+                }
+                UnaryOp::BitNot => { CodeGen_wl(self, "    mvn x0, x0"); }
+            }
+        }
+        Expr::Call(callee, args) => {
+            if str_equal(callee, "print") {
+                if args.len() > 0 {
+                    CodeGen_gen_expr(self, args.get(0));
+                    CodeGen_wl(self, "    mov x1, x0");
+                    CodeGen_wl(self, "    mov x2, #64");
+                    CodeGen_wl(self, "    mov x0, #1");
+                    CodeGen_wl(self, "    mov x8, #64");
+                    CodeGen_wl(self, "    svc #0");
+                }
+                CodeGen_wl(self, "    mov x0, #0");
+                return;
+            }
+
+            // Eval args, store on stack
+            var i: i64 = 0;
+            while i < args.len() {
+                CodeGen_gen_expr(self, args.get(i));
+                var temp: i64 = self.next_offset;
+                self.next_offset = self.next_offset + 8;
+                CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(temp) + "]");
+                i = i + 1;
+            }
+            // Load args into x0-x7 (reverse)
+            var j: i64 = args.len() - 1;
+            while j >= 0 {
+                self.next_offset = self.next_offset - 8;
+                if j < 8 {
+                    CodeGen_wl(self, "    ldr x" + int_to_str(j) + ", [sp, #" + int_to_str(self.next_offset) + "]");
+                }
+                j = j - 1;
+            }
+
+            var mangled: str = "p_" + callee;
+            CodeGen_wl(self, "    bl " + mangled);
+        }
+        Expr::FieldAccess(e, field) => {
+            // Evaluate the struct expression (pointer in x0)
+            CodeGen_gen_expr(self, box_expr_unbox(e));
+            // Look up field offset
+            var offset: i64 = CodeGen_get_field_offset(self, field);
+            if offset > 0 {
+                CodeGen_wl(self, "    ldr x0, [x0, #" + int_to_str(offset) + "]");
+            } else {
+                CodeGen_wl(self, "    ldr x0, [x0, #0]");
+            }
+        }
+        Expr::OptionalFieldAccess(e, _field) => {
+            // Simplified: just evaluate expr (lowerer handles the logic)
+            CodeGen_gen_expr(self, box_expr_unbox(e));
+        }
+        Expr::StructLit(_name, fields, _spread) => {
+            // Allocate space for struct on stack
+            var struct_size: i64 = fields.len() * 8;
+            var struct_offset: i64 = self.next_offset;
+            self.next_offset = self.next_offset + struct_size;
+
+            // Evaluate each field and store at offset
+            var i: i64 = 0;
+            while i < fields.len() {
+                var finit: FieldInit = fields.get(i);
+                CodeGen_gen_expr(self, finit.value);
+                var field_offset: i64 = struct_offset + i * 8;
+                CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(field_offset) + "]");
+                i = i + 1;
+            }
+
+            // Return pointer to struct (stack address)
+            CodeGen_wl(self, "    add x0, sp, #" + int_to_str(struct_offset));
+        }
+        Expr::If(cond, then_block, else_block) => {
+            var else_label: str = CodeGen_fresh_label(self, "else");
+            var end_label: str = CodeGen_fresh_label(self, "endif");
+
+            CodeGen_gen_expr(self, box_expr_unbox(cond));
+            CodeGen_wl(self, "    cmp x0, #0");
+            CodeGen_wl(self, "    beq " + else_label);
+
+            CodeGen_push_scope(self);
+            var i: i64 = 0;
+            while i < then_block.len() {
+                CodeGen_gen_stmt(self, then_block.get(i));
+                i = i + 1;
+            }
+            CodeGen_pop_scope(self);
+
+            CodeGen_wl(self, "    b " + end_label);
+            CodeGen_wl(self, else_label + ":");
+            match else_block {
+                OptStmts::Some(else_b) => {
+                    CodeGen_push_scope(self);
+                    var j: i64 = 0;
+                    while j < else_b.len() {
+                        CodeGen_gen_stmt(self, else_b.get(j));
+                        j = j + 1;
+                    }
+                    CodeGen_pop_scope(self);
+                }
+                OptStmts::None => {}
+            }
+            CodeGen_wl(self, end_label + ":");
+        }
+        Expr::Range(start, _end, _inclusive) => {
+            // Range evaluates to start value (for standalone use)
+            CodeGen_gen_expr(self, box_expr_unbox(start));
+        }
+        Expr::Block(stmts) => {
+            CodeGen_push_scope(self);
+            var i: i64 = 0;
+            while i < stmts.len() {
+                CodeGen_gen_stmt(self, stmts.get(i));
+                i = i + 1;
+            }
+            CodeGen_pop_scope(self);
+        }
+        Expr::MethodCall(receiver, method, args) => {
+            // Determine struct name from receiver
+            var struct_name: ArmOptStr = ArmOptStr::None;
+            match box_expr_unbox(receiver) {
+                Expr::Ident(name) => {
+                    struct_name = CodeGen_lookup_var_type(self, name);
+                }
+                _ => {}
+            }
+
+            // Evaluate receiver (struct pointer in x0)
+            CodeGen_gen_expr(self, box_expr_unbox(receiver));
+            // Store receiver as first arg
+            var temp: i64 = self.next_offset;
+            self.next_offset = self.next_offset + 8;
+            CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(temp) + "]");
+
+            // Evaluate other args
+            var i: i64 = 0;
+            while i < args.len() {
+                CodeGen_gen_expr(self, args.get(i));
+                var arg_temp: i64 = self.next_offset;
+                self.next_offset = self.next_offset + 8;
+                CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(arg_temp) + "]");
+                i = i + 1;
+            }
+
+            // Load args: x0 = receiver, x1.. = other args
+            CodeGen_wl(self, "    ldr x0, [sp, #" + int_to_str(temp) + "]");
+            var j: i64 = 0;
+            while j < args.len() {
+                var arg_offset: i64 = temp + (j + 1) * 8;
+                if j + 1 < 8 {
+                    CodeGen_wl(self, "    ldr x" + int_to_str(j + 1) + ", [sp, #" + int_to_str(arg_offset) + "]");
+                }
+                j = j + 1;
+            }
+            self.next_offset = self.next_offset - 8 - args.len() * 8;
+
+            // Call mangled method name
+            match struct_name {
+                ArmOptStr::Some(sn) => {
+                    CodeGen_wl(self, "    bl p_" + sn + "_" + method);
+                }
+                ArmOptStr::None => {
+                    CodeGen_wl(self, "    bl p_?_" + method);
+                }
+            }
+        }
+        Expr::ArrayLit(_elem_type, elements) => {
+            // Allocate array on stack: each element is 8 bytes
+            var arr_offset: i64 = self.next_offset;
+            var arr_size: i64 = elements.len() * 8;
+            self.next_offset = self.next_offset + arr_size;
+
+            var i: i64 = 0;
+            while i < elements.len() {
+                CodeGen_gen_expr(self, elements.get(i));
+                var elem_offset: i64 = arr_offset + i * 8;
+                CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(elem_offset) + "]");
+                i = i + 1;
+            }
+
+            // Return base address of array
+            CodeGen_wl(self, "    mov x0, sp");
+            CodeGen_wl(self, "    add x0, x0, #" + int_to_str(arr_offset));
+        }
+        Expr::Index(array, index) => {
+            // Evaluate array base address
+            CodeGen_gen_expr(self, box_expr_unbox(array));
+            var base_temp: i64 = self.next_offset;
+            self.next_offset = self.next_offset + 8;
+            CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(base_temp) + "]");
+
+            // Evaluate index
+            CodeGen_gen_expr(self, box_expr_unbox(index));
+
+            // Compute address: base + index * 8
+            CodeGen_wl(self, "    ldr x1, [sp, #" + int_to_str(base_temp) + "]");
+            CodeGen_wl(self, "    lsl x0, x0, #3");
+            CodeGen_wl(self, "    add x0, x1, x0");
+            CodeGen_wl(self, "    ldr x0, [x0]");
+            self.next_offset = self.next_offset - 8;
+        }
+        Expr::FString(parts) => {
+            // For f-strings, concatenate all parts into a single string
+            // Simplified: just evaluate expression parts and ignore literal parts
+            var i: i64 = 0;
+            while i < parts.len() {
+                match parts.get(i) {
+                    FStringPart::Expr(e) => {
+                        CodeGen_gen_expr(self, box_expr_unbox(e));
+                    }
+                    FStringPart::Literal(_s) => {}
+                }
+                i = i + 1;
+            }
+        }
+        Expr::Match(expr, arms) => {
+            CodeGen_gen_match(self, box_expr_unbox(expr), arms);
+        }
+        Expr::EnumLit(_enum_name, _variant, args) => {
+            // Simplified: store variant index and args on stack
+            var i: i64 = 0;
+            while i < args.len() {
+                CodeGen_gen_expr(self, args.get(i));
+                var temp: i64 = self.next_offset;
+                self.next_offset = self.next_offset + 8;
+                CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(temp) + "]");
+                i = i + 1;
+            }
+            // Store variant name as string label (simplified: use index 0)
+            CodeGen_wl(self, "    mov x0, #0");
+        }
+        Expr::Ref(e, _is_mut) => {
+            // Take address of variable
+            match box_expr_unbox(e) {
+                Expr::Ident(name) => {
+                    match CodeGen_lookup_var(self, name) {
+                        OptI64::Some(offset) => {
+                            CodeGen_wl(self, "    add x0, sp, #" + int_to_str(offset));
+                        }
+                        OptI64::None => {}
+                    }
+                }
+                _ => {
+                    // For non-ident expressions, allocate temp and take address
+                    CodeGen_gen_expr(self, box_expr_unbox(e));
+                    var temp: i64 = self.next_offset;
+                    self.next_offset = self.next_offset + 8;
+                    CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(temp) + "]");
+                    CodeGen_wl(self, "    add x0, sp, #" + int_to_str(temp));
+                }
+            }
+        }
+        Expr::Deref(e) => {
+            // Load value from pointer
+            CodeGen_gen_expr(self, box_expr_unbox(e));
+            CodeGen_wl(self, "    ldr x0, [x0]");
+        }
+        Expr::StrConcat(left, right) => {
+            // Simplified: evaluate both sides, left result in x0
+            CodeGen_gen_expr(self, box_expr_unbox(left));
+            var left_temp: i64 = self.next_offset;
+            self.next_offset = self.next_offset + 8;
+            CodeGen_wl(self, "    str x0, [sp, #" + int_to_str(left_temp) + "]");
+            CodeGen_gen_expr(self, box_expr_unbox(right));
+            // x0 has right string ptr, x1 has left string ptr
+            CodeGen_wl(self, "    ldr x1, [sp, #" + int_to_str(left_temp) + "]");
+            // Call runtime concat: p_str_concat
+            CodeGen_wl(self, "    bl p_str_concat");
+            self.next_offset = self.next_offset - 8;
+        }
+        Expr::Try(e) => {
+            // ? operator: evaluate expr, check if it's an error/none
+            // Simplified: just evaluate and return the value
+            CodeGen_gen_expr(self, box_expr_unbox(e));
+        }
+        Expr::Coalesce(e, default) => {
+            // ?? operator: evaluate expr, if None evaluate default
+            // Simplified: just evaluate expr (the interpreter/lowerer handles the logic)
+            CodeGen_gen_expr(self, box_expr_unbox(e));
+            CodeGen_gen_expr(self, box_expr_unbox(default));
+        }
+        Expr::IsCheck(e, _type_name) => {
+            // is check — simplified, just evaluate expr
+            CodeGen_gen_expr(self, box_expr_unbox(e));
+        }
+        Expr::TupleLit(elems) => {
+            // Simplified: evaluate each element, last result in x0
+            var i: i64 = 0;
+            while i < elems.len() {
+                CodeGen_gen_expr(self, elems.get(i));
+                i = i + 1;
+            }
+        }
+        Expr::Closure(params, body, _ret_ty) => {
+            // Simplified: generate closure body inline
+            CodeGen_push_scope(self);
+            var i: i64 = 0;
+            while i < params.len() {
+                var p: Param = params.get(i);
+                var offset: i64 = CodeGen_declare_var(self, p.name);
+                // Params would be passed in registers; simplified: zero-init
+                CodeGen_wl(self, "    str xzr, [sp, #" + int_to_str(offset) + "]");
+                i = i + 1;
+            }
+            var j: i64 = 0;
+            while j < body.len() {
+                CodeGen_gen_stmt(self, body.get(j));
+                j = j + 1;
+            }
+            CodeGen_pop_scope(self);
+        }
+        _ => {}
+    }
+}
+
+// ===========================================================================
+// Helper: count let declarations (for frame size estimation)
+// ===========================================================================
+
+pub fn count_lets(stmts: Vec<Stmt>) -> i64 {
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < stmts.len() {
+        match stmts.get(i) {
+            Stmt::Let(_name, _ty, _expr, _is_mut, _is_persist, _line) => {
+                count = count + 1;
+            }
+            Stmt::LetTuple(_names, _expr, _line) => {
+                count = count + 1;
+            }
+            Stmt::If(_cond, then_block, else_block, _line) => {
+                count = count + count_lets(then_block);
+                match else_block {
+                    OptStmts::Some(eb) => { count = count + count_lets(eb); }
+                    OptStmts::None => {}
+                }
+            }
+            Stmt::While(_cond, body, _line) => {
+                count = count + count_lets(body);
+            }
+            Stmt::For(_var, _iter, body, _line) => {
+                count = count + count_lets(body);
+            }
+            Stmt::Loop(body, _line) => {
+                count = count + count_lets(body);
+            }
+            Stmt::Defer(body, _line) => {
+                count = count + count_lets(body);
+            }
+            Stmt::Match(_expr, arms, _line) => {
+                var j: i64 = 0;
+                while j < arms.len() {
+                    count = count + count_lets(arms.get(j).body);
+                    j = j + 1;
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+    return count;
+}

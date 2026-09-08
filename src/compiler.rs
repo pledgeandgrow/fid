@@ -13,6 +13,8 @@ use crate::typechecker::TypeChecker;
 use crate::x86;
 use crate::pe;
 use crate::pir;
+use crate::elf64;
+use crate::linker;
 use crate::ir::{Effect, IrModule, Inst};
 use crate::wasm;
 
@@ -1530,6 +1532,30 @@ pub fn build_source_with_path(source: &str, source_path: &str) -> Result<String,
 
     // Generate x86_64 assembly
     Ok(x86::generate_asm(&module))
+}
+
+/// Build a native Linux ELF executable using the x86.rs stack-machine backend.
+/// This is the simpler backend (no PIR, no register allocation) — each SSA value
+/// lives on the stack. Uses AT&T syntax GAS assembly → elf64.rs assembler → linker.
+pub fn build_x86_linux(source: &str, source_path: &str) -> Result<Vec<u8>, Vec<String>> {
+    let program = build_program_with_path(source, Some(source_path))?;
+    let module = lower::lower(&program);
+
+    // Generate AT&T assembly via the x86.rs backend
+    let asm = x86::generate_asm(&module);
+
+    // Debug: dump assembly
+    let _ = std::fs::write("/tmp/x86_debug.asm", &asm);
+
+    // Assemble to ELF64 object file using our built-in assembler
+    // (L3Module not needed — the assembler only uses the asm text)
+    let pir_module = pir::L3Module::default();
+    let obj = elf64::emit_object_file(&pir_module, &asm)
+        .map_err(|e| vec![e])?;
+
+    // Link with an empty runtime (the x86.rs backend includes its own runtime stubs)
+    linker::link(&[obj], "_start")
+        .map_err(|e| vec![e])
 }
 
 /// Direct PE emission — generate native .exe without ml64.exe or link.exe

@@ -452,6 +452,11 @@ impl CCodeGen {
             ("p_float_to_str", &[F64]),
             ("p_f64_to_bits", &[F64]),
             ("p_f32_to_bits", &[F32]),
+            ("p_f64_from_bits", &[I64]),
+            ("p_f32_from_bits", &[I64]),
+            ("p_int_to_float", &[I64]),
+            ("p_float_to_int", &[F64]),
+            ("p_str_to_int", &[p()]),
             ("p_bool_to_str", &[Bool]),
             ("p_vec_to_str", &[p()]),
             ("p_str_concat", &[p(), p()]),
@@ -1054,6 +1059,11 @@ impl CCodeGen {
         wln!(self, "char* p_float_to_str(double val);");
         wln!(self, "int64_t p_f64_to_bits(double val);");
         wln!(self, "int64_t p_f32_to_bits(float val);");
+        wln!(self, "double p_f64_from_bits(int64_t bits);");
+        wln!(self, "float p_f32_from_bits(int64_t bits);");
+        wln!(self, "double p_int_to_float(int64_t val);");
+        wln!(self, "int64_t p_float_to_int(double val);");
+        wln!(self, "int64_t p_str_to_int(const char* s);");
         wln!(self, "double p_str_to_float(const char* s);");
         wln!(self, "char* p_bool_to_str(bool val);");
         wln!(self, "char* p_vec_to_str(PVec* v);");
@@ -3385,6 +3395,11 @@ impl CCodeGen {
         // Float bit-pattern conversion (B5: preserve NaN/Inf/-0.0 in ConstFloat)
         wln!(self, "int64_t p_f64_to_bits(double val) {{ union {{ double d; int64_t i; }} u; u.d = val; return u.i; }}");
         wln!(self, "int64_t p_f32_to_bits(float val) {{ union {{ float f; int32_t i; }} u; u.f = val; return (int64_t)u.i; }}");
+        wln!(self, "double p_f64_from_bits(int64_t bits) {{ union {{ double d; int64_t i; }} u; u.i = bits; return u.d; }}");
+        wln!(self, "float p_f32_from_bits(int64_t bits) {{ union {{ float f; int32_t i; }} u; u.i = (int32_t)bits; return u.f; }}");
+        wln!(self, "double p_int_to_float(int64_t val) {{ return (double)val; }}");
+        wln!(self, "int64_t p_float_to_int(double val) {{ return (int64_t)val; }}");
+        wln!(self, "int64_t p_str_to_int(const char* s) {{ if (!s) return 0; return atoll(s); }}");
 
         // ─── Socket builtins (native HTTP server, Phase 5D) ───
         wln!(self, "");
@@ -3606,12 +3621,14 @@ impl CCodeGen {
         wln!(self, "    int64_t b_shape[8]; int64_t b_ndim;");
         wln!(self, "    double* stored_data; int64_t stored_len; int is_checkpoint;");
         wln!(self, "} AGEntry;");
-        wln!(self, "static AGEntry ag_tape[256];");
+        wln!(self, "static AGEntry* ag_tape = NULL;");
+        wln!(self, "static int64_t ag_tape_cap = 0;");
         wln!(self, "static int64_t ag_tape_len = 0;");
         wln!(self, "static int ag_mode = 0;");
         wln!(self, "static int ag_checkpoint_mode = 0;");
-        wln!(self, "static void* ag_grad_ptrs[256];");
-        wln!(self, "static PTensor* ag_grads[256];");
+        wln!(self, "static void** ag_grad_ptrs = NULL;");
+        wln!(self, "static PTensor** ag_grads = NULL;");
+        wln!(self, "static int64_t ag_grad_cap = 0;");
         wln!(self, "static int64_t ag_grad_len = 0;");
         wln!(self, "static double ag_dp_budget = 0.0;");
         wln!(self, "static double ag_dp_limit = 0.0;");
@@ -3624,7 +3641,15 @@ impl CCodeGen {
         wln!(self, "static void ag_accum_grad(void* ptr, PTensor* grad) {{");
         wln!(self, "    PTensor* ex = ag_get_grad(ptr);");
         wln!(self, "    if (ex) {{ for (int64_t i = 0; i < ex->len && i < grad->len; i++) ex->data[i] += grad->data[i]; }}");
-        wln!(self, "    else {{ if (ag_grad_len < 256) {{ ag_grad_ptrs[ag_grad_len] = ptr; ag_grads[ag_grad_len] = grad; ag_grad_len++; }} }}");
+        wln!(self, "    else {{");
+        wln!(self, "        if (ag_grad_len >= ag_grad_cap) {{");
+        wln!(self, "            int64_t new_cap = ag_grad_cap == 0 ? 64 : ag_grad_cap * 2;");
+        wln!(self, "            ag_grad_ptrs = (void**)realloc(ag_grad_ptrs, new_cap * sizeof(void*));");
+        wln!(self, "            ag_grads = (PTensor**)realloc(ag_grads, new_cap * sizeof(PTensor*));");
+        wln!(self, "            ag_grad_cap = new_cap;");
+        wln!(self, "        }}");
+        wln!(self, "        ag_grad_ptrs[ag_grad_len] = ptr; ag_grads[ag_grad_len] = grad; ag_grad_len++;");
+        wln!(self, "    }}");
         wln!(self, "}}");
         wln!(self, "static PTensor* ag_clone_tensor(PTensor* t) {{");
         wln!(self, "    if (!t) return NULL;");
@@ -3652,7 +3677,12 @@ impl CCodeGen {
         wln!(self, "    return r;");
         wln!(self, "}}");
         wln!(self, "static void ag_record(AGOpKind op, void* result, void* a, void* b, double s) {{");
-        wln!(self, "    if (!ag_mode || ag_tape_len >= 256) return;");
+        wln!(self, "    if (!ag_mode) return;");
+        wln!(self, "    if (ag_tape_len >= ag_tape_cap) {{");
+        wln!(self, "        int64_t new_cap = ag_tape_cap == 0 ? 64 : ag_tape_cap * 2;");
+        wln!(self, "        ag_tape = (AGEntry*)realloc(ag_tape, new_cap * sizeof(AGEntry));");
+        wln!(self, "        ag_tape_cap = new_cap;");
+        wln!(self, "    }}");
         wln!(self, "    AGEntry* e = &ag_tape[ag_tape_len++];");
         wln!(self, "    e->op = op; e->result = result; e->a = a; e->b = b; e->scalar = s;");
         wln!(self, "    e->stored_data = NULL; e->stored_len = 0; e->is_checkpoint = 0;");
@@ -3660,6 +3690,20 @@ impl CCodeGen {
         wln!(self, "    if (ta) {{ e->a_ndim = ta->ndim; for (int64_t i = 0; i < ta->ndim && i < 8; i++) e->a_shape[i] = ta->shape[i]; }} else e->a_ndim = 0;");
         wln!(self, "    PTensor* tb = (PTensor*)b;");
         wln!(self, "    if (tb) {{ e->b_ndim = tb->ndim; for (int64_t i = 0; i < tb->ndim && i < 8; i++) e->b_shape[i] = tb->shape[i]; }} else e->b_ndim = 0;");
+        wln!(self, "}}");
+
+        // Helper: ensure ag_tape has room for one more entry. Returns pointer
+        // to the next slot and increments ag_tape_len. Returns NULL if not in
+        // ag_mode or allocation fails.
+        wln!(self, "static AGEntry* ag_grow(void) {{");
+        wln!(self, "    if (!ag_mode) return NULL;");
+        wln!(self, "    if (ag_tape_len >= ag_tape_cap) {{");
+        wln!(self, "        int64_t new_cap = ag_tape_cap == 0 ? 64 : ag_tape_cap * 2;");
+        wln!(self, "        AGEntry* nt = (AGEntry*)realloc(ag_tape, new_cap * sizeof(AGEntry));");
+        wln!(self, "        if (!nt) return NULL;");
+        wln!(self, "        ag_tape = nt; ag_tape_cap = new_cap;");
+        wln!(self, "    }}");
+        wln!(self, "    return &ag_tape[ag_tape_len++];");
         wln!(self, "}}");
 
         wln!(self, "void* p_tensor_new(int64_t ndim, int64_t* shape) {{");
@@ -3735,13 +3779,14 @@ impl CCodeGen {
         wln!(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = pt->shape[i];");
         wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
         wln!(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = pt->data[i] > 0 ? pt->data[i] : 0;");
-        wln!(self, "    if (ag_mode && ag_tape_len < 256) {{");
-        wln!(self, "        AGEntry* e = &ag_tape[ag_tape_len++];");
+        wln!(self, "    {{ AGEntry* e = ag_grow();");
+        wln!(self, "        if (e) {{");
         wln!(self, "        e->op = AG_RELU; e->result = r; e->a = t; e->b = NULL; e->scalar = 0;");
         wln!(self, "        e->a_ndim = pt->ndim; for (int64_t i = 0; i < pt->ndim && i < 8; i++) e->a_shape[i] = pt->shape[i];");
         wln!(self, "        e->b_ndim = 0;");
         wln!(self, "        if (ag_checkpoint_mode) {{ e->is_checkpoint = 1; e->stored_len = pt->len; e->stored_data = (double*)malloc(pt->len * sizeof(double)); for (int64_t i = 0; i < pt->len; i++) e->stored_data[i] = pt->data[i]; }}");
         wln!(self, "        else {{ e->is_checkpoint = 0; e->stored_len = r->len; e->stored_data = (double*)malloc(r->len * sizeof(double)); for (int64_t i = 0; i < r->len; i++) e->stored_data[i] = r->data[i]; }}");
+        wln!(self, "        }}");
         wln!(self, "    }}");
         wln!(self, "    return r;");
         wln!(self, "}}");
@@ -3859,13 +3904,14 @@ impl CCodeGen {
         wln!(self, "    for (int64_t i = 0; i < r->ndim && i < 8; i++) r->shape[i] = pt->shape[i];");
         wln!(self, "    r->data = (double*)malloc(r->len * sizeof(double));");
         wln!(self, "    for (int64_t i = 0; i < r->len; i++) r->data[i] = 1.0 / (1.0 + exp(-pt->data[i]));");
-        wln!(self, "    if (ag_mode && ag_tape_len < 256) {{");
-        wln!(self, "        AGEntry* e = &ag_tape[ag_tape_len++];");
+        wln!(self, "    {{ AGEntry* e = ag_grow();");
+        wln!(self, "        if (e) {{");
         wln!(self, "        e->op = AG_SIGMOID; e->result = r; e->a = t; e->b = NULL; e->scalar = 0;");
         wln!(self, "        e->a_ndim = pt->ndim; for (int64_t i = 0; i < pt->ndim && i < 8; i++) e->a_shape[i] = pt->shape[i];");
         wln!(self, "        e->b_ndim = 0;");
         wln!(self, "        if (ag_checkpoint_mode) {{ e->is_checkpoint = 1; e->stored_len = pt->len; e->stored_data = (double*)malloc(pt->len * sizeof(double)); for (int64_t i = 0; i < pt->len; i++) e->stored_data[i] = pt->data[i]; }}");
         wln!(self, "        else {{ e->is_checkpoint = 0; e->stored_len = r->len; e->stored_data = (double*)malloc(r->len * sizeof(double)); for (int64_t i = 0; i < r->len; i++) e->stored_data[i] = r->data[i]; }}");
+        wln!(self, "        }}");
         wln!(self, "    }}");
         wln!(self, "    return r;");
         wln!(self, "}}");
@@ -3881,7 +3927,7 @@ impl CCodeGen {
         wln!(self, "    return r;");
         wln!(self, "}}");
         wln!(self, "double p_tensor_sum(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt) return 0; double s=0; for (int64_t i=0;i<pt->len;i++) s+=pt->data[i]; ag_record(AG_SUM, (void*)pt, t, NULL, 0); return s; }}");
-        wln!(self, "double p_tensor_mean(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; double r=p_tensor_sum(t)/pt->len; if (ag_mode && ag_tape_len < 256) {{ AGEntry* e=&ag_tape[ag_tape_len-1]; e->op=AG_MEAN; e->scalar=(double)pt->len; }} return r; }}");
+        wln!(self, "double p_tensor_mean(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; double r=p_tensor_sum(t)/pt->len; if (ag_mode && ag_tape_len > 0) {{ AGEntry* e=&ag_tape[ag_tape_len-1]; e->op=AG_MEAN; e->scalar=(double)pt->len; }} return r; }}");
         wln!(self, "double p_tensor_min(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; double m=pt->data[0]; for (int64_t i=1;i<pt->len;i++) if (pt->data[i]<m) m=pt->data[i]; return m; }}");
         wln!(self, "double p_tensor_max(void* t) {{ PTensor* pt = (PTensor*)t; if (!pt || pt->len==0) return 0; double m=pt->data[0]; for (int64_t i=1;i<pt->len;i++) if (pt->data[i]>m) m=pt->data[i]; return m; }}");
         wln!(self, "double p_tensor_dot(void* a, void* b) {{ PTensor* ta=(PTensor*)a; PTensor* tb=(PTensor*)b; if (!ta||!tb) return 0; double s=0; for (int64_t i=0;i<ta->len&&i<tb->len;i++) s+=ta->data[i]*tb->data[i]; return s; }}");

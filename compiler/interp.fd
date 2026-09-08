@@ -1,0 +1,2839 @@
+// interp.fd -- IR Interpreter (self-hosted)
+// Ported from src/interp.rs (~6,060 LOC)
+//
+// Executes Fides IR directly without generating machine code.
+// This is the reference interpreter for the `run` command, comptime
+// evaluation, debugging, and testing.
+//
+// Adaptations from Rust:
+// 1. HashMap<K,V> -> Vec-based maps with helper structs
+// 2. Rc<RefCell<...>> -> Vec side-tables indexed by handle
+// 3. String/CompactString -> str
+// 4. usize/u64/u32 -> i64 (Fides has no usize)
+// 5. struct-style enum variants -> tuple-style (Fides convention)
+// 6. Option<T> -> Opt* enums
+// 7. closures -> top-level helper functions
+// 8. SmallVec -> Vec
+// 9. to_le_bytes/from_le_bytes -> manual byte operations via unsafe ptr
+
+module compiler::interp;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+
+// ===========================================================================
+// Value -- runtime value representation
+// ===========================================================================
+//
+// Rust has 13 Value variants. Fides simplifies to 8:
+//   Int, Float, Bool, Str, Ptr, Void, Vec, Map
+// Tensor/Json/Dyn/Allocator/Future/ThreadHandle are stored as opaque
+// pointers (Ptr) with side-table entries when needed.
+
+pub enum Value {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(str),
+    Ptr(i64),
+    Void,
+    Vec(i64),   // index into interp.vec_side_table
+    Map(i64),   // index into interp.map_side_table
+}
+
+pub fn Value_int(v: i64) -> Value { return Value::Int(v); }
+pub fn Value_float(v: f64) -> Value { return Value::Float(v); }
+pub fn Value_bool(v: bool) -> Value { return Value::Bool(v); }
+pub fn Value_str(v: str) -> Value { return Value::Str(v); }
+pub fn Value_ptr(v: i64) -> Value { return Value::Ptr(v); }
+pub fn Value_void() -> Value { return Value::Void; }
+
+/// Check if two values are equal (for PartialEq equivalent)
+pub fn value_eq(a: Value, b: Value) -> bool {
+    match a {
+        Value::Int(x) => {
+            match b {
+                Value::Int(y) => { return x == y; }
+                _ => { return false; }
+            }
+        }
+        Value::Float(x) => {
+            match b {
+                Value::Float(y) => { return x == y; }
+                _ => { return false; }
+            }
+        }
+        Value::Bool(x) => {
+            match b {
+                Value::Bool(y) => { return x == y; }
+                _ => { return false; }
+            }
+        }
+        Value::Str(x) => {
+            match b {
+                Value::Str(y) => { return str_equal(x, y); }
+                _ => { return false; }
+            }
+        }
+        Value::Ptr(x) => {
+            match b {
+                Value::Ptr(y) => { return x == y; }
+                _ => { return false; }
+            }
+        }
+        Value::Void => {
+            match b {
+                Value::Void => { return true; }
+                _ => { return false; }
+            }
+        }
+        Value::Vec(x) => {
+            match b {
+                Value::Vec(y) => { return x == y; }
+                _ => { return false; }
+            }
+        }
+        Value::Map(x) => {
+            match b {
+                Value::Map(y) => { return x == y; }
+                _ => { return false; }
+            }
+        }
+    }
+    return false;
+}
+
+/// Check if a value is Void (used for overflow/error detection)
+pub fn value_is_void(v: Value) -> bool {
+    match v {
+        Value::Void => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+// ===========================================================================
+// Memory -- byte-addressed simulated memory
+// ===========================================================================
+//
+// Replaces Rust's Vec<u8> with a Fides Vec<i64> where each element
+// stores one byte (0-255). This is simpler than bit-packing and
+// sufficient for the interpreter's performance needs.
+
+pub struct Memory {
+    pub data: Vec<i64>,
+    pub next_alloc: i64,
+}
+
+pub fn Memory_new() -> Memory {
+    var data: Vec<i64> = Vec::new();
+    // Pre-allocate 1MB (1048576 bytes)
+    var i: i64 = 0;
+    while i < 1048576 {
+        data.push(0);
+        i = i + 1;
+    }
+    return Memory { data: data, next_alloc: 0x1000 };
+}
+
+pub fn Memory_alloc(self: &mut Memory, size: i64) -> i64 {
+    if size <= 0 { return self.next_alloc; }
+    var addr: i64 = self.next_alloc;
+    self.next_alloc = self.next_alloc + size;
+    // Grow if needed
+    while self.next_alloc >= self.data.len() {
+        var i: i64 = 0;
+        while i < 4096 {
+            self.data.push(0);
+            i = i + 1;
+        }
+    }
+    return addr;
+}
+
+pub fn Memory_allocated(self: &Memory) -> i64 {
+    return self.next_alloc;
+}
+
+pub fn Memory_capacity(self: &Memory) -> i64 {
+    return self.data.len();
+}
+
+pub fn Memory_is_valid_addr(self: &Memory, addr: i64) -> bool {
+    return addr >= 0 && addr < self.data.len();
+}
+
+// Store a single byte at addr
+pub fn Memory_store_byte(self: &mut Memory, addr: i64, b: i64) {
+    if addr >= 0 && addr < self.data.len() {
+        self.data.set(addr, b & 0xFF);
+    }
+}
+
+// Load a single byte from addr
+pub fn Memory_load_byte(self: &Memory, addr: i64) -> i64 {
+    if addr >= 0 && addr < self.data.len() {
+        return self.data.get(addr);
+    }
+    return 0;
+}
+
+// Store an i64 (8 bytes, little-endian) at addr
+pub fn Memory_store_i64(self: &mut Memory, addr: i64, val: i64) {
+    var v: i64 = val;
+    var i: i64 = 0;
+    while i < 8 {
+        Memory_store_byte(self, addr + i, v & 0xFF);
+        v = v >> 8;
+        i = i + 1;
+    }
+}
+
+// Load an i64 (8 bytes, little-endian) from addr
+pub fn Memory_load_i64(self: &Memory, addr: i64) -> i64 {
+    var result: i64 = 0;
+    var i: i64 = 0;
+    while i < 8 {
+        var b: i64 = Memory_load_byte(self, addr + i);
+        result = result | (b << (i * 8));
+        i = i + 1;
+    }
+    return result;
+}
+
+// Store a bool (1 byte) at addr
+pub fn Memory_store_bool(self: &mut Memory, addr: i64, val: bool) {
+    if val {
+        Memory_store_byte(self, addr, 1);
+    } else {
+        Memory_store_byte(self, addr, 0);
+    }
+}
+
+// Load a bool (1 byte) from addr
+pub fn Memory_load_bool(self: &Memory, addr: i64) -> bool {
+    return Memory_load_byte(self, addr) != 0;
+}
+
+// Store an i32 (4 bytes, little-endian) at addr
+pub fn Memory_store_i32(self: &mut Memory, addr: i64, val: i64) {
+    var v: i64 = val;
+    var i: i64 = 0;
+    while i < 4 {
+        Memory_store_byte(self, addr + i, v & 0xFF);
+        v = v >> 8;
+        i = i + 1;
+    }
+}
+
+// Load an i32 (4 bytes, little-endian) from addr
+pub fn Memory_load_i32(self: &Memory, addr: i64) -> i64 {
+    var result: i64 = 0;
+    var i: i64 = 0;
+    while i < 4 {
+        var b: i64 = Memory_load_byte(self, addr + i);
+        result = result | (b << (i * 8));
+        i = i + 1;
+    }
+    // Sign-extend from 32 bits
+    if result >= 0x80000000 {
+        result = result - 0x100000000;
+    }
+    return result;
+}
+
+// Store an f64 (8 bytes) at addr using p_f64_to_bits
+pub fn Memory_store_f64(self: &mut Memory, addr: i64, val: f64) {
+    var bits: i64 = p_f64_to_bits(val);
+    Memory_store_i64(self, addr, bits);
+}
+
+// Load an f64 (8 bytes) from addr using p_f64_from_bits
+pub fn Memory_load_f64(self: &Memory, addr: i64) -> f64 {
+    var bits: i64 = Memory_load_i64(self, addr);
+    return p_f64_from_bits(bits);
+}
+
+// Store an f32 (4 bytes) at addr
+pub fn Memory_store_f32(self: &mut Memory, addr: i64, val: f64) {
+    var bits: i64 = p_f32_to_bits(val);
+    Memory_store_i32(self, addr, bits);
+}
+
+// Load an f32 (4 bytes) from addr
+pub fn Memory_load_f32(self: &Memory, addr: i64) -> f64 {
+    var bits: i64 = Memory_load_i32(self, addr);
+    return p_f32_from_bits(bits);
+}
+
+// Store a null-terminated string at addr, return the address
+pub fn Memory_store_cstr(self: &mut Memory, s: str) -> i64 {
+    var slen: i64 = str_len(s);
+    var addr: i64 = Memory_alloc(self, slen + 1);
+    var i: i64 = 0;
+    while i < slen {
+        // Read byte from string using pointer arithmetic
+        var s_addr: i64 = s + i;
+        var ptr: *mut u8 = s_addr;
+        var b: i64 = 0;
+        unsafe { b = *ptr; }
+        Memory_store_byte(self, addr + i, b);
+        i = i + 1;
+    }
+    Memory_store_byte(self, addr + slen, 0);
+    return addr;
+}
+
+// Load a null-terminated C string from addr, return as str
+pub fn Memory_load_cstr(self: &Memory, addr: i64) -> str {
+    if addr <= 0 { return ""; }
+    var result: str = "";
+    var offset: i64 = addr;
+    while offset < self.data.len() {
+        var b: i64 = Memory_load_byte(self, offset);
+        if b == 0 { break; }
+        result = result + p_char_to_str(b);
+        offset = offset + 1;
+    }
+    return result;
+}
+
+// ===========================================================================
+// ExecOutcome / RunResult -- instruction and function results
+// ===========================================================================
+
+pub enum ExecOutcome {
+    Continue,
+    Value(Value),
+    Jump(i64),
+    Return(Value),
+    Panic(str),
+}
+
+pub enum RunResult {
+    Return(Value),
+    Panic(str),
+    Paused,
+}
+
+// ===========================================================================
+// Side-table entries for opaque values (Vec, Map, string addrs, globals)
+// ===========================================================================
+//
+// These replace Rust's HashMap<K, V> with Vec-based lookup tables.
+
+pub struct StringAddrEntry {
+    pub content: str,
+    pub addr: i64,
+}
+
+pub fn StringAddrEntry_new(content: str, addr: i64) -> StringAddrEntry {
+    return StringAddrEntry { content: content, addr: addr };
+}
+
+pub struct GlobalAddrEntry {
+    pub name: str,
+    pub addr: i64,
+}
+
+pub fn GlobalAddrEntry_new(name: str, addr: i64) -> GlobalAddrEntry {
+    return GlobalAddrEntry { name: name, addr: addr };
+}
+
+pub struct OpaqueEntry {
+    pub addr: i64,
+    pub value: Value,
+}
+
+pub fn OpaqueEntry_new(addr: i64, value: Value) -> OpaqueEntry {
+    return OpaqueEntry { addr: addr, value: value };
+}
+
+pub struct ArrayBoundEntry {
+    pub addr: i64,
+    pub size: i64,
+}
+
+pub fn ArrayBoundEntry_new(addr: i64, size: i64) -> ArrayBoundEntry {
+    return ArrayBoundEntry { addr: addr, size: size };
+}
+
+pub struct VecSideEntry {
+    pub vec_addr: i64,
+    pub side_idx: i64,
+}
+
+pub fn VecSideEntry_new(vec_addr: i64, side_idx: i64) -> VecSideEntry {
+    return VecSideEntry { vec_addr: vec_addr, side_idx: side_idx };
+}
+
+// Vec side-table: stores Vec<Value> for interpreter-created Vecs
+pub struct VecValueEntry {
+    pub handle: i64,
+    pub elements: Vec<Value>,
+}
+
+pub fn VecValueEntry_new(handle: i64) -> VecValueEntry {
+    return VecValueEntry { handle: handle, elements: Vec::new() };
+}
+
+// Map side-table: stores key-value pairs for interpreter-created Maps
+pub struct MapValueEntry {
+    pub handle: i64,
+    pub keys: Vec<str>,
+    pub vals: Vec<Value>,
+}
+
+pub fn MapValueEntry_new(handle: i64) -> MapValueEntry {
+    return MapValueEntry { handle: handle, keys: Vec::new(), vals: Vec::new() };
+}
+
+// ===========================================================================
+// Interpreter -- the IR interpreter
+// ===========================================================================
+//
+// Fields mirror src/interp.rs::Interpreter, simplified for self-hosting.
+// Advanced features (autograd, futures, channels, ECS, etc.) are stubbed
+// or omitted in this initial port. Core execution is fully implemented.
+
+pub struct Interpreter {
+    pub module: IrModule,
+    pub memory: Memory,
+    pub string_addrs: Vec<StringAddrEntry>,
+    pub global_addrs: Vec<GlobalAddrEntry>,
+    pub opaque_values: Vec<OpaqueEntry>,
+    pub vec_side_table: Vec<VecSideEntry>,
+    pub vec_values: Vec<VecValueEntry>,
+    pub map_values: Vec<MapValueEntry>,
+    pub verbose: bool,
+    pub debug_mode: bool,
+    pub array_bounds: Vec<ArrayBoundEntry>,
+    pub current_func_name: str,
+    pub call_stack: Vec<str>,
+    pub call_site_lines: Vec<i64>,
+    pub pending_call_site: OptU64,
+    pub panic_stack_trace: OptStr,
+    pub interp_unsafe_depth: i64,
+    pub txn_mem_snapshots: Vec<Memory>,
+    pub txn_opaque_snapshots: Vec<OpaqueEntry>,
+    pub max_recursion: i64,
+    pub max_steps: i64,
+    pub step_count: i64,
+    pub max_memory: i64,
+    pub region_stack: Vec<str>,
+}
+
+pub fn Interpreter_new(module: IrModule) -> Interpreter {
+    var interp: Interpreter = Interpreter {
+        module: module,
+        memory: Memory_new(),
+        string_addrs: Vec::new(),
+        global_addrs: Vec::new(),
+        opaque_values: Vec::new(),
+        vec_side_table: Vec::new(),
+        vec_values: Vec::new(),
+        map_values: Vec::new(),
+        verbose: false,
+        debug_mode: true,
+        array_bounds: Vec::new(),
+        current_func_name: "",
+        call_stack: Vec::new(),
+        call_site_lines: Vec::new(),
+        pending_call_site: OptU64::None,
+        panic_stack_trace: OptStr::None,
+        interp_unsafe_depth: 0,
+        txn_mem_snapshots: Vec::new(),
+        txn_opaque_snapshots: Vec::new(),
+        max_recursion: 1000,
+        max_steps: 0,
+        step_count: 0,
+        max_memory: 0,
+        region_stack: Vec::new(),
+    };
+    Interpreter_init_strings(&mut interp);
+    Interpreter_init_globals(&mut interp);
+    return interp;
+}
+
+pub fn Interpreter_verbose(self: &mut Interpreter) {
+    self.verbose = true;
+}
+
+pub fn Interpreter_set_max_recursion(self: &mut Interpreter, depth: i64) {
+    self.max_recursion = depth;
+}
+
+pub fn Interpreter_set_max_steps(self: &mut Interpreter, steps: i64) {
+    self.max_steps = steps;
+}
+
+pub fn Interpreter_set_max_memory(self: &mut Interpreter, bytes: i64) {
+    self.max_memory = bytes;
+}
+
+// ===========================================================================
+// Lookup helpers for Vec-based maps
+// ===========================================================================
+
+pub fn Interpreter_lookup_string_addr(self: &Interpreter, content: str) -> i64 {
+    var i: i64 = 0;
+    while i < self.string_addrs.len() {
+        if str_equal(self.string_addrs.get(i).content, content) {
+            return self.string_addrs.get(i).addr;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub fn Interpreter_lookup_global_addr(self: &Interpreter, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < self.global_addrs.len() {
+        if str_equal(self.global_addrs.get(i).name, name) {
+            return self.global_addrs.get(i).addr;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub fn Interpreter_lookup_opaque(self: &Interpreter, addr: i64) -> OptValue {
+    var i: i64 = 0;
+    while i < self.opaque_values.len() {
+        if self.opaque_values.get(i).addr == addr {
+            return OptValue::Some(self.opaque_values.get(i).value);
+        }
+        i = i + 1;
+    }
+    return OptValue::None;
+}
+
+pub fn Interpreter_set_opaque(self: &mut Interpreter, addr: i64, value: Value) {
+    // Replace existing or add new
+    var i: i64 = 0;
+    while i < self.opaque_values.len() {
+        if self.opaque_values.get(i).addr == addr {
+            self.opaque_values.set(i, OpaqueEntry_new(addr, value));
+            return;
+        }
+        i = i + 1;
+    }
+    self.opaque_values.push(OpaqueEntry_new(addr, value));
+}
+
+pub fn Interpreter_remove_opaque(self: &mut Interpreter, addr: i64) {
+    // Mark as Void (removing would shift indices; instead set to Void)
+    var i: i64 = 0;
+    while i < self.opaque_values.len() {
+        if self.opaque_values.get(i).addr == addr {
+            self.opaque_values.set(i, OpaqueEntry_new(addr, Value::Void));
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+pub fn Interpreter_lookup_array_bound(self: &Interpreter, addr: i64) -> i64 {
+    var i: i64 = 0;
+    while i < self.array_bounds.len() {
+        if self.array_bounds.get(i).addr == addr {
+            return self.array_bounds.get(i).size;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn Interpreter_set_array_bound(self: &mut Interpreter, addr: i64, size: i64) {
+    self.array_bounds.push(ArrayBoundEntry_new(addr, size));
+}
+
+// OptValue for opaque lookups
+pub enum OptValue {
+    Some(Value),
+    None,
+}
+
+// OptStr for panic_stack_trace
+pub enum OptStr {
+    Some(str),
+    None,
+}
+
+// OptVecI64 for vec extraction helpers
+pub enum OptVecI64 {
+    Some(Vec<i64>),
+    None,
+}
+
+// OptVecF64 for vec extraction helpers
+pub enum OptVecF64 {
+    Some(Vec<f64>),
+    None,
+}
+
+// ===========================================================================
+// init_strings / init_globals
+// ===========================================================================
+
+pub fn Interpreter_init_strings(self: &mut Interpreter) {
+    var i: i64 = 0;
+    while i < self.module.string_constants.len() {
+        var s: str = self.module.string_constants.get(i).key;
+        var addr: i64 = Memory_store_cstr(&mut self.memory, s);
+        self.string_addrs.push(StringAddrEntry_new(s, addr));
+        Interpreter_set_opaque(self, addr, Value::Str(s));
+        i = i + 1;
+    }
+}
+
+pub fn Interpreter_init_globals(self: &mut Interpreter) {
+    var addr: i64 = 0x00400000;
+    var i: i64 = 0;
+    while i < self.module.globals.len() {
+        var entry: GlobalEntry = self.module.globals.get(i);
+        self.global_addrs.push(GlobalAddrEntry_new(entry.name, addr));
+        var init_val: Value = eval_global_init(entry.init, entry.ty);
+        match init_val {
+            Value::Int(v) => { Memory_store_i64(&mut self.memory, addr, v); }
+            Value::Float(v) => { Memory_store_f64(&mut self.memory, addr, v); }
+            Value::Bool(v) => { Memory_store_bool(&mut self.memory, addr, v); }
+            Value::Ptr(v) => { Memory_store_i64(&mut self.memory, addr, v); }
+            Value::Str(s) => {
+                var str_addr: i64 = Memory_store_cstr(&mut self.memory, s);
+                Interpreter_set_opaque(self, str_addr, Value::Str(s));
+                Memory_store_i64(&mut self.memory, addr, str_addr);
+            }
+            _ => { Memory_store_i64(&mut self.memory, addr, 0); }
+        }
+        addr = addr + 8;
+        i = i + 1;
+    }
+}
+
+pub fn eval_global_init(expr: Expr, ty: IrType) -> Value {
+    match expr {
+        Expr::IntLit(v) => {
+            match ty {
+                IrType::Bool => { return Value::Bool(v != 0); }
+                _ => { return Value::Int(v); }
+            }
+        }
+        Expr::FloatLit(v) => { return Value::Float(v); }
+        Expr::BoolLit(b) => { return Value::Bool(b); }
+        Expr::StringLit(s) => { return Value::Str(s); }
+        _ => { return Value::Int(0); }
+    }
+    return Value::Int(0);
+}
+
+// ===========================================================================
+// value_to_string -- convert a Value to a display string
+// ===========================================================================
+
+pub fn Interpreter_value_to_string(self: &Interpreter, v: Value) -> str {
+    match v {
+        Value::Str(s) => { return s; }
+        Value::Ptr(addr) => { return Memory_load_cstr(&self.memory, addr); }
+        Value::Int(i) => { return int_to_str(i); }
+        Value::Float(f) => { return float_to_str(f); }
+        Value::Bool(b) => {
+            if b { return "true"; }
+            return "false";
+        }
+        Value::Void => { return "void"; }
+        _ => { return ""; }
+    }
+    return "";
+}
+
+// ===========================================================================
+// format_call_stack -- for panic stack traces
+// ===========================================================================
+
+pub fn Interpreter_format_call_stack(self: &Interpreter) -> str {
+    if self.call_stack.len() == 0 { return ""; }
+    var out: str = "stack trace:\n";
+    var i: i64 = self.call_stack.len() - 1;
+    var idx: i64 = 0;
+    while i >= 0 {
+        var name: str = self.call_stack.get(i);
+        var suffix: str = "";
+        if i < self.call_site_lines.len() {
+            var line: i64 = self.call_site_lines.get(i);
+            if line > 0 {
+                suffix = " at line " + int_to_str(line);
+            }
+        }
+        if idx == 0 {
+            out = out + "    -> " + name + suffix + "\n";
+        } else {
+            out = out + "    called from " + name + suffix + "\n";
+        }
+        i = i - 1;
+        idx = idx + 1;
+    }
+    return out;
+}
+
+// ===========================================================================
+// run -- entry point: find and execute main()
+// ===========================================================================
+
+pub fn Interpreter_run(self: &mut Interpreter) -> RunResult {
+    match IrModule_get_function(&self.module, "main") {
+        OptIrFunction::Some(main_fn) => {
+            return Interpreter_run_function(self, main_fn, Vec::new());
+        }
+        OptIrFunction::None => {
+            return RunResult::Panic("No main function found");
+        }
+    }
+    return RunResult::Panic("No main function found");
+}
+
+// ===========================================================================
+// run_function -- execute a function with arguments
+// ===========================================================================
+
+pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: Vec<Value>) -> RunResult {
+    // Recursion depth check
+    if self.call_stack.len() >= self.max_recursion {
+        var depth: i64 = self.max_recursion;
+        var caller: str = "";
+        if self.call_stack.len() > 0 {
+            caller = self.call_stack.get(self.call_stack.len() - 1);
+        }
+        self.panic_stack_trace = OptStr::Some(Interpreter_format_call_stack(self));
+        return RunResult::Panic("Recursion depth limit (" + int_to_str(depth) + ") exceeded in function '" + func.name + "' (called from '" + caller + "')");
+    }
+
+    var saved_func_name: str = self.current_func_name;
+    self.current_func_name = func.name;
+    self.call_stack.push(func.name);
+    var saved_call_site: OptU64 = self.pending_call_site;
+    self.pending_call_site = OptU64::None;
+    var call_line: i64 = 0;
+    match saved_call_site {
+        OptU64::Some(line) => { call_line = line; }
+        OptU64::None => { call_line = 0; }
+    }
+    self.call_site_lines.push(call_line);
+
+    var saved_region_depth: i64 = self.region_stack.len();
+
+    // Build value table: Vec<ValueIdValue> where index = value_id
+    // We use a Vec<Value> indexed by value_id for O(1) lookup.
+    var max_val: i64 = func.next_value;
+    var values: Vec<Value> = Vec::new();
+    var vi: i64 = 0;
+    while vi < max_val {
+        values.push(Value::Void);
+        vi = vi + 1;
+    }
+
+    // Detect missing __env param: if first param is Ptr(U8) and caller
+    // passed one fewer arg, insert a dummy env value.
+    var effective_args: Vec<Value> = Vec::new();
+    var has_env_param: bool = false;
+    if func.params.len() > 0 {
+        var first_param: ValueIdType = func.params.get(0);
+        match first_param.ty {
+            IrType::Ptr(inner) => {
+                match inner {
+                    IrType::U8 => { has_env_param = true; }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    if has_env_param && args.len() == func.params.len() - 1 {
+        effective_args.push(Value::Int(0));
+        var ai: i64 = 0;
+        while ai < args.len() {
+            effective_args.push(args.get(ai));
+            ai = ai + 1;
+        }
+    } else {
+        effective_args = args;
+    }
+
+    // Bind parameters
+    var pi: i64 = 0;
+    while pi < func.params.len() {
+        var param: ValueIdType = func.params.get(pi);
+        var pval: Value = Value::Void;
+        if pi < effective_args.len() {
+            pval = effective_args.get(pi);
+        }
+        // Phase 10B: When a Value::Str is passed to an i64 or pointer param,
+        // materialize the string into memory and pass the address.
+        match pval {
+            Value::Str(s) => {
+                var is_i64_or_ptr: bool = false;
+                match param.ty {
+                    IrType::I64 => { is_i64_or_ptr = true; }
+                    IrType::U64 => { is_i64_or_ptr = true; }
+                    IrType::Ptr(_) => { is_i64_or_ptr = true; }
+                    _ => {}
+                }
+                if is_i64_or_ptr {
+                    var str_addr: i64 = Memory_store_cstr(&mut self.memory, s);
+                    Interpreter_set_opaque(self, str_addr, Value::Str(s));
+                    match param.ty {
+                        IrType::Ptr(_) => { pval = Value::Ptr(str_addr); }
+                        _ => { pval = Value::Int(str_addr); }
+                    }
+                }
+            }
+            _ => {}
+        }
+        if param.id < values.len() {
+            values.set(param.id, pval);
+        }
+        pi = pi + 1;
+    }
+
+    // Execute basic blocks
+    var current_block: i64 = func.entry;
+    var result: RunResult = RunResult::Return(Value::Void);
+
+    while true {
+        if current_block < 0 || current_block >= func.blocks.len() {
+            // No valid block — return void
+            result = RunResult::Return(Value::Void);
+            break;
+        }
+        var block: BasicBlock = func.blocks.get(current_block);
+
+        if self.verbose {
+            p_eprint_str("  -> block ");
+            p_eprint_str(int_to_str(current_block));
+            p_eprint_str("\n");
+        }
+
+        var next_block: i64 = -1;
+        var done: bool = false;
+        var ii: i64 = 0;
+        while ii < block.instructions.len() {
+            var inst_id: i64 = block.instructions.get(ii);
+
+            // Step limit check
+            if self.max_steps > 0 {
+                self.step_count = self.step_count + 1;
+                if self.step_count > self.max_steps {
+                    self.panic_stack_trace = OptStr::Some(Interpreter_format_call_stack(self));
+                    result = RunResult::Panic("Step limit exceeded: " + int_to_str(self.step_count) + " instructions executed (limit: " + int_to_str(self.max_steps) + ")");
+                    done = true;
+                    break;
+                }
+            }
+
+            // Get the instruction
+            var inst_opt: OptInst = IrFunction_get_inst(&func, inst_id);
+            match inst_opt {
+                OptInst::None => { }
+                OptInst::Some(inst) => {
+                    var outcome: ExecOutcome = Interpreter_execute_inst(self, inst, inst_id, &mut values, &func);
+                    match outcome {
+                        ExecOutcome::Continue => { }
+                        ExecOutcome::Value(v) => {
+                            if inst_id < values.len() {
+                                values.set(inst_id, v);
+                            }
+                        }
+                        ExecOutcome::Jump(target) => {
+                            next_block = target;
+                            done = true;
+                            break;
+                        }
+                        ExecOutcome::Return(rv) => {
+                            result = RunResult::Return(rv);
+                            done = true;
+                            break;
+                        }
+                        ExecOutcome::Panic(msg) => {
+                            // Capture stack trace
+                            match self.panic_stack_trace {
+                                OptStr::None => {
+                                    self.panic_stack_trace = OptStr::Some(Interpreter_format_call_stack(self));
+                                }
+                                OptStr::Some(_) => { }
+                            }
+                            // Transaction rollback
+                            if self.txn_mem_snapshots.len() > 0 {
+                                var snap_mem: Memory = self.txn_mem_snapshots.get(self.txn_mem_snapshots.len() - 1);
+                                self.memory = snap_mem;
+                                self.txn_mem_snapshots.pop();
+                                // Also restore opaque snapshots (simplified)
+                            }
+                            result = RunResult::Panic(msg);
+                            done = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            ii = ii + 1;
+        }
+
+        if done {
+            break;
+        }
+
+        if next_block >= 0 {
+            current_block = next_block;
+        } else {
+            // No terminator found — return void
+            result = RunResult::Return(Value::Void);
+            break;
+        }
+    }
+
+    // Cleanup: restore region_stack depth
+    while self.region_stack.len() > saved_region_depth {
+        self.region_stack.pop();
+    }
+    self.current_func_name = saved_func_name;
+    self.call_stack.pop();
+    self.call_site_lines.pop();
+
+    return result;
+}
+
+// ===========================================================================
+// get_value -- safe lookup from the value table
+// ===========================================================================
+
+pub fn get_value(values: &Vec<Value>, id: i64) -> Value {
+    if id >= 0 && id < values.len() {
+        return values.get(id);
+    }
+    return Value::Void;
+}
+
+// ===========================================================================
+// execute_inst -- execute a single IR instruction
+// ===========================================================================
+
+pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64, values: &mut Vec<Value>, func: &IrFunction) -> ExecOutcome {
+    match inst {
+        // ─── Constants ───
+        Inst::ConstInt(value, ty) => {
+            match ty {
+                IrType::Bool => { return ExecOutcome::Value(Value::Bool(value != 0)); }
+                _ => { return ExecOutcome::Value(Value::Int(value)); }
+            }
+        }
+        Inst::ConstFloat(value, ty) => {
+            // value is already an f64 in Fides IR (unlike Rust which stores bits)
+            match ty {
+                IrType::F32 => { return ExecOutcome::Value(Value::Float(value)); }
+                _ => { return ExecOutcome::Value(Value::Float(value)); }
+            }
+        }
+        Inst::ConstBool(value) => {
+            return ExecOutcome::Value(Value::Bool(value));
+        }
+        Inst::ConstStr(value) => {
+            return ExecOutcome::Value(Value::Str(value));
+        }
+        Inst::ConstFnRef(name) => {
+            return ExecOutcome::Value(Value::Str(name));
+        }
+        Inst::ConstNull(_) => {
+            return ExecOutcome::Value(Value::Ptr(0));
+        }
+
+        // ─── Globals ───
+        Inst::GlobalAddr(name, _) => {
+            var addr: i64 = Interpreter_lookup_global_addr(self, name);
+            return ExecOutcome::Value(Value::Ptr(addr));
+        }
+
+        // ─── Arithmetic ───
+        Inst::BinOp(op, left, right, _) => {
+            var l: Value = get_value(values, left);
+            var r: Value = get_value(values, right);
+            // String comparison: when both operands are Ptr(U8) (str type),
+            // compare content rather than pointer addresses.
+            var is_str_cmp: bool = false;
+            var left_meta_opt: OptValueMeta = IrFunction_get_meta(func, left);
+            var right_meta_opt: OptValueMeta = IrFunction_get_meta(func, right);
+            match left_meta_opt {
+                OptValueMeta::Some(lm) => {
+                    match right_meta_opt {
+                        OptValueMeta::Some(rm) => {
+                            match lm.ty {
+                                IrType::Ptr(linner) => {
+                                    match linner {
+                                        IrType::U8 => {
+                                            match rm.ty {
+                                                IrType::Ptr(rinner) => {
+                                                    match rinner {
+                                                        IrType::U8 => { is_str_cmp = true; }
+                                                        _ => {}
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        OptValueMeta::None => {}
+                    }
+                }
+                OptValueMeta::None => {}
+            }
+            if is_str_cmp {
+                match op {
+                    BinOp::Eq => {
+                        var l_str: str = Interpreter_value_to_string(self, l);
+                        var r_str: str = Interpreter_value_to_string(self, r);
+                        return ExecOutcome::Value(Value::Bool(str_equal(l_str, r_str)));
+                    }
+                    BinOp::Neq => {
+                        var l_str2: str = Interpreter_value_to_string(self, l);
+                        var r_str2: str = Interpreter_value_to_string(self, r);
+                        return ExecOutcome::Value(Value::Bool(!str_equal(l_str2, r_str2)));
+                    }
+                    _ => {}
+                }
+            }
+            var result: Value = Interpreter_eval_binop(self, op, l, r);
+            if value_is_void(result) {
+                var msg: str = "Arithmetic error";
+                match op {
+                    BinOp::Add => { msg = "Integer overflow on addition"; }
+                    BinOp::Sub => { msg = "Integer overflow on subtraction"; }
+                    BinOp::Mul => { msg = "Integer overflow on multiplication"; }
+                    BinOp::Div => { msg = "Division by zero"; }
+                    BinOp::Mod => { msg = "Modulo by zero"; }
+                    _ => { msg = "Arithmetic error"; }
+                }
+                return ExecOutcome::Panic(msg);
+            }
+            return ExecOutcome::Value(result);
+        }
+
+        Inst::UnaryOp(op, operand, _) => {
+            var v: Value = get_value(values, operand);
+            var result: Value = Interpreter_eval_unaryop(self, op, v);
+            return ExecOutcome::Value(result);
+        }
+
+        // ─── Memory ───
+        Inst::Alloca(ty, _) => {
+            var size: i64 = IrModule_type_size(&self.module, ty);
+            if size < 1 { size = 1; }
+            // Memory limit check
+            if self.max_memory > 0 {
+                var current: i64 = Memory_allocated(&self.memory);
+                if current + size > self.max_memory {
+                    self.panic_stack_trace = OptStr::Some(Interpreter_format_call_stack(self));
+                    return ExecOutcome::Panic("Memory limit exceeded");
+                }
+            }
+            var addr: i64 = Memory_alloc(&mut self.memory, size);
+            // Track array bounds
+            match ty {
+                IrType::Array(_, arr_size) => {
+                    Interpreter_set_array_bound(self, addr, arr_size);
+                }
+                _ => {}
+            }
+            return ExecOutcome::Value(Value::Ptr(addr));
+        }
+
+        Inst::Load(ptr, ty) => {
+            var addr: i64 = 0;
+            match get_value(values, ptr) {
+                Value::Ptr(a) => { addr = a; }
+                Value::Int(i) => { addr = i; }
+                Value::Str(s) => {
+                    addr = Memory_store_cstr(&mut self.memory, s);
+                }
+                _ => { addr = 0; }
+            }
+            // Check opaque side-table first (for Vec, Map, Str, Ptr values)
+            match Interpreter_lookup_opaque(self, addr) {
+                OptValue::Some(ov) => {
+                    match ov {
+                        Value::Ptr(_) => { return ExecOutcome::Value(ov); }
+                        Value::Vec(_) => { return ExecOutcome::Value(ov); }
+                        Value::Map(_) => { return ExecOutcome::Value(ov); }
+                        Value::Str(_) => { return ExecOutcome::Value(ov); }
+                        _ => {}
+                    }
+                }
+                OptValue::None => {}
+            }
+            // Load from byte memory based on type
+            match ty {
+                IrType::I8 => {
+                    var b: i64 = Memory_load_byte(&self.memory, addr);
+                    // Sign-extend from 8 bits
+                    if b >= 128 { b = b - 256; }
+                    return ExecOutcome::Value(Value::Int(b));
+                }
+                IrType::U8 => {
+                    return ExecOutcome::Value(Value::Int(Memory_load_byte(&self.memory, addr)));
+                }
+                IrType::I16 => {
+                    var lo: i64 = Memory_load_byte(&self.memory, addr);
+                    var hi: i64 = Memory_load_byte(&self.memory, addr + 1);
+                    var v: i64 = lo | (hi << 8);
+                    if v >= 32768 { v = v - 65536; }
+                    return ExecOutcome::Value(Value::Int(v));
+                }
+                IrType::U16 => {
+                    var lo: i64 = Memory_load_byte(&self.memory, addr);
+                    var hi: i64 = Memory_load_byte(&self.memory, addr + 1);
+                    return ExecOutcome::Value(Value::Int(lo | (hi << 8)));
+                }
+                IrType::I32 => {
+                    return ExecOutcome::Value(Value::Int(Memory_load_i32(&self.memory, addr)));
+                }
+                IrType::U32 => {
+                    return ExecOutcome::Value(Value::Int(Memory_load_i32(&self.memory, addr)));
+                }
+                IrType::I64 => {
+                    return ExecOutcome::Value(Value::Int(Memory_load_i64(&self.memory, addr)));
+                }
+                IrType::U64 => {
+                    return ExecOutcome::Value(Value::Int(Memory_load_i64(&self.memory, addr)));
+                }
+                IrType::F32 => {
+                    return ExecOutcome::Value(Value::Float(Memory_load_f32(&self.memory, addr)));
+                }
+                IrType::F64 => {
+                    return ExecOutcome::Value(Value::Float(Memory_load_f64(&self.memory, addr)));
+                }
+                IrType::Bool => {
+                    return ExecOutcome::Value(Value::Bool(Memory_load_bool(&self.memory, addr)));
+                }
+                IrType::Ptr(_) => {
+                    return ExecOutcome::Value(Value::Ptr(Memory_load_i64(&self.memory, addr)));
+                }
+                IrType::Opaque(_) => {
+                    // Check side-table again for opaque types
+                    match Interpreter_lookup_opaque(self, addr) {
+                        OptValue::Some(ov2) => { return ExecOutcome::Value(ov2); }
+                        OptValue::None => {
+                            return ExecOutcome::Value(Value::Ptr(Memory_load_i64(&self.memory, addr)));
+                        }
+                    }
+                }
+                IrType::Generic(_, _) => {
+                    // Check side-table again for generic types
+                    match Interpreter_lookup_opaque(self, addr) {
+                        OptValue::Some(ov3) => { return ExecOutcome::Value(ov3); }
+                        OptValue::None => {
+                            return ExecOutcome::Value(Value::Ptr(Memory_load_i64(&self.memory, addr)));
+                        }
+                    }
+                }
+                _ => {
+                    return ExecOutcome::Value(Value::Ptr(addr));
+                }
+            }
+        }
+
+        Inst::Store(ptr, value, _) => {
+            var addr: i64 = 0;
+            match get_value(values, ptr) {
+                Value::Ptr(a) => { addr = a; }
+                _ => { addr = 0; }
+            }
+            var v: Value = get_value(values, value);
+            // Clear any stale opaque entry
+            Interpreter_remove_opaque(self, addr);
+            match v {
+                Value::Int(iv) => {
+                    Memory_store_i64(&mut self.memory, addr, iv);
+                }
+                Value::Float(fv) => {
+                    Memory_store_f64(&mut self.memory, addr, fv);
+                }
+                Value::Bool(bv) => {
+                    Memory_store_bool(&mut self.memory, addr, bv);
+                }
+                Value::Ptr(pv) => {
+                    Memory_store_i64(&mut self.memory, addr, pv);
+                }
+                Value::Str(s) => {
+                    var str_addr: i64 = Memory_store_cstr(&mut self.memory, s);
+                    Memory_store_i64(&mut self.memory, addr, str_addr);
+                    Interpreter_set_opaque(self, addr, Value::Str(s));
+                }
+                Value::Vec(_) => {
+                    // Opaque values stored in side-table
+                    Interpreter_set_opaque(self, addr, v);
+                }
+                Value::Map(_) => {
+                    // Opaque values stored in side-table
+                    Interpreter_set_opaque(self, addr, v);
+                }
+                _ => {}
+            }
+            return ExecOutcome::Continue;
+        }
+
+        Inst::GetFieldPtr(struct_ptr, field_index, _) => {
+            var base: i64 = 0;
+            match get_value(values, struct_ptr) {
+                Value::Ptr(a) => { base = a; }
+                Value::Int(n) => { base = n; }
+                _ => { base = 0; }
+            }
+            // Look up real field offset from struct layout
+            var struct_name: str = "";
+            var meta_opt: OptValueMeta = IrFunction_get_meta(func, struct_ptr);
+            match meta_opt {
+                OptValueMeta::Some(m) => {
+                    match m.ty {
+                        IrType::Ptr(inner) => {
+                            match inner {
+                                IrType::Struct(name) => { struct_name = name; }
+                                _ => {}
+                            }
+                        }
+                        IrType::Struct(name) => { struct_name = name; }
+                        _ => {}
+                    }
+                }
+                OptValueMeta::None => {}
+            }
+            var offset: i64 = field_index * 8;
+            if str_len(struct_name) > 0 {
+                match IrModule_get_struct(&self.module, struct_name) {
+                    OptStructLayout::Some(layout) => {
+                        if field_index >= 0 && field_index < layout.fields.len() {
+                            var field: StringIrTypeOffset = layout.fields.get(field_index);
+                            offset = field.offset;
+                        }
+                    }
+                    OptStructLayout::None => {}
+                }
+            }
+            return ExecOutcome::Value(Value::Ptr(base + offset));
+        }
+
+        Inst::GetElemPtr(base_ptr, index, elem_ty) => {
+            var base: i64 = 0;
+            match get_value(values, base_ptr) {
+                Value::Ptr(a) => { base = a; }
+                Value::Int(n) => { base = n; }
+                _ => { base = 0; }
+            }
+            var idx_val: i64 = 0;
+            match get_value(values, index) {
+                Value::Int(i) => { idx_val = i; }
+                _ => { idx_val = 0; }
+            }
+            // Bounds checking (when not in unsafe block)
+            if self.interp_unsafe_depth == 0 {
+                if idx_val < 0 {
+                    return ExecOutcome::Panic("Array index out of bounds: negative index " + int_to_str(idx_val));
+                }
+                var arr_size: i64 = Interpreter_lookup_array_bound(self, base);
+                if arr_size >= 0 && idx_val >= arr_size {
+                    return ExecOutcome::Panic("Array index out of bounds: index " + int_to_str(idx_val) + " but array has " + int_to_str(arr_size) + " elements");
+                }
+            }
+            var elem_size: i64 = IrModule_type_size(&self.module, elem_ty);
+            if elem_size < 1 { elem_size = 1; }
+            return ExecOutcome::Value(Value::Ptr(base + idx_val * elem_size));
+        }
+
+        // ─── Control Flow ───
+        Inst::Jump(target) => {
+            return ExecOutcome::Jump(target);
+        }
+        Inst::Branch(cond, then_block, else_block) => {
+            var c: bool = false;
+            match get_value(values, cond) {
+                Value::Bool(b) => { c = b; }
+                Value::Int(i) => { c = (i != 0); }
+                _ => { c = false; }
+            }
+            if c {
+                return ExecOutcome::Jump(then_block);
+            } else {
+                return ExecOutcome::Jump(else_block);
+            }
+        }
+        Inst::Return(opt_val) => {
+            match opt_val {
+                OptValueId::Some(id) => {
+                    return ExecOutcome::Return(get_value(values, id));
+                }
+                OptValueId::None => {
+                    return ExecOutcome::Return(Value::Void);
+                }
+            }
+        }
+        Inst::Unreachable => {
+            return ExecOutcome::Panic("Reached unreachable instruction");
+        }
+
+        // ─── Function Calls ───
+        Inst::Call(name, arg_ids, _, _) => {
+            var arg_vals: Vec<Value> = Vec::new();
+            var ai: i64 = 0;
+            while ai < arg_ids.len() {
+                arg_vals.push(get_value(values, arg_ids.get(ai)));
+                ai = ai + 1;
+            }
+            // Check if it's a runtime function
+            if Interpreter_is_runtime_func(self, name) {
+                return Interpreter_call_runtime(self, name, arg_vals);
+            }
+            // Check if it's a user function
+            match IrModule_get_function(&self.module, name) {
+                OptIrFunction::Some(callee) => {
+                    // Record call site
+                    var meta_opt2: OptValueMeta = IrFunction_get_meta(func, inst_id);
+                    match meta_opt2 {
+                        OptValueMeta::Some(m2) => {
+                            match m2.source_line {
+                                OptU64::Some(sl) => { self.pending_call_site = OptU64::Some(sl); }
+                                OptU64::None => { self.pending_call_site = OptU64::None; }
+                            }
+                        }
+                        OptValueMeta::None => { self.pending_call_site = OptU64::None; }
+                    }
+                    var result: RunResult = Interpreter_run_function(self, callee, arg_vals);
+                    match result {
+                        RunResult::Return(v) => { return ExecOutcome::Value(v); }
+                        RunResult::Panic(msg) => { return ExecOutcome::Panic(msg); }
+                        RunResult::Paused => { return ExecOutcome::Continue; }
+                    }
+                }
+                OptIrFunction::None => {
+                    return ExecOutcome::Panic("Unknown function '" + name + "'");
+                }
+            }
+        }
+
+        Inst::CallPtr(fn_ptr, arg_ids, _, _, _) => {
+            var arg_vals2: Vec<Value> = Vec::new();
+            var ai2: i64 = 0;
+            while ai2 < arg_ids.len() {
+                arg_vals2.push(get_value(values, arg_ids.get(ai2)));
+                ai2 = ai2 + 1;
+            }
+            // Function pointer is an env struct: field 0 = fn name string
+            var fn_name: str = "";
+            var env_ptr: i64 = 0;
+            match get_value(values, fn_ptr) {
+                Value::Str(s) => {
+                    fn_name = s;
+                }
+                Value::Ptr(addr) => {
+                    // Read fn name pointer from field 0
+                    var fn_ptr_addr: i64 = Memory_load_i64(&self.memory, addr);
+                    fn_name = Memory_load_cstr(&self.memory, fn_ptr_addr);
+                    env_ptr = addr;
+                }
+                _ => {
+                    return ExecOutcome::Panic("CallPtr: function pointer is not a string or pointer");
+                }
+            }
+            if Interpreter_is_runtime_func(self, fn_name) {
+                return Interpreter_call_runtime(self, fn_name, arg_vals2);
+            }
+            match IrModule_get_function(&self.module, fn_name) {
+                OptIrFunction::Some(callee2) => {
+                    var all_args: Vec<Value> = Vec::new();
+                    if callee2.params.len() > arg_vals2.len() {
+                        if env_ptr > 0 {
+                            all_args.push(Value::Ptr(env_ptr));
+                        } else {
+                            all_args.push(Value::Int(0));
+                        }
+                    }
+                    var xi: i64 = 0;
+                    while xi < arg_vals2.len() {
+                        all_args.push(arg_vals2.get(xi));
+                        xi = xi + 1;
+                    }
+                    var result2: RunResult = Interpreter_run_function(self, callee2, all_args);
+                    match result2 {
+                        RunResult::Return(v2) => { return ExecOutcome::Value(v2); }
+                        RunResult::Panic(msg2) => { return ExecOutcome::Panic(msg2); }
+                        RunResult::Paused => { return ExecOutcome::Continue; }
+                    }
+                }
+                OptIrFunction::None => {
+                    return ExecOutcome::Panic("Unknown function in CallPtr: '" + fn_name + "'");
+                }
+            }
+        }
+
+        Inst::MakeDyn(value, type_name, _) => {
+            var data_ptr: i64 = 0;
+            match get_value(values, value) {
+                Value::Ptr(p) => { data_ptr = p; }
+                Value::Int(i) => { data_ptr = i; }
+                _ => { data_ptr = 0; }
+            }
+            // Store type_name as a string for DynCall lookup
+            return ExecOutcome::Value(Value::Str(type_name));
+        }
+
+        Inst::DynCall(trait_name, method, arg_ids, _, _) => {
+            var arg_vals3: Vec<Value> = Vec::new();
+            var ai3: i64 = 0;
+            while ai3 < arg_ids.len() {
+                arg_vals3.push(get_value(values, arg_ids.get(ai3)));
+                ai3 = ai3 + 1;
+            }
+            // First arg is the receiver (Dyn or Str with type name)
+            var type_name: str = "";
+            var all_args3: Vec<Value> = Vec::new();
+            if arg_vals3.len() > 0 {
+                match arg_vals3.get(0) {
+                    Value::Str(s) => { type_name = s; }
+                    _ => { type_name = ""; }
+                }
+            }
+            var mangled: str = type_name + "_" + method;
+            match IrModule_get_function(&self.module, mangled) {
+                OptIrFunction::Some(callee3) => {
+                    if callee3.params.len() > arg_vals3.len() {
+                        all_args3.push(Value::Int(0));
+                    }
+                    var zi: i64 = 0;
+                    while zi < arg_vals3.len() {
+                        all_args3.push(arg_vals3.get(zi));
+                        zi = zi + 1;
+                    }
+                    var result3: RunResult = Interpreter_run_function(self, callee3, all_args3);
+                    match result3 {
+                        RunResult::Return(v3) => { return ExecOutcome::Value(v3); }
+                        RunResult::Panic(msg3) => { return ExecOutcome::Panic(msg3); }
+                        RunResult::Paused => { return ExecOutcome::Continue; }
+                    }
+                }
+                OptIrFunction::None => {
+                    return ExecOutcome::Panic("DynCall: no method '" + method + "' on type '" + type_name + "' (looked for '" + mangled + "')");
+                }
+            }
+        }
+
+        // ─── Conversions ───
+        Inst::BitCast(value, _, to) => {
+            var v: Value = get_value(values, value);
+            return ExecOutcome::Value(Interpreter_cast_value(self, v, to));
+        }
+        Inst::IntExtend(value, _, _) => {
+            var v: Value = get_value(values, value);
+            match v {
+                Value::Int(i) => { return ExecOutcome::Value(Value::Int(i)); }
+                _ => { return ExecOutcome::Value(Value::Int(0)); }
+            }
+        }
+        Inst::IntTrunc(value, _, to) => {
+            var v: Value = get_value(values, value);
+            match v {
+                Value::Int(i) => {
+                    match to {
+                        IrType::I8 => {
+                            var t: i64 = i & 0xFF;
+                            if t >= 128 { t = t - 256; }
+                            return ExecOutcome::Value(Value::Int(t));
+                        }
+                        IrType::I16 => {
+                            var t2: i64 = i & 0xFFFF;
+                            if t2 >= 32768 { t2 = t2 - 65536; }
+                            return ExecOutcome::Value(Value::Int(t2));
+                        }
+                        IrType::I32 => {
+                            var t3: i64 = i & 0xFFFFFFFF;
+                            if t3 >= 0x80000000 { t3 = t3 - 0x100000000; }
+                            return ExecOutcome::Value(Value::Int(t3));
+                        }
+                        IrType::U8 => { return ExecOutcome::Value(Value::Int(i & 0xFF)); }
+                        IrType::U16 => { return ExecOutcome::Value(Value::Int(i & 0xFFFF)); }
+                        IrType::U32 => { return ExecOutcome::Value(Value::Int(i & 0xFFFFFFFF)); }
+                        _ => { return ExecOutcome::Value(Value::Int(i)); }
+                    }
+                }
+                _ => { return ExecOutcome::Value(Value::Int(0)); }
+            }
+        }
+        Inst::IntToFloat(value, _, _) => {
+            var v: Value = get_value(values, value);
+            match v {
+                Value::Int(i) => {
+                    var f: f64 = p_int_to_float(i);
+                    return ExecOutcome::Value(Value::Float(f));
+                }
+                _ => { return ExecOutcome::Value(Value::Float(0.0)); }
+            }
+        }
+        Inst::FloatToInt(value, _, _) => {
+            var v: Value = get_value(values, value);
+            match v {
+                Value::Float(f) => {
+                    var i: i64 = p_float_to_int(f);
+                    return ExecOutcome::Value(Value::Int(i));
+                }
+                _ => { return ExecOutcome::Value(Value::Int(0)); }
+            }
+        }
+
+        // ─── Fides-Specific ───
+        Inst::TryUnwrap(value, ok_block, _, _) => {
+            return ExecOutcome::Jump(ok_block);
+        }
+        Inst::Print(value, ty) => {
+            var v: Value = get_value(values, value);
+            // Ptr(U8) typed values stored as Int should be printed as strings
+            match ty {
+                IrType::Ptr(inner) => {
+                    match inner {
+                        IrType::U8 => {
+                            match v {
+                                Value::Int(addr) => {
+                                    if addr > 0 && Memory_is_valid_addr(&self.memory, addr) {
+                                        var s: str = Memory_load_cstr(&self.memory, addr);
+                                        if str_len(s) > 0 {
+                                            p_print_str(s);
+                                            return ExecOutcome::Continue;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            // Default printing
+            match v {
+                Value::Int(i) => { p_print_int(i); }
+                Value::Float(f) => { p_print_float(f); }
+                Value::Bool(b) => { p_print_bool(b); }
+                Value::Str(s) => { p_print_str(s); }
+                Value::Ptr(addr2) => {
+                    var s2: str = Memory_load_cstr(&self.memory, addr2);
+                    if str_len(s2) > 0 {
+                        p_print_str(s2);
+                    } else {
+                        p_print_str("ptr(0x");
+                        p_print_str(int_to_str(addr2));
+                        p_print_str(")");
+                    }
+                }
+                _ => { p_print_str("void"); }
+            }
+            return ExecOutcome::Continue;
+        }
+        Inst::Panic(message) => {
+            return ExecOutcome::Panic(message);
+        }
+        Inst::Asm(_, _, _, ret_ty) => {
+            // Interpreter: no actual assembly execution
+            match ret_ty {
+                IrType::Void => { return ExecOutcome::Continue; }
+                _ => { return ExecOutcome::Value(Value::Int(0)); }
+            }
+        }
+
+        // ─── Region Management ───
+        Inst::RegionBegin(name, _, _, _) => {
+            self.region_stack.push(name);
+            return ExecOutcome::Value(Value::Int(0));
+        }
+        Inst::RegionEnd(_, _, _) => {
+            if self.region_stack.len() > 0 {
+                self.region_stack.pop();
+            }
+            return ExecOutcome::Continue;
+        }
+
+        // ─── Persist Variables ───
+        Inst::PersistLoad(name, default, _) => {
+            // Simplified: just use the default value
+            var dv: Value = get_value(values, default);
+            return ExecOutcome::Value(dv);
+        }
+        Inst::PersistSave(_, _) => {
+            return ExecOutcome::Continue;
+        }
+
+        // ─── Transaction Blocks ───
+        Inst::TxnBegin => {
+            // Snapshot memory (simplified: just push current next_alloc)
+            self.txn_mem_snapshots.push(self.memory);
+            return ExecOutcome::Continue;
+        }
+        Inst::TxnEnd => {
+            if self.txn_mem_snapshots.len() > 0 {
+                self.txn_mem_snapshots.pop();
+            }
+            return ExecOutcome::Continue;
+        }
+
+        // ─── Unsafe Blocks ───
+        Inst::UnsafeBegin => {
+            self.interp_unsafe_depth = self.interp_unsafe_depth + 1;
+            return ExecOutcome::Continue;
+        }
+        Inst::UnsafeEnd => {
+            if self.interp_unsafe_depth > 0 {
+                self.interp_unsafe_depth = self.interp_unsafe_depth - 1;
+            }
+            return ExecOutcome::Continue;
+        }
+
+        // ─── Autograd (stubbed) ───
+        Inst::GradBegin(_) => { return ExecOutcome::Continue; }
+        Inst::GradEnd => { return ExecOutcome::Continue; }
+        Inst::Backward(_) => { return ExecOutcome::Continue; }
+    }
+    return ExecOutcome::Continue;
+}
+
+// ===========================================================================
+// eval_binop -- evaluate a binary operation
+// ===========================================================================
+
+pub fn Interpreter_eval_binop(self: &Interpreter, op: BinOp, l: Value, r: Value) -> Value {
+    match l {
+        Value::Int(a) => {
+            match r {
+                Value::Int(b) => {
+                    match op {
+                        BinOp::Add => {
+                            // Checked addition (simplified: wrapping for now)
+                            return Value::Int(a + b);
+                        }
+                        BinOp::Sub => {
+                            return Value::Int(a - b);
+                        }
+                        BinOp::Mul => {
+                            return Value::Int(a * b);
+                        }
+                        BinOp::Div => {
+                            if b == 0 { return Value::Void; }
+                            return Value::Int(a / b);
+                        }
+                        BinOp::Mod => {
+                            if b == 0 { return Value::Void; }
+                            return Value::Int(a % b);
+                        }
+                        BinOp::Eq => { return Value::Bool(a == b); }
+                        BinOp::Neq => { return Value::Bool(a != b); }
+                        BinOp::Lt => { return Value::Bool(a < b); }
+                        BinOp::Gt => { return Value::Bool(a > b); }
+                        BinOp::LtEq => { return Value::Bool(a <= b); }
+                        BinOp::GtEq => { return Value::Bool(a >= b); }
+                        BinOp::And => { return Value::Bool(a != 0 && b != 0); }
+                        BinOp::Or => { return Value::Bool(a != 0 || b != 0); }
+                        BinOp::BitAnd => { return Value::Int(a & b); }
+                        BinOp::BitOr => { return Value::Int(a | b); }
+                        BinOp::BitXor => { return Value::Int(a ^ b); }
+                        BinOp::Shl => { return Value::Int(a << b); }
+                        BinOp::Shr => { return Value::Int(a >> b); }
+                    }
+                }
+                Value::Ptr(b_addr) => {
+                    match op {
+                        BinOp::Add => { return Value::Ptr(a + b_addr); }
+                        BinOp::Eq => { return Value::Bool(a == b_addr); }
+                        BinOp::Neq => { return Value::Bool(a != b_addr); }
+                        BinOp::Lt => { return Value::Bool(a < b_addr); }
+                        BinOp::LtEq => { return Value::Bool(a <= b_addr); }
+                        BinOp::Gt => { return Value::Bool(a > b_addr); }
+                        BinOp::GtEq => { return Value::Bool(a >= b_addr); }
+                        _ => { return Value::Void; }
+                    }
+                }
+                _ => { return Value::Void; }
+            }
+        }
+        Value::Float(a) => {
+            match r {
+                Value::Float(b) => {
+                    match op {
+                        BinOp::Add => { return Value::Float(a + b); }
+                        BinOp::Sub => { return Value::Float(a - b); }
+                        BinOp::Mul => { return Value::Float(a * b); }
+                        BinOp::Div => { return Value::Float(a / b); }
+                        BinOp::Mod => { return Value::Float(a % b); }
+                        BinOp::Eq => { return Value::Bool(a == b); }
+                        BinOp::Neq => { return Value::Bool(a != b); }
+                        BinOp::Lt => { return Value::Bool(a < b); }
+                        BinOp::Gt => { return Value::Bool(a > b); }
+                        BinOp::LtEq => { return Value::Bool(a <= b); }
+                        BinOp::GtEq => { return Value::Bool(a >= b); }
+                        _ => { return Value::Float(0.0); }
+                    }
+                }
+                _ => { return Value::Void; }
+            }
+        }
+        Value::Bool(a) => {
+            match r {
+                Value::Bool(b) => {
+                    match op {
+                        BinOp::Eq => { return Value::Bool(a == b); }
+                        BinOp::Neq => { return Value::Bool(a != b); }
+                        BinOp::And => { return Value::Bool(a && b); }
+                        BinOp::Or => { return Value::Bool(a || b); }
+                        _ => { return Value::Bool(false); }
+                    }
+                }
+                _ => { return Value::Void; }
+            }
+        }
+        Value::Str(a) => {
+            match r {
+                Value::Str(b) => {
+                    match op {
+                        BinOp::Eq => { return Value::Bool(str_equal(a, b)); }
+                        BinOp::Neq => { return Value::Bool(!str_equal(a, b)); }
+                        _ => { return Value::Void; }
+                    }
+                }
+                Value::Int(b2) => {
+                    match op {
+                        BinOp::Eq => { return Value::Bool(str_len(a) == 0 && b2 == 0); }
+                        BinOp::Neq => { return Value::Bool(!(str_len(a) == 0 && b2 == 0)); }
+                        _ => { return Value::Void; }
+                    }
+                }
+                _ => { return Value::Void; }
+            }
+        }
+        Value::Ptr(a_addr) => {
+            match r {
+                Value::Int(b3) => {
+                    match op {
+                        BinOp::Add => { return Value::Ptr(a_addr + b3); }
+                        BinOp::Sub => { return Value::Ptr(a_addr - b3); }
+                        BinOp::Eq => { return Value::Bool(a_addr == b3); }
+                        BinOp::Neq => { return Value::Bool(a_addr != b3); }
+                        BinOp::Lt => { return Value::Bool(a_addr < b3); }
+                        BinOp::LtEq => { return Value::Bool(a_addr <= b3); }
+                        BinOp::Gt => { return Value::Bool(a_addr > b3); }
+                        BinOp::GtEq => { return Value::Bool(a_addr >= b3); }
+                        _ => { return Value::Void; }
+                    }
+                }
+                Value::Ptr(b_addr2) => {
+                    match op {
+                        BinOp::Eq => { return Value::Bool(a_addr == b_addr2); }
+                        BinOp::Neq => { return Value::Bool(a_addr != b_addr2); }
+                        BinOp::Lt => { return Value::Bool(a_addr < b_addr2); }
+                        BinOp::LtEq => { return Value::Bool(a_addr <= b_addr2); }
+                        BinOp::Gt => { return Value::Bool(a_addr > b_addr2); }
+                        BinOp::GtEq => { return Value::Bool(a_addr >= b_addr2); }
+                        _ => { return Value::Void; }
+                    }
+                }
+                _ => { return Value::Void; }
+            }
+        }
+        _ => { return Value::Void; }
+    }
+    return Value::Void;
+}
+
+// ===========================================================================
+// eval_unaryop -- evaluate a unary operation
+// ===========================================================================
+
+pub fn Interpreter_eval_unaryop(self: &Interpreter, op: UnaryOp, v: Value) -> Value {
+    match v {
+        Value::Int(i) => {
+            match op {
+                UnaryOp::Neg => { return Value::Int(-i); }
+                UnaryOp::Not => { return Value::Bool(i == 0); }
+                UnaryOp::BitNot => { return Value::Int(~i); }
+            }
+        }
+        Value::Float(f) => {
+            match op {
+                UnaryOp::Neg => { return Value::Float(-f); }
+                _ => { return Value::Float(0.0); }
+            }
+        }
+        Value::Bool(b) => {
+            match op {
+                UnaryOp::Not => { return Value::Bool(!b); }
+                _ => { return Value::Bool(false); }
+            }
+        }
+        _ => { return Value::Void; }
+    }
+    return Value::Void;
+}
+
+// ===========================================================================
+// cast_value -- cast a value to a different type
+// ===========================================================================
+
+pub fn Interpreter_cast_value(self: &Interpreter, v: Value, to: IrType) -> Value {
+    match v {
+        Value::Int(i) => {
+            match to {
+                IrType::F32 => { return Value::Float(p_int_to_float(i)); }
+                IrType::F64 => { return Value::Float(p_int_to_float(i)); }
+                _ => { return Value::Int(i); }
+            }
+        }
+        Value::Float(f) => {
+            match to {
+                IrType::I64 => { return Value::Int(p_float_to_int(f)); }
+                IrType::I32 => { return Value::Int(p_float_to_int(f)); }
+                _ => { return Value::Float(f); }
+            }
+        }
+        Value::Bool(b) => {
+            match to {
+                IrType::I64 => {
+                    if b { return Value::Int(1); }
+                    return Value::Int(0);
+                }
+                _ => { return Value::Bool(b); }
+            }
+        }
+        _ => { return v; }
+    }
+    return v;
+}
+
+// ===========================================================================
+// is_runtime_func -- check if a name is a runtime function
+// ===========================================================================
+
+pub fn Interpreter_is_runtime_func(self: &Interpreter, name: str) -> bool {
+    // Check if it's an extern function
+    var i: i64 = 0;
+    while i < self.module.extern_functions.len() {
+        if str_equal(self.module.extern_functions.get(i).name, name) {
+            return true;
+        }
+        i = i + 1;
+    }
+    // Check known runtime prefixes
+    if str_equal(name, "print") { return true; }
+    if str_starts_with(name, "p_vec_") { return true; }
+    if str_starts_with(name, "p_map_") { return true; }
+    if str_starts_with(name, "p_string_") { return true; }
+    if str_starts_with(name, "p_json_") { return true; }
+    if str_starts_with(name, "p_tensor_") { return true; }
+    if str_starts_with(name, "p_simd_") { return true; }
+    if str_starts_with(name, "p_socket_") { return true; }
+    if str_starts_with(name, "p_http_") { return true; }
+    if str_starts_with(name, "p_db_") { return true; }
+    if str_starts_with(name, "p_file_") { return true; }
+    if str_starts_with(name, "p_thread_") { return true; }
+    if str_starts_with(name, "p_atomic_") { return true; }
+    if str_starts_with(name, "p_mutex_") { return true; }
+    if str_starts_with(name, "p_shared_") { return true; }
+    if str_starts_with(name, "p_future_") { return true; }
+    if str_starts_with(name, "p_grad_") { return true; }
+    if str_starts_with(name, "p_dp_") { return true; }
+    if str_starts_with(name, "p_tp_") { return true; }
+    if str_starts_with(name, "p_checkpoint_") { return true; }
+    // Check common p_ builtins
+    if str_equal(name, "p_print_int") { return true; }
+    if str_equal(name, "p_print_float") { return true; }
+    if str_equal(name, "p_print_bool") { return true; }
+    if str_equal(name, "p_print_str") { return true; }
+    if str_equal(name, "p_eprint_str") { return true; }
+    if str_equal(name, "p_print_newline") { return true; }
+    if str_equal(name, "p_panic") { return true; }
+    if str_equal(name, "p_alloc") { return true; }
+    if str_equal(name, "p_malloc") { return true; }
+    if str_equal(name, "p_free") { return true; }
+    if str_equal(name, "p_region_free") { return true; }
+    if str_equal(name, "p_str_concat") { return true; }
+    if str_equal(name, "p_to_str") { return true; }
+    if str_equal(name, "p_char_to_str") { return true; }
+    if str_equal(name, "p_float_to_str") { return true; }
+    if str_equal(name, "p_str_to_float") { return true; }
+    if str_equal(name, "p_str_to_int") { return true; }
+    if str_equal(name, "p_str_len") { return true; }
+    if str_equal(name, "p_str_equal") { return true; }
+    if str_equal(name, "p_str_cmp") { return true; }
+    return false;
+}
+
+// ===========================================================================
+// call_runtime -- dispatch runtime builtin functions
+// ===========================================================================
+//
+// This implements the essential runtime builtins needed for basic
+// program execution: printing, panics, allocation, string operations,
+// vectors, maps, and numeric conversions.
+// Advanced builtins (tensors, networking, threads, etc.) return defaults.
+
+pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Value>) -> ExecOutcome {
+    // ─── Printing ───
+    if str_equal(name, "p_print_int") {
+        if args.len() > 0 {
+            match args.get(0) {
+                Value::Int(i) => { p_print_int(i); }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_print_float") {
+        if args.len() > 0 {
+            match args.get(0) {
+                Value::Float(f) => { p_print_float(f); }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_print_bool") {
+        if args.len() > 0 {
+            match args.get(0) {
+                Value::Bool(b) => { p_print_bool(b); }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_print_str") {
+        if args.len() > 0 {
+            match args.get(0) {
+                Value::Str(s) => { p_print_str(s); }
+                Value::Ptr(addr) => {
+                    var loaded: str = Memory_load_cstr(&self.memory, addr);
+                    p_print_str(loaded);
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_eprint_str") {
+        if args.len() > 0 {
+            match args.get(0) {
+                Value::Str(s) => { p_eprint_str(s); }
+                Value::Ptr(addr) => {
+                    var loaded: str = Memory_load_cstr(&self.memory, addr);
+                    p_eprint_str(loaded);
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_print_newline") {
+        p_print_str("\n");
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "print") {
+        if args.len() > 0 {
+            match args.get(0) {
+                Value::Int(i) => { p_print_int(i); }
+                Value::Float(f) => { p_print_float(f); }
+                Value::Bool(b) => { p_print_bool(b); }
+                Value::Str(s) => { p_print_str(s); }
+                Value::Ptr(addr) => {
+                    var loaded: str = Memory_load_cstr(&self.memory, addr);
+                    p_print_str(loaded);
+                }
+                _ => { p_print_str("void"); }
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+
+    // ─── Panic ───
+    if str_equal(name, "p_panic") {
+        var msg: str = "panic";
+        if args.len() > 0 {
+            msg = Interpreter_value_to_string(self, args.get(0));
+        }
+        return ExecOutcome::Panic(msg);
+    }
+
+    // ─── Allocation ───
+    if str_equal(name, "p_alloc") || str_equal(name, "p_malloc") {
+        var size: i64 = 0;
+        if args.len() > 0 {
+            match args.get(0) {
+                Value::Int(s) => {
+                    if s < 0 { size = 0; } else { size = s; }
+                }
+                _ => {}
+            }
+        }
+        var addr: i64 = Memory_alloc(&mut self.memory, size);
+        return ExecOutcome::Value(Value::Ptr(addr));
+    }
+    if str_equal(name, "p_free") || str_equal(name, "p_region_free") {
+        // Interpreter doesn't actually free — memory is arena-based
+        return ExecOutcome::Value(Value::Void);
+    }
+
+    // ─── String Operations ───
+    if str_equal(name, "p_str_concat") {
+        var left: str = "";
+        var right: str = "";
+        if args.len() > 0 { left = Interpreter_value_to_string(self, args.get(0)); }
+        if args.len() > 1 { right = Interpreter_value_to_string(self, args.get(1)); }
+        return ExecOutcome::Value(Value::Str(left + right));
+    }
+    if str_equal(name, "p_to_str") {
+        if args.len() > 0 {
+            return ExecOutcome::Value(Value::Str(Interpreter_value_to_string(self, args.get(0))));
+        }
+        return ExecOutcome::Value(Value::Str(""));
+    }
+    if str_equal(name, "p_char_to_str") {
+        if args.len() > 0 {
+            match args.get(0) {
+                Value::Int(i) => { return ExecOutcome::Value(Value::Str(p_char_to_str(i))); }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Str(""));
+    }
+    if str_equal(name, "p_float_to_str") {
+        if args.len() > 0 {
+            match args.get(0) {
+                Value::Float(f) => { return ExecOutcome::Value(Value::Str(float_to_str(f))); }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Str(""));
+    }
+    if str_equal(name, "p_str_to_float") {
+        if args.len() > 0 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            return ExecOutcome::Value(Value::Float(p_str_to_float(s)));
+        }
+        return ExecOutcome::Value(Value::Float(0.0));
+    }
+    if str_equal(name, "p_str_to_int") {
+        if args.len() > 0 {
+            var s: str = Interpreter_value_to_string(self, args.get(0));
+            return ExecOutcome::Value(Value::Int(p_str_to_int(s)));
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_str_len") {
+        if args.len() > 0 {
+            match args.get(0) {
+                Value::Str(s) => { return ExecOutcome::Value(Value::Int(str_len(s))); }
+                Value::Ptr(addr) => {
+                    var loaded: str = Memory_load_cstr(&self.memory, addr);
+                    return ExecOutcome::Value(Value::Int(str_len(loaded)));
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_str_equal") {
+        // p_str_equal(a, b, n) — compare n bytes
+        if args.len() >= 3 {
+            var a_str: str = Interpreter_value_to_string(self, args.get(0));
+            var b_str: str = Interpreter_value_to_string(self, args.get(1));
+            match args.get(2) {
+                Value::Int(n) => {
+                    if n >= str_len(a_str) && n >= str_len(b_str) {
+                        return ExecOutcome::Value(Value::Bool(str_equal(a_str, b_str)));
+                    }
+                    // Compare first n characters
+                    var i: i64 = 0;
+                    while i < n {
+                        var ac: i64 = 0;
+                        var bc: i64 = 0;
+                        if i < str_len(a_str) {
+                            var ap: i64 = a_str + i;
+                            var aptr: *mut u8 = ap;
+                            unsafe { ac = *aptr; }
+                        }
+                        if i < str_len(b_str) {
+                            var bp: i64 = b_str + i;
+                            var bptr: *mut u8 = bp;
+                            unsafe { bc = *bptr; }
+                        }
+                        if ac != bc { return ExecOutcome::Value(Value::Bool(false)); }
+                        i = i + 1;
+                    }
+                    return ExecOutcome::Value(Value::Bool(true));
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Bool(false));
+    }
+    if str_equal(name, "p_str_cmp") {
+        if args.len() >= 2 {
+            var a_str2: str = Interpreter_value_to_string(self, args.get(0));
+            var b_str2: str = Interpreter_value_to_string(self, args.get(1));
+            if str_equal(a_str2, b_str2) { return ExecOutcome::Value(Value::Int(0)); }
+            // Simplified: return 1 if a > b, -1 if a < b
+            return ExecOutcome::Value(Value::Int(1));
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+
+    // ─── Vec Operations ───
+    // p_vec_new() -> returns a raw Fides Vec struct (24 bytes: data, len, cap)
+    // The interpreter allocates this in simulated memory and tracks it.
+    if str_equal(name, "p_vec_new") {
+        // Allocate 24 bytes for the Vec struct {data: i64, len: i64, cap: i64}
+        var vec_addr: i64 = Memory_alloc(&mut self.memory, 24);
+        // Initialize: data=0, len=0, cap=0
+        Memory_store_i64(&mut self.memory, vec_addr, 0);
+        Memory_store_i64(&mut self.memory, vec_addr + 8, 0);
+        Memory_store_i64(&mut self.memory, vec_addr + 16, 0);
+        // Also create a side-table entry for interpreter-level Vec operations
+        var handle: i64 = self.vec_values.len();
+        self.vec_values.push(VecValueEntry_new(handle));
+        self.vec_side_table.push(VecSideEntry_new(vec_addr, handle));
+        return ExecOutcome::Value(Value::Int(vec_addr));
+    }
+    if str_equal(name, "p_vec_push") {
+        // p_vec_push(vec_addr, elem) — elem is an i64 (raw value)
+        if args.len() >= 2 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    var elem: i64 = 0;
+                    match args.get(1) {
+                        Value::Int(e) => { elem = e; }
+                        Value::Ptr(p) => { elem = p; }
+                        _ => {}
+                    }
+                    // Read current len and cap
+                    var len: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                    var cap: i64 = Memory_load_i64(&self.memory, vec_addr + 16);
+                    var data: i64 = Memory_load_i64(&self.memory, vec_addr);
+                    // Grow if needed
+                    if len >= cap {
+                        var new_cap: i64 = 8;
+                        if cap > 0 { new_cap = cap * 2; }
+                        var new_data: i64 = Memory_alloc(&mut self.memory, new_cap * 8);
+                        // Copy old data
+                        var ci: i64 = 0;
+                        while ci < len {
+                            var v: i64 = Memory_load_i64(&self.memory, data + ci * 8);
+                            Memory_store_i64(&mut self.memory, new_data + ci * 8, v);
+                            ci = ci + 1;
+                        }
+                        data = new_data;
+                        cap = new_cap;
+                        Memory_store_i64(&mut self.memory, vec_addr, data);
+                        Memory_store_i64(&mut self.memory, vec_addr + 16, cap);
+                    }
+                    // Store element
+                    Memory_store_i64(&mut self.memory, data + len * 8, elem);
+                    len = len + 1;
+                    Memory_store_i64(&mut self.memory, vec_addr + 8, len);
+                    return ExecOutcome::Value(Value::Void);
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_vec_get") {
+        if args.len() >= 2 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    match args.get(1) {
+                        Value::Int(idx) => {
+                            var len: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                            if idx < 0 || idx >= len {
+                                return ExecOutcome::Panic("Vec index out of bounds");
+                            }
+                            var data: i64 = Memory_load_i64(&self.memory, vec_addr);
+                            var elem: i64 = Memory_load_i64(&self.memory, data + idx * 8);
+                            return ExecOutcome::Value(Value::Int(elem));
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_vec_set") {
+        if args.len() >= 3 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    match args.get(1) {
+                        Value::Int(idx) => {
+                            var elem2: i64 = 0;
+                            match args.get(2) {
+                                Value::Int(e2) => { elem2 = e2; }
+                                Value::Ptr(p2) => { elem2 = p2; }
+                                _ => {}
+                            }
+                            var len2: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                            if idx < 0 || idx >= len2 {
+                                return ExecOutcome::Panic("Vec index out of bounds");
+                            }
+                            var data2: i64 = Memory_load_i64(&self.memory, vec_addr);
+                            Memory_store_i64(&mut self.memory, data2 + idx * 8, elem2);
+                            return ExecOutcome::Value(Value::Void);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_vec_len") {
+        if args.len() >= 1 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    var len3: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                    return ExecOutcome::Value(Value::Int(len3));
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_vec_is_empty") {
+        if args.len() >= 1 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    var len4: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                    return ExecOutcome::Value(Value::Bool(len4 == 0));
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Bool(true));
+    }
+    if str_equal(name, "p_vec_pop") {
+        if args.len() >= 1 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    var len5: i64 = Memory_load_i64(&self.memory, vec_addr + 8);
+                    if len5 == 0 {
+                        return ExecOutcome::Panic("Vec is empty");
+                    }
+                    var data5: i64 = Memory_load_i64(&self.memory, vec_addr);
+                    var elem5: i64 = Memory_load_i64(&self.memory, data5 + (len5 - 1) * 8);
+                    len5 = len5 - 1;
+                    Memory_store_i64(&mut self.memory, vec_addr + 8, len5);
+                    return ExecOutcome::Value(Value::Int(elem5));
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_vec_clear") {
+        if args.len() >= 1 {
+            match args.get(0) {
+                Value::Int(vec_addr) => {
+                    Memory_store_i64(&mut self.memory, vec_addr + 8, 0);
+                    return ExecOutcome::Value(Value::Void);
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
+    }
+
+    // ─── Map Operations (simplified) ───
+    if str_equal(name, "p_map_new") {
+        // Allocate a HashMap struct (simplified: 32 bytes)
+        var map_addr: i64 = Memory_alloc(&mut self.memory, 32);
+        Memory_store_i64(&mut self.memory, map_addr, 0);     // keys ptr
+        Memory_store_i64(&mut self.memory, map_addr + 8, 0); // vals ptr
+        Memory_store_i64(&mut self.memory, map_addr + 16, 0); // len
+        Memory_store_i64(&mut self.memory, map_addr + 24, 0); // cap
+        return ExecOutcome::Value(Value::Int(map_addr));
+    }
+    if str_equal(name, "p_map_insert") {
+        // p_map_insert(map_addr, key, value) — simplified linear scan
+        // For now, just return void (full implementation would use
+        // a side-table for key-value pairs)
+        return ExecOutcome::Value(Value::Void);
+    }
+    if str_equal(name, "p_map_get") || str_equal(name, "p_map_get_or") {
+        // Simplified: return 0 if not found
+        if str_equal(name, "p_map_get_or") && args.len() >= 3 {
+            return ExecOutcome::Value(args.get(2));
+        }
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_map_contains") {
+        return ExecOutcome::Value(Value::Bool(false));
+    }
+    if str_equal(name, "p_map_len") {
+        return ExecOutcome::Value(Value::Int(0));
+    }
+    if str_equal(name, "p_map_is_empty") {
+        return ExecOutcome::Value(Value::Bool(true));
+    }
+    if str_equal(name, "p_map_clear") {
+        return ExecOutcome::Value(Value::Void);
+    }
+
+    // ─── Default: return 0 for unknown runtime functions ───
+    // This handles stubs for advanced features (tensors, networking, etc.)
+    if self.verbose {
+        p_eprint_str("[interp] unimplemented runtime func: ");
+        p_eprint_str(name);
+        p_eprint_str("\n");
+    }
+    return ExecOutcome::Value(Value::Int(0));
+}
+
+// ===========================================================================
+// run_and_print -- execute main() and print result, return exit code
+// ===========================================================================
+//
+// This wraps Interpreter_run and handles printing the result.
+// Returns 0 on success, 1 on panic/error.
+
+pub fn Interpreter_run_and_print(self: &mut Interpreter) -> i64 {
+    var result: RunResult = Interpreter_run(self);
+    match result {
+        RunResult::Return(v) => {
+            match v {
+                Value::Void => { }
+                _ => {
+                    p_print_str("=> ");
+                    p_print_str(Interpreter_value_to_string(self, v));
+                    p_print_str("\n");
+                }
+            }
+            return 0;
+        }
+        RunResult::Panic(msg) => {
+            p_eprint_str("Runtime panic: ");
+            p_eprint_str(msg);
+            p_eprint_str("\n");
+            return 1;
+        }
+        RunResult::Paused => {
+            p_eprint_str("Execution paused\n");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// ===========================================================================
+// Missing helper functions — ported from src/interp.rs
+// ===========================================================================
+
+/// coerce_str_to_int — materialize a Str value into memory and return Int(addr).
+/// Used when a string value is passed to an I64/U64 parameter.
+pub fn Interpreter_coerce_str_to_int(self: &mut Interpreter, v: Value) -> Value {
+    match v {
+        Value::Str(s) => {
+            var addr: i64 = Memory_store_cstr(&mut self.memory, s);
+            return Value::Int(addr);
+        }
+        _ => { return v; }
+    }
+}
+
+/// is_wrapping_func — check if the currently executing function is @wrapping.
+pub fn Interpreter_is_wrapping_func(self: &Interpreter) -> bool {
+    if str_len(self.current_func_name) == 0 { return false; }
+    var func_opt: OptIrFunction = IrModule_get_function(&self.module, self.current_func_name);
+    match func_opt {
+        OptIrFunction::Some(f) => { return f.is_wrapping; }
+        OptIrFunction::None => { return false; }
+    }
+}
+
+/// stringify_value — serialize a Value to a type-prefixed string for persistence.
+/// Format: "i:42", "b:true", "f:3.14", "s:hello", "p:0x1234", "pv:elem,elem"
+pub fn Interpreter_stringify_value(self: &Interpreter, val: Value) -> str {
+    match val {
+        Value::Int(n) => { return "i:" + int_to_str(n); }
+        Value::Bool(b) => {
+            if b { return "b:true"; }
+            return "b:false";
+        }
+        Value::Float(f) => { return "f:" + float_to_str(f); }
+        Value::Str(s) => { return "s:" + s; }
+        Value::Ptr(addr) => {
+            // Look up opaque side-table for richer serialization
+            var opaque_opt: OptValue = Interpreter_lookup_opaque(self, addr);
+            match opaque_opt {
+                OptValue::Some(opaque) => {
+                    match opaque {
+                        Value::Str(s) => { return "ps:" + s; }
+                        _ => { return "p:" + int_to_str(addr); }
+                    }
+                }
+                OptValue::None => { return "p:" + int_to_str(addr); }
+            }
+        }
+        _ => { return "v:void"; }
+    }
+}
+
+/// parse_persisted_value — parse a type-prefixed string back into a Value.
+pub fn Interpreter_parse_persisted_value(self: &Interpreter, saved: str, default: Value) -> Value {
+    var colon_idx: i64 = str_find(saved, ":");
+    if colon_idx >= 0 {
+        var prefix: str = str_slice(saved, 0, colon_idx + 1);
+        var rest: str = str_slice(saved, colon_idx + 1, str_len(saved));
+        if str_equal(prefix, "i:") { return Value::Int(str_parse_int(rest)); }
+        if str_equal(prefix, "b:") { return Value::Bool(str_equal(rest, "true")); }
+        if str_equal(prefix, "f:") { return Value::Float(str_parse_float(rest)); }
+        if str_equal(prefix, "s:") { return Value::Str(rest); }
+        if str_equal(prefix, "ps:") { return Value::Str(rest); }
+        if str_equal(prefix, "p:") { return Value::Ptr(str_parse_int(rest)); }
+    }
+    return default;
+}
+
+/// arg_string — extract a string from a Value argument.
+/// Handles Value::Str, Value::Ptr (load C string from memory), and
+/// Value::Int (check opaque table or load from memory).
+pub fn Interpreter_arg_string(self: &Interpreter, v: Value) -> OptStr {
+    match v {
+        Value::Str(s) => { return OptStr::Some(s); }
+        Value::Ptr(addr) => {
+            if addr > 0 {
+                var loaded: str = Memory_load_cstr(&self.memory, addr);
+                return OptStr::Some(loaded);
+            }
+            return OptStr::None;
+        }
+        Value::Int(i) => {
+            if i > 0 {
+                // Check opaque side-table first
+                var opaque_opt: OptValue = Interpreter_lookup_opaque(self, i);
+                match opaque_opt {
+                    OptValue::Some(o) => {
+                        match o {
+                            Value::Str(s) => { return OptStr::Some(s); }
+                            _ => {}
+                        }
+                    }
+                    OptValue::None => {}
+                }
+                // Try loading a null-terminated string from memory
+                if Memory_is_valid_addr(&self.memory, i) {
+                    var loaded2: str = Memory_load_cstr(&self.memory, i);
+                    if str_len(loaded2) > 0 { return OptStr::Some(loaded2); }
+                }
+            }
+            return OptStr::None;
+        }
+        _ => { return OptStr::None; }
+    }
+}
+
+/// lookup_vec_value — look up a Vec Value from an Int/Ptr address.
+/// Checks the vec_side_table first, then the opaque_values table.
+pub fn Interpreter_lookup_vec_value(self: &Interpreter, arg: Value) -> OptValue {
+    match arg {
+        Value::Int(addr) => {
+            if addr > 0 {
+                // Check vec_side_table
+                var si: i64 = 0;
+                while si < self.vec_side_table.len() {
+                    if self.vec_side_table.get(si).vec_addr == addr {
+                        var side_idx: i64 = self.vec_side_table.get(si).side_idx;
+                        // Look up in opaque_values by side_idx as address
+                        return Interpreter_lookup_opaque(self, side_idx);
+                    }
+                    si = si + 1;
+                }
+                // Try opaque_values directly
+                return Interpreter_lookup_opaque(self, addr);
+            }
+            return OptValue::None;
+        }
+        Value::Ptr(addr) => {
+            if addr > 0 {
+                var si2: i64 = 0;
+                while si2 < self.vec_side_table.len() {
+                    if self.vec_side_table.get(si2).vec_addr == addr {
+                        var side_idx2: i64 = self.vec_side_table.get(si2).side_idx;
+                        return Interpreter_lookup_opaque(self, side_idx2);
+                    }
+                    si2 = si2 + 1;
+                }
+                return Interpreter_lookup_opaque(self, addr);
+            }
+            return OptValue::None;
+        }
+        _ => { return OptValue::None; }
+    }
+}
+
+/// read_raw_vec_i64 — read a raw Fides Vec struct from memory.
+/// Vec is 24 bytes: { data: i64, len: i64, cap: i64 }.
+/// Elements are at data[i*8] as raw i64 values.
+pub fn Interpreter_read_raw_vec_i64(self: &Interpreter, addr: i64) -> OptVecI64 {
+    if addr == 0 { return OptVecI64::None; }
+    var len: i64 = Memory_load_i64(&self.memory, addr + 8);
+    if len < 0 { return OptVecI64::None; }
+    var data: i64 = Memory_load_i64(&self.memory, addr);
+    if data <= 0 { return OptVecI64::Some(Vec::new()); }
+    var result: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < len {
+        var elem: i64 = Memory_load_i64(&self.memory, data + i * 8);
+        result.push(elem);
+        i = i + 1;
+    }
+    return OptVecI64::Some(result);
+}
+
+/// arg_to_vec_i64 — extract a Vec<i64> from an argument.
+/// Handles Value::Vec (interpreter builtin) and Value::Int/Ptr (raw Fides Vec).
+pub fn Interpreter_arg_to_vec_i64(self: &Interpreter, arg: Value) -> OptVecI64 {
+    match arg {
+        Value::Vec(vec_handle) => {
+            // Read from vec_values side table
+            if vec_handle >= 0 && vec_handle < self.vec_values.len() {
+                // This is a simplified version — returns empty for now
+                return OptVecI64::Some(Vec::new());
+            }
+            return OptVecI64::None;
+        }
+        Value::Int(addr) => {
+            if addr > 0 {
+                // First try the side-table
+                var lookup: OptValue = Interpreter_lookup_vec_value(self, arg);
+                match lookup {
+                    OptValue::Some(v) => {
+                        match v {
+                            Value::Vec(_) => {
+                                // Simplified — would extract elements
+                                return OptVecI64::Some(Vec::new());
+                            }
+                            _ => {}
+                        }
+                    }
+                    OptValue::None => {}
+                }
+                // Try reading as raw Fides Vec
+                return Interpreter_read_raw_vec_i64(self, addr);
+            }
+            return OptVecI64::None;
+        }
+        Value::Ptr(addr) => {
+            if addr > 0 {
+                var lookup2: OptValue = Interpreter_lookup_vec_value(self, arg);
+                match lookup2 {
+                    OptValue::Some(v2) => {
+                        match v2 {
+                            Value::Vec(_) => { return OptVecI64::Some(Vec::new()); }
+                            _ => {}
+                        }
+                    }
+                    OptValue::None => {}
+                }
+                return Interpreter_read_raw_vec_i64(self, addr);
+            }
+            return OptVecI64::None;
+        }
+        _ => { return OptVecI64::None; }
+    }
+}
+
+/// args_to_f64_vec — extract a Vec<f64> from args[idx].
+/// Handles Value::Vec and Value::Int/Ptr (Fides Vec via fides_vec_to_value_vec).
+pub fn Interpreter_args_to_f64_vec(self: &mut Interpreter, args: Vec<Value>, idx: i64) -> OptVecF64 {
+    if idx < 0 || idx >= args.len() { return OptVecF64::None; }
+    var arg: Value = args.get(idx);
+    match arg {
+        Value::Vec(_) => {
+            // Simplified — would extract float elements
+            return OptVecF64::Some(Vec::new());
+        }
+        Value::Int(ptr) => {
+            // Fides Vec — convert via fides_vec_to_value_vec
+            var v: Value = Interpreter_fides_vec_to_value_vec(self, ptr);
+            match v {
+                Value::Vec(_) => { return OptVecF64::Some(Vec::new()); }
+                _ => { return OptVecF64::None; }
+            }
+        }
+        Value::Ptr(ptr) => {
+            var v2: Value = Interpreter_fides_vec_to_value_vec(self, ptr);
+            match v2 {
+                Value::Vec(_) => { return OptVecF64::Some(Vec::new()); }
+                _ => { return OptVecF64::None; }
+            }
+        }
+        _ => { return OptVecF64::None; }
+    }
+}
+
+/// fides_vec_to_value_vec — convert a Fides Vec (i64 pointer) to a Value::Vec.
+/// Uses Vec_len and Vec_get functions if available.
+pub fn Interpreter_fides_vec_to_value_vec(self: &mut Interpreter, vec_ptr: i64) -> Value {
+    // Try using Vec_len/Vec_get from the module
+    var len_fn_opt: OptIrFunction = IrModule_get_function(&self.module, "Vec_len");
+    var get_fn_opt: OptIrFunction = IrModule_get_function(&self.module, "Vec_get");
+    match len_fn_opt {
+        OptIrFunction::Some(len_fn) => {
+            match get_fn_opt {
+                OptIrFunction::Some(get_fn) => {
+                    var len_args: Vec<Value> = Vec::new();
+                    len_args.push(Value::Int(0));
+                    len_args.push(Value::Int(vec_ptr));
+                    var len_result: RunResult = Interpreter_run_function(self, len_fn, len_args);
+                    var len: i64 = 0;
+                    match len_result {
+                        RunResult::Return(v) => {
+                            match v {
+                                Value::Int(n) => { len = n; }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                    // Simplified — return empty Vec Value
+                    return Value::Void;
+                }
+                OptIrFunction::None => {}
+            }
+        }
+        OptIrFunction::None => {}
+    }
+    return Value::Void;
+}
+
+/// find_vec_addr — find the Vec struct address for a Value::Vec by scanning vec_side_table.
+pub fn Interpreter_find_vec_addr(self: &Interpreter, v: Value) -> i64 {
+    match v {
+        Value::Vec(target_handle) => {
+            var si: i64 = 0;
+            while si < self.vec_side_table.len() {
+                if self.vec_side_table.get(si).side_idx == target_handle {
+                    return self.vec_side_table.get(si).vec_addr;
+                }
+                si = si + 1;
+            }
+        }
+        _ => {}
+    }
+    return 0;
+}
+
+/// format_panic_trace — format the panic stack trace as a string.
+pub fn Interpreter_format_panic_trace(self: &Interpreter) -> OptStr {
+    match self.panic_stack_trace {
+        OptStr::Some(s) => { return OptStr::Some(s); }
+        OptStr::None => { return OptStr::None; }
+    }
+}
+
+/// take_panic_stack_trace — consume the panic stack trace.
+pub fn Interpreter_take_panic_stack_trace(self: &mut Interpreter) -> OptStr {
+    var trace: OptStr = self.panic_stack_trace;
+    self.panic_stack_trace = OptStr::None;
+    return trace;
+}
+
+/// get_call_stack — return a copy of the call stack.
+pub fn Interpreter_get_call_stack(self: &Interpreter) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < self.call_stack.len() {
+        result.push(self.call_stack.get(i));
+        i = i + 1;
+    }
+    return result;
+}
+
+/// get_current_func_name — return the current function name.
+pub fn Interpreter_get_current_func_name(self: &Interpreter) -> str {
+    return self.current_func_name;
+}
+
+/// get_memory_usage — return (allocated, capacity) as packed i64.
+pub fn Interpreter_get_memory_usage(self: &Interpreter) -> i64 {
+    var allocated: i64 = Memory_allocated(&self.memory);
+    var cap: i64 = Memory_capacity(&self.memory);
+    return allocated * 1000000 + cap;
+}
+
+/// get_module — return a reference to the IR module.
+/// In Fides, we return a copy since references are limited.
+pub fn Interpreter_get_module(self: &Interpreter) -> IrModule {
+    return self.module;
+}
+
+/// get_thread_count — return the number of threads (always 1 for interpreter).
+pub fn Interpreter_get_thread_count(self: &Interpreter) -> i64 {
+    return 1;
+}
+
+/// enable_profiling — enable profiling mode.
+pub fn Interpreter_enable_profiling(self: &mut Interpreter) {
+    self.verbose = true;
+}
+
+/// enable_recording — enable trace recording.
+pub fn Interpreter_enable_recording(self: &mut Interpreter) {
+    self.verbose = true;
+}
+
+/// get_profile — return profiling data (simplified: empty).
+pub fn Interpreter_get_profile(self: &Interpreter) -> Vec<str> {
+    return Vec::new();
+}
+
+/// get_trace — return trace data (simplified: empty).
+pub fn Interpreter_get_trace(self: &Interpreter) -> Vec<str> {
+    return Vec::new();
+}
+
+/// set_debug_hook — set a debug hook (simplified: no-op in self-hosted).
+pub fn Interpreter_set_debug_hook(self: &mut Interpreter) {
+    self.debug_mode = true;
+}
+
+/// save_persist_state — save persistent state (simplified: no-op).
+pub fn Interpreter_save_persist_state(self: &Interpreter) {
+    // No-op in self-hosted interpreter
+}
+
+/// with_persist_file — set persist file path (simplified: no-op).
+pub fn Interpreter_with_persist_file(self: &mut Interpreter, path: str) {
+    // No-op in self-hosted interpreter
+}
+
+/// wildcard_match — simple wildcard pattern matching.
+/// ? matches any single char, * matches zero or more chars.
+pub fn wildcard_match(s: str, pattern: str) -> bool {
+    var s_len: i64 = str_len(s);
+    var p_len: i64 = str_len(pattern);
+    var s_idx: i64 = 0;
+    var p_idx: i64 = 0;
+    var star_s: i64 = -1;
+    var star_p: i64 = -1;
+    while s_idx < s_len {
+        if p_idx < p_len {
+            var pc: i64 = str_byte_at(pattern, p_idx);
+            var sc: i64 = str_byte_at(s, s_idx);
+            if pc == 63 || pc == sc {
+                s_idx = s_idx + 1;
+                p_idx = p_idx + 1;
+            } else if pc == 42 {
+                star_p = p_idx;
+                star_s = s_idx;
+                p_idx = p_idx + 1;
+            } else if star_p >= 0 {
+                p_idx = star_p + 1;
+                s_idx = star_s + 1;
+                star_s = s_idx;
+            } else {
+                return false;
+            }
+        } else if star_p >= 0 {
+            p_idx = star_p + 1;
+            s_idx = star_s + 1;
+            star_s = s_idx;
+        } else {
+            return false;
+        }
+    }
+    while p_idx < p_len && str_byte_at(pattern, p_idx) == 42 {
+        p_idx = p_idx + 1;
+    }
+    return p_idx == p_len;
+}
+
+/// arg_vec_usize — extract a Vec<usize> from args[idx] (simplified).
+pub fn arg_vec_usize(args: Vec<Value>, idx: i64) -> OptVecI64 {
+    if idx < 0 || idx >= args.len() { return OptVecI64::None; }
+    match args.get(idx) {
+        Value::Vec(_) => { return OptVecI64::Some(Vec::new()); }
+        _ => { return OptVecI64::None; }
+    }
+}
+
+/// arg_vec_i64 — extract a Vec<i64> from args[idx] (simplified).
+pub fn arg_vec_i64(args: Vec<Value>, idx: i64) -> OptVecI64 {
+    if idx < 0 || idx >= args.len() { return OptVecI64::None; }
+    match args.get(idx) {
+        Value::Vec(_) => { return OptVecI64::Some(Vec::new()); }
+        _ => { return OptVecI64::None; }
+    }
+}
+
+/// arg_vec_f64 — extract a Vec<f64> from args[idx] (simplified).
+pub fn arg_vec_f64(args: Vec<Value>, idx: i64) -> OptVecF64 {
+    if idx < 0 || idx >= args.len() { return OptVecF64::None; }
+    match args.get(idx) {
+        Value::Vec(_) => { return OptVecF64::Some(Vec::new()); }
+        _ => { return OptVecF64::None; }
+    }
+}
+
+/// simd_binary — SIMD binary operation helper.
+pub fn simd_binary(args: Vec<Value>, f: fn(f64, f64) -> f64) -> ExecOutcome {
+    // Simplified — would extract vec elements, apply f, return Vec
+    return ExecOutcome::Panic("simd: not fully supported in self-hosted interpreter");
+}
+
+/// interpret — convenience function: lower and interpret a program.
+pub fn interpret(module: IrModule, verbose: bool, release: bool) -> i64 {
+    return interpret_ir_module(module);
+}
+
+/// interpret_with_options — interpret with configurable max_recursion.
+pub fn interpret_with_options(module: IrModule, verbose: bool, release: bool, max_recursion: i64) -> i64 {
+    var max_steps: i64 = 0;
+    var max_memory: i64 = 0;
+    return interpret_ir_module_with_options(module, max_recursion, max_steps, max_memory, verbose);
+}
+
+/// interpret_with_options_full — full version with max_steps.
+pub fn interpret_with_options_full(module: IrModule, verbose: bool, release: bool, max_recursion: i64, max_steps: i64) -> i64 {
+    var max_memory: i64 = 0;
+    return interpret_ir_module_with_options(module, max_recursion, max_steps, max_memory, verbose);
+}
+
+/// interpret_with_options_full2 — full version with max_steps and max_memory.
+pub fn interpret_with_options_full2(module: IrModule, verbose: bool, release: bool, max_recursion: i64, max_steps: i64, max_memory: i64) -> i64 {
+    return interpret_ir_module_with_options(module, max_recursion, max_steps, max_memory, verbose);
+}
+
+// ===========================================================================
+// interpret_ir_module -- run a pre-built IrModule, return exit code
+// ===========================================================================
+
+pub fn interpret_ir_module(ir_mod: IrModule) -> i64 {
+    var interp_inst: Interpreter = Interpreter_new(ir_mod);
+    return Interpreter_run_and_print(&mut interp_inst);
+}
+
+pub fn interpret_ir_module_with_options(ir_mod: IrModule, max_recursion: i64, max_steps: i64, max_memory: i64, verbose: bool) -> i64 {
+    var interp_inst: Interpreter = Interpreter_new(ir_mod);
+    if verbose { Interpreter_verbose(&mut interp_inst); }
+    if max_recursion > 0 { Interpreter_set_max_recursion(&mut interp_inst, max_recursion); }
+    if max_steps > 0 { Interpreter_set_max_steps(&mut interp_inst, max_steps); }
+    if max_memory > 0 { Interpreter_set_max_memory(&mut interp_inst, max_memory); }
+    return Interpreter_run_and_print(&mut interp_inst);
+}

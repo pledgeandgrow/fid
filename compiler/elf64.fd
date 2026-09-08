@@ -1,0 +1,2423 @@
+// elf64.fd -- ELF64 Object File Emitter for Linux x86-64
+// Ported from src/elf64.rs. Produces ELF64 relocatable object files (.o).
+//
+// Pipeline: IrModule -> assembly text -> encode instructions -> ELF64 .o file
+//
+// ELF64 format:
+//   - ELF header (64 bytes)
+//   - Section headers (array of Elf64Shdr, 64 bytes each)
+//   - Sections: .text, .rela.text, .symtab, .strtab, .shstrtab
+
+module compiler::elf64;
+
+use core;
+use vec;
+use string;
+use compiler::pir;
+
+// --- Local helper: split string by newlines ---
+fn str_lines(s: str) -> Vec<str> {
+    var result: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    var start: i64 = 0;
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        if b == 10 {
+            result.push(str_slice(s, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < str_len(s) {
+        result.push(str_slice(s, start, str_len(s)));
+    }
+    return result;
+}
+
+// --- Constants ------------------------------------------------------------
+
+pub const ELFMAG0: i64 = 0x7f;
+pub const ELFMAG1: i64 = 0x45;  // 'E'
+pub const ELFMAG2: i64 = 0x4c;  // 'L'
+pub const ELFMAG3: i64 = 0x46;  // 'F'
+pub const ELFCLASS64: i64 = 2;
+pub const ELFDATA2LSB: i64 = 1;
+pub const EV_CURRENT: i64 = 1;
+pub const ELFOSABI_NONE: i64 = 0;
+pub const ET_REL: i64 = 1;
+pub const ET_EXEC: i64 = 2;
+pub const EM_X86_64: i64 = 62;
+pub const EM_AARCH64: i64 = 183;
+pub const EM_RISCV: i64 = 243;
+
+pub const SHT_NULL: i64 = 0;
+pub const SHT_PROGBITS: i64 = 1;
+pub const SHT_SYMTAB: i64 = 2;
+pub const SHT_STRTAB: i64 = 3;
+pub const SHT_RELA: i64 = 4;
+
+pub const SHF_ALLOC: i64 = 0x2;
+pub const SHF_EXECINSTR: i64 = 0x4;
+pub const SHF_INFO_LINK: i64 = 0x40;
+
+pub const STB_LOCAL: i64 = 0;
+pub const STB_GLOBAL: i64 = 1;
+
+pub const STT_NOTYPE: i64 = 0;
+pub const STT_FUNC: i64 = 2;
+pub const STT_SECTION: i64 = 3;
+pub const STT_FILE: i64 = 4;
+
+pub const SHN_UNDEF: i64 = 0;
+pub const SHN_ABS: i64 = 0xfff1;
+
+pub const R_X86_64_64: i64 = 1;
+pub const R_X86_64_PC32: i64 = 2;
+pub const R_X86_64_PLT32: i64 = 4;
+
+// --- Structs --------------------------------------------------------------
+
+pub struct Symbol {
+    pub name: str,
+    pub value: i64,
+    pub size: i64,
+    pub binding: i64,
+    pub sym_type: i64,
+    pub section: i64,
+    pub is_defined: bool,
+}
+
+pub fn Symbol_new(name: str, value: i64, size: i64, binding: i64, sym_type: i64, section: i64, is_defined: bool) -> Symbol {
+    return Symbol { name: name, value: value, size: size, binding: binding, sym_type: sym_type, section: section, is_defined: is_defined };
+}
+
+pub struct Relocation {
+    pub offset: i64,
+    pub symbol: i64,
+    pub rtype: i64,
+    pub addend: i64,
+}
+
+pub fn Relocation_new(offset: i64, symbol: i64, rtype: i64, addend: i64) -> Relocation {
+    return Relocation { offset: offset, symbol: symbol, rtype: rtype, addend: addend };
+}
+
+pub struct RodataSym {
+    pub name: str,
+    pub offset: i64,
+}
+
+pub fn RodataSym_new(name: str, offset: i64) -> RodataSym {
+    return RodataSym { name: name, offset: offset };
+}
+
+pub struct SymIndex {
+    pub name: str,
+    pub idx: i64,
+}
+
+pub struct ElfEmitter {
+    pub text: Vec<i64>,
+    pub machine: i64,
+    pub comment: Vec<i64>,
+    pub symbols: Vec<Symbol>,
+    pub symbol_index: Vec<SymIndex>,
+    pub relocations: Vec<Relocation>,
+    pub strtab: Vec,
+    pub strtab_offsets: Vec<SymIndex>,
+    pub shstrtab: Vec,
+    pub shstrtab_offsets: Vec<SymIndex>,
+    pub rodata: Vec<i64>,
+    pub rodata_symbols: Vec<RodataSym>,
+    pub rodata_relocations: Vec<Relocation>,
+}
+
+pub fn ElfEmitter_new() -> ElfEmitter {
+    var e: ElfEmitter = ElfEmitter {
+        text: Vec::new(),
+        machine: EM_X86_64,
+        comment: Vec::new(),
+        symbols: Vec::new(),
+        symbol_index: Vec::new(),
+        relocations: Vec::new(),
+        strtab: Vec::new(),
+        strtab_offsets: Vec::new(),
+        shstrtab: Vec::new(),
+        shstrtab_offsets: Vec::new(),
+        rodata: Vec::new(),
+        rodata_symbols: Vec::new(),
+        rodata_relocations: Vec::new(),
+    };
+    e.strtab.push(0);
+    e.shstrtab.push(0);
+    ElfEmitter_add_shstrtab(e, "");
+    ElfEmitter_add_shstrtab(e, ".text");
+    ElfEmitter_add_shstrtab(e, ".rodata");
+    ElfEmitter_add_shstrtab(e, ".symtab");
+    ElfEmitter_add_shstrtab(e, ".strtab");
+    ElfEmitter_add_shstrtab(e, ".shstrtab");
+    ElfEmitter_add_shstrtab(e, ".rela.text");
+    ElfEmitter_add_shstrtab(e, ".rela.rodata");
+    return e;
+}
+
+// --- Helper: lookup in Vec<SymIndex> ---
+fn symindex_lookup(vec: Vec<SymIndex>, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < vec.len() {
+        if str_equal(vec.get(i).name, name) { return vec.get(i).idx; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn symindex_set(vec: &mut Vec<SymIndex>, name: str, idx: i64) {
+    var i: i64 = 0;
+    while i < vec.len() {
+        if str_equal(vec.get(i).name, name) {
+            vec.get(i).idx = idx;
+            return;
+        }
+        i = i + 1;
+    }
+    vec.push(SymIndex { name: name, idx: idx });
+}
+
+// --- ElfEmitter methods ---
+
+pub fn ElfEmitter_add_shstrtab(self: &mut ElfEmitter, s: str) -> i64 {
+    var off: i64 = symindex_lookup(self.shstrtab_offsets, s);
+    if off >= 0 { return off; }
+    off = self.shstrtab.len();
+    var i: i64 = 0;
+    while i < str_len(s) { self.shstrtab.push(str_byte_at(s, i)); i = i + 1; }
+    self.shstrtab.push(0);
+    symindex_set(self.shstrtab_offsets, s, off);
+    return off;
+}
+
+pub fn ElfEmitter_add_strtab(self: &mut ElfEmitter, s: str) -> i64 {
+    var off: i64 = symindex_lookup(self.strtab_offsets, s);
+    if off >= 0 { return off; }
+    off = self.strtab.len();
+    var i: i64 = 0;
+    while i < str_len(s) { self.strtab.push(str_byte_at(s, i)); i = i + 1; }
+    self.strtab.push(0);
+    symindex_set(self.strtab_offsets, s, off);
+    return off;
+}
+
+pub fn ElfEmitter_add_symbol(self: &mut ElfEmitter, name: str, value: i64, size: i64, binding: i64, sym_type: i64, section: i64, is_defined: bool) {
+    var idx: i64 = symindex_lookup(self.symbol_index, name);
+    if idx >= 0 {
+        self.symbols.get(idx).value = value;
+        self.symbols.get(idx).size = size;
+        self.symbols.get(idx).binding = binding;
+        self.symbols.get(idx).sym_type = sym_type;
+        self.symbols.get(idx).section = section;
+        self.symbols.get(idx).is_defined = is_defined;
+        return;
+    }
+    idx = self.symbols.len();
+    self.symbols.push(Symbol_new(name, value, size, binding, sym_type, section, is_defined));
+    symindex_set(self.symbol_index, name, idx);
+}
+
+pub fn ElfEmitter_get_or_add_undef_symbol(self: &mut ElfEmitter, name: str) -> i64 {
+    var idx: i64 = symindex_lookup(self.symbol_index, name);
+    if idx >= 0 { return idx; }
+    idx = self.symbols.len();
+    self.symbols.push(Symbol_new(name, 0, 0, STB_GLOBAL, STT_NOTYPE, SHN_UNDEF, false));
+    symindex_set(self.symbol_index, name, idx);
+    return idx;
+}
+
+// --- Byte emission helpers ---
+fn pb2(t: &mut Vec, a: i64, b: i64) { t.push(a & 0xFF); t.push(b & 0xFF); }
+fn pb3(t: &mut Vec, a: i64, b: i64, c: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); }
+fn pb4(t: &mut Vec, a: i64, b: i64, c: i64, d: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); }
+fn pb5(t: &mut Vec, a: i64, b: i64, c: i64, d: i64, e: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); t.push(e & 0xFF); }
+fn pb6(t: &mut Vec, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); t.push(e & 0xFF); t.push(f & 0xFF); }
+fn pb7(t: &mut Vec, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); t.push(e & 0xFF); t.push(f & 0xFF); t.push(g & 0xFF); }
+fn pb8(t: &mut Vec, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) { t.push(a & 0xFF); t.push(b & 0xFF); t.push(c & 0xFF); t.push(d & 0xFF); t.push(e & 0xFF); t.push(f & 0xFF); t.push(g & 0xFF); t.push(h & 0xFF); }
+
+fn emit_u16(t: &mut Vec, v: i64) { t.push(v & 0xFF); t.push((v >> 8) & 0xFF); }
+fn emit_u32(t: &mut Vec, v: i64) { t.push(v & 0xFF); t.push((v >> 8) & 0xFF); t.push((v >> 16) & 0xFF); t.push((v >> 24) & 0xFF); }
+fn emit_u64(t: &mut Vec, v: i64) {
+    var i: i64 = 0;
+    while i < 8 { t.push((v >> (i * 8)) & 0xFF); i = i + 1; }
+}
+
+// --- Result types ---
+pub enum ResultVec { Ok(Vec<i64>), Err(str) }
+
+// --- Unwrap helpers (for cross-module use without enum pattern matching) ---
+
+pub fn ResultVec_is_ok(r: ResultVec) -> bool {
+    match r {
+        ResultVec::Ok(_) => { return true; }
+        ResultVec::Err(_) => { return false; }
+    }
+}
+
+pub fn ResultVec_is_err(r: ResultVec) -> bool {
+    match r {
+        ResultVec::Ok(_) => { return false; }
+        ResultVec::Err(_) => { return true; }
+    }
+}
+
+pub fn ResultVec_err_msg(r: ResultVec) -> str {
+    match r {
+        ResultVec::Ok(_) => { return ""; }
+        ResultVec::Err(e) => { return e; }
+    }
+}
+
+pub fn ResultVec_bytes(r: ResultVec) -> Vec<i64> {
+    match r {
+        ResultVec::Ok(b) => { return b; }
+        ResultVec::Err(_) => { return Vec::new(); }
+    }
+}
+
+// --- Public API ---
+
+pub fn emit_object_file(module: i64, asm: str) -> ResultVec {
+    var emitter: ElfEmitter = ElfEmitter_new();
+    match ElfEmitter_assemble(emitter, asm) {
+        ResultUnit::Ok => {}
+        ResultUnit::Err(e) => { return ResultVec::Err(e); }
+    }
+    return ElfEmitter_build_elf(emitter);
+}
+
+pub fn emit_object_file_for_target(module: i64, asm: str, target: str) -> ResultVec {
+    if str_equal(target, "x86-64") || str_equal(target, "x64") {
+        return emit_object_file(module, asm);
+    }
+    if str_equal(target, "arm64") || str_equal(target, "aarch64") {
+        var emitter: ElfEmitter = ElfEmitter_new();
+        emitter.machine = EM_AARCH64;
+        emitter.text = Vec::new();
+        // Store assembly as .comment section
+        var i: i64 = 0;
+        while i < str_len(asm) { emitter.comment.push(str_byte_at(asm, i)); i = i + 1; }
+        return ElfEmitter_build_elf(emitter);
+    }
+    if str_equal(target, "riscv") || str_equal(target, "riscv64") {
+        var emitter: ElfEmitter = ElfEmitter_new();
+        emitter.machine = EM_RISCV;
+        emitter.text = Vec::new();
+        var i: i64 = 0;
+        while i < str_len(asm) { emitter.comment.push(str_byte_at(asm, i)); i = i + 1; }
+        return ElfEmitter_build_elf(emitter);
+    }
+    return ResultVec::Err("Unknown target: " + target);
+}
+
+// --- Assembly parsing + encoding ---
+
+pub enum ResultUnit { Ok, Err(str) }
+
+
+// --- ElfEmitter::assemble ---
+// Parses assembly text, encodes instructions, collects symbols + relocations.
+pub fn ElfEmitter_assemble(self: &mut ElfEmitter, asm: str) -> ResultUnit {
+    var lines: Vec<str> = str_lines(asm);
+    var li: i64 = 0;
+    var current_func_start: i64 = -1;
+    var current_func_name: str = "";
+    while li < lines.len() {
+        var line: str = str_trim(lines.get(li));
+        if str_len(line) == 0 || str_starts_with(line, "#") || str_starts_with(line, "//") {
+            li = li + 1; continue;
+        }
+        // Handle labels (end with :)
+        if str_ends_with(line, ":") {
+            var label: str = str_slice(line, 0, str_len(line) - 1);
+            // Close previous function
+            if current_func_start >= 0 && str_len(current_func_name) > 0 {
+                var size: i64 = self.text.len() - current_func_start;
+                var idx: i64 = symindex_lookup(self.symbol_index, current_func_name);
+                if idx >= 0 { self.symbols.get(idx).size = size; }
+            }
+            // Rodata labels
+            if str_starts_with(label, ".vtable_") || str_starts_with(label, ".str_") || str_starts_with(label, ".flt_") {
+                current_func_start = -1;
+                current_func_name = "";
+                self.rodata_symbols.push(RodataSym_new(label, self.rodata.len()));
+                li = li + 1; continue;
+            }
+            // Function labels (not starting with .L)
+            if !str_starts_with(label, ".L") {
+                current_func_start = self.text.len();
+                current_func_name = label;
+                ElfEmitter_add_symbol(self, label, self.text.len(), 0, STB_GLOBAL, STT_FUNC, 1, true);
+            } else {
+                ElfEmitter_add_symbol(self, label, self.text.len(), 0, STB_LOCAL, STT_NOTYPE, 1, true);
+            }
+            li = li + 1; continue;
+        }
+        // Handle directives
+        if str_starts_with(line, ".") {
+            ElfEmitter_handle_directive(self, line);
+            li = li + 1; continue;
+        }
+        // Encode instruction
+        ElfEmitter_encode_instruction(self, line);
+        li = li + 1;
+    }
+    // Close last function
+    if current_func_start >= 0 && str_len(current_func_name) > 0 {
+        var size: i64 = self.text.len() - current_func_start;
+        var idx: i64 = symindex_lookup(self.symbol_index, current_func_name);
+        if idx >= 0 { self.symbols.get(idx).size = size; }
+    }
+    return ResultUnit::Ok;
+}
+
+// --- handle_directive ---
+// String constants (.asciz) and float constants (.quad) go into .rodata.
+pub fn ElfEmitter_handle_directive(self: &mut ElfEmitter, line: str) {
+    // Format: "label: .asciz \"value\"" or "label: .quad bits"
+    var colon_idx: i64 = str_find(line, ":");
+    if colon_idx >= 0 {
+        var label: str = str_trim(str_slice(line, 0, colon_idx));
+        var rest: str = str_trim(str_slice(line, colon_idx + 1, str_len(line)));
+        if str_starts_with(rest, ".asciz") || str_starts_with(rest, ".ascii") {
+            var val: str = extract_string_literal(rest);
+            var offset: i64 = self.rodata.len();
+            var vi: i64 = 0;
+            while vi < str_len(val) { self.rodata.push(str_byte_at(val, vi)); vi = vi + 1; }
+            if str_starts_with(rest, ".asciz") { self.rodata.push(0); }
+            self.rodata_symbols.push(RodataSym_new(label, offset));
+            return;
+        }
+        if str_starts_with(rest, ".quad") {
+            // .quad value: either numeric or symbol reference
+            var parts: Vec<str> = str_split(rest, " ");
+            if parts.len() >= 2 {
+                var offset: i64 = self.rodata.len();
+                var bits: i64 = str_parse_int(parts.get(1));
+                if bits != 0 || str_equal(parts.get(1), "0") {
+                    // Numeric constant
+                    emit_u64(self.rodata, bits);
+                    self.rodata_symbols.push(RodataSym_new(label, offset));
+                } else {
+                    // Symbol reference
+                    var sym_idx: i64 = 0;
+                    if str_starts_with(parts.get(1), ".L") {
+                        sym_idx = ElfEmitter_get_or_add_local_label(self, parts.get(1));
+                    } else {
+                        sym_idx = ElfEmitter_get_or_add_undef_symbol(self, parts.get(1));
+                    }
+                    var zi: i64 = 0; while zi < 8 { self.rodata.push(0); zi = zi + 1; }
+                    self.rodata_symbols.push(RodataSym_new(label, offset));
+                    self.rodata_relocations.push(Relocation_new(offset, sym_idx, R_X86_64_64, 0));
+                }
+            }
+            return;
+        }
+    }
+    // .quad without label
+    if str_starts_with(line, ".quad") {
+        var parts: Vec<str> = str_split(line, " ");
+        if parts.len() >= 2 {
+            var bits: i64 = str_parse_int(parts.get(1));
+            if bits != 0 || str_equal(parts.get(1), "0") {
+                emit_u64(self.rodata, bits);
+            } else {
+                var sym_idx: i64 = 0;
+                if str_starts_with(parts.get(1), ".L") {
+                    sym_idx = ElfEmitter_get_or_add_local_label(self, parts.get(1));
+                } else {
+                    sym_idx = ElfEmitter_get_or_add_undef_symbol(self, parts.get(1));
+                }
+                var offset: i64 = self.rodata.len();
+                var zi: i64 = 0; while zi < 8 { self.rodata.push(0); zi = zi + 1; }
+                self.rodata_relocations.push(Relocation_new(offset, sym_idx, R_X86_64_64, 0));
+            }
+        }
+    }
+    // .globl, .type, .size, .text, .section, .align — all ignored
+}
+
+// --- get_or_add_local_label ---
+pub fn ElfEmitter_get_or_add_local_label(self: &mut ElfEmitter, label: str) -> i64 {
+    var idx: i64 = symindex_lookup(self.symbol_index, label);
+    if idx >= 0 { return idx; }
+    idx = self.symbols.len();
+    self.symbols.push(Symbol_new(label, 0, 0, STB_LOCAL, STT_NOTYPE, SHN_UNDEF, false));
+    symindex_set(self.symbol_index, label, idx);
+    return idx;
+}
+
+// ===========================================================================
+// Register parsing helpers
+// ===========================================================================
+
+// Option types for parsing
+pub enum OptI64 { Some(i64), None }
+
+/// Parse a 64-bit or 32-bit register name to its index (0-15).
+/// Input: "%rax" -> 0, "%rcx" -> 1, etc.
+fn try_parse_reg(s: str) -> OptI64 {
+    var t: str = str_trim(s);
+    if !str_starts_with(t, "%") { return OptI64::None; }
+    var r: str = str_slice(t, 1, str_len(t));
+    if str_equal(r, "rax") { return OptI64::Some(0); }
+    if str_equal(r, "rcx") { return OptI64::Some(1); }
+    if str_equal(r, "rdx") { return OptI64::Some(2); }
+    if str_equal(r, "rbx") { return OptI64::Some(3); }
+    if str_equal(r, "rsp") { return OptI64::Some(4); }
+    if str_equal(r, "rbp") { return OptI64::Some(5); }
+    if str_equal(r, "rsi") { return OptI64::Some(6); }
+    if str_equal(r, "rdi") { return OptI64::Some(7); }
+    if str_equal(r, "r8") { return OptI64::Some(8); }
+    if str_equal(r, "r9") { return OptI64::Some(9); }
+    if str_equal(r, "r10") { return OptI64::Some(10); }
+    if str_equal(r, "r11") { return OptI64::Some(11); }
+    if str_equal(r, "r12") { return OptI64::Some(12); }
+    if str_equal(r, "r13") { return OptI64::Some(13); }
+    if str_equal(r, "r14") { return OptI64::Some(14); }
+    if str_equal(r, "r15") { return OptI64::Some(15); }
+    // 32-bit names
+    if str_equal(r, "eax") { return OptI64::Some(0); }
+    if str_equal(r, "ecx") { return OptI64::Some(1); }
+    if str_equal(r, "edx") { return OptI64::Some(2); }
+    if str_equal(r, "ebx") { return OptI64::Some(3); }
+    if str_equal(r, "esp") { return OptI64::Some(4); }
+    if str_equal(r, "ebp") { return OptI64::Some(5); }
+    if str_equal(r, "esi") { return OptI64::Some(6); }
+    if str_equal(r, "edi") { return OptI64::Some(7); }
+    if str_equal(r, "r8d") { return OptI64::Some(8); }
+    if str_equal(r, "r9d") { return OptI64::Some(9); }
+    if str_equal(r, "r10d") { return OptI64::Some(10); }
+    if str_equal(r, "r11d") { return OptI64::Some(11); }
+    if str_equal(r, "r12d") { return OptI64::Some(12); }
+    if str_equal(r, "r13d") { return OptI64::Some(13); }
+    if str_equal(r, "r14d") { return OptI64::Some(14); }
+    if str_equal(r, "r15d") { return OptI64::Some(15); }
+    return OptI64::None;
+}
+
+/// Check if a register operand is 32-bit (e.g., "%eax", "%r8d").
+fn is_reg32(s: str) -> bool {
+    var t: str = str_trim(s);
+    if !str_starts_with(t, "%") { return false; }
+    var r: str = str_slice(t, 1, str_len(t));
+    if str_equal(r, "eax") { return true; }
+    if str_equal(r, "ecx") { return true; }
+    if str_equal(r, "edx") { return true; }
+    if str_equal(r, "ebx") { return true; }
+    if str_equal(r, "esp") { return true; }
+    if str_equal(r, "ebp") { return true; }
+    if str_equal(r, "esi") { return true; }
+    if str_equal(r, "edi") { return true; }
+    if str_equal(r, "r8d") { return true; }
+    if str_equal(r, "r9d") { return true; }
+    if str_equal(r, "r10d") { return true; }
+    if str_equal(r, "r11d") { return true; }
+    if str_equal(r, "r12d") { return true; }
+    if str_equal(r, "r13d") { return true; }
+    if str_equal(r, "r14d") { return true; }
+    if str_equal(r, "r15d") { return true; }
+    return false;
+}
+
+/// Parse an 8-bit register name to its index.
+fn try_parse_reg8(s: str) -> OptI64 {
+    var t: str = str_trim(s);
+    if !str_starts_with(t, "%") { return OptI64::None; }
+    var r: str = str_slice(t, 1, str_len(t));
+    if str_equal(r, "al") { return OptI64::Some(0); }
+    if str_equal(r, "cl") { return OptI64::Some(1); }
+    if str_equal(r, "dl") { return OptI64::Some(2); }
+    if str_equal(r, "bl") { return OptI64::Some(3); }
+    if str_equal(r, "sil") { return OptI64::Some(6); }
+    if str_equal(r, "dil") { return OptI64::Some(7); }
+    if str_equal(r, "r8b") { return OptI64::Some(8); }
+    if str_equal(r, "r9b") { return OptI64::Some(9); }
+    if str_equal(r, "r10b") { return OptI64::Some(10); }
+    if str_equal(r, "r11b") { return OptI64::Some(11); }
+    if str_equal(r, "r12b") { return OptI64::Some(12); }
+    if str_equal(r, "r13b") { return OptI64::Some(13); }
+    if str_equal(r, "r14b") { return OptI64::Some(14); }
+    if str_equal(r, "r15b") { return OptI64::Some(15); }
+    return OptI64::None;
+}
+
+/// Parse an XMM register: %xmm0-%xmm15
+fn parse_xmm_reg(s: str) -> OptI64 {
+    var t: str = str_trim(s);
+    if !str_starts_with(t, "%") { return OptI64::None; }
+    var r: str = str_slice(t, 1, str_len(t));
+    if str_starts_with(r, "xmm") {
+        var n: i64 = str_parse_int(str_slice(r, 3, str_len(r)));
+        if n >= 0 && n <= 15 { return OptI64::Some(n); }
+    }
+    return OptI64::None;
+}
+
+/// Parse a memory operand like "-16(%rbp)" -> (offset, base_reg).
+/// Returns OptI64::Some(packed) or None.
+/// We use a MemInfo struct to return the result.
+pub struct MemInfo {
+    pub offset: i64,
+    pub base: i64,
+}
+
+pub struct MemInfoSib {
+    pub offset: i64,
+    pub base: i64,
+    pub index: i64,
+    pub scale: i64,
+}
+
+/// Parse "offset(%reg)" or "(%reg)" (no comma = not SIB)
+fn try_parse_mem(s: str) -> OptI64 {
+    var t: str = str_trim(s);
+    if !str_contains(t, "(%") { return OptI64::None; }
+    var paren_idx: i64 = str_find(t, "(");
+    if paren_idx < 0 { return OptI64::None; }
+    var offset_str: str = str_slice(t, 0, paren_idx);
+    var offset: i64 = 0;
+    if str_len(offset_str) > 0 { offset = str_parse_int(offset_str); }
+    var rest: str = str_slice(t, paren_idx + 1, str_len(t));
+    var end_idx: i64 = str_find(rest, ")");
+    if end_idx < 0 { return OptI64::None; }
+    var reg_str: str = str_slice(rest, 0, end_idx);
+    // Reject SIB patterns (containing comma)
+    if str_contains(reg_str, ",") { return OptI64::None; }
+    match try_parse_reg(reg_str) {
+        OptI64::Some(base) => { return OptI64::Some(offset * 256 + base); }
+        OptI64::None => { return OptI64::None; }
+    }
+}
+
+/// Parse indexed memory: "offset(%base,%index)" or "(%base,%index,scale)"
+fn try_parse_mem_indexed(s: str) -> OptI64 {
+    var t: str = str_trim(s);
+    if !str_contains(t, "(%") { return OptI64::None; }
+    var paren_idx: i64 = str_find(t, "(");
+    if paren_idx < 0 { return OptI64::None; }
+    var offset_str: str = str_slice(t, 0, paren_idx);
+    var offset: i64 = 0;
+    if str_len(offset_str) > 0 { offset = str_parse_int(offset_str); }
+    var rest: str = str_slice(t, paren_idx + 1, str_len(t));
+    var end_idx: i64 = str_find(rest, ")");
+    if end_idx < 0 { return OptI64::None; }
+    var inner: str = str_slice(rest, 0, end_idx);
+    var comma_idx: i64 = str_find(inner, ",");
+    if comma_idx < 0 { return OptI64::None; }
+    var base_str: str = str_trim(str_slice(inner, 0, comma_idx));
+    var remaining: str = str_trim(str_slice(inner, comma_idx + 1, str_len(inner)));
+    // Check for scale: "index,scale" or just "index"
+    var index_str: str = "";
+    var scale: i64 = 1;
+    var c2: i64 = str_find(remaining, ",");
+    if c2 >= 0 {
+        index_str = str_trim(str_slice(remaining, 0, c2));
+        scale = str_parse_int(str_trim(str_slice(remaining, c2 + 1, str_len(remaining))));
+    } else {
+        index_str = remaining;
+    }
+    var base: i64 = 0;
+    var index: i64 = 0;
+    match try_parse_reg(base_str) {
+        OptI64::Some(b) => { base = b; }
+        OptI64::None => { return OptI64::None; }
+    }
+    match try_parse_reg(index_str) {
+        OptI64::Some(i) => { index = i; }
+        OptI64::None => { return OptI64::None; }
+    }
+    var scale_bits: i64 = 0;
+    if scale == 1 { scale_bits = 0; }
+    else if scale == 2 { scale_bits = 1; }
+    else if scale == 4 { scale_bits = 2; }
+    else if scale == 8 { scale_bits = 3; }
+    else { return OptI64::None; }
+    // Pack: offset*4096 + base*256 + index*16 + scale_bits
+    return OptI64::Some(offset * 4096 + base * 256 + index * 16 + scale_bits);
+}
+
+/// Build REX prefix with optional W bit.
+fn rex_w(size: i64) -> i64 {
+    if size == 8 { return 0x48; }
+    return 0x40;
+}
+
+/// Extract a string literal from a .asciz/.ascii directive.
+fn extract_string_literal(s: str) -> str {
+    var start: i64 = str_find(s, "\"");
+    if start < 0 { return ""; }
+    var end: i64 = str_rfind(s, "\"");
+    if end <= start { return ""; }
+    var raw: str = str_slice(s, start + 1, end);
+    // Unescape
+    var result: str = "";
+    var i: i64 = 0;
+    while i < str_len(raw) {
+        var c: i64 = str_byte_at(raw, i);
+        if c == 92 && i + 1 < str_len(raw) {  // backslash
+            var next: i64 = str_byte_at(raw, i + 1);
+            if next == 110 { result = result + "\n"; }       // \n
+            else if next == 116 { result = result + "\t"; }  // \t
+            else if next == 114 { result = result + "\r"; }  // \r
+            else if next == 34 { result = result + "\""; }   // \"
+            else if next == 92 { result = result + "\\"; }   // \\
+            else { result = result + char_to_str(next); }
+            i = i + 2;
+        } else {
+            result = result + char_to_str(c);
+            i = i + 1;
+        }
+    }
+    return result;
+}
+
+// ===========================================================================
+// encode_instruction — main dispatch
+// ===========================================================================
+
+pub fn ElfEmitter_encode_instruction(self: &mut ElfEmitter, line: str) {
+    // Strip trailing comment
+    var comment_idx: i64 = str_find(line, "#");
+    var clean: str = line;
+    if comment_idx >= 0 { clean = str_trim(str_slice(line, 0, comment_idx)); }
+
+    // Split mnemonic and operands
+    var space_idx: i64 = str_find(clean, " ");
+    var mnemonic: str = "";
+    var operands_str: str = "";
+    if space_idx >= 0 {
+        mnemonic = str_slice(clean, 0, space_idx);
+        operands_str = str_trim(str_slice(clean, space_idx + 1, str_len(clean)));
+    } else {
+        mnemonic = clean;
+    }
+
+    // Split operands by comma, respecting parentheses
+    var operands: Vec<str> = Vec::new();
+    if str_len(operands_str) > 0 {
+        var current: str = "";
+        var paren_depth: i64 = 0;
+        var i: i64 = 0;
+        while i < str_len(operands_str) {
+            var c: i64 = str_byte_at(operands_str, i);
+            if c == 40 { paren_depth = paren_depth + 1; current = current + char_to_str(c); }
+            else if c == 41 { paren_depth = paren_depth - 1; current = current + char_to_str(c); }
+            else if c == 44 && paren_depth == 0 {
+                operands.push(str_trim(current));
+                current = "";
+            } else {
+                current = current + char_to_str(c);
+            }
+            i = i + 1;
+        }
+        if str_len(current) > 0 { operands.push(str_trim(current)); }
+    }
+
+    // ─── No-operand instructions ───
+    if str_equal(mnemonic, "ret") { self.text.push(0xc3); return; }
+    if str_equal(mnemonic, "leave") { self.text.push(0xc9); return; }
+    if str_equal(mnemonic, "nop") { self.text.push(0x90); return; }
+    if str_equal(mnemonic, "cqto") { self.text.push(0x48); self.text.push(0x99); return; }
+    if str_equal(mnemonic, "cdq") { self.text.push(0x99); return; }
+    if str_equal(mnemonic, "ud2") { self.text.push(0x0f); self.text.push(0x0b); return; }
+    if str_equal(mnemonic, "syscall") { self.text.push(0x0f); self.text.push(0x05); return; }
+
+    // ─── pushq / popq ───
+    if str_equal(mnemonic, "pushq") {
+        if operands.len() == 1 { ElfEmitter_encode_push(self, operands.get(0)); }
+        return;
+    }
+    if str_equal(mnemonic, "popq") {
+        if operands.len() == 1 { ElfEmitter_encode_pop(self, operands.get(0)); }
+        return;
+    }
+
+    // ─── movq / movl / movb ───
+    if str_equal(mnemonic, "movq") {
+        if operands.len() == 2 { ElfEmitter_encode_mov(self, operands.get(0), operands.get(1), 8); }
+        return;
+    }
+    if str_equal(mnemonic, "movl") {
+        if operands.len() == 2 { ElfEmitter_encode_mov(self, operands.get(0), operands.get(1), 4); }
+        return;
+    }
+    if str_equal(mnemonic, "movb") {
+        if operands.len() == 2 { ElfEmitter_encode_mov(self, operands.get(0), operands.get(1), 1); }
+        return;
+    }
+
+    // ─── Arithmetic ───
+    if str_equal(mnemonic, "addq") { ElfEmitter_encode_alu(self, 0x00, operands, 8); return; }
+    if str_equal(mnemonic, "subq") { ElfEmitter_encode_alu(self, 0x28, operands, 8); return; }
+    if str_equal(mnemonic, "andq") { ElfEmitter_encode_alu(self, 0x20, operands, 8); return; }
+    if str_equal(mnemonic, "orq") { ElfEmitter_encode_alu(self, 0x08, operands, 8); return; }
+    if str_equal(mnemonic, "xorq") { ElfEmitter_encode_alu(self, 0x30, operands, 8); return; }
+    if str_equal(mnemonic, "addl") { ElfEmitter_encode_alu(self, 0x00, operands, 4); return; }
+    if str_equal(mnemonic, "subl") { ElfEmitter_encode_alu(self, 0x28, operands, 4); return; }
+    if str_equal(mnemonic, "andl") { ElfEmitter_encode_alu(self, 0x20, operands, 4); return; }
+    if str_equal(mnemonic, "orl") { ElfEmitter_encode_alu(self, 0x08, operands, 4); return; }
+    if str_equal(mnemonic, "xorl") { ElfEmitter_encode_alu(self, 0x30, operands, 4); return; }
+    if str_equal(mnemonic, "andb") { ElfEmitter_encode_alu_8bit(self, 0x20, operands); return; }
+    if str_equal(mnemonic, "orb") { ElfEmitter_encode_alu_8bit(self, 0x08, operands); return; }
+    if str_equal(mnemonic, "xorb") { ElfEmitter_encode_alu_8bit(self, 0x30, operands); return; }
+    if str_equal(mnemonic, "addb") { ElfEmitter_encode_alu_8bit(self, 0x00, operands); return; }
+    if str_equal(mnemonic, "subb") { ElfEmitter_encode_alu_8bit(self, 0x28, operands); return; }
+
+    // ─── imulq ───
+    if str_equal(mnemonic, "imulq") {
+        if operands.len() == 2 {
+            match try_parse_reg(operands.get(0)) {
+                OptI64::Some(src) => {
+                    match try_parse_reg(operands.get(1)) {
+                        OptI64::Some(dst) => {
+                            var rex: i64 = 0x48 | ((dst >> 3) << 2) | ((src >> 3) << 0);
+                            var modrm: i64 = 0xc0 | ((dst & 7) << 3) | (src & 7);
+                            self.text.push(rex & 0xFF);
+                            self.text.push(0x0f);
+                            self.text.push(0xaf);
+                            self.text.push(modrm & 0xFF);
+                        }
+                        OptI64::None => {}
+                    }
+                }
+                OptI64::None => {}
+            }
+        }
+        return;
+    }
+
+    // ─── negq / incq / decq / notq / idivq ───
+    if str_equal(mnemonic, "negq") {
+        if operands.len() == 1 {
+            match try_parse_reg(operands.get(0)) {
+                OptI64::Some(r) => {
+                    var rex: i64 = 0x48 | ((r >> 3) << 0);
+                    var modrm: i64 = 0xd8 | (r & 7);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0xf7);
+                    self.text.push(modrm & 0xFF);
+                }
+                OptI64::None => {}
+            }
+        }
+        return;
+    }
+    if str_equal(mnemonic, "incq") {
+        if operands.len() == 1 {
+            match try_parse_reg(operands.get(0)) {
+                OptI64::Some(r) => {
+                    var rex: i64 = 0x48 | ((r >> 3) << 0);
+                    var modrm: i64 = 0xc0 | (r & 7);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0xff);
+                    self.text.push(modrm & 0xFF);
+                }
+                OptI64::None => {
+                    match try_parse_mem(operands.get(0)) {
+                        OptI64::Some(packed) => {
+                            var off: i64 = packed / 256;
+                            var base: i64 = packed % 256;
+                            if off < 0 { off = off + 256; } // handle negative
+                            var rex: i64 = 0x48 | ((base >> 3) << 0);
+                            self.text.push(rex & 0xFF);
+                            self.text.push(0xff);
+                            ElfEmitter_encode_modrm_mem(self, 0, off, base);
+                        }
+                        OptI64::None => {}
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if str_equal(mnemonic, "decq") {
+        if operands.len() == 1 {
+            match try_parse_reg(operands.get(0)) {
+                OptI64::Some(r) => {
+                    var rex: i64 = 0x48 | ((r >> 3) << 0);
+                    var modrm: i64 = 0xc8 | (r & 7);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0xff);
+                    self.text.push(modrm & 0xFF);
+                }
+                OptI64::None => {}
+            }
+        }
+        return;
+    }
+    if str_equal(mnemonic, "notq") {
+        if operands.len() == 1 {
+            match try_parse_reg(operands.get(0)) {
+                OptI64::Some(r) => {
+                    var rex: i64 = 0x48 | ((r >> 3) << 0);
+                    var modrm: i64 = 0xd0 | (r & 7);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0xf7);
+                    self.text.push(modrm & 0xFF);
+                }
+                OptI64::None => {}
+            }
+        }
+        return;
+    }
+    if str_equal(mnemonic, "idivq") {
+        if operands.len() == 1 {
+            match try_parse_reg(operands.get(0)) {
+                OptI64::Some(r) => {
+                    var rex: i64 = 0x48 | ((r >> 3) << 0);
+                    var modrm: i64 = 0xf8 | (r & 7);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0xf7);
+                    self.text.push(modrm & 0xFF);
+                }
+                OptI64::None => {
+                    self.text.push(0x48);
+                    self.text.push(0xf7);
+                    self.text.push(0x38);
+                }
+            }
+        }
+        return;
+    }
+
+    // ─── Shifts ───
+    if str_equal(mnemonic, "shlq") { ElfEmitter_encode_shift(self, 0xe0, operands, 8); return; }
+    if str_equal(mnemonic, "shrq") { ElfEmitter_encode_shift(self, 0xe8, operands, 8); return; }
+    if str_equal(mnemonic, "sarq") { ElfEmitter_encode_shift(self, 0xf8, operands, 8); return; }
+
+    // ─── testq / testl ───
+    if str_equal(mnemonic, "testq") {
+        if operands.len() == 2 {
+            match try_parse_reg(operands.get(0)) {
+                OptI64::Some(a) => {
+                    match try_parse_reg(operands.get(1)) {
+                        OptI64::Some(b) => {
+                            var rex: i64 = 0x48 | ((a >> 3) << 2) | ((b >> 3) << 0);
+                            var modrm: i64 = 0xc0 | ((a & 7) << 3) | (b & 7);
+                            self.text.push(rex & 0xFF);
+                            self.text.push(0x85);
+                            self.text.push(modrm & 0xFF);
+                        }
+                        OptI64::None => {}
+                    }
+                }
+                OptI64::None => {}
+            }
+        }
+        return;
+    }
+    if str_equal(mnemonic, "testl") {
+        if operands.len() == 2 {
+            match try_parse_reg(operands.get(0)) {
+                OptI64::Some(a) => {
+                    match try_parse_reg(operands.get(1)) {
+                        OptI64::Some(b) => {
+                            if a >= 8 || b >= 8 {
+                                var rex: i64 = ((a >> 3) << 2) | ((b >> 3) << 0);
+                                self.text.push(rex & 0xFF);
+                            }
+                            var modrm: i64 = 0xc0 | ((a & 7) << 3) | (b & 7);
+                            self.text.push(0x85);
+                            self.text.push(modrm & 0xFF);
+                        }
+                        OptI64::None => {}
+                    }
+                }
+                OptI64::None => {}
+            }
+        }
+        return;
+    }
+
+    // ─── cmpq ───
+    if str_equal(mnemonic, "cmpq") {
+        if operands.len() == 2 { ElfEmitter_encode_cmp(self, operands.get(0), operands.get(1), 8); }
+        return;
+    }
+
+    // ─── setcc ───
+    if str_equal(mnemonic, "sete") { ElfEmitter_encode_setcc(self, 0x94, operands); return; }
+    if str_equal(mnemonic, "setne") { ElfEmitter_encode_setcc(self, 0x95, operands); return; }
+    if str_equal(mnemonic, "setl") { ElfEmitter_encode_setcc(self, 0x9c, operands); return; }
+    if str_equal(mnemonic, "setg") { ElfEmitter_encode_setcc(self, 0x9f, operands); return; }
+    if str_equal(mnemonic, "setle") { ElfEmitter_encode_setcc(self, 0x9e, operands); return; }
+    if str_equal(mnemonic, "setge") { ElfEmitter_encode_setcc(self, 0x9d, operands); return; }
+    if str_equal(mnemonic, "setb") { ElfEmitter_encode_setcc(self, 0x92, operands); return; }
+    if str_equal(mnemonic, "seta") { ElfEmitter_encode_setcc(self, 0x97, operands); return; }
+    if str_equal(mnemonic, "setbe") { ElfEmitter_encode_setcc(self, 0x96, operands); return; }
+    if str_equal(mnemonic, "setae") { ElfEmitter_encode_setcc(self, 0x93, operands); return; }
+
+    // ─── movzbq / movzwq / movsbq / movswq / movslq ───
+    if str_equal(mnemonic, "movzbq") { ElfEmitter_encode_movzx(self, 0xb6, operands, 8); return; }
+    if str_equal(mnemonic, "movzwq") { ElfEmitter_encode_movzx(self, 0xb7, operands, 8); return; }
+    if str_equal(mnemonic, "movsbq") { ElfEmitter_encode_movsx(self, 0xbe, operands); return; }
+    if str_equal(mnemonic, "movswq") { ElfEmitter_encode_movsx(self, 0xbf, operands); return; }
+    if str_equal(mnemonic, "movslq") {
+        if operands.len() == 2 {
+            match try_parse_reg(operands.get(0)) {
+                OptI64::Some(s) => {
+                    match try_parse_reg(operands.get(1)) {
+                        OptI64::Some(d) => {
+                            var rex: i64 = 0x48 | ((s >> 3) << 2) | ((d >> 3) << 0);
+                            var modrm: i64 = 0xc0 | ((s & 7) << 3) | (d & 7);
+                            self.text.push(rex & 0xFF);
+                            self.text.push(0x63);
+                            self.text.push(modrm & 0xFF);
+                        }
+                        OptI64::None => {}
+                    }
+                }
+                OptI64::None => {}
+            }
+        }
+        return;
+    }
+
+    // ─── Jumps ───
+    if str_equal(mnemonic, "jmp") {
+        if operands.len() == 1 { ElfEmitter_encode_jmp(self, operands.get(0)); }
+        return;
+    }
+    if str_equal(mnemonic, "jne") { ElfEmitter_encode_jcc(self, 0x85, operands); return; }
+    if str_equal(mnemonic, "je") { ElfEmitter_encode_jcc(self, 0x84, operands); return; }
+    if str_equal(mnemonic, "jz") { ElfEmitter_encode_jcc(self, 0x84, operands); return; }
+    if str_equal(mnemonic, "jnz") { ElfEmitter_encode_jcc(self, 0x85, operands); return; }
+    if str_equal(mnemonic, "jl") { ElfEmitter_encode_jcc(self, 0x8c, operands); return; }
+    if str_equal(mnemonic, "jg") { ElfEmitter_encode_jcc(self, 0x8f, operands); return; }
+    if str_equal(mnemonic, "jle") { ElfEmitter_encode_jcc(self, 0x8e, operands); return; }
+    if str_equal(mnemonic, "jge") { ElfEmitter_encode_jcc(self, 0x8d, operands); return; }
+    if str_equal(mnemonic, "jb") { ElfEmitter_encode_jcc(self, 0x82, operands); return; }
+    if str_equal(mnemonic, "ja") { ElfEmitter_encode_jcc(self, 0x87, operands); return; }
+    if str_equal(mnemonic, "jbe") { ElfEmitter_encode_jcc(self, 0x86, operands); return; }
+    if str_equal(mnemonic, "jae") { ElfEmitter_encode_jcc(self, 0x83, operands); return; }
+
+    // ─── call ───
+    if str_equal(mnemonic, "call") {
+        if operands.len() == 1 { ElfEmitter_encode_call(self, operands.get(0)); }
+        return;
+    }
+
+    // ─── leaq ───
+    if str_equal(mnemonic, "leaq") {
+        if operands.len() == 2 { ElfEmitter_encode_lea(self, operands.get(0), operands.get(1)); }
+        return;
+    }
+
+    // ─── Float conversions ───
+    if str_equal(mnemonic, "cvtsi2sdq") {
+        if operands.len() == 2 {
+            match try_parse_reg(operands.get(0)) {
+                OptI64::Some(src) => {
+                    match parse_xmm_reg(operands.get(1)) {
+                        OptI64::Some(dst_xmm) => {
+                            var rex: i64 = 0x48 | ((src >> 3) << 0);
+                            var modrm: i64 = 0xc0 | ((dst_xmm & 7) << 3) | (src & 7);
+                            self.text.push(0xf2);
+                            self.text.push(rex & 0xFF);
+                            self.text.push(0x0f);
+                            self.text.push(0x2a);
+                            self.text.push(modrm & 0xFF);
+                        }
+                        OptI64::None => {}
+                    }
+                }
+                OptI64::None => {}
+            }
+        }
+        return;
+    }
+    if str_equal(mnemonic, "cvttsd2siq") {
+        if operands.len() == 2 {
+            match parse_xmm_reg(operands.get(0)) {
+                OptI64::Some(src_xmm) => {
+                    match try_parse_reg(operands.get(1)) {
+                        OptI64::Some(dst) => {
+                            var rex: i64 = 0x48 | ((src_xmm >> 3) << 2) | ((dst >> 3) << 0);
+                            var modrm: i64 = 0xc0 | ((src_xmm & 7) << 3) | (dst & 7);
+                            self.text.push(0xf2);
+                            self.text.push(rex & 0xFF);
+                            self.text.push(0x0f);
+                            self.text.push(0x2c);
+                            self.text.push(modrm & 0xFF);
+                        }
+                        OptI64::None => {}
+                    }
+                }
+                OptI64::None => {}
+            }
+        }
+        return;
+    }
+
+    // ─── SSE2 double-precision ───
+    if str_equal(mnemonic, "movsd") {
+        if operands.len() == 2 { ElfEmitter_encode_movsd(self, operands.get(0), operands.get(1)); }
+        return;
+    }
+    if str_equal(mnemonic, "addsd") {
+        if operands.len() == 2 { ElfEmitter_encode_sse2_arith(self, 0x58, operands.get(0), operands.get(1)); }
+        return;
+    }
+    if str_equal(mnemonic, "subsd") {
+        if operands.len() == 2 { ElfEmitter_encode_sse2_arith(self, 0x5c, operands.get(0), operands.get(1)); }
+        return;
+    }
+    if str_equal(mnemonic, "mulsd") {
+        if operands.len() == 2 { ElfEmitter_encode_sse2_arith(self, 0x59, operands.get(0), operands.get(1)); }
+        return;
+    }
+    if str_equal(mnemonic, "divsd") {
+        if operands.len() == 2 { ElfEmitter_encode_sse2_arith(self, 0x5e, operands.get(0), operands.get(1)); }
+        return;
+    }
+    if str_equal(mnemonic, "ucomisd") {
+        if operands.len() == 2 { ElfEmitter_encode_sse2_arith_66(self, 0x2e, operands.get(0), operands.get(1)); }
+        return;
+    }
+
+    // ─── SSE single-precision ───
+    if str_equal(mnemonic, "movss") {
+        if operands.len() == 2 { ElfEmitter_encode_movss(self, operands.get(0), operands.get(1)); }
+        return;
+    }
+    if str_equal(mnemonic, "addss") {
+        if operands.len() == 2 { ElfEmitter_encode_sse_arith(self, 0x58, operands.get(0), operands.get(1)); }
+        return;
+    }
+    if str_equal(mnemonic, "subss") {
+        if operands.len() == 2 { ElfEmitter_encode_sse_arith(self, 0x5c, operands.get(0), operands.get(1)); }
+        return;
+    }
+    if str_equal(mnemonic, "mulss") {
+        if operands.len() == 2 { ElfEmitter_encode_sse_arith(self, 0x59, operands.get(0), operands.get(1)); }
+        return;
+    }
+    if str_equal(mnemonic, "divss") {
+        if operands.len() == 2 { ElfEmitter_encode_sse_arith(self, 0x5e, operands.get(0), operands.get(1)); }
+        return;
+    }
+    if str_equal(mnemonic, "ucomiss") {
+        if operands.len() == 2 { ElfEmitter_encode_sse_arith_66(self, 0x2e, operands.get(0), operands.get(1)); }
+        return;
+    }
+
+    // ─── Unknown instruction — emit nop placeholder ───
+    self.text.push(0x90);
+}
+
+// ===========================================================================
+// Instruction encoders
+// ===========================================================================
+
+fn ElfEmitter_encode_push(self: &mut ElfEmitter, op: str) {
+    match try_parse_reg(op) {
+        OptI64::Some(r) => {
+            if r >= 8 {
+                self.text.push(0x41);  // REX.B
+                self.text.push((0x50 + (r - 8)) & 0xFF);
+            } else {
+                self.text.push((0x50 + r) & 0xFF);
+            }
+        }
+        OptI64::None => {
+            if str_starts_with(op, "$") {
+                var v: i64 = str_parse_int(str_slice(op, 1, str_len(op)));
+                if v >= -128 && v <= 127 {
+                    self.text.push(0x6a);
+                    self.text.push(v & 0xFF);
+                } else {
+                    self.text.push(0x68);
+                    emit_u32(self.text, v);
+                }
+            }
+        }
+    }
+}
+
+fn ElfEmitter_encode_pop(self: &mut ElfEmitter, op: str) {
+    match try_parse_reg(op) {
+        OptI64::Some(r) => {
+            if r >= 8 {
+                self.text.push(0x41);  // REX.B
+                self.text.push((0x58 + (r - 8)) & 0xFF);
+            } else {
+                self.text.push((0x58 + r) & 0xFF);
+            }
+        }
+        OptI64::None => {}
+    }
+}
+
+fn ElfEmitter_encode_mov(self: &mut ElfEmitter, src: str, dst: str, size: i64) {
+    // movq $imm, %reg
+    if str_starts_with(src, "$") {
+        match try_parse_reg(dst) {
+            OptI64::Some(r) => {
+                var imm_str: str = str_slice(src, 1, str_len(src));
+                var imm: i64 = str_parse_int(imm_str);
+                if imm == 0 && !str_equal(imm_str, "0") {
+                    // Try hex parse
+                    if str_starts_with(imm_str, "0x") || str_starts_with(imm_str, "0X") {
+                        imm = str_parse_hex(str_slice(imm_str, 2, str_len(imm_str)));
+                    }
+                }
+                if size == 8 {
+                    var rex: i64 = 0x48 | ((r >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push((0xb8 + (r & 7)) & 0xFF);
+                    emit_u64(self.text, imm);
+                } else {
+                    if r >= 8 { self.text.push(0x41); }
+                    self.text.push((0xb8 + (r & 7)) & 0xFF);
+                    emit_u32(self.text, imm);
+                }
+                return;
+            }
+            OptI64::None => {}
+        }
+    }
+
+    // movq %xmmN, %gpr → 66 [REX.W] 0F 7E /r
+    match parse_xmm_reg(src) {
+        OptI64::Some(s_xmm) => {
+            match try_parse_reg(dst) {
+                OptI64::Some(d) => {
+                    var rex: i64 = 0x48 | ((s_xmm >> 3) << 2) | ((d >> 3) << 0);
+                    self.text.push(0x66);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x0f);
+                    self.text.push(0x7e);
+                    var modrm: i64 = 0xc0 | ((s_xmm & 7) << 3) | (d & 7);
+                    self.text.push(modrm & 0xFF);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+
+    // movq %gpr, %xmmN → 66 [REX.W] 0F 6E /r
+    match try_parse_reg(src) {
+        OptI64::Some(s) => {
+            match parse_xmm_reg(dst) {
+                OptI64::Some(d_xmm) => {
+                    var rex: i64 = 0x48 | ((d_xmm >> 3) << 2) | ((s >> 3) << 0);
+                    self.text.push(0x66);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x0f);
+                    self.text.push(0x6e);
+                    var modrm: i64 = 0xc0 | ((d_xmm & 7) << 3) | (s & 7);
+                    self.text.push(modrm & 0xFF);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+
+    // movq %reg, %reg
+    match try_parse_reg(src) {
+        OptI64::Some(s) => {
+            match try_parse_reg(dst) {
+                OptI64::Some(d) => {
+                    var rex: i64 = rex_w(size) | ((s >> 3) << 2) | ((d >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x89);
+                    var modrm: i64 = 0xc0 | ((s & 7) << 3) | (d & 7);
+                    self.text.push(modrm & 0xFF);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+
+    // movq %reg, mem (store to memory)
+    // Try reg or reg8
+    var src_reg: OptI64 = try_parse_reg(src);
+    match src_reg {
+        OptI64::None => { src_reg = try_parse_reg8(src); }
+        OptI64::Some(_) => { }
+    }
+
+    // Try SIB first
+    match try_parse_mem_indexed(dst) {
+        OptI64::Some(packed) => {
+            var off: i64 = packed / 4096;
+            var base: i64 = (packed / 256) % 16;
+            var index: i64 = (packed / 16) % 16;
+            var sc: i64 = packed % 16;
+            match src_reg {
+                OptI64::Some(s) => {
+                    if size == 1 {
+                        var rex: i64 = 0x40 | ((s >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                        self.text.push(rex & 0xFF);
+                        self.text.push(0x88);
+                        ElfEmitter_encode_modrm_sib(self, s, off, base, index, sc);
+                    } else {
+                        var rex: i64 = rex_w(size) | ((s >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                        self.text.push(rex & 0xFF);
+                        self.text.push(0x89);
+                        ElfEmitter_encode_modrm_sib(self, s, off, base, index, sc);
+                    }
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+    match try_parse_mem(dst) {
+        OptI64::Some(packed) => {
+            var off: i64 = packed / 256;
+            var base: i64 = packed % 256;
+            match src_reg {
+                OptI64::Some(s) => {
+                    if size == 1 {
+                        var rex: i64 = 0x40 | ((s >> 3) << 2) | ((base >> 3) << 0);
+                        self.text.push(rex & 0xFF);
+                        self.text.push(0x88);
+                        ElfEmitter_encode_modrm_mem(self, s, off, base);
+                    } else {
+                        var rex: i64 = rex_w(size) | ((s >> 3) << 2) | ((base >> 3) << 0);
+                        self.text.push(rex & 0xFF);
+                        self.text.push(0x89);
+                        ElfEmitter_encode_modrm_mem(self, s, off, base);
+                    }
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+
+    // movq mem, %reg (load from memory)
+    var dst_reg: OptI64 = try_parse_reg(dst);
+    match dst_reg {
+        OptI64::None => { dst_reg = try_parse_reg8(dst); }
+        OptI64::Some(_) => { }
+    }
+
+    match try_parse_mem_indexed(src) {
+        OptI64::Some(packed) => {
+            var off: i64 = packed / 4096;
+            var base: i64 = (packed / 256) % 16;
+            var index: i64 = (packed / 16) % 16;
+            var sc: i64 = packed % 16;
+            match dst_reg {
+                OptI64::Some(d) => {
+                    if size == 1 {
+                        var rex: i64 = 0x40 | ((d >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                        self.text.push(rex & 0xFF);
+                        self.text.push(0x8a);
+                        ElfEmitter_encode_modrm_sib(self, d, off, base, index, sc);
+                    } else {
+                        var rex: i64 = rex_w(size) | ((d >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                        self.text.push(rex & 0xFF);
+                        self.text.push(0x8b);
+                        ElfEmitter_encode_modrm_sib(self, d, off, base, index, sc);
+                    }
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+    match try_parse_mem(src) {
+        OptI64::Some(packed) => {
+            var off: i64 = packed / 256;
+            var base: i64 = packed % 256;
+            match dst_reg {
+                OptI64::Some(d) => {
+                    if size == 1 {
+                        var rex: i64 = 0x40 | ((d >> 3) << 2) | ((base >> 3) << 0);
+                        self.text.push(rex & 0xFF);
+                        self.text.push(0x8a);
+                        ElfEmitter_encode_modrm_mem(self, d, off, base);
+                    } else {
+                        var rex: i64 = rex_w(size) | ((d >> 3) << 2) | ((base >> 3) << 0);
+                        self.text.push(rex & 0xFF);
+                        self.text.push(0x8b);
+                        ElfEmitter_encode_modrm_mem(self, d, off, base);
+                    }
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+
+    // movq $imm, mem (immediate to memory)
+    if str_starts_with(src, "$") {
+        var imm: i64 = str_parse_int(str_slice(src, 1, str_len(src)));
+        match try_parse_mem_indexed(dst) {
+            OptI64::Some(packed) => {
+                var off: i64 = packed / 4096;
+                var base: i64 = (packed / 256) % 16;
+                var index: i64 = (packed / 16) % 16;
+                var sc: i64 = packed % 16;
+                if size == 1 {
+                    var rex: i64 = 0x40 | ((index >> 3) << 1) | ((base >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0xc6);
+                    ElfEmitter_encode_modrm_sib(self, 0, off, base, index, sc);
+                    self.text.push(imm & 0xFF);
+                } else {
+                    var rex: i64 = rex_w(size) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0xc7);
+                    ElfEmitter_encode_modrm_sib(self, 0, off, base, index, sc);
+                    emit_u32(self.text, imm);
+                }
+                return;
+            }
+            OptI64::None => {}
+        }
+        match try_parse_mem(dst) {
+            OptI64::Some(packed) => {
+                var off: i64 = packed / 256;
+                var base: i64 = packed % 256;
+                if size == 1 {
+                    var rex: i64 = 0x40 | ((base >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0xc6);
+                    ElfEmitter_encode_modrm_mem(self, 0, off, base);
+                    self.text.push(imm & 0xFF);
+                } else {
+                    var rex: i64 = rex_w(size) | ((base >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0xc7);
+                    ElfEmitter_encode_modrm_mem(self, 0, off, base);
+                    emit_u32(self.text, imm);
+                }
+                return;
+            }
+            OptI64::None => {}
+        }
+    }
+
+    // Fallback: nop
+    self.text.push(0x90);
+}
+
+fn ElfEmitter_encode_alu_8bit(self: &mut ElfEmitter, opcode_base: i64, operands: Vec<str>) {
+    if operands.len() != 2 { return; }
+    var src: str = operands.get(0);
+    var dst: str = operands.get(1);
+    // Parse 8-bit register names
+    var s: i64 = parse_byte_reg(src);
+    var d: i64 = parse_byte_reg(dst);
+    if s >= 0 && d >= 0 {
+        var need_rex: bool = s >= 4 || d >= 4;
+        if need_rex {
+            var rex: i64 = ((s >> 3) << 2) | ((d >> 3) << 0);
+            self.text.push(rex & 0xFF);
+        }
+        self.text.push((opcode_base | 0x01) & 0xFF);
+        var modrm: i64 = 0xc0 | ((s & 7) << 3) | (d & 7);
+        self.text.push(modrm & 0xFF);
+    }
+}
+
+fn ElfEmitter_encode_alu(self: &mut ElfEmitter, opcode_base: i64, operands: Vec<str>, size: i64) {
+    if operands.len() != 2 { return; }
+    var src: str = operands.get(0);
+    var dst: str = operands.get(1);
+    var op_is_32bit: bool = is_reg32(src) || is_reg32(dst);
+    var effective_size: i64 = size;
+    if op_is_32bit { effective_size = 4; }
+
+    // ALU %reg, %reg
+    match try_parse_reg(src) {
+        OptI64::Some(s) => {
+            match try_parse_reg(dst) {
+                OptI64::Some(d) => {
+                    var need_rex: bool = effective_size == 8 || s >= 8 || d >= 8;
+                    if need_rex {
+                        var rex: i64 = rex_w(effective_size) | ((s >> 3) << 2) | ((d >> 3) << 0);
+                        self.text.push(rex & 0xFF);
+                    }
+                    self.text.push((opcode_base | 0x01) & 0xFF);
+                    var modrm: i64 = 0xc0 | ((s & 7) << 3) | (d & 7);
+                    self.text.push(modrm & 0xFF);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+
+    // ALU $imm, %reg
+    if str_starts_with(src, "$") {
+        var imm: i64 = str_parse_int(str_slice(src, 1, str_len(src)));
+        match try_parse_reg(dst) {
+            OptI64::Some(d) => {
+                var dst_is_32: bool = is_reg32(dst);
+                var esize: i64 = effective_size;
+                if dst_is_32 { esize = 4; }
+                var need_rex: bool = esize == 8 || d >= 8;
+                if imm >= -128 && imm <= 127 {
+                    if need_rex {
+                        var rex: i64 = rex_w(esize) | ((d >> 3) << 0);
+                        self.text.push(rex & 0xFF);
+                    }
+                    self.text.push(0x83);
+                    var reg_field: i64 = (opcode_base >> 3) & 7;
+                    var modrm: i64 = 0xc0 | (reg_field << 3) | (d & 7);
+                    self.text.push(modrm & 0xFF);
+                    self.text.push(imm & 0xFF);
+                } else {
+                    if need_rex {
+                        var rex: i64 = rex_w(esize) | ((d >> 3) << 0);
+                        self.text.push(rex & 0xFF);
+                    }
+                    self.text.push(0x81);
+                    var reg_field2: i64 = (opcode_base >> 3) & 7;
+                    var modrm2: i64 = 0xc0 | (reg_field2 << 3) | (d & 7);
+                    self.text.push(modrm2 & 0xFF);
+                    emit_u32(self.text, imm);
+                }
+                return;
+            }
+            OptI64::None => {}
+        }
+    }
+
+    // ALU %reg, mem
+    match try_parse_reg(src) {
+        OptI64::Some(s) => {
+            match try_parse_mem(dst) {
+                OptI64::Some(packed) => {
+                    var off: i64 = packed / 256;
+                    var base: i64 = packed % 256;
+                    var rex: i64 = rex_w(size) | ((s >> 3) << 2) | ((base >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push((opcode_base | 0x01) & 0xFF);
+                    ElfEmitter_encode_modrm_mem(self, s, off, base);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+    // ALU mem, %reg
+    match try_parse_mem(src) {
+        OptI64::Some(packed) => {
+            var off: i64 = packed / 256;
+            var base: i64 = packed % 256;
+            match try_parse_reg(dst) {
+                OptI64::Some(d) => {
+                    var rex: i64 = rex_w(size) | ((d >> 3) << 2) | ((base >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push((opcode_base | 0x03) & 0xFF);
+                    ElfEmitter_encode_modrm_mem(self, d, off, base);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+    self.text.push(0x90);
+}
+
+fn ElfEmitter_encode_shift(self: &mut ElfEmitter, modrm_base: i64, operands: Vec<str>, size: i64) {
+    if operands.len() != 2 { return; }
+    var count: str = operands.get(0);
+    var dst: str = operands.get(1);
+    match try_parse_reg(dst) {
+        OptI64::Some(d) => {
+            var rex: i64 = rex_w(size) | ((d >> 3) << 0);
+            self.text.push(rex & 0xFF);
+            if str_starts_with(count, "$") {
+                self.text.push(0xc1);
+                var modrm: i64 = 0xc0 | modrm_base | (d & 7);
+                self.text.push(modrm & 0xFF);
+                var imm: i64 = str_parse_int(str_slice(count, 1, str_len(count)));
+                self.text.push(imm & 0xFF);
+            } else if str_equal(count, "%cl") {
+                self.text.push(0xd3);
+                var modrm: i64 = 0xc0 | modrm_base | (d & 7);
+                self.text.push(modrm & 0xFF);
+            }
+        }
+        OptI64::None => {}
+    }
+}
+
+fn ElfEmitter_encode_cmp(self: &mut ElfEmitter, src: str, dst: str, size: i64) {
+    // cmpq $imm, %reg
+    if str_starts_with(src, "$") {
+        var imm: i64 = str_parse_int(str_slice(src, 1, str_len(src)));
+        match try_parse_reg(dst) {
+            OptI64::Some(d) => {
+                if imm >= -128 && imm <= 127 {
+                    var rex: i64 = rex_w(size) | ((d >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x83);
+                    var modrm: i64 = 0xc0 | (7 << 3) | (d & 7);
+                    self.text.push(modrm & 0xFF);
+                    self.text.push(imm & 0xFF);
+                } else {
+                    var rex: i64 = rex_w(size) | ((d >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x81);
+                    var modrm: i64 = 0xc0 | (7 << 3) | (d & 7);
+                    self.text.push(modrm & 0xFF);
+                    emit_u32(self.text, imm);
+                }
+                return;
+            }
+            OptI64::None => {}
+        }
+    }
+    // cmpq %reg, %reg
+    match try_parse_reg(src) {
+        OptI64::Some(s) => {
+            match try_parse_reg(dst) {
+                OptI64::Some(d) => {
+                    var rex: i64 = rex_w(size) | ((s >> 3) << 2) | ((d >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x39);
+                    var modrm: i64 = 0xc0 | ((s & 7) << 3) | (d & 7);
+                    self.text.push(modrm & 0xFF);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+    // cmpq mem, %reg (SIB)
+    match try_parse_mem_indexed(src) {
+        OptI64::Some(packed) => {
+            var off: i64 = packed / 4096;
+            var base: i64 = (packed / 256) % 16;
+            var index: i64 = (packed / 16) % 16;
+            var sc: i64 = packed % 16;
+            match try_parse_reg(dst) {
+                OptI64::Some(d) => {
+                    var rex: i64 = rex_w(size) | ((d >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x3b);
+                    ElfEmitter_encode_modrm_sib(self, d, off, base, index, sc);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+    // cmpq mem, %reg
+    match try_parse_mem(src) {
+        OptI64::Some(packed) => {
+            var off: i64 = packed / 256;
+            var base: i64 = packed % 256;
+            match try_parse_reg(dst) {
+                OptI64::Some(d) => {
+                    var rex: i64 = rex_w(size) | ((d >> 3) << 2) | ((base >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x3b);
+                    ElfEmitter_encode_modrm_mem(self, d, off, base);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+    // cmpq %reg, mem (SIB)
+    match try_parse_reg(src) {
+        OptI64::Some(s) => {
+            match try_parse_mem_indexed(dst) {
+                OptI64::Some(packed) => {
+                    var off: i64 = packed / 4096;
+                    var base: i64 = (packed / 256) % 16;
+                    var index: i64 = (packed / 16) % 16;
+                    var sc: i64 = packed % 16;
+                    var rex: i64 = rex_w(size) | ((s >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x39);
+                    ElfEmitter_encode_modrm_sib(self, s, off, base, index, sc);
+                    return;
+                }
+                OptI64::None => {}
+            }
+            match try_parse_mem(dst) {
+                OptI64::Some(packed) => {
+                    var off: i64 = packed / 256;
+                    var base: i64 = packed % 256;
+                    var rex: i64 = rex_w(size) | ((s >> 3) << 2) | ((base >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x39);
+                    ElfEmitter_encode_modrm_mem(self, s, off, base);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+    self.text.push(0x90);
+}
+
+fn ElfEmitter_encode_setcc(self: &mut ElfEmitter, opcode: i64, operands: Vec<str>) {
+    if operands.len() != 1 { return; }
+    match try_parse_reg8(operands.get(0)) {
+        OptI64::Some(r) => {
+            if r >= 4 && r < 8 { self.text.push(0x40); }
+            if r >= 8 { self.text.push(0x41); }
+            self.text.push(0x0f);
+            self.text.push(opcode & 0xFF);
+            self.text.push((0xc0 | (r & 7)) & 0xFF);
+        }
+        OptI64::None => {}
+    }
+}
+
+fn ElfEmitter_encode_movsx(self: &mut ElfEmitter, opcode: i64, operands: Vec<str>) {
+    if operands.len() != 2 { return; }
+    match try_parse_reg(operands.get(1)) {
+        OptI64::Some(d) => {
+            // Memory source
+            match try_parse_mem(operands.get(0)) {
+                OptI64::Some(packed) => {
+                    var off: i64 = packed / 256;
+                    var base: i64 = packed % 256;
+                    var rex: i64 = 0x48 | (((d >> 3) & 1) << 2) | (((base >> 3) & 1) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x0f);
+                    self.text.push(opcode & 0xFF);
+                    ElfEmitter_encode_modrm_mem(self, d, off, base);
+                    return;
+                }
+                OptI64::None => {}
+            }
+            // Register source
+            var s_opt: OptI64 = try_parse_reg8(operands.get(0));
+            match s_opt {
+                OptI64::None => { s_opt = try_parse_reg(operands.get(0)); }
+                OptI64::Some(_) => { }
+            }
+            match s_opt {
+                OptI64::Some(s) => {
+                    var rex: i64 = 0x48 | (((d >> 3) & 1) << 2) | (((s >> 3) & 1) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x0f);
+                    self.text.push(opcode & 0xFF);
+                    var modrm: i64 = 0xc0 | ((d & 7) << 3) | (s & 7);
+                    self.text.push(modrm & 0xFF);
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+}
+
+fn ElfEmitter_encode_movzx(self: &mut ElfEmitter, opcode: i64, operands: Vec<str>, size: i64) {
+    if operands.len() != 2 { return; }
+    match try_parse_reg(operands.get(1)) {
+        OptI64::Some(d) => {
+            // SIB memory source
+            match try_parse_mem_indexed(operands.get(0)) {
+                OptI64::Some(packed) => {
+                    var off: i64 = packed / 4096;
+                    var base: i64 = (packed / 256) % 16;
+                    var index: i64 = (packed / 16) % 16;
+                    var sc: i64 = packed % 16;
+                    var rex: i64 = 0x48 | (((d >> 3) & 1) << 2) | (((index >> 3) & 1) << 1) | (((base >> 3) & 1) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x0f);
+                    self.text.push(opcode & 0xFF);
+                    ElfEmitter_encode_modrm_sib(self, d, off, base, index, sc);
+                    return;
+                }
+                OptI64::None => {}
+            }
+            // Memory source
+            match try_parse_mem(operands.get(0)) {
+                OptI64::Some(packed) => {
+                    var off: i64 = packed / 256;
+                    var base: i64 = packed % 256;
+                    var rex: i64 = 0x48 | (((d >> 3) & 1) << 2) | (((base >> 3) & 1) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x0f);
+                    self.text.push(opcode & 0xFF);
+                    ElfEmitter_encode_modrm_mem(self, d, off, base);
+                    return;
+                }
+                OptI64::None => {}
+            }
+            // Register source
+            var s_opt: OptI64 = try_parse_reg8(operands.get(0));
+            match s_opt {
+                OptI64::None => { s_opt = try_parse_reg(operands.get(0)); }
+                OptI64::Some(_) => { }
+            }
+            match s_opt {
+                OptI64::Some(s) => {
+                    var rex: i64 = 0x48 | (((d >> 3) & 1) << 2) | (((s >> 3) & 1) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x0f);
+                    self.text.push(opcode & 0xFF);
+                    var modrm: i64 = 0xc0 | ((d & 7) << 3) | (s & 7);
+                    self.text.push(modrm & 0xFF);
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+}
+
+fn ElfEmitter_encode_jmp(self: &mut ElfEmitter, target: str) {
+    if str_starts_with(target, ".L") {
+        var sym_idx: i64 = ElfEmitter_get_or_add_local_label(self, target);
+        var reloc_offset: i64 = self.text.len() + 1;
+        self.relocations.push(Relocation_new(reloc_offset, sym_idx, R_X86_64_PC32, -4));
+        self.text.push(0xe9);
+        self.text.push(0); self.text.push(0); self.text.push(0); self.text.push(0);
+    } else {
+        self.text.push(0xe9);
+        self.text.push(0); self.text.push(0); self.text.push(0); self.text.push(0);
+    }
+}
+
+fn ElfEmitter_encode_jcc(self: &mut ElfEmitter, opcode: i64, operands: Vec<str>) {
+    if operands.len() != 1 { return; }
+    var target: str = operands.get(0);
+    var sym_idx: i64 = ElfEmitter_get_or_add_local_label(self, target);
+    var reloc_offset: i64 = self.text.len() + 2;
+    self.relocations.push(Relocation_new(reloc_offset, sym_idx, R_X86_64_PC32, -4));
+    self.text.push(0x0f);
+    self.text.push(opcode & 0xFF);
+    self.text.push(0); self.text.push(0); self.text.push(0); self.text.push(0);
+}
+
+fn ElfEmitter_encode_call(self: &mut ElfEmitter, target: str) {
+    // call *%reg → indirect call through register
+    if str_starts_with(target, "*%") {
+        match try_parse_reg(str_slice(target, 1, str_len(target))) {
+            OptI64::Some(r) => {
+                if r >= 8 { self.text.push(0x41); }
+                self.text.push(0xff);
+                self.text.push((0xd0 | (r & 7)) & 0xFF);
+                return;
+            }
+            OptI64::None => {}
+        }
+    }
+    // call *offset(%reg) → indirect call through memory
+    if str_starts_with(target, "*") {
+        match try_parse_mem(str_slice(target, 1, str_len(target))) {
+            OptI64::Some(packed) => {
+                var off: i64 = packed / 256;
+                var base: i64 = packed % 256;
+                if base >= 8 { self.text.push(0x41); }
+                self.text.push(0xff);
+                var modrm: i64 = 0x50 | (2 << 3) | (base & 7);
+                self.text.push(modrm & 0xFF);
+                self.text.push(off & 0xFF);
+                return;
+            }
+            OptI64::None => {}
+        }
+    }
+    // call rel32 → 0xE8 rel32
+    if str_starts_with(target, ".L") {
+        var sym_idx: i64 = ElfEmitter_get_or_add_local_label(self, target);
+        var reloc_offset: i64 = self.text.len() + 1;
+        self.relocations.push(Relocation_new(reloc_offset, sym_idx, R_X86_64_PC32, -4));
+    } else {
+        var sym_idx: i64 = ElfEmitter_get_or_add_undef_symbol(self, target);
+        var reloc_offset: i64 = self.text.len() + 1;
+        self.relocations.push(Relocation_new(reloc_offset, sym_idx, R_X86_64_PLT32, -4));
+    }
+    self.text.push(0xe8);
+    self.text.push(0); self.text.push(0); self.text.push(0); self.text.push(0);
+}
+
+fn ElfEmitter_encode_lea(self: &mut ElfEmitter, src: str, dst: str) {
+    match try_parse_reg(dst) {
+        OptI64::Some(d) => {
+            // leaq label(%rip), %reg
+            if str_contains(src, "(%rip)") {
+                var label: str = str_slice(src, 0, str_len(src) - 6);
+                var sym_idx: i64 = 0;
+                if str_starts_with(label, ".L") {
+                    sym_idx = ElfEmitter_get_or_add_local_label(self, label);
+                } else {
+                    sym_idx = ElfEmitter_get_or_add_undef_symbol(self, label);
+                }
+                var rex: i64 = 0x48 | ((d >> 3) << 2);
+                self.text.push(rex & 0xFF);
+                self.text.push(0x8d);
+                var modrm: i64 = 0x05 | ((d & 7) << 3);
+                self.text.push(modrm & 0xFF);
+                var reloc_offset: i64 = self.text.len();
+                self.relocations.push(Relocation_new(reloc_offset, sym_idx, R_X86_64_PC32, -4));
+                self.text.push(0); self.text.push(0); self.text.push(0); self.text.push(0);
+                return;
+            }
+            // leaq (%base,%index,scale), %reg — SIB
+            match try_parse_mem_indexed(src) {
+                OptI64::Some(packed) => {
+                    var off: i64 = packed / 4096;
+                    var base: i64 = (packed / 256) % 16;
+                    var index: i64 = (packed / 16) % 16;
+                    var sc: i64 = packed % 16;
+                    var rex: i64 = 0x48 | ((d >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x8d);
+                    ElfEmitter_encode_modrm_sib(self, d, off, base, index, sc);
+                    return;
+                }
+                OptI64::None => {}
+            }
+            // leaq offset(%base), %reg
+            match try_parse_mem(src) {
+                OptI64::Some(packed) => {
+                    var off: i64 = packed / 256;
+                    var base: i64 = packed % 256;
+                    var rex: i64 = 0x48 | ((d >> 3) << 2) | ((base >> 3) << 0);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x8d);
+                    ElfEmitter_encode_modrm_mem(self, d, off, base);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+    self.text.push(0x90);
+}
+
+// --- SSE2/SSE encoders ---
+
+fn ElfEmitter_encode_movsd(self: &mut ElfEmitter, src: str, dst: str) {
+    // movsd label(%rip), %xmmN
+    if str_contains(src, "(%rip)") {
+        match parse_xmm_reg(dst) {
+            OptI64::Some(dst_xmm) => {
+                var label: str = str_slice(src, 0, str_len(src) - 6);
+                var sym_idx: i64 = 0;
+                if str_starts_with(label, ".L") {
+                    sym_idx = ElfEmitter_get_or_add_local_label(self, label);
+                } else {
+                    sym_idx = ElfEmitter_get_or_add_undef_symbol(self, label);
+                }
+                var rex: i64 = 0x40;
+                if dst_xmm >= 8 { rex = 0x44; }
+                self.text.push(0xf2);
+                self.text.push(rex & 0xFF);
+                self.text.push(0x0f);
+                self.text.push(0x10);
+                var modrm: i64 = 0x05 | ((dst_xmm & 7) << 3);
+                self.text.push(modrm & 0xFF);
+                var reloc_offset: i64 = self.text.len();
+                self.relocations.push(Relocation_new(reloc_offset, sym_idx, R_X86_64_PC32, -4));
+                self.text.push(0); self.text.push(0); self.text.push(0); self.text.push(0);
+                return;
+            }
+            OptI64::None => {}
+        }
+    }
+    // movsd %xmmN, %xmmM (reg-to-reg)
+    match parse_xmm_reg(src) {
+        OptI64::Some(s_xmm) => {
+            match parse_xmm_reg(dst) {
+                OptI64::Some(d_xmm) => {
+                    var rex: i64 = 0x00;
+                    if s_xmm >= 8 || d_xmm >= 8 {
+                        rex = 0x40 | ((s_xmm >> 3) << 2) | ((d_xmm >> 3) << 0);
+                    }
+                    self.text.push(0xf2);
+                    if rex != 0 { self.text.push(rex & 0xFF); }
+                    self.text.push(0x0f);
+                    self.text.push(0x10);
+                    var modrm: i64 = 0xc0 | ((d_xmm & 7) << 3) | (s_xmm & 7);
+                    self.text.push(modrm & 0xFF);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+    // movsd %xmmN, mem (store)
+    match parse_xmm_reg(src) {
+        OptI64::Some(s_xmm) => {
+            match try_parse_mem_indexed(dst) {
+                OptI64::Some(packed) => {
+                    var off: i64 = packed / 4096;
+                    var base: i64 = (packed / 256) % 16;
+                    var index: i64 = (packed / 16) % 16;
+                    var sc: i64 = packed % 16;
+                    var rex: i64 = 0x40 | ((s_xmm >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                    self.text.push(0xf2);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x0f);
+                    self.text.push(0x11);
+                    ElfEmitter_encode_modrm_sib(self, s_xmm, off, base, index, sc);
+                    return;
+                }
+                OptI64::None => {}
+            }
+            match try_parse_mem(dst) {
+                OptI64::Some(packed) => {
+                    var off: i64 = packed / 256;
+                    var base: i64 = packed % 256;
+                    var rex: i64 = 0x40 | ((s_xmm >> 3) << 2) | ((base >> 3) << 0);
+                    self.text.push(0xf2);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x0f);
+                    self.text.push(0x11);
+                    ElfEmitter_encode_modrm_mem(self, s_xmm, off, base);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+    // movsd mem, %xmmN (load)
+    match parse_xmm_reg(dst) {
+        OptI64::Some(d_xmm) => {
+            match try_parse_mem_indexed(src) {
+                OptI64::Some(packed) => {
+                    var off: i64 = packed / 4096;
+                    var base: i64 = (packed / 256) % 16;
+                    var index: i64 = (packed / 16) % 16;
+                    var sc: i64 = packed % 16;
+                    var rex: i64 = 0x40 | ((d_xmm >> 3) << 2) | ((index >> 3) << 1) | ((base >> 3) << 0);
+                    self.text.push(0xf2);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x0f);
+                    self.text.push(0x10);
+                    ElfEmitter_encode_modrm_sib(self, d_xmm, off, base, index, sc);
+                    return;
+                }
+                OptI64::None => {}
+            }
+            match try_parse_mem(src) {
+                OptI64::Some(packed) => {
+                    var off: i64 = packed / 256;
+                    var base: i64 = packed % 256;
+                    var rex: i64 = 0x40 | ((d_xmm >> 3) << 2) | ((base >> 3) << 0);
+                    self.text.push(0xf2);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x0f);
+                    self.text.push(0x10);
+                    ElfEmitter_encode_modrm_mem(self, d_xmm, off, base);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+    self.text.push(0x90);
+}
+
+fn ElfEmitter_encode_sse2_arith(self: &mut ElfEmitter, opcode: i64, src: str, dst: str) {
+    match parse_xmm_reg(src) {
+        OptI64::Some(s_xmm) => {
+            match parse_xmm_reg(dst) {
+                OptI64::Some(d_xmm) => {
+                    var rex: i64 = 0x00;
+                    if s_xmm >= 8 || d_xmm >= 8 {
+                        rex = 0x40 | ((d_xmm >> 3) << 2) | ((s_xmm >> 3) << 0);
+                    }
+                    self.text.push(0xf2);
+                    if rex != 0 { self.text.push(rex & 0xFF); }
+                    self.text.push(0x0f);
+                    self.text.push(opcode & 0xFF);
+                    var modrm: i64 = 0xc0 | ((d_xmm & 7) << 3) | (s_xmm & 7);
+                    self.text.push(modrm & 0xFF);
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+}
+
+fn ElfEmitter_encode_sse2_arith_66(self: &mut ElfEmitter, opcode: i64, src: str, dst: str) {
+    match parse_xmm_reg(src) {
+        OptI64::Some(s_xmm) => {
+            match parse_xmm_reg(dst) {
+                OptI64::Some(d_xmm) => {
+                    var rex: i64 = 0x00;
+                    if s_xmm >= 8 || d_xmm >= 8 {
+                        rex = 0x40 | ((d_xmm >> 3) << 2) | ((s_xmm >> 3) << 0);
+                    }
+                    self.text.push(0x66);
+                    if rex != 0 { self.text.push(rex & 0xFF); }
+                    self.text.push(0x0f);
+                    self.text.push(opcode & 0xFF);
+                    var modrm: i64 = 0xc0 | ((d_xmm & 7) << 3) | (s_xmm & 7);
+                    self.text.push(modrm & 0xFF);
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+}
+
+fn ElfEmitter_encode_sse_arith(self: &mut ElfEmitter, opcode: i64, src: str, dst: str) {
+    match parse_xmm_reg(src) {
+        OptI64::Some(s_xmm) => {
+            match parse_xmm_reg(dst) {
+                OptI64::Some(d_xmm) => {
+                    var rex: i64 = 0x00;
+                    if s_xmm >= 8 || d_xmm >= 8 {
+                        rex = 0x40 | ((d_xmm >> 3) << 2) | ((s_xmm >> 3) << 0);
+                    }
+                    self.text.push(0xf3);
+                    if rex != 0 { self.text.push(rex & 0xFF); }
+                    self.text.push(0x0f);
+                    self.text.push(opcode & 0xFF);
+                    var modrm: i64 = 0xc0 | ((d_xmm & 7) << 3) | (s_xmm & 7);
+                    self.text.push(modrm & 0xFF);
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+}
+
+fn ElfEmitter_encode_sse_arith_66(self: &mut ElfEmitter, opcode: i64, src: str, dst: str) {
+    match parse_xmm_reg(src) {
+        OptI64::Some(s_xmm) => {
+            match parse_xmm_reg(dst) {
+                OptI64::Some(d_xmm) => {
+                    var rex: i64 = 0x00;
+                    if s_xmm >= 8 || d_xmm >= 8 {
+                        rex = 0x40 | ((d_xmm >> 3) << 2) | ((s_xmm >> 3) << 0);
+                    }
+                    self.text.push(0x66);
+                    if rex != 0 { self.text.push(rex & 0xFF); }
+                    self.text.push(0x0f);
+                    self.text.push(opcode & 0xFF);
+                    var modrm: i64 = 0xc0 | ((d_xmm & 7) << 3) | (s_xmm & 7);
+                    self.text.push(modrm & 0xFF);
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+}
+
+fn ElfEmitter_encode_movss(self: &mut ElfEmitter, src: str, dst: str) {
+    // movss label(%rip), %xmmN
+    if str_contains(src, "(%rip)") {
+        match parse_xmm_reg(dst) {
+            OptI64::Some(dst_xmm) => {
+                var label: str = str_slice(src, 0, str_len(src) - 6);
+                var sym_idx: i64 = 0;
+                if str_starts_with(label, ".L") {
+                    sym_idx = ElfEmitter_get_or_add_local_label(self, label);
+                } else {
+                    sym_idx = ElfEmitter_get_or_add_undef_symbol(self, label);
+                }
+                var rex: i64 = 0x40;
+                if dst_xmm >= 8 { rex = 0x44; }
+                self.text.push(0xf3);
+                self.text.push(rex & 0xFF);
+                self.text.push(0x0f);
+                self.text.push(0x10);
+                var modrm: i64 = 0x05 | ((dst_xmm & 7) << 3);
+                self.text.push(modrm & 0xFF);
+                var reloc_offset: i64 = self.text.len();
+                self.relocations.push(Relocation_new(reloc_offset, sym_idx, R_X86_64_PC32, -4));
+                self.text.push(0); self.text.push(0); self.text.push(0); self.text.push(0);
+                return;
+            }
+            OptI64::None => {}
+        }
+    }
+    // movss %xmmN, %xmmM (reg-to-reg)
+    match parse_xmm_reg(src) {
+        OptI64::Some(s_xmm) => {
+            match parse_xmm_reg(dst) {
+                OptI64::Some(d_xmm) => {
+                    var rex: i64 = 0x00;
+                    if s_xmm >= 8 || d_xmm >= 8 {
+                        rex = 0x40 | ((s_xmm >> 3) << 2) | ((d_xmm >> 3) << 0);
+                    }
+                    self.text.push(0xf3);
+                    if rex != 0 { self.text.push(rex & 0xFF); }
+                    self.text.push(0x0f);
+                    self.text.push(0x10);
+                    var modrm: i64 = 0xc0 | ((d_xmm & 7) << 3) | (s_xmm & 7);
+                    self.text.push(modrm & 0xFF);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+    // movss %xmmN, mem (store)
+    match parse_xmm_reg(src) {
+        OptI64::Some(s_xmm) => {
+            match try_parse_mem(dst) {
+                OptI64::Some(packed) => {
+                    var off: i64 = packed / 256;
+                    var base: i64 = packed % 256;
+                    var rex: i64 = 0x40 | ((s_xmm >> 3) << 2) | ((base >> 3) << 0);
+                    self.text.push(0xf3);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x0f);
+                    self.text.push(0x11);
+                    ElfEmitter_encode_modrm_mem(self, s_xmm, off, base);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+    // movss mem, %xmmN (load)
+    match parse_xmm_reg(dst) {
+        OptI64::Some(d_xmm) => {
+            match try_parse_mem(src) {
+                OptI64::Some(packed) => {
+                    var off: i64 = packed / 256;
+                    var base: i64 = packed % 256;
+                    var rex: i64 = 0x40 | ((d_xmm >> 3) << 2) | ((base >> 3) << 0);
+                    self.text.push(0xf3);
+                    self.text.push(rex & 0xFF);
+                    self.text.push(0x0f);
+                    self.text.push(0x10);
+                    ElfEmitter_encode_modrm_mem(self, d_xmm, off, base);
+                    return;
+                }
+                OptI64::None => {}
+            }
+        }
+        OptI64::None => {}
+    }
+}
+
+// --- ModRM/SIB encoding ---
+
+fn ElfEmitter_encode_modrm_mem(self: &mut ElfEmitter, reg: i64, offset: i64, base: i64) {
+    var reg_field: i64 = reg & 7;
+    var base_field: i64 = base & 7;
+    if offset == 0 && base_field != 5 {
+        var modrm: i64 = 0x00 | (reg_field << 3) | base_field;
+        self.text.push(modrm & 0xFF);
+        if base_field == 4 { self.text.push(0x24); }
+    } else if offset >= -128 && offset <= 127 {
+        var modrm: i64 = 0x40 | (reg_field << 3) | base_field;
+        self.text.push(modrm & 0xFF);
+        if base_field == 4 { self.text.push(0x24); }
+        self.text.push(offset & 0xFF);
+    } else {
+        var modrm: i64 = 0x80 | (reg_field << 3) | base_field;
+        self.text.push(modrm & 0xFF);
+        if base_field == 4 { self.text.push(0x24); }
+        emit_u32(self.text, offset);
+    }
+}
+
+fn ElfEmitter_encode_modrm_sib(self: &mut ElfEmitter, reg: i64, offset: i64, base: i64, index: i64, scale_bits: i64) {
+    var reg_field: i64 = reg & 7;
+    var base_field: i64 = base & 7;
+    var index_field: i64 = index & 7;
+    if offset == 0 && base_field != 5 {
+        var modrm: i64 = 0x04 | (reg_field << 3);
+        self.text.push(modrm & 0xFF);
+        var sib: i64 = (scale_bits << 6) | (index_field << 3) | base_field;
+        self.text.push(sib & 0xFF);
+    } else if offset >= -128 && offset <= 127 {
+        var modrm: i64 = 0x44 | (reg_field << 3);
+        self.text.push(modrm & 0xFF);
+        var sib: i64 = (scale_bits << 6) | (index_field << 3) | base_field;
+        self.text.push(sib & 0xFF);
+        self.text.push(offset & 0xFF);
+    } else {
+        var modrm: i64 = 0x84 | (reg_field << 3);
+        self.text.push(modrm & 0xFF);
+        var sib: i64 = (scale_bits << 6) | (index_field << 3) | base_field;
+        self.text.push(sib & 0xFF);
+        emit_u32(self.text, offset);
+    }
+}
+
+// --- Helper: parse byte register name ---
+fn parse_byte_reg(s: str) -> i64 {
+    var t: str = str_trim(s);
+    if str_starts_with(t, "%") { t = str_slice(t, 1, str_len(t)); }
+    if str_equal(t, "al") { return 0; }
+    if str_equal(t, "cl") { return 1; }
+    if str_equal(t, "dl") { return 2; }
+    if str_equal(t, "bl") { return 3; }
+    if str_equal(t, "spl") { return 4; }
+    if str_equal(t, "bpl") { return 5; }
+    if str_equal(t, "sil") { return 6; }
+    if str_equal(t, "dil") { return 7; }
+    if str_equal(t, "r8b") { return 8; }
+    if str_equal(t, "r9b") { return 9; }
+    if str_equal(t, "r10b") { return 10; }
+    if str_equal(t, "r11b") { return 11; }
+    if str_equal(t, "r12b") { return 12; }
+    if str_equal(t, "r13b") { return 13; }
+    if str_equal(t, "r14b") { return 14; }
+    if str_equal(t, "r15b") { return 15; }
+    return -1;
+}
+// Assembles the final ELF64 relocatable object file.
+pub fn ElfEmitter_build_elf(self: &ElfEmitter) -> ResultVec {
+    var buf: Vec = Vec::new();
+    // ELF Header (64 bytes)
+    buf.push(ELFMAG0); buf.push(ELFMAG1); buf.push(ELFMAG2); buf.push(ELFMAG3);
+    buf.push(ELFCLASS64); buf.push(ELFDATA2LSB); buf.push(EV_CURRENT); buf.push(ELFOSABI_NONE);
+    // 8 bytes padding
+    var pi: i64 = 0; while pi < 8 { buf.push(0); pi = pi + 1; }
+    emit_u16(buf, ET_REL); // e_type
+    emit_u16(buf, self.machine); // e_machine
+    emit_u32(buf, EV_CURRENT); // e_version
+    emit_u64(buf, 0); // e_entry (0 for relocatable)
+    emit_u64(buf, 0); // e_phoff (no program headers)
+    // e_shoff: section headers offset (computed later)
+    var shoff_pos: i64 = buf.len();
+    emit_u64(buf, 0); // placeholder
+    emit_u32(buf, 0); // e_flags
+    emit_u16(buf, 64); // e_ehsize
+    emit_u16(buf, 0); // e_phentsize
+    emit_u16(buf, 0); // e_phnum
+    emit_u16(buf, 64); // e_shentsize
+    emit_u16(buf, 0); // e_shnum (placeholder)
+    emit_u16(buf, 0); // e_shstrndx (placeholder)
+    // Section data follows ELF header
+    // .text section
+    var text_offset: i64 = buf.len();
+    var ti: i64 = 0; while ti < self.text.len() { buf.push(self.text.get(ti)); ti = ti + 1; }
+    // .rodata section
+    var rodata_offset: i64 = buf.len();
+    var ri: i64 = 0; while ri < self.rodata.len() { buf.push(self.rodata.get(ri)); ri = ri + 1; }
+    // .symtab section
+    var symtab_offset: i64 = buf.len();
+    // Null symbol (index 0)
+    emit_u32(buf, 0); // st_name
+    buf.push(0); buf.push(0); // st_info, st_other
+    emit_u16(buf, 0); // st_shndx
+    emit_u64(buf, 0); // st_value
+    emit_u64(buf, 0); // st_size
+    // Real symbols
+    var si: i64 = 0;
+    while si < self.symbols.len() {
+        var sym: Symbol = self.symbols.get(si);
+        var name_off: i64 = ElfEmitter_add_strtab(self, sym.name);
+        emit_u32(buf, name_off); // st_name
+        var st_info: i64 = (sym.binding << 4) | sym.sym_type;
+        buf.push(st_info & 0xFF); // st_info
+        buf.push(0); // st_other
+        emit_u16(buf, sym.section); // st_shndx
+        emit_u64(buf, sym.value); // st_value
+        emit_u64(buf, sym.size); // st_size
+        si = si + 1;
+    }
+    var symtab_size: i64 = buf.len() - symtab_offset;
+    // .strtab section
+    var strtab_offset: i64 = buf.len();
+    var stri: i64 = 0; while stri < self.strtab.len() { buf.push(self.strtab.get(stri)); stri = stri + 1; }
+    // .shstrtab section
+    var shstrtab_offset: i64 = buf.len();
+    var shstri: i64 = 0; while shstri < self.shstrtab.len() { buf.push(self.shstrtab.get(shstri)); shstri = shstri + 1; }
+    // .rela.text section
+    var rela_offset: i64 = buf.len();
+    var rli: i64 = 0;
+    while rli < self.relocations.len() {
+        var rel: Relocation = self.relocations.get(rli);
+        emit_u64(buf, rel.offset); // r_offset
+        // r_info = (symbol << 32) | type
+        emit_u32(buf, rel.symbol); // r_info lower 32 = symbol
+        emit_u32(buf, rel.rtype); // r_info upper 32 = type
+        emit_u64(buf, rel.addend); // r_addend
+        rli = rli + 1;
+    }
+    var rela_size: i64 = buf.len() - rela_offset;
+    // Section headers
+    var shoff: i64 = buf.len();
+    // Section 0: null
+    emit_u32(buf, 0); emit_u32(buf, 0); emit_u64(buf, 0); emit_u64(buf, 0); emit_u64(buf, 0); emit_u32(buf, 0); emit_u32(buf, 0); emit_u64(buf, 0); emit_u64(buf, 0);
+    // Section 1: .text
+    var text_name: i64 = ElfEmitter_add_shstrtab(self, ".text");
+    emit_u32(buf, text_name); emit_u32(buf, SHT_PROGBITS); emit_u64(buf, SHF_ALLOC | SHF_EXECINSTR); emit_u64(buf, text_offset); emit_u64(buf, self.text.len()); emit_u32(buf, 0); emit_u32(buf, 0); emit_u64(buf, 16); emit_u64(buf, 0);
+    // Section 2: .rodata
+    var rodata_name: i64 = ElfEmitter_add_shstrtab(self, ".rodata");
+    emit_u32(buf, rodata_name); emit_u32(buf, SHT_PROGBITS); emit_u64(buf, SHF_ALLOC); emit_u64(buf, rodata_offset); emit_u64(buf, self.rodata.len()); emit_u32(buf, 0); emit_u32(buf, 0); emit_u64(buf, 16); emit_u64(buf, 0);
+    // Section 3: .symtab
+    var symtab_name: i64 = ElfEmitter_add_shstrtab(self, ".symtab");
+    var strtab_idx: i64 = 4;
+    emit_u32(buf, symtab_name); emit_u32(buf, SHT_SYMTAB); emit_u64(buf, 0); emit_u64(buf, symtab_offset); emit_u64(buf, symtab_size); emit_u32(buf, strtab_idx); emit_u32(buf, 1); emit_u64(buf, 8); emit_u64(buf, 24);
+    // Section 4: .strtab
+    var strtab_name: i64 = ElfEmitter_add_shstrtab(self, ".strtab");
+    emit_u32(buf, strtab_name); emit_u32(buf, SHT_STRTAB); emit_u64(buf, 0); emit_u64(buf, strtab_offset); emit_u64(buf, self.strtab.len()); emit_u32(buf, 0); emit_u32(buf, 0); emit_u64(buf, 1); emit_u64(buf, 0);
+    // Section 5: .shstrtab
+    var shstrtab_name: i64 = ElfEmitter_add_shstrtab(self, ".shstrtab");
+    emit_u32(buf, shstrtab_name); emit_u32(buf, SHT_STRTAB); emit_u64(buf, 0); emit_u64(buf, shstrtab_offset); emit_u64(buf, self.shstrtab.len()); emit_u32(buf, 0); emit_u32(buf, 0); emit_u64(buf, 1); emit_u64(buf, 0);
+    // Section 6: .rela.text
+    var rela_name: i64 = ElfEmitter_add_shstrtab(self, ".rela.text");
+    emit_u32(buf, rela_name); emit_u32(buf, SHT_RELA); emit_u64(buf, SHF_INFO_LINK); emit_u64(buf, rela_offset); emit_u64(buf, rela_size); emit_u32(buf, 1); emit_u32(buf, 3); emit_u64(buf, 8); emit_u64(buf, 24);
+    var num_sections: i64 = 7;
+    // Patch e_shoff, e_shnum, e_shstrndx
+    // e_shoff at offset 40
+    var p: i64 = 40;
+    buf.set(p, shoff & 0xFF); buf.set(p+1, (shoff >> 8) & 0xFF); buf.set(p+2, (shoff >> 16) & 0xFF); buf.set(p+3, (shoff >> 24) & 0xFF);
+    buf.set(p+4, (shoff >> 32) & 0xFF); buf.set(p+5, (shoff >> 40) & 0xFF); buf.set(p+6, (shoff >> 48) & 0xFF); buf.set(p+7, (shoff >> 56) & 0xFF);
+    // e_shnum at offset 60
+    p = 60;
+    buf.set(p, num_sections & 0xFF); buf.set(p+1, (num_sections >> 8) & 0xFF);
+    // e_shstrndx at offset 62
+    p = 62;
+    var shstrndx: i64 = 5;
+    buf.set(p, shstrndx & 0xFF); buf.set(p+1, (shstrndx >> 8) & 0xFF);
+    return ResultVec::Ok(buf);
+}
+
+// --- encode_asm_block ---
+// Public function that encodes asm text and returns (bytes, symbols, relocations)
+// Used by runtime_linux.fd to encode assembly-encoded runtime functions.
+pub struct AsmBlockResult {
+    pub bytes: Vec,
+    pub symbols: Vec<Symbol>,
+    pub relocations: Vec<Relocation>,
+}
+
+pub fn encode_asm_block(asm: str) -> AsmBlockResult {
+    var emitter: ElfEmitter = ElfEmitter_new();
+    match ElfEmitter_assemble(emitter, asm) {
+        ResultUnit::Ok => {}
+        ResultUnit::Err(e) => { return AsmBlockResult { bytes: Vec::new(), symbols: Vec::new(), relocations: Vec::new() }; }
+    }
+    return AsmBlockResult { bytes: emitter.text, symbols: emitter.symbols, relocations: emitter.relocations };
+}
+
+// --- dump_symbols (debug) ---
+pub fn dump_symbols(elf: Vec) {
+    // TODO: implement ELF symbol table dump
+}

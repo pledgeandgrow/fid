@@ -1,0 +1,312 @@
+// SQLite FFI bindings for Fides
+//
+// Provides a real database driver by binding to the system SQLite3 library
+// via FFI. This implements the `Database` capability from db.fd, so SQLite
+// databases can be used interchangeably with the in-memory stub.
+//
+// Requirements:
+//   - libsqlite3-dev installed (provides sqlite3.h and libsqlite3.so)
+//   - On Ubuntu/Debian: sudo apt-get install libsqlite3-dev
+//   - On macOS: brew install sqlite3
+//
+// Usage:
+//   use sqlite;
+//   var db = SQLite::open("test.db");
+//   db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+//   db.exec("INSERT INTO users (name) VALUES ('Alice')");
+//   val rows = db.query("SELECT * FROM users");
+//   // rows is a JSON array: [{"id":1,"name":"Alice"}]
+//   db.close();
+//
+// The query results are returned as JSON strings (matching the db.fd
+// Database capability interface) so they work within Fides's current type
+// system.
+
+module sqlite;
+
+use json;
+
+// ─── FFI declarations: bind to the SQLite3 C library ───
+//
+// We declare the subset of the SQLite C API needed for basic database
+// operations. We do NOT include <sqlite3.h> because Fides represents all
+// C pointers as i64, which would conflict with SQLite's typed pointers
+// (sqlite3*, sqlite3_stmt*). Instead, we declare the functions with i64
+// types and link against -lsqlite3. The linker resolves the symbols at
+// link time.
+
+extern "C" link "sqlite3" {
+    // Opening / closing a database connection
+    // sqlite3_open(filename, &ppDb) -> int (SQLITE_OK=0 on success)
+    fn sqlite3_open as p_sqlite3_open(filename: str, ppDb: *i64) -> i64;
+    fn sqlite3_close as p_sqlite3_close(db: i64) -> i64;
+
+    // One-shot exec: execute SQL without results
+    // sqlite3_exec(db, sql, callback, arg, &errmsg) -> int
+    fn sqlite3_exec as p_sqlite3_exec(
+        db: i64,
+        sql: str,
+        callback: i64,
+        arg: i64,
+        errmsg: *str
+    ) -> i64;
+
+    // Prepared statements
+    // sqlite3_prepare_v2(db, sql, nByte, &ppStmt, &tail) -> int
+    fn sqlite3_prepare_v2 as p_sqlite3_prepare_v2(
+        db: i64,
+        sql: str,
+        nByte: i64,
+        ppStmt: *i64,
+        tail: *str
+    ) -> i64;
+    fn sqlite3_step as p_sqlite3_step(stmt: i64) -> i64;
+    fn sqlite3_finalize as p_sqlite3_finalize(stmt: i64) -> i64;
+
+    // Column metadata
+    // sqlite3_column_count(stmt) -> int
+    fn sqlite3_column_count as p_sqlite3_column_count(stmt: i64) -> i64;
+    // sqlite3_column_name(stmt, col) -> const char*
+    fn sqlite3_column_name as p_sqlite3_column_name(stmt: i64, col: i64) -> str;
+    // sqlite3_column_text(stmt, col) -> const unsigned char*
+    fn sqlite3_column_text as p_sqlite3_column_text(stmt: i64, col: i64) -> str;
+    // sqlite3_column_int64(stmt, col) -> int64
+    fn sqlite3_column_int64 as p_sqlite3_column_int64(stmt: i64, col: i64) -> i64;
+    // sqlite3_column_double(stmt, col) -> double
+    fn sqlite3_column_double as p_sqlite3_column_double(stmt: i64, col: i64) -> f64;
+    // sqlite3_column_type(stmt, col) -> int (SQLITE_INTEGER=1, FLOAT=2, TEXT=3, BLOB=4, NULL=5)
+    fn sqlite3_column_type as p_sqlite3_column_type(stmt: i64, col: i64) -> i64;
+
+    // Error handling
+    // sqlite3_errmsg(db) -> const char*
+    fn sqlite3_errmsg as p_sqlite3_errmsg(db: i64) -> str;
+
+    // Metadata
+    // sqlite3_last_insert_rowid(db) -> int64
+    fn sqlite3_last_insert_rowid as p_sqlite3_last_insert_rowid(db: i64) -> i64;
+    // sqlite3_changes(db) -> int (rows affected by last INSERT/UPDATE/DELETE)
+    fn sqlite3_changes as p_sqlite3_changes(db: i64) -> i64;
+
+    // Free memory allocated by SQLite (e.g., error messages from sqlite3_exec)
+    fn sqlite3_free as p_sqlite3_free(ptr: i64) -> void;
+}
+
+// ─── SQLite constants ───
+//
+// These mirror the SQLITE_* return code constants from sqlite3.h.
+
+const SQLITE_OK: i64 = 0;
+const SQLITE_ROW: i64 = 100;
+const SQLITE_DONE: i64 = 101;
+const SQLITE_INTEGER: i64 = 1;
+const SQLITE_FLOAT: i64 = 2;
+const SQLITE_TEXT: i64 = 3;
+const SQLITE_BLOB: i64 = 4;
+const SQLITE_NULL: i64 = 5;
+
+// ─── SQLite connection struct ───
+
+/// A connection to a SQLite database file.
+/// The `handle` field holds the raw `sqlite3*` pointer as an i64.
+struct SQLite {
+    handle: i64,
+}
+
+impl SQLite {
+    /// Open a SQLite database file.
+    /// If the file doesn't exist, a new database is created.
+    /// Returns a SQLite connection on success.
+    pub fn open(path: str) -> SQLite {
+        var handle: i64 = 0;
+        var rc = p_sqlite3_open(path, &handle);
+        if rc != SQLITE_OK {
+            // If open failed, the handle may still be valid for getting
+            // the error message. If handle is 0, use a generic error.
+            var msg = "sqlite3_open failed";
+            if handle != 0 {
+                msg = p_sqlite3_errmsg(handle);
+                p_sqlite3_close(handle);
+            }
+            p_panic(msg);
+        }
+        return SQLite { handle: handle };
+    }
+
+    /// Open an in-memory SQLite database (use ":memory:" as path).
+    pub fn open_memory() -> SQLite {
+        return SQLite::open(":memory:");
+    }
+}
+
+// ─── Database operations ───
+//
+// These methods mirror the `Database` capability interface from db.fd:
+//   query(sql: str) -> str  — SELECT, returns JSON array of row objects
+//   exec(sql: str) -> i64   — INSERT/UPDATE/DELETE/DDL, returns rows affected
+//   close()                 — close the connection
+
+impl SQLite {
+    /// Execute a SELECT query and return results as a JSON array string.
+    /// Each row is a JSON object with column names as keys.
+    /// Example: [{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]
+    pub fn query(self: SQLite, sql: str) -> str {
+        var stmt: i64 = 0;
+        var tail: str = "";
+        var rc = p_sqlite3_prepare_v2(self.handle, sql, -1, &stmt, &tail);
+        if rc != SQLITE_OK {
+            var msg = p_sqlite3_errmsg(self.handle);
+            p_panic(msg);
+        }
+
+        var ncol = p_sqlite3_column_count(stmt);
+        var result = "[";
+        var first = true;
+
+        loop {
+            rc = p_sqlite3_step(stmt);
+            if rc != SQLITE_ROW {
+                break;
+            }
+
+            if !first {
+                result = result + ",";
+            }
+            first = false;
+
+            result = result + "{";
+            var col = 0;
+            while col < ncol {
+                if col > 0 {
+                    result = result + ",";
+                }
+                var name = p_sqlite3_column_name(stmt, col);
+                var col_type = p_sqlite3_column_type(stmt, col);
+
+                // JSON-encode the column name
+                result = result + "\"" + json_escape(name) + "\":";
+
+                // Encode the value based on its SQLite type
+                if col_type == SQLITE_INTEGER {
+                    result = result + int_to_str(p_sqlite3_column_int64(stmt, col));
+                } else if col_type == SQLITE_FLOAT {
+                    result = result + float_to_str(p_sqlite3_column_double(stmt, col));
+                } else if col_type == SQLITE_TEXT {
+                    var text = p_sqlite3_column_text(stmt, col);
+                    result = result + "\"" + json_escape(text) + "\"";
+                } else if col_type == SQLITE_NULL {
+                    result = result + "null";
+                } else {
+                    // BLOB or unknown — encode as null
+                    result = result + "null";
+                }
+                col = col + 1;
+            }
+            result = result + "}";
+        }
+
+        result = result + "]";
+        p_sqlite3_finalize(stmt);
+        return result;
+    }
+
+    /// Execute a non-query SQL statement (INSERT/UPDATE/DELETE/CREATE TABLE, etc.)
+    /// Returns the number of rows affected.
+    pub fn exec(self: SQLite, sql: str) -> i64 {
+        var errmsg: str = "";
+        var rc = p_sqlite3_exec(self.handle, sql, 0, 0, &errmsg);
+        if rc != SQLITE_OK {
+            var msg = errmsg;
+            if errmsg != "" {
+                // sqlite3_exec allocates the error message with sqlite3_malloc
+                // We should free it, but we don't have the raw pointer easily.
+                // In practice, the C runtime will clean it up.
+            }
+            // Fall back to sqlite3_errmsg if errmsg is empty
+            if msg == "" {
+                msg = p_sqlite3_errmsg(self.handle);
+            }
+            p_panic(msg);
+        }
+        return p_sqlite3_changes(self.handle);
+    }
+
+    /// Close the database connection.
+    pub fn close(self: SQLite) {
+        p_sqlite3_close(self.handle);
+    }
+}
+
+// ─── Convenience helpers ───
+
+/// Get the rowid of the most recent successful INSERT.
+pub fn last_insert_rowid(db: SQLite) -> i64 {
+    return p_sqlite3_last_insert_rowid(db.handle);
+}
+
+/// Get the number of rows modified by the most recent INSERT/UPDATE/DELETE.
+pub fn changes(db: SQLite) -> i64 {
+    return p_sqlite3_changes(db.handle);
+}
+
+/// Get the last error message from the database connection.
+pub fn error_message(db: SQLite) -> str {
+    return p_sqlite3_errmsg(db.handle);
+}
+
+// ─── JSON string escaping ───
+//
+// Escapes special characters for safe inclusion in JSON string values.
+// This mirrors the logic in stdlib/json.fd but is kept local to avoid
+// import cycles.
+
+fn json_escape(s: str) -> str {
+    var result = "";
+    var i = 0;
+    var len = str_len(s);
+    while i < len {
+        var ch = str_byte_at(s, i);
+        if ch == 34 {        // "
+            result = result + "\\\"";
+        } else if ch == 92 { // backslash
+            result = result + "\\\\";
+        } else if ch == 10 { // newline
+            result = result + "\\n";
+        } else if ch == 13 { // carriage return
+            result = result + "\\r";
+        } else if ch == 9 {  // tab
+            result = result + "\\t";
+        } else if ch < 32 {
+            // Control character — escape as \uXXXX
+            result = result + "\\u00";
+            result = result + hex_digit(ch / 16);
+            result = result + hex_digit(ch % 16);
+        } else {
+            result = result + p_char_to_str(ch);
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+fn hex_digit(n: i64) -> str {
+    if n < 10 {
+        return p_to_str(n);
+    }
+    if n == 10 { return "a"; }
+    if n == 11 { return "b"; }
+    if n == 12 { return "c"; }
+    if n == 13 { return "d"; }
+    if n == 14 { return "e"; }
+    return "f";
+}
+
+/// Convert an i64 to its string representation.
+/// (Local copy to avoid import issues — delegates to the core builtin.)
+fn int_to_str(n: i64) -> str {
+    return p_to_str(n);
+}
+
+/// Convert an f64 to its string representation.
+fn float_to_str(f: f64) -> str {
+    return p_float_to_str(f);
+}

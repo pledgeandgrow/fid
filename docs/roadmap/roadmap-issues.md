@@ -6,6 +6,153 @@
 
 ---
 
+## Critical Blockers (must fix before any production use)
+
+> Added Sep 7, 2026 (Session 18). All four items verified by reading source
+> and running tests. These are the highest-priority issues — they undermine
+> the language's core value propositions if left unfixed.
+
+### CB1: Self-hosted compiler doesn't enforce its own annotations
+
+**Status:** Open — highest priority
+
+The Rust bootstrap (`src/typechecker.rs`) has real enforcement of
+`@medical`, `@conserve`, `@deterministic`, `@crashfree`, `@gas`, `@dp`,
+`@shard`, `@constant_time`, `@realtime`, `@tainted`, `@differentiable`,
+`@quantized`, `@checkpoint`, `@adapter`. But the self-hosted compiler
+(`compiler/typechecker.fd`) has these as **stubs with `// stub (no
+enforcement)` comments** — they are permissive and never reject code.
+
+Verified in `compiler/typechecker.fd` lines 1494–1552:
+```
+// @conserve: energy conservation -- stub (no enforcement)
+// @gas(N): gas cost analysis -- stub (no enforcement)
+// @constant_time: constant-time execution -- stub (no enforcement)
+// @realtime: real-time deadline -- stub (no enforcement)
+// @differentiable: autodiff compatibility -- stub (no enforcement)
+// @quantized: quantization annotation -- stub (no enforcement)
+// @checkpoint: gradient checkpointing -- stub (no enforcement)
+// @dp: differential privacy -- stub (no enforcement)
+// @shard: tensor parallelism -- stub (no enforcement)
+// @adapter: adapter pattern -- stub (no enforcement)
+// @tainted: taint tracking -- stub (no enforcement)
+```
+
+Only `@deterministic` has partial enforcement (lines 1480–1487 — checks
+for `!IO`/`!Alloc` effects and floating-point operations).
+
+**Impact:** The self-hosted compiler is the primary compiler per
+`AGENTS.md`. If you use it, the safety annotations that are the
+language's main selling point don't actually work. You get false
+confidence — code marked `@medical` or `@constant_time` is not checked.
+
+**Fix:** Port the enforcement logic from `src/typechecker.rs` into
+`compiler/typechecker.fd` for each stubbed annotation. Each annotation
+needs its own verification pass that rejects non-conforming code.
+
+---
+
+### CB2: Result<T,E> and Option<T> hardcoded to i64
+
+**Status:** Open — blocks real error handling
+
+`stdlib/core.fd` defines `Result<T,E>` and `Option<T>` with `i64`
+payloads only:
+
+```fides
+pub enum Option<T> {
+    Some(i64),   // should be Some(T)
+    None,
+}
+
+pub enum Result<T, E> {
+    Ok(i64),     // should be Ok(T)
+    Err(i64),    // should be Err(E)
+}
+```
+
+Verified at `stdlib/core.fd` lines 48–49 and 126–129.
+
+**Impact:** You can't return `Result<str, str>` or `Option<Vec>`
+properly. This makes error handling unusable for real programs. A
+self-hosted compiler needs `Option<Token>`, `Result<Node, ParseError>`,
+etc. everywhere.
+
+**Fix:** Implement proper generic enum instantiation in the
+monomorphization pass (`src/mono.rs` / `compiler/mono.fd`). Same
+pattern as the `Vec<T>` fix — declare payloads as type params
+(`Some(T)` instead of `Some(i64)`), add type-param substitution to
+`pattern_binding_ir_types()` in the lowerer.
+
+**Note:** This is also tracked as Issue 1 below (kept there for
+historical context).
+
+---
+
+### CB3: Backend test parity is not 100%
+
+**Status:** Open — verified Sep 7, 2026
+
+Current test results from `./target/release/fidesc test`:
+
+| Backend | Pass rate | Detail |
+|---------|----------|--------|
+| Interpreter | 231/242 (95.5%) | 11 failures |
+| C codegen | 214/242 (88.4%) | 28 failures |
+| PE emitter | 234/242 (96.7%) | 8 failures |
+
+Failing tests include: `real_crypto`, `real_database`, `real_threads`,
+`test_banking`, `test_game_stdlib`, `test_os_features`, `test_parallel`,
+`test_sandbox_alloc_fail`, `test_tier1_kernel`, `test_token_full`,
+`probe_parser_direct`, `probe_parser_direct2`, `probe_parser_simple`,
+`test_codegen_c`, `test_fmt_harness`, `test_lexer_harness`,
+`test_parser_harness`, `test_sl_debug`, and others.
+
+**Impact:** For production, you need 100% on at least one backend.
+Currently no backend is at 100%.
+
+**Fix:** Triage and fix the remaining failing tests. Run `./verify.sh`
+and `./verify-selfhost.sh` to get the current list. Some failures are
+shared across all backends (indicating a common root cause in lowering
+or typechecking), others are backend-specific.
+
+---
+
+### CB4: No real error recovery in the parser
+
+**Status:** Partially addressed — needs hardening
+
+The Rust bootstrap parser (`src/parser.rs`) **does** have error recovery
+with synchronization tokens (`recover_to_sync_token`, line 332). It
+collects multiple errors per run and continues parsing.
+
+The self-hosted parser (`compiler/parser.fd`) also has error recovery
+(`recover_to_sync_token` at line 313, error collection at lines 442 and
+2311). However, it has issues:
+
+1. **Debug prints left in production code** — `print("DBG: parse loop
+   done\n")` at line 451, `print("DBG: parse returning Err\n")` at line
+   453, `print("DBG: parse returning Ok\n")` at line 456. These must be
+   removed.
+2. **Recovery may not be as robust** as the Rust version — the
+   synchronization token set and recovery strategies need auditing to
+   ensure they match.
+3. **Statement-level recovery** exists but may not cover all cases
+   (e.g., recovery inside expressions, nested blocks).
+
+**Impact:** Parse errors are potentially fatal in edge cases — one
+syntax error may stop compilation prematurely. Production compilers
+report multiple errors per run.
+
+**Fix:**
+1. Remove debug prints from `compiler/parser.fd` (lines 451, 453, 456).
+2. Audit `recover_to_sync_token` in `compiler/parser.fd` against
+   `src/parser.rs` to ensure parity.
+3. Add tests for multi-error recovery (e.g., two syntax errors in
+   different functions should both be reported).
+
+---
+
 ## Issue 1: Result<T,E> Hardcoded to i64
 
 **Status:** Fix in progress (blocked on syntax migration)

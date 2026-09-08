@@ -641,6 +641,7 @@ impl ElfEmitter {
             // ─── Shifts ───
             "shlq" => self.encode_shift(0xe0, operands, 8)?,
             "shrq" => self.encode_shift(0xe8, operands, 8)?,
+            "sarq" => self.encode_shift(0xf8, operands, 8)?,
 
             // ─── testq ───
             "testq" => {
@@ -690,6 +691,8 @@ impl ElfEmitter {
             // ─── movzbq / movzwq / movslq ───
             "movzbq" => self.encode_movzx(0xb6, operands, 8)?,
             "movzwq" => self.encode_movzx(0xb7, operands, 8)?,
+            "movsbq" => self.encode_movsx(0xbe, operands)?,
+            "movswq" => self.encode_movsx(0xbf, operands)?,
             "movslq" => {
                 if operands.len() == 2 {
                     // movslq %reg, %reg → REX.W 0x63 /r
@@ -793,6 +796,38 @@ impl ElfEmitter {
             "ucomisd" => {
                 if operands.len() == 2 {
                     self.encode_sse2_arith_66(0x2e, operands[0], operands[1])?;
+                }
+            }
+
+            // ─── Single-precision float (SSE) ───
+            "movss" => {
+                if operands.len() == 2 {
+                    self.encode_movss(operands[0], operands[1])?;
+                }
+            }
+            "addss" => {
+                if operands.len() == 2 {
+                    self.encode_sse_arith(0x58, operands[0], operands[1])?;
+                }
+            }
+            "subss" => {
+                if operands.len() == 2 {
+                    self.encode_sse_arith(0x5c, operands[0], operands[1])?;
+                }
+            }
+            "mulss" => {
+                if operands.len() == 2 {
+                    self.encode_sse_arith(0x59, operands[0], operands[1])?;
+                }
+            }
+            "divss" => {
+                if operands.len() == 2 {
+                    self.encode_sse_arith(0x5e, operands[0], operands[1])?;
+                }
+            }
+            "ucomiss" => {
+                if operands.len() == 2 {
+                    self.encode_sse_arith_66(0x2e, operands[0], operands[1])?;
                 }
             }
 
@@ -1264,6 +1299,37 @@ impl ElfEmitter {
         Ok(())
     }
 
+    /// Encode movsx (sign-extend): movsbq/movswq.
+    /// Encoding: REX.W 0F opcode /r  (same as movzx but with 0x63-style sign extension)
+    fn encode_movsx(&mut self, opcode: u8, operands: Vec<&str>) -> Result<(), String> {
+        if operands.len() != 2 {
+            return Ok(());
+        }
+        let d_opt = try_parse_reg(operands[1]);
+
+        // Memory source: movsbq offset(%base), %dst
+        if let (Some((off, base)), Some(d)) = (try_parse_mem(operands[0]), d_opt) {
+            let rex = 0x48 | (((d >> 3) & 1) << 2) | (((base >> 3) & 1) << 0);
+            self.text.push(rex);
+            self.text.push(0x0f);
+            self.text.push(opcode);
+            self.encode_modrm_mem(d, off, base);
+            return Ok(());
+        }
+
+        // Register source: movsbq %al, %rdx → REX.W 0F BE /r
+        let s_opt = try_parse_reg8(operands[0]).or_else(|| try_parse_reg(operands[0]));
+        if let (Some(s), Some(d)) = (s_opt, d_opt) {
+            let rex = 0x48 | (((d >> 3) & 1) << 2) | (((s >> 3) & 1) << 0);
+            self.text.push(rex);
+            self.text.push(0x0f);
+            self.text.push(opcode);
+            let modrm = 0xc0 | ((d & 7) << 3) | (s & 7);
+            self.text.push(modrm);
+        }
+        Ok(())
+    }
+
     fn encode_movzx(&mut self, opcode: u8, operands: Vec<&str>, _size: usize) -> Result<(), String> {
         if operands.len() != 2 {
             return Ok(());
@@ -1596,6 +1662,108 @@ impl ElfEmitter {
         self.text.push(opcode);
         let modrm = 0xc0 | ((d_xmm & 7) << 3) | (s_xmm & 7);
         self.text.push(modrm);
+        Ok(())
+    }
+
+    /// Encode SSE (single-precision) arithmetic: addss/subss/mulss/divss.
+    /// Uses F3 prefix (instead of F2 for double).
+    /// Encoding: F3 [REX] 0F opcode /r
+    fn encode_sse_arith(&mut self, opcode: u8, src: &str, dst: &str) -> Result<(), String> {
+        let s_xmm = parse_xmm_reg(src)?;
+        let d_xmm = parse_xmm_reg(dst)?;
+        let rex = if (s_xmm >= 8) || (d_xmm >= 8) {
+            0x40 | ((d_xmm >> 3) << 2) | ((s_xmm >> 3) << 0)
+        } else { 0x00 };
+        self.text.push(0xf3);
+        if rex != 0 { self.text.push(rex); }
+        self.text.push(0x0f);
+        self.text.push(opcode);
+        let modrm = 0xc0 | ((d_xmm & 7) << 3) | (s_xmm & 7);
+        self.text.push(modrm);
+        Ok(())
+    }
+
+    /// Encode SSE (single-precision) with 66 prefix (ucomiss).
+    fn encode_sse_arith_66(&mut self, opcode: u8, src: &str, dst: &str) -> Result<(), String> {
+        let s_xmm = parse_xmm_reg(src)?;
+        let d_xmm = parse_xmm_reg(dst)?;
+        let rex = if (s_xmm >= 8) || (d_xmm >= 8) {
+            0x40 | ((d_xmm >> 3) << 2) | ((s_xmm >> 3) << 0)
+        } else { 0x00 };
+        self.text.push(0x66);
+        if rex != 0 { self.text.push(rex); }
+        self.text.push(0x0f);
+        self.text.push(opcode);
+        let modrm = 0xc0 | ((d_xmm & 7) << 3) | (s_xmm & 7);
+        self.text.push(modrm);
+        Ok(())
+    }
+
+    /// Encode movss: move scalar single-precision FP value.
+    fn encode_movss(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        // movss label(%rip), %xmmN
+        if src.contains("(%rip)") {
+            let dst_xmm = parse_xmm_reg(dst)?;
+            let label = src.trim_end_matches("(%rip)").to_string();
+            let sym_idx = if label.starts_with(".L") {
+                self.get_or_add_local_label(&label)
+            } else {
+                self.get_or_add_undef_symbol(&label)
+            };
+            let rex = if dst_xmm >= 8 { 0x44 } else { 0x40 };
+            self.text.push(0xf3);
+            self.text.push(rex);
+            self.text.push(0x0f);
+            self.text.push(0x10);
+            let modrm = 0x05 | ((dst_xmm & 7) << 3);
+            self.text.push(modrm);
+            let reloc_offset = self.text.len() as u64;
+            self.relocations.push(Relocation {
+                offset: reloc_offset,
+                symbol: sym_idx,
+                rtype: R_X86_64_PC32,
+                addend: -4,
+            });
+            self.text.extend_from_slice(&[0, 0, 0, 0]);
+            return Ok(());
+        }
+        // movss %xmmN, %xmmM (reg-to-reg)
+        if let (Ok(s_xmm), Ok(d_xmm)) = (parse_xmm_reg(src), parse_xmm_reg(dst)) {
+            let rex = if (s_xmm >= 8) || (d_xmm >= 8) {
+                0x40 | ((s_xmm >> 3) << 2) | ((d_xmm >> 3) << 0)
+            } else { 0x00 };
+            self.text.push(0xf3);
+            if rex != 0 { self.text.push(rex); }
+            self.text.push(0x0f);
+            self.text.push(0x10);
+            let modrm = 0xc0 | ((d_xmm & 7) << 3) | (s_xmm & 7);
+            self.text.push(modrm);
+            return Ok(());
+        }
+        // movss %xmmN, mem (store)
+        if let Ok(s_xmm) = parse_xmm_reg(src) {
+            if let Some((off, base)) = try_parse_mem(dst) {
+                let rex = 0x40 | ((s_xmm >> 3) << 2) | ((base >> 3) << 0);
+                self.text.push(0xf3);
+                self.text.push(rex);
+                self.text.push(0x0f);
+                self.text.push(0x11);
+                self.encode_modrm_mem(s_xmm, off, base);
+                return Ok(());
+            }
+        }
+        // movss mem, %xmmN (load)
+        if let Ok(d_xmm) = parse_xmm_reg(dst) {
+            if let Some((off, base)) = try_parse_mem(src) {
+                let rex = 0x40 | ((d_xmm >> 3) << 2) | ((base >> 3) << 0);
+                self.text.push(0xf3);
+                self.text.push(rex);
+                self.text.push(0x0f);
+                self.text.push(0x10);
+                self.encode_modrm_mem(d_xmm, off, base);
+                return Ok(());
+            }
+        }
         Ok(())
     }
 

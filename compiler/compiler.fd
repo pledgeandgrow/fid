@@ -36,7 +36,15 @@ use compiler::codegen_c;
 use compiler::comptime_eval;
 use compiler::pe;
 use compiler::inc;
-
+use compiler::interp;
+use compiler::elf64;
+use compiler::linker;
+use compiler::runtime_linux;
+use compiler::codegen_x64;
+use compiler::peephole;
+use compiler::pir;
+use compiler::opt;
+use compiler::codegen;
 // ===========================================================================
 // Result types (Fides has no generic Result<T,E>)
 // ===========================================================================
@@ -53,6 +61,11 @@ pub enum ResultProgram {
 
 pub enum ResultIrModule {
     Ok(IrModule),
+    Err(Vec<str>),
+}
+
+pub enum ResultBytes {
+    Ok(Vec),
     Err(Vec<str>),
 }
 
@@ -1175,7 +1188,149 @@ pub fn lower_to_ir_module(source: str) -> ResultIrModule {
     return ResultIrModule::Err(c_vec1("unreachable"));
 }
 
-/// Get diagnostics (errors) for a source file -- used by LSP.
+/// Interpret a source file by lowering to IR and executing via the
+/// self-hosted interpreter. Returns exit code (0 = success, 1 = error).
+pub fn interpret_source(source: str) -> i64 {
+    var result: ResultIrModule = lower_to_ir_module(source);
+    match result {
+        ResultIrModule::Err(errs) => {
+            var msg: str = "Compilation error:\n";
+            var i: i64 = 0;
+            while i < errs.len() {
+                msg = msg + errs.get(i) + "\n";
+                i = i + 1;
+            }
+            p_eprint_str(msg);
+            return 1;
+        }
+        ResultIrModule::Ok(ir_mod) => {
+            return interpret_ir_module(ir_mod);
+        }
+    }
+    return 1;
+}
+
+/// Interpret a source file with execution limits and verbose flag.
+/// Returns exit code (0 = success, 1 = error).
+pub fn interpret_source_with_options(source: str, max_recursion: i64, max_steps: i64, max_memory: i64, verbose: bool) -> i64 {
+    var result: ResultIrModule = lower_to_ir_module(source);
+    match result {
+        ResultIrModule::Err(errs) => {
+            var msg: str = "Compilation error:\n";
+            var i: i64 = 0;
+            while i < errs.len() {
+                msg = msg + errs.get(i) + "\n";
+                i = i + 1;
+            }
+            p_eprint_str(msg);
+            return 1;
+        }
+        ResultIrModule::Ok(ir_mod2) => {
+            return interpret_ir_module_with_options(ir_mod2, max_recursion, max_steps, max_memory, verbose);
+        }
+    }
+    return 1;
+}
+
+/// Build a native executable from source.
+/// Dispatches to the appropriate backend based on target:
+///   x86-64 / x64       -> codegen_x64 + elf64 + runtime_linux + linker
+///   arm64 / aarch64    -> codegen (legacy ARM64) + elf64 + linker
+///   windows / x64-win  -> pe::generate_pe
+///   wasm               -> (future)
+pub fn build_executable(source: str, source_path: str, target: str, do_opt: bool, do_lto: bool) -> ResultBytes {
+    // Parse + lower to IR
+    var prog_result: ResultProgram = build_program_with_path(source, OptStr::Some(source_path));
+    match prog_result {
+        ResultProgram::Err(errs) => { return ResultBytes::Err(errs); }
+        ResultProgram::Ok(program) => {
+            var module: IrModule = lower(program);
+
+            // PIR pipeline: IR -> L1 -> L2 -> (optimize) -> L3
+            var l1: L1Module = lower_ir_to_l1(&module);
+            var l2: L2Module = lower_l1_to_l2(&l1);
+
+            if do_lto {
+                var _stats: OptStats = optimize_l2_lto(&mut l2);
+            } else if do_opt {
+                var _stats2: OptStats = optimize_l2(&mut l2);
+            }
+
+            var l3: L3Module = lower_l2_to_l3(&l2, &module);
+
+            // Dispatch to backend
+            if str_equal(target, "x86-64") || str_equal(target, "x64") {
+                // Generate x86-64 assembly
+                var asm: str = generate_asm(l3);
+                // Run peephole optimization
+                asm = peephole_optimize(asm);
+                // Emit ELF64 object file
+                var obj_result: ResultVec = emit_object_file(0, asm);
+                if ResultVec_is_err(obj_result) {
+                    return ResultBytes::Err(c_vec1(ResultVec_err_msg(obj_result)));
+                }
+                var obj: Vec<i64> = ResultVec_bytes(obj_result);
+                // Get runtime parts
+                var rt: RuntimeParts = runtime_parts();
+                var rt_relocs: Vec<RuntimeReloc> = runtime_relocations();
+                // Link
+                var objects: Vec<Vec> = Vec::new();
+                objects.push(obj);
+                // Convert runtime symbols to linker symbols
+                var rt_syms: Vec<LinkerSymbol> = Vec::new();
+                var si: i64 = 0;
+                while si < rt.symbols.len() {
+                    var rs: RuntimeSymbol = rt.symbols.get(si);
+                    rt_syms.push(LinkerSymbol_new(rs.name, rs.offset, true));
+                    si = si + 1;
+                }
+                // Convert runtime rodata syms to linker rodata syms
+                var rt_rodata_syms: Vec<LinkerRodataSym> = Vec::new();
+                var rsi: i64 = 0;
+                while rsi < rt.rodata_syms.len() {
+                    var rrs: RuntimeRodataSym = rt.rodata_syms.get(rsi);
+                    rt_rodata_syms.push(LinkerRodataSym_new(rrs.name, rrs.offset));
+                    rsi = rsi + 1;
+                }
+                // Convert runtime relocs to linker relocs
+                var rt_linker_relocs: Vec<LinkerReloc> = Vec::new();
+                var rri: i64 = 0;
+                while rri < rt_relocs.len() {
+                    var rr: RuntimeReloc = rt_relocs.get(rri);
+                    rt_linker_relocs.push(LinkerReloc_new(rr.offset, rr.symbol, rr.rtype));
+                    rri = rri + 1;
+                }
+                var link_result: LinkerResult = link_with_runtime(
+                    objects, "_start",
+                    rt.text, rt_syms,
+                    rt.rodata, rt_rodata_syms,
+                    rt_linker_relocs
+                );
+                if LinkerResult_is_ok(link_result) {
+                    return ResultBytes::Ok(LinkerResult_bytes(link_result));
+                }
+                return ResultBytes::Err(c_vec1(LinkerResult_err_msg(link_result)));
+            }
+            if str_equal(target, "x86-64-windows") || str_equal(target, "x64-windows") || str_equal(target, "windows") {
+                // Windows PE cross-compilation
+                var pe_bytes: Vec = generate_pe(module);
+                return ResultBytes::Ok(pe_bytes);
+            }
+            if str_equal(target, "arm64") || str_equal(target, "aarch64") {
+                // ARM64: use legacy codegen to produce assembly text, then emit via elf64
+                var asm_arm: str = generate(program);
+                var obj_result2: ResultVec = emit_object_file_for_target(0, asm_arm, "arm64");
+                if ResultVec_is_err(obj_result2) {
+                    return ResultBytes::Err(c_vec1(ResultVec_err_msg(obj_result2)));
+                }
+                return ResultBytes::Ok(ResultVec_bytes(obj_result2));
+            }
+            // Unknown target
+            return ResultBytes::Err(c_vec1("Unknown target: " + target));
+        }
+    }
+    return ResultBytes::Err(c_vec1("unreachable"));
+}
 pub fn get_diagnostics(source: str, source_path: OptStr) -> Vec<StrTriple> {
     var result: ResultProgram = build_program_with_path(source, source_path);
     match result {

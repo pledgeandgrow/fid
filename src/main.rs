@@ -6,6 +6,7 @@ use fidesc::codegen_arm64;
 use fidesc::codegen_riscv;
 use fidesc::codegen_x64;
 use fidesc::coff;
+use fidesc::ast;
 use fidesc::compiler;
 use fidesc::compiler::RunResult;
 use fidesc::cparser;
@@ -198,6 +199,47 @@ fn main() {
                         let _ = fs::set_permissions(&output, fs::Permissions::from_mode(0o755));
                     }
                     println!("Built native executable: {} ({} bytes, zero external tools)", output, exe_bytes.len());
+                }
+                Err(errors) => {
+                    print_errors(&errors);
+                    process::exit(1);
+                }
+            }
+        }
+
+        "build-x86" => {
+            if args.len() < 3 {
+                eprintln!("Usage: fidesc build-x86 <file.fd> [-o output]");
+                eprintln!("       Builds a Linux ELF executable using the x86.rs stack-machine backend (AT&T syntax)");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let output = args.iter().position(|a| a == "-o")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| s.clone())
+                .unwrap_or_else(|| {
+                    let stem = input.rsplit('.').nth(1).unwrap_or("output");
+                    format!("{}", stem)
+                });
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+            match compiler::build_x86_linux(&source, input) {
+                Ok(exe_bytes) => {
+                    fs::write(&output, &exe_bytes).unwrap_or_else(|e| {
+                        eprintln!("Error writing '{}': {}", output, e);
+                        process::exit(1);
+                    });
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(&output, fs::Permissions::from_mode(0o755));
+                    }
+                    println!("Built native executable: {} ({} bytes, x86.rs backend)", output, exe_bytes.len());
                 }
                 Err(errors) => {
                     print_errors(&errors);
@@ -1209,11 +1251,43 @@ fn main() {
                         // gcc/clang/tcc: -O2 + security hardening flags -o output c_path
                         // Extract link libraries from the C source (extern "C" link "m")
                         let mut link_libs: Vec<String> = vec!["-lm".to_string()];
+                        // Track preprocessor state to only pick up PLINK comments
+                        // that are active on the current platform.
+                        let is_windows = cfg!(target_os = "windows");
+                        let mut in_win32_block: bool = false;
+                        let mut in_else_block: bool = false;
                         for line in c_code.lines() {
+                            let trimmed = line.trim();
+                            // Track #ifdef _WIN32 / #else / #endif
+                            if trimmed.starts_with("#ifdef _WIN32") || trimmed.starts_with("#if defined(_WIN32)") {
+                                in_win32_block = true;
+                                in_else_block = false;
+                                continue;
+                            }
+                            if trimmed.starts_with("#else") && in_win32_block {
+                                in_else_block = true;
+                                continue;
+                            }
+                            if trimmed.starts_with("#endif") && in_win32_block {
+                                in_win32_block = false;
+                                in_else_block = false;
+                                continue;
+                            }
                             if line.starts_with("// PLINK:") {
-                                let lib = line.trim_start_matches("// PLINK:").trim();
-                                if !lib.is_empty() {
-                                    link_libs.push(format!("-l{}", lib));
+                                // Only include PLINK if it's in an active block for this platform
+                                let in_win32_active = in_win32_block && !in_else_block;
+                                let in_unix_active = in_win32_block && in_else_block;
+                                let in_global = !in_win32_block;
+                                let active = if is_windows {
+                                    in_win32_active || in_global
+                                } else {
+                                    in_unix_active || in_global
+                                };
+                                if active {
+                                    let lib = line.trim_start_matches("// PLINK:").trim();
+                                    if !lib.is_empty() {
+                                        link_libs.push(format!("-l{}", lib));
+                                    }
                                 }
                             }
                         }
@@ -2776,11 +2850,242 @@ fn main() {
             }
         }
 
+        "sbom" => {
+            // STUB: Software Bill of Materials export.
+            // Planned: parse a Fides source file, extract its import graph
+            // with capabilities and annotations, and output a CycloneDX or
+            // SPDX JSON document. See: docs/roadmap/safety-critical.md §19
+            if args.len() < 3 {
+                eprintln!("Usage: fidesc sbom <file.fd> [--format cyclonedx|spdx] [-o output]");
+                eprintln!("  Export a Software Bill of Materials for a Fides program.");
+                eprintln!("  --format cyclonedx   Output CycloneDX JSON (default)");
+                eprintln!("  --format spdx        Output SPDX JSON");
+                eprintln!("  -o <file>            Write to file (default: stdout)");
+                eprintln!();
+                eprintln!("  NOTE: This is a stub. Full SBOM export is not yet implemented.");
+                eprintln!("  See docs/roadmap/safety-critical.md for the implementation plan.");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let format = args.iter().position(|a| a == "--format")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| s.as_str())
+                .unwrap_or("cyclonedx");
+            let output_file = args.iter().position(|a| a == "-o")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| s.to_string());
+
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+
+            // Build the program to extract import and annotation data.
+            let program = match compiler::build_program_with_path(&source, Some(input)) {
+                Ok(p) => p,
+                Err(errors) => {
+                    print_errors(&errors);
+                    process::exit(1);
+                }
+            };
+
+            // Generate SBOM document (stub — emits a minimal structure).
+            let sbom = generate_sbom(&program, input, format);
+
+            if let Some(out_path) = output_file {
+                if let Err(e) = fs::write(&out_path, &sbom) {
+                    eprintln!("Error writing SBOM to '{}': {}", out_path, e);
+                    process::exit(1);
+                }
+                eprintln!("SBOM written to {} (format: {})", out_path, format);
+            } else {
+                println!("{}", sbom);
+            }
+            process::exit(0);
+        }
+
+        "qualify" => {
+            // STUB: Toolchain qualification manifest.
+            // Planned: emit a manifest with compiler version, optimizer pass
+            // list, test results, and annotation enforcement status. This is
+            // the first step toward IEC 62304 / DO-178C tool qualification.
+            // See: docs/roadmap/safety-critical.md §17
+            if args.len() < 3 {
+                eprintln!("Usage: fidesc qualify <file.fd> [-o output]");
+                eprintln!("  Emit a toolchain qualification manifest for compiling <file.fd>.");
+                eprintln!("  -o <file>   Write to file (default: stdout)");
+                eprintln!();
+                eprintln!("  The manifest includes:");
+                eprintln!("    - Compiler version and build info");
+                eprintln!("    - Optimizer passes applied");
+                eprintln!("    - Annotations enforced (and stubs)");
+                eprintln!("    - Backend target and test status");
+                eprintln!("    - Capability/effect analysis of the input program");
+                eprintln!();
+                eprintln!("  NOTE: This is a stub. Full tool qualification requires");
+                eprintln!("  partnership with a certification body (IEC 62304, DO-178C).");
+                eprintln!("  See docs/roadmap/safety-critical.md for the full plan.");
+                process::exit(1);
+            }
+            let input = &args[2];
+            let output_file = args.iter().position(|a| a == "-o")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| s.to_string());
+
+            let source = match fs::read_to_string(input) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading '{}': {}", input, e);
+                    process::exit(1);
+                }
+            };
+
+            // Build the program to extract annotation/capability data.
+            let program = match compiler::build_program_with_path(&source, Some(input)) {
+                Ok(p) => p,
+                Err(errors) => {
+                    print_errors(&errors);
+                    process::exit(1);
+                }
+            };
+
+            let manifest = generate_qualification_manifest(&program, input);
+
+            if let Some(out_path) = output_file {
+                if let Err(e) = fs::write(&out_path, &manifest) {
+                    eprintln!("Error writing manifest to '{}': {}", out_path, e);
+                    process::exit(1);
+                }
+                eprintln!("Qualification manifest written to {}", out_path);
+            } else {
+                println!("{}", manifest);
+            }
+            process::exit(0);
+        }
+
         _ => {
             print_usage();
             process::exit(1);
         }
     }
+}
+
+/// Generate a minimal SBOM document (STUB).
+/// See docs/roadmap/safety-critical.md §19 for the full implementation plan.
+fn generate_sbom(program: &ast::Program, source_path: &str, format: &str) -> String {
+    // Collect imported modules and their capabilities.
+    let mut components: Vec<String> = Vec::new();
+    for imp in &program.imports {
+        let caps = if imp.capabilities.is_empty() {
+            "none".to_string()
+        } else {
+            imp.capabilities.join(", ")
+        };
+        let version = imp.version.as_deref().unwrap_or("unknown");
+        components.push(format!(
+            "    {{\n      \"name\": \"{}\",\n      \"version\": \"{}\",\n      \"capabilities\": \"{}\"\n    }}",
+            imp.path, version, caps
+        ));
+    }
+
+    // Collect annotations used in the program.
+    let mut annotations: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for f in &program.funcs {
+        for a in &f.annotations {
+            annotations.insert(a.name.clone());
+        }
+    }
+    for s in &program.structs {
+        for a in &s.annotations {
+            annotations.insert(a.name.clone());
+        }
+    }
+
+    match format {
+        "spdx" => {
+            // Minimal SPDX 2.3 JSON stub.
+            let ann_list: Vec<String> = annotations.iter().cloned().collect();
+            format!(
+                "{{\n  \"spdxVersion\": \"SPDX-2.3\",\n  \"dataLicense\": \"CC0-1.0\",\n  \"SPDXID\": \"SPDXRef-DOCUMENT\",\n  \"name\": \"{}\",\n  \"documentNamespace\": \"https://fides.dev/sbom/{}\",\n  \"creationInfo\": {{\n    \"created\": \"STUB\",\n    \"creators\": [\"Tool: fidesc 0.1.0\"]\n  }},\n  \"annotations\": [\"{}\"],\n  \"components\": [\n{}\n  ]\n}}",
+                source_path,
+                source_path.replace('/', "_"),
+                ann_list.join("\", \""),
+                components.join(",\n")
+            )
+        }
+        _ => {
+            // Minimal CycloneDX 1.5 JSON stub.
+            let ann_list: Vec<String> = annotations.iter().cloned().collect();
+            format!(
+                "{{\n  \"bomFormat\": \"CycloneDX\",\n  \"specVersion\": \"1.5\",\n  \"metadata\": {{\n    \"tools\": [{{ \"name\": \"fidesc\", \"version\": \"0.1.0\" }}],\n    \"component\": {{ \"name\": \"{}\", \"type\": \"application\" }}\n  }},\n  \"annotations\": [\"{}\"],\n  \"components\": [\n{}\n  ]\n}}",
+                source_path,
+                ann_list.join("\", \""),
+                components.join(",\n")
+            )
+        }
+    }
+}
+
+/// Generate a toolchain qualification manifest (STUB).
+/// See docs/roadmap/safety-critical.md §17 for the full plan.
+fn generate_qualification_manifest(program: &ast::Program, source_path: &str) -> String {
+    // Collect annotations used.
+    let mut annotations: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for f in &program.funcs {
+        for a in &f.annotations {
+            annotations.insert(a.name.clone());
+        }
+    }
+    for s in &program.structs {
+        for a in &s.annotations {
+            annotations.insert(a.name.clone());
+        }
+    }
+
+    // Collect capabilities used.
+    let mut caps: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for imp in &program.imports {
+        for c in &imp.capabilities {
+            caps.insert(c.clone());
+        }
+    }
+
+    // Optimizer passes (from opt::Pass::all()).
+    let passes: Vec<&str> = opt::Pass::all().iter().map(|p| p.name()).collect();
+
+    // Annotations that are enforced vs stubbed (in the Rust bootstrap).
+    // The Rust bootstrap enforces most annotations; the self-hosted compiler
+    // has stubs for many. This manifest reflects the Rust bootstrap status.
+    let enforced: &[&str] = &[
+        "linear", "send", "sync", "wrapping", "deterministic", "crashfree",
+        "no-alloc", "no-recursion", "no-unbounded", "no-indirect",
+        "requires-audit", "medical", "safety-critical", "autosar",
+        "conserve", "gas", "tainted", "constant_time", "realtime",
+        "differentiable", "quantized", "checkpoint", "dp", "shard", "adapter",
+        "audit", "repr(C)", "kernel",
+    ];
+    let stubbed_in_selfhost: &[&str] = &[
+        "conserve", "gas", "safety-critical", "constant_time", "realtime",
+        "differentiable", "quantized", "checkpoint", "dp", "shard", "adapter",
+        "tainted",
+    ];
+
+    let used_ann: Vec<&str> = annotations.iter().map(|s| s.as_str()).collect();
+    let used_caps: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();
+
+    format!(
+        "{{\n  \"manifestVersion\": \"0.1\",\n  \"compiler\": {{\n    \"name\": \"fidesc\",\n    \"version\": \"0.1.0\",\n    \"implementation\": \"Rust bootstrap (src/*.rs)\",\n    \"selfHosted\": \"compiler/*.fd (26 modules, 61,885 LOC)\"\n  }},\n  \"source\": {{\n    \"path\": \"{}\",\n    \"annotations\": [\"{}\"],\n    \"capabilities\": [\"{}\"]\n  }},\n  \"optimizer\": {{\n    \"passes\": [\"{}\"],\n    \"passCount\": {}\n  }},\n  \"annotationEnforcement\": {{\n    \"enforcedInBootstrap\": [\"{}\"],\n    \"stubbedInSelfHost\": [\"{}\"]\n  }},\n  \"qualificationStatus\": \"NOT_QUALIFIED\",\n  \"note\": \"This manifest is generated by a stub. Full IEC 62304 / DO-178C tool qualification requires certification body partnership. See docs/roadmap/safety-critical.md.\"\n}}",
+        source_path,
+        used_ann.join("\", \""),
+        used_caps.join("\", \""),
+        passes.join("\", \""),
+        passes.len(),
+        enforced.join("\", \""),
+        stubbed_in_selfhost.join("\", \""),
+    )
 }
 
 /// Parse a target triple string into the canonical target name used by the compiler.
@@ -2874,6 +3179,8 @@ fn print_usage() {
     eprintln!("  fidesc bench  <file.fd> [-n <count>]     Benchmark: run file N times, report timing");
     eprintln!("  fidesc profile <file.fd> [-n <count>]    Profile: per-function call count and timing");
     eprintln!("  fidesc fmt    <file.fd> [--check]        Format source code (or check if formatted)");
+    eprintln!("  fidesc sbom   <file.fd> [--format cyclonedx|spdx] [-o out]  Export SBOM (stub)");
+    eprintln!("  fidesc qualify <file.fd> [-o out]        Emit toolchain qualification manifest (stub)");
     eprintln!();
     eprintln!("Global flags (can appear after any command):");
     eprintln!("  --borrowck=off|warn|on   Borrow checker mode (default: on)");

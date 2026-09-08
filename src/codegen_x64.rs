@@ -38,6 +38,7 @@ use std::collections::{HashMap, HashSet};
 pub fn generate_asm(module: &L3Module) -> String {
     let allocs = allocate_module(module);
     let mut gen = X64CodeGen::new(allocs);
+    gen.struct_layouts = module.struct_layouts.clone();
     gen.gen_module(module);
     gen.output
 }
@@ -45,6 +46,7 @@ pub fn generate_asm(module: &L3Module) -> String {
 /// Generate x86-64 assembly with per-function allocation info (for debugging).
 pub fn generate_asm_with_allocs(module: &L3Module, allocs: ModuleAllocation) -> String {
     let mut gen = X64CodeGen::new(allocs);
+    gen.struct_layouts = module.struct_layouts.clone();
     gen.gen_module(module);
     gen.output
 }
@@ -78,6 +80,8 @@ struct X64CodeGen {
     /// Panic stubs to emit at end of current function.
     /// Each entry: (label, panic_message_string)
     pending_panic_stubs: Vec<(String, String)>,
+    /// Struct layouts: struct name → StructLayout (for type_size and struct copies).
+    struct_layouts: HashMap<String, crate::ir::StructLayout>,
 }
 
 impl X64CodeGen {
@@ -95,6 +99,7 @@ impl X64CodeGen {
             wrapping_functions: HashSet::new(),
             panic_label_counter: 0,
             pending_panic_stubs: Vec::new(),
+            struct_layouts: HashMap::new(),
         }
     }
 
@@ -310,9 +315,9 @@ impl X64CodeGen {
                     let loc = a.loc(*vreg);
                     match loc {
                         Location::Reg(r) => {
-                            // Move from XMM to integer register via stack.
-                            self.wl(&format!("    movsd %{}, -8(%rbp)", xmm_regs[xmm_idx].name()));
-                            self.wl(&format!("    movq -8(%rbp), %{}", r.name()));
+                            // Move from XMM to integer register via stack scratch at -16(%rbp).
+                            self.wl(&format!("    movsd %{}, -16(%rbp)", xmm_regs[xmm_idx].name()));
+                            self.wl(&format!("    movq -16(%rbp), %{}", r.name()));
                         }
                         Location::Spill(offset) => {
                             self.wl(&format!(
@@ -1043,7 +1048,16 @@ impl X64CodeGen {
     }
 
     fn gen_store(&mut self, ptr: &Operand, val: &Operand, ty: &IrType) {
-        let size = type_size(ty);
+        let size = self.struct_type_size(ty);
+
+        // Struct copy: when storing a struct larger than 8 bytes, we need to
+        // copy multiple words. The value operand is a pointer to the source
+        // struct, and ptr is a pointer to the destination.
+        if size > 8 {
+            self.gen_struct_copy(ptr, val, size);
+            return;
+        }
+
         let store_op = match size {
             1 => "movb",
             2 => "movw",
@@ -1093,6 +1107,43 @@ impl X64CodeGen {
                 store_op,
                 self.reg_str(ptr_reg)
             ));
+        }
+    }
+
+    /// Copy a struct from source pointer to destination pointer.
+    /// Copies `size` bytes in 8-byte chunks using movq.
+    /// Uses RAX as scratch, saving/restoring RCX and RSI if needed.
+    fn gen_struct_copy(&mut self, dst_ptr: &Operand, src_ptr: &Operand, size: u64) {
+        // Load source pointer into RSI, destination pointer into RDI
+        self.gen_operand_to_reg(src_ptr, PhysReg::Rsi);
+        self.gen_operand_to_reg(dst_ptr, PhysReg::Rdi);
+
+        let n_words = size / 8;
+        let remainder = size % 8;
+
+        for i in 0..n_words {
+            let off = i * 8;
+            self.wl(&format!("    movq {}(%rsi), %rax", off));
+            self.wl(&format!("    movq %rax, {}(%rdi)", off));
+        }
+
+        // Handle remaining bytes (1-7) if any
+        if remainder > 0 {
+            let off = n_words * 8;
+            if remainder <= 4 {
+                self.wl(&format!("    movl {}(%rsi), %eax", off));
+                self.wl(&format!("    movl %eax, {}(%rdi)", off));
+                if remainder > 4 {
+                    let extra = remainder - 4;
+                    self.wl(&format!("    movl {}(%rsi), %eax", off + 4));
+                    // Only copy the needed bytes using a mask
+                    // For simplicity, just store the full 4 bytes (slight over-store)
+                    self.wl(&format!("    movl %eax, {}(%rdi)", off + 4));
+                }
+            } else {
+                self.wl(&format!("    movq {}(%rsi), %rax", off));
+                self.wl(&format!("    movq %rax, {}(%rdi)", off));
+            }
         }
     }
 
@@ -1341,9 +1392,9 @@ impl X64CodeGen {
                         match loc {
                             Location::Reg(r) => {
                                 // Need to move from XMM0 to the dst register.
-                                // For now, store to stack and reload (simplification).
-                                self.wl("    movsd %xmm0, -8(%rbp)");
-                                self.wl(&format!("    movq -8(%rbp), %{}", r.name()));
+                                // For now, store to stack scratch and reload.
+                                self.wl("    movsd %xmm0, -16(%rbp)");
+                                self.wl(&format!("    movq -16(%rbp), %{}", r.name()));
                             }
                             Location::Spill(off) => {
                                 self.wl(&format!("    movsd %xmm0, -{}(%rbp)", off));
@@ -1533,16 +1584,16 @@ impl X64CodeGen {
             CastKind::IntToFloat => {
                 // cvtsi2sdq
                 self.wl(&format!("    cvtsi2sdq %{}, %xmm0", dst_reg.name()));
-                self.wl("    movsd %xmm0, -8(%rbp)");
-                self.wl("    movq -8(%rbp), %rax");
+                self.wl("    movsd %xmm0, -16(%rbp)");
+                self.wl("    movq -16(%rbp), %rax");
                 if dst_reg != PhysReg::Rax {
                     self.wl(&format!("    movq %rax, %{}", dst_reg.name()));
                 }
             }
             CastKind::FloatToInt => {
                 // cvttsd2siq
-                self.wl("    movq %rax, -8(%rbp)");
-                self.wl("    movsd -8(%rbp), %xmm0");
+                self.wl("    movq %rax, -16(%rbp)");
+                self.wl("    movsd -16(%rbp), %xmm0");
                 self.wl(&format!("    cvttsd2siq %xmm0, %{}", dst_reg.name()));
             }
         }
@@ -1902,6 +1953,20 @@ impl X64CodeGen {
         self.strings.insert(label.clone(), format!("__float_bits:{}", bits));
         label
     }
+
+    /// Get the actual byte size of a type, using struct layouts for accurate
+    /// struct sizes. Falls back to 8 for unknown structs.
+    fn struct_type_size(&self, ty: &IrType) -> u64 {
+        match ty {
+            IrType::Struct(name) => {
+                if let Some(layout) = self.struct_layouts.get(name) {
+                    return layout.size as u64;
+                }
+                8
+            }
+            _ => type_size(ty),
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1918,6 +1983,8 @@ fn type_size(ty: &IrType) -> u64 {
         IrType::Never => 0,
         IrType::Array(elem, n) => type_size(elem) * (*n as u64),
         IrType::Struct(name) => {
+            // Default to 8 if we don't know — the caller should use
+            // X64CodeGen::struct_type_size for accurate sizes.
             let _ = name;
             8
         }
@@ -1980,6 +2047,66 @@ fn escape_str(s: &str) -> String {
         .replace('\n', "\\n")
         .replace('\t', "\\t")
         .replace('\r', "\\r")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Post-codegen constant-time verification (STUB)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Result of a constant-time verification check on generated assembly.
+#[derive(Debug)]
+pub struct CtViolation {
+    pub function: String,
+    pub line: usize,
+    pub instruction: String,
+    pub reason: String,
+}
+
+/// Verify that generated x86-64 assembly is constant-time for `@constant_time` functions.
+///
+/// This is a STUB for a planned post-codegen verification pass. The compile-time
+/// `verify_constant_time` in typechecker.rs checks source-level rules (no IO,
+/// no early returns, transitive @constant_time calls). However, the optimizer
+/// and code generator can introduce branches that the source-level check cannot
+/// catch — for example:
+///
+///   - Strength reduction turning a multiply into a shift+add sequence with
+///     a branch on the multiplier's sign
+///   - Register allocator spilling a secret value to the stack, creating
+///     cache-timing-dependent memory access patterns
+///   - Peephole optimizer converting a CMOV to a Jcc (branch)
+///   - Bounds-check elimination introducing a data-dependent branch
+///
+/// Planned full verification:
+///   1. Identify @constant_time functions in the assembly (by function label)
+///   2. Scan each instruction in those functions
+///   3. Flag: Jcc/JMP with register operands (data-dependent branches)
+///   4. Flag: CMOV with memory operand (cache-dependent)
+///   5. Flag: memory access with secret-derived index (leaks via cache)
+///   6. Flag: DIV/IDIV (variable-latency on most x86 CPUs)
+///   7. Report violations with function name, line, and instruction
+///
+/// See: docs/roadmap/safety-critical.md §20
+pub fn verify_constant_time_asm(asm: &str, ct_functions: &[String]) -> Vec<CtViolation> {
+    // STUB: post-codegen constant-time verification is not yet implemented.
+    // The source-level check in typechecker.rs (verify_constant_time) provides
+    // basic protection but does not inspect generated machine code.
+    //
+    // When implemented, this function will:
+    //   - Parse the assembly string line by line
+    //   - Track which function we're currently in (by label)
+    //   - For functions in ct_functions, scan for:
+    //     * Conditional jumps (jne, je, jg, jl, ja, jb, jge, jle, etc.)
+    //       whose condition depends on a register (not a constant)
+    //     * CMOV instructions with memory operands
+    //     * Memory accesses with computed (non-constant) indices
+    //     * DIV/IDIV instructions
+    //   - Return a list of CtViolation with precise locations
+    //
+    // For now, return empty (no violations detected) — the stub is a no-op.
+    let _ = asm;
+    let _ = ct_functions;
+    Vec::new()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -1,0 +1,339 @@
+# path — Fides Documentation
+
+## Contents
+
+- [PATH_SEP:](#path_sep:) (const)
+- [path_sep](#path_sep) (function)
+- [path_join](#path_join) (function)
+- [path_join_many](#path_join_many) (function)
+- [path_split](#path_split) (function)
+- [path_dirname](#path_dirname) (function)
+- [path_basename](#path_basename) (function)
+- [path_extension](#path_extension) (function)
+- [path_stem](#path_stem) (function)
+- [path_set_extension](#path_set_extension) (function)
+- [path_normalize](#path_normalize) (function)
+- [path_is_absolute](#path_is_absolute) (function)
+- [path_is_relative](#path_is_relative) (function)
+- [path_has_extension](#path_has_extension) (function)
+- [path_components](#path_components) (function)
+- [path_parent](#path_parent) (function)
+- [path_depth](#path_depth) (function)
+
+## PATH_SEP:
+
+Path separator (always '/' for portability).
+
+```fides
+pub const PATH_SEP: str = "/";
+```
+
+*Defined at line 21*
+
+---
+
+## path_sep
+
+Get the path separator character.
+
+```fides
+pub fn path_sep() -> str {
+```
+
+**Returns:** `str`
+
+*Defined at line 24*
+
+---
+
+## path_join
+
+Join two path components with a separator.
+path_join("foo", "bar") → "foo/bar"
+path_join("foo/", "bar") → "foo/bar"
+path_join("foo", "/bar") → "foo/bar"
+
+```fides
+pub fn path_join(a: str, b: str) -> str {
+```
+
+**Parameters:**
+
+- `a`: `str`
+- `b`: `str`
+
+**Returns:** `str`
+
+*Defined at line 34*
+
+---
+
+## path_join_many
+
+Join multiple path components.
+path_join_many(["a", "b", "c"]) → "a/b/c"
+
+```fides
+pub fn path_join_many(parts: Vec) -> str {
+```
+
+**Parameters:**
+
+- `parts`: `Vec`
+
+**Returns:** `str`
+
+*Defined at line 50*
+
+---
+
+## path_split
+
+Split a path into (dirname, basename).
+path_split("/a/b/c.txt") → ("/a/b", "c.txt")
+
+```fides
+pub fn path_split(path: str) -> Vec {
+```
+
+**Parameters:**
+
+- `path`: `str`
+
+**Returns:** `Vec`
+
+*Defined at line 65*
+
+---
+
+## path_dirname
+
+Get the directory name of a path.
+path_dirname("/a/b/c.txt") → "/a/b"
+
+```fides
+pub fn path_dirname(path: str) -> str {
+```
+
+**Parameters:**
+
+- `path`: `str`
+
+**Returns:** `str`
+
+*Defined at line 85*
+
+---
+
+## path_basename
+
+Get the base name (file name) of a path.
+path_basename("/a/b/c.txt") → "c.txt"
+
+```fides
+pub fn path_basename(path: str) -> str {
+```
+
+**Parameters:**
+
+- `path`: `str`
+
+**Returns:** `str`
+
+*Defined at line 94*
+
+---
+
+## path_extension
+
+Get the file extension (including the dot).
+path_extension("file.txt") → ".txt"
+path_extension("file") → ""
+path_extension("file.tar.gz") → ".gz"
+
+```fides
+pub fn path_extension(path: str) -> str {
+```
+
+**Parameters:**
+
+- `path`: `str`
+
+**Returns:** `str`
+
+*Defined at line 106*
+
+---
+
+## path_stem
+
+Get the file name without extension.
+path_stem("file.txt") → "file"
+path_stem("file.tar.gz") → "file.tar"
+
+```fides
+pub fn path_stem(path: str) -> str {
+```
+
+**Parameters:**
+
+- `path`: `str`
+
+**Returns:** `str`
+
+*Defined at line 116*
+
+---
+
+## path_set_extension
+
+Change the extension of a path.
+path_set_extension("file.txt", ".md") → "file.md"
+path_set_extension("file", ".txt") → "file.txt"
+
+```fides
+pub fn path_set_extension(path: str, ext: str) -> str {
+```
+
+**Parameters:**
+
+- `path`: `str`
+- `ext`: `str`
+
+**Returns:** `str`
+
+*Defined at line 126*
+
+---
+
+## path_normalize
+
+Normalize a path by resolving "." and ".." components.
+path_normalize("a/./b/../c") → "a/c"
+path_normalize("/a/b/../c") → "/a/c"
+
+```fides
+pub fn path_normalize(path: str) -> str {
+```
+
+**Parameters:**
+
+- `path`: `str`
+
+**Returns:** `str`
+
+*Defined at line 141*
+
+---
+
+## path_is_absolute
+
+Check if a path is absolute.
+
+```fides
+pub fn path_is_absolute(path: str) -> bool {
+```
+
+**Parameters:**
+
+- `path`: `str`
+
+**Returns:** `bool`
+
+*Defined at line 181*
+
+---
+
+## path_is_relative
+
+Check if a path is relative.
+
+```fides
+pub fn path_is_relative(path: str) -> bool {
+```
+
+**Parameters:**
+
+- `path`: `str`
+
+**Returns:** `bool`
+
+*Defined at line 187*
+
+---
+
+## path_has_extension
+
+Check if a path has the given extension.
+
+```fides
+pub fn path_has_extension(path: str, ext: str) -> bool {
+```
+
+**Parameters:**
+
+- `path`: `str`
+- `ext`: `str`
+
+**Returns:** `bool`
+
+*Defined at line 192*
+
+---
+
+## path_components
+
+Split a path into its components.
+path_components("/a/b/c") → ["", "a", "b", "c"]
+
+```fides
+pub fn path_components(path: str) -> Vec {
+```
+
+**Parameters:**
+
+- `path`: `str`
+
+**Returns:** `Vec`
+
+*Defined at line 201*
+
+---
+
+## path_parent
+
+Get the parent directory (same as dirname but handles trailing slashes).
+
+```fides
+pub fn path_parent(path: str) -> str {
+```
+
+**Parameters:**
+
+- `path`: `str`
+
+**Returns:** `str`
+
+*Defined at line 206*
+
+---
+
+## path_depth
+
+Get the number of path components.
+
+```fides
+pub fn path_depth(path: str) -> i64 {
+```
+
+**Parameters:**
+
+- `path`: `str`
+
+**Returns:** `i64`
+
+*Defined at line 212*
+
+---
+
+*Generated by [scribe](https://fides.dev) — Fides documentation generator*

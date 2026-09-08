@@ -4,7 +4,7 @@
 > Fides compiler safely. Read this before making changes.
 >
 > **Fides is self-hosted and independent.** The primary compiler is in
-> `compiler/*.fd` (26 modules, 61,885 LOC). The Rust source in `src/*.rs` is
+> `compiler/*.fd` (31 modules, 74,914 LOC). The Rust source in `src/*.rs` is
 > the bootstrap reference, used only when `compiler/*.fd` changes. For everyday
 > work (writing programs, adding stdlib, adding tests, building tools), use
 > `release/fides-c3.exe` directly — no Rust build needed.
@@ -153,25 +153,29 @@ cargo build
 
 ```
 SELF-HOSTED COMPILER (primary):
-  compiler/*.fd:  26 modules, 61,885 LOC — THE COMPILER
+  compiler/*.fd:  31 modules, 74,914 LOC — THE COMPILER
   Fixpoint:       fides-c2.c == fides-c3.c (0 diffs / 701,158 lines, byte-identical)
   Bootstrap:      3 generations verified (Rust → c1 → c2 → c3, all work)
   Use:            release/fides-c3.exe for everyday work
 
 RUST BOOTSTRAP (reference only):
-  src/*.rs:       52 files, 91,038 LOC — bootstrap reference
+  src/*.rs:       55 files, 91,490 LOC — bootstrap reference
   Used when:      compiler/*.fd changes (regenerate C1, verify fixpoint)
 
 TESTS:
   Interpreter:    209/211 passed
   C Codegen:      198/211 matched
   PE Emitter:     209/211 valid
-  Self-host:      23/23 pass on interp + PE (tests/selfhost/)
+  Self-host:      33/42 pass on interp + C + PE (tests/selfhost/)
 
 STDLIB:
-  stdlib/*.fd:    70 modules, 18,529 LOC (including rc.fd, kernel.fd, uefi.fd)
+  stdlib/*.fd:    74 modules, 19,230 LOC (including rc.fd, kernel.fd, uefi.fd)
 
 RECENT IMPROVEMENTS:
+  ELF64 encoder:  Full x86-64 instruction encoder ported (compiler/elf64.fd, 2,423 LOC)
+  Interp port:    75 missing interpreter functions ported (compiler/interp.fd, 2,839 LOC)
+  Linux runtime:  Native Linux syscall runtime (compiler/runtime_linux.fd, 4,362 LOC)
+  Linker:         ELF relocation/linker ported (compiler/linker.fd, 1,051 LOC)
   Sandbox:        Alloc capability enforced (p_malloc/p_free blocked in sandbox)
   Rc/Arc:         stdlib/rc.fd — reference counting (rc_new, rc_clone, rc_drop, etc.)
   @repr(C):       C-compatible struct layout for hardware/FFI/kernel
@@ -188,7 +192,7 @@ Binaries:     4 (fidesc, ark, scribe, veil) — fidesc is bootstrap only
 **Build directories:**
 - `target/` — Rust bootstrap compiler output (`fidesc.exe`) — gitignored
 - `release/` — Self-hosted compiler output (`fides-c3.exe`, generated C) — gitignored
-- `compiler/` — Self-hosted compiler source (26 `.fd` modules) — THE PRIMARY COMPILER
+- `compiler/` — Self-hosted compiler source (31 `.fd` modules) — THE PRIMARY COMPILER
 
 **Changelog:** See `docs/reference/changelog.md` for the full history of
 features and fixes. (Previously duplicated here — removed to avoid maintaining
@@ -204,9 +208,9 @@ touching them.
 
 | File | Risk | Why |
 |------|------|-----|
-| `src/regalloc.rs` | **CRITICAL** | Linear scan allocator (~1100 LOC). F-1A: constant rematerialization (`Location::Remat`). F-1D: effect-aware register allocation — calls to pure functions (in `L3Module.pure_functions`) only clobber RAX, not all caller-saved registers. I-2D: calls to `@no-alloc` functions (in `L3Module.no_alloc_functions`) also only clobber RAX. `@medical` functions included in no-alloc set. Any change here affects EVERY function. |
+| `src/regalloc.rs` | **CRITICAL** | Linear scan allocator (~1100 LOC). F-1A: constant rematerialization (`Location::Remat`). F-1D: effect-aware register allocation — calls to pure functions (in `L3Module.pure_functions`) only clobber RAX, not all caller-saved registers. I-2D: calls to `@no-alloc` functions (in `L3Module.no_alloc_functions`) also only clobber RAX. `@medical` functions included in no-alloc set. S-17: deterministic interval sorting (secondary key: vreg ID) to prevent non-deterministic codegen from HashMap iteration order. Any change here affects EVERY function. |
 | `src/peephole.rs` | **CRITICAL** | 9 passes, always on in `build`. A wrong transform silently corrupts all output. |
-| `src/elf64.rs` | **HIGH** | ELF64 header bytes, section layout, relocations (R_X86_64_PC32/PLT32/64). Off-by-one = corrupt binary. |
+| `src/elf64.rs` | **HIGH** | ELF64 header bytes, section layout, relocations (R_X86_64_PC32/PLT32/64). Off-by-one = corrupt binary. Self-hosted port in `compiler/elf64.fd` (2,423 LOC, 85% parity) includes full x86-64 instruction encoder, assembly parser, and ELF builder. |
 | `src/pe.rs` | **HIGH** | PE header bytes, import table, section layout. Off-by-one = corrupt .exe. |
 | `src/coff.rs` | **HIGH** | COFF object file format. Same byte-level risk as PE/ELF. |
 | `src/macho.rs` | **HIGH** | Mach-O object file format. Same byte-level risk. |
@@ -216,11 +220,11 @@ touching them.
 | `src/lower.rs` | **MEDIUM** | AST → SSA IR. Changes here affect interpreter + all backends. `runtime_effects()` helper sets Write/Alloc/IO effects on `p_*` builtin calls — without this, the optimizer DCE's side-effecting calls. `p_vec_*` extern declarations (23 functions) ensure correct calling convention. |
 | `src/typechecker.rs` | **MEDIUM** | Types + regions + effects + capabilities. Wrong rejection = broken code; wrong acceptance = silent miscompilation. |
 | `src/borrowck.rs` | **LOW** | Borrow checker (Phases 1-6 complete). Separate pass after typecheck. `--borrowck=on` by default; `off`/`warn` modes available. Field-wise borrows, two-phase borrows, NLL (non-lexical lifetimes via last-use analysis). |
-| `src/opt.rs` | **MEDIUM** | PIR optimizer. 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. 22 in default pass list (region-pool via `--region-pool`). `--opt` is enabled by default in `build` (use `--no-opt` to disable). `--lto` enables aggressive cross-module inlining (larger inline limits). PGO has been removed. S-1A pass skipping: `pass_relevant_for_module()` skips passes that can't help (no loops → skip unroll, no calls → skip inline, etc.). Inline cost model (F-3F): cost = blocks×5 + insts, with `is_pure` (50% bonus), `is_crashfree` (25%), `is_deterministic` (10%), capped at 75%. Sandbox-aware inlining (I-3C): sandbox call sites use 6 blocks / 40 insts vs normal 3/20. Sandbox-aware devirt (I-3C): devirtualize DynCalls in sandbox blocks to pure impls. Region bulk free (I-1C): `pass_region_pool` emits `p_region_free` before returns. @crashfree code hoisting (I-4B): `pass_effect_optimize` hoists @crashfree + effectively-pure calls out of loops. @gas-guided unrolling (I-4C): `pass_unroll` uses max_unroll=64 when `gas_limit.is_some()` (vs normal 8). Annotations propagated: `is_wrapping`, `is_deterministic`, `is_crashfree`, `is_no_alloc`, `is_medical`, `gas_limit`. I-6B linear type alias analysis: `linear_structs` propagated from AST → IrModule → L1Module → L2Module; `alias_analysis_function` tracks `linear_ptrs` and uses them to prove non-aliasing (stores through linear pointers can't invalidate loads from other pointers). |
+| `src/opt.rs` | **MEDIUM** | PIR optimizer. 23 passes: const-fold, CSE, GVN, SROA, DSE, DCE, inline, unroll, TCO, alias-analysis, effect-reorder, partial-eval, vectorize, strength-reduce, devirt, jump-thread, loop-rotate, loop-vec, effect-opt, region-pool, reassociate, memoize. 22 in default pass list (region-pool via `--region-pool`). `--opt` is enabled by default in `build` (use `--no-opt` to disable). `--lto` enables aggressive cross-module inlining (larger inline limits). PGO has been removed. S-1A pass skipping: `pass_relevant_for_module()` skips passes that can't help (no loops → skip unroll, no calls → skip inline, etc.). S-17: all instruction traversal functions now handle `L2Inst::Copy` (was missing, causing SROA+CSE to produce dangling references). Inline cost model (F-3F): cost = blocks×5 + insts, with `is_pure` (50% bonus), `is_crashfree` (25%), `is_deterministic` (10%), capped at 75%. Sandbox-aware inlining (I-3C): sandbox call sites use 6 blocks / 40 insts vs normal 3/20. Sandbox-aware devirt (I-3C): devirtualize DynCalls in sandbox blocks to pure impls. Region bulk free (I-1C): `pass_region_pool` emits `p_region_free` before returns. @crashfree code hoisting (I-4B): `pass_effect_optimize` hoists @crashfree + effectively-pure calls out of loops. @gas-guided unrolling (I-4C): `pass_unroll` uses max_unroll=64 when `gas_limit.is_some()` (vs normal 8). Annotations propagated: `is_wrapping`, `is_deterministic`, `is_crashfree`, `is_no_alloc`, `is_medical`, `gas_limit`. I-6B linear type alias analysis: `linear_structs` propagated from AST → IrModule → L1Module → L2Module; `alias_analysis_function` tracks `linear_ptrs` and uses them to prove non-aliasing (stores through linear pointers can't invalidate loads from other pointers). |
 | `src/comptime.rs` | **LOW** | Comptime evaluation engine. Evaluates `comptime <expr>`, `comptime { block }`, `comptime reflect_op(T)`, `comptime gen { block }` at compile time. I-5A: Aggressive comptime evaluation — auto-evaluates calls to `comptime fn` functions with all-literal args (no explicit `comptime` wrapper needed). I-5D: Comptime loop unrolling — unrolls `for` loops with literal bounds (≤16 iterations, ≤16 body stmts) at AST level. Also eliminates dead `if` branches with literal conditions. |
 | `src/runtime_linux.rs` | **HIGH** | Hand-encoded x86-64 machine code (raw bytes). No assembler — every byte is manual. |
 | `src/linker.rs` | **MEDIUM** | Relocation resolution. Wrong offset = crash or silent corruption. |
-| `src/interp.rs` | **MEDIUM** | The reference oracle (~4400 LOC). If this is wrong, all backends "match" but produce wrong results. `p_vec_new` uses `vec_side_table` to separate raw struct fields from `Value::Vec`. `run_function` auto-detects missing `__env` param and inserts dummy. |
+| `src/interp.rs` | **MEDIUM** | The reference oracle (~6060 LOC). If this is wrong, all backends "match" but produce wrong results. `p_vec_new` uses `vec_side_table` to separate raw struct fields from `Value::Vec`. `run_function` auto-detects missing `__env` param and inserts dummy. Self-hosted port in `compiler/interp.fd` (2,839 LOC) covers core execution + 75 helper functions. |
 
 ## LOWER-RISK FILES
 
@@ -240,6 +244,14 @@ touching them.
 
 ## Known Bugs (Do Not Re-Introduce)
 
+> **Critical Blockers:** See `docs/roadmap/roadmap-issues.md` → "Critical
+> Blockers" section for the four highest-priority issues that must be fixed
+> before production use:
+> 1. Self-hosted compiler doesn't enforce safety annotations (CB1)
+> 2. Result<T,E> and Option<T> hardcoded to i64 (CB2)
+> 3. Backend test parity not 100% (CB3)
+> 4. Parser error recovery needs hardening (CB4)
+
 1. **Register allocator clobbering** (`regalloc.rs`): Previously, constants not
    loaded into registers before use could be clobbered by intervening
    instructions. **Fixed by F-1A (Constant Rematerialization):** constants are
@@ -248,10 +260,9 @@ touching them.
    fixed to respect memory dependencies and keep terminators last. Test with
    `--no-opt` when changing regalloc to isolate issues.
 
-2. **Debug `eprintln!` statements** in `compiler.rs` and `elf64.rs`: There are
-   temporary debug prints (DBG ASM, DBG ALU) added during debugging sessions.
-   These should be removed before committing but are safe to leave during
-   active debugging.
+2. **Debug `eprintln!` statements**: Temporary debug prints (DBG ASM, DBG ALU,
+   DEBUG gen_store, DEBUG struct_layouts) were added during debugging sessions
+   and have been removed. Do not re-add them.
 
 3. **PIR L2 GetFieldPtr offset** (`pir.rs`): Previously used `field_index * 8`
    as the byte offset, which was correct when all struct fields were 8 bytes.
@@ -267,6 +278,35 @@ touching them.
    prefix byte in `p_json_at` (`0x49` instead of `0x4C` — see changelog for
    details). The `--opt` flag produces identical output to non-opt for all
    tests except 3 closure tests that are broken in both paths.
+
+5. **Non-deterministic register allocation** (`src/regalloc.rs`): The linear
+   scan allocator sorted live intervals by start point only. When multiple
+   intervals shared the same start, HashMap iteration order (non-deterministic
+   due to random seeding) determined their relative order, producing different
+   register/stack-slot assignments on each run. **Fixed:** Added `i.vreg.0` as
+   a secondary sort key: `sorted.sort_by_key(|i| (i.start, i.vreg.0))`. The
+   self-hosted compiler (`compiler/regalloc.fd`) was already deterministic
+   (uses Vec, not HashMap).
+
+6. **SROA + CSE dangling reference** (`src/opt.rs`): SROA replaces struct
+   field loads with `Copy` instructions. CSE then eliminates duplicate
+   constants and calls `replace_all_refs` to update references — but
+   `replace_refs_in_inst` did not handle `L2Inst::Copy`, leaving dangling
+   references after DCE removed the original constant. This caused
+   zero-valued struct fields to print garbage in optimized native builds.
+   **Fixed:** Added `L2Inst::Copy { value, .. }` to all instruction traversal
+   functions in `src/opt.rs` (`replace_refs_in_inst`, `apply_replacements`,
+   `remap_inst`, `inst_references`, `is_pure`, `is_pure_inst`, `cse_key`,
+   `gvn_key`). The self-hosted compiler (`compiler/opt.fd`) already handled
+   `Copy` correctly — the bug was only in the Rust bootstrap.
+
+7. **Stack canary / float scratch overlap** (`compiler/pir.fd`,
+   `compiler/codegen_x64.fd`): PIR frame allocation started at offset 0,
+   causing the first alloca slot to overlap with the canary at `-8(%rbp)`.
+   Float conversion also used `-8(%rbp)`, overlapping the canary.
+   **Fixed:** Frame size starts at 16 bytes (8 canary + 8 float scratch) in
+   `compiler/pir.fd`. Float scratch moved to `-16(%rbp)` in
+   `compiler/codegen_x64.fd`.
 
 ## NEVER DO THESE (Hard Rules)
 

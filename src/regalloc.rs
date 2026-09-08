@@ -266,9 +266,11 @@ pub fn allocate(func: &L3Function, pure_funcs: &HashSet<String>, no_alloc_funcs:
         preassigned_all.insert(*vreg);
     }
 
-    // 4. Sort intervals by start point.
+    // 4. Sort intervals by start point, then by vreg for determinism.
+    // (HashMap iteration order is non-deterministic due to random seeding,
+    // so we need a secondary sort key to ensure deterministic allocation.)
     let mut sorted: Vec<LiveInterval> = intervals.values().cloned().collect();
-    sorted.sort_by_key(|i| i.start);
+    sorted.sort_by_key(|i| (i.start, i.vreg.0));
 
     // 5. Linear scan.
     // `active` holds intervals currently assigned to a physical register,

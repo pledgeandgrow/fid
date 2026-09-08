@@ -535,6 +535,7 @@ fn is_pure(inst: &L2Inst) -> bool {
                 | L2Inst::GetFieldPtr { .. }
                 | L2Inst::GetElemPtr { .. }
                 | L2Inst::BitCast { .. }
+                | L2Inst::Copy { .. }
                 | L2Inst::IntExtend { .. }
                 | L2Inst::IntTrunc { .. }
                 | L2Inst::IntToFloat { .. }
@@ -908,6 +909,7 @@ fn cse_key(inst: &L2Inst) -> String {
         }
         L2Inst::GetElemPtr { array_ptr, index, .. } => format!("gep:{}:{}", array_ptr, index),
         L2Inst::BitCast { value, from, to } => format!("bc:{}:{}:{}", value, from, to),
+        L2Inst::Copy { value, ty } => format!("cp:{}:{}", value, ty),
         L2Inst::IntExtend { value, from, to } => format!("ie:{}:{}:{}", value, from, to),
         L2Inst::IntTrunc { value, from, to } => format!("it:{}:{}:{}", value, from, to),
         L2Inst::IntToFloat { value, from, to } => format!("i2f:{}:{}:{}", value, from, to),
@@ -981,6 +983,7 @@ fn replace_refs_in_inst(inst: &mut L2Inst, from: PValue, to: PValue) {
         }
         L2Inst::MakeDyn { value, .. } => r(value, from, to),
         L2Inst::BitCast { value, .. }
+        | L2Inst::Copy { value, .. }
         | L2Inst::IntExtend { value, .. }
         | L2Inst::IntTrunc { value, .. }
         | L2Inst::IntToFloat { value, .. }
@@ -1116,6 +1119,7 @@ fn gvn_key(inst: &L2Inst, copy_of: &HashMap<PValue, PValue>) -> String {
             format!("gep:{}:{}", resolve(*array_ptr), resolve(*index))
         }
         L2Inst::BitCast { value, from, to } => format!("bc:{}:{}:{}", resolve(*value), from, to),
+        L2Inst::Copy { value, ty } => format!("cp:{}:{}", resolve(*value), ty),
         L2Inst::IntExtend { value, from, to } => format!("ie:{}:{}:{}", resolve(*value), from, to),
         L2Inst::IntTrunc { value, from, to } => format!("it:{}:{}:{}", resolve(*value), from, to),
         L2Inst::IntToFloat { value, from, to } => format!("i2f:{}:{}:{}", resolve(*value), from, to),
@@ -3799,6 +3803,7 @@ fn apply_replacements(inst: &mut L2Inst, replacements: &HashMap<PValue, PValue>)
         }
         L2Inst::MakeDyn { value, .. } => r(value, replacements),
         L2Inst::BitCast { value, .. }
+        | L2Inst::Copy { value, .. }
         | L2Inst::IntExtend { value, .. }
         | L2Inst::IntTrunc { value, .. }
         | L2Inst::IntToFloat { value, .. }
@@ -4133,6 +4138,7 @@ fn remap_inst(inst: &mut L2Inst, value_map: &HashMap<PValue, PValue>, block_map:
         }
         L2Inst::MakeDyn { value, .. } => *value = rv(*value, value_map),
         L2Inst::BitCast { value, .. }
+        | L2Inst::Copy { value, .. }
         | L2Inst::IntExtend { value, .. }
         | L2Inst::IntTrunc { value, .. }
         | L2Inst::IntToFloat { value, .. }
@@ -4618,6 +4624,7 @@ fn inst_uses_value(inst: &L2Inst, target: &PValue) -> bool {
         L2Inst::DynCall { args, .. } => args.iter().any(|a| a == target),
         L2Inst::MakeDyn { value, .. } => value == target,
         L2Inst::BitCast { value, .. } => value == target,
+        L2Inst::Copy { value, .. } => value == target,
         L2Inst::IntExtend { value, .. } => value == target,
         L2Inst::IntTrunc { value, .. } => value == target,
         L2Inst::IntToFloat { value, .. } => value == target,
@@ -5388,6 +5395,7 @@ fn is_pure_inst(inst: &L2Inst) -> bool {
             | L2Inst::BinOp { .. }
             | L2Inst::UnaryOp { .. }
             | L2Inst::BitCast { .. }
+            | L2Inst::Copy { .. }
             | L2Inst::IntExtend { .. }
             | L2Inst::IntTrunc { .. }
             | L2Inst::IntToFloat { .. }
@@ -5455,6 +5463,7 @@ fn inst_refs(inst: &L2Inst) -> Vec<PValue> {
             v
         }
         L2Inst::BitCast { value, .. } => vec![*value],
+        L2Inst::Copy { value, .. } => vec![*value],
         L2Inst::IntExtend { value, .. } => vec![*value],
         L2Inst::IntTrunc { value, .. } => vec![*value],
         L2Inst::IntToFloat { value, .. } => vec![*value],

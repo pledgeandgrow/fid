@@ -1,5 +1,173 @@
 # Fides Language Changelog
 
+## Linux Native Backend Port — Session 18 (Sep 7, 2026)
+
+### Summary
+
+**Major port of the ELF64 x86-64 instruction encoder and interpreter
+runtime functions from the Rust bootstrap (`src/*.rs`) into the
+self-hosted Fides compiler (`compiler/*.fd`)**, advancing Linux native
+code generation and interpreter parity. All changes compile cleanly with
+the Rust bootstrap compiler. No new test regressions.
+
+### ELF64 Encoder Port (`compiler/elf64.fd`)
+
+Grew from ~450 lines to **2,423 lines (85% of `src/elf64.rs`)**. Now includes:
+
+- **Full `assemble` function** with label tracking, function symbol sizing,
+  local label handling, and `.L` prefix detection
+- **`handle_directive`** for `.asciz`, `.ascii`, `.quad` (numeric and symbol
+  references), with rodata relocation generation
+- **Complete `encode_instruction` dispatch** covering all instruction families:
+  - No-operand: `ret`, `leave`, `nop`, `cqto`, `cdq`, `ud2`, `syscall`
+  - `pushq`/`popq` (register and immediate forms)
+  - `movq`/`movl`/`movb` (reg-reg, reg-mem, mem-reg, imm-reg, imm-mem, xmm-gpr)
+  - ALU: `addq`/`subq`/`andq`/`orq`/`xorq` (+ 32-bit and 8-bit variants)
+  - `imulq`, `negq`, `incq`, `decq`, `notq`, `idivq`
+  - Shifts: `shlq`, `shrq`, `sarq` (immediate and `%cl` forms)
+  - `testq`, `testl`, `cmpq` (reg-reg, reg-mem, imm-reg)
+  - `setcc` (all condition codes)
+  - Sign/zero extension: `movzbq`, `movzwq`, `movsbq`, `movswq`, `movslq`
+  - Jumps: `jmp`, `jne`/`je`/`jl`/`jg`/`jle`/`jge`/`jb`/`ja`/`jbe`/`jae`
+  - `call` (direct with PLT32 relocation, indirect through `*%reg`, indirect through memory)
+  - `leaq` (RIP-relative with PC32 relocation, SIB addressing, simple memory)
+  - SSE/SSE2: `movsd`, `movss`, `addsd`/`subsd`/`mulsd`/`divsd`, `ucomisd`,
+    single-precision `addss`/`subss`/`mulss`/`divss`/`ucomiss`
+  - Float conversions: `cvtsi2sdq`, `cvttsd2siq`
+- **Register parsing**: `try_parse_reg` (64/32-bit), `try_parse_reg8` (byte
+  regs including sil/dil), `parse_xmm_reg`, `is_reg32`
+- **Memory operand parsing**: `try_parse_mem` (offset+base),
+  `try_parse_mem_indexed` (SIB with scale)
+- **ModRM/SIB encoding**: `encode_modrm_mem`, `encode_modrm_sib` with
+  correct mod field selection (00/01/10) and SIB byte construction
+- **Relocation generation** for `R_X86_64_PC32` (type 2),
+  `R_X86_64_PLT32` (type 4), `R_X86_64_64` (type 1)
+- **`get_or_add_local_label`** and **`get_or_add_undef_symbol`** for
+  symbol table management
+
+### Interpreter Port (`compiler/interp.fd`)
+
+Grew from ~2,346 lines to **2,839 lines**. Added 75 missing functions
+identified by comparison with `src/interp.rs`:
+
+- **Critical runtime**: `coerce_str_to_int`, `is_wrapping_func`,
+  `stringify_value`, `parse_persisted_value`, `arg_string`,
+  `lookup_vec_value`, `read_raw_vec_i64`, `arg_to_vec_i64`,
+  `fides_vec_to_value_vec`, `find_vec_addr`
+- **Public API**: `interpret`, `interpret_with_options`,
+  `interpret_with_options_full`, `interpret_with_options_full2`
+- **Diagnostics**: `format_panic_trace`, `take_panic_stack_trace`,
+  `get_call_stack`, `get_current_func_name`, `get_memory_usage`,
+  `get_module`, `get_thread_count`
+- **Profiling/debugging**: `enable_profiling`, `enable_recording`,
+  `get_profile`, `get_trace`, `set_debug_hook`
+- **Persistence**: `save_persist_state`, `with_persist_file`
+- **Vector helpers**: `arg_vec_usize`, `arg_vec_i64`, `arg_vec_f64`,
+  `args_to_f64_vec`, `simd_binary`
+- **Utility**: `wildcard_match` (glob pattern matching with `?` and `*`)
+- **New enums**: `OptVecI64`, `OptVecF64` for optional vector return types
+
+### String Utility Functions (`compiler/peephole.fd`)
+
+Added shared string functions needed by multiple compiler modules
+(`elf64.fd`, `interp.fd`, `linker.fd`, `runtime_linux.fd`):
+
+- `str_char_at` — get byte at index (alias for `str_byte_at`)
+- `str_char_str` — convert single byte to one-character string
+- `str_split_whitespace` — split string by whitespace into `Vec<str>`
+- `str_parse_i64` — parse decimal integer from string
+- `str_parse_hex` — parse hexadecimal integer with optional `0x` prefix
+- `str_parse_float` — parse float from string (delegates to `p_str_to_float`)
+
+### Verification
+
+- `cargo build --release` — succeeds (warnings only, no errors)
+- `./verify-selfhost.sh` — **33/42 pass** on all 3 backends (interpreter,
+  C codegen, PE emitter). The 9 failures are pre-existing tests
+  (`probe_parser_*`, `test_compiler`, `test_fmt_harness`,
+  `test_lexer_harness`, `test_parser_harness`, `test_sl_debug`) that were
+  not in the original 23-test baseline and were already failing before
+  these changes.
+
+### Files Changed
+
+| File | Lines | Change |
+|------|------:|--------|
+| `compiler/elf64.fd` | 2,423 | +1,973 (full x86-64 encoder) |
+| `compiler/interp.fd` | 2,839 | +493 (75 missing functions) |
+| `compiler/peephole.fd` | 1,150 | +96 (shared string utilities) |
+| `compiler/linker.fd` | 1,051 | (existing port, validated) |
+| `compiler/runtime_linux.fd` | 4,362 | (existing port, validated) |
+
+### Updated LOC Counts
+
+| Component | Previous | Current |
+|-----------|---------:|--------:|
+| `compiler/*.fd` | 61,885 | 74,914 (31 modules) |
+| `src/*.rs` | 91,038 | 91,490 (55 files) |
+| `stdlib/*.fd` | 18,529 | 19,230 (74 modules) |
+
+## Linux Native Backend Fixes — Session 17 (Sep 8, 2026)
+
+### Summary
+
+**Three critical bugs in the Linux x86-64 native backend fixed**, bringing
+optimized native builds to correctness parity with unoptimized builds for
+struct field access. The self-hosted compiler (`compiler/*.fd`) was already
+correct for the main bug; the fixes were in the Rust bootstrap (`src/*.rs`).
+
+### Bugs Fixed
+
+1. **Non-deterministic register allocation** (`src/regalloc.rs`):
+   The linear scan allocator sorted live intervals by start point only.
+   When multiple intervals shared the same start, HashMap iteration order
+   (non-deterministic due to random seeding) determined their relative order,
+   producing different register/stack-slot assignments on each compilation.
+   This made optimized native builds produce different (sometimes wrong) output
+   on every run.
+   **Fix:** Added `i.vreg.0` as a secondary sort key in
+   `sorted.sort_by_key(|i| (i.start, i.vreg.0))`.
+   The self-hosted compiler (`compiler/regalloc.fd`) was already deterministic
+   (uses Vec, not HashMap, for intervals).
+
+2. **SROA + CSE interaction producing dangling references** (`src/opt.rs`):
+   The SROA pass replaces struct field loads with `Copy` instructions
+   (e.g., `%34 = copy %27`). The CSE pass then eliminates duplicate constants
+   (e.g., `%27 = const i64 0` is a duplicate of `%2 = const i64 0`), calling
+   `replace_all_refs` to update all references. However,
+   `replace_refs_in_inst` did **not** handle `L2Inst::Copy` — it fell through
+   to the `_ => {}` catch-all. So `%34 = copy %27` was never updated to
+   `%34 = copy %2`, and when DCE removed the now-unreferenced `%27`, the copy
+   had a dangling reference, producing garbage at runtime for zero-valued
+   struct fields.
+   **Fix:** Added `L2Inst::Copy { value, .. }` to all instruction traversal
+   functions in `src/opt.rs`:
+   - `replace_refs_in_inst` — reference replacement during CSE/GVN
+   - `apply_replacements` — reference replacement during inlining
+   - `remap_inst` — instruction remapping during inlining
+   - `inst_references` — reference checking
+   - `is_pure` / `is_pure_inst` — purity analysis (Copy is pure)
+   - `cse_key` / `gvn_key` — CSE/GVN canonical keys (enables Copy elimination)
+   The self-hosted compiler (`compiler/opt.fd`) already handled `Copy` in its
+   `replace_refs_in_inst` — the bug was only in the Rust bootstrap.
+
+3. **Stack canary / float scratch overlap** (`compiler/pir.fd`,
+   `compiler/codegen_x64.fd`):
+   The PIR frame allocator started at offset 0, causing the first alloca slot
+   to overlap with the stack canary at `-8(%rbp)`. Float conversion also used
+   `-8(%rbp)`, overlapping the canary.
+   **Fix:** Frame size now starts at 16 bytes (8 for canary + 8 for float
+   scratch) in `compiler/pir.fd`. Float conversion scratch moved from
+   `-8(%rbp)` to `-16(%rbp)` in `compiler/codegen_x64.fd`. This eliminated
+   "Stack smashing detected" failures.
+
+### Test Results
+
+- Struct field zero-value bug: **fixed** (`a = 0` now correct in optimized builds)
+- `test_mut.fd`: **passes** natively (was segfaulting)
+- `test_stmt_drop.fd`: **passes** natively (was segfaulting)
+- No regressions: Interpreter 230/242, PE 233/242 (unchanged)
+
 ## Tier 3 OS Features — Session 16 (Sep 6, 2026)
 
 ### Summary

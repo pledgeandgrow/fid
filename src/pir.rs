@@ -1273,7 +1273,7 @@ fn lower_func_l2_to_l3(f: &L2Function, module: &IrModule) -> L3Function {
     // Compute a simple stack frame: each Alloca gets a slot sized by its type.
     // We lay out slots contiguously from the frame pointer. This is a naive
     // layout; Phase 4C will do proper alignment-aware layout.
-    let mut frame_size: u64 = 0;
+    let mut frame_size: u64 = 16;  // 8 for canary at -8(%rbp), 8 for float scratch at -16(%rbp)
     let mut slot_of: HashMap<PValue, Slot> = HashMap::new();
     // Sort values by PValue to ensure deterministic slot assignment.
     // (HashMap iteration order is non-deterministic due to random seeding.)

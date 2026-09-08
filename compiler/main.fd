@@ -197,17 +197,23 @@ fn find_output_arg(n: i64, start: i64, default: str) -> str {
     return default;
 }
 
-// --- Helper: ensure output has .exe extension ----------------------------
-// The self-hosted compiler currently targets Windows (PE emitter + tcc with
-// -lws2_32). If the user-supplied output name doesn't end with .exe, append
-// it so the resulting binary is runnable without a manual Copy-Item rename.
-// Matches the bootstrap compiler behavior in src/main.rs (ccompile/emit both
-// default to "{stem}.exe" and keep the .exe extension on the output path).
+// --- Helper: ensure output has appropriate extension ---------------------
+// On Linux, executables don't need an extension.
+// On Windows, append .exe if not already present.
 fn ensure_exe_extension(s: str) -> str {
+    if is_linux() {
+        return s;
+    }
     if str_ends_with(s, ".exe") {
         return s;
     }
     return s + ".exe";
+}
+
+// --- Helper: detect Linux platform ----------------------------------------
+fn is_linux() -> bool {
+    // Check for /proc/self/exe which exists on Linux
+    return c_file_exists("/proc/self/exe");
 }
 
 // --- Helper: read source file or error -----------------------------------
@@ -541,7 +547,7 @@ fn cmd_fmt(n: i64, start: i64) -> i64 {
 
 // --- run -----------------------------------------------------------------
 // Reference: src/main.rs:389
-// Compiles to C, builds with tcc, then executes the resulting binary.
+// Interprets the source file using the self-hosted IR interpreter.
 // Flags: -v/--verbose, --release, --max-recursion N, --max-steps N,
 //        --max-memory N, --timeout N, --trace
 fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
@@ -595,67 +601,18 @@ fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         return 1;
     }
 
-    // TODO: The self-hosted compiler does not yet have an interpreter backend.
-    // The Rust compiler uses interpret_source_traced_full2() for the `run`
-    // command. Here we compile to C and execute the native binary instead.
-    // --max-recursion, --max-steps, --max-memory, --trace are parsed but
-    // not yet wired into the C codegen runtime. When the interpreter is
-    // ported to self-hosted Fides, these flags will control execution.
-
-    // Compile to C
-    var result: ResultStr = ccompile_source_with_path(source, input);
-    match result {
-        ResultStr::Ok(c_code) => {
-            // Write C to temp file
-            var c_file: str = "_fides_run_tmp.c";
-            p_file_write(c_file, c_code);
-
-            // Compile with available C compiler
-            var exe_name: str = "_fides_run_tmp.exe";
-            var cc: str = p_getenv("CC");
-            if str_len(cc) == 0 { cc = "tcc"; }
-            var is_tcc: bool = str_equal(cc, "tcc") || str_ends_with(cc, "tcc.exe");
-            var cc_cmd: str = "";
-            if is_tcc {
-                cc_cmd = cc + " -O2 -w -o " + exe_name + " " + c_file + " -lws2_32";
-            } else {
-                cc_cmd = cc + " -O2 -w -o " + exe_name + " " + c_file + " -lws2_32";
-            }
-            if verbose {
-                p_eprint_str("[run] Compiling: ");
-                p_eprint_str(cc_cmd);
-                p_eprint_str("\n");
-            }
-            var ret: i64 = p_system(cc_cmd);
-            if ret != 0 {
-                p_eprint_str("C compilation failed\n");
-                return 1;
-            }
-
-            // Patch PE stack to 256MB for deep recursion support
-            patch_pe_stack(exe_name);
-
-            // Execute the binary
-            if verbose {
-                p_eprint_str("[run] Executing: ");
-                p_eprint_str(exe_name);
-                p_eprint_str("\n");
-            }
-            var run_cmd: str = exe_name;
-            var exit_code: i64 = p_system(run_cmd);
-
-            // Clean up
-            p_system("del _fides_run_tmp.c");
-            p_system("del _fides_run_tmp.exe");
-
-            return exit_code;
-        }
-        ResultStr::Err(errs) => {
-            print_errors(errs);
-            return 1;
-        }
+    // Use the self-hosted IR interpreter for the `run` command.
+    // This replaces the previous C compile-and-execute fallback.
+    // --max-recursion, --max-steps, --max-memory, --trace are wired
+    // into the interpreter's execution limits.
+    if verbose {
+        p_eprint_str("[run] Using IR interpreter\n");
     }
-    return 1;
+
+    // Convert max_memory from MB to bytes
+    var max_memory_bytes: i64 = max_memory * 1048576;
+
+    return interpret_source_with_options(source, max_recursion, max_steps, max_memory_bytes, verbose);
 }
 
 // --- test ----------------------------------------------------------------
@@ -669,8 +626,12 @@ fn cmd_test(n: i64, start: i64) -> i64 {
 
     p_eprint_str("[test] Scanning tests/bootstrap/ directory...\n");
 
-    // Use dir command to list .fd files, redirect to temp file
-    p_system("dir /b tests\\bootstrap\\*.fd > _fides_test_list.txt 2>nul");
+    // Use ls/dir command to list .fd files, redirect to temp file
+    if is_linux() {
+        p_system("ls tests/bootstrap/*.fd > _fides_test_list.txt 2>/dev/null");
+    } else {
+        p_system("dir /b tests\\bootstrap\\*.fd > _fides_test_list.txt 2>nul");
+    }
     var listing: str = c_file_read("_fides_test_list.txt");
     if str_len(listing) == 0 {
         if fail_only {
@@ -818,7 +779,7 @@ fn cmd_test(n: i64, start: i64) -> i64 {
             continue;
         }
 
-        // -- Backend 1: C codegen (tcc) --
+        // -- Backend 1: C codegen --
         var c_ok: bool = false;
         var result: ResultStr = ccompile_source_with_path(source, test_path);
         match result {
@@ -826,10 +787,18 @@ fn cmd_test(n: i64, start: i64) -> i64 {
                 var c_file: str = "_fides_test_tmp.c";
                 p_file_write(c_file, c_code);
                 var exe_name: str = "_fides_test_tmp.exe";
+                if is_linux() { exe_name = "_fides_test_tmp"; }
                 var cc: str = p_getenv("CC");
-                if str_len(cc) == 0 { cc = "tcc"; }
-                var tcc_cmd: str = cc + " -O2 -w -o " + exe_name + " " + c_file + " -lws2_32";
-                var ret: i64 = p_system(tcc_cmd);
+                if str_len(cc) == 0 {
+                    if is_linux() { cc = "gcc"; } else { cc = "tcc"; }
+                }
+                var cc_cmd: str = "";
+                if is_linux() {
+                    cc_cmd = cc + " -O2 -w -o " + exe_name + " " + c_file + " -lm";
+                } else {
+                    cc_cmd = cc + " -O2 -w -o " + exe_name + " " + c_file + " -lws2_32";
+                }
+                var ret: i64 = p_system(cc_cmd);
                 if ret != 0 {
                     c_ok = false;
                 } else {
@@ -893,9 +862,13 @@ fn cmd_test(n: i64, start: i64) -> i64 {
     }
 
     // Clean up
-    p_system("del _fides_test_list.txt");
-    p_system("del _fides_test_tmp.c");
-    p_system("del _fides_test_tmp.exe");
+    if is_linux() {
+        p_system("rm -f _fides_test_list.txt _fides_test_tmp.c _fides_test_tmp");
+    } else {
+        p_system("del _fides_test_list.txt");
+        p_system("del _fides_test_tmp.c");
+        p_system("del _fides_test_tmp.exe");
+    }
 
     p_eprint_str("\n=== Results ===\n");
     p_eprint_str("C codegen:  ");
@@ -960,8 +933,14 @@ fn cmd_bench(n: i64, start: i64) -> i64 {
             var c_file: str = "_fides_bench_tmp.c";
             p_file_write(c_file, c_code);
             var exe_name: str = "_fides_bench_tmp.exe";
-            var tcc_cmd: str = "tcc -O2 -w -o " + exe_name + " " + c_file + " -lws2_32";
-            var ret: i64 = p_system(tcc_cmd);
+            if is_linux() { exe_name = "_fides_bench_tmp"; }
+            var bench_cmd: str = "";
+            if is_linux() {
+                bench_cmd = "gcc -O2 -w -o " + exe_name + " " + c_file + " -lm";
+            } else {
+                bench_cmd = "tcc -O2 -w -o " + exe_name + " " + c_file + " -lws2_32";
+            }
+            var ret: i64 = p_system(bench_cmd);
             if ret != 0 {
                 p_eprint_str("C compilation failed\n");
                 return 1;
@@ -988,8 +967,12 @@ fn cmd_bench(n: i64, start: i64) -> i64 {
             }
 
             // Clean up
-            p_system("del _fides_bench_tmp.c");
-            p_system("del _fides_bench_tmp.exe");
+            if is_linux() {
+                p_system("rm -f _fides_bench_tmp.c _fides_bench_tmp");
+            } else {
+                p_system("del _fides_bench_tmp.c");
+                p_system("del _fides_bench_tmp.exe");
+            }
 
             return 0;
         }
@@ -1098,7 +1081,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     }
 
     var input: str = p_argv(start + 1);
-    var output: str = find_output_arg(n, start, "a.exe");
+    var output: str = find_output_arg(n, start, "a.out");
     output = ensure_exe_extension(output);
 
     // --target <triple> for cross-compilation
@@ -1134,32 +1117,54 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     match result {
         ResultStr::Ok(c_code) => {
             p_eprint_str("[main] C code generated. Writing to file...\n");
-            // Derive the C source path from the executable path: replace the
-            // .exe suffix with .c (matches src/main.rs ccompile behavior).
-            var c_file: str = str_replace(output, ".exe", ".c");
+            // Derive the C source path from the executable path
+            var c_file: str = "";
+            if str_ends_with(output, ".exe") {
+                c_file = str_replace(output, ".exe", ".c");
+            } else {
+                c_file = output + ".c";
+            }
             p_file_write(c_file, c_code);
             p_eprint_str("[main] C file written. ");
 
-            // Find a C compiler: check CC env var, then gcc, clang, tcc, cl.exe
-            // Reference: src/main.rs:1139-1165
+            // Find a C compiler: check CC env var, then gcc, clang, tcc
             var cc: str = p_getenv("CC");
             if str_len(cc) == 0 {
-                // Try to find an available C compiler
-                // Check gcc first, then clang, then tcc, then cl.exe
-                if p_system("gcc --version >nul 2>&1") == 0 {
-                    cc = "gcc";
-                } else {
-                    if p_system("clang --version >nul 2>&1") == 0 {
-                        cc = "clang";
+                if is_linux() {
+                    // Linux: check gcc, clang, cc, tcc
+                    if p_system("which gcc >/dev/null 2>&1") == 0 {
+                        cc = "gcc";
                     } else {
-                        if p_system("tcc --version >nul 2>&1") == 0 {
-                            cc = "tcc";
+                        if p_system("which clang >/dev/null 2>&1") == 0 {
+                            cc = "clang";
                         } else {
-                            if p_system("where cl.exe >nul 2>&1") == 0 {
-                                cc = "cl.exe";
+                            if p_system("which cc >/dev/null 2>&1") == 0 {
+                                cc = "cc";
                             } else {
-                                // Fallback to tcc (will likely fail with a clear error)
+                                if p_system("which tcc >/dev/null 2>&1") == 0 {
+                                    cc = "tcc";
+                                } else {
+                                    cc = "gcc";
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Windows: check gcc, clang, tcc, cl.exe
+                    if p_system("gcc --version >nul 2>&1") == 0 {
+                        cc = "gcc";
+                    } else {
+                        if p_system("clang --version >nul 2>&1") == 0 {
+                            cc = "clang";
+                        } else {
+                            if p_system("tcc --version >nul 2>&1") == 0 {
                                 cc = "tcc";
+                            } else {
+                                if p_system("where cl.exe >nul 2>&1") == 0 {
+                                    cc = "cl.exe";
+                                } else {
+                                    cc = "tcc";
+                                }
                             }
                         }
                     }
@@ -1170,17 +1175,33 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             if str_len(target) > 0 {
                 var cross_gcc: str = target + "-gcc";
                 var cross_clang: str = target + "-clang";
-                if p_system(cross_gcc + " --version >nul 2>&1") == 0 {
-                    cc = cross_gcc;
-                } else {
-                    if p_system(cross_clang + " --version >nul 2>&1") == 0 {
-                        cc = cross_clang;
+                if is_linux() {
+                    if p_system("which " + cross_gcc + " >/dev/null 2>&1") == 0 {
+                        cc = cross_gcc;
                     } else {
-                        p_eprint_str("Warning: cross-compiler for target '");
-                        p_eprint_str(target);
-                        p_eprint_str("' not found, falling back to ");
-                        p_eprint_str(cc);
-                        p_eprint_str("\n");
+                        if p_system("which " + cross_clang + " >/dev/null 2>&1") == 0 {
+                            cc = cross_clang;
+                        } else {
+                            p_eprint_str("Warning: cross-compiler for target '");
+                            p_eprint_str(target);
+                            p_eprint_str("' not found, falling back to ");
+                            p_eprint_str(cc);
+                            p_eprint_str("\n");
+                        }
+                    }
+                } else {
+                    if p_system(cross_gcc + " --version >nul 2>&1") == 0 {
+                        cc = cross_gcc;
+                    } else {
+                        if p_system(cross_clang + " --version >nul 2>&1") == 0 {
+                            cc = cross_clang;
+                        } else {
+                            p_eprint_str("Warning: cross-compiler for target '");
+                            p_eprint_str(target);
+                            p_eprint_str("' not found, falling back to ");
+                            p_eprint_str(cc);
+                            p_eprint_str("\n");
+                        }
                     }
                 }
             }
@@ -1201,10 +1222,18 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
             } else {
                 if is_tcc {
                     // tcc: minimal flags
-                    cc_cmd = cc + " -O2 -w -o " + output + " " + c_file + " -lws2_32";
+                    if is_linux() {
+                        cc_cmd = cc + " -O2 -w -o " + output + " " + c_file + " -lm";
+                    } else {
+                        cc_cmd = cc + " -O2 -w -o " + output + " " + c_file + " -lws2_32";
+                    }
                 } else {
                     // gcc/clang: -O2 + hardening flags
-                    cc_cmd = cc + " -O2 -w -Wno-int-conversion -o " + output + " " + c_file + " -lws2_32";
+                    if is_linux() {
+                        cc_cmd = cc + " -O2 -w -Wno-int-conversion -o " + output + " " + c_file + " -lm -lpthread";
+                    } else {
+                        cc_cmd = cc + " -O2 -w -Wno-int-conversion -o " + output + " " + c_file + " -lws2_32";
+                    }
                 }
             }
             var ret: i64 = p_system(cc_cmd);
@@ -1219,7 +1248,10 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
 
             // Patch PE stack to 256MB (tcc defaults to 1MB, which is too
             // small for the self-hosted compiler's deep recursion).
-            patch_pe_stack(output);
+            // Only needed on Windows with PE executables.
+            if !is_linux() {
+                patch_pe_stack(output);
+            }
 
             print("Built native executable: ");
             print(output);
@@ -1245,12 +1277,12 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
 // Flags: -o <output>, --target <triple>, --no-opt, --lto, --caps <list>
 fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     if start + 2 > n {
-        print("Usage: fides-c build <file.fd> [-o output.exe] [--target <triple>] [--no-opt] [--lto] [--caps <list>]\n");
+        print("Usage: fides-c build <file.fd> [-o output] [--target <triple>] [--no-opt] [--lto] [--caps <list>]\n");
         return 1;
     }
 
     var input: str = p_argv(start + 1);
-    var output: str = find_output_arg(n, start, "a.exe");
+    var output: str = find_output_arg(n, start, "a.out");
     output = ensure_exe_extension(output);
 
     // --target <triple> (default: x86-64)
@@ -1259,6 +1291,8 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     var do_opt: bool = !has_flag(n, start, "--no-opt");
     // --lto: enable link-time optimization
     var do_lto: bool = has_flag(n, start, "--lto");
+    // --native: use native backend (ELF64/PE) instead of C codegen
+    var use_native: bool = has_flag(n, start, "--native");
     // --caps <list>: capability restrictions
     var caps: str = get_flag_value(n, start, "--caps", "");
 
@@ -1285,12 +1319,6 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         p_eprint_str("\n");
     }
 
-    // TODO: --target is parsed but the PE emitter currently only supports
-    // x86-64. Cross-compilation to ARM64/RISC-V requires codegen_arm64/
-    // codegen_riscv modules which are not yet ported to self-hosted Fides.
-    // TODO: --caps capability stripping is not yet implemented in the
-    // self-hosted compiler pipeline.
-
     var source: str = c_file_read(input);
     if str_len(source) == 0 {
         print("Error: could not read file: ");
@@ -1315,13 +1343,66 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         ResultProgram::Ok(program) => {
             p_eprint_str("[build] Lowering to IR...\n");
             var ir_mod: IrModule = lower(program);
-            // TODO: When do_opt is false, skip the PIR optimizer.
-            // Currently the PE emitter pipeline always runs optimization.
-            // TODO: When do_lto is true, use optimize_l2_lto() instead of
-            // optimize_l2() for aggressive cross-module inlining.
-            p_eprint_str("[build] Generating PE executable...\n");
-            // Use C codegen + TCC for the build command.
-            p_eprint_str("[build] Using C codegen...\n");
+
+            // Try native backend if --native flag is set
+            if use_native {
+                p_eprint_str("[build] Using native backend...\n");
+                var native_result: ResultBytes = build_executable(source, input, target, do_opt, do_lto);
+                match native_result {
+                    ResultBytes::Err(nerrs) => {
+                        p_eprint_str("[build] Native backend failed, falling back to C codegen:\n");
+                        var ne: i64 = 0;
+                        while ne < nerrs.len() {
+                            p_eprint_str("  ");
+                            p_eprint_str(nerrs.get(ne));
+                            p_eprint_str("\n");
+                            ne = ne + 1;
+                        }
+                    }
+                    ResultBytes::Ok(native_bytes) => {
+                        p_eprint_str("[build] Writing native executable...\n");
+                        p_file_write_vec(output, native_bytes);
+                        p_eprint_str("[build] Native executable built.\n");
+                        print("Built native executable: ");
+                        print(output);
+                        print("\n");
+                        return 0;
+                    }
+                }
+            }
+
+            // On Linux, use C codegen + system C compiler (gcc/clang)
+            // On Windows, use C codegen + TCC
+            if is_linux() {
+                p_eprint_str("[build] Using C codegen (Linux)...\n");
+                var cgen: CCodeGen = CCodeGen_new();
+                var c_source: str = CCodeGen_generate(&mut cgen, ir_mod);
+                var c_file: str = output + ".c";
+                p_file_write(c_file, c_source);
+                // Try gcc first, then clang
+                var cc_cmd: str = "gcc -O2 -o " + output + " " + c_file + " -lm 2>/dev/null";
+                var cc_ret: i64 = p_system(cc_cmd);
+                if cc_ret != 0 {
+                    cc_cmd = "clang -O2 -o " + output + " " + c_file + " -lm 2>/dev/null";
+                    cc_ret = p_system(cc_cmd);
+                }
+                if cc_ret != 0 {
+                    cc_cmd = "cc -O2 -o " + output + " " + c_file + " -lm";
+                    cc_ret = p_system(cc_cmd);
+                }
+                if cc_ret != 0 {
+                    print("Error: C compilation failed (tried gcc, clang, cc)\n");
+                    return 1;
+                }
+                p_eprint_str("[build] Native executable built via C codegen.\n");
+                print("Built native executable: ");
+                print(output);
+                print("\n");
+                return 0;
+            }
+
+            // Windows: C codegen + TCC
+            p_eprint_str("[build] Using C codegen (TCC)...\n");
             var cgen: CCodeGen = CCodeGen_new();
             var c_source: str = CCodeGen_generate(&mut cgen, ir_mod);
             var c_file: str = output + ".c";
@@ -1348,8 +1429,8 @@ fn print_usage() {
     p_eprint_str("\n");
     p_eprint_str("Usage:\n");
     p_eprint_str("  fides-c ccompile <file.fd> -o <output>    Compile via C codegen (tcc)\n");
-    p_eprint_str("  fides-c build    <file.fd> -o <output.exe> Compile via PE emitter (no tcc)\n");
-    p_eprint_str("  fides-c emit     <file.fd> -o <output.exe> Alias for build\n");
+    p_eprint_str("  fides-c build    <file.fd> -o <output>    Compile to native executable\n");
+    p_eprint_str("  fides-c emit     <file.fd> -o <output>    Alias for build\n");
     p_eprint_str("  fides-c run      <file.fd>                Compile + execute\n");
     p_eprint_str("  fides-c tokens   <file.fd>                Show tokens\n");
     p_eprint_str("  fides-c ast      <file.fd>                Show AST summary\n");

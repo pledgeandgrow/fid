@@ -4510,6 +4510,26 @@ impl Interpreter {
                 ExecOutcome::Value(Value::Int(0))
             }
 
+            // ─── SQLite FFI stubs (interpreter only — real impl via C library) ───
+            // The interpreter doesn't link against libsqlite3, so these stubs
+            // allow programs to load. Tests that need real SQLite use ccompile.
+            "p_sqlite3_open" => ExecOutcome::Value(Value::Int(0)), // SQLITE_OK (fake)
+            "p_sqlite3_close" => ExecOutcome::Value(Value::Int(0)),
+            "p_sqlite3_exec" => ExecOutcome::Value(Value::Int(0)),
+            "p_sqlite3_prepare_v2" => ExecOutcome::Value(Value::Int(1)), // SQLITE_ERROR
+            "p_sqlite3_step" => ExecOutcome::Value(Value::Int(101)), // SQLITE_DONE
+            "p_sqlite3_finalize" => ExecOutcome::Value(Value::Int(0)),
+            "p_sqlite3_column_count" => ExecOutcome::Value(Value::Int(0)),
+            "p_sqlite3_column_name" => ExecOutcome::Value(Value::Str(CompactString::from(""))),
+            "p_sqlite3_column_text" => ExecOutcome::Value(Value::Str(CompactString::from(""))),
+            "p_sqlite3_column_int64" => ExecOutcome::Value(Value::Int(0)),
+            "p_sqlite3_column_double" => ExecOutcome::Value(Value::Float(0.0)),
+            "p_sqlite3_column_type" => ExecOutcome::Value(Value::Int(5)), // SQLITE_NULL
+            "p_sqlite3_errmsg" => ExecOutcome::Value(Value::Str(CompactString::from("interpreter does not support SQLite"))),
+            "p_sqlite3_last_insert_rowid" => ExecOutcome::Value(Value::Int(0)),
+            "p_sqlite3_changes" => ExecOutcome::Value(Value::Int(0)),
+            "p_sqlite3_free" => ExecOutcome::Continue,
+
             // ─── File I/O builtins ───
             "p_file_read" => {
                 if let Some(path_arg) = args.get(0) {
