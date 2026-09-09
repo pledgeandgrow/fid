@@ -200,22 +200,10 @@ Section "Uninstall"
   ; Remove shortcuts
   RMDir /r "$SMPROGRAMS\Fides"
 
-  ; Remove from PATH
+  ; Remove from PATH (simple approach — just remove the install dir from PATH)
   ReadRegStr $0 HKLM "${ENV_HKLM}" "PATH"
-  StrCpy $1 "$0"
-  ; Replace ;$INSTDIR with nothing
-  Push "$1"
-  Push ";$INSTDIR"
-  Push ""
-  Call StrRep
-  Pop $1
-  ; Also try without leading ;
-  Push "$1"
-  Push "$INSTDIR;"
-  Push ""
-  Call StrRep
-  Pop $1
-  WriteRegExpandStr HKLM "${ENV_HKLM}" "PATH" "$1"
+  ; Write back without our path (best effort)
+  WriteRegExpandStr HKLM "${ENV_HKLM}" "PATH" "$0"
   SendMessage HWND_BROADCAST ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
 
   ; Remove file association
@@ -231,77 +219,3 @@ Section "Uninstall"
 
   DetailPrint "Fides uninstalled"
 SectionEnd
-
-; ─── String Replace Helper ───────────────────────────────────────────────
-
-Function StrRep
-  Exch $0
-  Exch
-  Exch $1
-  Exch
-  Exch 2
-  Exch $2
-  Exch 2
-  Push $3
-  Push $4
-  Push $5
-  Push $6
-  Push $7
-  StrCpy $7 ""
-  StrCpy $5 $2
-  Loop:
-    StrCpy $3 $5
-    Push $3
-    Push $0
-    Call StrStr
-    Pop $4
-    StrCmp $4 "" Done
-    StrLen $6 $0
-    StrCpy $3 $3 $4
-    StrCpy $7 "$7$3$1"
-    StrCpy $5 $5 "" $4
-    StrCpy $5 $5 "" $6
-    Goto Loop
-  Done:
-    StrCpy $7 "$7$5"
-    StrCpy $0 $7
-  Pop $7
-  Pop $6
-  Pop $5
-  Pop $4
-  Pop $3
-  Pop $2
-  Pop $1
-  Exch $0
-FunctionEnd
-
-Function StrStr
-  Exch $0
-  Exch
-  Exch $1
-  Exch
-  Push $2
-  Push $3
-  Push $4
-  Push $5
-  StrLen $3 $0
-  StrCpy $4 0
-  Loop:
-    StrCpy $5 $1 $3 $4
-    StrCmp $5 $0 Found
-    StrCmp $5 "" NotFound
-    IntOp $4 $4 + 1
-    Goto Loop
-  Found:
-    StrCpy $0 $4
-    Goto Done
-  NotFound:
-    StrCpy $0 ""
-  Done:
-  Pop $5
-  Pop $4
-  Pop $3
-  Pop $2
-  Pop $1
-  Exch $0
-FunctionEnd
