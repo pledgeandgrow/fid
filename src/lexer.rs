@@ -115,6 +115,7 @@ impl Lexer {
             "with" => TokenKind::With,
             "async" => TokenKind::Async,
             "await" => TokenKind::Await,
+            "parallel" => TokenKind::Parallel,
             "comptime" => TokenKind::Comptime,
             "defer" => TokenKind::Defer,
             "spawn" => TokenKind::Spawn,

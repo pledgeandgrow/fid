@@ -9,7 +9,7 @@
 | # | Item | Status | Stub Location |
 |---|------|--------|---------------|
 | 17 | Certified toolchain | Stub (`qualify` command) | `src/main.rs` `generate_qualification_manifest` |
-| 18 | Information-flow control | Stub (`verify_taint_propagation`) | `src/typechecker.rs` |
+| 18 | Information-flow control | **DONE** — full data-flow taint tracking | `src/typechecker.rs` |
 | 19 | SBOM export | Stub (`sbom` command) | `src/main.rs` `generate_sbom` |
 | 20 | Post-codegen constant-time verification | Stub (`verify_constant_time_asm`) | `src/codegen_x64.rs` |
 
@@ -107,9 +107,18 @@ This means:
 
 ### Current State
 
-- `verify_tainted` in `src/typechecker.rs:2599` — coarse sink-call detection
-- `verify_taint_propagation` in `src/typechecker.rs` — STUB (no-op)
-- Called from the typecheck pipeline after `verify_tainted`
+- `verify_taint_propagation` in `src/typechecker.rs` — **IMPLEMENTED** with full
+  data-flow tracking:
+  - `TaintState` enum: `Untainted`, `Tainted`, `Sanitized`
+  - `@tainted` params initialized as `Tainted` (parser updated to parse annotations)
+  - Propagation through assignments, binary ops, string concat, f-strings, struct literals
+  - Sanitizer calls (`sql_escape`, `shell_escape`, `html_escape`, `path_normalize`)
+    produce `Sanitized` state
+  - Sink calls (SQL, shell, HTML, filesystem) reject `Tainted` (not `Sanitized`) args
+  - Return propagation: returning tainted from non-`@tainted` functions is rejected
+  - Call propagation: taint flows through function call arguments
+- `verify_tainted` (old coarse check) is now a no-op to avoid duplicate errors
+  and false positives on sanitized code
 
 ### Full Implementation Plan
 

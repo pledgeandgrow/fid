@@ -288,6 +288,8 @@ pub struct L1Function {
     pub is_kernel: bool,
     /// Workgroup size from @kernel annotation. ML8.
     pub workgroup_size: [u32; 3],
+    /// F23: Whether this function is @simd — enables aggressive loop vectorization.
+    pub is_simd: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -464,6 +466,8 @@ pub struct L2Function {
     pub is_kernel: bool,
     /// Workgroup size from @kernel annotation. ML8.
     pub workgroup_size: [u32; 3],
+    /// F23: Whether this function is @simd — enables aggressive loop vectorization.
+    pub is_simd: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -630,6 +634,8 @@ pub struct L3Function {
     pub is_kernel: bool,
     /// Workgroup size from @kernel annotation: [x, y, z]. Default: [1, 1, 1].
     pub workgroup_size: [u32; 3],
+    /// F23: Whether this function is @simd — enables aggressive loop vectorization.
+    pub is_simd: bool,
 }
 
 impl L3Function {
@@ -777,6 +783,16 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
                 ptr: *ptr,
                 value: *value,
                 store_ty: store_ty.clone(),
+                effects: {
+                    let mut e = EffectSet::new();
+                    e.add(Effect::Write);
+                    e
+                },
+            },
+            Inst::StructCopy { dst, src, ty } => L1Inst::Store {
+                ptr: *dst,
+                value: *src,
+                store_ty: Some(ty.clone()),
                 effects: {
                     let mut e = EffectSet::new();
                     e.add(Effect::Write);
@@ -949,6 +965,7 @@ fn lower_func_to_l1(f: &IrFunction) -> L1Function {
         is_no_alloc: f.is_no_alloc,
         is_medical: f.is_medical,
         is_kernel: f.is_kernel,
+        is_simd: f.is_simd,
         workgroup_size: f.workgroup_size,
     }
 }
@@ -1161,6 +1178,7 @@ fn lower_func_l1_to_l2(f: &L1Function) -> L2Function {
         is_no_alloc: f.is_no_alloc,
         is_medical: f.is_medical,
         is_kernel: f.is_kernel,
+        is_simd: f.is_simd,
         workgroup_size: f.workgroup_size,
     }
 }
@@ -1347,6 +1365,7 @@ fn lower_func_l2_to_l3(f: &L2Function, module: &IrModule) -> L3Function {
         frame_size,
         next_vreg: next,
         is_kernel: f.is_kernel,
+        is_simd: f.is_simd,
         workgroup_size: f.workgroup_size,
     }
 }

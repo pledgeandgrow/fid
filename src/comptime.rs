@@ -570,6 +570,11 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<String>) 
                 substitute_stmts(def, original, errs);
             }
         }
+        Stmt::Parallel { branches, .. } => {
+            for branch in branches {
+                substitute_stmts(branch, original, errs);
+            }
+        }
     }
 }
 

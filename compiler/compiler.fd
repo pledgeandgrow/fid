@@ -619,16 +619,146 @@ pub fn build_program_no_std(source: str, source_path: OptStr) -> ResultProgram {
             return ResultProgram::Err(enrich_errors(c_vec1(e), source, file2));
         }
         ParseResultProgram::Ok(user) => {
-            // In no-std mode, skip stdlib merge and import resolution.
-            // Use the user program directly as the merged program.
+            // In no-std mode, skip stdlib merge but DO resolve `use` imports
+            // from disk (for multi-module kernels/firmware).
             var program: Program = user;
+
+            // -- Resolve use imports from disk (no stdlib in no-std mode) ----
+            var imported_modules: Vec<Program> = Vec::new();
+            var imported_module_names: Vec<str> = Vec::new();
+            var loaded_module_names: Vec<str> = Vec::new();
+            var has_source_path: bool = false;
+            var base_dir: str = ".";
+            match source_path {
+                OptStr::Some(sp) => {
+                    has_source_path = true;
+                    base_dir = c_path_dirname(sp);
+                }
+                OptStr::None => { }
+            }
+
+            if has_source_path && user.imports.len() > 0 {
+                p_eprint_str("[build] No-std: resolving imports...\n");
+                var project_root: str = find_project_root(base_dir);
+                var imports_to_process: Vec<str> = Vec::new();
+                var ui: i64 = user.imports.len() - 1;
+                while ui >= 0 {
+                    imports_to_process.push(user.imports.get(ui).path);
+                    ui = ui - 1;
+                }
+
+                while imports_to_process.len() > 0 {
+                    var import_path: str = imports_to_process.get(imports_to_process.len() - 1);
+                    imports_to_process.pop();
+                    // Skip "core" -- not available in no-std mode
+                    if str_equal(import_path, "core") { continue; }
+                    // Skip already-loaded modules
+                    var already_loaded: bool = false;
+                    var li: i64 = 0;
+                    while li < loaded_module_names.len() {
+                        if str_equal(loaded_module_names.get(li), import_path) {
+                            already_loaded = true;
+                            break;
+                        }
+                        li = li + 1;
+                    }
+                    if already_loaded { continue; }
+
+                    // Try candidate paths (base_dir + project_root, no stdlib)
+                    var path_str: str = str_replace(import_path, "::", "/");
+                    var candidates: Vec<str> = Vec::new();
+                    candidates.push(c_path_join(base_dir, str_concat(path_str, ".fd")));
+                    candidates.push(c_path_join(base_dir, c_path_join(path_str, "mod.fd")));
+                    candidates.push(c_path_join(project_root, str_concat(path_str, ".fd")));
+                    candidates.push(c_path_join(project_root, c_path_join(path_str, "mod.fd")));
+
+                    var found_path: str = "";
+                    var found: bool = false;
+                    var ci: i64 = 0;
+                    while ci < candidates.len() {
+                        if c_file_exists(candidates.get(ci)) {
+                            found_path = candidates.get(ci);
+                            found = true;
+                            break;
+                        }
+                        ci = ci + 1;
+                    }
+
+                    if found {
+                        p_eprint_str("[build] No-std: loading import: ");
+                        p_eprint_str(found_path);
+                        p_eprint_str("\n");
+                        var module_source: str = p_file_read(found_path);
+                        if module_source == 0 {
+                            p_eprint_str("[build] Warning: could not read: ");
+                            p_eprint_str(found_path);
+                            p_eprint_str("\n");
+                            continue;
+                        }
+                        var empty_struct_names: Vec<str> = Vec::new();
+                        var empty_enum_names: Vec<str> = Vec::new();
+                        var ilex: Lexer = Lexer::new(module_source);
+                        var itokens: Vec<Token> = ilex.tokenize();
+                        var ip: Parser = Parser_with_names(itokens, empty_struct_names, empty_enum_names);
+                        var iresult: ParseResultProgram = ip.parse();
+                        match iresult {
+                            ParseResultProgram::Err(e) => {
+                                return ResultProgram::Err(enrich_errors(c_vec1(e), module_source, found_path));
+                            }
+                            ParseResultProgram::Ok(imported) => {
+                                var module_name: str = import_path;
+                                match imported.module {
+                                    OptStr::Some(mn) => { module_name = mn; }
+                                    OptStr::None => { }
+                                }
+                                // Queue transitive imports
+                                var ti: i64 = 0;
+                                while ti < imported.imports.len() {
+                                    var trans_path: str = imported.imports.get(ti).path;
+                                    var trans_loaded: bool = false;
+                                    var tli: i64 = 0;
+                                    while tli < loaded_module_names.len() {
+                                        if str_equal(loaded_module_names.get(tli), trans_path) {
+                                            trans_loaded = true;
+                                            break;
+                                        }
+                                        tli = tli + 1;
+                                    }
+                                    if !trans_loaded && !str_equal(trans_path, "core") {
+                                        imports_to_process.push(trans_path);
+                                    }
+                                    ti = ti + 1;
+                                }
+                                loaded_module_names.push(import_path);
+                                imported_modules.push(imported);
+                                imported_module_names.push(module_name);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Apply desugar and default trait methods
             desugar_layers_models(&mut program);
             program = process_gen(program);
             fill_default_trait_methods(&mut program);
-            // Typecheck — register only the user program
+
+            // Merge imported modules into the program (imports first, user wins)
+            var mi: i64 = 0;
+            while mi < imported_modules.len() {
+                program = merge_programs(program, imported_modules.get(mi));
+                mi = mi + 1;
+            }
+
+            // Typecheck — register imported modules first, then user
             p_eprint_str("[build] No-std: typechecking (no stdlib)...\n");
             var tc: TypeChecker = TypeChecker::new();
+            // Register imported modules first so their functions are visible
+            var mi2: i64 = 0;
+            while mi2 < imported_modules.len() {
+                TypeChecker_register_program(&mut tc, imported_modules.get(mi2), imported_module_names.get(mi2));
+                mi2 = mi2 + 1;
+            }
             var user_module: str = "main";
             match user.module {
                 OptStr::Some(m2) => { user_module = m2; }
@@ -638,6 +768,13 @@ pub fn build_program_no_std(source: str, source_path: OptStr) -> ResultProgram {
             TypeChecker_register_trait_impls(&mut tc, program);
             TypeChecker_collect_capabilities(&mut tc, user);
             TypeChecker_check_bodies(&mut tc, program);
+            // Also check imported module bodies
+            var mi3: i64 = 0;
+            while mi3 < imported_modules.len() {
+                TypeChecker_collect_capabilities(&mut tc, imported_modules.get(mi3));
+                TypeChecker_check_bodies(&mut tc, imported_modules.get(mi3));
+                mi3 = mi3 + 1;
+            }
             if tc.errors.len() > 0 {
                 var file3: str = "<stdin>";
                 match source_path {
@@ -657,33 +794,51 @@ pub fn build_program_no_std(source: str, source_path: OptStr) -> ResultProgram {
 }
 
 /// Build a program with optional file path for resolving `use` imports.
+/// Cached parsed stdlib for LSP (avoids re-parsing on every keystroke).
+/// Uses module-level vars for persistence across calls in a single process.
+pub var g_stdlib_cache: OptProgram = OptProgram::None;
+var g_stdlib_struct_names: Vec<str> = Vec::new();
+var g_stdlib_enum_names: Vec<str> = Vec::new();
+var g_stdlib_cache_init: bool = false;
+
+/// Get the cached parsed stdlib. Parses on first call, returns cache on subsequent calls.
+/// Returns (stdlib_program, struct_names, enum_names).
+pub fn get_cached_stdlib() -> OptProgram {
+    if g_stdlib_cache_init {
+        return g_stdlib_cache;
+    }
+    // Parse stdlib/core.fd
+    var stdlib_raw: str = p_file_read("stdlib/core.fd");
+    if stdlib_raw == 0 {
+        return OptProgram::None;
+    }
+    var stdlib_result: ParseResultProgram = parse_source(stdlib_raw);
+    match stdlib_result {
+        ParseResultProgram::Ok(stdlib) => {
+            g_stdlib_cache = OptProgram::Some(stdlib);
+            g_stdlib_cache_init = true;
+            return g_stdlib_cache;
+        }
+        ParseResultProgram::Err(_) => {
+            return OptProgram::None;
+        }
+    }
+}
+
 /// This is the main entry point for the compiler pipeline:
 ///   parse stdlib -> parse user -> resolve imports -> merge -> cfg filter ->
 ///   derive -> desugar layers/models -> comptime -> typecheck -> borrowck -> mono
 pub fn build_program_with_path(source: str, source_path: OptStr) -> ResultProgram {
     var t0: i64 = p_clock_now_ms();
-    // Parse stdlib first
-    p_eprint_str("[build] Reading stdlib/core.fd...\n");
-    var stdlib_raw: str = p_file_read("stdlib/core.fd");
-    if stdlib_raw == 0 {
-        p_eprint_str("[build] FAILED: stdlib/core.fd not found\n");
-        return ResultProgram::Err(c_vec1("Stdlib not found: stdlib/core.fd (CWD must be project root)"));
-    }
-    var stdlib_source: str = stdlib_raw;
-    p_eprint_str("[build] Lexing + parsing stdlib...\n");
-    var t1: i64 = p_clock_now_ms();
-    var stdlib_result: ParseResultProgram = parse_source(stdlib_source);
-    var t2: i64 = p_clock_now_ms();
-    p_eprint_str("[prof] stdlib parse: ");
-    p_eprint_str(int_to_str(t2 - t1));
-    p_eprint_str("ms\n");
-    match stdlib_result {
-        ParseResultProgram::Err(e) => {
-            p_eprint_str("[build] FAILED: stdlib parse error\n");
-            return ResultProgram::Err(c_vec1(str_concat("Stdlib parse error: ", e)));
+    // Parse stdlib first (use cache if available)
+    var stdlib_opt: OptProgram = get_cached_stdlib();
+    match stdlib_opt {
+        OptProgram::None => {
+            p_eprint_str("[build] FAILED: stdlib/core.fd not found or parse error\n");
+            return ResultProgram::Err(c_vec1("Stdlib not found: stdlib/core.fd (CWD must be project root)"));
         }
-        ParseResultProgram::Ok(stdlib) => {
-            p_eprint_str("[build] Stdlib parsed ok. Extracting names...\n");
+        OptProgram::Some(stdlib) => {
+            p_eprint_str("[build] Stdlib parsed ok (cached). Extracting names...\n");
             // Extract stdlib struct/enum names for parser
             var struct_names: Vec<str> = Vec::new();
             var enum_names: Vec<str> = Vec::new();

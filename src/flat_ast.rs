@@ -423,7 +423,7 @@ pub fn expr_flat(e: &Expr, depth: usize) -> String {
 pub fn stmt_flat(s: &Stmt, depth: usize) -> String {
     let ind = indent(depth);
     match s {
-        Stmt::Let { name, ty, expr, is_mut, is_persist, line } => {
+        Stmt::Let { name, ty, expr, is_mut, is_persist, annotations: _, line } => {
             let mut out = format!("{}Let \"{}\" {} {} {}\n", ind, esc(name), bool_str(*is_mut), bool_str(*is_persist), line);
             match ty {
                 Some(t) => out.push_str(&type_flat(t, depth + 1)),
@@ -439,7 +439,7 @@ pub fn stmt_flat(s: &Stmt, depth: usize) -> String {
             out.push_str(&expr_flat(expr, depth + 1));
             out
         }
-        Stmt::LetUninit { name, ty, line } => {
+        Stmt::LetUninit { name, ty, annotations: _, line } => {
             let mut out = format!("{}LetUninit \"{}\" {}\n", ind, esc(name), line);
             out.push_str(&type_flat(ty, depth + 1));
             out
@@ -636,6 +636,15 @@ pub fn stmt_flat(s: &Stmt, depth: usize) -> String {
                     for st in stmts { out.push_str(&stmt_flat(st, depth + 2)); out.push('\n'); }
                 }
                 None => { out.push_str(&format!("{}DefaultNone\n", indent(depth + 1))); }
+            }
+            if out.ends_with('\n') { out.pop(); }
+            out
+        }
+        Stmt::Parallel { branches, line } => {
+            let mut out = format!("{}Parallel {}\n", ind, line);
+            for (i, branch) in branches.iter().enumerate() {
+                out.push_str(&format!("{}Branch {}\n", indent(depth + 1), i));
+                for st in branch { out.push_str(&stmt_flat(st, depth + 2)); out.push('\n'); }
             }
             if out.ends_with('\n') { out.pop(); }
             out

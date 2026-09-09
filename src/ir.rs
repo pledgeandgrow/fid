@@ -573,6 +573,13 @@ pub enum Inst {
         /// Defaults to I64 for local variable stores.
         store_ty: Option<IrType>,
     },
+    /// Copy struct data from src to dst (memcpy of struct size bytes).
+    /// Both dst and src are pointers to struct data.
+    StructCopy {
+        dst: ValueId,
+        src: ValueId,
+        ty: IrType,
+    },
     /// Get the address of a struct field
     GetFieldPtr {
         struct_ptr: ValueId,
@@ -818,6 +825,7 @@ impl Inst {
             Inst::GradBegin { .. } => IrType::Void,
             Inst::GradEnd => IrType::Void,
             Inst::Backward { .. } => IrType::Void,
+            Inst::StructCopy { .. } => IrType::Void,
         }
     }
 
@@ -854,6 +862,7 @@ impl Inst {
             Inst::UnsafeBegin | Inst::UnsafeEnd => {}
             Inst::GradBegin { .. } | Inst::GradEnd => effects.add(Effect::Diff),
             Inst::Backward { .. } => effects.add(Effect::Diff),
+            Inst::StructCopy { .. } => effects.add(Effect::Write),
             _ => {}
         }
         effects
@@ -904,6 +913,7 @@ impl Inst {
             Inst::GradBegin { .. } => "GradBegin",
             Inst::GradEnd => "GradEnd",
             Inst::Backward { .. } => "Backward",
+            Inst::StructCopy { .. } => "StructCopy",
         }
     }
 
@@ -969,6 +979,7 @@ impl Inst {
             Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd => vec![],
             Inst::GradBegin { .. } | Inst::GradEnd => vec![],
             Inst::Backward { loss } => vec![*loss],
+            Inst::StructCopy { dst, src, .. } => vec![*dst, *src],
         }
     }
 }
@@ -1024,12 +1035,19 @@ pub struct IrFunction {
     /// Whether this is an interrupt handler (bare-metal mode).
     /// Interrupt handlers save/restore all registers and use `iret` instead of `ret`.
     pub is_interrupt: bool,
+    /// F29: IDT vector number for @interrupt(N) annotated functions.
+    /// None = no vector assigned (use `interrupt` keyword without vector, or no annotation).
+    pub interrupt_vector: Option<u64>,
     /// Persist variables in this function — (name, alloca_ptr)
     /// Used to emit PersistSave before returns
     pub persist_vars: Vec<(String, ValueId)>,
     /// Drop-eligible locals — (alloca_ptr, struct_name) for variables whose
     /// type implements Drop. The compiler inserts drop calls at exit points.
     pub drop_locals: Vec<(ValueId, String)>,
+    /// @zeroize locals — (alloca_ptr, size_in_bytes) for variables that must
+    /// be wiped from memory at scope exit. The compiler inserts memset calls
+    /// at exit points (before drops and returns).
+    pub zeroize_locals: Vec<(ValueId, u64)>,
     /// Whether this function is annotated @wrapping (F65).
     /// @wrapping functions use wrap-around arithmetic instead of checked arithmetic.
     pub is_wrapping: bool,
@@ -1054,6 +1072,9 @@ pub struct IrFunction {
     pub is_kernel: bool,
     /// Workgroup size from @kernel annotation: [x, y, z]. Default: [1, 1, 1].
     pub workgroup_size: [u32; 3],
+    /// F23: Whether this function is @simd — enables aggressive loop vectorization.
+    /// @simd functions get larger unroll limits and prefer SSE2/AVX/NEON instructions.
+    pub is_simd: bool,
 }
 
 impl IrFunction {
@@ -1071,8 +1092,10 @@ impl IrFunction {
             entry: BlockId(0),
             locals: HashMap::new(),
             is_interrupt: false,
+            interrupt_vector: None,
             persist_vars: Vec::new(),
             drop_locals: Vec::new(),
+            zeroize_locals: Vec::new(),
             is_wrapping: false,
             is_deterministic: false,
             is_crashfree: false,
@@ -1081,6 +1104,7 @@ impl IrFunction {
             is_medical: false,
             is_kernel: false,
             workgroup_size: [1, 1, 1],
+            is_simd: false,
         };
         // Create entry block
         func.new_block();

@@ -654,6 +654,12 @@ impl CodeGen {
                     for s in def { self.gen_stmt(s); }
                 }
             }
+            Stmt::Parallel { branches, .. } => {
+                // Parallel is lowered to IR before codegen — execute branches sequentially.
+                for branch in branches {
+                    for s in branch { self.gen_stmt(s); }
+                }
+            }
         }
     }
 

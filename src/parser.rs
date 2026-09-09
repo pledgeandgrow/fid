@@ -983,14 +983,20 @@ impl Parser {
             let mut params = Vec::new();
             if !self.check(&TokenKind::RParen) {
                 loop {
+                    // Parse optional @annotations on params (e.g. @tainted)
+                    let mut param_annotations: Vec<Annotation> = Vec::new();
+                    while self.check(&TokenKind::At) {
+                        let ann = self.parse_at_annotation()?;
+                        param_annotations.push(ann);
+                    }
                     let pname = self.expect_ident()?;
                     if pname == "self" && !self.check(&TokenKind::Colon) {
                         // Bare 'self' — type will be filled in by the impl
-                        params.push(Param { name: "self".to_string(), ty: Type::Named("Self".to_string()), is_pub: false, annotations: Vec::new() });
+                        params.push(Param { name: "self".to_string(), ty: Type::Named("Self".to_string()), is_pub: false, annotations: param_annotations });
                     } else {
                         self.expect(TokenKind::Colon, ":")?;
                         let ty = self.parse_type()?;
-                        params.push(Param { name: pname, ty, is_pub: false, annotations: Vec::new() });
+                        params.push(Param { name: pname, ty, is_pub: false, annotations: param_annotations });
                     }
                     if !self.match_tok(TokenKind::Comma) {
                         break;
@@ -1210,14 +1216,20 @@ impl Parser {
         }
 
         loop {
+            // Parse optional @annotations on params (e.g. @tainted)
+            let mut param_annotations: Vec<Annotation> = Vec::new();
+            while self.check(&TokenKind::At) {
+                let ann = self.parse_at_annotation()?;
+                param_annotations.push(ann);
+            }
             let name = self.expect_ident_or_keyword()?;
             // Handle bare 'self' (without type annotation) in impl methods
             if name == "self" && !self.check(&TokenKind::Colon) {
-                params.push(Param { name: "self".to_string(), ty: Type::Named("Self".to_string()), is_pub: false, annotations: Vec::new() });
+                params.push(Param { name: "self".to_string(), ty: Type::Named("Self".to_string()), is_pub: false, annotations: param_annotations });
             } else {
                 self.expect(TokenKind::Colon, ":")?;
                 let ty = self.parse_type()?;
-                params.push(Param { name, ty, is_pub: false, annotations: Vec::new() });
+                params.push(Param { name, ty, is_pub: false, annotations: param_annotations });
             }
 
             if !self.match_tok(TokenKind::Comma) {
@@ -1460,6 +1472,32 @@ impl Parser {
 
     fn parse_stmt(&mut self) -> Result<Stmt, String> {
         match self.peek() {
+            TokenKind::At => {
+                // @annotation(s) on a local variable declaration (e.g. @zeroize, @secret)
+                let mut annotations = Vec::new();
+                while self.check(&TokenKind::At) {
+                    annotations.push(self.parse_at_annotation()?);
+                }
+                // The annotated statement must be a val/var declaration
+                match self.peek() {
+                    TokenKind::Val | TokenKind::Var => {
+                        let mut stmt = self.parse_let()?;
+                        match &mut stmt {
+                            Stmt::Let { annotations: anns, .. } => *anns = annotations,
+                            Stmt::LetUninit { annotations: anns, .. } => *anns = annotations,
+                            _ => return Err(format!(
+                                "Parse error: @annotations can only be applied to val/var declarations at line {}",
+                                self.peek_token().line
+                            )),
+                        }
+                        Ok(stmt)
+                    }
+                    _ => Err(format!(
+                        "Parse error at {}:{}: @annotations on statements require a val/var declaration",
+                        self.peek_token().line, self.peek_token().col
+                    )),
+                }
+            }
             TokenKind::Persist => self.parse_persist_let(),
             TokenKind::Val => self.parse_let(),
             TokenKind::Var => self.parse_let(),
@@ -1506,6 +1544,7 @@ impl Parser {
             }
             TokenKind::Match => self.parse_match_stmt(),
             TokenKind::Select => self.parse_select_stmt(),
+            TokenKind::Parallel => self.parse_parallel_stmt(),
             TokenKind::Use => self.parse_use_stmt(),
             TokenKind::Handle => self.parse_handle_stmt(),
             TokenKind::Do => self.parse_do_stmt(),
@@ -1707,6 +1746,54 @@ impl Parser {
         self.expect(TokenKind::RBrace, "}")?;
 
         Ok(Stmt::Match { expr, arms, line })
+    }
+
+    /// F13: Parse a parallel fork-join block: `parallel { | branch1 | branch2 | ... }`
+    /// Each `|` starts a new branch. Branches execute in parallel and are joined
+    /// before continuing.
+    fn parse_parallel_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.peek_token().line;
+        self.expect(TokenKind::Parallel, "parallel")?;
+        self.expect(TokenKind::LBrace, "{")?;
+
+        let mut branches: Vec<Vec<Stmt>> = Vec::new();
+
+        // Parse branches separated by `|`
+        loop {
+            // Expect `|` to start each branch (first one is required)
+            if self.peek_token().kind != TokenKind::Pipe {
+                return Err(format!(
+                    "line {}: expected '|' to start parallel branch, got '{}'",
+                    self.peek_token().line, self.peek_token().kind
+                ));
+            }
+            self.advance(); // consume `|`
+
+            // Parse statements until we hit `|` or `}`
+            let mut branch = Vec::new();
+            while self.peek_token().kind != TokenKind::Pipe
+                && self.peek_token().kind != TokenKind::RBrace
+            {
+                branch.push(self.parse_stmt()?);
+            }
+            branches.push(branch);
+
+            // If next is `}`, we're done
+            if self.peek_token().kind == TokenKind::RBrace {
+                break;
+            }
+        }
+
+        self.expect(TokenKind::RBrace, "}")?;
+
+        if branches.is_empty() {
+            return Err(format!(
+                "line {}: parallel block must have at least one branch",
+                line
+            ));
+        }
+
+        Ok(Stmt::Parallel { branches, line })
     }
 
     /// Parse a select statement: `select { case ch => x => { body } default => { body } }`
@@ -1941,14 +2028,14 @@ impl Parser {
             self.advance(); // consume ;
             // ty must be Some for uninit vars
             let ty = ty.ok_or_else(|| format!("var {} needs type annotation for uninitialized declaration at line {}", name, line))?;
-            return Ok(Stmt::LetUninit { name, ty, line });
+            return Ok(Stmt::LetUninit { name, ty, annotations: Vec::new(), line });
         }
         // Also handle `var x: i32` without semicolon (end of block etc.)
         if is_mut && !self.check(&TokenKind::Eq) {
             // No initializer — uninitialized variable
             let ty = ty.ok_or_else(|| format!("var {} needs type annotation for uninitialized declaration at line {}", name, line))?;
             self.match_tok(TokenKind::Semicolon);
-            return Ok(Stmt::LetUninit { name, ty, line });
+            return Ok(Stmt::LetUninit { name, ty, annotations: Vec::new(), line });
         }
 
         self.expect(TokenKind::Eq, "=")?;
@@ -1959,7 +2046,7 @@ impl Parser {
         // Syntax: `val name = expr; persist` or `persist val name = expr;`
         // We use the prefix form: `persist val name = expr;`
         // This is handled in parse_stmt by checking for Persist token before Val
-        Ok(Stmt::Let { name, ty, expr, is_mut, is_persist: false, line })
+        Ok(Stmt::Let { name, ty, expr, is_mut, is_persist: false, annotations: Vec::new(), line })
     }
 
     /// Parse `var name: Type;` — uninitialized mutable variable (F63: init guarantee).
@@ -1973,7 +2060,7 @@ impl Parser {
         self.expect(TokenKind::Colon, ":")?;
         let ty = self.parse_type()?;
         self.match_tok(TokenKind::Semicolon);
-        Ok(Stmt::LetUninit { name, ty, line })
+        Ok(Stmt::LetUninit { name, ty, annotations: Vec::new(), line })
     }
 
     /// Parse `persist val name = expr;` or `persist var name = expr;` — variable that survives hot reloads.
@@ -2000,7 +2087,7 @@ impl Parser {
         let expr = self.parse_expr()?;
         self.match_tok(TokenKind::Semicolon);
 
-        Ok(Stmt::Let { name, ty, expr, is_mut, is_persist: true, line })
+        Ok(Stmt::Let { name, ty, expr, is_mut, is_persist: true, annotations: Vec::new(), line })
     }
 
     fn parse_return(&mut self) -> Result<Stmt, String> {

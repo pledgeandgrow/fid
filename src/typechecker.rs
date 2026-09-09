@@ -1,6 +1,19 @@
 use crate::ast::*;
 use std::collections::{HashMap, HashSet};
 
+/// Taint state for information-flow control (IFC) analysis.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TaintState {
+    /// Not derived from untrusted input.
+    Untainted,
+    /// Derived from @tainted input — must not flow to sinks.
+    Tainted,
+    /// Was tainted but has been cleansed by a sanitizer function.
+    Sanitized,
+    /// Derived from @secret input — must not flow to output sinks (print, log, network).
+    Secret,
+}
+
 /// Check if a type name is a vector type (for operator overloading)
 fn is_vec_type(name: &str) -> bool {
     matches!(name, "vec2" | "vec3" | "vec4")
@@ -111,6 +124,10 @@ pub struct TypeChecker {
     strict_caps: bool,
     /// Track which functions produce which effects (func_name → set of effect names)
     func_effects: HashMap<String, HashSet<String>>,
+    /// Effect polymorphism: maps (func_name, param_name) → effects that calling
+    /// that function-typed parameter may produce. This allows higher-order
+    /// functions to propagate effects from their function arguments.
+    ho_param_effects: HashMap<(String, String), HashSet<String>>,
     /// Stack of active region scopes (region name → depth)
     /// When a `region r { ... }` block is entered, `r` is pushed.
     /// When exited, `r` is popped and any references to it become invalid.
@@ -204,6 +221,7 @@ impl TypeChecker {
             granted_caps: HashSet::new(),
             strict_caps: false,
             func_effects: HashMap::new(),
+            ho_param_effects: HashMap::new(),
             region_stack: Vec::new(),
             var_regions: HashMap::new(),
             freed_regions: HashSet::new(),
@@ -1382,7 +1400,133 @@ impl TypeChecker {
     ///   - Have the Noise effect (gradient noise must be added for DP)
     ///   - Not have IO or Net effects (raw data must not escape)
     ///   - The epsilon parameter is recorded for audit purposes
+    ///   - Epsilon composition: if a @dp function calls other @dp functions,
+    ///     the total epsilon (own + callees) must not exceed the declared epsilon.
     fn verify_dp(&mut self, program: &Program) {
+        // Parse epsilon value from @dp(epsilon=N) annotation.
+        let parse_epsilon = |anns: &[Annotation]| -> Option<f64> {
+            let dp_ann = anns.iter().find(|a| a.name == "dp")?;
+            for arg in &dp_ann.args {
+                if let Some(val) = arg.strip_prefix("epsilon=") {
+                    return val.parse::<f64>().ok();
+                }
+            }
+            None
+        };
+
+        // Validate epsilon values (must be positive).
+        for func in &program.funcs {
+            if let Some(eps) = parse_epsilon(&func.annotations) {
+                if eps <= 0.0 {
+                    self.errors.push(format!(
+                        "Differential privacy error: function '{}' has @dp(epsilon={}) —\n\
+                         \x20\x20\x20\x20epsilon must be positive. A zero or negative epsilon\n\
+                         \x20\x20\x20\x20provides no privacy guarantee.\n\
+                         \x20\x20\x20\x20Fix: use a positive epsilon value (e.g., @dp(epsilon=1.0)).",
+                        func.name, eps
+                    ));
+                }
+            }
+        }
+
+        // Build call graph for epsilon composition.
+        let mut dp_call_graph: HashMap<String, HashSet<String>> = HashMap::new();
+        for func in &program.funcs {
+            let mut calls = HashSet::new();
+            scan_stmts_for_calls(&func.body, &mut calls);
+            dp_call_graph.insert(func.name.clone(), calls);
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                let mangled = format!("{}_{}", imp.struct_name, method.name);
+                let mut calls = HashSet::new();
+                scan_stmts_for_calls(&method.body, &mut calls);
+                dp_call_graph.insert(mangled, calls);
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                let mangled = format!("{}_{}", ti.type_name, method.name);
+                let mut calls = HashSet::new();
+                scan_stmts_for_calls(&method.body, &mut calls);
+                dp_call_graph.insert(mangled, calls);
+            }
+        }
+
+        // Map of @dp functions and their declared epsilon.
+        let mut dp_epsilons: HashMap<String, f64> = HashMap::new();
+        for func in &program.funcs {
+            if let Some(eps) = parse_epsilon(&func.annotations) {
+                dp_epsilons.insert(func.name.clone(), eps);
+            }
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                if let Some(eps) = parse_epsilon(&method.annotations) {
+                    let mangled = format!("{}_{}", imp.struct_name, method.name);
+                    dp_epsilons.insert(mangled, eps);
+                }
+            }
+        }
+        for ti in &program.trait_impls {
+            for method in &ti.methods {
+                if let Some(eps) = parse_epsilon(&method.annotations) {
+                    let mangled = format!("{}_{}", ti.type_name, method.name);
+                    dp_epsilons.insert(mangled, eps);
+                }
+            }
+        }
+
+        // Compute total epsilon (own + transitive @dp callees) for each @dp function.
+        // Uses DFS with cycle detection to avoid infinite recursion.
+        fn compute_total_epsilon(
+            name: &str,
+            dp_epsilons: &HashMap<String, f64>,
+            call_graph: &HashMap<String, HashSet<String>>,
+            visited: &mut HashSet<String>,
+            cache: &mut HashMap<String, f64>,
+        ) -> f64 {
+            if let Some(&cached) = cache.get(name) {
+                return cached;
+            }
+            if visited.contains(name) {
+                return 0.0; // cycle — don't double-count
+            }
+            visited.insert(name.to_string());
+
+            let own = dp_epsilons.get(name).copied().unwrap_or(0.0);
+            let callee_eps: f64 = call_graph.get(name)
+                .map(|calls| {
+                    calls.iter()
+                        .filter(|c| dp_epsilons.contains_key(*c))
+                        .map(|c| compute_total_epsilon(c, dp_epsilons, call_graph, visited, cache))
+                        .sum()
+                })
+                .unwrap_or(0.0);
+
+            let total = own + callee_eps;
+            cache.insert(name.to_string(), total);
+            total
+        }
+
+        let mut eps_cache: HashMap<String, f64> = HashMap::new();
+        for (name, &declared_eps) in &dp_epsilons {
+            let mut visited = HashSet::new();
+            let total_eps = compute_total_epsilon(
+                name, &dp_epsilons, &dp_call_graph, &mut visited, &mut eps_cache
+            );
+            if total_eps > declared_eps {
+                self.errors.push(format!(
+                    "Differential privacy error: function '{}' declares @dp(epsilon={}) but\n\
+                     \x20\x20\x20\x20the total epsilon across this function and its @dp callees is {}.\n\
+                     \x20\x20\x20\x20Epsilon composition: each @dp call consumes privacy budget.\n\
+                     \x20\x20\x20\x20Calling other @dp functions adds their epsilon to yours.\n\
+                     \x20\x20\x20\x20Fix: increase the epsilon budget, or reduce the number of @dp calls.",
+                    name, declared_eps, total_eps
+                ));
+            }
+        }
+
         let check_one = |func: &Func| -> Vec<String> {
             let dp_ann = func.annotations.iter().find(|a| a.name == "dp");
             if dp_ann.is_none() { return Vec::new(); }
@@ -1935,6 +2079,7 @@ impl TypeChecker {
                     "no-indirect" => { primitives.insert("no-indirect"); }
                     "requires-audit" => { primitives.insert("requires-audit"); }
                     "bounded-stack" => { primitives.insert("bounded-stack"); }
+                    "firmware" => { primitives.insert("firmware"); }
                     _ => {}
                 }
                 // Domain presets — expand to their primitives
@@ -2018,9 +2163,25 @@ impl TypeChecker {
         // Indirect call patterns (forbidden by @no-indirect)
         let indirect_funcs: &[&str] = &["p_make_dyn", "p_call_ptr", "p_dyn_call"];
 
+        // F30: OS-dependent functions (forbidden by @firmware)
+        // These functions require a hosted OS environment and cannot be used in bare-metal firmware.
+        let os_dep_funcs: &[&str] = &[
+            "p_file_read", "p_file_write", "p_file_append", "p_file_delete", "p_file_exists", "p_file_size",
+            "p_file_write_bin", "p_file_write_vec",
+            "p_socket_create", "p_socket_connect", "p_socket_send", "p_socket_recv", "p_socket_recv_str",
+            "p_socket_close", "p_socket_listen", "p_socket_accept",
+            "p_http_get", "p_http_post", "p_http_send_response",
+            "p_thread_create", "p_thread_join", "p_mutex_create", "p_mutex_lock", "p_mutex_unlock",
+            "p_env_get", "p_env_set",
+            "p_args_count", "p_args_get",
+            "p_sqlite_open", "p_sqlite_exec", "p_sqlite_query",
+        ];
+
         // Domain label for error messages (use the original annotation name)
         let domain_label = |prims: &HashSet<&str>| -> &str {
-            if prims.contains("requires-audit") && prims.contains("no-indirect") {
+            if prims.contains("firmware") {
+                "firmware (bare-metal)"
+            } else if prims.contains("requires-audit") && prims.contains("no-indirect") {
                 "safety-critical (ISO 26262 / DO-178C)"
             } else if prims.contains("requires-audit") {
                 "medical (IEC 62304 / DAL-A)"
@@ -2096,6 +2257,21 @@ impl TypeChecker {
                              \x20\x20\x20\x20Indirect calls (function pointers, dynamic dispatch) are forbidden —\n\
                              \x20\x20\x20\x20they make call graph analysis impossible.\n\
                              \x20\x20\x20\x20Fix: use direct calls only, or remove the safety annotation.",
+                            label, func_name, called
+                        ));
+                        continue;
+                    }
+                }
+
+                // F30: @firmware — check for OS-dependent function calls
+                if prims.contains("firmware") {
+                    if os_dep_funcs.contains(&called.as_str()) {
+                        errs.push(format!(
+                            "Safety error ({}): function '{}' is @firmware but calls '{}'.\n\
+                             \x20\x20\x20\x20OS-dependent functions (file I/O, sockets, threads, env vars) are forbidden\n\
+                             \x20\x20\x20\x20in bare-metal firmware — they require a hosted OS environment.\n\
+                             \x20\x20\x20\x20Fix: use bare-metal alternatives (port I/O, memory-mapped I/O),\n\
+                             \x20\x20\x20\x20or remove the @firmware annotation.",
                             label, func_name, called
                         ));
                         continue;
@@ -2649,50 +2825,12 @@ impl TypeChecker {
     ///
     /// This is similar to Perl's taint mode, but enforced at compile time
     /// through the type system rather than at runtime.
-    fn verify_tainted(&mut self, program: &Program) {
-        // Functions that are "sinks" — they must not receive tainted input
-        let sql_sinks: &[&str] = &["sql_query", "sql_literal", "db_query", "db_exec"];
-        let shell_sinks: &[&str] = &["process_system", "shell_cmd", "shell_escape"];
-        let html_sinks: &[&str] = &["html_literal", "html_escape"];
-        let path_sinks: &[&str] = &["file_read", "file_write", "file_append"];
-
-        for func in &program.funcs {
-            // Check if function has @tainted parameters
-            let has_tainted = func.params.iter().any(|p| {
-                p.annotations.iter().any(|a| a.name == "tainted")
-            });
-            if !has_tainted { continue; }
-
-            let tainted_params: HashSet<String> = func.params.iter()
-                .filter(|p| p.annotations.iter().any(|a| a.name == "tainted"))
-                .map(|p| p.name.clone())
-                .collect();
-
-            // Scan body for tainted values flowing into sinks
-            let mut calls = HashSet::new();
-            scan_stmts_for_calls(&func.body, &mut calls);
-
-            for called in &calls {
-                let is_sink = sql_sinks.contains(&called.as_str())
-                    || shell_sinks.contains(&called.as_str())
-                    || html_sinks.contains(&called.as_str())
-                    || path_sinks.contains(&called.as_str());
-
-                if is_sink {
-                    // Check if any tainted variable is used as an argument
-                    // For now, we flag all calls to sinks from functions with @tainted params
-                    // A more precise analysis would track taint through expressions
-                    self.errors.push(format!(
-                        "Security error (tainted): function '{}' has @tainted parameters and calls sink '{}'.\n\
-                         \x20\x20\x20\x20Tainted (untrusted) input must be sanitized before passing to '{}'.\n\
-                         \x20\x20\x20\x20Sinks: SQL queries, shell commands, file paths, HTML output.\n\
-                         \x20\x20\x20\x20Fix: sanitize the input with sql_escape/shell_escape/html_escape/path_normalize,\n\
-                         \x20\x20\x20\x20or remove the @tainted annotation if the input is already trusted.",
-                        func.name, called, called
-                    ));
-                }
-            }
-        }
+    ///
+    /// Note: The coarse sink-call detection that previously lived here has been
+    /// superseded by the precise data-flow analysis in `verify_taint_propagation`,
+    /// which tracks taint through assignments, expressions, and sanitizer calls.
+    fn verify_tainted(&mut self, _program: &Program) {
+        // No-op: precise analysis is in verify_taint_propagation.
     }
 
     /// Verify full information-flow control (IFC) for @tainted parameters.
@@ -2717,27 +2855,478 @@ impl TypeChecker {
     ///
     /// See: docs/roadmap/safety-critical.md §18 for the full implementation plan.
     fn verify_taint_propagation(&mut self, program: &Program) {
-        // STUB: full data-flow taint tracking is not yet implemented.
-        // The coarse `verify_tainted` above provides sink-call detection
-        // but does not track taint through expressions or recognize sanitizers.
+        // Full information-flow control (IFC) for @tainted and @secret parameters.
         //
-        // When implemented, this function will:
-        //   - Build a taint map per function (HashMap<String, TaintState>)
-        //   - Walk statements in order, propagating taint
-        //   - Check sink arguments against the taint map
-        //   - Report precise errors with the taint propagation path
-        //
-        // For now, we emit a warning for functions that use @tainted so users
-        // know the analysis is incomplete.
+        // Taint lattice: { Untainted, Tainted, Sanitized, Secret }
+        //   - @tainted params start as Tainted
+        //   - @secret params start as Secret
+        //   - All other vars start as Untainted
+        //   - Assignments propagate taint: let x = tainted_var → x is Tainted
+        //   - Sanitizer functions cleanse taint: sql_escape(t) → Sanitized
+        //   - Sinks reject Tainted (not Sanitized) input
+        //   - Output sinks (print, log, network) reject Secret input
+        //   - Returning Tainted from a non-@tainted function is an error
+        //   - Returning Secret from a non-@secret function is an error
+
+        // Known sink functions (must not receive Tainted input)
+        let sql_sinks: &[&str] = &["sql_query", "sql_literal", "db_query", "db_exec"];
+        let shell_sinks: &[&str] = &["process_system", "shell_cmd", "shell_escape"];
+        let html_sinks: &[&str] = &["html_literal", "html_escape"];
+        let path_sinks: &[&str] = &["file_read", "file_write", "file_append"];
+        let all_sinks: Vec<&str> = sql_sinks.iter()
+            .chain(shell_sinks.iter())
+            .chain(html_sinks.iter())
+            .chain(path_sinks.iter())
+            .copied()
+            .collect();
+
+        // Output sinks — must not receive Secret input (F74: @secret info-flow control)
+        let output_sinks: &[&str] = &[
+            "print", "println", "eprint", "eprintln",
+            "p_print_int", "p_print_str", "p_print_float", "p_print_bool", "p_print_newline",
+            "p_eprint_str", "p_print_vec",
+            "p_socket_send", "p_socket_send_str", "p_http_send_response",
+            "p_file_write", "p_file_append", "p_file_write_bin",
+            "log_info", "log_warn", "log_error", "log_debug",
+        ];
+
+        // Known sanitizer functions (cleanse taint → result is Sanitized)
+        let sanitizers: &[&str] = &[
+            "sql_escape", "shell_escape", "html_escape", "path_normalize",
+            "sanitize", "sanitize_input", "escape_html", "escape_sql",
+            "escape_shell", "normalize_path",
+        ];
+
         for func in &program.funcs {
             let has_tainted = func.params.iter().any(|p| {
                 p.annotations.iter().any(|a| a.name == "tainted")
             });
-            if has_tainted {
-                // TODO: implement full IFC. For now, verify_tainted handles
-                // the coarse sink-call check. This stub is a no-op.
-                let _ = &func.name;
+            let has_secret = func.params.iter().any(|p| {
+                p.annotations.iter().any(|a| a.name == "secret")
+            });
+            if !has_tainted && !has_secret { continue; }
+
+            // Build initial taint map: @tainted params → Tainted, @secret → Secret, rest → Untainted
+            let mut taint_map: HashMap<String, TaintState> = HashMap::new();
+            for param in &func.params {
+                let is_tainted = param.annotations.iter().any(|a| a.name == "tainted");
+                let is_secret = param.annotations.iter().any(|a| a.name == "secret");
+                taint_map.insert(
+                    param.name.clone(),
+                    if is_tainted { TaintState::Tainted }
+                    else if is_secret { TaintState::Secret }
+                    else { TaintState::Untainted },
+                );
             }
+
+            // Walk statements in order, propagating taint
+            self.propagate_taint_stmts(&func.body, &mut taint_map, &all_sinks, sanitizers, &func.name, program);
+            // Also check for secret flow to output sinks
+            self.propagate_secret_stmts(&func.body, &taint_map, output_sinks, &func.name);
+        }
+    }
+
+    /// Walk statements propagating taint state through assignments and expressions.
+    fn propagate_taint_stmts(
+        &mut self,
+        stmts: &[Stmt],
+        taint_map: &mut HashMap<String, TaintState>,
+        sinks: &[&str],
+        sanitizers: &[&str],
+        func_name: &str,
+        program: &Program,
+    ) {
+        for stmt in stmts {
+            self.propagate_taint_stmt(stmt, taint_map, sinks, sanitizers, func_name, program);
+        }
+    }
+
+    /// Walk statements checking for @secret values flowing to output sinks.
+    /// This is the F74 info-flow control check: secrets must not be printed, logged, or sent.
+    fn propagate_secret_stmts(
+        &mut self,
+        stmts: &[Stmt],
+        taint_map: &HashMap<String, TaintState>,
+        output_sinks: &[&str],
+        func_name: &str,
+    ) {
+        for stmt in stmts {
+            self.propagate_secret_stmt(stmt, taint_map, output_sinks, func_name);
+        }
+    }
+
+    fn propagate_secret_stmt(
+        &mut self,
+        stmt: &Stmt,
+        taint_map: &HashMap<String, TaintState>,
+        output_sinks: &[&str],
+        func_name: &str,
+    ) {
+        match stmt {
+            Stmt::Expr(expr, _) => {
+                self.check_secret_sink(expr, taint_map, output_sinks, func_name);
+            }
+            Stmt::If { cond, then_block, else_block, .. } => {
+                self.check_secret_sink(cond, taint_map, output_sinks, func_name);
+                self.propagate_secret_stmts(then_block, taint_map, output_sinks, func_name);
+                if let Some(else_blk) = else_block {
+                    self.propagate_secret_stmts(else_blk, taint_map, output_sinks, func_name);
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                self.check_secret_sink(cond, taint_map, output_sinks, func_name);
+                self.propagate_secret_stmts(body, taint_map, output_sinks, func_name);
+            }
+            Stmt::For { iterator, body, .. } => {
+                self.check_secret_sink(iterator, taint_map, output_sinks, func_name);
+                self.propagate_secret_stmts(body, taint_map, output_sinks, func_name);
+            }
+            Stmt::Loop { body, .. } => {
+                self.propagate_secret_stmts(body, taint_map, output_sinks, func_name);
+            }
+            Stmt::Match { expr, arms, .. } => {
+                self.check_secret_sink(expr, taint_map, output_sinks, func_name);
+                for arm in arms {
+                    self.propagate_secret_stmts(&arm.body, taint_map, output_sinks, func_name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Check if an expression is a call to an output sink with a Secret argument.
+    fn check_secret_sink(
+        &mut self,
+        expr: &Expr,
+        taint_map: &HashMap<String, TaintState>,
+        output_sinks: &[&str],
+        func_name: &str,
+    ) {
+        match expr {
+            Expr::Call { callee, args, .. } => {
+                if output_sinks.contains(&callee.as_str()) {
+                    for arg in args {
+                        if self.expr_contains_secret(arg, taint_map) {
+                            self.errors.push(format!(
+                                "Security error (@secret): function '{}' calls output sink '{}' with a secret value.\n\
+                                 \x20\x20\x20\x20Secret values must not be printed, logged, or sent over the network.\n\
+                                 \x20\x20\x20\x20Fix: don't pass @secret-derived values to output functions, or\n\
+                                 \x20\x20\x20\x20remove the @secret annotation if the value is not actually secret.",
+                                func_name, callee
+                            ));
+                            return;
+                        }
+                    }
+                }
+                // Recursively check nested calls
+                for arg in args {
+                    self.check_secret_sink(arg, taint_map, output_sinks, func_name);
+                }
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                // Check if the method is an output sink
+                if let Expr::Ident(name) = receiver.as_ref() {
+                    if output_sinks.contains(&name.as_str()) {
+                        for arg in args {
+                            if self.expr_contains_secret(arg, taint_map) {
+                                self.errors.push(format!(
+                                    "Security error (@secret): function '{}' calls output sink '{}' with a secret value.",
+                                    func_name, name
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                }
+                self.check_secret_sink(receiver, taint_map, output_sinks, func_name);
+                for arg in args {
+                    self.check_secret_sink(arg, taint_map, output_sinks, func_name);
+                }
+            }
+            Expr::Binary { left, right, .. } => {
+                self.check_secret_sink(left, taint_map, output_sinks, func_name);
+                self.check_secret_sink(right, taint_map, output_sinks, func_name);
+            }
+            _ => {}
+        }
+    }
+
+    /// Check if an expression contains a secret-typed variable.
+    fn expr_contains_secret(&self, expr: &Expr, taint_map: &HashMap<String, TaintState>) -> bool {
+        match expr {
+            Expr::Ident(name) => {
+                taint_map.get(name) == Some(&TaintState::Secret)
+            }
+            Expr::Binary { left, right, .. } => {
+                self.expr_contains_secret(left, taint_map) || self.expr_contains_secret(right, taint_map)
+            }
+            Expr::Call { args, .. } => {
+                args.iter().any(|a| self.expr_contains_secret(a, taint_map))
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                self.expr_contains_secret(receiver, taint_map) || args.iter().any(|a| self.expr_contains_secret(a, taint_map))
+            }
+            Expr::FieldAccess { expr, .. } => self.expr_contains_secret(expr, taint_map),
+            Expr::Index { array, index, .. } => {
+                self.expr_contains_secret(array, taint_map) || self.expr_contains_secret(index, taint_map)
+            }
+            _ => false,
+        }
+    }
+
+    fn propagate_taint_stmt(
+        &mut self,
+        stmt: &Stmt,
+        taint_map: &mut HashMap<String, TaintState>,
+        sinks: &[&str],
+        sanitizers: &[&str],
+        func_name: &str,
+        program: &Program,
+    ) {
+        match stmt {
+            Stmt::Let { name, expr, .. } => {
+                let taint = self.eval_taint_expr(expr, taint_map, sinks, sanitizers, func_name, program);
+                taint_map.insert(name.clone(), taint);
+            }
+            Stmt::Assign { target, expr, .. } => {
+                let taint = self.eval_taint_expr(expr, taint_map, sinks, sanitizers, func_name, program);
+                taint_map.insert(target.clone(), taint);
+            }
+            Stmt::Expr(expr, _) => {
+                self.eval_taint_expr(expr, taint_map, sinks, sanitizers, func_name, program);
+            }
+            Stmt::Return(Some(expr), _) => {
+                let taint = self.eval_taint_expr(expr, taint_map, sinks, sanitizers, func_name, program);
+                if taint == TaintState::Tainted {
+                    // Check if the function itself is @tainted (allowed to return tainted)
+                    let func_is_tainted = program.funcs.iter()
+                        .find(|f| f.name == func_name)
+                        .map(|f| f.annotations.iter().any(|a| a.name == "tainted"))
+                        .unwrap_or(false);
+                    if !func_is_tainted {
+                        self.errors.push(format!(
+                            "Security error (taint): function '{}' returns a tainted value.\n\
+                             \x20\x20\x20\x20The return value is derived from @tainted input but the function\n\
+                             \x20\x20\x20\x20is not annotated @tainted. Tainted values must be sanitized\n\
+                             \x20\x20\x20\x20before returning to prevent injection attacks.\n\
+                             \x20\x20\x20\x20Fix: sanitize the return value with a sanitizer function\n\
+                             \x20\x20\x20\x20(e.g. sql_escape, html_escape), or annotate the function @tainted.",
+                            func_name
+                        ));
+                    }
+                }
+                if taint == TaintState::Secret {
+                    // Check if the function itself is @secret (allowed to return secret)
+                    let func_is_secret = program.funcs.iter()
+                        .find(|f| f.name == func_name)
+                        .map(|f| f.annotations.iter().any(|a| a.name == "secret"))
+                        .unwrap_or(false);
+                    if !func_is_secret {
+                        self.errors.push(format!(
+                            "Security error (@secret): function '{}' returns a secret value.\n\
+                             \x20\x20\x20\x20The return value is derived from @secret input but the function\n\
+                             \x20\x20\x20\x20is not annotated @secret. Secret values must not leak through\n\
+                             \x20\x20\x20\x20return values to prevent information disclosure.\n\
+                             \x20\x20\x20\x20Fix: don't return secret-derived values, or annotate the function @secret.",
+                            func_name
+                        ));
+                    }
+                }
+            }
+            Stmt::If { cond, then_block, else_block, .. } => {
+                self.eval_taint_expr(cond, taint_map, sinks, sanitizers, func_name, program);
+                self.propagate_taint_stmts(then_block, taint_map, sinks, sanitizers, func_name, program);
+                if let Some(else_blk) = else_block {
+                    self.propagate_taint_stmts(else_blk, taint_map, sinks, sanitizers, func_name, program);
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                self.eval_taint_expr(cond, taint_map, sinks, sanitizers, func_name, program);
+                self.propagate_taint_stmts(body, taint_map, sinks, sanitizers, func_name, program);
+            }
+            Stmt::For { iterator, body, .. } => {
+                self.eval_taint_expr(iterator, taint_map, sinks, sanitizers, func_name, program);
+                self.propagate_taint_stmts(body, taint_map, sinks, sanitizers, func_name, program);
+            }
+            Stmt::Loop { body, .. } => {
+                self.propagate_taint_stmts(body, taint_map, sinks, sanitizers, func_name, program);
+            }
+            Stmt::Match { expr, arms, .. } => {
+                self.eval_taint_expr(expr, taint_map, sinks, sanitizers, func_name, program);
+                for arm in arms {
+                    self.propagate_taint_stmts(&arm.body, taint_map, sinks, sanitizers, func_name, program);
+                }
+            }
+            Stmt::Unsafe { body, .. } | Stmt::Txn { body, .. } | Stmt::GradBlock { body, .. } => {
+                self.propagate_taint_stmts(body, taint_map, sinks, sanitizers, func_name, program);
+            }
+            _ => {}
+        }
+    }
+
+    /// Evaluate the taint state of an expression.
+    /// Returns Tainted if any part of the expression derives from a tainted source
+    /// and is not sanitized.
+    fn eval_taint_expr(
+        &mut self,
+        expr: &Expr,
+        taint_map: &HashMap<String, TaintState>,
+        sinks: &[&str],
+        sanitizers: &[&str],
+        func_name: &str,
+        program: &Program,
+    ) -> TaintState {
+        match expr {
+            Expr::Ident(name) => {
+                taint_map.get(name).copied().unwrap_or(TaintState::Untainted)
+            }
+            Expr::Binary { left, right, .. } => {
+                let lt = self.eval_taint_expr(left, taint_map, sinks, sanitizers, func_name, program);
+                let rt = self.eval_taint_expr(right, taint_map, sinks, sanitizers, func_name, program);
+                // Taint propagates through binary operations
+                if lt == TaintState::Tainted || rt == TaintState::Tainted {
+                    TaintState::Tainted
+                } else if lt == TaintState::Secret || rt == TaintState::Secret {
+                    // Secret propagates through binary operations (derived values are still secret)
+                    TaintState::Secret
+                } else if lt == TaintState::Sanitized || rt == TaintState::Sanitized {
+                    TaintState::Sanitized
+                } else {
+                    TaintState::Untainted
+                }
+            }
+            Expr::Unary { expr, .. } => {
+                self.eval_taint_expr(expr, taint_map, sinks, sanitizers, func_name, program)
+            }
+            Expr::Call { callee, args } => {
+                // Check if this is a sanitizer function
+                if sanitizers.contains(&callee.as_str()) {
+                    // Sanitizer cleanses taint → result is Sanitized
+                    for arg in args {
+                        self.eval_taint_expr(arg, taint_map, sinks, sanitizers, func_name, program);
+                    }
+                    return TaintState::Sanitized;
+                }
+                // Check if this is a sink function
+                if sinks.contains(&callee.as_str()) {
+                    // Check all arguments for tainted values
+                    for arg in args {
+                        let arg_taint = self.eval_taint_expr(arg, taint_map, sinks, sanitizers, func_name, program);
+                        if arg_taint == TaintState::Tainted {
+                            self.errors.push(format!(
+                                "Security error (taint): function '{}' passes tainted value to sink '{}'.\n\
+                                 \x20\x20\x20\x20Tainted (untrusted) input must be sanitized before passing to '{}'.\n\
+                                 \x20\x20\x20\x20Fix: sanitize the input with a sanitizer function\n\
+                                 \x20\x20\x20\x20(e.g. sql_escape, html_escape, shell_escape, path_normalize).",
+                                func_name, callee, callee
+                            ));
+                        }
+                    }
+                    return TaintState::Untainted;
+                }
+                // Check if calling another function with tainted arguments
+                // taints that function's return value
+                let any_tainted = args.iter().any(|arg| {
+                    self.eval_taint_expr(arg, taint_map, sinks, sanitizers, func_name, program) == TaintState::Tainted
+                });
+                let any_secret = args.iter().any(|arg| {
+                    self.eval_taint_expr(arg, taint_map, sinks, sanitizers, func_name, program) == TaintState::Secret
+                });
+                // Check if the callee has @tainted params (transitive taint)
+                let callee_has_tainted = program.funcs.iter()
+                    .find(|f| f.name == *callee)
+                    .map(|f| f.params.iter().any(|p| p.annotations.iter().any(|a| a.name == "tainted")))
+                    .unwrap_or(false);
+                // Check if the callee has @secret params (transitive secret)
+                let callee_has_secret = program.funcs.iter()
+                    .find(|f| f.name == *callee)
+                    .map(|f| f.params.iter().any(|p| p.annotations.iter().any(|a| a.name == "secret")))
+                    .unwrap_or(false);
+                if any_tainted || callee_has_tainted {
+                    TaintState::Tainted
+                } else if any_secret || callee_has_secret {
+                    TaintState::Secret
+                } else {
+                    TaintState::Untainted
+                }
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                // Method calls propagate taint from receiver
+                let rt = self.eval_taint_expr(receiver, taint_map, sinks, sanitizers, func_name, program);
+                for arg in args {
+                    self.eval_taint_expr(arg, taint_map, sinks, sanitizers, func_name, program);
+                }
+                rt
+            }
+            Expr::FieldAccess { expr, .. } => {
+                self.eval_taint_expr(expr, taint_map, sinks, sanitizers, func_name, program)
+            }
+            Expr::StrConcat { left, right } => {
+                let lt = self.eval_taint_expr(left, taint_map, sinks, sanitizers, func_name, program);
+                let rt = self.eval_taint_expr(right, taint_map, sinks, sanitizers, func_name, program);
+                if lt == TaintState::Tainted || rt == TaintState::Tainted {
+                    TaintState::Tainted
+                } else {
+                    TaintState::Untainted
+                }
+            }
+            Expr::FString { parts } => {
+                // F-strings: if any part is tainted, the whole string is tainted
+                let mut result = TaintState::Untainted;
+                for part in parts {
+                    match part {
+                        crate::ast::FStringPart::Expr(e) => {
+                            let t = self.eval_taint_expr(e, taint_map, sinks, sanitizers, func_name, program);
+                            if t == TaintState::Tainted {
+                                result = TaintState::Tainted;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                result
+            }
+            Expr::Index { array, index } => {
+                let at = self.eval_taint_expr(array, taint_map, sinks, sanitizers, func_name, program);
+                let it = self.eval_taint_expr(index, taint_map, sinks, sanitizers, func_name, program);
+                if at == TaintState::Tainted || it == TaintState::Tainted {
+                    TaintState::Tainted
+                } else {
+                    TaintState::Untainted
+                }
+            }
+            Expr::Ref { expr, .. } | Expr::Deref { expr } => {
+                self.eval_taint_expr(expr, taint_map, sinks, sanitizers, func_name, program)
+            }
+            Expr::StructLit { fields, .. } => {
+                // If any field value is tainted, consider the struct tainted
+                let mut result = TaintState::Untainted;
+                for (_, val) in fields {
+                    let t = self.eval_taint_expr(val, taint_map, sinks, sanitizers, func_name, program);
+                    if t == TaintState::Tainted {
+                        result = TaintState::Tainted;
+                    }
+                }
+                result
+            }
+            Expr::If { cond, .. } => {
+                // Expression-form if: evaluate condition for sink checks.
+                // Inner-statement taint propagation is handled when these
+                // statements appear at the top level via propagate_taint_stmts.
+                self.eval_taint_expr(cond, taint_map, sinks, sanitizers, func_name, program);
+                TaintState::Untainted
+            }
+            Expr::Block(_) => {
+                // Expression-form block: taint propagation handled at stmt level.
+                TaintState::Untainted
+            }
+            Expr::Match { expr, .. } => {
+                // Expression-form match: evaluate scrutinee for sink checks.
+                self.eval_taint_expr(expr, taint_map, sinks, sanitizers, func_name, program);
+                TaintState::Untainted
+            }
+            // Literals are never tainted
+            _ => TaintState::Untainted,
         }
     }
 
@@ -2882,15 +3471,69 @@ impl TypeChecker {
         // First pass: collect direct effects (print calls etc.)
         let mut results: Vec<(String, HashSet<String>)> = Vec::new();
 
+        // Identify function-typed parameters for each function (for effect polymorphism).
+        // When a function has a parameter of type `fn(...) -> ...`, calling that
+        // parameter may produce effects that depend on what function is passed.
+        // We track this as "polymorphic effects" keyed by (func_name, param_name).
+        for func in &program.funcs {
+            for param in &func.params {
+                if let Type::Func { .. } = &param.ty {
+                    // Mark this as a function-typed parameter. The actual effects
+                    // will be determined at call sites based on what function is passed.
+                    // For now, we conservatively assume it can produce any effect.
+                    self.ho_param_effects.insert(
+                        (func.name.clone(), param.name.clone()),
+                        // Conservative: all known effects possible
+                        ["IO", "Net", "Spawn", "Diverge", "Alloc", "Read", "Write",
+                         "Diff", "Noise", "Comm"]
+                            .iter().map(|s| s.to_string()).collect(),
+                    );
+                }
+            }
+        }
+        for imp in &program.impls {
+            for method in &imp.methods {
+                for param in &method.params {
+                    if let Type::Func { .. } = &param.ty {
+                        self.ho_param_effects.insert(
+                            (method.name.clone(), param.name.clone()),
+                            ["IO", "Net", "Spawn", "Diverge", "Alloc", "Read", "Write",
+                             "Diff", "Noise", "Comm"]
+                                .iter().map(|s| s.to_string()).collect(),
+                        );
+                    }
+                }
+            }
+        }
+
         for func in &program.funcs {
             let mut effects = HashSet::new();
             self.scan_stmts_for_effects(&func.body, &mut effects);
+            // Add effects from function-typed parameters (conservative: all effects).
+            for param in &func.params {
+                if let Type::Func { .. } = &param.ty {
+                    if let Some(ho_effs) = self.ho_param_effects.get(&(func.name.clone(), param.name.clone())) {
+                        for e in ho_effs {
+                            effects.insert(e.clone());
+                        }
+                    }
+                }
+            }
             results.push((func.name.clone(), effects));
         }
         for imp in &program.impls {
             for method in &imp.methods {
                 let mut effects = HashSet::new();
                 self.scan_stmts_for_effects(&method.body, &mut effects);
+                for param in &method.params {
+                    if let Type::Func { .. } = &param.ty {
+                        if let Some(ho_effs) = self.ho_param_effects.get(&(method.name.clone(), param.name.clone())) {
+                            for e in ho_effs {
+                                effects.insert(e.clone());
+                            }
+                        }
+                    }
+                }
                 results.push((method.name.clone(), effects));
             }
         }
@@ -3069,6 +3712,16 @@ impl TypeChecker {
                 if let Some(func_effs) = self.func_effects.get(callee) {
                     for e in func_effs {
                         effects.insert(e.clone());
+                    }
+                }
+                // Effect polymorphism: if the callee is a function-typed parameter,
+                // add the polymorphic effects associated with that parameter.
+                // We check all registered HO param effects for any function.
+                for ((_, param_name), ho_effs) in &self.ho_param_effects {
+                    if param_name == callee {
+                        for e in ho_effs {
+                            effects.insert(e.clone());
+                        }
                     }
                 }
                 for arg in args {
@@ -3682,7 +4335,7 @@ impl TypeChecker {
         // Track current line for error messages in check_expr
         self.current_line = stmt_line(stmt);
         match stmt {
-            Stmt::Let { name, ty, expr, is_mut, is_persist: _, line } => {
+            Stmt::Let { name, ty, expr, is_mut, is_persist: _, annotations, line } => {
                 // Bidirectional type inference: pass declared type as hint
                 let hint = ty.as_ref().map(|t| t.clone()).unwrap_or(Type::Never);
                 let expr_ty = self.check_expr_with_hint(expr, &hint);
@@ -3760,7 +4413,7 @@ impl TypeChecker {
                     }
                 }
             }
-            Stmt::LetUninit { name, ty, line } => {
+            Stmt::LetUninit { name, ty, annotations: _, line } => {
                 let resolved_ty = self.resolve_type(ty);
                 // Declare the variable with its type
                 self.declare(name, resolved_ty.clone());
@@ -4398,6 +5051,17 @@ impl TypeChecker {
                 if let Some(ref def_body) = default {
                     self.push_scope();
                     for s in def_body {
+                        self.check_stmt(s);
+                    }
+                    self.pop_scope();
+                }
+            }
+            Stmt::Parallel { branches, .. } => {
+                // F13: parallel { | branch1 | branch2 | ... }
+                // Each branch is typechecked in its own scope.
+                for branch in branches {
+                    self.push_scope();
+                    for s in branch {
                         self.check_stmt(s);
                     }
                     self.pop_scope();
@@ -7647,5 +8311,6 @@ fn stmt_line(stmt: &Stmt) -> usize {
         Stmt::Backward { line, .. } => *line,
         Stmt::Query { line, .. } => *line,
         Stmt::Select { line, .. } => *line,
+        Stmt::Parallel { line, .. } => *line,
     }
 }

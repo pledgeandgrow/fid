@@ -709,6 +709,168 @@ pub fn compute_live_intervals(func: &L3Function) -> Vec<LiveInterval> {
         bi = bi + 1;
     }
 
+    // -- Block-local liveness refinement --
+    // Backward dataflow to compute per-block live_in/live_out sets, then
+    // shrink each VReg's interval to only cover blocks where it's live.
+    // This produces more precise intervals -> fewer spills, better code.
+
+    // Build block index map: block_id -> index in func.blocks.
+    var block_idx_ids: Vec<i64> = Vec::new();
+    var block_idx_vals: Vec<i64> = Vec::new();
+    var bii: i64 = 0;
+    while bii < func.blocks.len() {
+        block_idx_ids.push(func.blocks.get(bii).id);
+        block_idx_vals.push(bii);
+        bii = bii + 1;
+    }
+
+    // Compute per-block use/def sets (as Vec<i64> of vreg IDs).
+    var block_uses: Vec<Vec<i64> > = Vec::new();
+    var block_defs: Vec<Vec<i64> > = Vec::new();
+    bi = 0;
+    while bi < func.blocks.len() {
+        var block: L3Block = func.blocks.get(bi);
+        var uses: Vec<i64> = Vec::new();
+        var defs: Vec<i64> = Vec::new();
+        // Block params are defs.
+        var pai: i64 = 0;
+        while pai < block.params.len() {
+            defs.push(block.params.get(pai).vreg.id);
+            pai = pai + 1;
+        }
+        var ii: i64 = 0;
+        while ii < block.instructions.len() {
+            var inst: L3Inst = block.instructions.get(ii);
+            var inst_uses_vec: Vec<i64> = inst_uses(inst);
+            var ui: i64 = 0;
+            while ui < inst_uses_vec.len() {
+                var vreg_id: i64 = inst_uses_vec.get(ui);
+                if !vec_contains_i64(defs, vreg_id) {
+                    if !vec_contains_i64(uses, vreg_id) {
+                        uses.push(vreg_id);
+                    }
+                }
+                ui = ui + 1;
+            }
+            var dst_opt: OptVReg = inst_def(inst);
+            match dst_opt {
+                OptVReg::Some(dst) => {
+                    if !vec_contains_i64(defs, dst.id) {
+                        defs.push(dst.id);
+                    }
+                }
+                OptVReg::None => {}
+            }
+            ii = ii + 1;
+        }
+        block_uses.push(uses);
+        block_defs.push(defs);
+        bi = bi + 1;
+    }
+
+    // Compute successors for each block.
+    var successors: Vec<Vec<i64> > = Vec::new();
+    bi = 0;
+    while bi < func.blocks.len() {
+        successors.push(block_targets(func.blocks.get(bi)));
+        bi = bi + 1;
+    }
+
+    // Backward dataflow: live_out[B] = union of live_in[S] for all successors S.
+    // live_in[B] = use[B] + (live_out[B] - def[B]).
+    var live_in: Vec<Vec<i64> > = Vec::new();
+    var live_out: Vec<Vec<i64> > = Vec::new();
+    bi = 0;
+    while bi < func.blocks.len() {
+        live_in.push(Vec::new());
+        live_out.push(Vec::new());
+        bi = bi + 1;
+    }
+
+    var df_changed: bool = true;
+    while df_changed {
+        df_changed = false;
+        bi = func.blocks.len() - 1;
+        while bi >= 0 {
+            // Compute new live_out = union of live_in of all successors.
+            var new_out: Vec<i64> = Vec::new();
+            var si: i64 = 0;
+            while si < successors.get(bi).len() {
+                var succ_id: i64 = successors.get(bi).get(si);
+                var succ_idx: i64 = vec_find_i64(block_idx_ids, succ_id);
+                if succ_idx >= 0 {
+                    var succ_live_in: Vec<i64> = live_in.get(succ_idx);
+                    var sli: i64 = 0;
+                    while sli < succ_live_in.len() {
+                        if !vec_contains_i64(new_out, succ_live_in.get(sli)) {
+                            new_out.push(succ_live_in.get(sli));
+                        }
+                        sli = sli + 1;
+                    }
+                }
+                si = si + 1;
+            }
+            // Compute new live_in = use[B] + (live_out[B] - def[B]).
+            var new_in: Vec<i64> = Vec::new();
+            var ui: i64 = 0;
+            while ui < block_uses.get(bi).len() {
+                if !vec_contains_i64(new_in, block_uses.get(bi).get(ui)) {
+                    new_in.push(block_uses.get(bi).get(ui));
+                }
+                ui = ui + 1;
+            }
+            var oi: i64 = 0;
+            while oi < new_out.len() {
+                var vreg_id: i64 = new_out.get(oi);
+                if !vec_contains_i64(block_defs.get(bi), vreg_id) {
+                    if !vec_contains_i64(new_in, vreg_id) {
+                        new_in.push(vreg_id);
+                    }
+                }
+                oi = oi + 1;
+            }
+            // Check for change.
+            if !vec_i64_eq(live_in.get(bi), new_in) || !vec_i64_eq(live_out.get(bi), new_out) {
+                live_in.set(bi, new_in);
+                live_out.set(bi, new_out);
+                df_changed = true;
+            }
+            bi = bi - 1;
+        }
+    }
+
+    // Refine intervals: extend end positions based on liveness.
+    bi = 0;
+    while bi < func.blocks.len() {
+        var block_start_pos: i64 = block_starts.get(bi);
+        var block_end_pos: i64 = block_ends.get(bi);
+        // VRegs live_in to this block: interval should cover block_start.
+        var li: i64 = 0;
+        while li < live_in.get(bi).len() {
+            var vreg_id: i64 = live_in.get(bi).get(li);
+            var int_idx: i64 = vec_find_i64(interval_ids, vreg_id);
+            if int_idx >= 0 {
+                if interval_ends.get(int_idx) < block_start_pos {
+                    interval_ends.set(int_idx, block_start_pos);
+                }
+            }
+            li = li + 1;
+        }
+        // VRegs live_out of this block: interval should cover block_end.
+        var lo: i64 = 0;
+        while lo < live_out.get(bi).len() {
+            var vreg_id: i64 = live_out.get(bi).get(lo);
+            var int_idx: i64 = vec_find_i64(interval_ids, vreg_id);
+            if int_idx >= 0 {
+                if interval_ends.get(int_idx) < block_end_pos {
+                    interval_ends.set(int_idx, block_end_pos);
+                }
+            }
+            lo = lo + 1;
+        }
+        bi = bi + 1;
+    }
+
     // Build result Vec
     var result: Vec<LiveInterval> = Vec::new();
     var ri: i64 = 0;
@@ -1021,6 +1183,17 @@ pub fn vec_contains_i64(vec: Vec<i64>, value: i64) -> bool {
         i = i + 1;
     }
     return false;
+}
+
+// Check if two Vec<i64> contain the same elements (order-independent).
+pub fn vec_i64_eq(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() { return false; }
+    var i: i64 = 0;
+    while i < a.len() {
+        if !vec_contains_i64(b, a.get(i)) { return false; }
+        i = i + 1;
+    }
+    return true;
 }
 
 pub fn vec_contains_str(vec: Vec<str>, value: str) -> bool {

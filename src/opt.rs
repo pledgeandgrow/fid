@@ -1632,6 +1632,180 @@ fn dse_function(f: &mut L2Function) -> usize {
         }
     }
 
+    // Pattern 3: Cross-block dead stores.
+    // A store to a local pointer in block A is dead if there's another store
+    // to the same pointer in a successor block with no intervening load.
+    // We use a backward dataflow analysis: compute which pointers are
+    // "stored before loaded" across block boundaries.
+    //
+    // For each block, compute:
+    //   store_no_load[B] = set of pointers that are stored-to in B before
+    //                      any load of them (in B, walking forward).
+    //   live_out_load[B] = set of pointers that are loaded in some successor
+    //                      before being stored (i.e., the store in B would be
+    //                      observed).
+    //
+    // A store S to ptr P in block B is dead if:
+    //   - P ∈ store_no_load[B] for some later store in B (already handled by
+    //     Pattern 1), OR
+    //   - P ∈ store_no_load[S] for ALL successors S, AND P is not in
+    //     live_out_load[B] (no successor loads P before storing).
+    //
+    // Simplified: we compute "definitely_stored_before_loaded" for each
+    // block's exit (backward dataflow), and if a store's pointer is in this
+    // set for all successors, the store is dead.
+
+    // Build block index map.
+    let block_idx: HashMap<PBlock, usize> = f.blocks.iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+
+    // Compute successors for each block.
+    let successors: Vec<Vec<PBlock>> = f.blocks.iter().map(|b| {
+        match b.instructions.last() {
+            Some(vid) => match f.values.get(vid) {
+                Some(L2Inst::Jump { target }) => vec![*target],
+                Some(L2Inst::Branch { then, else_, .. }) => vec![*then, *else_],
+                _ => vec![],
+            },
+            None => vec![],
+        }
+    }).collect();
+
+    // For each block, compute the set of local pointers that are "stored to
+    // but not loaded" before the block's end (walking forward through the block).
+    // These are candidates for cross-block DSE: if ALL successors also store
+    // to them before loading, the store in this block is dead.
+    let mut block_store_before_load: Vec<HashSet<PValue>> = vec![HashSet::new(); f.blocks.len()];
+
+    for (bi, block) in f.blocks.iter().enumerate() {
+        let mut stored: HashSet<PValue> = HashSet::new();
+        let mut loaded: HashSet<PValue> = HashSet::new();
+        for &vid in &block.instructions {
+            let inst = match f.values.get(&vid) {
+                Some(i) => i.clone(),
+                None => continue,
+            };
+            match &inst {
+                L2Inst::Store { ptr, .. } if is_local_ptr(*ptr) => {
+                    stored.insert(*ptr);
+                    // If this ptr was loaded before this store, remove from
+                    // the "store before load" set — the load observed the
+                    // earlier store.
+                    loaded.remove(ptr);
+                }
+                L2Inst::Load { ptr, .. } if is_local_ptr(*ptr) => {
+                    // A load of this ptr means any earlier store is observed.
+                    loaded.insert(*ptr);
+                }
+                L2Inst::Call { func, .. } if !is_known_pure_func(func) => {
+                    // Side-effecting call — conservatively, all local stores
+                    // are observed.
+                    for p in local_allocas.iter().chain(gfp_base.keys()) {
+                        loaded.insert(*p);
+                    }
+                }
+                L2Inst::CallPtr { .. } | L2Inst::DynCall { .. } => {
+                    for p in local_allocas.iter().chain(gfp_base.keys()) {
+                        loaded.insert(*p);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Pointers that are stored but not loaded by end of block.
+        for p in &stored {
+            if !loaded.contains(p) {
+                block_store_before_load[bi].insert(*p);
+            }
+        }
+    }
+
+    // Backward dataflow: for each block, compute "must_be_stored_before_loaded"
+    // in all successors. This is the set of pointers where every path from
+    // this block's exit reaches a store before a load.
+    //
+    // stored_before_loaded_out[B] = intersection over all successors S of:
+    //   (block_store_before_load[S] ∪ stored_before_loaded_out[S])
+    //
+    // A store to ptr P in block B is dead if P ∈ stored_before_loaded_out[B]
+    // (all successors store P before loading it).
+
+    let mut sbl_out: Vec<HashSet<PValue>> = vec![HashSet::new(); f.blocks.len()];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bi in (0..f.blocks.len()).rev() {
+            let mut new_out: Option<HashSet<PValue>> = None;
+            for &succ in &successors[bi] {
+                if let Some(&si) = block_idx.get(&succ) {
+                    let succ_set: HashSet<PValue> = {
+                        let mut s = block_store_before_load[si].clone();
+                        s.extend(&sbl_out[si]);
+                        s
+                    };
+                    new_out = match new_out {
+                        None => Some(succ_set),
+                        Some(existing) => Some(existing.intersection(&succ_set).cloned().collect()),
+                    };
+                } else {
+                    // Successor not found — conservative, no info.
+                    new_out = Some(HashSet::new());
+                }
+            }
+            let new_out = new_out.unwrap_or_default();
+            if new_out != sbl_out[bi] {
+                sbl_out[bi] = new_out;
+                changed = true;
+            }
+        }
+    }
+
+    // Now find cross-block dead stores: a store to ptr P in block B is dead
+    // if P ∈ sbl_out[B] (all successors store P before loading it) AND the
+    // store is not the last store to P in B (the last store is the one that
+    // the successors' stores overwrite — but we need to keep the last store
+    // because it's the one that writes the value that the successors
+    // actually overwrite... wait, no. If ALL successors store before loading,
+    // then even the last store in B is dead because it's overwritten before
+    // being read).
+    //
+    // Actually: if P ∈ sbl_out[B], then every path from B's exit stores P
+    // before loading it. So the last store to P in B is dead too — its value
+    // is never observed. But we must be careful: if B has no successors (e.g.,
+    // a return block), sbl_out[B] is empty, so no stores are removed.
+    for (bi, block) in f.blocks.iter().enumerate() {
+        // Find the LAST store to each local pointer in this block.
+        let mut last_store: HashMap<PValue, PValue> = HashMap::new();
+        for &vid in &block.instructions {
+            let inst = match f.values.get(&vid) {
+                Some(i) => i.clone(),
+                None => continue,
+            };
+            if let L2Inst::Store { ptr, .. } = &inst {
+                if is_local_ptr(*ptr) {
+                    last_store.insert(*ptr, vid);
+                }
+            }
+        }
+        // If the pointer is in sbl_out[bi], the last store is dead.
+        for (ptr, vid) in &last_store {
+            if sbl_out[bi].contains(ptr) && !to_remove.contains(vid) {
+                to_remove.push(*vid);
+                count += 1;
+            }
+        }
+    }
+
+    // Remove the cross-block dead stores.
+    for vid in &to_remove {
+        f.values.remove(vid);
+        for b in &mut f.blocks {
+            b.instructions.retain(|v| *v != *vid);
+        }
+    }
+
     count
 }
 
@@ -2751,13 +2925,17 @@ fn vectorize_loop(
 ) -> usize {
     // Determine vector width: 2 for f64, 4 for i32/i64.
     // We check the type of the first BinOp in the body.
+    // F23: @simd functions use wider vectors (4 for f64 with AVX, 8 for i64 with AVX2).
     let body = &f.blocks[bi];
     let mut vector_width = 4; // default to 4 for integer types
+    let is_simd = f.is_simd;
 
     for &vid in &body.instructions {
         if let Some(L2Inst::BinOp { ty, .. }) = f.values.get(&vid) {
             if *ty == PirType::F64 || *ty == PirType::F32 {
-                vector_width = 2; // 2-wide for doubles (SSE2)
+                vector_width = if is_simd { 4 } else { 2 }; // 4-wide for doubles with AVX (@simd), 2 for SSE2
+            } else {
+                vector_width = if is_simd { 8 } else { 4 }; // 8-wide for integers with AVX2 (@simd), 4 for SSE2
             }
             break;
         }

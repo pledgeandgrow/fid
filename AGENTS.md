@@ -4,7 +4,7 @@
 > Fides compiler safely. Read this before making changes.
 >
 > **Fides is self-hosted and independent.** The primary compiler is in
-> `compiler/*.fd` (50 modules, 91,924 LOC). The Rust source in `src/*.rs` is
+> `compiler/*.fd` (50 modules, 93,605 LOC). The Rust source in `src/*.rs` is
 > the bootstrap reference, used only when `compiler/*.fd` changes. For everyday
 > work (writing programs, adding stdlib, adding tests, building tools), use
 > `release/fides-c3.exe` directly — no Rust build needed.
@@ -158,8 +158,8 @@ cargo build
 
 ```
 SELF-HOSTED COMPILER (primary):
-  compiler/*.fd:  50 modules, 91,924 LOC — THE COMPILER
-  Fixpoint:       fides-c2.c == fides-c3.c (0 diffs / 701,158 lines, byte-identical)
+  compiler/*.fd:  50 modules, 93,605 LOC — THE COMPILER
+  Fixpoint:       NOT VERIFIABLE (fides-c2.c missing); self-compilation segfaults in Lowerer_mangle_method
   Bootstrap:      3 generations verified (Rust → c1 → c2 → c3, all work)
   Use:            release/fides-c3.exe for everyday work
 
@@ -175,7 +175,7 @@ WINDOWS INSTALLER (v1.0.0):
 
 TESTS:
   Self-host:      38/38 pass on interp + C + PE (tests/selfhost/)
-  Bootstrap:      hello, test_alloc, test_allocator, test_arinc, test_asm pass
+  Bootstrap:      Interpreter 234/237, C Codegen 225/237, PE Emitter 237/237
   Fixpoint:       c3 type-checks + borrow-checks full 75K LOC compiler
 
 STDLIB:

@@ -185,6 +185,22 @@ pub struct CompileResult {
 
 const STDLIB_CORE: &str = include_str!("../stdlib/core.fd");
 
+// Cached parsed stdlib for LSP (parsed once, reused across all LSP requests).
+// This avoids re-parsing the ~3000-line stdlib/core.fd on every keystroke.
+use std::sync::OnceLock;
+static STDLIB_CACHE: OnceLock<Program> = OnceLock::new();
+
+/// Get the parsed stdlib program, using a cache to avoid re-parsing on every call.
+/// The first call parses; subsequent calls return the cached result.
+fn get_cached_stdlib() -> &'static Program {
+    STDLIB_CACHE.get_or_init(|| {
+        match parse_source(STDLIB_CORE) {
+            Ok(p) => p,
+            Err(_) => Program::default(),
+        }
+    })
+}
+
 /// Walk up from `start` to find the project root — the first directory
 /// containing a `stdlib/` subdirectory. We require `stdlib/` (not just
 /// `compiler/`) because `tests/selfhost/` is a test directory that would
@@ -1198,11 +1214,8 @@ pub fn get_diagnostics(source: &str, source_path: Option<&str>) -> Vec<(usize, u
 /// completions and hover info even for partially-correct code.
 /// Returns (Program, TypeChecker) with symbol tables populated.
 pub fn build_program_for_lsp(source: &str) -> (Program, TypeChecker) {
-    // Parse stdlib first
-    let stdlib = match parse_source(STDLIB_CORE) {
-        Ok(p) => p,
-        Err(_) => Program::default(),
-    };
+    // Use cached stdlib (parsed once, reused across all LSP requests)
+    let stdlib = get_cached_stdlib();
     let stdlib_module = stdlib.module.clone().unwrap_or_else(|| "core".to_string());
 
     // Extract stdlib struct/enum names so the user parser recognizes them
@@ -1761,15 +1774,82 @@ pub fn emit_bare(source: &str, _source_path: &str) -> Result<Vec<u8>, Vec<String
 
 /// Boot mode: generate a Multiboot2-compatible kernel binary (Phase 5A.5).
 /// Same as bare mode but with a multiboot2 header and boot entry point.
-pub fn emit_boot(source: &str, _source_path: &str) -> Result<Vec<u8>, Vec<String>> {
+/// Supports `use` imports for multi-module kernels (Phase 5A.6).
+pub fn emit_boot(source: &str, source_path: &str) -> Result<Vec<u8>, Vec<String>> {
     // Parse user code WITHOUT stdlib
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();
     let mut parser = Parser::new(tokens);
     let user = parser.parse().map_err(|e| vec![e])?;
 
-    // Typecheck user code (no stdlib registration)
+    // Resolve use imports — load files from disk (no stdlib in boot mode)
+    let mut imported_modules: Vec<(String, Program)> = Vec::new();
+    let mut loaded_module_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut struct_names: Vec<String> = user.structs.iter().map(|s| s.name.clone()).collect();
+    let mut enum_names: Vec<String> = user.enums.iter().map(|e| e.name.clone()).collect();
+
+    let base_dir = Path::new(source_path)
+        .parent()
+        .unwrap_or(Path::new("."));
+    let project_root = find_project_root(base_dir);
+
+    let mut imports_to_process: Vec<String> = user.imports.iter()
+        .map(|i| i.path.clone())
+        .rev()
+        .collect();
+
+    while let Some(import_path) = imports_to_process.pop() {
+        if import_path == "core" { continue; }
+        if loaded_module_names.contains(&import_path) { continue; }
+
+        let path_str = import_path.replace("::", "/");
+        let candidates = [
+            base_dir.join(format!("{}.fd", path_str)),
+            base_dir.join(format!("{}/mod.fd", path_str)),
+            project_root.join(format!("{}.fd", path_str)),
+            project_root.join(format!("{}/mod.fd", path_str)),
+        ];
+
+        let mut found = None;
+        for candidate in &candidates {
+            if candidate.exists() {
+                found = Some(candidate.clone());
+                break;
+            }
+        }
+
+        if let Some(file_path) = found {
+            let module_source = std::fs::read_to_string(&file_path)
+                .map_err(|e| vec![format!("Error reading '{}': {}", file_path.display(), e)])?;
+
+            let mut lex = Lexer::new(&module_source);
+            let toks = lex.tokenize();
+            let mut p = Parser::with_names(toks, struct_names.clone(), enum_names.clone());
+            let imported = p.parse().map_err(|e| vec![e])?;
+
+            let module_name = imported.module.clone()
+                .unwrap_or_else(|| import_path.clone());
+
+            struct_names.extend(imported.structs.iter().map(|s| s.name.clone()));
+            enum_names.extend(imported.enums.iter().map(|e| e.name.clone()));
+
+            for trans_import in &imported.imports {
+                if !loaded_module_names.contains(&trans_import.path) {
+                    imports_to_process.push(trans_import.path.clone());
+                }
+            }
+
+            loaded_module_names.insert(import_path.clone());
+            imported_modules.push((module_name, imported));
+        }
+    }
+
+    // Typecheck: register imported modules FIRST, then user code
     let mut tc = TypeChecker::new();
+    // Register imported modules first so their functions are visible
+    for (mod_name, mod_prog) in &imported_modules {
+        tc.register_program(mod_prog, mod_name);
+    }
     let user_module = user.module.clone().unwrap_or_else(|| "boot".to_string());
     tc.register_program(&user, &user_module);
     tc.collect_capabilities(&user);
@@ -1778,8 +1858,52 @@ pub fn emit_boot(source: &str, _source_path: &str) -> Result<Vec<u8>, Vec<String
         return Err(tc.errors);
     }
 
+    // Also check imported module bodies
+    for (mod_name, mod_prog) in &imported_modules {
+        tc.collect_capabilities(mod_prog);
+        tc.check_bodies(mod_prog);
+    }
+    if !tc.errors.is_empty() {
+        return Err(tc.errors);
+    }
+
+    // Merge: start with imported modules, then user (user wins)
+    let mut merged_program = Program {
+        module: user.module.clone(),
+        funcs: Vec::new(),
+        structs: Vec::new(),
+        enums: Vec::new(),
+        consts: Vec::new(),
+        globals: Vec::new(),
+        type_aliases: Vec::new(),
+        impls: Vec::new(),
+        imports: user.imports.clone(),
+        attributes: Vec::new(),
+        traits: Vec::new(),
+        trait_impls: Vec::new(),
+        extern_decls: Vec::new(),
+        layers: Vec::new(),
+        models: Vec::new(),
+        components: Vec::new(),
+        systems: Vec::new(),
+        state_machines: Vec::new(),
+        event_handlers: Vec::new(),
+    };
+    for (_, mod_prog) in &imported_modules {
+        merged_program.funcs.extend(mod_prog.funcs.iter().cloned());
+        merged_program.structs.extend(mod_prog.structs.iter().cloned());
+        merged_program.enums.extend(mod_prog.enums.iter().cloned());
+        merged_program.globals.extend(mod_prog.globals.iter().cloned());
+        merged_program.consts.extend(mod_prog.consts.iter().cloned());
+    }
+    merged_program.funcs.extend(user.funcs.iter().cloned());
+    merged_program.structs.extend(user.structs.iter().cloned());
+    merged_program.enums.extend(user.enums.iter().cloned());
+    merged_program.globals.extend(user.globals.iter().cloned());
+    merged_program.consts.extend(user.consts.iter().cloned());
+
     // Lower to IR
-    let module = lower::lower(&user);
+    let module = lower::lower(&merged_program);
 
     // Generate multiboot2-compatible boot binary
     Ok(pe::generate_boot_binary(&module))

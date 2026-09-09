@@ -1739,7 +1739,47 @@ fn check_expr(self: &mut BorrowChecker, expr: Expr) -> void {
             // body in a new scope -- captured variables are treated as
             // borrowed from the outer scope.
             push_scope(self);
+            // Collect identifiers used in the body that are NOT params or
+            // locals declared inside the closure. These are captures.
+            var captured: Vec<str> = Vec::new();
             var b: i64 = 0;
+            while b < body.len() {
+                collect_captures_stmt_fd(body.get(b), &mut captured);
+                b = b + 1;
+            }
+            // Collect identifiers that are assigned to (for mutable capture).
+            var assigned: Vec<str> = Vec::new();
+            b = 0;
+            while b < body.len() {
+                collect_assigned_stmt_fd(body.get(b), &mut assigned);
+                b = b + 1;
+            }
+            // Record a borrow for each captured variable that exists in an
+            // outer scope.
+            var ci: i64 = 0;
+            while ci < captured.len() {
+                var cap: str = captured.get(ci);
+                // Check if this variable exists in the outer scope.
+                var in_outer: bool = false;
+                var si: i64 = 0;
+                while si < self.scope_stack.len() - 1 {
+                    var scope: Vec<str> = self.scope_stack.get(si).items;
+                    var sji: i64 = 0;
+                    while sji < scope.len() {
+                        if str_equal(scope.get(sji), cap) { in_outer = true; }
+                        sji = sji + 1;
+                    }
+                    si = si + 1;
+                }
+                if in_outer && self.unsafe_depth == 0 {
+                    var is_mut: bool = bc_vec_contains_str(assigned, cap);
+                    var borrower: str = "__closure_capture_" + cap;
+                    create_borrow(self, cap, borrower, is_mut, 0);
+                    scope_stack_push_name(self, borrower);
+                }
+                ci = ci + 1;
+            }
+            b = 0;
             while b < body.len() {
                 check_stmt(self, body.get(b));
                 b = b + 1;
@@ -1827,4 +1867,169 @@ pub fn str_to_lower(s: str) -> str {
         i = i + 1;
     }
     return result;
+}
+
+// --- Closure capture helpers (Issue 8) -----------------------------------
+
+// Collect identifiers used in a statement that are NOT locals (params or
+// locally-declared variables). These are closure captures.
+fn collect_captures_stmt_fd(stmt: Stmt, captured: &mut Vec<str>) -> void {
+    match stmt {
+        Stmt::Let(_, _, expr, _, _, _) => {
+            collect_captures_expr_fd(expr, captured);
+        }
+        Stmt::Assign(target, _, expr, _) => {
+            // target is a captured variable if it's not a local.
+            // We don't know locals here (no param set), so we collect all
+            // idents and let the caller filter. But we do need to track
+            // the target as a potential capture for read-before-write.
+            collect_captures_expr_fd(expr, captured);
+        }
+        Stmt::FieldAssign(object, _, _, expr, _) => {
+            collect_captures_expr_fd(object, captured);
+            collect_captures_expr_fd(expr, captured);
+        }
+        Stmt::Expr(e, _) => { collect_captures_expr_fd(e, captured); }
+        Stmt::Return(opt_e, _) => {
+            match opt_e {
+                OptBoxExpr::Some(e) => { collect_captures_expr_fd(box_expr_unbox(e), captured); }
+                OptBoxExpr::None => {}
+            }
+        }
+        Stmt::If(cond, then_block, else_block, _) => {
+            collect_captures_expr_fd(cond, captured);
+            var i: i64 = 0;
+            while i < then_block.len() {
+                collect_captures_stmt_fd(then_block.get(i), captured);
+                i = i + 1;
+            }
+            match else_block {
+                OptStmts::Some(eb) => {
+                    var j: i64 = 0;
+                    while j < eb.len() {
+                        collect_captures_stmt_fd(eb.get(j), captured);
+                        j = j + 1;
+                    }
+                }
+                OptStmts::None => {}
+            }
+        }
+        Stmt::While(cond, body, _) => {
+            collect_captures_expr_fd(cond, captured);
+            var i: i64 = 0;
+            while i < body.len() {
+                collect_captures_stmt_fd(body.get(i), captured);
+                i = i + 1;
+            }
+        }
+        Stmt::For(_, iterator, body, _) => {
+            collect_captures_expr_fd(iterator, captured);
+            var i: i64 = 0;
+            while i < body.len() {
+                collect_captures_stmt_fd(body.get(i), captured);
+                i = i + 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_captures_expr_fd(expr: Expr, captured: &mut Vec<str>) -> void {
+    match expr {
+        Expr::Ident(name) => {
+            if !bc_vec_contains_str(captured, name) {
+                captured.push(name);
+            }
+        }
+        Expr::FieldAccess(e, _) => { collect_captures_expr_fd(box_expr_unbox(e), captured); }
+        Expr::Index(arr, idx) => {
+            collect_captures_expr_fd(box_expr_unbox(arr), captured);
+            collect_captures_expr_fd(box_expr_unbox(idx), captured);
+        }
+        Expr::Call(_, args) => {
+            var i: i64 = 0;
+            while i < args.len() {
+                collect_captures_expr_fd(args.get(i), captured);
+                i = i + 1;
+            }
+        }
+        Expr::MethodCall(recv, _, args) => {
+            collect_captures_expr_fd(box_expr_unbox(recv), captured);
+            var i: i64 = 0;
+            while i < args.len() {
+                collect_captures_expr_fd(args.get(i), captured);
+                i = i + 1;
+            }
+        }
+        Expr::Binary(_, left, right) => {
+            collect_captures_expr_fd(box_expr_unbox(left), captured);
+            collect_captures_expr_fd(box_expr_unbox(right), captured);
+        }
+        Expr::Unary(_, e) => { collect_captures_expr_fd(box_expr_unbox(e), captured); }
+        Expr::Ref(e, _) => { collect_captures_expr_fd(box_expr_unbox(e), captured); }
+        _ => {}
+    }
+}
+
+// Local vec_contains_str (not imported from typechecker.fd).
+fn bc_vec_contains_str(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if str_equal(v.get(i), s) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Collect identifiers that are assigned to in a statement (for mutable capture).
+fn collect_assigned_stmt_fd(stmt: Stmt, assigned: &mut Vec<str>) -> void {
+    match stmt {
+        Stmt::Assign(target, _, _, _) => {
+            if !bc_vec_contains_str(assigned, target) {
+                assigned.push(target);
+            }
+        }
+        Stmt::FieldAssign(object, _, _, _, _) => {
+            match object {
+                Expr::Ident(name) => {
+                    if !bc_vec_contains_str(assigned, name) {
+                        assigned.push(name);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Stmt::If(_, then_block, else_block, _) => {
+            var i: i64 = 0;
+            while i < then_block.len() {
+                collect_assigned_stmt_fd(then_block.get(i), assigned);
+                i = i + 1;
+            }
+            match else_block {
+                OptStmts::Some(eb) => {
+                    var j: i64 = 0;
+                    while j < eb.len() {
+                        collect_assigned_stmt_fd(eb.get(j), assigned);
+                        j = j + 1;
+                    }
+                }
+                OptStmts::None => {}
+            }
+        }
+        Stmt::While(_, body, _) => {
+            var i: i64 = 0;
+            while i < body.len() {
+                collect_assigned_stmt_fd(body.get(i), assigned);
+                i = i + 1;
+            }
+        }
+        Stmt::For(_, _, body, _) => {
+            var i: i64 = 0;
+            while i < body.len() {
+                collect_assigned_stmt_fd(body.get(i), assigned);
+                i = i + 1;
+            }
+        }
+        _ => {}
+    }
 }

@@ -2,7 +2,7 @@
 
 > Things that have broken before and how to avoid re-introducing them.
 >
-> Last updated: Sep 9, 2026 (v1.0.0 released — Windows installer working, 38/38 self-host tests pass, visibility fixes for scribe.fd/elf64.fd, PRNG xorshift128+).
+> Last updated: Sep 9, 2026 (session 22: bugs 3.16–3.19 fixed — global Vec init, Vec::set overflow, struct return reassignment, Vec<f64> bit patterns).
 
 ---
 
@@ -1229,112 +1229,111 @@ The PE emitter has been ported from Rust to Fides (session 5). If you change
 includes instruction encoding, PE header layout, import table format, and
 runtime stubs.
 
-### 3.16 Global `Vec::new()` in struct literals crashes at runtime (session 17)
+### 3.16 Global `Vec::new()` in struct literals crashes at runtime (session 17) — FIXED (session 22)
 
-**Symptom:** Native binaries crash with SIGSEGV during initialization of any
-module that declares a global variable containing `Vec::new()` inside a
-struct literal:
+**Status:** FIXED. The C backend now emits an `__init_globals()` function
+that is called from the generated `main()` entry point. Complex global
+initializers (struct literals containing `Vec::new()` and other method calls)
+are generated as runtime initialization code rather than being reduced to `0`.
+
+**Symptom (historical):** Native binaries crashed with SIGSEGV during
+initialization of any module that declares a global variable containing
+`Vec::new()` inside a struct literal:
 
 ```fides
 var g_state: MyState = MyState {
-    items: Vec::new(),   // <-- crashes here
+    items: Vec::new(),   // <-- crashed here
     ...
 };
 ```
 
-**Root cause:** The C backend's global variable initialization does not
-properly initialize `Vec` fields in global struct literals. The `Vec::new()`
-call produces a zero-initialized struct, but the runtime's `PVec` expects
-specific internal pointers (data, capacity, length) to be set up. When
-subsequent code tries to `push` or `clear` the Vec, it dereferences null
-or garbage pointers.
+**Root cause:** The C backend's global variable initialization only handled
+literal expressions (integers, floats, booleans, strings). Complex expressions
+such as struct literals and `Vec::new()` calls were reduced to `0`, producing
+a null pointer that was dereferenced on first use.
 
-**Workaround:** Use caller-owned state instead of global state. Pass
-`&mut State` to each function. Create the state in `main()` with
-`var state = state_create();` where `state_create()` returns a struct
-with `Vec::new()` called inside a function (which works correctly).
+**Fix:** `compiler/codegen_c.fd` now generates an `__init_globals()` function
+containing runtime initialization code for complex global initializers. This
+function is called at the start of the generated C `main()` wrapper. The
+`gen_global_runtime_expr` helper handles struct literals and `Vec::new()`
+method calls.
 
-**Affected modules (all worked around):** `profiler.fd`, `replay.fd`,
-`touch.fd`, `editor.fd`, `shader.fd` (MaterialCache).
+**Affected modules (workarounds no longer needed):** `profiler.fd`,
+`replay.fd`, `touch.fd`, `editor.fd`, `shader.fd` (MaterialCache).
 
-### 3.17 `Vec::set()` on same index twice with struct containing `str` causes buffer overflow (session 17)
+### 3.17 `Vec::set()` on same index twice with struct containing `str` causes buffer overflow (session 17) — FIXED (session 22)
 
-**Symptom:** Native binary aborts with `*** buffer overflow detected ***`
-(SIGABRT) when calling `Vec::set()` twice on the same index with a struct
-value that contains a `str` (heap-allocated) field:
+**Status:** FIXED. The C backend now allocates the full struct size for
+`alloca` slots used in struct vector operations, and `memcpy` uses the
+correct struct size. Repeated `Vec::set()` on the same index with struct
+values containing `str` fields no longer overflows.
 
-```fides
-var e = entities.get(idx);
-e.visible = false;
-entities.set(idx, e);        // first set — OK
-e.locked = true;
-entities.set(idx, e);        // second set — OVERFLOW
-```
+**Symptom (historical):** Native binary aborted with
+`*** buffer overflow detected ***` (SIGABRT) when calling `Vec::set()`
+twice on the same index with a struct value that contains a `str`
+(heap-allocated) field.
 
-**Root cause:** The generated C code allocates an 8-byte `alloca` slot for
-a struct pointer, but then `memcpy`s the full struct size (e.g., 88 bytes)
-into it on reassignment. The first `set` overflows the 8-byte buffer, and
-the second `set` causes further corruption that triggers the buffer overflow
-detector.
+**Root cause:** The generated C code allocated an 8-byte `alloca` slot for
+a struct pointer, but then `memcpy`'d the full struct size into it on
+reassignment, overflowing the buffer.
 
-**Workaround:** Avoid repeated `Vec::set()` on the same index with struct
-values. Use fresh struct literals instead of modifying a retrieved value:
+**Fix:** `compiler/codegen_c.fd` now uses correct struct allocation sizes
+for all `alloca` slots involved in struct vector operations, and `memcpy`
+uses the actual struct layout size.
 
-```fides
-// BAD: entities.set(idx, modified_retrieved_struct);
-// GOOD: entities.set(idx, MyStruct { ... fresh literal ... });
-```
+**Affected modules (workarounds no longer needed):** `editor.fd`.
 
-Or use separate helper functions for each mutation to avoid the generated
-temporary reuse pattern.
+### 3.18 Struct return value reassignment causes `memcpy` overflow (session 17) — FIXED (session 22)
 
-**Affected modules (all worked around):** `editor.fd`
-(`editor_duplicate_selected` uses fresh struct literal).
+**Status:** FIXED. The lowerer now uses the inner struct type (not
+`Ptr(Struct)`) for `alloca` slots when an inferred `let` variable receives
+a struct-returning function call via SRET. This ensures the destination
+has the full struct layout size.
 
-### 3.18 Struct return value reassignment causes `memcpy` overflow (session 17)
-
-**Symptom:** Native binary aborts with `*** buffer overflow detected ***`
-when reassigning a variable with a struct return value from a function,
-especially on the second assignment:
+**Symptom (historical):** Native binary aborted with
+`*** buffer overflow detected ***` when reassigning a variable with a
+struct return value from a function, especially on the second assignment:
 
 ```fides
 var frame = replay_get_frame(&rp);   // OK
 frame = replay_get_frame(&rp);       // OVERFLOW on second call
 ```
 
-**Root cause:** The generated C code allocates an 8-byte `alloca` for the
-variable, but then `memcpy`s the full struct size (e.g., 88 bytes for
-`ReplayFrame`) into it. The first assignment overflows the 8-byte buffer,
-and the second assignment causes further corruption.
+**Root cause:** The lowerer allocated an 8-byte `alloca` for the variable
+because the SRET convention returns a `Ptr(Struct)`, but the codegen then
+`memcpy`'d the full struct size (e.g., 88 bytes) into it, overflowing.
 
-**Workaround:** Use an "into" pattern — pass a mutable reference to a
-pre-allocated struct instead of returning by value:
+**Fix:** `compiler/lower.fd` `Stmt::Let` lowering now checks if the
+inferred value is a pointer to a struct returned through SRET. If so, the
+`alloca` uses the inner struct type rather than `Ptr(Struct)`, ensuring
+the destination has the complete layout size. Existing struct store logic
+then performs a correctly-sized copy.
 
-```fides
-// BAD:  var frame = get_frame(); frame = get_frame();
-// GOOD: var frame = make_frame(); get_frame_into(&rp, &mut frame);
-```
+**Affected modules (workarounds no longer needed):** `replay.fd`.
 
-**Affected modules (all worked around):** `replay.fd`
-(`replay_get_frame_into` + `replay_make_frame`).
+### 3.19 `Vec<f64>` stores integer bit patterns instead of floats (session 17) — FIXED (session 22)
 
-### 3.19 `Vec<f64>` stores integer bit patterns instead of floats (session 17)
+**Status:** FIXED. The C backend now uses a type-punning union
+(`{ double d; int64_t i; }`) for `Vec_push` and `Vec_get` when the
+element type is `f64`, preserving the float bit pattern through the
+`int64_t` word representation used by the runtime vector.
 
-**Symptom:** A `Vec<f64>` returns integer bit patterns (e.g.,
-`4621819117588971520`) instead of the stored float values (e.g., `10.0`).
+**Symptom (historical):** A `Vec<f64>` returned integer bit patterns
+(e.g., `4621819117588971520`) instead of the stored float values
+(e.g., `10.0`).
 
-**Root cause:** The runtime's generic pointer-vector (`PVec`) stores all
-elements as `void*` pointers. When `f64` values are pushed, they are
-bit-cast to `int64_t` and stored as pointers. On retrieval, the `p_vec_get`
-function returns the pointer value as `int64_t`, but the generated code
-may not properly cast it back to `double`.
+**Root cause:** The runtime's generic pointer-vector stores all elements
+as `void*` pointers. When `f64` values were pushed, they were
+bit-cast to `int64_t` and stored as pointers. On retrieval, the
+generated code cast the `int64_t` return value directly to `double`,
+which did not preserve the float bit pattern correctly.
 
-**Workaround:** Avoid `Vec<f64>` for parallel float arrays. Use `Vec<i64>`
-for integer storage and convert, or use struct-based storage with
-helper functions that properly handle the type conversion.
+**Fix:** `compiler/codegen_c.fd` now generates type-punning unions for
+`Vec_push` arguments and `Vec_get` return values when the element type is
+`f64`, ensuring the float value is preserved through the `int64_t` word
+representation used by the runtime vector.
 
-**Affected modules (all worked around):** `editor.fd` (uses scalar fields
-in struct instead of parallel `Vec<f64>` arrays).
+**Affected modules (workarounds no longer needed):** `editor.fd`.
 
 ---
 
@@ -1388,10 +1387,10 @@ Also high-risk in Rust reference compiler:
 | PE: string_contains returns true | Runtime stub returns true always | `pe.fd` — see bug 2c.15 |
 | Generic with >1 type param mis-substituted | `subst_gat_type_args` always uses args.get(0) | `mono.fd:649` — see bug 2c.16 |
 | Comptime in `return` not evaluated | Return re-wrap omitted in substitute | `comptime_eval.fd` — see bug 2c.17 |
-| Global Vec crashes on init | `Vec::new()` in global struct literal not initialized | Use caller-owned state — see gotcha 3.16 |
-| `Vec::set()` overflow on structs with `str` | 8-byte alloca + full struct memcpy | Use fresh struct literals — see gotcha 3.17 |
-| Struct return reassignment overflow | 8-byte alloca + full struct memcpy on 2nd call | Use "into" pattern — see gotcha 3.18 |
-| `Vec<f64>` returns integer bit patterns | Generic pointer-vector stores f64 as int64 | Avoid `Vec<f64>`, use struct fields — see gotcha 3.19 |
+| Global Vec crashes on init | `Vec::new()` in global struct literal not initialized | FIXED in session 22 — see 3.16 |
+| `Vec::set()` overflow on structs with `str` | 8-byte alloca + full struct memcpy | FIXED in session 22 — see 3.17 |
+| Struct return reassignment overflow | 8-byte alloca + full struct memcpy on 2nd call | FIXED in session 22 — see 3.18 |
+| `Vec<f64>` returns integer bit patterns | Generic pointer-vector stores f64 as int64 | FIXED in session 22 — see 3.19 |
 
 ---
 
@@ -1415,5 +1414,5 @@ Also high-risk in Rust reference compiler:
   `fidesc.exe` (the Rust bootstrap compiler) renamed as `fides.exe`. This
   is fully functional for compiling Fides programs. The self-hosted compiler
   (`release/fides-c3.exe`) is available from source builds.
-- **4 runtime bugs from Session 21** (3.16–3.19) — documented above, all
-  have workarounds using the caller-owned state pattern.
+- **4 runtime bugs from Session 21** (3.16–3.19) — all FIXED in session 22.
+  See bugs 3.16–3.19 above for details.

@@ -3,7 +3,14 @@
 > **Goal:** The Fides compiler compiles itself, producing identical output
 > across generations (bootstrap fixpoint).
 >
-> **Last updated:** Sep 9, 2026 (v1.0.0 released — Windows installer working, 38/38 self-host tests pass, fixpoint verified)
+> **Last updated:** Sep 9, 2026 (session 22 audit — bugs 3.16–3.19 fixed, roadmap verified against codebase)
+>
+> **Current status (audited):**
+> - 50 modules, 93,605 LOC — all type-check with `release/fides-c3.exe`
+> - 38/38 self-host tests pass on all 3 backends
+> - **Self-compilation FAILS** — SIGSEGV in `Lowerer_mangle_method` during lowering
+> - **Fixpoint NOT verifiable** — `release/fides-c2.c` does not exist
+> - Bugs 3.16–3.19 (global Vec, struct overflow, Vec<f64>) — all FIXED in session 22
 
 ---
 
@@ -37,6 +44,53 @@ Self-host tests:  38/38 passed (Interpreter, C Codegen, PE Emitter)
 Bootstrap:        hello, test_alloc, test_allocator, test_arinc, test_asm pass
 Fixpoint:         c3 type-checks + borrow-checks full compiler (75K LOC)
 Installer:        Fides-Setup-1.0.0.exe tested on Windows — working
+```
+
+---
+
+## Session 22 Progress (Sep 9, 2026)
+
+### What was done
+
+1. **4 runtime/codegen bugs fixed** (3.16–3.19, see `docs/selfhost/known-bugs.md`):
+   - Bug 3.16: Global `Vec::new()` in struct literals — FIXED. `compiler/codegen_c.fd`
+     now emits `__init_globals()` function called from C `main()`.
+   - Bug 3.17: `Vec::set()` overflow with struct containing `str` — FIXED.
+     Correct struct allocation sizes in `compiler/codegen_c.fd`.
+   - Bug 3.18: Struct return reassignment overflow — FIXED. `compiler/lower.fd`
+     `Stmt::Let` now uses inner struct type for alloca when value is `Ptr(Struct)`
+     from SRET convention.
+   - Bug 3.19: `Vec<f64>` stores integer bit patterns — FIXED. `compiler/codegen_c.fd`
+     now uses type-punning unions for float vector push/get.
+
+2. **Roadmap audited against actual codebase** — all phases verified:
+   - Fixpoint claim (c2==c3) — FALSE. `release/fides-c2.c` does not exist.
+   - Self-compilation claim — FALSE. SIGSEGV in `Lowerer_mangle_method`.
+   - @send/@sync claim — FALSE. 0 matches in code.
+   - UEFI bindings claim — FALSE. `stdlib/uefi.fd` moved to fides-os project.
+   - Compiler LOC — STALE. Actual 93,605, was claimed 91,924.
+   - LSP — **DONE**. `compiler/main.fd` imports `compiler::lsp` and dispatches
+     `lsp` command to `lsp_run()`. JSON-RPC server over stdio with initialize,
+     diagnostics, completion, hover, definition, rename.
+   - ark — **DONE**. `compiler/main.fd` imports `compiler::ark` and dispatches
+     `ark` command to `ark_main()`. Package manager with init/add/install/remove/
+     list/lock/update/search/publish/version/help.
+   - Phase 10B — OVERSTATED. `compiler/pe.fd` exists (6,448 LOC), was claimed "NOT STARTED".
+
+3. **All 4 bug reproductions pass** with rebuilt compiler.
+4. **13/13 bootstrap tests pass**, game module tests pass (profiler, chunk).
+5. **Self-compilation still fails** — pre-existing issue, not a regression.
+
+### Verification status
+
+```
+Bug 3.16:    exit 0 (global Vec::new() init)
+Bug 3.17:    exit 0 (Vec::set with str struct)
+Bug 3.18:    exit 0 (struct return reassignment)
+Bug 3.19:    exit 0 (Vec<f64> correct floats)
+Bootstrap:   13/13 passed (hello, arithmetic, control_flow, functions, etc.)
+Self-host:   38/38 passed (unchanged)
+Self-compilation: FAILS (SIGSEGV in Lowerer_mangle_method — pre-existing)
 ```
 
 ---

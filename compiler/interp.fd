@@ -424,6 +424,12 @@ pub struct Interpreter {
     pub step_count: i64,
     pub max_memory: i64,
     pub region_stack: Vec<str>,
+    // PRNG state for DP noise (xorshift128+)
+    pub prng_state_a: u64,
+    pub prng_state_b: u64,
+    // DP epsilon budget tracking
+    pub dp_epsilon_budget: f64,
+    pub dp_epsilon_limit: f64,
 }
 
 pub fn Interpreter_new(module: IrModule) -> Interpreter {
@@ -452,6 +458,10 @@ pub fn Interpreter_new(module: IrModule) -> Interpreter {
         step_count: 0,
         max_memory: 0,
         region_stack: Vec::new(),
+        prng_state_a: 0x9E3779B97F4A7C15,
+        prng_state_b: 0xBF58476D1CE4E5B9,
+        dp_epsilon_budget: 0.0,
+        dp_epsilon_limit: 0.0,
     };
     Interpreter_init_strings(&mut interp);
     Interpreter_init_globals(&mut interp);
@@ -1853,6 +1863,13 @@ pub fn Interpreter_is_runtime_func(self: &Interpreter, name: str) -> bool {
     if str_starts_with(name, "p_checkpoint_") { return true; }
     if str_starts_with(name, "p_volatile_") { return true; }
     if str_starts_with(name, "p_sb_") { return true; }
+    // PRNG and noise builtins
+    if str_equal(name, "p_prng_next") { return true; }
+    if str_equal(name, "p_prng_uniform") { return true; }
+    if str_equal(name, "p_prng_gaussian") { return true; }
+    if str_equal(name, "p_dp_noise") { return true; }
+    if str_equal(name, "p_gaussian_noise") { return true; }
+    if str_equal(name, "p_dropout") { return true; }
     // Check common p_ builtins
     if str_equal(name, "p_print_int") { return true; }
     if str_equal(name, "p_print_float") { return true; }
@@ -2367,6 +2384,220 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: Vec<Val
             }
         }
         return ExecOutcome::Value(Value::Int(0));
+    }
+
+    // ─── PRNG (xorshift128+) for DP noise ───
+    if str_equal(name, "p_prng_next") {
+        // xorshift128+ — returns a u64 value as i64
+        var a: u64 = self.prng_state_a;
+        var b: u64 = self.prng_state_b;
+        a = a ^ (a << 23);
+        a = a ^ (a >> 17);
+        a = a ^ b;
+        a = a ^ (b >> 26);
+        self.prng_state_a = b;
+        self.prng_state_b = a;
+        return ExecOutcome::Value(Value::Int(a as i64));
+    }
+    if str_equal(name, "p_prng_uniform") {
+        // Returns a uniform random f64 in [0, 1)
+        var a: u64 = self.prng_state_a;
+        var b: u64 = self.prng_state_b;
+        a = a ^ (a << 23);
+        a = a ^ (a >> 17);
+        a = a ^ b;
+        a = a ^ (b >> 26);
+        self.prng_state_a = b;
+        self.prng_state_b = a;
+        // Use upper 53 bits for mantissa
+        var bits: i64 = (a >> 11) as i64;
+        var result: f64 = (bits as f64) / (9007199254740992.0);
+        return ExecOutcome::Value(Value::Float(result));
+    }
+    if str_equal(name, "p_prng_gaussian") {
+        // Box-Muller transform: generates a standard normal random f64
+        var a: u64 = self.prng_state_a;
+        var b: u64 = self.prng_state_b;
+        a = a ^ (a << 23);
+        a = a ^ (a >> 17);
+        a = a ^ b;
+        a = a ^ (b >> 26);
+        self.prng_state_a = b;
+        self.prng_state_b = a;
+        var bits1: i64 = (a >> 11) as i64;
+        var u1: f64 = (bits1 as f64) / (9007199254740992.0);
+        if u1 < 0.0000001 { u1 = 0.0000001; }
+
+        a = self.prng_state_a;
+        b = self.prng_state_b;
+        a = a ^ (a << 23);
+        a = a ^ (a >> 17);
+        a = a ^ b;
+        a = a ^ (b >> 26);
+        self.prng_state_a = b;
+        self.prng_state_b = a;
+        var bits2: i64 = (a >> 11) as i64;
+        var u2: f64 = (bits2 as f64) / (9007199254740992.0);
+
+        // Box-Muller: sqrt(-2 * ln(u1)) * cos(2 * pi * u2)
+        // We don't have ln/cos in the interpreter, so use a simple
+        // approximation: sum of 12 uniforms (Central Limit Theorem)
+        var sum: f64 = u1 + u2;
+        var i: i64 = 0;
+        while i < 10 {
+            a = self.prng_state_a;
+            b = self.prng_state_b;
+            a = a ^ (a << 23);
+            a = a ^ (a >> 17);
+            a = a ^ b;
+            a = a ^ (b >> 26);
+            self.prng_state_a = b;
+            self.prng_state_b = a;
+            var bits3: i64 = (a >> 11) as i64;
+            sum = sum + (bits3 as f64) / (9007199254740992.0);
+            i = i + 1;
+        }
+        // Approximate Gaussian: (sum - 6) gives mean 0, variance ~1
+        var gaussian: f64 = sum - 6.0;
+        return ExecOutcome::Value(Value::Float(gaussian));
+    }
+
+    // ─── DP noise functions (use PRNG, not deterministic formulas) ───
+    if str_equal(name, "p_dp_noise") {
+        // p_dp_noise(epsilon, sensitivity, value) -> noisy value
+        if args.len() >= 3 {
+            match args.get(0) {
+                Value::Float(epsilon) => {
+                    match args.get(1) {
+                        Value::Float(sensitivity) => {
+                            match args.get(2) {
+                                Value::Float(v) => {
+                                    // Generate Gaussian noise with sigma = sensitivity / epsilon
+                                    var sigma: f64 = sensitivity / epsilon;
+                                    // Use CLT approximation for Gaussian
+                                    var sum: f64 = 0.0;
+                                    var i: i64 = 0;
+                                    while i < 12 {
+                                        var a: u64 = self.prng_state_a;
+                                        var b: u64 = self.prng_state_b;
+                                        a = a ^ (a << 23);
+                                        a = a ^ (a >> 17);
+                                        a = a ^ b;
+                                        a = a ^ (b >> 26);
+                                        self.prng_state_a = b;
+                                        self.prng_state_b = a;
+                                        var bits: i64 = (a >> 11) as i64;
+                                        sum = sum + (bits as f64) / (9007199254740992.0);
+                                        i = i + 1;
+                                    }
+                                    var noise: f64 = (sum - 6.0) * sigma;
+                                    return ExecOutcome::Value(Value::Float(v + noise));
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Float(0.0));
+    }
+    if str_equal(name, "p_gaussian_noise") {
+        // p_gaussian_noise(sigma, value) -> noisy value
+        if args.len() >= 2 {
+            match args.get(0) {
+                Value::Float(sigma) => {
+                    match args.get(1) {
+                        Value::Float(v) => {
+                            var sum: f64 = 0.0;
+                            var i: i64 = 0;
+                            while i < 12 {
+                                var a: u64 = self.prng_state_a;
+                                var b: u64 = self.prng_state_b;
+                                a = a ^ (a << 23);
+                                a = a ^ (a >> 17);
+                                a = a ^ b;
+                                a = a ^ (b >> 26);
+                                self.prng_state_a = b;
+                                self.prng_state_b = a;
+                                var bits: i64 = (a >> 11) as i64;
+                                sum = sum + (bits as f64) / (9007199254740992.0);
+                                i = i + 1;
+                            }
+                            var noise: f64 = (sum - 6.0) * sigma;
+                            return ExecOutcome::Value(Value::Float(v + noise));
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Float(0.0));
+    }
+    if str_equal(name, "p_dropout") {
+        // p_dropout(prob, value) -> value * 0 with probability prob, else value
+        if args.len() >= 2 {
+            match args.get(0) {
+                Value::Float(prob) => {
+                    match args.get(1) {
+                        Value::Float(v) => {
+                            var a: u64 = self.prng_state_a;
+                            var b: u64 = self.prng_state_b;
+                            a = a ^ (a << 23);
+                            a = a ^ (a >> 17);
+                            a = a ^ b;
+                            a = a ^ (b >> 26);
+                            self.prng_state_a = b;
+                            self.prng_state_b = a;
+                            var bits: i64 = (a >> 11) as i64;
+                            var r: f64 = (bits as f64) / (9007199254740992.0);
+                            if r < prob {
+                                return ExecOutcome::Value(Value::Float(0.0));
+                            }
+                            return ExecOutcome::Value(Value::Float(v));
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Float(0.0));
+    }
+    if str_equal(name, "p_dp_budget_check") {
+        if args.len() >= 2 {
+            match args.get(0) {
+                Value::Float(epsilon) => {
+                    match args.get(1) {
+                        Value::Float(limit) => {
+                            self.dp_epsilon_budget = self.dp_epsilon_budget + epsilon;
+                            if self.dp_epsilon_budget > limit {
+                                return ExecOutcome::Panic("DP budget exhausted: consumed " + float_to_str(self.dp_epsilon_budget) + " > limit " + float_to_str(limit));
+                            }
+                            return ExecOutcome::Value(Value::Void);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Panic("dp_budget_check: expected (f64, f64)");
+    }
+    if str_equal(name, "p_dp_budget_reset") {
+        self.dp_epsilon_budget = 0.0;
+        if args.len() >= 1 {
+            match args.get(0) {
+                Value::Float(limit) => {
+                    self.dp_epsilon_limit = limit;
+                }
+                _ => {}
+            }
+        }
+        return ExecOutcome::Value(Value::Void);
     }
 
     // ─── Default: return 0 for unknown runtime functions ───

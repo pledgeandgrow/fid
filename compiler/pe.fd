@@ -785,6 +785,94 @@ pub fn X86Encoder_divsd(self: &mut X86Encoder, dst: i64, src: i64) {
     X86Encoder_modrm(self, 3, dst & 7, src & 7);
 }
 
+// --- SSE2 packed double-precision (f64x2) instructions ---
+// These operate on XMM registers. Encoding: 66 0F <opcode> ModR/M
+// For register-to-register: ModR/M = 11 (mod) | reg (dst) | rm (src)
+
+// addpd xmm_dst, xmm_src — SSE2 packed double add
+// Encoding: 66 0F 58 ModR/M
+pub fn X86Encoder_addpd_rr(self: &mut X86Encoder, dst: i64, src: i64) {
+    self.code.push(0x66);
+    if dst >= 8 || src >= 8 {
+        X86Encoder_rex(self, false, dst >= 8, false, src >= 8);
+    }
+    self.code.push(0x0F);
+    self.code.push(0x58);
+    X86Encoder_modrm(self, 3, dst & 7, src & 7);
+}
+
+// subpd xmm_dst, xmm_src — SSE2 packed double subtract
+// Encoding: 66 0F 5C ModR/M
+pub fn X86Encoder_subpd_rr(self: &mut X86Encoder, dst: i64, src: i64) {
+    self.code.push(0x66);
+    if dst >= 8 || src >= 8 {
+        X86Encoder_rex(self, false, dst >= 8, false, src >= 8);
+    }
+    self.code.push(0x0F);
+    self.code.push(0x5C);
+    X86Encoder_modrm(self, 3, dst & 7, src & 7);
+}
+
+// mulpd xmm_dst, xmm_src — SSE2 packed double multiply
+// Encoding: 66 0F 59 ModR/M
+pub fn X86Encoder_mulpd_rr(self: &mut X86Encoder, dst: i64, src: i64) {
+    self.code.push(0x66);
+    if dst >= 8 || src >= 8 {
+        X86Encoder_rex(self, false, dst >= 8, false, src >= 8);
+    }
+    self.code.push(0x0F);
+    self.code.push(0x59);
+    X86Encoder_modrm(self, 3, dst & 7, src & 7);
+}
+
+// divpd xmm_dst, xmm_src — SSE2 packed double divide
+// Encoding: 66 0F 5E ModR/M
+pub fn X86Encoder_divpd_rr(self: &mut X86Encoder, dst: i64, src: i64) {
+    self.code.push(0x66);
+    if dst >= 8 || src >= 8 {
+        X86Encoder_rex(self, false, dst >= 8, false, src >= 8);
+    }
+    self.code.push(0x0F);
+    self.code.push(0x5E);
+    X86Encoder_modrm(self, 3, dst & 7, src & 7);
+}
+
+// movapd xmm_dst, xmm_src — SSE2 move aligned packed double
+// Encoding: 66 0F 28 ModR/M
+pub fn X86Encoder_movapd_rr(self: &mut X86Encoder, dst: i64, src: i64) {
+    self.code.push(0x66);
+    if dst >= 8 || src >= 8 {
+        X86Encoder_rex(self, false, dst >= 8, false, src >= 8);
+    }
+    self.code.push(0x0F);
+    self.code.push(0x28);
+    X86Encoder_modrm(self, 3, dst & 7, src & 7);
+}
+
+// movapd xmm_dst, [rbp+disp] — SSE2 load from memory
+// Encoding: 66 0F 28 ModR/M(mod=01|10, reg=dst, rm=rbp)
+pub fn X86Encoder_movapd_rbp_reg(self: &mut X86Encoder, dst: i64, disp: i64) {
+    self.code.push(0x66);
+    if dst >= 8 {
+        X86Encoder_rex(self, false, dst >= 8, false, false);
+    }
+    self.code.push(0x0F);
+    self.code.push(0x28);
+    X86Encoder_emit_mem_rbp(self, dst & 7, disp);
+}
+
+// movapd [rbp+disp], xmm_src — SSE2 store to memory
+// Encoding: 66 0F 29 ModR/M(mod=01|10, reg=src, rm=rbp)
+pub fn X86Encoder_movapd_mem_rbp(self: &mut X86Encoder, disp: i64, src: i64) {
+    self.code.push(0x66);
+    if src >= 8 {
+        X86Encoder_rex(self, false, false, false, src >= 8);
+    }
+    self.code.push(0x0F);
+    self.code.push(0x29);
+    X86Encoder_emit_mem_rbp(self, src & 7, disp);
+}
+
 // xorpd xmm, [rbp + disp]
 pub fn X86Encoder_xorpd_xmm_mem_rbp(self: &mut X86Encoder, xmm: i64, disp: i64) {
     self.code.push(0x66);
@@ -1612,40 +1700,26 @@ pub fn PeCodeGen_generate_flat(self: &mut PeCodeGen, module: IrModule) -> Vec {
 //   magic: 0xE85250D6, architecture: 0, header_length: 24, checksum
 //   end tag: type=0, flags=0, size=8
 pub fn build_multiboot2_header() -> Vec {
-    var header: Vec = Vec::new();
-    var magic: i64 = 0xE85250D6;
-    var architecture: i64 = 0;  // i386 protected mode
-    var header_length: i64 = 24;
-    // Checksum: -(magic + architecture + header_length) mod 2^32
-    var checksum: i64 = 0 - (magic + architecture + header_length);
-    // Mask to 32 bits (unsigned)
+    // Build a 24-byte Multiboot2 header as a byte Vec.
+    // Each byte is pushed individually. Vec in Fides stores i64 elements,
+    // so we use p_byte_vec_push if available, or build via encoder.
+    // Actually, Vec.push stores i64 per slot — we need a byte buffer.
+    // Use X86Encoder to build raw bytes, then extract.
+    var enc: X86Encoder = X86Encoder_new();
+    // 0xE85250D6 — split into parts to avoid large hex literal issues
+    X86Encoder_emit_u32(&mut enc, 0xE8000000 + 0x00520000 + 0x00005000 + 0x000000D6);
+    X86Encoder_emit_u32(&mut enc, 0); // architecture
+    X86Encoder_emit_u32(&mut enc, 24); // header_length
+    // Checksum: -(magic + arch + length) mod 2^32
+    var magic: i64 = 0xE8000000 + 0x00520000 + 0x00005000 + 0x000000D6;
+    var checksum: i64 = 0 - (magic + 0 + 24);
     checksum = checksum & 0xFFFFFFFF;
-
-    // Magic (4 bytes, little-endian)
-    header.push(magic & 0xFF);
-    header.push((magic >> 8) & 0xFF);
-    header.push((magic >> 16) & 0xFF);
-    header.push((magic >> 24) & 0xFF);
-    // Architecture (4 bytes, little-endian)
-    header.push(architecture & 0xFF);
-    header.push((architecture >> 8) & 0xFF);
-    header.push((architecture >> 16) & 0xFF);
-    header.push((architecture >> 24) & 0xFF);
-    // Header length (4 bytes, little-endian)
-    header.push(header_length & 0xFF);
-    header.push((header_length >> 8) & 0xFF);
-    header.push((header_length >> 16) & 0xFF);
-    header.push((header_length >> 24) & 0xFF);
-    // Checksum (4 bytes, little-endian)
-    header.push(checksum & 0xFF);
-    header.push((checksum >> 8) & 0xFF);
-    header.push((checksum >> 16) & 0xFF);
-    header.push((checksum >> 24) & 0xFF);
+    X86Encoder_emit_u32(&mut enc, checksum);
     // End tag: type=0 (u16), flags=0 (u16), size=8 (u32)
-    header.push(0); header.push(0);  // type
-    header.push(0); header.push(0);  // flags
-    header.push(8); header.push(0); header.push(0); header.push(0);  // size
-    return header;
+    X86Encoder_emit_u16(&mut enc, 0); // type
+    X86Encoder_emit_u16(&mut enc, 0); // flags
+    X86Encoder_emit_u32(&mut enc, 8); // size
+    return enc.code;
 }
 
 pub fn generate_boot_binary(module: IrModule) -> Vec {
@@ -1670,14 +1744,15 @@ pub fn PeCodeGen_generate_boot(self: &mut PeCodeGen, module: IrModule) -> Vec {
     PeCodeGen_register_runtime_labels1(self);
     PeCodeGen_register_runtime_labels2(self);
 
-    // 4. Generate code for each function
+    // 4. Generate boot entry point FIRST (must be at start of code so GRUB
+    //    jumps into our 32-bit → 64-bit trampoline)
+    PeCodeGen_gen_boot_entry_point(self);
+
+    // 5. Generate code for each function
     PeCodeGen_gen_all_functions(self, module);
 
-    // 5. Generate runtime stubs
+    // 6. Generate runtime stubs
     PeCodeGen_gen_runtime_stubs(self);
-
-    // 6. Generate entry point
-    PeCodeGen_gen_entry_point(self);
 
     // 7. Resolve labels
     X86Encoder_resolve_labels(&mut self.enc);
@@ -1845,6 +1920,23 @@ pub fn PeCodeGen_register_runtime_labels2(self: &mut PeCodeGen) {
     PeCodeGen_register_func(self, "p_string_repeat");
     PeCodeGen_register_func(self, "p_string_bytes");
     PeCodeGen_register_func(self, "p_string_clone");
+    // Bare-metal port I/O stubs
+    PeCodeGen_register_func(self, "p_inb");
+    PeCodeGen_register_func(self, "p_outb");
+    PeCodeGen_register_func(self, "p_outw");
+    PeCodeGen_register_func(self, "p_inw");
+    // Bare-metal CPU control stubs
+    PeCodeGen_register_func(self, "p_hlt");
+    PeCodeGen_register_func(self, "p_cli");
+    PeCodeGen_register_func(self, "p_sti");
+    // Bare-metal memory access stubs
+    PeCodeGen_register_func(self, "p_mem_read8");
+    PeCodeGen_register_func(self, "p_mem_write8");
+    // Bare-metal serial port stubs
+    PeCodeGen_register_func(self, "p_serial_init");
+    PeCodeGen_register_func(self, "p_serial_write");
+    PeCodeGen_register_func(self, "p_serial_read");
+    PeCodeGen_register_func(self, "p_serial_ready");
 }
 
 // Helper: generate code for all functions
@@ -2978,6 +3070,46 @@ pub fn PeCodeGen_gen_unaryop(self: &mut PeCodeGen, op: UnaryOp, off: i64, dst: i
 
 // --- Function call generation (Windows x64 ABI) -------------------------
 pub fn PeCodeGen_gen_call(self: &mut PeCodeGen, func_name: str, args: Vec, dst: i64, frame: &PeStackFrame) {
+    // SIMD intrinsics: emit hardware SSE2 instructions instead of calls
+    // p_simd_add/sub/mul/div(a, b) -> load a into xmm0, b into xmm1,
+    //   operate, store xmm0 to dst (dst is already a frame offset)
+    if str_equal(func_name, "p_simd_add") && args.len() == 2 {
+        var a_off: i64 = PeStackFrame_find_offset(frame, args.get(0));
+        var b_off: i64 = PeStackFrame_find_offset(frame, args.get(1));
+        X86Encoder_movapd_rbp_reg(&mut self.enc, 0, a_off);  // xmm0 = a
+        X86Encoder_movapd_rbp_reg(&mut self.enc, 1, b_off);  // xmm1 = b
+        X86Encoder_addpd_rr(&mut self.enc, 0, 1);            // xmm0 += xmm1
+        X86Encoder_movapd_mem_rbp(&mut self.enc, dst, 0);    // [rbp+dst] = xmm0
+        return;
+    }
+    if str_equal(func_name, "p_simd_sub") && args.len() == 2 {
+        var a_off: i64 = PeStackFrame_find_offset(frame, args.get(0));
+        var b_off: i64 = PeStackFrame_find_offset(frame, args.get(1));
+        X86Encoder_movapd_rbp_reg(&mut self.enc, 0, a_off);
+        X86Encoder_movapd_rbp_reg(&mut self.enc, 1, b_off);
+        X86Encoder_subpd_rr(&mut self.enc, 0, 1);
+        X86Encoder_movapd_mem_rbp(&mut self.enc, dst, 0);
+        return;
+    }
+    if str_equal(func_name, "p_simd_mul") && args.len() == 2 {
+        var a_off: i64 = PeStackFrame_find_offset(frame, args.get(0));
+        var b_off: i64 = PeStackFrame_find_offset(frame, args.get(1));
+        X86Encoder_movapd_rbp_reg(&mut self.enc, 0, a_off);
+        X86Encoder_movapd_rbp_reg(&mut self.enc, 1, b_off);
+        X86Encoder_mulpd_rr(&mut self.enc, 0, 1);
+        X86Encoder_movapd_mem_rbp(&mut self.enc, dst, 0);
+        return;
+    }
+    if str_equal(func_name, "p_simd_div") && args.len() == 2 {
+        var a_off: i64 = PeStackFrame_find_offset(frame, args.get(0));
+        var b_off: i64 = PeStackFrame_find_offset(frame, args.get(1));
+        X86Encoder_movapd_rbp_reg(&mut self.enc, 0, a_off);
+        X86Encoder_movapd_rbp_reg(&mut self.enc, 1, b_off);
+        X86Encoder_divpd_rr(&mut self.enc, 0, 1);
+        X86Encoder_movapd_mem_rbp(&mut self.enc, dst, 0);
+        return;
+    }
+
     var arg_regs: Vec = Vec::new();
     arg_regs.push(REG_RCX);
     arg_regs.push(REG_RDX);
@@ -3154,6 +3286,23 @@ pub fn PeCodeGen_gen_runtime_stubs(self: &mut PeCodeGen) {
     PeCodeGen_gen_string_repeat(self);
     PeCodeGen_gen_string_bytes(self);
     PeCodeGen_gen_string_clone(self);
+    // Bare-metal port I/O stubs
+    PeCodeGen_gen_p_inb(self);
+    PeCodeGen_gen_p_outb(self);
+    PeCodeGen_gen_p_outw(self);
+    PeCodeGen_gen_p_inw(self);
+    // Bare-metal CPU control stubs
+    PeCodeGen_gen_p_hlt(self);
+    PeCodeGen_gen_p_cli(self);
+    PeCodeGen_gen_p_sti(self);
+    // Bare-metal memory access stubs
+    PeCodeGen_gen_p_mem_read8(self);
+    PeCodeGen_gen_p_mem_write8(self);
+    // Bare-metal serial port stubs
+    PeCodeGen_gen_p_serial_init(self);
+    PeCodeGen_gen_p_serial_write(self);
+    PeCodeGen_gen_p_serial_read(self);
+    PeCodeGen_gen_p_serial_ready(self);
 }
 
 // p_print_int(rcx = value) -- prints an i64 followed by newline
@@ -3385,70 +3534,112 @@ pub fn PeCodeGen_gen_panic(self: &mut PeCodeGen) {
 pub fn PeCodeGen_gen_malloc(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_malloc");
     X86Encoder_place_label(&mut self.enc, lbl);
-    X86Encoder_push(&mut self.enc, REG_RBP);
-    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
-    X86Encoder_push(&mut self.enc, REG_R12);
-    X86Encoder_push(&mut self.enc, REG_R13);
-    X86Encoder_sub_rsp_i32(&mut self.enc, 48);
+    if self.bare_mode {
+        // Bare-metal bump allocator: heap ptr stored at 0x300000
+        // Load current heap ptr from 0x300000
+        X86Encoder_mov_imm64(&mut self.enc, REG_RAX, 0x300000);
+        X86Encoder_mov_reg_ptr(&mut self.enc, REG_RAX, REG_RAX);
+        // Check if first allocation (rax == 0)
+        X86Encoder_test_rr(&mut self.enc, REG_RAX, REG_RAX);
+        var not_first: i64 = X86Encoder_alloc_label(&mut self.enc);
+        X86Encoder_jcc_label(&mut self.enc, 0x5, not_first);
+        // First allocation: set heap ptr to 0x300008
+        X86Encoder_mov_imm64(&mut self.enc, REG_RAX, 0x300008);
+        X86Encoder_place_label(&mut self.enc, not_first);
+        // Save old ptr in r12
+        X86Encoder_push(&mut self.enc, REG_R12);
+        X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RAX);
+        // Align size to 8 bytes: add rcx, 7; and rcx, ~7
+        X86Encoder_emit_u8(&mut self.enc, 0x48);
+        X86Encoder_emit_u8(&mut self.enc, 0x83);
+        X86Encoder_emit_u8(&mut self.enc, 0xC1);
+        X86Encoder_emit_u8(&mut self.enc, 0x07);
+        X86Encoder_emit_u8(&mut self.enc, 0x48);
+        X86Encoder_emit_u8(&mut self.enc, 0x83);
+        X86Encoder_emit_u8(&mut self.enc, 0xE1);
+        X86Encoder_emit_u8(&mut self.enc, 0xF8);
+        // new_ptr = rax + rcx
+        X86Encoder_add_rr(&mut self.enc, REG_RAX, REG_RCX);
+        // Store new heap ptr: [0x300000] = rax
+        X86Encoder_mov_imm64(&mut self.enc, REG_RCX, 0x300000);
+        X86Encoder_mov_ptr_reg(&mut self.enc, REG_RCX, REG_RAX);
+        // Return old ptr
+        X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_R12);
+        X86Encoder_pop(&mut self.enc, REG_R12);
+        X86Encoder_ret(&mut self.enc);
+    } else {
+        // Windows HeapAlloc
+        X86Encoder_push(&mut self.enc, REG_RBP);
+        X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+        X86Encoder_push(&mut self.enc, REG_R12);
+        X86Encoder_push(&mut self.enc, REG_R13);
+        X86Encoder_sub_rsp_i32(&mut self.enc, 48);
 
-    // Save size in r12 before GetProcessHeap clobbers RCX
-    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
+        // Save size in r12 before GetProcessHeap clobbers RCX
+        X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
 
-    // GetProcessHeap()
-    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
-    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_GET_PROCESS_HEAP));
-    X86Encoder_add_rsp_i32(&mut self.enc, 32);
-    X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_RAX); // r13 = heap handle
+        // GetProcessHeap()
+        X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+        X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_GET_PROCESS_HEAP));
+        X86Encoder_add_rsp_i32(&mut self.enc, 32);
+        X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_RAX); // r13 = heap handle
 
-    // HeapAlloc(heap, 0, size)
-    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R13); // heap
-    X86Encoder_xor_self(&mut self.enc, REG_RDX); // flags = 0
-    X86Encoder_mov_rr(&mut self.enc, REG_R8, REG_R12); // size (saved)
-    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
-    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_HEAP_ALLOC));
-    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+        // HeapAlloc(heap, 0, size)
+        X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R13); // heap
+        X86Encoder_xor_self(&mut self.enc, REG_RDX); // flags = 0
+        X86Encoder_mov_rr(&mut self.enc, REG_R8, REG_R12); // size (saved)
+        X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+        X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_HEAP_ALLOC));
+        X86Encoder_add_rsp_i32(&mut self.enc, 32);
 
-    X86Encoder_add_rsp_i32(&mut self.enc, 48);
-    X86Encoder_pop(&mut self.enc, REG_R13);
-    X86Encoder_pop(&mut self.enc, REG_R12);
-    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
-    X86Encoder_pop(&mut self.enc, REG_RBP);
-    X86Encoder_ret(&mut self.enc);
+        X86Encoder_add_rsp_i32(&mut self.enc, 48);
+        X86Encoder_pop(&mut self.enc, REG_R13);
+        X86Encoder_pop(&mut self.enc, REG_R12);
+        X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+        X86Encoder_pop(&mut self.enc, REG_RBP);
+        X86Encoder_ret(&mut self.enc);
+    }
 }
 
 // p_free(rcx = ptr) -- HeapFree the pointer
 pub fn PeCodeGen_gen_free(self: &mut PeCodeGen) {
     var lbl: i64 = PeCodeGen_get_func_label(self, "p_free");
     X86Encoder_place_label(&mut self.enc, lbl);
-    X86Encoder_push(&mut self.enc, REG_RBP);
-    X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
-    X86Encoder_push(&mut self.enc, REG_R12);
-    X86Encoder_push(&mut self.enc, REG_R13);
-    X86Encoder_sub_rsp_i32(&mut self.enc, 48);
+    if self.bare_mode {
+        // Bare-metal: no-op (bump allocator doesn't support freeing)
+        X86Encoder_ret(&mut self.enc);
+    } else {
+        // Windows HeapFree
+        X86Encoder_push(&mut self.enc, REG_RBP);
+        X86Encoder_mov_rr(&mut self.enc, REG_RBP, REG_RSP);
+        X86Encoder_push(&mut self.enc, REG_R12);
+        X86Encoder_push(&mut self.enc, REG_R13);
+        X86Encoder_sub_rsp_i32(&mut self.enc, 48);
 
-    // Save ptr in r12
-    X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
+        // Save ptr in r12
+        X86Encoder_mov_rr(&mut self.enc, REG_R12, REG_RCX);
 
-    // GetProcessHeap()
-    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
-    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_GET_PROCESS_HEAP));
-    X86Encoder_add_rsp_i32(&mut self.enc, 32);
-    X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_RAX); // r13 = heap handle
+        // GetProcessHeap()
+        X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+        X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_GET_PROCESS_HEAP));
+        X86Encoder_add_rsp_i32(&mut self.enc, 32);
+        X86Encoder_mov_rr(&mut self.enc, REG_R13, REG_RAX); // r13 = heap handle
 
-    // HeapFree(heap, 0, ptr)
-    X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R13); // heap
-    X86Encoder_xor_self(&mut self.enc, REG_RDX); // flags = 0
-    X86Encoder_mov_rr(&mut self.enc, REG_R8, REG_R12); // ptr (saved)
-    X86Encoder_sub_rsp_i32(&mut self.enc, 32);
-    X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_HEAP_FREE));
-    X86Encoder_add_rsp_i32(&mut self.enc, 32);
+        // HeapFree(heap, 0, ptr)
+        X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_R13); // heap
+        X86Encoder_xor_self(&mut self.enc, REG_RDX); // flags = 0
+        X86Encoder_mov_rr(&mut self.enc, REG_R8, REG_R12); // ptr (saved)
+        X86Encoder_sub_rsp_i32(&mut self.enc, 32);
+        X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_HEAP_FREE));
+        X86Encoder_add_rsp_i32(&mut self.enc, 32);
 
-    X86Encoder_add_rsp_i32(&mut self.enc, 48);
-    X86Encoder_pop(&mut self.enc, REG_R13);
-    X86Encoder_pop(&mut self.enc, REG_R12);
-    X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
-    X86Encoder_pop(&mut self.enc, REG_RBP);
-    X86Encoder_ret(&mut self.enc);
+        X86Encoder_add_rsp_i32(&mut self.enc, 48);
+        X86Encoder_pop(&mut self.enc, REG_R13);
+        X86Encoder_pop(&mut self.enc, REG_R12);
+        X86Encoder_mov_rr(&mut self.enc, REG_RSP, REG_RBP);
+        X86Encoder_pop(&mut self.enc, REG_RBP);
+        X86Encoder_ret(&mut self.enc);
+    }
 }
 
 // p_str_concat(rcx = left, rdx = right) -> rax = new string
@@ -4950,6 +5141,448 @@ pub fn PeCodeGen_gen_entry_point(self: &mut PeCodeGen) {
     X86Encoder_mov_rr(&mut self.enc, REG_RCX, REG_RAX);
     X86Encoder_call_rip(&mut self.enc, PeCodeGen_iat_off(self, IAT_EXIT_PROCESS));
     X86Encoder_ud2(&mut self.enc);
+}
+
+// ===========================================================================
+// Multiboot2 boot entry point (ported from src/pe.rs gen_boot_entry_point)
+// ===========================================================================
+// When GRUB loads the kernel, it jumps to the entry point with:
+//   eax = 0x36d76289 (MB2_BOOTLOADER_MAGIC)
+//   ebx = multiboot info structure address
+//   32-bit protected mode, paging disabled
+// We must switch to 64-bit long mode before calling main(), because the
+// Fides compiler generates 64-bit code.
+
+pub fn PeCodeGen_gen_boot_entry_point(self: &mut PeCodeGen) {
+    self.entry_offset = X86Encoder_offset(&self.enc);
+
+    // ─── 32-bit trampoline to switch to long mode ───────────────────
+    // Set up temporary stack: mov esp, 0x90000
+    X86Encoder_emit_u8(&mut self.enc, 0xBC);
+    X86Encoder_emit_u32(&mut self.enc, 0x90000);
+
+    // Load GDT: lgdt [gdt_desc]
+    X86Encoder_emit_u8(&mut self.enc, 0x0F);
+    X86Encoder_emit_u8(&mut self.enc, 0x01);
+    X86Encoder_emit_u8(&mut self.enc, 0x15);
+    var lgdt_patch_offset: i64 = X86Encoder_offset(&self.enc);
+    X86Encoder_emit_u32(&mut self.enc, 0); // placeholder for gdt_desc address
+
+    // Enable PAE: mov eax, cr4; or eax, 0x20; mov cr4, eax
+    X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x20); X86Encoder_emit_u8(&mut self.enc, 0xE0);
+    X86Encoder_emit_u8(&mut self.enc, 0x0D); X86Encoder_emit_u32(&mut self.enc, 0x20);
+    X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x22); X86Encoder_emit_u8(&mut self.enc, 0xE0);
+
+    // Zero out page table memory (4 pages at 0x70000)
+    // mov edi, 0x70000
+    X86Encoder_emit_u8(&mut self.enc, 0xBF);
+    X86Encoder_emit_u32(&mut self.enc, 0x70000);
+    // mov ecx, 0x800
+    X86Encoder_emit_u8(&mut self.enc, 0xB9);
+    X86Encoder_emit_u32(&mut self.enc, 0x800);
+    // xor eax, eax
+    X86Encoder_emit_u8(&mut self.enc, 0x31); X86Encoder_emit_u8(&mut self.enc, 0xC0);
+    // rep stosd
+    X86Encoder_emit_u8(&mut self.enc, 0xF3); X86Encoder_emit_u8(&mut self.enc, 0xAB);
+
+    // PML4[0] = 0x71000 | 3 (present + writable)
+    // mov dword [0x70000], 0x71003
+    X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x05);
+    X86Encoder_emit_u32(&mut self.enc, 0x70000);
+    X86Encoder_emit_u32(&mut self.enc, 0x71003);
+
+    // PDPT[0] = 0x83 (present + writable + huge page, maps first 1GB)
+    // mov dword [0x71000], 0x83
+    X86Encoder_emit_u8(&mut self.enc, 0xC7); X86Encoder_emit_u8(&mut self.enc, 0x05);
+    X86Encoder_emit_u32(&mut self.enc, 0x71000);
+    X86Encoder_emit_u32(&mut self.enc, 0x83);
+
+    // Load CR3: mov eax, 0x70000; mov cr3, eax
+    X86Encoder_emit_u8(&mut self.enc, 0xB8);
+    X86Encoder_emit_u32(&mut self.enc, 0x70000);
+    X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x22); X86Encoder_emit_u8(&mut self.enc, 0xD8);
+
+    // Enable long mode: mov ecx, 0xC0000080; rdmsr; or eax, 0x100; wrmsr
+    X86Encoder_emit_u8(&mut self.enc, 0xB9);
+    X86Encoder_emit_u32(&mut self.enc, 0xC0000000 + 0x80);
+    X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x32);
+    X86Encoder_emit_u8(&mut self.enc, 0x0D); X86Encoder_emit_u32(&mut self.enc, 0x100);
+    X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x30);
+
+    // Enable paging: mov eax, cr0; or eax, 0x80000001; mov cr0, eax
+    X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x20); X86Encoder_emit_u8(&mut self.enc, 0xC0);
+    X86Encoder_emit_u8(&mut self.enc, 0x0D); X86Encoder_emit_u32(&mut self.enc, 0x80000000 + 0x01);
+    X86Encoder_emit_u8(&mut self.enc, 0x0F); X86Encoder_emit_u8(&mut self.enc, 0x22); X86Encoder_emit_u8(&mut self.enc, 0xC0);
+
+    // Far jump to 64-bit code segment (selector 0x08)
+    // ljmp 0x08:long_mode_start
+    X86Encoder_emit_u8(&mut self.enc, 0xEA); // ljmp ptr16:32
+    var ljmp_target_patch: i64 = X86Encoder_offset(&self.enc);
+    X86Encoder_emit_u32(&mut self.enc, 0); // offset (patch later)
+    X86Encoder_emit_u16(&mut self.enc, 0x08); // segment selector 0x08
+
+    // ─── GDT ───────────────────────────────────────────────────────
+    // Align to 8 bytes
+    while X86Encoder_offset(&self.enc) % 8 != 0 {
+        X86Encoder_emit_u8(&mut self.enc, 0x90); // nop padding
+    }
+    var gdt_offset: i64 = X86Encoder_offset(&self.enc);
+
+    // Null descriptor (8 bytes)
+    var gi: i64 = 0;
+    while gi < 8 { X86Encoder_emit_u8(&mut self.enc, 0); gi = gi + 1; }
+
+    // Code segment (64-bit): base=0, limit=0, access=0x9A, flags=0x20 (L=1, D=0)
+    // GDT entry: [limit_lo(2)][base_lo(2)][base_mid(1)][access(1)][flags+limit_hi(1)][base_hi(1)]
+    X86Encoder_emit_u16(&mut self.enc, 0); // limit_lo
+    X86Encoder_emit_u16(&mut self.enc, 0); // base_lo
+    X86Encoder_emit_u8(&mut self.enc, 0); // base_mid
+    X86Encoder_emit_u8(&mut self.enc, 0x9A); // access
+    X86Encoder_emit_u8(&mut self.enc, 0x20); // flags (L=1, D=0)
+    X86Encoder_emit_u8(&mut self.enc, 0); // base_hi
+
+    // Data segment (64-bit): base=0, limit=0, access=0x92, flags=0x00
+    X86Encoder_emit_u16(&mut self.enc, 0); // limit_lo
+    X86Encoder_emit_u16(&mut self.enc, 0); // base_lo
+    X86Encoder_emit_u8(&mut self.enc, 0); // base_mid
+    X86Encoder_emit_u8(&mut self.enc, 0x92); // access
+    X86Encoder_emit_u8(&mut self.enc, 0); // flags
+    X86Encoder_emit_u8(&mut self.enc, 0); // base_hi
+
+    // GDT descriptor
+    var gdt_desc_offset: i64 = X86Encoder_offset(&self.enc);
+    // Size (limit): 23 bytes (3 entries * 8 - 1)
+    X86Encoder_emit_u16(&mut self.enc, 0x17);
+    // Base address: will be patched
+    var gdt_base_patch: i64 = X86Encoder_offset(&self.enc);
+    X86Encoder_emit_u32(&mut self.enc, 0); // base (patch later)
+
+    // ─── 64-bit code ────────────────────────────────────────────────
+    var long_mode_offset: i64 = X86Encoder_offset(&self.enc);
+
+    // Set up 64-bit stack: mov rsp, 0x90000
+    X86Encoder_emit_u8(&mut self.enc, 0x48); // REX.W
+    X86Encoder_emit_u8(&mut self.enc, 0xBC);
+    X86Encoder_emit_u64(&mut self.enc, 0x90000);
+    // mov rbp, rsp
+    X86Encoder_emit_u8(&mut self.enc, 0x48); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0xE5);
+
+    // Push 0 (fake return address)
+    X86Encoder_emit_u8(&mut self.enc, 0x6A); X86Encoder_emit_u8(&mut self.enc, 0x00);
+
+    // ─── Direct VGA test: write 'F' to VGA memory at 0xB8000 ───────────
+    // This bypasses all function calls to verify VGA memory is accessible.
+    // mov rax, 0xB8000
+    X86Encoder_emit_u8(&mut self.enc, 0x48);
+    X86Encoder_emit_u8(&mut self.enc, 0xB8);
+    X86Encoder_emit_u8(&mut self.enc, 0x00);
+    X86Encoder_emit_u8(&mut self.enc, 0x80);
+    X86Encoder_emit_u8(&mut self.enc, 0x0B);
+    X86Encoder_emit_u8(&mut self.enc, 0x00);
+    X86Encoder_emit_u8(&mut self.enc, 0x00);
+    X86Encoder_emit_u8(&mut self.enc, 0x00);
+    X86Encoder_emit_u8(&mut self.enc, 0x00);
+    // mov byte [rax], 0x46  ('F')
+    X86Encoder_emit_u8(&mut self.enc, 0xC6);
+    X86Encoder_emit_u8(&mut self.enc, 0x00);
+    X86Encoder_emit_u8(&mut self.enc, 0x46);
+    // mov byte [rax+1], 0x07  (attribute: white on black)
+    X86Encoder_emit_u8(&mut self.enc, 0xC6);
+    X86Encoder_emit_u8(&mut self.enc, 0x40);
+    X86Encoder_emit_u8(&mut self.enc, 0x01);
+    X86Encoder_emit_u8(&mut self.enc, 0x07);
+
+    // Call main()
+    var main_label: i64 = PeCodeGen_get_func_label(self, "main");
+    X86Encoder_call_label(&mut self.enc, main_label);
+
+    // Halt loop: cli; hlt; jmp -3
+    X86Encoder_emit_u8(&mut self.enc, 0xFA); // cli (disable interrupts)
+    X86Encoder_emit_u8(&mut self.enc, 0xF4); // hlt
+    X86Encoder_emit_u8(&mut self.enc, 0xEB); X86Encoder_emit_u8(&mut self.enc, 0xFD); // jmp -3
+
+    // ─── Patch addresses ────────────────────────────────────────────
+    // Binary layout: [MB2 header (24 bytes)][code][rdata]
+    // Code is loaded at 0x100000 + 24 = 0x100018
+    var MB2_HEADER_SIZE: i64 = 24;
+    var LOAD_ADDR: i64 = 0x100000;
+    var CODE_BASE: i64 = LOAD_ADDR + MB2_HEADER_SIZE;
+
+    // Patch lgdt address (absolute m32)
+    var lgdt_addr: i64 = CODE_BASE + gdt_desc_offset;
+    self.enc.code.set(lgdt_patch_offset, lgdt_addr & 0xFF);
+    self.enc.code.set(lgdt_patch_offset + 1, (lgdt_addr >> 8) & 0xFF);
+    self.enc.code.set(lgdt_patch_offset + 2, (lgdt_addr >> 16) & 0xFF);
+    self.enc.code.set(lgdt_patch_offset + 3, (lgdt_addr >> 24) & 0xFF);
+
+    // Patch ljmp target (absolute 32-bit offset)
+    var ljmp_addr: i64 = CODE_BASE + long_mode_offset;
+    self.enc.code.set(ljmp_target_patch, ljmp_addr & 0xFF);
+    self.enc.code.set(ljmp_target_patch + 1, (ljmp_addr >> 8) & 0xFF);
+    self.enc.code.set(ljmp_target_patch + 2, (ljmp_addr >> 16) & 0xFF);
+    self.enc.code.set(ljmp_target_patch + 3, (ljmp_addr >> 24) & 0xFF);
+
+    // Patch GDT base (absolute linear address)
+    var gdt_base: i64 = CODE_BASE + gdt_offset;
+    self.enc.code.set(gdt_base_patch, gdt_base & 0xFF);
+    self.enc.code.set(gdt_base_patch + 1, (gdt_base >> 8) & 0xFF);
+    self.enc.code.set(gdt_base_patch + 2, (gdt_base >> 16) & 0xFF);
+    self.enc.code.set(gdt_base_patch + 3, (gdt_base >> 24) & 0xFF);
+}
+
+// ===========================================================================
+// Bare-metal port I/O stubs (ported from src/pe.rs)
+// ===========================================================================
+
+// p_inb(rcx = port) -> rax = byte — read from I/O port
+// Calling convention: first arg in rcx (no env pointer for extern)
+pub fn PeCodeGen_gen_p_inb(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_inb");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // mov dx, cx (port to dx)
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0xCA);
+        // xor rax, rax
+        X86Encoder_xor_rr(&mut self.enc, REG_RAX, REG_RAX);
+        // in al, dx
+        X86Encoder_emit_u8(&mut self.enc, 0xEC);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_outb(rcx = port, rdx = value) — write to I/O port
+// Calling convention: first arg in rcx, second in rdx (no env pointer for extern)
+pub fn PeCodeGen_gen_p_outb(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_outb");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // mov al, dl (value to al — must do before overwriting dx)
+        X86Encoder_emit_u8(&mut self.enc, 0x88); X86Encoder_emit_u8(&mut self.enc, 0xD0);
+        // mov dx, cx (port to dx)
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0xCA);
+        // out dx, al
+        X86Encoder_emit_u8(&mut self.enc, 0xEE);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_outw(rcx = port, rdx = value) — write 16-bit word to I/O port
+pub fn PeCodeGen_gen_p_outw(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_outw");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // mov ax, dx (value to ax — must do before overwriting dx)
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0xD0);
+        // mov dx, cx (port to dx)
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0xCA);
+        // out dx, ax
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xEF);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_inw(rcx = port) -> rax = word — read 16-bit from I/O port
+pub fn PeCodeGen_gen_p_inw(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_inw");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // mov dx, cx (port to dx)
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0x89); X86Encoder_emit_u8(&mut self.enc, 0xCA);
+        // xor rax, rax
+        X86Encoder_xor_rr(&mut self.enc, REG_RAX, REG_RAX);
+        // in ax, dx
+        X86Encoder_emit_u8(&mut self.enc, 0x66); X86Encoder_emit_u8(&mut self.enc, 0xED);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_hlt() — halt CPU (hlt only; interrupts must be enabled for wakeup)
+pub fn PeCodeGen_gen_p_hlt(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_hlt");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        X86Encoder_emit_u8(&mut self.enc, 0xF4); // hlt (no cli — interrupts wake the CPU)
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_cli() — clear interrupt flag
+pub fn PeCodeGen_gen_p_cli(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_cli");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        X86Encoder_emit_u8(&mut self.enc, 0xFA); // cli
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_sti() — set interrupt flag
+pub fn PeCodeGen_gen_p_sti(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_sti");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        X86Encoder_emit_u8(&mut self.enc, 0xFB); // sti
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_mem_read8(rcx=addr) -> rax — read 1 byte from memory
+pub fn PeCodeGen_gen_p_mem_read8(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_mem_read8");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // movzx eax, byte [rcx]
+        X86Encoder_emit_u8(&mut self.enc, 0x0F);
+        X86Encoder_emit_u8(&mut self.enc, 0xB6);
+        X86Encoder_emit_u8(&mut self.enc, 0x01);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_mem_write8(rcx=addr, rdx=val) — write 1 byte to memory
+pub fn PeCodeGen_gen_p_mem_write8(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_mem_write8");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // mov [rcx], dl
+        X86Encoder_emit_u8(&mut self.enc, 0x88);
+        X86Encoder_emit_u8(&mut self.enc, 0x11);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_serial_init() — initialize COM1 serial port (115200 baud, 8N1)
+pub fn PeCodeGen_gen_p_serial_init(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_serial_init");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // Disable interrupts: outb(0x3F9, 0x00)
+        X86Encoder_mov_imm32(&mut self.enc, REG_RDX, 0x3F9);
+        X86Encoder_xor_rr(&mut self.enc, REG_RAX, REG_RAX);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE); // out dx, al
+
+        // Enable DLAB: outb(0x3FB, 0x80)
+        X86Encoder_mov_imm32(&mut self.enc, REG_RDX, 0x3FB);
+        X86Encoder_mov_imm32(&mut self.enc, REG_RAX, 0x80);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE); // out dx, al
+
+        // Set divisor low byte (115200 baud = divisor 1): outb(0x3F8, 0x01)
+        X86Encoder_mov_imm32(&mut self.enc, REG_RDX, 0x3F8);
+        X86Encoder_mov_imm32(&mut self.enc, REG_RAX, 0x01);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE); // out dx, al
+
+        // Set divisor high byte: outb(0x3F9, 0x00)
+        X86Encoder_mov_imm32(&mut self.enc, REG_RDX, 0x3F9);
+        X86Encoder_xor_rr(&mut self.enc, REG_RAX, REG_RAX);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE); // out dx, al
+
+        // 8 bits, no parity, 1 stop bit: outb(0x3FB, 0x03)
+        X86Encoder_mov_imm32(&mut self.enc, REG_RDX, 0x3FB);
+        X86Encoder_mov_imm32(&mut self.enc, REG_RAX, 0x03);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE); // out dx, al
+
+        // Enable FIFO, clear them, 14-byte threshold: outb(0x3FA, 0xC7)
+        X86Encoder_mov_imm32(&mut self.enc, REG_RDX, 0x3FA);
+        X86Encoder_mov_imm32(&mut self.enc, REG_RAX, 0xC7);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE); // out dx, al
+
+        // IRQs enabled, RTS/DSR set: outb(0x3FC, 0x0B)
+        X86Encoder_mov_imm32(&mut self.enc, REG_RDX, 0x3FC);
+        X86Encoder_mov_imm32(&mut self.enc, REG_RAX, 0x0B);
+        X86Encoder_emit_u8(&mut self.enc, 0xEE); // out dx, al
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_serial_write(rcx = char) — write one byte to COM1
+pub fn PeCodeGen_gen_p_serial_write(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_serial_write");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // Wait for transmit buffer empty (LSR bit 5)
+        var sw_wait: i64 = X86Encoder_alloc_label(&mut self.enc);
+        X86Encoder_place_label(&mut self.enc, sw_wait);
+        X86Encoder_mov_imm32(&mut self.enc, REG_RDX, 0x3FD); // LSR
+        X86Encoder_emit_u8(&mut self.enc, 0xEC); // in al, dx
+        X86Encoder_emit_u8(&mut self.enc, 0xA8); // test al, 0x20
+        X86Encoder_emit_u8(&mut self.enc, 0x20);
+        X86Encoder_jcc_label(&mut self.enc, 0x4, sw_wait); // jz (wait)
+
+        // Send byte: outb(0x3F8, char)
+        X86Encoder_mov_imm32(&mut self.enc, REG_RDX, 0x3F8); // THR
+        X86Encoder_mov_rr(&mut self.enc, REG_RAX, REG_RCX); // al = char
+        X86Encoder_emit_u8(&mut self.enc, 0xEE); // out dx, al
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_serial_read() -> rax = byte — read one byte from COM1
+pub fn PeCodeGen_gen_p_serial_read(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_serial_read");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // Wait for data ready (LSR bit 0)
+        var sr_wait: i64 = X86Encoder_alloc_label(&mut self.enc);
+        X86Encoder_place_label(&mut self.enc, sr_wait);
+        X86Encoder_mov_imm32(&mut self.enc, REG_RDX, 0x3FD); // LSR
+        X86Encoder_emit_u8(&mut self.enc, 0xEC); // in al, dx
+        X86Encoder_emit_u8(&mut self.enc, 0xA8); // test al, 0x01
+        X86Encoder_emit_u8(&mut self.enc, 0x01);
+        X86Encoder_jcc_label(&mut self.enc, 0x4, sr_wait); // jz (wait)
+
+        // Read byte: in al, 0x3F8
+        X86Encoder_mov_imm32(&mut self.enc, REG_RDX, 0x3F8); // RBR
+        X86Encoder_emit_u8(&mut self.enc, 0xEC); // in al, dx
+        // movzx eax, al (zero-extend)
+        X86Encoder_emit_u8(&mut self.enc, 0x0F);
+        X86Encoder_emit_u8(&mut self.enc, 0xB6);
+        X86Encoder_emit_u8(&mut self.enc, 0xC0);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
+}
+
+// p_serial_ready() -> rax = bool — check if data is available
+pub fn PeCodeGen_gen_p_serial_ready(self: &mut PeCodeGen) {
+    var lbl: i64 = PeCodeGen_get_func_label(self, "p_serial_ready");
+    X86Encoder_place_label(&mut self.enc, lbl);
+    if self.bare_mode {
+        // Read LSR and check bit 0 (data ready)
+        X86Encoder_mov_imm32(&mut self.enc, REG_RDX, 0x3FD); // LSR
+        X86Encoder_emit_u8(&mut self.enc, 0xEC); // in al, dx
+        X86Encoder_emit_u8(&mut self.enc, 0x24); // and al, 0x01
+        X86Encoder_emit_u8(&mut self.enc, 0x01);
+        // movzx eax, al
+        X86Encoder_emit_u8(&mut self.enc, 0x0F);
+        X86Encoder_emit_u8(&mut self.enc, 0xB6);
+        X86Encoder_emit_u8(&mut self.enc, 0xC0);
+    } else {
+        X86Encoder_ud2(&mut self.enc);
+    }
+    X86Encoder_ret(&mut self.enc);
 }
 
 // ===========================================================================

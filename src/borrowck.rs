@@ -341,6 +341,11 @@ impl<'tc> BorrowChecker<'tc> {
                     for s in def { self.collect_var_uses_stmt(s, idx); }
                 }
             }
+            Stmt::Parallel { branches, .. } => {
+                for branch in branches {
+                    for s in branch { self.collect_var_uses_stmt(s, idx); }
+                }
+            }
         }
     }
 
@@ -981,6 +986,13 @@ impl<'tc> BorrowChecker<'tc> {
                 if let Some(ref def) = default {
                     self.push_scope();
                     for s in def { self.check_stmt(s); }
+                    self.pop_scope();
+                }
+            }
+            Stmt::Parallel { branches, .. } => {
+                for branch in branches {
+                    self.push_scope();
+                    for s in branch { self.check_stmt(s); }
                     self.pop_scope();
                 }
             }

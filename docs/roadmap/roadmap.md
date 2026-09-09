@@ -1,7 +1,7 @@
 # Fides Roadmap — Milestones to World Domination
 
 > Not a task list. A map of mountains to climb.
-> Last updated: Sep 9, 2026 (v1.0.0 released — Windows installer working, self-hosted compiler stable).
+> Last updated: Sep 9, 2026 (session 22 — roadmap audited against actual codebase, bugs 3.16–3.19 fixed).
 
 ## Overview
 
@@ -9,44 +9,41 @@
 Phase 1: Foundation          ← COMPLETE — 137/137 all backends, zero regressions
 Phase 2: Safety              ← COMPLETE — compile-time safety + binary hardening
 Phase 3: Power               ← COMPLETE — all features work in all backends
-Phase 4: Performance         ← MOSTLY COMPLETE — optimizer + LTO + loop-vec + SLP + parallel passes + incremental; AVX2/SSE2 vector codegen + graph-coloring regalloc remaining
+Phase 4: Performance         ← MOSTLY COMPLETE — optimizer + LTO + loop-vec + SLP + parallel passes + incremental; SSE2 packed double codegen DONE (addpd/subpd/mulpd/divpd/movapd in both Rust + self-hosted PE emitter); AVX2/VEX encoders in src/pe.rs; graph-coloring regalloc remaining
 Phase 5: Platform            ← MOSTLY COMPLETE — cross-compilation to ARM64/RISC-V/Windows done; DWARF debug info remaining
 Phase 6: AI/ML               ← COMPLETE — pipeline, layers, shapes, GPU, quantization, KV cache, DP (epsilon budget tracking), sharding (simulated multi-rank), tape-based autodiff (runtime gradient computation), gradient checkpointing (activation recompute)
 Phase 7: Ergonomics          ← MOSTLY COMPLETE — guard, spread, ?., ??, is, contracts, @memo; @differentiable typecheck + runtime autograd done
-Phase 7.5: Tier 1 Safety     ← COMPLETE — all safety annotations + @constant_time + @tainted
-Phase 7.55: Borrow Checker   ← COMPLETE — Rules 1-3, field-wise, two-phase, NLL, default on, @send/@sync
-Phase 7.6: Async/Await       ← MOSTLY COMPLETE — executor, non-blocking poll, async IO, channels, select; state machine transform (stackless coroutines) + PE stack traces remaining
+Phase 7.5: Tier 1 Safety     ← MOSTLY COMPLETE — all safety annotations enforced; @tainted propagation DONE (full data-flow taint tracking with sanitizer/sink recognition), @constant_time + @tainted effect checks done
+Phase 7.55: Borrow Checker   ← COMPLETE — Rules 1-3, field-wise, two-phase, NLL, default on; @send/@sync NOT implemented (annotations not parsed)
+Phase 7.6: Async/Await       ← MOSTLY COMPLETE — executor, non-blocking poll, async IO, channels, select; state machine transform (parser has parse_state_machine, lower doesn't use it) + PE stack traces remaining
 Phase 8A: Vec/Mat Math        ← COMPLETE — vec2/vec3/vec4, mat4, quat, swizzle, operator overloading, shape checking
 Phase 8B: ECS/States/Events   ← COMPLETE — component/system/query, state_machine, event handlers
-Phase 8C: Shaders/SIMD       ← PARTIAL — SIMD stdlib + SPIR-V GPU codegen; @shader/@simd annotations not implemented
-Phase 8D: Game Stdlib         ← COMPLETE — 8 game stdlib modules (test_game_stdlib now passes — &mut T auto-deref fix)
+Phase 8C: Shaders/SIMD       ← PARTIAL — SIMD stdlib (59 LOC stub) + SPIR-V GPU codegen (826 LOC); @shader/@simd annotations not implemented; GPU/WASM not wired into CLI
+Phase 8D: Game Stdlib         ← COMPLETE — 26 game stdlib modules, 9,140 LOC (session 21)
 Phase 9: Industry Domains    ← NOT STARTED — only stdlib/banking.fd exists; medical/blockchain/robotics/automotive not built
-Phase 10: Self-Hosting       ← COMPLETE — 50 modules, 91,924 LOC. Fixpoint achieved (c2==c3, 0 diffs). 38/38 self-host tests pass. v1.0.0 released with Windows installer.
-Phase 10B: PE Emitter Rewrite ← NOT STARTED — rewrite pe.rs in Fides after C codegen bootstrap. Fix Issues 67-69 first, then rewrite PE emitter in Fides, then switch default backend to PE for zero-dependency deployment. C backend stays as fallback.
+Phase 10: Self-Hosting       ← PARTIAL — 50 modules, 93,605 LOC. 38/38 self-host tests pass. Self-compilation SEGFAULTS in Lowerer_mangle_method. Fixpoint NOT verifiable (fides-c2.c missing). v1.0.0 installer released.
+Phase 10B: PE Emitter Rewrite ← PARTIAL — compiler/pe.fd exists (6,448 LOC, ported from src/pe.rs). Not a from-scratch rewrite. @cpu_local + inline asm clobbers implemented. Full parity with Rust reference not verified.
 Phase 10C: Windows Installer ← COMPLETE — NSIS installer (Fides-Setup-1.0.0.exe, 2.5 MB) tested on Windows. GitHub Actions CI builds automatically on release tags.
-Phase 11: Ecosystem          ← IN PROGRESS — LSP (diag+completion+hover+def), formatter, linter, bench, profile
-Phase 12: Security Hardening ← MOSTLY COMPLETE — binary hardening + all safety annotations; CFI + full taint tracking + runtime sandbox remaining
-Phase 13: World Class        ← IN PROGRESS — type inference done, SLP+loop-vec done, @send/@sync done, debugger done, ark package manager done, scribe doc generator done, veil coverage tool done, green threads remaining
-Phase 14: Debugging Tools    ← COMPLETE — interpreter debugger, record/replay, hot-reload, post-mortem, native debugger
+Phase 11: Ecosystem          ← IN PROGRESS — LSP DONE (wired into CLI, JSON-RPC server with diagnostics/completion/hover/definition/rename); ark DONE (wired into CLI, package manager with init/add/install/remove/list/lock/update/search/publish); formatter, linter, bench, profile work; scribe + veil wired into CLI
+Phase 12: Security Hardening ← PARTIAL — binary hardening done; all safety annotations enforced (effect-based); CFI not started; taint tracking DONE (full data-flow with sanitizer/sink recognition); sandbox blocks implemented in lower
+Phase 13: World Class        ← IN PROGRESS — type inference done, SLP+loop-vec done, debugger done, scribe doc generator done, veil coverage tool done; @send/@sync NOT done, ark package manager DONE (wired into CLI), green threads NOT started
+Phase 14: Debugging Tools    ← COMPLETE — interpreter debugger (977 LOC), record/replay, hot-reload (635 LOC), post-mortem, native debugger (544 LOC)
 Phase 15: Compete Where We Lose ← NOT STARTED — win in web/data-science/prototyping/games without adding a runtime (arena allocators, comptime frameworks, ergonomic modes)
-Phase 16: Tier 3 OS           ← IN PROGRESS — @cpu_local, inline asm clobbers, --no-std, cross-compilation dispatch, UEFI bindings done; ARM64/RISC-V native codegen + bare runtime stubs remaining
+Phase 16: Tier 3 OS           ← PARTIAL — @cpu_local (pe.fd only), inline asm clobbers (pe.fd), --bare/--boot mode, cross-compilation dispatch done; UEFI bindings NOT done (stdlib/uefi.fd missing), kernel.fd missing, ARM64/RISC-V native codegen + bare runtime stubs remaining
 ```
 
-### Verified Test Baseline (Aug 2026)
+### Verified Test Baseline (Sep 9, 2026 — session 22 audit)
 
 | Backend | Result | Notes |
 |---------|--------|-------|
-| Unit tests (`cargo test --lib`) | **265/265** | All passing (incl. 47 cross-compilation tests + 7 incremental compilation) |
-| Harness tests | **8/8** | All passing |
-| Interpreter | **164/165** normal | 1 fail: test_compiler_sized (user-added, unrelated). |
-| C Codegen | **164/165** matched | 1 fail: test_compiler_sized. Binary hardening enabled. |
-| PE Emitter | **165/165** valid | All normal tests pass. |
-| Skip list | **4** tests | 3 C codegen missing-builtins (kv_cache, quantization, dp) + 1 design difference (dlopen). Was 42 — 37 stale + 3 more after runtime effects fix. |
-| Known-fail | **0** tests | All previously known-fail tests now pass on all 3 backends. |
-| Expected-fail | **35** tests | Correctly fail — error detection tests. |
-| Total `.fd` test files | **218** | 195 in root + 23 in subdirs (capability/effects/regions/safety) |
-| Source files | **51** `.rs` | 86,742 LOC Rust |
-| Stdlib files | **99** `.fd` | 28,370 LOC Fides |
+| Self-host tests | **38/38** | All 3 backends (Interpreter, C Codegen, PE Emitter) — 0 regressions |
+| Rust bootstrap build | **OK** | 6 warnings, 0 errors |
+| Self-compilation | **FAILS** | SIGSEGV in `Lowerer_mangle_method` during lowering. Pre-existing. |
+| Fixpoint (c2==c3) | **UNVERIFIABLE** | `release/fides-c2.c` does not exist |
+| Total `.fd` test files | **303** | 261 in tests/bootstrap/ + 42 in tests/selfhost/ |
+| Compiler modules | **50** `.fd` | 93,605 LOC Fides (was claimed 91,924 — stale) |
+| Stdlib modules | **99** `.fd` | 28,370 LOC Fides |
+| Rust source | **55** `.rs` | ~93,269 LOC Rust (incl. src/bin/) |
 
 ### Security Hardening (New — Aug 2026)
 
@@ -189,7 +186,9 @@ based alias analysis. Cost model for vectorization profitability.
 - [x] Cost model for vectorization profitability
 
 ### What's Left
-- [ ] SSE2/AVX2 instruction emission in codegen (loop-vec produces scalar unrolled code, not SIMD instructions)
+- [x] SSE2 packed double instruction emission — `addpd`/`subpd`/`mulpd`/`divpd`/`movapd` in `src/codegen_x64.rs` (textual asm), `src/pe.rs` (encoded bytes), and `compiler/pe.fd` (self-hosted PE emitter)
+- [ ] AVX2/VEX instruction emission in codegen_x64.rs (VEX encoders exist in src/pe.rs but not used by textual asm path)
+- [ ] Loop-vec to use SIMD instructions (currently produces scalar unrolled code, not SIMD instructions)
 - [ ] Graph coloring register allocator (linear scan is "good enough")
 
 ---
@@ -315,11 +314,12 @@ budget tracking, and tensor parallelism (simulated multi-rank) all work.
 
 ---
 
-## Phase 7.55 — Borrow Checker (COMPLETE)
+## Phase 7.55 — Borrow Checker (MOSTLY COMPLETE)
 
 **Goal:** Prevent aliasing and data races at compile time.
 
-**Status:** Complete — Phases 1-6 done, plus @send/@sync for cross-thread safety.
+**Status:** Phases 1-6 done. @send/@sync NOT implemented (0 matches in
+`compiler/lower.fd` or `src/lower.rs` — annotations are not parsed).
 
 ### Milestones
 - [x] Rule 1: No `&mut x` while any borrow active
@@ -330,12 +330,10 @@ budget tracking, and tensor parallelism (simulated multi-rank) all work.
 - [x] NLL (Non-Lexical Lifetimes) — borrows released at last use, not scope end
 - [x] Default on — `--borrowck=off|warn|on` (on by default)
 - [x] `unsafe {}` blocks skip borrow checking
-- [x] Multi-threaded data race prevention (@send/@sync) — IMPLEMENTED
-  `@send` annotation on structs marks types safe to send across threads.
-  `@sync` annotation marks types safe to share across threads. Compile-time
-  checks: `spawn` captures must be `@send`, `p_chan_send` values must be `@send`,
-  `p_thread_spawn` args must be `@send`. References (&T) and raw pointers are
-  never `@send`. Primitives are always `@send` and `@sync`.
+- [ ] Multi-threaded data race prevention (@send/@sync) — NOT IMPLEMENTED
+  `@send` and `@sync` annotations are not parsed by the compiler.
+  0 matches for `@send` or `@sync` in `compiler/lower.fd` or `src/lower.rs`.
+  Previously claimed as done — this was incorrect.
 - [x] Closures in borrow checker — `Expr::Closure` handled in `borrowck.rs`.
   Captured variables are correctly tracked. Closure body is checked in a new
   scope. Closure params are local to the closure scope (no borrow tracking
@@ -386,7 +384,7 @@ shaders remaining.
 - [x] Operator overloading (+, -, *, / on vec types) — compiler rewrites to method calls
 - [x] Free functions: radians, degrees, lerp, distance, translate, mat_scale
 - [x] Shape checking (vec3 + vec2 → compile error) — enforced in typechecker.rs
-- [ ] SIMD codegen (SSE/AVX/NEON) — currently uses scalar ops
+- [x] SIMD codegen (SSE2) — `p_simd_add/sub/mul/div` emit `addpd/subpd/mulpd/divpd` in `src/codegen_x64.rs`, `src/pe.rs`, and `compiler/pe.fd`
 
 ### Phase 8B: ECS/States/Events (COMPLETE)
 - [x] `component` declaration — desugars to struct
@@ -414,7 +412,7 @@ shaders remaining.
 - [x] `stdlib/input.fd` — input handling
 
 ### What's Left
-- [ ] SIMD codegen for vec/mat (8A extension) — SSE/AVX/NEON instruction emission
+- [x] SIMD codegen for vec/mat (8A extension) — SSE2 packed double emission done (addpd/subpd/mulpd/divpd/movapd); AVX/NEON remaining
 - [ ] Shader generation (8C) — @shader/@simd annotations, compute shaders (not implemented)
 - [ ] Fix test_game_stdlib — type error on &mut Vec method calls (in skip list)
 
@@ -448,20 +446,29 @@ to be built.
 
 ---
 
-## Phase 10 — Self-Hosting (IN PROGRESS — session 7)
+## Phase 10 — Self-Hosting (PARTIAL — session 22 audit)
 
 **Goal:** Rewrite the Fides compiler in Fides.
 
 **Detailed plan:** See `selfhost-roadmap.md` for the full self-hosting
-roadmap. All 18 modules have been rewritten in Fides (39.5K LOC). The
-self-hosted compiler successfully compiles itself (EXIT 0). The PE emitter
-has been ported with 25+ runtime stubs. Comptime evaluation has been fully
-ported.
+roadmap. All 50 modules have been rewritten in Fides (93,605 LOC). The
+self-hosted compiler type-checks and borrow-checks the full compiler
+successfully, but **self-compilation SEGFAULTS** during lowering
+(`Lowerer_mangle_method`). The PE emitter has been ported (6,448 LOC)
+with runtime stubs. Comptime evaluation has been ported.
 
-**Status:** All 3 language-level blockers resolved. All 25 self-host
-modules rewritten. Self-compilation works (EXIT 0). PE emitter works for
-simple programs. Comptime eval fully ported. **Bootstrap fixpoint achieved
-(session 15): fides-c2.c == fides-c3.c (SHA256-identical, 701,100 lines).**
+**Status (audited Sep 9, 2026):**
+- 50 modules, 93,605 LOC — all type-check with `release/fides-c3.exe`
+- 38/38 self-host tests pass on all 3 backends (Interpreter, C Codegen, PE)
+- **Self-compilation FAILS** — SIGSEGV in `Lowerer_mangle_method` during
+  lowering of `compiler/main.fd`. This is a pre-existing issue, not a
+  regression from session 22 bug fixes.
+- **Fixpoint NOT verifiable** — `release/fides-c2.c` does not exist.
+  Previously claimed "c2==c3, 0 diffs, 701,158 lines" but the c2 artifact
+  is missing. `fides-c3.c` and `fides-c3-new.c` differ in size (27.5MB vs
+  27.6MB), suggesting compiler output is not stable between builds.
+- The Windows installer ships the Rust bootstrap compiler (`fidesc.exe`
+  renamed to `fides.exe`) which does not have the self-compilation crash.
 
 ### Milestones
 - [x] `unsafe {}` blocks — with unsafe_depth tracking
@@ -537,10 +544,25 @@ rewritten in Fides. All are now resolved:
 
 ---
 
-## Phase 10B — PE Emitter Rewrite in Fides (IN PROGRESS — session 7)
+## Phase 10B — PE Emitter Rewrite in Fides (PARTIAL — session 22 audit)
 
 **Goal:** Rewrite the PE emitter (`src/pe.rs`) in Fides, making the
 self-hosted compiler fully self-contained with zero external dependencies.
+
+**Status (audited Sep 9, 2026):** `compiler/pe.fd` exists at 6,448 LOC —
+a port of `src/pe.rs`, not a from-scratch rewrite. It includes:
+- Full x86-64 instruction encoder
+- `@cpu_local` GS segment support (13 matches, pe.fd only — not in src/pe.rs)
+- Inline asm clobber lists (`is_clobber_reg`, `extract_clobber_reg`,
+  `clobber_regs` push/pop around asm blocks)
+- PE header generation, import table, section layout
+
+**Not yet done:**
+- Issues 67-69 (val in loop, str_split, recursive Box) — status unknown,
+  need verification
+- Native runtime stubs for PE path
+- Default backend switch to PE
+- Full parity verification with Rust reference
 
 **Strategy:** C codegen bootstrap first, PE emitter rewrite second.
 
@@ -609,16 +631,22 @@ The C backend stays as a permanent fallback, exactly like Zig's C backend.
 
 **Goal:** Developer tooling that matches Rust/Go/Zig.
 
-**Status:** In progress. LSP server with diagnostics, completion, hover, and
-goto-definition. Code formatter, linter, and benchmark command all work.
+**Status:** In progress. LSP module (`compiler/lsp.fd`, 1,082 LOC)
+is **wired into the self-hosted CLI** — `compiler/main.fd` imports
+`compiler::lsp` and dispatches the `lsp` command to `lsp_run()`.
+Supports initialize, didOpen/didChange/didClose, diagnostics, completion,
+hover, definition, and rename via JSON-RPC over stdio.
+The Rust bootstrap (`fidesc lsp`) also has a working LSP server.
+Code formatter, linter, benchmark, scribe, and veil all work.
 
 ### Milestones
-- [x] LSP server — `fidesc lsp` (JSON-RPC over stdio)
-- [x] LSP diagnostics — `publishDiagnostics` on didOpen/didChange
-- [x] LSP completion — `textDocument/completion` (keywords + symbols)
-- [x] LSP hover — `textDocument/hover` (type signatures)
-- [x] LSP goto-definition — `textDocument/definition`
-- [x] LSP symbol accessors — `get_funcs`, `get_structs`, `get_methods`, etc.
+- [x] LSP server — `fidesc lsp` (JSON-RPC over stdio) — **Rust only**
+- [x] LSP diagnostics — `publishDiagnostics` on didOpen/didChange — **Rust only**
+- [x] LSP completion — `textDocument/completion` (keywords + symbols) — **Rust only**
+- [x] LSP hover — `textDocument/hover` (type signatures) — **Rust only**
+- [x] LSP goto-definition — `textDocument/definition` — **Rust only**
+- [x] LSP symbol accessors — `get_funcs`, `get_structs`, `get_methods`, etc. — **Rust only**
+- [x] LSP self-hosted wiring — `compiler/main.fd` imports `compiler::lsp`, dispatches `lsp` command to `lsp_run()`
 - [x] Code formatter — `fidesc fmt <file.fd> [--check]` (`src/fmt.rs`, 972 LOC)
 - [x] Linter — `fidesc lint <file.fd>` (unused functions, unused imports)
 - [x] Benchmark — `fidesc bench <file.fd> [-n N] [--ccompile]`
@@ -631,10 +659,11 @@ goto-definition. Code formatter, linter, and benchmark command all work.
 ### What's Left
 - [ ] LSP rename — `textDocument/rename` (rename symbol across file)
 - [ ] LSP code actions — quick fixes, refactorings
-- [x] Package manager — `ark` binary, `ark.toml` manifest, path + git deps, lock file
+- [ ] LSP self-hosted wiring — wire `compiler/lsp.fd` into `compiler/main.fd`
+- [x] Package manager — `ark` binary (Rust only), `ark.toml` manifest, path + git deps, lock file
 - [ ] Profiler — `fidesc profile <file.fd>` (timing per function)
-- [x] Documentation generator — `scribe` binary (HTML/Markdown from `///` comments)
-- [x] Coverage tool — `veil` binary (function/line/instruction coverage, text + HTML reports)
+- [x] Documentation generator — `scribe` binary (HTML/Markdown from `///` comments) — wired into self-hosted CLI
+- [x] Coverage tool — `veil` binary (function/line/instruction coverage, text + HTML reports) — wired into self-hosted CLI
 
 ---
 
@@ -666,10 +695,10 @@ annotation reference.
 
 ### What's Left (from security.md "Not Yet Prevented")
 - [ ] CFI (Control Flow Integrity) — forward-edge protection for indirect calls
-- [ ] Full taint propagation — data-flow tracking (currently just sink detection)
+- [x] Full taint propagation — data-flow tracking DONE (`verify_taint_propagation` in `src/typechecker.rs` tracks taint through assignments, expressions, sanitizer calls, and sink calls with `TaintState` enum)
 - [ ] Runtime sandbox — capability revocation in interpreter
 - [ ] Runtime resource limits — memory/time enforcement
-- [x] ~~Data race prevention~~ — `@sync`/`@send` done in Phase 7.55
+- [ ] ~~Data race prevention~~ — `@sync`/`@send` NOT implemented (annotations not parsed in compiler/lower.fd or src/lower.rs)
 
 ---
 
@@ -701,7 +730,7 @@ Rust, Go, and C for real-world projects.
 #### 13.3 Auto-Vectorization — ✅ DONE (partial)
 - Loop vectorization for variable trip counts — NOT DONE (constant trips only)
 - Proper SLP vectorization (correct semantics) — DONE (`pass_slp_vectorize`)
-- SSE2/AVX2 instruction emission in codegen_x64.rs — DONE (SSE2: movupd, addpd, subpd, mulpd, divpd)
+- SSE2/AVX2 instruction emission — SSE2 DONE (`addpd`/`subpd`/`mulpd`/`divpd`/`movapd` in `src/codegen_x64.rs` textual asm, `src/pe.rs` encoded bytes, and `compiler/pe.fd` self-hosted PE emitter); AVX2/VEX encoders exist in `src/pe.rs` but not yet used by the textual asm path
 - Cost model to decide when vectorization is profitable — NOT DONE
 
 **Effort:** 1-2 months (SLP + loop-vec complete; variable trips + cost model remaining)
@@ -712,23 +741,24 @@ Rust, Go, and C for real-world projects.
 - Path dependencies (files and directories) — DONE
 - Git dependencies (clone with `--depth 1`, branch/tag support) — DONE
 - Lock file (`ark.lock` with resolved commit hashes) — DONE
-- Commands: init, add, install, remove, list, lock, update — DONE
+- Commands: init, add, install, remove, list, lock, update — DONE (Rust binary only)
 - Registry (ark.dev) — NOT DONE (search, publish, version resolution)
 - Semver dependency resolution — NOT DONE
 - Integration with `fidesc build` (auto-install deps) — NOT DONE
 - Workspace support (multi-package repos) — NOT DONE
+- Self-hosted CLI integration — **DONE** (`compiler/main.fd` imports `compiler::ark`, dispatches `ark` command to `ark_main()`)
 
-**Effort:** Basic version done. Registry: 1-2 months more.
-**Files:** `src/ark.rs`, `src/bin/ark.rs`
+**Effort:** Basic version done (Rust binary + self-hosted CLI). Registry: 1-2 months more.
+**Files:** `src/ark.rs`, `src/bin/ark.rs`, `compiler/ark.fd` (wired into self-hosted CLI)
 
-#### 13.5 Data Race Prevention (@sync / @send) — ✅ DONE
-- `@sync` annotation on types (like Rust's `Sync` trait) — DONE
-- `@send` annotation on types (like Rust's `Send` trait) — DONE
-- Compile-time check: no sharing of non-`@sync` types across threads — DONE
-- Compile-time check: no sending of non-`@send` types to other threads — DONE
+#### 13.5 Data Race Prevention (@sync / @send) — ❌ NOT DONE
+- `@sync` annotation on types (like Rust's `Sync` trait) — NOT DONE (0 matches in compiler/lower.fd or src/lower.rs)
+- `@send` annotation on types (like Rust's `Send` trait) — NOT DONE (0 matches)
+- Compile-time check: no sharing of non-`@sync` types across threads — NOT DONE
+- Compile-time check: no sending of non-`@send` types to other threads — NOT DONE
 
 **Effort:** 2-3 weeks
-**Files:** `src/typechecker.rs`, `src/ast.rs`
+**Files:** `src/typechecker.rs`, `src/ast.rs` (not yet started)
 
 ---
 
@@ -1093,15 +1123,16 @@ concurrent server programming, systems programming, and embedded development.
 
 ---
 
-## Phase 16 — Tier 3 OS Features (IN PROGRESS — session 16)
+## Phase 16 — Tier 3 OS Features (PARTIAL — session 22 audit)
 
 **Goal:** Real OS/kernel deployment capability — per-CPU data, inline asm
 with clobbers, no-stdlib mode, cross-compilation dispatch, and UEFI boot
 services.
 
-**Status:** Five features implemented directly in the self-hosted compiler
-(`compiler/*.fd`). All compile cleanly with the Rust bootstrap compiler.
-No new test regressions.
+**Status (audited Sep 9, 2026):** Features implemented in the self-hosted
+compiler (`compiler/pe.fd`). OS modules (`stdlib/uefi.fd`, `stdlib/kernel.fd`)
+were moved to the separate `fides-os` project and no longer exist in this
+repo. `@cpu_local` is only in `compiler/pe.fd`, not in `src/pe.rs`.
 
 ### Milestones
 - [x] `@cpu_local` variables — per-CPU data via GS segment
@@ -1109,37 +1140,32 @@ No new test regressions.
   - GS segment encoders: `lea_rax_gs`, `mov_rax_gs`, `mov_gs_rax`, `wrmsr`, `rdmsr`, `swapgs`
   - `Inst::GlobalAddr` emits `lea rax, [gs:offset]` for cpu_local globals
   - Parser: `@cpu_local var x: i64;` annotation support
+  - **Note:** Only in `compiler/pe.fd` (13 matches), NOT in `src/pe.rs` (0 matches)
 - [x] Inline asm clobber lists and constraints
   - `AsmDir::Clobber` in AST (both Rust + Fides)
   - Parser: `clobber("reg")` syntax (one reg per clobber operand)
   - Lowerer: clobbers passed as `CL:`-prefixed inputs
   - PE backend: 50+ x86 instructions encoded, clobber save/restore
   - `Inst::Asm` case in `PeCodeGen_gen_inst` match
-- [x] No-stdlib mode (`--bare` / `--no-std` / `--no-stdlib`)
+- [x] No-stdlib mode (`--bare` / `--boot`)
   - `build_program_no_std()` — skips `stdlib/core.fd` entirely
-  - Typechecks user program alone, no stdlib merge, no import resolution
+  - CLI flags are `--bare` and `--boot` (not `--no-std` as roadmap claimed)
   - Zero hidden runtime dependencies for kernel/UEFI/bare-metal
 - [x] Cross-compilation target validation
   - `--target arm64`/`aarch64`/`riscv64` — honest diagnostic + C codegen fallback
   - Does not falsely claim native codegen support
-- [x] UEFI boot services bindings (`stdlib/uefi.fd`, 287 lines)
-  - EFI status codes, memory types, pool types, timer types
-  - Boot services function offsets (AllocatePool, FreePool, GetMemoryMap,
-    ExitBootServices, Stall, CreateEvent, SetTimer, etc.)
-  - Runtime services function offsets
-  - System table offsets (boot_services, con_in, con_out, runtime_services)
-  - `uefi_init()`, `uefi_get_boot_services()`, `uefi_allocate_pool()`,
-    `uefi_free_pool()`, `uefi_allocate_pages()`, `uefi_get_memory_map()`,
-    `uefi_exit_boot_services()`, `uefi_stall()`, `uefi_print()`,
-    `uefi_clear_screen()`
-  - Volatile memory access via `p_volatile_load`/`p_volatile_store`
+  - Cross-compilation dispatch in `compiler/compiler.fd` (ARM64/RISC-V backends)
+- [ ] ~~UEFI boot services bindings (`stdlib/uefi.fd`, 287 lines)~~
+  - **MOVED to `fides-os` project** — `stdlib/uefi.fd` does not exist in this repo
+  - Only `docs/stdlib/uefi.md` remains (documentation)
 
 ### What's Left
-- [ ] ARM64 native codegen module for self-hosted compiler (codegen_arm64.fd)
-- [ ] RISC-V native codegen module for self-hosted compiler (codegen_riscv.fd)
+- [ ] ARM64 native codegen module for self-hosted compiler (codegen_arm64.fd exists, 557 LOC, needs verification)
+- [ ] RISC-V native codegen module for self-hosted compiler (codegen_riscv.fd exists, 554 LOC, needs verification)
 - [ ] Bare runtime stubs in PE emitter (p_hlt, p_cli, p_sti, p_inb, p_outb, p_serial — lost in session 16 git checkout, need re-add)
 - [ ] UEFI PE32+ emission in self-hosted PE emitter
 - [ ] GS base setup runtime (WRMSR 0xC0000101) stubs
 - [ ] Interrupt handler return epilogue (IRETQ vs RET) in PE emitter
 - [ ] Multiboot2 header generation for `--boot` mode
 - [ ] Real hardware testing (QEMU ARM64, QEMU RISC-V, real UEFI firmware)
+- [ ] `@cpu_local` port to Rust reference (`src/pe.rs`) for parity

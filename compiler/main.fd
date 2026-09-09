@@ -27,6 +27,8 @@ use compiler::veil;
 use compiler::tensor;
 use compiler::gpu;
 use compiler::wasm;
+use compiler::lsp;
+use compiler::ark;
 
 // --- Global flag state ---------------------------------------------------
 // Parsed from --borrowck= and --timeout flags before command dispatch.
@@ -132,9 +134,10 @@ pub fn main() -> i64 {
     if str_equal(command, "bench") { return cmd_bench(n, start); }
     if str_equal(command, "lint") { return cmd_lint(n, start); }
     if str_equal(command, "watch") { return cmd_bench(n, start); }
-    if str_equal(command, "lsp") { return cmd_lsp(); }
+    if str_equal(command, "lsp") { return lsp_run(); }
     if str_equal(command, "scribe") { return cmd_scribe(n, start); }
     if str_equal(command, "veil") { return cmd_veil(n, start); }
+    if str_equal(command, "ark") { return ark_main(); }
 
     print("Unknown command: ");
     print(command);
@@ -1030,11 +1033,6 @@ fn cmd_lint(n: i64, start: i64) -> i64 {
     return 1;
 }
 
-// --- lsp ----------------------------------------------------------------
-fn cmd_lsp() -> i64 {
-    return 1;
-}
-
 // --- PE stack patching ---------------------------------------------------
 // Patches SizeOfStackReserve to 256MB and SizeOfStackCommit to 16MB in a
 // PE executable. tcc defaults to 1MB stack which is too small for the
@@ -1330,6 +1328,10 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     var do_lto: bool = has_flag(n, start, "--lto");
     // --native: use native backend (ELF64/PE) instead of C codegen
     var use_native: bool = has_flag(n, start, "--native");
+    // --bare: bare-metal mode (skip stdlib, flat binary)
+    var bare_mode: bool = has_flag(n, start, "--bare");
+    // --boot: multiboot2 boot mode (skip stdlib, generate boot binary)
+    var boot_mode: bool = has_flag(n, start, "--boot");
     // --caps <list>: capability restrictions
     var caps: str = get_flag_value(n, start, "--caps", "");
 
@@ -1364,6 +1366,68 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         return 1;
     }
     p_eprint_str("[build] Source read ok. Compiling...\n");
+
+    // --boot mode: multiboot2 kernel binary (no stdlib, boot entry point)
+    if boot_mode {
+        p_eprint_str("[build] Boot mode: generating multiboot2 kernel...\n");
+        var boot_result: ResultProgram = build_program_no_std(source, OptStr::Some(input));
+        match boot_result {
+            ResultProgram::Err(errs) => {
+                print("Compilation errors:\n");
+                var ei: i64 = 0;
+                while ei < errs.len() {
+                    print(errs.get(ei));
+                    print("\n");
+                    ei = ei + 1;
+                }
+                return 1;
+            }
+            ResultProgram::Ok(program) => {
+                p_eprint_str("[build] Lowering to IR...\n");
+                var ir_mod: IrModule = lower(program);
+                p_eprint_str("[build] Generating boot binary...\n");
+                var bin: Vec = generate_boot_binary(ir_mod);
+                p_file_write_vec(output, bin);
+                print("Emitted multiboot2 kernel: ");
+                print(output);
+                print(" (");
+                print(int_to_str(bin.len()));
+                print(" bytes, boot-ready)\n");
+                return 0;
+            }
+        }
+    }
+
+    // --bare mode: flat binary (no stdlib)
+    if bare_mode {
+        p_eprint_str("[build] Bare mode: generating flat binary...\n");
+        var bare_result: ResultProgram = build_program_no_std(source, OptStr::Some(input));
+        match bare_result {
+            ResultProgram::Err(errs) => {
+                print("Compilation errors:\n");
+                var ei: i64 = 0;
+                while ei < errs.len() {
+                    print(errs.get(ei));
+                    print("\n");
+                    ei = ei + 1;
+                }
+                return 1;
+            }
+            ResultProgram::Ok(program) => {
+                p_eprint_str("[build] Lowering to IR...\n");
+                var ir_mod: IrModule = lower(program);
+                p_eprint_str("[build] Generating bare binary...\n");
+                var bin: Vec = generate_boot_binary(ir_mod);
+                p_file_write_vec(output, bin);
+                print("Emitted bare-metal binary: ");
+                print(output);
+                print(" (");
+                print(int_to_str(bin.len()));
+                print(" bytes, no stdlib, no PE headers)\n");
+                return 0;
+            }
+        }
+    }
 
     var result: ResultProgram = build_program_with_path(source, OptStr::Some(input));
     match result {
@@ -1468,6 +1532,8 @@ fn print_usage() {
     p_eprint_str("  fides-c ccompile <file.fd> -o <output>    Compile via C codegen (tcc)\n");
     p_eprint_str("  fides-c build    <file.fd> -o <output>    Compile to native executable\n");
     p_eprint_str("  fides-c emit     <file.fd> -o <output>    Alias for build\n");
+    p_eprint_str("  fides-c emit     <file.fd> --boot -o <out>  Multiboot2 kernel binary\n");
+    p_eprint_str("  fides-c emit     <file.fd> --bare -o <out>  Bare-metal flat binary\n");
     p_eprint_str("  fides-c run      <file.fd>                Compile + execute\n");
     p_eprint_str("  fides-c tokens   <file.fd>                Show tokens\n");
     p_eprint_str("  fides-c ast      <file.fd>                Show AST summary\n");

@@ -393,6 +393,7 @@ pub enum Stmt {
         expr: Expr,
         is_mut: bool,
         is_persist: bool,
+        annotations: Vec<Annotation>,
         line: usize,
     },
     /// Tuple destructuring: `pv (a, b, ...) = expr`
@@ -408,6 +409,7 @@ pub enum Stmt {
     LetUninit {
         name: String,
         ty: Type,
+        annotations: Vec<Annotation>,
         line: usize,
     },
     Assign {
@@ -567,6 +569,14 @@ pub enum Stmt {
         default: Option<Vec<Stmt>>,
         line: usize,
     },
+    /// F13: Parallel fork-join block: `parallel { | branch1 | branch2 | ... }`
+    /// Each branch is executed in parallel (spawned as a thread), and all branches
+    /// are joined before continuing. Branch results are discarded (use shared
+    /// mutable state or channels for communication).
+    Parallel {
+        branches: Vec<Vec<Stmt>>,
+        line: usize,
+    },
 }
 
 /// A case in a select statement.
@@ -625,7 +635,8 @@ impl Stmt {
             | Stmt::GradBlock { line, .. }
             | Stmt::Backward { line, .. }
             | Stmt::Query { line, .. }
-            | Stmt::Select { line, .. } => *line,
+            | Stmt::Select { line, .. }
+            | Stmt::Parallel { line, .. } => *line,
         }
     }
 }

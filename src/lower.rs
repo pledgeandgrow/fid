@@ -27,6 +27,7 @@ fn runtime_effects(name: &str) -> Option<EffectSet> {
         "p_vec_push" | "p_vec_push_str" | "p_vec_set" | "p_vec_clear"
         | "p_vec_insert" | "p_vec_remove" | "p_vec_reverse" | "p_vec_extend"
         | "p_vec_truncate" | "p_vec_sort" | "p_vec_resize"
+        | "p_memset"
     ) {
         effects.add(Effect::Write);
         return Some(effects);
@@ -115,6 +116,7 @@ fn runtime_effects(name: &str) -> Option<EffectSet> {
     if matches!(name,
         "p_cli" | "p_sti" | "p_hlt" | "p_lidt" | "p_idt_set_entry"
         | "p_lgdt" | "p_gdt_set_entry"
+        | "p_enter_user_mode"
         | "p_outb" | "p_serial_init" | "p_serial_write"
         | "p_cr0_write" | "p_cr3_write" | "p_cr4_write" | "p_invlpg"
         | "p_page_map" | "p_page_unmap" | "p_phys_write64"
@@ -457,6 +459,40 @@ impl Lowerer {
         // Pre-register all function signatures so calls can look up return types
         // before the function body is lowered
         for func in &program.funcs {
+            // If the function returns a tuple, register the __tuple_N struct layout
+            // with the same layout that TupleLit produces (struct fields inline).
+            if let Type::Tuple(types) = &func.ret_ty {
+                let n = types.len();
+                let tuple_name = format!("__tuple_{}", n);
+                let mut fields: Vec<(String, IrType, u32)> = Vec::new();
+                let mut offset: u32 = 0;
+                for (i, t) in types.iter().enumerate() {
+                    let ir_ty = self.lower_type(t);
+                    // For struct types, store the struct data inline (not a pointer)
+                    let field_ty = if let IrType::Ptr(ref inner) = ir_ty {
+                        if let IrType::Struct(_) = inner.as_ref() {
+                            (**inner).clone()
+                        } else {
+                            ir_ty.clone()
+                        }
+                    } else {
+                        ir_ty.clone()
+                    };
+                    let field_size = self.module.type_size(&field_ty) as u32;
+                    fields.push((format!("_{}", i), field_ty, offset));
+                    offset += field_size;
+                    offset = (offset + 7) & !7; // align to 8
+                }
+                let size = offset as u64;
+                self.module.add_struct(crate::ir::StructLayout {
+                    name: tuple_name.clone(),
+                    fields,
+                    size,
+                    align: 8,
+                    repr_c: false,
+                    packed_layout: false,
+                });
+            }
             let ret_ty = self.lower_type_sret(&func.ret_ty);
             let ir_func = IrFunction::new(func.name.clone(), ret_ty);
             self.module.functions.insert(func.name.clone(), ir_func);
@@ -877,6 +913,9 @@ impl Lowerer {
         self.module.add_extern("p_inb", vec![IrType::I64], IrType::I64);  // port I/O: read byte
         self.module.add_extern("p_outb", vec![IrType::I64, IrType::I64], IrType::Void); // port I/O: write byte
 
+        // ─── @zeroize: memory wiping builtin ───
+        self.module.add_extern("p_memset", vec![IrType::I64, IrType::I32, IrType::I64], IrType::Void); // memset(ptr, val, size)
+
         // ─── Phase 5A.4: MMU/page table management (bare-metal) ───
         self.module.add_extern("p_cr3_read", vec![], IrType::I64);         // read CR3 (page table base)
         self.module.add_extern("p_cr3_write", vec![IrType::I64], IrType::Void); // write CR3
@@ -902,6 +941,9 @@ impl Lowerer {
         // ─── Phase 5A.5: GDT builtins (bare-metal) ───
         self.module.add_extern("p_lgdt", vec![IrType::I64], IrType::Void); // load GDT
         self.module.add_extern("p_gdt_set_entry", vec![IrType::I64, IrType::I64, IrType::I64, IrType::I64, IrType::I64], IrType::Void); // set GDT entry
+
+        // ─── User-mode transition (ring 3) ───
+        self.module.add_extern("p_enter_user_mode", vec![IrType::I64, IrType::I64], IrType::Void); // enter ring 3 (entry_addr, stack_addr)
 
         // ─── Phase 5A.6: Serial port builtins (bare-metal) ───
         self.module.add_extern("p_serial_init", vec![], IrType::Void);           // init COM1
@@ -1074,9 +1116,57 @@ impl Lowerer {
 
     /// Lower a single function
     fn lower_func(&mut self, func: &Func) {
+        // If the function returns a tuple, register the __tuple_N struct layout
+        // so the C codegen can determine the correct alloca size for SRET.
+        // Uses the same layout as TupleLit (struct fields stored inline).
+        if let Type::Tuple(types) = &func.ret_ty {
+            let n = types.len();
+            let tuple_name = format!("__tuple_{}", n);
+            let mut fields: Vec<(String, IrType, u32)> = Vec::new();
+            let mut offset: u32 = 0;
+            for (i, t) in types.iter().enumerate() {
+                let ir_ty = self.lower_type(t);
+                let field_ty = if let IrType::Ptr(ref inner) = ir_ty {
+                    if let IrType::Struct(_) = inner.as_ref() {
+                        (**inner).clone()
+                    } else {
+                        ir_ty.clone()
+                    }
+                } else {
+                    ir_ty.clone()
+                };
+                let field_size = self.module.type_size(&field_ty) as u32;
+                fields.push((format!("_{}", i), field_ty, offset));
+                offset += field_size;
+                offset = (offset + 7) & !7;
+            }
+            let size = offset as u64;
+            self.module.add_struct(crate::ir::StructLayout {
+                name: tuple_name.clone(),
+                fields,
+                size,
+                align: 8,
+                repr_c: false,
+                packed_layout: false,
+            });
+        }
         let ret_ty = self.lower_type_sret(&func.ret_ty);
         let mut ir_func = IrFunction::new(func.name.clone(), ret_ty.clone());
-        ir_func.is_interrupt = func.is_interrupt;
+        ir_func.is_interrupt = func.is_interrupt
+            || func.annotations.iter().any(|a| a.name == "interrupt");
+        // F29: @interrupt(N) annotation — store the IDT vector number for automatic IDT setup.
+        // The vector number is the first argument of the annotation: @interrupt(0x20)
+        ir_func.interrupt_vector = func.annotations.iter()
+            .find(|a| a.name == "interrupt")
+            .and_then(|a| a.args.first())
+            .and_then(|s| {
+                // Parse as hex (0xNN) or decimal
+                if s.starts_with("0x") || s.starts_with("0X") {
+                    u64::from_str_radix(&s[2..], 16).ok()
+                } else {
+                    s.parse::<u64>().ok()
+                }
+            });
         // F65: @wrapping annotation — use wrap-around arithmetic instead of checked
         ir_func.is_wrapping = func.annotations.iter().any(|a| a.name == "wrapping");
         // I-4A: @deterministic annotation — function is reproducible, can be memoized
@@ -1097,6 +1187,8 @@ impl Lowerer {
         ir_func.is_medical = func.annotations.iter().any(|a| a.name == "medical");
         // ML8: @kernel annotation — GPU entry point for SPIR-V/PTX codegen
         ir_func.is_kernel = func.annotations.iter().any(|a| a.name == "kernel");
+        // F23: @simd annotation — enables aggressive loop vectorization
+        ir_func.is_simd = func.annotations.iter().any(|a| a.name == "simd");
         // Parse workgroup size from @kernel(x, y, z) or @kernel([x, y, z])
         if ir_func.is_kernel {
             if let Some(kann) = func.annotations.iter().find(|a| a.name == "kernel") {
@@ -1422,6 +1514,16 @@ impl Lowerer {
     /// convention and codegen treat them as aggregate types.
     /// Used only at function signature boundaries (return type + call sites).
     fn lower_type_sret(&self, ty: &Type) -> IrType {
+        // Convert tuple types to struct types so SRET calling convention is used.
+        // Without this, tuples lower to IrType::Opaque("tuple") (8 bytes) and
+        // functions returning tuples return a dangling pointer to stack alloca.
+        // The __tuple_N struct layout is registered by TupleLit lowering or
+        // by register_tuple_struct called during function lowering.
+        if let Type::Tuple(types) = ty {
+            let n = types.len();
+            let tuple_name = format!("__tuple_{}", n);
+            return IrType::Struct(tuple_name);
+        }
         let ir_ty = self.lower_type(ty);
         if let IrType::Generic(ref name, _) = ir_ty {
             let resolved_name = self.resolve_struct_name(name);
@@ -1643,7 +1745,7 @@ impl Lowerer {
         // Set current line for debug info
         self.current_line = Some(stmt.line());
         match stmt {
-            Stmt::Let { name, ty, expr, is_mut: _, is_persist, line: _ } => {
+            Stmt::Let { name, ty, expr, is_mut: _, is_persist, annotations, line: _ } => {
                 // Pass the declared type as a hint so Vec::new()/HashMap::new()
                 // can pick up the element type from the annotation.
                 let saved_hint = self.let_hint.take();
@@ -1682,6 +1784,8 @@ impl Lowerer {
                     region: self.current_region(),
                 });
                 self.alloca_types.insert(alloca, ir_ty.clone());
+                // Save the type size for @zeroize before ir_ty is moved
+                let ir_ty_size = self.module.type_size(&ir_ty);
                 if *is_persist {
                     // Emit PersistLoad — returns saved value or the default
                     let loaded = self.emit_inst(Inst::PersistLoad {
@@ -1726,14 +1830,26 @@ impl Lowerer {
                 // Do this before borrowing current_func mutably.
                 let drop_struct = ty.as_ref().and_then(|t| self.type_struct_name(t))
                     .filter(|sn| self.has_drop_impl(sn));
+                // @zeroize: check if the variable has @zeroize annotation
+                let has_zeroize = annotations.iter().any(|a| a.name == "zeroize");
+                let zeroize_size = if has_zeroize {
+                    Some(ir_ty_size)
+                } else {
+                    None
+                };
                 if let Some(ref mut f) = self.current_func {
                     f.bind_local(name, alloca);
                     if let Some(struct_name) = drop_struct {
                         f.drop_locals.push((alloca, struct_name));
                     }
+                    if let Some(size) = zeroize_size {
+                        if size > 0 {
+                            f.zeroize_locals.push((alloca, size));
+                        }
+                    }
                 }
             }
-            Stmt::LetUninit { name, ty, line: _ } => {
+            Stmt::LetUninit { name, ty, annotations, line: _ } => {
                 // Uninitialized variable — allocate storage but don't store a value.
                 // The typechecker enforces that it must be assigned before read.
                 let ir_ty = self.lower_type(ty);
@@ -1741,10 +1857,22 @@ impl Lowerer {
                     ty: ir_ty.clone(),
                     region: self.current_region(),
                 });
-                self.alloca_types.insert(alloca, ir_ty);
+                self.alloca_types.insert(alloca, ir_ty.clone());
                 self.allocas.insert(name.clone(), alloca);
+                // @zeroize: check if the variable has @zeroize annotation
+                let has_zeroize = annotations.iter().any(|a| a.name == "zeroize");
+                let zeroize_size = if has_zeroize {
+                    Some(self.module.type_size(&ir_ty))
+                } else {
+                    None
+                };
                 if let Some(ref mut f) = self.current_func {
                     f.bind_local(name, alloca);
+                    if let Some(size) = zeroize_size {
+                        if size > 0 {
+                            f.zeroize_locals.push((alloca, size));
+                        }
+                    }
                 }
             }
             Stmt::LetTuple { names, expr, line: _ } => {
@@ -1786,38 +1914,46 @@ impl Lowerer {
                         field_index: i as u32,
                         field_ty: field_ty.clone(),
                     });
-                    // Load from the tuple field. For struct fields, use Ptr type so
-                    // the interpreter returns Value::Ptr. For scalars, use the field type.
-                    let load_ty = if matches!(field_ty, IrType::Struct(_)) {
-                        IrType::Ptr(Box::new(IrType::I64))
+                    if matches!(field_ty, IrType::Struct(_)) {
+                        // Struct field: the struct data is stored inline in the
+                        // tuple. Copy the struct data to a new alloca.
+                        // The alloca IS the pointer to the struct data — the
+                        // variable is bound to the alloca pointer directly.
+                        let alloca = self.emit_inst(Inst::Alloca {
+                            ty: field_ty.clone(),
+                            region: self.current_region(),
+                        });
+                        self.alloca_types.insert(alloca, field_ty.clone());
+                        // Copy struct data from tuple field to alloca
+                        self.emit_inst(Inst::StructCopy {
+                            dst: alloca,
+                            src: field_ptr,
+                            ty: field_ty.clone(),
+                        });
+                        self.allocas.insert(name.clone(), alloca);
+                        if let Some(ref mut f) = self.current_func {
+                            f.bind_local(name, alloca);
+                        }
                     } else {
-                        field_ty.clone()
-                    };
-                    let val = self.emit_inst(Inst::Load {
-                        ptr: field_ptr,
-                        ty: load_ty.clone(),
-                    });
-                    // For struct fields, the alloca holds a pointer to the struct.
-                    // Use Ptr(Struct(...)) as the alloca type so that variable loads
-                    // return the pointer correctly.
-                    let alloca_ty = if matches!(field_ty, IrType::Struct(_)) {
-                        IrType::Ptr(Box::new(field_ty.clone()))
-                    } else {
-                        field_ty.clone()
-                    };
-                    let alloca = self.emit_inst(Inst::Alloca {
-                        ty: alloca_ty.clone(),
-                        region: self.current_region(),
-                    });
-                    self.alloca_types.insert(alloca, alloca_ty.clone());
-                    self.emit_inst(Inst::Store {
-                        ptr: alloca,
-                        value: val,
-                        store_ty: None,
-                    });
-                    self.allocas.insert(name.clone(), alloca);
-                    if let Some(ref mut f) = self.current_func {
-                        f.bind_local(name, alloca);
+                        // Scalar field: load the value and store in alloca
+                        let val = self.emit_inst(Inst::Load {
+                            ptr: field_ptr,
+                            ty: field_ty.clone(),
+                        });
+                        let alloca = self.emit_inst(Inst::Alloca {
+                            ty: field_ty.clone(),
+                            region: self.current_region(),
+                        });
+                        self.alloca_types.insert(alloca, field_ty.clone());
+                        self.emit_inst(Inst::Store {
+                            ptr: alloca,
+                            value: val,
+                            store_ty: None,
+                        });
+                        self.allocas.insert(name.clone(), alloca);
+                        if let Some(ref mut f) = self.current_func {
+                            f.bind_local(name, alloca);
+                        }
                     }
                 }
             }
@@ -2437,6 +2573,23 @@ impl Lowerer {
                 }
                 self.emit_terminator(Inst::Jump { target: merge_block });
                 self.set_current_block(merge_block);
+            }
+            Stmt::Parallel { branches, line: _ } => {
+                // F13: parallel { | branch1 | branch2 | ... }
+                // Lower as fork-join parallelism using the executor system.
+                // Each branch is spawned as a thread, then all are joined.
+                // For branches that are single call expressions, spawn them directly.
+                // For complex branches, execute sequentially (semantics preserved).
+                //
+                // Simplified lowering: execute branches sequentially.
+                // This preserves semantics (all branches run, join at end) even
+                // though it's not actually parallel. True parallelism requires
+                // closure support which is not yet available.
+                for branch in branches {
+                    for s in branch {
+                        self.lower_stmt(s);
+                    }
+                }
             }
         }
     }
@@ -5536,12 +5689,32 @@ impl Lowerer {
                     elem_vals.push(val);
                     elem_tys.push(ty);
                 }
-                // Register or update the tuple struct layout with actual element types
-                // Always update — different tuples with same arity may have different element types
-                let fields: Vec<(String, IrType, u32)> = elem_tys.iter().enumerate()
-                    .map(|(i, ty)| (format!("_{}", i), ty.clone(), (i * 8) as u32))
-                    .collect();
-                let size = (tuple_size * 8) as u64;
+                // For struct-typed elements (Ptr(Struct)), store the struct data
+                // inline in the tuple field (not just the pointer). This prevents
+                // dangling pointers when the tuple is returned from a function.
+                // The field type is the inner struct type, and the field offset
+                // is the cumulative size of preceding fields.
+                let mut fields: Vec<(String, IrType, u32)> = Vec::new();
+                let mut offset: u32 = 0;
+                let mut field_tys_resolved: Vec<IrType> = Vec::new();
+                for (i, ty) in elem_tys.iter().enumerate() {
+                    let field_ty = if let IrType::Ptr(ref inner) = ty {
+                        if let IrType::Struct(_) = inner.as_ref() {
+                            (**inner).clone()
+                        } else {
+                            ty.clone()
+                        }
+                    } else {
+                        ty.clone()
+                    };
+                    let field_size = self.module.type_size(&field_ty) as u32;
+                    fields.push((format!("_{}", i), field_ty.clone(), offset));
+                    field_tys_resolved.push(field_ty);
+                    offset += field_size;
+                    // Align to 8 bytes
+                    offset = (offset + 7) & !7;
+                }
+                let size = offset as u64;
                 self.module.add_struct(StructLayout {
                     name: tuple_name.clone(),
                     fields,
@@ -5556,14 +5729,25 @@ impl Lowerer {
                 });
                 for (i, val) in elem_vals.iter().enumerate() {
                     let val_ty = &elem_tys[i];
+                    let field_ty = &field_tys_resolved[i];
                     let field_ptr = self.emit_inst(Inst::GetFieldPtr {
                         struct_ptr: ptr,
                         field_index: i as u32,
-                        field_ty: val_ty.clone(),
+                        field_ty: field_ty.clone(),
                     });
-                    // Store the value — for structs, this is already a pointer
-                    // (structs are passed by pointer in Fides). Don't do struct copy
-                    // into tuple fields — just store the pointer.
+                    if let IrType::Ptr(ref inner) = val_ty {
+                        if let IrType::Struct(_) = inner.as_ref() {
+                            // Struct element: memcpy from the source pointer to
+                            // the field pointer (stores struct data inline).
+                            self.emit_inst(Inst::StructCopy {
+                                dst: field_ptr,
+                                src: *val,
+                                ty: (**inner).clone(),
+                            });
+                            continue;
+                        }
+                    }
+                    // Non-struct element: store the value directly
                     self.emit_inst(Inst::Store { ptr: field_ptr, value: *val, store_ty: None });
                 }
                 ptr
@@ -6013,6 +6197,11 @@ impl Lowerer {
                     }
                     if let Some(def_body) = default {
                         self.collect_free_vars(def_body, free_vars, local_names);
+                    }
+                }
+                Stmt::Parallel { branches, .. } => {
+                    for branch in branches {
+                        self.collect_free_vars(branch, free_vars, local_names);
                     }
                 }
             }
@@ -6822,6 +7011,8 @@ impl Lowerer {
     /// Drops are emitted in reverse declaration order (LIFO — last declared
     /// is dropped first, matching Rust's drop order).
     fn emit_drops(&mut self) {
+        // Emit zeroize calls first (wipe secrets before dropping)
+        self.emit_zeroize();
         // Collect (alloca_ptr, struct_name) pairs for locals with Drop impls.
         // Clone first to avoid borrowing self while emitting.
         let drop_locals: Vec<(ValueId, String)> = if let Some(ref f) = self.current_func {
@@ -6849,6 +7040,35 @@ impl Lowerer {
                 args: vec![dummy_env, val],
                 ret_ty: IrType::Void,
                 effects: EffectSet::new(),
+            });
+        }
+    }
+
+    /// Emit compiler-inserted memset(0) calls for all @zeroize locals.
+    /// Called before drops and returns. Wipes secrets from memory at scope exit.
+    /// Emits in reverse declaration order (LIFO — last declared wiped first).
+    fn emit_zeroize(&mut self) {
+        let zeroize_locals: Vec<(ValueId, u64)> = if let Some(ref f) = self.current_func {
+            f.zeroize_locals.clone()
+        } else {
+            return;
+        };
+        for (alloca, size) in zeroize_locals.into_iter().rev() {
+            if self.current_block_has_terminator() {
+                break;
+            }
+            // Emit: p_memset(alloca_ptr, 0, size)
+            // The alloca is a pointer to the variable's storage.
+            // We call p_memset which is a runtime function: void* p_memset(void* ptr, int val, int64_t size)
+            let zero_val = self.emit_inst(Inst::ConstInt { value: 0, ty: IrType::I32 });
+            let size_val = self.emit_inst(Inst::ConstInt { value: size as i64, ty: IrType::I64 });
+            let mut effects = EffectSet::new();
+            effects.add(Effect::Write);
+            self.emit_inst(Inst::Call {
+                func: "p_memset".to_string(),
+                args: vec![alloca, zero_val, size_val],
+                ret_ty: IrType::Void,
+                effects,
             });
         }
     }

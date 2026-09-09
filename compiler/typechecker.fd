@@ -673,6 +673,7 @@ pub struct TypeChecker {
     granted_caps: Vec<str>,
     strict_caps: bool,
     func_effects: Vec<StringVecStrTc>,                 // func_name -> effect names
+    ho_param_effects: Vec<StringVecStrTc>,              // param_name -> conservative effects (effect polymorphism)
     region_stack: Vec<str>,
     var_regions: Vec<StringString>,                  // var_name -> region_name
     freed_regions: Vec<str>,
@@ -786,6 +787,7 @@ impl TypeChecker {
             granted_caps: Vec::new(),
             strict_caps: false,
             func_effects: Vec::new(),
+            ho_param_effects: Vec::new(),
             region_stack: Vec::new(),
             var_regions: Vec::new(),
             freed_regions: Vec::new(),
@@ -1330,17 +1332,90 @@ fn TypeChecker_get_func_effects(self: &TypeChecker, name: str) -> Vec<str> {
     return Vec::new();
 }
 
+// Helper: set ho_param_effects entry (insert or update)
+fn TypeChecker_set_ho_param_effects(self: &mut TypeChecker, name: str, effects: Vec<str>) {
+    var i: i64 = 0;
+    while i < self.ho_param_effects.len() {
+        if self.ho_param_effects.get(i).key == name {
+            var entry: StringVecStrTc = self.ho_param_effects.get(i);
+            entry.val = effects;
+            self.ho_param_effects.set(i, entry);
+            return;
+        }
+        i = i + 1;
+    }
+    self.ho_param_effects.push(StringVecStrTc_new(name, effects));
+}
+
+// Helper: get ho_param_effects entry (returns empty Vec if not found)
+fn TypeChecker_get_ho_param_effects(self: &TypeChecker, name: str) -> Vec<str> {
+    var i: i64 = 0;
+    while i < self.ho_param_effects.len() {
+        if self.ho_param_effects.get(i).key == name {
+            return self.ho_param_effects.get(i).val;
+        }
+        i = i + 1;
+    }
+    return Vec::new();
+}
+
 pub fn TypeChecker_compute_func_effects(self: &mut TypeChecker, program: Program) {
     // First pass: collect direct effects (print calls, allocations, etc.)
     // Store only names (not bodies) to avoid boxing Vec<Stmt> into a Vec.
     var names: Vec<str> = Vec::new();
 
+    // Effect polymorphism: identify function-typed parameters.
+    // When a function has a param of type Func(...), calling that param
+    // may produce any effect. We conservatively register all effects.
+    var all_effs: Vec<str> = Vec::new();
+    all_effs.push("IO");
+    all_effs.push("Net");
+    all_effs.push("Spawn");
+    all_effs.push("Diverge");
+    all_effs.push("Alloc");
+    all_effs.push("Read");
+    all_effs.push("Write");
+    all_effs.push("Diff");
+    all_effs.push("Noise");
+    all_effs.push("Comm");
+
     var fi: i64 = 0;
     while fi < program.funcs.len() {
         var func: Func = program.funcs.get(fi);
         names.push(func.name);
+        // Register function-typed params for effect polymorphism.
+        var pi: i64 = 0;
+        while pi < func.params.len() {
+            var param: Param = func.params.get(pi);
+            match param.ty {
+                Type::Func(_, _) => {
+                    TypeChecker_set_ho_param_effects(self, param.name, all_effs);
+                }
+                _ => {}
+            }
+            pi = pi + 1;
+        }
         var effects: Vec<str> = Vec::new();
         TypeChecker_scan_stmts_for_effects(self, func.body, &mut effects);
+        // Add conservative effects from function-typed params.
+        pi = 0;
+        while pi < func.params.len() {
+            var param: Param = func.params.get(pi);
+            match param.ty {
+                Type::Func(_, _) => {
+                    var ho_effs: Vec<str> = TypeChecker_get_ho_param_effects(self, param.name);
+                    var hi: i64 = 0;
+                    while hi < ho_effs.len() {
+                        if !str_vec_contains(effects, ho_effs.get(hi)) {
+                            effects.push(ho_effs.get(hi));
+                        }
+                        hi = hi + 1;
+                    }
+                }
+                _ => {}
+            }
+            pi = pi + 1;
+        }
         TypeChecker_set_func_effects(self, func.name, effects);
         fi = fi + 1;
     }
@@ -1351,8 +1426,38 @@ pub fn TypeChecker_compute_func_effects(self: &mut TypeChecker, program: Program
         while mi < imp.methods.len() {
             var method: Func = imp.methods.get(mi);
             names.push(method.name);
+            // Register function-typed params for effect polymorphism.
+            var pi: i64 = 0;
+            while pi < method.params.len() {
+                var param: Param = method.params.get(pi);
+                match param.ty {
+                    Type::Func(_, _) => {
+                        TypeChecker_set_ho_param_effects(self, param.name, all_effs);
+                    }
+                    _ => {}
+                }
+                pi = pi + 1;
+            }
             var effects: Vec<str> = Vec::new();
             TypeChecker_scan_stmts_for_effects(self, method.body, &mut effects);
+            pi = 0;
+            while pi < method.params.len() {
+                var param: Param = method.params.get(pi);
+                match param.ty {
+                    Type::Func(_, _) => {
+                        var ho_effs: Vec<str> = TypeChecker_get_ho_param_effects(self, param.name);
+                        var hi: i64 = 0;
+                        while hi < ho_effs.len() {
+                            if !str_vec_contains(effects, ho_effs.get(hi)) {
+                                effects.push(ho_effs.get(hi));
+                            }
+                            hi = hi + 1;
+                        }
+                    }
+                    _ => {}
+                }
+                pi = pi + 1;
+            }
             TypeChecker_set_func_effects(self, method.name, effects);
             mi = mi + 1;
         }
@@ -2660,15 +2765,58 @@ pub fn TypeChecker_verify_checkpoint(self: &mut TypeChecker, program: Program) {
 pub fn TypeChecker_verify_dp(self: &mut TypeChecker, program: Program) {
     // @dp: differential privacy
     // Rejects IO/Net/Spawn/Diverge effects.
+    // Also validates epsilon values and composes epsilon across @dp callees.
+
+    // Parse epsilon from @dp(epsilon=N) annotation.
+    var dp_names: Vec<str> = Vec::new();
+    var dp_epsilons: Vec<f64> = Vec::new();
+    var dp_call_names: Vec<str> = Vec::new();
+    var dp_call_offsets: Vec<i64> = Vec::new();
+    var dp_call_flat: Vec<str> = Vec::new();
+
     var fi: i64 = 0;
     while fi < program.funcs.len() {
         var func: Func = program.funcs.get(fi);
         var is_dp: bool = false;
+        var epsilon: f64 = 0.0;
         var ai: i64 = 0;
         while ai < func.annotations.len() {
-            if str_equal(func.annotations.get(ai).name, "dp") { is_dp = true; }
+            var ann: Annotation = func.annotations.get(ai);
+            if str_equal(ann.name, "dp") {
+                is_dp = true;
+                // Parse epsilon=N from args (simple parser — handles N.M format)
+                var argi: i64 = 0;
+                while argi < ann.args.len() {
+                    var arg: str = ann.args.get(argi);
+                    if str_starts_with(arg, "epsilon=") {
+                        var val_str: str = str_slice(arg, 8, str_len(arg));
+                        epsilon = dp_parse_float(val_str);
+                    }
+                    argi = argi + 1;
+                }
+            }
             ai = ai + 1;
         }
+        if is_dp {
+            // Validate epsilon is positive
+            if epsilon <= 0.0 {
+                self.errors.push("Differential privacy error: function '" + func.name + "' has @dp(epsilon=" + float_to_str(epsilon) + ") — epsilon must be positive");
+            }
+            dp_names.push(func.name);
+            dp_epsilons.push(epsilon);
+        }
+        // Build call graph entry for this function
+        var calls: Vec<str> = Vec::new();
+        scan_stmts_for_calls(func.body, &mut calls);
+        dp_call_names.push(func.name);
+        dp_call_offsets.push(dp_call_flat.len());
+        var ci: i64 = 0;
+        while ci < calls.len() {
+            dp_call_flat.push(calls.get(ci));
+            ci = ci + 1;
+        }
+
+        // Check effects
         if is_dp {
             var effects: Vec<str> = TypeChecker_get_func_effects(self, func.name);
             var ei: i64 = 0;
@@ -2682,6 +2830,118 @@ pub fn TypeChecker_verify_dp(self: &mut TypeChecker, program: Program) {
         }
         fi = fi + 1;
     }
+
+    // Epsilon composition: for each @dp function, compute total epsilon
+    // (own + transitive @dp callees) and reject if it exceeds declared.
+    var nri: i64 = 0;
+    while nri < dp_names.len() {
+        var target: str = dp_names.get(nri);
+        var declared: f64 = dp_epsilons.get(nri);
+        // DFS to sum epsilon of all @dp callees reachable from target
+        var visited: Vec<str> = Vec::new();
+        var total: f64 = dp_compute_total_epsilon(target, dp_names, dp_epsilons, dp_call_names, dp_call_offsets, dp_call_flat, &mut visited);
+        if total > declared {
+            self.errors.push("Differential privacy error: function '" + target + "' declares @dp(epsilon=" + float_to_str(declared) + ") but total epsilon across @dp callees is " + float_to_str(total));
+        }
+        nri = nri + 1;
+    }
+}
+
+// Simple float parser for DP epsilon values (handles N.M format).
+fn dp_parse_float(s: str) -> f64 {
+    var result: f64 = 0.0;
+    var i: i64 = 0;
+    var negative: bool = false;
+    if str_len(s) > 0 && str_byte_at(s, 0) == 45 {
+        negative = true;
+        i = 1;
+    }
+    var int_part: f64 = 0.0;
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        if b >= 48 && b <= 57 {
+            int_part = int_part * 10.0 + (b - 48) as f64;
+        } else {
+            i = i + 1;
+            break;
+        }
+        i = i + 1;
+    }
+    var frac_part: f64 = 0.0;
+    var frac_div: f64 = 10.0;
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        if b >= 48 && b <= 57 {
+            frac_part = frac_part + (b - 48) as f64 / frac_div;
+            frac_div = frac_div * 10.0;
+        } else {
+            break;
+        }
+        i = i + 1;
+    }
+    result = int_part + frac_part;
+    if negative { result = -result; }
+    return result;
+}
+
+// Compute total epsilon (own + transitive @dp callees) via DFS.
+fn dp_compute_total_epsilon(target: str, dp_names: Vec<str>, dp_epsilons: Vec<f64>, cg_names: Vec<str>, cg_offsets: Vec<i64>, cg_calls: Vec<str>, visited: &mut Vec<str>) -> f64 {
+    // Check if already visited (cycle)
+    var vi: i64 = 0;
+    while vi < visited.len() {
+        if str_equal(visited.get(vi), target) { return 0.0; }
+        vi = vi + 1;
+    }
+    visited.push(target);
+
+    // Find target's epsilon
+    var own: f64 = 0.0;
+    var found: bool = false;
+    var ni: i64 = 0;
+    while ni < dp_names.len() {
+        if str_equal(dp_names.get(ni), target) {
+            own = dp_epsilons.get(ni);
+            found = true;
+            ni = dp_names.len();
+        }
+        ni = ni + 1;
+    }
+
+    // Find target's callees in the call graph
+    var target_idx: i64 = -1;
+    ni = 0;
+    while ni < cg_names.len() {
+        if str_equal(cg_names.get(ni), target) { target_idx = ni; }
+        ni = ni + 1;
+    }
+    if target_idx < 0 { return own; }
+
+    var start: i64 = cg_offsets.get(target_idx);
+    var end: i64 = 0;
+    if target_idx + 1 < cg_offsets.len() {
+        end = cg_offsets.get(target_idx + 1);
+    } else {
+        end = cg_calls.len();
+    }
+
+    var callee_eps: f64 = 0.0;
+    var ci: i64 = start;
+    while ci < end {
+        var callee: str = cg_calls.get(ci);
+        // Only sum if callee is a @dp function
+        var is_dp: bool = false;
+        ni = 0;
+        while ni < dp_names.len() {
+            if str_equal(dp_names.get(ni), callee) { is_dp = true; }
+            ni = ni + 1;
+        }
+        if is_dp {
+            callee_eps = callee_eps + dp_compute_total_epsilon(callee, dp_names, dp_epsilons, cg_names, cg_offsets, cg_calls, visited);
+        }
+        ci = ci + 1;
+    }
+
+    return own + callee_eps;
 }
 
 pub fn TypeChecker_verify_shard(self: &mut TypeChecker, program: Program) {
@@ -4379,9 +4639,30 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                     OptI64::Some(_) => {}
                 }
             }
+            // Track variables reassigned inside the region (flow-sensitive).
+            var reassigned_in_region: Vec<str> = Vec::new();
             var si: i64 = 0;
             while si < body.len() {
-                TypeChecker_check_stmt(self, body.get(si));
+                var s: Stmt = body.get(si);
+                match s {
+                    Stmt::Assign(target, _, _, _) => {
+                        if !vec_contains_str(reassigned_in_region, target) {
+                            reassigned_in_region.push(target);
+                        }
+                    }
+                    Stmt::FieldAssign(object, _, _, _, _) => {
+                        match object {
+                            Expr::Ident(n) => {
+                                if !vec_contains_str(reassigned_in_region, n) {
+                                    reassigned_in_region.push(n);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+                TypeChecker_check_stmt(self, s);
                 si = si + 1;
             }
             TypeChecker_pop_scope(self);
@@ -6049,6 +6330,22 @@ pub fn TypeChecker_scan_expr_for_effects(self: &TypeChecker, expr: Expr, effects
                     fi = self.func_effects.len();
                 }
                 fi = fi + 1;
+            }
+            // Effect polymorphism: if callee is a function-typed parameter,
+            // add the conservative HO param effects for that parameter name.
+            var hoi: i64 = 0;
+            while hoi < self.ho_param_effects.len() {
+                if self.ho_param_effects.get(hoi).key == callee {
+                    var ho_effs: Vec<str> = self.ho_param_effects.get(hoi).val;
+                    var hei: i64 = 0;
+                    while hei < ho_effs.len() {
+                        if !str_vec_contains_ref(effects, ho_effs.get(hei)) {
+                            effects.push(ho_effs.get(hei));
+                        }
+                        hei = hei + 1;
+                    }
+                }
+                hoi = hoi + 1;
             }
             var ai: i64 = 0;
             while ai < args.len() {

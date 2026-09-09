@@ -600,10 +600,111 @@ fn compute_live_intervals(func: &L3Function) -> HashMap<VReg, LiveInterval> {
         }
     }
 
+    // ── Block-local liveness refinement ──
+    // After computing conservative whole-function intervals, run a backward
+    // dataflow pass to compute per-block live_in/live_out sets. Then shrink
+    // each VReg's interval to only cover blocks where it's actually live.
+    // This produces more precise intervals → fewer spills, better code.
+    {
+        // Build block index map: PBlock → block index in func.blocks.
+        let block_idx: HashMap<PBlock, usize> = func.blocks.iter()
+            .enumerate()
+            .map(|(i, b)| (b.id, i))
+            .collect();
+
+        // Compute per-block use/def sets.
+        let mut block_uses: Vec<HashSet<VReg>> = Vec::with_capacity(func.blocks.len());
+        let mut block_defs: Vec<HashSet<VReg>> = Vec::with_capacity(func.blocks.len());
+        for block in &func.blocks {
+            let mut uses = HashSet::new();
+            let mut defs = HashSet::new();
+            // Block params are defs.
+            for (vreg, _) in &block.params {
+                defs.insert(*vreg);
+            }
+            for inst in &block.instructions {
+                for vreg in inst_uses(inst) {
+                    if !defs.contains(&vreg) {
+                        uses.insert(vreg);
+                    }
+                }
+                if let Some(dst) = inst_def(inst) {
+                    defs.insert(dst);
+                }
+            }
+            block_uses.push(uses);
+            block_defs.push(defs);
+        }
+
+        // Compute successors for each block.
+        let successors: Vec<Vec<PBlock>> = func.blocks.iter().map(|block| {
+            match block.instructions.last() {
+                Some(L3Inst::Jmp { target }) => vec![*target],
+                Some(L3Inst::Br { then, else_, .. }) => vec![*then, *else_],
+                _ => vec![],
+            }
+        }).collect();
+
+        // Backward dataflow: live_out[B] = union of live_in[S] for all successors S.
+        // live_in[B] = use[B] ∪ (live_out[B] - def[B])
+        let mut live_in: Vec<HashSet<VReg>> = vec![HashSet::new(); func.blocks.len()];
+        let mut live_out: Vec<HashSet<VReg>> = vec![HashSet::new(); func.blocks.len()];
+
+        // Iterate until fixpoint.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for bi in (0..func.blocks.len()).rev() {
+                let mut new_out = HashSet::new();
+                for &succ in &successors[bi] {
+                    if let Some(&si) = block_idx.get(&succ) {
+                        new_out.extend(&live_in[si]);
+                    }
+                }
+                let mut new_in = block_uses[bi].clone();
+                for vreg in &new_out {
+                    if !block_defs[bi].contains(vreg) {
+                        new_in.insert(*vreg);
+                    }
+                }
+                if new_in != live_in[bi] || new_out != live_out[bi] {
+                    live_in[bi] = new_in;
+                    live_out[bi] = new_out;
+                    changed = true;
+                }
+            }
+        }
+
+        // Now refine intervals: for each VReg, find the actual range of
+        // blocks where it's live (live_in or live_out is non-empty for that vreg).
+        // Shrink the interval to only cover those blocks.
+        for (bi, block) in func.blocks.iter().enumerate() {
+            let block_start_pos = block_ranges[bi].1;
+            let block_end_pos = block_ranges[bi].2;
+            // VRegs live_in to this block: interval should start at or before block_start.
+            // VRegs live_out of this block: interval should extend to block_end.
+            for vreg in &live_in[bi] {
+                if let Some(entry) = intervals.get_mut(vreg) {
+                    // The vreg is live at the start of this block — ensure the
+                    // interval covers from block_start. But don't extend start
+                    // backward (the def might be in a predecessor).
+                    if entry.end < block_start_pos {
+                        entry.end = block_start_pos;
+                    }
+                }
+            }
+            for vreg in &live_out[bi] {
+                if let Some(entry) = intervals.get_mut(vreg) {
+                    if entry.end < block_end_pos {
+                        entry.end = block_end_pos;
+                    }
+                }
+            }
+        }
+    }
+
     intervals
 }
-
-/// Physical registers implicitly clobbered by the codegen for each instruction.
 /// The regalloc must not keep live vregs in these registers across the instruction.
 ///
 /// F-1D: Effect-Aware Register Allocation

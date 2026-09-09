@@ -2734,6 +2734,211 @@ fn dse_function(f: &mut L2Function) -> i64 {
         ai = ai + 1;
     }
 
+    // Pattern 3: Cross-block dead stores.
+    // A store to a local pointer in block B is dead if ALL successors
+    // store to the same pointer before loading it. Uses backward dataflow.
+    // Compute per-block "store_before_load" sets (walking forward).
+    var block_sbl: Vec<Vec<i64> > = Vec::new();
+    bi = 0;
+    while bi < f.blocks.len() {
+        var stored: Vec<i64> = Vec::new();
+        var loaded: Vec<i64> = Vec::new();
+        var ii: i64 = 0;
+        while ii < f.blocks.get(bi).instructions.len() {
+            var vid: i64 = f.blocks.get(bi).instructions.get(ii);
+            if has_inst(f, vid) {
+                var inst: L2Inst = get_inst(f, vid);
+                match inst {
+                    L2Inst::Store(ptr, _, _) => {
+                        if dse_is_local_ptr(ptr, local_allocas, gfp_base_ids) {
+                            dse_set_add(&mut stored, ptr);
+                            dse_set_remove(&mut loaded, ptr);
+                        }
+                    }
+                    L2Inst::Load(ptr, _) => {
+                        if dse_is_local_ptr(ptr, local_allocas, gfp_base_ids) {
+                            dse_set_add(&mut loaded, ptr);
+                        }
+                    }
+                    L2Inst::Call(func, _, _) => {
+                        if !is_known_pure_func(func) {
+                            var k: i64 = 0;
+                            while k < local_allocas.len() {
+                                dse_set_add(&mut loaded, local_allocas.get(k));
+                                k = k + 1;
+                            }
+                            k = 0;
+                            while k < gfp_base_ids.len() {
+                                dse_set_add(&mut loaded, gfp_base_ids.get(k));
+                                k = k + 1;
+                            }
+                        }
+                    }
+                    L2Inst::CallPtr(_, _, _, _) => {
+                        var k: i64 = 0;
+                        while k < local_allocas.len() {
+                            dse_set_add(&mut loaded, local_allocas.get(k));
+                            k = k + 1;
+                        }
+                    }
+                    L2Inst::DynCall(_, _, _, _) => {
+                        var k: i64 = 0;
+                        while k < local_allocas.len() {
+                            dse_set_add(&mut loaded, local_allocas.get(k));
+                            k = k + 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ii = ii + 1;
+        }
+        // Pointers stored but not loaded by end of block.
+        var sbl: Vec<i64> = Vec::new();
+        var si: i64 = 0;
+        while si < stored.len() {
+            if !i64_vec_contains(loaded, stored.get(si)) {
+                sbl.push(stored.get(si));
+            }
+            si = si + 1;
+        }
+        block_sbl.push(sbl);
+        bi = bi + 1;
+    }
+
+    // Build block index map.
+    var block_idx_ids: Vec<i64> = Vec::new();
+    var block_idx_vals: Vec<i64> = Vec::new();
+    bi = 0;
+    while bi < f.blocks.len() {
+        block_idx_ids.push(f.blocks.get(bi).id);
+        block_idx_vals.push(bi);
+        bi = bi + 1;
+    }
+
+    // Compute successors for each block.
+    var block_succs: Vec<Vec<i64> > = Vec::new();
+    bi = 0;
+    while bi < f.blocks.len() {
+        var succs: Vec<i64> = Vec::new();
+        var last_inst: L2Inst = L2Inst::Unreachable;
+        if f.blocks.get(bi).instructions.len() > 0 {
+            var last_vid: i64 = f.blocks.get(bi).instructions.get(f.blocks.get(bi).instructions.len() - 1);
+            if has_inst(f, last_vid) {
+                last_inst = get_inst(f, last_vid);
+            }
+        }
+        succs = terminator_targets(last_inst);
+        block_succs.push(succs);
+        bi = bi + 1;
+    }
+
+    // Backward dataflow: sbl_out[B] = intersection over all successors S of
+    // (block_sbl[S] + sbl_out[S]).
+    var sbl_out: Vec<Vec<i64> > = Vec::new();
+    bi = 0;
+    while bi < f.blocks.len() {
+        sbl_out.push(Vec::new());
+        bi = bi + 1;
+    }
+
+    var df_changed: bool = true;
+    while df_changed {
+        df_changed = false;
+        bi = f.blocks.len() - 1;
+        while bi >= 0 {
+            // Compute intersection of successor sets.
+            var new_out: Vec<i64> = Vec::new();
+            var has_succ: bool = false;
+            var si: i64 = 0;
+            while si < block_succs.get(bi).len() {
+                has_succ = true;
+                var succ_id: i64 = block_succs.get(bi).get(si);
+                var succ_idx: i64 = dse_find_block_idx(block_idx_ids, succ_id);
+                if succ_idx >= 0 {
+                    var succ_set: Vec<i64> = Vec::new();
+                    // Union block_sbl[succ] and sbl_out[succ].
+                    var k: i64 = 0;
+                    while k < block_sbl.get(succ_idx).len() {
+                        if !i64_vec_contains(succ_set, block_sbl.get(succ_idx).get(k)) {
+                            succ_set.push(block_sbl.get(succ_idx).get(k));
+                        }
+                        k = k + 1;
+                    }
+                    k = 0;
+                    while k < sbl_out.get(succ_idx).len() {
+                        if !i64_vec_contains(succ_set, sbl_out.get(succ_idx).get(k)) {
+                            succ_set.push(sbl_out.get(succ_idx).get(k));
+                        }
+                        k = k + 1;
+                    }
+                    if si == 0 {
+                        new_out = succ_set;
+                    } else {
+                        // Intersection.
+                        var inter: Vec<i64> = Vec::new();
+                        var ki: i64 = 0;
+                        while ki < new_out.len() {
+                            if i64_vec_contains(succ_set, new_out.get(ki)) {
+                                inter.push(new_out.get(ki));
+                            }
+                            ki = ki + 1;
+                        }
+                        new_out = inter;
+                    }
+                }
+                si = si + 1;
+            }
+            if !has_succ { new_out = Vec::new(); }
+            if !dse_vec_i64_eq(sbl_out.get(bi), new_out) {
+                sbl_out.set(bi, new_out);
+                df_changed = true;
+            }
+            bi = bi - 1;
+        }
+    }
+
+    // Find cross-block dead stores: the LAST store to ptr P in block B
+    // is dead if P is in sbl_out[B].
+    bi = 0;
+    while bi < f.blocks.len() {
+        var last_store_ids: Vec<i64> = Vec::new();
+        var last_store_ptrs: Vec<i64> = Vec::new();
+        var ii: i64 = 0;
+        while ii < f.blocks.get(bi).instructions.len() {
+            var vid: i64 = f.blocks.get(bi).instructions.get(ii);
+            if has_inst(f, vid) {
+                var inst: L2Inst = get_inst(f, vid);
+                match inst {
+                    L2Inst::Store(ptr, _, _) => {
+                        if dse_is_local_ptr(ptr, local_allocas, gfp_base_ids) {
+                            var idx: i64 = dse_find_ptr(last_store_ptrs, ptr);
+                            if idx >= 0 {
+                                last_store_ids.set(idx, vid);
+                            } else {
+                                last_store_ids.push(vid);
+                                last_store_ptrs.push(ptr);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ii = ii + 1;
+        }
+        var li: i64 = 0;
+        while li < last_store_ptrs.len() {
+            if i64_vec_contains(sbl_out.get(bi), last_store_ptrs.get(li)) {
+                if !i64_vec_contains(to_remove, last_store_ids.get(li)) {
+                    to_remove.push(last_store_ids.get(li));
+                    count = count + 1;
+                }
+            }
+            li = li + 1;
+        }
+        bi = bi + 1;
+    }
+
     // Remove dead stores
     if to_remove.len() > 0 {
         var new_values: Vec<ValueIdL2Entry> = Vec::new();
@@ -2822,6 +3027,37 @@ fn dse_gfp_find(gfp_base_ids: Vec<i64>, ptr: i64) -> i64 {
         i = i + 1;
     }
     return -1;
+}
+
+// Find the index of a block ID in the block_idx_ids vector.
+fn dse_find_block_idx(block_idx_ids: Vec<i64>, id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < block_idx_ids.len() {
+        if block_idx_ids.get(i) == id { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Find the index of a pointer in a vector.
+fn dse_find_ptr(ptrs: Vec<i64>, ptr: i64) -> i64 {
+    var i: i64 = 0;
+    while i < ptrs.len() {
+        if ptrs.get(i) == ptr { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Check if two Vec<i64> contain the same elements (order-independent).
+fn dse_vec_i64_eq(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() { return false; }
+    var i: i64 = 0;
+    while i < a.len() {
+        if !i64_vec_contains(b, a.get(i)) { return false; }
+        i = i + 1;
+    }
+    return true;
 }
 
 // ===========================================================================

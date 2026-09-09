@@ -690,6 +690,15 @@ impl X86CodeGen {
             Inst::GradBegin { .. } | Inst::GradEnd | Inst::Backward { .. } => {
                 wln!(self, "    # autodiff marker (no-op)");
             }
+            Inst::StructCopy { dst, src, ty } => {
+                let size = module.type_size(ty);
+                let dst_off = frame.offset(*dst);
+                let src_off = frame.offset(*src);
+                wln!(self, "    leaq {}(%rbp), %rdi", fmt_offset(dst_off));
+                wln!(self, "    leaq {}(%rbp), %rsi", fmt_offset(src_off));
+                wln!(self, "    movq ${}, %rdx", size);
+                wln!(self, "    call memcpy");
+            }
         }
     }
 

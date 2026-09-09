@@ -453,17 +453,19 @@ fn subst_expr(expr: &Expr, subst: &Subst, renames: &HashMap<String, String>, met
 /// Apply substitution to a statement
 fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, method_renames: &HashMap<String, String>) -> Stmt {
     match stmt {
-        Stmt::Let { name, ty, is_mut, is_persist, expr, line } => Stmt::Let {
+        Stmt::Let { name, ty, is_mut, is_persist, annotations, expr, line } => Stmt::Let {
             name: name.clone(),
             ty: ty.as_ref().map(|t| subst_type(t, subst)),
             is_mut: *is_mut,
             is_persist: *is_persist,
+            annotations: annotations.clone(),
             expr: subst_expr(expr, subst, renames, method_renames),
             line: *line,
         },
-        Stmt::LetUninit { name, ty, line } => Stmt::LetUninit {
+        Stmt::LetUninit { name, ty, annotations, line } => Stmt::LetUninit {
             name: name.clone(),
             ty: subst_type(ty, subst),
+            annotations: annotations.clone(),
             line: *line,
         },
         Stmt::LetTuple { names, expr, line } => Stmt::LetTuple {
@@ -599,6 +601,10 @@ fn subst_stmt(stmt: &Stmt, subst: &Subst, renames: &HashMap<String, String>, met
                 body: c.body.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect(),
             }).collect(),
             default: default.as_ref().map(|d| d.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect()),
+            line: *line,
+        },
+        Stmt::Parallel { branches, line } => Stmt::Parallel {
+            branches: branches.iter().map(|b| b.iter().map(|s| subst_stmt(s, subst, renames, method_renames)).collect()).collect(),
             line: *line,
         },
     }
@@ -813,10 +819,10 @@ fn fixup_generic_calls(stmts: &[Stmt], generics: &HashMap<String, (Func, Vec<Str
 fn fixup_generic_calls_stmt(stmt: &Stmt, generics: &HashMap<String, (Func, Vec<String>)>, current_func: &Func) -> Stmt {
     match stmt {
         Stmt::Expr(e, line) => Stmt::Expr(fixup_generic_calls_expr(e, generics, current_func), *line),
-        Stmt::Let { name, ty, expr, is_mut, is_persist, line } => Stmt::Let {
+        Stmt::Let { name, ty, expr, is_mut, is_persist, annotations, line } => Stmt::Let {
             name: name.clone(), ty: ty.clone(),
             expr: fixup_generic_calls_expr(expr, generics, current_func),
-            is_mut: *is_mut, is_persist: *is_persist, line: *line,
+            is_mut: *is_mut, is_persist: *is_persist, annotations: annotations.clone(), line: *line,
         },
         Stmt::LetTuple { names, expr, line } => Stmt::LetTuple {
             names: names.clone(),
@@ -1207,6 +1213,13 @@ fn collect_generic_calls_stmt_with_hint(
             }
             if let Some(ref def) = default {
                 for s in def {
+                    collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
+                }
+            }
+        }
+        Stmt::Parallel { branches, .. } => {
+            for branch in branches {
+                for s in branch {
                     collect_generic_calls_stmt_with_hint(s, generics, generic_methods, calls, method_calls, current_func, None);
                 }
             }

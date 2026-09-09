@@ -1599,6 +1599,25 @@ impl Interpreter {
                 ExecOutcome::Continue
             }
 
+            Inst::StructCopy { dst, src, ty } => {
+                // Copy struct data from src to dst (memcpy of struct size bytes)
+                let dst_addr = match values.get(dst) {
+                    Some(Value::Ptr(a)) => *a,
+                    Some(Value::Int(n)) => *n as u64,
+                    _ => 0,
+                };
+                let src_addr = match values.get(src) {
+                    Some(Value::Ptr(a)) => *a,
+                    Some(Value::Int(n)) => *n as u64,
+                    _ => 0,
+                };
+                let size = self.module.type_size(ty) as usize;
+                if size > 0 {
+                    let src_bytes = self.memory.load(src_addr, size);
+                    self.memory.store(dst_addr, &src_bytes);
+                }
+                return ExecOutcome::Continue;
+            }
             Inst::GetFieldPtr { struct_ptr, field_index, field_ty, .. } => {
                 // Value::Int is also a valid pointer (e.g., Vec_get returns i64
                 // but the IR type is Ptr(Struct(...))). Treat Int as Ptr.
@@ -2732,6 +2751,19 @@ impl Interpreter {
             }
             "p_free" => {
                 // Interpreter doesn't actually free — memory is arena-based
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_memset" => {
+                // @zeroize: wipe memory at ptr for size bytes with val
+                if let (Some(Value::Ptr(addr)), Some(Value::Int(val)), Some(Value::Int(size))) =
+                    (args.first(), args.get(1), args.get(2))
+                {
+                    let sz = if *size < 0 { 0 } else { *size as usize };
+                    let byte_val = (*val as u8) & 0xFF;
+                    for i in 0..sz {
+                        let _ = self.memory.store(*addr + i as u64, &[byte_val]);
+                    }
+                }
                 ExecOutcome::Value(Value::Void)
             }
             "p_region_free" => {
@@ -5984,6 +6016,35 @@ impl Interpreter {
             }
 
             // ─── FFI stubs (audio, input, etc.) — return safe defaults ───
+            "pledge_putchar" => {
+                if let Some(Value::Int(ch)) = args.first() {
+                    print!("{}", (*ch as u8) as char);
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
+                ExecOutcome::Value(Value::Int(0))
+            }
+            "pledge_getchar" => ExecOutcome::Value(Value::Int(0)),
+            "pledge_printf" => {
+                // Variadic printf — just print the format string
+                if let Some(Value::Ptr(addr)) = args.first() {
+                    let mut bytes = Vec::new();
+                    let mut offset = *addr;
+                    loop {
+                        let b = self.memory.load(offset, 1);
+                        if b[0] == 0 { break; }
+                        bytes.push(b[0]);
+                        offset += 1;
+                    }
+                    print!("{}", String::from_utf8_lossy(&bytes));
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
+                ExecOutcome::Value(Value::Int(0))
+            }
+            "pledge_fgets" => ExecOutcome::Value(Value::Ptr(0)),
+            "pledge_fputs" => ExecOutcome::Value(Value::Int(0)),
+            "pledge_fflush" => ExecOutcome::Value(Value::Int(0)),
             "pledge_audio_init" => ExecOutcome::Value(Value::Int(0)),
             "pledge_audio_shutdown" | "pledge_audio_stop" | "pledge_audio_pause"
             | "pledge_audio_resume" | "pledge_audio_stop_all"

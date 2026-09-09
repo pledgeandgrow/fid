@@ -641,7 +641,7 @@ impl CCodeGen {
             "p_vec_reverse", "p_vec_sort", "p_vec_truncate", "p_vec_extend",
             "p_map_insert", "p_map_remove", "p_map_clear",
             "p_print", "p_print_str", "p_eprint_str", "p_print_int", "p_print_bool",
-            "p_print_float", "p_print_newline", "p_free", "p_arena_restore", "p_region_free", "p_panic",
+            "p_print_float", "p_print_newline", "p_flush_stdout", "p_free", "p_arena_restore", "p_region_free", "p_panic",
             "p_socket_close",
             "p_cli", "p_sti", "p_cr3_write", "p_invlpg", "p_page_map", "p_page_unmap",
             "p_phys_write64", "p_lgdt", "p_gdt_set_entry",
@@ -807,6 +807,13 @@ impl CCodeGen {
             let inc_missing = ext.include.as_ref()
                 .map(|inc| missing_includes.contains(inc))
                 .unwrap_or(false);
+            // Check if this is a system header include — if so, the function
+            // is already declared by the header. Only emit the #define rename,
+            // not a conflicting forward declaration (e.g. printf is variadic
+            // in <stdio.h> but the FFI decl has fixed args).
+            let is_system_include = ext.include.as_ref()
+                .map(|inc| inc.starts_with('<'))
+                .unwrap_or(false);
             if inc_missing {
                 let ret_default = match &ext.ret_ty {
                     ast::Type::F32 | ast::Type::F64 => "0.0",
@@ -818,6 +825,9 @@ impl CCodeGen {
                     format!(" {{ return {}; }}", ret_default)
                 };
                 wln!(self, "{} {}({}){}", ret_c, ext.pledge_name, params_str, body);
+            } else if is_system_include && ext.pledge_name != ext.c_name {
+                // System header already declares the function — just emit the #define
+                wln!(self, "#define {} {}", ext.pledge_name, ext.c_name);
             } else {
                 wln!(self, "{} {}({});", ret_c, ext.c_name, params_str);
                 if ext.pledge_name != ext.c_name {
@@ -1102,7 +1112,9 @@ impl CCodeGen {
         wln!(self, "void p_call_stack_pop(void) {{ if (p_call_stack_depth > 0) p_call_stack_depth--; }}");
         wln!(self, "void p_set_max_recursion(int limit) {{ p_max_recursion = limit; }}");
         wln!(self, "void* p_malloc(int64_t size);");
+        wln!(self, "void* p_alloc(int64_t size);");
         wln!(self, "void p_free(void* ptr);");
+        wln!(self, "void p_memset(void* ptr, int val, int64_t size);");
         // File I/O builtins
         wln!(self, "char* p_file_read(const char* path);");
         wln!(self, "int64_t p_file_write(const char* path, const char* content);");
@@ -1709,6 +1721,17 @@ impl CCodeGen {
                         wln!(self, "    *(int64_t*){} = (int64_t){};", p, v);
                     }
                 }
+            }
+            Inst::StructCopy { dst, src, ty } => {
+                let d = self.val_name(*dst);
+                let s = self.val_name(*src);
+                let size = match ty {
+                    IrType::Struct(name) => {
+                        self.struct_layouts.get(name).map(|l| l.size).unwrap_or(8)
+                    }
+                    _ => ty.size(),
+                };
+                wln!(self, "    memcpy({}, {}, {});", d, s, size);
             }
             Inst::GetFieldPtr { struct_ptr, field_index, .. } => {
                 let s = self.val_name(*struct_ptr);
@@ -2633,6 +2656,7 @@ impl CCodeGen {
         // the fn_param_types table. TCC treats void* and int64_t as compatible
         // pointer-sized types, but to be safe we match the forward declaration.
         wln!(self, "void p_free(void* ptr) { /* arena memory — no individual frees */ }");
+        wln!(self, "void p_memset(void* ptr, int val, int64_t size) { if (ptr && size > 0) memset(ptr, val, (size_t)size); }");
         wln!(self, "int64_t p_arena_save(void) { return 0; }");
         wln!(self, "void p_arena_restore(int64_t mark) {");
         wln!(self, "    __p_arena_chunk* c = __p_arena_head;");
@@ -2664,7 +2688,7 @@ impl CCodeGen {
         wln!(self, "int64_t p_file_write_vec(const char* path, PVec* v) {{");
         wln!(self, "    FILE* f = fopen(path, \"wb\");");
         wln!(self, "    if (!f) return -1;");
-        wln!(self, "    if (v) {{ fwrite(v->data, 1, (size_t)(v->len * sizeof(void*)), f); }}");
+        wln!(self, "    if (v) {{ int64_t i; for (i = 0; i < v->len; i++) {{ unsigned char b = (unsigned char)(int64_t)v->data[i]; fwrite(&b, 1, 1, f); }} }}");
         wln!(self, "    fclose(f); return 0;");
         wln!(self, "}}");
         wln!(self, "bool p_file_exists(const char* path) {{ FILE* f = fopen(path, \"rb\"); if (f) {{ fclose(f); return true; }} return false; }}");

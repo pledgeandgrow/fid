@@ -963,6 +963,14 @@ impl WasmCodeGen {
             Inst::TxnBegin | Inst::TxnEnd | Inst::UnsafeBegin | Inst::UnsafeEnd | Inst::GradBegin { .. } | Inst::GradEnd | Inst::Backward { .. } => {
                 // No-op in WASM (rollback/unsafe not supported)
             }
+            Inst::StructCopy { dst, src, .. } => {
+                // Emit as memory.copy (WASM bulk memory operations)
+                self.emit_value(out, *dst, func);
+                self.emit_value(out, *src, func);
+                // size: compute from struct layout if available — use 0 as placeholder
+                self.emit_const_i32(out, 0);
+                out.push(0xFC); out.uleb(10); // memory.copy
+            }
             Inst::Panic { message } => {
                 let addr = self.string_addrs.get(message).copied().unwrap_or(0);
                 self.emit_const_i64(out, addr as i64);
@@ -987,6 +995,9 @@ impl WasmCodeGen {
             }
             Inst::GradBegin { .. } | Inst::GradEnd | Inst::Backward { .. } => {
                 // Autodiff markers — no-op in WASM
+            }
+            Inst::StructCopy { .. } => {
+                // Handled above with the bulk memory path
             }
         }
     }
