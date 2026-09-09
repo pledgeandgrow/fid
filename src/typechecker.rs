@@ -4194,7 +4194,21 @@ impl TypeChecker {
                     .cloned()
                     .collect();
 
+                // Track variables that are reassigned inside the region to
+                // non-region values — these don't escape (flow-sensitive analysis).
+                let mut reassigned_in_region: HashSet<String> = HashSet::new();
+
                 for s in body {
+                    // Before checking each statement, record if it reassigns
+                    // an existing variable to a new value.
+                    if let Stmt::Assign { target, .. } = s {
+                        reassigned_in_region.insert(target.clone());
+                    }
+                    if let Stmt::FieldAssign { object, .. } = s {
+                        if let Expr::Ident(name) = object {
+                            reassigned_in_region.insert(name.clone());
+                        }
+                    }
                     self.check_stmt(s);
                 }
 
@@ -4204,7 +4218,11 @@ impl TypeChecker {
                     .var_regions
                     .iter()
                     .filter(|(k, v)| {
-                        v.as_str() == region_name.as_str() && !vars_before.contains(k.as_str())
+                        v.as_str() == region_name.as_str()
+                            && !vars_before.contains(k.as_str())
+                            // Flow-sensitive: don't flag variables that were
+                            // reassigned to a non-region value inside the region.
+                            && !reassigned_in_region.contains(k.as_str())
                     })
                     .map(|(k, _)| k.clone())
                     .collect();

@@ -61,8 +61,14 @@ C:\tcc\tcc.exe release\fides-c_wrapped.c -o release\fides-c.exe -lws2_32
 ./verify.sh
 ```
 
-## Current Status (Sep 5, 2026 — session 15)
+## Current Status (Sep 9, 2026 — v1.0.0 released)
 
+- **🎉 v1.0.0 RELEASED!** — Windows installer (`Fides-Setup-1.0.0.exe`, 2.5 MB)
+  tested and working on Windows. Users can download, install, and compile
+  `.fd` files immediately. Available at
+  [GitHub Releases](https://github.com/pledgeandgrow/p-lang/releases/tag/v1.0.0).
+- **🎉 GitHub Actions CI** — automated installer builds on tagged releases
+  (`.github/workflows/build-installer.yml`).
 - **🎉🎉🎉 BOOTSTRAP FIXPOINT ACHIEVED!** — `fides-c2.c` is byte-identical to `fides-c3.c` (0 diffs out of 701,100 lines). The self-hosted compiler reproduces itself exactly across generations.
 - **🎉🎉 SELF-HOSTING ACHIEVED ACROSS 3 GENERATIONS!** — The full bootstrap chain works:
   - Gen 1 (`fides-c.exe`): Rust → C → TCC → runs `test_simple.fd` ✓, builds `fides-c2.c` ✓
@@ -97,22 +103,25 @@ C:\tcc\tcc.exe release\fides-c_wrapped.c -o release\fides-c.exe -lws2_32
 - **23/23 self-host tests pass** on interp + PE (tests/compiler/)
 - **Strict fixpoint ACHIEVED** — `fides-c2.c` == `fides-c3.c` (byte-identical, 0 diffs out of 701,100 lines). The fix was replacing all non-ASCII (corrupted Unicode) characters in compiler source files with ASCII equivalents.
 
-### Codebase size (session 21)
+### Codebase size (v1.0.0)
 | Component | Files | LOC |
 |-----------|-------|-----|
 | Self-hosted compiler (`compiler/*.fd`) | 50 | 91,924 |
 | Rust compiler (`src/*.rs`) | 55 | 91,490 |
 | Stdlib (`stdlib/*.fd`) | 99 | 28,370 |
-| Test files (`tests/*.fd` + `tests/compiler/*.fd`) | 225 + 23 | — |
+| Test files (`tests/*.fd` + `tests/selfhost/*.fd`) | 238 + 42 | — |
+| Installer (`installer/`) | 5 | — |
 
-### Test results (session 15)
+### Test results (v1.0.0)
 | Backend | Result |
 |---------|--------|
-| Interpreter | 209/211 passed |
-| C Codegen | 198/211 matched |
-| PE Emitter | 209/211 valid |
-| Self-host (tests/compiler/) | 23/23 pass on interp + PE |
-| Bootstrap chain | 3 generations verified (gen1→gen2→gen3, all run test_simple.fd) |
+| Self-host tests (Interpreter) | 38/38 passed |
+| Self-host tests (C Codegen) | 38/38 passed |
+| Self-host tests (PE Emitter) | 38/38 passed |
+| Bootstrap tests | hello, test_alloc, test_allocator, test_arinc, test_asm pass |
+| Bootstrap chain | 3 generations verified (gen1→gen2→gen3, all work) |
+| Fixpoint | c3 type-checks + borrow-checks full 75K LOC compiler |
+| Windows installer | Tested on Windows — working |
 
 Pre-existing failures (documented in known-bugs.md §2b.8): test_codegen_c, test_lower, test_banking, test_deep_nesting, test_new_features, test_parallel, test_parallel_concurrent, test_phase8b, test_rc_arc, test_regression_collections, test_vec_math, test_token_full, test_fmt_real — all related to the `var` feature implementation (session 11).
 

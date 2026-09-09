@@ -1837,6 +1837,147 @@ fn gen_global_init_expr(expr: Expr) -> str {
     return "0";
 }
 
+// Bug 3.16 fix: Check if a global init expression is a simple literal
+// (can be used as a C static initializer) or complex (needs runtime init).
+fn is_simple_init_expr(expr: Expr) -> bool {
+    match expr {
+        Expr::IntLit(_) => { return true; }
+        Expr::FloatLit(_) => { return true; }
+        Expr::BoolLit(_) => { return true; }
+        Expr::StringLit(_) => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+// Local helper to unbox Box<Expr> for pattern matching.
+fn cg_box_expr_unbox(b: Box<Expr>) -> Expr {
+    match b {
+        Expr::IntLit(v) => { return Expr::IntLit(v); }
+        Expr::FloatLit(v) => { return Expr::FloatLit(v); }
+        Expr::StringLit(v) => { return Expr::StringLit(v); }
+        Expr::BoolLit(v) => { return Expr::BoolLit(v); }
+        Expr::Ident(n) => { return Expr::Ident(n); }
+        Expr::Call(n, a) => { return Expr::Call(n, a); }
+        Expr::MethodCall(r, m, a) => { return Expr::MethodCall(r, m, a); }
+        Expr::StructLit(n, f, s) => { return Expr::StructLit(n, f, s); }
+        _ => { return Expr::IntLit(0); }
+    }
+    return Expr::IntLit(0);
+}
+
+// Bug 3.16 fix: Generate a C expression for a runtime global initializer.
+// Handles struct literals with Vec::new() fields and simple function calls.
+fn gen_global_runtime_expr(self: &CCodeGen, expr: Expr) -> str {
+    match expr {
+        Expr::IntLit(v) => { return int_to_str(v) + "LL"; }
+        Expr::FloatLit(f) => {
+            if f != f { return "NAN"; }
+            if f > 1.7976931348623157e308 { return "INFINITY"; }
+            if f < -1.7976931348623157e308 { return "-INFINITY"; }
+            return float_to_str(f);
+        }
+        Expr::BoolLit(b) => {
+            if b { return "true"; }
+            return "false";
+        }
+        Expr::StringLit(s) => { return "\"" + escape_c_string(s) + "\""; }
+        Expr::MethodCall(receiver, method, args) => {
+            // Handle Vec::new() which is parsed as MethodCall(Ident("Vec"), "new", []).
+            var recv_expr: Expr = cg_box_expr_unbox(receiver);
+            var recv_name: str = "";
+            match recv_expr {
+                Expr::Ident(n) => { recv_name = n; }
+                _ => {}
+            }
+            if str_len(recv_name) > 0 {
+                var mangled: str = recv_name + "_" + method;
+                var c_fname: str = sanitize_c_name(self, mangled);
+                // Vec_new and similar runtime functions need a dummy env arg
+                if str_equal(mangled, "Vec_new") || str_equal(mangled, "HashMap_new") {
+                    if args.len() == 0 {
+                        return "(void*)" + c_fname + "(0LL)";
+                    }
+                    var arg_strs: str = "";
+                    var i: i64 = 0;
+                    while i < args.len() {
+                        if i > 0 { arg_strs = arg_strs + ", "; }
+                        arg_strs = arg_strs + gen_global_runtime_expr(self, args.get(i));
+                        i = i + 1;
+                    }
+                    return "(void*)" + c_fname + "(0LL, " + arg_strs + ")";
+                }
+            }
+            return "0";
+        }
+        Expr::StructLit(sname, fields, _spread) => {
+            // Allocate struct on heap, initialize fields, return pointer
+            var size: i64 = 8;
+            var si: i64 = 0;
+            while si < self.struct_layouts.len() {
+                if self.struct_layouts.get(si).name == sname {
+                    size = self.struct_layouts.get(si).layout.size;
+                    break;
+                }
+                si = si + 1;
+            }
+            var tmp: str = "__ginit_" + sname;
+            wln(self, "    struct " + sname + "_s* " + tmp + " = (struct " + sname + "_s*)p_malloc(" + int_to_str(size) + ");");
+            wln(self, "    memset(" + tmp + ", 0, " + int_to_str(size) + ");");
+            var fi: i64 = 0;
+            while fi < fields.len() {
+                var field: FieldInit = fields.get(fi);
+                // Find field offset and type from struct layout
+                var foffset: i64 = 0;
+                var ftype: IrType = IrType::I64;
+                var found: bool = false;
+                var li: i64 = 0;
+                while li < self.struct_layouts.len() {
+                    if self.struct_layouts.get(li).name == sname {
+                        var layout: StructLayout = self.struct_layouts.get(li).layout;
+                        var fj: i64 = 0;
+                        while fj < layout.fields.len() {
+                            var sf: StringIrTypeOffset = layout.fields.get(fj);
+                            if sf.name == field.name {
+                                foffset = sf.offset;
+                                ftype = sf.ty;
+                                found = true;
+                                break;
+                            }
+                            fj = fj + 1;
+                        }
+                        break;
+                    }
+                    li = li + 1;
+                }
+                if found {
+                    var val_str: str = gen_global_runtime_expr(self, field.value);
+                    var ptr_str: str = "((char*)" + tmp + " + " + int_to_str(foffset) + ")";
+                    match ftype {
+                        IrType::F64 => { wln(self, "    *(double*)" + ptr_str + " = " + val_str + ";"); }
+                        IrType::F32 => { wln(self, "    *(float*)" + ptr_str + " = " + val_str + ";"); }
+                        IrType::Bool => { wln(self, "    *(bool*)" + ptr_str + " = " + val_str + ";"); }
+                        IrType::I8 => { wln(self, "    *(int8_t*)" + ptr_str + " = (int8_t)" + val_str + ";"); }
+                        IrType::I16 => { wln(self, "    *(int16_t*)" + ptr_str + " = (int16_t)" + val_str + ";"); }
+                        IrType::I32 => { wln(self, "    *(int32_t*)" + ptr_str + " = (int32_t)" + val_str + ";"); }
+                        IrType::U8 => { wln(self, "    *(uint8_t*)" + ptr_str + " = (uint8_t)" + val_str + ";"); }
+                        IrType::U16 => { wln(self, "    *(uint16_t*)" + ptr_str + " = (uint16_t)" + val_str + ";"); }
+                        IrType::U32 => { wln(self, "    *(uint32_t*)" + ptr_str + " = (uint32_t)" + val_str + ";"); }
+                        IrType::Ptr(_) => { wln(self, "    *(void**)" + ptr_str + " = (void*)" + val_str + ";"); }
+                        IrType::Opaque(_) => { wln(self, "    *(void**)" + ptr_str + " = (void*)" + val_str + ";"); }
+                        IrType::Generic(_, _) => { wln(self, "    *(void**)" + ptr_str + " = (void*)" + val_str + ";"); }
+                        _ => { wln(self, "    *(int64_t*)" + ptr_str + " = (int64_t)" + val_str + ";"); }
+                    }
+                }
+                fi = fi + 1;
+            }
+            return "(void*)" + tmp;
+        }
+        _ => { return "0"; }
+    }
+    return "0";
+}
+
 fn emit_globals(self: &mut CCodeGen, module: IrModule) -> void {
     if module.globals.len() == 0 { return; }
     wln(self, "// --- Module-level mutable globals ---");
@@ -1849,6 +1990,51 @@ fn emit_globals(self: &mut CCodeGen, module: IrModule) -> void {
         wln(self, "static " + c_ty + " " + c_name + " = " + init_str + ";");
         gi = gi + 1;
     }
+    wln(self, "");
+}
+
+// Bug 3.16 fix: Emit __init_globals() function that initializes globals
+// with complex (non-literal) initializers at runtime.
+fn emit_global_init_function(self: &CCodeGen, module: IrModule) -> void {
+    // Always emit a forward declaration so main() can call it unconditionally
+    wln(self, "// --- Runtime global initialization (bug 3.16 fix) ---");
+    wln(self, "static void __init_globals(void);");
+    if module.globals.len() == 0 {
+        // Emit empty function body
+        wln(self, "static void __init_globals(void) { }");
+        wln(self, "");
+        return;
+    }
+    // Check if any global needs runtime init
+    var needs_init: bool = false;
+    var gi: i64 = 0;
+    while gi < module.globals.len() {
+        var entry: GlobalEntry = module.globals.get(gi);
+        if !is_simple_init_expr(entry.init) {
+            needs_init = true;
+            break;
+        }
+        gi = gi + 1;
+    }
+    if !needs_init {
+        // Emit empty function body
+        wln(self, "static void __init_globals(void) { }");
+        wln(self, "");
+        return;
+    }
+
+    wln(self, "static void __init_globals(void) {");
+    gi = 0;
+    while gi < module.globals.len() {
+        var entry: GlobalEntry = module.globals.get(gi);
+        if !is_simple_init_expr(entry.init) {
+            var c_name: str = global_c_name(entry.name);
+            var val_str: str = gen_global_runtime_expr(self, entry.init);
+            wln(self, "    " + c_name + " = " + val_str + ";");
+        }
+        gi = gi + 1;
+    }
+    wln(self, "}");
     wln(self, "");
 }
 
@@ -1938,6 +2124,7 @@ fn emit_main_wrapper(self: &mut CCodeGen, module: IrModule) -> void {
             }
             f = f + 1;
         }
+        wln(self, "    __init_globals();");
         wln(self, "    int64_t result = main_entry(NULL);");
         wln(self, "    return (int)result;");
         wln(self, "}");
@@ -2607,8 +2794,25 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
                         IrType::Generic(_, _) => {
                             if dst_is_ptr && callee_returns_int { cast = "(void*)"; } else { cast = ""; }
                         }
-                        IrType::F64 => { cast = "(double)"; }
-                        IrType::F32 => { cast = "(float)"; }
+                        IrType::F64 => {
+                            // Bug 3.19 fix: When the callee returns int64_t but
+                            // the dst is f64, the int64 contains a float bit
+                            // pattern (e.g. from Vec_get). Type-pun it back to
+                            // double via a union instead of casting directly.
+                            if callee_returns_int {
+                                wln(self, "    " + dst + " = ((union { int64_t i; double d; }){ .i = " + c_fname + "(" + arg_strs + ") }).d;");
+                                return;
+                            }
+                            cast = "(double)";
+                        }
+                        IrType::F32 => {
+                            // Bug 3.19 fix: Same type-pun for f32.
+                            if callee_returns_int {
+                                wln(self, "    " + dst + " = ((union { int32_t i; float f; }){ .i = (int32_t)" + c_fname + "(" + arg_strs + ") }).f;");
+                                return;
+                            }
+                            cast = "(float)";
+                        }
                         IrType::Bool => { cast = "(bool)"; }
                         _ => { cast = "(int64_t)"; }
                     }
@@ -2918,6 +3122,7 @@ pub fn CCodeGen_generate(self: &mut CCodeGen, module: IrModule) -> str {
     emit_struct_defs(self, module);
     emit_globals(self, module);
     emit_prototypes(self, module);
+    emit_global_init_function(self, module);
 
     f = 0;
     while f < module.functions.len() {

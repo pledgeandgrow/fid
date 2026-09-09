@@ -2419,7 +2419,25 @@ fn Lowerer_lower_let_stmt(self: &mut Lowerer, name: str, ty: OptType, expr: Expr
                 ir_ty = declared_ir;
             }
         }
-        OptType::None => { ir_ty = val_ty; }
+        OptType::None => {
+            // Bug 3.18 fix: When there's no declared type and the value is a
+            // Ptr(Struct(...)) returned from a function (SRET pattern), use
+            // the inner struct type for the alloca so it holds the full struct
+            // data inline. Otherwise the alloca is only 8 bytes (pointer size),
+            // and a later Assign with store_ty=Some(Struct) will memcpy the
+            // full struct into an 8-byte buffer, causing a buffer overflow.
+            match val_ty {
+                IrType::Ptr(inner) => {
+                    var inner_ty: IrType = box_ir_type_unbox(inner);
+                    if ir_type_is_aggregate(inner_ty) {
+                        ir_ty = inner_ty;
+                    } else {
+                        ir_ty = val_ty;
+                    }
+                }
+                _ => { ir_ty = val_ty; }
+            }
+        }
     }
 
     var alloca: i64 = Lowerer_emit_inst(self, Inst::Alloca(ir_ty, Lowerer_current_region(self)));

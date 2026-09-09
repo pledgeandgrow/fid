@@ -1,7 +1,7 @@
 # Fides Roadmap — Milestones to World Domination
 
 > Not a task list. A map of mountains to climb.
-> Last updated: August 2026. Based on full codebase analysis.
+> Last updated: Sep 9, 2026 (v1.0.0 released — Windows installer working, self-hosted compiler stable).
 
 ## Overview
 
@@ -21,8 +21,9 @@ Phase 8B: ECS/States/Events   ← COMPLETE — component/system/query, state_mac
 Phase 8C: Shaders/SIMD       ← PARTIAL — SIMD stdlib + SPIR-V GPU codegen; @shader/@simd annotations not implemented
 Phase 8D: Game Stdlib         ← COMPLETE — 8 game stdlib modules (test_game_stdlib now passes — &mut T auto-deref fix)
 Phase 9: Industry Domains    ← NOT STARTED — only stdlib/banking.fd exists; medical/blockchain/robotics/automotive not built
-Phase 10: Self-Hosting       ← IN PROGRESS — SH-6 through SH-9.4 DONE (all 15 modules compile, 37,584 LOC Fides). Bootstrap (SH-9.5) IN PROGRESS: `fides-bootstrap` (Rust-compiled Fides compiler) no longer segfaults on hello.fd — 4 codegen/porting bugs fixed: (1) string padding, (2) auto-deref &mut Vec in infer_expr_type, (3) box_type_unbox Deref returning inner Box directly, (4) box_expr_unbox(receiver) porting bug in check_method_call — receiver was Expr not Box<Expr>, causing double-deref segfault. Now produces false typechecker errors — 3 remaining bugs: (1) unsafe block init tracking, (2) Type::Named("Vec") method dispatch, (3) undefined function lookups. 265/265 Rust unit tests pass, 164/165 normal tests pass on interp+C codegen, 165/165 PE.
+Phase 10: Self-Hosting       ← COMPLETE — 50 modules, 91,924 LOC. Fixpoint achieved (c2==c3, 0 diffs). 38/38 self-host tests pass. v1.0.0 released with Windows installer.
 Phase 10B: PE Emitter Rewrite ← NOT STARTED — rewrite pe.rs in Fides after C codegen bootstrap. Fix Issues 67-69 first, then rewrite PE emitter in Fides, then switch default backend to PE for zero-dependency deployment. C backend stays as fallback.
+Phase 10C: Windows Installer ← COMPLETE — NSIS installer (Fides-Setup-1.0.0.exe, 2.5 MB) tested on Windows. GitHub Actions CI builds automatically on release tags.
 Phase 11: Ecosystem          ← IN PROGRESS — LSP (diag+completion+hover+def), formatter, linter, bench, profile
 Phase 12: Security Hardening ← MOSTLY COMPLETE — binary hardening + all safety annotations; CFI + full taint tracking + runtime sandbox remaining
 Phase 13: World Class        ← IN PROGRESS — type inference done, SLP+loop-vec done, @send/@sync done, debugger done, ark package manager done, scribe doc generator done, veil coverage tool done, green threads remaining

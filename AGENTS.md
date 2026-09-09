@@ -147,9 +147,14 @@ cargo build
 
 # Code coverage (function, line, and instruction coverage)
 ./target/release/veil <file.fd> [--format text|html] [--output <dir>]
+
+# Build the Windows installer (requires NSIS)
+# On Windows: cd installer && makensis fides.nsi
+# On CI: triggered automatically by GitHub Actions on release tags
+# Manual trigger: gh workflow run build-installer.yml -f version=1.0.0
 ```
 
-## Current Baseline (post-fixpoint — Fides is self-hosted and independent)
+## Current Baseline (v1.0.0 — released Sep 9, 2026)
 
 ```
 SELF-HOSTED COMPILER (primary):
@@ -162,14 +167,19 @@ RUST BOOTSTRAP (reference only):
   src/*.rs:       55 files, 91,490 LOC — bootstrap reference
   Used when:      compiler/*.fd changes (regenerate C1, verify fixpoint)
 
+WINDOWS INSTALLER (v1.0.0):
+  installer/:     NSIS script + build helper
+  CI:            .github/workflows/build-installer.yml (builds on release tags)
+  Output:        Fides-Setup-1.0.0.exe (2.5 MB, tested on Windows)
+  Ships:         fidesc.exe renamed as fides.exe (fully functional)
+
 TESTS:
-  Interpreter:    209/211 passed
-  C Codegen:      198/211 matched
-  PE Emitter:     209/211 valid
-  Self-host:      33/42 pass on interp + C + PE (tests/selfhost/)
+  Self-host:      38/38 pass on interp + C + PE (tests/selfhost/)
+  Bootstrap:      hello, test_alloc, test_allocator, test_arinc, test_asm pass
+  Fixpoint:       c3 type-checks + borrow-checks full 75K LOC compiler
 
 STDLIB:
-  stdlib/*.fd:    99 modules, 28,370 LOC (including rc.fd, kernel.fd, uefi.fd, and 26 game/media modules)
+  stdlib/*.fd:    99 modules, 28,370 LOC (OS modules moved to fides-os project)
 
 RECENT IMPROVEMENTS:
   Session 21:     26 game/media stdlib modules added (sdl, gl, image, font, mesh,

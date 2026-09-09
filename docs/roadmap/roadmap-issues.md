@@ -6,6 +6,20 @@
 
 ---
 
+## v1.0.0 Release Milestone (Sep 9, 2026)
+
+**Status:** ✅ Complete — installer tested on Windows
+
+- Windows NSIS installer (`Fides-Setup-1.0.0.exe`, 2.5 MB) built via GitHub
+  Actions on Windows runners. Tested on Windows: installs, compiles `.fd`
+  files, PATH works, file association works, uninstall works.
+- GitHub Actions workflow at `.github/workflows/build-installer.yml`
+  builds the installer on tagged releases and manual dispatch.
+- Release published at https://github.com/pledgeandgrow/p-lang/releases/tag/v1.0.0
+- 38/38 self-host tests pass on all 3 backends. No regressions.
+
+---
+
 ## Critical Blockers (must fix before any production use)
 
 > Added Sep 7, 2026 (Session 18). All four items verified by reading source
@@ -158,6 +172,8 @@ native_debugger, gpu) hit a self-hosted C codegen segfault. This is a
 known compiler limitation (C generation crashes after successful type
 checking), not a Fides source error. The pre-built
 `release/fides-c3.exe` compiles all 50 modules through type checking.
+The Windows installer ships the Rust bootstrap compiler (`fidesc.exe`
+renamed to `fides.exe`) which does not have this limitation.
 
 ---
 

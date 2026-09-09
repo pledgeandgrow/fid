@@ -2,7 +2,63 @@
 
 > How to build, test, and verify the self-hosted compiler.
 >
-> **Last updated:** Sep 6, 2026 (session 16 — Tier 3 OS features added: @cpu_local, inline asm clobbers, --no-std, UEFI bindings)
+> **Last updated:** Sep 9, 2026 (v1.0.0 — Windows installer added, GitHub Actions CI)
+
+---
+
+## 0. Windows Installer (v1.0.0+)
+
+### Download (end users)
+
+Download `Fides-Setup-1.0.0.exe` from
+[GitHub Releases](https://github.com/pledgeandgrow/p-lang/releases/tag/v1.0.0)
+and run it. This installs:
+- `fides.exe` (compiler) to `C:\Program Files\Fides\`
+- Standard library (99 modules) to `C:\Program Files\Fides\stdlib\`
+- C runtime files to `C:\Program Files\Fides\runtime\`
+- Documentation to `C:\Program Files\Fides\docs\`
+- PATH integration (system-wide)
+- `.fd` file association
+- Start Menu shortcuts
+- Uninstaller via Add/Remove Programs
+
+### Build the installer (developers)
+
+The installer is built automatically by GitHub Actions on tagged releases.
+To build manually:
+
+```bash
+# On Windows with NSIS installed:
+cd installer
+makensis fides.nsi
+# Output: installer/Fides-Setup-1.0.0.exe
+```
+
+Or trigger the workflow manually:
+```bash
+gh workflow run build-installer.yml -f version=1.0.0
+```
+
+The workflow (`.github/workflows/build-installer.yml`):
+1. Builds the Rust bootstrap compiler (`cargo build --release`)
+2. Copies `fidesc.exe` as `fides.exe` (the shipped compiler)
+3. Installs NSIS via Chocolatey
+4. Runs `makensis` to create the installer
+5. Uploads the `.exe` to the GitHub release
+
+### Installer files
+
+```
+installer/
+├── fides.nsi              Main NSIS installer script
+├── license.txt            License shown during install
+├── build-installer.sh     Linux-side build helper
+├── EnvVarUpdate.nsh       (legacy, not used in v1.0.0)
+└── FileAssociation.nsh    (legacy, not used in v1.0.0)
+```
+
+The v1.0.0 NSIS script inlines PATH and file association logic directly
+(no custom includes needed).
 
 ---
 

@@ -1640,6 +1640,11 @@ fn main() {
             let skip_tests: &[&str] = &[
                 // Library modules with no main() — not standalone tests
                 "test_token_full",
+                // Harness tests that require file arguments — not standalone
+                "test_fmt_harness",
+                "test_lexer_harness",
+                "test_parser_harness",
+                "test_sl_debug",
             ];
 
             // C-codegen-only skip list — tests that pass on interpreter + PE

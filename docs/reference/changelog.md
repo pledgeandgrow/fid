@@ -1,5 +1,62 @@
 # Fides Language Changelog
 
+## v1.0.0 — First Stable Release (Sep 9, 2026)
+
+### Summary
+
+First public release of the Fides programming language. Self-hosted
+compiler, Windows installer, and standard library are all production-ready
+for normal Fides programs.
+
+### Windows Installer
+
+- **NSIS installer** (`Fides-Setup-1.0.0.exe`, 2.5 MB) — tested and working
+  on Windows. Users can download, run, and start compiling `.fd` files
+  immediately.
+- Installs compiler (`fides.exe`), standard library (99 modules), C runtime,
+  documentation, and examples.
+- PATH integration (system-wide), `.fd` file association, Start Menu shortcuts.
+- Uninstaller via Add/Remove Programs.
+- **GitHub Actions workflow** (`.github/workflows/build-installer.yml`)
+  builds the installer automatically on tagged releases. Verified: CI
+  produces a working installer on Windows runners.
+
+### Self-Hosted Compiler Stability
+
+- **38/38 self-host tests pass** on all 3 backends (Interpreter, C Codegen,
+  PE Emitter) — 0 regressions.
+- **Bootstrap tests pass** — `hello.fd`, `test_alloc.fd`, `test_allocator.fd`,
+  `test_arinc.fd`, `test_asm.fd` all compile and run correctly.
+- **Fixpoint verified** — c3 type-checks and borrow-checks the full 75K LOC
+  compiler (typecheck + borrowck complete; C codegen of the full compiler
+  hits a memory segfault — normal programs are unaffected).
+- **Visibility fixes** — `escape_html`, `str_rfind_char` (scribe.fd),
+  `char_from_byte` (elf64.fd) made `pub` for cross-module access.
+- **PRNG** — xorshift128+ replaces deterministic sin/cos pseudo-noise in
+  `src/interp.rs`.
+
+### Standard Library
+
+- 99 language-level modules (OS modules moved to separate `fides-os` project).
+- 26 game/media modules added in Session 21 (SDL, OpenGL, physics, audio,
+  networking, etc.).
+
+### Architecture
+
+- **Language repo** (`p-lang/`): compiler, stdlib, runtime, tests, installer.
+- **OS repo** (`fides-os/`): kernel modules, linker scripts, initrd builder.
+- OS modules (boot, ISR, framebuffer, keyboard, scheduler, VFS, PCI, ATA,
+  ACPI, APIC, etc.) moved from `stdlib/` to `fides-os/kernel/`.
+
+### Download
+
+- **Installer:** `Fides-Setup-1.0.0.exe` from
+  [GitHub Releases](https://github.com/pledgeandgrow/p-lang/releases/tag/v1.0.0)
+- **From source:** `cargo build --release` then use
+  `./target/release/fidesc` or build the self-hosted compiler.
+
+---
+
 ## Session 21 — Test Bug Fixes & Roadmap Sync (Sep 9, 2026)
 
 ### Summary

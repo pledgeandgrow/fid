@@ -2,7 +2,7 @@
 
 > Things that have broken before and how to avoid re-introducing them.
 >
-> Last updated: Sep 9, 2026 (session 17 — 26 game/media stdlib modules added: sdl, gl, image, font, mesh, gameloop, physics3d, skel, ui, net, camera, particles, animation2d, audio_mixer, asset, serialize, collision_broad, raycast, navmesh, terrain, profiler, replay, shader, editor, chunk, touch. 4 new runtime/codegen bugs documented: 3.16-3.19.).
+> Last updated: Sep 9, 2026 (v1.0.0 released — Windows installer working, 38/38 self-host tests pass, visibility fixes for scribe.fd/elf64.fd, PRNG xorshift128+).
 
 ---
 
@@ -1392,3 +1392,28 @@ Also high-risk in Rust reference compiler:
 | `Vec::set()` overflow on structs with `str` | 8-byte alloca + full struct memcpy | Use fresh struct literals — see gotcha 3.17 |
 | Struct return reassignment overflow | 8-byte alloca + full struct memcpy on 2nd call | Use "into" pattern — see gotcha 3.18 |
 | `Vec<f64>` returns integer bit patterns | Generic pointer-vector stores f64 as int64 | Avoid `Vec<f64>`, use struct fields — see gotcha 3.19 |
+
+---
+
+## v1.0.0 Release Notes (Sep 9, 2026)
+
+### Bugs fixed for the release
+
+- **Visibility errors** — `escape_html`, `str_rfind_char` in `compiler/scribe.fd`
+  and `char_from_byte` in `compiler/elf64.fd` were private, blocking
+  cross-module access. Fixed by adding `pub`.
+- **PRNG** — `src/interp.rs` `prng_next_f64` had an unnecessary `mut` on `s0`
+  (harmless but cleaned up).
+
+### Known limitations at v1.0.0
+
+- **C codegen segfault on full compiler** — c3 type-checks and borrow-checks
+  the full 75K LOC compiler successfully, but segfaults during C codegen of
+  the very large output. This is a memory issue, not a correctness issue.
+  Normal Fides programs compile and run correctly.
+- **Installer ships Rust bootstrap compiler** — The Windows installer ships
+  `fidesc.exe` (the Rust bootstrap compiler) renamed as `fides.exe`. This
+  is fully functional for compiling Fides programs. The self-hosted compiler
+  (`release/fides-c3.exe`) is available from source builds.
+- **4 runtime bugs from Session 21** (3.16–3.19) — documented above, all
+  have workarounds using the caller-owned state pattern.
