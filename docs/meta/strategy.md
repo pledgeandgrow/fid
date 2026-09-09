@@ -306,7 +306,7 @@ master of none.
 make it another D, Crystal, or V — technically good, commercially irrelevant.**
 
 The project has built an impressive amount of working compiler infrastructure
-(86,742 LOC, 51 source files, 164/165 C codegen parity (164/165 interp, 165/165 PE) across 3 backends, 70 stdlib
+(86,742 LOC, 51 source files, 164/165 C codegen parity (164/165 interp, 165/165 PE) across 3 backends, 99 stdlib
 modules, 6 backends, 4 binaries: fidesc/ark/scribe/veil). But it's spreading into too many domains (games,
 blockchain, robotics, medical, serverless) before it has proven it can do the
 basics better than existing languages.

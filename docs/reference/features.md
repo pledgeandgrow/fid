@@ -210,7 +210,7 @@ See `AGENTS.md` → "Current Baseline" for authoritative test counts.*
 | `use ... *` glob imports | ✅ | Glob imports |
 | Re-exports | ✅ | |
 | Multi-file modules | ✅ | |
-| Standard library (stdlib/core.fd) | ✅ | Auto-imported. 70 modules: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, uefi |
+| Standard library (stdlib/core.fd) | ✅ | Auto-imported. 99 modules: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, uefi |
 
 ### Capabilities (Security)
 
@@ -770,7 +770,7 @@ enabling editor integration (VS Code, Neovim, Emacs, etc.) with live diagnostics
 
 **See `AGENTS.md` → "Current Baseline"** for authoritative test counts.
 (209/211 on interpreter, 198/211 C codegen, 209/211 PE, 265/265 unit tests,
-225+ .fd test files, 70 stdlib modules, 52 source files, 4 binaries.)
+225+ .fd test files, 99 stdlib modules, 52 source files, 4 binaries.)
 
 ### Self-Hosting (session 15)
 

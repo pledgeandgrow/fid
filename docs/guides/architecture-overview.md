@@ -390,7 +390,7 @@ Native Binary / WASM / SPIR-V / C Source / Running Code
 - Integrated linker (ELF64 objects → executable, in-process)
 - Hot reload (`fidesc watch`) — native JIT + function-level change detection
 - Custom runtime: hand-encoded x86-64 machine code via raw syscalls (Linux, no libc) / kernel32.dll (Windows)
-- 70 stdlib modules: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, uefi
+- 99 stdlib modules: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, uefi
 - C header FFI parsing (`fidesc parse-header`)
 - Embedded/IoT: FixedBufferAllocator, `!RealTime` effect, RISC-V target, HAL framework
 - Smart pointers: `Box<T>` (recursive types), `Rc<T>` / `Arc<T>` (manual refcount management)

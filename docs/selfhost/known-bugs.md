@@ -2,7 +2,7 @@
 
 > Things that have broken before and how to avoid re-introducing them.
 >
-> Last updated: Sep 6, 2026 (session 16 — Tier 3 OS features added: @cpu_local, inline asm clobbers, --no-std, UEFI bindings. Bootstrap fixpoint preserved.).
+> Last updated: Sep 9, 2026 (session 17 — 26 game/media stdlib modules added: sdl, gl, image, font, mesh, gameloop, physics3d, skel, ui, net, camera, particles, animation2d, audio_mixer, asset, serialize, collision_broad, raycast, navmesh, terrain, profiler, replay, shader, editor, chunk, touch. 4 new runtime/codegen bugs documented: 3.16-3.19.).
 
 ---
 
@@ -1229,6 +1229,113 @@ The PE emitter has been ported from Rust to Fides (session 5). If you change
 includes instruction encoding, PE header layout, import table format, and
 runtime stubs.
 
+### 3.16 Global `Vec::new()` in struct literals crashes at runtime (session 17)
+
+**Symptom:** Native binaries crash with SIGSEGV during initialization of any
+module that declares a global variable containing `Vec::new()` inside a
+struct literal:
+
+```fides
+var g_state: MyState = MyState {
+    items: Vec::new(),   // <-- crashes here
+    ...
+};
+```
+
+**Root cause:** The C backend's global variable initialization does not
+properly initialize `Vec` fields in global struct literals. The `Vec::new()`
+call produces a zero-initialized struct, but the runtime's `PVec` expects
+specific internal pointers (data, capacity, length) to be set up. When
+subsequent code tries to `push` or `clear` the Vec, it dereferences null
+or garbage pointers.
+
+**Workaround:** Use caller-owned state instead of global state. Pass
+`&mut State` to each function. Create the state in `main()` with
+`var state = state_create();` where `state_create()` returns a struct
+with `Vec::new()` called inside a function (which works correctly).
+
+**Affected modules (all worked around):** `profiler.fd`, `replay.fd`,
+`touch.fd`, `editor.fd`, `shader.fd` (MaterialCache).
+
+### 3.17 `Vec::set()` on same index twice with struct containing `str` causes buffer overflow (session 17)
+
+**Symptom:** Native binary aborts with `*** buffer overflow detected ***`
+(SIGABRT) when calling `Vec::set()` twice on the same index with a struct
+value that contains a `str` (heap-allocated) field:
+
+```fides
+var e = entities.get(idx);
+e.visible = false;
+entities.set(idx, e);        // first set — OK
+e.locked = true;
+entities.set(idx, e);        // second set — OVERFLOW
+```
+
+**Root cause:** The generated C code allocates an 8-byte `alloca` slot for
+a struct pointer, but then `memcpy`s the full struct size (e.g., 88 bytes)
+into it on reassignment. The first `set` overflows the 8-byte buffer, and
+the second `set` causes further corruption that triggers the buffer overflow
+detector.
+
+**Workaround:** Avoid repeated `Vec::set()` on the same index with struct
+values. Use fresh struct literals instead of modifying a retrieved value:
+
+```fides
+// BAD: entities.set(idx, modified_retrieved_struct);
+// GOOD: entities.set(idx, MyStruct { ... fresh literal ... });
+```
+
+Or use separate helper functions for each mutation to avoid the generated
+temporary reuse pattern.
+
+**Affected modules (all worked around):** `editor.fd`
+(`editor_duplicate_selected` uses fresh struct literal).
+
+### 3.18 Struct return value reassignment causes `memcpy` overflow (session 17)
+
+**Symptom:** Native binary aborts with `*** buffer overflow detected ***`
+when reassigning a variable with a struct return value from a function,
+especially on the second assignment:
+
+```fides
+var frame = replay_get_frame(&rp);   // OK
+frame = replay_get_frame(&rp);       // OVERFLOW on second call
+```
+
+**Root cause:** The generated C code allocates an 8-byte `alloca` for the
+variable, but then `memcpy`s the full struct size (e.g., 88 bytes for
+`ReplayFrame`) into it. The first assignment overflows the 8-byte buffer,
+and the second assignment causes further corruption.
+
+**Workaround:** Use an "into" pattern — pass a mutable reference to a
+pre-allocated struct instead of returning by value:
+
+```fides
+// BAD:  var frame = get_frame(); frame = get_frame();
+// GOOD: var frame = make_frame(); get_frame_into(&rp, &mut frame);
+```
+
+**Affected modules (all worked around):** `replay.fd`
+(`replay_get_frame_into` + `replay_make_frame`).
+
+### 3.19 `Vec<f64>` stores integer bit patterns instead of floats (session 17)
+
+**Symptom:** A `Vec<f64>` returns integer bit patterns (e.g.,
+`4621819117588971520`) instead of the stored float values (e.g., `10.0`).
+
+**Root cause:** The runtime's generic pointer-vector (`PVec`) stores all
+elements as `void*` pointers. When `f64` values are pushed, they are
+bit-cast to `int64_t` and stored as pointers. On retrieval, the `p_vec_get`
+function returns the pointer value as `int64_t`, but the generated code
+may not properly cast it back to `double`.
+
+**Workaround:** Avoid `Vec<f64>` for parallel float arrays. Use `Vec<i64>`
+for integer storage and convert, or use struct-based storage with
+helper functions that properly handle the type conversion.
+
+**Affected modules (all worked around):** `editor.fd` (uses scalar fields
+in struct instead of parallel `Vec<f64>` arrays).
+
 ---
 
 ## 4. Files That Require Extra Care
@@ -1281,3 +1388,7 @@ Also high-risk in Rust reference compiler:
 | PE: string_contains returns true | Runtime stub returns true always | `pe.fd` — see bug 2c.15 |
 | Generic with >1 type param mis-substituted | `subst_gat_type_args` always uses args.get(0) | `mono.fd:649` — see bug 2c.16 |
 | Comptime in `return` not evaluated | Return re-wrap omitted in substitute | `comptime_eval.fd` — see bug 2c.17 |
+| Global Vec crashes on init | `Vec::new()` in global struct literal not initialized | Use caller-owned state — see gotcha 3.16 |
+| `Vec::set()` overflow on structs with `str` | 8-byte alloca + full struct memcpy | Use fresh struct literals — see gotcha 3.17 |
+| Struct return reassignment overflow | 8-byte alloca + full struct memcpy on 2nd call | Use "into" pattern — see gotcha 3.18 |
+| `Vec<f64>` returns integer bit patterns | Generic pointer-vector stores f64 as int64 | Avoid `Vec<f64>`, use struct fields — see gotcha 3.19 |

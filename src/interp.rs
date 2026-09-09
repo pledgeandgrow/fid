@@ -681,7 +681,7 @@ impl Interpreter {
     /// Generate a uniform double in [0, 1) using xorshift128+.
     /// Replaces the deterministic sin/cos-based pseudo-noise.
     fn prng_next_f64(&mut self) -> f64 {
-        let mut s0 = self.prng_state[0];
+        let s0 = self.prng_state[0];
         let mut s1 = self.prng_state[1];
         let result = s0.wrapping_add(s1);
         s1 ^= s0;
@@ -2623,6 +2623,7 @@ impl Interpreter {
             || name.starts_with("p_dp_budget_")
             || name.starts_with("p_tp_")
             || name.starts_with("p_checkpoint_")
+            || name.starts_with("p_volatile_")
     }
 
     /// ML3: Get a unique address for a tensor (for gradient tracking)
@@ -4722,6 +4723,82 @@ impl Interpreter {
             }
             "p_phys_write64" => {
                 // Write 8 bytes to physical address — simulated
+                ExecOutcome::Value(Value::Void)
+            }
+
+            // ─── Volatile memory access (MMIO simulation) ───
+            // These read/write the interpreter's byte-addressed memory.
+            "p_volatile_load" => {
+                if let Some(Value::Int(addr)) = args.first() {
+                    let a = *addr as u64;
+                    if self.memory.is_valid_addr(a) && self.memory.is_valid_addr(a + 7) {
+                        return ExecOutcome::Value(Value::Int(self.memory.load_i64(a)));
+                    }
+                }
+                ExecOutcome::Value(Value::Int(0))
+            }
+            "p_volatile_store" => {
+                if let (Some(Value::Int(addr)), Some(Value::Int(val))) = (args.get(0), args.get(1)) {
+                    let a = *addr as u64;
+                    if self.memory.is_valid_addr(a) && self.memory.is_valid_addr(a + 7) {
+                        self.memory.store_i64(a, *val);
+                    }
+                }
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_volatile_load8" => {
+                if let Some(Value::Int(addr)) = args.first() {
+                    let a = *addr as u64;
+                    if self.memory.is_valid_addr(a) {
+                        let bytes = self.memory.load(a, 1);
+                        return ExecOutcome::Value(Value::Int(bytes[0] as i64));
+                    }
+                }
+                ExecOutcome::Value(Value::Int(0))
+            }
+            "p_volatile_store8" => {
+                if let (Some(Value::Int(addr)), Some(Value::Int(val))) = (args.get(0), args.get(1)) {
+                    let a = *addr as u64;
+                    if self.memory.is_valid_addr(a) {
+                        self.memory.store(a, &[*val as u8]);
+                    }
+                }
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_volatile_load16" => {
+                if let Some(Value::Int(addr)) = args.first() {
+                    let a = *addr as u64;
+                    if self.memory.is_valid_addr(a) && self.memory.is_valid_addr(a + 1) {
+                        return ExecOutcome::Value(Value::Int(self.memory.load_i32(a) as i64));
+                    }
+                }
+                ExecOutcome::Value(Value::Int(0))
+            }
+            "p_volatile_store16" => {
+                if let (Some(Value::Int(addr)), Some(Value::Int(val))) = (args.get(0), args.get(1)) {
+                    let a = *addr as u64;
+                    if self.memory.is_valid_addr(a) && self.memory.is_valid_addr(a + 1) {
+                        self.memory.store_i32(a, *val as i32);
+                    }
+                }
+                ExecOutcome::Value(Value::Void)
+            }
+            "p_volatile_load32" => {
+                if let Some(Value::Int(addr)) = args.first() {
+                    let a = *addr as u64;
+                    if self.memory.is_valid_addr(a) && self.memory.is_valid_addr(a + 3) {
+                        return ExecOutcome::Value(Value::Int(self.memory.load_i32(a) as i64));
+                    }
+                }
+                ExecOutcome::Value(Value::Int(0))
+            }
+            "p_volatile_store32" => {
+                if let (Some(Value::Int(addr)), Some(Value::Int(val))) = (args.get(0), args.get(1)) {
+                    let a = *addr as u64;
+                    if self.memory.is_valid_addr(a) && self.memory.is_valid_addr(a + 3) {
+                        self.memory.store_i32(a, *val as i32);
+                    }
+                }
                 ExecOutcome::Value(Value::Void)
             }
 

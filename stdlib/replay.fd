@@ -1,51 +1,42 @@
 // Fides Replay system standard library
 //
 // Deterministic replay: record game inputs each frame, then replay
-// them to reproduce the exact same game state. Useful for:
-//   - Bug reproduction
-//   - Esports/spectator features
-//   - Debugging
-//   - Killcam/replay
-//
-// Requires the game to be deterministic (no floating-point nondeterminism,
-// no system-time-dependent logic, no threading races).
+// them to reproduce the exact same game state. Uses caller-owned state
+// with flat arrays to avoid Vec-in-struct issues.
 //
 // Usage:
 //   use replay;
-//   use input;
 //
-//   // Recording:
-//   replay_start_recording();
-//   // In game loop:
-//   replay_record_frame(&input_state, dt);
-//   replay_save("replay.dat");
+//   var rp = replay_create();
+//   replay_start_recording(&mut rp, 42, "Game", "1.0");
+//   replay_record_frame(&mut rp, keys, mouse_x, mouse_y, btns, dt, seed);
+//   replay_save(&rp, "replay.dat");
 //
-//   // Playback:
-//   replay_load("replay.dat");
-//   replay_start_playback();
-//   // In game loop:
-//   var frame = replay_get_frame();
-//   // Apply frame.input to game
+//   replay_load(&mut rp, "replay.dat");
+//   replay_start_playback(&mut rp);
+//   var frame = replay_get_frame(&rp);
 
 module replay;
 
 use vec;
 use string;
+use file;
 
-// ─── Replay Frame ────────────────────────────────────────────────────────
+// ─── Replay Frame (returned by value, no Vec fields) ─────────────────────
 
 pub struct ReplayFrame {
     pub frame_number: i64,
-    pub keys: Vec<i64>,        // pressed keys (scancodes)
+    pub key_count: i64,
+    pub key0: i64, pub key1: i64, pub key2: i64, pub key3: i64,
     pub mouse_x: i64,
     pub mouse_y: i64,
-    pub mouse_buttons: i64,    // bitmask
-    pub dt_ms: i64,            // frame delta in ms (fixed-point for determinism)
-    pub seed: i64,             // RNG seed at this frame
+    pub mouse_buttons: i64,
+    pub dt_ms: i64,
+    pub seed: i64,
 }
 
 pub struct ReplayHeader {
-    pub magic: i64,            // "FDRP" = 0x46505244
+    pub magic: i64,
     pub version: i64,
     pub frame_count: i64,
     pub start_seed: i64,
@@ -56,10 +47,22 @@ pub struct ReplayHeader {
 
 pub struct Replay {
     pub header: ReplayHeader,
-    pub frames: Vec<ReplayFrame>,
+    pub frame_numbers: Vec<i64>,
+    pub key_counts: Vec<i64>,
+    pub key0s: Vec<i64>,
+    pub key1s: Vec<i64>,
+    pub key2s: Vec<i64>,
+    pub key3s: Vec<i64>,
+    pub mouse_xs: Vec<i64>,
+    pub mouse_ys: Vec<i64>,
+    pub mouse_buttons: Vec<i64>,
+    pub dt_ms: Vec<i64>,
+    pub seeds: Vec<i64>,
     pub current_frame: i64,
-    pub mode: i64,             // 0 = idle, 1 = recording, 2 = playing
+    pub mode: i64,
     pub max_frames: i64,
+    pub read_pos: i64,
+    pub read_data: Vec<i64>,
 }
 
 pub const REPLAY_IDLE: i64 = 0;
@@ -68,28 +71,53 @@ pub const REPLAY_PLAYING: i64 = 2;
 pub const REPLAY_MAGIC: i64 = 0x46505244;
 pub const REPLAY_VERSION: i64 = 1;
 
-var g_replay: Replay = Replay {
-    header: ReplayHeader {
-        magic: REPLAY_MAGIC,
-        version: REPLAY_VERSION,
-        frame_count: 0,
-        start_seed: 0,
-        game_name: "",
-        game_version: "",
-        recorded_at: 0,
-    },
-    frames: Vec::new(),
-    current_frame: 0,
-    mode: REPLAY_IDLE,
-    max_frames: 3600,  // 60 seconds at 60fps
-};
+/// Create a new replay state.
+pub fn replay_create() -> Replay {
+    return Replay {
+        header: ReplayHeader {
+            magic: REPLAY_MAGIC,
+            version: REPLAY_VERSION,
+            frame_count: 0,
+            start_seed: 0,
+            game_name: "",
+            game_version: "",
+            recorded_at: 0,
+        },
+        frame_numbers: Vec::new(),
+        key_counts: Vec::new(),
+        key0s: Vec::new(),
+        key1s: Vec::new(),
+        key2s: Vec::new(),
+        key3s: Vec::new(),
+        mouse_xs: Vec::new(),
+        mouse_ys: Vec::new(),
+        mouse_buttons: Vec::new(),
+        dt_ms: Vec::new(),
+        seeds: Vec::new(),
+        current_frame: 0,
+        mode: REPLAY_IDLE,
+        max_frames: 3600,
+        read_pos: 0,
+        read_data: Vec::new(),
+    };
+}
 
 /// Start recording a replay.
-pub fn replay_start_recording(seed: i64, game_name: str, game_version: str) -> void {
-    g_replay.frames.clear();
-    g_replay.current_frame = 0;
-    g_replay.mode = REPLAY_RECORDING;
-    g_replay.header = ReplayHeader {
+pub fn replay_start_recording(rp: &mut Replay, seed: i64, game_name: str, game_version: str) -> void {
+    rp.frame_numbers.clear();
+    rp.key_counts.clear();
+    rp.key0s.clear();
+    rp.key1s.clear();
+    rp.key2s.clear();
+    rp.key3s.clear();
+    rp.mouse_xs.clear();
+    rp.mouse_ys.clear();
+    rp.mouse_buttons.clear();
+    rp.dt_ms.clear();
+    rp.seeds.clear();
+    rp.current_frame = 0;
+    rp.mode = REPLAY_RECORDING;
+    rp.header = ReplayHeader {
         magic: REPLAY_MAGIC,
         version: REPLAY_VERSION,
         frame_count: 0,
@@ -100,173 +128,288 @@ pub fn replay_start_recording(seed: i64, game_name: str, game_version: str) -> v
     };
 }
 
-/// Record a frame of input.
-pub fn replay_record_frame(keys: Vec<i64>, mouse_x: i64, mouse_y: i64, mouse_buttons: i64, dt_ms: i64, seed: i64) -> void {
-    if g_replay.mode != REPLAY_RECORDING { return; }
-    if g_replay.frames.len() >= g_replay.max_frames { return; }
+/// Record a frame of input (up to 4 keys per frame).
+pub fn replay_record_frame(rp: &mut Replay, keys: Vec<i64>, mouse_x: i64, mouse_y: i64, mouse_buttons: i64, dt_ms: i64, seed: i64) -> void {
+    if rp.mode != REPLAY_RECORDING { return; }
+    if rp.frame_numbers.len() >= rp.max_frames { return; }
 
-    var frame = ReplayFrame {
-        frame_number: g_replay.frames.len(),
-        keys: Vec::new(),
-        mouse_x: mouse_x,
-        mouse_y: mouse_y,
-        mouse_buttons: mouse_buttons,
-        dt_ms: dt_ms,
-        seed: seed,
-    };
+    var k0 = 0; var k1 = 0; var k2 = 0; var k3 = 0;
+    if keys.len() > 0 { k0 = keys.get(0); }
+    if keys.len() > 1 { k1 = keys.get(1); }
+    if keys.len() > 2 { k2 = keys.get(2); }
+    if keys.len() > 3 { k3 = keys.get(3); }
 
-    // Copy keys
-    var i = 0;
-    while i < keys.len() {
-        frame.keys.push(keys.get(i));
-        i = i + 1;
-    }
-
-    g_replay.frames.push(frame);
-    g_replay.header.frame_count = g_replay.frames.len();
+    rp.frame_numbers.push(rp.frame_numbers.len());
+    rp.key_counts.push(keys.len());
+    rp.key0s.push(k0);
+    rp.key1s.push(k1);
+    rp.key2s.push(k2);
+    rp.key3s.push(k3);
+    rp.mouse_xs.push(mouse_x);
+    rp.mouse_ys.push(mouse_y);
+    rp.mouse_buttons.push(mouse_buttons);
+    rp.dt_ms.push(dt_ms);
+    rp.seeds.push(seed);
+    rp.header.frame_count = rp.frame_numbers.len();
 }
 
 /// Stop recording.
-pub fn replay_stop_recording() -> void {
-    g_replay.mode = REPLAY_IDLE;
+pub fn replay_stop_recording(rp: &mut Replay) -> void {
+    rp.mode = REPLAY_IDLE;
 }
 
 /// Start playback of a loaded replay.
-pub fn replay_start_playback() -> void {
-    if g_replay.frames.len() == 0 { return; }
-    g_replay.current_frame = 0;
-    g_replay.mode = REPLAY_PLAYING;
+pub fn replay_start_playback(rp: &mut Replay) -> void {
+    if rp.frame_numbers.len() == 0 { return; }
+    rp.current_frame = 0;
+    rp.mode = REPLAY_PLAYING;
+}
+
+/// Create a default replay frame (for pre-allocation).
+pub fn replay_make_frame() -> ReplayFrame {
+    return ReplayFrame {
+        frame_number: -1, key_count: 0,
+        key0: 0, key1: 0, key2: 0, key3: 0,
+        mouse_x: 0, mouse_y: 0, mouse_buttons: 0,
+        dt_ms: 16, seed: 0,
+    };
+}
+
+/// Get the current replay frame (during playback). Writes into the provided frame.
+pub fn replay_get_frame_into(rp: &Replay, out: &mut ReplayFrame) -> void {
+    if rp.mode != REPLAY_PLAYING {
+        out.frame_number = -1;
+        out.key_count = 0;
+        out.key0 = 0; out.key1 = 0; out.key2 = 0; out.key3 = 0;
+        out.mouse_x = 0; out.mouse_y = 0; out.mouse_buttons = 0;
+        out.dt_ms = 16; out.seed = 0;
+        return;
+    }
+    if rp.current_frame >= rp.frame_numbers.len() {
+        out.frame_number = -1;
+        out.key_count = 0;
+        out.key0 = 0; out.key1 = 0; out.key2 = 0; out.key3 = 0;
+        out.mouse_x = 0; out.mouse_y = 0; out.mouse_buttons = 0;
+        out.dt_ms = 16; out.seed = 0;
+        return;
+    }
+    out.frame_number = rp.frame_numbers.get(rp.current_frame);
+    out.key_count = rp.key_counts.get(rp.current_frame);
+    out.key0 = rp.key0s.get(rp.current_frame);
+    out.key1 = rp.key1s.get(rp.current_frame);
+    out.key2 = rp.key2s.get(rp.current_frame);
+    out.key3 = rp.key3s.get(rp.current_frame);
+    out.mouse_x = rp.mouse_xs.get(rp.current_frame);
+    out.mouse_y = rp.mouse_ys.get(rp.current_frame);
+    out.mouse_buttons = rp.mouse_buttons.get(rp.current_frame);
+    out.dt_ms = rp.dt_ms.get(rp.current_frame);
+    out.seed = rp.seeds.get(rp.current_frame);
 }
 
 /// Get the current replay frame (during playback).
-pub fn replay_get_frame() -> ReplayFrame {
-    if g_replay.mode != REPLAY_PLAYING { return ReplayFrame {
-        frame_number: -1, keys: Vec::new(),
+pub fn replay_get_frame(rp: &Replay) -> ReplayFrame {
+    var f = ReplayFrame {
+        frame_number: -1, key_count: 0,
+        key0: 0, key1: 0, key2: 0, key3: 0,
         mouse_x: 0, mouse_y: 0, mouse_buttons: 0,
         dt_ms: 16, seed: 0,
-    }; }
-    if g_replay.current_frame >= g_replay.frames.len() { return ReplayFrame {
-        frame_number: -1, keys: Vec::new(),
-        mouse_x: 0, mouse_y: 0, mouse_buttons: 0,
-        dt_ms: 16, seed: 0,
-    }; }
-    return g_replay.frames.get(g_replay.current_frame);
+    };
+    replay_get_frame_into(rp, &mut f);
+    return f;
 }
 
 /// Advance to the next frame during playback.
-pub fn replay_next_frame() -> void {
-    if g_replay.mode != REPLAY_PLAYING { return; }
-    g_replay.current_frame = g_replay.current_frame + 1;
-    if g_replay.current_frame >= g_replay.frames.len() {
-        g_replay.mode = REPLAY_IDLE;
+pub fn replay_next_frame(rp: &mut Replay) -> void {
+    if rp.mode != REPLAY_PLAYING { return; }
+    rp.current_frame = rp.current_frame + 1;
+    if rp.current_frame >= rp.frame_numbers.len() {
+        rp.mode = REPLAY_IDLE;
     }
 }
 
 /// Check if playback is finished.
-pub fn replay_is_finished() -> bool {
-    return g_replay.mode == REPLAY_PLAYING &&
-           g_replay.current_frame >= g_replay.frames.len();
+pub fn replay_is_finished(rp: &Replay) -> bool {
+    return rp.current_frame >= rp.frame_numbers.len() && rp.frame_numbers.len() > 0;
 }
 
 /// Stop playback.
-pub fn replay_stop_playback() -> void {
-    g_replay.mode = REPLAY_IDLE;
+pub fn replay_stop_playback(rp: &mut Replay) -> void {
+    rp.mode = REPLAY_IDLE;
 }
 
 /// Get the current replay mode.
-pub fn replay_mode() -> i64 {
-    return g_replay.mode;
+pub fn replay_mode(rp: &Replay) -> i64 {
+    return rp.mode;
 }
 
 /// Get the total number of frames.
-pub fn replay_frame_count() -> i64 {
-    return g_replay.frames.len();
+pub fn replay_frame_count(rp: &Replay) -> i64 {
+    return rp.frame_numbers.len();
 }
 
 /// Get the current frame index (during playback).
-pub fn replay_current_frame_idx() -> i64 {
-    return g_replay.current_frame;
+pub fn replay_current_frame_idx(rp: &Replay) -> i64 {
+    return rp.current_frame;
 }
 
 /// Get the start seed from the replay.
-pub fn replay_start_seed() -> i64 {
-    return g_replay.header.start_seed;
+pub fn replay_start_seed(rp: &Replay) -> i64 {
+    return rp.header.start_seed;
 }
 
 /// Get the progress (0..1) of playback.
-pub fn replay_progress() -> f64 {
-    if g_replay.frames.len() == 0 { return 0.0; }
-    return g_replay.current_frame as f64 / g_replay.frames.len() as f64;
+pub fn replay_progress(rp: &Replay) -> f64 {
+    if rp.frame_numbers.len() == 0 { return 0.0; }
+    return rp.current_frame as f64 / rp.frame_numbers.len() as f64;
 }
 
 /// Seek to a specific frame (for scrubbing).
-pub fn replay_seek(frame: i64) -> void {
-    if frame < 0 { g_replay.current_frame = 0; return; }
-    if frame >= g_replay.frames.len() {
-        g_replay.current_frame = g_replay.frames.len() - 1;
+pub fn replay_seek(rp: &mut Replay, frame: i64) -> void {
+    if frame < 0 { rp.current_frame = 0; return; }
+    if frame >= rp.frame_numbers.len() {
+        rp.current_frame = rp.frame_numbers.len() - 1;
     } else {
-        g_replay.current_frame = frame;
+        rp.current_frame = frame;
     }
 }
 
 /// Set the maximum recording length (in frames).
-pub fn replay_set_max_frames(max: i64) -> void {
-    g_replay.max_frames = max;
+pub fn replay_set_max_frames(rp: &mut Replay, max: i64) -> void {
+    rp.max_frames = max;
 }
 
-/// Save the replay to a binary format (using serialize).
-pub fn replay_save(path: str) -> bool {
-    // Write header + frames as binary
-    // For simplicity, we use a simple format:
-    //   magic (i32), version (i32), frame_count (i32), start_seed (i32)
-    //   For each frame: frame_number, mouse_x, mouse_y, mouse_buttons, dt_ms, seed, key_count, keys...
+/// Save the replay to a file as a binary string.
+pub fn replay_save(rp: &Replay, path: str) -> bool {
     var data = Vec::new();
     replay_write_i32(&mut data, REPLAY_MAGIC);
     replay_write_i32(&mut data, REPLAY_VERSION);
-    replay_write_i32(&mut data, g_replay.frames.len());
-    replay_write_i32(&mut data, g_replay.header.start_seed);
+    replay_write_i32(&mut data, rp.frame_numbers.len());
+    replay_write_i32(&mut data, rp.header.start_seed);
 
     var i = 0;
-    while i < g_replay.frames.len() {
-        var f = g_replay.frames.get(i);
-        replay_write_i32(&mut data, f.frame_number);
-        replay_write_i32(&mut data, f.mouse_x);
-        replay_write_i32(&mut data, f.mouse_y);
-        replay_write_i32(&mut data, f.mouse_buttons);
-        replay_write_i32(&mut data, f.dt_ms);
-        replay_write_i32(&mut data, f.seed);
-        replay_write_i32(&mut data, f.keys.len());
-        var j = 0;
-        while j < f.keys.len() {
-            replay_write_i32(&mut data, f.keys.get(j));
-            j = j + 1;
-        }
+    while i < rp.frame_numbers.len() {
+        replay_write_i32(&mut data, rp.frame_numbers.get(i));
+        replay_write_i32(&mut data, rp.key_counts.get(i));
+        replay_write_i32(&mut data, rp.key0s.get(i));
+        replay_write_i32(&mut data, rp.key1s.get(i));
+        replay_write_i32(&mut data, rp.key2s.get(i));
+        replay_write_i32(&mut data, rp.key3s.get(i));
+        replay_write_i32(&mut data, rp.mouse_xs.get(i));
+        replay_write_i32(&mut data, rp.mouse_ys.get(i));
+        replay_write_i32(&mut data, rp.mouse_buttons.get(i));
+        replay_write_i32(&mut data, rp.dt_ms.get(i));
+        replay_write_i32(&mut data, rp.seeds.get(i));
         i = i + 1;
     }
 
-    return pledge_replay_save(path, data.len(), 0) == 0;
+    var content = "";
+    var k = 0;
+    while k < data.len() {
+        content = content + char_to_str(data.get(k));
+        k = k + 1;
+    }
+
+    var result = file_write(path, content);
+    return result == 0;
 }
 
 /// Load a replay from a file.
-pub fn replay_load(path: str) -> bool {
-    g_replay.frames.clear();
-    g_replay.current_frame = 0;
-    g_replay.mode = REPLAY_IDLE;
+pub fn replay_load(rp: &mut Replay, path: str) -> bool {
+    if !file_exists(path) { return false; }
 
-    var size = pledge_replay_load(path, 0, 0);
-    if size <= 0 { return false; }
+    rp.frame_numbers.clear();
+    rp.key_counts.clear();
+    rp.key0s.clear();
+    rp.key1s.clear();
+    rp.key2s.clear();
+    rp.key3s.clear();
+    rp.mouse_xs.clear();
+    rp.mouse_ys.clear();
+    rp.mouse_buttons.clear();
+    rp.dt_ms.clear();
+    rp.seeds.clear();
+    rp.current_frame = 0;
+    rp.mode = REPLAY_IDLE;
 
-    // In native builds, the runtime fills the buffer
-    // For now, return true if the file exists
+    var content = file_read(path);
+    if str_len(content) == 0 { return false; }
+
+    rp.read_data.clear();
+    var i = 0;
+    while i < str_len(content) {
+        rp.read_data.push(str_byte_at(content, i));
+        i = i + 1;
+    }
+
+    if rp.read_data.len() < 16 { return false; }
+
+    rp.read_pos = 0;
+    var magic = replay_read_i32(rp);
+    if magic != REPLAY_MAGIC { return false; }
+
+    var version = replay_read_i32(rp);
+    var frame_count = replay_read_i32(rp);
+    var seed = replay_read_i32(rp);
+
+    rp.header = ReplayHeader {
+        magic: magic,
+        version: version,
+        frame_count: frame_count,
+        start_seed: seed,
+        game_name: "",
+        game_version: "",
+        recorded_at: 0,
+    };
+
+    var f = 0;
+    while f < frame_count {
+        if rp.read_pos + 44 > rp.read_data.len() { break; }
+        var fn_ = replay_read_i32(rp);
+        var kc = replay_read_i32(rp);
+        var k0 = replay_read_i32(rp);
+        var k1 = replay_read_i32(rp);
+        var k2 = replay_read_i32(rp);
+        var k3 = replay_read_i32(rp);
+        var mx = replay_read_i32(rp);
+        var my = replay_read_i32(rp);
+        var mb = replay_read_i32(rp);
+        var dt = replay_read_i32(rp);
+        var sd = replay_read_i32(rp);
+
+        rp.frame_numbers.push(fn_);
+        rp.key_counts.push(kc);
+        rp.key0s.push(k0);
+        rp.key1s.push(k1);
+        rp.key2s.push(k2);
+        rp.key3s.push(k3);
+        rp.mouse_xs.push(mx);
+        rp.mouse_ys.push(my);
+        rp.mouse_buttons.push(mb);
+        rp.dt_ms.push(dt);
+        rp.seeds.push(sd);
+        f = f + 1;
+    }
+
+    rp.header.frame_count = rp.frame_numbers.len();
     return true;
 }
 
 /// Clear the replay buffer.
-pub fn replay_clear() -> void {
-    g_replay.frames.clear();
-    g_replay.current_frame = 0;
-    g_replay.mode = REPLAY_IDLE;
-    g_replay.header.frame_count = 0;
+pub fn replay_clear(rp: &mut Replay) -> void {
+    rp.frame_numbers.clear();
+    rp.key_counts.clear();
+    rp.key0s.clear();
+    rp.key1s.clear();
+    rp.key2s.clear();
+    rp.key3s.clear();
+    rp.mouse_xs.clear();
+    rp.mouse_ys.clear();
+    rp.mouse_buttons.clear();
+    rp.dt_ms.clear();
+    rp.seeds.clear();
+    rp.current_frame = 0;
+    rp.mode = REPLAY_IDLE;
+    rp.header.frame_count = 0;
 }
 
 // ─── Binary Helpers ─────────────────────────────────────────────────────
@@ -278,9 +421,12 @@ fn replay_write_i32(data: &mut Vec<i64>, val: i64) -> void {
     data.push(val & 0xFF);
 }
 
-// ─── Native Helpers ──────────────────────────────────────────────────────
-
-extern "C" include "pledge_replay.h" link "" {
-    fn pledge_replay_save(path: str, len: i64, data: i64) -> i64;
-    fn pledge_replay_load(path: str, data: i64, max_size: i64) -> i64;
+fn replay_read_i32(rp: &mut Replay) -> i64 {
+    if rp.read_pos + 3 >= rp.read_data.len() { return 0; }
+    var b0 = rp.read_data.get(rp.read_pos);
+    var b1 = rp.read_data.get(rp.read_pos + 1);
+    var b2 = rp.read_data.get(rp.read_pos + 2);
+    var b3 = rp.read_data.get(rp.read_pos + 3);
+    rp.read_pos = rp.read_pos + 4;
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
 }

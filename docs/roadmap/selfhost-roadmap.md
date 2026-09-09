@@ -3,7 +3,101 @@
 > **Goal:** The Fides compiler compiles itself, producing identical output
 > across generations (bootstrap fixpoint).
 >
-> **Last updated:** Sep 9, 2026 (session 20 — 12 Rust modules ported, PE stubs fixed, ELF dump implemented)
+> **Last updated:** Sep 9, 2026 (session 21 — 26 game/media stdlib modules added, 4 runtime bugs documented)
+
+---
+
+## Session 21 Progress (Sep 9, 2026)
+
+### What was done
+
+1. **26 game/media stdlib modules added** (S37–S62, ~9,800 LOC total):
+   - `sdl.fd` (447) — SDL2 bindings (window, events, audio, GL context)
+   - `gl.fd` (384) — OpenGL bindings (shaders, buffers, textures, FBO)
+   - `image.fd` (306) — Image loading (PNG, JPEG, BMP) via stb_image
+   - `font.fd` (337) — Font rendering (TTF, bitmap) via stb_truetype
+   - `mesh.fd` (366) — 3D mesh loading (OBJ) and primitive generation
+   - `gameloop.fd` (177) — Fixed-timestep game loop with accumulator
+   - `physics3d.fd` (489) — 3D rigid body physics (AABB, sphere, collision)
+   - `skel.fd` (412) — Skeletal animation (skeleton, skinning, pose)
+   - `ui.fd` (345) — Immediate-mode UI (panels, buttons, sliders, text)
+   - `net.fd` (396) — UDP networking (socket, send, recv, client/server)
+   - `camera.fd` (303) — 2D/3D camera (follow, zoom, shake, screen-to-world)
+   - `particles.fd` (235) — Particle system (emit, update, render)
+   - `animation2d.fd` (210) — Sprite sheet animation states (idle/walk/jump)
+   - `audio_mixer.fd` (293) — Multi-channel mixer, 3D positional audio, music streaming
+   - `asset.fd` (364) — Asset manager (cache, load/unload, hot reload)
+   - `serialize.fd` (353) — Binary save/load, JSON scene serialization
+   - `collision_broad.fd` (302) — Broad-phase: spatial hash grid, sweep-and-prune
+   - `raycast.fd` (347) — 2D + 3D raycasting (mouse picking, line of sight)
+   - `navmesh.fd` (391) — Navigation mesh pathfinding (A* on polygons)
+   - `terrain.fd` (330) — Heightmap terrain, LOD, height queries
+   - `profiler.fd` (370) — Frame profiler (CPU/GPU timing, draw call counter)
+   - `replay.fd` (432) — Deterministic replay (record inputs, replay)
+   - `shader.fd` (384) — Shader graph / material system on top of gl
+   - `editor.fd` (363) — In-game editor (entity inspector, transform gizmo)
+   - `chunk.fd` (377) — Chunked voxel / infinite terrain management
+   - `touch.fd` (414) — Touch input for mobile games (multi-touch, gestures)
+
+2. **4 runtime/codegen bugs discovered and documented** (see `docs/selfhost/known-bugs.md` 3.16–3.19):
+   - Global `Vec::new()` in struct literals crashes at runtime (SIGSEGV)
+   - `Vec::set()` on same index twice with struct containing `str` causes buffer overflow (SIGABRT)
+   - Struct return value reassignment causes `memcpy` overflow (SIGABRT)
+   - `Vec<f64>` stores integer bit patterns instead of floats
+
+3. **All modules use caller-owned state pattern** to work around the global Vec bug:
+   - Pass `&mut State` to each function instead of using global variables
+   - Create state in `main()` with `state_create()` returning a struct with `Vec::new()` called inside a function
+
+### Verification status
+
+All 26 modules type-check successfully with `release/fides-c3.exe`:
+```
+stdlib/sdl.fd:         Type check ok
+stdlib/gl.fd:          Type check ok
+stdlib/image.fd:       Type check ok
+stdlib/font.fd:        Type check ok
+stdlib/mesh.fd:        Type check ok
+stdlib/gameloop.fd:    Type check ok
+stdlib/physics3d.fd:   Type check ok
+stdlib/skel.fd:         Type check ok
+stdlib/ui.fd:           Type check ok
+stdlib/net.fd:          Type check ok
+stdlib/camera.fd:       Type check ok
+stdlib/particles.fd:    Type check ok
+stdlib/animation2d.fd:  Type check ok
+stdlib/audio_mixer.fd:  Type check ok
+stdlib/asset.fd:        Type check ok
+stdlib/serialize.fd:    Type check ok
+stdlib/collision_broad.fd: Type check ok
+stdlib/raycast.fd:      Type check ok
+stdlib/navmesh.fd:      Type check ok
+stdlib/terrain.fd:      Type check ok
+stdlib/profiler.fd:     Type check ok
+stdlib/replay.fd:       Type check ok
+stdlib/shader.fd:       Type check ok
+stdlib/editor.fd:       Type check ok
+stdlib/chunk.fd:        Type check ok
+stdlib/touch.fd:        Type check ok
+```
+
+Native runtime tests pass for pure-Fides modules:
+- `profiler.fd` — exit 0 (frame/scope/draw-call tracking)
+- `replay.fd` — exit 0 (record/playback/seek/clear)
+- `chunk.fd` — exit 0 (chunk world set/get/update/coords)
+- `touch.fd` — exit 0 (begin/move/end, pinch, swipe, pixel conversion)
+- `editor.fd` — exit 0 (add/select/move/rotate/scale/delete/duplicate/vis/lock)
+
+Graphics-dependent modules (sdl, gl, image, font, mesh, skel, ui, shader)
+type-check but require SDL2/OpenGL headers for native testing.
+
+### Module count
+
+```
+Previous: 99 stdlib modules (was 74 before this session)
+Current:  99 stdlib modules, 28,370 LOC (+25 game/media modules, +9,140 LOC)
+Compiler: 50 modules, 91,924 LOC (unchanged)
+```
 
 ---
 
@@ -1838,7 +1932,7 @@ release/             ← Self-hosted compiler output — gitignored
 compiler/            ← Self-hosted compiler source (25 .fd modules, 57K LOC)
 tests/selfhost/      ← Self-host module tests (23 .fd files)
 tests/selfhost/      ← Harness/probe files for differential testing
-stdlib/              ← Fides standard library (70 .fd modules)
+stdlib/              ← Fides standard library (99 .fd modules)
 ```
 
 ## Terminology

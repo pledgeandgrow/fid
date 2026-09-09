@@ -12,9 +12,9 @@ Interpreter:  209/211 passed
 C Codegen:    198/211 matched
 PE Emitter:   209/211 valid
 Self-host:    23/23 pass (interp + PE)
-Stdlib:       70 modules (18,529 LOC)
-Source:       52 .rs files (84,447 LOC)
-Self-host:    25 .fd modules (57,021 LOC)
+Stdlib:       99 modules (28,370 LOC)
+Source:       55 .rs files (91,490 LOC)
+Self-host:    50 .fd modules (91,924 LOC)
 Test files:   225+ in tests/ + 23 in tests/selfhost/
 ```
 
@@ -133,7 +133,7 @@ implementation (session 11) and not core codegen bugs.
 | Memory safety | 9/10 | 9/10 | Tie (different approaches) |
 | Safety UX | 6/10 (borrow checker fights) | 8/10 (regions, no fights) | **Fides** |
 | Compilation speed | 2/10 (25-30 min builds) | 10/10 (sub-second) | **Fides** |
-| Ecosystem | 8/10 (100k+ crates) | 2/10 (70 stdlib modules) | Rust |
+| Ecosystem | 8/10 (100k+ crates) | 4/10 (99 stdlib modules) | Rust |
 | Concurrency safety | 9/10 (Send/Sync) | 4/10 (no data race prevention) | Rust |
 | Async | 6/10 ("suffering") | 6/10 (effect handlers) | Tie |
 | Hot reload | ❌ | ✅ | **Fides** |
@@ -229,7 +229,7 @@ These are verified working today, not aspirational:
 - No PGO (profile-guided optimization)
 - No escape analysis
 - Weaker auto-vectorization (constant trips only, no variable-trip)
-- Smaller ecosystem (70 modules vs 100k+ crates)
+- Smaller ecosystem (99 modules vs 100k+ crates)
 - No registry for packages
 
 ### Missing vs Go

@@ -740,6 +740,17 @@ is a constant complaint.
 
 **Fides's unique advantage:**
 
+Fides now ships 26 game/media stdlib modules (S37–S62): SDL2 bindings,
+OpenGL bindings, image loading, font rendering, 3D mesh loading, game
+loop, 3D physics, skeletal animation, immediate-mode UI, UDP networking,
+2D/3D camera, particle system, sprite animation, audio mixer, asset
+manager, serialization, broad-phase collision, raycasting, navmesh
+pathfinding, heightmap terrain, frame profiler, deterministic replay,
+shader/material system, in-game editor, chunked voxel terrain, and touch
+input. All written in readable Fides code that users can modify or replace.
+
+**Fides's unique advantage:**
+
 ```
 // Game loop with hot reload
 fn game_loop() {

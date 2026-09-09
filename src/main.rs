@@ -1495,6 +1495,7 @@ fn main() {
                 "test_trait_verify_fail",
                 "test_budget_fail",
                 "test_sandbox_fail",
+                "test_sandbox_alloc_fail",
                 "test_deterministic_fail",
                 "test_field_privacy_fail",
                 "test_money_linear_fail",
@@ -1637,7 +1638,8 @@ fn main() {
             // Skip list — tests that fail on C codegen due to missing builtins
             // or legitimate design differences. These pass on interpreter + PE.
             let skip_tests: &[&str] = &[
-                // All previously skipped tests now pass on C codegen!
+                // Library modules with no main() — not standalone tests
+                "test_token_full",
             ];
 
             // C-codegen-only skip list — tests that pass on interpreter + PE

@@ -169,9 +169,16 @@ TESTS:
   Self-host:      33/42 pass on interp + C + PE (tests/selfhost/)
 
 STDLIB:
-  stdlib/*.fd:    74 modules, 19,230 LOC (including rc.fd, kernel.fd, uefi.fd)
+  stdlib/*.fd:    99 modules, 28,370 LOC (including rc.fd, kernel.fd, uefi.fd, and 26 game/media modules)
 
 RECENT IMPROVEMENTS:
+  Session 21:     26 game/media stdlib modules added (sdl, gl, image, font, mesh,
+                  gameloop, physics3d, skel, ui, net, camera, particles, animation2d,
+                  audio_mixer, asset, serialize, collision_broad, raycast, navmesh,
+                  terrain, profiler, replay, shader, editor, chunk, touch)
+                  — 9,140 LOC added, 99 stdlib modules total
+                  4 runtime bugs documented (global Vec crash, Vec::set overflow,
+                  struct return reassignment overflow, Vec<f64> bit patterns)
   Session 20:     12 Rust modules ported (coff, macho, cparser, embedded, tensor,
                   wasm, scribe, veil, hotreload, debugger, native_debugger, gpu)
                   + 7 cross-comp backends (codegen_arm64/riscv, runtime_arm64/riscv,
@@ -248,7 +255,7 @@ touching them.
 | `src/compiler.rs` | LOW | Pipeline orchestration — changes are visible. Phase 12: `enrich_errors()` post-processes errors with source context + error codes. |
 | `src/diag.rs` | LOW | Diagnostic system — structured error/warning/note/help with error codes, source context, color. Zero external deps. |
 | `src/lsp.rs` | LOW | LSP server — JSON-RPC over stdio, no external deps. |
-| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. 70 stdlib modules: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, uefi. |
+| `stdlib/*.fd` | LOW | Fides source — errors surface as test failures. 99 stdlib modules: core, vec, math, string, fmt, bits, sort, hash, iter, stack, queue, buffer, collections, result, random, path, units, uuid, crypto, storage, clinical, medical, ecu, scada, swift, grid, ota, banking, kv_cache, quant, dp, shard, fs, io, os, sys, ecs, events, parallel, sync, channel, db, http, json, shape, simd, tensor, money, alloc, file, time, typed_strings, memo, privacy, env, args, process, regex, tilemap, sprite, flowfield, streaming, scene, physics, audio, input, arinc, can, uefi, kernel, rc, volatile, test, sqlite, sdl, gl, image, font, mesh, gameloop, physics3d, skel, ui, net, camera, particles, animation2d, audio_mixer, asset, serialize, collision_broad, raycast, navmesh, terrain, profiler, replay, shader, editor, chunk, touch. |
 
 ## Known Bugs (Do Not Re-Introduce)
 

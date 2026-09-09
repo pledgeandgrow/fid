@@ -2249,15 +2249,18 @@ impl CCodeGen {
                     }
                     IrType::Generic(name, _) if name == "Vec" => {
                         // Phase 10B: Vec is now a raw i64 pointer — call Fides Vec_to_str
-                        wln!(self, "    {{ char* _s = (char*)Vec_to_str(0, (int64_t){}); p_print_str(_s); free(_s); }}", v);
+                        // Note: Vec_to_str returns arena-allocated string (via p_str_concat/p_malloc) — do NOT free
+                        wln!(self, "    {{ char* _s = (char*)Vec_to_str(0, (int64_t){}); p_print_str(_s); }}", v);
                     }
                     IrType::Opaque(name) if name == "Vec" => {
                         // Phase 10B: Vec is now a raw i64 pointer — call Fides Vec_to_str
-                        wln!(self, "    {{ char* _s = (char*)Vec_to_str(0, (int64_t){}); p_print_str(_s); free(_s); }}", v);
+                        // Note: Vec_to_str returns arena-allocated string (via p_str_concat/p_malloc) — do NOT free
+                        wln!(self, "    {{ char* _s = (char*)Vec_to_str(0, (int64_t){}); p_print_str(_s); }}", v);
                     }
                     IrType::Generic(name, _) if name == "HashMap" => {
                         // Phase 10B: HashMap is now a raw i64 pointer — call Fides HashMap_to_str
-                        wln!(self, "    {{ char* _s = (char*)HashMap_to_str(0, (int64_t){}); p_print_str(_s); free(_s); }}", v);
+                        // Note: HashMap_to_str returns arena-allocated string — do NOT free
+                        wln!(self, "    {{ char* _s = (char*)HashMap_to_str(0, (int64_t){}); p_print_str(_s); }}", v);
                     }
                     IrType::Opaque(name) if name == "String" => {
                         // Phase 10B: String from Vec_get is an i64 pointer — cast to char*

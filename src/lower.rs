@@ -118,6 +118,7 @@ fn runtime_effects(name: &str) -> Option<EffectSet> {
         | "p_outb" | "p_serial_init" | "p_serial_write"
         | "p_cr0_write" | "p_cr3_write" | "p_cr4_write" | "p_invlpg"
         | "p_page_map" | "p_page_unmap" | "p_phys_write64"
+        | "p_volatile_store" | "p_volatile_store8" | "p_volatile_store16" | "p_volatile_store32"
     ) {
         effects.add(Effect::Write);
         effects.add(Effect::IO);
@@ -125,6 +126,7 @@ fn runtime_effects(name: &str) -> Option<EffectSet> {
     }
     if matches!(name, "p_inb" | "p_serial_read" | "p_serial_ready"
         | "p_cr0_read" | "p_cr3_read" | "p_cr4_read" | "p_phys_read64"
+        | "p_volatile_load" | "p_volatile_load8" | "p_volatile_load16" | "p_volatile_load32"
     ) {
         effects.add(Effect::IO);
         return Some(effects);
@@ -887,6 +889,15 @@ impl Lowerer {
         self.module.add_extern("p_page_unmap", vec![IrType::I64, IrType::I64], IrType::Void); // unmap vaddr
         self.module.add_extern("p_phys_read64", vec![IrType::I64], IrType::I64); // read 8 bytes from physical addr
         self.module.add_extern("p_phys_write64", vec![IrType::I64, IrType::I64], IrType::Void); // write 8 bytes to physical addr
+        // Volatile memory access (MMIO)
+        self.module.add_extern("p_volatile_load", vec![IrType::I64], IrType::I64);
+        self.module.add_extern("p_volatile_store", vec![IrType::I64, IrType::I64], IrType::Void);
+        self.module.add_extern("p_volatile_load8", vec![IrType::I64], IrType::I64);
+        self.module.add_extern("p_volatile_store8", vec![IrType::I64, IrType::I64], IrType::Void);
+        self.module.add_extern("p_volatile_load16", vec![IrType::I64], IrType::I64);
+        self.module.add_extern("p_volatile_store16", vec![IrType::I64, IrType::I64], IrType::Void);
+        self.module.add_extern("p_volatile_load32", vec![IrType::I64], IrType::I64);
+        self.module.add_extern("p_volatile_store32", vec![IrType::I64, IrType::I64], IrType::Void);
 
         // ─── Phase 5A.5: GDT builtins (bare-metal) ───
         self.module.add_extern("p_lgdt", vec![IrType::I64], IrType::Void); // load GDT

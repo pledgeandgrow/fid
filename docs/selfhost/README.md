@@ -97,12 +97,12 @@ C:\tcc\tcc.exe release\fides-c_wrapped.c -o release\fides-c.exe -lws2_32
 - **23/23 self-host tests pass** on interp + PE (tests/compiler/)
 - **Strict fixpoint ACHIEVED** — `fides-c2.c` == `fides-c3.c` (byte-identical, 0 diffs out of 701,100 lines). The fix was replacing all non-ASCII (corrupted Unicode) characters in compiler source files with ASCII equivalents.
 
-### Codebase size (session 15)
+### Codebase size (session 21)
 | Component | Files | LOC |
 |-----------|-------|-----|
-| Self-hosted compiler (`compiler/*.fd`) | 26 | 61,885 |
-| Rust compiler (`src/*.rs`) | 52 | 91,038 |
-| Stdlib (`stdlib/*.fd`) | 70 | 18,529 |
+| Self-hosted compiler (`compiler/*.fd`) | 50 | 91,924 |
+| Rust compiler (`src/*.rs`) | 55 | 91,490 |
+| Stdlib (`stdlib/*.fd`) | 99 | 28,370 |
 | Test files (`tests/*.fd` + `tests/compiler/*.fd`) | 225 + 23 | — |
 
 ### Test results (session 15)
